@@ -6130,3 +6130,85 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_getfb2_reports_framebuffer
 );
+
+/// drm_setversion + drm_getunique (libdrm's drmSetInterfaceVersion and
+/// drmGetBusid): the unique name is empty until the master asks for
+/// interface 1.1+, then "pci:DDDD:BB:SS.F", copied only into a buffer at
+/// least that long, its length always written back. A bad interface is
+/// EINVAL, SET_VERSION from a non-master EACCES.
+fn smoke_drm_set_version_and_get_unique() -> TestResult {
+    let idx = register_test_card();
+    let get_unique = |open: u64, buf: &mut [u8]| {
+        let mut u = [0u8; 16];
+        u[0..8].copy_from_slice(&(buf.len() as u64).to_le_bytes());
+        u[8..16].copy_from_slice(&(buf.as_mut_ptr() as u64).to_le_bytes());
+        let r = crate::drm_ioctl_bridge::dispatch_card(
+            idx,
+            open,
+            iowr(DRM_IOCTL_BASE, 0x01, 16),
+            u.as_mut_ptr() as usize,
+            false,
+        );
+        (r, u64::from_le_bytes(u[0..8].try_into().unwrap()))
+    };
+    let set_version = |open: u64, v: [i32; 4]| {
+        let mut b = [0u8; 16];
+        for (dst, value) in b.chunks_exact_mut(4).zip(v) {
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
+        let r = crate::drm_ioctl_bridge::dispatch_card(
+            idx,
+            open,
+            iowr(DRM_IOCTL_BASE, 0x07, 16),
+            b.as_mut_ptr() as usize,
+            false,
+        );
+        let out: alloc::vec::Vec<i32> = b
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        (r, out)
+    };
+    if get_unique(SMOKE_MASTER_ID, &mut []) != (Ok(0), 0) {
+        return TestResult::Fail("GET_UNIQUE before SET_VERSION is not empty");
+    }
+    if set_version(SMOKE_MASTER_ID + 1, [1, 4, -1, -1]).0 != Err(FsError::PermissionDenied) {
+        return TestResult::Fail("SET_VERSION from a non-master");
+    }
+    let (r, out) = set_version(SMOKE_MASTER_ID, [2, 0, -1, -1]);
+    if r != Err(FsError::InvalidData) || out[..2] != [1, 4] {
+        return TestResult::Fail("SET_VERSION of interface 2.0");
+    }
+    if get_unique(SMOKE_MASTER_ID, &mut []).1 != 0 {
+        return TestResult::Fail("a refused SET_VERSION set the unique name");
+    }
+    let (r, out) = set_version(SMOKE_MASTER_ID, [1, 4, -1, -1]);
+    if r != Ok(0) || out[..2] != [1, 4] || out[2] != 1 || out[3] != 0 {
+        return TestResult::Fail("SET_VERSION 1.4");
+    }
+    let (r, len) = get_unique(SMOKE_MASTER_ID, &mut []);
+    if r != Ok(0) || len != 16 {
+        return TestResult::Fail("GET_UNIQUE length pass");
+    }
+    let mut short = [0u8; 15];
+    if get_unique(SMOKE_MASTER_ID, &mut short) != (Ok(0), 16) || short != [0; 15] {
+        return TestResult::Fail("GET_UNIQUE copied into a short buffer");
+    }
+    let mut name = [0u8; 16];
+    // Another open under this master sees the master's name.
+    if get_unique(SMOKE_MASTER_ID + 1, &mut name) != (Ok(0), 16) {
+        return TestResult::Fail("GET_UNIQUE copy pass");
+    }
+    let Ok(name) = core::str::from_utf8(&name) else {
+        return TestResult::Fail("unique name is not text");
+    };
+    let b = name.as_bytes();
+    if !name.starts_with("pci:") || b[8] != b':' || b[11] != b':' || b[14] != b'.' {
+        return TestResult::Fail("unique name is not drm_pci_set_busid's format");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_set_version_and_get_unique
+);

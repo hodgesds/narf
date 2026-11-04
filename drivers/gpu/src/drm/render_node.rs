@@ -279,6 +279,14 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         // VERSION + GET_CAP are RENDER_ALLOW per Linux.
         0x00 => Some(IoctlFlags::render_allow()),
         0x0C => Some(IoctlFlags::render_allow()),
+        // GET_UNIQUE — flags 0 (any primary open); SET_VERSION — DRM_MASTER.
+        0x01 => Some(IoctlFlags {
+            auth: false,
+            master: false,
+            root_only: false,
+            render_allow: false,
+        }),
+        0x07 => Some(IoctlFlags::master_only()),
         // GEM_CLOSE — RENDER_ALLOW (no display authority needed).
         // Linux: DRM_RENDER_ALLOW in drm_ioctls[] (drm_ioctl.c).
         0x09 => Some(IoctlFlags::render_allow()),

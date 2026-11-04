@@ -2299,6 +2299,12 @@ fn dispatch_card_for_file_inner(
         // DRM_RENDER_ALLOW, so `drm_ioctl_permit` returns EACCES. `drm_ioctl`
         // still copies the (zeroed) kdata back afterwards, and a faulting
         // copy-out overrides the return code with EFAULT.
+        // Neither carries DRM_RENDER_ALLOW (drm_ioctl_permit: EACCES).
+        IoctlCmd::GetUnique | IoctlCmd::SetVersion if ctx.is_render_client() => {
+            Err(FsError::PermissionDenied)
+        }
+        IoctlCmd::GetUnique => handle_get_unique(card_index, &mode_state, arg, open_id),
+        IoctlCmd::SetVersion => handle_set_version(card_index, &mode_state, arg, open_id),
         IoctlCmd::GetMagic => {
             let (magic, ret) = if ctx.is_render_client() {
                 (0u32, Err(FsError::PermissionDenied))
@@ -4711,6 +4717,98 @@ pub fn amdgpu_getfb_bo(
         }
         Ok(0)
     })())
+}
+
+/// The device's unique name as drm_pci_set_busid formats it
+/// ("pci:DDDD:BB:SS.F"); `None` for a card without a PCI parent.
+fn bus_id(card_index: u32) -> Option<alloc::string::String> {
+    let card = crate::drm_registry::card(card_index)?;
+    let a = crate::drm_sysfs_bridge::pci_addr_for_card(card.as_ref(), card_index)?;
+    Some(alloc::format!(
+        "pci:{:04x}:{:02x}:{:02x}.{}",
+        a.segment,
+        a.bus,
+        a.device,
+        a.function
+    ))
+}
+
+/// DRM_IOCTL_GET_UNIQUE — `struct drm_unique { __kernel_size_t unique_len;
+/// char __user *unique; }`: drm_getunique. The name (no NUL) is copied only
+/// when the caller's length is at least the name's; the name's length is
+/// always written back, so libdrm asks twice. Empty until SET_VERSION 1.1+
+/// filled in the master's name.
+fn handle_get_unique(
+    card_index: u32,
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    open_id: u64,
+) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the validated 16-byte ioctl pointer.
+    let mut b = unsafe { copy_in(arg, 16)? };
+    let len = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let ptr = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
+    let name = if mode_state.lock().has_unique(open_id) {
+        bus_id(card_index).unwrap_or_default()
+    } else {
+        alloc::string::String::new()
+    };
+    if !name.is_empty() && len >= name.len() as u64 {
+        // SAFETY: the caller's buffer holds at least `len` bytes.
+        unsafe { copy_out(ptr, name.as_bytes())? };
+    }
+    b[0..8].copy_from_slice(&(name.len() as u64).to_le_bytes());
+    // SAFETY: as above.
+    unsafe { copy_out(arg, &b)? };
+    Ok(0)
+}
+
+/// DRM_IOCTL_SET_VERSION — `struct drm_set_version { int drm_di_major,
+/// drm_di_minor, drm_dd_major, drm_dd_minor; }`: drm_setversion. Interface
+/// 1.1 to 1.4 fills in the master's unique name (drm_set_busid); a wrong
+/// interface or driver version is EINVAL; -1 skips a check. The versions
+/// the device supports are written back either way.
+fn handle_set_version(
+    card_index: u32,
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    open_id: u64,
+) -> Result<u64, FsError> {
+    const DRM_IF_MAJOR: i32 = 1;
+    const DRM_IF_MINOR: i32 = 4;
+    // SAFETY: `arg` is the validated 16-byte ioctl pointer.
+    let b = unsafe { copy_in(arg, 16)? };
+    let field = |i: usize| i32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+    let (di_major, di_minor, dd_major, dd_minor) = (field(0), field(1), field(2), field(3));
+    let mut card = mode_state.lock();
+    // DRM_MASTER: drm_ioctl_permit refuses anyone else after the copy-in.
+    if !card.is_master(open_id) {
+        return Err(FsError::PermissionDenied);
+    }
+    let (major, minor, _) = card.version;
+    let (major, minor) = (major as i32, minor as i32);
+    let mut result = Ok(0);
+    if di_major != -1 {
+        if di_major != DRM_IF_MAJOR || !(0..=DRM_IF_MINOR).contains(&di_minor) {
+            result = Err(invalid_at(line!()));
+        } else if di_minor >= 1 && bus_id(card_index).is_some() {
+            card.set_unique(open_id);
+        }
+    }
+    if result.is_ok() && dd_major != -1 && (dd_major != major || !(0..=minor).contains(&dd_minor)) {
+        result = Err(invalid_at(line!()));
+    }
+    drop(card);
+    let mut out = [0u8; 16];
+    for (i, v) in [DRM_IF_MAJOR, DRM_IF_MINOR, major, minor]
+        .into_iter()
+        .enumerate()
+    {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // SAFETY: as above.
+    unsafe { copy_out(arg, &out)? };
+    result
 }
 
 /// DRM_IOCTL_MODE_CLOSEFB — `struct drm_mode_closefb { u32 fb_id; u32

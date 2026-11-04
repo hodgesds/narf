@@ -1053,6 +1053,10 @@ pub struct Card {
     /// model, which let a greeter and a user-session compositor both drive the
     /// same scanout with no handoff.
     pub(crate) current_master: Option<u64>,
+    /// Opens whose master has its unique name (the bus id) filled in by
+    /// SET_VERSION 1.1+ (drm_set_busid). GET_UNIQUE answers an empty name
+    /// until then, which libdrm's drmOpenByName depends on.
+    pub(crate) unique_masters: Vec<u64>,
     /// Issued DRM magic tokens: `(magic, open_id, authenticated)`. One magic
     /// per open, allocated on its first `GET_MAGIC` and kept for the life of
     /// the fd (a repeat `GET_MAGIC` returns the same value). `AUTH_MAGIC`
@@ -1328,6 +1332,7 @@ impl Card {
             vblank_seq: 0,
             next_vblank_ns: 0,
             current_master: None,
+            unique_masters: Vec::new(),
             magics: Vec::new(),
             next_magic: 1,
             native: Vec::new(),
@@ -1411,6 +1416,25 @@ impl Card {
 
     /// Whether `open_id` is the current DRM master. Drives `DrmFileCtx`'s
     /// `is_master` for the per-ioctl permission gate.
+    /// drm_set_busid: fill in the unique name of `open_id`'s master.
+    pub fn set_unique(&mut self, open_id: u64) {
+        if !self.unique_masters.contains(&open_id) {
+            self.unique_masters.push(open_id);
+        }
+    }
+    /// Whether GET_UNIQUE from `open_id` reports the bus id: its master's
+    /// unique name was set (file_priv->master: the open's own master, or
+    /// the current one it was opened under).
+    pub fn has_unique(&self, open_id: u64) -> bool {
+        self.unique_masters.contains(&open_id)
+            || self
+                .current_master
+                .is_some_and(|m| self.unique_masters.contains(&m))
+    }
+    /// The master's unique name goes with its last open.
+    pub fn release_unique(&mut self, open_id: u64) {
+        self.unique_masters.retain(|&o| o != open_id);
+    }
     pub fn is_master(&self, open_id: u64) -> bool {
         self.current_master == Some(open_id)
     }

@@ -36,7 +36,9 @@ use super::render_node::{check_permission, ioctl_flags, DrmFileCtx, PermError};
 #[repr(u32)]
 pub enum IoctlCmd {
     Version = 0x00,
+    GetUnique = 0x01,
     GetMagic = 0x02,
+    SetVersion = 0x07,
     AuthMagic = 0x11,
     GemClose = 0x09,
     GetCap = 0x0C,
@@ -93,7 +95,9 @@ impl IoctlCmd {
     pub fn from_raw(raw: u32) -> Self {
         match raw & 0xFF {
             0x00 => IoctlCmd::Version,
+            0x01 => IoctlCmd::GetUnique,
             0x02 => IoctlCmd::GetMagic,
+            0x07 => IoctlCmd::SetVersion,
             0x11 => IoctlCmd::AuthMagic,
             0x09 => IoctlCmd::GemClose,
             0x0C => IoctlCmd::GetCap,
@@ -452,6 +456,8 @@ pub fn dispatch(
         // GET_MAGIC / AUTH_MAGIC are handled in the bridge (primary-node fd is
         // the authenticated master); they never reach this generic dispatcher.
         IoctlCmd::GetMagic
+        | IoctlCmd::GetUnique
+        | IoctlCmd::SetVersion
         | IoctlCmd::AuthMagic
         | IoctlCmd::ModeSetCrtc
         | IoctlCmd::ModeGetCrtc
