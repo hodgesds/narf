@@ -196,10 +196,11 @@ impl Dp {
         hal: &mut Hal,
         io: &impl ChipIo,
         ring_desc: &[u32; 16],
+        mac_id: u32,
         buf_id: u32,
         drop: bool,
     ) -> bool {
-        let Some(data) = self.take_rx_buf(buf_id) else {
+        let Some(data) = self.take_rx_buf_for(mac_id, buf_id) else {
             // "rx err buf with invalid buf_id"
             self.stats.rx_invalid_cookie += 1;
             return false;

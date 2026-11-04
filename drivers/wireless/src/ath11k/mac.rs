@@ -528,6 +528,43 @@ impl DeviceCaps {
             num_radios: ext.num_radios.max(1),
         })
     }
+
+    /// Assemble the caps for one radio of a multi-pdev part: the pdev
+    /// is selected by `pdev_id` (not by array position — the
+    /// bring-up pdev list is in allocation order, and a radio's
+    /// position is not its id once pdev 0 is not first). The radio's
+    /// MAC address is its entry in the READY extra addresses, in
+    /// pdev order (`ath11k_wmi_tlv_rdy_parse`); `None` when the
+    /// firmware did not report enough extra addresses — the caller
+    /// skips that radio rather than inventing an address. The
+    /// single-radio case is [`Self::from_events`] (device MAC).
+    pub fn from_events_for(
+        sr: &ServiceReady,
+        ext: &ServiceReadyExt,
+        ready: &Ready,
+        svc: &ServiceMap,
+        pdev_id: u32,
+    ) -> Option<Self> {
+        let pos = ext.pdevs.iter().position(|p| p.pdev_id == pdev_id)?;
+        let pdev = ext.pdevs[pos];
+        let num_radios = ext.num_radios.max(1);
+        let mac_addr = match ready.pdev_mac_addrs(num_radios) {
+            Some(addrs) => addrs[pos],
+            None => return None,
+        };
+        let pick = |phy| ext.hal_reg_cap(phy).copied().unwrap_or_default();
+        Some(DeviceCaps {
+            mac_addr,
+            pdev_id: pdev.pdev_id,
+            pdev,
+            hal_reg_cap: ext.hal_reg_caps.first().copied().unwrap_or_default(),
+            hal_reg_cap_2g: pick(pdev.band_2g.phy_id),
+            hal_reg_cap_5g: pick(pdev.band_5g.phy_id),
+            svc: *svc,
+            hw_max_tx_power: sr.caps.map_or(0, |c| c.hw_max_tx_power),
+            num_radios,
+        })
+    }
 }
 
 /// `ath11k_hw_params` / module defaults the mac layer reads.
@@ -579,6 +616,28 @@ impl MacConfig {
     pub const fn with_vdev(mut self, vdev_id: u32) -> Self {
         self.vdev_id = vdev_id;
         self
+    }
+
+    /// Per-radio config for a multi-pdev part: the WCN6855 policy
+    /// defaults (idle PS, station PS, current-CC, vdev-start delay,
+    /// listen interval, powersave) with `single_pdev_only` cleared and
+    /// the chip's own `num_rxdma_per_pdev`. These are mac-layer policy
+    /// knobs, not chip register values, so one shared default per radio
+    /// is honest; the vdev slot still comes from [`Self::with_vdev`].
+    pub const fn for_radio(num_rxdma_per_pdev: u32) -> Self {
+        MacConfig {
+            vdev_id: 0,
+            idle_ps: true,
+            supports_sta_ps: true,
+            current_cc_support: true,
+            single_pdev_only: false,
+            vdev_start_delay: true,
+            num_rxdma_per_pdev,
+            listen_interval: 5,
+            powersave: true,
+            frame_mode_ethernet: false,
+            raw_mode: false,
+        }
     }
 }
 
@@ -1782,6 +1841,13 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     /// The configuration the layer was built with (a restart reuses it).
     pub fn config(&self) -> MacConfig {
         self.cfg
+    }
+
+    /// The radio this MAC instance drives (`ar->pdev->pdev_id`): the
+    /// netdev layer uses it to rebuild this radio's port (not pdev 0's)
+    /// across recovery and virtual-interface creation.
+    pub fn pdev_id(&self) -> u32 {
+        self.caps.pdev_id
     }
 
     pub fn wiphy(&self) -> &Wiphy {

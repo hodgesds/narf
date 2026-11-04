@@ -13,6 +13,7 @@ use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 use super::core::CoreConfig;
 use super::dp_ring::*;
 use super::hal::*;
+use super::mac::DeviceCaps;
 use super::power::ChipIo;
 
 struct RecIo;
@@ -25,7 +26,10 @@ impl ChipIo for RecIo {
     fn restore_window(&self) {}
 }
 use super::hw::*;
-use super::wmi::{self, InitCmdParam, PdevCap, ServiceReadyExt, TargetResourceConfig};
+use super::wmi::{
+    self, BandCap, HalRegCapExt, InitCmdParam, PdevCap, Ready, ServiceMap, ServiceReady,
+    ServiceReadyExt, TargetResourceConfig,
+};
 
 const SIZES: DpRingSizes = DpRingSizes {
     wbm_release: 16,
@@ -217,3 +221,84 @@ kernel_test_in!(
 );
 
 use alloc::boxed::Box;
+
+/// Per-radio caps (`DeviceCaps::from_events_for`): the pdev is selected
+/// by `pdev_id`, not by array position, and each radio gets its own
+/// READY extra MAC address plus the HAL reg caps of its own band phys.
+/// A radio without an extra address yields no caps instead of an
+/// invented address.
+fn smoke_ath11k_multi_pdev_caps() -> TestResult {
+    let pdev = |id: u32, bands: u32, phy2g: u32, phy5g: u32| PdevCap {
+        pdev_id: id,
+        supported_bands: bands,
+        band_2g: BandCap {
+            phy_id: phy2g,
+            ..Default::default()
+        },
+        band_5g: BandCap {
+            phy_id: phy5g,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let ext = ServiceReadyExt {
+        pdevs: vec![pdev(0, 0x3, 0, 1), pdev(1, 0x1, 2, 3)],
+        num_radios: 2,
+        hal_reg_caps: (0..4)
+            .map(|phy| HalRegCapExt {
+                phy_id: phy,
+                eeprom_reg_domain: 0x100 + phy,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let ready = Ready {
+        mac_addr: [0x02, 0, 0, 0, 0, 0xAA],
+        num_extra_mac_addr: 2,
+        extra_mac_addrs: vec![[0x02, 0, 0, 0, 0, 0xB0], [0x02, 0, 0, 0, 0, 0xB1]],
+        ..Default::default()
+    };
+    let sr = ServiceReady {
+        caps: None,
+        fw_build_vers: 0,
+        svc_map: ServiceMap::default(),
+        bitmap_seen: true,
+    };
+    let svc = ServiceMap::default();
+    let c0 = DeviceCaps::from_events_for(&sr, &ext, &ready, &svc, 0).expect("radio 0 caps");
+    kt_assert_eq!(c0.pdev_id, 0);
+    kt_assert_eq!(c0.mac_addr, [0x02, 0, 0, 0, 0, 0xB0]);
+    kt_assert_eq!(c0.hal_reg_cap_2g.eeprom_reg_domain, 0x100);
+    kt_assert_eq!(c0.hal_reg_cap_5g.eeprom_reg_domain, 0x101);
+    let c1 = DeviceCaps::from_events_for(&sr, &ext, &ready, &svc, 1).expect("radio 1 caps");
+    kt_assert_eq!(c1.pdev_id, 1);
+    kt_assert_eq!(c1.mac_addr, [0x02, 0, 0, 0, 0, 0xB1]);
+    kt_assert_eq!(c1.hal_reg_cap_2g.eeprom_reg_domain, 0x102);
+    kt_assert_eq!(c1.hal_reg_cap_5g.eeprom_reg_domain, 0x103);
+    // Unknown pdev: no caps. Too few extra addresses: no caps for the
+    // second radio (never an invented address).
+    kt_assert!(
+        DeviceCaps::from_events_for(&sr, &ext, &ready, &svc, 2).is_none(),
+        "unknown pdev"
+    );
+    let short = Ready {
+        num_extra_mac_addr: 1,
+        extra_mac_addrs: vec![[0x02, 0, 0, 0, 0, 0xB0]],
+        ..Default::default()
+    };
+    kt_assert!(
+        DeviceCaps::from_events_for(&sr, &ext, &short, &svc, 1).is_none(),
+        "missing extra address"
+    );
+    // The single-radio legacy path still takes the device MAC.
+    let single = ServiceReadyExt {
+        pdevs: vec![pdev(0, 0x3, 0, 1)],
+        num_radios: 1,
+        ..Default::default()
+    };
+    let c = DeviceCaps::from_events(&sr, &single, &ready, &svc).expect("single caps");
+    kt_assert_eq!(c.mac_addr, [0x02, 0, 0, 0, 0, 0xAA]);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_multi_pdev_caps);

@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::ce::CeMsi;
+use super::dp::BUFFER_ADDR_INFO1_SW_COOKIE;
 use super::dp_ring::step;
 use super::dp_ring::*;
 use super::hal::*;
@@ -1054,7 +1055,7 @@ fn smoke_ath11k_dp_rx_replenish_cookies() -> TestResult {
     // Ring full: nothing more fits.
     check!(
         {
-            r.dp.replenish_refill(&mut r.hal, &r.io, 4);
+            r.dp.replenish_refill_for(&mut r.hal, &r.io, 0, 4);
             r.dp.pdev.as_ref().unwrap().rx_refill_buf_ring.bufs.len() == 15
         },
         "full refill ring takes nothing"
@@ -1064,7 +1065,7 @@ fn smoke_ath11k_dp_rx_replenish_cookies() -> TestResult {
     for _ in 0..3 {
         fw_take(&r.io, &mut refill);
     }
-    r.dp.replenish_refill(&mut r.hal, &r.io, 3);
+    r.dp.replenish_refill_for(&mut r.hal, &r.io, 0, 3);
     check!(refill.pending(&r.io) == 15, "three reposted");
     let ids: Vec<u32> = (15..18)
         .map(|i| {
@@ -1080,12 +1081,12 @@ fn smoke_ath11k_dp_rx_replenish_cookies() -> TestResult {
     for _ in 0..4 {
         fw_take(&r.io, &mut refill);
     }
-    r.dp.replenish_refill(&mut r.hal, &r.io, 0);
+    r.dp.replenish_refill_for(&mut r.hal, &r.io, 0, 0);
     check!(refill.pending(&r.io) == 11, "0 = no top-up at 4/15 free");
     for _ in 0..9 {
         fw_take(&r.io, &mut refill);
     }
-    r.dp.replenish_refill(&mut r.hal, &r.io, 0);
+    r.dp.replenish_refill_for(&mut r.hal, &r.io, 0, 0);
     check!(
         refill.pending(&r.io) == 15,
         "0 = refill everything when > 3/4 free"
@@ -1565,7 +1566,7 @@ fn smoke_ath11k_dp_rxdma_err_link_desc_return() -> TestResult {
     e[1] = link[1];
     e[6] = 3 << 2;
     check!(err.produce(&r.io, &e), "rxdma err entry");
-    let n = r.dp.process_rxdma_err(&mut r.hal, &r.io, 0, 64);
+    let n = r.dp.process_rxdma_err_for(&mut r.hal, &r.io, 0, 0, 64);
     check!(
         n == 2,
         "Linux returns processed + 1 (quota-- post-decrement)"
@@ -1593,7 +1594,7 @@ fn smoke_ath11k_dp_rxdma_err_link_desc_return() -> TestResult {
     e2[0] = 0x10;
     e2[1] = 7 << 11; // bank 7
     check!(err.produce(&r.io, &e2), "bad bank");
-    r.dp.process_rxdma_err(&mut r.hal, &r.io, 0, 64);
+    r.dp.process_rxdma_err_for(&mut r.hal, &r.io, 0, 0, 64);
     check!(
         r.dp.stats.link_desc_lookup_fail == 1,
         "lookup failure counted"
@@ -1760,7 +1761,8 @@ fn smoke_ath11k_dp_mon_status_reap() -> TestResult {
     phys_wr32(buf_addr_get(a[0], a[1]).0, 0x140 << 1); // HAL_RX_STATUS_BUFFER_DONE
     phys_wr32(buf_addr_get(b[0], b[1]).0, 0);
     let mut budget = 8;
-    let n = r.dp.reap_mon_status(&mut r.hal, &r.io, 0, &mut budget);
+    let n =
+        r.dp.reap_mon_status_for(&mut r.hal, &r.io, 0, 0, &mut budget);
     // HP slot (never filled) refilled, then slot 0 DONE reaped + refilled,
     // then slot 1: next peek would hit TP → stop.
     check!(n == 2, "two slots refilled");
@@ -3329,4 +3331,153 @@ fn smoke_ath11k_qca6390_defrag_reinject_golden() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath11k/qca6390",
     smoke_ath11k_qca6390_defrag_reinject_golden
+);
+
+/// Multi-pdev RX service (IPQ8074, two radios): the per-pdev paths the
+/// pdev-0-only service pass used to skip. The UMAC register helpers do
+/// not apply to IPQ8074, so every per-pdev LMAC ring comes from that
+/// pdev's own HTT SRING_SETUP messages, matched to the ring by DMA
+/// base address (never by message index); the link descriptor for the
+/// RXDMA-error leg is written straight into the host-side bank, as the
+/// hardware's WBM idle ring would have delivered it.
+fn msg_for(msgs: &[Vec<u8>], hal: &Hal, ring_id: u32) -> DevRing {
+    let base = hal
+        .srng(ring_id)
+        .expect("pdev ring programmed")
+        .ring_base_paddr;
+    let m = msgs
+        .iter()
+        .find(|m| msg_word(m, 1) as u64 | ((msg_word(m, 2) as u64) << 32) == base)
+        .expect("sring setup message for the ring");
+    lmac(m)
+}
+
+fn smoke_ath11k_dp_service_multi_pdev() -> TestResult {
+    let cfg = DpHwParams::for_rev(HwRev::Ipq8074).expect("ipq8074 params");
+    let mut hal = Hal::new(&cfg.hw).expect("hal");
+    let io = RecIo::default();
+    let mut dp = Dp::alloc(&mut hal, &io, &cfg, SMALL, None).expect("dp alloc");
+    dp.pdev_reo_setup(&mut hal, &io).expect("reo setup");
+    let _msgs0 = dp.pdev_alloc(&mut hal, &io, 0).expect("pdev 0 alloc");
+    let msgs1 = dp.pdev_alloc(&mut hal, &io, 1).expect("pdev 1 alloc");
+    check!(
+        dp.pdev_mac_ids() == vec![0, 1],
+        "two pdevs in allocation order"
+    );
+    let pdev1 = dp.pdevs().find(|p| p.mac_id == 1).expect("pdev 1");
+    let err_id = pdev1.rxdma_err_dst_ring[0].ring_id;
+    let mon_id = pdev1.rx_mon_status_refill_ring[0].refill_buf_ring.ring_id;
+    let refill_id = pdev1.rx_refill_buf_ring.refill_buf_ring.ring_id;
+    let mgr = dp.cfg.hal_params.rx_buf_rbm;
+
+    // Setup pre-posts each radio's refill ring (15 of 16 entries, as
+    // the single-pdev replenish test pins); the per-pdev legs below
+    // work on those posted buffers, not on fresh replenishes.
+    let ids = |dp: &Dp, mac: u32| -> Vec<u32> {
+        let p = dp.pdevs().find(|p| p.mac_id == mac).expect("pdev");
+        (0..16)
+            .filter(|id| p.rx_refill_buf_ring.bufs.find(*id).is_some())
+            .collect()
+    };
+    check!(ids(&dp, 0).len() == 15, "pdev 0 refill posted");
+    check!(ids(&dp, 1).len() == 15, "pdev 1 refill posted");
+
+    // RXDMA error on pdev 1's own error ring: one link descriptor
+    // naming a posted pdev-1 buffer cookie (PDEV_ID 1). The freed
+    // buffer must come back to pdev 1's refill ring, not pdev 0's.
+    let mut refill1 = msg_for(&msgs1, &hal, refill_id);
+    let (_, cookie, _) = buf_addr_get(refill1.entry(0)[0], refill1.entry(0)[1]);
+    let buf0 = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, cookie);
+    check!(
+        field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, cookie) == 1,
+        "posted pdev 1 cookie carries PDEV_ID 1"
+    );
+    let bank = &dp.link_desc_banks[0];
+    let pa = bank.paddr;
+    bank.wr(pa, 8, 0x1000);
+    bank.wr(pa, 9, ((mgr as u32) << 8) | (cookie << 11));
+    bank.wr(pa, 12, 0);
+    let mut err = msg_for(&msgs1, &hal, err_id);
+    let mut e = [0u32; 8];
+    let link = link_desc_words(0, pa);
+    e[0] = link[0];
+    e[1] = link[1];
+    e[6] = 3 << 2; // hal_reo_entr_ring info1: RXDMA error code 3 (DECRYPT)
+    check!(err.produce(&io, &e), "rxdma err entry");
+    let n = dp.process_rxdma_err_for(&mut hal, &io, 1, 0, 64);
+    check!(
+        n == 2,
+        "Linux returns processed + 1 (quota-- post-decrement)"
+    );
+    check!(dp.stats.rxdma_error[3] == 1, "rxdma_error[DECRYPT]");
+    check!(ids(&dp, 1).len() == 15, "pdev 1 buffer freed and reposted");
+    check!(ids(&dp, 0).len() == 15, "pdev 0 refill untouched");
+    check!(
+        ids(&dp, 1).contains(&buf0),
+        "the freed id is the reposted one"
+    );
+
+    // Same buf_id on both radios resolves independently: distinct
+    // patterns written into each radio's first buffer must come back
+    // from that radio's take, and the sibling's buffer must survive.
+    let id0 = ids(&dp, 0)[0];
+    let id1 = ids(&dp, 1)[0];
+    let p0 = dp.pdevs().find(|p| p.mac_id == 0).expect("pdev 0");
+    p0.rx_refill_buf_ring
+        .bufs
+        .find(id0)
+        .expect("pdev 0 buf")
+        .mem
+        .wr32(0, 0xA0A7_0001);
+    let p1 = dp.pdevs().find(|p| p.mac_id == 1).expect("pdev 1");
+    p1.rx_refill_buf_ring
+        .bufs
+        .find(id1)
+        .expect("pdev 1 buf")
+        .mem
+        .wr32(0, 0xA1A7_0001);
+    let data = dp.take_rx_buf_for(1, id1).expect("pdev 1 take resolves");
+    check!(
+        u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == 0xA1A7_0001,
+        "pdev 1 take returns pdev 1's buffer"
+    );
+    let still = dp
+        .rx_buf_for(0, id0)
+        .expect("pdev 0 buffer survives the sibling take");
+    check!(still.mem.rd32(0) == 0xA0A7_0001, "pdev 0 buffer intact");
+
+    // Replenish targets the named pdev's ring: the taken pdev-1 slot
+    // comes back, pdev 0's map does not move.
+    check!(ids(&dp, 1).len() == 14, "pdev 1 take leaves a hole");
+    dp.replenish_refill_for(&mut hal, &io, 1, 1);
+    check!(ids(&dp, 1).len() == 15, "pdev 1 hole refilled");
+    check!(ids(&dp, 1).contains(&id1), "the taken id is reposted");
+    check!(ids(&dp, 0).len() == 15, "pdev 0 refill still untouched");
+
+    // Monitor-status reap on pdev 1's own status ring: the first DONE
+    // buffer is reaped, and the fresh buffers posted in its place
+    // carry PDEV_ID 1 (the owning pdev), not the RXDMA index.
+    let mut mon = msg_for(&msgs1, &hal, mon_id);
+    check!(mon.pending(&io) == 7, "7 of 8 status buffers posted");
+    let a = mon.consume(&io).unwrap();
+    let b = mon.consume(&io).unwrap();
+    phys_wr32(buf_addr_get(a[0], a[1]).0, 0x140 << 1); // HAL_RX_STATUS_BUFFER_DONE
+    phys_wr32(buf_addr_get(b[0], b[1]).0, 0);
+    let hp_before = hal.srng(mon_id).expect("mon ring").hp;
+    let mut budget = 8;
+    let n = dp.reap_mon_status_for(&mut hal, &io, 1, 0, &mut budget);
+    check!(n == 2, "two slots refilled");
+    check!(dp.stats.mon_status_reaped == 1, "one DONE buffer");
+    for off in [hp_before, hp_before + mon.esz] {
+        let cookie = field_get(BUFFER_ADDR_INFO1_SW_COOKIE, hal.desc_rd(mon_id, off, 1));
+        check!(
+            field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, cookie) == 1,
+            "fresh mon buffer carries PDEV_ID 1"
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_dp_service_multi_pdev
 );

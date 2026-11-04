@@ -1625,6 +1625,22 @@ impl Dp {
         self.pdev.iter().chain(self.extra_pdevs.iter())
     }
 
+    /// The allocated pdev with this `mac_id`, if any (`ab->pdevs[]` by
+    /// `pdev_id`, not by position: a pdev's array slot is its allocation
+    /// order, which only coincides with `mac_id` while pdev 0 is first).
+    pub fn pdev_mut(&mut self, mac_id: u32) -> Option<&mut PdevDp> {
+        if let Some(p) = self.pdev.as_mut().filter(|p| p.mac_id == mac_id) {
+            return Some(p);
+        }
+        self.extra_pdevs.iter_mut().find(|p| p.mac_id == mac_id)
+    }
+
+    /// Allocated pdev `mac_id`s in allocation order. A snapshot (not a
+    /// live iterator) because service loops mutate the pdevs they visit.
+    pub fn pdev_mac_ids(&self) -> Vec<u32> {
+        self.pdevs().map(|p| p.mac_id).collect()
+    }
+
     fn has_pdev(&self, mac_id: u32) -> bool {
         self.pdevs().any(|p| p.mac_id == mac_id)
     }
@@ -2627,29 +2643,43 @@ impl Dp {
         req - num_remain
     }
 
-    /// Post `n` buffers to the pdev's refill ring with the RX buffer
-    /// manager (the `ath11k_dp_rxbufs_replenish(.., rx_refill_buf_ring,
-    /// n, rx_buf_rbm)` every reap path ends with).
-    pub fn replenish_refill(&mut self, hal: &mut Hal, io: &impl ChipIo, n: u32) {
-        let Some(mut pdev) = self.pdev.take() else {
+    /// Post `n` buffers to the owning pdev's refill ring with the RX
+    /// buffer manager (the `ath11k_dp_rxbufs_replenish(..,
+    /// rx_refill_buf_ring, n, rx_buf_rbm)` every reap path ends with).
+    /// The pdev is taken out of its slot while replenishing so the
+    /// `&mut self` replenish helper does not borrow it twice, then put
+    /// back in the same slot (allocation order preserved).
+    pub fn replenish_refill_for(&mut self, hal: &mut Hal, io: &impl ChipIo, mac_id: u32, n: u32) {
+        let mgr = self.cfg.hal_params.rx_buf_rbm;
+        if self.pdev.as_ref().is_some_and(|p| p.mac_id == mac_id) {
+            let Some(mut pdev) = self.pdev.take() else {
+                return;
+            };
+            self.rxbufs_replenish(hal, io, mac_id, &mut pdev.rx_refill_buf_ring, n, mgr);
+            self.pdev = Some(pdev);
+            return;
+        }
+        let Some(idx) = self.extra_pdevs.iter().position(|p| p.mac_id == mac_id) else {
             return;
         };
-        let mgr = self.cfg.hal_params.rx_buf_rbm;
-        let mac_id = pdev.mac_id;
+        let mut pdev = self.extra_pdevs.remove(idx);
         self.rxbufs_replenish(hal, io, mac_id, &mut pdev.rx_refill_buf_ring, n, mgr);
-        self.pdev = Some(pdev);
+        self.extra_pdevs.insert(idx, pdev);
     }
 
-    /// Take the refill-ring buffer `buf_id` (`idr_find` + `idr_remove` +
-    /// `dma_unmap_single`), returning its full contents.
-    pub(super) fn take_rx_buf(&mut self, buf_id: u32) -> Option<Vec<u8>> {
-        self.take_rx_buf_frag(buf_id).map(|(d, _)| d)
+    /// Take the refill-ring buffer `buf_id` of the owning pdev
+    /// (`idr_find` + `idr_remove` + `dma_unmap_single`), returning its
+    /// full contents. The cookie's PDEV_ID selects the pdev: refill
+    /// `buf_id` spaces are per ring, so a search across pdevs would
+    /// resolve a colliding id to the wrong radio's buffer.
+    pub(super) fn take_rx_buf_for(&mut self, mac_id: u32, buf_id: u32) -> Option<Vec<u8>> {
+        self.take_rx_buf_frag_for(mac_id, buf_id).map(|(d, _)| d)
     }
 
-    /// [`Self::take_rx_buf`] + whether it is a reinjected reassembled
-    /// MPDU (`rxcb->is_frag`; its exact length is returned).
-    fn take_rx_buf_frag(&mut self, buf_id: u32) -> Option<(Vec<u8>, bool)> {
-        let pdev = self.pdev.as_mut()?;
+    /// [`Self::take_rx_buf_for`] + whether it is a reinjected
+    /// reassembled MPDU (`rxcb->is_frag`; its exact length is returned).
+    fn take_rx_buf_frag_for(&mut self, mac_id: u32, buf_id: u32) -> Option<(Vec<u8>, bool)> {
+        let pdev = self.pdev_mut(mac_id)?;
         let b = pdev.rx_refill_buf_ring.bufs.remove(buf_id)?;
         let len = b
             .frag_len
@@ -2662,7 +2692,35 @@ impl Dp {
     /// Posted RX buffer `buf_id` of the refill ring (tests / device
     /// models).
     pub fn rx_buf(&self, buf_id: u32) -> Option<&RxBuf> {
-        self.pdev.as_ref()?.rx_refill_buf_ring.bufs.find(buf_id)
+        self.rx_buf_for(0, buf_id)
+    }
+
+    /// Posted RX buffer `buf_id` of the owning pdev's refill ring
+    /// (tests / device models).
+    pub fn rx_buf_for(&self, mac_id: u32, buf_id: u32) -> Option<&RxBuf> {
+        self.pdevs()
+            .find(|p| p.mac_id == mac_id)?
+            .rx_refill_buf_ring
+            .bufs
+            .find(buf_id)
+    }
+
+    /// Count one reaped buffer for `mac_id` in a per-pdev tally. Reap
+    /// paths count takes per owning pdev, then replenish each pdev once
+    /// at the end (one ring write batch per radio, not per buffer).
+    fn bump_reaped(counts: &mut Vec<(u32, u32)>, mac_id: u32) {
+        if let Some(c) = counts.iter_mut().find(|(m, _)| *m == mac_id) {
+            c.1 += 1;
+        } else {
+            counts.push((mac_id, 1));
+        }
+    }
+
+    /// Replenish every pdev in a per-pdev tally once.
+    fn replenish_reaped(&mut self, hal: &mut Hal, io: &impl ChipIo, counts: &[(u32, u32)]) {
+        for (mac_id, n) in counts {
+            self.replenish_refill_for(hal, io, *mac_id, *n);
+        }
     }
 
     // ── TX ───────────────────────────────────────────────────────
@@ -3015,7 +3073,7 @@ impl Dp {
         };
         let id = r.ring_id;
         let mut list: VecDeque<RxSkb> = VecDeque::new();
-        let mut num_buffs_reaped = 0u32;
+        let mut reaped: Vec<(u32, u32)> = Vec::new();
         let mut total_msdu_reaped = 0u32;
         let mut done = false;
 
@@ -3029,11 +3087,11 @@ impl Dp {
                 if buf_id == 0 {
                     continue;
                 }
-                let Some((data, is_frag)) = self.take_rx_buf_frag(buf_id) else {
+                let Some((data, is_frag)) = self.take_rx_buf_frag_for(mac_id as u32, buf_id) else {
                     self.stats.rx_invalid_cookie += 1;
                     continue;
                 };
-                num_buffs_reaped += 1;
+                Self::bump_reaped(&mut reaped, mac_id as u32);
                 let push = field_get(HAL_REO_DEST_RING_INFO0_PUSH_REASON, d[7]);
                 if push != reo::PUSH_REASON_ROUTING_INSTRUCTION {
                     self.stats.hal_reo_error[ring] += 1;
@@ -3073,7 +3131,7 @@ impl Dp {
         if total_msdu_reaped == 0 {
             return (0, out);
         }
-        if num_buffs_reaped != 0 {
+        if !reaped.is_empty() {
             // ath11k_dp_rx_process_received_packets
             while let Some(msdu) = list.pop_front() {
                 match self.process_msdu(msdu, &mut list) {
@@ -3085,7 +3143,7 @@ impl Dp {
                     Err(e) => self.count_drop(e),
                 }
             }
-            self.replenish_refill(hal, io, num_buffs_reaped);
+            self.replenish_reaped(hal, io, &reaped);
         }
         (total_msdu_reaped, out)
     }
@@ -3413,6 +3471,7 @@ impl Dp {
         let quota = budget;
         let mut budget = budget;
         let mut tot_n_bufs_reaped = 0u32;
+        let mut reaped: Vec<(u32, u32)> = Vec::new();
         let mut drop = false;
 
         hal.access_begin(id);
@@ -3456,8 +3515,10 @@ impl Dp {
             }
             for c in cookies {
                 let buf_id = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, c);
-                if self.rx_err_buf(hal, io, &d, buf_id, drop) {
+                let mac_id = field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, c) as u32;
+                if self.rx_err_buf(hal, io, &d, mac_id, buf_id, drop) {
                     tot_n_bufs_reaped += 1;
+                    Self::bump_reaped(&mut reaped, mac_id);
                 }
             }
             if tot_n_bufs_reaped >= quota {
@@ -3469,7 +3530,7 @@ impl Dp {
         hal.access_end(io, id);
 
         if tot_n_bufs_reaped != 0 {
-            self.replenish_refill(hal, io, tot_n_bufs_reaped);
+            self.replenish_reaped(hal, io, &reaped);
         }
         tot_n_bufs_reaped
     }
@@ -3489,6 +3550,7 @@ impl Dp {
         let id = self.rx_rel_ring.ring_id;
         let mut budget = budget;
         let mut total = 0u32;
+        let mut reaped: Vec<(u32, u32)> = Vec::new();
         let mut list: VecDeque<RxSkb> = VecDeque::new();
         hal.access_begin(id);
         while budget > 0 {
@@ -3526,11 +3588,12 @@ impl Dp {
             };
             let buf_id = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, cookie);
             let mac_id = field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, cookie) as u8;
-            let Some(data) = self.take_rx_buf(buf_id) else {
+            let Some(data) = self.take_rx_buf_for(mac_id as u32, buf_id) else {
                 self.stats.rx_invalid_cookie += 1;
                 continue;
             };
             total += 1;
+            Self::bump_reaped(&mut reaped, mac_id as u32);
             budget -= 1;
             if push != reo::PUSH_REASON_ERR_DETECTED {
                 continue;
@@ -3546,7 +3609,7 @@ impl Dp {
         if total == 0 {
             return (0, out);
         }
-        self.replenish_refill(hal, io, total);
+        self.replenish_reaped(hal, io, &reaped);
 
         while let Some(skb) = list.pop_front() {
             let r = match skb.err_rel_src {
@@ -3633,21 +3696,24 @@ impl Dp {
         }))
     }
 
-    /// Linux `ath11k_dp_process_rxdma_err` for `mac_id`: count the error
-    /// code, free the MSDUs of each link descriptor, return the link
-    /// descriptor. Returns `budget - quota` as Linux does.
-    pub fn process_rxdma_err(
+    /// Linux `ath11k_dp_process_rxdma_err` for pdev `pdev_mac_id`,
+    /// RXDMA ring `rxdma_idx` within that pdev (Linux's per-`ar`
+    /// service: the group mask's bit selects the RXDMA ring, the `ar`
+    /// selects the pdev). Count the error code, free the MSDUs of each
+    /// link descriptor, return the link descriptor. Returns
+    /// `budget - quota` as Linux does. Each freed buffer is taken from
+    /// the pdev its cookie names and replenished to that pdev.
+    pub fn process_rxdma_err_for(
         &mut self,
         hal: &mut Hal,
         io: &impl ChipIo,
-        mac_id: u32,
+        pdev_mac_id: u32,
+        rxdma_idx: u32,
         budget: u32,
     ) -> u32 {
-        // ath11k_hw_mac_id_to_srng_id_qca6390 = mac_id
         let Some(ring) = self
-            .pdev
-            .as_ref()
-            .and_then(|p| p.rxdma_err_dst_ring.get(mac_id as usize))
+            .pdev_mut(pdev_mac_id)
+            .and_then(|p| p.rxdma_err_dst_ring.get(rxdma_idx as usize))
             .copied()
         else {
             return 0;
@@ -3655,6 +3721,7 @@ impl Dp {
         let id = ring.ring_id;
         let mut quota = budget as i64;
         let mut num_buf_freed = 0u32;
+        let mut reaped: Vec<(u32, u32)> = Vec::new();
         let mut returns: Vec<[u32; 2]> = Vec::new();
         hal.access_begin(id);
         loop {
@@ -3676,8 +3743,10 @@ impl Dp {
                 Some((cookies, _rbm)) => {
                     for c in cookies {
                         let buf_id = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, c);
-                        if self.take_rx_buf(buf_id).is_some() {
+                        let mac_id = field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, c) as u32;
+                        if self.take_rx_buf_for(mac_id, buf_id).is_some() {
                             num_buf_freed += 1;
+                            Self::bump_reaped(&mut reaped, mac_id);
                         } else {
                             self.stats.rx_invalid_cookie += 1;
                         }
@@ -3692,7 +3761,7 @@ impl Dp {
             let _ = self.link_desc_return(hal, io, b, HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
         }
         if num_buf_freed != 0 {
-            self.replenish_refill(hal, io, num_buf_freed);
+            self.replenish_reaped(hal, io, &reaped);
         }
         (budget as i64 - quota) as u32
     }
@@ -3730,24 +3799,64 @@ impl Dp {
         out
     }
 
-    /// Linux `ath11k_dp_rx_reap_mon_status_ring` for RXDMA `mac_id`
-    /// (non-full-monitor): decode each completed status buffer's peer RSSI,
-    /// per-chain RSSI, and RX duration, then recycle it. The parser has the
-    /// same per-buffer scope as `ath11k_hal_rx_parse_mon_status`; it never
-    /// treats an arbitrary raw DMA word as a completed PPDU.
-    pub fn reap_mon_status(
+    /// Linux `ath11k_dp_rx_reap_mon_status_ring` for pdev
+    /// `pdev_mac_id`, RXDMA ring `rxdma_idx` within that pdev
+    /// (non-full-monitor): decode each completed status buffer's peer
+    /// RSSI, per-chain RSSI, and RX duration, then recycle it. The
+    /// parser has the same per-buffer scope as
+    /// `ath11k_hal_rx_parse_mon_status`; it never treats an arbitrary
+    /// raw DMA word as a completed PPDU. Fresh buffers posted here
+    /// carry the owning pdev's `mac_id` as PDEV_ID (the
+    /// `rxbufs_replenish` convention); the refill ring's own `buf_id`
+    /// map is what consumes them, never the cookie.
+    pub fn reap_mon_status_for(
         &mut self,
         hal: &mut Hal,
         io: &impl ChipIo,
-        mac_id: u32,
+        pdev_mac_id: u32,
+        rxdma_idx: u32,
         budget: &mut u32,
     ) -> u32 {
-        let Some(mut pdev) = self.pdev.take() else {
-            return 0;
+        // Take the pdev out of its slot so the ring helper can borrow it
+        // while `self` stays borrowed for stats; put it back in the same
+        // slot afterwards (allocation order preserved).
+        let (slot, mut pdev) = if self.pdev.as_ref().is_some_and(|p| p.mac_id == pdev_mac_id) {
+            let Some(p) = self.pdev.take() else {
+                return 0;
+            };
+            (None, p)
+        } else {
+            let Some(idx) = self
+                .extra_pdevs
+                .iter()
+                .position(|p| p.mac_id == pdev_mac_id)
+            else {
+                return 0;
+            };
+            (Some(idx), self.extra_pdevs.remove(idx))
         };
+        let reaped = self.reap_mon_status_on(&mut pdev, hal, io, pdev_mac_id, rxdma_idx, budget);
+        match slot {
+            None => self.pdev = Some(pdev),
+            Some(idx) => self.extra_pdevs.insert(idx, pdev),
+        }
+        reaped
+    }
+
+    /// The monitor-status reap over one pdev's ring (see
+    /// [`Self::reap_mon_status_for`]).
+    fn reap_mon_status_on(
+        &mut self,
+        pdev: &mut PdevDp,
+        hal: &mut Hal,
+        io: &impl ChipIo,
+        pdev_mac_id: u32,
+        rxdma_idx: u32,
+        budget: &mut u32,
+    ) -> u32 {
         let mgr = self.cfg.hal_params.rx_buf_rbm;
         let mut reaped = 0;
-        if let Some(ring) = pdev.rx_mon_status_refill_ring.get_mut(mac_id as usize) {
+        if let Some(ring) = pdev.rx_mon_status_refill_ring.get_mut(rxdma_idx as usize) {
             let id = ring.refill_buf_ring.ring_id;
             hal.access_begin(id);
             while *budget > 0 {
@@ -3821,7 +3930,7 @@ impl Dp {
                         break;
                     }
                     Some((buf_id, p)) => {
-                        let cookie = field_prep(DP_RXDMA_BUF_COOKIE_PDEV_ID, mac_id)
+                        let cookie = field_prep(DP_RXDMA_BUF_COOKIE_PDEV_ID, pdev_mac_id)
                             | field_prep(DP_RXDMA_BUF_COOKIE_BUF_ID, buf_id);
                         hal.desc_wr(id, off, &buf_addr_words(p, cookie, mgr));
                         hal.src_get_next_entry(id);
@@ -3831,7 +3940,6 @@ impl Dp {
             }
             hal.access_end(io, id);
         }
-        self.pdev = Some(pdev);
         reaped
     }
 
@@ -3935,6 +4043,11 @@ impl Dp {
     }
 
     /// Linux `ath11k_dp_service_srng` for ext-IRQ group `grp_id`.
+    /// Shared rings (TX completion, REO exception, WBM release, REO
+    /// destination, REO status) run once; the per-RXDMA parts run once
+    /// per allocated pdev with the same group mask, in allocation order
+    /// — Linux services each `ar` with its own mask copy, and the
+    /// mask's bits index RXDMA rings within one pdev, not pdevs.
     pub fn service_srng(
         &mut self,
         hal: &mut Hal,
@@ -3979,29 +4092,36 @@ impl Dp {
             o.rx.extend(rx);
             account!(n);
         }
+        // Per-pdev parts (see the doc comment): single-pdev parts
+        // execute exactly once, as before.
+        let pdevs = self.pdev_mac_ids();
         if mask.rx_mon_status[grp_id] != 0 {
-            for j in 0..self.cfg.num_rxdma_per_pdev {
-                if mask.rx_mon_status[grp_id] & (1 << j) != 0 {
-                    let mut b = budget as u32;
-                    let n = self.reap_mon_status(hal, io, j, &mut b);
-                    account!(n);
+            for mac_id in &pdevs {
+                for j in 0..self.cfg.num_rxdma_per_pdev {
+                    if mask.rx_mon_status[grp_id] & (1 << j) != 0 {
+                        let mut b = budget as u32;
+                        let n = self.reap_mon_status_for(hal, io, *mac_id, j, &mut b);
+                        account!(n);
+                    }
                 }
             }
         }
         if mask.reo_status[grp_id] != 0 {
             o.reo_status = self.process_reo_status(hal, io);
         }
-        for j in 0..self.cfg.num_rxdma_per_pdev {
-            if mask.rxdma2host[grp_id] & (1 << j) != 0 {
-                let n = self.process_rxdma_err(hal, io, j, budget as u32);
-                budget -= n as i64;
-                o.work_done += n;
-            }
-            if budget <= 0 {
-                return o;
-            }
-            if mask.host2rxdma[grp_id] & (1 << j) != 0 {
-                self.replenish_refill(hal, io, 0);
+        for mac_id in &pdevs {
+            for j in 0..self.cfg.num_rxdma_per_pdev {
+                if mask.rxdma2host[grp_id] & (1 << j) != 0 {
+                    let n = self.process_rxdma_err_for(hal, io, *mac_id, j, budget as u32);
+                    budget -= n as i64;
+                    o.work_done += n;
+                }
+                if budget <= 0 {
+                    return o;
+                }
+                if mask.host2rxdma[grp_id] & (1 << j) != 0 {
+                    self.replenish_refill_for(hal, io, *mac_id, 0);
+                }
             }
         }
         o
