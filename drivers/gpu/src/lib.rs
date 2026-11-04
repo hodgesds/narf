@@ -211,6 +211,8 @@ pub mod amdgpu_dcn30_hubbub;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_mst;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_dcn30_scl;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_takeover;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_watermarks;

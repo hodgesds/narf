@@ -11525,6 +11525,23 @@ fabric-adjusted urgent latency) in `amdgpu_dml::Fx` fixed point. Register
 fields are Linux's `(unsigned int)` truncations and are refused (not wrapped)
 when they exceed the DCN3.0 mask; everything fails before hardware is touched.
 
+`amdgpu_dcn30_scl::build(h_active, v_active, (odm_index, odm_count), src:
+Rect, dst: Rect) -> Result<ScalerData, Error>` is `resource_build_scaling_params`
+as DCN3.0 runs it (`use_spl` off) for one pipe of an amdgpu_dm-placed linear
+RGB primary on a stream mapped 1:1 onto its timing: `calculate_recout` (the
+CRTC rectangle clipped to the stream and to the ODM slice of
+`odm_slice(h_active, v_active, (index, count))`, relative to it),
+`calculate_scaling_ratios` (`dc_fixpt` src/dst truncated to U3.19),
+`dpp3_get_optimal_number_of_taps` with zeroed scaling quality (first for a
+100x100 dummy viewport, then the real one; LB_MEMORY_CONFIG_0 partitions,
+`lb_partitions(viewport_w, recout_w)`, `max_downscale_src_width` 7680,
+identity ratios take one tap) and `calculate_init_and_vp` (initial phase
+`trunc19((ratio + taps + 1) / 2 + frac)`, the viewport backed off for the
+filter, clipped to the source), then the 12-pixel `MIN_VIEWPORT_SIZE`
+clamp. `ScalerData { h_active, v_active, recout, viewport, ratio_h, ratio_v,
+init_h, init_v, h_taps, v_taps }` (RGB: DC's chroma copies equal luma).
+`Error::{Invalid, Empty (nothing on this slice), Taps (DC's refusal)}`.
+
 `Soc::from_board(levels, channels, width, dchub_refclk)` builds the top
 bounding-box state from the DAL DPM table (DCFCLK doubling as fabric clock,
 `memclk*16`, DENTIST-reachable DISP/DPP ceilings, PHY ceiling, VCO).
