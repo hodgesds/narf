@@ -431,6 +431,7 @@ fn dml_stream(
         }),
         phy_khz,
         odm: dml30::Odm::None,
+        scale: None,
     }
 }
 

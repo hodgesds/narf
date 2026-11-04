@@ -11475,9 +11475,9 @@ DMUB (`dc_is_dmub_outbox_supported` is false outside DCN3.1 DPIA/GC11 unless
 ### Navi 22 DCN3.0 mode math
 
 `amdgpu_dml30::plan_joint(&[Stream], &Soc) -> Result<JointPlan, Error>` is the
-DCN3.0 admission of a whole context (one to six streams, one unscaled linear
-RGB plane each; GPUVM/HostVM, DCC, dynamic metadata, writeback and MPC combine
-off): `dml30_ModeSupportAndSystemConfigurationFull`'s ODM choice per stream
+DCN3.0 admission of a whole context (one to six streams, one linear RGB
+plane each, positioned and scaled through the 4:4:4 RGB DSCL; GPUVM/HostVM,
+DCC, dynamic metadata, writeback and MPC combine off): `dml30_ModeSupportAndSystemConfigurationFull`'s ODM choice per stream
 (`Odm::TwoToOne` when one pipe's DISPCLK exceeds the DFS-rounded ceiling or a
 DSC line is wider than 5184; 4:1, odd widths and more than six pipes are
 refused), ROB and vertical-active bandwidth support (60% SDP / 40% DRAM), then
@@ -11489,9 +11489,23 @@ multi-plane DRAM clock change margin (SynchronizedVBlank false: no OTG sync)
 and stutter critical plane, one watermark set, DSC delay (`dscceComputeDelay`)
 and ODM after-scaler allowance — and `display_rq_dlg_calc_30.c` per pipe (an
 ODM slice's viewport, swath and blank end). `Stream { config, dsc:
-Option<Dsc { slices, bits_per_pixel_x16 }>, phy_khz, odm }` (`Stream::tmds(config)`
-for 8-bpc TMDS; `odm` is the least ODM the caller drives, which mode support
-still checks); `JointPlan { prefetch_mode, clocks, watermarks, hubbub,
+Option<Dsc { slices, bits_per_pixel_x16 }>, phy_khz, odm, scale:
+Option<Scale { h_ratio, v_ratio, recout_width, recout_height }> }`
+(`Stream::tmds(config)` for 8-bpc TMDS, unscaled; `odm` is the least ODM the
+caller drives, which mode support still checks). `scale` is the plane's DSCL
+as `resource_build_scaling_params` leaves it (U3.19 source/destination
+ratios, the whole plane's recout; the taps are `Plane::{h_taps, v_taps}`);
+None is an unscaled plane whose recout is its viewport. Every DML30 term the
+scaler moves follows Linux: `ScaleRatioAndTapsSupport` (one tap each on an
+identity ratio, else even horizontal taps, at most 6:1 and no ratio above
+its taps — `Unsupported`), `PSCL_THROUGHPUT_LUMA` and
+`DPPCLKUsingSingleDPPLuma` (a plane one pipe per ODM slice cannot clock is
+refused: no MPC combine), the line-buffer swath limit, `ReadBandwidthPlaneLuma`
+and cursor bandwidth times VRatio, deep-sleep DCFCLK, the scaler's DPP delay
+(`scl_enable`), `CalculatePrefetchSourceLines`, the urgent burst factors,
+the p-state margin's line-buffer and DET hiding, and the DLG/TTU's
+`hscale_pixel_rate`, recout-paced delivery, PTE row per destination line and
+cursor pacing. A recout outside the active area is `Invalid`; `JointPlan { prefetch_mode, clocks, watermarks, hubbub,
 dram_clock_change, urgent_bandwidth_thousandths, planes: Vec<PlanePlan { odm,
 geometry, prefetch, dppclk_khz, dsc_delay, pipes: [Option<PipePlan {
 viewport_x, viewport_width, registers, cursor }>; 2] }> }`. The prefetch-mode
