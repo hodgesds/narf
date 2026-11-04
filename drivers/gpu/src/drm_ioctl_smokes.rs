@@ -4397,7 +4397,7 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
     // drm_mode_getfb2: the master gets a new handle of the framebuffer's BO
     // in its own table (GEM_CLOSE of it leaves its ADDFB handle alone);
     // another open gets 0.
-    let getfb = |open: u64, fb: u32, v2: bool| {
+    let getfb_as = |open: u64, fb: u32, v2: bool, sys_admin: bool| {
         let mut arg = [0u8; 104];
         arg[0..4].copy_from_slice(&fb.to_le_bytes());
         let cmd = if v2 {
@@ -4411,6 +4411,7 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
             cmd,
             arg.as_mut_ptr() as usize,
             &gem,
+            sys_admin,
         );
         let at = if v2 { 20 } else { 24 };
         (
@@ -4419,6 +4420,7 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
             arg,
         )
     };
+    let getfb = |open: u64, fb: u32, v2: bool| getfb_as(open, fb, v2, false);
     let (Some(Ok(0)), handle, arg) = getfb(OWNER, fa, true) else {
         return TestResult::Fail("GETFB2 by the master");
     };
@@ -4448,6 +4450,13 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
         )
     {
         return TestResult::Fail("GETFB2 handle for a non-master, or unknown fb");
+    }
+    // CAP_SYS_ADMIN gets one without master, as drm_mode_getfb2_ioctl.
+    let (Some(Ok(0)), admin, _) = getfb_as(SMOKE_MASTER_ID, fa, true, true) else {
+        return TestResult::Fail("GETFB2 by CAP_SYS_ADMIN");
+    };
+    if admin == 0 || !gem.remove(admin) {
+        return TestResult::Fail("GETFB2 gave CAP_SYS_ADMIN no handle");
     }
     let show = |fb: u32| {
         let card = ms.lock();

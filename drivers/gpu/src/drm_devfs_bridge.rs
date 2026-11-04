@@ -597,6 +597,8 @@ impl FileOps for DriCardFile {
                     cmd,
                     arg,
                     &self.amdgpu_gem,
+                    // CAP_SYS_ADMIN = 21.
+                    narf_filesystem::caller_capable(21),
                 ) {
                     return result;
                 }

@@ -4652,9 +4652,9 @@ fn handle_getfb(
 }
 
 /// DRM_IOCTL_MODE_GETFB / GETFB2 on the native amdgpu card, with the GEM
-/// handles drm_mode_getfb(2) creates: for the current master (Linux also
-/// for CAP_SYS_ADMIN, which NARF has no notion of) a new handle in the
-/// caller's own table for the framebuffer's BO (drm_gem_handle_create, one
+/// handles drm_mode_getfb(2) creates: for the current master or a caller
+/// with CAP_SYS_ADMIN (`sys_admin`, `capable()` in the initial user
+/// namespace) a new handle in the caller's own table for the framebuffer's BO (drm_gem_handle_create, one
 /// handle shared by both planes of a two-plane format); 0 for anyone else,
 /// and for a framebuffer without an amdgpu BO. `None` for other requests.
 pub fn amdgpu_getfb_bo(
@@ -4663,6 +4663,7 @@ pub fn amdgpu_getfb_bo(
     cmd: u32,
     arg: usize,
     gem: &crate::amdgpu_gem::GemState,
+    sys_admin: bool,
 ) -> Option<Result<u64, FsError>> {
     let v2 = match cmd {
         c if c == drm_uapi::iowr(drm_uapi::DRM_IOCTL_BASE, 0xAD, drm_uapi::SZ_DRM_MODE_FB_CMD) => {
@@ -4686,7 +4687,7 @@ pub fn amdgpu_getfb_bo(
         let fb_id = u32::from_le_bytes(unsafe { copy_in(arg, 4)? }[..4].try_into().unwrap());
         let object = {
             let card = mode_state.lock();
-            if !card.is_master(open_id) {
+            if !card.is_master(open_id) && !sys_admin {
                 return Ok(0);
             }
             match card.framebuffer(fb_id).ok().and_then(|fb| {
