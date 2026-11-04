@@ -970,6 +970,9 @@ async unsafe fn light(
     restart_vblank();
     publish_console(boot);
     crate::amdgpu_navi22_kms::publish();
+    if back.is_ok() {
+        present_committed_again();
+    }
     Ok(output)
 }
 
@@ -1828,6 +1831,11 @@ struct PresentSlot {
     geometry: narf_lib::sync::IrqSafeSpinLock<Option<GenericFb>>,
     /// The client framebuffer the pipe may still fetch.
     shown: narf_lib::sync::IrqSafeSpinLock<frame_copy::ShownPin>,
+    /// The primary DRM last committed (its ticket and damage cleared), shown
+    /// again on the new pipe after a relight: amdgpu_dm's modeset commit
+    /// programs its new stream with the committed plane, and a compositor
+    /// does not repaint an unchanged frame. Dropped at lastclose.
+    committed: narf_lib::sync::IrqSafeSpinLock<Option<Frame>>,
     /// Trace counters: frames scanned out in place, frames copied, and
     /// their summed present time.
     direct: AtomicU64,
@@ -1843,6 +1851,7 @@ static PRESENT: PresentSlot = PresentSlot {
     damage: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_present_damage::Damage::new()),
     geometry: narf_lib::sync::IrqSafeSpinLock::new(None),
     shown: narf_lib::sync::IrqSafeSpinLock::new(frame_copy::ShownPin::new()),
+    committed: narf_lib::sync::IrqSafeSpinLock::new(None),
     direct: AtomicU64::new(0),
     copied: AtomicU64::new(0),
     present_ns: AtomicU64::new(0),
@@ -1922,6 +1931,9 @@ async unsafe fn release_client_scanout(boot: &mut boot::ColdBoot) -> bool {
 /// drm_fb_helper's restore on lastclose: take the pipe off the closed
 /// client's framebuffer (its pin goes after that flip latches).
 pub fn release_client_scanout_async() {
+    // The closed client's frame is not shown again by a later relight.
+    let dropped = PRESENT.committed.lock().take();
+    drop(dropped);
     narf_scheduler::spawn(async {
         // A present may hold an armed flip (OWNER released while it
         // latches); returning to the owned surface is refused until it
@@ -2053,6 +2065,7 @@ pub(crate) fn present_damaged(
         return false;
     };
     frame.damage = damage;
+    *PRESENT.committed.lock() = Some(committed_copy(&frame));
     {
         let mut next = PRESENT.next.lock();
         frame.ticket = ticket.max(next.as_ref().and_then(|f| f.ticket));
@@ -2065,6 +2078,34 @@ pub(crate) fn present_damaged(
         narf_scheduler::spawn(presenter());
     }
     true
+}
+
+/// `frame` as the committed state a relight shows again: no event to
+/// complete, every row to copy.
+fn committed_copy(frame: &Frame) -> Frame {
+    Frame {
+        ticket: None,
+        damage: None,
+        ..frame.clone()
+    }
+}
+
+/// After a relight lit the pipe on its cleared owned surface, queue the
+/// committed primary again unless a newer frame is already waiting.
+fn present_committed_again() {
+    let Some(frame) = PRESENT.committed.lock().clone() else {
+        return;
+    };
+    {
+        let mut next = PRESENT.next.lock();
+        if next.is_some() {
+            return;
+        }
+        *next = Some(frame);
+    }
+    if !PRESENT.presenting.swap(true, Ordering::AcqRel) {
+        narf_scheduler::spawn(presenter());
+    }
 }
 
 async fn presenter() {

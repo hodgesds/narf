@@ -567,6 +567,27 @@ mod tests {
         navi22_placed_primary_composes_and_is_not_direct
     );
 
+    /// A relight lights the pipe on its cleared owned surface; the committed
+    /// primary is shown again from a copy that completes no event and
+    /// copies every row (the compositor will not repaint an unchanged frame).
+    fn navi22_committed_frame_is_shown_again_after_relight() -> TestResult {
+        let mut frame = Frame::from_plane(
+            PlaneFrame::linear(0x10_0000, 256, 64, 16, 0x3432_5258),
+            Some(7),
+        )
+        .unwrap();
+        frame.damage = Some(3..5);
+        let again = super::super::committed_copy(&frame);
+        if again.ticket.is_some() || again.damage.is_some() || again.phys != frame.phys {
+            return TestResult::Fail("committed copy keeps the event or damage");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_committed_frame_is_shown_again_after_relight
+    );
+
     fn navi22_direct_scanout_eligibility() -> TestResult {
         use narf_graphics_driver::generic::GenericFb;
         let fixture = Fixture::new();
