@@ -2106,6 +2106,11 @@ pub(crate) fn reset_invalid_line() {
     LAST_INVALID_LINE.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// The source line [`invalid_at`] last recorded (0: none since the reset).
+pub(crate) fn last_invalid_line() -> u32 {
+    LAST_INVALID_LINE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Stateful card dispatcher used by a real DRM open file.
 ///
 /// Bring-up visibility: an EINVAL from any card ioctl is logged once per
