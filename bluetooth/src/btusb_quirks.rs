@@ -217,6 +217,12 @@ pub fn firmware_paths(quirk: Quirk) -> Vec<(&'static str, Option<&'static str>)>
             out.push(("rtl8852au_fw.bin", Some("rtl8852au_config.bin")));
             out.push(("rtl8852bu_fw.bin", Some("rtl8852bu_config.bin")));
             out.push(("rtl8761bu_fw.bin", Some("rtl8761bu_config.bin")));
+            // 8852C USB entry and 8822C USB entry in Linux's
+            // `ic_info` table; the loader selects by USB product
+            // id, so these names must be resolvable even though
+            // no earlier lane needed them.
+            out.push(("rtl8852cu_fw.bin", Some("rtl8852cu_config.bin")));
+            out.push(("rtl8822cu_fw.bin", Some("rtl8822cu_config.bin")));
         }
         Quirk::QualcommWcn6855 => {
             // USB rampatch + NVM pairs. Runtime code selects by the
