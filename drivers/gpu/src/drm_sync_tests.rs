@@ -802,8 +802,8 @@ fn sync_timeline_cap() -> TestResult {
     let get_cap = 0xc010_640c;
     if crate::drm_ioctl_bridge::amdgpu_get_cap(get_cap, b.as_mut_ptr() as usize) != Some(Ok(0))
         || u64::from_le_bytes(b[8..16].try_into().unwrap()) != 1
-        || crate::drm::ioctl::cap_value(cap) != 0
-        || crate::drm_ioctl_bridge::amdgpu_cap_value(crate::drm::ioctl::drm_cap::SYNCOBJ) != 1
+        || crate::drm::ioctl::cap_value(cap) != Some(0)
+        || crate::drm_ioctl_bridge::amdgpu_cap_value(crate::drm::ioctl::drm_cap::SYNCOBJ) != Some(1)
     {
         return TestResult::Fail("SYNCOBJ_TIMELINE cap");
     }

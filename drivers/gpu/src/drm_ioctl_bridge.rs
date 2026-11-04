@@ -2033,7 +2033,15 @@ fn map_err(e: DrmIoctlError) -> FsError {
     match e {
         DrmIoctlError::UnknownCmd | DrmIoctlError::BadSize => FsError::Unsupported,
         DrmIoctlError::PermissionDenied(_) => FsError::PermissionDenied,
-        DrmIoctlError::UnknownConnector | DrmIoctlError::Card(_) => invalid_at(line!()),
+        // drm_mode_object_find: an unknown object id is -ENOENT.
+        DrmIoctlError::UnknownConnector
+        | DrmIoctlError::Card(
+            crate::drm::card::CardError::UnknownCrtc
+            | crate::drm::card::CardError::UnknownConnector
+            | crate::drm::card::CardError::UnknownEncoder
+            | crate::drm::card::CardError::UnknownFb,
+        ) => FsError::NotFound,
+        DrmIoctlError::Invalid | DrmIoctlError::Card(_) => invalid_at(line!()),
     }
 }
 
@@ -8418,7 +8426,7 @@ pub fn without_kms(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, 
             // SAFETY: `arg` is the ioctl struct pointer; 16 bytes.
             let mut b = unsafe { copy_in(arg, 16)? };
             let cap = u64::from_le_bytes(b[0..8].try_into().unwrap());
-            let value = amdgpu_cap_value(cap);
+            let value = amdgpu_cap_value(cap).ok_or(invalid_at(line!()))?;
             b[8..16].copy_from_slice(&value.to_le_bytes());
             // SAFETY: as above.
             unsafe { copy_out(arg, &b)? };
@@ -8431,15 +8439,17 @@ pub fn without_kms(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, 
 /// `DRM_IOCTL_GET_CAP` for amdgpu: the generic table, plus
 /// `DRM_CAP_SYNCOBJ_TIMELINE` = 1 (amdgpu has `DRIVER_SYNCOBJ_TIMELINE`).
 #[cfg(feature = "amdgpu")]
-pub fn amdgpu_cap_value(cap: u64) -> u64 {
-    // amdgpu: DRIVER_SYNCOBJ_TIMELINE, and format modifiers are supported
-    // (!fb_modifiers_not_supported); only LINEAR scans out natively.
-    if cap == crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE
-        || cap == crate::drm::ioctl::drm_cap::ADDFB2_MODIFIERS
-    {
-        1
-    } else {
-        crate::drm::ioctl::cap_value(cap)
+pub fn amdgpu_cap_value(cap: u64) -> Option<u64> {
+    use crate::drm::ioctl::drm_cap;
+    match cap {
+        // amdgpu: DRIVER_SYNCOBJ_TIMELINE, and format modifiers are
+        // supported (!fb_modifiers_not_supported); only LINEAR scans out
+        // natively.
+        drm_cap::SYNCOBJ_TIMELINE | drm_cap::ADDFB2_MODIFIERS => Some(1),
+        // amdgpu_dm_mode_config_init: preferred_depth 24, prefer_shadow 1.
+        drm_cap::DUMB_PREFERRED_DEPTH => Some(24),
+        drm_cap::DUMB_PREFER_SHADOW => Some(1),
+        _ => crate::drm::ioctl::cap_value(cap),
     }
 }
 
@@ -8457,12 +8467,17 @@ pub fn amdgpu_get_cap(cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
         Err(e) => return Some(Err(e)),
     };
     let cap = u64::from_le_bytes(b[0..8].try_into().unwrap());
-    if cap != crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE
-        && cap != crate::drm::ioctl::drm_cap::ADDFB2_MODIFIERS
-    {
+    if !matches!(
+        cap,
+        crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE
+            | crate::drm::ioctl::drm_cap::ADDFB2_MODIFIERS
+            | crate::drm::ioctl::drm_cap::DUMB_PREFERRED_DEPTH
+            | crate::drm::ioctl::drm_cap::DUMB_PREFER_SHADOW
+    ) {
         return None;
     }
-    b[8..16].copy_from_slice(&amdgpu_cap_value(cap).to_le_bytes());
+    let value = amdgpu_cap_value(cap)?;
+    b[8..16].copy_from_slice(&value.to_le_bytes());
     // SAFETY: as above.
     Some(unsafe { copy_out(arg, &b) }.map(|()| 0))
 }

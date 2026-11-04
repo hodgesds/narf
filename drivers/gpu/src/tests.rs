@@ -7019,7 +7019,7 @@ fn smoke_drm_perm_master_only_blocks_authed() -> TestResult {
     // A primary-node fd that is authenticated but NOT master must be
     // blocked from DRM_MASTER ioctls (ADDFB2).
     use crate::drm::ioctl::{dispatch, DrmIoctlError};
-    use crate::drm::render_node::{DrmFileCtx, MinorType, PermError};
+    use crate::drm::render_node::{DrmFileCtx, MinorType};
     let mut card = make_test_card_for_ioctl();
     let authed = DrmFileCtx {
         minor: MinorType::Primary,

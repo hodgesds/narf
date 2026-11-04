@@ -303,7 +303,7 @@ fn smoke_intel_x_tiled_layout_extent_metadata_test_only_and_arch_refusal() -> Te
         intel_modifiers_cap(&mode, drm_uapi::DRM_IOCTL_GET_CAP, u64::MAX, &capability),
         None
     );
-    assert_eq!(crate::drm::ioctl::cap_value(0x10), 0);
+    assert_eq!(crate::drm::ioctl::cap_value(0x10), Some(0));
     assert!(intel_primary_formats_blob(&mode.lock(), INTEL_PRIMARY_FORMATS_BLOB).is_none());
     assert!(frame(&mode, 7, true, false).is_err());
     mode.lock().intel_x_tiled = true;
