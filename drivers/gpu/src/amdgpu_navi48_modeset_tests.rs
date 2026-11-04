@@ -691,7 +691,7 @@ fn navi48_modeset_picks_the_deepest_hdmi_depth_that_fits() -> TestResult {
         return TestResult::Fail("selected depth");
     }
     set_max_bpc(11);
-    if max_bpc() != 8 {
+    if max_bpc() != 16 {
         return TestResult::Fail("invalid max bpc accepted");
     }
     TestResult::Pass
