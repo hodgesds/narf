@@ -525,7 +525,7 @@ impl CableDiscoveryPort {
         if got_target != target {
             return Ok(AwaitOutcome::StillWaiting { polls });
         }
-        let Some((_h, objs)) = narf_usbpd::message::decode_message(&bytes) else {
+        let Some((_h, mut objs)) = narf_usbpd::message::decode_message(&bytes) else {
             return Ok(AwaitOutcome::StillWaiting { polls });
         };
         if _h.msg_type != DataMsg::VendorDefined as u8 || objs.is_empty() {
@@ -539,7 +539,14 @@ impl CableDiscoveryPort {
             return Ok(AwaitOutcome::StillWaiting { polls });
         }
         match vh.command_type {
-            CommandType::Ack => Ok(AwaitOutcome::Ack(objs)),
+            // Strip the VDM header: decode_plug expects objs[0]
+            // to be the ID Header VDO, and the message's first
+            // object is the VDM header itself. Without this strip
+            // the VDM header DWORD (SVID 0xFF01) decodes as an ID
+            // Header with product type 7, which matches no cable
+            // plug type, so decode_plug returns None and every
+            // ACK walk lands Failed.
+            CommandType::Ack => Ok(AwaitOutcome::Ack(objs.split_off(1))),
             CommandType::Nak => Ok(AwaitOutcome::Nak),
             // Busy: keep waiting; the plug will answer or we time out.
             _ => Ok(AwaitOutcome::StillWaiting { polls }),
@@ -1077,7 +1084,9 @@ pub(crate) mod tests {
             return TestResult::Fail("wrong-target ACK must not store an identity");
         }
         // No further answers: poll to the budget → NotPresent, and
-        // no retransmit storm (exactly one transmit total).
+        // no retransmit storm (exactly one SOP' Discover transmit;
+        // the port drive's own SOP Request is unrelated traffic
+        // and must not count against cable discovery).
         for _ in 0..=MAX_RESPONSE_POLLS {
             let _ = cable.step(&cap).unwrap();
         }
@@ -1085,7 +1094,13 @@ pub(crate) mod tests {
             Ok(CableStep::NotPresent) => {}
             _ => return TestResult::Fail("poll budget exhaustion should land NotPresent"),
         }
-        if chip.tx_targets().len() != 1 {
+        if chip
+            .tx_targets()
+            .iter()
+            .filter(|t| **t == SopTarget::SopPrime)
+            .count()
+            != 1
+        {
             return TestResult::Fail("no-response path must not retransmit");
         }
         TestResult::Pass
