@@ -262,6 +262,27 @@ pub fn capture() {
 // head is the judge: if the census smoke fails there, this
 // correction is wrong, not the snapshot.
 //
+// CORRECTION (2026-11-04, CI run 41797368770 on #1045's rebased head
+// 5eb6e634c): the 2026-11-03 refresh placed `rtw88-8821cu-usb-ids`
+// and `rtw88-8822bu-usb-ids` directly after `rtw88`, in
+// `usb_driver::register` order — but that is registration-site order,
+// not snapshot order. Those names are registered during EXECUTION of
+// the `rtw88` initcall (drivers/wireless/src/lib.rs registers `rtw88`
+// as an initcall whose body calls `rtw88::register()`), and
+// `narf_init::register` appends while `run_stage` runs from a
+// snapshot, so execution-time registrations land at the TAIL of the
+// stage vec, in parent-execution order, and are only visible to
+// `capture()` after boot init. The snapshot's first divergence was
+// subsys[46] (expected `rtw88-8821cu-usb-ids`, got `rtw89`). The two
+// names move to the tail directly after `rtl8xxxu-usb-ids` — the
+// other execution-time append whose parent (`rtl8xxxu`) executes
+// before `rtw88` — and before the later execution appends (the
+// `ipmi`/`itco_wdt` second registrations, `pl011`, and the
+// Device-stage `psmouse`). Rule for future refreshes: a name
+// registered from an initcall body goes at the tail in parent order,
+// never at its registration-site position. No set change: still 163
+// Subsys, 268 total.
+//
 // The recording is reality, not an ideal: on x86_64 the `arch` stage
 // is empty and `ipmi`, `itco_wdt`, and `usb-r8152` each register
 // twice at Subsys (pre-existing duplicate registrations; the census
@@ -328,8 +349,6 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "rtl8xxxu",
         "rtlwifi",
         "rtw88",
-        "rtw88-8821cu-usb-ids",
-        "rtw88-8822bu-usb-ids",
         "rtw89",
         "brcmfmac",
         "ath11k",
@@ -441,6 +460,8 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "fw_cfg-probe",
         "csprng-seed",
         "rtl8xxxu-usb-ids",
+        "rtw88-8821cu-usb-ids",
+        "rtw88-8822bu-usb-ids",
         "ipmi",
         "itco_wdt",
         "pl011",
