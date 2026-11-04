@@ -47,10 +47,26 @@ pub struct IntelHda {
     codecs: Vec<CodecInfo>,
     pub(super) graphs: Vec<Codec>,
     pub(super) outputs: Vec<super::routing::Path>,
-    pub(super) input: Option<super::routing::Path>,
+    /// Currently selected capture path. Behind a lock because the
+    /// 100 ms jack loop re-selects it from `&self` while streams
+    /// read it at configure time; `inputs` itself is immutable
+    /// after discovery.
+    pub(super) input: IrqSafeSpinLock<Option<super::routing::Path>>,
+    /// Every discovered analog input path, in preference order (Mic >
+    /// Line > AUX). `input` is the currently selected one; jack state
+    /// re-selects among these without re-enumerating the codec.
+    pub(super) inputs: Vec<super::routing::Path>,
     pub(super) streams: [IrqSafeSpinLock<super::stream::Stream>; 2],
     pub(super) irq_control: IrqSafeSpinLock<()>,
     pub(super) volume: IrqSafeSpinLock<super::routing::Volume>,
+    /// Per-route playback trims (headphone, speaker). The effective
+    /// converter gain is master × route / 87 with either mute
+    /// silencing the path, so untouched routes behave exactly like
+    /// the old single-master path.
+    pub(super) route_volumes: IrqSafeSpinLock<super::routing::RouteVolumes>,
+    /// Capture gain state, re-applied after every capture path
+    /// configuration so a jack-driven source switch cannot reset it.
+    pub(super) capture_gain: IrqSafeSpinLock<super::routing::CaptureGain>,
     /// Formats the routed converters can actually configure, indexed by
     /// `capture as usize`. Queried once at probe from the codec's
     /// `AC_PAR_PCM` word — the same word `configure_paths` enforces — so
@@ -194,7 +210,8 @@ impl IntelHda {
             codecs: Vec::new(),
             graphs: Vec::new(),
             outputs: Vec::new(),
-            input: None,
+            input: IrqSafeSpinLock::new(None),
+            inputs: Vec::new(),
             supported_formats: [Vec::new(), Vec::new()],
             streams: [
                 IrqSafeSpinLock::new(super::stream::Stream::new(counts.0, false)),
@@ -205,6 +222,22 @@ impl IntelHda {
                 left: 87,
                 right: 87,
                 enabled: true,
+            }),
+            route_volumes: IrqSafeSpinLock::new(super::routing::RouteVolumes {
+                headphone: super::routing::Volume {
+                    left: 87,
+                    right: 87,
+                    enabled: true,
+                },
+                speaker: super::routing::Volume {
+                    left: 87,
+                    right: 87,
+                    enabled: true,
+                },
+            }),
+            capture_gain: IrqSafeSpinLock::new(super::routing::CaptureGain {
+                volume: 87,
+                boost: 0,
             }),
             ready: false,
             noncoherent,
@@ -307,7 +340,7 @@ impl IntelHda {
             dev.query_supported_formats(false),
             dev.query_supported_formats(true),
         ];
-        dev.ready = !dev.outputs.is_empty() || dev.input.is_some();
+        dev.ready = !dev.outputs.is_empty() || dev.input.lock().is_some();
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         unsafe {
             bar.write16(REG_STATESTS, mask);
@@ -898,7 +931,7 @@ pub fn capture_card() -> Option<u32> {
     CONTROLLERS
         .lock()
         .iter()
-        .find(|(_, c, _)| c.input.is_some())
+        .find(|(_, c, _)| c.input.lock().is_some())
         .map(|(_, _, card)| *card)
 }
 pub fn is_probed() -> bool {
@@ -965,7 +998,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         id: "HDA",
         name: "HD Audio",
         playback_count: u32::from(!dev.outputs.is_empty()),
-        capture_count: u32::from(dev.input.is_some()),
+        capture_count: u32::from(dev.input.lock().is_some()),
     };
     let card = narf_drivers_sound::register_hardware_card_at(
         info,

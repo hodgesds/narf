@@ -72,6 +72,11 @@ struct Controller {
     /// reinit. The PCM bring-up paths reinit when they see it set;
     /// the service loop skips work while it is set.
     suspended: AtomicBool,
+    /// Software capture gain, left/right in 0..87 ALSA-style units
+    /// (87 = unity). The PDM blocks expose no hardware gain stage
+    /// in-tree, so the card scales samples in `Pcm::read` instead of
+    /// programming an ungrounded register.
+    capture_volume: IrqSafeSpinLock<(u8, u8)>,
 }
 fn wait(predicate: impl FnMut() -> bool) -> bool {
     narf_scheduler::responsive_spin_until(predicate, Deadline::after_ms(100))
@@ -154,6 +159,7 @@ impl Controller {
             route: None,
             capture: IrqSafeSpinLock::new(Capture::default()),
             suspended: AtomicBool::new(false),
+            capture_volume: IrqSafeSpinLock::new((87, 87)),
         })
     }
     fn count(&self) -> Result<u64, SoundError> {
@@ -387,6 +393,26 @@ impl Drop for Controller {
         }
     }
 }
+/// Scale `count` bytes of S32LE stereo samples in place by the
+/// per-channel 0..87 gains (87 = unity, exact passthrough; 0 =
+/// silence). The product is computed in i64 and clamped to i32;
+/// with gains ≤ 87 the result never exceeds the input magnitude,
+/// so the clamp is defense only. Shared by the ACP 3.x and 6.3
+/// cards, whose PDM paths are both S32LE.
+pub(crate) fn scale_capture_samples(buf: &mut [u8], count: usize, left: u8, right: u8) {
+    if left == 87 && right == 87 {
+        return;
+    }
+    let count = count.min(buf.len()) / 4 * 4;
+    for (index, sample) in buf[..count].chunks_exact_mut(4).enumerate() {
+        let value = i32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+        let gain = if index % 2 == 0 { left } else { right };
+        let scaled =
+            (value as i64 * gain as i64 / 87).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        sample.copy_from_slice(&scaled.to_le_bytes());
+    }
+}
+
 #[derive(Debug)]
 struct Card(Arc<Controller>);
 impl PcmDevice for Card {
@@ -420,6 +446,44 @@ impl PcmDevice for Card {
         }
         state.claimed = true;
         Ok(Box::new(Pcm(self.0.clone())))
+    }
+    fn controls(&self) -> alloc::vec::Vec<narf_drivers_sound::mixer::ControlId> {
+        alloc::vec![narf_drivers_sound::mixer::ControlId {
+            index: 0,
+            kind: narf_drivers_sound::mixer::ControlKind::CaptureVolume,
+        }]
+    }
+    fn get_control(
+        &self,
+        id: narf_drivers_sound::mixer::ControlId,
+    ) -> Result<narf_drivers_sound::mixer::ControlValue, SoundError> {
+        if !self.controls().contains(&id) {
+            return Err(SoundError::NoSuchControl);
+        }
+        let (left, right) = *self.0.capture_volume.lock();
+        Ok(narf_drivers_sound::mixer::ControlValue::integer(
+            left as i32,
+            right as i32,
+        ))
+    }
+    fn set_control(
+        &self,
+        id: narf_drivers_sound::mixer::ControlId,
+        value: narf_drivers_sound::mixer::ControlValue,
+    ) -> Result<(), SoundError> {
+        use narf_drivers_sound::mixer::{ControlKind, ControlValue};
+        if !self.controls().contains(&id) {
+            return Err(SoundError::NoSuchControl);
+        }
+        match (id.kind, value) {
+            (ControlKind::CaptureVolume, ControlValue::Integer { left, right })
+                if (0..=87).contains(&left) && (0..=87).contains(&right) =>
+            {
+                *self.0.capture_volume.lock() = (left as u8, right as u8);
+                Ok(())
+            }
+            _ => Err(SoundError::OutOfRange),
+        }
     }
 }
 #[derive(Debug)]
@@ -559,6 +623,11 @@ impl PcmHardware for Pcm {
             let _ = self.0.stop(&mut state);
             return Err(SoundError::BadState);
         }
+        // Software capture gain: the PDM block has no hardware gain
+        // stage, so the card's CaptureVolume scales the copied
+        // samples. Unity (87, 87) is an exact passthrough.
+        let (left, right) = *self.0.capture_volume.lock();
+        scale_capture_samples(out, count, left, right);
         Ok(count)
     }
     fn drain(&mut self) -> Result<(), SoundError> {
@@ -1093,4 +1162,69 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/acp63", native_acp63_pm_runtime_ops);
+
+    fn native_acp63_software_capture_gain() -> TestResult {
+        // Unity (87, 87) is an exact passthrough, including extremes.
+        let mut buf = [
+            0x00, 0x00, 0x00, 0x40, // 0x40000000
+            0x00, 0x00, 0x00, 0xC0, // -0x40000000
+            0xFF, 0xFF, 0xFF, 0x7F, // i32::MAX
+        ];
+        scale_capture_samples(&mut buf, 12, 87, 87);
+        if buf
+            != [
+                0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xC0, 0xFF, 0xFF, 0xFF, 0x7F,
+            ]
+        {
+            return TestResult::Fail("unity gain must pass samples through exactly");
+        }
+        // Channels scale independently: left silenced, right at 43.
+        scale_capture_samples(&mut buf, 12, 0, 43);
+        let right = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let expected = (-0x40000000i64 * 43 / 87) as i32;
+        if buf[0..4] != [0, 0, 0, 0] || right != expected || buf[8..12] != [0, 0, 0, 0] {
+            return TestResult::Fail("per-channel software gain");
+        }
+        // A trailing partial sample is never touched.
+        let mut tail = [0x00, 0x00, 0x00, 0x40, 0xAA, 0xBB];
+        scale_capture_samples(&mut tail, 6, 0, 0);
+        if tail != [0, 0, 0, 0, 0xAA, 0xBB] {
+            return TestResult::Fail("partial trailing sample untouched");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/acp63", native_acp63_software_capture_gain);
+
+    fn native_acp63_capture_volume_control() -> TestResult {
+        use narf_drivers_sound::mixer::{ControlId, ControlKind, ControlValue};
+        let fixture = match Fixture::new() {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("ACP init"),
+        };
+        let dev = fixture.dev.as_ref().unwrap().clone();
+        let card = Card(dev);
+        let id = ControlId {
+            index: 0,
+            kind: ControlKind::CaptureVolume,
+        };
+        if !card.controls().contains(&id)
+            || card.get_control(id) != Ok(ControlValue::integer(87, 87))
+            || card.set_control(id, ControlValue::integer(10, 20)).is_err()
+            || card.get_control(id) != Ok(ControlValue::integer(10, 20))
+            || card.set_control(id, ControlValue::integer(88, 0)).is_ok()
+            || card
+                .set_control(
+                    ControlId {
+                        index: 1,
+                        kind: ControlKind::MasterVolume,
+                    },
+                    ControlValue::integer(10, 10),
+                )
+                .is_ok()
+        {
+            return TestResult::Fail("ACP capture volume control round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/acp63", native_acp63_capture_volume_control);
 }

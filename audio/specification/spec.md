@@ -78,7 +78,21 @@ capture walks from an ADC through selectors/mixers to a microphone/line pin.
 Headphone presence disables speaker pins. Mixer controls expose master volume
 when the routed converters have output amplifiers, output enable/mute through
 pin controls, and headphone presence where supported. Gain never exceeds the
-codec's advertised 0 dB offset.
+codec's advertised 0 dB offset. Per-route playback controls (Headphone/Speaker
+Volume and Switch) apply to their route's converters only; the effective
+converter gain is master × route / 87 and the path is muted when either mute
+is set, so untouched routes behave exactly like the master-only path. Capture
+controls follow the selected input path: Capture Volume drives the ADC's
+input amp at the selected input (attenuation from its 0 dB offset), Mic Boost
+drives a mic source pin's input amp (from its 0 dB offset up to its maximum
+step). The capture source is re-selected from jack state on every 100 ms
+jack tick: a plugged presence-capable pin beats an unplugged one, ties break
+by class preference (Mic > Line > AUX) then discovery order, and a sense
+failure keeps the current selection; the new source takes effect at the next
+capture configure, never mid-stream. ACP 3.x and 6.3 PDM cards expose a
+software Capture Volume (left/right, 0..87, 87 = unity): their PDM blocks
+have no hardware gain stage in-tree, so the card scales the copied S32LE
+samples in the read path instead of programming an ungrounded register.
 
 AMD GPU HD-Audio functions (Linux's ATI HDMI NS IDs, `HDA_ATI_HDMI_NS_DEVICES`,
 through 0xab40) run without snoop as Linux's `AZX_DCAPS_SNOOP_OFF`: narf DMA

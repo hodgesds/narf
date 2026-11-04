@@ -47,12 +47,17 @@ impl IntelHda {
                     }
                 }
             }
-            if self.input.is_none() && self.stream_counts().0 != 0 {
-                self.input = hda_codec::find_input_path(graph).map(|nodes| Path {
-                    codec: index,
-                    nodes,
-                });
+            if self.stream_counts().0 != 0 {
+                for nodes in hda_codec::find_input_paths(graph) {
+                    self.inputs.push(Path {
+                        codec: index,
+                        nodes,
+                    });
+                }
             }
+        }
+        if self.input.lock().is_none() {
+            *self.input.lock() = self.inputs.first().cloned();
         }
     }
     /// The `AC_PAR_PCM` (parameter 0x0a) size bit for `format`.
@@ -83,8 +88,9 @@ impl IntelHda {
     /// a sink that never takes a quantum. QEMU's hda-duplex codec is exactly
     /// such a codec.
     pub(super) fn query_supported_formats(&self, capture: bool) -> Vec<SampleFormat> {
+        let input = self.input.lock().clone();
         let paths: Vec<&Path> = if capture {
-            self.input.iter().collect()
+            input.iter().collect()
         } else {
             self.outputs.iter().collect()
         };
@@ -133,8 +139,13 @@ impl IntelHda {
     }
     pub(super) fn configure_paths(&self, capture: bool, params: HwParams) -> Result<(), HdaError> {
         if capture {
-            let path = self.input.as_ref().ok_or(HdaError::NoOutputStream)?;
-            return self.configure_path(path, 0, true, params);
+            let path = self.input.lock().clone().ok_or(HdaError::NoOutputStream)?;
+            self.configure_path(&path, 0, true, params)?;
+            // A jack-driven source switch must not reset the user's
+            // capture gain: the stored state is re-applied after
+            // every capture configuration, same as playback volume.
+            self.apply_capture_gain()?;
+            return Ok(());
         }
         if self.outputs.is_empty() {
             return Err(HdaError::NoOutputStream);
@@ -155,7 +166,7 @@ impl IntelHda {
                 )?;
             }
         }
-        self.apply_volume(&self.volume.lock())?;
+        self.apply_volumes()?;
         self.refresh_jacks()?;
         Ok(())
     }
@@ -372,6 +383,13 @@ impl IntelHda {
     pub(super) fn refresh_jacks(&self) -> Result<(), HdaError> {
         // HDMI/DP sinks come and go whether or not a stream is prepared.
         self.refresh_hdmi(true)?;
+        // Capture-source selection runs on every tick, independent of
+        // playback state: a headset mic plugged while nothing plays
+        // must already be the selected source when capture opens.
+        // A sense failure keeps the current selection (fail-closed);
+        // a running capture stream keeps its configured source until
+        // its next configure, which reads the new selection.
+        self.select_capture_source();
         if !self.streams[0]
             .lock()
             .ring
@@ -406,6 +424,74 @@ impl IntelHda {
         }
         Ok(())
     }
+    /// Re-select the capture source from jack state. Rule, in order:
+    /// a plugged presence-capable pin beats an unplugged one; ties
+    /// break by class preference (Mic > Line > AUX) then discovery
+    /// order. Pins without presence-detect capability never report
+    /// plugged, so they keep their preference position when nothing
+    /// is plugged and never displace a plugged pin. A sense failure
+    /// keeps the current selection. The selection takes effect at
+    /// the next capture configure; a running stream is untouched.
+    pub(super) fn select_capture_source(&self) {
+        if self.inputs.is_empty() {
+            return;
+        }
+        // Sense reads first, with no lock held.
+        let mut plugged: Vec<bool> = Vec::new();
+        for path in &self.inputs {
+            let Some(graph) = self.graphs.get(path.codec) else {
+                return;
+            };
+            let Some(pin) = graph.widget(path.nodes.pin_nid) else {
+                return;
+            };
+            // Presence-detect capability, same bit the output
+            // automute path uses.
+            let senseable = pin.pin_caps.unwrap_or(0) & 4 != 0;
+            if !senseable {
+                plugged.push(false);
+                continue;
+            }
+            match self.verb(graph.addr, pin.nid, 0xf09 << 8) {
+                Ok(reply) => plugged.push(reply & (1 << 31) != 0),
+                Err(_) => return,
+            }
+        }
+        let rank = |path: &Path| -> u8 {
+            match self.graphs[path.codec]
+                .widget(path.nodes.pin_nid)
+                .and_then(|p| p.pin_config)
+                .map_or(0, |p| p.default_device)
+            {
+                0xA => 0,
+                0x8 => 1,
+                0x9 => 2,
+                _ => 3,
+            }
+        };
+        let mut best: Option<usize> = None;
+        let mut best_key = (true, u8::MAX, usize::MAX);
+        for (index, path) in self.inputs.iter().enumerate() {
+            let key = (!plugged[index], rank(path), index);
+            if key < best_key {
+                best_key = key;
+                best = Some(index);
+            }
+        }
+        if let Some(index) = best {
+            let mut selected = self.input.lock();
+            let changed = match selected.as_ref() {
+                None => true,
+                Some(cur) => {
+                    cur.codec != self.inputs[index].codec
+                        || cur.nodes.pin_nid != self.inputs[index].nodes.pin_nid
+                }
+            };
+            if changed {
+                *selected = Some(self.inputs[index].clone());
+            }
+        }
+    }
     /// Configure the discovered analog output route at the baseline PCM format.
     /// # Safety
     /// Caller owns this controller and has stopped its output stream.
@@ -429,6 +515,26 @@ pub(super) struct Volume {
     pub left: u8,
     pub right: u8,
     pub enabled: bool,
+}
+
+/// Per-route playback trims. The effective converter gain is
+/// master × route / 87 and the path is muted when either mute is
+/// set, so a route control left at its 87/87/enabled default changes
+/// nothing — the master alone still drives the path.
+#[derive(Debug, Copy, Clone)]
+pub(super) struct RouteVolumes {
+    pub headphone: Volume,
+    pub speaker: Volume,
+}
+
+/// Capture gain state, in the same 0..87 ALSA-style units as
+/// playback volume. `volume` attenuates from the ADC's 0 dB offset
+/// down; `boost` lifts the mic pin's input amp from its 0 dB offset
+/// up to its maximum step.
+#[derive(Debug, Copy, Clone)]
+pub(super) struct CaptureGain {
+    pub volume: u8,
+    pub boost: u8,
 }
 impl IntelHda {
     pub(super) fn mixer_controls(&self) -> Vec<narf_drivers_sound::mixer::ControlId> {
@@ -465,6 +571,65 @@ impl IntelHda {
                 kind: ControlKind::JackSense,
             });
         }
+        // Per-route playback controls, one pair per route class whose
+        // converter has an output amp to drive.
+        let route_has_amp = |device: u8| {
+            self.outputs.iter().any(|path| {
+                self.graphs[path.codec]
+                    .widget(path.nodes.pin_nid)
+                    .is_some_and(|pin| pin.pin_config.is_some_and(|p| p.default_device == device))
+                    && self.graphs[path.codec]
+                        .widget(path.nodes.converter_nid)
+                        .and_then(|w| w.out_amp)
+                        .is_some()
+            })
+        };
+        if route_has_amp(2) {
+            controls.push(ControlId {
+                index: 10,
+                kind: ControlKind::HeadphoneVolume,
+            });
+            controls.push(ControlId {
+                index: 11,
+                kind: ControlKind::HeadphoneMute,
+            });
+        }
+        if route_has_amp(1) {
+            controls.push(ControlId {
+                index: 12,
+                kind: ControlKind::SpeakerVolume,
+            });
+            controls.push(ControlId {
+                index: 13,
+                kind: ControlKind::SpeakerMute,
+            });
+        }
+        // Capture controls follow the currently selected input path,
+        // so a jack-driven source switch re-publishes them for the
+        // new source's amps.
+        if let Some(path) = self.input.lock().clone() {
+            if self.graphs[path.codec]
+                .widget(path.nodes.converter_nid)
+                .and_then(|w| w.in_amp)
+                .is_some()
+            {
+                controls.push(ControlId {
+                    index: 14,
+                    kind: ControlKind::CaptureVolume,
+                });
+            }
+            if self.graphs[path.codec]
+                .widget(path.nodes.pin_nid)
+                .is_some_and(|pin| {
+                    pin.pin_config.is_some_and(|p| p.default_device == 0xA) && pin.in_amp.is_some()
+                })
+            {
+                controls.push(ControlId {
+                    index: 15,
+                    kind: ControlKind::MicBoost,
+                });
+            }
+        }
         if !self.hdmi.lock().is_empty() {
             controls.push(ControlId {
                 index: 3,
@@ -486,26 +651,109 @@ impl IntelHda {
         }
         controls
     }
-    fn apply_volume(&self, volume: &Volume) -> Result<(), HdaError> {
+    /// Program every routed output converter's output amp from the
+    /// master and per-route states: effective gain is master ×
+    /// route / 87, muted when either mute is set. Paths of other
+    /// classes (line out, digital) use the master alone.
+    fn apply_volumes(&self) -> Result<(), HdaError> {
+        let master = *self.volume.lock();
+        let routes = *self.route_volumes.lock();
+        self.apply_volumes_with(&master, &routes)
+    }
+    /// `apply_volumes` over pending states, so `set_mixer` can
+    /// program the hardware before committing the new state (a
+    /// failed apply leaves the stored state untouched).
+    fn apply_volumes_with(&self, master: &Volume, routes: &RouteVolumes) -> Result<(), HdaError> {
         for path in &self.outputs {
             let graph = &self.graphs[path.codec];
             let converter = graph
                 .widget(path.nodes.converter_nid)
                 .ok_or(HdaError::NoCodecs)?;
-            if let Some(amp) = converter.out_amp {
-                for (channel, value) in [(0x2000, volume.left), (0x1000, volume.right)] {
-                    let gain = amp.offset.min(amp.num_steps) as u32 * value as u32 / 87;
+            let Some(amp) = converter.out_amp else {
+                continue;
+            };
+            let pin_device = graph
+                .widget(path.nodes.pin_nid)
+                .and_then(|pin| pin.pin_config)
+                .map_or(0, |p| p.default_device);
+            let route = match pin_device {
+                2 => Some(routes.headphone),
+                1 => Some(routes.speaker),
+                _ => None,
+            };
+            let (left, right, enabled) = match route {
+                Some(r) => (
+                    master.left as u32 * r.left as u32 / 87,
+                    master.right as u32 * r.right as u32 / 87,
+                    master.enabled && r.enabled,
+                ),
+                None => (master.left as u32, master.right as u32, master.enabled),
+            };
+            for (channel, value) in [(0x2000, left), (0x1000, right)] {
+                let gain = amp.offset.min(amp.num_steps) as u32 * value / 87;
+                self.verb(
+                    graph.addr,
+                    converter.nid,
+                    VERB_SET_AMP_GAIN_MUTE
+                        | 0x8000
+                        | channel
+                        | gain
+                        | if enabled { 0 } else { 0x80 },
+                )?;
+            }
+        }
+        Ok(())
+    }
+    /// Program the selected capture path's amps from the stored
+    /// capture gain: the ADC's input amp at the selected input
+    /// (attenuation from its 0 dB offset) and, for a mic source,
+    /// the mic pin's input amp (boost from its 0 dB offset up to
+    /// its maximum step). Called after every capture configuration
+    /// so the gain survives re-configuration; a path without the
+    /// amp simply has nothing to program.
+    fn apply_capture_gain(&self) -> Result<(), HdaError> {
+        let gain = *self.capture_gain.lock();
+        self.apply_capture_gain_with(&gain)
+    }
+    /// `apply_capture_gain` over a pending state, so `set_mixer`
+    /// can program the hardware before committing the new state.
+    fn apply_capture_gain_with(&self, gain: &CaptureGain) -> Result<(), HdaError> {
+        let Some(path) = self.input.lock().clone() else {
+            return Ok(());
+        };
+        let graph = &self.graphs[path.codec];
+        let converter = graph
+            .widget(path.nodes.converter_nid)
+            .ok_or(HdaError::NoCodecs)?;
+        if let Some(amp) = converter.in_amp {
+            // The input index configure_path selected for this
+            // converter: the next node on the capture chain, or the
+            // pin for a direct path.
+            let next = path
+                .nodes
+                .chain
+                .first()
+                .copied()
+                .unwrap_or(path.nodes.pin_nid);
+            if let Some(selected) = converter.connections.iter().position(|n| *n == next) {
+                if selected <= 15 {
+                    let steps = amp.offset.min(amp.num_steps) as u32 * gain.volume as u32 / 87;
                     self.verb(
                         graph.addr,
                         converter.nid,
-                        VERB_SET_AMP_GAIN_MUTE
-                            | 0x8000
-                            | channel
-                            | gain
-                            | if volume.enabled { 0 } else { 0x80 },
+                        VERB_SET_AMP_GAIN_MUTE | 0x7000 | ((selected as u32) << 8) | steps,
                     )?;
                 }
             }
+        }
+        let pin = graph.widget(path.nodes.pin_nid).ok_or(HdaError::NoCodecs)?;
+        if let Some(amp) = pin
+            .in_amp
+            .filter(|_| pin.pin_config.is_some_and(|p| p.default_device == 0xA))
+        {
+            let steps = amp.offset as u32
+                + (amp.num_steps.saturating_sub(amp.offset)) as u32 * gain.boost as u32 / 87;
+            self.verb(graph.addr, pin.nid, VERB_SET_AMP_GAIN_MUTE | 0x7000 | steps)?;
         }
         Ok(())
     }
@@ -526,6 +774,28 @@ impl IntelHda {
                 Ok(ControlValue::integer(v.left as i32, v.right as i32))
             }
             ControlKind::MasterMute => Ok(ControlValue::boolean(self.volume.lock().enabled)),
+            ControlKind::HeadphoneVolume => {
+                let v = self.route_volumes.lock().headphone;
+                Ok(ControlValue::integer(v.left as i32, v.right as i32))
+            }
+            ControlKind::HeadphoneMute => Ok(ControlValue::boolean(
+                self.route_volumes.lock().headphone.enabled,
+            )),
+            ControlKind::SpeakerVolume => {
+                let v = self.route_volumes.lock().speaker;
+                Ok(ControlValue::integer(v.left as i32, v.right as i32))
+            }
+            ControlKind::SpeakerMute => Ok(ControlValue::boolean(
+                self.route_volumes.lock().speaker.enabled,
+            )),
+            ControlKind::CaptureVolume => {
+                let g = self.capture_gain.lock();
+                Ok(ControlValue::integer(g.volume as i32, g.volume as i32))
+            }
+            ControlKind::MicBoost => {
+                let g = self.capture_gain.lock();
+                Ok(ControlValue::integer(g.boost as i32, g.boost as i32))
+            }
             ControlKind::JackSense => {
                 let mut present = false;
                 for path in &self.outputs {
@@ -559,7 +829,6 @@ impl IntelHda {
                 let map = self.hdmi_playback.lock().chmap;
                 Ok(ControlValue::integers(&map.map(i32::from)))
             }
-            _ => Err(SoundError::NoSuchControl),
         }
     }
     pub(super) fn set_mixer(
@@ -590,21 +859,69 @@ impl IntelHda {
             }
             _ => {}
         }
-        let mut current = self.volume.lock();
-        let mut next = *current;
+        // Playback and capture volume groups: program the hardware
+        // from the pending state first, commit only on success.
+        // Each set touches only its own group, so a capture-path
+        // fault cannot fail a playback control (and vice versa).
+        let capture_arm = matches!(id.kind, ControlKind::CaptureVolume | ControlKind::MicBoost);
+        let master = *self.volume.lock();
+        let routes = *self.route_volumes.lock();
+        let capture = *self.capture_gain.lock();
+        let mut next_master = master;
+        let mut next_routes = routes;
+        let mut next_capture = capture;
         match (id.kind, value) {
             (ControlKind::MasterVolume, ControlValue::Integer { left, right })
                 if (0..=87).contains(&left) && (0..=87).contains(&right) =>
             {
-                next.left = left as u8;
-                next.right = right as u8;
+                next_master.left = left as u8;
+                next_master.right = right as u8;
             }
-            (ControlKind::MasterMute, ControlValue::Boolean(enabled)) => next.enabled = enabled,
+            (ControlKind::MasterMute, ControlValue::Boolean(enabled)) => {
+                next_master.enabled = enabled;
+            }
+            (ControlKind::HeadphoneVolume, ControlValue::Integer { left, right })
+                if (0..=87).contains(&left) && (0..=87).contains(&right) =>
+            {
+                next_routes.headphone.left = left as u8;
+                next_routes.headphone.right = right as u8;
+            }
+            (ControlKind::HeadphoneMute, ControlValue::Boolean(enabled)) => {
+                next_routes.headphone.enabled = enabled;
+            }
+            (ControlKind::SpeakerVolume, ControlValue::Integer { left, right })
+                if (0..=87).contains(&left) && (0..=87).contains(&right) =>
+            {
+                next_routes.speaker.left = left as u8;
+                next_routes.speaker.right = right as u8;
+            }
+            (ControlKind::SpeakerMute, ControlValue::Boolean(enabled)) => {
+                next_routes.speaker.enabled = enabled;
+            }
+            (ControlKind::CaptureVolume, ControlValue::Integer { left, right })
+                if (0..=87).contains(&left) && (0..=87).contains(&right) =>
+            {
+                // The ADC input amp is a single gain stage, so the
+                // left channel wins; get reports it on both channels.
+                next_capture.volume = left as u8;
+            }
+            (ControlKind::MicBoost, ControlValue::Integer { left, right })
+                if (0..=87).contains(&left) && (0..=87).contains(&right) =>
+            {
+                next_capture.boost = left as u8;
+            }
             _ => return Err(SoundError::OutOfRange),
         }
-        self.apply_volume(&next).map_err(|_| SoundError::BadState)?;
-        *current = next;
-        drop(current);
+        if capture_arm {
+            self.apply_capture_gain_with(&next_capture)
+                .map_err(|_| SoundError::BadState)?;
+        } else {
+            self.apply_volumes_with(&next_master, &next_routes)
+                .map_err(|_| SoundError::BadState)?;
+        }
+        *self.volume.lock() = next_master;
+        *self.route_volumes.lock() = next_routes;
+        *self.capture_gain.lock() = next_capture;
         self.refresh_jacks().map_err(|_| SoundError::BadState)?;
         Ok(())
     }

@@ -35,6 +35,14 @@ struct Model {
     navi22: bool,
     /// Navi22: the port (Azalia endpoint) whose sink the display enabled.
     sink_port: u8,
+    /// Analog variant: add a line-in pin (nid 9) beside the mic pin
+    /// and give the mic pin presence capability, so jack-driven
+    /// capture-source switching has two sources to switch between.
+    /// False keeps the default fixture byte-identical.
+    line_in: bool,
+    /// Analog variant: pin sense for the mic (7) / line-in (9) pins.
+    mic_plugged: bool,
+    line_plugged: bool,
 }
 impl Model {
     fn step(&mut self) {
@@ -81,6 +89,33 @@ impl Model {
                 } else {
                     response(command)
                 };
+                if self.line_in && !self.ati && !self.navi22 {
+                    let nid = (command >> 20) as u8;
+                    let verb = (command >> 8) & 0xfff;
+                    let param = command as u8;
+                    match (nid, verb, param) {
+                        // Eight widgets (2..=9) instead of seven.
+                        (1, 0xf00, 4) => reply = 0x00020008,
+                        // Mic pin gains an input amp (Mic Boost) and
+                        // presence capability; its sense follows the flag.
+                        (7, 0xf00, 9) => reply = (4 << 20) | 0x101 | 6,
+                        (7, 0xf00, 0xc) => reply = 0x1024,
+                        (7, 0xf09, _) if self.mic_plugged => reply = 0xc000_0000,
+                        // Line-in pin 9: input + presence caps, line
+                        // class config, one connection (to the ADC
+                        // selector), sense follows the flag.
+                        (9, 0xf00, 9) => reply = (4 << 20) | 0x101 | 4,
+                        (9, 0xf00, 0xc) => reply = 0x1024,
+                        (9, 0xf00, 0xe) => reply = 1,
+                        (9, 0xf1c, _) => reply = (0x8 << 20) | 0x40,
+                        (9, 0xf02, _) => reply = 8,
+                        (9, 0xf09, _) if self.line_plugged => reply = 0xc000_0000,
+                        // The ADC selector reaches the line pin too,
+                        // appended last so the mic trace is unchanged.
+                        (8, 0xf02, _) => reply = 0x090708,
+                        _ => {}
+                    }
+                }
                 if command == make_verb(0, 1, VERB_GET_PARAMETER | 0xa) && !self.supports_32 {
                     reply &= !(1 << 20);
                 }
@@ -308,7 +343,12 @@ impl Fixture {
         Self::build(true, true, true)
     }
     fn build(noncoherent: bool, ati: bool, second_port: bool) -> Result<Self, &'static str> {
-        Self::build_model(noncoherent, ati, second_port, false)
+        Self::build_model(noncoherent, ati, second_port, false, false)
+    }
+    /// The analog codec with a line-in pin beside the mic pin, for
+    /// jack-driven capture-source switching tests.
+    fn line_in() -> Result<Self, &'static str> {
+        Self::build_model(false, false, false, false, true)
     }
     /// The RX 6750 XT's HD-Audio function: 1002:ab28 runs without snoop.
     fn navi22() -> Result<Self, &'static str> {
@@ -317,6 +357,7 @@ impl Fixture {
             true,
             false,
             true,
+            false,
         )
     }
     fn build_model(
@@ -324,6 +365,7 @@ impl Fixture {
         ati: bool,
         second_port: bool,
         navi22: bool,
+        line_in: bool,
     ) -> Result<Self, &'static str> {
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
@@ -361,6 +403,9 @@ impl Fixture {
                 hbr: 0x11,
                 navi22,
                 sink_port: 0,
+                line_in,
+                mic_plugged: false,
+                line_plugged: false,
             }),
         };
         *MODEL.lock() = &mut *fixture.model as *mut Model as usize;
@@ -396,10 +441,13 @@ fn pcm_case(noncoherent: bool) -> TestResult {
         Err(e) => return TestResult::Fail(e),
     };
     let dev = fixture.controller.as_ref().unwrap().clone();
-    if dev.codecs()[0].vendor_id != 0x10ec0287 || dev.outputs.len() != 2 || dev.input.is_none() {
+    if dev.codecs()[0].vendor_id != 0x10ec0287
+        || dev.outputs.len() != 2
+        || dev.input.lock().is_none()
+    {
         return TestResult::Fail("codec discovery and reverse ADC path");
     }
-    if dev.input.as_ref().unwrap().nodes.chain != alloc::vec![8] {
+    if dev.input.lock().as_ref().unwrap().nodes.chain != alloc::vec![8] {
         return TestResult::Fail("ADC selector path and cycle rejection");
     }
     let card = super::super::stream::Card(dev.clone());
@@ -544,7 +592,7 @@ fn native_hda_ati_hdmi_port_streams_stereo_like_atihdmi() -> TestResult {
         || dev.outputs.len() != 1
         || dev.outputs[0].nodes.pin_nid != 3
         || dev.outputs[0].nodes.converter_nid != 2
-        || dev.input.is_some()
+        || dev.input.lock().is_some()
     {
         return TestResult::Fail("HDMI port discovery");
     }
@@ -1337,7 +1385,7 @@ fn native_hda_navi22_binds_ab28_and_routes_the_dcn30_endpoint() -> TestResult {
     if dev.codecs()[0].vendor_id != 0x1002aa01
         || !crate::hda_codec::is_ati_hdmi(codec)
         || !crate::hda_codec::ati_hdmi_rev3(codec)
-        || dev.input.is_some()
+        || dev.input.lock().is_some()
     {
         return TestResult::Fail("R6xx HDMI rev3+ codec");
     }
@@ -1655,3 +1703,179 @@ fn native_hda_pm_runtime_ops_and_pci_wrapper() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/hda", native_hda_pm_runtime_ops_and_pci_wrapper);
+
+fn native_hda_route_and_capture_controls() -> TestResult {
+    use narf_drivers_sound::mixer::{ControlId, ControlKind, ControlValue};
+    let mut fixture = match Fixture::new() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let controls = card.controls();
+    let has = |index: u32, kind: ControlKind| controls.contains(&ControlId { index, kind });
+    // Both output converters have output amps, so both route pairs
+    // publish; the ADC has an input amp, so Capture Volume does.
+    // The mic pin has no input amp in the default fixture, so Mic
+    // Boost does not publish there (the line-in variant adds one).
+    if !has(10, ControlKind::HeadphoneVolume)
+        || !has(11, ControlKind::HeadphoneMute)
+        || !has(12, ControlKind::SpeakerVolume)
+        || !has(13, ControlKind::SpeakerMute)
+        || !has(14, ControlKind::CaptureVolume)
+        || has(15, ControlKind::MicBoost)
+    {
+        return TestResult::Fail("route/capture control publication");
+    }
+    // Headphone trim (40, 50) over the 87 master: converter 2 is
+    // shared by both output paths in this fixture, so the verbs
+    // carry the speaker defaults (16 steps) and then the headphone
+    // values (7 left, 9 right) — the last write wins on the shared
+    // amp, which separate converters would not share.
+    let hp = ControlId {
+        index: 10,
+        kind: ControlKind::HeadphoneVolume,
+    };
+    if card.set_control(hp, ControlValue::integer(40, 50)).is_err()
+        || card.get_control(hp) != Ok(ControlValue::integer(40, 50))
+    {
+        return TestResult::Fail("headphone volume round-trip");
+    }
+    let amp = VERB_SET_AMP_GAIN_MUTE;
+    if !fixture
+        .model
+        .verbs
+        .contains(&make_verb(0, 2, amp | 0x8000 | 0x2000 | 7))
+        || !fixture
+            .model
+            .verbs
+            .contains(&make_verb(0, 2, amp | 0x8000 | 0x1000 | 9))
+        || !fixture
+            .model
+            .verbs
+            .contains(&make_verb(0, 2, amp | 0x8000 | 0x2000 | 16))
+    {
+        return TestResult::Fail("headphone trim programs the converter amp");
+    }
+    // Route mute ANDs with the master: muting the speaker route
+    // writes the mute bit for the shared converter.
+    let sp_mute = ControlId {
+        index: 13,
+        kind: ControlKind::SpeakerMute,
+    };
+    if card
+        .set_control(sp_mute, ControlValue::boolean(false))
+        .is_err()
+        || !fixture
+            .model
+            .verbs
+            .contains(&make_verb(0, 2, amp | 0x8000 | 0x2000 | 16 | 0x80))
+        || card
+            .set_control(sp_mute, ControlValue::boolean(true))
+            .is_err()
+    {
+        return TestResult::Fail("speaker route mute programs the mute bit");
+    }
+    // Capture gain programs the ADC input amp at the selected input
+    // (converter 3, input 0, 16 steps at unity, 7 at 43).
+    let cap = ControlId {
+        index: 14,
+        kind: ControlKind::CaptureVolume,
+    };
+    if card
+        .set_control(cap, ControlValue::integer(43, 43))
+        .is_err()
+        || card.get_control(cap) != Ok(ControlValue::integer(43, 43))
+        || !fixture
+            .model
+            .verbs
+            .contains(&make_verb(0, 3, amp | 0x7000 | 7))
+    {
+        return TestResult::Fail("capture volume programs the ADC input amp");
+    }
+    // And a capture configure re-applies it after the path setup
+    // itself wrote unity (16 steps) to the same amp.
+    let mut capture = match card.open(true, 0) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("capture open"),
+    };
+    fixture.model.verbs.clear();
+    if capture
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || !fixture
+            .model
+            .verbs
+            .contains(&make_verb(0, 3, amp | 0x7000 | 7))
+    {
+        return TestResult::Fail("capture configure re-applies the stored gain");
+    }
+    drop(capture);
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_route_and_capture_controls);
+
+fn native_hda_jack_driven_capture_switch() -> TestResult {
+    use narf_drivers_sound::mixer::{ControlId, ControlKind};
+    let mut fixture = match Fixture::line_in() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    if dev.inputs.len() != 2 || dev.input.lock().as_ref().map(|p| p.nodes.pin_nid) != Some(7) {
+        return TestResult::Fail("mic preferred before any jack state");
+    }
+    // Line plugged, mic not: the line source wins.
+    fixture.model.mic_plugged = false;
+    fixture.model.line_plugged = true;
+    if dev.refresh_jacks().is_err() || dev.input.lock().as_ref().map(|p| p.nodes.pin_nid) != Some(9)
+    {
+        return TestResult::Fail("plugged line displaces the mic");
+    }
+    // Mic plugged beats line: back to the mic.
+    fixture.model.mic_plugged = true;
+    if dev.refresh_jacks().is_err() || dev.input.lock().as_ref().map(|p| p.nodes.pin_nid) != Some(7)
+    {
+        return TestResult::Fail("plugged mic retakes the source");
+    }
+    // Nothing plugged: preference order falls back to the mic.
+    fixture.model.mic_plugged = false;
+    fixture.model.line_plugged = false;
+    if dev.refresh_jacks().is_err() || dev.input.lock().as_ref().map(|p| p.nodes.pin_nid) != Some(7)
+    {
+        return TestResult::Fail("unplugged fallback is the preference order");
+    }
+    // The published capture controls follow the selected source:
+    // the mic pin has an input amp (Mic Boost), the line pin does not.
+    let boost = ControlId {
+        index: 15,
+        kind: ControlKind::MicBoost,
+    };
+    if !card.controls().contains(&boost) {
+        return TestResult::Fail("mic boost publishes for the mic source");
+    }
+    fixture.model.line_plugged = true;
+    if dev.refresh_jacks().is_err() || card.controls().contains(&boost) {
+        return TestResult::Fail("mic boost withdraws for the line source");
+    }
+    // Mic Boost at full writes the mic pin's input amp from its
+    // 0 dB offset (16) to its maximum step (32).
+    fixture.model.mic_plugged = true;
+    if dev.refresh_jacks().is_err() {
+        return TestResult::Fail("reselect mic");
+    }
+    use narf_drivers_sound::mixer::ControlValue;
+    if card
+        .set_control(boost, ControlValue::integer(87, 87))
+        .is_err()
+        || !fixture
+            .model
+            .verbs
+            .contains(&make_verb(0, 7, VERB_SET_AMP_GAIN_MUTE | 0x7000 | 32))
+    {
+        return TestResult::Fail("mic boost programs the mic pin input amp");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_jack_driven_capture_switch);

@@ -80,6 +80,10 @@ struct Controller {
     irq: Arc<State>,
     route: Option<Route>,
     capture: IrqSafeSpinLock<Capture>,
+    /// Software capture gain, left/right in 0..87 ALSA-style units
+    /// (87 = unity). Same rationale as the 6.3 card: no hardware
+    /// gain stage exists in-tree for the PDM block.
+    capture_volume: IrqSafeSpinLock<(u8, u8)>,
 }
 fn wait(predicate: impl FnMut() -> bool) -> bool {
     narf_scheduler::responsive_spin_until(predicate, Deadline::after_ms(100))
@@ -143,6 +147,7 @@ impl Controller {
             irq: State::new(mmio, Kind::Acp3x),
             route: None,
             capture: IrqSafeSpinLock::new(Capture::default()),
+            capture_volume: IrqSafeSpinLock::new((87, 87)),
         })
     }
     fn count(&self) -> Result<u64, SoundError> {
@@ -263,6 +268,44 @@ impl PcmDevice for Card {
         }
         state.claimed = true;
         Ok(Box::new(Pcm(self.0.clone())))
+    }
+    fn controls(&self) -> alloc::vec::Vec<narf_drivers_sound::mixer::ControlId> {
+        alloc::vec![narf_drivers_sound::mixer::ControlId {
+            index: 0,
+            kind: narf_drivers_sound::mixer::ControlKind::CaptureVolume,
+        }]
+    }
+    fn get_control(
+        &self,
+        id: narf_drivers_sound::mixer::ControlId,
+    ) -> Result<narf_drivers_sound::mixer::ControlValue, SoundError> {
+        if !self.controls().contains(&id) {
+            return Err(SoundError::NoSuchControl);
+        }
+        let (left, right) = *self.0.capture_volume.lock();
+        Ok(narf_drivers_sound::mixer::ControlValue::integer(
+            left as i32,
+            right as i32,
+        ))
+    }
+    fn set_control(
+        &self,
+        id: narf_drivers_sound::mixer::ControlId,
+        value: narf_drivers_sound::mixer::ControlValue,
+    ) -> Result<(), SoundError> {
+        use narf_drivers_sound::mixer::{ControlKind, ControlValue};
+        if !self.controls().contains(&id) {
+            return Err(SoundError::NoSuchControl);
+        }
+        match (id.kind, value) {
+            (ControlKind::CaptureVolume, ControlValue::Integer { left, right })
+                if (0..=87).contains(&left) && (0..=87).contains(&right) =>
+            {
+                *self.0.capture_volume.lock() = (left as u8, right as u8);
+                Ok(())
+            }
+            _ => Err(SoundError::OutOfRange),
+        }
     }
 }
 #[derive(Debug)]
@@ -393,6 +436,9 @@ impl PcmHardware for Pcm {
             let _ = self.0.stop(&mut state);
             return Err(SoundError::BadState);
         }
+        // Software capture gain, shared with the 6.3 card.
+        let (left, right) = *self.0.capture_volume.lock();
+        crate::acp63::scale_capture_samples(out, count, left, right);
         Ok(count)
     }
     fn drain(&mut self) -> Result<(), SoundError> {
@@ -732,4 +778,27 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/acp3x", native_acp3x_power_on_and_overrun);
+    fn native_acp3x_capture_volume_control() -> TestResult {
+        use narf_drivers_sound::mixer::{ControlId, ControlKind, ControlValue};
+        let fixture = match Fixture::new(0) {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("ACP init"),
+        };
+        let dev = fixture.dev.as_ref().unwrap().clone();
+        let card = Card(dev);
+        let id = ControlId {
+            index: 0,
+            kind: ControlKind::CaptureVolume,
+        };
+        if !card.controls().contains(&id)
+            || card.get_control(id) != Ok(ControlValue::integer(87, 87))
+            || card.set_control(id, ControlValue::integer(10, 20)).is_err()
+            || card.get_control(id) != Ok(ControlValue::integer(10, 20))
+            || card.set_control(id, ControlValue::integer(88, 0)).is_ok()
+        {
+            return TestResult::Fail("ACP3x capture volume control round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/acp3x", native_acp3x_capture_volume_control);
 }
