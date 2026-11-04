@@ -231,8 +231,9 @@ fn smoke_coredump_vm_wire_owned_tables_corruption_and_immutable_reads() -> TestR
     gem.close(handle).unwrap();
     drop(object);
     drop(batch);
-    assert_eq!(ready(file.read(0x27537e, &mut bytes)), Ok(2));
-    assert_eq!(ready(file.read(0x275380, &mut bytes)), Ok(0));
+    // The version-4 bundle (with its Xe text section) ends at 0x27d3c0.
+    assert_eq!(ready(file.read(0x27d3be, &mut bytes)), Ok(2));
+    assert_eq!(ready(file.read(0x27d3c0, &mut bytes)), Ok(0));
     TestResult::Pass
 }
 kernel_test_in!(

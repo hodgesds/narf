@@ -340,7 +340,8 @@ fn smoke_coredump_live_gt_capture_stop_and_authority_loss() -> TestResult {
     assert_eq!(arena.live_allocations(), live);
     let dump = coredump::take_for_test(54);
     assert_eq!(&dump[..8], b"NARFCDMP");
-    assert_eq!(u32::from_le_bytes(dump[8..12].try_into().unwrap()), 3);
+    // Wire version 4 (the Xe text section); its length moved with it.
+    assert_eq!(u32::from_le_bytes(dump[8..12].try_into().unwrap()), 4);
     assert_eq!(dump.len(), 0x27d3c0);
     assert_eq!(u32::from_le_bytes(dump[72..76].try_into().unwrap()), 31);
     assert_eq!(
