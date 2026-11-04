@@ -8,14 +8,20 @@
 //! `rtl8xxxu_bss_info_changed` ASSOC (`ra_connect_8192e`), the 2 s
 //! `rtl8xxxu_ra_iter` watchdog and `rtl8xxxu_stop` (`disable_rf`). The
 //! admitted signed permission (`N92P`/`N8BP`) is the only channel/rate
-//! authority; nothing here widens it. Other channels are reached only with
+//! authority. Other channels are reached only with
 //! a grant minted from the same signed record and authenticated domain
 //! (`Authority::grant`), through a cold `retune` (`rtl8xxxu_stop`, the
 //! chip power-off and a fresh `rtl8xxxu_init_device` lifecycle, then
-//! `rtl8xxxu_start` on the new channel). QoS DATA needs the programmed
+//! `rtl8xxxu_start` on the new channel). A 40 MHz operating channel is
+//! reached only with a wide grant minted from the same record and domain
+//! (`Authority::grant_wide`) and activated by `Radio::widen` after a
+//! Forty negotiation; the initial grant never widens itself. QoS DATA needs the programmed
 //! EDCA rows; HT20 MCS reception, firmware-RA HT masks and A-MPDU fields
 //! need a negotiated HT association (`associate(.., ht = true)`) whose
 //! local capability is `ht_local` (the signed admitted MCS set).
+//! The HT40 variant lives in `ht40_capability`: it adds
+//! SUP_WIDTH_20_40, SGI_40 and MCS32 (RX-only), and is offered only to
+//! a station holding a wide grant.
 use super::{
     btcoex::Coex,
     firmware_transport::{ControlIo, Error as ControlError, Owner as Firmware, Stage},
@@ -65,6 +71,14 @@ impl Grant {
         match self {
             Self::Rtl8192e(p) => p.admitted(),
             Self::Rtl8723b(p) => p.admitted(),
+        }
+    }
+    /// The operating width this grant qualifies: `Ht20` for the initial
+    /// grant, `Ht40Above`/`Ht40Below` for a wide grant.
+    pub fn width(&self) -> super::rtl8192e_radio::Width {
+        match self {
+            Self::Rtl8192e(p) => p.width(),
+            Self::Rtl8723b(p) => p.width(),
         }
     }
     fn chip(&self) -> ChipFamily {
@@ -133,6 +147,27 @@ impl Authority {
                 .map_err(|_| Error::Profile),
         }
     }
+    /// A 40 MHz grant for `primary` at `width` (secondary above or below),
+    /// minted from the same signed record and domain: the record must
+    /// carry a measured row for that primary/width and the domain must
+    /// allow the full 40 MHz span. Refusal leaves the caller at 20 MHz;
+    /// it is never a fallback to a narrower grant.
+    pub fn grant_wide(
+        &self,
+        primary: u8,
+        width: super::rtl8192e_radio::Width,
+    ) -> Result<Grant, Error> {
+        match self {
+            Self::Rtl8192e { record, domain } => record
+                .permission(domain, primary, width)
+                .map(Grant::Rtl8192e)
+                .map_err(|_| Error::Profile),
+            Self::Rtl8723b { record, domain } => record
+                .permission(domain, primary, width)
+                .map(Grant::Rtl8723b)
+                .map_err(|_| Error::Profile),
+        }
+    }
     /// Channels 1..=13 this record and domain currently grant.
     pub fn channels(&self) -> Vec<u8> {
         (1..=13).filter(|c| self.grant(*c).is_ok()).collect()
@@ -188,19 +223,26 @@ pub(super) fn mpdu(frame: rtl8192e_packet::Frame) -> Mpdu {
 
 /// Gen2 station RX admission of one rxdesc24 MPDU (`rtl8xxxu_parse_rxdesc24`
 /// facts, checked before any crypto): legacy 20 MHz plaintext always; with
-/// a negotiated HT20 association (`ht`) also HT MCS within the advertised
-/// RX streams at 20 MHz (`Frame::admitted(ht, false, ba)`), A-MPDU members
-/// only on a TID in `rx_ba` (accepted recipient sessions), and a
+/// a negotiated HT association (`ht`) also HT MCS within the advertised
+/// RX streams at 20 MHz, or at 40 MHz once `ht40` (a widened Forty
+/// association) is active (`Frame::admitted(ht, ht40, ba)`), A-MPDU
+/// members only on a TID in `rx_ba` (accepted recipient sessions), and a
 /// standalone A-MSDU whose descriptor and QoS-header A-MSDU bits agree,
 /// never inside an A-MPDU (the ADDBA response clears A-MSDU permission:
 /// rtl8xxxu lacks `SUPPORTS_AMSDU_IN_AMPDU`).
-pub(super) fn admit(frame: &rtl8192e_packet::Frame, ht: bool, rx_ba: u8, streams: u8) -> bool {
+pub(super) fn admit(
+    frame: &rtl8192e_packet::Frame,
+    ht: bool,
+    ht40: bool,
+    rx_ba: u8,
+    streams: u8,
+) -> bool {
     if frame.ht() && (!ht || frame.rate >= MCS0 + 8 * streams.clamp(1, 2)) {
         return false;
     }
     let ba = ht && frame.qos && frame.tid < 8 && rx_ba & (1 << frame.tid) != 0;
     if !frame.amsdu {
-        return frame.admitted(ht, false, ba);
+        return frame.admitted(ht, ht40, ba);
     }
     let b = &frame.bytes;
     ht && frame.ht()
@@ -210,7 +252,7 @@ pub(super) fn admit(frame: &rtl8192e_packet::Frame, ht: bool, rx_ba: u8, streams
         && !frame.more_frag
         && !frame.ldpc
         && !frame.stbc
-        && !frame.bandwidth40
+        && (!frame.bandwidth40 || ht40)
         && b.len() >= 26
         && b[0] == 0x88
         && b[1] & 4 == 0
@@ -222,11 +264,12 @@ pub(super) fn admit(frame: &rtl8192e_packet::Frame, ht: bool, rx_ba: u8, streams
 }
 
 /// The station-level gate for a gen2 `Mpdu` (descriptor facts already
-/// checked by `admit`): plaintext 20 MHz, legacy rates, or HT MCS0..15
-/// only under a negotiated HT association.
-pub(super) fn station_admitted(frame: &Mpdu, ht: bool) -> bool {
+/// checked by `admit`): plaintext, legacy rates, or HT MCS0..15 only
+/// under a negotiated HT association, at 20 MHz or at 40 MHz once `ht40`
+/// (a widened Forty association) is active.
+pub(super) fn station_admitted(frame: &Mpdu, ht: bool, ht40: bool) -> bool {
     !frame.decrypted
-        && !frame.bandwidth40
+        && (!frame.bandwidth40 || ht40)
         && frame.native.is_none()
         && frame.wide.is_none()
         && if frame.ht {
@@ -243,10 +286,53 @@ pub(super) fn station_admitted(frame: &Mpdu, ht: bool) -> bool {
 /// 2T board whose signed record admits MCS8..15 (a 1T2R RTL8191EU or a 2T
 /// record without 2SS rows advertises one stream). TX selection is the
 /// signed admitted MCS set; a record admitting no MCS keeps the legacy
-/// station. Not advertised: SUP_WIDTH_20_40/SGI_40 (HT40 is not granted)
-/// and MCS32 (`rx_mask[4]`, an HT40-only duplicate).
+/// station. Without a wide grant the station advertises HT20 only: no
+/// SUP_WIDTH_20_40, no SGI_40, no MCS32 (`rx_mask[4]`, an HT40-only
+/// duplicate); see `ht40_capability` for the granted variant.
 pub(super) fn ht_local(admitted: u32, tx_paths: u8) -> Option<LocalPhy> {
     LocalPhy::ht20(ht_capability(admitted, tx_paths)?).ok()
+}
+
+/// `rtl8xxxu_probe` HT capability (core.c `sband->ht_cap`) for HT40:
+/// the HT20 capability plus `SUP_WIDTH_20_40`, `SGI_40` in both
+/// directions and MCS32 (`rx_mask[4]` bit 0, the 40 MHz duplicate,
+/// RX-only: the TX mask and TX selection never carry it, since the
+/// station never transmits the duplicate mode). Only a station holding
+/// a wide grant for its primary offers this; the grant, not the
+/// capability computation, is the authority.
+pub(super) fn ht40_capability(admitted: u32, tx_paths: u8) -> Option<LocalHt> {
+    let one = (admitted >> 12) as u8;
+    let two = (admitted >> 20) as u8;
+    let two_ss = tx_paths == 2 && two != 0;
+    if one == 0 && !two_ss {
+        return None;
+    }
+    let mut rx = [0u8; 10];
+    rx[0] = 0xff;
+    rx[1] = if two_ss { 0xff } else { 0 };
+    rx[4] = 1;
+    let mut tx = [0u8; 10];
+    tx[0] = 0xff;
+    tx[1] = if two_ss { 0xff } else { 0 };
+    let mut selection = [0u8; 10];
+    selection[0] = one;
+    selection[1] = if two_ss { two } else { 0 };
+    let gi = HtGi {
+        rx20: true,
+        tx20: true,
+        rx40: true,
+        tx40: true,
+    };
+    LocalHt::new(rx, tx, HtWidth::TwentyForty, gi, 3, 7)
+        .ok()?
+        .with_tx_selection(selection)
+        .ok()
+}
+
+/// The HT40 local capability, offered only to a station holding a wide
+/// grant for its primary.
+pub(super) fn ht40_local(admitted: u32, tx_paths: u8) -> Option<LocalPhy> {
+    LocalPhy::ht40(ht40_capability(admitted, tx_paths)?).ok()
 }
 pub(super) fn ht_capability(admitted: u32, tx_paths: u8) -> Option<LocalHt> {
     let one = (admitted >> 12) as u8;
@@ -336,6 +422,15 @@ pub struct Radio<C: ControlIo, B: PacketIo> {
     ht: bool,
     /// TIDs with an accepted recipient BA session (A-MPDU RX admission).
     rx_ba: u8,
+    /// Offered-but-unactivated 40 MHz grant for the current primary
+    /// (minted at connect when the BSS operates at 40 MHz and the
+    /// signed record admits it; activated by `widen` only on a Forty
+    /// negotiation, retained across stops for `rejoin`, cleared by
+    /// `offer_wide(None)` at the next connect).
+    wide: Option<Grant>,
+    /// `widen` has programmed the 40 MHz channel and no stop has
+    /// since cleared it: RX admission and firmware RA use 40 MHz.
+    wide_active: bool,
 }
 impl<C: ControlIo, B: PacketIo> core::fmt::Debug for Radio<C, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -402,6 +497,8 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             generation: 1,
             ht: false,
             rx_ba: 0,
+            wide: None,
+            wide_active: false,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -429,9 +526,81 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
     pub fn generation(&self) -> u64 {
         self.generation
     }
-    /// The local HT20 capability this board's signed record supports.
+    /// The local HT capability this board's signed record supports:
+    /// HT40 when a wide grant is held for the current primary, else
+    /// HT20.
     pub(super) fn ht_local(&self) -> Option<LocalPhy> {
-        ht_local(self.grant.admitted(), self.tx_paths)
+        if self.wide.is_some() {
+            ht40_local(self.grant.admitted(), self.tx_paths)
+        } else {
+            ht_local(self.grant.admitted(), self.tx_paths)
+        }
+    }
+    /// Offer a 40 MHz grant for the current primary, or clear any
+    /// offered grant. The grant must be for this radio's chip and
+    /// primary at a Forty width; anything else is a programming error
+    /// and refuses, leaving the previous offer untouched. Offering
+    /// clears any prior activation: a new offer must be widened anew.
+    pub(super) fn offer_wide(&mut self, wide: Option<Grant>) -> Result<(), Error> {
+        if let Some(grant) = &wide {
+            if grant.chip() != self.chip()
+                || grant.primary() != self.grant.primary()
+                || !matches!(
+                    grant.width(),
+                    super::rtl8192e_radio::Width::Ht40Above
+                        | super::rtl8192e_radio::Width::Ht40Below
+                )
+            {
+                return Err(Error::State);
+            }
+        }
+        self.wide = wide;
+        self.wide_active = false;
+        Ok(())
+    }
+    /// The offered wide grant's width, if one is held.
+    pub(super) fn wide_width(&self) -> Option<super::rtl8192e_radio::Width> {
+        self.wide.as_ref().map(Grant::width)
+    }
+    /// A `widen` is in effect: RX admission and firmware RA use 40 MHz.
+    pub(super) fn wide_active(&self) -> bool {
+        self.wide_active
+    }
+    /// Program the offered 40 MHz channel (`set_tx_power` with the
+    /// wide flag, then `config_channel` at the wide width) on a
+    /// receiving, unassociated radio, and mark 40 MHz active. The
+    /// initial grant stays the admission anchor; only the programmed
+    /// channel and the active flag change. Permission refusal (a
+    /// mismatched record or domain) fails before any transfer; a
+    /// mid-tune device error fails the radio terminally through the
+    /// attempt guard, as every other radio operation.
+    pub(super) async fn widen(&mut self) -> Result<(), Error> {
+        self.current()?;
+        if self.phase() != Phase::Receiving || self.peer.is_none() || self.ra.is_some() {
+            return Err(Error::State);
+        }
+        let Some(wide) = self.wide else {
+            return Err(Error::State);
+        };
+        if wide.primary() != self.grant.primary() {
+            return Err(Error::State);
+        }
+        match &wide {
+            Grant::Rtl8192e(permission) => {
+                self.firmware
+                    .tune_8192e(permission, wide.primary(), wide.width())
+                    .await
+                    .map_err(Error::Control)?;
+            }
+            Grant::Rtl8723b(permission) => {
+                self.firmware
+                    .tune_8723b(permission, wide.primary(), wide.width())
+                    .await
+                    .map_err(Error::Control)?;
+            }
+        }
+        self.wide_active = true;
+        Ok(())
     }
     /// Advertised RX spatial streams (`rx_mask[1]` present).
     fn streams(&self) -> u8 {
@@ -563,7 +732,7 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
                             self.rssi.add(signal.unwrap_or(0));
                         }
                     }
-                    if admit(&frame, self.ht, self.rx_ba, streams) {
+                    if admit(&frame, self.ht, self.wide_active, self.rx_ba, streams) {
                         frames.push(mpdu(frame));
                     }
                 }
@@ -710,7 +879,7 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
         if peer.ht && (!self.packets.qos || self.ht_local().is_none()) {
             return Err(Error::Profile);
         }
-        let mut ra = Ra::new(peer, self.grant.admitted(), self.tx_paths, false)
+        let mut ra = Ra::new(peer, self.grant.admitted(), self.tx_paths, self.wide_active)
             .map_err(|_| Error::Profile)?;
         let mut attempt = self.attempt();
         let result = self.firmware.ra_connect_8192e(&mut ra, aid).await;
@@ -794,6 +963,7 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             self.bt.clear();
             self.ht = false;
             self.rx_ba = 0;
+            self.wide_active = false;
             self.packets.ht = false;
             self.packets.ampdu = None;
             let f = &self.firmware;

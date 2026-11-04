@@ -1719,12 +1719,28 @@ receipt outstanding. An associated-scan `rejoin` restores HT admission and
 BA facts after the cold restart and reprograms TX_START limits for a
 started originator session. Disconnect/failure retires all sessions.
 
-Deviations: no HT40/SGI_40 (no HT40 grant for gen2); MCS32 (`rx_mask[4]`)
-not advertised; a 1T2R RTL8191EU advertises one RX stream (Linux
+Deviations: HT40 is grant-gated, not absent: against a 40 MHz BSS the
+station mints a wide grant from the same signed record and domain
+(`Authority::grant_wide`, HT40-above/below rows + 40 MHz regulatory
+span), offers HT40 with SGI_40 and MCS32 (`rx_mask[4]`, RX-only — the
+station never transmits the duplicate mode), programs the wide channel
+with `Radio::widen` on a Forty negotiation, and admits 40 MHz RX (DATA,
+standalone A-MSDU) only while widened. A missing wide grant at connect
+falls back to a 20 MHz offer; a Forty geometry without a matching wide
+grant, or a widen failure, fails the association rather than silently
+falling back. A Forty rejoin re-programs the retained wide grant. A
+1T2R RTL8191EU advertises one RX stream (Linux
 `rf_paths = 2`); active-scan Probe Requests carry no HT Capabilities; no
-BlockAckReq (RX filter passes none, as RTL8188EU). Regressions (written,
-unexecuted): `smoke_rtl8xxxu_gen2_ht20_rx_admission`,
+BlockAckReq (RX filter passes none, as RTL8188EU). A distinct MCS32
+rxdesc rate byte, if silicon reports one, is unobserved and remains a
+follow-up rate case, not a silent drop; DSSS/CCK40 is not advertised.
+Regressions (written, unexecuted): `smoke_rtl8xxxu_gen2_ht20_rx_admission`,
+`smoke_rtl8xxxu_gen2_ht40_rx_admission`,
 `smoke_rtl8xxxu_gen2_ht_local_capability` (`gen2_radio_tests.rs`),
+`smoke_rtl8xxxu_gen2_ht40_negotiation_and_secondary`
+(`management_tests.rs`),
+`smoke_rtl8xxxu_gen2_ht_peer_ra_bandwidth40`
+(`gen2_station_tests.rs`),
 `smoke_rtl8xxxu_gen2_ba_recipient`, `smoke_rtl8xxxu_gen2_ba_originator`
 (`ba_sessions_tests.rs`).
 
@@ -1753,7 +1769,7 @@ physical link metadata (`set_link_metadata_for` /
 the operator's IFF_UP (`set_link_state` is only the initial DOWN
 registration). `disassociate` while DOWN is a no-op.
 
-Deviations / not implemented: no HT40 on gen2; a scan or channel change costs a full cold firmware lifecycle per
+Deviations / not implemented: HT40 on gen2 is grant-gated (wide grant + Forty negotiation + `widen`; no live 40 MHz scan); a scan or channel change costs a full cold firmware lifecycle per
 transition (Linux retunes live); the retained host TX/RX rings are not
 serviced on away visits (home grace services one Ethernet frame per step);
 no station power-save

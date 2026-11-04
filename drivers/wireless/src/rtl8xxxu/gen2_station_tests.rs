@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{legacy_peer, open_data, open_qos_data};
-use crate::rtl8xxxu::rtl8192e_ra::Ra;
+use crate::rtl8xxxu::rtl8192e_ra::{Peer, Ra};
 
 const OWN: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const BSSID: [u8; 6] = [2, 0, 0, 0, 0, 2];
@@ -116,4 +116,26 @@ fn smoke_rtl8xxxu_gen2_wmm_qos_data_queues() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/gen2station",
     smoke_rtl8xxxu_gen2_wmm_qos_data_queues
+);
+
+/// A widened Forty association programs firmware RA at 40 MHz for an HT
+/// peer; the same peer still associates at 20 MHz when not widened.
+fn smoke_rtl8xxxu_gen2_ht_peer_ra_bandwidth40() -> TestResult {
+    let peer = Peer {
+        legacy: 0xf0ff,
+        mcs: [0xff, 0],
+        ht: true,
+        sgi: true,
+    };
+    if Ra::new(peer, 0x000f_ffff, 1, true).is_err() {
+        return TestResult::Fail("40 MHz HT peer");
+    }
+    if Ra::new(peer, 0x000f_ffff, 1, false).is_err() {
+        return TestResult::Fail("20 MHz HT peer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/gen2station",
+    smoke_rtl8xxxu_gen2_ht_peer_ra_bandwidth40
 );
