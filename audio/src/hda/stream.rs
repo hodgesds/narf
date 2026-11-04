@@ -142,11 +142,14 @@ impl Stream {
     }
     fn start(&mut self, dev: &IntelHda) -> Result<(), SoundError> {
         let ring = self.ring.as_mut().ok_or(SoundError::BadState)?;
+        // No queued-data requirement: a prepared ring with nothing
+        // written yet starts DMA on the reset-zeroed buffer (silence),
+        // and the restart sequence (fresh prepare, then start) must
+        // not need a preceding write. The other guards still apply.
         if !ring.prepared
             || ring.running
             || ring.xrun
             || dev.irq.failed.load(Ordering::Acquire)
-            || (!self.capture && ring.application == 0)
         {
             return Err(SoundError::BadState);
         }
