@@ -5229,7 +5229,7 @@ fn handle_atomic(
         .chunks_exact(8)
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
         .collect();
-    atomic_commit(
+    let result = atomic_commit(
         card_index,
         mode_state,
         AtomicRequest {
@@ -5243,7 +5243,87 @@ fn handle_atomic(
         events,
         out_fences,
         None,
-    )
+    );
+    if let Err(error) = &result {
+        note_atomic_rejection(
+            mode_state,
+            req.flags,
+            error,
+            &objects,
+            &prop_counts,
+            &props,
+            &values,
+        );
+    }
+    result
+}
+
+/// Bring-up visibility for refused atomic requests: most rejection paths
+/// return EINVAL without a log line, so a compositor's "Modeset failed:
+/// Invalid argument" could not be traced to a property. Log each distinct
+/// (flags, error, property set) once, with every object/property/value and
+/// a MODE_ID blob's timing, at most [`ATOMIC_REJECT_LOG_LIMIT`] per boot.
+const ATOMIC_REJECT_LOG_LIMIT: usize = 24;
+
+fn note_atomic_rejection(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    flags: u32,
+    error: &FsError,
+    objects: &[u32],
+    prop_counts: &[u32],
+    props: &[u32],
+    values: &[u64],
+) {
+    static SEEN: narf_lib::sync::IrqSafeSpinLock<Vec<(u32, u64, Vec<u32>)>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    let mut error_text = alloc::string::String::new();
+    let _ = write!(error_text, "{error:?}");
+    let error_key = error_text
+        .bytes()
+        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
+    {
+        let mut seen = SEEN.lock();
+        if seen.len() >= ATOMIC_REJECT_LOG_LIMIT
+            || seen
+                .iter()
+                .any(|(f, e, p)| *f == flags && *e == error_key && p.as_slice() == props)
+        {
+            return;
+        }
+        seen.push((flags, error_key, props.to_vec()));
+    }
+    let mut line = alloc::string::String::new();
+    let _ = write!(
+        line,
+        "  drm: ATOMIC refused flags={flags:#x} err={error_text}:"
+    );
+    let mut at = 0usize;
+    let card = mode_state.lock();
+    for (&object, &count) in objects.iter().zip(prop_counts) {
+        let _ = write!(line, " obj{object}{{");
+        let end = (at + count as usize).min(props.len());
+        for (i, &prop) in props.iter().enumerate().take(end).skip(at) {
+            let value = values.get(i).copied().unwrap_or(0);
+            let _ = write!(line, "{prop:#x}={value:#x}");
+            if prop == CRTC_MODE_ID_PROP_ID && value != 0 {
+                if let Some(mode) = card
+                    .property_blob(value as u32)
+                    .and_then(crate::drm::ioctl::DrmModeModeInfo::from_bytes)
+                {
+                    let _ = write!(
+                        line,
+                        "[{}x{} {}kHz h{} v{}]",
+                        mode.hdisplay, mode.vdisplay, mode.clock, mode.htotal, mode.vtotal
+                    );
+                }
+            }
+            line.push(' ');
+        }
+        line.push('}');
+        at += count as usize;
+    }
+    drop(card);
+    let _ = writeln!(narf_console::Writer, "{line}");
 }
 
 /// One decoded DRM_IOCTL_MODE_ATOMIC request: its flags and event cookie
@@ -5636,6 +5716,22 @@ fn atomic_commit(
                 narf_console::Writer,
                 "  drm: ATOMIC check failed: {error:?}"
             );
+            if matches!(error, crate::drm::atomic::AtomicError::ModesetNotAllowed) {
+                for c in state.crtcs.iter().filter(|c| c.needs_modeset()) {
+                    let old = card.crtc(c.id).ok().map(|o| (o.enabled, o.mode));
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  drm: ModesetNotAllowed crtc {}: mode_changed={} active_changed={} connectors_changed={} old={:?} new=({}, {:?})",
+                        c.id,
+                        c.mode_changed,
+                        c.active_changed,
+                        c.connectors_changed,
+                        old,
+                        c.active,
+                        c.mode
+                    );
+                }
+            }
             return Err(FsError::InvalidData);
         }
         check_native_atomic(&card, &state)?;
