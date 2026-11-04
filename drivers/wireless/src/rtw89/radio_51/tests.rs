@@ -118,6 +118,7 @@ fn smoke_rtw89_n51_radio_owner_starts_new() -> TestResult {
         || radio.bases().is_some()
         || radio.epoch() != 0
         || radio.tracker().is_some()
+        || radio.antdiv().is_some()
         || radio.init().results().is_some()
         || radio.rfk().state() != ChannelState::New
     {

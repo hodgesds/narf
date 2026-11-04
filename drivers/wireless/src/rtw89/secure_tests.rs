@@ -55,6 +55,52 @@ kernel_test_in!(
     smoke_rtw89_all_physical_secure_selections
 );
 
+fn smoke_rtw89_8851b_secure_policy_is_linux_null_list() -> TestResult {
+    // The exact Linux RTL8851B policy: `rtw8851b_chip_info.fw_blacklist`
+    // is NULL, so no host chip list is enforced at all.
+    let policy = match Blacklist::upstream(ChipId::Rtl8851B) {
+        Some(policy) if !policy.has_chip_list() => policy,
+        _ => return TestResult::Fail("8851B upstream policy is not the NULL list"),
+    };
+    // Contrast: 8852B/8852C carry the version-0/all-clear default list.
+    if Blacklist::upstream(ChipId::Rtl8852B).map(|p| p.has_chip_list()) != Some(true) {
+        return TestResult::Fail("8852B upstream policy lost its chip list");
+    }
+    // Legacy fuse selection (255, 0x7F): secure boot enabled.
+    let fuses = Fuses::decode(ChipId::Rtl8851B, 255, 0x7F).unwrap();
+    if !fuses.enabled {
+        return TestResult::Fail("8851B legacy fuses decode as disabled");
+    }
+    // Content present but hostile — bit byte and version both 0xFF —
+    // still passes: with no chip list, only the bounds are enforced
+    // (fw.c `__check_secure_blacklist` returns -ENOENT, the section
+    // parse only WARN_ONCEs, and the MSS signature is the policy).
+    let mut content = [0u8; 64];
+    content[32] = 0xFF;
+    content[33] = 0xFF;
+    if fuses.check_blacklist(Some(policy), &content).is_err() {
+        return TestResult::Fail("8851B NULL list rejected present content");
+    }
+    // Content too short: the bounds are still enforced.
+    if fuses.check_blacklist(Some(policy), &[0; 10]).is_ok() {
+        return TestResult::Fail("8851B NULL list accepted truncated content");
+    }
+    // Secure boot off: no policy is needed.
+    let off = Fuses::decode(ChipId::Rtl8851B, 255, 255).unwrap();
+    if off.check_blacklist(None, &content).is_err() {
+        return TestResult::Fail("8851B disabled fuses demanded a policy");
+    }
+    // Secure boot on without a policy: refused, never silently allowed.
+    if fuses.check_blacklist(None, &content).is_ok() {
+        return TestResult::Fail("8851B enabled fuses accepted a missing policy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8851b_secure_policy_is_linux_null_list
+);
+
 fn smoke_rtw89_signature_rank_dimensions_and_dsp_stride() -> TestResult {
     let mut image = vec![0; 32 + 32 + 3 * 520];
     image[21] = 1;
