@@ -774,6 +774,7 @@ pub(crate) mod tests {
         let pdos = [SourcePdo::Fixed {
             voltage_mv: 5000,
             max_current_ma: 3000,
+            epr_mode_capable: false,
         }];
         let h = Header::data(
             DataMsg::SourceCapabilities,
@@ -1282,7 +1283,10 @@ pub(crate) mod tests {
             Ok(CableStep::Advanced(_)) => {}
             _ => return TestResult::Fail("non-EPR active SOP' ACK should chain to SOP''"),
         }
-        let (t, f) = ack_frame(SopTarget::SopDoublePrime, &passive_ack_objects_with_epr(true));
+        let (t, f) = ack_frame(
+            SopTarget::SopDoublePrime,
+            &passive_ack_objects_with_epr(true),
+        );
         chip.enqueue_rx_sop(t, f);
         match cable.step(&cap) {
             Ok(CableStep::Done(_)) => {}
