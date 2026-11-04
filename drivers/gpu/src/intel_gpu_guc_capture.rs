@@ -1057,6 +1057,9 @@ impl Queue {
 /// `__xe_devcoredump_read` in source order. NARF keeps the GuC log, CT,
 /// LRC/ring bodies and VM state as the bundle's binary sections; this text
 /// names their header offsets instead of re-encoding them in ascii85.
+// Each argument is one input __xe_devcoredump_read prints from; grouping
+// them would only rename the parameters.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn print_dump(
     out: &mut impl Write,
     device: &Device,
