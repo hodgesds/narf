@@ -1323,6 +1323,95 @@ pub fn rx_max_size(gen: RtlGen) -> u16 {
     }
 }
 
+/// MTU → `PLA_RMS` programming (Linux `mtu_to_size`, r8152.c):
+/// receive-max-size = MTU + `VLAN_ETH_HLEN` (18) + `ETH_FCS_LEN`
+/// (4).
+pub fn mtu_to_rms(mtu: u32) -> u32 {
+    mtu + 22
+}
+
+/// Linux `ndo_change_mtu` bounds (r8152.c probe switch):
+/// `ETH_MIN_MTU` (68) ..= max, where max is 1500 for VER_01/02/07
+/// and unknown/test versions, 9194 (9 KiB − 22) for
+/// VER_03/04/05/06/08/09/14, 15338 (15 KiB − 22) for VER_10/11, and
+/// 16362 (16 KiB − 22) for VER_12/13/15/16/17.
+pub fn max_mtu_for(version: RtlVersion) -> u32 {
+    match version {
+        RtlVersion::Ver03
+        | RtlVersion::Ver04
+        | RtlVersion::Ver05
+        | RtlVersion::Ver06
+        | RtlVersion::Ver08
+        | RtlVersion::Ver09
+        | RtlVersion::Ver14 => 9194,
+        RtlVersion::Ver10 | RtlVersion::Ver11 => 15338,
+        RtlVersion::Ver12
+        | RtlVersion::Ver13
+        | RtlVersion::Ver15
+        | RtlVersion::Ver16
+        | RtlVersion::Ver17 => 16362,
+        _ => 1500,
+    }
+}
+
+/// Validate a requested MTU against the chip version:
+/// `Err(22)` outside 68..=max.
+pub fn validate_mtu(version: RtlVersion, mtu: u32) -> Result<(), i32> {
+    if (68..=max_mtu_for(version)).contains(&mtu) {
+        Ok(())
+    } else {
+        Err(22)
+    }
+}
+
+/// `PLA_RMS` reprogram needed for an MTU change, if any. Linux
+/// leaves `PLA_RMS` untouched for VER_01/02/07 (FE: fixed 1522
+/// bound, max MTU 1500) and for versions with no `change_mtu` op;
+/// GbE versions with an op write `PLA_RMS` = MTU + 22. `None`
+/// when the MTU is unchanged.
+pub fn mtu_reprogram(version: RtlVersion, current: u32, desired: u32) -> Option<u16> {
+    if current == desired {
+        return None;
+    }
+    match version {
+        RtlVersion::Ver03
+        | RtlVersion::Ver04
+        | RtlVersion::Ver05
+        | RtlVersion::Ver06
+        | RtlVersion::Ver08
+        | RtlVersion::Ver09
+        | RtlVersion::Ver10
+        | RtlVersion::Ver11
+        | RtlVersion::Ver12
+        | RtlVersion::Ver13
+        | RtlVersion::Ver14
+        | RtlVersion::Ver15
+        | RtlVersion::Ver16
+        | RtlVersion::Ver17 => Some(mtu_to_rms(desired) as u16),
+        _ => None,
+    }
+}
+
+/// Pure MTU-change transition for a bound record, returning
+/// `(new_mtu, new_pending)`. `Err(19)` when the record is not
+/// live (detached or pump stopped); `Err(22)` when the MTU is out
+/// of range. A pending write survives an unchanged MTU; a changed
+/// GbE MTU overwrites it with the new bound.
+pub fn mtu_transition(
+    version: RtlVersion,
+    current: u32,
+    pending: Option<u16>,
+    desired: u32,
+    live: bool,
+) -> Result<(u32, Option<u16>), i32> {
+    if !live {
+        return Err(19);
+    }
+    validate_mtu(version, desired)?;
+    let next_pending = mtu_reprogram(version, current, desired).or(pending);
+    Ok((desired, next_pending))
+}
+
 /// One bound RTL device.
 #[derive(Clone, Debug)]
 pub struct RtlDevice {
@@ -1344,6 +1433,13 @@ pub struct RtlDevice {
     pub pump_running: bool,
     /// Last `PLA_PHYSTATUS` byte sampled (0xFF = never sampled).
     pub link_byte: u8,
+    /// Registry MTU the record tracks. Fresh registrations start
+    /// at 1500; rebinds restore the retired entry's MTU, synced
+    /// from the registry after registration.
+    pub mtu: u32,
+    /// `PLA_RMS` value awaiting application by the RX pump
+    /// (MTU-change path; `None` when hardware matches `mtu`).
+    pub pending_rms: Option<u16>,
     /// Detach tombstone: set by `detach_r8152_slot`. The pump
     /// exits when `pump_running` clears; TX resolves to `None`.
     /// Records are never removed, because net-registry TX
@@ -1355,6 +1451,52 @@ pub struct RtlDevice {
 
 /// System-wide registry of bound RTL devices.
 pub static RTL_DEVICES: IrqSafeSpinLock<Vec<RtlDevice>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Driver control hook installed on each bound r8152 iface
+/// (issue #1258). `configure` is synchronous while USB control
+/// transfers are async, so it validates and records only: the RX
+/// pump applies a pending `PLA_RMS` write on its next turn.
+/// Registry metadata therefore commits after validation, with
+/// hardware following within one pump turn — a transient window,
+/// never a permanent divergence — and a failed pump write stays
+/// pending for the next turn. Non-MTU fields are deliberately
+/// untouched here: MAC / promiscuity / address changes keep
+/// their existing registry-only behavior.
+#[derive(Debug)]
+pub struct RtlControl {
+    idx: usize,
+}
+
+impl narf_net::iface::DeviceControl for RtlControl {
+    fn configure(&self, desired: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+        let mut g = RTL_DEVICES.lock();
+        let Some(rec) = g.get_mut(self.idx) else {
+            return Err(19);
+        };
+        let live = !rec.detached && rec.pump_running;
+        let (mtu, pending) =
+            mtu_transition(rec.version, rec.mtu, rec.pending_rms, desired.mtu, live)?;
+        rec.mtu = mtu;
+        rec.pending_rms = pending;
+        Ok(())
+    }
+}
+
+/// Take a pending `PLA_RMS` reprogram for the RX pump to apply.
+fn take_pending_rms(idx: usize) -> Option<u16> {
+    RTL_DEVICES
+        .lock()
+        .get_mut(idx)
+        .and_then(|rec| rec.pending_rms.take())
+}
+
+/// Restore a `PLA_RMS` reprogram the pump failed to apply, so
+/// the next turn retries it.
+fn restore_pending_rms(idx: usize, rms: u16) {
+    if let Some(rec) = RTL_DEVICES.lock().get_mut(idx) {
+        rec.pending_rms = Some(rms);
+    }
+}
 
 /// Resolve a device-record index to its TX target
 /// `(slot_id, bulk_out_dci)`. The send trampoline routes through
@@ -1548,6 +1690,8 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
             iface_name: format!("usb-rtl{}", idx),
             pump_running: false,
             link_byte: 0xFF,
+            mtu: 1500,
+            pending_rms: None,
             detached: false,
         });
         idx
@@ -1566,6 +1710,19 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         g[idx].iface_name = assigned.clone();
         g[idx].pump_running = true;
     }
+    // Sync the record's MTU from the registry (a rebind restores
+    // the retired entry's MTU, which need not be 1500), then
+    // install the control hook so registry MTU changes validate
+    // against the chip and reprogram `PLA_RMS` (issue #1258).
+    {
+        let mut g = RTL_DEVICES.lock();
+        if let Some(rec) = g.get_mut(idx) {
+            rec.mtu = narf_net::iface::lookup(&assigned)
+                .map(|s| s.mtu)
+                .unwrap_or(1500);
+        }
+    }
+    narf_net::iface::set_device_control(&assigned, Arc::new(RtlControl { idx }));
     let _ = writeln!(
         narf_console::Writer,
         "  net: r8152 bound slot {} as {} (gen {:?}, tcr1 version {:#06x} {:?}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
@@ -1634,6 +1791,18 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
     let mut errors = 0u32;
     let mut turns = 0u32;
     while pump_should_continue(idx) {
+        // MTU-change path (issue #1258): apply a pending
+        // `PLA_RMS` reprogram before posting reads, so the
+        // receive bound tracks the registry MTU. A failed write
+        // stays pending for the next turn.
+        if let Some(rms) = take_pending_rms(idx) {
+            if ocp_write_word(&device, MCU_TYPE_PLA, PLA_RMS, rms)
+                .await
+                .is_err()
+            {
+                restore_pending_rms(idx, rms);
+            }
+        }
         match device.bulk_in(bulk_in_dci, &mut buf).await {
             Ok(n) if n > 0 => {
                 errors = 0;
@@ -2306,6 +2475,8 @@ pub mod tests {
             iface_name: alloc::format!("usb-rtl-model-{}", slot_id),
             pump_running: false,
             link_byte: 0xFF,
+            mtu: 1500,
+            pending_rms: None,
             detached: false,
         };
         {
@@ -2349,6 +2520,8 @@ pub mod tests {
             iface_name: alloc::format!("usb-rtl-detach{}", slot_id),
             pump_running: true,
             link_byte: 0xFF,
+            mtu: 1500,
+            pending_rms: None,
             detached: false,
         };
         {
@@ -2469,6 +2642,8 @@ pub mod tests {
                 iface_name: alloc::format!("usb-rtl-detach{}", 7),
                 pump_running: true,
                 link_byte: 0xFF,
+                mtu: 1500,
+                pending_rms: None,
                 detached: false,
             });
         }
@@ -2509,6 +2684,8 @@ pub mod tests {
             iface_name: alloc::format!("usb-rtl-detach{}", slot_id),
             pump_running: true,
             link_byte: 0xFF,
+            mtu: 1500,
+            pending_rms: None,
             detached: false,
         };
         {
@@ -3132,4 +3309,85 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_wol_decode_and_ops);
+
+    fn smoke_r8152_mtu_policy() -> TestResult {
+        // Linux max-MTU classes (r8152.c probe switch).
+        if max_mtu_for(RtlVersion::Ver01) != 1500
+            || max_mtu_for(RtlVersion::Ver02) != 1500
+            || max_mtu_for(RtlVersion::Ver07) != 1500
+            || max_mtu_for(RtlVersion::Unknown) != 1500
+            || max_mtu_for(RtlVersion::Test01) != 1500
+        {
+            return TestResult::Fail("FE/unknown max MTU is not 1500");
+        }
+        if max_mtu_for(RtlVersion::Ver03) != 9194 || max_mtu_for(RtlVersion::Ver14) != 9194 {
+            return TestResult::Fail("9 KiB class max MTU is not 9194");
+        }
+        if max_mtu_for(RtlVersion::Ver10) != 15338 {
+            return TestResult::Fail("15 KiB class max MTU is not 15338");
+        }
+        if max_mtu_for(RtlVersion::Ver12) != 16362 || max_mtu_for(RtlVersion::Ver17) != 16362 {
+            return TestResult::Fail("16 KiB class max MTU is not 16362");
+        }
+        // Bounds: 68 accepted, 67 rejected, max accepted, max+1
+        // rejected, per class.
+        if validate_mtu(RtlVersion::Ver03, 68).is_err()
+            || validate_mtu(RtlVersion::Ver03, 67).is_ok()
+            || validate_mtu(RtlVersion::Ver03, 9194).is_err()
+            || validate_mtu(RtlVersion::Ver03, 9195).is_ok()
+            || validate_mtu(RtlVersion::Ver01, 1500).is_err()
+            || validate_mtu(RtlVersion::Ver01, 1501).is_ok()
+        {
+            return TestResult::Fail("MTU validation bounds wrong");
+        }
+        // RMS values: MTU + 22 (VLAN header + FCS).
+        if mtu_to_rms(1500) != 1522 || mtu_to_rms(9000) != 9022 {
+            return TestResult::Fail("MTU to RMS conversion wrong");
+        }
+        // Reprogram decisions: FE never reprograms (Linux leaves
+        // PLA_RMS untouched for VER_01/02/07); GbE reprograms on
+        // change; nothing reprograms when unchanged.
+        if mtu_reprogram(RtlVersion::Ver01, 1500, 1400).is_some()
+            || mtu_reprogram(RtlVersion::Ver03, 1500, 1500).is_some()
+            || mtu_reprogram(RtlVersion::Ver03, 1500, 9000) != Some(9022)
+        {
+            return TestResult::Fail("MTU reprogram decision wrong");
+        }
+        // Transition: not-live rejects with ENODEV; out-of-range
+        // rejects with EINVAL and leaves state untouched; a
+        // pending write survives an unchanged MTU; a changed GbE
+        // MTU overwrites it with the new bound.
+        if mtu_transition(RtlVersion::Ver03, 1500, Some(1522), 9000, false) != Err(19) {
+            return TestResult::Fail("MTU transition on dead record is not ENODEV");
+        }
+        if mtu_transition(RtlVersion::Ver03, 1500, None, 9195, true) != Err(22) {
+            return TestResult::Fail("MTU transition out of range is not EINVAL");
+        }
+        if mtu_transition(RtlVersion::Ver03, 1500, Some(1522), 1500, true) != Ok((1500, Some(1522)))
+        {
+            return TestResult::Fail("unchanged MTU dropped a pending write");
+        }
+        if mtu_transition(RtlVersion::Ver03, 1500, Some(1522), 9000, true) != Ok((9000, Some(9022)))
+        {
+            return TestResult::Fail("changed GbE MTU did not overwrite pending bound");
+        }
+        if mtu_transition(RtlVersion::Ver01, 1500, None, 1400, true) != Ok((1400, None)) {
+            return TestResult::Fail("FE MTU change queued a reprogram");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_mtu_policy);
+
+    fn smoke_r8152_mtu_rms_packing() -> TestResult {
+        // MTU 9000 programs PLA_RMS 9022 (0x233E): word write at
+        // 0xC016 aligns down to 0xC014, byte-enable 0x33 << 2 in
+        // wIndex, value in the high lanes — same packing the
+        // bind-time 1522 case pins.
+        let (_, _, wv, wi, data) = ocp_write_word_pack(MCU_TYPE_PLA, PLA_RMS, 9022);
+        if wv != 0xC014 || wi != 0x01CC || data != [0, 0, 0x3E, 0x23] {
+            return TestResult::Fail("MTU RMS word write packing wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_mtu_rms_packing);
 }

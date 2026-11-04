@@ -369,6 +369,19 @@ also consult upstream Linux GPL sources.
   (CRC/DROP errors and runts dropped, dummy headers skipped).
   Link-status interrupt, offload advertisement, multicast filter,
   VLAN, and jumbo frames are follow-ups, not v1.
+- `r8152` installs an `iface::DeviceControl` at bind, so registry
+  MTU changes validate against the chip version (68..=1500 for
+  FE / unknown versions, 68..=9194 / 15338 / 16362 for the GbE
+  version classes, matching Linux's probe switch) and reprogram
+  `PLA_RMS` to MTU + 22 (VLAN header + FCS) on GbE; FE versions
+  never reprogram, matching Linux, which leaves `PLA_RMS`
+  untouched for VER_01/02/07. Because `configure` is synchronous
+  and USB control transfers are async, the hook records a
+  pending bound the RX pump applies on its next turn; registry
+  metadata commits after validation, with hardware following
+  within one pump turn. Version-specific FIFO tuning from
+  Linux's `change_mtu` variants (`PLA_MTPS`, `PLA_TXFIFO_*`) is
+  not programmed by this path.
 - Address Device reserves a slot before DMA setup, retains Input/Device
   Contexts plus EP0 ring/page before DCBAA publication, and adopts them only
   after the exact command TRB succeeds. Address, Configure, Evaluate, Disable
