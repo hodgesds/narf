@@ -3,7 +3,7 @@ use crate::{
     hda_codec::Codec,
     native_irq::{Kind, Route, State},
 };
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     mem::ManuallyDrop,
     sync::atomic::{fence, AtomicBool, AtomicU32, Ordering},
@@ -67,6 +67,11 @@ pub struct IntelHda {
     /// Sound card index once registered (`u32::MAX` before), for control
     /// change notifications.
     pub(super) card: AtomicU32,
+    /// Power-management park flag (#779): set by quiesce once the
+    /// codecs are D3 and the command + stream engines are off,
+    /// cleared by reinit. The PCM bring-up paths reinit when they
+    /// see it set; the service loops skip work while it is set.
+    suspended: AtomicBool,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -206,6 +211,7 @@ impl IntelHda {
             hdmi: IrqSafeSpinLock::new(Vec::new()),
             hdmi_playback: IrqSafeSpinLock::new(super::hdmi::Playback::from_converter(0)),
             card: AtomicU32::new(u32::MAX),
+            suspended: AtomicBool::new(false),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the
@@ -518,10 +524,321 @@ impl IntelHda {
     }
 
     fn service(&self) {
+        if self.suspended.load(Ordering::Acquire) {
+            return;
+        }
         self.irq.service();
         for state in &self.streams {
             state.lock().update(self);
         }
+    }
+}
+
+// ── Power management (#779) ──────────────────────────────────────────
+// Two layers, one quiesce/reinit core:
+//
+// - System PM: `HdaSystemPm` implements `narf_power::device_pm::
+//   DevicePmOps` and is registered at probe; the S3/s2idle fan-out
+//   calls it with interrupts gated. Suspend refuses (Busy) while
+//   any stream is running or prepared — suspend never discards
+//   stream state — and resume re-inits engines + codecs.
+// - Runtime PM: `HdaRuntimePm` implements `narf_power::runtime_pm::
+//   RuntimePmOps` over the same core, fixture-proven through the
+//   `PciRuntimePm` wrapper. Production probe registration of the
+//   PCI node is a follow-up: moving the function to D3hot needs a
+//   PCM start path that can await resume (the ALSA start hook is
+//   sync), and wiring it without one would let a start touch a
+//   D3hot BAR. The live idle path is the PCM stop hook below
+//   (codecs D3 + engines off, PCI stays D0).
+//
+// The verb path is synchronous in both layers: `send_verb` polls
+// RIRB via MMIO and never waits on an IRQ, so it is safe with
+// interrupts gated and cheap (microseconds on the success path)
+// inside the async runtime callbacks.
+impl IntelHda {
+    /// True when no stream can move samples: every descriptor
+    /// either has no ring or a ring that is neither running nor
+    /// prepared. A prepared-but-idle ring still blocks quiesce:
+    /// its BDL is published and its SD state would go stale across
+    /// a command-ring restart, so the owner must stop it first.
+    fn streams_idle(&self) -> bool {
+        self.streams.iter().all(|s| {
+            !s.lock()
+                .ring
+                .as_ref()
+                .is_some_and(|r| r.running || r.prepared)
+        })
+    }
+
+    /// Send a power-state verb to every codec that discovered an
+    /// audio function group (HDA §7.3.3.10; payload D0 = 0, D3 = 3).
+    /// Codecs without an AFG node are skipped: there is no node to
+    /// address, and guessing one would power-manage the wrong
+    /// widget. On failure the codecs already switched are rolled
+    /// back to D0, so a half-switched controller never escapes.
+    fn set_codec_power(&self, d3: bool) -> Result<(), HdaError> {
+        let mut switched = Vec::new();
+        for codec in &self.codecs {
+            let Some(nid) = codec.afg_node_id else {
+                continue;
+            };
+            // SAFETY: Controller owns this live BAR and its command
+            // rings; the verb targets the codec's own AFG node.
+            let verb = make_verb(
+                codec.addr,
+                nid,
+                crate::hda_codec::verb::SET_POWER_STATE | if d3 { 3 } else { 0 },
+            );
+            // SAFETY: Controller owns this live BAR and its command rings.
+            if let Err(e) = unsafe { self.send_verb(verb) } {
+                for (addr, nid) in switched {
+                    // Best-effort rollback; the original error wins.
+                    // SAFETY: Controller owns this live BAR and its command rings.
+                    let _ = unsafe {
+                        self.send_verb(make_verb(
+                            addr,
+                            nid,
+                            crate::hda_codec::verb::SET_POWER_STATE,
+                        ))
+                    };
+                }
+                return Err(e);
+            }
+            switched.push((codec.addr, nid));
+        }
+        Ok(())
+    }
+
+    /// Power-management quiesce: codecs to D3, command + stream
+    /// engines off, DMA rings retained (host memory survives the
+    /// park). Idempotent: already-suspended is Ok. Refuses with
+    /// Busy when any stream is running or prepared.
+    fn quiesce(&self) -> Result<(), HdaError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.streams_idle() {
+            return Err(HdaError::Busy);
+        }
+        self.set_codec_power(true)?;
+        // SAFETY: Controller owns this live BAR; fixed register
+        // offsets are inside the validated window. Mirrors Drop
+        // minus ring handling: the rings stay owned for resume.
+        unsafe {
+            self.bar0.write32(REG_INTCTL, 0);
+            self.bar0.write8(REG_CORBCTL, 0);
+            self.bar0.write8(REG_RIRBCTL, 0);
+            self.bar0.write32(REG_GCTL, 0);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        if !wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 == 0, 100) {
+            // The engines are already off and the codecs D3: this
+            // is a parked controller even though the reset did not
+            // acknowledge, so mark it suspended — the next
+            // ensure_active (or system resume) runs the full
+            // reinit rather than trusting a half-parked controller.
+            self.suspended.store(true, Ordering::Release);
+            return Err(HdaError::ResetTimeout);
+        }
+        self.suspended.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Reverse of quiesce: reset the controller, reprogram the
+    /// command rings from the retained CORB/RIRB buffers (mirrors
+    /// `initialize`'s engine sequence), restore IRQs, codecs back
+    /// to D0. Stream descriptors are NOT restored: suspend refused
+    /// running or prepared streams, so every stream needs a fresh
+    /// prepare after resume. Clears the sticky command-transport
+    /// failure: the rings were reset, so a pre-suspend verb timeout
+    /// must not poison post-resume verbs (`acquire_command`
+    /// refuses while `irq.failed` is set). Idempotent.
+    fn reinit(&self) -> Result<(), HdaError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // SAFETY: Controller owns this live BAR; fixed register
+        // offsets are inside the validated window.
+        unsafe {
+            self.bar0.write32(REG_GCTL, 0);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        if !wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 == 0, 100) {
+            return Err(HdaError::ResetTimeout);
+        }
+        delay_us(100);
+        // SAFETY: Controller owns this live BAR; fixed register
+        // offsets are inside the validated window.
+        unsafe {
+            self.bar0.write32(REG_GCTL, GCTL_CRST);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        if !wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 != 0, 100) {
+            return Err(HdaError::ResetTimeout);
+        }
+        delay_us(1000);
+        // SAFETY: Controller owns this live BAR and its retained
+        // CORB/RIRB buffers; same writes as `initialize`.
+        unsafe {
+            self.bar0.write8(REG_CORBSIZE, CORBSIZE_256);
+            self.bar0.write8(REG_RIRBSIZE, RIRBSIZE_256);
+            self.bar0
+                .write32(REG_CORBLBASE, self.corb.dma_addr().raw() as u32);
+            self.bar0
+                .write32(REG_CORBUBASE, (self.corb.dma_addr().raw() >> 32) as u32);
+            self.bar0
+                .write32(REG_RIRBLBASE, self.rirb.dma_addr().raw() as u32);
+            self.bar0
+                .write32(REG_RIRBUBASE, (self.rirb.dma_addr().raw() >> 32) as u32);
+            self.bar0.write16(REG_CORBWP, 0);
+            self.bar0.write16(REG_CORBRP, 1 << 15);
+        }
+        let corb_reset = wait(
+            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+            || unsafe { self.bar0.read16(REG_CORBRP) } & (1 << 15) != 0,
+            100,
+        );
+        if !corb_reset {
+            return Err(HdaError::CorbResetTimeout);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register
+        // offsets are inside the validated window.
+        unsafe {
+            self.bar0.write16(REG_CORBRP, 0);
+        }
+        let corb_cleared = wait(
+            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+            || unsafe { self.bar0.read16(REG_CORBRP) } & (1 << 15) == 0,
+            100,
+        );
+        if !corb_cleared {
+            return Err(HdaError::CorbResetTimeout);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register
+        // offsets are inside the validated window.
+        unsafe {
+            self.bar0.write16(REG_RIRBWP, 1 << 15);
+            self.bar0.write16(REG_RINTCNT, 1);
+            self.bar0
+                .write8(REG_RIRBSTS, self.bar0.read8(REG_RIRBSTS) & 5);
+            self.bar0
+                .write8(REG_CORBSTS, self.bar0.read8(REG_CORBSTS) & 1);
+            self.bar0
+                .write8(REG_RIRBCTL, RIRBCTL_RUN | RIRBCTL_RINTCTL | RIRBCTL_OIC);
+            self.bar0.write8(REG_CORBCTL, CORBCTL_RUN | CORBCTL_CMEIE);
+            self.bar0.write32(
+                REG_INTCTL,
+                if self.route.is_some() {
+                    INTCTL_GIE | INTCTL_CIE
+                } else {
+                    0
+                },
+            );
+        }
+        // The ring pointers above restarted at 0 (CORBWP=0, RIRBWP
+        // reset): the driver's shadow cursors must restart with
+        // them, exactly as `initialize` starts them at 0. Without
+        // this, the first post-reset response() reads RIRBWP's reset
+        // value (low byte 0) with a stale rp and walks pre-reset
+        // RIRB slots, accepting the first stale reply whose cad
+        // nibble matches as the new verb's response — the D0 verb
+        // then "succeeds" without ever reaching the codec, and every
+        // following verb validates against a stale value.
+        {
+            let mut state = self.commands.lock();
+            state.wp = 0;
+            state.rp = 0;
+        }
+        // The rings are reset; a pre-suspend verb timeout no longer
+        // describes the transport.
+        self.irq.failed.store(false, Ordering::Release);
+        self.set_codec_power(false)?;
+        self.suspended.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// PCM bring-up entry: reinit a parked controller before any
+    /// path that sends verbs or programs streams.
+    pub(super) fn ensure_active(&self) -> Result<(), HdaError> {
+        self.reinit()
+    }
+
+    /// Best-effort idle transition for the PCM stop path: quiesce
+    /// when every stream is stopped, ignore failures (the next stop
+    /// retries; the controller simply stays powered).
+    pub(super) fn maybe_idle_quiesce(&self) {
+        if self.suspended.load(Ordering::Acquire) || !self.streams_idle() {
+            return;
+        }
+        let _ = self.quiesce();
+    }
+}
+
+/// System-PM ops over every probed HDA controller (#779). The
+/// device_pm registry holds one entry per name, so a single unit
+/// struct fans out over CONTROLLERS instead of one entry per
+/// controller; the lock is dropped before touching any device.
+/// Suspend refuses (Busy) while any controller has a running or
+/// prepared stream; resume re-inits every suspended controller.
+struct HdaSystemPm;
+impl narf_power::device_pm::DevicePmOps for HdaSystemPm {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        use narf_power::device_pm::DeviceSuspendError as E;
+        let devs: Vec<Arc<IntelHda>> = CONTROLLERS
+            .lock()
+            .iter()
+            .map(|(_, dev, _)| dev.clone())
+            .collect();
+        for dev in devs {
+            dev.quiesce().map_err(|e| match e {
+                HdaError::Busy => E::Busy,
+                _ => E::DriverError,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        use narf_power::device_pm::DeviceSuspendError as E;
+        let devs: Vec<Arc<IntelHda>> = CONTROLLERS
+            .lock()
+            .iter()
+            .map(|(_, dev, _)| dev.clone())
+            .collect();
+        for dev in devs {
+            dev.reinit().map_err(|_| E::DriverError)?;
+        }
+        Ok(())
+    }
+}
+
+/// Runtime-PM ops for one HDA controller (#779). The core is
+/// synchronous (see above), so the async callbacks simply run it;
+/// the PCI D3hot move belongs to the `PciRuntimePm` wrapper.
+/// Constructed by kernel tests today; production probe
+/// registration is the follow-up that needs an async-aware PCM
+/// start path, so the non-test build does not construct it yet.
+#[allow(dead_code)]
+pub(super) struct HdaRuntimePm {
+    pub(super) dev: Arc<IntelHda>,
+}
+impl narf_power::runtime_pm::RuntimePmOps for HdaRuntimePm {
+    fn runtime_suspend(&self) -> narf_power::runtime_pm::RpmFuture<'_> {
+        let dev = self.dev.clone();
+        Box::pin(async move {
+            dev.quiesce().map_err(|e| match e {
+                HdaError::Busy => narf_power::runtime_pm::RpmError::Busy,
+                _ => narf_power::runtime_pm::RpmError::Failed,
+            })
+        })
+    }
+
+    fn runtime_resume(&self) -> narf_power::runtime_pm::RpmFuture<'_> {
+        let dev = self.dev.clone();
+        Box::pin(async move {
+            dev.reinit()
+                .map_err(|_| narf_power::runtime_pm::RpmError::Failed)
+        })
     }
 }
 struct CommandLease<'a> {
@@ -674,7 +991,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             let Some(dev) = weak.upgrade() else {
                 break;
             };
-            let _ = dev.refresh_jacks();
+            if !dev.suspended.load(Ordering::Acquire) {
+                let _ = dev.refresh_jacks();
+            }
         }
     });
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -684,6 +1003,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Audio.default_domain(),
     });
+    // System power management (#779): one registry entry fans out
+    // over every probed controller. Registration is idempotent on
+    // the name, so re-probe is safe.
+    narf_power::device_pm::register_device_pm_ops("hda", Arc::new(HdaSystemPm));
     Ok(())
 }
 

@@ -879,6 +879,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power",
  "narf-scheduler",
  "narf-shmem",
  "narf-time",

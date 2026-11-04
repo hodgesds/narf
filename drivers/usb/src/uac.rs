@@ -2294,4 +2294,47 @@ pub fn register_initcalls() {
         probe,
         detach_uac_slot,
     );
+    // System power management (#779): one registry entry; the
+    // handlers read live state at call time, so registration at
+    // init time covers every device bound later.
+    narf_power::device_pm::register_device_pm(
+        "snd-usb-audio",
+        suspend_uac_devices,
+        resume_uac_devices,
+    );
+}
+
+/// System-PM suspend for USB audio (#779): refuse (Busy) while
+/// any bound UAC device has a live stream lease, so S3 never
+/// strands an open stream. Otherwise there is nothing
+/// device-side to power down: USB bus power is the xHCI
+/// controller's domain (it registers its own device_pm entry),
+/// and a UAC stream is just isochronous transfers on that bus.
+/// Note the busy signal is the live lease, not `active_alt`:
+/// `from_bind` seeds `active_alt` with the default streaming alt,
+/// so a never-opened card already reads non-zero there.
+pub(crate) fn suspend_uac_devices() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError as E;
+    let busy = UAC_DEVICES.lock().iter().any(|dev| {
+        dev.card.as_ref().is_some_and(|state| {
+            state
+                .playback
+                .as_ref()
+                .is_some_and(|s| s.live.lock().is_some())
+                || state
+                    .capture
+                    .as_ref()
+                    .is_some_and(|s| s.live.lock().is_some())
+        })
+    });
+    if busy {
+        return Err(E::Busy);
+    }
+    Ok(())
+}
+
+/// System-PM resume for USB audio (#779): no-op. Streams re-open
+/// through the normal path; nothing was powered down device-side.
+pub(crate) fn resume_uac_devices() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    Ok(())
 }
