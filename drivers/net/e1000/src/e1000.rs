@@ -315,10 +315,10 @@ const REG_MTA_BASE: u64 = 0x5200; // Multicast Table Array
 const MTA_WORDS: usize = 128; // 4096 hash bits / 32 bits per word
 const REG_RAL_STRIDE: u64 = 8; // RAL array entry stride (RAH at +4)
 const RAH_AV: u32 = 1 << 31; // Receive Address High: Address Valid
-// RCTL.MO lives in bits 13:12 (SDM §13.4.22). This driver leaves
-// MO = 0 (the reset value), selecting window [47:36]; the other
-// windows are implemented in `multicast_hash12` for completeness
-// and tested, but never programmed.
+                             // RCTL.MO lives in bits 13:12 (SDM §13.4.22). This driver leaves
+                             // MO = 0 (the reset value), selecting window [47:36]; the other
+                             // windows are implemented in `multicast_hash12` for completeness
+                             // and tested, but never programmed.
 
 // PCH (Lynx Point onward) — Management Engine PHY-ownership
 // handshake. The Intel ME shares the integrated PHY with the host
@@ -378,15 +378,15 @@ pub const EEER_LPI_MASK: u32 = EEER_TX_LPI_EN | EEER_RX_LPI_EN | EEER_LPI_FC;
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6; // Set Link Up
-// VLAN Mode Enable (8254x SDM §13.4.1). The single VLAN-mode gate
-// for both directions: on RX, a VET-matching packet has its 4-byte
-// tag stripped and the TCI recorded in the descriptor's `special`
-// field (SDM §3.2); on TX, it enables VLE tag insertion (SDM
-// §3.3.3.1: "otherwise VLE capability is ignored"). NOTE: SDM §3.2
-// prose writes "RCTL.VME", but the §13 register tables place VME
-// only in CTRL bit 30, and §3.3.3.1 confirms CTRL.VME gates VLE —
-// this driver treats CTRL.VME as the one gate, and the RX path
-// re-inserts stripped tags, so leaving it set once enabled is safe.
+                              // VLAN Mode Enable (8254x SDM §13.4.1). The single VLAN-mode gate
+                              // for both directions: on RX, a VET-matching packet has its 4-byte
+                              // tag stripped and the TCI recorded in the descriptor's `special`
+                              // field (SDM §3.2); on TX, it enables VLE tag insertion (SDM
+                              // §3.3.3.1: "otherwise VLE capability is ignored"). NOTE: SDM §3.2
+                              // prose writes "RCTL.VME", but the §13 register tables place VME
+                              // only in CTRL bit 30, and §3.3.3.1 confirms CTRL.VME gates VLE —
+                              // this driver treats CTRL.VME as the one gate, and the RX path
+                              // re-inserts stripped tags, so leaving it set once enabled is safe.
 const CTRL_VME: u32 = 1 << 30; // VLAN Mode Enable
 
 // TCTL bits.
@@ -402,10 +402,10 @@ const TIPG_COPPER_DEFAULT: u32 = 8 | (8 << 10) | (6 << 20);
 const TXD_CMD_EOP: u8 = 1 << 0;
 const TXD_CMD_IFCS: u8 = 1 << 1; // Insert FCS
 const TXD_CMD_RS: u8 = 1 << 3; // Report Status
-// VLAN Packet Enable (8254x SDM §3.3.3.1, Table 3-10): when set on
-// a legacy data descriptor, hardware inserts the 802.1Q tag (VET
-// ethertype + the descriptor's `special` TCI) into the transmitted
-// frame. Requires CTRL.VME set, and is valid only when EOP is set.
+                               // VLAN Packet Enable (8254x SDM §3.3.3.1, Table 3-10): when set on
+                               // a legacy data descriptor, hardware inserts the 802.1Q tag (VET
+                               // ethertype + the descriptor's `special` TCI) into the transmitted
+                               // frame. Requires CTRL.VME set, and is valid only when EOP is set.
 const TXD_CMD_VLE: u8 = 1 << 6; // VLAN Packet Enable
 const TXD_STAT_DD: u8 = 1 << 0; // Done
 
@@ -455,9 +455,9 @@ const RCTL_UPE: u32 = 1 << 3; // Unicast Promiscuous
 const RCTL_MPE: u32 = 1 << 4; // Multicast Promiscuous
 const RCTL_BAM: u32 = 1 << 15; // Broadcast Accept
 const RCTL_BSIZE_2K: u32 = 0 << 16; // Buffer Size = 2048
-// VLAN Filter Enable (8254x SDM §13.4.22). When set, a received
-// 802.1Q frame (type matches VET) is accepted only if its VID bit
-// is set in the VFTA; otherwise it is dropped (SDM §3.2.9).
+                                    // VLAN Filter Enable (8254x SDM §13.4.22). When set, a received
+                                    // 802.1Q frame (type matches VET) is accepted only if its VID bit
+                                    // is set in the VFTA; otherwise it is dropped (SDM §3.2.9).
 const RCTL_VFE: u32 = 1 << 18; // VLAN Filter Enable
 const RCTL_SECRC: u32 = 1 << 26; // Strip Ethernet CRC
 
@@ -766,10 +766,18 @@ fn vfta_bit(vid: u16) -> u32 {
 /// `add`/`remove` return `true` iff the shadow changed; duplicates
 /// and out-of-range VIDs are no-ops (the caller distinguishes them
 /// with [`VlanFilter::contains`]).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct VlanFilter {
     words: [u32; VFTA_WORDS],
     count: usize,
+}
+
+// NOTE: arrays implement Default only up to 32 elements, so the 128-word
+// tables cannot derive it; Default is new() spelled out by hand.
+impl Default for VlanFilter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VlanFilter {
@@ -877,10 +885,18 @@ fn mta_bit(hash: u16) -> u32 {
 /// to the same bit share it, and removing one clears it for both.
 /// That is standard hash-filter semantics; an exact-match RAL slot
 /// is the answer when a collision must not drop a peer.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MulticastFilter {
     words: [u32; MTA_WORDS],
     count: usize,
+}
+
+// NOTE: arrays implement Default only up to 32 elements, so the 128-word
+// tables cannot derive it; Default is new() spelled out by hand.
+impl Default for MulticastFilter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MulticastFilter {
@@ -938,10 +954,8 @@ impl MulticastFilter {
 /// Hardware expects little-endian byte order (RAL = bytes 0..3,
 /// RAH = bytes 4..5) with the Address Valid bit set in RAH.
 fn rar_encode(mac: &[u8; 6]) -> (u32, u32) {
-    let ral = mac[0] as u32
-        | ((mac[1] as u32) << 8)
-        | ((mac[2] as u32) << 16)
-        | ((mac[3] as u32) << 24);
+    let ral =
+        mac[0] as u32 | ((mac[1] as u32) << 8) | ((mac[2] as u32) << 16) | ((mac[3] as u32) << 24);
     let rah = mac[4] as u32 | ((mac[5] as u32) << 8) | RAH_AV;
     (ral, rah)
 }
@@ -1605,10 +1619,7 @@ impl E1000 {
             // OFF by default — the old accept-all behavior is
             // available explicitly via `set_promiscuous(true)`.
             // RCTL.MO bits are 0 in this value (window [47:36]).
-            mmio.write32(
-                REG_RCTL,
-                RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K,
-            );
+            mmio.write32(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K);
         }
 
         // 6. Set link up.
@@ -3197,8 +3208,8 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use super::{
-        mta_bit, mta_word, multicast_hash12, rar_encode, rar_slot_ok, vlan_reinsert_tag,
-        vlan_tci_parts, vfta_bit, vfta_word, MulticastFilter, TxDesc, TxQueueState, VlanFilter,
+        mta_bit, mta_word, multicast_hash12, rar_encode, rar_slot_ok, vfta_bit, vfta_word,
+        vlan_reinsert_tag, vlan_tci_parts, MulticastFilter, TxDesc, TxQueueState, VlanFilter,
         TXD_CMD_EOP, TXD_CMD_IFCS, TXD_CMD_RS, TXD_CMD_VLE, TX_RING_USABLE,
     };
 
