@@ -16,9 +16,10 @@
 //! and TX offload cannot coexist on this family — a runtime MTU
 //! switch is future work); RSS is not a gap here (Linux keeps
 //! one RX ring on 8168). Still missing: GMII auto-negotiation
-//! tuning, per-revision 8168 PHY tables, and EEE PHY advertisement
-//! (the 8168evl VER_34 WoL magic step is programmed through the
-//! ERI accessor by `set_wol_opts`).
+//! tuning, EEE PHY advertisement, and the 8168evl (VER_34) ERI
+//! step for WoL magic packets. Per-revision 8168 PHY tables are
+//! programmed by `crate::rtl8168` during bring-up.
+//! (reported by `set_wol_opts`, not silently dropped).
 //!
 //! ## Reference
 //!
@@ -443,6 +444,21 @@ impl RtlNic {
         let txcfg = unsafe { mmio.read32(REG_TCR) };
         let mac_version = crate::features::mac_version_from_xid(txcfg);
         let csum_v2 = crate::features::supports_csum_v2(mac_version);
+
+        // 2.6. Program the PHY for this chip revision
+        //     (`crate::rtl8168`). A failed table step is logged,
+        //     not fatal: the registers it already programmed stay
+        //     programmed, and the pre-existing bring-up (which
+        //     programmed no PHY registers at all) still proceeds.
+        //     SAFETY: identity-mapped.
+        if let Err(e) = crate::rtl8168::configure_phy_8168(&mmio, mac_version, txcfg) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  r8169: PHY table aborted: {:?}; continuing bring-up",
+                e,
+            );
+        }
 
         // 4. C+CR first per §7 step 1. Enable RX checksum offload
         //    (the RX pump decodes it into `Frame::rx_meta`) and
