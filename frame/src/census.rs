@@ -233,6 +233,35 @@ pub fn capture() {
 // the census smoke fails there, this correction is wrong, not
 // the snapshot.
 //
+// CORRECTION (2026-11-03, rebase onto origin/main 5d98bfef0): the
+// baseline again predates merges that landed on main after the
+// c3e2bc171 refresh — Subsys recorded 160 where the snapshot
+// composes 163, and no other stage diverged. Each delta name is
+// accounted for by a named, already-merged PR, verified against
+// the registration sites on main and the crate call order in
+// frame's boot sequence: PR #1351 (codex/finish-wifi-drivers,
+// commits 1fb8f44aa/517496312) added `rtw88-8821cu-usb-ids` and
+// `rtw88-8822bu-usb-ids` at Subsys (directly after `rtw88`, in
+// `usb_driver::register` order, called unconditionally from
+// `rtw88::register`); PR #1352 (codex/intel-software-next,
+// commit 2548f1152) added `fb-intel-lnl-reset-exclusion` at
+// Subsys (directly before `fb-amdgpu-handoff-register`, its
+// registration order in `fb/src/lib.rs`, under the `intel`
+// feature that the default/all build enables). The delta was
+// verified three ways: a full-tree multiset diff of all three
+// registration shapes (`narf_init::register`, multi-line
+// `register`, and `register_with_budget`) between the refresh
+// base (629f4f1b) and the current tip (exactly these three
+// additions, no removals or renames), a per-file ordered
+// register-call diff over every registration-site file (only
+// `drivers/wireless` and `fb` changed, each by pure insertion),
+// and a bare_main call-order diff (identical). No other stage
+// diverged, and no delta name is unaccounted for. The entries
+// below are updated to the verified set; the fixture still
+// asserts exact-set, exact-order equality. CI on the rebased
+// head is the judge: if the census smoke fails there, this
+// correction is wrong, not the snapshot.
+//
 // The recording is reality, not an ideal: on x86_64 the `arch` stage
 // is empty and `ipmi`, `itco_wdt`, and `usb-r8152` each register
 // twice at Subsys (pre-existing duplicate registrations; the census
@@ -299,6 +328,8 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "rtl8xxxu",
         "rtlwifi",
         "rtw88",
+        "rtw88-8821cu-usb-ids",
+        "rtw88-8822bu-usb-ids",
         "rtw89",
         "brcmfmac",
         "ath11k",
@@ -392,6 +423,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "qxl-gpu-pci",
         "vmware-svga-pci",
         "nvidia-pci",
+        "fb-intel-lnl-reset-exclusion",
         "fb-amdgpu-handoff-register",
         "fb-syscall-vtable",
         "fb-exit-observer",
@@ -413,7 +445,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "itco_wdt",
         "pl011",
         "psmouse",
-    ], // subsys: 160
+    ], // subsys: 163
     &[
         "modules-sysfs",
         "devfs-mount",
