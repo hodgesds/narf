@@ -199,10 +199,11 @@ PME_Status bit 2), WUS at 0x05810 (RW1C, same bits + MNG 8),
 IP4AT at 0x05840 + 8*n (n = 0..3) and IP6AT at 0x05880 + 4*n.
 `Ixgbe::configure_wol` arms (clear status, program WUFC, set
 PME_En) and records the config; `wol_status` decodes WUS.
-Per-part rule: 82599EB only. X540/X550EM_x are NOT armed (their
-datasheets were not consulted here); X550 is additionally
-LOM/board-gated per Intel adapter guidance, so it is not armed
-blindly either. IPAV is NOT programmed: the datasheet text
+Per-part rule: 82599EB by its datasheet rule; X540/X550/X550EM_x
+only when the board record permits (Linux EEPROM-cap rule — see
+§13g). Nothing arms by default: without a permitting record,
+X540+ stays unarmed, and X550's LOM/board gating IS the record.
+IPAV is NOT programmed: the datasheet text
 extracted ambiguously ("0x5838"), so it is a remainder (§14),
 not a guessed value.
 
@@ -334,6 +335,65 @@ snapshot cannot populate EEE state from hardware without
 those transports, so EEE status is reported through
 `eee_status()`, not the snapshot.
 
+## 13g. X540 WoL grounding + X550 LOM opt-in (Linux model)
+
+Grounding: Linux ixgbe @ `cbbddb6` — the X540/X550 datasheets
+were NOT consulted, so this section is Linux-transcribed, not
+datasheet-grounded (same standing as §13b–§13f, which are
+unmerged drafts on sibling branches; whoever lands second must
+union the §1/§14 areas, not overwrite them).
+
+X540 verdict: SUPPORTED, via the shared wake block. Linux's
+shutdown path programs `IXGBE_WUFC` with the stored filter word
+for 82599/X540/X550/X550EM_x alike (`ixgbe_main.c`
+`__ixgbe_shutdown`), and `pci_wake_from_d3` is enabled for the
+same set — there are no X540-specific wake registers and no
+per-part WoL ops. The in-tree `WolConfig::arm` conversation
+(WUS clear, WUFC program, WUC.PME_En) is therefore the X540
+conversation too, pinned by the §13g smoke.
+
+The gate is a board record, not a device ID. Linux's
+`ixgbe_wol_supported` (`ixgbe_main.c:11375`) reads the EEPROM
+DEVICE_CAPS word at probe (`hw->eeprom.ops.read(hw, 0x2c, ...)`
+at `:11913`) and, for mac.type >= X540 (enum order
+`ixgbe_type.h:3216-3220`: 82598EB < 82599EB < X540 < X550 <
+X550EM_x), arms WoL only when the masked cap word permits:
+`wol_cap = eeprom_cap & 0xC` (`ixgbe_type.h:2179-2181`:
+PORT0_1 0x4, PORT0 0x8, MASK 0xC); cap 0x4 permits any function,
+cap 0x8 permits function 0 only (`hw->bus.func == 0`), anything
+else — including 0xC, both bits set, which the equality
+comparisons reject — permits nothing. 82599 and older use a
+subdevice table instead; 82598 never wakes.
+
+X550 LOM verdict: the same rule. Linux has no separate LOM
+concept in `ixgbe_wol_supported` — the board's EEPROM image IS
+the LOM/board opt-in, and a board that does not opt in never
+wakes. Intel's adapter guidance (most 10 GbE adapters do not
+support WoL; X550 supports it as LAN on Motherboard when the
+board enables it) is consistent with this mechanism.
+
+NARF design (`wol.rs` `WolBoardCap`, `wol_allowed`,
+`Ixgbe::set_wol_board_cap`): the record carries the raw cap
+bits plus the device's PCI function number, and `allows()`
+implements the Linux rule literally, including the 0xC
+rejection and the mask-then-compare order (so 0x14 masks to
+0x4 and permits). The default record permits nothing;
+`configure_wol` and `suspend` gate on `wol_allowed`, and the
+ethtool snapshot's `wol_supported` reflects the gated verdict.
+Setting a record arms nothing by itself. One deliberate
+difference from Linux: Linux arms magic-packet-only by default
+at probe when `wol_enabled` (`adapter->wol = IXGBE_WUFC_MAG`
+at `:11916-11917`); NARF arms only on an explicit
+`configure_wol` / suspend-with-config call — no probe-time
+default arming.
+
+Remainders: X540/X550 datasheet re-grounding (this section is
+Linux-only); an EEPROM word-0x2c reader via the existing EERD
+helper so the record can one day come from hardware instead of
+board configuration; X550EM_A / E610 DIDs (same Linux rule
+applies when they land); the 82599 subdevice table (NARF does
+not track subdevice IDs; the 82599EB datasheet rule stands).
+
 ## 13l. Resume ring rebuild (issue #1271 decision: rebuild, not re-probe)
 
 Decision: on resume, the driver REBUILDS the DMA rings in
@@ -397,6 +457,7 @@ Remainders (not silently dropped):
 - No `CTRL.RST` means a device that wedges across suspend
   (rather than merely losing state) is not reset by this
   path; that recovery belongs to the same future lane.
+
 ## 14. Sequenced follow-ups (not silently dropped)
 
 Per the v0.1 exclusion list, still open after this stream:
@@ -416,8 +477,10 @@ Per the v0.1 exclusion list, still open after this stream:
   device support.
 - Per-queue DMA rings + pumps for queues 1..63, and per-queue
   MSI-X vectors beyond the shared misc vector.
-- X540 / X550EM_x WoL grounding (X540 datasheet not consulted;
-  X550 WoL is LOM/board-gated — see §12).
+- X540 / X550EM_x WoL grounding + X550 LOM opt-in — landed as
+  the Linux-cap-rule model (§13g); remainders are datasheet
+  re-grounding, the EEPROM word-0x2c reader, and E610/X550EM_A
+  DIDs.
 - IPAV (0x05838 candidate) — datasheet text extraction was
   ambiguous, so it is not programmed; see §12.
 - Per-queue statistics counters (QPRC/QPTC offsets ungrounded).

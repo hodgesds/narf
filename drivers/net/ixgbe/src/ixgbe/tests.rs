@@ -667,6 +667,92 @@ fn smoke_ixgbe_wol() -> TestResult {
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol);
 
+// ── WoL board-cap gate (#1266) ────────────────────────────────────
+
+fn smoke_ixgbe_wol_board_cap() -> TestResult {
+    use super::queues::RegBank;
+    use super::wol::{
+        is_x540_or_newer, wol_allowed, WolBoardCap, WolConfig, REG_WUC, REG_WUFC, WOL_CAP_MASK,
+        WOL_CAP_PORT0, WOL_CAP_PORT0_1, WUC_PME_EN,
+    };
+    // Cap constants are Linux's (ixgbe_type.h:2179-2181).
+    if WOL_CAP_MASK != 0xC || WOL_CAP_PORT0_1 != 0x4 || WOL_CAP_PORT0 != 0x8 {
+        return TestResult::Fail("WoL cap constants drifted from Linux");
+    }
+    // Rule table: (cap_bits, func) -> allows. Linux-literal
+    // (ixgbe_main.c ixgbe_wol_supported, X540+ arm): masked 0x4
+    // permits any func, masked 0x8 permits func 0 only, anything
+    // else — including 0xC, both bits set — permits nothing.
+    let cases: [(u16, u8, bool); 8] = [
+        (0x0, 0, false),
+        (0x0, 1, false),
+        (0x4, 0, true),
+        (0x4, 1, true),
+        (0x8, 0, true),
+        (0x8, 1, false),
+        (0xC, 0, false),
+        (0x14, 1, true), // masks to 0x4
+    ];
+    for (bits, func, want) in cases {
+        let cap = WolBoardCap {
+            cap_bits: bits,
+            func,
+        };
+        if cap.allows() != want {
+            return TestResult::Fail("WolBoardCap rule table mismatch");
+        }
+    }
+    if WolBoardCap::default().allows() {
+        return TestResult::Fail("default board record must permit nothing");
+    }
+    // Generation split: X540/X550/X550EM_x are X540-or-newer;
+    // 82599EB is not, and unknown parts are neither.
+    if !is_x540_or_newer(super::IXGBE_DEV_X540)
+        || !is_x540_or_newer(super::IXGBE_DEV_X550)
+        || !is_x540_or_newer(super::IXGBE_DEV_X550EM_X)
+        || is_x540_or_newer(super::IXGBE_DEV_82599EB)
+        || is_x540_or_newer(0xFFFF)
+    {
+        return TestResult::Fail("is_x540_or_newer split wrong");
+    }
+    // Gate predicate: 82599EB stands on its datasheet rule whatever
+    // the record says; X540+ needs a permitting record; unknown
+    // parts never pass, even with a permitting record.
+    let none = WolBoardCap::default();
+    let both = WolBoardCap {
+        cap_bits: 0x4,
+        func: 1,
+    };
+    let port0_f1 = WolBoardCap {
+        cap_bits: 0x8,
+        func: 1,
+    };
+    let port0_f0 = WolBoardCap {
+        cap_bits: 0x8,
+        func: 0,
+    };
+    if !wol_allowed(super::IXGBE_DEV_82599EB, none)
+        || !wol_allowed(super::IXGBE_DEV_82599EB, both)
+        || wol_allowed(super::IXGBE_DEV_X540, none)
+        || !wol_allowed(super::IXGBE_DEV_X540, both)
+        || wol_allowed(super::IXGBE_DEV_X550, port0_f1)
+        || !wol_allowed(super::IXGBE_DEV_X550EM_X, port0_f0)
+        || wol_allowed(0xFFFF, both)
+    {
+        return TestResult::Fail("wol_allowed gate wrong");
+    }
+    // Shared wake block: the X540 arm conversation is the same
+    // WUFC/WUC programming Linux issues on its shared shutdown
+    // path — no part-specific wake registers exist.
+    let mut bank = FakeBank::new();
+    WolConfig::magic_only().arm(&mut bank);
+    if bank.read32(REG_WUFC) != 0x2 || bank.read32(REG_WUC) & WUC_PME_EN == 0 {
+        return TestResult::Fail("X540 arm conversation differs from 82599");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol_board_cap);
+
 // ── PM fixtures (commit 5) ───────────────────────────────────────
 
 fn smoke_ixgbe_pm_plans() -> TestResult {
