@@ -151,9 +151,8 @@ fn smoke_drm_legacy_addfb_user_buffer_and_rmfb() -> TestResult {
     }
     let saved = bytes;
     let arg = bytes[4..].as_mut_ptr() as usize;
+    // ADDFB has drm_ioctl.c flags 0: denied on a render node only.
     if dispatch_card(idx, 0xc01c_64ae, arg, true) != Err(FsError::PermissionDenied)
-        || crate::drm_ioctl_bridge::dispatch_card(idx, SMOKE_MASTER_ID + 1, 0xc01c_64ae, arg, false)
-            != Err(FsError::PermissionDenied)
         || bytes != saved
         || !state.lock().framebuffers.is_empty()
     {
@@ -5903,4 +5902,82 @@ fn smoke_drm_committed_mode_identity_and_mode_id_readback() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_committed_mode_identity_and_mode_id_readback
+);
+
+/// drm_mode_closefb / atomic_remove_fb: CLOSEFB of a shown framebuffer
+/// leaves it (and its CRTC) lit for the next master and frees it once off
+/// screen; a nonzero pad is EINVAL and an unknown id ENOENT. RMFB of a
+/// shown framebuffer disables its CRTC and detaches the connector.
+fn smoke_drm_closefb_keeps_scanout_and_rmfb_detaches() -> TestResult {
+    let idx = register_test_card();
+    let state = crate::drm_registry::mode_state(idx).unwrap();
+    let addfb = || -> Option<u32> {
+        let handle = state.lock().gem.alloc(0x8000_0000, 8192).ok()?;
+        let mut b = [0u8; 32];
+        for (dst, value) in b[..28]
+            .chunks_exact_mut(4)
+            .zip([0, 64, 32, 256, 32, 24, handle])
+        {
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
+        dispatch_card(idx, 0xc01c_64ae, b.as_mut_ptr() as usize, false).ok()?;
+        Some(u32::from_le_bytes(b[0..4].try_into().unwrap()))
+    };
+    let show = |fb: u32| {
+        let mut card = state.lock();
+        let crtc = card.crtcs.iter_mut().find(|c| c.id == 11).unwrap();
+        crtc.primary_fb = Some(fb);
+        crtc.enabled = true;
+        card.encoders[0].crtc_id = Some(11);
+    };
+    let closefb = |fb: u32, pad: u32| {
+        let mut b = [0u8; 8];
+        b[0..4].copy_from_slice(&fb.to_le_bytes());
+        b[4..8].copy_from_slice(&pad.to_le_bytes());
+        dispatch_card(
+            idx,
+            iowr(DRM_IOCTL_BASE, 0xD0, 8),
+            b.as_mut_ptr() as usize,
+            false,
+        )
+    };
+    let Some(shown) = addfb() else {
+        return TestResult::Fail("ADDFB failed");
+    };
+    show(shown);
+    if closefb(shown, 1) != Err(FsError::InvalidData) || closefb(9999, 0) != Err(FsError::NotFound)
+    {
+        return TestResult::Fail("CLOSEFB pad/unknown errno");
+    }
+    if closefb(shown, 0) != Ok(0)
+        || state.lock().framebuffer(shown).is_err()
+        || !state.lock().crtc(11).unwrap().enabled
+    {
+        return TestResult::Fail("CLOSEFB of a shown framebuffer disabled it");
+    }
+    // An unshown framebuffer goes at once.
+    let Some(hidden) = addfb() else {
+        return TestResult::Fail("second ADDFB failed");
+    };
+    if closefb(hidden, 0) != Ok(0) || state.lock().framebuffer(hidden).is_ok() {
+        return TestResult::Fail("CLOSEFB of an unshown framebuffer kept it");
+    }
+    // RMFB of a shown framebuffer: atomic_remove_fb disables and detaches.
+    let Some(other) = addfb() else {
+        return TestResult::Fail("third ADDFB failed");
+    };
+    show(other);
+    let mut rm = other.to_le_bytes();
+    if dispatch_card(idx, 0xc004_64af, rm.as_mut_ptr() as usize, false) != Ok(0) {
+        return TestResult::Fail("RMFB failed");
+    }
+    let card = state.lock();
+    if card.crtc(11).unwrap().enabled || card.encoders[0].crtc_id.is_some() {
+        return TestResult::Fail("RMFB left the CRTC enabled or the connector routed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_closefb_keeps_scanout_and_rmfb_detaches
 );

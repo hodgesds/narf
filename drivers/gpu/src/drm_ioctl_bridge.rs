@@ -2358,6 +2358,7 @@ fn dispatch_card_for_file_inner(
         IoctlCmd::GemClose => handle_gem_close(&mode_state, arg, &ctx),
         // RMFB of a framebuffer on screen turns its CRTC off; the native
         // display follows.
+        IoctlCmd::ModeCloseFb => handle_closefb(&mode_state, arg, open_id),
         IoctlCmd::ModeRmFb => {
             // SAFETY: `arg` is the user drm_mode_rmfb pointer (a u32 fb id).
             #[cfg(feature = "amdgpu")]
@@ -4578,6 +4579,38 @@ fn handle_gamma(
     Ok(0)
 }
 
+/// DRM_IOCTL_MODE_CLOSEFB — `struct drm_mode_closefb { u32 fb_id; u32
+/// pad; }`: drm_mode_closefb_ioctl. A nonzero pad is EINVAL, a framebuffer
+/// this open does not own ENOENT; the framebuffer leaves the file without
+/// disabling what scans it (Card::closefb), so the next master takes over a
+/// lit CRTC.
+fn handle_closefb(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    open_id: u64,
+) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the validated 8-byte ioctl pointer.
+    let b = unsafe { copy_in(arg, 8)? };
+    let fb_id = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    if u32::from_le_bytes(b[4..8].try_into().unwrap()) != 0 {
+        return Err(invalid_at(line!()));
+    }
+    let freed = mode_state
+        .lock()
+        .closefb(fb_id, open_id)
+        .map_err(|_| FsError::NotFound)?;
+    if let Some((phys, order)) = freed {
+        free_backing_pages(phys, order);
+    }
+    Ok(0)
+}
+
+/// Buddy-free a dumb backing a framebuffer removal released.
+fn free_backing_pages(phys: u64, order: u8) {
+    let frame = narf_memory::frame::PhysFrame::new(narf_memory::addr::PhysAddr::new(phys));
+    narf_memory::frame::free_pages(frame, order);
+}
+
 /// DRM_IOCTL_MODE_GETPROPBLOB — `struct drm_mode_get_blob` (16 bytes):
 /// blob_id@0, length@4, data@8. Two-pass like the other array ioctls: the
 /// first call (length 0 / data NULL) reports the blob's byte length; the second
@@ -6119,6 +6152,11 @@ fn atomic_commit(
                     "  drm: ATOMIC commit failed: {error:?}"
                 );
                 return Err(invalid_at(line!()));
+            }
+            // A framebuffer CLOSEFB released while shown goes once this
+            // commit took its planes off it.
+            for (phys, order) in card.collect_closed_fbs() {
+                free_backing_pages(phys, order);
             }
             // drm_crtc_state::mode / mode_blob: the full committed timing
             // and the blob naming it; a CRTC without a mode forgets both.

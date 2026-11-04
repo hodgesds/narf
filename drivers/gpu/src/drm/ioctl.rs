@@ -58,6 +58,7 @@ pub enum IoctlCmd {
     ModeGetConnector = 0xA7,
     ModeAddFb = 0xAE,
     ModeRmFb = 0xAF,
+    ModeCloseFb = 0xD0,
     ModePageFlip = 0xB0,
     ModeDirtyFb = 0xB1,
     ModeCreateDumb = 0xB2,
@@ -112,6 +113,7 @@ impl IoctlCmd {
             0xA7 => IoctlCmd::ModeGetConnector,
             0xAE => IoctlCmd::ModeAddFb,
             0xAF => IoctlCmd::ModeRmFb,
+            0xD0 => IoctlCmd::ModeCloseFb,
             0xB9 => IoctlCmd::ModeObjGetProperties,
             0xAA => IoctlCmd::ModeGetProperty,
             0xAB => IoctlCmd::ModeConnectorSetProperty,
@@ -411,6 +413,8 @@ pub fn dispatch(
         }
         IoctlCmd::ModeAddFb2 => handle_addfb2(card, arg),
         IoctlCmd::ModeRmFb => handle_rmfb(card, arg),
+        // CLOSEFB needs the caller's open (the bridge handles it).
+        IoctlCmd::ModeCloseFb => Err(DrmIoctlError::UnknownCmd),
         IoctlCmd::ModeGetPlaneRes => handle_getplane_res(card),
         // GemClose: handled in the bridge where we can free the backing.
         // Return Ok here so the permission gate fires correctly.

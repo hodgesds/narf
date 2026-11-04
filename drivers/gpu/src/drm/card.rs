@@ -277,6 +277,10 @@ pub struct IntelFb {
 }
 
 /// An amdgpu GEM buffer a framebuffer holds, and the open that made it:
+/// [`FbBo::owner`] of a framebuffer CLOSEFB released while it was still
+/// shown: no file owns it; it goes when nothing scans it.
+pub const CLOSED_FB_OWNER: u64 = u64::MAX;
+
 /// drm_fb_release removes an open's framebuffers when it closes.
 #[derive(Clone, Debug)]
 pub struct FbBo {
@@ -2607,6 +2611,54 @@ impl Card {
     /// buffer's last reference.
     ///
     /// Linux equivalent: `drm_mode_rmfb`.
+    /// `DRM_IOCTL_MODE_CLOSEFB` for open `owner`: the framebuffer leaves
+    /// the file without disabling the planes that scan it (drm_mode_closefb).
+    /// One nothing shows is removed now; one still shown stays, owned by no
+    /// file, until [`Card::collect_closed_fbs`] finds it off screen.
+    /// `UnknownFb` (→ ENOENT) for an id this open does not own.
+    pub fn closefb(&mut self, fb_id: u32, owner: u64) -> Result<Option<(u64, u8)>, CardError> {
+        let fb = self
+            .framebuffers
+            .iter()
+            .find(|fb| fb.id == fb_id)
+            .ok_or(CardError::UnknownFb)?;
+        if fb.gem_owner().is_some_and(|o| o != owner) {
+            return Err(CardError::UnknownFb);
+        }
+        if !self.fb_shown(fb_id) {
+            return self.rmfb(fb_id);
+        }
+        if let Some(bo) = self
+            .framebuffers
+            .iter_mut()
+            .find(|fb| fb.id == fb_id)
+            .and_then(|fb| fb.bo.as_mut())
+        {
+            bo.owner = CLOSED_FB_OWNER;
+        }
+        Ok(None)
+    }
+    /// Whether a CRTC or native plane still scans framebuffer `fb_id`.
+    pub fn fb_shown(&self, fb_id: u32) -> bool {
+        self.crtcs.iter().any(|c| c.primary_fb == Some(fb_id))
+            || self.native_planes.iter().any(|p| p.fb_id == Some(fb_id))
+    }
+    /// Free closed framebuffers (CLOSEFB'd while shown) nothing scans any
+    /// more. Returns dumb backings to buddy-free.
+    pub fn collect_closed_fbs(&mut self) -> Vec<(u64, u8)> {
+        let closed: Vec<u32> = self
+            .framebuffers
+            .iter()
+            .filter(|fb| fb.bo.as_ref().is_some_and(|bo| bo.owner == CLOSED_FB_OWNER))
+            .map(|fb| fb.id)
+            .filter(|&id| !self.fb_shown(id))
+            .collect();
+        closed
+            .into_iter()
+            .filter_map(|id| self.rmfb(id).ok().flatten())
+            .collect()
+    }
+
     pub fn rmfb(&mut self, fb_id: u32) -> Result<Option<(u64, u8)>, CardError> {
         let pos = self
             .framebuffers
@@ -2627,6 +2679,15 @@ impl Card {
             crtc.enabled = false;
             crtc.mode = None;
             disabled.push(crtc.id);
+        }
+        // atomic_remove_fb (amdgpu cannot keep an active CRTC without its
+        // primary): the CRTC is disabled and its connectors detached.
+        for e in self
+            .encoders
+            .iter_mut()
+            .filter(|e| e.crtc_id.is_some_and(|c| disabled.contains(&c)))
+        {
+            e.crtc_id = None;
         }
         for crtc in disabled {
             self.set_committed_mode(crtc, None);

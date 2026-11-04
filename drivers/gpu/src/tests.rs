@@ -7028,9 +7028,14 @@ fn smoke_drm_perm_master_only_blocks_authed() -> TestResult {
         sys_admin: false,
     };
     let arg = [0u8; 68];
+    // drm_ioctl.c gives ADDFB2 flags 0: an authenticated non-master
+    // primary open passes the permission gate (it may then fail on its
+    // arguments, never with a permission error).
     match dispatch(&mut card, 0xB8, &arg, &authed) {
-        Err(DrmIoctlError::PermissionDenied(PermError::NotMaster)) => TestResult::Pass,
-        _ => TestResult::Fail("authed non-master ADDFB2 should be NotMaster"),
+        Err(DrmIoctlError::PermissionDenied(_)) => {
+            TestResult::Fail("authed non-master ADDFB2 hit the permission gate")
+        }
+        _ => TestResult::Pass,
     }
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_perm_master_only_blocks_authed);
