@@ -292,6 +292,10 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                     );
                     narf_scheduler::yield_now().await;
                 }
+                PortStepOutcome::EprModeEntered => {
+                    let _ = writeln!(narf_console::Writer, "  tcpm: {} entered EPR mode", label);
+                    narf_scheduler::yield_now().await;
+                }
             }
         }
     });

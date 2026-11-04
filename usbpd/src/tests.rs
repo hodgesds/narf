@@ -12,8 +12,9 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::message::{
-    decode_message, encode_message, CtrlMsg, DataMsg, DataRole, FixedRdo, Header, PowerRole,
-    SourcePdo, SpecRev,
+    decode_message, encode_message, AvsRdo, CtrlMsg, DataMsg, DataRole, EprEnterFailedReason,
+    EprModeAction, EprModeDataObject, FixedRdo, Header, PowerRole, ProgrammableRdo, SourcePdo,
+    SpecRev,
 };
 use crate::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
 use crate::tcpm::{SinkPort, SinkState, StepOutcome};
@@ -51,6 +52,7 @@ fn smoke_fixed_pdo_round_trip() -> TestResult {
     let pdo = SourcePdo::Fixed {
         voltage_mv: 5000,
         max_current_ma: 3000,
+        epr_mode_capable: false,
     };
     let raw = pdo.encode();
     // Type field = 00.
@@ -95,6 +97,7 @@ fn smoke_fixed_rdo_round_trip() -> TestResult {
         usb_comms: true,
         no_usb_suspend: true,
         cap_mismatch: false,
+        epr_mode_capable: false,
     };
     let raw = rdo.encode();
     let back = FixedRdo::decode(raw);
@@ -120,6 +123,7 @@ fn smoke_message_codec_pack_layout() -> TestResult {
     let pdo = SourcePdo::Fixed {
         voltage_mv: 5000,
         max_current_ma: 3000,
+        epr_mode_capable: false,
     };
     let frame = encode_message(h, &[pdo.encode()]);
     if frame.len() != 6 {
@@ -138,6 +142,217 @@ fn smoke_message_codec_pack_layout() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("usbpd/message", smoke_message_codec_pack_layout);
+
+// ── EPR wire types (§6.4.1.2.5.2, §6.4.2 table 6.27, §6.4.10) ─────
+
+fn smoke_epr_avs_apdo_byte_exact() -> TestResult {
+    // EPR AVS APDO, source, 48 V max / 15 V min / 240 W PDP, peak 00.
+    // Hand-built from table 6.14: bits 31..30 = 11, 29..28 = 01,
+    // 27..26 = 00, 25..17 = 480 (48 V in 100 mV steps), bit 16 = 0,
+    // 15..8 = 150 (15 V), 7..0 = 240 (PDP in watts).
+    let pdo = SourcePdo::EprAvs {
+        max_voltage_mv: 48000,
+        min_voltage_mv: 15000,
+        pdp_w: 240,
+        peak_current: 0,
+    };
+    let raw = pdo.encode();
+    if raw != 0xD3C0_96F0 {
+        return TestResult::Fail("EPR AVS APDO word drift from table 6.14 layout");
+    }
+    let back = SourcePdo::decode(raw);
+    if back != pdo {
+        return TestResult::Fail("EPR AVS APDO round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_epr_avs_apdo_byte_exact);
+
+fn smoke_apdo_subtype_split_is_not_masked() -> TestResult {
+    // Masking-defeating: an SPR PPS word (sub-type 00) and an EPR
+    // AVS word (sub-type 01) share type bits 31..30 = 11 but must
+    // decode to different variants. The old code decoded every APDO
+    // as SPR PPS, which would read an EPR AVS word's 9-bit max
+    // voltage truncated and its PDP watts as a 50 mA current.
+    let pps = SourcePdo::Augmented {
+        max_voltage_mv: 21000,
+        min_voltage_mv: 3300,
+        max_current_ma: 5000,
+    };
+    let pps_raw = pps.encode();
+    if (pps_raw >> 28) & 0x3 != 0b00 {
+        return TestResult::Fail("SPR PPS sub-type bits drift");
+    }
+    if !matches!(SourcePdo::decode(pps_raw), SourcePdo::Augmented { .. }) {
+        return TestResult::Fail("SPR PPS word decoded as non-Augmented");
+    }
+    let avs = SourcePdo::EprAvs {
+        max_voltage_mv: 48000,
+        min_voltage_mv: 15000,
+        pdp_w: 240,
+        peak_current: 0,
+    };
+    let avs_raw = avs.encode();
+    if (avs_raw >> 28) & 0x3 != 0b01 {
+        return TestResult::Fail("EPR AVS sub-type bits drift");
+    }
+    match SourcePdo::decode(avs_raw) {
+        SourcePdo::EprAvs {
+            max_voltage_mv,
+            min_voltage_mv,
+            pdp_w,
+            ..
+        } => {
+            if max_voltage_mv != 48000 || min_voltage_mv != 15000 || pdp_w != 240 {
+                return TestResult::Fail("EPR AVS fields drift after decode");
+            }
+        }
+        _ => return TestResult::Fail("EPR AVS word decoded as non-EprAvs"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_apdo_subtype_split_is_not_masked);
+
+fn smoke_avs_rdo_byte_exact_and_quantisation() -> TestResult {
+    // AVS RDO, position 9 (EPR), 28 V @ 5 A, usb-comms + no-suspend
+    // + EPR-capable set. Hand-built from table 6.27: bits 31..28 =
+    // 1001, bit 25 = 1, bit 24 = 1, bit 22 = 1, bits 20..9 = 1120
+    // (28 V in 25 mV units, low bits zero), bits 6..0 = 100 (5 A).
+    let rdo = AvsRdo {
+        object_position: 9,
+        voltage_mv: 28000,
+        op_current_ma: 5000,
+        usb_comms: true,
+        no_usb_suspend: true,
+        cap_mismatch: false,
+        epr_mode_capable: true,
+    };
+    let raw = rdo.encode();
+    if raw != 0x9348_C064 {
+        return TestResult::Fail("AVS RDO word drift from table 6.27 layout");
+    }
+    let back = AvsRdo::decode(raw);
+    if back != rdo {
+        return TestResult::Fail("AVS RDO round-trip mismatch");
+    }
+    // Voltage floors to the 100 mV step: 28130 mV encodes as 28100.
+    let floored = AvsRdo {
+        voltage_mv: 28130,
+        ..rdo
+    };
+    if AvsRdo::decode(floored.encode()).voltage_mv != 28100 {
+        return TestResult::Fail("AVS RDO voltage should floor to 100 mV");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_avs_rdo_byte_exact_and_quantisation);
+
+fn smoke_epr_mode_data_object_codec() -> TestResult {
+    // Table 6.51: bits 31..24 Action, bits 23..16 Data, bits 15..0 zero.
+    let enter = EprModeDataObject::enter(240);
+    if enter.encode() != 0x01F0_0000 {
+        return TestResult::Fail("EPR_Mode Enter word drift");
+    }
+    if enter.operational_pdp_w() != Some(240) {
+        return TestResult::Fail("Enter PDP accessor drift");
+    }
+    let failed = EprModeDataObject::enter_failed(EprEnterFailedReason::CableNotEprCapable);
+    if failed.encode() != 0x0401_0000 {
+        return TestResult::Fail("EPR_Mode Enter Failed word drift");
+    }
+    if failed.failed_reason() != Some(EprEnterFailedReason::CableNotEprCapable) {
+        return TestResult::Fail("Enter Failed reason accessor drift");
+    }
+    let exit = EprModeDataObject::exit();
+    if exit.encode() != 0x0500_0000 || exit.action != EprModeAction::Exit {
+        return TestResult::Fail("EPR_Mode Exit word drift");
+    }
+    if EprModeDataObject::decode(0x0600_0000).is_some() {
+        return TestResult::Fail("reserved EPR_Mode action 0x06 should not decode");
+    }
+    let back = EprModeDataObject::decode(enter.encode()).expect("decode Enter");
+    if back != enter {
+        return TestResult::Fail("EPRMDO round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_epr_mode_data_object_codec);
+
+fn smoke_epr_mode_capable_bits_and_positions() -> TestResult {
+    // Fixed PDO bit 23 (table 6.9) and RDO bit 22 (§6.4.2.7).
+    let pdo = SourcePdo::Fixed {
+        voltage_mv: 5000,
+        max_current_ma: 3000,
+        epr_mode_capable: true,
+    };
+    let raw = pdo.encode();
+    if (raw >> 23) & 0x1 != 1 {
+        return TestResult::Fail("Fixed PDO EPR Mode Capable bit 23 not set");
+    }
+    if !matches!(
+        SourcePdo::decode(raw),
+        SourcePdo::Fixed {
+            epr_mode_capable: true,
+            ..
+        }
+    ) {
+        return TestResult::Fail("Fixed PDO EPR bit lost on decode");
+    }
+    // Object positions 8..=11 must survive the RDO codec — the old
+    // 3-bit mask wrapped position 9 to 1.
+    let rdo = FixedRdo {
+        object_position: 9,
+        op_current_ma: 5000,
+        max_op_current_ma: 5000,
+        give_back: false,
+        usb_comms: true,
+        no_usb_suspend: true,
+        cap_mismatch: false,
+        epr_mode_capable: true,
+    };
+    let raw = rdo.encode();
+    if (raw >> 28) & 0xF != 9 || (raw >> 22) & 0x1 != 1 {
+        return TestResult::Fail("Fixed RDO position 9 / EPR bit drift");
+    }
+    if FixedRdo::decode(raw) != rdo {
+        return TestResult::Fail("Fixed RDO position-9 round-trip mismatch");
+    }
+    // Programmable RDO carries the same bit and width.
+    let prdo = ProgrammableRdo {
+        object_position: 2,
+        voltage_mv: 9000,
+        op_current_ma: 2000,
+        usb_comms: true,
+        no_usb_suspend: true,
+        cap_mismatch: false,
+        epr_mode_capable: true,
+    };
+    let raw = prdo.encode();
+    if (raw >> 22) & 0x1 != 1 || ProgrammableRdo::decode(raw) != prdo {
+        return TestResult::Fail("Programmable RDO EPR bit drift");
+    }
+    // Data message types: EPR_Request 0x09, EPR_Mode 0x0A.
+    if DataMsg::from_u8(0x09) != Some(DataMsg::EprRequest)
+        || DataMsg::from_u8(0x0A) != Some(DataMsg::EprMode)
+    {
+        return TestResult::Fail("EPR data message types drift");
+    }
+    // An EPR_Request frame is header + RDO + PDO copy = 10 bytes.
+    let h = Header::data(
+        DataMsg::EprRequest,
+        DataRole::Ufp,
+        PowerRole::Sink,
+        SpecRev::R3_0,
+        0,
+        2,
+    );
+    let frame = encode_message(h, &[rdo.encode(), pdo.encode()]);
+    if frame.len() != 10 {
+        return TestResult::Fail("EPR_Request frame should be 2 + 8 = 10 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_epr_mode_capable_bits_and_positions);
 
 // ── TCPC fake + sink state machine ─────────────────────────────────
 
@@ -256,6 +471,7 @@ fn smoke_sink_state_machine_5v3a_contract() -> TestResult {
     let pdos = [SourcePdo::Fixed {
         voltage_mv: 5000,
         max_current_ma: 3000,
+        epr_mode_capable: false,
     }];
     tcpc.enqueue_rx(source_caps_frame(&pdos, 0));
     let _ = port.step(&cap).unwrap(); // WaitCaps → EvaluateCaps
@@ -328,6 +544,7 @@ fn smoke_sink_reset_clears_contract_and_renegotiates() -> TestResult {
     let pdos_a = [SourcePdo::Fixed {
         voltage_mv: 5000,
         max_current_ma: 3000,
+        epr_mode_capable: false,
     }];
     for _ in 0..5 {
         let _ = port.step(&cap).unwrap();
@@ -359,6 +576,7 @@ fn smoke_sink_reset_clears_contract_and_renegotiates() -> TestResult {
     let pdos_b = [SourcePdo::Fixed {
         voltage_mv: 5000,
         max_current_ma: 1000,
+        epr_mode_capable: false,
     }];
     for _ in 0..5 {
         let _ = port.step(&cap).unwrap();

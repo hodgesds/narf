@@ -30,6 +30,18 @@ exists to avoid competing with firmware for the same controller.
 - UCSI publishes `extcon::typec::FirmwareState` without programming a host mux.
 - Existing TCPC drivers register `Arc<dyn Tcpc>`; production I2C drivers retain
   their granted `Cap<I2cBus, Write>` and use capability-checked operations.
+- EPR policy (`policy::SinkPolicy::evaluate_epr`,
+  `policy::SourcePolicy::evaluate_epr_request`,
+  `policy::SourceEprEntry` / `policy::SinkEprEntry`) is opt-in per port
+  (`epr_capable`, default off). The source advertises the EPR Mode Capable
+  bit on PDO #1 only, resolves EPR positions 8..=11 against `epr_pdos`,
+  verifies the EPR_Request PDO copy byte-for-byte, and runs the §6.4.10.1
+  entry sequence in `SourcePort` Ready (`EprEntryPending` state) with the
+  cable-capability input fed via `SourcePort::set_cable_epr_capability`
+  (fail-closed: unknown cable never yields Enter Succeeded). EPR_Request
+  handling, EPR exit (re-advertise on SPR contract, Hard Reset on EPR
+  contract), and `PortStepOutcome::EprModeEntered` are live on the source
+  side; sink-side entry initiation awaits the policy-driven sink engine.
 
 ## 4. Invariants
 
@@ -75,3 +87,10 @@ Lenovo firmware has not been exercised by this change.
 
 Broader platform quirks and role-swap interfaces.
 GPU source modesetting and native USB4 tunneling are separate subsystems.
+EPR follow-ups: EPR_Source_Capabilities / EPR_Sink_Capabilities extended-message
+transport (§6.5.15) for EPR contract advertisement after entry; sink-side EPR
+entry initiation once the sink engine is policy-driven; EPR keepalive timers
+(tSinkEPRKeepAlive / tSourceEPRKeepAlive) and tEnterEPR; VCONN-Swap-during-entry
+(the entry machine fails with NotVconnSource when the source is not already
+the VCONN supplier); wiring the cable-capability input from SOP' discovery
+(#1215).

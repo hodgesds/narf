@@ -38,14 +38,15 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use narf_capabilities::{Cap, CapError, Grant, NoopOp};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_usbpd::message::{
-    decode_message, encode_message, BistDataObject, BistMode, CtrlMsg, DataMsg, DataRole, FixedRdo,
-    Header, PowerRole, ProgrammableRdo, SourcePdo, SpecRev,
+    decode_message, encode_message, AvsRdo, BistDataObject, BistMode, CtrlMsg, DataMsg, DataRole,
+    EprModeAction, EprModeDataObject, FixedRdo, Header, PowerRole, ProgrammableRdo, SourcePdo,
+    SpecRev,
 };
 use narf_usbpd::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
 use narf_usbpd::tcpm::{Contract, SinkPort, SinkState, StepOutcome};
 use narf_usbpd::UsbPd;
 
-use crate::policy::{RequestDecision, SinkPolicy, SourcePolicy};
+use crate::policy::{EprRequestKind, RequestDecision, SinkPolicy, SourceEprEntry, SourcePolicy};
 
 // ── Source Policy Engine state (§8.3.3.2) ──────────────────────────
 
@@ -101,6 +102,10 @@ pub enum SourceState {
     /// BIST_Carrier_Mode (§6.4.3.1): a BIST data message was received;
     /// we acknowledge entry. The chip-level emit is left to the TCPC.
     BistCarrierMode = 18,
+    /// EPR_Mode entry pending (§6.4.10.1): Enter was Acknowledged
+    /// and the source is waiting on cable-capability resolution
+    /// before sending Enter Succeeded / Enter Failed.
+    EprEntryPending = 19,
 }
 
 /// Error from the source state machine.
@@ -144,6 +149,10 @@ pub enum SourceStepOutcome {
     /// pattern; the TCPC chip is responsible for actually generating
     /// it. We park here until the partner clears with a Hard Reset.
     BistEntered,
+    /// EPR Mode entered — the Enter Succeeded message was just sent
+    /// after a successful §6.4.10.1 entry sequence. The live contract
+    /// is still the SPR one until an EPR_Request renegotiates it.
+    EprModeEntered,
 }
 
 /// Source-role policy engine running on top of a TCPC.
@@ -166,6 +175,25 @@ pub struct SourcePort {
     /// default to supplying VConn (§4.5.4); flips on every successful
     /// VConn_Swap.
     is_vconn_supplier: AtomicU8,
+    /// True once EPR Mode has been entered (§6.4.10.1) and not yet
+    /// exited. Gates EPR_Request handling in Ready.
+    epr_mode: AtomicU8,
+    /// Cable EPR capability, as resolved by SOP' discovery (#1215):
+    /// `cable_epr_known` says discovery has produced an answer,
+    /// `cable_epr_capable` says the answer was EPR capable. Both
+    /// default to unknown/not-capable (fail-closed): entry cannot
+    /// succeed until discovery reports a capable cable.
+    cable_epr_known: AtomicU8,
+    cable_epr_capable: AtomicU8,
+    /// EPR Mode Capable bit (§6.4.2.7 bit 22) from the sink's most
+    /// recent Request RDO. Entry step 2a checks this; it survives
+    /// TransitionSupply (which consumes the pending request itself).
+    last_rdo_epr_capable: AtomicU8,
+    /// EPR Mode entry machine (§6.4.10.1), source side.
+    epr_entry: IrqSafeSpinLock<SourceEprEntry>,
+    /// EPR contract triple stashed on EPR_Request Accept, consumed
+    /// by TransitionSupply: (object position, voltage mV, current mA).
+    pending_epr_contract: IrqSafeSpinLock<Option<(u8, u32, u32)>>,
 }
 
 impl SourcePort {
@@ -180,6 +208,12 @@ impl SourcePort {
             contract: IrqSafeSpinLock::new(None),
             is_dfp: AtomicU8::new(1),
             is_vconn_supplier: AtomicU8::new(1),
+            epr_mode: AtomicU8::new(0),
+            cable_epr_known: AtomicU8::new(0),
+            cable_epr_capable: AtomicU8::new(0),
+            last_rdo_epr_capable: AtomicU8::new(0),
+            epr_entry: IrqSafeSpinLock::new(SourceEprEntry::new()),
+            pending_epr_contract: IrqSafeSpinLock::new(None),
         }
     }
 
@@ -204,8 +238,14 @@ impl SourcePort {
     pub fn reset(&self) {
         *self.pending_request.lock() = None;
         *self.pending_pps_request.lock() = None;
+        *self.pending_epr_contract.lock() = None;
         *self.contract.lock() = None;
         self.next_msg_id.store(0, Ordering::Release);
+        self.epr_mode.store(0, Ordering::Release);
+        self.cable_epr_known.store(0, Ordering::Release);
+        self.cable_epr_capable.store(0, Ordering::Release);
+        self.last_rdo_epr_capable.store(0, Ordering::Release);
+        *self.epr_entry.lock() = SourceEprEntry::new();
         self.set_state(SourceState::Startup);
     }
 
@@ -219,6 +259,23 @@ impl SourcePort {
     /// active CC pin. Flips on every successful VConn_Swap.
     pub fn is_vconn_supplier(&self) -> bool {
         self.is_vconn_supplier.load(Ordering::Acquire) != 0
+    }
+
+    /// True once EPR Mode has been entered and not yet exited.
+    pub fn epr_mode(&self) -> bool {
+        self.epr_mode.load(Ordering::Acquire) != 0
+    }
+
+    /// Report SOP' cable-discovery results (#1215) for EPR entry.
+    /// `known = false` means discovery has not produced an answer
+    /// yet (entry stays pending); `known = true` with `capable`
+    /// resolves the pending entry to Succeeded or Failed. Until a
+    /// discovery task drives this, entry fails closed: an unknown
+    /// cable never yields Enter Succeeded.
+    pub fn set_cable_epr_capability(&self, known: bool, capable: bool) {
+        self.cable_epr_known.store(known as u8, Ordering::Release);
+        self.cable_epr_capable
+            .store(capable as u8, Ordering::Release);
     }
 
     fn set_state(&self, s: SourceState) {
@@ -276,9 +333,13 @@ impl SourcePort {
                 self.next_msg_id.store(0, Ordering::Release);
                 *self.pending_request.lock() = None;
                 *self.pending_pps_request.lock() = None;
+                *self.pending_epr_contract.lock() = None;
                 *self.contract.lock() = None;
                 self.is_dfp.store(1, Ordering::Release);
                 self.is_vconn_supplier.store(1, Ordering::Release);
+                self.epr_mode.store(0, Ordering::Release);
+                self.last_rdo_epr_capable.store(0, Ordering::Release);
+                *self.epr_entry.lock() = SourceEprEntry::new();
                 self.set_state(SourceState::Discovery);
                 Ok(SourceStepOutcome::Advanced(SourceState::Discovery))
             }
@@ -310,6 +371,7 @@ impl SourcePort {
             SourceState::VconnSwapWaitReply => self.step_vconn_swap_wait_reply(),
             SourceState::VconnSwapStart => self.step_vconn_swap_start(),
             SourceState::VconnSwapTurnOff => self.step_vconn_swap_turn_off(),
+            SourceState::EprEntryPending => self.step_epr_entry_pending(),
             SourceState::BistCarrierMode => {
                 Ok(SourceStepOutcome::Idle(SourceState::BistCarrierMode))
             }
@@ -317,7 +379,7 @@ impl SourcePort {
     }
 
     fn step_send_capabilities(&self) -> Result<SourceStepOutcome, SourceError> {
-        let pdos: Vec<SourcePdo> = self.policy.lock().pdos.clone();
+        let pdos: Vec<SourcePdo> = self.policy.lock().advertised_pdos();
         if pdos.is_empty() {
             // Empty source policy is a configuration bug — fail loud
             // by hopping into Hard Reset.
@@ -363,9 +425,11 @@ impl SourcePort {
         }
         // Pick the right RDO type by inspecting the targeted PDO.
         // Augmented PDOs use a Programmable RDO (§6.4.2.5); everything
-        // else uses a Fixed RDO.
+        // else uses a Fixed RDO. Object position is bits 31..28
+        // (§6.4.2.1) — the full 4-bit field, so EPR positions 8..=11
+        // decode distinctly instead of wrapping to 0..=3.
         let raw = objs[0];
-        let position = ((raw >> 28) & 0x7) as u8;
+        let position = ((raw >> 28) & 0xF) as u8;
         let pdo = self
             .policy
             .lock()
@@ -380,10 +444,14 @@ impl SourcePort {
         let is_pps = matches!(pdo, Some(SourcePdo::Augmented { .. }));
         let decision = if is_pps {
             let prdo = ProgrammableRdo::decode(raw);
+            self.last_rdo_epr_capable
+                .store(prdo.epr_mode_capable as u8, Ordering::Release);
             *self.pending_pps_request.lock() = Some(prdo);
             self.policy.lock().evaluate_programmable_request(&prdo)
         } else {
             let rdo = FixedRdo::decode(raw);
+            self.last_rdo_epr_capable
+                .store(rdo.epr_mode_capable as u8, Ordering::Release);
             *self.pending_request.lock() = Some(rdo);
             self.policy.lock().evaluate_request(&rdo)
         };
@@ -416,10 +484,13 @@ impl SourcePort {
         // voltage and then sends PS_RDY. We don't drive a real rail —
         // emit PS_RDY immediately, and let the chip driver decide
         // how Vbus is actually steered.
-        // PPS path first — if a Programmable RDO was stashed, the
-        // contract is built from its requested voltage.
+        // EPR path first — an EPR_Request Accept stashes the
+        // contract triple directly (no Fixed/Programmable pending
+        // request exists for an AVS Accept).
         let (object_position, voltage_mv, op_current_ma) =
-            if let Some(prdo) = self.pending_pps_request.lock().take() {
+            if let Some(triple) = self.pending_epr_contract.lock().take() {
+                triple
+            } else if let Some(prdo) = self.pending_pps_request.lock().take() {
                 (prdo.object_position, prdo.voltage_mv, prdo.op_current_ma)
             } else {
                 let pending = match self.pending_request.lock().take() {
@@ -449,6 +520,14 @@ impl SourcePort {
                     SourcePdo::Variable { max_voltage_mv, .. } => max_voltage_mv,
                     SourcePdo::Augmented { max_voltage_mv, .. } => max_voltage_mv,
                     SourcePdo::Battery { max_voltage_mv, .. } => max_voltage_mv,
+                    // An EPR AVS PDO at an SPR position is malformed
+                    // policy: EPR contracts arrive via the EPR stash
+                    // branch above, never through a plain Request.
+                    // Bounce to HardReset like the no-pending case.
+                    SourcePdo::EprAvs { .. } => {
+                        self.set_state(SourceState::HardReset);
+                        return Err(SourceError::Protocol);
+                    }
                 };
                 (pending.object_position, voltage_mv, pending.op_current_ma)
             };
@@ -484,17 +563,23 @@ impl SourcePort {
         };
         let (h, objs) = decode_message(&buf).ok_or(SourceError::Protocol)?;
         if h.num_data_objects > 0 {
-            // BIST is the only inbound data message we handle in
-            // Ready; anything else is a protocol violation.
-            if DataMsg::from_u8(h.msg_type) == Some(DataMsg::Bist) && !objs.is_empty() {
-                if let Some(bdo) = BistDataObject::decode(objs[0]) {
-                    if matches!(bdo.mode, BistMode::CarrierMode2 | BistMode::TestData) {
-                        // §6.4.3: the UUT enters BIST and parks here
-                        // until the partner clears with a Hard Reset.
-                        self.set_state(SourceState::BistCarrierMode);
-                        return Ok(SourceStepOutcome::BistEntered);
+            // EPR_Mode / EPR_Request are handled by their own arms;
+            // BIST is the only other inbound data message we handle
+            // in Ready; anything else is a protocol violation.
+            match DataMsg::from_u8(h.msg_type) {
+                Some(DataMsg::EprMode) => return self.handle_epr_mode(&objs),
+                Some(DataMsg::EprRequest) => return self.handle_epr_request(&objs),
+                Some(DataMsg::Bist) if !objs.is_empty() => {
+                    if let Some(bdo) = BistDataObject::decode(objs[0]) {
+                        if matches!(bdo.mode, BistMode::CarrierMode2 | BistMode::TestData) {
+                            // §6.4.3: the UUT enters BIST and parks here
+                            // until the partner clears with a Hard Reset.
+                            self.set_state(SourceState::BistCarrierMode);
+                            return Ok(SourceStepOutcome::BistEntered);
+                        }
                     }
                 }
+                _ => {}
             }
             self.set_state(SourceState::HardReset);
             return Err(SourceError::Protocol);
@@ -525,6 +610,175 @@ impl SourcePort {
         let frame = encode_message(h, &[]);
         self.tcpc.transmit(&frame)?;
         Ok(())
+    }
+
+    fn send_epr_mode(&self, mdo: EprModeDataObject) -> Result<(), SourceError> {
+        let h = Header::data(
+            DataMsg::EprMode,
+            self.data_role(),
+            PowerRole::Source,
+            SpecRev::R3_0,
+            self.next_msg_id(),
+            1,
+        );
+        let frame = encode_message(h, &[mdo.encode()]);
+        self.tcpc.transmit(&frame)?;
+        Ok(())
+    }
+
+    /// Inbound EPR_Mode message while in Ready (§6.4.10).
+    fn handle_epr_mode(&self, objs: &[u32]) -> Result<SourceStepOutcome, SourceError> {
+        let mdo = match objs.first().and_then(|o| EprModeDataObject::decode(*o)) {
+            Some(m) => m,
+            None => {
+                // Reserved action — protocol violation.
+                self.set_state(SourceState::HardReset);
+                return Err(SourceError::Protocol);
+            }
+        };
+        match mdo.action {
+            EprModeAction::Enter => {
+                // Step 2 inputs: the sink's last RDO bit, our
+                // advertised PDO #1 bit, and still-able (policy).
+                let rdo_bit = self.last_rdo_epr_capable.load(Ordering::Acquire) != 0;
+                let policy = self.policy.lock().clone();
+                let pdo_bit = match policy.advertised_pdos().first() {
+                    Some(SourcePdo::Fixed {
+                        epr_mode_capable, ..
+                    }) => *epr_mode_capable,
+                    _ => false,
+                };
+                let reply = self
+                    .epr_entry
+                    .lock()
+                    .on_enter(rdo_bit, pdo_bit, policy.epr_capable);
+                let acked = reply.action == EprModeAction::EnterAcknowledged;
+                self.send_epr_mode(reply)?;
+                if acked {
+                    self.set_state(SourceState::EprEntryPending);
+                    Ok(SourceStepOutcome::Advanced(SourceState::EprEntryPending))
+                } else {
+                    Ok(SourceStepOutcome::Idle(SourceState::Ready))
+                }
+            }
+            EprModeAction::Exit => {
+                if !self.epr_mode() {
+                    // Not in EPR Mode; nothing to exit.
+                    return Ok(SourceStepOutcome::Idle(SourceState::Ready));
+                }
+                self.epr_entry.lock().on_exit();
+                self.epr_mode.store(0, Ordering::Release);
+                // §6.4.10.3.3: Exit with an EPR contract is a Hard
+                // Reset offence — the SPR contract must be in place
+                // before the exit sequence.
+                let current = *self.contract.lock();
+                if matches!(current, Some(c) if c.object_position >= 8) {
+                    self.set_state(SourceState::HardReset);
+                    return Err(SourceError::Protocol);
+                }
+                // §6.4.10.3.1 step 3: re-advertise SPR caps; the new
+                // SPR contract formalises the return to SPR mode.
+                self.set_state(SourceState::SendCapabilities);
+                Ok(SourceStepOutcome::Advanced(SourceState::SendCapabilities))
+            }
+            // Ack / Succeeded / Failed are source-only sends; a
+            // source receiving one is a protocol violation.
+            _ => {
+                self.set_state(SourceState::HardReset);
+                Err(SourceError::Protocol)
+            }
+        }
+    }
+
+    /// Inbound EPR_Request message while in Ready (§6.4.9, §6.4.10.2).
+    /// Only valid in EPR Mode; the message carries an RDO plus a
+    /// copy of the targeted PDO.
+    fn handle_epr_request(&self, objs: &[u32]) -> Result<SourceStepOutcome, SourceError> {
+        if !self.epr_mode() {
+            self.set_state(SourceState::HardReset);
+            return Err(SourceError::Protocol);
+        }
+        if objs.len() != 2 {
+            self.set_state(SourceState::HardReset);
+            return Err(SourceError::Protocol);
+        }
+        let raw = objs[0];
+        let pdo_copy = objs[1];
+        let position = ((raw >> 28) & 0xF) as u8;
+        // Resolve the targeted PDO to pick the RDO kind. EPR Mode
+        // uses only Fixed + AVS; a Variable/Battery target or an
+        // unresolvable position is a protocol violation, not a
+        // Reject.
+        let policy = self.policy.lock().clone();
+        let pdo = policy.epr_position_pdo(position);
+        let (kind, triple) = match pdo {
+            Some(SourcePdo::Fixed { voltage_mv, .. }) => {
+                let rdo = FixedRdo::decode(raw);
+                (
+                    EprRequestKind::Fixed(rdo),
+                    (position, voltage_mv, rdo.op_current_ma),
+                )
+            }
+            Some(SourcePdo::Augmented { .. }) => {
+                let rdo = ProgrammableRdo::decode(raw);
+                (
+                    EprRequestKind::Programmable(rdo),
+                    (position, rdo.voltage_mv, rdo.op_current_ma),
+                )
+            }
+            Some(SourcePdo::EprAvs { .. }) => {
+                let rdo = AvsRdo::decode(raw);
+                (
+                    EprRequestKind::Avs(rdo),
+                    (position, rdo.voltage_mv, rdo.op_current_ma),
+                )
+            }
+            _ => {
+                self.set_state(SourceState::HardReset);
+                return Err(SourceError::Protocol);
+            }
+        };
+        let reply = match policy.evaluate_epr_request(&kind, pdo_copy) {
+            RequestDecision::Accept => {
+                *self.pending_epr_contract.lock() = Some(triple);
+                self.send_control(CtrlMsg::Accept)?;
+                self.set_state(SourceState::TransitionSupply);
+                return Ok(SourceStepOutcome::Advanced(SourceState::TransitionSupply));
+            }
+            // evaluate_epr_request never returns Wait (a sink
+            // receiving Wait to an EPR_Request Hard Resets), so any
+            // non-Accept here answers Reject.
+            _ => CtrlMsg::Reject,
+        };
+        self.send_control(reply)?;
+        Ok(SourceStepOutcome::Idle(SourceState::Ready))
+    }
+
+    /// EprEntryPending step (§6.4.10.1 steps 4–7): resolve the
+    /// pending entry once cable capability is known. While discovery
+    /// is still in flight this idles — it does not drain RX, so any
+    /// message arriving mid-entry is handled on return to Ready.
+    fn step_epr_entry_pending(&self) -> Result<SourceStepOutcome, SourceError> {
+        let known = self.cable_epr_known.load(Ordering::Acquire) != 0;
+        let capable = self.cable_epr_capable.load(Ordering::Acquire) != 0;
+        let vconn = self.is_vconn_supplier();
+        let verdict = self
+            .epr_entry
+            .lock()
+            .on_cable_resolved(known, capable, vconn);
+        let mdo = match verdict {
+            None => return Ok(SourceStepOutcome::Idle(SourceState::EprEntryPending)),
+            Some(m) => m,
+        };
+        self.send_epr_mode(mdo)?;
+        if mdo.action == EprModeAction::EnterSucceeded {
+            self.epr_mode.store(1, Ordering::Release);
+            self.set_state(SourceState::Ready);
+            Ok(SourceStepOutcome::EprModeEntered)
+        } else {
+            self.set_state(SourceState::Ready);
+            Ok(SourceStepOutcome::Advanced(SourceState::Ready))
+        }
     }
 
     // ── PR_Swap — initiated by us ──────────────────────────────────
@@ -796,6 +1050,10 @@ pub enum PortStepOutcome {
     VconnSwapped {
         now_supplying: bool,
     },
+    /// EPR Mode just entered (§6.4.10.1) — the port can now serve
+    /// EPR_Request negotiations. The live contract is still the SPR
+    /// one until an EPR_Request renegotiates it.
+    EprModeEntered,
 }
 
 /// Top-level port driver: owns one chip + both engines, picks which
@@ -937,6 +1195,7 @@ impl TcpmPort {
                         self.set_state(PortState::Bist);
                         PortStepOutcome::BistEntered
                     }
+                    SourceStepOutcome::EprModeEntered => PortStepOutcome::EprModeEntered,
                 })
             }
             PortState::ErrorRecovery => {
@@ -1041,8 +1300,8 @@ pub(crate) mod tests {
     use alloc::vec::Vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_usbpd::message::{
-        BistDataObject, BistMode, CtrlMsg, DataMsg, DataRole, FixedRdo, Header, PowerRole,
-        ProgrammableRdo, SpecRev,
+        AvsRdo, BistDataObject, BistMode, CtrlMsg, DataMsg, DataRole, EprEnterFailedReason,
+        EprModeAction, EprModeDataObject, FixedRdo, Header, PowerRole, ProgrammableRdo, SpecRev,
     };
     use narf_usbpd::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
 
@@ -1117,6 +1376,7 @@ pub(crate) mod tests {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: false,
+            epr_mode_capable: false,
         };
         encode_message(h, &[rdo.encode()])
     }
@@ -1595,6 +1855,7 @@ pub(crate) mod tests {
             SourcePolicy::from_pdos(alloc::vec![narf_usbpd::message::SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 1000,
+                epr_mode_capable: false,
             }]),
             alloc::string::String::from("host-1a"),
         ));
@@ -1976,6 +2237,7 @@ pub(crate) mod tests {
             SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
             SourcePdo::Augmented {
                 max_voltage_mv: 11000,
@@ -1995,6 +2257,7 @@ pub(crate) mod tests {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: false,
+            epr_mode_capable: false,
         };
         chip.enqueue_rx(partner_data_frame(DataMsg::Request, &[prdo.encode()]));
         let _ = port.step(&cap).unwrap();
@@ -2028,6 +2291,7 @@ pub(crate) mod tests {
             SourcePdo::Fixed {
                 voltage_mv: 5000,
                 max_current_ma: 3000,
+                epr_mode_capable: false,
             },
             SourcePdo::Augmented {
                 max_voltage_mv: 11000,
@@ -2047,6 +2311,7 @@ pub(crate) mod tests {
             usb_comms: true,
             no_usb_suspend: true,
             cap_mismatch: false,
+            epr_mode_capable: false,
         };
         chip.enqueue_rx(partner_data_frame(DataMsg::Request, &[prdo.encode()]));
         let _ = port.step(&cap).unwrap();
@@ -2130,4 +2395,424 @@ pub(crate) mod tests {
         }
     }
     kernel_test_in!("drivers/usbpd/tcpm", smoke_bist_tcpmport_relays_outcome);
+
+    // ── EPR (§6.4.9, §6.4.10) ────────────────────────────────────
+
+    fn request_frame_epr(position: u8, current_ma: u32, epr_bit: bool, message_id: u8) -> Vec<u8> {
+        let h = Header::data(
+            DataMsg::Request,
+            DataRole::Ufp,
+            PowerRole::Sink,
+            SpecRev::R3_0,
+            message_id,
+            1,
+        );
+        let rdo = FixedRdo {
+            object_position: position,
+            op_current_ma: current_ma,
+            max_op_current_ma: current_ma,
+            give_back: false,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+            epr_mode_capable: epr_bit,
+        };
+        encode_message(h, &[rdo.encode()])
+    }
+
+    fn epr_mode_frame(mdo: EprModeDataObject, message_id: u8) -> Vec<u8> {
+        let h = Header::data(
+            DataMsg::EprMode,
+            DataRole::Ufp,
+            PowerRole::Sink,
+            SpecRev::R3_0,
+            message_id,
+            1,
+        );
+        encode_message(h, &[mdo.encode()])
+    }
+
+    fn epr_request_frame(rdo_raw: u32, pdo_copy: u32, message_id: u8) -> Vec<u8> {
+        let h = Header::data(
+            DataMsg::EprRequest,
+            DataRole::Ufp,
+            PowerRole::Sink,
+            SpecRev::R3_0,
+            message_id,
+            2,
+        );
+        encode_message(h, &[rdo_raw, pdo_copy])
+    }
+
+    fn epr_source_policy() -> SourcePolicy {
+        let mut p = SourcePolicy::from_pdos(alloc::vec![
+            SourcePdo::Fixed {
+                voltage_mv: 5000,
+                max_current_ma: 3000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 20000,
+                max_current_ma: 5000,
+                epr_mode_capable: false,
+            },
+        ]);
+        p.epr_capable = true;
+        p.epr_pdos = alloc::vec![
+            SourcePdo::Fixed {
+                voltage_mv: 28000,
+                max_current_ma: 5000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::Fixed {
+                voltage_mv: 48000,
+                max_current_ma: 5000,
+                epr_mode_capable: false,
+            },
+            SourcePdo::EprAvs {
+                max_voltage_mv: 48000,
+                min_voltage_mv: 15000,
+                pdp_w: 240,
+                peak_current: 0,
+            },
+        ];
+        p
+    }
+
+    /// Drive a fresh EPR-capable source port to Ready (SPR contract
+    /// on PDO #1 @ 1.5 A). `epr_bit` sets the EPR Mode Capable bit
+    /// in the sink's Request RDO.
+    fn drive_epr_source_to_ready(
+        chip: &Arc<FakeChip>,
+        port: &SourcePort,
+        cap: &Cap<UsbPd, Grant>,
+        epr_bit: bool,
+    ) -> Result<Contract, &'static str> {
+        port.step(cap).map_err(|_| "startup step failed")?;
+        port.step(cap).map_err(|_| "discovery step failed")?;
+        port.step(cap).map_err(|_| "send-caps step failed")?;
+        if port.state() != SourceState::NegotiateCapability {
+            return Err("did not reach NegotiateCapability");
+        }
+        chip.enqueue_rx(request_frame_epr(1, 1500, epr_bit, 0));
+        port.step(cap).map_err(|_| "negotiate step failed")?;
+        if port.state() != SourceState::TransitionSupply {
+            return Err("Accept path didn't reach TransitionSupply");
+        }
+        match port.step(cap).map_err(|_| "transition step failed")? {
+            SourceStepOutcome::Ready { contract } => Ok(contract),
+            _ => Err("TransitionSupply should produce Ready"),
+        }
+    }
+
+    /// Drive a Ready EPR-capable source through entry to EPR Mode.
+    fn drive_epr_source_to_epr_mode(
+        chip: &Arc<FakeChip>,
+        port: &SourcePort,
+        cap: &Cap<UsbPd, Grant>,
+    ) -> Result<(), &'static str> {
+        drive_epr_source_to_ready(chip, port, cap, true)?;
+        chip.enqueue_rx(epr_mode_frame(EprModeDataObject::enter(240), 1));
+        match port.step(cap).map_err(|_| "Enter step failed")? {
+            SourceStepOutcome::Advanced(SourceState::EprEntryPending) => {}
+            _ => return Err("Enter should advance to EprEntryPending"),
+        }
+        port.set_cable_epr_capability(true, true);
+        match port.step(cap).map_err(|_| "pending step failed")? {
+            SourceStepOutcome::EprModeEntered => {}
+            _ => return Err("pending step should yield EprModeEntered"),
+        }
+        if !port.epr_mode() || port.state() != SourceState::Ready {
+            return Err("port should be in EPR Mode at Ready");
+        }
+        Ok(())
+    }
+
+    fn last_tx_epr_mode(chip: &Arc<FakeChip>) -> Result<EprModeDataObject, &'static str> {
+        let sent = chip.sent();
+        let last = sent.last().ok_or("no frames transmitted")?;
+        let (h, objs) = decode_message(last).ok_or("last TX undecodable")?;
+        if DataMsg::from_u8(h.msg_type) != Some(DataMsg::EprMode) || objs.len() != 1 {
+            return Err("last TX was not a one-object EPR_Mode message");
+        }
+        EprModeDataObject::decode(objs[0]).ok_or("last TX EPRMDO undecodable")
+    }
+
+    fn smoke_source_epr_entry_ack_then_succeeded() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let port = SourcePort::new(chip.clone(), epr_source_policy());
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        let contract = match drive_epr_source_to_ready(&chip, &port, &cap, true) {
+            Ok(c) => c,
+            Err(e) => return TestResult::Fail(e),
+        };
+        if contract.object_position != 1 || contract.voltage_mv != 5000 {
+            return TestResult::Fail("SPR contract should be PDO #1 @ 5V");
+        }
+        // The advertised PDO #1 must carry the EPR bit (table 6.9).
+        let sent = chip.sent();
+        let (_, caps) = match decode_message(&sent[0]) {
+            Some(p) => p,
+            None => return TestResult::Fail("caps frame undecodable"),
+        };
+        match SourcePdo::decode(caps[0]) {
+            SourcePdo::Fixed {
+                epr_mode_capable: true,
+                ..
+            } => {}
+            _ => return TestResult::Fail("advertised PDO #1 should carry the EPR bit"),
+        }
+        // Sink sends EPR_Mode Enter (240 W operational PDP).
+        chip.enqueue_rx(epr_mode_frame(EprModeDataObject::enter(240), 1));
+        let outcome = match port.step(&cap) {
+            Ok(o) => o,
+            Err(_) => return TestResult::Fail("Enter step errored"),
+        };
+        if !matches!(
+            outcome,
+            SourceStepOutcome::Advanced(SourceState::EprEntryPending)
+        ) {
+            return TestResult::Fail("Enter should advance to EprEntryPending");
+        }
+        match last_tx_epr_mode(&chip) {
+            Ok(mdo) if mdo.action == EprModeAction::EnterAcknowledged => {}
+            _ => return TestResult::Fail("reply to Enter should be Enter Acknowledged"),
+        }
+        // Cable still unknown: the pending step idles, no verdict.
+        match port.step(&cap) {
+            Ok(SourceStepOutcome::Idle(SourceState::EprEntryPending)) => {}
+            _ => return TestResult::Fail("unknown cable should keep entry pending"),
+        }
+        // Cable discovery reports capable: Succeeded + EPR Mode.
+        port.set_cable_epr_capability(true, true);
+        match port.step(&cap) {
+            Ok(SourceStepOutcome::EprModeEntered) => {}
+            _ => return TestResult::Fail("capable cable should yield EprModeEntered"),
+        }
+        if !port.epr_mode() || port.state() != SourceState::Ready {
+            return TestResult::Fail("port should be in EPR Mode at Ready");
+        }
+        match last_tx_epr_mode(&chip) {
+            Ok(mdo) if mdo.action == EprModeAction::EnterSucceeded => TestResult::Pass,
+            _ => TestResult::Fail("verdict frame should be Enter Succeeded"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_source_epr_entry_ack_then_succeeded
+    );
+
+    fn smoke_source_epr_entry_fails_when_rdo_bit_clear() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let port = SourcePort::new(chip.clone(), epr_source_policy());
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        // The sink's Request did NOT set the EPR bit (step 2a fails).
+        if let Err(e) = drive_epr_source_to_ready(&chip, &port, &cap, false) {
+            return TestResult::Fail(e);
+        }
+        chip.enqueue_rx(epr_mode_frame(EprModeDataObject::enter(240), 1));
+        match port.step(&cap) {
+            Ok(SourceStepOutcome::Idle(SourceState::Ready)) => {}
+            _ => return TestResult::Fail("failed Enter should stay in Ready"),
+        }
+        match last_tx_epr_mode(&chip) {
+            Ok(mdo) if mdo.failed_reason() == Some(EprEnterFailedReason::RdoBitNotSet) => {}
+            _ => return TestResult::Fail("reply should be Enter Failed (RDO bit)"),
+        }
+        if port.epr_mode() {
+            return TestResult::Fail("failed entry must not set EPR mode");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_source_epr_entry_fails_when_rdo_bit_clear
+    );
+
+    fn smoke_source_epr_request_negotiates_avs_contract() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let port = SourcePort::new(chip.clone(), epr_source_policy());
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        if let Err(e) = drive_epr_source_to_epr_mode(&chip, &port, &cap) {
+            return TestResult::Fail(e);
+        }
+        // EPR_Request for the AVS APDO at position 10, 28 V @ 5 A,
+        // with the exact PDO copy.
+        let avs_pdo = SourcePdo::EprAvs {
+            max_voltage_mv: 48000,
+            min_voltage_mv: 15000,
+            pdp_w: 240,
+            peak_current: 0,
+        };
+        let rdo = AvsRdo {
+            object_position: 10,
+            voltage_mv: 28000,
+            op_current_ma: 5000,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+            epr_mode_capable: true,
+        };
+        chip.enqueue_rx(epr_request_frame(rdo.encode(), avs_pdo.encode(), 2));
+        match port.step(&cap) {
+            Ok(SourceStepOutcome::Advanced(SourceState::TransitionSupply)) => {}
+            _ => return TestResult::Fail("AVS EPR_Request should be Accepted"),
+        }
+        match port.step(&cap) {
+            Ok(SourceStepOutcome::Ready { contract }) => {
+                if contract.object_position != 10
+                    || contract.voltage_mv != 28000
+                    || contract.op_current_ma != 5000
+                {
+                    return TestResult::Fail("AVS contract triple drift");
+                }
+            }
+            _ => return TestResult::Fail("TransitionSupply should produce Ready"),
+        }
+        if !port.epr_mode() {
+            return TestResult::Fail("EPR mode must survive renegotiation");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_source_epr_request_negotiates_avs_contract
+    );
+
+    fn smoke_source_epr_exit_with_spr_contract_readvertises() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let port = SourcePort::new(chip.clone(), epr_source_policy());
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        if let Err(e) = drive_epr_source_to_epr_mode(&chip, &port, &cap) {
+            return TestResult::Fail(e);
+        }
+        // Live contract is still SPR (PDO #1): Exit re-advertises.
+        chip.enqueue_rx(epr_mode_frame(EprModeDataObject::exit(), 2));
+        match port.step(&cap) {
+            Ok(SourceStepOutcome::Advanced(SourceState::SendCapabilities)) => {}
+            _ => return TestResult::Fail("Exit with SPR contract should re-advertise"),
+        }
+        if port.epr_mode() {
+            return TestResult::Fail("Exit must clear EPR mode");
+        }
+        match port.step(&cap) {
+            Ok(SourceStepOutcome::Advanced(SourceState::NegotiateCapability)) => {}
+            _ => return TestResult::Fail("re-advertise should reach NegotiateCapability"),
+        }
+        let sent = chip.sent();
+        let (h, _) = match decode_message(sent.last().unwrap()) {
+            Some(p) => p,
+            None => return TestResult::Fail("re-advertised frame undecodable"),
+        };
+        if DataMsg::from_u8(h.msg_type) != Some(DataMsg::SourceCapabilities) {
+            return TestResult::Fail("re-advertise should send Source_Capabilities");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_source_epr_exit_with_spr_contract_readvertises
+    );
+
+    fn smoke_source_epr_exit_with_epr_contract_hard_resets() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let port = SourcePort::new(chip.clone(), epr_source_policy());
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        if let Err(e) = drive_epr_source_to_epr_mode(&chip, &port, &cap) {
+            return TestResult::Fail(e);
+        }
+        // Negotiate the AVS contract first (position 10).
+        let avs_pdo = SourcePdo::EprAvs {
+            max_voltage_mv: 48000,
+            min_voltage_mv: 15000,
+            pdp_w: 240,
+            peak_current: 0,
+        };
+        let rdo = AvsRdo {
+            object_position: 10,
+            voltage_mv: 28000,
+            op_current_ma: 5000,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+            epr_mode_capable: true,
+        };
+        chip.enqueue_rx(epr_request_frame(rdo.encode(), avs_pdo.encode(), 2));
+        let _ = port.step(&cap);
+        let _ = port.step(&cap);
+        if port.contract().map(|c| c.object_position) != Some(10) {
+            return TestResult::Fail("setup did not reach the AVS contract");
+        }
+        // Exit with an EPR contract live is a Hard Reset offence.
+        chip.enqueue_rx(epr_mode_frame(EprModeDataObject::exit(), 3));
+        match port.step(&cap) {
+            Err(SourceError::Protocol) => {}
+            _ => return TestResult::Fail("Exit with EPR contract should be a protocol error"),
+        }
+        if port.state() != SourceState::HardReset {
+            return TestResult::Fail("Exit with EPR contract should enter HardReset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_source_epr_exit_with_epr_contract_hard_resets
+    );
+
+    fn smoke_source_epr_request_outside_epr_mode_hard_resets() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let port = SourcePort::new(chip.clone(), epr_source_policy());
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        if let Err(e) = drive_epr_source_to_ready(&chip, &port, &cap, true) {
+            return TestResult::Fail(e);
+        }
+        // EPR_Request while still in SPR Ready: protocol violation.
+        let rdo = FixedRdo {
+            object_position: 8,
+            op_current_ma: 5000,
+            max_op_current_ma: 5000,
+            give_back: false,
+            usb_comms: true,
+            no_usb_suspend: true,
+            cap_mismatch: false,
+            epr_mode_capable: true,
+        };
+        let copy = SourcePdo::Fixed {
+            voltage_mv: 28000,
+            max_current_ma: 5000,
+            epr_mode_capable: false,
+        }
+        .encode();
+        chip.enqueue_rx(epr_request_frame(rdo.encode(), copy, 1));
+        match port.step(&cap) {
+            Err(SourceError::Protocol) => {}
+            _ => return TestResult::Fail("EPR_Request outside EPR mode should error"),
+        }
+        if port.state() != SourceState::HardReset {
+            return TestResult::Fail("EPR_Request outside EPR mode should enter HardReset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm",
+        smoke_source_epr_request_outside_epr_mode_hard_resets
+    );
 }

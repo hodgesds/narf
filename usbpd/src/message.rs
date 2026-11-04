@@ -102,6 +102,12 @@ pub enum DataMsg {
     Alert = 0x06,
     GetCountryInfo = 0x07,
     EnterUsb = 0x08,
+    /// EPR_Request (§6.4.9): sink to source, SOP only, only in EPR
+    /// Mode. Carries an RDO plus a copy of the PDO it targets.
+    EprRequest = 0x09,
+    /// EPR_Mode (§6.4.10): sink or source, SOP only. Carries one
+    /// EPR Mode Data Object (EPRMDO, table 6.51).
+    EprMode = 0x0A,
     VendorDefined = 0x0F,
 }
 
@@ -113,6 +119,8 @@ impl DataMsg {
             0x03 => DataMsg::Bist,
             0x04 => DataMsg::SinkCapabilities,
             0x06 => DataMsg::Alert,
+            0x09 => DataMsg::EprRequest,
+            0x0A => DataMsg::EprMode,
             0x0F => DataMsg::VendorDefined,
             _ => return None,
         })
@@ -209,16 +217,24 @@ impl Header {
 // ── Power Data Objects (§6.4.1) ────────────────────────────────────
 
 /// One PDO advertised by a Source. We model only the four Source
-/// PDO variants the spec defines.
+/// PDO variants the spec defines, plus the EPR AVS APDO.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SourcePdo {
     /// Fixed Supply (§6.4.1.2.3). 5V / Vbus / max-current at 10mA units
     /// stored as 5V * 50mV-step is documented separately — we keep the
     /// raw values per §6.4.1.2.3 table 6-9: voltage in 50 mV units,
     /// current in 10 mA units.
+    ///
+    /// `epr_mode_capable` is table 6-9 bit 23. Per §6.4.1.2.2.7 it is
+    /// a static bit set when the source can supply more than 100 W
+    /// and operate in EPR Mode. Bits 29…23 convey information only
+    /// on the vSafe5V PDO (position 1); every other Fixed PDO sets
+    /// them to zero — policy enforces that on advertisement, decode
+    /// reads the bit wherever it appears.
     Fixed {
         voltage_mv: u32,
         max_current_ma: u32,
+        epr_mode_capable: bool,
     },
     /// Variable Supply (Non-Battery). §6.4.1.2.4.
     Variable {
@@ -238,6 +254,20 @@ pub enum SourcePdo {
         min_voltage_mv: u32,
         max_current_ma: u32,
     },
+    /// EPR Adjustable Voltage Supply APDO (§6.4.1.2.5.2, table
+    /// 6.14 source / table 6.21 sink). APDO sub-type 01b, supplying
+    /// 15 V up to 48 V. Voltages in 100 mV steps; `pdp_w` is the
+    /// port's PDP in 1 W steps (the sink APDO's PDP is the power
+    /// the device needs for full function). `peak_current` is the
+    /// 2-bit table 6.15 overload capability on source APDOs; sink
+    /// APDOs set bits 27…26 to zero, so sink-side construction
+    /// passes 0 here.
+    EprAvs {
+        max_voltage_mv: u32,
+        min_voltage_mv: u32,
+        pdp_w: u32,
+        peak_current: u8,
+    },
 }
 
 impl SourcePdo {
@@ -246,13 +276,15 @@ impl SourcePdo {
             SourcePdo::Fixed {
                 voltage_mv,
                 max_current_ma,
+                epr_mode_capable,
             } => {
                 // §6.4.1.2.3 table 6-9: type=0b00 (bits 30..31 = 00),
-                // bits 10..19 = voltage / 50 mV, bits 0..9 = current / 10 mA.
+                // bit 23 = EPR Mode Capable, bits 10..19 = voltage /
+                // 50 mV, bits 0..9 = current / 10 mA.
                 let v = (voltage_mv / 50) & 0x3FF;
                 let i = (max_current_ma / 10) & 0x3FF;
                 // type field (bits 30..31) is 0b00, contributing nothing.
-                (v << 10) | i
+                ((epr_mode_capable as u32) << 23) | (v << 10) | i
             }
             SourcePdo::Battery {
                 max_voltage_mv,
@@ -288,6 +320,24 @@ impl SourcePdo {
                 let i = (max_current_ma / 50) & 0x7F;
                 (0b11 << 30) | (mxv << 17) | (mnv << 8) | i
             }
+            SourcePdo::EprAvs {
+                max_voltage_mv,
+                min_voltage_mv,
+                pdp_w,
+                peak_current,
+            } => {
+                // EPR AVS APDO (§6.4.1.2.5.2, table 6.14): type =
+                // 0b11, sub-type = 0b01 (bits 28..29), peak current
+                // bits 26..27, max voltage in 100 mV steps over
+                // NINE bits (17..25 — 48 V needs bit 25), reserved
+                // bit 16 zero, min voltage in 100 mV steps bits
+                // 8..15, PDP in 1 W steps bits 0..7.
+                let mxv = (max_voltage_mv / 100) & 0x1FF;
+                let mnv = (min_voltage_mv / 100) & 0xFF;
+                let pdp = pdp_w & 0xFF;
+                let pc = (peak_current as u32) & 0x3;
+                (0b11 << 30) | (0b01 << 28) | (pc << 26) | (mxv << 17) | (mnv << 8) | pdp
+            }
         }
     }
 
@@ -296,6 +346,7 @@ impl SourcePdo {
             0b00 => SourcePdo::Fixed {
                 voltage_mv: ((raw >> 10) & 0x3FF) * 50,
                 max_current_ma: (raw & 0x3FF) * 10,
+                epr_mode_capable: (raw >> 23) & 0x1 != 0,
             },
             0b01 => SourcePdo::Battery {
                 max_voltage_mv: ((raw >> 20) & 0x3FF) * 50,
@@ -307,11 +358,30 @@ impl SourcePdo {
                 min_voltage_mv: ((raw >> 10) & 0x3FF) * 50,
                 max_current_ma: (raw & 0x3FF) * 10,
             },
-            _ => SourcePdo::Augmented {
-                max_voltage_mv: ((raw >> 17) & 0xFF) * 100,
-                min_voltage_mv: ((raw >> 8) & 0xFF) * 100,
-                max_current_ma: (raw & 0x7F) * 50,
-            },
+            _ => {
+                // APDO: split on the sub-type in bits 28..29. 00b is
+                // SPR PPS (§6.4.1.2.6.1); 01b is EPR AVS
+                // (§6.4.1.2.5.2). The SPR AVS sub-type (10b, PD 3.2)
+                // is not modelled in this crate, so it falls through
+                // to the SPR PPS shape — the same mis-decode the old
+                // code applied to every APDO — rather than inventing
+                // a variant for it. EPR AVS must NOT land here: its
+                // 9-bit max-voltage and PDP-in-watts fields would
+                // decode as a truncated voltage and a bogus current.
+                match (raw >> 28) & 0x3 {
+                    0b01 => SourcePdo::EprAvs {
+                        max_voltage_mv: ((raw >> 17) & 0x1FF) * 100,
+                        min_voltage_mv: ((raw >> 8) & 0xFF) * 100,
+                        pdp_w: raw & 0xFF,
+                        peak_current: ((raw >> 26) & 0x3) as u8,
+                    },
+                    _ => SourcePdo::Augmented {
+                        max_voltage_mv: ((raw >> 17) & 0xFF) * 100,
+                        min_voltage_mv: ((raw >> 8) & 0xFF) * 100,
+                        max_current_ma: (raw & 0x7F) * 50,
+                    },
+                }
+            }
         }
     }
 }
@@ -338,26 +408,35 @@ pub struct FixedRdo {
     pub no_usb_suspend: bool,
     /// Capability mismatch flag (§6.4.2.4 bit 26).
     pub cap_mismatch: bool,
+    /// `EPR_Mode_Capable` per §6.4.2.7 bit 22: the sink can operate
+    /// in EPR Mode. EPR Mode entry (§6.4.10.1) requires this bit set
+    /// in the sink's last Request RDO.
+    pub epr_mode_capable: bool,
 }
 
 impl FixedRdo {
     pub fn encode(&self) -> u32 {
-        ((self.object_position as u32 & 0x7) << 28)
+        // Object position is bits 31..28 (§6.4.2.1): SPR PDOs live
+        // at 1..=7, EPR PDOs at 8..=11 — the full 4-bit field, not
+        // the 3 bits the old code masked.
+        ((self.object_position as u32 & 0xF) << 28)
             | ((self.give_back as u32) << 27)
             | ((self.cap_mismatch as u32) << 26)
             | ((self.usb_comms as u32) << 25)
             | ((self.no_usb_suspend as u32) << 24)
+            | ((self.epr_mode_capable as u32) << 22)
             | (((self.op_current_ma / 10) & 0x3FF) << 10)
             | ((self.max_op_current_ma / 10) & 0x3FF)
     }
 
     pub fn decode(raw: u32) -> Self {
         Self {
-            object_position: ((raw >> 28) & 0x7) as u8,
+            object_position: ((raw >> 28) & 0xF) as u8,
             give_back: (raw >> 27) & 0x1 != 0,
             cap_mismatch: (raw >> 26) & 0x1 != 0,
             usb_comms: (raw >> 25) & 0x1 != 0,
             no_usb_suspend: (raw >> 24) & 0x1 != 0,
+            epr_mode_capable: (raw >> 22) & 0x1 != 0,
             op_current_ma: ((raw >> 10) & 0x3FF) * 10,
             max_op_current_ma: (raw & 0x3FF) * 10,
         }
@@ -382,27 +461,217 @@ pub struct ProgrammableRdo {
     pub no_usb_suspend: bool,
     /// Capability mismatch flag (§6.4.2.4 bit 26).
     pub cap_mismatch: bool,
+    /// `EPR_Mode_Capable` per §6.4.2.7 bit 22, same rule as FixedRdo.
+    pub epr_mode_capable: bool,
 }
 
 impl ProgrammableRdo {
     pub fn encode(&self) -> u32 {
-        ((self.object_position as u32 & 0x7) << 28)
+        // Object position is bits 31..28 (§6.4.2.1), full 4-bit field.
+        ((self.object_position as u32 & 0xF) << 28)
             | ((self.cap_mismatch as u32) << 26)
             | ((self.usb_comms as u32) << 25)
             | ((self.no_usb_suspend as u32) << 24)
+            | ((self.epr_mode_capable as u32) << 22)
             | (((self.voltage_mv / 20) & 0x7FF) << 9)
             | ((self.op_current_ma / 50) & 0x7F)
     }
 
     pub fn decode(raw: u32) -> Self {
         Self {
-            object_position: ((raw >> 28) & 0x7) as u8,
+            object_position: ((raw >> 28) & 0xF) as u8,
             cap_mismatch: (raw >> 26) & 0x1 != 0,
             usb_comms: (raw >> 25) & 0x1 != 0,
             no_usb_suspend: (raw >> 24) & 0x1 != 0,
+            epr_mode_capable: (raw >> 22) & 0x1 != 0,
             voltage_mv: ((raw >> 9) & 0x7FF) * 20,
             op_current_ma: (raw & 0x7F) * 50,
         }
+    }
+}
+
+/// AVS Request Data Object (§6.4.2, table 6.27) — the sink's Request
+/// when picking an EPR AVS APDO, sent inside an EPR_Request Message.
+/// Unlike PPS, an AVS source does NOT current-limit: the sink is
+/// responsible for not taking more current than it requested, so
+/// there is no max-current field, only the operating current.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AvsRdo {
+    /// 1-based PDO position from the most recently received
+    /// EPR_Source_Capabilities (§6.4.2.1). EPR PDOs live at 8..=11.
+    pub object_position: u8,
+    /// Requested output voltage in millivolts. Encoded in 25 mV
+    /// units (bits 20..9) whose low two bits SHALL be zero, making
+    /// the effective step 100 mV — encode floors to 100 mV.
+    pub voltage_mv: u32,
+    /// Requested operating current in milliamps. Quantised to 50 mA.
+    pub op_current_ma: u32,
+    /// `USB_Communications_Capable` per §6.4.2.4 bit 25.
+    pub usb_comms: bool,
+    /// `No_USB_Suspend` per §6.4.2.4 bit 24.
+    pub no_usb_suspend: bool,
+    /// Capability mismatch flag (§6.4.2.4 bit 26).
+    pub cap_mismatch: bool,
+    /// `EPR_Mode_Capable` per §6.4.2.7 bit 22, same rule as FixedRdo.
+    pub epr_mode_capable: bool,
+}
+
+impl AvsRdo {
+    pub fn encode(&self) -> u32 {
+        // Voltage: 100 mV steps × 4 = 25 mV units with the low two
+        // bits zero, per the table 6.27 note.
+        let v_units = (self.voltage_mv / 100) * 4;
+        ((self.object_position as u32 & 0xF) << 28)
+            | ((self.cap_mismatch as u32) << 26)
+            | ((self.usb_comms as u32) << 25)
+            | ((self.no_usb_suspend as u32) << 24)
+            | ((self.epr_mode_capable as u32) << 22)
+            | ((v_units & 0x7FF) << 9)
+            | ((self.op_current_ma / 50) & 0x7F)
+    }
+
+    pub fn decode(raw: u32) -> Self {
+        Self {
+            object_position: ((raw >> 28) & 0xF) as u8,
+            cap_mismatch: (raw >> 26) & 0x1 != 0,
+            usb_comms: (raw >> 25) & 0x1 != 0,
+            no_usb_suspend: (raw >> 24) & 0x1 != 0,
+            epr_mode_capable: (raw >> 22) & 0x1 != 0,
+            voltage_mv: ((raw >> 9) & 0x7FF) * 25,
+            op_current_ma: (raw & 0x7F) * 50,
+        }
+    }
+}
+
+/// EPR_Mode Action field values (§6.4.10, table 6.51). Sent by the
+/// role in the "Sent By" column; anything else is reserved.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EprModeAction {
+    Enter = 0x01,
+    EnterAcknowledged = 0x02,
+    EnterSucceeded = 0x03,
+    EnterFailed = 0x04,
+    Exit = 0x05,
+}
+
+impl EprModeAction {
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0x01 => EprModeAction::Enter,
+            0x02 => EprModeAction::EnterAcknowledged,
+            0x03 => EprModeAction::EnterSucceeded,
+            0x04 => EprModeAction::EnterFailed,
+            0x05 => EprModeAction::Exit,
+            _ => return None,
+        })
+    }
+}
+
+/// EPR_Mode Enter Failed Data values (§6.4.10, table 6.51).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EprEnterFailedReason {
+    Unknown = 0x00,
+    CableNotEprCapable = 0x01,
+    NotVconnSource = 0x02,
+    RdoBitNotSet = 0x03,
+    UnableAtThisTime = 0x04,
+    PdoBitNotSet = 0x05,
+}
+
+impl EprEnterFailedReason {
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0x00 => EprEnterFailedReason::Unknown,
+            0x01 => EprEnterFailedReason::CableNotEprCapable,
+            0x02 => EprEnterFailedReason::NotVconnSource,
+            0x03 => EprEnterFailedReason::RdoBitNotSet,
+            0x04 => EprEnterFailedReason::UnableAtThisTime,
+            0x05 => EprEnterFailedReason::PdoBitNotSet,
+            _ => return None,
+        })
+    }
+}
+
+/// EPR Mode Data Object (§6.4.10, table 6.51) — the single data
+/// object of an EPR_Mode Message. Bits 31..24 Action, bits 23..16
+/// Data, bits 15..0 reserved zero.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EprModeDataObject {
+    pub action: EprModeAction,
+    /// Data byte. Its meaning depends on the action: Enter carries
+    /// the sink's Operational PDP in watts; Enter Acknowledged,
+    /// Enter Succeeded and Exit carry zero; Enter Failed carries an
+    /// `EprEnterFailedReason` code.
+    pub data: u8,
+}
+
+impl EprModeDataObject {
+    /// Sink's Enter: Data = Operational PDP in watts.
+    pub fn enter(operational_pdp_w: u8) -> Self {
+        Self {
+            action: EprModeAction::Enter,
+            data: operational_pdp_w,
+        }
+    }
+
+    pub fn enter_acknowledged() -> Self {
+        Self {
+            action: EprModeAction::EnterAcknowledged,
+            data: 0,
+        }
+    }
+
+    pub fn enter_succeeded() -> Self {
+        Self {
+            action: EprModeAction::EnterSucceeded,
+            data: 0,
+        }
+    }
+
+    pub fn enter_failed(reason: EprEnterFailedReason) -> Self {
+        Self {
+            action: EprModeAction::EnterFailed,
+            data: reason as u8,
+        }
+    }
+
+    pub fn exit() -> Self {
+        Self {
+            action: EprModeAction::Exit,
+            data: 0,
+        }
+    }
+
+    /// Operational PDP in watts; only meaningful on Enter.
+    pub fn operational_pdp_w(&self) -> Option<u8> {
+        if self.action == EprModeAction::Enter {
+            Some(self.data)
+        } else {
+            None
+        }
+    }
+
+    /// Failed reason; only meaningful on Enter Failed.
+    pub fn failed_reason(&self) -> Option<EprEnterFailedReason> {
+        if self.action == EprModeAction::EnterFailed {
+            EprEnterFailedReason::from_u8(self.data)
+        } else {
+            None
+        }
+    }
+
+    pub fn encode(&self) -> u32 {
+        ((self.action as u32) << 24) | ((self.data as u32) << 16)
+    }
+
+    pub fn decode(raw: u32) -> Option<Self> {
+        let action = EprModeAction::from_u8(((raw >> 24) & 0xFF) as u8)?;
+        Some(Self {
+            action,
+            data: ((raw >> 16) & 0xFF) as u8,
+        })
     }
 }
 

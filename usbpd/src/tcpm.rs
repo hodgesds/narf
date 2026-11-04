@@ -264,6 +264,7 @@ impl SinkPort {
             if let SourcePdo::Fixed {
                 voltage_mv,
                 max_current_ma,
+                ..
             } = pdo
             {
                 pos = Some((i + 1) as u8);
@@ -293,6 +294,7 @@ impl SinkPort {
             usb_comms: false,
             no_usb_suspend: false,
             cap_mismatch: false,
+            epr_mode_capable: false,
         };
         let h = Header::data(
             DataMsg::Request,
