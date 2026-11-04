@@ -8763,7 +8763,11 @@ framebuffer_check: handles, pitches, overflow, per-plane modifiers equal,
 unused planes zero), the BO lookup, then amdgpu_display_gem_fb_verify_and_init
 (`check_amdgpu_fb`: drm_any_plane_has_format with modifier[0], every plane
 in the same BO, without DRM_MODE_FB_MODIFIERS the BO's tiling flags through
-convert_tiling_flags_to_modifier_gfx12, amdgpu_display_verify_sizes: each
+convert_tiling_flags_to_modifier_gfx12, or on the GFX10.3 linear-primary card
+(`TilingFlags::Gfx10_3 { pipes_log2, packers_log2 }` from GB_ADDR_CONFIG)
+through `from_tiling_flags_gfx10_3` (convert_tiling_flags_to_modifier: 5-bit
+swizzle, block size, version, pipe-XOR/packers, DCC bits; Z swizzles refused);
+`check_amdgpu_fb(..., layout: TilingFlags)`, amdgpu_display_verify_sizes: each
 plane's pitch whole swizzle blocks and at least its width, block-aligned
 offsets, whole block rows within the BO, LINEAR in 256-byte units); a
 refusal is EINVAL (FsError has no ERANGE). `Framebuffer` records
@@ -11883,9 +11887,24 @@ console's publication on the owned front is withdrawn; lastclose
 (`amdgpu_native_kms::restore_displays` →
 `amdgpu_navi22_platform::release_client_scanout_async`) flips back to the
 owned front (`ColdBoot::return_display_to_owned`), releases the pin and
-republishes the console. Other frames are copied: CPU-visible placements by
-bounded rows, honoring pitch and offset; hidden VRAM through the existing
-SDMA transfer into private system staging, also outside the owner. The
+republishes the console. Every presenter flip is armed under the owner and
+its latch awaited without it, as amdgpu_dm's commit worker waits for
+flip_done holding no display lock: `ColdBoot::arm_display_flip(kind,
+external)` → `Scanout::arm(ArmedKind::{Back, External}, ..) -> Armed`
+programs the surface, then `ColdBoot::poll_display_flip(&armed)` →
+`Scanout::poll_armed` (one non-blocking pflip/VUPDATE acknowledge and
+pending check, retaking the owner every `POLL_US`) completes it. Each
+`Scanout` has an epoch: a relight, recovery, stop or withdraw while armed
+makes `poll_armed` refuse (`Busy`) and the frame is dropped with its event
+completed; timeout and device loss fail the present. A pinned GEM frame that
+cannot be scanned out in place is copied by the GPU, not the CPU:
+`amdgpu_rdna2_vram::blit_ops(src, src_pitch, dst, dst_pitch, row_bytes,
+rows)` (one whole-line copy for equal pitches, else one per row) run by
+`amdgpu_rdna2_vram::blit(ops, held)` on the kernel SDMA queue into the owned
+back surface, the owner held only to read that surface and to flip; it falls
+back to the CPU copy only without a kernel SDMA queue. Dumb frames are copied
+by bounded rows, honoring pitch and offset, one streaming store per row into
+the write-combined back buffer. The
 frame retains its `ScanoutPin` through queueing, readback, copying and the
 completed native back-buffer flip. Unsupported format/extent checks precede
 queueing. GEM sources never fall through to a raw physical pointer. The
@@ -11895,6 +11914,7 @@ every 512 presents. Secondary CRTCs still cannot present.
 `ColdBoot::{modeset_display(connector, sink, want, draw), stop_display(),
 display_scanout(), display_admitted(), display_output(),
 prepare_display_back_buffer(), flip_display(), flip_display_external(address),
+arm_display_flip(kind, external), poll_display_flip(&armed),
 return_display_to_owned(), set_display_cursor()}` own
 these. `into_recovery` re-prepares DMUB and the display owner from the
 retained VBIOS/routes so the recovered sequence restarts DMUB.

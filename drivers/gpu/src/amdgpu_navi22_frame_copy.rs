@@ -387,6 +387,49 @@ mod tests {
         navi22_linear_gem_copy_waits_for_render_fence_without_owner
     );
 
+    /// The render-fence wait is woken by a fence interrupt (the change
+    /// sequence it registered on), not only by its 1 ms re-check timer.
+    fn navi22_render_wait_wakes_on_fence_change() -> TestResult {
+        struct Count(core::sync::atomic::AtomicUsize);
+        impl alloc::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let fixture = Fixture::new();
+        let object = fixture.object();
+        let pin = object.pin_scanout().unwrap();
+        let fence = Arc::new(Fence(AtomicBool::new(false)));
+        object
+            .dma_buf()
+            .resv
+            .add_fence(fence.clone(), narf_filesystem::dma_buf::DmaResvUsage::Write);
+        let count = Arc::new(Count(core::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut future = core::pin::pin!(wait_rendered(&pin));
+        if !matches!(future.as_mut().poll(&mut context), Poll::Pending) {
+            return TestResult::Fail("render wait finished before its fence");
+        }
+        let before = count.0.load(Ordering::Acquire);
+        fence.0.store(true, Ordering::Release);
+        crate::amdgpu_fence_navi22::notify_all();
+        if count.0.load(Ordering::Acquire) == before {
+            return TestResult::Fail("fence interrupt did not wake the render wait");
+        }
+        if !matches!(future.as_mut().poll(&mut context), Poll::Ready(Ok(()))) {
+            return TestResult::Fail("woken render wait did not complete");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_render_wait_wakes_on_fence_change
+    );
+
     /// Direct scanout takes a pinned client framebuffer only when the
     /// HUBP can fetch it as programmed: same pitch and size as the lit
     /// surface, first pixel on a 256-byte boundary. Everything else copies.
