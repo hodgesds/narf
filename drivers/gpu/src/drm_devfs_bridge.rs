@@ -279,8 +279,20 @@ impl Drop for DriCardFile {
         let was_master = if let Some(ms) = crate::drm_registry::mode_state(self.index) {
             let mut ms = ms.lock();
             let was_master = ms.is_master(self.open_id);
-            // drm_fb_release: the framebuffers it made of its GEM buffers.
+            // drm_fb_release: the framebuffers it made of its GEM buffers,
+            // each removed as RMFB removes it (atomic_remove_fb: the CRTC
+            // showing it goes off and its connectors are detached).
+            #[cfg(feature = "amdgpu")]
+            let shown = ms.crtcs_showing_owner(self.open_id);
             ms.release_file_framebuffers(self.open_id);
+            #[cfg(feature = "amdgpu")]
+            if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                for crtc in shown {
+                    if let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc) {
+                        crate::amdgpu_native_kms::request_display_active(display, false);
+                    }
+                }
+            }
             ms.master_release(self.open_id);
             ms.magic_release(self.open_id);
             was_master

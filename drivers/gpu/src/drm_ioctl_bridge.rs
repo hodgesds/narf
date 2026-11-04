@@ -2368,6 +2368,16 @@ fn dispatch_card_for_file_inner(
         // display follows.
         IoctlCmd::ModeCloseFb => handle_closefb(&mode_state, arg, open_id),
         IoctlCmd::ModeRmFb => {
+            // drm_mode_rmfb: a framebuffer not on this file's list is ENOENT.
+            // SAFETY: `arg` is the user drm_mode_rmfb pointer (a u32 fb id).
+            let rm_id = u32::from_le_bytes(unsafe { copy_in(arg, 4)? }[..4].try_into().unwrap());
+            if mode_state
+                .lock()
+                .framebuffer(rm_id)
+                .is_ok_and(|fb| fb.gem_owner().is_some_and(|o| o != open_id))
+            {
+                return Err(FsError::NotFound);
+            }
             // SAFETY: `arg` is the user drm_mode_rmfb pointer (a u32 fb id).
             #[cfg(feature = "amdgpu")]
             let fb_id = u32::from_le_bytes(unsafe { copy_in(arg, 4)? }[..4].try_into().unwrap());

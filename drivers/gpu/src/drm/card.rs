@@ -2537,6 +2537,18 @@ impl Card {
         Ok(id)
     }
 
+    /// CRTCs whose primary is a framebuffer open `owner` made.
+    pub fn crtcs_showing_owner(&self, owner: u64) -> Vec<u32> {
+        self.crtcs
+            .iter()
+            .filter(|c| {
+                c.primary_fb
+                    .and_then(|id| self.framebuffer(id).ok())
+                    .is_some_and(|fb| fb.gem_owner() == Some(owner))
+            })
+            .map(|c| c.id)
+            .collect()
+    }
     /// drm_fb_release for open `owner`: remove every framebuffer it made
     /// from one of its GEM handles (as RMFB does, turning off what shows
     /// it). Returns how many went.
