@@ -15,8 +15,9 @@
 //!   BE, BK, HQ) followed by the seven descriptor rings in the same order.
 //! - Publication (`rtl92ee_hw_init` → `_rtl92ee_init_mac`): the
 //!   `_rtl8192ee_check_pcie_dma_hang` probe of `REG_BACKDOOR_DBI_DATA + 3`
-//!   (a hung DMA engine is refused: `_rtl8192ee_reset_pcie_interface_dma` is
-//!   not implemented), then `rtl8192ee::mac::init_mac` (auto LLT, BD ring
+//!   (a hung DMA engine runs `_rtl8192ee_reset_pcie_interface_dma`
+//!   below; only a still-hung engine after recovery refuses the board),
+//!   then `rtl8192ee::mac::init_mac` (auto LLT, BD ring
 //!   bases, `TXBD_NUM`/`RXBD_NUM`) with host DMA stopped (`0x301 = 0xff`),
 //!   CR DMA/MAC gates and IRQ masks closed. Unlike Linux this runs after the
 //!   firmware owner's download, as for the 88EE/8821AE profiles.
@@ -299,6 +300,59 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         })
     }
 
+    /// `_rtl8192ee_reset_pcie_interface_dma` as NARF implements it from
+    /// in-tree primitives. Linux's exact register dance for this reset
+    /// is not recorded in-tree and is not claimed here; every step below
+    /// reuses a write this file (or the 8723BE release) already grounds:
+    /// 1. Pause RX DMA (`REG_RXDMA_CONTROL` BIT(2), the step-2
+    ///    primitive named in the module comment) with read-back.
+    /// 2. Stop host DMA (`REG_PCIE_CTRL_REG + 1 = 0xff`), close the CR
+    ///    DMA/MAC gates (`REG_CR & !0xcf`) and the IRQ masks
+    ///    (`0xb0`/`0xb8 = 0`), each with read-back — the same writes
+    ///    `ee92_prepare` performs after the check, so a recovered board
+    ///    continues into the identical post-check state.
+    /// 3. Re-probe the hang bits (set BIT(2) + 100 ms when clear, as the
+    ///    check does). If the bits cleared, release the RX DMA pause
+    ///    (inverse of step 1, cf. the 8723BE release) with read-back and
+    ///    report recovered; a still-hung engine reports unrecovered and
+    ///    the caller refuses the board as before. Any failed read-back
+    ///    fails the prepare fail-closed.
+    async fn ee92_reset_pcie_interface_dma(&self) -> Result<bool, Error> {
+        let rxdma = self.io.read8(REG_RXDMA_CONTROL)?;
+        self.io.write8(REG_RXDMA_CONTROL, rxdma | RXDMA_PAUSE)?;
+        if self.io.read8(REG_RXDMA_CONTROL)? & RXDMA_PAUSE == 0 {
+            return Err(Error::Readback);
+        }
+        self.io.write8(mac::REG_PCIE_CTRL_REG + 1, 0xff)?;
+        if self.io.read8(mac::REG_PCIE_CTRL_REG + 1)? != 0xff {
+            return Err(Error::Readback);
+        }
+        let cr = self.io.read8(mac::REG_CR)?;
+        self.io.write8(mac::REG_CR, cr & !0xcf)?;
+        if self.io.read8(mac::REG_CR)? & 0xcf != 0 {
+            return Err(Error::Readback);
+        }
+        for address in [0xb0, 0xb8] {
+            self.io.write32(address, 0)?;
+            if self.io.read32(address)? != 0 {
+                return Err(Error::Readback);
+            }
+        }
+        let dbi = self.io.read8(REG_BACKDOOR_DBI_DATA + 3)?;
+        if dbi & (1 << 2) == 0 {
+            self.io.write8(REG_BACKDOOR_DBI_DATA + 3, dbi | (1 << 2))?;
+            self.io.delay_us(100_000).await;
+        }
+        if self.io.read8(REG_BACKDOOR_DBI_DATA + 3)? & 3 != 0 {
+            return Ok(false);
+        }
+        self.io.write8(REG_RXDMA_CONTROL, rxdma & !RXDMA_PAUSE)?;
+        if self.io.read8(REG_RXDMA_CONTROL)? & RXDMA_PAUSE != 0 {
+            return Err(Error::Readback);
+        }
+        Ok(true)
+    }
+
     /// `_rtl8192ee_check_pcie_dma_hang`, closed gates, then the
     /// `_rtl92ee_init_mac` remainder over the owned BD rings.
     pub(in super::super) async fn ee92_prepare(&mut self) -> Result<(), Error> {
@@ -311,8 +365,10 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             self.io.delay_us(100_000).await; // mdelay(100), "DD Justin_tsai".
         }
         // BIT(25) RX hang / BIT(24) TX hang: Linux resets the PCIe DMA
-        // interface; that reset is not implemented, so the board is refused.
-        if self.io.read8(REG_BACKDOOR_DBI_DATA + 3)? & 3 != 0 {
+        // interface; only a still-hung engine after recovery is refused.
+        if self.io.read8(REG_BACKDOOR_DBI_DATA + 3)? & 3 != 0
+            && !self.ee92_reset_pcie_interface_dma().await?
+        {
             return Err(Error::Readback);
         }
         self.io.write8(mac::REG_PCIE_CTRL_REG + 1, 0xff)?;

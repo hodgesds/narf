@@ -414,7 +414,7 @@ kernel_test_in!(
     smoke_rtl8821ae_native_join_rsvd_page_h2c_and_leave
 );
 
-fn smoke_rtl8821ae_bt_function_board_refused_at_admission() -> TestResult {
+fn smoke_rtl8821ae_bt_function_board_admitted_with_coexistence() -> TestResult {
     let Some((mut owner, port)) = owner() else {
         return TestResult::Fail("fixture");
     };
@@ -427,27 +427,81 @@ fn smoke_rtl8821ae_bt_function_board_refused_at_admission() -> TestResult {
     ));
     owner.phase = Phase::ChannelConfigured;
     owner.packet.local = None;
+    // BT-strapped board: admitted with a coexistence owner.
     port.set32(0x68, 1 << 18);
-    if owner.configure_rtl8821ae_mac(&factory).is_ok() || owner.phase != Phase::ChannelConfigured {
-        return TestResult::Fail("BT-function board admitted without coexistence");
+    if owner.configure_rtl8821ae_mac(&factory).is_err()
+        || owner.phase != Phase::MacConfigured
+        || owner.packet.local != Some(MAC)
+        || owner.rtl8821ae_coex().is_none()
+    {
+        return TestResult::Fail("BT-function board refused or admitted without coexistence");
     }
-    port.set32(0x68, 0);
+    // Another factory identity is still refused (phase reset first so
+    // the identity check, not the phase check, decides).
+    owner.phase = Phase::ChannelConfigured;
+    owner.packet.local = None;
     let mut other = factory.clone();
     other.mac[5] ^= 1;
     if owner.configure_rtl8821ae_mac(&other).is_ok() {
         return TestResult::Fail("another factory identity admitted");
     }
+    // WLAN-only board: admitted with no coexistence owner.
+    owner.phase = Phase::ChannelConfigured;
+    port.set32(0x68, 0);
     if owner.configure_rtl8821ae_mac(&factory).is_err()
         || owner.phase != Phase::MacConfigured
         || owner.packet.local != Some(MAC)
+        || owner.rtl8821ae_coex().is_some()
     {
-        return TestResult::Fail("WLAN-only board refused");
+        return TestResult::Fail("WLAN-only board refused or given a coexistence owner");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8821ae",
-    smoke_rtl8821ae_bt_function_board_refused_at_admission
+    smoke_rtl8821ae_bt_function_board_admitted_with_coexistence
+);
+
+fn smoke_rtl8821ae_coex_bt_only_holds_lps_off() -> TestResult {
+    use super::super::super::super::btcoex::BtState;
+    let Some((mut owner, _port)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    owner.phase = Phase::Running;
+    // Baseline (no coexistence owner): LPS enter and leave proceed.
+    if run(owner.enter_leisure()).is_err() || !owner.leisure() {
+        return TestResult::Fail("baseline LPS enter failed");
+    }
+    if run(owner.leave_leisure()).is_err() || owner.leisure() {
+        return TestResult::Fail("baseline LPS leave failed");
+    }
+    // BT-strapped owner with BT streaming: enter is a held-off no-op —
+    // Ok, but `leisure` stays false and the phase stays Running.
+    owner.rtl8821ae_coex = Some(Box::new(
+        super::super::super::super::rtl8821ae::coex::Owner::bind(),
+    ));
+    owner
+        .rtl8821ae_coex
+        .as_mut()
+        .unwrap()
+        .notify_bt(BtState::Streaming);
+    if run(owner.enter_leisure()).is_err() || owner.leisure() || owner.phase != Phase::Running {
+        return TestResult::Fail("BtOnly LPS enter not held off");
+    }
+    // BT idle releases the antenna: enter proceeds again.
+    owner
+        .rtl8821ae_coex
+        .as_mut()
+        .unwrap()
+        .notify_bt(BtState::Idle);
+    if run(owner.enter_leisure()).is_err() || !owner.leisure() {
+        return TestResult::Fail("BT idle LPS enter failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8821ae",
+    smoke_rtl8821ae_coex_bt_only_holds_lps_off
 );
 
 /// Deliver one RX buffer: `bytes` at offset 0, descriptor dwords 0 and 2..4.

@@ -49,6 +49,7 @@
 
 pub mod c2h;
 pub mod channel;
+pub mod coex;
 pub mod envelope;
 pub mod fw;
 pub mod h2c;
