@@ -336,8 +336,12 @@ fn forcewake_read(mmio: &impl MmioWindow, platform: GtPlatform, offset: u64) -> 
     {
         return None;
     }
-    let value = mmio.read32(offset);
-    (value != u32::MAX).then_some(value)
+    // Access is proven by the forcewake request and acknowledgements just
+    // read, which cannot be all-ones on a live function. The captured
+    // register itself can be: RING_HWSTAM and RING_IMR are ~0 after
+    // xe_hw_engine_enable_ring, so its value is reported as read, as
+    // xe_engine_manual_capture does.
+    Some(mmio.read32(offset))
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
