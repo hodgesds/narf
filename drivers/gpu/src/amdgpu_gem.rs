@@ -2582,7 +2582,8 @@ fn op(state: &GemState, arg: usize) -> Result<u64, FsError> {
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let which = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     let value = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    let object = state.get(handle).ok_or(FsError::InvalidData)?;
+    // amdgpu_gem_op_ioctl: drm_gem_object_lookup failing is -ENOENT.
+    let object = state.get(handle).ok_or(FsError::NotFound)?;
 
     match which {
         // Report the creation parameters back, into the user pointer `value`

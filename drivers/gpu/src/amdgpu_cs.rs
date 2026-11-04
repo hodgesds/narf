@@ -476,6 +476,21 @@ pub fn parse(
                 };
                 user_fence = Some((handle, offset));
             }
+            // `drm_amdgpu_cs_chunk_cp_gfx_shadow { shadow_va, csa_va, gds_va,
+            // flags, _pad }` (amdgpu_cs_p2_shadow): only INIT_SHADOW is a
+            // defined flag. The addresses feed gfx11's register shadowing;
+            // GFX10.3 emits no shadow packets for them, so after validation
+            // the chunk changes nothing here, as in Linux.
+            uapi::AMDGPU_CHUNK_ID_CP_GFX_SHADOW => {
+                // SAFETY: as above.
+                let words = unsafe { read_dwords(chunk_data, length_dw, 64)? };
+                let Some(&flags) = words.get(6) else {
+                    return Err(FsError::InvalidData);
+                };
+                if flags & !uapi::AMDGPU_CS_CHUNK_CP_GFX_SHADOW_FLAGS_INIT_SHADOW != 0 {
+                    return Err(FsError::InvalidData);
+                }
+            }
             _ => return Err(FsError::InvalidData),
         }
     }
@@ -1475,3 +1490,7 @@ pub fn dispatch(
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_cs_liveness_tests.rs"]
 mod liveness_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_ioctl_parity_tests.rs"]
+mod ioctl_parity_tests;
