@@ -19,7 +19,7 @@ simplicity), one MSI-X vector for link / RX completion, and a
 `HwNic` adapter exposing the same surface the e1000/mlx5 drivers
 do.
 
-Does NOT own: DCB, FCoE, SR-IOV, RSS, FlowDirector, VMDq.
+Does NOT own: DCB, FCoE, SR-IOV, RSS, VMDq.
 
 ## 2. PCI match
 
@@ -245,6 +245,42 @@ into frame metadata), TSO claims no bound (the send path caps
 frames at 1518 bytes), and VLAN insertion is NOT claimed (RX
 filtering only).
 
+## 13c. Flow Director (FDIR)
+
+Implemented surface (`drivers/net/ixgbe/src/ixgbe/fdir.rs`,
+opt-in via `Ixgbe::configure_fdir` and friends; probe still
+brings up 1/1): FDIR init in signature mode (hash keys +
+FDIRCTRL: flex shift 6, max 0xA filters per bucket, full
+threshold 4) and perfect mode (plus perfect-match enable and
+drop queue 127), perfect-filter input masks (FDIRM + TCP/UDP
+port masks + IPv4 masks; SCTP mask only on X550-family parts),
+perfect-filter add (IPv4 only) and erase (query first, remove
+if present), signature-filter add (the ATR primitive: ATR
+signature hash + FDIRHASH/FDIRCMD write pair), table reinit
+(CLEARHT toggle + FDIRCTRL rewrite + INIT_DONE poll +
+statistics clear), and statistics reads (all read to clear).
+
+Grounding: Linux ixgbe @ cbbddb6 (`ixgbe_type.h` FDIR block +
+`ixgbe_82599.c` FDIR functions). No local 82599 datasheet copy
+exists, so the Linux transcription is the authority, as with
+§13b. This lane programs ONLY the 0x0EE00 FDIR block and never
+touches MRQC / RETA / RSSRK (verified: no Linux FDIR function
+writes them); the #1397 MRQC-map conflict therefore does not
+block this lane, and this lane does not pick a side in it. The
+"ATR interacts with RSS" note is steering semantics (an
+FDIR-steered flow bypasses RSS indirection), not a register
+dependency.
+
+Limits (see §14): no TX sampling hook (no in-tree TX packet
+parser; sample rate + queue binding are policy for a
+follow-up), no IPv6 perfect filters (Linux masks DIPv6), no
+persistent filter list (reinit clears filters; callers
+re-add), no cloud / MACVLAN filter modes, flex bytes fixed at
+the ethertype shift. The signature-add 64-bit FDIRHASH write
+is split into two 32-bit writes (hash, then command) because
+`RegBank` is 32-bit. Section number is letter-suffixed so it
+merges cleanly against §13b regardless of landing order.
+
 ## 13f. EEE control/status (Linux model, no MAC registers)
 
 EEE in Linux ixgbe has no MAC register programming: `get_eee`
@@ -305,8 +341,10 @@ Per the v0.1 exclusion list, still open after this stream:
 
 - SR-IOV / VMDq (MRQC virtualization modes, PFVTCTL, VF
   registers) — needs the virtualization programming model.
-- FlowDirector (FDIRCTRL / FDIRHASH / filter tables) — ATR
-  complexity; the RSS path covers flow steering for now.
+- FlowDirector remainders (see §13c): TX sampling hook for ATR
+  (packet parser + sample-rate policy + queue binding), IPv6
+  perfect filters, persistent filter list with restore on
+  reinit, cloud / MACVLAN filter modes.
 - DCB (MTQC RT_Ena, RTRUP2TC, packet-buffer partitioning).
 - FCoE (FCRETA, FCRXCTRL) — out of the Ethernet scope.
 - EEE: model + capability gate + FW-PHY decode + ACI cap
