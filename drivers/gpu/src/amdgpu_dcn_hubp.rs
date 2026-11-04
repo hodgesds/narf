@@ -23,6 +23,17 @@ const DCSURF_ADDR_CONFIG: u64 = 0x05e6; // linux: mmHUBP0_DCSURF_ADDR_CONFIG
 const DCSURF_TILING_CONFIG: u64 = 0x05e7; // linux: mmHUBP0_DCSURF_TILING_CONFIG
 const DCSURF_PRI_VIEWPORT_START: u64 = 0x05e9; // linux: mmHUBP0_DCSURF_PRI_VIEWPORT_START
 const DCSURF_PRI_VIEWPORT_DIMENSION: u64 = 0x05ea; // linux: mmHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
+                                                   // The chroma and stereo viewports `min_set_viewport` also writes, DCN3.0
+                                                   // only (`dcn_3_0_0_offset.h`).
+const DCSURF_PRI_VIEWPORT_START_C: u64 = 0x05eb; // linux: mmHUBP0_DCSURF_PRI_VIEWPORT_START_C
+                                                 // linux: mmHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION_C
+const DCSURF_PRI_VIEWPORT_DIMENSION_C: u64 = 0x05ec;
+const DCSURF_SEC_VIEWPORT_START: u64 = 0x05ed; // linux: mmHUBP0_DCSURF_SEC_VIEWPORT_START
+                                               // linux: mmHUBP0_DCSURF_SEC_VIEWPORT_DIMENSION
+const DCSURF_SEC_VIEWPORT_DIMENSION: u64 = 0x05ee;
+const DCSURF_SEC_VIEWPORT_START_C: u64 = 0x05ef; // linux: mmHUBP0_DCSURF_SEC_VIEWPORT_START_C
+                                                 // linux: mmHUBP0_DCSURF_SEC_VIEWPORT_DIMENSION_C
+const DCSURF_SEC_VIEWPORT_DIMENSION_C: u64 = 0x05f0;
 const DCHUBP_REQ_SIZE_CONFIG: u64 = 0x05f1; // linux: mmHUBP0_DCHUBP_REQ_SIZE_CONFIG
 const DCHUBP_REQ_SIZE_CONFIG_C: u64 = 0x05f2; // linux: mmHUBP0_DCHUBP_REQ_SIZE_CONFIG_C
 const DCHUBP_CNTL: u64 = 0x05f3; // linux: mmHUBP0_DCHUBP_CNTL
@@ -399,6 +410,44 @@ impl<I: Io> Engine<I> {
         // The low half last: writing it is what arms the new address.
         self.set(DCSURF_PRIMARY_SURFACE_ADDRESS, surface.address as u32)
     }
+    /// `min_set_viewport` (DCN3.0's `mem_program_viewport`) for an RGB plane:
+    /// the primary, stereo-secondary and chroma viewports all take the
+    /// luma rectangle, as DC computes `viewport_c` equal to it at vpc_div 1.
+    fn set_viewport(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), Error> {
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        let field = 0x3fff; // linux: HUBP0_DCSURF_PRI_VIEWPORT_START__PRI_VIEWPORT_X_START_MASK
+        if x > field || y > field || width == 0 || height == 0 || width > field || height > field {
+            return Err(Error::Invalid);
+        }
+        // linux-lit: 16=HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION__PRI_VIEWPORT_HEIGHT__SHIFT
+        let dimension = width | height << 16;
+        // linux-lit: 16=HUBP0_DCSURF_PRI_VIEWPORT_START__PRI_VIEWPORT_Y_START__SHIFT
+        let start = x | y << 16;
+        for (reg, value) in [
+            (DCSURF_PRI_VIEWPORT_DIMENSION, dimension),
+            (DCSURF_PRI_VIEWPORT_START, start),
+            (DCSURF_SEC_VIEWPORT_DIMENSION, dimension),
+            (DCSURF_SEC_VIEWPORT_START, start),
+            (DCSURF_PRI_VIEWPORT_DIMENSION_C, dimension),
+            (DCSURF_PRI_VIEWPORT_START_C, start),
+            (DCSURF_SEC_VIEWPORT_DIMENSION_C, dimension),
+            (DCSURF_SEC_VIEWPORT_START_C, start),
+        ] {
+            self.set(reg, value)?;
+        }
+        Ok(())
+    }
+    /// `hubp2_program_size` for a linear RGB surface without DCC: the pitch
+    /// in pixels, one less, and no meta pitch.
+    fn set_pitch(&mut self, pitch: u32) -> Result<(), Error> {
+        if pitch == 0 || pitch > 0x4000 {
+            return Err(Error::Invalid);
+        }
+        // linux-lit: 0x3fff3fff=HUBPREQ0_DCSURF_SURFACE_PITCH__PITCH_MASK | HUBPREQ0_DCSURF_SURFACE_PITCH__META_PITCH_MASK
+        self.update(DCSURF_SURFACE_PITCH, 0x3fff_3fff, pitch - 1)
+    }
     /// `hubp2_vready_at_or_After_vsync`. The condition is the same one the DLG
     /// encoding already evaluated, so it is taken from there rather than
     /// recomputed from the timing and risking the two disagreeing.
@@ -519,6 +568,21 @@ impl Hubp {
         self.0.program_pacing(registers)?;
         self.0.program_vready(registers)?;
         self.0.program_surface_at(surface, x)
+    }
+    /// `hubp3_setup`'s request/deadline/vready half for a plan derived for
+    /// a new plane (`dcn20_update_dchubp_dpp` on `hubp_rq_dlg_ttu`). The
+    /// caller holds the OTG's pipe-control lock.
+    pub fn setup(&mut self, registers: &Registers) -> Result<(), Error> {
+        self.0.program_vready(registers)?;
+        self.0.program_pacing(registers)
+    }
+    /// `min_set_viewport`: the surface rectangle this HUBP fetches (DCN3.0).
+    pub fn set_viewport(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), Error> {
+        self.0.set_viewport(x, y, width, height)
+    }
+    /// `hubp2_program_size`: a flip's framebuffer pitch, in pixels.
+    pub fn set_pitch(&mut self, pitch: u32) -> Result<(), Error> {
+        self.0.set_pitch(pitch)
     }
     /// `hubp2_vtg_sel`: the OTG whose timing this HUBP fetches for
     /// (`DCHUBP_CNTL.HUBP_VTG_SEL`).

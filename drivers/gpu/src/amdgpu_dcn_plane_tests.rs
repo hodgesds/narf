@@ -478,3 +478,34 @@ kernel_test_in!(
     "drivers/gpu/dcn-plane",
     plane_dcn30_dscl_scales_like_dpp1_dscl_set_scaler_manual_scale
 );
+
+fn plane_dcn30_mpcc_background_is_black() -> TestResult {
+    let mut mpc = block(3, 0x0680);
+    mpc.profile = Profile::Navi22;
+    // A firmware owner's grey background.
+    for reg in [MPCC_BG_R_CR, MPCC_BG_G_Y, MPCC_BG_B_CB] {
+        mpc.io.values[(reg + 3 * MPCC_STRIDE) as usize] = 0x800;
+    }
+    if mpc.mpc_set_bg_color([0; 3]).is_err() {
+        return TestResult::Fail("background refused");
+    }
+    if [MPCC_BG_R_CR, MPCC_BG_G_Y, MPCC_BG_B_CB]
+        .iter()
+        .any(|reg| mpc.io.values[(reg + 3 * MPCC_STRIDE) as usize] != 0)
+    {
+        return TestResult::Fail("background not black");
+    }
+    // 10-bit tg_color into the 12-bit MPC fields.
+    if mpc.mpc_set_bg_color([0x3ff, 0x200, 1]).is_err()
+        || mpc.io.values[(MPCC_BG_R_CR + 3 * MPCC_STRIDE) as usize] != 0xffc
+        || mpc.io.values[(MPCC_BG_G_Y + 3 * MPCC_STRIDE) as usize] != 0x800
+        || mpc.io.values[(MPCC_BG_B_CB + 3 * MPCC_STRIDE) as usize] != 4
+    {
+        return TestResult::Fail("12-bit background");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_dcn30_mpcc_background_is_black
+);

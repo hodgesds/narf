@@ -72,6 +72,9 @@ const MPCC_TOP_SEL: u64 = 0x0000; // linux: mmMPCC0_MPCC_TOP_SEL
 const MPCC_BOT_SEL: u64 = 0x0001; // linux: mmMPCC0_MPCC_BOT_SEL
 const MPCC_OPP_ID: u64 = 0x0002; // linux: mmMPCC0_MPCC_OPP_ID
 const MPCC_CONTROL: u64 = 0x0003; // linux: mmMPCC0_MPCC_CONTROL
+const MPCC_BG_R_CR: u64 = 0x0009; // linux: mmMPCC0_MPCC_BG_R_CR
+const MPCC_BG_G_Y: u64 = 0x000a; // linux: mmMPCC0_MPCC_BG_G_Y
+const MPCC_BG_B_CB: u64 = 0x000b; // linux: mmMPCC0_MPCC_BG_B_CB
 const MPCC_STRIDE: u64 = 0x20; // linux: mmMPCC1_MPCC_TOP_SEL - mmMPCC0_MPCC_TOP_SEL
 const MPCC_OGAM_CONTROL: u64 = 0x0100; // linux: mmMPCC_OGAM0_MPCC_OGAM_CONTROL
 const MPCC_GAMUT_REMAP_MODE: u64 = 0x014b; // linux: mmMPCC_OGAM0_MPCC_GAMUT_REMAP_MODE
@@ -586,6 +589,21 @@ impl<I: Io> Block<I> {
             }
         })
     }
+    /// [`Mpc::set_bg_color`] (DCN3.0 only).
+    fn mpc_set_bg_color(&mut self, rgb: [u16; 3]) -> Result<(), Error> {
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        for (reg, value) in [MPCC_BG_R_CR, MPCC_BG_G_Y, MPCC_BG_B_CB]
+            .into_iter()
+            .zip(rgb)
+        {
+            let reg = self.mpcc(reg);
+            // linux-lit: 0xfff=MPCC0_MPCC_BG_R_CR__MPCC_BG_R_CR_MASK
+            self.set(reg, (u32::from(value) << 2) & 0xfff)?;
+        }
+        Ok(())
+    }
     /// `mpc1_mux_plane`: bind this MPCC to a DPP and an OPP and route the OPP's
     /// output mux to it. Opaque passthrough, no bottom layer.
     fn mpc_mux_plane(&mut self, dpp: u8, opp: u8) -> Result<(), Error> {
@@ -794,6 +812,14 @@ impl Mpc {
     }
     pub fn mux_plane(&mut self, dpp: u8, opp: u8) -> Result<(), Error> {
         self.0.mpc_mux_plane(dpp, opp)
+    }
+    /// `mpc1_set_bg_color` on this (bottommost) MPCC: the colour shown
+    /// wherever the plane's recout does not cover the OPP. `rgb` is DC's
+    /// 10-bit `tg_color`; MPC colour is 12-bit. `dcn20_update_mpcc` sets it
+    /// from `visual_confirm_color`, all zero (black) with visual confirm
+    /// off on DCN2+.
+    pub fn set_bg_color(&mut self, rgb: [u16; 3]) -> Result<(), Error> {
+        self.0.mpc_set_bg_color(rgb)
     }
     /// Park the combiner so neither the DPP nor the OPP is still routed.
     pub fn release(&mut self, opp: u8) -> Result<(), Error> {

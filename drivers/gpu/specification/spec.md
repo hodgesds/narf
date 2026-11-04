@@ -13884,7 +13884,12 @@ chroma request sizes are cleared rather than left behind, so a previous owner's
 chroma plane cannot keep fetching. `blank` waits up to 100 ms for the pipe's
 outstanding requests to retire; a power-gated pipe reads back zero and needs no
 wait. As `hubp2_set_blank_regs`' REG_WAIT, a pipe that never retires is logged,
-counted (`blank_stalls()`) and blanked anyway.
+counted (`blank_stalls()`) and blanked anyway. For a flip that changes the
+plane (DCN3.0): `setup(&Registers)` is `hubp3_setup`'s vready, requestor and
+deadline half; `set_viewport(x, y, w, h)` is `min_set_viewport` (primary,
+stereo-secondary and chroma viewports all the RGB luma rectangle, 14-bit
+fields checked before any write); `set_pitch(pitch)` is `hubp2_program_size`
+for linear RGB without DCC (pitch - 1, meta pitch 0).
 
 `amdgpu_dcn_plane` programs the rest of the plane path. The DPP and OPP banks are
 DCN base index 2 while the MPC bank is index 3. `Dpp::program` enables the pipe
@@ -13911,7 +13916,11 @@ nothing; `program` drops that cache (`dpp_reset`).
 one DPP and one OPP and points that
 OPP's output mux at it, with the bottom select parked so a stale value cannot
 blend another pipe's output in, and opaque passthrough with no alpha;
-`release` unroutes both ends. `Opp::program` leaves truncation, spatial dither
+`release` unroutes both ends. `set_bg_color([r, g, b])` (DCN3.0) is
+`mpc1_set_bg_color` on the bottommost (only) MPCC: 10-bit `tg_color` shifted
+into the 12-bit MPCC_BG fields, the colour the OPP shows outside the plane's
+recout; `dcn20_update_mpcc` passes `visual_confirm_color`, black with visual
+confirm off. `Opp::program` leaves truncation, spatial dither
 and frame randomisation off so the plane's depth passes through, and sizes the
 pattern generator to the stream so a blanked stream covers the whole screen.
 `Opp::set_blank` is where a stream is blanked: painting the pattern generator
