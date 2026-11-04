@@ -97,7 +97,9 @@ fn stats_rdna2_clock_uses_discovery_and_current_authority() -> TestResult {
                     2 => gpu.ip_blocks.push(original),
                     _ => gpu.regs.len = (0x500 + 0x103) * 4,
                 }
-                assert_eq!(timestamp_rdna2(&gpu, &cap), Err(FsError::InvalidData));
+                // A counter that cannot be located leaves TIMESTAMP without a
+                // reader: ENODEV, as for an owner that is gone.
+                assert_eq!(timestamp_rdna2(&gpu, &cap), Err(FsError::NoDevice));
                 if bad == 2 {
                     gpu.ip_blocks.pop();
                 }
