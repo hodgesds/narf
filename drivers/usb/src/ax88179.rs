@@ -220,6 +220,7 @@ pub fn build_tx_segment(frame: &[u8], max_packet: u16) -> Vec<u8> {
 }
 
 /// Outcome of parsing one RX aggregation buffer.
+#[derive(Debug)]
 pub struct AxRxOutcome {
     /// Frames extracted (pseudo-header stripped), in wire order.
     pub frames: Vec<Vec<u8>>,
@@ -307,6 +308,7 @@ pub fn parse_rx_aggregate(buf: &[u8]) -> AxRxOutcome {
 /// One fixed reset write: register + payload. The executor derives
 /// `wIndex` = payload length (the MAC packing rule), so the table
 /// cannot drift out of sync with the wire format.
+#[derive(Debug)]
 pub struct AxMacWrite {
     pub reg: u16,
     pub data: &'static [u8],
@@ -538,6 +540,7 @@ async fn auto_detach_best_effort(dev: &USBDevice) {
 // ── Device table + publication ─────────────────────────────────────
 
 /// Bound AX88179 device record (mirrors the r8152 record shape).
+#[derive(Debug)]
 pub struct AxDevice {
     pub slot_id: u8,
     pub mac: [u8; 6],
