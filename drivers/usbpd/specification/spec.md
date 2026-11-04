@@ -47,7 +47,14 @@ No hardware polling holds a spinlock or runs a custom busy-spin loop.
 ## 5. Architecture notes
 
 The ACPI transport maps firmware RAM write-back, uses volatile little-endian
-accesses and fences, and polls `_DSM` every 100 ms as a Notify fallback.
+accesses and fences, and registers an ACPI Notify handler on each PNP0CA0
+device (#1218): the handler only sets the owning task's kick flag (it never
+issues commands or evaluates AML in Notify context), and the task's poll wait
+re-checks the flag every 10 ms, so firmware-signaled events are observed
+within ~10 ms. The Notify event value is ignored — Linux's `ucsi_acpi_notify`
+likewise ignores it and just re-reads CCI — and polling every 100 ms
+(1000 ms after failures) remains as the fallback for platforms whose firmware
+never notifies and as the cadence for state drift without a Notify.
 The protocol and fake-device tests run on x86_64 and aarch64.
 
 ## 6. Dependencies and references
@@ -66,5 +73,5 @@ Lenovo firmware has not been exercised by this change.
 
 ## 8. Open work
 
-ACPI Notify-driven wakeups, broader platform quirks and role-swap interfaces.
+Broader platform quirks and role-swap interfaces.
 GPU source modesetting and native USB4 tunneling are separate subsystems.

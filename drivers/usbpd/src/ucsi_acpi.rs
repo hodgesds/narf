@@ -7,6 +7,7 @@ use core::{
     sync::atomic::{fence, AtomicBool, AtomicU8, Ordering},
 };
 use narf_aml::{resource::ResourceItem, NameValue, Value};
+use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::ioremap::{ioremap, iounmap, IoMapping, MmioAttrs};
 
 const UUID: [u8; 16] = [
@@ -142,6 +143,76 @@ fn resource(path: &str) -> Option<(u64, u64)> {
         })
 }
 
+/// Slice granularity for the Notify-aware poll wait: the task re-checks
+/// the kick flag every 10 ms, so a firmware Notify arriving mid-wait is
+/// observed within ~10 ms instead of at the next 100 ms / 1000 ms
+/// cadence boundary, and a Notify arriving while the task is polling
+/// is honored immediately (the flag is checked before the first sleep).
+/// Kicks coalesce into one flag — a Notify storm cannot queue unbounded
+/// work — but each kick still triggers a prompt poll, so a sustained
+/// storm would poll repeatedly; each poll is bounded to one CCI read
+/// plus refreshes of pending connectors only.
+const NOTIFY_SLICE_MS: u64 = 10;
+
+/// Per-device Notify kick flags, keyed by ACPI namespace path. The
+/// Notify handler is a bare `fn` pointer (it cannot capture the
+/// owning task's flag), so `probe()` registers the flag here and the
+/// handler looks it up by the target path dispatch hands it. Lock
+/// holders never await (register once at probe, find + atomic store
+/// in the handler), so the handler cannot deadlock against the task.
+static NOTIFY_KICKS: IrqSafeSpinLock<Vec<(String, Arc<AtomicBool>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Register (or replace) the kick flag for one PNP0CA0 path.
+/// Replace-by-path: a second probe of the same device must not leave
+/// a stale flag behind that the handler would set while the live task
+/// watches a different one.
+fn register_notify_kick(path: &str) -> Arc<AtomicBool> {
+    let kick = Arc::new(AtomicBool::new(false));
+    let mut kicks = NOTIFY_KICKS.lock();
+    if let Some(slot) = kicks.iter_mut().find(|(p, _)| p == path) {
+        slot.1 = kick.clone();
+    } else {
+        kicks.push((String::from(path), kick.clone()));
+    }
+    kick
+}
+
+/// ACPI Notify handler for PNP0CA0 devices. Runs in AML-evaluation
+/// context: it must never issue commands, evaluate AML, or block — it
+/// only sets the owning task's kick flag, and the task polls. The
+/// event value is deliberately ignored: Linux's `ucsi_acpi_notify`
+/// likewise ignores it (installed with `ACPI_DEVICE_NOTIFY`) and just
+/// re-reads CCI. NARF's poll is idempotent state observation
+/// (`read_cci` + refresh only pending connectors), so any firmware
+/// signal on this path means "state may have changed" and a spurious
+/// kick costs at most one extra poll.
+fn ucsi_notify_handler(target: &str, _value: u64) {
+    let kicks = NOTIFY_KICKS.lock();
+    if let Some((_, kick)) = kicks.iter().find(|(p, _)| p == target) {
+        kick.store(true, Ordering::Release);
+    }
+}
+
+/// Wait for either a Notify kick or the cadence deadline, checking the
+/// kick flag every `NOTIFY_SLICE_MS`. Returns true if kicked. The
+/// flag is checked before the first sleep, so a Notify that arrived
+/// while the task was polling is honored without another full slice.
+async fn wait_kicked(kick: &AtomicBool, deadline_ms: u64) -> bool {
+    let mut waited_ms = 0;
+    loop {
+        if kick.swap(false, Ordering::AcqRel) {
+            return true;
+        }
+        if waited_ms >= deadline_ms {
+            return false;
+        }
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(NOTIFY_SLICE_MS).as_instant())
+            .await;
+        waited_ms += NOTIFY_SLICE_MS;
+    }
+}
+
 pub(crate) fn probe() -> narf_init::InitResult {
     let mut found = 0;
     for node in narf_aml::find_all_devices_by_hid("PNP0CA0") {
@@ -183,8 +254,15 @@ pub(crate) fn probe() -> narf_init::InitResult {
             reset: AtomicBool::new(true),
         });
         narf_power::device_pm::register_device_pm_ops(&format!("ucsi:{path}"), pm.clone());
-        // _DSM read is a polling fallback for platforms without ACPI Notify.
-        // The PM gate excludes AML/CCI access while firmware is asleep.
+        // ACPI Notify-driven wakeups (#1218): firmware signals connector
+        // events with Notify on this device; the handler kicks the
+        // task's poll instead of waiting for the next cadence tick.
+        // Polling remains as the fallback for platforms whose firmware
+        // never notifies, and as the cadence for state drift without
+        // a Notify. The PM gate excludes AML/CCI access while firmware
+        // is asleep.
+        let kick = register_notify_kick(&path);
+        narf_aml::sync::register_notify_handler(&path, ucsi_notify_handler);
         narf_scheduler::spawn(async move {
             let mut ppm = match Ppm::new(transport) {
                 Ok(ppm) => ppm,
@@ -237,11 +315,7 @@ pub(crate) fn probe() -> narf_init::InitResult {
                         break;
                     }
                 }
-                narf_time::SleepUntil::new(
-                    narf_time::Deadline::after_ms(if failures == 0 { 100 } else { 1000 })
-                        .as_instant(),
-                )
-                .await;
+                wait_kicked(&kick, if failures == 0 { 100 } else { 1000 }).await;
             }
         });
         found += 1;
@@ -251,4 +325,125 @@ pub(crate) fn probe() -> narf_init::InitResult {
     } else {
         narf_init::InitResult::Ok
     }
+}
+
+// ── Smoke tests ────────────────────────────────────────────────────
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// Test-only cleanup: the kick registry is process-global, so each
+    /// test removes its own paths (unique per test) at start and end
+    /// rather than trusting the harness to isolate statics.
+    fn remove_notify_kick(path: &str) {
+        let mut kicks = NOTIFY_KICKS.lock();
+        kicks.retain(|(p, _)| p != path);
+    }
+
+    fn notify_handler_sets_registered_kick_for_any_value() -> TestResult {
+        const PATH: &str = "\\_SB.UCSI1";
+        remove_notify_kick(PATH);
+        let kick = register_notify_kick(PATH);
+        ucsi_notify_handler(PATH, 0x80);
+        if !kick.load(Ordering::Acquire) {
+            return TestResult::Fail("Notify 0x80 should set the registered kick");
+        }
+        kick.store(false, Ordering::Release);
+        ucsi_notify_handler(PATH, 0x00);
+        if !kick.load(Ordering::Acquire) {
+            return TestResult::Fail("Notify value must be ignored: 0x00 should also kick");
+        }
+        remove_notify_kick(PATH);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/ucsi-notify",
+        notify_handler_sets_registered_kick_for_any_value
+    );
+
+    fn notify_handler_ignores_unknown_path() -> TestResult {
+        const PATH: &str = "\\_SB.UCSI2";
+        remove_notify_kick(PATH);
+        let kick = register_notify_kick(PATH);
+        ucsi_notify_handler("\\_SB.OTHER", 0x80);
+        if kick.load(Ordering::Acquire) {
+            return TestResult::Fail("Notify for an unknown path must not set any kick");
+        }
+        remove_notify_kick(PATH);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/ucsi-notify",
+        notify_handler_ignores_unknown_path
+    );
+
+    fn notify_kick_replace_by_path() -> TestResult {
+        const PATH: &str = "\\_SB.UCSI3";
+        remove_notify_kick(PATH);
+        let stale = register_notify_kick(PATH);
+        let live = register_notify_kick(PATH);
+        ucsi_notify_handler(PATH, 0x80);
+        if stale.load(Ordering::Acquire) {
+            return TestResult::Fail("Re-registration must retire the stale flag");
+        }
+        if !live.load(Ordering::Acquire) {
+            return TestResult::Fail("Handler must set the latest registered flag");
+        }
+        remove_notify_kick(PATH);
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usbpd/ucsi-notify", notify_kick_replace_by_path);
+
+    fn wait_kicked_preset_kick_returns_true_and_consumes() -> TestResult {
+        let kick = AtomicBool::new(true);
+        if !narf_scheduler::block_on_spin(wait_kicked(&kick, 0)) {
+            return TestResult::Fail("Pre-set kick must return true without sleeping");
+        }
+        if kick.load(Ordering::Acquire) {
+            return TestResult::Fail("wait_kicked must consume the kick it honors");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/ucsi-notify",
+        wait_kicked_preset_kick_returns_true_and_consumes
+    );
+
+    fn wait_kicked_zero_deadline_without_kick_returns_false() -> TestResult {
+        let kick = AtomicBool::new(false);
+        if narf_scheduler::block_on_spin(wait_kicked(&kick, 0)) {
+            return TestResult::Fail("No kick and zero deadline must return false");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/ucsi-notify",
+        wait_kicked_zero_deadline_without_kick_returns_false
+    );
+
+    fn wait_kicked_waits_full_deadline_without_kick() -> TestResult {
+        let kick = AtomicBool::new(false);
+        if narf_scheduler::block_on_spin(wait_kicked(&kick, 30)) {
+            return TestResult::Fail("No kick must wait out the deadline, not return true");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/ucsi-notify",
+        wait_kicked_waits_full_deadline_without_kick
+    );
+
+    fn wait_kicked_preset_kick_beats_deadline() -> TestResult {
+        let kick = AtomicBool::new(true);
+        if !narf_scheduler::block_on_spin(wait_kicked(&kick, 100)) {
+            return TestResult::Fail("Pre-set kick must beat a 100 ms deadline");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/ucsi-notify",
+        wait_kicked_preset_kick_beats_deadline
+    );
 }
