@@ -877,8 +877,8 @@ impl Ixgbe {
         // stay within [offset, offset + head_len).
         unsafe {
             let base = frame.buf().cpu_ptr_at::<u8>(frame.offset() as u64);
-            for i in 0..head_len {
-                head[i] = core::ptr::read_volatile(base.add(i));
+            for (i, slot) in head.iter_mut().enumerate().take(head_len) {
+                *slot = core::ptr::read_volatile(base.add(i));
             }
         }
         let mut tail_g = self.tx_tail.lock();
