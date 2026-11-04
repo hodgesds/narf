@@ -52,6 +52,12 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
+/// SR-IOV / VMDq state: VF pools, VF MAC/VLAN filters, and the
+/// PF↔VF mailbox dispatcher (issue #1253). Pure register math and
+/// shadow state; the wiring below seeds the shadows from live MMIO
+/// and applies the dispatcher's programs.
+pub mod vmdq;
+
 // ── PCI device IDs ──────────────────────────────────────────────────
 //
 // Mirrors a subset of Linux's `igb_pci_tbl[]` in
@@ -1503,6 +1509,11 @@ pub struct Igb {
     /// Opt-in VLAN filter shadow; no VFTA word is programmed at
     /// bring-up (see [`VlanFilter`]).
     vlan_filter: IrqSafeSpinLock<VlanFilter>,
+    /// PCI device id (from probe), for VT family selection.
+    device_id: u16,
+    /// SR-IOV / VMDq allocation, `None` until [`Igb::vt_allocate`].
+    /// Lock order everywhere: `vt` before `vlan_filter`, never reversed.
+    vt: IrqSafeSpinLock<Option<vmdq::VtState>>,
     /// Live counters for the ethtool surface.
     stats: IgbStats,
     /// WoL filters the suspend sequence will arm (default: none).
@@ -1789,6 +1800,8 @@ impl Igb {
             tx_buf_pool,
             tx_state: IrqSafeSpinLock::new(TxRingCursor::new()),
             vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
+            device_id: device.id.device,
+            vt: IrqSafeSpinLock::new(None),
             stats: IgbStats::default(),
             wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
             suspended: AtomicBool::new(false),
@@ -1894,7 +1907,44 @@ impl Igb {
     /// The caller owns the policy question of whether enabling any
     /// filter also needs VID 0 restored (see
     /// [`VlanFilter::restore_default`]).
+    ///
+    /// With a VT allocation active, the PF add goes through the
+    /// VMDq-aware path instead (Linux `igb_vlan_rx_add_vid` with
+    /// VFs): the PF pool bit is programmed in VLVF, bypassing to
+    /// VFTA-only when no slot is free, and the VFTA word is written
+    /// only when the VFTA bit actually changes.
     pub fn vlan_filter_add(&self, vid: u16) -> bool {
+        // VMDq-aware path (lock order vt -> vlan_filter).
+        {
+            let mut vt = self.vt.lock();
+            if let Some(vt) = vt.as_mut() {
+                let mut filter = self.vlan_filter.lock();
+                let bit_set = filter.contains(vid);
+                let Ok(out) = vt.vfta_set(vid, vmdq::pf_pool(vt.num_vfs), true, vid != 0, bit_set)
+                else {
+                    return false;
+                };
+                if let Some((idx, value)) = out.vlvf_write {
+                    // SAFETY: mapped MMIO; VLVF index is within 0..32.
+                    unsafe {
+                        self.mmio.write32(vmdq::vlvf_addr(idx), value);
+                    }
+                }
+                if out.vfta_changed {
+                    filter.add(vid);
+                    let word = vfta_word(vid);
+                    let value = filter.word(word);
+                    drop(filter);
+                    drop(vt);
+                    // SAFETY: mapped MMIO; VFTA word `word` is within
+                    // the 128-word table for any valid VID.
+                    unsafe {
+                        self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
+                    }
+                }
+                return true;
+            }
+        }
         let mut filter = self.vlan_filter.lock();
         if !filter.add(vid) {
             return false;
@@ -1912,7 +1962,64 @@ impl Igb {
 
     /// Remove a VID from the hardware VLAN filter (shadow + the one
     /// VFTA word). Returns false for VID > 4095.
+    ///
+    /// With a VT allocation active, the PF remove goes through the
+    /// VMDq-aware path (Linux `igb_vlan_rx_kill_vid` with VFs):
+    /// the PF pool bit clears in VLVF, the PF entry is cleaned up,
+    /// and the VFTA word is written only when the VFTA bit changes.
     pub fn vlan_filter_remove(&self, vid: u16) -> bool {
+        // VMDq-aware path (lock order vt -> vlan_filter).
+        {
+            let mut vt = self.vt.lock();
+            if let Some(vt) = vt.as_mut() {
+                let mut filter = self.vlan_filter.lock();
+                let bit_set = filter.contains(vid);
+                let Ok(out) = vt.vfta_set(vid, vmdq::pf_pool(vt.num_vfs), false, true, bit_set)
+                else {
+                    return false;
+                };
+                // Last-pool remove: the VFTA bit clears BEFORE the
+                // entry is disabled (Linux `igb_vfta_set` ordering —
+                // otherwise a packet for this VID could leak into the
+                // PF via the default pool in between). Every other
+                // case programs the entry first, then the VFTA word.
+                let last_pool_out = out.vfta_changed && matches!(out.vlvf_write, Some((_, 0)));
+                if last_pool_out {
+                    filter.remove(vid);
+                    let word = vfta_word(vid);
+                    let value = filter.word(word);
+                    // SAFETY: mapped MMIO; VFTA word is within the
+                    // 128-word table for any valid VID.
+                    unsafe {
+                        self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
+                    }
+                }
+                if let Some((idx, value)) = out.vlvf_write {
+                    // SAFETY: mapped MMIO; VLVF index is within 0..32.
+                    unsafe {
+                        self.mmio.write32(vmdq::vlvf_addr(idx), value);
+                    }
+                }
+                if let Some((idx, value)) = vt.update_pf_vlvf(vid) {
+                    // SAFETY: mapped MMIO; VLVF index is within 0..32.
+                    unsafe {
+                        self.mmio.write32(vmdq::vlvf_addr(idx), value);
+                    }
+                }
+                if out.vfta_changed && !last_pool_out {
+                    filter.remove(vid);
+                    let word = vfta_word(vid);
+                    let value = filter.word(word);
+                    drop(filter);
+                    drop(vt);
+                    // SAFETY: mapped MMIO; see `vlan_filter_add`.
+                    unsafe {
+                        self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
+                    }
+                }
+                return true;
+            }
+        }
         let mut filter = self.vlan_filter.lock();
         if !filter.remove(vid) {
             return false;
@@ -1925,6 +2032,158 @@ impl Igb {
             self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
         }
         true
+    }
+
+    /// Allocate SR-IOV / VMDq state for `num_vfs` VFs (Linux
+    /// `igb_enable_sriov` device-side half): 1..=7 VFs (more is
+    /// refused, matching `IGB_MAX_VF_FUNCTIONS` minus the PF pool),
+    /// MSI-X required, one allocation per device. Seeds the VLVF /
+    /// VMOLR / VFRE / VFTE shadows from live MMIO, programs the
+    /// VT_CTL default pool (the PF pool) and the per-family switch
+    /// registers (Linux `igb_vmm_control`: 82576 gets DTXCTL
+    /// VLAN_ADDED + RPLOLR STRVLAN; I350 neither; I210/I211 none of
+    /// the switch registers), and programs MRQC into VMDq mode with
+    /// RXCSUM PCSD (Linux `igb_setup_mrqc`).
+    ///
+    /// What this does NOT do (remainders, see the spec): PCI SR-IOV
+    /// config-space enablement and VF BAR exposure (needs a PCI-layer
+    /// lane), the mailbox interrupt pump (the dispatcher below is
+    /// callable but nothing polls MBVFICR yet), and live PF queue
+    /// relocation to `rbase_offset` (bring-up is queue-0-only; the
+    /// pool math itself is fixture-proven in `vmdq`).
+    ///
+    /// Later RSS reprogramming of MRQC must pass `vmdq = true` and
+    /// the actual RSS queue count to [`mrqc_word`]; with VFs
+    /// allocated, [`max_queues_for_device`] already pins I350 to 1
+    /// RSS queue and 82576 to 2.
+    pub fn vt_allocate(&self, num_vfs: usize) -> Result<(), IgbError> {
+        // Linux `igb_enable_sriov` requires MSI-X.
+        if self._msix.is_none() {
+            return Err(IgbError::Other("igb VT allocation requires MSI-X"));
+        }
+        let mut vt_guard = self.vt.lock();
+        if vt_guard.is_some() {
+            return Err(IgbError::Other("igb VT already allocated"));
+        }
+        let mut state = vmdq::VtState::new(self.device_id, num_vfs)
+            .map_err(|_| IgbError::Other("igb VT VF count or device unsupported"))?;
+        // SAFETY: mapped MMIO throughout; every address is a
+        // documented igb register for this device family.
+        unsafe {
+            // Seed shadows from live registers (reset values are
+            // assumed 0 only when no live read is possible — here the
+            // reads are possible, so the shadows track the device).
+            for i in 0..32 {
+                state.vlvf.entries[i] = self.mmio.read32(vmdq::vlvf_addr(i));
+            }
+            for p in 0..8 {
+                state.vmolr[p] = self.mmio.read32(vmdq::vmolr_addr(p));
+            }
+            state.vfre = self.mmio.read32(vmdq::REG_VFRE);
+            state.vfte = self.mmio.read32(vmdq::REG_VFTE);
+            // VT_CTL: PF default pool + replication (replication only
+            // for families whose switch programming exists — see
+            // `igb_vmm_control`'s early return for I210/I211).
+            let vt_ctl = self.mmio.read32(vmdq::REG_VT_CTL);
+            let vt_ctl = vmdq::vt_ctl_default_pool_word(vt_ctl, vmdq::pf_pool(num_vfs));
+            let vt_ctl = match vmdq::switch_family_for_device(self.device_id) {
+                Some(vmdq::SwitchFamily::Dtxswc82576) | Some(vmdq::SwitchFamily::TxswcI350) => {
+                    vmdq::vt_ctl_replication_word(vt_ctl, true)
+                }
+                _ => vt_ctl,
+            };
+            self.mmio.write32(vmdq::REG_VT_CTL, vt_ctl);
+            // Per-family switch programming.
+            match vmdq::switch_family_for_device(self.device_id) {
+                Some(vmdq::SwitchFamily::Dtxswc82576) => {
+                    let dtxctl = self.mmio.read32(vmdq::REG_DTXCTL);
+                    self.mmio
+                        .write32(vmdq::REG_DTXCTL, dtxctl | vmdq::DTXCTL_VLAN_ADDED);
+                    let rplolr = self.mmio.read32(vmdq::REG_RPLOLR);
+                    self.mmio
+                        .write32(vmdq::REG_RPLOLR, rplolr | vmdq::RPLOLR_STRVLAN);
+                    let dtxswc = self.mmio.read32(vmdq::REG_DTXSWC);
+                    let dtxswc = vmdq::switch_loopback_word(dtxswc, true);
+                    let dtxswc = vmdq::switch_antispoof_word(dtxswc, vmdq::pf_pool(num_vfs));
+                    self.mmio.write32(vmdq::REG_DTXSWC, dtxswc);
+                }
+                Some(vmdq::SwitchFamily::TxswcI350) => {
+                    let txswc = self.mmio.read32(vmdq::REG_TXSWC);
+                    let txswc = vmdq::switch_loopback_word(txswc, true);
+                    let txswc = vmdq::switch_antispoof_word(txswc, vmdq::pf_pool(num_vfs));
+                    self.mmio.write32(vmdq::REG_TXSWC, txswc);
+                }
+                _ => {}
+            }
+            // MRQC VMDq mode + RXCSUM PCSD. Live bring-up never
+            // programs MRQC, so the builder word is the whole
+            // register; RXCSUM keeps its current bits.
+            self.mmio
+                .write32(REG_MRQC, mrqc_word(false, false, true, 1));
+            let rxcsum = self.mmio.read32(REG_RXCSUM);
+            self.mmio.write32(REG_RXCSUM, rxcsum_rss_word(rxcsum));
+        }
+        *vt_guard = Some(state);
+        Ok(())
+    }
+
+    /// Run one PF↔VF mailbox message for `vf` through the VT
+    /// dispatcher (Linux `igb_rcv_msg_from_vf`) and apply its
+    /// program to the device: register writes directly, MTA sets as
+    /// read-OR-write, and VFTA consequences through the VLAN filter
+    /// shadow (the same single word write `vlan_filter_add` /
+    /// `vlan_filter_remove` perform, applied inline because the
+    /// filter lock is already held — lock order vt -> vlan_filter).
+    /// Returns the dispatcher's reply words; the caller writes them
+    /// to VMBMEM and rings P2VMAILBOX (Linux `igb_write_mbx`), which
+    /// is the mailbox pump's job and a remainder of this lane.
+    pub fn vt_dispatch_mailbox(
+        &self,
+        vf: usize,
+        msg: &[u32],
+    ) -> Result<vmdq::DispatchOutcome, IgbError> {
+        let mut vt_guard = self.vt.lock();
+        let Some(vt) = vt_guard.as_mut() else {
+            return Err(IgbError::Other("igb VT not allocated"));
+        };
+        let mut filter = self.vlan_filter.lock();
+        let outcome = vt
+            .dispatch(vf, msg, &filter)
+            .map_err(|_| IgbError::Other("igb VT mailbox message invalid"))?;
+        // Application order is load-bearing (see `vmdq::Program`):
+        // VFTA clears for removes first (a last-pool remove must
+        // clear its VFTA bit before its entry is disabled), then
+        // register writes and MTA sets, then VFTA sets for adds.
+        for vid in &outcome.program.vlan_removes[..outcome.program.n_vlan_removes] {
+            filter.remove(*vid);
+            let word = vfta_word(*vid);
+            let value = filter.word(word);
+            // SAFETY: mapped MMIO; VFTA word is within the table.
+            unsafe {
+                self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
+            }
+        }
+        // SAFETY: mapped MMIO throughout; every address comes from
+        // the dispatcher's bounded program.
+        unsafe {
+            for w in &outcome.program.writes[..outcome.program.n_writes] {
+                self.mmio.write32(w.addr, w.value);
+            }
+            for (addr, bit) in &outcome.program.mta_sets[..outcome.program.n_mta_sets] {
+                let cur = self.mmio.read32(*addr);
+                self.mmio.write32(*addr, cur | bit);
+            }
+        }
+        for vid in &outcome.program.vlan_adds[..outcome.program.n_vlan_adds] {
+            filter.add(*vid);
+            let word = vfta_word(*vid);
+            let value = filter.word(word);
+            // SAFETY: mapped MMIO; VFTA word is within the table.
+            unsafe {
+                self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
+            }
+        }
+        Ok(outcome)
     }
 
     /// Suspend the device (Linux `__igb_shutdown` order): mask
