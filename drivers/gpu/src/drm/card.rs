@@ -343,6 +343,9 @@ pub struct PlaneFrame {
     /// The pin amdgpu_dm_plane_helper_prepare_fb took on the framebuffer's
     /// GEM buffer; it lasts until a flip latches past it.
     pub bo: Option<ScanoutPin>,
+    /// Where a primary that is not full-screen and unscaled shows: its
+    /// SRC and CRTC rectangles. None for the full-screen unscaled frame.
+    pub placement: Option<Placement>,
 }
 impl PlaneFrame {
     /// A linear single-plane framebuffer at `phys`.
@@ -357,8 +360,18 @@ impl PlaneFrame {
             chroma_pitch: 0,
             modifier: 0,
             bo: None,
+            placement: None,
         }
     }
+}
+
+/// A positioned or scaled plane: the framebuffer rectangle it shows
+/// (SRC_X/Y/W/H, whole pixels) and the CRTC rectangle it shows it in
+/// (CRTC_X/Y/W/H, which may reach past the CRTC; DC clips it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub src: (u32, u32, u32, u32),
+    pub dst: (i32, i32, u32, u32),
 }
 
 // ── Card ───────────────────────────────────────────────────────────────

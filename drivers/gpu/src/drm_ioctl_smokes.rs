@@ -3730,7 +3730,8 @@ fn smoke_drm_native_planes_refuse_what_scanout_cannot_show() -> TestResult {
     {
         return TestResult::Fail("PAGE_FLIP to a short framebuffer");
     }
-    // Atomic: only the unscaled full-screen plane passes.
+    // Atomic: the primary may be positioned and scaled within DCN3.0's
+    // limits (amdgpu_dm_plane_helper_check_state).
     let plane = |fb: u32, crtc_w: u32, src_x: u32| PlaneState {
         id: ids[0],
         crtc_id: Some(11),
@@ -3762,12 +3763,46 @@ fn smoke_drm_native_planes_refuse_what_scanout_cannot_show() -> TestResult {
         refresh_hz: 60,
         bpp: 32,
     };
+    // Full-screen; downscaled 2:1 horizontally; SRC past the framebuffer
+    // (drm_atomic_plane_check's ENOSPC); not covering a wider mode (the
+    // MPC background shows beside it).
     if check(plane(full, 64, 0), None) != Ok(())
-        || check(plane(full, 32, 0), None) != Err(FsError::InvalidData)
-        || check(plane(full, 64, 8), None) != Err(FsError::InvalidData)
-        || check(plane(full, 64, 0), Some(wide)) != Err(FsError::InvalidData)
+        || check(plane(full, 32, 0), None) != Ok(())
+        || check(plane(full, 64, 8), None) != Err(FsError::NoSpace)
+        || check(plane(full, 64, 0), Some(wide)) != Ok(())
     {
         return TestResult::Fail("atomic native plane checks");
+    }
+    // KWin's TEST_ONLY primary on a 3840x2160 CRTC: a 55x55 framebuffer
+    // shown unscaled at (1912, 1073).
+    let Ok(kwin) = addfb(55, 55, XR24) else {
+        return TestResult::Fail("55x55 framebuffer refused");
+    };
+    let uhd = crate::Mode {
+        width: 3840,
+        height: 2160,
+        refresh_hz: 60,
+        bpp: 32,
+    };
+    let at = |x: i32, y: i32, w: u32, h: u32, src: (u32, u32)| PlaneState {
+        crtc_x: x,
+        crtc_y: y,
+        crtc_w: w,
+        crtc_h: h,
+        src_w: src.0,
+        src_h: src.1,
+        ..plane(kwin, 55, 0)
+    };
+    if check(at(1912, 1073, 55, 55, (55, 55)), Some(uhd)) != Ok(()) {
+        return TestResult::Fail("KWin's positioned 55x55 primary refused");
+    }
+    // Refused like Linux: more than 16x up, a visible part under
+    // MIN_VIEWPORT_SIZE (x2 wide), entirely off the CRTC.
+    if check(at(0, 0, 32, 32, (1, 1)), Some(uhd)) != Err(FsError::InvalidData)
+        || check(at(3830, 0, 55, 55, (55, 55)), Some(uhd)) != Err(FsError::InvalidData)
+        || check(at(-100, -100, 55, 55, (55, 55)), Some(uhd)) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("out-of-range primary placement accepted");
     }
     // RMFB of the framebuffer on screen turns the CRTC off.
     if dispatch_card(

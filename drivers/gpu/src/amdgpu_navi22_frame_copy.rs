@@ -31,6 +31,20 @@ impl Frame {
         } else if p.phys == 0 || p.phys % 4 != 0 || p.phys.checked_add(end).is_none() {
             return None;
         }
+        if let Some(placement) = p.placement {
+            let (sx, sy, sw, sh) = placement.src;
+            let (_, _, dw, dh) = placement.dst;
+            let fits = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
+            if sw == 0
+                || sh == 0
+                || dw == 0
+                || dh == 0
+                || !fits(sx, sw, p.width)
+                || !fits(sy, sh, p.height)
+            {
+                return None;
+            }
+        }
         Some(Self {
             phys: p.phys,
             pitch: p.pitch,
@@ -40,7 +54,43 @@ impl Frame {
             bo: p.bo,
             ticket,
             damage: None,
+            placement: p.placement,
         })
+    }
+}
+
+/// The framebuffer row a placed plane shows on CRTC row `y`, or None where
+/// its CRTC rectangle does not reach: DC's recout and vertical scale
+/// ratio, sampled at the destination pixel's centre (nearest source row;
+/// LINUX-GAP: DC's DSCL filters with its polyphase taps).
+pub(super) fn placed_source_row(p: &crate::drm::card::Placement, y: u32) -> Option<u32> {
+    let (_, sy, _, sh) = p.src;
+    let (_, dy, _, dh) = p.dst;
+    let within = i64::from(y) - i64::from(dy);
+    if within < 0 || within >= i64::from(dh) {
+        return None;
+    }
+    let offset = (2 * within + 1) * i64::from(sh) / (2 * i64::from(dh));
+    u32::try_from(i64::from(sy) + offset).ok()
+}
+
+/// One composed CRTC row of a placed plane: `source` (the framebuffer row
+/// [`placed_source_row`] chose) scaled into its CRTC rectangle, the black
+/// background elsewhere. Columns past the CRTC are clipped.
+pub(super) fn compose_row(p: &crate::drm::card::Placement, source: &[u32], out: &mut [u32]) {
+    let (sx, _, sw, _) = p.src;
+    let (dx, _, dw, _) = p.dst;
+    for (x, px) in out.iter_mut().enumerate() {
+        let within = x as i64 - i64::from(dx);
+        *px = if within < 0 || within >= i64::from(dw) {
+            0
+        } else {
+            let offset = (2 * within + 1) * i64::from(sw) / (2 * i64::from(dw));
+            source
+                .get((i64::from(sx) + offset) as usize)
+                .copied()
+                .unwrap_or(0)
+        };
     }
 }
 
@@ -55,9 +105,19 @@ pub(super) enum Ineligible {
     Size,
     /// The first pixel is not on a 256-byte request boundary.
     Alignment,
+    /// The primary is positioned or scaled: it is composed into the owned
+    /// surface (LINUX-GAP: DC programs the HUBP viewport, DSCL recout and
+    /// scaler and the MPC background instead).
+    Placed,
 }
 impl Ineligible {
-    pub(super) const ALL: [Self; 4] = [Self::NotGem, Self::Pitch, Self::Size, Self::Alignment];
+    pub(super) const ALL: [Self; 5] = [
+        Self::NotGem,
+        Self::Pitch,
+        Self::Size,
+        Self::Alignment,
+        Self::Placed,
+    ];
 }
 
 /// `amdgpu_dm_plane_helper_prepare_fb` + `fill_plane_buffer_attributes`
@@ -71,6 +131,9 @@ pub(super) fn direct(
     front: &narf_graphics_driver::generic::GenericFb,
 ) -> Result<u64, Ineligible> {
     let pin = frame.bo.as_ref().ok_or(Ineligible::NotGem)?;
+    if frame.placement.is_some() {
+        return Err(Ineligible::Placed);
+    }
     if frame.pitch != front.pitch {
         return Err(Ineligible::Pitch);
     }
@@ -433,6 +496,77 @@ mod tests {
     /// Direct scanout takes a pinned client framebuffer only when the
     /// HUBP can fetch it as programmed: same pitch and size as the lit
     /// surface, first pixel on a 256-byte boundary. Everything else copies.
+    /// A positioned or scaled primary is composed into the owned surface:
+    /// its CRTC rectangle shows the SRC rectangle (nearest sample), the
+    /// background is black, and it is never fetched in place.
+    fn navi22_placed_primary_composes_and_is_not_direct() -> TestResult {
+        use crate::drm::card::Placement;
+        // KWin's 55x55 at (1912, 1073), scaled down to a 16-pixel row: x 5
+        // and up show source columns 0, 1, ...
+        let unscaled = Placement {
+            src: (0, 0, 55, 55),
+            dst: (5, 3, 55, 55),
+        };
+        let source: Vec<u32> = (0..55).map(|x| 0x100 + x).collect();
+        let mut out = vec![0xffff_ffffu32; 16];
+        compose_row(&unscaled, &source, &mut out);
+        if out[..5] != [0; 5] || out[5] != 0x100 || out[15] != 0x10a {
+            return TestResult::Fail("unscaled placed row");
+        }
+        if placed_source_row(&unscaled, 2).is_some()
+            || placed_source_row(&unscaled, 3) != Some(0)
+            || placed_source_row(&unscaled, 57) != Some(54)
+            || placed_source_row(&unscaled, 58).is_some()
+        {
+            return TestResult::Fail("unscaled placed rows");
+        }
+        // 2x up from SRC (2, 1, 4, 4) into (0, 0, 8, 8); left of it is
+        // clipped (negative CRTC_X).
+        let up = Placement {
+            src: (2, 1, 4, 4),
+            dst: (-2, 0, 8, 8),
+        };
+        let mut out = vec![0u32; 8];
+        compose_row(&up, &source, &mut out);
+        if out != [0x103, 0x103, 0x104, 0x104, 0x105, 0x105, 0, 0] {
+            return TestResult::Fail("upscaled placed row");
+        }
+        if placed_source_row(&up, 0) != Some(1) || placed_source_row(&up, 7) != Some(4) {
+            return TestResult::Fail("upscaled placed rows");
+        }
+        // 2:1 down samples every other source pixel's centre.
+        let down = Placement {
+            src: (0, 0, 8, 8),
+            dst: (0, 0, 4, 4),
+        };
+        let mut out = vec![0u32; 4];
+        compose_row(&down, &source, &mut out);
+        if out != [0x101, 0x103, 0x105, 0x107] {
+            return TestResult::Fail("downscaled placed row");
+        }
+        // Placement outside the framebuffer is refused at from_plane.
+        let mut plane = PlaneFrame::linear(0x10_0000, 256, 55, 55, 0x3432_5258);
+        plane.placement = Some(Placement {
+            src: (10, 0, 55, 55),
+            dst: (0, 0, 55, 55),
+        });
+        if Frame::from_plane(plane.clone(), None).is_some() {
+            return TestResult::Fail("SRC past the framebuffer accepted");
+        }
+        plane.placement = Some(unscaled);
+        let Some(frame) = Frame::from_plane(plane, None) else {
+            return TestResult::Fail("placed frame refused");
+        };
+        if frame.placement != Some(unscaled) {
+            return TestResult::Fail("placement lost");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_placed_primary_composes_and_is_not_direct
+    );
+
     fn navi22_direct_scanout_eligibility() -> TestResult {
         use narf_graphics_driver::generic::GenericFb;
         let fixture = Fixture::new();

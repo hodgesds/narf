@@ -6606,6 +6606,29 @@ fn atomic_commit(
                 .filter_map(|&(crtc_id, fb_id)| {
                     let fb = card.framebuffer(fb_id).ok()?;
                     let gem_handle = fb.gem_handle;
+                    // A positioned or scaled primary of a native card
+                    // without native planes (check_native_plane).
+                    let placement =
+                        card.plane_formats
+                            .filter(|_| amdgpu && card.native_planes.is_empty())
+                            .and_then(|_| {
+                                let plane = state.planes.iter().find(|p| {
+                                    p.crtc_id == Some(crtc_id) && p.fb_id == Some(fb_id)
+                                })?;
+                                let mode = state
+                                    .crtcs
+                                    .iter()
+                                    .find(|c| c.id == crtc_id)
+                                    .and_then(|c| c.mode)
+                                    .or_else(|| card.crtc(crtc_id).ok().and_then(|c| c.mode))?;
+                                placement_of(
+                                    (
+                                        (plane.crtc_x, plane.crtc_y, plane.crtc_w, plane.crtc_h),
+                                        (plane.src_x, plane.src_y, plane.src_w, plane.src_h),
+                                    ),
+                                    (mode.width, mode.height),
+                                )
+                            });
                     Some((
                         crtc_id,
                         card.virtgpu_import(gem_handle).cloned(),
@@ -6614,12 +6637,14 @@ fn atomic_commit(
                         fb_id,
                         fb.bo
                             .as_ref()
-                            .and_then(|_| prepared_frame(&card, fb, &prepared)),
+                            .and_then(|_| prepared_frame(&card, fb, &prepared))
+                            .map(|f| crate::drm::card::PlaneFrame { placement, ..f }),
                         intel_frame(fb),
                         flip_tickets
                             .iter()
                             .find(|(id, _)| *id == crtc_id)
                             .map(|(_, t)| *t),
+                        placement,
                     ))
                 })
                 .collect();
@@ -6676,6 +6701,7 @@ fn atomic_commit(
         gem_frame,
         intel,
         flip_ticket,
+        placement,
     ) in presentation.into_iter().flatten()
     {
         if let Some(resource) = resource {
@@ -6688,7 +6714,10 @@ fn atomic_commit(
             present_frame(
                 card_index,
                 crtc_id,
-                crate::drm::card::PlaneFrame::linear(src_phys, pitch, width, height, format),
+                crate::drm::card::PlaneFrame {
+                    placement,
+                    ..crate::drm::card::PlaneFrame::linear(src_phys, pitch, width, height, format)
+                },
                 flip_ticket,
             );
         } else {
@@ -7276,12 +7305,16 @@ fn should_log(counter: &AtomicU64) -> (bool, u64) {
 /// in the framebuffer) rectangles.
 type PlaneRects = ((i32, i32, u32, u32), (u32, u32, u32, u32));
 
-/// What a natively scanned-out primary plane can show: an unscaled,
-/// full-screen frame from the framebuffer's origin in one of the card's
-/// plane formats (`Card::plane_formats`), covering the CRTC's mode. Linux
-/// refuses scaling or positioning a plane cannot do with EINVAL, and a
-/// framebuffer smaller than its viewport with ENOSPC
-/// (drm_atomic_helper_check_plane_state, drm_crtc_check_viewport).
+/// What a natively scanned-out primary plane can show, in one of the
+/// card's plane formats (`Card::plane_formats`). Through the legacy paths
+/// (no `rects`) it is the full-screen frame from the CRTC's x/y, which must
+/// be the framebuffer's origin. An atomic primary may be positioned and
+/// scaled as amdgpu_dm_plane_helper_check_state allows on DCN3.0
+/// (`drm_native_planes::check_plane`: can_position, the visible part at
+/// least MIN_VIEWPORT_SIZE, 16x up to 1/6 down for 8888); its SRC must lie
+/// in the framebuffer (drm_atomic_plane_check's ENOSPC). Linux refuses
+/// scaling or positioning a plane cannot do with EINVAL, and a framebuffer
+/// smaller than its viewport with ENOSPC (drm_crtc_check_viewport).
 /// `Ok` on cards without native planes.
 fn check_native_plane(
     card: &crate::drm::card::Card,
@@ -7304,8 +7337,31 @@ fn check_native_plane(
     if origin != (0, 0) {
         return Err(invalid_at(line!()));
     }
-    if let Some((dst, src)) = rects {
-        if dst != (0, 0, w, h) || src != (0, 0, w, h) {
+    if let Some((dst, src)) = rects.filter(|&r| placement_of(r, (w, h)).is_some()) {
+        #[cfg(feature = "amdgpu")]
+        {
+            let plane = crate::drm::atomic::PlaneState {
+                crtc_x: dst.0,
+                crtc_y: dst.1,
+                crtc_w: dst.2,
+                crtc_h: dst.3,
+                src_x: src.0,
+                src_y: src.1,
+                src_w: src.2,
+                src_h: src.3,
+                ..Default::default()
+            };
+            crate::drm_native_planes::check_plane(&plane, (w, h))
+                .map_err(|_| invalid_at(line!()))?;
+            let fits = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
+            if !fits(src.0, src.2, fb.width) || !fits(src.1, src.3, fb.height) {
+                return Err(FsError::NoSpace);
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "amdgpu"))]
+        {
+            let _ = (dst, src);
             return Err(invalid_at(line!()));
         }
     }
@@ -7313,6 +7369,15 @@ fn check_native_plane(
         return Err(FsError::NoSpace);
     }
     Ok(())
+}
+
+/// The placement of a primary with `rects` on a CRTC of `mode` (width,
+/// height): None when it is full-screen and unscaled.
+fn placement_of(rects: PlaneRects, mode: (u32, u32)) -> Option<crate::drm::card::Placement> {
+    let (dst, src) = rects;
+    let full = (0, 0, mode.0, mode.1);
+    (dst != (0, 0, mode.0, mode.1) || src != full)
+        .then_some(crate::drm::card::Placement { src, dst })
 }
 
 /// Every enabled plane of an atomic state on a native card, in the mode
@@ -8258,6 +8323,7 @@ fn fb_frame(fb: &crate::drm::card::Framebuffer, phys: u64) -> crate::drm::card::
         chroma_pitch: fb.chroma_pitch,
         modifier: fb.modifier,
         bo: None,
+        placement: None,
     }
 }
 
@@ -8316,8 +8382,12 @@ fn present_frame(
             // A refused frame completes its ticket at once. A tiled or 4:2:0
             // framebuffer (only the Navi 48 card takes them) goes as its
             // primary plane's frame.
-            let linear =
-                f.bo.is_none() && f.modifier == 0 && f.offsets == [0; 2] && f.chroma_pitch == 0;
+            // A positioned or scaled primary goes as its plane's frame.
+            let linear = f.bo.is_none()
+                && f.modifier == 0
+                && f.offsets == [0; 2]
+                && f.chroma_pitch == 0
+                && f.placement.is_none();
             let gem = f.bo.is_some();
             let native = if linear {
                 crate::amdgpu_native_kms::present_frame(

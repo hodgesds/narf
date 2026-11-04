@@ -1959,6 +1959,8 @@ struct Frame {
     /// The rows that changed since the source's previous frame (DIRTYFB);
     /// None: all of them.
     damage: Option<core::ops::Range<u32>>,
+    /// A positioned or scaled primary's SRC and CRTC rectangles.
+    placement: Option<crate::drm::card::Placement>,
 }
 
 #[path = "amdgpu_navi22_frame_copy.rs"]
@@ -2326,6 +2328,10 @@ async fn present_blit(
     frame: &Frame,
     pin: &alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>,
 ) -> Result<Blitted, ScanError> {
+    // The SDMA copy is a whole-frame copy; a placed frame is composed.
+    if frame.placement.is_some() {
+        return Ok(Blitted::Unavailable);
+    }
     frame_copy::wait_rendered(pin).await?;
     let source = pin
         .address()
@@ -2436,6 +2442,41 @@ async unsafe fn present_native(
     let back = surface.fb;
     // Navi22 reallocates no buffer behind the presenter (a relight forgets
     // them), so one epoch serves.
+    if let Some(placement) = frame.placement {
+        // Every row is composed: the plane where its CRTC rectangle lies,
+        // the black background elsewhere (no damage tracking).
+        damage.forget();
+        let mut source_row = alloc::vec::Vec::new();
+        let mut out = alloc::vec::Vec::new();
+        source_row
+            .try_reserve_exact(frame.width as usize)
+            .map_err(|_| ScanError::Allocation)?;
+        out.try_reserve_exact(back.width as usize)
+            .map_err(|_| ScanError::Allocation)?;
+        source_row.resize(frame.width as usize, 0u32);
+        out.resize(back.width as usize, 0u32);
+        for y in 0..back.height {
+            let src_y = frame_copy::placed_source_row(&placement, y);
+            if let Some(src_y) = src_y.filter(|&r| r < frame.height) {
+                boot.access_vram(|| {
+                    frame_copy::row(frame, source, src_y, &mut source_row)
+                        .map_err(|_| narf_filesystem::FsError::InvalidData)
+                })
+                .map_err(|_| ScanError::DeviceGone)?;
+                frame_copy::compose_row(&placement, &source_row, &mut out);
+            } else {
+                out.fill(0);
+            }
+            boot.display_scanout()?.upload_back(0, y, &out)?;
+            if y % 64 == 63 {
+                narf_scheduler::yield_now().await;
+            }
+        }
+        return Ok(Copied {
+            tracked: None,
+            address: surface.address,
+        });
+    }
     let tracked = frame_copy::damage_source(frame);
     let rows = match tracked {
         Some(_) => damage.plan(tracked, frame.damage.as_ref(), surface.address, 0),
