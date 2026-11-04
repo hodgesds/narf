@@ -527,8 +527,10 @@ pub(crate) fn publish_navi48_clocks(clocks: [u32; 4]) {
     *NAVI48_CLOCKS.lock() = Some(clocks);
 }
 /// `AMDGPU_INFO_TIMESTAMP` → amdgpu_gfx_get_gpu_clock_counter as a u64.
-/// Without a reader (or once the device is gone) EINVAL, as amdgpu's
-/// default arm.
+/// Linux always answers (gfx_v10_0_get_gpu_clock_counter / gfx12). The
+/// RDNA2 counter is read by its retained owner through `dispatch_live`;
+/// reaching this path means no live owner can read it: ENODEV, the
+/// device being unavailable, not EINVAL for a well-formed query.
 fn timestamp(
     snap: &Snapshot,
     clock: Option<crate::amdgpu_smuio14::ClockReader>,
@@ -537,7 +539,7 @@ fn timestamp(
         .filter(|_| rdna4(snap).is_some())
         .and_then(|c| c.read())
         .map(|t| t.to_le_bytes().to_vec())
-        .ok_or(FsError::InvalidData)
+        .ok_or(FsError::NoDevice)
 }
 fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
     let topology = *NAVI48_TOPOLOGY.lock();
@@ -811,6 +813,12 @@ pub fn query_against(snap: &Snapshot, query: u32, payload: [u32; 4]) -> Result<V
         // `read_mmr_reg { dword_offset, count, instance, flags }`.
         uapi::AMDGPU_INFO_READ_MMR_REG => read_mmr_reg(snap, *NAVI48_TOPOLOGY.lock(), payload),
         uapi::AMDGPU_INFO_TIMESTAMP => timestamp(snap, *NAVI48_CLOCK.lock()),
+        // amdgpu_info_ioctl: no running DPM is ENOENT (live owners answer
+        // the sensors through `dispatch_live`).
+        uapi::AMDGPU_INFO_SENSOR => Err(FsError::NotFound),
+        // No MAX_IBS query reaches here without an open; Linux still
+        // answers u32[AMDGPU_HW_IP_NUM].
+        uapi::AMDGPU_INFO_MAX_IBS => Ok(alloc::vec![0u8; 4 * uapi::AMDGPU_HW_IP_NUM as usize]),
         // `query_fw { fw_type, ip_instance, index }`.
         uapi::AMDGPU_INFO_FW_VERSION => {
             let firmware = *NAVI48_FIRMWARE.lock();
@@ -966,19 +974,22 @@ pub fn dispatch_for(
         }
         // amdgpu_ring_max_ibs per IP type: what one CS may carry on the
         // rings the open's card runs, 0 for the rest.
+        // Linux answers this unconditionally (amdgpu_ring_max_ibs, 0 for an
+        // IP with no ring): without a registered submitter the device-level
+        // answer, else zeros — never EINVAL.
         (uapi::AMDGPU_INFO_MAX_IBS, Some(vm)) => {
-            let engine = vm
-                .card()
-                .and_then(crate::amdgpu_cs::submitter)
-                .ok_or(FsError::InvalidData)?;
-            (0..uapi::AMDGPU_HW_IP_NUM)
-                .flat_map(|ip| {
-                    engine
-                        .ring_for(ip, 0, 0)
-                        .map_or(0, |ring| engine.max_ibs(ring))
-                        .to_le_bytes()
-                })
-                .collect()
+            match vm.card().and_then(crate::amdgpu_cs::submitter) {
+                Some(engine) => (0..uapi::AMDGPU_HW_IP_NUM)
+                    .flat_map(|ip| {
+                        engine
+                            .ring_for(ip, 0, 0)
+                            .map_or(0, |ring| engine.max_ibs(ring))
+                            .to_le_bytes()
+                    })
+                    .collect(),
+                None => query(which, payload)
+                    .unwrap_or_else(|_| alloc::vec![0u8; 4 * uapi::AMDGPU_HW_IP_NUM as usize]),
+            }
         }
         _ => query(which, payload)?,
     };

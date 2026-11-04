@@ -659,3 +659,59 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_dev_info_memory_link_and_cache
 );
+
+/// INFO queries Linux answers on Navi 22 that NARF used to refuse with the
+/// default arm's EINVAL (amdgpu_kms.c amdgpu_info_ioctl), and the errnos
+/// of the queries only a live owner can read.
+fn navi22_info_parity_with_linux() -> TestResult {
+    let s = snap(booted(true));
+    let sub = Submission::Wired;
+    // gfx_v10_0_set_gds_init: 64 KiB GDS, 64 GWS, 16 OA, compute partition.
+    let gds = match ask(&s, sub, uapi::AMDGPU_INFO_GDS_CONFIG, [0; 4]) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("GDS_CONFIG refused"),
+    };
+    if gds.len() != 32
+        || u32_at(&gds, 0) != 0
+        || u32_at(&gds, 1) != 0x10000
+        || u32_at(&gds, 2) != 0x10000
+        || u32_at(&gds, 4) != 64
+        || u32_at(&gds, 6) != 16
+    {
+        return TestResult::Fail("GDS_CONFIG differs from gfx_v10_0_set_gds_init");
+    }
+    // swsmu: no VCE clock states.
+    match ask(&s, sub, uapi::AMDGPU_INFO_VCE_CLOCK_TABLE, [0; 4]) {
+        Ok(b) if b.len() == 264 && b.iter().all(|&x| x == 0) => {}
+        _ => return TestResult::Fail("VCE_CLOCK_TABLE is not the empty swsmu table"),
+    }
+    match ask(&s, sub, uapi::AMDGPU_INFO_RAS_ENABLED_FEATURES, [0; 4]) {
+        Ok(b) if b == 0u64.to_le_bytes() => {}
+        _ => return TestResult::Fail("RAS_ENABLED_FEATURES is not mask 0"),
+    }
+    // An unpublished CRTC id: amdgpu_info_ioctl's EINVAL.
+    if ask(
+        &s,
+        sub,
+        uapi::AMDGPU_INFO_CRTC_FROM_ID,
+        [0xdead_beef, 0, 0, 0],
+    ) != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("CRTC_FROM_ID accepted an unknown CRTC");
+    }
+    // Without a live owner: ENOENT for sensors (DPM not running), ENODEV
+    // for the clock counter — never the unknown-query EINVAL.
+    if ask(&s, sub, uapi::AMDGPU_INFO_SENSOR, [0; 4]) != Err(FsError::NotFound) {
+        return TestResult::Fail("SENSOR without DPM is not ENOENT");
+    }
+    if ask(&s, sub, uapi::AMDGPU_INFO_TIMESTAMP, [0; 4]) != Err(FsError::NoDevice) {
+        return TestResult::Fail("TIMESTAMP without an owner is not ENODEV");
+    }
+    // MAX_IBS always answers u32[AMDGPU_HW_IP_NUM].
+    match ask(&s, sub, uapi::AMDGPU_INFO_MAX_IBS, [0; 4]) {
+        Ok(b) if b.len() == 4 * uapi::AMDGPU_HW_IP_NUM as usize => {}
+        _ => return TestResult::Fail("MAX_IBS is not u32[AMDGPU_HW_IP_NUM]"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu/navi22", navi22_info_parity_with_linux);

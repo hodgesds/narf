@@ -25,12 +25,14 @@ struct ClockLayout {
 }
 impl ClockLayout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, FsError> {
-        let profile = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did)
-            .ok_or(FsError::InvalidData)?;
-        bank(gpu, ip::HW_ID_GC, &[profile.gc_version], 0, 0).map_err(|_| FsError::InvalidData)?;
+        // A device whose counter cannot be located is unavailable to this
+        // query (ENODEV); Linux's gfx_v10 read has no failure for a client.
+        let profile =
+            crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(FsError::NoDevice)?;
+        bank(gpu, ip::HW_ID_GC, &[profile.gc_version], 0, 0).map_err(|_| FsError::NoDevice)?;
         let smuio = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_SMUIO, 0)
             .filter(|b| b.major == 11 && b.minor == 0)
-            .ok_or(FsError::InvalidData)?;
+            .ok_or(FsError::NoDevice)?;
         let base = bank(
             gpu,
             ip::HW_ID_SMUIO,
@@ -38,7 +40,7 @@ impl ClockLayout {
             1,
             LOWER,
         )
-        .map_err(|_| FsError::InvalidData)?;
+        .map_err(|_| FsError::NoDevice)?;
         let hdp = bank(
             gpu,
             ip::HW_ID_HDP,
@@ -46,7 +48,7 @@ impl ClockLayout {
             0,
             HDP_LIVE,
         )
-        .map_err(|_| FsError::InvalidData)?;
+        .map_err(|_| FsError::NoDevice)?;
         Ok(Self {
             upper: base + u64::from(UPPER) * 4,
             lower: base + u64::from(LOWER) * 4,
