@@ -3996,6 +3996,60 @@ fn pci_drain() -> bool {
     devices.iter().any(|dev| dev.drain_sync())
 }
 
+/// Transport-erased send/drain dispatch for AHB netdevs. Rust has no
+/// generic statics, so the AHB side cannot mirror PCI's `ACTIVE` list
+/// with one concrete `Ath11kNetdev` type: AHB-attached cores arrive as
+/// production types (`AhbIo`/`AhbIrq`/`AhbWlfw`) and as fixture fakes,
+/// all behind this trait. The object exposes only what the
+/// stack's send/drain callbacks need: the interface name, the dispatch
+/// cookie, and the two ring operations. The method names deliberately
+/// differ from `Ath11kNetdev`'s own (`name`, `dispatch_cookie`,
+/// `queue_tx`, `drain_sync`): this trait lives in the same module, so
+/// same-named methods would make every call site ambiguous.
+trait AhbDispatch: Send + Sync {
+    fn dispatch_name(&self) -> &str;
+    fn cookie(&self) -> u64;
+    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
+    fn drain(&self) -> bool;
+}
+
+impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> AhbDispatch for Ath11kNetdev<Io, Irq, Q> {
+    fn dispatch_name(&self) -> &str {
+        narf_net::Interface::name(self)
+    }
+    fn cookie(&self) -> u64 {
+        self.dispatch_cookie()
+    }
+    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+        self.queue_tx(bytes, meta)
+    }
+    fn drain(&self) -> bool {
+        self.drain_sync()
+    }
+}
+
+/// Live AHB netdevs, the AHB counterpart of `ACTIVE`. Entries are
+/// pushed at registration and never removed: the PCI list has the same
+/// shape (see `register_pci_netdev`), and the dispatch lookup below
+/// filters on the cookie, so a stale entry can only ever route to its
+/// own deleted device, which refuses transmits.
+static AHB_ACTIVE: IrqSafeSpinLock<Vec<Arc<dyn AhbDispatch>>> = IrqSafeSpinLock::new(Vec::new());
+
+fn ahb_send_context(cookie: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let dev = AHB_ACTIVE
+        .lock()
+        .iter()
+        .find(|dev| dev.cookie() == cookie)
+        .cloned()
+        .ok_or(())?;
+    dev.send(bytes, meta)
+}
+
+fn ahb_drain() -> bool {
+    let devices = AHB_ACTIVE.lock().clone();
+    devices.iter().any(|dev| dev.drain())
+}
+
 fn pci_link(name: &str, up: bool) {
     // netif_carrier_on / netif_carrier_off (IFF_UP is the stack's).
     narf_net::iface::set_link_metadata(name, up, None, None);
@@ -4038,10 +4092,12 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> narf_net::iface::OpenStopTarget for AdminTa
 }
 
 /// Netdevs the capability registry holds (`Box<dyn Interface>`): a view
-/// on the shared device.
-struct Registered(Arc<PciNetdev>);
+/// on the shared device. Generic over the transport: the PCI and AHB
+/// netdevs are the same device shape with different `Io`/`Irq`/`Q` types,
+/// and the registry view does not touch the transport.
+struct Registered<Io: RtIo, Irq: DpIrq, Q: RtQmi>(Arc<Ath11kNetdev<Io, Irq, Q>>);
 
-impl Interface for Registered {
+impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Interface for Registered<Io, Irq, Q> {
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -4065,7 +4121,9 @@ impl Interface for Registered {
     }
 }
 
-fn pci_sinks() -> Sinks {
+/// Sinks shared by the PCI and AHB netdevs: every sink below is keyed
+/// by interface name or is a stack callback, never by transport.
+fn netdev_sinks() -> Sinks {
     Sinks {
         rx: narf_net::iface::on_rx_frame_from,
         link: pci_link,
@@ -4131,7 +4189,7 @@ fn pci_virtual_create(
             parent.shared.clone(),
             mac,
             mac_addr,
-            pci_sinks(),
+            netdev_sinks(),
             vdev_id,
             iftype,
             Some(lifecycle),
@@ -4254,27 +4312,32 @@ fn pci_radio_recover<'a>(
 /// Common registration for the initial netdev and every child virtual
 /// interface.  Each gets a context-dispatched stack send hook and its own
 /// NARF rings; only the initial netdev is a system-PM owner.
-fn register_pci_netdev(
-    dev: Arc<PciNetdev>,
+/// Shared registration tail for the initial netdev, PCI and AHB alike:
+/// stack registration, driver info, offloads, down/no-carrier link
+/// state, the open/stop target, the RX drain, the capability registry,
+/// the wireless registry, and the `run`/`tx_pump` tasks. The caller
+/// pushes the device to its transport's active list first, so the
+/// dispatch callbacks can route to it from the moment the stack knows
+/// the name. Factoring this out keeps PCI and AHB registration from
+/// drifting apart — the exact failure mode the AHB side just fixed.
+fn register_netdev<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
+    dev: Arc<Ath11kNetdev<Io, Irq, Q>>,
     tx_cons: Consumer<Frame, TX_RING_N>,
-    system_pm_owner: bool,
+    system_pm: Option<Arc<dyn narf_power::system_pm::AsyncSystemPm>>,
+    driver_name: &'static str,
+    send_context: narf_net::iface::SendCtxFn,
+    drain: fn() -> bool,
 ) {
     use core::fmt::Write as _;
     let name = dev.name();
-    ACTIVE.lock().push(dev.clone());
     // cfg80211 → mac80211 calls ath11k's WoW hooks from the platform PM
     // sequence.  This registry is NARF's equivalent and keeps the WMI/MHI
     // exchanges outside the later interrupt-gated device-PM fan-out.
-    if system_pm_owner {
-        narf_power::system_pm::register_async_system_pm(name, dev.clone());
+    if let Some(pm) = system_pm {
+        narf_power::system_pm::register_async_system_pm(name, pm);
     }
-    narf_net::iface::register_with_context(
-        name,
-        dev.mac(),
-        dev.dispatch_cookie(),
-        pci_send_context,
-    );
-    narf_net::iface::set_driver_info(name, "ath11k_pci", None, alloc::string::String::new());
+    narf_net::iface::register_with_context(name, dev.mac(), dev.dispatch_cookie(), send_context);
+    narf_net::iface::set_driver_info(name, driver_name, None, alloc::string::String::new());
     // ath11k_mac_register: hw->netdev_features = NETIF_F_HW_CSUM.
     narf_net::iface::set_offloads(name, super::tx_offload::OFFLOADS);
     // register_netdevice: down, no carrier; IFF_UP opens the hardware.
@@ -4282,7 +4345,7 @@ fn register_pci_netdev(
     if let Some(registration) = narf_net::iface::lookup(name) {
         narf_net::iface::set_open_stop_target(&registration, dev.admin_target());
     }
-    narf_net::iface::install_rx_drain(pci_drain);
+    narf_net::iface::install_rx_drain(drain);
     match narf_net::trusted_net_authority().and_then(|a| a.derive().ok()) {
         Some(authority) => {
             if let Err(e) = narf_net::registry().register(&authority, Registered(dev.clone())) {
@@ -4316,6 +4379,90 @@ fn register_pci_netdev(
     narf_scheduler::spawn(async move { d.tx_pump(tx_cons).await });
 }
 
+fn register_pci_netdev(
+    dev: Arc<PciNetdev>,
+    tx_cons: Consumer<Frame, TX_RING_N>,
+    system_pm_owner: bool,
+) {
+    ACTIVE.lock().push(dev.clone());
+    let system_pm = system_pm_owner.then(|| {
+        let pm: Arc<dyn narf_power::system_pm::AsyncSystemPm> = dev.clone();
+        pm
+    });
+    register_netdev(
+        dev,
+        tx_cons,
+        system_pm,
+        "ath11k_pci",
+        pci_send_context,
+        pci_drain,
+    );
+}
+
+/// `ieee80211_register_hw` + `ieee80211_if_add("wlan%d")` for an
+/// AHB-attached core: the counterpart of [`register_pci`], with the
+/// same lifecycle expectations — one initial netdev on vdev 0, station
+/// iftype, registered with `narf_net` + `narf_wireless`, down with no
+/// carrier until IFF_UP, and the autoconnect command-line handling.
+/// Two deliberate non-goals, both named rather than smuggled in:
+/// no system-PM ownership (the `AsyncSystemPm` implementation is
+/// PCI-concrete and MHI-shaped; an AHB suspend path is follow-up
+/// work), and no virtual interfaces (the `VirtualLifecycle` hooks
+/// route through the PCI active list; generalizing them belongs with
+/// multi-vdev/multi-pdev work).
+pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
+    shared: Arc<Shared<Io, Irq, Q>>,
+    mac: RtMac<Io, Irq, Q>,
+    mac_addr: [u8; 6],
+) -> &'static str {
+    use core::fmt::Write as _;
+    let name = narf_net::iface::reserve_name("wlan%d");
+    let (dev, tx_cons) = Ath11kNetdev::new_on_vdev_with_lifecycle(
+        name,
+        shared,
+        mac,
+        mac_addr,
+        netdev_sinks(),
+        0,
+        2,
+        None,
+    );
+    let dev = Arc::new(dev);
+    AHB_ACTIVE.lock().push(dev.clone());
+    register_netdev(
+        dev.clone(),
+        tx_cons,
+        None,
+        "ath11k_ahb",
+        ahb_send_context,
+        ahb_drain,
+    );
+    // Bring-up aid: `ath11k.scan=1` / `ath11k.ssid=…` (autoconnect.rs).
+    match super::autoconnect::parse(narf_boot::cmdline()) {
+        Ok(Some(cfg)) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: {}: autoconnect {:?}",
+                name,
+                cfg
+            );
+            // Like `ip link set wlan0 up` before wpa_supplicant connects.
+            narf_net::iface::set_link_state(name, true);
+            narf_scheduler::spawn(super::autoconnect::run(dev, cfg));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: {}: ignoring ath11k.* cmdline: {:?}",
+                name,
+                e
+            );
+        }
+    }
+    name
+}
+
 /// `ieee80211_register_hw` + `ieee80211_if_add("wlan%d")`: name the
 /// initial netdev, bind it to WMI vdev zero, and make it the physical radio's
 /// system-PM owner. Later `NL80211_CMD_NEW_INTERFACE` calls share its
@@ -4338,7 +4485,7 @@ pub fn register_pci(
         shared,
         mac,
         mac_addr,
-        pci_sinks(),
+        netdev_sinks(),
         0,
         2,
         Some(lifecycle),
@@ -4370,3 +4517,7 @@ pub fn register_pci(
     }
     name
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "ahb_netdev_tests.rs"]
+mod ahb_netdev_tests;

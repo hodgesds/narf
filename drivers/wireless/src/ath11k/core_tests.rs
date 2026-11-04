@@ -20,7 +20,7 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -29,6 +29,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_lib::sync::IrqSafeSpinLock;
 
 use super::ce::{self, CeIrq, CeMsi, CeRecv, HOST_CE_CONFIG_QCA6390};
 use super::ce_tests::FakeChip;
@@ -101,11 +102,11 @@ enum Ev {
     Hook(&'static str),
 }
 
-type Trace = Rc<RefCell<Vec<Ev>>>;
+type Trace = Arc<IrqSafeSpinLock<Vec<Ev>>>;
 
 /// Trace without the TX payloads, for order checks.
 fn shape(t: &Trace) -> Vec<Ev> {
-    t.borrow()
+    t.lock()
         .iter()
         .map(|e| match e {
             Ev::Tx { pipe, tid, .. } => Ev::Tx {
@@ -146,7 +147,7 @@ struct FakeQmi {
 
 impl QmiFw for FakeQmi {
     async fn firmware_start(&mut self, mode: u32, shadow_reg_v2: &[u32]) -> Result<(), WlfwError> {
-        self.trace.borrow_mut().push(Ev::QmiStart {
+        self.trace.lock().push(Ev::QmiStart {
             mode,
             shadow: shadow_reg_v2.to_vec(),
         });
@@ -156,7 +157,7 @@ impl QmiFw for FakeQmi {
         }
     }
     async fn firmware_stop(&mut self) {
-        self.trace.borrow_mut().push(Ev::QmiStop);
+        self.trace.lock().push(Ev::QmiStop);
     }
 }
 
@@ -485,25 +486,25 @@ impl Hif for FakeHif {
         WCN6855_SHADOW_REG_V2.to_vec()
     }
     fn init_pipes(&mut self) -> Result<(), TransportError> {
-        self.trace.borrow_mut().push(Ev::InitPipes);
+        self.trace.lock().push(Ev::InitPipes);
         if self.fail_init_pipes {
             return Err(TransportError::new(ce::step::INIT_RING, 3, 22));
         }
         Ok(())
     }
     fn start(&mut self) {
-        self.trace.borrow_mut().push(Ev::HifStart);
+        self.trace.lock().push(Ev::HifStart);
         self.fw.on_start();
         self.collect();
     }
     fn stop(&mut self) {
-        self.trace.borrow_mut().push(Ev::HifStop);
+        self.trace.lock().push(Ev::HifStop);
     }
     fn send(&mut self, pipe: u8, frame: &[u8], transfer_id: u16) -> Result<(), TransportError> {
         if self.fail_send_pipe == Some(pipe) {
             return Err(TransportError::new(ce::step::RING_FULL, pipe as u32, 105));
         }
-        self.trace.borrow_mut().push(Ev::Tx {
+        self.trace.lock().push(Ev::Tx {
             pipe,
             tid: transfer_id,
             frame: frame.to_vec(),
@@ -519,7 +520,7 @@ impl Hif for FakeHif {
         HOST_CE_CONFIG_QCA6390.get(pipe as usize)?.recv_cb
     }
     fn poll_all(&mut self) {
-        self.trace.borrow_mut().push(Ev::PollAll);
+        self.trace.lock().push(Ev::PollAll);
         self.fw.on_poll();
         self.collect();
     }
@@ -542,27 +543,27 @@ impl<H: Hif, Q: QmiFw> CoreHooks<H, Q> for RecHooks {
     fn dp_alloc(&mut self, core: &mut Ath11kCore<H, Q>) -> Result<(), TransportError> {
         // Before core_start: no endpoint yet.
         let _ = core.htt_ep.is_none();
-        self.trace.borrow_mut().push(Ev::Hook("dp_alloc"));
+        self.trace.lock().push(Ev::Hook("dp_alloc"));
         Ok(())
     }
     fn pdev_reo_setup(&mut self, core: &mut Ath11kCore<H, Q>) -> Result<(), TransportError> {
         let _ = core.svc_ext.is_some();
-        self.trace.borrow_mut().push(Ev::Hook("reo_setup"));
+        self.trace.lock().push(Ev::Hook("reo_setup"));
         Ok(())
     }
     async fn htt_ver_req(&mut self, core: &mut Ath11kCore<H, Q>) -> Result<(), TransportError> {
-        self.trace.borrow_mut().push(Ev::Hook("htt_ver_req"));
+        self.trace.lock().push(Ev::Hook("htt_ver_req"));
         // HTT_H2T_MSG_TYPE_VERSION_REQ (0), as the DP layer will send it.
         core.htt_send(&[0, 0, 0, 0])?;
         self.htt_reply = core.wait_htt(3000).await;
         Ok(())
     }
     async fn pdev_create(&mut self, _core: &mut Ath11kCore<H, Q>) -> Result<(), TransportError> {
-        self.trace.borrow_mut().push(Ev::Hook("pdev_create"));
+        self.trace.lock().push(Ev::Hook("pdev_create"));
         Ok(())
     }
     fn irq_enable(&mut self, _core: &mut Ath11kCore<H, Q>) {
-        self.trace.borrow_mut().push(Ev::Hook("irq_enable"));
+        self.trace.lock().push(Ev::Hook("irq_enable"));
     }
 }
 
@@ -573,7 +574,7 @@ pub(super) fn cfg() -> CoreConfig {
 type Fake = Ath11kCore<FakeHif, FakeQmi>;
 
 fn fake_core(s: Script) -> (Fake, Trace) {
-    let trace: Trace = Rc::new(RefCell::new(Vec::new()));
+    let trace: Trace = Arc::new(IrqSafeSpinLock::new(Vec::new()));
     let hif = FakeHif::new(trace.clone(), s);
     let qmi = FakeQmi {
         trace: trace.clone(),
@@ -653,7 +654,7 @@ fn golden_set_hw_mode() -> Vec<u8> {
 }
 
 fn tx_frames(t: &Trace) -> Vec<(u8, u16, Vec<u8>)> {
-    t.borrow()
+    t.lock()
         .iter()
         .filter_map(|e| match e {
             Ev::Tx { pipe, tid, frame } => Some((*pipe, *tid, frame.clone())),
@@ -734,7 +735,7 @@ fn smoke_ath11k_core_bring_up_order_wcn6855() -> TestResult {
     ];
     ensure!(shape(&trace) == want, "Linux core start order");
     // QMI: the HAL's WCN6855 shadow list, mode NORMAL.
-    match trace.borrow().first() {
+    match trace.lock().first() {
         Some(Ev::QmiStart { mode, shadow }) => ensure!(
             *mode == 0 && shadow[..] == WCN6855_SHADOW_REG_V2,
             "firmware_start(NORMAL, WCN6855 shadow v2)"
@@ -1392,7 +1393,7 @@ fn core_over_real_ce(revision: HwRev) -> TestResult {
         on_start: noop,
         clock,
     };
-    let trace: Trace = Rc::new(RefCell::new(Vec::new()));
+    let trace: Trace = Arc::new(IrqSafeSpinLock::new(Vec::new()));
     let qmi = FakeQmi {
         trace: trace.clone(),
         fail: None,
@@ -1409,7 +1410,7 @@ fn core_over_real_ce(revision: HwRev) -> TestResult {
         err == 0 && stage == narf_memory::diag::WifiStage::Commands,
         "no latch, stage commands"
     );
-    match trace.borrow().first() {
+    match trace.lock().first() {
         Some(Ev::QmiStart { shadow, .. }) => ensure!(
             shadow[..]
                 == if revision == HwRev::Qca6390Hw20 {
