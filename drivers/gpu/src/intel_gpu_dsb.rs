@@ -237,7 +237,13 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             return Err(FsError::Unsupported);
         }
         // Every Gen12 family shares one GGTT PTE profile without a PAT field.
-        Self::reserve_profile(io, bar_len, Some(latencies), Generation::TigerLake, !display13)
+        Self::reserve_profile(
+            io,
+            bar_len,
+            Some(latencies),
+            Generation::TigerLake,
+            !display13,
+        )
     }
     fn reserve_profile(
         io: M,

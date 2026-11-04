@@ -551,7 +551,7 @@ impl UserContext {
         self.state.lock().policy.0 = map_i915_prio_to_guc_prio(priority);
     }
     /// The GuC priority a request queued now would carry.
-    #[cfg(feature = "kernel-test")]
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn guc_priority(&self) -> u32 {
         self.state.lock().policy.0
     }
@@ -597,7 +597,7 @@ impl UserContext {
     pub(crate) fn request_ban(&self) {
         self.state.lock().banned = true;
     }
-    #[cfg(feature = "kernel-test")]
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn busy(&self) -> bool {
         self.state.lock().busy
     }

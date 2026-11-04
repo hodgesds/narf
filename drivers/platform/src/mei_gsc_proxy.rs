@@ -82,8 +82,8 @@ use narf_drivers::gsc_proxy::{
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::mei::{
-    uuid_le, BarRegs, HeciRegs, MeClientInfo, MeiClHandle, MeiDevice, MeiUuid, MEI_DEV_ARL_H,
-    MEI_DEV_ARL_S, MEI_DEV_MTL_M,
+    uuid_le, BarRegs, HeciRegs, MeClientInfo, MeiClHandle, MeiDevState, MeiDevice, MeiUuid,
+    MEI_DEV_ARL_H, MEI_DEV_ARL_S, MEI_DEV_MTL_M,
 };
 
 /// `MEI_UUID_GSC_PROXY`: `UUID_LE(0xf73db04, 0x97ab, 0x4125, 0xb8,
@@ -228,30 +228,63 @@ pub fn remove<R: HeciRegs + 'static>(bound: &GscProxyBound<R>) -> Result<(), i32
 
 static BOUND: IrqSafeSpinLock<Option<GscProxyBound>> = IrqSafeSpinLock::new(None);
 
+fn gsc_opted_in() -> bool {
+    let args = narf_boot::args::KernelCmdline::new(narf_boot::cmdline());
+    let mut enabled = false;
+    for token in args.tokens().take_while(|token| *token != "--") {
+        let Some(rest) = token.strip_prefix("narf.intel.gsc") else {
+            continue;
+        };
+        if rest.is_empty() {
+            return false;
+        }
+        if let Some(value) = rest.strip_prefix('=') {
+            if enabled || value != "1" {
+                return false;
+            }
+            enabled = true;
+        } else {
+            return false;
+        }
+    }
+    enabled
+}
+
 /// Bind the client on the probed HECI device, replacing any earlier
 /// binding. Called from the MEI probe and after resume. Silent on
-/// HECI functions this client does not bind on.
+/// HECI functions this client does not bind on or when `narf.intel.gsc=1`
+/// is not opted in. Spawns asynchronously so probe is non-blocking.
 pub fn bind(dev: &Arc<MeiDevice>) {
     if !heci_carries_gsc_proxy(dev.device_id) {
         return;
     }
-    unbind();
-    use core::fmt::Write as _;
-    match probe(dev) {
-        Ok(bound) => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "  mei: gsc proxy client connected (host {}, fw {}), component master gen {}",
-                bound.proxy.cl.host_addr,
-                bound.proxy.cl.me_addr,
-                bound.generation,
-            );
-            *BOUND.lock() = Some(bound);
-        }
-        Err(e) => {
-            let _ = writeln!(narf_console::Writer, "  mei: gsc proxy not bound: {:?}", e);
-        }
+    if !gsc_opted_in() {
+        return;
     }
+    unbind();
+    let dev = dev.clone();
+    narf_scheduler::spawn(async move {
+        use core::fmt::Write as _;
+        match probe(&dev) {
+            Ok(bound) => {
+                if dev.state() == MeiDevState::Enabled {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  mei: gsc proxy client connected (host {}, fw {}), component master gen {}",
+                        bound.proxy.cl.host_addr,
+                        bound.proxy.cl.me_addr,
+                        bound.generation,
+                    );
+                    *BOUND.lock() = Some(bound);
+                } else {
+                    let _ = remove(&bound);
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(narf_console::Writer, "  mei: gsc proxy not bound: {:?}", e);
+            }
+        }
+    });
 }
 
 /// Unbind the production client, if bound.

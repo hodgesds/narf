@@ -1322,8 +1322,6 @@ impl<R: HeciRegs> MeiDevice<R> {
             return Err(MeiError::MessageTooLong);
         }
 
-        let _g = self.io.lock();
-
         let have_room = narf_scheduler::responsive_spin_until(
             || matches!(self.hbuf_empty_slots(), Some(n) if n as u32 >= slots_needed),
             narf_time::Deadline::after_ms(self.timeouts.hbuf_drain_ms),
@@ -1332,6 +1330,7 @@ impl<R: HeciRegs> MeiDevice<R> {
             return Err(MeiError::HostBufferFull);
         }
 
+        let _g = self.io.lock();
         self.push_packet(hdr, payload);
         Ok(())
     }
@@ -1347,13 +1346,15 @@ impl<R: HeciRegs> MeiDevice<R> {
             return Err(MeiError::HbmTimeout);
         }
 
-        let _g = self.io.lock();
+        let (hdr, slots) = {
+            let _g = self.io.lock();
+            let hdr = MeiMsgHdr::from_u32(self.regs.read32(REG_ME_CB_RW));
+            let slots = data_to_slots(hdr.length as usize);
+            (hdr, slots)
+        };
 
-        let hdr = MeiMsgHdr::from_u32(self.regs.read32(REG_ME_CB_RW));
-
-        let slots = data_to_slots(hdr.length as usize);
-        // `mei_irq_read_handler` returns -ENODATA and retries when the
-        // payload is not all there yet; wait for it, within the budget.
+        // Wait for the remaining slots without holding the lock so we never
+        // busy-wait with interrupts disabled.
         let complete = narf_scheduler::responsive_spin_until(
             || me_filled_slots(self.regs.read32(REG_ME_CSR_HA)) as u32 >= slots,
             narf_time::Deadline::after_ms(self.timeouts.hbm_ms),
@@ -1361,6 +1362,8 @@ impl<R: HeciRegs> MeiDevice<R> {
         if !complete {
             return Err(MeiError::HbmTimeout);
         }
+
+        let _g = self.io.lock();
         out.clear();
         out.reserve(hdr.length as usize);
         for _ in 0..slots {

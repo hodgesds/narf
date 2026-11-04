@@ -2031,6 +2031,7 @@ dependencies = [
  "narf-acpi",
  "narf-aml",
  "narf-arch",
+ "narf-boot",
  "narf-bus",
  "narf-capabilities",
  "narf-console",

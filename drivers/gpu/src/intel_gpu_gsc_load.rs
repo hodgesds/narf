@@ -281,6 +281,52 @@ pub trait CsmeProxy {
 static CSME: IrqSafeSpinLock<(Option<Box<dyn CsmeProxy + Send>>, u64)> =
     IrqSafeSpinLock::new((None, 0));
 
+struct GscProxyCsme(narf_drivers::gsc_proxy::GscProxyBinding);
+
+impl CsmeProxy for GscProxyCsme {
+    fn send(&mut self, message: &[u8]) -> Result<usize, i32> {
+        self.0.send(message)
+    }
+    fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, i32> {
+        self.0.recv(buffer)
+    }
+}
+
+pub const INTEL_DISPLAY_COMPONENT: narf_drivers::gsc_proxy::DisplayComponent =
+    narf_drivers::gsc_proxy::DisplayComponent {
+        segment: 0,
+        bus: 0,
+        device: 2,
+        function: 0,
+        vendor: narf_drivers::gsc_proxy::PCI_VENDOR_ID_INTEL,
+        class: narf_drivers::gsc_proxy::PCI_CLASS_DISPLAY_VGA_CODE,
+    };
+
+static MEI_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Synchronize any registered MEI GSC proxy component master with the GPU's CSME slot.
+/// A generation change in the registered binding is treated as a rebind.
+pub(crate) fn sync_csme_proxy() {
+    let binding = narf_drivers::gsc_proxy::lookup(&INTEL_DISPLAY_COMPONENT);
+    let cur_gen = MEI_GENERATION.load(core::sync::atomic::Ordering::Acquire);
+    match binding {
+        Some(b) => {
+            if b.generation != cur_gen {
+                let _ = unregister_csme_proxy();
+                if register_csme_proxy(Box::new(GscProxyCsme(b.clone()))).is_ok() {
+                    MEI_GENERATION.store(b.generation, core::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+        None => {
+            if cur_gen != 0 {
+                let _ = unregister_csme_proxy();
+                MEI_GENERATION.store(0, core::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
+
 /// gsc_proxy_component_bind: hand the GSC proxy its CSME end. A component
 /// already bound is replaced only after `unregister_csme_proxy`. The next
 /// GT1 start allocates the proxy channel and xe_gsc_proxy_start runs over
@@ -307,6 +353,7 @@ pub fn unregister_csme_proxy() -> Option<Box<dyn CsmeProxy + Send>> {
 
 /// A component is bound (xe_gsc_proxy_irq_handler drops requests otherwise).
 pub(crate) fn csme_bound() -> bool {
+    sync_csme_proxy();
     CSME.lock().0.is_some()
 }
 
@@ -317,6 +364,7 @@ pub(crate) fn csme_bound() -> bool {
 pub(crate) fn with_csme<R>(
     f: impl FnOnce(Option<&mut (dyn CsmeProxy + Send + 'static)>) -> R,
 ) -> R {
+    sync_csme_proxy();
     let (mut taken, generation) = {
         let mut slot = CSME.lock();
         (slot.0.take(), slot.1)
