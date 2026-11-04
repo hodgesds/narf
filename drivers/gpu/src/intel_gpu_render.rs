@@ -42,16 +42,16 @@ const CONTEXT_MAX_USER_PRIORITY: i64 = 1023;
 /// intel_engine_user.c::set_scheduler_caps gives every GuC device ENABLED
 /// and PRIORITY (sched_engine->schedule), and PREEMPTION, ENGINE_BUSY_STATS
 /// and STATIC_PRIORITY_MAP from its engine flags; with no uabi engine the
-/// caps are 0. NARF advertises ENABLED only while a live owner admits
-/// submission. PRIORITY stays clear until a context priority reaches the
-/// GuC registration (map_i915_prio_to_guc_prio): an unsupported capability
-/// stays unadvertised, so validate_priority returns -ENODEV for every
-/// PRIORITY set, exactly as Linux does on a device without CAP_PRIORITY.
-/// PREEMPTION, BUSY_STATS and STATIC_PRIORITY_MAP stay clear because no
-/// preempt-to-idle cancellation, busy-stat or priority-map contract exists.
+/// caps are 0. NARF advertises ENABLED and PRIORITY while a live owner admits
+/// submission: every hardware member registers with its context's priority
+/// through map_i915_prio_to_guc_prio, and a request queued behind a job in
+/// flight raises that job's registered GuC priority
+/// (UserContext::queue_request). PREEMPTION, BUSY_STATS and
+/// STATIC_PRIORITY_MAP stay clear because no preempt-to-idle cancellation,
+/// busy-stat or priority-map contract exists.
 fn scheduler_caps(info: &DeviceInfo) -> i32 {
     if info.submission_ready() {
-        SCHEDULER_CAP_ENABLED
+        SCHEDULER_CAP_ENABLED | SCHEDULER_CAP_PRIORITY
     } else {
         0
     }
@@ -232,24 +232,31 @@ struct Context {
     /// Always true: clearing it needs I915_SCHEDULER_CAP_PREEMPTION, which
     /// NARF does not advertise (scheduler_caps).
     persistence: bool,
-    /// ctx->sched.priority, I915_CONTEXT_MIN..=MAX_USER_PRIORITY. LINUX-GAP:
-    /// map_i915_prio_to_guc_prio never reaches GuC; every registration keeps
-    /// UserContext's fixed policy, and no SET_CONTEXT_PRIORITY is sent.
+    /// ctx->sched.priority, I915_CONTEXT_MIN..=MAX_USER_PRIORITY. Every
+    /// hardware member, including ones created later, stores
+    /// map_i915_prio_to_guc_prio of it for its next GuC registration.
+    /// LINUX-GAP: only a submission on the same hardware context raises a
+    /// job in flight; __i915_schedule's bumps through object and fence
+    /// dependencies on other contexts are not modelled.
     priority: i32,
 }
 
 impl Context {
+    /// proto_context_create's priority is I915_PRIORITY_NORMAL.
     fn new(vm: Arc<Vm>, finalized: bool) -> Self {
         use crate::intel_gpu_engine::Engine;
         let no_error_capture = Arc::new(crate::intel_gpu_user::CapturePolicy::default());
+        let priority = 0;
         Self {
             user: crate::intel_gpu_user::UserContext::for_i915_engine(
                 Engine::Rcs0,
                 no_error_capture.clone(),
+                priority,
             ),
             copy: crate::intel_gpu_user::UserContext::for_i915_engine(
                 Engine::Bcs0,
                 no_error_capture.clone(),
+                priority,
             ),
             media: BTreeMap::new(),
             sseu_media: None,
@@ -261,7 +268,7 @@ impl Context {
             bannable: true,
             recoverable: false,
             persistence: true,
-            priority: 0,
+            priority,
         }
     }
 
@@ -308,6 +315,7 @@ impl Context {
                     let user = crate::intel_gpu_user::UserContext::for_i915_engine(
                         engine,
                         self.no_error_capture.clone(),
+                        self.priority,
                     );
                     if self.low_latency {
                         user.configure_low_latency()?;
@@ -544,6 +552,17 @@ impl Namespaces {
         context.select(ring, media)
     }
 
+    /// setparam_ioctl's lookup (-ENOENT), which precedes every parameter
+    /// check and so every capable() question.
+    fn lookup(&mut self, id: u32) -> Result<(), FsError> {
+        self.initialize();
+        if self.contexts.contains_key(&id) {
+            Ok(())
+        } else {
+            Err(FsError::NotFound)
+        }
+    }
+
     /// ENGINES may only be set once, on a proto-context.
     fn engines_settable(&mut self, id: u32) -> Result<(), FsError> {
         self.initialize();
@@ -581,6 +600,7 @@ impl Namespaces {
                             let user = crate::intel_gpu_user::UserContext::for_i915_placements(
                                 placements,
                                 context.no_error_capture.clone(),
+                                context.priority,
                             )?;
                             if context.low_latency {
                                 user.configure_low_latency()?;
@@ -673,10 +693,17 @@ impl Namespaces {
                 context.recoverable = value != 0;
             }
             abi::CONTEXT_PARAM_PRIORITY => {
-                // set_proto_ctx_param stores it; ctx_setparam's set_priority
-                // also retunes semaphore use, which GuC submission never has.
+                // set_proto_ctx_param stores pc->sched.priority; ctx_setparam's
+                // set_priority stores ctx->sched.priority and also retunes
+                // semaphore use, which GuC submission never has. Neither
+                // sends GuC anything: each hardware member stores the GuC
+                // band for the requests queued from now on, and the next
+                // request on a member raises its job in flight (exec_ioctl).
                 validate_priority(size, value, facts)?;
                 context.priority = value as i64 as i32;
+                for user in context.users() {
+                    user.set_i915_priority(context.priority);
+                }
             }
             abi::CONTEXT_PARAM_PERSISTENCE => {
                 if size != 0 {
@@ -980,6 +1007,11 @@ impl RenderFile {
             namespaces.select(request.context_id, request.ring, info)?
         };
         let backend = info.backend.as_ref().ok_or(FsError::NotImplemented)?;
+        // i915_request_add queues this request at the context's current
+        // priority behind every earlier job on its timeline, and
+        // __i915_schedule bumps them before anything waits; NARF's request
+        // waits below.
+        let mut queued = context.queue_request();
         let _order = context.serial.lock().await;
         sync.wait().await;
         if let Some(previous) = context.last() {
@@ -1004,6 +1036,7 @@ impl RenderFile {
                 }
             }
             let batch = request.prepare_user(status.platform)?;
+            queued.stage();
             let result = if output {
                 let address = arg.checked_add(56).ok_or(FsError::BadAddress)?;
                 backend
@@ -1503,6 +1536,12 @@ impl RenderFile {
                         | GtPlatform::Alchemist
                         | GtPlatform::Integrated(Generation::MeteorLake)
                 ) && crate::intel_gpu_xe::low_latency_supported(info);
+                if set {
+                    // A missing context is -ENOENT before validate_priority
+                    // or BANNABLE asks capable(); parameter() looks it up
+                    // again under the lock.
+                    self.namespaces.lock().lookup(u32_at(&request, 0))?;
+                }
                 let facts = ParamFacts::sample(info, &request, set, low_latency_admitted);
                 self.namespaces
                     .lock()
