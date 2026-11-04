@@ -59,7 +59,10 @@
 //! [`sdio_bridge`] supplies an adapter over an `SdioFunction` host.
 //! Standard PCI SDHCI/card matches now feed the firmware loader, F2
 //! FIFO service, station control and registered `WirelessNetIface` path.
-//! Platform-specific power/clock discovery and hardware acceptance remain.
+//! [`host_ports`] adds the additional host ports: a gSPI `Transport`
+//! over a registered SPI bus, plus the described-but-blocked platform
+//! SDHCI port. Platform-specific power/clock discovery and hardware
+//! acceptance remain.
 
 #![allow(dead_code)]
 
@@ -74,6 +77,7 @@ pub mod events;
 pub mod firmware;
 pub mod fullmac;
 pub mod gspi;
+pub mod host_ports;
 pub mod interface;
 pub mod ioctl;
 pub mod iovar;
@@ -266,6 +270,8 @@ pub mod tests {
 mod external_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod fullmac_fixture;
+#[cfg(any(test, feature = "kernel-test"))]
+mod host_ports_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod mfp_fixture;
 #[cfg(any(test, feature = "kernel-test"))]
