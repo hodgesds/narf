@@ -430,7 +430,7 @@ fn smoke_intel_and_amd_cpu_alias_providers_coexist_without_cross_release() -> Te
     let (handle, _) = amd.create_kernel_system(PAGE, &gate).unwrap();
     drop(gate);
     let a = amd
-        .mmap_backing(u64::from(handle) << 12, PAGE as usize)
+        .mmap_backing(crate::amdgpu_gem::mmap_offset(handle), PAGE as usize)
         .unwrap();
     let intel = GemState::new();
     let (_, object) = create(&intel, 1);
