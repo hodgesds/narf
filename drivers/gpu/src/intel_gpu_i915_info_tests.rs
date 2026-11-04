@@ -143,7 +143,8 @@ fn smoke_i915_observed_discovery_and_immutable_facts_after_loss() -> TestResult 
                 ),
                 (51, 19_200_000),
                 (57, 38_400_000),
-                (41, i32::from(live)),
+                // I915_SCHEDULER_CAP_ENABLED | I915_SCHEDULER_CAP_PRIORITY.
+                (41, if live { 3 } else { 0 }),
             ] {
                 assert_eq!(parameter(&file, &info, &user, param), Ok(value));
             }
@@ -408,10 +409,11 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
         context_param(&file, &info, &user, false, id, 0, param, 0).map(|(_, value)| value)
     };
     let neg = |value: i64| value as u64;
-    // I915_SCHEDULER_CAP_ENABLED only while live: PRIORITY is unadvertised
-    // until a context priority reaches the GuC registration.
-    assert_eq!(parameter(&file, &info, &user, 41), Ok(1));
-    // The lookup precedes every size and parameter check.
+    // I915_SCHEDULER_CAP_ENABLED | I915_SCHEDULER_CAP_PRIORITY while live.
+    assert_eq!(parameter(&file, &info, &user, 41), Ok(3));
+    // The lookup precedes every size and parameter check, and so every
+    // capable(): an in-size BANNABLE clear or positive PRIORITY on a
+    // missing context is -ENOENT without a capability question.
     for param in [4, 5, 6, 8, 9, 11, 13, u64::MAX] {
         assert_eq!(set(99, 1, param, 0), Err(FsError::NotFound));
         assert_eq!(
@@ -419,7 +421,9 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
             Err(FsError::NotFound)
         );
     }
-    assert_eq!(credentials.asked(), 0, "capable() before the size check");
+    assert_eq!(set(99, 0, 5, 0), Err(FsError::NotFound));
+    assert_eq!(set(99, 0, 6, 5), Err(FsError::NotFound));
+    assert_eq!(credentials.asked(), 0, "capable() before the lookup");
 
     // Context 0 is finalized at open (ctx_setparam); a created context is a
     // proto-context (set_proto_ctx_param) until GETPARAM looks it up.
@@ -477,28 +481,56 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
         assert_eq!(set(id, 99, 13, 0), Err(FsError::InvalidData));
     }
 
-    // PRIORITY: size, then I915_SCHEDULER_CAP_PRIORITY (validate_priority).
-    // The capability is unadvertised, so every in-size set is -ENODEV
-    // before the s64 range and CAP_SYS_NICE checks, as on a Linux device
-    // without CAP_PRIORITY; GETPARAM still reports the default 0.
+    // PRIORITY (validate_priority): size -EINVAL, then
+    // I915_SCHEDULER_CAP_PRIORITY (now advertised), then the s64 range
+    // -1023..=1023 -EINVAL, then CAP_SYS_NICE above
+    // I915_CONTEXT_DEFAULT_PRIORITY -EPERM. capable() is asked only for an
+    // in-range positive value. Proto (set_proto_ctx_param) and finalized
+    // (ctx_setparam's set_priority) contexts store it; GETPARAM reports it
+    // sign-extended.
     for live in [false, true] {
         let id = if live { 0 } else { context(&file, &info, &user) };
-        credentials.grant(&[NICE]);
+        credentials.grant(&[]);
         credentials.asked();
         assert_eq!(set(id, 1, 6, 0), Err(FsError::InvalidData));
-        for value in [0, 1, 1023, 1024, neg(-1), neg(-1024), 1 << 32] {
-            assert_eq!(set(id, 0, 6, value), Err(FsError::NoDevice), "{value:#x}");
+        assert_eq!(set(id, 1, 6, 1), Err(FsError::InvalidData));
+        for value in [1024, neg(-1024), 1 << 32, neg(i64::MIN), i64::MAX as u64] {
+            assert_eq!(set(id, 0, 6, value), Err(FsError::InvalidData), "{value:#x}");
         }
-        assert_eq!(credentials.asked(), 0, "capable() before the capability check");
-        assert_eq!(get(id, 6), Ok(0));
+        assert_eq!(credentials.asked(), 0, "capable() before the range check");
+        for value in [1, 1023] {
+            assert_eq!(set(id, 0, 6, value), Err(FsError::OperationNotPermitted));
+            assert_eq!(credentials.asked(), 1 << NICE);
+        }
+        assert_eq!(get(id, 6), Ok(0), "a refused set stored nothing");
+        // The default and lower priorities need no capability.
+        for value in [neg(-1023), neg(-1), 0, u64::MAX] {
+            assert_eq!(set(id, 0, 6, value), Ok(()), "{value:#x}");
+            assert_eq!(get(id, 6), Ok(value));
+        }
+        assert_eq!(credentials.asked(), 0, "capable() for a priority <= 0");
+        credentials.grant(&[NICE]);
+        for value in [1, 1023] {
+            assert_eq!(set(id, 0, 6, value), Ok(()));
+            assert_eq!(credentials.asked(), 1 << NICE);
+            assert_eq!(get(id, 6), Ok(value));
+        }
+        assert_eq!(set(id, 0, 6, 1024), Err(FsError::InvalidData));
+        assert_eq!(credentials.asked(), 0, "capable() for an out-of-range value");
+        assert_eq!(get(id, 6), Ok(1023));
+        assert_eq!(set(id, 0, 6, 0), Ok(()));
     }
     // With no uabi engine i915->caps.scheduler is 0: PRIORITY is -ENODEV
-    // after the size check, whatever its value.
+    // after the size check and before the range and capability checks.
     backend.live.store(false, Ordering::Release);
     assert_eq!(parameter(&file, &info, &user, 41), Ok(0));
+    credentials.grant(&[NICE]);
+    credentials.asked();
     assert_eq!(set(0, 1, 6, 0), Err(FsError::InvalidData));
-    assert_eq!(set(0, 0, 6, 0), Err(FsError::NoDevice));
-    assert_eq!(set(0, 0, 6, 5000), Err(FsError::NoDevice));
+    for value in [0, 5, 5000, neg(-1)] {
+        assert_eq!(set(0, 0, 6, value), Err(FsError::NoDevice), "{value:#x}");
+    }
+    assert_eq!(credentials.asked(), 0, "capable() before the capability check");
     backend.live.store(true, Ordering::Release);
 
     // CREATE_EXT applies the same set_proto_ctx_param at each link.
@@ -519,7 +551,8 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
     credentials.grant(&[]);
     for (size, param, value, expected) in [
         (0, 5, 0, FsError::OperationNotPermitted),
-        (0, 6, 5, FsError::NoDevice),
+        (0, 6, 5, FsError::OperationNotPermitted),
+        (0, 6, 1024, FsError::InvalidData),
         (1, 6, 0, FsError::InvalidData),
         (0, 11, 0, FsError::NoDevice),
         (7, 13, 1, FsError::NoDevice),
@@ -527,7 +560,13 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
         assert_eq!(create_ext(size, param, value), Err(expected));
     }
     credentials.grant(&[ADMIN, NICE]);
-    for (size, param, value, expected) in [(0, 5, 0, 0), (0, 8, 1, 1), (7, 13, 0, 0)] {
+    for (size, param, value, expected) in [
+        (0, 5, 0, 0),
+        (0, 8, 1, 1),
+        (7, 13, 0, 0),
+        (0, 6, 5, 5),
+        (0, 6, neg(-7), neg(-7)),
+    ] {
         let id = create_ext(size, param, value).expect("applied link");
         assert_eq!(get(id, param), Ok(expected));
     }
@@ -536,4 +575,78 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
 kernel_test_in!(
     "drivers/gpu/intel_gpu_render",
     smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam
+);
+
+/// MIT Linux b90c984d intel_guc_submission.c::map_i915_prio_to_guc_prio over
+/// intel_guc_fwif.h GUC_CLIENT_PRIORITY_KMD_HIGH 0, HIGH 1, KMD_NORMAL 2 and
+/// NORMAL 3, with i915_priolist_types.h's I915_PRIORITY_NORMAL 0, MAX 1024,
+/// HEARTBEAT 1025 and DISPLAY 1026. guc_context_init maps ctx->sched.priority,
+/// so every i915 hardware member stores its context's band.
+fn smoke_i915_priority_maps_to_guc_client_bands() -> TestResult {
+    use crate::intel_gpu_engine::{Engine, EngineSet};
+    use crate::intel_gpu_user::{self as u, map_i915_prio_to_guc_prio as map};
+    assert_eq!(
+        [
+            u::GUC_PRIORITY_KMD_HIGH,
+            u::GUC_PRIORITY_HIGH,
+            u::GUC_PRIORITY_KMD_NORMAL,
+            u::GUC_PRIORITY_NORMAL,
+        ],
+        [0, 1, 2, 3]
+    );
+    for (priority, band) in [
+        // NORMAL is KMD_NORMAL.
+        (0, 2),
+        // Below NORMAL: NORMAL.
+        (-1, 3),
+        (-1023, 3),
+        (-1024, 3),
+        (i32::MIN, 3),
+        // Below DISPLAY: HIGH, including MAX and HEARTBEAT.
+        (1, 1),
+        (1023, 1),
+        (1024, 1),
+        (1025, 1),
+        // DISPLAY and above: KMD_HIGH, unreachable from validate_priority.
+        (1026, 0),
+        (i32::MAX, 0),
+    ] {
+        assert_eq!(map(priority), band, "{priority}");
+    }
+    let capture = Arc::new(u::CapturePolicy::default());
+    for (priority, band) in [(0, 2), (-7, 3), (7, 1)] {
+        let engine = UserContext::for_i915_engine(Engine::Rcs0, capture.clone(), priority);
+        assert_eq!(engine.guc_priority(), band);
+        let placements = UserContext::for_i915_placements(
+            EngineSet::of(&[Engine::Bcs0, Engine::Bcs8]),
+            capture.clone(),
+            priority,
+        )
+        .unwrap();
+        assert_eq!(placements.guc_priority(), band);
+        // set_priority stores a later value on an unclaimed member.
+        for (later, band) in [(-1, 3), (0, 2), (1023, 1)] {
+            engine.set_i915_priority(later);
+            assert_eq!(engine.guc_priority(), band);
+        }
+    }
+    // Native Xe queues keep their own LOW3/NORMAL2/HIGH1 range; neither
+    // KMD_HIGH nor an unknown band is configurable.
+    let queue = UserContext::new();
+    for band in [1, 2, 3] {
+        assert_eq!(queue.configure_schedule(band, 1000), Ok(()));
+        assert_eq!(queue.guc_priority(), band);
+    }
+    for band in [0, 4, u32::MAX] {
+        assert_eq!(
+            queue.configure_schedule(band, 1000),
+            Err(FsError::InvalidData)
+        );
+    }
+    assert_eq!(queue.guc_priority(), 3);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_render",
+    smoke_i915_priority_maps_to_guc_client_bands
 );

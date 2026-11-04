@@ -1672,6 +1672,16 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     }
                 }
             }
+            0x100b if request.len() == 4 => {
+                // __guc_context_set_prio: SCHEDULING_PRIORITY alone, for a
+                // registered context, in the userspace HIGH1..NORMAL3 range.
+                assert_eq!(request[2], 0x20030001);
+                assert!((1..=3).contains(&request[3]));
+                assert!(registered.contains_key(&request[1]));
+                w.0.borrow_mut()
+                    .priority_updates
+                    .push((request[1], request[3]));
+            }
             0x100b => {
                 // User HIGH1, KMD_NORMAL2 and NORMAL3; KMD_HIGH0 remains
                 // unavailable to the native userspace queue profile.
