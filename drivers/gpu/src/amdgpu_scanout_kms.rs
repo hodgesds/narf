@@ -285,7 +285,22 @@ impl Request {
         admission: Option<&CommitAdmission<'_>>,
     ) -> Result<u64, FsError> {
         match self {
-            Self::Atomic(a) => atomic_commit(card, mode, a.request(), events, out, admission),
+            Self::Atomic(a) => {
+                let result = atomic_commit(card, mode, a.request(), events, out, admission);
+                if let Err(error) = &result {
+                    let request = a.request();
+                    note_atomic_rejection(
+                        mode,
+                        request.flags,
+                        error,
+                        request.objects,
+                        request.prop_counts,
+                        request.props,
+                        request.values,
+                    );
+                }
+                result
+            }
             Self::SetCrtc(r, c) => handle_setcrtc_decoded(card, mode, *r, *c, admission, false),
             Self::PageFlip(r) => handle_page_flip_decoded(card, mode, *r, events, admission, false),
             Self::SetPlane(b) => handle_setplane_decoded(card, mode, b, admission, false),

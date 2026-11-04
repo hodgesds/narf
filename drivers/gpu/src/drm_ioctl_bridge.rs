@@ -2082,22 +2082,28 @@ pub(crate) fn note_drm_fd_einval(cmd: u32, result: &Result<u64, FsError>) {
     if !matches!(result, Err(FsError::InvalidData)) {
         return;
     }
-    static SEEN: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u32>> =
+    static SEEN: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u32, u32)>> =
         narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+    let line = LAST_INVALID_LINE.load(core::sync::atomic::Ordering::Relaxed);
     {
         let mut seen = SEEN.lock();
-        if seen.len() >= 48 || seen.contains(&cmd) {
+        if seen.len() >= 64 || seen.contains(&(cmd, line)) {
             return;
         }
-        seen.push(cmd);
+        seen.push((cmd, line));
     }
     use core::fmt::Write;
     let _ = writeln!(
         narf_console::Writer,
-        "  drm: fd ioctl {cmd:#010x} (nr {:#x}) EINVAL (last bridge line {})",
+        "  drm: fd ioctl {cmd:#010x} (nr {:#x}) EINVAL (last bridge line {line})",
         drm_uapi::ioc_nr(cmd),
-        LAST_INVALID_LINE.load(core::sync::atomic::Ordering::Relaxed),
     );
+}
+
+/// Clear the recorded [`invalid_at`] line before an fd ioctl runs, so a
+/// trace names this call's check rather than an earlier one's.
+pub(crate) fn reset_invalid_line() {
+    LAST_INVALID_LINE.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Stateful card dispatcher used by a real DRM open file.

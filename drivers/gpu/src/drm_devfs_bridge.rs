@@ -480,6 +480,7 @@ impl FileOps for DriCardFile {
     /// implies authenticated master per `DrmFileCtx::primary_master`
     /// so the modesetting ioctls are reachable.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        crate::drm_ioctl_bridge::reset_invalid_line();
         let result = (|| -> Result<u64, FsError> {
             #[cfg(feature = "intel")]
             if let Some(result) = self.intel.dispatch_card(
@@ -631,6 +632,7 @@ impl FileOps for DriCardFile {
         context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
+            crate::drm_ioctl_bridge::reset_invalid_line();
             let result = async move {
                 #[cfg(feature = "intel")]
                 if let Some(result) = self
@@ -1630,6 +1632,7 @@ impl FileOps for DriRenderFile {
     /// modesetting ioctls with PermissionDenied (→ EACCES at the
     /// syscall layer).
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        crate::drm_ioctl_bridge::reset_invalid_line();
         let result = (|| -> Result<u64, FsError> {
             #[cfg(feature = "intel")]
             if let Some(result) = self.intel.dispatch_card(
@@ -1729,6 +1732,7 @@ impl FileOps for DriRenderFile {
         context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
+            crate::drm_ioctl_bridge::reset_invalid_line();
             let result = async move {
                 #[cfg(feature = "intel")]
                 if let Some(result) = self
