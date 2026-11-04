@@ -338,9 +338,13 @@ mod both {
         set_aliases(&[(f[2], 1)]);
         // SAFETY: both frames live for the call; roots are live.
         let rebound = unsafe {
-            with_revoked_shared_frames(core::slice::from_ref(&b), &[f[2]], &[spare], aliases, || {
-                Ok(())
-            })
+            with_revoked_shared_frames(
+                core::slice::from_ref(&b),
+                &[f[2]],
+                &[spare],
+                aliases,
+                || Ok(()),
+            )
         };
         if rebound != Err(AddressSpaceError::Pinned) || slot(&b, va3, 0) != f[2] {
             return TestResult::Fail("a revoked frame was rebound");
