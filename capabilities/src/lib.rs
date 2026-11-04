@@ -291,6 +291,39 @@ impl<T, R: Rights> Cap<T, R> {
     }
 }
 
+impl<T: CapType> Cap<T, Grant> {
+    /// Grant-gated cross-task transfer (spec §9.1, issue #1283).
+    ///
+    /// Installs `cap`'s slot into `target`'s table and returns the
+    /// receiver's task-local slot number. Both caps must be live and
+    /// must name the *same object* (`slot.index` equal): a Grant cap
+    /// for object A authorises handing out caps for object A only,
+    /// never for an unrelated object B. The sender retains its own
+    /// slot — §9.1 sharing semantics; an explicit `revoke()` is the
+    /// only move-like operation, and it invalidates all holders via
+    /// the epoch bump.
+    ///
+    /// This is the only cross-table install path besides
+    /// `CapTable::install_bootstrap` (task creation). There is no
+    /// ungated insert: a table entry always traces to a live Grant
+    /// cap or to a kernel mint at task creation.
+    pub fn transfer<R: Rights>(
+        &self,
+        cap: &Cap<T, R>,
+        target: &mut CapTable,
+    ) -> Result<u32, CapError> {
+        self.check_live()?;
+        cap.check_live()?;
+        if self.slot.index != cap.slot.index {
+            return Err(CapError::ObjectMismatch);
+        }
+        if cap.slot.type_tag != T::KIND as u32 {
+            return Err(CapError::TypeMismatch);
+        }
+        target.install_general(cap.slot)
+    }
+}
+
 impl<T: CapType, R: Rights> Cap<T, R> {
     /// Safe mint: allocates a fresh object-table entry with
     /// `T::KIND` and produces a cap with `R::BITS`.
@@ -373,6 +406,180 @@ pub mod object_table {
 
     pub fn len() -> usize {
         TABLE.lock().len()
+    }
+}
+
+// ── CapTable: per-task capability tables ────────────────────────────
+//
+// Spec §9.7 sizing, spec §8 dispatch validation, spec §9.1 transfer.
+// This is the #1283 fix: before this type existed, every cap resolved
+// against the single global object table, so a copied (index,
+// generation) pair was usable by any holder. A `CapTable` binds slots
+// to one task: slot numbers are meaningful only within their table,
+// and the only ways an entry appears are task creation
+// (`install_bootstrap`) and Grant-gated `transfer`.
+//
+// Two index namespaces — read carefully, they are the whole design:
+// - A table POSITION (0..len) is the task-local slot number. At the
+//   task boundary (ABI `Submission` caps, spec §8 step 2) the
+//   presented `CapSlot.index` IS this position: dispatch looks the
+//   entry up in the submitting task's table, never in a global table.
+// - The STORED entry's `index` field is the global object-table
+//   index (the same index an in-kernel `Cap` carries). The epoch
+//   check runs against that global index, so `revoke()` still
+//   invalidates every table entry for the object in O(1).
+// A copied wire slot therefore resolves only against the submitter's
+// own table: presenting another task's bytes yields the submitter's
+// own entry at that position (or `Revoked` for an empty one) — never
+// the victim's object, because the resolved object comes from the
+// table, never from the presented bytes.
+//
+// `CapTable` is deliberately NOT internally synchronized: it is a
+// value owned by task state, and the owning subsystem (task
+// creation / scheduler / ABI dispatch) serializes access to that
+// state. Tables live in the capability domain's memory (spec §4);
+// holding `&mut CapTable` is the authority to modify that task's
+// table, which is why `install_bootstrap` is a method on the table
+// rather than a free function.
+//
+// Slots are never freed or reused within a table's lifetime: entries
+// for revoked objects linger as dead entries (bounded by MAX_SLOTS).
+// Reuse would let a stale presented slot alias a new grant, so the
+// install cursors are monotonic.
+
+/// One task's capability table (spec §9.7).
+#[derive(Debug)]
+pub struct CapTable {
+    /// Dense slots; position = task-local slot number. `EMPTY` = never
+    /// installed (or, at position 0, the null-cap sentinel).
+    slots: Vec<CapSlot>,
+    /// Next free position in the bootstrap region (0..RESERVED_SLOTS).
+    next_bootstrap: usize,
+    /// Next free position in the general region (RESERVED_SLOTS..).
+    next_general: usize,
+}
+
+impl CapTable {
+    /// Starting size: one 4 KiB page of 16-byte slots (spec §9.7).
+    pub const INITIAL_SLOTS: usize = 256;
+    /// Per-task hard cap: 2 MiB of slots (spec §9.7). Installing past
+    /// this returns `Err(CapTableFull)`.
+    pub const MAX_SLOTS: usize = 131_072;
+    /// First 16 slots are reserved for bootstrap caps installed by
+    /// the kernel at task creation (spec §9.7). General installs
+    /// (transfer) never land here.
+    pub const RESERVED_SLOTS: usize = 16;
+
+    /// An empty table: `INITIAL_SLOTS` empty slots. Position 0 is the
+    /// null-cap sentinel — `lookup` on it returns `Err(Revoked)`
+    /// deterministically — unless task creation installs a bootstrap
+    /// cap there.
+    pub fn new() -> Self {
+        Self {
+            slots: alloc::vec![CapSlot::EMPTY; Self::INITIAL_SLOTS],
+            next_bootstrap: 0,
+            next_general: Self::RESERVED_SLOTS,
+        }
+    }
+
+    /// Current capacity in slots (grows by doubling up to MAX_SLOTS).
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Install a bootstrap cap into the reserved region (task
+    /// creation path, spec §2: the creator supplies the initial cap
+    /// set). Returns the task-local slot number. The cap must be
+    /// live and its type tag must match `T::KIND`; the reserved
+    /// region holds at most `RESERVED_SLOTS` entries, past that this
+    /// returns `Err(CapTableFull)`.
+    ///
+    /// This is intentionally NOT Grant-gated: the kernel mints the
+    /// first caps of a task's life (there is no prior Grant holder
+    /// to gate on). The gate here is possession of `&mut self` —
+    /// only the task's creator/manager ever holds it.
+    pub fn install_bootstrap<T: CapType, R: Rights>(
+        &mut self,
+        cap: &Cap<T, R>,
+    ) -> Result<u32, CapError> {
+        cap.check_live()?;
+        if cap.slot.type_tag != T::KIND as u32 {
+            return Err(CapError::TypeMismatch);
+        }
+        if self.next_bootstrap >= Self::RESERVED_SLOTS {
+            return Err(CapError::CapTableFull);
+        }
+        let at = self.next_bootstrap;
+        self.slots[at] = cap.slot;
+        self.next_bootstrap += 1;
+        Ok(at as u32)
+    }
+
+    /// General-region install: the `transfer` path. Not public —
+    /// cross-table installs go through `Cap<T, Grant>::transfer`,
+    /// which is where the Grant gate lives.
+    fn install_general(&mut self, slot: CapSlot) -> Result<u32, CapError> {
+        if self.next_general == self.slots.len() {
+            if self.slots.len() >= Self::MAX_SLOTS {
+                return Err(CapError::CapTableFull);
+            }
+            let new_len = (self.slots.len() * 2).min(Self::MAX_SLOTS);
+            self.slots.resize(new_len, CapSlot::EMPTY);
+        }
+        let at = self.next_general;
+        self.slots[at] = slot;
+        self.next_general += 1;
+        Ok(at as u32)
+    }
+
+    /// Task-boundary dispatch validation (spec §8 steps 1–4; step 5's
+    /// domain-tag match stays dispatch-side, where the calling
+    /// task's domain is known).
+    ///
+    /// `presented.index` is the task-local slot number (the position
+    /// in THIS table). Validation, in spec order:
+    /// 1. Position in range and entry non-empty, else `Revoked`
+    ///    (out-of-range or the null-cap sentinel).
+    /// 2. `presented.type_tag` matches the entry's, else
+    ///    `TypeMismatch`.
+    /// 3. `presented.generation` matches the entry's, and the
+    ///    entry's global object epoch still equals it, else
+    ///    `Revoked` (a `revoke()` anywhere invalidates all holders).
+    /// 4. `presented.rights` must be a subset of the entry's,
+    ///    else `RightsTooWeak`. Presenting fewer rights than held
+    ///    is a voluntary downgrade for this op and is allowed.
+    ///
+    /// On success returns the stored entry — the resolved global
+    /// object slot dispatch should use. The resolved object always
+    /// comes from the table, never from the presented bytes.
+    pub fn lookup(&self, presented: CapSlot) -> Result<CapSlot, CapError> {
+        let entry = self
+            .slots
+            .get(presented.index as usize)
+            .ok_or(CapError::Revoked)?;
+        if entry.is_empty() {
+            return Err(CapError::Revoked);
+        }
+        if presented.type_tag != entry.type_tag {
+            return Err(CapError::TypeMismatch);
+        }
+        if presented.generation != entry.generation {
+            return Err(CapError::Revoked);
+        }
+        match object_table::current_epoch(entry.index) {
+            Some(e) if e == entry.generation => {}
+            _ => return Err(CapError::Revoked),
+        }
+        if (presented.rights & !entry.rights) != 0 {
+            return Err(CapError::RightsTooWeak);
+        }
+        Ok(*entry)
+    }
+}
+
+impl Default for CapTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -658,4 +865,11 @@ pub enum CapError {
     DomainMismatch,
     TypeMismatch,
     RightsTooWeak,
+    /// A `CapTable` install past its per-task hard cap (spec §9.7:
+    /// 131072 slots) or past the 16-slot bootstrap region.
+    CapTableFull,
+    /// A `transfer` whose Grant cap and transferred cap name different
+    /// objects. A Grant cap for object A never authorises handing out
+    /// caps for object B.
+    ObjectMismatch,
 }
