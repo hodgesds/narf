@@ -2964,6 +2964,10 @@ impl<M: Platform> Guard<'_, M> {
     pub(crate) fn panel_dark(&self) -> bool {
         self.state.panel_off
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn psr(&self) -> Option<crate::intel_gpu_psr::Psr> {
+        self.state.psr
+    }
     /// The panel's crtc off (display 14): `intel_atomic_commit_tail` for
     /// the crtc going inactive. The caller has restored the console, so no
     /// client surface, cursor, colour or DSB stream remains; a frame change

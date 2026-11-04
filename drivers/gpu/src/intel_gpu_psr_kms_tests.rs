@@ -646,7 +646,7 @@ fn smoke_kms_mtl_panel_off_disables_psr_first_and_refuses_unlatched_flip() -> Te
         let start = platform.all_writes().len();
         complete(session.panel_off()).unwrap();
         assert!(session.panel_dark());
-        assert!(psr(&device).is_none());
+        assert!(session.psr().is_none());
         let writes = platform.all_writes()[start..].to_vec();
         let off = writes.iter().position(|&w| w == (PANEL_LOG, 0)).unwrap();
         assert_eq!(writes.iter().filter(|&&(r, _)| r == PANEL_LOG).count(), 1);
