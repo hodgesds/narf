@@ -280,6 +280,7 @@ the ethertype shift. The signature-add 64-bit FDIRHASH write
 is split into two 32-bit writes (hash, then command) because
 `RegBank` is 32-bit. Section number is letter-suffixed so it
 merges cleanly against §13b regardless of landing order.
+
 ## 13f. EEE control/status (Linux model, no MAC registers)
 
 EEE in Linux ixgbe has no MAC register programming: `get_eee`

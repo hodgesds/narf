@@ -986,6 +986,7 @@ fn smoke_ixgbe_eee_ls_modes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_ls_modes);
+
 // ── Flow Director ────────────────────────────────────────────────────
 
 // Test bank modeling documented hardware completion behavior: FDIRCTRL
@@ -1008,6 +1009,7 @@ impl FdirBank {
     }
 
     fn stored(&self, offset: u64) -> u32 {
+        use super::queues::RegBank;
         self.inner.read32(offset)
     }
 }
@@ -1332,6 +1334,7 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_signature_conversation);
 
 fn smoke_ixgbe_fdir_reinit_conversation() -> TestResult {
     use super::fdir::{reinit_tables, REG_FDIRCMD, REG_FDIRCTRL, REG_FDIRFREE, REG_FDIRHASH};
+    use super::queues::RegBank;
     let mut bank = FdirBank::new(false);
     bank.write32(REG_FDIRCTRL, 0x4A06_7F11);
     bank.write32(REG_FDIRCMD, 0x0000_8001);
@@ -1355,6 +1358,7 @@ fn smoke_ixgbe_fdir_stats() -> TestResult {
     use super::fdir::{
         stats, REG_FDIRFREE, REG_FDIRFSTAT, REG_FDIRLEN, REG_FDIRMATCH, REG_FDIRMISS, REG_FDIRUSTAT,
     };
+    use super::queues::RegBank;
     let mut bank = FdirBank::new(false);
     bank.write32(REG_FDIRMATCH, 11);
     bank.write32(REG_FDIRMISS, 22);

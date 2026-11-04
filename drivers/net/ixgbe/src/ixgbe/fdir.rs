@@ -511,7 +511,7 @@ pub fn sig_hash(input: u32, common: u32) -> u32 {
     let flow_vm_vlan = input;
     let mut hi = common;
     // Low dword is the word-swapped common dword.
-    let mut lo = (hi >> 16) | (hi << 16);
+    let mut lo = hi.rotate_left(16);
     // Apply flow ID / VM pool / VLAN bits to the high word.
     hi ^= flow_vm_vlan ^ (flow_vm_vlan >> 16);
     let mut sig = 0u32;
@@ -544,10 +544,10 @@ pub fn sig_hash(input: u32, common: u32) -> u32 {
 pub fn perfect_bucket_hash(words: &[u32; 11]) -> u16 {
     let flow_vm_vlan = words[0];
     let mut hi = 0u32;
-    for i in 1..11 {
-        hi ^= words[i];
+    for w in &words[1..] {
+        hi ^= *w;
     }
-    let mut lo = (hi >> 16) | (hi << 16);
+    let mut lo = hi.rotate_left(16);
     hi ^= flow_vm_vlan ^ (flow_vm_vlan >> 16);
     let mut sig = 0u32;
     let mut buck = 0u32;
