@@ -59,6 +59,15 @@ UMEM/ring setup through `SOL_XDP` (including user-page `XDP_UMEM_REG`,
 and direct queue binding through `XDP_ZEROCOPY` (flag 4), with network
 administration permission for hardware binding and truthful `XDP_OPTIONS`.
 
+The file-backed ELF loader returns `LoadedElf` (address space, entry, load
+bias, parsed image and `PageInPlan`). `load_elf_into_at_file` returns the
+entry and plan; the byte-only wrappers retain their existing return types.
+A plan contains `(base, pages)` runs from demand-paged PT_LOAD mappings,
+with a shared 256-page budget per image. `UserProcess` and `ExecRequest`
+carry it to exec completion. `loader::page_in_plan` is unsafe: callers must
+activate the corresponding address space and publish its resume root before
+running the advisory batch, which may perform I/O. Skipped pages retain the
+ordinary fault behavior. Fork/clone children carry empty plans.
 
 Blocking poll/ppoll and select/pselect distinguish providers with a durable
 readiness arm or broadcast notification from silent legacy providers (such
