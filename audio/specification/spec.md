@@ -63,6 +63,12 @@ the existing S16Le and F32Le variants. Backend support remains explicit.
 
 ### 3.2 Native cards and codecs
 
+The unused standalone `acp6`, `codec`, `hda_tests`, `i2s`, `realtek_alc`
+and `wm8960` model modules are retired. Native HDA and ACP controller paths
+continue to register through the sound-card surface below. Preserved Realtek
+identification and quirk tables live in `hda::quirks`; these tables are staged
+data and do not by themselves enable a runtime codec fixup.
+
 HDA registers one sound card per usable controller with at most one exclusive
 playback lease and one exclusive capture lease. Both directions support
 S16LE/S32LE stereo 48 kHz when codec capabilities allow it. Buffers contain

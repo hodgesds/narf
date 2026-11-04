@@ -290,90 +290,6 @@ fn smoke_audio_submit_shmem_zero_copy() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("audio", smoke_audio_submit_shmem_zero_copy);
 
-// ── AMD ACP6 I2S0 TX path smokes ──────────────────────────────────
-//
-// These exercise the new `acp6_pcm` module. The ACP6 controller
-// isn't present in QEMU (no `1022:15E2` device on the bus), so
-// the runtime smokes Skip cleanly there. Structural smokes that
-// don't need MMIO run unconditionally.
-
-fn smoke_acp6_pcm_period_samples_constant() -> TestResult {
-    // 4 KiB ring / 2 bytes per i16 = 2048 sample slots. Matches
-    // the value the audio mixer + lib.rs default_playback expect.
-    if crate::acp6_pcm::period_samples() == 2048 {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("acp6_pcm period_samples != 2048")
-    }
-}
-kernel_test_in!("audio/acp6", smoke_acp6_pcm_period_samples_constant);
-
-fn smoke_acp6_pcm_play_skips_when_no_controller() -> TestResult {
-    // play_pcm + stop_pcm should report NoController cleanly when
-    // no ACP6 device is probed. Confirms the gating path is the
-    // first check in each entry point.
-    crate::acp6_pcm::__reset_for_test();
-    let silence = [0i16; 8];
-    match crate::acp6_pcm::play_pcm(&silence) {
-        Err(crate::acp6_pcm::PcmError::NoController) => {}
-        Err(_) => return TestResult::Fail("play_pcm wrong error"),
-        Ok(_) => return TestResult::Fail("play_pcm should require a controller"),
-    }
-    match crate::acp6_pcm::stop_pcm() {
-        Ok(()) => TestResult::Pass,
-        Err(_) => TestResult::Fail("stop_pcm should be a no-op without stream"),
-    }
-}
-kernel_test_in!("audio/acp6", smoke_acp6_pcm_play_skips_when_no_controller);
-
-fn smoke_acp6_pcm_play_rejects_bad_buffer() -> TestResult {
-    // Empty / odd-channel-count buffer is rejected at the input-
-    // validation gate; doesn't need a controller. Run before the
-    // "no controller" gate by passing an obviously bad buffer.
-    crate::acp6_pcm::__reset_for_test();
-    // 3 samples = not a multiple of CHANNELS=2.
-    let bad = [0i16; 3];
-    match crate::acp6_pcm::play_pcm(&bad) {
-        Err(crate::acp6_pcm::PcmError::BadBuffer) => {}
-        // If no controller is probed, the controller-gate fires
-        // first — also acceptable, since the result is still "not
-        // played". Don't fail the smoke on that.
-        Err(crate::acp6_pcm::PcmError::NoController) => {}
-        _ => return TestResult::Fail("play_pcm should reject odd-sample buffer"),
-    }
-    let empty: [i16; 0] = [];
-    match crate::acp6_pcm::play_pcm(&empty) {
-        Err(crate::acp6_pcm::PcmError::BadBuffer)
-        | Err(crate::acp6_pcm::PcmError::NoController) => TestResult::Pass,
-        _ => TestResult::Fail("play_pcm should reject empty buffer"),
-    }
-}
-kernel_test_in!("audio/acp6", smoke_acp6_pcm_play_rejects_bad_buffer);
-
-fn smoke_acp6_pcm_wm8960_init_sequence_shape() -> TestResult {
-    // The codec init sequence emitted for the I2S0 TX path must
-    // start with a software reset (datasheet §10) and conclude
-    // with output-volume writes. The exact contents are codec-
-    // datasheet driven; here we just guard the high-level shape.
-    let seq = crate::acp6_pcm::build_wm8960_init_for_i2s0_tx();
-    if seq.is_empty() {
-        return TestResult::Fail("wm8960 init sequence empty");
-    }
-    let (first_reg, _) = seq[0];
-    if first_reg != crate::wm8960::regs::RESET {
-        return TestResult::Fail("wm8960 init must begin with software reset (R15)");
-    }
-    // Must include the audio-interface programming step.
-    let has_iface = seq
-        .iter()
-        .any(|(r, _)| *r == crate::wm8960::regs::AUDIO_INTERFACE);
-    if !has_iface {
-        return TestResult::Fail("wm8960 init missing audio-interface write");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("audio/acp6", smoke_acp6_pcm_wm8960_init_sequence_shape);
-
 fn smoke_acp63_pci_match_excludes_hda() -> TestResult {
     use narf_bus::{registered_pci_drivers, MatchKind};
     narf_bus::driver_match::__reset_for_test();
@@ -426,3 +342,91 @@ fn smoke_audio_format_unsupported_rate_rejects() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio", smoke_audio_format_unsupported_rate_rejects);
+
+fn smoke_hda_quirks_table_contents() -> TestResult {
+    use crate::hda::quirks::{
+        find_quirk, first_for_chip, init_table_for, quirk_count, CoefRow, RealtekChip, QUIRK_TABLE,
+    };
+
+    // Rescued from drivers/sound/src/codec/{quirks,realtek}.rs (#783):
+    // the table must carry all six subsystem quirks verbatim.
+    if quirk_count() != 6 {
+        return TestResult::Fail("quirk table must hold 6 entries");
+    }
+    let total_pins: usize = QUIRK_TABLE.iter().map(|q| q.pins.len()).sum();
+    if total_pins != 21 {
+        return TestResult::Fail("quirk table must hold 21 pin overrides in total");
+    }
+    let x1 = match find_quirk(0x17AA_22BE) {
+        Some(q) => q,
+        None => return TestResult::Fail("X1 Carbon quirk missing"),
+    };
+    if x1.name != "Lenovo ThinkPad X1 Carbon Gen 7" || x1.chip != RealtekChip::Alc285 {
+        return TestResult::Fail("X1 Carbon quirk identity changed");
+    }
+    if (x1.pins[0].nid, x1.pins[0].cfg) != (0x14, 0x9017_0110) {
+        return TestResult::Fail("X1 Carbon first pin override changed");
+    }
+    match find_quirk(0x103C_8716) {
+        Some(q) if q.chip == RealtekChip::Alc285 => {}
+        _ => return TestResult::Fail("EliteBook 845 G8 quirk missing or wrong chip"),
+    }
+    if find_quirk(0xDEAD_BEEF).is_some() {
+        return TestResult::Fail("unknown subsystem id must not match a quirk");
+    }
+    match first_for_chip(RealtekChip::Alc256) {
+        Some(q) if q.subsystem_id == 0x1028_0AB9 => {}
+        _ => return TestResult::Fail("first ALC256 quirk must be the Dell entry"),
+    }
+
+    // Init tables: the 18 literal tables hold 29 coef rows in total.
+    const BASE_CHIPS: [RealtekChip; 18] = [
+        RealtekChip::Alc256,
+        RealtekChip::Alc233,
+        RealtekChip::Alc235,
+        RealtekChip::Alc236,
+        RealtekChip::Alc270,
+        RealtekChip::Alc280,
+        RealtekChip::Alc282,
+        RealtekChip::Alc283,
+        RealtekChip::Alc285,
+        RealtekChip::Alc286,
+        RealtekChip::Alc287,
+        RealtekChip::Alc289,
+        RealtekChip::Alc290,
+        RealtekChip::Alc292,
+        RealtekChip::Alc293,
+        RealtekChip::Alc294,
+        RealtekChip::Alc295,
+        RealtekChip::Alc298,
+    ];
+    let total_rows: usize = BASE_CHIPS.iter().map(|c| init_table_for(*c).len()).sum();
+    if total_rows != 29 {
+        return TestResult::Fail("init tables must hold 29 coef rows in total");
+    }
+    if init_table_for(RealtekChip::Alc285)[1] != CoefRow::new(0x6F, 0x0007) {
+        return TestResult::Fail("ALC285 init row 1 changed");
+    }
+    if init_table_for(RealtekChip::Alc287)[2] != CoefRow::new(0x38, 0x4901) {
+        return TestResult::Fail("ALC287 init row 2 changed");
+    }
+    // Alias arms must resolve to the same tables as their base chips.
+    if init_table_for(RealtekChip::Alc257) != init_table_for(RealtekChip::Alc256) {
+        return TestResult::Fail("ALC257 must alias the ALC256 init table");
+    }
+    if init_table_for(RealtekChip::Alc3204) != init_table_for(RealtekChip::Alc287) {
+        return TestResult::Fail("ALC3204 must alias the ALC287 init table");
+    }
+    // Chip identification by codec device id.
+    if RealtekChip::from_vendor_id(0x10EC_0285) != Some(RealtekChip::Alc285) {
+        return TestResult::Fail("0x10EC0285 must identify as ALC285");
+    }
+    if RealtekChip::from_vendor_id(0x10EC_9999).is_some() {
+        return TestResult::Fail("unknown Realtek device id must not identify");
+    }
+    if RealtekChip::Alc295.name() != "ALC295" {
+        return TestResult::Fail("ALC295 name changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda-quirks", smoke_hda_quirks_table_contents);
