@@ -2335,6 +2335,55 @@ Remainder, not in this step: MCI Bluetooth coexistence, WoW
 (`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`), the AR9462 board-value
 deltas (`thermo_cal`, switch tables) and per-chip calibration branches.
 
+**AR9565 (`ar9565_enablement`, in progress — not claimed).** Step 1
+(identity and INI, plus owner probe and admission record):
+`ar9003::Chip::Ar9565` is PCIe `0x0036`
+(`hw.h::AR9300_DEVID_AR9565`, chip_chainmask 1, one chain — Linux
+groups it with the AR9485/AR9285/AR9330 in
+`ath9k_hw_fill_cap_info`). It has its own macVersion
+`AR_SREV_VERSION_9565` 0x2c0, so no macRev split against the AR9300
+is needed; `Revision::decode` accepts every macRev (Linux's 9565
+branches cover all of them — `AR_SREV_9565_11_OR_LATER` selects the
+1.1 set, anything else the 1.0 set), with shipped silicon 1.0
+(macRev 0), 1.0.1 (macRev 1) and 1.1 (macRev 2,
+`AR_SREV_REVISION_9565_11`). The EEPROM restore limits are the
+AR9300's. `ar9003/initvals_ar9565.rs` transcribes every data table of
+`ar9565_1p0_initvals.h` and `ar9565_1p1_initvals.h` (17 names: 15
+tables of 1088 rows — 14 from 1.0, 1 from 1.1 — and 2 selected aliases,
+generated verbatim in file order; the 1.0 mac-postamble `#define` is the
+9331 array already transcribed as `AR9462_2P0_MAC_POSTAMBLE`, the 1.0
+Japan 2484 `#define` is the 2p2 table; the 1.0 lowest-ob/db `#define`
+and every 1.1 `#define` alias are omitted because `Tables::ar9565`
+selects the 1.0 constants for both revisions — unselected aliases are
+dead code under clippy `-D warnings` — and 1.1 owns only its radio
+postamble). `ini::Tables::for_revision` dispatches
+`ar9003_hw_init_mode_regs` on the 1.1/1.0 branches:
+`Tables::ar9565` is the 1.0 set (1.1 swaps only its radio postamble)
+plus `ar9003_tx_gain_table_apply` (modes 0/2 are the 9565 low-ob/db
+table, mode 1 the high-ob/db table, mode 3 the high-power table, mode
+4 falls through to the AR9300 2p2 mixed-ob/db table, modes 5/6/7 have
+no 9565 arm and keep the mode-regs lowest-ob/db value — which is the
+low-ob/db table by `#define` — and index >= 8 is mode 0) and
+`ar9003_rx_gain_table_apply` (mode 1 is the 9565 wo-XLNA table; modes
+2/3 are AR9462-only and keep the common default). `phy::prepare`/
+`expected` need no 9565 change (the sys2ant postamble and RX-gain
+overrides are empty for this chip). Linux sets no DFS array for the
+AR9565, so `dfs` stays empty, and the PCIe SerDes arrays are the
+`pciephy_clkreq_disable_L1` table in both slots (Linux gates them on
+`pll_pwrsave`, not modeled here). The owner matches `0x0036` as
+`ath9k-ar9565` and the admission record is `N65A` v1 (one-chain)
+under `ath9k/ar9565-admit-v1-ch<N>-<mac>.bin`, binding the 1p0/1p1
+INI preparation. AR9300/AR9580/AR9462 tables and streams are
+unchanged. Smokes (written, not executed):
+`smoke_ath9k_ar9565_revision_and_ini_selection` (FNV-1a oracle over
+the 711 default-selected 2 GHz HT20 rows for each of 1.0 and 1.1, and
+every TX/RX gain mode, computed from the local Linux headers) and
+`smoke_ath9k_ar9565_admission_records_bind_part_channel_and_magic`.
+Remainder, not in this step: MCI Bluetooth coexistence, WoW
+(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0036`), the AR9565 board-value
+deltas and per-chip calibration branches, and the SerDes `pll_pwrsave`
+gating.
+
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
 Physical acceptance for the initial profile covers EEPROM, RF calibration,

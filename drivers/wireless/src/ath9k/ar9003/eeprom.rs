@@ -315,7 +315,7 @@ pub(in crate::ath9k) struct Limits {
 impl Limits {
     pub fn for_chip(chip: Chip) -> Self {
         match chip {
-            Chip::Ar9300 | Chip::Ar9580 | Chip::Ar9462 => Self {
+            Chip::Ar9300 | Chip::Ar9580 | Chip::Ar9462 | Chip::Ar9565 => Self {
                 max_length: 1023,
                 first_eeprom_base: AR9300_BASE_ADDR,
             },
