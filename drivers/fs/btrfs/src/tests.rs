@@ -3445,6 +3445,225 @@ kernel_test_in!(
     smoke_btrfs_queued_fallocate_invalidates_old_fill
 );
 
+/// A read must never wait for a writer or a commit: Linux's
+/// `btrfs_file_read_iter`, `btrfs_lookup` and `btrfs_getattr` take nothing a
+/// transaction commit holds. The operation lock spans forced commits, which
+/// run for hundreds of milliseconds on a real root, and every read used to
+/// queue behind it; a Plasma session's daemons spent their whole 15 s start
+/// timeout in ld.so that way. Holding the lock here stands in for a running
+/// commit: on the fully synchronous fixture a read that took it would simply
+/// never complete.
+fn smoke_btrfs_reads_do_not_wait_for_a_running_commit() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let root = vol.root();
+    let file = match poll_once(root.create("reader.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create reader.dat failed"),
+    };
+    if !matches!(poll_once(file.write(0, b"visible")), Some(Ok(7))) {
+        return TestResult::Fail("seed write failed");
+    }
+    let held = match poll_once(vol.op_lock().lock()) {
+        Some(held) => held,
+        None => return TestResult::Fail("operation lock busy"),
+    };
+    let mut bytes = [0u8; 7];
+    match poll_once(file.read(0, &mut bytes)) {
+        Some(Ok(7)) if &bytes == b"visible" => {}
+        Some(_) => return TestResult::Fail("read under a running commit returned wrong data"),
+        None => return TestResult::Fail("read waited for the operation lock"),
+    }
+    match poll_once(root.lookup_async("reader.dat")) {
+        Some(Ok(_)) => {}
+        Some(Err(_)) => return TestResult::Fail("lookup failed"),
+        None => return TestResult::Fail("lookup waited for the operation lock"),
+    }
+    match poll_once(root.lookup_async("absent.dat")) {
+        Some(Err(FsError::NotFound)) => {}
+        Some(_) => return TestResult::Fail("negative lookup did not report ENOENT"),
+        None => return TestResult::Fail("negative lookup waited for the operation lock"),
+    }
+    match poll_once(file.stat_async()) {
+        Some(Ok(stat)) if stat.size == 7 => {}
+        Some(_) => return TestResult::Fail("stat failed"),
+        None => return TestResult::Fail("stat waited for the operation lock"),
+    }
+    match poll_once(file.statx_async(0, 0)) {
+        Some(Ok(statx)) if statx.size == 7 => {}
+        Some(_) => return TestResult::Fail("statx failed"),
+        None => return TestResult::Fail("statx waited for the operation lock"),
+    }
+    drop(held);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/cache",
+    smoke_btrfs_reads_do_not_wait_for_a_running_commit
+);
+
+/// A commit frees blocks and extents that a tree a reader sampled before it
+/// still names. They stay out of the allocator until that reader is done, and
+/// not one reader longer.
+fn smoke_btrfs_commit_keeps_freed_space_for_older_readers() -> TestResult {
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    const RANGE: (u64, u64) = (0x7000_0000, 0x4000);
+    const LATER: (u64, u64) = (0x7100_0000, 0x4000);
+    vol.pin_extent(RANGE.0, RANGE.1);
+    let older = vol.begin_reader();
+    vol.unpin_all();
+    if !vol.pinned_ranges().contains(&RANGE) {
+        return TestResult::Fail("a commit released space a running reader may use");
+    }
+    let newer = vol.begin_reader();
+    vol.pin_extent(LATER.0, LATER.1);
+    vol.unpin_all();
+    drop(older);
+    let ranges = vol.pinned_ranges();
+    if ranges.contains(&RANGE) {
+        return TestResult::Fail("space stayed withheld past the reader that needed it");
+    }
+    if !ranges.contains(&LATER) {
+        return TestResult::Fail("a newer reader's range was released with an older one's");
+    }
+    drop(newer);
+    if !vol.pinned_ranges().is_empty() {
+        return TestResult::Fail("space stayed withheld with no reader running");
+    }
+    vol.pin_extent(RANGE.0, RANGE.1);
+    vol.unpin_all();
+    if !vol.pinned_ranges().is_empty() {
+        return TestResult::Fail("a commit with no reader running withheld its space");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/cache",
+    smoke_btrfs_commit_keeps_freed_space_for_older_readers
+);
+
+/// Lookup and final eviction race without a lock: an eviction either sees the
+/// lookup's anchor and backs off, or the lookup sees the eviction's count.
+fn smoke_btrfs_eviction_claim_excludes_open_inodes() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let root = vol.root();
+    let file = match poll_once(root.create("evict.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create evict.dat failed"),
+    };
+    let (tree, ino) = (vol.fs_tree_id(), file.ino());
+    let before = vol.eviction_count();
+    if vol.claim_for_eviction(tree, ino) {
+        return TestResult::Fail("eviction claimed an open inode");
+    }
+    if vol.eviction_count() != before {
+        return TestResult::Fail("a refused claim sent running lookups back to the start");
+    }
+    drop(file);
+    if !vol.claim_for_eviction(tree, ino) {
+        return TestResult::Fail("eviction refused a closed inode");
+    }
+    if vol.eviction_count() == before {
+        return TestResult::Fail("an eviction was invisible to a running lookup");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/cache",
+    smoke_btrfs_eviction_claim_excludes_open_inodes
+);
+
+/// A lock-free `stat` refresh that read the tree before a mutation must not
+/// overwrite what the mutation published, or `fstat` and EOF go backwards.
+fn smoke_btrfs_stale_refresh_cannot_overwrite_a_mutation() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let root = vol.root();
+    let file = match poll_once(root.create("refresh.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create refresh.dat failed"),
+    };
+    let ino = file.ino();
+    let old = match poll_once(vol.load_inode(ino)) {
+        Some(Ok(inode)) => inode,
+        _ => return TestResult::Fail("load inode failed"),
+    };
+    let node = crate::node::BtrfsNode::new(vol.self_weak.clone(), None, ino, old);
+    let seq = node.update_seq();
+    if !matches!(poll_once(file.write(0, b"grown")), Some(Ok(5))) {
+        return TestResult::Fail("write failed");
+    }
+    if node.publish_refreshed(seq, old) {
+        return TestResult::Fail("a refresh that lost the race to a write was published");
+    }
+    if file.stat().size != 5 {
+        return TestResult::Fail("a stale refresh moved the published size");
+    }
+    let current = node.update_seq();
+    if current & 1 != 0 {
+        return TestResult::Fail("a finished mutation left its update marked in flight");
+    }
+    let fresh = match poll_once(vol.load_inode(ino)) {
+        Some(Ok(inode)) => inode,
+        _ => return TestResult::Fail("reload inode failed"),
+    };
+    if !node.publish_refreshed(current, fresh) {
+        return TestResult::Fail("an uncontended refresh was refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/cache",
+    smoke_btrfs_stale_refresh_cannot_overwrite_a_mutation
+);
+
+/// A page fill runs beside a mutation, so a generation sampled while it runs
+/// must not be the one it leaves current: both sides of it issue an epoch.
+fn smoke_btrfs_mutation_leaves_no_midway_cache_epoch_current() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let root = vol.root();
+    let file = match poll_once(root.create("epochs.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create epochs.dat failed"),
+    };
+    let Some(before) = file.mmap_cache_generation() else {
+        return TestResult::Fail("regular file reports no cache generation");
+    };
+    if !matches!(poll_once(file.write(0, b"bytes")), Some(Ok(5))) {
+        return TestResult::Fail("write failed");
+    }
+    let Some(after) = file.mmap_cache_generation() else {
+        return TestResult::Fail("written file reports no cache generation");
+    };
+    // Ticks are issued in order: fewer than two since `before` means the
+    // epoch current during the write is still current now.
+    if after < before + 2 {
+        return TestResult::Fail("a write issued no epoch after its bytes moved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/cache",
+    smoke_btrfs_mutation_leaves_no_midway_cache_epoch_current
+);
+
 /// The btrfs half of the `mmap_cache_generation` contract (issue
 /// #680; the minix/FAT smokes of the same name are the shape): the
 /// generation lives in the shared core, keyed by (fs tree, inode),
