@@ -25,7 +25,14 @@
 //! - **RX**: bulk-IN transfers carry an aggregation buffer of
 //!   back-to-back segments; each segment is a 24-byte `rx_desc`
 //!   (`opts1..opts6`, `opts1 & 0x7FFF` = frame length, frame bytes
-//!   only) followed immediately by the frame.
+//!   only) followed immediately by the frame. `opts2` carries the
+//!   checksum report bits (`RD_IPV4_CS` / `RD_IPV6_CS` /
+//!   `RD_TCP_CS` / `RD_UDP_CS`) and `opts3` the fail bits
+//!   (`RX_IPF` / `RX_UDPF` / `RX_TCPF`); the pump decodes them
+//!   (`rx_csum_result`) and drops device-verified corrupt frames
+//!   (`rx_segment_deliverable`), with an IPv4/UDP zero-checksum
+//!   exception. The v1 layout is used for all generations; the
+//!   RTL8157 v2 descriptor layout is not decoded.
 //! - **TX**: each bulk-OUT transfer is one 8-byte `tx_desc`
 //!   (`opts1 = len | TX_FS | TX_LS`, plus GTSENDV4/V6 +
 //!   transport-offset for hardware TSO) followed by the frame,
@@ -232,6 +239,17 @@ pub const TX_TCPHO_MAX: u32 = 0x7FF;
 pub const TX_VLAN_TAG_BIT: u32 = 1 << 16;
 // `rx_desc.opts2` VLAN bit (Linux `RX_VLAN_TAG`).
 pub const RX_VLAN_TAG_BIT: u32 = 1 << 16;
+// `rx_desc.opts2` RX checksum report bits (Linux `RD_*_CS`, v1
+// descriptor): which checksums the chip examined on this frame.
+pub const RD_IPV4_CS: u32 = 1 << 19;
+pub const RD_IPV6_CS: u32 = 1 << 20;
+pub const RD_TCP_CS: u32 = 1 << 22;
+pub const RD_UDP_CS: u32 = 1 << 23;
+// `rx_desc.opts3` RX checksum fail bits (Linux `IPF` / `UDPF` /
+// `TCPF`, v1 descriptor): the examined checksum was wrong.
+pub const RX_IPF: u32 = 1 << 23;
+pub const RX_UDPF: u32 = 1 << 22;
+pub const RX_TCPF: u32 = 1 << 21;
 
 // ── Datapath descriptor formats ──────────────────────────────────
 
@@ -736,6 +754,10 @@ pub struct RxSegment {
     /// carries no VLAN tag. The pump splices a reported tag
     /// back into the delivered frame (see `insert_vlan_tag`).
     pub vlan_tag: Option<u16>,
+    /// RX checksum verdict decoded from the `rx_desc` `opts2` /
+    /// `opts3` report bits (see [`rx_csum_result`]). The pump
+    /// drops `Bad` segments per [`rx_segment_deliverable`].
+    pub csum: RxCsumResult,
 }
 
 /// Extract the VLAN tag (TCI) from an `rx_desc` `opts2` word:
@@ -750,6 +772,125 @@ pub fn rx_vlan_tag_from_opts2(opts2: u32) -> Option<u16> {
     }
 }
 
+/// What the device concluded about a received frame's checksums,
+/// decoded from the v1 `rx_desc` report bits (Linux
+/// `r8152_rx_csum`). Follows the in-tree v1 descriptor layout
+/// used for all generations; the RTL8157 v2 descriptor layout
+/// (Linux `r8157_rx_csum`) is not decoded here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxCsumResult {
+    /// The device did not examine L3/L4 (non-IP frame, or no
+    /// checked protocol). Delivered as before; the stack does
+    /// not verify RX checksums, so nothing changes for these.
+    NotChecked,
+    /// Checked and correct.
+    Good,
+    /// Checked and wrong: `ip` = IP header checksum failed,
+    /// `l4` = transport checksum failed.
+    Bad { ip: bool, l4: bool },
+}
+
+/// Decode the RX checksum verdict from a v1 `rx_desc` `opts2` /
+/// `opts3` pair, mirroring Linux `r8152_rx_csum` with one
+/// fail-closed deviation: Linux's final `CHECKSUM_NONE` branch
+/// conflates "checked and failed" with "not checked" (both go to
+/// the stack, which re-verifies in software). NARF's stack has
+/// no RX software-verification consumer, so this function must
+/// distinguish them — any checked protocol failed means `Bad`,
+/// even on a contradictory descriptor (Linux would
+/// optimistically return `CHECKSUM_UNNECESSARY` if a later L4
+/// branch hits; a corrupt descriptor must not pass here).
+/// Fail bits for protocols the device did not mark checked are
+/// ignored, as in Linux.
+pub fn rx_csum_result(opts2: u32, opts3: u32) -> RxCsumResult {
+    if opts2 & (RD_IPV4_CS | RD_IPV6_CS) == 0 {
+        return RxCsumResult::NotChecked;
+    }
+    let ip_fail = opts2 & RD_IPV4_CS != 0 && opts3 & RX_IPF != 0;
+    let l4_fail = (opts2 & RD_UDP_CS != 0 && opts3 & RX_UDPF != 0)
+        || (opts2 & RD_TCP_CS != 0 && opts3 & RX_TCPF != 0);
+    if ip_fail || l4_fail {
+        return RxCsumResult::Bad {
+            ip: ip_fail,
+            l4: l4_fail,
+        };
+    }
+    let l4_ok = (opts2 & RD_UDP_CS != 0 && opts3 & RX_UDPF == 0)
+        || (opts2 & RD_TCP_CS != 0 && opts3 & RX_TCPF == 0);
+    if l4_ok {
+        RxCsumResult::Good
+    } else {
+        RxCsumResult::NotChecked
+    }
+}
+
+/// Whether an IPv4/UDP frame carries a zero UDP checksum field,
+/// i.e. RFC 768 "no checksum" — a legal frame even if the device
+/// flagged UDPF. Only the IPv4 case qualifies (IPv6 UDP checksums
+/// are mandatory). Parses the Ethernet header plus one optional
+/// VLAN tag, then the IPv4 header (IHL-aware); any parse failure
+/// or short frame returns `false` (fail closed).
+pub fn ipv4_udp_zero_checksum(frame: &[u8]) -> bool {
+    let read_u16 = |off: usize| -> Option<u16> {
+        frame
+            .get(off..off + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+    };
+    let mut et_off = 12usize;
+    let Some(mut ethertype) = read_u16(et_off) else {
+        return false;
+    };
+    if ethertype == 0x8100 || ethertype == 0x88A8 {
+        et_off = 16;
+        let Some(inner) = read_u16(et_off) else {
+            return false;
+        };
+        ethertype = inner;
+    }
+    if ethertype != 0x0800 {
+        return false;
+    }
+    let l3 = et_off + 2;
+    let Some(&vihl) = frame.get(l3) else {
+        return false;
+    };
+    if vihl >> 4 != 4 {
+        return false;
+    }
+    let ihl = (vihl & 0x0F) as usize * 4;
+    if ihl < 20 || frame.len() < l3 + ihl + 8 {
+        return false;
+    }
+    if frame[l3 + 9] != 17 {
+        return false;
+    }
+    let csum_off = l3 + ihl + 6;
+    frame[csum_off] == 0 && frame[csum_off + 1] == 0
+}
+
+/// Whether a parsed RX segment reaches the stack — the delivery
+/// half of the RX checksum channel (the stack has no RX metadata
+/// consumer, so a device-verified corrupt frame is dropped here
+/// rather than marked: that is the outcome the stack's software
+/// verification would produce).
+/// - `Good` / `NotChecked` → deliver.
+/// - `Bad` with an IP failure → drop (a corrupt IP header's
+///   fields cannot be trusted for any exception).
+/// - `Bad` L4-only → drop, except an IPv4/UDP frame with a zero
+///   checksum field (legal "no checksum", see
+///   [`ipv4_udp_zero_checksum`]).
+pub fn rx_segment_deliverable(csum: RxCsumResult, frame: &[u8]) -> bool {
+    match csum {
+        RxCsumResult::Good | RxCsumResult::NotChecked => true,
+        RxCsumResult::Bad { ip: true, .. } => false,
+        RxCsumResult::Bad {
+            ip: false,
+            l4: true,
+        } => ipv4_udp_zero_checksum(frame),
+        RxCsumResult::Bad { .. } => false,
+    }
+}
+
 /// Walk an RX aggregation buffer into its frames. Stops at the
 /// first segment whose length field is implausible (< ETH_ZLEN,
 /// or running past the buffer) — the stream cannot be resynced
@@ -760,6 +901,7 @@ pub fn parse_rx_aggregate(buf: &[u8]) -> Vec<RxSegment> {
     while off + RX_DESC_LEN <= buf.len() {
         let opts1 = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         let opts2 = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+        let opts3 = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
         let len = (opts1 & RX_LEN_MASK) as usize;
         if (len as u32) < RX_MIN_FRAME || off + RX_DESC_LEN + len > buf.len() {
             break;
@@ -768,6 +910,7 @@ pub fn parse_rx_aggregate(buf: &[u8]) -> Vec<RxSegment> {
             offset: off + RX_DESC_LEN,
             len,
             vlan_tag: rx_vlan_tag_from_opts2(opts2),
+            csum: rx_csum_result(opts2, opts3),
         });
         off += RX_DESC_LEN + len;
     }
@@ -936,16 +1079,18 @@ pub fn build_tx_segment_meta(
     Ok(())
 }
 
-/// Offloads this driver's send path honours, advertised to the
-/// stack at bind via `iface::set_offloads` so `TxMeta` requests
-/// arrive at all. `max_tso_bytes` is the descriptor's hard
-/// length cap (`TX_LEN_MASK`); RX checksum metadata is not
-/// advertised — the RX descriptor's fail bits have no delivery
-/// channel in `on_rx_frame_from`.
+/// Offloads this driver honours, advertised to the stack at bind
+/// via `iface::set_offloads` so `TxMeta` requests arrive at all.
+/// `max_tso_bytes` is the descriptor's hard length cap
+/// (`TX_LEN_MASK`). RX checksum is advertised because the RX path
+/// now decodes the descriptor's fail bits (`rx_csum_result`) and
+/// drops device-verified corrupt frames in the pump
+/// (`rx_segment_deliverable`); the stack has no RX metadata
+/// consumer, so the drop — not a mark — is the delivery channel.
 pub fn r8152_offloads() -> narf_net::OffloadCapabilities {
     narf_net::OffloadCapabilities {
         tx_checksum: true,
-        rx_checksum: false,
+        rx_checksum: true,
         max_tso_bytes: TX_LEN_MASK,
         vlan_insert: true,
     }
@@ -1511,6 +1656,16 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
                             Some(tag) => insert_vlan_tag(raw, tag).unwrap_or_else(|| raw.to_vec()),
                             None => raw.to_vec(),
                         };
+                        // RX checksum channel: a device-verified
+                        // corrupt frame is dropped here (the
+                        // stack has no RX metadata consumer, so a
+                        // mark would be dead data — the drop is
+                        // the outcome software verification
+                        // would produce). See
+                        // `rx_segment_deliverable`.
+                        if !rx_segment_deliverable(seg.csum, &frame) {
+                            continue;
+                        }
                         narf_net::iface::on_rx_frame_from(&name, &mut frame);
                     }
                 }
@@ -1791,6 +1946,7 @@ pub mod tests {
                 offset: RX_DESC_LEN,
                 len: 60,
                 vlan_tag: None,
+                csum: RxCsumResult::NotChecked,
             })
         {
             return TestResult::Fail("first segment location wrong");
@@ -1800,6 +1956,7 @@ pub mod tests {
                 offset: RX_DESC_LEN + 60 + RX_DESC_LEN,
                 len: 100,
                 vlan_tag: None,
+                csum: RxCsumResult::NotChecked,
             })
         {
             return TestResult::Fail("second segment location wrong");
@@ -1822,6 +1979,203 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_rx_aggregate_walk);
+
+    /// Minimal IPv4 frame carrying a TCP or UDP header, for the
+    /// RX checksum deliverability tests. The IPv4 header checksum
+    /// field is left zero: the parser under test reads only the
+    /// protocol byte and the UDP checksum field, never the IP
+    /// checksum. `vlan_tag` inserts an inline 802.1Q tag (the
+    /// post-splice shape the pump hands the deliverability check).
+    fn ipv4_l4_frame(proto: u8, l4_checksum: u16, vlan_tag: Option<u16>) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+        f.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x02]);
+        if let Some(tag) = vlan_tag {
+            f.extend_from_slice(&[0x81, 0x00]);
+            f.extend_from_slice(&tag.to_be_bytes());
+        }
+        f.extend_from_slice(&[0x08, 0x00]);
+        let l4_len = if proto == 17 { 8 } else { 20 };
+        let total = (20 + l4_len + 4) as u16;
+        f.push(0x45);
+        f.push(0);
+        f.extend_from_slice(&total.to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0, 0]);
+        f.push(64);
+        f.push(proto);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(&[10, 0, 0, 1]);
+        f.extend_from_slice(&[10, 0, 0, 2]);
+        if proto == 17 {
+            f.extend_from_slice(&1234u16.to_be_bytes());
+            f.extend_from_slice(&5678u16.to_be_bytes());
+            f.extend_from_slice(&12u16.to_be_bytes());
+            f.extend_from_slice(&l4_checksum.to_be_bytes());
+        } else {
+            f.extend_from_slice(&1234u16.to_be_bytes());
+            f.extend_from_slice(&5678u16.to_be_bytes());
+            f.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+            f.extend_from_slice(&[0x50, 0, 0, 0]);
+            f.extend_from_slice(&l4_checksum.to_be_bytes());
+            f.extend_from_slice(&[0, 0]);
+        }
+        f.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        f
+    }
+
+    fn smoke_r8152_rx_csum_verdict() -> TestResult {
+        let cases: &[(u32, u32, RxCsumResult)] = &[
+            (0, 0, RxCsumResult::NotChecked),
+            (RD_IPV4_CS | RD_TCP_CS, 0, RxCsumResult::Good),
+            (RD_IPV4_CS | RD_UDP_CS, 0, RxCsumResult::Good),
+            (RD_IPV6_CS | RD_UDP_CS, 0, RxCsumResult::Good),
+            (RD_IPV6_CS | RD_TCP_CS, 0, RxCsumResult::Good),
+            (
+                RD_IPV4_CS,
+                RX_IPF,
+                RxCsumResult::Bad {
+                    ip: true,
+                    l4: false,
+                },
+            ),
+            (
+                RD_IPV4_CS | RD_TCP_CS,
+                RX_TCPF,
+                RxCsumResult::Bad {
+                    ip: false,
+                    l4: true,
+                },
+            ),
+            (
+                RD_IPV4_CS | RD_UDP_CS,
+                RX_UDPF,
+                RxCsumResult::Bad {
+                    ip: false,
+                    l4: true,
+                },
+            ),
+            // Checked IP only (e.g. ICMP): no L4 verdict either way.
+            (RD_IPV4_CS, 0, RxCsumResult::NotChecked),
+            // Fail bits for protocols the device did not mark
+            // checked are ignored.
+            (0, RX_IPF | RX_UDPF | RX_TCPF, RxCsumResult::NotChecked),
+            // Stray IPF on an IPv6 frame: IPF only applies to IPv4.
+            (RD_IPV6_CS | RD_TCP_CS, RX_IPF, RxCsumResult::Good),
+            // Contradictory descriptor (UDP failed, TCP passed):
+            // fail-closed Bad, where Linux would optimistically
+            // return CHECKSUM_UNNECESSARY via the TCP branch.
+            (
+                RD_IPV4_CS | RD_UDP_CS | RD_TCP_CS,
+                RX_UDPF,
+                RxCsumResult::Bad {
+                    ip: false,
+                    l4: true,
+                },
+            ),
+        ];
+        for (opts2, opts3, want) in cases {
+            let got = rx_csum_result(*opts2, *opts3);
+            if got != *want {
+                return TestResult::Fail("rx_csum_result verdict wrong");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_rx_csum_verdict);
+
+    fn smoke_r8152_rx_segment_deliverable() -> TestResult {
+        let udp_zero = ipv4_l4_frame(17, 0, None);
+        let udp_nonzero = ipv4_l4_frame(17, 0x1234, None);
+        let tcp = ipv4_l4_frame(6, 0x1234, None);
+        let udp_zero_vlan = ipv4_l4_frame(17, 0, Some(0x0007));
+        let short = alloc::vec![0u8; 10];
+        // IPv6/UDP with a zero checksum field: no exception (the
+        // IPv6 UDP checksum is mandatory), so a Bad verdict drops.
+        let mut udp6_zero = Vec::new();
+        udp6_zero.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+        udp6_zero.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x02]);
+        udp6_zero.extend_from_slice(&[0x86, 0xDD]);
+        udp6_zero.extend_from_slice(&[0x60, 0, 0, 0, 0, 12, 17, 64]);
+        udp6_zero.extend_from_slice(&[0u8; 32]);
+        udp6_zero.extend_from_slice(&1234u16.to_be_bytes());
+        udp6_zero.extend_from_slice(&5678u16.to_be_bytes());
+        udp6_zero.extend_from_slice(&12u16.to_be_bytes());
+        udp6_zero.extend_from_slice(&[0, 0]);
+        udp6_zero.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let bad_l4 = RxCsumResult::Bad {
+            ip: false,
+            l4: true,
+        };
+        let bad_ip = RxCsumResult::Bad {
+            ip: true,
+            l4: false,
+        };
+        let cases: &[(RxCsumResult, &[u8], bool)] = &[
+            (RxCsumResult::Good, &udp_zero, true),
+            (RxCsumResult::NotChecked, &udp_zero, true),
+            // IP failure wins over the UDP-zero exception: the
+            // header's fields cannot be trusted.
+            (bad_ip, &udp_zero, false),
+            // IPv4/UDP zero checksum is legal "no checksum".
+            (bad_l4, &udp_zero, true),
+            (bad_l4, &udp_nonzero, false),
+            (bad_l4, &tcp, false),
+            (bad_l4, &udp_zero_vlan, true),
+            (bad_l4, &short, false),
+            (bad_l4, &udp6_zero, false),
+            (
+                RxCsumResult::Bad {
+                    ip: false,
+                    l4: false,
+                },
+                &udp_zero,
+                false,
+            ),
+        ];
+        for (csum, frame, want) in cases {
+            if rx_segment_deliverable(*csum, frame) != *want {
+                return TestResult::Fail("rx_segment_deliverable wrong");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_rx_segment_deliverable);
+
+    fn smoke_r8152_rx_aggregate_csum_carriage() -> TestResult {
+        // One Good and one Bad segment: the walk must carry each
+        // segment's verdict, not just its location.
+        let mut f_good = ipv4_l4_frame(6, 0x1234, None);
+        f_good.resize(60, 0);
+        let mut f_bad = ipv4_l4_frame(6, 0x1234, None);
+        f_bad.resize(60, 0);
+        let mut buf = Vec::new();
+        let push_seg = |buf: &mut Vec<u8>, frame: &[u8], opts2: u32, opts3: u32| {
+            buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&opts2.to_le_bytes());
+            buf.extend_from_slice(&opts3.to_le_bytes());
+            buf.extend_from_slice(&[0u8; 12]);
+            buf.extend_from_slice(frame);
+        };
+        push_seg(&mut buf, &f_good, RD_IPV4_CS | RD_TCP_CS, 0);
+        push_seg(&mut buf, &f_bad, RD_IPV4_CS | RD_TCP_CS, RX_TCPF);
+        let segs = parse_rx_aggregate(&buf);
+        if segs.len() != 2 {
+            return TestResult::Fail("aggregate csum walk frame count wrong");
+        }
+        if segs[0].csum != RxCsumResult::Good {
+            return TestResult::Fail("good segment verdict lost");
+        }
+        if segs[1].csum
+            != (RxCsumResult::Bad {
+                ip: false,
+                l4: true,
+            })
+        {
+            return TestResult::Fail("bad segment verdict lost");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_rx_aggregate_csum_carriage);
 
     fn smoke_r8152_tx_segment_build() -> TestResult {
         let frame = datagram_frame(61, 0x5A);

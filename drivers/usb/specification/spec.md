@@ -330,13 +330,23 @@ also consult upstream Linux GPL sources.
   register writes (EEE/ALDPS configuration, flow-control
   advertisement) executed before CR RE/TE enable; RTL8153
   VER_03–VER_06 tables are implemented, other versions run on
-  reset defaults. After bind it advertises TX checksum, TSO and
-  VLAN-insert offloads via `iface::set_offloads`; TX metadata the
-  hardware cannot encode is rejected, and TCP super-frames fall
-  back to the stack's software GSO splitter. RX VLAN tags are
-  delivered in-band: with VLAN receive enabled the driver splices
-  the tag reported in the RX descriptor back into the frame for
-  the stack. Wake-on-LAN options are snapshotted from the device
+  reset defaults. After bind it advertises TX checksum, TSO,
+  VLAN-insert and RX checksum offloads via `iface::set_offloads`;
+  TX metadata the hardware cannot encode is rejected, and TCP
+  super-frames fall back to the stack's software GSO splitter.
+  RX checksum is decoded from the v1 RX descriptor report bits
+  (`opts2` `RD_IPV4_CS` / `RD_IPV6_CS` / `RD_TCP_CS` /
+  `RD_UDP_CS`, `opts3` `RX_IPF` / `RX_UDPF` / `RX_TCPF`): a
+  device-verified corrupt frame is dropped in the RX pump, since
+  the stack has no RX metadata consumer and a mark would be dead
+  data — the drop is the outcome software verification would
+  produce. The one exception is an IPv4/UDP frame with a zero
+  checksum field (legal "no checksum" per RFC 768), which is
+  delivered despite a UDP fail bit; contradictory descriptors
+  fail closed to drop. The RTL8157 v2 descriptor layout is not
+  decoded. RX VLAN tags are delivered in-band: with VLAN
+  receive enabled the driver splices the tag reported in the RX
+  descriptor back into the frame for the stack. Wake-on-LAN options are snapshotted from the device
   at bind and programmed through the `PLA_CRWECR` config window
   (`MAGIC` / link-on-wake / unicast / broadcast / multicast);
   USB remote-wakeup arming is not yet wired (per-NIC suspend
