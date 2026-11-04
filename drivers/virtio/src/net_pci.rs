@@ -113,6 +113,9 @@ pub const VIRTIO_NET_PCI_DEVICE: u16 = 0x1041;
 // the control queue.
 /// The device completes a partial transport checksum supplied by the driver.
 const VIRTIO_NET_F_CSUM: u64 = 0;
+/// The device validates RX transport checksums and reports
+/// `VIRTIO_NET_HDR_F_DATA_VALID` on valid frames (VirtIO 1.2 §5.1.3).
+const VIRTIO_NET_F_GUEST_CSUM: u64 = 1;
 const VIRTIO_NET_F_MTU: u64 = 3;
 const VIRTIO_NET_F_MAC: u64 = 5;
 /// The device can segment a driver-supplied IPv4/TCP GSO packet.
@@ -197,7 +200,11 @@ pub struct VirtioNetHdr {
 }
 
 const VIRTIO_NET_HDR_LEN: usize = core::mem::size_of::<VirtioNetHdr>();
-const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+pub(crate) const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+/// RX header flag (VirtIO 1.2 §5.1.6.1): the device validated the
+/// packet's checksum and it is valid. Mutually exclusive with
+/// NEEDS_CSUM (a partial checksum is, by definition, not validated).
+pub(crate) const VIRTIO_NET_HDR_F_DATA_VALID: u8 = 2;
 const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
 const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
 const ETH_HDR_LEN: usize = 14;
@@ -360,6 +367,11 @@ pub struct VirtioNetPci {
     /// request a partial checksum or GSO packet the transport did not accept.
     tx_checksum: bool,
     tx_tso4: bool,
+    /// True when `VIRTIO_NET_F_GUEST_CSUM` was negotiated. The RX
+    /// forwarder then enforces the DATA_VALID verdict (see
+    /// `rx_csum_deliver`); when false the device never reports
+    /// validity, so the forwarder delivers everything as before.
+    rx_guest_csum: bool,
     /// Runtime control-queue index (VirtIO 1.2 §5.1.2): with F_MQ
     /// negotiated and pairs > 1 the controlq sits at
     /// `2 * num_pairs`; without F_MQ it sits at fixed index 2.
@@ -706,6 +718,11 @@ impl VirtioNetPci {
         let want_mtu = feats & (1u64 << VIRTIO_NET_F_MTU) != 0;
         let want_csum = feats & (1u64 << VIRTIO_NET_F_CSUM) != 0;
         let want_tso4 = want_csum && feats & (1u64 << VIRTIO_NET_F_HOST_TSO4) != 0;
+        // GUEST_CSUM is independent of the TX profile: the device
+        // validates RX checksums and reports DATA_VALID per frame.
+        // Negotiating it never changes a TX header (the RX verdict
+        // path below reads the device-supplied flag only).
+        let want_guest_csum = feats & (1u64 << VIRTIO_NET_F_GUEST_CSUM) != 0;
         let want_ctrl_vq = feats & (1u64 << VIRTIO_NET_F_CTRL_VQ) != 0;
         // F_MQ requires F_CTRL_VQ (we can only command the device to
         // enable a pair count through the control queue). Reject MQ
@@ -723,6 +740,7 @@ impl VirtioNetPci {
         let drv_lo = ((1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32))
             | ((1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32))
             | ((1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32))
+            | ((1u32 << VIRTIO_NET_F_GUEST_CSUM) * (want_guest_csum as u32))
             | ((1u32 << VIRTIO_NET_F_HOST_TSO4) * (want_tso4 as u32))
             | ((1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32))
@@ -1015,6 +1033,7 @@ impl VirtioNetPci {
             has_status: want_status,
             tx_checksum: want_csum,
             tx_tso4: want_tso4,
+            rx_guest_csum: want_guest_csum,
             ctrl_qidx,
             ctrl,
             cfg_phys,
@@ -1167,6 +1186,13 @@ impl VirtioNetPci {
     /// after the optional `VQ_PAIRS_SET` ack). Always ≥ 1.
     pub fn num_pairs(&self) -> usize {
         self.pairs.len()
+    }
+
+    /// True when `VIRTIO_NET_F_GUEST_CSUM` was negotiated with this
+    /// device. The negotiated set is immutable after probe, so the RX
+    /// forwarder snapshots this once instead of consulting it per frame.
+    pub fn rx_guest_csum(&self) -> bool {
+        self.rx_guest_csum
     }
 
     fn tx_offload_profile(&self) -> TxOffloadProfile {
@@ -1739,6 +1765,136 @@ impl VirtioNetPci {
     }
 }
 
+/// RX checksum verdict under `VIRTIO_NET_F_GUEST_CSUM` — pure, so the
+/// smokes pin it without a device.
+///
+/// Returns true when the forwarder may deliver `payload` (the Ethernet
+/// frame *after* the 12-byte virtio-net header), false when it must drop
+/// it. `hdr_flags` is the header's flags byte.
+///
+/// Policy (drop-on-error interim, e1000 lane-2 precedent): Linux
+/// delivers an unverified frame and lets the stack re-verify it in
+/// software; NARF has no deliver-with-verdict channel yet (that is open
+/// PR #1411's RxMeta work — deliberately NOT built here), so the driver
+/// drops fail-closed instead. The end state is equivalent: no unverified
+/// checksummed frame reaches the stack. When #1411 lands, this function
+/// keeps its parse and the forwarder switches from drop to
+/// deliver-with-verdict.
+///
+/// The rule, in order:
+/// 1. Device-verified (`DATA_VALID` set, `NEEDS_CSUM` clear — the two
+///    are mutually exclusive per Linux `virtio_net_handle_csum_offload`)
+///    → deliver. A `NEEDS_CSUM` frame carries only a partial checksum
+///    the stack would have to complete, so it is NOT verified.
+/// 2. Otherwise the frame is unverified. Drop it ONLY when it is
+///    identifiably a checksummed transport segment: unfragmented (or
+///    first-fragment) IPv4/IPv6 TCP, or IPv4/IPv6 UDP with a nonzero
+///    checksum field. Everything else delivers, because dropping it
+///    would break traffic that has no checksum to verify:
+///    - Non-IP frames (ARP, …) have no transport checksum.
+///    - UDPv4 with a zero checksum field transmits no checksum
+///      (RFC 768); UDPv6 checksums are mandatory, so no exception.
+///    - Non-first IPv4 fragments carry no L4 header to verify, and
+///      dropping them would wedge reassembly; IPv6 fragments hide
+///      behind extension header 44 and take the same path.
+///    - Other IPv4/IPv6 protocols (ICMP, …) are delivered unverified
+///      exactly as before — their checksums are a follow-up, not
+///      silently claimed here.
+///    - Unparseable frames (runt, bad version/IHL, double VLAN tag)
+///      deliver: the stack drops malformed frames, and this function
+///      must not invent a verdict it cannot establish.
+/// 3. A single 802.1Q tag is skipped (L3 starts at offset 18, inner
+///    ethertype at [16..18]); double-tagged frames take the
+///    unparseable path and deliver.
+pub(crate) fn rx_csum_deliver(hdr_flags: u8, payload: &[u8]) -> bool {
+    const ETH_IPV4: u16 = 0x0800;
+    const ETH_IPV6: u16 = 0x86dd;
+    const ETH_VLAN: u16 = 0x8100;
+    const IP_PROTO_TCP: u8 = 6;
+    const IP_PROTO_UDP: u8 = 17;
+    const IPV6_EXT_HOP: u8 = 0;
+    const IPV6_EXT_ROUTE: u8 = 43;
+    const IPV6_EXT_FRAG: u8 = 44;
+    const IPV6_EXT_DEST: u8 = 60;
+    const IPV6_EXT_AH: u8 = 51;
+    const IPV6_EXT_ESP: u8 = 50;
+
+    if hdr_flags & VIRTIO_NET_HDR_F_DATA_VALID != 0 && hdr_flags & VIRTIO_NET_HDR_F_NEEDS_CSUM == 0
+    {
+        return true;
+    }
+    // Ethernet header + ethertype, with one VLAN hop.
+    let mut l3 = 14usize;
+    let mut ethertype = match payload.get(12..14) {
+        Some(b) => u16::from_be_bytes([b[0], b[1]]),
+        None => return true,
+    };
+    if ethertype == ETH_VLAN {
+        ethertype = match payload.get(16..18) {
+            Some(b) => u16::from_be_bytes([b[0], b[1]]),
+            None => return true,
+        };
+        l3 = 18;
+    }
+    match ethertype {
+        ETH_IPV4 => {
+            let Some(vihl) = payload.get(l3) else {
+                return true;
+            };
+            if vihl >> 4 != 4 {
+                return true;
+            }
+            let ihl = (vihl & 0x0f) as usize * 4;
+            if ihl < 20 || payload.len() < l3 + ihl {
+                return true;
+            }
+            // Fragmentation field (flags + offset), big-endian.
+            let frag = u16::from_be_bytes([payload[l3 + 6], payload[l3 + 7]]);
+            // Non-first fragment (offset != 0): no L4 header present.
+            if frag & 0x1fff != 0 {
+                return true;
+            }
+            let proto = payload[l3 + 9];
+            match proto {
+                IP_PROTO_TCP => false,
+                IP_PROTO_UDP => {
+                    // UDP header: checksum at +6, 8 bytes total.
+                    let Some(csum) = payload.get(l3 + ihl + 6..l3 + ihl + 8) else {
+                        return true;
+                    };
+                    // Zero UDPv4 checksum = no checksum transmitted.
+                    u16::from_be_bytes([csum[0], csum[1]]) == 0
+                }
+                _ => true,
+            }
+        }
+        ETH_IPV6 => {
+            if payload.len() < l3 + 40 {
+                return true;
+            }
+            if payload[l3] >> 4 != 6 {
+                return true;
+            }
+            let nh = payload[l3 + 6];
+            match nh {
+                IP_PROTO_TCP => false,
+                IP_PROTO_UDP => {
+                    // UDPv6 checksum is mandatory: no zero exception,
+                    // so a present UDP header drops. Only a truncated
+                    // frame (unparseable) delivers.
+                    payload.len() < l3 + 48
+                }
+                // Extension headers hide the L4 protocol (fragment
+                // header 44 included): deliver, do not guess.
+                IPV6_EXT_HOP | IPV6_EXT_ROUTE | IPV6_EXT_FRAG | IPV6_EXT_DEST | IPV6_EXT_AH
+                | IPV6_EXT_ESP => true,
+                _ => true,
+            }
+        }
+        _ => true,
+    }
+}
+
 // ── Driver-match registration ────────────────────────────────────────
 
 /// Every bound virtio-net device. A modern host can attach more than
@@ -2039,6 +2195,12 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                 if pair_idx == 0 {
                     narf_scheduler::wake_race_track(narf_scheduler::current_task_id().raw());
                 }
+                // GUEST_CSUM is negotiated once at probe and never
+                // re-negotiated, so snapshot it here instead of
+                // consulting the controller per frame. A vanished
+                // controller (None) disables enforcement — the drain
+                // loop returns on the first take anyway.
+                let rx_guest_csum = with_at(idx, |c| c.rx_guest_csum()).unwrap_or(false);
                 loop {
                     // Snapshot the IRQ generation BEFORE draining (Linux NAPI
                     // re-check pattern). A frame that lands during or after the
@@ -2085,6 +2247,24 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                             to_recycle = Some(buf);
                             continue;
                         }
+                        // GUEST_CSUM verdict (drop-on-error interim, see
+                        // `rx_csum_deliver`): the header's flags byte sits
+                        // at buf[0], the payload at [12..end]. Only
+                        // enforced when negotiated — without GUEST_CSUM
+                        // the device never sets DATA_VALID, so enforcing
+                        // would drop all checksummed traffic. Drops count
+                        // via note_rx_drop like the ring-full path, and
+                        // the buffer recycles exactly like an empty frame.
+                        let end = (12 + payload_len as usize).min(buf.len());
+                        if rx_guest_csum {
+                            let hdr_flags = buf.as_slice().first().copied().unwrap_or(0);
+                            let payload = buf.as_slice().get(12..end).unwrap_or(&[]);
+                            if !rx_csum_deliver(hdr_flags, payload) {
+                                narf_net::iface::note_rx_drop(primary_iface_name(), 1);
+                                to_recycle = Some(buf);
+                                continue;
+                            }
+                        }
                         // Tap: synchronously dispatch the payload through the iface
                         // RX handler. Only installed for the primary controller
                         // (idx 0) — the TCP stack hooked itself there at boot via
@@ -2095,7 +2275,6 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                         // the buddy allocator + per-frame 4 KiB zero-fill off the
                         // hot path.
                         if idx == 0 {
-                            let end = (12 + payload_len as usize).min(buf.len());
                             // `&mut`: an attached XDP program may rewrite header
                             // bytes in place. `buf` is a DmaBuffer this pump owns
                             // for the duration (recycled into the RX pool on the
@@ -2585,6 +2764,7 @@ mod tx_tests {
                 has_status: false,
                 tx_checksum: true,
                 tx_tso4: true,
+                rx_guest_csum: false,
                 ctrl_qidx: 4,
                 ctrl: None,
                 cfg_phys: 0,

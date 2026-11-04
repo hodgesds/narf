@@ -797,6 +797,114 @@ kernel_test_in!(
     smoke_virtio_net_tx_checksum_header_is_feature_gated
 );
 
+fn smoke_virtio_net_rx_csum_verdict() -> TestResult {
+    use crate::net_pci::{
+        rx_csum_deliver, VIRTIO_NET_HDR_F_DATA_VALID, VIRTIO_NET_HDR_F_NEEDS_CSUM,
+    };
+
+    const DATA_VALID: u8 = VIRTIO_NET_HDR_F_DATA_VALID;
+    const NEEDS_CSUM: u8 = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+    // IPv4/TCP frame via the shared builder (eth 14 + ip 20 + tcp 20).
+    let mut tcp4 = [0u8; 54];
+    virtio_test_ipv4_tcp_frame(&mut tcp4);
+    if !rx_csum_deliver(DATA_VALID, &tcp4) {
+        return TestResult::Fail("device-verified TCPv4 dropped");
+    }
+    if rx_csum_deliver(0, &tcp4) {
+        return TestResult::Fail("unverified TCPv4 delivered");
+    }
+    if rx_csum_deliver(NEEDS_CSUM, &tcp4) {
+        return TestResult::Fail("partial-checksum TCPv4 delivered");
+    }
+    if rx_csum_deliver(DATA_VALID | NEEDS_CSUM, &tcp4) {
+        return TestResult::Fail("contradictory DATA_VALID|NEEDS_CSUM TCPv4 delivered");
+    }
+    // IPv4/UDP with a nonzero checksum: drop when unverified.
+    let mut udp4 = [0u8; 42];
+    udp4[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    udp4[14] = 0x45;
+    udp4[14 + 9] = 17;
+    udp4[14 + 20 + 6..14 + 20 + 8].copy_from_slice(&0x1234u16.to_be_bytes());
+    if rx_csum_deliver(0, &udp4) {
+        return TestResult::Fail("unverified UDPv4 with checksum delivered");
+    }
+    if !rx_csum_deliver(DATA_VALID, &udp4) {
+        return TestResult::Fail("device-verified UDPv4 dropped");
+    }
+    // IPv4/UDP with a zero checksum field: no checksum transmitted.
+    let mut udp4_zero = udp4;
+    udp4_zero[14 + 20 + 6..14 + 20 + 8].copy_from_slice(&0u16.to_be_bytes());
+    if !rx_csum_deliver(0, &udp4_zero) {
+        return TestResult::Fail("zero-checksum UDPv4 dropped");
+    }
+    // ARP: no transport checksum to verify.
+    let mut arp = [0u8; 42];
+    arp[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    if !rx_csum_deliver(0, &arp) {
+        return TestResult::Fail("ARP dropped");
+    }
+    // IPv4/ICMP: delivered unverified (documented remainder).
+    let mut icmp4 = [0u8; 42];
+    icmp4[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    icmp4[14] = 0x45;
+    icmp4[14 + 9] = 1;
+    if !rx_csum_deliver(0, &icmp4) {
+        return TestResult::Fail("ICMPv4 dropped");
+    }
+    // IPv4 non-first fragment of a TCP packet: no L4 header present.
+    let mut frag = tcp4;
+    frag[14 + 6..14 + 8].copy_from_slice(&0x0001u16.to_be_bytes());
+    if !rx_csum_deliver(0, &frag) {
+        return TestResult::Fail("non-first TCPv4 fragment dropped");
+    }
+    // IPv4 first fragment (MF set, offset 0): L4 header present, drops.
+    let mut frag_first = tcp4;
+    frag_first[14 + 6..14 + 8].copy_from_slice(&0x2000u16.to_be_bytes());
+    if rx_csum_deliver(0, &frag_first) {
+        return TestResult::Fail("unverified first TCPv4 fragment delivered");
+    }
+    // IPv6/TCP and IPv6/UDP: drop when unverified.
+    let mut tcp6 = [0u8; 74];
+    tcp6[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    tcp6[14] = 0x60;
+    tcp6[14 + 6] = 6;
+    if rx_csum_deliver(0, &tcp6) {
+        return TestResult::Fail("unverified TCPv6 delivered");
+    }
+    if !rx_csum_deliver(DATA_VALID, &tcp6) {
+        return TestResult::Fail("device-verified TCPv6 dropped");
+    }
+    let mut udp6 = tcp6;
+    udp6[14 + 6] = 17;
+    if rx_csum_deliver(0, &udp6) {
+        return TestResult::Fail("unverified UDPv6 delivered");
+    }
+    // IPv6 with a fragment extension header: L4 hidden, delivers.
+    let mut ext6 = tcp6;
+    ext6[14 + 6] = 44;
+    if !rx_csum_deliver(0, &ext6) {
+        return TestResult::Fail("extension-header IPv6 dropped");
+    }
+    // Single 802.1Q tag around an IPv4/TCP frame: MAC + tag + inner
+    // ethertype, then the IP/TCP part (tcp4[14..]) at L3 offset 18.
+    let mut vlan = [0u8; 58];
+    vlan[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
+    vlan[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
+    vlan[18..58].copy_from_slice(&tcp4[14..54]);
+    if rx_csum_deliver(0, &vlan) {
+        return TestResult::Fail("unverified VLAN-tagged TCPv4 delivered");
+    }
+    if !rx_csum_deliver(DATA_VALID, &vlan) {
+        return TestResult::Fail("device-verified VLAN-tagged TCPv4 dropped");
+    }
+    // Runt: unparseable, delivers for the stack to drop.
+    if !rx_csum_deliver(0, &[0u8; 10]) {
+        return TestResult::Fail("runt dropped by verdict");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_rx_csum_verdict);
+
 fn smoke_virtio_net_pci_tx() -> TestResult {
     use crate::net_pci;
     use narf_bus::driver_match::__reset_for_test;
