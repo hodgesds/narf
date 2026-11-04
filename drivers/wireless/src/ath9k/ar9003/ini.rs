@@ -444,6 +444,7 @@ impl Tables {
             bb_post: AR9485_1_1_BASEBAND_POSTAMBLE,
             radio_core: AR9485_1_1_RADIO_CORE,
             radio_post: &[],
+            radio_post_sys2ant: &[],
             radio_post_allmodes: AR9485_1_1_RADIO_POSTAMBLE,
             soc_pre: AR9485_1_1_SOC_PREAMBLE,
             soc_post: &[],
