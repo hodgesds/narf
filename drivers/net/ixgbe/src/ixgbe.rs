@@ -944,16 +944,92 @@ impl Ixgbe {
         Ok(())
     }
 
-    /// Resume: re-enable queue 0 + RX + the misc vector, refresh
-    /// link state. Ring contents are NOT rebuilt here — a suspend
-    /// that lost DMA state needs a full re-probe (caller decision).
-    pub fn resume(&self) {
-        let mut bank = queues::MmioBank::new(&self.mmio);
-        pm::resume_plan(&mut bank);
+    /// Resume: REBUILD the DMA rings in place from the retained
+    /// host buffers, then unquiesce and refresh link state (spec
+    /// §13l decision — rebuild, not re-probe, following Linux's
+    /// resume shape of reset → reconfigure → open, minus the reset:
+    /// a reset would wipe RAR/RSS/VLAN/IVAR state this rebuild
+    /// does not restore, while the rebuild overwrites exactly the
+    /// datapath state it owns, so it is correct whether or not
+    /// the suspend actually lost device state).
+    ///
+    /// Fail-closed: every validation runs before any register or
+    /// ring memory is touched. On `Err` the device stays quiesced
+    /// (pumps keep refusing work) and the caller may re-probe;
+    /// a half-rebuilt datapath is never re-enabled.
+    pub fn resume(&self) -> Result<(), IxgbeError> {
+        let cfg = &self.queue_config;
+        cfg.validate()
+            .map_err(|_| IxgbeError::Other("invalid queue config"))?;
+        // The rebuild programs cfg.ring_len descriptors per queue
+        // into the rings bring-up allocated; a mismatch would
+        // over- or under-fill ring memory, so refuse rather than
+        // guess.
+        if cfg.ring_len != TX_RING_LEN || cfg.ring_len != RX_RING_LEN {
+            return Err(IxgbeError::Other(
+                "queue ring length != allocated ring length",
+            ));
+        }
+        // A slot-count mismatch means the ring and the slot table
+        // disagree; refuse before touching anything rather than
+        // arm a descriptor with no backing buffer.
+        if self.rx_slots.lock().len() != RX_RING_LEN {
+            return Err(IxgbeError::Other("rx slot count != ring length"));
+        }
+        // 1. Zero the TX ring: stale descriptors must not reach
+        // the device after re-enable.
+        // SAFETY: identity-mapped DMA ring page.
+        unsafe {
+            for i in 0..(TX_RING_LEN * 16) {
+                core::ptr::write_volatile(self.tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
+            }
+        }
+        // 2. Re-arm every RX descriptor from the buffer its slot
+        // currently owns (slots rotate as frames are handed up, so
+        // the current contents — not the bring-up pool order — are
+        // the truth).
+        let rx_phys = self.rx_ring.dma_addr().raw();
+        {
+            let slots = self.rx_slots.lock();
+            for (i, buf) in slots.iter().enumerate() {
+                let desc = RxDesc {
+                    addr: buf.dma_addr().raw(),
+                    length: 0,
+                    csum: 0,
+                    status: 0,
+                    errors: 0,
+                    special: 0,
+                };
+                // SAFETY: identity-mapped DMA ring page.
+                unsafe {
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
+                            .kernel_mut_ptr::<RxDesc>(),
+                        desc,
+                    );
+                }
+            }
+        }
+        // Descriptor writes must be visible before the device
+        // reads the rebuilt rings (same fence discipline as the
+        // RX pump's re-arm path).
+        compiler_fence(Ordering::SeqCst);
+        // 3. Reprogram rings + enables, one entry per queue.
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            pm::resume_rebuild_plan(&mut bank, cfg, &[self.tx_ring.dma_addr().raw()], &[rx_phys])
+                .map_err(IxgbeError::Other)?;
+        }
+        // 4. Reset the pump cursors to the rebuilt state, then
+        // unquiesce last, so no pump runs against a half-rebuilt
+        // ring.
+        *self.tx_tail.lock() = 0;
+        *self.rx_head.lock() = 0;
         *self.quiesced.lock() = false;
         // SAFETY: identity-mapped MMIO.
         let links = unsafe { self.mmio.read32(REG_LINKS) };
         *self.link_up.lock() = links & LINKS_UP != 0;
+        Ok(())
     }
 
     /// Prepare detach: suspend with no WoL + clear DRV_LOAD, and

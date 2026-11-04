@@ -16,11 +16,16 @@
 //!   refuses new TX / reports no RX while it is set, so the pumps
 //!   (which the driver cannot cancel — they hold `Arc` clones)
 //!   spin harmlessly instead of feeding a stopped device.
-//! * Resume: clear the quiesced flag → re-enable queue 0 (the only
-//!   live ring) → re-enable RX → unmask the misc vector → re-read
-//!   LINKS. Ring contents are NOT rebuilt here: a suspend that
-//!   lost DMA state needs a full re-probe, which is the caller's
-//!   decision (documented, not silently attempted).
+//! * Resume: REBUILD the DMA rings in place, then unquiesce (see
+//!   `resume_rebuild_plan` and spec §13l for the decision): clear
+//!   queue enables → reprogram ring bases, lengths, heads, tails
+//!   from the retained host buffers, one entry per configured
+//!   queue → re-arm the RX filter + master enable → unmask the
+//!   misc vector. The rebuild is unconditional and idempotent —
+//!   it is correct whether or not the suspend actually lost
+//!   device state — and fail-closed: any validation failure
+//!   returns before a single register is written, so the device
+//!   stays quiesced and the caller may re-probe instead.
 //! * Detach: the suspend sequence with no WoL, plus clearing
 //!   CTRL_EXT.DRV_LOAD, plus (in `detach_controller`, ixgbe.rs) the
 //!   framework steps — clear the CONTROLLER slot, clear the RX
@@ -28,8 +33,9 @@
 //!   — so a re-probe under a recycled `eth%d` name starts clean
 //!   (see net spec §3, issue #789).
 
-use super::queues::{rx_queue_regs, tx_queue_regs, RegBank};
+use super::queues::{rx_queue_regs, tx_queue_regs, QueueConfig, RegBank};
 use super::wol::WolConfig;
+use super::{FCTRL_BAM, FCTRL_MPE, FCTRL_UPE, REG_FCTRL, SRRCTL_BSIZE_2K, SRRCTL_DESCTYPE_LEGACY};
 
 /// RXCTRL register + RXEN bit (datasheet §8.2.3.8.10).
 pub const REG_RXCTRL: u64 = 0x03000;
@@ -66,19 +72,70 @@ pub fn suspend_plan(bank: &mut impl RegBank, wol: Option<WolConfig>) {
     }
 }
 
-/// Re-enable the queue-0 datapath after resume.
-pub fn resume_plan(bank: &mut impl RegBank) {
-    // 1. Re-enable queue 0.
-    if let Some(tx) = tx_queue_regs(0) {
+/// Rebuild the DMA datapath after resume, in place, from the
+/// retained host ring buffers — the §13l decision (rebuild, not
+/// re-probe). `tx_bases` / `rx_bases` hold one DMA base address
+/// per configured queue, in queue order; on main that is one entry
+/// each (the 1/1 bring-up), and a multi-queue bring-up passes one
+/// entry per live queue, so this loop — never a hardcoded queue 0
+/// — is what composes with per-queue rings.
+///
+/// Sequence mirrors Linux `ixgbe_configure_tx_ring` /
+/// `ixgbe_configure_rx_ring` (clear the queue-enable bit, program
+/// base / length / head / tail, then set enable) and NARF's own
+/// bring-up values (RX tail = ring_len - 1 after all descriptors
+/// are armed, SRRCTL 2K legacy, FCTRL BAM|UPE|MPE, RXCTRL RXEN).
+/// The caller (`Ixgbe::resume`) zeroes the TX ring memory and
+/// re-arms the RX descriptors from the retained slot buffers
+/// before calling this; this plan only programs registers.
+///
+/// Fail-closed: configuration validation and base-count checks
+/// run before any register write. On `Err` the bank is untouched
+/// and the device must stay quiesced.
+pub fn resume_rebuild_plan(
+    bank: &mut impl RegBank,
+    cfg: &QueueConfig,
+    tx_bases: &[u64],
+    rx_bases: &[u64],
+) -> Result<(), &'static str> {
+    cfg.validate().map_err(|_| "invalid queue config")?;
+    if tx_bases.len() != cfg.num_tx {
+        return Err("tx base count != tx queue count");
+    }
+    if rx_bases.len() != cfg.num_rx {
+        return Err("rx base count != rx queue count");
+    }
+    // 1. TX queues: disable, reprogram, re-enable.
+    for (q, base) in tx_bases.iter().enumerate() {
+        let tx = tx_queue_regs(q).ok_or("tx queue registers unresolvable")?;
+        bank.clear_bits(tx.txdctl, XDCTL_ENABLE_PM);
+        bank.write32(tx.tdbal, *base as u32);
+        bank.write32(tx.tdbah, (*base >> 32) as u32);
+        bank.write32(tx.tdlen, (cfg.ring_len * 16) as u32);
+        bank.write32(tx.tdh, 0);
+        bank.write32(tx.tdt, 0);
         bank.set_bits(tx.txdctl, XDCTL_ENABLE_PM);
     }
-    if let Some(rx) = rx_queue_regs(0) {
+    // 2. RX queues: disable, reprogram, re-enable. Tail =
+    // ring_len - 1: every descriptor was re-armed by the caller,
+    // so all of them belong to the device again.
+    for (q, base) in rx_bases.iter().enumerate() {
+        let rx = rx_queue_regs(q).ok_or("rx queue registers unresolvable")?;
+        bank.clear_bits(rx.rxdctl, XDCTL_ENABLE_PM);
+        bank.write32(rx.rdbal, *base as u32);
+        bank.write32(rx.rdbah, (*base >> 32) as u32);
+        bank.write32(rx.rdlen, (cfg.ring_len * 16) as u32);
+        bank.write32(rx.rdh, 0);
+        bank.write32(rx.rdt, (cfg.ring_len - 1) as u32);
+        bank.write32(rx.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY);
         bank.set_bits(rx.rxdctl, XDCTL_ENABLE_PM);
     }
-    // 2. Re-enable the receiver.
+    // 3. Restore the bring-up receive filter + master enable,
+    // then unmask the shared misc vector.
+    bank.write32(REG_FCTRL, FCTRL_BAM | FCTRL_UPE | FCTRL_MPE);
     bank.set_bits(REG_RXCTRL, RXCTRL_RXEN);
-    // 3. Unmask the shared misc vector.
     bank.write32(REG_EIMS_PM, EIMS_MISC_VECTOR);
+    Ok(())
 }
 
 /// Detach extras, after [`suspend_plan`] with no WoL: tell

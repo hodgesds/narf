@@ -213,20 +213,19 @@ a fake bank (fixtures assert the register conversations):
 `suspend_plan` masks all interrupts (EIMC = all-ones), clears
 RXEN (RXCTRL 0x03000 bit 0), disables queue 0 (RXDCTL/TXDCTL
 ENABLE bit 25 cleared), clears wake status, and arms WoL when
-given a config; `resume_plan` re-enables queue 0, RXEN, and the
-misc vector (EIMS = 1) and refreshes link state from LINKS;
-`detach_plan` suspends with no WoL and clears CTRL_EXT DRV_LOAD
-(bit 28, set at bring-up). `Ixgbe::suspend(wol)` /
-`resume()` / `prepare_detach()` drive the plans and the
-`quiesced` flag, which makes `tx`/`tx_frame` refuse and RX
-report nothing while set (pumps cannot be cancelled — they
-hold Arc clones). `detach_controller()` additionally drops
-the CONTROLLER slot, clears the RX mirror note, and
-unregisters the iface (eth%d names are reused). The PCI
-D-state step itself belongs to the platform PM layer, not
-this driver. Ring contents are NOT rebuilt on resume — a
-suspend that lost DMA state needs a full re-probe, which is
-a caller decision recorded as a follow-up (§14).
+given a config; `resume_rebuild_plan` rebuilds the DMA rings
+in place (see §13l) and re-enables RXEN and the misc vector
+(EIMS = 1); `detach_plan` suspends with no WoL and clears
+CTRL_EXT DRV_LOAD (bit 28, set at bring-up).
+`Ixgbe::suspend(wol)` / `resume()` / `prepare_detach()` drive
+the plans and the `quiesced` flag, which makes `tx`/`tx_frame`
+refuse and RX report nothing while set (pumps cannot be
+cancelled — they hold Arc clones). `detach_controller()`
+additionally drops the CONTROLLER slot, clears the RX mirror
+note, and unregisters the iface (eth%d names are reused).
+The PCI D-state step itself belongs to the platform PM layer,
+not this driver. `resume()` returns `Result`: on error the
+device stays quiesced and the caller may re-probe.
 
 ## 13. Ethtool surface
 
@@ -299,6 +298,69 @@ snapshot cannot populate EEE state from hardware without
 those transports, so EEE status is reported through
 `eee_status()`, not the snapshot.
 
+## 13l. Resume ring rebuild (issue #1271 decision: rebuild, not re-probe)
+
+Decision: on resume, the driver REBUILDS the DMA rings in
+place from the retained host buffers instead of requiring a
+full re-probe after a suspend that lost DMA state.
+
+Rationale, following Linux: Linux `ixgbe_resume`
+(`ixgbe_main.c`) does `pci_enable_device_mem` →
+`ixgbe_reset` → WUS clear → `ixgbe_init_interrupt_scheme`
+→ `ixgbe_open` (when running), and `open` reconfigures the
+rings from scratch (`ixgbe_configure_tx_ring` /
+`ixgbe_configure_rx_ring`: clear the queue-enable bit,
+program base / length / head / tail, then set enable).
+NARF maps that shape onto what it retains: the driver owns
+the ring buffers for the device's lifetime (`tx_ring` /
+`rx_ring` / `tx_pool` / `rx_slots` are struct fields, never
+freed on suspend), so `Ixgbe::resume` zeroes the TX ring,
+re-arms every RX descriptor from its slot's current buffer
+(slots rotate as frames are handed up — current contents,
+not bring-up order, are the truth), resets the pump cursors,
+and `pm::resume_rebuild_plan` reprograms one ring per
+configured queue (never a hardcoded queue 0 — the plan takes
+one DMA base per queue, which is what composes with
+per-queue rings), restores SRRCTL / FCTRL / RXEN, and
+unmasks the misc vector. The rebuild is unconditional and
+idempotent: reprogramming rings from retained buffers is
+correct whether or not the suspend actually lost device
+state, so no lost-vs-preserved detection is needed.
+
+Deliberate differences from Linux, each documented so the
+maintainer can overrule:
+- NO `CTRL.RST` on resume. A reset would wipe non-DMA
+  config this rebuild does not restore (RAR, RSS tables,
+  VLAN tables, IVAR routing), leaving a worse-than-before
+  datapath. The rebuild overwrites exactly the datapath
+  state it owns; registers it does not touch keep their
+  pre-suspend values when the device preserves them.
+- NO re-probe path. Re-probe would need a platform PM
+  re-enumeration hook plus controller replacement under
+  live pump `Arc` clones; neither exists in-tree. The
+  fail-closed `Err` from `resume()` is the re-probe
+  trigger instead: the device stays quiesced, pumps keep
+  refusing work, and the caller may re-probe.
+
+Fail-closed rules (all checked before any register or ring
+memory is touched): queue config must validate; ring
+length must equal the allocated ring lengths; RX slot count
+must equal the ring length; per-queue base counts must
+match the queue counts; every queue's register block must
+resolve. Any violation returns `Err` with the device still
+quiesced.
+
+Remainders (not silently dropped):
+- Non-DMA state is NOT restored: RAR, RSS tables, VLAN
+  tables, and the MSI-X interrupt scheme keep pre-suspend
+  values only if the device preserved them. A suspend that
+  loses non-DMA state still needs a re-probe — or a future
+  full-reconfigure lane that restores those tables from the
+  driver's retained config (`mac`, `rss_cfg`,
+  `vlan_filter`, `msix`).
+- No `CTRL.RST` means a device that wedges across suspend
+  (rather than merely losing state) is not reset by this
+  path; that recovery belongs to the same future lane.
 ## 14. Sequenced follow-ups (not silently dropped)
 
 Per the v0.1 exclusion list, still open after this stream:
@@ -321,6 +383,8 @@ Per the v0.1 exclusion list, still open after this stream:
 - IPAV (0x05838 candidate) — datasheet text extraction was
   ambiguous, so it is not programmed; see §12.
 - Per-queue statistics counters (QPRC/QPTC offsets ungrounded).
+- Resume full-reconfigure (RAR / RSS / VLAN / MSI-X restore)
+  for suspends that lose non-DMA state — see §13l.
 
 Per project rule, smokes live in `drivers/net/src/ixgbe/tests.rs`
 and register via `kernel_test_in!("drivers/net/ixgbe", …)`.
