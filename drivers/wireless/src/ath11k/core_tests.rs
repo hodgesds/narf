@@ -1465,3 +1465,75 @@ kernel_test_in!(
     smoke_ath11k_qca6390_core_over_real_ce
 );
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_core_over_real_ce);
+
+/// Per-pdev WMI routing: commands addressed to pdev 1 go to the MAC1
+/// endpoint, not the soc / pdev-0 endpoint, and events arriving on a
+/// per-pdev endpoint are delivered to the WMI queue instead of being
+/// counted unrouted. The endpoints are connected by hand (no bring-up
+/// script): the routing under test is the endpoint selection, not the
+/// HTC connect handshake.
+fn smoke_ath11k_wmi_per_pdev_routing() -> TestResult {
+    let (mut core, trace) = fake_core(Script::default());
+    let ep0 = super::htc::HtcConnected {
+        service_id: svc_id::WMI_CONTROL,
+        eid: 2,
+        max_msg_len: 2048,
+        ul_pipe: 5,
+        dl_pipe: 6,
+        tx_credits: 0,
+        credit_flow: false,
+    };
+    let ep1 = super::htc::HtcConnected {
+        service_id: svc_id::WMI_CONTROL_MAC1,
+        eid: 3,
+        max_msg_len: 2048,
+        ul_pipe: 7,
+        dl_pipe: 8,
+        tx_credits: 0,
+        credit_flow: false,
+    };
+    core.wmi_ep = Some(ep0);
+    core.wmi_pdev_eps = vec![ep0, ep1];
+    core.htc.endpoints[2].ul_pipe_id = 5;
+    core.htc.endpoints[2].tx_credit_flow_enabled = false;
+    core.htc.endpoints[3].ul_pipe_id = 7;
+    core.htc.endpoints[3].tx_credit_flow_enabled = false;
+    let cmd = WmiCmd {
+        cmd_id: 0x1234,
+        buf: vec![],
+    };
+    // The legacy path stays on pdev 0.
+    ensure!(core.wmi_cmd_try_send(&cmd).is_ok(), "pdev 0 send");
+    // The per-pdev path goes to the MAC1 endpoint.
+    ensure!(core.wmi_cmd_try_send_on(1, &cmd).is_ok(), "pdev 1 send");
+    // No third endpoint connected.
+    ensure!(
+        core.wmi_cmd_try_send_on(2, &cmd).is_err(),
+        "unconnected pdev sends"
+    );
+    let pipes: Vec<u8> = trace
+        .borrow()
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Tx { pipe, .. } => Some(*pipe),
+            _ => None,
+        })
+        .collect();
+    ensure!(pipes == vec![5, 7], "commands land on their pdev's pipe");
+    // Delivery: an event on the MAC1 endpoint reaches the WMI queue.
+    let event = 0x9999u32.to_le_bytes().to_vec();
+    let frame = htc::target_frame(3, &event, &[]);
+    core.hif.rx.push_back((99, frame));
+    core.drain_rx();
+    let ev = match core.take_event() {
+        Some(ev) => ev,
+        None => return TestResult::Fail("pdev 1 event delivered"),
+    };
+    ensure!(ev.id == 0x9999, "pdev 1 event id");
+    ensure!(
+        core.stats.rx_unrouted == 0,
+        "pdev 1 event not counted unrouted"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_wmi_per_pdev_routing);

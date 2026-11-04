@@ -27,8 +27,8 @@ fn sibling_ap(u: &Up) -> Result<Sibling, &'static str> {
     let own = [2, 3, 7, 0x12, 0x34, 0x57];
     caps.mac_addr = own;
     let mac = Mac::new(
-        Port(u.shared.clone(), 1),
-        Port(u.shared.clone(), 1),
+        Port(u.shared.clone(), 1, 0),
+        Port(u.shared.clone(), 1, 0),
         caps,
         MacConfig::wcn6855().with_vdev(1),
         reg.as_deref(),
