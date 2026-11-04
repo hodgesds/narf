@@ -70,7 +70,9 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   Connections pairing), §2.3.5.1 (pairing-method selection table 2.8),
   §2.3.5.6 (pairing phase 2), §2.2.5 (AES-CMAC), §2.2.6 (f4 confirm
   values, table 2.1), §2.2.7 (f5 MacKey / LTK derivation), §2.2.8
-  (f6 DHKey checks, table 2.2), §2.2.9 (g2), Appendix D (sample
+  (f6 DHKey checks, table 2.2), §2.2.9 (g2), §3.6.1 (key
+  distribution, Peripheral first), §3.6.4–§3.6.6 (distribution only
+  on an encrypted link), §3.6.7 (Security Request), Appendix D (sample
   data pinning the f4/f5/f6 helpers byte-for-byte).
 
 ### HFP (Hands-Free Profile)
@@ -192,11 +194,15 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   `PumpCore`; `pump::enable_spawning()` (Stage::Late `bluetooth-pump`
   initcall) starts a stackful pump task per controller. `pump::pump_once(index)`
   is the fixture-drivable step: events are dispatched (connection tracking,
-  LTK-request refusal, flow control) and fanned out to the raw-HCI socket
+  LTK-request answering from the in-progress AuthComplete session or
+  the bond store, else negative reply, flow control) and fanned out to the raw-HCI socket
   queue (`hci_sock::drain_event` reads it once a pump is active), ACL frames
   are reassembled per connection and routed by CID — ATT to the
-  per-controller `GattServer`, SMP to a per-connection `smp::Responder`
-  driven by the production `pump::NarfSmpCrypto` (narf-crypto P-256 /
+  per-controller `GattServer`, SMP to a per-connection SMP session
+  (`smp::Responder` for peer-initiated pairings, `smp::Initiator`
+  when the peer sends a Security Request or the application calls
+  `pump::smp_initiate_pairing`) driven by the production
+  `pump::NarfSmpCrypto` (narf-crypto P-256 /
   AES-CMAC / hardware RNG), signalling channels answered per §L2CAP.
   Connection tracking also mirrors into sysfs: connect gains the
   `hci<N>:<handle>` child, disconnect removes it (issue #891).
@@ -264,9 +270,10 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   composing the layers below into a running system — connection table,
   ACL flow control, raw-socket event fan-out, per-connection L2CAP
   dispatch (ATT → GATT server with default GAP/GATT/DIS/Battery/HID
-  services, SMP → Just-Works responder, LE + BR/EDR signalling
-  answers, dynamic CIDs → open channel servers). Production
-  `SmpCrypto` via narf-crypto (`NarfSmpCrypto`).
+  services, SMP → Just-Works responder + initiator with bonding
+  (§3.6.1 Phase 3 distribution, bond store, re-encryption), LE +
+  BR/EDR signalling answers, dynamic CIDs → open channel servers).
+  Production `SmpCrypto` via narf-crypto (`NarfSmpCrypto`).
 - **L2CAP** (`l2cap`): CID constants, B-frame codec, ACL fragment
   reassembler that handles the PB-flag rules from Vol 4 Part E §5.4.2,
   signalling-command codec + iterator, dynamic CID allocator, LE
@@ -303,6 +310,25 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   0x04 / 0x0B via the pump). Numeric Comparison g2 helper
   (§2.2.9). Crypto primitives injected through `SmpCrypto` trait
   (P-256 keygen + DH, AES-CMAC, RNG).
+- **Bonding** (`bond_store` + pump SMP session): both roles negotiate
+  bonding (both Bonding_Flags == 01) and Phase 3 key distribution
+  (§3.6.1: IdKey + Sign, negotiated as the intersection of the two
+  sides' distribution bytes; EncKey ignored for LE Secure
+  Connections, LinkKey out of scope). After authentication the
+  session parks at AuthComplete until the link is encrypted —
+  distribution PDUs are only legal on an encrypted link
+  (§3.6.4–§3.6.6) — then the Peripheral distributes first, then the
+  Central, in IRK / identity-address / CSRK order. A completed
+  bonded pairing persists in the per-controller `BondStore`
+  (peer address + LTK + EDIV/Rand, both zero for SC, + peer IRK /
+  identity address / CSRK); LE LTK Requests are answered from the
+  in-progress AuthComplete session first, then from the store on
+  exact peer + EDIV/Rand match, else negative-replied. The pump
+  exposes `smp_initiate_pairing` (application trigger),
+  `smp_start_encryption` (re-encrypt from a bond), `forget_bond`,
+  and `bond_count`. No ATT-triggered pairing yet (no auth-gated
+  attribute exists); no on-disk bond persistence (bonds live for
+  the controller lifetime).
 - **GATT server** (`gatt_server`): in-memory attribute database
   with handle assignment + permission flags, request handler that
   answers Read / Write / Read By Type / Read By Group Type / Find
@@ -383,10 +409,10 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
 - Realtek / Broadcom USB vendor firmware protocols (Intel, MediaTek and
   Qualcomm loaders live in `narf-drivers-usb::btusb`) and Bluetooth
   policy daemons.
-- Bonding / LTK storage, SMP key distribution, pairing initiation from
-  the kernel (needs an application policy trigger), and SCO/eSCO
-  isochronous USB transport. Staged channel payloads have no
-  socket/devfs consumer yet (drain APIs exist; wiring is follow-up).
+- Pairing initiation from the kernel on application policy trigger
+  (no upper-layer trigger API yet), and SCO/eSCO isochronous USB
+  transport. Staged channel payloads have no socket/devfs consumer
+  yet (drain APIs exist; wiring is follow-up).
 
 ## Cap surface
 

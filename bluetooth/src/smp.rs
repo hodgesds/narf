@@ -63,6 +63,21 @@ pub const SMP_PAIRING_PUBLIC_KEY: u8 = 0x0C;
 pub const SMP_PAIRING_DHKEY_CHECK: u8 = 0x0D;
 pub const SMP_PAIRING_KEYPRESS_NOTIFICATION: u8 = 0x0E;
 
+/// Key-distribution field bits (Part H §3.6.1, Figure 3.11).
+/// The octet layout is a bitmask: bit 0 EncKey, bit 1 IdKey,
+/// bit 2 Sign, bit 3 LinkKey. This lane only ever negotiates the
+/// IdKey and Sign bits — EncKey is ignored for LE Secure
+/// Connections (§3.6.1: "the EncKey field shall be ignored. EDIV
+/// and Rand shall be set to zero and shall not be distributed"),
+/// and LinkKey (BR/EDR cross-transport) is out of scope.
+pub const DIST_ENCKEY: u8 = 0x01;
+pub const DIST_IDKEY: u8 = 0x02;
+pub const DIST_SIGN: u8 = 0x04;
+pub const DIST_LINKKEY: u8 = 0x08;
+
+/// Distribution bits this lane negotiates (IdKey | Sign).
+pub const DIST_SUPPORTED: u8 = DIST_IDKEY | DIST_SIGN;
+
 // ── Pairing failure reasons (§3.5.5, table 3.7) ───────────────────
 pub const SMP_FAILED_PASSKEY_ENTRY: u8 = 0x01;
 pub const SMP_FAILED_OOB_NOT_AVAILABLE: u8 = 0x02;
@@ -382,6 +397,17 @@ pub enum PairingState {
     WaitConfirm,
     WaitRandom,
     SentDhKeyCheck,
+    /// Authentication (Phase 2) completed and keys are negotiated
+    /// for distribution, but the link is not yet encrypted. Phase 3
+    /// distribution PDUs are only legal on an encrypted link (Part H
+    /// §3.6.4–§3.6.6), so the session parks here until the pump
+    /// reports encryption; the pump then calls
+    /// [`Initiator::begin_distribution`].
+    AuthComplete,
+    /// Our side's distribution PDUs (if any) are sent and the
+    /// peer's are still arriving. [`Initiator::on_distribution`]
+    /// consumes them in §3.6.1 order.
+    WaitDistribution,
     Done,
     Failed,
 }
@@ -396,6 +422,91 @@ pub enum PairingError {
     BadDhKeyCheck,
     /// Peer sent a PDU we don't know how to consume in this state.
     Protocol,
+}
+
+/// Phase 3 key-distribution helpers (Part H §3.6.1, §3.6.4–§3.6.6).
+///
+/// Distribution order for LE Secure Connections is fixed: the
+/// Peripheral distributes first (IRK, then BD_ADDR, then CSRK),
+/// then the Central distributes in the same order. Within one
+/// side's distribution, Identity Information (IRK) is always
+/// followed by Identity Address Information — the two are one
+/// IdKey unit, not independent keys.
+///
+/// Build this side's Phase 3 PDUs for the negotiated `dist_send`
+/// set, in §3.6.1 order: Identity Information, Identity Address
+/// Information, Signing Information. The IRK and CSRK are fresh
+/// randoms per pairing — a stable device IRK (so a peer's stored
+/// bond can resolve our RPA across pairings) is future work; a
+/// fresh IRK per pairing is conformant, it only forfeits RPA
+/// resolution by previously-bonded peers.
+fn own_distribution_pdus(crypto: &dyn SmpCrypto, dist_send: u8, own_addr: &[u8; 7]) -> Vec<Pdu> {
+    let mut out = Vec::new();
+    if dist_send & DIST_IDKEY != 0 {
+        out.push(Pdu {
+            code: SMP_IDENTITY_INFORMATION,
+            payload: crypto.rand128().to_vec(),
+        });
+        let mut addr = Vec::with_capacity(7);
+        addr.extend_from_slice(own_addr);
+        out.push(Pdu {
+            code: SMP_IDENTITY_ADDRESS_INFORMATION,
+            payload: addr,
+        });
+    }
+    if dist_send & DIST_SIGN != 0 {
+        out.push(Pdu {
+            code: SMP_SIGNING_INFORMATION,
+            payload: crypto.rand128().to_vec(),
+        });
+    }
+    out
+}
+
+/// Consume one peer Phase 3 PDU in §3.6.1 order. Returns true
+/// when the peer's distribution is complete (no keys remain
+/// expected). Strict: a PDU out of order, of the wrong code, or
+/// arriving when nothing is expected is a Protocol error — the
+/// caller fails the pairing rather than storing a half-parsed
+/// key set.
+#[allow(clippy::too_many_arguments)]
+fn consume_distribution_pdu(
+    dist_expect: &mut u8,
+    got_identity: &mut bool,
+    peer_irk: &mut Option<[u8; 16]>,
+    peer_identity_addr: &mut Option<[u8; 7]>,
+    peer_csrk: &mut Option<[u8; 16]>,
+    rx: &Pdu,
+) -> Result<bool, PairingError> {
+    if *dist_expect & DIST_IDKEY != 0 && !*got_identity {
+        if rx.code != SMP_IDENTITY_INFORMATION || rx.payload.len() != 16 {
+            return Err(PairingError::Protocol);
+        }
+        let mut irk = [0u8; 16];
+        irk.copy_from_slice(&rx.payload);
+        *peer_irk = Some(irk);
+        *got_identity = true;
+    } else if *got_identity {
+        if rx.code != SMP_IDENTITY_ADDRESS_INFORMATION || rx.payload.len() != 7 {
+            return Err(PairingError::Protocol);
+        }
+        let mut addr = [0u8; 7];
+        addr.copy_from_slice(&rx.payload);
+        *peer_identity_addr = Some(addr);
+        *got_identity = false;
+        *dist_expect &= !DIST_IDKEY;
+    } else if *dist_expect & DIST_SIGN != 0 {
+        if rx.code != SMP_SIGNING_INFORMATION || rx.payload.len() != 16 {
+            return Err(PairingError::Protocol);
+        }
+        let mut csrk = [0u8; 16];
+        csrk.copy_from_slice(&rx.payload);
+        *peer_csrk = Some(csrk);
+        *dist_expect &= !DIST_SIGN;
+    } else {
+        return Err(PairingError::Protocol);
+    }
+    Ok(*dist_expect == 0)
 }
 
 /// Initiator-side pairing state. The application drives `start()`
@@ -432,6 +543,23 @@ pub struct Initiator<C: SmpCrypto> {
     features: PairingFeatureExchange,
     /// Peer features captured from Pairing_Response.
     peer_features: PairingFeatureExchange,
+    /// True when both sides negotiated bonding (both Bonding_Flags
+    /// == 01). The pump stores a bond only when this is set; a
+    /// non-bonded pairing's LTK lives for the connection only.
+    pub bonded: bool,
+    /// Keys this side sends in Phase 3, negotiated as (own byte) ∩
+    /// (peer byte) masked to [`DIST_SUPPORTED`]. Zero when not
+    /// bonding or when nothing was negotiated.
+    dist_send: u8,
+    /// Keys the peer sends in Phase 3, same negotiation.
+    dist_expect: u8,
+    /// True after Identity Information arrived while expecting
+    /// IdKey — the next PDU must be Identity Address Information.
+    got_identity: bool,
+    /// Peer's distributed keys, filled as Phase 3 PDUs arrive.
+    pub peer_irk: Option<[u8; 16]>,
+    pub peer_identity_addr: Option<[u8; 7]>,
+    pub peer_csrk: Option<[u8; 16]>,
 }
 
 impl<C: SmpCrypto> Initiator<C> {
@@ -460,8 +588,13 @@ impl<C: SmpCrypto> Initiator<C> {
                 oob_data_flag: 0,
                 auth_req: AUTH_BONDING | AUTH_SC,
                 max_encryption_key_size: 16,
-                initiator_key_distribution: 0,
-                responder_key_distribution: 0,
+                // Offer IdKey + Sign and request the same. The
+                // negotiated set is the intersection (§3.6.1: "The
+                // Peripheral shall not set to one any flag in the
+                // Response that the Central has set to zero in the
+                // Request"), so offering both never over-promises.
+                initiator_key_distribution: DIST_SUPPORTED,
+                responder_key_distribution: DIST_SUPPORTED,
             },
             peer_features: PairingFeatureExchange {
                 io_capability: 0,
@@ -471,6 +604,13 @@ impl<C: SmpCrypto> Initiator<C> {
                 initiator_key_distribution: 0,
                 responder_key_distribution: 0,
             },
+            bonded: false,
+            dist_send: 0,
+            dist_expect: 0,
+            got_identity: false,
+            peer_irk: None,
+            peer_identity_addr: None,
+            peer_csrk: None,
         }
     }
 
@@ -499,8 +639,50 @@ impl<C: SmpCrypto> Initiator<C> {
             PairingState::WaitConfirm => self.on_pairing_confirm(rx),
             PairingState::WaitRandom => self.on_pairing_random(rx),
             PairingState::SentDhKeyCheck => self.on_dhkey_check(rx),
+            PairingState::WaitDistribution => self.on_distribution(rx),
+            // AuthComplete parks the session until the pump
+            // reports encryption. A distribution PDU here is
+            // nonconformant (Phase 3 needs an encrypted link) —
+            // fail, do not buffer it.
             _ => Err(PairingError::Protocol),
         }
+    }
+
+    /// Start Phase 3 after the pump reports the link encrypted.
+    /// The responder (Peripheral) distributes first (§3.6.1), so
+    /// the initiator sends nothing yet when it still expects peer
+    /// keys; when nothing is expected it sends its own PDUs and
+    /// completes immediately. Only valid from AuthComplete.
+    pub fn begin_distribution(&mut self) -> Vec<Pdu> {
+        if self.state != PairingState::AuthComplete {
+            return Vec::new();
+        }
+        if self.dist_expect == 0 {
+            self.state = PairingState::Done;
+            return own_distribution_pdus(&self.crypto, self.dist_send, &self.iat_addr);
+        }
+        self.state = PairingState::WaitDistribution;
+        Vec::new()
+    }
+
+    fn on_distribution(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
+        let complete = consume_distribution_pdu(
+            &mut self.dist_expect,
+            &mut self.got_identity,
+            &mut self.peer_irk,
+            &mut self.peer_identity_addr,
+            &mut self.peer_csrk,
+            rx,
+        )?;
+        if !complete {
+            return Ok(Vec::new());
+        }
+        self.state = PairingState::Done;
+        Ok(own_distribution_pdus(
+            &self.crypto,
+            self.dist_send,
+            &self.iat_addr,
+        ))
     }
 
     fn on_response(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
@@ -517,6 +699,26 @@ impl<C: SmpCrypto> Initiator<C> {
             IoCapability::from_u8(self.features.io_capability).ok_or(PairingError::Protocol)?;
         let peer_io = IoCapability::from_u8(peer.io_capability).ok_or(PairingError::Protocol)?;
         self.method = pick_pairing_method(local_io, peer_io, mitm, sc, oob);
+
+        // Negotiate bonding and Phase 3 distribution (§3.6.1).
+        // Bonding requires both sides' Bonding_Flags == 01 (the
+        // low two auth_req bits). Each distributed key is sent
+        // only when BOTH sides set its bit: the initiator's send
+        // set is its own initiator byte ∩ the peer's initiator
+        // byte, its expect set its own responder byte ∩ the peer's
+        // responder byte — each masked to the bits this lane
+        // implements (EncKey ignored for SC, LinkKey out of scope).
+        // Without bonding the distribution bytes are ignored and
+        // the pairing completes at authentication, as before.
+        self.bonded = (self.features.auth_req & 0x03) == 0x01 && (peer.auth_req & 0x03) == 0x01;
+        if self.bonded {
+            self.dist_send = self.features.initiator_key_distribution
+                & peer.initiator_key_distribution
+                & DIST_SUPPORTED;
+            self.dist_expect = self.features.responder_key_distribution
+                & peer.responder_key_distribution
+                & DIST_SUPPORTED;
+        }
 
         // Send our public key.
         let mut pk = Vec::with_capacity(64);
@@ -654,7 +856,15 @@ impl<C: SmpCrypto> Initiator<C> {
             self.state = PairingState::Failed;
             return Err(PairingError::BadDhKeyCheck);
         }
-        self.state = PairingState::Done;
+        // Authentication is complete. With negotiated distribution
+        // keys the session parks at AuthComplete until the pump
+        // reports encryption (Phase 3 needs an encrypted link);
+        // otherwise pairing completes here, as before.
+        if self.bonded && (self.dist_send != 0 || self.dist_expect != 0) {
+            self.state = PairingState::AuthComplete;
+        } else {
+            self.state = PairingState::Done;
+        }
         Ok(Vec::new())
     }
 }
@@ -699,6 +909,18 @@ pub enum ResponderState {
     SentPublicKey,
     SentRandom,
     WaitDhKeyCheck,
+    /// Authentication (Phase 2) completed and keys are negotiated
+    /// for distribution, but the link is not yet encrypted. Same
+    /// parking state as [`PairingState::AuthComplete`]: the pump
+    /// calls [`Responder::begin_distribution`] once encryption is
+    /// reported. A responder at AuthComplete whose LTK Request
+    /// arrives first is answered from the session itself (the bond
+    /// is stored only when distribution finishes).
+    AuthComplete,
+    /// Our side's distribution PDUs (if any) are sent and the
+    /// peer's are still arriving. [`Responder::on_distribution`]
+    /// consumes them in §3.6.1 order.
+    WaitDistribution,
     Done,
     Failed,
 }
@@ -729,6 +951,21 @@ pub struct Responder<C: SmpCrypto> {
     /// NumericComparison). Application surfaces this to the user
     /// for confirmation.
     pub numeric_comparison: Option<u32>,
+    /// True when both sides negotiated bonding (both Bonding_Flags
+    /// == 01). Same rule as [`Initiator::bonded`].
+    pub bonded: bool,
+    /// Keys this side sends in Phase 3, negotiated as (own byte) ∩
+    /// (peer byte) masked to [`DIST_SUPPORTED`].
+    dist_send: u8,
+    /// Keys the peer sends in Phase 3, same negotiation.
+    dist_expect: u8,
+    /// True after Identity Information arrived while expecting
+    /// IdKey — the next PDU must be Identity Address Information.
+    got_identity: bool,
+    /// Peer's distributed keys, filled as Phase 3 PDUs arrive.
+    pub peer_irk: Option<[u8; 16]>,
+    pub peer_identity_addr: Option<[u8; 7]>,
+    pub peer_csrk: Option<[u8; 16]>,
 }
 
 impl<C: SmpCrypto> Responder<C> {
@@ -757,8 +994,11 @@ impl<C: SmpCrypto> Responder<C> {
                 oob_data_flag: 0,
                 auth_req: AUTH_BONDING | AUTH_SC | AUTH_MITM,
                 max_encryption_key_size: 16,
-                initiator_key_distribution: 0,
-                responder_key_distribution: 0,
+                // Same offer as the initiator: IdKey + Sign, both
+                // directions. The negotiated set is the
+                // intersection, so this never over-promises.
+                initiator_key_distribution: DIST_SUPPORTED,
+                responder_key_distribution: DIST_SUPPORTED,
             },
             features_peer: PairingFeatureExchange {
                 io_capability: 0,
@@ -769,6 +1009,13 @@ impl<C: SmpCrypto> Responder<C> {
                 responder_key_distribution: 0,
             },
             numeric_comparison: None,
+            bonded: false,
+            dist_send: 0,
+            dist_expect: 0,
+            got_identity: false,
+            peer_irk: None,
+            peer_identity_addr: None,
+            peer_csrk: None,
         }
     }
 
@@ -788,8 +1035,47 @@ impl<C: SmpCrypto> Responder<C> {
             ResponderState::SentPublicKey => self.on_pairing_confirm(rx),
             ResponderState::SentRandom => self.on_pairing_random(rx),
             ResponderState::WaitDhKeyCheck => self.on_dhkey_check(rx),
+            ResponderState::WaitDistribution => self.on_distribution(rx),
+            // AuthComplete parks the session until the pump
+            // reports encryption; a distribution PDU here is
+            // nonconformant — fail, do not buffer it.
             _ => Err(PairingError::Protocol),
         }
+    }
+
+    /// Start Phase 3 after the pump reports the link encrypted.
+    /// The responder (Peripheral) distributes first (§3.6.1), so
+    /// its own PDUs always leave here; when nothing is expected
+    /// back the pairing completes immediately, otherwise it parks
+    /// in WaitDistribution for the initiator's PDUs. Only valid
+    /// from AuthComplete.
+    pub fn begin_distribution(&mut self) -> Vec<Pdu> {
+        if self.state != ResponderState::AuthComplete {
+            return Vec::new();
+        }
+        let out = own_distribution_pdus(&self.crypto, self.dist_send, &self.rat_addr);
+        if self.dist_expect == 0 {
+            self.state = ResponderState::Done;
+        } else {
+            self.state = ResponderState::WaitDistribution;
+        }
+        out
+    }
+
+    fn on_distribution(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
+        let complete = consume_distribution_pdu(
+            &mut self.dist_expect,
+            &mut self.got_identity,
+            &mut self.peer_irk,
+            &mut self.peer_identity_addr,
+            &mut self.peer_csrk,
+            rx,
+        )?;
+        if !complete {
+            return Ok(Vec::new());
+        }
+        self.state = ResponderState::Done;
+        Ok(Vec::new())
     }
 
     fn on_request(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
@@ -811,6 +1097,23 @@ impl<C: SmpCrypto> Responder<C> {
         // signature is (initiator, responder, ...) so we pass peer
         // first since the peer started this exchange.
         self.method = pick_pairing_method(peer_io, local_io, mitm, sc, oob);
+
+        // Negotiate bonding and Phase 3 distribution (§3.6.1),
+        // mirrored from the initiator side: the responder's send
+        // set is its own responder byte ∩ the peer's responder
+        // byte, its expect set its own initiator byte ∩ the peer's
+        // initiator byte — each masked to DIST_SUPPORTED. Without
+        // bonding the distribution bytes are ignored.
+        self.bonded =
+            (peer.auth_req & 0x03) == 0x01 && (self.features_local.auth_req & 0x03) == 0x01;
+        if self.bonded {
+            self.dist_send = self.features_local.responder_key_distribution
+                & peer.responder_key_distribution
+                & DIST_SUPPORTED;
+            self.dist_expect = self.features_local.initiator_key_distribution
+                & peer.initiator_key_distribution
+                & DIST_SUPPORTED;
+        }
 
         let rsp = self.features_local.encode(SMP_PAIRING_RESPONSE);
         self.state = ResponderState::GotRequest;
@@ -954,7 +1257,14 @@ impl<C: SmpCrypto> Responder<C> {
                 a2: &self.iat_addr,
             },
         );
-        self.state = ResponderState::Done;
+        // Authentication is complete. With negotiated distribution
+        // keys the session parks at AuthComplete until the pump
+        // reports encryption; otherwise pairing completes here.
+        if self.bonded && (self.dist_send != 0 || self.dist_expect != 0) {
+            self.state = ResponderState::AuthComplete;
+        } else {
+            self.state = ResponderState::Done;
+        }
         Ok(alloc::vec![Pdu {
             code: SMP_PAIRING_DHKEY_CHECK,
             payload: eb.to_vec(),
