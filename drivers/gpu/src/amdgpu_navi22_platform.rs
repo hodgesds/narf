@@ -2085,6 +2085,16 @@ async fn presenter() {
                 follow_external(before).await;
                 return Ok(latched);
             }
+            // A client framebuffer the HUBP cannot fetch as programmed is
+            // copied by the GPU into the owned back surface (amdgpu_dm never
+            // reads a client framebuffer with the CPU).
+            if let Some(pin) = frame.bo.as_ref() {
+                match present_blit(&frame, pin).await? {
+                    Blitted::Flipped(latched) => return Ok(latched),
+                    Blitted::Dropped => return Ok(None),
+                    Blitted::Unavailable => {}
+                }
+            }
             // Wait on rendering and perform hidden-VRAM SDMA readback
             // before taking OWNER: the producer/transfer also needs it.
             let source = frame_copy::source(&frame).await?;
@@ -2169,6 +2179,88 @@ async unsafe fn present_direct(
     // Owned surfaces are both stale now; DIRTYFB damage restarts.
     PRESENT.damage.lock().forget();
     Ok(Some(front))
+}
+
+/// Outcome of the SDMA fallback for a client framebuffer.
+enum Blitted {
+    /// Copied and flipped; the latch time.
+    Flipped(Option<crate::drm::card::VblankTime>),
+    /// The lit surface changed under the frame: dropped, event completed.
+    Dropped,
+    /// No kernel SDMA queue (or nothing to copy): use the CPU copy.
+    Unavailable,
+}
+
+/// Copy a pinned client framebuffer into the owned back surface with the
+/// kernel SDMA queue, then flip to it. OWNER is held only to read the back
+/// surface and to flip, never across the copy (the queue's worker takes it).
+async fn present_blit(
+    frame: &Frame,
+    pin: &alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>,
+) -> Result<Blitted, ScanError> {
+    frame_copy::wait_rendered(pin).await?;
+    let source = pin
+        .address()
+        .checked_add(frame.offset)
+        .ok_or(ScanError::Invalid)?;
+    let back = {
+        let mut owner = OWNER.lock().await;
+        let boot = owner.as_mut().ok_or(ScanError::Busy)?;
+        // CPU views of the surface this copy overwrites must be retired.
+        crate::scanout_access::wait_retired().await;
+        boot.display_scanout()?.back().ok_or(ScanError::Invalid)?
+    };
+    let width = frame.width.min(back.fb.width);
+    let rows = frame.height.min(back.fb.height);
+    let ops = crate::amdgpu_rdna2_vram::blit_ops(
+        source,
+        u64::from(frame.pitch),
+        back.address,
+        u64::from(back.fb.pitch),
+        u64::from(width) * 4,
+        u64::from(rows),
+    );
+    if ops.is_empty() {
+        return Ok(Blitted::Unavailable);
+    }
+    let held: alloc::sync::Arc<dyn Send + Sync> = pin.clone();
+    match crate::amdgpu_rdna2_vram::blit(&ops, held).await {
+        Ok(()) => {}
+        Err(narf_filesystem::FsError::NoDevice | narf_filesystem::FsError::Unsupported) => {
+            return Ok(Blitted::Unavailable)
+        }
+        Err(narf_filesystem::FsError::TimedOut) => return Err(ScanError::Timeout),
+        Err(_) => return Err(ScanError::DeviceGone),
+    }
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(ScanError::Busy)?;
+    // A relight or recovery between the copy and here replaced the surfaces.
+    if boot.display_scanout()?.back().map(|b| b.address) != Some(back.address) {
+        return Ok(Blitted::Dropped);
+    }
+    let before = boot.display_scanout()?.front().fb;
+    boot.flip_display().await?;
+    let after = boot.display_scanout()?.front().fb;
+    // An owned surface is shown: the client framebuffer the pipe left is
+    // unfetched, and DIRTYFB damage no longer describes either surface.
+    let released = PRESENT.shown.lock().latched_owned();
+    drop(released);
+    PRESENT.damage.lock().forget();
+    let latched = read_vblank(boot);
+    drop(owner);
+    static TRACED: AtomicBool = AtomicBool::new(false);
+    if !TRACED.swap(true, Ordering::Relaxed) {
+        use core::fmt::Write;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 present: sdma blit {} op(s), pitch {} -> {}",
+            ops.len(),
+            frame.pitch,
+            back.fb.pitch
+        );
+    }
+    follow_flip(before, after).await;
+    Ok(Blitted::Flipped(latched))
 }
 
 /// The pipe now fetches a client framebuffer: withdraw a console published

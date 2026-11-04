@@ -328,11 +328,19 @@ impl Scanout {
         if start + u64::from(count) * 4 > map.len {
             return Err(Error::Invalid);
         }
-        for (i, &pixel) in pixels.iter().enumerate() {
-            // SAFETY: bounds checked against the back buffer's mapping,
-            // which no fetch reads until the next flip.
-            unsafe { map.write32(start + i as u64 * 4, pixel) };
+        // One streaming copy per row into the write-combined BAR (the
+        // per-word MMIO accessor fences every store), then drain the WC
+        // buffers before anything can flip to this surface.
+        // SAFETY: bounds checked against the back buffer's mapping, which
+        // no fetch reads until the next flip; `virt` maps it for the CPU.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pixels.as_ptr(),
+                (map.virt + start) as *mut u32,
+                pixels.len(),
+            );
         }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 

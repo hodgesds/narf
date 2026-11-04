@@ -312,13 +312,20 @@ async fn readback(
 
 async fn await_done(done: &Arc<dyn DrmFence>) -> Result<(), FsError> {
     let deadline = narf_time::monotonic_ns().saturating_add(5_000_000_000);
-    while !done.is_signalled() {
-        if narf_time::monotonic_ns() >= deadline {
+    loop {
+        // Sequence before the sample: a completion between them still wakes.
+        let observed = crate::amdgpu_fence_navi22::change_sequence();
+        if done.is_signalled() {
+            return Ok(());
+        }
+        let now = narf_time::monotonic_ns();
+        if now >= deadline {
             return Err(FsError::TimedOut);
         }
-        narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+        // Completion is published by the queue worker; also re-sample
+        // within 100 µs as before, in case it is not interrupt-driven.
+        crate::amdgpu_fence_navi22::wait_change(observed, deadline.min(now + 100_000)).await;
     }
-    Ok(())
 }
 async fn await_last(binding: &Binding) -> Result<(), FsError> {
     let last = binding.last.lock().clone();
@@ -395,6 +402,56 @@ impl crate::amdgpu_gem::VramTransfer for Reader {
         alloc::boxed::Box::pin(async move { upload(self.0, &object, &source, &destination).await })
     }
 }
+/// The kernel SDMA copies for a 2D VRAM→VRAM blit of `rows` rows of
+/// `row_bytes` from `src` (line pitch `src_pitch`) to `dst` (`dst_pitch`):
+/// one linear copy when both pitches equal the row (or each other, with
+/// whole lines copied), else one copy per row. Empty when nothing fits.
+pub(crate) fn blit_ops(
+    src: u64,
+    src_pitch: u64,
+    dst: u64,
+    dst_pitch: u64,
+    row_bytes: u64,
+    rows: u64,
+) -> alloc::vec::Vec<KernelOp> {
+    if row_bytes == 0 || rows == 0 || row_bytes > src_pitch || row_bytes > dst_pitch {
+        return alloc::vec::Vec::new();
+    }
+    if src_pitch == dst_pitch {
+        // Whole lines: the padding between rows is copied too, which the
+        // destination's own pitch already reserves.
+        let bytes = src_pitch * (rows - 1) + row_bytes;
+        return alloc::vec![KernelOp::Copy { src, dst, bytes }];
+    }
+    (0..rows)
+        .map(|y| KernelOp::Copy {
+            src: src + y * src_pitch,
+            dst: dst + y * dst_pitch,
+            bytes: row_bytes,
+        })
+        .collect()
+}
+
+/// Run `ops` (VRAM→VRAM copies between owned/pinned framebuffer-aperture
+/// ranges) on the kernel SDMA queue in order and wait for all of them.
+/// `held` keeps the source alive until the last copy retires, even if this
+/// future is dropped. Never takes a lock the caller may hold except the
+/// platform owner inside the queue's worker, so the caller must not hold it.
+pub(crate) async fn blit(ops: &[KernelOp], held: Arc<dyn Send + Sync>) -> Result<(), FsError> {
+    let mut fences = alloc::vec::Vec::new();
+    fences
+        .try_reserve(ops.len())
+        .map_err(|_| FsError::NoSpace)?;
+    let engine = engine();
+    for op in ops {
+        fences.push(engine.enqueue(*op, Some(held.clone()), None)?);
+    }
+    for done in &fences {
+        await_done(done).await?;
+    }
+    Ok(())
+}
+
 pub(crate) fn reader(card: u32) -> Arc<dyn crate::amdgpu_gem::VramTransfer> {
     Arc::new(Reader(card))
 }
@@ -484,6 +541,44 @@ async fn run(
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// The presenter's SDMA fallback: equal pitches copy whole lines in one
+    /// op; differing pitches copy each row to its own line; rows wider than
+    /// either pitch plan nothing.
+    fn rdna2_vram_blit_plans_rows() -> TestResult {
+        let one = blit_ops(0x1000_0000, 16384, 0x2000_0000, 16384, 15360, 3);
+        if one
+            != alloc::vec![KernelOp::Copy {
+                src: 0x1000_0000,
+                dst: 0x2000_0000,
+                bytes: 16384 * 2 + 15360
+            }]
+        {
+            return TestResult::Fail("equal-pitch blit is not one whole-line copy");
+        }
+        let rows = blit_ops(0x1000_0000, 16384, 0x2000_0000, 15360, 15360, 3);
+        let want: alloc::vec::Vec<_> = (0..3u64)
+            .map(|y| KernelOp::Copy {
+                src: 0x1000_0000 + y * 16384,
+                dst: 0x2000_0000 + y * 15360,
+                bytes: 15360,
+            })
+            .collect();
+        if rows != want {
+            return TestResult::Fail("pitch-changing blit is not one copy per row");
+        }
+        if !blit_ops(0x1000_0000, 1024, 0x2000_0000, 4096, 2048, 2).is_empty()
+            || !blit_ops(0x1000_0000, 4096, 0x2000_0000, 4096, 0, 2).is_empty()
+            || !blit_ops(0x1000_0000, 4096, 0x2000_0000, 4096, 1024, 0).is_empty()
+        {
+            return TestResult::Fail("degenerate blit planned copies");
+        }
+        if !rows.iter().all(|op| valid(*op)) || !one.iter().all(|op| valid(*op)) {
+            return TestResult::Fail("planned blit op rejected by the queue");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/amdgpu/navi22", rdna2_vram_blit_plans_rows);
 
     fn rdna2_cancelled_copy_retains_backing_until_completion() -> TestResult {
         struct Held(Arc<AtomicBool>, Arc<Completion>);
