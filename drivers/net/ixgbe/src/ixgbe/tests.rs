@@ -18,8 +18,9 @@ use super::{
 };
 
 /// In-memory register bank for fixtures: 64 KiB of BAR0 window,
-/// covering every register this stream programs (highest is
-/// MRQC at 0x0EC80). Lives here (not in queues.rs) because this
+/// covering every register this stream programs (highest native
+/// address is MRQC at 0x0EC80; the canonical 0x05xxx RSS block
+/// is covered too). Lives here (not in queues.rs) because this
 /// test module is x86_64-only while the driver builds for both
 /// arches — a test-only helper in the driver module would trip
 /// dead-code on aarch64.
@@ -547,6 +548,75 @@ fn smoke_ixgbe_rss_register_conversation() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_rss_register_conversation);
+
+/// #1397 fixture: the RSS/VMDq register-map authority pins the
+/// datasheet dual-map, and the RSS programming path writes the
+/// canonical (Linux/compat) addresses — not a second literal.
+/// The datasheet (rev. 2.6, 322429-007) dual-maps all three
+/// registers: MRQC §8.2.3.7.12 (0x0EC80 / 0x05818), RSSRK
+/// §8.2.3.7.14 (0x0EB80 / 0x05C80), RETA §8.2.3.7.15 (0x0EB00 /
+/// 0x05C00), each "also mapped ... to maintain compatibility
+/// with the 82598". The VMDq path (PR #1398) programs the 0x05
+/// block; if this path ever redefined its own addresses, the
+/// two would silently program different aliases of the same
+/// registers again — this test fails first.
+fn smoke_ixgbe_rss_reg_alias_map() -> TestResult {
+    use super::queues::RegBank;
+    use super::regs::{
+        MRQE_VMDQ_32_RSS, MRQE_VMDQ_64_NO_RSS, MRQE_VMDQ_64_RSS, REG_MRQC, REG_MRQC_NATIVE,
+        REG_RETA_BASE, REG_RETA_BASE_NATIVE, REG_RSSRK_BASE, REG_RSSRK_BASE_NATIVE, REG_STRIDE,
+        RETA_REGS, RSSRK_REGS,
+    };
+    use super::rss::IxgbeRss;
+    // 1. Shared authority == Linux's shipping map (ixgbe_type.h
+    // :376/:417/:419) — the addresses the VMDq path programs.
+    if REG_MRQC != 0x05818 || REG_RETA_BASE != 0x05C00 || REG_RSSRK_BASE != 0x05C80 {
+        return TestResult::Fail("regs authority != Linux MRQC/RETA/RSSRK map");
+    }
+    // 2. Datasheet alias pairs (§8.2.3.7.12/.14/.15).
+    if REG_MRQC_NATIVE != 0x0EC80
+        || REG_RETA_BASE_NATIVE != 0x0EB00
+        || REG_RSSRK_BASE_NATIVE != 0x0EB80
+    {
+        return TestResult::Fail("regs native aliases != datasheet 0x0E block");
+    }
+    // 3. Alias ranges end where the datasheet says: RETA
+    // 0x05C00-0x05C7C, RSSRK 0x05C80-0x05CA4.
+    if REG_STRIDE != 4
+        || REG_RETA_BASE + REG_STRIDE * (RETA_REGS as u64 - 1) != 0x05C7C
+        || REG_RSSRK_BASE + REG_STRIDE * (RSSRK_REGS as u64 - 1) != 0x05CA4
+    {
+        return TestResult::Fail("regs alias ranges != datasheet ends");
+    }
+    // 4. MRQE virtualization modes (§8.2.3.7.12; Linux :2332-:2334).
+    if MRQE_VMDQ_64_NO_RSS != 0x8 || MRQE_VMDQ_32_RSS != 0xA || MRQE_VMDQ_64_RSS != 0xB {
+        return TestResult::Fail("regs MRQE VMDq modes wrong");
+    }
+    // 5. The programming path writes the CANONICAL addresses:
+    // read the fake bank back at literals, not via the REG_*
+    // imports, so a reintroduced local literal fails here. The
+    // native aliases must stay unwritten by apply().
+    let rss = match IxgbeRss::standard(4) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("IxgbeRss::standard(4) failed"),
+    };
+    let mut bank = FakeBank::new();
+    rss.apply(&mut bank);
+    if bank.read32(0x05818) != 0x00F3_0001 {
+        return TestResult::Fail("apply() did not program canonical MRQC");
+    }
+    if bank.read32(0x05C80) != 0xda56_5a6d {
+        return TestResult::Fail("apply() did not program canonical RSSRK[0]");
+    }
+    if bank.read32(0x05C00) != 0x0302_0100 {
+        return TestResult::Fail("apply() did not program canonical RETA[0]");
+    }
+    if bank.read32(0x0EC80) != 0 || bank.read32(0x0EB80) != 0 || bank.read32(0x0EB00) != 0 {
+        return TestResult::Fail("apply() wrote a native alias address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_rss_reg_alias_map);
 
 // ── VLAN fixtures (commit 3) ─────────────────────────────────────
 
