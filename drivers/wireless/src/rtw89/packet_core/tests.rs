@@ -1038,6 +1038,49 @@ kernel_test_in!(
     smoke_rtw89_b_packet_aggregate_window_multi_slot_rpq_retirement
 );
 
+/// 6GHz HE-only TX A-MPDU (sweep F1): an HE program without HT maps to
+/// `RxPhy::He` (not `Legacy`), so `enable_aggregation` admits it and an
+/// aggregated frame with Linux's 6GHz density 0 submits.
+fn smoke_rtw89_c_packet_he_only_aggregates_with_zero_density() -> TestResult {
+    if RxPhy::from_programs(false, true) != RxPhy::He
+        || RxPhy::from_programs(false, false) != RxPhy::Legacy
+        || RxPhy::from_programs(true, false) != RxPhy::Ht
+    {
+        return TestResult::Fail("HE-only program did not map to the He owner");
+    }
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852C;
+    let Ok(mut core) =
+        Core::prepare_with(&mut model, OWN, 0, false, RxPhy::from_programs(false, true))
+    else {
+        return TestResult::Fail("HE-only packet preparation");
+    };
+    if core.enable_aggregation().is_err() || core.start(&mut model).is_err() {
+        return TestResult::Fail("HE-only aggregation start");
+    }
+    let agg = format::Agg {
+        num: 63,
+        density: 0,
+    };
+    if core
+        .submit_agg(
+            &mut model,
+            &qos_frame(1),
+            false,
+            format::FIRMWARE_RA,
+            Some(agg),
+        )
+        .is_err()
+    {
+        return TestResult::Fail("HE-only aggregated frame with density 0 refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_c_packet_he_only_aggregates_with_zero_density
+);
+
 /// Inert source/hardware setup for the actual Native publication fixture:
 /// prepare/start and retained mappings are genuine Core operations. Only PCI/
 /// RFK/startup readiness is replaced by this existing exclusive RAM model.

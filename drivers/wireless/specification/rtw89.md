@@ -3849,7 +3849,7 @@ wide link); a beacon TPE change after association is not re-applied
 (mac80211 `BSS_CHANGED_TPE` -> `rtw89_reg_6ghz_recalc`): the join-time TPE
 from the scanned beacon/probe response stays; the scan ignores
 `psc_no_listen`/unsolicited-probe target hints (every planned channel is
-dwelt); no TX A-MPDU on 6GHz (`self.ht` stays false). RTL8922A 6GHz
+dwelt); TX A-MPDU on 6GHz follows HE-only negotiation (`ampdu` admits `he` without `ht`, density 0 per Linux's zeroed 6GHz ht_cap). RTL8922A 6GHz
 belongs to the separate open RTL8922A chip row. Unexecuted cases:
 `smoke_rtw8852c_6ghz_txpwr_follows_rtw89_regd_and_phy_6g`,
 `smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule`,

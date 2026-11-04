@@ -2926,7 +2926,10 @@ impl State {
                         self.density = plan
                             .negotiated_phy()
                             .map_or(0, |phy| phy.ht().peer_mpdu_density());
-                        self.ampdu = self.ht && io.station_ampdu_allowed()?;
+                        // HE-only (6GHz) aggregates too: negotiated HT is
+                        // absent on 6GHz, but HE BA sessions carry TX
+                        // A-MPDU (density 0: Linux's zeroed 6GHz ht_cap).
+                        self.ampdu = (self.ht || self.he) && io.station_ampdu_allowed()?;
                         self.er = he.is_some_and(|(_, er)| er);
                         let he = he.map(|(he, _)| he);
                         match self.wide {

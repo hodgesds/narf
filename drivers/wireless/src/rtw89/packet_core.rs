@@ -237,8 +237,12 @@ pub(super) enum RxPhy {
 }
 impl RxPhy {
     pub(super) fn from_programs(ht: bool, he: bool) -> Self {
+        // HE without HT is the 6GHz HE-only station (no HT/VHT on 6GHz):
+        // it is an `He` owner, not `Legacy` — otherwise its TX A-MPDU
+        // (`enable_aggregation` needs `rx >= Ht`) and its HE RX rates
+        // (`admits`) would both be refused.
         match (ht, he) {
-            (true, true) => Self::He,
+            (_, true) => Self::He,
             (true, false) => Self::Ht,
             _ => Self::Legacy,
         }
