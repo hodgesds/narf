@@ -2603,6 +2603,71 @@ render, user, i915-balance, UAPI, BCS8, i915-async and context prefixes.
 The `intel_gpu_i915_info` prefix holds no tests of its own; that file's tests
 register under render.
 
+### GuC error capture, coredump text and the OA remainder — targeted release gates recorded
+
+`narf.intel.devcoredump=1` now registers Xe's GuC error-capture lists on the
+primary GuC, following `xe_guc_capture.c`:
+- **Lists:** the XeLP/XeHPG global, class and engine-instance lists, plus the
+  steered INSTDONE extension per fused DSS. They are laid out as
+  `guc_capture_prep_lists` does, in a worst-size GGTT object referenced from
+  `guc_ads.capture_*`, and written only during the stopped-GuC submission
+  reload.
+- **STATE_CAPTURE_NOTIFICATION (0x8002):** handled only when lists are
+  registered. It is parsed into four preallocated nodes, then acknowledged
+  with LOG_BUFFER_FILE_FLUSH_COMPLETE (0x30, type 2). Without registered
+  lists it stays a protocol loss.
+- **Manual capture:** at a context timeout with no GuC node, the scheduler
+  takes `xe_engine_manual_capture` under its forcewake proof before the
+  schedule disable.
+
+The coredump wire format is now version 4. It adds a bounded NARFXETX text
+section in `__xe_devcoredump_read` order. Earlier section offsets are
+unchanged; the bundle grows from 0x275380 to 0x27d3c0 bytes, so a consumer
+that checks the version or the length must accept 4.
+
+The OA remainder:
+- **OA fd mmap:** `xe_oa_mmap`'s checks apply in Linux's order: EACCES
+  without privilege, EINVAL unless the length is the whole buffer, and
+  EINVAL for write, exec or MAP_SHARED. A mapping that passes every check
+  returns ENODEV, because the syscall layer has no read-only private
+  device-PFN path. No OA mapping reaches the read()-backed fallback any
+  more, which would have consumed reports.
+- **Metrics sysfs:** with `narf.intel.oa=1`, the card node gains `metrics/`,
+  and ADD/REMOVE_CONFIG publish and remove `<uuid>/id`.
+- **New sysctl `dev.xe.observation_paranoid`:** 0644, range 0..1, default 1,
+  registered with the first Intel card. At 0, every OA and EU-stall
+  privilege gate admits the caller.
+
+Deliberate bounds: four capture nodes, 256 register groups, the list object
+kept outside the ADS, and a manual capture without the steered list (its
+unicast reads would need MCR steering writes in the failure path).
+
+The integration made these changes:
+- **Production fix:** the manual capture refused any register that read
+  0xffffffff. RING_HWSTAM and RING_IMR are ~0 once the ring is enabled, so
+  every manual capture stopped at the first instance register. Values are
+  now reported as read, as Linux does. The forcewake request and
+  acknowledgements are still re-read before every capture read, so a
+  function that drops off the bus is still detected.
+- **Fixtures:** two fixtures still expected wire version 3 or the old end of
+  file, and now expect version 4. A Clippy allowance was added on the
+  coredump text printer.
+- **HWCONFIG fixture:** the timeout case had been broken since the
+  condition-before-deadline unit above, whose targeted run did not cover the
+  `intel_gpu_hwconfig` prefix. It posted a reply before a late poll, and the
+  reply now wins. It now posts none, so it still times out.
+- **sysfs (failure already on origin/main):** `dcf524ecf` moved the
+  attribute `show()` into the read future, so an attribute updated between
+  `read()` and its first poll returned the newer value. The value is now
+  taken when `read()` is called, after the per-open event cursor, so
+  `kernfs_seq_show`'s ordering is kept.
+
+Targeted release runs passed 343 tests with no failures. They covered the
+error, HWCONFIG, EU-stall, OA, GuC-GT, GuC-boot, user, GT, media-GT, BCS8,
+parallel, Gen12, GT-IRQ and GuC-log prefixes, plus `filesystem/sysfs` and
+`sysfs_e2e`. The devcoredump and VM-dump tests register under the error
+prefix. None of this has run on physical Intel hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
