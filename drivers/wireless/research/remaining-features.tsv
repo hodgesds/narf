@@ -13,7 +13,7 @@ rtlwifi	bt_coexistence	Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl
 rtlwifi	rtl8192de	RTL8192DE per-function retained runtime; blocked on porting rtl8192de dual-MAC per-function runtime (shared MAC/PHY ownership, dual-band tables) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1477
 rtlwifi	rtl8723ae	RTL8723AE retained runtime; blocked on porting the rtl8723ae runtime (firmware event mailbox, BT coexistence) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1478
 rtlwifi	rtl8723be	RTL8723BE retained runtime; blocked on porting the rtl8723be runtime (C2H packets, BT coexistence, antenna path) plus signed envelopes	chip	drivers/wireless/specification/rtlwifi.md	1478
-rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	2198
+rtw89	eht	EHT operation on RTL8922A (step 1 done: width programming + EHT PHY programs in eht.rs; still open: station owner, MCS/NSS maps, TXWD_INFO EHT fields)	feature	drivers/wireless/specification/rtw89.md	4514
 rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading and its one-path antenna-diversity tracking (hal->ant_diversity)	chip	drivers/wireless/specification/rtw89.md	2257
 rtw89	rtl8852a	RTL8852A retained runtime including exact secure-policy loading and its NHM noise monitoring (support_noise)	chip	drivers/wireless/specification/rtw89.md	2256
 rtw89	rtl8922a	RTL8922A BE EFUSE/container/descriptor/transport/runtime (step 1 done: BE EFUSE, chip container, BE TXD/RXD, v2 interrupt, BE RA H2C v1; still open: firmware/RF/power/station profile, BE DMA ring programming, station admission)	chip	drivers/wireless/specification/rtw89.md	4575
