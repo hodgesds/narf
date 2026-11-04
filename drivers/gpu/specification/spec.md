@@ -1195,15 +1195,28 @@ before their copy; GETPARAM ENGINES is EINVAL. Each map slot is its own
 DEFAULT/RENDER→RCS0 and BLT→BCS0. Source-qualified Gen12 main-GuC BSD/VEBOX
 use the published dense media selectors described below; absent/unowned engines,
 holes and out-of-range slots return EINVAL. GEM_CONTEXT_GETPARAM/SETPARAM
-look the context up first (ENOENT); SET follows set_proto_ctx_param on a
-proto-context and ctx_setparam on a finalized one. BANNABLE: size EINVAL, then
+look the context up first (ENOENT, before any capable() question); SET
+follows set_proto_ctx_param on a proto-context and ctx_setparam on a finalized
+one. BANNABLE: size EINVAL, then
 value 0 without CAP_SYS_ADMIN EPERM; any nonzero value sets it. RECOVERABLE:
 size EINVAL, then 0 clears and any other value sets it. PRIORITY
-(validate_priority): size EINVAL, ENODEV without I915_SCHEDULER_CAP_PRIORITY,
-EINVAL outside -1023..=1023 as an s64, EPERM above 0 without CAP_SYS_NICE.
-CAP_PRIORITY is unadvertised until a context priority reaches the GuC
-registration, so every in-size PRIORITY set is ENODEV today, as on a Linux
-device without CAP_PRIORITY.
+(validate_priority): size EINVAL, ENODEV without I915_SCHEDULER_CAP_PRIORITY
+(advertised while submission is live), EINVAL outside -1023..=1023 as an s64,
+EPERM above 0 without CAP_SYS_NICE; capable() is asked only for an in-range
+positive value. A set stores the priority and sends GuC nothing (Linux
+set_priority). Every hardware member of the context, including engine-map
+slots and Gen12 media members created later, registers its next job at
+map_i915_prio_to_guc_prio of it: 0 is GUC_CLIENT_PRIORITY_KMD_NORMAL (2),
+below 0 NORMAL (3), above 0 HIGH (1); KMD_HIGH (0) needs
+I915_PRIORITY_DISPLAY and is unreachable from userspace. Each execbuffer is
+queued at the context's priority at its ioctl (rq->sched.attr) and raises,
+never lowers, the jobs ahead of it on the same hardware context
+(__i915_schedule, guc_bump_inflight_request_prio): a raised job whose GuC
+registration is enabled gets one priority-only UPDATE_CONTEXT_POLICIES
+(guc_context_set_prio); a job not yet registered registers with the raise;
+a job being disabled gets none. A queued request registers at its own
+priority raised by the requests queued behind it. LINUX-GAP: dependencies on
+other contexts' jobs (objects, fences) do not raise them.
 PERSISTENCE: size EINVAL; a finalized context already in the requested state
 succeeds; setting succeeds (the job watchdog is hangcheck); clearing is ENODEV
 (no I915_SCHEDULER_CAP_PREEMPTION). PROTECTED_CONTENT on a proto has no size
@@ -1211,9 +1224,9 @@ check: 0 succeeds, nonzero is ENODEV (no PXP); finalized, it is EINVAL, as are
 LOW_LATENCY, GTT_SIZE and unknown parameters. capable() is asked only where
 Linux asks it, outside the namespace lock. GETPARAM never reads the input
 size, reports size 0, and returns PROTECTED_CONTENT 0 and the stored,
-sign-extended PRIORITY. LINUX-GAP: BANNABLE, RECOVERABLE and PRIORITY are
-stored and reported only; a reset bans every context it finds, none is
-recovered, and GuC registration keeps the fixed i915 policy. VM is settable
+sign-extended PRIORITY. LINUX-GAP: BANNABLE and RECOVERABLE are stored and
+reported only; a reset bans every context it finds and none is recovered.
+VM is settable
 only on a proto-context (set_proto_ctx_vm: size EINVAL, then upper_32_bits and
 the lookup ENOENT), whose engine states are never claimed; a finalized
 context's VM is immutable (ctx_setparam EINVAL). QUERY has Linux's
@@ -1247,9 +1260,8 @@ the clock with Wa_18013179988's CTC shift on 12.55 and 12.70–12.74, sampled
 with the clock and independent of the OA opt-in). PERF_REVISION (54) stays 0
 without i915 perf. Missing or mismatched topology/facts return ENODEV, never zero; immutable
 facts survive a stopped GT without MMIO or wake. HAS_SCHEDULER (41) reports
-ENABLED while live and 0 otherwise, leaving the
-priority/preemption/semaphore/busy-stat/static-priority-map capability bits
-clear;
+ENABLED | PRIORITY (3) while live and 0 otherwise, leaving the
+preemption/semaphore/busy-stat/static-priority-map capability bits clear;
 context PRIORITY and PERSISTENCE checks read the same value. Obsolete UMS parameters 1/2/3/14 return ENODEV. Legacy
 slice/subslice masks 46/47 return EINVAL on Xe_HP-and-later profiles, as in
 Linux; callers use full topology queries.

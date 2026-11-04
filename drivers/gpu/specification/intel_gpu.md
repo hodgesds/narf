@@ -2646,6 +2646,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | BMG opt-in GPU-only VRAM | Exact headless small-BAR takeover, immutable hidden backing, trusted GPU zero/copies, retained quota and off-lock exact-VM publication | Implemented; native fixtures pass |
 | i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; native fixtures pass |
 | i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; native fixtures pass |
+| i915 context priority | map_i915_prio_to_guc_prio at every registration (default KMD_NORMAL2), request-time priority with same-context in-flight raises as priority-only UPDATE_CONTEXT_POLICIES, advertised I915_SCHEDULER_CAP_PRIORITY | Implemented; native fixtures added, unexecuted |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open. MTL/Arrow and Gen12 owners arm autosuspend. Lit pipes, display-14 `DC_off` references and the DC re-entry hold display wakerefs (RPM usage references), so a lit panel keeps D0 (Linux display wakeref) and idles through DC5/DC6 (§12.1). A dark panel parks with the DMC retained and re-verified and with 10 s polled hotplug; atomic `ACTIVE=0`, `SETCRTC` off and `FBIOBLANK` turn the MTL/Arrow panel's crtc off and drop its wakeref, and a KMS commit resumes the function first (§20). System-memory mappings need no revocation (xe_bo.c). VRAM revocation is blocked on a TCB revoke/refault API, and D3cold refuses with a typed reason (no `_PR3`/platform power). Flush consumers and media power remain |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; opted-in LNL display 20 has an owned eDP Pipe-A modeset with display-20 resources, a display-preserving GT owner (no driver FLR; GT-only GuC/full reset; D0-only), an owned console with the KMS owner's Pipe-A flips at Xe2 PAT3 (linear, and X/Tile4 through an owned power-of-two DPT), the display-14 cursor, CTM/LUTs and DSB with Xe2 PTEs, the Xe `SCANOUT` create flag, Wa_15015404425 on the probe-time modeset window, and the DC service loading `xe2lpd_dmc.bin` into DC6 (native fixtures added, unexecuted); LNL PSR1 (refused), FBC, tiled panning, suspend/relight, externals and all PTL display remain |
 
@@ -6990,3 +6991,80 @@ Remaining for the workstream, in order: display-20 suspend and relight
 (display power and DMC restore, the GT owner's resume without an FLR and
 the KMS restore); PSR1's display-20 deltas, recorded in §17; FBC on display
 20; panning of a tiled display-20 primary; and Type-C/PICA externals.
+
+### i915 context priority through GuC registration — native fixtures added
+
+Sources are Linux b90c984d `intel_guc_submission.c`
+(`map_i915_prio_to_guc_prio`, `guc_context_init`, `add_to_context`,
+`update_context_prio`, `guc_context_set_prio`, `__guc_context_set_prio`,
+`guc_bump_inflight_request_prio`, `guc_context_policy_init_v70`),
+`intel_guc_fwif.h`, `i915_priolist_types.h`, `i915_gem_context.c`
+(`proto_context_create`, `validate_priority`, `set_priority`,
+`set_proto_ctx_param`, `setparam_ioctl`), `i915_request.c` and
+`i915_scheduler.c::__i915_schedule`.
+
+**Behaviour change on real hardware.** Every i915 compatibility context used
+to register with GuC priority 3 (GUC_CLIENT_PRIORITY_NORMAL), below Linux's
+default. Each hardware member now registers at `map_i915_prio_to_guc_prio`
+of its context's priority, so a default context is KMD_NORMAL (2), as in
+Linux. Negative priorities give NORMAL (3), positive ones HIGH (1); KMD_HIGH
+(0) needs I915_PRIORITY_DISPLAY and stays unreachable from userspace. Native
+Xe queues keep their own LOW3/NORMAL2/HIGH1 mapping, which already matches
+`xe_exec_queue_prio_to_guc`.
+
+**Live priority.** A PRIORITY set on a proto or finalized context stores the
+priority, as Linux's does, and sends GuC nothing. Each execbuffer is a
+request queued at the context's priority at its ioctl (rq->sched.attr) and
+counted per band until its claim, like `ce->guc_state.prio_count`. A request
+raises, and never lowers, the job ahead of it on the same hardware context
+(`__i915_schedule` and `guc_bump_inflight_request_prio`). The scheduler
+follows `guc_context_set_prio`:
+
+- A raise before the job's Policy request is stored, and the registration
+  carries it.
+- A raise while the registration is enabled (Enable through Running) sends
+  one priority-only UPDATE_CONTEXT_POLICIES (0x100b, SCHEDULING_PRIORITY
+  KLV 0x20030001), as `__guc_context_set_prio` does for GuC 1.x.
+- A job being disabled, timed out or reset gets no update. NARF's
+  registration ends with each job.
+- A queued request registers at its own band, raised by the requests still
+  queued behind it.
+
+`UserContext::configure_schedule` no longer returns EBUSY for a claimed
+context. Its policy applies from the next registration; a job in flight keeps
+the policy it was claimed with.
+
+**UAPI.** GETPARAM HAS_SCHEDULER (41) reports ENABLED | PRIORITY (3) while
+submission is live and 0 otherwise. PRIORITY sets follow `validate_priority`:
+size EINVAL, then the capability (ENODEV only without a live owner), the
+-1023..=1023 s64 range EINVAL, and EPERM above 0 without CAP_SYS_NICE, which
+is asked only for an in-range positive value. SET looks the context up
+(ENOENT) before any capability question; before this change a size-0
+BANNABLE clear on a missing context asked CAP_SYS_ADMIN first.
+
+LINUX-GAP: only requests on the same hardware context raise a job. Linux's
+priority inheritance through object and fence dependencies on other
+contexts' requests is not modelled.
+
+New fixtures, all unexecuted in this slice:
+
+- `smoke_i915_priority_maps_to_guc_client_bands`
+- `smoke_userspace_priority_update_follows_guc_context_set_prio`
+- `smoke_i915_priority_default_contexts_register_kmd_normal`
+- `smoke_i915_priority_bands_apply_at_the_next_registration`
+- `smoke_i915_priority_lazy_gen12_media_member_takes_the_context_band`
+- `smoke_i915_priority_raise_reaches_the_registered_job_through_the_next_request`
+
+Changed fixtures:
+
+- `smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam`
+  pinned ENODEV for every in-size PRIORITY set and GETPARAM 41 = 1; it now
+  checks the full `validate_priority` order with and without CAP_SYS_NICE,
+  the lookup before capable(), and GETPARAM 41 = 3.
+- `smoke_i915_observed_discovery_and_immutable_facts_after_loss` and
+  `smoke_i915_xe_exact_dispatch_discovery_sseu_and_wc_refusal` assert
+  GETPARAM 41 = 3 while live.
+- The `intel_gpu_i915_low_latency_tests.rs` policy decoder asserted the old
+  priority 3 for every default i915 registration and now asserts 2.
+- The GuC model accepts a 4-word priority-only UPDATE_CONTEXT_POLICIES only
+  for a registered context, and records it.
