@@ -1774,7 +1774,7 @@ mod tests {
     }
 
     struct NoopWaker;
-    impl core::task::Wake for NoopWaker {
+    impl alloc::task::Wake for NoopWaker {
         fn wake(self: Arc<Self>) {}
         fn wake_by_ref(self: &Arc<Self>) {}
     }

@@ -551,9 +551,18 @@ also consult upstream Linux GPL sources.
   0xFC09 → Intel Reset boot 0xFC01 → best-effort `.ddc` over 0xFC8B), and
   for MediaTek-quirk IDs the btmtk 79xx WMT RAM-code download (WMT
   PATCH_DWNLD over 0xFC6F, section-map probe + ≤250-byte flagged chunks,
-  status from the 0xE4 WMT event); a failed vendor setup fails the bind.
-  Firmware pairs are the `btusb_quirks::firmware_paths` names under the
-  vendor prefix (`intel/`, `mediatek/`).
+  status from the 0xE4 WMT event); for Realtek-quirk IDs the btrtl
+  sequence (ROM version over 0xFC6D → security key id over 0xFC61 →
+  epatch v1/v2 parse with the patch selected by ROM version + 1 and
+  the file's project id verified against the product id's chip
+  family, config bytes appended verbatim when the key id is zero →
+  0xFC20 fragment download with the echoed fragment index
+  verified); for Broadcom-quirk IDs the btbcm patchram upload
+  (HCI_Reset → Download Minidriver over 0xFC2E → 50 ms delay →
+  the `.hcd` command stream in file order → 250 ms delay); a failed
+  vendor setup fails the bind. Firmware pairs are the
+  `btusb_quirks::firmware_paths` names under the vendor prefix
+  (`intel/`, `mediatek/`, `rtl_bt/`, `brcm/`).
 - `MSC_DEVICES` entries are tombstoned on detach, never shifted: a bind
   reuses the first tombstone, so the `usb-msc{idx}` block name is stable
   across unplug/replug. Each entry carries a monotonic bind generation

@@ -36,8 +36,8 @@
 //! 6. Log `bluetooth: $vendor adapter, HCI v$ver, Bluetooth $bt_ver`.
 //! 7. Register an `HciTransport` against the slot for Stage-1+ users.
 //!
-//! Out of scope for Stage 0: SCO/eSCO isoch streaming, Realtek /
-//! Broadcom vendor firmware, LE Advertising, and BR/EDR Inquiry.
+//! Out of scope for Stage 0: SCO/eSCO isoch streaming, LE
+//! Advertising, and BR/EDR Inquiry.
 //! Those land as separate stages. (The ACL data plane is driven by
 //! the `narf_bluetooth::pump` task registered at bring-up.)
 //!
@@ -766,8 +766,45 @@ pub async fn try_bind_btusb_already_addressed(
                 return Err(BtUsbError::FirmwareSetup);
             }
         }
-        // Realtek / Broadcom / CSR / Marvell and unrecognised parts
-        // proceed without a vendor sequence for now, as before.
+        Some(narf_bluetooth::btusb_quirks::Quirk::Realtek) => {
+            if let Err(error) = crate::btusb_rtl::setup_realtek(
+                xhci_dev,
+                slot_id,
+                eps.interface,
+                event_dci,
+                vendor_id,
+                product_id,
+            )
+            .await
+            {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  btusb-rtl: {:04x}:{:04x} setup failed: {:?}",
+                    vendor_id,
+                    product_id,
+                    error,
+                );
+                return Err(BtUsbError::FirmwareSetup);
+            }
+        }
+        Some(narf_bluetooth::btusb_quirks::Quirk::Broadcom) => {
+            if let Err(error) =
+                crate::btusb_bcm::setup_broadcom(xhci_dev, slot_id, eps.interface, event_dci).await
+            {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  btusb-bcm: {:04x}:{:04x} setup failed: {:?}",
+                    vendor_id,
+                    product_id,
+                    error,
+                );
+                return Err(BtUsbError::FirmwareSetup);
+            }
+        }
+        // CSR / Marvell and unrecognised parts proceed without a
+        // vendor sequence for now, as before.
         _ => {}
     }
 
