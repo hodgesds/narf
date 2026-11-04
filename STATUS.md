@@ -2540,6 +2540,30 @@ Gen12, media-GT and fence prefixes, and the display prefixes that use the
 spin helper: PSR, display-14 modeset, pcode, Type-C, DSC, resources, WM and
 KMS. The existing true-timeout tests still time out.
 
+### Xe OA observation streams on the main-GT OAG unit — targeted release gates recorded
+
+`narf.intel.oa=1` is a new default-off option. It enables Xe OA observation
+streams on the main-GT OAG unit for DG2, MTL/Arrow, BMG and LNL. These cover
+query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO, and
+read/poll, all in Linux's errno order. The OA configuration runs as
+kernel-ring LRI jobs through a privileged `submit_commands`, which only the OA
+unit reaches, with addresses validated by `xe_oa_is_valid_config_reg_addr`. An
+open stream blocks runtime park. Stop, reset or suspend returns ENODEV, halts
+the counters and undoes the metric set. Wa_18013179988 (the CTC shift) now
+also applies to MTL/Arrow; `xe_wa_oob.rules` lists 12.55 and 12.70..12.74. EU-
+stall open now returns ENODEV before EACCES, as Linux does.
+
+UAPI change on every native Xe device: query 8 (OA units) used to be EINVAL.
+It now answers in Linux's format, with zero units unless an OAG owner is
+published. Like Linux, it answers even with the option off.
+
+One Clippy fix was needed. The OA and PXP query arms were merged in numeric
+order, and EU-stall keeps both the extension-walker property chain and this
+unit's ENODEV-then-EACCES open. One targeted release run passed 250 tests with
+no failures. It covered the OA, EU-stall, user, Xe, GuC-GT, GuC-boot, RCS, GT,
+media-GT and render prefixes. None of this has run on physical Intel
+hardware.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
