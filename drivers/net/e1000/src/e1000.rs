@@ -560,8 +560,12 @@ pub struct TxContextDesc {
 
 const _: () = assert!(core::mem::size_of::<TxContextDesc>() == 16);
 
+/// Opaque handle for a reserved TX ring slot, returned by `tx_send_vlan`.
+/// The slot/generation pair is meaningful only to the driver's own
+/// completion polling (`tx_slot_done`); fields stay private so a caller
+/// cannot forge a ticket for a slot it never reserved.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct TxTicket {
+pub struct TxTicket {
     slot: usize,
     generation: u64,
 }
@@ -2469,11 +2473,23 @@ impl E1000 {
             // stripped (documented corner).
             let page = self.rx_pool[head].cpu_mut_ptr_at::<u8>(0);
             let deliver_len = if desc.special != 0 {
+                // SAFETY: `page` is the base of the `rx_pool[head]` DMA page
+                // (one page per descriptor, RX_BUF_LEN bytes consumed), which
+                // the driver owns; DD is set, so the device has finished
+                // writing it, and we re-arm only after `f` returns, so no
+                // concurrent device write aliases this slice. RX_BUF_LEN is
+                // within the page, so the slice is in-bounds and non-null.
                 let page_slice = unsafe { core::slice::from_raw_parts_mut(page, RX_BUF_LEN) };
                 vlan_reinsert_tag(page_slice, len, desc.special).unwrap_or(len)
             } else {
                 len
             };
+            // SAFETY: same `rx_pool[head]` page as above; `deliver_len <=
+            // RX_BUF_LEN` because `vlan_reinsert_tag` returns `None`
+            // (falling back to `len`) unless `len + 4` fits in the
+            // RX_BUF_LEN slice, and `len` itself is clamped to RX_BUF_LEN.
+            // The slice ends before the descriptor is re-armed below, so
+            // the device cannot write it concurrently while `f` runs.
             let frame = unsafe { core::slice::from_raw_parts_mut(page, deliver_len) };
             f(frame);
             // Re-arm the descriptor: clear status, keep the same buffer
