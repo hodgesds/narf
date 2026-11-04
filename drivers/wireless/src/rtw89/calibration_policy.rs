@@ -137,7 +137,8 @@ impl Board {
     /// bound container tables (BB/GAIN/RADIO_A/NCTL), the RTL8851B recipe
     /// and coexistence owner with its firmware BTC ABI row
     /// (`coex_native::Protocol51`). An antenna-diversity RFE
-    /// (`rfe_type % 3 == 2`) has no identity until that owner exists.
+    /// (`rfe_type % 3 == 2`) is admitted through the `antdiv_51`
+    /// owner composed by `radio_51::prepare_controls`.
     pub fn new_51(
         factory: &Factory,
         device: narf_bus::DeviceId,
@@ -152,7 +153,6 @@ impl Board {
             || !calibration.valid
             || calibration.rfe_type == 255
             || calibration.rfe_type == 0
-            || super::radio_51::antenna_diversity(calibration.rfe_type)
         {
             return Err(Error::Identity);
         }

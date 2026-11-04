@@ -47,6 +47,7 @@
 
 extern crate alloc;
 
+mod antdiv_51;
 mod ap_control;
 mod ap_crypto;
 mod ap_host;

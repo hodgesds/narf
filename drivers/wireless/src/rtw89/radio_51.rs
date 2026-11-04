@@ -8,8 +8,9 @@
 //! `rtw8851b_bb_sethw` (`radio_init::controls_51`), the phy.c DM sub-inits
 //! (PHYSTS/DIG/CFO/EDCCA through `phy_operating::Operating::prepare`, whose
 //! RTL8852B sequence RTL8851B shares), `rtw8851b_rfe_gpio` +
-//! `rtw89_phy_antdiv_*` (no-ops unless `rfe_type % 3 == 2`, which is refused
-//! here until the antenna-diversity owner exists), `rtw89_phy_init_rf_nctl`
+//! `rtw89_phy_antdiv_*` (composed through `antdiv_51` for
+//! `rfe_type % 3 == 2` boards; empty programs otherwise),
+//! `rtw89_phy_init_rf_nctl`
 //! (`radio_init::nctl_51`; `rfk_hw_init` is NULL), `rtw8851b_rfk_init`
 //! (`rfk::n51::Init`), `rtw8851b_set_txpwr_ctrl`
 //! (`radio_power_c::reference_51`), `rtw8851b_power_trim` (path-A thermal +
@@ -17,7 +18,7 @@
 //! `rfk::n51_channel::Channel::set_channel` (incl. `rtw8851b_set_txpwr`)
 //! and `rtw8851b_rfk_channel`. RTL8851B sends no RF_GET_MCCCH.
 use super::{
-    channel_51, factory_51,
+    antdiv_51, channel_51, factory_51,
     operating_channel::Profile,
     power,
     radio_gain::Gain,
@@ -162,6 +163,11 @@ pub(super) struct Radio {
     init: Init,
     channel: Channel,
     track: Option<Track>,
+    /// Retained antenna-diversity runtime for `rfe_type % 3 == 2` boards
+    /// (`antdiv_51::AntDiv`); `None` for non-diversity boards and before
+    /// [`Self::prepare_controls`]. The live PHYSTS/periodic hookup is
+    /// still open, so this state is retained but not yet driven.
+    antdiv: Option<antdiv_51::AntDiv>,
     epoch: u32,
 }
 
@@ -199,10 +205,14 @@ impl Radio {
     pub fn tracker(&self) -> Option<&Track> {
         self.track.as_ref()
     }
+    pub fn antdiv(&self) -> Option<&antdiv_51::AntDiv> {
+        self.antdiv.as_ref()
+    }
 
     /// `rtw8851b_bb_sethw` (`radio_init::controls_51`), the phy.c DM
     /// sub-inits (`phy_operating::Operating::prepare`), the
-    /// `rtw8851b_rfe_gpio`/antenna-diversity gate and
+    /// `rtw8851b_rfe_gpio`/antenna-diversity owner (`antdiv_51`, for
+    /// `rfe_type % 3 == 2` boards) and
     /// `rtw89_phy_init_rf_nctl` (`radio_init::nctl_51` with the selected
     /// firmware NCTL table), before any RFK admission.
     ///
@@ -224,17 +234,28 @@ impl Radio {
         if identity.chip() != super::mac::ChipId::Rtl8851B {
             return Err(Error::Table);
         }
-        // `rtw8851b_rfe_gpio` and `rtw89_phy_antdiv_init/_set_ant` write
-        // only for an antenna-diversity RFE; that owner is not composed, so
-        // such a board is refused before any write.
-        if antenna_diversity(identity.calibration().rfe_type) {
-            return Err(Error::Policy);
-        }
+        // `identity` moves into `operating.prepare` below, so the RFE
+        // type is captured first.
+        let rfe_type = identity.calibration().rfe_type;
+        let diversity = antenna_diversity(rfe_type);
         self.state = State::Preparing;
         let bases = radio_init::controls_51(io).map_err(radio_error)?;
         self.bases = Some(bases);
         // SAFETY: caller contract; directly after the RTL8851B bb_sethw.
         unsafe { operating.prepare(io, identity) }.await?;
+        // Diversity boards program the antenna-diversity owner between
+        // the DM sub-inits and NCTL, in Linux dm_init order: antdiv
+        // init (reg_init writes), rfe_gpio, initial set_ant on RF_A.
+        // Non-diversity boards skip all three (empty write lists and
+        // no retained state).
+        if diversity {
+            let antdiv = antdiv_51::AntDiv::new(antdiv_51::RF_A, antdiv_51::RF_A);
+            antdiv_51::apply_controls(io, &antdiv_51::reg_init_fields())?;
+            antdiv_51::apply_controls(io, &antdiv_51::rfe_gpio_fields(rfe_type))?;
+            antdiv_51::apply_mac8(io, &antdiv_51::rfe_gpio_mac_fields(rfe_type))?;
+            antdiv_51::apply_controls(io, &antdiv.set_ant_fields())?;
+            self.antdiv = Some(antdiv);
+        }
         radio_init::nctl_51(io, nctl).await.map_err(radio_error)?;
         self.state = State::New;
         Ok(())
