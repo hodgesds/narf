@@ -18,9 +18,8 @@ use super::{
     INT32_ROK, INT32_TOK, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS, PHY_CONFIG_TABLE,
     PHY_CONFIG_TABLE_LEN, REG_IMR_8125, REG_INT_CFG0_8125, REG_INT_CFG1_8125, REG_ISR_8125,
     REG_RDSAR, REG_RDSAR_Q1_LOW, REG_TPPOLL_8125, RING_LEN, RSS_RX_TCPFAIL, RSS_RX_TCPT,
-    RSS_RX_UDPFAIL, RSS_RX_UDPT, RTL_DEV_8127, RTL_VENDOR, RXD_EOR, RXD_LEN_MASK, RXD_OWN,
-    RX_BUF_LEN, RX_FETCH_DFLT_8125, RX_PAUSE_SLOT_ON, TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS,
-    TXD_OWN,
+    RSS_RX_UDPFAIL, RSS_RX_UDPT, RTL_DEV_8127, RTL_VENDOR, RXD_EOR, RXD_LEN_MASK, RXD_LS, RXD_OWN,
+    RX_BUF_LEN, RX_FETCH_DFLT_8125, RX_PAUSE_SLOT_ON, TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
 };
 
 // ── PCI match table ──────────────────────────────────────────────────
@@ -575,10 +574,7 @@ fn smoke_rtl8127_rss_queue_base_regs() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/net/rtl8127",
-    smoke_rtl8127_rss_queue_base_regs
-);
+kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_rss_queue_base_regs);
 
 fn smoke_rtl8127_rss_msix_count() -> TestResult {
     // (table size, want) -> request; 0 means "no MSI-X".
@@ -725,7 +721,4 @@ fn smoke_rtl8127_rss_routing_properties() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/net/rtl8127",
-    smoke_rtl8127_rss_routing_properties
-);
+kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_rss_routing_properties);

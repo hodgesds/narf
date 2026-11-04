@@ -1685,9 +1685,7 @@ impl Rtl8127Nic {
         cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, NicError> {
         // SAFETY: same contract as `bring_up_queues`.
-        unsafe {
-            Self::bring_up_queues(device, cap, select_rss_queues(narf_lib::smp::cpu_count()))
-        }
+        unsafe { Self::bring_up_queues(device, cap, select_rss_queues(narf_lib::smp::cpu_count())) }
     }
 
     /// Bring up with an explicit RX queue count (1 = Linux's
@@ -1747,7 +1745,8 @@ impl Rtl8127Nic {
             let mut pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
             for _ in 0..RING_LEN {
                 pool.push(
-                    alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
+                    alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0)
+                        .map_err(|_| NicError::NoMemory)?,
                 );
             }
             rx_queues.push(RxQueue {
