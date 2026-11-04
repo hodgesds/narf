@@ -1517,6 +1517,7 @@ const MSC_CLASS_MATCH: [crate::class_registry::UsbClassMatch; 1] =
 /// would have seen before this entry existed.
 fn msc_registry_probe(
     _device: alloc::sync::Arc<crate::device::USBDevice>,
+    _hub_port: Option<(u8, u8)>,
 ) -> Result<(), crate::class_registry::UsbProbeError> {
     Err(crate::class_registry::UsbProbeError::BindFailed)
 }

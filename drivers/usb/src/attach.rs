@@ -355,6 +355,20 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
     let work = without_hid_ports(work, &hid::hub_ports(xhci_dev.id()));
     let mut suspended = 0;
     for (slot, p) in &work {
+        // Class suspend hooks run BEFORE gating (#1256): a driver
+        // with a live device on this port parks its datapath and
+        // arms remote wakeup first, because a gated port blocks
+        // all transfers including the arming control transfer.
+        // If any hook reports a failed park, SKIP gating this
+        // cycle — the unparked device's pump would otherwise
+        // break on the gated port with no resume path. The pass
+        // retries next cycle; a detach in between drops the
+        // candidate (its bound bit clears). Ports claimed by no
+        // hook gate exactly as before.
+        let report = crate::class_registry::dispatch_suspend(*slot, *p).await;
+        if report.failed > 0 {
+            continue;
+        }
         // Snapshot the bound hub out of the registry lock so we don't
         // hold the IrqSafeSpinLock across the .await.
         let hub_copy: Option<crate::hub::UsbHub> = {
@@ -407,6 +421,69 @@ pub async fn resume_port(xhci_dev: &crate::xhci::Xhci, parent_hub_slot: u8, port
             // pass — let class driver do real work first.
             h.last_activity_tick[port as usize & 63] = u64::MAX;
         }
+    }
+}
+
+/// Decode the remote-wakeup-signaled edge from a full 32-bit
+/// hub port status word (GET_STATUS on a hub port, USB 2.0
+/// §11.24.2.7.2: `wPortStatus` in the low 16 bits, `wPortChange`
+/// in the high 16). A suspended device that signals remote
+/// wakeup sets the `C_PORT_SUSPEND` change bit — bit 2 of the
+/// high half, i.e. bit 18 of the word. This is NOT the
+/// `PORT_SUSPEND` SET-feature selector (2) nor the
+/// `C_PORT_SUSPEND` CLEAR-feature selector (18): those select
+/// features, this reads a change bit. Pure, so tests pin it
+/// without a hub.
+pub fn suspend_change_set(status_word: u32) -> bool {
+    (status_word >> 16) & (1u32 << 2) != 0
+}
+
+/// NIC pump loop decision for one turn, from the record's flags
+/// (shared by the r8152/NCM/ECM pumps, #1256). Detach dominates
+/// suspend: a parked pump exits on detach, it never parks a
+/// detached record. Suspend parks without transfers, error
+/// counts, or link sampling; otherwise the pump transfers.
+/// Pinned by tests; each family's loop just matches on this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NicPumpAction {
+    Exit,
+    Park,
+    Transfer,
+}
+
+pub fn nic_pump_action(detached: bool, suspended: bool, pump_running: bool) -> NicPumpAction {
+    if !pump_running || detached {
+        NicPumpAction::Exit
+    } else if suspended {
+        NicPumpAction::Park
+    } else {
+        NicPumpAction::Transfer
+    }
+}
+
+/// Read one hub port's status and report whether its device has
+/// signaled a remote-wakeup edge (the `C_PORT_SUSPEND` change bit
+/// in the status word). Used by the NIC wake-watch step: a
+/// suspended NIC port is resumed only on an observed signal, so
+/// idle ports stay suspended and autosuspend + WoL keep working.
+/// Returns `None` when the hub is gone or the status read fails
+/// (no signal observed — the port stays suspended and the watch
+/// retries next cycle).
+pub async fn hub_port_suspend_change(
+    xhci_dev: &crate::xhci::Xhci,
+    parent_hub_slot: u8,
+    port: u8,
+) -> Option<bool> {
+    let hub_copy: Option<crate::hub::UsbHub> = {
+        let g = HUBS.lock();
+        g.iter()
+            .find(|h| h.hub.slot_id == parent_hub_slot)
+            .map(|h| h.hub)
+    };
+    let hub = hub_copy?;
+    match hub.port_status(xhci_dev, port).await {
+        Ok(word) => Some(suspend_change_set(word)),
+        Err(_) => None,
     }
 }
 
@@ -1082,8 +1159,16 @@ async fn dispatch_after_address(
             return AttachOutcome::VideoClass;
         }
         // CDC-NCM ethernet — class 0x02 (Comm), subclass 0x0D.
-        if let Ok(_idx) =
-            crate::cdc_ncm::try_bind_ncm_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        // The hub context rides in the same shape the registry
+        // probes receive (MSC precedent): parent hub slot +
+        // downstream port, None on a root port.
+        if let Ok(_idx) = crate::cdc_ncm::try_bind_ncm_already_addressed(
+            xhci_dev,
+            slot_id,
+            &cfg_blob,
+            parent_hub_slot.map(|slot| (slot, port)),
+        )
+        .await
         {
             return AttachOutcome::NetworkClass;
         }
@@ -1092,8 +1177,13 @@ async fn dispatch_after_address(
         // ECM device falls through NCM's attempt (NotEcm) and an
         // NCM device falls through ECM's the same way. Same
         // outcome: one Ethernet iface either way.
-        if let Ok(_idx) =
-            crate::cdc_ecm::try_bind_ecm_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        if let Ok(_idx) = crate::cdc_ecm::try_bind_ecm_already_addressed(
+            xhci_dev,
+            slot_id,
+            &cfg_blob,
+            parent_hub_slot.map(|slot| (slot, port)),
+        )
+        .await
         {
             return AttachOutcome::NetworkClass;
         }
@@ -1228,7 +1318,11 @@ async fn dispatch_after_address(
             let mut dev = crate::device::USBDevice::new(c, slot_id, port, speed);
             dev.set_ids(dev_vid, dev_pid);
             let dev = Arc::new(dev);
-            if crate::class_registry::dispatch_probe(dev, &cfg_blob) {
+            if crate::class_registry::dispatch_probe(
+                dev,
+                &cfg_blob,
+                parent_hub_slot.map(|slot| (slot, port)),
+            ) {
                 return AttachOutcome::UsbClassDriver;
             }
         }

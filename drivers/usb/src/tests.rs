@@ -2809,6 +2809,7 @@ fn unbind_hook_record(_controller: u8, slot: u8) -> Result<(), ()> {
 
 fn unbind_test_probe(
     _dev: alloc::sync::Arc<crate::device::USBDevice>,
+    _hub_port: Option<(u8, u8)>,
 ) -> Result<(), crate::class_registry::UsbProbeError> {
     Err(crate::class_registry::UsbProbeError::UnsupportedVariant)
 }
@@ -2913,6 +2914,101 @@ kernel_test_in!(
     "drivers/usb/class-registry",
     smoke_usb_class_registry_unbind_isolation
 );
+
+// ── Class suspend hooks (#1256) ────────────────────────────────────
+
+static SUSPEND_PARKED_CALLS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static SUSPEND_FAILED_CALLS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static SUSPEND_NOTMINE_CALLS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+// Each dummy hook is its own fn: the outcome is a
+// compile-time value per fn (a closure capturing its outcome
+// could not coerce to the hook fn-pointer type).
+fn suspend_hook_parked(
+    _slot: u8,
+    _port: u8,
+) -> crate::class_registry::SuspendFuture {
+    SUSPEND_PARKED_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    alloc::boxed::Box::pin(async { crate::class_registry::SuspendOutcome::Parked })
+}
+
+fn suspend_hook_failed(
+    _slot: u8,
+    _port: u8,
+) -> crate::class_registry::SuspendFuture {
+    SUSPEND_FAILED_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    alloc::boxed::Box::pin(async { crate::class_registry::SuspendOutcome::ParkFailed })
+}
+
+fn suspend_hook_notmine(
+    _slot: u8,
+    _port: u8,
+) -> crate::class_registry::SuspendFuture {
+    SUSPEND_NOTMINE_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    alloc::boxed::Box::pin(async { crate::class_registry::SuspendOutcome::NotMine })
+}
+
+fn smoke_usb_class_registry_suspend_dispatch() -> TestResult {
+    use crate::class_registry::{dispatch_suspend, register_suspend_hook};
+    // The failing hook registers FIRST: dispatch must run past
+    // it (isolation, same rule as dispatch_unbind), and the
+    // report must count exactly one park + one failure. The
+    // distinctive (0xEE, 7) port matches no production record,
+    // so production hooks (if registered in this binary) answer
+    // NotMine and cannot move the parked/failed counts.
+    if register_suspend_hook("test-suspend-failed", suspend_hook_failed).is_err()
+        || register_suspend_hook("test-suspend-parked", suspend_hook_parked).is_err()
+        || register_suspend_hook("test-suspend-notmine", suspend_hook_notmine).is_err()
+    {
+        return TestResult::Fail("suspend-hook registration failed");
+    }
+    let failed_before = SUSPEND_FAILED_CALLS.load(core::sync::atomic::Ordering::SeqCst);
+    let parked_before = SUSPEND_PARKED_CALLS.load(core::sync::atomic::Ordering::SeqCst);
+    let notmine_before = SUSPEND_NOTMINE_CALLS.load(core::sync::atomic::Ordering::SeqCst);
+    let report = narf_scheduler::block_on(dispatch_suspend(0xEE, 7));
+    if SUSPEND_FAILED_CALLS.load(core::sync::atomic::Ordering::SeqCst) != failed_before + 1 {
+        return TestResult::Fail("failing suspend hook was not called exactly once");
+    }
+    if SUSPEND_PARKED_CALLS.load(core::sync::atomic::Ordering::SeqCst) != parked_before + 1 {
+        return TestResult::Fail("dispatch stopped after the failing suspend hook");
+    }
+    if SUSPEND_NOTMINE_CALLS.load(core::sync::atomic::Ordering::SeqCst) != notmine_before + 1 {
+        return TestResult::Fail("dispatch stopped before the last suspend hook");
+    }
+    if report.parked != 1 || report.failed != 1 {
+        return TestResult::Fail("dispatch did not count one park + one failure");
+    }
+    // At least the three dummy hooks ran; production hooks (if
+    // registered in this binary) only add NotMine invocations.
+    if report.invoked < 3 {
+        return TestResult::Fail("dispatch invoked fewer hooks than registered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/class-registry",
+    smoke_usb_class_registry_suspend_dispatch
+);
+
+fn smoke_usb_suspend_change_decode() -> TestResult {
+    use crate::attach::suspend_change_set;
+    // Bit 18 = C_PORT_SUSPEND change bit (bit 2 of the high
+    // half): the only bit that signals a wake.
+    if !suspend_change_set(1u32 << 18) || !suspend_change_set((1u32 << 18) | 0x0000_0007) {
+        return TestResult::Fail("suspend change bit not decoded");
+    }
+    // Bit 2 of the LOW half is PSTAT_SUSPEND (status, not a
+    // change edge); a bare status word and zero must not read
+    // as a wake signal.
+    if suspend_change_set(1u32 << 2) || suspend_change_set(0) {
+        return TestResult::Fail("status bit mis-decoded as a wake signal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/class-registry", smoke_usb_suspend_change_decode);
 
 fn smoke_usb_uac_finder_picks_audiocontrol_interface() -> TestResult {
     use crate::uac::{

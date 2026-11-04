@@ -75,7 +75,9 @@ use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::class_registry::{register_class_driver_with_unbind, UsbClassMatch, UsbProbeError};
+use crate::class_registry::{
+    register_class_driver_with_unbind, SuspendOutcome, UsbClassMatch, UsbProbeError,
+};
 use crate::device::USBDevice;
 use crate::xhci::{EndpointConfig, EndpointKind};
 
@@ -1934,7 +1936,7 @@ pub struct RtlDevice {
     pub version: RtlVersion,
     /// Wake-on-LAN options snapshotted at bind (the device's
     /// current register state); reprogrammed via `apply_wol`
-    /// by the future suspend path.
+    /// by the suspend path (#1256).
     pub wol_opts: WolOpts,
     pub mac: [u8; 6],
     pub bulk_in_dci: u8,
@@ -1961,6 +1963,26 @@ pub struct RtlDevice {
     /// Index of the xHCI controller the device is on
     /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
     pub controller: u8,
+    /// Hub context recorded at bind: `Some((parent hub slot id,
+    /// downstream port))` when the device sits behind a hub,
+    /// `None` on a root port. Root-port devices never become
+    /// idle-suspend candidates (no hub to gate them); hub-port
+    /// devices use this to park/resume their own port (#1256).
+    pub hub_port: Option<(u8, u8)>,
+    /// Port speed recorded at bind, so the suspend hook can
+    /// build a transient `USBDevice` for the WoL register
+    /// programming without retaining a device Arc.
+    pub speed: crate::xhci::PortSpeed,
+    /// Park flag: set by the class suspend hook, cleared by
+    /// resume. Distinct from the `detached` tombstone (detach
+    /// dominates: a parked pump exits on detach) and from
+    /// `pump_running` (the pump task stays alive while parked).
+    pub suspended: bool,
+    /// Whether DEVICE_REMOTE_WAKEUP arming succeeded at the
+    /// last park. `false` after a park whose arming transfer
+    /// stalled: the datapath still parks (TX-demand resume
+    /// works), but the device cannot signal a wake.
+    pub wakeup_armed: bool,
 }
 
 /// System-wide registry of bound RTL devices (records carry their
@@ -2045,6 +2067,37 @@ fn rtl_send_segment(controller: u8, slot_id: u8, bulk_out_dci: u8, seg: &[u8]) -
 /// rather than sent with a partial offload. Driver-local only:
 /// no shared TX-path code is touched.
 fn rtl_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    // TX-demand resume (#1256): a parked device's port is
+    // gated, so a bulk-OUT would fail. Resume first; on
+    // failure fail fast rather than sending into a gated port.
+    // Root-port devices never park (hub_port None), so this
+    // is a no-op for them. The record lock is never held
+    // across the resume await: read, release, resume,
+    // re-resolve via tx_target.
+    let resume_needed = {
+        let g = RTL_DEVICES.lock();
+        g.get(idx).and_then(|d| {
+            if d.detached {
+                None
+            } else {
+                d.hub_port.filter(|_| d.suspended)
+            }
+        })
+    };
+    if let Some((hub_slot, port)) = resume_needed {
+        let Some(c) = crate::xhci::controller() else {
+            return Err(());
+        };
+        let resumed = narf_scheduler::block_on(resume_r8152_port(&c, hub_slot, port));
+        if !resumed {
+            return Err(());
+        }
+        // Waking for TX opens a fresh idle window, so a TX
+        // burst does not flap the port straight back into
+        // suspend (the pump's RX marking alone would let a
+        // TX-only flow idle-expire).
+        crate::attach::mark_port_activity(hub_slot, port);
+    }
     let (slot_id, bulk_out_dci) = tx_target(idx).ok_or(())?;
     let controller = RTL_DEVICES.lock().get(idx).ok_or(())?.controller;
     let mut seg = Vec::new();
@@ -2111,7 +2164,7 @@ pub fn cr_with_datapath_enabled(old: u8) -> u8 {
 /// Full bind for an addressed RTL8152/8153 device: configuration,
 /// endpoint setup, MAC-level bring-up, station-address read,
 /// netdev publication, RX pump. Returns the device-record index.
-async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
+async fn bind(device: Arc<USBDevice>, hub_port: Option<(u8, u8)>) -> Result<usize, ()> {
     use core::fmt::Write;
     // Fetch the configuration descriptor (two-step like xpad:
     // 9-byte header for wTotalLength, then the full blob).
@@ -2244,6 +2297,10 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
             pending_rms: None,
             detached: false,
             controller: device.controller().id(),
+            hub_port,
+            speed: device.speed(),
+            suspended: false,
+            wakeup_armed: false,
         });
         idx
     };
@@ -2342,6 +2399,28 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
     let mut errors = 0u32;
     let mut turns = 0u32;
     while pump_should_continue(idx) {
+        // Park decision (#1256): a parked pump yields without
+        // issuing transfers — a gated port would fail them and
+        // the 16-error bound would kill the pump — and without
+        // counting errors or sampling link (the device is
+        // gated). Detach dominates: it clears `pump_running`,
+        // so the loop condition exits. The yield loop matches
+        // the pump's existing empty-poll arm; a timer-based
+        // park sleep is follow-up polish, not correctness.
+        let action = {
+            let g = RTL_DEVICES.lock();
+            g.get(idx)
+                .map(|d| crate::attach::nic_pump_action(d.detached, d.suspended, d.pump_running))
+                .unwrap_or(crate::attach::NicPumpAction::Exit)
+        };
+        match action {
+            crate::attach::NicPumpAction::Exit => break,
+            crate::attach::NicPumpAction::Park => {
+                narf_scheduler::yield_now().await;
+                continue;
+            }
+            crate::attach::NicPumpAction::Transfer => {}
+        }
         // MTU-change path (issue #1258): apply a pending
         // `PLA_RMS` reprogram before posting reads, so the
         // receive bound tracks the registry MTU. A failed write
@@ -2357,11 +2436,13 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
         match device.bulk_in(bulk_in_dci, &mut buf).await {
             Ok(n) if n > 0 => {
                 errors = 0;
-                let name = {
+                let (name, hub_port) = {
                     let g = RTL_DEVICES.lock();
-                    g.get(idx).map(|d| d.iface_name.clone())
+                    g.get(idx)
+                        .map(|d| (d.iface_name.clone(), d.hub_port))
                 };
                 if let Some(name) = name {
+                    let mut delivered = 0usize;
                     for seg in parse_rx_aggregate(&buf[..n]) {
                         let raw = &buf[seg.offset..seg.offset + seg.len];
                         // With CPCR_RX_VLAN / RCR1 VLAN enabled
@@ -2387,6 +2468,17 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
                             continue;
                         }
                         narf_net::iface::on_rx_frame_from(&name, &mut frame);
+                        delivered += 1;
+                    }
+                    // Real traffic keeps the port's idle clock
+                    // fresh (#1256): only delivered frames mark
+                    // activity, never empty bulk-IN polls, so an
+                    // idle NIC still becomes a suspend candidate
+                    // after the 30 s window.
+                    if delivered > 0 {
+                        if let Some((hub_slot, port)) = hub_port {
+                            crate::attach::mark_port_activity(hub_slot, port);
+                        }
                     }
                 }
             }
@@ -2407,6 +2499,153 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
     let mut g = RTL_DEVICES.lock();
     if let Some(rec) = g.get_mut(idx) {
         rec.pump_running = false;
+    }
+}
+
+// ── Suspend / resume (#1256) ─────────────────────────────────────
+//
+// Shape: the supervisor's idle-suspend pass calls the class
+// suspend hook BEFORE gating the port (a gated port blocks all
+// transfers, including the arming transfer). The hook parks the
+// datapath (the pump's park branch) and arms wakeup in two
+// steps: (1) reprogram the chip's wake filter from the
+// bind-time snapshot via apply_wol — a failed filter program
+// is ParkFailed, because gating without the wake filter would
+// leave the device unable to wake on magic packet; (2)
+// SET_FEATURE(DEVICE_REMOTE_WAKEUP) — a stall here only
+// clears `wakeup_armed` and the park still proceeds (the
+// device cannot signal, but TX-demand resume still works;
+// same as HID's "nothing enables remote wakeup" state).
+// Resume re-opens the port and clears the park flag; link
+// state restores via the pump's existing 32-turn sampling,
+// which resumes with the pump — no separate re-probe. The
+// wake-watch step resumes a port only on an observed
+// remote-wakeup edge, so idle ports stay suspended (an
+// unconditional resume would defeat autosuspend + WoL).
+// Arming MUST precede gating; the pass guarantees the order.
+
+/// Class suspend hook for one hub port. Self-filters on the
+/// record's hub context; idempotent (an already-parked device
+/// returns `Parked` without re-arming). Never holds the record
+/// lock across an await: lock to find, release, transfer, lock
+/// to set flags.
+async fn suspend_r8152_port(hub_slot: u8, port: u8) -> SuspendOutcome {
+    // Read what arming needs, then release before any await.
+    let target = {
+        let g = RTL_DEVICES.lock();
+        g.iter().find_map(|d| {
+            if !d.detached && d.hub_port == Some((hub_slot, port)) {
+                if d.suspended {
+                    Some(None)
+                } else {
+                    Some(Some((d.slot_id, d.speed, d.wol_opts)))
+                }
+            } else {
+                None
+            }
+        })
+    };
+    let Some(target) = target else {
+        return SuspendOutcome::NotMine;
+    };
+    let Some((slot_id, speed, wol_opts)) = target else {
+        // Already parked: idempotent re-park, no re-arm.
+        return SuspendOutcome::Parked;
+    };
+    let Some(c) = crate::xhci::controller() else {
+        return SuspendOutcome::ParkFailed;
+    };
+    // Transient device handle for the OCP register path
+    // (apply_wol takes &USBDevice). The hub-port number IS
+    // the device's downstream port; the slot id and speed
+    // come from the record.
+    let dev = USBDevice::new(c.clone(), slot_id, port, speed);
+    if apply_wol(&dev, wol_opts).await.is_err() {
+        return SuspendOutcome::ParkFailed;
+    }
+    let setup = crate::control::set_feature_device_remote_wakeup();
+    let armed = c
+        .control_out(
+            slot_id,
+            setup.bm_request_type,
+            setup.b_request,
+            setup.w_value,
+            setup.w_index,
+            &[],
+        )
+        .await
+        .is_ok();
+    // Set the park flag only if the record is still live
+    // (a detach in between wins; the pass's gating of a
+    // device-less port is harmless).
+    let mut g = RTL_DEVICES.lock();
+    match g.iter_mut().find(|d| {
+        !d.detached && d.hub_port == Some((hub_slot, port)) && d.slot_id == slot_id
+    }) {
+        Some(rec) => {
+            rec.suspended = true;
+            rec.wakeup_armed = armed;
+            SuspendOutcome::Parked
+        }
+        None => SuspendOutcome::NotMine,
+    }
+}
+
+/// Resume one parked r8152 port: re-open the hub port, then
+/// clear the park flag. Returns `true` iff the port is awake
+/// and the flag cleared. Idempotent in the sense that a
+/// non-parked port returns `false` (nothing was resumed) —
+/// callers that need "awake" semantics re-check the flag.
+/// Never holds the record lock across the resume await.
+pub async fn resume_r8152_port(
+    xhci_dev: &crate::xhci::Xhci,
+    hub_slot: u8,
+    port: u8,
+) -> bool {
+    let idx = {
+        let g = RTL_DEVICES.lock();
+        g.iter().position(|d| {
+            !d.detached && d.suspended && d.hub_port == Some((hub_slot, port))
+        })
+    };
+    let Some(idx) = idx else {
+        return false;
+    };
+    crate::attach::resume_port(xhci_dev, hub_slot, port).await;
+    if crate::attach::hub_port_is_suspended(hub_slot, port) {
+        return false;
+    }
+    let mut g = RTL_DEVICES.lock();
+    match g.get_mut(idx) {
+        Some(rec) if !rec.detached && rec.suspended => {
+            rec.suspended = false;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Hub ports holding a parked (suspended, non-detached) r8152
+/// record. Mirrors `hid::hub_ports`, filtered to parked
+/// devices: the wake-watch step's candidate list.
+pub fn suspended_hub_ports() -> Vec<(u8, u8)> {
+    let g = RTL_DEVICES.lock();
+    g.iter()
+        .filter(|d| !d.detached && d.suspended)
+        .filter_map(|d| d.hub_port)
+        .collect()
+}
+
+/// Wake-watch step: for each parked r8152 port, read the hub
+/// port status; on an observed remote-wakeup edge (the
+/// `C_PORT_SUSPEND` change bit) resume the port. `port_resume`
+/// acks the change bit, so no double-resume. Ports with no
+/// edge stay suspended.
+pub async fn wake_suspended_ports(xhci_dev: &crate::xhci::Xhci) {
+    for (hub_slot, port) in suspended_hub_ports() {
+        if crate::attach::hub_port_suspend_change(xhci_dev, hub_slot, port).await == Some(true) {
+            let _ = resume_r8152_port(xhci_dev, hub_slot, port).await;
+        }
     }
 }
 
@@ -2441,12 +2680,14 @@ const MATCHES: &[UsbClassMatch] = &[
     UsbClassMatch::vid_pid(0x0955, 0x09ff),
 ];
 
-fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
+fn probe(device: Arc<USBDevice>, hub_port: Option<(u8, u8)>) -> Result<(), UsbProbeError> {
     // The registry probe is synchronous, but bind needs async
-    // control transfers — spawn it (xpad precedent).
+    // control transfers — spawn it (xpad precedent). The hub
+    // context rides into bind so the record can participate in
+    // hub idle-suspend (#1256).
     narf_scheduler::spawn_stackful(async move {
         use core::fmt::Write;
-        if bind(device).await.is_err() {
+        if bind(device, hub_port).await.is_err() {
             let _ = writeln!(
                 narf_console::Writer,
                 "  net: r8152 bind failed (no valid station address or config error)"
@@ -2539,6 +2780,9 @@ pub fn detach_all_r8152(controller: u8) {
 /// failure with `Err(())`, never by panicking).
 pub fn register() {
     let _ = register_class_driver_with_unbind("r8152", MATCHES, probe, detach_r8152_slot);
+    let _ = crate::class_registry::register_suspend_hook("r8152", |slot, port| {
+        alloc::boxed::Box::pin(suspend_r8152_port(slot, port))
+    });
 }
 
 // ── Fixtures ─────────────────────────────────────────────────────
@@ -3036,6 +3280,10 @@ pub mod tests {
             pending_rms: None,
             detached: false,
             controller: 0,
+            hub_port: None,
+            speed: crate::xhci::PortSpeed::High,
+            suspended: false,
+            wakeup_armed: false,
         };
         {
             let mut g = RTL_DEVICES.lock();
@@ -3082,6 +3330,10 @@ pub mod tests {
             pending_rms: None,
             detached: false,
             controller: 0,
+            hub_port: None,
+            speed: crate::xhci::PortSpeed::High,
+            suspended: false,
+            wakeup_armed: false,
         };
         {
             let mut g = RTL_DEVICES.lock();
@@ -3205,6 +3457,10 @@ pub mod tests {
                 pending_rms: None,
                 detached: false,
                 controller: 0,
+                hub_port: None,
+                speed: crate::xhci::PortSpeed::High,
+                suspended: false,
+                wakeup_armed: false,
             });
         }
         register();
@@ -3248,6 +3504,10 @@ pub mod tests {
             pending_rms: None,
             detached: false,
             controller: 0,
+            hub_port: None,
+            speed: crate::xhci::PortSpeed::High,
+            suspended: false,
+            wakeup_armed: false,
         };
         {
             let mut g = RTL_DEVICES.lock();
@@ -4179,4 +4439,84 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_mtu_rms_packing);
+
+    // Suspend/resume fixture tests (#1256). The transfer-level
+    // behavior (park -> gate -> wake -> traffic) needs a hub +
+    // device and is CI/silicon-only — no fake xhci exists. What
+    // fixtures CAN pin: the pump decision precedence, the
+    // remote-wakeup SETUP bytes, and the parked-port selection
+    // + flag cycle the hook and resume manipulate.
+    fn smoke_r8152_pump_action_precedence() -> TestResult {
+        use crate::attach::{nic_pump_action, NicPumpAction};
+        // Detach dominates suspend; a stopped pump exits.
+        if nic_pump_action(true, true, true) != NicPumpAction::Exit
+            || nic_pump_action(true, false, true) != NicPumpAction::Exit
+            || nic_pump_action(false, true, false) != NicPumpAction::Exit
+            || nic_pump_action(false, false, false) != NicPumpAction::Exit
+        {
+            return TestResult::Fail("pump_action did not exit on detach/stop");
+        }
+        // Suspended + running parks without transfers.
+        if nic_pump_action(false, true, true) != NicPumpAction::Park {
+            return TestResult::Fail("pump_action did not park a suspended pump");
+        }
+        // Live + running transfers.
+        if nic_pump_action(false, false, true) != NicPumpAction::Transfer {
+            return TestResult::Fail("pump_action did not transfer for a live pump");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_pump_action_precedence);
+
+    fn smoke_r8152_remote_wakeup_setup() -> TestResult {
+        // USB 2.0 §9.4.2 + Table 9-6: host-to-device, standard,
+        // device recipient; SET_FEATURE (3); selector 1
+        // (DEVICE_REMOTE_WAKEUP); wIndex 0; no Data Stage.
+        let setup = crate::control::set_feature_device_remote_wakeup();
+        if setup.to_bytes() != [0x00, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00] {
+            return TestResult::Fail("remote-wakeup SETUP packet mis-encoded");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_remote_wakeup_setup);
+
+    fn smoke_r8152_suspended_hub_ports() -> TestResult {
+        let mk = |slot_id: u8, hub_port: Option<(u8, u8)>, suspended: bool, detached: bool| {
+            RtlDevice {
+                slot_id,
+                generation: RtlGen::GbE,
+                version: RtlVersion::Ver03,
+                wol_opts: WolOpts::default(),
+                mac: [0x02, 0, 0, 0, 0, slot_id],
+                bulk_in_dci: 3,
+                bulk_out_dci: 4,
+                iface_name: alloc::format!("usb-rtl-susp{}", slot_id),
+                pump_running: true,
+                link_byte: 0xFF,
+                detached,
+                controller: 0,
+                hub_port,
+                speed: crate::xhci::PortSpeed::High,
+                suspended,
+                wakeup_armed: suspended,
+            }
+        };
+        {
+            let mut g = RTL_DEVICES.lock();
+            g.push(mk(7, Some((2, 3)), true, false));
+            g.push(mk(8, Some((2, 4)), false, false));
+            g.push(mk(9, None, true, false));
+            g.push(mk(10, Some((2, 5)), true, true));
+        }
+        let ports = suspended_hub_ports();
+        RTL_DEVICES.lock().clear();
+        // Only the live parked hub-port device selects; the
+        // running hub-port device, the parked root-port device
+        // (no hub to gate), and the detached record do not.
+        if ports != alloc::vec![(2, 3)] {
+            return TestResult::Fail("suspended_hub_ports selected the wrong ports");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_suspended_hub_ports);
 }

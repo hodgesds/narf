@@ -532,6 +532,16 @@ pub struct CdcEcmDevice {
     /// Index of the xHCI controller the device is on
     /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
     pub controller: u8,
+    /// Hub context recorded at bind: `Some((parent hub slot id,
+    /// downstream port))` when the device sits behind a hub,
+    /// `None` on a root port (see r8152's field docs, #1256).
+    pub hub_port: Option<(u8, u8)>,
+    /// Park flag: set by the class suspend hook, cleared by
+    /// resume. Both pumps stay alive while parked.
+    pub suspended: bool,
+    /// Whether DEVICE_REMOTE_WAKEUP arming succeeded at the
+    /// last park (see r8152's field docs, #1256).
+    pub wakeup_armed: bool,
 }
 
 /// System-wide registry of bound CDC-ECM devices (records carry their
@@ -605,6 +615,7 @@ pub async fn try_bind_ecm_already_addressed(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
     cfg: &[u8],
+    hub_port: Option<(u8, u8)>,
 ) -> Result<usize, EcmError> {
     let comm_iface = find_ecm_comm_interface(cfg).ok_or(EcmError::NotEcm)?;
     let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
@@ -702,6 +713,9 @@ pub async fn try_bind_ecm_already_addressed(
             uplink_bps: 0,
             detached: false,
             controller: xhci_dev.id(),
+            hub_port,
+            suspended: false,
+            wakeup_armed: false,
         });
         idx
     };
@@ -749,7 +763,7 @@ pub async fn try_bind_ecm_already_addressed(
 /// surfaces as persistent errors) or when the record vanishes
 /// or is detached.
 async fn ecm_rx_pump(idx: usize) {
-    let (slot_id, bulk_in_dci, name, buf_len) = {
+    let (slot_id, bulk_in_dci, name, buf_len, hub_port) = {
         let g = CDC_ECM_DEVICES.lock();
         let Some(dev) = g.get(idx).filter(|d| !d.detached) else {
             return;
@@ -759,6 +773,7 @@ async fn ecm_rx_pump(idx: usize) {
             dev.bulk_in_dci,
             dev.iface_name.clone(),
             ecm_rx_buf_len(dev.max_segment_size as u32),
+            dev.hub_port,
         )
     };
     let Some(c) = controller_of(idx) else {
@@ -779,12 +794,34 @@ async fn ecm_rx_pump(idx: usize) {
                 break;
             }
         }
+        // Park decision (#1256): same shape as r8152 — a
+        // parked pump yields without transfers or delivery;
+        // detach (above) dominates.
+        let action = {
+            let g = CDC_ECM_DEVICES.lock();
+            g.get(idx)
+                .map(|d| crate::attach::nic_pump_action(d.detached, d.suspended, d.pump_running))
+                .unwrap_or(crate::attach::NicPumpAction::Exit)
+        };
+        match action {
+            crate::attach::NicPumpAction::Exit => break,
+            crate::attach::NicPumpAction::Park => {
+                narf_scheduler::yield_now().await;
+                continue;
+            }
+            crate::attach::NicPumpAction::Transfer => {}
+        }
         match c.bulk_in(slot_id, bulk_in_dci, &mut buf).await {
             Ok(n) => {
                 errors = 0;
                 if let Some(frame) = ecm_rx_transfer(&buf, n) {
                     let mut owned = frame.to_vec();
                     narf_net::iface::on_rx_frame_from(&name, &mut owned);
+                    // Real traffic keeps the port's idle clock
+                    // fresh (#1256); empty transfers never mark.
+                    if let Some((hub_slot, port)) = hub_port {
+                        crate::attach::mark_port_activity(hub_slot, port);
+                    }
                 } else {
                     narf_scheduler::yield_now().await;
                 }
@@ -835,6 +872,28 @@ async fn ecm_notif_pump(idx: usize) {
             if g.get(idx).map(|d| d.detached).unwrap_or(true) {
                 break;
             }
+        }
+        // Park decision (#1256): the notification pump parks
+        // on the same flag as the RX pump — an interrupt-IN
+        // poll on a gated port would fail the same way a
+        // bulk-IN would. `notif_running` stays true while
+        // parked, so resume needs no re-spawn. Link-state
+        // notifications do NOT mark port activity: a flapping
+        // link is not traffic, and an idle device must still
+        // become a suspend candidate.
+        let action = {
+            let g = CDC_ECM_DEVICES.lock();
+            g.get(idx)
+                .map(|d| crate::attach::nic_pump_action(d.detached, d.suspended, d.notif_running))
+                .unwrap_or(crate::attach::NicPumpAction::Exit)
+        };
+        match action {
+            crate::attach::NicPumpAction::Exit => break,
+            crate::attach::NicPumpAction::Park => {
+                narf_scheduler::yield_now().await;
+                continue;
+            }
+            crate::attach::NicPumpAction::Transfer => {}
         }
         match c.poll_interrupt_in(slot_id, notif_dci, &mut buf) {
             Ok(Some(n)) => {
@@ -891,7 +950,44 @@ pub fn tx_target(idx: usize) -> Option<(u8, u8)> {
 /// Send `eth_frame` via the bound ECM device. The frame goes on
 /// bulk-OUT verbatim — no NTB wrap, no sequence, no CRC — after
 /// the `wMaxSegmentSize` cap check in [`ecm_tx_frame`].
+/// Datapath-demand resume (#1256), shared by `send_frame`
+/// and `recv_frame`: a parked port is gated, so any explicit
+/// datapath demand wakes it first (Linux usbnet runtime-PM
+/// semantics — I/O wakes the device). Returns `Ok(true)` when
+/// the device is awake (or was never parked), `Ok(false)`
+/// when resume failed and the caller must fail fast rather
+/// than issue a transfer into a gated port. Never holds the
+/// record lock across the resume await.
+fn demand_resume(idx: usize) -> Result<bool, EcmError> {
+    let resume_needed = {
+        let g = CDC_ECM_DEVICES.lock();
+        g.get(idx).and_then(|d| {
+            if d.detached {
+                None
+            } else {
+                d.hub_port.filter(|_| d.suspended)
+            }
+        })
+    };
+    let Some((hub_slot, port)) = resume_needed else {
+        return Ok(true);
+    };
+    let c = crate::xhci::controller().ok_or(EcmError::NoController)?;
+    if narf_scheduler::block_on(resume_ecm_port(&c, hub_slot, port)) {
+        // Waking for demand opens a fresh idle window, so a
+        // burst does not flap the port straight back into
+        // suspend.
+        crate::attach::mark_port_activity(hub_slot, port);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, EcmError> {
+    if !demand_resume(idx)? {
+        return Err(EcmError::Truncated);
+    }
     let (slot_id, bulk_out_dci, max_segment_size) = {
         let g = CDC_ECM_DEVICES.lock();
         let dev = g
@@ -919,6 +1015,9 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, EcmError> {
 /// `None`. Caller polls this periodically; on real silicon the
 /// RX pump (not this call) is what streams frames in.
 pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, EcmError> {
+    if !demand_resume(idx)? {
+        return Err(EcmError::Truncated);
+    }
     let (slot_id, bulk_in_dci) = {
         let g = CDC_ECM_DEVICES.lock();
         let dev = g
@@ -1091,10 +1190,123 @@ pub static CDC_ECM_MATCH: [crate::class_registry::UsbClassMatch; 1] = [
 
 pub fn probe(
     _device: alloc::sync::Arc<crate::device::USBDevice>,
+    _hub_port: Option<(u8, u8)>,
 ) -> Result<(), crate::class_registry::UsbProbeError> {
     use core::fmt::Write;
     let _ = writeln!(narf_console::Writer, "  usb: CDC-ECM device bound!");
     Ok(())
+}
+
+// ── Suspend / resume (#1256) ─────────────────────────────────────
+//
+// Shape mirrors NCM (SET_FEATURE arming only — ECM has no chip
+// wake filter), plus the notification pump: it parks on the
+// same flag as the RX pump, so a gated port fails neither
+// pump's transfers. On resume, link state re-reports via the
+// notification pump itself — no separate restore step — and
+// `link_up`/`downlink_bps`/`uplink_bps` keep their last
+// reported values across the park (a stale link report is
+// corrected by the next notification, exactly as on any
+// missed-notification window).
+
+/// Class suspend hook for one hub port. Self-filters on the
+/// record's hub context; idempotent. Never holds the record
+/// lock across an await.
+async fn suspend_ecm_port(hub_slot: u8, port: u8) -> crate::class_registry::SuspendOutcome {
+    use crate::class_registry::SuspendOutcome;
+    let target = {
+        let g = CDC_ECM_DEVICES.lock();
+        g.iter().find_map(|d| {
+            if !d.detached && d.hub_port == Some((hub_slot, port)) {
+                if d.suspended {
+                    Some(None)
+                } else {
+                    Some(Some(d.slot_id))
+                }
+            } else {
+                None
+            }
+        })
+    };
+    let Some(target) = target else {
+        return SuspendOutcome::NotMine;
+    };
+    let Some(slot_id) = target else {
+        return SuspendOutcome::Parked;
+    };
+    let Some(c) = crate::xhci::controller() else {
+        return SuspendOutcome::ParkFailed;
+    };
+    let setup = crate::control::set_feature_device_remote_wakeup();
+    let armed = c
+        .control_out(
+            slot_id,
+            setup.bm_request_type,
+            setup.b_request,
+            setup.w_value,
+            setup.w_index,
+            &[],
+        )
+        .await
+        .is_ok();
+    let mut g = CDC_ECM_DEVICES.lock();
+    match g
+        .iter_mut()
+        .find(|d| !d.detached && d.hub_port == Some((hub_slot, port)) && d.slot_id == slot_id)
+    {
+        Some(rec) => {
+            rec.suspended = true;
+            rec.wakeup_armed = armed;
+            SuspendOutcome::Parked
+        }
+        None => SuspendOutcome::NotMine,
+    }
+}
+
+/// Resume one parked ECM port: re-open the hub port, then clear
+/// the park flag. Returns `true` iff the port is awake and the
+/// flag cleared. Never holds the record lock across the await.
+pub async fn resume_ecm_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port: u8) -> bool {
+    let idx = {
+        let g = CDC_ECM_DEVICES.lock();
+        g.iter()
+            .position(|d| !d.detached && d.suspended && d.hub_port == Some((hub_slot, port)))
+    };
+    let Some(idx) = idx else {
+        return false;
+    };
+    crate::attach::resume_port(xhci_dev, hub_slot, port).await;
+    if crate::attach::hub_port_is_suspended(hub_slot, port) {
+        return false;
+    }
+    let mut g = CDC_ECM_DEVICES.lock();
+    match g.get_mut(idx) {
+        Some(rec) if !rec.detached && rec.suspended => {
+            rec.suspended = false;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Hub ports holding a parked (suspended, non-detached) ECM
+/// record: the wake-watch step's candidate list.
+pub fn suspended_hub_ports() -> Vec<(u8, u8)> {
+    let g = CDC_ECM_DEVICES.lock();
+    g.iter()
+        .filter(|d| !d.detached && d.suspended)
+        .filter_map(|d| d.hub_port)
+        .collect()
+}
+
+/// Wake-watch step: resume a parked ECM port only on an
+/// observed remote-wakeup edge.
+pub async fn wake_suspended_ports(xhci_dev: &crate::xhci::Xhci) {
+    for (hub_slot, port) in suspended_hub_ports() {
+        if crate::attach::hub_port_suspend_change(xhci_dev, hub_slot, port).await == Some(true) {
+            let _ = resume_ecm_port(xhci_dev, hub_slot, port).await;
+        }
+    }
 }
 
 pub fn register_initcalls() {
@@ -1109,6 +1321,9 @@ pub fn register_initcalls() {
             Ok(())
         },
     );
+    let _ = crate::class_registry::register_suspend_hook("cdc-ecm", |slot, port| {
+        alloc::boxed::Box::pin(suspend_ecm_port(slot, port))
+    });
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -1459,6 +1674,9 @@ pub mod tests {
             uplink_bps: 0,
             detached: false,
             controller: 0,
+            hub_port: None,
+            suspended: false,
+            wakeup_armed: false,
         };
         {
             let mut g = CDC_ECM_DEVICES.lock();
@@ -1513,6 +1731,9 @@ pub mod tests {
             uplink_bps: 0,
             detached: false,
             controller: 0,
+            hub_port: None,
+            suspended: false,
+            wakeup_armed: false,
         };
         {
             let mut g = CDC_ECM_DEVICES.lock();
@@ -1592,4 +1813,49 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/cdc_ecm", smoke_ecm_redock_rebind_and_wholesale);
+
+    // Suspend fixture test (#1256): the parked-port selection
+    // the hook and wake-watch manipulate. Transfer-level
+    // park -> gate -> wake -> traffic is CI/silicon-only (no
+    // fake xhci exists); the pump decision itself is pinned
+    // once in the r8152 module via the shared helper.
+    fn smoke_ecm_suspended_hub_ports() -> TestResult {
+        let mk = |slot: u8, hub_port: Option<(u8, u8)>, suspended: bool, detached: bool| {
+            CdcEcmDevice {
+                slot_id: slot,
+                comm_iface: 0,
+                data_iface: 1,
+                bulk_in_dci: 3,
+                bulk_out_dci: 4,
+                notif_dci: 0,
+                mac: [0x02, 0, 0, 0, 0, slot],
+                max_segment_size: 1518,
+                iface_name: alloc::format!("usb-ecm-susp{}", slot),
+                pump_running: true,
+                notif_running: false,
+                link_up: false,
+                downlink_bps: 0,
+                uplink_bps: 0,
+                detached,
+                controller: 0,
+                hub_port,
+                suspended,
+                wakeup_armed: suspended,
+            }
+        };
+        {
+            let mut g = CDC_ECM_DEVICES.lock();
+            g.push(mk(7, Some((2, 3)), true, false));
+            g.push(mk(8, Some((2, 4)), false, false));
+            g.push(mk(9, None, true, false));
+            g.push(mk(10, Some((2, 5)), true, true));
+        }
+        let ports = suspended_hub_ports();
+        __reset_ecm_for_test();
+        if ports != alloc::vec![(2, 3)] {
+            return TestResult::Fail("suspended_hub_ports selected the wrong ports");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ecm", smoke_ecm_suspended_hub_ports);
 }

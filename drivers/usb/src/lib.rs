@@ -333,6 +333,20 @@ fn spawn_supervisor_for(controller: alloc::sync::Arc<xhci::Xhci>) {
     narf_scheduler::spawn_stackful(supervisor(controller));
 }
 
+/// NIC wake-watch (#1256): resume parked NIC ports that
+/// signaled a remote-wakeup edge. Each family's step reads its
+/// own parked ports and resumes only on an observed edge;
+/// without this step, WoL arming would be unobservable — the
+/// device would wake, but the host would never notice until
+/// TX demand. See the supervisor-cycle comment at the call
+/// site for why this step is conditional while
+/// `resume_bound_ports` is unconditional.
+async fn wake_suspended_nic_ports(controller: &xhci::Xhci) {
+    r8152::wake_suspended_ports(controller).await;
+    cdc_ncm::wake_suspended_ports(controller).await;
+    cdc_ecm::wake_suspended_ports(controller).await;
+}
+
 /// The long-running USB supervisor of one controller. Walks every
 /// root-hub port the controller reports as connected, then every
 /// downstream port of every hub bound on it, attempting to bind one
@@ -340,6 +354,7 @@ fn spawn_supervisor_for(controller: alloc::sync::Arc<xhci::Xhci>) {
 /// Loops pumping interrupt-IN reports onto the global input ring
 /// between wakes.
 fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
+
     // Stackful: USB HID supervisor's enumeration loop polls xHCI
     // MMIO + per-port reset state. Preemption-capped at the
     // default 10 ms slice so a stuck port can't starve init.
@@ -750,6 +765,17 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
             // autosuspended port is exactly as dead as the
             // keyboard was (#763).
             resume_bound_ports(c).await;
+            // NIC wake-watch (#1256): unlike the unconditional
+            // wake above, a suspended NIC port is resumed ONLY
+            // on an observed remote-wakeup edge (the
+            // C_PORT_SUSPEND change bit). Resuming every
+            // suspended NIC port each cycle would defeat
+            // autosuspend and WoL: the port must STAY
+            // suspended while idle so the device can signal,
+            // and TX demand wakes it through the send path
+            // instead. Runs before the pumps so a woken
+            // device's pump transfers on its next turn.
+            wake_suspended_nic_ports(c).await;
             pump_bound_devices(c);
             SUPERVISOR_PHASE.store(8, core::sync::atomic::Ordering::Relaxed);
             // Power management: suspend any downstream port whose
