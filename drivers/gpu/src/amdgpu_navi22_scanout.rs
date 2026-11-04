@@ -707,7 +707,12 @@ impl Scanout {
     pub fn stop(&mut self) -> Result<(), Error> {
         let hidden = self.cursor.hide();
         self.disable_interrupts();
-        if matches!(self.state, State::Running) {
+        // An armed (unlatched) flip is not a failure: the caller's pipeline
+        // disable drains HUBP before `release`, so both surfaces become
+        // reclaimable. Leaving it Flipping made `release` refuse and leaked
+        // the published surfaces on hotplug/recovery/lastclose mid-flip.
+        // `Failed` keeps its quarantine.
+        if matches!(self.state, State::Running | State::Flipping) {
             self.state = State::Stopped;
         }
         hidden

@@ -90,6 +90,8 @@ pub struct GenericDevice {
     pub(crate) evdev_id: DeviceId,
     /// evdev DeviceNode — keyboard/mouse events dispatched here.
     pub(crate) evdev_node: Arc<DeviceNode>,
+    /// (parent hub slot, port) when behind a hub; spared by idle suspend.
+    pub(crate) hub_port: Option<(u8, u8)>,
 }
 
 /// Global registry of bound Generic HID interfaces.
@@ -97,6 +99,13 @@ static GENERIC_DEVICES: crate::xhci::PerController<Vec<GenericDevice>> =
     crate::per_controller_vec!();
 
 /// Lock-free count.
+/// Hub contexts of every generic-HID binding on `controller`, so idle
+/// suspend spares them like the other HID classes.
+pub fn hub_ports(controller: u8) -> Vec<(u8, u8)> {
+    let g = GENERIC_DEVICES.of(controller).lock();
+    g.iter().filter_map(|d| d.hub_port).collect()
+}
+
 pub static ATTACHED_GENERIC_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -195,6 +204,7 @@ pub async fn try_bind_generic(
     let (evdev_id, evdev_node) = ROUTER.register_device(caps);
 
     let dev = GenericDevice {
+        hub_port,
         slot_id,
         interrupt_in_dci,
         interface_num,

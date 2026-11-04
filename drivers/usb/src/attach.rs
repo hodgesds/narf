@@ -482,7 +482,8 @@ pub(crate) fn note_attach_failure(
     use core::fmt::Write as _;
     let _ = writeln!(
         narf_console::Writer,
-        "  usb-attach: root_port={} route=0x{:05x} failed at {}: {:?}",
+        "  usb-attach: xhci{} root_port={} route=0x{:05x} failed at {}: {:?}",
+        controller,
         root_port,
         route,
         step,
@@ -1324,6 +1325,14 @@ async fn log_unknown_device_classes(xhci_dev: &Xhci, slot_id: u8, port: u8) {
                 (0xFF, _) => "Vendor",
                 _ => "?",
             };
+            // Once per (port, class triple): a retried device would
+            // otherwise repeat every interface's line on each attempt.
+            static SEEN: IrqSafeSpinLock<alloc::collections::BTreeSet<(u8, u8, u8, u8)>> =
+                IrqSafeSpinLock::new(alloc::collections::BTreeSet::new());
+            if !SEEN.lock().insert((port, cls, sub, prot)) {
+                i += len;
+                continue;
+            }
             let _ = writeln!(
                 narf_console::Writer,
                 "  usb-attach: port={} slot={} unknown class {:02x}/{:02x}/{:02x} ({})",

@@ -1923,11 +1923,28 @@ async unsafe fn release_client_scanout(boot: &mut boot::ColdBoot) -> bool {
 /// client's framebuffer (its pin goes after that flip latches).
 pub fn release_client_scanout_async() {
     narf_scheduler::spawn(async {
-        let mut owner = OWNER.lock().await;
-        if let Some(boot) = owner.as_mut() {
-            // SAFETY: OWNER serializes display writers.
-            let _ = unsafe { release_client_scanout(boot) }.await;
+        // A present may hold an armed flip (OWNER released while it
+        // latches); returning to the owned surface is refused until it
+        // completes. Retry for up to ~1 s rather than leaving the pipe on
+        // the closed client's last frame.
+        for _ in 0..50 {
+            if !PRESENT.presenting.load(Ordering::Acquire) {
+                let mut owner = OWNER.lock().await;
+                let Some(boot) = owner.as_mut() else {
+                    return;
+                };
+                // SAFETY: OWNER serializes display writers.
+                if unsafe { release_client_scanout(boot) }.await {
+                    return;
+                }
+            }
+            narf_time::sleep_ms(20).await;
         }
+        use core::fmt::Write;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 lastclose could not return to the owned scanout"
+        );
     });
 }
 #[derive(Clone, Debug)]
@@ -2265,12 +2282,10 @@ async fn present_direct(
     let Ok(address) = frame_copy::direct(frame, &front) else {
         return Ok(None);
     };
-    // HDP: client GPU writes are complete (fences); flush the read cache
-    // path as the copy does before sampling.
-    boot.client_fence_reader()
-        .ok_or(ScanError::Busy)?
-        .completed(0)
-        .map_err(|_| ScanError::DeviceGone)?;
+    // No HDP step: display fetch reads VRAM through the MMHUB, not the
+    // HDP read path the CPU copy samples (amdgpu_dm programs the address
+    // after the fence wait alone). Requiring verified queues here would
+    // disable native present during recovery for no reason.
     match flip_unlocked(owner, ArmedKind::External, address).await {
         Ok(Latch::Done {
             before, latched, ..

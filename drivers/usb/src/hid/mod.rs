@@ -891,6 +891,7 @@ pub fn hub_ports(controller: u8) -> alloc::vec::Vec<(u8, u8)> {
     v.extend(mouse::hub_ports(controller));
     v.extend(touchpad::hub_ports(controller));
     v.extend(consumer::hub_ports(controller));
+    v.extend(generic::hub_ports(controller));
     v.sort_unstable();
     v.dedup();
     v

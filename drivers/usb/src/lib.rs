@@ -370,6 +370,10 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
         let mut claimed_root: u128 = 0;
         // Per-root-port consecutive-failure counter.
         let mut root_fail_count = [0u8; 128];
+        // Downstream hub ports get the same retry budget as root ports;
+        // keyed by (hub slot, port), forgotten when the port disconnects.
+        let mut hub_fail_count: alloc::collections::BTreeMap<(u8, u8), u8> =
+            alloc::collections::BTreeMap::new();
         // Per-root-port last-observed PLS encoding. Sentinel value
         // 0xFF means "not yet sampled" so the first sample doesn't
         // trip a spurious "PLS changed" reset.
@@ -657,12 +661,19 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                     }
                 }
                 let mut new_bound_bits: u64 = 0;
+                hub_fail_count
+                    .retain(|&(slot, port), _| slot != *hub_slot || connected.contains(&port));
                 for &dp in &connected {
                     if (*num_ports != 0) && dp > *num_ports {
                         continue;
                     }
                     let dpb = 1u64 << (dp as u32 & 63);
                     if (bound_mask | new_bound_bits) & dpb != 0 {
+                        continue;
+                    }
+                    if hub_fail_count.get(&(*hub_slot, dp)).copied().unwrap_or(0)
+                        >= MAX_PER_PORT_RETRIES
+                    {
                         continue;
                     }
                     let outcome = enumeration_wait::run(
@@ -689,8 +700,23 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                         | AttachOutcome::UsbClassDriver
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;
+                            hub_fail_count.remove(&(*hub_slot, dp));
                         }
-                        AttachOutcome::UnknownClass => {}
+                        AttachOutcome::UnknownClass => {
+                            let fails = hub_fail_count.entry((*hub_slot, dp)).or_insert(0);
+                            *fails = fails.saturating_add(1);
+                            if *fails == MAX_PER_PORT_RETRIES {
+                                use core::fmt::Write as _;
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "  usb-supervisor: xhci{} hub slot {} port {} gave up after {} attempts",
+                                    c.id(),
+                                    hub_slot,
+                                    dp,
+                                    MAX_PER_PORT_RETRIES
+                                );
+                            }
+                        }
                     }
                 }
                 if new_bound_bits != 0 {
