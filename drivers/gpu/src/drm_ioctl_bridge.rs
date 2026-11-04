@@ -2074,8 +2074,61 @@ pub fn dispatch_card(
 }
 
 /// Stateful card dispatcher used by a real DRM open file.
+///
+/// Bring-up visibility: an EINVAL from any card ioctl is logged once per
+/// (ioctl number, source line), with the line [`invalid_at`] recorded in
+/// this file (0 when the error was built elsewhere). Compositors report
+/// only "Invalid argument" for a whole modeset sequence.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_card_for_file(
+    card_index: u32,
+    open_id: u64,
+    cmd: u32,
+    arg: usize,
+    render: bool,
+    client_caps: &DrmClientCaps,
+    events: Option<&narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
+    out_fences: Option<&narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>>,
+) -> Result<u64, FsError> {
+    LAST_INVALID_LINE.store(0, core::sync::atomic::Ordering::Relaxed);
+    let result = dispatch_card_for_file_inner(
+        card_index,
+        open_id,
+        cmd,
+        arg,
+        render,
+        client_caps,
+        events,
+        out_fences,
+    );
+    if matches!(result, Err(FsError::InvalidData)) {
+        static SEEN: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u32, u32)>> =
+            narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+        let line = LAST_INVALID_LINE.load(core::sync::atomic::Ordering::Relaxed);
+        let key = (cmd, line);
+        let fresh = {
+            let mut seen = SEEN.lock();
+            let fresh = seen.len() < 48 && !seen.contains(&key);
+            if fresh {
+                seen.push(key);
+            }
+            fresh
+        };
+        if fresh {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  drm: ioctl {cmd:#010x} (nr {:#x}, {}) EINVAL at drm_ioctl_bridge.rs:{line}",
+                drm_uapi::ioc_nr(cmd),
+                if render { "render" } else { "primary" },
+            );
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_card_for_file_inner(
     card_index: u32,
     open_id: u64,
     cmd: u32,
