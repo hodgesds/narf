@@ -422,6 +422,8 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
     for live in [false, true] {
         let id = if live { 0 } else { context(&file, &info, &user) };
         credentials.grant(&[]);
+        // The previous pass ended on ctx_setparam's CAP_SYS_ADMIN question.
+        credentials.asked();
         // BANNABLE: size, then `!capable(CAP_SYS_ADMIN) && !args->value`.
         assert_eq!(set(id, 1, 5, 0), Err(FsError::InvalidData));
         assert_eq!(credentials.asked(), 0, "capable() before the size check");
