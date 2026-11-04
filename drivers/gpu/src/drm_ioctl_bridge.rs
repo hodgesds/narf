@@ -2339,8 +2339,12 @@ fn dispatch_card_for_file_inner(
         // ATOMIC so weston falls back to legacy SETCRTC modeset, which
         // narf-drm implements (full atomic-commit is not wired yet).
         IoctlCmd::SetClientCap => handle_set_client_cap(&mode_state, arg, client_caps),
-        IoctlCmd::ModeCreatePropBlob => handle_create_property_blob(&mode_state, arg, &ctx),
-        IoctlCmd::ModeDestroyPropBlob => handle_destroy_property_blob(&mode_state, arg, &ctx),
+        IoctlCmd::ModeCreatePropBlob => {
+            handle_create_property_blob(&mode_state, arg, &ctx, open_id)
+        }
+        IoctlCmd::ModeDestroyPropBlob => {
+            handle_destroy_property_blob(&mode_state, arg, &ctx, open_id)
+        }
         IoctlCmd::ModeListLessees => handle_list_lessees(arg, &ctx),
         // Dumb-buffer ioctls — new in Rung 3.
         IoctlCmd::ModeCreateDumb => handle_create_dumb(&mode_state, arg, &ctx),
@@ -4821,6 +4825,7 @@ fn handle_getpropblob(
     };
 
     // Second pass: copy the bytes out when the caller sized its buffer.
+    // LINUX-GAP: drm_mode_getblob_ioctl copies only on an exact length.
     if data_ptr != 0 && user_len as usize >= edid.len() {
         // SAFETY: user-supplied `data_ptr` the caller sized for >= edid.len().
         unsafe { copy_out(data_ptr as usize, &edid)? };
@@ -5120,6 +5125,7 @@ fn handle_create_property_blob(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     ctx: &DrmFileCtx,
+    open_id: u64,
 ) -> Result<u64, FsError> {
     if ctx.is_render_client() {
         return Err(FsError::PermissionDenied);
@@ -5137,6 +5143,9 @@ fn handle_create_property_blob(
         // validates the full user range; generic copy_in retains its 1MiB cap.
         unsafe { copy_in_bounded(ptr as usize, len, limit) }
     })?;
+    // The blob belongs to this file (drm_property_create_blob's file_priv).
+    let id = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    mode_state.lock().set_blob_owner(id, open_id);
     // SAFETY: fixed 16-byte in/out structure.
     unsafe { copy_out(arg, &bytes)? };
     Ok(0)
@@ -5147,6 +5156,7 @@ fn handle_destroy_property_blob(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     ctx: &DrmFileCtx,
+    open_id: u64,
 ) -> Result<u64, FsError> {
     if ctx.is_render_client() {
         return Err(FsError::PermissionDenied);
@@ -5155,10 +5165,11 @@ fn handle_destroy_property_blob(
     // validates the complete userspace range.
     let bytes = unsafe { copy_in(arg, 4)? };
     let blob_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    if mode_state.lock().destroy_property_blob(blob_id) {
-        Ok(0)
-    } else {
-        Err(FsError::NotFound)
+    // drm_mode_destroyblob_ioctl: another file's blob is EPERM.
+    match mode_state.lock().destroy_owned_blob(blob_id, open_id) {
+        Ok(()) => Ok(0),
+        Err(true) => Err(FsError::OperationNotPermitted),
+        Err(false) => Err(FsError::NotFound),
     }
 }
 

@@ -426,6 +426,9 @@ pub(crate) struct VirtGpuImport {
 pub(crate) struct PropertyBlob {
     pub(crate) id: u32,
     pub(crate) data: Vec<u8>,
+    /// The open that created it with CREATEPROPBLOB (drm_property_blob's
+    /// file_priv); `None` for a kernel or fixture blob.
+    pub(crate) owner: Option<u64>,
     /// Still owned by its creator: DESTROYPROPBLOB not yet called. A blob a
     /// committed property still names outlives its creator's reference, as
     /// a refcounted `drm_property_blob` does (`Card::collect_blobs`).
@@ -1806,9 +1809,46 @@ impl Card {
         self.property_blobs.push(PropertyBlob {
             id,
             data,
+            owner: None,
             user: true,
         });
         Ok(id)
+    }
+
+    /// Record that open `owner` created blob `id` (CREATEPROPBLOB).
+    pub(crate) fn set_blob_owner(&mut self, id: u32, owner: u64) {
+        if let Some(b) = self.property_blobs.iter_mut().find(|b| b.id == id) {
+            b.owner = Some(owner);
+        }
+    }
+    /// DESTROYPROPBLOB by open `owner` (drm_mode_destroyblob_ioctl):
+    /// `Err(true)` → EPERM for another open's blob, `Err(false)` → ENOENT.
+    pub(crate) fn destroy_owned_blob(&mut self, id: u32, owner: u64) -> Result<(), bool> {
+        let blob = self
+            .property_blobs
+            .iter()
+            .find(|b| b.id == id && b.user)
+            .ok_or(false)?;
+        if blob.owner.is_some_and(|o| o != owner) {
+            return Err(true);
+        }
+        if self.destroy_property_blob(id) {
+            Ok(())
+        } else {
+            Err(false)
+        }
+    }
+    /// drm_property_destroy_user_blobs: a closing open's blobs go (those a
+    /// committed property still names stay until it lets them go).
+    pub fn release_file_blobs(&mut self, owner: u64) {
+        for b in self
+            .property_blobs
+            .iter_mut()
+            .filter(|b| b.owner == Some(owner))
+        {
+            b.user = false;
+        }
+        self.collect_blobs();
     }
 
     /// Look up a KMS property blob by id.

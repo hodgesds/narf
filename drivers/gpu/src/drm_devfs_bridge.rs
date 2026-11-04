@@ -285,6 +285,7 @@ impl Drop for DriCardFile {
             #[cfg(feature = "amdgpu")]
             let shown = ms.crtcs_showing_owner(self.open_id);
             ms.release_file_framebuffers(self.open_id);
+            ms.release_file_blobs(self.open_id);
             #[cfg(feature = "amdgpu")]
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
                 for crtc in shown {
