@@ -905,6 +905,65 @@ fn smoke_virtio_net_rx_csum_verdict() -> TestResult {
 }
 kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_rx_csum_verdict);
 
+/// Regression pin for the HASH_REPORT + GUEST_CSUM fail-open: the RX
+/// pump's csum check must slice the payload at the runtime header
+/// length (20 with HASH_REPORT), not a hardcoded 12. Under the old
+/// slicing, an unverified TCPv4 segment under a 20-byte header
+/// delivered (the shifted window misreads the ethertype as 0x0000
+/// from the dst-MAC bytes); under the fix it drops fail-closed, and
+/// the 12-byte (GUEST_CSUM-only) path behaves byte-identically.
+fn smoke_virtio_net_rx_csum_hash_report_header() -> TestResult {
+    use crate::net_pci::{
+        rx_csum_deliver, rx_csum_payload, rx_header_len, VIRTIO_NET_HDR_F_DATA_VALID,
+    };
+
+    if rx_header_len(true) != 20 || rx_header_len(false) != 12 {
+        return TestResult::Fail("rx_header_len mismatch");
+    }
+    // IPv4/TCP frame via the shared builder (eth 14 + ip 20 + tcp 20).
+    let mut tcp4 = [0u8; 54];
+    virtio_test_ipv4_tcp_frame(&mut tcp4);
+    // Full RX buffer: 20-byte HASH_REPORT header (zeroed but for the
+    // flags byte, which stays 0 = unverified) + payload.
+    let mut buf20 = [0u8; 74];
+    buf20[20..74].copy_from_slice(&tcp4);
+    let payload20 = rx_csum_payload(&buf20, 20, tcp4.len() as u32);
+    if payload20 != tcp4 {
+        return TestResult::Fail("20-byte-header csum slice is not the true payload");
+    }
+    // Unverified TCPv4 under HASH_REPORT must drop (fail-closed).
+    if rx_csum_deliver(0, payload20) {
+        return TestResult::Fail("unverified TCPv4 under HASH_REPORT delivered");
+    }
+    // Device-verified TCPv4 under HASH_REPORT delivers.
+    if !rx_csum_deliver(VIRTIO_NET_HDR_F_DATA_VALID, payload20) {
+        return TestResult::Fail("device-verified TCPv4 under HASH_REPORT dropped");
+    }
+    // Regression pin: the old hardcoded-12 slice of the same buffer
+    // delivers the unverified segment — the fail-open this fix closes.
+    // (Shifted window's ethertype read lands on dst-MAC bytes = 0x0000,
+    // which takes the deliver-by-default arm.)
+    let shifted = buf20.get(12..12 + tcp4.len()).unwrap_or(&[]);
+    if !rx_csum_deliver(0, shifted) {
+        return TestResult::Fail("shifted-slice pin does not reproduce the fail-open");
+    }
+    // GUEST_CSUM-only path (12-byte header): same slice, same verdicts.
+    let mut buf12 = [0u8; 66];
+    buf12[12..66].copy_from_slice(&tcp4);
+    let payload12 = rx_csum_payload(&buf12, 12, tcp4.len() as u32);
+    if payload12 != tcp4 {
+        return TestResult::Fail("12-byte-header csum slice changed");
+    }
+    if rx_csum_deliver(0, payload12) {
+        return TestResult::Fail("unverified TCPv4 without HASH_REPORT delivered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_rx_csum_hash_report_header
+);
+
 fn smoke_virtio_net_pci_tx() -> TestResult {
     use crate::net_pci;
     use narf_bus::driver_match::__reset_for_test;
@@ -1079,6 +1138,128 @@ fn smoke_virtio_net_pci_registers_iface() -> TestResult {
 kernel_test_in!(
     "drivers/virtio/net-pci",
     smoke_virtio_net_pci_registers_iface
+);
+
+// ── virtio-net RSS (audit gap 8) ────────────────────────────────────
+// Pure-encoder smokes: the RSS/HASH config builders + RX header
+// length selection, exercised without PCI, DMA, or a live QEMU
+// NIC (default QEMU does not offer F_RSS, so no live-device
+// coverage exists in CI either — the wire bytes are pinned here
+// and the device behavior is CI/silicon-verified).
+
+fn smoke_virtio_net_rss_config_encoding() -> TestResult {
+    use crate::net_pci::{build_hash_config, build_rss_config, rx_header_len};
+    use crate::net_pci::{VIRTIO_NET_HDR_HASH_LEN, VIRTIO_NET_HDR_LEN};
+
+    // Header lengths: 12 base, 20 with HASH_REPORT.
+    if VIRTIO_NET_HDR_LEN != 12 || VIRTIO_NET_HDR_HASH_LEN != 20 {
+        return TestResult::Fail("RX header length constants wrong");
+    }
+    if rx_header_len(false) != 12 || rx_header_len(true) != 20 {
+        return TestResult::Fail("rx_header_len selection wrong");
+    }
+
+    // Full config: device advertises all 9 hash types (incl. _EX)
+    // + 128-entry table max + 52-byte key max, 4 live pairs.
+    // Expect: _EX masked out (0x3f), table capped at 64 (mask 63),
+    // entries i % 4, max_tx_vq 4, key clamped to 40.
+    let payload = match build_rss_config(0x1ff, 4, 128, 52) {
+        Some(p) => p,
+        None => return TestResult::Fail("valid RSS config returned None"),
+    };
+    // 11 fixed bytes + 2*64 table + 40 key = 179.
+    if payload.len() != 179 {
+        return TestResult::Fail("RSS config length wrong");
+    }
+    let hash_types = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if hash_types != 0x3f {
+        return TestResult::Fail("RSS hash types not masked to base six");
+    }
+    let mask = u16::from_le_bytes([payload[4], payload[5]]);
+    if mask != 63 {
+        return TestResult::Fail("RSS indirection mask not 63");
+    }
+    let unclassified = u16::from_le_bytes([payload[6], payload[7]]);
+    if unclassified != 0 {
+        return TestResult::Fail("RSS unclassified queue not pair 0");
+    }
+    for i in 0..64u16 {
+        let off = 8 + 2 * i as usize;
+        let entry = u16::from_le_bytes([payload[off], payload[off + 1]]);
+        if entry != i % 4 {
+            return TestResult::Fail("RSS indirection entry not i % num_pairs");
+        }
+    }
+    let max_tx_vq = u16::from_le_bytes([payload[136], payload[137]]);
+    if max_tx_vq != 4 {
+        return TestResult::Fail("RSS max_tx_vq not live pair count");
+    }
+    if payload[138] != 40 {
+        return TestResult::Fail("RSS key length not clamped to 40");
+    }
+    // Key pinned from an independent splitmix64 computation: an
+    // accidental key change silently re-steers every flow.
+    let expected_key: [u8; 8] = [0xc6, 0xb4, 0x50, 0xbb, 0x39, 0x33, 0xb8, 0x21];
+    if payload[139..147] != expected_key {
+        return TestResult::Fail("RSS key bytes changed from pinned splitmix64 output");
+    }
+
+    // Non-power-of-two device max rounds DOWN (5 -> 4, mask 3).
+    let small = match build_rss_config(0x3f, 2, 5, 40) {
+        Some(p) => p,
+        None => return TestResult::Fail("small-table RSS config returned None"),
+    };
+    if u16::from_le_bytes([small[4], small[5]]) != 3 || small.len() != 11 + 8 + 40 {
+        return TestResult::Fail("RSS table size not rounded down to power of two");
+    }
+
+    // Degenerate inputs fail closed (caller skips the command).
+    if build_rss_config(0x3f, 0, 128, 40).is_some()
+        || build_rss_config(0x3f, 4, 0, 40).is_some()
+        || build_rss_config(0x3f, 4, 128, 0).is_some()
+    {
+        return TestResult::Fail("degenerate RSS config not rejected");
+    }
+    // Zero advertised types fall back to the base six, not zero.
+    let fallback = match build_rss_config(0, 1, 1, 40) {
+        Some(p) => p,
+        None => return TestResult::Fail("fallback RSS config returned None"),
+    };
+    if u32::from_le_bytes([fallback[0], fallback[1], fallback[2], fallback[3]]) != 0x3f {
+        return TestResult::Fail("RSS hash types did not fall back to base six");
+    }
+
+    // HASH_CONFIG: hash_types + 8 reserved zero bytes + key.
+    let hash = match build_hash_config(0x1ff, 40) {
+        Some(p) => p,
+        None => return TestResult::Fail("valid HASH config returned None"),
+    };
+    if hash.len() != 53
+        || u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]) != 0x3f
+        || hash[4..12] != [0u8; 8]
+        || hash[12] != 40
+        || hash[13..21] != expected_key
+    {
+        return TestResult::Fail("HASH config layout wrong");
+    }
+    if build_hash_config(0x3f, 0).is_some() {
+        return TestResult::Fail("zero-key HASH config not rejected");
+    }
+
+    // Strip math: a max-size frame fits under both header forms,
+    // and a header-only buffer strips to an empty payload.
+    let total_hash = (20 + 1518) as u32;
+    if total_hash.saturating_sub(rx_header_len(true) as u32) != 1518 {
+        return TestResult::Fail("hash-report strip math wrong");
+    }
+    if (20u32).saturating_sub(rx_header_len(true) as u32) != 0 {
+        return TestResult::Fail("header-only frame did not strip to empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_rss_config_encoding
 );
 
 fn smoke_virtio_net_pci_legacy_iface_registered() -> TestResult {
