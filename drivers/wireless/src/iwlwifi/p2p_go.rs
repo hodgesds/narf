@@ -8,6 +8,93 @@ const OUI: [u8; 4] = [0x50, 0x6f, 0x9a, 9];
 const NOA: u8 = 12;
 const MAX_ATTRIBUTES: usize = 1536;
 
+/// Linux `IEEE80211_P2P_OPPPS_ENABLE_BIT` (bit 7) and
+/// `IEEE80211_P2P_OPPPS_CTWINDOW_MASK` (bits 0-6) from
+/// `include/linux/ieee80211-p2p.h`: the GO's Notice-of-Absence
+/// `oppps_ctwindow` byte packs opportunistic-PS enable + CTWindow.
+/// Same packing as Linux `mvm/mac-ctxt.c` GO programming
+/// (`cmd.go.ctwin = oppps_ctwindow & MASK`,
+/// `cmd.go.opp_ps_enabled = !!(oppps_ctwindow & ENABLE_BIT)`) and
+/// mac80211 START_AP (`cfg.c`: `p2p_ctwindow & MASK`, OR the enable
+/// bit when `p2p_opp_ps`).
+pub(super) fn oppps_ctwindow(ctwindow_tu: u8, opportunistic: bool) -> u8 {
+    (ctwindow_tu & 0x7f) | if opportunistic { 0x80 } else { 0 }
+}
+
+/// Full Notice-of-Absence attribute bytes for a driver-owned GO power
+/// save setting: `[id 12, len 2 LE, index, oppps_ctwindow]`.
+/// No absence descriptors: `P2pGoPowerSave` carries no schedule, so
+/// this advertises opportunistic PS + CTWindow only. The index counts
+/// driver-owned NoA versions: 0 at GO start, +1 per live update.
+pub(super) fn noa_attribute(index: u8, ctwindow_tu: u8, opportunistic: bool) -> Vec<u8> {
+    vec![NOA, 2, 0, index, oppps_ctwindow(ctwindow_tu, opportunistic)]
+}
+
+/// Rewrite the P2P vendor IE(s) inside beacon elements so the
+/// transmitted template carries exactly one driver-owned NoA
+/// attribute (index + oppps byte, no descriptors). Any
+/// SME-supplied NoA attribute is replaced wholesale: a userspace
+/// NoA is metadata only (same rule as `Native::project_probe`),
+/// and the setter contract has no descriptor input to preserve.
+/// Non-P2P elements pass through byte-identical and in order; the
+/// rebuilt P2P IE takes the position of the first original P2P IE
+/// (or is appended when none exists), re-fragmented at 251
+/// attribute bytes per vendor element, matching `project_probe`.
+pub(super) fn set_noa_in_elements(
+    elements: &[u8],
+    index: u8,
+    ctwindow_tu: u8,
+    opportunistic: bool,
+) -> Result<Vec<u8>, &'static str> {
+    let parsed = super::ap_wire::elements_iter(elements)?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut attrs: Vec<u8> = Vec::new();
+    let mut p2p_at: Option<usize> = None;
+    for (id, body) in &parsed {
+        if *id == 221 && body.starts_with(&OUI) {
+            if p2p_at.is_none() {
+                p2p_at = Some(out.len());
+            }
+            if attrs.len() + body.len() - OUI.len() > MAX_ATTRIBUTES {
+                return Err("GO P2P attributes exceed bounded template");
+            }
+            attrs.extend_from_slice(&body[4..]);
+        } else {
+            out.extend_from_slice(&[*id, body.len() as u8]);
+            out.extend_from_slice(body);
+        }
+    }
+    // Drop any SME-supplied NoA, then append the driver-owned one.
+    let mut kept: Vec<u8> = Vec::new();
+    let mut raw = attrs.as_slice();
+    while !raw.is_empty() {
+        let len = usize::from(u16::from_le_bytes([raw[1], raw[2]]));
+        if raw[0] != NOA {
+            kept.extend_from_slice(&raw[..3 + len]);
+        }
+        raw = &raw[3 + len..];
+    }
+    kept.extend_from_slice(&noa_attribute(index, ctwindow_tu, opportunistic));
+    let mut rebuilt: Vec<u8> = Vec::new();
+    for part in kept.chunks(251) {
+        rebuilt.extend_from_slice(&[221, (4 + part.len()) as u8]);
+        rebuilt.extend_from_slice(&OUI);
+        rebuilt.extend_from_slice(part);
+    }
+    match p2p_at {
+        Some(at) => {
+            let mut final_elements = out[..at].to_vec();
+            final_elements.extend_from_slice(&rebuilt);
+            final_elements.extend_from_slice(&out[at..]);
+            Ok(final_elements)
+        }
+        None => {
+            out.extend_from_slice(&rebuilt);
+            Ok(out)
+        }
+    }
+}
+
 /// P2P Device Address is protocol identity, never physical MAC ownership.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Identity {

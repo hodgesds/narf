@@ -56,6 +56,8 @@ pub(super) enum Operation {
     ),
     Stop,
     Beacon(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>),
+    /// Live GO CTWindow/OPPPS update (driver-owned NoA re-send).
+    SetGoPowerSave(narf_wireless::P2pGoPowerSave),
     Add(narf_wireless::StationConfig),
     Set(narf_wireless::StationConfig),
     Delete(Option<[u8; 6]>),

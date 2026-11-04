@@ -278,48 +278,38 @@ fn schema_denials() -> R {
             "GO true1MHz NO_P2P overlap admitted",
         )?;
     }
-    for bad in 0..4 {
+    for bad in 0..3 {
         let f = Fixture::new(None, None)?;
         f.admin.set_link(false).map_err(|_| "GO malformed DOWN")?;
         f.device()
             .set_iftype(9)
             .map_err(|_| "GO malformed actual role")?;
         f.admin.set_link(true).map_err(|_| "GO malformed UP")?;
-        let (config, mut settings) = config(true);
+        let (config, settings) = config(true);
         let mut config = wire::decorate(config);
-        match bad {
-            0 => {
-                // Actual GO flag in the capability attr, not a host role enum.
-                let pos = config
-                    .beacon_head
-                    .windows(5)
-                    .position(|raw| raw == [2, 2, 0, 0x25, 1])
-                    .ok_or("GO literal capability fixture")?;
-                config.beacon_head[pos + 4] = 0;
-            }
-            1 => {
-                // Protocol device address is independently bound in probe.
-                let probe = config.probe_resp.as_mut().unwrap();
-                let pos = probe
-                    .windows(6)
-                    .position(|raw| raw == wire::DEVICE)
-                    .ok_or("GO literal device info fixture")?;
-                probe[pos + 5] ^= 1;
-            }
-            2 => {
-                let pos = config
-                    .beacon_head
-                    .windows(5)
-                    .position(|raw| raw == [1, 3, 0x8c, 0x98, 0xb0])
-                    .ok_or("GO literal OFDM rates fixture")?;
-                config.beacon_head[pos + 2] = 0x82;
-            }
-            _ => {
-                settings.p2p_go = Some(narf_wireless::P2pGoPowerSave {
-                    ctwindow_tu: Some(4),
-                    opportunistic: Some(true),
-                });
-            }
+        if bad == 0 {
+            // Actual GO flag in the capability attr, not a host role enum.
+            let pos = config
+                .beacon_head
+                .windows(5)
+                .position(|raw| raw == [2, 2, 0, 0x25, 1])
+                .ok_or("GO literal capability fixture")?;
+            config.beacon_head[pos + 4] = 0;
+        } else if bad == 1 {
+            // Protocol device address is independently bound in probe.
+            let probe = config.probe_resp.as_mut().unwrap();
+            let pos = probe
+                .windows(6)
+                .position(|raw| raw == wire::DEVICE)
+                .ok_or("GO literal device info fixture")?;
+            probe[pos + 5] ^= 1;
+        } else {
+            let pos = config
+                .beacon_head
+                .windows(5)
+                .position(|raw| raw == [1, 3, 0x8c, 0x98, 0xb0])
+                .ok_or("GO literal OFDM rates fixture")?;
+            config.beacon_head[pos + 2] = 0x82;
         }
         let a = f.authority()?;
         require(
@@ -380,8 +370,8 @@ fn source_denials() -> R {
                 require(
                     f.device().set_iftype(3) == Err(WirelessError::Busy)
                         && f.device().set_iftype(8) == Err(WirelessError::Busy)
-                        && !f.device().supports_p2p_go_power_save(),
-                    "GO active role allowed retype or invented CLIENT/GO PS contract",
+                        && f.device().supports_p2p_go_power_save(),
+                    "GO active role allowed retype or lost GO PS contract",
                 )?;
                 f.daemon.revoke();
             }
@@ -617,3 +607,165 @@ fn group_sequences(f: &Fixture) -> R {
     sequence(f, 2, 0)?;
     Ok(())
 }
+
+#[inline(never)]
+fn template_noa(body: &[u8]) -> R<Vec<u8>> {
+    // Firmware beacon template: 32-byte header, then the beacon frame
+    // (36-byte 802.11 header + elements).
+    let beacon = body.get(32..).ok_or("GO PS template extent")?;
+    let elements = beacon.get(36..).ok_or("GO PS beacon extent")?;
+    let mut attrs: Vec<u8> = Vec::new();
+    let mut rest = elements;
+    while !rest.is_empty() {
+        let len = usize::from(*rest.get(1).ok_or("GO PS IE header")?);
+        let end = 2 + len;
+        let part = rest.get(2..end).ok_or("GO PS IE extent")?;
+        if rest[0] == 221 && part.starts_with(&[0x50, 0x6f, 0x9a, 9]) {
+            attrs.extend_from_slice(&part[4..]);
+        }
+        rest = rest.get(end..).ok_or("GO PS IE overrun")?;
+    }
+    let mut raw = attrs.as_slice();
+    while !raw.is_empty() {
+        let header = raw.get(..3).ok_or("GO PS attribute header")?;
+        let len = usize::from(u16::from_le_bytes([header[1], header[2]]));
+        let attr = raw.get(..3 + len).ok_or("GO PS attribute extent")?;
+        if header[0] == 12 {
+            return Ok(attr.to_vec());
+        }
+        raw = &raw[3 + len..];
+    }
+    Err("GO PS template omitted NoA attribute")
+}
+
+#[inline(never)]
+fn templates() -> R<Vec<Vec<u8>>> {
+    let slot = HARNESS.lock();
+    let commands = &slot.as_ref().ok_or("GO PS harness")?.1.commands;
+    Ok(commands
+        .iter()
+        .filter(|(g, c, _)| (*g, *c) == (1, 0x91))
+        .map(|(_, _, body)| body.clone())
+        .collect())
+}
+
+#[inline(never)]
+fn go_ps() -> R {
+    // Start-time setter: CTWindow 4 + opportunistic -> index 0, 0x84.
+    let f = Fixture::new(None, None)?;
+    f.admin.set_link(false).map_err(|_| "GO PS DOWN")?;
+    f.device().set_iftype(9).map_err(|_| "GO PS role")?;
+    f.admin.set_link(true).map_err(|_| "GO PS UP")?;
+    require(
+        f.device().supports_p2p_go_power_save(),
+        "GO device lost PS contract",
+    )?;
+    let (config, mut settings) = config(true);
+    settings.p2p_go = Some(narf_wireless::P2pGoPowerSave {
+        ctwindow_tu: Some(4),
+        opportunistic: Some(true),
+    });
+    let config = wire::decorate(config);
+    let a = f.authority()?;
+    run(
+        f.device()
+            .start_ap_with_settings_async(&a, config, settings),
+        service,
+    )?
+    .map_err(|_| "GO PS START rejected")?;
+    drop(a);
+    let sent = templates()?;
+    require(!sent.is_empty(), "GO PS start sent no beacon template")?;
+    require(
+        template_noa(sent.first().unwrap())? == [12, 2, 0, 0, 0x84],
+        "GO PS start template NoA is not index 0 CTWindow 4 OPPPS",
+    )?;
+    // Live update: CTWindow 10, opportunistic preserved -> index 1, 0x8a.
+    let a = f.authority()?;
+    run(
+        f.device().set_p2p_go_power_save_ap_async(
+            &a,
+            narf_wireless::P2pGoPowerSave {
+                ctwindow_tu: Some(10),
+                opportunistic: None,
+            },
+        ),
+        service,
+    )?
+    .map_err(|_| "GO PS live update rejected")?;
+    drop(a);
+    let sent = templates()?;
+    require(sent.len() >= 2, "GO PS live update sent no new template")?;
+    require(
+        template_noa(sent.last().unwrap())? == [12, 2, 0, 1, 0x8a],
+        "GO PS live template NoA is not index 1 CTWindow 10 OPPPS",
+    )?;
+    // Explicit reset: CTWindow 0 + OPPPS off -> index 2, 0x00.
+    let a = f.authority()?;
+    run(
+        f.device().set_p2p_go_power_save_ap_async(
+            &a,
+            narf_wireless::P2pGoPowerSave {
+                ctwindow_tu: Some(0),
+                opportunistic: Some(false),
+            },
+        ),
+        service,
+    )?
+    .map_err(|_| "GO PS reset rejected")?;
+    drop(a);
+    let sent = templates()?;
+    require(
+        template_noa(sent.last().unwrap())? == [12, 2, 0, 2, 0x00],
+        "GO PS reset template NoA is not index 2 zero",
+    )?;
+    // CTWindow beyond the 7-bit field is refused, not truncated.
+    let f = Fixture::new(None, None)?;
+    f.admin.set_link(false).map_err(|_| "GO PS bad DOWN")?;
+    f.device().set_iftype(9).map_err(|_| "GO PS bad role")?;
+    f.admin.set_link(true).map_err(|_| "GO PS bad UP")?;
+    let (config, mut settings) = config(true);
+    settings.p2p_go = Some(narf_wireless::P2pGoPowerSave {
+        ctwindow_tu: Some(200),
+        opportunistic: Some(true),
+    });
+    let config = wire::decorate(config);
+    let a = f.authority()?;
+    require(
+        run(
+            f.device()
+                .start_ap_with_settings_async(&a, config, settings),
+            service,
+        )?
+        .is_err()
+            && !f.device().link_up(),
+        "GO PS CTWindow 200 reached native START",
+    )?;
+    // Ordinary APs still refuse GO power-save fields.
+    let f = Fixture::new(None, None)?;
+    f.admin.set_link(false).map_err(|_| "AP PS DOWN")?;
+    f.admin.set_link(true).map_err(|_| "AP PS UP")?;
+    let (config, mut settings) = config(true);
+    settings.p2p_go = Some(narf_wireless::P2pGoPowerSave {
+        ctwindow_tu: Some(4),
+        opportunistic: Some(true),
+    });
+    let a = f.authority()?;
+    require(
+        run(
+            f.device()
+                .start_ap_with_settings_async(&a, config, settings),
+            service,
+        )?
+        .is_err(),
+        "ordinary AP accepted GO power-save fields",
+    )?;
+    Ok(())
+}
+fn smoke_iwl_p2p_go_native_ps_setter_beacon_template() -> TestResult {
+    check(go_ps)
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/p2p/go",
+    smoke_iwl_p2p_go_native_ps_setter_beacon_template
+);

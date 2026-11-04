@@ -270,7 +270,7 @@ impl Device {
         };
         let start = if let Operation::Start(config, settings) = &operation {
             let plan = if self.current_iftype() == 9 {
-                super::super::ap_wire::Plan::new_go(config.as_ref().clone(), settings, self.mac)
+                super::super::ap_wire::Plan::new_go(config.as_ref().clone(), settings, self.mac, 0)
             } else {
                 super::super::ap_wire::Plan::new(config.as_ref().clone(), settings, self.mac)
             }
@@ -462,6 +462,7 @@ impl Device {
             let hw = &mut state.hardware;
             match operation {
                 Operation::Beacon(head, tail, probe) => ap.beacon(hw, head, tail, probe).await?,
+                Operation::SetGoPowerSave(ps) => ap.set_go_power_save(hw, ps).await?,
                 Operation::Add(config) => ap.add_peer(hw, config).await?,
                 Operation::Set(config) => ap.set_peer(hw, config).await?,
                 Operation::Delete(peer) => {
