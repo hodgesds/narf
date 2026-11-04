@@ -997,7 +997,7 @@ fn config_h_2(seq: &mut Seq, txcfg: u32) -> Result<(), PhyError> {
         seq.run(&[wp(0x0bcf, 0x16, ioffset)], txcfg)?;
     }
     let data = seq.read_paged(0x0bcd, 0x16)? & 0x000f;
-    let rlen = if data > 3 { data - 3 } else { 0 };
+    let rlen = data.saturating_sub(3);
     let data = rlen | (rlen << 4) | (rlen << 8) | (rlen << 12);
     seq.run(&[wp(0x0bcd, 0x17, data)], txcfg)?;
     seq.run(
@@ -1060,7 +1060,7 @@ pub const fn revision_for(ver: u32) -> Option<Revision> {
         36 => Some(Revision::F2),
         38 => Some(Revision::M8411),
         40 => Some(Revision::G1),
-        42 | 43 | 44 => Some(Revision::G2),
+        42..=44 => Some(Revision::G2),
         46 | 48 => Some(Revision::H2),
         51 => Some(Revision::Ep2),
         52 => Some(Revision::M8117),
