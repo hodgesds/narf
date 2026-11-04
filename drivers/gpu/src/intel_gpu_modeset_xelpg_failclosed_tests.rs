@@ -329,13 +329,19 @@ fn smoke_mtl_failclosed_actual_stop_and_pll_abort_later_programming() -> TestRes
     let io = FailClosedMtl::new();
     io.mode.cdclk_pll.set((1 << 31) | 34); // acknowledged652.8MHz, still below floor
     assert_eq!(
+        crate::intel_gpu_modeset_xelpg::program_cdclk_floor(&io, &beyond),
+        Err(ModesetError::PllLockTimeout)
+    );
+    assert_eq!(
         crate::intel_gpu_modeset::modeset_display(
             &io,
             Generation::MeteorLake,
             &test_fb(),
             Some(&beyond)
         ),
-        Err(ModesetError::PllLockTimeout)
+        Err(ModesetError::Dsc(
+            crate::intel_gpu_xelpg_dsc::DscRefusal::SinkUnsupported
+        ))
     );
     for r in [0x45230, 0x45234, 0x44300, 0x46070, 0x64040, 0x46140] {
         assert!(io.written(r).is_empty(), "missing source rung wrote {r:#x}");
