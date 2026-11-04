@@ -321,21 +321,21 @@ fn smoke_rtl8xxxu_gen2_bar_admission() -> TestResult {
     bar.extend_from_slice(&PEER);
     bar.extend_from_slice(&0x3004u16.to_le_bytes());
     bar.extend_from_slice(&1600u16.to_le_bytes());
-    if bar.len() != 20 || !admit(&frame(bar.clone(), 4, false, 0), false, 0, 1) {
+    if bar.len() != 20 || !admit(&frame(bar.clone(), 4, false, 0), false, false, 0, 1) {
         return TestResult::Fail("20-byte BAR admitted");
     }
     let mut frag = bar.clone();
     frag[1] = 4;
-    if admit(&frame(frag, 4, false, 0), false, 0, 1) {
+    if admit(&frame(frag, 4, false, 0), false, false, 0, 1) {
         return TestResult::Fail("fragmented BAR refused");
     }
     let mut paggr = frame(bar.clone(), 4, false, 0);
     paggr.paggr = true;
-    if admit(&paggr, false, 0, 1) {
+    if admit(&paggr, false, false, 0, 1) {
         return TestResult::Fail("PAGGR BAR refused");
     }
     let rts = vec![0xb4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    if admit(&frame(rts, 4, false, 0), false, 0, 1) {
+    if admit(&frame(rts, 4, false, 0), false, false, 0, 1) {
         return TestResult::Fail("short control frame refused");
     }
     let mut ba = vec![0x94, 0, 0, 0];
@@ -344,7 +344,7 @@ fn smoke_rtl8xxxu_gen2_bar_admission() -> TestResult {
     ba.extend_from_slice(&0x3004u16.to_le_bytes());
     ba.extend_from_slice(&1600u16.to_le_bytes());
     ba.extend_from_slice(&[0; 8]);
-    if ba.len() != 28 || !admit(&frame(ba, 4, false, 0), false, 0, 1) {
+    if ba.len() != 28 || !admit(&frame(ba, 4, false, 0), false, false, 0, 1) {
         return TestResult::Fail("BA admitted at descriptor layer");
     }
     TestResult::Pass
