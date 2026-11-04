@@ -433,7 +433,7 @@ impl Tables {
             _ => (AR9485MODES_LOW_OB_DB_TX_GAIN_1_1, TxGain::LowestObDb),
         };
         let (rx_gain, rx_gain_kind) = match identity.rx_gain {
-            1 | 2 | 3 => (AR9485COMMON_WO_XLNA_RX_GAIN_1_1, RxGain::WithoutXlna),
+            1..=3 => (AR9485COMMON_WO_XLNA_RX_GAIN_1_1, RxGain::WithoutXlna),
             _ => (AR9485_COMMON_RX_GAIN_1_1, RxGain::Common),
         };
         Self {

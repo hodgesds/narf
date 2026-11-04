@@ -20,7 +20,7 @@
 //! postamble), its one-chain masks and its `N65A` record differ.
 //! The AR9485 likewise
 //! differs only in its `AR_SREV` revision rule (macVersion 0x240, macRev
-//! >= 1), the `ar9485_1_1` INI and gain tables, and its `N48A` record;
+//! \>= 1), the `ar9485_1_1` INI and gain tables, and its `N48A` record;
 //! its EEPROM masks are single-chain and its `opFlags` enable 2.4 GHz
 //! only, so the shared `channel_supported` gate already refuses 5 GHz
 //! for it.
