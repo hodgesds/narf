@@ -9,17 +9,20 @@
 //! 0x05880 + 4*n, 4 words per address). No Linux ixgbe source
 //! consulted.
 //!
-//! Per-part support (the lane brief's datasheet check):
+//! Per-part support:
 //! * 82599EB — supported: the 82599 datasheet's §8.2.3.24 + power
 //!   management chapter describe the full WoL filter set.
-//! * X540-AT2 / X550EM_x — NOT enabled: the X540 datasheet was not
-//!   consulted in this stream, so no claim is made either way.
-//! * X550 — controller-level WoL exists but is LOM/board-gated
-//!   (Intel's own adapter guidance: most 10 GbE adapters do not
-//!   support WoL; the X550 controller supports it as a LAN on
-//!   Motherboard when the board enables it). The driver therefore
-//!   does not arm X550 WoL on its own; a board that wires it must
-//!   opt in explicitly (follow-up issue, see spec §14).
+//! * X540-AT2 / X550 / X550EM_x — grounded in Linux, NOT in a
+//!   datasheet (the X540/X550 datasheets were not consulted in this
+//!   stream): Linux programs the same WUFC/WUC block for these
+//!   parts on its shared shutdown path, and gates arming on a
+//!   board capability record (see `WolBoardCap`). Nothing arms by
+//!   default: without a permitting record, X540+ stays unarmed.
+//! * X550 LOM/board gating IS the record: Linux's
+//!   `ixgbe_wol_supported` has no separate LOM concept for X550 —
+//!   the board's EEPROM DEVICE_CAPS word is the opt-in, and a
+//!   board that does not opt in never wakes. The driver therefore
+//!   never arms X550 WoL on its own.
 //!
 //! Deliberately NOT programmed: IPAV. The datasheet text extracted
 //! as "0x5838", which is one hex digit short of the neighbouring
@@ -176,12 +179,79 @@ impl WakeStatus {
     }
 }
 
-/// Per-part WoL support (see the module header for the reasoning).
-/// `device_id` is the PCI device id from the driver's match table.
+/// Per-part WoL support with no board record (see the module header
+/// for the reasoning). `device_id` is the PCI device id from the
+/// driver's match table.
 pub fn wol_supported(device_id: u16) -> bool {
-    // 82599EB only. X540/X550EM_x are ungrounded in this stream;
-    // X550 is LOM/board-gated and must not be armed blindly.
+    // 82599EB only. X540-and-newer parts need a permitting board
+    // record (`wol_allowed`); they are never armed by default.
     device_id == super::IXGBE_DEV_82599EB
+}
+
+/// Linux EEPROM DEVICE_CAPS WoL bits (ixgbe_type.h:2179-2181).
+/// The word is read from EEPROM/NVM offset 0x2c at probe
+/// (ixgbe_main.c:11913); only the 0xC mask matters here.
+pub const WOL_CAP_PORT0_1: u16 = 0x4; // WoL supported on ports 0 & 1
+pub const WOL_CAP_PORT0: u16 = 0x8; // WoL supported on port 0
+pub const WOL_CAP_MASK: u16 = 0xC;
+
+/// Board capability record gating WoL on X540-and-newer parts.
+///
+/// Linux determines X540+ WoL from the EEPROM DEVICE_CAPS word, not
+/// from the device ID (ixgbe_main.c `ixgbe_wol_supported`, X540+ arm):
+/// the board (via its EEPROM image) opts in, and the driver never
+/// arms blindly. NARF has an EERD reader but no DEVICE_CAPS consumer
+/// yet, so the record is supplied explicitly by the board/platform
+/// layer through `Ixgbe::set_wol_board_cap`; the default record opts
+/// nothing in. A future lane can populate it from EEPROM word 0x2c
+/// via the existing EERD helper instead of board configuration.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WolBoardCap {
+    /// Raw DEVICE_CAPS word bits (only the 0xC mask is consulted).
+    pub cap_bits: u16,
+    /// PCI function number of this device. A PORT0-only cap permits
+    /// function 0 only (Linux's `hw->bus.func == 0` clause).
+    pub func: u8,
+}
+
+impl WolBoardCap {
+    /// The Linux-literal X540+ rule (ixgbe_main.c `ixgbe_wol_supported`):
+    /// masked cap 0x4 permits any function; masked cap 0x8 permits
+    /// function 0 only; anything else — including 0xC, both bits set,
+    /// which Linux's equality comparisons reject — permits nothing.
+    pub const fn allows(&self) -> bool {
+        let cap = self.cap_bits & WOL_CAP_MASK;
+        if cap == WOL_CAP_PORT0_1 {
+            return true;
+        }
+        if cap == WOL_CAP_PORT0 && self.func == 0 {
+            return true;
+        }
+        false
+    }
+}
+
+/// X540-and-newer parts in this driver's match table (mac.type >=
+/// ixgbe_mac_X540 in Linux's enum, ixgbe_type.h:3218-3220).
+pub fn is_x540_or_newer(device_id: u16) -> bool {
+    device_id == super::IXGBE_DEV_X540
+        || device_id == super::IXGBE_DEV_X550
+        || device_id == super::IXGBE_DEV_X550EM_X
+}
+
+/// WoL allowed for this device under the board record: 82599EB by
+/// its datasheet rule (`wol_supported`), X540-and-newer only when
+/// the board record permits (Linux EEPROM-cap rule), everything
+/// else never. With the default (empty) record, X540+ stays
+/// unarmed — the opt-in is explicit, never a default.
+pub fn wol_allowed(device_id: u16, board: WolBoardCap) -> bool {
+    if wol_supported(device_id) {
+        return true;
+    }
+    if is_x540_or_newer(device_id) {
+        return board.allows();
+    }
+    false
 }
 
 /// Program one directed-IPv4 wake address (IP4AT[n], n = 0..3).

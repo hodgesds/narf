@@ -340,6 +340,11 @@ pub struct Ixgbe {
     /// `UnsupportedDevice` before storing anything (see
     /// `eee.rs`).
     pub eee_state: IrqSafeSpinLock<Option<eee::EeeState>>,
+    /// Board WoL capability record for X540-and-newer parts
+    /// (Linux EEPROM-cap rule, see wol.rs `WolBoardCap`).
+    /// Default opts nothing in; the board/platform layer sets it
+    /// via `set_wol_board_cap`.
+    pub wol_board_cap: IrqSafeSpinLock<wol::WolBoardCap>,
     /// True while the datapath is quiesced (suspend/detach): tx/rx
     /// paths refuse work instead of feeding a stopped device.
     pub quiesced: IrqSafeSpinLock<bool>,
@@ -550,6 +555,7 @@ impl Ixgbe {
             fdir_cfg: IrqSafeSpinLock::new(None),
             wol_armed: IrqSafeSpinLock::new(None),
             eee_state: IrqSafeSpinLock::new(None),
+            wol_board_cap: IrqSafeSpinLock::new(wol::WolBoardCap::default()),
             quiesced: IrqSafeSpinLock::new(false),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
@@ -971,11 +977,23 @@ impl Ixgbe {
         fdir::stats(&mut bank)
     }
 
-    /// Arm Wake-on-LAN. 82599EB only (`wol_supported`); other
-    /// parts return `UnsupportedDevice` — X540 is ungrounded and
-    /// X550 WoL is LOM/board-gated (see wol.rs header).
+    /// Record the board's WoL capability for X540-and-newer parts
+    /// (see wol.rs `WolBoardCap`). Explicit opt-in only: the
+    /// default record permits nothing, and setting a record arms
+    /// nothing by itself — `configure_wol` / `suspend` still gate
+    /// on it. The record is a board-layer statement (today from
+    /// board configuration; later it can come from EEPROM word
+    /// 0x2c via the EERD helper).
+    pub fn set_wol_board_cap(&self, cap: wol::WolBoardCap) {
+        *self.wol_board_cap.lock() = cap;
+    }
+
+    /// Arm Wake-on-LAN. 82599EB by its datasheet rule; X540 and
+    /// newer only when the board record permits (`wol_allowed`).
+    /// Other parts, or X540+ without a permitting record, return
+    /// `UnsupportedDevice` — X540+ is never armed blindly.
     pub fn configure_wol(&self, cfg: wol::WolConfig) -> Result<(), IxgbeError> {
-        if !wol::wol_supported(self.did) {
+        if !wol::wol_allowed(self.did, *self.wol_board_cap.lock()) {
             return Err(IxgbeError::UnsupportedDevice);
         }
         {
@@ -1028,7 +1046,7 @@ impl Ixgbe {
     /// given. The platform PM layer owns the PCI D-state step.
     pub fn suspend(&self, wol_cfg: Option<wol::WolConfig>) -> Result<(), IxgbeError> {
         if let Some(cfg) = wol_cfg {
-            if !wol::wol_supported(self.did) {
+            if !wol::wol_allowed(self.did, *self.wol_board_cap.lock()) {
                 return Err(IxgbeError::UnsupportedDevice);
             }
             let mut bank = queues::MmioBank::new(&self.mmio);
@@ -1155,7 +1173,7 @@ impl Ixgbe {
             caps: <Self as crate::HwNic>::caps(self).0,
             rss_enabled: self.rss_cfg.lock().is_some(),
             vlan_filter_enabled: self.vlan_filter.lock().is_some(),
-            wol_supported: wol::wol_supported(self.did),
+            wol_supported: wol::wol_allowed(self.did, *self.wol_board_cap.lock()),
             wol_armed: self.wol_armed.lock().is_some(),
             stats: ethtool::read_stats(&bank),
         }
