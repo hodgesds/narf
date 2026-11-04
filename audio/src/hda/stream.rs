@@ -146,11 +146,7 @@ impl Stream {
         // written yet starts DMA on the reset-zeroed buffer (silence),
         // and the restart sequence (fresh prepare, then start) must
         // not need a preceding write. The other guards still apply.
-        if !ring.prepared
-            || ring.running
-            || ring.xrun
-            || dev.irq.failed.load(Ordering::Acquire)
-        {
+        if !ring.prepared || ring.running || ring.xrun || dev.irq.failed.load(Ordering::Acquire) {
             return Err(SoundError::BadState);
         }
         let sd = sd_base(self.index);
