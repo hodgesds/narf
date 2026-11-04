@@ -35,9 +35,12 @@
 //!
 //! ## What this module does NOT do
 //!
-//! - No USB4 / policy consumption of the identity yet: the exposure
-//!   surface is [`CableDiscoveryPort::cable_identity`] plus the
-//!   [`registered_ports`] registry. Consumers are follow-on lanes.
+//! - No USB4 consumption of the identity yet: the exposure surface
+//!   is [`CableDiscoveryPort::cable_identity`] plus the
+//!   [`registered_ports`] registry. The EPR entry hook IS a
+//!   consumer: terminal discovery outcomes are reported via
+//!   `SourcePort::set_cable_epr_capability` (see the `report_epr`
+//!   mapping table for which outcome reports what).
 //! - No VPD VDO decode beyond the ID Header: VPD has its own VDO
 //!   layout, stored here as header-only.
 //! - No TPS65987 SOP' transmit: that chip's `transmit` is
@@ -224,6 +227,57 @@ impl CableDiscoveryPort {
         *self.identity.lock() = None;
     }
 
+    /// Report a terminal discovery outcome to the EPR entry hook
+    /// (`SourcePort::set_cable_epr_capability`). STATED MAPPING,
+    /// for the maintainer to overrule:
+    ///
+    /// - Done → (true, near-plug EPR capability): the hook doc
+    ///   asks for "SOP' cable-discovery results", and SOP' is the
+    ///   near plug, so only the near VDO's `epr_mode_capable`
+    ///   bit counts (passive or active; VPD / missing → false).
+    ///   The far plug's bit never changes the entry verdict:
+    ///   the entry machine takes one `capable` bool.
+    /// - NotPresent / Failed / Unsupported → (true, false):
+    ///   each is terminal for this attach — discovery has
+    ///   produced its answer (no e-marker; protocol violation;
+    ///   no SOP* path), and EPR entry requires PROVEN
+    ///   capability, so unproven resolves the pending entry to
+    ///   EnterFailed(CableNotEprCapable) instead of hanging it:
+    ///   `step_epr_entry_pending` idles ONLY "while discovery
+    ///   is still in flight", and a settled task will not
+    ///   produce a better answer this attach. The next attach
+    ///   re-discovers after detach clears to unknown.
+    /// - Detach → (false, false): back to unknown; the next
+    ///   attach re-discovers. (Idempotent with the port
+    ///   `reset()` on detach, which zeroes the same fields;
+    ///   this call covers task-loop ordering either way.)
+    ///
+    /// Only transition arms call this: settled re-polls return
+    /// the terminal outcome again without re-reporting. The
+    /// call is two atomic stores — no locks, so it is safe
+    /// under the cable state lock — and the entry machine
+    /// ignores the values unless an entry is pending
+    /// (`awaiting_cable`), so reports from sink-side discovery
+    /// (or across a later PR_Swap, where the cable is
+    /// unchanged) are inert, never wrong.
+    fn report_epr(&self, known: bool, capable: bool) {
+        self.port.source().set_cable_epr_capability(known, capable);
+    }
+
+    /// The near plug's EPR capability from a decoded identity.
+    fn near_epr_capable(identity: &CableIdentity) -> bool {
+        identity
+            .near
+            .passive
+            .map(|v| v.epr_mode_capable)
+            .unwrap_or(false)
+            || identity
+                .near
+                .active
+                .map(|v| v.epr_mode_capable)
+                .unwrap_or(false)
+    }
+
     /// Message-header roles for an outgoing cable-plug frame, from
     /// the port's live state. Source side follows the source
     /// engine's data role; sink side is UFP (the sink engine
@@ -302,6 +356,9 @@ impl CableDiscoveryPort {
             let mut state = self.state.lock();
             if *state != CableState::NotReady {
                 self.reset_locked(&mut state);
+                // Detach clears the EPR hook back to unknown;
+                // the next attach re-discovers.
+                self.report_epr(false, false);
             }
             return Ok(CableStep::NotReady);
         }
@@ -319,6 +376,10 @@ impl CableDiscoveryPort {
                     }
                     Err(CableError::Tcpc(TcpcError::Unsupported)) => {
                         *state = CableState::Unsupported;
+                        // No SOP* path: EPR can never be proven
+                        // on this port, so the pending entry
+                        // resolves Failed rather than hanging.
+                        self.report_epr(true, false);
                         Ok(CableStep::Unsupported)
                     }
                     Err(e) => Err(e),
@@ -332,15 +393,24 @@ impl CableDiscoveryPort {
                     }
                     AwaitOutcome::Timeout => {
                         *state = CableState::NotPresent;
+                        // No e-marker: an unmarked cable cannot
+                        // be EPR-capable, so the pending entry
+                        // resolves Failed.
+                        self.report_epr(true, false);
                         Ok(CableStep::NotPresent)
                     }
                     AwaitOutcome::Nak => {
                         *state = CableState::Failed;
+                        // Terminal for this attach: EPR requires
+                        // proven capability, so an unproven cable
+                        // resolves Failed, not pending.
+                        self.report_epr(true, false);
                         Ok(CableStep::Failed)
                     }
                     AwaitOutcome::Ack(objs) => {
                         let Some(near) = Self::decode_plug(&objs) else {
                             *state = CableState::Failed;
+                            self.report_epr(true, false);
                             return Ok(CableStep::Failed);
                         };
                         // Chain into SOP'' only for an active near
@@ -354,6 +424,7 @@ impl CableDiscoveryPort {
                             let identity = CableIdentity { near, far: None };
                             *self.identity.lock() = Some(identity);
                             *state = CableState::Done;
+                            self.report_epr(true, Self::near_epr_capable(&identity));
                             return Ok(CableStep::Done(identity));
                         }
                         match self.transmit_discover(SopTarget::SopDoublePrime) {
@@ -373,6 +444,7 @@ impl CableDiscoveryPort {
                                 let identity = CableIdentity { near, far: None };
                                 *self.identity.lock() = Some(identity);
                                 *state = CableState::Done;
+                                self.report_epr(true, Self::near_epr_capable(&identity));
                                 Ok(CableStep::Done(identity))
                             }
                             Err(e) => Err(e),
@@ -395,23 +467,28 @@ impl CableDiscoveryPort {
                     AwaitOutcome::Timeout | AwaitOutcome::Nak => {
                         let Some(identity) = *self.identity.lock() else {
                             *state = CableState::Failed;
+                            self.report_epr(true, false);
                             return Ok(CableStep::Failed);
                         };
                         *state = CableState::Done;
+                        self.report_epr(true, Self::near_epr_capable(&identity));
                         Ok(CableStep::Done(identity))
                     }
                     AwaitOutcome::Ack(objs) => {
                         let Some(far) = Self::decode_plug(&objs) else {
                             *state = CableState::Failed;
+                            self.report_epr(true, false);
                             return Ok(CableStep::Failed);
                         };
                         let Some(mut identity) = *self.identity.lock() else {
                             *state = CableState::Failed;
+                            self.report_epr(true, false);
                             return Ok(CableStep::Failed);
                         };
                         identity.far = Some(far);
                         *self.identity.lock() = Some(identity);
                         *state = CableState::Done;
+                        self.report_epr(true, Self::near_epr_capable(&identity));
                         Ok(CableStep::Done(identity))
                     }
                 }
@@ -742,6 +819,12 @@ pub(crate) mod tests {
     /// Discover Identity ACK objects for a passive cable fixture:
     /// ID Header (passive plug, 5 A, Gen2) + Passive Cable VDO.
     fn passive_ack_objects() -> Vec<u32> {
+        passive_ack_objects_with_epr(false)
+    }
+
+    /// Same as [`passive_ack_objects`], with the Passive Cable
+    /// VDO's EPR-capable bit set per `epr`.
+    fn passive_ack_objects_with_epr(epr: bool) -> Vec<u32> {
         let id = IdHeaderVdo {
             usb_host_capable: false,
             usb_device_capable: false,
@@ -756,7 +839,7 @@ pub(crate) mod tests {
             firmware_version: 2,
             vdo_version: 0,
             plug_type: 0,
-            epr_mode_capable: false,
+            epr_mode_capable: epr,
             cable_latency: 2,
             cable_termination: 1,
             max_vbus_voltage: 1,
@@ -769,6 +852,12 @@ pub(crate) mod tests {
     /// Discover Identity ACK objects for an active cable fixture
     /// with SOP'' support: ID Header (active plug) + Active VDO 1.
     fn active_ack_objects() -> Vec<u32> {
+        active_ack_objects_with_epr(false)
+    }
+
+    /// Same as [`active_ack_objects`], with the Active VDO 1's
+    /// EPR-capable bit set per `epr`.
+    fn active_ack_objects_with_epr(epr: bool) -> Vec<u32> {
         let id = IdHeaderVdo {
             usb_host_capable: false,
             usb_device_capable: false,
@@ -783,7 +872,7 @@ pub(crate) mod tests {
             firmware_version: 1,
             vdo_version: 0,
             plug_type: 0,
-            epr_mode_capable: false,
+            epr_mode_capable: epr,
             cable_latency: 1,
             cable_termination: 0,
             max_vbus_voltage: 1,
@@ -810,6 +899,21 @@ pub(crate) mod tests {
         }
         .encode()];
         vdos.extend_from_slice(objs);
+        (target, vdm_frame(&vdos))
+    }
+
+    /// Discover Identity NAK VDM frame addressed from `target`
+    /// (header object only: the NAK outcome needs no VDOs).
+    fn nak_frame(target: SopTarget) -> (SopTarget, Vec<u8>) {
+        let vdos = alloc::vec![VdmHeader {
+            svid: SVID_PD,
+            vdm_type: narf_usbpd::vdm::VdmType::Structured,
+            version: narf_usbpd::vdm::StructuredVdmVersion::V2_0,
+            object_position: 0,
+            command_type: CommandType::Nak,
+            command: VdmCommand::DiscoverIdentity as u8,
+        }
+        .encode()];
         (target, vdm_frame(&vdos))
     }
 
@@ -1048,5 +1152,289 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/usbpd/cable-discovery",
         smoke_cable_unsupported_tcpc_settles
+    );
+
+    /// EPR hook wiring: Done with an EPR-capable passive cable
+    /// reports (known=true, capable=true). The hook starts
+    /// unknown before discovery runs.
+    fn smoke_cable_epr_hook_done_capable() -> TestResult {
+        let chip = Arc::new(FakeChip::new());
+        let port = Arc::new(TcpmPort::new(
+            chip.clone(),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("cable-epr-cap"),
+        ));
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        drive_to_sink_ready(&chip, &port, &cap);
+        if port.source().cable_epr_capability() != (false, false) {
+            return TestResult::Fail("EPR hook must start unknown");
+        }
+        let cable = CableDiscoveryPort::new(port.clone(), ConnectorId::from_index(0));
+        let _ = cable.step(&cap).unwrap(); // kickoff SOP'
+        let (t, f) = ack_frame(SopTarget::SopPrime, &passive_ack_objects_with_epr(true));
+        chip.enqueue_rx_sop(t, f);
+        match cable.step(&cap) {
+            Ok(CableStep::Done(_)) => {}
+            _ => return TestResult::Fail("EPR-capable SOP' ACK should land Done"),
+        }
+        if port.source().cable_epr_capability() != (true, true) {
+            return TestResult::Fail("Done EPR-capable cable must report (true, true)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/cable-discovery",
+        smoke_cable_epr_hook_done_capable
+    );
+
+    /// EPR hook wiring: Done with a non-EPR-capable passive cable
+    /// reports (known=true, capable=false).
+    fn smoke_cable_epr_hook_done_not_capable() -> TestResult {
+        let chip = Arc::new(FakeChip::new());
+        let port = Arc::new(TcpmPort::new(
+            chip.clone(),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("cable-epr-nocap"),
+        ));
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        drive_to_sink_ready(&chip, &port, &cap);
+        let cable = CableDiscoveryPort::new(port.clone(), ConnectorId::from_index(0));
+        let _ = cable.step(&cap).unwrap(); // kickoff SOP'
+        let (t, f) = ack_frame(SopTarget::SopPrime, &passive_ack_objects());
+        chip.enqueue_rx_sop(t, f);
+        match cable.step(&cap) {
+            Ok(CableStep::Done(_)) => {}
+            _ => return TestResult::Fail("non-EPR SOP' ACK should land Done"),
+        }
+        if port.source().cable_epr_capability() != (true, false) {
+            return TestResult::Fail("Done non-EPR cable must report (true, false)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/cable-discovery",
+        smoke_cable_epr_hook_done_not_capable
+    );
+
+    /// EPR hook wiring, near-only rule (positive direction): an
+    /// EPR-capable active near plug chained to a non-EPR far plug
+    /// still reports (true, true) — the far bit never overrides
+    /// the near (SOP') verdict.
+    fn smoke_cable_epr_hook_near_decides_over_far() -> TestResult {
+        let chip = Arc::new(FakeChip::new());
+        let port = Arc::new(TcpmPort::new(
+            chip.clone(),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("cable-epr-near"),
+        ));
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        drive_to_sink_ready(&chip, &port, &cap);
+        let cable = CableDiscoveryPort::new(port.clone(), ConnectorId::from_index(0));
+        let _ = cable.step(&cap).unwrap(); // kickoff SOP'
+        let (t, f) = ack_frame(SopTarget::SopPrime, &active_ack_objects_with_epr(true));
+        chip.enqueue_rx_sop(t, f);
+        match cable.step(&cap) {
+            Ok(CableStep::Advanced(_)) => {}
+            _ => return TestResult::Fail("EPR-capable active SOP' ACK should chain to SOP''"),
+        }
+        let (t, f) = ack_frame(SopTarget::SopDoublePrime, &passive_ack_objects());
+        chip.enqueue_rx_sop(t, f);
+        match cable.step(&cap) {
+            Ok(CableStep::Done(id)) => {
+                if id.far.is_none() {
+                    return TestResult::Fail("far identity missing");
+                }
+            }
+            _ => return TestResult::Fail("SOP'' ACK should land Done with near+far"),
+        }
+        if port.source().cable_epr_capability() != (true, true) {
+            return TestResult::Fail("near EPR-capable must report (true, true) regardless of far");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/cable-discovery",
+        smoke_cable_epr_hook_near_decides_over_far
+    );
+
+    /// EPR hook wiring, near-only rule (negative direction): a
+    /// non-EPR active near plug chained to an EPR-capable far
+    /// plug still reports (true, false) — the far bit is ignored,
+    /// not OR-ed in.
+    fn smoke_cable_epr_hook_far_ignored() -> TestResult {
+        let chip = Arc::new(FakeChip::new());
+        let port = Arc::new(TcpmPort::new(
+            chip.clone(),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("cable-epr-far"),
+        ));
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        drive_to_sink_ready(&chip, &port, &cap);
+        let cable = CableDiscoveryPort::new(port.clone(), ConnectorId::from_index(0));
+        let _ = cable.step(&cap).unwrap(); // kickoff SOP'
+        let (t, f) = ack_frame(SopTarget::SopPrime, &active_ack_objects());
+        chip.enqueue_rx_sop(t, f);
+        match cable.step(&cap) {
+            Ok(CableStep::Advanced(_)) => {}
+            _ => return TestResult::Fail("non-EPR active SOP' ACK should chain to SOP''"),
+        }
+        let (t, f) = ack_frame(SopTarget::SopDoublePrime, &passive_ack_objects_with_epr(true));
+        chip.enqueue_rx_sop(t, f);
+        match cable.step(&cap) {
+            Ok(CableStep::Done(_)) => {}
+            _ => return TestResult::Fail("SOP'' ACK should land Done with near+far"),
+        }
+        if port.source().cable_epr_capability() != (true, false) {
+            return TestResult::Fail("near non-EPR must report (true, false) regardless of far");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/cable-discovery",
+        smoke_cable_epr_hook_far_ignored
+    );
+
+    /// EPR hook wiring: detach after Done clears the hook back to
+    /// unknown (and clears the stored identity).
+    fn smoke_cable_epr_hook_detach_clears() -> TestResult {
+        let chip = Arc::new(FakeChip::new());
+        let port = Arc::new(TcpmPort::new(
+            chip.clone(),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("cable-epr-detach"),
+        ));
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        drive_to_sink_ready(&chip, &port, &cap);
+        let cable = CableDiscoveryPort::new(port.clone(), ConnectorId::from_index(0));
+        let _ = cable.step(&cap).unwrap(); // kickoff SOP'
+        let (t, f) = ack_frame(SopTarget::SopPrime, &passive_ack_objects_with_epr(true));
+        chip.enqueue_rx_sop(t, f);
+        if !matches!(cable.step(&cap), Ok(CableStep::Done(_))) {
+            return TestResult::Fail("setup walk should land Done");
+        }
+        if port.source().cable_epr_capability() != (true, true) {
+            return TestResult::Fail("setup Done must report (true, true)");
+        }
+        // Detach: open CC pins, step the port, then step cable.
+        *chip.cc.lock() = CcStatus {
+            cc1: CcState::Open,
+            cc2: CcState::Open,
+        };
+        let _ = port.step(&cap).unwrap();
+        match cable.step(&cap) {
+            Ok(CableStep::NotReady) => {}
+            _ => return TestResult::Fail("detach should return cable to NotReady"),
+        }
+        if cable.cable_identity().is_some() {
+            return TestResult::Fail("detach must clear the stored identity");
+        }
+        if port.source().cable_epr_capability() != (false, false) {
+            return TestResult::Fail("detach must clear the EPR hook to unknown");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/cable-discovery",
+        smoke_cable_epr_hook_detach_clears
+    );
+
+    /// EPR hook wiring: no e-marker within the poll budget
+    /// (NotPresent) reports (true, false) — an unmarked cable
+    /// cannot be EPR-capable, and the pending entry must resolve
+    /// rather than hang for the whole attach.
+    fn smoke_cable_epr_hook_not_present() -> TestResult {
+        let chip = Arc::new(FakeChip::new());
+        let port = Arc::new(TcpmPort::new(
+            chip.clone(),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("cable-epr-np"),
+        ));
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        drive_to_sink_ready(&chip, &port, &cap);
+        let cable = CableDiscoveryPort::new(port.clone(), ConnectorId::from_index(0));
+        let _ = cable.step(&cap).unwrap(); // kickoff SOP'
+        for _ in 0..=MAX_RESPONSE_POLLS {
+            let _ = cable.step(&cap).unwrap();
+        }
+        match cable.step(&cap) {
+            Ok(CableStep::NotPresent) => {}
+            _ => return TestResult::Fail("poll budget exhaustion should land NotPresent"),
+        }
+        if port.source().cable_epr_capability() != (true, false) {
+            return TestResult::Fail("NotPresent must report (true, false)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/cable-discovery",
+        smoke_cable_epr_hook_not_present
+    );
+
+    /// EPR hook wiring: NAK to the near-plug request (Failed)
+    /// reports (true, false) — EPR requires proven capability,
+    /// so an unproven cable resolves Failed, not pending.
+    fn smoke_cable_epr_hook_failed_nak() -> TestResult {
+        let chip = Arc::new(FakeChip::new());
+        let port = Arc::new(TcpmPort::new(
+            chip.clone(),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("cable-epr-nak"),
+        ));
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        drive_to_sink_ready(&chip, &port, &cap);
+        let cable = CableDiscoveryPort::new(port.clone(), ConnectorId::from_index(0));
+        let _ = cable.step(&cap).unwrap(); // kickoff SOP'
+        let (t, f) = nak_frame(SopTarget::SopPrime);
+        chip.enqueue_rx_sop(t, f);
+        match cable.step(&cap) {
+            Ok(CableStep::Failed) => {}
+            _ => return TestResult::Fail("SOP' NAK should land Failed"),
+        }
+        if port.source().cable_epr_capability() != (true, false) {
+            return TestResult::Fail("Failed must report (true, false)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/cable-discovery",
+        smoke_cable_epr_hook_failed_nak
+    );
+
+    /// EPR hook wiring: a TCPC with no SOP* path (Unsupported)
+    /// reports (true, false) — EPR can never be proven on this
+    /// port, so the pending entry resolves Failed rather than
+    /// hanging.
+    fn smoke_cable_epr_hook_unsupported() -> TestResult {
+        let mut chip = FakeChip::new();
+        chip.no_sop = true;
+        let chip = Arc::new(chip);
+        let port = Arc::new(TcpmPort::new(
+            chip.clone(),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("cable-epr-unsup"),
+        ));
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        drive_to_sink_ready(&chip, &port, &cap);
+        let cable = CableDiscoveryPort::new(port.clone(), ConnectorId::from_index(0));
+        match cable.step(&cap) {
+            Ok(CableStep::Unsupported) => {}
+            _ => return TestResult::Fail("SOP*-less TCPC should settle Unsupported, not error"),
+        }
+        if port.source().cable_epr_capability() != (true, false) {
+            return TestResult::Fail("Unsupported must report (true, false)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/cable-discovery",
+        smoke_cable_epr_hook_unsupported
     );
 }
