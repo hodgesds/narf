@@ -535,7 +535,7 @@ fn smoke_rtl8127_rss_queue_count_selection() -> TestResult {
         if got != want {
             return TestResult::Fail("rss queue count wrong for cpu count");
         }
-        if got < 1 || got > 8 || got & (got - 1) != 0 {
+        if !(1..=8).contains(&got) || got & (got - 1) != 0 {
             return TestResult::Fail("rss queue count not a power of two in [1, 8]");
         }
     }

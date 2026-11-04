@@ -1783,6 +1783,8 @@ impl Rtl8127Nic {
         let rss_config = if queues >= 2 {
             let config =
                 narf_net::rss::RssConfig::standard(queues, crate::features::RSS_INDIR_ENTRIES);
+            // SAFETY: bring_up owns the register window exclusively
+            // (single probe path; apply_rss requires exclusive ownership).
             let ok = unsafe {
                 let mut regs = crate::features::MmioRegs(&mmio);
                 crate::features::apply_rss(&mut regs, queues, &config.key, &config.indirection)
@@ -1792,6 +1794,8 @@ impl Rtl8127Nic {
             }
             Some(config)
         } else {
+            // SAFETY: bring_up owns the register window exclusively
+            // (single probe path; apply_rss_single_queue requires it).
             unsafe {
                 let mut regs = crate::features::MmioRegs(&mmio);
                 crate::features::apply_rss_single_queue(&mut regs);
@@ -1880,6 +1884,9 @@ impl Rtl8127Nic {
             }
             // SAFETY: identity-mapped MMIO.
             let base_reg = rx_queue_base_reg(q);
+            // SAFETY: identity-mapped MMIO; q indexes rx_queues, so
+            // base_reg is a valid per-queue RX base register, and
+            // ring_phys is that queue's DMA ring base address.
             unsafe {
                 mmio.write32(base_reg, ring_phys as u32);
                 mmio.write32(base_reg + 4, (ring_phys >> 32) as u32);
@@ -2196,6 +2203,10 @@ impl Rtl8127Nic {
         // RSS hash: rss_result is word 1 of the RSS descriptor.
         // SAFETY: identity-mapped DMA ring.
         let hash = if rss {
+            // SAFETY: identity-mapped DMA ring; slot is head mod
+            // RING_LEN, so desc_addr + 4 is word 1 of a valid
+            // 16-byte descriptor, and rss selects the RSS layout
+            // whose word 1 is the steering hash.
             Some(unsafe {
                 core::ptr::read_volatile(
                     narf_memory::PhysAddr::new(desc_addr + 4).kernel_ptr::<u32>(),
@@ -2593,8 +2604,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // controllers request one vector, as before.
     // SAFETY: caller-authority over the device's cfg space.
     let msix_want: u16 = if dev.rx_queues.len() > 1 { 30 } else { 1 };
+    // SAFETY: probe owns the device's BAR + cfg windows
+    // exclusively (enable_msix_vectors requires it); cap is the
+    // MSI-X capability found during probe.
     let msix_ok = match unsafe { dev.enable_msix_vectors(&cap, &device, msix_want) } {
         Ok(_) => true,
+        // SAFETY: same BAR + cfg exclusivity as the primary
+        // attempt; single-vector fallback after it failed.
         Err(_) if msix_want > 1 => unsafe { dev.enable_msix_vectors(&cap, &device, 1) }.is_ok(),
         Err(_) => false,
     };
