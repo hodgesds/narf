@@ -166,7 +166,32 @@ pub struct DriCardFile {
 /// back to zero — the last compositor's `card<N>` fd closed (typically at
 /// process exit) — we hand the framebuffer back to the kernel console so
 /// post-compositor kernel logs are visible again.
-static LIVE_CARD_FILES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Open files per DRM device, card and render nodes alike (Linux's
+/// `dev->open_count`): the last close of a device runs its lastclose.
+static OPEN_COUNT: [core::sync::atomic::AtomicUsize; 16] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 16];
+
+fn device_opened(index: u32) {
+    if let Some(count) = OPEN_COUNT.get(index as usize) {
+        count.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// drm_lastclose when device `index`'s last open goes: the console takes
+/// the framebuffer back and, as drm_fb_helper restores the fbdev mode, a
+/// native display a client switched off lights again for it.
+fn device_closed(index: u32) {
+    let Some(count) = OPEN_COUNT.get(index as usize) else {
+        return;
+    };
+    if count.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 {
+        narf_console::fb_release_from_user();
+        #[cfg(feature = "amdgpu")]
+        if crate::drm_registry::driver_name(index) == Some("amdgpu") {
+            crate::amdgpu_native_kms::restore_displays();
+        }
+    }
+}
 
 /// Monotonically-increasing source of per-open DRM master ids. Starts at 1 so
 /// 0 is reserved as a "no such open" sentinel (render nodes pass 0 — they never
@@ -182,7 +207,7 @@ impl DriCardFile {
         #[cfg(feature = "intel")]
         let intel_client = crate::intel_gpu_ccs_control::client_open(index).ok()?;
         let open_id = NEXT_OPEN_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        LIVE_CARD_FILES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        device_opened(index);
         // drm_master_open: the first opener of a master-free device becomes its
         // master automatically (cards without mode_state have no master to hold).
         if let Some(ms) = crate::drm_registry::mode_state(index) {
@@ -288,16 +313,7 @@ impl Drop for DriCardFile {
         }
         #[cfg(not(feature = "intel"))]
         let _ = was_master;
-        // Last master node closed → release the framebuffer back to the
-        // kernel console (no-op if a DRM client never took it over).
-        if LIVE_CARD_FILES.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 {
-            narf_console::fb_release_from_user();
-            // As drm_fb_helper restores the console on lastclose: a native
-            // display a client switched off lights again for the console,
-            // in the sink's preferred mode.
-            #[cfg(feature = "amdgpu")]
-            crate::amdgpu_native_kms::restore_displays();
-        }
+        device_closed(self.index);
     }
 }
 
@@ -1515,6 +1531,7 @@ pub struct DriRenderFile {
 
 impl Drop for DriRenderFile {
     fn drop(&mut self) {
+        device_closed(self.index);
         // Quiesce the host resource before `DmaBuffer::drop` releases its
         // pages. If the device is already gone or rejects teardown, retain
         // the backing instead: a bounded process-exit leak is preferable to a
@@ -1965,6 +1982,7 @@ impl DirOps for DriDir {
                         let intel_client = crate::intel_gpu_ccs_control::client_open(idx).ok()?;
                         #[cfg(feature = "amdgpu")]
                         crate::amdgpu_navi48_runtime_pm::on_open(idx);
+                        device_opened(idx);
                         return Some(Arc::new(DriRenderFile {
                             index: idx,
                             metadata,

@@ -1013,6 +1013,10 @@ pub struct Card {
     /// KMS property blobs created through MODE_CREATEPROPBLOB.
     /// Per-CRTC committed timing and MODE_ID blob ([`CommittedMode`]).
     pub committed_modes: Vec<CommittedMode>,
+    /// The kernel console's framebuffer (drm_fb_helper's fbdev fb): the
+    /// primary of every CRTC the console lights while no client is master.
+    /// No file owns it; RMFB/CLOSEFB refuse it.
+    pub console_fb: Option<u32>,
     pub(crate) property_blobs: Vec<PropertyBlob>,
     /// Next non-zero property-blob id.
     pub(crate) next_property_blob_id: u32,
@@ -1306,6 +1310,7 @@ impl Card {
             virtgpu_imports: Vec::new(),
             property_blobs: Vec::new(),
             committed_modes: Vec::new(),
+            console_fb: None,
             next_property_blob_id: 1,
             vblank_seq: 0,
             next_vblank_ns: 0,
@@ -2617,6 +2622,9 @@ impl Card {
     /// file, until [`Card::collect_closed_fbs`] finds it off screen.
     /// `UnknownFb` (→ ENOENT) for an id this open does not own.
     pub fn closefb(&mut self, fb_id: u32, owner: u64) -> Result<Option<(u64, u8)>, CardError> {
+        if self.console_fb == Some(fb_id) {
+            return Err(CardError::UnknownFb);
+        }
         let fb = self
             .framebuffers
             .iter()
@@ -2659,7 +2667,54 @@ impl Card {
             .collect()
     }
 
+    /// drm_client_modeset_commit for the console (lastclose with no master):
+    /// CRTC `crtc` shows the kernel console framebuffer, created on first
+    /// use at the CRTC's size.
+    pub fn show_console(&mut self, crtc: u32) {
+        let Some(mode) = self
+            .crtcs
+            .iter()
+            .find(|c| c.id == crtc && c.primary_fb.is_none())
+            .and_then(|c| c.mode)
+        else {
+            return;
+        };
+        let fits = |fb: &Framebuffer| fb.width == mode.width && fb.height == mode.height;
+        let id = match self
+            .console_fb
+            .filter(|&id| self.framebuffer(id).is_ok_and(fits))
+        {
+            Some(id) => id,
+            None => {
+                let id = self.next_fb_id;
+                self.next_fb_id = self.next_fb_id.wrapping_add(1).max(1);
+                self.framebuffers.push(Framebuffer {
+                    id,
+                    width: mode.width,
+                    height: mode.height,
+                    format: PixelFormat::Xrgb8888,
+                    pitch: mode.width * 4,
+                    gem_handle: 0,
+                    offsets: [0; 2],
+                    chroma_pitch: 0,
+                    modifier: 0,
+                    bo: None,
+                    #[cfg(feature = "intel")]
+                    intel: None,
+                });
+                self.console_fb = Some(id);
+                id
+            }
+        };
+        if let Ok(c) = self.crtc_mut(crtc) {
+            c.primary_fb = Some(id);
+        }
+    }
+
     pub fn rmfb(&mut self, fb_id: u32) -> Result<Option<(u64, u8)>, CardError> {
+        if self.console_fb == Some(fb_id) {
+            return Err(CardError::UnknownFb);
+        }
         let pos = self
             .framebuffers
             .iter()

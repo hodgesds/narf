@@ -786,6 +786,16 @@ fn navi48_kms_publish_keeps_committed_state_under_a_master() -> TestResult {
     {
         return TestResult::Fail("masterless publication did not restore the lit state");
     }
+    // drm_fb_helper: the console's framebuffer is the lit CRTC's primary,
+    // and no client can remove it.
+    let console = card.console_fb;
+    if console.is_none()
+        || card.crtc(crtc_id(0)).unwrap().primary_fb != console
+        || card.rmfb(console.unwrap()).is_ok()
+        || card.closefb(console.unwrap(), 7).is_ok()
+    {
+        return TestResult::Fail("console framebuffer not committed or removable");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

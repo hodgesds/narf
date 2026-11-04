@@ -262,6 +262,10 @@ pub fn apply_routed_vrr(
             }
         }
         card.set_committed_mode(crtc_id(k), shown.map(|t| (t, None)));
+        // No master: the console owns the lit CRTC (fbdev's framebuffer).
+        if mode.is_some() && !card.has_master() {
+            card.show_console(crtc_id(k));
+        }
     }
     card.vrr_enabled = match vrr_capable {
         Some(_) => (0..crtcs.len())
