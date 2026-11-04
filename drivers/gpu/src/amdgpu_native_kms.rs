@@ -272,13 +272,15 @@ pub fn hdr_metadata_valid(blob: &[u8]) -> bool {
     crate::amdgpu_hdr::HdrOutputMetadata::from_blob(blob).is_ok()
 }
 /// A DRM cursor plane commit on display `display`: its image at CRTC_X/Y,
-/// or off (Navi48 only: Navi22 exposes no cursor plane, its cursor ioctls
-/// keep driving the console's pointer).
+/// or off, on the display's hardware cursor.
 pub fn request_display_cursor(
     display: u8,
     image: Option<crate::amdgpu_navi48_platform::CursorContent>,
     position: (i32, i32),
 ) -> bool {
-    !navi22()
-        && crate::amdgpu_navi48_platform::request_display_cursor_content(display, image, position)
+    if navi22() {
+        crate::amdgpu_navi22_platform::request_display_cursor(display, image, position)
+    } else {
+        crate::amdgpu_navi48_platform::request_display_cursor_content(display, image, position)
+    }
 }

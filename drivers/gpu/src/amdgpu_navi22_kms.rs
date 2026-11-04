@@ -608,10 +608,11 @@ fn apply_card_vrr(
     card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
     // Share connector/CRTC bookkeeping, not DCN401's plane capabilities.
-    // This presenter copies one linear 8888 primary into its DCN30 back
-    // buffer; overlays, GFX12 tiling and native plane geometry have no
-    // implementation here. Keep the generic atomic primary/cursor ABI.
-    card.native_planes.clear();
+    // This presenter shows one linear 8888 primary per CRTC; overlays and
+    // GFX12 tiling have no implementation here, so the primaries stay the
+    // synthesized ones. Each CRTC has its DRM_PLANE_TYPE_CURSOR plane
+    // (amdgpu_dm_crtc_init), shown on the DCN30 hardware cursor.
+    card.native_planes.retain(|p| p.is_cursor());
     card.overlay_formats = None;
     card.gfx12_modifiers = false;
 }

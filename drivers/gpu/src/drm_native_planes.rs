@@ -95,7 +95,10 @@ pub const COLOR_RANGE_ENUMS: [(u64, &[u8]); 2] = [
 /// The formats plane `id` lists: a primary's `plane_formats`, an overlay's
 /// `overlay_formats`, a cursor's `CURSOR_FORMATS`.
 fn formats_of(card: &Card, id: u32) -> Option<&'static [u32]> {
-    if crate::amdgpu_native_kms::linear_gem_card(card) && card.native_planes.is_empty() {
+    if card.native_plane(id).is_some_and(NativePlane::is_cursor) {
+        return Some(&CURSOR_FORMATS);
+    }
+    if crate::amdgpu_native_kms::linear_gem_card(card) && !card.has_native_kms_planes() {
         let index = id.checked_sub(PRIMARY_PLANE_ID_BASE)?;
         return card.crtcs.get(index as usize).and(card.plane_formats);
     }
@@ -244,6 +247,35 @@ pub fn planes_for(old: &[NativePlane], crtcs: &[u32]) -> Vec<NativePlane> {
         out.push(p);
     }
     out
+}
+
+/// A cursor plane per CRTC alone (amdgpu_dm_crtc_init's
+/// DRM_PLANE_TYPE_CURSOR planes), for a card whose primaries stay
+/// synthesized (Navi22): `planes_for`'s cursor planes.
+pub fn cursor_planes_for(old: &[NativePlane], crtcs: &[u32]) -> Vec<NativePlane> {
+    planes_for(old, crtcs)
+        .into_iter()
+        .filter(NativePlane::is_cursor)
+        .collect()
+}
+
+/// dc caps max_cursor_size of `card`'s display core: 256 on DCN 3.0
+/// (Navi22, whose primaries stay synthesized), 64 on DCN 4.0.1.
+pub fn max_cursor_size(card: &Card) -> u32 {
+    if card.has_native_kms_planes() {
+        MAX_CURSOR_SIZE
+    } else {
+        crate::amdgpu_dcn30_cursor::CURSOR_MAX
+    }
+}
+/// DRM_CAP_CURSOR_WIDTH/HEIGHT (mode_config.cursor_width/height =
+/// max_cursor_size) on a card with cursor planes; None otherwise (the
+/// generic answer).
+pub fn cursor_size_cap(card: &Card) -> Option<u32> {
+    card.native_planes
+        .iter()
+        .any(NativePlane::is_cursor)
+        .then(|| max_cursor_size(card))
 }
 
 /// The overlay plane ids of `card`.
@@ -622,6 +654,21 @@ pub fn check(
     state: &AtomicState,
     mode_of: impl Fn(u32) -> Option<crate::Mode>,
 ) -> Result<Vec<DisplayPlanes>, FsError> {
+    // Cursor planes alone: drm_atomic_plane_check and the cursor checks;
+    // the synthesized primaries are checked by the bridge.
+    if !card.has_native_kms_planes() {
+        for p in &state.planes {
+            let Some(native) = card.native_plane(p.id).filter(|n| n.is_cursor()) else {
+                continue;
+            };
+            let old = plane_state(card, p.id).and_then(|s| s.crtc_id);
+            if old.is_some() && p.crtc_id.is_some() && old != p.crtc_id {
+                return Err(FsError::InvalidData);
+            }
+            check_cursor_plane(card, native, p)?;
+        }
+        return Ok(Vec::new());
+    }
     let mut crtcs: Vec<u32> = state.crtcs.iter().map(|c| c.id).collect();
     // The CRTCs only a cursor plane brings in.
     let mut cursor_crtcs: Vec<u32> = Vec::new();
@@ -750,11 +797,20 @@ pub fn check_cursor(
     src: (u32, u32, u32, u32),
     crtc: (u32, u32),
 ) -> Result<(), FsError> {
+    check_cursor_max(fb, src, crtc, MAX_CURSOR_SIZE)
+}
+/// [`check_cursor`] against a display core whose max_cursor_size is `max`.
+pub fn check_cursor_max(
+    fb: CursorFb,
+    src: (u32, u32, u32, u32),
+    crtc: (u32, u32),
+    max: u32,
+) -> Result<(), FsError> {
     let (src_x, src_y, src_w, src_h) = src;
     if src_x != 0 || src_y != 0 {
         return Err(FsError::InvalidData);
     }
-    if fb.width > MAX_CURSOR_SIZE || fb.height > MAX_CURSOR_SIZE {
+    if fb.width > max || fb.height > max {
         return Err(FsError::InvalidData);
     }
     if u64::from(src_w) != u64::from(fb.width) << 16
@@ -804,10 +860,11 @@ fn check_cursor_plane(card: &Card, native: &NativePlane, p: &PlaneState) -> Resu
             .filter(|s| s >> 16 == v)
             .unwrap_or(u32::MAX)
     };
-    check_cursor(
+    check_cursor_max(
         fb,
         (src(p.src_x), src(p.src_y), src(p.src_w), src(p.src_h)),
         (p.crtc_w, p.crtc_h),
+        max_cursor_size(card),
     )
 }
 
@@ -878,13 +935,14 @@ pub fn cursor_content(
 ) -> Option<crate::amdgpu_navi48_platform::CursorContent> {
     let fb = card.framebuffer(fb_id).ok()?;
     let (w, h) = (fb.width, fb.height);
-    if w == 0 || h == 0 || w > MAX_CURSOR_SIZE || h > MAX_CURSOR_SIZE {
+    let max = max_cursor_size(card);
+    if w == 0 || h == 0 || w > max || h > max {
         return None;
     }
     let row = u64::from(w) * 4;
     let end = u64::from(fb.offsets[0]) + u64::from(h - 1) * u64::from(fb.pitch) + row;
     let mut pixels = Vec::with_capacity((w * h) as usize);
-    let mut line = [0u8; MAX_CURSOR_SIZE as usize * 4];
+    let mut line = alloc::vec![0u8; row as usize];
     if fb.bo.is_some() {
         let pin = pin?;
         if end > pin.byte_len() {

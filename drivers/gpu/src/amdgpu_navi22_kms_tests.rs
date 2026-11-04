@@ -187,8 +187,30 @@ fn navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers() -> TestResu
         possible_crtcs: 1,
     }];
     apply_card(&mut card, &crtcs, &connectors);
-    if card.gfx12_modifiers || !card.native_planes.is_empty() || card.overlay_formats.is_some() {
+    if card.gfx12_modifiers || card.has_native_kms_planes() || card.overlay_formats.is_some() {
         return TestResult::Fail("DCN30 advertised RDNA4-only KMS operations");
+    }
+    // amdgpu_dm_crtc_init: a DRM_PLANE_TYPE_CURSOR plane per CRTC, possible
+    // on its own CRTC, ARGB8888 with LINEAR only.
+    let cursors = crate::drm_native_planes::cursor_ids(&card);
+    if cursors.len() != card.crtcs.len()
+        || card.native_planes.len() != cursors.len()
+        || cursors.iter().enumerate().any(|(k, &id)| {
+            id != crate::drm_native_planes::CURSOR_PLANE_ID_BASE + k as u32
+                || card.native_plane(id).and_then(|p| p.cursor_of) != Some(card.crtcs[k].id)
+        })
+    {
+        return TestResult::Fail("DCN30 cursor planes not one per CRTC");
+    }
+    let Some(blob) = crate::drm_native_planes::in_formats_blob(
+        &card,
+        crate::drm_native_planes::in_formats_blob_id(cursors[0]),
+    ) else {
+        return TestResult::Fail("cursor plane has no IN_FORMATS");
+    };
+    let word = |i: usize| u32::from_le_bytes(blob[i..i + 4].try_into().unwrap());
+    if word(8) != 1 || word(16) != 1 || word(24) != 0x3432_5241 {
+        return TestResult::Fail("cursor plane formats are not ARGB8888 alone");
     }
     if !card.native_atomic
         || card.plane_formats != Some(&PLANE_FORMATS[..])
@@ -225,7 +247,7 @@ fn navi22_kms_publication_excludes_rdna4_only_planes_and_modifiers() -> TestResu
     // Re-publishing keeps committed controls and excludes DCN401's planes.
     apply_card(&mut card, &crtcs, &connectors);
     if card.gfx12_modifiers
-        || !card.native_planes.is_empty()
+        || card.has_native_kms_planes()
         || card.native[0].max_bpc != Some(10)
         || card.native[0].colorspace != Some(crate::amdgpu_hdr::DRM_MODE_COLORIMETRY_BT2020_RGB)
         || card.native[0].color_format != Some(crate::amdgpu_hdr::ColorFormat::Ycbcr422)

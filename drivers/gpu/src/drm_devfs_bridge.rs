@@ -571,7 +571,9 @@ impl FileOps for DriCardFile {
                 {
                     return result;
                 }
-                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_get_cap(cmd, arg) {
+                if let Some(result) =
+                    crate::drm_ioctl_bridge::amdgpu_get_cap_for(Some(self.index), cmd, arg)
+                {
                     return result;
                 }
                 if let Some(result) =
@@ -1710,7 +1712,9 @@ impl FileOps for DriRenderFile {
                 {
                     return result;
                 }
-                if let Some(result) = crate::drm_ioctl_bridge::amdgpu_get_cap(cmd, arg) {
+                if let Some(result) =
+                    crate::drm_ioctl_bridge::amdgpu_get_cap_for(Some(self.index), cmd, arg)
+                {
                     return result;
                 }
                 if let Some(result) =

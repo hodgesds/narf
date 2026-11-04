@@ -588,6 +588,52 @@ mod tests {
         navi22_committed_frame_is_shown_again_after_relight
     );
 
+    /// The DRM cursor plane's state is recorded without OWNER: every move
+    /// and image lands at once, the newest wins, and the cursor task (which
+    /// waits for OWNER) applies it, so a move during a present is late but
+    /// never lost.
+    fn navi22_drm_cursor_moves_are_recorded_without_owner() -> TestResult {
+        use crate::amdgpu_navi48_platform::{CursorContent, CursorImage};
+        let mut c = super::super::DrmCursor {
+            image: None,
+            pending: None,
+            position: (0, 0),
+            dirty: false,
+            running: true,
+        };
+        let image = || CursorImage {
+            width: 2,
+            height: 1,
+            pixels: vec![0xff00_0000, 0xffff_ffff],
+        };
+        super::super::record_cursor(&mut c, Some(CursorContent::Image(image())), (10, 20));
+        let first = c.image.clone();
+        // Moves while the task is still waiting: the latest position stays,
+        // the unchanged image is not replaced (no re-upload).
+        for x in 11..40 {
+            super::super::record_cursor(&mut c, Some(CursorContent::Image(image())), (x, 20));
+        }
+        if !c.dirty
+            || c.position != (39, 20)
+            || !c
+                .image
+                .as_ref()
+                .zip(first.as_ref())
+                .is_some_and(|(a, b)| alloc::sync::Arc::ptr_eq(a, b))
+        {
+            return TestResult::Fail("cursor moves lost or image replaced");
+        }
+        super::super::record_cursor(&mut c, None, (-5, -5));
+        if c.image.is_some() || c.position != (-5, -5) {
+            return TestResult::Fail("cursor off not recorded");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_drm_cursor_moves_are_recorded_without_owner
+    );
+
     fn navi22_direct_scanout_eligibility() -> TestResult {
         use narf_graphics_driver::generic::GenericFb;
         let fixture = Fixture::new();

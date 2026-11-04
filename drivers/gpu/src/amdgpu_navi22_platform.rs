@@ -797,6 +797,10 @@ pub fn set_hw_cursor(enabled: bool) {
 /// an off-screen move. Never waits for the owner. False (software sprite)
 /// while the hardware cursor is not enabled or nothing is lit.
 fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bool {
+    // DRM's cursor plane owns the hardware cursor while a client drives it.
+    if DRM_CURSOR_OWNED.load(Ordering::Acquire) {
+        return true;
+    }
     if !HW_CURSOR.load(Ordering::Acquire) {
         return false;
     }
@@ -820,6 +824,150 @@ fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bo
         (false, Some(at)) => boot.set_display_cursor(image, at),
     };
     true
+}
+
+// ── DRM cursor plane (amdgpu_dm_crtc_init's DRM_PLANE_TYPE_CURSOR) ────
+
+/// CRTC 0's DRM cursor plane as last committed: the image to show (None:
+/// off) at CRTC_X/Y, and a GEM framebuffer whose rows are read once its
+/// writes land. Kept apart from OWNER so a commit or move is recorded at
+/// once and never dropped; the cursor task applies the latest state when it
+/// next holds OWNER (amdgpu_dm_commit_cursors programs the cursor without
+/// waiting for a vblank).
+struct DrmCursor {
+    image: Option<alloc::sync::Arc<crate::amdgpu_navi48_platform::CursorImage>>,
+    pending: Option<crate::amdgpu_navi48_platform::GemCursor>,
+    position: (i32, i32),
+    dirty: bool,
+    running: bool,
+}
+static DRM_CURSOR: narf_lib::sync::IrqSafeSpinLock<DrmCursor> =
+    narf_lib::sync::IrqSafeSpinLock::new(DrmCursor {
+        image: None,
+        pending: None,
+        position: (0, 0),
+        dirty: false,
+        running: false,
+    });
+/// A DRM client drives the hardware cursor (the console's pointer stays off
+/// it until lastclose).
+static DRM_CURSOR_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// Record a DRM cursor plane commit on display `display` and have the
+/// cursor task program it. Navi22 presents on display 0 only.
+pub(crate) fn request_display_cursor(
+    display: u8,
+    content: Option<crate::amdgpu_navi48_platform::CursorContent>,
+    position: (i32, i32),
+) -> bool {
+    if display != 0 {
+        return false;
+    }
+    let spawn = {
+        let mut c = DRM_CURSOR.lock();
+        DRM_CURSOR_OWNED.store(true, Ordering::Release);
+        record_cursor(&mut c, content, position);
+        !core::mem::replace(&mut c.running, true)
+    };
+    if spawn {
+        narf_scheduler::spawn(drm_cursor_task());
+    }
+    true
+}
+
+/// The new cursor state of a commit: a dumb buffer's image as is, a GEM
+/// framebuffer's once read, off, and the position in every case.
+fn record_cursor(
+    c: &mut DrmCursor,
+    content: Option<crate::amdgpu_navi48_platform::CursorContent>,
+    position: (i32, i32),
+) {
+    use crate::amdgpu_navi48_platform::CursorContent;
+    match content {
+        Some(CursorContent::Gem(gem)) => c.pending = Some(gem),
+        Some(CursorContent::Image(image)) => {
+            c.pending = None;
+            if c.image.as_deref() != Some(&image) {
+                c.image = Some(alloc::sync::Arc::new(image));
+            }
+        }
+        None => {
+            c.pending = None;
+            c.image = None;
+        }
+    }
+    c.position = position;
+    c.dirty = true;
+}
+
+async fn drm_cursor_task() {
+    loop {
+        let pending = {
+            let mut c = DRM_CURSOR.lock();
+            if !c.dirty {
+                c.running = false;
+                return;
+            }
+            c.dirty = false;
+            c.pending.clone()
+        };
+        // A GEM cursor: its writes land first (the commit's fence wait),
+        // then its rows become the image, unless a newer commit replaced it.
+        if let Some(gem) = pending {
+            let deadline =
+                narf_time::Deadline::after_ms(crate::amdgpu_navi48_platform::CURSOR_FENCE_WAIT_MS);
+            let resv = &gem.pin.object().dma_buf().resv;
+            while !resv
+                .fences(narf_filesystem::dma_buf::DmaResvUsage::Write)
+                .is_empty()
+                && !deadline.expired()
+            {
+                narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+            }
+            let image = gem.read();
+            let mut c = DRM_CURSOR.lock();
+            if c.pending.as_ref().is_some_and(|p| p.same(&gem)) {
+                c.pending = None;
+                c.image = image.map(alloc::sync::Arc::new);
+            }
+        }
+        let mut owner = OWNER.lock().await;
+        if let Some(boot) = owner.as_mut() {
+            apply_drm_cursor(boot);
+        }
+    }
+}
+
+/// Program the lit pipe's DCN30 cursor with the DRM cursor state: the image
+/// (uploaded when it changed) at its position, or off.
+fn apply_drm_cursor(boot: &mut boot::ColdBoot) {
+    if !DRM_CURSOR_OWNED.load(Ordering::Acquire) {
+        return;
+    }
+    let (image, position) = {
+        let c = DRM_CURSOR.lock();
+        (c.image.clone(), c.position)
+    };
+    match image {
+        Some(i) => {
+            let _ = boot.set_display_cursor((i.width, i.height, &i.pixels), position);
+        }
+        None => {
+            if let Ok(scanout) = boot.display_scanout() {
+                let _ = scanout.hide_cursor();
+            }
+        }
+    }
+}
+
+/// Lastclose: the cursor plane's client is gone; the console's pointer
+/// may use the hardware cursor again.
+fn release_drm_cursor() {
+    let mut c = DRM_CURSOR.lock();
+    c.image = None;
+    c.pending = None;
+    c.dirty = true;
+    DRM_CURSOR_OWNED.store(false, Ordering::Release);
 }
 
 /// Put the console on the lit pipe's front buffer, or withdraw it.
@@ -973,6 +1121,8 @@ async unsafe fn light(
     if back.is_ok() {
         present_committed_again();
     }
+    // A relit pipe starts without a cursor.
+    apply_drm_cursor(boot);
     Ok(output)
 }
 
@@ -1934,6 +2084,7 @@ pub fn release_client_scanout_async() {
     // The closed client's frame is not shown again by a later relight.
     let dropped = PRESENT.committed.lock().take();
     drop(dropped);
+    release_drm_cursor();
     narf_scheduler::spawn(async {
         // A present may hold an armed flip (OWNER released while it
         // latches); returning to the owned surface is refused until it

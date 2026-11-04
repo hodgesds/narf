@@ -6326,3 +6326,77 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_file_close_releases_generic_framebuffers
 );
+
+/// A card with cursor planes alone (Navi22): amdgpu_dm's cursor checks
+/// apply to them, the synthesized primary keeps its own, and
+/// GET_CAP CURSOR_WIDTH/HEIGHT report DC's 256-pixel cursor.
+#[cfg(feature = "amdgpu")]
+fn smoke_drm_cursor_only_native_planes() -> TestResult {
+    use crate::drm::atomic::{AtomicState, PlaneState};
+    use crate::drm::ioctl::drm_cap;
+    const AR24: u32 = 0x3432_5241;
+    let idx = register_test_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no mode state");
+    };
+    let (cursor, fb, narrow) = {
+        let mut card = ms.lock();
+        let crtcs: alloc::vec::Vec<u32> = card.crtcs.iter().map(|c| c.id).collect();
+        card.native_planes = crate::drm_native_planes::cursor_planes_for(&[], &crtcs);
+        let handle = card.gem.alloc(0xBEE0_0000, 64 * 64 * 4).unwrap();
+        let fb = card.addfb2(64, 64, AR24, 256, handle).unwrap();
+        let narrow = card.addfb2(50, 50, AR24, 200, handle).unwrap();
+        (crate::drm_native_planes::cursor_ids(&card)[0], fb, narrow)
+    };
+    let card = ms.lock();
+    if card.has_native_kms_planes() {
+        return TestResult::Fail("cursor planes alone counted as native primaries");
+    }
+    let crtc = card.native_plane(cursor).and_then(|p| p.cursor_of);
+    let state = |fb: u32, w: u32| {
+        let mut s = AtomicState::default();
+        s.planes.push(PlaneState {
+            id: cursor,
+            crtc_id: crtc,
+            fb_id: Some(fb),
+            crtc_x: 100,
+            crtc_y: 50,
+            crtc_w: w,
+            crtc_h: w,
+            src_w: w,
+            src_h: w,
+            ..Default::default()
+        });
+        s
+    };
+    let mode_of = |c: u32| card.crtc(c).ok().and_then(|c| c.mode);
+    if crate::drm_native_planes::check(&card, &state(fb, 64), mode_of) != Ok(alloc::vec::Vec::new())
+        || crate::drm_ioctl_bridge::check_native_atomic(&card, &state(fb, 64)) != Ok(())
+    {
+        return TestResult::Fail("valid 64x64 cursor refused");
+    }
+    // dm_check_cursor_fb: the pitch must be 64, 128 or 256 pixels.
+    if crate::drm_native_planes::check(&card, &state(narrow, 50), mode_of)
+        != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("cursor with a 50-pixel pitch accepted");
+    }
+    if crate::drm_native_planes::cursor_size_cap(&card) != Some(256) {
+        return TestResult::Fail("DCN30 cursor caps are not 256");
+    }
+    drop(card);
+    let mut cap = [0u8; 16];
+    cap[0..8].copy_from_slice(&drm_cap::CURSOR_WIDTH.to_le_bytes());
+    if crate::drm_ioctl_bridge::amdgpu_get_cap_for(
+        Some(idx),
+        iowr(DRM_IOCTL_BASE, 0x0C, 16),
+        cap.as_mut_ptr() as usize,
+    ) != Some(Ok(0))
+        || u64::from_le_bytes(cap[8..16].try_into().unwrap()) != 256
+    {
+        return TestResult::Fail("GET_CAP CURSOR_WIDTH is not 256");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_cursor_only_native_planes);

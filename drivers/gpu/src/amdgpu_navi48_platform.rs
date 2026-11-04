@@ -5483,7 +5483,7 @@ pub struct GemCursor {
 }
 impl GemCursor {
     /// The rows as premultiplied ARGB8888 pixels.
-    fn read(&self) -> Option<CursorImage> {
+    pub(crate) fn read(&self) -> Option<CursorImage> {
         let row = self.width as usize * 4;
         let mut line = alloc::vec![0u8; row];
         let mut pixels = Vec::with_capacity((self.width * self.height) as usize);
@@ -5502,14 +5502,14 @@ impl GemCursor {
         })
     }
     /// The same commit's content: the same pin.
-    fn same(&self, other: &Self) -> bool {
+    pub(crate) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.pin, &other.pin)
     }
 }
 /// How long the cursor task waits for a GEM cursor's writes before it
 /// copies the rows anyway (Linux waits without a bound; NARF bounds it at
 /// the GFX job timeout, as a hung writer would be reset by then).
-const CURSOR_FENCE_WAIT_MS: u64 = 10_000;
+pub(crate) const CURSOR_FENCE_WAIT_MS: u64 = 10_000;
 
 /// One display's DRM cursor plane as last committed.
 struct DrmCursor {

@@ -6193,7 +6193,7 @@ fn atomic_commit(
                 let (Some(fb_id), Some(crtc_id)) = (plane.fb_id, plane.crtc_id) else {
                     continue;
                 };
-                if !card.native_planes.is_empty() {
+                if card.has_native_kms_planes() {
                     break;
                 }
                 let Some(d) = crate::amdgpu_native_kms::crtc_display(crtc_id) else {
@@ -6290,7 +6290,7 @@ fn atomic_commit(
                     .map(|(_, m)| *m);
                 let planes = if let Some(d) = native_displays.iter().find(|d| d.crtc_id == crtc) {
                     Some((d.primary_format, d.setup))
-                } else if !card.native_planes.is_empty() {
+                } else if card.has_native_kms_planes() {
                     // A connector-only color-format change still needs the
                     // committed primary/overlays, including pending DRM state.
                     let mut snapshot = state.clone();
@@ -6610,7 +6610,7 @@ fn atomic_commit(
                     // without native planes (check_native_plane).
                     let placement =
                         card.plane_formats
-                            .filter(|_| amdgpu && card.native_planes.is_empty())
+                            .filter(|_| amdgpu && !card.has_native_kms_planes())
                             .and_then(|_| {
                                 let plane = state.planes.iter().find(|p| {
                                     p.crtc_id == Some(crtc_id) && p.fb_id == Some(fb_id)
@@ -7388,13 +7388,17 @@ pub(crate) fn check_native_atomic(
 ) -> Result<(), FsError> {
     // amdgpu_dm's native planes take placement and scaling, checked by
     // `drm_native_planes::check` instead.
-    if !card.native_planes.is_empty() {
+    if card.has_native_kms_planes() {
         return Ok(());
     }
     for plane in &state.planes {
         let (Some(fb_id), Some(crtc_id)) = (plane.fb_id, plane.crtc_id) else {
             continue;
         };
+        // A cursor plane is checked as one (`drm_native_planes::check`).
+        if card.native_plane(plane.id).is_some_and(|p| p.is_cursor()) {
+            continue;
+        }
         let mode = state
             .crtcs
             .iter()
@@ -8101,7 +8105,11 @@ fn handle_setplane_decoded_native(
         if let Some(a) = admission {
             a.check(&card)?;
         }
-        if card.native_planes.is_empty() {
+        // SETPLANE takes the native planes; on a card with cursor planes
+        // alone, only those.
+        if !card.has_native_kms_planes()
+            && !card.native_plane(plane_id).is_some_and(|p| p.is_cursor())
+        {
             return Err(FsError::Unsupported);
         }
         let mut plane =
@@ -8759,6 +8767,18 @@ pub fn amdgpu_cap_value(cap: u64) -> Option<u64> {
 /// generic table answers identically for amdgpu.
 #[cfg(feature = "amdgpu")]
 pub fn amdgpu_get_cap(cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
+    amdgpu_get_cap_for(None, cmd, arg)
+}
+
+/// [`amdgpu_get_cap`] on card `card_index`, which also answers
+/// DRM_CAP_CURSOR_WIDTH/HEIGHT with its DC's max_cursor_size
+/// (mode_config.cursor_width/height) once it has cursor planes.
+#[cfg(feature = "amdgpu")]
+pub fn amdgpu_get_cap_for(
+    card_index: Option<u32>,
+    cmd: u32,
+    arg: usize,
+) -> Option<Result<u64, FsError>> {
     if (cmd >> 8) & 0xff != u32::from(b'd') || drm_uapi::ioc_nr(cmd) != 0x0c {
         return None;
     }
@@ -8768,6 +8788,17 @@ pub fn amdgpu_get_cap(cmd: u32, arg: usize) -> Option<Result<u64, FsError>> {
         Err(e) => return Some(Err(e)),
     };
     let cap = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    if matches!(
+        cap,
+        crate::drm::ioctl::drm_cap::CURSOR_WIDTH | crate::drm::ioctl::drm_cap::CURSOR_HEIGHT
+    ) {
+        let size = card_index
+            .and_then(crate::drm_registry::mode_state)
+            .and_then(|m| crate::drm_native_planes::cursor_size_cap(&m.lock()))?;
+        b[8..16].copy_from_slice(&u64::from(size).to_le_bytes());
+        // SAFETY: as above.
+        return Some(unsafe { copy_out(arg, &b) }.map(|()| 0));
+    }
     if !matches!(
         cap,
         crate::drm::ioctl::drm_cap::SYNCOBJ_TIMELINE

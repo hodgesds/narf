@@ -1185,6 +1185,14 @@ pub struct NativePlane {
     /// cursor_x/cursor_y), which a CURSOR ioctl without MOVE keeps.
     pub legacy_position: (i32, i32),
 }
+impl Card {
+    /// Whether DRM's primary and overlay planes are native planes
+    /// (`drm_native_planes`). A card with cursor planes alone (Navi22)
+    /// keeps the synthesized primary path.
+    pub fn has_native_kms_planes(&self) -> bool {
+        self.native_planes.iter().any(|p| !p.is_cursor())
+    }
+}
 impl NativePlane {
     /// An overlay: neither a primary nor a cursor plane.
     pub fn is_overlay(&self) -> bool {
