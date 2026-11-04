@@ -70,6 +70,7 @@ fn connection() -> Connection {
         active_request: None,
         mld_association: None,
         ttlm: Default::default(),
+        neg_ttlm: Default::default(),
         client: None,
         mld_eapol: VecDeque::new(),
         tx_amsdu: super::super::sc_tx_amsdu::Limits::default(),

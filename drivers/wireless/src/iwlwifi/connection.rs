@@ -96,6 +96,11 @@ pub struct Connection {
     mld_association: Option<super::sc_mlo_assoc::AssociationBodies>,
     /// Advertised TID-to-link mapping and dormant links (mlme.c).
     ttlm: super::sc_emlsr::TtlmState,
+    /// Negotiated TID-to-link mapping and link reconfiguration
+    /// (`sc_ttlm_neg`): the pending/staged/active negotiated maps. The
+    /// advertised `ttlm` above still publishes the active/dormant masks
+    /// (the negotiated engine writes them there at apply time).
+    neg_ttlm: super::sc_ttlm_neg::NegotiatedTtlm,
     client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
     mld_eapol: VecDeque<(u64, [u8; 32])>,
     tx_amsdu: super::sc_tx_amsdu::Limits,
@@ -233,6 +238,7 @@ impl Connection {
             active_request: None,
             mld_association: None,
             ttlm: Default::default(),
+            neg_ttlm: Default::default(),
             client: None,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
@@ -835,6 +841,7 @@ impl Connection {
             active_request: None,
             mld_association: None,
             ttlm: Default::default(),
+            neg_ttlm: Default::default(),
             client,
             mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
@@ -3011,13 +3018,35 @@ impl Connection {
             return Ok(());
         };
         let valid = self.mld_valid_links() | 1 << mld.association().spec_link;
-        let Some((active, dormant)) = self.ttlm.due(now_ms(), valid) else {
-            return Ok(());
-        };
-        if active == 0 {
-            self.authorized = false;
-            return Err("advertised TID-to-link mapping maps no valid link");
+        if let Some((active, dormant)) = self.ttlm.due(now_ms(), valid) {
+            if active == 0 {
+                self.authorized = false;
+                return Err("advertised TID-to-link mapping maps no valid link");
+            }
+            self.apply_ttlm_switch(active, dormant, valid);
         }
+        // A negotiated staged map whose switch time arrived: publish the
+        // per-TID map's union mask and dormant set, then drive the same
+        // link-activation request as an advertised switch.
+        if let Some((_, active, dormant)) = self.neg_ttlm.due(now_ms(), valid) {
+            if active == 0 {
+                self.authorized = false;
+                return Err("negotiated TID-to-link mapping maps no valid link");
+            }
+            self.ttlm.info.map = active;
+            self.ttlm.info.switch_time = 0;
+            self.ttlm.active = true;
+            self.ttlm.negotiated = true;
+            self.ttlm.dormant = dormant;
+            self.apply_ttlm_switch(active, dormant, valid);
+        }
+        Ok(())
+    }
+
+    /// Drive the link-activation request for a TTLM switch's
+    /// (active, dormant) masks: keep the mapped current links, else the
+    /// lowest usable link serves.
+    fn apply_ttlm_switch(&mut self, active: u16, dormant: u16, valid: u16) {
         let current = self.mld_active_links();
         if current != active {
             let mut keep = active & current;
@@ -3026,7 +3055,6 @@ impl Connection {
             }
             self.active_request = Some(keep);
         }
-        Ok(())
     }
 
     async fn remove_links(&mut self, hw: &mut Hardware, remove: u16) -> Result<(), &'static str> {

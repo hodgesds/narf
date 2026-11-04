@@ -1124,15 +1124,17 @@ impl Selector {
 mod tests;
 
 /// Linux ieee80211-eht.h IEEE80211_TTLM_* and mlme.c IEEE80211_ADV_TTLM_*.
-const TTLM_EXT_ID: u8 = 109;
+/// Shared with the negotiated-TTLM engine (`sc_ttlm_neg`), which reuses
+/// this element framing with per-TID maps.
+pub(super) const TTLM_EXT_ID: u8 = 109;
 const TTLM_MAX_CNT: usize = 2;
-const TTLM_DIRECTION_BOTH: u8 = 2;
-const TTLM_DEF_LINK_MAP: u8 = 0x04;
-const TTLM_SWITCH_TIME_PRESENT: u8 = 0x08;
-const TTLM_EXPECTED_DUR_PRESENT: u8 = 0x10;
-const TTLM_LINK_MAP_SIZE: u8 = 0x20;
-const ADV_TTLM_ST_UNDERFLOW: u16 = 0xff00;
-const ADV_TTLM_SAFETY_BUFFER_US: u64 = 100_000;
+pub(super) const TTLM_DIRECTION_BOTH: u8 = 2;
+pub(super) const TTLM_DEF_LINK_MAP: u8 = 0x04;
+pub(super) const TTLM_SWITCH_TIME_PRESENT: u8 = 0x08;
+pub(super) const TTLM_EXPECTED_DUR_PRESENT: u8 = 0x10;
+pub(super) const TTLM_LINK_MAP_SIZE: u8 = 0x20;
+pub(super) const ADV_TTLM_ST_UNDERFLOW: u16 = 0xff00;
+pub(super) const ADV_TTLM_SAFETY_BUFFER_US: u64 = 100_000;
 
 /// mlme.c `struct ieee80211_adv_ttlm_info` (without the active flag).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1144,7 +1146,7 @@ pub(super) struct AdvTtlm {
 
 /// ieee80211-eht.h `ieee80211_tid_to_link_map_size_ok` over the element
 /// body after the extension id.
-fn ttlm_size_ok(data: &[u8]) -> bool {
+pub(super) fn ttlm_size_ok(data: &[u8]) -> bool {
     let Some(&control) = data.first() else {
         return false;
     };
@@ -1269,6 +1271,11 @@ pub(super) struct TtlmState {
     pub active: bool,
     pub switch_at_ms: Option<u64>,
     pub dormant: u16,
+    /// A negotiated mapping (see `sc_ttlm_neg`) is currently published
+    /// here. While set, the advertised beacon path must not touch this
+    /// state: only teardown or reconfiguration withdraws a negotiated
+    /// mapping, never beacon element absence.
+    pub negotiated: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1288,12 +1295,18 @@ impl TtlmState {
             active: info.is_some(),
             switch_at_ms: None,
             dormant,
+            negotiated: false,
         };
     }
 
     /// mlme.c `ieee80211_process_adv_ttlm` for one beacon of an MLD
     /// association with its TSF `beacon_ts`.
     pub fn process(&mut self, ies: &[u8], beacon_ts: u64, now_ms: u64) -> TtlmAction {
+        if self.negotiated {
+            // Negotiated state belongs to `sc_ttlm_neg`; beacon element
+            // absence must not withdraw it (see the field docs).
+            return TtlmAction::None;
+        }
         let elements = ttlm_elements(ies);
         if elements.is_empty() {
             let mut action = TtlmAction::None;
