@@ -27,6 +27,7 @@ narf-io           = { path = "../../io" }
 narf-ipc          = { path = "../../ipc" }
 narf-input        = { path = "../../input" }
 narf-net          = { path = "../../net" }
+narf-drivers-net-core = { path = "../net/core" }
 narf-graphics     = { path = "../../graphics" }
 narf-init         = { path = "../../init" }
 narf-filesystem   = { path = "../../filesystem" }
