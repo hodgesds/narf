@@ -9970,7 +9970,7 @@ fn smoke_btrfs_batch_commits_once_for_many_ops() -> TestResult {
     let _ = poll_once(vol.sync_to_disk());
 
     let before = vol.superblock().generation;
-    for i in 0..8 {
+    for i in 0..crate::write::MAX_BATCH_OPS {
         if !matches!(
             poll_once(root.create(&format!("batch-{i}.txt"))),
             Some(Ok(_))
@@ -9978,16 +9978,16 @@ fn smoke_btrfs_batch_commits_once_for_many_ops() -> TestResult {
             return TestResult::Fail("a batched create failed");
         }
     }
-    // Eight operations, and the eighth fills the batch and commits it: exactly
-    // one transaction. Without accumulation this would be eight.
+    // A batch's worth of operations, and the last fills it and commits it:
+    // exactly one transaction. Without accumulation this would be one each.
     let after = vol.superblock().generation;
     if after != before + 1 {
-        return TestResult::Fail("eight operations did not commit as one transaction");
+        return TestResult::Fail("a full batch did not commit as one transaction");
     }
 
     // And the batch is not a cache trick: every one of them is really there.
     let names = dir_names(&vol.root());
-    for i in 0..8 {
+    for i in 0..crate::write::MAX_BATCH_OPS {
         if !names.iter().any(|n| n == &format!("batch-{i}.txt")) {
             return TestResult::Fail("a batched create was lost");
         }
@@ -10028,7 +10028,7 @@ fn smoke_btrfs_batch_is_visible_before_commit_and_lost_on_crash() -> TestResult 
     let _ = poll_once(vol.sync_to_disk());
     let committed_gen = vol.superblock().generation;
 
-    // Three operations, none of them committed (the batch holds eight).
+    // Three operations, none of them committed (the batch holds more).
     for i in 0..3 {
         if !matches!(
             poll_once(root.create(&format!("pending-{i}.txt"))),
@@ -10251,16 +10251,16 @@ fn smoke_btrfs_quota_volume_batches() -> TestResult {
     let _ = poll_once(vol.sync_to_disk());
 
     let before = vol.superblock().generation;
-    for i in 0..8 {
+    for i in 0..crate::write::MAX_BATCH_OPS {
         if !matches!(poll_once(root.create(&format!("q-{i}.txt"))), Some(Ok(_))) {
             return TestResult::Fail("a batched create on a quota volume failed");
         }
     }
     if vol.superblock().generation != before + 1 {
-        return TestResult::Fail("a quota volume did not batch eight operations into one commit");
+        return TestResult::Fail("a quota volume did not batch a full batch into one commit");
     }
     let names = dir_names(&vol.root());
-    for i in 0..8 {
+    for i in 0..crate::write::MAX_BATCH_OPS {
         if !names.iter().any(|n| n == &format!("q-{i}.txt")) {
             return TestResult::Fail("a batched create on a quota volume was lost");
         }
