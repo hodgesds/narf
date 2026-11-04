@@ -265,6 +265,29 @@ impl<R: Fullmac + 'static> Device<R> {
                 consider(session);
             }
         }
+        // F20: channel agreement with an associated primary STA. Linux
+        // `brcmf_setup_ifmodes` (cfg80211.c) puts STA+AP on the p2p
+        // combination (channels = 1) even with mchan: mchan's second
+        // channel licenses STA+STA and P2P, never STA+AP. A plain
+        // secondary AP beside an associated primary STA must therefore
+        // share the STA's channel; a P2P GO beside it may use its own
+        // channel only when the firmware advertises mchan (combo0
+        // channels = 1 + (p2p && mchan)). An unassociated or mid-roam
+        // primary (no live grant) constrains nothing, as before.
+        let sta_constrains = shell.role != Role::P2pGo || !features.mchan;
+        if sta_constrains {
+            if let Some(sta_channel) = state.station.associated_primary_channel() {
+                if let Some(sta_chanspec) = crate::cyw43439::channel::encode20(sta_channel) {
+                    match required_chanspec {
+                        None => required_chanspec = Some(sta_chanspec),
+                        Some(existing) if existing != sta_chanspec => {
+                            chanspec_conflict = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         // A P2P GO starts on its own connection bsscfg (`Scope::Go`).
         let scope = if shell.role == Role::P2pGo {
             let bsscfgidx = state

@@ -17,6 +17,15 @@ impl<R: Fullmac> Station<R> {
             || self.connection.is_some()
             || self.external.is_some()
     }
+
+    /// Primary 20 MHz channel of the live association, if any: the
+    /// policy-granted channel of the current `connection` (set on
+    /// association and on roam confirmation, cleared on disconnect and
+    /// while a firmware roam is in progress). `None` while unassociated
+    /// or mid-roam, when no STA channel constrains a new AP.
+    pub(crate) fn associated_primary_channel(&self) -> Option<u8> {
+        self.connection.map(|grant| grant.primary_channel())
+    }
     pub(crate) fn ap_channel(&self, policy: &Policy, primary: u8) -> Result<Channel, Error> {
         if !R::PRIMARY_AP
             || self.operation
