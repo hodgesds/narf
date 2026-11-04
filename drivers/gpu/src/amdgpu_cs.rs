@@ -880,9 +880,17 @@ fn gem_deadline(timeout: u64) -> u64 {
     }
 }
 
-/// Sleep briefly inside an ioctl that waits.
+/// Sleep briefly inside an ioctl that waits: until the next Navi22 fence
+/// interrupt, and never longer than the previous 100 µs poll period (other
+/// families' fences, and any change between the caller's sample and here,
+/// still re-sample on that period).
 async fn nap() {
-    narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
+    let observed = crate::amdgpu_fence_navi22::change_sequence();
+    crate::amdgpu_fence_navi22::wait_change(
+        observed,
+        narf_time::monotonic_ns().saturating_add(100_000),
+    )
+    .await;
 }
 
 async fn wait_kernel(
