@@ -15,13 +15,12 @@ use alloc::vec;
 use core::future::Future;
 
 use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
-use narf_wireless::WirelessNetIface;
 
 use super::super::ce::{monotonic_ms, Ce, CeIrq, CeMsi};
 use super::super::core::{Ath11kCore, CeHif, QmiFw};
 use super::super::dp_ring::{Dp, DpHwParams, DpRingSizes};
 use super::super::hal::Hal;
-use super::super::hw::{AhbChip, HwRev, MSI_CONFIG_NONE};
+use super::super::hw::{HwRev, MSI_CONFIG_NONE};
 use super::super::mac::{Mac, MacConfig};
 use super::super::power::ChipIo;
 use super::super::runtime::{Port, Rt, Shared};
@@ -30,7 +29,7 @@ use super::super::wmi::{
     PdevCap, Ready, ServiceMap, ServiceReadyExt, TargetCaps, WMI_HOST_WLAN_2G_CAP,
     WMI_HOST_WLAN_5G_CAP,
 };
-use super::{ahb_drain, ahb_send_context, register_ahb, AHB_ACTIVE};
+use super::{ahb_drain, ahb_send_context, register_ahb, AhbChip, AHB_ACTIVE};
 
 /// Locally-administered test MAC, distinct from every in-tree fixture
 /// MAC (integration tests use `02:00:00:00:00:02`-style addresses only
