@@ -3,6 +3,7 @@ use super::packet_codec::{self, Kind, Mpdu};
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_wireless::association::phy::{HtGi, HtWidth, LocalHt, LocalPhy};
 
 const LOCAL: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const AP: [u8; 6] = [2, 0, 0, 0, 0, 2];
@@ -351,4 +352,137 @@ fn smoke_rtl8188eu_management_plan_uses_actual_retained_packet_owner() -> TestRe
 kernel_test_in!(
     "wireless",
     smoke_rtl8188eu_management_plan_uses_actual_retained_packet_owner
+);
+
+/// Gen2 HT40 negotiation facts: a Forty offer against a 40 MHz BSS
+/// negotiates Forty with the operation's secondary channel, `ht_peer`
+/// reports SGI_40 (not SGI_20) for the TX direction, and the candidate's
+/// HT Operation element yields the secondary channel for the wide grant.
+fn smoke_rtl8xxxu_gen2_ht40_negotiation_and_secondary() -> TestResult {
+    // WMM parameter element (the rejection test's fixture): offering HT
+    // without WMM is refused by `Join::prepare_with_phy`, and a WMM join
+    // requires a valid WMM element in the association response.
+    const WMM: [u8; 26] = [
+        221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0, 0, 3, 0xa4, 0, 0, 0x27, 0xa4, 0, 0, 0x42, 0x43, 94, 0,
+        0x62, 0x32, 47, 0,
+    ];
+    if beacon(false).bytes[48..51] != [3, 1, 1] {
+        return TestResult::Fail("beacon DS element moved");
+    }
+    fn peer_cap(sgi40: bool) -> [u8; 26] {
+        LocalHt::new(
+            [255, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [255, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            HtWidth::TwentyForty,
+            HtGi {
+                rx20: true,
+                tx20: true,
+                rx40: sgi40,
+                tx40: sgi40,
+            },
+            3,
+            7,
+        )
+        .unwrap()
+        .capability_body()
+    }
+    fn op_body(primary: u8, above: bool) -> [u8; 22] {
+        let mut body = [0u8; 22];
+        body[0] = primary;
+        body[1] = if above { 0x05 } else { 0x07 };
+        body
+    }
+    fn beacon_ht(channel: u8, above: bool, sgi40: bool) -> Mpdu {
+        let mut b = beacon(false);
+        b.bytes[50] = channel;
+        b.bytes.extend_from_slice(&WMM);
+        let cap = peer_cap(sgi40);
+        b.bytes.extend_from_slice(&[45, 26]);
+        b.bytes.extend_from_slice(&cap);
+        let op = op_body(channel, above);
+        b.bytes.extend_from_slice(&[61, 22]);
+        b.bytes.extend_from_slice(&op);
+        b
+    }
+    fn local_forty() -> LocalPhy {
+        LocalPhy::ht40(
+            LocalHt::new(
+                [255, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [255, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                HtWidth::TwentyForty,
+                HtGi {
+                    rx20: true,
+                    tx20: true,
+                    rx40: true,
+                    tx40: true,
+                },
+                3,
+                7,
+            )
+            .unwrap()
+            .with_tx_selection([255, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .unwrap(),
+        )
+        .unwrap()
+    }
+    fn associate_ht(channel: u8, above: bool, sgi40: bool) -> Join {
+        let candidate =
+            Candidate::from_receive(&beacon_ht(channel, above, sgi40), channel, LOCAL).unwrap();
+        let mut p = Join::prepare_with_phy(
+            candidate,
+            LOCAL,
+            b"narf",
+            SecurityMode::Open,
+            Some(local_forty()),
+        )
+        .unwrap();
+        p.begin().unwrap();
+        p.receive(&auth(0)).unwrap();
+        let mut response = assoc(false);
+        response.bytes.extend_from_slice(&WMM);
+        let cap = peer_cap(sgi40);
+        response.bytes.extend_from_slice(&[45, 26]);
+        response.bytes.extend_from_slice(&cap);
+        let op = op_body(channel, above);
+        response.bytes.extend_from_slice(&[61, 22]);
+        response.bytes.extend_from_slice(&op);
+        p.receive(&response).unwrap();
+        p
+    }
+    // Secondary channels from the candidate's HT Operation element.
+    let candidate = Candidate::from_receive(&beacon_ht(1, true, true), 1, LOCAL).unwrap();
+    if candidate.ht_secondary() != Some(5) {
+        return TestResult::Fail("HT Operation above did not yield secondary 5");
+    }
+    let candidate = Candidate::from_receive(&beacon_ht(9, false, true), 9, LOCAL).unwrap();
+    if candidate.ht_secondary() != Some(5) {
+        return TestResult::Fail("HT Operation below did not yield secondary 5");
+    }
+    let mut flat = beacon_ht(1, true, true);
+    let n = flat.bytes.len();
+    flat.bytes[n - 21] = 0x04;
+    let candidate = Candidate::from_receive(&flat, 1, LOCAL).unwrap();
+    if candidate.ht_secondary().is_some() {
+        return TestResult::Fail("HT Operation without a secondary offset yielded one");
+    }
+    // Forty offer, SGI_40 peer, secondary above channel 1.
+    let p = associate_ht(1, true, true);
+    if p.ht_peer() != Some(([0xff, 0], true)) {
+        return TestResult::Fail("Forty negotiation did not report SGI_40");
+    }
+    let geometry = p.negotiated_geometry().unwrap().unwrap();
+    if geometry.primary() != 1 || geometry.secondary() != 5 {
+        return TestResult::Fail("negotiated Forty geometry is not primary 1 + secondary 5");
+    }
+    // Same offer against a peer without SGI_40: Forty still negotiates,
+    // but the TX direction reports no short GI.
+    let p = associate_ht(1, true, false);
+    if p.ht_peer() != Some(([0xff, 0], false)) {
+        return TestResult::Fail("peer without SGI_40 reported short GI");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless",
+    smoke_rtl8xxxu_gen2_ht40_negotiation_and_secondary
 );

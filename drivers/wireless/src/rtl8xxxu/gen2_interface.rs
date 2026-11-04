@@ -911,11 +911,23 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
         // Refuse an unsupported BSS before the radio is handed to a station.
         super::management_runtime::Join::prepare(candidate.clone(), self.mac, &request.ssid, mode)
             .map_err(|_| WirelessError::InvalidArgs)?;
+        // A 40 MHz BSS earns a wide grant only when the signed record and
+        // domain admit the secondary channel: any failure here is a
+        // silent Twenty fallback, not a connect error — the station
+        // offers HT20 and the Forty negotiation simply never happens.
+        let wide = candidate.ht_secondary().and_then(|secondary| {
+            let width = if secondary > candidate.channel() {
+                super::rtl8192e_radio::Width::Ht40Above
+            } else {
+                super::rtl8192e_radio::Width::Ht40Below
+            };
+            state.authority.grant_wide(candidate.channel(), width).ok()
+        });
         state.clear_transmit();
         let Slot::Idle(radio) = core::mem::replace(&mut state.slot, Slot::Failed) else {
             return Err(WirelessError::Busy);
         };
-        let mut station = match Station::new(*radio, candidate, &request.ssid, mode, pmk) {
+        let mut station = match Station::new(*radio, candidate, &request.ssid, mode, pmk, wide) {
             Ok(station) => Box::new(station),
             Err(error) => {
                 self.fail(&mut state);

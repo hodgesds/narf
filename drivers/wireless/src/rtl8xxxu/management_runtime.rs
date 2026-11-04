@@ -173,6 +173,28 @@ impl Candidate {
     pub fn information_elements(&self) -> &[u8] {
         &self.bss.information_elements
     }
+    /// The secondary channel of a 40 MHz BSS, from its HT Operation
+    /// element (id 61, 22 bytes): `primary + 4` when the secondary-offset
+    /// field is 1 (above), `primary - 4` when it is 3 (below), else
+    /// `None` (no secondary, or an unparseable element). The offset
+    /// encoding mirrors `HtOperation::parse` (association phy); grant
+    /// validation downstream rejects an out-of-range secondary.
+    pub(super) fn ht_secondary(&self) -> Option<u8> {
+        let mut rest = self.information_elements();
+        while rest.len() >= 2 {
+            let (id, len) = (rest[0], rest[1] as usize);
+            let body = rest.get(2..2 + len)?;
+            if id == 61 && len == 22 && body[0] == self.channel() {
+                return match body[1] & 3 {
+                    1 => self.channel().checked_add(4),
+                    3 => self.channel().checked_sub(4),
+                    _ => None,
+                };
+            }
+            rest = &rest[2 + len..];
+        }
+        None
+    }
     /// Original AP bodies, retained independently from the station's canonical
     /// negotiated RSNE for Supplicant::with_rsna and M3 KDE binding.
     pub fn ap_rsne(&self) -> Option<&[u8]> {
@@ -327,11 +349,18 @@ impl Join {
     }
     /// Negotiated HT facts for gen2 firmware RA (`sta->deflink.ht_cap`
     /// after mac80211 `ieee80211_ht_cap_ie_to_sta_ht_cap`): the peer RX MCS
-    /// the local TX selection may use (`rx_mask[0..2]`) and SGI_20.
+    /// the local TX selection may use (`rx_mask[0..2]`) and the short-GI
+    /// flag for the negotiated width (`SGI_40` at Forty, `SGI_20` at
+    /// Twenty; firmware RA programs `short_gi` from this).
     pub(super) fn ht_peer(&self) -> Option<([u8; 2], bool)> {
         self.plan.negotiated_phy().map(|phy| {
             let mcs = phy.ht().tx_mcs();
-            ([mcs[0], mcs[1]], phy.ht().tx_sgi20())
+            let sgi = if phy.width() == association::phy::Width::Forty {
+                phy.ht().tx_sgi40()
+            } else {
+                phy.ht().tx_sgi20()
+            };
+            ([mcs[0], mcs[1]], sgi)
         })
     }
     pub(super) fn ht_selected(&self) -> bool {

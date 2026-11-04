@@ -463,6 +463,61 @@ fn local_encoding() -> Result<(), &'static str> {
             && LocalVht::new(0xfffc, 0xfffc, false, false, 8).is_err(),
         "invalid local VHT admitted"
     );
+    // MCS32 is the 40 MHz duplicate: RX-only, never TX or TX selection.
+    let mcs32 = LocalHt::new(
+        [255, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+        [255, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        HtWidth::TwentyForty,
+        HtGi {
+            rx20: true,
+            tx20: true,
+            rx40: true,
+            tx40: true,
+        },
+        3,
+        7,
+    )
+    .unwrap();
+    check!(
+        mcs32.capability_body()[7] == 1
+            && mcs32.capability_body()[2] & 0x42 == 0x42
+            && mcs32
+                .with_tx_selection([255, 0, 0, 0, 1, 0, 0, 0, 0, 0])
+                .is_err(),
+        "MCS32 RX-only duplicate not encoded or leaked into TX selection"
+    );
+    for (rx, tx) in [
+        (
+            [255, 0, 0, 0, 3, 0, 0, 0, 0, 0],
+            [255, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        (
+            [255, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+            [255, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        (
+            [255, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+            [255, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+        ),
+    ] {
+        check!(
+            LocalHt::new(
+                rx,
+                tx,
+                HtWidth::TwentyForty,
+                HtGi {
+                    rx20: true,
+                    tx20: true,
+                    rx40: true,
+                    tx40: true,
+                },
+                3,
+                7,
+            )
+            .is_err(),
+            "MCS32 mask beyond the single RX duplicate bit admitted"
+        );
+    }
     Ok(())
 }
 smoke!(smoke_phy_local_exact_encoding_and_bounds, local_encoding);

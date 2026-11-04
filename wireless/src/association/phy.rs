@@ -31,6 +31,9 @@ pub enum Width {
 /// and one-stream RX STBC, explicit TX STBC and large RX A-MSDU,
 /// without HT-control or beamforming. RX/TX must include
 /// mandatory MCS0..7 (IEEE20.3.5; Linux ath10k/mac.c peer HT-rate check).
+/// MCS32 is RX-only (rx_mask[4] bit 0, the 40 MHz duplicate): it may appear
+/// in the RX mask, never in TX or TX selection, since the station never
+/// transmits the duplicate mode.
 /// An optional subset bounds TX selection without changing capability IEs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalHt {
@@ -61,7 +64,9 @@ impl LocalHt {
     ) -> Result<Self, Error> {
         if rx[0] != 255
             || tx[0] != 255
-            || rx[4..].iter().chain(&tx[4..]).any(|v| *v != 0)
+            || rx[4] & !1 != 0
+            || rx[5..].iter().any(|v| *v != 0)
+            || tx[4..].iter().any(|v| *v != 0)
             || ampdu_factor > 3
             || mpdu_density > 7
             || width == HtWidth::Twenty && (gi.rx40 || gi.tx40)

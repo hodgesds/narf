@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One 20 MHz station transaction over the gen2 radio, shared by RTL8192EU
+//! One station transaction over the gen2 radio, shared by RTL8192EU
 //! and RTL8723BU: legacy, optional WMM and, against a WMM HT AP when the
 //! signed record admits MCS, optional HT20 (`Radio::ht_local`) with host
-//! Block Ack sessions (`ba_sessions`). The join plan, the shared RSNA/software-CCMP
+//! Block Ack sessions (`ba_sessions`). Against a 40 MHz BSS, when the
+//! signed record and domain grant the wide channel, the station offers
+//! HT40 (`Radio::ht40_local`), programs it with `Radio::widen` on a
+//! Forty negotiation, and admits 40 MHz RX under that grant. The join plan, the shared RSNA/software-CCMP
 //! supplicant and the Ethernet conversion are the RTL8188EU station's
 //! (`station_runtime`); rate control is the gen2 firmware's (`ra_connect`
 //! at association, `rtl8xxxu_ra_iter` every 2 s, C2H RA reports), and the
@@ -165,20 +168,23 @@ impl<C: ControlIo, B: packet_transport::Io> core::fmt::Debug for Station<C, B> {
 
 impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     pub fn new(
-        radio: Radio<C, B>,
+        mut radio: Radio<C, B>,
         candidate: Candidate,
         ssid: &[u8],
         mode: SecurityMode,
         pmk: Option<Zeroizing<[u8; 32]>>,
+        wide: Option<gen2_radio::Grant>,
     ) -> Result<Self, Error> {
         if candidate.channel() != radio.channel() || mode.is_wpa2() != pmk.is_some() {
             return Err(Error::Profile);
         }
+        radio.offer_wide(wide).map_err(Error::Radio)?;
         // A WMM AP selects the optional QoS station: the join plan appends
         // the Information IE (no U-APSD) and requires valid response rows.
         // mac80211 `ieee80211_determine_chan_mode` disables HT without WMM;
-        // with WMM the signed record's HT20 capability is offered (a non-HT
-        // AP still negotiates the legacy/QoS station).
+        // with WMM the signed record's HT capability is offered (HT40 when
+        // a wide grant is held, else HT20; a non-HT AP still negotiates
+        // the legacy/QoS station).
         let wmm = narf_wireless::wmm::Parameters::parse(candidate.information_elements())
             .ok()
             .flatten()
@@ -397,6 +403,33 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         }
         Ok(())
     }
+    /// Activate the offered 40 MHz channel when the negotiated geometry
+    /// is Forty, or clear the offer when it is Twenty. A Forty geometry
+    /// without a matching wide grant (same primary, secondary on the
+    /// offered side), or a widen failure, fails the association rather
+    /// than silently falling back to 20 MHz. `rejoin` reuses this: the
+    /// retained wide grant survives `leave`/`stop` (which clear only the
+    /// activation), so a Forty rejoin re-programs the wide channel.
+    async fn widen_if_forty(&mut self) -> Result<(), Error> {
+        let Some(geometry) = self.plan.negotiated_geometry().map_err(Error::Management)? else {
+            self.radio.offer_wide(None).map_err(Error::Radio)?;
+            return Ok(());
+        };
+        let primary = self.radio.channel();
+        let wide_ok = match self.radio.wide_width() {
+            Some(super::rtl8192e_radio::Width::Ht40Above) => {
+                geometry.primary() == primary && geometry.secondary() == primary.saturating_add(4)
+            }
+            Some(super::rtl8192e_radio::Width::Ht40Below) => {
+                geometry.primary() == primary && geometry.secondary() == primary.saturating_sub(4)
+            }
+            _ => false,
+        };
+        if !wide_ok {
+            return Err(Error::Profile);
+        }
+        self.radio.widen().await.map_err(Error::Radio)
+    }
     /// `BSS_CHANGED_ASSOC`: firmware RA over the negotiated legacy rates
     /// within the signed admitted mask, then the RSNA owner or the open port.
     async fn associated(&mut self, aid: u16, now: u64) -> Result<(), Error> {
@@ -405,6 +438,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if let Some(p) = self.plan.wmm() {
             self.program_edca(p).await?;
         }
+        self.widen_if_forty().await?;
         self.radio
             .associate(aid, self.ra_peer(), now)
             .await
@@ -647,7 +681,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         if !admitted
             || !self.controlled_port_open()
             || !self.plan.ht_selected()
-            || !gen2_radio::station_admitted(frame, false)
+            || !gen2_radio::station_admitted(frame, false, false)
             || b.len() < 26
             || b[1] & 0xc7 != 0
             || b[4..10] != own
@@ -713,7 +747,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         nonce: impl FnMut() -> Option<[u8; 32]>,
     ) -> Result<bool, Error> {
         let ht = self.plan.ht_selected();
-        if !gen2_radio::station_admitted(frame, ht) {
+        if !gen2_radio::station_admitted(frame, ht, self.radio.wide_active()) {
             return Ok(false);
         }
         let b = &frame.bytes;
@@ -1010,6 +1044,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                     .await
                     .map_err(Error::Radio)?;
             }
+            self.widen_if_forty().await?;
             self.radio
                 .associate(aid, self.ra_peer(), now)
                 .await
