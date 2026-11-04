@@ -3088,6 +3088,10 @@ pub mod tests {
     /// mirrors the production op semantics (read-modify-write
     /// for set/clr-bits, two-step SRAM writes); the ALDPS poll
     /// is modelled as satisfied.
+    /// All polls are modelled the same way. Byte ops touch
+    /// the low byte of the word at `addr` (all byte-op addresses
+    /// in the sequences are even, so this is exact there); a
+    /// dword write splits low@`addr`, high@`addr + 1`.
     struct ModelRegs {
         pla: Vec<(u16, u16)>,
         ocp: Vec<(u16, u16)>,
@@ -3140,6 +3144,51 @@ pub mod tests {
                     let cur = Self::get(&self.mdio, addr);
                     Self::set(&mut self.mdio, addr, cur | bits);
                 }
+                UsbWordClrBits { addr, bits } => {
+                    let cur = Self::get(&self.usb, addr);
+                    Self::set(&mut self.usb, addr, cur & !bits);
+                }
+                UsbWordWrite { addr, value } => Self::set(&mut self.usb, addr, value),
+                UsbByteSetBits { addr, bits } => {
+                    let cur = Self::get(&self.usb, addr);
+                    let lo = (cur as u8 | bits) as u16;
+                    Self::set(&mut self.usb, addr, (cur & 0xFF00) | lo);
+                }
+                UsbByteClrBits { addr, bits } => {
+                    let cur = Self::get(&self.usb, addr);
+                    let lo = (cur as u8 & !bits) as u16;
+                    Self::set(&mut self.usb, addr, (cur & 0xFF00) | lo);
+                }
+                UsbByteWrite { addr, value } => {
+                    let cur = Self::get(&self.usb, addr);
+                    Self::set(&mut self.usb, addr, (cur & 0xFF00) | value as u16);
+                }
+                UsbDwordWrite { addr, value } => {
+                    Self::set(&mut self.usb, addr, value as u16);
+                    Self::set(&mut self.usb, addr + 1, (value >> 16) as u16);
+                }
+                PlaByteSetBits { addr, bits } => {
+                    let cur = Self::get(&self.pla, addr);
+                    let lo = (cur as u8 | bits) as u16;
+                    Self::set(&mut self.pla, addr, (cur & 0xFF00) | lo);
+                }
+                PlaByteClrBits { addr, bits } => {
+                    let cur = Self::get(&self.pla, addr);
+                    let lo = (cur as u8 & !bits) as u16;
+                    Self::set(&mut self.pla, addr, (cur & 0xFF00) | lo);
+                }
+                PlaByteWrite { addr, value } => {
+                    let cur = Self::get(&self.pla, addr);
+                    Self::set(&mut self.pla, addr, (cur & 0xFF00) | value as u16);
+                }
+                MdioClrBits { reg, bits } => {
+                    let addr = OCP_BASE_MII + reg * 2;
+                    let cur = Self::get(&self.mdio, addr);
+                    Self::set(&mut self.mdio, addr, cur & !bits);
+                }
+                // Polls write nothing and always complete, so the
+                // model treats them as satisfied (as with ALDPS).
+                AutoloadPoll | PhyStatusPollAny | PhyStatusPollLanOn => {}
                 AldpsDisable => {
                     let cur = Self::get(&self.ocp, OCP_POWER_CFG);
                     Self::set(&mut self.ocp, OCP_POWER_CFG, cur & !POWER_CFG_EN_ALDPS);
