@@ -74,7 +74,15 @@ const ETIMEDOUT: i32 = 110;
 /// The platform services [`LiveAhb`] needs. Mappings and carve-outs are
 /// `'static`: the device owns them for the kernel's lifetime (Linux
 /// `devm_ioremap` on a never-unbound platform device).
-pub trait AhbEnv: Send + Sync + 'static {
+// The bring-up task is spawned, so it moves firmware blobs and DMA
+// memory across tasks: the payload types must be `Send` too, not just
+// the loader/allocator. This is what the `QmiFw` impl for `Wlfw`
+// requires (`core.rs`: `Blob: Send`, `Mem: Send`).
+pub trait AhbEnv: Send + Sync + 'static
+where
+    <Self::Fw as FirmwareLoader>::Blob: Send,
+    <Self::Dma as DmaAllocator>::Mem: Send,
+{
     type Regs: RegIo + Send + Sync + 'static;
     type Delay: Delay + Send + Sync + 'static;
     type Smc: SmcConduit + Send + 'static;
