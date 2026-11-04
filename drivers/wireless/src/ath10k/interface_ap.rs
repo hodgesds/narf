@@ -536,8 +536,15 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             if !self.owns_ap(&radio) {
                 return Ok(None);
             }
-            if radio.ap_abandoned() {
+            if radio.ap_abandoned() || radio.ap_failed() {
                 return Err(Error::Failed);
+            }
+            // A staged or still-starting session has no live native rings:
+            // its WMI completions are consumed by the START/STOP path under
+            // the Radio lock. Polling it here would read a transport that
+            // is not yet the AP's and close a healthy netdev.
+            if !radio.ap_running() {
+                return Ok(None);
             }
             let policy = radio.ap_policy().ok_or(Error::Failed)?;
             let mut state = self

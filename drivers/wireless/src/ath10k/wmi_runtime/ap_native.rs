@@ -74,6 +74,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn ap_exists(&self) -> bool {
         self.ap.is_some()
     }
+    pub(in crate::ath10k) fn ap_failed(&self) -> bool {
+        self.ap.as_ref().is_some_and(|ap| ap.failed)
+    }
     pub(in crate::ath10k) fn ap_running(&self) -> bool {
         self.ap
             .as_ref()
