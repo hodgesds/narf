@@ -42,8 +42,8 @@ pub const REG_GPTC: u64 = 0x04080;
 
 /// Number of per-queue packet counters in hardware (datasheet
 /// §8.2.3.23.74/.78; Linux ixgbe_type.h "16 of these"). Queues
-/// >= 16 have no per-queue packet counter: their traffic still
-/// counts in the GPRC/GPTC totals, but no QPRC/QPTC register
+/// 16 and above have no per-queue packet counter: their traffic
+/// still counts in the GPRC/GPTC totals, but no QPRC/QPTC register
 /// exists for them.
 pub const NUM_QUEUE_COUNTERS: usize = 16;
 /// QPRC base: queue n's received-packet counter, RC
@@ -121,9 +121,11 @@ pub fn read_queue_stats(
     num_rx_queues: usize,
     num_tx_queues: usize,
 ) -> QueueStats {
-    let mut stats = QueueStats::default();
-    stats.rx_valid = num_rx_queues.min(NUM_QUEUE_COUNTERS);
-    stats.tx_valid = num_tx_queues.min(NUM_QUEUE_COUNTERS);
+    let mut stats = QueueStats {
+        rx_valid: num_rx_queues.min(NUM_QUEUE_COUNTERS),
+        tx_valid: num_tx_queues.min(NUM_QUEUE_COUNTERS),
+        ..Default::default()
+    };
     for q in 0..stats.rx_valid {
         if let Some(addr) = qprc_addr(q) {
             stats.rx_packets[q] = bank.read32(addr);
