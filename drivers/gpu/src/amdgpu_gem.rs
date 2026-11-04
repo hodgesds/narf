@@ -768,11 +768,8 @@ impl GemObject {
     /// there. A VRAM placement is one reservation, so it is contiguous. The
     /// pin keeps the buffer, and that placement, until it drops.
     pub fn pin_scanout(self: &Arc<Self>) -> Result<ScanoutPin, FsError> {
-        if self.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
-            == 0
-        {
-            return Err(FsError::InvalidData);
-        }
+        // amdgpu_bo_pin checks no allowed domains: a buffer resident in
+        // VRAM is pinned in place whatever it was created for.
         let placement = self.placement.lock();
         let address = match &placement.backing {
             Backing::Vram { _held } => _held.address(),
@@ -1722,18 +1719,21 @@ pub(crate) async fn prepare_scanout_locked(
         }
     }
     for object in &unique {
-        // Preserve amdgpu_bo_pin's domain/userptr/foreign validation before
-        // trying to move it; these objects cannot become display buffers.
-        if object.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
-            == 0
-        {
-            return Err(FsError::InvalidData);
-        }
+        // amdgpu_bo_pin's userptr refusal; it checks no allowed domains: a
+        // buffer already in VRAM is pinned where it is.
         if object.is_userptr() {
             return Err(FsError::OperationNotPermitted);
         }
         if !object.system() || object.pinned() {
             continue;
+        }
+        // LINUX-GAP: amdgpu_bo_pin(VRAM) also moves a buffer whose allowed
+        // domains exclude VRAM; NARF's relocation honours them, so such a
+        // buffer outside VRAM is refused as before.
+        if object.allowed_domains.load(Ordering::Acquire) & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
+            == 0
+        {
+            return Err(FsError::InvalidData);
         }
         match crate::amdgpu_vm::relocate(&gate, object, true).await {
             Ok(()) => {}

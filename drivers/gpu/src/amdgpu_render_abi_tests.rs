@@ -1167,9 +1167,16 @@ fn scanout_pin_holds_vram_placement_until_unpinned() -> TestResult {
     drop(preparation);
     assert!(!both.system() && pin.address() >= 0x8_0000_0000);
     drop(pin);
-    // One VRAM is not allowed for is refused.
+    // One VRAM is not allowed for sits in system memory: the pin (which
+    // checks no allowed domains, as amdgpu_bo_pin) finds it outside VRAM,
+    // and preparation cannot move it there (LINUX-GAP: amdgpu_bo_pin would).
     let system_only = state.get(create(&state, 4096, gtt)).unwrap();
-    assert_eq!(system_only.pin_scanout().err(), Some(FsError::InvalidData));
+    assert_eq!(system_only.pin_scanout().err(), Some(FsError::OutOfMemory));
+    assert_eq!(
+        narf_scheduler::block_on_spin(prepare_scanout(CARD, alloc::vec![system_only.clone()]))
+            .err(),
+        Some(FsError::InvalidData)
+    );
     // Unpinned, evict_all moves them all again.
     let (touched, result) = narf_scheduler::block_on_spin(async {
         let gate = lock_placement(CARD).await;
