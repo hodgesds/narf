@@ -21,19 +21,18 @@
 // in file order. The header's `#define` of
 // `ar9485_1_1_mac_postamble` onto
 // `ar9330_1p1_initvals.h::ar9331_1p1_mac_postamble` is transcribed from
-// that array; the `#define` of `ar9485_modes_lowest_ob_db_tx_gain_1_1`
-// onto `ar9485Modes_low_ob_db_tx_gain_1_1` is an alias of that in-file
-// constant, and the Japan 2484 CCK FIR `#define` is an alias of the
-// `super::initvals` 2p2 table. `ar9003_hw.c::ar9003_hw_init_mode_regs`
+// that array; the `#define`s of `ar9485_modes_lowest_ob_db_tx_gain_1_1`
+// onto `ar9485Modes_low_ob_db_tx_gain_1_1` and of the Japan 2484 CCK FIR
+// onto the `super::initvals` 2p2 table are intentionally NOT separate
+// constants: selection uses the target constants directly, so the aliases
+// would be dead code (dropped 2026-11-04, same omission rule as the
+// AR9565 fix). `ar9003_hw.c::ar9003_hw_init_mode_regs`
 // selects this 1.1 set for `AR_SREV_9485_11_OR_LATER` (macVersion 0x240,
 // macRev >= 1); no 1.0 tables exist in the Linux tree. Five-column modes
 // tables are `[addr, 5G_HT20, 5G_HT40, 2G_HT40, 2G_HT20]`.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::initvals::*;
-
-/// Linux `ar9485_initvals.h::ar9485_modes_lowest_ob_db_tx_gain_1_1` (`#define` of `ar9485Modes_low_ob_db_tx_gain_1_1`).
-pub const AR9485_MODES_LOWEST_OB_DB_TX_GAIN_1_1: &[[u32; 5]] = AR9485MODES_LOW_OB_DB_TX_GAIN_1_1;
 
 /// Linux `ar9485_initvals.h::ar9485_1_1_mac_postamble` (transcribed from `ar9330_1p1_initvals.h::ar9331_1p1_mac_postamble`, the `#define` target).
 pub const AR9485_1_1_MAC_POSTAMBLE: &[[u32; 5]] = &[
@@ -46,10 +45,6 @@ pub const AR9485_1_1_MAC_POSTAMBLE: &[[u32; 5]] = &[
     [0x000081d0, 0x00003210, 0x00003210, 0x0000320a, 0x0000320a],
     [0x00008318, 0x00003e80, 0x00007d00, 0x00006880, 0x00003440],
 ];
-
-/// Linux `ar9485_initvals.h::ar9485_1_1_baseband_core_txfir_coeff_japan_2484` (`#define` of `ar9300_2p2_baseband_core_txfir_coeff_japan_2484`).
-pub const AR9485_1_1_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484: &[[u32; 2]] =
-    AR9300_2P2_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484;
 
 /// Linux `ar9485_initvals.h::ar9485Common_wo_xlna_rx_gain_1_1`.
 pub const AR9485COMMON_WO_XLNA_RX_GAIN_1_1: &[[u32; 2]] = &[
@@ -1249,6 +1244,13 @@ pub const AR9485_1_1_PCIE_PHY_CLKREQ_DISABLE_L1: &[[u32; 2]] = &[
 ];
 
 /// Linux `ar9485_initvals.h::ar9485_1_1_pll_on_cdr_on_clkreq_disable_L1`.
+///
+/// Kept intentionally: Linux gates this SerDes table on `pll_pwrsave`,
+/// which is not modeled here (TSV remainder), while `Tables::ar9485`
+/// programs the `pcie_phy_clkreq_disable_L1` table in both slots. The
+/// allow exists so the transcribed table survives until the pll_pwrsave
+/// path lands; deleting it would lose data, not an alias.
+#[allow(dead_code)]
 pub const AR9485_1_1_PLL_ON_CDR_ON_CLKREQ_DISABLE_L1: &[[u32; 2]] = &[
     [0x00018c00, 0x1801265e],
     [0x00018c04, 0x000801d8],
