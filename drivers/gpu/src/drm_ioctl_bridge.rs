@@ -667,7 +667,7 @@ impl VirtGpuRenderState {
         if self.find(handle).is_some() {
             return Err(FsError::AlreadyExists);
         }
-        let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::InvalidData)?;
+        let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(invalid_at(line!()))?;
         self.ensure_context(dev)?;
         dev.attach_virgl_resource(self.ctx_id, resource.resource_id)
             .map_err(map_gpu_transport_error)?;
@@ -856,7 +856,7 @@ fn map_gpu_transport_error(error: narf_drivers_virtio::pci::VirtioPciError) -> F
     match error {
         narf_drivers_virtio::pci::VirtioPciError::CompletionTimeout => FsError::Busy,
         narf_drivers_virtio::pci::VirtioPciError::OutOfMemory => FsError::OutOfMemory,
-        _ => FsError::InvalidData,
+        _ => invalid_at(line!()),
     }
 }
 
@@ -901,16 +901,16 @@ pub(crate) fn read_exec_syncobjs(
         return Ok(Vec::new());
     }
     if count > MAX_SYNCOBJS || base == 0 || stride == 0 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let copy_len = (stride as usize).min(entry_size);
     let mut deps = Vec::with_capacity(count as usize);
     for index in 0..count {
         let offset = u64::from(index)
             .checked_mul(u64::from(stride))
-            .ok_or(FsError::InvalidData)?;
-        let address = base.checked_add(offset).ok_or(FsError::InvalidData)?;
-        let address = usize::try_from(address).map_err(|_| FsError::InvalidData)?;
+            .ok_or(invalid_at(line!()))?;
+        let address = base.checked_add(offset).ok_or(invalid_at(line!()))?;
+        let address = usize::try_from(address).map_err(|_| invalid_at(line!()))?;
         // Linux zero-fills the part omitted by a short extensible stride.
         let mut wire = [0u8; 16];
         // SAFETY: the user address and bounded byte count come from the UAPI;
@@ -924,7 +924,7 @@ pub(crate) fn read_exec_syncobjs(
         // syncobj implementation. Output flags must be zero; input supports
         // only RESET, exactly like virtgpu_parse_{deps,post_deps}.
         if point != 0 || (output && flags != 0) || (!output && flags & !SYNCOBJ_RESET != 0) {
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
         deps.push(ExecSyncobjDep {
             handle,
@@ -956,14 +956,14 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
     const BLOB_FLAG_USE_MASK: u32 =
         BLOB_FLAG_USE_MAPPABLE | BLOB_FLAG_USE_SHAREABLE | BLOB_FLAG_USE_CROSS_DEVICE;
 
-    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::InvalidData)?;
+    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(invalid_at(line!()))?;
     if !dev.resource_blob_enabled()
         || req.size == 0
         || req.blob_flags & !BLOB_FLAG_USE_MASK != 0
         // RESOURCE_ASSIGN_UUID is not implemented or advertised by NARF.
         || req.blob_flags & BLOB_FLAG_USE_CROSS_DEVICE != 0
     {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let host3d_blob = matches!(req.blob_mem, BLOB_MEM_HOST3D | BLOB_MEM_HOST3D_GUEST);
     if !matches!(
@@ -973,7 +973,7 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
         || (!host3d_blob && (req.blob_id != 0 || req.cmd_size != 0))
         || (host3d_blob && req.cmd_size % 4 != 0)
     {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     // Linux creates a context only when VirGL is active. Pure guest blobs do
     // not need one; HOST3D variants were feature-checked above.
@@ -1015,7 +1015,7 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
                 req.size,
                 &entries,
             )
-            .map_err(|_| FsError::InvalidData)?;
+            .map_err(|_| invalid_at(line!()))?;
             state.insert_guest_blob(
                 handle,
                 resource_id,
@@ -1038,21 +1038,21 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
                 req.blob_id,
                 req.size,
             )
-            .map_err(|_| FsError::InvalidData)?;
+            .map_err(|_| invalid_at(line!()))?;
             if req.blob_flags & BLOB_FLAG_USE_MAPPABLE != 0 {
-                let base = dev.host_visible_base().ok_or(FsError::InvalidData)?;
+                let base = dev.host_visible_base().ok_or(invalid_at(line!()))?;
                 let offset = dev
                     .alloc_host_visible(req.size)
                     .ok_or(FsError::OutOfMemory)?;
                 dev.map_blob(resource_id, offset)
-                    .map_err(|_| FsError::InvalidData)?;
+                    .map_err(|_| invalid_at(line!()))?;
                 state.insert_host_visible(handle, resource_id, base, offset, req.size, attach);
             } else {
                 state.insert_host_only(handle, resource_id, req.size, attach);
             }
         }
 
-        _ => return Err(FsError::InvalidData),
+        _ => return Err(invalid_at(line!())),
     }
     if attach {
         if let Err(error) = dev.attach_virgl_resource(state.ctx_id, resource_id) {
@@ -1090,7 +1090,7 @@ fn handle_transfer_3d(
     if resource.is_guest_only_blob()
         || (!resource.host3d_blob && (req.stride != 0 || req.layer_stride != 0))
     {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let dev = dev
         .filter(|d| d.virgl_enabled())
@@ -1320,7 +1320,7 @@ fn register_card_virtgpu_resource(
         (req.bo_handle, false)
     };
     let resource = state.find(old_handle).ok_or(FsError::NotFound)?;
-    let mode_state = crate::drm_registry::mode_state(card_index).ok_or(FsError::InvalidData)?;
+    let mode_state = crate::drm_registry::mode_state(card_index).ok_or(invalid_at(line!()))?;
     let handle = {
         let card = mode_state.lock();
         if card.gem.lookup(old_handle).is_none() {
@@ -1420,7 +1420,7 @@ fn dispatch_virtgpu_render_inner(
                 8 => u64::from(ctx_ok),
                 // Linux `virtio_gpu_getparam_ioctl` returns -EINVAL for any
                 // param it does not recognise — not a silent 0.
-                _ => return Err(FsError::InvalidData),
+                _ => return Err(invalid_at(line!())),
             };
             // Linux `virtio_gpu_getparam_ioctl` treats the struct's `value`
             // field as a USER POINTER and writes the result there as an int:
@@ -1439,9 +1439,9 @@ fn dispatch_virtgpu_render_inner(
         }
         DRM_IOCTL_VIRTGPU_CONTEXT_INIT => {
             let req: DrmVirtGpuContextInitUapi = read_uapi(arg)?;
-            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::InvalidData)?;
+            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(invalid_at(line!()))?;
             if !dev.context_init_enabled() || !dev.virgl_enabled() || req.num_params > 4 {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             if state.context_ready.load(Ordering::Acquire) {
                 return Err(FsError::AlreadyExists);
@@ -1468,25 +1468,25 @@ fn dispatch_virtgpu_render_inner(
                                 || dev.capsets().iter().all(|c| c.capset_id != v as u32)
                                 || capset != 0
                             {
-                                return Err(FsError::InvalidData);
+                                return Err(invalid_at(line!()));
                             }
                             capset = v as u32;
                         }
                         VIRTGPU_CONTEXT_PARAM_NUM_RINGS => {
                             if num_rings != 0 || v > 64 {
-                                return Err(FsError::InvalidData);
+                                return Err(invalid_at(line!()));
                             }
                             num_rings = v as u32;
                         }
                         VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK => {
                             if ring_mask != 0 {
-                                return Err(FsError::InvalidData);
+                                return Err(invalid_at(line!()));
                             }
                             ring_mask = v;
                         }
                         VIRTGPU_CONTEXT_PARAM_DEBUG_NAME => {
                             if explicit_debug_name {
-                                return Err(FsError::InvalidData);
+                                return Err(invalid_at(line!()));
                             }
                             if v == 0 {
                                 return Err(FsError::BadAddress);
@@ -1496,7 +1496,7 @@ fn dispatch_virtgpu_render_inner(
                             // the Linux-visible contract.
                             explicit_debug_name = true;
                         }
-                        _ => return Err(FsError::InvalidData),
+                        _ => return Err(invalid_at(line!())),
                     }
                 }
             }
@@ -1506,7 +1506,7 @@ fn dispatch_virtgpu_render_inner(
                 count => (1u64 << count) - 1,
             };
             if ring_mask & !valid_ring_mask != 0 {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             // Record the capset for this open and create its context now.
             state.context_capset.store(capset, Ordering::Release);
@@ -1551,7 +1551,7 @@ fn dispatch_virtgpu_render_inner(
                 },
                 &entries,
             )
-            .map_err(|_| FsError::InvalidData)?;
+            .map_err(|_| invalid_at(line!()))?;
             let handle = state.allocate_handle();
             state.insert_backing(handle, resource_id, backing);
             req.bo_handle = handle;
@@ -1583,7 +1583,7 @@ fn dispatch_virtgpu_render_inner(
             // Linux rejects a zero transfer size with EINVAL. A null or bad
             // destination instead fails copy_to_user with EFAULT below.
             if req.size == 0 {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             let dev =
                 narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::NotImplemented)?;
@@ -1607,7 +1607,7 @@ fn dispatch_virtgpu_render_inner(
                         && capset.capset_max_version >= req.cap_set_ver
                         && capset.capset_max_size != 0
                 })
-                .ok_or(FsError::InvalidData)?;
+                .ok_or(invalid_at(line!()))?;
             let caps = dev
                 .virgl_capset(req.cap_set_id, req.cap_set_ver)
                 .map_err(map_gpu_transport_error)?;
@@ -1636,7 +1636,7 @@ fn dispatch_virtgpu_render_inner(
             // FENCE_FD_OUT descriptor before dispatch. Binary syncobj arrays
             // are handled below; non-zero timeline points remain unsupported.
             if req.flags & !EXECBUF_KNOWN != 0 {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             if req.size as usize > VIRTGPU_EXECBUFFER_MAX_BYTES || req.num_bo_handles > 256 {
                 return Err(FsError::OutOfMemory);
@@ -1644,7 +1644,7 @@ fn dispatch_virtgpu_render_inner(
             let ring_idx = if req.flags & EXECBUF_RING_IDX != 0 {
                 let num_rings = state.context_num_rings.load(Ordering::Acquire);
                 if num_rings == 0 || req.ring_idx >= num_rings {
-                    return Err(FsError::InvalidData);
+                    return Err(invalid_at(line!()));
                 }
                 Some(req.ring_idx as u8)
             } else {
@@ -1669,16 +1669,16 @@ fn dispatch_virtgpu_render_inner(
             let input_fences: Vec<Arc<dyn crate::drm::syncobj::DmaFence>> = {
                 let table = state.syncobjs.lock();
                 for dep in &out_syncobjs {
-                    table.get(dep.handle).map_err(|_| FsError::InvalidData)?;
+                    table.get(dep.handle).map_err(|_| invalid_at(line!()))?;
                 }
                 in_syncobjs
                     .iter()
                     .map(|dep| {
                         table
                             .get(dep.handle)
-                            .map_err(|_| FsError::InvalidData)?
+                            .map_err(|_| invalid_at(line!()))?
                             .fence()
-                            .ok_or(FsError::InvalidData)
+                            .ok_or(invalid_at(line!()))
                     })
                     .collect::<Result<Vec<_>, _>>()?
             };
@@ -1704,7 +1704,7 @@ fn dispatch_virtgpu_render_inner(
                     unsafe { copy_in(req.bo_handles as usize, req.num_bo_handles as usize * 4)? };
                 for (index, chunk) in bytes.chunks_exact(4).enumerate() {
                     let handle =
-                        u32::from_le_bytes(chunk.try_into().map_err(|_| FsError::InvalidData)?);
+                        u32::from_le_bytes(chunk.try_into().map_err(|_| invalid_at(line!()))?);
                     referenced[index] = Some(state.find(handle).ok_or(FsError::NotFound)?);
                 }
             }
@@ -1782,7 +1782,7 @@ fn dispatch_virtgpu_render_inner(
             // validates the complete fixed-size range and SMAP-brackets it.
             let bytes = unsafe { copy_in(arg, 8)? };
             let handle =
-                u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| FsError::InvalidData)?);
+                u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| invalid_at(line!()))?);
             // The primary node also owns dumb GEM handles, which live in the
             // generic card table rather than this VirtGPU per-open table.
             // Let the caller fall through to that path when the handle is not
@@ -1834,12 +1834,12 @@ pub fn dispatch_virtgpu_mmap(
     len: usize,
 ) -> Result<Vec<u64>, FsError> {
     if offset & 0xfff != 0 || len == 0 || len & 0xfff != 0 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let handle = (offset >> 12) as u32;
-    let resource = state.find(handle).ok_or(FsError::InvalidData)?;
+    let resource = state.find(handle).ok_or(invalid_at(line!()))?;
     if !resource.is_cpu_mappable() || len > resource.len() {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     // Guest-backed resources map their coherent DMA pages; host-visible blobs
     // map a slice of the host-visible PCI window. `page_phys` hides the split.
@@ -1867,7 +1867,7 @@ pub(crate) unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError
 }
 unsafe fn copy_in_bounded(uptr: usize, len: usize, limit: usize) -> Result<Vec<u8>, FsError> {
     if len > limit {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     if !access_ok(uptr as u64, len) {
         return Err(FsError::BadAddress);
@@ -2033,7 +2033,7 @@ fn map_err(e: DrmIoctlError) -> FsError {
     match e {
         DrmIoctlError::UnknownCmd | DrmIoctlError::BadSize => FsError::Unsupported,
         DrmIoctlError::PermissionDenied(_) => FsError::PermissionDenied,
-        DrmIoctlError::UnknownConnector | DrmIoctlError::Card(_) => FsError::InvalidData,
+        DrmIoctlError::UnknownConnector | DrmIoctlError::Card(_) => invalid_at(line!()),
     }
 }
 
@@ -2192,7 +2192,7 @@ pub(crate) fn dispatch_card_for_file(
             }
             match mode_state.lock().drop_master(open_id) {
                 Ok(()) => Ok(0),
-                Err(_) => Err(FsError::InvalidData), // → EINVAL
+                Err(_) => Err(invalid_at(line!())), // → EINVAL
             }
         }
         // GET_MAGIC (_IOR) — this open's magic token (`drm_getmagic`).
@@ -2231,7 +2231,7 @@ pub(crate) fn dispatch_card_for_file(
             if mode_state.lock().auth_magic(magic) {
                 Ok(0)
             } else {
-                Err(FsError::InvalidData) // → EINVAL
+                Err(invalid_at(line!())) // → EINVAL
             }
         }
         // SET_CLIENT_CAP — opt into UAPI behaviours. We accept
@@ -2662,7 +2662,7 @@ fn handle_getencoder(
     let mut out = [0u8; 20];
     {
         let card = mode_state.lock();
-        let enc = card.encoder(encoder_id).map_err(|_| FsError::InvalidData)?;
+        let enc = card.encoder(encoder_id).map_err(|_| invalid_at(line!()))?;
         out[0..4].copy_from_slice(&enc.id.to_le_bytes());
         out[4..8].copy_from_slice(&(enc.encoder_type as u32).to_le_bytes());
         out[8..12].copy_from_slice(&enc.crtc_id.unwrap_or(0).to_le_bytes());
@@ -2738,18 +2738,16 @@ fn wait_vblank_begin(
     if kind & VBLANK_SIGNAL != 0
         || kind & !(VBLANK_RELATIVE | VBLANK_FLAGS_MASK | VBLANK_HIGH_CRTC_MASK) != 0
     {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let flags = kind & VBLANK_FLAGS_MASK;
     let index = match kind & VBLANK_HIGH_CRTC_MASK {
         0 => usize::from(flags & VBLANK_SECONDARY != 0),
         high => (high >> 1) as usize,
     };
-    let crtc_id = card.crtcs.get(index).ok_or(FsError::InvalidData)?.id;
+    let crtc_id = card.crtcs.get(index).ok_or(invalid_at(line!()))?.id;
     // drm_vblank_get fails on a CRTC whose vblank is off.
-    let t = card
-        .vblank_time(crtc_id)
-        .map_err(|_| FsError::InvalidData)?;
+    let t = card.vblank_time(crtc_id).map_err(|_| invalid_at(line!()))?;
     let mut target = if kind & VBLANK_RELATIVE != 0 {
         t.count.wrapping_add(u64::from(sequence))
     } else {
@@ -2759,7 +2757,7 @@ fn wait_vblank_begin(
         target = t.count + 1;
     }
     if flags & VBLANK_EVENT != 0 {
-        let mut queue = events.ok_or(FsError::InvalidData)?.lock();
+        let mut queue = events.ok_or(invalid_at(line!()))?.lock();
         queue
             .ensure_flip_event_space(1)
             .map_err(|_| FsError::OutOfMemory)?;
@@ -2839,9 +2837,7 @@ fn handle_crtc_get_sequence(
         return Err(FsError::Unsupported);
     }
     let active = card.crtc(crtc_id).map_err(|_| FsError::NotFound)?.enabled;
-    let t = card
-        .vblank_time(crtc_id)
-        .map_err(|_| FsError::InvalidData)?;
+    let t = card.vblank_time(crtc_id).map_err(|_| invalid_at(line!()))?;
     drop(card);
     let mut out = [0u8; 20];
     out[0..4].copy_from_slice(&u32::from(active).to_le_bytes());
@@ -2876,11 +2872,9 @@ fn handle_crtc_queue_sequence(
     }
     card.crtc(crtc_id).map_err(|_| FsError::NotFound)?;
     if flags & !(RELATIVE | NEXT_ON_MISS) != 0 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
-    let t = card
-        .vblank_time(crtc_id)
-        .map_err(|_| FsError::InvalidData)?;
+    let t = card.vblank_time(crtc_id).map_err(|_| invalid_at(line!()))?;
     let mut target = if flags & RELATIVE != 0 {
         sequence.wrapping_add(t.count)
     } else {
@@ -2889,7 +2883,7 @@ fn handle_crtc_queue_sequence(
     if flags & NEXT_ON_MISS != 0 && crate::drm::card::vblank_passed(t.count, target) {
         target = t.count + 1;
     }
-    let mut queue = events.ok_or(FsError::InvalidData)?.lock();
+    let mut queue = events.ok_or(invalid_at(line!()))?.lock();
     queue
         .ensure_flip_event_space(1)
         .map_err(|_| FsError::OutOfMemory)?;
@@ -2922,7 +2916,7 @@ fn handle_getcrtc(
     let mut out = in_bytes;
     {
         let card = mode_state.lock();
-        let crtc = card.crtc(crtc_id).map_err(|_| FsError::InvalidData)?;
+        let crtc = card.crtc(crtc_id).map_err(|_| invalid_at(line!()))?;
         out[12..16].copy_from_slice(&crtc.id.to_le_bytes());
         out[16..20].copy_from_slice(&crtc.primary_fb.unwrap_or(0).to_le_bytes()); // fb_id
         out[20..24].copy_from_slice(&crtc.x.to_le_bytes());
@@ -2988,7 +2982,7 @@ fn handle_set_client_cap(
         | DRM_CLIENT_CAP_ASPECT_RATIO => {
             // Boolean opt-in: Linux rejects any value > 1.
             if value > 1 {
-                Err(FsError::InvalidData)
+                Err(invalid_at(line!()))
             } else {
                 Ok(0)
             }
@@ -2999,7 +2993,7 @@ fn handle_set_client_cap(
                 return Err(FsError::Unsupported);
             }
             if value > 2 {
-                Err(FsError::InvalidData)
+                Err(invalid_at(line!()))
             } else {
                 client_caps.set_atomic(value != 0);
                 Ok(0)
@@ -3007,10 +3001,10 @@ fn handle_set_client_cap(
         }
         DRM_CLIENT_CAP_WRITEBACK_CONNECTORS | DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE => {
             if !client_caps.atomic() {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             if value > 1 {
-                Err(FsError::InvalidData)
+                Err(invalid_at(line!()))
             } else {
                 Ok(0)
             }
@@ -3023,11 +3017,11 @@ fn handle_set_client_cap(
                 return Err(FsError::Unsupported);
             }
             if !client_caps.atomic() || value > 1 {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             Ok(0)
         }
-        _ => Err(FsError::InvalidData),
+        _ => Err(invalid_at(line!())),
     }
 }
 
@@ -3279,7 +3273,7 @@ fn handle_getplane(
                     card.overlay_formats.unwrap_or(&[]),
                     (p.crtc_id.unwrap_or(0), p.fb_id.unwrap_or(0)),
                 ),
-                None => return Err(FsError::InvalidData),
+                None => return Err(invalid_at(line!())),
             },
         }
     };
@@ -3540,7 +3534,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
             DRM_MODE_PROP_ENUM,
             &crate::drm_native_planes::COLOR_RANGE_ENUMS,
         ),
-        _ => return Err(FsError::InvalidData),
+        _ => return Err(invalid_at(line!())),
     };
     out[20..24].copy_from_slice(&flags.to_le_bytes());
     out[24..56].fill(0);
@@ -3646,10 +3640,10 @@ fn blob_value(
     if value == 0 {
         return Ok(0);
     }
-    let id = u32::try_from(value).map_err(|_| FsError::InvalidData)?;
-    let data = card.property_blob(id).ok_or(FsError::InvalidData)?;
+    let id = u32::try_from(value).map_err(|_| invalid_at(line!()))?;
+    let data = card.property_blob(id).ok_or(invalid_at(line!()))?;
     if size.is_some_and(|n| data.len() != n) || element.is_some_and(|n| data.len() % n != 0) {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     Ok(id)
 }
@@ -3722,29 +3716,29 @@ fn crtc_color_property(
         return Ok(false);
     }
     if card.crtc_color(crtc).is_none() {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     if prop == CRTC_CTM_PROP_ID {
         change.ctm = Some(blob_value(card, value, Some(CTM_BLOB_SIZE), None)?);
         return Ok(true);
     }
     if card.intel_ctm_supported(crtc) && !card.intel_color(crtc) {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     if prop == CRTC_DEGAMMA_LUT_PROP_ID {
         if !card.intel_color(crtc) {
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
         let id = blob_value(
             card,
             value,
-            Some(card.intel_lut_sizes(crtc).ok_or(FsError::InvalidData)?.1 * COLOR_LUT_ENTRY_SIZE),
+            Some(card.intel_lut_sizes(crtc).ok_or(invalid_at(line!()))?.1 * COLOR_LUT_ENTRY_SIZE),
             None,
         )?;
         #[cfg(feature = "intel")]
         if id != 0 {
             crate::intel_gpu_color::DegammaLut::decode_profile(
-                card.property_blob(id).ok_or(FsError::InvalidData)?,
+                card.property_blob(id).ok_or(invalid_at(line!()))?,
                 card.intel_lut_profile(),
             )?;
         }
@@ -3763,7 +3757,7 @@ fn crtc_color_property(
             entries == GAMMA_LUT_SIZE as usize || entries == crate::drm::card::LEGACY_GAMMA_SIZE
         };
         if !valid {
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
     }
     change.gamma_lut = Some(id);
@@ -3931,22 +3925,22 @@ fn connector_color_property(
     match prop {
         COLOR_FORMAT_PROP_ID => {
             if native.and_then(|n| n.color_format).is_none() {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             change.color_format =
-                Some(crate::drm::card::ColorFormat::from_linux(value).ok_or(FsError::InvalidData)?);
+                Some(crate::drm::card::ColorFormat::from_linux(value).ok_or(invalid_at(line!()))?);
         }
         COLORSPACE_PROP_ID => {
             if native.and_then(|n| n.colorspace).is_none()
                 || !COLORSPACE_ENUMS.iter().any(|&(v, _)| v == value)
             {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             change.colorspace = Some(value as u32);
         }
         HDR_OUTPUT_METADATA_PROP_ID => {
             if native.and_then(|n| n.hdr_output_metadata).is_none() {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             change.hdr_output_metadata = Some(blob_value(
                 card,
@@ -3996,7 +3990,7 @@ fn connector_color_check(
             if let Some(data) = bytes(new) {
                 #[cfg(feature = "amdgpu")]
                 if !crate::amdgpu_native_kms::hdr_metadata_valid(data) {
-                    return Err(FsError::InvalidData);
+                    return Err(invalid_at(line!()));
                 }
                 #[cfg(not(feature = "amdgpu"))]
                 let _ = data;
@@ -4018,7 +4012,7 @@ fn connector_color_check(
         true
     };
     if native_card && !color_supported {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     Ok(modeset)
 }
@@ -4097,7 +4091,7 @@ fn vrr_enabled_value(
     value: u64,
 ) -> Result<bool, FsError> {
     if crtc_vrr_enabled(card, crtc).is_none() || value > 1 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     Ok(value != 0)
 }
@@ -4136,7 +4130,7 @@ fn max_bpc_value(card: &crate::drm::card::Card, connector: u32, value: u64) -> R
         .native_output(connector)
         .is_some_and(|n| n.max_bpc.is_some());
     if !has || !(MAX_BPC_RANGE[0]..=MAX_BPC_RANGE[1]).contains(&value) {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     Ok(value as u8)
 }
@@ -4184,7 +4178,7 @@ fn broadcast_rgb_value(
         .native_output(connector)
         .is_some_and(|n| n.broadcast_rgb.is_some());
     if !has || !BROADCAST_RGB_ENUMS.iter().any(|&(v, _)| v == value) {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     Ok(value as u8)
 }
@@ -4240,7 +4234,7 @@ fn set_property_object(
     match found {
         DRM_MODE_OBJECT_CONNECTOR | DRM_MODE_OBJECT_CRTC | DRM_MODE_OBJECT_PLANE => Ok(found),
         // `!arg_obj->properties`.
-        _ => Err(FsError::InvalidData),
+        _ => Err(invalid_at(line!())),
     }
 }
 
@@ -4287,7 +4281,7 @@ fn handle_set_property(
         }
         // set_property_legacy: a plane has no legacy-settable property.
         if obj_type == DRM_MODE_OBJECT_PLANE {
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
         obj_type
     };
@@ -4305,7 +4299,7 @@ fn handle_set_property(
             return Ok(0);
         }
         if prop_id != CRTC_VRR_ENABLED_PROP_ID {
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
         let value = vrr_enabled_value(&card, obj_id, value)?;
         let _request = apply_vrr_enabled(card_index, &mut card, obj_id, value);
@@ -4329,7 +4323,7 @@ fn handle_set_property(
         // entering/leaving HDR on a driven connector is EINVAL.
         let native = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
         if connector_color_check(&card, native, obj_id, crtc, color)? {
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
         let _request = apply_connector_color(card_index, &mut card, obj_id, color);
         drop(card);
@@ -4350,7 +4344,7 @@ fn handle_set_property(
         return Ok(0);
     }
     if prop_id != BROADCAST_RGB_PROP_ID {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let value = broadcast_rgb_value(&card, obj_id, value)?;
     apply_broadcast_rgb(card_index, &mut card, obj_id, value);
@@ -4430,7 +4424,7 @@ fn handle_gamma(
         } else if size == 0 {
             Ok(0)
         } else {
-            Err(FsError::InvalidData)
+            Err(invalid_at(line!()))
         };
     }
     if set && card.intel_color(crtc_id) {
@@ -4446,11 +4440,11 @@ fn handle_gamma(
         } else if size == 0 {
             Ok(0)
         } else {
-            Err(FsError::InvalidData)
+            Err(invalid_at(line!()))
         };
     };
     if size != crate::drm::card::LEGACY_GAMMA_SIZE {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     if !set {
         let store = color.gamma_store.clone();
@@ -4637,7 +4631,7 @@ fn handle_getpropblob(
         match (card.property_blob(blob_id), native_blob) {
             (Some(data), _) => {
                 if data.len() > reserved_len {
-                    return Err(FsError::InvalidData);
+                    return Err(invalid_at(line!()));
                 }
                 let mut copy = Vec::new();
                 copy.try_reserve_exact(data.len())
@@ -4648,9 +4642,9 @@ fn handle_getpropblob(
             (None, Some(data)) => data,
             (None, None) => {
                 let connector_id =
-                    connector_id_from_edid_blob(blob_id).ok_or(FsError::InvalidData)?;
+                    connector_id_from_edid_blob(blob_id).ok_or(invalid_at(line!()))?;
                 connector_edid(&card, connector_id)
-                    .ok_or(FsError::InvalidData)?
+                    .ok_or(invalid_at(line!()))?
                     .to_vec()
             }
         }
@@ -4759,7 +4753,7 @@ fn handle_obj_getproperties(
                 .into_iter()
                 .find(|(id, _)| *id == obj_id)
             else {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             };
             let crtc = &card.crtcs[crtc_idx as usize];
             let fb = crtc.primary_fb.and_then(|id| card.framebuffer(id).ok());
@@ -4829,7 +4823,7 @@ fn handle_obj_getproperties(
             }
             (props, values)
         } else if obj_type == DRM_MODE_OBJECT_CRTC {
-            let crtc = card.crtc(obj_id).map_err(|_| FsError::InvalidData)?;
+            let crtc = card.crtc(obj_id).map_err(|_| invalid_at(line!()))?;
             let mut props = vec![
                 CRTC_ACTIVE_PROP_ID,
                 CRTC_MODE_ID_PROP_ID,
@@ -4847,7 +4841,7 @@ fn handle_obj_getproperties(
             values.extend(color_values);
             (props, values)
         } else if obj_type == DRM_MODE_OBJECT_CONNECTOR {
-            let connector = card.connector(obj_id).map_err(|_| FsError::InvalidData)?;
+            let connector = card.connector(obj_id).map_err(|_| invalid_at(line!()))?;
             let crtc_id = connector
                 .encoder_id
                 .and_then(|id| card.encoder(id).ok())
@@ -4855,7 +4849,7 @@ fn handle_obj_getproperties(
                 .unwrap_or(0);
             connector_properties(&card, obj_id, crtc_id)
         } else {
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
     };
     if props_ptr != 0 && values_ptr != 0 && user_count as usize >= props.len() {
@@ -4926,18 +4920,18 @@ fn create_property_blob_owned(
     copy: impl FnOnce(u64, usize) -> Result<Vec<u8>, FsError>,
 ) -> Result<(), FsError> {
     if bytes.len() != 16 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let data_ptr = u64::from_le_bytes(bytes[..8].try_into().unwrap());
     let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let limit = property_blob_limit(&mode.lock());
     if len == 0 || len > limit {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let _copy_budget = reserve_property_blob_copy(mode, len)?;
     let data = copy(data_ptr, len)?;
     if data.len() != len {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let result = {
         let mut card = mode.lock();
@@ -5006,7 +5000,7 @@ fn handle_list_lessees(arg: usize, ctx: &DrmFileCtx) -> Result<u64, FsError> {
     // validates the complete userspace range before returning owned bytes.
     let mut bytes = unsafe { copy_in(arg, 16)? };
     if u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != 0 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     bytes[0..4].copy_from_slice(&0u32.to_le_bytes());
     // SAFETY: write back the same validated fixed-size request buffer.
@@ -5037,10 +5031,10 @@ pub(crate) fn wait_atomic_in_fences(arg: u64, context: &dyn IoctlContext) -> Res
     // object. `read_unaligned` matches the byte-array alignment.
     let req = unsafe { core::ptr::read_unaligned(header.as_ptr() as *const DrmModeAtomicUapi) };
     if req.reserved != 0 || req.flags & !VALID_FLAGS != 0 || req.count_objs > 256 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     if req.flags & TEST_ONLY != 0 && req.flags & 0x0001 != 0 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     if req.count_objs == 0 {
         return Ok(());
@@ -5088,14 +5082,14 @@ pub(crate) fn wait_atomic_in_fences(arg: u64, context: &dyn IoctlContext) -> Res
         }
         let fd = value as i64;
         if fd < -1 || fd > i32::MAX as i64 {
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
         let Some(fences) = (fd >= 0)
             .then(|| context.sync_file_fences(fd as i32))
             .flatten()
         else {
             if fd >= 0 {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             continue;
         };
@@ -5129,6 +5123,18 @@ fn atomic_card(card: &crate::drm::card::Card) -> bool {
 /// `AtomicState`, run `core_check` + `core_commit`.
 ///
 /// Linux ref: `drivers/gpu/drm/drm_atomic_uapi.c::drm_mode_atomic_ioctl`.
+/// Source line of the most recent `InvalidData` built in this file, so a
+/// refused atomic request names its check (bring-up diagnostics: the
+/// atomic path has dozens of silent EINVAL returns). Best effort under
+/// concurrent ioctls; the atomic handler resets it per request.
+static LAST_INVALID_LINE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+fn invalid_at(line: u32) -> FsError {
+    LAST_INVALID_LINE.store(line, core::sync::atomic::Ordering::Relaxed);
+    FsError::InvalidData
+}
+
 fn handle_atomic(
     card_index: u32,
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
@@ -5143,6 +5149,7 @@ fn handle_atomic(
     if !ctx.is_master {
         return Err(FsError::PermissionDenied);
     }
+    LAST_INVALID_LINE.store(0, core::sync::atomic::Ordering::Relaxed);
 
     // SAFETY: `arg` is the ioctl argument pointer validated by the syscall
     // trap layer (or kernel-owned on the test path); we request exactly
@@ -5172,7 +5179,7 @@ fn handle_atomic(
         || (req.flags & TEST_ONLY != 0 && req.flags & PAGE_FLIP_EVENT != 0)
         || req.count_objs > 256
     {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     if req.count_objs != 0
         && (req.objs_ptr == 0
@@ -5295,7 +5302,8 @@ fn note_atomic_rejection(
     let mut line = alloc::string::String::new();
     let _ = write!(
         line,
-        "  drm: ATOMIC refused flags={flags:#x} err={error_text}:"
+        "  drm: ATOMIC refused flags={flags:#x} err={error_text} at drm_ioctl_bridge.rs:{}:",
+        LAST_INVALID_LINE.load(core::sync::atomic::Ordering::Relaxed)
     );
     let mut at = 0usize;
     let card = mode_state.lock();
@@ -5414,7 +5422,7 @@ fn atomic_commit(
             let end = prop_index
                 .checked_add(object_prop_count)
                 .filter(|end| *end <= props.len())
-                .ok_or(FsError::InvalidData)?;
+                .ok_or(invalid_at(line!()))?;
             let object_props = &props[prop_index..end];
             let object_values = &values[prop_index..end];
             prop_index = end;
@@ -5459,7 +5467,7 @@ fn atomic_commit(
                         PLANE_IN_FENCE_FD_PROP_ID => {
                             let fd = value as i64;
                             if fd < -1 || fd > i32::MAX as i64 {
-                                return Err(FsError::InvalidData);
+                                return Err(invalid_at(line!()));
                             }
                             plane.in_fence_fd = (fd >= 0).then_some(fd as i32);
                         }
@@ -5467,13 +5475,13 @@ fn atomic_commit(
                         p if crate::drm_native_planes::set_property(
                             &card, &mut plane, p, value,
                         )? => {}
-                        _ => return Err(FsError::InvalidData),
+                        _ => return Err(invalid_at(line!())),
                     }
                 }
                 // dm_check_cursor_fb on SRC_* in 16.16: an enabled cursor
                 // shows its whole framebuffer from 0,0, so no fraction.
                 if fraction && cursor_plane_shown(&card, &plane) {
-                    return Err(FsError::InvalidData);
+                    return Err(invalid_at(line!()));
                 }
                 if let (Some(crtc_ids), Some(crtc_id)) = (event_crtc_ids.as_mut(), plane.crtc_id) {
                     if !crtc_ids.contains(&crtc_id) {
@@ -5536,11 +5544,11 @@ fn atomic_commit(
                             // Linux set_property: -1 clears, other negatives
                             // are EINVAL, and the value must fit an s32.
                             if fd < -1 || fd > i32::MAX as i64 {
-                                return Err(FsError::InvalidData);
+                                return Err(invalid_at(line!()));
                             }
                             plane.in_fence_fd = (fd >= 0).then_some(fd as i32);
                         }
-                        _ => return Err(FsError::InvalidData),
+                        _ => return Err(invalid_at(line!())),
                     }
                 }
                 if let (Some(crtc_ids), Some(crtc_id)) = (event_crtc_ids.as_mut(), plane.crtc_id) {
@@ -5565,7 +5573,7 @@ fn atomic_commit(
                         p if crtc_color_property(&card, object_id, p, value, &mut color)? => {}
                         CRTC_ACTIVE_PROP_ID => {
                             if value > 1 {
-                                return Err(FsError::InvalidData);
+                                return Err(invalid_at(line!()));
                             }
                             crtc_state.enable = value != 0;
                             crtc_state.active = value != 0;
@@ -5577,11 +5585,11 @@ fn atomic_commit(
                                 let mode = card
                                     .property_blob(value as u32)
                                     .filter(|blob| blob.len() == 68)
-                                    .ok_or(FsError::InvalidData)?;
+                                    .ok_or(invalid_at(line!()))?;
                                 // A native display runs only its published
                                 // timing; any other is refused at check time.
                                 if !card.accepts_mode_blob(mode) {
-                                    return Err(FsError::InvalidData);
+                                    return Err(invalid_at(line!()));
                                 }
                                 if let Some(wire) =
                                     crate::drm::ioctl::DrmModeModeInfo::from_bytes(mode)
@@ -5595,7 +5603,7 @@ fn atomic_commit(
                                         && crate::amdgpu_native_kms::crtc_display(object_id)
                                             .is_none()
                                     {
-                                        return Err(FsError::InvalidData);
+                                        return Err(invalid_at(line!()));
                                     }
                                     native_modes.retain(|(id, _)| *id != object_id);
                                     native_modes.push((object_id, wire));
@@ -5620,7 +5628,7 @@ fn atomic_commit(
                         // Not a modeset: amdgpu_dm reprograms DRR in place.
                         CRTC_VRR_ENABLED_PROP_ID => vrr_enabled
                             .push((object_id, vrr_enabled_value(&card, object_id, value)?)),
-                        _ => return Err(FsError::InvalidData),
+                        _ => return Err(invalid_at(line!())),
                     }
                 }
                 // Not a modeset: amdgpu_dm updates the stream's transfer
@@ -5642,9 +5650,7 @@ fn atomic_commit(
                 }
                 state.crtcs.push(crtc_state);
             } else if card.connector(object_id).is_ok() {
-                let connector = card
-                    .connector(object_id)
-                    .map_err(|_| FsError::InvalidData)?;
+                let connector = card.connector(object_id).map_err(|_| invalid_at(line!()))?;
                 let mut connector_state = crate::drm::atomic::ConnectorState {
                     id: object_id,
                     crtc_id: connector
@@ -5672,12 +5678,12 @@ fn atomic_commit(
                             let bpc = max_bpc_value(&card, object_id, value)?;
                             // A modeset of the CRTC the connector drove.
                             if max_bpc_modeset(&card, object_id, bpc) && !state.allow_modeset {
-                                return Err(FsError::InvalidData);
+                                return Err(invalid_at(line!()));
                             }
                             max_bpcs.retain(|(id, _)| *id != object_id);
                             max_bpcs.push((object_id, bpc));
                         }
-                        _ => return Err(FsError::InvalidData),
+                        _ => return Err(invalid_at(line!())),
                     }
                 }
                 // amdgpu_dm_connector_atomic_check against the CRTC the
@@ -5693,7 +5699,7 @@ fn atomic_commit(
                         color,
                     )? && !state.allow_modeset
                     {
-                        return Err(FsError::InvalidData);
+                        return Err(invalid_at(line!()));
                     }
                     connector_colors.retain(|(id, _)| *id != object_id);
                     connector_colors.push((object_id, color));
@@ -5707,7 +5713,7 @@ fn atomic_commit(
                 }
                 state.connectors.push(connector_state);
             } else {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
         }
 
@@ -5732,7 +5738,7 @@ fn atomic_commit(
                     );
                 }
             }
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
         check_native_atomic(&card, &state)?;
         // amdgpu_dm's plane checks on a card with its native planes, and
@@ -5765,7 +5771,7 @@ fn atomic_commit(
                 if !crate::amdgpu_native_kms::crtc_display(*crtc_id)
                     .is_some_and(|d| crate::amdgpu_native_kms::display_offers(d, connector, wire))
                 {
-                    return Err(FsError::InvalidData);
+                    return Err(invalid_at(line!()));
                 }
             }
             // DML admission of each touched display's planes (with its
@@ -5796,7 +5802,7 @@ fn atomic_commit(
                     dp.primary_format,
                     &dp.setup,
                 ) {
-                    return Err(FsError::InvalidData);
+                    return Err(invalid_at(line!()));
                 }
             }
             for plane in &state.planes {
@@ -5828,7 +5834,7 @@ fn atomic_commit(
                     wire,
                     format as u32,
                 ) {
-                    return Err(FsError::InvalidData);
+                    return Err(invalid_at(line!()));
                 }
             }
         }
@@ -5905,7 +5911,7 @@ fn atomic_commit(
                     // committed primary/overlays, including pending DRM state.
                     let mut snapshot = state.clone();
                     if !snapshot.crtcs.iter().any(|c| c.id == crtc) {
-                        let c = card.crtc(crtc).map_err(|_| FsError::InvalidData)?;
+                        let c = card.crtc(crtc).map_err(|_| invalid_at(line!()))?;
                         snapshot.crtcs.push(crate::drm::atomic::CrtcState {
                             id: crtc,
                             enable: c.enabled,
@@ -5955,7 +5961,7 @@ fn atomic_commit(
                 });
             }
             if !crate::amdgpu_native_kms::output_formats_supported(&outputs, &routes) {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
         }
 
@@ -5964,11 +5970,11 @@ fn atomic_commit(
         // exhausting this drm_file's 4 KiB event budget is ENOMEM and must not
         // mutate display state.
         let mut event_queue = if req.flags & PAGE_FLIP_EVENT != 0 {
-            let crtc_ids = event_crtc_ids.as_ref().ok_or(FsError::InvalidData)?;
+            let crtc_ids = event_crtc_ids.as_ref().ok_or(invalid_at(line!()))?;
             if crtc_ids.is_empty() {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
-            let queue = events.ok_or(FsError::InvalidData)?.lock();
+            let queue = events.ok_or(invalid_at(line!()))?.lock();
             queue
                 .ensure_flip_event_space(crtc_ids.len())
                 .map_err(|_| FsError::OutOfMemory)?;
@@ -5997,7 +6003,7 @@ fn atomic_commit(
                     narf_console::Writer,
                     "  drm: ATOMIC commit failed: {error:?}"
                 );
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             #[cfg(feature = "amdgpu")]
             crate::drm_native_planes::commit(&mut card, &state);
@@ -6417,7 +6423,7 @@ fn cursor_universal_native(
         return Err(FsError::PermissionDenied);
     }
     if req.flags == 0 || req.flags & !(DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE) != 0 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let requests = {
         let mut card = mode_state.lock();
@@ -6426,7 +6432,7 @@ fn cursor_universal_native(
         }
         card.crtc(req.crtc_id).map_err(|_| FsError::NotFound)?;
         let cursor =
-            *crate::drm_native_planes::cursor_of(&card, req.crtc_id).ok_or(FsError::InvalidData)?;
+            *crate::drm_native_planes::cursor_of(&card, req.crtc_id).ok_or(invalid_at(line!()))?;
         let mut wrapped = None;
         let fb_id = if req.flags & DRM_MODE_CURSOR_BO == 0 {
             cursor.fb_id
@@ -6450,7 +6456,7 @@ fn cursor_universal_native(
             }
             .map_err(|e| match e {
                 crate::drm::card::CardError::BadGemHandle => FsError::NotFound,
-                _ => FsError::InvalidData,
+                _ => invalid_at(line!()),
             })?;
             wrapped = Some(id);
             Some(id)
@@ -6539,7 +6545,7 @@ fn commit_cursor_plane(
     state.planes.push(plane);
     let policy = crate::drm::atomic::AtomicCheckPolicy::default();
     if state.core_check(card, &policy).is_err() {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     crate::drm_native_planes::check(card, &state, |c| card.crtc(c).ok().and_then(|c| c.mode))?;
     if validate_only {
@@ -6556,7 +6562,7 @@ fn commit_cursor_plane(
     )?;
     let cursors = crate::drm_native_planes::cursor_changes(card, &state);
     if state.core_commit(card).is_err() {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     crate::drm_native_planes::commit(card, &state);
     Ok(native_cursor_requests(
@@ -6640,7 +6646,7 @@ fn handle_create_dumb(
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeCreateDumbUapi) };
 
     if req.width == 0 || req.height == 0 || req.bpp == 0 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let bpp_bytes = req.bpp.div_ceil(8);
     // The native amdgpu card pads lines as amdgpu_mode_dumb_create does
@@ -6652,7 +6658,7 @@ fn handle_create_dumb(
         #[cfg(feature = "amdgpu")]
         {
             match crate::amdgpu_gem::align_pitch(req.width, bpp_bytes) {
-                0 => return Err(FsError::InvalidData),
+                0 => return Err(invalid_at(line!())),
                 pitch => pitch,
             }
         }
@@ -6679,7 +6685,7 @@ fn handle_create_dumb(
     };
 
     // Allocate contiguous physical pages via the buddy allocator.
-    let frame = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| FsError::InvalidData)?;
+    let frame = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| invalid_at(line!()))?;
     let phys = frame.start_address().raw();
 
     // Zero the buffer so userspace doesn't see stale kernel data.
@@ -6698,7 +6704,7 @@ fn handle_create_dumb(
     let handle = {
         let mut card = mode_state.lock();
         card.register_dumb_backing(phys, size as usize, order)
-            .map_err(|_| FsError::InvalidData)?
+            .map_err(|_| invalid_at(line!()))?
     };
 
     // Write back the result.
@@ -6740,7 +6746,7 @@ fn handle_map_dumb(
         let card = mode_state.lock();
         card.dumb_backing(req.handle)
             .map(|b| b.mmap_offset)
-            .ok_or(FsError::InvalidData)?
+            .ok_or(invalid_at(line!()))?
     };
 
     req.offset = mmap_offset;
@@ -6778,7 +6784,7 @@ fn handle_destroy_dumb(
     } else {
         // drm_mode_destroy_dumb() delegates to drm_gem_handle_delete(), which
         // returns EINVAL when the per-file handle does not exist.
-        Err(FsError::InvalidData)
+        Err(invalid_at(line!()))
     }
 }
 
@@ -6790,7 +6796,7 @@ fn handle_gem_close(
 ) -> Result<u64, FsError> {
     let _ = ctx;
     if arg == 0 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     // GEM_CLOSE struct: u32 handle + u32 pad.
     // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -6802,7 +6808,7 @@ fn handle_gem_close(
     } else {
         // Linux drm_gem_handle_delete() reports EINVAL for an unknown or
         // already-closed handle.
-        Err(FsError::InvalidData)
+        Err(invalid_at(line!()))
     }
 }
 
@@ -6886,18 +6892,18 @@ fn check_native_plane(
     };
     let fb = card.framebuffer(fb_id).map_err(|_| FsError::NotFound)?;
     if !formats.contains(&(fb.format as u32)) {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let Some(mode) = mode else {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     };
     let (w, h) = (mode.width, mode.height);
     if origin != (0, 0) {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     if let Some((dst, src)) = rects {
         if dst != (0, 0, w, h) || src != (0, 0, w, h) {
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
     }
     if fb.width < w || fb.height < h {
@@ -6987,11 +6993,11 @@ fn handle_setcrtc_decoded(
         #[cfg(feature = "amdgpu")]
         let native_connector = if native_display.is_some() && req.count_connectors != 0 {
             if req.count_connectors != 1 || req.set_connectors_ptr == 0 {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
-            let id = setcrtc_connector.ok_or(FsError::InvalidData)?;
+            let id = setcrtc_connector.ok_or(invalid_at(line!()))?;
             if card.connector(id).is_err() {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             Some(id)
         } else {
@@ -7019,7 +7025,7 @@ fn handle_setcrtc_decoded(
                 name: m.name,
             };
             if !card.accepts_mode(&wire) {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             // On the native card, a timing this CRTC's own display offers.
             #[cfg(feature = "amdgpu")]
@@ -7028,7 +7034,7 @@ fn handle_setcrtc_decoded(
             }) || (crate::drm_registry::driver_name(card_index) == Some("amdgpu")
                 && native_display.is_none())
             {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             #[cfg(feature = "amdgpu")]
             {
@@ -7078,7 +7084,7 @@ fn handle_setcrtc_decoded(
                         format as u32,
                         setup,
                     ) {
-                        return Err(FsError::InvalidData);
+                        return Err(invalid_at(line!()));
                     }
                 } else if let Some(planes) = placed {
                     let planes = planes?;
@@ -7089,7 +7095,7 @@ fn handle_setcrtc_decoded(
                         format as u32,
                         &planes.setup,
                     ) {
-                        return Err(FsError::InvalidData);
+                        return Err(invalid_at(line!()));
                     }
                 } else if !crate::amdgpu_native_kms::display_admits_format(
                     d,
@@ -7097,7 +7103,7 @@ fn handle_setcrtc_decoded(
                     native_wire.as_ref(),
                     format as u32,
                 ) {
-                    return Err(FsError::InvalidData);
+                    return Err(invalid_at(line!()));
                 }
             }
         }
@@ -7156,7 +7162,7 @@ fn handle_setcrtc_decoded(
 
         let fb = card
             .framebuffer(req.fb_id)
-            .map_err(|_| FsError::InvalidData)?;
+            .map_err(|_| invalid_at(line!()))?;
         src_pitch = fb.pitch;
         src_w = fb.width;
         src_h = fb.height;
@@ -7241,7 +7247,7 @@ fn handle_dirty_fb(
     // clips_ptr: u64 } is 24 bytes.
     // SAFETY: `arg` is the user drm_mode_fb_dirty_cmd pointer.
     let raw = unsafe { copy_in(arg, 24)? };
-    let cmd = crate::drm::fb_cmd::DirtyCmd::parse(&raw).ok_or(FsError::InvalidData)?;
+    let cmd = crate::drm::fb_cmd::DirtyCmd::parse(&raw).ok_or(invalid_at(line!()))?;
     let clips = if cmd.num_clips == 0 {
         Vec::new()
     } else {
@@ -7342,7 +7348,7 @@ fn handle_page_flip_decoded(
     // Linux virtio-gpu does not advertise async flips and its CRTC exposes
     // `page_flip`, not `page_flip_target`, so ASYNC/TARGET are EINVAL.
     if req.flags & !DRM_MODE_PAGE_FLIP_EVENT != 0 || req.reserved != 0 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
 
     let src_phys: Option<u64>;
@@ -7372,7 +7378,7 @@ fn handle_page_flip_decoded(
             .format;
         let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::NotFound)?;
         if fb.format != old_format {
-            return Err(FsError::InvalidData);
+            return Err(invalid_at(line!()));
         }
         let mode = card.crtc(req.crtc_id).ok().and_then(|c| c.mode);
         let (x, y) = card
@@ -7402,7 +7408,7 @@ fn handle_page_flip_decoded(
         if validate_only {
             if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
                 events
-                    .ok_or(FsError::InvalidData)?
+                    .ok_or(invalid_at(line!()))?
                     .lock()
                     .ensure_flip_event_space(1)
                     .map_err(|_| FsError::OutOfMemory)?;
@@ -7422,7 +7428,7 @@ fn handle_page_flip_decoded(
         // Reserve Linux's per-file event space before changing the CRTC, so an
         // ENOMEM failure leaves scanout state untouched.
         let mut event_queue = if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            let queue = events.ok_or(FsError::InvalidData)?.lock();
+            let queue = events.ok_or(invalid_at(line!()))?.lock();
             queue
                 .ensure_flip_event_space(1)
                 .map_err(|_| FsError::OutOfMemory)?;
@@ -7535,7 +7541,7 @@ fn present_virgl_frame(resource: &VirtGpuResource, width: u32, height: u32) -> R
     // or reservation lock here, so an asynchronous render submission can
     // finish and reap its fence without lock inversion.
     wait_virgl_scanout_writes(resource)?;
-    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::InvalidData)?;
+    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(invalid_at(line!()))?;
     narf_console::fb_take_for_user();
     dev.present_virgl_resource(resource.resource_id, width, height)
         .map_err(map_gpu_transport_error)
@@ -7646,7 +7652,7 @@ fn handle_setplane_decoded_native(
                 || crtc_h > i32::MAX as u32
                 || crtc_y > i32::MAX - crtc_h as i32
             {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             let (fw, fh) = (u64::from(fb.width) << 16, u64::from(fb.height) << 16);
             let (sx, sy, sw, sh) = (
@@ -7670,7 +7676,7 @@ fn handle_setplane_decoded_native(
             plane.src_h = src_h >> 16;
             // dm_check_cursor_fb on the 16.16 source.
             if cursor && (src_x | src_y | src_w | src_h) & 0xffff != 0 {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
         }
         if cursor {
@@ -7682,7 +7688,7 @@ fn handle_setplane_decoded_native(
             state.planes.push(plane);
             let policy = crate::drm::atomic::AtomicCheckPolicy::default();
             if state.core_check(&card, &policy).is_err() {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             let displays = crate::drm_native_planes::check(&card, &state, |c| {
                 card.crtc(c).ok().and_then(|c| c.mode)
@@ -7698,7 +7704,7 @@ fn handle_setplane_decoded_native(
                         dp.primary_format,
                         &dp.setup,
                     ) {
-                        return Err(FsError::InvalidData);
+                        return Err(invalid_at(line!()));
                     }
                 }
             }
@@ -7708,7 +7714,7 @@ fn handle_setplane_decoded_native(
             }
             let prepared = PreparedFbs::prepare(&card, state.planes[0].fb_id)?;
             if state.core_commit(&mut card).is_err() {
-                return Err(FsError::InvalidData);
+                return Err(invalid_at(line!()));
             }
             crate::drm_native_planes::commit(&mut card, &state);
             let mut frames = Vec::new();
@@ -8121,9 +8127,9 @@ pub fn dispatch_mmap(card_index: u32, offset: u64, len: usize) -> Result<Vec<u64
     let card = mode_state.lock();
     let backing = card
         .dumb_backing_by_offset(offset)
-        .ok_or(FsError::InvalidData)?;
+        .ok_or(invalid_at(line!()))?;
     if len > backing.byte_len {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     let pages = len / 4096;
     let mut frames = Vec::with_capacity(pages);
@@ -8212,7 +8218,7 @@ pub fn get_client(
         .read(arg, &mut client)
         .map_err(|_| FsError::BadAddress)?;
     if i32::from_le_bytes(client[0..4].try_into().unwrap()) != 0 {
-        return Err(FsError::InvalidData);
+        return Err(invalid_at(line!()));
     }
     /// `overflowuid` default.
     const OVERFLOW_UID: u64 = 65534;
@@ -8323,7 +8329,7 @@ pub fn amdgpu_dumb_metadata(card_index: u32, cmd: u32, arg: usize) -> Option<Res
     match op {
         crate::amdgpu_uapi::AMDGPU_GEM_METADATA_OP_SET_METADATA => {
             if field(&b, 24) > 256 {
-                return Some(Err(FsError::InvalidData));
+                return Some(Err(invalid_at(line!())));
             }
             let tiling = u64::from_le_bytes(b[16..24].try_into().unwrap());
             // A dumb BO is never created with AMDGPU_GEM_CREATE_GFX12_DCC.
@@ -8405,7 +8411,7 @@ pub fn amdgpu_addfb2_bo(
         .addfb2_bo(&fb, object, open_id)
         .map_err(|e| match e {
             crate::drm::card::CardError::BadGemHandle => FsError::NotFound,
-            _ => FsError::InvalidData,
+            _ => invalid_at(line!()),
         });
     Some(id.and_then(|id| {
         // SAFETY: as above; fb_id is the struct's first u32.
@@ -8462,7 +8468,7 @@ pub fn intel_addfb2_bo(
         .addfb2_intel(&fb, object, open_id, info.native_xe())
         .map_err(|e| match e {
             crate::drm::card::CardError::BadGemHandle => FsError::NotFound,
-            _ => FsError::InvalidData,
+            _ => invalid_at(line!()),
         });
     Some(id.and_then(|id| {
         // SAFETY: as above; fb_id is the struct's first u32.
