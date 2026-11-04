@@ -11109,11 +11109,11 @@ fn smoke_amdgpu_ctx_alloc_query_and_priority_gate() -> TestResult {
     narf_filesystem::__test_swap_caller_capable_hook(saved);
 
     // ── query ──
-    // A query naming no context is ENOENT, not a zeroed answer that would
-    // read as "healthy".
+    // A query naming no context is EINVAL (amdgpu_ctx_query/query2), not a
+    // zeroed answer that would read as "healthy".
     for op in [u::AMDGPU_CTX_OP_QUERY_STATE, u::AMDGPU_CTX_OP_QUERY_STATE2] {
-        if !matches!(call(op, 0, 999_999, 0, false).0, Err(FsError::NotFound)) {
-            return TestResult::Fail("a query naming no context should be ENOENT");
+        if !matches!(call(op, 0, 999_999, 0, false).0, Err(FsError::InvalidData)) {
+            return TestResult::Fail("a query naming no context should be EINVAL");
         }
         if call(op, 0, id, 0, false).0.is_err() {
             return TestResult::Fail("a query on a live context failed");
@@ -11177,9 +11177,10 @@ fn smoke_amdgpu_ctx_alloc_query_and_priority_gate() -> TestResult {
     }
     if !matches!(
         call(u::AMDGPU_CTX_OP_FREE_CTX, 0, id, 0, false).0,
-        Err(FsError::NotFound)
+        Err(FsError::InvalidData)
     ) {
-        return TestResult::Fail("a double free should be ENOENT");
+        // amdgpu_ctx_free: `return ctx ? 0 : -EINVAL`.
+        return TestResult::Fail("a double free should be EINVAL");
     }
     // Every context this test allocated has been freed, including the ones
     // the refused-flags cases did NOT create.
@@ -12529,10 +12530,12 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         );
         let mut want = [0u32; u::AMDGPU_HW_IP_NUM as usize];
         want[u::AMDGPU_HW_IP_GFX as usize] = 1;
+        // An open whose card has no submitter still gets an answer:
+        // amdgpu_ring_max_ibs is reported unconditionally (0 for no ring).
         if ok.is_err()
             || max_ibs != want
             || crate::amdgpu_info::dispatch_for(info_cmd, info.as_mut_ptr() as usize, Some(&state))
-                != Err(FsError::InvalidData)
+                != Ok(0)
         {
             return Some("MAX_IBS from the card's submitter");
         }
