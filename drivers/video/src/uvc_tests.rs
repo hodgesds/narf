@@ -14,6 +14,8 @@
 //! 7.  Probe control encode: SET_CUR(PROBE) 34-byte payload (UVC 1.5)
 //! 8.  UVC payload header decode: FID flip, EOF bit
 //! 9.  Frame reassembly: 3 payloads same FID → one frame, EOF closes it
+//!     9b. Frame-based (1.5) header decode + H.264 reassembly (mirrored
+//!     in the drivers/usb tests, including GET_CUR version validation)
 //! 10. Brightness control GET_MIN/MAX/RES round-trip
 //! 11. Format negotiation: 1280×720 MJPEG @ 30 fps → nearest supported
 //! 12. Probe UVC: config blob with VC + VS interfaces
@@ -24,6 +26,8 @@
 
 #![cfg(target_arch = "x86_64")]
 
+use alloc::vec;
+use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 // ── Smoke 1: VC header descriptor decode ────────────────────────────
@@ -353,6 +357,151 @@ kernel_test_in!(
     "drivers/video/uvc",
     smoke_uvc_frame_reassembly_three_payloads
 );
+
+// ── Smoke 9b: Frame-based (1.5) header decode + H.264 reassembly ─────
+// UVC 1.5 §2.4.3.3 (shared header) + §2.4.3.7 (frame-based class
+// requires FID; temporally-encoded requires EOF). A spec-shaped
+// H.264 stream — 12-byte PTS+SCR headers, Annex-B-style NAL payload
+// — must reassemble byte-for-byte through the same header machine,
+// with D4 surfacing as payload-specific and STI as intra-coded.
+
+fn uvc_frame_based_packet(bfh: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = vec![12, bfh];
+    packet.extend_from_slice(&0x0010_0000u32.to_le_bytes());
+    packet.extend_from_slice(&0x0020_0000u32.to_le_bytes());
+    packet.extend_from_slice(&0x0123u16.to_le_bytes());
+    packet.extend_from_slice(payload);
+    packet
+}
+
+fn smoke_uvc_frame_based_header_decode() -> TestResult {
+    use crate::uvc::payload::{
+        PayloadHeader, BFH_EOH, BFH_FID, BFH_PAYLOAD_SPECIFIC, BFH_PTS, BFH_SCR, BFH_STI,
+    };
+
+    // FID=1, D4 + STI set, PTS+SCR present, no EOF.
+    let packet = uvc_frame_based_packet(
+        BFH_EOH | BFH_FID | BFH_PTS | BFH_SCR | BFH_PAYLOAD_SPECIFIC | BFH_STI,
+        &[0xAA],
+    );
+    let (hdr, off) = match PayloadHeader::decode(&packet) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("frame-based header must decode"),
+    };
+    if hdr.length != 12 || off != 12 {
+        return TestResult::Fail("header length / payload offset must be 12");
+    }
+    if !hdr.fid() || hdr.is_eof() {
+        return TestResult::Fail("FID/EOF bits must decode");
+    }
+    if hdr.pts != Some(0x0010_0000) {
+        return TestResult::Fail("PTS must decode LE from the header");
+    }
+    if hdr.scr != Some((0x0020_0000, 0x123)) {
+        return TestResult::Fail("SCR must decode as (STC, 11-bit SOF)");
+    }
+    if !hdr.payload_specific() {
+        return TestResult::Fail("D4 must surface as payload-specific, not reserved");
+    }
+    if !hdr.is_intra_coded() {
+        return TestResult::Fail("STI must surface as intra-coded for frame-based streams");
+    }
+    // Masking-defeating: a header lying about its length, a PTS flag
+    // with no timestamp room, and an empty packet must all fail.
+    if PayloadHeader::decode(&[12, BFH_EOH | BFH_PTS, 0x00, 0x00]).is_ok() {
+        return TestResult::Fail("truncated 12-byte header must not decode");
+    }
+    if PayloadHeader::decode(&[2, BFH_EOH | BFH_PTS, 0xAA]).is_ok() {
+        return TestResult::Fail("PTS flag with no timestamp room must not decode");
+    }
+    if PayloadHeader::decode(&[]).is_ok() {
+        return TestResult::Fail("empty packet must not decode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video/uvc", smoke_uvc_frame_based_header_decode);
+
+fn smoke_uvc_frame_based_h264_reassembly() -> TestResult {
+    use crate::uvc::payload::{
+        FrameReassembler, PushResult, BFH_EOF, BFH_EOH, BFH_FID, BFH_PAYLOAD_SPECIFIC, BFH_PTS,
+        BFH_SCR, BFH_STI,
+    };
+
+    let mut r = FrameReassembler::new();
+
+    // Frame 1 (IDR, FID=0): two packets, 12-byte PTS+SCR headers.
+    let p1 = uvc_frame_based_packet(
+        BFH_EOH | BFH_PTS | BFH_SCR,
+        &[0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21],
+    );
+    if r.push(&p1) != PushResult::Appended {
+        return TestResult::Fail("first frame-based packet must Append");
+    }
+    let p2 = uvc_frame_based_packet(BFH_EOH | BFH_PTS | BFH_SCR | BFH_EOF, &[0xAA, 0xBB, 0xCC]);
+    if r.push(&p2) != PushResult::FrameComplete {
+        return TestResult::Fail("EOF packet must complete the frame");
+    }
+    let frame1 = r.take_frame();
+    if frame1
+        != vec![
+            0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xAA, 0xBB, 0xCC,
+        ]
+    {
+        return TestResult::Fail("frame 1 must reassemble byte-for-byte");
+    }
+
+    // Frame 2 (non-IDR, FID=1, intra-coded + D4 set): D4 must not
+    // disturb framing, and the FID flip must start a new frame.
+    let p3 = uvc_frame_based_packet(
+        BFH_EOH | BFH_FID | BFH_PTS | BFH_SCR | BFH_PAYLOAD_SPECIFIC | BFH_STI,
+        &[0x00, 0x00, 0x00, 0x01, 0x41, 0x9A],
+    );
+    if r.push(&p3) != PushResult::FidReset {
+        return TestResult::Fail("FID-flipped packet must FidReset");
+    }
+    let p4 = uvc_frame_based_packet(
+        BFH_EOH | BFH_FID | BFH_PTS | BFH_SCR | BFH_EOF,
+        &[0xDE, 0xAD],
+    );
+    if r.push(&p4) != PushResult::FrameComplete {
+        return TestResult::Fail("EOF packet must complete frame 2");
+    }
+    let frame2 = r.take_frame();
+    if frame2 != vec![0x00, 0x00, 0x00, 0x01, 0x41, 0x9A, 0xDE, 0xAD] {
+        return TestResult::Fail("frame 2 must reassemble byte-for-byte");
+    }
+    if r.frames_completed != 2 {
+        return TestResult::Fail("frames_completed should be 2");
+    }
+
+    // FID flip mid-frame drops the partial frame's bytes. After frame
+    // 2 the reassembler sits at FID=1, so the partial packet keeps
+    // FID=1 and the completing packet flips to FID=0.
+    let q1 = [2u8, BFH_EOH | BFH_FID, 0x11, 0x22];
+    if r.push(&q1) != PushResult::Appended {
+        return TestResult::Fail("partial packet must Append");
+    }
+    let q2 = [2u8, BFH_EOH | BFH_EOF, 0x33];
+    if r.push(&q2) != PushResult::FrameComplete {
+        return TestResult::Fail("flipped EOF packet must complete");
+    }
+    if r.take_frame() != vec![0x33] {
+        return TestResult::Fail("FID flip must drop the partial frame's bytes");
+    }
+
+    // Truncated / malformed packets are skipped, never appended.
+    if r.push(&[12, BFH_EOH | BFH_PTS, 0x00, 0x00]) != PushResult::Skipped {
+        return TestResult::Fail("truncated header must Skip");
+    }
+    if r.push(&[2, BFH_EOH | BFH_PTS, 0xAA]) != PushResult::Skipped {
+        return TestResult::Fail("PTS flag without timestamp room must Skip");
+    }
+    if r.push(&[]) != PushResult::Skipped {
+        return TestResult::Fail("empty packet must Skip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video/uvc", smoke_uvc_frame_based_h264_reassembly);
 
 // ── Smoke 10: Brightness control GET_MIN/MAX/RES round-trip ─────────
 

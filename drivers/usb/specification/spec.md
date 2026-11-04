@@ -63,10 +63,23 @@ also consult upstream Linux GPL sources.
 
 - **UVC 1.5 §2.4.3.3** "Video and Still Image Payload Headers" —
   USB-IF. Public. Bit Field Header layout (FID toggle, EOF, PTS
-  flag, SCR flag, SI flag, Error, EOH).
+  flag, SCR flag, payload-specific bit D4 — assigned by the
+  individual payload specification, NOT reserved — SI flag, Error,
+  EOH). The header is shared across format classes: frame-based
+  and temporally-encoded formats use this same header.
 - **UVC 1.5 §2.4.3.4** "Source Clock Reference and Presentation
   Time Stamp" — USB-IF. Public. PTS = LE 32-bit; SCR = LE 32-bit
   SOF tick + 11-bit clock counter packed across 6 bytes.
+- **UVC 1.5 §2.4.3.7** "Data Format Classes" — USB-IF. Public.
+  Frame-based formats require FID; temporally-encoded formats
+  (H.264, VP8) require EOF and the EOS slice marker; stream-based
+  formats leave FID/EOF optional.
+- **UVC 1.5 §4.3.1.1** "Video Probe and Commit Controls" — USB-IF.
+  Public. Version fields carry the payload-format-spec minor
+  version (1–255); the host inits them to zero on the first Probe
+  SET, the device returns its preferred version plus its supported
+  [min, max] range, and the host may only pick a preferred value
+  inside that range (host must not alter min/max).
 
 ### USB CDC (Communications Device Class)
 
@@ -509,6 +522,24 @@ also consult upstream Linux GPL sources.
   dispatches on the active endpoint's transport (`isoch_in` /
   `bulk_in`), behind which the depth-4 isochronous pipelining work (#808)
   slots in without changing the composition.
+- UVC payload headers (1.5 §2.4.3.3) are decoded by
+  `uvc::UvcPayloadHeader::parse` (mirrored by `narf-drivers-video`'s
+  `PayloadHeader::decode`) for every format class: frame-based
+  formats and temporally-encoded formats (H.264/VP8,
+  `VS_FORMAT_FRAME_BASED`) share the §2.4.3.3 header (HLE + BFH +
+  optional PTS/SCR), with frame boundaries from the FID toggle and
+  EOF completion (§2.4.3.7). BFH D4 is the payload-specific bit (not
+  reserved) and is surfaced, not acted on; D5 (STI) reads as
+  intra-coded for temporally-encoded streams.
+- GET_CUR(PROBE) version validation (#1244, 1.5 §4.3.1.1): on a
+  34-byte (1.1+) response the device's preferred version must lie
+  inside its own declared [min, max] range (device resets min/max
+  to 1–255); a malformed triple fails negotiation (`ProbeFailed`)
+  before any COMMIT is sent. The host's first-SET 0x10 declaration
+  is a #1225 design choice, retained unchanged; the spec-correct
+  encoding (payload-format-spec minor version, host inits to zero
+  on first Probe SET) is documented on
+  `VsProbeCommit::preferred_version` for future work.
 - `try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
   config)` binds the standard Bluetooth USB interface. For a recognised
   WCN6855 ID it completes the Qualcomm USB firmware/status protocol before

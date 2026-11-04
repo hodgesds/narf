@@ -3322,6 +3322,307 @@ fn smoke_uvc_streamon_v15_negotiation() -> TestResult {
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_v15_negotiation);
 
+/// Bind the modelled 1.5 camera and build the production desired
+/// PROBE/COMMIT for it, shared by the #1244 negotiation tests so
+/// they exercise the real bind + desired path, not hand-built
+/// payloads. Returns (device index, desired probe/commit).
+fn uvc_negotiate_setup(
+    transport: &Arc<FixtureTransport>,
+) -> Result<(usize, crate::uvc::VsProbeCommit), &'static str> {
+    narf_drivers_video::devfs_bridge::__reset_for_test();
+    crate::uvc::__reset_uvc_for_test();
+    transport.set_clock(48_000_000);
+    let blob = uvc_fixture_config_blob_versioned(0x0150, 48_000_000);
+    let idx = narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &**transport,
+        7,
+        &blob,
+    ))
+    .map_err(|_| "bind against the modelled 1.5 camera failed")?;
+    let desired = {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = devices.get(idx).ok_or("bound device missing")?;
+        if device.uvc_version != 0x0150 || device.clock_frequency != 48_000_000 {
+            return Err("bind should record bcdUVC + VC clock");
+        }
+        let format = narf_drivers_video::v4l2_ioctl::PixFormat {
+            width: 640,
+            height: 480,
+            fourcc: u32::from_le_bytes(*b"YUYV"),
+        };
+        crate::uvc::desired_probe_commit(device, format).ok_or("desired_probe_commit failed")?
+    };
+    Ok((idx, desired))
+}
+
+/// A spec-shaped frame-based packet: 12-byte §2.4.3.3 header (HLE=12,
+/// BFH, LE PTS, 6-byte SCR) followed by the payload bytes. PTS and
+/// SCR values are fixed so the decode assertions below pin them
+/// byte-for-byte.
+fn uvc_frame_based_packet(bfh: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = alloc::vec![12, bfh];
+    packet.extend_from_slice(&0x0010_0000u32.to_le_bytes());
+    packet.extend_from_slice(&0x0020_0000u32.to_le_bytes());
+    packet.extend_from_slice(&0x0123u16.to_le_bytes());
+    packet.extend_from_slice(payload);
+    packet
+}
+
+fn smoke_usb_uvc_frame_based_header_decode() -> TestResult {
+    use crate::uvc::{bfh, UvcPayloadHeader};
+    // FID=1, payload-specific D4 + STI set, PTS+SCR present, no EOF.
+    let packet = uvc_frame_based_packet(
+        bfh::EOH | bfh::FID | bfh::PTS | bfh::SCR | bfh::PAYLOAD_SPECIFIC | bfh::STI,
+        &[0xAA],
+    );
+    let hdr = match UvcPayloadHeader::parse(&packet) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("frame-based header must parse"),
+    };
+    if hdr.length != 12 || !hdr.fid() || hdr.is_eof() {
+        return TestResult::Fail("header fields must decode");
+    }
+    if hdr.pts != Some(0x0010_0000) {
+        return TestResult::Fail("PTS must decode LE from the header");
+    }
+    if !hdr.is_payload_specific() {
+        return TestResult::Fail("D4 must surface as payload-specific, not reserved");
+    }
+    if !hdr.is_intra_coded() {
+        return TestResult::Fail("STI must surface as intra-coded for frame-based streams");
+    }
+    // Masking-defeating: a header that lies about its length, a
+    // PTS flag with no room for the timestamp, and an empty packet
+    // must all be rejected, not reassembled.
+    if UvcPayloadHeader::parse(&[12, bfh::EOH | bfh::PTS, 0x00, 0x00]).is_ok() {
+        return TestResult::Fail("truncated 12-byte header must not parse");
+    }
+    if UvcPayloadHeader::parse(&[2, bfh::EOH | bfh::PTS, 0xAA]).is_ok() {
+        return TestResult::Fail("PTS flag with no timestamp room must not parse");
+    }
+    if UvcPayloadHeader::parse(&[]).is_ok() {
+        return TestResult::Fail("empty packet must not parse");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_frame_based_header_decode);
+
+fn smoke_usb_uvc_frame_based_h264_reassembly() -> TestResult {
+    use crate::uvc::{bfh, ReassemblerOutcome, UvcFrameReassembler};
+    let mut r = UvcFrameReassembler::new();
+    // Frame 1 (IDR, FID=0): two packets, 12-byte PTS+SCR headers,
+    // Annex-B-style NAL payload. FID=0 matches the reassembler's
+    // initial state, so no flip occurs.
+    let p1 = uvc_frame_based_packet(
+        bfh::EOH | bfh::PTS | bfh::SCR,
+        &[0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21],
+    );
+    if r.push(&p1) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("first frame-based packet must Append");
+    }
+    let p2 = uvc_frame_based_packet(
+        bfh::EOH | bfh::PTS | bfh::SCR | bfh::EOF,
+        &[0xAA, 0xBB, 0xCC],
+    );
+    if r.push(&p2) != ReassemblerOutcome::FrameComplete {
+        return TestResult::Fail("EOF packet must complete the frame");
+    }
+    let frame1 = r.take_frame();
+    if frame1 != alloc::vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xAA, 0xBB, 0xCC,] {
+        return TestResult::Fail("frame 1 must reassemble byte-for-byte");
+    }
+    // Frame 2 (non-IDR, FID=1, intra-coded + payload-specific D4
+    // set): the D4 bit must not disturb framing, and the FID flip
+    // must start a new frame.
+    let p3 = uvc_frame_based_packet(
+        bfh::EOH | bfh::FID | bfh::PTS | bfh::SCR | bfh::PAYLOAD_SPECIFIC | bfh::STI,
+        &[0x00, 0x00, 0x00, 0x01, 0x41, 0x9A],
+    );
+    if r.push(&p3) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("FID-flipped packet must start the next frame");
+    }
+    let p4 = uvc_frame_based_packet(
+        bfh::EOH | bfh::FID | bfh::PTS | bfh::SCR | bfh::EOF,
+        &[0xDE, 0xAD],
+    );
+    if r.push(&p4) != ReassemblerOutcome::FrameComplete {
+        return TestResult::Fail("EOF packet must complete frame 2");
+    }
+    let frame2 = r.take_frame();
+    if frame2 != alloc::vec![0x00, 0x00, 0x00, 0x01, 0x41, 0x9A, 0xDE, 0xAD] {
+        return TestResult::Fail("frame 2 must reassemble byte-for-byte");
+    }
+    // Truncated / malformed packets are skipped, never appended.
+    if r.push(&[12, bfh::EOH | bfh::PTS, 0x00, 0x00]) != ReassemblerOutcome::Skipped {
+        return TestResult::Fail("truncated header must Skip");
+    }
+    if r.push(&[2, bfh::EOH | bfh::PTS, 0xAA]) != ReassemblerOutcome::Skipped {
+        return TestResult::Fail("PTS flag without timestamp room must Skip");
+    }
+    if r.push(&[]) != ReassemblerOutcome::Skipped {
+        return TestResult::Fail("empty packet must Skip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_frame_based_h264_reassembly);
+
+fn smoke_usb_uvc_frame_based_fid_flip_drops_partial() -> TestResult {
+    use crate::uvc::{bfh, ReassemblerOutcome, UvcFrameReassembler};
+    let mut r = UvcFrameReassembler::new();
+    // Partial frame, FID=0, never sees EOF.
+    let p1 = [2, bfh::EOH, 0x11, 0x22];
+    if r.push(&p1) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("partial packet must Append");
+    }
+    // FID flip with EOF: the partial frame is dropped, and only the
+    // new packet's payload completes.
+    let p2 = [2, bfh::EOH | bfh::FID | bfh::EOF, 0x33];
+    if r.push(&p2) != ReassemblerOutcome::FrameComplete {
+        return TestResult::Fail("flipped EOF packet must complete");
+    }
+    if r.take_frame() != alloc::vec![0x33] {
+        return TestResult::Fail("FID flip must drop the partial frame's bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_frame_based_fid_flip_drops_partial
+);
+
+fn smoke_usb_uvc_get_cur_version_validation() -> TestResult {
+    use crate::uvc::VsProbeCommit;
+    // Device echoing the host's 0x10 declaration: valid.
+    let mut v = VsProbeCommit {
+        preferred_version: 0x10,
+        min_version: 0x10,
+        max_version: 0x10,
+        ..VsProbeCommit::default()
+    };
+    if !v.accepted_versions_valid() {
+        return TestResult::Fail("0x10/0x10/0x10 triple must validate");
+    }
+    // Device answering a real range containing its preferred: valid.
+    v.preferred_version = 2;
+    v.min_version = 1;
+    v.max_version = 2;
+    if !v.accepted_versions_valid() {
+        return TestResult::Fail("preferred inside [min, max] must validate");
+    }
+    // Masking-defeating: every malformed shape must fail, including
+    // the ones a naive "preferred != 0" or "nonzero" check would miss.
+    v.preferred_version = 5;
+    v.min_version = 1;
+    v.max_version = 2;
+    if v.accepted_versions_valid() {
+        return TestResult::Fail("preferred outside [min, max] must not validate");
+    }
+    v.preferred_version = 0;
+    v.min_version = 0;
+    v.max_version = 0;
+    if v.accepted_versions_valid() {
+        return TestResult::Fail("zero triple must not validate");
+    }
+    v.preferred_version = 2;
+    v.min_version = 3;
+    v.max_version = 2;
+    if v.accepted_versions_valid() {
+        return TestResult::Fail("min > max must not validate");
+    }
+    v.preferred_version = 0;
+    v.min_version = 1;
+    v.max_version = 2;
+    if v.accepted_versions_valid() {
+        return TestResult::Fail("preferred below min must not validate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_get_cur_version_validation);
+
+fn smoke_usb_uvc_negotiation_rejects_bad_version_triple() -> TestResult {
+    let transport = Arc::new(FixtureTransport::new(
+        false,
+        false,
+        uvc_fixture_frame_packets(),
+    ));
+    // Model a device answering a preferred version outside its own
+    // declared [min, max] range.
+    transport.set_versions(5, 1, 2);
+    let (idx, desired) = match uvc_negotiate_setup(&transport) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if narf_scheduler::block_on(crate::uvc::negotiate_and_activate_video_stream_with(
+        &*transport,
+        idx,
+        desired,
+    ))
+    .is_ok()
+    {
+        return TestResult::Fail("negotiation must fail on a malformed version triple");
+    }
+    let log = transport.log();
+    if !log.iter().any(|x| matches!(x, FixtureXfer::GetCurProbe)) {
+        return TestResult::Fail("negotiation must reach GET_CUR before rejecting");
+    }
+    if log
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetCurCommit { .. }))
+    {
+        return TestResult::Fail("no COMMIT may be sent after a malformed GET_CUR triple");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_negotiation_rejects_bad_version_triple
+);
+
+fn smoke_usb_uvc_negotiation_accepts_device_version_range() -> TestResult {
+    let transport = Arc::new(FixtureTransport::new(
+        false,
+        false,
+        uvc_fixture_frame_packets(),
+    ));
+    // Model a device answering a real range (preferred 2 in [1, 2]).
+    transport.set_versions(2, 1, 2);
+    let (idx, desired) = match uvc_negotiate_setup(&transport) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let negotiated = match narf_scheduler::block_on(
+        crate::uvc::negotiate_and_activate_video_stream_with(&*transport, idx, desired),
+    ) {
+        Ok(n) => n,
+        Err(_) => {
+            return TestResult::Fail(
+                "negotiation must accept a device range containing its preferred version",
+            )
+        }
+    };
+    let commit = match transport.log().iter().find_map(|x| match x {
+        FixtureXfer::SetCurCommit { payload } => Some(payload.clone()),
+        _ => None,
+    }) {
+        Some(p) => p,
+        None => return TestResult::Fail("no SET_CUR(COMMIT) logged"),
+    };
+    if commit.len() < 34 || commit[31] != 2 || commit[32] != 1 || commit[33] != 2 {
+        return TestResult::Fail("COMMIT must carry the device's version range verbatim");
+    }
+    if negotiated.control.preferred_version != 2
+        || negotiated.control.min_version != 1
+        || negotiated.control.max_version != 2
+    {
+        return TestResult::Fail("negotiated control must carry the device version range");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_negotiation_accepts_device_version_range
+);
+
 fn smoke_usb_uvc_reassembler_completes_two_packet_frame() -> TestResult {
     use crate::uvc::{bfh, ReassemblerOutcome, UvcFrameReassembler};
     let mut r = UvcFrameReassembler::new();
@@ -7433,6 +7734,11 @@ struct FixtureState {
     /// The modelled device's clock (its VC HEADER clock), answered in
     /// the 1.1+ extension block of GET_CUR(PROBE).
     clock_frequency: u32,
+    /// Override for the GET_CUR(PROBE) version triple, when the test
+    /// models a device answering its own preferred/[min, max] range
+    /// instead of echoing the host's 0x10 declaration. None = the
+    /// default 0x10/0x10/0x10 answer.
+    versions: Option<(u8, u8, u8)>,
     fail_probe: bool,
     fail_set_interface: bool,
     packets: VecDeque<Vec<u8>>,
@@ -7456,6 +7762,7 @@ impl FixtureTransport {
                 log: Vec::new(),
                 probe: None,
                 clock_frequency: 0,
+                versions: None,
                 fail_probe,
                 fail_set_interface,
                 packets: packets.into(),
@@ -7471,6 +7778,15 @@ impl FixtureTransport {
     /// 1.1+ extension block of GET_CUR(PROBE).
     fn set_clock(&self, hz: u32) {
         self.state.lock().clock_frequency = hz;
+    }
+
+    /// Set the modelled device's GET_CUR(PROBE) version triple
+    /// (preferred, min, max), answered in the 1.1+ extension block
+    /// instead of the default 0x10/0x10/0x10 echo. Used to model a
+    /// device answering a real range — or a malformed triple — for
+    /// the #1244 GET_CUR version-validation tests.
+    fn set_versions(&self, preferred: u8, min: u8, max: u8) {
+        self.state.lock().versions = Some((preferred, min, max));
     }
 
     /// Stage a packet for the modelled device to source, as if it
@@ -7581,13 +7897,15 @@ impl crate::uvc::UvcTransport for FixtureTransport {
                 accepted[22..26].copy_from_slice(&1024u32.to_le_bytes());
             }
             // A 1.1+ device answers the extension block: its clock and
-            // the 1.0 payload versions it accepts.
+            // the 1.0 payload versions it accepts — or the version
+            // triple the test staged via set_versions.
             if accepted.len() >= 34 {
                 accepted[26..30].copy_from_slice(&state.clock_frequency.to_le_bytes());
                 accepted[30] = 0;
-                accepted[31] = 0x10;
-                accepted[32] = 0x10;
-                accepted[33] = 0x10;
+                let (preferred, min, max) = state.versions.unwrap_or((0x10, 0x10, 0x10));
+                accepted[31] = preferred;
+                accepted[32] = min;
+                accepted[33] = max;
             }
             let n = out.len().min(accepted.len());
             out[..n].copy_from_slice(&accepted[..n]);
