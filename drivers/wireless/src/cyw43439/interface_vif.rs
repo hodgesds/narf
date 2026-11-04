@@ -501,9 +501,9 @@ impl<R: Fullmac + 'static> Device<R> {
     /// `p2p`, combo0 is `1 + mchan` STAs, one P2P_DEVICE and one
     /// P2P_CLIENT|P2P_GO on `1 + mchan` channels with Linux's
     /// `max_interfaces` = the limit count (3), and the P2P combination is
-    /// one each of STA, AP, P2P_CLIENT and P2P_DEVICE on one channel. The
-    /// `mbss` multi-AP combination is not advertised: `vif->mbss` is not
-    /// implemented and only one AP may run.
+    /// one each of STA, AP, P2P_CLIENT and P2P_DEVICE on one channel.
+    /// With `mbss`, the multi-AP combination is up to 4 APs on one
+    /// channel (`vif->mbss` path; no STA or P2P role shares it).
     pub(super) fn vif_combinations(&self) -> Vec<narf_wireless::InterfaceCombination> {
         use narf_wireless::{InterfaceCombination, InterfaceTypeLimit};
         let Some(features) = self
@@ -528,14 +528,19 @@ impl<R: Fullmac + 'static> Device<R> {
                 beacon_interval_min_gcd: None,
                 radar_detect_widths: None,
             };
-        if !features.p2p || !p2p_device::P2P_ADVERTISED {
-            return alloc::vec![combination(&[(1, &[2]), (1, &[3])], 2, 1)];
+        let mut combinations = if !features.p2p || !p2p_device::P2P_ADVERTISED {
+            alloc::vec![combination(&[(1, &[2]), (1, &[3])], 2, 1)]
+        } else {
+            let mchan = u32::from(features.mchan);
+            alloc::vec![
+                combination(&[(1 + mchan, &[2]), (1, &[10]), (1, &[8, 9])], 3, 1 + mchan),
+                combination(&[(1, &[2]), (1, &[3]), (1, &[8]), (1, &[10])], 4, 1),
+            ]
+        };
+        if features.mbss {
+            combinations.push(combination(&[(4, &[3])], 4, 1));
         }
-        let mchan = u32::from(features.mchan);
-        alloc::vec![
-            combination(&[(1 + mchan, &[2]), (1, &[10]), (1, &[8, 9])], 3, 1 + mchan),
-            combination(&[(1, &[2]), (1, &[3]), (1, &[8]), (1, &[10])], 4, 1),
-        ]
+        combinations
     }
 
     /// `brcmf_cfg80211_add_iface` admission and `brcmf_net_attach`

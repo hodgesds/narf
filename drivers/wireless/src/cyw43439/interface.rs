@@ -1043,7 +1043,7 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
                 state.clear_transmit();
                 let State { station, ap, .. } = &mut *state;
                 if let Some(session) = ap.as_mut() {
-                    if let Err(error) = session.stop(station).await {
+                    if let Err(error) = session.stop(station, true).await {
                         station.runtime.fail();
                         let _ = station.runtime.stop_transport().await;
                         return Err(error);

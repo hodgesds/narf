@@ -1406,9 +1406,9 @@ lists only the STA/AP combinations `vif_owner::admits` enforces, from
 absent) combo0 = `1 + mchan` STAs on `1 + mchan` channels (listed only
 with `mchan`, since cfg80211 needs `max_interfaces` >= 2 once the P2P
 iftype limits are dropped — no P2P role is created here) plus the P2P
-combination's 1 STA + 1 AP on one channel. The `mbss` multi-AP
-combination is not advertised (`vif->mbss` is not implemented; only one
-AP runs).
+combination's 1 STA + 1 AP on one channel. With `mbss`, the multi-AP
+combination is advertised: up to 4 APs on one channel (Linux
+`vif->mbss` path — see the secondary AP paragraph below).
 
 #### Per-bsscfg Fullmac adapter
 
@@ -1585,11 +1585,18 @@ retained shell frame under its original data capture, and delivers
 received data/events after the state lock, each behind the bsscfg's
 completed-prefix final check. Removal stops a running AP first; a failed
 stop fail-stops the bsscfg and the ifidx's AP owner retires its own
-flows/TX (`ap_leave_on`) before `vif_close`. Only one AP may run: a
-secondary START is refused beside the primary or another secondary AP
-(Linux `vif->mbss` path not implemented), and a primary START is refused
-while a secondary AP runs. Known gap: channel agreement with a primary
-STA is left to the firmware (no mchan scheduling).
+flows/TX (`ap_leave_on`) before `vif_close`. Several APs may run when
+the firmware advertises `mbss` (Linux `vif->mbss` path): a secondary
+START beside a running AP skips the shared radio setup (DOWN/apsta),
+the first secondary AP enables firmware MBSS mode (`mbss 1`) and only
+the last MBSS AP's stop clears it (`mbss 0`), and every live AP BSS
+must share one radio chanspec (a mismatched request is refused before
+any firmware mutation); a running P2P GO BSS is never an MBSS peer.
+Without `mbss`, a secondary START beside a running AP is still
+refused, and a primary START is refused while a secondary AP runs
+(the primary Program's device-wide setup must not run beside a
+secondary AP). Known gap: channel agreement with a primary STA is
+left to the firmware (no mchan scheduling).
 
 #### Composed event mask
 

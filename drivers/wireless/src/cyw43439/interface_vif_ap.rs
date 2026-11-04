@@ -221,6 +221,50 @@ impl<R: Fullmac + 'static> Device<R> {
             .as_ref()
             .map(|owner| owner.features())
             .ok_or(WirelessError::Denied)?;
+        // MBSS accounting, computed before the slot is rebound: whether
+        // another AP already exists at all, whether another secondary
+        // AP is actually running (firmware MBSS mode is then already
+        // enabled), whether a running GO BSS exists (never an MBSS
+        // peer), and the one radio chanspec every live AP BSS must
+        // share (conflicting live chanspecs refuse a further AP).
+        let other_ap = state.ap.is_some()
+            || state
+                .secondaries
+                .iter()
+                .any(|slot| slot.cookie != cookie && slot.ap.is_some());
+        let other_secondary_active = state.secondaries.iter().any(|slot| {
+            slot.cookie != cookie && slot.ap.as_ref().is_some_and(|session| session.active())
+        });
+        let go_running = state.secondaries.iter().any(|slot| {
+            slot.cookie != cookie
+                && slot
+                    .ap
+                    .as_ref()
+                    .is_some_and(|session| session.active() && session.is_go())
+        });
+        let mut required_chanspec: Option<u16> = None;
+        let mut chanspec_conflict = false;
+        let mut consider = |session: &crate::brcmfmac::ap::Session| {
+            if let Some(chanspec) = session.running_chanspec() {
+                match required_chanspec {
+                    None => required_chanspec = Some(chanspec),
+                    Some(existing) if existing != chanspec => chanspec_conflict = true,
+                    _ => {}
+                }
+            }
+        };
+        if let Some(session) = state.ap.as_deref() {
+            consider(session);
+        }
+        for slot in state
+            .secondaries
+            .iter()
+            .filter(|slot| slot.cookie != cookie)
+        {
+            if let Some(session) = slot.ap.as_deref() {
+                consider(session);
+            }
+        }
         // A P2P GO starts on its own connection bsscfg (`Scope::Go`).
         let scope = if shell.role == Role::P2pGo {
             let bsscfgidx = state
@@ -231,18 +275,13 @@ impl<R: Fullmac + 'static> Device<R> {
                 .ok_or(WirelessError::Denied)?;
             Scope::Go { bsscfgidx }
         } else {
-            Scope::secondary(features)
+            Scope::secondary(features, other_ap, other_secondary_active)
         };
         let mode = Mode {
             generation: host.generation.clone(),
             value: host.generation.load(Ordering::Acquire),
         };
         let history = host.history.clone();
-        let other_ap = state.ap.is_some()
-            || state
-                .secondaries
-                .iter()
-                .any(|slot| slot.cookie != cookie && slot.ap.is_some());
         if starting {
             shell.ap_set_carrier(false);
         }
@@ -258,10 +297,12 @@ impl<R: Fullmac + 'static> Device<R> {
                         if ap.is_some() || station.ap_station_busy() {
                             return Err(Error::Busy);
                         }
-                        // Linux `vif->mbss` (another AP already created)
-                        // skips the shared radio setup; that MBSS path is
-                        // not implemented, so this AP must be the only one.
-                        if other_ap {
+                        // Linux `vif->mbss`: a further AP may start
+                        // beside running APs only when the firmware
+                        // advertises MBSS; a running GO BSS is never
+                        // an MBSS peer, and live AP BSSs must agree
+                        // on one radio chanspec.
+                        if go_running || chanspec_conflict || (other_ap && !features.mbss) {
                             return Err(Error::Unsupported);
                         }
                         let session = Session::prepare_secondary(
@@ -274,6 +315,14 @@ impl<R: Fullmac + 'static> Device<R> {
                             history,
                             scope,
                         )?;
+                        // Refused before insert: prepare performs no
+                        // firmware mutation, so no cleanup owner is
+                        // needed for a channel-mismatched request.
+                        if let Some(required) = required_chanspec {
+                            if session.chanspec() != required {
+                                return Err(Error::Unsupported);
+                            }
+                        }
                         // Stored before the first wait: a dropped START keeps
                         // a real cleanup owner in the slot.
                         let session = ap.insert(Box::new(session));
@@ -296,7 +345,12 @@ impl<R: Fullmac + 'static> Device<R> {
                     Operation::Stop => {
                         shell.ap_set_carrier(false);
                         match ap.as_mut() {
-                            Some(session) => session.stop(&mut station).await.map(|_| false),
+                            // Only the last AP's stop clears the
+                            // device-wide MBSS mode (`other_ap` counts
+                            // APs besides this one).
+                            Some(session) => {
+                                session.stop(&mut station, !other_ap).await.map(|_| false)
+                            }
                             None => Err(Error::Unsupported),
                         }
                     }
@@ -529,7 +583,10 @@ pub(super) async fn secondary_ap_pass<R: Fullmac>(
                 Err(_) => {
                     shell.ap_set_carrier(false);
                     session.fail();
-                    if session.stop(&mut station).await.is_ok() {
+                    // Teardown keeps MBSS mode: another AP may still
+                    // run, and a stale mode flag is benign (the next
+                    // secondary AP start re-enables it idempotently).
+                    if session.stop(&mut station, false).await.is_ok() {
                         cleared = true;
                         shell.ap.events.lock().take();
                         *shell.ap.staging.lock() = Staging::default();
@@ -618,7 +675,8 @@ pub(super) async fn secondary_ap_stop<R: Fullmac>(
     };
     let (mut station, rest) = parked.rebind(Bsscfg::new(runtime, owner, &mut slot.link));
     let stopped = match slot.ap.as_mut() {
-        Some(session) => session.stop(&mut station).await.is_ok(),
+        // Removal teardown keeps MBSS mode (see the pass path above).
+        Some(session) => session.stop(&mut station, false).await.is_ok(),
         None => true,
     };
     if !stopped {

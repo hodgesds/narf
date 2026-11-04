@@ -380,6 +380,308 @@ kernel_test_in!(
     smoke_brcmf_msgbuf_primary_station_beside_secondary_ap
 );
 
+/// Linux `vif->mbss` multi-AP over msgbuf: a secondary AP START beside
+/// a running primary AP on the same channel (firmware `mbss` cap),
+/// then secondary teardown that keeps `mbss 1` while the primary AP
+/// runs, then primary teardown.
+fn primary_ap_secondary_ap_mbss() -> Result<(), &'static str> {
+    use super::ap_native_tests::{config, Source};
+    use narf_capabilities::{Cap, Invoke};
+    use narf_wireless::ap_control::ApControlAuthority;
+    const NAME: &str = "wlvap7";
+    let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
+    bus.enable_ap();
+    bus.enable_vif_ap();
+    // No `mchan`: the MBSS path must skip DOWN/apsta even though a
+    // lone secondary AP would perform them.
+    bus.set_caps(b"ap sta mbss");
+    let database = Arc::new(narf_wireless::reg::db::Database::new());
+    database.install(firmware::domain());
+    let mut station = block(Station::initialize_live(adapter, &[], database.clone()))
+        .map_err(|_| "primary station over msgbuf")?;
+    let owner = block(super::vif::discover(&mut station.runtime, station.mac))
+        .map_err(|_| "cap discovery")?
+        .ok_or("firmware cap refused")?;
+    if !owner.features().mbss || owner.features().mchan {
+        return Err("cap tokens not parsed as mbss without mchan");
+    }
+    let name = narf_net::iface::register("wlan%d", OWN, send);
+    let device = shell(name.clone(), station);
+    device.state.try_lock().ok_or("state")?.vif = Some(owner);
+    device.ap_fixture_setup(database);
+    super::vif::register_primary(&device);
+    narf_net::iface::set_link_state(&name, false);
+    device.set_iftype(3).map_err(|_| "primary AP mode")?;
+    let cap = narf_net::registry()
+        .register(&narf_net::bootstrap_authority(), Registered(device.clone()))
+        .map_err(|_| "primary registered netdev")?;
+    let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+        iface: cap,
+        daemon: Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap(),
+    })
+    .map_err(|_| "primary admin authority")?
+    .admin;
+    let iface: Arc<dyn WirelessNetIface> = device.clone();
+    narf_wireless::registry::register(iface.clone());
+    narf_net::iface::set_link_state(&name, true);
+    let result = (|| {
+        let primary_source = Arc::new(Source::new());
+        let primary_authority = ApControlAuthority::bind(
+            admin.clone(),
+            &iface,
+            0,
+            narf_net::iface::lookup(&name).ok_or("ifindex")?.ifindex,
+            primary_source.clone(),
+        )
+        .map_err(|_| "primary AP authority bind")?
+        .reserve()
+        .map_err(|_| "primary AP control reservation")?;
+        let (primary_config, primary_settings) = config(false);
+        block(device.start_ap_with_settings_async(
+            &primary_authority,
+            primary_config,
+            primary_settings,
+        ))
+        .map_err(|_| "primary AP START")?;
+        if !bus.ap_change(|p| p.active && p.up && p.formed) {
+            return Err("primary AP not running");
+        }
+        let vap = device
+            .vif_new(NAME, 3, None)
+            .map_err(|_| "secondary AP shell admission")?;
+        block(device.vif_worker());
+        if vap.ap_sme_capabilities() != Some(0) {
+            return Err("secondary AP shell not attached after IF ADD");
+        }
+        narf_net::iface::set_link_state(NAME, true);
+        let secondary_cap = narf_net::registry()
+            .with_handle(NAME, |cap| *cap)
+            .ok_or("secondary netdev handle")?;
+        let secondary_admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+            iface: secondary_cap,
+            daemon: Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap(),
+        })
+        .map_err(|_| "secondary admin authority")?
+        .admin;
+        let secondary_iface: Arc<dyn WirelessNetIface> = vap.clone();
+        let source = Arc::new(Source::new());
+        let authority = ApControlAuthority::bind(
+            secondary_admin,
+            &secondary_iface,
+            0,
+            narf_net::iface::lookup(NAME).ok_or("ifindex")?.ifindex,
+            source.clone(),
+        )
+        .map_err(|_| "secondary AP authority bind")?
+        .reserve()
+        .map_err(|_| "secondary AP control reservation")?;
+        let (mut ap_config, settings) = config(false);
+        ap_config.beacon_head[10..22].copy_from_slice(&[VIF, VIF].concat());
+        let before = bus.commands().len();
+        block(vap.start_ap_with_settings_async(&authority, ap_config, settings))
+            .map_err(|_| "secondary AP START beside primary AP")?;
+        let commands = bus.commands();
+        let ifidx = bus.command_ifidx();
+        let program: Vec<_> = commands[before..].iter().zip(&ifidx[before..]).collect();
+        // MBSS program on ifidx 1: no shared DOWN/apsta, `mbss 1` once.
+        let mbss_set = b"mbss\0\x01\x00\x00\x00".to_vec();
+        let mbss_sets = program
+            .iter()
+            .filter(|((command, body, _), _)| *command == 263 && **body == mbss_set)
+            .count();
+        if program.iter().any(|(_, index)| **index != 1)
+            || program
+                .iter()
+                .any(|((command, body, _), _)| *command == 3 || body.starts_with(b"apsta\0"))
+            || mbss_sets != 1
+        {
+            return Err("secondary AP Program not the MBSS bsscfg-1 form");
+        }
+        if !bus.vif_ap_change(|p| p.active && p.up && p.formed)
+            || !bus.ap_change(|p| p.active && p.up && p.formed)
+            || !vap.link_up()
+        {
+            return Err("secondary AP not running beside the primary AP");
+        }
+        let stop_before = bus.commands().len();
+        block(vap.stop_ap_async(&authority)).map_err(|_| "secondary AP STOP")?;
+        let stop_commands = bus.commands();
+        let stop_ifidx = bus.command_ifidx();
+        let mbss_clear = b"mbss\0\x00\x00\x00\x00".to_vec();
+        if stop_commands[stop_before..]
+            .iter()
+            .zip(&stop_ifidx[stop_before..])
+            .any(|((command, body, _), index)| {
+                *command == 263 && *index == 1 && **body == mbss_clear
+            })
+            || bus.vif_ap_change(|p| p.active)
+            || vap.link_up()
+            || !bus.ap_change(|p| p.active && p.up && p.formed)
+        {
+            return Err("secondary AP stop cleared mbss or disturbed the primary AP");
+        }
+        block(device.stop_ap_async(&primary_authority)).map_err(|_| "primary AP STOP")?;
+        if bus.ap_change(|p| p.active) {
+            return Err("primary AP stop kept its BSS");
+        }
+        Ok(())
+    })();
+    super::vif::withdraw_family(crate::cyw43439::fullmac::Family::Pcie);
+    bus.d3_ack(true);
+    let _ = block(device.teardown());
+    *ACTIVE_TEST.lock() = None;
+    narf_wireless::registry::unregister(&name);
+    narf_net::registry().unregister(&name);
+    narf_net::iface::unregister(&name);
+    result
+}
+
+fn smoke_brcmf_msgbuf_primary_ap_secondary_ap_mbss() -> TestResult {
+    match primary_ap_secondary_ap_mbss() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_brcmf_msgbuf_primary_ap_secondary_ap_mbss
+);
+
+/// MBSS channel agreement: a secondary AP requesting another channel
+/// beside a running primary AP is refused before any firmware
+/// mutation, and the primary AP is undisturbed.
+fn secondary_ap_mbss_channel_mismatch() -> Result<(), &'static str> {
+    use super::ap_native_tests::{config, Source};
+    use narf_capabilities::{Cap, Invoke};
+    use narf_wireless::ap_control::ApControlAuthority;
+    const NAME: &str = "wlvap7";
+    let (adapter, bus) = firmware::create(7, false).map_err(|_| "CR4 msgbuf attach")?;
+    bus.enable_ap();
+    bus.enable_vif_ap();
+    bus.set_caps(b"ap sta mbss");
+    let database = Arc::new(narf_wireless::reg::db::Database::new());
+    database.install(firmware::domain());
+    let mut station = block(Station::initialize_live(adapter, &[], database.clone()))
+        .map_err(|_| "primary station over msgbuf")?;
+    let owner = block(super::vif::discover(&mut station.runtime, station.mac))
+        .map_err(|_| "cap discovery")?
+        .ok_or("firmware cap refused")?;
+    if !owner.features().mbss {
+        return Err("cap tokens not parsed as mbss");
+    }
+    let name = narf_net::iface::register("wlan%d", OWN, send);
+    let device = shell(name.clone(), station);
+    device.state.try_lock().ok_or("state")?.vif = Some(owner);
+    device.ap_fixture_setup(database);
+    super::vif::register_primary(&device);
+    narf_net::iface::set_link_state(&name, false);
+    device.set_iftype(3).map_err(|_| "primary AP mode")?;
+    let cap = narf_net::registry()
+        .register(&narf_net::bootstrap_authority(), Registered(device.clone()))
+        .map_err(|_| "primary registered netdev")?;
+    let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+        iface: cap,
+        daemon: Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap(),
+    })
+    .map_err(|_| "primary admin authority")?
+    .admin;
+    let iface: Arc<dyn WirelessNetIface> = device.clone();
+    narf_wireless::registry::register(iface.clone());
+    narf_net::iface::set_link_state(&name, true);
+    let result = (|| {
+        let primary_source = Arc::new(Source::new());
+        let primary_authority = ApControlAuthority::bind(
+            admin.clone(),
+            &iface,
+            0,
+            narf_net::iface::lookup(&name).ok_or("ifindex")?.ifindex,
+            primary_source.clone(),
+        )
+        .map_err(|_| "primary AP authority bind")?
+        .reserve()
+        .map_err(|_| "primary AP control reservation")?;
+        let (primary_config, primary_settings) = config(false);
+        block(device.start_ap_with_settings_async(
+            &primary_authority,
+            primary_config,
+            primary_settings,
+        ))
+        .map_err(|_| "primary AP START")?;
+        if !bus.ap_change(|p| p.active && p.up && p.formed) {
+            return Err("primary AP not running");
+        }
+        let vap = device
+            .vif_new(NAME, 3, None)
+            .map_err(|_| "secondary AP shell admission")?;
+        block(device.vif_worker());
+        if vap.ap_sme_capabilities() != Some(0) {
+            return Err("secondary AP shell not attached after IF ADD");
+        }
+        narf_net::iface::set_link_state(NAME, true);
+        let secondary_cap = narf_net::registry()
+            .with_handle(NAME, |cap| *cap)
+            .ok_or("secondary netdev handle")?;
+        let secondary_admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+            iface: secondary_cap,
+            daemon: Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap(),
+        })
+        .map_err(|_| "secondary admin authority")?
+        .admin;
+        let secondary_iface: Arc<dyn WirelessNetIface> = vap.clone();
+        let source = Arc::new(Source::new());
+        let authority = ApControlAuthority::bind(
+            secondary_admin,
+            &secondary_iface,
+            0,
+            narf_net::iface::lookup(NAME).ok_or("ifindex")?.ifindex,
+            source.clone(),
+        )
+        .map_err(|_| "secondary AP authority bind")?
+        .reserve()
+        .map_err(|_| "secondary AP control reservation")?;
+        // Primary AP runs on channel 6 (2437 MHz); request channel 1.
+        let (mut ap_config, settings) = config(false);
+        ap_config.beacon_head[10..22].copy_from_slice(&[VIF, VIF].concat());
+        ap_config.frequency_mhz = 2412;
+        let before = bus.commands().len();
+        if block(vap.start_ap_with_settings_async(&authority, ap_config, settings)).is_ok() {
+            return Err("channel-mismatched secondary AP START was admitted");
+        }
+        let commands = bus.commands();
+        let ifidx = bus.command_ifidx();
+        if commands[before..]
+            .iter()
+            .zip(&ifidx[before..])
+            .any(|((command, _, _), index)| *command == 26 && *index == 1)
+            || vap.link_up()
+            || !bus.ap_change(|p| p.active && p.up && p.formed)
+        {
+            return Err("refused secondary AP mutated firmware or disturbed the primary AP");
+        }
+        block(device.stop_ap_async(&primary_authority)).map_err(|_| "primary AP STOP")?;
+        Ok(())
+    })();
+    super::vif::withdraw_family(crate::cyw43439::fullmac::Family::Pcie);
+    bus.d3_ack(true);
+    let _ = block(device.teardown());
+    *ACTIVE_TEST.lock() = None;
+    narf_wireless::registry::unregister(&name);
+    narf_net::registry().unregister(&name);
+    narf_net::iface::unregister(&name);
+    result
+}
+
+fn smoke_brcmf_msgbuf_secondary_ap_mbss_channel_mismatch() -> TestResult {
+    match secondary_ap_mbss_channel_mismatch() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/brcmfmac/vif",
+    smoke_brcmf_msgbuf_secondary_ap_mbss_channel_mismatch
+);
+
 /// Linux 7.3-rc4 `p2p.c` `brcmf_p2p_add_vif` (GO) and `cfg80211.c`
 /// `brcmf_cfg80211_start_ap`/`_stop_ap` P2P_GO branch over msgbuf: the
 /// GO connection bsscfg comes from `p2p_ifadd` on the primary, its BSS is
