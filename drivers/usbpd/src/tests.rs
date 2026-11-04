@@ -363,3 +363,43 @@ kernel_test_in!(
     "drivers/usbpd/fusb302",
     smoke_fusb302_default_address_constant
 );
+
+fn smoke_tcpc_connector_published_to_both_registries() -> TestResult {
+    // Reset both registries (mirrors extcon sysfs_bridge tests' reset()).
+    narf_drivers_extcon::class::REGISTRY.lock().clear();
+    narf_drivers_extcon::typec_class::TYPEC_REGISTRY
+        .lock()
+        .clear();
+    let conn = crate::publish_tcpc_connector("test-bus@0x22");
+    // Publication → both registries, exactly once.
+    if narf_drivers_extcon::typec_class::TYPEC_REGISTRY
+        .lock()
+        .len()
+        != 1
+    {
+        return TestResult::Fail("TYPEC_REGISTRY should hold exactly one connector");
+    }
+    if narf_drivers_extcon::class::lookup("typec-test-bus@0x22").is_none() {
+        return TestResult::Fail("extcon REGISTRY missing the TCPC connector");
+    }
+    // Initial class observation: an unattached port reads Dual/Dual.
+    if conn.power_role() != narf_drivers_extcon::typec::PowerRole::Dual
+        || conn.data_role() != narf_drivers_extcon::typec::DataRole::Dual
+    {
+        return TestResult::Fail("new TCPC connector should read Dual/Dual");
+    }
+    // A second binding is a second object, not a second entry for the first.
+    let _ = crate::publish_tcpc_connector("test-bus@0x38");
+    if narf_drivers_extcon::typec_class::TYPEC_REGISTRY
+        .lock()
+        .len()
+        != 2
+    {
+        return TestResult::Fail("second TCPC binding should add a second registry entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usbpd/typec-publish",
+    smoke_tcpc_connector_published_to_both_registries
+);

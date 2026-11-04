@@ -2815,4 +2815,49 @@ pub(crate) mod tests {
         "drivers/usbpd/tcpm",
         smoke_source_epr_request_outside_epr_mode_hard_resets
     );
+
+    fn smoke_tcpm_state_sync_feeds_typec_connector() -> TestResult {
+        let chip = Arc::new(FakeChip::new(CcStatus {
+            cc1: CcState::Rd,
+            cc2: CcState::Open,
+        }));
+        let port = TcpmPort::new(
+            chip.clone(),
+            SinkPolicy::default(),
+            SourcePolicy::default(),
+            alloc::string::String::from("sync-test"),
+        );
+        let conn = Arc::new(narf_drivers_extcon::typec::TypecConnector::new("sync-test"));
+        let cap = narf_usbpd::bootstrap_usbpd_authority();
+        // Attach as source: Rd on CC1 → AttachedSrc, DFP by default.
+        let _ = port.step(&cap).unwrap();
+        if port.state() != PortState::AttachedSrc {
+            return TestResult::Fail("expected AttachedSrc after Rd attach");
+        }
+        crate::sync_typec_connector(&conn, &port);
+        if conn.power_role() != narf_drivers_extcon::typec::PowerRole::Source
+            || conn.data_role() != narf_drivers_extcon::typec::DataRole::Host
+            || conn.orientation() != narf_drivers_extcon::typec::Orientation::Normal
+        {
+            return TestResult::Fail("AttachedSrc sync should read Source/Host/Normal");
+        }
+        // Detach: CC open → Unattached, roles and orientation clear.
+        chip.set_cc(CcState::Open, CcState::Open);
+        let _ = port.step(&cap).unwrap();
+        if port.state() != PortState::Unattached {
+            return TestResult::Fail("expected Unattached after CC open");
+        }
+        crate::sync_typec_connector(&conn, &port);
+        if conn.power_role() != narf_drivers_extcon::typec::PowerRole::Dual
+            || conn.data_role() != narf_drivers_extcon::typec::DataRole::Dual
+            || conn.orientation() != narf_drivers_extcon::typec::Orientation::Unknown
+        {
+            return TestResult::Fail("detach sync should clear roles and orientation");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/tcpm-typec-sync",
+        smoke_tcpm_state_sync_feeds_typec_connector
+    );
 }

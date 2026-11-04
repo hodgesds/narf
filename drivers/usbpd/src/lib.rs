@@ -173,13 +173,92 @@ fn register_port(bus_name: &str, i2c_addr: u8, tcpc: Arc<dyn Tcpc>) {
         label.clone(),
     ));
     tcpm::register_port(port.clone());
+    // #1211: one TypecConnector per TCPC binding, published through BOTH
+    // registries at creation — the single publication path. UCSI
+    // connectors take the same path (ucsi::publish). A connector is owned
+    // by exactly one producer (extcon spec §4: host PD/mux operations must
+    // not compete with firmware for one connector); on this platform the
+    // two producers are mutually exclusive anyway, since PNP0CA0 presence
+    // makes register_initcalls skip TCPC probing entirely.
+    let typec = publish_tcpc_connector(&label);
     let alt = Arc::new(altmode_dp::DpAltModePort::new(
         port.clone(),
         dp_gpu_bridge::ConnectorId::from_index(connector_idx),
+        typec.clone(),
     ));
     altmode_dp::register_port(alt.clone());
-    spawn_tcpm_task(port, label.clone());
+    spawn_tcpm_task(port, label.clone(), typec);
     altmode_dp::spawn_discovery_task(alt, label);
+}
+
+/// Create and register one TypecConnector for a TCPC binding, through BOTH
+/// the extcon registry and `TYPEC_REGISTRY`.
+///
+/// This is the single publication path: every producer registers through
+/// both registries at creation, exactly once per connector object.
+/// `TYPEC_REGISTRY` has no dedup and the sysfs bridge publishes one
+/// `port<N>` per entry, so a second registration of the same object
+/// would double-publish it.
+///
+/// Testable seam: exercises publication without spawning tasks.
+pub(crate) fn publish_tcpc_connector(
+    label: &str,
+) -> Arc<narf_drivers_extcon::typec::TypecConnector> {
+    // Connector names are boot-lifetime objects.
+    let name = alloc::boxed::Box::leak(alloc::format!("typec-{}", label).into_boxed_str());
+    let conn = Arc::new(narf_drivers_extcon::typec::TypecConnector::new(name));
+    narf_drivers_extcon::class::register(conn.clone());
+    narf_drivers_extcon::typec_class::typec_register(conn.clone());
+    conn
+}
+
+/// Mirror live TCPM state into a TCPC-owned TypecConnector. Called by the
+/// TCPM task on every port-state change and on data-role-swap outcomes
+/// (a power-role swap always changes `PortState`, so the state-change
+/// call already covers it).
+///
+/// Roles come from the attach side. The data role defaults by side
+/// (source → host, sink → device) and is corrected by DR-swap outcomes;
+/// sink-side DR swap does not exist yet (G7). Detach and error recovery
+/// clear roles and entered alt modes; BIST leaves class state untouched.
+/// Orientation comes from the live CC snapshot; a failed CC read leaves
+/// the previous orientation in place rather than inventing one.
+pub(crate) fn sync_typec_connector(
+    conn: &Arc<narf_drivers_extcon::typec::TypecConnector>,
+    port: &tcpm::TcpmPort,
+) {
+    use narf_drivers_extcon::typec::{DataRole, PowerRole};
+    match port.state() {
+        tcpm::PortState::Unattached | tcpm::PortState::ErrorRecovery => {
+            conn.set_power_role(PowerRole::Dual);
+            conn.set_data_role(DataRole::Dual);
+            for mode in conn.entered_alt_modes() {
+                conn.set_alt_mode(mode, false);
+            }
+            if let Ok(cc) = port.tcpc().cc_status() {
+                conn.update_cc(cc);
+            }
+        }
+        tcpm::PortState::AttachedSnk => {
+            conn.set_power_role(PowerRole::Sink);
+            conn.set_data_role(DataRole::Device);
+            if let Ok(cc) = port.tcpc().cc_status() {
+                conn.update_cc(cc);
+            }
+        }
+        tcpm::PortState::AttachedSrc => {
+            conn.set_power_role(PowerRole::Source);
+            conn.set_data_role(if port.source().is_dfp() {
+                DataRole::Host
+            } else {
+                DataRole::Device
+            });
+            if let Ok(cc) = port.tcpc().cc_status() {
+                conn.update_cc(cc);
+            }
+        }
+        tcpm::PortState::Bist => {}
+    }
 }
 
 /// Spawn an async task that drives one TCPM port to a Ready contract
@@ -195,7 +274,11 @@ fn register_port(bus_name: &str, i2c_addr: u8, tcpc: Arc<dyn Tcpc>) {
 /// drifted by >2x across our two bring-up targets. Same bug class as
 /// the LAPIC initial_count note: hard-coded cycle counts read as
 /// timing bugs on real silicon.
-fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
+fn spawn_tcpm_task(
+    port: Arc<tcpm::TcpmPort>,
+    label: alloc::string::String,
+    typec: Arc<narf_drivers_extcon::typec::TypecConnector>,
+) {
     use core::fmt::Write as _;
     use narf_time::{Deadline, SleepUntil};
     use tcpm::{PortState, PortStepOutcome};
@@ -222,6 +305,8 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
             };
             if port.state() != last_logged_state {
                 last_logged_state = port.state();
+                // #1211: mirror the new attach/role state into the class.
+                sync_typec_connector(&typec, &port);
                 let _ = writeln!(
                     narf_console::Writer,
                     "  tcpm: {} → {:?}",
@@ -277,6 +362,9 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                         label,
                         if now_dfp { "DFP" } else { "UFP" }
                     );
+                    // PortState does not change on a DR swap, so the
+                    // state-change branch above does not fire: sync here.
+                    sync_typec_connector(&typec, &port);
                     narf_scheduler::yield_now().await;
                 }
                 PortStepOutcome::VconnSwapped { now_supplying } => {
