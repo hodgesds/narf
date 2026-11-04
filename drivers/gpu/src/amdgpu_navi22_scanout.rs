@@ -118,6 +118,17 @@ pub fn vblank_phase(p: Position, timing: &Timing) -> Option<crate::amdgpu_dcn401
     .phase()
 }
 
+/// The pipeline's errors in the presentation owner's terms.
+fn pipeline_error(e: crate::amdgpu_navi22_modeset::Error) -> Error {
+    use crate::amdgpu_navi22_modeset::Error as E;
+    match e {
+        E::Block(e) => e,
+        E::Unsupported => Error::Unsupported,
+        E::Invalid => Error::Invalid,
+        _ => Error::Busy,
+    }
+}
+
 /// Distinguishes successive `Scanout`s (relight, recovery), so a flip
 /// armed on one is never completed against its replacement.
 static EPOCHS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -482,6 +493,107 @@ impl Scanout {
             kind,
             deadline: narf_time::Deadline::after_us(flip_timeout_us(&longest)),
         })
+    }
+    /// [`Scanout::arm`] for a frame whose placement differs from what the
+    /// pipe shows (`commit_planes_for_stream`, full update): the update's
+    /// raised watermarks first (`prepare_bandwidth`), then under the OTG's
+    /// pipe-control lock the plane's registers
+    /// ([`crate::amdgpu_navi22_modeset::Pipeline::program_plane`]) and the
+    /// surface address, so both latch at one VUPDATE. A failure after the
+    /// lock leaves the pipe's state unknown: the owner fails as a flip that
+    /// never latched does.
+    pub async fn arm_plane(
+        &mut self,
+        kind: ArmedKind,
+        external: u64,
+        pipeline: &mut crate::amdgpu_navi22_modeset::Pipeline,
+        update: &crate::amdgpu_navi22_plane::Update,
+    ) -> Result<Armed, Error> {
+        self.running()?;
+        let address = match kind {
+            ArmedKind::Back => self.buffers.back().ok_or(Error::Invalid)?.address,
+            ArmedKind::External => external,
+        };
+        let mut longest = self.timing;
+        if let Some(bounds) = self.vrr {
+            longest.v_total = bounds.v_total_max;
+        }
+        self.program_plane_locked(pipeline, update, address).await?;
+        self.state = State::Flipping;
+        if self.vrr.is_some() {
+            if let Err(error) = self.flip.manual_trigger() {
+                self.state = State::Failed(error);
+                return Err(error);
+            }
+        }
+        Ok(Armed {
+            epoch: self.epoch,
+            address,
+            kind,
+            deadline: narf_time::Deadline::after_us(flip_timeout_us(&longest)),
+        })
+    }
+    /// The HDP flush, the raised watermarks, then the plane's registers and
+    /// `address` under the pipe-control lock (always released). A failure
+    /// after the lock fails the owner.
+    async fn program_plane_locked(
+        &mut self,
+        pipeline: &mut crate::amdgpu_navi22_modeset::Pipeline,
+        update: &crate::amdgpu_navi22_plane::Update,
+        address: u64,
+    ) -> Result<(), Error> {
+        // The producer's CPU writes must reach VRAM before the latch.
+        pipeline.flush().map_err(pipeline_error)?;
+        pipeline
+            .prepare_plane(update)
+            .await
+            .map_err(pipeline_error)?;
+        self.flip.pipe_control_lock(true)?;
+        let programmed = match pipeline.program_plane(update).await {
+            Ok(()) => self.flip.program_locked(address),
+            Err(e) => Err(pipeline_error(e)),
+        };
+        // The lock is always released, so a failure cannot freeze updates.
+        let unlocked = self.flip.pipe_control_lock(false);
+        if let Err(error) = programmed.and(unlocked) {
+            self.state = State::Failed(error);
+            return Err(error);
+        }
+        Ok(())
+    }
+    /// [`Scanout::return_to_owned`] when the pipe shows another placement
+    /// than the owned front's (a client framebuffer in place, or a placed
+    /// copy): the owned front's full-screen plane `update` latches with its
+    /// address, then the watermarks follow (`optimize_bandwidth`).
+    pub async fn return_to_owned_plane(
+        &mut self,
+        pipeline: &mut crate::amdgpu_navi22_modeset::Pipeline,
+        update: &crate::amdgpu_navi22_plane::Update,
+    ) -> Result<Option<FlipDone>, Error> {
+        self.running()?;
+        let front = self.buffers.front().address;
+        self.program_plane_locked(pipeline, update, front).await?;
+        self.state = State::Flipping;
+        if self.vrr.is_some() {
+            if let Err(error) = self.flip.manual_trigger() {
+                self.state = State::Failed(error);
+                return Err(error);
+            }
+        }
+        match self.wait_latched().await {
+            Ok(()) => {
+                self.state = State::Running;
+                self.flips += 1;
+            }
+            Err(error) => {
+                self.state = State::Failed(error);
+                return Err(error);
+            }
+        }
+        let frame = self.flip.position().map(|p| p.frame).unwrap_or(0);
+        let back = self.buffers.show_owned_front();
+        pipeline.optimize_plane().map_err(pipeline_error)?;
+        Ok(Some(FlipDone { front, back, frame }))
     }
     /// One non-blocking check of an armed flip: acknowledge pending
     /// pflip/VUPDATE vectors, and once the HUBP no longer reports the flip

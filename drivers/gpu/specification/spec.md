@@ -11567,6 +11567,10 @@ other revisions are refused.
 `unsafe amdgpu_dcn30_hubbub::Hubbub::new(gpu, pci_cap)` owns the DCN3.0
 arbiter. `dchub_refclk_khz(dccg_ref)` mirrors `hubbub2_get_dchub_ref_freq`
 but refuses a disabled global timer or a reference outside 40–60 MHz.
+`program_live(&WatermarkSet, &mut current, refclk, safe_to_lower)` is the
+live `hubbub3_program_watermarks` around a plane update: each watermark is
+written only when lowering is safe or it rises, `current` follows what was
+written, and it returns whether a lower value is pending.
 `unsafe program(&WatermarkSet, refclk)` (no HUBP fetching) writes sets A–D
 identically (data/VM-row urgency, trip to memory, SR enter/exit, DRAM clock
 change, FRAC_URG_BW nom/flip), `ARB_SAT_LEVEL = 60 * refclk_mhz`,
@@ -11904,13 +11908,44 @@ the pinned GEM source through the presentation handoff.
 The DCN30 presenter waits for implicit WRITE fences before taking the GPU
 owner (`frame_copy::wait_rendered`: woken by any Navi22 fence interrupt via
 `amdgpu_fence_navi22::wait_change`, re-sampled at least every millisecond,
-5 s bound). A pinned GEM framebuffer whose pitch and size equal the lit
-surface's and whose first pixel is 256-byte aligned (`frame_copy::direct`,
-reasons `Ineligible::{NotGem, Pitch, Size, Alignment}`) is scanned out in
-place, as amdgpu_dm flips to the client BO address:
+5 s bound). A pinned GEM framebuffer whose first pixel is 256-byte aligned
+and whose pitch fits the HUBP (`frame_copy::direct`, reasons
+`Ineligible::{NotGem, Pitch, Alignment}`) is scanned out in place at its own
+pitch, size and placement, as amdgpu_dm flips to the client BO address:
 `ColdBoot::flip_display_external(address)` → `Scanout::flip_external`
 programs it into the HUBP and completes when SURFACE_EARLIEST_INUSE names
-it. The flip event completes at that latch. The pin is kept
+it. A frame whose placement (`amdgpu_navi22_plane::Request { pitch, width,
+height, src, dst }`: `frame_copy::direct_request`, or for a copy
+`frame_copy::copied_request`, its SRC unscaled at the owned back surface's
+origin) differs from what the pipe shows (`ColdBoot::display_plane_request`)
+is a DC full update: `amdgpu_navi22_plane::plan(timing, vco, soc, lit,
+&request) -> Result<Update { request, scaler, plan }, Refusal>` (also
+`Basis::plan`) runs `amdgpu_dcn30_scl::build` and `dml30::plan_stream` on
+the lit stream; `Refusal::{Invalid, Geometry, Mode, Clock, Odm}`
+(LINUX-GAP: an update needing more DPPCLK/DISPCLK than the lit stream, or a
+stream on two ODM pipes, is refused where DC would raise the clocks or
+place a viewport per slice). The lit owned surface is itself the
+full-screen request (`Request::full_screen`), whose plan is the modeset's.
+`ColdBoot::arm_display_plane(kind, external, &update)` →
+`Scanout::arm_plane(kind, external, &mut Pipeline, &update)` is
+`commit_planes_for_stream`: the HDP flush, `Pipeline::prepare_plane`
+(`prepare_bandwidth`: `Hubbub::program_live(.., safe_to_lower = false)`),
+then under `Flip::pipe_control_lock` `Pipeline::program_plane`
+(`dcn20_program_pipe`: `Otg::update_global_sync` when the plan moved
+VSTARTUP/VUPDATE/VREADY, `Hubp::setup`, the cursor TTU,
+`Dpp::set_scaler`, `Mpc::set_bg_color(black)`, `Hubp::set_viewport`,
+`Hubp::set_pitch`) and `Flip::program_locked(address)`, the lock always
+released (a failure inside it fails the owner). Once the flip latches the
+presenter calls `ColdBoot::optimize_display_plane` (`optimize_bandwidth`:
+the lowered watermarks). A frame the lit pipe cannot fetch in place
+(`Direct::Refused`) takes the copy path; a placement refused there too is
+dropped with its event completed (logged once per refusal). Lastclose
+(`return_display_to_owned`, also when only a placed copy is shown:
+`display_plane_is_owned`) flips back with the owned front's plane
+(`Scanout::return_to_owned_plane`). The atomic check refuses (EINVAL) a
+placement DC would (`amdgpu_native_kms::primary_placement_admitted` →
+`amdgpu_navi22_platform::placement_admitted` on the lit stream's
+`Pipeline::plane_basis()`, kept with the presentation geometry). The flip event completes at that latch. The pin is kept
 (`frame_copy::ShownPin`) until a later flip latches (client, copied frame,
 `return_to_owned`) or the pipe is stopped or relit; a failed flip keeps it.
 While a client framebuffer is shown (`Scanout::external_front`) the
@@ -11928,14 +11963,16 @@ pending check, retaking the owner every `POLL_US`) completes it. Each
 `Scanout` has an epoch: a relight, recovery, stop or withdraw while armed
 makes `poll_armed` refuse (`Busy`) and the frame is dropped with its event
 completed; timeout and device loss fail the present. A pinned GEM frame that
-cannot be scanned out in place is copied by the GPU, not the CPU:
+cannot be scanned out in place has its SRC rectangle copied by the GPU, not
+the CPU, to the owned back surface's origin (the pipe scales and positions
+it):
 `amdgpu_rdna2_vram::blit_ops(src, src_pitch, dst, dst_pitch, row_bytes,
 rows)` (one whole-line copy for equal pitches, else one per row) run by
 `amdgpu_rdna2_vram::blit(ops, held)` on the kernel SDMA queue into the owned
 back surface, the owner held only to read that surface and to flip; it falls
 back to the CPU copy only without a kernel SDMA queue. Dumb frames are copied
-by bounded rows, honoring pitch and offset, one streaming store per row into
-the write-combined back buffer. The
+by bounded rows (a placed one's SRC rectangle), honoring pitch and offset,
+one streaming store per row into the write-combined back buffer. The
 frame retains its `ScanoutPin` through queueing, readback, copying and the
 completed native back-buffer flip. Unsupported format/extent checks precede
 queueing. GEM sources never fall through to a raw physical pointer. The
@@ -11945,7 +11982,9 @@ every 512 presents. Secondary CRTCs still cannot present.
 `ColdBoot::{modeset_display(connector, sink, want, draw), stop_display(),
 display_scanout(), display_admitted(), display_output(),
 prepare_display_back_buffer(), flip_display(), flip_display_external(address),
-arm_display_flip(kind, external), poll_display_flip(&armed),
+arm_display_flip(kind, external), arm_display_plane(kind, external, &update),
+optimize_display_plane(), display_plane_request(), plan_display_plane(&request),
+display_plane_basis(), display_plane_is_owned(), poll_display_flip(&armed),
 return_display_to_owned(), set_display_cursor()}` own
 these. `into_recovery` re-prepares DMUB and the display owner from the
 retained VBIOS/routes so the recovered sequence restarts DMUB.
@@ -13866,6 +13905,12 @@ line; `disable` parks every segment, drops the master enable, stops the timing
 generator and waits for the block to report idle rather than assuming it.
 Pixel blanking is deliberately absent: from DCN2 onwards a stream is blanked by
 the OPP's display pattern generator, not by the timing generator.
+`update_global_sync(&GlobalSync)` (DCN3.0, running generator, caller holding
+the pipe-control lock) is `dcn20_program_tg` for a plane update whose mode
+math moved the sync: `optc1_program_global_sync`, `optc1_wait_for_state
+(CRTC_STATE_VACTIVE)` (OTG_STATUS.OTG_V_ACTIVE_DISP, 100 ms, logged on
+timeout as REG_WAIT is), then `optc1_set_vtg_params(program_fp2)` (VTG0_FP2
+for the new VStartup, VCOUNT_INIT at the blank start).
 
 `amdgpu_dcn_hubp::Hubp::new` is unsafe: it claims one hub pixel pipe, whose
 scanout memory the caller must keep reserved until the pipe is blanked.

@@ -2616,6 +2616,71 @@ impl ColdBoot {
         let (scanout, _, flush) = self.presentation()?;
         scanout.arm(kind, external, flush)
     }
+    /// Whether the lit pipe shows its owned front's own full-screen plane
+    /// (no client placement left programmed).
+    pub fn display_plane_is_owned(&self) -> bool {
+        let h = &self.sequence.backend;
+        let (Some(scanout), Some(pipeline)) = (h.scanout.as_ref(), h.modeset.as_ref()) else {
+            return true;
+        };
+        let front = scanout.front().fb;
+        pipeline.plane_request()
+            == Some(crate::amdgpu_navi22_plane::Request::full_screen(
+                front.pitch / 4,
+                front.width,
+                front.height,
+                &scanout.timing(),
+            ))
+    }
+    /// The DML30 plan the lit pipe runs under now (`Pipeline::plane_plan`).
+    pub fn display_plane_plan(&self) -> Option<crate::amdgpu_dml30::Plan> {
+        self.sequence.backend.modeset.as_ref()?.plane_plan()
+    }
+    /// The lit stream placements are planned on (`Pipeline::plane_basis`).
+    pub fn display_plane_basis(&self) -> Option<crate::amdgpu_navi22_plane::Basis> {
+        self.sequence.backend.modeset.as_ref()?.plane_basis()
+    }
+    /// The primary placement the lit pipe shows (its owned surface, full
+    /// screen, until a plane update).
+    pub fn display_plane_request(&self) -> Option<crate::amdgpu_navi22_plane::Request> {
+        self.sequence.backend.modeset.as_ref()?.plane_request()
+    }
+    /// [`crate::amdgpu_navi22_plane::plan`] on the lit stream.
+    pub fn plan_display_plane(
+        &self,
+        request: &crate::amdgpu_navi22_plane::Request,
+    ) -> Result<crate::amdgpu_navi22_plane::Update, crate::amdgpu_navi22_plane::Refusal> {
+        self.sequence
+            .backend
+            .modeset
+            .as_ref()
+            .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)?
+            .plan_plane(request)
+    }
+    /// Arm a flip that also moves the plane to `update`
+    /// (`Scanout::arm_plane`).
+    pub async fn arm_display_plane(
+        &mut self,
+        kind: crate::amdgpu_navi22_scanout::ArmedKind,
+        external: u64,
+        update: &crate::amdgpu_navi22_plane::Update,
+    ) -> Result<crate::amdgpu_navi22_scanout::Armed, crate::amdgpu_dcn_clk::Error> {
+        use crate::amdgpu_dcn_clk::Error as E;
+        let h = &mut self.sequence.backend;
+        let scanout = h.scanout.as_mut().ok_or(E::Invalid)?;
+        let pipeline = h.modeset.as_mut().ok_or(E::Invalid)?;
+        scanout.arm_plane(kind, external, pipeline, update).await
+    }
+    /// `optimize_bandwidth` once a plane update latched: the watermarks it
+    /// lowers.
+    pub fn optimize_display_plane(&mut self) -> Result<(), crate::amdgpu_dcn_clk::Error> {
+        use crate::amdgpu_dcn_clk::Error as E;
+        let pipeline = self.sequence.backend.modeset.as_mut().ok_or(E::Invalid)?;
+        pipeline.optimize_plane().map_err(|e| match e {
+            crate::amdgpu_navi22_modeset::Error::Block(e) => e,
+            _ => E::Busy,
+        })
+    }
     /// One non-blocking latch check of an armed flip (`Scanout::poll_armed`).
     pub fn poll_display_flip(
         &mut self,
@@ -2635,6 +2700,24 @@ impl ColdBoot {
     pub async fn return_display_to_owned(
         &mut self,
     ) -> Result<Option<crate::amdgpu_navi22_scanout::FlipDone>, crate::amdgpu_dcn_clk::Error> {
+        use crate::amdgpu_dcn_clk::Error as E;
+        // The owned front is the lit plane: a client placement shown now is
+        // undone with the flip back.
+        let h = &mut self.sequence.backend;
+        if let (Some(scanout), Some(pipeline)) = (h.scanout.as_mut(), h.modeset.as_mut()) {
+            let front = scanout.front().fb;
+            let timing = scanout.timing();
+            let owned = crate::amdgpu_navi22_plane::Request::full_screen(
+                front.pitch / 4,
+                front.width,
+                front.height,
+                &timing,
+            );
+            if pipeline.plane_request() != Some(owned) {
+                let update = pipeline.plan_plane(&owned).map_err(|_| E::Invalid)?;
+                return scanout.return_to_owned_plane(pipeline, &update).await;
+            }
+        }
         let (scanout, _, flush) = self.presentation()?;
         scanout.return_to_owned(flush).await
     }

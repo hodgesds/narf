@@ -917,7 +917,13 @@ fn per_pipe(clock: Fx, pipes: u32) -> Fx {
 /// Mode support plus the performance calculation for one plane. Fails before
 /// any hardware is touched when the board cannot carry the mode.
 pub fn plan(config: &Config, soc: &Soc) -> Result<Plan, Error> {
-    let joint = plan_joint(&[Stream::tmds(*config)], soc)?;
+    plan_stream(&Stream::tmds(*config), soc)
+}
+
+/// [`plan`] for one stream whose plane may be positioned or scaled
+/// (`Stream::scale`), on one pipe.
+pub fn plan_stream(stream: &Stream, soc: &Soc) -> Result<Plan, Error> {
+    let joint = plan_joint(core::slice::from_ref(stream), soc)?;
     let plane = joint.planes.first().ok_or(Error::Invalid)?;
     let pipe = plane.pipes[0].ok_or(Error::Invalid)?;
     if plane.odm != Odm::None {

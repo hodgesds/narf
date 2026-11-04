@@ -1,7 +1,8 @@
 //! DCN30's linear primary: a pinned GEM framebuffer the HUBP scans out in
-//! place (amdgpu_dm's flip to the client BO address), or a retained GEM
-//! placement or dumb buffer copied into the native back buffer before its
-//! VUPDATE flip.
+//! place (amdgpu_dm's flip to the client BO address) at its own pitch,
+//! viewport and placement, or a retained GEM placement or dumb buffer whose
+//! SRC rectangle is copied unscaled into the native back buffer, which the
+//! pipe then shows with the frame's placement.
 use super::{Frame, ScanError};
 use crate::amdgpu_present_damage as damage;
 use crate::{amdgpu_gem::GemPlacement, amdgpu_navi48_platform::PlaneFrame};
@@ -59,86 +60,80 @@ impl Frame {
     }
 }
 
-/// The framebuffer row a placed plane shows on CRTC row `y`, or None where
-/// its CRTC rectangle does not reach: DC's recout and vertical scale
-/// ratio, sampled at the destination pixel's centre (nearest source row;
-/// LINUX-GAP: DC's DSCL filters with its polyphase taps).
-pub(super) fn placed_source_row(p: &crate::drm::card::Placement, y: u32) -> Option<u32> {
-    let (_, sy, _, sh) = p.src;
-    let (_, dy, _, dh) = p.dst;
-    let within = i64::from(y) - i64::from(dy);
-    if within < 0 || within >= i64::from(dh) {
-        return None;
-    }
-    let offset = (2 * within + 1) * i64::from(sh) / (2 * i64::from(dh));
-    u32::try_from(i64::from(sy) + offset).ok()
-}
-
-/// One composed CRTC row of a placed plane: `source` (the framebuffer row
-/// [`placed_source_row`] chose) scaled into its CRTC rectangle, the black
-/// background elsewhere. Columns past the CRTC are clipped.
-pub(super) fn compose_row(p: &crate::drm::card::Placement, source: &[u32], out: &mut [u32]) {
-    let (sx, _, sw, _) = p.src;
-    let (dx, _, dw, _) = p.dst;
-    for (x, px) in out.iter_mut().enumerate() {
-        let within = x as i64 - i64::from(dx);
-        *px = if within < 0 || within >= i64::from(dw) {
-            0
-        } else {
-            let offset = (2 * within + 1) * i64::from(sw) / (2 * i64::from(dw));
-            source
-                .get((i64::from(sx) + offset) as usize)
-                .copied()
-                .unwrap_or(0)
-        };
-    }
-}
-
 /// Why a GEM frame cannot be scanned out in place (it is then copied).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Ineligible {
     /// A dumb buffer (no GEM pin to fetch from).
     NotGem,
-    /// The pitch differs from the one the HUBP was programmed with.
+    /// The pitch does not fit the HUBP's 14-bit pitch field.
     Pitch,
-    /// The frame does not cover the active mode exactly.
-    Size,
     /// The first pixel is not on a 256-byte request boundary.
     Alignment,
-    /// The primary is positioned or scaled: it is composed into the owned
-    /// surface (LINUX-GAP: DC programs the HUBP viewport, DSCL recout and
-    /// scaler and the MPC background instead).
-    Placed,
 }
 impl Ineligible {
-    pub(super) const ALL: [Self; 5] = [
-        Self::NotGem,
-        Self::Pitch,
-        Self::Size,
-        Self::Alignment,
-        Self::Placed,
-    ];
+    pub(super) const ALL: [Self; 3] = [Self::NotGem, Self::Pitch, Self::Alignment];
+}
+
+/// The CRTC's full screen, as `(width, height)` of its mode.
+type Mode = (u32, u32);
+
+/// The SRC rectangle a frame shows: its placement's, else the mode's
+/// full screen from the framebuffer's origin.
+pub(super) fn source_rect(frame: &Frame, mode: Mode) -> (u32, u32, u32, u32) {
+    frame.placement.map_or((0, 0, mode.0, mode.1), |p| p.src)
+}
+/// The CRTC rectangle a frame shows its SRC in.
+fn crtc_rect(frame: &Frame, mode: Mode) -> (i32, i32, u32, u32) {
+    frame.placement.map_or((0, 0, mode.0, mode.1), |p| p.dst)
+}
+
+/// What the pipe fetches for `frame` scanned out in place: its own
+/// framebuffer (pitch in pixels, size) and its placement
+/// (`fill_dc_plane_info_and_addr`, `amdgpu_dm_plane_fill_dc_scaling_info`).
+pub(super) fn direct_request(frame: &Frame, mode: Mode) -> crate::amdgpu_navi22_plane::Request {
+    crate::amdgpu_navi22_plane::Request {
+        pitch: frame.pitch / 4,
+        width: frame.width,
+        height: frame.height,
+        src: source_rect(frame, mode),
+        dst: crtc_rect(frame, mode),
+    }
+}
+
+/// Where a frame that cannot be fetched in place is copied: its SRC
+/// rectangle, unscaled, to the origin of the owned back surface `back`,
+/// which the pipe then shows in the frame's CRTC rectangle. None when the
+/// SRC rectangle is larger than the owned surface. An unplaced frame copies
+/// its full screen (clipped to the framebuffer), as before.
+pub(super) fn copied_request(
+    frame: &Frame,
+    back: &narf_graphics_driver::generic::GenericFb,
+) -> Option<crate::amdgpu_navi22_plane::Request> {
+    let mode = (back.width, back.height);
+    let (_, _, w, h) = source_rect(frame, mode);
+    if w > back.width || h > back.height {
+        return None;
+    }
+    Some(crate::amdgpu_navi22_plane::Request {
+        pitch: back.pitch / 4,
+        width: back.width,
+        height: back.height,
+        src: (0, 0, w, h),
+        dst: crtc_rect(frame, mode),
+    })
 }
 
 /// `amdgpu_dm_plane_helper_prepare_fb` + `fill_plane_buffer_attributes`
-/// for the lit primary: the GPU address the HUBP fetches `frame` from,
-/// when it can be scanned out in place on a pipe showing `front` (the
-/// owned surface the modeset programmed: its pitch and size). `from_plane`
-/// already restricted frames to linear XR24/AR24 and the extent to the
-/// pinned (VRAM, contiguous) placement.
-pub(super) fn direct(
-    frame: &Frame,
-    front: &narf_graphics_driver::generic::GenericFb,
-) -> Result<u64, Ineligible> {
+/// for the lit primary: the GPU address the HUBP fetches `frame` from when
+/// it can be scanned out in place, at its own pitch and placement (the
+/// plane update programs the pitch, viewport and scaler with it).
+/// `from_plane` already restricted frames to linear XR24/AR24, SRC inside
+/// the framebuffer and the extent to the pinned (VRAM, contiguous)
+/// placement.
+pub(super) fn direct(frame: &Frame) -> Result<u64, Ineligible> {
     let pin = frame.bo.as_ref().ok_or(Ineligible::NotGem)?;
-    if frame.placement.is_some() {
-        return Err(Ineligible::Placed);
-    }
-    if frame.pitch != front.pitch {
+    if frame.pitch / 4 > crate::amdgpu_dcn_plane::MAX_DIMENSION + 1 {
         return Err(Ineligible::Pitch);
-    }
-    if (frame.width, frame.height) != (front.width, front.height) {
-        return Err(Ineligible::Size);
     }
     let address = pin
         .address()
@@ -493,59 +488,18 @@ mod tests {
         navi22_render_wait_wakes_on_fence_change
     );
 
-    /// Direct scanout takes a pinned client framebuffer only when the
-    /// HUBP can fetch it as programmed: same pitch and size as the lit
-    /// surface, first pixel on a 256-byte boundary. Everything else copies.
-    /// A positioned or scaled primary is composed into the owned surface:
-    /// its CRTC rectangle shows the SRC rectangle (nearest sample), the
-    /// background is black, and it is never fetched in place.
-    fn navi22_placed_primary_composes_and_is_not_direct() -> TestResult {
+    /// A positioned or scaled primary keeps its placement: scanned out in
+    /// place it is its own framebuffer's request; copied, its SRC moves to
+    /// the owned surface's origin and keeps its CRTC rectangle.
+    fn navi22_placed_primary_requests() -> TestResult {
         use crate::drm::card::Placement;
-        // KWin's 55x55 at (1912, 1073), scaled down to a 16-pixel row: x 5
-        // and up show source columns 0, 1, ...
-        let unscaled = Placement {
-            src: (0, 0, 55, 55),
-            dst: (5, 3, 55, 55),
+        use narf_graphics_driver::generic::GenericFb;
+        let kwin = Placement {
+            src: (3, 2, 55, 55),
+            dst: (1912, 1073, 55, 55),
         };
-        let source: Vec<u32> = (0..55).map(|x| 0x100 + x).collect();
-        let mut out = vec![0xffff_ffffu32; 16];
-        compose_row(&unscaled, &source, &mut out);
-        if out[..5] != [0; 5] || out[5] != 0x100 || out[15] != 0x10a {
-            return TestResult::Fail("unscaled placed row");
-        }
-        if placed_source_row(&unscaled, 2).is_some()
-            || placed_source_row(&unscaled, 3) != Some(0)
-            || placed_source_row(&unscaled, 57) != Some(54)
-            || placed_source_row(&unscaled, 58).is_some()
-        {
-            return TestResult::Fail("unscaled placed rows");
-        }
-        // 2x up from SRC (2, 1, 4, 4) into (0, 0, 8, 8); left of it is
-        // clipped (negative CRTC_X).
-        let up = Placement {
-            src: (2, 1, 4, 4),
-            dst: (-2, 0, 8, 8),
-        };
-        let mut out = vec![0u32; 8];
-        compose_row(&up, &source, &mut out);
-        if out != [0x103, 0x103, 0x104, 0x104, 0x105, 0x105, 0, 0] {
-            return TestResult::Fail("upscaled placed row");
-        }
-        if placed_source_row(&up, 0) != Some(1) || placed_source_row(&up, 7) != Some(4) {
-            return TestResult::Fail("upscaled placed rows");
-        }
-        // 2:1 down samples every other source pixel's centre.
-        let down = Placement {
-            src: (0, 0, 8, 8),
-            dst: (0, 0, 4, 4),
-        };
-        let mut out = vec![0u32; 4];
-        compose_row(&down, &source, &mut out);
-        if out != [0x101, 0x103, 0x105, 0x107] {
-            return TestResult::Fail("downscaled placed row");
-        }
         // Placement outside the framebuffer is refused at from_plane.
-        let mut plane = PlaneFrame::linear(0x10_0000, 256, 55, 55, 0x3432_5258);
+        let mut plane = PlaneFrame::linear(0x10_0000, 256, 60, 60, 0x3432_5258);
         plane.placement = Some(Placement {
             src: (10, 0, 55, 55),
             dst: (0, 0, 55, 55),
@@ -553,19 +507,49 @@ mod tests {
         if Frame::from_plane(plane.clone(), None).is_some() {
             return TestResult::Fail("SRC past the framebuffer accepted");
         }
-        plane.placement = Some(unscaled);
+        plane.placement = Some(kwin);
         let Some(frame) = Frame::from_plane(plane, None) else {
             return TestResult::Fail("placed frame refused");
         };
-        if frame.placement != Some(unscaled) {
-            return TestResult::Fail("placement lost");
+        let mode = (3840, 2160);
+        let r = direct_request(&frame, mode);
+        if (r.pitch, r.width, r.height, r.src, r.dst) != (64, 60, 60, kwin.src, kwin.dst) {
+            return TestResult::Fail("in-place request");
+        }
+        let back = GenericFb::new(0xe000_0000, 3840, 2160, 3840 * 4, 32);
+        let Some(c) = copied_request(&frame, &back) else {
+            return TestResult::Fail("copied request");
+        };
+        if (c.pitch, c.width, c.height, c.src, c.dst)
+            != (3840, 3840, 2160, (0, 0, 55, 55), kwin.dst)
+        {
+            return TestResult::Fail("copied request rectangles");
+        }
+        // An unplaced frame is the full screen; a SRC wider than the owned
+        // surface cannot be copied into it.
+        let full = Frame::from_plane(
+            PlaneFrame::linear(0x10_0000, 256, 64, 16, 0x3432_5258),
+            None,
+        )
+        .unwrap();
+        let small = GenericFb::new(0xe000_0000, 64, 16, 256, 32);
+        if copied_request(&full, &small).map(|r| (r.src, r.dst))
+            != Some(((0, 0, 64, 16), (0, 0, 64, 16)))
+        {
+            return TestResult::Fail("full-screen copy");
+        }
+        let mut wide = PlaneFrame::linear(0x10_0000, 512, 128, 16, 0x3432_5258);
+        wide.placement = Some(Placement {
+            src: (0, 0, 128, 16),
+            dst: (0, 0, 64, 8),
+        });
+        let wide = Frame::from_plane(wide, None).unwrap();
+        if copied_request(&wide, &small).is_some() {
+            return TestResult::Fail("SRC larger than the owned surface");
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/gpu/amdgpu/navi22",
-        navi22_placed_primary_composes_and_is_not_direct
-    );
+    kernel_test_in!("drivers/gpu/amdgpu/navi22", navi22_placed_primary_requests);
 
     /// A relight lights the pipe on its cleared owned surface; the committed
     /// primary is shown again from a copy that completes no event and
@@ -634,23 +618,29 @@ mod tests {
         navi22_drm_cursor_moves_are_recorded_without_owner
     );
 
+    /// Any pinned, request-aligned GEM framebuffer is scanned out in place:
+    /// the plane update programs its pitch, size and placement. A dumb
+    /// buffer, a pitch past the HUBP's field or an unaligned first pixel
+    /// copies.
     fn navi22_direct_scanout_eligibility() -> TestResult {
-        use narf_graphics_driver::generic::GenericFb;
         let fixture = Fixture::new();
         let object = fixture.object();
         let pin = Arc::new(object.pin_scanout().unwrap());
-        let front = GenericFb::new(0xe000_0000, 8, 2, 256, 32);
         let gem = |pitch: u32, width: u32, height: u32, offset: u32| {
             let mut plane = PlaneFrame::linear(0, pitch, width, height, 0x3432_5258);
             plane.bo = Some(pin.clone());
             plane.offsets[0] = offset;
             Frame::from_plane(plane, None).unwrap()
         };
-        if direct(&gem(256, 8, 2, 0), &front) != Ok(pin.address()) {
-            return TestResult::Fail("matching pinned frame was not scanned out in place");
+        if direct(&gem(256, 8, 2, 0)) != Ok(pin.address()) {
+            return TestResult::Fail("pinned frame was not scanned out in place");
         }
-        if direct(&gem(256, 8, 2, 512), &front) != Ok(pin.address() + 512) {
+        if direct(&gem(256, 8, 2, 512)) != Ok(pin.address() + 512) {
             return TestResult::Fail("aligned offset not added to the pin address");
+        }
+        // Another pitch or size than the lit surface is fetched in place.
+        if direct(&gem(512, 8, 2, 0)).is_err() || direct(&gem(256, 4, 1, 0)).is_err() {
+            return TestResult::Fail("pitch or size forced a copy");
         }
         let dumb = Frame::from_plane(
             PlaneFrame::linear(0x8000_0000, 256, 8, 2, 0x3432_5258),
@@ -659,16 +649,13 @@ mod tests {
         .unwrap();
         for (frame, want, what) in [
             (dumb, Ineligible::NotGem, "dumb buffer"),
-            (gem(512, 8, 2, 0), Ineligible::Pitch, "pitch"),
-            (gem(256, 4, 2, 0), Ineligible::Size, "width"),
-            (gem(256, 8, 1, 0), Ineligible::Size, "height"),
             (
                 gem(256, 8, 2, 16),
                 Ineligible::Alignment,
                 "offset alignment",
             ),
         ] {
-            if direct(&frame, &front) != Err(want) {
+            if direct(&frame) != Err(want) {
                 return TestResult::Fail(what);
             }
         }

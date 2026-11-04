@@ -7357,6 +7357,16 @@ fn check_native_plane(
             if !fits(src.0, src.2, fb.width) || !fits(src.1, src.3, fb.height) {
                 return Err(FsError::NoSpace);
             }
+            // dc_validate_global_state: the scaler geometry and DML of the
+            // placement on the lit stream (Navi22; EINVAL when DC refuses).
+            if !crate::amdgpu_native_kms::primary_placement_admitted(
+                (fb.pitch, fb.width, fb.height),
+                (w, h),
+                src,
+                dst,
+            ) {
+                return Err(invalid_at(line!()));
+            }
             return Ok(());
         }
         #[cfg(not(feature = "amdgpu"))]

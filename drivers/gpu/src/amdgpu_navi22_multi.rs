@@ -1083,6 +1083,7 @@ impl Group {
             member.admitted = Some(Admitted {
                 soc,
                 refclk_khz: refclk,
+                vco_khz: levels.vco_khz,
                 plan: single_plan(&joint, k)?,
                 offered: offered_on(
                     &self.requests[k].sink,

@@ -478,3 +478,51 @@ kernel_test_in!(
     "drivers/gpu/dcn-otg",
     dcn30_otg_drr_bounds_manual_trigger_and_fixed_restore
 );
+
+fn otg_dcn30_live_global_sync_follows_dcn20_program_tg() -> TestResult {
+    let mut otg = engine(1);
+    otg.profile = Profile::Navi22;
+    if otg.program_timing(&timing(), &sync()).is_err() {
+        return TestResult::Fail("timing");
+    }
+    otg.state = State::Running;
+    let vtg = otg.otg_vtg() as usize;
+    let status = otg.otg(OTG_STATUS_DCN30) as usize;
+    // In active display, as optc1_wait_for_state waits for.
+    otg.io.values[status] = OTG_V_ACTIVE_DISP;
+    let next = GlobalSync {
+        v_startup_lines: 44,
+        v_update_offset_pix: 550,
+        v_update_width_pix: 250,
+        v_ready_offset_pix: 330,
+    };
+    otg.io.writes.clear();
+    let done = narf_scheduler::block_on_spin(async {
+        otg.program_global_sync(&next)?;
+        otg.wait_vactive().await?;
+        otg.vtg_params(&next)
+    });
+    if done.is_err() {
+        return TestResult::Fail("global sync update");
+    }
+    // DCN30's sync quartet sits one dword later; VSTARTUP 44 is past the
+    // 41-line blank end (1125 - 4 - 1080), so FP2 = 44 - 42 = 2, and
+    // VCOUNT_INIT is the blank start (1121).
+    let reg = |r: u64| otg.io.values[otg.otg(r) as usize];
+    if reg(OTG_VSTARTUP_PARAM) != 44
+        || reg(OTG_VUPDATE_PARAM) != 550 | 250 << 16
+        || reg(OTG_VREADY_PARAM) != 330
+        || otg.io.values[vtg] & 0x7fff_7fff != 1121 << 16 | 2
+    {
+        return TestResult::Fail("global sync registers");
+    }
+    // A VStartup inside the blank leaves FP2 zero.
+    if otg.vtg_params(&sync()).is_err() || otg.io.values[vtg] & 0x7fff != 0 {
+        return TestResult::Fail("FP2 inside the blank");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-otg",
+    otg_dcn30_live_global_sync_follows_dcn20_program_tg
+);

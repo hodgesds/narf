@@ -432,6 +432,7 @@ fn navi22_display_admission_reports_only_what_dml30_proved() -> TestResult {
     let a = crate::amdgpu_navi22_modeset::Admitted {
         soc,
         refclk_khz: 50_000,
+        vco_khz: 3_650_000,
         plan,
         offered: vec![hd()],
     };

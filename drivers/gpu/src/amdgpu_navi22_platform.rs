@@ -987,6 +987,7 @@ async fn withdraw(boot: &boot::ColdBoot) {
     PRESENT.native.store(false, Ordering::Release);
     PRESENT.damage.lock().forget();
     *PRESENT.geometry.lock() = None;
+    *PLANE_BASIS.lock() = None;
     if let Some(s) = boot.display_scanout_ref() {
         let ours = |addr| {
             [Some(s.front()), s.back()]
@@ -1114,6 +1115,7 @@ async unsafe fn light(
     // Unpinned outside the IRQ-safe lock.
     drop(released);
     *PRESENT.geometry.lock() = boot.display_scanout_ref().map(|s| s.front().fb);
+    *PLANE_BASIS.lock() = boot.display_plane_basis();
     PRESENT.native.store(back.is_ok(), Ordering::Release);
     restart_vblank();
     publish_console(boot);
@@ -1832,9 +1834,13 @@ pub fn display_admission() -> Option<crate::amdgpu_navi22_power_policy::DisplayA
         return Some(a);
     }
     let streams = u8::from(boot.display_output().is_some());
+    // The plan the pipe runs under now: a placed primary's own.
+    let mut admitted = boot.display_admitted()?.clone();
+    if let Some(plan) = boot.display_plane_plan() {
+        admitted.plan = plan;
+    }
     Some(crate::amdgpu_navi22_kms::display_admission(
-        boot.display_admitted()?,
-        streams,
+        &admitted, streams,
     ))
 }
 
@@ -2053,6 +2059,71 @@ fn trace_present(direct: Option<u64>, reason: Option<frame_copy::Ineligible>, pi
     }
 }
 
+/// The lit stream placements are validated against without OWNER (the
+/// atomic check), set with the presentation geometry at each relight.
+static PLANE_BASIS: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_navi22_plane::Basis>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// `dc_validate_global_state` for a positioned or scaled primary of `fb`
+/// (pitch in bytes, width, height) on a CRTC of `mode`: what the presenter
+/// would plan for it in place on the lit stream. A mode other than the lit
+/// one (a modeset in the same commit) or no lit stream is validated by the
+/// modeset that lights it.
+pub(crate) fn placement_admitted(
+    fb: (u32, u32, u32),
+    mode: (u32, u32),
+    src: (u32, u32, u32, u32),
+    dst: (i32, i32, u32, u32),
+) -> bool {
+    let Some(basis) = *PLANE_BASIS.lock() else {
+        return true;
+    };
+    if (basis.timing.h_active, basis.timing.v_active) != mode {
+        return true;
+    }
+    let request = crate::amdgpu_navi22_plane::Request {
+        pitch: fb.0 / 4,
+        width: fb.1,
+        height: fb.2,
+        src,
+        dst,
+    };
+    basis.plan(&request).is_ok()
+}
+
+/// The plane update `request` needs on the lit pipe: None when the pipe
+/// already shows that placement (an address-only flip).
+fn plane_update(
+    boot: &boot::ColdBoot,
+    request: &crate::amdgpu_navi22_plane::Request,
+) -> Result<Option<crate::amdgpu_navi22_plane::Update>, crate::amdgpu_navi22_plane::Refusal> {
+    if boot.display_plane_request() == Some(*request) {
+        return Ok(None);
+    }
+    boot.plan_display_plane(request).map(Some)
+}
+
+/// A frame whose placement the lit pipe cannot show is dropped (its event
+/// completes without a latch); logged once per kind.
+fn trace_refusal(refusal: crate::amdgpu_navi22_plane::Refusal) {
+    use core::fmt::Write;
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    let bit = 1u64
+        << match refusal {
+            crate::amdgpu_navi22_plane::Refusal::Invalid => 0,
+            crate::amdgpu_navi22_plane::Refusal::Geometry(_) => 1,
+            crate::amdgpu_navi22_plane::Refusal::Mode(_) => 2,
+            crate::amdgpu_navi22_plane::Refusal::Clock => 3,
+            crate::amdgpu_navi22_plane::Refusal::Odm => 4,
+        };
+    if LOGGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 present: placement dropped ({refusal:?})"
+        );
+    }
+}
+
 /// Take the lit pipe off a client framebuffer and back onto its owned
 /// front, then release the client's pin (Navi48's `release_client_scanout`,
 /// amdgpu_dm's restore commit on lastclose). The console comes back on the
@@ -2064,7 +2135,8 @@ async unsafe fn release_client_scanout(boot: &mut boot::ColdBoot) -> bool {
     let external = boot
         .display_scanout_ref()
         .is_some_and(|s| s.external_front().is_some());
-    if external {
+    // A placed copy on the owned surface is undone too.
+    if external || !boot.display_plane_is_owned() {
         let Ok(Some(_)) = boot.return_display_to_owned().await else {
             return false;
         };
@@ -2274,18 +2346,18 @@ async fn presenter() {
             continue;
         }
         let started = narf_time::monotonic_ns();
-        // In place when the pinned client framebuffer matches the lit
-        // pipe's surface (amdgpu_dm never copies a client framebuffer).
-        let plan = match PRESENT.geometry.lock().as_ref() {
-            Some(front) => frame_copy::direct(&frame, front),
-            None => Err(frame_copy::Ineligible::Size),
-        };
+        // In place when the pinned client framebuffer can be fetched at its
+        // own pitch, size and placement (amdgpu_dm never copies a client
+        // framebuffer).
+        let plan = frame_copy::direct(&frame);
         let result = async {
             if let (Ok(_), Some(pin)) = (plan, frame.bo.as_ref()) {
                 // Rendering must finish before the HUBP fetches it; wait
                 // without OWNER (the producer may need it).
                 frame_copy::wait_rendered(pin).await?;
-                return present_direct(&frame, pin).await;
+                if let Direct::Shown(latched) = present_direct(&frame, pin).await? {
+                    return Ok::<_, ScanError>(latched);
+                }
             }
             // A client framebuffer the HUBP cannot fetch as programmed is
             // copied by the GPU into the owned back surface (amdgpu_dm never
@@ -2302,6 +2374,17 @@ async fn presenter() {
             let source = frame_copy::source(&frame).await?;
             let mut owner = OWNER.lock().await;
             let boot = owner.as_mut().ok_or(ScanError::Busy)?;
+            // The copy shows with the frame's placement: its SRC at the
+            // owned surface's origin, in its CRTC rectangle.
+            let back = boot.display_scanout()?.back().ok_or(ScanError::Invalid)?;
+            let Some(update) = frame_copy::copied_request(&frame, &back.fb)
+                .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)
+                .and_then(|r| plane_update(boot, &r))
+                .map_err(trace_refusal)
+                .ok()
+            else {
+                return Ok(None);
+            };
             // Taken for the present: a failed copy or flip leaves both
             // buffers unknown, so it is only put back after the latch.
             let mut damage = core::mem::take(&mut *PRESENT.damage.lock());
@@ -2310,7 +2393,7 @@ async fn presenter() {
             // completed outside this lock.
             let copied =
                 unsafe { present_native(boot, &frame, source.as_deref(), &mut damage) }.await?;
-            match flip_unlocked(owner, ArmedKind::Back, 0).await? {
+            match flip_unlocked(owner, ArmedKind::Back, 0, update).await? {
                 Latch::Done {
                     before,
                     after,
@@ -2380,10 +2463,16 @@ async fn flip_unlocked(
     mut owner: narf_lib::mutex::MutexGuard<'static, Option<boot::ColdBoot>>,
     kind: ArmedKind,
     external: u64,
+    update: Option<crate::amdgpu_navi22_plane::Update>,
 ) -> Result<Latch, ScanError> {
     let boot = owner.as_mut().ok_or(ScanError::Busy)?;
     let before = boot.display_scanout()?.front().fb;
-    let armed = boot.arm_display_flip(kind, external)?;
+    // A placement other than the one shown is a plane update latched with
+    // the address (commit_planes_for_stream); otherwise only the address.
+    let armed = match update {
+        Some(u) => boot.arm_display_plane(kind, external, &u).await?,
+        None => boot.arm_display_flip(kind, external)?,
+    };
     drop(owner);
     loop {
         narf_time::sleep_us(crate::amdgpu_dcn30_flip::POLL_US).await;
@@ -2393,6 +2482,16 @@ async fn flip_unlocked(
         };
         match latch_step(boot.poll_display_flip(&armed))? {
             LatchStep::Latched => {
+                // optimize_bandwidth: what the update lowered follows now.
+                if update.is_some() {
+                    if let Err(e) = boot.optimize_display_plane() {
+                        use core::fmt::Write;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "amdgpu: navi22 plane watermarks not lowered: {e:?}"
+                        );
+                    }
+                }
                 let after = boot.display_scanout()?.front().fb;
                 let latched = read_vblank(boot);
                 return Ok(Latch::Done {
@@ -2460,27 +2559,41 @@ fn navi22_flip_latch_wait_outcomes() -> narf_kernel_test::TestResult {
 #[cfg(feature = "kernel-test")]
 narf_kernel_test::kernel_test_in!("drivers/gpu/amdgpu/navi22", navi22_flip_latch_wait_outcomes);
 
-/// Flip the lit pipe to `frame`'s pinned client framebuffer in place and
-/// keep that pin until a later flip latches. A frame that no longer matches
-/// the lit mode, or whose pipe changed while armed, is dropped.
+/// What [`present_direct`] did with a frame.
+enum Direct {
+    /// Flipped (or dropped because its pipe changed while armed): the latch.
+    Shown(Option<crate::drm::card::VblankTime>),
+    /// The lit pipe cannot fetch its placement in place (an ODM stream,
+    /// say): the frame takes the copy path instead.
+    Refused,
+}
+
+/// Flip the lit pipe to `frame`'s pinned client framebuffer in place, with
+/// its pitch, size and placement, and keep that pin until a later flip
+/// latches. A frame whose pipe changed while armed is dropped.
 async fn present_direct(
     frame: &Frame,
     pin: &alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>,
-) -> Result<Option<crate::drm::card::VblankTime>, ScanError> {
+) -> Result<Direct, ScanError> {
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(ScanError::Busy)?;
     // A cancelled presenter may have left the old front's views draining.
     crate::scanout_access::wait_retired().await;
     let front = boot.display_scanout()?.front().fb;
-    // The mode can change between choosing and taking OWNER.
-    let Ok(address) = frame_copy::direct(frame, &front) else {
-        return Ok(None);
+    let Ok(address) = frame_copy::direct(frame) else {
+        return Ok(Direct::Refused);
+    };
+    // The frame's pitch, size and placement on the mode lit now (it can
+    // change between choosing and taking OWNER).
+    let request = frame_copy::direct_request(frame, (front.width, front.height));
+    let Ok(update) = plane_update(boot, &request) else {
+        return Ok(Direct::Refused);
     };
     // No HDP step: display fetch reads VRAM through the MMHUB, not the
     // HDP read path the CPU copy samples (amdgpu_dm programs the address
     // after the fence wait alone). Requiring verified queues here would
     // disable native present during recovery for no reason.
-    match flip_unlocked(owner, ArmedKind::External, address).await {
+    match flip_unlocked(owner, ArmedKind::External, address, update).await {
         Ok(Latch::Done {
             before, latched, ..
         }) => {
@@ -2491,9 +2604,9 @@ async fn present_direct(
             // Owned surfaces are both stale now; DIRTYFB damage restarts.
             PRESENT.damage.lock().forget();
             follow_external(before).await;
-            Ok(latched)
+            Ok(Direct::Shown(latched))
         }
-        Ok(Latch::Dropped) => Ok(None),
+        Ok(Latch::Dropped) => Ok(Direct::Shown(None)),
         Err(e) => {
             // The HUBP may still fetch either client buffer after a failed
             // flip: keep this one alive (the previous stays in `shown`).
@@ -2520,15 +2633,7 @@ async fn present_blit(
     frame: &Frame,
     pin: &alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>,
 ) -> Result<Blitted, ScanError> {
-    // The SDMA copy is a whole-frame copy; a placed frame is composed.
-    if frame.placement.is_some() {
-        return Ok(Blitted::Unavailable);
-    }
     frame_copy::wait_rendered(pin).await?;
-    let source = pin
-        .address()
-        .checked_add(frame.offset)
-        .ok_or(ScanError::Invalid)?;
     let back = {
         let mut owner = OWNER.lock().await;
         let boot = owner.as_mut().ok_or(ScanError::Busy)?;
@@ -2536,8 +2641,27 @@ async fn present_blit(
         crate::scanout_access::wait_retired().await;
         boot.display_scanout()?.back().ok_or(ScanError::Invalid)?
     };
-    let width = frame.width.min(back.fb.width);
-    let rows = frame.height.min(back.fb.height);
+    // The SRC rectangle (an unplaced frame: what fits of its full screen)
+    // goes unscaled to the back surface's origin.
+    let (x, y, width, rows) = match frame.placement {
+        Some(p) => p.src,
+        None => (
+            0,
+            0,
+            frame.width.min(back.fb.width),
+            frame.height.min(back.fb.height),
+        ),
+    };
+    if width > back.fb.width || rows > back.fb.height {
+        trace_refusal(crate::amdgpu_navi22_plane::Refusal::Invalid);
+        return Ok(Blitted::Dropped);
+    }
+    let source = pin
+        .address()
+        .checked_add(frame.offset)
+        .and_then(|a| a.checked_add(u64::from(y) * u64::from(frame.pitch)))
+        .and_then(|a| a.checked_add(u64::from(x) * 4))
+        .ok_or(ScanError::Invalid)?;
     let ops = crate::amdgpu_rdna2_vram::blit_ops(
         source,
         u64::from(frame.pitch),
@@ -2564,7 +2688,15 @@ async fn present_blit(
     if boot.display_scanout()?.back().map(|b| b.address) != Some(back.address) {
         return Ok(Blitted::Dropped);
     }
-    let (before, after, latched) = match flip_unlocked(owner, ArmedKind::Back, 0).await? {
+    let Some(update) = frame_copy::copied_request(frame, &back.fb)
+        .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)
+        .and_then(|r| plane_update(boot, &r))
+        .map_err(trace_refusal)
+        .ok()
+    else {
+        return Ok(Blitted::Dropped);
+    };
+    let (before, after, latched) = match flip_unlocked(owner, ArmedKind::Back, 0, update).await? {
         Latch::Done {
             before,
             after,
@@ -2635,32 +2767,27 @@ async unsafe fn present_native(
     // Navi22 reallocates no buffer behind the presenter (a relight forgets
     // them), so one epoch serves.
     if let Some(placement) = frame.placement {
-        // Every row is composed: the plane where its CRTC rectangle lies,
-        // the black background elsewhere (no damage tracking).
+        // The SRC rectangle, unscaled, to the back surface's origin; the
+        // pipe scales and positions it (no damage tracking).
         damage.forget();
-        let mut source_row = alloc::vec::Vec::new();
-        let mut out = alloc::vec::Vec::new();
-        source_row
-            .try_reserve_exact(frame.width as usize)
+        let (sx, sy, sw, sh) = placement.src;
+        if sw > back.width || sh > back.height {
+            return Err(ScanError::Invalid);
+        }
+        let mut pixels = alloc::vec::Vec::new();
+        pixels
+            .try_reserve_exact((sx + sw) as usize)
             .map_err(|_| ScanError::Allocation)?;
-        out.try_reserve_exact(back.width as usize)
-            .map_err(|_| ScanError::Allocation)?;
-        source_row.resize(frame.width as usize, 0u32);
-        out.resize(back.width as usize, 0u32);
-        for y in 0..back.height {
-            let src_y = frame_copy::placed_source_row(&placement, y);
-            if let Some(src_y) = src_y.filter(|&r| r < frame.height) {
-                boot.access_vram(|| {
-                    frame_copy::row(frame, source, src_y, &mut source_row)
-                        .map_err(|_| narf_filesystem::FsError::InvalidData)
-                })
-                .map_err(|_| ScanError::DeviceGone)?;
-                frame_copy::compose_row(&placement, &source_row, &mut out);
-            } else {
-                out.fill(0);
-            }
-            boot.display_scanout()?.upload_back(0, y, &out)?;
-            if y % 64 == 63 {
+        pixels.resize((sx + sw) as usize, 0u32);
+        for row in 0..sh {
+            boot.access_vram(|| {
+                frame_copy::row(frame, source, sy + row, &mut pixels)
+                    .map_err(|_| narf_filesystem::FsError::InvalidData)
+            })
+            .map_err(|_| ScanError::DeviceGone)?;
+            boot.display_scanout()?
+                .upload_back(0, row, &pixels[sx as usize..])?;
+            if row % 64 == 63 {
                 narf_scheduler::yield_now().await;
             }
         }

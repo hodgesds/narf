@@ -164,6 +164,17 @@ pub fn display_admits_planes(
         )
         .is_ok()
 }
+/// DC's validation of a positioned or scaled primary of an `fb` (pitch in
+/// bytes, width, height) on a CRTC of `mode` (Navi22's lit stream; other
+/// cards validate their planes elsewhere).
+pub fn primary_placement_admitted(
+    fb: (u32, u32, u32),
+    mode: (u32, u32),
+    src: (u32, u32, u32, u32),
+    dst: (i32, i32, u32, u32),
+) -> bool {
+    !navi22() || crate::amdgpu_navi22_platform::placement_admitted(fb, mode, src, dst)
+}
 /// Present an atomic commit's planes on display `display` (Navi48).
 pub fn present_planes(
     display: u8,

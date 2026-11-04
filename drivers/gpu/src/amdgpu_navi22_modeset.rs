@@ -746,6 +746,8 @@ pub(crate) fn dp_dto(pixel_khz: u32) -> (u32, u32) {
 pub struct Admitted {
     pub soc: dml30::Soc,
     pub refclk_khz: u32,
+    /// The DENTIST VCO the plan's DFS steps assume.
+    pub vco_khz: u32,
     pub plan: dml30::Plan,
     pub offered: Vec<Timing>,
 }
@@ -919,6 +921,13 @@ pub struct Pipeline {
     /// plane with both slices.
     slice: Option<Slice>,
     odm: Option<dml30::PlanePlan>,
+    /// The primary's placement programmed after the modeset (None: the
+    /// lit owned surface, full screen), the HUBBUB watermarks and the OTG
+    /// global sync now in effect (DC's cached `hubbub1->watermarks` and
+    /// `pipe_dlg_param`).
+    plane: Option<crate::amdgpu_navi22_plane::Update>,
+    live_watermarks: Option<dml30::WatermarkSet>,
+    live_sync: Option<GlobalSync>,
 }
 impl core::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1026,6 +1035,9 @@ impl Pipeline {
                 hdmi_vrr: None,
                 slice: None,
                 odm: None,
+                plane: None,
+                live_watermarks: None,
+                live_sync: None,
             })
         }
     }
@@ -1496,6 +1508,7 @@ impl Pipeline {
         self.admitted = Some(Admitted {
             soc,
             refclk_khz: refclk,
+            vco_khz: levels.vco_khz,
             plan,
             offered: offered_on(sink, &soc, levels.vco_khz, verified),
         });
@@ -1548,6 +1561,8 @@ impl Pipeline {
         self.at(Step::Watermarks);
         // SAFETY: no HUBP fetches yet.
         unsafe { self.hubbub.program(&plan.hubbub, refclk) }.map_err(Error::Hubbub)?;
+        self.plane = None;
+        self.live_watermarks = Some(plan.hubbub);
         // enable_stream_timing: OPTC clocks, then the pixel clock.
         self.at(Step::PixelClock);
         self.enable_optc_clock().await?;
@@ -1565,6 +1580,7 @@ impl Pipeline {
             Signal::Hdmi => self.otg.program_tmds_timing(&timing, &sync)?,
             Signal::DisplayPort => self.otg.program_timing(&timing, &sync)?,
         }
+        self.live_sync = Some(sync);
         // dcn20_enable_stream_timing -> mpc3_set_out_rate_control.
         // mpc3_mpc_init_single_inst only clears FLOW_CONTROL_COUNT;
         // the stream step also clears a previously selected rate mode.
@@ -2588,6 +2604,134 @@ pub fn test_pattern(_line: u32, row: &mut [u32]) {
     let width = row.len().max(1);
     for (x, pixel) in row.iter_mut().enumerate() {
         *pixel = BARS[x * 8 / width];
+    }
+}
+
+/// Plane updates of the lit primary (positioned, scaled, another pitch or
+/// size): DC's `commit_planes_for_stream` for a full update of the one
+/// plane, split around the flip the presentation owner arms. Callers hold
+/// the display owner; `program_plane` runs under the OTG's pipe-control
+/// lock, which the flip owner takes and releases around it and the
+/// surface address.
+impl Pipeline {
+    /// The placement the pipe now shows (the lit owned surface when no
+    /// update was programmed since the modeset).
+    pub fn plane_request(&self) -> Option<crate::amdgpu_navi22_plane::Request> {
+        if let Some(u) = self.plane {
+            return Some(u.request);
+        }
+        let timing = self.output?.timing;
+        Some(crate::amdgpu_navi22_plane::Request::full_screen(
+            pitch(&timing),
+            timing.h_active,
+            timing.v_active,
+            &timing,
+        ))
+    }
+    /// What [`crate::amdgpu_navi22_plane::plan`] needs of the lit stream,
+    /// for validating a placement without the display owner (the atomic
+    /// check).
+    pub fn plane_basis(&self) -> Option<crate::amdgpu_navi22_plane::Basis> {
+        let (output, admitted) = (self.output?, self.admitted.as_ref()?);
+        Some(crate::amdgpu_navi22_plane::Basis {
+            timing: output.timing,
+            vco_khz: admitted.vco_khz,
+            soc: admitted.soc,
+            lit: admitted.plan,
+            odm: self.odm.is_some() || self.slice.is_some(),
+        })
+    }
+    /// [`crate::amdgpu_navi22_plane::plan`] for `request` on the lit stream.
+    pub fn plan_plane(
+        &self,
+        request: &crate::amdgpu_navi22_plane::Request,
+    ) -> Result<crate::amdgpu_navi22_plane::Update, crate::amdgpu_navi22_plane::Refusal> {
+        self.plane_basis()
+            .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)?
+            .plan(request)
+    }
+    /// The DML30 plan the pipe runs under now: the placement's after a
+    /// plane update, else the modeset's.
+    pub fn plane_plan(&self) -> Option<dml30::Plan> {
+        self.plane
+            .map(|u| u.plan)
+            .or_else(|| self.admitted.as_ref().map(|a| a.plan))
+    }
+    /// `prepare_bandwidth` for an update: `dcn3_update_clocks` pins UCLK at
+    /// its top level when the new plan loses DRAM clock change support
+    /// (DISPCLK/DPPCLK stay: [`crate::amdgpu_navi22_plane::plan`] admits no
+    /// update that needs more), then the HUBBUB watermarks it raises
+    /// (`hubbub3_program_watermarks(safe_to_lower = false)`).
+    pub async fn prepare_plane(
+        &mut self,
+        u: &crate::amdgpu_navi22_plane::Update,
+    ) -> Result<(), Error> {
+        use crate::amdgpu_dml30::DramClockChange::Unsupported;
+        let now = self.plane_plan().ok_or(Error::Invalid)?;
+        if u.plan.dram_clock_change == Unsupported && now.dram_clock_change != Unsupported {
+            let levels = self.clocks.levels().ok_or(Error::Invalid)?;
+            let top = levels.range(Clock::Memory).max_khz();
+            self.clocks
+                .hard_min(Clock::Memory, top)
+                .await
+                .map_err(Error::Block)?;
+        }
+        let refclk = self.admitted.as_ref().ok_or(Error::Invalid)?.refclk_khz;
+        let current = self.live_watermarks.as_mut().ok_or(Error::Invalid)?;
+        self.hubbub
+            .program_live(&u.plan.hubbub, current, refclk, false)
+            .map_err(Error::Hubbub)?;
+        Ok(())
+    }
+    /// `dcn20_program_pipe` for the update, under the pipe-control lock the
+    /// caller holds: the OTG global sync when the plan moved it
+    /// (`dcn20_program_tg`), then `dcn20_update_dchubp_dpp`'s HUBP request
+    /// and deadline registers with the cursor's, the DSCL scaler, the
+    /// MPCC background, the viewport and the surface pitch. The address
+    /// follows from the flip owner inside the same lock.
+    pub async fn program_plane(
+        &mut self,
+        u: &crate::amdgpu_navi22_plane::Update,
+    ) -> Result<(), Error> {
+        if self.state != State::At(Step::Running) || self.odm.is_some() {
+            return Err(Error::Busy);
+        }
+        let p = &u.plan.prefetch;
+        let sync = GlobalSync {
+            v_startup_lines: p.v_startup,
+            v_update_offset_pix: p.v_update_offset_pix,
+            v_update_width_pix: p.v_update_width_pix,
+            v_ready_offset_pix: p.v_ready_offset_pix,
+        };
+        if self.live_sync != Some(sync) {
+            self.otg.update_global_sync(&sync).await?;
+            self.live_sync = Some(sync);
+        }
+        self.hubp.setup(&u.plan.registers)?;
+        self.program_cursor_ttu(u.plan.cursor)?;
+        self.dpp.set_scaler(&u.scaler)?;
+        // dcn20_update_mpcc -> update_visual_confirm_color: black.
+        self.mpc.set_bg_color([0; 3])?;
+        let vp = u.scaler.viewport;
+        self.hubp
+            .set_viewport(vp.x as u32, vp.y as u32, vp.width as u32, vp.height as u32)?;
+        self.hubp.set_pitch(u.request.pitch)?;
+        self.plane = Some(*u);
+        Ok(())
+    }
+    /// `optimize_bandwidth` once the update latched: the watermarks lowered
+    /// to its plan (`safe_to_lower`).
+    pub fn optimize_plane(&mut self) -> Result<(), Error> {
+        let refclk = self.admitted.as_ref().ok_or(Error::Invalid)?.refclk_khz;
+        let set = match self.plane {
+            Some(u) => u.plan.hubbub,
+            None => self.admitted.as_ref().ok_or(Error::Invalid)?.plan.hubbub,
+        };
+        let current = self.live_watermarks.as_mut().ok_or(Error::Invalid)?;
+        self.hubbub
+            .program_live(&set, current, refclk, true)
+            .map_err(Error::Hubbub)?;
+        Ok(())
     }
 }
 
