@@ -6610,14 +6610,14 @@ pub fn register_initcalls() {
         let _ = registry().mount(&auth, "/proc", procfs::ProcFs);
         let _ = registry().mount(&auth, "/sys", sysfs::SysFs::new());
         sysfs::populate_all();
-        // Populate the system-wide `/proc/sys/{fs,kernel,vm}/*` sysctl
+        // Populate the system-wide `/proc/sys/{fs,kernel,vm,net}/*` sysctl
         // keys and the `/proc/{stat,vmstat,…}` aggregate views. Without
-        // this a reader of e.g. `/proc/sys/fs/file-max` sees ENOENT.
-        // (`/proc/sys/net/*` is registered separately by the net crate's
-        // cross-crate init, which also installs its snapshot hooks.)
+        // this a reader of e.g. `/proc/sys/fs/file-max` or
+        // `/proc/sys/net/ipv4/conf/default/forwarding` sees ENOENT.
         procfs::sys_fs::register_all();
         procfs::sys_kernel::register_all();
         procfs::sys_vm::register_all();
+        procfs::sys_net::register_all();
         procfs::aggregate::register_all();
         procfs::stubs::register_all();
         procfs::bus::register_bus_proc();
