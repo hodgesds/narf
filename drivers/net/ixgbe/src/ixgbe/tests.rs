@@ -997,7 +997,10 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_pm_plans);
 fn smoke_ixgbe_pm_resume_rebuild() -> TestResult {
     use super::pm::resume_rebuild_plan;
     use super::queues::{rx_queue_regs, tx_queue_regs, QueueConfig, RegBank};
-    use super::{FCTRL_BAM, FCTRL_MPE, FCTRL_UPE, RXDCTL_ENABLE, SRRCTL_BSIZE_2K, TXDCTL_ENABLE};
+    use super::{
+        FCTRL_BAM, FCTRL_MPE, FCTRL_UPE, RXDCTL_ENABLE, SRRCTL_BSIZE_2K,
+        SRRCTL_DESCTYPE_ADV_ONEBUF, TXDCTL_ENABLE,
+    };
     let tx0 = match tx_queue_regs(0) {
         Some(t) => t,
         None => return TestResult::Fail("tx_queue_regs(0) is None"),
@@ -1035,7 +1038,7 @@ fn smoke_ixgbe_pm_resume_rebuild() -> TestResult {
         || bank.read32(rx0.rdlen) != 32 * 16
         || bank.read32(rx0.rdh) != 0
         || bank.read32(rx0.rdt) != 31
-        || bank.read32(rx0.srrctl) != SRRCTL_BSIZE_2K
+        || bank.read32(rx0.srrctl) != (SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_ADV_ONEBUF)
         || bank.read32(rx0.rxdctl) & RXDCTL_ENABLE == 0
         || bank.read32(0x05080) != (FCTRL_BAM | FCTRL_UPE | FCTRL_MPE)
         || bank.read32(0x03000) & 1 == 0

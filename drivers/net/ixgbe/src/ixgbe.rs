@@ -1629,19 +1629,12 @@ impl Ixgbe {
             {
                 let slots = q.rx_slots.lock();
                 for (i, buf) in slots.iter().enumerate() {
-                    let desc = RxDesc {
-                        addr: buf.dma_addr().raw(),
-                        length: 0,
-                        csum: 0,
-                        status: 0,
-                        errors: 0,
-                        special: 0,
-                    };
+                    let desc = AdvRxDescRead::new(buf.dma_addr().raw());
                     // SAFETY: identity-mapped DMA ring page.
                     unsafe {
                         core::ptr::write_volatile(
                             narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
-                                .kernel_mut_ptr::<RxDesc>(),
+                                .kernel_mut_ptr::<AdvRxDescRead>(),
                             desc,
                         );
                     }
