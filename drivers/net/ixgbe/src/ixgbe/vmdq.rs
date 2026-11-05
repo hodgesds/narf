@@ -70,11 +70,11 @@
 //! "64 pools no RSS") to `VMDQRSS64EN` (0xB, Linux's SR-IOV
 //! value) with the hash fields on, programs the shared RSS key
 //! + the per-pool indirection table (the 82599's single RETA is
-//! common to all pools; each entry is the queue inside the pool
-//! — datasheet §4.6.10.1.1), and bounds the lookup per pool
-//! with `PSRTYPE` RQPL. The X550 per-pool registers
-//! (`PFVFMRQC` / `PFVFRETA` / `PFVFRSSRK`) do not exist on
-//! 82599 and are never programmed.
+//!   common to all pools; each entry is the queue inside the pool
+//!   — datasheet §4.6.10.1.1), and bounds the lookup per pool
+//!   with `PSRTYPE` RQPL. The X550 per-pool registers
+//!   (`PFVFMRQC` / `PFVFRETA` / `PFVFRSSRK`) do not exist on
+//!   82599 and are never programmed.
 //!
 //! RAR 16 note: VF 15's primary slot (RAR 16, 0x0A200) coincides
 //! with the driver's `REG_RAL0` fallback-read address. That path
