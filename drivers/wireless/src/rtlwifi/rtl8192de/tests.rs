@@ -192,3 +192,731 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_table_inventory
 );
+
+// ── step 2: firmware, envelope, descriptors, packet ─────────────────────
+
+use super::{envelope, fw, packet, trx};
+use crate::rtlwifi::firmware_transport::{Error as FwError, Io};
+use alloc::{sync::Arc, vec, vec::Vec};
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// Firmware image bytes for header tests: 32-byte header + body, with
+/// the RAM-code size at bytes 12..14.
+fn fw_image(signature: u16, version: u16, subversion: u8, body_len: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; fw::HEADER + body_len];
+    bytes[0..2].copy_from_slice(&signature.to_le_bytes());
+    bytes[4..6].copy_from_slice(&version.to_le_bytes());
+    bytes[6] = subversion;
+    bytes[12..14].copy_from_slice(&(body_len as u16).to_le_bytes());
+    bytes
+}
+
+/// `IS_FW_HEADER_EXIST` signatures, version/subversion/payload, and
+/// the rejection rules (bad signature, truncation, oversize, size
+/// mismatch), plus the `firmware_transport` DID dispatch.
+fn smoke_rtl8192de_firmware_header_geometry() -> TestResult {
+    for signature in [
+        0x92c0, 0x92c1, 0x88c0, 0x88cf, 0x92d0, 0x92d1, 0x92d2, 0x92d3,
+    ] {
+        let bytes = fw_image(signature, 0x1234, 0x56, 100);
+        match fw::parse(&bytes) {
+            Ok((info, payload))
+                if info.version == 0x1234
+                    && info.subversion == 0x56
+                    && info.payload == 100
+                    && payload.len() == 100 => {}
+            _ => return TestResult::Fail("8192DE header signature admitted"),
+        }
+        match crate::rtlwifi::firmware_transport::parse(
+            crate::rtlwifi::regs::RTL_DEV_8192DE,
+            &bytes,
+        ) {
+            Ok((info, _)) if info.version == 0x1234 => {}
+            _ => return TestResult::Fail("8192DE transport DID dispatch"),
+        }
+    }
+    for signature in [0x92c2, 0x92d4, 0x5300, 0x2300, 0x0000] {
+        if fw::parse(&fw_image(signature, 1, 0, 100)).is_ok() {
+            return TestResult::Fail("8192DE bad signature admitted");
+        }
+    }
+    let bytes = fw_image(0x92c0, 1, 0, 100);
+    for end in [0, 31, 32] {
+        if fw::parse(&bytes[..end]).is_ok() {
+            return TestResult::Fail("8192DE truncated image admitted");
+        }
+    }
+    if fw::parse(&vec![0u8; fw::MAX_FILE + 1]).is_ok() {
+        return TestResult::Fail("8192DE oversized image admitted");
+    }
+    let mut mismatch = fw_image(0x92c0, 1, 0, 100);
+    mismatch[12..14].copy_from_slice(&99u16.to_le_bytes());
+    if fw::parse(&mismatch).is_ok() {
+        return TestResult::Fail("8192DE RAM-code size mismatch admitted");
+    }
+    if fw::parse(&[]).is_ok() || fw::parse(&vec![0u8; fw::HEADER]).is_ok() {
+        return TestResult::Fail("8192DE empty image admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_firmware_header_geometry
+);
+
+// ── firmware download model ───────────────────────────────────────────────
+
+struct DeFwModel {
+    regs: Vec<u8>,
+    pages: Vec<Vec<u8>>,
+    writes: Vec<(u16, u8)>,
+    checksum: bool,
+    ready: bool,
+    reset_clears: bool,
+    wait_finish_after: u32,
+    wait_reads: u32,
+}
+
+#[derive(Clone)]
+struct DeFwFake(Arc<IrqSafeSpinLock<DeFwModel>>);
+
+#[async_trait::async_trait]
+impl Io for DeFwFake {
+    fn read8(&self, reg: u16) -> Result<u8, FwError> {
+        let mut g = self.0.lock();
+        if reg == fw::REG_IN_PROCESS && g.wait_finish_after > 0 {
+            g.wait_reads += 1;
+            if g.wait_reads >= g.wait_finish_after {
+                g.regs[usize::from(reg)] &= !fw::IN_PROCESS_BIT;
+                g.regs[usize::from(fw::REG_MCUFWDL)] |= fw::MCUFWDL_EN as u8 | 0x02;
+            }
+        }
+        // The firmware raises the MAC-ready bit once the image is
+        // downloaded and marked ready; `fw_init` polls this byte.
+        if (reg == fw::FW_MAC0_READY || reg == fw::FW_MAC1_READY)
+            && g.ready
+            && g.regs[usize::from(fw::REG_MCUFWDL)] & 0x02 != 0
+        {
+            return Ok(g.regs[usize::from(reg)] | fw::MAC_READY);
+        }
+        Ok(g.regs[usize::from(reg)])
+    }
+    fn read32(&self, reg: u16) -> Result<u32, FwError> {
+        let g = self.0.lock();
+        let r = usize::from(reg);
+        let mut v = u32::from_le_bytes([g.regs[r], g.regs[r + 1], g.regs[r + 2], g.regs[r + 3]]);
+        if reg == fw::REG_MCUFWDL
+            && g.checksum
+            && v & u32::from(fw::MCUFWDL_EN) == 0
+            && !g.pages.is_empty()
+        {
+            v |= fw::FWDL_CHKSUM_RPT;
+        }
+        Ok(v)
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        g.writes.push((reg, value));
+        if reg == fw::REG_HMETFR + 3 && value == 0x20 && g.reset_clears {
+            g.regs[usize::from(fw::REG_SYS_FUNC_EN) + 1] &= !fw::SYS_FUNC_EN_CPUEN;
+        }
+        g.regs[usize::from(reg)] = value;
+        Ok(())
+    }
+    fn write32(&self, reg: u16, value: u32) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        let r = usize::from(reg);
+        g.regs[r..r + 4].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+    fn write_bytes(&self, reg: u16, bytes: &[u8]) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        let page = usize::from(g.regs[usize::from(fw::REG_MCUFWDL) + 2] & 7);
+        while g.pages.len() <= page {
+            g.pages.push(Vec::new());
+        }
+        let at = usize::from(reg - 0x1000);
+        let p = &mut g.pages[page];
+        if p.len() < at + bytes.len() {
+            p.resize(at + bytes.len(), 0xee);
+        }
+        p[at..at + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+    async fn delay_us(&self, _micros: u64) {}
+}
+
+fn de_fw_fake(checksum: bool, ready: bool, running: bool) -> DeFwFake {
+    let mut regs = vec![0u8; 0x2000];
+    if running {
+        regs[usize::from(fw::REG_MCUFWDL)] = fw::RAM_DL_SEL;
+    }
+    regs[usize::from(fw::REG_SYS_FUNC_EN) + 1] = fw::SYS_FUNC_EN_CPUEN;
+    DeFwFake(Arc::new(IrqSafeSpinLock::new(DeFwModel {
+        regs,
+        pages: Vec::new(),
+        writes: Vec::new(),
+        checksum,
+        ready,
+        reset_clears: true,
+        wait_finish_after: 0,
+        wait_reads: 0,
+    })))
+}
+
+/// `rtl92d_download_fw`: running-image self-reset and `MCUFWDL = 0`,
+/// 8051 enable + download gate, eight-page bound, `rtl_fill_dummy`,
+/// close, checksum handshake, `MCUFWDL_RDY`, firmware-ready poll, and
+/// the dual-MAC coordination (already-downloaded, wait-then-finish,
+/// stuck-wait deadline, checksum/ready failures with the flag cleared).
+fn smoke_rtl8192de_firmware_paged_download() -> TestResult {
+    let payload: Vec<u8> = (0..(fw::PAGE + 5)).map(|i| i as u8).collect();
+    let io = de_fw_fake(true, true, true);
+    if narf_scheduler::block_on(fw::download(&io, &payload)).is_err() {
+        return TestResult::Fail("8192DE model download failed");
+    }
+    let g = io.0.lock();
+    if g.pages.len() != 2
+        || g.pages[0] != payload[..fw::PAGE]
+        || g.pages[1].len() != 8
+        || g.pages[1][..5] != payload[fw::PAGE..]
+        || g.pages[1][5..] != [0, 0, 0]
+        || !g.writes.contains(&(fw::REG_HMETFR + 3, 0x20))
+        || !g.writes.contains(&(fw::REG_MCUFWDL, 0))
+        || g.regs[usize::from(fw::REG_IN_PROCESS)] & fw::IN_PROCESS_BIT != 0
+        || g.regs[usize::from(fw::REG_MCUFWDL)] & 0x02 == 0
+        || g.regs[usize::from(fw::REG_MCUFWDL)] & fw::MCUFWDL_EN != 0
+    {
+        return TestResult::Fail("8192DE download pages / gates / flag");
+    }
+    drop(g);
+    // Already downloaded: no page writes, firmware-ready poll only.
+    let downloaded = de_fw_fake(true, true, false);
+    downloaded.0.lock().regs[usize::from(fw::REG_MCUFWDL)] |= 0x02;
+    if narf_scheduler::block_on(fw::download(&downloaded, &payload)).is_err()
+        || !downloaded.0.lock().pages.is_empty()
+    {
+        return TestResult::Fail("8192DE already-downloaded short-circuit");
+    }
+    // Other function finishes mid-wait: no download, ready poll only.
+    let waiting = de_fw_fake(true, true, false);
+    waiting.0.lock().regs[usize::from(fw::REG_IN_PROCESS)] |= fw::IN_PROCESS_BIT;
+    waiting.0.lock().wait_finish_after = 3;
+    if narf_scheduler::block_on(fw::download(&waiting, &payload)).is_err()
+        || !waiting.0.lock().pages.is_empty()
+    {
+        return TestResult::Fail("8192DE dual-MAC wait-then-finish");
+    }
+    // Other function never finishes: deadline, flag never taken.
+    let stuck = de_fw_fake(true, true, false);
+    stuck.0.lock().regs[usize::from(fw::REG_IN_PROCESS)] |= fw::IN_PROCESS_BIT;
+    if narf_scheduler::block_on(fw::download(&stuck, &payload)) != Err(FwError::Deadline) {
+        return TestResult::Fail("8192DE stuck dual-MAC wait admitted");
+    }
+    // No checksum report: checksum error, flag cleared.
+    let no_checksum = de_fw_fake(false, true, false);
+    if narf_scheduler::block_on(fw::download(&no_checksum, &payload)) != Err(FwError::Checksum)
+        || no_checksum.0.lock().regs[usize::from(fw::REG_IN_PROCESS)] & fw::IN_PROCESS_BIT != 0
+    {
+        return TestResult::Fail("8192DE checksum failure / flag leak");
+    }
+    // Firmware never ready: start error, flag cleared.
+    let no_ready = de_fw_fake(true, false, false);
+    if narf_scheduler::block_on(fw::download(&no_ready, &payload)) != Err(FwError::Start)
+        || no_ready.0.lock().regs[usize::from(fw::REG_IN_PROCESS)] & fw::IN_PROCESS_BIT != 0
+    {
+        return TestResult::Fail("8192DE ready failure / flag leak");
+    }
+    // 8051 reset stuck: start error, flag cleared.
+    let stuck_reset = de_fw_fake(true, true, true);
+    stuck_reset.0.lock().reset_clears = false;
+    if narf_scheduler::block_on(fw::download(&stuck_reset, &payload)) != Err(FwError::Start)
+        || stuck_reset.0.lock().regs[usize::from(fw::REG_IN_PROCESS)] & fw::IN_PROCESS_BIT != 0
+    {
+        return TestResult::Fail("8192DE self-reset failure / flag leak");
+    }
+    if narf_scheduler::block_on(fw::download(&de_fw_fake(true, true, false), &[]))
+        != Err(FwError::Image)
+        || narf_scheduler::block_on(fw::download(
+            &de_fw_fake(true, true, false),
+            &vec![0; fw::MAX_PAYLOAD + 1],
+        )) != Err(FwError::Image)
+    {
+        return TestResult::Fail("8192DE empty / oversized payload downloaded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_firmware_paged_download
+);
+
+/// `trx.rs` fill: the 92D layout (rate dword 5, buffer dword 8, link
+/// dword 10), the 5 GHz rate floor, the dual-dual MCS7 short-GI rule,
+/// AMPDU 0x14, the RTS override without driver rate, the LPS hwseq
+/// rule, bandwidth / sub-carrier selection, the `useramask` rate-id /
+/// MAC-id rule, and the command descriptor.
+fn smoke_rtl8192de_trx_fill() -> TestResult {
+    let base = trx::TxParams {
+        pkt_size: 100,
+        queue_sel: trx::QSLT_BE,
+        macid: 3,
+        rate_id: 5,
+        hw_rate: trx::DESC_RATEMCS7,
+        use_driver_rate: true,
+        disable_fallback: false,
+        use_shortgi: false,
+        use_shortpreamble: false,
+        bw_40: true,
+        packet_bw_40: true,
+        cur_40_prime_sc: 1,
+        ampdu: true,
+        ampdu_density: 5,
+        sec_type: 0,
+        qos_data: true,
+        seq: 0xabc,
+        rts_enable: true,
+        cts_enable: false,
+        rts_rate: 0x08,
+        rts_sc: 2,
+        rts_stbc: true,
+        rts_use_shortpreamble: false,
+        rts_use_shortgi: true,
+        buffer_len: 100,
+        buffer_addr: 0xdead_0000,
+        band_5g: false,
+        dual_mac_dual_phy: true,
+        fwctrl_lps: false,
+        rdg_en: true,
+    };
+    let d = trx::TxDesc::fill(&base);
+    if d.own()
+        || d.pkt_size() != 100
+        || d.queue_sel() != trx::QSLT_BE
+        || d.macid() != 3
+        || d.tx_rate() != trx::DESC_RATEMCS7
+        || d.data_bw() != 1
+        || d.sub_carrier() != 3
+        || d.buffer_addr() != 0xdead_0000
+        || d.dw[5] & (1 << 6) == 0
+        || d.dw[1] & (1 << 5) == 0
+        || (d.dw[6] >> 11) & 0x1f != 0x14
+        || (d.dw[3] >> 16) & 0xfff != 0xabc
+        || d.dw[4] & (1 << 12) == 0
+        || d.dw[4] & (1 << 13) == 0
+        || d.dw[4] & 0x1f != 0x08
+        || (d.dw[4] >> 30) & 0x3 != 1
+        || d.dw[2] & (1 << 17) != 0
+        || d.dw[1] & (1 << 7) == 0
+        || d.dw[0] & (1 << 25) == 0
+    {
+        return TestResult::Fail("8192DE TX fill fields");
+    }
+    // 5 GHz floor: data and RTS rates below 6M rise to 6M.
+    let g = trx::TxDesc::fill(&trx::TxParams {
+        hw_rate: trx::DESC_RATE1M,
+        rts_rate: trx::DESC_RATE1M,
+        band_5g: true,
+        ..base
+    });
+    if g.tx_rate() != trx::DESC_RATE6M || g.dw[4] & 0x1f != trx::DESC_RATE6M as u32 {
+        return TestResult::Fail("8192DE 5 GHz rate floor");
+    }
+    // No driver rate: RTS rate is forced to 0x08 after the TCB value.
+    let nodrv = trx::TxDesc::fill(&trx::TxParams {
+        use_driver_rate: false,
+        rts_rate: 0x0b,
+        ..base
+    });
+    if nodrv.dw[4] & 0x1f != 0x08 {
+        return TestResult::Fail("8192DE RTS override without driver rate");
+    }
+    // Non-QoS + firmware LPS: hwseq enable + packet id 8 (over 0).
+    let lps = trx::TxDesc::fill(&trx::TxParams {
+        qos_data: false,
+        fwctrl_lps: true,
+        ..base
+    });
+    if lps.dw[4] & (1 << 7) == 0 || (lps.dw[3] >> 28) & 0xf != 8 {
+        return TestResult::Fail("8192DE LPS hwseq rule");
+    }
+    // 20 MHz: bandwidth 0, sub-carrier 0 regardless of prime.
+    let narrow = trx::TxDesc::fill(&trx::TxParams {
+        bw_40: false,
+        cur_40_prime_sc: 2,
+        ..base
+    });
+    if narrow.data_bw() != 0 || narrow.sub_carrier() != 0 {
+        return TestResult::Fail("8192DE 20 MHz bandwidth fields");
+    }
+    // 40 MHz packet on a 20 MHz station: sub-carrier is the prime.
+    let prime = trx::TxDesc::fill(&trx::TxParams {
+        packet_bw_40: false,
+        cur_40_prime_sc: 2,
+        ..base
+    });
+    if prime.data_bw() != 0 || prime.sub_carrier() != 2 {
+        return TestResult::Fail("8192DE 40 MHz prime sub-carrier");
+    }
+    if trx::rate_id_macid(true, 2, 5) != (2, 5) || trx::rate_id_macid(false, 2, 5) != (0x0e, 2) {
+        return TestResult::Fail("8192DE rate-id / MAC-id rule");
+    }
+    let mut cmd = trx::TxDesc::fill_cmd(128, 0x1000_0000, false, false);
+    if cmd.queue_sel() != trx::QSLT_BEACON
+        || cmd.tx_rate() != trx::DESC_RATE1M
+        || cmd.macid() != trx::CMD_MACID
+        || cmd.buffer_addr() != 0x1000_0000
+        || cmd.own()
+    {
+        return TestResult::Fail("8192DE command descriptor");
+    }
+    let cmd5 = trx::TxDesc::fill_cmd(128, 0x1000_0000, true, true);
+    if cmd5.tx_rate() != trx::DESC_RATE6M
+        || cmd5.dw[4] & (1 << 7) == 0
+        || (cmd5.dw[3] >> 28) & 0xf != 8
+    {
+        return TestResult::Fail("8192DE 5 GHz / LPS command descriptor");
+    }
+    cmd.set_next(0x2000_0000);
+    if cmd.dw[10] != 0x2000_0000 {
+        return TestResult::Fail("8192DE ring link word");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_trx_fill
+);
+
+/// `trx.rs` RX decode: OWN refusal, every query field, the
+/// software-decrypt + encryption-type rule, payload offset, hardware
+/// error, and re-arm.
+fn smoke_rtl8192de_trx_rx_status() -> TestResult {
+    let mut dw = [0u32; 8];
+    dw[0] |= 1 << 31;
+    if trx::RxStatus::parse(&dw).is_some() {
+        return TestResult::Fail("8192DE hardware-owned RX admitted");
+    }
+    dw = [0u32; 8];
+    dw[0] |= 1500 | (1 << 14) | (2 << 16) | (1 << 24) | (1 << 26);
+    dw[1] |= (1 << 14) | (1 << 15);
+    dw[3] |= 0x13 | (1 << 6) | (1 << 8) | (1 << 9);
+    dw[5] = 0x1234_5678;
+    dw[6] = 0x4000_0000;
+    let status = match trx::RxStatus::parse(&dw) {
+        Some(s) => s,
+        None => return TestResult::Fail("8192DE RX parse failed"),
+    };
+    if status.length != 1500
+        || !status.crc
+        || status.icv
+        || status.drvinfo_size != 2 * trx::RX_DRV_INFO_SIZE_UNIT
+        || status.shift != 1
+        || !status.physt
+        || status.decrypted
+        || status.rate != 0x13
+        || !status.short_preamble
+        || !status.ampdu
+        || !status.first_ampdu
+        || status.bw != 1
+        || !status.is_ht
+        || status.tsfl != 0x1234_5678
+        || status.payload_offset() != 32 + 16 + 1
+        || !status.hw_error()
+        || status.is_cck()
+    {
+        return TestResult::Fail("8192DE RX status fields");
+    }
+    // Decrypted only when not software-decrypted AND encrypted.
+    dw[0] |= 4 << 20;
+    let decrypted = trx::RxStatus::parse(&dw).unwrap();
+    if !decrypted.decrypted {
+        return TestResult::Fail("8192DE RX decrypted rule");
+    }
+    dw[0] |= 1 << 27;
+    if trx::RxStatus::parse(&dw).unwrap().decrypted {
+        return TestResult::Fail("8192DE RX software-decrypt rule");
+    }
+    let mut arm = [0u32; 8];
+    trx::rx_arm(&mut arm, 0x4000_0000, 1536, true);
+    if arm[6] != 0x4000_0000
+        || arm[0] & 0x3fff != 1536
+        || arm[0] & (1 << 30) == 0
+        || arm[0] & (1 << 31) == 0
+    {
+        return TestResult::Fail("8192DE RX re-arm");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_trx_rx_status
+);
+
+// ── signed envelopes ──────────────────────────────────────────────────────
+
+/// Test board factory (synthetic values, not any board's).
+fn de_factory() -> crate::rtlwifi::efuse::Factory {
+    crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x81, 0x92, 0xde],
+        logical: [0u8; 512],
+    }
+}
+
+/// Build a NAPC envelope from the documented layout (header 96, rows of
+/// 388 bytes: channel/band/bandwidth/offset + three 64-entry curves).
+/// `rows` are (channel, bandwidth, offset, curve-value fn) for v2, or
+/// (channel, 20, 0, fn) for v1.
+fn de_napc_fixture(
+    version: u16,
+    antenna: i16,
+    qualified: i16,
+    rows: &[(u8, u8, u8, fn(u8, u8) -> i16)],
+) -> Vec<u8> {
+    let factory = de_factory();
+    let identity = crate::rtlwifi::radio::factory_identity(&factory);
+    let total = 96 + rows.len() * 388;
+    let mut bytes = vec![0u8; total];
+    bytes[0..4].copy_from_slice(b"NAPC");
+    bytes[4..6].copy_from_slice(&version.to_le_bytes());
+    bytes[6..8].copy_from_slice(&96u16.to_le_bytes());
+    bytes[8..12].copy_from_slice(&(total as u32).to_le_bytes());
+    bytes[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    bytes[14..16].copy_from_slice(&0x8193u16.to_le_bytes());
+    bytes[16..48].copy_from_slice(&identity);
+    bytes[48..54].copy_from_slice(&factory.mac);
+    bytes[56..58].copy_from_slice(&antenna.to_le_bytes());
+    bytes[58..60].copy_from_slice(&qualified.to_le_bytes());
+    bytes[60..62].copy_from_slice(&(rows.len() as u16).to_le_bytes());
+    bytes[62..64].copy_from_slice(&(if version == 1 { 20u16 } else { 0u16 }).to_le_bytes());
+    for (i, (channel, bandwidth, offset, curve)) in rows.iter().enumerate() {
+        let row = &mut bytes[96 + i * 388..96 + (i + 1) * 388];
+        row[0] = *channel;
+        if version == 2 {
+            row[1] = 0;
+            row[2] = *bandwidth;
+            row[3] = *offset;
+        }
+        for curve_idx in 0..3u8 {
+            for idx in 0..64u8 {
+                let at = 4 + (usize::from(curve_idx) * 64 + usize::from(idx)) * 2;
+                row[at..at + 2].copy_from_slice(&curve(curve_idx, idx).to_le_bytes());
+            }
+        }
+    }
+    bytes
+}
+
+/// Flat rising curves: output `2 * index` quarter dBm, so a 20 dBm
+/// ceiling with antenna 0 admits index 40 on every rate.
+fn de_rising(_curve: u8, idx: u8) -> i16 {
+    i16::from(idx) * 2
+}
+
+/// HT curve unmeasured: MCS rates can never be admitted.
+fn de_no_ht(curve: u8, idx: u8) -> i16 {
+    if curve == 2 {
+        i16::MAX
+    } else {
+        i16::from(idx) * 2
+    }
+}
+
+/// US 2.4 GHz domain: 2402-2472 MHz, 40 MHz, 20 dBm.
+fn de_us_domain() -> narf_wireless::reg::RegulatoryDomain {
+    use narf_wireless::reg::*;
+    RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: 40,
+            max_power_dbm: 20,
+            flags: RegFlags::empty(),
+        }],
+    }
+}
+
+/// v1 parse + permission (all 20 rates admitted, index 40), tampered
+/// variants, the 5 GHz row refusal, unordered rows, unmeasured HT,
+/// and the v2 40 MHz point.
+fn smoke_rtl8192de_envelope_parse_permission() -> TestResult {
+    use envelope::*;
+    let factory = de_factory();
+    let domain = de_us_domain();
+    let bytes = de_napc_fixture(1, 0, 80, &[(6, 20, 0, de_rising)]);
+    let cal = match Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8192DE envelope v1 parse"),
+    };
+    if cal.operating_points().count() != 1 || !cal.measures(Operating::twenty(6)) {
+        return TestResult::Fail("8192DE envelope v1 rows");
+    }
+    let permission = match cal.permission_for(&domain, Operating::twenty(6)) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("8192DE envelope v1 permission"),
+    };
+    if permission.channel() != 6
+        || permission.admitted_rates() != 0xfffff
+        || (0..20u8).any(|r| permission.index(r) != 40 || !permission.admits(r))
+        || permission.admits(20)
+        || permission.eirp_limit_qdbm() != 80
+    {
+        return TestResult::Fail("8192DE envelope v1 permission values");
+    }
+    let mut bad = bytes.clone();
+    bad[0] = b'X';
+    if Calibration::from_verified(&bad, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8192DE envelope bad magic admitted");
+    }
+    let mut wrong_device = bytes.clone();
+    wrong_device[14..16].copy_from_slice(&0xb723u16.to_le_bytes());
+    if Calibration::from_verified(&wrong_device, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8192DE envelope wrong device admitted");
+    }
+    if Calibration::from_verified(&bytes, None, &factory).is_ok() {
+        return TestResult::Fail("8192DE envelope unsigned admitted");
+    }
+    let other = crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x81, 0x92, 0xdf],
+        logical: [0u8; 512],
+    };
+    if Calibration::from_verified(&bytes, Some([0xabu8; 32]), &other).is_ok() {
+        return TestResult::Fail("8192DE envelope identity mismatch admitted");
+    }
+    // A 5 GHz row (band byte 1) is a format failure in step 2.
+    let mut banded = de_napc_fixture(2, 0, 80, &[(6, 20, 0, de_rising)]);
+    banded[96 + 1] = 1;
+    if Calibration::from_verified(&banded, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8192DE envelope 5 GHz row admitted");
+    }
+    let unordered = de_napc_fixture(2, 0, 80, &[(6, 40, 1, de_rising), (6, 20, 0, de_rising)]);
+    if Calibration::from_verified(&unordered, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8192DE envelope unordered rows admitted");
+    }
+    let no_ht = de_napc_fixture(1, 0, 80, &[(6, 20, 0, de_no_ht)]);
+    let cal_no_ht = match Calibration::from_verified(&no_ht, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8192DE envelope no-HT parse"),
+    };
+    if cal_no_ht
+        .permission_for(&domain, Operating::twenty(6))
+        .is_ok()
+    {
+        return TestResult::Fail("8192DE envelope unmeasured HT admitted");
+    }
+    let v2 = de_napc_fixture(2, 0, 80, &[(6, 20, 0, de_rising), (6, 40, 1, de_rising)]);
+    let cal_v2 = match Calibration::from_verified(&v2, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8192DE envelope v2 parse"),
+    };
+    let wide = Operating {
+        width: Width::W40Above,
+        channel: 6,
+    };
+    if !wide.forty() || wide.prime_sc() != 1 || wide.center_mhz() != Some(2447) {
+        return TestResult::Fail("8192DE envelope 40 MHz point shape");
+    }
+    match cal_v2.permission_for(&domain, wide) {
+        Ok(p) if p.admitted_rates() == 0xfffff => {}
+        _ => return TestResult::Fail("8192DE envelope v2 40 MHz permission"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_envelope_parse_permission
+);
+
+/// Packet owner: firmware `Info` + envelope `Permission` admission,
+/// TX fill fields, refusal rules, and RX decode.
+fn smoke_rtl8192de_packet_admission_and_fill() -> TestResult {
+    use envelope::*;
+    use packet::*;
+    let factory = de_factory();
+    let domain = de_us_domain();
+    let bytes = de_napc_fixture(1, 0, 80, &[(6, 20, 0, de_rising)]);
+    let cal = match Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8192DE packet envelope parse"),
+    };
+    let permission = match cal.permission_for(&domain, Operating::twenty(6)) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("8192DE packet permission"),
+    };
+    let owner = Owner::admit(
+        crate::rtlwifi::firmware_transport::Info {
+            version: 0x1234,
+            subversion: 0x56,
+            payload: 100,
+        },
+        permission,
+    );
+    if owner.firmware_version() != 0x1234 {
+        return TestResult::Fail("8192DE packet firmware version");
+    }
+    let mut slot = trx::TxDesc::default();
+    let frame = TxFrame {
+        op: Operating::twenty(6),
+        class: FrameClass::Data { priority: 3 },
+        len: 100,
+        buf_addr: 0x3000_0000,
+        rate: 12,
+        seq: 0x42,
+        short: false,
+        rts: None,
+        next_desc: 0x4000_0000,
+    };
+    if owner.fill_tx_slot(&mut slot, &frame).is_err()
+        || slot.own()
+        || slot.pkt_size() != 100
+        || slot.queue_sel() != 3
+        || slot.tx_rate() != 12
+        || slot.buffer_addr() != 0x3000_0000
+        || slot.dw[10] != 0x4000_0000
+    {
+        return TestResult::Fail("8192DE packet TX fill");
+    }
+    let wrong_op = TxFrame {
+        op: Operating::twenty(7),
+        ..frame
+    };
+    if owner.fill_tx_slot(&mut slot, &wrong_op) != Err(Error::NotAdmitted) {
+        return TestResult::Fail("8192DE packet wrong operating point admitted");
+    }
+    let wrong_rate = TxFrame { rate: 20, ..frame };
+    if owner.fill_tx_slot(&mut slot, &wrong_rate) != Err(Error::NotAdmitted) {
+        return TestResult::Fail("8192DE packet unadmitted rate admitted");
+    }
+    let empty = TxFrame { len: 0, ..frame };
+    if owner.fill_tx_slot(&mut slot, &empty) != Err(Error::Frame) {
+        return TestResult::Fail("8192DE packet empty frame admitted");
+    }
+    let huge = TxFrame {
+        len: 0x1_0000,
+        ..frame
+    };
+    if owner.fill_tx_slot(&mut slot, &huge) != Err(Error::Frame) {
+        return TestResult::Fail("8192DE packet oversized frame admitted");
+    }
+    let mut dw = [0u32; 8];
+    dw[0] |= 1 << 31;
+    if owner.service_rx(&dw, &[0u8; 64]) != Err(Error::NotReady) {
+        return TestResult::Fail("8192DE packet hardware-owned RX serviced");
+    }
+    dw = [0u32; 8];
+    dw[0] |= 10 | (1 << 16);
+    let buffer = [0xabu8; 64];
+    match owner.service_rx(&dw, &buffer) {
+        Ok(rx) if rx.status.length == 10 && rx.payload == &buffer[32 + 8..32 + 8 + 10] => {}
+        _ => return TestResult::Fail("8192DE packet RX decode"),
+    }
+    if owner.service_rx(&dw, &[0u8; 16]) != Err(Error::Frame) {
+        return TestResult::Fail("8192DE packet short RX buffer admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_packet_admission_and_fill
+);

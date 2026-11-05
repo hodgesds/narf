@@ -6,10 +6,13 @@
 //! This module is step 1 of the `rtl8192de` TSV row: the per-function
 //! ownership model — how Linux selects the MAC/PHY mode from EFUSE, what
 //! each mode programs, which band each function runs, and which register
-//! tables each function/band/PA combination loads. It is not admitted yet
-//! (probe keeps it diagnostic); the power-on sequence, firmware header
-//! parse + transport admission, station chains, bands/HT/QoS/lifecycle and
-//! the signed envelope are remainders.
+//! tables each function/band/PA combination loads. Step 2 adds the
+//! firmware image + paged download ([`fw`]), the signed per-board
+//! power envelope ([`envelope`], 2.4 GHz only), the chip's own TX/RX
+//! descriptors ([`trx`]) and the packet owner ([`packet`]). It is not
+//! admitted yet (probe keeps it diagnostic); the power-on sequence,
+//! station chains, bands/HT/QoS/lifecycle, TX-power levels and the
+//! 5 GHz envelope are remainders.
 //!
 //! Per-function EFUSE identity already lives in-tree: `efuse.rs` maps
 //! function 0 / 1 to MAC offsets `0x55` / `0x5b` (497 physical bytes, 256
@@ -25,10 +28,18 @@
 //!
 //! - [`tables`] — the 10 Linux `table.c` arrays, generated verbatim
 //!   (`gen_tables.py` + independent `check_tables.py`, 0 failures).
+//! - [`fw`] — the firmware image, header parse and paged download.
+//! - [`envelope`] — the signed per-board power envelope (NAPC).
+//! - [`trx`] — the chip's own TX/RX descriptors.
+//! - [`packet`] — the packet owner (TX fill + RX decode).
 
 #![allow(dead_code)]
 
+pub mod envelope;
+pub mod fw;
+pub mod packet;
 pub mod tables;
+pub mod trx;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests;
