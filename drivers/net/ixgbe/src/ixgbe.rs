@@ -2110,7 +2110,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             rx_checksum: true,
             max_tso_bytes: TX_TSO_MAX_TX as u32,
             vlan_insert: true,
-            ..Default::default()
         },
     );
     IXGBE_IFNAME.set(name);
