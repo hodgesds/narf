@@ -1135,7 +1135,11 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
     result
 }
 
-fn eval_term_arg_inner(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<Value, AmlError> {
+fn eval_term_arg_inner(
+    buf: &[u8],
+    cur: &mut usize,
+    state: &mut EvalState,
+) -> Result<Value, AmlError> {
     let op = next_u8(buf, cur)?;
     let v = match op {
         // Constants
@@ -1678,11 +1682,7 @@ fn eval_term_arg_inner(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Re
                         // (a missing optional helper must not
                         // abort the caller — that compat question
                         // is out of scope for this lane).
-                        match evaluate_method_with_depth(
-                            &node.path,
-                            &args,
-                            state.call_depth,
-                        ) {
+                        match evaluate_method_with_depth(&node.path, &args, state.call_depth) {
                             Ok(v) => v,
                             Err(AmlError::RecursionDepthExceeded) => {
                                 return Err(AmlError::RecursionDepthExceeded);

@@ -395,11 +395,7 @@ fn pkg_length_for(payload: usize) -> alloc::vec::Vec<u8> {
 /// Build a `Method(\NAME, flags, body)` blob with a correctly
 /// sized (possibly multi-byte) PkgLength. Same shape as
 /// `build_eval_method_blob`, without its 63-byte ceiling.
-fn build_eval_method_blob_long(
-    name4: &[u8; 4],
-    flags: u8,
-    body: &[u8],
-) -> alloc::vec::Vec<u8> {
+fn build_eval_method_blob_long(name4: &[u8; 4], flags: u8, body: &[u8]) -> alloc::vec::Vec<u8> {
     // PkgLength covers itself + root char + NameSeg + flags + body.
     let pkglen = pkg_length_for(1 + 4 + 1 + body.len());
     let mut blob = alloc::vec::Vec::new();
@@ -430,7 +426,10 @@ fn smoke_aml_eval_self_recursive_method_stops_at_depth_budget() -> TestResult {
         Err(_) => TestResult::Fail("self-recursive method failed with the wrong error"),
     }
 }
-kernel_test_in!("aml", smoke_aml_eval_self_recursive_method_stops_at_depth_budget);
+kernel_test_in!(
+    "aml",
+    smoke_aml_eval_self_recursive_method_stops_at_depth_budget
+);
 
 fn smoke_aml_eval_nested_method_chain_under_budget_completes() -> TestResult {
     // Four-deep helper chain, the shape real DSDTs use
@@ -458,14 +457,16 @@ fn smoke_aml_eval_nested_method_chain_under_budget_completes() -> TestResult {
         Err(_) => TestResult::Fail("evaluate_method failed"),
     }
 }
-kernel_test_in!("aml", smoke_aml_eval_nested_method_chain_under_budget_completes);
+kernel_test_in!(
+    "aml",
+    smoke_aml_eval_nested_method_chain_under_budget_completes
+);
 
 /// Build `Add(Add(...Add(1, 2)...), 0, Local0)` nested `levels`
 /// deep, wrapped in `Return(...)`. Each level adds one AddOp
 /// (0x72) + one `BytePrefix 0` operand + one Local0 target.
 fn nested_add_body(levels: usize) -> alloc::vec::Vec<u8> {
-    let mut inner: alloc::vec::Vec<u8> =
-        alloc::vec![0x72, 0x0A, 0x01, 0x0A, 0x02, 0x60];
+    let mut inner: alloc::vec::Vec<u8> = alloc::vec![0x72, 0x0A, 0x01, 0x0A, 0x02, 0x60];
     for _ in 1..levels {
         let mut outer = alloc::vec![0x72];
         outer.extend_from_slice(&inner);
