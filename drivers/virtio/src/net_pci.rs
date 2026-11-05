@@ -138,6 +138,11 @@ const VIRTIO_NET_F_HOST_TSO6: u64 = 12;
 /// segment) — different application-visible behavior, and no meta kind
 /// exists to express the fragmentation choice.
 const VIRTIO_NET_F_HOST_USO: u64 = 56;
+/// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_MRG_RXBUF (bit 15, uapi
+/// `linux/virtio_net.h:48`). The device may span one RX frame across
+/// several posted buffers, reporting the count in the header's
+/// `num_buffers` field; the driver reassembles before delivery.
+const VIRTIO_NET_F_MRG_RXBUF: u64 = 15;
 const VIRTIO_NET_F_STATUS: u64 = 16;
 const VIRTIO_NET_F_CTRL_VQ: u64 = 17;
 /// VirtIO 1.2 §5.1.3 — VIRTIO_NET_F_CTRL_RX (bit 18). Required for
@@ -306,12 +311,13 @@ const CFG_SUPPORTED_HASH_TYPES: u64 = 20;
 ///   TX submission across a typical small-core machine.
 const MAX_QUEUE_PAIRS: u16 = 4;
 
-/// virtio-net header (VirtIO 1.2 §5.1.6.1). 12 bytes when
-/// VIRTIO_F_VERSION_1 is negotiated and VIRTIO_NET_F_MRG_RXBUF /
-/// VIRTIO_NET_F_HASH_REPORT are *not* — the TX form, which is
-/// always 12 bytes (the hash fields are device-written on RX
-/// only). The RX header is 12 bytes, or 20 with HASH_REPORT
-/// (`VIRTIO_NET_HDR_HASH_LEN`); see `rx_hdr_len`.
+/// virtio-net header (VirtIO 1.2 §5.1.6.1), 12 bytes: the
+/// `virtio_net_hdr_mrg_rxbuf` form. `num_buffers` is live on RX when
+/// VIRTIO_NET_F_MRG_RXBUF is negotiated (and ignored otherwise); on
+/// TX it is always 0 (Linux `virtio_net.c:3335` likewise). The RX
+/// header is 12 bytes, or 20 with HASH_REPORT
+/// (`VIRTIO_NET_HDR_HASH_LEN`); see `rx_hdr_len`. The TX form is
+/// always 12 bytes (the hash fields are device-written on RX only).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct VirtioNetHdr {
@@ -363,6 +369,30 @@ pub const MAX_RX_FRAME: usize = 1518 + VIRTIO_NET_HDR_LEN;
 /// MAX_RX_FRAME_PAYLOAD` so a max-size frame still fits when the
 /// RX header grows to 20 bytes with HASH_REPORT.
 const MAX_RX_FRAME_PAYLOAD: usize = MAX_RX_FRAME - VIRTIO_NET_HDR_LEN;
+
+/// Largest MTU honestly advertisable without MRG_RXBUF: a standard
+/// frame (1500 MTU + Ethernet header + VLAN tag). A device advertising
+/// more while MRG is off gets clamped to this at probe — previously
+/// the raw device MTU was published while the datapath capped at
+/// 1518, a probe/datapath inconsistency (audit gap 4).
+const RX_MTU_CAP_PLAIN: u32 = 1500;
+/// Largest MTU honestly advertisable with MRG_RXBUF: the standard
+/// jumbo MTU. The reassembly buffer for a cap-sized frame is
+/// 9018 + 12 header bytes (3 pages) — bounded, not MTU-unbounded.
+const RX_MTU_CAP_MRG: u32 = 9000;
+
+/// Largest frame (header excluded) the datapath accepts for a given
+/// advertised MTU: MTU + Ethernet header + VLAN tag headroom.
+const fn max_frame_for_mtu(mtu: u32) -> usize {
+    mtu as usize + ETH_HDR_LEN + VLAN_TAG_LEN
+}
+
+/// Maximum number of posted buffers one merged RX frame may span.
+/// A cap-sized jumbo frame needs at most 6 (1518 first payload +
+/// 1530 per continuation); 16 is generous headroom, and anything
+/// above it is a pathological split (or a corrupt `num_buffers`)
+/// dropped fail-closed.
+const RX_MRG_MAX_BUFFERS: usize = 16;
 
 /// Largest complete Ethernet frame accepted by the bounded virtio TX GSO
 /// profile. It is deliberately the same 64 KiB order used by the TCP stack's
@@ -570,6 +600,11 @@ pub struct VirtioNetPci {
     /// `rx_csum_deliver`); when false the device never reports
     /// validity, so the forwarder delivers everything as before.
     rx_guest_csum: bool,
+    /// True when `VIRTIO_NET_F_MRG_RXBUF` was negotiated. RX frames may
+    /// then span several posted buffers (`num_buffers` in the header);
+    /// `rx_take_on` reassembles them before delivery. False keeps the
+    /// legacy one-buffer-per-frame path byte-identical.
+    mrg_rxbuf: bool,
     /// Runtime control-queue index (VirtIO 1.2 §5.1.2): with F_MQ
     /// negotiated and pairs > 1 the controlq sits at
     /// `2 * num_pairs`; without F_MQ it sits at fixed index 2.
@@ -1018,10 +1053,15 @@ pub(crate) fn ipv6_pseudo_seed(src: &[u8; 16], dst: &[u8; 16], next_header: u8) 
 /// Prepare the virtio-net header for one transmit. This is deliberately
 /// feature-gated: a frame carrying partial checksum data or GSO metadata must
 /// never reach a device that did not negotiate the matching virtio feature.
+/// `max_plain_frame` caps non-GSO frames (plain + checksum): the
+/// advertised MTU + headers, so a jumbo-MTU device accepts jumbo plain
+/// frames while a standard-MTU device keeps the old 1518 bound exactly
+/// (1500 + 14 + 4). The GSO arm keeps its own `MAX_TX_TSO_FRAME` cap.
 pub(crate) fn tx_header_for_frame(
     frame: &mut [u8],
     meta: narf_net::TxMeta,
     profile: TxOffloadProfile,
+    max_plain_frame: usize,
 ) -> Result<VirtioNetHdr, VirtioPciError> {
     // A vlan_tag reaching this point is a caller error: insertion
     // happens at copy time in the send fns (`vnet0_send_fn` /
@@ -1181,7 +1221,7 @@ pub(crate) fn tx_header_for_frame(
         }
         (Some(_), _) => Err(malformed_tx()),
         (None, Some(kind)) => {
-            if !profile.checksum || frame.len() > MAX_RX_FRAME - VIRTIO_NET_HDR_LEN {
+            if !profile.checksum || frame.len() > max_plain_frame {
                 return Err(malformed_tx());
             }
             let (l4, csum_offset) = l4_checksum_layout(frame, kind)?;
@@ -1193,11 +1233,64 @@ pub(crate) fn tx_header_for_frame(
                 ..VirtioNetHdr::default()
             })
         }
-        (None, None) if frame.len() <= MAX_RX_FRAME - VIRTIO_NET_HDR_LEN => {
-            Ok(VirtioNetHdr::default())
-        }
+        (None, None) if frame.len() <= max_plain_frame => Ok(VirtioNetHdr::default()),
         (None, None) => Err(malformed_tx()),
     }
+}
+
+/// Decode the mergeable-buffer count from an RX header's `num_buffers`
+/// field (bytes 10..12, little-endian under VIRTIO_F_VERSION_1).
+/// `None` when the slice is shorter than the 12-byte header.
+fn mrg_num_buffers(hdr: &[u8]) -> Option<u16> {
+    let b = hdr.get(10..12)?;
+    Some(u16::from_le_bytes([b[0], b[1]]))
+}
+
+/// Pure shape check for a merged RX frame (testable without hardware).
+/// `first_len` is the first used entry's length including the 12-byte
+/// virtio header; `cont_lens` are the continuation used lengths (raw
+/// payload, no header). Returns the frame payload length (header
+/// excluded) when the shape is deliverable, else `None`:
+/// - `num_buffers` in 1..=RX_MRG_MAX_BUFFERS and matching the collected
+///   segment count (a short collection means the device published
+///   fewer used entries than promised — fail closed, never deliver
+///   a prefix as a frame);
+/// - every segment within the posted descriptor length;
+/// - the reassembled frame within the advertised MTU + headers.
+fn mrg_frame_payload_len(
+    first_len: usize,
+    cont_lens: &[usize],
+    num_buffers: usize,
+    mtu: u32,
+) -> Option<usize> {
+    if num_buffers == 0 || num_buffers > RX_MRG_MAX_BUFFERS {
+        return None;
+    }
+    if cont_lens.len() + 1 != num_buffers {
+        return None;
+    }
+    if first_len < VIRTIO_NET_HDR_LEN || first_len > MAX_RX_FRAME {
+        return None;
+    }
+    if cont_lens.iter().any(|&l| l > MAX_RX_FRAME) {
+        return None;
+    }
+    let payload = first_len - VIRTIO_NET_HDR_LEN + cont_lens.iter().sum::<usize>();
+    if payload > max_frame_for_mtu(mtu) {
+        return None;
+    }
+    Some(payload)
+}
+
+/// Pure MTU clamp (testable): never advertise an MTU the datapath
+/// cannot deliver. Without MRG_RXBUF the datapath caps at a standard
+/// frame; with it, at the jumbo cap.
+fn clamp_mtu(device_mtu: u32, mrg: bool) -> u32 {
+    device_mtu.min(if mrg {
+        RX_MTU_CAP_MRG
+    } else {
+        RX_MTU_CAP_PLAIN
+    })
 }
 
 impl VirtioNetPci {
@@ -1259,6 +1352,7 @@ impl VirtioNetPci {
         // `VIRTIO_NET_F_HOST_USO`): its fragmentation semantics do not
         // match the segmentation `TxMeta` requests.
         let want_mac = feats & (1u64 << VIRTIO_NET_F_MAC) != 0;
+        let want_mrg = feats & (1u64 << VIRTIO_NET_F_MRG_RXBUF) != 0;
         let want_status = feats & (1u64 << VIRTIO_NET_F_STATUS) != 0;
         let want_mtu = feats & (1u64 << VIRTIO_NET_F_MTU) != 0;
         let want_csum = feats & (1u64 << VIRTIO_NET_F_CSUM) != 0;
@@ -1302,6 +1396,7 @@ impl VirtioNetPci {
             | ((1u32 << VIRTIO_NET_F_GUEST_CSUM) * (want_guest_csum as u32))
             | ((1u32 << VIRTIO_NET_F_HOST_TSO4) * (want_tso4 as u32))
             | ((1u32 << VIRTIO_NET_F_HOST_TSO6) * (want_tso6 as u32))
+            | ((1u32 << VIRTIO_NET_F_MRG_RXBUF) * (want_mrg as u32))
             | ((1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32))
             | ((1u32 << VIRTIO_NET_F_MQ) * (want_mq as u32))
@@ -1598,6 +1693,13 @@ impl VirtioNetPci {
                 rss_supported_hash_types = unsafe { r.read32(CFG_SUPPORTED_HASH_TYPES) };
             }
         }
+        // Clamp to what the datapath can actually deliver (audit
+        // gap 4): without MRG_RXBUF a device advertising MTU 9000
+        // previously got 9000 published while RX capped at 1518
+        // and TX rejected past 1518 — the stack sized frames the
+        // driver could never move. With MRG the jumbo cap applies.
+        // A no-op at the QEMU default (1500) either way.
+        mtu = clamp_mtu(mtu, want_mrg);
         // Stash an initial link-state guess on the controller so
         // accessors don't need to re-read MMIO on every poll.
         let _ = link_up_init;
@@ -1633,6 +1735,7 @@ impl VirtioNetPci {
             tx_tso6: want_tso6,
             tx_uso: want_uso,
             rx_guest_csum: want_guest_csum,
+            mrg_rxbuf: want_mrg,
             ctrl_qidx,
             ctrl,
             cfg_phys,
@@ -1925,9 +2028,20 @@ impl VirtioNetPci {
 
     /// Return a fully-consumed RX DMA buffer to the queue that supplied it,
     /// or drop it (freeing) when that bounded pool is already full.
+    /// A buffer whose size differs from the pool's is also dropped, not
+    /// pooled: reassembled merged frames are larger than the 4 KiB pool
+    /// buffers, and pooling one would hand a wrong-sized buffer to a
+    /// later refill (`DmaPool::release` drops only undersized buffers,
+    /// so an oversized one would be retained — a latent pool wart this
+    /// driver does not rely on). Jumbo frames are rare; the buddy free
+    /// is cheap.
     pub fn rx_buf_release_on(&self, pair_idx: usize, buf: DmaBuffer) {
         if let Some(pair) = self.pairs.get(pair_idx) {
-            pair.rx_pool.release(buf);
+            if buf.len() != pair.rx_pool.buf_len() {
+                drop(buf);
+            } else {
+                pair.rx_pool.release(buf);
+            }
         }
     }
 
@@ -2015,6 +2129,7 @@ impl VirtioNetPci {
                 &mut slice[VIRTIO_NET_HDR_LEN..total_len],
                 meta,
                 self.tx_offload_profile(),
+                max_frame_for_mtu(self.mtu),
             )?;
             write_tx_header(&mut slice[..VIRTIO_NET_HDR_LEN], header);
         }
@@ -2149,7 +2264,8 @@ impl VirtioNetPci {
     }
 
     /// Negotiated MTU. Defaults to 1500 when `VIRTIO_NET_F_MTU`
-    /// wasn't offered.
+    /// wasn't offered. Always clamped to what the datapath can
+    /// deliver (see the probe-time `clamp_mtu` call).
     pub fn mtu(&self) -> u32 {
         self.mtu
     }
@@ -2174,6 +2290,11 @@ impl VirtioNetPci {
     /// RX header length in bytes: 20 with HASH_REPORT, else 12.
     pub fn rx_hdr_len(&self) -> usize {
         self.rx_hdr_len
+    }
+
+    /// Whether mergeable RX buffers were negotiated with this device.
+    pub fn mrg_rxbuf(&self) -> bool {
+        self.mrg_rxbuf
     }
 
     /// Live link state. Reads the status word from device-cfg every
@@ -2596,10 +2717,32 @@ impl VirtioNetPci {
         }
     }
 
+    /// Take ownership of one device-filled RX frame from the given
+    /// pair. When MRG_RXBUF was negotiated the frame may span several
+    /// posted buffers; it is reassembled into one contiguous buffer
+    /// before return so forwarders keep their one-frame-per-take
+    /// contract. Otherwise the legacy single-buffer path, unchanged.
+    ///
+    /// Returns `None` if the pair index is out of range, the used
+    /// ring is empty, a replacement allocation fails on the first
+    /// segment, or a merged frame fails shape validation (dropped
+    /// fail-closed after draining all its used entries so the ring
+    /// stays in sync).
     pub fn rx_take_on(&self, pair_idx: usize) -> Option<(DmaBuffer, u32)> {
         if self.datapath_gated() {
             return None;
         }
+        if self.mrg_rxbuf {
+            self.rx_take_merged_on(pair_idx)
+        } else {
+            self.rx_take_single_on(pair_idx)
+        }
+    }
+
+    /// Legacy single-buffer take (MRG_RXBUF not negotiated). The
+    /// pre-merge body, unchanged except that the datapath gate now
+    /// lives in the `rx_take_on` dispatcher above.
+    fn rx_take_single_on(&self, pair_idx: usize) -> Option<(DmaBuffer, u32)> {
         let pair = self.pairs.get(pair_idx)?;
         let elem = {
             let mut g = pair.rx_queue.lock();
@@ -2654,6 +2797,223 @@ impl VirtioNetPci {
         // Park the replacement in its slot for the next rx_take.
         pair.rx_buffers.lock()[new_head as usize] = Some(replacement);
         Some((original, len))
+    }
+
+    /// Post `replacement` for the consumed descriptor `head` on `pair`
+    /// and park it in the slot table. Returns false only when the
+    /// queue vanished (detach); the caller restores its buffer and
+    /// bails. A full ring (add_buffer None) drops the replacement
+    /// and returns true — the ring is one descriptor down, like the
+    /// single path's refill-failure arm, but the frame still stands.
+    /// Lock order matches the single path: queue lock, then slot lock.
+    fn rx_refill_segment(&self, pair: &QueuePair, head: u16, replacement: DmaBuffer) -> bool {
+        let rep_phys = replacement.dma_addr().raw();
+        let mut g = pair.rx_queue.lock();
+        let Some(q) = g.as_mut() else {
+            return false;
+        };
+        q.free_chain(head);
+        let descs = [VirtqDesc {
+            addr: rep_phys,
+            len: MAX_RX_FRAME as u32,
+            flags: VIRTQ_DESC_F_WRITE,
+            next: 0,
+        }];
+        match q.add_buffer(&descs) {
+            Some(h) => {
+                pair.rx_buffers.lock()[h as usize] = Some(replacement);
+                true
+            }
+            None => {
+                drop(replacement);
+                true
+            }
+        }
+    }
+
+    /// Merged-buffer RX take (MRG_RXBUF negotiated). Linux
+    /// `receive_mergeable` shape: the first used entry's header
+    /// carries `num_buffers`; one used entry per buffer follows, in
+    /// order. Segments are reassembled into one contiguous
+    /// `[header | frame]` buffer (the forwarder contract); segment
+    /// buffers return to the pair's RX pool and each consumed
+    /// descriptor gets a fresh replacement posted, so the ring stays
+    /// full. Any shape violation drops the frame fail-closed — after
+    /// draining all its used entries, never delivering a prefix.
+    ///
+    /// Late-continuation caveat, shared with Linux's missing-buffer
+    /// path: if a device publishes continuation used entries after
+    /// the forwarder already polled a short merge, the partial frame
+    /// is dropped and the late entries may later be misparsed as a
+    /// new head. In practice a device completes a packet's buffers
+    /// before the guest's poll observes them, and the shape check
+    /// (buffer-count + frame caps) plus the stack's own L2 parse are
+    /// the backstops; no retry loop here, since waiting on a
+    /// genuinely broken device would wedge the forwarder.
+    fn rx_take_merged_on(&self, pair_idx: usize) -> Option<(DmaBuffer, u32)> {
+        let pair = self.pairs.get(pair_idx)?;
+        // Segment 0: same swap discipline as the single path — poll,
+        // acquire the replacement BEFORE surrendering the filled
+        // buffer, so an empty pool parks the buffer (used entry
+        // consumed) instead of losing the refill slot.
+        let (head0, len0) = {
+            let mut g = pair.rx_queue.lock();
+            g.as_mut()?.poll_used()?
+        };
+        // `poll_used` reports the used-ring elem id (le32), but
+        // descriptor indices are u16 — same conversion as the
+        // single path (`let head = id as u16`).
+        let head0 = head0 as u16;
+        let replacement0 = self.rx_buf_acquire_on(pair_idx)?;
+        let buf0 = {
+            let mut bufs = pair.rx_buffers.lock();
+            bufs.get_mut(head0 as usize).and_then(|s| s.take())?
+        };
+        // Parse num_buffers BEFORE posting the refill: a short or
+        // corrupt header drops the frame, and the refill still goes
+        // out below so the ring does not shrink on a device bug.
+        let num_buffers = buf0
+            .as_slice()
+            .get(..VIRTIO_NET_HDR_LEN)
+            .and_then(mrg_num_buffers)
+            .unwrap_or(0) as usize;
+        // Post segment 0's replacement now (mirrors the single path).
+        if !self.rx_refill_segment(pair, head0, replacement0) {
+            // Queue vanished mid-take: restore and bail (detach is
+            // resetting the device; the ring is gone either way).
+            pair.rx_buffers.lock()[head0 as usize] = Some(buf0);
+            return None;
+        }
+        // Collect continuations, draining up to num_buffers - 1
+        // further used entries. `short` marks any anomaly (poll
+        // miss, empty slot, undersized buffer) that must fail the
+        // frame even though draining continues for ring sync.
+        // The drain is capped at RX_MRG_MAX_BUFFERS - 1: a corrupt
+        // huge num_buffers must not eat a whole burst as
+        // "continuations" (the shape check rejects > cap anyway, so
+        // capping the drain changes no deliverable frame).
+        let mut segments: Vec<(DmaBuffer, usize)> = Vec::new();
+        let mut cont_lens: Vec<usize> = Vec::new();
+        let mut short = false;
+        for _ in 1..num_buffers.min(RX_MRG_MAX_BUFFERS) {
+            let entry = {
+                let mut g = pair.rx_queue.lock();
+                g.as_mut().and_then(|q| q.poll_used())
+            };
+            let Some((head, len)) = entry else {
+                short = true;
+                break;
+            };
+            // See segment 0: used-ring ids are le32, indices are u16.
+            let head = head as u16;
+            let buf = {
+                let mut bufs = pair.rx_buffers.lock();
+                bufs.get_mut(head as usize).and_then(|s| s.take())
+            };
+            let Some(buf) = buf else {
+                // Published entry with no parked buffer: free the
+                // descriptor, mark short, keep draining for sync.
+                let mut g = pair.rx_queue.lock();
+                if let Some(q) = g.as_mut() {
+                    q.free_chain(head);
+                }
+                short = true;
+                continue;
+            };
+            if buf.len() < len as usize {
+                // Used length exceeds its buffer: corrupt entry.
+                // Still refill the descriptor, mark short, keep the
+                // buffer for release at drop time.
+                if let Some(rep) = self.rx_buf_acquire_on(pair_idx) {
+                    let _ = self.rx_refill_segment(pair, head, rep);
+                } else {
+                    let mut g = pair.rx_queue.lock();
+                    if let Some(q) = g.as_mut() {
+                        q.free_chain(head);
+                    }
+                }
+                segments.push((buf, 0));
+                short = true;
+                continue;
+            }
+            // Refill this segment (a failed acquire shrinks the ring
+            // by one, like the single path's refill-failure arm —
+            // the frame still delivers; the ring is not wedged).
+            if let Some(rep) = self.rx_buf_acquire_on(pair_idx) {
+                let _ = self.rx_refill_segment(pair, head, rep);
+            } else {
+                let mut g = pair.rx_queue.lock();
+                if let Some(q) = g.as_mut() {
+                    q.free_chain(head);
+                }
+            }
+            cont_lens.push(len as usize);
+            segments.push((buf, len as usize));
+        }
+        // Validate, then copy or drop. Segments are released to the
+        // pool on both paths (no locks held during the copy).
+        let payload_len = if short {
+            None
+        } else {
+            mrg_frame_payload_len(len0 as usize, &cont_lens, num_buffers, self.mtu)
+        };
+        let Some(payload_len) = payload_len else {
+            for (buf, _) in segments {
+                pair.rx_pool.release(buf);
+            }
+            pair.rx_pool.release(buf0);
+            return None;
+        };
+        if num_buffers == 1 {
+            // No split: the single buffer IS the frame (the common
+            // case — a standard frame fits one posted descriptor).
+            // The refill already went out above; return it directly
+            // with no copy and no allocation.
+            return Some((buf0, len0));
+        }
+        let total = VIRTIO_NET_HDR_LEN + payload_len;
+        let mut merged = match alloc_coherent(total, DomainId::DRIVER_0) {
+            Ok(b) => b,
+            Err(_) => {
+                // Allocation failure must not strand the segments:
+                // return them to the pool like every other drop path
+                // (their replacements are already posted, so the ring
+                // stays full).
+                for (buf, _) in segments {
+                    pair.rx_pool.release(buf);
+                }
+                pair.rx_pool.release(buf0);
+                return None;
+            }
+        };
+        if merged.len() < total {
+            // Defensive: allocator rounded down (should not happen).
+            for (buf, _) in segments {
+                pair.rx_pool.release(buf);
+            }
+            pair.rx_pool.release(buf0);
+            return None;
+        }
+        {
+            let dst = merged.as_mut_slice();
+            let src0 = buf0.as_slice();
+            dst[..VIRTIO_NET_HDR_LEN].copy_from_slice(&src0[..VIRTIO_NET_HDR_LEN]);
+            let mut off = VIRTIO_NET_HDR_LEN;
+            let first_payload = len0 as usize - VIRTIO_NET_HDR_LEN;
+            dst[off..off + first_payload].copy_from_slice(&src0[VIRTIO_NET_HDR_LEN..len0 as usize]);
+            off += first_payload;
+            for (buf, len) in &segments {
+                let s = buf.as_slice();
+                dst[off..off + *len].copy_from_slice(&s[..*len]);
+                off += *len;
+            }
+            debug_assert_eq!(off, total);
+        }
+        for (buf, _) in segments {
+            pair.rx_pool.release(buf);
+        }
+        pair.rx_pool.release(buf0);
+        Some((merged, total as u32))
     }
 
     /// Notify the device that new RX buffers have been posted to the avail ring.
@@ -3882,7 +4242,10 @@ mod tx_tests {
                     rx_buffers: IrqSafeSpinLock::new(Vec::new()),
                     tx_buffers: IrqSafeSpinLock::new((0..QSIZE).map(|_| None).collect()),
                     tx_pool: pool,
-                    rx_pool: DmaPool::new(4096, DomainId::DRIVER_0, 0),
+                    // Retained cap (not prefilled — TX tests never touch
+                    // the RX pool) so the recycle-guard test can observe
+                    // retention; the old cap 0 made every release a drop.
+                    rx_pool: DmaPool::new(4096, DomainId::DRIVER_0, RX_POOL_CAP),
                     _rx_q_buf: rx,
                     _tx_q_buf: tx,
                     rx_qsize: 0,
@@ -3923,6 +4286,7 @@ mod tx_tests {
                 tx_tso6: true,
                 tx_uso: true,
                 rx_guest_csum: false,
+                mrg_rxbuf: false,
                 ctrl_qidx: 4,
                 ctrl: None,
                 cfg_phys: 0,
@@ -4334,6 +4698,32 @@ mod tx_tests {
             Err(e) => TestResult::Fail(e),
         }
     }
+    fn smoke_virtio_net_mrg_header_decode() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let mut hdr = [0u8; 12];
+            hdr[10] = 6;
+            hdr[11] = 0;
+            if mrg_num_buffers(&hdr) != Some(6) {
+                return Err("num_buffers LE decode wrong");
+            }
+            hdr[10] = 0x34;
+            hdr[11] = 0x12;
+            if mrg_num_buffers(&hdr) != Some(0x1234) {
+                return Err("num_buffers high byte ignored");
+            }
+            if mrg_num_buffers(&hdr[..11]).is_some() {
+                return Err("short header decoded");
+            }
+            if mrg_num_buffers(&[]).is_some() {
+                return Err("empty header decoded");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
     kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_vlan_insert_bytes);
 
     fn smoke_virtio_net_mac_table_payload() -> TestResult {
@@ -4357,6 +4747,55 @@ mod tx_tests {
             let empty = mac_table_payload(&[], &[]);
             if empty.as_slice() != [0u8; 8].as_slice() {
                 return Err("empty MAC table payload wrong");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_mrg_header_decode);
+
+    fn smoke_virtio_net_mrg_frame_shape() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            // Cap-sized jumbo frame: 1518 first payload + 5 x 1530
+            // continuations + 1380 = 9018, exactly the 9000-MTU cap.
+            let cont = [1530usize, 1530, 1530, 1530, 1380];
+            if mrg_frame_payload_len(1530, &cont, 6, 9000) != Some(9018) {
+                return Err("cap-sized jumbo rejected");
+            }
+            // One byte over the cap.
+            let cont = [1530usize, 1530, 1530, 1530, 1381];
+            if mrg_frame_payload_len(1530, &cont, 6, 9000).is_some() {
+                return Err("over-cap jumbo accepted");
+            }
+            // Standard frame on a standard MTU, unsplit.
+            if mrg_frame_payload_len(1530, &[], 1, 1500) != Some(1518) {
+                return Err("standard frame rejected");
+            }
+            // Same frame over a standard MTU with one continuation.
+            if mrg_frame_payload_len(1530, &[100], 2, 1500).is_some() {
+                return Err("over-MTU split accepted");
+            }
+            // Degenerate counts.
+            if mrg_frame_payload_len(1530, &[], 0, 9000).is_some() {
+                return Err("num_buffers 0 accepted");
+            }
+            if mrg_frame_payload_len(1530, &[1530; 16], 17, 9000).is_some() {
+                return Err("num_buffers over cap accepted");
+            }
+            // Count mismatch (device published fewer than promised).
+            if mrg_frame_payload_len(1530, &[1530], 3, 9000).is_some() {
+                return Err("short collection accepted");
+            }
+            // Short first segment (no room for the header).
+            if mrg_frame_payload_len(11, &[], 1, 9000).is_some() {
+                return Err("sub-header first segment accepted");
+            }
+            // Continuation longer than the posted descriptor.
+            if mrg_frame_payload_len(1530, &[1531], 2, 9000).is_some() {
+                return Err("over-descriptor continuation accepted");
             }
             Ok(())
         };
@@ -4411,6 +4850,32 @@ mod tx_tests {
                 Err(VirtioPciError::RequestTooLarge)
             ) {
                 return Err("oversize MAC table did not report RequestTooLarge");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_mrg_frame_shape);
+
+    fn smoke_virtio_net_mtu_clamp() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            if clamp_mtu(9000, true) != 9000 {
+                return Err("jumbo MTU clamped with MRG");
+            }
+            if clamp_mtu(9000, false) != 1500 {
+                return Err("jumbo MTU published without MRG");
+            }
+            if clamp_mtu(16000, true) != 9000 {
+                return Err("oversize MTU published with MRG");
+            }
+            if clamp_mtu(1500, true) != 1500 || clamp_mtu(1500, false) != 1500 {
+                return Err("standard MTU changed by clamp");
+            }
+            if clamp_mtu(64, false) != 64 {
+                return Err("minimum MTU changed by clamp");
             }
             Ok(())
         };
@@ -4516,6 +4981,36 @@ mod tx_tests {
                 || fixture.dev.pairs[1].tx_pool.available() != TX_POOL_CAP
             {
                 return Err("tagged TX leaked buffers or crossed queue pools");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_mtu_clamp);
+
+    fn smoke_virtio_net_tx_plain_cap_follows_mtu() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let profile = TxOffloadProfile {
+                checksum: false,
+                tso4: false,
+                tso6: false,
+                uso: false,
+            };
+            let mut buf = alloc_coherent(9018, DomainId::DRIVER_0).map_err(|_| "jumbo buf")?;
+            let frame = &mut buf.as_mut_slice()[..9018];
+            // Plain arm validates length only; zero-filled content is fine.
+            if tx_header_for_frame(frame, narf_net::TxMeta::plain(), profile, 9018).is_err() {
+                return Err("jumbo plain frame rejected at jumbo cap");
+            }
+            if tx_header_for_frame(frame, narf_net::TxMeta::plain(), profile, 1518).is_ok() {
+                return Err("jumbo plain frame accepted at standard cap");
+            }
+            let frame = &mut buf.as_mut_slice()[..1518];
+            if tx_header_for_frame(frame, narf_net::TxMeta::plain(), profile, 1518).is_err() {
+                return Err("standard plain frame rejected at standard cap");
             }
             Ok(())
         };
@@ -4658,6 +5153,7 @@ mod tx_tests {
                 tx_tso6: false,
                 tx_uso: false,
                 rx_guest_csum: guest_csum,
+                mrg_rxbuf: false,
                 has_rss: false,
                 has_hash_report: rx_hdr_len == 20,
                 rss_configured: false,
@@ -4764,5 +5260,38 @@ mod tx_tests {
     kernel_test_in!(
         "drivers/virtio/net-pci",
         smoke_virtio_net_drain_enforces_guest_csum
+    );
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_tx_plain_cap_follows_mtu
+    );
+
+    fn smoke_virtio_net_rx_recycle_drops_oversized() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let fixture = TxFixture::new()?;
+            let pool = &fixture.dev.pairs[0].rx_pool;
+            if !pool.prepare() {
+                return Err("rx pool prepare");
+            }
+            let small = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "pool buf")?;
+            fixture.dev.rx_buf_release_on(0, small);
+            if pool.available() != 1 {
+                return Err("4 KiB buffer not retained");
+            }
+            let big = alloc_coherent(9030, DomainId::DRIVER_0).map_err(|_| "jumbo buf")?;
+            fixture.dev.rx_buf_release_on(0, big);
+            if pool.available() != 1 {
+                return Err("oversized reassembled buffer pooled");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_rx_recycle_drops_oversized
     );
 }
