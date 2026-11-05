@@ -125,6 +125,27 @@ pub(crate) const ADVTXD_STAT_DD: u32 = 1 << 0;
 // Source: Linux ixgbe_type.h §7.2.3.2.2 / ixgbe_main.c.
 pub const ADVTXD_DTYP_CTXT: u32 = 0x2 << 20;
 pub const ADVTXD_DCMD_TSE: u32 = 1 << 31;
+/// VLAN Packet Enable: when set on a data descriptor, hardware
+/// inserts the 802.1Q tag from the preceding context descriptor's
+/// VLAN field (datasheet §7.2.3.2.4: VLE is DCMD bit 6, i.e. word
+/// bit 30; Linux ixgbe_type.h: IXGBE_ADVTXD_DCMD_VLE 0x40000000).
+pub const ADVTXD_DCMD_VLE: u32 = 1 << 30;
+/// VLAN tag shift in the context descriptor's vlan_macip_lens word
+/// (Linux ixgbe_type.h: IXGBE_ADVTXD_VLAN_SHIFT 16).
+pub const ADVTXD_VLAN_SHIFT: u32 = 16;
+
+/// Non-TSO frame cap (existing behavior: MTU-sized frames only;
+/// jumbo is a separate issue).
+pub const TX_LEN_MAX: usize = 1518;
+/// TSO frame cap for `tx()`: the per-slot copy buffer is 4096
+/// bytes (see bring_up), so a copied TSO superframe cannot run
+/// longer. Advertised as `max_tso_bytes` (see probe).
+pub const TX_TSO_MAX_TX: usize = 4096;
+/// TSO frame cap for `tx_frame()`: zero-copy, so the bound is the
+/// per-descriptor data length (Linux ixgbe.h:
+/// IXGBE_MAX_DATA_PER_TXD = 1 << 14). Larger TSO needs
+/// multi-descriptor scatter, which this driver does not do yet.
+pub const TX_TSO_MAX_TX_FRAME: usize = 16384;
 pub const ADVTXD_POPTS_IXSM: u32 = 0x0100;
 pub const ADVTXD_POPTS_TXSM: u32 = 0x0200;
 pub(crate) const ADVTXD_PAYLEN_SHIFT: u32 = 14;
@@ -220,11 +241,15 @@ impl AdvTxDesc {
 
     /// Build a TX data descriptor for TSO. The DCMD_TSE bit is added to
     /// `cmd_type_len`; the context descriptor carries the MSS and L4len.
-    pub fn with_tso(addr: u64, len: u16, _mss: u16) -> Self {
+    /// `len` is the full superframe length (DTALEN); `paylen` is the
+    /// TCP payload length (datasheet §7.2.3.2.4: in TSO, PAYLEN is
+    /// the payload size, not the frame size — the headers are
+    /// accounted by MACLEN/IPLEN/L4LEN in the context descriptor).
+    pub fn with_tso(addr: u64, len: u16, paylen: u32) -> Self {
         AdvTxDesc {
             addr,
             cmd_type_len: Self::ctrl_word(len) | ADVTXD_DCMD_TSE,
-            olinfo: ((len as u32) << ADVTXD_PAYLEN_SHIFT) | ADVTXD_POPTS_IXSM | ADVTXD_POPTS_TXSM,
+            olinfo: (paylen << ADVTXD_PAYLEN_SHIFT) | ADVTXD_POPTS_IXSM | ADVTXD_POPTS_TXSM,
         }
     }
 }
@@ -235,8 +260,20 @@ impl AdvTxCtxtDesc {
     /// `ip_len`  = IP header length in bytes (usually 20).
     /// `l4_len`  = TCP header length in bytes (usually 20).
     /// `mss`     = maximum segment size in bytes.
-    pub fn new_tso_v4(mac_len: u8, ip_len: u8, l4_len: u8, mss: u16) -> Self {
-        let vlan_macip_lens = (ip_len as u32) | ((mac_len as u32) << ADVTXD_MACLEN_SHIFT);
+    /// `vlan_tag` = 802.1Q tag to insert when the data descriptor
+    /// carries VLE, else `None` (tag rides in vlan_macip_lens bits
+    /// 31:16 per Linux ixgbe's ctxtdesc construction).
+    pub fn new_tso_v4(
+        mac_len: u8,
+        ip_len: u8,
+        l4_len: u8,
+        mss: u16,
+        vlan_tag: Option<u16>,
+    ) -> Self {
+        let mut vlan_macip_lens = (ip_len as u32) | ((mac_len as u32) << ADVTXD_MACLEN_SHIFT);
+        if let Some(tag) = vlan_tag {
+            vlan_macip_lens |= (tag as u32) << ADVTXD_VLAN_SHIFT;
+        }
         let type_tucmd_mlhl =
             ADVTXD_DCMD_DEXT | ADVTXD_DTYP_CTXT | ADVTXD_TUCMD_IPV4 | ADVTXD_TUCMD_L4T_TCP;
         let mss_l4len_idx =
@@ -248,6 +285,144 @@ impl AdvTxCtxtDesc {
             mss_l4len_idx,
         }
     }
+
+    /// Build a VLAN-insertion-only context descriptor (no
+    /// segmentation, no checksum context): the tag rides in
+    /// vlan_macip_lens bits 31:16, MACLEN is the driver-supplied
+    /// Ethernet header (14 — the inserted tag is hardware-added,
+    /// so it is NOT counted in MACLEN per datasheet §7.2.3.2.2's
+    /// table: no SNAP + hardware VLAN gives MACLEN 14), and IPLEN
+    /// is 0 (nothing in this context consumes header positions).
+    /// The data descriptor must carry VLE for the tag to be used.
+    pub fn new_vlan(vlan_tag: u16) -> Self {
+        AdvTxCtxtDesc {
+            vlan_macip_lens: ((vlan_tag as u32) << ADVTXD_VLAN_SHIFT)
+                | ((14u32) << ADVTXD_MACLEN_SHIFT),
+            seqnum_seed: 0,
+            type_tucmd_mlhl: ADVTXD_DCMD_DEXT | ADVTXD_DTYP_CTXT,
+            mss_l4len_idx: 0,
+        }
+    }
+}
+
+/// Parsed header lengths for a TSO frame (IPv4/TCP only).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TsoHeaders {
+    pub mac_len: u8,
+    pub ip_len: u8,
+    pub l4_len: u8,
+}
+
+/// Parse the Ethernet/IPv4/TCP header lengths of a TSO frame.
+/// Returns the lengths the context descriptor needs
+/// (MACLEN/IPLEN/L4LEN). Rejects anything that is not an
+/// IPv4/TCP frame with sane header lengths — TSO for other
+/// protocols, and TSO on an already-tagged frame, are follow-ups,
+/// and sending a mis-parsed frame would segment garbage on
+/// silicon. The caller supplies an untagged frame: with VLE
+/// insertion the tag is hardware-added, so MACLEN stays 14.
+/// `head` is the frame's leading bytes (at least the headers;
+/// headers span at most 14 + 60 + 60 = 134 bytes) and `total_len`
+/// is the full frame length, used for the truncation checks.
+pub(crate) fn parse_tso_headers(head: &[u8], total_len: usize) -> Result<TsoHeaders, IxgbeError> {
+    // Ethernet header (14) + min IPv4 (20) + min TCP (20).
+    if total_len < 54 {
+        return Err(IxgbeError::Other("tso frame too short"));
+    }
+    if head[12] == 0x81 && head[13] == 0x00 {
+        return Err(IxgbeError::Other(
+            "tso on VLAN-tagged frame: strip the tag or request vlan_tag insertion",
+        ));
+    }
+    if head[12] != 0x08 || head[13] != 0x00 {
+        return Err(IxgbeError::Other("tso requires IPv4"));
+    }
+    let ip = &head[14..];
+    let ihl = (ip[0] & 0x0F) as usize;
+    if ihl < 5 {
+        return Err(IxgbeError::Other("tso bad IPv4 IHL"));
+    }
+    let ip_len = ihl * 4;
+    if ip[9] != 6 {
+        return Err(IxgbeError::Other("tso requires TCP"));
+    }
+    if total_len < 14 + ip_len + 20 {
+        return Err(IxgbeError::Other("tso frame truncated"));
+    }
+    let tcp = &head[14 + ip_len..];
+    let doff = (tcp[12] >> 4) as usize;
+    if doff < 5 {
+        return Err(IxgbeError::Other("tso bad TCP data offset"));
+    }
+    let l4_len = doff * 4;
+    if total_len < 14 + ip_len + l4_len {
+        return Err(IxgbeError::Other("tso frame truncated"));
+    }
+    Ok(TsoHeaders {
+        mac_len: 14,
+        ip_len: ip_len as u8,
+        l4_len: l4_len as u8,
+    })
+}
+
+/// Plan the descriptor pair for one transmit: optional context
+/// descriptor (TSO and/or VLAN insertion) + data descriptor.
+/// Callers enforce their own length bound first (`tx`: copy-buffer
+/// bound, `tx_frame`: per-descriptor bound); `frame_len` fits u16
+/// by construction of those bounds. `head` is the frame's leading
+/// bytes (see `parse_tso_headers`); `tx()` passes the whole frame,
+/// `tx_frame()` a stack copy of the header region.
+///
+/// VLAN + checksum offload without TSO is rejected: the csum path
+/// programs no context descriptor, so a VLAN context with IPLEN 0
+/// would misplace the hardware checksum computation (datasheet
+/// Table 7.35: XSUM consumes MACLEN/IPLEN). VLAN + TSO is fine —
+/// TSO parsing fills the context. The csum path gaining header
+/// parsing is a follow-up (spec §13j).
+fn tx_plan(
+    phys: u64,
+    frame_len: usize,
+    head: &[u8],
+    meta: &TxMeta,
+) -> Result<(Option<AdvTxCtxtDesc>, AdvTxDesc), IxgbeError> {
+    let tso = match meta.tso_mss {
+        Some(0) => return Err(IxgbeError::Other("tso mss is zero")),
+        Some(mss) => Some((mss, parse_tso_headers(head, frame_len)?)),
+        None => None,
+    };
+    if meta.vlan_tag.is_some() && meta.csum_l4.is_some() && meta.tso_mss.is_none() {
+        return Err(IxgbeError::Other(
+            "vlan insertion with checksum offload requires TSO",
+        ));
+    }
+    let ctxt = match (tso, meta.vlan_tag) {
+        (Some((mss, h)), tag) => Some(AdvTxCtxtDesc::new_tso_v4(
+            h.mac_len, h.ip_len, h.l4_len, mss, tag,
+        )),
+        (None, Some(tag)) => Some(AdvTxCtxtDesc::new_vlan(tag)),
+        (None, None) => None,
+    };
+    let len = frame_len as u16;
+    let mut desc = if let Some((_, h)) = tso {
+        // PAYLEN is the TCP payload, not the frame (datasheet
+        // §7.2.3.2.4: in TSO, PAYLEN defines the payload size).
+        let hdr = h.mac_len as usize + h.ip_len as usize + h.l4_len as usize;
+        AdvTxDesc::with_tso(phys, len, (frame_len - hdr) as u32)
+    } else if meta.csum_l4.is_some() {
+        AdvTxDesc::with_csum(phys, len)
+    } else {
+        AdvTxDesc {
+            addr: phys,
+            cmd_type_len: AdvTxDesc::ctrl_word(len),
+            // PAYLEN field at bits [31:14] of olinfo (§7.2.3.2.4);
+            // single-send PAYLEN is the full frame size.
+            olinfo: (frame_len as u32) << 14,
+        }
+    };
+    if meta.vlan_tag.is_some() {
+        desc.cmd_type_len |= ADVTXD_DCMD_VLE;
+    }
+    Ok((ctxt, desc))
 }
 
 impl RxDesc {
@@ -580,45 +755,67 @@ impl Ixgbe {
     }
 
     /// Transmit a single frame, polling the descriptor's DD bit.
+    /// Honors `TxMeta`: TSO (IPv4/TCP, up to `TX_TSO_MAX_TX` bytes
+    /// — the per-slot copy-buffer size) and VLAN insertion (tag
+    /// from the context descriptor + VLE on the data descriptor).
+    /// Non-TSO frames keep the 1518 cap.
     pub fn tx(&self, frame: &[u8], meta: &TxMeta) -> Result<(), IxgbeError> {
         if *self.quiesced.lock() {
             return Err(IxgbeError::Other("device quiesced"));
         }
-        if frame.is_empty() || frame.len() > 1518 {
+        if frame.is_empty() {
+            return Err(IxgbeError::FrameTooLong);
+        }
+        // Bounds: non-TSO keeps the 1518 cap; TSO runs to the
+        // per-slot copy-buffer size. Larger TSO needs scatter.
+        let limit = if meta.tso_mss.is_some() {
+            TX_TSO_MAX_TX
+        } else {
+            TX_LEN_MAX
+        };
+        if frame.len() > limit {
             return Err(IxgbeError::FrameTooLong);
         }
         // Persistent per-slot buffer (audit #4).
         let mut tail_g = self.tx_tail.lock();
         let slot = (*tail_g) as usize % TX_RING_LEN;
         let phys = self.tx_pool[slot].dma_addr().raw();
-        // SAFETY: identity-mapped DMA buffer; bounds-checked above.
+        // SAFETY: identity-mapped DMA buffer; bounds-checked above
+        // (len <= 4096 = slot size for TSO, <= 1518 otherwise).
         unsafe {
             for (i, b) in frame.iter().enumerate() {
                 core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
         }
+        // Pure descriptor planning (no I/O); safe under the tail lock.
+        let (ctxt, desc) = tx_plan(phys, frame.len(), frame, meta)?;
         let ring_phys = self.tx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (slot * 16) as u64;
-        let desc = if let Some(mss) = meta.tso_mss {
-            AdvTxDesc::with_tso(phys, frame.len() as u16, mss)
-        } else if meta.csum_l4.is_some() {
-            AdvTxDesc::with_csum(phys, frame.len() as u16)
+        // Context first (if any), then the data descriptor; the tail
+        // advances past both. DD is polled on the data descriptor
+        // only (context descriptors carry no DD write-back).
+        let has_ctxt = ctxt.is_some();
+        let data_slot = if has_ctxt {
+            (slot + 1) % TX_RING_LEN
         } else {
-            AdvTxDesc {
-                addr: phys,
-                cmd_type_len: AdvTxDesc::ctrl_word(frame.len() as u16),
-                // PAYLEN field at bits [31:14] of olinfo (§7.2.3.2.4).
-                olinfo: (frame.len() as u32) << 14,
-            }
+            slot
         };
+        let data_addr = ring_phys + (data_slot * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
         unsafe {
+            if let Some(ctxt) = ctxt {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(ring_phys + (slot * 16) as u64)
+                        .kernel_mut_ptr::<AdvTxCtxtDesc>(),
+                    ctxt,
+                );
+            }
             core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<AdvTxDesc>(),
+                narf_memory::PhysAddr::new(data_addr).kernel_mut_ptr::<AdvTxDesc>(),
                 desc,
             );
         }
-        let next_tail = (*tail_g + 1) % (TX_RING_LEN as u32);
+        let used = 1 + has_ctxt as u32;
+        let next_tail = (*tail_g + used) % (TX_RING_LEN as u32);
         compiler_fence(Ordering::SeqCst);
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -633,7 +830,7 @@ impl Ixgbe {
         // covers a worst-case Tx-side congestion stall.
         let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
-            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u32>()) } & ADVTXD_STAT_DD != 0,
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(data_addr + 12).kernel_ptr::<u32>()) } & ADVTXD_STAT_DD != 0,
             narf_time::Deadline::after_ms(250),
         );
         if !done {
@@ -646,42 +843,75 @@ impl Ixgbe {
     /// Zero-copy transmit (P-F): post the TX descriptor pointing straight at
     /// the `Frame`'s own DMA buffer — no copy into a per-slot buffer, unlike
     /// [`Self::tx`]. The stack built the frame into that buffer, so DMA it in
-    /// place. Honors the frame's `TxMeta` (TSO / checksum offload). ixgbe TX is
-    /// synchronous (polls DD), so the device is done the moment this returns
-    /// and the caller may drop or recycle the buffer immediately.
+    /// place. Honors the frame's `TxMeta` (TSO / checksum offload / VLAN
+    /// insertion). TSO frames run to `TX_TSO_MAX_TX_FRAME` (the
+    /// per-descriptor data length); non-TSO frames keep the 1518 cap.
+    /// ixgbe TX is synchronous (polls DD), so the device is done the
+    /// moment this returns and the caller may drop or recycle the
+    /// buffer immediately.
     pub fn tx_frame(&self, frame: &Frame) -> Result<(), IxgbeError> {
         if *self.quiesced.lock() {
             return Err(IxgbeError::Other("device quiesced"));
         }
         let len = frame.len() as usize;
-        if len == 0 || len > 1518 {
+        if len == 0 {
+            return Err(IxgbeError::FrameTooLong);
+        }
+        let meta = frame.tx_meta();
+        let limit = if meta.tso_mss.is_some() {
+            TX_TSO_MAX_TX_FRAME
+        } else {
+            TX_LEN_MAX
+        };
+        if len > limit {
             return Err(IxgbeError::FrameTooLong);
         }
         let phys = frame.buf().dma_addr_at(frame.offset() as u64).raw();
-        let meta = frame.tx_meta();
+        // Stack copy of the header region for TSO parsing: headers
+        // span at most 14 + 60 + 60 = 134 bytes. The frame owns its
+        // DMA buffer for this synchronous call, so volatile header
+        // reads are safe.
+        let mut head = [0u8; 134];
+        let head_len = len.min(134);
+        // SAFETY: identity-mapped DMA buffer owned by `frame`; reads
+        // stay within [offset, offset + head_len).
+        unsafe {
+            let base = frame.buf().cpu_ptr_at::<u8>(frame.offset() as u64);
+            for (i, slot) in head.iter_mut().enumerate().take(head_len) {
+                *slot = core::ptr::read_volatile(base.add(i));
+            }
+        }
         let mut tail_g = self.tx_tail.lock();
         let slot = (*tail_g) as usize % TX_RING_LEN;
         let ring_phys = self.tx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (slot * 16) as u64;
-        let desc = if let Some(mss) = meta.tso_mss {
-            AdvTxDesc::with_tso(phys, len as u16, mss)
-        } else if meta.csum_l4.is_some() {
-            AdvTxDesc::with_csum(phys, len as u16)
+        // Pure descriptor planning (no I/O); safe under the tail lock.
+        let (ctxt, desc) = tx_plan(phys, len, &head[..head_len], &meta)?;
+        // Context first (if any), then the data descriptor; the tail
+        // advances past both. DD is polled on the data descriptor
+        // only (context descriptors carry no DD write-back).
+        let has_ctxt = ctxt.is_some();
+        let data_slot = if has_ctxt {
+            (slot + 1) % TX_RING_LEN
         } else {
-            AdvTxDesc {
-                addr: phys,
-                cmd_type_len: AdvTxDesc::ctrl_word(len as u16),
-                olinfo: (len as u32) << 14,
-            }
+            slot
         };
+        let data_addr = ring_phys + (data_slot * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
         unsafe {
+            if let Some(ctxt) = ctxt {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(ring_phys + (slot * 16) as u64)
+                        .kernel_mut_ptr::<AdvTxCtxtDesc>(),
+                    ctxt,
+                );
+            }
             core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<AdvTxDesc>(),
+                narf_memory::PhysAddr::new(data_addr).kernel_mut_ptr::<AdvTxDesc>(),
                 desc,
             );
         }
-        let next_tail = (*tail_g + 1) % (TX_RING_LEN as u32);
+        let used = 1 + has_ctxt as u32;
+        let next_tail = (*tail_g + used) % (TX_RING_LEN as u32);
         compiler_fence(Ordering::SeqCst);
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -693,7 +923,7 @@ impl Ixgbe {
         // Poll DD; the device reads the frame's buffer directly in this window.
         let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
-            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u32>()) } & ADVTXD_STAT_DD != 0,
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(data_addr + 12).kernel_ptr::<u32>()) } & ADVTXD_STAT_DD != 0,
             narf_time::Deadline::after_ms(250),
         );
         if !done {
@@ -1314,7 +1544,11 @@ impl crate::HwNic for Ixgbe {
         crate::NicModel::IntelIxgbe
     }
     fn caps(&self) -> crate::NicCaps {
-        let mut caps = crate::NicCaps::PROMISC | crate::NicCaps::MULTICAST_HASH;
+        // TSO is a static send-path capability now (see tx());
+        // VLAN_TAGGING here still means RX filtering configured —
+        // TX insertion is advertised via OffloadCapabilities.
+        let mut caps =
+            crate::NicCaps::PROMISC | crate::NicCaps::MULTICAST_HASH | crate::NicCaps::TSO;
         if self.rss_cfg.lock().is_some() {
             caps = caps | crate::NicCaps::RSS;
         }
@@ -1555,7 +1789,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // Ethtool surface (what ETHTOOL_GDRVINFO reports): driver,
     // version, bus address, and the offloads the send path
-    // actually honors (TX checksum only — see ethtool.rs).
+    // actually honors (TX checksum, TSO to the tx() copy-buffer
+    // bound, VLAN insertion — see ethtool.rs).
     // Runs before IXGBE_IFNAME.set moves `name`.
     let bus_info = match device.addr {
         narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
@@ -1566,6 +1801,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         &name,
         narf_net::OffloadCapabilities {
             tx_checksum: true,
+            max_tso_bytes: TX_TSO_MAX_TX as u32,
+            vlan_insert: true,
             ..Default::default()
         },
     );
