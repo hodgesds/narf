@@ -152,6 +152,13 @@ const VIRTIO_NET_F_CTRL_RX: u64 = 18;
 /// VirtIO 1.2 §5.1.3 — VIRTIO_NET_F_CTRL_VLAN (bit 19). Required for
 /// `VIRTIO_NET_CTRL_VLAN_ADD` / `VIRTIO_NET_CTRL_VLAN_DEL` to succeed.
 const VIRTIO_NET_F_CTRL_VLAN: u64 = 19;
+/// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_GUEST_ANNOUNCE (bit 21). The
+/// device may raise `VIRTIO_NET_S_ANNOUNCE` in the STATUS word to
+/// ask the driver to announce itself (gratuitous ARP / unsolicited
+/// ND) after link-up, migration, or failover; the driver acks with
+/// `VIRTIO_NET_CTRL_ANNOUNCE_ACK`. Requires F_CTRL_VQ (Linux
+/// `virtnet_validate_features` fails the feature otherwise).
+const VIRTIO_NET_F_GUEST_ANNOUNCE: u64 = 21;
 /// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_CTRL_MAC_ADDR (bit 23).
 /// Required for `VIRTIO_NET_CTRL_MAC_ADDR_SET` to succeed.
 const VIRTIO_NET_F_CTRL_MAC_ADDR: u64 = 23;
@@ -211,6 +218,15 @@ const VIRTIO_NET_CTRL_VLAN: u8 = 2;
 const VIRTIO_NET_CTRL_VLAN_ADD: u8 = 0;
 /// `VIRTIO_NET_CTRL_VLAN_DEL` (§5.1.6.5.3). 2-byte LE VID payload.
 const VIRTIO_NET_CTRL_VLAN_DEL: u8 = 1;
+
+/// VirtIO 1.2 §5.1.6.5.4 — VIRTIO_NET_CTRL_ANNOUNCE class.
+/// `VIRTIO_NET_CTRL_ANNOUNCE_ACK` (cmd 0) tells the device the
+/// driver received its announce request; the device clears
+/// `VIRTIO_NET_S_ANNOUNCE` on receipt. No payload (Linux
+/// `virtnet_ack_link_announce` sends NULL data) — the command is
+/// just the 2-byte header + 1-byte ack.
+const VIRTIO_NET_CTRL_ANNOUNCE: u8 = 3;
+const VIRTIO_NET_CTRL_ANNOUNCE_ACK: u8 = 0;
 
 /// 802.1Q tag protocol identifier, big-endian on the wire.
 const ETHERTYPE_VLAN: u16 = 0x8100;
@@ -286,6 +302,11 @@ const VIRTIO_NET_OK: u8 = 0;
 
 // virtio-net config status bits.
 const VIRTIO_NET_S_LINK_UP: u16 = 1 << 0;
+/// VirtIO 1.2 §5.1.4 — VIRTIO_NET_S_ANNOUNCE (bit 1): the device
+/// wants the driver to announce (see `VIRTIO_NET_F_GUEST_ANNOUNCE`).
+/// Cleared by the device once it receives
+/// `VIRTIO_NET_CTRL_ANNOUNCE_ACK`.
+const VIRTIO_NET_S_ANNOUNCE: u16 = 1 << 1;
 
 // Offsets within the device-specific config region (VirtIO 1.2
 // §5.1.4 — `struct virtio_net_config`).
@@ -579,6 +600,11 @@ pub struct VirtioNetPci {
     /// True when `VIRTIO_NET_F_STATUS` was negotiated. Without it
     /// the spec says treat link as always up.
     has_status: bool,
+    /// True when `VIRTIO_NET_F_GUEST_ANNOUNCE` was negotiated
+    /// (requires F_CTRL_VQ). `ack_announce` short-circuits with
+    /// NoQueues when this is false rather than firing a doomed
+    /// CTRL_VQ command.
+    has_guest_announce: bool,
     /// True when `VIRTIO_NET_F_RSS` was negotiated (requires
     /// F_CTRL_VQ; the steering config goes through the control
     /// queue). Device-side RX steering replaces the host-backend
@@ -1394,6 +1420,11 @@ impl VirtioNetPci {
         // VLAN_DEL. Same F_CTRL_VQ dependency.
         let want_ctrl_rx = (feats & (1u64 << VIRTIO_NET_F_CTRL_RX) != 0) && want_ctrl_vq;
         let want_ctrl_vlan = (feats & (1u64 << VIRTIO_NET_F_CTRL_VLAN) != 0) && want_ctrl_vq;
+        // F_GUEST_ANNOUNCE gates the ANNOUNCE_ACK command; same
+        // F_CTRL_VQ dependency as the other control-queue features
+        // (Linux fails the feature without CTRL_VQ).
+        let want_guest_announce =
+            (feats & (1u64 << VIRTIO_NET_F_GUEST_ANNOUNCE) != 0) && want_ctrl_vq;
         // F_RSS / F_HASH_REPORT gate on the control queue too: the
         // steering + hash params travel via CTRL_MQ commands. Both
         // live in the high feature half (bits 57/60), unlike the
@@ -1419,6 +1450,7 @@ impl VirtioNetPci {
             | ((1u32 << VIRTIO_RING_F_EVENT_IDX) * (want_event_idx as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_RX) * (want_ctrl_rx as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_VLAN) * (want_ctrl_vlan as u32))
+            | ((1u32 << VIRTIO_NET_F_GUEST_ANNOUNCE) * (want_guest_announce as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_MAC_ADDR) * (want_ctrl_mac_addr as u32));
         let drv_hi = (1u32 << (VIRTIO_F_VERSION_1 - 32))
             | ((1u32 << (VIRTIO_NET_F_HOST_USO - 32)) * (want_uso as u32))
@@ -1742,6 +1774,7 @@ impl VirtioNetPci {
             has_ctrl_vlan: want_ctrl_vlan,
             mtu,
             has_status: want_status,
+            has_guest_announce: want_guest_announce,
             has_rss: want_rss,
             has_hash_report: want_hash_report,
             rss_configured: false,
@@ -2392,6 +2425,87 @@ impl VirtioNetPci {
             narf_net::iface::set_link_metadata(name, link, None, None);
         }
         link
+    }
+
+    /// Raw device-cfg STATUS word. `0` when F_STATUS wasn't
+    /// negotiated or the device has no config region — the spec
+    /// has no status word to read in either case, and no announce
+    /// bit can be set.
+    fn status_word(&self) -> u16 {
+        if !self.has_status {
+            return 0;
+        }
+        let r = match self.device_cfg.as_ref() {
+            Some(r) => r,
+            None => return 0,
+        };
+        // SAFETY: device-cfg region was mapped at bring_up; field
+        // at offset 6 stays valid for the controller's lifetime.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let s = unsafe { r.read16(CFG_STATUS) };
+        s
+    }
+
+    /// True when the device is asking for an announce: the
+    /// `VIRTIO_NET_S_ANNOUNCE` status bit is set and
+    /// `VIRTIO_NET_F_GUEST_ANNOUNCE` was negotiated. Without the
+    /// feature the bit is meaningless (and without F_STATUS there
+    /// is no word to read), so both gates apply.
+    pub fn announce_pending(&self) -> bool {
+        self.has_guest_announce && self.status_word() & VIRTIO_NET_S_ANNOUNCE != 0
+    }
+
+    /// Acknowledge a device announce request via
+    /// `VIRTIO_NET_CTRL_ANNOUNCE_ACK` (VirtIO 1.2 §5.1.6.5.4).
+    /// No payload — Linux `virtnet_ack_link_announce` sends NULL
+    /// data. The device clears `VIRTIO_NET_S_ANNOUNCE` on receipt,
+    /// so a successful ack is what stops the next config-change
+    /// fire from re-announcing.
+    pub fn ack_announce(&self) -> Result<(), VirtioPciError> {
+        if !self.has_guest_announce {
+            return Err(VirtioPciError::NoQueues);
+        }
+        let ack =
+            self.submit_control(VIRTIO_NET_CTRL_ANNOUNCE, VIRTIO_NET_CTRL_ANNOUNCE_ACK, &[])?;
+        if ack != VIRTIO_NET_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Notify peers of our MAC location (Linux `netdev_notify_peers`):
+    /// gratuitous ARP for the interface's primary IPv4 address, via
+    /// the stack's existing `send_gratuitous_arp` surface. No-op when
+    /// the controller has no registered name or no IPv4 address.
+    /// IPv6 unsolicited NA has no stack emit surface yet — the
+    /// builder exists (`ndp::build_na`) but nothing transmits an
+    /// ICMPv6 packet on an interface — so the IPv6 half is a filed
+    /// remainder (issue #1536), not invented here.
+    fn notify_peers(&self) {
+        let name = match self.ifname.lock().as_deref() {
+            Some(n) => alloc::string::String::from(n),
+            None => return,
+        };
+        if let Some(addr) = narf_net::ifaddr::iface_primary_addr(&name) {
+            narf_net::arp_cache::send_gratuitous_arp(&name, addr.addr.0);
+        }
+    }
+
+    /// Config-change event handler — the config-change watcher's
+    /// per-fire action: if the device raised
+    /// `VIRTIO_NET_S_ANNOUNCE`, notify peers (gratuitous ARP) and
+    /// ack the announce, then republish link metadata. Order mirrors
+    /// Linux `virtnet_config_changed_work`: peers first, ack second,
+    /// link state last. The ack is best-effort: a refused ack leaves
+    /// S_ANNOUNCE set, so the next config-change fire retries; the
+    /// link republish still runs. A spurious fire (no S_ANNOUNCE)
+    /// costs only a STATUS read + the idempotent republish.
+    pub fn handle_config_change(&self) {
+        if self.announce_pending() {
+            self.notify_peers();
+            let _ = self.ack_announce();
+        }
+        let _ = self.refresh_link_from_status();
     }
 
     // ── Power management and detach ──────────────────────────────────
@@ -3869,17 +3983,18 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     // configuration (VirtIO 1.2 §4.1.5.2 routes config-change
     // interrupts to `msix_config` exclusively, so the vector itself
     // is the discriminator — no ISR read needed, matching Linux's
-    // `vp_config_changed`). Each fire re-reads live STATUS and
-    // republishes link metadata; the republish is idempotent, so a
-    // spurious fire is harmless. No vector (table exhausted at
-    // probe) → no watcher; link state stays poll-based via
-    // `link_up()`, as before. Exits when the controller vanishes
-    // (detach tombstone).
+    // `vp_config_changed`). Each fire runs `handle_config_change`:
+    // announce (gratuitous ARP + ANNOUNCE_ACK) when the device
+    // raised S_ANNOUNCE, then a link-metadata republish from live
+    // STATUS; both are idempotent, so a spurious fire is harmless.
+    // No vector (table exhausted at probe) → no watcher; link state
+    // stays poll-based via `link_up()`, as before. Exits when the
+    // controller vanishes (detach tombstone).
     if let Some(cfg_v) = config_irq_vector {
         narf_scheduler::spawn_stackful(async move {
             loop {
                 let _ = narf_interrupts::wait_for_irq(cfg_v).await;
-                if with_at(idx, |c| c.refresh_link_from_status()).is_none() {
+                if with_at(idx, |c| c.handle_config_change()).is_none() {
                     return;
                 }
             }
@@ -4405,6 +4520,7 @@ mod tx_tests {
                 has_ctrl_vlan: false,
                 mtu: 1500,
                 has_status: false,
+                has_guest_announce: false,
                 has_rss: false,
                 has_hash_report: false,
                 rss_configured: false,
@@ -5452,6 +5568,7 @@ mod tx_tests {
                 has_ctrl_vlan: false,
                 mtu: 1500,
                 has_status: false,
+                has_guest_announce: false,
                 tx_checksum: true,
                 tx_tso4: true,
                 tx_tso6: false,
@@ -5893,5 +6010,184 @@ mod tx_tests {
     kernel_test_in!(
         "drivers/virtio/net-pci",
         smoke_virtio_net_config_change_republishes_link
+    );
+
+    /// Announce constants pinned byte-for-byte against the
+    /// authoritative header (`include/uapi/linux/virtio_net.h`,
+    /// torvalds/linux): class 3, ack cmd 0, feature bit 21, status
+    /// bit 2 — never derived from the code under test.
+    fn smoke_virtio_net_announce_constants() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            if VIRTIO_NET_CTRL_ANNOUNCE != 3 {
+                return Err("CTRL_ANNOUNCE is not class 3");
+            }
+            if VIRTIO_NET_CTRL_ANNOUNCE_ACK != 0 {
+                return Err("CTRL_ANNOUNCE_ACK is not cmd 0");
+            }
+            if VIRTIO_NET_F_GUEST_ANNOUNCE != 21 {
+                return Err("F_GUEST_ANNOUNCE is not bit 21");
+            }
+            if VIRTIO_NET_S_ANNOUNCE != 2 {
+                return Err("S_ANNOUNCE is not bit 1");
+            }
+            if VIRTIO_NET_S_LINK_UP != 1 {
+                return Err("S_LINK_UP is not bit 0");
+            }
+            // The announce class sits between VLAN (2) and MQ (4)
+            // in the §5.1.6.5 class space — a renumbering of either
+            // neighbour would break this pin.
+            if VIRTIO_NET_CTRL_VLAN != 2 || VIRTIO_NET_CTRL_MQ != 4 {
+                return Err("announce neighbours moved in the class space");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_announce_constants
+    );
+
+    /// Announce gating + STATUS decode (gap 13): `ack_announce`
+    /// short-circuits with NoQueues when F_GUEST_ANNOUNCE wasn't
+    /// negotiated, and `announce_pending` follows the S_ANNOUNCE
+    /// bit only when the feature AND F_STATUS are both negotiated.
+    /// The fixture has no control queue and no registered name, so
+    /// this pins the gates and the decode, not the wire command.
+    fn smoke_virtio_net_announce_gating() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let mut fx = TxFixture::new()?;
+            let page = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "cfg page")?;
+            let region = VirtioRegion {
+                region: narf_bus::MmioRegion {
+                    phys: page.phys_addr(),
+                    virt: page.cpu_ptr::<u8>() as u64,
+                    len: 4096,
+                    kind: narf_bus::BarKind::Mmio32 {
+                        prefetchable: false,
+                    },
+                },
+                virt: page.cpu_ptr::<u8>() as u64,
+                offset: 0,
+                length: 4096,
+            };
+            fx.dev.device_cfg = Some(region);
+            // Fixture negotiates nothing: no ack, no pending, even
+            // with S_ANNOUNCE raised in STATUS.
+            unsafe {
+                fx.dev
+                    .device_cfg
+                    .as_ref()
+                    .ok_or("no device_cfg")?
+                    .write16(CFG_STATUS, VIRTIO_NET_S_ANNOUNCE);
+            }
+            if !matches!(fx.dev.ack_announce(), Err(VirtioPciError::NoQueues)) {
+                return Err("ack_announce without F_GUEST_ANNOUNCE did not report NoQueues");
+            }
+            if fx.dev.announce_pending() {
+                return Err("announce pending without negotiation");
+            }
+            // F_STATUS alone is not enough: the feature gate stays.
+            fx.dev.has_status = true;
+            if fx.dev.announce_pending() {
+                return Err("announce pending with F_STATUS but no F_GUEST_ANNOUNCE");
+            }
+            // Both negotiated: the bit decodes.
+            fx.dev.has_guest_announce = true;
+            if !fx.dev.announce_pending() {
+                return Err("S_ANNOUNCE did not read as pending");
+            }
+            // LINK_UP alone is not an announce request.
+            unsafe {
+                fx.dev
+                    .device_cfg
+                    .as_ref()
+                    .ok_or("no device_cfg")?
+                    .write16(CFG_STATUS, VIRTIO_NET_S_LINK_UP);
+            }
+            if fx.dev.announce_pending() {
+                return Err("LINK_UP alone read as announce pending");
+            }
+            // Both bits set: still pending.
+            unsafe {
+                fx.dev
+                    .device_cfg
+                    .as_ref()
+                    .ok_or("no device_cfg")?
+                    .write16(CFG_STATUS, VIRTIO_NET_S_LINK_UP | VIRTIO_NET_S_ANNOUNCE);
+            }
+            if !fx.dev.announce_pending() {
+                return Err("S_ANNOUNCE|LINK_UP did not read as pending");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_announce_gating);
+
+    /// `handle_config_change` (gap 13, watcher path): with
+    /// S_ANNOUNCE raised and no control queue, the ack fails
+    /// best-effort and is swallowed, the peer notification is a
+    /// no-op (no registered name), and the link republish still
+    /// runs — up, then down. A refused ack must never wedge
+    /// the watcher or drop the link update.
+    fn smoke_virtio_net_announce_handle_config_change() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let mut fx = TxFixture::new()?;
+            let page = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "cfg page")?;
+            let region = VirtioRegion {
+                region: narf_bus::MmioRegion {
+                    phys: page.phys_addr(),
+                    virt: page.cpu_ptr::<u8>() as u64,
+                    len: 4096,
+                    kind: narf_bus::BarKind::Mmio32 {
+                        prefetchable: false,
+                    },
+                },
+                virt: page.cpu_ptr::<u8>() as u64,
+                offset: 0,
+                length: 4096,
+            };
+            fx.dev.device_cfg = Some(region);
+            fx.dev.has_status = true;
+            fx.dev.has_guest_announce = true;
+            unsafe {
+                fx.dev
+                    .device_cfg
+                    .as_ref()
+                    .ok_or("no device_cfg")?
+                    .write16(CFG_STATUS, VIRTIO_NET_S_LINK_UP | VIRTIO_NET_S_ANNOUNCE);
+            }
+            fx.dev.handle_config_change();
+            if !fx.dev.link_up() {
+                return Err("link did not read up after announce handle");
+            }
+            unsafe {
+                fx.dev
+                    .device_cfg
+                    .as_ref()
+                    .ok_or("no device_cfg")?
+                    .write16(CFG_STATUS, 0);
+            }
+            fx.dev.handle_config_change();
+            if fx.dev.link_up() {
+                return Err("link did not read down after announce handle");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_announce_handle_config_change
     );
 }
