@@ -3263,6 +3263,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // needs no ordering against probe_all_pci: devices the
             // GPU probes register afterwards publish themselves.
             narf_drivers_backlight::register_initcalls();
+            // LED class: registry + /sys/class/leds. Until #956
+            // nothing called this, so the class never populated in
+            // a production boot and the keyboard backlight (which
+            // registers into the LED registry) was unreachable.
+            // Publication is dynamic (register/unregister hooks in
+            // narf-drivers-leds), so this needs no ordering against
+            // probe_all_pci.
+            narf_drivers_leds::register_initcalls();
             narf_drivers_serial::register_initcalls();
             narf_drivers_spi::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the

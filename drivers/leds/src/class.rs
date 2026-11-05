@@ -69,22 +69,47 @@ pub static REGISTERED_COUNT: AtomicU32 = AtomicU32::new(0);
 /// If a device with the same `name()` already exists it is replaced,
 /// matching Linux's `led_classdev_register` idempotency convention
 /// (`drivers/leds/led-class.c:led_classdev_register`).
+///
+/// Publication is dynamic (#956): the sysfs directory is
+/// reconciled after every registration, so a device registered
+/// from a probe — after all Stage::Device initcalls have run — is
+/// published immediately, and a same-name replacement rebuilds
+/// its directory against the new device object.
 pub fn register_led(dev: Arc<dyn LedDevice>) {
-    let mut g = LEDS.lock();
-    let name = dev.name();
-    if let Some(slot) = g.iter_mut().find(|d| d.name() == name) {
-        *slot = dev;
-    } else {
-        g.push(dev);
+    let name: String = String::from(dev.name());
+    let replaced = {
+        let mut g = LEDS.lock();
+        let replaced = if let Some(slot) = g.iter_mut().find(|d| d.name() == name.as_str()) {
+            *slot = dev;
+            true
+        } else {
+            g.push(dev);
+            false
+        };
+        REGISTERED_COUNT.store(g.len() as u32, Ordering::Release);
+        replaced
+    };
+    // Publication follows the registry dynamically (#956). The
+    // sysfs attribute closures capture the device `Arc`, so a
+    // same-name replacement must rebuild its directory rather than
+    // leave sysfs driving the superseded device object.
+    if replaced {
+        crate::sysfs_bridge::unpublish(&name);
     }
-    REGISTERED_COUNT.store(g.len() as u32, Ordering::Release);
+    crate::sysfs_bridge::sync_publication();
 }
 
 /// Unregister a device by name. No-op if not present.
+///
+/// Publication follows the registry (#956): the sysfs directory
+/// is removed with the device.
 pub fn unregister_led(name: &str) {
-    let mut g = LEDS.lock();
-    g.retain(|d| d.name() != name);
-    REGISTERED_COUNT.store(g.len() as u32, Ordering::Release);
+    {
+        let mut g = LEDS.lock();
+        g.retain(|d| d.name() != name);
+        REGISTERED_COUNT.store(g.len() as u32, Ordering::Release);
+    }
+    crate::sysfs_bridge::sync_publication();
 }
 
 /// Return a snapshot of all registered devices. Allocates.
@@ -102,6 +127,9 @@ pub fn lookup_led_by_name(name: &str) -> Option<Arc<dyn LedDevice>> {
 pub fn __reset_for_test() {
     LEDS.lock().clear();
     REGISTERED_COUNT.store(0, Ordering::Release);
+    // Reconcile publication so a reset removes every published
+    // directory (mirrors the backlight crate's reset path).
+    crate::sysfs_bridge::sync_publication();
 }
 
 // ── SimpleLed — software-only LED ─────────────────────────────────

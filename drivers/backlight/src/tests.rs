@@ -25,7 +25,7 @@ mod smokes {
         __reset_for_test as bk_reset, handle_notify, register_video_notify, NOTIFY_BRIGHTNESS_DOWN,
         NOTIFY_BRIGHTNESS_UP,
     };
-    use crate::kbd_backlight::dell_encode_kbd_level;
+    use crate::kbd_backlight::{dell_encode_kbd_level, install, KbdBacklightDevice, KbdBlVendor};
     use crate::leds::{led_device, register_led, unregister_led, LedDevice, SimpleLed, Trigger};
     use crate::sysfs_bridge::populate_backlight_class;
     use crate::{
@@ -922,5 +922,49 @@ mod smokes {
     kernel_test_in!(
         "drivers/backlight",
         smoke_notify_without_owner_still_emits_key
+    );
+
+    // ── 26. Kbd backlight install publishes to /sys/class/leds (#956) ──
+
+    fn smoke_kbd_backlight_install_publishes_led() -> TestResult {
+        __reset_all_for_test();
+        sysfs_reset();
+        // The production Dell device, minus the WMI transport: with
+        // no GUID the set path is cache-only, so the fixture drives
+        // install → register_led → dynamic publication → sysfs
+        // store without touching firmware.
+        let dev = KbdBacklightDevice::new(KbdBlVendor::Dell, None);
+        install(dev.clone());
+        let class = narf_filesystem::sysfs::class_register("leds");
+        let kobj = match class.get_child("dell::kbd_backlight") {
+            Some(k) => k,
+            None => {
+                __reset_all_for_test();
+                sysfs_reset();
+                return TestResult::Fail("dell::kbd_backlight not published on install");
+            }
+        };
+        if !matches!(kobj.attr_store("brightness", b"2"), Some(Ok(()))) {
+            __reset_all_for_test();
+            sysfs_reset();
+            return TestResult::Fail("brightness store(2) failed");
+        }
+        let got = dev.brightness();
+        // Unregister removes the publication again.
+        unregister_led("dell::kbd_backlight");
+        let gone = class.get_child("dell::kbd_backlight").is_none();
+        __reset_all_for_test();
+        sysfs_reset();
+        if got != 2 {
+            return TestResult::Fail("store did not reach the kbd device");
+        }
+        if !gone {
+            return TestResult::Fail("kbd device still published after unregister");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_kbd_backlight_install_publishes_led
     );
 }

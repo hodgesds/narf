@@ -13,10 +13,16 @@
 //!   the Dell SMBIOS documentation, so WMI events are enabled
 //! - WMI event decode (9DBB GUID) → KEY_* via input layer; the
 //!   mic-mute key (0x0150) reports the distinct `KEY_MICMUTE`
-//! - Keyboard backlight level control via Dell token 0x02C6
 //! - Battery charge limit (BIOS token 0x044F)
 //! - Touchpad LED control
 //! - Fan speed read / set via SMBIOS class 17
+//!
+//! Keyboard backlight is NOT owned here: the single Dell path is
+//! the backlight crate's WMI device (`dell::kbd_backlight`, #956).
+//! The SMBIOS token-0x02C6 path this file used to expose had no
+//! callers and is removed rather than kept as a parallel driver;
+//! a Dell generation that needs the token path should re-add it
+//! as a backend behind that WMI device, not as a second API.
 //!
 //! ## Linux references (GPL-2.0-or-later)
 //!
@@ -248,47 +254,6 @@ pub fn dell_wmi_keycode(code: u16) -> Option<KeyCode> {
     }
 }
 
-// ── Keyboard backlight ────────────────────────────────────────────────
-
-/// Dell keyboard backlight levels (0 = off, 1 = low, 2 = high).
-/// Reference: `dell-laptop.c::dell_laptop_kbd_led_set()` — writes
-/// token 0x02C6 with value 0/1/2 via `kbd_set_token_bit`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum KbdBacklight {
-    Off = 0,
-    Low = 1,
-    High = 2,
-}
-
-static KBD_BACKLIGHT: AtomicU32 = AtomicU32::new(0);
-
-/// Get the current keyboard backlight level (as last set).
-pub fn kbd_backlight_level() -> KbdBacklight {
-    match KBD_BACKLIGHT.load(Ordering::Relaxed) {
-        1 => KbdBacklight::Low,
-        2 => KbdBacklight::High,
-        _ => KbdBacklight::Off,
-    }
-}
-
-/// Set the keyboard backlight level.
-///
-/// Reference: `dell-laptop.c::dell_laptop_kbd_led_set()` — calls
-/// `kbd_set_token_bit(0x02C6, level)` which ultimately goes through
-/// `dell_send_request(class=4, select=0, in1=token, in2=value)`.
-pub fn set_kbd_backlight(level: KbdBacklight) {
-    KBD_BACKLIGHT.store(level as u32, Ordering::Release);
-    // Issue SMBIOS class=4 select=0 token=0x02C6 value=level over
-    // the WMI transport when the SMBIOS GUID is present. (The
-    // previous body encoded the command and dropped it.) When the
-    // GUID is absent the value stays cache-only — the SMI port
-    // transport `dell-laptop.c` uses by default is not modelled.
-    let mut cmd = DellSmbiosCmd::new(4, 0);
-    cmd.input[0] = 0x02C6;
-    cmd.input[1] = level as u32;
-    let _ = smbios_wmi_call(&cmd);
-}
-
 // ── Battery charge limit ──────────────────────────────────────────────
 
 /// Battery charge limit as percentage (0 = no limit, 80/60/etc = custom).
@@ -382,6 +347,5 @@ pub fn init() {
 #[doc(hidden)]
 pub fn __test_reset() {
     WMI_EVENT_COUNT.store(0, Ordering::Relaxed);
-    KBD_BACKLIGHT.store(0, Ordering::Relaxed);
     CHARGE_LIMIT.store(0, Ordering::Relaxed);
 }
