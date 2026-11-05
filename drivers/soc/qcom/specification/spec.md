@@ -188,6 +188,47 @@ edge from it (GIC lines still call `Q6v5::signal` from hard IRQ). The
 the start / stop futures `Send`, so a spawned task can boot the remote.
 `new` leaks the `Q6v5` so `Q6Irqs::bind_gic` can chain its `&'static`.
 
+### 3.10 RPMh votes and AOSS QMP (`cmd_db`, `rpmh`, `aoss`, `wpss`)
+```rust
+pub struct CmdDb<'a>;  impl CmdDb { parse(data) -> Result<Self, CmdDbError>, read_addr(id) -> Option<u32> }
+pub enum CmdDbError { Truncated, BadMagic }
+pub struct Rsc<R>;  impl Rsc { probe(regs, tcs_base) -> Self,
+                               write_active(delay, cmds: &[(u32, u32)], wait) -> Result<(), RscError> }
+pub enum RscError { Empty, TooManyCmds, Timeout }
+pub struct Rpmh<'a, R>;  impl Rpmh { new(db, rsc), vote(delay, id, value),
+                                     vote_rail(delay, rail, level), vote_xo(delay, on) }
+pub enum VoteError { UnknownResource, BadRail, Rsc(RscError) }
+pub struct Qmp<R, K>;  impl Qmp { open(msgram, kick, delay) -> Result<Self, QmpError>,
+                                 close(&self), send(delay, msg), load_state(delay, name, on),
+                                 mbox_size(&self) -> u32 }
+pub enum QmpError { BadMagic, BadVersion, BadMbox, Timeout, TooLong }
+pub struct WpssPower<'a, R1, R2, K>;  impl WpssPower { new(rpmh, qmp),
+    prepare(delay, cx_level, mx_level), unprepare(delay) }
+pub enum WpssPowerError { Vote(VoteError), Qmp(QmpError) }
+```
+`CmdDb::read_addr` is `cmd_db_read_addr` (magic `0xdb 0x30 0x03 0x0c`,
+8-byte NUL-padded ids, scan stops at the first zero `slv_id`).
+`Rsc::write_active` programs TCS 0 only (the proxy-vote path is the
+sole RSC user; a second user must add TCS allocation first) with
+`CMD_MSGID = 8 | WRITE | RESP_REQ`, the slot mask in `CMD_ENABLE`,
+and the AMC ENABLE then ENABLE|TRIGGER sequence; completion polls
+`IRQ_STATUS` through `Delay` (Linux waits on the TCS IRQ) and the
+teardown mirrors `tcs_tx_done`. The register table follows the DRV ID
+register (major >= 3 selects the 3.0 table, else 2.7); the TCS region
+base is the DT `qcom,tcs-offset`, never guessed. Votes are ACTIVE_ONLY
+only — wake/sleep peer aggregation is rpmhpd policy, out of scope.
+Rail levels are caller-supplied (per-SoC DT `qcom,level` tables);
+`xo.lvl` enables with data `0x3` (`clk-rpmh.c` ARC `res_on_val`).
+`Qmp::open` runs the `qcom_aoss.c` link/channel handshake over the
+msgram descriptor (`MAIL` magic, version 1, MCORE mailbox fields)
+with the `Kick` trait as the mailbox doorbell; `send` writes the
+64-byte zero-padded message at mbox+4, the length word at mbox, and
+waits for AOSS to clear it. `load_state` is the `qcom_q6v5.c` image
+message (`{class: image, res: load_state, name: %s, val: %s}`).
+`WpssPower::prepare` votes `cx`, `mx`, `xo` on, then load-state `on`
+for `wpss`; `unprepare` sends load-state `off` only, leaving the
+votes cast, as `qcom_q6v5_unprepare` does.
+
 ## 4. Invariants
 - No busy waits on hardware registers: every poll sleeps via `Delay`.
 - SCM: at most four register arguments; `x6` starts 0 and is echoed on an
@@ -225,7 +266,11 @@ Tests: `cargo xtask test --subsystem drivers/soc/qcom --kernel-tests-only`.
   chrdev/`rpmsg_ctrl` are not implemented. The edge interrupt is
   delivered by the caller (`Glink::process_rx` on each SPI).
 - **RPMh / AOSS QMP** proxy votes (WPSS `xo`, `cx`/`mx`, `load_state`) are
-  not implemented; `PasRproc` assumes firmware already holds them.
+  implemented (`cmd_db`, `rpmh`, `aoss`, `wpss`, §3.10) but NOT wired
+  into the live bring-up: that needs the host DT nodes for the RSC
+  window, the cmd-db reserved-memory region, and the AOSS msgram +
+  mailbox, which no in-tree fixture DT carries yet. `PasRproc` still
+  assumes firmware already holds the votes until that wiring lands.
 - **IPQ8074 AON reset:** mainline has no `GCC_WCSSAON_RESET` for IPQ8074
   and no WCSS DT node; IPQ8074 boards need a binding decision.
 - **IPQ5018 WCSS** has no upstream DT node or Linux match data; the GCC
