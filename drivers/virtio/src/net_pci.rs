@@ -1590,7 +1590,11 @@ impl VirtioNetPci {
                 // (u8), 18 (u16 LE), 20 (u32 LE); only valid when
                 // the device offered RSS or HASH_REPORT.
                 rss_max_key_size = unsafe { r.read8(CFG_RSS_MAX_KEY_SIZE) };
+                // SAFETY: same. RSS max indir len at packed offset 18 (u16 LE);
+                // only valid when RSS or HASH_REPORT was offered.
                 rss_max_indir_len = unsafe { r.read16(CFG_RSS_MAX_INDIR_LEN) };
+                // SAFETY: same. Supported hash types at packed offset 20 (u32 LE);
+                // only valid when RSS or HASH_REPORT was offered.
                 rss_supported_hash_types = unsafe { r.read32(CFG_SUPPORTED_HASH_TYPES) };
             }
         }
@@ -2266,11 +2270,11 @@ impl VirtioNetPci {
         if self.suspended.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        // SAFETY: caller owns the device's config space; datapath
-        // sources are gated above, and the table entries + vectors
-        // are retained (not freed), so an in-flight IRQ wake just
-        // re-parks its forwarder.
         if let Some(table) = self.msix.lock().as_mut() {
+            // SAFETY: caller owns the device's config space; datapath
+            // sources are gated above, and the table entries + vectors
+            // are retained (not freed), so an in-flight IRQ wake just
+            // re-parks its forwarder.
             unsafe { table.disable() };
         }
         if let Some(name) = self.ifname.lock().as_deref() {
@@ -2291,10 +2295,10 @@ impl VirtioNetPci {
         if !self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
-        // SAFETY: same config-space ownership as suspend; the table
-        // entries were programmed at probe and retained, so
-        // re-enable restores delivery on the same vectors.
         if let Some(table) = self.msix.lock().as_mut() {
+            // SAFETY: caller owns the device's config space; entries were
+            // programmed at probe and retained, so re-enable restores
+            // delivery on the same vectors.
             // Same conversion as the probe-time table.enable() sites
             // (pci.rs): MsixError folds into BarMapFailed.
             unsafe { table.enable() }.map_err(|_| VirtioPciError::BarMapFailed)?;
@@ -2318,9 +2322,9 @@ impl VirtioNetPci {
         if self.detached.swap(true, Ordering::AcqRel) {
             return;
         }
-        // SAFETY: caller owns the device's config space; datapath
-        // sources are gated above, table entries retained.
         if let Some(table) = self.msix.lock().as_mut() {
+            // SAFETY: caller owns the device's config space; datapath
+            // sources are gated above, table entries retained.
             unsafe { table.disable() };
         }
         // Device reset: writing 0 to device status clears DRIVER_OK
@@ -2720,6 +2724,7 @@ impl VirtioNetPci {
 /// 3. A single 802.1Q tag is skipped (L3 starts at offset 18, inner
 ///    ethertype at [16..18]); double-tagged frames take the
 ///    unparseable path and deliver.
+///
 /// Payload slice for the RX pump's GUEST_CSUM check.
 ///
 /// The virtio-net RX header is `rx_hdr_len` bytes (12, or 20 with
@@ -2728,7 +2733,7 @@ impl VirtioNetPci {
 /// function would parse header-shifted bytes, misread the ethertype,
 /// and deliver checksummed segments unverified. With `rx_hdr_len == 12`
 /// this reproduces the pre-RSS slicing exactly.
-pub(crate) fn rx_csum_payload<'a>(buf: &'a [u8], rx_hdr_len: usize, payload_len: u32) -> &'a [u8] {
+pub(crate) fn rx_csum_payload(buf: &[u8], rx_hdr_len: usize, payload_len: u32) -> &[u8] {
     let end = (rx_hdr_len + payload_len as usize).min(buf.len());
     buf.get(rx_hdr_len..end).unwrap_or(&[])
 }
@@ -4311,7 +4316,7 @@ mod tx_tests {
                 0x08, 0x00, // EtherType IPv4
                 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // payload
             ];
-            if &dst[..24] != &expected {
+            if dst[..24] != expected {
                 return Err("inserted bytes wrong");
             }
             // Too short to carry a tag (needs dst + src + EtherType).
@@ -4443,11 +4448,9 @@ mod tx_tests {
                 .tx_dma_on_with_meta(0, buf, FRAME_LEN as u32, narf_net::TxMeta::with_tso(1024))
                 .map_err(|_| "untagged TSO submit rejected")?;
             // Tagged TSO submit: same frame with a tag inserted.
-            let mut tagged = Vec::new();
-            tagged.resize(FRAME_LEN + VLAN_TAG_LEN, 0);
+            let mut tagged = vec![0; FRAME_LEN + VLAN_TAG_LEN];
             {
-                let mut plain = Vec::new();
-                plain.resize(FRAME_LEN, 0);
+                let mut plain = vec![0; FRAME_LEN];
                 build_untagged(&mut plain);
                 let len =
                     copy_frame_with_vlan(&mut tagged, &plain, 0x1234).ok_or("tag insert failed")?;
@@ -4486,16 +4489,16 @@ mod tx_tests {
                 if hdr[0] != 1 || hdr[1] != 1 || csum_offset != 16 {
                     return Err("virtio header flags/type/offset wrong");
                 }
-                if &frame[12..14] == &[0x08, 0x00] {
+                if frame[12..14] == [0x08, 0x00] {
                     if hdr_len != 54 || csum_start != 34 {
                         return Err("untagged TSO layout wrong");
                     }
                     seen_untagged = true;
-                } else if &frame[12..16] == &[0x81, 0x00, 0x12, 0x34] {
+                } else if frame[12..16] == [0x81, 0x00, 0x12, 0x34] {
                     if hdr_len != 58 || csum_start != 38 {
                         return Err("tagged TSO layout not shifted by the tag");
                     }
-                    if &frame[16..18] != &[0x08, 0x00] {
+                    if frame[16..18] != [0x08, 0x00] {
                         return Err("inner EtherType wrong after tag");
                     }
                     seen_tagged = true;
@@ -4627,8 +4630,7 @@ mod tx_tests {
                 rx_notify_off: 0,
                 tx_notify_off: 1,
             };
-            let mut pairs = Vec::new();
-            pairs.push(pair);
+            let pairs = vec![pair];
             let dev = VirtioNetPci {
                 common: region(),
                 notify: region(),
