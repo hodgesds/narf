@@ -79,13 +79,21 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
     pub(in crate::ath10k) fn wowlan_support(&self) -> Option<WowlanSupport> {
         self.wow.support
     }
+    /// Whether the retained advertisement carries NET_DETECT
+    /// (`WMI_TLV_SERVICE_NLO` was present at init).
+    fn nlo_supported(&self) -> bool {
+        self.wow
+            .support
+            .is_some_and(|support| support.net_detect_max_match_sets > 0)
+    }
     /// `nl80211_set_wowlan`: re-validated exactly as suspend will program it.
     pub(in crate::ath10k) fn set_wowlan(&self, config: Option<WowlanConfig>) -> Result<(), i32> {
         if self.wow.support.is_none() {
             return Err(narf_wireless::EOPNOTSUPP);
         }
         if let Some(config) = &config {
-            wow::Program::new(config, self.wow.decap).map_err(|_| 22)?; // EINVAL
+            wow::Program::new(config, self.wow.decap, self.nlo_supported()).map_err(|_| 22)?;
+            // EINVAL
         }
         *self.wow.config.lock() = config;
         Ok(())
@@ -119,7 +127,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         {
             return Ok(None);
         }
-        let program = wow::Program::new(&config, self.wow.decap)?;
+        let program = wow::Program::new(&config, self.wow.decap, self.nlo_supported())?;
         let arming = Arming {
             device: self.clone(),
             armed: Slot::new(),

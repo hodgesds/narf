@@ -105,16 +105,26 @@ kernel_test_in!(
 );
 
 /// `ath10k_vif_wow_set_wakeups` (STA): disconnect -> DEAUTH/DISASSOC/BMISS/
-/// CSA_IE, magic -> MAGIC_PKT; RAW decap advertises no patterns, GTK/ND are
-/// refused; native-WiFi converts 802.3 offsets like
-/// `ath10k_wow_convert_8023_to_80211`.
+/// CSA_IE, magic -> MAGIC_PKT; RAW decap advertises no patterns, GTK is
+/// refused, ND is refused without NLO; native-WiFi converts 802.3 offsets
+/// like `ath10k_wow_convert_8023_to_80211`.
 fn smoke_ath10k_wow_program_and_conversion() -> TestResult {
-    let raw = support(Decap::Raw);
-    if !raw.disconnect || !raw.magic_packet || raw.max_patterns != 0 || raw.gtk_rekey {
+    let raw = support(Decap::Raw, false);
+    if !raw.disconnect
+        || !raw.magic_packet
+        || raw.max_patterns != 0
+        || raw.gtk_rekey
+        || raw.net_detect_max_match_sets != 0
+        || raw.net_detect_random_mac
+    {
         return TestResult::Fail("RAW advertisement");
     }
-    let native = support(Decap::NativeWifi);
-    if native.max_patterns != 22 || native.max_pattern_len != 134 || native.max_packet_offset != 114
+    let native = support(Decap::NativeWifi, true);
+    if native.max_patterns != 22
+        || native.max_pattern_len != 134
+        || native.max_packet_offset != 114
+        || native.net_detect_max_match_sets != 16
+        || !native.net_detect_random_mac
     {
         return TestResult::Fail("native-WiFi WOW_MAX_REDUCE limits");
     }
@@ -123,7 +133,7 @@ fn smoke_ath10k_wow_program_and_conversion() -> TestResult {
         magic_packet: true,
         ..WowlanConfig::default()
     };
-    match Program::new(&config, Decap::Raw) {
+    match Program::new(&config, Decap::Raw, false) {
         Ok(p) if p.events == 0b101_0000_1101 && p.patterns.is_empty() => {}
         _ => return TestResult::Fail("disconnect+magic event mask"),
     }
@@ -135,13 +145,14 @@ fn smoke_ath10k_wow_program_and_conversion() -> TestResult {
         }],
         ..WowlanConfig::default()
     };
-    if Program::new(&with_pattern(0, vec![1]), Decap::Raw).is_ok()
+    if Program::new(&with_pattern(0, vec![1]), Decap::Raw, false).is_ok()
         || Program::new(
             &WowlanConfig {
                 gtk_rekey_failure: true,
                 ..WowlanConfig::default()
             },
             Decap::NativeWifi,
+            false,
         )
         .is_ok()
     {
@@ -151,7 +162,7 @@ fn smoke_ath10k_wow_program_and_conversion() -> TestResult {
     let mut eth = vec![0xaa; 6];
     eth.extend_from_slice(&[0xbb; 6]);
     eth.extend_from_slice(&[0x08, 0x00, 0x45, 0x00]);
-    let Ok(p) = Program::new(&with_pattern(0, eth), Decap::NativeWifi) else {
+    let Ok(p) = Program::new(&with_pattern(0, eth), Decap::NativeWifi, false) else {
         return TestResult::Fail("native pattern refused");
     };
     let q = &p.patterns[0];
@@ -164,7 +175,7 @@ fn smoke_ath10k_wow_program_and_conversion() -> TestResult {
         return TestResult::Fail("802.3 header conversion");
     }
     // A body-only pattern only shifts by WOW_HDR_LEN - ETH_HLEN.
-    let Ok(p) = Program::new(&with_pattern(20, vec![7, 8]), Decap::NativeWifi) else {
+    let Ok(p) = Program::new(&with_pattern(20, vec![7, 8]), Decap::NativeWifi, false) else {
         return TestResult::Fail("body pattern refused");
     };
     if p.patterns[0].offset != 38 || p.patterns[0].bytes != [7, 8] {
@@ -204,4 +215,159 @@ fn smoke_ath10k_wow_wakeup_event_decode() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath10k/wow",
     smoke_ath10k_wow_wakeup_event_decode
+);
+
+/// `ath10k_wmi_tlv_op_gen_config_pno_start/stop`: NLO command id, TLV
+/// 144 fixed header, dwell pair, plan periods, SSID records (rssi + hidden
+/// broadcast type) and channel array; passive + random-MAC flag forms;
+/// validation bounds; `Program` gates net-detect on the NLO service and
+/// sets the NLO_DETECTED event bit.
+fn smoke_ath10k_wow_nlo_config_layout() -> TestResult {
+    use crate::ath11k::wmi::{NloConfig, NloNetwork};
+    let nlo = |probe_ssids: Vec<Vec<u8>>,
+               random_mac: Option<narf_wireless::ScanRandomMac>|
+     -> NloConfig {
+        NloConfig {
+            probe_ssids,
+            channels_mhz: vec![2412, 2437],
+            probe_ies: Vec::new(),
+            networks: vec![
+                NloNetwork {
+                    ssid: b"TestNet".to_vec(),
+                    rssi_threshold_dbm: Some(-70),
+                    hidden: false,
+                },
+                NloNetwork {
+                    ssid: b"Hidden".to_vec(),
+                    rssi_threshold_dbm: None,
+                    hidden: true,
+                },
+            ],
+            plans: vec![(30, Some(3)), (300, None)],
+            delay_secs: 5,
+            random_mac,
+        }
+    };
+    let config = nlo(vec![b"TestNet".to_vec()], None);
+    let Ok(c) = nlo_config_start(2, &config) else {
+        return TestResult::Fail("NLO start refused");
+    };
+    // 4 WMI header + 4 TLV + 112 fixed + 4 array + 2*76 records + 4 chan
+    // TLV + 2*4 channels.
+    if c.len() != 128 + 2 * 76 + 8
+        || word(&c, 0) != 0x18001
+        || word(&c, 4) != (144 << 16) | 112
+        || word(&c, 8) != (1 << 1) | (1 << 6)
+        || word(&c, 12) != 2
+        || word(&c, 16) != 3
+        || word(&c, 20) != 40
+        || word(&c, 24) != 110
+        || word(&c, 44) != 30000
+        || word(&c, 48) != 300000
+        || word(&c, 52) != 2
+        || word(&c, 56) != 2
+        || word(&c, 60) != 5
+        || word(&c, 120) != (18 << 16) | 152
+        || word(&c, 124) != (17 << 16) | 72
+        || word(&c, 128) != 1
+        || word(&c, 132) != 7
+        || c[136..143] != *b"TestNet"
+        || word(&c, 184) != 1
+        || word(&c, 188) != (-70i32) as u32
+        || word(&c, 192) != 1
+        || word(&c, 196) != 0
+        || word(&c, 200) != (17 << 16) | 72
+        || word(&c, 204) != 1
+        || word(&c, 208) != 6
+        || c[212..218] != *b"Hidden"
+        || word(&c, 260) != 0
+        || word(&c, 268) != 1
+        || word(&c, 272) != 2
+        || word(&c, 276) != (16 << 16) | 8
+        || word(&c, 280) != 2412
+        || word(&c, 284) != 2437
+    {
+        return TestResult::Fail("NLO start layout");
+    }
+    // Empty probe SSIDs -> passive scan; random MAC -> spoof + seq flags
+    // and the address/mask unions (6 bytes + 2 pad each).
+    let passive = nlo(Vec::new(), None);
+    let Ok(p) = nlo_config_start(0, &passive) else {
+        return TestResult::Fail("passive NLO start refused");
+    };
+    if word(&p, 8) != (1 << 1) | (1 << 6) | (1 << 8) {
+        return TestResult::Fail("NLO passive flag");
+    }
+    let random = nlo(
+        vec![b"TestNet".to_vec()],
+        Some(narf_wireless::ScanRandomMac {
+            addr: [1, 2, 3, 4, 5, 6],
+            mask: [0xff; 6],
+        }),
+    );
+    let Ok(r) = nlo_config_start(0, &random) else {
+        return TestResult::Fail("random-MAC NLO start refused");
+    };
+    if word(&r, 8) != (1 << 1) | (1 << 6) | (1 << 10) | (1 << 11)
+        || r[64..70] != [1, 2, 3, 4, 5, 6]
+        || r[72..78] != [0xff; 6]
+    {
+        return TestResult::Fail("NLO random-MAC flag/address");
+    }
+    // Stop: fixed header only, STOP bit + vdev.
+    let Ok(s) = nlo_config_stop(2) else {
+        return TestResult::Fail("NLO stop refused");
+    };
+    if s.len() != 120
+        || word(&s, 0) != 0x18001
+        || word(&s, 4) != (144 << 16) | 112
+        || word(&s, 8) != 1
+        || word(&s, 12) != 2
+        || word(&s, 16) != 0
+        || word(&s, 116) != 0
+    {
+        return TestResult::Fail("NLO stop layout");
+    }
+    // Validation bounds: empty/overfull networks, channels, plans.
+    let mut bad = nlo(vec![b"TestNet".to_vec()], None);
+    bad.networks.clear();
+    let mut many = nlo(vec![b"TestNet".to_vec()], None);
+    many.networks = (0..17)
+        .map(|_| NloNetwork {
+            ssid: b"x".to_vec(),
+            rssi_threshold_dbm: None,
+            hidden: false,
+        })
+        .collect();
+    let mut chans = nlo(vec![b"TestNet".to_vec()], None);
+    chans.channels_mhz = (0..61).map(|i| 2412 + i).collect();
+    let mut noplan = nlo(vec![b"TestNet".to_vec()], None);
+    noplan.plans.clear();
+    let mut final_iter = nlo(vec![b"TestNet".to_vec()], None);
+    final_iter.plans = vec![(30, Some(3)), (300, Some(2))];
+    if nlo_config_start(0, &bad).is_ok()
+        || nlo_config_start(0, &many).is_ok()
+        || nlo_config_start(0, &chans).is_ok()
+        || nlo_config_start(0, &noplan).is_ok()
+        || nlo_config_start(0, &final_iter).is_ok()
+    {
+        return TestResult::Fail("invalid NLO configuration accepted");
+    }
+    // Program gates net-detect on the NLO service and sets bit 7.
+    let with_nd = WowlanConfig {
+        net_detect: Some(config.clone()),
+        ..WowlanConfig::default()
+    };
+    if Program::new(&with_nd, Decap::Raw, false).is_ok() {
+        return TestResult::Fail("net-detect accepted without NLO service");
+    }
+    match Program::new(&with_nd, Decap::Raw, true) {
+        Ok(p) if p.events == 1 << 7 && p.nlo.is_some() => {}
+        _ => return TestResult::Fail("net-detect program"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/wow",
+    smoke_ath10k_wow_nlo_config_layout
 );

@@ -174,8 +174,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         current: impl Fn() -> Result<RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
         // Raw PCI diagnostics keep their original exclusive unassociated
-        // owner. Registered associated scans use retained stepwise dwell.
-        if plan.station.is_some() || self.station.peer.is_some() {
+        // owner. Registered associated scans use retained stepwise dwell,
+        // except a P2P-device scan: it runs on the P2P_DEVICE vdev with
+        // firmware dwell while the managed station stays associated, so
+        // its station binding is carried for setup/restore only. A failed
+        // P2P scan while associated still fails the radio (station
+        // retirement), exactly as a failed managed associated scan does;
+        // scan-failure isolation is a separate item.
+        if plan.p2p_device.is_none() && (plan.station.is_some() || self.station.peer.is_some()) {
             return Err(Error::Failed);
         }
         // Plans carry requested geometry, not authority for another physical
@@ -190,7 +196,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 &plan.channels,
                 (&plan.ssids, &plan.extra_ies),
                 &plan.setup,
-                plan.restore.first().map(Vec::as_slice),
+                &plan.restore,
                 || plan.validate(&caps, &current()?),
             )
             .await;

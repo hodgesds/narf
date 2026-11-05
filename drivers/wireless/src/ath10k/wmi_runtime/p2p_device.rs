@@ -158,11 +158,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// `mac.c::ath10k_hw_scan` on the P2P_DEVICE vif (P2P search): the
     /// firmware scan runs on that vdev, so its Probe Requests carry the
     /// P2P Device Address and its events carry that vdev id. `plan` is an
-    /// unassociated active plan (`prepare_active_scan`); `None` is a passive
-    /// scan of `channels`. Refused (`Unsupported`, nothing published) with
-    /// no P2P_DEVICE vdev, a ROC in flight (`ar->scan.state` is shared with
-    /// ROC), a station peer or an AP on the managed vdev. The managed
-    /// role's scan cache is not replaced.
+    /// active plan (`prepare_active_scan`); `None` is a passive scan of
+    /// `channels`. Refused (`Unsupported`, nothing published) with no
+    /// P2P_DEVICE vdev, a ROC in flight (`ar->scan.state` is shared with
+    /// ROC), a prepared-but-unassociated station peer, or an AP on the
+    /// managed vdev. An associated managed station no longer refuses:
+    /// Linux runs the requesting vif's scan on its own vdev with no
+    /// associated-state check, and firmware owns dwell and the home
+    /// return; the plan's station binding is carried for setup/restore
+    /// only. The managed role's scan cache is not replaced.
     pub(in crate::ath10k) async fn p2p_device_scan(
         &mut self,
         plan: Option<active_scan::Plan>,
@@ -170,13 +174,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         current: impl Fn() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
         let vdev = self.p2p_device_vdev().ok_or(Error::Unsupported)?;
-        if self.roc.is_some() || self.station.peer.is_some() || self.ap.is_some() {
+        if self.roc.is_some()
+            || self.station.peer.is_some() && self.station_link().is_none()
+            || self.ap.is_some()
+        {
             return Err(Error::Unsupported);
         }
         if let Some(mut plan) = plan {
-            if plan.station.is_some() {
-                return Err(Error::Unsupported);
-            }
             plan.p2p_device = Some(vdev);
             return self.active_scan(plan, current).await;
         }
@@ -186,7 +190,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             Ok(())
         };
         validate()?;
-        self.scan_run_on(Some(vdev), channels, (&[], &[]), &[], None, validate)
+        self.scan_run_on(Some(vdev), channels, (&[], &[]), &[], &[], validate)
             .await
     }
     /// The current ROC runs on the P2P_DEVICE vdev (its owner is the wdev).
