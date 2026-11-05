@@ -189,6 +189,12 @@ pub trait NicControl: core::fmt::Debug + Send + Sync {
     fn nvm(&self, _: u32, _: u32) -> Result<Vec<u8>> {
         Err(95)
     }
+    /// Write EEPROM/NVM bytes (ETHTOOL_SETEEPROM, 0x0c). `magic` is the
+    /// driver-reported value from `nvm_info`; `offset` is a byte offset.
+    /// Defaults to -EOPNOTSUPP; igc implements Linux igc_ethtool_set_eeprom.
+    fn set_nvm(&self, _: u32, _: u32, _: &[u8]) -> Result<()> {
+        Err(95)
+    }
     fn diagnostics(&self, _: bool) -> Result<Vec<Diagnostic>> {
         Err(95)
     }
@@ -395,6 +401,26 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("net", smoke_ethtool_control_roundtrip_and_rejection);
+    fn smoke_ethtool_set_eeprom_routes_to_driver() -> TestResult {
+        // SETEEPROM (0x0c) must size like GETEEPROM (0x0b) and reach the
+        // driver's set_nvm op; the test Model leaves the default, so the
+        // op itself refuses with -EOPNOTSUPP.
+        if crate::ethtool::header_size(0x0c) != Some(16) {
+            return TestResult::Fail("SETEEPROM header size wrong");
+        }
+        let mut b = alloc::vec![0; 20];
+        put(&mut b, 0, 0x0c);
+        put(&mut b, 12, 4);
+        if crate::ethtool::request_size(&b) != Ok(20) {
+            return TestResult::Fail("SETEEPROM request size wrong");
+        }
+        let (name, _) = setup();
+        if crate::ethtool::execute(&name.0, &mut b) != Err(95) {
+            return TestResult::Fail("SETEEPROM not routed to driver op");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net", smoke_ethtool_set_eeprom_routes_to_driver);
     fn smoke_ethtool_variable_requests_are_bounded() -> TestResult {
         for (cmd, size, offset) in [
             (4, 12, 8),

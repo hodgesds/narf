@@ -43,7 +43,10 @@ ring/channel/RSS changes, diagnostics, flow rules, PHC/timestamp and TSN/MAC
 Merge policy, PM and direct UMEM binding. Mutation callers must hold network
 administration authority. `net::ethtool` is a bounded (64-KiB) Linux wire codec;
 userspace owns permission checks and guarded copies. Unsupported controls
-return positive errno, never successful no-ops.
+return positive errno, never successful no-ops. `NicControl::set_nvm`
+implements ETHTOOL_SETEEPROM (0x0c): igc writes shadow RAM via SRWR and
+updates the NVM checksum plus the flash commit; drivers without NVM write
+support refuse with -EOPNOTSUPP, and a bad EEPROM magic fails with -EFAULT.
 
 `enable_zero_copy_tx_context` preserves an owned-frame device cookie alongside
 queue-local recycling. `Frame::tx_timing` carries an optional hardware timestamp

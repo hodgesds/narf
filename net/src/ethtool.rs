@@ -17,7 +17,7 @@ pub fn header_size(cmd: u32) -> Option<usize> {
         0x01 | 0x02 => 44,
         0x05 | 0x06 => 20,
         0x04 => 12,
-        0x0b => 16,
+        0x0b | 0x0c => 16,
         0x09 => 4,
         0x0e | 0x0f => 92,
         0x10 | 0x11 | 0x3c | 0x3d => 36,
@@ -47,7 +47,7 @@ pub fn request_size(header: &[u8]) -> nic::Result<usize> {
     }
     let extra = match cmd {
         0x04 => get(header, 8) as usize,
-        0x0b => get(header, 12) as usize,
+        0x0b | 0x0c => get(header, 12) as usize,
         0x1b => (get(header, 8) as usize).checked_mul(32).ok_or(22)?,
         0x1d => (get(header, 4) as usize).checked_mul(8).ok_or(22)?,
         0x1a => (get(header, 12) as usize).checked_mul(8).ok_or(22)?,
@@ -117,6 +117,13 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                     return Err(5);
                 }
                 b[16..].copy_from_slice(&bytes);
+                return Ok(());
+            }
+            0x0c => {
+                let magic = get(b, 4);
+                let offset = get(b, 8);
+                let len = get(b, 12) as usize;
+                driver.set_nvm(magic, offset, &b[16..16 + len])?;
                 return Ok(());
             }
             0x2e..=0x32 => {
