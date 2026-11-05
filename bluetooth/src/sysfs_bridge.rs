@@ -293,6 +293,9 @@ pub mod tests {
             sco_data_mtu: 64,
             acl_total_num: 8,
             sco_total_num: 4,
+            dev_class: [0; 3],
+            local_name: [0; 248],
+            short_name: [0; 10],
         }
     }
 

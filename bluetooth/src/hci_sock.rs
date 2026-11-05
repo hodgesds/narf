@@ -128,13 +128,13 @@ pub fn monitor_replay() -> Vec<Vec<u8>> {
 }
 
 /// Power a controller on/off (HCIDEVUP/HCIDEVDOWN). Returns false for an
-/// unknown or detached index.
+/// unknown index or a failed transition (a power-on whose HCI
+/// sequence failed leaves the controller off).
 pub fn dev_power(dev: u16, on: bool) -> bool {
     if !controller::is_live(dev as usize) {
         return false;
     }
-    crate::mgmt::set_powered(dev, on);
-    true
+    crate::mgmt::set_powered(dev, on)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

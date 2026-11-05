@@ -42,6 +42,16 @@ pub const HCI_READ_LOCAL_SUPPORTED_FEATURES: u16 = opcode(OGF_INFORMATIONAL, 0x0
 /// HCI_Read_BD_ADDR (§7.4.6). Returns the 6-byte BD_ADDR.
 pub const HCI_READ_BD_ADDR: u16 = opcode(OGF_INFORMATIONAL, 0x0009);
 
+/// HCI_Read_Local_Name (§7.4.14). Returns Status (1) + the 248-byte
+/// local name (NUL-padded). Read during bring-up so mgmt READ_INFO
+/// reports the controller's real name (issue #815).
+pub const HCI_READ_LOCAL_NAME: u16 = opcode(OGF_INFORMATIONAL, 0x0014);
+
+/// HCI_Read_Class_Of_Device (§7.4.23). Returns Status (1) + the
+/// 3-byte Class of Device. Read during bring-up so mgmt READ_INFO
+/// reports the controller's real class (issue #815).
+pub const HCI_READ_CLASS_OF_DEVICE: u16 = opcode(OGF_INFORMATIONAL, 0x0023);
+
 /// HCI_Read_Buffer_Size (§7.4.5). Returns ACL/SCO MTU + count.
 pub const HCI_READ_BUFFER_SIZE: u16 = opcode(OGF_INFORMATIONAL, 0x0005);
 
@@ -114,12 +124,28 @@ pub const HCI_USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY: u16 = opcode(OGF_LINK_CO
 pub const HCI_USER_PASSKEY_REQUEST_REPLY: u16 = opcode(OGF_LINK_CONTROL, 0x002E);
 pub const HCI_REMOTE_OOB_DATA_REQUEST_REPLY: u16 = opcode(OGF_LINK_CONTROL, 0x0030);
 // ── SSP + Host Config (§7.3) ──────────────────────────────────────
+/// HCI_Write_Authentication_Enable (§7.3.31). 1-byte parameter:
+/// 0x00 = link security off, 0x01 = on (Security Mode 3). Issued
+/// by mgmt SET_LINK_SECURITY (issue #815).
+pub const HCI_WRITE_AUTHENTICATION_ENABLE: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0020);
 pub const HCI_WRITE_SIMPLE_PAIRING_MODE: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0056);
 pub const HCI_WRITE_INQUIRY_MODE: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0045);
 pub const HCI_WRITE_PAGE_TIMEOUT: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0018);
 pub const HCI_WRITE_SCAN_ENABLE: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x001A);
 pub const HCI_WRITE_CLASS_OF_DEVICE: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0024);
 pub const HCI_WRITE_LOCAL_NAME: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0013);
+/// HCI_Write_Page_Scan_Type (§7.3.44). 1-byte parameter: 0x00 =
+/// standard page scan, 0x01 = interlaced (fast connectable).
+/// Issued by mgmt SET_FAST_CONNECTABLE (issue #815).
+pub const HCI_WRITE_PAGE_SCAN_TYPE: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x0047);
+/// HCI_Write_LE_Host_Support (§7.3.66). 2-byte parameter:
+/// LE_Host_Supported (1) + Simultaneous_LE_Host_Supported (1,
+/// always 0 here). Issued by mgmt SET_LE (issue #815).
+pub const HCI_WRITE_LE_HOST_SUPPORT: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x006D);
+/// HCI_Write_Secure_Connections_Host_Support (§7.3.76). 1-byte
+/// parameter: 0x00 = off, 0x01 = on. Issued by mgmt
+/// SET_SECURE_CONN (issue #815).
+pub const HCI_WRITE_SECURE_CONNECTIONS_HOST_SUPPORT: u16 = opcode(OGF_CONTROLLER_BASEBAND, 0x007A);
 
 // ── LE Advertising (§7.8.5..7.8.9) ────────────────────────────────
 /// HCI_LE_Set_Advertising_Parameters (§7.8.5).
@@ -236,4 +262,16 @@ mod selftest_ext {
     const _: () = assert!(HCI_WRITE_INQUIRY_MODE == 0x0C45);
     // §7.4.5: OGF=0x04 OCF=0x0005 → 0x1005.
     const _: () = assert!(HCI_READ_BUFFER_SIZE == 0x1005);
+    // §7.4.14: OGF=0x04 OCF=0x0014 → 0x1014.
+    const _: () = assert!(HCI_READ_LOCAL_NAME == 0x1014);
+    // §7.4.23: OGF=0x04 OCF=0x0023 → 0x1023.
+    const _: () = assert!(HCI_READ_CLASS_OF_DEVICE == 0x1023);
+    // §7.3.31: OGF=0x03 OCF=0x0020 → 0x0C20.
+    const _: () = assert!(HCI_WRITE_AUTHENTICATION_ENABLE == 0x0C20);
+    // §7.3.44: OGF=0x03 OCF=0x0047 → 0x0C47.
+    const _: () = assert!(HCI_WRITE_PAGE_SCAN_TYPE == 0x0C47);
+    // §7.3.66: OGF=0x03 OCF=0x006D → 0x0C6D.
+    const _: () = assert!(HCI_WRITE_LE_HOST_SUPPORT == 0x0C6D);
+    // §7.3.76: OGF=0x03 OCF=0x007A → 0x0C7A.
+    const _: () = assert!(HCI_WRITE_SECURE_CONNECTIONS_HOST_SUPPORT == 0x0C7A);
 }

@@ -16,6 +16,11 @@ use crate::opcode;
 use crate::transport::{HciTransport, TransportError};
 use crate::Bluetooth;
 
+/// Default Event Mask per §7.3.1: 0x0000_1FFF_FFFF_FFFF — every event the
+/// host is interested in for a generic bring-up. Shared by bring-up
+/// and mgmt power-on (issue #815) so the two cannot drift apart.
+pub const DEFAULT_EVENT_MASK: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00];
+
 /// Phases a controller passes through during bring-up.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -25,7 +30,15 @@ pub enum BringupPhase {
     ReadBdAddr = 2,
     ReadBufferSize = 3,
     SetEventMask = 4,
-    Ready = 5,
+    /// HCI_Read_Local_Name (§7.4.14) — the name mgmt READ_INFO
+    /// reports (issue #815). Informational, after the mandatory
+    /// sequence; a controller that cannot answer it fails bring-up
+    /// rather than reporting a zeroed name.
+    ReadLocalName = 5,
+    /// HCI_Read_Class_Of_Device (§7.4.23) — the class mgmt READ_INFO
+    /// reports (issue #815). Same discipline as the local name.
+    ReadClassOfDevice = 6,
+    Ready = 7,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -62,7 +75,7 @@ impl From<TransportError> for BringupError {
 }
 
 /// Controller-supplied capabilities collected during bring-up.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ControllerInfo {
     /// 6-byte BD_ADDR (LE on the wire). All-zero until ReadBdAddr completes.
     pub bd_addr: [u8; 6],
@@ -84,6 +97,44 @@ pub struct ControllerInfo {
     pub acl_total_num: u16,
     /// Number of HC SCO data buffers.
     pub sco_total_num: u16,
+    /// 3-byte Class of Device (§7.4.23). All-zero until
+    /// ReadClassOfDevice completes; mgmt READ_INFO reports this
+    /// verbatim, so a zero here means "not yet read", never a
+    /// fabricated class (issue #815).
+    pub dev_class: [u8; 3],
+    /// 248-byte local name (§7.4.14, NUL-padded). All-zero until
+    /// ReadLocalName completes; mgmt READ_INFO reports this verbatim
+    /// (issue #815).
+    pub local_name: [u8; 248],
+    /// 10-byte short name (the first 10 bytes of the mgmt short
+    /// name, without its NUL). The controller has no short-name
+    /// concept: this stays zero until userspace sets one via mgmt
+    /// SET_LOCAL_NAME, matching Linux (an unset short name reads
+    /// back empty). mgmt READ_INFO reports this verbatim.
+    pub short_name: [u8; 10],
+}
+
+// NOTE: no #[derive(Default)] — the pinned toolchain caps array
+// `Default` at 32 elements and `local_name` is [u8; 248] (see
+// AGENTS.md). Keep this in sync with the struct fields above.
+impl Default for ControllerInfo {
+    fn default() -> Self {
+        Self {
+            bd_addr: [0; 6],
+            hci_version: 0,
+            hci_revision: 0,
+            lmp_version: 0,
+            manufacturer: 0,
+            lmp_subversion: 0,
+            acl_data_mtu: 0,
+            sco_data_mtu: 0,
+            acl_total_num: 0,
+            sco_total_num: 0,
+            dev_class: [0; 3],
+            local_name: [0; 248],
+            short_name: [0; 10],
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -121,7 +172,7 @@ impl Controller {
     pub fn phase(&self) -> BringupPhase {
         let v = self.phase.load(Ordering::Acquire);
         // SAFETY: `BringupPhase` is `#[repr(u8)]` and `self.phase` is only
-        // ever stored as one of its discriminants (0..=5), so `v` is a valid
+        // ever stored as one of its discriminants (0..=7), so `v` is a valid
         // bit pattern for the enum.
         // SAFETY: Valid memory or trusted environment
         unsafe { core::mem::transmute(v) }
@@ -204,19 +255,115 @@ impl Controller {
             },
         )?;
 
-        // Default Event Mask per §7.3.1: 0x0000_1FFF_FFFF_FFFF — every
-        // event the host is interested in for a generic bring-up.
-        let mask: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00];
         self.run_phase(
             BringupPhase::SetEventMask,
             opcode::HCI_SET_EVENT_MASK,
-            &mask,
+            &DEFAULT_EVENT_MASK,
             |_, _| Ok(()),
+        )?;
+
+        // Local name + Class of Device (§7.4.14/§7.4.23): the
+        // identity mgmt READ_INFO reports. Informational, not part
+        // of the §3 mandatory sequence, but read here so the
+        // registry never advertises a zeroed name/class for a
+        // controller that knows its own (issue #815).
+        self.run_phase(
+            BringupPhase::ReadLocalName,
+            opcode::HCI_READ_LOCAL_NAME,
+            &[],
+            |info, ret| {
+                // Status (1) + Local_Name (248).
+                if ret.len() < 249 {
+                    return Err(BringupError::UnexpectedEvent {
+                        phase: BringupPhase::ReadLocalName,
+                        code: 0,
+                    });
+                }
+                info.local_name.copy_from_slice(&ret[1..249]);
+                Ok(())
+            },
+        )?;
+
+        self.run_phase(
+            BringupPhase::ReadClassOfDevice,
+            opcode::HCI_READ_CLASS_OF_DEVICE,
+            &[],
+            |info, ret| {
+                // Status (1) + Class_Of_Device (3).
+                if ret.len() < 4 {
+                    return Err(BringupError::UnexpectedEvent {
+                        phase: BringupPhase::ReadClassOfDevice,
+                        code: 0,
+                    });
+                }
+                info.dev_class.copy_from_slice(&ret[1..4]);
+                Ok(())
+            },
         )?;
 
         self.phase
             .store(BringupPhase::Ready as u8, Ordering::Release);
         Ok(*self.info.lock())
+    }
+
+    /// Issue one HCI command and wait for its Command Complete,
+    /// returning the return parameters (status byte first).
+    ///
+    /// The synchronous issuance path mgmt uses (issue #815): the
+    /// same send + polled-wait discipline as bring-up. Callers must
+    /// hold no `IrqSafeSpinLock` across this call — the wait halts
+    /// on IRQs (see the `block_on` lock rule in the repo AGENTS.md).
+    ///
+    /// Known limit, not a silent assumption: while the pump task is
+    /// draining this transport's events, the completion can be
+    /// consumed by the pump instead of this waiter (and vice versa
+    /// for pump events). The waiter then times out after the
+    /// bring-up budget and reports failure even though the command
+    /// was issued. A single command path (pump/CmdQueue) is the
+    /// follow-up; mgmt fixtures run pump-less, where the wait is
+    /// exact.
+    pub fn issue_command(
+        &self,
+        opcode: u16,
+        params: &[u8],
+    ) -> Result<alloc::vec::Vec<u8>, BringupError> {
+        let cmd = Command::with_params(opcode, params);
+        self.transport.send_command(&cmd)?;
+        let event = self.wait_for_event()?;
+        let cc = CommandComplete::parse(&event).ok_or(BringupError::UnexpectedEvent {
+            phase: self.phase(),
+            code: event.code,
+        })?;
+        if cc.opcode != opcode {
+            return Err(BringupError::OpcodeMismatch {
+                phase: self.phase(),
+                got: cc.opcode,
+            });
+        }
+        let status = cc.status().unwrap_or(0xFF);
+        if status != 0x00 {
+            return Err(BringupError::BadStatus {
+                phase: self.phase(),
+                status,
+            });
+        }
+        Ok(cc.return_params.to_vec())
+    }
+
+    /// Record a Class of Device written via mgmt SET_DEV_CLASS
+    /// (issue #815): the stored copy is what READ_INFO reports and
+    /// what power-on re-applies.
+    pub fn set_dev_class(&self, class: [u8; 3]) {
+        self.info.lock().dev_class = class;
+    }
+
+    /// Record a local name written via mgmt SET_LOCAL_NAME (issue
+    /// #815): the stored copies are what READ_INFO reports and what
+    /// power-on re-applies.
+    pub fn set_local_name(&self, name: [u8; 248], short_name: [u8; 10]) {
+        let mut info = self.info.lock();
+        info.local_name = name;
+        info.short_name = short_name;
     }
 
     fn run_phase<F>(
@@ -230,25 +377,9 @@ impl Controller {
         F: FnMut(&mut ControllerInfo, &[u8]) -> Result<(), BringupError>,
     {
         self.phase.store(phase as u8, Ordering::Release);
-        let cmd = Command::with_params(op, params);
-        self.transport.send_command(&cmd)?;
-        let event = self.wait_for_event()?;
-        let cc = CommandComplete::parse(&event).ok_or(BringupError::UnexpectedEvent {
-            phase,
-            code: event.code,
-        })?;
-        if cc.opcode != op {
-            return Err(BringupError::OpcodeMismatch {
-                phase,
-                got: cc.opcode,
-            });
-        }
-        let status = cc.status().unwrap_or(0xFF);
-        if status != 0x00 {
-            return Err(BringupError::BadStatus { phase, status });
-        }
+        let ret = self.issue_command(op, params)?;
         let mut info = self.info.lock();
-        on_complete(&mut info, cc.return_params)?;
+        on_complete(&mut info, &ret)?;
         Ok(())
     }
 

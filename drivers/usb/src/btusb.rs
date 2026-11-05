@@ -1059,6 +1059,37 @@ pub(crate) fn apply_buffer_size_return(
     Ok(())
 }
 
+/// Decode Read Local Name's Command Complete return parameters
+/// (§7.4.14): Status (1) + Local_Name (248). The name mgmt
+/// READ_INFO reports (issue #815).
+pub(crate) fn apply_local_name_return(
+    info: &mut ControllerInfo,
+    ret: &[u8],
+) -> Result<(), BtUsbError> {
+    if ret.len() < 249 {
+        return Err(BtUsbError::ShortReturnParams);
+    }
+    if ret[0] != 0 {
+        return Err(BtUsbError::BadStatus(ret[0]));
+    }
+    info.local_name.copy_from_slice(&ret[1..249]);
+    Ok(())
+}
+
+/// Decode Read Class Of Device's Command Complete return parameters
+/// (§7.4.23): Status (1) + Class_Of_Device (3). The class mgmt
+/// READ_INFO reports (issue #815).
+pub(crate) fn apply_class_return(info: &mut ControllerInfo, ret: &[u8]) -> Result<(), BtUsbError> {
+    if ret.len() < 4 {
+        return Err(BtUsbError::ShortReturnParams);
+    }
+    if ret[0] != 0 {
+        return Err(BtUsbError::BadStatus(ret[0]));
+    }
+    info.dev_class.copy_from_slice(&ret[1..4]);
+    Ok(())
+}
+
 /// Post-address Bluetooth bind: caller has already issued port_reset +
 /// enable_slot + address_device. We pull the config descriptor, match
 /// the HCI interface + endpoints, configure them on the xHC, issue
@@ -1159,9 +1190,11 @@ pub async fn try_bind_btusb_already_addressed(
     }
 
     // ── Stage-0 bring-up dance ────────────────────────────────────
-    // Vol 4 Part E §3 — Reset, Read_Local_Version. We stop at
-    // Read_Local_Version: Read_BD_ADDR + Read_Buffer_Size +
-    // Set_Event_Mask are part of Stage-1 (full controller setup).
+    // Vol 4 Part E §3 — Reset, Read_Local_Version, Read_BD_ADDR,
+    // Read_Buffer_Size, Set_Event_Mask, Read_Local_Name,
+    // Read_Class_Of_Device: the same sequence the sync bring-up
+    // runs (see `narf_bluetooth::controller::Controller::bring_up`),
+    // so the registered controller carries its real identity.
     let event_dci = ep_dci(eps.event_in.ep_addr, /*is_in*/ true);
     let acl_in_dci = ep_dci(eps.acl_in.ep_addr, /*is_in*/ true);
     let acl_out_dci = ep_dci(eps.acl_out.ep_addr, /*is_in*/ false);
@@ -1362,16 +1395,42 @@ pub async fn try_bind_btusb_already_addressed(
     apply_buffer_size_return(&mut info, &ret)?;
 
     // Default host event mask used by the shared controller bring-up.
-    let event_mask = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00];
     let _ = send_command_and_await_complete(
         xhci_dev,
         slot_id,
         eps.interface,
         event_dci,
         op::HCI_SET_EVENT_MASK,
-        &event_mask,
+        &narf_bluetooth::controller::DEFAULT_EVENT_MASK,
     )
     .await?;
+
+    // Local name + Class of Device (§7.4.14/§7.4.23), mirroring the
+    // sync bring-up: the identity mgmt READ_INFO reports (issue
+    // #815). Read after the event mask, before registration, so no
+    // mgmt socket ever sees a zeroed name/class for a controller
+    // that knows its own.
+    let ret = send_command_and_await_complete(
+        xhci_dev,
+        slot_id,
+        eps.interface,
+        event_dci,
+        op::HCI_READ_LOCAL_NAME,
+        &[],
+    )
+    .await?;
+    apply_local_name_return(&mut info, &ret)?;
+
+    let ret = send_command_and_await_complete(
+        xhci_dev,
+        slot_id,
+        eps.interface,
+        event_dci,
+        op::HCI_READ_CLASS_OF_DEVICE,
+        &[],
+    )
+    .await?;
+    apply_class_return(&mut info, &ret)?;
 
     // Register a sync-context transport for Stage-1+ callers (L2CAP
     // pump, ACL data plane). Mandatory bring-up is done: every command

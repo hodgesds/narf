@@ -156,6 +156,21 @@ fn smoke_controller_bringup_drives_mandatory_sequence() -> TestResult {
         ],
     ));
     lt.enqueue_event(make_command_complete(op::HCI_SET_EVENT_MASK, 0x00, &[]));
+    // Identity reads (§7.4.14/§7.4.23): the name/class mgmt
+    // READ_INFO reports (issue #815). Enqueued after the event
+    // mask, matching the bring-up order.
+    let mut name_ret = [0u8; 248];
+    name_ret[..9].copy_from_slice(b"narf-test");
+    lt.enqueue_event(make_command_complete(
+        op::HCI_READ_LOCAL_NAME,
+        0x00,
+        &name_ret,
+    ));
+    lt.enqueue_event(make_command_complete(
+        op::HCI_READ_CLASS_OF_DEVICE,
+        0x00,
+        &[0x04, 0x0C, 0x02],
+    ));
 
     let controller = Controller::new(lt.clone());
     let cap = bootstrap_bluetooth_authority();
@@ -180,6 +195,12 @@ fn smoke_controller_bringup_drives_mandatory_sequence() -> TestResult {
     if info.acl_total_num != 16 {
         return TestResult::Fail("ACL buffer count not captured");
     }
+    if info.local_name[..9] != *b"narf-test" {
+        return TestResult::Fail("local name not captured");
+    }
+    if info.dev_class != [0x04, 0x0C, 0x02] {
+        return TestResult::Fail("Class of Device not captured");
+    }
     if controller.phase() != BringupPhase::Ready {
         return TestResult::Fail("controller did not reach Ready");
     }
@@ -192,6 +213,8 @@ fn smoke_controller_bringup_drives_mandatory_sequence() -> TestResult {
         op::HCI_READ_BD_ADDR,
         op::HCI_READ_BUFFER_SIZE,
         op::HCI_SET_EVENT_MASK,
+        op::HCI_READ_LOCAL_NAME,
+        op::HCI_READ_CLASS_OF_DEVICE,
     ];
     if sent.len() != want.len() {
         return TestResult::Fail("wrong number of commands emitted");
