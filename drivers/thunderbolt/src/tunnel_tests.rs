@@ -903,3 +903,194 @@ kernel_test_in!(
     "drivers/thunderbolt/tunnel",
     usb4_pcie_nearest_ancestor_pairing
 );
+
+// ── Retimer-fault reconcile gate (#1122 item 3) ──────────────
+//
+// A tunnel whose path traverses a lane port with `retimer_fault`
+// set is hard-refused with `Error::RetimerFault` before any
+// configuration write; `reconcile` skips that tunnel (it does not
+// fail the pass) and programs it again once the fault clears.
+
+fn usb4_reconcile_refuses_tunnel_over_retimer_fault() -> TestResult {
+    forget_domain(u32::MAX);
+    let (mut d, mut m) = model();
+    // Fault on the host lane port the DP/USB3 paths traverse.
+    d.routers[0].ports[0].retimer_fault = Some(crate::retimer::Error::Timeout);
+    let mut t = tunnel(Protocol::DisplayPort);
+    if narf_scheduler::block_on_spin(t.activate(&mut m, &d)) != Err(Error::RetimerFault)
+        || !t.writes.is_empty()
+        || m.get(0, 5, CfgSpace::Port, 32) & (3 << 30) != 0
+    {
+        return TestResult::Fail("faulted-link DP tunnel not refused unprogrammed");
+    }
+    let mut tunnels = Vec::new();
+    if narf_scheduler::block_on_spin(reconcile(&mut m, &d, &mut tunnels, 3)).is_err()
+        || !tunnels.is_empty()
+        || live_tunnel_count() != 0
+        || m.get(0, 5, CfgSpace::Port, 32) & (3 << 30) != 0
+        || m.get(0, 3, CfgSpace::Port, 32) & (3 << 30) != 0
+        || m.get(0, 1, CfgSpace::Hops, 16) != 0
+    {
+        return TestResult::Fail("reconcile programmed a tunnel over a faulted link");
+    }
+    // The gate is scoped to lane ports: the same fault value on a
+    // protocol adapter — which cannot carry retimers — refuses
+    // nothing.
+    d.routers[0].ports[0].retimer_fault = None;
+    d.routers[1].ports[2].retimer_fault = Some(crate::retimer::Error::Timeout);
+    let mut t = tunnel(Protocol::DisplayPort);
+    if narf_scheduler::block_on_spin(t.activate(&mut m, &d)).is_err()
+        || narf_scheduler::block_on_spin(t.teardown(&mut m, &d)).is_err()
+        || !t.writes.is_empty()
+    {
+        return TestResult::Fail("adapter-port fault value gated a healthy path");
+    }
+    // Fault cleared — the scan publishes `None` again — and the
+    // same reconcile pass programs both tunnels.
+    d.routers[1].ports[2].retimer_fault = None;
+    let mut tunnels = Vec::new();
+    if narf_scheduler::block_on_spin(reconcile(&mut m, &d, &mut tunnels, 3)).is_err()
+        || tunnels.len() != 2
+        || live_tunnel_count() != 2
+    {
+        return TestResult::Fail("cleared-fault link did not program again");
+    }
+    forget_domain(u32::MAX);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/thunderbolt/tunnel",
+    usb4_reconcile_refuses_tunnel_over_retimer_fault
+);
+
+fn usb4_pcie_reconcile_refuses_tunnel_over_retimer_fault() -> TestResult {
+    forget_domain(u32::MAX);
+    let (mut d, mut m) = pcie_model();
+    d.routers[0].ports[0].retimer_fault = Some(crate::retimer::Error::Timeout);
+    let mut tunnels = Vec::new();
+    if narf_scheduler::block_on_spin(reconcile(&mut m, &d, &mut tunnels, 4)).is_err()
+        || !tunnels.is_empty()
+        || live_tunnel_count() != 0
+        || m.get(0, 7, CfgSpace::Port, 32) != 0
+        || m.get(1, 7, CfgSpace::Port, 32) != 0
+        || hop8(&m, 0, 1) != [0, 0]
+    {
+        return TestResult::Fail("PCIe tunnel programmed over a faulted link");
+    }
+    // Fault cleared: the next pass programs the PCIe tunnel.
+    d.routers[0].ports[0].retimer_fault = None;
+    let mut tunnels = Vec::new();
+    if narf_scheduler::block_on_spin(reconcile(&mut m, &d, &mut tunnels, 4)).is_err()
+        || tunnels.len() != 1
+        || tunnels[0].display.protocol != Protocol::Pcie
+        || live_tunnel_count() != 1
+    {
+        return TestResult::Fail("cleared-fault PCIe link did not program again");
+    }
+    forget_domain(u32::MAX);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/thunderbolt/tunnel",
+    usb4_pcie_reconcile_refuses_tunnel_over_retimer_fault
+);
+
+/// Two-link DP domain built on [`model`]: a second host lane port
+/// (2) leads to a second child router (route 2) with its own DP
+/// sink, served by a second host DP IN adapter (port 6).
+fn two_link_model() -> (Domain, Model) {
+    let (mut d, mut m) = model();
+    d.routers[0].ports.push(Port {
+        number: 2,
+        kind: 1,
+        adapter_cap: 0,
+        phy_cap: 8,
+        usb4_cap: 64,
+        max_in_hop: 15,
+        max_out_hop: 15,
+        total_credits: 64,
+        secondary: false,
+        retimers: Vec::new(),
+        retimer_fault: None,
+    });
+    d.routers[0].ports.push(Port {
+        number: 6,
+        kind: 0x0e0101,
+        adapter_cap: 32,
+        phy_cap: 8,
+        usb4_cap: 64,
+        max_in_hop: 15,
+        max_out_hop: 15,
+        total_credits: 64,
+        secondary: false,
+        retimers: Vec::new(),
+        retimer_fault: None,
+    });
+    let mut ports = Vec::new();
+    for (number, kind, cap) in [(1, 1, 0), (3, 0x200102, 32), (5, 0x0e0102, 32)] {
+        ports.push(Port {
+            number,
+            kind,
+            adapter_cap: cap,
+            phy_cap: 8,
+            usb4_cap: 64,
+            max_in_hop: 15,
+            max_out_hop: 15,
+            total_credits: 64,
+            secondary: false,
+            retimers: Vec::new(),
+            retimer_fault: None,
+        });
+    }
+    d.routers.push(Router {
+        route: 2,
+        upstream: 1,
+        vendor: 0x8086,
+        device: 2,
+        ports,
+    });
+    m.put(0, 2, CfgSpace::Port, 4, 64 << 20);
+    m.put(0, 6, CfgSpace::Port, 36, 2 << 12);
+    m.put(2, 1, CfgSpace::Port, 4, 64 << 20);
+    m.put(2, 5, CfgSpace::Port, 34, 1 << 6);
+    m.put(2, 5, CfgSpace::Port, 36, 2 << 12);
+    (d, m)
+}
+
+fn usb4_reconcile_fault_on_one_link_leaves_other_link_open() -> TestResult {
+    forget_domain(u32::MAX);
+    let (mut d, mut m) = two_link_model();
+    // Only the link to child route 1 is faulted.
+    d.routers[0].ports[0].retimer_fault = Some(crate::retimer::Error::Timeout);
+    let mut tunnels = Vec::new();
+    if narf_scheduler::block_on_spin(reconcile(&mut m, &d, &mut tunnels, 2)).is_err()
+        || tunnels.len() != 1
+        || tunnels[0].display.output != (Endpoint { route: 2, port: 5 })
+        || tunnels[0].display.input != (Endpoint { route: 0, port: 5 })
+        || live_tunnel_count() != 1
+        || m.get(1, 5, CfgSpace::Port, 32) & (3 << 30) != 0
+        || m.get(2, 5, CfgSpace::Port, 32) & (3 << 30) == 0
+        || m.get(0, 1, CfgSpace::Hops, 16) != 0
+    {
+        return TestResult::Fail("fault on one link blocked the healthy link");
+    }
+    // Fault cleared: the next pass programs the first link too,
+    // on the remaining free DP IN adapter.
+    d.routers[0].ports[0].retimer_fault = None;
+    if narf_scheduler::block_on_spin(reconcile(&mut m, &d, &mut tunnels, 2)).is_err()
+        || tunnels.len() != 2
+        || live_tunnel_count() != 2
+        || !tunnels.iter().any(|t| {
+            t.display.input == (Endpoint { route: 0, port: 6 })
+                && t.display.output == (Endpoint { route: 1, port: 5 })
+        })
+    {
+        return TestResult::Fail("cleared-fault link did not program on the next pass");
+    }
+    forget_domain(u32::MAX);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/thunderbolt/tunnel",
+    usb4_reconcile_fault_on_one_link_leaves_other_link_open
+);

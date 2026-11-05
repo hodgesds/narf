@@ -153,7 +153,14 @@ without allocation mode are programmed in legacy mode at the full
 negotiated envelope. `TunnelInfo` publishes each DP tunnel's negotiated
 envelope and live grant (`dp`) and every tunnel's fabric consumption in
 Mb/s (`consumed_mbps`), so suspend/resume replay rebuilds a DP tunnel at
-its recorded rate. Existing enabled
+its recorded rate. Tunnel programming hard-gates on retimer faults:
+`Tunnel::activate` — the choke point for `reconcile`'s USB3, DisplayPort
+and PCIe paths and the suspend/resume replay — refuses with
+`Error::RetimerFault` before any configuration write when any lane port
+the path traverses carries a `Port::retimer_fault`; `reconcile` treats
+the refusal per-tunnel (skips that tunnel, programs the rest) and
+retries it on later passes, so a fault the next scan clears lets the
+path program again. Existing enabled
 firmware tunnels are preserved and are not represented as newly owned paths.
 
 ## 4. Invariants
@@ -355,8 +362,10 @@ plus `SET_INBOUND_SBTX` orchestration before training) is engine-only;
 lane margining Port Operations (`RDCP`/`RHMG`/`RSMG`/`RDSW`) are
 implemented as a fixture-proved protocol surface with no caller wiring
 them into a margining workflow yet; and `reconcile`
-does not yet hard-gate tunnel programming on a port's `retimer_fault` —
-the fault is published typed state that consumers must check.
+hard-gates tunnel programming on a port's `retimer_fault` (see §3):
+a path over a faulted lane port is refused with
+`Error::RetimerFault` before any configuration write, per-tunnel,
+and retried on later passes once the scan clears the fault.
 PCIe remainders: a pre-activation wait for the PCIe adapters' LTSSM
 Detect state, and a runtime PCI rescan of the NHI's companion bridge so
 tunnelled devices enumerate without a reboot (the CM publishes tunnels;
