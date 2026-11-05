@@ -2108,24 +2108,26 @@ fn smoke_ixgbe_fdir_restore_conversation() -> TestResult {
     };
     use super::fdir::{REG_FDIRDIP4M, REG_FDIRIP6M, REG_FDIRSIP4M, REG_FDIRTCPM, REG_FDIRUDPM};
     use super::wol::REG_IP6AT_BASE;
-    let mut state = FdirState::default();
-    state.config = Some(FdirConfig {
-        mode: FdirMode::Perfect,
-        pballoc: FdirPballoc::K64,
-    });
-    state.mask = Some(FdirMask {
-        vm_pool: 0x7F,
-        flow_type: 0x03,
-        vlan_id: 0xEFFF,
-        src_port: 0xFFFF,
-        dst_port: 0xFFFF,
-        flex_bytes: 0xFFFF,
-        src_ip: 0xFFFF_FFFF,
-        dst_ip: 0xFFFF_FFFF,
-        dst_ipv6_match: false,
-    });
-    state.ip6_mask = Some((0xFF00, 0xFFFF));
-    state.ip6at = Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let mut state = FdirState {
+        config: Some(FdirConfig {
+            mode: FdirMode::Perfect,
+            pballoc: FdirPballoc::K64,
+        }),
+        mask: Some(FdirMask {
+            vm_pool: 0x7F,
+            flow_type: 0x03,
+            vlan_id: 0xEFFF,
+            src_port: 0xFFFF,
+            dst_port: 0xFFFF,
+            flex_bytes: 0xFFFF,
+            src_ip: 0xFFFF_FFFF,
+            dst_ip: 0xFFFF_FFFF,
+            dst_ipv6_match: false,
+        }),
+        ip6_mask: Some((0xFF00, 0xFFFF)),
+        ip6at: Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+        ..Default::default()
+    };
     state.record_perfect(
         FdirPerfectInput {
             vm_pool: 0,

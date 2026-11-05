@@ -457,17 +457,17 @@ pub struct FdirPerfectInput {
 ///
 /// Source IPv6 gets a full 128-bit per-filter match (FDIRSIPv6[0..2]
 /// + FDIRIPSA, masked per byte by FDIRIP6M.SIPM). Destination IPv6
-/// has NO per-filter register: the match compares it as a whole
-/// against the single global IP6AT entry (see module docs), so
-/// `dst_ip` is used ONLY for the bucket hash (datasheet Table 7.8
-/// includes the full destination in the hash stream) and
-/// `dst_matches_ip6at` selects the FDIRCMD.IPv6DMatch sense.
-/// Addresses are wire-order byte arrays (byte 0 first on the wire);
-/// the hash words are their `from_be_bytes` numerics, while the
-/// register writes use the LE-loaded form (see module docs).
-/// `bkt_hash` must already hold the value from
-/// [`perfect_bucket_hash`] over [`perfect_stream6`] for this tuple
-/// under the programmed input masks.
+///   has NO per-filter register: the match compares it as a whole
+///   against the single global IP6AT entry (see module docs), so
+///   `dst_ip` is used ONLY for the bucket hash (datasheet Table 7.8
+///   includes the full destination in the hash stream) and
+///   `dst_matches_ip6at` selects the FDIRCMD.IPv6DMatch sense.
+///   Addresses are wire-order byte arrays (byte 0 first on the wire);
+///   the hash words are their `from_be_bytes` numerics, while the
+///   register writes use the LE-loaded form (see module docs).
+///   `bkt_hash` must already hold the value from
+///   [`perfect_bucket_hash`] over [`perfect_stream6`] for this tuple
+///   under the programmed input masks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdirPerfectInput6 {
     /// VM pool (VT pool for the FDIRCMD word).
@@ -1002,17 +1002,17 @@ pub fn add_perfect(
 
 /// Add an IPv6 perfect-match filter (datasheet §7.1.2.7.13 Table 7.7
 /// + §8.2.3.21.16/.17/.22). Writes the source IPv6 as its MS three
-/// dwords (FDIRSIPv6[0..2]) plus its LS dword (FDIRIPSA), FDIRIPDA
-/// = 0 (an IPv4-only register, not meaningful for IPv6 — the
-/// destination matches against the global IP6AT entry instead),
-/// then ports / VLAN / hash and FDIRCMD with IPV6 (+ IPv6DMatch
-/// when `dst_matches_ip6at`). The address words are the LE-loaded
-/// form (LS byte first on the wire), as in [`add_perfect`].
-/// Rejects non-IPv6 flow types (exact match on 4..7, so no stray
-/// flow-type bit can leak into FDIRCMD) and queue indices above the
-/// drop queue. The destination-IPv6 compare is meaningful only when
-/// FDIRM.DIPv6 is clear (`FdirMask::dst_ipv6_match`) and IP6AT
-/// holds the address to match (`wol::program_ipv6` programs it).
+///   dwords (FDIRSIPv6[0..2]) plus its LS dword (FDIRIPSA), FDIRIPDA
+///   = 0 (an IPv4-only register, not meaningful for IPv6 — the
+///   destination matches against the global IP6AT entry instead),
+///   then ports / VLAN / hash and FDIRCMD with IPV6 (+ IPv6DMatch
+///   when `dst_matches_ip6at`). The address words are the LE-loaded
+///   form (LS byte first on the wire), as in [`add_perfect`].
+///   Rejects non-IPv6 flow types (exact match on 4..7, so no stray
+///   flow-type bit can leak into FDIRCMD) and queue indices above the
+///   drop queue. The destination-IPv6 compare is meaningful only when
+///   FDIRM.DIPv6 is clear (`FdirMask::dst_ipv6_match`) and IP6AT
+///   holds the address to match (`wol::program_ipv6` programs it).
 pub fn add_perfect_ipv6(
     bank: &mut impl RegBank,
     input: &FdirPerfectInput6,
