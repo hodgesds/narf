@@ -167,6 +167,10 @@ fn pipe(
         port_clock_khz: port,
         combo_phy: Some(phy),
         dsc: None,
+        src_w: None,
+        src_h: None,
+        scaler: None,
+        bigjoiner_slave: None,
     })
 }
 
@@ -1259,4 +1263,67 @@ fn smoke_xelpg_resources_dsc_pipe_adds_vdsc_cdclk_and_prefill() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_resources",
     smoke_xelpg_resources_dsc_pipe_adds_vdsc_cdclk_and_prefill
+);
+
+fn smoke_xelpg_resources_bigjoiner_and_panel_fitter_allocation() -> TestResult {
+    let mut request = Request {
+        pipes: [None; PIPES],
+        min_cdclk_khz: 0,
+    };
+    // 1. Panel fitter custom source sizing
+    request.pipes[0] = pipe(148_500, (1920, 2200), (1080, 1125), 540_000, 0);
+    if let Some(p) = request.pipes[0].as_mut() {
+        p.src_w = Some(1280);
+        p.src_h = Some(720);
+    }
+    let fit_state = match compute(&request, &latency()) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("panel fitter request must compute"),
+    };
+    if fit_state.requests[0].unwrap().src_w != Some(1280) {
+        return TestResult::Fail("src_w not preserved in state");
+    }
+
+    // Source size exceeding display size is rejected
+    if let Some(p) = request.pipes[0].as_mut() {
+        p.src_w = Some(2560);
+    }
+    if compute(&request, &latency()) != Err(ResourceError::Unsupported) {
+        return TestResult::Fail("src_w > hdisplay must be rejected");
+    }
+
+    // 2. Bigjoiner resource allocation
+    request.pipes[0] = pipe(148_500, (1920, 2200), (1080, 1125), 540_000, 0);
+    if let Some(p) = request.pipes[0].as_mut() {
+        p.bigjoiner_slave = Some(crate::intel_gpu_pipes::Pipe::B);
+    }
+    let joiner_state = match compute(&request, &latency()) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bigjoiner request must compute"),
+    };
+    // Both pipe A and pipe B must be marked active in DBUF
+    if joiner_state.dbuf.active_pipes != (1 << 0) | (1 << 1) {
+        return TestResult::Fail("bigjoiner slave must be active in DBUF");
+    }
+
+    // Conflict: requesting pipe B directly while it's also a slave pipe must fail
+    request.pipes[1] = pipe(74_250, (1280, 1650), (720, 750), 270_000, 1);
+    if compute(&request, &latency()) != Err(ResourceError::Unsupported) {
+        return TestResult::Fail("slave pipe conflict must be rejected");
+    }
+
+    // Master pipe cannot join with itself
+    request.pipes[1] = None;
+    if let Some(p) = request.pipes[0].as_mut() {
+        p.bigjoiner_slave = Some(crate::intel_gpu_pipes::Pipe::A);
+    }
+    if compute(&request, &latency()) != Err(ResourceError::Unsupported) {
+        return TestResult::Fail("self-joining must be rejected");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_resources",
+    smoke_xelpg_resources_bigjoiner_and_panel_fitter_allocation
 );

@@ -1717,6 +1717,57 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
+    /// Program custom pipe source dimensions (e.g. for panel fitting) into `PIPE_SRCSZ`.
+    #[allow(dead_code)]
+    pub(crate) fn program_pipe_source(&mut self, src_w: u16, src_h: u16) {
+        use crate::intel_gpu_pipes::{Pipe as PipeIdx, PIPE_SRCSZ_OFFSET};
+        let srcsz = (((src_w.saturating_sub(1)) as u32) << 16) | ((src_h.saturating_sub(1)) as u32);
+        self.mmio
+            .write32(PipeIdx::A.trans_base() + PIPE_SRCSZ_OFFSET, srcsz);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Program panel-fitting scaler registers for Pipe A.
+    #[allow(dead_code)]
+    pub(crate) fn program_scaler(&mut self, scaler: &crate::intel_gpu_xelpg_scaler::PipeScaler) {
+        use crate::intel_gpu_pipes::Pipe as PipeIdx;
+        for (reg, val) in scaler.enable_writes(PipeIdx::A) {
+            self.mmio.write32(reg, val);
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Disable and detach scalers on Pipe A.
+    #[allow(dead_code)]
+    pub(crate) fn disable_scaler(&mut self) {
+        use crate::intel_gpu_pipes::Pipe as PipeIdx;
+        for (reg, val) in crate::intel_gpu_xelpg_scaler::disable_writes(PipeIdx::A) {
+            self.mmio.write32(reg, val);
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Program DSS_CTL joiner registers when joining master and slave pipes.
+    #[allow(dead_code)]
+    pub(crate) fn program_bigjoiner(
+        &mut self,
+        master: crate::intel_gpu_pipes::Pipe,
+        slave: crate::intel_gpu_pipes::Pipe,
+        enable: bool,
+    ) {
+        use crate::intel_gpu_xelpg_dsc::{dss_ctl1, JOINER_ENABLE};
+        const SECONDARY_BIG_JOINER_ENABLE: u32 = 1 << 29;
+        if enable {
+            self.mmio.write32(dss_ctl1(master), JOINER_ENABLE);
+            self.mmio
+                .write32(dss_ctl1(slave), SECONDARY_BIG_JOINER_ENABLE);
+        } else {
+            self.mmio.write32(dss_ctl1(master), 0);
+            self.mmio.write32(dss_ctl1(slave), 0);
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+
     /// `TRANS_DDI_FUNC_CTL` for DP SST on this port at `lanes`, with the
     /// pipe's BPC field (`TRANS_DDI_BPC_8` is 0).
     fn program_trans_ddi_func_ctl(&mut self, lanes: u8, pipe_bpp: u32) {

@@ -29,6 +29,10 @@ pub const GEM_CONTEXT_DESTROY: u32 = iow(D, 0x6e, 8);
 pub const GEM_SET_CACHING: u32 = iow(D, 0x6f, 8);
 pub const GEM_GET_CACHING: u32 = iowr(D, 0x70, 8);
 pub const GET_RESET_STATS: u32 = iowr(D, 0x72, 24);
+pub const GEM_USERPTR: u32 = iowr(D, 0x73, 24);
+pub const I915_USERPTR_READ_ONLY: u32 = 1 << 0;
+pub const I915_USERPTR_PROBE: u32 = 1 << 1;
+pub const I915_USERPTR_UNSYNCHRONIZED: u32 = 1 << 31;
 pub const GEM_CONTEXT_GETPARAM: u32 = iowr(D, 0x74, 24);
 pub const GEM_CONTEXT_SETPARAM: u32 = iowr(D, 0x75, 24);
 pub const QUERY: u32 = iowr(D, 0x79, 16);
@@ -117,6 +121,7 @@ pub(crate) fn compatibility_ioctl(cmd: u32) -> bool {
             | GEM_SET_CACHING
             | GEM_GET_CACHING
             | GET_RESET_STATS
+            | GEM_USERPTR
             | GEM_CONTEXT_GETPARAM
             | GEM_CONTEXT_SETPARAM
             | QUERY
@@ -209,6 +214,7 @@ mod tests {
             || GEM_EXECBUFFER2_WR != 0xc040_6469
             || GEM_CONTEXT_CREATE != 0xc008_646d
             || GEM_CONTEXT_CREATE_EXT != 0xc010_646d
+            || GEM_USERPTR != 0xc018_6473
             || QUERY != 0xc010_6479
             || GEM_CREATE_EXT != 0xc018_647c
         {

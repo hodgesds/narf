@@ -1031,6 +1031,9 @@ impl RenderFile {
                 .ok_or(FsError::NoDevice)?;
             context.check_epoch(status.epoch)?;
             for entry in &request.objects {
+                if entry.writable && entry.object.is_read_only() {
+                    return Err(FsError::InvalidData);
+                }
                 if !entry.asynchronous {
                     entry.object.wait_idle(entry.writable, None).await?;
                 }
@@ -1085,6 +1088,9 @@ impl RenderFile {
         let request = read(user, arg, if cmd == abi::GEM_SET_DOMAIN { 12 } else { 4 })?;
         let object = self.gem.object(u32_at(&request, 0))?;
         let write = cpu_domain_write(cmd, &request)?;
+        if write && object.is_read_only() {
+            return Err(FsError::InvalidData);
+        }
         if !object.idle(write) && user.restart_after(1_000_000) {
             return Err(FsError::WouldBlock);
         }
@@ -1151,6 +1157,9 @@ impl RenderFile {
             .checked_add(size as u64)
             .ok_or(FsError::BadAddress)?;
         let write = cmd == abi::GEM_PWRITE;
+        if write && object.is_read_only() {
+            return Err(FsError::PermissionDenied);
+        }
         let mut done = 0;
         while done < size {
             let count = (size - done).min(16 * 1024);
@@ -1331,7 +1340,7 @@ impl RenderFile {
             }
             abi::GEM_CREATE | abi::GEM_CREATE_EXT => {
                 let mut request = read(user, arg, if cmd == abi::GEM_CREATE { 16 } else { 24 })?;
-                let mut pat = false;
+                let mut pat = None;
                 if cmd == abi::GEM_CREATE_EXT {
                     // i915_gem_create_ext_ioctl: unknown flags, then the
                     // chain, then I915_GEM_CREATE_EXT_FLAG_NEEDS_CPU_ACCESS,
@@ -1346,18 +1355,27 @@ impl RenderFile {
                         return Err(FsError::InvalidData);
                     }
                 }
-                self.gem.create(u64_at(&request, 0), |handle, size| {
-                    // LINUX-GAP: Linux sets the object's PAT index here, after
-                    // __i915_gem_object_create_user_ext; NARF objects carry no
-                    // per-object PAT, so the object is not published.
-                    if pat {
-                        return Err(FsError::NotImplemented);
-                    }
-                    put64(&mut request, 0, size);
-                    put32(&mut request, 8, handle);
-                    user.write(arg, &request)
-                })?;
+                self.gem.create_with_pat(
+                    u64_at(&request, 0),
+                    None,
+                    crate::intel_gpu_gem::Placement::System,
+                    pat,
+                    |handle, size| {
+                        put64(&mut request, 0, size);
+                        put32(&mut request, 8, handle);
+                        user.write(arg, &request)
+                    },
+                )?;
                 Ok(())
+            }
+            abi::GEM_USERPTR => {
+                let mut request = read(user, arg, 24)?;
+                let user_ptr = u64_at(&request, 0);
+                let user_size = u64_at(&request, 8);
+                let flags = u32_at(&request, 16);
+                let handle = self.gem.userptr(user_ptr, user_size, flags, user)?;
+                put32(&mut request, 20, handle);
+                user.write(arg, &request)
             }
             abi::GEM_CLOSE => {
                 let request = read(user, arg, 8)?;
@@ -1834,9 +1852,9 @@ fn create_extensions(
     info: &DeviceInfo,
     user: &dyn IoctlContext,
     address: u64,
-) -> Result<bool, FsError> {
+) -> Result<Option<u8>, FsError> {
     let mut placements = false;
-    let mut pat = false;
+    let mut pat = None;
     abi::user_extensions(user, address, |address, name| match name {
         // I915_GEM_CREATE_EXT_MEMORY_REGIONS: ext_set_placements copies the
         // 48-byte drm_i915_gem_create_ext_memory_regions; set_placements
@@ -1887,10 +1905,11 @@ fn create_extensions(
             ) {
                 return Err(FsError::NoDevice);
             }
-            if u32_at(&read(user, address, 40)?, 32) > MAX_PAT_INDEX {
+            let pat_index = u32_at(&read(user, address, 40)?, 32);
+            if pat_index > MAX_PAT_INDEX {
                 return Err(FsError::InvalidData);
             }
-            pat = true;
+            pat = Some(pat_index as u8);
             Ok(())
         }
         _ => Err(FsError::InvalidData),
@@ -2026,13 +2045,14 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
             }
             i32::try_from(frequency).map_err(|_| FsError::NoDevice)?
         }
-        // Explicitly absent features; do not advertise perf, USERPTR,
+        23 => 1, // I915_PARAM_HAS_GEM_USERPTR
+        // Explicitly absent features; do not advertise perf,
         // secure dispatch, CPU coherency or unimplemented scheduler controls.
         6..=8
         | 12..=13
         | 15..=17
         | 20..=21
-        | 23..=24
+        | 24
         | 27..=29
         | 36
         | 38..=39
@@ -2232,6 +2252,30 @@ pub(crate) mod tests {
         }
         fn nonblocking(&self) -> bool {
             false
+        }
+        fn pin_user_pages(
+            &self,
+            address: u64,
+            pages: u64,
+            _writable: bool,
+        ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
+            let memory = self.bytes.lock();
+            let len = pages.checked_mul(4096).ok_or(FsError::BadAddress)?;
+            let end = address.checked_add(len).ok_or(FsError::BadAddress)?;
+            if address == 0 || end > memory.len() as u64 {
+                return Err(FsError::BadAddress);
+            }
+            drop(memory);
+            let mut pins = Vec::new();
+            for _ in 0..pages {
+                let frame = narf_memory::alloc_frame().map_err(|_| FsError::OutOfMemory)?;
+                // SAFETY: newly allocated frame retained by UserPagePin for this test
+                let pin = unsafe {
+                    narf_memory::address_space::UserPagePin::retain_ram(frame.start_address())
+                };
+                pins.push(pin);
+            }
+            Ok(pins)
         }
     }
     fn info(generation: Generation) -> DeviceInfo {
@@ -2983,6 +3027,14 @@ pub(crate) mod tests {
         fn nonblocking(&self) -> bool {
             false
         }
+        fn pin_user_pages(
+            &self,
+            address: u64,
+            pages: u64,
+            writable: bool,
+        ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
+            self.user.pin_user_pages(address, pages, writable)
+        }
     }
 
     /// MIT Linux b90c984d i915_gem_context.c::create_setparam:2265 applies
@@ -3238,17 +3290,23 @@ pub(crate) mod tests {
             if create(&mtl, 0, 1024, 0) != Err(FsError::InvalidData) {
                 return Err("object size before PAT");
             }
-            // LINUX-GAP: Linux sets the index on the new object; NARF has
-            // no per-object PAT and publishes nothing.
-            if create(&mtl, 0, 1024, 4096) != Err(FsError::NotImplemented) {
-                return Err("SET_PAT refusal");
+            // Linux sets the index on the new object.
+            let pat_handle = create(&mtl, 0, 1024, 4096).map_err(|_| "SET_PAT application")?;
+            if file
+                .gem
+                .object(pat_handle)
+                .map_err(|_| "lookup")?
+                .pat_index()
+                != Some(4)
+            {
+                return Err("SET_PAT did not set pat_index on object");
             }
             // Names past SET_PAT have no table entry.
             link(1024, 0, 3, &[]);
             if create(&mtl, 0, 1024, 4096) != Err(FsError::InvalidData) {
                 return Err("unknown create extension");
             }
-            if create(&mtl, 0, 0, 4096) != Ok(placed + 1) {
+            if create(&mtl, 0, 0, 4096) != Ok(placed + 2) {
                 return Err("a refused create consumed a handle");
             }
             Ok(())
@@ -3559,6 +3617,126 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_render",
         smoke_intel_pread_pwrite_and_mmap_wire
+    );
+
+    fn smoke_i915_gem_userptr_creation_and_validation() -> TestResult {
+        check(|| {
+            let file = RenderFile::new();
+            let user = User::new();
+
+            // 1. Verify I915_PARAM_HAS_GEM_USERPTR reports 1
+            let mut getparam_req = [0; 16];
+            put32(&mut getparam_req, 0, 23); // I915_PARAM_HAS_GEM_USERPTR
+            put64(&mut getparam_req, 8, 1024);
+            user.store(64, &getparam_req);
+            invoke(&file, &user, abi::GETPARAM).map_err(|_| "getparam 23")?;
+            let val = i32::from_le_bytes(user.load(1024, 4).try_into().unwrap());
+            if val != 1 {
+                return Err("I915_PARAM_HAS_GEM_USERPTR != 1");
+            }
+
+            // 2. Alignment checks: unaligned pointer or unaligned size
+            let mut userptr_req = [0; 24];
+            put64(&mut userptr_req, 0, 4097); // unaligned ptr
+            put64(&mut userptr_req, 8, 4096);
+            put32(&mut userptr_req, 16, 0);
+            user.store(64, &userptr_req);
+            if invoke(&file, &user, abi::GEM_USERPTR) != Err(FsError::InvalidData) {
+                return Err("unaligned ptr accepted");
+            }
+
+            put64(&mut userptr_req, 0, 4096);
+            put64(&mut userptr_req, 8, 4095); // unaligned size
+            user.store(64, &userptr_req);
+            if invoke(&file, &user, abi::GEM_USERPTR) != Err(FsError::InvalidData) {
+                return Err("unaligned size accepted");
+            }
+
+            // 3. Zero size check
+            put64(&mut userptr_req, 8, 0);
+            user.store(64, &userptr_req);
+            if invoke(&file, &user, abi::GEM_USERPTR) != Err(FsError::InvalidData) {
+                return Err("zero size accepted");
+            }
+
+            // 4. Invalid flags check
+            put64(&mut userptr_req, 8, 4096);
+            put32(&mut userptr_req, 16, 1 << 4); // unknown flag
+            user.store(64, &userptr_req);
+            if invoke(&file, &user, abi::GEM_USERPTR) != Err(FsError::InvalidData) {
+                return Err("invalid flag accepted");
+            }
+
+            // 5. Valid creation: Read-Write
+            put32(&mut userptr_req, 16, 0);
+            user.store(64, &userptr_req);
+            invoke(&file, &user, abi::GEM_USERPTR).map_err(|_| "valid userptr")?;
+            let reply = user.load(64, 24);
+            let handle = u32_at(&reply, 20);
+            if handle == 0 {
+                return Err("returned zero handle");
+            }
+            let obj = file.gem.object(handle).map_err(|_| "lookup")?;
+            if obj.is_read_only() || !obj.is_userptr() {
+                return Err("incorrect read_only or is_userptr state");
+            }
+
+            // Userptr cannot be mmapped or exported
+            if file.gem.mmap_offset(handle) != Err(FsError::Unsupported) {
+                return Err("userptr allowed mmap_offset");
+            }
+            if !matches!(file.gem.export_object(handle), Err(FsError::InvalidData)) {
+                return Err("userptr allowed export");
+            }
+
+            // 6. Valid creation: Read-Only
+            put64(&mut userptr_req, 0, 8192);
+            put64(&mut userptr_req, 8, 4096);
+            put32(&mut userptr_req, 16, abi::I915_USERPTR_READ_ONLY);
+            user.store(64, &userptr_req);
+            invoke(&file, &user, abi::GEM_USERPTR).map_err(|_| "ro userptr")?;
+            let ro_handle = u32_at(&user.load(64, 24), 20);
+            let ro_obj = file.gem.object(ro_handle).map_err(|_| "lookup ro")?;
+            if !ro_obj.is_read_only() {
+                return Err("read_only flag not set on object");
+            }
+
+            // Writing to read-only object via pwrite fails with PermissionDenied
+            let mut pwrite_req = [0; 32];
+            put32(&mut pwrite_req, 0, ro_handle);
+            put64(&mut pwrite_req, 8, 0);
+            put64(&mut pwrite_req, 16, 16);
+            put64(&mut pwrite_req, 24, 1024);
+            user.store(64, &pwrite_req);
+            if invoke(&file, &user, abi::GEM_PWRITE) != Err(FsError::PermissionDenied) {
+                return Err("pwrite on read-only userptr accepted");
+            }
+
+            // Setting write domain on read-only object fails with InvalidData
+            let mut domain_req = [0; 12];
+            put32(&mut domain_req, 0, ro_handle);
+            put32(&mut domain_req, 4, 1);
+            put32(&mut domain_req, 8, 1);
+            user.store(64, &domain_req);
+            if invoke(&file, &user, abi::GEM_SET_DOMAIN) != Err(FsError::InvalidData) {
+                return Err("write domain on read-only userptr accepted");
+            }
+
+            // GEM_CLOSE releases the handles
+            let mut close_req = [0; 8];
+            put32(&mut close_req, 0, handle);
+            user.store(64, &close_req);
+            invoke(&file, &user, abi::GEM_CLOSE).map_err(|_| "close handle")?;
+            if file.gem.object(handle).is_ok() {
+                return Err("closed handle still looked up");
+            }
+
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_i915_gem_userptr_creation_and_validation
     );
 
     fn smoke_intel_prime_import_identity_offsets_and_mapping_owner() -> TestResult {

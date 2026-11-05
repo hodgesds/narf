@@ -190,6 +190,10 @@ fn request(ext: &ExternalPipe) -> PipeRequest {
         port_clock_khz: ext.port_clock_khz,
         combo_phy: ext.combo_phy,
         dsc: ext.dsc,
+        src_w: None,
+        src_h: None,
+        scaler: None,
+        bigjoiner_slave: None,
     }
 }
 
