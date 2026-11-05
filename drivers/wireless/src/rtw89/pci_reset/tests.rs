@@ -6,7 +6,6 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     task::{Context, Poll, Waker},
 };
-use narf_capabilities::{object_table, CapKind, Rights};
 use narf_kernel_test::{kernel_test_in, TestResult};
 include!("golden.rs");
 
@@ -41,16 +40,10 @@ struct Model {
     quiet_violation: bool,
 }
 fn authority() -> Cap<BusDeviceCap, Write> {
-    let (index, generation) = object_table::register(CapKind::BusDevice);
-    // SAFETY: fresh exact typed fixture object and Write rights.
-    unsafe {
-        Cap::mint(CapSlot::new(
-            generation,
-            index,
-            Write::BITS,
-            CapKind::BusDevice as u32,
-        ))
-    }
+    // Fresh live BusDevice/Write fixture authority, minted via the
+    // safe `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    Cap::bootstrap()
 }
 fn device() -> BusDevice {
     let addr = narf_bus::PcieAddr::new(0, 2, 3, 0);

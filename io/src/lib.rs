@@ -80,26 +80,21 @@ static REGISTRY: IrqSafeSpinLock<Vec<Option<Arc<DmaBuffer>>>> = IrqSafeSpinLock:
 /// `slot.index` is the registry slot, so devices can `resolve()`
 /// back to the buffer from a `BlockRequest::buffer` field.
 pub fn register_with_cap(mut buf: DmaBuffer) -> Cap<DmaBuffer, narf_capabilities::Write> {
-    let (index, _gen) = narf_capabilities::object_table::register(CapKind::DmaBuffer);
+    // `Cap::bootstrap` registers a fresh DmaBuffer object-table entry
+    // and mints the cap for it (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`, so this is the only way to
+    // mint from outside the crate). The slot's generation is 1 for a
+    // fresh entry — the same value the old hand-built slot read back
+    // via `current_epoch` — and `slot.index` is the registry index.
+    let cap: Cap<DmaBuffer, narf_capabilities::Write> = Cap::bootstrap();
+    let index = cap.slot().index;
     buf.slot_index = Some(index);
     let mut r = REGISTRY.lock();
     if (index as usize) >= r.len() {
         r.resize(index as usize + 1, None);
     }
     r[index as usize] = Some(Arc::new(buf));
-    drop(r);
-    let slot = narf_capabilities::CapSlot::new(
-        narf_capabilities::object_table::current_epoch(index).unwrap_or(1),
-        index,
-        <narf_capabilities::Write as narf_capabilities::Rights>::BITS,
-        CapKind::DmaBuffer as u32,
-    );
-    // SAFETY: the slot we just synthesised is consistent with the
-    // entry we wrote into REGISTRY a moment ago — same index, live
-    // epoch, DmaBuffer kind. `Cap::mint` only requires that the
-    // slot describe an authority the caller actually holds.
-    // SAFETY: Valid memory or trusted environment
-    unsafe { Cap::mint(slot) }
+    cap
 }
 
 /// Revoke the cap and free the registry slot. After this call

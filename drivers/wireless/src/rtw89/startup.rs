@@ -869,7 +869,6 @@ mod wow;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
-    use narf_capabilities::{object_table, CapKind, CapSlot, Rights};
     use narf_kernel_test::{kernel_test_in, TestResult};
     fn device() -> BusDevice {
         let addr = narf_bus::PcieAddr::new(0, 0, 7, 0);
@@ -889,16 +888,10 @@ mod tests {
         }
     }
     fn authority() -> Cap<BusDeviceCap, Write> {
-        let (index, generation) = object_table::register(CapKind::BusDevice);
-        // SAFETY: fresh fixture object with exact BusDevice/Write type/rights.
-        unsafe {
-            Cap::mint(CapSlot::new(
-                generation,
-                index,
-                Write::BITS,
-                CapKind::BusDevice as u32,
-            ))
-        }
+        // Fresh live BusDevice/Write fixture authority, minted via
+        // the safe `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint`
+        // is crate-private to `capabilities/`).
+        Cap::bootstrap()
     }
     fn smoke_rtw89_cold_claim_revocation_precedes_unmapped_pci_and_dma() -> TestResult {
         let cap = authority();

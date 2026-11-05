@@ -138,7 +138,6 @@ mod tests {
         pin::pin,
         task::{Context, Poll, Waker},
     };
-    use narf_capabilities::{object_table, CapKind, CapSlot, Rights};
     use narf_kernel_test::{kernel_test_in, TestResult};
     fn ready<F: Future>(future: F) -> Option<F::Output> {
         let mut f = pin!(future);
@@ -149,16 +148,10 @@ mod tests {
     }
     fn smoke_rtw89_native_pcie_policy_requires_current_authority() -> TestResult {
         let mut words = vec![0u32; 16384];
-        let (index, generation) = object_table::register(CapKind::BusDevice);
-        // SAFETY: fresh test object with exact BusDevice/Write type and rights.
-        let authority = unsafe {
-            Cap::<BusDeviceCap, Write>::mint(CapSlot::new(
-                generation,
-                index,
-                Write::BITS,
-                CapKind::BusDevice as u32,
-            ))
-        };
+        // Fresh live BusDevice/Write fixture authority, minted via the
+        // safe `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+        // crate-private to `capabilities/`).
+        let authority = Cap::<BusDeviceCap, Write>::bootstrap();
         let address = narf_bus::PcieAddr::new(0, 0, 7, 0);
         let device = BusDevice {
             addr: narf_bus::BusAddr::Pcie(address),

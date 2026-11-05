@@ -214,18 +214,11 @@ kernel_test_in!(
 fn smoke_rtw89_b_rf_native_window_and_current_authority() -> TestResult {
     use super::super::{mac::ChipId, power_native::NativeIo};
     use narf_bus::{BusDeviceCap, MmioRegion};
-    use narf_capabilities::{object_table, Cap, CapKind, CapSlot, Rights, Write};
-    let (index, generation) = object_table::register(CapKind::BusDevice);
-    // SAFETY: exact fresh model BusDevice/Write object; no ambient production
-    // authority or real device is created by this fixture.
-    let authority = unsafe {
-        Cap::<BusDeviceCap, Write>::mint(CapSlot::new(
-            generation,
-            index,
-            Write::BITS,
-            CapKind::BusDevice as u32,
-        ))
-    };
+    use narf_capabilities::{Cap, Write};
+    // Fresh live BusDevice/Write fixture authority, minted via the
+    // safe `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    let authority = Cap::<BusDeviceCap, Write>::bootstrap();
     let mut words = vec![0u32; 0x20000 / 4];
     let mut region = MmioRegion {
         phys: narf_memory::PhysAddr::new(0),

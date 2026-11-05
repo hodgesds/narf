@@ -17,7 +17,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use narf_bus::{BusDevice, BusDeviceCap, BusKind};
-use narf_capabilities::{object_table, Cap, CapKind, CapSlot, Rights, Write};
+use narf_capabilities::{Cap, Write};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// Fixture register bank implementing [`Regs`] (same shape as the
@@ -83,16 +83,10 @@ impl super::irq::Regs for Model {
 }
 
 fn test_cap() -> Cap<BusDeviceCap, Write> {
-    let (index, generation) = object_table::register(CapKind::BusDevice);
-    // SAFETY: fresh model object, exact BusDevice/Write rights and generation.
-    unsafe {
-        Cap::mint(CapSlot::new(
-            generation,
-            index,
-            Write::BITS,
-            CapKind::BusDevice as u32,
-        ))
-    }
+    // Fresh live BusDevice/Write fixture authority, minted via the
+    // safe `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    Cap::bootstrap()
 }
 
 /// Non-PCI fixture function: MSI discovery must fail without

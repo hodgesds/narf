@@ -2,7 +2,7 @@ use super::*;
 use alloc::{sync::Arc, vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_bus::BusDeviceCap;
-use narf_capabilities::{object_table, Cap, CapKind, CapSlot, Rights, Write};
+use narf_capabilities::{Cap, Write};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -94,16 +94,10 @@ impl Model {
         !self.incoming.is_empty() || !self.controls.incoming.lock().is_empty()
     }
     pub(in crate::rtw89) fn new() -> Self {
-        let (index, generation) = object_table::register(CapKind::BusDevice);
-        // SAFETY: private fresh fixture object has exact BusDevice/Write type.
-        let authority = unsafe {
-            Cap::mint(CapSlot::new(
-                generation,
-                index,
-                Write::BITS,
-                CapKind::BusDevice as u32,
-            ))
-        };
+        // Fresh live BusDevice/Write fixture authority, minted via the
+        // safe `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+        // crate-private to `capabilities/`).
+        let authority = Cap::bootstrap();
         let mut registers = vec![0; 65536];
         registers[0x1010..0x1014].copy_from_slice(&format::STOP_ALL.to_le_bytes());
         Self {

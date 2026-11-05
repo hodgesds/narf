@@ -13,21 +13,14 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn make_block_request(op: crate::BlockOp, user_tag: u64) -> crate::BlockRequest {
     use crate::{BlockRequest, QosHint};
-    use narf_capabilities::{Cap, CapSlot, Read, Rights};
-    // SAFETY: this is a test-only synthetic capability. `mint` requires the
-    // slot's `type_tag` and `rights` to match the `Cap`'s `T` and `R`. The
-    // slot is built here with `type_tag = CapKind::DmaBuffer` and `rights =
-    // Read::BITS`, which exactly match `Cap::<DmaBuffer, Read>`, so the
-    // type/rights coherence invariant holds.
-    // SAFETY: Valid memory or trusted environment
-    let cap = unsafe {
-        Cap::<narf_io::DmaBuffer, Read>::mint(CapSlot::new(
-            1,
-            0,
-            Read::BITS,
-            narf_capabilities::CapKind::DmaBuffer as u32,
-        ))
-    };
+    use narf_capabilities::{Cap, Read};
+    // Test-only synthetic capability, minted via the safe
+    // `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`). The cap is live — its
+    // object-table entry is freshly registered with DmaBuffer kind
+    // and Read rights — which is strictly stronger than the old
+    // hand-built slot for index 0 that was never registered.
+    let cap = Cap::<narf_io::DmaBuffer, Read>::bootstrap();
     BlockRequest {
         op,
         lba: 0,
