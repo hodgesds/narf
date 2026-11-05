@@ -12,8 +12,9 @@ fn smoke_rtw89_cctl_g7_default() -> TestResult {
     // m6 = 0x80FFFFFF; w7 = 0xB8109, m7 = 0xEFFFEFFF;
     // w14/w15 zero, m14 = all ones, m15 = 0x0FFFFFFF;
     // w2/w3/w8 zero with ALL masks; w9..w13/m9..m13 zero.
-    let table =
-        build_default(0x2A, false).map_err(|_| TestResult::Fail("cctl g7 rejects valid macid"))?;
+    let Ok(table) = build_default(0x2A, false) else {
+        return TestResult::Fail("cctl g7 rejects valid macid");
+    };
     if table.c0 != 0xAA
         || table.w[0] != 4
         || table.m[0] != 0xFFF7_FFFF
@@ -46,8 +47,9 @@ fn smoke_rtw89_cctl_g7_default() -> TestResult {
         }
     }
     // MGQ report enable sets only W0 bit 21.
-    let table = build_default(0x2A, true)
-        .map_err(|_| TestResult::Fail("cctl g7 mgq rejects valid macid"))?;
+    let Ok(table) = build_default(0x2A, true) else {
+        return TestResult::Fail("cctl g7 mgq rejects valid macid");
+    };
     if table.w[0] != (4 | (1 << 21)) || table.c0 != 0xAA {
         return TestResult::Fail("cctl g7 mgq word");
     }

@@ -8,6 +8,7 @@
 //! FN bits 29-28, ADDR bits 27-11, LENGTH bits 10-0.
 
 use super::host_ports::*;
+use super::transport::{Function, Transport, TransportError};
 use ::core::fmt;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
