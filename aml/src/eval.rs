@@ -106,6 +106,19 @@ struct EvalState {
     /// same-named child (`PRTP` etc.). With `scope` populated we
     /// walk parent paths properly.
     scope: alloc::string::String,
+    /// Live method-call depth of this frame: 1 for a top-level
+    /// `evaluate_method` call, +1 per nested method invocation
+    /// (SEC-F1, #1289). Set by `evaluate_method_with_depth`
+    /// after construction; the evaluator never mutates it.
+    call_depth: u32,
+    /// Live structural-nesting depth inside this method frame:
+    /// incremented on entry to `eval_term_arg` and to
+    /// `walk_term_list`, decremented on exit (SEC-F1, #1289).
+    /// Counts expression nesting (`Add(Add(...))`) and
+    /// `If`/`While` body nesting alike. A fresh `EvalState` per
+    /// method call means the gauge restarts per frame — the
+    /// cross-frame budget is `call_depth`.
+    nest_depth: u32,
 }
 
 impl EvalState {
@@ -129,6 +142,8 @@ impl EvalState {
             ],
             args: args.to_vec(),
             scope: alloc::string::String::from(scope),
+            call_depth: 0,
+            nest_depth: 0,
         }
     }
 
@@ -157,6 +172,24 @@ impl EvalState {
 /// the caller-supplied arguments, walks the TermList, and returns the value
 /// produced by `Return(...)` or `Value::Integer(0)` if the body falls through.
 pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
+    evaluate_method_with_depth(path, args, 0)
+}
+
+/// Internal entry point carrying the caller's live method-call
+/// depth (SEC-F1, #1289). `depth` is the number of method frames
+/// already live above this call: 0 for a top-level evaluation,
+/// `state.call_depth` for a nested invocation from inside
+/// another method's `EvalState`. The public `evaluate_method`
+/// keeps its signature — only the two in-evaluator call sites
+/// (statement-level and TermArg method invocation) use this.
+///
+/// The bound is checked before the node lookup and before the
+/// per-frame body copy, so a call at the budget allocates
+/// nothing and returns `RecursionDepthExceeded` immediately.
+/// The predefined `_OSI` shortcut above the check is not a
+/// recursion path — it returns a constant without evaluating
+/// anything — so it neither consumes depth nor needs it.
+fn evaluate_method_with_depth(path: &str, args: &[Value], depth: u32) -> Result<Value, AmlError> {
     // 1a. Predefined methods we handle without consulting the AML
     //     namespace. `_OSI(string)` (ACPI 6.5 §5.7.2) is the
     //     compatibility shim DSDTs gate behaviour on — touchpad
@@ -170,6 +203,17 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
     //     compatibility wins over historical caution).
     if path == "\\_OSI" || path.ends_with("._OSI") {
         return Ok(predefined_osi(args));
+    }
+    // SEC-F1 (#1289): numeric call-depth budget. ACPI 6.5 §5.7.5
+    // leaves the maximum "implementation defined"; without a cap
+    // a self-recursive method (`A` calls `A`) recursed until the
+    // stack gave out, bypassing the `While` iteration cap
+    // entirely — and each frame also copied the method body, so
+    // deep recursion burned heap as well as stack. At most
+    // `MAX_METHOD_CALL_DEPTH` method frames are live at once;
+    // the next nested call fails closed instead of recursing.
+    if depth >= crate::MAX_METHOD_CALL_DEPTH {
+        return Err(AmlError::RecursionDepthExceeded);
     }
     // 1. Look up the node.
     let node: AmlNode = crate::find_node(path).ok_or(AmlError::MethodNotFound)?;
@@ -200,6 +244,7 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
         None => "\\",
     };
     let mut state = EvalState::with_scope(args, scope);
+    state.call_depth = depth + 1;
     let mut cur = 0usize;
     match walk_term_list(&body, &mut cur, body.len(), &mut state)? {
         Signal::Return(v) => Ok(v),
@@ -549,7 +594,28 @@ pub fn skip_term_arg(bytes: &[u8], cur: &mut usize) -> Result<(), AmlError> {
 
 /// Walk a TermList bounded by `end` (exclusive index into `buf`).
 /// Returns when we hit `end`, `ReturnOp`, `BreakOp`, or `ContinueOp`.
+///
+/// Enforces the in-method nesting budget (SEC-F1, #1289) together
+/// with `eval_term_arg`: `If`/`While` bodies recurse into
+/// `walk_term_list`, so a method body of arbitrarily nested `If`s
+/// would otherwise recurse arbitrarily deep without ever touching
+/// the TermArg gauge. Same gauge, same cap.
 fn walk_term_list(
+    buf: &[u8],
+    cur: &mut usize,
+    end: usize,
+    state: &mut EvalState,
+) -> Result<Signal, AmlError> {
+    if state.nest_depth >= crate::MAX_EVAL_NESTING {
+        return Err(AmlError::RecursionDepthExceeded);
+    }
+    state.nest_depth += 1;
+    let result = walk_term_list_inner(buf, cur, end, state);
+    state.nest_depth -= 1;
+    result
+}
+
+fn walk_term_list_inner(
     buf: &[u8],
     cur: &mut usize,
     end: usize,
@@ -978,7 +1044,27 @@ fn eval_term(
                     for _ in 0..argc {
                         args.push(eval_term_arg(buf, cur, state)?);
                     }
-                    let _ = evaluate_method(&node.path, &args);
+                    // SEC-F1 (#1289): nested calls carry the
+                    // caller's live depth so the method-call
+                    // budget spans the whole chain, and a
+                    // budget exhaustion aborts the outer method
+                    // instead of being swallowed. Other failures
+                    // keep the pre-existing best-effort behaviour
+                    // (statement value discarded; a missing or
+                    // failing optional method must not abort the
+                    // caller — that compat question is out of
+                    // scope for this lane).
+                    match evaluate_method_with_depth(
+                        &node.path,
+                        &args,
+                        state.call_depth,
+                    ) {
+                        Ok(_) => {}
+                        Err(AmlError::RecursionDepthExceeded) => {
+                            return Err(AmlError::RecursionDepthExceeded);
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         }
@@ -1031,7 +1117,25 @@ fn eval_term(
 /// Evaluate the next TermArg at `*cur`, returning its Value.
 /// This is the recursive descent entry — it handles any opcode that
 /// produces a value.
+/// Evaluate one TermArg, enforcing the in-method nesting budget
+/// (SEC-F1, #1289). `state.nest_depth` counts live
+/// `eval_term_arg` / `walk_term_list` frames in this method; the
+/// gauge is per-frame (a fresh `EvalState` per method call), so
+/// sequential TermArgs each run at depth 1 while truly nested
+/// ones accumulate. Exhaustion fails closed with
+/// `RecursionDepthExceeded` — the caller must not substitute a
+/// default value.
 fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<Value, AmlError> {
+    if state.nest_depth >= crate::MAX_EVAL_NESTING {
+        return Err(AmlError::RecursionDepthExceeded);
+    }
+    state.nest_depth += 1;
+    let result = eval_term_arg_inner(buf, cur, state);
+    state.nest_depth -= 1;
+    result
+}
+
+fn eval_term_arg_inner(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<Value, AmlError> {
     let op = next_u8(buf, cur)?;
     let v = match op {
         // Constants
@@ -1553,12 +1657,38 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
                         for _ in 0..argc {
                             args.push(eval_term_arg(buf, cur, state)?);
                         }
-                        // Recursive evaluate_method. ACPI 6.5
-                        // §5.7.5 specifies a max recursion depth
-                        // of "implementation defined" — we lean
-                        // on the kernel stack guard (~64 KiB)
-                        // rather than imposing a numeric cap.
-                        evaluate_method(&node.path, &args).unwrap_or(Value::Integer(0))
+                        // Recursive evaluate_method, carrying the
+                        // caller's live depth (SEC-F1, #1289).
+                        // ACPI 6.5 §5.7.5 leaves the max depth
+                        // "implementation defined"; the numeric
+                        // cap in `crate::MAX_METHOD_CALL_DEPTH`
+                        // is now the policy. The old comment
+                        // claimed we "lean on the kernel stack
+                        // guard (~64 KiB)": there is no guard
+                        // page — the task stack is 32 KiB with
+                        // only a canary tripwire
+                        // (`scheduler/src/stackful.rs`), so the
+                        // guard was never a backstop, let alone
+                        // a policy.
+                        //
+                        // A budget exhaustion propagates as an
+                        // error so the whole evaluation fails
+                        // closed. Other failures keep the
+                        // pre-existing fallback to Integer(0)
+                        // (a missing optional helper must not
+                        // abort the caller — that compat question
+                        // is out of scope for this lane).
+                        match evaluate_method_with_depth(
+                            &node.path,
+                            &args,
+                            state.call_depth,
+                        ) {
+                            Ok(v) => v,
+                            Err(AmlError::RecursionDepthExceeded) => {
+                                return Err(AmlError::RecursionDepthExceeded);
+                            }
+                            Err(_) => Value::Integer(0),
+                        }
                     }
                     // BufferField read (audit #9). Returns the
                     // bit-slice as Integer (max 64 bits).
@@ -1855,6 +1985,16 @@ fn value_to_name_value(value: Value) -> NameValue {
 /// bodies — reachable for statically parsed names and package
 /// elements — decode from the AML store, mirroring the top-level
 /// name read in `eval_term_arg`.
+///
+/// NOTE (SEC-F1, #1289): this recurses over nested `Package`
+/// elements with no independent gauge. That is bounded by
+/// construction, not by luck: every stored `Package` is built
+/// either by the evaluator's `PackageOp` arm (nested through the
+/// `eval_term_arg` gauge, so at most `MAX_EVAL_NESTING` deep)
+/// or by `value_to_name_value` from an already-evaluated `Value`
+/// (same bound). If a future constructor ever builds a stored
+/// package outside the evaluator, this function needs its own
+/// depth parameter.
 fn name_value_to_value(nv: NameValue) -> Value {
     match nv {
         NameValue::Integer(v) => Value::Integer(v),
