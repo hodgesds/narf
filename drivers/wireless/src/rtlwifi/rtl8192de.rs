@@ -9,8 +9,9 @@
 //! tables each function/band/PA combination loads. Step 2 adds the
 //! firmware image + paged download ([`fw`]), the signed per-board
 //! power envelope ([`envelope`], 2.4 GHz only), the chip's own TX/RX
-//! descriptors ([`trx`]) and the packet owner ([`packet`]). It is not
-//! admitted yet (probe keeps it diagnostic); the power-on sequence,
+//! descriptors ([`trx`]) and the packet owner ([`packet`]). Step 3 adds
+//! the power-on sequence ([`power`]), the LLT ([`llt`]) and MAC init
+//! ([`mac`]). It is not admitted yet (probe keeps it diagnostic); the
 //! station chains, bands/HT/QoS/lifecycle, TX-power levels and the
 //! 5 GHz envelope are remainders.
 //!
@@ -32,12 +33,21 @@
 //! - [`envelope`] — the signed per-board power envelope (NAPC).
 //! - [`trx`] — the chip's own TX/RX descriptors.
 //! - [`packet`] — the packet owner (TX fill + RX decode).
+//! - [`power`] — power-on: `rtl92d_phy_set_poweron` + the
+//!   `_rtl92de_init_mac` power prefix through `REG_CR = 0x2ff`.
+//! - [`llt`] — the LLT table init (`_rtl92de_llt_table_init`).
+//! - [`mac`] — MAC init (`_rtl92de_init_mac` after the LLT),
+//!   `_rtl92de_hw_configure`, interrupt control, CAM reset and the
+//!   station identity.
 
 #![allow(dead_code)]
 
 pub mod envelope;
 pub mod fw;
+pub mod llt;
+pub mod mac;
 pub mod packet;
+pub mod power;
 pub mod tables;
 pub mod trx;
 

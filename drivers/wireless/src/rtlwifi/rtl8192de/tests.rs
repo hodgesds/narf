@@ -5,7 +5,7 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-fn check(cond: bool, msg: &str) -> TestResult {
+fn check(cond: bool, msg: &'static str) -> TestResult {
     if cond {
         TestResult::Pass
     } else {
@@ -197,7 +197,7 @@ kernel_test_in!(
 
 use super::{envelope, fw, packet, trx};
 use crate::rtlwifi::firmware_transport::{Error as FwError, Io};
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Firmware image bytes for header tests: 32-byte header + body, with
@@ -919,4 +919,454 @@ fn smoke_rtl8192de_packet_admission_and_fill() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_packet_admission_and_fill
+);
+
+// ── step 3: power-on + LLT + MAC init model ───────────────────────────────
+
+struct DeMacModel {
+    regs: Vec<u8>,
+    llt_writes: u32,
+    llt_stuck: bool,
+    apfm_clear_after: u32,
+    apfm_reads: u32,
+    poip_clear_after: u32,
+    poip_reads: u32,
+    apsd_set_after: u32,
+    apsd_reads: u32,
+}
+
+#[derive(Clone)]
+struct DeMacFake(Arc<IrqSafeSpinLock<DeMacModel>>);
+
+#[async_trait::async_trait]
+impl Io for DeMacFake {
+    fn read8(&self, reg: u16) -> Result<u8, FwError> {
+        let mut g = self.0.lock();
+        if reg == power::REG_APS_FSMCO + 1 {
+            g.apfm_reads += 1;
+            if g.apfm_reads >= g.apfm_clear_after {
+                g.regs[usize::from(reg)] &= !1;
+            }
+        }
+        if reg == power::REG_POWER_OFF_IN_PROCESS {
+            g.poip_reads += 1;
+            if g.poip_reads >= g.poip_clear_after {
+                g.regs[usize::from(reg)] &= !power::POWER_OFF_IN_PROCESS;
+            }
+        }
+        if reg == mac::REG_APSD_CTRL {
+            g.apsd_reads += 1;
+            if g.apsd_reads >= g.apsd_set_after {
+                g.regs[usize::from(reg)] |= 1 << 7;
+            }
+        }
+        Ok(g.regs[usize::from(reg)])
+    }
+    fn read32(&self, reg: u16) -> Result<u32, FwError> {
+        let g = self.0.lock();
+        let r = usize::from(reg);
+        Ok(u32::from_le_bytes([
+            g.regs[r],
+            g.regs[r + 1],
+            g.regs[r + 2],
+            g.regs[r + 3],
+        ]))
+    }
+    fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
+        self.0.lock().regs[usize::from(reg)] = value;
+        Ok(())
+    }
+    fn write16(&self, reg: u16, value: u16) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        let r = usize::from(reg);
+        g.regs[r..r + 2].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+    fn write32(&self, reg: u16, value: u32) -> Result<(), FwError> {
+        let mut g = self.0.lock();
+        let r = usize::from(reg);
+        g.regs[r..r + 4].copy_from_slice(&value.to_le_bytes());
+        if reg == llt::REG_LLT_INIT {
+            g.llt_writes += 1;
+            if !g.llt_stuck {
+                // Hardware completes the write: op field reads back
+                // NO_ACTIVE.
+                g.regs[r + 3] &= !0xc0;
+            }
+        }
+        Ok(())
+    }
+    fn write_bytes(&self, _reg: u16, _bytes: &[u8]) -> Result<(), FwError> {
+        Err(FwError::Access)
+    }
+    async fn delay_us(&self, _micros: u64) {}
+}
+
+fn de_mac_fake() -> DeMacFake {
+    DeMacFake(Arc::new(IrqSafeSpinLock::new(DeMacModel {
+        regs: vec![0u8; 0x2000],
+        llt_writes: 0,
+        llt_stuck: false,
+        apfm_clear_after: 3,
+        apfm_reads: 0,
+        poip_clear_after: 3,
+        poip_reads: 0,
+        apsd_set_after: 2,
+        apsd_reads: 0,
+    })))
+}
+
+fn de_mac_read16(io: &DeMacFake, reg: u16) -> u16 {
+    let g = io.0.lock();
+    u16::from_le_bytes([g.regs[usize::from(reg)], g.regs[usize::from(reg) + 1]])
+}
+
+fn de_mac_read32(io: &DeMacFake, reg: u16) -> u32 {
+    let g = io.0.lock();
+    let r = usize::from(reg);
+    u32::from_le_bytes([g.regs[r], g.regs[r + 1], g.regs[r + 2], g.regs[r + 3]])
+}
+
+/// `rtl92d_phy_set_poweron` + the `_rtl92de_init_mac` power prefix,
+/// single MAC on 2.4 GHz: band bit and MAC-ON land on `REG_MAC0`, the
+/// V11 resume writes land, `REG_CR` ends at `0x2ff`, DMA stop clears.
+fn smoke_rtl8192de_power_on_single() -> TestResult {
+    let io = de_mac_fake();
+    if narf_scheduler::block_on(power::power_on(
+        &io,
+        MacPhyMode::SingleMacSinglePhy,
+        0,
+        Band::On2Ghz,
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("8192DE single power-on failed");
+    }
+    let g = io.0.lock();
+    check(
+        g.regs[usize::from(power::REG_MAC0)] == power::MAC0_ON | (1 << 1)
+            && g.regs[usize::from(power::REG_MAC1)] == 0
+            && g.regs[usize::from(power::REG_RSV_CTRL)] == 0
+            && g.regs[usize::from(power::REG_LDOA15_CTRL)] == 0x05
+            && g.regs[usize::from(power::REG_SPS0_CTRL)] == 0x2b
+            && g.regs[usize::from(power::REG_AFE_XTAL_CTRL)] == 0x0f
+            && u16::from_le_bytes([g.regs[0x04], g.regs[0x05]]) == 0x1012
+            && g.regs[usize::from(power::REG_SYS_ISO_CTRL) + 1] == 0x82
+            && u16::from_le_bytes([g.regs[0x100], g.regs[0x101]]) == 0x2ff
+            && g.regs[usize::from(power::REG_PCIE_CTRL_REG) + 1] == 0,
+        "8192DE single power-on registers",
+    )
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_power_on_single
+);
+
+/// Dual MAC1 on 5 GHz: the band bit clears and `MAC1_ON` lands on
+/// `REG_MAC1`, and the power-off-in-process wait observes the other
+/// function finishing.
+fn smoke_rtl8192de_power_on_dual_mac1() -> TestResult {
+    let io = de_mac_fake();
+    io.0.lock().regs[usize::from(power::REG_POWER_OFF_IN_PROCESS)] = power::POWER_OFF_IN_PROCESS;
+    if narf_scheduler::block_on(power::power_on(
+        &io,
+        MacPhyMode::DualMacDualPhy,
+        1,
+        Band::On5Ghz,
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("8192DE dual MAC1 power-on failed");
+    }
+    let g = io.0.lock();
+    check(
+        g.regs[usize::from(power::REG_MAC1)] == power::MAC1_ON
+            && g.regs[usize::from(power::REG_MAC0)] == 0
+            && g.poip_reads >= 3
+            && g.regs[usize::from(power::REG_POWER_OFF_IN_PROCESS)] & power::POWER_OFF_IN_PROCESS
+                == 0,
+        "8192DE dual MAC1 power-on registers",
+    )
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_power_on_dual_mac1
+);
+
+/// Failure paths: a stuck `APFM_ONMAC` is a gate error; a stuck
+/// power-off-in-process wait is a deadline error.
+fn smoke_rtl8192de_power_on_failures() -> TestResult {
+    let stuck_apfm = de_mac_fake();
+    stuck_apfm.0.lock().apfm_clear_after = u32::MAX;
+    if narf_scheduler::block_on(power::power_on(
+        &stuck_apfm,
+        MacPhyMode::SingleMacSinglePhy,
+        0,
+        Band::On2Ghz,
+    )) != Err(FwError::Gate)
+    {
+        return TestResult::Fail("8192DE stuck APFM_ONMAC admitted");
+    }
+    let stuck_poip = de_mac_fake();
+    stuck_poip.0.lock().regs[usize::from(power::REG_POWER_OFF_IN_PROCESS)] =
+        power::POWER_OFF_IN_PROCESS;
+    stuck_poip.0.lock().poip_clear_after = u32::MAX;
+    if narf_scheduler::block_on(power::power_on(
+        &stuck_poip,
+        MacPhyMode::DualMacDualPhy,
+        0,
+        Band::On5Ghz,
+    )) != Err(FwError::Deadline)
+    {
+        return TestResult::Fail("8192DE stuck power-off wait admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_power_on_failures
+);
+
+/// LLT geometry per mode: single writes boundary 246 / max page 255 /
+/// RQPN `0x80bf0d29` with 256 links; dual writes 123 / 127 /
+/// `0x80750005` with 128 links; `REG_TRXFF_BNDY` keeps the live high
+/// word; PBP `0x11`, RX driver-info size 4.
+fn smoke_rtl8192de_llt_geometry() -> TestResult {
+    let single = de_mac_fake();
+    single.0.lock().regs[usize::from(llt::REG_TRXFF_BNDY) + 2] = 0x27;
+    if llt::init(&single, MacPhyMode::SingleMacSinglePhy).is_err() {
+        return TestResult::Fail("8192DE single LLT failed");
+    }
+    let g = single.0.lock();
+    let single_ok = g.llt_writes == 256
+        && u32::from_le_bytes([g.regs[0x200], g.regs[0x201], g.regs[0x202], g.regs[0x203]])
+            == 0x80bf_0d29
+        && u32::from_le_bytes([g.regs[0x114], g.regs[0x115], g.regs[0x116], g.regs[0x117]])
+            == 0x0027_00f6
+        && g.regs[usize::from(llt::REG_RQPN_NPQ)] == 0
+        && g.regs[usize::from(llt::REG_TDECTRL) + 1] == 246
+        && g.regs[usize::from(llt::REG_TXPKTBUF_BCNQ_BDNY)] == 246
+        && g.regs[usize::from(llt::REG_TXPKTBUF_MGQ_BDNY)] == 246
+        && g.regs[usize::from(llt::REG_LBK_BF_HD)] == 246
+        && g.regs[usize::from(llt::REG_PBP)] == 0x11
+        && g.regs[usize::from(llt::REG_RX_DRVINFO_SZ)] == 0x4;
+    drop(g);
+    if !single_ok {
+        return TestResult::Fail("8192DE single LLT registers");
+    }
+    let dual = de_mac_fake();
+    dual.0.lock().regs[usize::from(llt::REG_TRXFF_BNDY) + 2] = 0x13;
+    if llt::init(&dual, MacPhyMode::DualMacDualPhy).is_err() {
+        return TestResult::Fail("8192DE dual LLT failed");
+    }
+    let g = dual.0.lock();
+    if g.llt_writes != 128
+        || u32::from_le_bytes([g.regs[0x200], g.regs[0x201], g.regs[0x202], g.regs[0x203]])
+            != 0x8075_0005
+        || u32::from_le_bytes([g.regs[0x114], g.regs[0x115], g.regs[0x116], g.regs[0x117]])
+            != 0x0013_007b
+    {
+        return TestResult::Fail("8192DE dual LLT registers");
+    }
+    drop(g);
+    let stuck = de_mac_fake();
+    stuck.0.lock().llt_stuck = true;
+    if llt::init(&stuck, MacPhyMode::SingleMacSinglePhy) != Err(FwError::Deadline) {
+        return TestResult::Fail("8192DE stuck LLT admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_llt_geometry
+);
+
+/// `rtl92d_phy_config_maccoexist_rfpage` per mode: DMC, RX packet
+/// limit and the TRX FIFO boundary high word.
+fn smoke_rtl8192de_maccoexist_rfpage() -> TestResult {
+    let single = de_mac_fake();
+    if mac::maccoexist_rfpage(&single, MacPhyMode::SingleMacSinglePhy).is_err() {
+        return TestResult::Fail("8192DE single maccoexist page");
+    }
+    let g = single.0.lock();
+    let single_ok = g.regs[usize::from(mac::REG_DMC)] == 0x00
+        && g.regs[usize::from(mac::REG_RX_PKT_LIMIT)] == 0x10
+        && u16::from_le_bytes([g.regs[0x116], g.regs[0x117]]) == 0x27ff;
+    drop(g);
+    if !single_ok {
+        return TestResult::Fail("8192DE single maccoexist page");
+    }
+    let dual_single = de_mac_fake();
+    if mac::maccoexist_rfpage(&dual_single, MacPhyMode::DualMacSinglePhy).is_err() {
+        return TestResult::Fail("8192DE dual-single maccoexist page");
+    }
+    let g = dual_single.0.lock();
+    let dual_single_ok = g.regs[usize::from(mac::REG_DMC)] == 0xf8
+        && g.regs[usize::from(mac::REG_RX_PKT_LIMIT)] == 0x08
+        && u16::from_le_bytes([g.regs[0x116], g.regs[0x117]]) == 0x13ff;
+    drop(g);
+    if !dual_single_ok {
+        return TestResult::Fail("8192DE dual-single maccoexist page");
+    }
+    let dual = de_mac_fake();
+    if mac::maccoexist_rfpage(&dual, MacPhyMode::DualMacDualPhy).is_err() {
+        return TestResult::Fail("8192DE dual-dual maccoexist page");
+    }
+    let g = dual.0.lock();
+    let dual_ok = g.regs[usize::from(mac::REG_DMC)] == 0x00
+        && g.regs[usize::from(mac::REG_RX_PKT_LIMIT)] == 0x08
+        && u16::from_le_bytes([g.regs[0x116], g.regs[0x117]]) == 0x13ff;
+    drop(g);
+    if !dual_ok {
+        return TestResult::Fail("8192DE dual-dual maccoexist page");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_maccoexist_rfpage
+);
+
+/// End-to-end step 3 for dual-dual MAC0 on 5 GHz: power-on, LLT,
+/// MAC init, HW configure, interrupt enable/disable, RCR trim, CAM
+/// reset and station identity — the full register state Linux's
+/// `_rtl92de_init_mac` + `_rtl92de_hw_configure` leave behind, minus
+/// the descriptor bases (deferred to `Prepared`) and the PHY/BB/RF
+/// steps (later lanes).
+fn smoke_rtl8192de_mac_init_end_to_end() -> TestResult {
+    let io = de_mac_fake();
+    io.0.lock().regs[usize::from(power::REG_POWER_OFF_IN_PROCESS)] = power::POWER_OFF_IN_PROCESS;
+    io.0.lock().regs[usize::from(llt::REG_TRXFF_BNDY) + 2] = 0x27;
+    if narf_scheduler::block_on(power::power_on(
+        &io,
+        MacPhyMode::DualMacDualPhy,
+        0,
+        Band::On5Ghz,
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("8192DE e2e power-on failed");
+    }
+    if llt::init(&io, MacPhyMode::DualMacDualPhy).is_err() {
+        return TestResult::Fail("8192DE e2e LLT failed");
+    }
+    if narf_scheduler::block_on(mac::init_mac(&io, MacPhyMode::DualMacDualPhy)).is_err() {
+        return TestResult::Fail("8192DE e2e init_mac failed");
+    }
+    if mac::hw_configure(&io, MacPhyMode::DualMacDualPhy).is_err() {
+        return TestResult::Fail("8192DE e2e hw_configure failed");
+    }
+    // Snapshot the byte-wide registers under one lock, then check the
+    // word/dword registers through the helpers (which lock themselves).
+    let g = io.0.lock();
+    let hisre = g.regs[usize::from(mac::REG_HISRE)];
+    let fwhw_txq_hi = g.regs[usize::from(mac::REG_FWHW_TXQ_CTRL) + 1];
+    let reg_4d0 = g.regs[0x04d0];
+    let pcie_3 = g.regs[usize::from(mac::REG_PCIE_CTRL_REG) + 3];
+    let apsd = g.regs[usize::from(mac::REG_APSD_CTRL)];
+    let inirts = g.regs[usize::from(mac::REG_INIRTS_RATE_SEL)];
+    let bwopmode = g.regs[usize::from(mac::REG_BWOPMODE)];
+    let slot = g.regs[usize::from(mac::REG_SLOT)];
+    let ampdu_min_space = g.regs[usize::from(mac::REG_AMPDU_MIN_SPACE)];
+    let hwseq = g.regs[usize::from(mac::REG_HWSEQ_CTRL)];
+    let atimwnd = g.regs[usize::from(mac::REG_ATIMWND)];
+    let bcn_max_err = g.regs[usize::from(mac::REG_BCN_MAX_ERR)];
+    let bcn_ctrl = g.regs[usize::from(mac::REG_BCN_CTRL)];
+    let tbtt_prohibit_1 = g.regs[usize::from(mac::REG_TBTT_PROHIBIT) + 1];
+    let pifs = g.regs[usize::from(mac::REG_PIFS)];
+    let aggr_break = g.regs[usize::from(mac::REG_AGGR_BREAK_TIME)];
+    let ackto = g.regs[usize::from(mac::REG_ACKTO)];
+    drop(g);
+    if de_mac_read32(&io, mac::REG_HISR) != u32::MAX
+        || hisre != 0xff
+        || de_mac_read16(&io, mac::REG_TRXDMA_CTRL) != 0xf771
+        || fwhw_txq_hi != 0x1f
+        || de_mac_read16(&io, mac::REG_FWHW_TXQ_CTRL) != 0x1f80
+        || de_mac_read32(&io, mac::REG_RCR) != mac::RCR
+        || de_mac_read32(&io, mac::REG_TCR) != mac::TCR
+        || reg_4d0 != 0
+        || pcie_3 != mac::PCIE_CTRL_REG_3
+        || de_mac_read32(&io, mac::REG_INT_MIG) != 0
+        || apsd & (1 << 6) != 0
+        || de_mac_read32(&io, mac::REG_MCUTST_1) != 0
+        || inirts != 0x8
+        || bwopmode != mac::BWOPMODE_20MHZ
+        || de_mac_read32(&io, mac::REG_RRSR) != mac::RRSR
+        || slot != 0x09
+        || ampdu_min_space != 0
+        || de_mac_read16(&io, mac::REG_RL) != 0x0707
+        || de_mac_read32(&io, mac::REG_BAR_MODE_CTRL) != 0x0201_2802
+        || hwseq != 0xff
+        || de_mac_read32(&io, mac::REG_DARFRC) != 0x0100_0000
+        || de_mac_read32(&io, mac::REG_DARFRC + 4) != 0x0706_0504
+        || de_mac_read32(&io, mac::REG_RARFRC) != 0x0100_0000
+        || de_mac_read32(&io, mac::REG_RARFRC + 4) != 0x0706_0504
+        || de_mac_read32(&io, mac::REG_AGGLEN_LMT) != 0xb972_6641
+        || atimwnd != 0x2
+        || bcn_max_err != 0x0a
+        || bcn_ctrl != 0x1f
+        || tbtt_prohibit_1 != 0xff
+        || pifs != 0x1c
+        || aggr_break != 0x16
+        || de_mac_read16(&io, mac::REG_NAV_PROT_LEN) != 0x0020
+        || de_mac_read16(&io, mac::REG_FAST_EDCA_CTRL) != 0x6666
+        || ackto != 0x40
+        || de_mac_read16(&io, mac::REG_SPEC_SIFS) != 0x1010
+        || de_mac_read16(&io, mac::REG_MAC_SPEC_SIFS) != 0x1010
+        || de_mac_read16(&io, mac::REG_SIFS_CTX) != 0x1010
+        || de_mac_read16(&io, mac::REG_SIFS_TRX) != 0x1010
+        || de_mac_read32(&io, mac::REG_MAR) != u32::MAX
+        || de_mac_read32(&io, mac::REG_MAR + 4) != u32::MAX
+    {
+        return TestResult::Fail("8192DE e2e MAC registers");
+    }
+    if mac::enable_interrupt(&io).is_err()
+        || de_mac_read32(&io, mac::REG_HIMR) != mac::IRQ_MASK.0
+        || de_mac_read32(&io, mac::REG_HIMRE) != mac::IRQ_MASK.1
+        || mac::disable_interrupt(&io).is_err()
+        || de_mac_read32(&io, mac::REG_HIMR) != 0
+        || de_mac_read32(&io, mac::REG_HIMRE) != 0
+    {
+        return TestResult::Fail("8192DE e2e interrupt masks");
+    }
+    match mac::trim_receive_config(&io) {
+        Ok(rcr) if rcr == mac::RCR & !mac::RCR_ACRC32_AICV => {}
+        _ => return TestResult::Fail("8192DE e2e RCR trim"),
+    }
+    if mac::cam_reset(&io).is_err()
+        || de_mac_read32(&io, mac::REG_CAMCMD) != mac::CAM_RESET
+        || mac::station_identity(&io, &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]).is_err()
+    {
+        return TestResult::Fail("8192DE e2e CAM / station identity");
+    }
+    let g = io.0.lock();
+    let identity_ok = g.regs[usize::from(mac::REG_SECCFG)] == 0
+        && g.regs[usize::from(mac::REG_MACID)] == 0x00
+        && g.regs[usize::from(mac::REG_MACID) + 5] == 0x55;
+    drop(g);
+    if !identity_ok {
+        return TestResult::Fail("8192DE e2e CAM / station identity");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_mac_init_end_to_end
+);
+
+/// The `REG_APSD_CTRL` BIT(7) poll proceeds after 200 reads even when
+/// the bit never sets, exactly as Linux does — it is not a failure.
+fn smoke_rtl8192de_apsd_poll_proceeds() -> TestResult {
+    let io = de_mac_fake();
+    io.0.lock().apsd_set_after = u32::MAX;
+    if narf_scheduler::block_on(mac::init_mac(&io, MacPhyMode::SingleMacSinglePhy)).is_err()
+        || io.0.lock().apsd_reads != 201
+    {
+        return TestResult::Fail("8192DE APSD poll did not proceed after 200 reads");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_apsd_poll_proceeds
 );
