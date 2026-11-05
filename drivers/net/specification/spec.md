@@ -456,24 +456,35 @@ frame itself and builds its descriptors from the shared builders.
   PHY tables are future work; r8169 decodes the version but
   transcribes no 8168 revision table.
 - **RSS (RTL8127 only).** Linux enables RSS only on VER_80.
-  The steering register programming (key / indirection /
-  control / queue-count / descriptor-type, via
-  `features::apply_rss`) is implemented and wired as a dormant
-  `Rtl8127Nic::configure_rss` method, but it is NOT enabled at
-  bring-up: enabling it needs a multi-ring datapath (per-queue
-  descriptor bases, RSS descriptor format, per-queue pumps,
-  30 MSI-X vectors) that the current single-consumer
-  `Interface` cannot express. Bring-up keeps Linux's
-  single-queue behavior (`RSS_CTRL` = 0), and RSS is not
-  advertised in caps/offloads. The other three drivers hold
-  RSS off, matching Linux.
+  Bring-up selects the RX queue count by Linux's rule
+  (`rounddown_pow2(min(cpu_count, 8))`, minimum 1); when it
+  is ≥ 2 it programs the steering registers (key /
+  indirection / control / queue-count / descriptor-type, via
+  `features::apply_rss`), allocates one RX descriptor ring +
+  buffer pool per queue (queue 0 at `REG_RDSAR`, queues 1..N
+  at `RDSAR_Q1_LOW + (q-1)*8`), switches every queue to the
+  RSS descriptor format, spawns one RX pump per queue, and
+  attempts up to 30 MSI-X vectors with a single-vector
+  fallback. `Interface` reports the live queue count, the
+  active `RssConfig`, and per-queue affinity, and `caps`
+  gains `NicCaps::RSS` (RSS has no `OffloadCapabilities`
+  field). On a 1-CPU boot bring-up keeps Linux's
+  single-queue behavior (`RSS_CTRL` = 0) and RSS is not
+  advertised. The pumps are polled, so per-queue vectors are
+  device configuration for future IRQ use; live multi-queue
+  validation is silicon-only (QEMU does not emulate an
+  8127). The other three drivers hold RSS off, matching
+  Linux.
 - **Tests.** The shared model carries register-conversation
   fixtures (`RegLog`-backed smokes) for C+CR, VLAN, WoL, EEE,
   jumbo, RSS programming, XID decode, transport parsing, RX
   checksum decode, and offload word layout; each driver keeps
   its existing kernel-test smokes plus PHY-table/firmware
-  coverage where it has tables. No silicon testing was
-  possible; QEMU does not emulate these chips.
+  coverage where it has tables. RTL8127 adds multi-ring
+  smokes (queue-count selection, per-queue bases, MSI-X
+  count, RSS-format checksum decode, RSS fill/rearm words,
+  indirection balance and routing properties). No silicon
+  testing was possible; QEMU does not emulate these chips.
 
 ## 4. Invariants & safety properties
 

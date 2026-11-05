@@ -19,7 +19,7 @@ simplicity), one MSI-X vector for link / RX completion, and a
 `HwNic` adapter exposing the same surface the e1000/mlx5 drivers
 do.
 
-Does NOT own: DCB, FCoE, SR-IOV, RSS, VMDq.
+Does NOT own: FCoE, SR-IOV, RSS, VMDq.
 
 ## 2. PCI match
 
@@ -72,12 +72,14 @@ All registers are 4-byte little-endian (host order). Offsets per
 | 0x06018+0x40*n | TDT[n]   | TX desc tail                         |
 | 0x06028+0x40*n | TXDCTL[n] | TX queue enable (bit 25) + thresholds |
 | 0x08120   | MTQC      | Multiple TX Queues Command (0 = non-DCB/non-VT, queues 0..63) |
-| 0x0EB00+4*n | RETA[n] | RSS redirection table (n=0..31, see §10) |
-| 0x0EB80+4*n | RSSRK[n] | RSS random key (n=0..9, see §10)    |
-| 0x0EC80   | MRQC      | Multiple RX Queues Command (see §10) |
+| 0x05C00+4*n | RETA[n] | RSS redirection table (n=0..31, see §10; native alias 0x0EB00+4*n) |
+| 0x05C80+4*n | RSSRK[n] | RSS random key (n=0..9, see §10; native alias 0x0EB80+4*n)    |
+| 0x05818   | MRQC      | Multiple RX Queues Command (see §10; native alias 0x0EC80) |
 | 0x04200   | LINKS     | LINK_UP = bit 30                     |
 | 0x04074   | GPRC      | Good Packets Received Count (RC, see §13) |
 | 0x04080   | GPTC      | Good Packets Transmitted Count (RC, see §13) |
+| 0x01030+0x40*n | QPRC[n] | Queue packets received count, RC (n=0..15, see §13i) |
+| 0x06030+0x40*n | QPTC[n] | Queue packets transmitted count, RC (n=0..15, see §13i) |
 | 0x10010   | EERD      | EEPROM Read (legacy 82599 path)      |
 
 Per-queue stride is 0x40 bytes. RX queues 0..63 use the 0x01000
@@ -160,11 +162,11 @@ fake bank plus IVAR sibling-preservation checks.
 ## 10. RSS
 
 `drivers/net/ixgbe/src/ixgbe/rss.rs` programs RSS-only mode
-(MRQC at 0x0EC80, MRQE = 0001b = single 16-queue set, all six
+(MRQC at 0x05818, MRQE = 0001b = single 16-queue set, all six
 hash-field enables: TcpIPv4/IPv4/IPv6/TcpIPv6/UdpIPv4/UdpIPv6),
-the 40-byte key into RSSRK[0..9] (0x0EB80 + 4*n, little-endian
+the 40-byte key into RSSRK[0..9] (0x05C80 + 4*n, little-endian
 words), and the 128-entry balanced indirection table into
-RETA[0..31] (0x0EB00 + 4*n, 4-bit entries). The key and table
+RETA[0..31] (0x05C00 + 4*n, 4-bit entries). The key and table
 come from `narf_net::rss` (standard conformance key + balanced
 table), so hardware steering equals `RssConfig::rx_queue` for
 the same frame — fixtures assert that agreement plus the
@@ -174,6 +176,22 @@ the state; `HwNic`/`Interface::rss()` expose it and `caps()`
 gains `RSS` once programmed. Bring-up leaves RSS off (queue 0
 only) until configured; reprogramming requires RX disabled.
 FlowDirector/ATR stays a follow-up (§14).
+
+Register-map authority (issue #1397, resolved): the 82599
+datasheet (rev. 2.6, 322429-007) dual-maps MRQC/RSSRK/RETA —
+§8.2.3.7.12 lists MRQC at 0x0EC80 / 0x05818, §8.2.3.7.14 RSSRK
+at 0x0EB80 / 0x05C80, §8.2.3.7.15 RETA at 0x0EB00 / 0x05C00,
+each "also mapped ... to maintain compatibility with the
+82598". Neither the old RSS path (0x0E block) nor the VMDq
+path (0x05 block, PR #1398) programmed a wrong register: both
+aliases are the same physical registers. `ixgbe/regs.rs` is the
+single authority both paths must import (canonical = 0x05
+block, following Linux's shipping map; native aliases kept
+as pinned constants, not programmed), and the alias-map
+fixture pins the pairing. The remaining VMDq+RSS composition
+work is the MRQE mode value (0xB = 64 pools + RSS per
+§8.2.3.7.12) + per-pool RETA, on the VMDq path — not an
+address question.
 
 ## 11. VLAN filtering
 
@@ -199,10 +217,11 @@ PME_Status bit 2), WUS at 0x05810 (RW1C, same bits + MNG 8),
 IP4AT at 0x05840 + 8*n (n = 0..3) and IP6AT at 0x05880 + 4*n.
 `Ixgbe::configure_wol` arms (clear status, program WUFC, set
 PME_En) and records the config; `wol_status` decodes WUS.
-Per-part rule: 82599EB only. X540/X550EM_x are NOT armed (their
-datasheets were not consulted here); X550 is additionally
-LOM/board-gated per Intel adapter guidance, so it is not armed
-blindly either. IPAV is NOT programmed: the datasheet text
+Per-part rule: 82599EB by its datasheet rule; X540/X550/X550EM_x
+only when the board record permits (Linux EEPROM-cap rule — see
+§13g). Nothing arms by default: without a permitting record,
+X540+ stays unarmed, and X550's LOM/board gating IS the record.
+IPAV is NOT programmed: the datasheet text
 extracted ambiguously ("0x5838"), so it is a remainder (§14),
 not a guessed value.
 
@@ -232,7 +251,8 @@ device stays quiesced and the caller may re-probe.
 Probe records `ETHTOOL_GDRVINFO` data via
 `narf_net::iface::set_driver_info` (driver "ixgbe", version
 "0.1.0", PCIe bus address per the igb pattern) and the honest
-offload set via `set_offloads` (TX checksum only). The
+offload set via `set_offloads` (TX checksum, TSO to the `tx()`
+bound, VLAN insertion). The
 driver-side snapshot is `drivers/net/ixgbe/src/ixgbe/
 ethtool.rs`: `EthtoolInfo` (identity, MTU, link, queue counts,
 caps word, RSS/VLAN/WoL state) plus `read_stats`, which reads
@@ -240,9 +260,71 @@ GPRC (0x04074) / GPTC (0x04080) — both RC, so snapshots are
 interval counters, not lifetime totals. `Ixgbe::ethtool_info`
 builds the snapshot on demand. Honest advertisement: RX
 checksum is NOT claimed (the decoder exists but is not plumbed
-into frame metadata), TSO claims no bound (the send path caps
-frames at 1518 bytes), and VLAN insertion is NOT claimed (RX
-filtering only).
+into frame metadata); TSO claims the `tx()` bound (4096 bytes;
+`tx_frame()` runs to 16384, see §13j); VLAN insertion IS
+claimed (`TxMeta::vlan_tag` rides the context descriptor +
+VLE). VLAN + checksum offload without TSO is rejected, not
+advertised (see §13j).
+
+## 13j. TX VLAN insertion + TSO frame-cap fix (#1269)
+
+`tx()` and `tx_frame()` plan each transmit with `tx_plan`,
+which returns an optional context descriptor plus the data
+descriptor. When TSO and/or VLAN insertion is requested, the
+context goes in slot S and the data descriptor in slot S+1
+(the tail advances past both; DD is polled on the data
+descriptor only — context descriptors carry no DD
+write-back). Frames with neither keep the old 1-slot form.
+
+VLAN insertion: the context descriptor's `vlan_macip_lens`
+carries the full 16-bit TCI (VID + PCP + CFI) in bits 31:16,
+and the data descriptor sets DCMD.VLE (0x40000000). MACLEN
+stays 14 with insertion (the tag is hardware-added, not
+driver-supplied). The inserted TPID is the VLNCTRL.VET
+default 0x8100; the TX path does not program VLNCTRL.
+
+TSO: `parse_tso_headers` accepts IPv4/TCP only (untagged
+frames; a tagged frame is a distinct error — strip the tag
+or request `vlan_tag` insertion). The context carries
+MACLEN/IPLEN/L4LEN, TUCMD IPV4|L4T_TCP, and MSS; the data
+descriptor sets TSE. PAYLEN is the TCP payload size only
+(frame length minus headers) — the old `with_tso` full-frame
+PAYLEN was wrong for TSO. Single-send PAYLEN stays the full
+frame size.
+
+Bounds: non-TSO frames keep the 1518 cap. TSO frames run to
+4096 through `tx()` (the per-slot copy-buffer size) and to
+16384 through `tx_frame()` (Linux's per-descriptor data
+length, `IXGBE_MAX_DATA_PER_TXD`). The advertised
+`max_tso_bytes` is 4096 — the bound the registered send
+path (`ixgbe_send_frame` → `tx()`) honors. Larger TSO needs
+multi-descriptor scatter (see §14).
+
+Advertisement: `caps()` adds `NicCaps::TSO` unconditionally
+(the path now honors TSO); `VLAN_TAGGING` keeps its RX-filter
+meaning. Probe `set_offloads` is `tx_checksum: true`,
+`max_tso_bytes: 4096`, `vlan_insert: true`.
+
+Rejected, not silently mis-sent: TSO with mss 0; VLAN +
+checksum offload without TSO (the csum path programs no
+context, so a VLAN context with IPLEN 0 would misplace the
+hardware checksum computation); TSO on a tagged or non-IPv4
+frame; IPv6 TSO (v4-only context constructor).
+
+Grounding: Linux ixgbe @ cbbddb6 — VLE
+`ixgbe_type.h:2962`, tag bits `ixgbe.h:166,169` +
+`ixgbe_main.c` csum/TSO paths, per-descriptor cap
+`ixgbe.h:250-251` + split loop `ixgbe_main.c:9010`, PAYLEN
+`ixgbe_main.c:8916,8980`; datasheet rev. 2.0 §7.2.3.2.2
+(context layout, MACLEN table, "MSS is ignored when TSE is
+not set") and §7.2.3.2.4 (VLE, DTALEN 15.5 KB, PAYLEN
+single-send vs TSO, 256 KB TSO).
+
+Smokes: VLE bit + context packing (VLAN-only and TSO+VLAN),
+TSO header parsing incl. options and all rejections, TSO
+PAYLEN split, and the full `tx_plan` matrix (plain / TSO /
+VLAN-only / VLAN+TSO / VLAN+csum rejection / mss-0
+rejection).
 
 ## 13c. Flow Director (FDIR)
 
@@ -280,6 +362,49 @@ is split into two 32-bit writes (hash, then command) because
 `RegBank` is 32-bit. Section number is letter-suffixed so it
 merges cleanly against §13b regardless of landing order.
 
+## 13d. DCB (Refs #1263)
+
+`drivers/net/ixgbe/src/ixgbe/dcb.rs` programs Data Center
+Bridging, opt-in via `Ixgbe::configure_dcb` (call before bringing
+up traffic: the MTQC write reinterprets the queue layout).
+Surface, all transcribed from Linux ixgbe @ cbbddb6 (see the
+module header for the full grounding note): MTQC mode (non-VT
+rows only: RT_ENA|8TC_8TQ = 0xD, RT_ENA|4TC_4TQ = 0x9, with the
+TX descriptor arbiter disabled around the write and
+SECTXMINIFG |= 0x1F00); packet-buffer partitioning, EQUAL
+strategy (RX (512 or 384 KiB)/num << 10, TX 160 KiB/num,
+TXPBTHRESH = TX/1024 - 10, unused TCs zeroed); RX packet
+arbiter (RTRPCS disable, RTRUP2TC UP map, RTRPT4C per-TC
+credits with LSP only, RTRPCS enable); TX descriptor arbiter
+(128 per-queue credits cleared, RTTDT2C per-TC credits,
+RTTDCS = TDPAC|TDRM); TX packet arbiter (RTTPCS disable with
+ARBD_DCB, RTTUP2TC UP map, RTTPT2C per-TC credits, RTTPCS
+enable); PFC (FCCFG priority FC, MFLCN per-TC bits on X540+
+else the single RPFCE bit, per-TC FCRTL/FCRTH watermarks with
+the RXPBSIZE-24 KiB guard for disabled TCs, FCTTV pause time,
+FCRTV refresh); TC statistics (RQSMR 16 queues per TC, TQSM
+32/32/16/16/8/8/8/8). The config struct carries explicit
+per-TC credits; the pure `ieee_credits` helper ports Linux's
+IEEE 802.1Qaz credit computation for callers starting from
+bandwidth percentages. Queue plan: TX 32/32/16/16/8/8/8/8, RX
+16 per TC; with the 1/1 probe, queue 0 belongs to TC0.
+
+⚠️ Grounding status (do not soften): Linux-only. Issue #1263
+asks for datasheet grounding for the DCB/TC registers + MTQC
+DCB rows, and no 82599/X540/X550 datasheet copy exists in this
+workspace; the sole in-tree corroboration is MTQC's address
+0x08120 (§3 table). Re-grounding against the datasheet is a
+follow-up. Composition notes: MTQC VT rows belong to #1398
+(SR-IOV, unmerged) — whoever lands second reconciles MTQC
+into one setup covering VT×DCB combos; RSS composition is
+unvalidated (different queue-layout assumptions — callers
+pick one mode); DCBx negotiation, CEE bandwidth-group
+credits, IPv6-style extras, and a DCB disable path are NOT
+implemented (re-probe restores non-DCB mode).
+
+Lettering note: §13d anticipates #1398's §13b (VMDq) and
+#1400's §13c (FlowDirector), so the three sections merge
+cleanly regardless of landing order.
 ## 13f. EEE control/status (Linux model, no MAC registers)
 
 EEE in Linux ixgbe has no MAC register programming: `get_eee`
@@ -333,6 +458,101 @@ actually enable EEE. `EthtoolInfo` is unchanged: the
 snapshot cannot populate EEE state from hardware without
 those transports, so EEE status is reported through
 `eee_status()`, not the snapshot.
+
+## 13g. X540 WoL grounding + X550 LOM opt-in (Linux model)
+
+Grounding: Linux ixgbe @ `cbbddb6` — the X540/X550 datasheets
+were NOT consulted, so this section is Linux-transcribed, not
+datasheet-grounded (same standing as §13b–§13f, which are
+unmerged drafts on sibling branches; whoever lands second must
+union the §1/§14 areas, not overwrite them).
+
+X540 verdict: SUPPORTED, via the shared wake block. Linux's
+shutdown path programs `IXGBE_WUFC` with the stored filter word
+for 82599/X540/X550/X550EM_x alike (`ixgbe_main.c`
+`__ixgbe_shutdown`), and `pci_wake_from_d3` is enabled for the
+same set — there are no X540-specific wake registers and no
+per-part WoL ops. The in-tree `WolConfig::arm` conversation
+(WUS clear, WUFC program, WUC.PME_En) is therefore the X540
+conversation too, pinned by the §13g smoke.
+
+The gate is a board record, not a device ID. Linux's
+`ixgbe_wol_supported` (`ixgbe_main.c:11375`) reads the EEPROM
+DEVICE_CAPS word at probe (`hw->eeprom.ops.read(hw, 0x2c, ...)`
+at `:11913`) and, for mac.type >= X540 (enum order
+`ixgbe_type.h:3216-3220`: 82598EB < 82599EB < X540 < X550 <
+X550EM_x), arms WoL only when the masked cap word permits:
+`wol_cap = eeprom_cap & 0xC` (`ixgbe_type.h:2179-2181`:
+PORT0_1 0x4, PORT0 0x8, MASK 0xC); cap 0x4 permits any function,
+cap 0x8 permits function 0 only (`hw->bus.func == 0`), anything
+else — including 0xC, both bits set, which the equality
+comparisons reject — permits nothing. 82599 and older use a
+subdevice table instead; 82598 never wakes.
+
+X550 LOM verdict: the same rule. Linux has no separate LOM
+concept in `ixgbe_wol_supported` — the board's EEPROM image IS
+the LOM/board opt-in, and a board that does not opt in never
+wakes. Intel's adapter guidance (most 10 GbE adapters do not
+support WoL; X550 supports it as LAN on Motherboard when the
+board enables it) is consistent with this mechanism.
+
+NARF design (`wol.rs` `WolBoardCap`, `wol_allowed`,
+`Ixgbe::set_wol_board_cap`): the record carries the raw cap
+bits plus the device's PCI function number, and `allows()`
+implements the Linux rule literally, including the 0xC
+rejection and the mask-then-compare order (so 0x14 masks to
+0x4 and permits). The default record permits nothing;
+`configure_wol` and `suspend` gate on `wol_allowed`, and the
+ethtool snapshot's `wol_supported` reflects the gated verdict.
+Setting a record arms nothing by itself. One deliberate
+difference from Linux: Linux arms magic-packet-only by default
+at probe when `wol_enabled` (`adapter->wol = IXGBE_WUFC_MAG`
+at `:11916-11917`); NARF arms only on an explicit
+`configure_wol` / suspend-with-config call — no probe-time
+default arming.
+
+Remainders: X540/X550 datasheet re-grounding (this section is
+Linux-only); an EEPROM word-0x2c reader via the existing EERD
+helper so the record can one day come from hardware instead of
+board configuration; X550EM_A / E610 DIDs (same Linux rule
+applies when they land); the 82599 subdevice table (NARF does
+not track subdevice IDs; the 82599EB datasheet rule stands).
+
+## 13i. Per-queue statistics (QPRC/QPTC)
+
+Datasheet-grounded (82599 rev. 2.0 §8.2.3.23.74/.78), corroborated
+by Linux ixgbe (`ixgbe_type.h:860-861`, `ixgbe_main.c` "16
+register reads" loop, `ixgbe_ethtool.c` register dump):
+
+- QPRC[n] at 0x01030 + 0x40*n, n = 0..15, RC: packets received
+  for the queue. FCoE packets count even when posted only to the
+  DDP queue (no trace in the legacy queue).
+- QPTC[n] at 0x06030 + 0x40*n, n = 0..15, RC: packets transmitted
+  for the queue (forwarded to the MAC and/or the internal Tx-to-Rx
+  switch). Packets dropped by anti-spoofing filtering or VLAN tag
+  validation are NOT counted. The datasheet also maps QPTC at
+  0x08680 + 0x4*n; this driver reads the 82598-compatible
+  0x06030 + 0x40*n mapping, which is the one Linux reads.
+- Both counters are RC (read-clear), like GPRC/GPTC: a snapshot
+  consumes the interval since the last read. `read_queue_stats`
+  reads min(num_rx_queues, 16) QPRC and min(num_tx_queues, 16)
+  QPTC registers into `QueueStats` (arrays of 16 plus
+  `rx_valid`/`tx_valid` counts); `EthtoolInfo` carries it as
+  `queue_stats`, read by the same `ethtool_info` call as the
+  totals, so one snapshot consumes every interval counter.
+  `summary()` keeps the totals line unchanged; per-queue detail
+  lives in the struct field.
+- The 16-queue bound is hardware, not policy: the QPRC block ends
+  where QPRDC begins (0x01430 = 0x01030 + 16*0x40), and Linux
+  reads exactly 16. A 64-queue bring-up therefore reports only
+  the first 16 queues per-queue; queues >= 16 have no per-queue
+  packet counter, and their traffic remains visible only in the
+  GPRC/GPTC totals.
+- Part scope: Linux reads this block for every mac type in the
+  family (82599EB, X540, X550, X550EM_x, x550em_a, e610) with no
+  per-part gating. The 82599 datasheet grounds the addresses;
+  X540/X550 datasheet re-grounding stays open under #1266's
+  remainders.
 
 ## 13l. Resume ring rebuild (issue #1271 decision: rebuild, not re-probe)
 
@@ -397,17 +617,23 @@ Remainders (not silently dropped):
 - No `CTRL.RST` means a device that wedges across suspend
   (rather than merely losing state) is not reset by this
   path; that recovery belongs to the same future lane.
+
 ## 14. Sequenced follow-ups (not silently dropped)
 
 Per the v0.1 exclusion list, still open after this stream:
 
 - SR-IOV / VMDq (MRQC virtualization modes, PFVTCTL, VF
   registers) — needs the virtualization programming model.
+  The #1397 address question is settled (datasheet dual-map;
+  `ixgbe/regs.rs` is the shared authority): what remains is
+  the MRQE 0xB + per-pool RETA composition on the VMDq path.
 - FlowDirector remainders (see §13c): TX sampling hook for ATR
   (packet parser + sample-rate policy + queue binding), IPv6
   perfect filters, persistent filter list with restore on
   reinit, cloud / MACVLAN filter modes.
-- DCB (MTQC RT_Ena, RTRUP2TC, packet-buffer partitioning).
+- DCB — see §13d (Refs #1263; Linux-grounded, datasheet
+  re-grounding + MTQC VT×DCB reconciliation + DCBx + CEE
+  credits + disable path remain).
 - FCoE (FCRETA, FCRXCTRL) — out of the Ethernet scope.
 - EEE: model + capability gate + FW-PHY decode + ACI cap
   computation landed (§13f); remainders are datasheet
@@ -416,13 +642,34 @@ Per the v0.1 exclusion list, still open after this stream:
   device support.
 - Per-queue DMA rings + pumps for queues 1..63, and per-queue
   MSI-X vectors beyond the shared misc vector.
-- X540 / X550EM_x WoL grounding (X540 datasheet not consulted;
-  X550 WoL is LOM/board-gated — see §12).
+- X540 / X550EM_x WoL grounding + X550 LOM opt-in — landed as
+  the Linux-cap-rule model (§13g); remainders are datasheet
+  re-grounding, the EEPROM word-0x2c reader, and E610/X550EM_A
+  DIDs.
 - IPAV (0x05838 candidate) — datasheet text extraction was
   ambiguous, so it is not programmed; see §12.
-- Per-queue statistics counters (QPRC/QPTC offsets ungrounded).
+- Per-queue statistics counters (QPRC/QPTC) — landed (§13i);
+  QPRDC (per-queue drops) and QBRC/QBTC (per-queue bytes) remain
+  as follow-ups.
 - Resume full-reconfigure (RAR / RSS / VLAN / MSI-X restore)
   for suspends that lose non-DMA state — see §13l.
+- IPv6 TSO (the TSO context constructor is v4-only; the parser
+  rejects non-IPv4 frames — a v6 constructor + parser leg is a
+  separate change).
+- Multi-descriptor TSO scatter for frames above 16384 bytes, and
+  `tx()` copy-buffer growth for larger `tx()` TSO (the advertised
+  bound is the `tx()` one until then).
+- VLAN + checksum offload without TSO (the csum path needs
+  header parsing + a context descriptor before it can carry a
+  VLAN context).
+- Csum-path context stickiness: after a TSO/VLAN frame, a later
+  csum-only frame reuses the stale context. Harmless per the
+  datasheet (non-TSE frames ignore MSS/L4LEN; no VLE means no
+  insertion), but documented here until a csum-path context is
+  added.
+- X540/X550 descriptor-format re-grounding against their own
+  datasheets (this lane's descriptor grounding is 82599 rev.
+  2.0 + Linux, which programs the same format across parts).
 
 Per project rule, smokes live in `drivers/net/src/ixgbe/tests.rs`
 and register via `kernel_test_in!("drivers/net/ixgbe", …)`.

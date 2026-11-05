@@ -604,3 +604,64 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/8192eu",
     smoke_rtl8192eu_packet_owner_codec_and_queue_map
 );
+
+/// Live channel relabel (gen2 F7): the posted RX transfer stays posted,
+/// association state resets, the channel moves; TX outstanding, a halted
+/// pipe, or an out-of-range channel refuses. The cold path keeps its
+/// no-transfer-posted rule.
+fn smoke_rtl8188eu_packet_live_retarget() -> TestResult {
+    let io = Fake::new();
+    let mut owner = Owner::new(io.clone(), endpoints(3), 6).unwrap();
+    owner.start().unwrap();
+    let posted = io.0.lock().posted.len();
+    owner.qos = true;
+    owner.ht = true;
+    owner.ampdu = Some((64, 16));
+    owner.scratch[0] = 9;
+    if owner.retarget_live(11).is_err()
+        || owner.channel != 11
+        || owner.qos
+        || owner.ht
+        || owner.ampdu.is_some()
+        || owner.scratch.iter().any(|b| *b != 0)
+        || io.0.lock().posted.len() != posted
+    {
+        return TestResult::Fail("live retarget keeps RX, resets state");
+    }
+    // TX outstanding refuses; the label does not move under it.
+    let native = frame(Kind::Management);
+    owner.submit(Kind::Management, &native).unwrap();
+    if owner.retarget_live(1).is_ok() || owner.channel != 11 {
+        return TestResult::Fail("TX outstanding refuses live retarget");
+    }
+    // Halted pipe refuses.
+    let io = Fake::new();
+    let mut owner = Owner::new(io.clone(), endpoints(3), 6).unwrap();
+    owner.start().unwrap();
+    owner.halted = (true, false);
+    if owner.retarget_live(1).is_ok() {
+        return TestResult::Fail("halted pipe refuses live retarget");
+    }
+    // Out-of-range channels refuse on both paths.
+    let mut owner = Owner::new(Fake::new(), endpoints(3), 6).unwrap();
+    if owner.retarget_live(0).is_ok()
+        || owner.retarget_live(14).is_ok()
+        || owner.retarget_stopped(0).is_ok()
+        || owner.retarget_stopped(14).is_ok()
+    {
+        return TestResult::Fail("out-of-range channel refused");
+    }
+    // Cold path: unstarted owner relabels; started owner refuses.
+    if owner.retarget_stopped(6).is_err() || owner.channel != 6 {
+        return TestResult::Fail("cold retarget on unstarted owner");
+    }
+    owner.start().unwrap();
+    if owner.retarget_stopped(1).is_ok() {
+        return TestResult::Fail("cold retarget refuses posted RX");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/packet",
+    smoke_rtl8188eu_packet_live_retarget
+);

@@ -131,6 +131,31 @@ pub const fn clear_feature(recipient: u8, feature: u16, index: u16) -> Setup {
     }
 }
 
+/// Build a standard SET_FEATURE setup packet (USB 2.0 §9.4.2),
+/// mirroring [`clear_feature`]: host-to-device, recipient
+/// encoded in the low bits of `bmRequestType`, `wValue` =
+/// feature selector, `wIndex` = endpoint address (for
+/// ENDPOINT_HALT), interface number, or 0 for device features.
+pub const fn set_feature(recipient: u8, feature: u16, index: u16) -> Setup {
+    Setup {
+        bm_request_type: RT_DIR_OUT | RT_TYPE_STANDARD | recipient,
+        b_request: REQ_SET_FEATURE,
+        w_value: feature,
+        w_index: index,
+        w_length: 0,
+    }
+}
+
+/// Build the SET_FEATURE(DEVICE_REMOTE_WAKEUP) packet a NIC
+/// suspend hook issues to arm remote wakeup (USB 2.0 §9.4.2 +
+/// §9.4, Table 9-6: feature selector 1, device recipient,
+/// `wIndex` 0, no Data Stage). A device with this feature set
+/// may signal resume on its upstream port while suspended;
+/// without it, the host would never observe a wake event.
+pub const fn set_feature_device_remote_wakeup() -> Setup {
+    set_feature(RT_RECIP_DEVICE, FEATURE_DEVICE_REMOTE_WAKEUP, 0)
+}
+
 pub const fn set_configuration(config: u8) -> Setup {
     Setup {
         bm_request_type: RT_DIR_OUT | RT_TYPE_STANDARD | RT_RECIP_DEVICE,

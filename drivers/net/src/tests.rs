@@ -1160,7 +1160,7 @@ fn smoke_ixgbe_tso_desc_encode() -> TestResult {
         AdvTxCtxtDesc, AdvTxDesc, ADVTXD_DCMD_TSE, ADVTXD_DTYP_CTXT, ADVTXD_MSS_SHIFT,
         ADVTXD_TUCMD_IPV4, ADVTXD_TUCMD_L4T_TCP,
     };
-    let ctx = AdvTxCtxtDesc::new_tso_v4(14, 20, 20, 1448);
+    let ctx = AdvTxCtxtDesc::new_tso_v4(14, 20, 20, 1448, None);
     if ctx.mss_l4len_idx >> ADVTXD_MSS_SHIFT != 1448 {
         return TestResult::Fail("ixgbe TSO ctx: mss wrong");
     }

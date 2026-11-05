@@ -5,30 +5,35 @@
 //! VLAN tag insertion on TX, RX checksum decode, jumbo-sized
 //! rings / RMS / MTPS, WoL register programming (including the
 //! 8125-family MAC-OCP steps), the EEE TX LPI idle timer, and
-//! the RSS register programming model as a dormant
-//! [`Rtl8127Nic::configure_rss`] method (see below). Deliberate
-//! asymmetries: RX VLAN stripping stays OFF, the interface MTU
-//! stays 1500 with offloads advertised, and RSS is NOT enabled
-//! at bring-up — steering registers are programmed only on an
-//! explicit `configure_rss` call, and enabling steering in
-//! production additionally needs a multi-ring datapath
-//! (per-queue descriptor bases, RSS descriptor format,
-//! per-queue pumps, 30 MSI-X vectors) that the current
-//! single-consumer `Interface` cannot express. Bring-up keeps
-//! Linux's single-queue behavior (`RSS_CTRL` = 0).
+//! the RSS register programming model (`features::apply_rss`)
+//! plus the multi-ring datapath that consumes it (see below).
+//! Deliberate asymmetries: RX VLAN stripping stays OFF, the
+//! interface MTU stays 1500 with offloads advertised, and on a
+//! 1-CPU boot bring-up keeps Linux's single-queue behavior
+//! (`RSS_CTRL` = 0).
 //!
 //! ## RSS, precisely
 //!
 //! Linux enables RSS only on VER_80 (`rtl_hw_support_rss`), and
-//! this is the only chip in the family with that gap. The
-//! register programming (key / indirection / control /
-//! queue-count / descriptor-type) is implemented in
-//! `crate::features` and wired here as `configure_rss`, but the
-//! datapath that would consume steered queues does not exist
-//! yet and QEMU does not emulate an 8127, so it would be
-//! untestable locally. The multi-ring datapath is a follow-up;
-//! until then `configure_rss` is dormant, exercised only by the
-//! shared feature fixtures.
+//! this is the only chip in the family with that gap. Bring-up
+//! selects the RX queue count by Linux's rule —
+//! `rounddown_pow2(min(cpu_count, 8))`, minimum 1 — and, when
+//! it is ≥ 2, programs the steering registers via
+//! `features::apply_rss` (key, indirection, control, queue
+//! count, descriptor type), allocates one RX descriptor ring
+//! and buffer pool per queue (queue 0 at `REG_RDSAR`, queues
+//! 1..N at `REG_RDSAR_Q1_LOW + (q-1)*8`), switches every queue
+//! to the RSS descriptor format, spawns one RX pump per queue,
+//! and attempts up to 30 MSI-X vectors (Linux's
+//! `R8127_MIN_NUM_IRQVEC`) with a single-vector fallback.
+//! `Interface` then reports the live queue count, the active
+//! `RssConfig`, and per-queue affinity, and `caps` gains
+//! `NicCaps::RSS`. The pumps are still polled, so per-queue
+//! vectors are programmed as device configuration for future
+//! IRQ use and do not demux the polled pumps; likewise the
+//! affinity core is the intended pump placement (spawns are
+//! currently unpinned). Live multi-queue datapath validation
+//! is silicon-only: QEMU does not emulate an 8127.
 //!
 //! ## Reference
 //!
@@ -144,6 +149,11 @@ pub(crate) const REG_TPPOLL_8125: u64 = 0x90;
 pub(crate) const REG_RMS: u64 = 0xDA;
 pub(crate) const REG_CPLUSCR: u64 = 0xE0;
 pub(crate) const REG_RDSAR: u64 = 0xE4;
+/// RX descriptor ring base for queue 1 (lo/hi pair). Queue q ≥ 1
+/// lives at `REG_RDSAR_Q1_LOW + (q-1)*8`: each queue's base is a
+/// 64-bit lo+hi pair, so the stride is 8. Linux programs these
+/// from `rtl_set_rx_tx_desc_registers` (`RDSAR_Q1_LOW` 0x4000).
+pub(crate) const REG_RDSAR_Q1_LOW: u64 = 0x4000;
 pub(crate) const REG_MTPS: u64 = 0xEC;
 
 // CR bits.
@@ -356,6 +366,125 @@ pub const fn build_rx_desc(slot: usize, phys: u64, buf_size: u32) -> TxDesc {
         addr_lo: phys as u32,
         addr_hi: (phys >> 32) as u32,
     }
+}
+
+// ── RSS multi-ring helpers ────────────────────────────────────────
+// Linux's `RxDesc` union: in RSS mode (descriptor type
+// `DESC_TYPE_RSS`, set by `apply_rss`) a descriptor is NOT the
+// default opts1/opts2/addr layout. It is rss_addr (64-bit, words
+// 0–1), rss_opts2 (word 2), rss_opts1 (word 3). The status word
+// the RX path reads is rss_opts1, whose bit positions Linux
+// treats as the shared opts1 layout (its `rtl8169_rx_desc_opts1`
+// returns rss_opts1 verbatim for the RSS type, and the RX loop
+// then applies the common OWN / error / length decode) — so
+// OWN/EOR/LS/LEN keep the positions in the `RXD_*` consts
+// above. The checksum bits DO differ: the RSS branch decodes
+// TCPT/UDPT/TCPF/UDPF from rss_opts1 instead of the
+// default format's PID/fail bits.
+
+// RSS-format checksum bits in rss_opts1 (Linux's
+// `RX_TCPT_DESC_RSS` / `RX_UDPT_DESC_RSS` /
+// `RX_TCPFAIL_DESC_RSS` / `RX_UDPFAIL_DESC_RSS`).
+pub(crate) const RSS_RX_TCPT: u32 = 1 << 18;
+pub(crate) const RSS_RX_UDPT: u32 = 1 << 19;
+pub(crate) const RSS_RX_TCPFAIL: u32 = 1 << 15;
+pub(crate) const RSS_RX_UDPFAIL: u32 = 1 << 16;
+
+/// Linux's RSS queue-count rule (`rtl8169_set_rx_ring_num`):
+/// `rounddown_pow2(min(cpu_count, RSS_MAX_QUEUES))`, minimum 1.
+/// `RSS_MAX_QUEUES` is 8 (the in-tree `features::RSS_MAX_QUEUES`
+/// bound, and the hardware queue-count field's width). A 0-CPU
+/// reading (no SMP info) yields 1 — the single-queue case.
+pub(crate) const fn select_rss_queues(cpus: u32) -> usize {
+    if cpus <= 1 {
+        return 1;
+    }
+    let n = if cpus > 8 { 8 } else { cpus };
+    let mut q = 1;
+    while q * 2 <= n {
+        q *= 2;
+    }
+    q as usize
+}
+
+/// MMIO register offset holding queue `q`'s RX descriptor base
+/// (lo word; hi word is +4). Queue 0 is `REG_RDSAR`; queues 1..N
+/// are `REG_RDSAR_Q1_LOW + (q-1)*8`.
+pub(crate) const fn rx_queue_base_reg(queue: usize) -> u64 {
+    if queue == 0 {
+        REG_RDSAR
+    } else {
+        REG_RDSAR_Q1_LOW + ((queue - 1) as u64) * 8
+    }
+}
+
+/// MSI-X vectors to request for a table of `table_size` entries,
+/// given a `want` from Linux's vector policy. The table size
+/// bounds the request; 0 means "no MSI-X capability". The
+/// caller falls back to 1 vector when allocation itself fails
+/// (Linux's `rtl_alloc_irq` min-vector fallback).
+pub(crate) const fn select_msix_count(table_size: u16, want: u16) -> u16 {
+    if table_size == 0 {
+        0
+    } else if want > table_size {
+        table_size
+    } else {
+        want
+    }
+}
+
+/// Decode the RSS-format checksum result from an rss_opts1
+/// status word. Linux's RSS branch marks the checksum OK iff
+/// (TCPT and not TCPF) or (UDPT and not UDPF), and failed iff
+/// TCPF or UDPF is set; otherwise the hardware did not verify
+/// (e.g. non-TCP/UDP). There is no separate IP-fail bit in the
+/// RSS branch — an IP-only failure surfaces as "not verified"
+/// here, matching Linux. OK takes precedence over Fail when
+/// both an OK bit and an unrelated Fail bit are set (a TCP
+/// checksum cannot fail while a UDP checksum succeeds on the
+/// same packet; the OK protocol's verdict wins, mirroring the
+/// default-format decode's Ok-first shape).
+pub(crate) const fn rss_rx_csum(opts1: u32) -> RxCsumResult {
+    let tcp_ok = opts1 & RSS_RX_TCPT != 0 && opts1 & RSS_RX_TCPFAIL == 0;
+    let udp_ok = opts1 & RSS_RX_UDPT != 0 && opts1 & RSS_RX_UDPFAIL == 0;
+    if tcp_ok || udp_ok {
+        RxCsumResult::Ok
+    } else if opts1 & (RSS_RX_TCPFAIL | RSS_RX_UDPFAIL) != 0 {
+        RxCsumResult::Fail
+    } else {
+        RxCsumResult::None
+    }
+}
+
+/// RSS-format initial-fill status word for `slot`: OWN + buffer
+/// size + EOR on the wrap slot (same shape as `build_rx_desc`,
+/// written to word 3 instead of word 0).
+pub(crate) const fn rss_fill_opts1(slot: usize) -> u32 {
+    let mut flags = RXD_OWN | (RX_BUF_LEN as u32 & RXD_LEN_MASK);
+    if slot == RING_LEN - 1 {
+        flags |= RXD_EOR;
+    }
+    flags
+}
+
+/// RSS-format rearm status word, mirroring Linux's `mark_to_asic`
+/// RSS branch: rss_opts2 = 0, then (after a fence) rss_opts1 =
+/// DescOwn | eor | R8169_RX_BUF_SIZE, where eor is preserved
+/// from the descriptor being rearmed. The caller writes the
+/// address words + rss_opts2 = 0 first, fences, then publishes
+/// this word last.
+pub(crate) const fn rss_rearm_opts1(cur_opts1: u32) -> u32 {
+    RXD_OWN | (cur_opts1 & RXD_EOR) | (RX_BUF_LEN as u32 & RXD_LEN_MASK)
+}
+
+/// One RX queue: its descriptor ring, its buffer pool, and its
+/// head. Each queue's pump owns its head; heads are independent
+/// (no cross-queue lock), and all pumps fan into the single
+/// mirror producer on the NIC.
+pub(crate) struct RxQueue {
+    ring: DmaBuffer,
+    pool: alloc::vec::Vec<DmaBuffer>,
+    head: IrqSafeSpinLock<u32>,
 }
 
 // ── TX offload descriptor helpers ───────────────────────────────────
@@ -1489,9 +1618,12 @@ pub struct Rtl8127Nic {
     tx_ring: DmaBuffer,
     tx_pool: alloc::vec::Vec<DmaBuffer>,
     tx_head: IrqSafeSpinLock<u32>,
-    rx_ring: DmaBuffer,
-    rx_pool: alloc::vec::Vec<DmaBuffer>,
-    rx_head: IrqSafeSpinLock<u32>,
+    /// RX queues: one descriptor ring + buffer pool + head per
+    /// queue. Length 1 in the single-queue case; N in RSS mode.
+    rx_queues: alloc::vec::Vec<RxQueue>,
+    /// Active RSS steering configuration (`None` when the
+    /// controller runs a single queue).
+    rss_config: Option<narf_net::rss::RssConfig>,
     /// MAC address read from IDR0..5 at bring-up.
     pub mac: [u8; 6],
     /// MAC version detected from TxConfig.XID at bring-up.
@@ -1502,16 +1634,25 @@ pub struct Rtl8127Nic {
     pub link_up: bool,
     /// IDT vector wired to MSI-X entry 0, when MSI-X is enabled.
     pub irq_vector: Option<u8>,
+    /// IDT vector per MSI-X entry (entry q → vector), when MSI-X
+    /// is enabled. Empty when MSI-X is off; `irq_vector` is
+    /// always the first entry of this list.
+    irq_vectors: alloc::vec::Vec<u8>,
     msix: Option<narf_bus::MsixTable>,
 
     rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    /// Mirror producer shared by all RX pumps. Installed by
+    /// `probe` before the pumps spawn; each pump locks it only
+    /// for the non-blocking `try_send` of its mirror.
+    rx_mirror: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
 }
 
-// SAFETY: all interior-mutable state (`tx_head`, `rx_head`, the IPC
-// rings) is guarded by `IrqSafeSpinLock`, and the remaining fields are
-// either plain data or DMA/MMIO handles describing identity-mapped
-// physical regions owned exclusively by this NIC instance.
+// SAFETY: all interior-mutable state (`tx_head`, the per-queue
+// heads, the IPC rings, the mirror producer) is guarded by
+// `IrqSafeSpinLock`, and the remaining fields are either plain
+// data or DMA/MMIO handles describing identity-mapped physical
+// regions owned exclusively by this NIC instance.
 unsafe impl Send for Rtl8127Nic {}
 // SAFETY: every path that mutates shared state goes through the
 // `IrqSafeSpinLock` fields above; the bare data fields are read-only
@@ -1534,14 +1675,32 @@ impl Rtl8127Nic {
     /// TX + RX rings, enable receive + transmit, observe link state.
     ///
     /// Mirrors `rtl_hw_start_8125_common`, with the VER_63…VER_80
-    /// RxConfig (`RX_PAUSE_SLOT_ON` set).
+    /// RxConfig (`RX_PAUSE_SLOT_ON` set). The RX queue count
+    /// follows Linux's rule (`select_rss_queues(cpu_count)`).
     ///
     /// # Safety
     /// Caller owns the device's BAR + cfg windows exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, NicError> {
+        // SAFETY: same contract as `bring_up_queues`.
+        unsafe { Self::bring_up_queues(device, cap, select_rss_queues(narf_lib::smp::cpu_count())) }
+    }
+
+    /// Bring up with an explicit RX queue count (1 = Linux's
+    /// single-queue behavior exactly; ≥ 2 = RSS multi-ring
+    /// datapath). `bring_up` selects the count from the CPU
+    /// count; tests and future callers can pin it here.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR + cfg windows exclusively.
+    pub unsafe fn bring_up_queues(
+        device: &BusDevice,
+        _cap: &Cap<BusDeviceCap, Write>,
+        queues: usize,
+    ) -> Result<Self, NicError> {
+        let queues = queues.max(1);
         // Same BAR layout as the rest of the family: MMIO in BAR2.
         // SAFETY: caller-asserted exclusive ownership.
         let mmio = unsafe { map_bar(device, 2) }.map_err(|_| NicError::BarMapFailed)?;
@@ -1573,16 +1732,28 @@ impl Rtl8127Nic {
         let txcfg = unsafe { mmio.read32(REG_TCR) };
         let mac_version = mac_version_from_xid(decode_xid(txcfg));
 
-        // 4. Allocate descriptor rings + per-slot buffers.
+        // 4. Allocate descriptor rings + per-slot buffers: one RX
+        //    ring + pool per queue (each queue costs a full ring
+        //    of 16 KiB buffers — the same shape Linux allocates
+        //    per ring; the queue count is capped at 8 above).
         let tx_ring =
             alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
-        let rx_ring =
-            alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
-        let mut rx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
-        for _ in 0..RING_LEN {
-            rx_pool.push(
-                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
-            );
+        let mut rx_queues: alloc::vec::Vec<RxQueue> = alloc::vec::Vec::with_capacity(queues);
+        for _ in 0..queues {
+            let ring =
+                alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
+            let mut pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
+            for _ in 0..RING_LEN {
+                pool.push(
+                    alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0)
+                        .map_err(|_| NicError::NoMemory)?,
+                );
+            }
+            rx_queues.push(RxQueue {
+                ring,
+                pool,
+                head: IrqSafeSpinLock::new(0),
+            });
         }
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
@@ -1596,15 +1767,41 @@ impl Rtl8127Nic {
         //    OFF (no VLAN-tag field in `Frame::rx_meta`). Then
         //    program the EEE TX LPI idle timer (Linux's
         //    `rtl_set_eee_txidle_timer` VER_61..LAST arm covers
-        //    VER_80), and make the single-queue RSS state explicit
-        //    (Linux's single-ring write: `RSS_CTRL` = 0).
+        //    VER_80).
         // SAFETY: bring_up owns the BAR exclusively.
         unsafe {
             let mut regs = crate::features::MmioRegs(&mmio);
             crate::features::apply_cplus(&mut regs, false, true);
             crate::features::apply_eee_txidle(&mut regs, 1500);
-            crate::features::apply_rss_single_queue(&mut regs);
         }
+        // RSS state: a single queue keeps Linux's single-ring
+        // write (`RSS_CTRL` = 0); ≥ 2 queues program key /
+        // indirection / control / queue-count / descriptor-type
+        // via `apply_rss`, and the config is kept for
+        // `Interface::rss`.
+        // SAFETY: bring_up owns the BAR exclusively.
+        let rss_config = if queues >= 2 {
+            let config =
+                narf_net::rss::RssConfig::standard(queues, crate::features::RSS_INDIR_ENTRIES);
+            // SAFETY: bring_up owns the register window exclusively
+            // (single probe path; apply_rss requires exclusive ownership).
+            let ok = unsafe {
+                let mut regs = crate::features::MmioRegs(&mmio);
+                crate::features::apply_rss(&mut regs, queues, &config.key, &config.indirection)
+            };
+            if !ok {
+                return Err(NicError::UnsupportedOffload);
+            }
+            Some(config)
+        } else {
+            // SAFETY: bring_up owns the register window exclusively
+            // (single probe path; apply_rss_single_queue requires it).
+            unsafe {
+                let mut regs = crate::features::MmioRegs(&mmio);
+                crate::features::apply_rss_single_queue(&mut regs);
+            }
+            None
+        };
 
         // 6. Enable TX + RX.
         // SAFETY: same.
@@ -1623,27 +1820,82 @@ impl Rtl8127Nic {
             mmio.write8(REG_MTPS, crate::features::mtps_for_frame(TX_BUF_LEN as u32));
         }
 
-        // 6b. Pre-fill RX descriptors.
-        let rx_ring_phys = rx_ring.dma_addr().raw();
-        for (i, buf) in rx_pool.iter().enumerate() {
-            let buf_phys = buf.dma_addr().raw();
-            let d = build_rx_desc(i, buf_phys, RX_BUF_LEN as u32);
-            // SAFETY: identity-mapped DMA ring page; i < RING_LEN so the
-            // 16-byte descriptor slot lies inside the RING_BYTES alloc.
+        // 6b. Pre-fill RX descriptors and program each queue's
+        //     base. A single queue keeps the legacy format and
+        //     base (`REG_RDSAR`); ≥ 2 queues switch EVERY queue
+        //     — queue 0 included — to the RSS format (Linux's
+        //     descriptor-type switch is per-controller, not
+        //     per-ring: `init_rx_desc_type` is one global) and
+        //     program queues 1..N at `RDSAR_Q1_LOW + (q-1)*8`.
+        //     Ordering note: RX is already enabled (step 6)
+        //     before the bases land, exactly as in the shipped
+        //     single-queue path (where RE precedes RDSAR), so
+        //     steering is live for a bring-up window in which
+        //     only queue 0's base is programmed. Queue 0's base
+        //     is programmed first to shrink it.
+        for (q, rxq) in rx_queues.iter().enumerate() {
+            let ring_phys = rxq.ring.dma_addr().raw();
+            for (i, buf) in rxq.pool.iter().enumerate() {
+                let buf_phys = buf.dma_addr().raw();
+                let desc_addr = ring_phys + (i * 16) as u64;
+                if queues >= 2 {
+                    // RSS format: rss_addr (words 0–1),
+                    // rss_opts2 = 0 (word 2), rss_opts1 (word 3).
+                    // The address words + rss_opts2 land before
+                    // OWN is published in word 3.
+                    // SAFETY: identity-mapped DMA ring page;
+                    // i < RING_LEN so the 16-byte slot lies
+                    // inside the RING_BYTES alloc.
+                    unsafe {
+                        core::ptr::write_volatile(
+                            narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<u32>(),
+                            buf_phys as u32,
+                        );
+                        core::ptr::write_volatile(
+                            narf_memory::PhysAddr::new(desc_addr + 4).kernel_mut_ptr::<u32>(),
+                            (buf_phys >> 32) as u32,
+                        );
+                        core::ptr::write_volatile(
+                            narf_memory::PhysAddr::new(desc_addr + 8).kernel_mut_ptr::<u32>(),
+                            0,
+                        );
+                    }
+                    compiler_fence(Ordering::SeqCst);
+                    // SAFETY: same.
+                    unsafe {
+                        core::ptr::write_volatile(
+                            narf_memory::PhysAddr::new(desc_addr + 12).kernel_mut_ptr::<u32>(),
+                            rss_fill_opts1(i),
+                        );
+                    }
+                    compiler_fence(Ordering::SeqCst);
+                } else {
+                    let d = build_rx_desc(i, buf_phys, RX_BUF_LEN as u32);
+                    // SAFETY: identity-mapped DMA ring page; i <
+                    // RING_LEN so the 16-byte descriptor slot lies
+                    // inside the RING_BYTES alloc.
+                    unsafe {
+                        core::ptr::write_volatile(
+                            narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
+                            d,
+                        );
+                    }
+                }
+            }
+            // SAFETY: identity-mapped MMIO.
+            let base_reg = rx_queue_base_reg(q);
+            // SAFETY: identity-mapped MMIO; q indexes rx_queues, so
+            // base_reg is a valid per-queue RX base register, and
+            // ring_phys is that queue's DMA ring base address.
             unsafe {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(rx_ring_phys + (i * 16) as u64)
-                        .kernel_mut_ptr::<TxDesc>(),
-                    d,
-                );
+                mmio.write32(base_reg, ring_phys as u32);
+                mmio.write32(base_reg + 4, (ring_phys >> 32) as u32);
             }
         }
         // RMS is the buffer bound (16383), not the MTU bound —
         // Linux's `rtl_set_rx_max_size` shape.
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            mmio.write32(REG_RDSAR, rx_ring_phys as u32);
-            mmio.write32(REG_RDSAR + 4, (rx_ring_phys >> 32) as u32);
             mmio.write16(REG_RMS, RX_BUF_LEN as u16);
         }
 
@@ -1711,36 +1963,62 @@ impl Rtl8127Nic {
             tx_ring,
             tx_pool,
             tx_head: IrqSafeSpinLock::new(0),
-            rx_ring,
-            rx_pool,
-            rx_head: IrqSafeSpinLock::new(0),
+            rx_queues,
+            rss_config,
             mac,
             mac_version,
             wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
             link_up,
             irq_vector: None,
+            irq_vectors: alloc::vec::Vec::new(),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(None),
             tx_ipc_ring: IrqSafeSpinLock::new(None),
+            rx_mirror: IrqSafeSpinLock::new(None),
         })
     }
 
-    /// Bring up MSI-X with a single vector wired to entry 0.
+    /// Bring up MSI-X with `want` vectors (entry i → IDT vector
+    /// `vectors[i]`), returning the IDT vectors in entry order.
+    /// The request is bounded by the device's own table size
+    /// (`select_msix_count`); a request of 0 (no table) is
+    /// `MsixSetup`. IDT vectors are allocated BEFORE any table
+    /// entry is programmed, so a vector-allocation failure
+    /// leaves the table untouched, and the table is enabled
+    /// only after every entry programs. The IMR bits are the
+    /// chip-global set (the 8127's IMR is not per-queue),
+    /// identical to the single-vector path. A program failure
+    /// mid-loop is unreachable for i < count ≤ size (only
+    /// VectorOutOfRange or a BAR-mapping failure can fail it);
+    /// on any error the table is left unenabled and dropped.
     ///
     /// # Safety
     /// Caller owns the device's BAR + cfg windows exclusively.
-    pub unsafe fn enable_msix(
+    pub unsafe fn enable_msix_vectors(
         &mut self,
         cap: &Cap<BusDeviceCap, Write>,
         device: &BusDevice,
-    ) -> Result<u8, NicError> {
+        want: u16,
+    ) -> Result<alloc::vec::Vec<u8>, NicError> {
         let mut table = narf_bus::enable_msix(cap, device).map_err(|_| NicError::MsixSetup)?;
-        let v = narf_interrupts::vector::alloc().map_err(|_| NicError::MsixSetup)?;
-        let _ = table.alloc_vector().ok_or(NicError::MsixSetup)?;
+        let count = select_msix_count(table.size(), want);
+        if count == 0 {
+            return Err(NicError::MsixSetup);
+        }
+        table.alloc_block(count).map_err(|_| NicError::MsixSetup)?;
+        let mut vectors = alloc::vec::Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            vectors.push(narf_interrupts::vector::alloc().map_err(|_| NicError::MsixSetup)?);
+        }
         // SAFETY: x2APIC is online by Stage-4 boot.
         let target_apic = unsafe { narf_interrupts::current_cpu_target_id() };
-        // SAFETY: caller-authority.
-        unsafe { table.program_vector(0, target_apic, v) }.map_err(|_| NicError::MsixSetup)?;
+        for (i, v) in vectors.iter().enumerate() {
+            // SAFETY: caller-authority; entry i < count ≤ table
+            // size, allocated above; the table is not enabled
+            // yet, so a failure here leaves it inert.
+            unsafe { table.program_vector(i as u16, target_apic, *v) }
+                .map_err(|_| NicError::MsixSetup)?;
+        }
         // SAFETY: same.
         unsafe { table.enable() }.map_err(|_| NicError::MsixSetup)?;
 
@@ -1752,9 +2030,10 @@ impl Rtl8127Nic {
             );
         }
 
-        self.irq_vector = Some(v);
+        self.irq_vector = vectors.first().copied();
+        self.irq_vectors = vectors.clone();
         self.msix = Some(table);
-        Ok(v)
+        Ok(vectors)
     }
 
     /// Transmit a single Ethernet frame (polled completion).
@@ -1866,32 +2145,79 @@ impl Rtl8127Nic {
 
     /// Like [`Rtl8127Nic::receive`], plus the chip's RX checksum
     /// verification result decoded from the returned descriptor.
+    /// Queue 0 in the current format (legacy when single-queue,
+    /// RSS format when multi-queue).
     pub fn receive_with_meta(&self) -> Option<(alloc::vec::Vec<u8>, RxCsumResult)> {
-        let mut head_g = self.rx_head.lock();
+        self.receive_on_queue(0).map(|(buf, csum, _)| (buf, csum))
+    }
+
+    /// Pop one received frame off RX queue `q`, plus the chip's
+    /// RX checksum verification result and — in RSS mode — the
+    /// hardware Toeplitz hash (`rss_result`) that steered the
+    /// frame to this queue (`None` in the single-queue case,
+    /// where no hash exists). The hash has already done its
+    /// steering work by the time the pump sees the frame (the
+    /// queue identity IS the steering outcome), so pumps do not
+    /// forward it; it is returned for diagnostics and future
+    /// stack use. Out-of-range `q` yields `None`.
+    pub fn receive_on_queue(
+        &self,
+        q: usize,
+    ) -> Option<(alloc::vec::Vec<u8>, RxCsumResult, Option<u32>)> {
+        let rxq = self.rx_queues.get(q)?;
+        let rss = self.rx_queues.len() > 1;
+        let mut head_g = rxq.head.lock();
         let slot = (*head_g) as usize % RING_LEN;
-        let ring_phys = self.rx_ring.dma_addr().raw();
+        let ring_phys = rxq.ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
 
+        // Status word: word 0 in the legacy format, word 3
+        // (rss_opts1) in the RSS format. Bit positions are
+        // shared (see the RSS-format comment above).
         // SAFETY: identity-mapped DMA ring.
         let flags_len = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>())
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(if rss { desc_addr + 12 } else { desc_addr })
+                    .kernel_ptr::<u32>(),
+            )
         };
         if flags_len & RXD_OWN != 0 {
             return None;
         }
 
         // Decode the RX checksum result now, before rearming
-        // overwrites the descriptor.
-        let csum = TxDesc {
-            flags_len,
-            vlan: 0,
-            addr_lo: 0,
-            addr_hi: 0,
-        }
-        .rx_csum_result();
+        // overwrites the descriptor. The RSS format uses its
+        // own TCPT/UDPT/TCPF/UDPF bits (see `rss_rx_csum`).
+        let csum = if rss {
+            rss_rx_csum(flags_len)
+        } else {
+            TxDesc {
+                flags_len,
+                vlan: 0,
+                addr_lo: 0,
+                addr_hi: 0,
+            }
+            .rx_csum_result()
+        };
+
+        // RSS hash: rss_result is word 1 of the RSS descriptor.
+        // SAFETY: identity-mapped DMA ring.
+        let hash = if rss {
+            // SAFETY: identity-mapped DMA ring; slot is head mod
+            // RING_LEN, so desc_addr + 4 is word 1 of a valid
+            // 16-byte descriptor, and rss selects the RSS layout
+            // whose word 1 is the steering hash.
+            Some(unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(desc_addr + 4).kernel_ptr::<u32>(),
+                )
+            })
+        } else {
+            None
+        };
 
         let len = (flags_len & RXD_LEN_MASK) as usize;
-        let buf_phys = self.rx_pool[slot].dma_addr().raw();
+        let buf_phys = rxq.pool[slot].dma_addr().raw();
 
         let mut out = alloc::vec::Vec::with_capacity(len.min(RX_BUF_LEN));
         if flags_len & RXD_LS != 0 {
@@ -1900,24 +2226,53 @@ impl Rtl8127Nic {
                 // SAFETY: this slot's RX DMA buffer is RX_BUF_LEN bytes
                 // and `i < copy_len <= RX_BUF_LEN`.
                 out.push(unsafe {
-                    core::ptr::read_volatile(self.rx_pool[slot].cpu_ptr_at::<u8>(i as u64))
+                    core::ptr::read_volatile(rxq.pool[slot].cpu_ptr_at::<u8>(i as u64))
                 });
             }
         }
 
         // Rearm the descriptor.
-        let d = build_rx_desc(slot, buf_phys, RX_BUF_LEN as u32);
-        // SAFETY: identity-mapped DMA ring; slot < RING_LEN.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
-                d,
-            )
-        };
+        if rss {
+            // RSS rearm, mirroring `mark_to_asic`: address words
+            // + rss_opts2 = 0, fence, then rss_opts1 last (EOR
+            // preserved from the descriptor being rearmed).
+            // SAFETY: identity-mapped DMA ring; slot < RING_LEN.
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<u32>(),
+                    buf_phys as u32,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr + 4).kernel_mut_ptr::<u32>(),
+                    (buf_phys >> 32) as u32,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr + 8).kernel_mut_ptr::<u32>(),
+                    0,
+                );
+            }
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: same.
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr + 12).kernel_mut_ptr::<u32>(),
+                    rss_rearm_opts1(flags_len),
+                );
+            }
+        } else {
+            let d = build_rx_desc(slot, buf_phys, RX_BUF_LEN as u32);
+            // SAFETY: identity-mapped DMA ring; slot < RING_LEN.
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
+                    d,
+                )
+            };
+        }
         compiler_fence(Ordering::SeqCst);
 
         *head_g = (*head_g + 1) % (RING_LEN as u32);
-        Some((out, csum))
+        Some((out, csum, hash))
     }
 
     /// Largest frame this driver will transmit: the family jumbo
@@ -1937,13 +2292,16 @@ impl Rtl8127Nic {
     /// (key / indirection / control / queue-count / descriptor
     /// type, via `crate::features::apply_rss`).
     ///
-    /// DORMANT: not called from bring-up. Enabling steering in
-    /// production additionally needs the multi-ring datapath
-    /// (per-queue descriptor bases, RSS descriptor format,
-    /// per-queue pumps, 30 MSI-X vectors) — see the module header.
-    /// Calling this on a live single-ring controller would steer
-    /// frames to queues nobody drains.
+    /// Bring-up already programs steering for multi-queue
+    /// controllers (via `apply_rss` directly); this method
+    /// re-programs steering on a live controller. It refuses
+    /// to steer to queues that do not exist: `queues` above
+    /// the live RX queue count is `UnsupportedOffload`, since
+    /// those queues have no ring and no pump to drain them.
     pub fn configure_rss(&self, queues: usize) -> Result<(), NicError> {
+        if queues > self.rx_queues.len() {
+            return Err(NicError::UnsupportedOffload);
+        }
         let config = narf_net::rss::RssConfig::standard(queues, crate::features::RSS_INDIR_ENTRIES);
         // SAFETY: bring_up owns the BAR; `configure_rss` is called
         // only on the live controller, whose MMIO is exclusively
@@ -2231,14 +2589,32 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
 
     // The rings are installed before the device is published, so the
-    // exclusive `&mut` here needs no Arc-aliasing argument.
+    // exclusive `&mut` here needs no Arc-aliasing argument. The
+    // mirror producer moves onto the NIC so every RX pump can
+    // share it (the single-owner `Producer` cannot be cloned
+    // into N pumps).
     *dev.rx_ipc_ring.lock() = Some(rx_cons);
     *dev.tx_ipc_ring.lock() = Some(tx_prod);
+    *dev.rx_mirror.lock() = Some(rx_prod);
 
     // Best-effort MSI-X. A failure leaves the NIC on the polled path
     // the pumps already drive, so it is not fatal to the probe.
+    // Multi-queue controllers attempt Linux's minimum vector
+    // count (30) with a single-vector fallback; single-queue
+    // controllers request one vector, as before.
     // SAFETY: caller-authority over the device's cfg space.
-    if unsafe { dev.enable_msix(&cap, &device) }.is_err() {
+    let msix_want: u16 = if dev.rx_queues.len() > 1 { 30 } else { 1 };
+    // SAFETY: probe owns the device's BAR + cfg windows
+    // exclusively (enable_msix_vectors requires it); cap is the
+    // MSI-X capability found during probe.
+    let msix_ok = match unsafe { dev.enable_msix_vectors(&cap, &device, msix_want) } {
+        Ok(_) => true,
+        // SAFETY: same BAR + cfg exclusivity as the primary
+        // attempt; single-vector fallback after it failed.
+        Err(_) if msix_want > 1 => unsafe { dev.enable_msix_vectors(&cap, &device, 1) }.is_ok(),
+        Err(_) => false,
+    };
+    if !msix_ok {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -2289,42 +2665,46 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         let _ = narf_net::registry().register(&auth, Rtl8127NicIface);
     }
 
-    spawn_pumps(dev, rx_prod, tx_cons);
+    spawn_pumps(dev, tx_cons);
 
     Ok(())
 }
 
-fn spawn_pumps(
-    device: Arc<Rtl8127Nic>,
-    rx_prod: Producer<Frame, RX_RING_N>,
-    tx_cons: Consumer<Frame, TX_RING_N>,
-) {
-    let d1 = device.clone();
-    narf_scheduler::spawn(async move {
-        rtl8127_rx_pump(d1, rx_prod).await;
-    });
+fn spawn_pumps(device: Arc<Rtl8127Nic>, tx_cons: Consumer<Frame, TX_RING_N>) {
+    // One RX pump per queue; every pump fans into the single
+    // mirror producer installed on the NIC by `probe`. Queue 0
+    // keeps the link-sample duty; the other pumps drain only.
+    for q in 0..device.rx_queues.len() {
+        let d = device.clone();
+        narf_scheduler::spawn(async move {
+            rtl8127_rx_pump(d, q).await;
+        });
+    }
     let d2 = device;
     narf_scheduler::spawn(async move {
         rtl8127_tx_pump(d2, tx_cons).await;
     });
 }
 
-async fn rtl8127_rx_pump(device: Arc<Rtl8127Nic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+async fn rtl8127_rx_pump(device: Arc<Rtl8127Nic>, queue: usize) {
     // Carrier refresh (issue #791): the production datapath is polled
-    // (probe never enables MSI-X, so the LinkChg bit in the ISR has no
-    // consumer), which makes this pump the family's link observer.
+    // (the pumps are polled, so the LinkChg bit in the ISR has no
+    // consumer), which makes queue 0's pump the family's link
+    // observer. Other queues' pumps drain only.
     // `phy_status()` is an `&self` MMIO read — unlike
     // `refresh_link_state(&mut self)`, it is safe to call while pumps
     // hold Arc clones. A transition republishes the iface metadata;
     // the cached `Interface::link_up` snapshot is left as-is.
     let mut last_sample = rtl8127_link_sample(device.phy_status());
     loop {
-        let sample = rtl8127_link_sample(device.phy_status());
-        if sample != last_sample {
-            last_sample = sample;
-            crate::publish::publish_link(rtl8127_ifname(), sample);
+        if queue == 0 {
+            let sample = rtl8127_link_sample(device.phy_status());
+            if sample != last_sample {
+                last_sample = sample;
+                crate::publish::publish_link(rtl8127_ifname(), sample);
+            }
         }
-        if let Some((pkt, csum)) = device.receive_with_meta() {
+        if let Some((pkt, csum, _hash)) = device.receive_on_queue(queue) {
             let dma_buf =
                 alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
@@ -2350,7 +2730,10 @@ async fn rtl8127_rx_pump(device: Arc<Rtl8127Nic>, mut rx_prod: Producer<Frame, R
                 &mut frame,
                 crate::publish::rx_mirror_attached(name),
                 |mirror| {
-                    let _ = rx_prod.try_send(mirror);
+                    let mut g = device.rx_mirror.lock();
+                    if let Some(p) = g.as_mut() {
+                        let _ = p.try_send(mirror);
+                    }
                 },
             );
         }
@@ -2420,11 +2803,31 @@ impl narf_net::Interface for Rtl8127NicIface {
     fn link_up(&self) -> bool {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
+    fn num_rx_queues(&self) -> u16 {
+        with_controller(|c| c.rx_queues.len() as u16).unwrap_or(1)
+    }
+    fn rss(&self) -> Option<narf_net::rss::RssConfig> {
+        with_controller(|c| c.rss_config.clone()).flatten()
+    }
+    fn queue_affinity(&self, q: u16) -> narf_net::rss::QueueAffinity {
+        // Intended pump placement: queue q on core q, on its
+        // MSI-X vector when one was programmed for it. Spawns
+        // are currently unpinned and the pumps are polled, so
+        // this is advisory until IRQ-driven pumps land. The
+        // default (boot CPU, no vector) covers the single-queue
+        // case and the no-controller-yet case.
+        with_controller(|c| narf_net::rss::QueueAffinity {
+            core: q as u32,
+            irq: c.irq_vectors.get(q as usize).copied(),
+        })
+        .unwrap_or_default()
+    }
     fn offloads(&self) -> narf_net::OffloadCapabilities {
         // The TSO byte cap is the TX slot buffer: a TSO packet is
-        // one frame copied into one slot. RSS is deliberately not
-        // advertised: the steering registers are dormant until
-        // the multi-ring datapath lands.
+        // one frame copied into one slot. RSS has no offload
+        // field (`OffloadCapabilities` carries checksum / TSO /
+        // VLAN only); it is advertised via `NicCaps::RSS` in
+        // `caps` and the live config in `rss` above.
         narf_net::OffloadCapabilities {
             tx_checksum: true,
             rx_checksum: true,
@@ -2483,13 +2886,17 @@ impl crate::HwNic for Rtl8127NicIface {
         crate::NicModel::RealtekRtl8168
     }
     fn caps(&self) -> crate::NicCaps {
-        // RSS is deliberately NOT advertised: the steering
-        // registers are dormant until the multi-ring datapath
-        // lands (see the module header).
-        crate::NicCaps::TX_CSUM
+        let mut caps = crate::NicCaps::TX_CSUM
             | crate::NicCaps::RX_CSUM
             | crate::NicCaps::TSO
-            | crate::NicCaps::VLAN_TAGGING
+            | crate::NicCaps::VLAN_TAGGING;
+        // RSS only when the live controller actually runs
+        // multiple RX queues; a single-queue controller (or no
+        // controller yet) does not advertise it.
+        if with_controller(|c| c.rx_queues.len() > 1).unwrap_or(false) {
+            caps = caps | crate::NicCaps::RSS;
+        }
+        caps
     }
     fn ring_capacity(&self) -> usize {
         RING_LEN

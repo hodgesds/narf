@@ -339,6 +339,9 @@ pub(super) struct Radio<T> {
     failed: bool,
     /// WOW_ENABLE was acknowledged; only `wow::wow_resume` may follow.
     wow_armed: bool,
+    /// Vdev a net-detect suspend armed PNO on; `wow::wow_resume` spends
+    /// it on the PNO stop after the wake report.
+    nlo_vdev: Option<u32>,
     chains: Option<chains::Chains>,
     management_subscriptions: Option<alloc::sync::Arc<offchannel::Subscriptions>>,
     management_received: VecDeque<offchannel::Captured>,
@@ -391,6 +394,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             pending: VecDeque::new(),
             failed: false,
             wow_armed: false,
+            nlo_vdev: None,
             chains: None,
             management_subscriptions: None,
             management_received: VecDeque::new(),
@@ -523,7 +527,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// Scan IDs never wrap within this firmware owner's lifetime. A timeout,
     /// failed scan or dropped future leaves the owner closed until reset.
     pub async fn passive_scan(&mut self, channels: &[u16]) -> Result<ScanReport, Error> {
-        self.scan_run(channels, (&[], &[]), &[], None, || Ok(()))
+        self.scan_run(channels, (&[], &[]), &[], &[], || Ok(()))
             .await
     }
     async fn scan_run(
@@ -531,7 +535,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         channels: &[u16],
         probes: (&[Vec<u8>], &[u8]),
         setup: &[Vec<u8>],
-        restore: Option<&[u8]>,
+        restore: &[Vec<u8>],
         validate: impl Fn() -> Result<(), Error>,
     ) -> Result<ScanReport, Error> {
         self.scan_run_on(None, channels, probes, setup, restore, validate)
@@ -540,19 +544,23 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// `p2p_device`: run on the P2P_DEVICE vdev (`ath10k_hw_scan` with
     /// `ar->scan.vdev_id = arvif->vdev_id`) instead of the managed role's
     /// vdev. Its discoveries are merged into the shared BSS table
-    /// (`publish_scan_cache`), as cfg80211's per-wiphy table.
+    /// (`publish_scan_cache`), as cfg80211's per-wiphy table. A P2P-device
+    /// scan may run while the managed station is associated: firmware
+    /// owns dwell and the home return on the P2P vdev, and the caller's
+    /// restore packets return the radio to the station's programming.
+    /// Every other scan still refuses with a station peer present.
     async fn scan_run_on(
         &mut self,
         p2p_device: Option<u8>,
         channels: &[u16],
         probes: (&[Vec<u8>], &[u8]),
         setup: &[Vec<u8>],
-        restore: Option<&[u8]>,
+        restore: &[Vec<u8>],
         validate: impl Fn() -> Result<(), Error>,
     ) -> Result<ScanReport, Error> {
         if self.failed
             || self.ready.is_none()
-            || self.station.peer.is_some()
+            || self.station.peer.is_some() && p2p_device.is_none()
             || self.scan_pending.is_some()
         {
             return Err(Error::Failed);
@@ -675,7 +683,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         }
                         match event.kind {
                             2 if event.reason == 0 => {
-                                if let Some(packet) = restore {
+                                // Every restore packet, not just the first:
+                                // an associated binding restores domain +
+                                // power + inventory, and leaving power or
+                                // inventory in scan state would corrupt
+                                // the associated station's programming.
+                                for packet in restore {
+                                    let packet = packet.as_slice();
                                     if retained {
                                         self.send_scan_command(packet, &validate).await?;
                                     } else {

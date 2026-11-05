@@ -389,6 +389,11 @@ pub struct Ath11kNetdev<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     mac_addr: [u8; 6],
     /// WMI vdev slot permanently assigned to this netdev.
     vdev_id: u32,
+    /// The radio (`ar->pdev->pdev_id`) this netdev belongs to: recovery
+    /// rebuilds and virtual-interface creation rebuild this radio's
+    /// port and caps, not pdev 0's. Read from the MAC at construction
+    /// (`Mac::pdev_id`), never assumed from the vdev slot.
+    pdev_id: u32,
     /// Present only on PCI netdevs whose physical radio may allocate virtual
     /// nl80211 interfaces. Test/fake netdevs keep this absent.
     virtual_lifecycle: Option<VirtualLifecycle<Io, Irq, Q>>,
@@ -558,6 +563,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         virtual_lifecycle: Option<VirtualLifecycle<Io, Irq, Q>>,
     ) -> (Self, Consumer<Frame, TX_RING_N>) {
         let radio = RadioInfo::from_mac(&mac);
+        let pdev_id = mac.pdev_id();
         // MBSSID's TX_IFINDEX resolution is physical-radio-local. Bind the
         // netdev before it enters any registry so a later child can only
         // name one of this Shared runtime's vdevs.
@@ -569,6 +575,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                 name,
                 mac_addr,
                 vdev_id,
+                pdev_id,
                 virtual_lifecycle,
                 shared,
                 mac: Mutex::new(mac),
@@ -2009,18 +2016,21 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         // LTO otherwise merges its large state/move temporaries into this
         // MAC recovery poll and can consume the ARM64 kernel stack before
         // a nested transport or console call gets a chance to run.
-        let dev = match super::future_heap::build(|| self.shared.recover_device(notice)).await {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
+        let dev =
+            match super::future_heap::build(|| self.shared.recover_device(notice, self.pdev_id))
+                .await
+            {
+                Ok(d) => d,
+                Err(_) => return false,
+            };
         // ath11k_core_halt + ieee80211_restart_hw → drv_start +
         // drv_add_interface on the rebuilt mac layer.
         // The interface was open: mac80211's reconfig brings the hardware
         // and the station vif back the way `ieee80211_do_open` did.
         let was_open = m.vif().is_some();
         let mut mac = Mac::new(
-            Port(self.shared.clone(), self.vdev_id),
-            Port(self.shared.clone(), self.vdev_id),
+            Port(self.shared.clone(), self.vdev_id, self.pdev_id),
+            Port(self.shared.clone(), self.vdev_id, self.pdev_id),
             dev.caps,
             m.config(),
             dev.reg_info.as_deref(),
@@ -2186,8 +2196,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             .and_then(|vdev_id| self.shared.mbssid_beacons(vdev_id));
         caps.mac_addr = self.mac_addr;
         let mut mac = Mac::new(
-            Port(self.shared.clone(), self.vdev_id),
-            Port(self.shared.clone(), self.vdev_id),
+            Port(self.shared.clone(), self.vdev_id, self.pdev_id),
+            Port(self.shared.clone(), self.vdev_id, self.pdev_id),
             caps,
             config,
             reg_info.as_deref(),
@@ -3854,8 +3864,8 @@ impl Ath11kNetdev<super::core::Bar0, super::ce::MsiCeIrq, super::pci::Wlfw> {
         let config = m.config();
         caps.mac_addr = self.mac_addr;
         let mut mac = Mac::new(
-            Port(self.shared.clone(), self.vdev_id),
-            Port(self.shared.clone(), self.vdev_id),
+            Port(self.shared.clone(), self.vdev_id, self.pdev_id),
+            Port(self.shared.clone(), self.vdev_id, self.pdev_id),
             caps,
             config,
             reg_info.as_deref(),
@@ -4168,18 +4178,25 @@ fn pci_virtual_create(
         // The physical radio may have completed a firmware recovery since
         // its root netdev was registered.  Read the live capability and
         // regulatory snapshots rather than a registration-time copy before
-        // building a later virtual vdev.
+        // building a later virtual vdev.  The caps are the parent's
+        // radio's, not pdev 0's (a radio-1 parent's child would
+        // otherwise come up with radio-0 bands/chains).
         let (mut caps, reg_info) = {
             let rt = parent.shared.try_lock().ok_or(WirelessError::Busy)?;
-            let caps = rt.device_caps().map_err(|_| WirelessError::HardwareError)?;
+            let caps = if parent.pdev_id == 0 {
+                rt.device_caps()
+            } else {
+                rt.device_caps_for(parent.pdev_id)
+            }
+            .map_err(|_| WirelessError::HardwareError)?;
             (caps, rt.core.reg_info.clone())
         };
         let name = Box::leak(alloc::string::String::from(requested_name).into_boxed_str());
         let mac_addr = requested_mac.unwrap_or_else(|| virtual_mac(parent.mac_addr, vdev_id));
         caps.mac_addr = mac_addr;
         let mac = Mac::new(
-            Port(parent.shared.clone(), vdev_id),
-            Port(parent.shared.clone(), vdev_id),
+            Port(parent.shared.clone(), vdev_id, parent.pdev_id),
+            Port(parent.shared.clone(), vdev_id, parent.pdev_id),
             caps,
             config.with_vdev(vdev_id),
             reg_info.as_deref(),
@@ -4471,6 +4488,7 @@ pub fn register_pci(
     shared: Arc<Shared<super::core::Bar0, super::ce::MsiCeIrq, super::pci::Wlfw>>,
     mac: RtMac<super::core::Bar0, super::ce::MsiCeIrq, super::pci::Wlfw>,
     mac_addr: [u8; 6],
+    vdev_id: u32,
 ) -> &'static str {
     use core::fmt::Write as _;
     let name = narf_net::iface::reserve_name("wlan%d");
@@ -4486,7 +4504,7 @@ pub fn register_pci(
         mac,
         mac_addr,
         netdev_sinks(),
-        0,
+        vdev_id,
         2,
         Some(lifecycle),
     );

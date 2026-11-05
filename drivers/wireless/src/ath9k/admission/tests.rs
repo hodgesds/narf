@@ -1209,11 +1209,58 @@ fn ar9565_facts(frequency: u16, ctl: u16) -> Result<Facts, BringUpError> {
     )
 }
 
+fn ar9485_facts(id: u16, frequency: u16, ctl: u16) -> Result<Facts, BringUpError> {
+    use crate::ath9k::ar9003::{eeprom, phy, power, templates::AR9300_DEFAULT, Chip, Revision};
+    // A genuine AR9485 board is 2.4 GHz-only with single-chain masks.
+    let identity = eeprom::Identity {
+        mac: [2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+        eeprom_version: 2,
+        template_version: 2,
+        regulatory_domains: [0x3a, 0],
+        op_flags: 2,
+        rx_chainmask: 1,
+        tx_chainmask: 1,
+        tx_gain: 0,
+        rx_gain: 0,
+    };
+    let prepared = phy::Prepared {
+        frequency,
+        modes_index: if frequency >= 4800 { 1 } else { 4 },
+        carrier_leak_cal: true,
+        selfgen_mask: 1,
+        power: power::plan(&AR9300_DEFAULT, frequency, ctl, 40, 1)?,
+        ini_writes: 200,
+    };
+    let revision = Revision {
+        chip: Chip::Ar9485,
+        mac_rev: 1,
+        pcie: true,
+    };
+    Facts::new_ar9003(
+        &device(id),
+        &revision,
+        &identity,
+        &prepared,
+        &AR9300_DEFAULT,
+        frequency,
+        ctl,
+    )
+}
+
 fn ar9565_record(facts: &Facts, channel: u8, antenna: u8, ceiling: u8) -> Vec<u8> {
     // The shared `record` helper lays out the AR9300 shape; the AR9565
     // record replaces the magic and the chain-mask bytes.
     let mut b = record(facts, antenna, ceiling);
     b[..4].copy_from_slice(b"N65A");
+    b[54..58].copy_from_slice(&[channel, 20, 1, 1]);
+    b
+}
+
+fn ar9485_record(facts: &Facts, channel: u8, antenna: u8, ceiling: u8) -> Vec<u8> {
+    // The shared `record` helper already lays out [channel, 20, 3, 3]:
+    // the AR9485's single-chain masks are [channel, 20, 1, 1].
+    let mut b = record(facts, antenna, ceiling);
+    b[..4].copy_from_slice(b"N48A");
     b[54..58].copy_from_slice(&[channel, 20, 1, 1]);
     b
 }
@@ -1274,4 +1321,64 @@ fn smoke_ath9k_ar9565_admission_records_bind_part_channel_and_magic() -> TestRes
 kernel_test_in!(
     "drivers/wireless/ath9k/admission",
     smoke_ath9k_ar9565_admission_records_bind_part_channel_and_magic
+);
+
+fn smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic() -> TestResult {
+    use crate::ath9k::ar9003::Chip;
+    let (Ok(two), Ok(ar1111), Ok(ar9300)) = (
+        ar9485_facts(0x0032, 2412, 0x12),
+        ar9485_facts(0x0037, 2412, 0x12),
+        ar9300_facts(0x0030, 2412, 0x12),
+    ) else {
+        return TestResult::Fail("AR9485 admission facts refused");
+    };
+    if two.request().filename != "ath9k/ar9485-admit-v1-ch1-02aabbccddee.bin"
+        || ar1111.request().filename != "ath9k/ar9485-admit-v1-ch1-02aabbccddee.bin"
+        || two.request().device != 0x0032
+        || ar1111.request().device != 0x0037
+        || two.request().identity == ar1111.request().identity
+        || two.request().identity == ar9300.request().identity
+    {
+        return TestResult::Fail("AR9485 records are not keyed per part and channel");
+    }
+    // Each AR9003 part is bound to its own device ID, and the 2.4
+    // GHz-only AR9485 refuses 5 GHz and off-grid channels.
+    if ar9003_facts(Chip::Ar9485, 0x0033, 2412, 0x12).is_ok()
+        || ar9003_facts(Chip::Ar9300, 0x0032, 2412, 0x12).is_ok()
+        || ar9485_facts(0x0032, 5180, 0x10).is_ok()
+        || ar9485_facts(0x0032, 2414, 0x12).is_ok()
+    {
+        return TestResult::Fail("AR9485 facts accepted a foreign device or channel");
+    }
+    let factory = two.factory_antenna;
+    let Ok(grant) = load(two.clone(), ar9485_record(&two, 1, factory, 30), true) else {
+        return TestResult::Fail("well-formed signed N48A record refused");
+    };
+    if grant.ceiling(40) != 30 {
+        return TestResult::Fail("AR9485 signed ceiling not applied");
+    }
+    let mut chains = ar9485_record(&two, 1, factory, 30);
+    chains[56] = 3;
+    for bytes in [
+        ar9300_record(&two, 1, factory, 30),  // AR9300 magic
+        ar9485_record(&two, 36, factory, 30), // wrong channel byte
+        ar9485_record(&two, 1, factory, 41),  // ceiling above 40
+        chains,                               // foreign chain mask
+        ar9485_record(&two, 1, factory, 30)[..127].to_vec(),
+    ] {
+        if load(two.clone(), bytes, true).is_ok() {
+            return TestResult::Fail("foreign or malformed N48A record admitted");
+        }
+    }
+    // An AR9485 record never admits the AR9300 facts.
+    if load(ar9300.clone(), ar9485_record(&ar9300, 1, factory, 30), true).is_ok()
+        || load(two.clone(), ar9485_record(&two, 1, factory, 30), false).is_ok()
+    {
+        return TestResult::Fail("N48A record crossed parts or admitted unsigned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/admission",
+    smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic
 );

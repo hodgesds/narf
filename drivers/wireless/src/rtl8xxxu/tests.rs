@@ -930,6 +930,7 @@ fn smoke_rtl8xxxu_class_registry_rtl8188eu_match() -> TestResult {
     // Register a no-op probe so the table is in.
     fn noop_probe(
         _dev: alloc::sync::Arc<narf_drivers_usb::device::USBDevice>,
+        _hub_port: Option<(u8, u8)>,
     ) -> Result<(), narf_drivers_usb::class_registry::UsbProbeError> {
         Ok(())
     }
@@ -976,6 +977,7 @@ fn smoke_rtl8xxxu_class_registry_non_matching() -> TestResult {
 
     fn noop_probe(
         _dev: alloc::sync::Arc<narf_drivers_usb::device::USBDevice>,
+        _hub_port: Option<(u8, u8)>,
     ) -> Result<(), narf_drivers_usb::class_registry::UsbProbeError> {
         Ok(())
     }

@@ -77,6 +77,30 @@ const RX_QUEUE: usize = 32;
 const CONTROLS: usize = 8;
 const BATCH: usize = 256;
 
+/// Single-TID BlockAckReq parse (gen2 F9): a 20-byte control frame
+/// (FC + Duration + RA + TA + BAR Control + Starting Sequence
+/// Control, FCS stripped by the hardware) from the bound peer to this
+/// station, with the Multi-TID bit clear and Fragment Number zero.
+/// Returns (TID, SSN) or `None` for a non-BAR frame, a malformed BAR,
+/// or a multi-TID BAR (consumed without advance). Pure; pinned by
+/// `gen2_station_tests`.
+pub(super) fn bar_requests(frame: &Mpdu, own: [u8; 6], peer: [u8; 6]) -> Option<(u8, u16)> {
+    let b = &frame.bytes;
+    if b.len() != 20 || b[0] != 0x84 {
+        return None;
+    }
+    let control = u16::from_le_bytes([b[16], b[17]]);
+    let ssn_raw = u16::from_le_bytes([b[18], b[19]]);
+    if b[4..10] != own || b[10..16] != peer || control & 0x0002 != 0 || ssn_raw & 0x000f != 0 {
+        return None;
+    }
+    let tid = (control >> 12) as u8;
+    if tid >= 8 {
+        return None;
+    }
+    Some((tid, ssn_raw >> 4))
+}
+
 /// `rtl8xxxu_refresh_rate_mask` peer inputs for a legacy association:
 /// the negotiated `supp_rates[0]`; no HT capability is advertised.
 pub(super) fn legacy_peer(legacy: u16) -> rtl8192e_ra::Peer {
@@ -397,6 +421,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             if self.control_frame(&frame, admitted, now)? {
                 continue;
             }
+            if self.bar_frame(&frame, admitted, now)? {
+                continue;
+            }
             if self.data_frame(&frame, admitted, now, &mut *nonce)? {
                 return Ok(());
             }
@@ -696,6 +723,37 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             return Err(Error::State);
         }
         if let Some(body) = self.ba.action(&b[24..], now) {
+            self.controls.push_back(body);
+        }
+        self.sync_ba();
+        Ok(true)
+    }
+    /// BlockAckReq gate (gen2 F9): a single-TID BAR from the bound peer
+    /// on the station's own address advances the recipient reorder
+    /// session (or earns one recipient DELBA for an unexpected TID);
+    /// every other control frame is consumed without action, so a BA
+    /// (which the descriptor layer admits) never reaches the DATA path
+    /// as an ethernet frame. Multi-TID BARs are consumed but not
+    /// advanced: the BlockAck bitmap layout is per-TID and the session
+    /// advance is single-TID (a follow-up if APs send multi-TID BARs).
+    /// Returns true when the frame is consumed (all control frames).
+    fn bar_frame(&mut self, frame: &Mpdu, admitted: bool, now: u64) -> Result<bool, Error> {
+        let Some((tid, ssn)) = bar_requests(frame, self.radio.local(), self.peer()) else {
+            // Not a BAR: control frames are still consumed (never DATA),
+            // management/data frames fall through to the DATA path.
+            return Ok(frame.bytes.first().is_some_and(|f| f & 0x0c == 0x04));
+        };
+        if !admitted || !self.controlled_port_open() || !self.plan.ht_selected() {
+            return Ok(true);
+        }
+        let (released, delba) = self.ba.bar(tid, ssn, now);
+        for item in released.into_iter().rev() {
+            self.batch.push_front(item);
+        }
+        for body in delba {
+            if self.controls.len() >= CONTROLS {
+                return Err(Error::State);
+            }
             self.controls.push_back(body);
         }
         self.sync_ba();

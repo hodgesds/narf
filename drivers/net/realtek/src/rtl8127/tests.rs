@@ -11,13 +11,15 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
     build_rx_desc, build_tx_desc, cr_reset_value, decode_mac, decode_xid, firmware_name_for_xid,
-    mac_is_invalid, mac_version_from_xid, name_for, phy_config_table_is_well_formed, MacVersion,
-    PhyConfigKind, PhyStatus, TxDesc, COALESCE_BLOCK_END_8127, COALESCE_BLOCK_START, CR_RST,
-    FIRMWARE_8127A_1, INT32_LINKCHG, INT32_ROK, INT32_TOK, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP,
-    PHYSTAT_LINKSTS, PHY_CONFIG_TABLE, PHY_CONFIG_TABLE_LEN, REG_IMR_8125, REG_INT_CFG0_8125,
-    REG_INT_CFG1_8125, REG_ISR_8125, REG_TPPOLL_8125, RING_LEN, RTL_DEV_8127, RTL_VENDOR, RXD_EOR,
-    RXD_LEN_MASK, RXD_OWN, RX_BUF_LEN, RX_FETCH_DFLT_8125, RX_PAUSE_SLOT_ON, TPPOLL_NPQ, TXD_EOR,
-    TXD_FS, TXD_LS, TXD_OWN,
+    mac_is_invalid, mac_version_from_xid, name_for, phy_config_table_is_well_formed,
+    rss_fill_opts1, rss_rearm_opts1, rss_rx_csum, rx_queue_base_reg, select_msix_count,
+    select_rss_queues, MacVersion, PhyConfigKind, PhyStatus, RxCsumResult, TxDesc,
+    COALESCE_BLOCK_END_8127, COALESCE_BLOCK_START, CR_RST, FIRMWARE_8127A_1, INT32_LINKCHG,
+    INT32_ROK, INT32_TOK, PHYSTAT_1000BPSF, PHYSTAT_FULLDUP, PHYSTAT_LINKSTS, PHY_CONFIG_TABLE,
+    PHY_CONFIG_TABLE_LEN, REG_IMR_8125, REG_INT_CFG0_8125, REG_INT_CFG1_8125, REG_ISR_8125,
+    REG_RDSAR, REG_RDSAR_Q1_LOW, REG_TPPOLL_8125, RING_LEN, RSS_RX_TCPFAIL, RSS_RX_TCPT,
+    RSS_RX_UDPFAIL, RSS_RX_UDPT, RTL_DEV_8127, RTL_VENDOR, RXD_EOR, RXD_LEN_MASK, RXD_LS, RXD_OWN,
+    RX_BUF_LEN, RX_FETCH_DFLT_8125, RX_PAUSE_SLOT_ON, TPPOLL_NPQ, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
 };
 
 // ── PCI match table ──────────────────────────────────────────────────
@@ -504,3 +506,219 @@ kernel_test_in!(
     "drivers/net/rtl8127",
     smoke_rtl8127_firmware_delay_is_capped
 );
+
+// ── RSS multi-ring datapath ──────────────────────────────────────────
+// Fixture coverage for the pieces the multi-ring bring-up programs
+// without hardware: queue-count selection, per-queue descriptor
+// bases, MSI-X vector-count selection, RSS-format checksum decode,
+// RSS descriptor fill/rearm words, and the indirection routing
+// model (hash key/table programming itself is covered by the
+// shared `smoke_features_rss_ver80` fixture).
+
+fn smoke_rtl8127_rss_queue_count_selection() -> TestResult {
+    // Linux's rule: rounddown_pow2(min(cpus, 8)), minimum 1.
+    let cases: [(u32, usize); 11] = [
+        (0, 1),
+        (1, 1),
+        (2, 2),
+        (3, 2),
+        (4, 4),
+        (5, 4),
+        (7, 4),
+        (8, 8),
+        (9, 8),
+        (16, 8),
+        (64, 8),
+    ];
+    for (cpus, want) in cases {
+        let got = select_rss_queues(cpus);
+        if got != want {
+            return TestResult::Fail("rss queue count wrong for cpu count");
+        }
+        if !(1..=8).contains(&got) || got & (got - 1) != 0 {
+            return TestResult::Fail("rss queue count not a power of two in [1, 8]");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/rtl8127",
+    smoke_rtl8127_rss_queue_count_selection
+);
+
+fn smoke_rtl8127_rss_queue_base_regs() -> TestResult {
+    if rx_queue_base_reg(0) != REG_RDSAR {
+        return TestResult::Fail("queue 0 base is not REG_RDSAR");
+    }
+    if REG_RDSAR != 0xE4 {
+        return TestResult::Fail("REG_RDSAR is not 0xE4");
+    }
+    if rx_queue_base_reg(1) != REG_RDSAR_Q1_LOW {
+        return TestResult::Fail("queue 1 base is not RDSAR_Q1_LOW");
+    }
+    if REG_RDSAR_Q1_LOW != 0x4000 {
+        return TestResult::Fail("RDSAR_Q1_LOW is not 0x4000");
+    }
+    // Stride 8 (one 64-bit lo+hi pair per queue), strictly
+    // increasing, all distinct.
+    let mut prev = rx_queue_base_reg(0);
+    for q in 1..8 {
+        let base = rx_queue_base_reg(q);
+        if base != REG_RDSAR_Q1_LOW + ((q - 1) as u64) * 8 {
+            return TestResult::Fail("queue base stride is not 8");
+        }
+        if base <= prev {
+            return TestResult::Fail("queue bases are not strictly increasing");
+        }
+        prev = base;
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_rss_queue_base_regs);
+
+fn smoke_rtl8127_rss_msix_count() -> TestResult {
+    // (table size, want) -> request; 0 means "no MSI-X".
+    let cases: [(u16, u16, u16); 6] = [
+        (0, 30, 0),
+        (32, 30, 30),
+        (4, 30, 4),
+        (1, 1, 1),
+        (32, 1, 1),
+        (2, 30, 2),
+    ];
+    for (size, want, expect) in cases {
+        if select_msix_count(size, want) != expect {
+            return TestResult::Fail("msix vector count selection wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_rss_msix_count);
+
+fn smoke_rtl8127_rss_csum_decode() -> TestResult {
+    let cases: [(u32, RxCsumResult); 9] = [
+        (RSS_RX_TCPT, RxCsumResult::Ok),
+        (RSS_RX_UDPT, RxCsumResult::Ok),
+        (RSS_RX_TCPFAIL, RxCsumResult::Fail),
+        (RSS_RX_UDPFAIL, RxCsumResult::Fail),
+        (0, RxCsumResult::None),
+        (RSS_RX_TCPT | RSS_RX_TCPFAIL, RxCsumResult::Fail),
+        (RSS_RX_UDPT | RSS_RX_UDPFAIL, RxCsumResult::Fail),
+        // OK takes precedence over an unrelated Fail bit.
+        (RSS_RX_TCPT | RSS_RX_UDPFAIL, RxCsumResult::Ok),
+        (RSS_RX_UDPT | RSS_RX_TCPFAIL, RxCsumResult::Ok),
+    ];
+    for (opts1, want) in cases {
+        if rss_rx_csum(opts1) != want {
+            return TestResult::Fail("rss csum decode wrong");
+        }
+    }
+    // Length/status bits do not disturb the decode.
+    if rss_rx_csum(RSS_RX_TCPT | RXD_LS | 0x40) != RxCsumResult::Ok {
+        return TestResult::Fail("rss csum decode disturbed by LS/len bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_rss_csum_decode);
+
+fn smoke_rtl8127_rss_rearm_words() -> TestResult {
+    let bufsize = (RX_BUF_LEN as u32) & RXD_LEN_MASK;
+    if rss_fill_opts1(0) != RXD_OWN | bufsize {
+        return TestResult::Fail("rss fill word for slot 0 wrong");
+    }
+    if rss_fill_opts1(RING_LEN - 1) != RXD_OWN | RXD_EOR | bufsize {
+        return TestResult::Fail("rss fill word for wrap slot missing EOR");
+    }
+    // Rearm preserves EOR from the descriptor being rearmed
+    // (Linux's `mark_to_asic` RSS branch) and drops it when the
+    // rearmed descriptor had none.
+    if rss_rearm_opts1(RXD_EOR | bufsize) != RXD_OWN | RXD_EOR | bufsize {
+        return TestResult::Fail("rss rearm did not preserve EOR");
+    }
+    if rss_rearm_opts1(bufsize) != RXD_OWN | bufsize {
+        return TestResult::Fail("rss rearm invented EOR");
+    }
+    // A stale OWN bit in the rearmed word is idempotent (OR).
+    if rss_rearm_opts1(RXD_OWN | RXD_EOR | bufsize) != RXD_OWN | RXD_EOR | bufsize {
+        return TestResult::Fail("rss rearm not idempotent over OWN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_rss_rearm_words);
+
+/// Minimal Ethernet + IPv4 + TCP frame for the routing model:
+/// 14-byte Ethernet header (ethertype 0x0800), 20-byte IPv4
+/// header (proto TCP, unfragmented), 4-byte TCP ports.
+fn rss_test_frame(src_port: u16, dst_port: u16) -> alloc::vec::Vec<u8> {
+    let mut f = alloc::vec![0u8; 38];
+    // Ethertype IPv4.
+    f[12] = 0x08;
+    f[13] = 0x00;
+    // IPv4: version/IHL, proto TCP at +9, src/dst at +12/+16.
+    f[14] = 0x45;
+    f[14 + 9] = 6;
+    f[14 + 12] = 10;
+    f[14 + 13] = 0;
+    f[14 + 14] = 0;
+    f[14 + 15] = 1;
+    f[14 + 16] = 10;
+    f[14 + 17] = 0;
+    f[14 + 18] = 0;
+    f[14 + 19] = 2;
+    // TCP ports at l4 = 14 + 20.
+    f[34] = (src_port >> 8) as u8;
+    f[35] = (src_port & 0xff) as u8;
+    f[36] = (dst_port >> 8) as u8;
+    f[37] = (dst_port & 0xff) as u8;
+    f
+}
+
+fn smoke_rtl8127_rss_routing_properties() -> TestResult {
+    use narf_net::rss::RssConfig;
+    let config = RssConfig::standard(4, crate::features::RSS_INDIR_ENTRIES);
+    // Balanced indirection: 128 entries, every queue exactly 32.
+    if config.indirection.len() != 128 {
+        return TestResult::Fail("rss indirection table is not 128 entries");
+    }
+    let mut counts = [0usize; 4];
+    for q in &config.indirection {
+        if (*q as usize) >= 4 {
+            return TestResult::Fail("rss indirection entry out of queue range");
+        }
+        counts[*q as usize] += 1;
+    }
+    if counts != [32, 32, 32, 32] {
+        return TestResult::Fail("rss indirection is not balanced over 4 queues");
+    }
+    // Deterministic: the same flow always lands on the same queue.
+    let frame = rss_test_frame(12345, 80);
+    let q0 = config.rx_queue(&frame);
+    if config.rx_queue(&frame) != q0 {
+        return TestResult::Fail("rss routing is not deterministic");
+    }
+    // Non-IP frames land on queue 0.
+    if config.rx_queue(&[]) != 0 {
+        return TestResult::Fail("empty frame did not land on queue 0");
+    }
+    let mut arp = alloc::vec![0u8; 14];
+    arp[12] = 0x08;
+    arp[13] = 0x06;
+    if config.rx_queue(&arp) != 0 {
+        return TestResult::Fail("non-IP frame did not land on queue 0");
+    }
+    // Distribution: sweeping destination ports must spread
+    // across queues (not all queue 0) and stay in range.
+    let mut seen = [false; 4];
+    for port in 0..128u16 {
+        let q = config.rx_queue(&rss_test_frame(12345, port));
+        if q >= 4 {
+            return TestResult::Fail("rss routing out of queue range");
+        }
+        seen[q] = true;
+    }
+    if seen.iter().filter(|s| **s).count() < 2 {
+        return TestResult::Fail("rss routing did not spread across queues");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_rss_routing_properties);

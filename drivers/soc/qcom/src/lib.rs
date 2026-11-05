@@ -19,6 +19,12 @@
 //! | [`q6v5`]    | `drivers/remoteproc/qcom_q6v5.c`                     |
 //! | [`wcss`]    | `drivers/remoteproc/qcom_q6v5_wcss.c` (IPQ8074 ops)  |
 //! | [`pas`]     | `drivers/remoteproc/qcom_q6v5_pas.c` (WPSS)          |
+//! | [`cmd_db`]  | `drivers/soc/qcom/cmd-db.c` (resource addresses)    |
+//! | [`rpmh`]    | `drivers/soc/qcom/rpmh-rsc.c` + `rpmh.c`, `rpmhpd.c`,
+//! |             | `clk-rpmh.c` (proxy votes)                          |
+//! | [`aoss`]    | `drivers/soc/qcom/qcom_aoss.c` (QMP) + `qcom_q6v5.c`
+//! |             | load-state message                                  |
+//! | [`wpss`]    | WPSS power sequence (votes + load-state)            |
 //! | [`rproc`]   | `remoteproc_core.c` boot/shutdown contract           |
 //!
 //! Nothing here has run on Qualcomm silicon; QEMU emulates no IPQ/SC7280
@@ -34,6 +40,8 @@
 
 extern crate alloc;
 
+pub mod aoss;
+pub mod cmd_db;
 pub mod dt;
 pub mod gcc;
 pub mod glink;
@@ -45,12 +53,18 @@ pub mod mdt;
 pub mod pas;
 pub mod platform;
 pub mod q6v5;
+pub mod rpmh;
 pub mod rproc;
 pub mod scm;
 pub mod smem;
 pub mod smp2p;
 pub mod wcss;
+pub mod wpss;
 
+#[cfg(any(test, feature = "kernel-test"))]
+mod aoss_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod cmd_db_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod fixtures;
 #[cfg(any(test, feature = "kernel-test"))]
@@ -58,4 +72,8 @@ mod glink_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod irq_tests;
 #[cfg(any(test, feature = "kernel-test"))]
+mod rpmh_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod wpss_tests;

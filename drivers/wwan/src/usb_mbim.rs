@@ -523,7 +523,7 @@ pub fn attached_mbim_count() -> usize {
 
 /// Class-registry probe: claim the slot and spawn the async
 /// bring-up. Returns `Ok` on claim, mirroring the rtl8xxxu pattern.
-pub fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
+pub fn probe(device: Arc<USBDevice>, _hub_port: Option<(u8, u8)>) -> Result<(), UsbProbeError> {
     {
         let key = (device.controller().id(), device.slot_id());
         let mut claimed = MBIM_CLAIMED_SLOTS.lock();

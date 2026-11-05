@@ -1033,6 +1033,7 @@ fn pd_contract_and_usb4_entry() -> Option<((u32, u32), EnterUsbDataObject)> {
 /// without a live `Arc<USBDevice>` — so it declines.
 fn cascade_probe_unused(
     _dev: Arc<narf_drivers_usb::device::USBDevice>,
+    _hub_port: Option<(u8, u8)>,
 ) -> Result<(), UsbProbeError> {
     Err(UsbProbeError::BindFailed)
 }

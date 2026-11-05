@@ -2304,6 +2304,7 @@ pub static UVC_MATCH: [crate::class_registry::UsbClassMatch; 1] =
 
 pub fn probe(
     _device: alloc::sync::Arc<crate::device::USBDevice>,
+    _hub_port: Option<(u8, u8)>,
 ) -> Result<(), crate::class_registry::UsbProbeError> {
     use core::fmt::Write;
     let _ = writeln!(

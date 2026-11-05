@@ -177,7 +177,7 @@ MHI/QMI support for another revision do not imply a registered WLAN:
 |---|---|---|
 | WCN6855 / QCA2066 / QCA6698AQ | MHI/QMI, CE/HTC/WMI, DP and STA/AP/P2P interfaces | Target-card and AP interoperability validation remains; optional Linux features outside this profile are not implied |
 | QCA6390 HW2.0 | Native IPQ8074 RX/error/fragment DP and production core/CE profile; resource and host vdev capacity four | Native DMA fixtures pass both architectures; composed production-profile CE startup, WPA2 station/data and four-slot fixtures now execute on both architectures; the full ARM64 subtree passes366 smokes with no failures and3 environment skips; physical interoperability remains |
-| QCN9074 HW1.0 | Recognized PCI ID; `qcn9074_regs`, static BAR windows, multi-pdev `CoreConfig` / `DpHwParams` admission; probe admits it since the composed PCI start-up smoke runs the startup path through admission on pdev 0 (fixture-tested only) | Multi-pdev runtime residuals: the RX service pass (refill replenish, RXDMA error and monitor-status reaping) covers pdev 0 only, the mac layer registers one radio on pdev 0 (`MacConfig::wcn6855`) and WMI commands go to `wmi[0]` although every per-pdev endpoint is connected, and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported; nothing run on hardware |
+| QCN9074 HW1.0 | Recognized PCI ID; `qcn9074_regs`, static BAR windows, multi-pdev `CoreConfig` / `DpHwParams` admission; probe admits it since the composed PCI start-up smoke runs the startup path through admission on pdev 0 (fixture-tested only) | Multi-pdev runtime residuals: the RX service pass, the mac layer and WMI routing are per-pdev (one MAC + netdev per allocated pdev, commands on that pdev's WMI endpoint; `MacConfig::for_radio` + `DeviceCaps::from_events_for`), and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported; nothing run on hardware |
 
 Probe first verifies inherited bus mastering and memory decode are off,
 with INTx masked, using command-register readback. Rejected family/singleton
@@ -1470,7 +1470,7 @@ step starts with `Rt::service()`:
    interrupt or every 100 ms; a reported crash is kept in
    `Rt::fw_notice` (first one wins).
 
-`Port` (`Arc<Shared>, vdev_id`) implements `mac::WmiPort` (`send` =
+`Port` (`Arc<Shared>, vdev_id, pdev_id`) implements `mac::WmiPort` (`send` =
 `ath11k_wmi_cmd_send` with credit / CE-full retry for 3 s;
 `next_event`; `mgmt_tx` = IDR id (≤ 512 pending) + DMA32 copy +
 `wmi::mgmt_send_cmd(vdev, id, frame, paddr, 0, false)`, freed on
@@ -1733,12 +1733,15 @@ interface return `HardwareError` (nl80211's `-ENETDOWN`). The command-line
 autoconnect sets `IFF_UP` before its first attempt, as `ip link set up`
 precedes wpa_supplicant.
 
-`start_pci(core, dp)`: `Rt::new` → `device_caps` (SERVICE_READY /
-EXT / READY; `step::MAC_CAPS`) → `Mac::new(Port, Port, caps,
-MacConfig::wcn6855(), core.reg_info)` (`ath11k_mac_register`) →
-`register_pci` (down; the hardware starts on `IFF_UP`). Failures latch their layer's step; the
-runtime is parked (`STRANDED_RT`), nothing panics, the init path never
-waits on it (all of it runs in the probe-spawned MHI task).
+`start_pci(core, dp)`: `Rt::new` → per allocated pdev, `device_caps`
+(single-pdev) or `device_caps_for(pdev)` (multi-pdev) → `Mac::new(Port,
+Port, caps, MacConfig::wcn6855()` or `MacConfig::for_radio(..).with_vdev(slot)`,
+`core.reg_info)` (`ath11k_mac_register`) → `register_pci` (down; the
+hardware starts on `IFF_UP`). A later radio whose caps are unavailable
+(no READY extra MAC address) is skipped, never invented. Failures latch
+their layer's step; the runtime is parked (`STRANDED_RT`), nothing
+panics, the init path never waits on it (all of it runs in the
+probe-spawned MHI task).
 
 `start_ahb(core, dp)`: `Rt::new` → `device_caps` → `Mac::new(Port,
 Port, caps, MacConfig::wcn6855(), core.reg_info)` → `register_ahb`
@@ -1815,6 +1818,17 @@ restart; detail 1, 3 caps).
    `qmi_firmware_ready(DpHooks)` over the same transport (new CE / HTC /
    WMI / DP; the TX queues and pending statuses carried over), the new
    `Rt` back in the slot.
+   The AHB path reuses the same tail through
+   `Shared::recover_after_remote_restart(restart)`: the transport
+   restart is caller-provided (remote shutdown + boot + a fresh WLFW
+   session over the re-registered GLINK edge, instead of the MHI power
+   cycle), driven by the post-boot crash-monitor task — which polls the
+   SMP2P edges (`LiveAhb::monitor_tick`), applies the same failure
+   gate (`recovery_gated`: FINAL always, FIRST inside the fail window),
+   quiesces (`pre_reconfigure_recovery`), and recovers — rather than by
+   a `FwNotice`. Host-side state (CE/HIF mappings, IRQ bindings, iface
+   registration) survives the remote restart and is reused by the
+   rebuilt core.
    The shared channel-reservation table is logical netdev ownership, not a
    mirror of firmware memory: it stays reserved throughout physical reset,
    replay and cancellation. Losing the firmware's channel contexts cannot
@@ -1985,7 +1999,7 @@ pub trait AhbEnv: Send + Sync + 'static {
     fn remote_tick(&self) {}                                                  // fixtures play the remote
 }
 pub struct LiveAhb<E: AhbEnv> { pub env: E, pub outcome: Option<LiveOutcome<E>>, pub failure, .. } // impl AhbBringUp
-impl LiveAhb { new(env, blob), hif(), rproc_state(), qrtr_open(), glink_negotiated(), set_wlan_smp2p(v) }
+impl LiveAhb { new(env, blob), hif(), rproc_state(), qrtr_open(), glink_negotiated(), set_wlan_smp2p(v), monitor_tick(p), restart_transport(p) }
 pub enum LiveOutcome<E> { Ready(Box<AhbCore<E>>, Box<Dp>), Stranded(Box<AhbCore<E>>, Option<Box<Dp>>) }
 pub type AhbWlfw<E> = Wlfw<GlinkQrtr<GlinkSmem<&Regs, DtKick<&Regs>>, Bus>, Fw, Dma>;
 pub struct NarfAhbEnv;      // MmioRegs, NarfDelay, ArchSmc, CoherentAlloc, NarfFirmware, Dma32, AhbGlinkBus
@@ -2014,8 +2028,12 @@ windows) and builds the HIF; then `CoreConfig::for_hw` +
 `qmi_firmware_ready` with `DpHooks` (`DpHwParams::for_rev`). The WLFW
 task hands a ready core to `runtime::start_ahb` (`Rt` + `Shared`, MAC
 from `device_caps`, initial netdev via `iface::register_ahb`); a failed
-core is kept unregistered. Not done: post-boot SMP2P crash monitoring
-(`fatal` / `wdog` → recovery), and RPMh / AOSS QMP votes (§8).
+core is kept unregistered. Post-boot SMP2P crash monitoring (`fatal` /
+`wdog` → recovery) is implemented: the crash-monitor task polls the
+edges and recovery restarts the remote and rebuilds the core through the
+shared runtime tail (fixture-proven through the remote restart; the WLFW
+re-run leg awaits the fake WLFW server fixture). Not done: RPMh / AOSS
+QMP votes (§8).
 
 Per-chip `hw_ops` (`hw_ops.rs`, Linux `hw.c` `*_ops`; the `rx_desc_*`
 members are `RxDescriptor`):
@@ -2155,8 +2173,8 @@ from physical RF, board, firmware and userspace interoperability acceptance.
 |---|---|---|
 | WCN6855 HW2.0/HW2.1 | Native dynamic-window PCI/MHI/QMI/CE/HTC/WMI/DP; advertised-band legacy/HT/VHT/HE station/AP/P2P, security/keys/PMF, four-vdev/two-channel ownership, scan/ROC, recovery and PS/WoW/cold suspend; firmware power readback and retained recovery channel reservations | Native composed hardware fixtures now run on aarch64: the2026-10-29 subtree completes366 passed/0 failed/3 environment skips, including Open/WPA2 actual DHCP, HE connection and recovery with an unscheduled old waiter. Lazy heap construction, explicit non-inlined poll boundaries and separate transient core/Rt fixture construction avoid overflowing the64KiB boot stack. The retained production recovery future also has its own heap/poll boundary. No kernel stack size or TCB code changed. The latest x86 subtree also completes367 passed/0 failed/2 environment skips. Full branch gates remain separate. DT board-variant and `memory-region` fixed-memory discovery are implemented (`board::dt_facts`, `wlfw::assign_fixed_target_mem`). Per-dialog TWT control and radar-detector diagnostics are implemented as the Linux debugfs-equivalent `Mac`/`Shared` APIs (`mac/diag.rs`; no nl80211 surface exists in Linux either). Non-contiguous RATEMASK programming and spectral diagnostics are inapplicable: Linux refuses the former with `-EINVAL` and initialises spectral only when `hw_params.spectral.fft_sz != 0`, which is false for every admitted profile (`hw::HwRev::spectral`, `hw::spectral_supported`; `group_pn_tests.rs::smoke_ath11k_spectral_inapplicable_on_admitted_pci`). |
 | QCA6390 HW2.0 | Independent IPQ8074 RX descriptor/DP profile and core dispatch, shared supported MAC/runtime capabilities, native normal/error/coalescing/fragment ownership and composed station/recovery path | The same explicit optional/control and architecture gaps above apply only when target services advertise them. Six-GHz/HE160/80+80/extended security are admitted only from actual band, peer and firmware capabilities, not inferred from WCN6855. |
-| QCN9074 | `qcn9074_regs`, static CE/UMAC BAR windows (`NativeIo` routing + `ath11k_pci_select_static_window` after MHI start), `CoreConfig` (1 radio, 8 vdevs, 128 peers) and multi-pdev `DpHwParams` (rxdma1, peer-map v2, full monitor flag); passes `validate_runtime_profile`; per-pdev rings + SRING_SETUP, `ath11k_init_wmi_config_ipq8074` init_cmd with band-to-mac (`multi_pdev_tests.rs`); composed PCI startup smoke on pdev 0 (`smoke_ath11k_qcn9074_pci_startup`, probe admits) | The RX service pass (refill replenish, RXDMA error and monitor-status reaping) covers pdev 0 only, the mac layer registers one radio on pdev 0 (`MacConfig::wcn6855`) and WMI commands go to `wmi[0]` although every per-pdev endpoint is connected, and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported. Nothing run on hardware. |
-| Other Linux ath11k SoC/AHB profiles (IPQ8074, IPQ6018, IPQ5018, WCN6750) | Qualcomm SoC platform layer (`drivers/soc/qcom`, `narf-drivers-qcom-soc`): DT platform devices and remoteproc resource resolution, SCM over SMCCC (PAS init/mem-setup/auth-and-reset/shutdown), MDT/MBN split loader, SMEM v11/v12, TCSR mutex, SMP2P, APCS/IPCC kicks, GCC reset/branch tables, Q6 WCSS host-reset start/stop (IPQ) and PAS WPSS start/stop (WCN6750). ath11k AHB glue (§3.12, `ahb.rs`): `ath11k_ahb_of_match`, the four AHB `hw_params` entries (CE/target-CE/service maps, QMI instance ids, ring masks, `ipq8074_regs`/`ipq5018_regs`/`wcn6750_regs`, CE remap/IE addresses, BDF address, firmware dir), the 52 named IRQs with CE and DP-group mapping, WCN6750 static windows and hybrid MSI resources, MSA/CE `memory-region`s, `qcom,rproc` resolution and boot through the matching loader; fixture-tested only (`ahb_tests.rs`, `drivers/soc/qcom/src/tests.rs`) | Admitted into the `HwRev`-keyed tables (§2.2, §3.12) and implemented in software, fixture/QEMU-tested only (nothing run on silicon): GLINK-SMEM + QRTR over GLINK, DT interrupt delivery, WLFW AHB paths, the AHB HIF, the bus DT driver match (`ath11k_ahb`), the production bring-up `ahb_live::LiveAhb` (MMIO mapping, live `Q6Wcss` / `PasRproc` boot with SMEM/SMP2P, GlinkSmem + GlinkQrtr, WLFW task handing a ready core to `runtime::start_ahb`), multi-pdev DP (rxdma1 rings, per-pdev SRING_SETUP, peer-map v2) and WMI (`init_cmd` with `ath11k_init_wmi_config_ipq8074`, per-pdev WMI endpoints), and the AHB netdev (`iface::register_ahb`: one initial netdev per AHB-attached radio, fixture-tested in `ahb_netdev_tests.rs`). Residual, all chips: no post-boot SMP2P crash monitoring / recovery, and the path after WLFW FW_READY now has a GLINK fixture (fake WLFW server in `ahb_live_tests.rs`: WCN6750 FW_READY + DEVICE_INFO BAR mapping through the real bring-up, IPQ6018 FW_READY incl. cold-boot calibration; remaining: core start past `firmware_start`, which needs a CE/HTC/WMI target fake). IPQ8074/IPQ6018/IPQ5018 multi-pdev: the RX service pass (refill replenish, RXDMA error and monitor-status reaping) covers pdev 0 only, the mac layer registers one radio on pdev 0 (`MacConfig::wcn6855`) and WMI commands go to `wmi[0]` although every per-pdev endpoint is connected, and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported. IPQ8074: mainline has no WCSS DT node and no `GCC_WCSSAON_RESET`. IPQ5018: no upstream `ipq5018` WCSS remoteproc binding. WCN6750: RPMh `xo` / `cx` / `mx` proxy votes need an RPMh RSC + cmd-db driver (not in `drivers/soc/qcom`); AOSS QMP `load_state` could be built from the existing `io::RegIo` + `ipc::Ipcc` pieces but is not implemented. |
+| QCN9074 | `qcn9074_regs`, static CE/UMAC BAR windows (`NativeIo` routing + `ath11k_pci_select_static_window` after MHI start), `CoreConfig` (1 radio, 8 vdevs, 128 peers) and multi-pdev `DpHwParams` (rxdma1, peer-map v2, full monitor flag); passes `validate_runtime_profile`; per-pdev rings + SRING_SETUP, `ath11k_init_wmi_config_ipq8074` init_cmd with band-to-mac (`multi_pdev_tests.rs`); composed PCI startup smoke on pdev 0 (`smoke_ath11k_qcn9074_pci_startup`, probe admits) | The RX service pass, the mac layer and WMI routing are per-pdev (one MAC + netdev per allocated pdev, commands on that pdev's WMI endpoint; `MacConfig::for_radio` + `DeviceCaps::from_events_for`), and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported. Nothing run on hardware. |
+| Other Linux ath11k SoC/AHB profiles (IPQ8074, IPQ6018, IPQ5018, WCN6750) | Qualcomm SoC platform layer (`drivers/soc/qcom`, `narf-drivers-qcom-soc`): DT platform devices and remoteproc resource resolution, SCM over SMCCC (PAS init/mem-setup/auth-and-reset/shutdown), MDT/MBN split loader, SMEM v11/v12, TCSR mutex, SMP2P, APCS/IPCC kicks, GCC reset/branch tables, Q6 WCSS host-reset start/stop (IPQ) and PAS WPSS start/stop (WCN6750). ath11k AHB glue (§3.12, `ahb.rs`): `ath11k_ahb_of_match`, the four AHB `hw_params` entries (CE/target-CE/service maps, QMI instance ids, ring masks, `ipq8074_regs`/`ipq5018_regs`/`wcn6750_regs`, CE remap/IE addresses, BDF address, firmware dir), the 52 named IRQs with CE and DP-group mapping, WCN6750 static windows and hybrid MSI resources, MSA/CE `memory-region`s, `qcom,rproc` resolution and boot through the matching loader; fixture-tested only (`ahb_tests.rs`, `drivers/soc/qcom/src/tests.rs`) | Admitted into the `HwRev`-keyed tables (§2.2, §3.12) and implemented in software, fixture/QEMU-tested only (nothing run on silicon): GLINK-SMEM + QRTR over GLINK, DT interrupt delivery, WLFW AHB paths, the AHB HIF, the bus DT driver match (`ath11k_ahb`), the production bring-up `ahb_live::LiveAhb` (MMIO mapping, live `Q6Wcss` / `PasRproc` boot with SMEM/SMP2P, GlinkSmem + GlinkQrtr, WLFW task handing a ready core to `runtime::start_ahb`), multi-pdev DP (rxdma1 rings, per-pdev SRING_SETUP, peer-map v2) and WMI (`init_cmd` with `ath11k_init_wmi_config_ipq8074`, per-pdev WMI endpoints), and the AHB netdev (`iface::register_ahb`: one initial netdev per AHB-attached radio, fixture-tested in `ahb_netdev_tests.rs`), and post-boot SMP2P crash monitoring / recovery (crash-monitor task, remote restart, shared runtime rebuild; the crash-restart fixture's WLFW leg still times out — it runs without a WLFW server attached). Residual, all chips: and the path after WLFW FW_READY now has a GLINK fixture (fake WLFW server in `ahb_live_tests.rs`: WCN6750 FW_READY + DEVICE_INFO BAR mapping through the real bring-up, IPQ6018 FW_READY incl. cold-boot calibration; remaining: core start past `firmware_start`, which needs a CE/HTC/WMI target fake). IPQ8074/IPQ6018/IPQ5018 multi-pdev: the RX service pass, the mac layer and WMI routing are per-pdev (one MAC + netdev per allocated pdev, commands on that pdev's WMI endpoint; `MacConfig::for_radio` + `DeviceCaps::from_events_for`), and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported. IPQ8074: mainline has no WCSS DT node and no `GCC_WCSSAON_RESET`. IPQ5018: no upstream `ipq5018` WCSS remoteproc binding. WCN6750: RPMh `xo` / `cx` / `mx` proxy votes need an RPMh RSC + cmd-db driver (not in `drivers/soc/qcom`); AOSS QMP `load_state` could be built from the existing `io::RegIo` + `ipc::Ipcc` pieces but is not implemented. |
 
 802.11be/MLO/EHT is not an ath11k Wi-Fi6/6E contract; it belongs to newer
 hardware/driver families. Firmware-owned HT/HE BA, OFDMA/TWT behavior is distinct

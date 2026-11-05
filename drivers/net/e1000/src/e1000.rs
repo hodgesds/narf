@@ -341,6 +341,99 @@ const REG_EXTCNF_CTRL: u64 = 0x0F00;
 /// `E1000_EXTCNF_CTRL_SWFLAG` — software-owns-the-PHY flag.
 const EXTCNF_CTRL_SWFLAG: u32 = 1 << 5;
 
+// MDIC (MDI Control) — PHY register access via MDIO. The 8254x SDM
+// §13.4.19 register (offset 0x0020) carries one MDIO transaction:
+// data in bits 15:0, register address in bits 20:16, PHY address in
+// bits 25:21, opcode in bits 27:26 (01 = write, 10 = read), READY in
+// bit 28, ERROR in bit 30. Values match Linux `e1000_hw.h`
+// (`E1000_MDIC_*`) and the igb crate's in-tree MDIC constants
+// (`drivers/net/igb/src/igb.rs`); the internal copper PHY lives at
+// PHY address 1 on every bound part (Linux classic e1000 uses
+// phy_addr 1 for all non-CE4100 parts; igb hardcodes the same).
+/// `E1000_MDIC` — MDI Control.
+const REG_MDIC: u64 = 0x0020;
+/// `E1000_MDIC_DATA_MASK` — data field of an MDIC word.
+const MDIC_DATA_MASK: u32 = 0x0000_FFFF;
+/// `E1000_MDIC_REG_SHIFT` — register-address field shift.
+const MDIC_REG_SHIFT: u32 = 16;
+/// `E1000_MDIC_PHY_SHIFT` — PHY-address field shift.
+const MDIC_PHY_SHIFT: u32 = 21;
+/// Internal-PHY address (1) placed in the MDIC PHY field.
+const MDIC_PHY_ADDR: u32 = 1 << MDIC_PHY_SHIFT;
+/// `E1000_MDIC_OP_WRITE` — MDIC write opcode.
+const MDIC_OP_WRITE: u32 = 0x0400_0000;
+/// `E1000_MDIC_OP_READ` — MDIC read opcode.
+const MDIC_OP_READ: u32 = 0x0800_0000;
+/// `E1000_MDIC_READY` — transaction-complete bit.
+const MDIC_READY: u32 = 1 << 28;
+/// `E1000_MDIC_ERROR` — transaction-error bit (read path only).
+const MDIC_ERROR: u32 = 1 << 30;
+
+// IEEE 802.3 Clause 22 PHY registers (standard, not vendor-specific)
+// and Clause 28/40 auto-negotiation words. Register numbers and bit
+// values match Linux `include/linux/mii.h` (MII_BMCR 0, MII_BMSR 1,
+// MII_PHYSID1 2, MII_PHYSID2 3, MII_ADVERTISE 4, MII_LPA 5,
+// MII_CTRL1000 9, MII_STAT1000 0x0a); BMCR bits match the igb
+// crate's in-tree constants too. No fresh SDM read was done for
+// these — see the lane disclosure in the PR body.
+/// PHY basic-mode control register.
+const PHY_BMCR: u32 = 0;
+/// PHY basic-mode status register.
+const PHY_BMSR: u32 = 1;
+/// PHY identifier register 1 (OUI bits 3–18).
+const PHY_ID1: u32 = 2;
+/// PHY identifier register 2 (OUI bits 19–24, model, revision).
+const PHY_ID2: u32 = 3;
+/// PHY auto-negotiation advertisement register.
+const PHY_ANAR: u32 = 4;
+/// PHY link-partner ability register.
+const PHY_LPA: u32 = 5;
+/// PHY 1000BASE-T control register.
+const PHY_GBCR: u32 = 9;
+/// PHY 1000BASE-T status register.
+const PHY_STAT1000: u32 = 10;
+/// BMCR auto-negotiation enable bit.
+const BMCR_ANENABLE: u16 = 1 << 12;
+/// BMCR auto-negotiation restart bit.
+const BMCR_ANRESTART: u16 = 1 << 9;
+/// BMSR link-status bit. Latch-low per IEEE 802.3 §22.2.4.2: once the
+/// link drops the bit sticks at 0 until read, so a single read can
+/// report a stale down — readers take two consecutive reads and
+/// trust the second.
+const BMSR_LINK: u16 = 1 << 2;
+/// BMSR auto-negotiation complete bit. Same latch-low discipline as
+/// LINK: readers take two consecutive reads and trust the second.
+const BMSR_ANCOMPLETE: u16 = 1 << 5;
+/// ANAR/LPA selector field value for IEEE 802.3 CSMA (bits 4:0).
+const ANAR_SELECTOR_CSMA: u16 = 0x0001;
+/// ANAR/LPA 10BASE-T half-duplex bit.
+const ANAR_10HALF: u16 = 1 << 5;
+/// ANAR/LPA 10BASE-T full-duplex bit.
+const ANAR_10FULL: u16 = 1 << 6;
+/// ANAR/LPA 100BASE-TX half-duplex bit.
+const ANAR_100HALF: u16 = 1 << 7;
+/// ANAR/LPA 100BASE-TX full-duplex bit.
+const ANAR_100FULL: u16 = 1 << 8;
+/// ANAR/LPA symmetric pause bit. Cleared by this lane (gap 7 owns
+/// pause advertisement — see `aneg_anar_next`).
+const ANAR_PAUSE: u16 = 1 << 10;
+/// ANAR/LPA asymmetric pause bit (same gap-7 note).
+const ANAR_PAUSE_ASYM: u16 = 1 << 11;
+/// ANAR 10/100 speed bits — the field `aneg_anar_next` rewrites.
+const ANAR_SPEED_MASK: u16 = ANAR_10HALF | ANAR_10FULL | ANAR_100HALF | ANAR_100FULL;
+/// ANAR pause bits — cleared with the speed field until gap 7.
+const ANAR_PAUSE_MASK: u16 = ANAR_PAUSE | ANAR_PAUSE_ASYM;
+/// 1000BASE-T control 1000BASE-T half-duplex advertisement bit.
+const GBCR_1000HALF: u16 = 1 << 8;
+/// 1000BASE-T control 1000BASE-T full-duplex advertisement bit.
+const GBCR_1000FULL: u16 = 1 << 9;
+/// 1000BASE-T control speed bits — the field `aneg_gbcr_next` rewrites.
+const GBCR_SPEED_MASK: u16 = GBCR_1000HALF | GBCR_1000FULL;
+/// 1000BASE-T status link-partner 1000BASE-T half-duplex bit.
+const STAT1000_1000HALF: u16 = 1 << 10;
+/// 1000BASE-T status link-partner 1000BASE-T full-duplex bit.
+const STAT1000_1000FULL: u16 = 1 << 11;
+
 // EEE (Energy Efficient Ethernet) — IEEE 802.3az. On I218/I219 the
 // MAC negotiates EEE LPI with its link partner; when the partner
 // (a dock or switch ASIC) pushes aggressive EEE during init while
@@ -431,12 +524,25 @@ const TXD_CTX_CMD_TSE: u32 = 1 << 26;
 const TXD_CTX_CMD_DEXT: u32 = 1 << 29;
 const TXD_CTX_PAYLEN_MASK: u32 = (1 << 20) - 1;
 
-// RX descriptor checksum status bits (e1000_hw.h E1000_RXD_STAT_IPCS /
-// E1000_RXD_STAT_TCPCS and E1000_RXD_ERR_IPE / E1000_RXD_ERR_TCPE).
+// RX descriptor status/error bits (Linux e1000_hw.h E1000_RXD_STAT_* /
+// E1000_RXD_ERR_*). Status: IPCS = IP checksum calculated, TCPCS = TCP
+// checksum calculated, UDPCS = UDP checksum calculated, IXSM = checksum
+// ignored by hardware. Errors: IPE / TCPE = IP / TCP-UDP checksum error;
+// CE / SE / SEQ / CXE / RXE = frame errors Linux drops unless RXALL
+// (e1000e FRAME_ERR_MASK).
 pub const RXD_STAT_IPCS: u8 = 1 << 6;
 pub const RXD_STAT_TCPCS: u8 = 1 << 5;
+pub const RXD_STAT_UDPCS: u8 = 1 << 4;
+pub const RXD_STAT_IXSM: u8 = 1 << 2;
 pub const RXD_ERR_IPE: u8 = 1 << 6;
 pub const RXD_ERR_TCPE: u8 = 1 << 5;
+pub const RXD_ERR_CE: u8 = 1 << 0;
+pub const RXD_ERR_SE: u8 = 1 << 1;
+pub const RXD_ERR_SEQ: u8 = 1 << 2;
+pub const RXD_ERR_CXE: u8 = 1 << 4;
+pub const RXD_ERR_RXE: u8 = 1 << 7;
+pub const RXD_ERR_FRAME_MASK: u8 =
+    RXD_ERR_CE | RXD_ERR_SE | RXD_ERR_SEQ | RXD_ERR_CXE | RXD_ERR_RXE;
 
 /// RX checksum verification result decoded from a legacy e1000 RxDesc.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -658,7 +764,7 @@ impl TxQueueState {
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct RxDesc {
+pub struct RxDesc {
     pub addr: u64,
     pub length: u16,
     pub csum: u16,
@@ -1048,20 +1154,81 @@ fn prepare_ipv4_tso(frame: &mut [u8], mss: u16) -> Result<TxContextDesc, E1000Er
 
 impl RxDesc {
     /// Decode the RX checksum result from the legacy e1000 descriptor
-    /// status and errors bytes.
-    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
+    /// status and errors bytes, in Linux `e1000e_rx_checksum` order:
+    /// IXSM first (hardware ignored the checksum — no verdict), then
+    /// error bits, then computed bits. Errors win over computed bits:
+    /// a UDP frame reports its checksum via UDPCS, not TCPCS, so the
+    /// old computed-first order returned `None` for a UDPCS-only frame
+    /// carrying TCPE and missed a real checksum failure.
     pub fn csum_result(&self) -> RxCsumResult {
-        let ip_computed = self.status & RXD_STAT_IPCS != 0;
-        let tcp_computed = self.status & RXD_STAT_TCPCS != 0;
-        if !ip_computed && !tcp_computed {
+        if self.status & RXD_STAT_IXSM != 0 {
             return RxCsumResult::None;
         }
-        let ip_err = self.errors & RXD_ERR_IPE != 0;
-        let tcp_err = self.errors & RXD_ERR_TCPE != 0;
-        if ip_err || tcp_err {
-            RxCsumResult::Fail
-        } else {
-            RxCsumResult::Ok
+        if self.errors & (RXD_ERR_IPE | RXD_ERR_TCPE) != 0 {
+            return RxCsumResult::Fail;
+        }
+        if self.status & (RXD_STAT_IPCS | RXD_STAT_TCPCS | RXD_STAT_UDPCS) != 0 {
+            return RxCsumResult::Ok;
+        }
+        RxCsumResult::None
+    }
+
+    /// `true` if the descriptor carries a frame error Linux drops
+    /// (CRC / symbol / sequence / carrier-extension / RX-data error),
+    /// independent of the checksum verdict.
+    pub fn has_frame_error(&self) -> bool {
+        self.errors & RXD_ERR_FRAME_MASK != 0
+    }
+}
+
+/// Why a received descriptor's frame must be dropped before delivery.
+/// Pure decision helper over the descriptor bytes so the matrix is
+/// fixture-pinned; both RX paths consult it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxDropReason {
+    /// CRC error — reported via `note_rx_crc_error` (its own counter,
+    /// also counted toward `rx_errs`).
+    CrcError,
+    /// Non-CRC frame error (symbol, sequence, carrier-extension, or
+    /// RX-data). Linux drops these unless RXALL; NARF has no RXALL
+    /// mode, so they are always dropped. Reported via `note_rx_drop`.
+    FrameError,
+    /// Hardware computed a checksum and it failed. Deliberate
+    /// difference from Linux `e1000e`, which delivers the frame and
+    /// lets the stack re-verify: NARF's stack would drop it anyway
+    /// (`tcp_stack::handle_ipv4` / transport checksum verification),
+    /// so dropping in-driver is fail-closed with the same end state —
+    /// a bad frame never reaches a socket. The stack's
+    /// `rx_csum::*_ERRORS` counters do not increment for these;
+    /// the driver reports them via `note_rx_drop` instead.
+    CsumFail,
+}
+
+/// Drop decision for one completed RX descriptor: CRC first (its own
+/// counter), then other frame errors (their checksum bits are
+/// meaningless on a corrupt frame), then the checksum verdict.
+/// `None` means deliver.
+pub fn rx_drop_reason(desc: &RxDesc) -> Option<RxDropReason> {
+    if desc.errors & RXD_ERR_CE != 0 {
+        return Some(RxDropReason::CrcError);
+    }
+    if desc.has_frame_error() {
+        return Some(RxDropReason::FrameError);
+    }
+    if desc.csum_result() == RxCsumResult::Fail {
+        return Some(RxDropReason::CsumFail);
+    }
+    None
+}
+
+/// Report one RX-verdict drop to the stack counters.
+fn count_rx_drop(reason: RxDropReason) {
+    match reason {
+        RxDropReason::CrcError => {
+            narf_net::iface::note_rx_crc_error(e1000_ifname(), 1);
+        }
+        RxDropReason::FrameError | RxDropReason::CsumFail => {
+            narf_net::iface::note_rx_drop(e1000_ifname(), 1);
         }
     }
 }
@@ -1080,6 +1247,13 @@ pub enum E1000Error {
     /// Management Engine never released the PHY. Bring-up gives up
     /// rather than risk a wedged PHY register read.
     PhyOwnershipTimeout,
+    /// MDIC transaction never set READY within the poll budget.
+    PhyMdioTimeout,
+    /// MDIC transaction completed with the ERROR bit set (read path).
+    PhyMdioError,
+    /// No PHY answered the MDIC identification read (ID1/ID2 read
+    /// all-ones, the MDIO pull-up signature, or all-zeros).
+    PhyNotPresent,
     /// Catch-all.
     Other(&'static str),
 }
@@ -1239,6 +1413,228 @@ fn release_phy_swflag(mmio: &MmioRegion, owned: bool) {
         let v = mmio.read32(REG_EXTCNF_CTRL);
         mmio.write32(REG_EXTCNF_CTRL, v & !EXTCNF_CTRL_SWFLAG);
     }
+}
+
+/// Build an MDIC read command word for `reg` (internal PHY address 1).
+fn mdic_read_cmd(reg: u32) -> u32 {
+    ((reg & 0x1F) << MDIC_REG_SHIFT) | MDIC_PHY_ADDR | MDIC_OP_READ
+}
+
+/// Build an MDIC write command word for `reg` carrying `data`.
+fn mdic_write_cmd(reg: u32, data: u16) -> u32 {
+    (data as u32) | ((reg & 0x1F) << MDIC_REG_SHIFT) | MDIC_PHY_ADDR | MDIC_OP_WRITE
+}
+
+/// Extract the 16-bit data field from a completed MDIC word.
+fn mdic_data(word: u32) -> u16 {
+    (word & MDIC_DATA_MASK) as u16
+}
+
+/// Compose a 32-bit PHY identifier from the PHYSID1/PHYSID2 reads
+/// (Linux `e1000_get_phy_id` shape: ID1 in the high half).
+fn phy_id_from(id1: u16, id2: u16) -> u32 {
+    ((id1 as u32) << 16) | (id2 as u32)
+}
+
+/// `true` unless the ID read is the no-device signature: all-ones
+/// (MDIO pull-ups, nothing answering) or all-zeros.
+fn phy_id_valid(id: u32) -> bool {
+    id != 0 && id != 0xFFFF_FFFF
+}
+
+/// Decode the BMSR link-status bit (single-read value; callers that
+/// need latch-low-correct state use `E1000::phy_link_up`).
+fn bmsr_link(bmsr: u16) -> bool {
+    bmsr & BMSR_LINK != 0
+}
+
+/// Auto-negotiation complete from a BMSR sample (same latch-low
+/// double-read discipline as `bmsr_link`).
+fn bmsr_ancomplete(bmsr: u16) -> bool {
+    bmsr & BMSR_ANCOMPLETE != 0
+}
+
+/// Negotiated link mode from auto-negotiation (IEEE 802.3 Annex 28B
+/// priority order, highest first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkMode {
+    Speed10Half,
+    Speed10Full,
+    Speed100Half,
+    Speed100Full,
+    Speed1000Half,
+    Speed1000Full,
+}
+
+/// This driver's auto-negotiation advertisement as (ANAR, GBCR):
+/// 10/100 half+full in ANAR, 1000 full only in GBCR, pause bits
+/// clear. 1000 half is denied exactly as Linux does ("We do not
+/// allow the Phy to advertise 1000 Mb Half Duplex",
+/// `e1000_phy_setup_autoneg`); pause is denied because flow
+/// control is audit gap 7 — advertising pause without FCRTL/FCRTH
+/// + RFCE/TFCE would promise a capability the datapath does not
+/// honor. The flow-control lane sets the pause bits when it lands.
+fn aneg_advertisement() -> (u16, u16) {
+    (
+        ANAR_SELECTOR_CSMA | ANAR_10HALF | ANAR_10FULL | ANAR_100HALF | ANAR_100FULL,
+        GBCR_1000FULL,
+    )
+}
+
+/// Next ANAR value from the current one, Linux
+/// `e1000_phy_setup_autoneg` shape: clear the 10/100 speed bits and
+/// the pause bits, then set this driver's speeds. The selector is
+/// forced to CSMA rather than preserved from the read: a zero
+/// selector is invalid, so forcing is strictly safer than copying
+/// a broken read. Remote-fault, acknowledge, and next-page bits
+/// are preserved (the PHY owns acknowledge; software must not
+/// clear it mid-negotiation).
+fn aneg_anar_next(current: u16) -> u16 {
+    (current & !(ANAR_SPEED_MASK | ANAR_PAUSE_MASK))
+        | ANAR_SELECTOR_CSMA
+        | ANAR_10HALF
+        | ANAR_10FULL
+        | ANAR_100HALF
+        | ANAR_100FULL
+}
+
+/// Next GBCR value from the current one: clear both 1000 speed
+/// bits, set 1000 full only (1000 half denied, see
+/// `aneg_advertisement`).
+fn aneg_gbcr_next(current: u16) -> u16 {
+    (current & !GBCR_SPEED_MASK) | GBCR_1000FULL
+}
+
+/// Next BMCR value from the current one: set ANENABLE + ANRESTART,
+/// preserving every other bit (Linux `e1000_copper_link_autoneg`
+/// read-modify-write shape; a blind write would drop power-down,
+/// loopback, and forced speed/duplex bits).
+fn aneg_bmcr_restart(current: u16) -> u16 {
+    current | BMCR_ANENABLE | BMCR_ANRESTART
+}
+
+/// Resolve the negotiated mode from our advertisement and the link
+/// partner's ability words (ANAR/LPA share speed-bit positions;
+/// 1000BASE-T lives in GBCR/STAT1000). Priority per IEEE 802.3
+/// Annex 28B: 1000F > 1000H > 100F > 100H > 10F > 10H. 100BASE-T4
+/// is not considered: neither side advertises it (Linux e1000e
+/// does not either), so it can never be the common mode. `None`
+/// means no common mode — the link cannot come up on these
+/// advertisements.
+fn resolve_negotiated_mode(
+    our_anar: u16,
+    our_gbcr: u16,
+    lp_anar: u16,
+    lp_stat1000: u16,
+) -> Option<LinkMode> {
+    if our_gbcr & GBCR_1000FULL != 0 && lp_stat1000 & STAT1000_1000FULL != 0 {
+        Some(LinkMode::Speed1000Full)
+    } else if our_gbcr & GBCR_1000HALF != 0 && lp_stat1000 & STAT1000_1000HALF != 0 {
+        Some(LinkMode::Speed1000Half)
+    } else if our_anar & ANAR_100FULL != 0 && lp_anar & ANAR_100FULL != 0 {
+        Some(LinkMode::Speed100Full)
+    } else if our_anar & ANAR_100HALF != 0 && lp_anar & ANAR_100HALF != 0 {
+        Some(LinkMode::Speed100Half)
+    } else if our_anar & ANAR_10FULL != 0 && lp_anar & ANAR_10FULL != 0 {
+        Some(LinkMode::Speed10Full)
+    } else if our_anar & ANAR_10HALF != 0 && lp_anar & ANAR_10HALF != 0 {
+        Some(LinkMode::Speed10Half)
+    } else {
+        None
+    }
+}
+
+/// Link-partner ability as read from LPA + STAT1000.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartnerAbility {
+    /// LPA word (register 5): 10/100 speed bits + pause bits, same
+    /// positions as ANAR.
+    pub anar: u16,
+    /// 1000BASE-T status word (register 10): partner 1000 halves.
+    pub stat1000: u16,
+}
+
+impl PartnerAbility {
+    /// Negotiated mode against our advertisement words.
+    pub const fn negotiated_mode(&self, our_anar: u16, our_gbcr: u16) -> Option<LinkMode> {
+        resolve_negotiated_mode(our_anar, our_gbcr, self.anar, self.stat1000)
+    }
+}
+
+/// Read a 16-bit register from the internal PHY via MDIC.
+///
+/// Linux: classic `e1000_read_phy_reg` MDIC branch
+/// (`e1000_hw.c`): write the OP_READ command word, poll READY
+/// (Linux: 64 × 50 µs ≈ 3.2 ms; we use the igb crate's 10 ms
+/// `responsive_spin_until` bound, strictly looser), then fail on
+/// the ERROR bit and return the low 16 bits. No SWFLAG scoping
+/// here — callers (`E1000::phy_read`) own the per-access handshake.
+fn mdic_read(mmio: &MmioRegion, reg: u32) -> Result<u16, E1000Error> {
+    // SAFETY: identity-mapped MMIO; MDIC is inside the e1000 BAR0
+    // register window on every bound part.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        mmio.write32(REG_MDIC, mdic_read_cmd(reg));
+    }
+    let ready = narf_scheduler::responsive_spin_until(
+        // SAFETY: identity-mapped MMIO.
+        || unsafe { mmio.read32(REG_MDIC) } & MDIC_READY != 0,
+        narf_time::Deadline::after_ms(10),
+    );
+    if !ready {
+        return Err(E1000Error::PhyMdioTimeout);
+    }
+    // SAFETY: identity-mapped MMIO.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let word = unsafe { mmio.read32(REG_MDIC) };
+    if word & MDIC_ERROR != 0 {
+        return Err(E1000Error::PhyMdioError);
+    }
+    Ok(mdic_data(word))
+}
+
+/// Write a 16-bit value to an internal-PHY register via MDIC.
+///
+/// Linux: classic `e1000_write_phy_reg` MDIC branch: write the
+/// OP_WRITE command word carrying the data, poll READY (Linux:
+/// 641 × 5 µs ≈ 3.2 ms; we use the same 10 ms bound as the read
+/// path). The write path checks READY only — Linux does not test
+/// the ERROR bit here either. No SWFLAG scoping here — callers
+/// (`E1000::phy_write`) own the per-access handshake.
+fn mdic_write(mmio: &MmioRegion, reg: u32, data: u16) -> Result<(), E1000Error> {
+    // SAFETY: identity-mapped MMIO; MDIC is inside the e1000 BAR0
+    // register window on every bound part.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        mmio.write32(REG_MDIC, mdic_write_cmd(reg, data));
+    }
+    let ready = narf_scheduler::responsive_spin_until(
+        // SAFETY: identity-mapped MMIO.
+        || unsafe { mmio.read32(REG_MDIC) } & MDIC_READY != 0,
+        narf_time::Deadline::after_ms(10),
+    );
+    if !ready {
+        return Err(E1000Error::PhyMdioTimeout);
+    }
+    Ok(())
+}
+
+/// Program auto-negotiation advertisement and restart negotiation
+/// (Linux `e1000_copper_link_autoneg` minus the wait: bring-up
+/// must not block on link — the LSC drain reports the transition).
+/// ANAR, then GBCR, then BMCR restart, each read-modify-write.
+/// Callers own SWFLAG scoping: bring_up holds it across init (so
+/// it calls this directly), and `E1000::autoneg_setup` takes it
+/// for the sequence. Must NOT be called with no SWFLAG held on a
+/// PCH part with an active ME.
+fn autoneg_setup_mmio(mmio: &MmioRegion) -> Result<(), E1000Error> {
+    let anar = mdic_read(mmio, PHY_ANAR)?;
+    mdic_write(mmio, PHY_ANAR, aneg_anar_next(anar))?;
+    let gbcr = mdic_read(mmio, PHY_GBCR)?;
+    mdic_write(mmio, PHY_GBCR, aneg_gbcr_next(gbcr))?;
+    let bmcr = mdic_read(mmio, PHY_BMCR)?;
+    mdic_write(mmio, PHY_BMCR, aneg_bmcr_restart(bmcr))?;
+    Ok(())
 }
 
 /// Disable Energy Efficient Ethernet on PCH parts.
@@ -1495,6 +1891,21 @@ impl E1000 {
         if pch_part {
             disable_eee_pchlan(&mmio);
         }
+
+        // 1c. Program auto-negotiation advertisement and restart
+        //    negotiation, before the rings and CTRL.SLU: starting AN
+        //    here gives it the whole bring-up window to complete
+        //    before the STATUS.LU sample at step 6 (the LSC drain
+        //    reports the transition if it completes later).
+        //    Best-effort: a PHY that does not answer MDIC keeps its
+        //    reset-default advertisement, which still negotiates —
+        //    failing bring-up here would brick a NIC whose only
+        //    fault is an unreadable PHY register. Post-bring-up,
+        //    `autoneg_setup()` re-runs this with errors propagated.
+        //    SWFLAG is already held (step 0) on PCH parts, so the
+        //    raw mmio sequence is correct here; the `E1000`
+        //    method must NOT be used (it would release early).
+        let _ = autoneg_setup_mmio(&mmio);
 
         // 2. Read MAC from RAL/RAH.
         // SAFETY: `mmio` was mapped from BAR0; `REG_RAL0` is a valid 32-bit
@@ -2384,73 +2795,125 @@ impl E1000 {
     /// frame is currently pending. After consuming, the descriptor
     /// is rearmed and RDT is bumped so the device sees the freshly-
     /// available slot.
+    /// Copy one received frame out of the ring, skipping (and counting)
+    /// descriptors the RX verdict drops — frame errors and checksum
+    /// failures — so a caller that polls for one frame never stalls on
+    /// a bad frame at the head. Returns 0 when the ring holds no
+    /// deliverable frame. Descriptors consumed by drops are re-armed
+    /// and handed back via RDT exactly like delivered ones.
     pub fn rx_recv(&self, out: &mut [u8]) -> usize {
         if !self.datapath_open() {
             return 0;
         }
         let mut head_g = self.rx_head.lock();
-        let head = (*head_g) as usize;
+        let mut head = (*head_g) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (head * 16) as u64;
-        // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
-        let desc = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>())
-        };
-        if desc.status & RXD_STAT_DD == 0 {
-            return 0;
-        }
-        // Copy out the payload.
-        let len = (desc.length as usize).min(out.len()).min(RX_BUF_LEN);
-        let buf_phys = desc.addr;
-        for (i, b) in out.iter_mut().enumerate().take(len) {
-            // SAFETY: the RX buffer at `buf_phys` is an identity-mapped DMA
-            // page the device filled; `i < len <= RX_BUF_LEN`, so the byte
-            // address `buf_phys + i` stays within that page.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe {
+        // Count, not head comparison: a full ring of drops wraps `head`
+        // back to its start, which a comparison would misread as "none".
+        let mut dropped = 0usize;
+        loop {
+            let desc_addr = ring_phys + (head * 16) as u64;
+            // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
+            let desc = unsafe {
                 core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
+                    narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>(),
                 )
             };
+            if desc.status & RXD_STAT_DD == 0 {
+                // Ring empty. If drops were consumed above, hand those
+                // descriptors back before returning; otherwise RDT is
+                // already at the last freed slot.
+                if dropped != 0 {
+                    let last_freed = (head + RX_RING_LEN - 1) % RX_RING_LEN;
+                    compiler_fence(Ordering::SeqCst);
+                    // SAFETY: identity-mapped MMIO.
+                    unsafe {
+                        self.mmio.write32(REG_RDT, last_freed as u32);
+                    }
+                    *head_g = head as u32;
+                }
+                return 0;
+            }
+            if let Some(reason) = rx_drop_reason(&desc) {
+                count_rx_drop(reason);
+                // Rearm the dropped descriptor: clear status, leave
+                // addr as-is. RDT advances below once a deliverable
+                // frame is found, or on the empty-exit above.
+                let new_desc = RxDesc {
+                    addr: desc.addr,
+                    length: 0,
+                    csum: 0,
+                    status: 0,
+                    errors: 0,
+                    special: 0,
+                };
+                // SAFETY: identity-mapped DMA ring.
+                unsafe {
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                        new_desc,
+                    );
+                }
+                head = (head + 1) % RX_RING_LEN;
+                dropped += 1;
+                continue;
+            }
+            // Copy out the payload.
+            let len = (desc.length as usize).min(out.len()).min(RX_BUF_LEN);
+            let buf_phys = desc.addr;
+            for (i, b) in out.iter_mut().enumerate().take(len) {
+                // SAFETY: the RX buffer at `buf_phys` is an identity-mapped DMA
+                // page the device filled; `i < len <= RX_BUF_LEN`, so the byte
+                // address `buf_phys + i` stays within that page.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
+                *b = unsafe {
+                    core::ptr::read_volatile(
+                        narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
+                    )
+                };
+            }
+            // VLAN: hardware stripped the tag and recorded the TCI in
+            // `special` (SDM §3.2). Restore the wire format in the
+            // caller's buffer when it has room; otherwise deliver the
+            // stripped frame (documented corner — the polled path's
+            // caller owns the buffer size).
+            let len = if desc.special != 0 {
+                vlan_reinsert_tag(out, len, desc.special).unwrap_or(len)
+            } else {
+                len
+            };
+            // Rearm the descriptor: clear status, leave addr as-is.
+            let new_desc = RxDesc {
+                addr: buf_phys,
+                length: 0,
+                csum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            };
+            // SAFETY: identity-mapped DMA ring.
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                    new_desc,
+                );
+            }
+            // Bump RDT to the just-freed slot. After consuming descriptor
+            // `head`, the most recently freed slot is `head` itself —
+            // RDT points at the last available slot for the device.
+            // Dropped slots before it are freed by the same write: slots
+            // are consumed in ring order, so every slot up to `head`
+            // is available.
+            let new_head = ((head + 1) % RX_RING_LEN) as u32;
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: identity-mapped MMIO.
+            unsafe {
+                self.mmio.write32(REG_RDT, head as u32);
+            }
+            *head_g = new_head;
+            let _ = RXD_STAT_EOP; // EOP-multi-descriptor frames land in a follow-up.
+            return len;
         }
-        // VLAN: hardware stripped the tag and recorded the TCI in
-        // `special` (SDM §3.2). Restore the wire format in the
-        // caller's buffer when it has room; otherwise deliver the
-        // stripped frame (documented corner — the polled path's
-        // caller owns the buffer size).
-        let len = if desc.special != 0 {
-            vlan_reinsert_tag(out, len, desc.special).unwrap_or(len)
-        } else {
-            len
-        };
-        // Rearm the descriptor: clear status, leave addr as-is.
-        let new_desc = RxDesc {
-            addr: buf_phys,
-            length: 0,
-            csum: 0,
-            status: 0,
-            errors: 0,
-            special: 0,
-        };
-        // SAFETY: identity-mapped DMA ring.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
-                new_desc,
-            );
-        }
-        // Bump RDT to the just-freed slot. After consuming descriptor
-        // `head`, the most recently freed slot is `head` itself —
-        // RDT points at the last available slot for the device.
-        let new_head = ((head + 1) % RX_RING_LEN) as u32;
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio.write32(REG_RDT, head as u32);
-        }
-        *head_g = new_head;
-        let _ = RXD_STAT_EOP; // EOP-multi-descriptor frames land in a follow-up.
-        len
     }
 
     /// Process up to `budget` received frames **in place** from their RX DMA
@@ -2458,6 +2921,9 @@ impl E1000 {
     /// doorbell. The device has set DD before each callback and a descriptor is
     /// re-armed only after its callback returns, so processing cannot race a
     /// device write. A bounded batch also keeps the cooperative executor fair.
+    /// Returns the number of descriptors consumed — delivered frames plus
+    /// verdict-dropped frames. The async pump treats nonzero as "ring
+    /// activity, keep draining"; dropped frames never reach `f`.
     fn rx_drain_in_place<F: FnMut(&mut [u8])>(&self, budget: usize, mut f: F) -> usize {
         if !self.datapath_open() {
             return 0;
@@ -2481,47 +2947,56 @@ impl E1000 {
             if desc.status & RXD_STAT_DD == 0 {
                 break;
             }
-            let len = (desc.length as usize).min(RX_BUF_LEN);
-            // Descriptor `head` is backed by `rx_pool[head]` at probe and
-            // re-armed in place (the buffer address never changes), so the
-            // pairing is stable for the device's lifetime. Hand the stack a
-            // mutable slice straight into that identity-mapped page.
-            // SAFETY: the page is device-filled (DD set) and not concurrently
-            // written (we re-arm only after `f` returns); it is identity-mapped
-            // and `len <= RX_BUF_LEN <= page size`, so the slice stays within
-            // the buffer. An XDP rewrite in `f` writes the DMA page we own.
-            // VLAN: when CTRL.VME is set, hardware strips the tag and
-            // records the TCI in `special` (SDM §3.2). Re-tag in place
-            // before the stack sees the frame; the DMA page holds
-            // RX_BUF_LEN bytes, so a stripped frame with room for 4
-            // more bytes is restored to wire format. `special == 0`
-            // is delivered as-is: either untagged, or a priority-only
-            // tag (VID 0, priority 0, CFI 0), which carries no VLAN
-            // membership and is indistinguishable from untagged in
-            // the legacy descriptor. A frame that exactly fills the
-            // buffer cannot be re-tagged in place and is delivered
-            // stripped (documented corner).
-            let page = self.rx_pool[head].cpu_mut_ptr_at::<u8>(0);
-            let deliver_len = if desc.special != 0 {
-                // SAFETY: `page` is the base of the `rx_pool[head]` DMA page
-                // (one page per descriptor, RX_BUF_LEN bytes consumed), which
-                // the driver owns; DD is set, so the device has finished
-                // writing it, and we re-arm only after `f` returns, so no
-                // concurrent device write aliases this slice. RX_BUF_LEN is
-                // within the page, so the slice is in-bounds and non-null.
-                let page_slice = unsafe { core::slice::from_raw_parts_mut(page, RX_BUF_LEN) };
-                vlan_reinsert_tag(page_slice, len, desc.special).unwrap_or(len)
+            // Verdict gate: dropped frames are re-armed and counted
+            // below exactly like delivered ones (so `drained` still
+            // counts consumed descriptors and the single RDT doorbell
+            // hands them back), but `f` — and therefore the stack and
+            // the RX mirror — never sees them.
+            if let Some(reason) = rx_drop_reason(&desc) {
+                count_rx_drop(reason);
             } else {
-                len
-            };
-            // SAFETY: same `rx_pool[head]` page as above; `deliver_len <=
-            // RX_BUF_LEN` because `vlan_reinsert_tag` returns `None`
-            // (falling back to `len`) unless `len + 4` fits in the
-            // RX_BUF_LEN slice, and `len` itself is clamped to RX_BUF_LEN.
-            // The slice ends before the descriptor is re-armed below, so
-            // the device cannot write it concurrently while `f` runs.
-            let frame = unsafe { core::slice::from_raw_parts_mut(page, deliver_len) };
-            f(frame);
+                let len = (desc.length as usize).min(RX_BUF_LEN);
+                // Descriptor `head` is backed by `rx_pool[head]` at probe and
+                // re-armed in place (the buffer address never changes), so the
+                // pairing is stable for the device's lifetime. Hand the stack a
+                // mutable slice straight into that identity-mapped page.
+                // SAFETY: the page is device-filled (DD set) and not concurrently
+                // written (we re-arm only after `f` returns); it is identity-mapped
+                // and `len <= RX_BUF_LEN <= page size`, so the slice stays within
+                // the buffer. An XDP rewrite in `f` writes the DMA page we own.
+                // VLAN: when CTRL.VME is set, hardware strips the tag and
+                // records the TCI in `special` (SDM §3.2). Re-tag in place
+                // before the stack sees the frame; the DMA page holds
+                // RX_BUF_LEN bytes, so a stripped frame with room for 4
+                // more bytes is restored to wire format. `special == 0`
+                // is delivered as-is: either untagged, or a priority-only
+                // tag (VID 0, priority 0, CFI 0), which carries no VLAN
+                // membership and is indistinguishable from untagged in
+                // the legacy descriptor. A frame that exactly fills the
+                // buffer cannot be re-tagged in place and is delivered
+                // stripped (documented corner).
+                let page = self.rx_pool[head].cpu_mut_ptr_at::<u8>(0);
+                let deliver_len = if desc.special != 0 {
+                    // SAFETY: `page` is the base of the `rx_pool[head]` DMA page
+                    // (one page per descriptor, RX_BUF_LEN bytes consumed), which
+                    // the driver owns; DD is set, so the device has finished
+                    // writing it, and we re-arm only after `f` returns, so no
+                    // concurrent device write aliases this slice. RX_BUF_LEN is
+                    // within the page, so the slice is in-bounds and non-null.
+                    let page_slice = unsafe { core::slice::from_raw_parts_mut(page, RX_BUF_LEN) };
+                    vlan_reinsert_tag(page_slice, len, desc.special).unwrap_or(len)
+                } else {
+                    len
+                };
+                // SAFETY: same `rx_pool[head]` page as above; `deliver_len <=
+                // RX_BUF_LEN` because `vlan_reinsert_tag` returns `None`
+                // (falling back to `len`) unless `len + 4` fits in the
+                // RX_BUF_LEN slice, and `len` itself is clamped to RX_BUF_LEN.
+                // The slice ends before the descriptor is re-armed below, so
+                // the device cannot write it concurrently while `f` runs.
+                let frame = unsafe { core::slice::from_raw_parts_mut(page, deliver_len) };
+                f(frame);
+            }
             // Re-arm the descriptor: clear status, keep the same buffer
             // address. The final compiler fence orders every descriptor write
             // before the single tail doorbell below.
@@ -2559,7 +3034,8 @@ impl E1000 {
     /// Process one received frame **in place** from its RX DMA page — zero
     /// copy — then re-arm the descriptor. This is the single-frame public API;
     /// the asynchronous pump uses `rx_drain_in_place` to amortize its RDT
-    /// doorbell across a burst. Returns `true` iff a frame was processed.
+    /// doorbell across a burst. Returns `true` iff a descriptor was
+    /// consumed (a frame delivered to `f`, or a verdict-dropped frame).
     pub fn rx_recv_in_place<F: FnMut(&mut [u8])>(&self, f: F) -> bool {
         self.rx_drain_in_place(1, f) != 0
     }
@@ -2634,8 +3110,9 @@ impl E1000 {
     // suspend (only the EN bits gate DMA), so in-flight descriptor
     // state survives and resume is a control-word restore, not a
     // bring-up replay; (3) no PHY power-down on suspend and no PHY
-    // power-up on resume — e1000 has no MDIC access (audit gap 5),
-    // so the igb-style BMCR power-down is not expressible here;
+    // power-up on resume — deliberate: the PHY is never powered
+    // down, so its autoneg advertisement persists across suspend
+    // and resume re-links without an AN restart;
     // (4) no WoL arming on suspend — WoL (audit gap 6) needs this
     // contract first and lands as its own item, so suspend is
     // always unarmed (no WUC/WUFC programming exists to clear).
@@ -3036,9 +3513,9 @@ fn e1000_send_frame_zc(mut frame: narf_net::Frame, meta: narf_net::TxMeta) -> Re
 }
 
 /// Drain one frame from the RX ring + dispatch it through the
-/// network stack's RX handler. Returns true iff a frame was
-/// processed. Called from a kernel-side polling task spawned at
-/// boot.
+/// network stack's RX handler. Returns true iff the ring advanced (a
+/// frame was delivered, or a verdict-dropped frame was consumed).
+/// Called from a kernel-side polling task spawned at boot.
 pub fn rx_pump_step() -> bool {
     // Zero-copy: dispatch the frame straight out of its RX DMA page rather than
     // copying it into a scratch buffer first (P-F). Same lock discipline as
@@ -3434,6 +3911,127 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     Ok(())
 }
 
+impl E1000 {
+    /// Read a 16-bit register from the internal PHY via MDIC, with
+    /// the FWSM/SWFLAG handshake scoped per access (Linux
+    /// `e1000_get_swflag_ich8lan` discipline, and the audit gap-5
+    /// re-scope requirement): acquire, transact, release — even on
+    /// transaction error, so a failed read never leaves the ME
+    /// locked out. On non-PCH parts the handshake is skipped
+    /// entirely (no ME to coordinate with).
+    ///
+    /// Must NOT be called during `bring_up`: bring-up holds SWFLAG
+    /// across init, and this method's release would drop that hold
+    /// early. Post-bring-up only.
+    pub fn phy_read(&self, reg: u32) -> Result<u16, E1000Error> {
+        let owned = if self.pch_part {
+            acquire_phy_swflag(&self.mmio)?
+        } else {
+            false
+        };
+        let r = mdic_read(&self.mmio, reg);
+        if self.pch_part {
+            release_phy_swflag(&self.mmio, owned);
+        }
+        r
+    }
+
+    /// Write a 16-bit value to an internal-PHY register via MDIC,
+    /// with the same per-access SWFLAG scoping as [`E1000::phy_read`]
+    /// (and the same do-not-call-during-bring-up constraint).
+    pub fn phy_write(&self, reg: u32, data: u16) -> Result<(), E1000Error> {
+        let owned = if self.pch_part {
+            acquire_phy_swflag(&self.mmio)?
+        } else {
+            false
+        };
+        let r = mdic_write(&self.mmio, reg, data);
+        if self.pch_part {
+            release_phy_swflag(&self.mmio, owned);
+        }
+        r
+    }
+
+    /// Read the PHY identifier (PHYSID1/PHYSID2 composed per
+    /// `phy_id_from`). Fails closed with `PhyNotPresent` when the
+    /// read returns the no-device signature rather than inventing
+    /// an identity for an absent PHY.
+    pub fn phy_id(&self) -> Result<u32, E1000Error> {
+        let id1 = self.phy_read(PHY_ID1)?;
+        let id2 = self.phy_read(PHY_ID2)?;
+        let id = phy_id_from(id1, id2);
+        if !phy_id_valid(id) {
+            return Err(E1000Error::PhyNotPresent);
+        }
+        Ok(id)
+    }
+
+    /// Read PHY link status via BMSR. Two consecutive reads: the
+    /// first re-arms the latch-low link bit (IEEE 802.3 §22.2.4.2),
+    /// the second reports live state. This is the PHY-side signal;
+    /// the MAC-side `STATUS.LU` sample that `link_up` reports is a
+    /// separate, already-existing path.
+    pub fn phy_link_up(&self) -> Result<bool, E1000Error> {
+        let _ = self.phy_read(PHY_BMSR)?;
+        let bmsr = self.phy_read(PHY_BMSR)?;
+        Ok(bmsr_link(bmsr))
+    }
+
+    /// Program auto-negotiation advertisement and restart
+    /// negotiation (post-bring-up entry to `autoneg_setup_mmio`).
+    /// The ANAR+GBCR+BMCR triple is one logical programming
+    /// operation, so the SWFLAG is held across the sequence
+    /// rather than per register (tighter than bring_up's
+    /// whole-init hold, safer than per-register against ME
+    /// interleaving mid-sequence).
+    ///
+    /// Must NOT be called during `bring_up`: bring-up holds SWFLAG
+    /// across init, and this method's release would drop that hold
+    /// early. Bring-up calls `autoneg_setup_mmio` directly.
+    pub fn autoneg_setup(&self) -> Result<(), E1000Error> {
+        let owned = if self.pch_part {
+            acquire_phy_swflag(&self.mmio)?
+        } else {
+            false
+        };
+        let r = autoneg_setup_mmio(&self.mmio);
+        if self.pch_part {
+            release_phy_swflag(&self.mmio, owned);
+        }
+        r
+    }
+
+    /// Auto-negotiation complete sample: two consecutive BMSR
+    /// reads (latch-low), trust the second — same discipline as
+    /// `phy_link_up`. Same do-not-call-during-bring_up constraint
+    /// as `phy_read`.
+    pub fn autoneg_complete(&self) -> Result<bool, E1000Error> {
+        let _ = self.phy_read(PHY_BMSR)?;
+        let bmsr = self.phy_read(PHY_BMSR)?;
+        Ok(bmsr_ancomplete(bmsr))
+    }
+
+    /// Link-partner ability: LPA + 1000BASE-T status. Same
+    /// do-not-call-during-bring_up constraint as `phy_read`.
+    pub fn link_partner_ability(&self) -> Result<PartnerAbility, E1000Error> {
+        Ok(PartnerAbility {
+            anar: self.phy_read(PHY_LPA)?,
+            stat1000: self.phy_read(PHY_STAT1000)?,
+        })
+    }
+
+    /// Negotiated mode against the live advertisement words: our
+    /// ANAR/GBCR as programmed plus the partner's ability. `None`
+    /// means no common mode (or the partner has not answered yet —
+    /// callers distinguish via `autoneg_complete`).
+    pub fn negotiated_mode(&self) -> Result<Option<LinkMode>, E1000Error> {
+        let our_anar = self.phy_read(PHY_ANAR)?;
+        let our_gbcr = self.phy_read(PHY_GBCR)?;
+        let partner = self.link_partner_ability()?;
+        Ok(partner.negotiated_mode(our_anar, our_gbcr))
+    }
+}
+
 mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -3488,6 +4086,101 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_link_sample_from_status_decodes);
+
+    fn smoke_aneg_advertisement_shape() -> TestResult {
+        // ANAR = selector + 10/100 half+full = 0x01E1; GBCR = 1000
+        // full only = 0x0200; pause bits clear (gap 7 owns them).
+        let (anar, gbcr) = super::aneg_advertisement();
+        if anar != 0x01E1 || gbcr != 0x0200 {
+            return TestResult::Fail("e1000 autoneg advertisement word mismatch");
+        }
+        if anar & super::ANAR_PAUSE_MASK != 0 {
+            return TestResult::Fail("e1000 autoneg advertisement sets pause bits");
+        }
+        if anar & 0x001F != super::ANAR_SELECTOR_CSMA {
+            return TestResult::Fail("e1000 autoneg advertisement selector is not CSMA");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_aneg_advertisement_shape);
+
+    fn smoke_aneg_next_rewrites_only_its_fields() -> TestResult {
+        // From zero: exactly the advertisement words.
+        if super::aneg_anar_next(0x0000) != 0x01E1 {
+            return TestResult::Fail("e1000 aneg_anar_next(0) is not the advertisement");
+        }
+        if super::aneg_gbcr_next(0x0000) != 0x0200 {
+            return TestResult::Fail("e1000 aneg_gbcr_next(0) is not 1000 full");
+        }
+        // From all-ones: speeds + pause rewritten, selector forced,
+        // reserved/remote-fault/ack/next-page bits preserved.
+        if super::aneg_anar_next(0xFFFF) != 0xF3FF {
+            return TestResult::Fail("e1000 aneg_anar_next(0xFFFF) preserved the wrong bits");
+        }
+        if super::aneg_gbcr_next(0xFFFF) != 0xFEFF {
+            return TestResult::Fail("e1000 aneg_gbcr_next(0xFFFF) preserved the wrong bits");
+        }
+        // BMCR restart sets only ANENABLE + ANRESTART.
+        if super::aneg_bmcr_restart(0x0000) != 0x1200 {
+            return TestResult::Fail("e1000 aneg_bmcr_restart(0) missed ANENABLE/ANRESTART");
+        }
+        if super::aneg_bmcr_restart(0x0800) != 0x1A00 {
+            return TestResult::Fail("e1000 aneg_bmcr_restart dropped the power-down bit");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/e1000",
+        smoke_aneg_next_rewrites_only_its_fields
+    );
+
+    fn smoke_aneg_resolve_priority_and_no_common() -> TestResult {
+        let ours = super::aneg_advertisement();
+        // Full agreement at 1000 full.
+        if super::resolve_negotiated_mode(ours.0, ours.1, 0x01E1, 0x0800)
+            != Some(super::LinkMode::Speed1000Full)
+        {
+            return TestResult::Fail("e1000 aneg resolve missed 1000 full agreement");
+        }
+        // Partner 1000 full but we do not offer 1000: fall to 100 full.
+        if super::resolve_negotiated_mode(0x01E1, 0x0000, 0x01E1, 0x0800)
+            != Some(super::LinkMode::Speed100Full)
+        {
+            return TestResult::Fail("e1000 aneg resolve did not fall through missing 1000");
+        }
+        // 1000 half resolves only when both sides offer it (general
+        // resolver; this driver never advertises it).
+        if super::resolve_negotiated_mode(0x01E1, 0x0100, 0x01E1, 0x0400)
+            != Some(super::LinkMode::Speed1000Half)
+        {
+            return TestResult::Fail("e1000 aneg resolve missed 1000 half agreement");
+        }
+        // Partner 1000 full, we offer 1000 half only: fall to 100 full.
+        if super::resolve_negotiated_mode(0x01E1, 0x0100, 0x01E1, 0x0800)
+            != Some(super::LinkMode::Speed100Full)
+        {
+            return TestResult::Fail("e1000 aneg resolve confused 1000 half/full");
+        }
+        // Partner 10 half only: lowest common mode.
+        if super::resolve_negotiated_mode(ours.0, ours.1, 0x0020, 0x0000)
+            != Some(super::LinkMode::Speed10Half)
+        {
+            return TestResult::Fail("e1000 aneg resolve missed 10 half agreement");
+        }
+        // No common mode: partner answers nothing we offer.
+        if super::resolve_negotiated_mode(ours.0, ours.1, 0x0000, 0x0000).is_some() {
+            return TestResult::Fail("e1000 aneg resolve invented a mode with no overlap");
+        }
+        // BMSR complete bit.
+        if !super::bmsr_ancomplete(0x0020) || super::bmsr_ancomplete(0x0000) {
+            return TestResult::Fail("e1000 bmsr_ancomplete misread the complete bit");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/e1000",
+        smoke_aneg_resolve_priority_and_no_common
+    );
 
     fn smoke_vlan_vfta_mapping() -> TestResult {
         // Boundary VIDs: first/last bit of the first word, first bit
@@ -3690,6 +4383,7 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_multicast_rar_encoding);
+
     fn smoke_datapath_allowed_gate_matrix() -> TestResult {
         // The gate every datapath entry point uses: only the
         // neither-detached-nor-suspended cell is open.
@@ -3752,4 +4446,128 @@ mod tests {
         "drivers/net/e1000",
         smoke_suspend_words_preserve_bringup_config
     );
+    fn smoke_mdic_command_words() -> TestResult {
+        // Read of PHYSID1 (reg 2): OP_READ | phy 1 | reg 2.
+        if super::mdic_read_cmd(super::PHY_ID1) != 0x0822_0000 {
+            return TestResult::Fail("e1000 MDIC read command word wrong");
+        }
+        // Write of 0x1140 to reg 0: OP_WRITE | phy 1 | data.
+        if super::mdic_write_cmd(0, 0x1140) != 0x0420_1140 {
+            return TestResult::Fail("e1000 MDIC write command word wrong");
+        }
+        // Register field is 5 bits: reg 0x3F masks to 0x1F.
+        if super::mdic_read_cmd(0x3F) != (super::MDIC_OP_READ | super::MDIC_PHY_ADDR | (0x1F << 16))
+        {
+            return TestResult::Fail("e1000 MDIC register field not masked to 5 bits");
+        }
+        // Data extraction masks off READY/ERROR/opcode bits.
+        if super::mdic_data(0x5000_1234) != 0x1234 {
+            return TestResult::Fail("e1000 MDIC data field not masked to 16 bits");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_mdic_command_words);
+
+    fn smoke_phy_id_composition_and_validity() -> TestResult {
+        if super::phy_id_from(0x0141, 0x0CC2) != 0x0141_0CC2 {
+            return TestResult::Fail("e1000 PHY ID composition wrong");
+        }
+        if !super::phy_id_valid(0x0141_0CC2) {
+            return TestResult::Fail("e1000 PHY ID validity rejected a real ID");
+        }
+        if super::phy_id_valid(0xFFFF_FFFF) || super::phy_id_valid(0) {
+            return TestResult::Fail("e1000 PHY ID validity accepted a no-device signature");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_phy_id_composition_and_validity);
+
+    fn smoke_bmsr_link_decode() -> TestResult {
+        if !super::bmsr_link(0x0004) {
+            return TestResult::Fail("e1000 BMSR link bit not decoded");
+        }
+        if super::bmsr_link(0xFFFB) || super::bmsr_link(0x0000) {
+            return TestResult::Fail("e1000 BMSR link bit decoded from a link-down value");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_bmsr_link_decode);
+
+    fn smoke_rx_csum_result_matrix() -> TestResult {
+        // Pin the descriptor bit values against the Linux literals
+        // (e1000_hw.h), not the module's own constants, so a
+        // mistranscribed constant cannot pass its own test.
+        if super::RXD_STAT_IPCS != 0x40
+            || super::RXD_STAT_TCPCS != 0x20
+            || super::RXD_STAT_UDPCS != 0x10
+            || super::RXD_STAT_IXSM != 0x04
+            || super::RXD_ERR_IPE != 0x40
+            || super::RXD_ERR_TCPE != 0x20
+        {
+            return TestResult::Fail("e1000 RX descriptor bit constants drifted from Linux");
+        }
+        // (status, errors) -> expected verdict. Status bits: DD 0x01,
+        // IXSM 0x04, UDPCS 0x10, TCPCS 0x20, IPCS 0x40; error bits:
+        // TCPE 0x20, IPE 0x40.
+        let cases: [(u8, u8, super::RxCsumResult); 13] = [
+            (0x00, 0x00, super::RxCsumResult::None),
+            (0x40, 0x00, super::RxCsumResult::Ok),
+            (0x20, 0x00, super::RxCsumResult::Ok),
+            (0x10, 0x00, super::RxCsumResult::Ok),
+            (0x60, 0x00, super::RxCsumResult::Ok),
+            (0x40, 0x40, super::RxCsumResult::Fail),
+            (0x20, 0x20, super::RxCsumResult::Fail),
+            // The UDP hole the old computed-first order missed: UDPCS
+            // only, carrying TCPE, must fail, not report None.
+            (0x10, 0x20, super::RxCsumResult::Fail),
+            // Errors win even with no computed bit set.
+            (0x00, 0x20, super::RxCsumResult::Fail),
+            (0x00, 0x40, super::RxCsumResult::Fail),
+            (0x60, 0x60, super::RxCsumResult::Fail),
+            // IXSM wins over everything: hardware ignored the checksum.
+            (0x44, 0x00, super::RxCsumResult::None),
+            (0x04, 0x20, super::RxCsumResult::None),
+        ];
+        for (status, errors, want) in cases {
+            let desc = super::RxDesc {
+                status,
+                errors,
+                ..Default::default()
+            };
+            if desc.csum_result() != want {
+                return TestResult::Fail("e1000 csum_result matrix mismatch");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_rx_csum_result_matrix);
+
+    fn smoke_rx_drop_reason_matrix() -> TestResult {
+        // Error bits: CE 0x01, SE 0x02, SEQ 0x04, CXE 0x10, TCPE 0x20,
+        // IPE 0x40, RXE 0x80. Status bits as in the csum matrix.
+        let cases: [(u8, u8, Option<super::RxDropReason>); 10] = [
+            (0x00, 0x01, Some(super::RxDropReason::CrcError)),
+            (0x40, 0x41, Some(super::RxDropReason::CrcError)),
+            (0x00, 0x02, Some(super::RxDropReason::FrameError)),
+            (0x00, 0x04, Some(super::RxDropReason::FrameError)),
+            (0x00, 0x10, Some(super::RxDropReason::FrameError)),
+            (0x00, 0x80, Some(super::RxDropReason::FrameError)),
+            (0x40, 0x20, Some(super::RxDropReason::CsumFail)),
+            (0x10, 0x20, Some(super::RxDropReason::CsumFail)),
+            (0x40, 0x00, None),
+            (0x00, 0x00, None),
+        ];
+        for (status, errors, want) in cases {
+            let desc = super::RxDesc {
+                status,
+                errors,
+                ..Default::default()
+            };
+            if super::rx_drop_reason(&desc) != want {
+                return TestResult::Fail("e1000 rx_drop_reason matrix mismatch");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_rx_drop_reason_matrix);
 }

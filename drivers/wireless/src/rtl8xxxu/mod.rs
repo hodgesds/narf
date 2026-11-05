@@ -174,6 +174,7 @@ pub static RTL8XXXU_USB_IDS: &[narf_drivers_usb::class_registry::UsbClassMatch] 
 /// `drivers/net/wireless/realtek/rtl8xxxu/rtl8xxxu_core.c` (~L7692).
 pub fn rtl8xxxu_probe(
     device: alloc::sync::Arc<narf_drivers_usb::device::USBDevice>,
+    _hub_port: Option<(u8, u8)>,
 ) -> Result<(), narf_drivers_usb::class_registry::UsbProbeError> {
     use narf_drivers_usb::class_registry::UsbProbeError;
 

@@ -213,6 +213,59 @@ also consult upstream Linux GPL sources.
   opening a fresh idle window — a suspended port gates the very
   interrupt endpoint the pump polls, so the resume has to come
   from the supervisor side of the pump, not from report traffic.
+- NIC idle-suspend (#1256): the USB NIC drivers (r8152, CDC-NCM,
+  CDC-ECM) participate in hub idle-suspend through a class
+  suspend-hook registry (`class_registry::register_suspend_hook`,
+  `dispatch_suspend`) alongside the class-driver registry.
+  Registry probes and the NCM/ECM walk arms receive the same
+  hub context — (parent hub slot id, downstream port), `None`
+  on a root port — and each NIC record stores it as `hub_port`
+  plus a `suspended` park flag and a `wakeup_armed` flag. The
+  supervisor's `idle_suspend_pass` calls `dispatch_suspend`
+  for a candidate port BEFORE gating it (a gated port blocks
+  all transfers, including the arming transfer); if any hook
+  reports a failed park, gating is skipped that cycle and
+  retried next cycle. Hooks are async (a sync hook bridging
+  with `block_on` would panic inside the supervisor's executor
+  poll) and self-filter by hub context; they never hold their
+  record lock across an await. Per-family park shapes: all
+  three pumps park in place (yield without transfers, error
+  counts, or link sampling; `pump_running` stays true, so
+  resume needs no re-spawn) and detach dominates park. r8152
+  additionally reprograms its chip wake filter from the
+  bind-time snapshot via `apply_wol` — a failed filter program
+  is `ParkFailed`, because gating without the wake filter
+  would leave the device unable to wake on magic packet — and
+  then issues SET_FEATURE(DEVICE_REMOTE_WAKEUP) (USB 2.0
+  §9.4.2, feature selector 1, device recipient, `wIndex` 0);
+  a stall on that transfer only clears `wakeup_armed` and the
+  park still proceeds. NCM and ECM have no chip wake filter,
+  so their hooks arm remote wakeup only. NIC pumps mark port
+  activity only on delivered frames, never on empty polls, so
+  an idle NIC still becomes a suspend candidate after the 30 s
+  window; a TX-demand resume (send path resumes a parked port
+  first, fails fast if resume fails, and opens a fresh idle
+  window) wakes a parked device for traffic, following Linux
+  usbnet runtime-PM semantics. The supervisor's wake-watch
+  step (`wake_suspended_nic_ports`, after `resume_bound_ports`
+  and before the pumps) resumes a parked NIC port only on an
+  observed remote-wakeup edge — the `C_PORT_SUSPEND` change
+  bit (bit 2 of the high half, i.e. bit 18) of the hub port
+  status word — because an unconditional resume would defeat
+  autosuspend and WoL. r8152 link state restores via the
+  pump's existing 32-turn sampling once unparked; ECM link
+  state re-reports via its notification pump. Root-port NICs
+  never park (no hub to gate them). SuperSpeed/U3 is out of
+  scope: the hub layer is USB-2.0-centric, so this covers the
+  USB 2.0 port_suspend/port_resume path; an SS device whose
+  SET_FEATURE(DEVICE_REMOTE_WAKEUP) stalls parks unarmed.
+  Merge-order notes: the r8152 RX-checksum verdict (#1374) is
+  driver-local pure logic, unaffected by suspend; the pending
+  PLA_RMS MTU write (#1375) is applied by the RX pump on its
+  next turn — whoever lands second must verify the park check
+  sits before transfers but does not bypass a pending
+  application, so the first post-resume pump turn still
+  applies it.
 - Fingerprint matching has a single authority (issue #918):
   `narf_drivers_fingerprint::FINGERPRINT_DEVICES` (31 entries: the
   scaffold table union the pre-#918 USB table). The USB binder owns
@@ -393,8 +446,18 @@ also consult upstream Linux GPL sources.
   maxpacket == 0`); RX parses concatenated-frame bulk buffers with
   a trailing `rx_hdr` (`pkt_cnt`/`hdr_off`) and per-packet metadata
   (CRC/DROP errors and runts dropped, dummy headers skipped).
-  Link-status interrupt, offload advertisement, multicast filter,
-  VLAN, and jumbo frames are follow-ups, not v1.
+  Audit item 2 is implemented on top: the interrupt-IN endpoint
+  (found by the shared r8152 finder walk) feeds a status task
+  that decodes the link bit (first word, bit 16) and, on
+  link-up, runs the Linux link-change sequence (TX FIFO quiesce
+  poll, PHYSICAL_LINK_STATUS + PHYSR read, bulkin/medium
+  programming, speed + duplex reporting); TX checksum offload
+  is advertised (`tx_checksum`, RX checksum deliberately not —
+  no verdict channel in `on_rx_frame_from`) and the multicast
+  filter is programmed via the stack's `DeviceControl` hook
+  (Linux `set_multicast` semantics, `ether_crc` filter hash).
+  VLAN and jumbo frames remain follow-ups (ungrounded per
+  audit §6).
 - `r8152` installs an `iface::DeviceControl` at bind, so registry
   MTU changes validate against the chip version (68..=1500 for
   FE / unknown versions, 68..=9194 / 15338 / 16362 for the GbE
@@ -408,6 +471,26 @@ also consult upstream Linux GPL sources.
   within one pump turn. Version-specific FIFO tuning from
   Linux's `change_mtu` variants (`PLA_MTPS`, `PLA_TXFIFO_*`) is
   not programmed by this path.
+- `lan95xx` is the core driver for the SMSC/Microchip LAN95xx
+  USB 2.0 10/100 family (LAN9500 / 9500A / 9512 / 9514 / 9530 /
+  9730 / 89530, issue #788): vendor control transport (`0xA1` /
+  `0xA0`, `wValue = 0`, `wIndex = register`), lite reset in
+  Linux's order, internal-PHY autoneg via `MII_ADDR` / `MII_DATA`,
+  EEPROM station address (offset `0x01`), TX command-word
+  framing with checksum-preamble offload, RX status-header
+  framing with FCS stripping, publication as `usb-lan95xx{N}`,
+  and detach. Register values are Linux-driver-observed
+  (`smsc95xx.c` / `smsc95xx.h` @ cbbddb6); no public LAN95xx
+  datasheet copy exists in the workspace. Deliberate limits:
+  station address from EEPROM only (a device reporting no valid
+  address fails the bind; the EEPROM-less fallback is a
+  follow-up); external PHY fails the bind; link state is
+  published once from the bind-time PHY read (the
+  interrupt-endpoint link-change task is a follow-up);
+  multicast programming is not implemented (receive-own only);
+  RX checksum offload stays disabled (no RX verdict channel on
+  the USB RX path); no TSO, no VLAN insert/strip, no
+  suspend/WoL, no hub-combo verification yet.
 - Address Device reserves a slot before DMA setup, retains Input/Device
   Contexts plus EP0 ring/page before DCBAA publication, and adopts them only
   after the exact command TRB succeeds. Address, Configure, Evaluate, Disable

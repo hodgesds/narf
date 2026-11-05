@@ -542,3 +542,671 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723ae",
     smoke_rtl8723ae_c2h_mailbox_bt_info
 );
+
+// ── 8723AE coexistence owner (step 2) ───────────────────────────────────
+
+/// `adapter::BtInfo` for a BT-strapped 1-antenna board.
+fn coex_bt() -> adapter::BtInfo {
+    adapter::BtInfo {
+        coexistence: true,
+        kind: adapter::BT_RTL8723A,
+        ant_num: adapter::AntNum::X1,
+        ant_isolation: 0,
+        radio_shared: 0,
+    }
+}
+
+/// `hal_btc.c` BT-info ingestion + the `btc_periodical` trigger:
+/// connected → busy + idle cleared + BtOnly decision; disconnected →
+/// idle set + WifiOnly; no BT strap → no decision.
+fn smoke_rtl8723ae_coex_ingest_and_periodical() -> TestResult {
+    use coex::*;
+    let mut owner = Owner::bind(&coex_bt());
+    if owner.pattern() != crate::rtlwifi::btcoex::TdmaPattern::WifiOnly {
+        return TestResult::Fail("8723AE coex initial pattern");
+    }
+    owner.ingest(&c2h::BtInfo {
+        original: 0x05,
+        retry_cnt: 3,
+        inquiry_page: true,
+        connected: true,
+    });
+    if !owner.bt_busy
+        || owner.bt_idle
+        || owner.retry_cnt != 3
+        || !owner.inquiry_page
+        || owner.req_sent
+        || owner.cstate & state::BT_IDLE != 0
+    {
+        return TestResult::Fail("8723AE coex connected ingest");
+    }
+    if owner.periodical() != Some(crate::rtlwifi::btcoex::TdmaPattern::BtOnly) {
+        return TestResult::Fail("8723AE coex connected periodical");
+    }
+    owner.ingest(&c2h::BtInfo {
+        original: 0x00,
+        retry_cnt: 0,
+        inquiry_page: false,
+        connected: false,
+    });
+    if owner.bt_busy
+        || !owner.bt_idle
+        || owner.cstate & state::BT_IDLE == 0
+        || owner.periodical() != Some(crate::rtlwifi::btcoex::TdmaPattern::WifiOnly)
+    {
+        return TestResult::Fail("8723AE coex disconnected ingest");
+    }
+    // Inquiry-only (page, no link) → Inquiry state → BtOnly while idle.
+    owner.ingest(&c2h::BtInfo {
+        original: 0x04,
+        retry_cnt: 1,
+        inquiry_page: true,
+        connected: false,
+    });
+    if owner.periodical() != Some(crate::rtlwifi::btcoex::TdmaPattern::BtOnly) {
+        return TestResult::Fail("8723AE coex inquiry periodical");
+    }
+    // A board without the BT strap gets no decision.
+    let mut plain = Owner::bind(&adapter::BtInfo {
+        coexistence: false,
+        ..coex_bt()
+    });
+    if plain.periodical().is_some() {
+        return TestResult::Fail("8723AE coex unstrapped periodical");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_coex_ingest_and_periodical
+);
+
+/// `hal_bt_coexist.c` wifi-state bits, RSSI hysteresis (levels 2 and 3,
+/// both variants), and state-changed detection.
+fn smoke_rtl8723ae_coex_wifi_state_and_rssi() -> TestResult {
+    use coex::*;
+    let mut owner = Owner::bind(&coex_bt());
+    owner.periodical();
+    owner.check_wifi_state(&WifiTraffic {
+        busy: true,
+        tx_busy: true,
+        rx_busy: false,
+        legacy: false,
+        bw40: true,
+        bt30: false,
+    });
+    if owner.cstate & state::WIFI_IDLE != 0
+        || owner.cstate & state::WIFI_UPLINK == 0
+        || owner.cstate & state::WIFI_DOWNLINK != 0
+        || owner.cstate & state::WIFI_HT40 == 0
+        || owner.cstate & state::WIFI_HT20 != 0
+        || owner.cstate & state::WIFI_LEGACY != 0
+        || !owner.is_wifi_up_link()
+        || !owner.is_coexist_state_changed()
+    {
+        return TestResult::Fail("8723AE coex wifi-state bits");
+    }
+    owner.periodical();
+    if owner.is_coexist_state_changed() {
+        return TestResult::Fail("8723AE coex state-changed snapshot");
+    }
+    // Level 2, non-1 variant: High → Low below thresh, Low → High at
+    // thresh + tolerance (6).
+    if owner.rssi_state(40, 2, 50, 0) != RssiState::Low
+        || owner.cstate & state::WIFI_RSSI_LOW == 0
+        || owner.cstate & state::WIFI_RSSI_HIGH != 0
+    {
+        return TestResult::Fail("8723AE coex rssi level-2 low");
+    }
+    if owner.rssi_state(60, 2, 50, 0) != RssiState::High
+        || owner.cstate & state::WIFI_RSSI_HIGH == 0
+        || owner.cstate & state::WIFI_RSSI_LOW != 0
+    {
+        return TestResult::Fail("8723AE coex rssi level-2 high");
+    }
+    // Level-3 threshold error returns the previous state unchanged.
+    if owner.rssi_state(99, 3, 60, 50) != RssiState::High {
+        return TestResult::Fail("8723AE coex rssi thresh error");
+    }
+    // Level 3, _1 variant: High → Medium below thresh1, Medium → High
+    // at thresh1 + tolerance.
+    if owner.rssi_state1(45, 3, 50, 60) != RssiState::Medium
+        || owner.cstate & state::WIFI_RSSI_1_MEDIUM == 0
+    {
+        return TestResult::Fail("8723AE coex rssi1 level-3 medium");
+    }
+    if owner.rssi_state1(70, 3, 50, 60) != RssiState::High
+        || owner.cstate & state::WIFI_RSSI_1_HIGH == 0
+        || owner.cstate & state::WIFI_RSSI_1_MEDIUM != 0
+    {
+        return TestResult::Fail("8723AE coex rssi1 level-3 high");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_coex_wifi_state_and_rssi
+);
+
+/// `hal_bt_coexist.c` DM register writes: AGC `0xc78` tables, BB
+/// back-off `0xc04`, balance H2C `0x0c`, and idempotent all-off.
+fn smoke_rtl8723ae_coex_dm_registers() -> TestResult {
+    use coex::*;
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if owner.agc_table(&io, false).is_err() || owner.bb_back_off(&io, false).is_err() {
+        return TestResult::Fail("8723AE coex off writes");
+    }
+    {
+        let g = io.0.lock();
+        if g.writes[..5]
+            != [
+                (REG_AGC_TABLE, 0x641c0001, 4),
+                (REG_AGC_TABLE + 4, 0x631d0001, 4),
+                (REG_AGC_TABLE + 8, 0x621e0001, 4),
+                (REG_AGC_TABLE + 12, 0x611f0001, 4),
+                (REG_AGC_TABLE + 16, 0x60200001, 4),
+            ]
+            || g.writes[5] != (REG_BB_BACKOFF, BB_BACKOFF_OFF, 4)
+        {
+            return TestResult::Fail("8723AE coex off table bytes");
+        }
+    }
+    if owner.agc_table(&io, true).is_err() || owner.bb_back_off(&io, true).is_err() {
+        return TestResult::Fail("8723AE coex on writes");
+    }
+    if !owner.agc_rf_pending {
+        return TestResult::Fail("8723AE coex RF half recorded");
+    }
+    {
+        let g = io.0.lock();
+        if g.writes[6..11]
+            != [
+                (REG_AGC_TABLE, 0x4e1c0001, 4),
+                (REG_AGC_TABLE + 4, 0x4d1d0001, 4),
+                (REG_AGC_TABLE + 8, 0x4c1e0001, 4),
+                (REG_AGC_TABLE + 12, 0x4b1f0001, 4),
+                (REG_AGC_TABLE + 16, 0x4a200001, 4),
+            ]
+            || g.writes[11] != (REG_BB_BACKOFF, BB_BACKOFF_ON, 4)
+        {
+            return TestResult::Fail("8723AE coex on table bytes");
+        }
+    }
+    // Balance H2C 0x0c [ms0, ms1, on] through box 0; turning it on
+    // clears the firmware all-off flag.
+    owner.fw_all_off = true;
+    if narf_scheduler::block_on(owner.balance(&io, true, 0x10, 0x20)).is_err()
+        || owner.fw_all_off
+        || !owner.balance_on
+    {
+        return TestResult::Fail("8723AE coex balance");
+    }
+    {
+        let g = io.0.lock();
+        if g.writes[12..]
+            != [
+                (REG_HMEBOX_0, u32::from(H2C_BALANCE), 1),
+                (REG_HMEBOX_0 + 1, 0x10, 1),
+                (REG_HMEBOX_0 + 2, 0x20, 1),
+                (REG_HMEBOX_0 + 3, 1, 1),
+            ]
+        {
+            return TestResult::Fail("8723AE coex balance box bytes");
+        }
+    }
+    // All-off: idempotent, runs the grounded SW subset once.
+    let before = io.0.lock().writes.len();
+    if owner.coex_all_off(&io).is_err()
+        || !owner.fw_all_off
+        || !owner.sw_all_off
+        || !owner.hw_all_off
+    {
+        return TestResult::Fail("8723AE coex all-off flags");
+    }
+    let after = io.0.lock().writes.len();
+    if after - before != 6 {
+        return TestResult::Fail("8723AE coex all-off sw subset writes");
+    }
+    if owner.coex_all_off(&io).is_err() || io.0.lock().writes.len() != after {
+        return TestResult::Fail("8723AE coex all-off idempotence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_coex_dm_registers
+);
+
+// ── 8723AE signed envelopes (step 2) ────────────────────────────────────
+
+/// Test board factory (synthetic values, not any board's).
+fn ae_factory() -> crate::rtlwifi::efuse::Factory {
+    crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x87, 0x23, 0xae],
+        logical: [0u8; 512],
+    }
+}
+
+/// Build a NAPC envelope from the documented layout (header 96, rows of
+/// 388 bytes: channel/band/bandwidth/offset + three 64-entry curves).
+/// `rows` are (channel, bandwidth, offset, curve-value fn) for v2, or
+/// (channel, 20, 0, fn) for v1. The identity is the board's factory
+/// identity; the MAC matches the factory.
+fn napc_fixture(
+    version: u16,
+    antenna: i16,
+    qualified: i16,
+    rows: &[(u8, u8, u8, fn(u8) -> i16)],
+) -> Vec<u8> {
+    let factory = ae_factory();
+    let identity = crate::rtlwifi::radio::factory_identity(&factory);
+    let total = 96 + rows.len() * 388;
+    let mut bytes = vec![0u8; total];
+    bytes[0..4].copy_from_slice(b"NAPC");
+    bytes[4..6].copy_from_slice(&version.to_le_bytes());
+    bytes[6..8].copy_from_slice(&96u16.to_le_bytes());
+    bytes[8..12].copy_from_slice(&(total as u32).to_le_bytes());
+    bytes[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    bytes[14..16].copy_from_slice(&0x8723u16.to_le_bytes());
+    bytes[16..48].copy_from_slice(&identity);
+    bytes[48..54].copy_from_slice(&factory.mac);
+    bytes[56..58].copy_from_slice(&antenna.to_le_bytes());
+    bytes[58..60].copy_from_slice(&qualified.to_le_bytes());
+    bytes[60..62].copy_from_slice(&(rows.len() as u16).to_le_bytes());
+    bytes[62..64].copy_from_slice(&(if version == 1 { 20u16 } else { 0u16 }).to_le_bytes());
+    for (i, (channel, bandwidth, offset, curve)) in rows.iter().enumerate() {
+        let row = &mut bytes[96 + i * 388..96 + (i + 1) * 388];
+        row[0] = *channel;
+        if version == 2 {
+            row[1] = 0;
+            row[2] = *bandwidth;
+            row[3] = *offset;
+        }
+        for curve_idx in 0..3 {
+            for idx in 0..64 {
+                let at = 4 + (curve_idx * 64 + idx) * 2;
+                row[at..at + 2].copy_from_slice(&curve(idx as u8).to_le_bytes());
+            }
+        }
+    }
+    bytes
+}
+
+/// Flat rising curves: output `2 * index` quarter dBm, so a 20 dBm
+/// ceiling with antenna 0 admits index 40 on every rate.
+fn rising(idx: u8) -> i16 {
+    i16::from(idx) * 2
+}
+
+/// US 2.4 GHz domain: 2402-2472 MHz, 40 MHz, 20 dBm.
+fn us_domain() -> narf_wireless::reg::RegulatoryDomain {
+    use narf_wireless::reg::*;
+    RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: 40,
+            max_power_dbm: 20,
+            flags: RegFlags::empty(),
+        }],
+    }
+}
+
+/// v1 parse + permission (all 20 rates admitted, index 40), tampered
+/// variants, and the masking-defeating multi-row v2 case.
+fn smoke_rtl8723ae_envelope_parse_and_permission() -> TestResult {
+    use envelope::*;
+    let factory = ae_factory();
+    let domain = us_domain();
+    let mut v1_rows = Vec::new();
+    for channel in 1..=11u8 {
+        v1_rows.push((channel, 20, 0, rising as fn(u8) -> i16));
+    }
+    let bytes = napc_fixture(1, 0, 256, &v1_rows);
+    let cal = match Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
+        Ok(cal) => cal,
+        Err(_) => return TestResult::Fail("8723AE envelope v1 parse"),
+    };
+    if cal.operating_points().count() != 11 || !cal.measures(Operating::twenty(6)) {
+        return TestResult::Fail("8723AE envelope v1 rows");
+    }
+    let perm = match cal.permission(&domain, 6) {
+        Ok(perm) => perm,
+        Err(_) => return TestResult::Fail("8723AE envelope v1 permission"),
+    };
+    if perm.channel() != 6
+        || perm.eirp_limit_qdbm() != 80
+        || perm.admitted_rates() != 0xfffff
+        || perm.index(0) != 40
+        || perm.index(12) != 40
+        || !perm.admits(19)
+    {
+        return TestResult::Fail("8723AE envelope v1 permission values");
+    }
+    // Tampered variants fail where verification is required.
+    let mut bad = bytes.clone();
+    bad[0] = b'X';
+    if Calibration::from_verified(&bad, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8723AE envelope bad magic admitted");
+    }
+    let mut bad = bytes.clone();
+    bad[14..16].copy_from_slice(&0x8821u16.to_le_bytes());
+    if Calibration::from_verified(&bad, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8723AE envelope wrong device admitted");
+    }
+    if Calibration::from_verified(&bytes, None, &factory).is_ok() {
+        return TestResult::Fail("8723AE envelope unsigned admitted");
+    }
+    let mut bad = bytes.clone();
+    bad[16] ^= 0xff;
+    if Calibration::from_verified(&bad, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8723AE envelope identity mismatch admitted");
+    }
+    // Unordered rows: swap channels 1 and 2.
+    let mut bad = bytes.clone();
+    bad.swap(96, 96 + 388);
+    if Calibration::from_verified(&bad, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8723AE envelope unordered rows admitted");
+    }
+    // A channel-12 row has no centre in the admitted plan.
+    let mut rows12 = v1_rows.clone();
+    rows12.push((12, 20, 0, rising as fn(u8) -> i16));
+    if Calibration::from_verified(
+        &napc_fixture(1, 0, 256, &rows12),
+        Some([0xabu8; 32]),
+        &factory,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("8723AE envelope channel 12 admitted");
+    }
+    // Wholly unmeasured HT curve on channel 6 → the point is refused.
+    let mut rows_unmeasured = v1_rows.clone();
+    rows_unmeasured[5] = (
+        6,
+        20,
+        0,
+        (|idx: u8| {
+            // CCK/OFDM rise; HT is filled below by hand.
+            let _ = idx;
+            0
+        }) as fn(u8) -> i16,
+    );
+    let mut bytes_unmeasured = napc_fixture(1, 0, 256, &rows_unmeasured);
+    // Blank the HT curve (third curve) of the channel-6 row.
+    let row6 = &mut bytes_unmeasured[96 + 5 * 388..96 + 6 * 388];
+    for idx in 0..64 {
+        let at = 4 + (2 * 64 + idx) * 2;
+        row6[at..at + 2].copy_from_slice(&i16::MAX.to_le_bytes());
+    }
+    let cal_unmeasured =
+        match Calibration::from_verified(&bytes_unmeasured, Some([0xabu8; 32]), &factory) {
+            Ok(cal) => cal,
+            Err(_) => return TestResult::Fail("8723AE envelope unmeasured parse"),
+        };
+    if cal_unmeasured.permission(&domain, 6).is_ok() {
+        return TestResult::Fail("8723AE envelope unmeasured HT admitted");
+    }
+    // Masking-defeating v2 case: a 20 MHz row must not satisfy a 40 MHz
+    // operating point, and a real 40 MHz row must.
+    let v2_only20 = napc_fixture(2, 0, 256, &[(6, 20, 0, rising as fn(u8) -> i16)]);
+    let cal20 = match Calibration::from_verified(&v2_only20, Some([0xabu8; 32]), &factory) {
+        Ok(cal) => cal,
+        Err(_) => return TestResult::Fail("8723AE envelope v2 20-only parse"),
+    };
+    if cal20
+        .permission_for(
+            &domain,
+            Operating {
+                width: Width::W40Above,
+                channel: 6,
+            },
+        )
+        .is_ok()
+    {
+        return TestResult::Fail("8723AE envelope 20 MHz row satisfied 40 MHz");
+    }
+    let v2_both = napc_fixture(
+        2,
+        0,
+        256,
+        &[
+            (6, 20, 0, rising as fn(u8) -> i16),
+            (6, 40, 1, rising as fn(u8) -> i16),
+        ],
+    );
+    let cal_both = match Calibration::from_verified(&v2_both, Some([0xabu8; 32]), &factory) {
+        Ok(cal) => cal,
+        Err(_) => return TestResult::Fail("8723AE envelope v2 both parse"),
+    };
+    if cal_both
+        .permission_for(
+            &domain,
+            Operating {
+                width: Width::W40Above,
+                channel: 6,
+            },
+        )
+        .is_err()
+    {
+        return TestResult::Fail("8723AE envelope 40 MHz row refused");
+    }
+    // A 5 GHz row (band 1) is a format failure on this 2.4 GHz part.
+    let mut v2_5g = napc_fixture(2, 0, 256, &[(6, 20, 0, rising as fn(u8) -> i16)]);
+    v2_5g[96 + 1] = 1;
+    if Calibration::from_verified(&v2_5g, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8723AE envelope 5 GHz row admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_envelope_parse_and_permission
+);
+
+// ── 8723AE packet owner (step 2) ────────────────────────────────────────
+
+/// Admitted permission for 20 MHz channel 6 (from the v1 fixture).
+fn ae_permission() -> envelope::Permission {
+    let factory = ae_factory();
+    let mut rows = Vec::new();
+    for channel in 1..=11u8 {
+        rows.push((channel, 20, 0, rising as fn(u8) -> i16));
+    }
+    let bytes = napc_fixture(1, 0, 256, &rows);
+    let cal = envelope::Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory)
+        .expect("8723AE packet test fixture");
+    cal.permission(&us_domain(), 6)
+        .expect("8723AE packet test permission")
+}
+
+/// TX descriptor golden values (independent bit math from `trx.h`),
+/// admission gates, and RX descriptor decode.
+fn smoke_rtl8723ae_packet_admission_and_desc() -> TestResult {
+    use packet::*;
+    let owner = Owner::admit(
+        crate::rtlwifi::firmware_transport::Info {
+            version: 1,
+            subversion: 0,
+            payload: 0,
+        },
+        ae_permission(),
+    );
+    let op = envelope::Operating::twenty(6);
+    if owner.admit_tx(op, 12).is_err()
+        || owner.admit_tx(envelope::Operating::twenty(7), 12).is_ok()
+        || owner.admit_tx(op, 20).is_ok()
+    {
+        return TestResult::Fail("8723AE packet admission gates");
+    }
+    let tx = TxFrame {
+        op,
+        class: FrameClass::Data { priority: 0 },
+        len: 100,
+        buf_phys: 0x1234_5678_9abc_def0,
+        rate: 12,
+        seq: 0xabc,
+        short_gi: true,
+        bw40: false,
+        tx_sc: 0,
+        bmc: false,
+        rts: None,
+        next_desc: 0,
+    };
+    let mut slot = [0u32; TX_DESC_DWORDS];
+    if owner.fill_tx_slot(&mut slot, &tx).is_err() {
+        return TestResult::Fail("8723AE packet fill admitted");
+    }
+    // DW0: len | offset 32 | lastseg | firstseg | own.
+    // DW1: queuesel 0. DW3: seq. DW5: rate | shortgi | fb limits.
+    // DW7: buf size. DW8/DW9: buf address low/high.
+    if slot[0] != 0x8c20_0064
+        || slot[1] != 0
+        || slot[3] != 0x0abc_0000
+        || slot[5] != 0x0001_ff4c
+        || slot[7] != 100
+        || slot[8] != 0x9abc_def0
+        || slot[9] != 0x1234_5678
+        || slot[10] != 0
+    {
+        return TestResult::Fail("8723AE packet TX descriptor bytes");
+    }
+    // Beacon class selects QSLT_BEACON (0x10); a refused frame writes
+    // nothing.
+    let mut beacon = [0u32; TX_DESC_DWORDS];
+    let beacon_tx = TxFrame {
+        class: FrameClass::Beacon,
+        ..tx
+    };
+    if owner.fill_tx_slot(&mut beacon, &beacon_tx).is_err() || beacon[1] != 0x1000 {
+        return TestResult::Fail("8723AE packet beacon queuesel");
+    }
+    let mut refused = [0u32; TX_DESC_DWORDS];
+    let refused_tx = TxFrame {
+        op: envelope::Operating::twenty(7),
+        ..tx
+    };
+    if owner.fill_tx_slot(&mut refused, &refused_tx).is_ok() || refused != [0u32; 16] {
+        return TestResult::Fail("8723AE packet refused frame wrote");
+    }
+    if owner
+        .fill_tx_slot(&mut refused, &TxFrame { len: 0, ..tx })
+        .is_ok()
+    {
+        return TestResult::Fail("8723AE packet zero length admitted");
+    }
+    // RX decode golden: len 200, drvinfo 2 (16 bytes), shift 1,
+    // PAGGR + FAGGR, rate 12 HT 40 MHz, timestamp + buffer address.
+    let d = [
+        0x0102_00c8u32,
+        0x0000_c000,
+        0,
+        0x0000_024c,
+        0,
+        0xdead_beef,
+        0x0000_1000,
+        0,
+    ];
+    let rx = decode_rx_desc(&d);
+    if rx.hw_owned
+        || rx.pkt_len != 200
+        || rx.drv_info_bytes != 16
+        || rx.shift != 1
+        || rx.payload_offset() != 17
+        || rx.payload_len() != 183
+        || !rx.paggr
+        || !rx.first_ampdu
+        || rx.rate != 12
+        || !rx.ht
+        || !rx.bw40
+        || rx.cck
+        || rx.timestamp_low != 0xdead_beef
+        || rx.buf_addr != 0x1000
+    {
+        return TestResult::Fail("8723AE packet RX decode");
+    }
+    let mut owned = d;
+    owned[0] |= 1 << 31;
+    if !decode_rx_desc(&owned).hw_owned {
+        return TestResult::Fail("8723AE packet RX own bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_packet_admission_and_desc
+);
+
+/// Mailbox wiring: `c2h_pending` gates the drain; BT info feeds the
+/// coexistence owner and returns the periodical decision.
+fn smoke_rtl8723ae_packet_service_c2h() -> TestResult {
+    use crate::rtlwifi::irq::{IsrStatus, IMR_C2HCMD};
+    use packet::*;
+    let mut owner = Owner::admit(
+        crate::rtlwifi::firmware_transport::Info {
+            version: 1,
+            subversion: 0,
+            payload: 0,
+        },
+        ae_permission(),
+    );
+    let mut coex = coex::Owner::bind(&coex_bt());
+    // No interrupt: nothing drained, no writes.
+    let idle_io = c2h_fake(0x2c, 7, c2h::C2H_EVT_FW_CLOSE, &[0x05, 0x03]);
+    if owner.service_c2h(&idle_io, IsrStatus { hisr: 0, hisre: 0 }, Some(&mut coex))
+        != Ok(Service::NotPending)
+        || !idle_io.0.lock().writes.is_empty()
+    {
+        return TestResult::Fail("8723AE packet service not-pending");
+    }
+    // Pending + BT info: ingested, BtOnly decision (idle Wi-Fi, BT link).
+    let io = c2h_fake(0x2c, 7, c2h::C2H_EVT_FW_CLOSE, &[0x05, 0x03]);
+    if owner.service_c2h(
+        &io,
+        IsrStatus {
+            hisr: IMR_C2HCMD,
+            hisre: 0,
+        },
+        Some(&mut coex),
+    ) != Ok(Service::BtInfo {
+        pattern: Some(crate::rtlwifi::btcoex::TdmaPattern::BtOnly),
+    }) || !coex.bt_busy
+    {
+        return TestResult::Fail("8723AE packet service bt-info");
+    }
+    // Pending + ignored id: consumed without effect.
+    let io = c2h_fake(0x04, 9, c2h::C2H_EVT_FW_CLOSE, &[]);
+    if owner.service_c2h(
+        &io,
+        IsrStatus {
+            hisr: IMR_C2HCMD,
+            hisre: 0,
+        },
+        Some(&mut coex),
+    ) != Ok(Service::Ignored {
+        id: c2h::C2H_V0_BT_RSSI,
+    }) {
+        return TestResult::Fail("8723AE packet service ignored");
+    }
+    // Pending + already closed: nothing read or written.
+    let io = c2h_fake(0x2c, 7, c2h::C2H_EVT_HOST_CLOSE, &[0x05, 0x03]);
+    if owner.service_c2h(
+        &io,
+        IsrStatus {
+            hisr: IMR_C2HCMD,
+            hisre: 0,
+        },
+        Some(&mut coex),
+    ) != Ok(Service::AlreadyClosed)
+        || !io.0.lock().writes.is_empty()
+    {
+        return TestResult::Fail("8723AE packet service already-closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_packet_service_c2h
+);

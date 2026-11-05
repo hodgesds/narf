@@ -44,7 +44,7 @@ use narf_drivers_qcom_soc::irq::Q6Irqs;
 use narf_drivers_qcom_soc::mdt::SegmentSource;
 use narf_drivers_qcom_soc::pas::PasRproc;
 use narf_drivers_qcom_soc::platform::{self, GlinkEdgeDt, KickDt, RprocKind};
-use narf_drivers_qcom_soc::q6v5::Q6v5;
+use narf_drivers_qcom_soc::q6v5::{Crash, Q6v5};
 use narf_drivers_qcom_soc::rproc::{Carveout, RprocError, StopState};
 use narf_drivers_qcom_soc::scm::{Scm, ScmAlloc, SmcConduit};
 use narf_drivers_qcom_soc::smem::Smem;
@@ -64,6 +64,19 @@ use super::runtime::DpHooks;
 use super::wlfw::{DmaAllocator, FirmwareLoader, Wlfw, WlfwConfig};
 
 const EINVAL: i32 = 22;
+
+/// Post-boot SMP2P crash-monitor poll period (ms). Linux is IRQ-driven
+/// here, so no Linux literal exists; this is a NARF host-side policy
+/// (one edge-servicing pass is a few SMEM reads).
+const CRASH_POLL_MS: u32 = 100;
+
+/// Map an [`AhbError`] to the errno the runtime recovery tail reports.
+fn restart_errno(e: &AhbError) -> i32 {
+    match e {
+        AhbError::Failed(errno) => *errno,
+        _ => EIO,
+    }
+}
 const ENOENT: i32 = 2;
 const ENOMEM: i32 = 12;
 const ENODEV: i32 = 19;
@@ -296,6 +309,79 @@ impl<E: AhbEnv> LiveAhb<E> {
         let e = g.iter().find(|e| e.wlan.is_some())?;
         let (h, _) = e.wlan?;
         e.smp2p.update_bits(smem, h, u32::MAX, value).ok()
+    }
+
+    /// One post-boot crash-monitor pass: service every SMP2P edge (the
+    /// same `qcom_smp2p_intr` pass the boot waits run, so GIC- and
+    /// IPCC-parented edges behave alike), route rising Q6 bits into the
+    /// remoteproc's [`Q6v5`], latch `Crashed` on the remoteproc if the
+    /// remote reported a crash, and return that crash. The `wdog` GIC
+    /// line signals [`Q6v5`] directly on hardware; this pass picks that
+    /// up too. Returns `None` before the remoteproc exists or while it
+    /// runs clean. The caller (the crash-monitor task) owns the poll
+    /// period and the recovery decision; this pass never sleeps.
+    pub fn monitor_tick(&mut self, p: &AhbPlatform) -> Option<Crash> {
+        let Self {
+            env,
+            edges,
+            smem,
+            rproc,
+            ..
+        } = self;
+        let (Some(smem), Some(rproc)) = (smem.as_ref(), rproc.as_mut()) else {
+            return None;
+        };
+        let q6: &'static Q6v5 = match rproc {
+            Rproc::Wcss { w, .. } => w.q6,
+            Rproc::Pas { p: pas, .. } => pas.q6,
+        };
+        env.remote_tick();
+        for e in edges.lock().iter_mut() {
+            let fired = e.smp2p.handle_interrupt(smem);
+            p.q6_irqs.route_smp2p(&e.path, &e.handles, &fired, q6);
+        }
+        match rproc {
+            Rproc::Wcss { w, .. } => w.note_crash(),
+            Rproc::Pas { p: pas, .. } => pas.note_crash(),
+        }
+        q6.crash()
+    }
+
+    /// The WLFW leg of [`Self::qmi_ready`], factored out so crash
+    /// recovery can run it after a remote restart without rebuilding
+    /// the core: a fresh WLFW client over the re-registered GLINK edge,
+    /// run to FW_READY.
+    async fn wlfw_ready(&mut self, _p: &AhbPlatform) -> Result<AhbWlfw<E>, AhbError> {
+        let qrtr = self.qrtr.take().ok_or(failed(EINVAL))?;
+        let cfg = self.cfg.take().ok_or(failed(EINVAL))?;
+        let fw = self.env.firmware().ok_or(failed(ENOENT))?;
+        let dma = self.env.dma();
+        let mut w = Wlfw::new(qrtr, fw, dma, cfg).map_err(|e| {
+            self.failure = Some(TransportError::new(e.step, e.detail, e.errno));
+            failed(e.errno)
+        })?;
+        if let Err(e) = w.run_to_fw_ready().await {
+            self.failure = Some(TransportError::new(e.step, e.detail, e.errno));
+            return Err(failed(e.errno));
+        }
+        Ok(w)
+    }
+
+    /// Restart the remote after a post-boot crash (Linux
+    /// `rproc_boot_recovery`): shut the crashed remote down (from
+    /// `Crashed` the stop skips the stop-ack wait — the remote is dead),
+    /// boot it again (MDT reload + start, which re-arms the Q6 crash
+    /// state), re-register GLINK, and run WLFW to FW_READY. Host-side
+    /// state is NOT rebuilt: the CE/HIF mappings, IRQ bindings and any
+    /// iface registration survive a remote restart, and the rebuilt core
+    /// (via the shared runtime recovery tail) reuses them. The SMP2P
+    /// SSR restart ack is serviced by the monitor's edge passes.
+    pub async fn restart_transport(&mut self, p: &AhbPlatform) -> Result<AhbWlfw<E>, AhbError> {
+        self.rproc_shutdown(p).await;
+        self.rproc_boot(p).await?;
+        self.glink_start(p).await?;
+        self.qmi_init_service(p)?;
+        self.wlfw_ready(p).await
     }
 
     fn kick(&mut self, k: &KickDt) -> Result<DtKick<&'static E::Regs>, AhbError> {
@@ -635,18 +721,7 @@ impl<E: AhbEnv> AhbBringUp for LiveAhb<E> {
     }
 
     async fn qmi_ready(&mut self, p: &AhbPlatform) -> Result<(), AhbError> {
-        let qrtr = self.qrtr.take().ok_or(failed(EINVAL))?;
-        let cfg = self.cfg.take().ok_or(failed(EINVAL))?;
-        let fw = self.env.firmware().ok_or(failed(ENOENT))?;
-        let dma = self.env.dma();
-        let mut w = Wlfw::new(qrtr, fw, dma, cfg).map_err(|e| {
-            self.failure = Some(TransportError::new(e.step, e.detail, e.errno));
-            failed(e.errno)
-        })?;
-        if let Err(e) = w.run_to_fw_ready().await {
-            self.failure = Some(TransportError::new(e.step, e.detail, e.errno));
-            return Err(failed(e.errno));
-        }
+        let w = self.wlfw_ready(p).await?;
         self.core_ready(p, w).await
     }
 
@@ -866,8 +941,83 @@ fn log(args: core::fmt::Arguments<'_>) {
     let _ = writeln!(narf_console::Writer, "  ath11k_ahb: {}", args);
 }
 
+/// Post-boot SMP2P crash monitor (Linux `ath11k_core_reset` /
+/// `restart_work`, driven by the remoteproc crash report instead of a
+/// QMI event): poll the SMP2P edges, and on a latched `fatal` / `wdog`
+/// crash run the shared runtime recovery tail with the AHB transport
+/// restart. Host-side state (CE/HIF mappings, IRQ bindings, iface
+/// registration) survives: the tail rebuilds only the core, DP and WMI
+/// over the restarted remote. The loop ends (wedged) once the failure
+/// gate trips or a recovery parks the device dead; a successful
+/// recovery resets the failure count and monitoring continues.
+async fn crash_monitor_task(
+    mut live: Box<LiveAhb<NarfAhbEnv>>,
+    p: AhbPlatform,
+    shared: Arc<NarfAhbShared>,
+) {
+    loop {
+        if let Some(crash) = live.monitor_tick(&p) {
+            log(format_args!(
+                "{}: remote crashed: {:?}",
+                p.res.node.path, crash
+            ));
+            let gated = {
+                let g = shared.rt.lock().await;
+                match g.as_ref() {
+                    Some(rt) => super::runtime::recovery_gated(
+                        rt.reset.fail_cont_count,
+                        rt.reset.reset_fail_timeout,
+                        shared.now_ms(),
+                    ),
+                    // No runtime: another recovery owns it (the AHB
+                    // monitor is the only recoverer, so this is
+                    // defensive) — do not attempt a second one.
+                    None => true,
+                }
+            };
+            if gated {
+                log(format_args!("{}: wedged: recovery gated", p.res.node.path));
+                break;
+            }
+            {
+                let mut g = shared.rt.lock().await;
+                if let Some(rt) = g.as_mut() {
+                    rt.pre_reconfigure_recovery();
+                }
+            }
+            let r = shared
+                .recover_after_remote_restart(|_old: &mut AhbWlfw<NarfAhbEnv>| {
+                    alloc::boxed::Box::pin(async {
+                        live.restart_transport(&p).await.map(Some).map_err(|e| {
+                            TransportError::new(
+                                super::runtime::step::RECOVERY_FW,
+                                0,
+                                restart_errno(&e),
+                            )
+                        })
+                    })
+                })
+                .await;
+            match r {
+                Ok(_) => {
+                    shared.reconfig_complete().await;
+                }
+                Err(_) => {
+                    if shared.is_dead() {
+                        log(format_args!("{}: wedged: recovery failed", p.res.node.path));
+                        break;
+                    }
+                }
+            }
+        }
+        live.env.delay().sleep_us(CRASH_POLL_MS * 1000).await;
+    }
+}
+
 /// The WLFW task: [`bring_up`] over [`LiveAhb`], then the ready core
-/// to the runtime ([`super::runtime::start_ahb`]).
+/// to the runtime ([`super::runtime::start_ahb`]), then the post-boot
+/// crash monitor over the retained bring-up (it owns the SMP2P edges,
+/// the remoteproc and the platform the recovery re-boots with).
 pub async fn bring_up_task(blob: &'static [u8], p: AhbPlatform) {
     let mut live = Box::new(LiveAhb::new(NarfAhbEnv::default(), blob));
     let r = bring_up(&p, &mut *live).await;
@@ -881,7 +1031,8 @@ pub async fn bring_up_task(blob: &'static [u8], p: AhbPlatform) {
                 )),
                 Err(e) => e.report("ath11k_ahb mac register"),
             }
-            AHB_RUNTIME.lock().push(shared);
+            AHB_RUNTIME.lock().push(shared.clone());
+            narf_scheduler::spawn(crash_monitor_task(live, p, shared));
         }
         (r, outcome) => {
             if let Err((step, e)) = r {

@@ -4,8 +4,8 @@
 //! device (signed `N92P`/`N8BP` record, signed regulatory policy, network
 //! authority). Unprovisioned devices never reach `attach`.
 //!
-//! One owner serves idle channel changes, passive and active scans over the
-//! channels the signed record and domain grant (each a cold retune), scans
+//! One owner serves idle channel changes (live retune), passive and active
+//! scans over the channels the signed record and domain grant, scans
 //! while associated (PM1 Null, cold away visit, cold return with the same
 //! station/key owners, PM0 Null), one station at a time, and the
 //! Linux-shaped teardown: `rtl8xxxu_stop`, the chip's power-off
@@ -169,14 +169,26 @@ async fn probe_visit<C: ControlIo, B: PacketIo>(
     assoc: bool,
 ) -> Result<(), gen2_radio::Error> {
     listen(radio, cache, probe.timing.0, assoc).await?;
-    let prepared = super::probe_runtime::Prepared::new(
-        radio.local(),
-        radio.channel(),
-        probe.ssid,
-        sequence,
-        false,
-        probe.extra,
-    )
+    // An HT-capable board's probe carries its own HT caps (gen2 F10);
+    // a legacy-only board's probe carries none.
+    let prepared = match radio.ht_caps() {
+        Some(caps) => super::probe_runtime::Prepared::new_with_ht(
+            radio.local(),
+            radio.channel(),
+            probe.ssid,
+            sequence,
+            &caps,
+            probe.extra,
+        ),
+        None => super::probe_runtime::Prepared::new(
+            radio.local(),
+            radio.channel(),
+            probe.ssid,
+            sequence,
+            false,
+            probe.extra,
+        ),
+    }
     .map_err(|_| gen2_radio::Error::Profile)?;
     radio.submit_probe(&prepared)?;
     let deadline = now_ms().saturating_add(PROBE_TX_MS);
@@ -227,7 +239,7 @@ impl<C: ControlIo, B: PacketIo> State<C, B> {
         sequence
     }
     /// Idle scan: every channel's grant precedes the first transition; each
-    /// visit is a cold retune (skipped for the current receiving channel),
+    /// visit is a live retune (skipped for the current receiving channel),
     /// then passive dwell or one probe visit; the home channel is restored.
     async fn idle_scan(
         &mut self,
@@ -703,7 +715,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
     }
     /// Passive or active scan over the requested (or every granted)
     /// channel. All grants, the probe frame and its timing are admitted
-    /// before the first hardware transition; idle scans cold-retune per
+    /// before the first hardware transition; idle scans live-retune per
     /// channel and restore home, associated scans visit as `associated_scan`.
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let (mut channels, dwell) = validate_scan(&request)?;
@@ -743,14 +755,31 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
         let ssid = request.ssids.first().map_or(&[][..], Vec::as_slice);
         let probe = if request.active {
             // The longest frame any visit emits bounds the source timing.
-            let prepared = super::probe_runtime::Prepared::new(
-                self.mac,
-                1,
-                ssid,
-                0,
-                false,
-                &request.extra_ies,
-            )
+            // The preflight mirrors the visit probes' HT caps (gen2 F10)
+            // so the timing bound covers the 28-byte caps element.
+            let caps = match &state.slot {
+                Slot::Idle(radio) => radio.ht_caps(),
+                Slot::Station(station) => station.radio().ht_caps(),
+                Slot::Failed => return Err(WirelessError::HardwareError),
+            };
+            let prepared = match caps {
+                Some(caps) => super::probe_runtime::Prepared::new_with_ht(
+                    self.mac,
+                    1,
+                    ssid,
+                    0,
+                    &caps,
+                    &request.extra_ies,
+                ),
+                None => super::probe_runtime::Prepared::new(
+                    self.mac,
+                    1,
+                    ssid,
+                    0,
+                    false,
+                    &request.extra_ies,
+                ),
+            }
             .map_err(|_| WirelessError::InvalidArgs)?;
             let timing = prepared
                 .timing(dwell, request.duration_mandatory)
@@ -844,9 +873,10 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
         preflight
             .append_sme_ies(&request.ie)
             .map_err(|_| WirelessError::InvalidArgs)?;
-        // A cold transition starts a new receive stream: CONNECT then needs a
-        // fresh copy of this BSS from it (a hidden SSID found by a directed
-        // response is probed again), never an old cache entry's age.
+        // A retune starts a new observation generation (cold or live):
+        // CONNECT then needs a fresh copy of this BSS from it (a hidden
+        // SSID found by a directed response is probed again), never an
+        // old cache entry's age.
         let fresh = async {
             let sequence = state.next_probe_sequence();
             let State { slot, cache, .. } = &mut *state;
@@ -873,14 +903,27 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
                 return Ok(Some(entry));
             }
             if candidate.probe_response() {
-                let prepared = super::probe_runtime::Prepared::new(
-                    radio.local(),
-                    radio.channel(),
-                    &request.ssid,
-                    0,
-                    false,
-                    &[],
-                )
+                // Timing only: the transmitted probe is built by
+                // `probe_visit` with the board's HT caps (gen2 F10);
+                // mirror them here so the bound covers the caps element.
+                let prepared = match radio.ht_caps() {
+                    Some(caps) => super::probe_runtime::Prepared::new_with_ht(
+                        radio.local(),
+                        radio.channel(),
+                        &request.ssid,
+                        0,
+                        &caps,
+                        &[],
+                    ),
+                    None => super::probe_runtime::Prepared::new(
+                        radio.local(),
+                        radio.channel(),
+                        &request.ssid,
+                        0,
+                        false,
+                        &[],
+                    ),
+                }
                 .map_err(|_| gen2_radio::Error::Profile)?;
                 let timing = prepared
                     .timing(0, false)
@@ -1017,7 +1060,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> WirelessNetIface for Device<
         }
     }
     /// Qualified idle channel change (`rtl8xxxu_config` CHANGE_CHANNEL as a
-    /// cold retune under the channel's own grant). No TX power override; a
+    /// live retune under the channel's own grant). No TX power override; a
     /// station keeps its channel.
     async fn set_config(&self, cfg: WirelessConfig) -> Result<(), WirelessError> {
         if cfg.tx_power_dbm.is_some() || !(1..=13).contains(&cfg.channel) {

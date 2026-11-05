@@ -140,6 +140,9 @@ pub enum PhyError {
     BadOcpAddress(u32),
     /// The device never retired an OCP transaction.
     OcpTimeout,
+    /// The device never raised the PHYAR completion flag for a
+    /// Clause-22 MDIO read.
+    PhyarTimeout,
     /// Firmware container was too short, misaligned, or failed its
     /// checksum.
     BadFirmwareFormat,
@@ -326,6 +329,108 @@ impl<'a> PhyAccess<'a> {
             reg
         };
         self.phy_ocp_read(self.ocp_base as u32 + r as u32 * 2)
+    }
+
+    // ── PHYAR Clause-22 MDIO window ──────────────────────────────
+    //
+    // The OCP window above is NOT the only route to the PHY. The
+    // controller also exposes a Clause-22 MDIO window at BAR2 offset
+    // 0x60 (`PHYAR`, Linux `r8169_main.c`): write
+    // `FLAG | (reg << 16) | data` to write, write `reg << 16` and
+    // poll for the flag to come back to read. Linux's `phy_*` ops
+    // all travel this window; the OCP window is an alternate route
+    // to the same register file that only expresses registers at or
+    // above 0x10 in a non-zero page. The 8168 tables need this
+    // window for page-5 registers 0x05/0x06 (the `d_param` helpers)
+    // and for the Clause-45 MMD write in the 8168e/8111e table.
+    //
+    // Unlike the OCP `mdio_write` tracker, PHYAR page state lives
+    // in the PHY's own page register: writing 0x1F here really
+    // selects the page for subsequent reads/writes, so callers
+    // that select a page must restore it, exactly as Linux's
+    // `phy_select_page` / `phy_restore_page` pair does.
+
+    /// `PHYAR` — Clause-22 MDIO window.
+    pub const PHYAR_REG: u64 = 0x60;
+    /// `PHYAR_FLAG` — set on a write; the device sets it when a
+    /// read's data is ready.
+    pub const PHYAR_FLAG: u32 = 0x8000_0000;
+    /// Register field mask within the PHYAR command word.
+    pub const PHYAR_REG_MASK: u16 = 0x1F;
+    /// Register field shift within the PHYAR command word.
+    pub const PHYAR_REG_SHIFT: u32 = 16;
+    /// Budget for the PHYAR read-completion poll. Linux waits
+    /// 25 × 20 µs; the budget here is rounded up for spin
+    /// granularity, as with [`OCP_TIMEOUT_MS`].
+    pub const PHYAR_TIMEOUT_MS: u64 = 2;
+    /// Delay required after a PHYAR read completes, before the next
+    /// command is sent (Linux `r8169_mdio_read_reg`).
+    pub const PHYAR_POST_READ_DELAY_US: u64 = 20;
+
+    /// Pure packing for a PHYAR write command. Kept separate from
+    /// [`Self::phyar_write`] so tests can pin the wire format
+    /// without MMIO.
+    pub const fn phyar_write_cmd(reg: u16, val: u16) -> u32 {
+        Self::PHYAR_FLAG
+            | (((reg & Self::PHYAR_REG_MASK) as u32) << Self::PHYAR_REG_SHIFT)
+            | val as u32
+    }
+
+    /// Pure packing for a PHYAR read command.
+    pub const fn phyar_read_cmd(reg: u16) -> u32 {
+        ((reg & Self::PHYAR_REG_MASK) as u32) << Self::PHYAR_REG_SHIFT
+    }
+
+    /// `r8169_mdio_write_reg` — one Clause-22 write. Fire-and-
+    /// forget, as in Linux: no completion poll on the write path.
+    pub fn phyar_write(&self, reg: u16, val: u16) -> Result<(), PhyError> {
+        // SAFETY: `self.mmio` is the controller's mapped BAR2 and
+        // `PHYAR_REG` is inside it — the caller checked the BAR
+        // length at bring-up.
+        unsafe {
+            self.mmio
+                .write32(Self::PHYAR_REG, Self::phyar_write_cmd(reg, val))
+        };
+        Ok(())
+    }
+
+    /// `r8169_mdio_read_reg` — one Clause-22 read: command, poll
+    /// for the completion flag, then the mandated post-read delay
+    /// before the next command.
+    pub fn phyar_read(&self, reg: u16) -> Result<u16, PhyError> {
+        // SAFETY: as above.
+        unsafe {
+            self.mmio
+                .write32(Self::PHYAR_REG, Self::phyar_read_cmd(reg))
+        };
+        let ready = narf_scheduler::responsive_spin_until(
+            || {
+                // SAFETY: as above.
+                let v = unsafe { self.mmio.read32(Self::PHYAR_REG) };
+                v & Self::PHYAR_FLAG != 0
+            },
+            narf_time::Deadline::after_ms(Self::PHYAR_TIMEOUT_MS),
+        );
+        if !ready {
+            return Err(PhyError::PhyarTimeout);
+        }
+        // SAFETY: as above.
+        let data = (unsafe { self.mmio.read32(Self::PHYAR_REG) } & 0xFFFF) as u16;
+        // The 20 µs post-read delay, expressed as a spin to the
+        // deadline: the condition never becomes true, so this
+        // simply waits out the interval.
+        let _ = narf_scheduler::responsive_spin_until(
+            || false,
+            narf_time::Deadline::after_us(Self::PHYAR_POST_READ_DELAY_US),
+        );
+        Ok(data)
+    }
+
+    /// Read-modify-write one Clause-22 register:
+    /// `(current & !mask) | set`, matching Linux `phy_modify`.
+    pub fn phyar_modify(&self, reg: u16, mask: u16, set: u16) -> Result<(), PhyError> {
+        let cur = self.phyar_read(reg)?;
+        self.phyar_write(reg, (cur & !mask) | set)
     }
 
     /// `mac_mcu_write`. Note the address arithmetic differs from the

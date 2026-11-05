@@ -805,7 +805,9 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
             // `ath11k_wow_wakeup` completion.
             HtcRxKind::WakeupFromSuspend => {}
             HtcRxKind::Deliver { eid, range } => {
-                if self.wmi_ep.map(|e| e.eid) == Some(eid) {
+                if self.wmi_ep.map(|e| e.eid) == Some(eid)
+                    || self.wmi_pdev_eps.iter().any(|e| e.eid == eid)
+                {
                     self.wmi_rx(&buf[range]);
                 } else if self.htt_ep.map(|e| e.eid) == Some(eid) {
                     self.push_htt(buf[range].to_vec());
@@ -1125,7 +1127,24 @@ impl<H: Hif, Q: QmiFw> Ath11kCore<H, Q> {
     /// endpoint. The runtime's [`super::runtime`] ports use this to wait
     /// without holding the core.
     pub fn wmi_cmd_try_send(&mut self, cmd: &WmiCmd) -> Result<(), i32> {
-        let Some(ep) = self.wmi_ep else {
+        self.wmi_cmd_try_send_on(0, cmd)
+    }
+
+    /// One `ath11k_wmi_cmd_send_nowait` attempt on
+    /// `wmi_ab.wmi[pdev_idx]` (pdev order; index 0 is the soc / pdev-0
+    /// handle, so this is [`Self::wmi_cmd_try_send`] for index 0):
+    /// `-ENODEV` when that pdev's WMI endpoint is not connected. A
+    /// port's pdev selects its endpoint; the command payload itself
+    /// carries no pdev field, and parsing per-command payload layouts
+    /// to recover one would be fragile, so routing by port is the
+    /// contract (see [`super::runtime::Port`]).
+    pub fn wmi_cmd_try_send_on(&mut self, pdev_idx: u32, cmd: &WmiCmd) -> Result<(), i32> {
+        let Some(ep) = self
+            .wmi_pdev_eps
+            .get(pdev_idx as usize)
+            .copied()
+            .or(self.wmi_ep.filter(|_| pdev_idx == 0))
+        else {
             return Err(ENODEV);
         };
         let payload = cmd.frame();

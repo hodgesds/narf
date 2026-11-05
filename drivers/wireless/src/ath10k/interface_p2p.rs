@@ -197,9 +197,12 @@ impl Native {
     /// wpa_supplicant `p2p_find` scans the social channels from the P2P
     /// device with the `DIRECT-` SSID and its P2P/WSC IEs). The request is
     /// validated as the netdev's; the WMI scan runs on the P2P_DEVICE vdev
-    /// (`Radio::p2p_device_scan`). A ROC in flight, a prepared/associated
-    /// station peer or an AP on the managed vdev is `Busy` before any
-    /// publication; an ambiguous native failure closes the netdev as its
+    /// (`Radio::p2p_device_scan`). A ROC in flight, a
+    /// prepared-but-unassociated station peer or a non-GO AP on the
+    /// managed vdev is `Busy` before any publication; an associated
+    /// managed station no longer refuses (Linux runs the requesting
+    /// vif's scan on its own vdev, firmware owning dwell and the home
+    /// return). An ambiguous native failure closes the netdev as its
     /// own scans do.
     async fn p2p_device_scan(
         &self,
@@ -214,8 +217,7 @@ impl Native {
             return Err(WirelessError::HardwareError);
         }
         if radio.roc_active()
-            || radio.prepared_peer().is_some()
-            || radio.station_link().is_some()
+            || radio.prepared_peer().is_some() && radio.station_link().is_none()
             || radio.ap_exists() && !radio.ap_is_go()
         {
             return Err(WirelessError::Busy);

@@ -1173,8 +1173,8 @@ fn up_down_caps_for_rev(
     let reg = rt.core.reg_info.clone();
     let shared = Shared::new(rt, test_rng);
     let mac = Mac::new(
-        Port(shared.clone(), 0),
-        Port(shared.clone(), 0),
+        Port(shared.clone(), 0, 0),
+        Port(shared.clone(), 0, 0),
         caps.clone(),
         MacConfig::wcn6855(),
         reg.as_deref(),

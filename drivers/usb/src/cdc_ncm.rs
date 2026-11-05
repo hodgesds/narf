@@ -1459,6 +1459,9 @@ pub mod tests {
             pump_running: false,
             detached: false,
             controller: 0,
+            hub_port: None,
+            suspended: false,
+            wakeup_armed: false,
         };
         {
             let mut g = CDC_NCM_DEVICES.lock();
@@ -1520,6 +1523,9 @@ pub mod tests {
             pump_running: true,
             detached: false,
             controller: 0,
+            hub_port: None,
+            suspended: false,
+            wakeup_armed: false,
         };
         {
             let mut g = CDC_NCM_DEVICES.lock();
@@ -1660,6 +1666,9 @@ pub mod tests {
                 pump_running: true,
                 detached: false,
                 controller: 0,
+                hub_port: None,
+                suspended: false,
+                wakeup_armed: false,
             });
         }
         register_initcalls();
@@ -1705,6 +1714,9 @@ pub mod tests {
             pump_running: true,
             detached: false,
             controller: 0,
+            hub_port: None,
+            suspended: false,
+            wakeup_armed: false,
         };
         {
             let mut g = CDC_NCM_DEVICES.lock();
@@ -1972,6 +1984,50 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_ntb32_rejections);
+
+    // Suspend fixture test (#1256): the parked-port selection
+    // the hook and wake-watch manipulate. Transfer-level
+    // park -> gate -> wake -> traffic is CI/silicon-only (no
+    // fake xhci exists); the pump decision itself is pinned
+    // once in the r8152 module via the shared helper.
+    fn smoke_ncm_suspended_hub_ports() -> TestResult {
+        let mk = |slot_id: u8, hub_port: Option<(u8, u8)>, suspended: bool, detached: bool| {
+            CdcNcmDevice {
+                slot_id,
+                comm_iface: 0,
+                data_iface: 1,
+                bulk_in_dci: 3,
+                bulk_out_dci: 4,
+                tx_sequence: 0,
+                mac: [0x02, 0, 0, 0, 0, slot_id],
+                ntb_in_max_size: 4096,
+                ntb_out_max_size: 16384,
+                crc_enabled: false,
+                ntb32: false,
+                iface_name: alloc::format!("usb-ncm-susp{}", slot_id),
+                pump_running: true,
+                detached,
+                controller: 0,
+                hub_port,
+                suspended,
+                wakeup_armed: suspended,
+            }
+        };
+        {
+            let mut g = CDC_NCM_DEVICES.lock();
+            g.push(mk(7, Some((2, 3)), true, false));
+            g.push(mk(8, Some((2, 4)), false, false));
+            g.push(mk(9, None, true, false));
+            g.push(mk(10, Some((2, 5)), true, true));
+        }
+        let ports = suspended_hub_ports();
+        CDC_NCM_DEVICES.lock().clear();
+        if ports != alloc::vec![(2, 3)] {
+            return TestResult::Fail("suspended_hub_ports selected the wrong ports");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_suspended_hub_ports);
 }
 
 // ── Class enumeration + bind ───────────────────────────────────────
@@ -2030,6 +2086,16 @@ pub struct CdcNcmDevice {
     /// Index of the xHCI controller the device is on
     /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
     pub controller: u8,
+    /// Hub context recorded at bind: `Some((parent hub slot id,
+    /// downstream port))` when the device sits behind a hub,
+    /// `None` on a root port (see r8152's field docs, #1256).
+    pub hub_port: Option<(u8, u8)>,
+    /// Park flag: set by the class suspend hook, cleared by
+    /// resume. The pump task stays alive while parked.
+    pub suspended: bool,
+    /// Whether DEVICE_REMOTE_WAKEUP arming succeeded at the
+    /// last park (see r8152's field docs, #1256).
+    pub wakeup_armed: bool,
 }
 
 /// System-wide registry of bound CDC-NCM devices (records carry their
@@ -2304,6 +2370,7 @@ pub async fn try_bind_ncm_already_addressed(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
     cfg: &[u8],
+    hub_port: Option<(u8, u8)>,
 ) -> Result<usize, NcmError> {
     let comm_iface = find_ncm_comm_interface(cfg).ok_or(NcmError::NotNcm)?;
     let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
@@ -2420,6 +2487,9 @@ pub async fn try_bind_ncm_already_addressed(
             pump_running: false,
             detached: false,
             controller: xhci_dev.id(),
+            hub_port,
+            suspended: false,
+            wakeup_armed: false,
         });
         idx
     };
@@ -2446,7 +2516,7 @@ pub async fn try_bind_ncm_already_addressed(
 /// transfer errors (a removed device surfaces as persistent
 /// errors) or when the record vanishes.
 async fn ncm_rx_pump(idx: usize) {
-    let (slot_id, bulk_in_dci, name, buf_len, ntb32) = {
+    let (slot_id, bulk_in_dci, name, buf_len, ntb32, hub_port, controller) = {
         let g = CDC_NCM_DEVICES.lock();
         let Some(dev) = g.get(idx) else {
             return;
@@ -2457,6 +2527,8 @@ async fn ncm_rx_pump(idx: usize) {
             dev.iface_name.clone(),
             (dev.ntb_out_max_size as usize).clamp(4096, 64 * 1024),
             dev.ntb32,
+            dev.hub_port,
+            dev.controller,
         )
     };
     let Some(c) = controller_of(idx) else {
@@ -2480,13 +2552,39 @@ async fn ncm_rx_pump(idx: usize) {
                 break;
             }
         }
+        // Park decision (#1256): same shape as r8152 — a
+        // parked pump yields without transfers, error counts,
+        // or delivery; detach (above) dominates.
+        let action = {
+            let g = CDC_NCM_DEVICES.lock();
+            g.get(idx)
+                .map(|d| crate::attach::nic_pump_action(d.detached, d.suspended, d.pump_running))
+                .unwrap_or(crate::attach::NicPumpAction::Exit)
+        };
+        match action {
+            crate::attach::NicPumpAction::Exit => break,
+            crate::attach::NicPumpAction::Park => {
+                narf_scheduler::yield_now().await;
+                continue;
+            }
+            crate::attach::NicPumpAction::Transfer => {}
+        }
         match c.bulk_in(slot_id, bulk_in_dci, &mut buf).await {
             Ok(n) if n > 0 => {
                 errors = 0;
-                let _ = for_each_frame_ntb(&buf[..n], ntb32, &mut |frame| {
+                let delivered = for_each_frame_ntb(&buf[..n], ntb32, &mut |frame| {
                     let mut owned = frame.to_vec();
                     narf_net::iface::on_rx_frame_from(&name, &mut owned);
-                });
+                })
+                .map(|(delivered, _)| delivered)
+                .unwrap_or(0);
+                // Real traffic keeps the port's idle clock
+                // fresh (#1256); empty polls never mark.
+                if delivered > 0 {
+                    if let Some((hub_slot, port)) = hub_port {
+                        crate::attach::mark_port_activity(controller, hub_slot, port);
+                    }
+                }
             }
             Ok(_) => narf_scheduler::yield_now().await,
             Err(_) => {
@@ -2609,6 +2707,34 @@ pub fn take_tx_state(idx: usize) -> Option<(u8, u8, u16, bool, u32, bool)> {
 /// CRC appended when CRC mode was negotiated) and ships it on
 /// the bulk-OUT endpoint.
 pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
+    // TX-demand resume (#1256): same shape as r8152 — resume
+    // a parked port before taking TX state, fail fast on a
+    // failed resume, and open a fresh idle window so a TX
+    // burst does not flap the port straight back into suspend.
+    // take_tx_state runs after resume, so a failed resume
+    // never consumes a TX sequence number.
+    let resume_needed = {
+        let g = CDC_NCM_DEVICES.lock();
+        g.get(idx).and_then(|d| {
+            if d.detached {
+                None
+            } else {
+                d.hub_port
+                    .filter(|_| d.suspended)
+                    .map(|hp| (hp, d.controller))
+            }
+        })
+    };
+    if let Some(((hub_slot, port), controller)) = resume_needed {
+        let Some(c) = controller_of(idx) else {
+            return Err(NcmError::Truncated);
+        };
+        let resumed = narf_scheduler::block_on(resume_ncm_port(&c, hub_slot, port));
+        if !resumed {
+            return Err(NcmError::Truncated);
+        }
+        crate::attach::mark_port_activity(controller, hub_slot, port);
+    }
     let (slot_id, bulk_out_dci, sequence, crc, in_max, ntb32) =
         take_tx_state(idx).ok_or(NcmError::NotNcm)?;
     let with_crc;
@@ -2846,8 +2972,9 @@ pub async fn try_bind_cdc_ncm_already_addressed(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
     cfg: &[u8],
+    hub_port: Option<(u8, u8)>,
 ) -> Result<usize, NcmError> {
-    try_bind_ncm_already_addressed(xhci_dev, slot_id, cfg).await
+    try_bind_ncm_already_addressed(xhci_dev, slot_id, cfg, hub_port).await
 }
 
 // ── CdcNcmIface — logical per-device interface handle ────────────
@@ -2906,10 +3033,122 @@ pub static CDC_NCM_MATCH: [crate::class_registry::UsbClassMatch; 1] = [
 
 pub fn probe(
     _device: alloc::sync::Arc<crate::device::USBDevice>,
+    _hub_port: Option<(u8, u8)>,
 ) -> Result<(), crate::class_registry::UsbProbeError> {
     use core::fmt::Write;
     let _ = writeln!(narf_console::Writer, "  usb: CDC-NCM device bound!");
     Ok(())
+}
+
+// ── Suspend / resume (#1256) ─────────────────────────────────────
+//
+// Shape mirrors r8152 minus the WoL register programming: NCM
+// has no chip wake filter to program, so the hook's only arming
+// step is SET_FEATURE(DEVICE_REMOTE_WAKEUP). A stall there
+// clears `wakeup_armed` and the park still proceeds (TX-demand
+// resume works; the device just cannot signal). There is no
+// link state to restore on resume — NCM carries none — so
+// resume is port re-open + flag clear only. The wake-watch
+// step resumes only on an observed remote-wakeup edge.
+
+/// Class suspend hook for one hub port. Self-filters on the
+/// record's hub context; idempotent. Never holds the record
+/// lock across an await.
+async fn suspend_ncm_port(hub_slot: u8, port: u8) -> crate::class_registry::SuspendOutcome {
+    use crate::class_registry::SuspendOutcome;
+    let target = {
+        let g = CDC_NCM_DEVICES.lock();
+        g.iter().find_map(|d| {
+            if !d.detached && d.hub_port == Some((hub_slot, port)) {
+                if d.suspended {
+                    Some(None)
+                } else {
+                    Some(Some((d.slot_id, d.controller)))
+                }
+            } else {
+                None
+            }
+        })
+    };
+    let Some(target) = target else {
+        return SuspendOutcome::NotMine;
+    };
+    let Some((slot_id, controller)) = target else {
+        return SuspendOutcome::Parked;
+    };
+    let Some(c) = crate::xhci::controller_by_id(controller) else {
+        return SuspendOutcome::ParkFailed;
+    };
+    let setup = crate::control::set_feature_device_remote_wakeup();
+    let armed = c
+        .control_out(
+            slot_id,
+            setup.bm_request_type,
+            setup.b_request,
+            setup.w_value,
+            setup.w_index,
+            &[],
+        )
+        .await
+        .is_ok();
+    let mut g = CDC_NCM_DEVICES.lock();
+    match g
+        .iter_mut()
+        .find(|d| !d.detached && d.hub_port == Some((hub_slot, port)) && d.slot_id == slot_id)
+    {
+        Some(rec) => {
+            rec.suspended = true;
+            rec.wakeup_armed = armed;
+            SuspendOutcome::Parked
+        }
+        None => SuspendOutcome::NotMine,
+    }
+}
+
+/// Resume one parked NCM port: re-open the hub port, then clear
+/// the park flag. Returns `true` iff the port is awake and the
+/// flag cleared. Never holds the record lock across the await.
+pub async fn resume_ncm_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port: u8) -> bool {
+    let idx = {
+        let g = CDC_NCM_DEVICES.lock();
+        g.iter()
+            .position(|d| !d.detached && d.suspended && d.hub_port == Some((hub_slot, port)))
+    };
+    let Some(idx) = idx else {
+        return false;
+    };
+    crate::attach::resume_port(xhci_dev, hub_slot, port).await;
+    if crate::attach::hub_port_is_suspended(xhci_dev.id(), hub_slot, port) {
+        return false;
+    }
+    let mut g = CDC_NCM_DEVICES.lock();
+    match g.get_mut(idx) {
+        Some(rec) if !rec.detached && rec.suspended => {
+            rec.suspended = false;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Hub ports holding a parked (suspended, non-detached) NCM
+/// record: the wake-watch step's candidate list.
+pub fn suspended_hub_ports() -> Vec<(u8, u8)> {
+    let g = CDC_NCM_DEVICES.lock();
+    g.iter()
+        .filter(|d| !d.detached && d.suspended)
+        .filter_map(|d| d.hub_port)
+        .collect()
+}
+
+/// Wake-watch step: resume a parked NCM port only on an
+/// observed remote-wakeup edge.
+pub async fn wake_suspended_ports(xhci_dev: &crate::xhci::Xhci) {
+    for (hub_slot, port) in suspended_hub_ports() {
+        if crate::attach::hub_port_suspend_change(xhci_dev, hub_slot, port).await == Some(true) {
+            let _ = resume_ncm_port(xhci_dev, hub_slot, port).await;
+        }
+    }
 }
 
 pub fn register_initcalls() {
@@ -2925,4 +3164,7 @@ pub fn register_initcalls() {
         probe,
         detach_ncm_slot,
     );
+    let _ = crate::class_registry::register_suspend_hook("cdc-ncm", |slot, port| {
+        alloc::boxed::Box::pin(suspend_ncm_port(slot, port))
+    });
 }

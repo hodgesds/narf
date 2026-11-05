@@ -12,14 +12,17 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    eeprom_decode, eerd_start, name_for, AdvTxDesc, RxDesc, ADVTXD_DCMD_DEXT, ADVTXD_DCMD_EOP,
-    ADVTXD_DCMD_IFCS, ADVTXD_DCMD_RS, ADVTXD_DTYP_DATA, EERD_START, IXGBE_DEV_82599EB,
+    eeprom_decode, eerd_start, name_for, parse_tso_headers, tx_plan, AdvTxCtxtDesc, AdvTxDesc,
+    RxDesc, ADVTXD_DCMD_DEXT, ADVTXD_DCMD_EOP, ADVTXD_DCMD_IFCS, ADVTXD_DCMD_RS, ADVTXD_DCMD_TSE,
+    ADVTXD_DCMD_VLE, ADVTXD_DTYP_CTXT, ADVTXD_DTYP_DATA, ADVTXD_PAYLEN_SHIFT, ADVTXD_POPTS_IXSM,
+    ADVTXD_POPTS_TXSM, ADVTXD_TUCMD_IPV4, ADVTXD_TUCMD_L4T_TCP, EERD_START, IXGBE_DEV_82599EB,
     IXGBE_DEV_X540, IXGBE_DEV_X550, IXGBE_DEV_X550EM_X, IXGBE_VENDOR,
 };
 
 /// In-memory register bank for fixtures: 64 KiB of BAR0 window,
-/// covering every register this stream programs (highest is
-/// MRQC at 0x0EC80). Lives here (not in queues.rs) because this
+/// covering every register this stream programs (highest native
+/// address is MRQC at 0x0EC80; the canonical 0x05xxx RSS block
+/// is covered too). Lives here (not in queues.rs) because this
 /// test module is x86_64-only while the driver builds for both
 /// arches — a test-only helper in the driver module would trip
 /// dead-code on aarch64.
@@ -548,6 +551,75 @@ fn smoke_ixgbe_rss_register_conversation() -> TestResult {
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_rss_register_conversation);
 
+/// #1397 fixture: the RSS/VMDq register-map authority pins the
+/// datasheet dual-map, and the RSS programming path writes the
+/// canonical (Linux/compat) addresses — not a second literal.
+/// The datasheet (rev. 2.6, 322429-007) dual-maps all three
+/// registers: MRQC §8.2.3.7.12 (0x0EC80 / 0x05818), RSSRK
+/// §8.2.3.7.14 (0x0EB80 / 0x05C80), RETA §8.2.3.7.15 (0x0EB00 /
+/// 0x05C00), each "also mapped ... to maintain compatibility
+/// with the 82598". The VMDq path (PR #1398) programs the 0x05
+/// block; if this path ever redefined its own addresses, the
+/// two would silently program different aliases of the same
+/// registers again — this test fails first.
+fn smoke_ixgbe_rss_reg_alias_map() -> TestResult {
+    use super::queues::RegBank;
+    use super::regs::{
+        MRQE_VMDQ_32_RSS, MRQE_VMDQ_64_NO_RSS, MRQE_VMDQ_64_RSS, REG_MRQC, REG_MRQC_NATIVE,
+        REG_RETA_BASE, REG_RETA_BASE_NATIVE, REG_RSSRK_BASE, REG_RSSRK_BASE_NATIVE, REG_STRIDE,
+        RETA_REGS, RSSRK_REGS,
+    };
+    use super::rss::IxgbeRss;
+    // 1. Shared authority == Linux's shipping map (ixgbe_type.h
+    // :376/:417/:419) — the addresses the VMDq path programs.
+    if REG_MRQC != 0x05818 || REG_RETA_BASE != 0x05C00 || REG_RSSRK_BASE != 0x05C80 {
+        return TestResult::Fail("regs authority != Linux MRQC/RETA/RSSRK map");
+    }
+    // 2. Datasheet alias pairs (§8.2.3.7.12/.14/.15).
+    if REG_MRQC_NATIVE != 0x0EC80
+        || REG_RETA_BASE_NATIVE != 0x0EB00
+        || REG_RSSRK_BASE_NATIVE != 0x0EB80
+    {
+        return TestResult::Fail("regs native aliases != datasheet 0x0E block");
+    }
+    // 3. Alias ranges end where the datasheet says: RETA
+    // 0x05C00-0x05C7C, RSSRK 0x05C80-0x05CA4.
+    if REG_STRIDE != 4
+        || REG_RETA_BASE + REG_STRIDE * (RETA_REGS as u64 - 1) != 0x05C7C
+        || REG_RSSRK_BASE + REG_STRIDE * (RSSRK_REGS as u64 - 1) != 0x05CA4
+    {
+        return TestResult::Fail("regs alias ranges != datasheet ends");
+    }
+    // 4. MRQE virtualization modes (§8.2.3.7.12; Linux :2332-:2334).
+    if MRQE_VMDQ_64_NO_RSS != 0x8 || MRQE_VMDQ_32_RSS != 0xA || MRQE_VMDQ_64_RSS != 0xB {
+        return TestResult::Fail("regs MRQE VMDq modes wrong");
+    }
+    // 5. The programming path writes the CANONICAL addresses:
+    // read the fake bank back at literals, not via the REG_*
+    // imports, so a reintroduced local literal fails here. The
+    // native aliases must stay unwritten by apply().
+    let rss = match IxgbeRss::standard(4) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("IxgbeRss::standard(4) failed"),
+    };
+    let mut bank = FakeBank::new();
+    rss.apply(&mut bank);
+    if bank.read32(0x05818) != 0x00F3_0001 {
+        return TestResult::Fail("apply() did not program canonical MRQC");
+    }
+    if bank.read32(0x05C80) != 0xda56_5a6d {
+        return TestResult::Fail("apply() did not program canonical RSSRK[0]");
+    }
+    if bank.read32(0x05C00) != 0x0302_0100 {
+        return TestResult::Fail("apply() did not program canonical RETA[0]");
+    }
+    if bank.read32(0x0EC80) != 0 || bank.read32(0x0EB80) != 0 || bank.read32(0x0EB00) != 0 {
+        return TestResult::Fail("apply() wrote a native alias address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_rss_reg_alias_map);
+
 // ── VLAN fixtures (commit 3) ─────────────────────────────────────
 
 fn smoke_ixgbe_vlan_filter() -> TestResult {
@@ -666,6 +738,92 @@ fn smoke_ixgbe_wol() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol);
+
+// ── WoL board-cap gate (#1266) ────────────────────────────────────
+
+fn smoke_ixgbe_wol_board_cap() -> TestResult {
+    use super::queues::RegBank;
+    use super::wol::{
+        is_x540_or_newer, wol_allowed, WolBoardCap, WolConfig, REG_WUC, REG_WUFC, WOL_CAP_MASK,
+        WOL_CAP_PORT0, WOL_CAP_PORT0_1, WUC_PME_EN,
+    };
+    // Cap constants are Linux's (ixgbe_type.h:2179-2181).
+    if WOL_CAP_MASK != 0xC || WOL_CAP_PORT0_1 != 0x4 || WOL_CAP_PORT0 != 0x8 {
+        return TestResult::Fail("WoL cap constants drifted from Linux");
+    }
+    // Rule table: (cap_bits, func) -> allows. Linux-literal
+    // (ixgbe_main.c ixgbe_wol_supported, X540+ arm): masked 0x4
+    // permits any func, masked 0x8 permits func 0 only, anything
+    // else — including 0xC, both bits set — permits nothing.
+    let cases: [(u16, u8, bool); 8] = [
+        (0x0, 0, false),
+        (0x0, 1, false),
+        (0x4, 0, true),
+        (0x4, 1, true),
+        (0x8, 0, true),
+        (0x8, 1, false),
+        (0xC, 0, false),
+        (0x14, 1, true), // masks to 0x4
+    ];
+    for (bits, func, want) in cases {
+        let cap = WolBoardCap {
+            cap_bits: bits,
+            func,
+        };
+        if cap.allows() != want {
+            return TestResult::Fail("WolBoardCap rule table mismatch");
+        }
+    }
+    if WolBoardCap::default().allows() {
+        return TestResult::Fail("default board record must permit nothing");
+    }
+    // Generation split: X540/X550/X550EM_x are X540-or-newer;
+    // 82599EB is not, and unknown parts are neither.
+    if !is_x540_or_newer(super::IXGBE_DEV_X540)
+        || !is_x540_or_newer(super::IXGBE_DEV_X550)
+        || !is_x540_or_newer(super::IXGBE_DEV_X550EM_X)
+        || is_x540_or_newer(super::IXGBE_DEV_82599EB)
+        || is_x540_or_newer(0xFFFF)
+    {
+        return TestResult::Fail("is_x540_or_newer split wrong");
+    }
+    // Gate predicate: 82599EB stands on its datasheet rule whatever
+    // the record says; X540+ needs a permitting record; unknown
+    // parts never pass, even with a permitting record.
+    let none = WolBoardCap::default();
+    let both = WolBoardCap {
+        cap_bits: 0x4,
+        func: 1,
+    };
+    let port0_f1 = WolBoardCap {
+        cap_bits: 0x8,
+        func: 1,
+    };
+    let port0_f0 = WolBoardCap {
+        cap_bits: 0x8,
+        func: 0,
+    };
+    if !wol_allowed(super::IXGBE_DEV_82599EB, none)
+        || !wol_allowed(super::IXGBE_DEV_82599EB, both)
+        || wol_allowed(super::IXGBE_DEV_X540, none)
+        || !wol_allowed(super::IXGBE_DEV_X540, both)
+        || wol_allowed(super::IXGBE_DEV_X550, port0_f1)
+        || !wol_allowed(super::IXGBE_DEV_X550EM_X, port0_f0)
+        || wol_allowed(0xFFFF, both)
+    {
+        return TestResult::Fail("wol_allowed gate wrong");
+    }
+    // Shared wake block: the X540 arm conversation is the same
+    // WUFC/WUC programming Linux issues on its shared shutdown
+    // path — no part-specific wake registers exist.
+    let mut bank = FakeBank::new();
+    WolConfig::magic_only().arm(&mut bank);
+    if bank.read32(REG_WUFC) != 0x2 || bank.read32(REG_WUC) & WUC_PME_EN == 0 {
+        return TestResult::Fail("X540 arm conversation differs from 82599");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol_board_cap);
 
 // ── PM fixtures (commit 5) ───────────────────────────────────────
 
@@ -831,7 +989,9 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_pm_resume_rebuild);
 // ── Ethtool fixtures (commit 6) ──────────────────────────────────
 
 fn smoke_ixgbe_ethtool_snapshot() -> TestResult {
-    use super::ethtool::{read_stats, EthtoolInfo, NicStats, ETHTOOL_DRIVER, ETHTOOL_VERSION};
+    use super::ethtool::{
+        read_stats, EthtoolInfo, NicStats, QueueStats, ETHTOOL_DRIVER, ETHTOOL_VERSION,
+    };
     use super::queues::RegBank;
     if ETHTOOL_DRIVER != "ixgbe" || ETHTOOL_VERSION != "0.1.0" {
         return TestResult::Fail("ethtool driver identity wrong");
@@ -862,6 +1022,7 @@ fn smoke_ixgbe_ethtool_snapshot() -> TestResult {
         wol_supported: true,
         wol_armed: false,
         stats,
+        queue_stats: QueueStats::default(),
     };
     let summary = info.summary();
     if !summary.contains("ixgbe 0.1.0")
@@ -1483,3 +1644,519 @@ fn smoke_ixgbe_fdir_stats() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_stats);
+
+// ── DCB fixtures ───────────────────────────────────────────────────
+
+fn dcb_tc(refill: u16, max: u16, bwg_id: u8, prio: super::dcb::PrioType) -> super::dcb::TcCredits {
+    super::dcb::TcCredits {
+        refill,
+        max,
+        bwg_id,
+        prio_type: prio,
+    }
+}
+
+fn smoke_ixgbe_dcb_register_conversation_8tc() -> TestResult {
+    use super::dcb::*;
+    use super::queues::RegBank;
+    use super::IXGBE_DEV_82599EB;
+    let mut tc = [dcb_tc(32, 256, 0, PrioType::None); MAX_TRAFFIC_CLASS];
+    for (i, slot) in tc.iter_mut().enumerate() {
+        *slot = dcb_tc(
+            32 * (i as u16 + 1),
+            256 * (i as u16 + 1),
+            i as u8,
+            match i % 3 {
+                0 => PrioType::Link,
+                1 => PrioType::Group,
+                _ => PrioType::None,
+            },
+        );
+    }
+    let mut high = [0u32; MAX_TRAFFIC_CLASS];
+    let mut low = [0u32; MAX_TRAFFIC_CLASS];
+    for i in 0..MAX_TRAFFIC_CLASS {
+        high[i] = 16 + i as u32;
+        low[i] = 8 + i as u32;
+    }
+    let cfg = DcbConfig {
+        num_tcs: 8,
+        tc,
+        prio_to_tc: [0, 1, 2, 3, 4, 5, 6, 7],
+        // UPs 0 and 2: TCs 0 and 2 PFC-enabled, the rest guard-pathed.
+        pfc_enable: 0b0000_0101,
+        high_water: high,
+        low_water: low,
+        pause_time: 160,
+    };
+    let mut bank = FakeBank::new();
+    if cfg.apply(&mut bank, IXGBE_DEV_82599EB).is_err() {
+        return TestResult::Fail("8-TC DCB apply failed");
+    }
+    // Mode + buffers.
+    if bank.read32(REG_MTQC) != 0x0000_000D {
+        return TestResult::Fail("MTQC not RT_ENA|8TC_8TQ");
+    }
+    if bank.read32(REG_SECTXMINIFG) != 0x0000_1F00 {
+        return TestResult::Fail("SECTXMINIFG DCB IFG not set");
+    }
+    if bank.read32(REG_RXPBSIZE_BASE) != 0x0001_0000
+        || bank.read32(REG_TXPBSIZE_BASE) != 0x0000_5000
+        || bank.read32(REG_TXPBTHRESH_BASE) != 10
+    {
+        return TestResult::Fail("packet buffers not 64K/20K/thresh-10");
+    }
+    // Arbiters.
+    if bank.read32(REG_RTRPCS) != 0x0000_0006
+        || bank.read32(REG_RTRUP2TC) != 0x00FA_C688
+        || bank.read32(REG_RTTUP2TC) != 0x00FA_C688
+        || bank.read32(REG_RTTDCS) != 0x0000_0011
+        || bank.read32(REG_RTTPCS) != 0x0100_0120
+    {
+        return TestResult::Fail("arbiter control/UP-map words wrong");
+    }
+    if bank.read32(REG_RTRPT4C_BASE) != 0x8010_0020
+        || bank.read32(REG_RTRPT4C_BASE + 4) != 0x0020_0240
+        || bank.read32(REG_RTTDT2C_BASE + 4) != 0x4020_0240
+        || bank.read32(REG_RTTPT2C_BASE + 8) != 0x0030_0460
+    {
+        return TestResult::Fail("per-TC credit words wrong");
+    }
+    if bank.read32(REG_RTTDQSEL) != 127 || bank.read32(REG_RTTDT1C) != 0 {
+        return TestResult::Fail("TX desc queue-credit clear incomplete");
+    }
+    // PFC: 82599 has no per-TC bits, only the single RPFCE bit.
+    if bank.read32(REG_FCCFG) != 0x0000_0010 || bank.read32(REG_MFLCN) != 0x0000_0006 {
+        return TestResult::Fail("FCCFG/MFLCN wrong for 82599");
+    }
+    if bank.read32(REG_FCRTL_BASE) != 0x8000_2000
+        || bank.read32(REG_FCRTH_BASE) != 0x8000_4000
+        || bank.read32(REG_FCRTL_BASE + 8) != 0x8000_2800
+        || bank.read32(REG_FCRTH_BASE + 8) != 0x8000_4800
+    {
+        return TestResult::Fail("enabled-TC watermarks wrong");
+    }
+    if bank.read32(REG_FCRTL_BASE + 4) != 0 || bank.read32(REG_FCRTH_BASE + 4) != 0x0000_A000 {
+        return TestResult::Fail("disabled-TC guard path wrong");
+    }
+    if bank.read32(REG_FCTTV_BASE) != 0x00A0_00A0 || bank.read32(REG_FCRTV) != 80 {
+        return TestResult::Fail("pause time / refresh threshold wrong");
+    }
+    // TC statistics mapping.
+    if bank.read32(REG_RQSMR_BASE) != 0
+        || bank.read32(REG_RQSMR_BASE + 16) != 0x0101_0101
+        || bank.read32(REG_RQSMR_BASE + 124) != 0x0707_0707
+        || bank.read32(REG_TQSM_BASE) != 0
+        || bank.read32(REG_TQSM_BASE + 32) != 0x0101_0101
+        || bank.read32(REG_TQSM_BASE + 64) != 0x0202_0202
+        || bank.read32(REG_TQSM_BASE + 124) != 0x0707_0707
+    {
+        return TestResult::Fail("TC statistics mapping wrong");
+    }
+    if read_up_to_tc(&bank) != [0, 1, 2, 3, 4, 5, 6, 7] {
+        return TestResult::Fail("RTRUP2TC read-back disagrees");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_dcb_register_conversation_8tc
+);
+
+fn smoke_ixgbe_dcb_register_conversation_4tc_x540() -> TestResult {
+    use super::dcb::*;
+    use super::queues::RegBank;
+    use super::IXGBE_DEV_X540;
+    let tc = [dcb_tc(100, 1000, 0, PrioType::None); MAX_TRAFFIC_CLASS];
+    let cfg = DcbConfig {
+        num_tcs: 4,
+        tc,
+        prio_to_tc: [0, 0, 1, 1, 2, 2, 3, 3],
+        pfc_enable: 0xFF,
+        high_water: [32; MAX_TRAFFIC_CLASS],
+        low_water: [16; MAX_TRAFFIC_CLASS],
+        pause_time: 0,
+    };
+    let mut bank = FakeBank::new();
+    if cfg.apply(&mut bank, IXGBE_DEV_X540).is_err() {
+        return TestResult::Fail("4-TC X540 DCB apply failed");
+    }
+    if bank.read32(REG_MTQC) != 0x0000_0009 {
+        return TestResult::Fail("MTQC not RT_ENA|4TC_4TQ");
+    }
+    // X540 packet buffer is 384 KiB: 96 KiB RX / 40 KiB TX per TC.
+    if bank.read32(REG_RXPBSIZE_BASE) != 0x0001_8000
+        || bank.read32(REG_TXPBSIZE_BASE) != 0x0000_A000
+        || bank.read32(REG_TXPBTHRESH_BASE) != 30
+    {
+        return TestResult::Fail("X540 packet buffers not 96K/40K/thresh-30");
+    }
+    // Unused TCs cleared.
+    if bank.read32(REG_RXPBSIZE_BASE + 16) != 0
+        || bank.read32(REG_TXPBSIZE_BASE + 16) != 0
+        || bank.read32(REG_TXPBTHRESH_BASE + 16) != 0
+    {
+        return TestResult::Fail("unused TC buffers not cleared");
+    }
+    if bank.read32(REG_RTRUP2TC) != 0x006D_2240 {
+        return TestResult::Fail("4-TC UP map wrong");
+    }
+    // X540 programs the per-TC RPFCE bits plus the single bit.
+    if bank.read32(REG_MFLCN) != 0x0000_0FF6 {
+        return TestResult::Fail("X540 MFLCN per-TC bits wrong");
+    }
+    // All TCs 0..3 PFC-enabled (max_tc = 3); TCs 4..7 zeroed.
+    if bank.read32(REG_FCRTH_BASE) != (32 << 10) | 0x8000_0000
+        || bank.read32(REG_FCRTL_BASE + 16) != 0
+        || bank.read32(REG_FCRTH_BASE + 16) != 0
+    {
+        return TestResult::Fail("4-TC PFC threshold range wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_dcb_register_conversation_4tc_x540
+);
+
+fn smoke_ixgbe_dcb_validation_rejects() -> TestResult {
+    use super::dcb::*;
+    use super::queues::RegBank;
+    use super::IXGBE_DEV_82599EB;
+    let base = DcbConfig {
+        num_tcs: 8,
+        tc: [dcb_tc(100, 1000, 0, PrioType::None); MAX_TRAFFIC_CLASS],
+        prio_to_tc: [0, 1, 2, 3, 4, 5, 6, 7],
+        pfc_enable: 0,
+        high_water: [16; MAX_TRAFFIC_CLASS],
+        low_water: [8; MAX_TRAFFIC_CLASS],
+        pause_time: 0,
+    };
+    let mut bad_num = base.clone();
+    bad_num.num_tcs = 2;
+    let mut bad_tc = base.clone();
+    bad_tc.prio_to_tc[0] = 8;
+    let mut bad_bwg = base.clone();
+    bad_bwg.tc[0].bwg_id = 8;
+    let mut bad_refill = base.clone();
+    bad_refill.tc[0].refill = 512;
+    let mut bad_max = base.clone();
+    bad_max.tc[0].max = 4096;
+    let mut bad_water = base.clone();
+    bad_water.high_water[0] = 0x0040_0000;
+    let cases = [
+        (bad_num, DcbError::NumTcs),
+        (bad_tc, DcbError::TcIndex),
+        (bad_bwg, DcbError::BwgId),
+        (bad_refill, DcbError::Refill),
+        (bad_max, DcbError::Max),
+        (bad_water, DcbError::Water),
+    ];
+    for (cfg, want) in cases {
+        let mut bank = FakeBank::new();
+        match cfg.apply(&mut bank, IXGBE_DEV_82599EB) {
+            Err(got) if got == want => {}
+            _ => return TestResult::Fail("DCB validation missed a bad config"),
+        }
+        // Validation precedes every write: the bank stays pristine.
+        if bank.read32(REG_MTQC) != 0 || bank.read32(REG_RTRPCS) != 0 {
+            return TestResult::Fail("rejected DCB config wrote registers");
+        }
+    }
+    let mut bank = FakeBank::new();
+    if base.apply(&mut bank, 0xFFFF).is_ok() {
+        return TestResult::Fail("DCB apply accepted an ungrounded device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_dcb_validation_rejects);
+
+fn smoke_ixgbe_dcb_ieee_credits() -> TestResult {
+    use super::dcb::*;
+    let bw = [50u8, 30, 20, 0, 0, 0, 0, 0];
+    let (refill, max) = ieee_credits(&bw, 1518);
+    if refill != [50, 30, 20, 12, 12, 12, 12, 12] {
+        return TestResult::Fail("IEEE refill credits wrong");
+    }
+    if max != [2047, 1228, 819, 12, 12, 12, 12, 12] {
+        return TestResult::Fail("IEEE max credits wrong");
+    }
+    // Zero-bandwidth TCs still get the minimum credit; a tiny
+    // bandwidth still clears the minimum-frame floor via the clamp.
+    let (refill2, _) = ieee_credits(&[1, 0, 0, 0, 0, 0, 0, 0], 9000);
+    // min_credit = (4500 + 63) / 64 = 71; multiplier = 71/1 + 1 = 72.
+    if refill2[0] != 72 || refill2[1] != 71 {
+        return TestResult::Fail("IEEE credit floor wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_dcb_ieee_credits);
+
+// ── TX VLAN insertion + TSO frame-cap fix (#1269) ─────────────────
+
+fn smoke_ixgbe_tx_vle_and_ctxt_vlan() -> TestResult {
+    if ADVTXD_DCMD_VLE != 0x4000_0000 {
+        return TestResult::Fail("VLE bit wrong");
+    }
+    let cw = AdvTxDesc::ctrl_word(0x40) | ADVTXD_DCMD_VLE;
+    if cw & ADVTXD_DCMD_VLE == 0 || cw & 0xFFFF != 0x40 {
+        return TestResult::Fail("VLE ctrl word wrong");
+    }
+    let v = AdvTxCtxtDesc::new_vlan(0x1234);
+    if v.vlan_macip_lens != (0x1234u32 << 16) | (14u32 << 9) {
+        return TestResult::Fail("vlan ctxt vlan_macip_lens wrong");
+    }
+    if v.type_tucmd_mlhl != ADVTXD_DCMD_DEXT | ADVTXD_DTYP_CTXT {
+        return TestResult::Fail("vlan ctxt type wrong");
+    }
+    if v.mss_l4len_idx != 0 || v.seqnum_seed != 0 {
+        return TestResult::Fail("vlan ctxt must zero the unused fields");
+    }
+    let t = AdvTxCtxtDesc::new_tso_v4(14, 20, 20, 1460, Some(0x00AB));
+    if t.vlan_macip_lens != 20u32 | (14u32 << 9) | (0x00ABu32 << 16) {
+        return TestResult::Fail("tso+vlan ctxt vlan_macip_lens wrong");
+    }
+    if t.type_tucmd_mlhl
+        != ADVTXD_DCMD_DEXT | ADVTXD_DTYP_CTXT | ADVTXD_TUCMD_IPV4 | ADVTXD_TUCMD_L4T_TCP
+    {
+        return TestResult::Fail("tso ctxt type wrong");
+    }
+    if t.mss_l4len_idx != (20u32 << 8) | (1460u32 << 16) {
+        return TestResult::Fail("tso ctxt mss_l4len wrong");
+    }
+    let t0 = AdvTxCtxtDesc::new_tso_v4(14, 20, 20, 1460, None);
+    if t0.vlan_macip_lens & 0xFFFF_0000 != 0 {
+        return TestResult::Fail("tso ctxt without vlan must clear tag bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_vle_and_ctxt_vlan);
+
+fn smoke_ixgbe_tx_tso_parse() -> TestResult {
+    // Crafted IPv4/TCP frame: 14 eth + 20 IP + 20 TCP + 46 payload.
+    let mut f = alloc::vec![0u8; 100];
+    f[12] = 0x08;
+    f[13] = 0x00;
+    f[14] = 0x45;
+    f[14 + 9] = 6;
+    f[14 + 20 + 12] = 0x50;
+    let h = match parse_tso_headers(&f, f.len()) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("valid tso frame rejected"),
+    };
+    if h.mac_len != 14 || h.ip_len != 20 || h.l4_len != 20 {
+        return TestResult::Fail("tso header lengths wrong");
+    }
+    // IP options (IHL 6) + TCP options (doff 6).
+    let mut g = alloc::vec![0u8; 120];
+    g[12] = 0x08;
+    g[13] = 0x00;
+    g[14] = 0x46;
+    g[14 + 9] = 6;
+    g[14 + 24 + 12] = 0x60;
+    let h = match parse_tso_headers(&g, g.len()) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("options tso frame rejected"),
+    };
+    if h.ip_len != 24 || h.l4_len != 24 {
+        return TestResult::Fail("options header lengths wrong");
+    }
+    // Rejections.
+    if parse_tso_headers(&f[..40], 40).is_ok() {
+        return TestResult::Fail("short frame accepted");
+    }
+    let mut t = f.clone();
+    t[12] = 0x81;
+    t[13] = 0x00;
+    if parse_tso_headers(&t, t.len()).is_ok() {
+        return TestResult::Fail("tagged frame accepted");
+    }
+    let mut a = f.clone();
+    a[13] = 0x06;
+    if parse_tso_headers(&a, a.len()).is_ok() {
+        return TestResult::Fail("ARP frame accepted as IPv4");
+    }
+    let mut b = f.clone();
+    b[14] = 0x44;
+    if parse_tso_headers(&b, b.len()).is_ok() {
+        return TestResult::Fail("bad IHL accepted");
+    }
+    let mut u = f.clone();
+    u[14 + 9] = 17;
+    if parse_tso_headers(&u, u.len()).is_ok() {
+        return TestResult::Fail("UDP accepted as TCP");
+    }
+    let mut d = f.clone();
+    d[14 + 20 + 12] = 0x40;
+    if parse_tso_headers(&d, d.len()).is_ok() {
+        return TestResult::Fail("bad doff accepted");
+    }
+    // Truncated: IHL 15 (60-byte IP header) but only 60 bytes total.
+    let mut tr = alloc::vec![0u8; 60];
+    tr[12] = 0x08;
+    tr[13] = 0x00;
+    tr[14] = 0x4F;
+    tr[14 + 9] = 6;
+    if parse_tso_headers(&tr, tr.len()).is_ok() {
+        return TestResult::Fail("truncated frame accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_tso_parse);
+
+fn smoke_ixgbe_tx_tso_paylen() -> TestResult {
+    let d = AdvTxDesc::with_tso(0x1000, 1500, 1460);
+    if d.addr != 0x1000 || d.cmd_type_len & ADVTXD_DCMD_TSE == 0 {
+        return TestResult::Fail("tso desc missing addr/TSE");
+    }
+    if d.cmd_type_len & 0xFFFF != 1500 {
+        return TestResult::Fail("tso desc DTALEN wrong");
+    }
+    let want = (1460u32 << ADVTXD_PAYLEN_SHIFT) | ADVTXD_POPTS_IXSM | ADVTXD_POPTS_TXSM;
+    if d.olinfo != want {
+        return TestResult::Fail("tso desc PAYLEN/POPTS wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_tso_paylen);
+
+fn smoke_ixgbe_tx_plan() -> TestResult {
+    use narf_net::{L4CsumKind, TxMeta};
+    // Plain frame: no context, no TSE/VLE, PAYLEN = full length.
+    let frame = [0u8; 100];
+    let (ctxt, desc) = match tx_plan(0x1000, frame.len(), &frame, &TxMeta::plain()) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("plain plan rejected"),
+    };
+    if ctxt.is_some()
+        || desc.addr != 0x1000
+        || desc.cmd_type_len & ADVTXD_DCMD_TSE != 0
+        || desc.cmd_type_len & ADVTXD_DCMD_VLE != 0
+        || desc.olinfo != (100u32 << 14)
+    {
+        return TestResult::Fail("plain plan wrong");
+    }
+    // TSO frame: 2000 bytes, headers 14+20+20, payload 1946.
+    let mut tso_frame = alloc::vec![0u8; 2000];
+    tso_frame[12] = 0x08;
+    tso_frame[13] = 0x00;
+    tso_frame[14] = 0x45;
+    tso_frame[14 + 9] = 6;
+    tso_frame[14 + 20 + 12] = 0x50;
+    let (ctxt, desc) = match tx_plan(0x2000, tso_frame.len(), &tso_frame, &TxMeta::with_tso(1460)) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("tso plan rejected"),
+    };
+    let c = match ctxt {
+        Some(c) => c,
+        None => return TestResult::Fail("tso plan missing context"),
+    };
+    if c.mss_l4len_idx != (20u32 << 8) | (1460u32 << 16) {
+        return TestResult::Fail("tso plan context mss/l4len wrong");
+    }
+    if desc.cmd_type_len & ADVTXD_DCMD_TSE == 0 {
+        return TestResult::Fail("tso plan desc missing TSE");
+    }
+    if desc.olinfo != (1946u32 << ADVTXD_PAYLEN_SHIFT) | ADVTXD_POPTS_IXSM | ADVTXD_POPTS_TXSM {
+        return TestResult::Fail("tso plan PAYLEN wrong");
+    }
+    // VLAN-only: context + VLE, no TSE.
+    let mut m = TxMeta::plain();
+    m.vlan_tag = Some(0x00AB);
+    let (ctxt, desc) = match tx_plan(0x3000, frame.len(), &frame, &m) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("vlan plan rejected"),
+    };
+    if ctxt.is_none()
+        || desc.cmd_type_len & ADVTXD_DCMD_VLE == 0
+        || desc.cmd_type_len & ADVTXD_DCMD_TSE != 0
+    {
+        return TestResult::Fail("vlan plan wrong");
+    }
+    // VLAN + TSO: context carries tag, desc carries TSE + VLE.
+    let mut mt = TxMeta::with_tso(1460);
+    mt.vlan_tag = Some(0x00AB);
+    let (ctxt, desc) = match tx_plan(0x4000, tso_frame.len(), &tso_frame, &mt) {
+        Ok(x) => x,
+        Err(_) => return TestResult::Fail("vlan+tso plan rejected"),
+    };
+    let c = match ctxt {
+        Some(c) => c,
+        None => return TestResult::Fail("vlan+tso plan missing context"),
+    };
+    if c.vlan_macip_lens & 0xFFFF_0000 != 0x00AB_0000 {
+        return TestResult::Fail("vlan+tso plan context tag wrong");
+    }
+    if desc.cmd_type_len & ADVTXD_DCMD_TSE == 0 || desc.cmd_type_len & ADVTXD_DCMD_VLE == 0 {
+        return TestResult::Fail("vlan+tso plan desc bits wrong");
+    }
+    // VLAN + csum without TSO: rejected.
+    let mut mc = TxMeta::with_csum(L4CsumKind::Tcp);
+    mc.vlan_tag = Some(1);
+    if tx_plan(0x5000, frame.len(), &frame, &mc).is_ok() {
+        return TestResult::Fail("vlan+csum plan accepted");
+    }
+    // TSO with mss 0: rejected.
+    if tx_plan(0x6000, tso_frame.len(), &tso_frame, &TxMeta::with_tso(0)).is_ok() {
+        return TestResult::Fail("tso mss 0 accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_plan);
+
+// ── Ethtool per-queue statistics (QPRC/QPTC, §13i) ──────────────
+
+fn smoke_ixgbe_ethtool_queue_stats() -> TestResult {
+    use super::ethtool::{
+        qprc_addr, qptc_addr, read_queue_stats, NUM_QUEUE_COUNTERS, QUEUE_COUNTER_STRIDE,
+        REG_QPRC_BASE, REG_QPTC_BASE,
+    };
+    use super::queues::RegBank;
+    // Address pins (datasheet §8.2.3.23.74/.78; Linux IXGBE_QPRC/QPTC).
+    if NUM_QUEUE_COUNTERS != 16
+        || REG_QPRC_BASE != 0x01030
+        || REG_QPTC_BASE != 0x06030
+        || QUEUE_COUNTER_STRIDE != 0x40
+    {
+        return TestResult::Fail("queue counter bases wrong");
+    }
+    if qprc_addr(0) != Some(0x01030)
+        || qprc_addr(15) != Some(0x013F0)
+        || qprc_addr(16).is_some()
+        || qptc_addr(0) != Some(0x06030)
+        || qptc_addr(15) != Some(0x063F0)
+        || qptc_addr(16).is_some()
+    {
+        return TestResult::Fail("queue counter addressing wrong");
+    }
+    let mut bank = FakeBank::new();
+    bank.write32(0x01030, 10); // QPRC[0]
+    bank.write32(0x01070, 20); // QPRC[1]
+    bank.write32(0x010B0, 99); // QPRC[2] — beyond a 2-queue read, must stay unread
+    bank.write32(0x013F0, 150); // QPRC[15]
+    bank.write32(0x06030, 7); // QPTC[0]
+    bank.write32(0x060B0, 27); // QPTC[2]
+    bank.write32(0x060F0, 33); // QPTC[3] — beyond a 3-queue read, must stay unread
+    let stats = read_queue_stats(&bank, 2, 3);
+    if stats.rx_valid != 2 || stats.tx_valid != 3 {
+        return TestResult::Fail("queue stats valid counts wrong");
+    }
+    if stats.rx_packets[0] != 10
+        || stats.rx_packets[1] != 20
+        || stats.rx_packets[2] != 0
+        || stats.tx_packets[0] != 7
+        || stats.tx_packets[1] != 0
+        || stats.tx_packets[2] != 27
+        || stats.tx_packets[3] != 0
+    {
+        return TestResult::Fail("queue stats interval read wrong");
+    }
+    // A 64-queue bring-up still reports only the first 16 queues:
+    // queues >= 16 have no hardware per-queue counter.
+    let wide = read_queue_stats(&bank, 64, 64);
+    if wide.rx_valid != 16 || wide.tx_valid != 16 || wide.rx_packets[15] != 150 {
+        return TestResult::Fail("queue stats 16-queue cap wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_ethtool_queue_stats);

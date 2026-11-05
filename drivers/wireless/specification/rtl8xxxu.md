@@ -497,9 +497,12 @@ delivery; released original captures re-enter the batch in sequence order and
 keep their capture-time port/epoch admission. Only such MPDUs may carry rxdesc16
 PAGGR/FAGGR, and only without the A-MSDU bit. Holes release after mac80211's
 100ms `HT_RX_REORDER_BUF_TIMEOUT`; old/duplicate sequences are dropped. The
-EU RX filter passes no BlockAckReq (REG_RXFLTMAP1 PS-Poll only, no
-RCR_ACCEPT_CTRL_FRAME, as `rtl8xxxu_configure_filter` in station mode), so
-BAR-driven advance does not occur. A nonzero session timeout without traffic
+EU RX filter passes control frames (REG_RXFLTMAP0/1/2 = 0xffff, the rtw88
+retained value for the same Realtek filter block), so a peer-bound
+single-TID BlockAckReq advances the recipient reorder session (or earns
+one recipient DELBA for an unexpected TID); multi-TID BARs are consumed
+without advance, and every other control frame is dropped by the station
+gate rather than reaching the DATA path. A nonzero session timeout without traffic
 (`sta_rx_agg_session_timer_expired`) purges the buffer and queues a30-byte
 recipient DELBA with `WLAN_REASON_QSTA_TIMEOUT`; an originator DELBA purges
 the session. Failure/disconnect purge every session. Smokes
@@ -1593,25 +1596,33 @@ is the set granted at attach, and every use mints its own grant again.
 `rtl8xxxu_stop` (TXPAUSE, RX filter maps cleared, USB Stop/SetDeq of both
 host transfers, `disable_rf`), `rtl8192eu_power_off`/`rtl8723bu_power_off`,
 a fresh `rtl8xxxu_init_device` lifecycle with the gen2 identity check,
-`retarget_stopped` (channel label changes only with no transfer posted),
-then `rtl8xxxu_start` whose `tune_8192e`/`tune_8723b` revalidate the grant
-against the retained factory/USB identity before `set_tx_power` +
-`gen2_config_channel`. A never-started radio only relabels. Linux
-`rtl8xxxu_config` retunes live; the cold boundary is the RTL8188EU rule that
-no old-channel device-FIFO byte reaches a new receive stream. Each restart
-advances `Radio::generation`. Any failure is terminal.
+`retarget_live` (live retune: the posted RX transfer stays posted — the
+channel is RF state, not per-transfer content — while association state
+resets and the channel label moves, with no TX outstanding) on a
+receiving radio, or `retarget_stopped` (channel label changes only with
+no transfer posted) after the cold lifecycle, then `rtl8xxxu_start`
+whose `tune_8192e`/`tune_8723b` revalidate the grant against the retained
+factory/USB identity before `set_tx_power` + `gen2_config_channel`. A
+never-started radio only relabels. Linux `rtl8xxxu_config` retunes live;
+the cold boundary is the RTL8188EU rule that no old-channel device-FIFO
+byte reaches a new receive stream — the live path keeps the transfer
+posted but the RF programming moves, so it is used only where no
+device-FIFO byte is in flight (unbound radios, no TX outstanding).
+Each retune, cold or live, advances `Radio::generation`. Any failure is
+terminal.
 
-- `set_config(channel)`: idle cold retune under that channel's grant
+- `set_config(channel)`: idle live retune under that channel's grant
   (no TX power override; a station keeps its channel, other values `Busy`).
 - Idle scans: bounded channel/frequency lists (1..=13, empty = every granted
   channel), at most one SSID for active requests and up to 2048 checked
   extra probe IEs (`max_scan_ssids = 1`, `max_scan_ie_len = MAX_IE`), no
   random address/6 GHz. All grants, the probe frame and its timing are
-  admitted before the first transition. Each visit cold-retunes (skipped for
+  admitted before the first transition. Each visit live-retunes (skipped for
   the current receiving channel) and either dwells passively or emits one
   `probe_runtime::Prepared` broadcast Probe Request (`Radio::submit_probe`:
   unbound receiving radio, exact local TA/current DS channel, legacy rates,
-  txdesc40 MGNT pipe) after the source 31 ms pre-probe delay, awaits its
+  txdesc40 MGNT pipe, the board's HT Capabilities body when the signed
+  record supports HT) after the source 31 ms pre-probe delay, awaits its
   exact host USB receipt (not an ACK) and listens the response window
   (`Prepared::timing`). Home is restored. The candidate cache keeps at most
   32 entries (oldest evicted) for 10 s, each with its observation time and
@@ -1775,8 +1786,10 @@ physical link metadata (`set_link_metadata_for` /
 the operator's IFF_UP (`set_link_state` is only the initial DOWN
 registration). `disassociate` while DOWN is a no-op.
 
-Deviations / not implemented: HT40 on gen2 is grant-gated (wide grant + Forty negotiation + `widen`; no live 40 MHz scan); a scan or channel change costs a full cold firmware lifecycle per
-transition (Linux retunes live); the retained host TX/RX rings are not
+Deviations / not implemented: HT40 on gen2 is grant-gated (wide grant + Forty negotiation + `widen`; no live 40 MHz scan); idle scans and channel
+changes retune live (Linux `rtl8xxxu_config`), while associated-scan
+away/return visits still pay the cold lifecycle (`leave` stops the radio);
+the retained host TX/RX rings are not
 serviced on away visits (home grace services one Ethernet frame per step);
 no station power-save
 nullfunc beyond the scan PM1/PM0 indications (Linux rtl8xxxu does not set

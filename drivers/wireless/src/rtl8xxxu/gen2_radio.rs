@@ -10,9 +10,12 @@
 //! admitted signed permission (`N92P`/`N8BP`) is the only channel/rate
 //! authority. Other channels are reached only with
 //! a grant minted from the same signed record and authenticated domain
-//! (`Authority::grant`), through a cold `retune` (`rtl8xxxu_stop`, the
-//! chip power-off and a fresh `rtl8xxxu_init_device` lifecycle, then
-//! `rtl8xxxu_start` on the new channel). A 40 MHz operating channel is
+//! (`Authority::grant`): on a receiving unbound radio through a live
+//! retune (`tune_8192e`/`tune_8723b` TX power + channel on the running
+//! radio, Linux `rtl8xxxu_config`); on a stopped radio through a cold
+//! `retune` (`rtl8xxxu_stop`, the chip power-off and a fresh
+//! `rtl8xxxu_init_device` lifecycle, then `rtl8xxxu_start` on the new
+//! channel). A 40 MHz operating channel is
 //! reached only with a wide grant minted from the same record and domain
 //! (`Authority::grant_wide`) and activated by `Radio::widen` after a
 //! Forty negotiation; the initial grant never widens itself. QoS DATA needs the programmed
@@ -182,6 +185,14 @@ const BT_QUEUE: usize = 8;
 const REG_TXPAUSE: u16 = 0x522;
 const REG_ACM_HW_CTRL: u16 = 0x5c0;
 const REG_RXFLTMAP0: u16 = 0x6a0;
+/// Control-frame RX filter map. Written `0xffff` at `start` (the rtw88
+/// retained value after mac_init + MAC table, same Realtek filter block):
+/// BlockAckReq reaches the host, where only peer-bound BARs advance a
+/// recipient session and every other control frame is dropped by the
+/// station gate. No narrower PS-Poll|BAR value is groundable in-tree —
+/// no RXFLTMAP1 subtype-bit table exists for rtl8xxxu — so the retained
+/// all-control value is used rather than a fabricated bit.
+const REG_RXFLTMAP1: u16 = 0x6a2;
 const REG_RXFLTMAP2: u16 = 0x6a4;
 const REG_OFDM0_XA_AGC_CORE1: u16 = 0xc50;
 const REG_MSR: u16 = 0x102;
@@ -415,8 +426,10 @@ pub struct Radio<C: ControlIo, B: PacketIo> {
     /// `priv->bt_coex` (RTL8723BU only).
     coex: Option<Coex>,
     bt: VecDeque<C2h>,
-    /// Physical receive-stream generation: advanced by every completed cold
-    /// restart, so an observation names the stream that copied it.
+    /// Physical receive generation: advanced by every completed retune,
+    /// cold or live, so an observation names the channel epoch that
+    /// copied it (a live retune keeps the transfer posted but the
+    /// channel — and therefore every observation's meaning — changes).
     generation: u64,
     /// Negotiated HT20 association: HT RX admission and HT TX fields.
     ht: bool,
@@ -439,6 +452,32 @@ impl<C: ControlIo, B: PacketIo> core::fmt::Debug for Radio<C, B> {
             .field("phase", &self.phase)
             .field("channel", &self.grant.primary())
             .finish_non_exhaustive()
+    }
+}
+
+/// How `retune` moves an unbound radio to a new grant. Pure dispatch,
+/// pinned by `gen2_radio_tests`: a receiving radio retunes live, a
+/// stopped radio pays the cold lifecycle, a never-started radio only
+/// relabels; a bound radio (peer or RA state) or a failed/parked one
+/// refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RetunePath {
+    Live,
+    Cold,
+    Relabel,
+}
+/// `retune` dispatch, as a free function so pure tests need no firmware
+/// fixture: the live/cold/relabel decision depends only on the phase
+/// and the bound flag.
+pub(super) fn retune_path(phase: Phase, bound: bool) -> Option<RetunePath> {
+    if bound {
+        return None;
+    }
+    match phase {
+        Phase::Receiving => Some(RetunePath::Live),
+        Phase::Stopped => Some(RetunePath::Cold),
+        Phase::Prepared => Some(RetunePath::Relabel),
+        _ => None,
     }
 }
 
@@ -602,6 +641,13 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
         self.wide_active = true;
         Ok(())
     }
+    /// The HT Capabilities IE body (26 bytes) this board's signed record
+    /// supports, for active-scan probes (gen2 F10): the same admitted MCS
+    /// set the association offers, not the probe constructor's SISO body.
+    /// `None` on a legacy-only board, whose probes carry no HT caps.
+    pub(super) fn ht_caps(&self) -> Option<[u8; 26]> {
+        ht_capability(self.grant.admitted(), self.tx_paths).map(|ht| ht.capability_body())
+    }
     /// Advertised RX spatial streams (`rx_mask[1]` present).
     fn streams(&self) -> u8 {
         if self.tx_paths == 2 && self.grant.admitted() >> 20 & 0xff != 0 {
@@ -644,7 +690,8 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
     }
     /// `rtl8xxxu_start`: `enable_rf` plus the admitted initial channel
     /// (`start_8192e`/`start_8723b`), the persistent RX transfer, then
-    /// `REG_RXFLTMAP2`/`REG_RXFLTMAP0 = 0xffff` and IGI `0x1e`.
+    /// `REG_RXFLTMAP2`/`REG_RXFLTMAP1`/`REG_RXFLTMAP0 = 0xffff` and IGI
+    /// `0x1e`.
     pub async fn start(&mut self) -> Result<(), Error> {
         self.current()?;
         if self.phase() != Phase::Prepared || self.firmware.status().stage != Stage::RadioReady {
@@ -665,7 +712,7 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
                 self.claimed = true;
             }
             self.packets.start().map_err(Error::Packet)?;
-            for reg in [REG_RXFLTMAP2, REG_RXFLTMAP0] {
+            for reg in [REG_RXFLTMAP2, REG_RXFLTMAP1, REG_RXFLTMAP0] {
                 self.firmware
                     .write16(reg, 0xffff)
                     .await
@@ -999,7 +1046,7 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             self.packets.ampdu = None;
             let f = &self.firmware;
             f.write8(REG_TXPAUSE, 0xff).await.map_err(Error::Control)?;
-            for reg in [REG_RXFLTMAP0, REG_RXFLTMAP2] {
+            for reg in [REG_RXFLTMAP0, REG_RXFLTMAP1, REG_RXFLTMAP2] {
                 f.write16(reg, 0).await.map_err(Error::Control)?;
             }
             self.packets.stop().await.map_err(Error::Packet)?;
@@ -1090,40 +1137,78 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             _ => Err(Error::State),
         }
     }
-    /// Cold channel change of an unbound radio: `stop` (MAC TX/RX and RX
-    /// filter maps closed, host transfers retired by USB Stop/SetDeq,
-    /// `disable_rf`), the chip power-off and a fresh `rtl8xxxu_init_device`
-    /// lifecycle, so no device-FIFO byte from the old channel survives into
-    /// the new stream; then the new grant's channel label and, when the radio
-    /// was receiving, `rtl8xxxu_start` (`tune_8192e`/`tune_8723b` revalidate
-    /// the grant against the retained identity before any channel write).
-    /// A never-started radio only relabels. Any failure is terminal.
+    /// Channel change of an unbound radio under a new grant from the same
+    /// record and domain. The path follows `retune_path`:
+    ///
+    /// - Live (receiving): Linux `rtl8xxxu_config` — `tune_8192e`/
+    ///   `tune_8723b` (TX power + channel) on the running radio. The RX
+    ///   transfer stays posted, the RX filter maps and IGI stay
+    ///   programmed, and no firmware lifecycle runs. No TX may be
+    ///   outstanding (callers guarantee it: probe visits await delivery,
+    ///   idle/set_config radios submit nothing); the packet channel
+    ///   label moves with the grant, and the observation generation
+    ///   advances, since a channel change redefines every observation
+    ///   even though the transfer continues. The tune writes, the
+    ///   relabel, the grant swap and the generation advance run without
+    ///   an await between them, so no poll can tag a frame with a
+    ///   half-moved channel.
+    /// - Cold (stopped): `stop` already ran, so the chip power-off and a
+    ///   fresh `rtl8xxxu_init_device` lifecycle, so no device-FIFO byte
+    ///   from the old channel survives into the new stream; then the new
+    ///   grant's channel label and `rtl8xxxu_start` when the radio was
+    ///   receiving. This is also what the associated-scan return pays:
+    ///   `leave` stops the radio, so `rejoin`'s retune stays cold until
+    ///   a later lane makes leave itself live.
+    /// - Relabel (never started): only the grant label moves.
+    ///
+    /// Any failure is terminal.
     pub async fn retune(&mut self, grant: Grant) -> Result<(), Error> {
         self.current()?;
-        if grant.chip() != self.chip() || self.peer.is_some() || self.ra.is_some() {
+        if grant.chip() != self.chip() {
             return Err(Error::State);
         }
-        let resume = match self.phase() {
-            Phase::Prepared => false,
-            Phase::Receiving | Phase::Stopped => true,
-            _ => return Err(Error::State),
-        };
-        if self.phase() == Phase::Receiving {
-            self.stop().await?;
+        let bound = self.peer.is_some() || self.ra.is_some();
+        match retune_path(self.phase(), bound) {
+            Some(RetunePath::Live) => {
+                if self.packets.transmit_pending() {
+                    return Err(Error::State);
+                }
+                let admitted = match &grant {
+                    Grant::Rtl8192e(p) => self.firmware.tune_8192e(p, p.primary(), p.width()).await,
+                    Grant::Rtl8723b(p) => self.firmware.tune_8723b(p, p.primary(), p.width()).await,
+                }
+                .map_err(Error::Control)?;
+                if admitted != grant.admitted() {
+                    self.fail_terminal();
+                    return Err(Error::Profile);
+                }
+                if let Err(error) = self.packets.retarget_live(grant.primary()) {
+                    self.fail_terminal();
+                    return Err(Error::Packet(error));
+                }
+                self.grant = grant;
+                self.generation = self.generation.saturating_add(1);
+                Ok(())
+            }
+            Some(RetunePath::Cold) => {
+                // Entered only from Stopped (Receiving takes the live
+                // path): the cold lifecycle, then receiving resumes.
+                self.park().await?;
+                self.restart_parked().await?;
+                if let Err(error) = self.packets.retarget_stopped(grant.primary()) {
+                    self.fail_terminal();
+                    return Err(Error::Packet(error));
+                }
+                self.grant = grant;
+                self.start().await?;
+                Ok(())
+            }
+            Some(RetunePath::Relabel) => {
+                self.grant = grant;
+                Ok(())
+            }
+            None => Err(Error::State),
         }
-        if self.phase() == Phase::Stopped {
-            self.park().await?;
-            self.restart_parked().await?;
-        }
-        if let Err(error) = self.packets.retarget_stopped(grant.primary()) {
-            self.fail_terminal();
-            return Err(Error::Packet(error));
-        }
-        self.grant = grant;
-        if resume {
-            self.start().await?;
-        }
-        Ok(())
     }
     /// Host BA facts, no device access: the HT peer's MPDU density with the
     /// operational originator TIDs (`priv->tid_tx_operational`) for the
@@ -1233,6 +1318,9 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
     /// The prepared broadcast Probe Request on the management pipe of an
     /// unbound receiving radio (`probe_runtime::Prepared` is the only
     /// broadcast management constructor; ordinary submission stays unicast).
+    /// An HT-capable board's probe carries its HT caps (`ht_caps`); a
+    /// legacy-only board's probe carries none — the prepared frame's HT
+    /// flag must match the board capability, not a constant.
     pub(super) fn submit_probe(
         &mut self,
         probe: &super::probe_runtime::Prepared,
@@ -1240,7 +1328,12 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
         self.current()?;
         if self.phase() != Phase::Receiving
             || self.peer.is_some()
-            || !probe.matches(self.local, self.grant.primary(), false, false)
+            || !probe.matches(
+                self.local,
+                self.grant.primary(),
+                self.ht_caps().is_some(),
+                false,
+            )
         {
             return Err(Error::State);
         }

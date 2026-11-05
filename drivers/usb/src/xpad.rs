@@ -2222,6 +2222,7 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
 
 pub fn probe(
     device: alloc::sync::Arc<crate::device::USBDevice>,
+    _hub_port: Option<(u8, u8)>,
 ) -> Result<(), crate::class_registry::UsbProbeError> {
     // The probe is synchronous, but we need to do async xHCI requests to fetch
     // the config descriptor and bind. So we spawn a task to do that.

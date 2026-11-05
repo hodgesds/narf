@@ -1,14 +1,23 @@
 //! ixgbe RSS programming — MRQC / RSSRK / RETA.
 //!
-//! Grounding: Intel 82599 Datasheet rev. 2.0 §8.2.3.7.12 (MRQC at
-//! 0x0EC80, MRQE field + RSS-field-enable bits), §8.2.3.7.14
-//! (RSSRK at 0x0EB80 + 4*n, n = 0..9, 40-byte key, byte 4*n+m in
-//! bits [8*m+7:8*m]), §8.2.3.7.15 (RETA at 0x0EB00 + 4*n, n = 0..31,
-//! 128 entries, 4 bits per entry at [3:0]/[11:8]/[19:16]/[27:24]).
+//! Grounding: Intel 82599 Datasheet rev. 2.6 (322429-007)
+//! §8.2.3.7.12 (MRQC, MRQE field + RSS-field-enable bits),
+//! §8.2.3.7.14 (RSSRK, 40-byte key, byte 4*n+m in bits
+//! [8*m+7:8*m]), §8.2.3.7.15 (RETA, 128 entries, 4 bits per
+//! entry at [3:0]/[11:8]/[19:16]/[27:24]).
 //! The hash itself is the shared Toeplitz implementation in
 //! `narf_net::rss` (standard 40-byte key, Microsoft conformance
 //! vectors); this module only packs that key + indirection table
-//! into the 82599's registers. No Linux ixgbe source consulted.
+//! into the 82599's registers.
+//!
+//! Register addresses: see `super::regs` (issue #1397). The
+//! datasheet dual-maps MRQC/RSSRK/RETA — native 0x0E block and
+//! 82598-compat 0x05 block are the SAME physical registers —
+//! and this path programs the 0x05 (Linux/compat) canonical
+//! addresses from the shared authority. The addresses
+//! themselves come from the datasheet; Linux's shipping map
+//! (ixgbe_type.h) is cited there only as the cross-check for
+//! which alias to program, not as copied code.
 //!
 //! Mode: MRQE = 0001b = "RSS only — single set of RSS 16 queues"
 //! (§8.2.3.7.12), so RSS is valid for 1..=16 RX queues. All six
@@ -21,15 +30,13 @@
 
 use super::queues::RegBank;
 
-/// MRQC register (datasheet §8.2.3.7.12).
-pub const REG_MRQC: u64 = 0x0EC80;
-/// RSS random-key base (datasheet §8.2.3.7.14).
-pub const REG_RSSRK_BASE: u64 = 0x0EB80;
-/// Redirection-table base (datasheet §8.2.3.7.15).
-pub const REG_RETA_BASE: u64 = 0x0EB00;
-
-/// MRQE value for RSS-only mode (single 16-queue set).
-pub const MRQE_RSS_ONLY: u32 = 0x0001;
+/// MRQE value for RSS-only mode — re-exported from the same
+/// authority (VMDq modes live there too, for the composition lane).
+pub use super::regs::MRQE_RSS_ONLY;
+/// Register addresses — single authority in `super::regs` (see
+/// #1397); re-exported here so existing importers keep working.
+/// Do NOT redefine these literals in this module.
+pub use super::regs::{REG_MRQC, REG_RETA_BASE, REG_RSSRK_BASE};
 /// RSS hash-field enables: TcpIPv4, IPv4, IPv6, TcpIPv6, UdpIPv4,
 /// UdpIPv6 (datasheet §8.2.3.7.12, bits 31:16).
 pub const MRQC_HASH_FIELDS: u32 =

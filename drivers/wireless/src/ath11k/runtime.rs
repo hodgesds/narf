@@ -106,6 +106,14 @@ pub const ATH11K_RESET_MAX_FAIL_COUNT_FIRST: u32 = 3;
 pub const ATH11K_RESET_MAX_FAIL_COUNT_FINAL: u32 = 5;
 /// `ATH11K_RESET_FAIL_TIMEOUT_HZ` (20 s).
 pub const ATH11K_RESET_FAIL_TIMEOUT_MS: u64 = 20_000;
+
+/// Linux `ath11k_core_reset`'s failure gate, shared by the runtime loop's
+/// `fw_notify` and the AHB SMP2P crash monitor: no further reset once
+/// `fail_cont_count` reached FINAL, or FIRST within the fail window.
+pub fn recovery_gated(fail_cont_count: u32, reset_fail_timeout: u64, now_ms: u64) -> bool {
+    fail_cont_count >= ATH11K_RESET_MAX_FAIL_COUNT_FINAL
+        || (fail_cont_count >= ATH11K_RESET_MAX_FAIL_COUNT_FIRST && now_ms < reset_fail_timeout)
+}
 pub const ESHUTDOWN: i32 = 108;
 
 pub const ETIMEDOUT: i32 = 110;
@@ -1208,6 +1216,12 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         device_caps(&self.core)
     }
 
+    /// The mac layer's view of one radio of a multi-pdev part
+    /// ([`device_caps_for`]).
+    pub fn device_caps_for(&self, pdev_id: u32) -> Result<DeviceCaps, TransportError> {
+        device_caps_for(&self.core, pdev_id)
+    }
+
     fn apply(&mut self, op: SyncOp) {
         let now = self.now_ms();
         match op {
@@ -1710,11 +1724,18 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         // ath11k_dp_service_mon_ring (non-full-monitor: status rings).
         if let Some(at) = self.mon_reap_at {
             if now >= at {
-                for j in 0..self.dp.cfg.num_rxdma_per_pdev {
-                    let mut budget = DP_MON_SERVICE_BUDGET;
-                    let hif = &mut self.core.hif;
-                    self.dp
-                        .reap_mon_status(&mut hif.ce.hal, &hif.io, j, &mut budget);
+                for mac_id in self.dp.pdev_mac_ids() {
+                    for j in 0..self.dp.cfg.num_rxdma_per_pdev {
+                        let mut budget = DP_MON_SERVICE_BUDGET;
+                        let hif = &mut self.core.hif;
+                        self.dp.reap_mon_status_for(
+                            &mut hif.ce.hal,
+                            &hif.io,
+                            mac_id,
+                            j,
+                            &mut budget,
+                        );
+                    }
                 }
                 self.mon_reap_at = Some(now + ATH11K_MON_TIMER_INTERVAL);
             }
@@ -1763,11 +1784,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         }
         if let FwNotice::Reset(_) = n {
             let fails = self.reset.fail_cont_count;
-            let now = self.now_ms();
-            if fails >= ATH11K_RESET_MAX_FAIL_COUNT_FINAL
-                || (fails >= ATH11K_RESET_MAX_FAIL_COUNT_FIRST
-                    && now < self.reset.reset_fail_timeout)
-            {
+            if recovery_gated(fails, self.reset.reset_fail_timeout, self.now_ms()) {
                 TransportError::new(step::RECOVERY_LIMIT, fails, ETIMEDOUT)
                     .report("ath11k reset (too many failed recoveries)");
                 return;
@@ -2446,6 +2463,40 @@ pub fn device_caps<H: Hif, Q: QmiFw>(
     .ok_or(TransportError::new(step::MAC_CAPS, 4, ENODEV))
 }
 
+/// [`DeviceCaps`] for one radio of a multi-pdev part (see
+/// [`DeviceCaps::from_events_for`]): `None` caps (unknown pdev, or the
+/// firmware did not report enough extra MAC addresses) surface as the
+/// same `MAC_CAPS` failure, so the caller skips that radio.
+pub fn device_caps_for<H: Hif, Q: QmiFw>(
+    core: &Ath11kCore<H, Q>,
+    pdev_id: u32,
+) -> Result<DeviceCaps, TransportError> {
+    let mut missing = 0;
+    if core.svc_ext.is_none() {
+        missing |= 1;
+    }
+    if core.ready.is_none() {
+        missing |= 2;
+    }
+    if missing != 0 {
+        return Err(TransportError::new(step::MAC_CAPS, missing, ENODEV));
+    }
+    let sr = ServiceReady {
+        caps: Some(core.target_caps),
+        fw_build_vers: core.fw_build_vers,
+        svc_map: core.svc_map,
+        bitmap_seen: true,
+    };
+    DeviceCaps::from_events_for(
+        &sr,
+        core.svc_ext.as_ref().unwrap(),
+        core.ready.as_ref().unwrap(),
+        &core.svc_map,
+        pdev_id,
+    )
+    .ok_or(TransportError::new(step::MAC_CAPS, 4, ENODEV))
+}
+
 /// [`Shared::lock`]'s guard: the runtime, present (a recovery that owns it
 /// makes `lock` wait instead).
 #[allow(missing_debug_implementations)]
@@ -2634,6 +2685,16 @@ struct VdevBinding {
     name: Option<&'static str>,
     mac: [u8; 6],
 }
+
+/// Boxed transport-restart future: the restart closure's future borrows
+/// the `&mut Q` it is passed, so it cannot name a single concrete future
+/// type — it is boxed with the borrow's lifetime (same idiom as the
+/// `VirtualRecover` fn type in `iface.rs`).
+type RestartFut<'a, Q> = core::pin::Pin<
+    alloc::boxed::Box<
+        dyn core::future::Future<Output = Result<Option<Q>, TransportError>> + Send + 'a,
+    >,
+>;
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     pub fn new(rt: Rt<Io, Irq, Q>, rng: fn(&mut [u8]) -> Result<(), i32>) -> Arc<Self> {
@@ -3248,11 +3309,27 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// for the whole of it (no lock is held across the awaits; `lock`
     /// callers wait). On failure the step is latched, what the firmware
     /// was given is parked and the device is marked dead.
-    pub async fn recover_device(&self, notice: FwNotice) -> Result<Recovered, TransportError> {
+    pub async fn recover_device(
+        &self,
+        notice: FwNotice,
+        pdev_id: u32,
+    ) -> Result<Recovered, TransportError> {
+        let power_cycle = matches!(notice, FwNotice::Reset(_));
         self.rebuild_after_transport_reset(
-            matches!(notice, FwNotice::Reset(_)),
+            move |qmi: &mut Q| {
+                alloc::boxed::Box::pin(async move {
+                    qmi.recover(power_cycle).await.map(|()| None).map_err(|e| {
+                        TransportError::new(
+                            step::RECOVERY_FW,
+                            (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                            e.errno,
+                        )
+                    })
+                })
+            },
             true,
             matches!(notice, FwNotice::Reset(MhiNotify::EeRddm)),
+            pdev_id,
         )
         .await
     }
@@ -3262,19 +3339,61 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// `restart_work`, but it must not count toward the crash-reset failure
     /// throttling or be reported as a firmware failure.
     pub async fn resume_after_system_suspend(&self) -> Result<Recovered, TransportError> {
-        self.rebuild_after_transport_reset(true, false, false).await
+        self.rebuild_after_transport_reset(
+            move |qmi: &mut Q| {
+                alloc::boxed::Box::pin(async move {
+                    qmi.recover(true).await.map(|()| None).map_err(|e| {
+                        TransportError::new(
+                            step::RECOVERY_FW,
+                            (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                            e.errno,
+                        )
+                    })
+                })
+            },
+            false,
+            false,
+            0,
+        )
+        .await
+    }
+
+    /// AHB remote-restart recovery for the SMP2P crash monitor: the
+    /// caller-provided transport restart (remote shutdown + boot + a
+    /// fresh WLFW session) replaces the PCI MHI power cycle; the
+    /// reconstruction tail, failure throttling and park-on-failure are
+    /// shared. A crash counts toward the reset throttle; no coredump is
+    /// collected on this path (AHB coredump capture is not implemented).
+    pub async fn recover_after_remote_restart<F>(
+        &self,
+        restart: F,
+    ) -> Result<Recovered, TransportError>
+    where
+        F: for<'a> FnOnce(&'a mut Q) -> RestartFut<'a, Q>,
+    {
+        self.rebuild_after_transport_reset(restart, true, false, 0)
+            .await
     }
 
     /// The common reconstruction tail for a firmware-reset recovery and an
     /// expected system-suspend cold cycle. `record_recovery_failure` is true
     /// only for a transport-reported crash: system resume failures still park
     /// the unsafe runtime, but never consume reset-throttle budget.
-    async fn rebuild_after_transport_reset(
+    /// `pdev_id` selects the radio whose caps the returned [`Recovered`]
+    /// carries (0 = the legacy pdev-0 caps, as system resume uses).
+    /// The transport restart is caller-provided: the PCI path power-cycles MHI
+    /// and keeps the QMI session (`Ok(None)`); the AHB path restarts the
+    /// remote and supplies a fresh WLFW session (`Ok(Some(qmi))`).
+    async fn rebuild_after_transport_reset<F>(
         &self,
-        power_cycle: bool,
+        restart: F,
         record_recovery_failure: bool,
         collect_crash_dump: bool,
-    ) -> Result<Recovered, TransportError> {
+        pdev_id: u32,
+    ) -> Result<Recovered, TransportError>
+    where
+        F: for<'a> FnOnce(&'a mut Q) -> RestartFut<'a, Q>,
+    {
         // Firmware lost all pdev state. Recreated MAC instances must elect a
         // fresh first opener rather than inheriting the old open-vif count.
         self.radio_mac_users.store(0, Ordering::Release);
@@ -3310,18 +3429,17 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
                 self.publish_firmware_crash_dump(dump);
             }
         }
-        if let Err(e) = rt.core.qmi.recover(power_cycle).await {
-            let te = TransportError::new(
-                step::RECOVERY_FW,
-                (e.step & 0xffff) << 16 | (e.detail & 0xffff),
-                e.errno,
-            );
-            te.report("ath11k recovery: firmware");
-            if record_recovery_failure {
-                Self::recovery_failed(&mut rt);
+        match restart(&mut rt.core.qmi).await {
+            Ok(Some(q)) => rt.core.qmi = q,
+            Ok(None) => {}
+            Err(te) => {
+                te.report("ath11k recovery: firmware");
+                if record_recovery_failure {
+                    Self::recovery_failed(&mut rt);
+                }
+                self.park(alloc::boxed::Box::new(rt));
+                return Err(te);
             }
-            self.park(alloc::boxed::Box::new(rt));
-            return Err(te);
         }
         // restart_work → ath11k_core_reconfigure_on_crash.
         let Rt {
@@ -3385,7 +3503,16 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         rt.vdevs = vdevs;
         rt.stats = stats;
         rt.reset = reset;
-        let r = match rt.device_caps() {
+        // The caps belong to the recovering netdev's radio, not pdev 0:
+        // a radio-1 netdev rebuilt with radio-0 bands/chains/MAC would
+        // come up as the wrong radio. Pdev 0 keeps the legacy path
+        // exactly (system resume passes 0).
+        let caps_r = if pdev_id == 0 {
+            rt.device_caps()
+        } else {
+            rt.device_caps_for(pdev_id)
+        };
+        let r = match caps_r {
             Ok(caps) => Ok(Recovered {
                 caps,
                 reg_info: rt.core.reg_info.clone(),
@@ -3482,6 +3609,14 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// `ath11k_wmi_cmd_send`: retry while HTC lacks credits (or the CE
     /// ring is full without credit flow) for `WMI_SEND_TIMEOUT_HZ`.
     pub async fn wmi_send(&self, cmd: &WmiCmd) -> Result<(), i32> {
+        self.wmi_send_on(0, cmd).await
+    }
+
+    /// [`Self::wmi_send`] on `wmi_ab.wmi[pdev]` (pdev order; index 0 is
+    /// the soc / pdev-0 handle, so this is [`Self::wmi_send`] for
+    /// index 0). A port's pdev selects its endpoint; see
+    /// [`super::core::Ath11kCore::wmi_cmd_try_send_on`].
+    pub async fn wmi_send_on(&self, pdev: u32, cmd: &WmiCmd) -> Result<(), i32> {
         enum Try {
             Done,
             Retry(i32),
@@ -3492,7 +3627,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
             let t = {
                 let mut g = self.lock().await;
                 g.service();
-                match g.core.wmi_cmd_try_send(cmd) {
+                match g.core.wmi_cmd_try_send_on(pdev, cmd) {
                     Ok(()) => Try::Done,
                     // "if (ret && CRASH_FLUSH) ret = -ESHUTDOWN"
                     Err(_) if g.crash_flush => Try::Fail(ESHUTDOWN),
@@ -3805,17 +3940,23 @@ pub struct Port<Io: RtIo, Irq: DpIrq, Q: RtQmi>(
     pub Arc<Shared<Io, Irq, Q>>,
     /// The only WMI vdev this port is allowed to consume or mutate.
     pub u32,
+    /// The pdev (`wmi_ab.wmi[pdev]`, `ar->pdev->pdev_id`) whose WMI
+    /// endpoint this port's commands go to and whose DP rings its
+    /// peer setup configures. Vdev slots are global across radios,
+    /// so the vdev alone cannot identify a radio once more than one
+    /// exists; the pdev is what routes commands to the right radio.
+    pub u32,
 );
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Clone for Port<Io, Irq, Q> {
     fn clone(&self) -> Self {
-        Port(self.0.clone(), self.1)
+        Port(self.0.clone(), self.1, self.2)
     }
 }
 
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WmiPort for Port<Io, Irq, Q> {
     async fn send(&self, cmd: WmiCmd) -> Result<(), i32> {
-        self.0.wmi_send(&cmd).await
+        self.0.wmi_send_on(self.2, &cmd).await
     }
 
     async fn next_event(&self, timeout_ms: u32) -> Option<Vec<u8>> {
@@ -3835,7 +3976,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WmiPort for Port<Io, Irq, Q> {
             let mut g = self.0.lock().await;
             g.mgmt_tx_prepare(vdev_id, frame, chanfreq)?
         };
-        match self.0.wmi_send(&cmd).await {
+        match self.0.wmi_send_on(self.2, &cmd).await {
             Ok(()) => {
                 let mut g = self.0.lock().await;
                 g.mgmt.pending += 1;
@@ -3874,7 +4015,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
         let msgs: Vec<Vec<u8>> = {
             let g = self.0.lock().await;
             htt::ppdu_stats_cfg_msgs(
-                0,
+                self.2,
                 g.dp.cfg.num_rxdma_per_pdev,
                 htt::HTT_PPDU_STATS_TAG_DEFAULT,
             )
@@ -4029,10 +4170,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
         // ath11k_dp_peer_setup(ar, vdev_id, addr): reo_dest = mac_id + 1.
         let (mut op, cmd) = {
             let g = self.0.lock().await;
-            g.dp.peer_setup_begin(vdev_id as u8, addr, 0)
+            g.dp.peer_setup_begin(vdev_id as u8, addr, self.2)
         };
         // WMI_PEER_SET_DEFAULT_ROUTING: "failed to set default routing".
-        self.0.wmi_send(&cmd).await?;
+        self.0.wmi_send_on(self.2, &cmd).await?;
         loop {
             let next = {
                 let mut g = self.0.lock().await;
@@ -4044,7 +4185,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
             };
             match next {
                 Ok(Some(cmd)) => {
-                    if let Err(e) = self.0.wmi_send(&cmd).await {
+                    if let Err(e) = self.0.wmi_send_on(self.2, &cmd).await {
                         let mut g = self.0.lock().await;
                         let now = g.now_ms();
                         let rt = &mut *g;
@@ -4259,7 +4400,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
                 )
                 .map_err(|e| e.errno)?
         };
-        if let Err(e) = self.0.wmi_send(&setup.cmd).await {
+        if let Err(e) = self.0.wmi_send_on(self.2, &setup.cmd).await {
             // "failed to setup rx reorder queue": ath11k_dp_rx_tid_mem_free.
             let mut g = self.0.lock().await;
             g.dp.rx_tid_wmi_failed(vdev_id as u8, &addr, &setup);
@@ -4280,7 +4421,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
         };
         match cmd {
             // "failed to send wmi to delete rx tid".
-            Some(c) => self.0.wmi_send(&c).await,
+            Some(c) => self.0.wmi_send_on(self.2, &c).await,
             None => Ok(()),
         }
     }
@@ -4413,37 +4554,76 @@ impl Shared<super::core::Bar0, MsiCeIrq, super::pci::Wlfw> {
 static STRANDED_RT: IrqSafeSpinLock<Option<Arc<PciShared>>> = IrqSafeSpinLock::new(None);
 
 /// After `ath11k_core_qmi_firmware_ready`: `ath11k_mac_register` (the
-/// mac layer from the bring-up events), then the netdev and its tasks.
-/// The hardware starts when the interface goes up (`ieee80211_do_open`
-/// → `ath11k_mac_op_start` + `ath11k_mac_op_add_interface`, in
-/// [`super::iface`]). Failures are latched by the layer that failed;
-/// nothing here panics or blocks the caller (it runs in the
-/// probe-spawned MHI task).
+/// mac layer from the bring-up events), then one netdev and its tasks
+/// per allocated pdev. The hardware starts when the interface goes up
+/// (`ieee80211_do_open` → `ath11k_mac_op_start` +
+/// `ath11k_mac_op_add_interface`, in [`super::iface`]). Failures are
+/// latched by the layer that failed; nothing here panics or blocks the
+/// caller (it runs in the probe-spawned MHI task).
 pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
     let rt = Rt::new(core, dp);
-    let caps = match rt.device_caps() {
-        Ok(c) => c,
-        Err(e) => {
-            e.report("ath11k mac register");
-            *STRANDED_RT.lock() = Some(Shared::new(rt, secure_random));
-            return;
+    // One MAC + netdev per allocated pdev (`ath11k_mac_register` per
+    // `ar`), in allocation order, each on its own global vdev slot.
+    // The single-pdev path is exactly the old one: pdev 0, vdev slot 0,
+    // `wcn6855()` config, and a caps failure strands the runtime.
+    let pdevs = rt.dp.pdev_mac_ids();
+    let single = pdevs.len() <= 1;
+    let num_rxdma = rt.dp.cfg.num_rxdma_per_pdev;
+    let mut radios: Vec<(u32, DeviceCaps)> = Vec::new();
+    for mac_id in &pdevs {
+        let r = if single {
+            rt.device_caps()
+        } else {
+            rt.device_caps_for(*mac_id)
+        };
+        match r {
+            Ok(c) => radios.push((*mac_id, c)),
+            Err(e) => {
+                if single {
+                    e.report("ath11k mac register");
+                    *STRANDED_RT.lock() = Some(Shared::new(rt, secure_random));
+                    return;
+                }
+                // A later radio's caps failure only skips that radio:
+                // its MAC address is unknowable without the READY extra
+                // addresses, and the other radios still come up.
+                log(format_args!(
+                    "ath11k mac register: radio pdev {} skipped: step {} detail {:#x} (-{})",
+                    mac_id, e.step, e.detail, e.errno
+                ));
+            }
         }
-    };
+    }
+    if radios.is_empty() {
+        // No radio registered (unreachable after a successful
+        // `pdev_create`, which allocates at least pdev 0): park the
+        // runtime as the single-pdev failure does.
+        *STRANDED_RT.lock() = Some(Shared::new(rt, secure_random));
+        return;
+    }
     let initial_reg = rt.core.reg_info.clone();
     let shared = Shared::new(rt, secure_random);
-    let mac = super::mac::Mac::new(
-        Port(shared.clone(), 0),
-        Port(shared.clone(), 0),
-        caps.clone(),
-        super::mac::MacConfig::wcn6855(),
-        initial_reg.as_deref(),
-    );
-    let m = caps.mac_addr;
-    let name = super::iface::register_pci(shared, mac, m);
-    log(format_args!(
-        "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
-        name, m[0], m[1], m[2], m[3], m[4], m[5]
-    ));
+    for (slot, (mac_id, caps)) in radios.iter().enumerate() {
+        let slot = slot as u32;
+        let cfg = if single {
+            super::mac::MacConfig::wcn6855()
+        } else {
+            super::mac::MacConfig::for_radio(num_rxdma).with_vdev(slot)
+        };
+        let mac = super::mac::Mac::new(
+            Port(shared.clone(), slot, *mac_id),
+            Port(shared.clone(), slot, *mac_id),
+            caps.clone(),
+            cfg,
+            initial_reg.as_deref(),
+        );
+        let m = caps.mac_addr;
+        let name = super::iface::register_pci(shared.clone(), mac, m, slot);
+        log(format_args!(
+            "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
+            name, m[0], m[1], m[2], m[3], m[4], m[5]
+        ));
+    }
 }
 
 /// `hw_ops->get_ring_selector` input for a TX frame: the current CPU

@@ -1,11 +1,17 @@
-//! ASIX AX88179 USB 3.0 to 10/100/1000M Gigabit Ethernet driver — core.
+//! ASIX AX88179 USB 3.0 to 10/100/1000M Gigabit Ethernet driver — core
+//! + audit item 2.
 //!
 //! Implements issue #788 part 1 (audit §7 item 1): probe, vendor control
 //! transport, reset, Clause 22 PHY, MAC read, TX/RX framing, publication
-//! as `usb-ax{N}`, and tombstone detach. Link-status interrupt, offload
-//! advertisement, and multicast filter are audit item 2 (separate lane);
-//! LAN95xx is item 3 (separate lane); VLAN handling and jumbo frames are
-//! UNGROUNDED per audit §6 and are not included.
+//! as `usb-ax{N}`, and tombstone detach; plus audit item 2: the
+//! link-status interrupt path (interrupt endpoint, PHYSR/medium/
+//! bulkin link-change, speed + duplex reporting), TX/RX offload
+//! advertisement (TX checksum accepted, RX checksum deliberately
+//! unadvertised — no verdict channel in `on_rx_frame_from`, the
+//! r8152 limitation), and multicast filter programming via the
+//! stack's `DeviceControl` hook. LAN95xx is item 3 (separate lane);
+//! VLAN handling and jumbo frames are UNGROUNDED per audit §6 and
+//! are not included.
 //!
 //! ## Grounding (read before touching a constant)
 //!
@@ -62,7 +68,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::class_registry::{register_class_driver_with_unbind, UsbClassMatch, UsbProbeError};
 use crate::device::USBDevice;
-use crate::r8152::find_rtl_endpoints;
+use crate::r8152::{find_rtl_endpoints, find_rtl_interrupt_endpoint};
 
 // ── Vendor control transport ───────────────────────────────────────
 
@@ -85,8 +91,22 @@ pub const AX_RX_CTL_DROPCRCERR: u16 = 0x0100;
 pub const AX_RX_CTL_IPE: u16 = 0x0200;
 pub const AX_RX_CTL_START: u16 = 0x0080;
 pub const AX_RX_CTL_AP: u16 = 0x0020;
+pub const AX_RX_CTL_AM: u16 = 0x0010;
 pub const AX_RX_CTL_AMALL: u16 = 0x0002;
 pub const AX_RX_CTL_AB: u16 = 0x0008;
+pub const AX_RX_CTL_PRO: u16 = 0x0001;
+pub const AX_RX_CTL_STOP: u16 = 0x0000;
+
+/// RX control programmed by the reset sequence (Linux `ax88179_reset`):
+/// the single source of truth for the record's tracked `rxctl` — the
+/// link-change path restores exactly this value, and the multicast
+/// hook replaces it with its own computed value.
+pub const AX_RX_CTL_RESET: u16 = AX_RX_CTL_DROPCRCERR
+    | AX_RX_CTL_IPE
+    | AX_RX_CTL_START
+    | AX_RX_CTL_AP
+    | AX_RX_CTL_AMALL
+    | AX_RX_CTL_AB;
 
 /// Station address, 6 bytes, read via MAC access (Linux `:65`).
 pub const AX_NODE_ID: u16 = 0x10;
@@ -126,6 +146,55 @@ pub const AX_COE_TCP: u8 = 0x02;
 pub const AX_COE_UDP: u8 = 0x04;
 pub const AX_COE_TCPV6: u8 = 0x20;
 pub const AX_COE_UDPV6: u8 = 0x40;
+
+// ── Link-status interrupt + link-change (audit item 2) ───────────
+
+/// Link bit in the interrupt event's first word (Linux `:22`,
+/// `ax88179_status`: `link = (intdata1 & AX_INT_PPLS_LINK) >> 16`).
+pub const AX_INT_PPLS_LINK: u32 = 1 << 16;
+
+/// USB link-status byte (Linux `:38–40`).
+pub const AX_PHYSICAL_LINK_STATUS: u16 = 0x02;
+pub const AX_USB_SS: u8 = 0x04;
+pub const AX_USB_HS: u8 = 0x02;
+
+/// PHY status page (Linux `:116–121`).
+pub const GMII_PHY_PHYSR: u16 = 0x11;
+pub const GMII_PHY_PHYSR_SMASK: u16 = 0xC000;
+pub const GMII_PHY_PHYSR_GIGA: u16 = 0x8000;
+pub const GMII_PHY_PHYSR_100: u16 = 0x4000;
+pub const GMII_PHY_PHYSR_FULL: u16 = 0x2000;
+pub const GMII_PHY_PHYSR_LINK: u16 = 0x0400;
+
+/// Medium-mode bits used only by the link-change path (Linux
+/// `:69–76`); the reset-programmed bits live above.
+pub const AX_MEDIUM_EN_125MHZ: u16 = 0x08;
+pub const AX_MEDIUM_PS: u16 = 0x200;
+
+/// Bulk-IN queue table, indexed by link speed + USB speed
+/// (Linux `AX88179_BULKIN_SIZE`: [0] SS giga, [1] HS giga,
+/// [2] SS/HS 100M, [3] everything else). Entry [0] is also the
+/// reset-programmed value (see `RESET_POST`).
+pub const AX_RX_BULKIN_SIZE: &[[u8; 5]] = &[
+    [0x07, 0x4F, 0x00, 0x12, 0xFF],
+    [0x07, 0x20, 0x03, 0x16, 0xFF],
+    [0x07, 0xAE, 0x07, 0x18, 0xFF],
+    [0x07, 0xCC, 0x4C, 0x18, 0x08],
+];
+
+/// TX FIFO quiesce poll (Linux `ax88179_link_reset`): a vendor IN
+/// request (`bRequest` 0x81, `wValue` 0x8c, 4 bytes) whose bit
+/// 0x40000000 reports TX FIFO busy. The register meaning is
+/// driver-observed, not datasheet-verified — only the wire
+/// behavior (request, bit, 100 ms budget) is pinned.
+pub const AX_TX_FIFO_STATUS_REQ: u8 = 0x81;
+pub const AX_TX_FIFO_STATUS_VALUE: u16 = 0x8C;
+pub const AX_TX_FIFO_BUSY: u32 = 0x4000_0000;
+
+/// Multicast filter (Linux `:20–21`, `:66`, `:867–905`).
+pub const AX_MULFLTARY: u16 = 0x16;
+pub const AX_MCAST_FLTSIZE: usize = 8;
+pub const AX_MAX_MCAST: usize = 64;
 
 // ── PHY (IEEE 802.3 Clause 22 standard registers) ──────────────────
 
@@ -303,6 +372,154 @@ pub fn parse_rx_aggregate(buf: &[u8]) -> AxRxOutcome {
     out
 }
 
+// ── Item-2 pure functions (fixture-pinned) ────────────────────────
+
+/// Decode one interrupt-IN transfer (Linux `ax88179_status`):
+/// the event is two little-endian words; link state is bit 16
+/// of the first. Transfers shorter than 8 bytes carry no event
+/// and are ignored, exactly like the reference.
+pub fn ax_interrupt_link(buf: &[u8]) -> Option<bool> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let intdata1 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    Some(intdata1 & AX_INT_PPLS_LINK != 0)
+}
+
+/// Link-change computation (Linux `ax88179_link_reset`, minus the
+/// EEE check and the jumbo branch — neither is in this lane):
+/// from the USB link-status byte and the PHY status page, the
+/// medium-mode word, the bulk-IN queue entry, the negotiated
+/// speed in Mbps, and the duplex. `None` when the PHY reports
+/// no link. The caller programs bulkin + medium mode and
+/// publishes speed + duplex; it must NOT publish a mode on
+/// `None` (the interrupt's carrier verdict still stands —
+/// Linux leaves carrier up when `link_reset` finds no PHY link).
+pub fn ax_link_mode(
+    link_sts: u8,
+    physr: u16,
+) -> Option<(u16, [u8; 5], u32, narf_net::iface::LinkDuplex)> {
+    if physr & GMII_PHY_PHYSR_LINK == 0 {
+        return None;
+    }
+    let mut mode = AX_MEDIUM_RECEIVE_EN | AX_MEDIUM_TXFLOW_CTRLEN | AX_MEDIUM_RXFLOW_CTRLEN;
+    let (bulkin, speed) = match physr & GMII_PHY_PHYSR_SMASK {
+        GMII_PHY_PHYSR_GIGA => {
+            mode |= AX_MEDIUM_GIGAMODE | AX_MEDIUM_EN_125MHZ;
+            let b = if link_sts & AX_USB_SS != 0 {
+                AX_RX_BULKIN_SIZE[0]
+            } else if link_sts & AX_USB_HS != 0 {
+                AX_RX_BULKIN_SIZE[1]
+            } else {
+                AX_RX_BULKIN_SIZE[3]
+            };
+            (b, 1000)
+        }
+        GMII_PHY_PHYSR_100 => {
+            mode |= AX_MEDIUM_PS;
+            let b = if link_sts & (AX_USB_SS | AX_USB_HS) != 0 {
+                AX_RX_BULKIN_SIZE[2]
+            } else {
+                AX_RX_BULKIN_SIZE[3]
+            };
+            (b, 100)
+        }
+        _ => (AX_RX_BULKIN_SIZE[3], 10),
+    };
+    let duplex = if physr & GMII_PHY_PHYSR_FULL != 0 {
+        mode |= AX_MEDIUM_FULL_DUPLEX;
+        narf_net::iface::LinkDuplex::Full
+    } else {
+        narf_net::iface::LinkDuplex::Half
+    };
+    Some((mode, bulkin, speed, duplex))
+}
+
+/// Ethernet CRC for the multicast filter (Linux `ether_crc`:
+/// `bitrev32(crc32_le(~0, addr, 6))`, `include/linux/crc32.h`).
+/// Bitwise reflected CRC-32 (polynomial 0xEDB88320), seeded
+/// all-ones, with NO final inversion (that is the `crc32_le`
+/// semantic — the final xor belongs to zlib-style callers, not
+/// here); the 32-bit reversal is `u32::reverse_bits`.
+pub fn ax_ether_crc(addr: &[u8; 6]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in addr.iter() {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc.reverse_bits()
+}
+
+/// Multicast programming (Linux `ax88179_set_multicast`, exact):
+/// from (promiscuous, all-multicast, multicast addresses) to
+/// (RX control, filter). The filter is `Some` only for a
+/// non-empty filtered list; promiscuous wins over all-multicast
+/// (the Linux if/else-if chain); more than `AX_MAX_MCAST`
+/// addresses fall back to accept-all-multicast. Note the base
+/// drops `DROPCRCERR` and `AP` relative to `AX_RX_CTL_RESET` —
+/// Linux recomputes from the same base on every call, and
+/// directed delivery is unaffected (CRC-error frames are still
+/// dropped by the RX parse; `AP` is never the directed gate,
+/// since Linux filtering works without it).
+pub fn ax_multicast_program(
+    promiscuous: bool,
+    all_multicast: bool,
+    addrs: &[[u8; 6]],
+) -> (u16, Option<[u8; AX_MCAST_FLTSIZE]>) {
+    let base = AX_RX_CTL_START | AX_RX_CTL_AB | AX_RX_CTL_IPE;
+    if promiscuous {
+        (base | AX_RX_CTL_PRO, None)
+    } else if all_multicast || addrs.len() > AX_MAX_MCAST {
+        (base | AX_RX_CTL_AMALL, None)
+    } else if addrs.is_empty() {
+        (base, None)
+    } else {
+        let mut filter = [0u8; AX_MCAST_FLTSIZE];
+        for addr in addrs {
+            let bits = ax_ether_crc(addr) >> 26;
+            filter[(bits >> 3) as usize] |= 1 << (bits & 7);
+        }
+        (base | AX_RX_CTL_AM, Some(filter))
+    }
+}
+
+/// Offload capabilities advertised at bind (mirrors
+/// `r8152_offloads`): TX checksum generation is real — the chip
+/// computes TCP/UDP checksums whenever TXCOE is programmed
+/// (bind), and Linux `tx_fixup` sets no per-frame checksum bit
+/// (only GSO size + the padding flag). RX checksum metadata is
+/// NOT advertised: the RX metadata's L3/L4 error bits have no
+/// delivery channel in `on_rx_frame_from` (same limitation as
+/// r8152), so csum-error frames keep being delivered and the
+/// stack revalidates (pinned by `rx_runt_and_csum_bits`).
+/// TSO and VLAN insertion are not advertised: no GSO size is
+/// ever programmed (`tx_hdr2` stays 0) and VLAN handling is
+/// UNGROUNDED per audit §6.
+pub fn ax88179_offloads() -> narf_net::OffloadCapabilities {
+    narf_net::OffloadCapabilities {
+        tx_checksum: true,
+        rx_checksum: false,
+        max_tso_bytes: 0,
+        vlan_insert: false,
+    }
+}
+
+/// TX offload acceptance for `ax_send_frame`: TCP/UDP checksum
+/// requests are accepted (chip-computed, see `ax88179_offloads`);
+/// SCTP is rejected (no TXCOE bit covers it — same rule as
+/// r8152); TSO and VLAN insertion are rejected (unprogrammed).
+pub fn ax_tx_meta_accepted(meta: narf_net::TxMeta) -> bool {
+    !matches!(meta.csum_l4, Some(narf_net::L4CsumKind::Sctp))
+        && meta.tso_mss.is_none()
+        && meta.vlan_tag.is_none()
+}
+
 // ── Reset program (ordered MAC writes; fixture-pinned) ─────────────
 
 /// One fixed reset write: register + payload. The executor derives
@@ -335,12 +552,11 @@ pub const RESET_CLK: AxMacWrite = AxMacWrite {
 
 /// Reset writes after the MAC read (Linux reset order): bulk-IN
 /// queue config (`BULKIN_SIZE[0]`, the SuperSpeed/giga entry —
-/// entries [1]–[3] are link-speed variants for the link-change path,
-/// audit item 2), pause watermarks, checksum offload controls
-/// (written but unadvertised in v1), RX control (drop-CRC + IP
-/// parsing + start + accept-all-multicast + accept-broadcast),
-/// monitor mode, medium mode (giga + full-duplex + flow control +
-/// receive enable).
+/// entries [1]–[3] are link-speed variants for the link-change
+/// path, audit item 2), pause watermarks, checksum offload
+/// controls (advertised by item 2 via `set_offloads`), RX control
+/// (`AX_RX_CTL_RESET`), monitor mode, medium mode (giga +
+/// full-duplex + flow control + receive enable).
 pub const RESET_POST: &[AxMacWrite] = &[
     AxMacWrite {
         reg: AX_RX_BULKIN_QCTRL,
@@ -364,21 +580,7 @@ pub const RESET_POST: &[AxMacWrite] = &[
     },
     AxMacWrite {
         reg: AX_RX_CTL,
-        data: &[
-            (AX_RX_CTL_DROPCRCERR
-                | AX_RX_CTL_IPE
-                | AX_RX_CTL_START
-                | AX_RX_CTL_AP
-                | AX_RX_CTL_AMALL
-                | AX_RX_CTL_AB) as u8,
-            ((AX_RX_CTL_DROPCRCERR
-                | AX_RX_CTL_IPE
-                | AX_RX_CTL_START
-                | AX_RX_CTL_AP
-                | AX_RX_CTL_AMALL
-                | AX_RX_CTL_AB)
-                >> 8) as u8,
-        ],
+        data: &[(AX_RX_CTL_RESET as u8), ((AX_RX_CTL_RESET >> 8) as u8)],
     },
     AxMacWrite {
         reg: AX_MONITOR_MOD,
@@ -544,15 +746,28 @@ async fn auto_detach_best_effort(dev: &USBDevice) {
 pub struct AxDevice {
     pub controller: u8,
     pub slot_id: u8,
+    /// Owning xHCI controller id ([`Xhci::id`]): slot ids are only
+    /// unique within one controller, so TX and detach resolve the
+    /// controller through this field, never a global accessor.
+    pub controller: u8,
     pub mac: [u8; 6],
     pub bulk_in_dci: u8,
     pub bulk_out_dci: u8,
     /// Bulk-OUT endpoint max packet (TX padding-flag divisor).
     pub out_max_packet: u16,
+    /// Interrupt-IN endpoint DCI, when the device exposes one
+    /// (`None` = BMSR polling is the only carrier source).
+    pub int_dci: Option<u8>,
+    /// Currently programmed RX control. Bind sets
+    /// `AX_RX_CTL_RESET`; the multicast hook and the link-change
+    /// path keep it in sync with hardware. Read under the lock,
+    /// never held across an await (AGENTS.md lock rule).
+    pub rxctl: u16,
     /// Assigned `narf_net::iface` name (`usb-ax{N}`).
     pub iface_name: String,
     pub pump_running: bool,
-    /// Last sampled carrier state (BMSR link bit).
+    /// Last published carrier state (interrupt event or BMSR
+    /// sample, whichever changed it most recently).
     pub link_up: bool,
     /// Detach tombstone: set by `detach_ax_slot`. The pump exits
     /// when `pump_running` clears; TX resolves to `None`.
@@ -589,16 +804,18 @@ fn ax_send_segment(controller: u8, slot_id: u8, bulk_out_dci: u8, seg: &[u8]) ->
     Ok(())
 }
 
-/// Send one frame for the device record at `idx`. v1 sends plain
-/// frames only: any stack offload request (L4 checksum, TSO, VLAN
-/// insert) is rejected rather than sent with a partial offload —
-/// nothing is advertised via `set_offloads` in v1 (audit item 2),
-/// so a request here is a stack/driver mismatch, not a normal path.
+/// Send one frame for the device record at `idx`. Offload
+/// requests the chip cannot honour (SCTP checksum, TSO, VLAN
+/// insert — see `ax_tx_meta_accepted`) are rejected rather than
+/// sent with a partial offload; a request here is a
+/// stack/driver mismatch, not a normal path, because the
+/// advertised caps (`ax88179_offloads`) never promise them.
 fn ax_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    if meta.csum_l4.is_some() || meta.tso_mss.is_some() || meta.vlan_tag.is_some() {
+    if !ax_tx_meta_accepted(meta) {
         return Err(());
     }
-    let (controller, slot_id, bulk_out_dci, out_max_packet) = tx_target(idx).ok_or(())?;
+    let (slot_id, bulk_out_dci, out_max_packet) = tx_target(idx).ok_or(())?;
+    let controller = AX_DEVICES.lock().get(idx).ok_or(())?.controller;
     let seg = build_tx_segment(frame, out_max_packet);
     ax_send_segment(controller, slot_id, bulk_out_dci, &seg)
 }
@@ -612,8 +829,12 @@ fn ax_send_ctx(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), 
 /// Sample carrier state from the PHY BMSR link bit. The bit is
 /// latched-low per IEEE 802.3, so it is read twice and the second
 /// read is used (the first read clears a latched-down state).
-/// Speed/duplex are not reported in v1 (they need the ASIX PHY
-/// status page decode, audit item 2 territory) — carrier only.
+/// Carrier only — speed/duplex come from the interrupt
+/// link-change path (item 2); this poll stays as the fallback
+/// carrier source when no interrupt endpoint exists, and as a
+/// reconciler when an interrupt event is missed. Publishes on
+/// change only, so it never overwrites the interrupt path's
+/// speed/duplex for an unchanged carrier state.
 async fn sample_link(dev: &USBDevice, idx: usize) {
     let Ok(_) = phy_read(dev, MII_BMSR).await else {
         return;
@@ -634,6 +855,255 @@ async fn sample_link(dev: &USBDevice, idx: usize) {
         rec.iface_name.clone()
     };
     narf_net::iface::set_link_metadata(&name, up, None, None);
+}
+
+// ── Item-2 runtime paths ───────────────────────────────────────────
+
+/// `DeviceControl` for one bound AX88179 record: programs the
+/// multicast filter + RX control from the stack's `DeviceConfig`
+/// (Linux `ax88179_set_multicast`). This is the first in-tree
+/// `DeviceControl` implementation; the trait is sync while the
+/// hardware path is async, so `configure` bridges via `block_on`
+/// (same contract as `ax_send_segment`: the caller is not inside
+/// an executor poll, and no lock is held across the `block_on` —
+/// AGENTS.md lock rule). The record's tracked `rxctl` is updated
+/// only after both writes succeed; a failed write leaves
+/// hardware and record unchanged, and the stack keeps its old
+/// metadata on `Err` (per the `DeviceConfig` contract: "an error
+/// leaves metadata unchanged").
+pub struct AxDeviceControl {
+    device: Arc<USBDevice>,
+    idx: usize,
+}
+
+// Manual `Debug` (`USBDevice` is `Clone`-only, so a derived impl
+// would fail): slot + record index identify the binding.
+impl core::fmt::Debug for AxDeviceControl {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AxDeviceControl")
+            .field("slot_id", &self.device.slot_id())
+            .field("idx", &self.idx)
+            .finish()
+    }
+}
+
+impl narf_net::iface::DeviceControl for AxDeviceControl {
+    fn configure(&self, config: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+        // Stack errno convention (positive, Linux numbers — see
+        // `configure_device`): ENODEV when the record is gone,
+        // EIO when a hardware write fails.
+        const ENODEV: i32 = 19;
+        const EIO: i32 = 5;
+        // Filter members are multicast addresses only: unicast
+        // entries are the station address, not filter members.
+        let mc: Vec<[u8; 6]> = config
+            .addresses
+            .iter()
+            .filter(|a| !a.unicast)
+            .map(|a| a.addr)
+            .collect();
+        let (rxctl, filter) = ax_multicast_program(config.promiscuous, config.all_multicast, &mc);
+        // Detach check before touching hardware (re-checked
+        // under the lock after the writes, before updating).
+        {
+            let g = AX_DEVICES.lock();
+            if g.get(self.idx).map(|d| d.detached).unwrap_or(true) {
+                return Err(ENODEV);
+            }
+        }
+        let device = self.device.clone();
+        let ok = narf_scheduler::block_on(async move {
+            if let Some(f) = filter {
+                ax_write(
+                    &device,
+                    AX_ACCESS_MAC,
+                    AX_MULFLTARY,
+                    AX_MCAST_FLTSIZE as u16,
+                    &f,
+                )
+                .await?;
+            }
+            ax_write_u16(&device, AX_ACCESS_MAC, AX_RX_CTL, 2, rxctl).await
+        })
+        .is_ok();
+        if !ok {
+            return Err(EIO);
+        }
+        let mut g = AX_DEVICES.lock();
+        let Some(rec) = g.get_mut(self.idx) else {
+            return Err(ENODEV);
+        };
+        if rec.detached {
+            return Err(ENODEV);
+        }
+        rec.rxctl = rxctl;
+        Ok(())
+    }
+}
+
+/// Link-change path (Linux `ax88179_link_reset`, minus the EEE
+/// check and the jumbo branch — neither is in this lane).
+/// Quiesces TX (STOP/restore + FIFO poll, 100 ms budget: 100
+/// iterations of up to 1 ms), reads link status + PHYSR,
+/// programs bulkin + medium mode. Returns the negotiated
+/// (speed Mbps, duplex) on success, `None` when the PHY
+/// reports no link or any transfer fails. On FIFO-poll
+/// timeout the receiver is left running on the old medium
+/// config (rxctl restored, no reprogramming) — the same
+/// early return Linux makes — and the caller still publishes
+/// the interrupt's carrier verdict with unknown mode.
+async fn ax_link_change(dev: &USBDevice, idx: usize) -> Option<(u32, narf_net::iface::LinkDuplex)> {
+    // Tracked rxctl, read before any await (no lock across
+    // awaits). A multicast configure landing mid-path may
+    // restore a newer rxctl afterwards; the next link event
+    // reconciles — last writer wins, same as the two carrier
+    // publishers.
+    let rxctl = {
+        let g = AX_DEVICES.lock();
+        g.get(idx).map(|d| d.rxctl).unwrap_or(AX_RX_CTL_RESET)
+    };
+    let mut drained = false;
+    for _ in 0..100 {
+        if ax_write_u16(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, AX_RX_CTL_STOP)
+            .await
+            .is_err()
+        {
+            break;
+        }
+        if ax_write_u16(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, rxctl)
+            .await
+            .is_err()
+        {
+            break;
+        }
+        let mut sts = [0u8; 4];
+        match dev
+            .control_in(
+                AX_REQT_READ,
+                AX_TX_FIFO_STATUS_REQ,
+                AX_TX_FIFO_STATUS_VALUE,
+                0,
+                &mut sts,
+            )
+            .await
+        {
+            Ok(n) if n == 4 => {
+                if u32::from_le_bytes(sts) & AX_TX_FIFO_BUSY == 0 {
+                    drained = true;
+                    break;
+                }
+            }
+            // A failed read counts as still-busy: the budget
+            // expires safely instead of programming blind.
+            _ => {}
+        }
+        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+    }
+    if !drained {
+        let _ = ax_write_u16(dev, AX_ACCESS_MAC, AX_RX_CTL, 2, rxctl).await;
+        return None;
+    }
+    let Ok(link_sts) = ax_read_u8(dev, AX_ACCESS_MAC, AX_PHYSICAL_LINK_STATUS, 1).await else {
+        return None;
+    };
+    let Ok(physr) = phy_read(dev, GMII_PHY_PHYSR).await else {
+        return None;
+    };
+    let Some((mode, bulkin, speed, duplex)) = ax_link_mode(link_sts, physr) else {
+        return None;
+    };
+    if ax_write(dev, AX_ACCESS_MAC, AX_RX_BULKIN_QCTRL, 5, &bulkin)
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    if ax_write_u16(dev, AX_ACCESS_MAC, AX_MEDIUM_STATUS_MODE, 2, mode)
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    Some((speed, duplex))
+}
+
+/// Handle one decoded interrupt event (Linux `ax88179_status`
+/// → `usbnet_link_change` → `link_reset`): publish + run the
+/// link-change path on carrier change only. On link-up the
+/// carrier verdict comes from the interrupt even when the
+/// link-change path fails (unknown mode); on link-down the
+/// stack clears speed/duplex (see `update_link_metadata`).
+async fn handle_status_event(dev: &USBDevice, idx: usize, up: bool) {
+    let name = {
+        let mut g = AX_DEVICES.lock();
+        let Some(rec) = g.get_mut(idx) else {
+            return;
+        };
+        if rec.detached || rec.link_up == up {
+            return;
+        }
+        rec.link_up = up;
+        rec.iface_name.clone()
+    };
+    if !up {
+        narf_net::iface::set_link_metadata(&name, false, None, None);
+        return;
+    }
+    match ax_link_change(dev, idx).await {
+        Some((speed, duplex)) => {
+            narf_net::iface::set_link_metadata(&name, true, Some(speed), Some(duplex));
+        }
+        None => {
+            narf_net::iface::set_link_metadata(&name, true, None, None);
+        }
+    }
+}
+
+/// Interrupt-IN status task (Linux `ax88179_status`): arm once,
+/// then poll — `poll_interrupt_in` re-arms after every
+/// completion (btusb pattern), so exactly one transfer stays
+/// outstanding. Short transfers are ignored; only carrier
+/// changes publish. Exits on detach or a bounded run of
+/// consecutive transfer errors (a removed device surfaces as
+/// persistent errors, same bound as the RX pump).
+async fn status_task(device: Arc<USBDevice>, idx: usize) {
+    let int_dci = {
+        let g = AX_DEVICES.lock();
+        match g.get(idx).and_then(|d| d.int_dci) {
+            Some(d) => d,
+            None => return,
+        }
+    };
+    if device.arm_interrupt_in(int_dci, 8).is_err() {
+        return;
+    }
+    let mut buf = [0u8; 8];
+    let mut errors = 0u32;
+    loop {
+        let detached = {
+            let g = AX_DEVICES.lock();
+            g.get(idx).map(|d| d.detached).unwrap_or(true)
+        };
+        if detached {
+            break;
+        }
+        match device.poll_interrupt_in(int_dci, &mut buf) {
+            Ok(Some(n)) => {
+                errors = 0;
+                if let Some(up) = ax_interrupt_link(&buf[..n]) {
+                    handle_status_event(&device, idx, up).await;
+                }
+            }
+            Ok(None) => narf_scheduler::yield_now().await,
+            Err(_) => {
+                errors += 1;
+                if errors >= 16 {
+                    break;
+                }
+                narf_scheduler::yield_now().await;
+            }
+        }
+    }
 }
 
 // ── Bind ───────────────────────────────────────────────────────────
@@ -660,11 +1130,14 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         .await
         .map_err(|_| ())?;
     let cfg_value = cfg[5];
-    // Bulk pair in the vendor (0xFF) interface: the r8152 finder
-    // shape, reused — the core lane needs no interrupt endpoint
-    // (link-status interrupt is audit item 2), so the finder is
-    // not extended here.
+    // Bulk pair + optional interrupt endpoint in the vendor
+    // (0xFF) interface: the r8152 finder shape, extended for
+    // the interrupt endpoint (audit item 2) without changing
+    // the bulk-pair result. A device without an interrupt
+    // endpoint still binds — BMSR polling remains the carrier
+    // source — but gets no status task and no link-change path.
     let (in_ep, out_ep) = find_rtl_endpoints(&cfg).ok_or(())?;
+    let int_ep = find_rtl_interrupt_endpoint(&cfg);
     if in_ep.max_packet == 0 || out_ep.max_packet == 0 {
         return Err(());
     }
@@ -678,15 +1151,26 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         )
         .await
         .map_err(|_| ())?;
-    device
-        .configure_endpoints(&[in_ep, out_ep])
-        .await
-        .map_err(|_| ())?;
+    match int_ep {
+        Some(ie) => {
+            device
+                .configure_endpoints(&[in_ep, out_ep, ie])
+                .await
+                .map_err(|_| ())?;
+        }
+        None => {
+            device
+                .configure_endpoints(&[in_ep, out_ep])
+                .await
+                .map_err(|_| ())?;
+        }
+    }
     let bulk_in_dci = ((in_ep.ep_addr & 0x0F) * 2) + 1;
     let bulk_out_dci = (out_ep.ep_addr & 0x0F) * 2;
+    let int_dci = int_ep.map(|e| ((e.ep_addr & 0x0F) * 2) + 1);
 
     // ── Reset sequence (Linux `ax88179_reset` order, minus LED /
-    // EEE-disable / WoL-check, which are item-2 / cosmetic) ──
+    // EEE-disable / WoL-check, which are cosmetic) ──
     // Power up the PHY, then set IPRL; the 500 ms wait follows.
     for w in RESET_PRE {
         ax_write_mac(&device, w).await?;
@@ -716,10 +1200,13 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         g.push(AxDevice {
             controller: device.controller().id(),
             slot_id: device.slot_id(),
+            controller: device.controller().id(),
             mac,
             bulk_in_dci,
             bulk_out_dci,
             out_max_packet: out_ep.max_packet,
+            int_dci,
+            rxctl: AX_RX_CTL_RESET,
             iface_name: format!("usb-ax{}", idx),
             pump_running: false,
             link_up: false,
@@ -732,7 +1219,19 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         g[idx].iface_name.clone()
     };
     let assigned = narf_net::iface::register_with_context(&requested, mac, idx as u64, ax_send_ctx);
-    // No offloads advertised in v1 (audit item 2).
+    // Offload advertisement (audit item 2) + the multicast
+    // control hook. The control install is best-effort: a
+    // `false` return (iface gone) leaves the stack's
+    // registry-only behavior, which is still correct — just
+    // without driver-side filter programming.
+    narf_net::iface::set_offloads(&assigned, ax88179_offloads());
+    let _ = narf_net::iface::set_device_control(
+        &assigned,
+        Arc::new(AxDeviceControl {
+            device: device.clone(),
+            idx,
+        }),
+    );
     {
         let mut g = AX_DEVICES.lock();
         g[idx].iface_name = assigned.clone();
@@ -750,12 +1249,20 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         mac[4],
         mac[5]
     );
-    // Initial link sample, then the RX pump owns the device.
+    // Initial link sample, then the RX pump owns the device and
+    // the status task owns the interrupt endpoint (when one
+    // exists — otherwise the BMSR poll is the carrier source).
     sample_link(&device, idx).await;
     let pump_dev = device.clone();
     narf_scheduler::spawn(async move {
         rx_pump(pump_dev, idx).await;
     });
+    if int_dci.is_some() {
+        let status_dev = device.clone();
+        narf_scheduler::spawn(async move {
+            status_task(status_dev, idx).await;
+        });
+    }
     Ok(idx)
 }
 
@@ -841,7 +1348,8 @@ fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
 
 /// Detach hook for a slot: tombstone every AX88179 record bound to
 /// it and unregister its net iface. The pump exits at its next
-/// `pump_should_continue` check once `pump_running` clears;
+/// `pump_should_continue` check once `pump_running` clears, and
+/// the status task exits at its next detached check;
 /// TX resolves to `None` instead of retargeting a later device
 /// (records are never removed — the ECM/NCM rule: net-registry
 /// TX cookies are record indices). Unknown slots no-op; repeat
@@ -1196,4 +1704,210 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/ax88179", smoke_ax88179_rx_runt_and_csum_bits);
+
+    fn smoke_ax88179_interrupt_decode() -> TestResult {
+        // intdata1 bit 16 set → link up; intdata2 is ignored.
+        let up = [0x00, 0x00, 0x01, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
+        if ax_interrupt_link(&up) != Some(true) {
+            return TestResult::Fail("interrupt link-up decode wrong");
+        }
+        // intdata1 clear, intdata2 all set → still down: only
+        // the first word carries the link bit.
+        let down = [0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+        if ax_interrupt_link(&down) != Some(false) {
+            return TestResult::Fail("interrupt link-down decode wrong");
+        }
+        // Short transfer (< 8 bytes): no event, not a verdict.
+        if ax_interrupt_link(&up[..7]).is_some() {
+            return TestResult::Fail("short interrupt transfer yielded a verdict");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/ax88179", smoke_ax88179_interrupt_decode);
+
+    fn smoke_ax88179_link_mode() -> TestResult {
+        use narf_net::iface::LinkDuplex;
+        // Giga + SuperSpeed + full: base + GIGAMODE + 125MHz + FULL.
+        let m = ax_link_mode(AX_USB_SS, 0xA400);
+        if m != Some((0x013B, AX_RX_BULKIN_SIZE[0], 1000, LinkDuplex::Full)) {
+            return TestResult::Fail("giga/SS/full link mode wrong");
+        }
+        // Giga + HighSpeed + half: bulkin[1], no FULL bit.
+        let m = ax_link_mode(AX_USB_HS, 0x8400);
+        if m != Some((0x0139, AX_RX_BULKIN_SIZE[1], 1000, LinkDuplex::Half)) {
+            return TestResult::Fail("giga/HS/half link mode wrong");
+        }
+        // Giga + neither speed: bulkin[3] (the else branch).
+        let m = ax_link_mode(0x00, 0x8400);
+        if m != Some((0x0139, AX_RX_BULKIN_SIZE[3], 1000, LinkDuplex::Half)) {
+            return TestResult::Fail("giga/other link mode wrong");
+        }
+        // 100M + SuperSpeed + full: PS bit, bulkin[2].
+        let m = ax_link_mode(AX_USB_SS, 0x6400);
+        if m != Some((0x0332, AX_RX_BULKIN_SIZE[2], 100, LinkDuplex::Full)) {
+            return TestResult::Fail("100M/SS/full link mode wrong");
+        }
+        // 100M + neither + half: bulkin[3].
+        let m = ax_link_mode(0x00, 0x4400);
+        if m != Some((0x0330, AX_RX_BULKIN_SIZE[3], 100, LinkDuplex::Half)) {
+            return TestResult::Fail("100M/other link mode wrong");
+        }
+        // 10M: no speed bits, bulkin[3], USB speed irrelevant.
+        let m = ax_link_mode(AX_USB_SS, 0x0400);
+        if m != Some((0x0130, AX_RX_BULKIN_SIZE[3], 10, LinkDuplex::Half)) {
+            return TestResult::Fail("10M link mode wrong");
+        }
+        // No PHY link bit → None, even with GIGA set.
+        if ax_link_mode(AX_USB_SS, 0x8000).is_some() {
+            return TestResult::Fail("no-link PHYSR yielded a mode");
+        }
+        if ax_link_mode(AX_USB_SS, 0x0000).is_some() {
+            return TestResult::Fail("zero PHYSR yielded a mode");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/ax88179", smoke_ax88179_link_mode);
+
+    fn smoke_ax88179_ether_crc() -> TestResult {
+        // Linux ether_crc vectors, computed independently via
+        // zlib CRC-32 + bitrev32 (see ax_ether_crc docs).
+        if ax_ether_crc(&[0x01, 0x00, 0x5E, 0x00, 0x00, 0x01]) != 0x7FA3_2D9B {
+            return TestResult::Fail("ether_crc 01:00:5e:00:00:01 wrong");
+        }
+        if ax_ether_crc(&[0x01, 0x00, 0x5E, 0x00, 0x00, 0xFB]) != 0x3F7B_3B21 {
+            return TestResult::Fail("ether_crc 01:00:5e:00:00:fb wrong");
+        }
+        if ax_ether_crc(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]) != 0xF99B_AABA {
+            return TestResult::Fail("ether_crc 33:33:00:00:00:01 wrong");
+        }
+        if ax_ether_crc(&[0x01, 0x80, 0xC2, 0x00, 0x00, 0x00]) != 0x67D8_C317 {
+            return TestResult::Fail("ether_crc 01:80:c2:00:00:00 wrong");
+        }
+        if ax_ether_crc(&[0x01, 0x00, 0x5E, 0x7F, 0xFF, 0xFA]) != 0xAE3C_4AFC {
+            return TestResult::Fail("ether_crc 01:00:5e:7f:ff:fa wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/ax88179", smoke_ax88179_ether_crc);
+
+    fn smoke_ax88179_multicast_program() -> TestResult {
+        // Base = START | AB | IPE = 0x0288.
+        // Promiscuous: + PRO, no filter (and promisc wins over
+        // all-multicast + a non-empty list — Linux if/else-if).
+        let (rxctl, filter) =
+            ax_multicast_program(true, true, &[[0x01, 0x00, 0x5E, 0x00, 0x00, 0x01]]);
+        if rxctl != 0x0289 || filter.is_some() {
+            return TestResult::Fail("promiscuous program wrong");
+        }
+        // Promiscuous with an empty list: still PRO, no filter.
+        let (rxctl, filter) = ax_multicast_program(true, false, &[]);
+        if rxctl != 0x0289 || filter.is_some() {
+            return TestResult::Fail("promiscuous (no list) program wrong");
+        }
+        // All-multicast: + AMALL, no filter.
+        let (rxctl, filter) = ax_multicast_program(false, true, &[]);
+        if rxctl != 0x028A || filter.is_some() {
+            return TestResult::Fail("all-multicast program wrong");
+        }
+        // Overflow past 64 addresses falls back to AMALL.
+        let many: Vec<[u8; 6]> = (0..65)
+            .map(|i| [0x01, 0x00, 0x5E, 0x00, 0x00, i as u8])
+            .collect();
+        let (rxctl, filter) = ax_multicast_program(false, false, &many);
+        if rxctl != 0x028A || filter.is_some() {
+            return TestResult::Fail("multicast overflow program wrong");
+        }
+        // Empty list: base only ("just broadcast and directed").
+        let (rxctl, filter) = ax_multicast_program(false, false, &[]);
+        if rxctl != 0x0288 || filter.is_some() {
+            return TestResult::Fail("empty multicast program wrong");
+        }
+        // Filtered list: + AM, filter bits from ether_crc
+        // (bits 31 → byte 3 bit 7; bits 62 → byte 7 bit 6).
+        let (rxctl, filter) = ax_multicast_program(
+            false,
+            false,
+            &[
+                [0x01, 0x00, 0x5E, 0x00, 0x00, 0x01],
+                [0x33, 0x33, 0x00, 0x00, 0x00, 0x01],
+            ],
+        );
+        if rxctl != 0x0298 || filter != Some([0, 0, 0, 0x80, 0, 0, 0, 0x40]) {
+            return TestResult::Fail("filtered multicast program wrong");
+        }
+        // Two addresses in one filter byte OR their bits
+        // (bits 31 → bit 7, bits 25 → bit 1, both byte 3).
+        let (rxctl, filter) = ax_multicast_program(
+            false,
+            false,
+            &[
+                [0x01, 0x00, 0x5E, 0x00, 0x00, 0x01],
+                [0x01, 0x80, 0xC2, 0x00, 0x00, 0x00],
+            ],
+        );
+        if rxctl != 0x0298 || filter != Some([0, 0, 0, 0x82, 0, 0, 0, 0]) {
+            return TestResult::Fail("multicast filter OR-accumulation wrong");
+        }
+        // Single address: bits 15 → byte 1 bit 7.
+        let (rxctl, filter) =
+            ax_multicast_program(false, false, &[[0x01, 0x00, 0x5E, 0x00, 0x00, 0xFB]]);
+        if rxctl != 0x0298 || filter != Some([0, 0x80, 0, 0, 0, 0, 0, 0]) {
+            return TestResult::Fail("single multicast program wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/ax88179", smoke_ax88179_multicast_program);
+
+    fn smoke_ax88179_offloads_and_tx_meta() -> TestResult {
+        let caps = ax88179_offloads();
+        if !caps.tx_checksum || caps.rx_checksum || caps.max_tso_bytes != 0 || caps.vlan_insert {
+            return TestResult::Fail("advertised offloads wrong");
+        }
+        let plain = narf_net::TxMeta {
+            csum_l4: None,
+            tso_mss: None,
+            vlan_tag: None,
+            more: false,
+        };
+        if !ax_tx_meta_accepted(plain) {
+            return TestResult::Fail("plain TX rejected");
+        }
+        let tcp = narf_net::TxMeta {
+            csum_l4: Some(narf_net::L4CsumKind::Tcp),
+            ..plain
+        };
+        if !ax_tx_meta_accepted(tcp) {
+            return TestResult::Fail("TCP csum TX rejected");
+        }
+        let udp = narf_net::TxMeta {
+            csum_l4: Some(narf_net::L4CsumKind::Udp),
+            ..plain
+        };
+        if !ax_tx_meta_accepted(udp) {
+            return TestResult::Fail("UDP csum TX rejected");
+        }
+        let sctp = narf_net::TxMeta {
+            csum_l4: Some(narf_net::L4CsumKind::Sctp),
+            ..plain
+        };
+        if ax_tx_meta_accepted(sctp) {
+            return TestResult::Fail("SCTP csum TX accepted");
+        }
+        let tso = narf_net::TxMeta {
+            tso_mss: Some(1460),
+            ..plain
+        };
+        if ax_tx_meta_accepted(tso) {
+            return TestResult::Fail("TSO TX accepted");
+        }
+        let vlan = narf_net::TxMeta {
+            vlan_tag: Some(7),
+            ..plain
+        };
+        if ax_tx_meta_accepted(vlan) {
+            return TestResult::Fail("VLAN TX accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/ax88179", smoke_ax88179_offloads_and_tx_meta);
 }

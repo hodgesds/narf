@@ -101,7 +101,7 @@ pub fn transmit(frame: &[u8], kind: Kind, control: TxControl) -> Result<Vec<u8>,
                 || !matches!(frame[0], 0x00 | 0x20 | 0xa0 | 0xb0 | 0xc0 | 0xd0)
                 || control.ampdu_density.is_some() =>
         {
-            return Err(Error::Header)
+            return Err(Error::Header);
         }
         Kind::Data
             if !matches!(frame[0], 0x08 | 0x88)
@@ -110,7 +110,7 @@ pub fn transmit(frame: &[u8], kind: Kind, control: TxControl) -> Result<Vec<u8>,
                     && !matches!(frame.get(24..26), Some(&[tid, 0]) if tid & 0xf8 == 0)
                 || frame[0] != 0x88 && control.ampdu_density.is_some() =>
         {
-            return Err(Error::Header)
+            return Err(Error::Header);
         }
         _ => (),
     }
@@ -234,6 +234,15 @@ impl Frame {
             return false;
         }
         let b = &self.bytes;
+        // BlockAckReq (gen2 F9): a 20-byte control frame (FC + Duration +
+        // RA + TA + BAR Control + Starting Sequence Control, FCS stripped
+        // by the hardware), admitted for the recipient reorder advance.
+        // The DATA checks below (24-byte header, QoS/TID view) do not
+        // apply to it; a descriptor PAGGR claim on a control frame is
+        // still refused.
+        if b.len() == 20 && b.first() == Some(&0x84) && !self.paggr {
+            return b[1] & 4 == 0;
+        }
         if b.len() < 24 || b[22] & 15 != 0 || b[1] & 4 != 0 {
             return false;
         }

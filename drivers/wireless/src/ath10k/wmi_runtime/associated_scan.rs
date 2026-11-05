@@ -63,7 +63,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             Ok(())
         };
         validate()?;
-        self.scan_run(channels, (&[], &[]), &[], None, validate)
+        self.scan_run(channels, (&[], &[]), &[], &[], validate)
             .await
     }
 
