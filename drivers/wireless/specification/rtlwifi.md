@@ -3349,6 +3349,29 @@ chip diagnostic (no firmware owner is built for it yet).
   `smoke_rtl8723ae_c2h_mailbox_close_protocol`,
   `smoke_rtl8723ae_c2h_mailbox_bt_info` (written, unexecuted).
 
+### RTL8192DE retained runtime (in progress, not admitted)
+
+- `rtl8192de` — dual-MAC per-function ownership model (step 1; not
+  admitted): `mode_from_prom` (PCI `EEPROM_MAC_FUNCTION` `0x08` bit 3,
+  USB `EEPROM_ENDPOINT_SETTING` `0x10` bit 0 inverted),
+  `phy_ctrl_word` (`REG_MAC_PHY_CTRL_NORMAL` `0x00f8`; PCI base `0xf0`,
+  USB read-modify clearing bits 0–2; dual-dual `0x03`, single `0x04`,
+  dual-single `0x01`), `mode_info` (single/dual-single 2T2R on both
+  bands from 2.4 GHz; dual-dual 1T1R with MAC0 on 5 GHz, MAC1 on
+  2.4 GHz), `ampdu_factor_base` (`0xb9726641` / `0x66626641` /
+  `0xb972a841`), sw consequences (non-single disables 8K A-MSDU and
+  caps RX at 4096; default channel 36 on 5 GHz, 1 otherwise),
+  `max_aggr_num` (`0x0B` single, `0x07` dual), and table selection
+  (MAC0 always the combined AGC table; MAC1 the 2G table on 2.4 GHz,
+  the 5G table on 5 GHz; per-path internal-PA radio tables; the DMDP
+  radio-B-on-path-A swap). The 10 `table.c` arrays (3462 words) are
+  transcribed verbatim via generator + independent checker. Firmware
+  image name `rtlwifi/rtl8192defw.bin`. Per-function EFUSE identity
+  (function 0 / 1 → MAC offsets `0x55` / `0x5b`) already lives in
+  `efuse.rs`. Still open: power-on sequence, firmware header parse +
+  transport admission, station chains, bands/HT/QoS/lifecycle, signed
+  envelope, TX-power levels.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
