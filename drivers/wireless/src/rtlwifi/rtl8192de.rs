@@ -11,9 +11,13 @@
 //! power envelope ([`envelope`], 2.4 GHz only), the chip's own TX/RX
 //! descriptors ([`trx`]) and the packet owner ([`packet`]). Step 3 adds
 //! the power-on sequence ([`power`]), the LLT ([`llt`]) and MAC init
-//! ([`mac`]). It is not admitted yet (probe keeps it diagnostic); the
-//! station chains, bands/HT/QoS/lifecycle, TX-power levels and the
-//! 5 GHz envelope are remainders.
+//! ([`mac`]). Step 4 adds the station chains ([`station`], the rate
+//! table [`rate`], the H2C mailbox [`h2c`]), bands/HT/QoS/lifecycle
+//! ([`channel`], [`lifecycle`]), the TX-power levels ([`txpower`]) and
+//! the DE factory table ([`phy::PgStore`]) plus the BB/RF access they
+//! need ([`phy`]). It is not admitted yet (probe keeps it diagnostic); the
+//! 5 GHz envelope rows + 2SS HT rates, the `Prepared` integration and the
+//! production `rtl92de_hw_init` orchestrator are remainders.
 //!
 //! Per-function EFUSE identity already lives in-tree: `efuse.rs` maps
 //! function 0 / 1 to MAC offsets `0x55` / `0x5b` (497 physical bytes, 256
@@ -39,17 +43,35 @@
 //! - [`mac`] — MAC init (`_rtl92de_init_mac` after the LLT),
 //!   `_rtl92de_hw_configure`, interrupt control, CAM reset and the
 //!   station identity.
+//! - [`station`] — station chains: network type / media status,
+//!   check-BSSID, BSSID, basic rate, AID, beacon registers, interrupt
+//!   mask, suspend/resume, and the `set_hw_reg` / `get_hw_reg` cases.
+//! - [`rate`] — the station rate table (`REG_ARFR0`).
+//! - [`h2c`] — the host-to-firmware mailbox + join-bss report.
+//! - [`channel`] — bands, channel switching, bandwidth mode, the
+//!   BB/RF band-switch configuration.
+//! - [`phy`] — BB/RF register access, the RF 3-wire serial path, the
+//!   DBI cross-function path, and the factory power-group table.
+//! - [`txpower`] — TX-power levels from the EFUSE factory map.
+//! - [`lifecycle`] — `init_sw_vars` / `deinit_sw_vars` / ASPM state.
 
 #![allow(dead_code)]
 
+pub mod channel;
 pub mod envelope;
 pub mod fw;
+pub mod h2c;
+pub mod lifecycle;
 pub mod llt;
 pub mod mac;
 pub mod packet;
+pub mod phy;
 pub mod power;
+pub mod rate;
+pub mod station;
 pub mod tables;
 pub mod trx;
+pub mod txpower;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests;
