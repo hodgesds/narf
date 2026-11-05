@@ -1878,11 +1878,14 @@ impl WirelessNetIface for Device {
     }
     /// mld/mac80211.c `iwl_mac_hw_set_wiphy` station `ext_capab[0]` on an
     /// 11be NVM: IWL_MLD_EMLSR_CAPA as EML capabilities, exactly what the
-    /// native multiple-link request carries. NARF negotiates neither
-    /// TID-to-link mapping nor link reconfiguration and has no UHR ML power
-    /// management, so IWL_MLD_CAPA_OPS / EXT_MLD_CAPA bits are 0, and no
-    /// Extended Capabilities bit (ext_capa_base) is claimed because the
-    /// native request carries no Extended Capabilities element.
+    /// native multiple-link request carries. NARF negotiates TID-to-link
+    /// mapping (SAME, one both-directions map — `sc_ttlm_neg`, wire values
+    /// verified #1553) but not link reconfiguration (wire layout
+    /// unverified, #1553 remainder) and has no UHR ML power management,
+    /// so `mld_capa_and_ops` carries only the TTLM-negotiation SAME bit
+    /// and `ext_mld_capa_and_ops` stays 0, and no Extended Capabilities
+    /// bit (ext_capa_base) is claimed because the native request carries
+    /// no Extended Capabilities element.
     fn iftype_extended_capabilities(&self) -> Vec<narf_wireless::IftypeExtendedCapability> {
         if !self.supports_mlo() {
             return Vec::new();
@@ -1892,7 +1895,7 @@ impl WirelessNetIface for Device {
             capabilities: Vec::new(),
             mask: Vec::new(),
             eml_capabilities: narf_wireless::association::mlo::EmlCapabilities::INTEL_MLD_LOCAL.0,
-            mld_capa_and_ops: 0,
+            mld_capa_and_ops: super::sc_ttlm_neg::MLD_CAP_OP_TTLM_NEG_SAME,
             ext_mld_capa_and_ops: 0,
         }]
     }
