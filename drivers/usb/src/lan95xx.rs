@@ -6,6 +6,12 @@
 //! autoneg + EEPROM station address + TX/RX pumps + publication
 //! as `usb-lan95xx{N}` + detach. 10/100 only, USB 2.0 — not gigabit.
 //!
+//! Issue #1552 (this lane's follow-up, now delivered): the
+//! interrupt-endpoint link-change task republishes link metadata
+//! when the cable state changes after bind, and multicast
+//! programming (hash filter + `MAC_CR` receive-mode bits) is
+//! wired to the stack's `DeviceControl` hook.
+//!
 //! ## Grounding (read before trusting a constant)
 //!
 //! Every register address, bit definition, and wire format below is
@@ -55,6 +61,39 @@
 //!   delivers the bare frame. `HW_CFG` RX data offset is programmed
 //!   to 2 at reset (Linux: `NET_IP_ALIGN << 9`).
 //!
+//! ## Link-change + multicast (#1552, delivered)
+//!
+//! - The interrupt endpoint is armed at bind (4-byte status
+//!   word, Linux `smsc95xx_status`: exactly 4 bytes, LE32,
+//!   `INT_ENP_PHY_INT_` = bit 15). A PHY-interrupt event makes
+//!   the status task re-read the PHY (BMSR twice, latched-low,
+//!   then `PHY_SPECIAL`) and republish link metadata on change
+//!   only — including a renegotiation that changes speed/duplex
+//!   without dropping carrier. Non-PHY events and short
+//!   transfers are ignored, exactly like the reference.
+//! - The PHY interrupt sources are armed in reset via
+//!   `PHY_INT_MASK` = `PHY_INT_MASK_DEFAULT` (autoneg-complete
+//!   + link-down, Linux `smsc95xx.h`); without it the endpoint
+//!   would never fire on real silicon. The handler acknowledges
+//!   the PHY interrupt by reading `PHY_INT_SRC` (best-effort).
+//! - Multicast is programmed through the stack's
+//!   `DeviceControl` hook (Linux `smsc95xx_set_multicast`,
+//!   `ndo_set_rx_mode`): promiscuous → `PRMS`, all-multicast
+//!   → `MCPAS`, a non-empty list → hash table + `HPFILT`,
+//!   empty → receive-own only. The `MAC_CR` shadow in the
+//!   device record is the single tracked value both the
+//!   multicast hook and the link-change path start from, so
+//!   neither clobbers the other's bits (last writer wins on
+//!   the shadow; a link event arriving mid-configure
+//!   reconciles on the next event — the AX88179 pattern).
+//! - Constant correction found by re-deriving against
+//!   `smsc95xx.h` @ cbbddb6: the old `MAC_CR_HPFILT_` value
+//!   `0x8000` is actually `MAC_CR_HFILT_` (hash-only
+//!   filtering); the real `HPFILT` (hash/perfect filtering,
+//!   the bit `smsc95xx_set_multicast` sets) is `0x2000`.
+//!   The reset-time receive-own clear previously cleared the
+//!   wrong bit; it now clears the right one.
+//!
 //! ## Scope limits (honest)
 //!
 //! - Station address comes from EEPROM only (offset `0x01`, 6
@@ -63,13 +102,6 @@
 //!   EEPROM-less MAC fallback is audit item 4, not this lane.
 //! - External PHY (`HW_CFG_PSEL_` set) fails the bind: only the
 //!   internal PHY (id 1) is driven.
-//! - Link state is published once from the bind-time PHY read.
-//!   The interrupt-endpoint link-change task is a follow-up (the
-//!   AX88179 item-2 shape); until then a cable plugged in after
-//!   bind does not republish link metadata.
-//! - Multicast programming is NOT implemented: bind leaves the
-//!   hash table empty and `MAC_CR` without `PRMS` / `MCPAS` /
-//!   `HPFILT` (receive-own only). Multicast is a follow-up item.
 //! - RX checksum offload is NOT enabled: NARF's USB RX path
 //!   (`on_rx_frame_from` takes bare bytes) has no verdict channel,
 //!   so `rx_checksum: false` is the honest advertisement and
@@ -184,13 +216,35 @@ pub const EEPROM_MAC_OFFSET: u32 = 0x01;
 // INT_EP_CTL bits.
 pub const INT_EP_CTL_PHY_INT_: u32 = 0x0000_8000;
 
+/// PHY-interrupt bit in the interrupt-endpoint status word
+/// (Linux `INT_ENP_PHY_INT_`, `BIT(15)` — the same value as
+/// `INT_STS_PHY_INT_` / `INT_EP_CTL_PHY_INT_`).
+pub const INT_ENP_PHY_INT_: u32 = 0x0000_8000;
+
+/// Interrupt-endpoint transfer length (Linux
+/// `smsc95xx_status`: any length other than 4 bytes is
+/// unexpected and ignored).
+pub const INT_STATUS_LEN: usize = 4;
+
 // TX_CFG bits.
 pub const TX_CFG_ON_: u32 = 0x0000_0004;
 
 // MAC_CR bits.
 pub const MAC_CR_PRMS_: u32 = 0x0004_0000;
 pub const MAC_CR_MCPAS_: u32 = 0x0008_0000;
-pub const MAC_CR_HPFILT_: u32 = 0x0000_8000;
+/// Hash/perfect filtering mode (Linux `MAC_CR_HPFILT_`,
+/// `0x2000` — the bit `smsc95xx_set_multicast` sets for a
+/// filtered list). NOTE: an earlier revision of this file had
+/// `0x8000` here; that value is `MAC_CR_HFILT_` (hash-only
+/// filtering), not `HPFILT` — corrected against `smsc95xx.h`
+/// @ cbbddb6 in #1552.
+pub const MAC_CR_HPFILT_: u32 = 0x0000_2000;
+/// Hash-only filtering mode (Linux `MAC_CR_HFILT_`).
+pub const MAC_CR_HFILT_: u32 = 0x0000_8000;
+/// Receive-own control (Linux `MAC_CR_RCVOWN_`): set in
+/// half duplex, clear in full duplex
+/// (`smsc95xx_mac_update_fullduplex`).
+pub const MAC_CR_RCVOWN_: u32 = 0x0080_0000;
 pub const MAC_CR_FDPX_: u32 = 0x0010_0000;
 pub const MAC_CR_TXEN_: u32 = 0x0000_0008;
 pub const MAC_CR_RXEN_: u32 = 0x0000_0004;
@@ -241,6 +295,20 @@ pub const PHY_SPECIAL_SPD_10HALF: u16 = 0x0004;
 pub const PHY_SPECIAL_SPD_10FULL: u16 = 0x0014;
 pub const PHY_SPECIAL_SPD_100HALF: u16 = 0x0008;
 pub const PHY_SPECIAL_SPD_100FULL: u16 = 0x0018;
+
+// PHY interrupt source / mask registers (Linux `smsc95xx.h`).
+/// Interrupt source (read to acknowledge the PHY interrupt).
+pub const PHY_INT_SRC: u16 = 29;
+/// Interrupt mask.
+pub const PHY_INT_MASK: u16 = 30;
+pub const PHY_INT_MASK_ENERGY_ON_: u16 = 0x0080;
+pub const PHY_INT_MASK_ANEG_COMP_: u16 = 0x0040;
+pub const PHY_INT_MASK_REMOTE_FAULT_: u16 = 0x0020;
+pub const PHY_INT_MASK_LINK_DOWN_: u16 = 0x0010;
+/// Mask programmed at reset so the PHY raises an interrupt on
+/// autoneg completion and on link-down (Linux
+/// `PHY_INT_MASK_DEFAULT_`).
+pub const PHY_INT_MASK_DEFAULT: u16 = PHY_INT_MASK_ANEG_COMP_ | PHY_INT_MASK_LINK_DOWN_;
 
 // Burst / bulk-IN tuning (Linux-observed tunables, see module docs).
 /// High-speed burst cap in USB packets: (16 KiB + 5*512) / 512.
@@ -356,6 +424,129 @@ pub fn hash_words(addrs: &[[u8; 6]]) -> (u32, u32) {
         }
     }
     (hi, lo)
+}
+
+// ── Link-change pure helpers (#1552) ────────────────────────────
+
+/// Published link state: carrier + negotiated mode (`None`
+/// speed/duplex = carrier known, mode unknown — e.g. the PHY
+/// reports link but `PHY_SPECIAL` decodes to nothing).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LinkState {
+    pub up: bool,
+    pub speed: Option<u32>,
+    pub duplex: Option<narf_net::iface::LinkDuplex>,
+}
+
+/// Decode one interrupt-endpoint transfer (Linux
+/// `smsc95xx_status`): the event is exactly one 4-byte
+/// little-endian status word; `true` iff its PHY-interrupt bit
+/// is set. Short transfers, long transfers, and words without
+/// the PHY bit are not link events — the reference warns and
+/// ignores them, and so does this.
+pub fn lan95xx_interrupt_phy(buf: &[u8]) -> bool {
+    if buf.len() != INT_STATUS_LEN {
+        return false;
+    }
+    let intdata = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    intdata & INT_ENP_PHY_INT_ != 0
+}
+
+/// Link-change decision from a fresh PHY sample: carrier plus
+/// the decoded speed/duplex (`phy_link_status` already applied
+/// the latched-low BMSR double-read and the `PHY_SPECIAL`
+/// decode). Returns the new [`LinkState`] iff it differs from
+/// the last published state, else `None` (no republish). A
+/// renegotiation that changes speed/duplex without dropping
+/// carrier is a change; a duplicate interrupt for an unchanged
+/// state is not. A down state never carries a mode, even if
+/// the caller passes one.
+pub fn link_change_decision(
+    prev: &LinkState,
+    up: bool,
+    speed: Option<u32>,
+    duplex: Option<narf_net::iface::LinkDuplex>,
+) -> Option<LinkState> {
+    let next = LinkState {
+        up,
+        speed: if up { speed } else { None },
+        duplex: if up { duplex } else { None },
+    };
+    if next == *prev {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+/// MAC control for a negotiated duplex (Linux
+/// `smsc95xx_mac_update_fullduplex`): full duplex sets `FDPX`
+/// and clears `RCVOWN`; half duplex clears `FDPX` and sets
+/// `RCVOWN`. Every other bit — including the multicast
+/// receive-mode bits — is preserved, so the link-change path
+/// and the multicast hook never clobber each other.
+pub fn mac_cr_for_duplex(mac_cr: u32, duplex: narf_net::iface::LinkDuplex) -> u32 {
+    use narf_net::iface::LinkDuplex;
+    match duplex {
+        LinkDuplex::Full => (mac_cr | MAC_CR_FDPX_) & !MAC_CR_RCVOWN_,
+        LinkDuplex::Half => (mac_cr & !MAC_CR_FDPX_) | MAC_CR_RCVOWN_,
+    }
+}
+
+// ── Multicast pure helper (#1552) ───────────────────────────────
+
+/// Result of programming the multicast filter: the `MAC_CR`
+/// value to write plus the `(HASHH, HASHL)` words.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MulticastProgram {
+    pub mac_cr: u32,
+    pub hash_hi: u32,
+    pub hash_lo: u32,
+}
+
+/// Multicast programming (Linux `smsc95xx_set_multicast`,
+/// exact branch order — promiscuous wins over all-multicast,
+/// which wins over a filtered list): promiscuous sets `PRMS`
+/// and clears `MCPAS`/`HPFILT`; all-multicast sets `MCPAS`
+/// and clears `PRMS`/`HPFILT`; a non-empty list sets
+/// `HPFILT`, clears `PRMS`/`MCPAS`, and fills the hash table
+/// from the addresses; an empty list clears all three and
+/// leaves the hash table empty (receive-own only). The hash
+/// table is zeroed in every branch — Linux writes `HASHH` /
+/// `HASHL` unconditionally. All other `MAC_CR` bits
+/// (`FDPX`/`RCVOWN`/`TXEN`/`RXEN`) are preserved.
+pub fn lan95xx_multicast_program(
+    mac_cr: u32,
+    promiscuous: bool,
+    all_multicast: bool,
+    addrs: &[[u8; 6]],
+) -> MulticastProgram {
+    if promiscuous {
+        MulticastProgram {
+            mac_cr: (mac_cr | MAC_CR_PRMS_) & !(MAC_CR_MCPAS_ | MAC_CR_HPFILT_),
+            hash_hi: 0,
+            hash_lo: 0,
+        }
+    } else if all_multicast {
+        MulticastProgram {
+            mac_cr: (mac_cr | MAC_CR_MCPAS_) & !(MAC_CR_PRMS_ | MAC_CR_HPFILT_),
+            hash_hi: 0,
+            hash_lo: 0,
+        }
+    } else if !addrs.is_empty() {
+        let (hash_hi, hash_lo) = hash_words(addrs);
+        MulticastProgram {
+            mac_cr: (mac_cr | MAC_CR_HPFILT_) & !(MAC_CR_PRMS_ | MAC_CR_MCPAS_),
+            hash_hi,
+            hash_lo,
+        }
+    } else {
+        MulticastProgram {
+            mac_cr: mac_cr & !(MAC_CR_PRMS_ | MAC_CR_MCPAS_ | MAC_CR_HPFILT_),
+            hash_hi: 0,
+            hash_lo: 0,
+        }
+    }
 }
 
 /// Station-address validity (USB-Ethernet contract): non-zero,
@@ -605,6 +796,41 @@ pub fn find_smsc_endpoints(cfg: &[u8]) -> Option<(EndpointConfig, EndpointConfig
     }
 }
 
+/// Find the interrupt-IN endpoint in a configuration-descriptor
+/// blob: the interrupt endpoint the link-change status task
+/// arms (4-byte status word, `INT_ENP_PHY_INT_`). Same
+/// descriptor walk as [`find_smsc_endpoints`] — a separate
+/// finder, not a second walk shape — and the same no-class-gate
+/// rule: the VID/PID match already identifies the device.
+/// `None` when the device exposes no interrupt endpoint; the
+/// device still binds, it just gets no status task (the
+/// AX88179 shape).
+pub fn find_smsc_interrupt_endpoint(cfg: &[u8]) -> Option<EndpointConfig> {
+    let mut i = 0usize;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        let desc_type = cfg[i + 1];
+        if desc_type == 0x05 && len >= 7 {
+            let ep_addr = cfg[i + 2];
+            let attrs = cfg[i + 3];
+            let max_packet = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]) & 0x07FF;
+            if attrs & 0x03 == 3 && ep_addr & 0x80 != 0 {
+                return Some(EndpointConfig {
+                    ep_addr,
+                    max_packet,
+                    kind: EndpointKind::InterruptIn,
+                    interval: cfg[i + 6],
+                });
+            }
+        }
+        i += len;
+    }
+    None
+}
+
 // ── Async device operations ─────────────────────────────────────
 
 /// Read a 32-bit register: vendor IN `0xA1`, `wValue = 0`,
@@ -736,12 +962,34 @@ async fn mdio_write(dev: &USBDevice, phy_id: u16, idx: u16, val: u16) -> Result<
     Ok(())
 }
 
+/// Current PHY link state without touching autoneg: read the
+/// (latched-low) BMSR link bit twice and decode `PHY_SPECIAL`
+/// for speed/duplex (Linux `smsc95xx_link_ok` shape). The
+/// link-change task calls this on every PHY interrupt; the
+/// bind-time `phy_link` calls it after autoneg completes.
+/// A down link yields `(false, None, None)`; an up link with
+/// an undecodable `PHY_SPECIAL` yields `(true, None, None)`
+/// — carrier known, mode unknown.
+async fn phy_link_status(
+    dev: &USBDevice,
+) -> Result<(bool, Option<u32>, Option<narf_net::iface::LinkDuplex>), ()> {
+    // BMSR link bit is latched-low: the second read is the truth.
+    let _ = mdio_read(dev, INTERNAL_PHY_ID, PHY_BMSR).await?;
+    let bmsr = mdio_read(dev, INTERNAL_PHY_ID, PHY_BMSR).await?;
+    if bmsr & BMSR_LINK == 0 {
+        return Ok((false, None, None));
+    }
+    let special = mdio_read(dev, INTERNAL_PHY_ID, PHY_SPECIAL).await?;
+    let (speed, duplex) = decode_phy_special(special);
+    Ok((true, speed, duplex))
+}
+
 /// Bring the internal PHY to autoneg and read the link state:
 /// advertise 10/100 + pause, restart autoneg, poll for completion,
-/// then read the (latched-low) link bit twice and decode
-/// `PHY_SPECIAL` for speed/duplex. A timeout or a down link
-/// yields `(false, None, None)` — the iface still publishes, with
-/// carrier down, exactly as a link-down netdev.
+/// then read the link state via [`phy_link_status`]. A timeout
+/// or a down link yields `(false, None, None)` — the iface
+/// still publishes, with carrier down, exactly as a link-down
+/// netdev.
 async fn phy_link(
     dev: &USBDevice,
 ) -> Result<(bool, Option<u32>, Option<narf_net::iface::LinkDuplex>), ()> {
@@ -759,15 +1007,7 @@ async fn phy_link(
     if !done {
         return Ok((false, None, None));
     }
-    // BMSR link bit is latched-low: the second read is the truth.
-    let _ = mdio_read(dev, INTERNAL_PHY_ID, PHY_BMSR).await?;
-    let bmsr = mdio_read(dev, INTERNAL_PHY_ID, PHY_BMSR).await?;
-    if bmsr & BMSR_LINK == 0 {
-        return Ok((false, None, None));
-    }
-    let special = mdio_read(dev, INTERNAL_PHY_ID, PHY_SPECIAL).await?;
-    let (speed, duplex) = decode_phy_special(special);
-    Ok((true, speed, duplex))
+    phy_link_status(dev).await
 }
 
 /// Burst-cap + RX-buffer pair for the device's USB speed (Linux
@@ -834,16 +1074,21 @@ async fn reset(dev: &USBDevice, burst_cap: u32) -> Result<([u8; 6], u32, ChipId)
     coe |= COE_TX_EN_;
     coe &= !COE_RX_EN_; // No RX verdict channel: RX COE stays off.
     reg_write(dev, COE_CR, coe).await?;
-    // Multicast default: receive-own only (hash table empty).
-    reg_write(dev, HASHH, 0).await?;
-    reg_write(dev, HASHL, 0).await?;
-    mac_cr &= !(MAC_CR_PRMS_ | MAC_CR_MCPAS_ | MAC_CR_HPFILT_);
+    // Multicast default: receive-own only (hash table empty),
+    // via the same program the `DeviceControl` hook uses.
+    let prog = lan95xx_multicast_program(mac_cr, false, false, &[]);
+    reg_write(dev, HASHH, prog.hash_hi).await?;
+    reg_write(dev, HASHL, prog.hash_lo).await?;
+    mac_cr = prog.mac_cr;
     reg_write(dev, MAC_CR, mac_cr).await?;
-    // Enable PHY interrupts at the endpoint (the link-change
-    // task that consumes them is a follow-up item).
+    // Enable PHY interrupts at the endpoint (consumed by the
+    // link-change status task) and arm the PHY interrupt
+    // sources that raise them: without the mask the endpoint
+    // would never fire on real silicon.
     let mut ep_ctl = reg_read(dev, INT_EP_CTL).await?;
     ep_ctl |= INT_EP_CTL_PHY_INT_;
     reg_write(dev, INT_EP_CTL, ep_ctl).await?;
+    mdio_write(dev, INTERNAL_PHY_ID, PHY_INT_MASK, PHY_INT_MASK_DEFAULT).await?;
     // Start TX, then RX (Linux `smsc95xx_start_tx_path` /
     // `smsc95xx_start_rx_path`).
     mac_cr |= MAC_CR_TXEN_;
@@ -867,9 +1112,23 @@ pub struct Lan95xxDevice {
     pub mac: [u8; 6],
     pub bulk_in_dci: u8,
     pub bulk_out_dci: u8,
+    /// Interrupt-IN endpoint DCI, when the device exposes one
+    /// (`None` = no status task; bind-time link state stands).
+    pub int_dci: Option<u8>,
     pub out_max_packet: u16,
     pub rx_buf_len: usize,
+    /// Tracked `MAC_CR` shadow: the single value both the
+    /// multicast hook and the link-change path start from.
+    /// Read under the lock, never held across an await
+    /// (AGENTS.md lock rule).
     pub mac_cr: u32,
+    /// Last published link state (bind-time sample, then the
+    /// status task's republishes). The link-change decision
+    /// compares against this triple, so only real changes
+    /// republish.
+    pub link_up: bool,
+    pub link_speed: Option<u32>,
+    pub link_duplex: Option<narf_net::iface::LinkDuplex>,
     pub iface_name: String,
     pub pump_running: bool,
     pub detached: bool,
@@ -944,11 +1203,92 @@ pub fn lan95xx_offloads() -> narf_net::OffloadCapabilities {
     }
 }
 
+// ── Multicast `DeviceControl` (#1552) ───────────────────────────
+
+/// `DeviceControl` for one bound LAN95xx record: programs the
+/// multicast hash filter + `MAC_CR` receive-mode bits from the
+/// stack's `DeviceConfig` (Linux `smsc95xx_set_multicast`).
+/// The trait is sync while the hardware path is async, so
+/// `configure` bridges via `block_on` (same contract as the
+/// send path: the caller is not inside an executor poll, and
+/// no lock is held across the `block_on` — AGENTS.md lock
+/// rule). The record's tracked `mac_cr` is updated only after
+/// all three writes succeed; a failed write leaves hardware
+/// partly programmed and the record unchanged, and the stack
+/// keeps its old metadata on `Err` (per the `DeviceConfig`
+/// contract: "an error leaves metadata unchanged").
+pub struct Lan95xxDeviceControl {
+    device: Arc<USBDevice>,
+    idx: usize,
+}
+
+// Manual `Debug` (`USBDevice` is `Clone`-only, so a derived impl
+// would fail): slot + record index identify the binding.
+impl core::fmt::Debug for Lan95xxDeviceControl {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Lan95xxDeviceControl")
+            .field("slot_id", &self.device.slot_id())
+            .field("idx", &self.idx)
+            .finish()
+    }
+}
+
+impl narf_net::iface::DeviceControl for Lan95xxDeviceControl {
+    fn configure(&self, config: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+        // Stack errno convention (positive, Linux numbers — see
+        // `configure_device`): ENODEV when the record is gone,
+        // EIO when a hardware write fails.
+        const ENODEV: i32 = 19;
+        const EIO: i32 = 5;
+        // Filter members are multicast addresses only: unicast
+        // entries are the station address, not filter members.
+        let mc: Vec<[u8; 6]> = config
+            .addresses
+            .iter()
+            .filter(|a| !a.unicast)
+            .map(|a| a.addr)
+            .collect();
+        // Tracked `MAC_CR` shadow, read before any await (no
+        // lock across awaits). A link-change landing mid-path
+        // may restore a newer shadow afterwards; the next link
+        // event reconciles — last writer wins, same as the two
+        // publishers in the AX88179 lane.
+        let mac_cr = {
+            let g = LAN95XX_DEVICES.lock();
+            match g.get(self.idx) {
+                Some(rec) if !rec.detached => rec.mac_cr,
+                _ => return Err(ENODEV),
+            }
+        };
+        let prog = lan95xx_multicast_program(mac_cr, config.promiscuous, config.all_multicast, &mc);
+        let device = self.device.clone();
+        let ok = narf_scheduler::block_on(async move {
+            // Linux's order: HASHH, HASHL, then MAC_CR.
+            reg_write(&device, HASHH, prog.hash_hi).await?;
+            reg_write(&device, HASHL, prog.hash_lo).await?;
+            reg_write(&device, MAC_CR, prog.mac_cr).await
+        })
+        .is_ok();
+        if !ok {
+            return Err(EIO);
+        }
+        let mut g = LAN95XX_DEVICES.lock();
+        let Some(rec) = g.get_mut(self.idx) else {
+            return Err(ENODEV);
+        };
+        if rec.detached {
+            return Err(ENODEV);
+        }
+        rec.mac_cr = prog.mac_cr;
+        Ok(())
+    }
+}
+
 // ── Bind ────────────────────────────────────────────────────────
 
 /// Full bind for an addressed LAN95xx device: configuration,
-/// endpoint setup, reset, PHY link, netdev publication, RX pump.
-/// Returns the device-record index.
+/// endpoint setup, reset, PHY link, netdev publication, RX pump,
+/// link-change status task. Returns the device-record index.
 async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
     use core::fmt::Write;
     // Fetch the configuration descriptor (two-step like xpad:
@@ -968,7 +1308,12 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         .await
         .map_err(|_| ())?;
     let cfg_value = cfg[5];
+    // Bulk pair + optional interrupt endpoint (#1552): a device
+    // without an interrupt endpoint still binds — the bind-time
+    // link state stands and no status task spawns (the AX88179
+    // shape).
     let (in_ep, out_ep) = find_smsc_endpoints(&cfg).ok_or(())?;
+    let int_ep = find_smsc_interrupt_endpoint(&cfg);
     device
         .control_out(
             0x00,
@@ -979,12 +1324,23 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         )
         .await
         .map_err(|_| ())?;
-    device
-        .configure_endpoints(&[in_ep, out_ep])
-        .await
-        .map_err(|_| ())?;
+    match int_ep {
+        Some(ie) => {
+            device
+                .configure_endpoints(&[in_ep, out_ep, ie])
+                .await
+                .map_err(|_| ())?;
+        }
+        None => {
+            device
+                .configure_endpoints(&[in_ep, out_ep])
+                .await
+                .map_err(|_| ())?;
+        }
+    }
     let bulk_in_dci = crate::bulk::dci_for(in_ep.ep_addr);
     let bulk_out_dci = crate::bulk::dci_for(out_ep.ep_addr);
+    let int_dci = int_ep.map(|e| crate::bulk::dci_for(e.ep_addr));
     let (burst_cap, rx_buf_len) = burst_for_speed(device.speed())?;
 
     // Reset in Linux's order (station address from EEPROM inside).
@@ -996,14 +1352,11 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         return Err(());
     }
 
-    // PHY autoneg + link state; duplex feeds MAC_CR FDPX.
+    // PHY autoneg + link state; duplex feeds MAC_CR FDPX/RCVOWN
+    // (Linux `smsc95xx_mac_update_fullduplex` steady state).
     let (carrier, speed, duplex) = phy_link(&device).await?;
     if let Some(duplex) = duplex {
-        use narf_net::iface::LinkDuplex;
-        match duplex {
-            LinkDuplex::Full => mac_cr |= MAC_CR_FDPX_,
-            LinkDuplex::Half => mac_cr &= !MAC_CR_FDPX_,
-        }
+        mac_cr = mac_cr_for_duplex(mac_cr, duplex);
         reg_write(&device, MAC_CR, mac_cr).await?;
     }
 
@@ -1018,9 +1371,13 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
             mac,
             bulk_in_dci,
             bulk_out_dci,
+            int_dci,
             out_max_packet: out_ep.max_packet,
             rx_buf_len,
             mac_cr,
+            link_up: carrier,
+            link_speed: speed,
+            link_duplex: duplex,
             iface_name: format!("usb-lan95xx{}", idx),
             pump_running: false,
             detached: false,
@@ -1035,6 +1392,17 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         narf_net::iface::register_with_context(&requested, mac, idx as u64, lan95xx_send_ctx);
     // Advertise the TX offloads the send path honours.
     narf_net::iface::set_offloads(&assigned, lan95xx_offloads());
+    // Multicast control hook (#1552). Best-effort: a `false`
+    // return (iface gone) leaves the stack's registry-only
+    // behavior, which is still correct — just without
+    // driver-side filter programming.
+    let _ = narf_net::iface::set_device_control(
+        &assigned,
+        Arc::new(Lan95xxDeviceControl {
+            device: device.clone(),
+            idx,
+        }),
+    );
     narf_net::iface::set_link_metadata(&assigned, carrier, speed, duplex);
     {
         let mut g = LAN95XX_DEVICES.lock();
@@ -1058,6 +1426,12 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
     narf_scheduler::spawn(async move {
         rx_pump(pump_dev, idx).await;
     });
+    if int_dci.is_some() {
+        let status_dev = device.clone();
+        narf_scheduler::spawn(async move {
+            status_task(status_dev, idx).await;
+        });
+    }
     Ok(idx)
 }
 
@@ -1112,6 +1486,129 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
     let mut g = LAN95XX_DEVICES.lock();
     if let Some(rec) = g.get_mut(idx) {
         rec.pump_running = false;
+    }
+}
+
+// ── Link-change status task (#1552) ─────────────────────────────
+
+/// Handle one PHY interrupt (Linux `smsc95xx_status` →
+/// PHY IRQ → `smsc95xx_handle_link_change`): acknowledge the
+/// PHY interrupt, re-read the PHY, and republish link metadata
+/// only when the state actually changed. On link-up the
+/// carrier verdict stands even when the mode is unknown
+/// (no `MAC_CR` duplex write then); on link-down the stack
+/// clears speed/duplex and the `MAC_CR` duplex bits keep
+/// their last value (Linux leaves them — `FDPX`/`RCVOWN`
+/// are only rewritten for a negotiated duplex).
+async fn handle_link_event(dev: &USBDevice, idx: usize) {
+    // Acknowledge the PHY interrupt (best-effort: a failed
+    // ack must not block the republish).
+    let _ = mdio_read(dev, INTERNAL_PHY_ID, PHY_INT_SRC).await;
+    let Ok((up, speed, duplex)) = phy_link_status(dev).await else {
+        return;
+    };
+    let prev = {
+        let g = LAN95XX_DEVICES.lock();
+        match g.get(idx) {
+            Some(rec) if !rec.detached => LinkState {
+                up: rec.link_up,
+                speed: rec.link_speed,
+                duplex: rec.link_duplex,
+            },
+            _ => return,
+        }
+    };
+    let Some(next) = link_change_decision(&prev, up, speed, duplex) else {
+        return;
+    };
+    let name = {
+        let mut g = LAN95XX_DEVICES.lock();
+        let Some(rec) = g.get_mut(idx) else {
+            return;
+        };
+        if rec.detached {
+            return;
+        }
+        rec.link_up = next.up;
+        rec.link_speed = next.speed;
+        rec.link_duplex = next.duplex;
+        rec.iface_name.clone()
+    };
+    // Duplex write from the freshest `MAC_CR` shadow (read
+    // after the PHY sample, immediately before the write, so
+    // a multicast configure landing mid-path is not clobbered).
+    if next.up {
+        if let Some(duplex) = next.duplex {
+            let shadow = {
+                let g = LAN95XX_DEVICES.lock();
+                g.get(idx).map(|d| d.mac_cr)
+            };
+            if let Some(shadow) = shadow {
+                let new_cr = mac_cr_for_duplex(shadow, duplex);
+                if reg_write(dev, MAC_CR, new_cr).await.is_ok() {
+                    let mut g = LAN95XX_DEVICES.lock();
+                    if let Some(rec) = g.get_mut(idx) {
+                        if !rec.detached {
+                            rec.mac_cr = new_cr;
+                        }
+                    }
+                }
+            }
+        }
+        narf_net::iface::set_link_metadata(&name, true, next.speed, next.duplex);
+    } else {
+        narf_net::iface::set_link_metadata(&name, false, None, None);
+    }
+}
+
+/// Interrupt-IN status task (Linux `smsc95xx_status`): arm
+/// once with a 4-byte buffer, then poll — `poll_interrupt_in`
+/// re-arms after every completion, so exactly one transfer
+/// stays outstanding. Only PHY-interrupt events reach the
+/// handler; short transfers and non-PHY words are ignored.
+/// Exits on detach or a bounded run of consecutive transfer
+/// errors (a removed device surfaces as persistent errors,
+/// same bound as the RX pump).
+async fn status_task(device: Arc<USBDevice>, idx: usize) {
+    let int_dci = {
+        let g = LAN95XX_DEVICES.lock();
+        match g.get(idx).and_then(|d| d.int_dci) {
+            Some(d) => d,
+            None => return,
+        }
+    };
+    if device
+        .arm_interrupt_in(int_dci, INT_STATUS_LEN as u32)
+        .is_err()
+    {
+        return;
+    }
+    let mut buf = [0u8; INT_STATUS_LEN];
+    let mut errors = 0u32;
+    loop {
+        let detached = {
+            let g = LAN95XX_DEVICES.lock();
+            g.get(idx).map(|d| d.detached).unwrap_or(true)
+        };
+        if detached {
+            break;
+        }
+        match device.poll_interrupt_in(int_dci, &mut buf) {
+            Ok(Some(n)) => {
+                errors = 0;
+                if lan95xx_interrupt_phy(&buf[..n]) {
+                    handle_link_event(&device, idx).await;
+                }
+            }
+            Ok(None) => narf_scheduler::yield_now().await,
+            Err(_) => {
+                errors += 1;
+                if errors >= 16 {
+                    break;
+                }
+                narf_scheduler::yield_now().await;
+            }
+        }
     }
 }
 
@@ -1177,7 +1674,9 @@ fn probe(device: Arc<USBDevice>, _hub_port: Option<(u8, u8)>) -> Result<(), UsbP
 
 /// Detach hook for a slot: tombstone every LAN95xx record bound
 /// to it and unregister its net iface. The pump exits at its next
-/// `pump_should_continue` check once `pump_running` clears;
+/// `pump_should_continue` check once `pump_running` clears; the
+/// link-change status task exits at its next loop check once
+/// `detached` is set.
 /// TX resolves to `None` instead of retargeting a later device
 /// (records are never removed — the ECM/NCM rule: net-registry
 /// TX cookies are record indices). Unknown slots no-op; repeat
@@ -1613,6 +2112,247 @@ pub mod tests {
         TestResult::Pass
     }
 
+    fn smoke_lan95xx_interrupt_decode() -> TestResult {
+        // Exactly 4 bytes, LE32, PHY-interrupt bit 15 set.
+        if !lan95xx_interrupt_phy(&[0x00, 0x80, 0x00, 0x00]) {
+            return TestResult::Fail("PHY interrupt word not recognised");
+        }
+        // All bits set still carries the PHY interrupt.
+        if !lan95xx_interrupt_phy(&[0xFF, 0xFF, 0xFF, 0xFF]) {
+            return TestResult::Fail("all-bits word not recognised");
+        }
+        // No PHY bit: TX-error word (bit 14) is not a link event.
+        if lan95xx_interrupt_phy(&[0x00, 0x40, 0x00, 0x00]) {
+            return TestResult::Fail("non-PHY word treated as link event");
+        }
+        // All-zero word: no event.
+        if lan95xx_interrupt_phy(&[0x00, 0x00, 0x00, 0x00]) {
+            return TestResult::Fail("zero word treated as link event");
+        }
+        // Linux requires exactly 4 bytes: short, empty, and long
+        // transfers are ignored even with the PHY bit set.
+        if lan95xx_interrupt_phy(&[0x00, 0x80, 0x00]) {
+            return TestResult::Fail("short transfer treated as link event");
+        }
+        if lan95xx_interrupt_phy(&[]) {
+            return TestResult::Fail("empty transfer treated as link event");
+        }
+        if lan95xx_interrupt_phy(&[0x00, 0x80, 0x00, 0x00, 0x00]) {
+            return TestResult::Fail("long transfer treated as link event");
+        }
+        TestResult::Pass
+    }
+
+    fn smoke_lan95xx_link_change_decision() -> TestResult {
+        use narf_net::iface::LinkDuplex;
+        let down = LinkState {
+            up: false,
+            speed: None,
+            duplex: None,
+        };
+        // Fake link-change interrupt, cable plugged in after
+        // bind: down -> 100/full republishes.
+        let up100 = match link_change_decision(&down, true, Some(100), Some(LinkDuplex::Full)) {
+            Some(s) => s,
+            None => return TestResult::Fail("link-up change missed"),
+        };
+        if up100
+            != (LinkState {
+                up: true,
+                speed: Some(100),
+                duplex: Some(LinkDuplex::Full),
+            })
+        {
+            return TestResult::Fail("link-up state wrong");
+        }
+        // Duplicate interrupt, same state: no republish.
+        if link_change_decision(&up100, true, Some(100), Some(LinkDuplex::Full)).is_some() {
+            return TestResult::Fail("unchanged state republished");
+        }
+        // Renegotiation without carrier drop: 100/full ->
+        // 10/half republishes.
+        let up10 = match link_change_decision(&up100, true, Some(10), Some(LinkDuplex::Half)) {
+            Some(s) => s,
+            None => return TestResult::Fail("renegotiation change missed"),
+        };
+        if up10.speed != Some(10) || up10.duplex != Some(LinkDuplex::Half) {
+            return TestResult::Fail("renegotiation state wrong");
+        }
+        // Cable unplugged: link-down republishes with no mode.
+        let back_down = match link_change_decision(&up10, false, None, None) {
+            Some(s) => s,
+            None => return TestResult::Fail("link-down change missed"),
+        };
+        if back_down != down {
+            return TestResult::Fail("link-down state wrong");
+        }
+        // No interrupt (still down): no republish.
+        if link_change_decision(&down, false, None, None).is_some() {
+            return TestResult::Fail("steady down state republished");
+        }
+        // Link-up with unknown mode still publishes carrier.
+        let unknown = match link_change_decision(&down, true, None, None) {
+            Some(s) => s,
+            None => return TestResult::Fail("unknown-mode link-up missed"),
+        };
+        if !unknown.up || unknown.speed.is_some() || unknown.duplex.is_some() {
+            return TestResult::Fail("unknown-mode state wrong");
+        }
+        // A down state never carries a mode, even if the
+        // caller passes one.
+        let forced = match link_change_decision(&up10, false, Some(100), Some(LinkDuplex::Full)) {
+            Some(s) => s,
+            None => return TestResult::Fail("forced-down change missed"),
+        };
+        if forced.speed.is_some() || forced.duplex.is_some() {
+            return TestResult::Fail("down state carries a mode");
+        }
+        TestResult::Pass
+    }
+
+    fn smoke_lan95xx_mac_cr_duplex() -> TestResult {
+        use narf_net::iface::LinkDuplex;
+        // Base: TXEN | RXEN | HPFILT (bind-time steady state).
+        let base = MAC_CR_TXEN_ | MAC_CR_RXEN_ | MAC_CR_HPFILT_;
+        let full = mac_cr_for_duplex(base, LinkDuplex::Full);
+        if full & MAC_CR_FDPX_ == 0 || full & MAC_CR_RCVOWN_ != 0 {
+            return TestResult::Fail("full-duplex bits wrong");
+        }
+        if full & MAC_CR_HPFILT_ == 0 || full & (MAC_CR_TXEN_ | MAC_CR_RXEN_) == 0 {
+            return TestResult::Fail("full-duplex clobbered other bits");
+        }
+        let half = mac_cr_for_duplex(base, LinkDuplex::Half);
+        if half & MAC_CR_FDPX_ != 0 || half & MAC_CR_RCVOWN_ == 0 {
+            return TestResult::Fail("half-duplex bits wrong");
+        }
+        if half & MAC_CR_HPFILT_ == 0 || half & (MAC_CR_TXEN_ | MAC_CR_RXEN_) == 0 {
+            return TestResult::Fail("half-duplex clobbered other bits");
+        }
+        // From zero: exactly one bit each.
+        if mac_cr_for_duplex(0, LinkDuplex::Full) != MAC_CR_FDPX_ {
+            return TestResult::Fail("full-duplex from zero wrong");
+        }
+        if mac_cr_for_duplex(0, LinkDuplex::Half) != MAC_CR_RCVOWN_ {
+            return TestResult::Fail("half-duplex from zero wrong");
+        }
+        TestResult::Pass
+    }
+
+    fn smoke_lan95xx_multicast_program() -> TestResult {
+        // Bind-time steady state as the base: TXEN | RXEN.
+        let base = MAC_CR_TXEN_ | MAC_CR_RXEN_;
+        // Filtered set, three addresses (hash bits 31, 43, 15 —
+        // each independently re-computed with a Python
+        // crc32_le + bitrev32 oracle): HASHL bits 31 + 15,
+        // HASHH bit 11.
+        let prog = lan95xx_multicast_program(
+            base,
+            false,
+            false,
+            &[
+                [0x01, 0x00, 0x5E, 0x00, 0x00, 0x01],
+                [0x01, 0x00, 0x5E, 0x7F, 0xFF, 0xFA],
+                [0x01, 0x00, 0x5E, 0x00, 0x00, 0xFB],
+            ],
+        );
+        if (prog.hash_hi, prog.hash_lo) != (0x0000_0800, 0x8000_8000) {
+            return TestResult::Fail("filtered hash words wrong");
+        }
+        // The corrected HPFILT bit (0x2000) is set; the old
+        // wrong value (0x8000, HFILT) is not.
+        if prog.mac_cr & MAC_CR_HPFILT_ == 0 {
+            return TestResult::Fail("filtered program lacks HPFILT");
+        }
+        if prog.mac_cr & MAC_CR_HFILT_ != 0 {
+            return TestResult::Fail("filtered program sets HFILT");
+        }
+        if prog.mac_cr & (MAC_CR_PRMS_ | MAC_CR_MCPAS_) != 0 {
+            return TestResult::Fail("filtered program sets PRMS/MCPAS");
+        }
+        if prog.mac_cr & (MAC_CR_TXEN_ | MAC_CR_RXEN_) == 0 {
+            return TestResult::Fail("filtered program clobbered TXEN/RXEN");
+        }
+        // Promiscuous wins over all-multicast + a list.
+        let prog =
+            lan95xx_multicast_program(base, true, true, &[[0x01, 0x00, 0x5E, 0x00, 0x00, 0x01]]);
+        if prog.mac_cr & MAC_CR_PRMS_ == 0
+            || prog.mac_cr & (MAC_CR_MCPAS_ | MAC_CR_HPFILT_) != 0
+            || (prog.hash_hi, prog.hash_lo) != (0, 0)
+        {
+            return TestResult::Fail("promiscuous program wrong");
+        }
+        // All-multicast: MCPAS, no filter, empty hash table.
+        let prog =
+            lan95xx_multicast_program(base, false, true, &[[0x01, 0x00, 0x5E, 0x00, 0x00, 0x01]]);
+        if prog.mac_cr & MAC_CR_MCPAS_ == 0
+            || prog.mac_cr & (MAC_CR_PRMS_ | MAC_CR_HPFILT_) != 0
+            || (prog.hash_hi, prog.hash_lo) != (0, 0)
+        {
+            return TestResult::Fail("all-multicast program wrong");
+        }
+        // Empty list: receive-own only, empty hash table.
+        let prog = lan95xx_multicast_program(base, false, false, &[]);
+        if prog.mac_cr & (MAC_CR_PRMS_ | MAC_CR_MCPAS_ | MAC_CR_HPFILT_) != 0
+            || (prog.hash_hi, prog.hash_lo) != (0, 0)
+        {
+            return TestResult::Fail("empty multicast program wrong");
+        }
+        if prog.mac_cr != base {
+            return TestResult::Fail("empty program changed base bits");
+        }
+        TestResult::Pass
+    }
+
+    fn smoke_lan95xx_interrupt_endpoint_finder() -> TestResult {
+        // Config (9) + interface (9, class 0xFF) + bulk OUT ep 2
+        // + bulk IN ep 0x81, maxpacket 512 each + interrupt IN
+        // ep 0x83, maxpacket 8, interval 10.
+        let mut cfg = Vec::new();
+        cfg.extend_from_slice(&[9, 0x02, 0x27, 0x00, 1, 1, 0, 0x80, 250]);
+        cfg.extend_from_slice(&[9, 0x04, 0, 0, 3, 0xFF, 0, 0, 0]);
+        cfg.extend_from_slice(&[7, 0x05, 0x02, 0x02, 0x00, 0x02, 0]);
+        cfg.extend_from_slice(&[7, 0x05, 0x81, 0x02, 0x00, 0x02, 0]);
+        cfg.extend_from_slice(&[7, 0x05, 0x83, 0x03, 0x08, 0x00, 10]);
+        // The bulk finder still finds its pair with the
+        // interrupt endpoint present.
+        let Some((in_ep, out_ep)) = find_smsc_endpoints(&cfg) else {
+            return TestResult::Fail("bulk pair lost with interrupt ep");
+        };
+        if in_ep.ep_addr != 0x81 || out_ep.ep_addr != 0x02 {
+            return TestResult::Fail("bulk addresses wrong");
+        }
+        let Some(ie) = find_smsc_interrupt_endpoint(&cfg) else {
+            return TestResult::Fail("interrupt endpoint not found");
+        };
+        if ie.ep_addr != 0x83 || ie.max_packet != 8 || ie.interval != 10 {
+            return TestResult::Fail("interrupt endpoint fields wrong");
+        }
+        if !matches!(ie.kind, EndpointKind::InterruptIn) {
+            return TestResult::Fail("interrupt endpoint kind wrong");
+        }
+        // No interrupt endpoint: None (bulk pair unaffected).
+        let mut cfg = Vec::new();
+        cfg.extend_from_slice(&[9, 0x02, 0x20, 0x00, 1, 1, 0, 0x80, 250]);
+        cfg.extend_from_slice(&[9, 0x04, 0, 0, 2, 0xFF, 0, 0, 0]);
+        cfg.extend_from_slice(&[7, 0x05, 0x02, 0x02, 0x00, 0x02, 0]);
+        cfg.extend_from_slice(&[7, 0x05, 0x81, 0x02, 0x00, 0x02, 0]);
+        if find_smsc_interrupt_endpoint(&cfg).is_some() {
+            return TestResult::Fail("interrupt endpoint invented");
+        }
+        // Interrupt-only config: finder finds it, bulk pair None.
+        let mut cfg = Vec::new();
+        cfg.extend_from_slice(&[9, 0x02, 0x10, 0x00, 1, 1, 0, 0x80, 250]);
+        cfg.extend_from_slice(&[9, 0x04, 0, 0, 1, 0xFF, 0, 0, 0]);
+        cfg.extend_from_slice(&[7, 0x05, 0x83, 0x03, 0x08, 0x00, 10]);
+        if find_smsc_interrupt_endpoint(&cfg).is_none() {
+            return TestResult::Fail("interrupt-only endpoint missed");
+        }
+        if find_smsc_endpoints(&cfg).is_some() {
+            return TestResult::Fail("interrupt-only accepted as bulk");
+        }
+        TestResult::Pass
+    }
+
     kernel_test_in!("drivers/usb/lan95xx", smoke_lan95xx_setup_packing);
     kernel_test_in!("drivers/usb/lan95xx", smoke_lan95xx_mii_address_cmd);
     kernel_test_in!("drivers/usb/lan95xx", smoke_lan95xx_multicast_hash);
@@ -1627,4 +2367,12 @@ pub mod tests {
     kernel_test_in!("drivers/usb/lan95xx", smoke_lan95xx_rx_aggregate_truncation);
     kernel_test_in!("drivers/usb/lan95xx", smoke_lan95xx_endpoint_finder);
     kernel_test_in!("drivers/usb/lan95xx", smoke_lan95xx_zlp_rule);
+    kernel_test_in!("drivers/usb/lan95xx", smoke_lan95xx_interrupt_decode);
+    kernel_test_in!("drivers/usb/lan95xx", smoke_lan95xx_link_change_decision);
+    kernel_test_in!("drivers/usb/lan95xx", smoke_lan95xx_mac_cr_duplex);
+    kernel_test_in!("drivers/usb/lan95xx", smoke_lan95xx_multicast_program);
+    kernel_test_in!(
+        "drivers/usb/lan95xx",
+        smoke_lan95xx_interrupt_endpoint_finder
+    );
 }
