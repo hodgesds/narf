@@ -55,6 +55,7 @@ pub mod gatt;
 pub mod gatt_client;
 pub mod gatt_server;
 pub mod h4;
+pub mod h4_transport;
 pub mod h5;
 pub mod h5_transport;
 pub mod hci;
