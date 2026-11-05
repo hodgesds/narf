@@ -183,6 +183,7 @@ impl ExecRequest {
     /// (ExecWire::read), then the fences (parse_execbuf2_extensions,
     /// add_fence_array, the IN/SUBMIT sync_file), and only then the objects
     /// eb_lookup_vmas resolves.
+    #[allow(dead_code)]
     pub(crate) fn read_submission(
         user: &dyn IoctlContext,
         address: u64,
@@ -197,7 +198,7 @@ impl ExecRequest {
 
 /// The copied drm_i915_gem_execbuffer2 and its exec-object array: what
 /// i915_gem_execbuffer2_ioctl hands i915_gem_do_execbuffer.
-struct ExecWire {
+pub(crate) struct ExecWire {
     request: [u8; 64],
     objects: Vec<u8>,
 }
@@ -207,7 +208,11 @@ impl ExecWire {
     /// i915_gem_check_execbuffer:2180 (each -EINVAL), the exec-object copy
     /// (-EFAULT), then i915_gem_do_execbuffer's first refusal: I915_EXEC_SECURE
     /// is -ENODEV on GRAPHICS_VER >= 11. No fence, handle or context is read.
-    fn read(user: &dyn IoctlContext, address: u64, explicit: bool) -> Result<Self, FsError> {
+    pub(crate) fn read(
+        user: &dyn IoctlContext,
+        address: u64,
+        explicit: bool,
+    ) -> Result<Self, FsError> {
         let mut request = [0; 64];
         user.read(address, &mut request)?;
         let count = u32_at(&request, 8) as usize;
@@ -259,8 +264,24 @@ impl ExecWire {
         Ok(Self { request, objects })
     }
 
+    pub(crate) fn raw_request(&self) -> &[u8; 64] {
+        &self.request
+    }
+
+    pub(crate) fn context_id(&self) -> u32 {
+        u64_at(&self.request, 48) as u32
+    }
+
+    pub(crate) fn ring(&self) -> u32 {
+        u64_at(&self.request, 40) as u32
+    }
+
+    pub(crate) fn dr4_fixed_up(&self) -> bool {
+        u32_at(&self.request, 24) == u32::MAX
+    }
+
     /// eb_lookup_vmas and the batch selection, after the fences.
-    fn resolve(self, gem: &GemState) -> Result<ExecRequest, FsError> {
+    pub(crate) fn resolve(self, gem: &GemState) -> Result<ExecRequest, FsError> {
         let request = &self.request;
         let count = u32_at(request, 8) as usize;
         let start = u32_at(request, 12) as u64;

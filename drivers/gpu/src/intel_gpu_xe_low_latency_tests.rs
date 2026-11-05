@@ -144,7 +144,6 @@ fn smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback() -> Test
         (6, 0, FsError::InvalidData),
         (3, 0, FsError::BadAddress),
         (3, 32768 - 3 * 4096 + 1, FsError::BadAddress),
-        (3, 32768 - 3 * 4096, FsError::NotImplemented),
     ] {
         queue_wire(&user, vm, 1, 1, &[[0, 0, 0, 0]]);
         let mut ext = [0; 48];
@@ -157,6 +156,14 @@ fn smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback() -> Test
             Err(error)
         );
     }
+    // A readable hang replay image successfully creates the queue:
+    queue_wire(&user, vm, 1, 1, &[[0, 0, 0, 0]]);
+    let mut ext = [0; 48];
+    put32(&mut ext, 16, 3);
+    put64(&mut ext, 24, 32768 - 3 * 4096);
+    user.wire.store(8192, &ext);
+    user.wire.store(64, &8192u64.to_le_bytes());
+    assert_eq!(invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE), Ok(0));
     assert_eq!(
         invoke(&file, &info, &user, 0x4028644e),
         Err(FsError::InvalidData)
