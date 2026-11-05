@@ -31,7 +31,9 @@ pub enum EventCode {
     MaxSlotsChange = 0x1B,
     ReadClockOffsetComplete = 0x1D,
     QosSetupComplete = 0x1F,
+    InquiryResultWithRssi = 0x22,
     SyncConnectionComplete = 0x2C,
+    ExtendedInquiryResult = 0x2F,
     EncryptionKeyRefreshComplete = 0x30,
     IoCapabilityRequest = 0x31,
     IoCapabilityResponse = 0x32,
@@ -67,7 +69,9 @@ impl EventCode {
             0x1B => Some(Self::MaxSlotsChange),
             0x1D => Some(Self::ReadClockOffsetComplete),
             0x1F => Some(Self::QosSetupComplete),
+            0x22 => Some(Self::InquiryResultWithRssi),
             0x2C => Some(Self::SyncConnectionComplete),
+            0x2F => Some(Self::ExtendedInquiryResult),
             0x30 => Some(Self::EncryptionKeyRefreshComplete),
             0x31 => Some(Self::IoCapabilityRequest),
             0x32 => Some(Self::IoCapabilityResponse),
@@ -684,6 +688,162 @@ pub fn parse_inquiry_results(event: &Event) -> Option<alloc::vec::Vec<InquiryRes
         });
     }
     Some(out)
+}
+
+/// One device returned inside an `HCI_Inquiry_Result_with_RSSI`
+/// event (§7.7.33, code 0x22). Each entry is 14 bytes: the
+/// standard 14-byte entry (§7.7.2) with its second Reserved byte
+/// dropped and a signed RSSI in dBm appended — BD_ADDR(6),
+/// PSRM(1), Reserved(1), CoD(3), Clock_Offset(2), RSSI(1).
+/// (Linux `struct inquiry_info_with_rssi`; a one-response event
+/// carries plen 15 = Num_Responses(1) + 14.) The byte after PSRM
+/// is the page-scan period mode / Reserved byte; it carries no
+/// host-usable value and is skipped, exactly as the 2 reserved
+/// bytes are skipped in the standard entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InquiryResultWithRssiEntry {
+    pub bd_addr: [u8; 6],
+    pub page_scan_repetition_mode: u8,
+    pub class_of_device: [u8; 3],
+    pub clock_offset: u16,
+    pub rssi: i8,
+}
+
+pub fn parse_inquiry_results_with_rssi(
+    event: &Event,
+) -> Option<alloc::vec::Vec<InquiryResultWithRssiEntry>> {
+    if event.code != EventCode::InquiryResultWithRssi as u8 {
+        return None;
+    }
+    let p = &event.params;
+    if p.is_empty() {
+        return None;
+    }
+    let n = p[0] as usize;
+    if p.len() < 1 + n * 14 {
+        return None;
+    }
+    let mut out = alloc::vec::Vec::with_capacity(n);
+    for i in 0..n {
+        let base = 1 + i * 14;
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&p[base..base + 6]);
+        let psrm = p[base + 6];
+        let mut cod = [0u8; 3];
+        cod.copy_from_slice(&p[base + 8..base + 11]);
+        let clk = u16::from_le_bytes([p[base + 11], p[base + 12]]);
+        let rssi = p[base + 13] as i8;
+        out.push(InquiryResultWithRssiEntry {
+            bd_addr: addr,
+            page_scan_repetition_mode: psrm,
+            class_of_device: cod,
+            clock_offset: clk,
+            rssi,
+        });
+    }
+    Some(out)
+}
+
+/// One device returned inside an `HCI_Extended_Inquiry_Result`
+/// event (§7.7.38, code 0x2F). Each entry is 254 bytes — the
+/// 14-byte RSSI entry (§7.7.33) plus the 240-byte Extended
+/// Inquiry Response (EIR), an AD-format TLV block (Core Spec
+/// Supplement Part A §1) whose Complete/Shortened Local Name
+/// records carry the peer's name. (Linux `struct
+/// extended_inquiry_info`; a one-response event carries plen 255
+/// = Num_Responses(1) + 254.) The EIR bytes are kept raw; name
+/// extraction lives with the peer table (`classic`), which reuses
+/// the AD walker in `gap` instead of re-parsing TLV here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtendedInquiryResultEntry {
+    pub bd_addr: [u8; 6],
+    pub page_scan_repetition_mode: u8,
+    pub class_of_device: [u8; 3],
+    pub clock_offset: u16,
+    pub rssi: i8,
+    pub eir: [u8; 240],
+}
+
+pub fn parse_extended_inquiry_results(
+    event: &Event,
+) -> Option<alloc::vec::Vec<ExtendedInquiryResultEntry>> {
+    if event.code != EventCode::ExtendedInquiryResult as u8 {
+        return None;
+    }
+    let p = &event.params;
+    if p.is_empty() {
+        return None;
+    }
+    let n = p[0] as usize;
+    if p.len() < 1 + n * 254 {
+        return None;
+    }
+    let mut out = alloc::vec::Vec::with_capacity(n);
+    for i in 0..n {
+        let base = 1 + i * 254;
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&p[base..base + 6]);
+        let psrm = p[base + 6];
+        let mut cod = [0u8; 3];
+        cod.copy_from_slice(&p[base + 8..base + 11]);
+        let clk = u16::from_le_bytes([p[base + 11], p[base + 12]]);
+        let rssi = p[base + 13] as i8;
+        let mut eir = [0u8; 240];
+        eir.copy_from_slice(&p[base + 14..base + 254]);
+        out.push(ExtendedInquiryResultEntry {
+            bd_addr: addr,
+            page_scan_repetition_mode: psrm,
+            class_of_device: cod,
+            clock_offset: clk,
+            rssi,
+            eir,
+        });
+    }
+    Some(out)
+}
+
+/// Decoded `HCI_Remote_Name_Request_Complete` event (§7.7.7,
+/// code 0x07). Layout: Status(1) BD_ADDR(6) Remote_Name(248)
+/// = 255 bytes. Remote_Name is the peer's user-friendly name,
+/// NUL-terminated and NUL-padded when shorter than 248 bytes;
+/// [`RemoteNameRequestComplete::name_bytes`] returns the bytes
+/// up to the first NUL (empty when the name field is all NULs).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RemoteNameRequestComplete {
+    pub status: u8,
+    pub bd_addr: [u8; 6],
+    pub remote_name: [u8; 248],
+}
+
+impl RemoteNameRequestComplete {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::RemoteNameRequestComplete as u8 {
+            return None;
+        }
+        let p = &event.params;
+        if p.len() < 255 {
+            return None;
+        }
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&p[1..7]);
+        let mut remote_name = [0u8; 248];
+        remote_name.copy_from_slice(&p[7..255]);
+        Some(Self {
+            status: p[0],
+            bd_addr: addr,
+            remote_name,
+        })
+    }
+
+    /// Name bytes up to the first NUL terminator.
+    pub fn name_bytes(&self) -> &[u8] {
+        let end = self
+            .remote_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.remote_name.len());
+        &self.remote_name[..end]
+    }
 }
 
 /// Decoded `HCI_Connection_Complete` event (§7.7.3) — classic BR/EDR.

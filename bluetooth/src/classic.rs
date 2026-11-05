@@ -14,7 +14,8 @@
 
 use alloc::vec::Vec;
 
-use crate::event::InquiryResultEntry;
+use crate::event::{ExtendedInquiryResultEntry, InquiryResultEntry, InquiryResultWithRssiEntry};
+use crate::gap;
 use crate::hci::Command;
 use crate::opcode as op;
 
@@ -45,6 +46,46 @@ pub fn build_inquiry(lap: [u8; 3], inquiry_length: u8, num_responses: u8) -> Com
 /// Inquiry Complete event (§7.7.1) ending the inquiry window.
 pub fn build_inquiry_cancel() -> Command {
     Command::with_params(op::HCI_INQUIRY_CANCEL, &[])
+}
+
+/// Build an `HCI_Remote_Name_Request` command (§7.1.19).
+///
+/// - `bd_addr`: remote device's 6-byte BD_ADDR (wire order, LSB first).
+/// - `psrm`: Page_Scan_Repetition_Mode (from an Inquiry Result).
+/// - `clock_offset`: 16-bit clock offset from an Inquiry Result.
+///
+/// Returns Command Status first; the name arrives in a Remote Name
+/// Request Complete event (§7.7.7, code 0x07). Only one Remote Name
+/// Request may be outstanding at a time — the controller rejects a
+/// second one (and one issued while inquiring) with Command
+/// Disallowed (0x0C), so the pump serialises it.
+pub fn build_remote_name_request(bd_addr: [u8; 6], psrm: u8, clock_offset: u16) -> Command {
+    let mut p = [0u8; 10];
+    p[0..6].copy_from_slice(&bd_addr);
+    p[6] = psrm;
+    p[7] = 0; // Reserved (§7.1.19).
+    p[8] = (clock_offset & 0xFF) as u8;
+    p[9] = (clock_offset >> 8) as u8;
+    Command::with_params(op::HCI_REMOTE_NAME_REQUEST, &p)
+}
+
+// ── Inquiry mode ───────────────────────────────────────────────────
+
+/// Inquiry mode (§7.3.45, `HCI_Write_Inquiry_Mode`): standard
+/// Inquiry Result events only (0x02).
+pub const INQUIRY_MODE_STANDARD: u8 = 0x00;
+/// Inquiry mode (§7.3.45): Inquiry Result with RSSI events (0x22).
+pub const INQUIRY_MODE_WITH_RSSI: u8 = 0x01;
+/// Inquiry mode (§7.3.45): Inquiry Result with RSSI (0x22) or
+/// Extended Inquiry Result (0x2F) events.
+pub const INQUIRY_MODE_WITH_RSSI_OR_EIR: u8 = 0x02;
+
+/// Build an `HCI_Write_Inquiry_Mode` command (§7.3.45).
+/// `mode`: 0 = standard, 1 = with RSSI, 2 = with RSSI or EIR.
+/// The controller only emits 0x22/0x2F results after mode 1/2 is
+/// accepted; until then inquiry yields standard results (0x02).
+pub fn build_write_inquiry_mode(mode: u8) -> Command {
+    Command::with_params(op::HCI_WRITE_INQUIRY_MODE, &[mode])
 }
 
 // ── Create Connection ──────────────────────────────────────────────
@@ -281,13 +322,31 @@ pub enum ClassicPhase {
 /// A peer discovered by inquiry (§7.7.2). PSRM + clock offset are
 /// the paging parameters HCI_Create_Connection needs (§7.1.5); the
 /// class of device is recorded for the trigger layer (profile
-/// selection lives in a later lane).
+/// selection lives in a later lane). RSSI and name arrive only
+/// from the richer result events: RSSI from Inquiry Result with
+/// RSSI (0x22) / Extended Inquiry Result (0x2F), the name from
+/// an EIR Complete/Shortened Local Name record (0x2F) or a Remote
+/// Name Request Complete (0x07). Both stay `None`/empty until
+/// such an event lands — a standard re-report never clears them.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ClassicPeer {
     pub bd_addr: [u8; 6],
     pub page_scan_repetition_mode: u8,
     pub class_of_device: [u8; 3],
     pub clock_offset: u16,
+    /// Last RSSI in dBm, if an 0x22/0x2F result ever reported it.
+    pub rssi: Option<i8>,
+    /// Remote name bytes (raw, not NUL-terminated); `name_len`
+    /// bytes are valid, 0 when the name is still unknown.
+    pub name: [u8; 248],
+    pub name_len: u8,
+}
+
+impl ClassicPeer {
+    /// Name bytes, empty when the name is still unknown.
+    pub fn name_bytes(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
 }
 
 /// Parameters for one deferred page: the peer's paging parameters
@@ -309,6 +368,10 @@ pub struct ClassicCentral {
     /// Last Write_Scan_Enable mode the controller accepted (0 = off,
     /// 1 = inquiry, 2 = page, 3 = both). 0 until one succeeds.
     pub scan_mode: u8,
+    /// Last Write_Inquiry_Mode mode the controller accepted
+    /// (0 = standard, 1 = with RSSI, 2 = with RSSI or EIR).
+    /// 0 until one succeeds — the controller's default.
+    pub inquiry_mode: u8,
 }
 
 impl ClassicCentral {
@@ -318,7 +381,9 @@ impl ClassicCentral {
 
     /// Record a discovered peer (or refresh its paging parameters).
     /// A re-report of the same BD_ADDR refreshes PSRM / class /
-    /// clock offset in place; it never duplicates the entry.
+    /// clock offset in place; it never duplicates the entry, and
+    /// never clears a previously learned RSSI or name — the
+    /// standard result carries neither.
     pub fn report_inquiry_result(&mut self, entry: &InquiryResultEntry) {
         if let Some(p) = self.peers.iter_mut().find(|p| p.bd_addr == entry.bd_addr) {
             p.page_scan_repetition_mode = entry.page_scan_repetition_mode;
@@ -331,7 +396,91 @@ impl ClassicCentral {
             page_scan_repetition_mode: entry.page_scan_repetition_mode,
             class_of_device: entry.class_of_device,
             clock_offset: entry.clock_offset,
+            rssi: None,
+            name: [0u8; 248],
+            name_len: 0,
         });
+    }
+
+    /// Record a discovered peer from an Inquiry Result with RSSI
+    /// (§7.7.33). Same refresh discipline as
+    /// [`Self::report_inquiry_result`], plus the RSSI is recorded;
+    /// a later standard re-report keeps the last RSSI.
+    pub fn report_inquiry_result_with_rssi(&mut self, entry: &InquiryResultWithRssiEntry) {
+        if let Some(p) = self.peers.iter_mut().find(|p| p.bd_addr == entry.bd_addr) {
+            p.page_scan_repetition_mode = entry.page_scan_repetition_mode;
+            p.class_of_device = entry.class_of_device;
+            p.clock_offset = entry.clock_offset;
+            p.rssi = Some(entry.rssi);
+            return;
+        }
+        self.peers.push(ClassicPeer {
+            bd_addr: entry.bd_addr,
+            page_scan_repetition_mode: entry.page_scan_repetition_mode,
+            class_of_device: entry.class_of_device,
+            clock_offset: entry.clock_offset,
+            rssi: Some(entry.rssi),
+            name: [0u8; 248],
+            name_len: 0,
+        });
+    }
+
+    /// Record a discovered peer from an Extended Inquiry Result
+    /// (§7.7.38). Same refresh discipline as
+    /// [`Self::report_inquiry_result_with_rssi`], plus the EIR
+    /// name: a Complete Local Name record wins, else a Shortened
+    /// Local Name record (same AD format / walker as LE
+    /// advertising data — `gap::find`). A malformed EIR, or one
+    /// with no name record, records the peer + RSSI and leaves
+    /// any previously learned name untouched.
+    pub fn report_extended_inquiry_result(&mut self, entry: &ExtendedInquiryResultEntry) {
+        let eir_name = gap::find(&entry.eir, gap::AD_COMPLETE_LOCAL_NAME)
+            .or_else(|| gap::find(&entry.eir, gap::AD_SHORTENED_LOCAL_NAME));
+        if let Some(p) = self.peers.iter_mut().find(|p| p.bd_addr == entry.bd_addr) {
+            p.page_scan_repetition_mode = entry.page_scan_repetition_mode;
+            p.class_of_device = entry.class_of_device;
+            p.clock_offset = entry.clock_offset;
+            p.rssi = Some(entry.rssi);
+            if let Some(name) = eir_name {
+                Self::store_name(p, name);
+            }
+            return;
+        }
+        let mut peer = ClassicPeer {
+            bd_addr: entry.bd_addr,
+            page_scan_repetition_mode: entry.page_scan_repetition_mode,
+            class_of_device: entry.class_of_device,
+            clock_offset: entry.clock_offset,
+            rssi: Some(entry.rssi),
+            name: [0u8; 248],
+            name_len: 0,
+        };
+        if let Some(name) = eir_name {
+            Self::store_name(&mut peer, name);
+        }
+        self.peers.push(peer);
+    }
+
+    /// Store `name` bytes into a peer entry, truncating to the
+    /// 248-byte Remote_Name field width. Caller supplies
+    /// already-delimited bytes (EIR payload length, or the
+    /// NUL-trimmed Remote_Name field).
+    fn store_name(peer: &mut ClassicPeer, name: &[u8]) {
+        let n = name.len().min(248);
+        peer.name[..n].copy_from_slice(&name[..n]);
+        peer.name[n..].fill(0);
+        peer.name_len = n as u8;
+    }
+
+    /// Deliver a Remote Name Request Complete (§7.7.7) name into
+    /// the peer table. Only updates a peer inquiry already
+    /// discovered; an unknown address is ignored (the pump only
+    /// issues name requests for discovered peers, so this is a
+    /// defence-in-depth no-op, never a table insert).
+    pub fn note_remote_name(&mut self, bd_addr: &[u8; 6], name: &[u8]) {
+        if let Some(p) = self.peers.iter_mut().find(|p| &p.bd_addr == bd_addr) {
+            Self::store_name(p, name);
+        }
     }
 
     /// The discovered peer with this BD_ADDR, if inquiry saw it.
@@ -378,6 +527,11 @@ impl ClassicCentral {
     /// Record a Write_Scan_Enable mode the controller accepted.
     pub fn note_scan_enable(&mut self, mode: u8) {
         self.scan_mode = mode;
+    }
+
+    /// Record a Write_Inquiry_Mode mode the controller accepted.
+    pub fn note_inquiry_mode(&mut self, mode: u8) {
+        self.inquiry_mode = mode;
     }
 
     /// Return to Idle (inquiry refused / ended, page refused).
