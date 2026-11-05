@@ -20,6 +20,9 @@
 //! - [`event`] — Event-code enum + event packet builders/parsers.
 //! - [`transport`] — `HciTransport` trait. USB / UART concrete
 //!   bindings register against the global registry.
+//! - [`h5_transport`] — `H5Transport: HciTransport` over a byte
+//!   port: H5 link establishment (SYNC / CONFIG) + reliable packets
+//!   (sequence numbers, sliding window, retransmission).
 //! - [`controller`] — bring-up state machine (Reset → Read Local
 //!   Version → Read BD_ADDR → Set Event Mask). Drives a transport
 //!   through the mandatory init dance described in Vol 4 Part E §3.
@@ -53,6 +56,7 @@ pub mod gatt_client;
 pub mod gatt_server;
 pub mod h4;
 pub mod h5;
+pub mod h5_transport;
 pub mod hci;
 pub mod hci_sock;
 pub mod hfp;

@@ -21,7 +21,7 @@
 //!   │           │   bit  9      reliable (ACK required)
 //!   │           │   bits 11:10  packet type (0=ACK, 1=Cmd, 2=ACL,
 //!   │           │                          3=Sync, 4=Event, 5=ISO,
-//!   │           │                          15=Vendor)
+//!   │           │                          14=Vendor, 15=Link Control)
 //!   │           │   bits 23:12  payload length
 //!   │           │   bits 31:24  header checksum
 //!   └───────────┘
@@ -48,12 +48,12 @@
 //!
 //! ## Scope
 //!
-//! Wire-format codec only — header packing, SLIP escape/unescape,
-//! and CRC. The retransmission state machine (sliding window,
-//! sender's/receiver's sequence numbers, RST/SYNC/CONFIG link
-//! establishment messages) is left for the Stage-3 driver core
-//! that drives an actual UART; this codec hands it the framed
-//! bytes ready to write and the unescaped frame ready to consume.
+//! Wire-format codec — header packing, SLIP escape/unescape, CRC, and
+//! the link-control message vocabulary (SYNC / CONFIG / WAKEUP ...,
+//! plus the Configuration Field). The link-establishment state machine
+//! (sliding window, sender's/receiver's sequence numbers,
+//! retransmission) lives in [`crate::h5_transport::H5Transport`],
+//! which drives this codec over a byte port.
 
 use alloc::vec::Vec;
 
@@ -75,7 +75,12 @@ pub enum H5PacketType {
     SyncData = 3,
     HciEvent = 4,
     IsoData = 5,
-    VendorSpecific = 15,
+    /// Vendor-specific packets (Vol 4 Part D §4.5 Table 4.1: 14).
+    VendorSpecific = 14,
+    /// Link-control packets — SYNC / CONFIG / WAKEUP / ... (§4.5
+    /// Table 4.1: 15). An earlier revision of this codec mislabelled
+    /// 15 as Vendor Specific; the spec assigns 14 to vendors.
+    LinkControl = 15,
 }
 
 impl H5PacketType {
@@ -87,9 +92,137 @@ impl H5PacketType {
             3 => H5PacketType::SyncData,
             4 => H5PacketType::HciEvent,
             5 => H5PacketType::IsoData,
-            15 => H5PacketType::VendorSpecific,
+            14 => H5PacketType::VendorSpecific,
+            15 => H5PacketType::LinkControl,
             _ => return None,
         })
+    }
+}
+
+// ── Link-control messages (Vol 4 Part D §8, §9) ─────────────────────
+
+// Link-control payloads are unreliable packets of type 15 (Link
+// Control). Every payload's second octet is the first octet's low 7
+// bits inverted, with the MSB set to ensure even parity (§8
+// footnote [3]); the pairs below are the spec's literal values.
+//
+// There is no RST link message in Part D: a peer reset is signalled
+// by a SYNC arriving while Active (§8.3), which restarts link
+// establishment at the Uninitialized state.
+
+/// SYNC (§8.4): sent periodically in the Uninitialized state.
+pub const LINK_SYNC: [u8; 2] = [0x01, 0x7E];
+/// SYNC RESPONSE (§8.5): reply to a SYNC.
+pub const LINK_SYNC_RESP: [u8; 2] = [0x02, 0x7D];
+/// CONFIG (§8.6): `0x03 0xFC` + Configuration Field (host sends the
+/// field; the controller sends CONFIG without one, §8.8).
+pub const LINK_CONFIG: [u8; 2] = [0x03, 0xFC];
+/// CONFIG RESPONSE (§8.7): `0x04 0x7B` + Configuration Field
+/// (controller sends the field; the host sends CONFIG RESPONSE
+/// without one, §8.8).
+pub const LINK_CONFIG_RESP: [u8; 2] = [0x04, 0x7B];
+/// WAKEUP (§9.1): first message when the peer is believed asleep.
+pub const LINK_WAKEUP: [u8; 2] = [0x05, 0xFA];
+/// WOKEN (§9.2): mandatory reply to a WAKEUP.
+pub const LINK_WOKEN: [u8; 2] = [0x06, 0xF9];
+/// SLEEP (§9.3): notifies the peer this device is going to sleep.
+pub const LINK_SLEEP: [u8; 2] = [0x07, 0x78];
+
+/// Second octet of a link-control payload, computed from the first
+/// octet by the §8 footnote [3] parity rule: invert the low 7 bits,
+/// then set the MSB iff that leaves an odd number of 1-bits (so the
+/// finished octet always has even parity).
+pub fn link_second_octet(first: u8) -> u8 {
+    let inv = !(first & 0x7F) & 0x7F;
+    if inv.count_ones() % 2 == 0 {
+        inv
+    } else {
+        inv | 0x80
+    }
+}
+
+/// A link-control message, classified from its payload.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LinkControlKind {
+    Sync,
+    SyncResp,
+    Config,
+    ConfigResp,
+    Wakeup,
+    Woken,
+    Sleep,
+}
+
+impl LinkControlKind {
+    /// Classify a Link Control payload. Returns the kind plus the
+    /// trailing bytes after the two-octet prefix — the Configuration
+    /// Field for CONFIG / CONFIG RESPONSE (possibly empty, §8.8),
+    /// empty for the rest. `None` for an unrecognised prefix.
+    pub fn from_payload(payload: &[u8]) -> Option<(Self, &[u8])> {
+        if payload.len() < 2 {
+            return None;
+        }
+        let kind = match (payload[0], payload[1]) {
+            (0x01, 0x7E) => LinkControlKind::Sync,
+            (0x02, 0x7D) => LinkControlKind::SyncResp,
+            (0x03, 0xFC) => LinkControlKind::Config,
+            (0x04, 0x7B) => LinkControlKind::ConfigResp,
+            (0x05, 0xFA) => LinkControlKind::Wakeup,
+            (0x06, 0xF9) => LinkControlKind::Woken,
+            (0x07, 0x78) => LinkControlKind::Sleep,
+            _ => return None,
+        };
+        Some((kind, &payload[2..]))
+    }
+
+    /// The two-octet prefix for this message.
+    pub fn prefix(self) -> [u8; 2] {
+        match self {
+            LinkControlKind::Sync => LINK_SYNC,
+            LinkControlKind::SyncResp => LINK_SYNC_RESP,
+            LinkControlKind::Config => LINK_CONFIG,
+            LinkControlKind::ConfigResp => LINK_CONFIG_RESP,
+            LinkControlKind::Wakeup => LINK_WAKEUP,
+            LinkControlKind::Woken => LINK_WOKEN,
+            LinkControlKind::Sleep => LINK_SLEEP,
+        }
+    }
+}
+
+/// The Configuration Field (Vol 4 Part D §8.8, Figure 8.6): a single
+/// octet, LSB-first — bits 2:0 sliding window size (1..=7, §8.8.2),
+/// bit 3 Out-Of-Frame software flow control (§8.8.4), bit 4
+/// data-integrity-check type (0 = none, 1 = 16-bit CCITT-CRC,
+/// §8.8.3), bits 7:5 version number (0 = v1.0, the only version this
+/// spec defines, §8.8.5).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct H5Config {
+    pub window: u8,
+    pub oof_flow_control: bool,
+    pub crc: bool,
+    pub version: u8,
+}
+
+impl H5Config {
+    pub fn encode(self) -> u8 {
+        (self.window & 0x07)
+            | (if self.oof_flow_control { 1 << 3 } else { 0 })
+            | (if self.crc { 1 << 4 } else { 0 })
+            | ((self.version & 0x07) << 5)
+    }
+
+    pub fn decode(b: u8) -> Self {
+        Self {
+            window: b & 0x07,
+            oof_flow_control: b & (1 << 3) != 0,
+            crc: b & (1 << 4) != 0,
+            version: (b >> 5) & 0x07,
+        }
+    }
+
+    /// Valid per §8.8.2/§8.8.5: window in 1..=7 and version 0 (v1.0).
+    pub fn is_valid(self) -> bool {
+        (1..=7).contains(&self.window) && self.version == 0
     }
 }
 
@@ -529,4 +662,117 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/h5", smoke_crc_ccitt_known_vector);
+
+    fn smoke_link_second_octet_matches_spec_pairs() -> TestResult {
+        // Vol 4 Part D §8.4–§8.7, §9.1–§9.3 literal pairs, each
+        // reproduced by the §8 footnote [3] parity rule.
+        let pairs = [
+            LINK_SYNC,
+            LINK_SYNC_RESP,
+            LINK_CONFIG,
+            LINK_CONFIG_RESP,
+            LINK_WAKEUP,
+            LINK_WOKEN,
+            LINK_SLEEP,
+        ];
+        for [first, second] in pairs {
+            if link_second_octet(first) != second {
+                return TestResult::Fail("parity rule != spec pair");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/h5", smoke_link_second_octet_matches_spec_pairs);
+
+    fn smoke_link_control_kind_classifies_all() -> TestResult {
+        let cases = [
+            (&LINK_SYNC[..], LinkControlKind::Sync),
+            (&LINK_SYNC_RESP[..], LinkControlKind::SyncResp),
+            (&LINK_CONFIG[..], LinkControlKind::Config),
+            (&LINK_CONFIG_RESP[..], LinkControlKind::ConfigResp),
+            (&LINK_WAKEUP[..], LinkControlKind::Wakeup),
+            (&LINK_WOKEN[..], LinkControlKind::Woken),
+            (&LINK_SLEEP[..], LinkControlKind::Sleep),
+        ];
+        for (payload, want) in cases {
+            match LinkControlKind::from_payload(payload) {
+                Some((got, rest)) if got == want && rest.is_empty() => {}
+                _ => return TestResult::Fail("link payload misclassified"),
+            }
+        }
+        // A CONFIG carrying a Configuration Field exposes the field.
+        let mut with_field = LINK_CONFIG.to_vec();
+        with_field.push(0x14);
+        match LinkControlKind::from_payload(&with_field) {
+            Some((LinkControlKind::Config, field)) if field == [0x14] => {}
+            _ => return TestResult::Fail("CONFIG field not exposed"),
+        }
+        // Unknown prefix / short payload rejected.
+        if LinkControlKind::from_payload(&[0x09, 0x76]).is_some()
+            || LinkControlKind::from_payload(&[0x01]).is_some()
+        {
+            return TestResult::Fail("bad link payload accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/h5", smoke_link_control_kind_classifies_all);
+
+    fn smoke_config_field_bit_layout() -> TestResult {
+        // Figure 8.6: window bits 2:0, OOF bit 3, CRC bit 4, version
+        // bits 7:5. Window 5 + CRC, version 0 → 0x15.
+        let cfg = H5Config {
+            window: 5,
+            oof_flow_control: false,
+            crc: true,
+            version: 0,
+        };
+        if cfg.encode() != 0x15 {
+            return TestResult::Fail("config octet bit layout wrong");
+        }
+        if H5Config::decode(0x15) != cfg {
+            return TestResult::Fail("config octet decode wrong");
+        }
+        // OOF sets bit 3; version 0 is the only valid version.
+        let oof = H5Config {
+            window: 1,
+            oof_flow_control: true,
+            crc: false,
+            version: 0,
+        };
+        if oof.encode() != 0x09 || !oof.is_valid() {
+            return TestResult::Fail("OOF bit wrong");
+        }
+        let window_zero = H5Config {
+            window: 0,
+            oof_flow_control: false,
+            crc: false,
+            version: 0,
+        };
+        let version_one = H5Config {
+            window: 4,
+            oof_flow_control: false,
+            crc: false,
+            version: 1,
+        };
+        if cfg.is_valid() && !window_zero.is_valid() && !version_one.is_valid() {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("config validity rule wrong")
+        }
+    }
+    kernel_test_in!("bluetooth/h5", smoke_config_field_bit_layout);
+
+    fn smoke_packet_type_vendor_is_14_link_is_15() -> TestResult {
+        // Vol 4 Part D §4.5 Table 4.1: Vendor Specific = 14, Link
+        // Control = 15 (an earlier revision had these swapped).
+        if H5PacketType::from_u8(14) != Some(H5PacketType::VendorSpecific)
+            || H5PacketType::from_u8(15) != Some(H5PacketType::LinkControl)
+            || H5PacketType::from_u8(6).is_some()
+            || H5PacketType::from_u8(13).is_some()
+        {
+            return TestResult::Fail("packet-type values wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/h5", smoke_packet_type_vendor_is_14_link_is_15);
 }
