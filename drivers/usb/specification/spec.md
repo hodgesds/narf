@@ -1016,7 +1016,17 @@ the USB download itself remains a target-silicon gate.
   SET_CONFIGURATION, per-stream SET_INTERFACE alt selection,
   sampling-frequency SET_CUR (v1 endpoint control; v2 clock entity,
   RANGE-resolved), and FeatureUnit GET_MIN/MAX/RES + SET_CUR
-  volume/mute. The bound device registers as a sound card
+  volume/mute. For UAC2, when the resolved clock source is reached
+  through a clock selector, bind first reads the selector's current
+  pin (GET_CUR on the selector control, §5.2.5.2.1) and switches it
+  to the resolved source's pin (SET_CUR, issued only when the pin
+  differs; skipped for single-pin selectors and absent controls).
+  MIXER_UNIT descriptors decode in both revisions (per-input-channel
+  × output-channel programmable-gain matrix, MCN-addressed) and
+  SELECTOR_UNIT descriptors decode alongside them; the topology walk
+  traverses mixer/selector units in both directions, so a Feature
+  Unit behind a mixer/selector unit is found and its volume/mute
+  controls are programmed like a directly-linked one. The bound device registers as a sound card
   (`narf-drivers-sound`, driver `snd-usb-audio`): PCM leases select
   alts at prepare, program rates, and run a per-stream isochronous
   pump; FeatureUnit volume/mute surface as ALSA controls. Unbind
@@ -1096,7 +1106,10 @@ the USB download itself remains a target-silicon gate.
 
 ### Out of scope (deferred)
 - UAC3 (protocol byte 0x30; descriptor layouts differ again).
-- UAC mixer/selector-unit routing beyond Feature Units, and runtime
-  clock-selector switching (bind resolves one clock per stream).
+- Runtime clock-selector switching after bind (bind now selects the
+  pin for the resolved source); mixer gain (MCN) programming at
+  bind/prepare; and the `InputTerminal2` bCSourceID parse deviation
+  (#1520 — the parser reads the clock-source ID as the channel
+  count; clock resolution uses the source's `assoc_terminal` instead).
 - Non-QCA Bluetooth vendor firmware protocols (Intel, Realtek, MediaTek,
   Broadcom).

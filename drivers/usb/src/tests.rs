@@ -7568,6 +7568,430 @@ fn smoke_uac_bind_plan_uac2_clock() -> TestResult {
 }
 kernel_test_in!("drivers/usb/uac", smoke_uac_bind_plan_uac2_clock);
 
+// ── UAC2 clock-selector + mixer-unit fixtures (#883) ───────────
+//
+// Modelled device: a UAC2 playback DAC whose stream clock runs
+// through a clock selector and whose Feature Unit sits behind a
+// Mixer Unit. The descriptor bytes are spec-shaped (Audio20
+// Tables 4-7 / 4-11, §5.2.5.2.1, Table A-18); the Input Terminal
+// bytes follow the in-tree #777 layout (see the `InputTerminal2`
+// note — the bCSourceID deviation is a separate lane).
+//
+//   CLOCK_SOURCE 9 (programmable, assoc IT 1) + CLOCK_SOURCE 11
+//   (fixed) → CLOCK_SELECTOR 10, pins [11, 9], programmable →
+//   IT 1 USB-streaming → MIXER_UNIT 4 (pin 1 ← IT 1, stereo in,
+//   stereo out, all 4 gains programmable) → FU 2 → OT 3 speaker.
+//
+// The resolved source is 9, on the selector's pin 2 — not pin 1,
+// so a fixture that always picked pin 1 would fail. The mixer has
+// one input pin, so n = 2 (IT 1's stereo cluster).
+fn uac2_selector_clock_mixer_config_with(pins: &[u8], controls: u8) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::new();
+    let mut add = |d: &[u8]| v.extend_from_slice(d);
+    add(&[9, 0x02, 0, 0, 2, 1, 0, 0x80, 50]); // CONFIGURATION
+    add(&[9, 0x04, 0, 0, 0, 0x01, 0x01, 0x20, 0]); // iface 0 AC (UAC2)
+    add(&[9, 0x24, 0x01, 0x00, 0x02, 0x09, 55, 0, 0]); // HEADER v2
+    add(&[8, 0x24, 0x0A, 9, 2, 0x03, 1, 0]); // CLOCK_SOURCE 9, programmable
+    add(&[8, 0x24, 0x0A, 11, 0, 0x01, 0, 0]); // CLOCK_SOURCE 11, fixed
+    // CLOCK_SELECTOR 10: bLength 7+p, pins, bmControls, iSelector.
+    let mut sel = alloc::vec![7 + pins.len() as u8, 0x24, 0x0B, 10, pins.len() as u8];
+    sel.extend_from_slice(pins);
+    sel.push(controls);
+    sel.push(0);
+    add(&sel);
+    add(&[
+        18, 0x24, 0x02, 1, 0x01, 0x01, 0, 2, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]); // IT 1
+    // MIXER_UNIT 4 (v2, Table 4-11): bLength 13+p+N = 15, p = 1,
+    // m = 2, bitmap 0xF0 = all 4 (2 in x 2 out) gains programmable.
+    add(&[15, 0x24, 0x04, 4, 1, 1, 2, 0x03, 0, 0, 0, 0, 0xF0, 0, 0]);
+    add(&[
+        18, 0x24, 0x06, 2, 4, 0x0F, 0, 0, 0, 0x0C, 0, 0, 0, 0x0C, 0, 0, 0, 0,
+    ]); // FU 2, source = mixer 4
+    add(&[12, 0x24, 0x03, 3, 0x01, 0x03, 0, 2, 0, 0, 0, 0]); // OT 3 speaker
+    add(&[9, 0x04, 1, 0, 0, 0x01, 0x02, 0x20, 0]); // AS 1 alt 0
+    add(&[16, 0x24, 0x01, 1, 0, 1, 1, 0, 0, 0, 2, 3, 0, 0, 0, 0]); // AS_GENERAL v2
+    add(&[9, 0x04, 1, 1, 1, 0x01, 0x02, 0x20, 0]); // AS 1 alt 1
+    add(&[16, 0x24, 0x01, 1, 0, 1, 1, 0, 0, 0, 2, 3, 0, 0, 0, 0]);
+    add(&[6, 0x24, 0x02, 0x01, 4, 24]); // FORMAT_TYPE_I v2: 24-in-32
+    add(&[9, 0x05, 0x01, 0x05, 0x00, 0x03, 1, 0, 0]); // EP OUT 768 B
+    v
+}
+
+fn uac2_selector_clock_mixer_config() -> alloc::vec::Vec<u8> {
+    uac2_selector_clock_mixer_config_with(&[11, 9], 0x03)
+}
+
+fn smoke_uac_mixer_unit_decodes_gain_matrix() -> TestResult {
+    use crate::uac::{MixerUnit, SelectorUnit, UacVersion};
+    // UAC2 mixer (Table 4-11): unit 4, p = 1, m = 2, bitmap 0xF0.
+    let v2 = [
+        15, 0x24, 0x04, 4, 1, 1, 2, 0x03, 0, 0, 0, 0, 0xF0, 0, 0,
+    ];
+    let m = match MixerUnit::parse(&v2, UacVersion::V2) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("UAC2 mixer parse"),
+    };
+    if m.unit_id != 4 || m.sources != alloc::vec![1] || m.nr_out_channels != 2 {
+        return TestResult::Fail("UAC2 mixer id / sources / m");
+    }
+    if m.mixer_controls != alloc::vec![0xF0] || m.controls != 0 {
+        return TestResult::Fail("UAC2 mixer bitmap / controls");
+    }
+    if m.gain(1, 1) != Some(true) || m.gain(2, 2) != Some(true) {
+        return TestResult::Fail("UAC2 mixer gains present");
+    }
+    if m.gain(1, 3) != None || m.gain(0, 1) != None {
+        return TestResult::Fail("UAC2 mixer gain out of range = None");
+    }
+    // UAC1 mixer (Table 4-5): unit 7, p = 2, m = 2, bitmap 0xFC
+    // (3 in x 2 out = 6 bits, all programmable).
+    let v1 = [13, 0x24, 0x04, 7, 2, 1, 4, 2, 0x03, 0, 0, 0xFC, 0];
+    let m1 = match MixerUnit::parse(&v1, UacVersion::V1) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("UAC1 mixer parse"),
+    };
+    if m1.unit_id != 7 || m1.sources != alloc::vec![1, 4] || m1.controls != 0 {
+        return TestResult::Fail("UAC1 mixer id / sources / controls");
+    }
+    if m1.gain(3, 2) != Some(true) || m1.gain(3, 1) != Some(true) {
+        return TestResult::Fail("UAC1 mixer gains present");
+    }
+    // Truncated v2 mixer (cut before the bitmap end) must fail.
+    if MixerUnit::parse(&v2[..13], UacVersion::V2).is_ok() {
+        return TestResult::Fail("truncated mixer must fail");
+    }
+    // Selector units, both revisions.
+    let s2 = [9, 0x24, 0x05, 8, 2, 1, 4, 0x03, 0];
+    let su = match SelectorUnit::parse(&s2, UacVersion::V2) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("UAC2 selector parse"),
+    };
+    if su.unit_id != 8 || su.sources != alloc::vec![1, 4] || su.controls != 0x03 {
+        return TestResult::Fail("UAC2 selector id / sources / controls");
+    }
+    let s1 = [7, 0x24, 0x05, 8, 1, 5, 0];
+    let su1 = match SelectorUnit::parse(&s1, UacVersion::V1) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("UAC1 selector parse"),
+    };
+    if su1.unit_id != 8 || su1.sources != alloc::vec![5] || su1.controls != 0 {
+        return TestResult::Fail("UAC1 selector id / sources / controls");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_uac_mixer_unit_decodes_gain_matrix
+);
+
+fn smoke_uac_topology_walk_uac2_mixer_clock_selector() -> TestResult {
+    use crate::uac::UacTopology;
+    let cfg = uac2_selector_clock_mixer_config();
+    let topo = match UacTopology::parse(&cfg) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("UAC2 mixer topology parse"),
+    };
+    if topo.mixers.len() != 1 || topo.selectors.len() != 0 {
+        return TestResult::Fail("UAC2 mixer / selector counts");
+    }
+    let mx = &topo.mixers[0];
+    if mx.id != 4 || mx.sources != alloc::vec![1] {
+        return TestResult::Fail("UAC2 mixer id / sources");
+    }
+    if mx.nr_out_channels != 2 || mx.nr_in_channels != 2 {
+        return TestResult::Fail("UAC2 mixer n = 2 (stereo in), m = 2");
+    }
+    if mx.gains != alloc::vec![true, true, true, true] {
+        return TestResult::Fail("UAC2 mixer gain matrix all programmable");
+    }
+    if mx.mcn(2, 1) != Some(2) || mx.gain(2, 1) != Some(true) {
+        return TestResult::Fail("UAC2 mixer MCN (2,1) = 2");
+    }
+    if topo.clocks.len() != 3 {
+        return TestResult::Fail("UAC2 clock count (2 sources + selector)");
+    }
+    let clock = match topo.clock_for_terminal(1) {
+        Some(c) => c,
+        None => return TestResult::Fail("UAC2 clock resolution for terminal 1"),
+    };
+    if clock.id != 9 || !clock.freq_programmable {
+        return TestResult::Fail("UAC2 resolved clock = source 9");
+    }
+    let (sel, pin) = match topo.selector_for_source(9) {
+        Some(s) => s,
+        None => return TestResult::Fail("UAC2 selector on path to source 9"),
+    };
+    if sel.id != 10 || pin != 2 || !sel.selector_control_programmable() {
+        return TestResult::Fail("UAC2 selector 10, pin 2, programmable");
+    }
+    let fu = match topo.feature_unit_for(1) {
+        Some(f) => f,
+        None => return TestResult::Fail("UAC2 FU behind mixer not found"),
+    };
+    if fu.id != 2 {
+        return TestResult::Fail("UAC2 FU behind mixer = FU 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_uac_topology_walk_uac2_mixer_clock_selector
+);
+
+fn smoke_uac_bind_plan_uac2_clock_selector() -> TestResult {
+    use crate::uac::{build_bind_plan, ResponseSlot, StepData, UacTopology};
+    let cfg = uac2_selector_clock_mixer_config();
+    let topo = UacTopology::parse(&cfg).expect("topo");
+    let choice = crate::uac::choose_stream_default(&topo.streams[0], topo.version).expect("choice");
+    let plan = build_bind_plan(&topo, 1, &[choice]);
+    // SET_CONFIGURATION, SET_INTERFACE, GET_CUR selector, SET_CUR
+    // selector, GET_RANGE, SET_CUR clock, GET_MIN, GET_MAX,
+    // GET_RES, SET_CUR vol, SET_CUR mute.
+    if plan.len() != 11 {
+        return TestResult::Fail("UAC2 selector plan length = 11");
+    }
+    let get = &plan[2];
+    if get.request_type != 0xA1
+        || get.request != crate::uac::REQ_CUR
+        || get.value != 0x0100
+        || get.index != (10 << 8)
+        || get.fatal
+    {
+        return TestResult::Fail("plan[2] = non-fatal GET_CUR selector 10");
+    }
+    if !matches!(get.data, StepData::In(1))
+        || get.slot != (ResponseSlot::ClockSelectorCur { capture: false })
+    {
+        return TestResult::Fail("plan[2] reads 1-byte pin, selector slot");
+    }
+    let set = &plan[3];
+    if set.request_type != 0x21
+        || set.request != crate::uac::REQ_CUR
+        || set.value != 0x0100
+        || set.index != (10 << 8)
+        || !set.fatal
+    {
+        return TestResult::Fail("plan[3] = fatal SET_CUR selector 10");
+    }
+    if set.set_selector_pin_if_differs != Some(false) {
+        return TestResult::Fail("plan[3] switches only when pin differs");
+    }
+    match &set.data {
+        StepData::Out(b) if b.as_slice() == [2] => {}
+        _ => return TestResult::Fail("plan[3] payload = pin 2"),
+    }
+    let rng = &plan[4];
+    if rng.request != crate::uac::REQ_RANGE || rng.index != (9 << 8) {
+        return TestResult::Fail("plan[4] = GET_RANGE on source 9");
+    }
+    let set_rate = &plan[5];
+    if set_rate.request != crate::uac::REQ_CUR || set_rate.index != (9 << 8) {
+        return TestResult::Fail("plan[5] = SET_CUR rate on source 9");
+    }
+    let vol = &plan[9];
+    if vol.index != crate::uac::fu_windex(2, 0) {
+        return TestResult::Fail("plan[9] targets FU 2 behind the mixer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_uac_bind_plan_uac2_clock_selector
+);
+
+fn smoke_uac_selector_pin_switch_needed() -> TestResult {
+    use crate::uac::{record_response, selector_pin_switch_needed, BindOutcome, ResponseSlot};
+    let mut outcome = BindOutcome::default();
+    // No GET_CUR yet: unknown pin — switch explicitly.
+    if !selector_pin_switch_needed(&outcome, false, 2) {
+        return TestResult::Fail("unknown pin must switch");
+    }
+    record_response(
+        &mut outcome,
+        ResponseSlot::ClockSelectorCur { capture: false },
+        &[2],
+    );
+    if selector_pin_switch_needed(&outcome, false, 2) {
+        return TestResult::Fail("pin already 2 must not switch");
+    }
+    if !selector_pin_switch_needed(&outcome, false, 1) {
+        return TestResult::Fail("pin 2 vs desired 1 must switch");
+    }
+    // Directions are independent: capture still unknown.
+    if !selector_pin_switch_needed(&outcome, true, 2) {
+        return TestResult::Fail("capture pin unknown must switch");
+    }
+    record_response(
+        &mut outcome,
+        ResponseSlot::ClockSelectorCur { capture: true },
+        &[1],
+    );
+    if selector_pin_switch_needed(&outcome, true, 1) {
+        return TestResult::Fail("capture pin already 1 must not switch");
+    }
+    if outcome.selector_pin_cur != [Some(2), Some(1)] {
+        return TestResult::Fail("recorded pins [playback 2, capture 1]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_uac_selector_pin_switch_needed
+);
+
+fn smoke_uac_bind_plan_uac2_clock_selector_skips() -> TestResult {
+    use crate::uac::{build_bind_plan, ResponseSlot, UacTopology};
+    let plan_for = |pins: &[u8], controls: u8| -> alloc::vec::Vec<crate::uac::ControlStep> {
+        let cfg = uac2_selector_clock_mixer_config_with(pins, controls);
+        let topo = UacTopology::parse(&cfg).expect("topo");
+        let choice =
+            crate::uac::choose_stream_default(&topo.streams[0], topo.version).expect("choice");
+        build_bind_plan(&topo, 1, &[choice])
+    };
+    // Single-pin selector: nothing to switch — no selector steps.
+    let single = plan_for(&[9], 0x03);
+    if single.len() != 9 || single[2].request != crate::uac::REQ_RANGE {
+        return TestResult::Fail("single-pin selector: plan = plain 9, no switch");
+    }
+    // Selector control absent (bmControls 0x00): no selector steps.
+    let absent = plan_for(&[11, 9], 0x00);
+    if absent.len() != 9 || absent[2].request != crate::uac::REQ_RANGE {
+        return TestResult::Fail("absent selector control: plan = plain 9");
+    }
+    // Read-only control (0x01): GET_CUR only, never a SET_CUR.
+    let ro = plan_for(&[11, 9], 0x01);
+    if ro.len() != 10 {
+        return TestResult::Fail("read-only selector: plan length = 10");
+    }
+    if ro[2].slot != (ResponseSlot::ClockSelectorCur { capture: false })
+        || ro[3].request != crate::uac::REQ_RANGE
+    {
+        return TestResult::Fail("read-only selector: GET_CUR then RANGE, no SET");
+    }
+    if ro.iter().any(|s| s.set_selector_pin_if_differs.is_some()) {
+        return TestResult::Fail("read-only selector: no conditional SET_CUR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_uac_bind_plan_uac2_clock_selector_skips
+);
+
+// ── UAC1 mixer/selector walk fixture (#883) ─────────────────
+//
+// UAC1 headset variant: playback IT 1 → MIXER_UNIT 7 (pins IT 1
+// stereo + IT 4 mono, so n = 3, m = 2, all 6 gains programmable)
+// → FU 2 → OT 3 speaker; capture IT 4 mic → FU 5 →
+// SELECTOR_UNIT 8 (pin 1 ← FU 5) → OT 6 USB-streaming. The mixer
+// has two input pins with different channel counts, so the
+// n-resolution sum (2 + 1) is genuinely exercised.
+fn uac1_mixer_selector_config() -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::new();
+    let mut add = |d: &[u8]| v.extend_from_slice(d);
+    add(&[9, 0x02, 0, 0, 3, 1, 0, 0x80, 50]); // CONFIGURATION
+    add(&[9, 0x04, 0, 0, 0, 0x01, 0x01, 0x00, 0]); // iface 0 AC (UAC1)
+    add(&[10, 0x24, 0x01, 0x00, 0x01, 62, 0, 2, 1, 2]); // AC HEADER
+    add(&[12, 0x24, 0x02, 1, 0x01, 0x01, 0, 2, 0x03, 0x00, 0, 0]); // IT 1
+    // MIXER_UNIT 7 (v1, Table 4-5): bLength 10+p+N = 13, p = 2,
+    // m = 2, bitmap 0xFC = all 6 (3 in x 2 out) gains programmable.
+    add(&[13, 0x24, 0x04, 7, 2, 1, 4, 2, 0x03, 0, 0, 0xFC, 0]);
+    add(&[
+        13, 0x24, 0x06, 2, 7, 2, 0x03, 0x00, 0x02, 0x00, 0x02, 0x00, 0,
+    ]); // FU 2, source = mixer 7
+    add(&[9, 0x24, 0x03, 3, 0x01, 0x03, 0, 2, 0]); // OT 3 speaker
+    add(&[12, 0x24, 0x02, 4, 0x01, 0x02, 0, 1, 0x01, 0x00, 0, 0]); // IT 4 mic
+    add(&[11, 0x24, 0x06, 5, 4, 2, 0x03, 0x00, 0x02, 0x00, 0]); // FU 5
+    add(&[7, 0x24, 0x05, 8, 1, 5, 0]); // SELECTOR_UNIT 8, pin 1 <- FU 5
+    add(&[9, 0x24, 0x03, 6, 0x01, 0x01, 0, 8, 0]); // OT 6, source = selector 8
+    add(&[9, 0x04, 1, 0, 0, 0x01, 0x02, 0x00, 0]); // AS 1 alt 0
+    add(&[7, 0x24, 0x01, 1, 0, 0x01, 0x00]); // AS_GENERAL link 1 PCM
+    add(&[9, 0x04, 1, 1, 1, 0x01, 0x02, 0x00, 0]); // AS 1 alt 1
+    add(&[7, 0x24, 0x01, 1, 0, 0x01, 0x00]);
+    add(&[
+        14, 0x24, 0x02, 0x01, 2, 2, 16, 2, 0x44, 0xAC, 0x00, 0x80, 0xBB, 0x00,
+    ]); // FORMAT_TYPE_I: stereo 44.1/48 kHz
+    add(&[9, 0x05, 0x01, 0x05, 0xC0, 0x00, 1, 0, 0]); // EP OUT 192 B
+    add(&[7, 0x25, 0x01, 0x01, 0, 0x00, 0x00]); // CS_ENDPOINT freq ctl
+    add(&[9, 0x04, 2, 0, 0, 0x01, 0x02, 0x00, 0]); // AS 2 alt 0
+    add(&[7, 0x24, 0x01, 6, 0, 0x01, 0x00]); // AS_GENERAL link 6 PCM
+    add(&[9, 0x04, 2, 1, 1, 0x01, 0x02, 0x00, 0]); // AS 2 alt 1
+    add(&[7, 0x24, 0x01, 6, 0, 0x01, 0x00]);
+    add(&[11, 0x24, 0x02, 0x01, 1, 2, 16, 1, 0x80, 0xBB, 0x00]); // mono 48 kHz
+    add(&[9, 0x05, 0x82, 0x05, 96, 0x00, 1, 0, 0]); // EP IN 96 B
+    v
+}
+
+fn smoke_uac_topology_walk_uac1_mixer_selector() -> TestResult {
+    use crate::uac::{build_bind_plan, UacTopology};
+    let cfg = uac1_mixer_selector_config();
+    let topo = match UacTopology::parse(&cfg) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("UAC1 mixer topology parse"),
+    };
+    if topo.mixers.len() != 1 || topo.selectors.len() != 1 {
+        return TestResult::Fail("UAC1 mixer / selector counts");
+    }
+    let mx = &topo.mixers[0];
+    if mx.id != 7 || mx.sources != alloc::vec![1, 4] {
+        return TestResult::Fail("UAC1 mixer id / sources");
+    }
+    // n = 2 (IT 1 stereo) + 1 (IT 4 mono) = 3; m = 2.
+    if mx.nr_in_channels != 3 || mx.nr_out_channels != 2 {
+        return TestResult::Fail("UAC1 mixer n = 3, m = 2");
+    }
+    if mx.gains != alloc::vec![true, true, true, true, true, true] {
+        return TestResult::Fail("UAC1 mixer gain matrix all programmable");
+    }
+    if mx.mcn(3, 2) != Some(5) {
+        return TestResult::Fail("UAC1 mixer MCN (3,2) = 5");
+    }
+    let su = &topo.selectors[0];
+    if su.id != 8 || su.sources != alloc::vec![5] {
+        return TestResult::Fail("UAC1 selector id / sources");
+    }
+    // Playback: FU behind the mixer (downstream walk).
+    let fu_pb = match topo.feature_unit_for(1) {
+        Some(f) => f,
+        None => return TestResult::Fail("UAC1 FU behind mixer not found"),
+    };
+    if fu_pb.id != 2 {
+        return TestResult::Fail("UAC1 playback FU behind mixer = FU 2");
+    }
+    // Capture: FU behind the selector, reached upstream from the
+    // streaming Output Terminal through the selector's sources.
+    let fu_cap = match topo.feature_unit_for(6) {
+        Some(f) => f,
+        None => return TestResult::Fail("UAC1 FU behind selector not found"),
+    };
+    if fu_cap.id != 5 {
+        return TestResult::Fail("UAC1 capture FU behind selector = FU 5");
+    }
+    // Both directions now get FU steps in the bind plan (before
+    // this lane the walk returned None for both).
+    let mut choices = alloc::vec::Vec::new();
+    for s in &topo.streams {
+        choices.push(crate::uac::choose_stream_default(s, topo.version).expect("choice"));
+    }
+    choices.sort_by_key(|c| c.capture);
+    let plan = build_bind_plan(&topo, 1, &choices);
+    if plan.len() != 15 {
+        return TestResult::Fail("UAC1 mixer plan length = 15");
+    }
+    if plan[3].index != crate::uac::fu_windex(2, 0) {
+        return TestResult::Fail("UAC1 mixer plan targets playback FU 2");
+    }
+    if plan[14].index != crate::uac::fu_windex(5, 0) {
+        return TestResult::Fail("UAC1 mixer plan targets capture FU 5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uac",
+    smoke_uac_topology_walk_uac1_mixer_selector
+);
+
 fn smoke_uac_card_publication() -> TestResult {
     use crate::uac::{BindOutcome, UacTopology};
     let cfg = uac1_headset_config();

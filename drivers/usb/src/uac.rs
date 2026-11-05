@@ -388,12 +388,18 @@ fn check_class_specific(buf: &[u8], expect_subtype: u8) -> Result<(), UacError> 
 // ── UAC2 class-specific descriptors (Release 2.0) ──────────────────
 //
 // The v2 AC block reuses the v1 subtype numbering for HEADER /
-// INPUT_TERMINAL / OUTPUT_TERMINAL / FEATURE_UNIT with wider
-// layouts, and adds the clock entity family that replaces the v1
-// endpoint sampling-frequency control:
+// INPUT_TERMINAL / OUTPUT_TERMINAL / MIXER_UNIT / SELECTOR_UNIT /
+// FEATURE_UNIT with wider layouts, and adds the clock entity
+// family that replaces the v1 endpoint sampling-frequency control:
 //   - 0x0A CLOCK_SOURCE    — the programmable (or fixed) clock
 //   - 0x0B CLOCK_SELECTOR  — picks one of N source pins
 //   - 0x0C CLOCK_MULTIPLIER — derives a rate from another clock
+// Mixer/selector units are decoded in both revisions (their
+// layouts differ only in the cluster width and the trailing
+// controls byte); the topology walk traverses them to find the
+// Feature Unit on a stream's path, and the bind plan switches a
+// clock selector to the resolved source's pin before programming
+// the rate.
 
 /// AC subtype: CLOCK_SOURCE (UAC2 §4.7.2.10).
 pub const AC_SUBTYPE_CLOCK_SOURCE: u8 = 0x0A;
@@ -406,6 +412,13 @@ pub const AC_SUBTYPE_CLOCK_MULTIPLIER: u8 = 0x0C;
 /// §5.2.2): SET_CUR / GET_CUR / GET_RANGE address it on the AC
 /// interface with `wIndex = (clock_id << 8) | interface`.
 pub const CLOCK_CS_SAMPLING_FREQUENCY: u8 = 0x01;
+/// Clock Selector control selector (UAC2 §5.2.5.2.1, Table A-18
+/// `CX_CLOCK_SELECTOR_CONTROL`): SET_CUR / GET_CUR address it
+/// on the AC interface with `wValue = (0x01 << 8) | 0` (channel
+/// number is always the master, 0), `wIndex = (selector_id << 8)
+/// | interface`, and a 1-byte Layout 1 (§5.2.3.1) payload holding
+/// the selected pin number, 1-based, in 1..=`bNrInPins`.
+pub const CLOCK_CS_SELECTOR_CONTROL: u8 = 0x01;
 /// UAC2 class request: RANGE (returns subranges for a control).
 pub const REQ_RANGE: u8 = 0x02;
 /// UAC2 class request: CUR.
@@ -446,6 +459,17 @@ impl AcHeader2 {
 /// sit at the same leading offsets the v2 layout shares with the
 /// walker's expectations; trailing clock-control fields are
 /// informational here.
+///
+/// NOTE (spec deviation, not fixed here): Table 4-9 lays the
+/// descriptor out as `bCSourceID` at offset 7 and `bNrChannels`
+/// at offset 8 (17 bytes total), while this parser reads
+/// `nr_channels` at offset 7 — i.e. it reads the clock-source
+/// ID as the channel count — and the #777 fixture encodes its
+/// IT the same way. The clock model therefore resolves a
+/// stream's clock from the clock source's `assoc_terminal`,
+/// not from the terminal's `bCSourceID`. Fixing the parse means
+/// re-wiring clock resolution onto `bCSourceID` and re-basing
+/// the #777 fixture; that is a separate lane (#1520), not this one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct InputTerminal2 {
     pub terminal_id: u8,
@@ -619,6 +643,151 @@ impl ClockMultiplier {
         Ok(Self {
             clock_id: buf[3],
             source_clock_id: buf[4],
+        })
+    }
+}
+
+/// MIXER_UNIT descriptor — both revisions.
+///
+/// UAC1 (§4.3.2.3, Table 4-5): `bLength = 10+p+N`; `bNrChannels`
+/// (output channels m) at `5+p`, `wChannelConfig` (2 bytes) at
+/// `6+p`, `iChannelNames` at `8+p`, and the programmable-gain
+/// bitmap at `9+p` (`N` bytes), `iMixer` last.
+///
+/// UAC2 (§4.7.2.6, Table 4-11): `bLength = 13+p+N`;
+/// `bNrChannels` at `5+p`, `bmChannelConfig` (4 bytes) at `6+p`,
+/// `iChannelNames` at `10+p`, the gain bitmap (`bmMixerControls`,
+/// `N` bytes) at `11+p`, a 1-byte `bmControls` (cluster /
+/// underflow / overflow bit pairs) at `11+p+N`, `iMixer` last.
+///
+/// In both revisions the bitmap is the same (n·m)-bit array,
+/// `n` = total logical input channels summed over all input
+/// clusters, `m` = output channels, `(n·m) ≤ 256` (v2; v1 caps
+/// n and m at 254 each). It is stored row after row, row = input
+/// channel u (1..=n), column = output channel v (1..=m); the MSb
+/// of the first byte is [u=1, v=1]. Bit [u, v] set means a
+/// programmable Mixer Control connects input channel u to output
+/// channel v; its Mixer Control Number is `MCN = (u-1)*m + (v-1)`
+/// (§5.2.5.5.1 addresses a gain by MCN in the low byte of
+/// `wValue`). `N = ceil(n*m/8)`; a short bitmap (truncated
+/// descriptor) decodes the bits present, the rest read as
+/// non-programmable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MixerUnit {
+    pub unit_id: u8,
+    /// Source entity IDs, one per input pin (pin order).
+    pub sources: Vec<u8>,
+    /// Number of logical output channels (m).
+    pub nr_out_channels: u8,
+    /// Raw programmable-gain bitmap bytes (MSb-first, row-major).
+    pub mixer_controls: Vec<u8>,
+    /// UAC2 `bmControls` byte (cluster / underflow / overflow
+    /// bit pairs); 0 for UAC1, which has no such byte.
+    pub controls: u8,
+}
+
+impl MixerUnit {
+    pub fn parse(buf: &[u8], version: UacVersion) -> Result<Self, UacError> {
+        if buf.len() < 5 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AC_SUBTYPE_MIXER_UNIT)?;
+        let p = buf[4] as usize;
+        if buf.len() < 5 + p + 1 {
+            return Err(UacError::Truncated);
+        }
+        let nr_out_channels = buf[5 + p];
+        // Bitmap offset and total length differ by revision (see
+        // the struct docs); the bitmap must hold at least one
+        // byte (n*m >= 1 for any legal unit) plus the trailing
+        // string index (and, for v2, the bmControls byte).
+        let (bitmap_off, min_len) = match version {
+            UacVersion::V1 => (9 + p, 11 + p),
+            UacVersion::V2 => (11 + p, 14 + p),
+        };
+        if buf.len() < min_len {
+            return Err(UacError::Truncated);
+        }
+        let bitmap_end = match version {
+            UacVersion::V1 => buf.len() - 1, // trailing iMixer
+            UacVersion::V2 => buf.len() - 2, // bmControls + iMixer
+        };
+        let controls = match version {
+            UacVersion::V1 => 0,
+            UacVersion::V2 => buf[bitmap_end],
+        };
+        Ok(Self {
+            unit_id: buf[3],
+            sources: buf[5..5 + p].to_vec(),
+            nr_out_channels,
+            mixer_controls: buf[bitmap_off..bitmap_end].to_vec(),
+            controls,
+        })
+    }
+
+    /// Programmable-gain bit for input channel `u` (1-based) to
+    /// output channel `v` (1-based), given `m` output channels:
+    /// bit `(u-1)*m + (v-1)` of the MSb-first bitmap. `None`
+    /// when the coordinates are out of range or the bitmap is
+    /// too short to hold the bit (reads as non-programmable).
+    pub fn gain(&self, u: u8, v: u8) -> Option<bool> {
+        if u == 0 || v == 0 {
+            return None;
+        }
+        let m = self.nr_out_channels as usize;
+        if m == 0 || (v as usize) > m {
+            return None;
+        }
+        let bit = ((u as usize) - 1) * m + ((v as usize) - 1);
+        let byte = self.mixer_controls.get(bit / 8)?;
+        Some(byte & (0x80 >> (bit % 8)) != 0)
+    }
+}
+
+/// SELECTOR_UNIT descriptor — both revisions.
+///
+/// UAC1 (§4.3.2.4, Table 4-6): `bLength = 6+p`; `bNrInPins` at
+/// 4, `baSourceID` at 5, `iSelector` at `5+p`. No controls byte.
+///
+/// UAC2 (§4.7.2.7, Table 4-12): `bLength = 7+p`; same leading
+/// fields, plus a 1-byte `bmControls` at `5+p` (D1..0: Selector
+/// Control) and `iSelector` at `6+p`.
+///
+/// All clusters entering a selector must carry the same channel
+/// count (§4.7.2.7), so the unit itself carries no channel count
+/// — the walk resolves it through the sources.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectorUnit {
+    pub unit_id: u8,
+    /// Source entity IDs, one per input pin (pin order).
+    pub sources: Vec<u8>,
+    /// UAC2 `bmControls` byte (D1..0: Selector Control); 0 for
+    /// UAC1, which has no such byte.
+    pub controls: u8,
+}
+
+impl SelectorUnit {
+    pub fn parse(buf: &[u8], version: UacVersion) -> Result<Self, UacError> {
+        if buf.len() < 5 {
+            return Err(UacError::Short);
+        }
+        check_class_specific(buf, AC_SUBTYPE_SELECTOR_UNIT)?;
+        let p = buf[4] as usize;
+        let min_len = match version {
+            UacVersion::V1 => 6 + p,
+            UacVersion::V2 => 7 + p,
+        };
+        if buf.len() < min_len {
+            return Err(UacError::Truncated);
+        }
+        let controls = match version {
+            UacVersion::V1 => 0,
+            UacVersion::V2 => buf[5 + p],
+        };
+        Ok(Self {
+            unit_id: buf[3],
+            sources: buf[5..5 + p].to_vec(),
+            controls,
         })
     }
 }
@@ -801,6 +970,62 @@ pub struct UacFeatureUnit {
     pub channels: u8,
 }
 
+/// A Mixer Unit in the AC topology (either revision). The gain
+/// matrix is decoded from the descriptor bitmap once the input
+/// channel count is resolved from the source clusters (see
+/// `UacTopology::resolve_mixer_gains`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UacMixerUnit {
+    pub id: u8,
+    /// Source entity IDs, one per input pin (pin order).
+    pub sources: Vec<u8>,
+    /// Number of logical output channels (m).
+    pub nr_out_channels: u8,
+    /// Total logical input channels (n), summed over the source
+    /// clusters; 0 when no source cluster could be resolved.
+    pub nr_in_channels: u8,
+    /// Raw programmable-gain bitmap bytes (MSb-first, row-major),
+    /// as decoded from the descriptor.
+    pub mixer_controls: Vec<u8>,
+    /// Per-(input channel, output channel) programmable-gain
+    /// matrix, row-major: `gains[(u-1)*m + (v-1)]` for 1-based
+    /// input channel u and output channel v; empty when
+    /// `nr_in_channels` is 0. See [`MixerUnit::gain`] for the
+    /// bit order; `gains` is that bitmap expanded.
+    pub gains: Vec<bool>,
+}
+
+impl UacMixerUnit {
+    /// Mixer Control Number for input channel `u` (1-based) to
+    /// output channel `v` (1-based): `MCN = (u-1)*m + (v-1)`
+    /// (UAC2 §4.7.2.6; UAC1 §4.3.2.3). `None` out of range.
+    pub fn mcn(&self, u: u8, v: u8) -> Option<u8> {
+        if u == 0 || v == 0 {
+            return None;
+        }
+        let m = self.nr_out_channels as usize;
+        if m == 0 || (v as usize) > m || (u as usize) > self.nr_in_channels as usize {
+            return None;
+        }
+        Some((((u as usize) - 1) * m + ((v as usize) - 1)) as u8)
+    }
+
+    /// Programmable-gain bit for input channel `u` (1-based) to
+    /// output channel `v` (1-based). `None` out of range.
+    pub fn gain(&self, u: u8, v: u8) -> Option<bool> {
+        let mcn = self.mcn(u, v)? as usize;
+        self.gains.get(mcn).copied()
+    }
+}
+
+/// A Selector Unit in the AC topology (either revision).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UacSelectorUnit {
+    pub id: u8,
+    /// Source entity IDs, one per input pin (pin order).
+    pub sources: Vec<u8>,
+}
+
 /// A clock entity (UAC2 only).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UacClock {
@@ -814,6 +1039,36 @@ pub struct UacClock {
     pub pins: Vec<u8>,
     /// For multipliers: the clock it derives from.
     pub derives_from: u8,
+    /// For selectors: the descriptor's `bmControls` byte (D1..0
+    /// = Clock Selector Control bit pair, §4.7.2.11); 0 for
+    /// sources and multipliers, which carry no selector control.
+    pub controls: u8,
+}
+
+impl UacClock {
+    /// Clock Selector Control bit pair (bmControls D1..0) for a
+    /// selector: 0b00 absent, 0b01 read-only, 0b11 host
+    /// programmable (0b10 is forbidden by the spec). 0 for
+    /// non-selector kinds.
+    pub fn selector_control_bits(&self) -> u8 {
+        if self.kind == UacClockKind::Selector {
+            self.controls & 0x03
+        } else {
+            0
+        }
+    }
+
+    /// True when the selector exposes a Clock Selector Control
+    /// at all (read-only or programmable).
+    pub fn selector_control_present(&self) -> bool {
+        self.selector_control_bits() != 0
+    }
+
+    /// True when the host may switch the selector's pin
+    /// (bit pair 0b11).
+    pub fn selector_control_programmable(&self) -> bool {
+        self.selector_control_bits() == 0x03
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -891,6 +1146,8 @@ pub struct UacTopology {
     pub ac_iface: u8,
     pub terminals: Vec<UacTerminal>,
     pub feature_units: Vec<UacFeatureUnit>,
+    pub mixers: Vec<UacMixerUnit>,
+    pub selectors: Vec<UacSelectorUnit>,
     pub clocks: Vec<UacClock>,
     pub streams: Vec<UacStream>,
 }
@@ -932,6 +1189,8 @@ impl UacTopology {
             ac_iface,
             terminals: Vec::new(),
             feature_units: Vec::new(),
+            mixers: Vec::new(),
+            selectors: Vec::new(),
             clocks: Vec::new(),
             streams: Vec::new(),
         };
@@ -1026,7 +1285,87 @@ impl UacTopology {
             }
             i += len;
         }
+        // Mixer gain matrices need the whole topology: resolve
+        // each mixer's input-channel count from its sources'
+        // clusters and expand the bitmap (see
+        // `resolve_mixer_gains`).
+        topo.resolve_mixer_gains();
         Ok(topo)
+    }
+
+    /// Resolve every mixer's input-channel count (n) from its
+    /// sources and expand its gain bitmap into the per-(input,
+    /// output) matrix. `n` is the sum of the source clusters'
+    /// channel counts (UAC2 §4.7.2.6; UAC1 §4.3.2.3); a source
+    /// whose cluster cannot be resolved contributes 0, and a
+    /// mixer left with n = 0 keeps an empty matrix (its source
+    /// edges still serve the path walk).
+    fn resolve_mixer_gains(&mut self) {
+        for i in 0..self.mixers.len() {
+            let (sources, m) = {
+                let mx = &self.mixers[i];
+                (mx.sources.clone(), mx.nr_out_channels)
+            };
+            let mut n = 0u8;
+            for src in &sources {
+                n = n.saturating_add(self.output_channels(*src));
+            }
+            let total = (n as usize) * (m as usize);
+            // The spec caps (n·m) at 256 (v2; v1 caps n and m at
+            // 254 each, so the same bound holds); bits past the
+            // cap cannot be addressed by an MCN and are dropped.
+            let total = total.min(256);
+            let mut gains = Vec::with_capacity(total);
+            for bit in 0..total {
+                let byte = self.mixers[i]
+                    .mixer_controls
+                    .get(bit / 8)
+                    .copied()
+                    .unwrap_or(0);
+                gains.push(byte & (0x80 >> (bit % 8)) != 0);
+            }
+            self.mixers[i].nr_in_channels = n;
+            self.mixers[i].gains = gains;
+        }
+    }
+
+    /// Logical output-channel count of the entity `id`: a
+    /// terminal's cluster size, a Feature Unit's logical channels
+    /// (master excluded), a mixer's output channels, or — for a
+    /// selector unit, whose inputs all share one cluster — the
+    /// first resolvable input's count. 0 when the entity is
+    /// unknown or carries no cluster. Cycle-safe: an entity is
+    /// expanded at most once per call.
+    fn output_channels(&self, id: u8) -> u8 {
+        let mut seen = Vec::new();
+        self.output_channels_inner(id, &mut seen)
+    }
+
+    fn output_channels_inner(&self, id: u8, seen: &mut Vec<u8>) -> u8 {
+        if seen.contains(&id) {
+            return 0;
+        }
+        seen.push(id);
+        if let Some(t) = self.terminals.iter().find(|t| t.id == id) {
+            return t.nr_channels;
+        }
+        if let Some(f) = self.feature_units.iter().find(|f| f.id == id) {
+            // `channels` counts the master entry plus one per
+            // logical channel.
+            return f.channels.saturating_sub(1);
+        }
+        if let Some(m) = self.mixers.iter().find(|m| m.id == id) {
+            return m.nr_out_channels;
+        }
+        if let Some(s) = self.selectors.iter().find(|s| s.id == id) {
+            for src in &s.sources {
+                let c = self.output_channels_inner(*src, seen);
+                if c != 0 {
+                    return c;
+                }
+            }
+        }
+        0
     }
 
     fn parse_ac_descriptor(&mut self, desc: &[u8]) {
@@ -1053,6 +1392,26 @@ impl UacTopology {
                         source_id: t.source_id,
                         is_input: false,
                         nr_channels: 0,
+                    });
+                }
+            }
+            (UacVersion::V1, AC_SUBTYPE_MIXER_UNIT) => {
+                if let Ok(m) = MixerUnit::parse(desc, UacVersion::V1) {
+                    self.mixers.push(UacMixerUnit {
+                        id: m.unit_id,
+                        sources: m.sources,
+                        nr_out_channels: m.nr_out_channels,
+                        nr_in_channels: 0,
+                        mixer_controls: m.mixer_controls,
+                        gains: Vec::new(),
+                    });
+                }
+            }
+            (UacVersion::V1, AC_SUBTYPE_SELECTOR_UNIT) => {
+                if let Ok(s) = SelectorUnit::parse(desc, UacVersion::V1) {
+                    self.selectors.push(UacSelectorUnit {
+                        id: s.unit_id,
+                        sources: s.sources,
                     });
                 }
             }
@@ -1088,6 +1447,26 @@ impl UacTopology {
                     });
                 }
             }
+            (UacVersion::V2, AC_SUBTYPE_MIXER_UNIT) => {
+                if let Ok(m) = MixerUnit::parse(desc, UacVersion::V2) {
+                    self.mixers.push(UacMixerUnit {
+                        id: m.unit_id,
+                        sources: m.sources,
+                        nr_out_channels: m.nr_out_channels,
+                        nr_in_channels: 0,
+                        mixer_controls: m.mixer_controls,
+                        gains: Vec::new(),
+                    });
+                }
+            }
+            (UacVersion::V2, AC_SUBTYPE_SELECTOR_UNIT) => {
+                if let Ok(s) = SelectorUnit::parse(desc, UacVersion::V2) {
+                    self.selectors.push(UacSelectorUnit {
+                        id: s.unit_id,
+                        sources: s.sources,
+                    });
+                }
+            }
             (UacVersion::V2, AC_SUBTYPE_FEATURE_UNIT) => {
                 if let Ok(f) = FeatureUnit2::parse(desc) {
                     self.feature_units.push(UacFeatureUnit {
@@ -1107,6 +1486,7 @@ impl UacTopology {
                         assoc_terminal: c.assoc_terminal,
                         pins: Vec::new(),
                         derives_from: 0,
+                        controls: 0,
                     });
                 }
             }
@@ -1119,6 +1499,7 @@ impl UacTopology {
                         assoc_terminal: 0,
                         pins: c.pins,
                         derives_from: 0,
+                        controls: c.controls,
                     });
                 }
             }
@@ -1131,6 +1512,7 @@ impl UacTopology {
                         assoc_terminal: 0,
                         pins: Vec::new(),
                         derives_from: c.source_clock_id,
+                        controls: 0,
                     });
                 }
             }
@@ -1219,28 +1601,109 @@ impl UacTopology {
         }
     }
 
-    /// The Feature Unit on the path feeding `terminal_id`:
-    /// follows `source_id` edges (FU → its source) until a unit
-    /// whose source is the terminal itself, or the FU whose own
-    /// source chain reaches it. Headset topologies are a direct
-    /// IT → FU → OT chain; selector/mixer units are traversed
-    /// through their recorded source edges where present.
+    /// The Feature Unit on the path feeding `terminal_id`.
+    ///
+    /// Breadth-first over the entity graph from the terminal:
+    /// downstream edges follow source links (an FU whose source
+    /// is the node; a mixer/selector unit listing the node as an
+    /// input pin), and upstream edges walk back through a
+    /// mixer/selector unit's own sources and through an Output
+    /// Terminal's `source_id` (the capture direction: the FU
+    /// feeding the mixer that feeds the streaming terminal).
+    /// Downstream neighbours are queued before upstream ones, so
+    /// the FU on the stream's own branch wins over an FU on a
+    /// sibling input branch of a shared mixer. Headset topologies
+    /// are the degenerate case (direct IT → FU → OT chain); an
+    /// FU behind a mixer/selector unit is found the same way.
+    /// Returns `None` when no Feature Unit is reachable (the
+    /// stream still binds and streams, with no mixer controls).
     pub fn feature_unit_for(&self, terminal_id: u8) -> Option<&UacFeatureUnit> {
-        // Direct: an FU whose source is the terminal.
-        if let Some(f) = self
-            .feature_units
-            .iter()
-            .find(|f| f.source_id == terminal_id)
-        {
-            return Some(f);
+        let mut visited: Vec<u8> = Vec::new();
+        let mut queue: Vec<u8> = Vec::new();
+        queue.push(terminal_id);
+        // An Output Terminal's source is the entity feeding it;
+        // seed the walk there too (capture direction).
+        if let Some(t) = self.terminals.iter().find(|t| t.id == terminal_id) {
+            if t.source_id != 0 {
+                queue.push(t.source_id);
+            }
         }
-        // One hop: FU feeding the terminal that feeds this one.
-        let feeder = self.terminals.iter().find(|t| t.id == terminal_id)?;
-        if feeder.source_id != 0 {
-            return self
-                .feature_units
-                .iter()
-                .find(|f| f.source_id == feeder.source_id || f.id == feeder.source_id);
+        let mut head = 0;
+        while head < queue.len() {
+            let node = queue[head];
+            head += 1;
+            if visited.contains(&node) {
+                continue;
+            }
+            visited.push(node);
+            if let Some(f) = self.feature_units.iter().find(|f| f.id == node) {
+                return Some(f);
+            }
+            // Downstream first: units taking this node as a source.
+            for f in self.feature_units.iter().filter(|f| f.source_id == node) {
+                if !visited.contains(&f.id) && !queue.contains(&f.id) {
+                    queue.push(f.id);
+                }
+            }
+            for m in self.mixers.iter().filter(|m| m.sources.contains(&node)) {
+                if !visited.contains(&m.id) && !queue.contains(&m.id) {
+                    queue.push(m.id);
+                }
+            }
+            for s in self.selectors.iter().filter(|s| s.sources.contains(&node)) {
+                if !visited.contains(&s.id) && !queue.contains(&s.id) {
+                    queue.push(s.id);
+                }
+            }
+            // Upstream through mixer/selector units only: their
+            // sources feed them, so an FU upstream of a mixer on
+            // this path is reachable here (capture direction).
+            // Terminals are never expanded upstream: an Input
+            // Terminal has no source, and an Output Terminal's
+            // source was seeded above.
+            if let Some(m) = self.mixers.iter().find(|m| m.id == node) {
+                for src in &m.sources {
+                    if !visited.contains(src) && !queue.contains(src) {
+                        queue.push(*src);
+                    }
+                }
+            }
+            if let Some(s) = self.selectors.iter().find(|s| s.id == node) {
+                for src in &s.sources {
+                    if !visited.contains(src) && !queue.contains(src) {
+                        queue.push(*src);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The clock selector on the path to clock source
+    /// `source_id`, if any: the first selector (in descriptor
+    /// order) whose input pins list the source, with the 1-based
+    /// pin number that selects it. `None` when no selector lists
+    /// the source — the stream is clocked straight from the
+    /// source. This is the same "selector whose pins include the
+    /// resolved source" relation `clock_for_terminal` uses to
+    /// resolve through a selector; it does not by itself prove
+    /// the terminal is clocked through the selector (the
+    /// terminal's `bCSourceID` is not modelled — see the
+    /// `InputTerminal2` note), but a selector listing the
+    /// resolved source is the only in-model signal, and
+    /// switching its pin to the resolved source is a no-op when
+    /// the stream was already clocked from it.
+    pub fn selector_for_source(&self, source_id: u8) -> Option<(&UacClock, u8)> {
+        for c in self
+            .clocks
+            .iter()
+            .filter(|c| c.kind == UacClockKind::Selector)
+        {
+            for (i, pin) in c.pins.iter().enumerate() {
+                if *pin == source_id {
+                    return Some((c, (i + 1) as u8));
+                }
+            }
         }
         None
     }
@@ -1450,6 +1913,13 @@ pub struct ControlStep {
     /// For a UAC2 clock SET_CUR: resolve the OUT payload against
     /// this direction's stored RANGE response at execution time.
     pub resolve_rate_from_range: Option<bool>,
+    /// For a UAC2 clock-selector SET_CUR: at execution time,
+    /// issue the transfer only when the direction's recorded
+    /// current pin differs from the payload's desired pin (see
+    /// `selector_pin_switch_needed`); a missing GET_CUR response
+    /// means "unknown — issue it". `Some(capture)` names the
+    /// direction whose recorded pin is compared.
+    pub set_selector_pin_if_differs: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1470,6 +1940,11 @@ pub enum ResponseSlot {
     /// Current sampling frequency of a fixed (non-programmable)
     /// clock.
     ClockCur {
+        capture: bool,
+    },
+    /// Current pin of the stream's clock selector (1-byte
+    /// Layout 1 payload, 1-based pin number).
+    ClockSelectorCur {
         capture: bool,
     },
     FuVolumeMin {
@@ -1494,7 +1969,14 @@ pub struct BindOutcome {
     pub clock_rate_hz: [Option<u32>; 2],
     /// Clock subranges seen (UAC2), per direction.
     pub clock_ranges: [Vec<ClockSubrange>; 2],
-    /// Steps completed (attempted non-fatal failures included).
+    /// Current clock-selector pin (1-based) read back at bind,
+    /// per direction [playback, capture]. `None` when the
+    /// selector GET_CUR was not issued (single-pin selector, or
+    /// no selector control) or failed.
+    pub selector_pin_cur: [Option<u8>; 2],
+    /// Steps completed (attempted non-fatal failures included; a
+    /// selector SET_CUR skipped because the pin already matches
+    /// counts as completed).
     pub steps_executed: usize,
 }
 
@@ -1508,9 +1990,23 @@ impl BindOutcome {
     }
 }
 
+/// Whether a clock-selector SET_CUR to `desired_pin` (1-based)
+/// must be issued for `capture`'s direction: yes when no current
+/// pin was recorded (the GET_CUR was not issued or failed — fail
+/// closed by switching explicitly, since an unknown pin may be
+/// the wrong source), or when the recorded pin differs; no when
+/// the recorded pin already equals the desired pin.
+pub fn selector_pin_switch_needed(outcome: &BindOutcome, capture: bool, desired_pin: u8) -> bool {
+    let i = BindOutcome::dir_idx(capture);
+    outcome.selector_pin_cur[i].map_or(true, |cur| cur != desired_pin)
+}
+
 /// Build the full ordered bind conversation for a device:
 /// SET_CONFIGURATION, then per direction (in `choices` order)
-/// SET_INTERFACE → sampling frequency → FeatureUnit range + set.
+/// SET_INTERFACE → clock-selector pin switch (UAC2, when the
+/// stream is clocked through a multi-pin selector: GET_CUR
+/// current pin, then SET_CUR only if it differs) → sampling
+/// frequency → FeatureUnit range + set.
 pub fn build_bind_plan(
     topo: &UacTopology,
     cfg_value: u8,
@@ -1527,6 +2023,7 @@ pub fn build_bind_plan(
                 fatal,
                 slot: ResponseSlot::None,
                 resolve_rate_from_range: None,
+                set_selector_pin_if_differs: None,
             }
         };
     let mut steps = alloc::vec![plain(
@@ -1560,6 +2057,43 @@ pub fn build_bind_plan(
             }
             UacVersion::V2 => {
                 if let Some(clock) = topo.clock_for_terminal(choice.terminal_link) {
+                    // Clock-selector pin switch, before rate
+                    // programming: when the resolved source is
+                    // reached through a selector, the stream is
+                    // still clocked by whatever pin the selector
+                    // currently selects until we switch it.
+                    // Skipped for single-pin selectors (nothing
+                    // to switch, and some such selectors carry
+                    // no control at all) and for selectors whose
+                    // control is absent; a read-only control
+                    // gets the GET_CUR only (we can observe the
+                    // pin, not switch it).
+                    if clock.kind == UacClockKind::Source {
+                        if let Some((sel, pin)) = topo.selector_for_source(clock.id) {
+                            if sel.pins.len() >= 2 && sel.selector_control_present() {
+                                let sidx = ((sel.id as u16) << 8) | topo.ac_iface as u16;
+                                let sval = (CLOCK_CS_SELECTOR_CONTROL as u16) << 8;
+                                let mut get_cur =
+                                    plain(0xA1, REQ_CUR, sval, sidx, StepData::In(1), false);
+                                get_cur.slot = ResponseSlot::ClockSelectorCur {
+                                    capture: choice.capture,
+                                };
+                                steps.push(get_cur);
+                                if sel.selector_control_programmable() {
+                                    let mut set_cur = plain(
+                                        0x21,
+                                        REQ_CUR,
+                                        sval,
+                                        sidx,
+                                        StepData::Out(alloc::vec![pin]),
+                                        true,
+                                    );
+                                    set_cur.set_selector_pin_if_differs = Some(choice.capture);
+                                    steps.push(set_cur);
+                                }
+                            }
+                        }
+                    }
                     let idx = ((clock.id as u16) << 8) | topo.ac_iface as u16;
                     let val = (CLOCK_CS_SAMPLING_FREQUENCY as u16) << 8;
                     if clock.freq_programmable {
@@ -1665,6 +2199,20 @@ pub async fn execute_bind_plan(
 ) -> Result<BindOutcome, UacError> {
     let mut outcome = BindOutcome::default();
     for step in steps {
+        // A clock-selector SET_CUR flagged
+        // `set_selector_pin_if_differs` is a no-op when the
+        // recorded current pin already equals the desired pin:
+        // skip the transfer (no bus traffic) and count the step
+        // as completed — its postcondition already holds.
+        if let (StepData::Out(bytes), Some(capture)) =
+            (&step.data, step.set_selector_pin_if_differs)
+        {
+            let desired = bytes.first().copied().unwrap_or(0);
+            if !selector_pin_switch_needed(&outcome, capture, desired) {
+                outcome.steps_executed += 1;
+                continue;
+            }
+        }
         let res: Result<Vec<u8>, UacError> = match &step.data {
             StepData::Out(bytes) => {
                 let mut payload = bytes.clone();
@@ -1747,6 +2295,12 @@ pub(crate) fn record_response(outcome: &mut BindOutcome, slot: ResponseSlot, dat
             if data.len() >= 4 {
                 outcome.clock_rate_hz[i] =
                     Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
+            }
+        }
+        ResponseSlot::ClockSelectorCur { capture } => {
+            let i = BindOutcome::dir_idx(capture);
+            if let Some(&pin) = data.first() {
+                outcome.selector_pin_cur[i] = Some(pin);
             }
         }
         ResponseSlot::FuVolumeMin { capture } => {
