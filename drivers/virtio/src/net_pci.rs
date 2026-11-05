@@ -3369,7 +3369,7 @@ fn vnet0_send_frame_zc(frame: narf_net::Frame, meta: narf_net::TxMeta) -> Result
     let copy = with_controller(|c| {
         let mut copy = c.tx_buf_acquire_on(queue)?;
         let done = (|| {
-            let src = orig.as_slice().get(off..off + len)?;
+            let src = orig.as_slice().get((off as usize)..(off as usize + len))?;
             let slice = copy.as_mut_slice();
             if slice.len() < VIRTIO_NET_HDR_LEN + new_len {
                 return None;
@@ -3678,6 +3678,10 @@ mod tx_tests {
                 has_ctrl_vlan: false,
                 mtu: 1500,
                 has_status: false,
+                has_rss: false,
+                has_hash_report: false,
+                rss_configured: false,
+                rx_hdr_len: VIRTIO_NET_HDR_LEN,
                 tx_checksum: true,
                 tx_tso4: true,
                 rx_guest_csum: false,
@@ -3987,7 +3991,7 @@ mod tx_tests {
                 [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb],
             ];
             let payload = mac_table_payload(&uc, &mc);
-            let expected: [u8; 8 + 6 + 8 + 12] = [
+            let expected: [u8; 4 + 6 + 4 + 12] = [
                 1, 0, 0, 0, // unicast count LE
                 1, 2, 3, 4, 5, 6, // unicast MAC
                 2, 0, 0, 0, // multicast count LE
