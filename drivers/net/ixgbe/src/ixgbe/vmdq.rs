@@ -64,12 +64,17 @@
 //! 0x05818, the Linux/compat alias; the datasheet dual-maps it
 //! to 0x0EC80, and `rss.rs` programs the same canonical address
 //! through `regs.rs`). `configure_rss` and `configure_vmdq`
-//! therefore write the SAME `MRQC` register. What still does
-//! NOT compose is the MRQE mode + tables: the MRQE value here
-//! is `VMDQEN` (0x8, "64 pools no RSS"), while Linux's SR-IOV
-//! path uses `VMDQRSS64EN` (0xB) because it always pairs RSS;
-//! switching to 0xB + per-pool RETA is the RSS+VMDq
-//! composition follow-up, not done here.
+//! therefore write the SAME `MRQC` register. The RSS+VMDq
+//! composition lives here too ([`enable_vmdq_rss`]): after VT
+//! mode is on, it switches the MRQE value from `VMDQEN` (0x8,
+//! "64 pools no RSS") to `VMDQRSS64EN` (0xB, Linux's SR-IOV
+//! value) with the hash fields on, programs the shared RSS key
+//! + the per-pool indirection table (the 82599's single RETA is
+//! common to all pools; each entry is the queue inside the pool
+//! — datasheet §4.6.10.1.1), and bounds the lookup per pool
+//! with `PSRTYPE` RQPL. The X550 per-pool registers
+//! (`PFVFMRQC` / `PFVFRETA` / `PFVFRSSRK`) do not exist on
+//! 82599 and are never programmed.
 //!
 //! RAR 16 note: VF 15's primary slot (RAR 16, 0x0A200) coincides
 //! with the driver's `REG_RAL0` fallback-read address. That path
@@ -77,6 +82,8 @@
 //! there is no live interference.
 
 use super::queues::RegBank;
+use super::regs::{REG_RETA_BASE, REG_RSSRK_BASE};
+use super::rss::{reta_words, rssrk_words, IxgbeRss, MRQC_HASH_FIELDS};
 use super::vlan::REG_VFTA_BASE;
 
 /// VMDq pools on the 82599 (VLVF entries, VMOLR entries).
@@ -112,6 +119,9 @@ pub use super::regs::REG_MRQC;
 pub const MRQC_MRQE_MASK: u32 = 0xF;
 /// `MRQC` VMDq2, 64 pools, no RSS.
 pub const MRQC_VMDQEN: u32 = 0x8;
+/// `MRQC` VMDq2, 64 pools, with RSS — re-exported from the shared
+/// authority (`regs::MRQE_VMDQ_64_RSS`), never redefined here.
+pub use super::regs::MRQE_VMDQ_64_RSS;
 /// Virtualization Control (`PFVTCTL`).
 pub const REG_VT_CTL: u64 = 0x051B0;
 /// `VT_CTL` VT-enable bit: defined, but NOT set by Linux in this
@@ -129,6 +139,49 @@ pub const VT_CTL_POOL_MASK: u32 = 0x3F << VT_CTL_POOL_SHIFT;
 pub const REG_PFDTXGSWC: u64 = 0x08220;
 /// `PFDTXGSWC` local-L2 VT-switch enable (VEB mode).
 pub const PFDTXGSWC_VT_LBEN: u32 = 0x1;
+
+// ── Per-pool RSS (PSRTYPE) ────────────────────────────────────────
+
+/// Packet Split Receive Type, pool `pool` (64 registers: pools
+/// 0..15 at 0x05480, pools 16..63 at 0x0EA00 — Linux
+/// `IXGBE_PSRTYPE`).
+pub fn psrtype(pool: usize) -> u64 {
+    if pool <= 15 {
+        0x05480 + 4 * pool as u64
+    } else {
+        0x0EA00 + 4 * pool as u64
+    }
+}
+
+/// `PSRTYPE` TCP-header split bit.
+pub const PSRTYPE_TCPHDR: u32 = 0x10;
+/// `PSRTYPE` UDP-header split bit.
+pub const PSRTYPE_UDPHDR: u32 = 0x20;
+/// `PSRTYPE` IPv4-header split bit.
+pub const PSRTYPE_IPV4HDR: u32 = 0x100;
+/// `PSRTYPE` IPv6-header split bit.
+pub const PSRTYPE_IPV6HDR: u32 = 0x200;
+/// `PSRTYPE` L2-header split bit.
+pub const PSRTYPE_L2HDR: u32 = 0x1000;
+/// `PSRTYPE` RSS-queues-per-pool field mask (bits 31:29).
+pub const PSRTYPE_RQPL_MASK: u32 = 0x7;
+/// `PSRTYPE` RSS-queues-per-pool field shift.
+pub const PSRTYPE_RQPL_SHIFT: u32 = 29;
+
+/// `PSRTYPE` word for `rss_queues_per_pool` RSS queues per pool
+/// (Linux `ixgbe_setup_psrtype`: the header-split bits are always
+/// set; RQPL is 0 for 1 queue, 1 for 2 queues, 2 for 4 queues).
+pub fn psrtype_word(rss_queues_per_pool: usize) -> u32 {
+    let w = PSRTYPE_TCPHDR | PSRTYPE_UDPHDR | PSRTYPE_IPV4HDR | PSRTYPE_L2HDR | PSRTYPE_IPV6HDR;
+    let rqpl = if rss_queues_per_pool > 3 {
+        2
+    } else if rss_queues_per_pool > 1 {
+        1
+    } else {
+        0
+    };
+    w | ((rqpl & PSRTYPE_RQPL_MASK) << PSRTYPE_RQPL_SHIFT)
+}
 
 // ── Pool registers ────────────────────────────────────────────────
 
@@ -467,6 +520,12 @@ pub enum VmdqError {
     BadFrame,
     /// Mailbox lock not obtained (PFU bit not set on read-back).
     MailboxBusy,
+    /// VT mode not enabled (`MTQC` VT_ENA clear) — call
+    /// `enable_virtualization` before composing RSS.
+    VtNotEnabled,
+    /// RSS config not built for exactly `QUEUES_PER_POOL` queues,
+    /// or its table names a queue outside the pool.
+    BadRssQueues,
 }
 
 // ── Configuration ─────────────────────────────────────────────────
@@ -535,6 +594,56 @@ pub fn enable_virtualization(bank: &mut impl RegBank, cfg: &VmdqConfig) -> Resul
     // 4. VEB switching: VF-to-VF traffic stays on the device
     // (ixgbe_enable_sriov writes the constant directly).
     bank.write32(REG_PFDTXGSWC, PFDTXGSWC_VT_LBEN);
+    Ok(())
+}
+
+// ── VT-mode RSS composition ───────────────────────────────────────
+
+/// Enable RSS inside VT mode (MRQE 0xB, 64 pools + RSS): program
+/// the shared RSS key + the per-pool indirection table, bound the
+/// table per pool, then switch `MRQC` from `VMDQEN` (0x8) to
+/// `VMDQRSS64EN` (0xB) with the hash fields on. Call after
+/// [`enable_virtualization`]; callers must have RX disabled while
+/// reprogramming filters.
+///
+/// The 82599 has ONE redirection table for the whole device
+/// (datasheet §4.6.10.1.1: "the redirection table is common to
+/// all the pools and only indicates the queue inside the pool to
+/// use once the pool is chosen"; Table 7.4 indexes a queue as
+/// pool + RSS bit). `rss` must therefore be a
+/// [`QUEUES_PER_POOL`]-queue config (`IxgbeRss::standard(2)`):
+/// each RETA entry is the queue offset *within* the pool, and an
+/// entry >= 2 would steer into the next pool's queues. The
+/// per-pool `PSRTYPE` RQPL field (Linux `ixgbe_setup_psrtype`)
+/// bounds the lookup to the pool's queue subset; the X550
+/// per-pool registers (`PFVFMRQC` / `PFVFRETA` / `PFVFRSSRK`)
+/// do not exist on 82599 and are not programmed.
+///
+/// Validates everything before touching any register: VT mode
+/// must be enabled, the config must be 2-queue, and every table
+/// entry must be in-pool. Write order mirrors Linux
+/// `ixgbe_setup_mrqc` (key + RETA first, `MRQC` last).
+pub fn enable_vmdq_rss(bank: &mut impl RegBank, rss: &IxgbeRss) -> Result<(), VmdqError> {
+    if bank.read32(REG_MTQC) & MTQC_VT_ENA == 0 {
+        return Err(VmdqError::VtNotEnabled);
+    }
+    if rss.queues != QUEUES_PER_POOL || rss.table.iter().any(|&e| e as usize >= QUEUES_PER_POOL) {
+        return Err(VmdqError::BadRssQueues);
+    }
+    for (n, w) in rssrk_words(&rss.key).iter().enumerate() {
+        bank.write32(REG_RSSRK_BASE + 4 * n as u64, *w);
+    }
+    for (n, w) in reta_words(&rss.table).iter().enumerate() {
+        bank.write32(REG_RETA_BASE + 4 * n as u64, *w);
+    }
+    for pool in 0..MAX_POOLS {
+        bank.write32(psrtype(pool), psrtype_word(QUEUES_PER_POOL));
+    }
+    let mrqc = bank.read32(REG_MRQC);
+    bank.write32(
+        REG_MRQC,
+        (mrqc & !MRQC_MRQE_MASK) | MRQE_VMDQ_64_RSS | MRQC_HASH_FIELDS,
+    );
     Ok(())
 }
 
