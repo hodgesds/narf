@@ -1968,7 +1968,7 @@ fn native_hda_realtek256_coef_init_applied() -> TestResult {
     // The fixups run before the graph build: the first
     // GET_CONFIG_DEFAULT the enumerator sends for a pin must come
     // after both coef verbs.
-    let first_pincfg = verbs.iter().position(|v| (**v >> 8) & 0xfff == 0xf1c);
+    let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
     match first_pincfg {
         Some(at) if at_coef < at => {}
         _ => return TestResult::Fail("coef init must precede enumeration"),
@@ -2004,7 +2004,7 @@ fn native_hda_unknown_subsystem_fails_open() -> TestResult {
         .model
         .verbs
         .iter()
-        .any(|v| (**v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
+        .any(|v| (*v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
     {
         return TestResult::Fail("unwired chip must get no coef verbs");
     }
@@ -2036,7 +2036,7 @@ fn native_hda_non_realtek_gets_no_fixups() -> TestResult {
         .model
         .verbs
         .iter()
-        .any(|v| (**v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
+        .any(|v| (*v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
     {
         return TestResult::Fail("non-Realtek codec must get no coef verbs");
     }
