@@ -47,6 +47,10 @@ mod http3_smoke;
 mod net_robust;
 mod passthrough;
 mod relocs;
+/// The `check-safety-argument` subcommand: the CI check `process/spec.md`
+/// §6.3 promises for `safety-argument.toml` (SEC-B9, #1284). Its pure core
+/// is unit-tested in `host-test`.
+mod safety_argument;
 mod usb_image;
 mod wifi_firmware;
 mod wifi_fixture_tools;
@@ -106,6 +110,12 @@ enum Cmd {
     /// boot-time slide would have to patch. Requires a kernel linked with
     /// `--emit-relocs`.
     Relocs(RelocsArgs),
+    /// Check `safety-argument.toml`: every `ref` resolves to a present spec
+    /// line, no entry cites a retired line (L75), and linkage fields
+    /// (`pr`/`commit`/`files`/`enforces`) resolve when present. With
+    /// `--diff-base`, entries added in the diff must carry all four linkage
+    /// fields. The CI check `process/spec.md` §6.3 promises (SEC-B9, #1284).
+    CheckSafetyArgument(safety_argument::Args),
     /// Cross-compile the kernel.
     Build(BuildArgs),
     /// Cross-compile and boot under QEMU.
@@ -15275,6 +15285,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::HostTest => host_test_cmd(),
+        Cmd::CheckSafetyArgument(args) => safety_argument::run(&args, &workspace_root()?),
         Cmd::Passthrough(args) => passthrough_cmd(&args),
         Cmd::Relocs(args) => {
             let table = if args.patch {

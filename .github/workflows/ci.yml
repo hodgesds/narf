@@ -108,6 +108,37 @@ jobs:
       - name: cargo fmt --all --check
         run: cargo fmt --all -- --check
 
+  # The check `process/specification/spec.md` §6.3 promises ("CI verifies the references
+  # exist") — SEC-B9, #1284. Runs unconditionally on every PR and push: it
+  # is host-only and cheap, and a safety-argument regression must fail the
+  # gate even when the `changes` job would skip everything else. No `needs:`
+  # gate, like `fmt`.
+  safety-argument:
+    name: safety-argument refs + linkage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so `git merge-base origin/main HEAD` resolves for
+          # the new-entry linkage check.
+          fetch-depth: 0
+
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+
+      - name: Check safety-argument.toml (SEC-B9, #1284)
+        run: |
+          set -euo pipefail
+          # Full-file check (refs resolve, L75 uncitable, linkage resolves)
+          # plus new-entry linkage enforcement against the PR merge-base.
+          # On pushes to main the merge-base is HEAD itself, so the diff
+          # check is vacuous there and the full-file check is the gate.
+          if BASE=$(git merge-base origin/main HEAD 2>/dev/null); then
+            cargo xtask check-safety-argument --diff-base "$BASE"
+          else
+            cargo xtask check-safety-argument
+          fi
+
   host-tests:
     name: host unit tests
     needs: changes
