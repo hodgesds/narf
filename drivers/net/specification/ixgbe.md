@@ -251,9 +251,10 @@ Per-part rule: 82599EB by its datasheet rule; X540/X550/X550EM_x
 only when the board record permits (Linux EEPROM-cap rule — see
 §13g). Nothing arms by default: without a permitting record,
 X540+ stays unarmed, and X550's LOM/board gating IS the record.
-IPAV is NOT programmed: the datasheet text
-extracted ambiguously ("0x5838"), so it is a remainder (§14),
-not a guessed value.
+IPAV is programmed (§13h): the datasheet
+prints its address as 0x5838 (leading zero dropped in
+extraction); Linux normalizes it to 0x05838, and §13h pins
+the valid-bit layout.
 
 ## 12b. Power management and detach
 
@@ -579,6 +580,43 @@ board configuration; X550EM_A / E610 DIDs (same Linux rule
 applies when they land); the 82599 subdevice table (NARF does
 not track subdevice IDs; the 82599EB datasheet rule stands).
 
+## 13h. IPAV — IP Address Valid (resolved by #1267)
+
+#1267 asked for the true IPAV address: #1259 had left it
+unprogrammed because the datasheet text extracted as "0x5838",
+one hex digit short of the neighbouring 0x058xx registers.
+Resolution: the Intel 82599 Datasheet rev. 2.0 §8.2.3.24.4
+header itself prints "0x5838" — the PDF text drops the
+leading zero, exactly as #1259 observed — and Linux
+normalizes the same register to 0x05838 (`ixgbe_type.h:508`;
+`e1000_hw.h:990` and igb `e1000_regs.h:304` agree, "IP
+Address Valid - RW"). The slot between WUS (0x05810) and
+IP4AT (0x05840) in the §8.2.3.24 sequence confirms it.
+Datasheet grounding is MET for IPAV specifically (unlike
+the sibling §13b–§13g items, which remain Linux-only).
+
+Bit layout (datasheet §8.2.3.24.4, RW): V40 bit 0 =
+IPv4 slot 0 valid, V41 bit 1 = slot 1, V42 bit 2 = slot 2,
+V43 bit 3 = slot 3, V60 bit 16 = IPv6 address 0 valid;
+all other bits reserved. V40 init comes from EEPROM
+(IPv4[0] itself is EEPROM-loaded from MIPAF); the other
+valid bits init 0b. The register states whether the
+IP4AT/IP6AT entries are valid for wake matching.
+
+Programming (`wol.rs`): `program_ipv4` sets the slot's
+valid bit alongside the table write, `program_ipv6` sets
+V60, `invalidate_ipv4` / `invalidate_ipv6` clear them.
+`arm` / `disarm` do not touch IPAV: validity is per-entry
+state, and with WUFC = 0 no filter can fire regardless of
+the valid bits. Note Linux never writes IPAV on any path
+(it appears only in ethtool register dumps), so there is
+no Linux write sequence to copy — the datasheet layout
+above is the sole authority for the programming, and the
+smoke pins address, bits, set-on-program, and
+clear-only-the-target-bit behavior. Per-part arming is
+still governed by the §12 board-cap rule; IPAV
+programming itself is part-agnostic register programming.
+
 ## 13i. Per-queue statistics (QPRC/QPTC)
 
 Datasheet-grounded (82599 rev. 2.0 §8.2.3.23.74/.78), corroborated
@@ -707,8 +745,6 @@ Per the v0.1 exclusion list, still open after this stream:
   the Linux-cap-rule model (§13g); remainders are datasheet
   re-grounding, the EEPROM word-0x2c reader, and E610/X550EM_A
   DIDs.
-- IPAV (0x05838 candidate) — datasheet text extraction was
-  ambiguous, so it is not programmed; see §12.
 - Per-queue statistics counters (QPRC/QPTC) — landed (§13i);
   QPRDC (per-queue drops) and QBRC/QBTC (per-queue bytes) remain
   as follow-ups.
