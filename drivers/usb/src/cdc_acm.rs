@@ -408,11 +408,19 @@ pub fn find_acm_interfaces(cfg: &[u8]) -> Option<AcmInterfaces> {
             USB_DT_INTERFACE_ASSOCIATION if len >= 8 => {
                 let fc = cfg[i + 4];
                 let fsc = cfg[i + 5];
+                // bFunctionProtocol at +6: 0xFF is the RNDIS
+                // vendor protocol, not an ACM protocol (CDC PSTN
+                // 1.2 §6.3: ACM protocols are 0x00–0x06). An IAD
+                // declaring it is an RNDIS function, not ACM —
+                // without this guard its state reset would wipe a
+                // previously accumulated ACM function in a
+                // composite device (see the interface case below).
+                let fproto = cfg[i + 6];
                 // If this IAD declares an ACM function, reset
                 // any previously-accumulated partial state so
                 // we bind to this function rather than a stale
                 // partial match from earlier in the blob.
-                if fc == USB_CLASS_CDC_COMM && fsc == CDC_SUBCLASS_ACM {
+                if fc == USB_CLASS_CDC_COMM && fsc == CDC_SUBCLASS_ACM && fproto != 0xFF {
                     finish_data!();
                     comm_iface = None;
                     notify = None;
@@ -429,9 +437,20 @@ pub fn find_acm_interfaces(cfg: &[u8]) -> Option<AcmInterfaces> {
                 let num = cfg[i + 2];
                 let cls = cfg[i + 5];
                 let sub = cfg[i + 6];
+                // bInterfaceProtocol at +7: 0xFF is the RNDIS
+                // vendor protocol, not an ACM protocol (CDC PSTN
+                // 1.2 §6.3: ACM protocols are 0x00–0x06). RNDIS
+                // presents as Comm/ACM/0xFF, and this finder
+                // used to match it — the ACM bind then claimed
+                // the device as a serial port (SET_LINE_CODING
+                // failures are non-fatal there) before any RNDIS
+                // binder could run. RNDIS devices belong to the
+                // `rndis` binder (which runs first in the attach
+                // cascade); ACM must not claim them here.
+                let proto = cfg[i + 7];
                 current_iface = Some(num);
                 current_class = cls;
-                if cls == USB_CLASS_CDC_COMM && sub == CDC_SUBCLASS_ACM {
+                if cls == USB_CLASS_CDC_COMM && sub == CDC_SUBCLASS_ACM && proto != 0xFF {
                     if comm_iface.is_none() {
                         comm_iface = Some(num);
                     }
@@ -1353,6 +1372,52 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/cdc_acm", smoke_acm_descriptor_caps);
+
+    /// RNDIS presents as Comm/ACM/0xFF — the ACM finder must
+    /// not claim it (the `rndis` binder owns those devices).
+    /// A real modem (protocol 0x01) in the same shape must
+    /// still match.
+    fn smoke_acm_finder_skips_rndis_protocol() -> TestResult {
+        #[rustfmt::skip]
+        let cfg: &[u8] = &[
+            9, 2, 0, 0, 2, 1, 0, 0x80, 0x32,
+            // Comm interface 0, class 2 / subclass ACM / protocol RNDIS
+            9, 4, 0, 0, 1, 0x02, 0x02, 0xFF, 0,
+            5, 0x24, 0x00, 0x20, 0x01, // Header functional
+            5, 0x24, 0x06, 0, 1, // Union { ctrl=0, sub=1 }
+            7, 5, 0x83, 3, 16, 0, 8, // interrupt endpoint
+            9, 4, 1, 0, 0, 0x0A, 0, 0, 0, // Data 1 alt 0
+            9, 4, 1, 1, 2, 0x0A, 0, 0, 0, // Data 1 alt 1
+            7, 5, 0x81, 2, 64, 0, 0,
+            7, 5, 0x02, 2, 64, 0, 0,
+        ];
+        let mut rndis_cfg = cfg.to_vec();
+        let total = rndis_cfg.len() as u16;
+        rndis_cfg[2..4].copy_from_slice(&total.to_le_bytes());
+        if find_acm_interfaces(&rndis_cfg).is_some() {
+            return TestResult::Fail("ACM finder claimed an RNDIS (0xFF) function");
+        }
+        // Same shape, real modem protocol: must still match.
+        let mut modem_cfg = rndis_cfg.clone();
+        modem_cfg[9 + 7] = 0x01;
+        if find_acm_interfaces(&modem_cfg).is_none() {
+            return TestResult::Fail("ACM finder rejected a real modem (protocol 0x01)");
+        }
+        // Same shape led by an RNDIS IAD: the IAD must not reset
+        // ACM state, and the function must still not match.
+        let mut iad_cfg: Vec<u8> = alloc::vec![
+            9, 2, 0, 0, 2, 1, 0, 0x80, 0x32, 8, 0x0B, 0, 2, 0x02, 0x02, 0xFF,
+            0, // IAD, function protocol 0xFF
+        ];
+        iad_cfg.extend_from_slice(&rndis_cfg[9..]);
+        let total = iad_cfg.len() as u16;
+        iad_cfg[2..4].copy_from_slice(&total.to_le_bytes());
+        if find_acm_interfaces(&iad_cfg).is_some() {
+            return TestResult::Fail("ACM finder claimed an IAD-led RNDIS function");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_acm", smoke_acm_finder_skips_rndis_protocol);
 
     /// Detach/replug latch: the "serial attached" announce
     /// predicate tracks ACM_DEVICES membership — latched while a
