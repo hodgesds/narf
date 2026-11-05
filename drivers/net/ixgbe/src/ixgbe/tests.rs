@@ -1639,3 +1639,250 @@ fn smoke_ixgbe_fdir_stats() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_stats);
+
+// ── DCB fixtures ───────────────────────────────────────────────────
+
+fn dcb_tc(refill: u16, max: u16, bwg_id: u8, prio: super::dcb::PrioType) -> super::dcb::TcCredits {
+    super::dcb::TcCredits {
+        refill,
+        max,
+        bwg_id,
+        prio_type: prio,
+    }
+}
+
+fn smoke_ixgbe_dcb_register_conversation_8tc() -> TestResult {
+    use super::dcb::*;
+    use super::queues::RegBank;
+    use super::IXGBE_DEV_82599EB;
+    let mut tc = [dcb_tc(32, 256, 0, PrioType::None); MAX_TRAFFIC_CLASS];
+    for (i, slot) in tc.iter_mut().enumerate() {
+        *slot = dcb_tc(
+            32 * (i as u16 + 1),
+            256 * (i as u16 + 1),
+            i as u8,
+            match i % 3 {
+                0 => PrioType::Link,
+                1 => PrioType::Group,
+                _ => PrioType::None,
+            },
+        );
+    }
+    let mut high = [0u32; MAX_TRAFFIC_CLASS];
+    let mut low = [0u32; MAX_TRAFFIC_CLASS];
+    for i in 0..MAX_TRAFFIC_CLASS {
+        high[i] = 16 + i as u32;
+        low[i] = 8 + i as u32;
+    }
+    let cfg = DcbConfig {
+        num_tcs: 8,
+        tc,
+        prio_to_tc: [0, 1, 2, 3, 4, 5, 6, 7],
+        // UPs 0 and 2: TCs 0 and 2 PFC-enabled, the rest guard-pathed.
+        pfc_enable: 0b0000_0101,
+        high_water: high,
+        low_water: low,
+        pause_time: 160,
+    };
+    let mut bank = FakeBank::new();
+    if cfg.apply(&mut bank, IXGBE_DEV_82599EB).is_err() {
+        return TestResult::Fail("8-TC DCB apply failed");
+    }
+    // Mode + buffers.
+    if bank.read32(REG_MTQC) != 0x0000_000D {
+        return TestResult::Fail("MTQC not RT_ENA|8TC_8TQ");
+    }
+    if bank.read32(REG_SECTXMINIFG) != 0x0000_1F00 {
+        return TestResult::Fail("SECTXMINIFG DCB IFG not set");
+    }
+    if bank.read32(REG_RXPBSIZE_BASE) != 0x0001_0000
+        || bank.read32(REG_TXPBSIZE_BASE) != 0x0000_5000
+        || bank.read32(REG_TXPBTHRESH_BASE) != 10
+    {
+        return TestResult::Fail("packet buffers not 64K/20K/thresh-10");
+    }
+    // Arbiters.
+    if bank.read32(REG_RTRPCS) != 0x0000_0006
+        || bank.read32(REG_RTRUP2TC) != 0x00FA_C688
+        || bank.read32(REG_RTTUP2TC) != 0x00FA_C688
+        || bank.read32(REG_RTTDCS) != 0x0000_0011
+        || bank.read32(REG_RTTPCS) != 0x0100_0120
+    {
+        return TestResult::Fail("arbiter control/UP-map words wrong");
+    }
+    if bank.read32(REG_RTRPT4C_BASE) != 0x8010_0020
+        || bank.read32(REG_RTRPT4C_BASE + 4) != 0x0020_0240
+        || bank.read32(REG_RTTDT2C_BASE + 4) != 0x4020_0240
+        || bank.read32(REG_RTTPT2C_BASE + 8) != 0x0030_0460
+    {
+        return TestResult::Fail("per-TC credit words wrong");
+    }
+    if bank.read32(REG_RTTDQSEL) != 127 || bank.read32(REG_RTTDT1C) != 0 {
+        return TestResult::Fail("TX desc queue-credit clear incomplete");
+    }
+    // PFC: 82599 has no per-TC bits, only the single RPFCE bit.
+    if bank.read32(REG_FCCFG) != 0x0000_0010 || bank.read32(REG_MFLCN) != 0x0000_0006 {
+        return TestResult::Fail("FCCFG/MFLCN wrong for 82599");
+    }
+    if bank.read32(REG_FCRTL_BASE) != 0x8000_2000
+        || bank.read32(REG_FCRTH_BASE) != 0x8000_4000
+        || bank.read32(REG_FCRTL_BASE + 8) != 0x8000_2800
+        || bank.read32(REG_FCRTH_BASE + 8) != 0x8000_4800
+    {
+        return TestResult::Fail("enabled-TC watermarks wrong");
+    }
+    if bank.read32(REG_FCRTL_BASE + 4) != 0 || bank.read32(REG_FCRTH_BASE + 4) != 0x0000_A000 {
+        return TestResult::Fail("disabled-TC guard path wrong");
+    }
+    if bank.read32(REG_FCTTV_BASE) != 0x00A0_00A0 || bank.read32(REG_FCRTV) != 80 {
+        return TestResult::Fail("pause time / refresh threshold wrong");
+    }
+    // TC statistics mapping.
+    if bank.read32(REG_RQSMR_BASE) != 0
+        || bank.read32(REG_RQSMR_BASE + 16) != 0x0101_0101
+        || bank.read32(REG_RQSMR_BASE + 124) != 0x0707_0707
+        || bank.read32(REG_TQSM_BASE) != 0
+        || bank.read32(REG_TQSM_BASE + 32) != 0x0101_0101
+        || bank.read32(REG_TQSM_BASE + 64) != 0x0202_0202
+        || bank.read32(REG_TQSM_BASE + 124) != 0x0707_0707
+    {
+        return TestResult::Fail("TC statistics mapping wrong");
+    }
+    if read_up_to_tc(&bank) != [0, 1, 2, 3, 4, 5, 6, 7] {
+        return TestResult::Fail("RTRUP2TC read-back disagrees");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_dcb_register_conversation_8tc
+);
+
+fn smoke_ixgbe_dcb_register_conversation_4tc_x540() -> TestResult {
+    use super::dcb::*;
+    use super::queues::RegBank;
+    use super::IXGBE_DEV_X540;
+    let tc = [dcb_tc(100, 1000, 0, PrioType::None); MAX_TRAFFIC_CLASS];
+    let cfg = DcbConfig {
+        num_tcs: 4,
+        tc,
+        prio_to_tc: [0, 0, 1, 1, 2, 2, 3, 3],
+        pfc_enable: 0xFF,
+        high_water: [32; MAX_TRAFFIC_CLASS],
+        low_water: [16; MAX_TRAFFIC_CLASS],
+        pause_time: 0,
+    };
+    let mut bank = FakeBank::new();
+    if cfg.apply(&mut bank, IXGBE_DEV_X540).is_err() {
+        return TestResult::Fail("4-TC X540 DCB apply failed");
+    }
+    if bank.read32(REG_MTQC) != 0x0000_0009 {
+        return TestResult::Fail("MTQC not RT_ENA|4TC_4TQ");
+    }
+    // X540 packet buffer is 384 KiB: 96 KiB RX / 40 KiB TX per TC.
+    if bank.read32(REG_RXPBSIZE_BASE) != 0x0001_8000
+        || bank.read32(REG_TXPBSIZE_BASE) != 0x0000_A000
+        || bank.read32(REG_TXPBTHRESH_BASE) != 30
+    {
+        return TestResult::Fail("X540 packet buffers not 96K/40K/thresh-30");
+    }
+    // Unused TCs cleared.
+    if bank.read32(REG_RXPBSIZE_BASE + 16) != 0
+        || bank.read32(REG_TXPBSIZE_BASE + 16) != 0
+        || bank.read32(REG_TXPBTHRESH_BASE + 16) != 0
+    {
+        return TestResult::Fail("unused TC buffers not cleared");
+    }
+    if bank.read32(REG_RTRUP2TC) != 0x006D_2240 {
+        return TestResult::Fail("4-TC UP map wrong");
+    }
+    // X540 programs the per-TC RPFCE bits plus the single bit.
+    if bank.read32(REG_MFLCN) != 0x0000_0FF6 {
+        return TestResult::Fail("X540 MFLCN per-TC bits wrong");
+    }
+    // All TCs 0..3 PFC-enabled (max_tc = 3); TCs 4..7 zeroed.
+    if bank.read32(REG_FCRTH_BASE) != (32 << 10) | 0x8000_0000
+        || bank.read32(REG_FCRTL_BASE + 16) != 0
+        || bank.read32(REG_FCRTH_BASE + 16) != 0
+    {
+        return TestResult::Fail("4-TC PFC threshold range wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_dcb_register_conversation_4tc_x540
+);
+
+fn smoke_ixgbe_dcb_validation_rejects() -> TestResult {
+    use super::dcb::*;
+    use super::queues::RegBank;
+    use super::IXGBE_DEV_82599EB;
+    let base = DcbConfig {
+        num_tcs: 8,
+        tc: [dcb_tc(100, 1000, 0, PrioType::None); MAX_TRAFFIC_CLASS],
+        prio_to_tc: [0, 1, 2, 3, 4, 5, 6, 7],
+        pfc_enable: 0,
+        high_water: [16; MAX_TRAFFIC_CLASS],
+        low_water: [8; MAX_TRAFFIC_CLASS],
+        pause_time: 0,
+    };
+    let mut bad_num = base.clone();
+    bad_num.num_tcs = 2;
+    let mut bad_tc = base.clone();
+    bad_tc.prio_to_tc[0] = 8;
+    let mut bad_bwg = base.clone();
+    bad_bwg.tc[0].bwg_id = 8;
+    let mut bad_refill = base.clone();
+    bad_refill.tc[0].refill = 512;
+    let mut bad_max = base.clone();
+    bad_max.tc[0].max = 4096;
+    let mut bad_water = base.clone();
+    bad_water.high_water[0] = 0x0040_0000;
+    let cases = [
+        (bad_num, DcbError::NumTcs),
+        (bad_tc, DcbError::TcIndex),
+        (bad_bwg, DcbError::BwgId),
+        (bad_refill, DcbError::Refill),
+        (bad_max, DcbError::Max),
+        (bad_water, DcbError::Water),
+    ];
+    for (cfg, want) in cases {
+        let mut bank = FakeBank::new();
+        match cfg.apply(&mut bank, IXGBE_DEV_82599EB) {
+            Err(got) if got == want => {}
+            _ => return TestResult::Fail("DCB validation missed a bad config"),
+        }
+        // Validation precedes every write: the bank stays pristine.
+        if bank.read32(REG_MTQC) != 0 || bank.read32(REG_RTRPCS) != 0 {
+            return TestResult::Fail("rejected DCB config wrote registers");
+        }
+    }
+    let mut bank = FakeBank::new();
+    if base.apply(&mut bank, 0xFFFF).is_ok() {
+        return TestResult::Fail("DCB apply accepted an ungrounded device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_dcb_validation_rejects);
+
+fn smoke_ixgbe_dcb_ieee_credits() -> TestResult {
+    use super::dcb::*;
+    let bw = [50u8, 30, 20, 0, 0, 0, 0, 0];
+    let (refill, max) = ieee_credits(&bw, 1518);
+    if refill != [50, 30, 20, 12, 12, 12, 12, 12] {
+        return TestResult::Fail("IEEE refill credits wrong");
+    }
+    if max != [2047, 1228, 819, 12, 12, 12, 12, 12] {
+        return TestResult::Fail("IEEE max credits wrong");
+    }
+    // Zero-bandwidth TCs still get the minimum credit; a tiny
+    // bandwidth still clears the minimum-frame floor via the clamp.
+    let (refill2, _) = ieee_credits(&[1, 0, 0, 0, 0, 0, 0, 0], 9000);
+    // min_credit = (4500 + 63) / 64 = 71; multiplier = 71/1 + 1 = 72.
+    if refill2[0] != 72 || refill2[1] != 71 {
+        return TestResult::Fail("IEEE credit floor wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_dcb_ieee_credits);

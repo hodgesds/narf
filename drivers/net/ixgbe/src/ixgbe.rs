@@ -19,6 +19,7 @@ use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
 use crate::ixgbe::queues::RegBank;
 
+pub mod dcb;
 pub mod eee;
 pub mod ethtool;
 pub mod fdir;
@@ -329,6 +330,8 @@ pub struct Ixgbe {
     pub queue_config: queues::QueueConfig,
     /// Programmed RSS state, if `configure_rss` ran.
     pub rss_cfg: IrqSafeSpinLock<Option<rss::IxgbeRss>>,
+    /// Programmed DCB state, if `configure_dcb` ran.
+    pub dcb_cfg: IrqSafeSpinLock<Option<dcb::DcbConfig>>,
     /// Programmed VLAN filter, if `configure_vlan` ran.
     pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
     /// Programmed Flow Director config, if `configure_fdir` ran.
@@ -552,6 +555,7 @@ impl Ixgbe {
             did: device.id.device,
             queue_config,
             rss_cfg: IrqSafeSpinLock::new(None),
+            dcb_cfg: IrqSafeSpinLock::new(None),
             vlan_filter: IrqSafeSpinLock::new(None),
             fdir_cfg: IrqSafeSpinLock::new(None),
             wol_armed: IrqSafeSpinLock::new(None),
@@ -856,6 +860,25 @@ impl Ixgbe {
             self.mmio.write32(REG_EIMS, 1);
         }
         self.msix = Some(table);
+        Ok(())
+    }
+
+    /// Program DCB (MTQC mode + packet buffers + arbiters + PFC +
+    /// TC statistics) from `cfg`. Call before bringing up traffic:
+    /// the MTQC write reinterprets the queue layout (see
+    /// `dcb::DcbConfig::apply`). Composition with RSS is
+    /// unvalidated (see the `dcb` module header); callers must
+    /// pick one mode. No DCB disable path exists — re-probe
+    /// restores non-DCB mode.
+    pub fn configure_dcb(&self, cfg: dcb::DcbConfig) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            cfg.apply(&mut bank, self.did).map_err(|e| match e {
+                dcb::DcbError::Device => IxgbeError::UnsupportedDevice,
+                _ => IxgbeError::Other("bad DCB config"),
+            })?;
+        }
+        *self.dcb_cfg.lock() = Some(cfg);
         Ok(())
     }
 
