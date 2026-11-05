@@ -101,8 +101,8 @@ pub fn run(args: &Args, root: &Path) -> Result<()> {
         .file
         .clone()
         .unwrap_or_else(|| root.join(SAFETY_ARGUMENT_REL));
-    let doc = std::fs::read_to_string(&file)
-        .with_context(|| format!("reading {}", file.display()))?;
+    let doc =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let spec_path = root.join(SPEC_REL);
     let spec = std::fs::read_to_string(&spec_path)
         .with_context(|| format!("reading {}", spec_path.display()))?;
@@ -152,7 +152,9 @@ pub fn check_document(doc: &str, spec: &str, root: &Path) -> CheckReport {
     let value: toml::Value = match doc.parse() {
         Ok(v) => v,
         Err(e) => {
-            report.errors.push(format!("safety-argument.toml does not parse: {e}"));
+            report
+                .errors
+                .push(format!("safety-argument.toml does not parse: {e}"));
             return report;
         }
     };
@@ -176,15 +178,12 @@ pub fn check_document(doc: &str, spec: &str, root: &Path) -> CheckReport {
         Some(other) => report.errors.push(format!(
             "[safety_argument] schema_version is {other}, expected {SCHEMA_VERSION}"
         )),
-        None => report.errors.push(
-            "[safety_argument] schema_version is missing (expected 2)".to_string(),
-        ),
+        None => report
+            .errors
+            .push("[safety_argument] schema_version is missing (expected 2)".to_string()),
     }
 
-    let entries = match table
-        .get("invariants_preserved")
-        .and_then(|v| v.as_array())
-    {
+    let entries = match table.get("invariants_preserved").and_then(|v| v.as_array()) {
         Some(a) => a,
         None => {
             report
@@ -219,9 +218,7 @@ fn check_entry(
     let entry = match entry.as_table() {
         Some(t) => t,
         None => {
-            report
-                .errors
-                .push(format!("entry {n}: not a TOML table"));
+            report.errors.push(format!("entry {n}: not a TOML table"));
             return;
         }
     };
@@ -231,7 +228,8 @@ fn check_entry(
     for key in entry.keys() {
         if !matches!(
             key.as_str(),
-            "ref" | "argument"
+            "ref"
+                | "argument"
                 | "pr"
                 | "commit"
                 | "files"
@@ -389,11 +387,7 @@ fn is_hex_sha(s: &str) -> bool {
 
 fn check_repo_path(n: usize, p: &str, root: &Path, report: &mut CheckReport) {
     let path = Path::new(p);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|c| matches!(c, Component::ParentDir))
-    {
+    if path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         report.errors.push(format!(
             "entry {n}: `files` path `{p}` must be repo-relative (no absolute path, no `..`)"
         ));
@@ -509,10 +503,7 @@ fn enforce_new_entry_linkage(doc: &str, base_doc: &str, report: &mut CheckReport
         Ok(v) => v,
         Err(_) => return, // already reported by check_document
     };
-    let Some(entries) = value
-        .get("invariants_preserved")
-        .and_then(|v| v.as_array())
-    else {
+    let Some(entries) = value.get("invariants_preserved").and_then(|v| v.as_array()) else {
         return;
     };
     let base_value: toml::Value = match base_doc.parse() {
@@ -559,7 +550,11 @@ fn enforce_new_entry_linkage(doc: &str, base_doc: &str, report: &mut CheckReport
 }
 
 fn print_report(file: &Path, report: &CheckReport) {
-    println!("safety-argument: {} — {} entries", file.display(), report.total_entries);
+    println!(
+        "safety-argument: {} — {} entries",
+        file.display(),
+        report.total_entries
+    );
     println!("  unique refs covered: {}", report.unique_refs);
     let mut top: Vec<(&String, &usize)> = report.ref_counts.iter().collect();
     top.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
@@ -601,8 +596,8 @@ mod tests {
     /// L75 the retired filing rule) and a fake source file for `enforces`.
     fn fixture_root() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir()
-            .join(format!("narf-safety-arg-test-{}-{}", std::process::id(), n));
+        let root =
+            std::env::temp_dir().join(format!("narf-safety-arg-test-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("security-model/specification")).unwrap();
         fs::create_dir_all(root.join("memory/src")).unwrap();
@@ -610,7 +605,9 @@ mod tests {
         for i in 1..=80 {
             let line = match i {
                 39 => "The TCB is strictly {frame/, memory/, capabilities/, scheduler/}.",
-                42 => "Every kernel-side data access is covered by both a cap check and a domain tag.",
+                42 => {
+                    "Every kernel-side data access is covered by both a cap check and a domain tag."
+                }
                 75 => "Anything not listed above is a hole, and must be filed as a security bug.",
                 50 => "",
                 _ => "filler line of the security-model specification.",
@@ -664,7 +661,11 @@ enforces = ["memory/src/wx.rs::jit_cap_default_policy"]
         let doc = good_doc().replace("#L42", "#L999");
         let report = check_document(&doc, &spec_text(&root), &root);
         assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].contains("beyond the end"), "{}", report.errors[0]);
+        assert!(
+            report.errors[0].contains("beyond the end"),
+            "{}",
+            report.errors[0]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -674,7 +675,11 @@ enforces = ["memory/src/wx.rs::jit_cap_default_policy"]
         let doc = good_doc().replace("#L42", "#L50");
         let report = check_document(&doc, &spec_text(&root), &root);
         assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].contains("empty spec line"), "{}", report.errors[0]);
+        assert!(
+            report.errors[0].contains("empty spec line"),
+            "{}",
+            report.errors[0]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -687,7 +692,11 @@ enforces = ["memory/src/wx.rs::jit_cap_default_policy"]
         );
         let report = check_document(&doc, &spec_text(&root), &root);
         assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].contains("malformed"), "{}", report.errors[0]);
+        assert!(
+            report.errors[0].contains("malformed"),
+            "{}",
+            report.errors[0]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -697,7 +706,11 @@ enforces = ["memory/src/wx.rs::jit_cap_default_policy"]
         let doc = good_doc().replace("#L42", "#L75");
         let report = check_document(&doc, &spec_text(&root), &root);
         assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].contains("retired line L75"), "{}", report.errors[0]);
+        assert!(
+            report.errors[0].contains("retired line L75"),
+            "{}",
+            report.errors[0]
+        );
         assert_eq!(report.retired_entries, 1);
 
         let doc2 = doc.replace(
@@ -715,7 +728,10 @@ enforces = ["memory/src/wx.rs::jit_cap_default_policy"]
         let root = fixture_root();
         let doc = good_doc().replace("schema_version = 2", "schema_version = 1");
         let report = check_document(&doc, &spec_text(&root), &root);
-        assert!(report.errors.iter().any(|e| e.contains("schema_version is 1")));
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("schema_version is 1")));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -816,9 +832,15 @@ enforces = ["memory/src/wx.rs::jit_cap_default_policy"]
         let reworded = base
             .replace("no cap check", "no capability check")
             .replace("pr = 1284\n", "")
-            .replace("commit = \"66beee0a6b4f8f47f2168f015a39bd1d6ff9bceb\"\n", "")
+            .replace(
+                "commit = \"66beee0a6b4f8f47f2168f015a39bd1d6ff9bceb\"\n",
+                "",
+            )
             .replace("files = [\"memory/src/wx.rs\"]\n", "")
-            .replace("enforces = [\"memory/src/wx.rs::jit_cap_default_policy\"]\n", "");
+            .replace(
+                "enforces = [\"memory/src/wx.rs::jit_cap_default_policy\"]\n",
+                "",
+            );
         let mut report = CheckReport::default();
         enforce_new_entry_linkage(&reworded, &base, &mut report);
         assert_eq!(report.errors.len(), 4, "{:?}", report.errors);
@@ -864,9 +886,7 @@ enforces = ["memory/src/wx.rs::jit_cap_default_policy"]
     fn real_repo_file_passes() {
         // Guard: the in-tree file must pass its own checker. Root is the
         // workspace root (build/xtask is two levels below it).
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
         let doc = fs::read_to_string(root.join(SAFETY_ARGUMENT_REL)).unwrap();
         let spec = fs::read_to_string(root.join(SPEC_REL)).unwrap();
         let report = check_document(&doc, &spec, &root);
