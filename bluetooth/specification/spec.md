@@ -257,6 +257,36 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   not parsed, evdev DeviceNode registration is not done, and HID
   Control Point / boot output reports are not driven — all
   follow-up.
+  AF_BLUETOOTH channel sockets (issue #814): the server side of
+  L2CAP/RFCOMM sockets is wired to the pump's existing channel
+  servers through the filesystem broker
+  (`narf_filesystem::bluetooth`, installed by the `bluetooth-mgmt`
+  initcall). `pump::register_psm` / `unregister_psm` register a
+  listening PSM as a Generic staging server (LE CoC or BR/EDR);
+  service PSMs (SDP 0x0001, RFCOMM 0x0003) refuse with InUse.
+  `pump::take_pending_channel` / `pending_channel` claim/peek the
+  oldest unclaimed peer-opened channel for a listener's PSM;
+  `pump::send_channel` sends one SDU (LE CoC: K-frame segmentation
+  against the peer's MPS and credit budget, all-or-nothing;
+  BR/EDR generic: one B-frame) and `pump::drain_channel_rx` /
+  `channel_rx_pending` drain/peek staged inbound SDUs;
+  `pump::disconnect_channel` removes the channel and sends the
+  peer a Disconnection Request. RFCOMM: `pump::take_pending_rfcomm`
+  / `pending_rfcomm` claim/peek the oldest unclaimed DLC for a
+  server channel (DLCI `2*channel+1` per TS 07.10 §5.4, matched
+  leniently on the direction bit), `pump::send_rfcomm` /
+  `drain_rfcomm_rx` / `rfcomm_rx_pending` move UIH frames on the
+  open DLC (C/R 0 — responder), and `pump::close_rfcomm_dlc`
+  sends DISC and forgets the DLC (the mux survives). Claims are
+  (handle, local CID, DLCI) and are released at every
+  channel-removal site, so a reused CID is never shadowed. The
+  pump publishes `narf_filesystem::bluetooth::publish_bt_channel_event`
+  when a Generic channel opens or data lands on a
+  socket-claimable channel, so parked poll/accept waiters re-run
+  their readiness scan. Out of scope here: `connect()` (no
+  outbound channel-open client — #889), SCO (#817), fixed-CID
+  sockets (ATT/SMP/signalling stay routed to the pump's own
+  server/responder), and SDP-channel sockets (service-owned).
 
 ## Scope
 

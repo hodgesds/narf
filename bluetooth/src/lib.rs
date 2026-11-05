@@ -182,6 +182,27 @@ pub fn register_initcalls() {
             crate::hci_sock::dev_power,
         );
         narf_filesystem::bluetooth::install_hci_monitor_replay(crate::hci_sock::monitor_replay);
+        // Stage: install the L2CAP/RFCOMM channel-socket handlers
+        // (issue #814) so AF_BLUETOOTH listen/accept/send/recv reach
+        // the pump's server-side channels.
+        narf_filesystem::bluetooth::install_bt_l2cap_handlers(
+            crate::pump::register_psm,
+            crate::pump::unregister_psm,
+            crate::pump::take_pending_channel,
+            crate::pump::pending_channel,
+            crate::pump::send_channel,
+            crate::pump::drain_channel_rx,
+            crate::pump::channel_rx_pending,
+            crate::pump::disconnect_channel,
+        );
+        narf_filesystem::bluetooth::install_bt_rfcomm_handlers(
+            crate::pump::take_pending_rfcomm,
+            crate::pump::pending_rfcomm,
+            crate::pump::send_rfcomm,
+            crate::pump::drain_rfcomm_rx,
+            crate::pump::rfcomm_rx_pending,
+            crate::pump::close_rfcomm_dlc,
+        );
         InitResult::Ok
     });
 }

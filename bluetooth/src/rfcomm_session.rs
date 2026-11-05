@@ -64,6 +64,33 @@ impl RfcommSession {
         self.mux_open
     }
 
+    /// Whether `dlci` is currently open (SABM answered, no DISC
+    /// since). A socket send must refuse a closed DLC instead of
+    /// emitting a UIH the peer answers with DM.
+    pub fn is_dlc_open(&self, dlci: u8) -> bool {
+        self.dlcs.iter().any(|d| d.dlci == dlci && d.open)
+    }
+
+    /// DLCIs currently open, in open order. A socket `accept` claims
+    /// the DLC whose server channel matches its listener.
+    pub fn open_dlcs(&self) -> Vec<u8> {
+        self.dlcs
+            .iter()
+            .filter(|d| d.open)
+            .map(|d| d.dlci)
+            .collect()
+    }
+
+    /// Close `dlci` from our side (the socket layer sends the DISC
+    /// frame itself): the DLC stops staging and a later UIH on it
+    /// gets DM, exactly as if the peer's DISC had arrived.
+    pub fn close_dlc(&mut self, dlci: u8) {
+        if let Some(dlc) = self.dlcs.iter_mut().find(|d| d.dlci == dlci) {
+            dlc.open = false;
+            dlc.rx.clear();
+        }
+    }
+
     /// Drain all staged UIH payloads for `dlci` (clears the queue).
     /// Returns an empty vec for an unknown or closed DLC.
     pub fn drain_rx(&mut self, dlci: u8) -> Vec<Vec<u8>> {
@@ -71,6 +98,14 @@ impl RfcommSession {
             Some(dlc) => core::mem::take(&mut dlc.rx),
             None => Vec::new(),
         }
+    }
+
+    /// Whether staged inbound data awaits on `dlci` — non-consuming
+    /// peek for poll readability.
+    pub fn rx_pending(&self, dlci: u8) -> bool {
+        self.dlcs
+            .iter()
+            .any(|d| d.dlci == dlci && d.open && !d.rx.is_empty())
     }
 
     /// Feed one decoded RFCOMM frame; returns the response frames
@@ -205,4 +240,47 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/rfcomm-session", rfcomm_mux_then_dlc_round_trip);
+
+    /// #814: the socket-side DLC queries — open tracking, our-side
+    /// close, and the open-DLC enumeration accept uses.
+    fn rfcomm_session_dlc_queries() -> TestResult {
+        let mut session = RfcommSession::new();
+        if session.is_dlc_open(2) || !session.open_dlcs().is_empty() {
+            return TestResult::Fail("fresh session should have no open DLC");
+        }
+        let _ = session.feed(&Frame::sabm(0, true));
+        let _ = session.feed(&Frame::sabm(2, true));
+        let _ = session.feed(&Frame::sabm(4, true));
+        if !session.is_dlc_open(2) || !session.is_dlc_open(4) {
+            return TestResult::Fail("SABM'd DLCs should read open");
+        }
+        if session.open_dlcs() != alloc::vec![2, 4] {
+            return TestResult::Fail("open DLC enumeration mismatch");
+        }
+        // Our-side close: stops staging, later UIH gets DM.
+        session.close_dlc(2);
+        if session.is_dlc_open(2) || session.open_dlcs() != alloc::vec![4] {
+            return TestResult::Fail("close_dlc should forget the DLC");
+        }
+        let rsp = session.feed(&Frame::uih(2, true, alloc::vec![b'x']));
+        if rsp.len() != 1 || rsp[0].frame_type != FRAME_DM {
+            return TestResult::Fail("UIH on our-closed DLC should get DM");
+        }
+        // Peek: staged data reads pending until drained.
+        let _ = session.feed(&Frame::uih(4, true, alloc::vec![b'y']));
+        if !session.rx_pending(4) || session.rx_pending(2) {
+            return TestResult::Fail("rx_pending should track staged data");
+        }
+        let _ = session.drain_rx(4);
+        if session.rx_pending(4) {
+            return TestResult::Fail("drained DLC should not read pending");
+        }
+        // Closing an unknown DLC is a no-op, not a panic.
+        session.close_dlc(60);
+        if session.open_dlcs() != alloc::vec![4] {
+            return TestResult::Fail("closing an unknown DLC must be a no-op");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/rfcomm-session", rfcomm_session_dlc_queries);
 }

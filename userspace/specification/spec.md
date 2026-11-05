@@ -1986,6 +1986,32 @@ executable, signal, instruction/stack pointers and diagnostic registers even
 when `RLIMIT_CORE` disables the file. Ordinary traps and syscalls do not emit
 that record.
 
+AF_BLUETOOTH L2CAP/RFCOMM sockets (issue #814) support the server side:
+bind stores the local sockaddr (L2CAP psm + bdaddr + cid + address type;
+RFCOMM bdaddr + server channel), listen registers the PSM with the pump's
+Generic staging server (LE CoC when the address type is 1 or 2, BR/EDR
+when 0) or the server channel in the socket layer's RFCOMM registry
+(the pump's responder session answers any server channel, so the socket
+layer is the conflict authority there), accept claims the oldest
+peer-opened channel and returns a socket carrying it, send moves one SDU
+(LE CoC: K-frame segmentation against the peer's MPS and credit budget,
+all-or-nothing) or one RFCOMM UIH frame, recv drains the pump into a
+per-socket queue and returns one SDU (SEQPACKET/DGRAM) or a STREAM prefix
+(a partial STREAM read leaves the remainder staged; MSG_PEEK does not
+consume), getpeername reports the peer, and shutdown/drop disconnects the
+channel (Disconnection Request / DISC) and unregisters the listener.
+Errors stay honest: listen without bind is EBADFD, an unroutable local
+bdaddr is ENODEV, a service PSM (SDP/RFCOMM) or a second listener on the
+same PSM/channel is EADDRINUSE, accept/recv with nothing pending is
+EAGAIN, send/recv without a channel is ENOTCONN, an oversize LE CoC SDU
+is EMSGSIZE. `connect()` still has no backend — the outbound
+channel-open exchange is #889's — and stays EOPNOTSUPP; SCO has no
+transport (#817) and its listen/accept behavior is unchanged. Poll
+reports POLL_IN on a listener with a pending channel and on a channel
+socket with staged data (local queue or pump peek), POLL_OUT on a
+channel socket always; the pump publishes a channel event when a
+socket-claimable channel opens or data lands, waking parked waiters.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

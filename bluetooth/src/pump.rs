@@ -118,6 +118,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use narf_filesystem::bluetooth::{BtRegisterStatus, BtSendError};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::att;
@@ -465,6 +466,18 @@ pub struct PumpCore {
     /// global, never exposed to userspace). Survives disconnects;
     /// lost on controller removal or reboot.
     bonds: BondStore,
+    /// Channels claimed by AF_BLUETOOTH sockets via `accept`, as
+    /// (ACL handle, local CID, DLCI). DLCI is 0 for L2CAP channels;
+    /// for RFCOMM it names the claimed DLC, so one mux can serve
+    /// several server channels at once. A claimed channel/DLC is
+    /// owned by its socket: a later `accept` never returns it twice,
+    /// and the pump's own services never route to it. Service
+    /// channels (SDP/RFCOMM) are never claimed as L2CAP channels.
+    /// Released when the socket disconnects it, the peer
+    /// disconnects it, or its connection goes away — every
+    /// channel-removal site releases, so a reused CID is never
+    /// shadowed by a stale claim.
+    claimed: Vec<(u16, u16, u8)>,
     /// Encoded outbound ACL packets awaiting flow-control credits.
     pending_acl: VecDeque<Vec<u8>>,
     /// Controller-wide ACL packets currently with the controller.
@@ -481,6 +494,7 @@ impl fmt::Debug for PumpCore {
             .field("central_phase", &self.central.phase)
             .field("classic_phase", &self.classic.phase)
             .field("bonds", &self.bonds.len())
+            .field("claimed", &self.claimed.len())
             .field("pending_acl", &self.pending_acl.len())
             .field("acl_in_flight", &self.acl_in_flight)
             .finish_non_exhaustive()
@@ -522,6 +536,7 @@ impl PumpCore {
             pending_page: None,
             pending_scan_mode: None,
             bonds: BondStore::new(),
+            claimed: Vec::new(),
             pending_acl: VecDeque::new(),
             acl_in_flight: 0,
             stats: PumpStats::default(),
@@ -543,8 +558,378 @@ impl PumpCore {
     /// Register an LE PSM served by the generic staging server
     /// (SDUs staged for [`drain_channel_rx`]). The registry is the
     /// extension point future LE profiles register against.
-    pub fn register_le_psm(&mut self, le_psm: u16) {
+    /// `false` when the PSM is already registered (a previous
+    /// listener owns it); the socket layer reports that as
+    /// EADDRINUSE.
+    pub fn register_le_psm(&mut self, le_psm: u16) -> bool {
+        if self.servers.lookup_le(le_psm).is_some() {
+            return false;
+        }
         self.servers.register_le(le_psm, ServerKind::Generic);
+        true
+    }
+
+    /// Register a BR/EDR PSM served by the generic staging server.
+    /// `false` when the PSM is owned by an in-kernel service (SDP on
+    /// 0x0001, RFCOMM on 0x0003) or already registered by a previous
+    /// listener.
+    pub fn register_bredr_psm(&mut self, psm: u16) -> bool {
+        match self.servers.lookup_bredr(psm) {
+            Some(_) => false,
+            None => {
+                self.servers.register_bredr(psm, ServerKind::Generic);
+                true
+            }
+        }
+    }
+
+    /// Release a socket-listener LE PSM registration. Service
+    /// entries are never removed (see `ServerRegistry::unregister_le`).
+    pub fn unregister_le_psm(&mut self, le_psm: u16) {
+        self.servers.unregister_le(le_psm);
+    }
+
+    /// Release a socket-listener BR/EDR PSM registration.
+    pub fn unregister_bredr_psm(&mut self, psm: u16) {
+        self.servers.unregister_bredr(psm);
+    }
+
+    /// Whether `handle`/`local_cid`/`dlci` is claimed by a socket
+    /// (DLCI 0 for L2CAP channels).
+    fn is_claimed(&self, handle: u16, local_cid: u16, dlci: u8) -> bool {
+        self.claimed.contains(&(handle, local_cid, dlci))
+    }
+
+    /// Release every socket claim on (`handle`, `local_cid`) — all
+    /// DLCIs. Call whenever the channel goes away.
+    fn release_claims(&mut self, handle: u16, local_cid: u16) {
+        self.claimed
+            .retain(|(h, c, _)| !(*h == handle && *c == local_cid));
+    }
+
+    /// Release every socket claim on a connection (connection gone).
+    fn release_handle_claims(&mut self, handle: u16) {
+        self.claimed.retain(|(h, _, _)| *h != handle);
+    }
+
+    /// Release one RFCOMM DLC claim (DLCI closed, mux survives).
+    fn release_dlc_claim(&mut self, handle: u16, local_cid: u16, dlci: u8) {
+        self.claimed
+            .retain(|(h, c, d)| !(*h == handle && *c == local_cid && *d == dlci));
+    }
+
+    /// Claim the oldest unclaimed socket-claimable channel opened by
+    /// a peer to `psm`: LE CoC channels for an LE listener, generic
+    /// BR/EDR channels otherwise. Service channels (SDP/RFCOMM) are
+    /// never claimable — they belong to the pump's own services.
+    /// Returns (ACL handle, local CID, peer CID, peer address).
+    pub fn take_pending_channel(&mut self, psm: u16, le: bool) -> Option<(u16, u16, u16, [u8; 7])> {
+        for conn in self.connections.iter() {
+            for ch in conn.channels.iter() {
+                let (matches, local_cid, peer_cid) = match ch {
+                    Channel::Le(lech) if le && lech.le_psm == psm => {
+                        (true, lech.local_cid, lech.peer_cid)
+                    }
+                    Channel::BrEdr(brch)
+                        if !le
+                            && brch.psm == psm
+                            && matches!(brch.service, ChannelService::Generic { .. }) =>
+                    {
+                        (true, brch.local_cid, brch.peer_cid)
+                    }
+                    _ => (false, 0, 0),
+                };
+                if matches && !self.is_claimed(conn.handle, local_cid, 0) {
+                    self.claimed.push((conn.handle, local_cid, 0));
+                    return Some((conn.handle, local_cid, peer_cid, conn.peer_addr));
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether an unclaimed socket-claimable channel to `psm` is
+    /// pending (non-consuming peek for poll/accept readiness).
+    pub fn pending_channel(&self, psm: u16, le: bool) -> bool {
+        for conn in self.connections.iter() {
+            for ch in conn.channels.iter() {
+                let matches = match ch {
+                    Channel::Le(lech) => le && lech.le_psm == psm,
+                    Channel::BrEdr(brch) => {
+                        !le && brch.psm == psm
+                            && matches!(brch.service, ChannelService::Generic { .. })
+                    }
+                };
+                if matches && !self.is_claimed(conn.handle, ch.local_cid(), 0) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Send one SDU on the open channel (`handle`, `local_cid`).
+    /// LE CoC: segmented into K-frames against the peer's MPS and
+    /// credit budget (all-or-nothing — see
+    /// `LeCocChannel::take_send_frames`). BR/EDR generic: one
+    /// B-frame. Returns the bytes sent. Frames are flushed to the
+    /// transport here, so a caller outside a pump step still moves
+    /// the bytes.
+    pub fn send_channel(
+        &mut self,
+        handle: u16,
+        local_cid: u16,
+        payload: &[u8],
+    ) -> Result<usize, BtSendError> {
+        if payload.is_empty() {
+            return Ok(0);
+        }
+        let conn_idx = match self.connections.iter().position(|c| c.handle == handle) {
+            Some(i) => i,
+            None => return Err(BtSendError::NoChannel),
+        };
+        let le = self.connections[conn_idx].le;
+        let pos = match self.connections[conn_idx].channel_pos(local_cid) {
+            Some(p) => p,
+            None => return Err(BtSendError::NoChannel),
+        };
+        match &mut self.connections[conn_idx].channels[pos] {
+            Channel::Le(ch) => {
+                let peer_cid = ch.peer_cid;
+                let frames = match ch.take_send_frames(payload) {
+                    Some(f) => f,
+                    None => {
+                        // Distinguish the two refusals without
+                        // re-deriving the budget: an oversize SDU
+                        // is TooBig, anything else is credit.
+                        if payload.len() > ch.peer_mtu as usize {
+                            return Err(BtSendError::TooBig);
+                        }
+                        return Err(BtSendError::NoCredits);
+                    }
+                };
+                for frame in frames {
+                    self.queue_frame(handle, le, &BFrame::new(peer_cid, frame));
+                }
+            }
+            Channel::BrEdr(ch) => match &ch.service {
+                ChannelService::Generic { .. } => {
+                    let peer_cid = ch.peer_cid;
+                    self.queue_frame(handle, le, &BFrame::new(peer_cid, payload.to_vec()));
+                }
+                // Service channels are never socket-held; a stale
+                // socket that kept one must not inject into the
+                // service's stream.
+                ChannelService::Sdp | ChannelService::Rfcomm(_) => {
+                    return Err(BtSendError::WrongService);
+                }
+            },
+        }
+        self.flush_acl();
+        Ok(payload.len())
+    }
+
+    /// Whether staged inbound data awaits on the open channel
+    /// (`handle`, `local_cid`) — non-consuming peek for poll.
+    pub fn channel_rx_pending(&self, handle: u16, local_cid: u16) -> bool {
+        let Some(conn) = self.connections.iter().find(|c| c.handle == handle) else {
+            return false;
+        };
+        let Some(pos) = conn.channel_pos(local_cid) else {
+            return false;
+        };
+        match &conn.channels[pos] {
+            Channel::Le(ch) => !ch.rx.is_empty(),
+            Channel::BrEdr(ch) => match &ch.service {
+                ChannelService::Generic { rx } => !rx.is_empty(),
+                // SDP traffic is synchronous request/response and
+                // RFCOMM DLCs have their own peek; neither stages
+                // on the channel itself.
+                ChannelService::Sdp | ChannelService::Rfcomm(_) => false,
+            },
+        }
+    }
+
+    /// Tear down the open channel (`handle`, `local_cid`): release
+    /// the socket claim, remove the channel, and send the peer a
+    /// Disconnection Request on the connection's signalling CID.
+    /// `false` when no such channel exists. The peer's own
+    /// Disconnection Request takes the same path through
+    /// `answer_*_signalling`, which also releases the claim.
+    pub fn disconnect_channel(&mut self, handle: u16, local_cid: u16) -> bool {
+        let Some(conn_idx) = self.connections.iter().position(|c| c.handle == handle) else {
+            return false;
+        };
+        let Some(pos) = self.connections[conn_idx].channel_pos(local_cid) else {
+            return false;
+        };
+        let (peer_cid, le) = {
+            let ch = &self.connections[conn_idx].channels[pos];
+            (ch.peer_cid(), self.connections[conn_idx].le)
+        };
+        self.connections[conn_idx].channels.remove(pos);
+        self.release_claims(handle, local_cid);
+        let cmd = l2cap::build_disconnection_request(0, peer_cid, local_cid);
+        let mut payload = Vec::new();
+        cmd.encode(&mut payload);
+        let cid = if le {
+            CID_LE_SIGNALLING
+        } else {
+            CID_SIGNALLING
+        };
+        self.queue_frame(handle, le, &BFrame::new(cid, payload));
+        self.flush_acl();
+        true
+    }
+
+    /// Claim the oldest unclaimed RFCOMM DLC opened by a peer to
+    /// server `channel`: the peer (mux initiator) opens DLCI
+    /// `2*channel+1` per TS 07.10 §5.4; the match is lenient on the
+    /// direction bit (`dlci >> 1 == channel`) because the session
+    /// mirrors any DLCI and the DLCI space partitions by server
+    /// channel either way. Returns (ACL handle, local CID, peer
+    /// CID, DLCI, peer address).
+    pub fn take_pending_rfcomm(&mut self, channel: u8) -> Option<(u16, u16, u16, u8, [u8; 7])> {
+        for conn in self.connections.iter() {
+            for ch in conn.channels.iter() {
+                let Channel::BrEdr(brch) = ch else {
+                    continue;
+                };
+                let ChannelService::Rfcomm(session) = &brch.service else {
+                    continue;
+                };
+                for dlci in session.open_dlcs() {
+                    if dlci >> 1 == channel && !self.is_claimed(conn.handle, brch.local_cid, dlci) {
+                        // The claim names the DLC, not the channel:
+                        // the mux is shared, so a second server
+                        // channel on the same L2CAP channel claims
+                        // its own DLCI independently.
+                        self.claimed.push((conn.handle, brch.local_cid, dlci));
+                        return Some((
+                            conn.handle,
+                            brch.local_cid,
+                            brch.peer_cid,
+                            dlci,
+                            conn.peer_addr,
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether an unclaimed RFCOMM DLC to server `channel` is
+    /// pending (non-consuming peek for poll/accept readiness).
+    pub fn pending_rfcomm(&self, channel: u8) -> bool {
+        for conn in self.connections.iter() {
+            for ch in conn.channels.iter() {
+                let Channel::BrEdr(brch) = ch else {
+                    continue;
+                };
+                let ChannelService::Rfcomm(session) = &brch.service else {
+                    continue;
+                };
+                if session
+                    .open_dlcs()
+                    .iter()
+                    .any(|d| d >> 1 == channel && !self.is_claimed(conn.handle, brch.local_cid, *d))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Send one UIH frame on the open RFCOMM DLC (`handle`,
+    /// `local_cid`, `dlci`). We are the responder, so C/R is 0
+    /// (TS 07.10 §5.1.1: the initiator sets C/R=1, the responder
+    /// 0). Returns the bytes sent.
+    pub fn send_rfcomm(
+        &mut self,
+        handle: u16,
+        local_cid: u16,
+        dlci: u8,
+        payload: &[u8],
+    ) -> Result<usize, BtSendError> {
+        if payload.is_empty() {
+            return Ok(0);
+        }
+        let conn_idx = match self.connections.iter().position(|c| c.handle == handle) {
+            Some(i) => i,
+            None => return Err(BtSendError::NoChannel),
+        };
+        let le = self.connections[conn_idx].le;
+        let pos = match self.connections[conn_idx].channel_pos(local_cid) {
+            Some(p) => p,
+            None => return Err(BtSendError::NoChannel),
+        };
+        let (peer_cid, open) = match &self.connections[conn_idx].channels[pos] {
+            Channel::BrEdr(ch) => match &ch.service {
+                ChannelService::Rfcomm(session) => (ch.peer_cid, session.is_dlc_open(dlci)),
+                _ => return Err(BtSendError::WrongService),
+            },
+            Channel::Le(_) => return Err(BtSendError::WrongService),
+        };
+        if !open {
+            return Err(BtSendError::NoChannel);
+        }
+        let frame = crate::rfcomm::Frame::uih(dlci, false, payload.to_vec());
+        self.queue_frame(handle, le, &BFrame::new(peer_cid, frame.encode()));
+        self.flush_acl();
+        Ok(payload.len())
+    }
+
+    /// Whether staged inbound data awaits on the open RFCOMM DLC
+    /// (`handle`, `local_cid`, `dlci`) — non-consuming peek for poll.
+    pub fn rfcomm_rx_pending(&self, handle: u16, local_cid: u16, dlci: u8) -> bool {
+        let Some(conn) = self.connections.iter().find(|c| c.handle == handle) else {
+            return false;
+        };
+        let Some(pos) = conn.channel_pos(local_cid) else {
+            return false;
+        };
+        match &conn.channels[pos] {
+            Channel::BrEdr(ch) => match &ch.service {
+                ChannelService::Rfcomm(session) => session.rx_pending(dlci),
+                _ => false,
+            },
+            Channel::Le(_) => false,
+        }
+    }
+
+    /// Close the open RFCOMM DLC (`handle`, `local_cid`, `dlci`)
+    /// from our side: forget the DLC in the session and send the
+    /// peer a DISC (C/R 0 — responder). The L2CAP channel (shared
+    /// mux) survives, as do its other DLCs. `false` when no such
+    /// channel/DLC exists.
+    pub fn close_rfcomm_dlc(&mut self, handle: u16, local_cid: u16, dlci: u8) -> bool {
+        let Some(conn_idx) = self.connections.iter().position(|c| c.handle == handle) else {
+            return false;
+        };
+        let Some(pos) = self.connections[conn_idx].channel_pos(local_cid) else {
+            return false;
+        };
+        let (peer_cid, le, was_open) = match &mut self.connections[conn_idx].channels[pos] {
+            Channel::BrEdr(ch) => match &mut ch.service {
+                ChannelService::Rfcomm(session) => {
+                    let was_open = session.is_dlc_open(dlci);
+                    session.close_dlc(dlci);
+                    (ch.peer_cid, self.connections[conn_idx].le, was_open)
+                }
+                _ => return false,
+            },
+            Channel::Le(_) => return false,
+        };
+        if !was_open {
+            return false;
+        }
+        self.release_dlc_claim(handle, local_cid, dlci);
+        let frame = crate::rfcomm::Frame::disc(dlci, false);
+        self.queue_frame(handle, le, &BFrame::new(peer_cid, frame.encode()));
+        self.flush_acl();
+        true
     }
 
     /// Drain staged SDUs/payloads for an LE COC or generic BR/EDR
@@ -1273,6 +1658,7 @@ impl PumpCore {
                         let mut peer = [0u8; 7];
                         peer[0] = cc.peer_address_type;
                         peer[1..7].copy_from_slice(&cc.peer_address);
+                        self.release_handle_claims(cc.handle);
                         self.connections.retain(|c| c.handle != cc.handle);
                         self.connections
                             .push(Connection::new(cc.handle, true, peer));
@@ -1420,6 +1806,7 @@ impl PumpCore {
                         let mut peer = [0u8; 7];
                         peer[0] = 0; // BR/EDR addresses are public.
                         peer[1..7].copy_from_slice(&cc.bd_addr);
+                        self.release_handle_claims(cc.handle);
                         self.connections.retain(|c| c.handle != cc.handle);
                         self.connections.push(Connection::new(cc.handle, false, peer));
                         self.sysfs_track_connect(cc.handle, false, &peer);
@@ -1428,6 +1815,7 @@ impl PumpCore {
             }
             code if code == EventCode::DisconnectionComplete as u8 => {
                 if let Some(dc) = DisconnectionComplete::parse(event) {
+                    self.release_handle_claims(dc.handle);
                     self.connections.retain(|c| c.handle != dc.handle);
                     self.sysfs_track_disconnect(dc.handle);
                     if self.central.connected_handle == Some(dc.handle) {
@@ -1675,12 +2063,17 @@ impl PumpCore {
         let mut top_up = 0u16;
         let mut no_credit = false;
         let mut drop_channel = false;
+        // Set when the frame staged data (or opened a DLC) a socket
+        // may be waiting on: the pump publishes a channel event so
+        // parked poll/accept waiters re-run their readiness scan.
+        let mut staged = false;
         {
             let conn = &mut self.connections[conn_idx];
             match &mut conn.channels[pos] {
                 Channel::Le(ch) => {
                     match ch.receive(&frame.payload) {
-                        LeReceiveOutcome::Consumed | LeReceiveOutcome::ConsumedSdu => {}
+                        LeReceiveOutcome::Consumed => {}
+                        LeReceiveOutcome::ConsumedSdu => staged = true,
                         LeReceiveOutcome::DroppedNoCredit => no_credit = true,
                         LeReceiveOutcome::Violation => drop_channel = true,
                     }
@@ -1700,11 +2093,22 @@ impl PumpCore {
                                 Err(_) => break,
                             }
                         }
+                        // A fed frame may have opened a DLC (accept
+                        // wake) or staged UIH data (recv wake); the
+                        // waiter re-checks, so a spurious publish on
+                        // a mux-only frame is harmless.
+                        staged = true;
                     }
-                    ChannelService::Generic { rx } => rx.push(frame.payload.clone()),
+                    ChannelService::Generic { rx } => {
+                        rx.push(frame.payload.clone());
+                        staged = true;
+                    }
                     ChannelService::Sdp => {} // handled above
                 },
             }
+        }
+        if staged {
+            narf_filesystem::bluetooth::publish_bt_channel_event();
         }
         if no_credit {
             self.stats.frames_dropped_no_credit += 1;
@@ -1725,6 +2129,7 @@ impl PumpCore {
                 (ch.local_cid(), ch.peer_cid())
             };
             self.connections[conn_idx].channels.remove(pos);
+            self.release_claims(handle, local_cid);
             // Disconnection Request: Dest = the peer's CID for the
             // channel, Source = our local CID.
             let cmd = l2cap::build_disconnection_request(0, peer_cid, local_cid);
@@ -1953,9 +2358,13 @@ impl PumpCore {
             }
             Some(SignallingCode::DisconnectionRequest) => {
                 let (dest, _source) = Self::parse_cid_pair(&cmd.data);
+                let handle = self.connections[conn_idx].handle;
                 self.connections[conn_idx]
                     .channels
                     .retain(|c| c.local_cid() != dest);
+                // A socket-claimed channel the peer tore down must
+                // not shadow a later channel reusing the CID.
+                self.release_claims(handle, dest);
                 l2cap::SignallingCommand {
                     code: SignallingCode::DisconnectionResponse as u8,
                     identifier: cmd.identifier,
@@ -1965,9 +2374,11 @@ impl PumpCore {
             }
             Some(SignallingCode::DisconnectionResponse) => {
                 let (dest, _source) = Self::parse_cid_pair(&cmd.data);
+                let handle = self.connections[conn_idx].handle;
                 self.connections[conn_idx]
                     .channels
                     .retain(|c| c.local_cid() != dest);
+                self.release_claims(handle, dest);
             }
             _ => {
                 // §4.1 Command Reject, reason 0x0000 (not understood).
@@ -2022,7 +2433,7 @@ impl PumpCore {
                 // LE channels stage SDUs regardless of kind today;
                 // kinds exist so future LE profiles can attach
                 // handlers to the registry.
-                Some(_) => match self.connections[conn_idx].cid_alloc.alloc_le() {
+                Some(kind) => match self.connections[conn_idx].cid_alloc.alloc_le() {
                     None => result = l2cap::LE_COC_RESULT_NO_RESOURCES,
                     Some(cid) => {
                         local_cid = cid;
@@ -2036,6 +2447,11 @@ impl PumpCore {
                                 mps,
                                 initial_credits,
                             )));
+                        // A Generic channel is socket-claimable: wake
+                        // a listener parked in accept.
+                        if kind == ServerKind::Generic {
+                            narf_filesystem::bluetooth::publish_bt_channel_event();
+                        }
                     }
                 },
             }
@@ -2155,6 +2571,11 @@ impl PumpCore {
                             self.connections[conn_idx].channels.push(Channel::BrEdr(
                                 BrEdrChannel::new(local_cid, source_cid, psm, kind),
                             ));
+                            // A Generic channel is socket-claimable:
+                            // wake a listener parked in accept.
+                            if kind == ServerKind::Generic {
+                                narf_filesystem::bluetooth::publish_bt_channel_event();
+                            }
                             l2cap::build_connection_response(
                                 cmd.identifier,
                                 local_cid,
@@ -2204,9 +2625,13 @@ impl PumpCore {
             }
             Some(SignallingCode::DisconnectionRequest) => {
                 let (dest, _source) = Self::parse_cid_pair(&cmd.data);
+                let handle = self.connections[conn_idx].handle;
                 self.connections[conn_idx]
                     .channels
                     .retain(|c| c.local_cid() != dest);
+                // A socket-claimed channel the peer tore down must
+                // not shadow a later channel reusing the CID.
+                self.release_claims(handle, dest);
                 l2cap::SignallingCommand {
                     code: SignallingCode::DisconnectionResponse as u8,
                     identifier: cmd.identifier,
@@ -2216,9 +2641,11 @@ impl PumpCore {
             }
             Some(SignallingCode::DisconnectionResponse) => {
                 let (dest, _source) = Self::parse_cid_pair(&cmd.data);
+                let handle = self.connections[conn_idx].handle;
                 self.connections[conn_idx]
                     .channels
                     .retain(|c| c.local_cid() != dest);
+                self.release_claims(handle, dest);
             }
             _ => {
                 l2cap::SignallingCommand {
@@ -2408,25 +2835,177 @@ pub fn connection_count(index: usize) -> Option<usize> {
 /// Register an LE PSM on controller `index`'s pump (see
 /// `PumpCore::register_le_psm`). No-op when no pump exists.
 pub fn register_le_psm(index: usize, le_psm: u16) {
+    let _ = register_psm(index as u16, le_psm, true);
+}
+
+// ── AF_BLUETOOTH channel-socket API (issue #814) ─────────────────────
+//
+// The socket layer reaches these through the filesystem broker
+// (`narf_filesystem::bluetooth`), which the `bluetooth-mgmt`
+// initcall wires up. `dev` is the controller index. Read-only calls
+// hold the slot lock (no transport I/O); calls that flush ACL frames
+// take the core out via `with_core`, so a transiently-busy pump
+// reports `Busy` (retryable) instead of stalling the caller.
+
+/// Register `psm` on controller `dev`'s pump for a listening socket
+/// (`le`: LE CoC PSM vs BR/EDR PSM). See
+/// `PumpCore::register_le_psm` / `register_bredr_psm`.
+pub fn register_psm(dev: u16, psm: u16, le: bool) -> BtRegisterStatus {
     let mut pumps = PUMPS.lock();
-    if let Some(slot) = find_slot_mut(&mut pumps, index) {
+    let Some(slot) = find_slot_mut(&mut pumps, dev as usize) else {
+        return BtRegisterStatus::NoPump;
+    };
+    let Some(core) = slot.core.as_mut() else {
+        return BtRegisterStatus::NoPump;
+    };
+    let ok = if le {
+        core.register_le_psm(psm)
+    } else {
+        core.register_bredr_psm(psm)
+    };
+    if ok {
+        BtRegisterStatus::Registered
+    } else {
+        BtRegisterStatus::InUse
+    }
+}
+
+/// Release a socket-listener PSM registration. No-op when no pump
+/// exists or the PSM is service-owned.
+pub fn unregister_psm(dev: u16, psm: u16, le: bool) {
+    let mut pumps = PUMPS.lock();
+    if let Some(slot) = find_slot_mut(&mut pumps, dev as usize) {
         if let Some(core) = slot.core.as_mut() {
-            core.register_le_psm(le_psm);
+            if le {
+                core.unregister_le_psm(psm);
+            } else {
+                core.unregister_bredr_psm(psm);
+            }
         }
     }
 }
 
-/// Drain staged channel payloads (see `PumpCore::drain_channel_rx`).
-pub fn drain_channel_rx(index: usize, handle: u16, cid: u16) -> Option<Vec<Vec<u8>>> {
+/// Claim the oldest unclaimed channel opened by a peer to `psm` on
+/// controller `dev`. `None` when nothing is pending or no pump
+/// exists. See `PumpCore::take_pending_channel`.
+pub fn take_pending_channel(dev: u16, psm: u16, le: bool) -> Option<(u16, u16, u16, [u8; 7])> {
     let mut pumps = PUMPS.lock();
-    let slot = find_slot_mut(&mut pumps, index)?;
+    let slot = find_slot_mut(&mut pumps, dev as usize)?;
+    slot.core.as_mut()?.take_pending_channel(psm, le)
+}
+
+/// Whether an unclaimed channel to `psm` is pending on controller
+/// `dev` (non-consuming peek for poll/accept readiness).
+pub fn pending_channel(dev: u16, psm: u16, le: bool) -> bool {
+    let pumps = PUMPS.lock();
+    let Some(slot) = pumps.iter().find(|s| s.index == dev as usize) else {
+        return false;
+    };
+    slot.core
+        .as_ref()
+        .map(|c| c.pending_channel(psm, le))
+        .unwrap_or(false)
+}
+
+/// Send one SDU on the open channel (`handle`, `cid`) of controller
+/// `dev`. See `PumpCore::send_channel`.
+pub fn send_channel(dev: u16, handle: u16, cid: u16, payload: &[u8]) -> Result<usize, BtSendError> {
+    with_core(dev as usize, |core| core.send_channel(handle, cid, payload))
+        .unwrap_or(Err(BtSendError::Busy))
+}
+
+/// Whether staged inbound data awaits on the open channel
+/// (`handle`, `cid`) — non-consuming peek for poll.
+pub fn channel_rx_pending(dev: u16, handle: u16, cid: u16) -> bool {
+    let pumps = PUMPS.lock();
+    let Some(slot) = pumps.iter().find(|s| s.index == dev as usize) else {
+        return false;
+    };
+    slot.core
+        .as_ref()
+        .map(|c| c.channel_rx_pending(handle, cid))
+        .unwrap_or(false)
+}
+
+/// Tear down the open channel (`handle`, `cid`) on controller `dev`
+/// (see `PumpCore::disconnect_channel`). `false` when no such
+/// channel exists, or the core is busy with a pump step (the claim
+/// then survives until the peer or the connection releases it).
+pub fn disconnect_channel(dev: u16, handle: u16, cid: u16) -> bool {
+    with_core(dev as usize, |core| core.disconnect_channel(handle, cid)).unwrap_or(false)
+}
+
+/// Claim the oldest unclaimed RFCOMM DLC opened by a peer to server
+/// `channel` on controller `dev`. `None` when nothing is pending or
+/// no pump exists. See `PumpCore::take_pending_rfcomm`.
+pub fn take_pending_rfcomm(dev: u16, channel: u8) -> Option<(u16, u16, u16, u8, [u8; 7])> {
+    let mut pumps = PUMPS.lock();
+    let slot = find_slot_mut(&mut pumps, dev as usize)?;
+    slot.core.as_mut()?.take_pending_rfcomm(channel)
+}
+
+/// Whether an unclaimed RFCOMM DLC to server `channel` is pending on
+/// controller `dev` (non-consuming peek for poll/accept readiness).
+pub fn pending_rfcomm(dev: u16, channel: u8) -> bool {
+    let pumps = PUMPS.lock();
+    let Some(slot) = pumps.iter().find(|s| s.index == dev as usize) else {
+        return false;
+    };
+    slot.core
+        .as_ref()
+        .map(|c| c.pending_rfcomm(channel))
+        .unwrap_or(false)
+}
+
+/// Send one UIH frame on the open RFCOMM DLC (`handle`, `cid`,
+/// `dlci`) of controller `dev`. See `PumpCore::send_rfcomm`.
+pub fn send_rfcomm(
+    dev: u16,
+    handle: u16,
+    cid: u16,
+    dlci: u8,
+    payload: &[u8],
+) -> Result<usize, BtSendError> {
+    with_core(dev as usize, |core| {
+        core.send_rfcomm(handle, cid, dlci, payload)
+    })
+    .unwrap_or(Err(BtSendError::Busy))
+}
+
+/// Whether staged inbound data awaits on the open RFCOMM DLC
+/// (`handle`, `cid`, `dlci`) — non-consuming peek for poll.
+pub fn rfcomm_rx_pending(dev: u16, handle: u16, cid: u16, dlci: u8) -> bool {
+    let pumps = PUMPS.lock();
+    let Some(slot) = pumps.iter().find(|s| s.index == dev as usize) else {
+        return false;
+    };
+    slot.core
+        .as_ref()
+        .map(|c| c.rfcomm_rx_pending(handle, cid, dlci))
+        .unwrap_or(false)
+}
+
+/// Close the open RFCOMM DLC (`handle`, `cid`, `dlci`) on controller
+/// `dev` (see `PumpCore::close_rfcomm_dlc`). `false` when no such
+/// DLC exists, or the core is busy with a pump step.
+pub fn close_rfcomm_dlc(dev: u16, handle: u16, cid: u16, dlci: u8) -> bool {
+    with_core(dev as usize, |core| {
+        core.close_rfcomm_dlc(handle, cid, dlci)
+    })
+    .unwrap_or(false)
+}
+
+/// Drain staged channel payloads (see `PumpCore::drain_channel_rx`).
+pub fn drain_channel_rx(dev: u16, handle: u16, cid: u16) -> Option<Vec<Vec<u8>>> {
+    let mut pumps = PUMPS.lock();
+    let slot = find_slot_mut(&mut pumps, dev as usize)?;
     slot.core.as_mut()?.drain_channel_rx(handle, cid)
 }
 
 /// Drain staged RFCOMM DLC payloads (see `PumpCore::drain_rfcomm_rx`).
-pub fn drain_rfcomm_rx(index: usize, handle: u16, cid: u16, dlci: u8) -> Option<Vec<Vec<u8>>> {
+pub fn drain_rfcomm_rx(dev: u16, handle: u16, cid: u16, dlci: u8) -> Option<Vec<Vec<u8>>> {
     let mut pumps = PUMPS.lock();
-    let slot = find_slot_mut(&mut pumps, index)?;
+    let slot = find_slot_mut(&mut pumps, dev as usize)?;
     slot.core.as_mut()?.drain_rfcomm_rx(handle, cid, dlci)
 }
 
@@ -4923,6 +5502,358 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_le_coc_open_data_disconnect);
+
+    /// #814: the AF_BLUETOOTH socket path over a scripted LE CoC
+    /// conversation — register → peer open → accept-claim → recv →
+    /// send → disconnect, all through the top-level pump API the
+    /// socket layer calls via the filesystem broker.
+    fn smoke_pump_bt_socket_le_coc_path() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0040;
+        let peer = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        fake.enqueue_event(le_connection_complete(handle, peer));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("LE connection not tracked");
+        }
+        // Register: first call wins, second reports InUse.
+        if register_psm(0, 0x0080, true) != BtRegisterStatus::Registered {
+            reset_all();
+            return TestResult::Fail("LE PSM registration should succeed");
+        }
+        if register_psm(0, 0x0080, true) != BtRegisterStatus::InUse {
+            reset_all();
+            return TestResult::Fail("second LE PSM registration should report InUse");
+        }
+        if pending_channel(0, 0x0080, true) {
+            reset_all();
+            return TestResult::Fail("no channel should be pending before the peer opens");
+        }
+        // Peer opens the CoC (id 0x07, PSM 0x0080, peer CID 0x0041,
+        // MTU 1024, MPS 256, 8 initial credits).
+        let open =
+            l2cap::build_le_credit_based_connection_request(0x07, 0x0080, 0x0041, 1024, 256, 8);
+        let mut payload = Vec::new();
+        open.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_LE_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        if !pending_channel(0, 0x0080, true) {
+            reset_all();
+            return TestResult::Fail("opened channel should be pending for accept");
+        }
+        let claimed = match take_pending_channel(0, 0x0080, true) {
+            Some(c) => c,
+            None => {
+                reset_all();
+                return TestResult::Fail("accept-claim should return the opened channel");
+            }
+        };
+        if claimed.0 != handle || claimed.1 != 0x0040 || claimed.2 != 0x0041 {
+            reset_all();
+            return TestResult::Fail("claimed channel handle/CID mismatch");
+        }
+        if claimed.3[1..7] != peer {
+            reset_all();
+            return TestResult::Fail("claimed channel peer address mismatch");
+        }
+        // A claim is single-use: the same channel never accepts twice.
+        if take_pending_channel(0, 0x0080, true).is_some() || pending_channel(0, 0x0080, true) {
+            reset_all();
+            return TestResult::Fail("claimed channel must not be pending again");
+        }
+        // Peer data: single-K-frame SDU "hi" on our local CID.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, alloc::vec![0x02, 0x00, b'h', b'i']),
+        ));
+        let _ = pump_once(0);
+        if !channel_rx_pending(0, handle, 0x0040) {
+            reset_all();
+            return TestResult::Fail("staged SDU should read pending");
+        }
+        if drain_channel_rx(0, handle, 0x0040) != Some(alloc::vec![alloc::vec![b'h', b'i']]) {
+            reset_all();
+            return TestResult::Fail("LE COC SDU not staged for the socket");
+        }
+        if channel_rx_pending(0, handle, 0x0040) {
+            reset_all();
+            return TestResult::Fail("drained channel should not read pending");
+        }
+        // Socket send: one K-frame ("pong" + length prefix) on the
+        // peer CID 0x0041, credits deducted (8 granted - 1 spent).
+        match send_channel(0, handle, 0x0040, b"pong") {
+            Ok(4) => {}
+            _ => {
+                reset_all();
+                return TestResult::Fail("LE COC send should report 4 bytes");
+            }
+        }
+        let frames = fake.sent_acl_frames();
+        let send_ok = frames.iter().any(|(h, f)| {
+            *h == handle
+                && f.cid == 0x0041
+                && f.payload == alloc::vec![0x04, 0x00, b'p', b'o', b'n', b'g']
+        });
+        if !send_ok {
+            reset_all();
+            return TestResult::Fail("LE COC send K-frame missing from the wire");
+        }
+        // Socket close: Disconnection Request on LE signalling, then
+        // the channel is gone for good.
+        if !disconnect_channel(0, handle, 0x0040) {
+            reset_all();
+            return TestResult::Fail("disconnect should tear the channel down");
+        }
+        let frames = fake.sent_acl_frames();
+        let disc_ok = frames.iter().any(|(_, f)| {
+            f.cid == CID_LE_SIGNALLING
+                && f.payload == alloc::vec![0x06, 0x00, 0x04, 0x00, 0x41, 0x00, 0x40, 0x00]
+        });
+        if !disc_ok {
+            reset_all();
+            return TestResult::Fail("disconnect request missing from the wire");
+        }
+        if drain_channel_rx(0, handle, 0x0040).is_some()
+            || channel_rx_pending(0, handle, 0x0040)
+            || send_channel(0, handle, 0x0040, b"x").is_ok()
+        {
+            reset_all();
+            return TestResult::Fail("disconnected channel must be gone");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_bt_socket_le_coc_path);
+
+    /// #814: the AF_BLUETOOTH socket path over a scripted BR/EDR
+    /// generic-PSM conversation — service PSMs refuse registration,
+    /// a peer open to a listener PSM claims, data round-trips, and
+    /// disconnect tears down.
+    fn smoke_pump_bt_socket_bredr_generic_path() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0041;
+        let peer = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        fake.enqueue_event(Event {
+            code: EventCode::ConnectionComplete as u8,
+            params: alloc::vec![0x00, 0x41, 0x00, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0x01, 0x00],
+        });
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("BR/EDR connection not tracked");
+        }
+        // Service PSMs are owned by the pump's own services.
+        if register_psm(0, l2cap::PSM_SDP, false) != BtRegisterStatus::InUse {
+            reset_all();
+            return TestResult::Fail("SDP PSM registration should report InUse");
+        }
+        if register_psm(0, l2cap::PSM_RFCOMM, false) != BtRegisterStatus::InUse {
+            reset_all();
+            return TestResult::Fail("RFCOMM PSM registration should report InUse");
+        }
+        if register_psm(0, 0x0101, false) != BtRegisterStatus::Registered {
+            reset_all();
+            return TestResult::Fail("generic BR/EDR PSM registration should succeed");
+        }
+        // Peer opens PSM 0x0101 (peer CID 0x0040) -> local CID 0x0040.
+        let open = l2cap::build_connection_request(0x05, 0x0101, 0x0040);
+        let mut payload = Vec::new();
+        open.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        let claimed = match take_pending_channel(0, 0x0101, false) {
+            Some(c) => c,
+            None => {
+                reset_all();
+                return TestResult::Fail("accept-claim should return the BR/EDR channel");
+            }
+        };
+        if claimed.0 != handle || claimed.1 != 0x0040 || claimed.2 != 0x0040 {
+            reset_all();
+            return TestResult::Fail("claimed BR/EDR channel handle/CID mismatch");
+        }
+        if claimed.3[1..7] != peer {
+            reset_all();
+            return TestResult::Fail("claimed BR/EDR channel peer address mismatch");
+        }
+        // Peer data on our local CID stages for the socket.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, alloc::vec![b'h', b'i']),
+        ));
+        let _ = pump_once(0);
+        if drain_channel_rx(0, handle, 0x0040) != Some(alloc::vec![alloc::vec![b'h', b'i']]) {
+            reset_all();
+            return TestResult::Fail("BR/EDR payload not staged for the socket");
+        }
+        // Socket send: one B-frame on the peer CID.
+        match send_channel(0, handle, 0x0040, b"yo") {
+            Ok(2) => {}
+            _ => {
+                reset_all();
+                return TestResult::Fail("BR/EDR send should report 2 bytes");
+            }
+        }
+        let frames = fake.sent_acl_frames();
+        let send_ok = frames
+            .iter()
+            .any(|(h, f)| *h == handle && f.cid == 0x0040 && f.payload == alloc::vec![b'y', b'o']);
+        if !send_ok {
+            reset_all();
+            return TestResult::Fail("BR/EDR send B-frame missing from the wire");
+        }
+        // Unregister releases the PSM; a later listener can claim it.
+        unregister_psm(0, 0x0101, false);
+        if register_psm(0, 0x0101, false) != BtRegisterStatus::Registered {
+            reset_all();
+            return TestResult::Fail("unregistered PSM should be claimable again");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_bt_socket_bredr_generic_path);
+
+    /// #814: the AF_BLUETOOTH RFCOMM socket path over a scripted
+    /// conversation — peer opens the PSM 0x0003 mux + DLCI 3 (server
+    /// channel 1), accept claims the DLC, UIH data round-trips, and
+    /// close sends DISC.
+    fn smoke_pump_bt_socket_rfcomm_path() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0041;
+        let peer = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        fake.enqueue_event(Event {
+            code: EventCode::ConnectionComplete as u8,
+            params: alloc::vec![0x00, 0x41, 0x00, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0x01, 0x00],
+        });
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("BR/EDR connection not tracked");
+        }
+        if pending_rfcomm(0, 1) {
+            reset_all();
+            return TestResult::Fail("no DLC should be pending before the peer opens");
+        }
+        // Peer opens PSM 0x0003 (peer CID 0x0040) -> local CID 0x0040.
+        let open = l2cap::build_connection_request(0x05, l2cap::PSM_RFCOMM, 0x0040);
+        let mut payload = Vec::new();
+        open.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        // Mux SABM (DLCI 0, C/R 1) then DLC SABM (DLCI 3 = server
+        // channel 1, C/R 1) on the new channel.
+        let mux_sabm = crate::rfcomm::Frame::sabm(0, true);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(0x0040, mux_sabm.encode())));
+        let dlc_sabm = crate::rfcomm::Frame::sabm(3, true);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(0x0040, dlc_sabm.encode())));
+        let _ = pump_once(0);
+        if !pending_rfcomm(0, 1) {
+            reset_all();
+            return TestResult::Fail("opened DLC should be pending for accept");
+        }
+        let claimed = match take_pending_rfcomm(0, 1) {
+            Some(c) => c,
+            None => {
+                reset_all();
+                return TestResult::Fail("accept-claim should return the opened DLC");
+            }
+        };
+        if claimed.0 != handle || claimed.1 != 0x0040 || claimed.2 != 0x0040 || claimed.3 != 3 {
+            reset_all();
+            return TestResult::Fail("claimed DLC handle/CID/DLCI mismatch");
+        }
+        if claimed.4[1..7] != peer {
+            reset_all();
+            return TestResult::Fail("claimed DLC peer address mismatch");
+        }
+        if take_pending_rfcomm(0, 1).is_some() || pending_rfcomm(0, 1) {
+            reset_all();
+            return TestResult::Fail("claimed DLC must not be pending again");
+        }
+        // Peer UIH data on DLCI 3 stages for the socket.
+        let data = crate::rfcomm::Frame::uih(3, true, alloc::vec![b'h', b'i']);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(0x0040, data.encode())));
+        let _ = pump_once(0);
+        if !rfcomm_rx_pending(0, handle, 0x0040, 3) {
+            reset_all();
+            return TestResult::Fail("staged UIH should read pending");
+        }
+        if drain_rfcomm_rx(0, handle, 0x0040, 3) != Some(alloc::vec![alloc::vec![b'h', b'i']]) {
+            reset_all();
+            return TestResult::Fail("UIH payload not staged for the socket");
+        }
+        // Socket send: one UIH frame on DLCI 3, C/R 0 (responder).
+        match send_rfcomm(0, handle, 0x0040, 3, b"yo") {
+            Ok(2) => {}
+            _ => {
+                reset_all();
+                return TestResult::Fail("RFCOMM send should report 2 bytes");
+            }
+        }
+        let frames = fake.sent_acl_frames();
+        let expected_uih = crate::rfcomm::Frame::uih(3, false, alloc::vec![b'y', b'o']).encode();
+        let send_ok = frames
+            .iter()
+            .any(|(h, f)| *h == handle && f.cid == 0x0040 && f.payload == expected_uih);
+        if !send_ok {
+            reset_all();
+            return TestResult::Fail("RFCOMM send UIH frame missing from the wire");
+        }
+        // Socket close: DISC on DLCI 3, C/R 0; the DLC is forgotten.
+        if !close_rfcomm_dlc(0, handle, 0x0040, 3) {
+            reset_all();
+            return TestResult::Fail("RFCOMM close should send DISC");
+        }
+        let frames = fake.sent_acl_frames();
+        let expected_disc = crate::rfcomm::Frame::disc(3, false).encode();
+        let disc_ok = frames
+            .iter()
+            .any(|(h, f)| *h == handle && f.cid == 0x0040 && f.payload == expected_disc);
+        if !disc_ok {
+            reset_all();
+            return TestResult::Fail("RFCOMM DISC missing from the wire");
+        }
+        if drain_rfcomm_rx(0, handle, 0x0040, 3).map(|v| v.len()) != Some(0)
+            || send_rfcomm(0, handle, 0x0040, 3, b"x").is_ok()
+        {
+            reset_all();
+            return TestResult::Fail("closed DLC must be gone");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_bt_socket_rfcomm_path);
 
     /// #889 BR/EDR fixture: open → SDP search/attribute → disconnect.
     fn smoke_pump_sdp_open_search_disconnect() -> TestResult {
