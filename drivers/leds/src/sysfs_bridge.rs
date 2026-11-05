@@ -663,8 +663,8 @@ pub mod tests {
         register_led(a as Arc<dyn LedDevice>);
         register_led(b as Arc<dyn LedDevice>);
         let class = narf_filesystem::sysfs::class_register("leds");
-        let both_published = class.get_child("test::gone-a").is_some()
-            && class.get_child("test::gone-b").is_some();
+        let both_published =
+            class.get_child("test::gone-a").is_some() && class.get_child("test::gone-b").is_some();
         if !both_published {
             reset();
             return TestResult::Fail("LEDs not published on register");
