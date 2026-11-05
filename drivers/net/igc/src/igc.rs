@@ -299,6 +299,7 @@ pub struct Igc {
     stats: IrqSafeSpinLock<IgcStats>,
     msix: IrqSafeSpinLock<Option<MsixTable>>,
     saved_pci: narf_bus::pci::SavedPciConfig,
+    published_link: IrqSafeSpinLock<crate::publish::LinkSample>,
     /// Administrative vector; queue completions use `irq_routes` when available.
     pub irq_vector: Option<u8>,
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -426,6 +427,7 @@ impl Igc {
             saved_pci: narf_bus::pci::save_config(cap, device)
                 .map_err(|_| IgcError::BarMapFailed)?,
             msix: IrqSafeSpinLock::new(msix),
+            published_link: IrqSafeSpinLock::new(crate::publish::LinkSample::DOWN),
             irq_vector,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -546,6 +548,7 @@ impl Igc {
         self.sample_counters();
         self.save_clock();
         self.merge.lock().reset();
+        *self.published_link.lock() = crate::publish::LinkSample::DOWN;
         crate::publish::publish_link(self.name(), crate::publish::LinkSample::DOWN);
         Ok(())
     }
@@ -687,7 +690,11 @@ impl Igc {
         if !self.ready() {
             return crate::publish::LinkSample::DOWN;
         }
-        decode_link(self.hw.read(8))
+        let status = self.hw.read(8);
+        if status == u32::MAX || status & 2 == 0 || !hardware::phy_has_link(&self.hw) {
+            return crate::publish::LinkSample::DOWN;
+        }
+        decode_link(status)
     }
     pub fn link_up(&self) -> bool {
         self.link_sample().carrier
@@ -1633,7 +1640,6 @@ fn spawn_pumps(
         }
     });
     narf_scheduler::spawn(async move {
-        let mut last = crate::publish::LinkSample::DOWN;
         while !device.removed.load(Ordering::Acquire) {
             device.maintain_admin();
             if device.recovery_requested.swap(false, Ordering::AcqRel) {
@@ -1641,6 +1647,7 @@ fn spawn_pumps(
             }
             device.maintain();
             let link = device.link_sample();
+            let last = *device.published_link.lock();
             if link != last {
                 if let Ok(_control) = device.control() {
                     if let Ok(_op) = device.operation() {
@@ -1652,7 +1659,7 @@ fn spawn_pumps(
                     }
                 }
                 crate::publish::publish_link(device.name(), link);
-                last = link;
+                *device.published_link.lock() = link;
             }
             let timeout = narf_time::ns_to_cycles(5_000_000_000);
             if link.carrier
