@@ -142,6 +142,7 @@ mod power_native;
 mod power_regs;
 mod power_tables;
 mod prepared;
+mod prepared_8922a;
 mod qos;
 mod ra_mask;
 mod ra_v1;
@@ -266,6 +267,9 @@ mod chip_8922a_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod efuse_be_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod prepared_8922a_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod eht_tests;

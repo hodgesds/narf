@@ -127,6 +127,59 @@ pub const B_AX_CHIP_VER_MASK: u32 = 0x0000_F000;
 /// Shift to align `B_AX_CHIP_VER_MASK` to a u8.
 pub const B_AX_CHIP_VER_SHIFT: u32 = 12;
 
+// ── BE (RTL8922A) system-block constants ──────────────────────────────
+//
+// The BE SYS block reuses the AX low addresses (`reg.h:3813..4210`):
+// SYS_PW_CTRL 0x0004, RSV_CTRL 0x001C, PLATFORM_ENABLE 0x0088, and
+// the power bits coincide (RDY_SYSPWR 17, EN_WLON 16, APFN_ONMAC 8,
+// R_DIS_PRST 6, PLATFORM_EN 0, APB_WRAP_EN 2). Two AX bits do NOT
+// carry over: BIT(3) is undefined on BE (no `B_BE_AXIDMA_EN` — the
+// AX `B_AX_AXIDMA_EN` write must never be reused here), and the AX
+// presence register `R_AX_SYS_FUNC_EN` (0x0002) has no BE counterpart
+// (0x0002 reads the upper half of `R_BE_SYS_ISO_CTRL`), so BE
+// presence is checked against the all-FF sentinel on SYS_PW_CTRL.
+
+/// `R_BE_SYS_PW_CTRL` — system power control. `reg.h:3830`.
+pub const R_BE_SYS_PW_CTRL: u64 = 0x0004;
+/// `B_BE_PSUS_OFF_CAPC_EN` — bit 14. `reg.h:3848`.
+pub const B_BE_PSUS_OFF_CAPC_EN: u32 = 1 << 14;
+/// `B_BE_AFSM_PCIE_SUS_EN` — bit 12. `reg.h:3850`.
+pub const B_BE_AFSM_PCIE_SUS_EN: u32 = 1 << 12;
+/// `B_BE_AFSM_WLSUS_EN` — bit 11. `reg.h:3851`.
+pub const B_BE_AFSM_WLSUS_EN: u32 = 1 << 11;
+/// `B_BE_APFM_SWLPS` — bit 10. `reg.h:3852`.
+pub const B_BE_APFM_SWLPS: u32 = 1 << 10;
+/// `B_BE_APFN_ONMAC` — bit 8. `reg.h:3854`.
+pub const B_BE_APFN_ONMAC: u32 = 1 << 8;
+/// `B_BE_DIS_WLBT_PDNSUSEN_SOPC` — bit 18. `reg.h:3844`.
+pub const B_BE_DIS_WLBT_PDNSUSEN_SOPC: u32 = 1 << 18;
+/// `B_BE_RDY_SYSPWR` — bit 17. `reg.h:3845`.
+pub const B_BE_RDY_SYSPWR: u32 = 1 << 17;
+/// `B_BE_EN_WLON` — bit 16. `reg.h:3846`.
+pub const B_BE_EN_WLON: u32 = 1 << 16;
+/// `B_BE_APDM_HPDN` — bit 15. `reg.h:3847`.
+pub const B_BE_APDM_HPDN: u32 = 1 << 15;
+/// `R_BE_RSV_CTRL` — reserved-control gate. `reg.h:3917`.
+pub const R_BE_RSV_CTRL: u64 = 0x001C;
+/// `B_BE_R_DIS_PRST` — bit 6. `reg.h:3924`.
+pub const B_BE_R_DIS_PRST: u8 = 1 << 6;
+/// `R_BE_WLLPS_CTRL` — WL LPS control. `reg.h:4172`.
+pub const R_BE_WLLPS_CTRL: u64 = 0x0090;
+/// `B_BE_DIS_WLBT_LPSEN_LOPC` — bit 1. `reg.h:4191`.
+pub const B_BE_DIS_WLBT_LPSEN_LOPC: u32 = 1 << 1;
+/// `R_BE_WLRESUME_CTRL` — WL resume control. `reg.h:4194`.
+pub const R_BE_WLRESUME_CTRL: u64 = 0x0094;
+/// `B_BE_LPSROP_CMAC0` — bit 12. `reg.h:4209`.
+pub const B_BE_LPSROP_CMAC0: u32 = 1 << 12;
+/// `B_BE_LPSROP_CMAC1` — bit 13. `reg.h:4208`.
+pub const B_BE_LPSROP_CMAC1: u32 = 1 << 13;
+/// `R_BE_PLATFORM_ENABLE` — top-level enable. `reg.h:4159`.
+pub const R_BE_PLATFORM_ENABLE: u64 = 0x0088;
+/// `B_BE_APB_WRAP_EN` — bit 2. `reg.h:4168`.
+pub const B_BE_APB_WRAP_EN: u8 = 1 << 2;
+/// `B_BE_PLATFORM_EN` — bit 0. `reg.h:4170`.
+pub const B_BE_PLATFORM_EN: u8 = 1 << 0;
+
 // ── Chip-version enumeration ───────────────────────────────────────
 //
 // Linux `core.h` (~L163) groups the parts into `enum rtw89_core_chip_id`.
@@ -203,6 +256,10 @@ pub enum MacError {
 
 /// Sentinel returned by an absent / unrouted PCIe BAR.
 const READ_GONE_U16: u16 = 0xFFFF;
+
+/// Sentinel returned by an absent / unrouted PCIe BAR on a 32-bit
+/// read (the BE presence check's equivalent of [`READ_GONE_U16`]).
+const READ_GONE_U32: u32 = 0xFFFF_FFFF;
 
 /// Detect the chip-version field from `R_AX_SYS_CFG1`. Linux uses
 /// this for per-cut quirks (e.g. `_rtw8852b_pwr_seq_a` only runs on
@@ -312,6 +369,134 @@ pub unsafe fn baseline_power_on(mmio: &MmioRegion) -> Result<(), MacError> {
         mmio.write8(
             R_AX_PLATFORM_ENABLE,
             v | B_AX_PLATFORM_EN | B_AX_APB_WRAP_EN | B_AX_AXIDMA_EN,
+        );
+    }
+
+    Ok(())
+}
+
+/// BE baseline power-on prologue for RTL8922A. Transcribes the head
+/// of Linux `rtw8922a_pwr_on_func` (`rtw8922a.c:475..~545`,
+/// torvalds/linux @ 05441d6) — the SYS-block portion, in the same
+/// order Linux runs it — as the BE analog of [`baseline_power_on`]:
+///
+/// 1. Presence check against the all-FF sentinel on
+///    `R_BE_SYS_PW_CTRL` (no `R_BE_SYS_FUNC_EN` exists; 0x0002 reads
+///    the upper half of `R_BE_SYS_ISO_CTRL`).
+/// 2. Unlock `R_BE_RSV_CTRL` (`B_BE_R_DIS_PRST` clear).
+/// 3. Exit suspend: clear the AFSM suspend enables +
+///    `B_BE_PSUS_OFF_CAPC_EN` + `B_BE_APDM_HPDN` +
+///    `B_BE_APFM_SWLPS`, set `B_BE_DIS_WLBT_PDNSUSEN_SOPC` and the
+///    WLLPS `B_BE_DIS_WLBT_LPSEN_LOPC` bit.
+/// 4. Poll `B_BE_RDY_SYSPWR` (Linux: 1 ms interval, 3 s timeout).
+/// 5. Set `B_BE_EN_WLON`, set the WLRESUME `B_BE_LPSROP_CMAC0/1`
+///    bits, set `B_BE_APFN_ONMAC`.
+/// 6. Poll `B_BE_APFN_ONMAC` clear (Linux: 1 ms interval, 3 s
+///    timeout).
+/// 7. Set `B_BE_PLATFORM_EN | B_BE_APB_WRAP_EN`. Bit 3 is NOT set:
+///    it is undefined on BE (no `B_BE_AXIDMA_EN`).
+///
+/// NOT transcribed here (remainder, with the full per-chip table):
+/// the AFE/ANAPAR/FEN_RST_ENABLE writes, the `R_BE_HCI_OPT_CTRL`
+/// HAXIDMA/WLAN IO enables and their polls, the
+/// `B_BE_PCIE_FORCE_IBX_EN` clear, the XTAL SI writes, and the
+/// ADIE pad-power writes — the tail of `rtw8922a_pwr_on_func`.
+/// The MAC-reset state machine (`rtw89_mac_reset_pwr_state_be`,
+/// `mac_be.c:474`) is likewise the future mac_pre_init owner's.
+///
+/// # Safety
+/// Caller owns the BAR2 MMIO exclusively for the duration of the
+/// call.
+pub unsafe fn baseline_power_on_be(mmio: &MmioRegion) -> Result<(), MacError> {
+    // SAFETY: identity-mapped MMIO.
+    let presence = unsafe { mmio.read32(R_BE_SYS_PW_CTRL) };
+    if presence == READ_GONE_U32 {
+        return Err(MacError::DeviceGone);
+    }
+
+    // Step 2: unlock RSV_CTRL so PMU writes land.
+    // SAFETY: same.
+    unsafe {
+        let v = mmio.read8(R_BE_RSV_CTRL);
+        mmio.write8(R_BE_RSV_CTRL, v & !B_BE_R_DIS_PRST);
+    }
+
+    // Step 3: exit suspend. Linux clears the AFSM suspend enables,
+    // the power-down suspend enables and the SWLPS bit, and sets the
+    // WLBT power-down-suspend-disable bits, before waiting on RDY.
+    // SAFETY: same.
+    unsafe {
+        let v = mmio.read32(R_BE_SYS_PW_CTRL);
+        mmio.write32(
+            R_BE_SYS_PW_CTRL,
+            (v & !(B_BE_AFSM_WLSUS_EN
+                | B_BE_AFSM_PCIE_SUS_EN
+                | B_BE_PSUS_OFF_CAPC_EN
+                | B_BE_APDM_HPDN
+                | B_BE_APFM_SWLPS))
+                | B_BE_DIS_WLBT_PDNSUSEN_SOPC,
+        );
+        let v = mmio.read32(R_BE_WLLPS_CTRL);
+        mmio.write32(R_BE_WLLPS_CTRL, v | B_BE_DIS_WLBT_LPSEN_LOPC);
+    }
+
+    // Step 4: wait for B_BE_RDY_SYSPWR. Linux polls at 1 ms for up
+    // to 3 s; the spin returns as soon as the bit asserts.
+    let mut last: u32 = 0;
+    let done = narf_scheduler::responsive_spin_until(
+        || {
+            // SAFETY: identity-mapped MMIO.
+            last = unsafe { mmio.read32(R_BE_SYS_PW_CTRL) };
+            last & B_BE_RDY_SYSPWR != 0
+        },
+        Deadline::after_ms(3000),
+    );
+    if !done {
+        return Err(MacError::Timeout);
+    }
+
+    // Step 5: WLON, resume-ROP bits, then APFN_ONMAC.
+    // SAFETY: same.
+    unsafe {
+        let v = mmio.read32(R_BE_SYS_PW_CTRL);
+        mmio.write32(R_BE_SYS_PW_CTRL, v | B_BE_EN_WLON);
+        let v = mmio.read32(R_BE_WLRESUME_CTRL);
+        mmio.write32(
+            R_BE_WLRESUME_CTRL,
+            v | B_BE_LPSROP_CMAC0 | B_BE_LPSROP_CMAC1,
+        );
+        let v = mmio.read32(R_BE_SYS_PW_CTRL);
+        mmio.write32(R_BE_SYS_PW_CTRL, v | B_BE_APFN_ONMAC);
+    }
+
+    // Step 6: wait for the PMU to clear APFN_ONMAC (power-on done).
+    // SAFETY: identity-mapped MMIO.
+    let done = narf_scheduler::responsive_spin_until(
+        || {
+            // SAFETY: identity-mapped MMIO.
+            last = unsafe { mmio.read32(R_BE_SYS_PW_CTRL) };
+            last & B_BE_APFN_ONMAC == 0
+        },
+        Deadline::after_ms(3000),
+    );
+    if !done {
+        // Don't leave APFN_ONMAC/EN_WLON asserted on the failure
+        // path; the AX baseline clears APFN_ONMAC the same way.
+        // SAFETY: same.
+        unsafe {
+            let v = mmio.read32(R_BE_SYS_PW_CTRL);
+            mmio.write32(R_BE_SYS_PW_CTRL, v & !(B_BE_APFN_ONMAC | B_BE_EN_WLON));
+        }
+        return Err(MacError::Timeout);
+    }
+
+    // Step 7: enable the platform (no AXIDMA_EN bit on BE).
+    // SAFETY: same.
+    unsafe {
+        let v = mmio.read8(R_BE_PLATFORM_ENABLE);
+        mmio.write8(
+            R_BE_PLATFORM_ENABLE,
+            v | B_BE_PLATFORM_EN | B_BE_APB_WRAP_EN,
         );
     }
 

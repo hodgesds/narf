@@ -91,6 +91,13 @@ impl PreparedFirmware {
 }
 
 pub const fn filenames(chip: ChipId) -> &'static [&'static str] {
+    // Firmware names follow Linux `rtw89_fw_get_filename`
+    // (`fw.h:4736`: format <= 0 is `%s.bin`, otherwise
+    // `%s-%d.bin`) with `rtw89_fw_request` (`fw.c:1102`) trying
+    // `fw_format` from `fw_format_max` down to 0. For 8922A the
+    // basename is `rtw89/rtw8922a_fw` and the format max is 4
+    // (`rtw8922a.c:18..19`); the other arms follow the same rule
+    // for their chips' basenames and maxima.
     match chip {
         ChipId::Rtl8852A => &["rtw89/rtw8852a_fw-1.bin", "rtw89/rtw8852a_fw.bin"],
         ChipId::Rtl8852B => &[
@@ -104,7 +111,13 @@ pub const fn filenames(chip: ChipId) -> &'static [&'static str] {
             "rtw89/rtw8852c_fw.bin",
         ],
         ChipId::Rtl8851B => &["rtw89/rtw8851b_fw-1.bin", "rtw89/rtw8851b_fw.bin"],
-        ChipId::Rtl8922A => &[],
+        ChipId::Rtl8922A => &[
+            "rtw89/rtw8922a_fw-4.bin",
+            "rtw89/rtw8922a_fw-3.bin",
+            "rtw89/rtw8922a_fw-2.bin",
+            "rtw89/rtw8922a_fw-1.bin",
+            "rtw89/rtw8922a_fw.bin",
+        ],
     }
 }
 

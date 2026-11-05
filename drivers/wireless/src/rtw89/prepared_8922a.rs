@@ -1,0 +1,488 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+//! Prepared 8922A owner — chip-row step 5 (Prepared wiring).
+//!
+//! The production composition point for the RTL8922A pieces built in
+//! steps 1–4: the chip container (`chip_8922a`), the BE factory
+//! identity (`efuse_be::BeFactory`), the station owner
+//! (`station_8922a`), the BE DMA control sequence + ring programming
+//! (`dma_be`, `dma_8922a`), the BE data + H2C transport (`tx_8922a`),
+//! the G7 CCTL / RA-v1 builders (`cctl_g7`, `ra_mask`), and the EHT
+//! cap maps (`eht`). `pci::bring_up` constructs this owner for a
+//! probed 8922A device and retains it on `Rtw89Device`; nothing here
+//! runs before probe admission.
+//!
+//! Linux order composed here (`pci_be.c:493`, `pci.c:1884` —
+//! `rtw89_pci_ops_mac_pre_init_be` / `rtw89_pci_ops_reset`,
+//! torvalds/linux @ 05441d6):
+//!
+//! 1. `pre_init_dma_before_reset` — wpdma off, trxdma off,
+//!    `clr_idx_all`, idle polls, `mode_op` (8922AE tuning).
+//! 2. The caller's MAC reset (NOT owned here: debounce, LDO-low-
+//!    power, PCIe-setting, SER-setting, and the full
+//!    `rtw8922a_pwr_on_func` tail live with the future mac_pre_init
+//!    owner).
+//! 3. `pre_init_dma_after_reset` — `rst_bdram_set`, bound poll,
+//!    `txdma_ch(false)`, `txdma_fw_ch(true)`, trxdma on.
+//! 4. `program_rings` — `rtw89_pci_reset_trx_rings`: NUM/DESA per
+//!    ring, RX doorbell seed `len - 1`, `init_wp_16sel`.
+//! 5. `post_init_dma` — the `dma_be::post_init_dma` tail
+//!    (trxdma RX on, wpdma on, `txdma_ch(true)`,
+//!    `txdma_fw_ch(true)`, `configure_mit`).
+//! 6. `admit_station` — MACID, G7 default + assoc CCTL, BA-CAM map,
+//!    EHT facet from the chip default (`EhtStation::new_8922ae`).
+//! 7. `prepare_data` / `kick_data` (CH0..11) and `prepare_h2c` /
+//!    `kick_h2c` (CH12), then `observe_data_rp` /
+//!    `observe_data_report` for completions.
+//!
+//! What this owner deliberately does NOT own (later steps):
+//! - Interrupt config/mask (`irq_be`) and the C2H completion path.
+//!   H2C buffers are retained in `h2c_retained` until that path
+//!   lands and releases them; the retention point is named here so
+//!   the C2H lane has somewhere to free from.
+//! - FWCMD header framing for H2C bodies (type/category/class/func/
+//!   sequence): the station owner builds CCTL/BA-CAM/RA bodies and
+//!   this owner moves caller-framed buffers across CH12.
+//! - The TXWD_INFO v2 fill: `prepare_data` clears BODY0 bit 22
+//!   (WDINFO_EN) via `tx_8922a::build_header`, as in pass 1.
+//! - 6 GHz admission, MLO multi-link, legacy-mode admission.
+//! - Firmware download (`prepared::load` selects the image; the
+//!   download plan + secure loader are a separate lane).
+//!
+//! DMA retention contract: a submitted data frame's header + frame
+//! `DmaBuffer`s are retained here (keyed by their DMA addresses)
+//! until the matching RPQ release retires them — the TXBD-consumption
+//! half (`observe_data_rp`) alone never frees. A `kick` failure
+//! after a successful `prepare` leaks that slot's reservation and
+//! its retained buffers (the slot is reserved but unpublished, so no
+//! RPQ will ever arrive for it); the owner stays usable for the
+//! remaining slots.
+
+use alloc::vec::Vec;
+use narf_bus::MmioRegion;
+use narf_io::DmaBuffer;
+
+use super::bacam_v1;
+use super::dma::{TxBd, TXCH_NUM};
+use super::dma_8922a;
+use super::dma_be::{self, Regs};
+use super::efuse_be::BeFactory;
+use super::eht::{EhtOperation, EhtStation, EHT_8922A};
+use super::ra_mask::{self, StationCaps};
+use super::station_8922a::{self, Request, Station};
+use super::tx_8922a::{self, H2cPrepared, PrepareArgs, Prepared, Retained};
+use super::tx_transport::Completion;
+
+/// Maximum BE data-header bytes: 32-byte TXWD_BODY_V2 + 8-byte WP
+/// info + at most 10 v1 address-info entries × 6 bytes. A submitter
+/// allocates this much header DMA before `prepare_data`, then copies
+/// only the built length (`Prepared::header.len()`).
+pub(super) const MAX_HEADER_BYTES: usize = 100;
+
+/// Prepared-owner failures. Every variant is a refusal; a refused
+/// call leaves no partially-programmed artifact behind except the
+/// documented kick-after-prepare slot leak (see module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Error {
+    /// BE DMA ring programming / sequencing failure.
+    Dma(dma_8922a::Error),
+    /// BE data / H2C transport failure.
+    Transport(tx_8922a::Error),
+    /// Station admission / BA-CAM failure.
+    Station(station_8922a::Error),
+    /// RA mask computation / encoding failure.
+    Ra(ra_mask::Error),
+    /// The fail-closed EHT facet (`EhtStation::new_8922ae`) could
+    /// not be built, so no station can be admitted.
+    EhtUnavailable,
+    /// Rings not programmed yet (`program_rings` not called, or
+    /// `stop_dma` ran since).
+    NotProgrammed,
+    /// No admitted station owns this MACID.
+    NoStation,
+    /// Out of DMA-coherent memory (ring allocation, header/frame
+    /// allocation, or transport-owner construction).
+    NoMemory,
+    /// This device has no 8922A Prepared owner (not an 8922A probe).
+    NoOwner,
+    /// Capability invoke failed (authority lapsed).
+    Authority,
+}
+
+impl From<dma_8922a::Error> for Error {
+    fn from(error: dma_8922a::Error) -> Self {
+        Error::Dma(error)
+    }
+}
+
+impl From<tx_8922a::Error> for Error {
+    fn from(error: tx_8922a::Error) -> Self {
+        Error::Transport(error)
+    }
+}
+
+impl From<station_8922a::Error> for Error {
+    fn from(error: station_8922a::Error) -> Self {
+        Error::Station(error)
+    }
+}
+
+impl From<ra_mask::Error> for Error {
+    fn from(error: ra_mask::Error) -> Self {
+        Error::Ra(error)
+    }
+}
+
+/// BAR2-backed [`Regs`] for the production path: the `pci::bring_up`
+/// owner passes its mapped BAR2 here. The caller owns the BAR2
+/// window exclusively; every address is a BAR2 offset.
+pub(super) struct MmioRegs<'a>(pub(super) &'a MmioRegion);
+
+impl Regs for MmioRegs<'_> {
+    fn read32(&mut self, address: u32) -> u32 {
+        // SAFETY: caller's owned-BAR2 contract; `address` is a
+        // BAR2 offset inside the mapped window.
+        unsafe { self.0.read32(address as u64) }
+    }
+
+    fn write32(&mut self, address: u32, value: u32) {
+        // SAFETY: same.
+        unsafe { self.0.write32(address as u64, value) }
+    }
+
+    fn write16(&mut self, address: u32, value: u16) {
+        // SAFETY: same.
+        unsafe { self.0.write16(address as u64, value) }
+    }
+}
+
+/// The prepared 8922A device: factory identity, admitted stations,
+/// BE data + H2C transport owners, and ring state. Constructed by
+/// `pci::bring_up` for a probed 8922A device and retained on
+/// `Rtw89Device`; the transport sequence runs when the mac_pre_init
+/// owner drives it (see module docs).
+pub(super) struct Prepared8922a {
+    factory: BeFactory,
+    chip_version: u8,
+    pool: station_8922a::MacIdPool,
+    stations: Vec<Station>,
+    data: tx_8922a::DataTx,
+    h2c: tx_8922a::H2cTx,
+    rings_programmed: bool,
+    /// Submitted data frames' DMA buffers, keyed by
+    /// (header DMA, frame DMA); freed on RPQ release.
+    data_retained: Vec<(u64, u64, DmaBuffer, DmaBuffer)>,
+    /// Submitted H2C buffers; freed by the future C2H path.
+    h2c_retained: Vec<DmaBuffer>,
+}
+
+impl Prepared8922a {
+    /// Empty owner for one probed 8922A device: twelve 256-deep data
+    /// queues (ACH0..7, CH8..11) and one 256-deep CH12 H2C ring
+    /// (Linux allocates `RTW89_PCI_TXBD_NUM_MAX` = 256 for every TX
+    /// channel, `dma_8922a::TXBD_NUM_MAX`). No station admitted, no
+    /// rings programmed.
+    pub(super) fn new(factory: BeFactory, chip_version: u8) -> Result<Self, Error> {
+        Ok(Self {
+            factory,
+            chip_version,
+            pool: station_8922a::MacIdPool::new(),
+            stations: Vec::new(),
+            data: tx_8922a::DataTx::new()?,
+            h2c: tx_8922a::H2cTx::new(tx_8922a::DATA_RING_DEPTH)?,
+            rings_programmed: false,
+            data_retained: Vec::new(),
+            h2c_retained: Vec::new(),
+        })
+    }
+
+    /// Factory identity read at probe (MAC, RFE, crystal, country,
+    /// PHY-cap window, cut, thermal K).
+    pub(super) fn factory(&self) -> &BeFactory {
+        &self.factory
+    }
+
+    /// Own MAC, from the BE factory identity.
+    pub(super) fn mac(&self) -> [u8; 6] {
+        self.factory.mac
+    }
+
+    /// Chip-version field from `R_AX_SYS_CFG1` (Linux `cv`, read
+    /// for every generation — `core.c:7134`).
+    pub(super) fn chip_version(&self) -> u8 {
+        self.chip_version
+    }
+
+    /// EHT operation profile for this chip (`eht::EHT_8922A`):
+    /// 320 MHz widths programmable, max MPDU 7991, MCS/NSS maps
+    /// from `eht_cap` — not from the 160 MHz chip bandwidth mask.
+    pub(super) fn eht_profile(&self) -> EhtOperation {
+        EHT_8922A
+    }
+
+    /// True once `program_rings` has run and `stop_dma` has not.
+    pub(super) fn rings_programmed(&self) -> bool {
+        self.rings_programmed
+    }
+
+    /// Pre-init DMA, first half (`pci_be.c:493`, before the caller's
+    /// MAC reset). See [`dma_8922a::pre_init_dma_before_reset`].
+    pub(super) fn pre_init_dma_before_reset(
+        &self,
+        regs: &mut impl Regs,
+        rxq_len: u16,
+        rpq_len: u16,
+    ) -> Result<(), Error> {
+        dma_8922a::pre_init_dma_before_reset(regs, rxq_len, rpq_len).map_err(Error::Dma)
+    }
+
+    /// Pre-init DMA, second half (`pci_be.c:493`, after the caller's
+    /// MAC reset). See [`dma_8922a::pre_init_dma_after_reset`].
+    pub(super) fn pre_init_dma_after_reset(&self, regs: &mut impl Regs) -> Result<(), Error> {
+        dma_8922a::pre_init_dma_after_reset(regs).map_err(Error::Dma)
+    }
+
+    /// Post-init DMA tail (`dma_be::post_init_dma`): trxdma RX on,
+    /// wpdma on, `txdma_ch(true)`, `txdma_fw_ch(true)`,
+    /// `configure_mit`.
+    pub(super) fn post_init_dma(&self, regs: &mut impl Regs) {
+        dma_be::post_init_dma(regs);
+    }
+
+    /// Program all 13 TX rings then both RX rings, then the
+    /// WP-select block (`rtw89_pci_reset_trx_rings`, `pci.c:1776`).
+    /// Marks the rings programmed; a later `stop_dma` clears the
+    /// mark. `tx_phys` / `rx_phys` are the probe-allocated ring
+    /// bases; `tx_len` / `rx_len` are the ring depths (Linux maxima
+    /// 256 unless the caller deliberately sizes smaller).
+    pub(super) fn program_rings(
+        &mut self,
+        regs: &mut impl Regs,
+        tx_phys: &[u64; TXCH_NUM],
+        rx_phys: &[u64; 2],
+        tx_len: u16,
+        rx_len: u16,
+    ) -> Result<(), Error> {
+        dma_8922a::reset_trx_rings(regs, tx_phys, rx_phys, tx_len, rx_len)?;
+        self.rings_programmed = true;
+        Ok(())
+    }
+
+    /// LV1-reset stop half (`pci_be.c:669`): `ctrl_dma_all(false)`
+    /// + IO-idle poll. Clears the programmed mark.
+    pub(super) fn stop_dma(&mut self, regs: &mut impl Regs) -> Result<(), Error> {
+        let result = dma_8922a::stop_dma(regs).map_err(Error::Dma);
+        if result.is_ok() {
+            self.rings_programmed = false;
+        }
+        result
+    }
+
+    /// Admit one EHT station with the chip-default facet
+    /// (`EhtStation::new_8922ae`: advertised EHT caps from
+    /// `eht_cap`, TX EHT overrides off). Returns the allocated
+    /// MACID. The station record — its G7 default + assoc CCTL
+    /// tables and BA-CAM map — is retained until
+    /// [`Self::release_station`].
+    pub(super) fn admit_station(&mut self, req: &Request) -> Result<u8, Error> {
+        let facet = EhtStation::new_8922ae().ok_or(Error::EhtUnavailable)?;
+        let station = station_8922a::admit(&self.factory, facet, &mut self.pool, req)?;
+        let macid = station.macid;
+        self.stations.push(station);
+        Ok(macid)
+    }
+
+    /// Admitted station by MACID, if any.
+    pub(super) fn station(&self, macid: u8) -> Option<&Station> {
+        self.stations.iter().find(|station| station.macid == macid)
+    }
+
+    /// Release a station: its MACID returns to the pool and its
+    /// record is dropped. Idempotent: releasing an unknown MACID
+    /// is a no-op.
+    pub(super) fn release_station(&mut self, macid: u8) {
+        if let Some(index) = self
+            .stations
+            .iter()
+            .position(|station| station.macid == macid)
+        {
+            let station = self.stations.remove(index);
+            station.release_macid(&mut self.pool);
+        }
+    }
+
+    /// EHT contribution to the BE TXWD_INFO block for one admitted
+    /// station: (info4 bits, info7 bits). `None` when the MACID is
+    /// not admitted or the facet cannot encode its NLTF value.
+    pub(super) fn txwd_info_eht(&self, macid: u8) -> Option<(u32, u32)> {
+        self.station(macid)?.txwd_info_eht()
+    }
+
+    /// Fill the BE RA v1 command for one admitted station
+    /// (`ra_mask::build`): fresh station update (`upd` flags
+    /// false), single-link pass-1 PHY index 0 (Linux
+    /// `phy.c:498`: `ra->band_num = rtwvif_link->phy_idx`).
+    pub(super) fn station_ra(&self, macid: u8, caps: &StationCaps) -> Result<[u32; 6], Error> {
+        if self.station(macid).is_none() {
+            return Err(Error::NoStation);
+        }
+        ra_mask::build(caps, macid, 0, false, false).map_err(Error::Ra)
+    }
+
+    /// Acquire a BA-CAM bitmap slot for one admitted station's
+    /// BlockAck session (`BaCam::acquire`); the index feeds
+    /// [`Self::ba_h2c`].
+    pub(super) fn acquire_bacam(&mut self, macid: u8, tid: u8) -> Result<usize, Error> {
+        let station = self
+            .stations
+            .iter_mut()
+            .find(|station| station.macid == macid)
+            .ok_or(Error::NoStation)?;
+        station
+            .bacam
+            .acquire(tid)
+            .map_err(|error| Error::Station(station_8922a::Error::BaCam(error)))
+    }
+
+    /// Build a BA-CAM v1 H2C body for one admitted station's
+    /// BlockAck session. `bitmap_idx` must come from
+    /// [`Self::acquire_bacam`].
+    pub(super) fn ba_h2c(
+        &self,
+        macid: u8,
+        tid: u32,
+        bmap_size: u32,
+        ssn: u32,
+        bitmap_idx: u32,
+    ) -> Result<bacam_v1::BaCamH2c, Error> {
+        let station = self.station(macid).ok_or(Error::NoStation)?;
+        station
+            .ba_h2c(tid, bmap_size, ssn, bitmap_idx)
+            .map_err(Error::Station)
+    }
+
+    /// Release a BA-CAM bitmap slot acquired via
+    /// [`Self::acquire_bacam`].
+    pub(super) fn release_bacam(&mut self, macid: u8, idx: usize) -> Result<(), Error> {
+        let station = self
+            .stations
+            .iter_mut()
+            .find(|station| station.macid == macid)
+            .ok_or(Error::NoStation)?;
+        station
+            .bacam
+            .release(idx)
+            .map_err(|error| Error::Station(station_8922a::Error::BaCam(error)))
+    }
+
+    /// Reserve a data slot, build the header, and fill the TXBD —
+    /// without publishing or ringing the doorbell (see
+    /// [`tx_8922a::DataTx::prepare`]). Refused unless the rings
+    /// are programmed and `args.mac_id` is an admitted station.
+    pub(super) fn prepare_data(&mut self, args: PrepareArgs<'_>) -> Result<Prepared, Error> {
+        if !self.rings_programmed {
+            return Err(Error::NotProgrammed);
+        }
+        if self.station(args.mac_id).is_none() {
+            return Err(Error::NoStation);
+        }
+        self.data.prepare(args).map_err(Error::Transport)
+    }
+
+    /// Publish a prepared frame and ring its doorbell. The caller
+    /// must have placed `prepared.header` into header DMA memory
+    /// and synced it first. Returns the new host WP.
+    pub(super) fn kick_data(
+        &mut self,
+        regs: &mut impl Regs,
+        prepared: &Prepared,
+    ) -> Result<u16, Error> {
+        self.data.kick(regs, prepared).map_err(Error::Transport)
+    }
+
+    /// Apply a TX ring read-pointer update: retire every
+    /// DMA-complete frame up to `rp`, returning their retained
+    /// addresses. The caller frees them only after the matching
+    /// RPQ release (see [`Self::observe_data_report`]).
+    pub(super) fn observe_data_rp(
+        &mut self,
+        regs: &mut impl Regs,
+        channel: u8,
+    ) -> Result<Vec<Completion<Retained>>, Error> {
+        self.data
+            .observe_rp(regs, channel)
+            .map_err(Error::Transport)
+    }
+
+    /// Apply one RPQ record (Linux's original 4-byte format):
+    /// retire the matching frame once its TXBD consumption is
+    /// also observed. Returns the completion only when both
+    /// halves have arrived.
+    pub(super) fn observe_data_report(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Option<Completion<Retained>>, Error> {
+        self.data.observe_report(bytes).map_err(Error::Transport)
+    }
+
+    /// Fill the TXBD at the CH12 write pointer for one
+    /// caller-framed H2C buffer — without advancing WP or ringing
+    /// the doorbell. Refused unless the rings are programmed.
+    pub(super) fn prepare_h2c(
+        &mut self,
+        bd: &mut [TxBd],
+        buf_dma: u64,
+        buf_len: usize,
+    ) -> Result<H2cPrepared, Error> {
+        if !self.rings_programmed {
+            return Err(Error::NotProgrammed);
+        }
+        self.h2c
+            .prepare_h2c(bd, buf_dma, buf_len)
+            .map_err(Error::Transport)
+    }
+
+    /// Advance the CH12 WP past a prepared buffer and ring the
+    /// CH12 doorbell. A stale or double kick is refused.
+    pub(super) fn kick_h2c(
+        &mut self,
+        regs: &mut impl Regs,
+        prepared: &H2cPrepared,
+    ) -> Result<u16, Error> {
+        self.h2c.kick_h2c(regs, prepared).map_err(Error::Transport)
+    }
+
+    /// Retain a submitted data frame's DMA buffers until RPQ
+    /// release. Called by the submitter after a successful
+    /// `prepare_data` (before `kick_data`); if `prepare_data`
+    /// itself fails the buffers are dropped by the submitter and
+    /// nothing is published.
+    pub(super) fn retain_data(&mut self, header: DmaBuffer, frame: DmaBuffer) {
+        let header_dma = header.dma_addr().raw();
+        let frame_dma = frame.dma_addr().raw();
+        self.data_retained
+            .push((header_dma, frame_dma, header, frame));
+    }
+
+    /// Release a completed frame's retained DMA buffers (the
+    /// `observe_data_report` completion's addresses). True when
+    /// an entry matched; false means the addresses were never
+    /// retained (or already released) — never an error.
+    pub(super) fn release_data(&mut self, header_dma: u64, frame_dma: u64) -> bool {
+        if let Some(index) = self
+            .data_retained
+            .iter()
+            .position(|(header, frame, _, _)| *header == header_dma && *frame == frame_dma)
+        {
+            self.data_retained.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Retain a submitted H2C buffer until the C2H completion
+    /// path releases it (later step).
+    pub(super) fn retain_h2c(&mut self, buf: DmaBuffer) {
+        self.h2c_retained.push(buf);
+    }
+}

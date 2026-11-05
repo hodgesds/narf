@@ -672,3 +672,38 @@ impl BeFactory {
         })
     }
 }
+
+/// Read the full 8922A factory identity over PCIe BAR2: the BE
+/// analog of `efuse::read_mac` for the probe path. `cut` is the
+/// chip-version field from `R_AX_SYS_CFG1` (Linux reads `cv` from
+/// that register for every generation, `core.c:7134`); CAV is cut 0
+/// (`core.h:201`, `enum rtw89_cv`: `CHIP_CAV` first), which selects
+/// the ISO-sequence skip in the BE power-cut protocol.
+///
+/// # Safety
+/// Caller owns powered BAR2 exclusively, including SYS/PMC/EFUSE
+/// controls.
+pub(super) unsafe fn read_factory(
+    mmio: &narf_bus::MmioRegion,
+    cut: u8,
+) -> Result<BeFactory, BeEfuseError> {
+    // SAFETY: caller's owned-BAR2 contract.
+    let mut io = super::efuse::Mmio(mmio);
+    BeFactory::read(&mut io, cut == 0, Hci::Pcie)
+}
+
+impl BeEfuseError {
+    /// Map onto the AX `EfuseError` the probe path reports
+    /// (`ProbeError::Efuse`): busy/timeout conditions are timeouts,
+    /// malformed-map conditions are malformed maps. `NotPresent`
+    /// never escapes `BeFactory::read` (cut/thermal-K absences
+    /// become `None` there).
+    pub(super) const fn as_efuse_error(self) -> super::efuse::EfuseError {
+        match self {
+            BeEfuseError::Busy | BeEfuseError::PowerStateTimeout => {
+                super::efuse::EfuseError::Timeout
+            }
+            _ => super::efuse::EfuseError::MalformedMap,
+        }
+    }
+}
