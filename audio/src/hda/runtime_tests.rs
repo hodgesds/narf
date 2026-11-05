@@ -43,6 +43,14 @@ struct Model {
     /// Analog variant: pin sense for the mic (7) / line-in (9) pins.
     mic_plugged: bool,
     line_plugged: bool,
+    /// Analog variant: answer as an ALC256 codec (vendor
+    /// 0x10ec0256) with codec subsystem id 0x10280d76 — the
+    /// subsystem Linux itself matches on in
+    /// `alc256_fixup_chromebook` — so the #776 coef-init path has
+    /// a Realtek chip to fix up. The widget model stays the
+    /// ALC287-shaped one; the fixture proves verb traffic +
+    /// CodecInfo, not widget semantics.
+    alc256: bool,
 }
 impl Model {
     fn step(&mut self) {
@@ -117,6 +125,19 @@ impl Model {
                         // line pin from the enumerated graph.
                         (8, 0xf00, 0xe) => reply = 3,
                         (8, 0xf02, _) => reply = 0x090708,
+                        _ => {}
+                    }
+                }
+                if self.alc256 && !self.ati && !self.navi22 {
+                    let nid = (command >> 20) as u8;
+                    let verb = (command >> 8) & 0xfff;
+                    let param = command as u8;
+                    match (nid, verb, param) {
+                        // ALC256 codec id + the Dell codec subsystem
+                        // id Linux matches on in
+                        // alc256_fixup_chromebook.
+                        (0, 0xf00, 0) => reply = 0x10ec0256,
+                        (0, 0xf00, 1) => reply = 0x10280d76,
                         _ => {}
                     }
                 }
@@ -347,12 +368,16 @@ impl Fixture {
         Self::build(true, true, true)
     }
     fn build(noncoherent: bool, ati: bool, second_port: bool) -> Result<Self, &'static str> {
-        Self::build_model(noncoherent, ati, second_port, false, false)
+        Self::build_model(noncoherent, ati, second_port, false, false, false)
     }
     /// The analog codec with a line-in pin beside the mic pin, for
     /// jack-driven capture-source switching tests.
     fn line_in() -> Result<Self, &'static str> {
-        Self::build_model(false, false, false, false, true)
+        Self::build_model(false, false, false, false, true, false)
+    }
+    /// The analog codec as an ALC256 (#776 coef-init fixture).
+    fn alc256() -> Result<Self, &'static str> {
+        Self::build_model(false, false, false, false, false, true)
     }
     /// The RX 6750 XT's HD-Audio function: 1002:ab28 runs without snoop.
     fn navi22() -> Result<Self, &'static str> {
@@ -362,6 +387,7 @@ impl Fixture {
             false,
             true,
             false,
+            false,
         )
     }
     fn build_model(
@@ -370,6 +396,7 @@ impl Fixture {
         second_port: bool,
         navi22: bool,
         line_in: bool,
+        alc256: bool,
     ) -> Result<Self, &'static str> {
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
@@ -410,6 +437,7 @@ impl Fixture {
                 line_in,
                 mic_plugged: false,
                 line_plugged: false,
+                alc256,
             }),
         };
         *MODEL.lock() = &mut *fixture.model as *mut Model as usize;
@@ -1883,3 +1911,169 @@ fn native_hda_jack_driven_capture_switch() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/hda", native_hda_jack_driven_capture_switch);
+
+// ── #776: live-path vendor codec fixups ─────────────────────────────
+// The expected verbs come from Linux `alc256_init`
+// (`alc_write_coef_idx(codec, 0x36, 0x5757)`), not from the
+// implementation: SET_COEF_INDEX (4-bit verb 0x5 + 16-bit payload)
+// then SET_PROC_COEF (0x4) to the Realtek coef node 0x20.
+
+/// The ALC256 coef-init pair the probe path must emit, as encoded
+/// verb words.
+fn coef_init_pair() -> (u32, u32) {
+    (
+        make_verb(
+            0,
+            crate::hda::quirks::COEF_NODE,
+            crate::hda_codec::verb::SET_COEF_INDEX | 0x36,
+        ),
+        make_verb(
+            0,
+            crate::hda::quirks::COEF_NODE,
+            crate::hda_codec::verb::SET_PROC_COEF | 0x5757,
+        ),
+    )
+}
+
+/// #776: an ALC256 codec gets its verified init coef sequence on
+/// the live probe path, before the widget graph is built, and its
+/// subsystem id is recorded on CodecInfo.
+fn native_hda_realtek256_coef_init_applied() -> TestResult {
+    let fixture = match Fixture::alc256() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x10ec0256 {
+        return TestResult::Fail("fixture codec must be ALC256");
+    }
+    if codec.subsystem_id != Some(0x1028_0d76) {
+        return TestResult::Fail("codec subsystem id must be recorded");
+    }
+    let (set_idx, set_coef) = coef_init_pair();
+    let verbs = &fixture.model.verbs;
+    if verbs.iter().filter(|v| **v == set_idx).count() != 1
+        || verbs.iter().filter(|v| **v == set_coef).count() != 1
+    {
+        return TestResult::Fail("ALC256 coef init must run exactly once at probe");
+    }
+    let at_idx = verbs.iter().position(|v| *v == set_idx).unwrap();
+    let at_coef = verbs.iter().position(|v| *v == set_coef).unwrap();
+    if at_idx + 1 != at_coef {
+        return TestResult::Fail("coef index must be immediately followed by its value");
+    }
+    // The fixups run before the graph build: the first
+    // GET_CONFIG_DEFAULT the enumerator sends for a pin must come
+    // after both coef verbs.
+    let first_pincfg = verbs.iter().position(|v| (**v >> 8) & 0xfff == 0xf1c);
+    match first_pincfg {
+        Some(at) if at_coef < at => {}
+        _ => return TestResult::Fail("coef init must precede enumeration"),
+    }
+    if dev.outputs.is_empty() {
+        return TestResult::Fail("fixed-up codec must still route outputs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_realtek256_coef_init_applied);
+
+/// #776: an unknown (zero) subsystem id fails open — the codec
+/// still enumerates and routes generically, and a chip whose
+/// rescued rows stay unwired (ALC287) gets no coef verbs at all.
+fn native_hda_unknown_subsystem_fails_open() -> TestResult {
+    let fixture = match Fixture::new() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x10ec0287 {
+        return TestResult::Fail("fixture codec must be ALC287");
+    }
+    if codec.subsystem_id.is_some() {
+        return TestResult::Fail("zero subsystem id must read as unknown");
+    }
+    // No verb may target the Realtek coef node: ALC287's rescued
+    // rows stay unwired.
+    if fixture
+        .model
+        .verbs
+        .iter()
+        .any(|v| (**v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
+    {
+        return TestResult::Fail("unwired chip must get no coef verbs");
+    }
+    if dev.outputs.is_empty() {
+        return TestResult::Fail("generic routing must survive unknown subsystem");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_unknown_subsystem_fails_open);
+
+/// #776: a non-Realtek codec is untouched — no subsystem-driven
+/// fixups, no coef verbs.
+fn native_hda_non_realtek_gets_no_fixups() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x1002aa01 {
+        return TestResult::Fail("fixture codec must be the ATI HDMI codec");
+    }
+    if codec.subsystem_id.is_some() {
+        return TestResult::Fail("ATI codec must report no subsystem id");
+    }
+    if fixture
+        .model
+        .verbs
+        .iter()
+        .any(|v| (**v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
+    {
+        return TestResult::Fail("non-Realtek codec must get no coef verbs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_non_realtek_gets_no_fixups);
+
+/// #776: a controller reset drops the codec's coef state, so
+/// resume re-applies the probe-time init (Linux re-runs its init
+/// hook on resume for the same reason).
+fn native_hda_pm_reinit_reapplies_coef_init() -> TestResult {
+    let fixture = match Fixture::alc256() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let (set_idx, _) = coef_init_pair();
+    let count = || {
+        fixture
+            .model
+            .verbs
+            .iter()
+            .filter(|v| **v == set_idx)
+            .count()
+    };
+    if count() != 1 {
+        return TestResult::Fail("probe must apply coef init once");
+    }
+    if dev.quiesce().is_err() {
+        return TestResult::Fail("quiesce idle controller");
+    }
+    if dev.reinit().is_err() {
+        return TestResult::Fail("reinit parked controller");
+    }
+    if count() != 2 {
+        return TestResult::Fail("reinit must re-apply coef init");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_pm_reinit_reapplies_coef_init);
