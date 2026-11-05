@@ -336,11 +336,13 @@ fn smoke_xe_exec_queue_extensions_follow_linux_check_order() -> TestResult {
     assert_eq!(bind(8192), (Err(FsError::InvalidData), 0));
     pxp_extension(&user, 8192, 0x10000, 0, 3, 32768 - 4096);
     assert_eq!(bind(8192), (Err(FsError::BadAddress), 0));
-    // LINUX-GAP: with a readable image and a clean chain Linux creates the
-    // queue from that LRC image; NARF has no replayed-context creation and
-    // refuses with -ENOSYS, publishing no queue.
+    // With a readable image and a clean chain Linux creates the queue from
+    // that LRC image.
     pxp_extension(&user, 8192, 0, 0, 3, 32768 - 4096);
-    assert_eq!(bind(8192), (Err(FsError::NotImplemented), 0));
+    let (result, id) = bind(8192);
+    assert_eq!(result, Ok(0));
+    assert_ne!(id, 0);
+    destroy_queue(id);
 
     // xe_exec_queue_create_ioctl runs the chain inside xe_exec_queue_create,
     // after calc_validate_logical_mask and the VM lookup. An RCS0/RCS0 row

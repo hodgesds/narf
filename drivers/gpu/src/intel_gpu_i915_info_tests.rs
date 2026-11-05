@@ -440,6 +440,8 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
         assert_eq!(credentials.asked(), 1 << ADMIN);
         credentials.grant(&[ADMIN]);
         assert_eq!(set(id, 0, 5, 0), Ok(()));
+        // RECOVERABLE defaults to 1 (Linux UAPI).
+        assert_eq!(get(id, 8), Ok(1), "RECOVERABLE defaults to 1");
         // RECOVERABLE: size, then 0 clears and anything else sets it.
         assert_eq!(set(id, 4, 8, 1), Err(FsError::InvalidData));
         assert_eq!(set(id, 0, 8, 7), Ok(()));

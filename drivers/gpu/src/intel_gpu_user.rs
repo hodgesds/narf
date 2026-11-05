@@ -534,6 +534,33 @@ impl UserContext {
     pub(crate) fn last(&self) -> Option<Arc<CompletionFence>> {
         self.state.lock().last.clone()
     }
+    /// DRM_XE_EXEC_QUEUE_SET_PROPERTY_HANG_REPLAY_STATE: seed the context's saved
+    /// image from the supplied user LRC buffer rather than golden state, matching
+    /// Linux xe_lrc_create().
+    pub(crate) fn init_hang_replay(&self, bytes: &[u8]) -> Result<(), FsError> {
+        let words = bytes.len() / 4;
+        let mut state = self.state.lock();
+        if !state.image.is_empty() {
+            return Err(FsError::InvalidData);
+        }
+        let byte_len = words * 4;
+        STATE_BYTES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_add(byte_len).filter(|n| *n <= MAX_STATE_BYTES)
+            })
+            .map_err(|_| FsError::OutOfMemory)?;
+        let mut image = Vec::new();
+        if image.try_reserve_exact(words).is_err() {
+            STATE_BYTES.fetch_sub(byte_len, Ordering::AcqRel);
+            return Err(FsError::OutOfMemory);
+        }
+        for chunk in bytes.chunks_exact(4) {
+            image.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        state.image = image;
+        state.valid = true;
+        Ok(())
+    }
     /// GuC priority 1..3 and the EXECUTION_QUANTUM (0x2001) KLV value in
     /// microseconds: init_policies passes q->sched_props.timeslice_us
     /// unchanged, so the whole exec_queue_set_timeslice range reaches GuC.

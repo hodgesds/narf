@@ -266,7 +266,7 @@ impl Context {
             no_error_capture,
             low_latency: false,
             bannable: true,
-            recoverable: false,
+            recoverable: true,
             persistence: true,
             priority,
         }
@@ -948,7 +948,7 @@ impl RenderFile {
             return self.dispatch(info, cmd, arg, user);
         }
         if matches!(cmd, abi::GEM_EXECBUFFER2 | abi::GEM_EXECBUFFER2_WR) {
-            return Some(self.exec_ioctl(info, arg, user).await);
+            return Some(self.exec_ioctl(info, cmd, arg, user).await);
         }
         if cmd == abi::GEM_THROTTLE {
             let fences: Vec<_> = {
@@ -982,30 +982,36 @@ impl RenderFile {
     async fn exec_ioctl(
         &self,
         info: &DeviceInfo,
+        cmd: u32,
         arg: u64,
         user: &dyn IoctlContext,
     ) -> Result<u64, FsError> {
         use crate::intel_gpu_user::{OutputError, UserOutput};
-        // Syncobjs and payloads are found and retained while the fence
-        // arrays are parsed, as i915_gem_do_execbuffer's eb->fences are.
-        let (request, sync) = crate::intel_gpu_exec::ExecRequest::read_submission(
+        let wire = crate::intel_gpu_exec::ExecWire::read(user, arg, true)?;
+        let sync = crate::intel_gpu_exec_sync::SyncRequest::read(
             user,
-            arg,
-            &self.gem,
+            wire.raw_request(),
             &self.syncobjs,
         )?;
+        // Context and engine selection precede object handle resolution, matching Linux:
+        let context = {
+            let mut namespaces = self.namespaces.lock();
+            namespaces.initialize();
+            namespaces.select(wire.context_id(), wire.ring(), info)?
+        };
+        let dr4_fixed_up = wire.dr4_fixed_up();
+        let request = wire.resolve(&self.gem)?;
         request.validate_for_gt(info.platform)?;
         if request.has_async() && !info.object_async_ready() {
             return Err(FsError::NoDevice);
         }
+        if dr4_fixed_up && cmd == abi::GEM_EXECBUFFER2_WR {
+            // Write back fixed-up DR4 (0) on writeable execbuffer2 ioctl.
+            let _ = user.write(arg + 24, &0u32.to_ne_bytes());
+        }
         let output = sync.output;
         let input_word = sync.input_word;
         let sync = sync.resolve();
-        let context = {
-            let mut namespaces = self.namespaces.lock();
-            namespaces.initialize();
-            namespaces.select(request.context_id, request.ring, info)?
-        };
         let backend = info.backend.as_ref().ok_or(FsError::NotImplemented)?;
         // i915_request_add queues this request at the context's current
         // priority behind every earlier job on its timeline, and
@@ -3805,6 +3811,60 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_render",
         smoke_intel_prime_import_identity_offsets_and_mapping_owner
+    );
+
+    fn smoke_i915_exec_context_order_and_dr4_fixup() -> TestResult {
+        check(|| {
+            let file = RenderFile::new();
+            let user = User::new();
+            let handle = file.gem.create(4096, |_, _| Ok(())).map_err(|_| "alloc")?;
+
+            // 1. Verify that context validation precedes object resolution.
+            // Pass an unknown context ID (0x9999) along with a non-existent GEM handle (0xbeef).
+            let mut request = [0; 64];
+            put64(&mut request, 0, 256); // objects ptr
+            put32(&mut request, 8, 1); // count = 1
+            put32(&mut request, 12, 0); // batch start
+            put32(&mut request, 16, 8); // batch len
+            put64(&mut request, 40, abi::EXEC_NO_RELOC);
+            put64(&mut request, 48, 0x9999); // bad context ID
+
+            let mut obj = [0; 56];
+            put32(&mut obj, 0, 0xbeef); // non-existent GEM handle
+            put64(&mut obj, 24, 0x20_0000);
+            put64(&mut obj, 32, abi::OBJECT_PINNED | abi::OBJECT_SUPPORTS_48B);
+
+            user.store(64, &request);
+            user.store(256, &obj);
+
+            // Fails with NotFound from context lookup, proving context lookup precedes object lookup.
+            if invoke(&file, &user, abi::GEM_EXECBUFFER2) != Err(FsError::NotFound) {
+                return Err("context selection must precede object resolution");
+            }
+
+            // 2. DR4 fixup writeback on GEM_EXECBUFFER2_WR:
+            // UXA submitting DR4 = 0xffffffff is fixed up to 0 and written back on _WR.
+            put64(&mut request, 48, 0); // valid default context 0
+            put32(&mut request, 24, u32::MAX); // DR4 = 0xffffffff
+            put32(&mut obj, 0, handle); // valid handle
+            user.store(64, &request);
+            user.store(256, &obj);
+
+            let res = invoke(&file, &user, abi::GEM_EXECBUFFER2_WR);
+            let written_dr4 = u32_at(&user.load(64, 64), 24);
+            if written_dr4 != 0 {
+                return Err("DR4 fixup was not written back");
+            }
+            if res != Err(FsError::NotImplemented) {
+                return Err("unexpected execution result");
+            }
+
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_i915_exec_context_order_and_dr4_fixup
     );
 
     include!("intel_gpu_sync_tests.rs");

@@ -16,6 +16,7 @@ use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
+    vec::Vec,
 };
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_filesystem::{FsError, IoctlContext};
@@ -126,7 +127,7 @@ struct QueueProperties {
     priority: u32,
     timeslice: u32,
     /// DRM_XE_EXEC_QUEUE_SET_HANG_REPLAY_STATE copied an LRC image.
-    replay: bool,
+    replay: Option<Vec<u8>>,
 }
 
 /// xe_lrc.c::xe_gt_lrc_hang_replay_size for a UAPI engine class. A VM_BIND
@@ -155,7 +156,7 @@ fn exec_queue_extensions(
     let mut queue = QueueProperties {
         priority: 2,
         timeslice: 1000,
-        replay: false,
+        replay: None,
     };
     let mut properties = 0u64;
     let mut ext_number = 0;
@@ -213,8 +214,8 @@ fn exec_queue_extensions(
             // exec_queue_set_hang_replay_state: vmemdup_user of the class's
             // replay size, so an unreadable image is -EFAULT here.
             HANG_REPLAY_STATE => {
-                read(user, value, hang_replay_size(class, xe2))?;
-                queue.replay = true;
+                let bytes = read(user, value, hang_replay_size(class, xe2))?;
+                queue.replay = Some(bytes);
             }
             // exec_queue_set_multi_group opens with
             // `if (!xe_exec_queue_supports_multi_queue(q)) return -ENODEV;`
@@ -632,18 +633,14 @@ impl XeFile {
             timeslice,
             replay,
         } = exec_queue_extensions(user, u64_at(&wire, 0), class, info.platform.is_xe2())?;
-        // LINUX-GAP: xe_lrc_create would initialise each LRC from the copied
-        // hang-replay image. NARF contexts start only from their own golden
-        // state, so a chain that copied one is refused here, after every
-        // check Linux makes on that chain.
-        if replay {
-            return Err(FsError::NotImplemented);
-        }
         let context = match lanes {
             Some(lanes) => UserContext::for_parallel(lanes)?,
             None if class == 5 => UserContext::new(),
             None => UserContext::for_placements(placements)?,
         };
+        if let Some(replay) = &replay {
+            context.init_hang_replay(replay)?;
+        }
         context.configure_schedule(priority, timeslice)?;
         if low_latency {
             context.configure_low_latency()?;
