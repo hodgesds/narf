@@ -56,9 +56,11 @@
 //! `narf_scheduler::block_on` from inside the supervisor's executor
 //! poll panics by design. So Stage-0 bring-up runs as an inline
 //! async dance using `xhci.control_out` / `xhci.poll_interrupt_in`
-//! directly, and the trait-based transport is registered afterwards
-//! for any caller that can drive it from a non-executor context
-//! (Stage-1+ ACL pumps). The completed controller is adopted into the shared
+//! directly, and the trait-based transport is registered afterwards.
+//! Its sync methods bridge via `narf_scheduler::block_on_spin`
+//! (not the halting `block_on`), which is safe from inside the
+//! pump task's executor poll — see the `UsbHciTransport` docs.
+//! The completed controller is adopted into the shared
 //! ready registry without rerunning synchronous bring-up.
 
 extern crate alloc;
@@ -66,7 +68,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use narf_bluetooth::controller::ControllerInfo;
 use narf_bluetooth::event::{CommandComplete, CommandStatus, EventCode};
@@ -424,6 +426,21 @@ pub struct BtUsbDevice {
     /// time — what the detach hook hands to
     /// `narf_bluetooth::controller::unregister_controller`.
     pub hci_index: usize,
+    /// Hub context for autosuspend: `Some((parent hub slot id,
+    /// downstream port))` when the device sits behind a hub, `None`
+    /// on a root port (root ports are never gated by the hub
+    /// idle-suspend pass). Recorded at bind from the supervisor's
+    /// attach context (MSC/NCM precedent) and used by the
+    /// activity accounting, the class suspend hook, and the
+    /// wake-watch. Slot id, never a `HUBS` index (see #892).
+    pub hub_port: Option<(u8, u8)>,
+    /// Whether the class suspend hook armed remote wakeup the last
+    /// time it parked this device. Diagnostic only: a parked device
+    /// with `wakeup_armed == false` cannot signal a device-side
+    /// wake and relies on host TX demand to resume. Atomic because
+    /// the hook mutates the record through the shared `Arc`
+    /// (`BTUSB_DEVICES` holds `Arc<BtUsbDevice>`).
+    pub wakeup_armed: AtomicBool,
     pub endpoints: BtEndpoints,
     /// Boxed transport handle. Same Arc is registered with
     /// `narf_bluetooth::transport::register`.
@@ -437,7 +454,9 @@ impl fmt::Debug for BtUsbDevice {
         f.debug_struct("BtUsbDevice")
             .field("controller", &self.controller)
             .field("slot_id", &self.slot_id)
+            .field("hub_port", &self.hub_port)
             .field("hci_index", &self.hci_index)
+            .field("wakeup_armed", &self.wakeup_armed)
             .field("endpoints", &self.endpoints)
             .field("info", &self.info)
             .finish_non_exhaustive()
@@ -538,12 +557,19 @@ pub fn register_initcalls() {
 /// `HciTransport` implementation backed by the xHCI control / bulk /
 /// interrupt-IN transfer paths.
 ///
-/// **Sync-context only**: every method bridges to async xHCI calls
-/// via `narf_scheduler::block_on`, which panics from inside an
-/// executor poll. Stage-0 bring-up uses the async helpers below
-/// directly; this transport exists so Stage-1+ callers running in
-/// a kernel thread (not an executor task) can issue HCI commands
-/// once L2CAP / GATT pumps are wired up.
+/// **Sync methods, `block_on_spin` bridge**: every method bridges
+/// to async xHCI calls via `narf_scheduler::block_on_spin` — NOT
+/// the halting `block_on`, which panics from inside an executor
+/// poll (`CURRENT_TASK != 0`). The callers include the HCI pump
+/// task (`spawn_stackful(async ... pump_once ...)` in
+/// `narf_bluetooth::pump`) and the HCI socket send path, both of
+/// which run inside executor polls, so the spinning bridge is the
+/// only correct one here: it busy-polls the IRQ-driven xHCI
+/// transfer itself instead of halting, and cannot deadlock the
+/// executor. Stage-0 bring-up uses the async helpers below
+/// directly; this transport exists so Stage-1+ callers (the pump
+/// task, socket sends) can issue HCI commands once L2CAP / GATT
+/// pumps are wired up.
 pub struct UsbHciTransport {
     /// Controller index ([`crate::xhci::Xhci::id`]) the slot belongs to.
     controller: u8,
@@ -553,6 +579,17 @@ pub struct UsbHciTransport {
     acl_in_dci: u8,
     acl_out_dci: u8,
     event_max_packet: u16,
+    /// Hub context for autosuspend accounting: `Some((parent hub
+    /// slot id, downstream port))` when behind a hub, `None` on a
+    /// root port. Every completed transfer feeds
+    /// [`crate::attach::mark_port_activity`] through it, so the
+    /// hub idle-suspend pass sees Bluetooth traffic (#820).
+    hub_port: Option<(u8, u8)>,
+    /// HCI ordinal assigned at bind, once
+    /// `register_ready_transport` returns it. `usize::MAX` until
+    /// then; the power-park checks below treat that as "unknown,
+    /// do not refuse".
+    hci_index: AtomicUsize,
     /// Re-arm flag: set the first time `recv_event` is called so the
     /// interrupt-IN endpoint is pre-armed before the first poll.
     armed: AtomicBool,
@@ -576,6 +613,7 @@ impl fmt::Debug for UsbHciTransport {
             .field("acl_in_dci", &self.acl_in_dci)
             .field("acl_out_dci", &self.acl_out_dci)
             .field("event_max_packet", &self.event_max_packet)
+            .field("hub_port", &self.hub_port)
             .field("sco_in_dci", &self.sco_in_dci)
             .field("sco_out_dci", &self.sco_out_dci)
             .field("sco_alt", &self.sco_alt.load(Ordering::Acquire))
@@ -595,6 +633,8 @@ pub fn __test_transport_without_sco(controller: u8, slot_id: u8) -> UsbHciTransp
         acl_in_dci: 5,
         acl_out_dci: 4,
         event_max_packet: 16,
+        hub_port: None,
+        hci_index: AtomicUsize::new(usize::MAX),
         armed: AtomicBool::new(false),
         sco_in_dci: None,
         sco_out_dci: None,
@@ -606,6 +646,85 @@ pub fn __test_transport_without_sco(controller: u8, slot_id: u8) -> UsbHciTransp
 impl UsbHciTransport {
     fn xhci(&self) -> Result<Arc<Xhci>, TransportError> {
         crate::xhci::controller_by_id(self.controller).ok_or(TransportError::Detached)
+    }
+
+    /// Record the HCI ordinal assigned at bind.
+    fn set_hci_index(&self, index: usize) {
+        self.hci_index.store(index, Ordering::Release);
+    }
+
+    /// HCI ordinal, or `usize::MAX` when not yet assigned at bind.
+    fn hci_index(&self) -> usize {
+        self.hci_index.load(Ordering::Acquire)
+    }
+
+    /// Feed one completed transfer into the hub idle-suspend
+    /// accounting (#820): the supervisor's idle timer resets on
+    /// every HCI packet in either direction, so an active
+    /// controller never idles into a port suspend. No-op on a root
+    /// port (no hub to account to) and when the hub is gone (the
+    /// lookup finds nothing).
+    fn mark_activity(&self) {
+        if let Some((hub_slot, port)) = self.hub_port {
+            crate::attach::mark_port_activity(self.controller, hub_slot, port);
+        }
+    }
+
+    /// Refuse a transfer while the controller is parked for a power
+    /// reason (mgmt power-off or system suspend, #820). A parked
+    /// controller must not be driven: the pump is gated and the
+    /// hardware may be powered down.
+    fn refuse_when_power_parked(&self) -> Result<(), TransportError> {
+        let index = self.hci_index();
+        if index != usize::MAX && narf_bluetooth::pm::parked_for_power(index) {
+            return Err(TransportError::Suspended);
+        }
+        Ok(())
+    }
+
+    /// TX-demand resume (#820): if the hub port is gated, resume
+    /// it and clear the autosuspend park before the transfer
+    /// proceeds (Linux `btusb_send_frame`'s
+    /// `usb_autopm_get_interface`). No-op for root-port devices
+    /// (`hub_port` is `None`) and when the port is already awake.
+    ///
+    /// Bridges via [`block_on_spin`], NOT the halting [`block_on`]:
+    /// the sync [`HciTransport`] send methods are called from
+    /// inside executor polls — the HCI pump task
+    /// (`spawn_stackful(async ... pump_once ...)` in
+    /// `narf_bluetooth::pump`) and the HCI socket send path — so
+    /// `CURRENT_TASK != 0` and the halting bridge would panic
+    /// (`narf_scheduler::block_on_inner`). The spinning bridge
+    /// cannot deadlock the executor (it busy-polls the future
+    /// itself instead of halting), and its documented callers may
+    /// legitimately observe `CURRENT_TASK != 0`. The awaited
+    /// [`resume_port`] is IRQ-driven xHCI control transfers, and
+    /// no caller holds a lock the resume needs across this call
+    /// (the pump core is taken out of its registry before
+    /// transport I/O; `hci_sock::send` holds only a cloned
+    /// controller `Vec`; the xHCI handle is a cloned `Arc`), so
+    /// the spin lasts only the resume's control transfers.
+    /// A failed resume is not reported (`resume_port` returns
+    /// `()`); the transfer that follows fails on the still-gated
+    /// port and the caller re-queues it, so nothing is lost.
+    /// [`block_on_spin`]: narf_scheduler::block_on_spin
+    /// [`block_on`]: narf_scheduler::block_on
+    /// [`resume_port`]: crate::attach::resume_port
+    fn ensure_port_awake(&self) {
+        let Some((hub_slot, port)) = self.hub_port else {
+            return;
+        };
+        if !crate::attach::hub_port_is_suspended(self.controller, hub_slot, port) {
+            return;
+        }
+        let Ok(xhci) = self.xhci() else {
+            return;
+        };
+        narf_scheduler::block_on_spin(crate::attach::resume_port(&xhci, hub_slot, port));
+        let index = self.hci_index();
+        if index != usize::MAX {
+            narf_bluetooth::pm::unpark_autosuspend(index);
+        }
     }
 
     fn arm_event_in(&self, xhci: &Xhci) -> Result<(), TransportError> {
@@ -727,9 +846,11 @@ impl UsbHciTransport {
 
 impl HciTransport for UsbHciTransport {
     fn send_command(&self, cmd: &Command) -> Result<(), TransportError> {
+        self.refuse_when_power_parked()?;
+        self.ensure_port_awake();
         let xhci = self.xhci()?;
         let payload = cmd.encode();
-        narf_scheduler::block_on(xhci.control_out(
+        let r = narf_scheduler::block_on_spin(xhci.control_out(
             self.slot_id,
             RT_HCI_COMMAND,
             REQ_HCI_COMMAND,
@@ -737,7 +858,11 @@ impl HciTransport for UsbHciTransport {
             self.interface as u16,
             &payload,
         ))
-        .map_err(|_| TransportError::Transient)?;
+        .map_err(|_| TransportError::Transient);
+        if r.is_ok() {
+            self.mark_activity();
+        }
+        r?;
         Ok(())
     }
 
@@ -747,6 +872,9 @@ impl HciTransport for UsbHciTransport {
         let mut buf = [0u8; 257];
         match xhci.poll_interrupt_in(self.slot_id, self.event_dci, &mut buf) {
             Ok(Some(n)) => {
+                // Bytes arrived: activity even if the decode below
+                // rejects them.
+                self.mark_activity();
                 let event = Event::decode(&buf[..n]).ok_or(TransportError::Transient)?;
                 Ok(Some(event))
             }
@@ -756,22 +884,33 @@ impl HciTransport for UsbHciTransport {
     }
 
     fn send_acl(&self, data: &[u8]) -> Result<(), TransportError> {
+        self.refuse_when_power_parked()?;
+        self.ensure_port_awake();
         let xhci = self.xhci()?;
-        narf_scheduler::block_on(xhci.bulk_out(self.slot_id, self.acl_out_dci, data))
-            .map_err(|_| TransportError::Transient)?;
+        let r = narf_scheduler::block_on_spin(xhci.bulk_out(self.slot_id, self.acl_out_dci, data))
+            .map_err(|_| TransportError::Transient);
+        if r.is_ok() {
+            self.mark_activity();
+        }
+        r?;
         Ok(())
     }
 
     fn recv_acl(&self) -> Result<Option<Vec<u8>>, TransportError> {
         // Stage 2: pull an ACL packet from the bulk-IN endpoint.
-        // Uses block_on(bulk_in) — only call from a non-executor
-        // kernel thread (ACL pump task). Ref: btusb_bulk_in() in
-        // drivers/bluetooth/btusb.c.
+        // Bridges via block_on_spin, not the halting block_on:
+        // this runs in the HCI pump task's executor poll, where
+        // CURRENT_TASK != 0 would make the halting bridge panic.
+        // See the `UsbHciTransport` docs. Ref: btusb_bulk_in()
+        // in drivers/bluetooth/btusb.c.
         let xhci = self.xhci()?;
         let mut buf = [0u8; 1024];
-        match narf_scheduler::block_on(xhci.bulk_in(self.slot_id, self.acl_in_dci, &mut buf)) {
+        match narf_scheduler::block_on_spin(xhci.bulk_in(self.slot_id, self.acl_in_dci, &mut buf)) {
             Ok(0) => Ok(None),
-            Ok(n) => Ok(Some(buf[..n].to_vec())),
+            Ok(n) => {
+                self.mark_activity();
+                Ok(Some(buf[..n].to_vec()))
+            }
             Err(_) => Ok(None),
         }
     }
@@ -785,6 +924,10 @@ impl HciTransport for UsbHciTransport {
         // voice frames onto the ACL pipe, where the controller
         // cannot interpret them. A packet larger than the active
         // alternate's isoch budget is refused, never truncated.
+        // (#820) Refuse while power-parked; a TX-demand resume
+        // wakes the port first, as on Linux.
+        self.refuse_when_power_parked()?;
+        self.ensure_port_awake();
         let (sco_out_dci, budget) = match (self.sco_out_dci, self.sco_budgets()) {
             (Some(dci), Some((_, out))) => (dci, out),
             _ => return Err(TransportError::Unsupported),
@@ -793,8 +936,12 @@ impl HciTransport for UsbHciTransport {
             return Err(TransportError::Unsupported);
         }
         let xhci = self.xhci()?;
-        narf_scheduler::block_on(xhci.isoch_out(self.slot_id, sco_out_dci, data))
-            .map_err(|_| TransportError::Transient)?;
+        let r = narf_scheduler::block_on(xhci.isoch_out(self.slot_id, sco_out_dci, data))
+            .map_err(|_| TransportError::Transient);
+        if r.is_ok() {
+            self.mark_activity();
+        }
+        r?;
         Ok(())
     }
 
@@ -1097,6 +1244,12 @@ pub(crate) fn apply_class_return(info: &mut ControllerInfo, ret: &[u8]) -> Resul
 /// SET_CONFIGURATION, then run the Stage-0 bring-up sequence and log
 /// a single line summarising the controller.
 ///
+/// `hub_port` is the device's hub context — `Some((parent hub slot
+/// id, downstream port))` when it sits behind a hub, `None` on a
+/// root port (MSC/NCM precedent) — recorded on the device record
+/// and the transport so the hub idle-suspend pass sees Bluetooth
+/// traffic and can park the datapath before gating the port (#820).
+///
 /// Returns `Ok(())` on success. On failure the caller frees the slot.
 pub async fn try_bind_btusb_already_addressed(
     xhci_dev: &Xhci,
@@ -1104,6 +1257,7 @@ pub async fn try_bind_btusb_already_addressed(
     vendor_id: u16,
     product_id: u16,
     cfg: &[u8],
+    hub_port: Option<(u8, u8)>,
 ) -> Result<(), BtUsbError> {
     let eps = find_bt_endpoints(cfg)?;
 
@@ -1449,7 +1603,7 @@ pub async fn try_bind_btusb_already_addressed(
     } else {
         (None, None, 0)
     };
-    let transport: Arc<dyn HciTransport> = Arc::new(UsbHciTransport {
+    let usb_transport = Arc::new(UsbHciTransport {
         controller: xhci_dev.id(),
         slot_id,
         interface: eps.interface,
@@ -1457,15 +1611,32 @@ pub async fn try_bind_btusb_already_addressed(
         acl_in_dci,
         acl_out_dci,
         event_max_packet: eps.event_in.max_packet,
+        hub_port,
+        hci_index: AtomicUsize::new(usize::MAX),
         armed: AtomicBool::new(true), // already armed by the bring-up
         sco_in_dci,
         sco_out_dci,
         sco_alts: eps.sco_alts,
         sco_alt: AtomicU8::new(sco_alt_setting),
     });
+    let transport: Arc<dyn HciTransport> = usb_transport.clone();
     narf_bluetooth::transport::register(transport.clone());
     let hci_index = narf_bluetooth::controller::register_ready_transport(transport.clone(), info);
+    // The transport needs its HCI ordinal for the power-park
+    // checks (refuse-while-parked, TX-demand unpark).
+    usb_transport.set_hci_index(hci_index);
     let _ = narf_bluetooth::sysfs_bridge::register_hci_controller(hci_index, info, &[]);
+
+    // Device-PM registration (#820): system suspend parks the HCI
+    // pump (no I/O, just the park flags — the handler runs with
+    // interrupts gated); resume clears the park. The USB port power
+    // state itself is owned by the hub/xHCI suspend path. The name
+    // is per-controller: the registry is idempotent on name, so a
+    // second dongle must not replace the first's entry.
+    narf_power::device_pm::register_device_pm_ops(
+        &alloc::format!("btusb-hci{}", hci_index),
+        Arc::new(BtUsbPm { hci_index }),
+    );
 
     {
         use core::fmt::Write as _;
@@ -1506,12 +1677,179 @@ pub async fn try_bind_btusb_already_addressed(
     BTUSB_DEVICES.lock().push(Arc::new(BtUsbDevice {
         controller: xhci_dev.id(),
         slot_id,
+        hub_port,
         hci_index,
+        wakeup_armed: AtomicBool::new(false),
         endpoints: eps,
         transport,
         info,
     }));
     Ok(())
+}
+
+/// Device-PM ops for one bound USB Bluetooth controller (#820).
+///
+/// Suspend parks the HCI pump (flag stores only — the handler runs
+/// on the boot CPU with interrupts gated, so no I/O, no scheduling);
+/// resume clears the park. The USB port power state itself is owned
+/// by the hub/xHCI suspend path.
+#[derive(Debug)]
+struct BtUsbPm {
+    hci_index: usize,
+}
+
+impl narf_power::device_pm::DevicePmOps for BtUsbPm {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        narf_bluetooth::pm::suspend_controller(self.hci_index);
+        Ok(())
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        narf_bluetooth::pm::resume_controller(self.hci_index);
+        Ok(())
+    }
+}
+
+/// Register the btusb class suspend hook (#820). Called from the
+/// drivers/usb Stage::Subsys initcalls, alongside the NIC drivers'
+/// registrations. The hook itself is per-port: it parks only a live
+/// BT device whose recorded hub context matches the port the
+/// supervisor's idle-suspend pass is about to gate.
+pub fn register() {
+    let _ = crate::class_registry::register_suspend_hook("btusb", |slot, port| {
+        alloc::boxed::Box::pin(suspend_btusb_port(slot, port))
+    });
+}
+
+/// Class suspend hook for one hub port (see
+/// [`crate::class_registry::dispatch_suspend`]). Runs inside the
+/// supervisor's idle-suspend pass, before the pass gates the port —
+/// a driver with a live device on the port parks its datapath and
+/// arms remote wakeup first, because a gated port blocks all
+/// transfers including the arming control transfer (#1256).
+///
+/// Outcomes, mirroring the r8152/NCM hooks:
+/// - No BT device on the port → `SuspendOutcome::NotMine`.
+/// - The controller's idle timeout is 0 ("never autosuspend",
+///   Linux semantics) → `SuspendOutcome::ParkFailed`: the pass
+///   must not gate this cycle, and retries next cycle.
+/// - Already parked → `SuspendOutcome::Parked` without re-arming
+///   (idempotent).
+/// - Remote-wakeup arming (standard `SET_FEATURE
+///   (DEVICE_REMOTE_WAKEUP)`) fails → `SuspendOutcome::ParkFailed`:
+///   fail closed. Without arming, a gated port has no
+///   device-initiated resume path — an inbound connection attempt
+///   while suspended would be missed until host-side TX demand —
+///   so a device that cannot arm simply stays awake.
+/// - Armed → park the HCI pump ([`narf_bluetooth::pm`]) and record
+///   the arming, then `SuspendOutcome::Parked`.
+async fn suspend_btusb_port(hub_slot: u8, port: u8) -> crate::class_registry::SuspendOutcome {
+    use crate::class_registry::SuspendOutcome;
+    // Read what arming needs, then release before any await.
+    let target = {
+        let g = BTUSB_DEVICES.lock();
+        g.iter().find_map(|d| {
+            if d.hub_port == Some((hub_slot, port)) {
+                Some((d.slot_id, d.controller, d.hci_index))
+            } else {
+                None
+            }
+        })
+    };
+    let Some((slot_id, controller, hci_index)) = target else {
+        return SuspendOutcome::NotMine;
+    };
+    if narf_bluetooth::pm::idle_timeout_ms(hci_index) == 0 {
+        return SuspendOutcome::ParkFailed;
+    }
+    if narf_bluetooth::pm::is_runtime_suspended(hci_index) {
+        return SuspendOutcome::Parked;
+    }
+    let Some(c) = crate::xhci::controller_by_id(controller) else {
+        return SuspendOutcome::ParkFailed;
+    };
+    let setup = crate::control::set_feature_device_remote_wakeup();
+    let armed = c
+        .control_out(
+            slot_id,
+            setup.bm_request_type,
+            setup.b_request,
+            setup.w_value,
+            setup.w_index,
+            &[],
+        )
+        .await
+        .is_ok();
+    if !armed {
+        return SuspendOutcome::ParkFailed;
+    }
+    // Park the pump, then record the arming only if the record is
+    // still live (a detach in between wins; the pass's gating of a
+    // device-less port is harmless).
+    narf_bluetooth::pm::park_autosuspend(hci_index);
+    let g = BTUSB_DEVICES.lock();
+    match g.iter().find(|d| {
+        d.hub_port == Some((hub_slot, port)) && d.slot_id == slot_id && d.hci_index == hci_index
+    }) {
+        Some(rec) => {
+            rec.wakeup_armed.store(true, Ordering::Release);
+            SuspendOutcome::Parked
+        }
+        None => SuspendOutcome::NotMine,
+    }
+}
+
+/// Resume one parked btusb port: re-open the hub port, then clear
+/// the autosuspend park. Returns `true` iff the port is awake and
+/// the park cleared. Idempotent in the sense that a non-parked
+/// port returns `false` (nothing was resumed) — callers that need
+/// "awake" semantics re-check the park flag. Never holds the
+/// record lock across the resume await.
+pub async fn resume_btusb_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port: u8) -> bool {
+    let hci_index = {
+        let g = BTUSB_DEVICES.lock();
+        g.iter()
+            .find(|d| {
+                d.hub_port == Some((hub_slot, port))
+                    && narf_bluetooth::pm::is_runtime_suspended(d.hci_index)
+            })
+            .map(|d| d.hci_index)
+    };
+    let Some(hci_index) = hci_index else {
+        return false;
+    };
+    crate::attach::resume_port(xhci_dev, hub_slot, port).await;
+    if crate::attach::hub_port_is_suspended(xhci_dev.id(), hub_slot, port) {
+        return false;
+    }
+    narf_bluetooth::pm::unpark_autosuspend(hci_index);
+    true
+}
+
+/// Hub ports holding a runtime-suspended btusb device. Mirrors
+/// `hid::hub_ports`, filtered to parked devices: the wake-watch
+/// step's candidate list.
+pub fn suspended_hub_ports() -> Vec<(u8, u8)> {
+    let g = BTUSB_DEVICES.lock();
+    g.iter()
+        .filter(|d| narf_bluetooth::pm::is_runtime_suspended(d.hci_index))
+        .filter_map(|d| d.hub_port)
+        .collect()
+}
+
+/// Wake-watch step: for each parked btusb port, read the hub port
+/// status; on an observed remote-wakeup edge (the
+/// `C_PORT_SUSPEND` change bit) resume the port. `port_resume`
+/// acks the change bit, so no double-resume. Ports with no edge
+/// stay suspended — unlike the HID/ACM unconditional wake, an
+/// unconditional BT wake every cycle would defeat autosuspend.
+/// Called from the supervisor's Phase 7, next to
+/// `wake_suspended_nic_ports`.
+pub async fn wake_suspended_ports(xhci_dev: &crate::xhci::Xhci) {
+    for (hub_slot, port) in suspended_hub_ports() {
+        if crate::attach::hub_port_suspend_change(xhci_dev, hub_slot, port).await == Some(true) {
+            let _ = resume_btusb_port(xhci_dev, hub_slot, port).await;
+        }
+    }
 }
 
 /// Translate a small set of common Bluetooth SIG manufacturer IDs
@@ -1568,10 +1906,23 @@ fn bt_version_name(hci_version: u8) -> &'static str {
     }
 }
 
+// ── Fixtures ─────────────────────────────────────────────────────
+//
+// The suspend hook's pre-arm decisions (no live device, idle
+// timeout veto, already-parked re-park) run against a modelled
+// device record with no xHCI controller present, so they execute
+// in the kernel-test binary. The arming control transfer itself
+// and the TX-demand / wake-watch resume paths need a real hub
+// port and are NOT covered here — they execute only on hardware
+// (see the #820 PR body).
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
+    use narf_bluetooth::controller::ControllerInfo;
+    use narf_bluetooth::transport::LoopbackTransport;
     use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_power::device_pm::DevicePmOps;
 
     fn fake_endpoints() -> BtEndpoints {
         use crate::xhci::{EndpointConfig, EndpointKind};
@@ -1647,7 +1998,9 @@ mod tests {
             BTUSB_DEVICES.lock().push(Arc::new(BtUsbDevice {
                 controller,
                 slot_id,
+                hub_port: None,
                 hci_index,
+                wakeup_armed: AtomicBool::new(false),
                 endpoints: fake_endpoints(),
                 transport,
                 info: ControllerInfo::default(),
@@ -1727,4 +2080,149 @@ mod tests {
         "drivers/usb/btusb",
         smoke_btusb_detach_slot_unregisters_controller
     );
+
+    fn fake_device(
+        slot_id: u8,
+        controller: u8,
+        hub_port: Option<(u8, u8)>,
+        hci_index: usize,
+    ) -> Arc<BtUsbDevice> {
+        Arc::new(BtUsbDevice {
+            slot_id,
+            controller,
+            hub_port,
+            hci_index,
+            wakeup_armed: AtomicBool::new(false),
+            endpoints: BtEndpoints {
+                interface: 0,
+                config_value: 1,
+                event_in: EndpointConfig {
+                    ep_addr: 0x81,
+                    max_packet: 64,
+                    kind: EndpointKind::InterruptIn,
+                    interval: 1,
+                },
+                acl_in: EndpointConfig {
+                    ep_addr: 0x82,
+                    max_packet: 64,
+                    kind: EndpointKind::BulkIn,
+                    interval: 0,
+                },
+                acl_out: EndpointConfig {
+                    ep_addr: 0x02,
+                    max_packet: 64,
+                    kind: EndpointKind::BulkOut,
+                    interval: 0,
+                },
+            },
+            transport: Arc::new(LoopbackTransport::new("test-btusb")),
+            info: ControllerInfo::default(),
+        })
+    }
+
+    fn reset_all() {
+        __test_reset();
+        narf_bluetooth::pm::__reset_for_test();
+    }
+
+    fn smoke_btusb_suspend_hook_not_mine() -> TestResult {
+        use crate::class_registry::SuspendOutcome;
+        reset_all();
+        let out = narf_scheduler::block_on(suspend_btusb_port(0xEE, 7));
+        reset_all();
+        if out != SuspendOutcome::NotMine {
+            return TestResult::Fail("hook claimed a port with no BT device");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/btusb", smoke_btusb_suspend_hook_not_mine);
+
+    fn smoke_btusb_suspend_hook_idle_timeout_zero_vetoes() -> TestResult {
+        use crate::class_registry::SuspendOutcome;
+        reset_all();
+        BTUSB_DEVICES
+            .lock()
+            .push(fake_device(3, 0, Some((0xEE, 7)), 0));
+        // Idle timeout 0 = "never autosuspend": the hook vetoes
+        // gating instead of parking.
+        narf_bluetooth::pm::set_idle_timeout_ms(0, 0);
+        let out = narf_scheduler::block_on(suspend_btusb_port(0xEE, 7));
+        let still_unparked = !narf_bluetooth::pm::is_runtime_suspended(0);
+        reset_all();
+        if out != SuspendOutcome::ParkFailed {
+            return TestResult::Fail("idle-timeout-0 device was not vetoed");
+        }
+        if !still_unparked {
+            return TestResult::Fail("vetoed device was parked anyway");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/btusb",
+        smoke_btusb_suspend_hook_idle_timeout_zero_vetoes
+    );
+
+    fn smoke_btusb_suspend_hook_already_parked() -> TestResult {
+        use crate::class_registry::SuspendOutcome;
+        reset_all();
+        BTUSB_DEVICES
+            .lock()
+            .push(fake_device(3, 0, Some((0xEE, 7)), 0));
+        // Default idle timeout (30 s) + already parked: idempotent
+        // re-park with no arming attempt (no xHCI exists here).
+        narf_bluetooth::pm::park_autosuspend(0);
+        let out = narf_scheduler::block_on(suspend_btusb_port(0xEE, 7));
+        let still_parked = narf_bluetooth::pm::is_runtime_suspended(0);
+        reset_all();
+        if out != SuspendOutcome::Parked {
+            return TestResult::Fail("already-parked device did not re-park");
+        }
+        if !still_parked {
+            return TestResult::Fail("re-park cleared the park");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/btusb", smoke_btusb_suspend_hook_already_parked);
+
+    fn smoke_btusb_suspended_hub_ports_lists_parked() -> TestResult {
+        reset_all();
+        BTUSB_DEVICES
+            .lock()
+            .push(fake_device(3, 0, Some((0xEE, 7)), 0));
+        BTUSB_DEVICES
+            .lock()
+            .push(fake_device(4, 0, Some((0xEE, 8)), 1));
+        // Only hci0 is parked; hci1 stays awake.
+        narf_bluetooth::pm::park_autosuspend(0);
+        let ports = suspended_hub_ports();
+        reset_all();
+        if ports != alloc::vec![(0xEE, 7)] {
+            return TestResult::Fail("wake-watch list missed the parked port or kept the live one");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/btusb",
+        smoke_btusb_suspended_hub_ports_lists_parked
+    );
+
+    fn smoke_btusb_pm_ops_park_and_resume() -> TestResult {
+        reset_all();
+        let ops = BtUsbPm { hci_index: 0 };
+        if ops.suspend().is_err() || !narf_bluetooth::pm::is_parked(0) {
+            reset_all();
+            return TestResult::Fail("device-PM suspend did not park the controller");
+        }
+        if !narf_bluetooth::pm::parked_for_power(0) {
+            reset_all();
+            return TestResult::Fail("device-PM suspend parked for the wrong reason");
+        }
+        if ops.resume().is_err() || narf_bluetooth::pm::is_parked(0) {
+            reset_all();
+            return TestResult::Fail("device-PM resume did not unpark the controller");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/btusb", smoke_btusb_pm_ops_park_and_resume);
 }

@@ -115,6 +115,10 @@ pub fn register_initcalls() {
         r8152::register();
         InitResult::Ok
     });
+    narf_init::register(Stage::Subsys, "usb-btusb", || {
+        btusb::register();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "usb-ax88179", || {
         ax88179::register();
         InitResult::Ok
@@ -795,7 +799,12 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
             // and TX demand wakes it through the send path
             // instead. Runs before the pumps so a woken
             // device's pump transfers on its next turn.
+            // Bluetooth gets the same edge-triggered wake-watch
+            // (#820): a parked BT controller resumes only when
+            // it signals remote wakeup, or when host TX demand
+            // resumes its port through the transport.
             wake_suspended_nic_ports(c).await;
+            btusb::wake_suspended_ports(c).await;
             pump_bound_devices(c);
             SUPERVISOR_PHASE.store(8, core::sync::atomic::Ordering::Relaxed);
             // Power management: suspend any downstream port whose

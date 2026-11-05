@@ -4202,7 +4202,19 @@ pub fn pump_once(index: usize) -> PumpStep {
     let mut step = PumpStep::default();
     let mut socket_frames: Vec<Vec<u8>> = Vec::new();
 
+    // Parked (mgmt power-off, system suspend, or USB autosuspend):
+    // do not poll the transport — a gated USB port fails every
+    // poll and the pump would spin on transport errors. The
+    // outbound flush below still runs: an empty queue returns
+    // without touching the transport, and a queued packet wakes
+    // the port through the transport's TX-demand resume instead
+    // of stalling until a remote-wakeup edge (#820).
+    let parked = crate::pm::is_parked(index);
+
     for _ in 0..MAX_PACKETS_PER_STEP {
+        if parked {
+            break;
+        }
         match core.transport.recv_event() {
             Ok(Some(event)) => {
                 step.events += 1;
@@ -4220,6 +4232,9 @@ pub fn pump_once(index: usize) -> PumpStep {
     step.acl_sent += core.flush_acl();
 
     for _ in 0..MAX_PACKETS_PER_STEP {
+        if parked {
+            break;
+        }
         match core.transport.recv_acl() {
             Ok(Some(bytes)) => {
                 step.acl_received += 1;
@@ -4525,6 +4540,63 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_fake_controller_conversation);
+
+    /// #820: a parked controller's pump step does not poll the
+    /// transport — queued events/ACL sit untouched until the park
+    /// clears, then flow on the next step. Covers the mgmt-off
+    /// and autosuspend parks through the same gate.
+    fn smoke_pump_parked_step_skips_transport() -> TestResult {
+        reset_all();
+        crate::pm::__reset_for_test();
+        let fail = |msg: &'static str| -> TestResult {
+            reset_all();
+            crate::pm::__reset_for_test();
+            TestResult::Fail(msg)
+        };
+
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            return fail("bring-up against fake controller failed");
+        }
+
+        // Queue one event + one ACL blob, then park (autosuspend).
+        fake.enqueue_event(le_connection_complete(
+            0x0040,
+            [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5],
+        ));
+        // Minimal ACL blob (handle 0x0040, 4 payload bytes); the
+        // pump counts it on receipt even though no connection
+        // exists to route it to.
+        fake.enqueue_acl(alloc::vec![0x40, 0x00, 0x04, 0x00, 0x01, 0x02, 0x03]);
+        crate::pm::park_autosuspend(0);
+
+        let step = pump_once(0);
+        if !step.is_idle() || step.events != 0 || step.acl_received != 0 {
+            return fail("parked pump step polled the transport");
+        }
+        if connection_count(0) != Some(0) {
+            return fail("parked pump step dispatched the queued event");
+        }
+        // Unpark: the queued event + ACL flow on the next step.
+        crate::pm::unpark_autosuspend(0);
+        let step = pump_once(0);
+        if step.events != 1 || step.acl_received != 1 {
+            return fail("unparked pump step did not drain the queued traffic");
+        }
+        if connection_count(0) != Some(1) {
+            return fail("pump did not track the connection after unpark");
+        }
+        reset_all();
+        crate::pm::__reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_parked_step_skips_transport);
 
     /// #891: the pump mirrors its connection table into sysfs — LE
     /// connect gains the `hci<N>:<handle>` child, disconnect removes

@@ -379,6 +379,8 @@ fn set_powered_inner(index: u16, on: bool) -> Result<u32, u8> {
     if on {
         power_on_apply(index)?;
         let settings = set_setting_bit(index, SETTING_POWERED, true);
+        // #820: power-on clears the mgmt park (power-off parks it below).
+        apply_powered(index, true);
         narf_filesystem::bluetooth::publish_mgmt_event(&new_settings(index, settings));
         Ok(settings)
     } else {
@@ -388,6 +390,9 @@ fn set_powered_inner(index: u16, on: bool) -> Result<u32, u8> {
         // even against a wedged controller.
         let _ = issue(index, op::HCI_WRITE_SCAN_ENABLE, &[0]);
         let mut settings = set_setting_bit(index, SETTING_POWERED, false);
+        // #820: power-off parks the controller (its pump stops
+        // touching the transport).
+        apply_powered(index, false);
         // A timeout-based discoverable expires on power-off (mgmt(7)).
         if DISCOV_TIMEOUT.lock().remove(&index) {
             settings = set_setting_bit(index, SETTING_DISCOVERABLE, false);
@@ -1186,8 +1191,26 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
 
 /// Whether controller `index` is currently powered (mgmt POWERED setting).
 /// Used by the legacy HCIGETDEVINFO ioctl to report the HCI_UP flag.
+///
+/// Truthful, not bitmap-only (#820): the `POWERED` setting bit is the
+/// *requested* state; the controller is actually powered only when it
+/// is not parked for a power reason (mgmt power-off or system
+/// suspend — see `crate::pm`). A runtime (USB autosuspend) park does
+/// not clear this: Linux keeps `HCI_UP` across runtime suspend.
 pub fn is_powered(index: u16) -> bool {
-    current_settings(index) & SETTING_POWERED != 0
+    current_settings(index) & SETTING_POWERED != 0 && !crate::pm::parked_for_power(index as usize)
+}
+
+/// Apply the mgmt power state to the pump park flags: power-off
+/// parks the controller (its pump stops touching the transport),
+/// power-on clears the mgmt park. A system-suspend park is
+/// independent and is not cleared here.
+fn apply_powered(index: u16, on: bool) {
+    if on {
+        crate::pm::unpark_mgmt(index as usize);
+    } else {
+        crate::pm::park_mgmt(index as usize);
+    }
 }
 
 /// Set controller `index`'s powered setting (the legacy HCIDEVUP/HCIDEVDOWN
@@ -1510,6 +1533,84 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/mgmt", smoke_mgmt_set_powered_toggles_settings);
+
+    // #820: `is_powered` is truthful, not bitmap-only. A system
+    // suspend clears the powered report even though the mgmt
+    // POWERED bit stays set; a resume restores it. Mgmt
+    // power-off parks the pump and clears the report; power-on
+    // unparks. A runtime (autosuspend) park leaves HCI_UP alone.
+    fn smoke_mgmt_powered_is_truthful_across_parks() -> TestResult {
+        use crate::transport::LoopbackTransport;
+        use alloc::sync::Arc;
+
+        crate::transport::__test_reset();
+        controller::__test_reset_controllers();
+        SETTINGS.lock().clear();
+        crate::pm::__reset_for_test();
+
+        let transport: Arc<dyn crate::transport::HciTransport> =
+            Arc::new(LoopbackTransport::new("mgmt-truthful"));
+        crate::transport::register(transport.clone());
+        let index =
+            controller::register_ready_transport(transport, controller::ControllerInfo::default())
+                as u16;
+
+        let cleanup = || {
+            crate::transport::__test_reset();
+            controller::__test_reset_controllers();
+            SETTINGS.lock().clear();
+            crate::pm::__reset_for_test();
+        };
+
+        // Fresh controller: not powered (default settings), unparked.
+        if is_powered(index) || crate::pm::is_parked(index as usize) {
+            cleanup();
+            return TestResult::Fail("fresh controller reads powered or parked");
+        }
+        // SET_POWERED(1) → powered and unparked.
+        let _ = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
+        if !is_powered(index) || crate::pm::is_parked(index as usize) {
+            cleanup();
+            return TestResult::Fail("SET_POWERED(1) did not power the controller");
+        }
+        // System suspend: the POWERED bit stays set, but the
+        // truthful report clears while the pump is parked.
+        crate::pm::suspend_controller(index as usize);
+        if is_powered(index) || !crate::pm::parked_for_power(index as usize) {
+            cleanup();
+            return TestResult::Fail("system suspend did not clear the powered report");
+        }
+        crate::pm::resume_controller(index as usize);
+        if !is_powered(index) {
+            cleanup();
+            return TestResult::Fail("system resume did not restore the powered report");
+        }
+        // Runtime (autosuspend) park: HCI_UP stays up.
+        crate::pm::park_autosuspend(index as usize);
+        if !is_powered(index) || !crate::pm::is_runtime_suspended(index as usize) {
+            cleanup();
+            return TestResult::Fail("autosuspend park cleared HCI_UP");
+        }
+        crate::pm::unpark_autosuspend(index as usize);
+        // SET_POWERED(0) → not powered, pump parked.
+        let _ = handle(&mgmt_cmd(OP_SET_POWERED, index, &[0]));
+        if is_powered(index) || !crate::pm::is_parked(index as usize) {
+            cleanup();
+            return TestResult::Fail("SET_POWERED(0) did not park the controller");
+        }
+        // Power back on → powered, unparked.
+        let _ = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
+        if !is_powered(index) || crate::pm::is_parked(index as usize) {
+            cleanup();
+            return TestResult::Fail("SET_POWERED(1) did not unpark the controller");
+        }
+        cleanup();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/mgmt",
+        smoke_mgmt_powered_is_truthful_across_parks
+    );
 
     static CAPTURED: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
         narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
