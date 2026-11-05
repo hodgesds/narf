@@ -73,9 +73,12 @@ memory-window ownership and do not use this control-register path.
   reporting an empty pool, allowing the stack's copy fallback to recover even
   after its zero-copy pool is exhausted.
 - The primary virtio-net interface opts into the kernel stack's
-  per-interface software GRO stage. Every RX forwarder flushes the current
-  CPU's held flows after its queue drains and before it parks; secondary
-  frame-ring-only interfaces do not alter the kernel-stack setting.
+  per-interface software GRO stage. Every RX forwarder of the primary
+  controller feeds GRO through the synchronous tap and flushes the current
+  CPU's held flows after its queue drains and before it parks, so
+  MQ-spread flows coalesce on every pair; secondary frame-ring-only
+  interfaces neither offer to GRO nor flush, and do not alter the
+  kernel-stack setting.
 - virtio-gpu exposes `offered_features()`, `host_offers_virgl()`, and
   `virgl_enabled()`. The first two report the pre-negotiation host offer;
   `virgl_enabled()` is true only after immutable negotiation accepts
