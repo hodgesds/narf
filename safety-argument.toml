@@ -7,8 +7,10 @@ prompt_hash = "d554969454a9819ebee3c17ea775569922d36154e527e200d6468081c3823fce"
 # introducing commit is small enough to list) the files it touched.
 #   pr       = GitHub PR number the entry arrived with (required for new entries).
 #   commit   = full SHA of the commit that added the entry (required for new entries).
-#   files    = repo-relative paths touched by that commit, when it touched
-#              <= 12 files; omitted for larger commits (the commit resolves them).
+#   files    = repo-relative paths touched by that commit that still exist
+#              in the tree, when it touched <= 12 files; omitted for larger
+#              commits, and paths the commit itself deleted are omitted
+#              (the commit resolves the full list).
 #   enforces = ["path/to/file.rs::function", ...] naming the code functions
 #              that enforce the claimed invariant (required for new entries).
 #              The checker verifies each file exists and contains `fn <name>`.
@@ -3709,6 +3711,10 @@ argument = "Untrusted processes reach these paths through their existing trigger
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
+pr = 1037
+commit = "a8f23d6586dcb3a1d18819b636450a27682dcab4"
+files = ["drivers/backlight/README.md", "drivers/backlight/src/lib.rs", "drivers/backlight/src/sysfs_bridge.rs", "drivers/backlight/src/tests.rs", "drivers/gpu/src/backlight.rs", "drivers/gpu/src/lib.rs", "drivers/platform/src/lib.rs", "drivers/platform/src/tests.rs", "frame/src/bare_main.rs", "safety-argument.toml"]
+enforces = ["drivers/backlight/src/lib.rs::register_initcalls"]
 agent = "Muse Wonder"
 argument = "The backlight composition change (#947) adds exactly one line to frame/src/bare_main.rs's subsystem enumeration — narf_drivers_backlight::register_initcalls() — alongside the dozens of identical register_initcalls() calls for sibling driver crates. It adds no TCB member: narf-drivers-backlight stays outside the TCB set defined at the ref, was already a frame dependency (frame/Cargo.toml, linked for its fixtures), and the call only appends Stage::Device initcall closures to the narf-init registry. It changes no frame data structure, mapping, capability, domain assignment, or scheduling state, and the registered initcalls execute later through the same staged executor as every other subsystem's. Sysfs publication of the backlight class is dynamic (register/unregister hooks inside the backlight crate), so the call introduces no new boot-ordering assumption against the PCI probe."
 [[invariants_preserved]]
