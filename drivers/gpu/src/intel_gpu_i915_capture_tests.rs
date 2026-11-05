@@ -31,6 +31,15 @@ fn get(file: &dyn FileOps, user: &User, id: u32) -> u64 {
     assert_eq!(u32_at(&wire, 4), 0);
     u64_at(&wire, 16)
 }
+fn recoverable(file: &dyn FileOps, user: &User, id: u32) -> u64 {
+    let mut wire = parameter(id, 0xfeed, u64::MAX);
+    put64(&mut wire, 8, 8);
+    user.store(64, &wire);
+    assert_eq!(node(file, user, abi::GEM_CONTEXT_GETPARAM), Ok(0));
+    let wire = user.load(64, 24);
+    assert_eq!(u32_at(&wire, 4), 0);
+    u64_at(&wire, 16)
+}
 fn create(file: &dyn FileOps, user: &User) -> u32 {
     user.store(64, &[0; 8]);
     assert_eq!(node(file, user, abi::GEM_CONTEXT_CREATE), Ok(0));
@@ -409,6 +418,29 @@ fn smoke_i915_capture_query_source_parameter_sizes_values_and_faults() -> TestRe
         "unrelated boolean accepts nonzero as true in Linux i915"
     );
     put32(&mut other, 4, 8);
+    user.store(64, &other);
+    assert_eq!(
+        node(&*file, &user, abi::GEM_CONTEXT_SETPARAM),
+        Err(FsError::InvalidData)
+    );
+    // RECOVERABLE (param 8) is a legitimate settable boolean in both Linux
+    // tables (set_proto_ctx_param and ctx_setparam: size-then-store), so a
+    // finalized context accepts it. The old InvalidData pin predates the
+    // 6d6851b50 per-parameter-errno alignment and is stale: pin the value
+    // round-trip instead, restore 0 so later steps see a clean context,
+    // and keep a rejection pin for a genuinely unknown parameter.
+    let mut other = parameter(0, 0, 2);
+    put64(&mut other, 8, 8);
+    user.store(64, &other);
+    assert_eq!(node(&*file, &user, abi::GEM_CONTEXT_SETPARAM), Ok(0));
+    assert_eq!(recoverable(&*file, &user, 0), 1);
+    let mut other = parameter(0, 0, 0);
+    put64(&mut other, 8, 8);
+    user.store(64, &other);
+    assert_eq!(node(&*file, &user, abi::GEM_CONTEXT_SETPARAM), Ok(0));
+    assert_eq!(recoverable(&*file, &user, 0), 0);
+    let mut other = parameter(0, 0, 0);
+    put64(&mut other, 8, 0xfeed);
     user.store(64, &other);
     assert_eq!(
         node(&*file, &user, abi::GEM_CONTEXT_SETPARAM),
