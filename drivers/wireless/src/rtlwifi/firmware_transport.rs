@@ -91,6 +91,11 @@ pub fn parse(did: u16, bytes: &[u8]) -> Result<(Info, &[u8]), Error> {
         // rtl8723ae is_fw_header (0x2300), exact length, max_fw_size.
         return super::rtl8723ae::fw::parse(bytes);
     }
+    if did == super::regs::RTL_DEV_8192DE {
+        // IS_FW_HEADER_EXIST (0x92c0 / 0x88c0 masked, 0x92d0-0x92d3
+        // exact), exact length, max_fw_size.
+        return super::rtl8192de::fw::parse(bytes);
+    }
     if did != super::regs::RTL_DEV_8188EE {
         return Err(Error::Unsupported);
     }
@@ -385,6 +390,13 @@ impl<I: Io> Owner<I> {
             let name = self.rtl8723ae_version()?.firmware();
             return self.initialize_registered_from(&authority, name).await;
         }
+        if self.did == super::regs::RTL_DEV_8192DE {
+            // rtl8192de/sw.c fw_name; no alt_fw_name, no version
+            // selection.
+            return self
+                .initialize_registered_from(&authority, super::rtl8192de::fw::FW_NAME)
+                .await;
+        }
         self.initialize_registered_from(&authority, super::fw::FW_8188EE)
             .await
     }
@@ -462,6 +474,7 @@ impl<I: Io> Owner<I> {
                         super::rtl8723be::version::FW_NORMAL
                             | super::rtl8723be::version::FW_NORMAL_ALT
                     )
+                    | (super::regs::RTL_DEV_8192DE, super::rtl8192de::fw::FW_NAME)
             )
         {
             return Err(Error::Unsupported);
@@ -524,6 +537,9 @@ impl<I: Io> Owner<I> {
         }
         if self.did == super::regs::RTL_DEV_8723AE {
             return self.run_8723ae(info, payload).await;
+        }
+        if self.did == super::regs::RTL_DEV_8192DE {
+            return self.run_8192de(info, payload).await;
         }
         narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
             self.set(Stage::Preparing, None);
@@ -726,6 +742,28 @@ impl<I: Io> Owner<I> {
             self.io.write8(0xf0, sys_cfg & 0x7f)?;
             self.set(Stage::Downloading, None);
             super::rtl8723be::fw::download(&self.io, payload).await?;
+            Ok(info)
+        })
+        .await
+        .unwrap_or(Err(Error::Deadline))
+    }
+    /// `rtl92d_download_fw` with packet engines still closed. No chip
+    /// version is measured (the 8192DE loads one image name with no
+    /// version selection) and no pre-download register writes run:
+    /// Linux's download starts directly with the dual-MAC coordination
+    /// check, and the MAC-init / power-on prefix (`_rtl92de_init_mac`,
+    /// card enable) belongs to the follow-up power-on lane, as do the
+    /// CR DMA/MAC gates, LLT and ring bases (retained ring owner).
+    /// The 5000 x 500 us dual-MAC wait plus the checksum and ready
+    /// polls bound the Linux wait near 2.5 s.
+    async fn run_8192de(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
+        narf_time::timeout(narf_time::Deadline::after_ms(6_000), async {
+            self.set(Stage::Preparing, None);
+            if self.io.read32(MCU)? == u32::MAX {
+                return Err(Error::Gone);
+            }
+            self.set(Stage::Downloading, None);
+            super::rtl8192de::fw::download(&self.io, payload).await?;
             Ok(info)
         })
         .await
