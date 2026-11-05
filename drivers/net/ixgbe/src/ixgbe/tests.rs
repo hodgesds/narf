@@ -3,7 +3,7 @@
 //! Stage 1: PCI match table + register-decoder structural tests.
 //! Stage 2: EEPROM word decode round-trip.
 //! Stage 3: AdvTxDesc cmd_type_len bit packing.
-//! Stage 4: RxDesc layout + size assertions.
+//! Stage 4: advanced RX descriptor layout + completion decode.
 //! Stage 5: live MSI-X enable (Skip when no silicon).
 //! Stage 6: HwNic adapter surface.
 
@@ -11,12 +11,17 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+use super::rxdesc::{
+    AdvRxDescRead, AdvRxDescWb, ADV_RXD_ERR_IPE, ADV_RXD_ERR_TCPE, ADV_RXD_STAT_DD,
+    ADV_RXD_STAT_EOP, ADV_RXD_STAT_IPCS, ADV_RXD_STAT_L4CS, ADV_RXD_STAT_VP,
+};
 use super::{
     eeprom_decode, eerd_start, name_for, parse_tso_headers, tx_plan, AdvTxCtxtDesc, AdvTxDesc,
-    RxDesc, ADVTXD_DCMD_DEXT, ADVTXD_DCMD_EOP, ADVTXD_DCMD_IFCS, ADVTXD_DCMD_RS, ADVTXD_DCMD_TSE,
+    ADVTXD_DCMD_DEXT, ADVTXD_DCMD_EOP, ADVTXD_DCMD_IFCS, ADVTXD_DCMD_RS, ADVTXD_DCMD_TSE,
     ADVTXD_DCMD_VLE, ADVTXD_DTYP_CTXT, ADVTXD_DTYP_DATA, ADVTXD_PAYLEN_SHIFT, ADVTXD_POPTS_IXSM,
     ADVTXD_POPTS_TXSM, ADVTXD_TUCMD_IPV4, ADVTXD_TUCMD_L4T_TCP, EERD_START, IXGBE_DEV_82599EB,
-    IXGBE_DEV_X540, IXGBE_DEV_X550, IXGBE_DEV_X550EM_X, IXGBE_VENDOR,
+    IXGBE_DEV_X540, IXGBE_DEV_X550, IXGBE_DEV_X550EM_X, IXGBE_VENDOR, SRRCTL_BSIZE_2K,
+    SRRCTL_DESCTYPE_ADV_ONEBUF,
 };
 
 /// In-memory register bank for fixtures: 0x14000 bytes of BAR0
@@ -149,33 +154,139 @@ fn smoke_ixgbe_advtxd_size_align() -> TestResult {
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_advtxd_size_align);
 
-// ── Stage 4: RX descriptor layout ──────────────────────────────────
+// ── Stage 4: advanced RX descriptor layout + decode ────────────────
 
-fn smoke_ixgbe_rxdesc_layout() -> TestResult {
-    if core::mem::size_of::<RxDesc>() != 16 {
-        return TestResult::Fail("RxDesc not 16 bytes");
+fn smoke_ixgbe_advrxdesc_layout() -> TestResult {
+    if core::mem::size_of::<AdvRxDescRead>() != 16 {
+        return TestResult::Fail("AdvRxDescRead not 16 bytes");
     }
-    if core::mem::align_of::<RxDesc>() != 16 {
-        return TestResult::Fail("RxDesc not 16-byte aligned");
+    if core::mem::align_of::<AdvRxDescRead>() != 16 {
+        return TestResult::Fail("AdvRxDescRead not 16-byte aligned");
     }
-    // Status byte at offset 12 (per datasheet §7.1.5 legacy).
-    let d = RxDesc {
-        addr: 0,
-        length: 0,
-        csum: 0,
-        status: 0xAB,
-        errors: 0,
-        special: 0,
+    if core::mem::size_of::<AdvRxDescWb>() != 16 {
+        return TestResult::Fail("AdvRxDescWb not 16 bytes");
+    }
+    if core::mem::align_of::<AdvRxDescWb>() != 16 {
+        return TestResult::Fail("AdvRxDescWb not 16-byte aligned");
+    }
+    // Read view: pkt_addr at offset 0, hdr_addr at offset 8.
+    let r = AdvRxDescRead::new(0x1122334455667788);
+    let rp = (&r) as *const _ as *const u8;
+    // SAFETY: structurally-sized reads in-bounds.
+    let pkt = unsafe { *(rp as *const u64) };
+    // SAFETY: structurally-sized reads in-bounds.
+    let hdr = unsafe { *(rp.add(8) as *const u64) };
+    if pkt != 0x1122334455667788 || hdr != 0 {
+        return TestResult::Fail("AdvRxDescRead field offsets wrong");
+    }
+    // Write-back view: status_error at offset 8, length at 12, vlan at 14
+    // (datasheet §7.1.6.2, Table 7.16). Distinct sentinels per field.
+    let w = AdvRxDescWb {
+        lo: 0xAABBCCDD,
+        hi: 0x11223344,
+        status_error: 0xDEADBEEF,
+        length: 0x1234,
+        vlan: 0x5678,
     };
-    let p = (&d) as *const _ as *const u8;
-    // SAFETY: structurally-sized read in-bounds.
-    let off12 = unsafe { *p.add(12) };
-    if off12 != 0xAB {
-        return TestResult::Fail("RxDesc.status not at offset 12");
+    let wp = (&w) as *const _ as *const u8;
+    // SAFETY: structurally-sized reads in-bounds.
+    let se = unsafe { *(wp.add(8) as *const u32) };
+    // SAFETY: structurally-sized reads in-bounds.
+    let len = unsafe { *(wp.add(12) as *const u16) };
+    // SAFETY: structurally-sized reads in-bounds.
+    let vlan = unsafe { *(wp.add(14) as *const u16) };
+    if se != 0xDEADBEEF || len != 0x1234 || vlan != 0x5678 {
+        return TestResult::Fail("AdvRxDescWb field offsets wrong");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_rxdesc_layout);
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_advrxdesc_layout);
+
+fn smoke_ixgbe_advrxdesc_decode() -> TestResult {
+    // Done + EOP bits.
+    let done = AdvRxDescWb {
+        status_error: ADV_RXD_STAT_DD | ADV_RXD_STAT_EOP,
+        ..Default::default()
+    };
+    if !done.is_done() || !done.is_eop() {
+        return TestResult::Fail("DD/EOP decode wrong");
+    }
+    let pending = AdvRxDescWb {
+        status_error: 0,
+        ..Default::default()
+    };
+    if pending.is_done() {
+        return TestResult::Fail("DD decode wrong on empty descriptor");
+    }
+    // VLAN: VP set -> tag reported; VP clear -> None even with a
+    // nonzero vlan field (stale value must not leak).
+    let tagged = AdvRxDescWb {
+        status_error: ADV_RXD_STAT_DD | ADV_RXD_STAT_VP,
+        vlan: 0x0064,
+        ..Default::default()
+    };
+    if tagged.vlan_tag() != Some(0x0064) {
+        return TestResult::Fail("VP tag not reported");
+    }
+    let untagged = AdvRxDescWb {
+        status_error: ADV_RXD_STAT_DD,
+        vlan: 0x0064,
+        ..Default::default()
+    };
+    if untagged.vlan_tag().is_some() {
+        return TestResult::Fail("tag reported without VP");
+    }
+    // Checksum matrix: status bit AND absence of its error bit.
+    let cases: &[(u32, bool, bool, &str)] = &[
+        (ADV_RXD_STAT_IPCS, true, false, "IPCS only"),
+        (
+            ADV_RXD_STAT_IPCS | ADV_RXD_ERR_IPE,
+            false,
+            false,
+            "IPCS+IPE",
+        ),
+        (ADV_RXD_STAT_L4CS, false, true, "L4CS only"),
+        (
+            ADV_RXD_STAT_L4CS | ADV_RXD_ERR_TCPE,
+            false,
+            false,
+            "L4CS+TCPE",
+        ),
+        (0, false, false, "no status"),
+        (
+            ADV_RXD_STAT_IPCS | ADV_RXD_STAT_L4CS,
+            true,
+            true,
+            "IPCS+L4CS",
+        ),
+    ];
+    for (bits, want_l3, want_l4, name) in cases {
+        let w = AdvRxDescWb {
+            status_error: ADV_RXD_STAT_DD | *bits,
+            ..Default::default()
+        };
+        let m = w.rx_meta();
+        if m.csum_l3 != *want_l3 || m.csum_l4 != *want_l4 {
+            return TestResult::Fail(name);
+        }
+    }
+    // rx_meta carries the VLAN tag through.
+    if tagged.rx_meta().vlan_tag != Some(0x0064) {
+        return TestResult::Fail("rx_meta vlan_tag not carried");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_advrxdesc_decode);
+
+fn smoke_ixgbe_srrctl_adv_onebuf() -> TestResult {
+    // Program word the driver writes: BSIZE_2K | DESCTYPE_ADV_ONEBUF
+    // = 2 | (1 << 25) = 0x02000002 (Linux ixgbe_type.h:2462).
+    if SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_ADV_ONEBUF != 0x02000002 {
+        return TestResult::Fail("SRRCTL advanced program word wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_srrctl_adv_onebuf);
 
 // ── Stage 5: live MSI-X enable (skips off real silicon) ────────────
 
@@ -422,7 +533,7 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_queue_config_validation);
 
 fn smoke_ixgbe_queue0_register_conversation() -> TestResult {
     use super::queues::{rx_queue_regs, tx_queue_regs, RegBank};
-    use super::{RXDCTL_ENABLE, SRRCTL_BSIZE_2K, SRRCTL_DESCTYPE_LEGACY, TXDCTL_ENABLE};
+    use super::{RXDCTL_ENABLE, SRRCTL_BSIZE_2K, SRRCTL_DESCTYPE_ADV_ONEBUF, TXDCTL_ENABLE};
     // Fake-bank replay of bring_up's queue-0 programming: base, length,
     // head/tail, SRRCTL, queue-enable — the exact register conversation
     // the hardware sees, minus DMA.
@@ -448,7 +559,7 @@ fn smoke_ixgbe_queue0_register_conversation() -> TestResult {
     bank.write32(rx.rdlen, 32 * 16);
     bank.write32(rx.rdh, 0);
     bank.write32(rx.rdt, 31);
-    bank.write32(rx.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY);
+    bank.write32(rx.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_ADV_ONEBUF);
     bank.set_bits(rx.rxdctl, RXDCTL_ENABLE);
     if bank.read32(tx.tdbal) != tx_phys as u32
         || bank.read32(tx.tdbah) != (tx_phys >> 32) as u32
@@ -460,7 +571,7 @@ fn smoke_ixgbe_queue0_register_conversation() -> TestResult {
     if bank.read32(rx.rdbal) != rx_phys as u32
         || bank.read32(rx.rdlen) != 512
         || bank.read32(rx.rdt) != 31
-        || bank.read32(rx.srrctl) != (SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY)
+        || bank.read32(rx.srrctl) != (SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_ADV_ONEBUF)
         || bank.read32(rx.rxdctl) & RXDCTL_ENABLE == 0
     {
         return TestResult::Fail("RX queue-0 conversation wrong");
@@ -947,7 +1058,10 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_pm_plans);
 fn smoke_ixgbe_pm_resume_rebuild() -> TestResult {
     use super::pm::resume_rebuild_plan;
     use super::queues::{rx_queue_regs, tx_queue_regs, QueueConfig, RegBank};
-    use super::{FCTRL_BAM, FCTRL_MPE, FCTRL_UPE, RXDCTL_ENABLE, SRRCTL_BSIZE_2K, TXDCTL_ENABLE};
+    use super::{
+        FCTRL_BAM, FCTRL_MPE, FCTRL_UPE, RXDCTL_ENABLE, SRRCTL_BSIZE_2K,
+        SRRCTL_DESCTYPE_ADV_ONEBUF, TXDCTL_ENABLE,
+    };
     let tx0 = match tx_queue_regs(0) {
         Some(t) => t,
         None => return TestResult::Fail("tx_queue_regs(0) is None"),
@@ -985,7 +1099,7 @@ fn smoke_ixgbe_pm_resume_rebuild() -> TestResult {
         || bank.read32(rx0.rdlen) != 32 * 16
         || bank.read32(rx0.rdh) != 0
         || bank.read32(rx0.rdt) != 31
-        || bank.read32(rx0.srrctl) != SRRCTL_BSIZE_2K
+        || bank.read32(rx0.srrctl) != (SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_ADV_ONEBUF)
         || bank.read32(rx0.rxdctl) & RXDCTL_ENABLE == 0
         || bank.read32(0x05080) != (FCTRL_BAM | FCTRL_UPE | FCTRL_MPE)
         || bank.read32(0x03000) & 1 == 0
@@ -2226,8 +2340,8 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_ethtool_queue_stats);
 fn smoke_ixgbe_multiqueue_register_conversation() -> TestResult {
     use super::queues::{rx_queue_regs, tx_queue_regs, RegBank};
     use super::{
-        program_rx_queue, program_tx_queue, RXDCTL_ENABLE, SRRCTL_BSIZE_2K, SRRCTL_DESCTYPE_LEGACY,
-        TXDCTL_ENABLE,
+        program_rx_queue, program_tx_queue, RXDCTL_ENABLE, SRRCTL_BSIZE_2K,
+        SRRCTL_DESCTYPE_ADV_ONEBUF, TXDCTL_ENABLE,
     };
     // Fake-bank replay of bring_up_with_config's per-queue
     // programming for TX queues 0..3 + RX queues 0..3 (ring_len 32,
@@ -2270,7 +2384,7 @@ fn smoke_ixgbe_multiqueue_register_conversation() -> TestResult {
             || bank.read32(rx.rdlen) != 512
             || bank.read32(rx.rdh) != 0
             || bank.read32(rx.rdt) != 31
-            || bank.read32(rx.srrctl) != (SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY)
+            || bank.read32(rx.srrctl) != (SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_ADV_ONEBUF)
             || bank.read32(rx.rxdctl) & RXDCTL_ENABLE == 0
         {
             return TestResult::Fail("RX multi-queue conversation wrong");

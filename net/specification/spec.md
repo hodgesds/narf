@@ -209,7 +209,10 @@ consumes `max_tso_bytes` for IPv4 only; IPv6 remains software-segmented even
 when a device advertises the generic limit.
 `RxMeta::csum_l3` means a verified IPv4 header checksum; IPv6 never sets it.
 `csum_l4` means verified TCP/UDP. Consumers verify in software whenever a flag
-is false. These fields describe the in-kernel frame-ring contract; they do not
+is false. `RxMeta::vlan_tag` carries the stripped 802.1Q tag (TCI: PCP + CFI +
+VID, same meaning as `TxMeta::vlan_tag`) when hardware stripped the tag and
+reported it in the RX descriptor; `None` means no stripped tag was reported.
+These fields describe the in-kernel frame-ring contract; they do not
 change the stack-daemon attach wire ABI.
 
 Software GRO is an explicit per-interface receive property:

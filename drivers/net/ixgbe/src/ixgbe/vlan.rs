@@ -11,11 +11,10 @@
 //! bit is set in the VFTA (and, when CFIEN is set, its CFI bit
 //! equals VLNCTRL.CFI); untagged frames are unaffected by the
 //! table. VME is per-queue: a stripped frame's tag lands in the
-//! RX descriptor's VLAN field (advanced descriptors; the legacy
-//! descriptors this driver uses report it in `special` — see the
-//! remainder note in the spec). This module programs the filter;
-//! per-queue strip selection is exposed so a later advanced-
-//! descriptor migration can consume the tag.
+//! advanced write-back descriptor's VLAN field and is surfaced
+//! to the stack as `RxMeta::vlan_tag` (spec §13k). This module
+//! programs the filter; per-queue strip selection is what
+//! decides which queues report tags.
 
 use alloc::vec::Vec;
 

@@ -14,11 +14,12 @@
 //! — the struct documents that, and callers must not present them
 //! as lifetime totals.
 //!
-//! Honest offload advertisement (what the send path actually
-//! honors today): TX checksum offload, yes (`tx()` builds
-//! `with_csum` from `TxMeta::csum_l4`); RX checksum, no (the
-//! `RxDesc::csum_result` decoder exists but is not plumbed into
-//! frame metadata); TSO, yes with a bound (`tx()` accepts TSO
+//! Honest offload advertisement (what the paths actually honor
+//! today): TX checksum offload, yes (`tx()` builds `with_csum`
+//! from `TxMeta::csum_l4`); RX checksum, yes — the advanced
+//! write-back descriptor's status/error bits are decoded
+//! conservatively into `RxMeta` (§13k) and `rx_checksum` is
+//! claimed; TSO, yes with a bound (`tx()` accepts TSO
 //! frames to `TX_TSO_MAX_TX` bytes, the per-slot copy-buffer
 //! size; `tx_frame()` runs to `TX_TSO_MAX_TX_FRAME`, the
 //! per-descriptor data length — the advertised bound is the
