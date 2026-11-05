@@ -475,7 +475,7 @@ pub async fn hub_port_suspend_change(
     port: u8,
 ) -> Option<bool> {
     let hub_copy: Option<crate::hub::UsbHub> = {
-        let g = HUBS.lock();
+        let g = HUBS.of(xhci_dev.id()).lock();
         g.iter()
             .find(|h| h.hub.slot_id == parent_hub_slot)
             .map(|h| h.hub)

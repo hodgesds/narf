@@ -2122,12 +2122,14 @@ fn rtl_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<()
             if d.detached {
                 None
             } else {
-                d.hub_port.filter(|_| d.suspended)
+                d.hub_port
+                    .filter(|_| d.suspended)
+                    .map(|hp| (hp, d.controller))
             }
         })
     };
-    if let Some((hub_slot, port)) = resume_needed {
-        let Some(c) = crate::xhci::controller() else {
+    if let Some(((hub_slot, port), controller)) = resume_needed {
+        let Some(c) = crate::xhci::controller_by_id(controller) else {
             return Err(());
         };
         let resumed = narf_scheduler::block_on(resume_r8152_port(&c, hub_slot, port));
@@ -2138,7 +2140,7 @@ fn rtl_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<()
         // burst does not flap the port straight back into
         // suspend (the pump's RX marking alone would let a
         // TX-only flow idle-expire).
-        crate::attach::mark_port_activity(hub_slot, port);
+        crate::attach::mark_port_activity(controller, hub_slot, port);
     }
     let (slot_id, bulk_out_dci) = tx_target(idx).ok_or(())?;
     let controller = RTL_DEVICES.lock().get(idx).ok_or(())?.controller;
@@ -2518,7 +2520,11 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
                     // after the 30 s window.
                     if delivered > 0 {
                         if let Some((hub_slot, port)) = hub_port {
-                            crate::attach::mark_port_activity(hub_slot, port);
+                            crate::attach::mark_port_activity(
+                                device.controller().id(),
+                                hub_slot,
+                                port,
+                            );
                         }
                     }
                 }
@@ -2579,7 +2585,7 @@ async fn suspend_r8152_port(hub_slot: u8, port: u8) -> SuspendOutcome {
                 if d.suspended {
                     Some(None)
                 } else {
-                    Some(Some((d.slot_id, d.speed, d.wol_opts)))
+                    Some(Some((d.slot_id, d.speed, d.wol_opts, d.controller)))
                 }
             } else {
                 None
@@ -2589,11 +2595,11 @@ async fn suspend_r8152_port(hub_slot: u8, port: u8) -> SuspendOutcome {
     let Some(target) = target else {
         return SuspendOutcome::NotMine;
     };
-    let Some((slot_id, speed, wol_opts)) = target else {
+    let Some((slot_id, speed, wol_opts, controller)) = target else {
         // Already parked: idempotent re-park, no re-arm.
         return SuspendOutcome::Parked;
     };
-    let Some(c) = crate::xhci::controller() else {
+    let Some(c) = crate::xhci::controller_by_id(controller) else {
         return SuspendOutcome::ParkFailed;
     };
     // Transient device handle for the OCP register path
@@ -2649,7 +2655,7 @@ pub async fn resume_r8152_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port:
         return false;
     };
     crate::attach::resume_port(xhci_dev, hub_slot, port).await;
-    if crate::attach::hub_port_is_suspended(hub_slot, port) {
+    if crate::attach::hub_port_is_suspended(xhci_dev.id(), hub_slot, port) {
         return false;
     }
     let mut g = RTL_DEVICES.lock();

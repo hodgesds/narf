@@ -858,6 +858,10 @@ async fn reset(dev: &USBDevice, burst_cap: u32) -> Result<([u8; 6], u32, ChipId)
 
 pub struct Lan95xxDevice {
     pub slot_id: u8,
+    /// Owning xHCI controller id ([`Xhci::id`]): slot ids are only
+    /// unique within one controller, so TX and detach resolve the
+    /// controller through this field, never a global accessor.
+    pub controller: u8,
     pub chip: ChipId,
     pub mac: [u8; 6],
     pub bulk_in_dci: u8,
@@ -887,8 +891,13 @@ pub fn tx_target(idx: usize) -> Option<(u8, u8, u16)> {
 /// The net stack's send hook is sync; bridge to the async
 /// bulk_out via block_on (called from TX paths that are not
 /// inside an executor poll — same contract as r8152's send).
-fn lan95xx_send_segment(slot_id: u8, bulk_out_dci: u8, seg: &[u8]) -> Result<(), ()> {
-    let c = crate::xhci::controller().ok_or(())?;
+fn lan95xx_send_segment(
+    controller: u8,
+    slot_id: u8,
+    bulk_out_dci: u8,
+    seg: &[u8],
+) -> Result<(), ()> {
+    let c = crate::xhci::controller_by_id(controller).ok_or(())?;
     let n = narf_scheduler::block_on(async move { c.bulk_out(slot_id, bulk_out_dci, seg).await })
         .map_err(|_| ())?;
     if n != seg.len() {
@@ -903,12 +912,13 @@ fn lan95xx_send_segment(slot_id: u8, bulk_out_dci: u8, seg: &[u8]) -> Result<(),
 /// a partial offload.
 fn lan95xx_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let (slot_id, bulk_out_dci, out_max_packet) = tx_target(idx).ok_or(())?;
+    let controller = LAN95XX_DEVICES.lock().get(idx).ok_or(())?.controller;
     let seg = build_tx_segment(frame, meta)?;
-    lan95xx_send_segment(slot_id, bulk_out_dci, &seg)?;
+    lan95xx_send_segment(controller, slot_id, bulk_out_dci, &seg)?;
     // FLAG_SEND_ZLP: a segment exactly filling maxpacket frames
     // needs a zero-length terminator.
     if needs_zlp(seg.len(), out_max_packet) {
-        let c = crate::xhci::controller().ok_or(())?;
+        let c = crate::xhci::controller_by_id(controller).ok_or(())?;
         narf_scheduler::block_on(async move { c.bulk_out(slot_id, bulk_out_dci, &[]).await })
             .map_err(|_| ())?;
     }
@@ -1002,6 +1012,7 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         let idx = g.len();
         g.push(Lan95xxDevice {
             slot_id: device.slot_id(),
+            controller: device.controller().id(),
             chip,
             mac,
             bulk_in_dci,
@@ -1186,11 +1197,14 @@ fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
 /// `publish::note_rx_mirror_attached`, and its `usb-lan95xx{N}`
 /// names cannot collide with the `eth%d` keys the mirror
 /// registry can ever hold.
-pub fn detach_lan95xx_slot(slot_id: u8) -> Result<(), ()> {
+pub fn detach_lan95xx_slot(controller: u8, slot_id: u8) -> Result<(), ()> {
     let ifaces: Vec<String> = {
         let mut g = LAN95XX_DEVICES.lock();
         let mut names = Vec::new();
-        for dev in g.iter_mut().filter(|d| d.slot_id == slot_id && !d.detached) {
+        for dev in g
+            .iter_mut()
+            .filter(|d| d.controller == controller && d.slot_id == slot_id && !d.detached)
+        {
             dev.detached = true;
             dev.pump_running = false;
             names.push(dev.iface_name.clone());
