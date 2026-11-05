@@ -5826,3 +5826,477 @@ kernel_test_in!(
     "bluetooth/controller",
     smoke_bluetooth_bring_up_all_isolates_failures
 );
+
+// ── LE Periodic Advertising — GAP encoders (#1560) ──────────────────
+
+fn smoke_gap_periodic_adv_parameters_encoding() -> TestResult {
+    use crate::gap::PeriodicAdvertisingParameters;
+    // §7.8.61: handle 0x02, 100 ms min/max, Tx Power + ADI.
+    let p = PeriodicAdvertisingParameters {
+        advertising_handle: 0x02,
+        interval_min: 0x0050,
+        interval_max: 0x0050,
+        include_tx_power: true,
+        include_adi: true,
+    };
+    if !p.is_valid() {
+        return TestResult::Fail("in-range intervals should be valid");
+    }
+    let raw = p.encode();
+    if raw != [0x02, 0x50, 0x00, 0x50, 0x00, 0x41, 0x00] {
+        return TestResult::Fail("Set Periodic Adv Parameters bytes wrong");
+    }
+    // Out-of-range intervals are refused by is_valid, never sent.
+    let bad = PeriodicAdvertisingParameters {
+        advertising_handle: 0x00,
+        interval_min: 0x0005,
+        interval_max: 0x0050,
+        include_tx_power: false,
+        include_adi: false,
+    };
+    if bad.is_valid() {
+        return TestResult::Fail("interval_min 0x0005 should be invalid");
+    }
+    let inverted = PeriodicAdvertisingParameters {
+        advertising_handle: 0x00,
+        interval_min: 0x0060,
+        interval_max: 0x0050,
+        include_tx_power: false,
+        include_adi: false,
+    };
+    if inverted.is_valid() {
+        return TestResult::Fail("interval_min > interval_max should be invalid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_periodic_adv_parameters_encoding);
+
+fn smoke_gap_periodic_adv_data_encoding() -> TestResult {
+    use crate::gap::{encode_periodic_adv_data, PeriodicAdvDataOperation};
+    // §7.8.62: handle 0x00, Complete, AD = Flags 0x06.
+    let raw = encode_periodic_adv_data(
+        0x00,
+        PeriodicAdvDataOperation::Complete,
+        &[0x02, 0x01, 0x06],
+    );
+    if raw != [0x00, 0x03, 0x03, 0x02, 0x01, 0x06] {
+        return TestResult::Fail("Set Periodic Adv Data bytes wrong");
+    }
+    // Unchanged data carries no payload.
+    let raw = encode_periodic_adv_data(0x01, PeriodicAdvDataOperation::Unchanged, &[]);
+    if raw != [0x01, 0x04, 0x00] {
+        return TestResult::Fail("Unchanged data bytes wrong");
+    }
+    // First fragment of a split payload.
+    let raw = encode_periodic_adv_data(0x00, PeriodicAdvDataOperation::First, &[0xAA, 0xBB]);
+    if raw != [0x00, 0x01, 0x02, 0xAA, 0xBB] {
+        return TestResult::Fail("First-fragment bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_periodic_adv_data_encoding);
+
+fn smoke_gap_periodic_adv_enable_encoding() -> TestResult {
+    use crate::gap::PeriodicAdvertisingEnable;
+    let e = PeriodicAdvertisingEnable {
+        enable: true,
+        advertising_handle: 0x03,
+    };
+    if e.encode() != [0x01, 0x03] {
+        return TestResult::Fail("Enable bytes wrong");
+    }
+    let d = PeriodicAdvertisingEnable {
+        enable: false,
+        advertising_handle: 0x03,
+    };
+    if d.encode() != [0x00, 0x03] {
+        return TestResult::Fail("Disable bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_periodic_adv_enable_encoding);
+
+fn smoke_gap_periodic_adv_create_sync_encoding() -> TestResult {
+    use crate::gap::{PeerAddressType, PeriodicAdvertisingCreateSync};
+    // §7.8.67, pinned byte-for-byte: options 0x02 (reporting on),
+    // SID 0x01, public advertiser C0:C1:C2:C3:C4:C5, skip 0,
+    // timeout 10 s, CTE 0xFF (no CTE sync).
+    let req = PeriodicAdvertisingCreateSync::to_advertiser(
+        0x01,
+        PeerAddressType::Public,
+        [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5],
+    );
+    if !req.is_valid() {
+        return TestResult::Fail("default Create Sync should be valid");
+    }
+    let raw = req.encode();
+    let want: [u8; 14] = [
+        0x02, 0x01, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x00, 0x00, 0xE8, 0x03, 0xFF,
+    ];
+    if raw != want {
+        return TestResult::Fail("Create Sync bytes wrong");
+    }
+    // Skip / timeout / CTE bounds are enforced by is_valid.
+    let mut bad = req;
+    bad.skip = 0x01F4;
+    if bad.is_valid() {
+        return TestResult::Fail("skip 0x01F4 should be invalid");
+    }
+    let mut bad = req;
+    bad.sync_timeout = 0x0009;
+    if bad.is_valid() {
+        return TestResult::Fail("sync_timeout 0x0009 should be invalid");
+    }
+    let mut bad = req;
+    bad.sync_cte_type = 0x04;
+    if bad.is_valid() {
+        return TestResult::Fail("sync_cte_type 0x04 should be invalid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_periodic_adv_create_sync_encoding);
+
+fn smoke_gap_periodic_adv_terminate_sync_encoding() -> TestResult {
+    use crate::gap::build_periodic_adv_terminate_sync;
+    if build_periodic_adv_terminate_sync(0x0007) != [0x07, 0x00] {
+        return TestResult::Fail("Terminate Sync bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gap",
+    smoke_gap_periodic_adv_terminate_sync_encoding
+);
+
+// ── LE Periodic Advertising — event parsers (#1560) ─────────────────
+
+fn le_meta_event(subevent: u8, payload: &[u8]) -> crate::hci::Event {
+    let mut p = vec![subevent];
+    p.extend_from_slice(payload);
+    crate::hci::Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: p,
+    }
+}
+
+fn smoke_event_periodic_adv_sync_established_parse() -> TestResult {
+    use crate::event::{LePeriodicAdvSyncEstablished, LeSubevent};
+    // §7.7.65.15: status 0, sync handle 0x0007, SID 0x01, public
+    // advertiser C0:C1:C2:C3:C4:C5, PHY 1M, interval 0x0050
+    // (100 ms), clock accuracy 0x00.
+    let payload: [u8; 15] = [
+        0x00, 0x07, 0x00, 0x01, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x01, 0x50, 0x00, 0x00,
+    ];
+    let ev = le_meta_event(
+        LeSubevent::PeriodicAdvertisingSyncEstablished as u8,
+        &payload,
+    );
+    let est = match LePeriodicAdvSyncEstablished::parse(&ev) {
+        Some(e) => e,
+        None => return TestResult::Fail("Sync Established parse returned None"),
+    };
+    if est.status != 0 || est.sync_handle != 0x0007 {
+        return TestResult::Fail("status / sync_handle wrong");
+    }
+    if est.advertising_sid != 0x01 || est.advertiser_address_type != 0x00 {
+        return TestResult::Fail("SID / address type wrong");
+    }
+    if est.advertiser_address != [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5] {
+        return TestResult::Fail("advertiser address wrong");
+    }
+    if est.advertiser_phy != 0x01 || est.periodic_advertising_interval != 0x0050 {
+        return TestResult::Fail("PHY / interval wrong");
+    }
+    if est.advertiser_clock_accuracy != 0x00 {
+        return TestResult::Fail("clock accuracy wrong");
+    }
+    // Truncated payload (14 of 15 bytes) is malformed.
+    let ev = le_meta_event(
+        LeSubevent::PeriodicAdvertisingSyncEstablished as u8,
+        &payload[..14],
+    );
+    if LePeriodicAdvSyncEstablished::parse(&ev).is_some() {
+        return TestResult::Fail("truncated Sync Established parsed");
+    }
+    // Wrong subevent code is not a Sync Established.
+    let ev = le_meta_event(LeSubevent::PeriodicAdvertisingReport as u8, &payload);
+    if LePeriodicAdvSyncEstablished::parse(&ev).is_some() {
+        return TestResult::Fail("Report subevent parsed as Sync Established");
+    }
+    // Non-LE-Meta event code is rejected.
+    let ev = crate::hci::Event {
+        code: crate::event::EventCode::CommandComplete as u8,
+        params: {
+            let mut p = vec![LeSubevent::PeriodicAdvertisingSyncEstablished as u8];
+            p.extend_from_slice(&payload);
+            p
+        },
+    };
+    if LePeriodicAdvSyncEstablished::parse(&ev).is_some() {
+        return TestResult::Fail("non-LE-Meta parsed as Sync Established");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/hci",
+    smoke_event_periodic_adv_sync_established_parse
+);
+
+fn smoke_event_periodic_adv_report_parse() -> TestResult {
+    use crate::event::{LePeriodicAdvReport, LeSubevent, LE_PA_DATA_COMPLETE};
+    // §7.7.65.14: sync handle 0x0007, Tx Power +4 dBm, RSSI -60,
+    // no CTE, complete, 3 bytes AD (Flags 0x06).
+    let payload: [u8; 10] = [0x07, 0x00, 0x04, 0xC4, 0xFF, 0x00, 0x03, 0x02, 0x01, 0x06];
+    let ev = le_meta_event(LeSubevent::PeriodicAdvertisingReport as u8, &payload);
+    let rep = match LePeriodicAdvReport::parse(&ev) {
+        Some(r) => r,
+        None => return TestResult::Fail("Report parse returned None"),
+    };
+    if rep.sync_handle != 0x0007 {
+        return TestResult::Fail("sync_handle wrong");
+    }
+    if rep.tx_power != 4 || rep.rssi != -60 {
+        return TestResult::Fail("Tx Power / RSSI sign wrong");
+    }
+    if rep.cte_type != 0xFF || rep.data_status != LE_PA_DATA_COMPLETE {
+        return TestResult::Fail("CTE type / data status wrong");
+    }
+    if rep.data != [0x02, 0x01, 0x06] {
+        return TestResult::Fail("report data wrong");
+    }
+    // Data_Length overruns the event: malformed (the 2026 kernel
+    // OOB-read case — the length is never trusted blindly).
+    let bad: [u8; 10] = [0x07, 0x00, 0x04, 0xC4, 0xFF, 0x00, 0x09, 0x02, 0x01, 0x06];
+    let ev = le_meta_event(LeSubevent::PeriodicAdvertisingReport as u8, &bad);
+    if LePeriodicAdvReport::parse(&ev).is_some() {
+        return TestResult::Fail("over-long Data_Length parsed");
+    }
+    // Reserved Data_Status 0x03 is malformed.
+    let bad: [u8; 10] = [0x07, 0x00, 0x04, 0xC4, 0xFF, 0x03, 0x03, 0x02, 0x01, 0x06];
+    let ev = le_meta_event(LeSubevent::PeriodicAdvertisingReport as u8, &bad);
+    if LePeriodicAdvReport::parse(&ev).is_some() {
+        return TestResult::Fail("reserved Data_Status parsed");
+    }
+    // Reserved CTE_Type 0x04 is malformed.
+    let bad: [u8; 10] = [0x07, 0x00, 0x04, 0xC4, 0x04, 0x00, 0x03, 0x02, 0x01, 0x06];
+    let ev = le_meta_event(LeSubevent::PeriodicAdvertisingReport as u8, &bad);
+    if LePeriodicAdvReport::parse(&ev).is_some() {
+        return TestResult::Fail("reserved CTE_Type parsed");
+    }
+    // Truncated fixed part (6 of 7 bytes) is malformed.
+    let ev = le_meta_event(LeSubevent::PeriodicAdvertisingReport as u8, &payload[..6]);
+    if LePeriodicAdvReport::parse(&ev).is_some() {
+        return TestResult::Fail("truncated Report parsed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_event_periodic_adv_report_parse);
+
+fn smoke_event_periodic_adv_sync_lost_parse() -> TestResult {
+    use crate::event::{LePeriodicAdvSyncLost, LeSubevent};
+    // §7.7.65.16: sync handle 0x0007.
+    let payload: [u8; 2] = [0x07, 0x00];
+    let ev = le_meta_event(LeSubevent::PeriodicAdvertisingSyncLost as u8, &payload);
+    let lost = match LePeriodicAdvSyncLost::parse(&ev) {
+        Some(l) => l,
+        None => return TestResult::Fail("Sync Lost parse returned None"),
+    };
+    if lost.sync_handle != 0x0007 {
+        return TestResult::Fail("sync_handle wrong");
+    }
+    // Truncated (1 of 2 bytes) is malformed.
+    let ev = le_meta_event(LeSubevent::PeriodicAdvertisingSyncLost as u8, &payload[..1]);
+    if LePeriodicAdvSyncLost::parse(&ev).is_some() {
+        return TestResult::Fail("truncated Sync Lost parsed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_event_periodic_adv_sync_lost_parse);
+
+// ── LE Periodic Advertising — sync state machine (#1560) ────────────
+
+fn smoke_gap_periodic_sync_state_machine() -> TestResult {
+    use crate::event::{
+        LePeriodicAdvReport, LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost, LeSubevent,
+        LE_PA_DATA_COMPLETE, LE_PA_DATA_MORE_TO_COME, LE_PA_DATA_TRUNCATED,
+    };
+    use crate::gap::{PeriodicSync, PeriodicSyncPhase};
+
+    fn established(status: u8, handle: u16) -> LePeriodicAdvSyncEstablished {
+        let payload: [u8; 15] = [
+            status,
+            (handle & 0xFF) as u8,
+            (handle >> 8) as u8,
+            0x01,
+            0x00,
+            0xC0,
+            0xC1,
+            0xC2,
+            0xC3,
+            0xC4,
+            0xC5,
+            0x01,
+            0x50,
+            0x00,
+            0x00,
+        ];
+        let ev = le_meta_event(
+            LeSubevent::PeriodicAdvertisingSyncEstablished as u8,
+            &payload,
+        );
+        LePeriodicAdvSyncEstablished::parse(&ev).expect("fixture established")
+    }
+
+    fn report(handle: u16, status: u8, data: &[u8]) -> LePeriodicAdvReport {
+        let mut payload = vec![
+            (handle & 0xFF) as u8,
+            (handle >> 8) as u8,
+            0x04,
+            0xC4,
+            0xFF,
+            status,
+            data.len() as u8,
+        ];
+        payload.extend_from_slice(data);
+        let ev = le_meta_event(LeSubevent::PeriodicAdvertisingReport as u8, &payload);
+        LePeriodicAdvReport::parse(&ev).expect("fixture report")
+    }
+
+    fn lost(handle: u16) -> LePeriodicAdvSyncLost {
+        let payload: [u8; 2] = [(handle & 0xFF) as u8, (handle >> 8) as u8];
+        let ev = le_meta_event(LeSubevent::PeriodicAdvertisingSyncLost as u8, &payload);
+        LePeriodicAdvSyncLost::parse(&ev).expect("fixture lost")
+    }
+
+    let mut sync = PeriodicSync::new();
+    if sync.phase != PeriodicSyncPhase::Idle {
+        return TestResult::Fail("initial phase not Idle");
+    }
+    // Reports and Sync Lost while Idle are ignored, not crashes.
+    sync.note_report(&report(0x0007, LE_PA_DATA_COMPLETE, &[0xAA]));
+    sync.note_sync_lost(&lost(0x0007));
+    if sync.phase != PeriodicSyncPhase::Idle || sync.reports_received != 0 {
+        return TestResult::Fail("Idle sync accepted a report or lost event");
+    }
+    // Failed establishment returns to Idle.
+    sync.note_create_sync_sent();
+    sync.note_sync_established(&established(0x3E, 0x0007));
+    if sync.phase != PeriodicSyncPhase::Idle {
+        return TestResult::Fail("failed establishment did not return to Idle");
+    }
+    // Successful establishment records the train.
+    sync.note_create_sync_sent();
+    sync.note_sync_established(&established(0x00, 0x0007));
+    if sync.phase != PeriodicSyncPhase::Synced || sync.sync_handle != Some(0x0007) {
+        return TestResult::Fail("establishment did not reach Synced");
+    }
+    if sync.advertising_sid != 0x01 || sync.periodic_interval != 0x0050 {
+        return TestResult::Fail("establishment fields wrong");
+    }
+    // A report for another handle is ignored.
+    sync.note_report(&report(0x0009, LE_PA_DATA_COMPLETE, &[0xAA]));
+    if sync.reports_received != 0 {
+        return TestResult::Fail("foreign-handle report counted");
+    }
+    // A complete report delivers.
+    sync.note_report(&report(0x0007, LE_PA_DATA_COMPLETE, &[0x02, 0x01, 0x06]));
+    if sync.reports_received != 1 || sync.last_report != [0x02, 0x01, 0x06] {
+        return TestResult::Fail("complete report not delivered");
+    }
+    if sync.last_rssi != -60 || sync.last_tx_power != 4 {
+        return TestResult::Fail("report RSSI / Tx Power wrong");
+    }
+    // Fragmented report: More-To-Come accumulates, nothing
+    // delivers until the Complete fragment lands.
+    sync.note_report(&report(0x0007, LE_PA_DATA_MORE_TO_COME, &[0x02, 0x01]));
+    if sync.reports_received != 1 {
+        return TestResult::Fail("partial fragment delivered early");
+    }
+    sync.note_report(&report(0x0007, LE_PA_DATA_COMPLETE, &[0x06]));
+    if sync.reports_received != 2 || sync.last_report != [0x02, 0x01, 0x06] {
+        return TestResult::Fail("fragmented report not reassembled");
+    }
+    // Truncated fragment drops the partial reassembly.
+    sync.note_report(&report(0x0007, LE_PA_DATA_MORE_TO_COME, &[0x02, 0x01]));
+    sync.note_report(&report(0x0007, LE_PA_DATA_TRUNCATED, &[0x06]));
+    sync.note_report(&report(0x0007, LE_PA_DATA_COMPLETE, &[0x09]));
+    if sync.reports_received != 3 || sync.last_report != [0x09] {
+        return TestResult::Fail("truncated fragment poisoned reassembly");
+    }
+    // Sync Lost for a stale handle is ignored; for ours it ends it.
+    sync.note_sync_lost(&lost(0x0009));
+    if sync.phase != PeriodicSyncPhase::Synced {
+        return TestResult::Fail("stale-handle Sync Lost tore the sync down");
+    }
+    sync.note_sync_lost(&lost(0x0007));
+    if sync.phase != PeriodicSyncPhase::Idle || sync.sync_handle.is_some() {
+        return TestResult::Fail("Sync Lost did not return to Idle");
+    }
+    // Terminate flow: refused terminate keeps the sync.
+    sync.note_create_sync_sent();
+    sync.note_sync_established(&established(0x00, 0x0007));
+    sync.note_terminate_sent();
+    if sync.phase != PeriodicSyncPhase::Terminating {
+        return TestResult::Fail("terminate did not reach Terminating");
+    }
+    sync.note_terminated(0x0C);
+    if sync.phase != PeriodicSyncPhase::Synced {
+        return TestResult::Fail("refused terminate did not stay Synced");
+    }
+    sync.note_terminate_sent();
+    sync.note_terminated(0x00);
+    if sync.phase != PeriodicSyncPhase::Idle {
+        return TestResult::Fail("accepted terminate did not return to Idle");
+    }
+    // Cancel flow: only a pending attempt can be cancelled.
+    sync.note_create_sync_sent();
+    sync.note_create_sync_cancelled(0x00);
+    if sync.phase != PeriodicSyncPhase::Idle {
+        return TestResult::Fail("cancel did not return to Idle");
+    }
+    sync.note_create_sync_sent();
+    sync.note_create_sync_rejected();
+    if sync.phase != PeriodicSyncPhase::Idle {
+        return TestResult::Fail("rejected Create Sync did not return to Idle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_periodic_sync_state_machine);
+
+fn smoke_gap_periodic_advertiser_state_machine() -> TestResult {
+    use crate::gap::{PeriodicAdvertiser, PeriodicAdvertiserPhase};
+    let mut adv = PeriodicAdvertiser::new();
+    if adv.phase != PeriodicAdvertiserPhase::Idle {
+        return TestResult::Fail("initial phase not Idle");
+    }
+    // Refused parameters change nothing.
+    adv.note_parameters_sent(0x00);
+    adv.note_parameters_set(0x0C);
+    if adv.phase != PeriodicAdvertiserPhase::Idle {
+        return TestResult::Fail("refused parameters configured the advertiser");
+    }
+    // Accepted parameters configure; refused enable keeps Configured.
+    adv.note_parameters_sent(0x00);
+    adv.note_parameters_set(0x00);
+    if adv.phase != PeriodicAdvertiserPhase::Configured || adv.advertising_handle != Some(0x00) {
+        return TestResult::Fail("accepted parameters did not configure");
+    }
+    adv.note_enable_sent(0x00, true);
+    adv.note_enable_done(0x0C);
+    if adv.phase != PeriodicAdvertiserPhase::Configured {
+        return TestResult::Fail("refused enable moved phase");
+    }
+    adv.note_enable_sent(0x00, true);
+    adv.note_enable_done(0x00);
+    if adv.phase != PeriodicAdvertiserPhase::Enabled {
+        return TestResult::Fail("accepted enable did not reach Enabled");
+    }
+    // Disable drops back to Configured (parameters survive).
+    adv.note_enable_sent(0x00, false);
+    adv.note_enable_done(0x00);
+    if adv.phase != PeriodicAdvertiserPhase::Configured {
+        return TestResult::Fail("disable did not return to Configured");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_periodic_advertiser_state_machine);

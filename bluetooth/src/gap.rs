@@ -558,3 +558,530 @@ impl Central {
         self.phase = CentralPhase::Idle;
     }
 }
+
+// ── LE Periodic Advertising — GAP encoders + state machines ────────
+//
+// Vol 4 Part E §7.8.61..63 (broadcaster: set parameters / data /
+// enable), §7.8.67..69 (receiver: create sync / cancel / terminate),
+// §7.7.65.14..16 (report / sync established / sync lost subevents).
+// OCFs live in `crate::opcode`; the builders here produce only the
+// parameter bytes that go after the 2-byte opcode + 1-byte length in
+// an HCI Command.
+//
+// Two roles, two machines, mirroring `Central`:
+// - `PeriodicAdvertiser` — the broadcaster side: which advertising
+//   handle carries a periodic train and whether it is enabled.
+// - `PeriodicSync` — the receiver side: creating / synced / lost.
+// The pump drives both from `dispatch_event` (inbound subevents +
+// command completions) and the `periodic_adv_*` API (outbound
+// issuance). The state machines themselves are transport-free so
+// they are straightforward to unit-test.
+
+/// Periodic advertising interval bounds (§7.8.61): 0x0006..=0xFFFF
+/// in units of 1.25 ms (7.5 ms..=81.91875 s).
+pub const PER_ADV_INTERVAL_MIN: u16 = 0x0006;
+pub const PER_ADV_INTERVAL_MAX: u16 = 0xFFFF;
+
+/// `Periodic_Advertising_Properties` bits (§7.8.61).
+pub const PER_ADV_PROP_INCLUDE_TX_POWER: u16 = 0x0001;
+pub const PER_ADV_PROP_INCLUDE_ADI: u16 = 0x0040;
+
+/// Maximum periodic advertising data length (§7.8.62):
+/// `Advertising_Data_Length` is 0..=251.
+pub const PER_ADV_DATA_MAX_LEN: usize = 251;
+
+/// `Options` bits for LE Periodic Advertising Create Sync (§7.8.67).
+pub const PA_SYNC_OPT_USE_PERIODIC_ADVERTISER_LIST: u8 = 0x01;
+pub const PA_SYNC_OPT_REPORTING_ENABLED: u8 = 0x02;
+pub const PA_SYNC_OPT_DUPLICATE_FILTERING: u8 = 0x04;
+
+/// `Skip` bounds for Create Sync (§7.8.67): 0x0000..=0x01F3
+/// periodic advertising events the controller may skip.
+pub const PA_SYNC_SKIP_MAX: u16 = 0x01F3;
+
+/// `Sync_Timeout` bounds for Create Sync (§7.8.67): 0x000A..=0x4000
+/// in units of 10 ms (100 ms..=163.84 s).
+pub const PA_SYNC_TIMEOUT_MIN: u16 = 0x000A;
+pub const PA_SYNC_TIMEOUT_MAX: u16 = 0x4000;
+
+/// `Sync_CTE_Type` values for Create Sync (§7.8.67).
+pub const PA_SYNC_CTE_NONE: u8 = 0x00;
+pub const PA_SYNC_CTE_AOA: u8 = 0x01;
+pub const PA_SYNC_CTE_AOD_1US: u8 = 0x02;
+pub const PA_SYNC_CTE_AOD_2US: u8 = 0x03;
+pub const PA_SYNC_CTE_NO_SYNC_TO_CTE: u8 = 0xFF;
+
+/// LE Set Periodic Advertising Parameters payload (§7.8.61).
+/// 7 bytes on the wire.
+#[derive(Copy, Clone, Debug)]
+pub struct PeriodicAdvertisingParameters {
+    pub advertising_handle: u8,
+    pub interval_min: u16,
+    pub interval_max: u16,
+    pub include_tx_power: bool,
+    pub include_adi: bool,
+}
+
+impl PeriodicAdvertisingParameters {
+    /// 100 ms periodic interval (0x0050 * 1.25 ms), Tx Power
+    /// included, ADI omitted — a typical broadcaster default.
+    pub fn for_handle(advertising_handle: u8) -> Self {
+        Self {
+            advertising_handle,
+            interval_min: 0x0050,
+            interval_max: 0x0050,
+            include_tx_power: true,
+            include_adi: false,
+        }
+    }
+
+    /// Spec range check (§7.8.61): both intervals in
+    /// 0x0006..=0xFFFF and min <= max. The controller rejects
+    /// out-of-range intervals with Invalid HCI Command Parameters
+    /// (0x12); the pump refuses to send them at all.
+    pub fn is_valid(&self) -> bool {
+        self.interval_min >= PER_ADV_INTERVAL_MIN
+            && self.interval_max >= PER_ADV_INTERVAL_MIN
+            && self.interval_min <= self.interval_max
+    }
+
+    /// Build the 7-byte parameter block for
+    /// HCI_LE_Set_Periodic_Advertising_Parameters.
+    pub fn encode(&self) -> [u8; 7] {
+        let mut properties: u16 = 0;
+        if self.include_tx_power {
+            properties |= PER_ADV_PROP_INCLUDE_TX_POWER;
+        }
+        if self.include_adi {
+            properties |= PER_ADV_PROP_INCLUDE_ADI;
+        }
+        let min = self.interval_min.to_le_bytes();
+        let max = self.interval_max.to_le_bytes();
+        let props = properties.to_le_bytes();
+        [
+            self.advertising_handle,
+            min[0],
+            min[1],
+            max[0],
+            max[1],
+            props[0],
+            props[1],
+        ]
+    }
+}
+
+/// `Operation` for LE Set Periodic Advertising Data (§7.8.62).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PeriodicAdvDataOperation {
+    /// Intermediate fragment of the periodic advertising data.
+    Intermediate = 0x00,
+    /// First fragment.
+    First = 0x01,
+    /// Last fragment.
+    Last = 0x02,
+    /// Complete periodic advertising data (single fragment).
+    Complete = 0x03,
+    /// Unchanged data (controller re-uses the previous data;
+    /// `Advertising_Data_Length` must be 0).
+    Unchanged = 0x04,
+}
+
+/// Build the parameter block for HCI_LE_Set_Periodic_Advertising_Data
+/// (§7.8.62): advertising_handle (1) + operation (1) +
+/// advertising_data_length (1) + advertising_data (0..=251).
+/// Callers must keep `data.len()` <= [`PER_ADV_DATA_MAX_LEN`] and
+/// pass empty data for [`PeriodicAdvDataOperation::Unchanged`]; the
+/// pump checks both before sending.
+pub fn encode_periodic_adv_data(
+    advertising_handle: u8,
+    operation: PeriodicAdvDataOperation,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + data.len());
+    out.push(advertising_handle);
+    out.push(operation as u8);
+    out.push(data.len() as u8);
+    out.extend_from_slice(data);
+    out
+}
+
+/// LE Set Periodic Advertising Enable payload (§7.8.63). 2 bytes.
+#[derive(Copy, Clone, Debug)]
+pub struct PeriodicAdvertisingEnable {
+    pub enable: bool,
+    pub advertising_handle: u8,
+}
+
+impl PeriodicAdvertisingEnable {
+    pub fn encode(&self) -> [u8; 2] {
+        [self.enable as u8, self.advertising_handle]
+    }
+}
+
+/// LE Periodic Advertising Create Sync payload (§7.8.67). 14 bytes.
+///
+/// `options` is a bitmap of the `PA_SYNC_OPT_*` consts; use
+/// [`PeriodicAdvertisingCreateSync::to_advertiser`] for the common
+/// case (reporting on, duplicate filtering off, sync to a named
+/// advertiser rather than the periodic advertiser list).
+#[derive(Copy, Clone, Debug)]
+pub struct PeriodicAdvertisingCreateSync {
+    pub options: u8,
+    pub advertising_sid: u8,
+    pub advertiser_address_type: PeerAddressType,
+    pub advertiser_address: [u8; 6],
+    pub skip: u16,
+    pub sync_timeout: u16,
+    pub sync_cte_type: u8,
+}
+
+impl PeriodicAdvertisingCreateSync {
+    /// Sync to a named advertiser: reporting initially enabled,
+    /// no duplicate filtering, no periodic events skipped, 10 s
+    /// sync timeout, no CTE sync (0xFF = do not sync to packets
+    /// with a Constant Tone Extension — plain periodic trains
+    /// carry none).
+    pub fn to_advertiser(
+        advertising_sid: u8,
+        advertiser_address_type: PeerAddressType,
+        advertiser_address: [u8; 6],
+    ) -> Self {
+        Self {
+            options: PA_SYNC_OPT_REPORTING_ENABLED,
+            advertising_sid,
+            advertiser_address_type,
+            advertiser_address,
+            skip: 0x0000,
+            // 0x03E8 * 10 ms = 10 s.
+            sync_timeout: 0x03E8,
+            sync_cte_type: PA_SYNC_CTE_NO_SYNC_TO_CTE,
+        }
+    }
+
+    /// Spec range check (§7.8.67): skip <= 0x01F3, timeout in
+    /// 0x000A..=0x4000, CTE type one of 0x00..=0x03 or 0xFF.
+    pub fn is_valid(&self) -> bool {
+        self.skip <= PA_SYNC_SKIP_MAX
+            && self.sync_timeout >= PA_SYNC_TIMEOUT_MIN
+            && self.sync_timeout <= PA_SYNC_TIMEOUT_MAX
+            && (self.sync_cte_type <= PA_SYNC_CTE_AOD_2US
+                || self.sync_cte_type == PA_SYNC_CTE_NO_SYNC_TO_CTE)
+    }
+
+    /// Build the 14-byte parameter block for
+    /// HCI_LE_Periodic_Advertising_Create_Sync.
+    pub fn encode(&self) -> [u8; 14] {
+        let mut out = [0u8; 14];
+        out[0] = self.options;
+        out[1] = self.advertising_sid;
+        out[2] = self.advertiser_address_type as u8;
+        out[3..9].copy_from_slice(&self.advertiser_address);
+        out[9..11].copy_from_slice(&self.skip.to_le_bytes());
+        out[11..13].copy_from_slice(&self.sync_timeout.to_le_bytes());
+        out[13] = self.sync_cte_type;
+        out
+    }
+}
+
+/// LE Periodic Advertising Terminate Sync parameter block (§7.8.69).
+/// 2 bytes: sync_handle (2 LE).
+pub fn build_periodic_adv_terminate_sync(sync_handle: u16) -> [u8; 2] {
+    sync_handle.to_le_bytes()
+}
+
+// ── Broadcaster side ────────────────────────────────────────────────
+
+/// Phases the periodic advertiser walks during train setup.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum PeriodicAdvertiserPhase {
+    /// No periodic parameters configured for any handle.
+    #[default]
+    Idle,
+    /// Parameters accepted for a handle; data may be set and the
+    /// train may be enabled.
+    Configured,
+    /// Train enabled on the configured handle.
+    Enabled,
+}
+
+/// Broadcaster-side periodic advertising state. The pump issues the
+/// §7.8.61..63 commands; this machine records what the controller
+/// has accepted, so the API can refuse enable-before-configure and
+/// data-for-the-wrong-handle instead of sending a command the
+/// controller must reject.
+#[derive(Debug, Default)]
+pub struct PeriodicAdvertiser {
+    pub phase: PeriodicAdvertiserPhase,
+    /// Handle the accepted parameters belong to, if any.
+    pub advertising_handle: Option<u8>,
+    /// Handle whose Set Parameters command is in flight (set at
+    /// send time, consumed by the Command Complete).
+    pending_handle: Option<u8>,
+    /// (handle, enable) of an in-flight Set Enable command.
+    pending_enable: Option<(u8, bool)>,
+}
+
+impl PeriodicAdvertiser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark a Set Periodic Advertising Parameters command sent.
+    pub fn note_parameters_sent(&mut self, advertising_handle: u8) {
+        self.pending_handle = Some(advertising_handle);
+    }
+
+    /// Apply the Command Complete for Set Parameters: on success
+    /// the handle is configured; on failure nothing changes and a
+    /// retry from Idle/Configured is still possible. Re-setting
+    /// parameters for the already-enabled handle keeps the train
+    /// Enabled.
+    pub fn note_parameters_set(&mut self, status: u8) {
+        if let (0, Some(handle)) = (status, self.pending_handle.take()) {
+            let was_enabled = self.phase == PeriodicAdvertiserPhase::Enabled
+                && self.advertising_handle == Some(handle);
+            self.advertising_handle = Some(handle);
+            self.phase = if was_enabled {
+                PeriodicAdvertiserPhase::Enabled
+            } else {
+                PeriodicAdvertiserPhase::Configured
+            };
+        }
+    }
+
+    /// Mark a Set Periodic Advertising Enable command sent.
+    pub fn note_enable_sent(&mut self, advertising_handle: u8, enable: bool) {
+        self.pending_enable = Some((advertising_handle, enable));
+    }
+
+    /// Apply the Command Complete for Set Enable: on success the
+    /// phase follows the requested direction; on failure the phase
+    /// is unchanged.
+    pub fn note_enable_done(&mut self, status: u8) {
+        match (status, self.pending_enable.take()) {
+            (0, Some((handle, true))) => {
+                self.advertising_handle = Some(handle);
+                self.phase = PeriodicAdvertiserPhase::Enabled;
+            }
+            (0, Some((_, false))) => {
+                // Disabling drops back to Configured (parameters
+                // survive; the train can be re-enabled).
+                if self.phase == PeriodicAdvertiserPhase::Enabled {
+                    self.phase = PeriodicAdvertiserPhase::Configured;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Receiver side ───────────────────────────────────────────────────
+
+/// Phases the periodic-sync receiver walks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum PeriodicSyncPhase {
+    /// No sync in progress or established.
+    #[default]
+    Idle,
+    /// Create Sync issued, awaiting Sync Established (or a
+    /// Command Status rejection).
+    Creating,
+    /// Sync established; reports are being received.
+    Synced,
+    /// Terminate Sync issued, awaiting its Command Complete.
+    Terminating,
+}
+
+/// Receiver-side periodic advertising sync state. Transport-free:
+/// the pump feeds it parsed subevents and command completions, and
+/// it reassembles fragmented reports (Data_Status 0x01 fragments
+/// accumulate until a 0x00 complete fragment lands; a 0x02
+/// truncated fragment discards the partial reassembly, matching
+/// the kernel's `iso_connect_ind` reassembly discipline).
+///
+/// A reassembled train payload is at most [`PER_ADV_DATA_MAX_LEN`]
+/// bytes (§7.8.62); a fragment run that would exceed that is
+/// discarded rather than grown without bound.
+#[derive(Debug, Default)]
+pub struct PeriodicSync {
+    pub phase: PeriodicSyncPhase,
+    /// Sync handle from the Sync Established subevent, while Synced
+    /// (or Terminating).
+    pub sync_handle: Option<u16>,
+    pub advertising_sid: u8,
+    pub advertiser_address_type: u8,
+    pub advertiser_address: [u8; 6],
+    pub advertiser_phy: u8,
+    pub periodic_interval: u16,
+    pub advertiser_clock_accuracy: u8,
+    /// Complete (reassembled) reports delivered so far.
+    pub reports_received: u32,
+    /// Most recent complete report payload (AD records, verbatim).
+    pub last_report: Vec<u8>,
+    pub last_rssi: i8,
+    pub last_tx_power: i8,
+    /// Partial reassembly of an in-flight fragmented report.
+    fragment: Vec<u8>,
+}
+
+impl PeriodicSync {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark a Create Sync command sent.
+    pub fn note_create_sync_sent(&mut self) {
+        self.phase = PeriodicSyncPhase::Creating;
+    }
+
+    /// The controller rejected Create Sync outright (Command Status
+    /// != 0): no sync will ever be established for this attempt.
+    pub fn note_create_sync_rejected(&mut self) {
+        if self.phase == PeriodicSyncPhase::Creating {
+            self.phase = PeriodicSyncPhase::Idle;
+        }
+    }
+
+    /// Apply the Command Complete for Create Sync Cancel: on
+    /// success the pending attempt is gone.
+    pub fn note_create_sync_cancelled(&mut self, status: u8) {
+        if self.phase == PeriodicSyncPhase::Creating && status == 0 {
+            self.phase = PeriodicSyncPhase::Idle;
+        }
+    }
+
+    /// Apply a Sync Established subevent (§7.7.65.15). Only a
+    /// pending attempt (Creating) can be established; a stale or
+    /// duplicate subevent is ignored. A failed establishment
+    /// (status != 0) returns to Idle.
+    pub fn note_sync_established(&mut self, est: &crate::event::LePeriodicAdvSyncEstablished) {
+        if self.phase != PeriodicSyncPhase::Creating {
+            return;
+        }
+        if est.status != 0 {
+            self.phase = PeriodicSyncPhase::Idle;
+            return;
+        }
+        self.sync_handle = Some(est.sync_handle);
+        self.advertising_sid = est.advertising_sid;
+        self.advertiser_address_type = est.advertiser_address_type;
+        self.advertiser_address = est.advertiser_address;
+        self.advertiser_phy = est.advertiser_phy;
+        self.periodic_interval = est.periodic_advertising_interval;
+        self.advertiser_clock_accuracy = est.advertiser_clock_accuracy;
+        self.fragment.clear();
+        self.phase = PeriodicSyncPhase::Synced;
+    }
+
+    /// Apply one Periodic Advertising Report (§7.7.65.14). Reports
+    /// for another sync handle, or while not Synced, are ignored —
+    /// a residual report racing a Sync Lost / Terminate must not
+    /// resurrect state. Complete fragments deliver the reassembled
+    /// payload; More-To-Come fragments accumulate (bounded by
+    /// [`PER_ADV_DATA_MAX_LEN`]); Truncated fragments drop the
+    /// partial reassembly.
+    pub fn note_report(&mut self, report: &crate::event::LePeriodicAdvReport) {
+        if self.phase != PeriodicSyncPhase::Synced {
+            return;
+        }
+        if self.sync_handle != Some(report.sync_handle) {
+            return;
+        }
+        self.last_rssi = report.rssi;
+        self.last_tx_power = report.tx_power;
+        match report.data_status {
+            crate::event::LE_PA_DATA_COMPLETE => {
+                let mut assembled = core::mem::take(&mut self.fragment);
+                assembled.extend_from_slice(&report.data);
+                self.last_report = assembled;
+                self.reports_received += 1;
+            }
+            crate::event::LE_PA_DATA_MORE_TO_COME => {
+                if self.fragment.len() + report.data.len() <= PER_ADV_DATA_MAX_LEN {
+                    self.fragment.extend_from_slice(&report.data);
+                } else {
+                    // Over-long fragment run: the train is
+                    // misbehaving; drop the partial reassembly
+                    // rather than grow without bound.
+                    self.fragment.clear();
+                }
+            }
+            crate::event::LE_PA_DATA_TRUNCATED => {
+                self.fragment.clear();
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply a Sync Lost subevent (§7.7.65.16). Only the matching
+    /// handle tears the sync down; a lost event for a stale handle
+    /// is ignored.
+    pub fn note_sync_lost(&mut self, lost: &crate::event::LePeriodicAdvSyncLost) {
+        if self.sync_handle != Some(lost.sync_handle) {
+            return;
+        }
+        self.clear_sync();
+    }
+
+    /// Mark a Terminate Sync command sent.
+    pub fn note_terminate_sent(&mut self) {
+        if self.phase == PeriodicSyncPhase::Synced {
+            self.phase = PeriodicSyncPhase::Terminating;
+        }
+    }
+
+    /// Apply the Command Complete for Terminate Sync: on success
+    /// the sync is gone; on failure the sync is still up.
+    pub fn note_terminated(&mut self, status: u8) {
+        if self.phase != PeriodicSyncPhase::Terminating {
+            return;
+        }
+        if status == 0 {
+            self.clear_sync();
+        } else {
+            self.phase = PeriodicSyncPhase::Synced;
+        }
+    }
+
+    fn clear_sync(&mut self) {
+        self.phase = PeriodicSyncPhase::Idle;
+        self.sync_handle = None;
+        self.fragment.clear();
+    }
+
+    /// Snapshot of the receiver-visible sync state, for the pump
+    /// API / fixtures. The in-flight fragment is intentionally not
+    /// exposed: only complete reports are observable.
+    pub fn snapshot(&self) -> PeriodicSyncSnapshot {
+        PeriodicSyncSnapshot {
+            phase: self.phase,
+            sync_handle: self.sync_handle,
+            advertising_sid: self.advertising_sid,
+            advertiser_address_type: self.advertiser_address_type,
+            advertiser_address: self.advertiser_address,
+            advertiser_phy: self.advertiser_phy,
+            periodic_interval: self.periodic_interval,
+            reports_received: self.reports_received,
+            last_report: self.last_report.clone(),
+            last_rssi: self.last_rssi,
+            last_tx_power: self.last_tx_power,
+        }
+    }
+}
+
+/// Receiver-visible periodic-sync state (see [`PeriodicSync::snapshot`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeriodicSyncSnapshot {
+    pub phase: PeriodicSyncPhase,
+    pub sync_handle: Option<u16>,
+    pub advertising_sid: u8,
+    pub advertiser_address_type: u8,
+    pub advertiser_address: [u8; 6],
+    pub advertiser_phy: u8,
+    pub periodic_interval: u16,
+    pub reports_received: u32,
+    pub last_report: Vec<u8>,
+    pub last_rssi: i8,
+    pub last_tx_power: i8,
+}

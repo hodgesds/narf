@@ -265,7 +265,10 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   packet codec, Mandatory + LE-basics opcodes, Command Complete /
   Command Status decoders, transport trait + USB class triple, full
   bring-up state machine (Reset → Read Local Version → Read BD_ADDR
-  → Read Buffer Size → Set Event Mask).
+  → Read Buffer Size → Set Event Mask). Periodic advertising
+  opcodes (§7.8.61..63, §7.8.67..69) + LE Meta subevent parsers
+  for Sync Established / Report / Sync Lost (§7.7.65.14..16,
+  subevents 0x0E..0x10).
 - **HCI pump** (`pump`): supervised per-controller event/ACL pump task
   composing the layers below into a running system — connection table,
   ACL flow control, raw-socket event fan-out, per-connection L2CAP
@@ -274,6 +277,12 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   (§3.6.1 Phase 3 distribution, bond store, re-encryption), LE +
   BR/EDR signalling answers, dynamic CIDs → open channel servers).
   Production `SmpCrypto` via narf-crypto (`NarfSmpCrypto`).
+  Periodic advertising (`periodic_adv_*` API, #1560): broadcaster
+  parameters / data / enable (§7.8.61..63) and receiver sync
+  Create / Cancel / Terminate (§7.8.67..69) with the
+  `PeriodicSync` receiver machine (Creating → Synced → Idle on
+  Sync Lost / Terminate, fragmented-report reassembly bounded at
+  251 bytes) driven by the §7.7.65.14..16 subevents.
 - **L2CAP** (`l2cap`): CID constants, B-frame codec, ACL fragment
   reassembler that handles the PB-flag rules from Vol 4 Part E §5.4.2,
   signalling-command codec + iterator, dynamic CID allocator, LE
@@ -342,7 +351,10 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   Data / 16-bit Service UUID list / Service Data, decoders for the
   same plus convenience helpers (find by AD type, local_name,
   flags, tx_power, manufacturer_data, service_uuids_16). AD type +
-  flags-byte constants per Assigned Numbers.
+  flags-byte constants per Assigned Numbers. Periodic advertising
+  encoders (`PeriodicAdvertisingParameters` / Data / Enable /
+  CreateSync, §7.8.61..63, §7.8.67) + the transport-free
+  `PeriodicAdvertiser` / `PeriodicSync` state machines.
 - **Mesh** (`mesh`): clean-room Bluetooth Mesh codec. Network PDU
   header (9 bytes — IVI/NID + CTL/TTL + 24-bit BE SEQ + SRC + DST),
   Lower Transport segmented Access PDU header (4 bytes — SEG/AKF/AID
