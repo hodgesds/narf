@@ -48,6 +48,27 @@ implements ETHTOOL_SETEEPROM (0x0c): igc writes shadow RAM via SRWR and
 updates the NVM checksum plus the flash commit; drivers without NVM write
 support refuse with -EOPNOTSUPP, and a bad EEPROM magic fails with -EFAULT.
 
+The ethtool surface mirrors Linux `igc_ethtool_ops`: `msglevel` /
+`set_msglevel` (`GMSGLVL` / `SMSGLVL`), `priv_flags` / `set_priv_flags` /
+`priv_flag_names` (`GPFLAGS` / `SPFLAGS`, `GSTRINGS` sset 2, `GDRVINFO`
+`n_priv_flags`), `rxfh_fields` / `set_rxfh_fields` (`GRXFH` / `SRXFH`,
+RXH-bit fields per flow type) plus the legacy 128-entry RXFH indirection
+(`GRXFHINDIR` / `SRXFHINDIR`), `mm_stats` (the `MM_GET` stats nest when
+`ETHTOOL_FLAG_STATS` is set), `registers_version` (the `GREGS` version
+word, `(2 << 24) | (revision << 16) | device_id` for igc), and
+`check_coalesce` (the Linux `set_coalesce` usecs rule: reject > 10000, 2,
+and 4..9; non-usecs fields are ignored). `GDRVINFO` also carries the
+driver firmware version. The `GREGS` dump is the 740-word Linux igc
+layout, with statistics words taken from the accumulated counters (never
+a live clear-on-read register), and `statistics()` appends the Linux
+global, net and per-queue statistic names after the driver's own names.
+Link ksettings use 2-word masks; advertising carries TP always and
+speeds / Pause / Asym_Pause only while autoneg is on, and a set must
+advertise a subset of supported modes. `GPERMADDR`, NVM writes
+(`SEEEPROM`), full RXNFC rule fields, MM set rounding and the shared
+codec's 32-rule flow cap remain unimplemented (see the igc ethtool
+surface-gaps issue).
+
 `enable_zero_copy_tx_context` preserves an owned-frame device cookie alongside
 queue-local recycling. `Frame::tx_timing` carries an optional hardware timestamp
 cookie, PHC launch time and queue; `RxMeta::timestamp_ns` carries the hardware

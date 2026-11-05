@@ -176,7 +176,7 @@ const FAILED: u8 = 4;
 const ADMIN_DOWN: u8 = 5;
 const REMOVED: u8 = 6;
 #[path = "control.rs"]
-mod control;
+pub(crate) mod control;
 const OFFLOADS: OffloadCapabilities = OffloadCapabilities {
     tx_checksum: true,
     rx_checksum: true,
@@ -259,6 +259,10 @@ pub struct IgcStats {
     pub rx_drops: u64,
     pub tx_rejected: u64,
     pub resets: u64,
+    /// TX stall recoveries (Linux `tx_timeout_count`): the supervisor
+    /// recovers a queue stalled 5s, mirroring `ndo_tx_timeout` + the TX
+    /// hang detection that increment Linux's counter.
+    pub tx_timeouts: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -281,7 +285,20 @@ pub struct Igc {
     ptp: IrqSafeSpinLock<crate::ptp::ClockState>,
     phc_index: core::sync::atomic::AtomicI32,
     counters: IrqSafeSpinLock<crate::counters::Counters>,
-    queue_history: IrqSafeSpinLock<[[u64; 8]; 4]>,
+    queue_history: IrqSafeSpinLock<[[u64; 10]; 4]>,
+    /// Linux `msg_enable` (ETHTOOL_GMSGLVL/SMSGLVL). Default is
+    /// DEFAULT_MSG_ENABLE = NETIF_MSG_DRV | NETIF_MSG_PROBE | NETIF_MSG_LINK.
+    msglevel: IrqSafeSpinLock<u32>,
+    /// Linux private flags (ETHTOOL_GPFLAGS/SPFLAGS): bit 0 `legacy-rx`
+    /// (stored only; no datapath consumer in Linux igc either), bit 1
+    /// `reverse-tsn-txq-prio` (reverses TXARB under an active TSN schedule).
+    priv_flags: IrqSafeSpinLock<u32>,
+    /// UDP RSS L4 hashing (Linux IGC_FLAG_RSS_FIELD_IPV4/6_UDP), set via
+    /// ETHTOOL_SRXFH. Off by default, matching Linux igc_setup_mrqc.
+    rss_udp: IrqSafeSpinLock<(bool, bool)>,
+    /// PCI Revision ID (config offset 8, low byte), for the ethtool regs
+    /// version word. Read once at bring-up; 0 when the config read fails.
+    pci_revision: u8,
     schedule: IrqSafeSpinLock<crate::traffic::Schedule>,
     flows: IrqSafeSpinLock<Vec<narf_net::nic::FlowRule>>,
     merge: IrqSafeSpinLock<crate::merge::Merge>,
@@ -364,6 +381,10 @@ impl Igc {
         let hw = Hardware { mmio, cap: *cap };
         hardware::reset(&hw, 4)?;
         let mac = hardware::read_mac(&hw)?;
+        // PCI Revision ID is config-space offset 8, low byte.
+        let pci_revision = narf_bus::pci::read_config32(cap, device, 8)
+            .map(|v| v as u8)
+            .unwrap_or(0);
         let mut queues = Vec::new();
         let count = narf_scheduler::online_cpu_set().len().clamp(1, 4) as usize;
         for _ in 0..count {
@@ -389,7 +410,11 @@ impl Igc {
             ptp: IrqSafeSpinLock::new(crate::ptp::ClockState::new()),
             phc_index: core::sync::atomic::AtomicI32::new(-1),
             counters: IrqSafeSpinLock::new(crate::counters::Counters::new()),
-            queue_history: IrqSafeSpinLock::new([[0; 8]; 4]),
+            queue_history: IrqSafeSpinLock::new([[0; 10]; 4]),
+            msglevel: IrqSafeSpinLock::new(0x7),
+            priv_flags: IrqSafeSpinLock::new(0),
+            rss_udp: IrqSafeSpinLock::new((false, false)),
+            pci_revision,
             schedule: IrqSafeSpinLock::new(
                 crate::traffic::Schedule::validate(Default::default(), count, 0).unwrap(),
             ),
@@ -605,6 +630,10 @@ impl Igc {
         }
         self.restore_clock()?;
         let now = crate::ptp::read(&self.hw)?;
+        // Read the private flags before taking the schedule lock: the
+        // reverse flag is applied by Schedule::apply, and taking the locks
+        // in the other order would invert with set_priv_flags.
+        let reverse_txq_prio = *self.priv_flags.lock() & 0x2 != 0;
         let mut schedule = self.schedule.lock();
         *schedule =
             crate::traffic::Schedule::validate(schedule.config.clone(), self.num_queues(), now)
@@ -625,6 +654,7 @@ impl Igc {
                     | IGC_I226_LMVP
                     | IGC_I226_BLANK_NVM
             ),
+            reverse_txq_prio,
         );
         for (q, queue) in self.queues().iter().enumerate() {
             // Reject permanently closed queues during the configuration
@@ -1335,6 +1365,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Some("0.1.0"),
         alloc::format!("{:?}", device.addr),
     );
+    // Firmware version for ETHTOOL_GDRVINFO (Linux igc_ethtool_get_drvinfo):
+    // best-effort; a failed NVM/PHY read leaves the field blank and never
+    // fails probe.
+    if let Some(fw) = crate::hardware::fw_version(&controller.hw) {
+        narf_net::iface::set_driver_fw_version(controller.name(), fw);
+    }
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -1668,6 +1704,7 @@ fn spawn_pumps(
                     .iter()
                     .any(|q| q.stalled(narf_time::now_cycles(), timeout))
             {
+                device.stats.lock().tx_timeouts += 1;
                 let _ = device.recover();
             }
             narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000)).await;

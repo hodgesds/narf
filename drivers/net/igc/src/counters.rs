@@ -124,6 +124,20 @@ impl Counters {
             .position(|c| c.1 == reg)
             .map_or(0, |i| self.totals[i])
     }
+    /// MAC Merge statistics in Linux `igc_ethtool_get_mm_stats` shape.
+    /// PRMEXCPRCNT (0x42a0) packs four 8-bit error fields: SMD errors in
+    /// bits [7:0], frame-count errors [15:8], fragment-count errors [23:16],
+    /// missing frame/fragment [31:24]; the assembly-error count is the sum
+    /// of the last three.
+    pub fn mm_stats(&self) -> narf_net::nic::MmStats {
+        narf_net::nic::MmStats {
+            reassembly_errors: self.merge_errors[1] + self.merge_errors[2] + self.merge_errors[3],
+            smd_errors: self.merge_errors[0],
+            reassembly_ok: self.value(0x4284),
+            rx_frag_count: self.value(0x429c),
+            tx_frag_count: self.value(0x4298),
+        }
+    }
     pub fn snapshot(&self) -> Vec<narf_net::nic::Statistic> {
         let mut out = COUNTERS
             .iter()

@@ -11,6 +11,12 @@ pub(crate) struct ClockState {
     pub pending: [Option<(u64, u64)>; 4],
     pub events: VecDeque<Timestamp>,
     pub timeouts: u64,
+    /// Requested TX timestamps the driver could not take (Linux
+    /// `tx_hwtstamp_skipped`): no free timestamp register, or the software
+    /// event queue full. A request that fails because TX timestamping is
+    /// disabled is not counted — the send itself fails, so no timestamp
+    /// was owed.
+    pub skipped: u64,
     pub quarantined: u8,
 }
 impl ClockState {
@@ -22,6 +28,7 @@ impl ClockState {
             pending: [None; 4],
             events: VecDeque::new(),
             timeouts: 0,
+            skipped: 0,
             quarantined: 0,
         }
     }
@@ -30,9 +37,11 @@ impl ClockState {
             return Err(IgcError::Other("TX timestamping disabled"));
         }
         if self.events.len() >= 252 {
+            self.skipped += 1;
             return Err(IgcError::Other("timestamp event queue full"));
         }
         if self.pending[queue].is_some() || self.quarantined & (1 << queue) != 0 {
+            self.skipped += 1;
             return Err(IgcError::Other("TX timestamp register busy"));
         }
         self.pending[queue] = Some((cookie, now));

@@ -204,6 +204,9 @@ pub struct NetIfaceEntry {
     /// Empty `driver` = no driver info (Linux answers -EOPNOTSUPP).
     pub driver: &'static str,
     pub driver_version: Option<&'static str>,
+    /// Linux `ETHTOOL_GDRVINFO` firmware version (`"%x:%x"` of NVM image +
+    /// PHY firmware for igc). `None` leaves the field blank.
+    pub fw_version: Option<String>,
     pub bus_info: String,
     /// `dev->promiscuity`: references taken by `dev_set_promiscuity`.
     pub promiscuity: u32,
@@ -304,6 +307,29 @@ pub fn set_driver_info(
         entry.driver_version = driver_version;
         entry.bus_info = bus_info;
     }
+}
+
+/// Record the firmware version `ETHTOOL_GDRVINFO` reports for `name`.
+/// A driver calls this after [`set_driver_info`] when it can read a
+/// firmware version; unset means the field is left blank.
+pub fn set_driver_fw_version(name: &str, fw_version: String) {
+    if let Some(entry) = IFACES
+        .lock()
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
+    {
+        entry.fw_version = Some(fw_version);
+    }
+}
+
+/// Firmware version recorded by [`set_driver_fw_version`], if any.
+pub fn driver_fw_version(name: &str) -> Option<String> {
+    let g = IFACES.lock();
+    g.as_ref()?
+        .iter()
+        .find(|entry| entry.name == name)?
+        .fw_version
+        .clone()
 }
 
 /// Record the transmit/receive offloads interface `name`'s send path honors.
@@ -866,6 +892,7 @@ fn register_inner(
         ifindex,
         driver: "",
         driver_version: None,
+        fw_version: None,
         bus_info: String::new(),
         promiscuity,
         allmulti,

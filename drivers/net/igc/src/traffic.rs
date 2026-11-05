@@ -104,7 +104,7 @@ impl Schedule {
             || self.config.launch_time_queues != 0
             || self.config.preemptible_queues != 0
     }
-    pub fn apply(&self, r: &impl Registers, queues: usize, i226: bool) {
+    pub fn apply(&self, r: &impl Registers, queues: usize, i226: bool, reverse_txq_prio: bool) {
         if !self.active() {
             r.write(0x3570, 0);
             for q in 0..4 {
@@ -112,7 +112,17 @@ impl Schedule {
             }
             r.write(0x355c, 0x98);
             r.write(0x3310, 0);
+            // Linux igc_tsn_disable restores the default TX arbitration
+            // (queue 0 highest priority).
+            write_txarb(r, false);
             return;
+        }
+        // Linux igc_tsn_enable reverses TX arbitration when the
+        // reverse-tsn-txq-prio private flag is set (or strict priority is
+        // enabled; NARF has no strict-priority marker yet, so only the flag
+        // reverses here).
+        if reverse_txq_prio {
+            write_txarb(r, true);
         }
         adjust_offset(r);
         r.write(0x355c, 0x19);
@@ -178,6 +188,15 @@ impl Schedule {
             next: time >= end,
         })
     }
+}
+
+/// TX arbitration priority fields (Linux `igc_tsn_tx_arb`, IGC_TXARB
+/// 0x3354): the four 2-bit queue-priority fields occupy the low byte;
+/// reversed is 0x1B (queue 3 highest), normal is 0xE4 (queue 0 highest).
+/// Read-modify-write preserves the other TXARB bits.
+fn write_txarb(r: &impl Registers, reverse: bool) {
+    let txarb = (r.read(0x3354) & !0xff) | if reverse { 0x1b } else { 0xe4 };
+    r.write(0x3354, txarb);
 }
 
 pub(crate) fn validate_flows(rules: &[FlowRule], queues: usize, unicast: usize) -> Result<(), i32> {
