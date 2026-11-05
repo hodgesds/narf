@@ -763,7 +763,7 @@ impl Ixgbe {
         //    at their own 0x40-strided blocks.
         let ring_len = queue_config.ring_len;
         let ring_bytes = ring_len * 16;
-        let ring_alloc = (ring_bytes + 4095) / 4096 * 4096;
+        let ring_alloc = ring_bytes.div_ceil(4096) * 4096;
         let mut tx_queues: Vec<TxQueueState> = Vec::with_capacity(queue_config.num_tx);
         for q in 0..queue_config.num_tx {
             let tx_ring =
