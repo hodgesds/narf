@@ -40,7 +40,10 @@ pub(super) trait Io {
         narf_scheduler::responsive_spin_until(|| false, Deadline::after_us(us));
     }
 }
-struct Mmio<'a>(&'a MmioRegion);
+/// BAR-window adapter shared with the BE EFUSE path
+/// (`efuse_be::BeFactory::read`); same owned-register contract as
+/// [`read_mac`].
+pub(super) struct Mmio<'a>(pub(super) &'a MmioRegion);
 impl Io for Mmio<'_> {
     fn read8(&mut self, a: u64) -> u8 {
         // SAFETY: read_mac's owned-register contract.

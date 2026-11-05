@@ -60,6 +60,10 @@ pub struct Rtw89Device {
     pub tx_ring_dma: Vec<DmaBuffer>,
     pub rx_ring_dma: Vec<DmaBuffer>,
     pub rx_buffers: Vec<Vec<DmaBuffer>>,
+    /// Prepared 8922A transport owner (chip-row step 5): factory
+    /// identity, station pool, BE data + H2C transport, ring state.
+    /// `None` for AX chips, whose transport stays with `native_tx`.
+    pub(crate) be_8922a: Option<IrqSafeSpinLock<super::prepared_8922a::Prepared8922a>>,
     pub irq_vector: Option<u8>,
 }
 
@@ -185,25 +189,46 @@ unsafe fn bring_up_registers(
     }
 
     let chip_id = ChipId::from_pci_did(device.id.device).ok_or(ProbeError::UnknownChip)?;
-    if chip_id == ChipId::Rtl8922A {
-        return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip));
-    }
+    // RTL8922A is admitted here (chip-row step 5): its power-on
+    // prologue, factory read, and transport owner are the BE
+    // variants below. Ring programming itself stays with the future
+    // mac_pre_init owner (`Prepared8922a::program_rings`).
+    let is_8922a = chip_id == ChipId::Rtl8922A;
 
     // SAFETY: BAR2 mapped + owned.
     unsafe {
-        mac::baseline_power_on(&mmio_bar2).map_err(ProbeError::PowerOn)?;
+        if is_8922a {
+            mac::baseline_power_on_be(&mmio_bar2).map_err(ProbeError::PowerOn)?;
+        } else {
+            mac::baseline_power_on(&mmio_bar2).map_err(ProbeError::PowerOn)?;
+        }
     }
 
     // SAFETY: `mmio_bar2` is the just-mapped, caller-owned BAR2 region; reading
     // the chip-version field (`R_AX_SYS_CFG1`) is an MMIO read of a valid,
-    // in-range device register on this owned window.
+    // in-range device register on this owned window. Linux reads `cv`
+    // from this register for every generation (`core.c:7134`).
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let chip_version = unsafe { mac::read_chip_version(&mmio_bar2) };
-    // SAFETY: `mmio_bar2` is the caller-owned BAR2 region; `efuse::read_mac`
-    // only touches in-range EFUSE registers on this owned window.
+    // 8922A reads its factory identity (MAC + RFE + PHY-cap + cut +
+    // thermal) through the BE EFUSE protocol; AX chips use the AX map.
+    // The factory is retained for the Prepared owner below.
+    let mut factory_8922a = None;
+    // SAFETY: `mmio_bar2` is the caller-owned BAR2 region; the EFUSE
+    // readers only touch in-range EFUSE registers on this owned window.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let mac =
-        unsafe { efuse::read_mac(&mmio_bar2, chip_id, chip_version) }.map_err(ProbeError::Efuse)?;
+    let mac = if is_8922a {
+        let factory = unsafe { super::efuse_be::read_factory(&mmio_bar2, chip_version) }
+            .map_err(|error| ProbeError::Efuse(error.as_efuse_error()))?;
+        if !efuse::mac_is_valid(factory.mac) {
+            return Err(ProbeError::Efuse(efuse::EfuseError::MacUninitialized));
+        }
+        let mac = factory.mac;
+        factory_8922a = Some(factory);
+        mac
+    } else {
+        unsafe { efuse::read_mac(&mmio_bar2, chip_id, chip_version) }.map_err(ProbeError::Efuse)?
+    };
 
     // No interrupt delivery is enabled until a complete firmware/ring owner
     // installs and owns its actual completion path.
@@ -214,11 +239,16 @@ unsafe fn bring_up_registers(
 
     let mut tx_rings = Vec::new();
     let mut tx_ring_dma = Vec::new();
+    // AX chips keep the native (AX-header) TX queues; 8922A owns
+    // its queues inside the Prepared owner (`DataTx`: 12 data
+    // channels + CH12 H2C) instead, so no AX queue is built for it.
     let mut native_tx = Vec::new();
-    for ch in 0..12 {
-        native_tx.push(IrqSafeSpinLock::new(
-            TxQueue::new(ch, DEFAULT_TXBD_NUM).map_err(|_| ProbeError::NoMemory)?,
-        ));
+    if !is_8922a {
+        for ch in 0..12 {
+            native_tx.push(IrqSafeSpinLock::new(
+                TxQueue::new(ch, DEFAULT_TXBD_NUM).map_err(|_| ProbeError::NoMemory)?,
+            ));
+        }
     }
     for ch in 0..TXCH_NUM as u8 {
         let buf = alloc_coherent(tx_ring_bytes(DEFAULT_TXBD_NUM), DomainId::DRIVER_0)
@@ -282,6 +312,19 @@ unsafe fn bring_up_registers(
 
     // The diagnostic owns unpublished storage only. Ring base/index/BDRAM
     // writes belong to the future verified firmware/DLE/HFC/reset owner.
+    // 8922A: retain the Prepared transport owner (station pool, BE
+    // data + H2C transport, ring state) for that owner to drive;
+    // ring programming itself is NOT done here — Linux programs the
+    // rings in `rtw89_pci_ops_mac_pre_init_be` /
+    // `rtw89_pci_ops_reset`, after the DMA pre-init halves and the
+    // MAC reset (`Prepared8922a::program_rings`).
+    let be_8922a = match factory_8922a {
+        Some(factory) => Some(IrqSafeSpinLock::new(
+            super::prepared_8922a::Prepared8922a::new(factory, chip_version)
+                .map_err(|_| ProbeError::NoMemory)?,
+        )),
+        None => None,
+    };
     Ok(Rtw89Device {
         bus_addr: device.addr,
         cap: *cap,
@@ -296,6 +339,7 @@ unsafe fn bring_up_registers(
         tx_ring_dma,
         rx_ring_dma,
         rx_buffers,
+        be_8922a,
         irq_vector,
     })
 }
@@ -471,6 +515,241 @@ impl Rtw89Device {
             statuses.push(done.status);
         }
         Ok(statuses)
+    }
+
+    /// BE data submit for a probed 8922A device: build the 32-byte
+    /// v2 TXWD body, reserve a slot + fill the TXBD through the
+    /// Prepared owner, then publish + ring the doorbell. No current
+    /// probe/network callback invokes it: firmware, RF and the
+    /// mac_pre_init ring programming still need a single runtime
+    /// owner. The header + frame DMA buffers are retained by the
+    /// owner until the matching RPQ release retires them
+    /// (`complete_be_report`).
+    ///
+    /// # Safety
+    /// Caller has initialized firmware/station rate state, admitted
+    /// the `info.mac_id` station, and programmed the rings through
+    /// the Prepared owner; no reset/removal can race. `frame` is an
+    /// unprotected, non-QoS native MPDU.
+    pub(super) unsafe fn submit_be_data(
+        &self,
+        info: super::txrx_be::TxwdBeInfo,
+        frame: &[u8],
+    ) -> Result<Ticket, super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller's live initialized ring/no-reset contract.
+            unsafe { self.submit_be_data_authorized(info, frame) }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn submit_be_data_authorized(
+        &self,
+        info: super::txrx_be::TxwdBeInfo,
+        frame: &[u8],
+    ) -> Result<Ticket, super::prepared_8922a::Error> {
+        use super::dma::{TxBd, DEFAULT_TXBD_NUM};
+        use super::prepared_8922a::{Error, MAX_HEADER_BYTES};
+        use super::tx_8922a::{PrepareArgs, BUFFER_DMA_MASK, FRAME_DMA_MASK, MAX_FRAME_LEN};
+        if info.channel >= 12 {
+            return Err(Error::Transport(super::tx_8922a::Error::BadChannel));
+        }
+        if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
+            return Err(Error::Transport(super::tx_8922a::Error::BadFrame));
+        }
+        let mac_id: u8 = info
+            .mac_id
+            .try_into()
+            .map_err(|_| Error::Transport(super::tx_8922a::Error::BadMacId))?;
+        let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
+        let frame_dma_buf = alloc_coherent_masked(frame.len(), DomainId::DRIVER_0, FRAME_DMA_MASK)
+            .map_err(|_| Error::NoMemory)?;
+        // SAFETY: fresh owned allocation covers exactly the frame length.
+        unsafe {
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), frame_dma_buf.as_mut_ptr(), frame.len());
+        }
+        frame_dma_buf.sync(0, frame.len());
+        let header_dma_buf =
+            alloc_coherent_masked(MAX_HEADER_BYTES, DomainId::DRIVER_0, BUFFER_DMA_MASK)
+                .map_err(|_| Error::NoMemory)?;
+        let mut body = [0u8; super::txrx_be::TXWD_BODY_V2_SIZE];
+        super::txrx_be::encode_txwd_be(&info, &mut body)
+            .ok_or(Error::Transport(super::tx_8922a::Error::BadFrame))?;
+        let mut owner = owner_lock.lock();
+        let ring_dma = &self.tx_ring_dma[info.channel as usize];
+        // SAFETY: `ring_dma` is a fresh DMA-coherent allocation of
+        // exactly `tx_ring_bytes(DEFAULT_TXBD_NUM)` bytes, so the
+        // TxBd slice covers exactly the ring; the owner validates
+        // slot < depth before writing.
+        let bd = unsafe {
+            core::slice::from_raw_parts_mut(
+                ring_dma.as_mut_ptr() as *mut TxBd,
+                DEFAULT_TXBD_NUM as usize,
+            )
+        };
+        let prepared = owner.prepare_data(PrepareArgs {
+            channel: info.channel,
+            mac_id,
+            qsel: info.qsel,
+            body: &body,
+            header_dma: header_dma_buf.dma_addr().raw(),
+            frame_dma: frame_dma_buf.dma_addr().raw(),
+            frame_len: frame.len(),
+            bd,
+        })?;
+        let ticket = prepared.ticket;
+        if prepared.header.len() > MAX_HEADER_BYTES {
+            return Err(Error::Transport(super::tx_8922a::Error::BadFrame));
+        }
+        // SAFETY: header_dma_buf is a fresh MAX_HEADER_BYTES
+        // allocation and the length check above bounds the copy.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                prepared.header.as_ptr(),
+                header_dma_buf.as_mut_ptr(),
+                prepared.header.len(),
+            );
+        }
+        header_dma_buf.sync(0, prepared.header.len());
+        // Retain both buffers until RPQ release; the queue keeps
+        // only their addresses. A failed kick below keeps them
+        // retained with the (unpublished) reservation.
+        owner.retain_data(header_dma_buf, frame_dma_buf);
+        ring_dma.sync(
+            ticket.slot as usize * core::mem::size_of::<TxBd>(),
+            core::mem::size_of::<TxBd>(),
+        );
+        native_dma_barrier();
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        owner.kick_data(regs, &prepared)?;
+        Ok(ticket)
+    }
+
+    /// BE H2C submit for a probed 8922A device: move one
+    /// caller-framed buffer across CH12. The buffer's DMA is
+    /// retained by the owner until the future C2H completion path
+    /// releases it. FWCMD header framing is the caller's (later
+    /// step).
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as [`Self::submit_be_data`]:
+    /// rings programmed through the Prepared owner, firmware
+    /// running, no reset/removal racing.
+    pub(super) unsafe fn submit_be_h2c(
+        &self,
+        buf: &[u8],
+    ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller's live initialized ring/no-reset contract.
+            unsafe { self.submit_be_h2c_authorized(buf) }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn submit_be_h2c_authorized(
+        &self,
+        buf: &[u8],
+    ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
+        use super::dma::{TxBd, DEFAULT_TXBD_NUM, TXCH_CH12};
+        use super::prepared_8922a::Error;
+        use super::tx_8922a::BUFFER_DMA_MASK;
+        if buf.is_empty() || buf.len() > u16::MAX as usize {
+            return Err(Error::Transport(super::tx_8922a::Error::BadFrame));
+        }
+        let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
+        let dma_buf = alloc_coherent_masked(buf.len(), DomainId::DRIVER_0, BUFFER_DMA_MASK)
+            .map_err(|_| Error::NoMemory)?;
+        // SAFETY: fresh owned allocation covers exactly the buffer length.
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), dma_buf.as_mut_ptr(), buf.len());
+        }
+        dma_buf.sync(0, buf.len());
+        let mut owner = owner_lock.lock();
+        let ring_dma = &self.tx_ring_dma[TXCH_CH12 as usize];
+        // SAFETY: same ring-slice contract as `submit_be_data_authorized`.
+        let bd = unsafe {
+            core::slice::from_raw_parts_mut(
+                ring_dma.as_mut_ptr() as *mut TxBd,
+                DEFAULT_TXBD_NUM as usize,
+            )
+        };
+        let prepared = owner.prepare_h2c(bd, dma_buf.dma_addr().raw(), buf.len())?;
+        owner.retain_h2c(dma_buf);
+        ring_dma.sync(
+            prepared.slot as usize * core::mem::size_of::<TxBd>(),
+            core::mem::size_of::<TxBd>(),
+        );
+        native_dma_barrier();
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        owner.kick_h2c(regs, &prepared)?;
+        Ok(prepared)
+    }
+
+    /// Apply one validated BE RPQ release (Linux's original 4-byte
+    /// record) together with the current DMA read pointer state.
+    /// Returns the TX status only once both the TXBD-consumption
+    /// half and the report half have arrived; the retired frame's
+    /// DMA buffers are freed here, never on the RP half alone.
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as [`Self::submit_be_data`].
+    /// `bytes` must come from this device's coherently acquired RPQ
+    /// (not untrusted network data).
+    pub(super) unsafe fn complete_be_report(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Option<u8>, super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller guarantees an acquired BE RPQ/live ring.
+            unsafe { self.complete_be_report_authorized(bytes) }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn complete_be_report_authorized(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Option<u8>, super::prepared_8922a::Error> {
+        use super::prepared_8922a::Error;
+        let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
+        let mut owner = owner_lock.lock();
+        let completion = owner.observe_data_report(bytes)?;
+        if let Some(done) = completion {
+            owner.release_data(done.resource.header_dma, done.resource.frame_dma);
+            Ok(Some(done.status))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Apply a BE TX ring read-pointer update: report the retained
+    /// addresses of DMA-complete frames (the caller frees them only
+    /// after the matching RPQ release — see
+    /// [`Self::complete_be_report`]).
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as [`Self::submit_be_data`].
+    pub(super) unsafe fn observe_be_rp(
+        &self,
+        channel: u8,
+    ) -> Result<Vec<super::tx_8922a::Retained>, super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller guarantees a live BE ring.
+            unsafe { self.observe_be_rp_authorized(channel) }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn observe_be_rp_authorized(
+        &self,
+        channel: u8,
+    ) -> Result<Vec<super::tx_8922a::Retained>, super::prepared_8922a::Error> {
+        use super::prepared_8922a::Error;
+        let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
+        let mut owner = owner_lock.lock();
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        let completed = owner.observe_data_rp(regs, channel)?;
+        Ok(completed.into_iter().map(|done| done.resource).collect())
     }
 }
 
