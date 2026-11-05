@@ -495,11 +495,44 @@ if present), signature-filter add (the ATR primitive: ATR
 signature hash + FDIRHASH/FDIRCMD write pair), table reinit
 (CLEARHT toggle + FDIRCTRL rewrite + INIT_DONE poll +
 statistics clear), and statistics reads (all read to clear).
+IPv6 perfect-filter add (`add_perfect_ipv6`, Refs #1262): full
+128-bit source-IPv6 per-filter match (FDIRSIPv6[0..2] + FDIRIPSA,
+masked per byte by FDIRIP6M.SIPM); the destination has no
+per-filter register — it compares as a whole against the single
+global IP6AT entry (shared with WoL; `wol::program_ipv6` is the
+single writer), gated by FDIRM.DIPv6 (clear = compare meaningful,
+via `FdirMask::dst_ipv6_match`) and per-filter FDIRCMD.IPv6DMatch
+(set = must match IP6AT, clear = must NOT match); FDIRIPDA is
+written 0 for IPv6 filters and the destination still enters the
+bucket hash. IPv6 mask register (`set_ip6_mask`, FDIRIP6M; DIPM
+is hash/signature only, never the perfect-match destination
+compare). Persistent filter state (`FdirState`): the configure /
+mask / add methods record what was programmed; `restore`
+(full init + masks + IP6AT + filters) rebuilds the tables after
+reset / resume (`Ixgbe::resume` runs it as step 3b, fail-closed),
+and `replay` (no init) re-programs them after `reinit_tables`,
+which preserves FDIRCTRL mode; `fdir_reinit` is reinit + replay
+and `fdir_erase_perfect` forgets from the store, so a later
+restore does not resurrect an erased filter.
 
 Grounding: Linux ixgbe @ cbbddb6 (`ixgbe_type.h` FDIR block +
-`ixgbe_82599.c` FDIR functions). No local 82599 datasheet copy
-exists, so the Linux transcription is the authority, as with
-§13b. This lane programs ONLY the 0x0EE00 FDIR block and never
+`ixgbe_82599.c` FDIR functions) for structure and flow; every
+register address and bit in the #1262 backfill was re-verified
+against the Intel 82599 Datasheet rev. 2.6 text (public mirror),
+which wins on disagreement — notably the address/mask register
+byte order (register LS byte first on the wire, §8.2.3.21.16/.17/.18
+and §8.2.3.21.4/.5) and the IPv6 perfect-match model (§7.1.2.7,
+§8.2.3.21.8/.9/.22). Two landed-code corrections came out of that
+re-grounding: (1) the address/mask registers were written with
+host-order numerics verbatim, byte-reversing the programmed
+address/mask on silicon — now byte-swapped (`swap_bytes` /
+`u32::from_le_bytes` of the wire bytes); the bucket hash was
+unaffected. (2) `perfect_bucket_hash` dropped the common
+accumulator, putting filters in the wrong bucket (IPv4 control
+vector hashed to 0x01b4 instead of the pinned 0x1f6c) — Linux's
+perfect-hash path uses only the bucket macro with the raw key,
+so the common-key bits are now folded back in, the same final
+fold as `sig_hash`. This lane programs ONLY the 0x0EE00 FDIR block and never
 touches MRQC / RETA / RSSRK (verified: no Linux FDIR function
 writes them); the #1397 MRQC-map conflict therefore does not
 block this lane, and this lane does not pick a side in it. The
@@ -509,10 +542,14 @@ dependency.
 
 Limits (see §14): no TX sampling hook (no in-tree TX packet
 parser; sample rate + queue binding are policy for a
-follow-up), no IPv6 perfect filters (Linux masks DIPv6), no
-persistent filter list (reinit clears filters; callers
-re-add), no cloud / MACVLAN filter modes, flex bytes fixed at
-the ethertype shift. The signature-add 64-bit FDIRHASH write
+follow-up), flex bytes fixed at the ethertype shift. Cloud /
+MACVLAN filter modes are NOT a limit to implement: FDIRCTRL
+bits 23:21 are Reserved on the 82599 (datasheet rev. 2.6
+§8.2.3.21.1 and rev. 3.4 §8.2.3.21.1 agree; neither revision
+mentions "Filter Mode", "MACVLAN", or "Cloud"), and Linux never
+programs the field on any 82599 path (the `ixgbe_type.h` defines
+are dead). This driver never sets those bits (pinned by fixture).
+The signature-add 64-bit FDIRHASH write
 is split into two 32-bit writes (hash, then command) because
 `RegBank` is 32-bit. Section number is letter-suffixed so it
 merges cleanly against §13b regardless of landing order.
@@ -876,9 +913,12 @@ Per the v0.1 exclusion list, still open after this stream:
   authority), and the MRQE 0xB + per-pool RETA composition is
   done (#1489).
 - FlowDirector remainders (see §13c): TX sampling hook for ATR
-  (packet parser + sample-rate policy + queue binding), IPv6
-  perfect filters, persistent filter list with restore on
-  reinit, cloud / MACVLAN filter modes.
+  (packet parser + sample-rate policy + queue binding) only.
+  IPv6 perfect filters and persistent filter restore landed
+  (Refs #1262); cloud / MACVLAN filter modes are closed as
+  not-available-on-82599 (FDIRCTRL bits 23:21 Reserved in
+  datasheet rev. 2.6 and rev. 3.4; Linux defines dead) — no
+  action, and the driver never sets those bits.
 - DCB — see §13d (Refs #1263; Linux-grounded, datasheet
   re-grounding + MTQC VT×DCB reconciliation + DCBx + CEE
   credits + disable path remain).

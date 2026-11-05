@@ -1,16 +1,19 @@
 //! ixgbe Flow Director (FDIR) — signature + perfect-match filters, ATR primitive.
 //!
-//! Grounding: Linux ixgbe @ cbbddb6 (`ixgbe_type.h` register block +
+//! Grounding: Intel 82599 Datasheet rev. 2.6 (322429-007, Dec 2010,
+//! public mirror) §7.1.2.7 (Flow Director Filters) + §8.2.3.21
+//! (FDIR registers) + §8.2.3.24.6 (IP6AT), cross-checked against
+//! Linux ixgbe @ cbbddb6 (`ixgbe_type.h` register block +
 //! `ixgbe_82599.c`: `ixgbe_fdir_enable_82599`,
 //! `ixgbe_init_fdir_signature_82599`, `ixgbe_init_fdir_perfect_82599`,
 //! `ixgbe_atr_compute_sig_hash_82599`, `ixgbe_fdir_add_signature_filter_82599`,
 //! `ixgbe_atr_compute_perfect_hash_82599`, `ixgbe_fdir_set_input_mask_82599`,
 //! `ixgbe_fdir_write_perfect_filter_82599`,
 //! `ixgbe_fdir_erase_perfect_filter_82599`,
-//! `ixgbe_reinit_fdir_tables_82599`). Every register address, bit, key,
-//! and sequence below is transcribed from those files, not invented.
-//! No local 82599 datasheet copy exists (searched, none found), so the
-//! Linux transcription is the authority here, as with `vmdq.rs`.
+//! `ixgbe_reinit_fdir_tables_82599`). Where the two disagree the
+//! datasheet wins; the one disagreement found is called out under
+//! "Endianness" below. Every register address, bit, key, and
+//! sequence below is transcribed from those sources, not invented.
 //!
 //! Scope notes (read before extending):
 //! - This lane programs ONLY the 0x0EE00 FDIR block. It never touches
@@ -20,32 +23,92 @@
 //!   (an FDIR-steered flow bypasses RSS indirection), not a register
 //!   dependency — so the #1397 MRQC-map conflict does not block this
 //!   lane, and this lane does not pick a side in it.
-//! - Endianness: all pure functions take HOST-order values (vm_pool in
-//!   the top byte of the hash word, ports as host u16, IPv4 addresses
-//!   as host u32). That is exact on NARF's little-endian targets
-//!   (x86_64, aarch64), where Linux's `ntohl`/`be16_to_cpu` compositions
-//!   reduce to the values used here. The one place Linux byte-swaps
-//!   twice (the BE32 mask/address stores) is the identity on LE and is
-//!   documented at each use.
+//! - Endianness — read carefully, the first version of this module
+//!   got the address registers wrong. The pure/hash functions take
+//!   WIRE-ORDER NUMERICS (an IPv4 address as the dotted-quad u32,
+//!   an IPv6 dword as `u32::from_be_bytes` of its four wire bytes,
+//!   ports as host u16): that is what the hash input stream
+//!   (datasheet Table 7.8) is built from, and the bucket oracles
+//!   pin it. The 32-bit IP address/mask REGISTERS take the opposite
+//!   byte order: the register's LS byte is the first byte on the
+//!   wire (datasheet §8.2.3.21.16: "the LS byte of FDIRSIPv6[0] is
+//!   first on the wire"; §8.2.3.21.17/.18, same for FDIRIPSA /
+//!   FDIRIPDA; §8.2.3.21.4/.5, "The LS bit of this register matches
+//!   the first byte on the wire" for the masks), so a register write
+//!   is the numeric value byte-swapped (`value.swap_bytes()`, i.e.
+//!   `u32::from_le_bytes` of the wire bytes). Linux agrees:
+//!   `ixgbe_fdir_write_perfect_filter_82599` issues
+//!   `WRITE_REG_BE32`, which on little-endian writes the LE-loaded
+//!   `__be32` unchanged — the byte-swapped numeric. The first
+//!   version wrote the numerics verbatim to the address/mask
+//!   registers; on silicon the filter would have matched the
+//!   byte-reversed address and never fired. Corrected here (see
+//!   `add_perfect` / `mask_words`); the hash is untouched. Ports,
+//!   VLAN, FDIRHASH and FDIRCMD words are numerics, as before
+//!   (Linux's `be16_to_cpu` / `ntohs` compositions reduce to them
+//!   on LE).
+//! - The perfect-bucket hash dropped the common accumulator (see
+//!   `perfect_bucket_hash`): Linux's perfect-hash path uses only the
+//!   bucket macro with the raw key, so the common-key bits — which
+//!   the shared `hash_iter` routes to `com`, as in the signature
+//!   path — belong in the bucket. The first version discarded them,
+//!   putting filters in the wrong bucket (the IPv4 control vector
+//!   hashed to 0x01b4 instead of the pinned 0x1f6c). Corrected here
+//!   (fold `com` back into `buck`, the same final fold as
+//!   `sig_hash`).
 //! - The signature-add path in Linux issues ONE 64-bit write to
 //!   FDIRHASH (low dword = hash, high dword = FDIRCMD at +4). `RegBank`
 //!   is 32-bit, so this module issues two writes, hash first then
 //!   command, matching the 64-bit write's dword order.
-//! - Perfect-match IPv6 is NOT implemented: Linux's input mask forces
-//!   `FDIRM_DIPv6` (IPv6 fields never match) and its write path
-//!   comments IPv6 as unsupported. Perfect add rejects flow types with
-//!   the IPv6 bit set (a NARF fail-closed guard, not Linux behavior).
+//! - Perfect-match IPv6 IS implemented (`add_perfect_ipv6`), per the
+//!   datasheet — Linux never implemented it (its write path comments
+//!   IPv6 as unsupported and its input mask forces `FDIRM_DIPv6`).
+//!   The hardware model is asymmetric, so read §7.1.2.7 before
+//!   extending: the SOURCE IPv6 gets a full 128-bit per-filter
+//!   match (FDIRSIPv6[0..2] + FDIRIPSA, masked per byte by
+//!   FDIRIP6M.SIPM), but there is NO per-filter destination-IPv6
+//!   register — the destination is compared as a whole, with no
+//!   range support, against the single global IP6AT entry
+//!   (datasheet §7.1.2.7: "the destination IPv6 address can only
+//!   be compared as a whole (with no range support) to the IP6AT"),
+//!   gated by FDIRM.DIPv6 (clear = compare meaningful) and the
+//!   per-filter FDIRCMD.IPv6DMatch bit (set = must match IP6AT,
+//!   clear = must NOT match). IP6AT is the WoL table
+//!   (§8.2.3.24.6, shared with directed-IPv6 wake-up), so
+//!   programming it for FDIR also changes the WoL address —
+//!   `wol::program_ipv6` is the single writer for that reason.
+//!   FDIRIP6M.DIPM is meaningful only for the hash function and
+//!   signature filters, never for the perfect-match destination
+//!   compare (§8.2.3.21.8). The bucket hash DOES cover the full
+//!   destination address (Table 7.8), so `dst_ip` is still part of
+//!   the hashed tuple even though the match compares it via IP6AT.
 //! - The TX sampling hook (Linux `ixgbe_atr`: parse a TX frame, sample
 //!   SYN / every Nth packet, add a signature filter) is NOT here: the
 //!   driver has no TX packet-parse point, and the sample rate + queue
 //!   binding are policy decisions for a follow-up. What IS here is the
 //!   ATR primitive itself: signature-hash computation + signature-filter
 //!   add, callable once a TX hook exists.
-//! - No persistent filter list is kept, so `reinit_tables` (like
-//!   Linux's table reinit) clears programmed filters; callers must
-//!   re-add after a reinit. Cloud / MACVLAN filter modes
-//!   (`FDIRCTRL_FILTERMODE`) are untouched (Linux's paths don't use
-//!   them either).
+//! - Persistent filter state IS kept (`FdirState`): `configure_fdir`
+//!   / `configure_fdir_mask` / the add methods record what was
+//!   programmed, and `restore` replays it (init + masks + IP6AT +
+//!   filters, in order) after a table reinit, reset, or resume —
+//!   which otherwise clears programmed filters. `replay` is the
+//!   no-init half, used after `reinit_tables` (which preserves the
+//!   FDIRCTRL mode). The store replays exactly what was recorded;
+//!   filters recorded without a config are not replayed (nothing
+//!   was ever initialized to replay into).
+//! - Cloud / MACVLAN filter modes (`FDIRCTRL_FILTERMODE`, Linux
+//!   `ixgbe_type.h` bits 23:21, values 001b/010b) do NOT exist on
+//!   the 82599: the datasheet says bits 23:21 are Reserved, in
+//!   rev. 2.6 §8.2.3.21.1 AND in rev. 3.4 (Nov 2019) §8.2.3.21.1,
+//!   and neither string ("Filter Mode", "MACVLAN", "Cloud") appears
+//!   anywhere in either revision; Linux never programs the field
+//!   on any 82599 path (the defines are dead — no use in the whole
+//!   tree). This driver therefore never sets those bits, and the
+//!   `FDIRCTRL_RESERVED_MASK` fixture pins that. If a later part
+//!   (X550 family) needs the modes, that belongs to its lane.
+
+use alloc::vec::Vec;
 
 use super::queues::RegBank;
 
@@ -95,6 +158,15 @@ pub const REG_FDIRSKEY: u64 = 0x0EE6C;
 pub const REG_FDIRM: u64 = 0x0EE70;
 /// Flow Director IPv6 destination mask.
 pub const REG_FDIRIP6M: u64 = 0x0EE74;
+/// FDIRIP6M: source-IPv6 mask field shift (bits 15:0; datasheet
+/// §8.2.3.21.8). Bit i masks wire byte i of the source address
+/// (bit 0 = first byte on the wire); set = byte ignored.
+pub const FDIRIP6M_SIPM_SHIFT: u32 = 0;
+/// FDIRIP6M: destination-IPv6 mask field shift (bits 31:16).
+/// Meaningful only for the hash function and signature filters —
+/// never for the perfect-match destination compare (that is
+/// FDIRM.DIPv6; datasheet §8.2.3.21.8).
+pub const FDIRIP6M_DIPM_SHIFT: u32 = 16;
 /// Flow Director SCTP port mask.
 pub const REG_FDIRSCTPM: u64 = 0x0EE78;
 
@@ -120,6 +192,12 @@ pub const FDIRCTRL_FLEX_SHIFT: u32 = 16;
 pub const FDIRCTRL_MAX_LENGTH_SHIFT: u32 = 24;
 /// FDIRCTRL: full-threshold field shift (interrupt at 16 * value left).
 pub const FDIRCTRL_FULL_THRESH_SHIFT: u32 = 28;
+/// FDIRCTRL bits 23:21: Reserved on the 82599 (datasheet rev. 2.6
+/// §8.2.3.21.1 and rev. 3.4 §8.2.3.21.1 agree). Linux's
+/// `IXGBE_FDIRCTRL_FILTERMODE_*` defines live in these bits but have
+/// no 82599 datasheet basis and are never programmed by Linux; this
+/// driver never sets them (pinned by fixture).
+pub const FDIRCTRL_RESERVED_MASK: u32 = 0x00E0_0000;
 /// Polls for INIT_DONE / command completion (Linux `FDIRCMD_CMD_POLL`
 /// and `FDIR_INIT_DONE_POLL` are both 10).
 pub const FDIR_POLL: u32 = 10;
@@ -148,6 +226,12 @@ pub const FDIRCMD_L4TYPE_TCP: u32 = 0x0000_0040;
 pub const FDIRCMD_L4TYPE_SCTP: u32 = 0x0000_0060;
 /// FDIRCMD: IPv6 (bit 7 of the flow-type field).
 pub const FDIRCMD_IPV6: u32 = 0x0000_0080;
+/// FDIRCMD: IPv6 destination match to IP6AT (bit 4; datasheet
+/// §8.2.3.21.22). Meaningful only for perfect-match IPv6 filters:
+/// set = the destination IPv6 address must match the IP6AT entry,
+/// clear = it must NOT match. Must be clear for all other filters.
+/// "This field can never match local VM to VM traffic."
+pub const FDIRCMD_IPV6DMATCH: u32 = 0x0000_0010;
 /// FDIRCMD: clear hash table (reinit toggle).
 pub const FDIRCMD_CLEARHT: u32 = 0x0000_0100;
 /// FDIRCMD: drop (drop-queue filters).
@@ -228,7 +312,8 @@ pub const L4TYPE_TUNNEL_BIT: u8 = 0x10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FdirError {
     /// Flow type rejected (signature: bare IPv4/IPv6 or unknown type;
-    /// perfect: IPv6 bit set — see module docs).
+    /// IPv4 perfect path: IPv6 bit set — use `add_perfect_ipv6`;
+    /// IPv6 perfect path: not an IPv6 flow type).
     BadFlowType,
     /// Input-mask field rejected; the string names the field.
     BadInputMask(&'static str),
@@ -332,13 +417,20 @@ pub struct FdirMask {
     pub src_ip: u32,
     /// Destination IPv4 mask (host order).
     pub dst_ip: u32,
+    /// Destination-IPv6 match: true clears FDIRM.DIPv6, making the
+    /// compare of the destination IPv6 address against the global
+    /// IP6AT entry meaningful for perfect-match IPv6 filters
+    /// (datasheet §8.2.3.21.9); false keeps Linux's behavior
+    /// (DIPv6 set: destination IPv6 never matches).
+    pub dst_ipv6_match: bool,
 }
 
 /// Perfect-filter tuple, host order.
 ///
 /// IPv4 only (see module docs). `bkt_hash` must already hold the
 /// value from [`perfect_bucket_hash`] for this tuple under the
-/// programmed input mask.
+/// programmed input mask. Addresses are wire-order numerics; the
+/// register writes byte-swap them (see module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdirPerfectInput {
     /// VM pool (VT pool for the FDIRCMD word).
@@ -359,6 +451,47 @@ pub struct FdirPerfectInput {
     pub flex_bytes: u16,
     /// Bucket hash from [`perfect_bucket_hash`] (13 bits).
     pub bkt_hash: u16,
+}
+
+/// Perfect-filter IPv6 tuple.
+///
+/// Source IPv6 gets a full 128-bit per-filter match (FDIRSIPv6[0..2]
+/// + FDIRIPSA, masked per byte by FDIRIP6M.SIPM). Destination IPv6
+/// has NO per-filter register: the match compares it as a whole
+/// against the single global IP6AT entry (see module docs), so
+/// `dst_ip` is used ONLY for the bucket hash (datasheet Table 7.8
+/// includes the full destination in the hash stream) and
+/// `dst_matches_ip6at` selects the FDIRCMD.IPv6DMatch sense.
+/// Addresses are wire-order byte arrays (byte 0 first on the wire);
+/// the hash words are their `from_be_bytes` numerics, while the
+/// register writes use the LE-loaded form (see module docs).
+/// `bkt_hash` must already hold the value from
+/// [`perfect_bucket_hash`] over [`perfect_stream6`] for this tuple
+/// under the programmed input masks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdirPerfectInput6 {
+    /// VM pool (VT pool for the FDIRCMD word).
+    pub vm_pool: u8,
+    /// Flow type (IPv6 types 4..7 only).
+    pub flow_type: u8,
+    /// VLAN ID (host order).
+    pub vlan_id: u16,
+    /// Source IPv6 address (wire order).
+    pub src_ip: [u8; 16],
+    /// Destination IPv6 address (wire order; hash only).
+    pub dst_ip: [u8; 16],
+    /// Source port (host order).
+    pub src_port: u16,
+    /// Destination port (host order).
+    pub dst_port: u16,
+    /// Flex bytes (host order).
+    pub flex_bytes: u16,
+    /// Bucket hash from [`perfect_bucket_hash`] (13 bits).
+    pub bkt_hash: u16,
+    /// FDIRCMD.IPv6DMatch: true = destination must match IP6AT,
+    /// false = destination must NOT match IP6AT. Meaningful only
+    /// when FDIRM.DIPv6 is clear (`FdirMask::dst_ipv6_match`).
+    pub dst_matches_ip6at: bool,
 }
 
 /// Flow Director statistics (all registers read to clear).
@@ -557,6 +690,14 @@ pub fn perfect_bucket_hash(words: &[u32; 11]) -> u16 {
     for n in 1..16 {
         hash_iter(n, lo, hi, &mut sig, &mut buck, &mut com, false);
     }
+    // Fold the common accumulator back in: Linux's perfect-hash path
+    // uses ONLY the bucket macro with the raw bucket key, so the
+    // common-key bits (which `hash_iter` routes to `com`, as in the
+    // signature path) belong in the bucket. Dropping `com` — as the
+    // first version of this function did — puts filters in the wrong
+    // bucket (the IPv4 control vector hashes to 0x01b4 instead of
+    // 0x1f6c). Same final fold as `sig_hash`.
+    buck ^= com;
     // The perfect hash keeps only the bucket half, limited to 13 bits
     // (max 8K buckets).
     (buck & PERFECT_BUCKET_MASK) as u16
@@ -592,16 +733,103 @@ pub fn perfect_stream(input: &FdirPerfectInput) -> [u32; 11] {
     ]
 }
 
+/// Build the 11-word perfect-hash stream for an IPv6 tuple
+/// (datasheet Table 7.8: VLAN, 16-byte source, 16-byte destination,
+/// ports, flex, pool, type): word 0 = flow/vm/VLAN, words 1..4 =
+/// source IPv6 dwords (MS first), words 5..8 = destination IPv6
+/// dwords (MS first), word 9 = ports, word 10 = flex bytes + zero
+/// bucket placeholder. Words are wire-order numerics
+/// (`u32::from_be_bytes`), the same convention as
+/// [`perfect_stream`], so [`perfect_bucket_hash`] applies unchanged.
+pub fn perfect_stream6(input: &FdirPerfectInput6) -> [u32; 11] {
+    let d = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    [
+        ((input.vm_pool as u32) << 24) | ((input.flow_type as u32) << 16) | (input.vlan_id as u32),
+        d(&input.src_ip[0..4]),
+        d(&input.src_ip[4..8]),
+        d(&input.src_ip[8..12]),
+        d(&input.src_ip[12..16]),
+        d(&input.dst_ip[0..4]),
+        d(&input.dst_ip[4..8]),
+        d(&input.dst_ip[8..12]),
+        d(&input.dst_ip[12..16]),
+        ((input.src_port as u32) << 16) | (input.dst_port as u32),
+        (input.flex_bytes as u32) << 16,
+    ]
+}
+
+/// One dword of an 11-word-stream IPv6 address mask: wire byte
+/// `4*j+k` of the address contributes 0xFF at byte position `k`
+/// (MS first) when its FDIRIP6M bit is clear (meaningful), 0x00
+/// when set (masked). Bit i of the mask covers wire byte i
+/// (datasheet §8.2.3.21.8).
+const fn ip6_mask_dword(mask: u16, j: usize) -> u32 {
+    let mut word = 0u32;
+    let mut k = 0;
+    while k < 4 {
+        let bit = 4 * j + k;
+        if mask & (1u16 << bit) == 0 {
+            word |= 0xFFu32 << (24 - 8 * k);
+        }
+        k += 1;
+    }
+    word
+}
+
+/// Convert the per-byte FDIRIP6M masks into the 11-word-stream mask
+/// words for the source (words 1..4) and destination (words 5..8)
+/// IPv6 addresses, for use with [`apply_mask`] before
+/// [`perfect_bucket_hash`]. A mask bit set means that wire byte is
+/// ignored by the match — and by the hash, since the hash input is
+/// the masked stream. Note DIPM only affects the hash and signature
+/// filters, never the perfect-match destination compare.
+pub const fn ip6_mask_words(sipm: u16, dipm: u16) -> ([u32; 4], [u32; 4]) {
+    (
+        [
+            ip6_mask_dword(sipm, 0),
+            ip6_mask_dword(sipm, 1),
+            ip6_mask_dword(sipm, 2),
+            ip6_mask_dword(sipm, 3),
+        ],
+        [
+            ip6_mask_dword(dipm, 0),
+            ip6_mask_dword(dipm, 1),
+            ip6_mask_dword(dipm, 2),
+            ip6_mask_dword(dipm, 3),
+        ],
+    )
+}
+
+/// FDIRCMD word for an IPv6 perfect-filter add: the IPv4 word, whose
+/// flow-type shift already carries FDIRCMD.IPV6 for v6 types
+/// (bit 7), plus FDIRCMD.IPv6DMatch when the destination must match
+/// the IP6AT entry.
+pub const fn perfect_add_cmd6(
+    flow_type: u8,
+    queue: u8,
+    vm_pool: u8,
+    dst_matches_ip6at: bool,
+) -> u32 {
+    let mut cmd = perfect_add_cmd(flow_type, queue, vm_pool);
+    if dst_matches_ip6at {
+        cmd |= FDIRCMD_IPV6DMATCH;
+    }
+    cmd
+}
+
 // ── Input mask ───────────────────────────────────────────────────────
 
 /// Compute the FDIRM word + port/IP mask words for an input mask
 /// (Linux `ixgbe_fdir_set_input_mask_82599`), without writing.
 /// Returns `(fdirm, port_mask, src_ip_mask, dst_ip_mask)` where the
 /// port/IP masks are the values the registers take (already inverted
-/// from the ethtool mask convention).
+/// from the ethtool mask convention, and byte-swapped: the IP mask
+/// registers' LS bit matches the first byte on the wire, datasheet
+/// §8.2.3.21.4/.5 — see `add_perfect`).
 pub fn mask_words(mask: &FdirMask) -> Result<(u32, u32, u32, u32), FdirError> {
-    // IPv6 is always masked: it is never matched.
-    let mut fdirm = FDIRM_DIPV6;
+    // Destination IPv6 is masked unless the caller asked for the
+    // IP6AT compare (FDIRM.DIPv6 clear = compare meaningful).
+    let mut fdirm = if mask.dst_ipv6_match { 0 } else { FDIRM_DIPV6 };
     match mask.vm_pool & 0x7F {
         0x00 => fdirm |= FDIRM_POOL,
         0x7F => {}
@@ -631,9 +859,15 @@ pub fn mask_words(mask: &FdirMask) -> Result<(u32, u32, u32, u32), FdirError> {
     }
     // Port masks are bit-reversed, then inverted for the register.
     let port = !port_mask_word(mask.src_port, mask.dst_port);
-    // IP masks are inverted for the register (the BE32 store is the
-    // identity on little-endian hosts).
-    Ok((fdirm, port, !mask.src_ip, !mask.dst_ip))
+    // IP masks are inverted for the register and byte-swapped (the
+    // mask registers' LS bit matches the first byte on the wire —
+    // same swap as the address registers, see `add_perfect`).
+    Ok((
+        fdirm,
+        port,
+        (!mask.src_ip).swap_bytes(),
+        (!mask.dst_ip).swap_bytes(),
+    ))
 }
 
 /// Program an input mask (Linux `ixgbe_fdir_set_input_mask_82599`).
@@ -654,6 +888,19 @@ pub fn set_input_mask(
     bank.write32(REG_FDIRSIP4M, src_ip);
     bank.write32(REG_FDIRDIP4M, dst_ip);
     Ok(())
+}
+
+/// Program the IPv6 mask register (FDIRIP6M, datasheet §8.2.3.21.8):
+/// `sipm` masks the source IPv6 address per byte (bit i = wire byte
+/// i, set = ignored), `dipm` the destination per byte. DIPM is
+/// meaningful only for the hash function and signature filters —
+/// it never gates the perfect-match destination compare (that is
+/// FDIRM.DIPv6, via `FdirMask::dst_ipv6_match`).
+pub fn set_ip6_mask(bank: &mut impl RegBank, sipm: u16, dipm: u16) {
+    bank.write32(
+        REG_FDIRIP6M,
+        ((dipm as u32) << FDIRIP6M_DIPM_SHIFT) | ((sipm as u32) << FDIRIP6M_SIPM_SHIFT),
+    );
 }
 
 // ── Bank sequences ───────────────────────────────────────────────────
@@ -715,6 +962,13 @@ pub fn init_perfect(bank: &mut impl RegBank, pballoc: FdirPballoc) -> bool {
 /// source registers take the IPv4 address + zeros, matching Linux's
 /// IPv4 inputs. Rejects flow types with the IPv6 bit set and queue
 /// indices above the drop queue (NARF guards, documented above).
+///
+/// Byte order: the address registers take the LE-loaded form — the
+/// register's LS byte is the first byte on the wire (datasheet
+/// §8.2.3.21.16/.17/.18) — i.e. the numeric host-order address
+/// byte-swapped, exactly what Linux's `WRITE_REG_BE32` writes.
+/// (The first version of this module wrote the numerics verbatim;
+/// that byte-reverses the address on silicon.)
 pub fn add_perfect(
     bank: &mut impl RegBank,
     input: &FdirPerfectInput,
@@ -729,11 +983,11 @@ pub fn add_perfect(
     }
     // IPv6 source registers: IPv4 address + zeros (Linux writes
     // src_ip[0..2]; the remaining words are zero for IPv4 inputs).
-    bank.write32(REG_FDIRSIPV6_BASE, input.src_ip);
+    bank.write32(REG_FDIRSIPV6_BASE, input.src_ip.swap_bytes());
     bank.write32(REG_FDIRSIPV6_BASE + 4, 0);
     bank.write32(REG_FDIRSIPV6_BASE + 8, 0);
-    bank.write32(REG_FDIRIPSA, input.src_ip);
-    bank.write32(REG_FDIRIPDA, input.dst_ip);
+    bank.write32(REG_FDIRIPSA, input.src_ip.swap_bytes());
+    bank.write32(REG_FDIRIPDA, input.dst_ip.swap_bytes());
     bank.write32(REG_FDIRPORT, port_word(input.src_port, input.dst_port));
     bank.write32(REG_FDIRVLAN, vlan_word(input.vlan_id, input.flex_bytes));
     bank.write32(REG_FDIRHASH, hash_word(input.bkt_hash, soft_id));
@@ -741,6 +995,55 @@ pub fn add_perfect(
     bank.write32(
         REG_FDIRCMD,
         perfect_add_cmd(input.flow_type, queue, input.vm_pool),
+    );
+    poll_cmd_complete(bank)?;
+    Ok(())
+}
+
+/// Add an IPv6 perfect-match filter (datasheet §7.1.2.7.13 Table 7.7
+/// + §8.2.3.21.16/.17/.22). Writes the source IPv6 as its MS three
+/// dwords (FDIRSIPv6[0..2]) plus its LS dword (FDIRIPSA), FDIRIPDA
+/// = 0 (an IPv4-only register, not meaningful for IPv6 — the
+/// destination matches against the global IP6AT entry instead),
+/// then ports / VLAN / hash and FDIRCMD with IPV6 (+ IPv6DMatch
+/// when `dst_matches_ip6at`). The address words are the LE-loaded
+/// form (LS byte first on the wire), as in [`add_perfect`].
+/// Rejects non-IPv6 flow types (exact match on 4..7, so no stray
+/// flow-type bit can leak into FDIRCMD) and queue indices above the
+/// drop queue. The destination-IPv6 compare is meaningful only when
+/// FDIRM.DIPv6 is clear (`FdirMask::dst_ipv6_match`) and IP6AT
+/// holds the address to match (`wol::program_ipv6` programs it).
+pub fn add_perfect_ipv6(
+    bank: &mut impl RegBank,
+    input: &FdirPerfectInput6,
+    soft_id: u16,
+    queue: u8,
+) -> Result<(), FdirError> {
+    match input.flow_type {
+        FLOW_TYPE_IPV6 | FLOW_TYPE_UDPV6 | FLOW_TYPE_TCPV6 | FLOW_TYPE_SCTPV6 => {}
+        _ => return Err(FdirError::BadFlowType),
+    }
+    if queue > FDIR_DROP_QUEUE {
+        return Err(FdirError::BadQueue);
+    }
+    let le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    bank.write32(REG_FDIRSIPV6_BASE, le(&input.src_ip[0..4]));
+    bank.write32(REG_FDIRSIPV6_BASE + 4, le(&input.src_ip[4..8]));
+    bank.write32(REG_FDIRSIPV6_BASE + 8, le(&input.src_ip[8..12]));
+    bank.write32(REG_FDIRIPSA, le(&input.src_ip[12..16]));
+    bank.write32(REG_FDIRIPDA, 0);
+    bank.write32(REG_FDIRPORT, port_word(input.src_port, input.dst_port));
+    bank.write32(REG_FDIRVLAN, vlan_word(input.vlan_id, input.flex_bytes));
+    bank.write32(REG_FDIRHASH, hash_word(input.bkt_hash, soft_id));
+    flush(bank);
+    bank.write32(
+        REG_FDIRCMD,
+        perfect_add_cmd6(
+            input.flow_type,
+            queue,
+            input.vm_pool,
+            input.dst_matches_ip6at,
+        ),
     );
     poll_cmd_complete(bank)?;
     Ok(())
@@ -804,8 +1107,8 @@ pub fn add_signature(
 /// `ixgbe_reinit_fdir_tables_82599`): clear INIT_DONE, wait for any
 /// in-flight command, clear the hash table, rewrite FDIRCTRL, poll
 /// INIT_DONE (an error here, unlike init), and clear the statistics.
-/// NOTE: programmed filters do not survive a reinit (no filter list
-/// is kept); callers must re-add afterwards.
+/// NOTE: programmed filters do not survive a reinit; use [`replay`]
+/// (or [`restore`]) afterwards to re-program the recorded state.
 pub fn reinit_tables(bank: &mut impl RegBank) -> Result<(), FdirError> {
     let mut fdirctrl = bank.read32(REG_FDIRCTRL);
     fdirctrl &= !FDIRCTRL_INIT_DONE;
@@ -830,6 +1133,191 @@ pub fn reinit_tables(bank: &mut impl RegBank) -> Result<(), FdirError> {
     let _ = bank.read32(REG_FDIRMISS);
     let _ = bank.read32(REG_FDIRLEN);
     Ok(())
+}
+
+// ── Persistent filter state ──────────────────────────────────────────
+
+/// One recorded Flow Director filter, for re-programming after the
+/// tables were cleared (reinit / reset / resume). The recorded form
+/// is exactly what the add call took, so a replay issues the same
+/// register conversation as the original add.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordedFilter {
+    /// IPv4 perfect filter (`add_perfect` arguments).
+    Perfect {
+        /// Tuple (including the precomputed bucket hash).
+        input: FdirPerfectInput,
+        /// Software index.
+        soft_id: u16,
+        /// RX queue (127 = drop).
+        queue: u8,
+    },
+    /// IPv6 perfect filter (`add_perfect_ipv6` arguments).
+    Perfect6 {
+        /// Tuple (including the precomputed bucket hash).
+        input: FdirPerfectInput6,
+        /// Software index.
+        soft_id: u16,
+        /// RX queue (127 = drop).
+        queue: u8,
+    },
+    /// Signature filter (`add_signature` arguments).
+    Signature {
+        /// Flow/vm/VLAN word.
+        input: u32,
+        /// Compressed dword.
+        common: u32,
+        /// Flow type (tunnel bit included).
+        flow_type: u8,
+        /// RX queue.
+        queue: u8,
+    },
+}
+
+/// Persistent Flow Director state: everything `restore` needs to
+/// rebuild the tables from scratch after they were cleared —
+/// the init config, the input masks, the IPv6 destination-match
+/// address, and the recorded filters in add order.
+///
+/// The store replays exactly what was recorded; it never invents
+/// state. Filters recorded without a config are not replayed
+/// (nothing was ever initialized to replay into).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FdirState {
+    /// Init config from `configure_fdir` (`None` = never configured).
+    pub config: Option<FdirConfig>,
+    /// Input mask from `configure_fdir_mask` (`None` = never set).
+    pub mask: Option<FdirMask>,
+    /// IPv6 mask from `configure_fdir_ip6_mask`: `(sipm, dipm)`.
+    pub ip6_mask: Option<(u16, u16)>,
+    /// Destination-IPv6 match address (IP6AT) from
+    /// `configure_fdir_ipv6_dst` (`None` = never set).
+    pub ip6at: Option<[u8; 16]>,
+    /// Recorded filters, in add order.
+    pub filters: Vec<RecordedFilter>,
+}
+
+impl FdirState {
+    /// Record an IPv4 perfect filter (call after a successful add).
+    pub fn record_perfect(&mut self, input: FdirPerfectInput, soft_id: u16, queue: u8) {
+        self.filters.push(RecordedFilter::Perfect {
+            input,
+            soft_id,
+            queue,
+        });
+    }
+
+    /// Record an IPv6 perfect filter (call after a successful add).
+    pub fn record_perfect6(&mut self, input: FdirPerfectInput6, soft_id: u16, queue: u8) {
+        self.filters.push(RecordedFilter::Perfect6 {
+            input,
+            soft_id,
+            queue,
+        });
+    }
+
+    /// Record a signature filter (call after a successful add).
+    pub fn record_signature(&mut self, input: u32, common: u32, flow_type: u8, queue: u8) {
+        self.filters.push(RecordedFilter::Signature {
+            input,
+            common,
+            flow_type,
+            queue,
+        });
+    }
+
+    /// Forget a perfect filter by its (bucket hash, software index)
+    /// — the erase key. Removes the first match only: software
+    /// indices are unique per the datasheet (§7.1.2.7.13), so at
+    /// most one recorded filter can carry a key.
+    pub fn forget_perfect(&mut self, bkt_hash: u16, soft_id: u16) {
+        if let Some(pos) = self.filters.iter().position(|f| match f {
+            RecordedFilter::Perfect {
+                input, soft_id: s, ..
+            } => input.bkt_hash == bkt_hash && *s == soft_id,
+            RecordedFilter::Perfect6 {
+                input, soft_id: s, ..
+            } => input.bkt_hash == bkt_hash && *s == soft_id,
+            RecordedFilter::Signature { .. } => false,
+        }) {
+            self.filters.remove(pos);
+        }
+    }
+
+    /// Number of recorded filters.
+    pub fn len(&self) -> usize {
+        self.filters.len()
+    }
+
+    /// Whether any filter is recorded.
+    pub fn is_empty(&self) -> bool {
+        self.filters.is_empty()
+    }
+}
+
+/// Re-program the recorded input masks, IP6AT address, and filters
+/// — the no-init half of [`restore`], for use after
+/// [`reinit_tables`] (which preserves the FDIRCTRL mode but clears
+/// the tables). Mask registers and IP6AT survive a reinit, so
+/// re-applying them is a harmless rewrite of the same values.
+/// Returns the first error; a partial replay leaves the earlier
+/// filters programmed, and re-adding an identical filter is
+/// idempotent (datasheet §7.1.2.7.6: discarded silently as a
+/// success), so callers may retry.
+pub fn replay(bank: &mut impl RegBank, state: &FdirState, sctp: bool) -> Result<(), FdirError> {
+    if let Some(mask) = &state.mask {
+        set_input_mask(bank, mask, sctp)?;
+    }
+    if let Some((sipm, dipm)) = state.ip6_mask {
+        set_ip6_mask(bank, sipm, dipm);
+    }
+    if let Some(addr) = state.ip6at {
+        super::wol::program_ipv6(bank, addr);
+    }
+    for f in &state.filters {
+        match *f {
+            RecordedFilter::Perfect {
+                input,
+                soft_id,
+                queue,
+            } => add_perfect(bank, &input, soft_id, queue)?,
+            RecordedFilter::Perfect6 {
+                input,
+                soft_id,
+                queue,
+            } => add_perfect_ipv6(bank, &input, soft_id, queue)?,
+            RecordedFilter::Signature {
+                input,
+                common,
+                flow_type,
+                queue,
+            } => add_signature(bank, input, common, flow_type, queue)?,
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild the Flow Director tables from the recorded state after
+/// they were cleared (reset / resume): re-init in the recorded mode
+/// (which re-creates the empty tables), then [`replay`] the masks,
+/// IP6AT, and filters. A missed INIT_DONE poll is not an error
+/// (same treatment as `configure_fdir`); a failed filter add
+/// surfaces as its error. No-op when no config was recorded.
+pub fn restore(bank: &mut impl RegBank, state: &FdirState, sctp: bool) -> Result<(), FdirError> {
+    match state.config {
+        None => Ok(()),
+        Some(cfg) => {
+            match cfg.mode {
+                FdirMode::Signature => {
+                    init_signature(bank, cfg.pballoc);
+                }
+                FdirMode::Perfect => {
+                    init_perfect(bank, cfg.pballoc);
+                }
+            }
+            replay(bank, state, sctp)
+        }
+    }
 }
 
 /// Read Flow Director statistics (all registers read to clear — call

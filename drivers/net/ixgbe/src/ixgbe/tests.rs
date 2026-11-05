@@ -1583,6 +1583,7 @@ fn smoke_ixgbe_fdir_mask_words() -> TestResult {
         flex_bytes: 0xFFFF,
         src_ip: 0xFFFF_FFFF,
         dst_ip: 0xFFFF_FFFF,
+        dst_ipv6_match: false,
     };
     let (fdirm, port, src, dst) = match mask_words(&all_match) {
         Ok(w) => w,
@@ -1590,6 +1591,16 @@ fn smoke_ixgbe_fdir_mask_words() -> TestResult {
     };
     if fdirm != 0x20 || port != 0 || src != 0 || dst != 0 {
         return TestResult::Fail("match-all mask words wrong");
+    }
+    // Asking for the IP6AT destination compare clears DIPv6.
+    let mut match_v6 = all_match;
+    match_v6.dst_ipv6_match = true;
+    let (fdirm, _, _, _) = match mask_words(&match_v6) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("ipv6-match mask rejected"),
+    };
+    if fdirm != 0x00 {
+        return TestResult::Fail("dst_ipv6_match did not clear DIPv6");
     }
     // Mask-everything mask: all FDIRM bits; inverted registers all ones.
     let all_masked = FdirMask {
@@ -1601,6 +1612,7 @@ fn smoke_ixgbe_fdir_mask_words() -> TestResult {
         flex_bytes: 0x0000,
         src_ip: 0,
         dst_ip: 0,
+        dst_ipv6_match: false,
     };
     let (fdirm, port, src, dst) = match mask_words(&all_masked) {
         Ok(w) => w,
@@ -1608,6 +1620,29 @@ fn smoke_ixgbe_fdir_mask_words() -> TestResult {
     };
     if fdirm != 0x3F || port != 0xFFFF_FFFF || src != 0xFFFF_FFFF || dst != 0xFFFF_FFFF {
         return TestResult::Fail("mask-all mask words wrong");
+    }
+    // Mask-all with the IP6AT compare: every FDIRM bit except DIPv6.
+    let mut masked_v6 = all_masked;
+    masked_v6.dst_ipv6_match = true;
+    let (fdirm, _, _, _) = match mask_words(&masked_v6) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("masked ipv6 mask rejected"),
+    };
+    if fdirm != 0x1F {
+        return TestResult::Fail("masked ipv6 FDIRM wrong");
+    }
+    // /24 source mask: only the last address byte is masked out, so
+    // the register is 0xFF000000 — the non-palindromic case that
+    // defeats the byte-order trap (verbatim numerics would give
+    // 0x000000FF here).
+    let mut slash24 = all_match;
+    slash24.src_ip = 0xFFFF_FF00;
+    let (_, _, src, _) = match mask_words(&slash24) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("/24 mask rejected"),
+    };
+    if src != 0xFF00_0000 {
+        return TestResult::Fail("/24 mask word wrong");
     }
     // Validation rejects each bad field.
     let mut bad = all_match;
@@ -1684,11 +1719,11 @@ fn smoke_ixgbe_fdir_perfect_conversation() -> TestResult {
     if add_perfect(&mut bank, &input, 7, 3).is_err() {
         return TestResult::Fail("add_perfect failed");
     }
-    if bank.stored(REG_FDIRSIPV6_BASE) != 0xC0A8_010A
+    if bank.stored(REG_FDIRSIPV6_BASE) != 0x0A01_A8C0
         || bank.stored(REG_FDIRSIPV6_BASE + 4) != 0
         || bank.stored(REG_FDIRSIPV6_BASE + 8) != 0
-        || bank.stored(REG_FDIRIPSA) != 0xC0A8_010A
-        || bank.stored(REG_FDIRIPDA) != 0xC0A8_0114
+        || bank.stored(REG_FDIRIPSA) != 0x0A01_A8C0
+        || bank.stored(REG_FDIRIPDA) != 0x1401_A8C0
         || bank.stored(REG_FDIRPORT) != 0x0050_3039
         || bank.stored(REG_FDIRVLAN) != 0x0000_0064
         || bank.stored(REG_FDIRHASH) != 0x0007_1f6c
@@ -1820,6 +1855,430 @@ fn smoke_ixgbe_fdir_stats() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_stats);
+
+// ── IPv6 perfect filters, IP6M, reserved-bits guard, restore ──────────
+
+fn smoke_ixgbe_fdir_ipv6_hash_oracles() -> TestResult {
+    use super::fdir::{
+        apply_mask, ip6_mask_words, perfect_bucket_hash, perfect_stream6, FdirPerfectInput6,
+    };
+    // TCPv6 2001:db8::1 -> 2001:db8::2, vlan 100, ports 12345/80.
+    // Oracles from an independent Python re-implementation of
+    // Linux's ixgbe_atr_compute_perfect_hash_82599 (validated
+    // against the landed IPv4 control vector 0x1f6c first).
+    let tcp6 = FdirPerfectInput6 {
+        vm_pool: 0,
+        flow_type: super::fdir::FLOW_TYPE_TCPV6,
+        vlan_id: 100,
+        src_ip: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        dst_ip: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        src_port: 12345,
+        dst_port: 80,
+        flex_bytes: 0,
+        bkt_hash: 0,
+        dst_matches_ip6at: true,
+    };
+    // Stream layout: word 0 flow/vm/VLAN, words 1..4 source dwords
+    // (MS first), words 5..8 destination dwords (MS first), word 9
+    // ports, word 10 flex bytes.
+    let stream = perfect_stream6(&tcp6);
+    if stream
+        != [
+            0x0006_0064,
+            0x2001_0DB8,
+            0,
+            0,
+            1,
+            0x2001_0DB8,
+            0,
+            0,
+            2,
+            0x3039_0050,
+            0,
+        ]
+    {
+        return TestResult::Fail("ipv6 perfect stream layout wrong");
+    }
+    if perfect_bucket_hash(&stream) != 0x0b40 {
+        return TestResult::Fail("ipv6 tcp bucket oracle mismatch");
+    }
+    // UDPv6 2001:db8:85a3::8a2e:370:7334 -> 2001:db8::ff, ports 53/5353.
+    let udp6 = FdirPerfectInput6 {
+        vm_pool: 0,
+        flow_type: super::fdir::FLOW_TYPE_UDPV6,
+        vlan_id: 0,
+        src_ip: [
+            0x20, 0x01, 0x0d, 0xb8, 0x85, 0xa3, 0, 0, 0, 0, 0x8a, 0x2e, 0x03, 0x70, 0x73, 0x34,
+        ],
+        dst_ip: [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff,
+        ],
+        src_port: 53,
+        dst_port: 5353,
+        flex_bytes: 0,
+        bkt_hash: 0,
+        dst_matches_ip6at: false,
+    };
+    if perfect_bucket_hash(&perfect_stream6(&udp6)) != 0x05b9 {
+        return TestResult::Fail("ipv6 udp bucket oracle mismatch");
+    }
+    // Bare IPv6 flow (type 0x4), all-ones source, all-0x01 destination.
+    let bare6 = FdirPerfectInput6 {
+        vm_pool: 0,
+        flow_type: super::fdir::FLOW_TYPE_IPV6,
+        vlan_id: 0,
+        src_ip: [0xFF; 16],
+        dst_ip: [0x01; 16],
+        src_port: 0,
+        dst_port: 0,
+        flex_bytes: 0,
+        bkt_hash: 0,
+        dst_matches_ip6at: false,
+    };
+    if perfect_bucket_hash(&perfect_stream6(&bare6)) != 0x14a5 {
+        return TestResult::Fail("ipv6 bare bucket oracle mismatch");
+    }
+    // Masked hash: SIPM=0xFF00 masks source bytes 8..15, DIPM=0xFFFF
+    // masks every destination byte (hash/signature only).
+    let (src_m, dst_m) = ip6_mask_words(0xFF00, 0xFFFF);
+    if src_m != [0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0] || dst_m != [0, 0, 0, 0] {
+        return TestResult::Fail("ip6 mask words wrong");
+    }
+    let mut mask = [0u32; 11];
+    mask[0] = 0xFFFF_FFFF;
+    mask[1..5].copy_from_slice(&src_m);
+    mask[5..9].copy_from_slice(&dst_m);
+    mask[9] = 0xFFFF_FFFF;
+    mask[10] = 0xFFFF_FFFF;
+    if perfect_bucket_hash(&apply_mask(&stream, &mask)) != 0x0999 {
+        return TestResult::Fail("ipv6 masked bucket oracle mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_ipv6_hash_oracles);
+
+fn smoke_ixgbe_fdir_ipv6_perfect_conversation() -> TestResult {
+    use super::fdir::REG_FDIRSIPV6_BASE;
+    use super::fdir::{add_perfect_ipv6, FdirPerfectInput6, FLOW_TYPE_TCPV6};
+    use super::fdir::{
+        REG_FDIRCMD, REG_FDIRHASH, REG_FDIRIPDA, REG_FDIRIPSA, REG_FDIRPORT, REG_FDIRVLAN,
+    };
+    let input = FdirPerfectInput6 {
+        vm_pool: 0,
+        flow_type: FLOW_TYPE_TCPV6,
+        vlan_id: 100,
+        src_ip: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        dst_ip: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        src_port: 12345,
+        dst_port: 80,
+        flex_bytes: 0,
+        bkt_hash: 0x0b40,
+        dst_matches_ip6at: true,
+    };
+    let mut bank = FdirBank::new(false);
+    if add_perfect_ipv6(&mut bank, &input, 8, 5).is_err() {
+        return TestResult::Fail("add_perfect_ipv6 failed");
+    }
+    // Source IPv6 as LE-loaded words (LS byte first on the wire):
+    // FDIRSIPv6[0] = 0xB80D0120, FDIRIPSA = 0x01000000; FDIRIPDA = 0
+    // (IPv4-only register; the destination matches via IP6AT).
+    // FDIRCMD carries IPV6 + IPv6DMatch + queue 5.
+    if bank.stored(REG_FDIRSIPV6_BASE) != 0xB80D_0120
+        || bank.stored(REG_FDIRSIPV6_BASE + 4) != 0
+        || bank.stored(REG_FDIRSIPV6_BASE + 8) != 0
+        || bank.stored(REG_FDIRIPSA) != 0x0100_0000
+        || bank.stored(REG_FDIRIPDA) != 0
+        || bank.stored(REG_FDIRPORT) != 0x0050_3039
+        || bank.stored(REG_FDIRVLAN) != 0x0000_0064
+        || bank.stored(REG_FDIRHASH) != 0x0008_0b40
+        || bank.stored(REG_FDIRCMD) != 0x0005_88D9
+    {
+        return TestResult::Fail("ipv6 perfect add register conversation wrong");
+    }
+    // Destination must NOT match IP6AT: IPv6DMatch clear.
+    let mut no_match = input;
+    no_match.dst_matches_ip6at = false;
+    let mut bank = FdirBank::new(false);
+    if add_perfect_ipv6(&mut bank, &no_match, 8, 5).is_err() {
+        return TestResult::Fail("ipv6 no-match add failed");
+    }
+    if bank.stored(REG_FDIRCMD) != 0x0005_88C9 {
+        return TestResult::Fail("ipv6 no-match FDIRCMD wrong");
+    }
+    // Drop-queue add sets the DROP bit.
+    let mut bank = FdirBank::new(false);
+    if add_perfect_ipv6(&mut bank, &input, 0, 127).is_err() {
+        return TestResult::Fail("ipv6 drop-queue add failed");
+    }
+    if bank.stored(REG_FDIRCMD) != 0x007F_8AD9 {
+        return TestResult::Fail("ipv6 drop-queue FDIRCMD wrong");
+    }
+    // Guards: IPv4 flow type and queue > 127 rejected.
+    let mut bad = input;
+    bad.flow_type = super::fdir::FLOW_TYPE_TCPV4;
+    let mut bank = FdirBank::new(false);
+    if add_perfect_ipv6(&mut bank, &bad, 0, 5).is_ok() {
+        return TestResult::Fail("IPv4 ipv6 perfect add accepted");
+    }
+    let mut bank = FdirBank::new(false);
+    if add_perfect_ipv6(&mut bank, &input, 0, 128).is_ok() {
+        return TestResult::Fail("queue 128 ipv6 perfect add accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_fdir_ipv6_perfect_conversation
+);
+
+fn smoke_ixgbe_fdir_ip6_mask() -> TestResult {
+    use super::fdir::{set_ip6_mask, REG_FDIRIP6M};
+    let mut bank = FdirBank::new(false);
+    set_ip6_mask(&mut bank, 0xFF00, 0xFFFF);
+    if bank.stored(REG_FDIRIP6M) != 0xFFFF_FF00 {
+        return TestResult::Fail("FDIRIP6M write wrong");
+    }
+    let mut bank = FdirBank::new(false);
+    set_ip6_mask(&mut bank, 0x0000, 0x0000);
+    if bank.stored(REG_FDIRIP6M) != 0 {
+        return TestResult::Fail("zero FDIRIP6M write wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_ip6_mask);
+
+fn smoke_ixgbe_fdirctrl_reserved_bits() -> TestResult {
+    use super::fdir::{fdirctrl_perfect, fdirctrl_signature, FdirPballoc, FDIRCTRL_RESERVED_MASK};
+    // Cloud / MACVLAN filter modes do not exist on the 82599:
+    // FDIRCTRL bits 23:21 are Reserved (datasheet rev. 2.6
+    // §8.2.3.21.1, rev. 3.4 §8.2.3.21.1). No mode/pballoc may set them.
+    for pballoc in [
+        FdirPballoc::None,
+        FdirPballoc::K64,
+        FdirPballoc::K128,
+        FdirPballoc::K256,
+    ] {
+        if fdirctrl_signature(pballoc) & FDIRCTRL_RESERVED_MASK != 0
+            || fdirctrl_perfect(pballoc) & FDIRCTRL_RESERVED_MASK != 0
+        {
+            return TestResult::Fail("FDIRCTRL reserved bits set");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdirctrl_reserved_bits);
+
+/// Journaling bank: records every write in order. `FakeBank` keeps
+/// only the last value per register, so a replay that wrote one
+/// filter then overwrote it would look identical to a replay that
+/// wrote both — the journal defeats that.
+struct JournalBank {
+    inner: FdirBank,
+    journal: alloc::vec::Vec<(u64, u32)>,
+}
+
+impl JournalBank {
+    fn new(query_valid: bool) -> Self {
+        Self {
+            inner: FdirBank::new(query_valid),
+            journal: alloc::vec::Vec::new(),
+        }
+    }
+}
+
+impl super::queues::RegBank for JournalBank {
+    fn read32(&self, offset: u64) -> u32 {
+        self.inner.read32(offset)
+    }
+
+    fn write32(&mut self, offset: u64, value: u32) {
+        self.journal.push((offset, value));
+        self.inner.write32(offset, value);
+    }
+}
+
+fn smoke_ixgbe_fdir_restore_conversation() -> TestResult {
+    use super::fdir::{
+        restore, FdirConfig, FdirMask, FdirMode, FdirPballoc, FdirPerfectInput, FdirPerfectInput6,
+        FdirState, FLOW_TYPE_TCPV4, FLOW_TYPE_TCPV6,
+    };
+    use super::fdir::{
+        REG_FDIRCMD, REG_FDIRCTRL, REG_FDIRHASH, REG_FDIRHKEY, REG_FDIRIPDA, REG_FDIRIPSA,
+        REG_FDIRM, REG_FDIRPORT, REG_FDIRSIPV6_BASE, REG_FDIRSKEY, REG_FDIRVLAN,
+    };
+    use super::fdir::{REG_FDIRDIP4M, REG_FDIRIP6M, REG_FDIRSIP4M, REG_FDIRTCPM, REG_FDIRUDPM};
+    use super::wol::REG_IP6AT_BASE;
+    let mut state = FdirState::default();
+    state.config = Some(FdirConfig {
+        mode: FdirMode::Perfect,
+        pballoc: FdirPballoc::K64,
+    });
+    state.mask = Some(FdirMask {
+        vm_pool: 0x7F,
+        flow_type: 0x03,
+        vlan_id: 0xEFFF,
+        src_port: 0xFFFF,
+        dst_port: 0xFFFF,
+        flex_bytes: 0xFFFF,
+        src_ip: 0xFFFF_FFFF,
+        dst_ip: 0xFFFF_FFFF,
+        dst_ipv6_match: false,
+    });
+    state.ip6_mask = Some((0xFF00, 0xFFFF));
+    state.ip6at = Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    state.record_perfect(
+        FdirPerfectInput {
+            vm_pool: 0,
+            flow_type: FLOW_TYPE_TCPV4,
+            vlan_id: 100,
+            src_ip: 0xC0A8_010A,
+            dst_ip: 0xC0A8_0114,
+            src_port: 12345,
+            dst_port: 80,
+            flex_bytes: 0,
+            bkt_hash: 0x1f6c,
+        },
+        7,
+        3,
+    );
+    state.record_perfect6(
+        FdirPerfectInput6 {
+            vm_pool: 0,
+            flow_type: FLOW_TYPE_TCPV6,
+            vlan_id: 100,
+            src_ip: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            dst_ip: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            src_port: 12345,
+            dst_port: 80,
+            flex_bytes: 0,
+            bkt_hash: 0x0b40,
+            dst_matches_ip6at: true,
+        },
+        8,
+        5,
+    );
+    state.record_signature(0x0002_0000, 0x0000_0003, 0x02, 5);
+    let mut bank = JournalBank::new(false);
+    if restore(&mut bank, &state, false).is_err() {
+        return TestResult::Fail("restore failed");
+    }
+    // Full write conversation, in order: init (keys + FDIRCTRL),
+    // input mask, IPv6 mask, IP6AT, IPv4 perfect add, IPv6 perfect
+    // add, signature add.
+    let want: &[(u64, u32)] = &[
+        (REG_FDIRHKEY, 0x3DAD_14E2),
+        (REG_FDIRSKEY, 0x174D_3614),
+        (REG_FDIRCTRL, 0x4A06_7F11),
+        (REG_FDIRM, 0x20),
+        (REG_FDIRTCPM, 0),
+        (REG_FDIRUDPM, 0),
+        (REG_FDIRSIP4M, 0),
+        (REG_FDIRDIP4M, 0),
+        (REG_FDIRIP6M, 0xFFFF_FF00),
+        (REG_IP6AT_BASE, 0xB80D_0120),
+        (REG_IP6AT_BASE + 4, 0),
+        (REG_IP6AT_BASE + 8, 0),
+        (REG_IP6AT_BASE + 12, 0x0200_0000),
+        (REG_FDIRSIPV6_BASE, 0x0A01_A8C0),
+        (REG_FDIRSIPV6_BASE + 4, 0),
+        (REG_FDIRSIPV6_BASE + 8, 0),
+        (REG_FDIRIPSA, 0x0A01_A8C0),
+        (REG_FDIRIPDA, 0x1401_A8C0),
+        (REG_FDIRPORT, 0x0050_3039),
+        (REG_FDIRVLAN, 0x0000_0064),
+        (REG_FDIRHASH, 0x0007_1f6c),
+        (REG_FDIRCMD, 0x0003_8849),
+        (REG_FDIRSIPV6_BASE, 0xB80D_0120),
+        (REG_FDIRSIPV6_BASE + 4, 0),
+        (REG_FDIRSIPV6_BASE + 8, 0),
+        (REG_FDIRIPSA, 0x0100_0000),
+        (REG_FDIRIPDA, 0),
+        (REG_FDIRPORT, 0x0050_3039),
+        (REG_FDIRVLAN, 0x0000_0064),
+        (REG_FDIRHASH, 0x0008_0b40),
+        (REG_FDIRCMD, 0x0005_88D9),
+        (REG_FDIRHASH, 0x1b79_58a1),
+        (REG_FDIRCMD, 0x0005_8849),
+    ];
+    if bank.journal.as_slice() != want {
+        return TestResult::Fail("restore write journal wrong");
+    }
+    // No config recorded: restore is a no-op.
+    let empty = FdirState::default();
+    let mut bank = JournalBank::new(false);
+    if restore(&mut bank, &empty, false).is_err() {
+        return TestResult::Fail("empty restore failed");
+    }
+    if !bank.journal.is_empty() {
+        return TestResult::Fail("empty restore wrote registers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fdir_restore_conversation);
+
+fn smoke_ixgbe_fdir_reinit_replay_conversation() -> TestResult {
+    use super::fdir::{reinit_tables, replay, FdirPerfectInput, FdirState, FLOW_TYPE_TCPV4};
+    use super::fdir::{
+        REG_FDIRCMD, REG_FDIRCTRL, REG_FDIRFREE, REG_FDIRHASH, REG_FDIRIPDA, REG_FDIRIPSA,
+        REG_FDIRPORT, REG_FDIRSIPV6_BASE, REG_FDIRVLAN,
+    };
+    use super::queues::RegBank;
+    let v4 = FdirPerfectInput {
+        vm_pool: 0,
+        flow_type: FLOW_TYPE_TCPV4,
+        vlan_id: 100,
+        src_ip: 0xC0A8_010A,
+        dst_ip: 0xC0A8_0114,
+        src_port: 12345,
+        dst_port: 80,
+        flex_bytes: 0,
+        bkt_hash: 0x1f6c,
+    };
+    let mut state = FdirState::default();
+    state.record_perfect(v4, 7, 3);
+    state.record_perfect(v4, 9, 4);
+    // Forget the second filter: replay must re-add only the first.
+    state.forget_perfect(0x1f6c, 9);
+    if state.len() != 1 {
+        return TestResult::Fail("forget_perfect did not drop the filter");
+    }
+    // Seed the bank as the existing reinit fixture does, then clear
+    // the journal so only the reinit+replay conversation is pinned.
+    let mut bank = JournalBank::new(false);
+    bank.write32(REG_FDIRCTRL, 0x4A06_7F11);
+    bank.write32(REG_FDIRCMD, 0x0000_8001);
+    bank.journal.clear();
+    if reinit_tables(&mut bank).is_err() {
+        return TestResult::Fail("reinit failed");
+    }
+    if replay(&mut bank, &state, false).is_err() {
+        return TestResult::Fail("replay failed");
+    }
+    let want: &[(u64, u32)] = &[
+        (REG_FDIRFREE, 0),
+        (REG_FDIRCMD, 0x8100),
+        (REG_FDIRCMD, 0x8000),
+        (REG_FDIRHASH, 0),
+        (REG_FDIRCTRL, 0x4A06_7F11),
+        (REG_FDIRSIPV6_BASE, 0x0A01_A8C0),
+        (REG_FDIRSIPV6_BASE + 4, 0),
+        (REG_FDIRSIPV6_BASE + 8, 0),
+        (REG_FDIRIPSA, 0x0A01_A8C0),
+        (REG_FDIRIPDA, 0x1401_A8C0),
+        (REG_FDIRPORT, 0x0050_3039),
+        (REG_FDIRVLAN, 0x0000_0064),
+        (REG_FDIRHASH, 0x0007_1f6c),
+        (REG_FDIRCMD, 0x0003_8849),
+    ];
+    if bank.journal.as_slice() != want {
+        return TestResult::Fail("reinit+replay write journal wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_fdir_reinit_replay_conversation
+);
 
 // ── DCB fixtures ───────────────────────────────────────────────────
 
