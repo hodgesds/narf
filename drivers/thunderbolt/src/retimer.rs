@@ -22,9 +22,11 @@
 //! Configuration Enabling Decisions — the Phase 3 record of lane
 //! bonding, §4.1.1.3 — must agree with the router port's own, or the
 //! link is rejected with a typed error rather than silently treated
-//! as single-lane), and the retimer NVM firmware-update surface
+//! as single-lane), the retimer NVM firmware-update surface
 //! (sector size, offset, 64-byte block writes, read-back, and the
-//! authenticate handshake) restricted to on-board retimers.
+//! authenticate handshake) restricted to on-board retimers, and the
+//! lane-margining Port Operations (capabilities, hardware and
+//! software runs, software error counters; USB4 v2.0 §8.3.2.4).
 //!
 //! Register indices, `PORT_CS_1` field positions and FourCC opcodes
 //! follow USB4 Specification v2.0 (June 2023) Table 4-18, Table 8-13
@@ -32,7 +34,12 @@
 //! `tb_regs.h`, `usb4.c` and `retimer.c`. Retimer-specific
 //! operations (`SET_INBOUND_SBTX` and the NVM operations) are
 //! defined by the USB4 Re-Timer Specification and named here with
-//! the FourCC values Linux uses for them.
+//! the FourCC values Linux uses for them. The lane-margining
+//! operation FourCCs, Metadata encodings, completion timeouts and
+//! Data-register result layouts are taken from Linux
+//! `drivers/thunderbolt/sb_regs.h` and `usb4.c`
+//! (`usb4_port_margining_caps`, `usb4_port_hw_margin`,
+//! `usb4_port_sw_margin`, `usb4_port_sw_margin_errors`).
 
 use super::{cm::CfgSpace, control::Config, ring};
 use alloc::vec::Vec;
@@ -87,6 +94,27 @@ pub const OP_NVM_AUTH_WRITE: u32 = 0x4854_5541;
 /// `NVM_READ` retimer operation ("AFRR"): reads NVM into the Data
 /// register; offset/length are staged in Metadata.
 pub const OP_NVM_READ: u32 = 0x5252_4641;
+/// `READ_LANE_MARGINING_CAP` Port Operation ("RDCP", USB4 §8.3.2.4):
+/// read the lane-margining capabilities; the three capability
+/// dwords land in the Data register after completion.
+pub const OP_READ_LANE_MARGINING_CAP: u32 = 0x5043_4452;
+/// `RUN_HW_LANE_MARGINING` Port Operation ("RHMG", USB4 §8.3.2.4):
+/// run hardware lane margining; the run parameters are staged in
+/// Metadata and the three result dwords land in the Data register
+/// after completion.
+pub const OP_RUN_HW_LANE_MARGINING: u32 = 0x474d_4852;
+/// `RUN_SW_LANE_MARGINING` Port Operation ("RSMG", USB4 §8.3.2.4):
+/// run software lane margining; the run parameters are staged in
+/// Metadata and the single result dword lands in the Data register
+/// after completion. The error counters it accumulates are read
+/// back with [`OP_READ_SW_MARGIN_ERR`].
+pub const OP_RUN_SW_LANE_MARGINING: u32 = 0x474d_5352;
+/// `READ_SW_MARGIN_ERR` Port Operation ("RDSW", USB4 §8.3.2.4):
+/// read the software margining error counters; the standard
+/// counters arrive in the completion Metadata, the extended
+/// counters (when the capabilities report them) in the Data
+/// register.
+pub const OP_READ_SW_MARGIN_ERR: u32 = 0x5753_4452;
 
 /// Maximum number of retimers on one link (USB4 v2.0 Figure 4-3).
 pub const MAX_RETIMERS: u8 = 6;
@@ -101,6 +129,13 @@ const SB_TIMEOUT_MS: u64 = 500;
 const OP_TIMEOUT_MS: u64 = 500;
 /// Completion deadline for `NVM_BLOCK_WRITE` (flash program time).
 const BLOCK_WRITE_TIMEOUT_MS: u64 = 1000;
+/// Completion deadline for the lane-margining run operations
+/// (`RUN_HW_LANE_MARGINING`, `RUN_SW_LANE_MARGINING`; Linux
+/// `usb4_port_hw_margin`/`usb4_port_sw_margin` use 2500 ms).
+const MARGIN_RUN_TIMEOUT_MS: u64 = 2500;
+/// Completion deadline for `READ_SW_MARGIN_ERR` (Linux
+/// `usb4_port_sw_margin_errors` uses 150 ms).
+const MARGIN_ERR_TIMEOUT_MS: u64 = 150;
 
 // `PORT_CS_1` fields (USB4 v2.0 Table 8-13).
 const CS1_WNR: u32 = 1 << 24;
@@ -710,6 +745,375 @@ pub async fn nvm_authenticate(
     .await
 }
 
+/// Which receiver lanes a lane-margining run covers (USB4 §8.3.2.4;
+/// Linux `enum usb4_margining_lane`). The value is the Metadata
+/// lanes field itself: a single receiver lane, or 7 for all lanes
+/// at once (when the capabilities report `all_lanes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarginLane {
+    /// Receiver lane 0.
+    Rx0 = 0,
+    /// Receiver lane 1.
+    Rx1 = 1,
+    /// Receiver lane 2 (asymmetric links only).
+    Rx2 = 2,
+    /// All lanes simultaneously.
+    All = 7,
+}
+
+/// Software margining error-counter operation (Linux `enum
+/// usb4_margin_sw_error_counter`): what a [`sw_margin`] run does
+/// to the error counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarginErrorCounter {
+    /// No change in counter setup.
+    Nop = 0,
+    /// Set the error counter to 0, enable counter.
+    Clear = 1,
+    /// Start counter, count from last value.
+    Start = 2,
+    /// Stop counter, do not clear value.
+    Stop = 3,
+}
+
+/// Parameters for a hardware or software lane-margining run (Linux
+/// `struct usb4_port_margining_params`). Fields that only one run
+/// kind uses are ignored by the other: `ber_level` is a hardware
+/// run field, `error_counter` and `voltage_time_offset` are
+/// software run fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarginParams {
+    /// Lanes to run on.
+    pub lanes: MarginLane,
+    /// True for time margining instead of voltage margining.
+    pub time: bool,
+    /// False for a left/low margin test, true for right/high.
+    pub right_high: bool,
+    /// True when the margin test runs on the upper eye, false for
+    /// the lower eye.
+    pub upper_eye: bool,
+    /// Enable the optional extended voltage range.
+    pub optional_voltage_offset_range: bool,
+    /// BER level contour value for a hardware run (0..=31); 0
+    /// leaves the contour unselected.
+    pub ber_level: u8,
+    /// Error-counter operation for a software run.
+    pub error_counter: MarginErrorCounter,
+    /// Voltage/time offset for a software run (0..=127).
+    pub voltage_time_offset: u8,
+}
+
+/// The Metadata word for a hardware lane-margining run (Linux
+/// `usb4_port_hw_margin`): lanes in bits 2:0, time in bit 3,
+/// right/high-or-upper-eye in bit 4, BER level in bits 9:5,
+/// optional voltage range in bit 10.
+fn hw_margin_metadata(params: &MarginParams) -> Result<u32, Error> {
+    if params.ber_level > 31 {
+        return Err(Error::InvalidArgument);
+    }
+    let mut value = params.lanes as u32;
+    if params.time {
+        value |= 1 << 3;
+    }
+    if params.right_high || params.upper_eye {
+        value |= 1 << 4;
+    }
+    value |= (params.ber_level as u32) << 5;
+    if params.optional_voltage_offset_range {
+        value |= 1 << 10;
+    }
+    Ok(value)
+}
+
+/// The Metadata word for a software lane-margining run (Linux
+/// `usb4_port_sw_margin`): lanes in bits 2:0, time in bit 3,
+/// right/high in bit 4, optional voltage range in bit 5,
+/// voltage/time offset in bits 12:6, error-counter operation in
+/// bits 14:13, upper eye in bit 15.
+fn sw_margin_metadata(params: &MarginParams) -> Result<u32, Error> {
+    if params.voltage_time_offset > 127 {
+        return Err(Error::InvalidArgument);
+    }
+    let mut value = params.lanes as u32;
+    if params.time {
+        value |= 1 << 3;
+    }
+    if params.right_high {
+        value |= 1 << 4;
+    }
+    if params.optional_voltage_offset_range {
+        value |= 1 << 5;
+    }
+    value |= (params.voltage_time_offset as u32) << 6;
+    value |= (params.error_counter as u32) << 13;
+    if params.upper_eye {
+        value |= 1 << 15;
+    }
+    Ok(value)
+}
+
+/// Lane-margining capabilities read by `RDCP`: the three Data
+/// dwords (USB4 §8.3.2.4; Linux `usb4_port_margining_caps` reads
+/// three). Dwords 0/1 describe Gen 2/3 behaviour; dword 2 is the
+/// Gen 4 set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarginCaps {
+    /// The three capability dwords, in Data-register order.
+    pub words: [u32; 3],
+}
+
+impl MarginCaps {
+    /// Hardware margining is supported (dword 0 bit 0).
+    pub fn supports_hw(&self) -> bool {
+        self.words[0] & 1 != 0
+    }
+    /// Software margining is supported (dword 0 bit 1).
+    pub fn supports_sw(&self) -> bool {
+        self.words[0] & (1 << 1) != 0
+    }
+    /// All lanes can be margined simultaneously (dword 0 bit 2).
+    pub fn all_lanes(&self) -> bool {
+        self.words[0] & (1 << 2) != 0
+    }
+    /// Time margining is supported (dword 0 bit 5).
+    pub fn time_supported(&self) -> bool {
+        self.words[0] & (1 << 5) != 0
+    }
+    /// Number of voltage margin steps (dword 0 bits 12:6).
+    pub fn voltage_steps(&self) -> u32 {
+        (self.words[0] >> 6) & 0x7f
+    }
+    /// Maximum voltage offset in mV (dword 0 bits 18:13).
+    pub fn max_voltage_offset(&self) -> u32 {
+        (self.words[0] >> 13) & 0x3f
+    }
+    /// The optional extended voltage range is supported
+    /// (dword 0 bit 19).
+    pub fn optional_voltage_supported(&self) -> bool {
+        self.words[0] & (1 << 19) != 0
+    }
+    /// Number of voltage margin steps in the optional range
+    /// (dword 0 bits 26:20).
+    pub fn voltage_steps_optional(&self) -> u32 {
+        (self.words[0] >> 20) & 0x7f
+    }
+    /// The extended error counter is supported (dword 0 bit 28):
+    /// [`sw_margin_errors_ext`] returns per-lane extended counts.
+    pub fn extended_error_counter(&self) -> bool {
+        self.words[0] & (1 << 28) != 0
+    }
+    /// Maximum voltage offset in mV in the optional range
+    /// (dword 1 bits 7:0).
+    pub fn max_voltage_offset_optional(&self) -> u32 {
+        self.words[1] & 0xff
+    }
+    /// Time margining is destructive (dword 1 bit 8).
+    pub fn time_destructive(&self) -> bool {
+        self.words[1] & (1 << 8) != 0
+    }
+    /// Number of time margin steps (dword 1 bits 15:11).
+    pub fn time_steps(&self) -> u32 {
+        (self.words[1] >> 11) & 0x1f
+    }
+    /// Maximum time offset in mUI (dword 1 bits 20:16).
+    pub fn max_time_offset(&self) -> u32 {
+        (self.words[1] >> 16) & 0x1f
+    }
+    /// Minimum BER level contour (dword 1 bits 25:21).
+    pub fn min_ber_level(&self) -> u32 {
+        (self.words[1] >> 21) & 0x1f
+    }
+    /// Maximum BER level contour (dword 1 bits 30:26).
+    pub fn max_ber_level(&self) -> u32 {
+        (self.words[1] >> 26) & 0x1f
+    }
+    /// Hardware margining is supported on a Gen 4 link
+    /// (dword 2 bit 0).
+    pub fn supports_hw_gen4(&self) -> bool {
+        self.words[2] & 1 != 0
+    }
+    /// Software margining is supported on a Gen 4 link
+    /// (dword 2 bit 1).
+    pub fn supports_sw_gen4(&self) -> bool {
+        self.words[2] & (1 << 1) != 0
+    }
+    /// Time margining is supported on a Gen 4 link (dword 2 bit 2).
+    pub fn time_supported_gen4(&self) -> bool {
+        self.words[2] & (1 << 2) != 0
+    }
+}
+
+/// Hardware lane-margining results from `RHMG`: the three Data
+/// dwords (Linux `HW_MARGINING_DWORDS`). Linux interprets dwords
+/// 1..2 as the per-lane results and leaves dword 0 uninterpreted:
+/// dword 1 holds lanes 0 (low half) and 1 (high half), dword 2
+/// holds lane 2. Each lane result is a byte pair — the low byte is
+/// the right/high margin, the high byte the left/low margin — with
+/// the margin value in bits 6:0 and the exceeds-maximum flag in
+/// bit 7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HwMarginResults {
+    /// The three result dwords, in Data-register order.
+    pub words: [u32; 3],
+}
+
+impl HwMarginResults {
+    /// The raw margin byte for `lane` on the requested side
+    /// (Linux `margining_hw_result_val` in `debugfs.c`).
+    pub fn lane_byte(&self, lane: MarginLane, right_high: bool) -> u8 {
+        let value = match lane {
+            MarginLane::Rx0 => self.words[1],
+            MarginLane::Rx1 => self.words[1] >> 16,
+            MarginLane::Rx2 => self.words[2],
+            MarginLane::All => 0,
+        };
+        let byte = if right_high { value } else { value >> 8 };
+        byte as u8
+    }
+
+    /// The margin value (bits 6:0) of a margin byte.
+    pub fn margin(byte: u8) -> u8 {
+        byte & 0x7f
+    }
+
+    /// Whether a margin byte reports the margin exceeds the
+    /// maximum (bit 7).
+    pub fn exceeds(byte: u8) -> bool {
+        byte & 0x80 != 0
+    }
+}
+
+/// Software margining error counters from `RDSW`: the standard
+/// counter word. Lane 0 occupies bits 3:0, lane 1 bits 7:4, lane 2
+/// bits 11:8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwMarginErrors {
+    /// The standard counter word.
+    pub word: u32,
+}
+
+impl SwMarginErrors {
+    /// The error count for one lane (0 for `All`: the standard
+    /// word holds per-lane counts, not an aggregate).
+    pub fn lane(&self, lane: MarginLane) -> u32 {
+        match lane {
+            MarginLane::Rx0 => self.word & 0xf,
+            MarginLane::Rx1 => (self.word >> 4) & 0xf,
+            MarginLane::Rx2 => (self.word >> 8) & 0xf,
+            MarginLane::All => 0,
+        }
+    }
+}
+
+/// Extended software margining error counters from `RDSW`: the
+/// four Data dwords (Linux `SW_MARGINING_DWORDS`). Dword 0 is the
+/// standard counter word (see [`SwMarginErrors`]); dword 1 + lane
+/// holds that lane's extended counter bits, placed in bits 15:4 of
+/// the lane's error count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwMarginErrorsExt {
+    /// The four counter dwords, in Data-register order.
+    pub words: [u32; 4],
+}
+
+impl SwMarginErrorsExt {
+    /// The error count for one lane, standard nibble plus its
+    /// extended bits (Linux `margining_get_lane_error`).
+    pub fn lane(&self, lane: MarginLane) -> u32 {
+        let index = match lane {
+            MarginLane::Rx0 => 0,
+            MarginLane::Rx1 => 1,
+            MarginLane::Rx2 => 2,
+            MarginLane::All => return 0,
+        };
+        let standard = SwMarginErrors {
+            word: self.words[0],
+        }
+        .lane(lane);
+        standard | ((self.words[1 + index] & 0xfff) << 4)
+    }
+}
+
+/// Read a port's lane-margining capabilities (`RDCP`, USB4
+/// §8.3.2.4). The operation runs against the channel's target —
+/// the router port itself or one retimer on the link, selected by
+/// `ch` — and the three capability dwords are read from the Data
+/// register after completion. A port without margining answers
+/// `!CMD` ([`Error::NotSupported`]).
+pub async fn margining_caps(ctl: &mut impl Config, ch: SbChannel) -> Result<MarginCaps, Error> {
+    port_op(ctl, ch, OP_READ_LANE_MARGINING_CAP, OP_TIMEOUT_MS).await?;
+    let data = sb_read(ctl, ch, SB_DATA, 12).await?;
+    Ok(MarginCaps {
+        words: [data[0], data[1], data[2]],
+    })
+}
+
+/// Run hardware lane margining (`RHMG`, USB4 §8.3.2.4) against the
+/// channel's target. The run parameters are staged in Metadata;
+/// the three result dwords are read from the Data register after
+/// completion and interpreted with [`HwMarginResults::lane_byte`].
+/// A `ber_level` above 31 is [`Error::InvalidArgument`].
+pub async fn hw_margin(
+    ctl: &mut impl Config,
+    ch: SbChannel,
+    params: &MarginParams,
+) -> Result<HwMarginResults, Error> {
+    let metadata = hw_margin_metadata(params)?;
+    sb_write(ctl, ch, SB_METADATA, &[metadata]).await?;
+    port_op(ctl, ch, OP_RUN_HW_LANE_MARGINING, MARGIN_RUN_TIMEOUT_MS).await?;
+    let data = sb_read(ctl, ch, SB_DATA, 12).await?;
+    Ok(HwMarginResults {
+        words: [data[0], data[1], data[2]],
+    })
+}
+
+/// Run software lane margining (`RSMG`, USB4 §8.3.2.4) against the
+/// channel's target. The run parameters are staged in Metadata;
+/// the single result dword is read from the Data register after
+/// completion. The error counters the run accumulates are read
+/// back with [`sw_margin_errors`] (or [`sw_margin_errors_ext`]
+/// when the capabilities report the extended counter). A
+/// `voltage_time_offset` above 127 is [`Error::InvalidArgument`].
+pub async fn sw_margin(
+    ctl: &mut impl Config,
+    ch: SbChannel,
+    params: &MarginParams,
+) -> Result<u32, Error> {
+    let metadata = sw_margin_metadata(params)?;
+    sb_write(ctl, ch, SB_METADATA, &[metadata]).await?;
+    port_op(ctl, ch, OP_RUN_SW_LANE_MARGINING, MARGIN_RUN_TIMEOUT_MS).await?;
+    Ok(sb_read(ctl, ch, SB_DATA, 4).await?[0])
+}
+
+/// Read the software margining error counters (`RDSW`, USB4
+/// §8.3.2.4) against the channel's target. The standard counters
+/// arrive in the completion Metadata; use
+/// [`sw_margin_errors_ext`] for the extended counters.
+pub async fn sw_margin_errors(
+    ctl: &mut impl Config,
+    ch: SbChannel,
+) -> Result<SwMarginErrors, Error> {
+    let metadata = port_op(ctl, ch, OP_READ_SW_MARGIN_ERR, MARGIN_ERR_TIMEOUT_MS).await?;
+    Ok(SwMarginErrors { word: metadata })
+}
+
+/// Read the extended software margining error counters (`RDSW`,
+/// USB4 §8.3.2.4) against the channel's target. Only meaningful
+/// when the capabilities report the extended error counter
+/// ([`MarginCaps::extended_error_counter`]); the four dwords are
+/// read from the Data register after completion and interpreted
+/// with [`SwMarginErrorsExt::lane`].
+pub async fn sw_margin_errors_ext(
+    ctl: &mut impl Config,
+    ch: SbChannel,
+) -> Result<SwMarginErrorsExt, Error> {
+    port_op(ctl, ch, OP_READ_SW_MARGIN_ERR, MARGIN_ERR_TIMEOUT_MS).await?;
+    let data = sb_read(ctl, ch, SB_DATA, 16).await?;
+    Ok(SwMarginErrorsExt {
+        words: [data[0], data[1], data[2], data[3]],
+    })
+}
+
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::super::{cm::CfgSpace, control::Config, ring::Error as RingError, topology::Port};
@@ -746,6 +1150,27 @@ mod tests {
         rc_reads: bool,
         garbage_ops: bool,
         drop_first_inbound: bool,
+        /// Lane-margining capabilities returned by `RDCP`.
+        margin_caps: [u32; 3],
+        /// Hardware margining results returned by `RHMG`.
+        hw_results: [u32; 3],
+        /// Software margining result dword returned by `RSMG`.
+        sw_result: u32,
+        /// Standard software error counters returned by `RDSW`
+        /// in the completion Metadata.
+        sw_errors: u32,
+        /// Extended software error counters returned by `RDSW`
+        /// in the Data register.
+        sw_errors_ext: [u32; 4],
+        /// Metadata word staged for the last `RHMG`/`RSMG` run,
+        /// snapshotted when the operation executes (the completion
+        /// overwrites the Metadata register, so the test reads the
+        /// request encoding here).
+        margin_metadata: u32,
+        /// The four lane-margining operations complete with `!CMD`.
+        margining_unsupported: bool,
+        /// The four lane-margining operations complete with `ERR `.
+        margining_failed: bool,
     }
 
     impl Default for SbDevice {
@@ -770,6 +1195,14 @@ mod tests {
                 rc_reads: false,
                 garbage_ops: false,
                 drop_first_inbound: false,
+                margin_caps: [0; 3],
+                hw_results: [0; 3],
+                sw_result: 0,
+                sw_errors: 0,
+                sw_errors_ext: [0; 4],
+                margin_metadata: 0,
+                margining_unsupported: false,
+                margining_failed: false,
             }
         }
     }
@@ -790,11 +1223,56 @@ mod tests {
             }
             let result = if self.garbage_ops {
                 (0xdead_beef, 0)
+            } else if self.margining_unsupported
+                && matches!(
+                    opcode,
+                    OP_READ_LANE_MARGINING_CAP
+                        | OP_RUN_HW_LANE_MARGINING
+                        | OP_RUN_SW_LANE_MARGINING
+                        | OP_READ_SW_MARGIN_ERR
+                )
+            {
+                (OP_ONS, 0)
+            } else if self.margining_failed
+                && matches!(
+                    opcode,
+                    OP_READ_LANE_MARGINING_CAP
+                        | OP_RUN_HW_LANE_MARGINING
+                        | OP_RUN_SW_LANE_MARGINING
+                        | OP_READ_SW_MARGIN_ERR
+                )
+            {
+                (OP_ERR, 0)
             } else {
                 match opcode {
                     OP_QUERY_LAST_RETIMER => (0, self.last as u32),
                     OP_QUERY_CABLE_RETIMER => (0, self.cable as u32),
                     OP_GET_NVM_SECTOR_SIZE => (0, self.sector_size),
+                    OP_READ_LANE_MARGINING_CAP => {
+                        self.data[0] = self.margin_caps[0];
+                        self.data[1] = self.margin_caps[1];
+                        self.data[2] = self.margin_caps[2];
+                        (0, 0)
+                    }
+                    OP_RUN_HW_LANE_MARGINING => {
+                        self.margin_metadata = self.metadata;
+                        self.data[0] = self.hw_results[0];
+                        self.data[1] = self.hw_results[1];
+                        self.data[2] = self.hw_results[2];
+                        (0, 0)
+                    }
+                    OP_RUN_SW_LANE_MARGINING => {
+                        self.margin_metadata = self.metadata;
+                        self.data[0] = self.sw_result;
+                        (0, 0)
+                    }
+                    OP_READ_SW_MARGIN_ERR => {
+                        self.data[0] = self.sw_errors_ext[0];
+                        self.data[1] = self.sw_errors_ext[1];
+                        self.data[2] = self.sw_errors_ext[2];
+                        self.data[3] = self.sw_errors_ext[3];
+                        (0, self.sw_errors)
+                    }
                     OP_NVM_SET_OFFSET => {
                         self.nvm_offset = (((self.metadata >> 2) & 0x003f_ffff) as usize) * 4;
                         (0, self.metadata)
@@ -1290,5 +1768,280 @@ mod tests {
     kernel_test_in!(
         "drivers/thunderbolt/retimer",
         usb4_retimer_inbound_sbtx_tolerance
+    );
+
+    /// Lane-margining capabilities (`RDCP`, USB4 §8.3.2.4): the
+    /// three Data dwords come back and the capability fields decode
+    /// per Linux `sb_regs.h`.
+    fn usb4_retimer_lane_margining_caps() -> TestResult {
+        let mut m = SbModel::new();
+        let mut rt = device(0x8087, 0x1111, 0x0001_0000, true, 0x03);
+        rt.margin_caps = [
+            (1 << 0)
+                | (1 << 1)
+                | (1 << 2)
+                | (1 << 5)
+                | (40 << 6)
+                | (30 << 13)
+                | (1 << 19)
+                | (20 << 20)
+                | (1 << 28),
+            0x55 | (1 << 8) | (25 << 11) | (18 << 16) | (3 << 21) | (12 << 26),
+            0x7,
+        ];
+        m.retimers = alloc::vec![rt];
+        let port = link_port();
+        let ch = SbChannel::retimer(0, &port, 1);
+        let caps = match run(margining_caps(&mut m, ch)) {
+            Ok(caps) => caps,
+            Err(_) => return TestResult::Fail("RDCP did not complete"),
+        };
+        if caps.words != m.retimers[0].margin_caps {
+            return TestResult::Fail("RDCP capability dwords are not the fixture words");
+        }
+        if !caps.supports_hw()
+            || !caps.supports_sw()
+            || !caps.all_lanes()
+            || !caps.time_supported()
+            || caps.voltage_steps() != 40
+            || caps.max_voltage_offset() != 30
+            || !caps.optional_voltage_supported()
+            || caps.voltage_steps_optional() != 20
+            || !caps.extended_error_counter()
+            || caps.max_voltage_offset_optional() != 0x55
+            || !caps.time_destructive()
+            || caps.time_steps() != 25
+            || caps.max_time_offset() != 18
+            || caps.min_ber_level() != 3
+            || caps.max_ber_level() != 12
+            || !caps.supports_hw_gen4()
+            || !caps.supports_sw_gen4()
+            || !caps.time_supported_gen4()
+        {
+            return TestResult::Fail("RDCP capability fields do not decode");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/thunderbolt/retimer",
+        usb4_retimer_lane_margining_caps
+    );
+
+    /// Hardware lane margining (`RHMG`, USB4 §8.3.2.4): the request
+    /// Metadata encodes lanes/time/right-high/BER/optional-voltage
+    /// per Linux `usb4_port_hw_margin`, and the three result dwords
+    /// parse per Linux `margining_hw_result_val`.
+    fn usb4_retimer_lane_margining_hw() -> TestResult {
+        let mut m = SbModel::new();
+        let mut rt = device(0x8087, 0x1111, 0x0001_0000, true, 0x03);
+        rt.hw_results = [0xdead_0001, 0x3310_8a25, 0x0000_0741];
+        m.retimers = alloc::vec![rt];
+        let port = link_port();
+        let ch = SbChannel::retimer(0, &port, 1);
+        let params = MarginParams {
+            lanes: MarginLane::All,
+            time: false,
+            right_high: true,
+            upper_eye: false,
+            optional_voltage_offset_range: true,
+            ber_level: 5,
+            error_counter: MarginErrorCounter::Nop,
+            voltage_time_offset: 0,
+        };
+        let results = match run(hw_margin(&mut m, ch, &params)) {
+            Ok(results) => results,
+            Err(_) => return TestResult::Fail("RHMG did not complete"),
+        };
+        // lanes 7 | right/high bit 4 | BER 5 in bits 9:5 |
+        // optional voltage bit 10.
+        if m.retimers[0].margin_metadata != 0x4b7 {
+            return TestResult::Fail("RHMG request Metadata is not the Linux encoding");
+        }
+        if results.words != [0xdead_0001, 0x3310_8a25, 0x0000_0741] {
+            return TestResult::Fail("RHMG result dwords are not the fixture words");
+        }
+        if results.lane_byte(MarginLane::Rx0, true) != 0x25
+            || results.lane_byte(MarginLane::Rx0, false) != 0x8a
+            || HwMarginResults::margin(0x8a) != 0x0a
+            || !HwMarginResults::exceeds(0x8a)
+            || HwMarginResults::exceeds(0x25)
+            || results.lane_byte(MarginLane::Rx1, true) != 0x10
+            || results.lane_byte(MarginLane::Rx1, false) != 0x33
+            || results.lane_byte(MarginLane::Rx2, true) != 0x41
+            || results.lane_byte(MarginLane::Rx2, false) != 0x07
+            || results.lane_byte(MarginLane::All, true) != 0
+        {
+            return TestResult::Fail("RHMG lane results do not parse");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/thunderbolt/retimer",
+        usb4_retimer_lane_margining_hw
+    );
+
+    /// Software lane margining (`RSMG`, USB4 §8.3.2.4): the request
+    /// Metadata encodes lanes/time/right-high/upper-eye/counter/
+    /// voltage-time offset per Linux `usb4_port_sw_margin`, and the
+    /// single result dword comes back from the Data register.
+    fn usb4_retimer_lane_margining_sw() -> TestResult {
+        let mut m = SbModel::new();
+        let mut rt = device(0x8087, 0x1111, 0x0001_0000, true, 0x03);
+        rt.sw_result = 0x0000_0001;
+        m.retimers = alloc::vec![rt];
+        let port = link_port();
+        let ch = SbChannel::retimer(0, &port, 1);
+        let params = MarginParams {
+            lanes: MarginLane::Rx1,
+            time: true,
+            right_high: true,
+            upper_eye: true,
+            optional_voltage_offset_range: false,
+            ber_level: 0,
+            error_counter: MarginErrorCounter::Start,
+            voltage_time_offset: 0x2a,
+        };
+        let result = match run(sw_margin(&mut m, ch, &params)) {
+            Ok(result) => result,
+            Err(_) => return TestResult::Fail("RSMG did not complete"),
+        };
+        // lanes 1 | time bit 3 | right/high bit 4 | VT 0x2a in
+        // bits 12:6 | counter START (2) in bits 14:13 | upper eye
+        // bit 15.
+        if m.retimers[0].margin_metadata != 0xca99 {
+            return TestResult::Fail("RSMG request Metadata is not the Linux encoding");
+        }
+        if result != 0x0000_0001 {
+            return TestResult::Fail("RSMG result dword is not the fixture word");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/thunderbolt/retimer",
+        usb4_retimer_lane_margining_sw
+    );
+
+    /// Software margining error counters (`RDSW`, USB4 §8.3.2.4):
+    /// the standard counters arrive in the completion Metadata and
+    /// the extended counters in the Data register, parsed per Linux
+    /// `margining_get_lane_error`.
+    fn usb4_retimer_lane_margining_errors() -> TestResult {
+        let mut m = SbModel::new();
+        let mut rt = device(0x8087, 0x1111, 0x0001_0000, true, 0x03);
+        rt.sw_errors = 0x3a5;
+        rt.sw_errors_ext = [0x3a5, 0x123, 0x456, 0x789];
+        m.retimers = alloc::vec![rt];
+        let port = link_port();
+        let ch = SbChannel::retimer(0, &port, 1);
+        let errors = match run(sw_margin_errors(&mut m, ch)) {
+            Ok(errors) => errors,
+            Err(_) => return TestResult::Fail("RDSW did not complete"),
+        };
+        if errors.word != 0x3a5
+            || errors.lane(MarginLane::Rx0) != 0x5
+            || errors.lane(MarginLane::Rx1) != 0xa
+            || errors.lane(MarginLane::Rx2) != 0x3
+            || errors.lane(MarginLane::All) != 0
+        {
+            return TestResult::Fail("RDSW standard counters do not parse");
+        }
+        let ext = match run(sw_margin_errors_ext(&mut m, ch)) {
+            Ok(ext) => ext,
+            Err(_) => return TestResult::Fail("RDSW extended read did not complete"),
+        };
+        if ext.words != [0x3a5, 0x123, 0x456, 0x789]
+            || ext.lane(MarginLane::Rx0) != 0x1235
+            || ext.lane(MarginLane::Rx1) != 0x456a
+            || ext.lane(MarginLane::Rx2) != 0x7893
+            || ext.lane(MarginLane::All) != 0
+        {
+            return TestResult::Fail("RDSW extended counters do not parse");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/thunderbolt/retimer",
+        usb4_retimer_lane_margining_errors
+    );
+
+    /// Lane-margining failure paths: `!CMD` is `NotSupported`,
+    /// `ERR ` is `OpFailed`, a garbage completion is `Malformed`,
+    /// and out-of-range run parameters are `InvalidArgument`
+    /// before any sideband traffic. The fixture's margining fault
+    /// flags are scoped to the four margining operations: an
+    /// unrelated NVM operation still completes.
+    fn usb4_retimer_lane_margining_failures() -> TestResult {
+        let port = link_port();
+        let ch = SbChannel::retimer(0, &port, 1);
+        let params = MarginParams {
+            lanes: MarginLane::All,
+            time: false,
+            right_high: false,
+            upper_eye: false,
+            optional_voltage_offset_range: false,
+            ber_level: 0,
+            error_counter: MarginErrorCounter::Nop,
+            voltage_time_offset: 0,
+        };
+        let mut m = SbModel::new();
+        let mut rt = device(0x8087, 0x1111, 0x0001_0000, true, 0x03);
+        rt.margining_unsupported = true;
+        rt.sector_size = 0x1000;
+        m.retimers = alloc::vec![rt];
+        if run(margining_caps(&mut m, ch)) != Err(Error::NotSupported)
+            || run(hw_margin(&mut m, ch, &params)) != Err(Error::NotSupported)
+            || run(sw_margin_errors(&mut m, ch)) != Err(Error::NotSupported)
+        {
+            return TestResult::Fail("unsupported margining was not NotSupported");
+        }
+        let rt = Retimer {
+            index: 1,
+            vendor_id: 0x8087,
+            product_id: 0x1111,
+            fw_version: 0x0001_0000,
+            last: true,
+            cable: false,
+            auth_status: None,
+            link_conf: [0x03, 0x10, 0x01],
+        };
+        if run(nvm_sector_size(&mut m, 0, &port, &rt)) != Ok(0x1000) {
+            return TestResult::Fail("margining fault flags leaked into NVM operations");
+        }
+        let mut m = SbModel::new();
+        let mut rt = device(0x8087, 0x1111, 0x0001_0000, true, 0x03);
+        rt.margining_failed = true;
+        m.retimers = alloc::vec![rt];
+        if run(margining_caps(&mut m, ch)) != Err(Error::OpFailed)
+            || run(sw_margin(&mut m, ch, &params)) != Err(Error::OpFailed)
+        {
+            return TestResult::Fail("failed margining was not OpFailed");
+        }
+        let mut m = SbModel::new();
+        let mut rt = device(0x8087, 0x1111, 0x0001_0000, true, 0x03);
+        rt.garbage_ops = true;
+        m.retimers = alloc::vec![rt];
+        if run(margining_caps(&mut m, ch)) != Err(Error::Malformed) {
+            return TestResult::Fail("garbage margining completion was not Malformed");
+        }
+        let mut m = SbModel::new();
+        m.retimers = alloc::vec![device(0x8087, 0x1111, 0x0001_0000, true, 0x03)];
+        let bad_ber = MarginParams {
+            ber_level: 32,
+            ..params
+        };
+        let bad_vt = MarginParams {
+            voltage_time_offset: 128,
+            ..params
+        };
+        if run(hw_margin(&mut m, ch, &bad_ber)) != Err(Error::InvalidArgument)
+            || run(sw_margin(&mut m, ch, &bad_vt)) != Err(Error::InvalidArgument)
+        {
+            return TestResult::Fail("out-of-range margining parameters were not rejected");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/thunderbolt/retimer",
+        usb4_retimer_lane_margining_failures
     );
 }
