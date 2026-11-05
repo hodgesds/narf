@@ -153,6 +153,7 @@ pub struct RxFrame<'a> {
 }
 
 /// The DE packet owner: firmware admission + envelope permission.
+#[derive(Debug)]
 pub struct Owner {
     /// Firmware download result (proof of admission).
     firmware: Info,
