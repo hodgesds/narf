@@ -216,8 +216,9 @@ glitchless bank switching mid-stream is out of scope.
 `acp63_sdw::probe`, `register_pci_driver`, `is_probed`, `capture_card`
 bind the ACP 6.3 function's SDW0 manager for pin configurations without
 PDM (the PDM probe declines those, and this driver is the next candidate
-for the function under the candidate-walking dispatcher, PR #852, which
-is on main). Configurations where PDM and SoundWire coexist compose
+for the function under the candidate-walking dispatcher
+(bus/src/driver_match.rs `probe_all`, on main; PR #852 was SDHCI probe
+arbitration, unrelated — it is not the dispatcher). Configurations where PDM and SoundWire coexist compose
 through the PDM probe instead: after claiming the function it calls
 `acp63_sdw::bind_composed`, which runs the manager init + enumeration
 on the already-powered block and publishes any codecs found alongside

@@ -2,8 +2,9 @@
 //! bound for the SoundWire configurations of 1022:15e2 rev 0x63 that
 //! [`crate::acp63`] leaves unbound (its probe requires the PDM mux;
 //! SoundWire-only pin configurations decline there and this driver is
-//! the next candidate under the candidate-walking probe dispatcher,
-//! PR #852, which is on main — see audio spec §3.2).
+//! the next candidate under the candidate-walking probe dispatcher
+//! (bus/src/driver_match.rs `probe_all`, on main — PR #852 was SDHCI
+//! probe arbitration, unrelated — see audio spec §3.2).
 //!
 //! The manager register model and the immediate-command framing are
 //! the ACP SDW manager's, as in Linux `drivers/soundwire/amd_manager.c`
