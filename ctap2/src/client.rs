@@ -22,6 +22,8 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use narf_crypto::p256::ecdsa::verify_p256;
+
 use crate::cbor::{self, Value};
 use crate::cose;
 use crate::crypto;
@@ -294,6 +296,126 @@ pub struct Assertion {
     /// reported it (first assertion only).
     pub number_of_credentials: Option<u64>,
     pub hmac_secret: Option<HmacSecretOutput>,
+}
+
+/// Verify one assertion against the enrolled credential's ES256
+/// public key (SEC-C1, #1285) — the check `parse_assertion`
+/// never performed.
+///
+/// Per CTAP2 §6.3 the authenticator signs "the clientDataHash
+/// along with authData ... using the structure specified in
+/// [WebAuthn]": the signed bytes are `authData ‖
+/// SHA-256(clientDataJSON)`, and the CTAP2 `clientDataHash`
+/// parameter *is* that hash, so the ECDSA digest is
+/// `SHA-256(authData ‖ clientDataHash)`. The signature is the
+/// ASN.1 DER-encoded ECDSA signature (SEC 1 `ECDSA-Sig-Value`:
+/// `SEQUENCE { r INTEGER, s INTEGER }`), parsed strictly below;
+/// the public key is the attested `X ‖ Y` with the `0x04`
+/// uncompressed-point tag `verify_p256` requires.
+///
+/// Checks, in order: UP is always required (an assertion
+/// without a touch is not an assertion for this flow); UV is
+/// required exactly when `require_uv` says the ceremony
+/// demanded it (the caller derives that from the PIN being in
+/// play — TouchAndPin — not from the token's say-so); then the
+/// signature must verify over the received authData bytes.
+///
+/// `sign_count` is deliberately NOT compared against a stored
+/// baseline here (audit open question §10): the hmac-secret
+/// output is deterministic per (credential, salt) — design
+/// §4.1 — so a replayed assertion yields exactly the output a
+/// fresh one would, and replay gains an attacker nothing they
+/// do not already have from capturing that output; the flow
+/// carries no challenge nonce (clientDataHash is a fixed
+/// protocol constant), so the counter cannot bind an assertion
+/// to *this* ceremony; and the resume path is read-only over
+/// the slot record by design, so there is no durable
+/// per-credential store to compare against without inventing a
+/// resume-time write-back into the image store. The counter is
+/// still authenticated — it sits inside the signed authData, so
+/// any tampering with it breaks the signature (pinned by
+/// `smoke_tampered_sign_count_breaks_assertion_signature`) —
+/// and a baseline that lived in the unauthenticated slot params
+/// could be rewound by any disk writer anyway, so enforcing
+/// monotonicity against it would be theatre, not detection.
+/// Genuine clone detection needs an authenticated baseline and
+/// is a custody-format design change, not this fix.
+pub fn verify_assertion(
+    assertion: &Assertion,
+    client_data_hash: &[u8; 32],
+    public_key: &[u8; 64],
+    require_uv: bool,
+) -> Result<(), Error> {
+    if !assertion.auth_data.user_present() {
+        return Err(Error::Protocol("assertion: user presence flag clear"));
+    }
+    if require_uv && !assertion.auth_data.user_verified() {
+        return Err(Error::Protocol("assertion: user verification flag clear"));
+    }
+    let digest = crypto::sha256_parts(&[
+        assertion.auth_data.raw.as_slice(),
+        client_data_hash.as_slice(),
+    ]);
+    let (r, s) = parse_der_ecdsa_signature(&assertion.signature)?;
+    let mut pubkey = [0u8; 65];
+    pubkey[0] = 0x04;
+    pubkey[1..].copy_from_slice(public_key);
+    if !verify_p256(&pubkey, &digest, &r, &s) {
+        return Err(Error::Protocol("assertion: signature verification failed"));
+    }
+    Ok(())
+}
+
+/// Parse a DER-encoded ECDSA signature (`SEQUENCE { r INTEGER,
+/// s INTEGER }`, SEC 1 §2.4.2 / X.690) into P1363-form `(r, s)`.
+/// Strict: short-form lengths only, exact total length, no
+/// trailing bytes, minimal INTEGER encoding (a leading `0x00`
+/// only to keep a high-bit value positive). Range checks on
+/// `r`/`s` (`[1, n)`) are `verify_p256`'s — a zero or
+/// out-of-range component fails there.
+fn parse_der_ecdsa_signature(sig: &[u8]) -> Result<([u8; 32], [u8; 32]), Error> {
+    if sig.len() < 8 || sig[0] != 0x30 {
+        return Err(Error::Protocol(
+            "assertion: signature is not a DER SEQUENCE",
+        ));
+    }
+    let total = sig[1] as usize;
+    if total >= 0x80 || total + 2 != sig.len() {
+        return Err(Error::Protocol("assertion: signature length mismatch"));
+    }
+    let mut off = 2;
+    let r = parse_der_integer(sig, &mut off)?;
+    let s = parse_der_integer(sig, &mut off)?;
+    if off != sig.len() {
+        return Err(Error::Protocol("assertion: trailing bytes in signature"));
+    }
+    Ok((r, s))
+}
+
+fn parse_der_integer(sig: &[u8], off: &mut usize) -> Result<[u8; 32], Error> {
+    if *off + 2 > sig.len() || sig[*off] != 0x02 {
+        return Err(Error::Protocol("assertion: signature integer tag"));
+    }
+    let len = sig[*off + 1] as usize;
+    if len == 0 || len > 33 || *off + 2 + len > sig.len() {
+        return Err(Error::Protocol("assertion: signature integer length"));
+    }
+    let mut bytes = &sig[*off + 2..*off + 2 + len];
+    if bytes.len() > 1 && bytes[0] == 0 {
+        if bytes[1] & 0x80 == 0 {
+            return Err(Error::Protocol("assertion: non-minimal signature integer"));
+        }
+        bytes = &bytes[1..];
+    } else if bytes[0] & 0x80 != 0 {
+        return Err(Error::Protocol("assertion: negative signature integer"));
+    }
+    if bytes.len() > 32 {
+        return Err(Error::Protocol("assertion: signature integer too long"));
+    }
+    let mut out = [0u8; 32];
+    out[32 - bytes.len()..].copy_from_slice(bytes);
+    *off += 2 + len;
+    Ok(out)
 }
 
 /// The CTAP2 client over one CTAPHID channel.

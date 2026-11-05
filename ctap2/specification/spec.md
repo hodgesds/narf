@@ -80,6 +80,15 @@ Client (`client`):
   decrypted from the authData ED extensions (32 or 64 bytes).
 - `Client::get_next_assertion(rp_id)` — drains the multi-
   credential queue signalled by `number_of_credentials`.
+- `verify_assertion(assertion, client_data_hash, public_key,
+  require_uv)` — SEC-C1 (#1285): UP always, UV exactly when
+  the ceremony demanded it, and the ES256 signature over
+  `SHA-256(authData ‖ clientDataHash)` (CTAP2 §6.3; the
+  signature is the DER-encoded ECDSA signature, SEC 1
+  `ECDSA-Sig-Value`, parsed strictly) against the enrolled
+  credential's public key via `narf-crypto`'s `verify_p256`.
+  `sign_count` is authenticated (inside the signed authData)
+  but not compared against a stored baseline — see §4.
 - `Client::pin_session()`, `Client::pin_retries()`.
 
 PIN protocol one (`pin`):
@@ -101,11 +110,20 @@ Enrollment surface (`enroll`) — the P1 seam:
   enrolls a discoverable credential with UV; `TouchOnly` only
   on explicit policy. Refuses tokens that do not advertise
   hmac-secret, and refuses enrollments whose authData does not
-  grant it (ED extensions `hmac-secret == true`).
+  grant it (ED extensions `hmac-secret == true`). The
+  returned `EnrolledToken` carries the attested ES256 public
+  key (`public_key`, X ‖ Y) alongside the credential id, aaguid,
+  rp id, and fmt — the resume path verifies assertions against
+  it (SEC-C1, #1285).
 - `derive_slot_output(client, DeriveParams)` — one
   getAssertion for one enrolled credential id + caller salt(s);
   returns `HmacSecretOutput { first, second }`. The returned
   bytes are P1's wrapping input; this crate wraps nothing.
+  Before the output is returned, the assertion is verified
+  (`verify_assertion` with the enrolled public key from
+  `DeriveParams`): UP always, UV exactly when a PIN is in play,
+  and the ES256 signature. A failed verification is
+  `Error::Protocol` — no hmac-secret output is returned.
 - `enrollment_complete(&[EnrolledToken])` — true only with
   ≥ 2 DISTINCT credential ids (mandatory backup token,
   decisions doc 2026-10-26). Each token wraps independently:
@@ -138,6 +156,23 @@ Protocol(&str), Crypto, Random, Unsupported(&str).
 - No key custody: pinUvAuthTokens, shared secrets, and
   hmac-secret outputs live only for the call that produced
   them; nothing is persisted by this crate.
+- Assertions are verified, not trusted: `derive_slot_output`
+  returns no hmac-secret output for an assertion whose
+  signature does not verify against the enrolled credential's
+  public key, or whose UP flag (always) or UV flag (when the
+  ceremony used a PIN) is clear. `sign_count` monotonicity is
+  explicitly scoped OUT of this flow (audit open question
+  §10): the hmac-secret output is deterministic per
+  (credential, salt), so a replayed assertion yields exactly
+  the output a fresh one would; the flow carries no challenge
+  nonce (clientDataHash is a fixed protocol constant), so the
+  counter cannot bind an assertion to one ceremony; the resume
+  path is read-only over the slot record, so there is no
+  durable baseline store without a resume-time write-back; and
+  a baseline in the unauthenticated slot params could be
+  rewound by any disk writer. The counter's integrity IS
+  covered — it sits inside the signed authData, so tampering
+  breaks the signature (fixture-pinned).
 
 ## 5. Architecture notes (x86_64, aarch64)
 
@@ -154,8 +189,9 @@ Protocol(&str), Crypto, Random, Unsupported(&str).
 ## 6. Dependencies
 
 - `narf-crypto` (workspace): SHA-256, P-256 point/scalar
-  arithmetic. (Its HKDF/HMAC is used by the fixture only; the
-  client carries its own HMAC over the streaming SHA-256 so
+  arithmetic, ECDSA `verify_p256` (assertion signatures).
+  (Its HKDF/HMAC is used by the fixture only; the client
+  carries its own HMAC over the streaming SHA-256 so
   multi-part MACs — saltAuth over saltEnc — stay one-pass.)
 - `aes` 0.8 (RustCrypto, default-features = false): raw
   AES-256 blocks for protocol-one CBC.

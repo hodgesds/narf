@@ -12,10 +12,15 @@
 //! - [`derive_slot_output`]: resume-side derivation — one
 //!   getAssertion with the caller-chosen salt, returning the
 //!   hmac-secret output that wraps the per-epoch slot secret.
-//!   Each enrolled token wraps independently: enrollment stores
-//!   one wrapped blob *per token* (the primary and the backup
-//!   have different credential keys and therefore different
-//!   outputs for the same salt) — the two-token recovery story is
+//!   Before the output is trusted, the assertion is verified
+//!   against the enrolled credential's public key
+//!   ([`crate::client::verify_assertion`]: ES256 signature over
+//!   `SHA-256(authData ‖ clientDataHash)`, UP always, UV when
+//!   the ceremony used a PIN — SEC-C1, #1285). Each enrolled
+//!   token wraps independently: enrollment stores one wrapped
+//!   blob *per token* (the primary and the backup have
+//!   different credential keys and therefore different outputs
+//!   for the same salt) — the two-token recovery story is
 //!   "either token unwraps its own blob", not "both tokens are
 //!   interchangeable".
 //! - [`enrollment_complete`]: the mandatory-backup rule. An
@@ -30,7 +35,8 @@ use alloc::vec::Vec;
 
 use crate::cbor::Value;
 use crate::client::{
-    Client, CredentialRef, GetAssertionParams, HmacSecretOutput, HmacSecretParams, UserVerification,
+    verify_assertion, Client, CredentialRef, GetAssertionParams, HmacSecretOutput,
+    HmacSecretParams, UserVerification,
 };
 use crate::ctaphid::HidPipe;
 use crate::{Error, RandomSource};
@@ -65,6 +71,12 @@ pub struct EnrolledToken {
     pub credential_id: Vec<u8>,
     pub aaguid: [u8; 16],
     pub rp_id: alloc::string::String,
+    /// Attested ES256 credential public key (X ‖ Y, 64 bytes),
+    /// from the makeCredential attested credential data. The
+    /// caller persists this alongside the wrapped slot secret:
+    /// the resume path verifies assertions against it (SEC-C1,
+    /// #1285) — dropping it was the finding's root cause.
+    pub public_key: [u8; 64],
     /// Attestation format from the enrollment response.
     pub fmt: alloc::string::String,
 }
@@ -139,6 +151,7 @@ pub fn enroll_token<P: HidPipe, R: RandomSource>(
         credential_id: attested.credential_id,
         aaguid: attested.aaguid,
         rp_id: params.rp_id.into(),
+        public_key: attested.public_key,
         fmt: result.fmt,
     })
 }
@@ -148,6 +161,10 @@ pub struct DeriveParams<'a> {
     pub client_data_hash: [u8; 32],
     pub rp_id: &'a str,
     pub credential_id: &'a [u8],
+    /// The enrolled credential's ES256 public key (X ‖ Y), from
+    /// [`EnrolledToken::public_key`]. The assertion is verified
+    /// against it before its hmac-secret output is trusted.
+    pub public_key: [u8; 64],
     pub salt1: [u8; 32],
     pub salt2: Option<[u8; 32]>,
     /// PIN for the token (touch+PIN policy). `None` only for
@@ -158,6 +175,19 @@ pub struct DeriveParams<'a> {
 /// Derive the hmac-secret output for one enrolled token. The
 /// returned 32 (or 64) bytes are the wrapping input P1 uses —
 /// this crate does not wrap anything itself.
+///
+/// The assertion is verified before its output is trusted
+/// (SEC-C1, #1285): credential-id match (as before), then
+/// [`verify_assertion`] — UP always, UV exactly when a PIN is
+/// in play (TouchAndPin as expressed at this seam: the caller
+/// supplies a PIN only for a touch+PIN ceremony), and the ES256
+/// signature over the received authData. Binding the *policy*
+/// to the slot record itself (so a touch-only assertion could
+/// never open a TouchAndPin slot regardless of the anchor's
+/// configured mode) is SEC-D2 — a Daniel scope call, untouched
+/// here; this check enforces the anchor's configured mode.
+/// `sign_count` monotonicity is scoped out with reasons in
+/// `verify_assertion`'s docs, not silently dropped.
 pub fn derive_slot_output<P: HidPipe, R: RandomSource>(
     client: &mut Client<P, R>,
     params: &DeriveParams<'_>,
@@ -187,6 +217,16 @@ pub fn derive_slot_output<P: HidPipe, R: RandomSource>(
             ));
         }
     }
+    // The assertion must be a genuine one for the enrolled
+    // credential, touched (and PIN-verified when the policy
+    // demands it) — a fabricated assertion, however well-formed
+    // its CBOR, earns no hmac-secret output.
+    verify_assertion(
+        &assertion,
+        &params.client_data_hash,
+        &params.public_key,
+        params.pin.is_some(),
+    )?;
     assertion.hmac_secret.ok_or(Error::Protocol(
         "derive: assertion carried no hmac-secret output",
     ))
