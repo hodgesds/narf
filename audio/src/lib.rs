@@ -531,8 +531,11 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     // ACP 6.3 SoundWire for the pin configurations the PDM probe
-    // declines; registered after it. The candidate-walking dispatcher
-    // (PR #852, on main) tries it when the PDM probe declines, and
+    // declines; registered after it. Candidate walking has landed
+    // (bus/src/driver_match.rs `probe_all`: candidates sorted by
+    // specificity, each attempted until one binds), so this binding
+    // wins when the PDM probe declines. PR #852 was SDHCI probe
+    // arbitration, unrelated — it is not the dispatcher.
     // PDM+SoundWire wirings compose through the PDM probe instead
     // (see audio spec §3.2).
     narf_init::register(Stage::Subsys, "acp63-sdw-pci", || {
