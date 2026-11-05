@@ -42,7 +42,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use narf_acpi::{AcpiError, SdtHeader};
+use narf_acpi::AcpiError;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
@@ -113,6 +113,10 @@ pub enum AmlError {
     BadNameSegment,
     /// DSDT was not present in the XSDT.
     NoDsdt,
+    /// Appending a table would push the AML store past
+    /// [`MAX_AML_STORE_BYTES`] (SEC-F2). The table is rejected;
+    /// nothing is appended.
+    AmlStoreFull,
     /// `evaluate_method` couldn't find the requested method path,
     /// or the path resolved to a non-Method node (Name / Device /
     /// Field / etc.). Distinct from `Truncated` so callers (e.g.
@@ -211,6 +215,18 @@ pub struct BufferFieldRef {
     pub bit_length: u64,
 }
 
+/// Cap on the total AML byte store across every table walked
+/// (SEC-F2). Policy bound, not a spec value — ACPI 6.5 places no
+/// bound on table length, so a corrupt `length` field could
+/// otherwise claim up to 4 GiB and drive the store (a kernel-heap
+/// `Vec`) toward exhaustion. 4 MiB bounds firmware-driven
+/// allocation to a negligible fraction of the heap while leaving
+/// generous headroom for legitimate firmware sets, which are
+/// bounded in practice by the firmware's own table area. If a
+/// future platform legitimately exceeds it, the failure names
+/// this cap.
+pub const MAX_AML_STORE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Backing storage. We collect every parsed node into one Vec
 /// behind an `IrqSafeSpinLock` — namespace builds are one-shot at
 /// boot and reads are typically cold.
@@ -225,6 +241,25 @@ struct Namespace {
     /// `method_body.0` is an offset into this Vec when the node
     /// was registered from `walk_aml_table`.
     aml: Vec<u8>,
+}
+
+impl Namespace {
+    /// Append `bytes` to the AML store, enforcing the total cap.
+    /// Returns the base offset of the appended bytes. Single choke
+    /// point for all store growth (`walk_aml_table` +
+    /// `__parse_body_for_test`); a table that would exceed the cap
+    /// is rejected with nothing appended.
+    fn append_aml(&mut self, bytes: &[u8]) -> Result<usize, AmlError> {
+        let base = self.aml.len();
+        let end = base
+            .checked_add(bytes.len())
+            .ok_or(AmlError::AmlStoreFull)?;
+        if end > MAX_AML_STORE_BYTES {
+            return Err(AmlError::AmlStoreFull);
+        }
+        self.aml.extend_from_slice(bytes);
+        Ok(base)
+    }
 }
 
 pub(crate) static NAMESPACE: IrqSafeSpinLock<Namespace> = IrqSafeSpinLock::new(Namespace {
@@ -911,6 +946,10 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
     {
         let mut g = NAMESPACE.lock();
         g.nodes.clear();
+        // Clear the AML store too: a rebuild must not double-count
+        // the previous parse, or a second call could trip the
+        // store cap (SEC-F2) on legitimate tables.
+        g.aml.clear();
         g.integer_width = None;
     }
 
@@ -969,17 +1008,24 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
 /// given physical address, registering nodes under `root_path`.
 /// Appends the table's AML bytes to the namespace-wide AML store
 /// so `method_body` offsets are stable references into that store.
+///
+/// SEC-F2: the table is checksummed and validated against the
+/// mapped window *before* any byte is sliced
+/// (`narf_acpi::verify_table_checksum`), and the append enforces
+/// the total store cap (`MAX_AML_STORE_BYTES`). A bad checksum, an
+/// out-of-window pointer/length, or a store overrun rejects the
+/// table fail-closed with nothing appended.
 unsafe fn walk_aml_table(phys: u64, root_path: &str) -> Result<u32, AmlError> {
-    // SAFETY: caller assertion.
-    let total = unsafe {
-        (narf_memory::PhysAddr::new(phys).kernel_ptr::<SdtHeader>())
-            .read_unaligned()
-            .length as usize
-    };
+    // Checksum + mapped-window validation first: header, full
+    // firmware-declared length, and the 8-bit ACPI checksum
+    // (ACPI 6.5 §5.2) are all verified before slicing.
+    let hdr = unsafe { narf_acpi::verify_table_checksum(phys)? };
+    let total = hdr.length as usize;
     if total <= 36 {
         return Ok(0);
     }
-    // SAFETY: caller assertion.
+    // SAFETY: verify_table_checksum validated phys+total against
+    // the mapped window.
     let body = unsafe {
         core::slice::from_raw_parts(narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(), total)
     };
@@ -989,14 +1035,12 @@ unsafe fn walk_aml_table(phys: u64, root_path: &str) -> Result<u32, AmlError> {
     // node body-offsets are absolute into that store.
     let base = {
         let mut g = NAMESPACE.lock();
-        if &body[..4] == b"DSDT" {
+        if hdr.signature == *b"DSDT" {
             // ACPICA utglobal.c/acpi_ut_set_integer_width: revision1
             // selects32-bit Integers; revision2+ selects64-bit Integers.
-            g.integer_width = Some(if body[8] < 2 { 32 } else { 64 });
+            g.integer_width = Some(if hdr.revision < 2 { 32 } else { 64 });
         }
-        let b = g.aml.len();
-        g.aml.extend_from_slice(aml_slice);
-        b
+        g.append_aml(aml_slice)?
     };
 
     let mut p = Parser::new(aml_slice);
@@ -2248,12 +2292,12 @@ pub fn __reset_for_test() {
 /// pieces without cooking a full ACPI table chain.
 #[doc(hidden)]
 pub fn __parse_body_for_test(body: &[u8], root: &str) -> Result<u32, AmlError> {
-    // Push body into AML store so method offsets resolve.
+    // Push body into AML store so method offsets resolve. Goes
+    // through the capped append so the store-cap fixture can fill
+    // the store via this hook.
     let base = {
         let mut g = NAMESPACE.lock();
-        let b = g.aml.len();
-        g.aml.extend_from_slice(body);
-        b
+        g.append_aml(body)?
     };
     let mut p = Parser::new(body);
     let mut count = 0u32;

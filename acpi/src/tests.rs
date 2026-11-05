@@ -1837,8 +1837,11 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
 
     // The synthetic-body shim isn't exposed for PMTT (the real
     // parser walks hierarchically); construct a complete table
-    // body and call parse_pmtt against an in-memory pointer.
-    // We're test-only here, so a heap allocation is fine.
+    // body and call parse_pmtt against a real frame. Heap buffers
+    // are fine for building the bytes, but the tables themselves
+    // must live in frames: SEC-F2 validates every table pointer
+    // against the mapped window, and a heap address is a kernel
+    // VA, not a phys.
     use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     // SDT header (36) + memory-device-count (4) = 40 bytes.
@@ -1901,9 +1904,11 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
     buf[cksum_off] = (0u8).wrapping_sub(sum);
 
     // Build a fake XSDT pointing at this PMTT, and an RSDP pointing
-    // at that XSDT. All three live in our heap buffer; the parser
-    // reads them via `*const u8` ptrs which is fine in-process.
-    let pmtt_phys = buf.as_ptr() as u64;
+    // at that XSDT. All three live in real frames (see above).
+    let (pmtt_frame, pmtt_phys) = match write_bytes_to_frame(&buf) {
+        Ok(v) => v,
+        Err(m) => return TestResult::Fail(m),
+    };
 
     let mut xsdt: Vec<u8> = Vec::new();
     xsdt.extend_from_slice(b"XSDT");
@@ -1921,7 +1926,13 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
     xsdt[xlen_pos..xlen_pos + 4].copy_from_slice(&total_xlen.to_le_bytes());
     let xsum: u8 = xsdt.iter().fold(0u8, |a, b| a.wrapping_add(*b));
     xsdt[9] = (0u8).wrapping_sub(xsum);
-    let xsdt_phys = xsdt.as_ptr() as u64;
+    let (xsdt_frame, xsdt_phys) = match write_bytes_to_frame(&xsdt) {
+        Ok(v) => v,
+        Err(m) => {
+            narf_memory::frame::free_frame(pmtt_frame);
+            return TestResult::Fail(m);
+        }
+    };
 
     let mut rsdp = [0u8; 36];
     rsdp[..8].copy_from_slice(b"RSD PTR ");
@@ -1929,16 +1940,28 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
     rsdp[24..32].copy_from_slice(&xsdt_phys.to_le_bytes());
     let v1_sum: u8 = rsdp[..20].iter().fold(0u8, |a, b| a.wrapping_add(*b));
     rsdp[8] = (0u8).wrapping_sub(v1_sum);
-    let rsdp_phys = narf_memory::PhysAddr::new(rsdp.as_ptr() as u64);
+    let (rsdp_frame, rsdp_phys_raw) = match write_bytes_to_frame(&rsdp) {
+        Ok(v) => v,
+        Err(m) => {
+            narf_memory::frame::free_frame(pmtt_frame);
+            narf_memory::frame::free_frame(xsdt_frame);
+            return TestResult::Fail(m);
+        }
+    };
+    let rsdp_phys = narf_memory::PhysAddr::new(rsdp_phys_raw);
 
-    // SAFETY: pointers refer to live in-process buffers backed by
-    // the heap; reads are bounded by the encoded lengths.
+    // SAFETY: pointers refer to live frames; reads are bounded by
+    // the encoded lengths.
     // SAFETY: Valid memory or trusted environment
-    let n = match unsafe { crate::parse_pmtt(rsdp_phys) } {
+    let parsed = unsafe { crate::parse_pmtt(rsdp_phys) };
+    // The parse copies everything it needs into static tables, so
+    // the frames can go back now, on every path.
+    narf_memory::frame::free_frame(pmtt_frame);
+    narf_memory::frame::free_frame(xsdt_frame);
+    narf_memory::frame::free_frame(rsdp_frame);
+    let n = match parsed {
         Ok(n) => n,
         Err(e) => {
-            // Keep buffers alive across the parse (Vec lifetimes).
-            let _ = (buf, xsdt, rsdp);
             return TestResult::Fail(match e {
                 crate::AcpiError::BadRsdpSignature => "bad rsdp sig",
                 crate::AcpiError::BadRsdpChecksum => "bad rsdp cksum",
@@ -1946,33 +1969,28 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
                 crate::AcpiError::BadXsdtSignature => "bad xsdt sig",
                 crate::AcpiError::NoSrat => "no pmtt",
                 crate::AcpiError::BadTableChecksum => "bad table cksum",
+                crate::AcpiError::OutOfMappedWindow => "out of window",
             });
         }
     };
     if n != 4 {
-        let _ = (buf, xsdt, rsdp);
         return TestResult::Fail("expected 4 PMTT structures (1+1+2)");
     }
     let (s, c, d) = crate::pmtt_counts();
     if (s, c, d) != (1, 1, 2) {
-        let _ = (buf, xsdt, rsdp);
         return TestResult::Fail("PMTT counts wrong");
     }
     let mut dimms = [crate::PmttDimm::default(); crate::MAX_PMTT_DIMMS];
     let dn = crate::copy_pmtt_dimms(&mut dimms);
     if dn != 2 {
-        let _ = (buf, xsdt, rsdp);
         return TestResult::Fail("DIMM table didn't capture 2 entries");
     }
     if dimms[0].socket_id != 7 || dimms[0].controller_id != 3 {
-        let _ = (buf, xsdt, rsdp);
         return TestResult::Fail("DIMM 0 parent ids wrong");
     }
     if dimms[1].smbios_handle != 0xCCCC_DDDD {
-        let _ = (buf, xsdt, rsdp);
         return TestResult::Fail("DIMM 1 smbios handle wrong");
     }
-    let _ = (buf, xsdt, rsdp);
     TestResult::Pass
 }
 kernel_test_in!("acpi", smoke_acpi_pmtt_synthetic_dimm_entry);
@@ -3053,3 +3071,131 @@ kernel_test_in!(
     "acpi/wake_vector",
     smoke_acpi_arm_s3_waking_vector_refuses_unsupported_firmware
 );
+
+// ── SEC-F2 (#1290): table pointers validated against the mapped window ──────
+//
+// Fixtures are built from the specification: table layout + 8-bit
+// checksum from ACPI 6.5 §5.2. Tables live in real frames — a heap
+// buffer's address is a kernel VA, not a phys, and the window check
+// rightly rejects it.
+
+/// Copy bytes into a real frame; returns the frame plus its physical
+/// address. The caller frees the frame on every path.
+fn write_bytes_to_frame(
+    bytes: &[u8],
+) -> Result<(narf_memory::frame::PhysFrame, u64), &'static str> {
+    if bytes.len() > 4096 {
+        return Err("table does not fit in one frame");
+    }
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return Err("alloc_frame"),
+    };
+    let phys = frame.start_address().raw();
+    // SAFETY: exclusively-owned frame, reached through the direct map.
+    let dst = frame.start_address().kernel_mut_ptr::<u8>();
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+    }
+    Ok((frame, phys))
+}
+
+/// An XSDT child pointer outside the mapped window is skipped —
+/// never dereferenced, never handed to the callback — while a valid
+/// sibling is still delivered.
+fn smoke_acpi_xsdt_out_of_window_child_skipped() -> TestResult {
+    use alloc::vec::Vec;
+    // Valid child table: header only, valid checksum (not required
+    // for children, but harmless).
+    let mut child: Vec<u8> = Vec::new();
+    child.extend_from_slice(b"TST1");
+    child.extend_from_slice(&36u32.to_le_bytes());
+    child.push(1); // revision
+    child.push(0); // checksum placeholder
+    child.extend_from_slice(b"NARFCO");
+    child.extend_from_slice(b"NARFTBL_");
+    child.extend_from_slice(&0u32.to_le_bytes());
+    child.extend_from_slice(&0u32.to_le_bytes());
+    child.extend_from_slice(&0u32.to_le_bytes());
+    let sum: u8 = child.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    child[9] = (0u8).wrapping_sub(sum);
+    let (child_frame, child_phys) = match write_bytes_to_frame(&child) {
+        Ok(v) => v,
+        Err(m) => return TestResult::Fail(m),
+    };
+
+    // XSDT with two entries: the valid child, then a pointer at the
+    // window end (out of window — must be skipped, never dereferenced).
+    let ceiling = narf_memory::phys_alloc_ceiling();
+    if ceiling == 0 {
+        narf_memory::frame::free_frame(child_frame);
+        return TestResult::Fail("phys_alloc_ceiling is 0");
+    }
+    let mut xsdt: Vec<u8> = Vec::new();
+    xsdt.extend_from_slice(b"XSDT");
+    xsdt.extend_from_slice(&0u32.to_le_bytes());
+    xsdt.push(1); // revision
+    xsdt.push(0); // checksum placeholder
+    xsdt.extend_from_slice(b"NARFCO");
+    xsdt.extend_from_slice(b"NARFTBL_");
+    xsdt.extend_from_slice(&0u32.to_le_bytes());
+    xsdt.extend_from_slice(&0u32.to_le_bytes());
+    xsdt.extend_from_slice(&0u32.to_le_bytes());
+    xsdt.extend_from_slice(&child_phys.to_le_bytes());
+    xsdt.extend_from_slice(&ceiling.to_le_bytes());
+    let total = xsdt.len() as u32;
+    xsdt[4..8].copy_from_slice(&total.to_le_bytes());
+    let xsum: u8 = xsdt.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    xsdt[9] = (0u8).wrapping_sub(xsum);
+    let (xsdt_frame, xsdt_phys) = match write_bytes_to_frame(&xsdt) {
+        Ok(v) => v,
+        Err(m) => {
+            narf_memory::frame::free_frame(child_frame);
+            return TestResult::Fail(m);
+        }
+    };
+
+    let mut seen: Vec<u64> = Vec::new();
+    let mut seen_sig: [u8; 4] = [0; 4];
+    // SAFETY: XSDT lives in a real frame; the out-of-window entry
+    // is validated, never dereferenced.
+    let r = unsafe {
+        crate::walk_xsdt(xsdt_phys, |phys, hdr| {
+            seen.push(phys);
+            seen_sig = hdr.signature;
+        })
+    };
+    narf_memory::frame::free_frame(child_frame);
+    narf_memory::frame::free_frame(xsdt_frame);
+    if r.is_err() {
+        return TestResult::Fail("walk_xsdt failed on a table with one bad child");
+    }
+    if seen.len() != 1 || seen[0] != child_phys {
+        return TestResult::Fail("out-of-window child was delivered, or valid child was not");
+    }
+    if &seen_sig != b"TST1" {
+        return TestResult::Fail("valid child header wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi", smoke_acpi_xsdt_out_of_window_child_skipped);
+
+/// The XSDT itself must lie inside the mapped window: a walk rooted
+/// at the window end (or at a pointer whose length addition
+/// overflows) fails before any byte is read.
+fn smoke_acpi_xsdt_itself_out_of_window_rejected() -> TestResult {
+    let ceiling = narf_memory::phys_alloc_ceiling();
+    if ceiling == 0 {
+        return TestResult::Fail("phys_alloc_ceiling is 0");
+    }
+    for phys in [ceiling, u64::MAX] {
+        // SAFETY: no byte is read — the window check rejects first.
+        match unsafe { crate::walk_xsdt(phys, |_, _| {}) } {
+            Err(crate::AcpiError::OutOfMappedWindow) => {}
+            Ok(()) => return TestResult::Fail("out-of-window XSDT accepted"),
+            Err(_) => return TestResult::Fail("out-of-window XSDT failed with the wrong error"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi", smoke_acpi_xsdt_itself_out_of_window_rejected);
