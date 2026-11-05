@@ -24,13 +24,14 @@ use super::{
     SRRCTL_DESCTYPE_ADV_ONEBUF,
 };
 
-/// In-memory register bank for fixtures: 0x14000 bytes of BAR0
-/// window, covering every register this stream programs (highest is
-/// PFMBMEM for VF 62 at 0x13F80 + 16 words = 0x13FC0; the canonical
-/// 0x05xxx RSS block is covered too). Lives here (not in queues.rs)
-/// because this test module is x86_64-only while the driver builds
-/// for both arches — a test-only helper in the driver module would
-/// trip dead-code on aarch64.
+/// In-memory register bank for fixtures: 192 KiB of BAR0 window,
+/// covering every register this stream programs (highest is
+/// FCDFC at 0x28000 + small-xid offsets for the X550 direct
+/// DDP path; PFMBMEM for VF 62 at 0x13F80 + 16 words = 0x13FC0
+/// and the canonical 0x05xxx RSS block are covered too). Lives
+/// here (not in queues.rs) because this test module is x86_64-only
+/// while the driver builds for both arches — a test-only helper in
+/// the driver module would trip dead-code on aarch64.
 struct FakeBank {
     regs: alloc::vec::Vec<u32>,
 }
@@ -38,7 +39,7 @@ struct FakeBank {
 impl FakeBank {
     fn new() -> Self {
         Self {
-            regs: alloc::vec![0u32; 0x14000 / 4],
+            regs: alloc::vec![0u32; 0x30000 / 4],
         }
     }
 }
@@ -3084,3 +3085,383 @@ fn smoke_ixgbe_vmdq_dispatch_messages() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_dispatch_messages);
+
+// ── FCoE fixtures ────────────────────────────────────────────────
+
+fn smoke_ixgbe_fcoe_configure_82599() -> TestResult {
+    use super::fcoe::{
+        FcoeConfig, FcoeFamily, FCRECTL_ENA, REG_ETQF_BASE, REG_ETQS_BASE, REG_FCRECTL,
+        REG_FCRETA_BASE, REG_FCRXCTRL,
+    };
+    use super::queues::RegBank;
+    let cfg = FcoeConfig {
+        queues: &[0, 1],
+        sriov_pool: None,
+    };
+    if cfg.validate().is_err() {
+        return TestResult::Fail("valid FCoE config rejected");
+    }
+    if (FcoeConfig {
+        queues: &[],
+        sriov_pool: None,
+    })
+    .validate()
+    .is_ok()
+    {
+        return TestResult::Fail("empty FCoE queues accepted");
+    }
+    if (FcoeConfig {
+        queues: &[128],
+        sriov_pool: None,
+    })
+    .validate()
+    .is_ok()
+    {
+        return TestResult::Fail("queue 128 accepted");
+    }
+    if (FcoeConfig {
+        queues: &[0],
+        sriov_pool: Some(64),
+    })
+    .validate()
+    .is_ok()
+    {
+        return TestResult::Fail("pool 64 accepted");
+    }
+    let mut bank = FakeBank::new();
+    cfg.apply(&mut bank, FcoeFamily::Other);
+    if bank.read32(REG_ETQF_BASE + 2 * 4) != 0x8800_8906 {
+        return TestResult::Fail("ETQF FCoE word wrong");
+    }
+    if bank.read32(REG_ETQS_BASE + 2 * 4) != 0 {
+        return TestResult::Fail("ETQS FCoE word wrong");
+    }
+    for i in 0..8 {
+        if bank.read32(REG_FCRETA_BASE + (i as u64) * 4) != (i % 2) as u32 {
+            return TestResult::Fail("FCRETA round-robin wrong");
+        }
+    }
+    if bank.read32(REG_FCRECTL) != FCRECTL_ENA {
+        return TestResult::Fail("FCRECTL not enabled");
+    }
+    if bank.read32(REG_ETQF_BASE + 4 * 4) != 0x8000_8914 {
+        return TestResult::Fail("ETQF FIP word wrong");
+    }
+    if bank.read32(REG_ETQS_BASE + 4 * 4) != 0x8000_0000 {
+        return TestResult::Fail("ETQS FIP word wrong");
+    }
+    if bank.read32(REG_FCRXCTRL) != 0x80 {
+        return TestResult::Fail("FCRXCTRL word wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fcoe_configure_82599);
+
+fn smoke_ixgbe_fcoe_configure_x550() -> TestResult {
+    use super::fcoe::{
+        FcoeConfig, FcoeFamily, REG_ETQF_BASE, REG_ETQS_BASE, REG_FCRETA_BASE, REG_FCRXCTRL,
+    };
+    use super::queues::RegBank;
+    let cfg = FcoeConfig {
+        queues: &[3],
+        sriov_pool: Some(5),
+    };
+    let mut bank = FakeBank::new();
+    cfg.apply(&mut bank, FcoeFamily::X550);
+    if bank.read32(REG_ETQF_BASE + 2 * 4) != 0x8c50_8906 {
+        return TestResult::Fail("ETQF FCoE X550 word wrong");
+    }
+    for i in 0..32 {
+        if bank.read32(REG_FCRETA_BASE + (i as u64) * 4) != 0x30003 {
+            return TestResult::Fail("FCRETA X550 high-half word wrong");
+        }
+    }
+    if bank.read32(REG_ETQF_BASE + 4 * 4) != 0x8450_8914 {
+        return TestResult::Fail("ETQF FIP X550 word wrong");
+    }
+    if bank.read32(REG_ETQS_BASE + 4 * 4) != 0x8003_0000 {
+        return TestResult::Fail("ETQS FIP X550 word wrong");
+    }
+    if bank.read32(REG_FCRXCTRL) != 0x80 {
+        return TestResult::Fail("FCRXCTRL X550 word wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fcoe_configure_x550);
+
+fn smoke_ixgbe_fcoe_ddp_context() -> TestResult {
+    use super::fcoe::{ddp_context, DmaBuf, FcoeError, FcoeFamily};
+    let bufs = [
+        DmaBuf {
+            addr: 0x1000,
+            len: 8192,
+        },
+        DmaBuf {
+            addr: 0x3000,
+            len: 4096,
+        },
+    ];
+    let ctx = match ddp_context(7, FcoeFamily::Other, &bufs, false, Some(0x9000)) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("ddp_context full-buffers failed"),
+    };
+    if ctx.entries[..4] != [0x1000, 0x2000, 0x3000, 0x9000]
+        || ctx.count != 4
+        || ctx.lastsize != 1
+        || ctx.fcbuff != 0x401
+        || ctx.fcdmarw != 0x14007
+        || ctx.fcfltrw != 0x4007
+    {
+        return TestResult::Fail("ddp_context extra-buffer case wrong");
+    }
+    let unaligned = [DmaBuf {
+        addr: 0x1400,
+        len: 8192,
+    }];
+    let ctx = match ddp_context(0, FcoeFamily::Other, &unaligned, false, None) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("ddp_context unaligned-first failed"),
+    };
+    if ctx.entries[..3] != [0x1000, 0x2000, 0x3000]
+        || ctx.count != 3
+        || ctx.firstoff != 0x400
+        || ctx.lastsize != 1024
+        || ctx.fcbuff != 0x0400_0301
+    {
+        return TestResult::Fail("ddp_context unaligned-first words wrong");
+    }
+    let tgt = match ddp_context(0, FcoeFamily::Other, &unaligned, true, None) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("ddp_context target failed"),
+    };
+    if tgt.fcbuff != 0x0400_0381 {
+        return TestResult::Fail("ddp_context target WRCONTX bit wrong");
+    }
+    let one = [DmaBuf {
+        addr: 0x1000,
+        len: 4096,
+    }];
+    if !matches!(
+        ddp_context(511, FcoeFamily::Other, &one, false, Some(0x9000)),
+        Err(FcoeError::XidOutOfRange)
+    ) {
+        return TestResult::Fail("xid 511 on 82599 accepted");
+    }
+    if !matches!(
+        ddp_context(2047, FcoeFamily::X550, &one, false, Some(0x9000)),
+        Err(FcoeError::XidOutOfRange)
+    ) {
+        return TestResult::Fail("xid 2047 on X550 accepted");
+    }
+    if !matches!(
+        ddp_context(0, FcoeFamily::Other, &[], false, None),
+        Err(FcoeError::EmptyBuffers)
+    ) {
+        return TestResult::Fail("empty buffers accepted");
+    }
+    if !matches!(
+        ddp_context(
+            0,
+            FcoeFamily::Other,
+            &[DmaBuf {
+                addr: 0x1000,
+                len: 0,
+            }],
+            false,
+            None,
+        ),
+        Err(FcoeError::EmptyBuffer)
+    ) {
+        return TestResult::Fail("zero-length buffer accepted");
+    }
+    let misaligned = [
+        DmaBuf {
+            addr: 0x1000,
+            len: 4096,
+        },
+        DmaBuf {
+            addr: 0x2400,
+            len: 4096,
+        },
+    ];
+    if !matches!(
+        ddp_context(0, FcoeFamily::Other, &misaligned, false, None),
+        Err(FcoeError::UnalignedBuffer)
+    ) {
+        return TestResult::Fail("misaligned non-first buffer accepted");
+    }
+    let short = [
+        DmaBuf {
+            addr: 0x1000,
+            len: 2048,
+        },
+        DmaBuf {
+            addr: 0x2000,
+            len: 4096,
+        },
+    ];
+    if !matches!(
+        ddp_context(0, FcoeFamily::Other, &short, false, None),
+        Err(FcoeError::ShortBuffer)
+    ) {
+        return TestResult::Fail("short non-last buffer accepted");
+    }
+    if !matches!(
+        ddp_context(0, FcoeFamily::Other, &one, false, None),
+        Err(FcoeError::MissingExtraBuffer)
+    ) {
+        return TestResult::Fail("full last piece without extra buffer accepted");
+    }
+    let many = alloc::vec![DmaBuf {
+        addr: 0x1000,
+        len: 4096,
+    }; 257];
+    if !matches!(
+        ddp_context(0, FcoeFamily::Other, &many, false, Some(0x9000)),
+        Err(FcoeError::TooManyBuffers)
+    ) {
+        return TestResult::Fail("257 buffers accepted");
+    }
+    let mut edge = alloc::vec![DmaBuf {
+        addr: 0x1000,
+        len: 4096,
+    }; 255];
+    edge.push(DmaBuf {
+        addr: 0x1000 + 255 * 4096,
+        len: 2048,
+    });
+    let ctx = match ddp_context(0, FcoeFamily::Other, &edge, false, None) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("256-chunk edge case failed"),
+    };
+    if ctx.count != 256 || ctx.fcbuff != 0x1 {
+        return TestResult::Fail("256-chunk count field edge wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fcoe_ddp_context);
+
+fn smoke_ixgbe_fcoe_ddp_program() -> TestResult {
+    use super::fcoe::{
+        ddp_context, invalidate_ddp, program_ddp, DmaBuf, FcoeFamily, REG_FCBUFF, REG_FCDMARW,
+        REG_FCFLT, REG_FCFLTRW, REG_FCPARAM, REG_FCPTRH, REG_FCPTRL, REG_FCRXCTRL,
+    };
+    use super::queues::RegBank;
+    let one = [DmaBuf {
+        addr: 0x1000,
+        len: 4096,
+    }];
+    let ctx550 = match ddp_context(2, FcoeFamily::X550, &one, false, Some(0x9000)) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("ddp_context X550 failed"),
+    };
+    let mut bank = FakeBank::new();
+    program_ddp(&mut bank, FcoeFamily::X550, 2, 0x1_0000_5000, &ctx550);
+    if bank.read32(0x20020) != 0x5000
+        || bank.read32(0x20024) != 0x1
+        || bank.read32(0x20028) != 0x201
+        || bank.read32(0x2002c) != 0x14002
+        || bank.read32(0x28020) != 0x1
+        || bank.read32(0x28024) != 0
+        || bank.read32(0x2802c) != 0x4002
+    {
+        return TestResult::Fail("X550 direct DDP program wrong");
+    }
+    if invalidate_ddp(&mut bank, FcoeFamily::X550, 2, true) {
+        return TestResult::Fail("X550 invalidate still VALID");
+    }
+    if bank.read32(0x28020) != 0 || bank.read32(0x20028) != 0 || bank.read32(0x2002c) != 0x8002 {
+        return TestResult::Fail("X550 invalidate writes wrong");
+    }
+    let before = bank.read32(0x28020);
+    if invalidate_ddp(&mut bank, FcoeFamily::X550, 2, false) || bank.read32(0x28020) != before {
+        return TestResult::Fail("no-error invalidate wrote registers");
+    }
+    let ctx99 = match ddp_context(1, FcoeFamily::Other, &one, true, Some(0x9000)) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("ddp_context 82599 failed"),
+    };
+    let mut bank = FakeBank::new();
+    program_ddp(&mut bank, FcoeFamily::Other, 1, 0x6000, &ctx99);
+    if bank.read32(REG_FCRXCTRL) != 0x08 {
+        return TestResult::Fail("target LASTSEQH not set");
+    }
+    if bank.read32(REG_FCPTRL) != 0x6000
+        || bank.read32(REG_FCPTRH) != 0
+        || bank.read32(REG_FCBUFF) != 0x281
+        || bank.read32(REG_FCDMARW) != 0x14001
+        || bank.read32(REG_FCPARAM) != 0
+        || bank.read32(REG_FCFLT) != 0x1
+        || bank.read32(REG_FCFLTRW) != 0x4001
+    {
+        return TestResult::Fail("82599 indirect DDP program wrong");
+    }
+    if invalidate_ddp(&mut bank, FcoeFamily::Other, 1, true) {
+        return TestResult::Fail("82599 invalidate still VALID");
+    }
+    if bank.read32(REG_FCFLT) != 0
+        || bank.read32(REG_FCBUFF) != 0
+        || bank.read32(REG_FCDMARW) != 0x8001
+    {
+        return TestResult::Fail("82599 invalidate writes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fcoe_ddp_program);
+
+fn smoke_ixgbe_fcoe_wwn() -> TestResult {
+    use super::fcoe::wwn_compose;
+    if wwn_compose(0x2000, &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]) != Some(0x2000_0011_2233_4455) {
+        return TestResult::Fail("WWN composition wrong");
+    }
+    if wwn_compose(0xffff, &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]).is_some() {
+        return TestResult::Fail("unset prefix accepted");
+    }
+    if wwn_compose(0x2000, &[0; 6]).is_some() {
+        return TestResult::Fail("zero SAN address accepted");
+    }
+    if wwn_compose(0x2000, &[0x01, 0x11, 0x22, 0x33, 0x44, 0x55]).is_some() {
+        return TestResult::Fail("multicast SAN address accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fcoe_wwn);
+
+fn smoke_ixgbe_fcoe_rx_classify() -> TestResult {
+    use super::fcoe::{classify_rx, csum_verdict, CsumVerdict, RxOutcome};
+    if classify_rx(0x30, 0, true) != RxOutcome::Bypass {
+        return TestResult::Fail("DDP completion not Bypass");
+    }
+    if classify_rx(0x10, 50, true) != RxOutcome::PassThrough(50) {
+        return TestResult::Fail("NODDP completion wrong");
+    }
+    if classify_rx(0x20, 0, true) != RxOutcome::Invalid {
+        return TestResult::Fail("zero-length FCPRSP accepted");
+    }
+    if classify_rx(0x20, 100, true) != RxOutcome::PassThrough(100) {
+        return TestResult::Fail("FCPRSP completion wrong");
+    }
+    if classify_rx(0x00, 0, true) != RxOutcome::Invalid {
+        return TestResult::Fail("NOMTCH completion accepted");
+    }
+    if classify_rx(0x8000_0030, 0, true) != RxOutcome::Invalid {
+        return TestResult::Fail("FCEOFE error accepted");
+    }
+    if classify_rx(0x0010_0030, 0, true) != RxOutcome::Invalid {
+        return TestResult::Fail("BADCRC completion accepted as DDP");
+    }
+    if classify_rx(0x30, 0, false) != RxOutcome::Invalid {
+        return TestResult::Fail("context-less completion accepted");
+    }
+    if csum_verdict(0x0010_0000) != CsumVerdict::None {
+        return TestResult::Fail("BADCRC csum verdict wrong");
+    }
+    if csum_verdict(0x8000_0000) != CsumVerdict::Unnecessary {
+        return TestResult::Fail("non-CRC error csum verdict wrong");
+    }
+    if csum_verdict(0) != CsumVerdict::Unnecessary {
+        return TestResult::Fail("clean csum verdict wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fcoe_rx_classify);

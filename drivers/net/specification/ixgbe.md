@@ -19,7 +19,7 @@ RX layout for simplicity), MSI-X vectors per queue (or one shared
 misc vector for 1/1), and a `HwNic` adapter exposing the same
 surface the e1000/mlx5 drivers do.
 
-Does NOT own: FCoE, RSS.
+Does NOT own: RSS.
 
 ## 2. PCI match
 
@@ -508,6 +508,60 @@ the ethertype shift. The signature-add 64-bit FDIRHASH write
 is split into two 32-bit writes (hash, then command) because
 `RegBank` is 32-bit. Section number is letter-suffixed so it
 merges cleanly against §13b regardless of landing order.
+## 13e. FCoE (driver-side programming surface)
+
+FCoE transmit offload and receive DDP programming, mirroring Linux
+`ixgbe_fcoe.c`. `FcoeConfig::apply` programs the enable sequence:
+ETQF filter 2 = FCoE EtherType 0x8906 (with ETQF_FCOE and FILTER_EN,
+plus POOL_ENABLE and the pool number when SR-IOV is in use),
+ETQS filter 2 = 0 (no queue bits — the FCoE filter only tags),
+FCRETA round-robin over the FCoE queues (8 entries on 82599/X540,
+32 on X550; high half = next queue, as Linux writes it),
+FCRECTL = ENA, ETQF filter 4 = FIP EtherType 0x8914 (FILTER_EN,
+plus pool bits), ETQS filter 4 = QUEUE_EN plus the first FCoE
+queue in bits 16..23, FCRXCTRL = FCCRCBO (CRC offload on).
+`configure_fcoe` on the driver validates (non-empty queues, each
+<= 127, pool <= 63), applies through `MmioBank`, and stores the
+queue list for the future consumer.
+
+DDP contexts (`ddp_context`) mirror Linux `ixgbe_fcoe_ddp_setup`:
+buffers are split into 4 KiB pieces; the first piece may start
+unaligned (its offset lands in FCBUFF firstoff); non-first pieces
+must be 4 KiB-aligned; non-last pieces must end at a 4 KiB
+boundary; a last piece of exactly 4 KiB appends the caller's extra
+1-byte buffer and sets lastsize = 1 (no extra buffer is an error).
+The count field is `count & 0xff`, so a full 256-piece context
+writes 0 — Linux's edge, preserved literally. Xid validation
+mirrors Linux's setup limit: xid >= ddp_max - 1 is rejected (the
+top xid is unusable at setup even though the RX path allows
+xid < ddp_max). X550 programs FCDDC/FCDFC directly; all other
+family members program the indirect FCPTR/FCBUFF path. `program_ddp`
+requires the caller to hold the driver lock across the indirect
+sequence (Linux's spin_lock_bh); `invalidate_ddp` mirrors Linux
+`ixgbe_fcoe_ddp_put` (clear filter + DMA context on error only,
+read-back VALID check; the 100–150 µs settle wait is the caller's).
+`wwn_compose` mirrors Linux `ixgbe_fcoe_get_wwn` (prefix in bits
+48..63, SAN MAC bytes in 0..47; unset prefix, zero MAC, and
+multicast MAC all refused). RX classification (`classify_rx`)
+mirrors `ixgbe_fcoe_ddp`/`ixgbe_fcoe_ddp_get` and the RX descriptor
+error decode: any FCEOFE/FCERR bit invalidates before the FCSTAT
+switch; DDP completions bypass the stack; FCPRSP/NODDP completions
+pass through with the DDP length (zero length is invalid); NOMTCH
+and context-less completions are invalid. Checksum verdict
+(`csum_verdict`) mirrors `ixgbe_fcoe_cksum`: BADCRC means the
+checksum is bad, anything else means hardware already validated it.
+
+Not in this surface: the FSO transmit path (needs a TX frame
+parser the tree lacks — same gap as Flow Director's TX sampling
+hook); SAN-MAC provisioning from NVM (no NVM-read path for the
+SAN address exists in-tree); FC-frame xid parsing (EX_CTX →
+ox_id else rx_id) for the consumer; a live consumer wiring
+`configure_fcoe` + DDP into a receive path; silicon verification
+of every register write. Datasheet grounding for this block is an
+open follow-up: no 82599/X540/X550 datasheet copy exists in the
+workspace, so every address/bit/sequence here is Linux-transcribed
+(the single in-tree corroboration is none — no other module
+programs these registers).
 
 ## 13d. DCB (Refs #1263)
 
@@ -820,7 +874,9 @@ Per the v0.1 exclusion list, still open after this stream:
 - DCB — see §13d (Refs #1263; Linux-grounded, datasheet
   re-grounding + MTQC VT×DCB reconciliation + DCBx + CEE
   credits + disable path remain).
-- FCoE (FCRETA, FCRXCTRL) — out of the Ethernet scope.
+- FCoE (see §13e): datasheet re-grounding of the whole block;
+  FSO transmit path; SAN-MAC provisioning from NVM; FC-frame xid
+  parsing; live consumer wiring; silicon verification.
 - EEE: model + capability gate + FW-PHY decode + ACI cap
   computation landed (§13f); remainders are datasheet
   re-grounding, the FW-PHY activity + ACI transports, live

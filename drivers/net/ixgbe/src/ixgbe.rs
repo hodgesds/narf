@@ -23,6 +23,7 @@ use crate::ixgbe::rxdesc::{AdvRxDescRead, AdvRxDescWb, ADV_RXD_STAT_DD};
 pub mod dcb;
 pub mod eee;
 pub mod ethtool;
+pub mod fcoe;
 pub mod fdir;
 pub mod pm;
 pub mod queues;
@@ -522,6 +523,11 @@ pub struct Ixgbe {
     pub fdir_cfg: IrqSafeSpinLock<Option<fdir::FdirConfig>>,
     /// Programmed VMDq config, if `configure_vmdq` ran.
     pub vmdq_cfg: IrqSafeSpinLock<Option<vmdq::VmdqConfig>>,
+    /// FCoE RX queues programmed by `configure_fcoe`, if it ran
+    /// (empty = not configured). The queue list is the FCRETA
+    /// round-robin set; DDP contexts themselves are consumer
+    /// state (no FCoE consumer in-tree) and live in `fcoe`.
+    pub fcoe_queues: IrqSafeSpinLock<Vec<u32>>,
     /// Armed WoL config, if `configure_wol` ran and was not disarmed.
     pub wol_armed: IrqSafeSpinLock<Option<wol::WolConfig>>,
     /// Programmed EEE state, if `configure_eee` ran. Always `None`
@@ -843,6 +849,7 @@ impl Ixgbe {
             vlan_filter: IrqSafeSpinLock::new(None),
             fdir_cfg: IrqSafeSpinLock::new(None),
             vmdq_cfg: IrqSafeSpinLock::new(None),
+            fcoe_queues: IrqSafeSpinLock::new(Vec::new()),
             wol_armed: IrqSafeSpinLock::new(None),
             eee_state: IrqSafeSpinLock::new(None),
             wol_board_cap: IrqSafeSpinLock::new(wol::WolBoardCap::default()),
@@ -1493,6 +1500,26 @@ impl Ixgbe {
                 .map_err(|_| IxgbeError::Other("bad VMDq config"))?;
         }
         *self.vmdq_cfg.lock() = Some(cfg);
+        Ok(())
+    }
+
+    /// Program FCoE (Ethertype filters for FCoE/FIP, FCRETA
+    /// redirection over `queues`, FCRXCTRL CRC offload). Callers
+    /// must have RX disabled while reprogramming filters.
+    /// `sriov_pool` adds the ETQF pool bits when SR-IOV is in
+    /// use (None = no pool bits). DDP contexts are a separate
+    /// `fcoe` API for the future consumer; this only programs
+    /// the enable sequence. Datasheet grounding for the FCoE
+    /// block is an open follow-up (see `fcoe` header).
+    pub fn configure_fcoe(&self, queues: &[u32], sriov_pool: Option<u8>) -> Result<(), IxgbeError> {
+        let cfg = fcoe::FcoeConfig { queues, sriov_pool };
+        cfg.validate()
+            .map_err(|_| IxgbeError::Other("bad FCoE config"))?;
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            cfg.apply(&mut bank, fcoe::family_for(self.did));
+        }
+        *self.fcoe_queues.lock() = queues.to_vec();
         Ok(())
     }
 
