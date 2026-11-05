@@ -126,20 +126,65 @@ impl TimerDelays {
 
 // ── populate ─────────────────────────────────────────────────────────
 
-/// Register `/sys/class/leds/<name>/` for every device in the LED
-/// registry.
+/// Reconcile `/sys/class/leds` with the LED registry.
 ///
-/// Called once from the `leds/sysfs` initcall (Stage::Device).
+/// The class directory is created if absent (so it exists even on
+/// a machine with no LEDs), any published child whose device is no
+/// longer registered is removed, and every registered device is
+/// published if it is not already. The reconciliation is derived
+/// from the kobject tree itself rather than shadow state, so it
+/// converges to the current registry regardless of the order
+/// registrations, unregistrations, and test resets interleave.
 ///
-/// Linux ref: `led_classdev_register` calls `device_create_with_groups`
-/// which runs `sysfs_create_group` for each `led_groups` entry
+/// Called from [`crate::register_led`] and
+/// [`crate::unregister_led`] after the registry lock is dropped;
+/// concurrent reconciliations are idempotent and the last one to
+/// run observes the final registry.
+///
+/// Linux ref: `led_classdev_register` calls
+/// `device_create_with_groups` which runs `sysfs_create_group`
+/// for each `led_groups` entry
 /// (`drivers/leds/led-class.c`).
-pub fn populate_leds_class() {
+///
+/// Mirrors the backlight bridge's `sync_publication` (#952):
+/// the earlier one-shot snapshot taken by a Stage::Device initcall
+/// could never publish probe-registered devices, because crate
+/// Device initcalls run before `probe_all_pci` within the stage.
+pub fn sync_publication() {
     let class = class_register("leds");
-
-    for dev in led_devices() {
-        register_one(class.clone(), dev);
+    let devs = led_devices();
+    for child in class.child_names() {
+        if !devs.iter().any(|d| d.name() == child.as_str()) {
+            class.remove_child(&child);
+        }
     }
+    for dev in devs {
+        if class.get_child(dev.name()).is_none() {
+            register_one(class.clone(), dev);
+        }
+    }
+}
+
+/// Remove `name`'s sysfs directory if it is published.
+///
+/// Used when a same-name registration replaces the device object:
+/// the published attribute closures capture the superseded `Arc`,
+/// so the directory is dropped and the following
+/// [`sync_publication`] rebuilds it against the replacement.
+pub fn unpublish(name: &str) {
+    let class = class_register("leds");
+    class.remove_child(name);
+}
+
+/// Populate `/sys/class/leds` for the registered LED devices.
+///
+/// Kept as the body of the `leds/sysfs` initcall (Stage::Device):
+/// it guarantees the class directory exists from boot even before
+/// any device registers, and reconciles publication with whatever
+/// the initcalls registered. Probe-time registrations afterwards
+/// publish themselves via [`sync_publication`].
+pub fn populate_leds_class() {
+    sync_publication();
 }
 
 fn register_one(class: Arc<narf_filesystem::sysfs::Kobject>, dev: Arc<dyn LedDevice>) {
@@ -276,7 +321,9 @@ pub mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use super::populate_leds_class;
-    use crate::class::{__reset_for_test as led_reset, register_led, LedDevice, SimpleLed};
+    use crate::class::{
+        __reset_for_test as led_reset, register_led, unregister_led, LedDevice, SimpleLed,
+    };
 
     fn read_attr(kobj: &narf_filesystem::sysfs::Kobject, attr: &str) -> alloc::string::String {
         kobj.attr_show(attr).unwrap_or_default()
@@ -515,4 +562,129 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/leds", smoke_led_trigger_invalid_name);
+
+    // ── smoke 9: publication follows registration, no populate ──────
+    //
+    // #956: a device registered after the Stage::Device initcalls
+    // (the probe order that defeated the old one-shot snapshot)
+    // publishes immediately, with no populate call anywhere in
+    // this fixture.
+
+    fn smoke_led_dynamic_publication_on_register() -> TestResult {
+        reset();
+        let led = Arc::new(SimpleLed::onoff("test::dyn"));
+        register_led(led.clone() as Arc<dyn LedDevice>);
+
+        let class = narf_filesystem::sysfs::class_register("leds");
+        let kobj = match class.get_child("test::dyn") {
+            Some(k) => k,
+            None => {
+                reset();
+                return TestResult::Fail("LED not published on register");
+            }
+        };
+        match kobj.attr_store("brightness", b"1") {
+            Some(Ok(())) => {}
+            _ => {
+                reset();
+                return TestResult::Fail("brightness store(1) failed");
+            }
+        }
+        let got = led.brightness();
+        reset();
+        if got != 1 {
+            return TestResult::Fail("store did not reach the published LED");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/leds", smoke_led_dynamic_publication_on_register);
+
+    // ── smoke 10: same-name replacement rebuilds the directory ─────
+    //
+    // #956: the published attribute closures capture the device
+    // `Arc`, so a replacement must rebuild the directory rather
+    // than leave sysfs driving the superseded device object.
+
+    fn smoke_led_dynamic_publication_on_replace() -> TestResult {
+        reset();
+        let old = Arc::new(SimpleLed::brightness_led("test::swap"));
+        register_led(old.clone() as Arc<dyn LedDevice>);
+        let class = narf_filesystem::sysfs::class_register("leds");
+        let kobj = match class.get_child("test::swap") {
+            Some(k) => k,
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing after first register");
+            }
+        };
+        if !matches!(kobj.attr_store("brightness", b"77"), Some(Ok(()))) {
+            reset();
+            return TestResult::Fail("brightness store(77) on first device failed");
+        }
+        if old.brightness() != 77 {
+            reset();
+            return TestResult::Fail("first device did not receive store(77)");
+        }
+        // Replace with a fresh device of the same name.
+        let new = Arc::new(SimpleLed::brightness_led("test::swap"));
+        register_led(new.clone() as Arc<dyn LedDevice>);
+        let kobj2 = match class.get_child("test::swap") {
+            Some(k) => k,
+            None => {
+                reset();
+                return TestResult::Fail("kobj missing after replacement");
+            }
+        };
+        if !matches!(kobj2.attr_store("brightness", b"42"), Some(Ok(()))) {
+            reset();
+            return TestResult::Fail("brightness store(42) on replacement failed");
+        }
+        let (old_lvl, new_lvl) = (old.brightness(), new.brightness());
+        reset();
+        if new_lvl != 42 {
+            return TestResult::Fail("store did not reach the replacement device");
+        }
+        if old_lvl != 77 {
+            return TestResult::Fail("store reached the superseded device");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/leds", smoke_led_dynamic_publication_on_replace);
+
+    // ── smoke 11: publication follows unregistration ─────────
+    //
+    // #956: unregistering the last device removes its directory;
+    // the class directory itself persists.
+
+    fn smoke_led_dynamic_publication_on_unregister() -> TestResult {
+        reset();
+        let a = Arc::new(SimpleLed::onoff("test::gone-a"));
+        let b = Arc::new(SimpleLed::onoff("test::gone-b"));
+        register_led(a as Arc<dyn LedDevice>);
+        register_led(b as Arc<dyn LedDevice>);
+        let class = narf_filesystem::sysfs::class_register("leds");
+        let both_published =
+            class.get_child("test::gone-a").is_some() && class.get_child("test::gone-b").is_some();
+        if !both_published {
+            reset();
+            return TestResult::Fail("LEDs not published on register");
+        }
+        unregister_led("test::gone-a");
+        if class.get_child("test::gone-a").is_some() {
+            reset();
+            return TestResult::Fail("unregistered LED still published");
+        }
+        if class.get_child("test::gone-b").is_none() {
+            reset();
+            return TestResult::Fail("surviving LED unpublished by a sibling unregister");
+        }
+        unregister_led("test::gone-b");
+        let empty = class.child_names().is_empty();
+        reset();
+        if !empty {
+            return TestResult::Fail("class not empty after last unregister");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/leds", smoke_led_dynamic_publication_on_unregister);
 }

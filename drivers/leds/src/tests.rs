@@ -23,6 +23,7 @@ use crate::leds_input_caps::{
     register_set_report, unregister_set_report, LedCapsLock, HID_LED_BYTE, HID_LED_CAPS_LOCK,
 };
 use crate::leds_pwm::LedPwm;
+use crate::sysfs_bridge::populate_leds_class;
 use crate::triggers::{Trigger, __compute_brightness_for_test};
 
 // ── Mock GPIO controller ───────────────────────────────────────────
@@ -435,3 +436,34 @@ fn smoke_led_worker_preserves_full_device_index() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/leds", smoke_led_worker_preserves_full_device_index);
+
+// ── Composition: initcalls registered in a composed boot (#956) ──
+
+fn smoke_led_composition_registers_initcalls() -> TestResult {
+    // #956: the frame composition root must call this crate's
+    // register_initcalls(), so a composed boot carries the LED
+    // Stage::Device initcalls. Before the fix the list contained
+    // no leds entries at all and none of the subsystem ever ran
+    // in production.
+    let names = narf_init::registered_names(narf_init::Stage::Device);
+    for want in ["leds/class", "leds/sysfs", "leds/worker"] {
+        if !names.contains(&want) {
+            return TestResult::Fail("LED initcall missing from composed boot");
+        }
+    }
+    // The sysfs initcall's body guarantees the class directory
+    // exists even on a machine with no LEDs. Run it, then verify
+    // through the non-creating child lookup so the assertion
+    // cannot create the class itself.
+    populate_leds_class();
+    let root = narf_filesystem::sysfs::sysfs_root();
+    let class_dir = match root.get_child("class") {
+        Some(c) => c,
+        None => return TestResult::Fail("/sys/class missing"),
+    };
+    if class_dir.get_child("leds").is_none() {
+        return TestResult::Fail("/sys/class/leds missing after populate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/leds", smoke_led_composition_registers_initcalls);

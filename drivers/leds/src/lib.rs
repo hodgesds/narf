@@ -77,8 +77,9 @@ pub use worker::{
 
 // ── initcalls ─────────────────────────────────────────────────────
 
-/// Register LED subsystem initcalls. Call from the top-level
-/// `drivers::register_initcalls()` during Stage::Device.
+/// Register LED subsystem initcalls. Called from the frame
+/// composition root (`frame/src/bare_main.rs`, #956) during
+/// Stage::Device.
 ///
 /// Registers:
 /// - the LED class and (linux-compat) sysfs bridge, at `Stage::Device`;
