@@ -4653,6 +4653,8 @@ mod tx_tests {
                 has_status: false,
                 tx_checksum: true,
                 tx_tso4: true,
+                tx_tso6: false,
+                tx_uso: false,
                 rx_guest_csum: guest_csum,
                 has_rss: false,
                 has_hash_report: rx_hdr_len == 20,
