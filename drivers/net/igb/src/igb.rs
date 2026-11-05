@@ -1038,6 +1038,7 @@ pub const IMS_RXSEQ: u32 = 1 << 3; // E1000_ICR_RXSEQ  0x00000008
 pub const IMS_LSC: u32 = 1 << 2; // E1000_ICR_LSC    0x00000004
 pub const IMS_RXDMT0: u32 = 1 << 4; // E1000_ICR_RXDMT0 0x00000010
 pub const IMS_RXT0: u32 = 1 << 7; // E1000_ICR_RXT0   0x00000080
+pub const IMS_VMMB: u32 = 1 << 8; // E1000_ICR_VMMB   0x00000100
                                   // Matches Linux's IMS_ENABLE_MASK subset the single-vector path needs:
                                   // RXT0 | TXDW | RXDMT0 | RXSEQ | LSC (DOUTSYNC is DMA-coalescing only).
 pub const IMS_DEFAULT: u32 = IMS_TXDW | IMS_LSC | IMS_RXSEQ | IMS_RXDMT0 | IMS_RXT0;
@@ -1106,6 +1107,29 @@ pub enum IgbError {
     Other(&'static str),
 }
 
+/// Outcome of one [`Igb::vt_mailbox_pump_step`]: which VFs had a
+/// message dispatched, an ack consumed, a reset event processed,
+/// or an ack-NACK sent. Bit `vf` set = VF `vf` took that path.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MailboxPumpOutcome {
+    /// VFs whose pending message was dispatched (reply written or
+    /// mailbox unlocked).
+    pub msgs: u8,
+    /// VFs whose VFACK bit was consumed.
+    pub acks: u8,
+    /// VFs whose VFLRE reset event was processed.
+    pub resets: u8,
+    /// VFs sent an ack-NACK (non-CTS VF acking a PF message).
+    pub ack_nacks: u8,
+}
+
+impl MailboxPumpOutcome {
+    /// No VF took any path.
+    pub const fn is_empty(&self) -> bool {
+        self.msgs == 0 && self.acks == 0 && self.resets == 0 && self.ack_nacks == 0
+    }
+}
+
 /// MMIO base of the IRQ-attached igb, shared with the static ISR so it
 /// can read ICR (read-to-clear) and acknowledge the device. 0 = no
 /// controller bound (handler short-circuits).
@@ -1120,6 +1144,11 @@ static ISR_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 /// was a probe-time photograph because the ISR read ICR only to
 /// acknowledge it (issue #791).
 static LSC_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Mailbox event pending, set by the ISR when ICR reports VMMB.
+/// The RX pump (task context) consumes the flag and runs the
+/// mailbox pump step — same shape as `LSC_PENDING` (issue #1253).
+static MB_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// The family's publication sample. i210/82576/i350 negotiate up to
 /// 1 GbE copper; report full duplex when the link is up (QEMU's igb
@@ -1150,6 +1179,11 @@ fn igb_isr() {
     // cause word (issue #791).
     if icr & IMS_LSC != 0 {
         LSC_PENDING.store(true, Ordering::Release);
+    }
+    // VMMB reaches this read once `vt_allocate` adds it to IMS;
+    // record it for the mailbox pump the same way.
+    if icr & IMS_VMMB != 0 {
+        MB_PENDING.store(true, Ordering::Release);
     }
 }
 
@@ -2046,11 +2080,14 @@ impl Igb {
     /// RXCSUM PCSD (Linux `igb_setup_mrqc`).
     ///
     /// What this does NOT do (remainders, see the spec): PCI SR-IOV
-    /// config-space enablement and VF BAR exposure (needs a PCI-layer
-    /// lane), the mailbox interrupt pump (the dispatcher below is
-    /// callable but nothing polls MBVFICR yet), and live PF queue
-    /// relocation to `rbase_offset` (bring-up is queue-0-only; the
-    /// pool math itself is fixture-proven in `vmdq`).
+    /// config-space enablement and VF BAR exposure — the caller
+    /// enables the bus half first via `narf_bus::sriov::enable_sriov`
+    /// (cap + device from bring-up) — and live PF queue relocation
+    /// to `rbase_offset` (bring-up is queue-0-only; the pool math
+    /// itself is fixture-proven in `vmdq`). The mailbox pump IS
+    /// wired here: MBVFIMR is unmasked and IMS gains VMMB, and the
+    /// RX pump drains the ISR's flag through
+    /// [`Igb::vt_mailbox_pump_step`].
     ///
     /// Later RSS reprogramming of MRQC must pass `vmdq = true` and
     /// the actual RSS queue count to [`mrqc_word`]; with VFs
@@ -2122,6 +2159,13 @@ impl Igb {
                 .write32(REG_MRQC, mrqc_word(false, false, true, 1));
             let rxcsum = self.mmio.read32(REG_RXCSUM);
             self.mmio.write32(REG_RXCSUM, rxcsum_rss_word(rxcsum));
+            // Mailbox interrupts (Linux `igb_irq_enable`, MSI-X
+            // branch, `vfs_allocated_count != 0`): unmask every VF
+            // in MBVFIMR and add VMMB to the legacy cause mask so
+            // the ISR sees VF mail and flags it for the pump.
+            self.mmio.write32(vmdq::REG_MBVFIMR, vmdq::MBVFIMR_ALL_VFS);
+            let ims = self.mmio.read32(REG_IMS);
+            self.mmio.write32(REG_IMS, ims | IMS_VMMB);
         }
         *vt_guard = Some(state);
         Ok(())
@@ -2134,9 +2178,9 @@ impl Igb {
     /// shadow (the same single word write `vlan_filter_add` /
     /// `vlan_filter_remove` perform, applied inline because the
     /// filter lock is already held — lock order vt -> vlan_filter).
-    /// Returns the dispatcher's reply words; the caller writes them
-    /// to VMBMEM and rings P2VMAILBOX (Linux `igb_write_mbx`), which
-    /// is the mailbox pump's job and a remainder of this lane.
+    /// Returns the dispatcher's reply words;
+    /// [`Igb::vt_mailbox_pump_step`] writes them to VMBMEM and
+    /// rings P2VMAILBOX (Linux `igb_write_mbx`).
     pub fn vt_dispatch_mailbox(
         &self,
         vf: usize,
@@ -2150,11 +2194,19 @@ impl Igb {
         let outcome = vt
             .dispatch(vf, msg, &filter)
             .map_err(|_| IgbError::Other("igb VT mailbox message invalid"))?;
-        // Application order is load-bearing (see `vmdq::Program`):
-        // VFTA clears for removes first (a last-pool remove must
-        // clear its VFTA bit before its entry is disabled), then
-        // register writes and MTA sets, then VFTA sets for adds.
-        for vid in &outcome.program.vlan_removes[..outcome.program.n_vlan_removes] {
+        self.apply_vt_program(&outcome.program, &mut filter);
+        Ok(outcome)
+    }
+
+    /// Apply a VT program to MMIO + VLAN filter shadow. Caller
+    /// holds the `vt` lock and the `vlan_filter` lock (order vt ->
+    /// vlan_filter, never reversed). Application order is
+    /// load-bearing (see `vmdq::Program`): VFTA clears for removes
+    /// first (a last-pool remove must clear its VFTA bit before its
+    /// entry is disabled), then register writes and MTA sets, then
+    /// VFTA sets for adds.
+    fn apply_vt_program(&self, program: &vmdq::Program, filter: &mut VlanFilter) {
+        for vid in &program.vlan_removes[..program.n_vlan_removes] {
             filter.remove(*vid);
             let word = vfta_word(*vid);
             let value = filter.word(word);
@@ -2164,17 +2216,17 @@ impl Igb {
             }
         }
         // SAFETY: mapped MMIO throughout; every address comes from
-        // the dispatcher's bounded program.
+        // the bounded program.
         unsafe {
-            for w in &outcome.program.writes[..outcome.program.n_writes] {
+            for w in &program.writes[..program.n_writes] {
                 self.mmio.write32(w.addr, w.value);
             }
-            for (addr, bit) in &outcome.program.mta_sets[..outcome.program.n_mta_sets] {
+            for (addr, bit) in &program.mta_sets[..program.n_mta_sets] {
                 let cur = self.mmio.read32(*addr);
                 self.mmio.write32(*addr, cur | bit);
             }
         }
-        for vid in &outcome.program.vlan_adds[..outcome.program.n_vlan_adds] {
+        for vid in &program.vlan_adds[..program.n_vlan_adds] {
             filter.add(*vid);
             let word = vfta_word(*vid);
             let value = filter.word(word);
@@ -2183,7 +2235,234 @@ impl Igb {
                 self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
             }
         }
-        Ok(outcome)
+    }
+
+    /// Run one VF reset event through the VT state machine (Linux
+    /// `igb_vf_reset_event`) and apply its program to the device.
+    /// Shares the dispatcher's application order via
+    /// [`Igb::apply_vt_program`].
+    pub fn vt_reset_event(&self, vf: usize) -> Result<(), IgbError> {
+        let mut vt_guard = self.vt.lock();
+        let Some(vt) = vt_guard.as_mut() else {
+            return Err(IgbError::Other("igb VT not allocated"));
+        };
+        let mut filter = self.vlan_filter.lock();
+        let program = vt
+            .vf_reset_event(vf, vmdq::pf_filter_contains(&filter))
+            .map_err(|_| IgbError::Other("igb VT reset event invalid"))?;
+        self.apply_vt_program(&program, &mut filter);
+        Ok(())
+    }
+
+    /// Whether the pump owes VF `vf` an ack-NACK: the VF acked a PF
+    /// message without CTS and has not been NACKed yet this epoch
+    /// (Linux `igb_rcv_ack_from_vf`, whose 2 s `last_nack` throttle
+    /// is a one-shot latch here — see
+    /// `vmdq::VfState::ack_nack_sent`). Records the latch when it
+    /// returns true.
+    fn vt_ack_nack_needed(&self, vf: usize) -> bool {
+        let mut vt_guard = self.vt.lock();
+        let Some(vt) = vt_guard.as_mut() else {
+            return false;
+        };
+        if vf >= vt.num_vfs || vt.vfs[vf].cts || vt.vfs[vf].ack_nack_sent {
+            return false;
+        }
+        vt.vfs[vf].ack_nack_sent = true;
+        true
+    }
+
+    /// Revoke a VF's clear-to-send (pump lock-failure path).
+    fn vt_revoke_cts(&self, vf: usize) {
+        if let Some(vt) = self.vt.lock().as_mut() {
+            vt.revoke_cts(vf);
+        }
+    }
+
+    /// Take the PF side of a VF mailbox (Linux
+    /// `igb_obtain_mbx_lock_pf`): write PFU, read it back, retry
+    /// up to 10 times. Linux waits 1 ms between tries (`udelay`);
+    /// this pump re-reads immediately — the VF raises VFREQ only
+    /// after releasing the buffer, so a contended first try is a
+    /// transient race, not a wait.
+    fn mailbox_obtain_lock(&self, vf: usize) -> bool {
+        // SAFETY: mapped MMIO; P2VMAILBOX is in range for vf.
+        unsafe {
+            for _ in 0..10 {
+                self.mmio
+                    .write32(vmdq::p2vmailbox_addr(vf), vmdq::P2VMAILBOX_PFU);
+                if self.mmio.read32(vmdq::p2vmailbox_addr(vf)) & vmdq::P2VMAILBOX_PFU != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Write reply words to a VF (Linux `igb_write_mbx_pf`): take
+    /// the lock, flush any stale message/ack bits for the VF, copy
+    /// the words to VMBMEM, and ring P2VMAILBOX STS to hand the
+    /// buffer to the VF. Returns false when the lock could not be
+    /// taken (no write performed). Words past the mailbox size are
+    /// dropped, never written into the next VF's window.
+    fn mailbox_write_reply(&self, vf: usize, words: &[u32]) -> bool {
+        if !self.mailbox_obtain_lock(vf) {
+            return false;
+        }
+        // SAFETY: mapped MMIO throughout; VMBMEM/P2VMAILBOX are in
+        // range for vf.
+        unsafe {
+            // Flush stale message/ack bits (Linux `igb_write_mbx_pf`
+            // calls `igb_check_for_msg_pf` + `igb_check_for_ack_pf`
+            // here); the VF waits for this reply before posting
+            // another message, so no live bit is lost.
+            let bit = 1u32 << vf;
+            self.mmio.write32(vmdq::REG_MBVFICR, bit | (bit << 16));
+            for (w, word) in words.iter().enumerate().take(vmdq::VFMAILBOX_WORDS) {
+                self.mmio.write32(vmdq::vmbmem_addr(vf, w), *word);
+            }
+            self.mmio
+                .write32(vmdq::p2vmailbox_addr(vf), vmdq::P2VMAILBOX_STS);
+        }
+        true
+    }
+
+    /// Release the PF side of a VF mailbox (Linux `igb_unlock_mbx`):
+    /// clear PFU, leaving the other control bits (e.g. ACK) as
+    /// they are.
+    fn mailbox_unlock(&self, vf: usize) {
+        // SAFETY: mapped MMIO; P2VMAILBOX is in range for vf.
+        unsafe {
+            let cur = self.mmio.read32(vmdq::p2vmailbox_addr(vf));
+            self.mmio
+                .write32(vmdq::p2vmailbox_addr(vf), cur & !vmdq::P2VMAILBOX_PFU);
+        }
+    }
+
+    /// Dispatch one pending message for `vf`: take the mailbox
+    /// lock, copy the 16-word message out of VMBMEM, ack-and-hold
+    /// (Linux `igb_read_mbx_pf` with `unlock = false`), run the
+    /// dispatcher, then write the reply back (or unlock when the
+    /// dispatcher says the message was already processed). Returns
+    /// false only when the mailbox lock could not be taken — the
+    /// message is lost and CTS is revoked, exactly Linux's
+    /// read-failure path.
+    fn mailbox_dispatch_one(&self, vf: usize) -> bool {
+        if !self.mailbox_obtain_lock(vf) {
+            self.vt_revoke_cts(vf);
+            return false;
+        }
+        let mut msg = [0u32; vmdq::VFMAILBOX_WORDS];
+        // SAFETY: mapped MMIO; VMBMEM words are in range for vf.
+        unsafe {
+            for (w, slot) in msg.iter_mut().enumerate() {
+                *slot = self.mmio.read32(vmdq::vmbmem_addr(vf, w));
+            }
+            // Acknowledge + keep the PF lock (unlock = false).
+            self.mmio.write32(
+                vmdq::p2vmailbox_addr(vf),
+                vmdq::P2VMAILBOX_ACK | vmdq::P2VMAILBOX_PFU,
+            );
+        }
+        match self.vt_dispatch_mailbox(vf, &msg) {
+            Ok(outcome) => {
+                if outcome.reply_len == 0 {
+                    // Already processed: unlock only.
+                    self.mailbox_unlock(vf);
+                } else if !self.mailbox_write_reply(vf, &outcome.reply[..outcome.reply_len]) {
+                    // Lock lost between read and write; the reply is
+                    // dropped and CTS revoked (same as a read
+                    // failure — the VF re-initiates with RESET).
+                    self.vt_revoke_cts(vf);
+                    return false;
+                }
+                true
+            }
+            Err(_) => {
+                // Dispatcher refused the message: NACK it (Linux
+                // `igb_rcv_msg_from_vf` `out:` path).
+                let nack = msg[0] | vmdq::VT_MSGTYPE_CTS | vmdq::VT_MSGTYPE_NACK;
+                if !self.mailbox_write_reply(vf, &[nack]) {
+                    self.vt_revoke_cts(vf);
+                    return false;
+                }
+                true
+            }
+        }
+    }
+
+    /// Run one mailbox-pump pass (Linux `igb_msg_task`): consume
+    /// MBVFICR / VFLRE, dispatch each pending VF message through
+    /// [`Igb::vt_dispatch_mailbox`], and write the reply back with
+    /// the `igb_write_mbx` lock dance. Also processes VF reset
+    /// events (`igb_vf_reset_event`) and VF acks
+    /// (`igb_rcv_ack_from_vf`). Callable from task context (the RX
+    /// pump drains `MB_PENDING` into this) and from fixtures; the
+    /// ISR itself only sets the flag.
+    ///
+    /// Fails fast with an empty outcome when the datapath gate is
+    /// closed (detached/suspended) or no VT is allocated — a parked
+    /// pump can no longer touch the device, and MBVFICR is never
+    /// read before VT exists.
+    pub fn vt_mailbox_pump_step(&self) -> MailboxPumpOutcome {
+        let mut outcome = MailboxPumpOutcome::default();
+        if !datapath_allowed(
+            self.detached.load(Ordering::Acquire),
+            self.suspended.load(Ordering::Acquire),
+        ) {
+            return outcome;
+        }
+        let num_vfs = {
+            let guard = self.vt.lock();
+            let Some(vt) = guard.as_ref() else {
+                return outcome;
+            };
+            vt.num_vfs
+        };
+        let vf_mask: u32 = (1u32 << num_vfs) - 1;
+        // SAFETY: mapped MMIO; MBVFICR/VFLRE have no read side
+        // effects (both are write-1-to-clear).
+        let mbvficr = unsafe { self.mmio.read32(vmdq::REG_MBVFICR) };
+        let vflre = unsafe { self.mmio.read32(vmdq::REG_VFLRE) };
+        let reqs = mbvficr & vmdq::MBVFICR_VFREQ_MASK & vf_mask;
+        let acks = (mbvficr & vmdq::MBVFICR_VFACK_MASK) >> 16 & vf_mask;
+        let resets = vflre & vf_mask;
+        if reqs == 0 && acks == 0 && resets == 0 {
+            return outcome;
+        }
+        for vf in 0..num_vfs {
+            let bit = 1u32 << vf;
+            // Linux `igb_msg_task` order per VF: reset, message, ack.
+            if resets & bit != 0 {
+                // SAFETY: mapped MMIO; W1C clear of this VF's bit.
+                unsafe { self.mmio.write32(vmdq::REG_VFLRE, bit) };
+                if self.vt_reset_event(vf).is_ok() {
+                    outcome.resets |= bit as u8;
+                }
+            }
+            if reqs & bit != 0 {
+                // SAFETY: mapped MMIO; W1C clear of this VF's
+                // request bit (Linux `igb_check_for_bit_pf`).
+                unsafe { self.mmio.write32(vmdq::REG_MBVFICR, bit) };
+                if self.mailbox_dispatch_one(vf) {
+                    outcome.msgs |= bit as u8;
+                }
+            }
+            if acks & bit != 0 {
+                // SAFETY: mapped MMIO; W1C clear of this VF's ack
+                // bit (Linux `igb_check_for_bit_pf`).
+                unsafe {
+                    self.mmio.write32(vmdq::REG_MBVFICR, bit << 16);
+                }
+                outcome.acks |= bit as u8;
+                if self.vt_ack_nack_needed(vf)
+                    && self.mailbox_write_reply(vf, &[vmdq::VT_MSGTYPE_NACK])
+                {
+                    outcome.ack_nacks |= bit as u8;
+                }
+            }
+        }
+        outcome
     }
 
     /// Suspend the device (Linux `__igb_shutdown` order): mask
@@ -2291,7 +2570,16 @@ impl Igb {
                 self.mmio.write32(REG_EIAC, MSIX_VECTOR0_MASK);
                 self.mmio.write32(REG_EIAM, MSIX_VECTOR0_MASK);
                 self.mmio.write32(REG_EIMS, MSIX_VECTOR0_MASK);
-                self.mmio.write32(REG_IMS, IMS_DEFAULT);
+                // Re-arm the mailbox cause when VT is allocated
+                // (Linux `igb_irq_enable` adds VMMB and unmasks
+                // MBVFIMR only with VFs; a D3 transition may have
+                // reset both).
+                if self.vt.lock().is_some() {
+                    self.mmio.write32(vmdq::REG_MBVFIMR, vmdq::MBVFIMR_ALL_VFS);
+                    self.mmio.write32(REG_IMS, IMS_DEFAULT | IMS_VMMB);
+                } else {
+                    self.mmio.write32(REG_IMS, IMS_DEFAULT);
+                }
             }
         }
         self.suspended.store(false, Ordering::Release);
@@ -3055,6 +3343,13 @@ async fn igb_rx_pump(device: Arc<Igb>) {
         if LSC_PENDING.swap(false, Ordering::AcqRel) {
             crate::publish::publish_link(igb_ifname(), igb_link_sample(&device));
         }
+        // Mailbox drain (issue #1253): the ISR flagged a VF
+        // mailbox event; run the pump step in task context. The
+        // pump fails fast when no VT is allocated, so this costs
+        // one flag check per loop when SR-IOV is off.
+        if MB_PENDING.swap(false, Ordering::AcqRel) {
+            let _ = device.vt_mailbox_pump_step();
+        }
         let irq_waiter = device.irq_vector.map(|vector| {
             narf_interrupts::wait_for_irq_until(
                 vector,
@@ -3146,6 +3441,239 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_extended_interrupt_layout);
+
+    use super::{
+        alloc_coherent, vmdq, AtomicBool, DmaBuffer, DomainId, Igb, IrqSafeSpinLock, MmioRegion,
+        Ordering, Vec, IMS_VMMB,
+    };
+    use narf_bus::{msix::__synth_msix_table, BarKind};
+
+    /// Fake-MMIO igb for the mailbox-pump fixtures: a 64 KiB
+    /// coherent backing store behind `MmioRegion` (the i40e
+    /// fixture pattern), a synthetic MSI-X table (only its
+    /// presence matters to `vt_allocate`), and an I350 device id.
+    /// Returns the device plus the backing store, which must stay
+    /// alive while the device is used.
+    fn fixture_igb_vt() -> Option<(Igb, DmaBuffer)> {
+        let mut backing = alloc_coherent(0x10000, DomainId::DRIVER_0).ok()?;
+        backing.as_mut_slice().fill(0);
+        let mmio = MmioRegion {
+            phys: backing.phys_addr(),
+            virt: backing.as_mut_ptr() as u64,
+            len: backing.len() as u64,
+            kind: BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        let tx_ring_buf = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
+        let rx_ring_buf = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
+        let igb = Igb {
+            mmio,
+            mac: [0x02, 0, 0, 0, 0, 0x01],
+            tx_ring_buf,
+            rx_ring_buf,
+            rx_buf_pool: IrqSafeSpinLock::new(Vec::new()),
+            tx_buf_pool: Vec::new(),
+            tx_state: IrqSafeSpinLock::new(TxRingCursor::new()),
+            vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
+            device_id: IGB_I350_COPPER,
+            vt: IrqSafeSpinLock::new(None),
+            stats: IgbStats::default(),
+            wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
+            suspended: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
+            rx_head: IrqSafeSpinLock::new(0),
+            rx_draining: AtomicBool::new(false),
+            ready: false,
+            _msix: Some(__synth_msix_table(1)),
+            irq_vector: None,
+            rx_ipc_ring: IrqSafeSpinLock::new(None),
+            tx_ipc_ring: IrqSafeSpinLock::new(None),
+        };
+        Some((igb, backing))
+    }
+
+    fn smoke_igb_mailbox_pump_reset_and_mac() -> TestResult {
+        let Some((igb, _backing)) = fixture_igb_vt() else {
+            return TestResult::Fail("mailbox pump fixture allocation failed");
+        };
+        if igb.vt_allocate(2).is_err() {
+            return TestResult::Fail("vt_allocate failed on the pump fixture");
+        }
+        // vt_allocate unmasks the mailbox (Linux `igb_irq_enable`).
+        // SAFETY: fixture-owned MMIO backing.
+        let mbvfimr = unsafe { igb.mmio.read32(vmdq::REG_MBVFIMR) };
+        let ims = unsafe { igb.mmio.read32(REG_IMS) };
+        if mbvfimr != vmdq::MBVFIMR_ALL_VFS || ims & IMS_VMMB == 0 {
+            return TestResult::Fail("vt_allocate did not unmask MBVFIMR / IMS.VMMB");
+        }
+        // VF 0 posts RESET with no MAC set: NACK reply, CTS earned.
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            igb.mmio.write32(vmdq::vmbmem_addr(0, 0), vmdq::VF_RESET);
+            igb.mmio.write32(vmdq::REG_MBVFICR, 1 << 0);
+        }
+        let outcome = igb.vt_mailbox_pump_step();
+        if outcome.msgs != 0x01 || outcome.acks != 0 || outcome.resets != 0 {
+            return TestResult::Fail("mailbox pump did not dispatch the RESET");
+        }
+        // SAFETY: fixture-owned MMIO backing.
+        let reply0 = unsafe { igb.mmio.read32(vmdq::vmbmem_addr(0, 0)) };
+        let p2v = unsafe { igb.mmio.read32(vmdq::p2vmailbox_addr(0)) };
+        if reply0 != vmdq::VF_RESET | vmdq::VT_MSGTYPE_NACK {
+            return TestResult::Fail("RESET reply was not NACK (no MAC set)");
+        }
+        if p2v != vmdq::P2VMAILBOX_STS {
+            return TestResult::Fail("P2VMAILBOX was not rung with STS");
+        }
+        // The plain backing store keeps the last MBVFICR write: the
+        // request clear (0x01) then the reply flush (0x0001_0001).
+        let mbvficr = unsafe { igb.mmio.read32(vmdq::REG_MBVFICR) };
+        if mbvficr != 0x0001_0001 {
+            return TestResult::Fail("MBVFICR clear/flush write sequence drift");
+        }
+        // VF 0 posts SET_MAC_ADDR (info 0, valid MAC): ACK reply,
+        // primary RAR programmed. msg words carry the MAC
+        // little-endian (`msg_mac`); RAR slot 31 is VF 0's primary
+        // on a 32-entry I350 table.
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            igb.mmio
+                .write32(vmdq::vmbmem_addr(0, 0), vmdq::VF_SET_MAC_ADDR);
+            igb.mmio.write32(vmdq::vmbmem_addr(0, 1), 0x0000_0002);
+            igb.mmio.write32(vmdq::vmbmem_addr(0, 2), 0x0005_0000);
+            igb.mmio.write32(vmdq::REG_MBVFICR, 1 << 0);
+        }
+        let outcome = igb.vt_mailbox_pump_step();
+        if outcome.msgs != 0x01 {
+            return TestResult::Fail("mailbox pump did not dispatch SET_MAC_ADDR");
+        }
+        // SAFETY: fixture-owned MMIO backing.
+        let reply0 = unsafe { igb.mmio.read32(vmdq::vmbmem_addr(0, 0)) };
+        let p2v = unsafe { igb.mmio.read32(vmdq::p2vmailbox_addr(0)) };
+        let ral31 = unsafe { igb.mmio.read32(vmdq::ral_addr(31)) };
+        if reply0 != vmdq::VF_SET_MAC_ADDR | vmdq::VT_MSGTYPE_CTS | vmdq::VT_MSGTYPE_ACK {
+            return TestResult::Fail("SET_MAC_ADDR reply was not ACK");
+        }
+        if p2v != vmdq::P2VMAILBOX_STS {
+            return TestResult::Fail("SET_MAC_ADDR reply did not ring P2VMAILBOX");
+        }
+        if ral31 != 0x0000_0002 {
+            return TestResult::Fail("SET_MAC_ADDR did not program the VF primary RAR");
+        }
+        // An already-processed message (ACK bit set) unlocks only:
+        // no reply written, P2VMAILBOX ends at ACK (PFU cleared).
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            igb.mmio.write32(
+                vmdq::vmbmem_addr(0, 0),
+                vmdq::VF_SET_MAC_ADDR | vmdq::VT_MSGTYPE_ACK,
+            );
+            igb.mmio
+                .write32(vmdq::p2vmailbox_addr(0), vmdq::P2VMAILBOX_PFU);
+            igb.mmio.write32(vmdq::REG_MBVFICR, 1 << 0);
+        }
+        let outcome = igb.vt_mailbox_pump_step();
+        if outcome.msgs != 0x01 {
+            return TestResult::Fail("already-processed message was not counted");
+        }
+        // SAFETY: fixture-owned MMIO backing.
+        let reply0 = unsafe { igb.mmio.read32(vmdq::vmbmem_addr(0, 0)) };
+        let p2v = unsafe { igb.mmio.read32(vmdq::p2vmailbox_addr(0)) };
+        let mbvficr = unsafe { igb.mmio.read32(vmdq::REG_MBVFICR) };
+        if reply0 != vmdq::VF_SET_MAC_ADDR | vmdq::VT_MSGTYPE_ACK {
+            return TestResult::Fail("already-processed message was overwritten");
+        }
+        if p2v != vmdq::P2VMAILBOX_ACK {
+            return TestResult::Fail("already-processed message did not unlock to ACK");
+        }
+        if mbvficr != 0x01 {
+            return TestResult::Fail("unlock path wrote an unexpected MBVFICR mask");
+        }
+        // No pending bits (the fake does not model W1C clearing,
+        // so drive the cause words to zero first): idle pump.
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            igb.mmio.write32(vmdq::REG_MBVFICR, 0);
+            igb.mmio.write32(vmdq::REG_VFLRE, 0);
+        }
+        if !igb.vt_mailbox_pump_step().is_empty() {
+            return TestResult::Fail("idle mailbox pump reported work");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_mailbox_pump_reset_and_mac);
+
+    fn smoke_igb_mailbox_pump_reset_event_and_ack() -> TestResult {
+        let Some((igb, _backing)) = fixture_igb_vt() else {
+            return TestResult::Fail("mailbox pump fixture allocation failed");
+        };
+        if igb.vt_allocate(2).is_err() {
+            return TestResult::Fail("vt_allocate failed on the pump fixture");
+        }
+        // VF 1 asserts VFLRE with no CTS and no MAC: the reset
+        // event runs and restores VMOLR AUPE for pool 1.
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            igb.mmio.write32(vmdq::REG_VFLRE, 1 << 1);
+        }
+        let outcome = igb.vt_mailbox_pump_step();
+        if outcome.resets != 0x02 || outcome.msgs != 0 || outcome.acks != 0 {
+            return TestResult::Fail("reset event was not processed");
+        }
+        // SAFETY: fixture-owned MMIO backing.
+        let vflre = unsafe { igb.mmio.read32(vmdq::REG_VFLRE) };
+        let vmolr1 = unsafe { igb.mmio.read32(vmdq::vmolr_addr(1)) };
+        if vflre != 0x02 {
+            return TestResult::Fail("VFLRE clear-write drift");
+        }
+        if vmolr1 != vmdq::VMOLR_AUPE {
+            return TestResult::Fail("reset event did not restore VMOLR AUPE");
+        }
+        // VF 1 acks a PF message without CTS: one NACK, then the
+        // latch suppresses the second.
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            igb.mmio.write32(vmdq::REG_MBVFICR, 1 << (16 + 1));
+        }
+        let outcome = igb.vt_mailbox_pump_step();
+        if outcome.acks != 0x02 || outcome.ack_nacks != 0x02 {
+            return TestResult::Fail("non-CTS ack was not NACKed");
+        }
+        // SAFETY: fixture-owned MMIO backing.
+        let reply0 = unsafe { igb.mmio.read32(vmdq::vmbmem_addr(1, 0)) };
+        if reply0 != vmdq::VT_MSGTYPE_NACK {
+            return TestResult::Fail("ack-NACK word drift");
+        }
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            igb.mmio.write32(vmdq::vmbmem_addr(1, 0), 0xDEAD_BEEF);
+            igb.mmio.write32(vmdq::REG_MBVFICR, 1 << (16 + 1));
+        }
+        let outcome = igb.vt_mailbox_pump_step();
+        if outcome.acks != 0x02 || outcome.ack_nacks != 0 {
+            return TestResult::Fail("ack-NACK latch did not suppress the second NACK");
+        }
+        // SAFETY: fixture-owned MMIO backing.
+        let reply0 = unsafe { igb.mmio.read32(vmdq::vmbmem_addr(1, 0)) };
+        if reply0 != 0xDEAD_BEEF {
+            return TestResult::Fail("second ack-NACK overwrote the mailbox");
+        }
+        // Detached gate: a parked pump touches nothing.
+        igb.detached.store(true, Ordering::Release);
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            igb.mmio.write32(vmdq::REG_MBVFICR, 1 << 0);
+        }
+        if !igb.vt_mailbox_pump_step().is_empty() {
+            return TestResult::Fail("detached pump step did work");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/igb",
+        smoke_igb_mailbox_pump_reset_event_and_ack
+    );
 
     fn smoke_igb_per_queue_enable_layout() -> TestResult {
         // The per-queue DMA-enable handshake is the functional delta vs

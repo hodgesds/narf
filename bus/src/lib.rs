@@ -57,6 +57,7 @@ pub mod pcie_aer;
 pub mod pcie_dpc;
 pub mod pcie_recovery;
 pub mod registry;
+pub mod sriov;
 pub mod vmd_domain;
 pub mod vmd_irq;
 

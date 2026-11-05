@@ -16,19 +16,19 @@
 //! drivers number pools differently because their Linux drivers do.
 //!
 //! What this module does NOT do (sequenced follow-ups, not silently
-//! dropped): the mailbox interrupt pump (nothing consumes MBVFICR
-//! yet — the dispatcher is callable, fixture-proven, and awaits a
-//! pump, same remainder as ixgbe #1398); PCI SR-IOV config-space
-//! enablement and VF BAR exposure (no SR-IOV cap programming exists
-//! in NARF's PCI layer yet — `vt_allocate` is the device-side
-//! allocation, the bus half is a PCI-layer lane); live PF queue
-//! relocation to `rbase_offset` (NARF igb bring-up is queue-0-only,
-//! so the pool-queue math here is fixture-proven until a multi-queue
-//! bring-up lands); VF rate limiting (`igb_ndo_set_vf_bw`);
-//! `SET_MULTICAST` MTA restore on PF multicast-list change
-//! (`igb_restore_vf_multicasts`); the `MAX_JUMBO_FRAME_SIZE` clamp
-//! on SET_LPE (that constant lives outside the drivers-only reference
-//! trees, so SET_LPE clamps to the VMOLR RLPML field width instead).
+//! dropped): PCI SR-IOV config-space enablement and VF BAR exposure
+//! live in `narf_bus::sriov` — `vt_allocate` is the device-side
+//! allocation and the caller enables the bus half first; live PF
+//! queue relocation to `rbase_offset` (NARF igb bring-up is
+//! queue-0-only, so the pool-queue math here is fixture-proven until
+//! a multi-queue bring-up lands); VF rate limiting
+//! (`igb_ndo_set_vf_bw`); `SET_MULTICAST` MTA restore on PF
+//! multicast-list change (`igb_restore_vf_multicasts`); the
+//! `MAX_JUMBO_FRAME_SIZE` clamp on SET_LPE (that constant lives
+//! outside the drivers-only reference trees, so SET_LPE clamps to
+//! the VMOLR RLPML field width instead). The mailbox interrupt pump
+//! (`Igb::vt_mailbox_pump_step`, in `igb.rs`) consumes MBVFICR and
+//! drives this dispatcher; it lives there because it owns MMIO.
 
 use super::{
     VlanFilter, IGB_82576, IGB_82576_NS, IGB_I210_COPPER, IGB_I210_COPPER_FLASHLESS,
@@ -117,6 +117,12 @@ pub const REG_VFTE: u64 = 0x00C90;
 pub const REG_MBVFICR: u64 = 0x00C80;
 /// Mailbox VF Interrupt Mask (e1000_regs.h:330).
 pub const REG_MBVFIMR: u64 = 0x00C84;
+/// VF Register Events, read-write-clear (e1000_regs.h:331).
+pub const REG_VFLRE: u64 = 0x00C88;
+/// Mailbox VF Interrupt Mask value that unmasks every VF (Linux
+/// `igb_irq_enable`: `wr32(E1000_MBVFIMR, 0xFF)` when VFs are
+/// allocated).
+pub const MBVFIMR_ALL_VFS: u32 = 0xFF;
 /// PF<->VF mailbox memory base, 64 bytes per VF (e1000_regs.h:344).
 pub const REG_VMBMEM_BASE: u64 = 0x00800;
 /// PF->VF mailbox control base, one word per VF (e1000_regs.h:343).
@@ -600,6 +606,12 @@ pub struct VfState {
     /// Clear to send (Linux `IGB_VF_FLAG_CTS` — set by RESET, gates
     /// every other message).
     pub cts: bool,
+    /// An ack-NACK has already been sent for this non-CTS epoch
+    /// (the pump's `igb_rcv_ack_from_vf` equivalent). Linux
+    /// rate-limits that NACK to once per 2 s (`last_nack`); NARF
+    /// has no jiffies here, so one NACK per reset epoch bounds the
+    /// same spam. Cleared by `vf_reset` and when CTS is earned.
+    pub ack_nack_sent: bool,
     /// Admin-assigned port VLAN, 0 = none (Linux `pf_vlan`).
     pub pf_vlan: u16,
     /// Admin-assigned port VLAN QoS (Linux `pf_qos`).
@@ -623,6 +635,7 @@ impl VfState {
             trusted: false,
             spoofchk_enabled: true,
             cts: false,
+            ack_nack_sent: false,
             pf_vlan: 0,
             pf_qos: 0,
             mc_hashes: [0; MAX_VF_MC_HASHES],
@@ -1255,6 +1268,33 @@ impl VtState {
         Ok(prog)
     }
 
+    /// VF reset EVENT (Linux `igb_vf_reset_event`): a VF that
+    /// asserted its VFLRE bit is treated as hotplug removed/added —
+    /// its MAC is cleared unless the PF set it — then the
+    /// function-level reset runs. Unlike the reset MESSAGE, this
+    /// does not re-enable VFRE/VFTE or earn CTS.
+    pub fn vf_reset_event(
+        &mut self,
+        vf: usize,
+        pf_monitors: impl Fn(u16) -> bool,
+    ) -> Result<Program, VmdqError> {
+        self.check_vf(vf)?;
+        if !self.vfs[vf].pf_set_mac {
+            self.vfs[vf].mac = [0; 6];
+        }
+        self.vf_reset(vf, pf_monitors)
+    }
+
+    /// Revoke clear-to-send (Linux `igb_rcv_msg_from_vf` on a
+    /// mailbox-read failure). The VF re-earns CTS with its next
+    /// RESET message. Out-of-range VFs are a silent no-op so the
+    /// pump's failure path never panics.
+    pub fn revoke_cts(&mut self, vf: usize) {
+        if self.check_vf(vf).is_ok() {
+            self.vfs[vf].cts = false;
+        }
+    }
+
     /// Reset MESSAGE handler (Linux `igb_vf_reset_msg`): function
     /// reset, primary-MAC reprogram, VFRE/VFTE enable, CTS set, and
     /// the 3-word reply (ACK + MAC when a MAC is set, else NACK).
@@ -1272,6 +1312,8 @@ impl VtState {
         prog.push_write(REG_VFTE, self.vfte)?;
         prog.push_write(REG_VFRE, self.vfre)?;
         self.vfs[vf].cts = true;
+        // A fresh CTS epoch may NACK one stray ack again.
+        self.vfs[vf].ack_nack_sent = false;
         let mut reply = [0u32; 3];
         if !is_zero_ether_addr(mac) {
             reply[0] = VF_RESET | VT_MSGTYPE_ACK;
@@ -1794,6 +1836,52 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_vmdq_allocation);
+
+    fn smoke_igb_vmdq_reset_event() -> TestResult {
+        let mut vt = vt_82576_2();
+        // VF 0 holds a MAC the PF did not set: a reset event
+        // clears it (hotplug remove/add) and clears the ack-NACK
+        // latch, and the program still restores VMOLR.
+        vt.vfs[0].mac = [0x02, 0, 0, 0, 0, 0x01];
+        vt.vfs[0].ack_nack_sent = true;
+        let prog = match vt.vf_reset_event(0, |_| false) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("reset event failed for a live VF"),
+        };
+        if vt.vfs[0].mac != [0; 6] {
+            return TestResult::Fail("reset event kept a non-PF-set MAC");
+        }
+        if vt.vfs[0].ack_nack_sent {
+            return TestResult::Fail("reset event did not clear the ack-NACK latch");
+        }
+        if !prog.writes[..prog.n_writes]
+            .iter()
+            .any(|w| w.addr == vmolr_addr(0))
+        {
+            return TestResult::Fail("reset event program lost the VMOLR restore");
+        }
+        // A PF-set MAC survives the event.
+        vt.vfs[0].mac = [0x02, 0, 0, 0, 0, 0x02];
+        vt.vfs[0].pf_set_mac = true;
+        if vt.vf_reset_event(0, |_| false).is_err() {
+            return TestResult::Fail("reset event failed for a PF-set MAC");
+        }
+        if vt.vfs[0].mac != [0x02, 0, 0, 0, 0, 0x02] {
+            return TestResult::Fail("reset event cleared a PF-set MAC");
+        }
+        // Out-of-range VF fails closed; revoke_cts is a no-op there.
+        if vt.vf_reset_event(7, |_| false).is_ok() {
+            return TestResult::Fail("reset event accepted an out-of-range VF");
+        }
+        vt.vfs[0].cts = true;
+        vt.revoke_cts(0);
+        if vt.vfs[0].cts {
+            return TestResult::Fail("revoke_cts did not clear CTS");
+        }
+        vt.revoke_cts(7);
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_vmdq_reset_event);
 
     fn smoke_igb_vmdq_rar_words() -> TestResult {
         let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
