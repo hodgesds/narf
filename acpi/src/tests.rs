@@ -3094,6 +3094,10 @@ fn write_bytes_to_frame(
     let phys = frame.start_address().raw();
     // SAFETY: exclusively-owned frame, reached through the direct map.
     let dst = frame.start_address().kernel_mut_ptr::<u8>();
+    // SAFETY: `dst` is the direct-map pointer to an exclusively-owned,
+    // freshly allocated frame; `bytes.len() <= 4096` was checked above,
+    // so the copy stays inside the single frame, and `bytes` is a
+    // borrowed slice, so the source range is valid.
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
     }

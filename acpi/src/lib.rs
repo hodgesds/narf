@@ -221,6 +221,9 @@ pub unsafe fn read_table_header(phys: u64) -> Result<SdtHeader, AcpiError> {
 /// # Safety
 /// Same precondition as [`read_table_header`].
 pub unsafe fn verify_table_checksum(phys: u64) -> Result<SdtHeader, AcpiError> {
+    // SAFETY: this fn's `# Safety` section upholds `read_table_header`'s
+    // precondition for `phys`; the callee re-validates the header and the
+    // full declared length against the mapped window before reading.
     let hdr = unsafe { read_table_header(phys)? };
     let total = hdr.length as usize;
     let p = narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>();
@@ -330,6 +333,10 @@ where
     // Header + full-length window validation happens here, before
     // the first read; the checksum below then runs over the
     // already-bounded slice.
+    // SAFETY: `phys` meets `read_table_header`'s precondition per this
+    // fn's `# Safety` section (identity-mapped, covers the advertised
+    // length); the callee re-validates the header and full length
+    // against the mapped window before reading.
     let hdr = unsafe { read_table_header(phys)? };
     let is_xsdt = &hdr.signature == b"XSDT";
     let is_rsdt = &hdr.signature == b"RSDT";
@@ -364,6 +371,11 @@ where
         // length against the mapped window BEFORE dereferencing
         // the pointer. Out-of-window / malformed children are
         // skipped, never passed to the callback.
+        // SAFETY: `phys` is a bounds-checked entry from the already-
+        // validated XSDT body (zero entries skipped above);
+        // `read_table_header` validates the child's header and full
+        // declared length against the mapped window before reading,
+        // and an out-of-window child errors out and is skipped.
         let child = match unsafe { read_table_header(phys) } {
             Ok(h) => h,
             Err(_) => continue,
