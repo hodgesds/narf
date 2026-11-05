@@ -501,6 +501,18 @@ pub unsafe fn enable_msix_queue(
     Ok((v, table))
 }
 
+/// One bound virtio queue: the IDT vector its interrupts land on
+/// plus the MSI-X table slot the device was told to signal.
+/// `None` on either side means that queue has no interrupt path
+/// (table full, IDT exhausted, or the device rejected the binding)
+/// and its consumer falls back to polling. The slot is returned
+/// alongside the vector so a caller can point a second queue at
+/// the same slot (a TX queue sharing its pair's RX vector).
+pub struct MsixQueueBinding {
+    pub idt_vector: Option<u8>,
+    pub slot: Option<u16>,
+}
+
 /// Enable MSI-X and bind *each* RX queue in `targets` to its own MSI-X
 /// vector, routed to the named CPU's LAPIC. Unlike [`enable_msix_queue`]
 /// (which hardcodes table slot 0 for a single queue), this reserves one
@@ -508,8 +520,8 @@ pub unsafe fn enable_msix_queue(
 /// own interrupt instead of polling. `targets` is `(queue_index,
 /// target_apic_id)` per RX queue (queue `2*K` for pair `K`).
 ///
-/// Returns the shared [`MsixTable`] plus a per-entry `Vec<Option<u8>>` of
-/// IDT vectors — `None` for any queue that couldn't get a slot/vector
+/// Returns the shared [`MsixTable`] plus a per-entry `Vec<MsixQueueBinding>`
+/// — `None` fields for any queue that couldn't get a slot/vector
 /// (table full, IDT exhausted, or the device rejected the binding). A
 /// `None` entry is not an error: the caller's forwarder falls back to its
 /// polled cadence for that queue, so the device still works, just without
@@ -523,10 +535,11 @@ pub unsafe fn enable_msix_rx_queues(
     cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     device: &narf_bus::BusDevice,
     targets: &[(u16, u32)],
-) -> Result<(narf_bus::MsixTable, alloc::vec::Vec<Option<u8>>), VirtioPciError> {
+) -> Result<(narf_bus::MsixTable, alloc::vec::Vec<MsixQueueBinding>), VirtioPciError> {
     let mut table =
         narf_bus::msix::enable_msix(cap, device).map_err(|_| VirtioPciError::BarMapFailed)?;
-    let mut vectors: alloc::vec::Vec<Option<u8>> = alloc::vec::Vec::with_capacity(targets.len());
+    let mut bindings: alloc::vec::Vec<MsixQueueBinding> =
+        alloc::vec::Vec::with_capacity(targets.len());
     // Program each entry while MSI-X delivery is still gated off (PCIe
     // §6.1.4 recommended order): reserve a slot, point it at the CPU's
     // LAPIC, then bind the virtio queue to that slot. Enable once at the end.
@@ -534,35 +547,107 @@ pub unsafe fn enable_msix_rx_queues(
         let slot = match table.alloc_vector() {
             Some(mv) => mv.vector,
             None => {
-                vectors.push(None);
+                bindings.push(MsixQueueBinding {
+                    idt_vector: None,
+                    slot: None,
+                });
                 continue;
             }
         };
         let v = match narf_interrupts::vector::alloc() {
             Ok(v) => v,
             Err(_) => {
-                vectors.push(None);
+                bindings.push(MsixQueueBinding {
+                    idt_vector: None,
+                    slot: None,
+                });
                 continue;
             }
         };
         // SAFETY: caller owns the device's BAR exclusively.
         if unsafe { table.program_vector(slot, target_apic, v) }.is_err() {
-            vectors.push(None);
+            bindings.push(MsixQueueBinding {
+                idt_vector: None,
+                slot: None,
+            });
             continue;
         }
-        // Bind virtio queue `q_idx` to MSI-X table slot `slot`.
-        // SAFETY: identity-mapped MMIO common-cfg region.
-        unsafe {
-            common.write16(CC_QUEUE_SELECT, q_idx);
-            common.write16(CC_QUEUE_MSIX_VECTOR, slot);
-        }
-        // SAFETY: same. Readback confirms the device accepted the binding.
-        let actual = unsafe { common.read16(CC_QUEUE_MSIX_VECTOR) };
-        vectors.push(if actual == slot { Some(v) } else { None });
+        // Bind virtio queue `q_idx` to MSI-X table slot `slot`; the
+        // readback inside confirms the device accepted the binding.
+        // SAFETY: caller owns the device's common-cfg region.
+        let ok = unsafe { bind_queue_msix_vector(common, q_idx, slot) };
+        bindings.push(MsixQueueBinding {
+            idt_vector: if ok { Some(v) } else { None },
+            slot: if ok { Some(slot) } else { None },
+        });
     }
     // SAFETY: caller owns the device; flip the global MSI-X enable gate.
     unsafe { table.enable() }.map_err(|_| VirtioPciError::BarMapFailed)?;
-    Ok((table, vectors))
+    Ok((table, bindings))
+}
+
+/// Bind one virtio queue to an already-programmed MSI-X table slot:
+/// write `queue_select` + `queue_msix_vector` in the common cfg and
+/// read back. Returns `true` iff the device accepted the binding.
+/// Shared by [`enable_msix_rx_queues`] and by callers that point a
+/// second queue at an existing slot (a TX queue sharing its pair's
+/// RX vector).
+///
+/// # Safety
+/// Caller owns the device's common-cfg region exclusively.
+pub unsafe fn bind_queue_msix_vector(common: &VirtioRegion, q_idx: u16, slot: u16) -> bool {
+    // SAFETY: identity-mapped MMIO common-cfg region.
+    unsafe {
+        common.write16(CC_QUEUE_SELECT, q_idx);
+        common.write16(CC_QUEUE_MSIX_VECTOR, slot);
+    }
+    // SAFETY: same. Readback confirms the device accepted the binding.
+    let actual = unsafe { common.read16(CC_QUEUE_MSIX_VECTOR) };
+    actual == slot
+}
+
+/// Bind the device-config-change vector: write `msix_config` in the
+/// common cfg and read back. Returns `true` iff the device accepted
+/// it. The table slot itself must already be allocated + programmed
+/// (see [`alloc_msix_config_vector`]).
+///
+/// # Safety
+/// Caller owns the device's common-cfg region exclusively.
+pub unsafe fn bind_config_msix_vector(common: &VirtioRegion, slot: u16) -> bool {
+    // SAFETY: identity-mapped MMIO common-cfg region.
+    unsafe {
+        common.write16(CC_MSIX_CONFIG, slot);
+    }
+    // SAFETY: same. Readback confirms the device accepted the binding.
+    let actual = unsafe { common.read16(CC_MSIX_CONFIG) };
+    actual == slot
+}
+
+/// Reserve one MSI-X table slot for device configuration changes and
+/// program it to deliver to `target_apic` at a fresh IDT vector.
+/// Returns `(idt_vector, slot)`; the caller binds the slot into the
+/// common cfg with [`bind_config_msix_vector`]. Takes the table
+/// `&mut` — never re-discovers it — so a driver that already bound
+/// queue vectors on the same table cannot clobber them by
+/// re-acquiring (a fresh `enable_msix` resets the slot allocator
+/// to 0, so a second acquisition would reprogram slot 0 underneath
+/// the live queue bindings).
+///
+/// # Safety
+/// Caller owns the device's BAR + cfg-space exclusively.
+pub unsafe fn alloc_msix_config_vector(
+    table: &mut narf_bus::MsixTable,
+    target_apic: u32,
+) -> Result<(u8, u16), VirtioPciError> {
+    let slot = table
+        .alloc_vector()
+        .ok_or(VirtioPciError::BarMapFailed)?
+        .vector;
+    let v = narf_interrupts::vector::alloc().map_err(|_| VirtioPciError::BarMapFailed)?;
+    // SAFETY: caller owns the device's BAR exclusively.
+    unsafe { table.program_vector(slot, target_apic, v) }
+        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    Ok((v, slot))
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
