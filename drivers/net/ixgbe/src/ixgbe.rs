@@ -1612,49 +1612,63 @@ impl Ixgbe {
         // The rebuild programs cfg.ring_len descriptors per queue
         // into the rings bring-up allocated; a mismatch would
         // over- or under-fill ring memory, so refuse rather than
-        // guess.
-        if cfg.ring_len != TX_RING_LEN || cfg.ring_len != RX_RING_LEN {
-            return Err(IxgbeError::Other(
-                "queue ring length != allocated ring length",
-            ));
+        // guess. Bring-up builds each queue's ring for exactly
+        // cfg.ring_len descriptors, so the per-queue state itself
+        // is the allocated length to check against — not the old
+        // single-ring constants (TX_RING_LEN/RX_RING_LEN were 32)
+        // and not TX_RING_N/RX_RING_N (1024: Frame channel
+        // capacities, a different quantity entirely).
+        if self.tx_queues.len() != cfg.num_tx || self.rx_queues.len() != cfg.num_rx {
+            return Err(IxgbeError::Other("queue count != configured queue count"));
+        }
+        for q in self.tx_queues.iter() {
+            if q.tx_pool.len() != cfg.ring_len {
+                return Err(IxgbeError::Other("tx pool size != ring length"));
+            }
         }
         // A slot-count mismatch means the ring and the slot table
         // disagree; refuse before touching anything rather than
         // arm a descriptor with no backing buffer.
-        if self.rx_slots.lock().len() != RX_RING_LEN {
-            return Err(IxgbeError::Other("rx slot count != ring length"));
+        for q in self.rx_queues.iter() {
+            if q.rx_slots.lock().len() != cfg.ring_len {
+                return Err(IxgbeError::Other("rx slot count != ring length"));
+            }
         }
-        // 1. Zero the TX ring: stale descriptors must not reach
+        // 1. Zero each TX ring: stale descriptors must not reach
         // the device after re-enable.
         // SAFETY: identity-mapped DMA ring page.
         unsafe {
-            for i in 0..(TX_RING_LEN * 16) {
-                core::ptr::write_volatile(self.tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
+            for q in self.tx_queues.iter() {
+                for i in 0..(cfg.ring_len * 16) {
+                    core::ptr::write_volatile(q.tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
+                }
             }
         }
         // 2. Re-arm every RX descriptor from the buffer its slot
         // currently owns (slots rotate as frames are handed up, so
         // the current contents — not the bring-up pool order — are
-        // the truth).
-        let rx_phys = self.rx_ring.dma_addr().raw();
-        {
-            let slots = self.rx_slots.lock();
-            for (i, buf) in slots.iter().enumerate() {
-                let desc = RxDesc {
-                    addr: buf.dma_addr().raw(),
-                    length: 0,
-                    csum: 0,
-                    status: 0,
-                    errors: 0,
-                    special: 0,
-                };
-                // SAFETY: identity-mapped DMA ring page.
-                unsafe {
-                    core::ptr::write_volatile(
-                        narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
-                            .kernel_mut_ptr::<RxDesc>(),
-                        desc,
-                    );
+        // the truth), one queue at a time.
+        for q in self.rx_queues.iter() {
+            let rx_phys = q.rx_ring.dma_addr().raw();
+            {
+                let slots = q.rx_slots.lock();
+                for (i, buf) in slots.iter().enumerate() {
+                    let desc = RxDesc {
+                        addr: buf.dma_addr().raw(),
+                        length: 0,
+                        csum: 0,
+                        status: 0,
+                        errors: 0,
+                        special: 0,
+                    };
+                    // SAFETY: identity-mapped DMA ring page.
+                    unsafe {
+                        core::ptr::write_volatile(
+                            narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
+                                .kernel_mut_ptr::<RxDesc>(),
+                            desc,
+                        );
+                    }
                 }
             }
         }
@@ -1663,16 +1677,33 @@ impl Ixgbe {
         // RX pump's re-arm path).
         compiler_fence(Ordering::SeqCst);
         // 3. Reprogram rings + enables, one entry per queue.
+        // resume_rebuild_plan validates the base counts against
+        // cfg.num_tx / cfg.num_rx itself, so a vector/cfg skew
+        // fails here before any register is written.
         {
+            let tx_bases: Vec<u64> = self
+                .tx_queues
+                .iter()
+                .map(|q| q.tx_ring.dma_addr().raw())
+                .collect();
+            let rx_bases: Vec<u64> = self
+                .rx_queues
+                .iter()
+                .map(|q| q.rx_ring.dma_addr().raw())
+                .collect();
             let mut bank = queues::MmioBank::new(&self.mmio);
-            pm::resume_rebuild_plan(&mut bank, cfg, &[self.tx_ring.dma_addr().raw()], &[rx_phys])
+            pm::resume_rebuild_plan(&mut bank, cfg, &tx_bases, &rx_bases)
                 .map_err(IxgbeError::Other)?;
         }
         // 4. Reset the pump cursors to the rebuilt state, then
         // unquiesce last, so no pump runs against a half-rebuilt
         // ring.
-        *self.tx_tail.lock() = 0;
-        *self.rx_head.lock() = 0;
+        for q in self.tx_queues.iter() {
+            *q.tx_tail.lock() = 0;
+        }
+        for q in self.rx_queues.iter() {
+            *q.rx_head.lock() = 0;
+        }
         *self.quiesced.lock() = false;
         // SAFETY: identity-mapped MMIO.
         let links = unsafe { self.mmio.read32(REG_LINKS) };
