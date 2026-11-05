@@ -36,18 +36,17 @@ const MBOX: u32 = 0x100;
 
 /// A kick that plays a responsive AOSS: every kick acks the link and
 /// channel and consumes any pending message (clears its length word).
-/// `responsive` can be switched off mid-test to force timeouts.
+/// `responsive` can be switched off mid-test to force timeouts. The
+/// flag is shared by reference so a test can still flip it after the
+/// kick has moved into `Qmp::open`.
 struct AckKick<'a> {
     regs: &'a FakeRegs,
-    responsive: AtomicBool,
+    responsive: &'a AtomicBool,
 }
 
 impl<'a> AckKick<'a> {
-    fn new(regs: &'a FakeRegs) -> Self {
-        Self {
-            regs,
-            responsive: AtomicBool::new(true),
-        }
+    fn new(regs: &'a FakeRegs, responsive: &'a AtomicBool) -> Self {
+        Self { regs, responsive }
     }
 }
 
@@ -65,6 +64,7 @@ impl Kick for AckKick<'_> {
 }
 
 /// A kick that never acks anything.
+#[derive(Debug)]
 struct NoopKick;
 
 impl Kick for NoopKick {
@@ -95,7 +95,8 @@ fn msg_at(regs: &FakeRegs) -> Vec<u8> {
 fn smoke_qcom_aoss_open_handshake() -> TestResult {
     let d = FakeDelay::new();
     let regs = msgram();
-    let kick = AckKick::new(&regs);
+    let responsive = AtomicBool::new(true);
+    let kick = AckKick::new(&regs, &responsive);
     let q = run(Qmp::open(&regs, kick, &d));
     kt_assert!(q.is_some());
     let q = q.unwrap().unwrap();
@@ -143,7 +144,8 @@ kernel_test_in!("drivers/soc/qcom", smoke_qcom_aoss_open_rejects);
 fn smoke_qcom_aoss_send_and_load_state() -> TestResult {
     let d = FakeDelay::new();
     let regs = msgram();
-    let kick = AckKick::new(&regs);
+    let responsive = AtomicBool::new(true);
+    let kick = AckKick::new(&regs, &responsive);
     let q = run(Qmp::open(&regs, kick, &d)).unwrap().unwrap();
     kt_assert_eq!(run(q.send(&d, "hello")), Some(Ok(())));
     kt_assert_eq!(msg_at(&regs), b"hello".to_vec());
@@ -172,11 +174,12 @@ kernel_test_in!("drivers/soc/qcom", smoke_qcom_aoss_send_and_load_state);
 fn smoke_qcom_aoss_send_timeout() -> TestResult {
     let d = FakeDelay::new();
     let regs = msgram();
-    let kick = AckKick::new(&regs);
+    let responsive = AtomicBool::new(true);
+    let kick = AckKick::new(&regs, &responsive);
     let q = run(Qmp::open(&regs, kick, &d)).unwrap().unwrap();
     // The AOSS stops responding after open: the send times out and
     // the length word is cleared.
-    kick.responsive.store(false, Ordering::Relaxed);
+    responsive.store(false, Ordering::Relaxed);
     kt_assert_eq!(run(q.send(&d, "hello")), Some(Err(QmpError::Timeout)));
     kt_assert_eq!(regs.get(MBOX), 0);
     TestResult::Pass
