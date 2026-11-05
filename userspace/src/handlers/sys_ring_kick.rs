@@ -38,6 +38,20 @@ pub(crate) fn sys_ring_kick(ctx: &mut dyn TrapContext) {
     let mut processed: u64 = 0;
     while let Ok(sub) = sq.try_recv() {
         let tag = sub.tag();
+        // Cap gate (#1363 wiring): the same check
+        // `Dispatcher::dispatch_one` runs — every presented cap
+        // resolves against the submitting task's own table
+        // (capabilities/ §8 steps 1–4). A failure completes with
+        // the cap status and the op never runs. This trap runs in
+        // the submitter's own context, so the owner is the current
+        // task id.
+        if let Err(status) =
+            narf_abi::validate_submission_caps(Some(narf_scheduler::TaskId(task)), &sub.caps)
+        {
+            let _ = cq.try_send(Completion::with(tag, status, [0; 6]));
+            processed = processed.saturating_add(1);
+            continue;
+        }
         let completion = match sub.op {
             OpCode::Noop => Completion::ok(tag),
             OpCode::OpenFile
@@ -72,6 +86,27 @@ pub(crate) fn sys_ring_kick(ctx: &mut dyn TrapContext) {
                 let mut result = [0u64; 6];
                 result[0] = r.value;
                 Completion::with(tag, status, result)
+            }
+            OpCode::CapTransfer => {
+                // §9.1 Grant-gated transfer via the ABI; same
+                // semantics as the `Dispatcher` arm. `caps[0]` is
+                // the sender's Grant cap, `caps[1]` the cap to
+                // transfer, `inline[0]` the target task id;
+                // `result[0]` is the receiver's fresh slot number.
+                let target = narf_scheduler::TaskId(sub.inline[0]);
+                match narf_scheduler::transfer_task_cap(
+                    narf_scheduler::TaskId(task),
+                    target,
+                    sub.caps[0],
+                    sub.caps[1],
+                ) {
+                    Ok(slot) => {
+                        let mut result = [0u64; 6];
+                        result[0] = u64::from(slot);
+                        Completion::with(tag, NarfStatus::Ok, result)
+                    }
+                    Err(e) => Completion::with(tag, narf_abi::cap_error_status(e), [0; 6]),
+                }
             }
             _ => Completion::with(tag, NarfStatus::InvalidOp, [0; 6]),
         };

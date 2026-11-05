@@ -5859,3 +5859,166 @@ kernel_test_in!(
     "scheduler/spin",
     smoke_responsive_spin_until_rechecks_after_the_deadline
 );
+
+// ── per-task capability tables (#1363 wiring) ───────────────────────
+
+fn smoke_scheduler_task_cap_table_bootstrap_and_lookup() -> TestResult {
+    // Spawn installs an empty table; the creator installs bootstrap
+    // caps (slots 0..16); dispatch-side lookup resolves against the
+    // owning task only. An unknown task, an empty position, and a
+    // task whose slot has dropped all fail closed as Revoked.
+    use narf_capabilities::{Cap, CapError, CapKind, CapSlot, CapType, Grant, Read, Rights};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+
+    crate::__reset_queues_for_test();
+    let id = crate::spawn(async {});
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read: Cap<TestObj, Read> = grant.derive().unwrap();
+
+    // Empty table: any presentation fails closed.
+    let g = grant.slot();
+    let probe = CapSlot::new(g.generation, 0, g.rights, g.type_tag);
+    if crate::lookup_task_cap(id, probe) != Err(CapError::Revoked) {
+        return TestResult::Fail("empty task table resolved a cap");
+    }
+    // Unknown task: Revoked, never a panic or a global-table hit.
+    if crate::lookup_task_cap(crate::TaskId(u64::MAX), probe) != Err(CapError::Revoked) {
+        return TestResult::Fail("unknown-task lookup did not fail closed");
+    }
+    // Install into the bootstrap region, in order.
+    match crate::install_task_bootstrap_cap(id, &grant) {
+        Ok(0) => {}
+        _ => return TestResult::Fail("grant bootstrap install did not land at slot 0"),
+    }
+    match crate::install_task_bootstrap_cap(id, &read) {
+        Ok(1) => {}
+        _ => return TestResult::Fail("read bootstrap install did not land at slot 1"),
+    }
+    // Own-table lookup resolves to the stored global object identity.
+    let r = read.slot();
+    let presented = CapSlot::new(r.generation, 1, r.rights, r.type_tag);
+    match crate::lookup_task_cap(id, presented) {
+        Ok(entry) if entry.index == r.index && entry.generation == r.generation => {}
+        Ok(_) => return TestResult::Fail("lookup resolved the wrong object"),
+        Err(_) => return TestResult::Fail("own-table lookup failed"),
+    }
+    // Wrong type tag against the stored entry: TypeMismatch.
+    let forged = CapSlot::new(r.generation, 1, r.rights, CapKind::Domain as u32);
+    if crate::lookup_task_cap(id, forged) != Err(CapError::TypeMismatch) {
+        return TestResult::Fail("type-forged lookup did not report TypeMismatch");
+    }
+    // Over-claimed rights: RightsTooWeak.
+    let greedy = CapSlot::new(r.generation, 1, r.rights | Grant::BITS, r.type_tag);
+    if crate::lookup_task_cap(id, greedy) != Err(CapError::RightsTooWeak) {
+        return TestResult::Fail("rights-overclaim lookup did not report RightsTooWeak");
+    }
+    // The 17th bootstrap install is CapTableFull (16-slot region).
+    for _ in 2..16 {
+        let filler: Cap<TestObj, Read> = Cap::bootstrap();
+        if crate::install_task_bootstrap_cap(id, &filler).is_err() {
+            return TestResult::Fail("bootstrap fill failed before slot 16");
+        }
+    }
+    let extra: Cap<TestObj, Read> = Cap::bootstrap();
+    if crate::install_task_bootstrap_cap(id, &extra) != Err(CapError::CapTableFull) {
+        return TestResult::Fail("17th bootstrap install did not report CapTableFull");
+    }
+    // Drain the task: final slot drop unregisters the table, so a
+    // later lookup fails closed instead of resolving a dead table.
+    crate::run_until_empty();
+    if crate::lookup_task_cap(id, presented) != Err(CapError::Revoked) {
+        return TestResult::Fail("dropped task's table still resolved");
+    }
+    if crate::install_task_bootstrap_cap(id, &grant) != Err(CapError::Revoked) {
+        return TestResult::Fail("install into a dropped task's table did not fail closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_task_cap_table_bootstrap_and_lookup
+);
+
+fn smoke_scheduler_task_cap_transfer_between_tasks() -> TestResult {
+    // `transfer_task_cap` moves a resolved entry from the sender's
+    // table to the receiver's fresh general-region slot (>= 16);
+    // the sender keeps its slot, the receiver resolves the same
+    // global object, and non-Grant / unknown-task transfers refuse.
+    use narf_capabilities::{Cap, CapError, CapKind, CapSlot, CapType, Grant, Read};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+
+    crate::__reset_queues_for_test();
+    let sender = crate::spawn(async {});
+    let receiver = crate::spawn(async {});
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read: Cap<TestObj, Read> = grant.derive().unwrap();
+    crate::install_task_bootstrap_cap(sender, &grant).unwrap();
+    crate::install_task_bootstrap_cap(sender, &read).unwrap();
+    let g = grant.slot();
+    let r = read.slot();
+    let grant_presented = CapSlot::new(g.generation, 0, g.rights, g.type_tag);
+    let read_presented = CapSlot::new(r.generation, 1, r.rights, r.type_tag);
+
+    let at = match crate::transfer_task_cap(sender, receiver, grant_presented, read_presented) {
+        Ok(at) => at,
+        Err(_) => return TestResult::Fail("transfer between live tasks failed"),
+    };
+    if at < 16 {
+        return TestResult::Fail("transfer landed in the receiver's bootstrap region");
+    }
+    // Receiver resolves the same global object at its fresh slot.
+    let at_receiver = CapSlot::new(r.generation, at, r.rights, r.type_tag);
+    match crate::lookup_task_cap(receiver, at_receiver) {
+        Ok(entry) if entry.index == r.index => {}
+        Ok(_) => return TestResult::Fail("receiver lookup resolved the wrong object"),
+        Err(_) => return TestResult::Fail("receiver lookup failed"),
+    }
+    // Sender retains its slot (sharing semantics).
+    if crate::lookup_task_cap(sender, read_presented).is_err() {
+        return TestResult::Fail("transfer revoked the sender's slot");
+    }
+    // Non-Grant presented as the grant: RightsTooWeak.
+    if crate::transfer_task_cap(sender, receiver, read_presented, read_presented)
+        != Err(CapError::RightsTooWeak)
+    {
+        return TestResult::Fail("non-Grant transfer did not report RightsTooWeak");
+    }
+    // Unknown receiver / sender: Revoked (fail closed).
+    if crate::transfer_task_cap(
+        sender,
+        crate::TaskId(u64::MAX),
+        grant_presented,
+        read_presented,
+    ) != Err(CapError::Revoked)
+    {
+        return TestResult::Fail("transfer to an unknown task did not fail closed");
+    }
+    if crate::transfer_task_cap(
+        crate::TaskId(u64::MAX),
+        receiver,
+        grant_presented,
+        read_presented,
+    ) != Err(CapError::Revoked)
+    {
+        return TestResult::Fail("transfer from an unknown task did not fail closed");
+    }
+    // Self-transfer installs a second entry in the same table and
+    // must not deadlock on the table lock. It lands at 16 — the
+    // sender's first general slot — which coincidentally equals the
+    // receiver's first general slot; slot numbers are task-local,
+    // so that is expected, not a collision.
+    match crate::transfer_task_cap(sender, sender, grant_presented, read_presented) {
+        Ok(self_at) if self_at >= 16 => {}
+        Ok(_) => return TestResult::Fail("self-transfer landed in the bootstrap region"),
+        Err(_) => return TestResult::Fail("self-transfer failed"),
+    }
+    crate::run_until_empty();
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_task_cap_transfer_between_tasks);

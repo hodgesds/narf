@@ -33,6 +33,7 @@ fn smoke_abi_submission_layout() -> TestResult {
         (crate::OpCode::Yield, 0x0004),
         (crate::OpCode::DomainEnter, 0x0005),
         (crate::OpCode::DomainExit, 0x0006),
+        (crate::OpCode::CapTransfer, 0x0007),
     ];
     for &(op, wire) in opcode_pins {
         if op.as_u32() != wire {
@@ -62,6 +63,8 @@ fn smoke_abi_completion_layout() -> TestResult {
         (crate::NarfStatus::InvalidOp, 0x0005),
         (crate::NarfStatus::Busy, 0x0006),
         (crate::NarfStatus::Closed, 0x0007),
+        (crate::NarfStatus::Forbidden, 0x0008),
+        (crate::NarfStatus::Unsupported, 0x0009),
     ];
     for &(st, wire) in status_pins {
         if st.as_u32() != wire {
@@ -560,6 +563,7 @@ fn smoke_abi_opcode_full_wire_pins() -> TestResult {
         (crate::OpCode::Yield, 0x0004, "Yield"),
         (crate::OpCode::DomainEnter, 0x0005, "DomainEnter"),
         (crate::OpCode::DomainExit, 0x0006, "DomainExit"),
+        (crate::OpCode::CapTransfer, 0x0007, "CapTransfer"),
         (crate::OpCode::OpenFile, 0x0010, "OpenFile"),
         (crate::OpCode::Read, 0x0011, "Read"),
         (crate::OpCode::Write, 0x0012, "Write"),
@@ -1330,3 +1334,399 @@ fn smoke_abi_request_inflight_cancel_miss_returns_false() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("abi", smoke_abi_request_inflight_cancel_miss_returns_false);
+
+// ── per-task cap-table dispatch (#1363 wiring) ──────────────────────
+//
+// Fixtures are built from the specification, not the implementation:
+// presented slots carry the task-local position in `index` with the
+// cap's own generation/rights/type_tag (capabilities/ §8 step 2);
+// the bootstrap installs land at deterministic positions 0, 1
+// because the test body installs them in that order before any
+// task runs. No fixture reads a value back out of the table it is
+// testing and feeds it in as the expectation.
+
+fn smoke_abi_dispatch_validates_caps_against_owner_table() -> TestResult {
+    // The §8 gate: a bound dispatcher resolves every presented cap
+    // against the submitting task's OWN table before the op runs.
+    // Own valid cap -> Ok; forged type tag -> Forbidden; empty
+    // position -> CapRevoked; no caps presented -> Ok.
+    use crate::{completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag};
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_capabilities::{Cap, CapKind, CapSlot, CapType, Grant, Read};
+
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::__reset_queues_for_test();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    // Bootstrap the caps in the test body: positions are
+    // deterministic (grant -> 0, read -> 1) because installs happen
+    // in this order before any task runs.
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read: Cap<TestObj, Read> = grant.derive().unwrap();
+    let g = grant.slot();
+    let r = read.slot();
+    let grant_presented = CapSlot::new(g.generation, 0, g.rights, g.type_tag);
+    let read_presented = CapSlot::new(r.generation, 1, r.rights, r.type_tag);
+    let forged = CapSlot::new(g.generation, 0, g.rights, CapKind::Domain as u32);
+    let empty_pos = CapSlot::new(g.generation, 5, g.rights, g.type_tag);
+
+    let owner = narf_scheduler::spawn(async move {
+        // 1. Own valid cap.
+        let mut s1 = Submission::noop(Tag::new(0xC001));
+        s1.caps[0] = grant_presented;
+        sq_tx.send(s1).await.unwrap();
+        let c1 = cq_rx.recv().await.unwrap();
+        if c1.status != NarfStatus::Ok {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        // 2. Forged type tag at a live position.
+        let mut s2 = Submission::noop(Tag::new(0xC002));
+        s2.caps[0] = forged;
+        sq_tx.send(s2).await.unwrap();
+        let c2 = cq_rx.recv().await.unwrap();
+        if c2.status != NarfStatus::Forbidden {
+            OUTCOME.store(3, Ordering::Relaxed);
+            return;
+        }
+        // 3. Empty position in the table.
+        let mut s3 = Submission::noop(Tag::new(0xC003));
+        s3.caps[0] = empty_pos;
+        sq_tx.send(s3).await.unwrap();
+        let c3 = cq_rx.recv().await.unwrap();
+        if c3.status != NarfStatus::CapRevoked {
+            OUTCOME.store(4, Ordering::Relaxed);
+            return;
+        }
+        // 4. No caps presented at all.
+        let s4 = Submission::noop(Tag::new(0xC004));
+        sq_tx.send(s4).await.unwrap();
+        let c4 = cq_rx.recv().await.unwrap();
+        if c4.status != NarfStatus::Ok {
+            OUTCOME.store(5, Ordering::Relaxed);
+            return;
+        }
+        // 5. A second, different cap from the same table (read at 1).
+        let mut s5 = Submission::noop(Tag::new(0xC005));
+        s5.caps[0] = read_presented;
+        sq_tx.send(s5).await.unwrap();
+        let c5 = cq_rx.recv().await.unwrap();
+        if c5.status != NarfStatus::Ok {
+            OUTCOME.store(6, Ordering::Relaxed);
+            return;
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+    // Install into the owner's table before anything runs.
+    narf_scheduler::install_task_bootstrap_cap(owner, &grant).unwrap();
+    narf_scheduler::install_task_bootstrap_cap(owner, &read).unwrap();
+
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::for_task(sq_rx, cq_tx, owner);
+        d.run().await;
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("own valid cap did not complete Ok"),
+        3 => TestResult::Fail("forged type tag did not complete Forbidden"),
+        4 => TestResult::Fail("empty-position cap did not complete CapRevoked"),
+        5 => TestResult::Fail("cap-less submission did not complete Ok"),
+        6 => TestResult::Fail("second own cap did not complete Ok"),
+        _ => TestResult::Fail("cap-gate round-trip did not run"),
+    }
+}
+kernel_test_in!("abi", smoke_abi_dispatch_validates_caps_against_owner_table);
+
+fn smoke_abi_dispatch_cross_task_caps_fail() -> TestResult {
+    // A wire slot copied across tasks resolves only against the
+    // submitter's own table: B presenting A's bytes hits B's OWN
+    // entry at that position (wrong type -> Forbidden), never A's
+    // object. A's own presentation still works (control).
+    use crate::{completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag};
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_capabilities::{Cap, CapKind, CapSlot, CapType, Grant, Read};
+
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    struct OtherObj;
+    impl CapType for OtherObj {
+        const KIND: CapKind = CapKind::Domain;
+    }
+
+    // One outcome per producer: a shared atomic would let one side's
+    // success overwrite the other's failure code.
+    static OUTCOME_A: AtomicU8 = AtomicU8::new(0);
+    static OUTCOME_B: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::__reset_queues_for_test();
+
+    // A's caps (Endpoint kind) and B's own cap (Domain kind).
+    let grant_a: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read_a: Cap<TestObj, Read> = grant_a.derive().unwrap();
+    let ga = grant_a.slot();
+    let a_presented = CapSlot::new(ga.generation, 0, ga.rights, ga.type_tag);
+    let cap_b: Cap<OtherObj, Read> = Cap::bootstrap();
+
+    // A's ring: control — A presents its own cap, expects Ok.
+    let (mut sq_a, sq_rx_a) = submission_channel::<4>();
+    let (cq_a, mut cq_rx_a) = completion_channel::<4>();
+    let id_a = narf_scheduler::spawn(async move {
+        let mut s = Submission::noop(Tag::new(0xA001));
+        s.caps[0] = a_presented;
+        sq_a.send(s).await.unwrap();
+        let c = cq_rx_a.recv().await.unwrap();
+        if c.status != NarfStatus::Ok {
+            OUTCOME_A.store(2, Ordering::Relaxed);
+            return;
+        }
+        OUTCOME_A.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_a);
+        core::mem::drop(cq_rx_a);
+    });
+    narf_scheduler::install_task_bootstrap_cap(id_a, &grant_a).unwrap();
+    narf_scheduler::install_task_bootstrap_cap(id_a, &read_a).unwrap();
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::for_task(sq_rx_a, cq_a, id_a);
+        d.run().await;
+    });
+
+    // B's ring: B presents A's bytes (position 0 in B's table holds
+    // B's Domain cap) -> Forbidden; then an empty position -> Revoked.
+    let (mut sq_b, sq_rx_b) = submission_channel::<4>();
+    let (cq_b, mut cq_rx_b) = completion_channel::<4>();
+    let id_b = narf_scheduler::spawn(async move {
+        let mut s1 = Submission::noop(Tag::new(0xB001));
+        s1.caps[0] = a_presented;
+        sq_b.send(s1).await.unwrap();
+        let c1 = cq_rx_b.recv().await.unwrap();
+        if c1.status != NarfStatus::Forbidden {
+            OUTCOME_B.store(3, Ordering::Relaxed);
+            return;
+        }
+        let mut s2 = Submission::noop(Tag::new(0xB002));
+        s2.caps[0] = CapSlot::new(ga.generation, 7, ga.rights, ga.type_tag);
+        sq_b.send(s2).await.unwrap();
+        let c2 = cq_rx_b.recv().await.unwrap();
+        if c2.status != NarfStatus::CapRevoked {
+            OUTCOME_B.store(4, Ordering::Relaxed);
+            return;
+        }
+        OUTCOME_B.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_b);
+        core::mem::drop(cq_rx_b);
+    });
+    narf_scheduler::install_task_bootstrap_cap(id_b, &cap_b).unwrap();
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::for_task(sq_rx_b, cq_b, id_b);
+        d.run().await;
+    });
+
+    narf_scheduler::run_until_empty();
+    if OUTCOME_A.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("owner's own cap did not complete Ok");
+    }
+    match OUTCOME_B.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        3 => TestResult::Fail("copied cross-task slot did not complete Forbidden"),
+        4 => TestResult::Fail("empty-position slot did not complete CapRevoked"),
+        _ => TestResult::Fail("cross-task round-trip did not run"),
+    }
+}
+kernel_test_in!("abi", smoke_abi_dispatch_cross_task_caps_fail);
+
+fn smoke_abi_dispatch_unbound_rejects_presented_caps() -> TestResult {
+    // The un-wired fallback fails closed: a legacy unbound
+    // dispatcher has no table, so any presented cap is Forbidden,
+    // while cap-less submissions still dispatch.
+    use crate::{completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag};
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_capabilities::CapSlot;
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::__reset_queues_for_test();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(sq_rx, cq_tx);
+        d.run().await;
+    });
+
+    narf_scheduler::spawn(async move {
+        let mut s1 = Submission::noop(Tag::new(0xD001));
+        s1.caps[0] = CapSlot::new(1, 0, 1, 0x0042);
+        sq_tx.send(s1).await.unwrap();
+        let c1 = cq_rx.recv().await.unwrap();
+        if c1.status != NarfStatus::Forbidden {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        let s2 = Submission::noop(Tag::new(0xD002));
+        sq_tx.send(s2).await.unwrap();
+        let c2 = cq_rx.recv().await.unwrap();
+        if c2.status != NarfStatus::Ok {
+            OUTCOME.store(3, Ordering::Relaxed);
+            return;
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("unbound dispatcher accepted a presented cap"),
+        3 => TestResult::Fail("unbound dispatcher rejected a cap-less submission"),
+        _ => TestResult::Fail("unbound round-trip did not run"),
+    }
+}
+kernel_test_in!("abi", smoke_abi_dispatch_unbound_rejects_presented_caps);
+
+fn smoke_abi_cap_transfer_end_to_end() -> TestResult {
+    // §9.1 through the ABI: A transfers a Read cap to B with
+    // `OpCode::CapTransfer`; B then spends the received slot through
+    // its own bound dispatcher. A non-Grant transfer refuses first.
+    use crate::{
+        completion_channel, submission_channel, Dispatcher, NarfStatus, OpCode, Submission, Tag,
+    };
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+    use narf_capabilities::{Cap, CapKind, CapSlot, CapType, Grant, Read};
+
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    static TRANSFERRED_SLOT: AtomicU64 = AtomicU64::new(0);
+    static TRANSFERRED_READY: AtomicBool = AtomicBool::new(false);
+
+    narf_scheduler::__reset_queues_for_test();
+
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read: Cap<TestObj, Read> = grant.derive().unwrap();
+    let g = grant.slot();
+    let r = read.slot();
+    let grant_presented = CapSlot::new(g.generation, 0, g.rights, g.type_tag);
+    let read_presented = CapSlot::new(r.generation, 1, r.rights, r.type_tag);
+
+    // Receiver first: A needs B's id for the transfer.
+    let (mut sq_b, sq_rx_b) = submission_channel::<4>();
+    let (cq_b, mut cq_rx_b) = completion_channel::<4>();
+    let read_slot = r;
+    let id_b = narf_scheduler::spawn(async move {
+        // Bounded wait: if A never lands the transfer (e.g. its
+        // negative case failed first), give up instead of spinning
+        // `run_until_empty` forever — a spinning task never parks,
+        // so the executor would never halt.
+        let mut landed = false;
+        for _ in 0..10_000 {
+            if TRANSFERRED_READY.load(Ordering::Acquire) {
+                landed = true;
+                break;
+            }
+            narf_scheduler::yield_now().await;
+        }
+        if !landed {
+            OUTCOME.store(6, Ordering::Relaxed);
+            core::mem::drop(sq_b);
+            core::mem::drop(cq_rx_b);
+            return;
+        }
+        let at = TRANSFERRED_SLOT.load(Ordering::Acquire);
+        let mut s = Submission::noop(Tag::new(0xE002));
+        s.caps[0] = CapSlot::new(
+            read_slot.generation,
+            at as u32,
+            read_slot.rights,
+            read_slot.type_tag,
+        );
+        sq_b.send(s).await.unwrap();
+        let c = cq_rx_b.recv().await.unwrap();
+        if c.status != NarfStatus::Ok {
+            OUTCOME.store(4, Ordering::Relaxed);
+            core::mem::drop(sq_b);
+            core::mem::drop(cq_rx_b);
+            return;
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_b);
+        core::mem::drop(cq_rx_b);
+    });
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::for_task(sq_rx_b, cq_b, id_b);
+        d.run().await;
+    });
+
+    // Sender: non-Grant transfer refuses, then the real one lands.
+    let (mut sq_a, sq_rx_a) = submission_channel::<4>();
+    let (cq_a, mut cq_rx_a) = completion_channel::<4>();
+    let target_b = id_b.0;
+    let id_a = narf_scheduler::spawn(async move {
+        // 1. Non-Grant cap as the grant: Forbidden.
+        let mut bad = Submission::noop(Tag::new(0xE000));
+        bad.op = OpCode::CapTransfer;
+        bad.caps[0] = read_presented;
+        bad.caps[1] = read_presented;
+        bad.inline[0] = target_b;
+        sq_a.send(bad).await.unwrap();
+        let cbad = cq_rx_a.recv().await.unwrap();
+        if cbad.status != NarfStatus::Forbidden {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        // 2. Real transfer.
+        let mut good = Submission::noop(Tag::new(0xE001));
+        good.op = OpCode::CapTransfer;
+        good.caps[0] = grant_presented;
+        good.caps[1] = read_presented;
+        good.inline[0] = target_b;
+        sq_a.send(good).await.unwrap();
+        let cgood = cq_rx_a.recv().await.unwrap();
+        if cgood.status != NarfStatus::Ok {
+            OUTCOME.store(3, Ordering::Relaxed);
+            return;
+        }
+        if cgood.result[0] < 16 {
+            OUTCOME.store(5, Ordering::Relaxed);
+            return;
+        }
+        TRANSFERRED_SLOT.store(cgood.result[0], Ordering::Release);
+        TRANSFERRED_READY.store(true, Ordering::Release);
+        core::mem::drop(sq_a);
+        core::mem::drop(cq_rx_a);
+    });
+    narf_scheduler::install_task_bootstrap_cap(id_a, &grant).unwrap();
+    narf_scheduler::install_task_bootstrap_cap(id_a, &read).unwrap();
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::for_task(sq_rx_a, cq_a, id_a);
+        d.run().await;
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("non-Grant transfer did not complete Forbidden"),
+        3 => TestResult::Fail("Grant transfer did not complete Ok"),
+        4 => TestResult::Fail("receiver could not spend the transferred slot"),
+        5 => TestResult::Fail("transfer landed in the receiver's bootstrap region"),
+        6 => TestResult::Fail("transfer never landed (sender failed first)"),
+        _ => TestResult::Fail("transfer round-trip did not run"),
+    }
+}
+kernel_test_in!("abi", smoke_abi_cap_transfer_end_to_end);

@@ -46,6 +46,29 @@ No `int 0x80` / `svc` syscalls on the fast path.
 - `OpCode` enumerates every user-callable operation, grouped by
   subsystem (memory, ipc, scheduler, drivers).
 - `CapSlot` is a tagged index into the task's capability table.
+- **Dispatch cap gate (#1363).** Before any op body runs, the
+  dispatcher resolves every non-empty `Submission::caps` entry
+  against the *submitting task's own* table
+  (`CapTable::lookup`, capabilities/ §8 steps 1–4) — never the
+  global object table. The resolved object comes from the table,
+  never from the presented bytes, so a wire slot copied across
+  tasks resolves at most to the submitter's own entry at that
+  position. A failed lookup short-circuits the op: `Revoked` →
+  `NarfStatus::CapRevoked` (authoritative, do NOT retry),
+  `TypeMismatch` / `RightsTooWeak` / `DomainMismatch` /
+  `ObjectMismatch` → `NarfStatus::Forbidden`. A dispatcher with
+  no bound task (legacy `Dispatcher::new`) has no table to check
+  against, so any presented cap fails closed as `Forbidden`;
+  cap-less submissions still dispatch. The synchronous
+  `sys_ring_kick` path enforces the same gate. §8 step 5
+  (domain-tag match) is a remainder: no per-op required-domain
+  table exists yet.
+- **`OpCode::CapTransfer` (0x0007)** is the ABI surface for
+  Grant-gated cross-task transfer (capabilities/ §9.1):
+  `caps[0]` is the sender's Grant cap, `caps[1]` the cap to
+  transfer, `inline[0]` the target task id; `result[0]` is the
+  receiver's fresh task-local slot number (≥ 16). The sender
+  retains its slot (sharing semantics).
 - **Slow-path `svc`/`syscall` is restricted to four operation classes**
   (anything else MUST go through the fast-path ring):
   1. **Initial ring-pair allocation** (returns submission +

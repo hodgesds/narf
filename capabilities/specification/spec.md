@@ -84,6 +84,11 @@ impl CapTable {
     /// stored entry on success; the resolved object always comes
     /// from the table, never from the presented bytes.
     pub fn lookup(&self, presented: CapSlot) -> Result<CapSlot, CapError>;
+    /// Raw-slot twin of `Cap<T, Grant>::transfer` for ABI dispatch
+    /// (§9.1, #1363 wiring): installs a RESOLVED entry (a sender
+    /// `lookup` result, never presented bytes) into this table's
+    /// general region; returns the receiver's fresh slot number.
+    pub fn install_transfer(&mut self, grant_entry: CapSlot, cap_entry: CapSlot) -> Result<u32, CapError>;
 }
 
 pub enum CapError { Revoked, DomainMismatch, TypeMismatch, RightsTooWeak, CapTableFull, ObjectMismatch }
@@ -336,6 +341,21 @@ on the sender side bumps the object epoch — affecting all
 holders, including the receiver). The framework does not
 distinguish "move" from "copy"; both are explicit operations
 on the sender.
+
+**§9.1 reading confirmed by the #1363 wiring.** "Same `index`,
+same `generation`" is the *stored entry's* global object index
+and generation — the receiver's slot NUMBER is fresh (general
+region, ≥ 16), never the sender's number. A literal
+"identical slot numbers" reading is incompatible with §9.7's
+dense task-local numbering plus the 0..16 bootstrap reservation
+(two tasks cannot both own slot 0 for different objects), so the
+wiring follows the stored-index reading; if the maintainer
+instead wants identical slot numbers, that is a spec
+clarification the wiring must follow, not a code fix. The ABI
+transfer op (`OpCode::CapTransfer`, `abi/` §3) is the dispatch
+surface for this decision: it resolves both presented slots
+against the sender's table, then installs the resolved entry
+into the receiver's table via `CapTable::install_transfer`.
 
 ### 9.2 Per-object epoch storage
 

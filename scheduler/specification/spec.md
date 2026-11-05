@@ -55,6 +55,16 @@ pub fn stackful::sched_yield_current() -> bool;
 pub fn has_other_runnable_work(current: u64) -> bool;
 pub fn donate_to(task: TaskId, cap: &Cap<Task, Invoke>)
     -> Result<(), DonateError>;
+/// Per-task capability tables (#1363 wiring; `capabilities/` §9.7).
+/// Every spawn creates an empty table owned by the task slot; the
+/// creator installs bootstrap caps (slots 0..16) before first
+/// dispatch, and ABI dispatch resolves a submission's caps against
+/// the submitting task's table only.
+pub fn lookup_task_cap(task: TaskId, presented: CapSlot) -> Result<CapSlot, CapError>;
+pub fn install_task_bootstrap_cap<T: CapType, R: Rights>(task: TaskId, cap: &Cap<T, R>)
+    -> Result<u32, CapError>;
+pub fn transfer_task_cap(sender: TaskId, receiver: TaskId, grant: CapSlot, cap: CapSlot)
+    -> Result<u32, CapError>;
 pub fn set_task_mems_allowed(task: u64, mask: u64);
 pub fn task_mems_allowed(task: u64) -> u64;
 pub fn clear_task_mems_allowed(task: u64);

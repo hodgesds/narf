@@ -575,6 +575,46 @@ impl CapTable {
         }
         Ok(*entry)
     }
+
+    /// Grant-gated cross-task install for the ABI path (spec §9.1,
+    /// #1363 wiring). The typed `Cap<T, Grant>::transfer` is the
+    /// in-kernel form; this is its raw-slot twin for dispatch, which
+    /// only ever sees wire `CapSlot`s.
+    ///
+    /// `grant_entry` and `cap_entry` must be RESOLVED entries — the
+    /// return values of the sender table's `lookup` on the presented
+    /// slots — never the presented bytes themselves. Checks, in order:
+    /// the resolved grant entry carries the `Grant` right, both
+    /// entries name the same object (`index` equal — the stored
+    /// global object index, per the §9.1 reading the #1283 mechanism
+    /// chose and this wiring confirms: the receiver's slot NUMBER is
+    /// fresh, only the stored index/generation are shared), and both
+    /// entries carry the same `type_tag`.
+    ///
+    /// On success installs the resolved cap entry into this table's
+    /// general region and returns the receiver's fresh task-local
+    /// slot number (≥ `RESERVED_SLOTS`). The sender retains its slot
+    /// (sharing semantics); `revoke()` is the only move-like
+    /// operation. A revoke landing between the sender-side `lookup`
+    /// and this install yields a dead entry: a later `lookup` on it
+    /// fails `Revoked` via the epoch check, exactly like the typed
+    /// transfer's check-then-install race (§9.5).
+    pub fn install_transfer(
+        &mut self,
+        grant_entry: CapSlot,
+        cap_entry: CapSlot,
+    ) -> Result<u32, CapError> {
+        if grant_entry.rights & Grant::BITS == 0 {
+            return Err(CapError::RightsTooWeak);
+        }
+        if grant_entry.index != cap_entry.index {
+            return Err(CapError::ObjectMismatch);
+        }
+        if grant_entry.type_tag != cap_entry.type_tag {
+            return Err(CapError::TypeMismatch);
+        }
+        self.install_general(cap_entry)
+    }
 }
 
 impl Default for CapTable {

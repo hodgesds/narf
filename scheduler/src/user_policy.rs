@@ -672,6 +672,12 @@ mod tests {
             awake: crate::new_wake_cell(id, cpu as u32, true),
             id,
             spec,
+            // Policy-fixture slot: an unregistered table. Policy
+            // tests never resolve caps; the registry path is covered
+            // by the scheduler's own spawn-path fixtures.
+            cap_table: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                narf_capabilities::CapTable::new(),
+            )),
             affinity_generation,
             addr_space: None,
             account: crate::BudgetAccount::new(),
