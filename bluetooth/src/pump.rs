@@ -2005,8 +2005,7 @@ impl PumpCore {
                     // by a peripheral connection must not flip it).
                     let classic_completed = self.classic.phase == ClassicPhase::Paging;
                     if classic_completed {
-                        self.classic
-                            .note_connection_complete(cc.status, cc.handle);
+                        self.classic.note_connection_complete(cc.status, cc.handle);
                     }
                     if cc.status == 0 {
                         let mut peer = [0u8; 7];
@@ -2014,7 +2013,8 @@ impl PumpCore {
                         peer[1..7].copy_from_slice(&cc.bd_addr);
                         self.release_handle_claims(cc.handle);
                         self.connections.retain(|c| c.handle != cc.handle);
-                        self.connections.push(Connection::new(cc.handle, false, peer));
+                        self.connections
+                            .push(Connection::new(cc.handle, false, peer));
                         self.sysfs_track_connect(cc.handle, false, &peer);
                     }
                 }
@@ -6729,12 +6729,7 @@ mod tests {
     /// Num_Responses, BD_ADDR, PSRM, 2 reserved bytes, Class of
     /// Device, Clock Offset. Bytes pinned against the spec layout,
     /// not against `parse_inquiry_results`.
-    fn inquiry_result_event(
-        bd_addr: [u8; 6],
-        psrm: u8,
-        cod: [u8; 3],
-        clock_offset: u16,
-    ) -> Event {
+    fn inquiry_result_event(bd_addr: [u8; 6], psrm: u8, cod: [u8; 3], clock_offset: u16) -> Event {
         let mut params = alloc::vec![0x01];
         params.extend_from_slice(&bd_addr);
         params.push(psrm);
@@ -7199,10 +7194,7 @@ mod tests {
         }
         let sent = fake.sent_command_params();
         let expect_inquiry: [u8; 5] = [0x33, 0x8B, 0x9E, 0x08, 0x00];
-        if sent.len() != 6
-            || sent[5].0 != op::HCI_INQUIRY
-            || sent[5].1 != expect_inquiry
-        {
+        if sent.len() != 6 || sent[5].0 != op::HCI_INQUIRY || sent[5].1 != expect_inquiry {
             reset_all();
             return TestResult::Fail("HCI_Inquiry bytes mismatch");
         }
