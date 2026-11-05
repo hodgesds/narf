@@ -20,10 +20,9 @@ const HCI_ACLDATA_PKT: u8 = 0x02;
 const HCI_EVENT_PKT: u8 = 0x04;
 
 /// Send a type-prefixed HCI packet to controller `dev`'s transport. Returns
-/// false for an unknown index or an unsupported/short packet.
+/// false for an unknown or detached index or an unsupported/short packet.
 pub fn send(dev: u16, packet: &[u8]) -> bool {
-    let controllers = controller::controllers();
-    let Some(controller) = controllers.get(dev as usize) else {
+    let Some(controller) = controller::get_live(dev as usize) else {
         return false;
     };
     let transport = controller.transport();
@@ -43,8 +42,8 @@ pub fn send(dev: u16, packet: &[u8]) -> bool {
 }
 
 /// Drain the next HCI event from controller `dev`, encoded for the socket as
-/// `HCI_EVENT_PKT || code || plen || params`. `None` when no controller or no
-/// pending event.
+/// `HCI_EVENT_PKT || code || plen || params`. `None` when no controller, a
+/// detached controller, or no pending event.
 ///
 /// Once the HCI pump is active for the controller it owns the
 /// transport's event stream, so events are read from the pump's
@@ -54,8 +53,7 @@ pub fn drain_event(dev: u16) -> Option<Vec<u8>> {
     if crate::pump::is_attached(dev as usize) {
         return crate::pump::take_socket_event(dev as usize);
     }
-    let controllers = controller::controllers();
-    let controller = controllers.get(dev as usize)?;
+    let controller = controller::get_live(dev as usize)?;
     let event = controller.transport().recv_event().ok()??;
     // HCI_EVENT_PKT || code || param-length || params.
     let mut out = Vec::with_capacity(3 + event.params.len());
@@ -66,16 +64,17 @@ pub fn drain_event(dev: u16) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Number of registered controllers — for the HCIGETDEVLIST ioctl.
+/// Number of live controllers — for the HCIGETDEVLIST ioctl.
 pub fn dev_count() -> usize {
     controller::controller_count()
 }
 
 /// Build the 92-byte `struct hci_dev_info` for controller `dev` (HCIGETDEVINFO).
 /// Fields NARF does not model (features, link policy/mode, stats) stay zero,
-/// as on a freshly-registered Linux adapter.
+/// as on a freshly-registered Linux adapter. `None` for an unknown or
+/// detached controller.
 pub fn dev_info(dev: u16) -> Option<Vec<u8>> {
-    let info = controller::controllers().get(dev as usize)?.info();
+    let info = controller::get_live(dev as usize)?.info();
     let mut b = alloc::vec![0u8; 92];
     b[0..2].copy_from_slice(&dev.to_le_bytes()); // dev_id
     let name = alloc::format!("hci{dev}");
@@ -101,7 +100,12 @@ pub fn monitor_replay() -> Vec<Vec<u8>> {
     const HCI_PRIMARY: u8 = 0;
     const HCI_VIRTUAL: u8 = 0;
     let mut out = Vec::new();
-    for (i, controller) in controller::controllers().iter().enumerate() {
+    // Live controllers only: a detached ordinal must not replay as
+    // a present adapter.
+    for i in controller::live_indices() {
+        let Some(controller) = controller::get_live(i) else {
+            continue;
+        };
         let info = controller.info();
         let mut payload = Vec::with_capacity(16);
         payload.push(HCI_PRIMARY); // type
@@ -124,9 +128,9 @@ pub fn monitor_replay() -> Vec<Vec<u8>> {
 }
 
 /// Power a controller on/off (HCIDEVUP/HCIDEVDOWN). Returns false for an
-/// unknown index.
+/// unknown or detached index.
 pub fn dev_power(dev: u16, on: bool) -> bool {
-    if (dev as usize) >= controller::controller_count() {
+    if !controller::is_live(dev as usize) {
         return false;
     }
     crate::mgmt::set_powered(dev, on);

@@ -107,6 +107,20 @@ pub fn register(t: Arc<dyn HciTransport>) {
     TRANSPORTS.lock().push(t);
 }
 
+/// Unregister an HCI transport by pointer identity — the detach half
+/// of [`register`]. Returns `true` when an entry was removed.
+/// Without this a detached transport would survive in the registry
+/// and a later [`crate::controller::bring_up_all`] pass could
+/// re-bring-up a controller whose device is gone.
+pub fn unregister(t: &Arc<dyn HciTransport>) -> bool {
+    let mut transports = TRANSPORTS.lock();
+    let Some(pos) = transports.iter().position(|x| Arc::ptr_eq(x, t)) else {
+        return false;
+    };
+    transports.remove(pos);
+    true
+}
+
 /// Snapshot every registered transport.
 pub fn transports() -> Vec<Arc<dyn HciTransport>> {
     TRANSPORTS.lock().clone()

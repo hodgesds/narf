@@ -736,10 +736,15 @@ pub async fn try_attach_via_hub(
 /// a genuine unplug the device is gone either way, and a slot whose
 /// reclaim refuses (Disable Slot failed) stays retired rather than
 /// returning to the pool half-alive. Classes the supervisor does
-/// not pump (MSC / btusb / CCID) have no
+/// not pump (CCID) have no
 /// per-class binding removal yet — their slot is disabled and
 /// reclaimed here, but their class-level registries are a
-/// documented follow-up in #748. CDC-NCM + r8152 + CDC-ECM are
+/// documented follow-up in #748. btusb is NOT in that set: its
+/// unbind hook (`btusb::detach_btusb_slot`, registered in
+/// `btusb::register_initcalls`) runs via `dispatch_unbind` in step
+/// 1 above, stopping the pump and unregistering the controller
+/// (mgmt INDEX_REMOVED, sysfs removal, BTUSB_DEVICES removal;
+/// #890). CDC-NCM + r8152 + CDC-ECM are
 /// NOT in that set: their unbind hooks
 /// (`cdc_ncm::detach_ncm_slot`, `r8152::detach_r8152_slot`,
 /// `cdc_ecm::detach_ecm_slot`, registered in their

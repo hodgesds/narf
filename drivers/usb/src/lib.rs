@@ -137,6 +137,13 @@ pub fn register_initcalls() {
         msc::register_initcalls();
         InitResult::Ok
     });
+    // btusb binds through the attach cascade, not the class registry;
+    // this registration exists so the registry's unbind dispatch
+    // (detach path) can reach btusb::detach_btusb_slot (#890).
+    narf_init::register(Stage::Subsys, "usb-btusb", || {
+        btusb::register_initcalls();
+        InitResult::Ok
+    });
     // Fingerprint binds through the attach cascade, not the class
     // registry; this registration exists so the registry's unbind
     // dispatch (detach path) can reach fingerprint::detach_fp for

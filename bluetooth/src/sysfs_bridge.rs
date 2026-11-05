@@ -64,6 +64,29 @@ fn store_hci_kobject(index: usize, kobj: &Arc<Kobject>) {
     slots[index] = Some(kobj.clone());
 }
 
+/// Remove `/sys/class/bluetooth/hci<index>/` for a detached
+/// controller: drop the class child (with its per-connection
+/// children) and clear the slot, so later index-keyed helpers
+/// become no-ops for the ordinal until a fresh registration
+/// reuses it. Returns `true` when a node was removed.
+///
+/// Linux ref: `hci_unregister_dev` → `device_del` / `device_unregister`
+/// (`net/bluetooth/hci_sysfs.c`, `drivers/base/core.c`).
+pub fn unregister_hci_controller(index: usize) -> bool {
+    let removed = {
+        let bt_class = class_register("bluetooth");
+        bt_class.remove_child(&format!("hci{}", index))
+    };
+    // Clear the slot even when the class child was already gone
+    // (e.g. a sysfs test reset dropped the tree): a stale slot
+    // would let later index-keyed helpers resurrect children under
+    // a detached controller's kobject.
+    if let Some(slot) = HCI_KOBJS.lock().get_mut(index) {
+        *slot = None;
+    }
+    removed
+}
+
 /// Register `/sys/class/bluetooth/hci<index>/` for one controller.
 ///
 /// - `index`  — ordinal assigned by the transport registry (0, 1, …).

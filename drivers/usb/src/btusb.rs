@@ -414,7 +414,16 @@ fn ep_dci(ep_addr: u8, is_in: bool) -> u8 {
 /// One bound USB Bluetooth controller. Kept in [`BTUSB_DEVICES`] so a
 /// future ACL data-plane has somewhere to find the transport.
 pub struct BtUsbDevice {
+    /// xHCI controller id ([`crate::xhci::Xhci::id`]) the slot belongs
+    /// to. Slot ids are unique per controller only, so the detach
+    /// hook matches on (controller, slot) together.
+    pub controller: u8,
     pub slot_id: u8,
+    /// HCI ordinal assigned by
+    /// `narf_bluetooth::controller::register_ready_transport` at bind
+    /// time — what the detach hook hands to
+    /// `narf_bluetooth::controller::unregister_controller`.
+    pub hci_index: usize,
     pub endpoints: BtEndpoints,
     /// Boxed transport handle. Same Arc is registered with
     /// `narf_bluetooth::transport::register`.
@@ -426,15 +435,18 @@ pub struct BtUsbDevice {
 impl fmt::Debug for BtUsbDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BtUsbDevice")
+            .field("controller", &self.controller)
             .field("slot_id", &self.slot_id)
+            .field("hci_index", &self.hci_index)
             .field("endpoints", &self.endpoints)
             .field("info", &self.info)
             .finish_non_exhaustive()
     }
 }
 
-/// Registry of bound USB Bluetooth controllers. Append-only for now;
-/// Stage 1 will introduce removal on detach.
+/// Registry of bound USB Bluetooth controllers. Entries are removed
+/// by the detach hook ([`detach_btusb_slot`], issue #890); a slot
+/// id reused by a replug gets a fresh entry.
 static BTUSB_DEVICES: IrqSafeSpinLock<Vec<Arc<BtUsbDevice>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Snapshot the registry. Used by tests + future data-plane.
@@ -452,6 +464,74 @@ pub fn __test_reset() {
     BTUSB_DEVICES.lock().clear();
     narf_bluetooth::transport::__test_reset();
     narf_bluetooth::controller::__test_reset_controllers();
+}
+
+/// Detach hook (issue #890): drop this slot's binding and tear its
+/// controller down. Called by the supervisor's `dispatch_unbind`
+/// from `detach_slot` step 1, while the slot is still addressed —
+/// the class-level teardown runs before Disable Slot reclaims it.
+///
+/// The hook is infallible bookkeeping (registry removal +
+/// [`narf_bluetooth::controller::unregister_controller`]), so it
+/// reports `Ok(())` unconditionally (#893: a hook reports failure
+/// with `Err(())`, never by panicking). It is idempotent: a slot
+/// with no btusb binding is a no-op, and a second call for the
+/// same slot finds nothing to remove because the first call took
+/// the entry — detach never double-tears a controller down.
+pub fn detach_btusb_slot(controller: u8, slot_id: u8) -> Result<(), ()> {
+    let hci_index = {
+        let mut devices = BTUSB_DEVICES.lock();
+        let Some(pos) = devices
+            .iter()
+            .position(|d| d.controller == controller && d.slot_id == slot_id)
+        else {
+            return Ok(());
+        };
+        devices.remove(pos).hci_index
+    };
+    // BTUSB_DEVICES entry first, then the Bluetooth-side teardown:
+    // even if the controller was already detached, the registry
+    // must not keep the stale entry.
+    let _ = narf_bluetooth::controller::unregister_controller(hci_index);
+    Ok(())
+}
+
+/// Class-triple match for the registry entry: any VID/PID, USB-IF
+/// Wireless Controller 0xE0/0x01/0x01 interface.
+const BTUSB_CLASS_MATCH: [crate::class_registry::UsbClassMatch; 1] =
+    [crate::class_registry::UsbClassMatch {
+        vendor_id: 0,
+        product_id: 0,
+        class: Some(USB_CLASS_WIRELESS),
+        subclass: Some(USB_SUBCLASS_RF),
+        protocol: Some(USB_PROTOCOL_BLUETOOTH),
+    }];
+
+/// Registry probe for btusb. A device only reaches `dispatch_probe`
+/// when the attach cascade's real (async) bind already declined or
+/// failed — the registry probe is synchronous and cannot run the
+/// Stage-0 bring-up — so it reports `BindFailed` and the dispatcher
+/// falls through to the same terminal-mismatch handling the device
+/// would have seen before this entry existed. (Same shape as MSC's
+/// `msc_registry_probe`.)
+fn btusb_registry_probe(
+    _device: alloc::sync::Arc<crate::device::USBDevice>,
+) -> Result<(), crate::class_registry::UsbProbeError> {
+    Err(crate::class_registry::UsbProbeError::BindFailed)
+}
+
+/// Register btusb's unbind hook with the class registry. Called from
+/// the crate's Stage::Subsys initcalls (`lib.rs`). btusb binds
+/// through the attach cascade, not the class registry; this
+/// registration exists so the registry's unbind dispatch (detach
+/// path) can reach [`detach_btusb_slot`].
+pub fn register_initcalls() {
+    let _ = crate::class_registry::register_class_driver_with_unbind(
+        "usb-btusb",
+        &BTUSB_CLASS_MATCH,
+        btusb_registry_probe,
+        detach_btusb_slot,
+    );
 }
 
 /// `HciTransport` implementation backed by the xHCI control / bulk /
@@ -1364,7 +1444,9 @@ pub async fn try_bind_btusb_already_addressed(
     }
 
     BTUSB_DEVICES.lock().push(Arc::new(BtUsbDevice {
+        controller: xhci_dev.id(),
         slot_id,
+        hci_index,
         endpoints: eps,
         transport,
         info,
@@ -1424,4 +1506,165 @@ fn bt_version_name(hci_version: u8) -> &'static str {
         0x0D => "5.4",
         _ => "?",
     }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn fake_endpoints() -> BtEndpoints {
+        use crate::xhci::{EndpointConfig, EndpointKind};
+        BtEndpoints {
+            interface: 0,
+            config_value: 1,
+            event_in: EndpointConfig {
+                ep_addr: 0x81,
+                max_packet: 16,
+                kind: EndpointKind::InterruptIn,
+                interval: 1,
+            },
+            acl_in: EndpointConfig {
+                ep_addr: 0x82,
+                max_packet: 64,
+                kind: EndpointKind::BulkIn,
+                interval: 0,
+            },
+            acl_out: EndpointConfig {
+                ep_addr: 0x02,
+                max_packet: 64,
+                kind: EndpointKind::BulkOut,
+                interval: 0,
+            },
+        }
+    }
+
+    /// #890: the detach hook (`detach_btusb_slot`, as invoked by
+    /// `dispatch_unbind` from `detach_slot`) drops the
+    /// BTUSB_DEVICES entry and tears the controller down — pump
+    /// slot gone, controller + transport unregistered, sysfs node
+    /// gone, mgmt INDEX_REMOVED published. Slot ids are unique per
+    /// controller only, so two devices sharing a slot id on
+    /// different controllers detach independently; a second detach
+    /// for the same slot and a detach for an unknown slot are
+    /// no-ops.
+    fn smoke_btusb_detach_slot_unregisters_controller() -> TestResult {
+        use narf_bluetooth::transport::LoopbackTransport;
+        use narf_filesystem::sysfs::__reset_for_test as sysfs_reset;
+
+        // mgmt event opcode (mgmt.h MGMT_EV_INDEX_REMOVED).
+        const EV_INDEX_REMOVED: u16 = 0x0005;
+
+        static CAPTURED: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+        fn capture_sink(event: &[u8]) {
+            CAPTURED.lock().push(event.to_vec());
+        }
+
+        __test_reset();
+        narf_bluetooth::pump::__test_reset();
+        sysfs_reset();
+        CAPTURED.lock().clear();
+        let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
+        let fail = |msg: &'static str| -> TestResult {
+            if let Some(prev) = previous {
+                narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+            }
+            __test_reset();
+            narf_bluetooth::pump::__test_reset();
+            sysfs_reset();
+            TestResult::Fail(msg)
+        };
+
+        // Two bound devices sharing slot id 3 on different xHCI
+        // controllers (hci 0 and hci 1).
+        let mk_device = |controller: u8, slot_id: u8, name: &'static str| {
+            let transport: Arc<dyn HciTransport> = Arc::new(LoopbackTransport::new(name));
+            narf_bluetooth::transport::register(transport.clone());
+            let hci_index = narf_bluetooth::controller::register_ready_transport(
+                transport.clone(),
+                ControllerInfo::default(),
+            );
+            BTUSB_DEVICES.lock().push(Arc::new(BtUsbDevice {
+                controller,
+                slot_id,
+                hci_index,
+                endpoints: fake_endpoints(),
+                transport,
+                info: ControllerInfo::default(),
+            }));
+        };
+        mk_device(0, 3, "btusb-detach-a");
+        mk_device(1, 3, "btusb-detach-b");
+        if attached_count() != 2 || narf_bluetooth::controller::controller_count() != 2 {
+            return fail("setup did not bind two controllers");
+        }
+        if narf_bluetooth::sysfs_bridge::hci_kobject(1).is_none() {
+            return fail("no sysfs node for hci1 after setup");
+        }
+
+        CAPTURED.lock().clear();
+        if detach_btusb_slot(0, 3).is_err() {
+            return fail("detach hook failed for a bound slot");
+        }
+        if attached_count() != 1 {
+            return fail("BTUSB_DEVICES entry survived detach");
+        }
+        if narf_bluetooth::controller::controller_count() != 1
+            || !narf_bluetooth::controller::is_live(1)
+            || narf_bluetooth::controller::is_live(0)
+        {
+            return fail("wrong controller survived detach");
+        }
+        if narf_bluetooth::transport::transport_count() != 1 {
+            return fail("detached transport survived detach");
+        }
+        if narf_bluetooth::pump::connection_count(0).is_some() {
+            return fail("pump slot survived detach");
+        }
+        if narf_bluetooth::sysfs_bridge::hci_kobject(0).is_some()
+            || narf_bluetooth::sysfs_bridge::hci_kobject(1).is_none()
+        {
+            return fail("sysfs nodes wrong after detach (hci0 must go, hci1 stay)");
+        }
+        let removed = CAPTURED
+            .lock()
+            .iter()
+            .filter(|e| {
+                e.len() >= 6
+                    && u16::from_le_bytes([e[0], e[1]]) == EV_INDEX_REMOVED
+                    && u16::from_le_bytes([e[2], e[3]]) == 0
+            })
+            .count();
+        if removed != 1 {
+            return fail("INDEX_REMOVED was not published exactly once for hci0");
+        }
+
+        // Second detach for the same slot: no-op.
+        if detach_btusb_slot(0, 3).is_err() || attached_count() != 1 {
+            return fail("second detach for the same slot was not a no-op");
+        }
+        // Unknown slot: no-op.
+        if detach_btusb_slot(0, 7).is_err() || attached_count() != 1 {
+            return fail("detach for an unknown slot was not a no-op");
+        }
+        // The other controller's slot detaches independently.
+        if detach_btusb_slot(1, 3).is_err() {
+            return fail("detach hook failed for the second controller");
+        }
+        if attached_count() != 0 || narf_bluetooth::controller::controller_count() != 0 {
+            return fail("registries not empty after both detaches");
+        }
+
+        if let Some(prev) = previous {
+            narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+        }
+        __test_reset();
+        narf_bluetooth::pump::__test_reset();
+        sysfs_reset();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/btusb",
+        smoke_btusb_detach_slot_unregisters_controller
+    );
 }
