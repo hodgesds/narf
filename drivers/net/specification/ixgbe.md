@@ -13,11 +13,11 @@
 ## 1. Scope
 
 Owns the full bring-up of an 82599-class NIC: PCIe BAR0 mapping,
-documented `CTRL.RST` reset, EEPROM-backed MAC read, TX descriptor
-ring (advanced layout), RX descriptor ring (legacy layout for
-simplicity), one MSI-X vector for link / RX completion, and a
-`HwNic` adapter exposing the same surface the e1000/mlx5 drivers
-do.
+documented `CTRL.RST` reset, EEPROM-backed MAC read, TX/RX
+descriptor rings per configured queue (advanced TX layout, legacy
+RX layout for simplicity), MSI-X vectors per queue (or one shared
+misc vector for 1/1), and a `HwNic` adapter exposing the same
+surface the e1000/mlx5 drivers do.
 
 Does NOT own: FCoE, SR-IOV, RSS, VMDq.
 
@@ -49,6 +49,9 @@ All registers are 4-byte little-endian (host order). Offsets per
 | 0x00898   | GPIE      | General-Purpose Interrupt Enable     |
 | 0x00900+  | IVAR[n]   | Interrupt-vector allocation (n=0..63, 2 queues each) |
 | 0x00A00   | IVAR_MISC | Misc (OTHER) interrupt-vector allocation |
+| 0x00AA0   | EIMS_EX0  | Extended interrupt mask set, queues 0..31 (per-queue vectors) |
+| 0x00AA4   | EIMS_EX1  | Extended interrupt mask set, queues 32..63 (per-queue vectors) |
+| 0x00AD0   | EIAM_EX0  | Extended interrupt auto-mask, queues 32..63 |
 | 0x01000+0x40*n | RDBAL[n] | RX desc base low (n=0..63; n=64..127 at 0x0D000+0x40*(n-64)) |
 | 0x01004+0x40*n | RDBAH[n] | RX desc base high                    |
 | 0x01008+0x40*n | RDLEN[n] | RX desc length                       |
@@ -142,22 +145,49 @@ queue 0's RX/TX onto that vector; OTHER_CAUSES_IVAR routes
 link-state changes to it as well. The bus-side `enable_msix`
 helper does the table programming.
 
+Per-queue vectors (`enable_msix_queue_vectors`) route RX queue
+`q` and TX queue `q` to vector `q` (the Linux q_vector shape)
+via `route_all_queue_vectors`, with the OTHER cause sharing
+vector 0; queue causes are unmasked via EIMS_EX(0/1) and the
+OTHER cause via EIMS bit 31 (EIMS_OTHER); EIAM/EIAM_EX0
+auto-mask the same sets. The datapath stays polled — no
+production path consumes these interrupts yet — so this is
+routing + unmasking, not ISR wire-up. The EX-mask register
+addresses were cross-checked against Linux ixgbe_type.h @
+cbbddb6 (IXGBE_EIMS_EX / IXGBE_EIAM_EX / IXGBE_EIMS_OTHER);
+all other layout in this spec is datasheet-sourced.
+`enable_msix_vector` (single shared misc vector) remains as the
+1/1 alternative; the two must not both run.
+
 ## 9. Multi-queue (v0.2)
 
 `drivers/net/ixgbe/src/ixgbe/queues.rs` owns queue addressing:
 `rx_queue_regs(q)` / `tx_queue_regs(q)` (stride 0x40, second RX
 bank for 64..127), `QueueConfig` validation (live cap 64 queues,
 ring length a power of two in 32..=4096), and IVAR routing
-(`route_queue_vector` / `route_misc_vector`: one IVAR per two
-queues, RX/TX fields + valid bits per §8.2.3.5.16; OTHER cause via
-IVAR_MISC bits 14:8 + valid bit 15). Bring-up still runs the live
-datapath on queue 0's rings; `Ixgbe::num_tx_queues` /
-`num_rx_queues` (exposed via both `HwNic` and `narf_net::Interface`)
-report the configured counts (1/1 today). Extra-queue DMA rings
-and per-queue pumps are a sequenced follow-up (§14): the
-addressing, validation, and vector routing they need are done
-here, and fixtures replay the queue-0 register conversation on a
-fake bank plus IVAR sibling-preservation checks.
+(`route_queue_vector` / `route_queue_vector_dir` /
+`route_misc_vector`: one IVAR per two queues, RX/TX fields +
+valid bits per §8.2.3.5.16; OTHER cause via IVAR_MISC bits 14:8 +
+valid bit 15). `Ixgbe::bring_up_with_config` allocates and
+programs TX/RX DMA rings for every configured queue
+(`program_tx_queue` / `program_rx_queue`, shared with the
+fake-bank fixtures) and spawns a per-queue pump set: one RX pump
+per RX queue (all fanning mirror copies into the one
+`rx_mirror` producer; only queue 0's pump observes the link),
+one TX pump per TX queue fed by a round-robin dispatcher from
+the stack-facing channel (no flow steering — RSS steering stays
+opt-in via `configure_rss`); a single-TX-queue config keeps the
+direct pump with no dispatcher hop, so the 1/1 topology is
+unchanged. `Ixgbe::bring_up` is the 1/1 case of the same path.
+`Ixgbe::num_tx_queues` / `num_rx_queues` (exposed via both
+`HwNic` and `narf_net::Interface`) report the configured counts,
+and `queue_affinity(q)` reports vector `q` for configured queues
+(boot CPU; pumps are unpinned). Per-queue MSI-X vectors are
+`enable_msix_queue_vectors` (see §7). Fixtures replay the queue-0
+register conversation on a fake bank, plus multi-queue
+conversations (queues 0..3 + 63), IVAR sibling-preservation
+checks, and the full vector routing table (including asymmetric
+configs) — all through the same production helpers bring-up uses.
 
 ## 10. RSS
 
@@ -640,8 +670,6 @@ Per the v0.1 exclusion list, still open after this stream:
   re-grounding, the FW-PHY activity + ACI transports, live
   link re-application after a set, and X550EM_A / E610
   device support.
-- Per-queue DMA rings + pumps for queues 1..63, and per-queue
-  MSI-X vectors beyond the shared misc vector.
 - X540 / X550EM_x WoL grounding + X550 LOM opt-in — landed as
   the Linux-cap-rule model (§13g); remainders are datasheet
   re-grounding, the EEPROM word-0x2c reader, and E610/X550EM_A

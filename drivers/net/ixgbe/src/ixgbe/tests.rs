@@ -2160,3 +2160,222 @@ fn smoke_ixgbe_ethtool_queue_stats() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_ethtool_queue_stats);
+// ── #1260: multi-queue rings + per-queue vectors ────────────────
+
+fn smoke_ixgbe_multiqueue_register_conversation() -> TestResult {
+    use super::queues::{rx_queue_regs, tx_queue_regs, RegBank};
+    use super::{
+        program_rx_queue, program_tx_queue, RXDCTL_ENABLE, SRRCTL_BSIZE_2K, SRRCTL_DESCTYPE_LEGACY,
+        TXDCTL_ENABLE,
+    };
+    // Fake-bank replay of bring_up_with_config's per-queue
+    // programming for TX queues 0..3 + RX queues 0..3 (ring_len 32,
+    // distinct ring addresses per queue), plus queue 63
+    // (last live queue). Assertions run after ALL programming, so
+    // queue 0's block still holding queue 0's values proves
+    // queues 1.. did not alias it (stride check with teeth).
+    let mut bank = FakeBank::new();
+    let ring_len = 32usize;
+    for q in 0..4usize {
+        let tx_phys: u64 = 0x1_0000_1000 + (q as u64) * 0x1_0000;
+        let rx_phys: u64 = 0x1_0000_8000 + (q as u64) * 0x1_0000;
+        program_tx_queue(&mut bank, q, tx_phys, ring_len);
+        program_rx_queue(&mut bank, q, rx_phys, ring_len);
+    }
+    program_tx_queue(&mut bank, 63, 0x2_0000_3000, ring_len);
+    program_rx_queue(&mut bank, 63, 0x2_0000_9000, ring_len);
+    for q in 0..4usize {
+        let tx = match tx_queue_regs(q) {
+            Some(t) => t,
+            None => return TestResult::Fail("tx_queue_regs is None"),
+        };
+        let rx = match rx_queue_regs(q) {
+            Some(r) => r,
+            None => return TestResult::Fail("rx_queue_regs is None"),
+        };
+        let tx_phys: u64 = 0x1_0000_1000 + (q as u64) * 0x1_0000;
+        let rx_phys: u64 = 0x1_0000_8000 + (q as u64) * 0x1_0000;
+        if bank.read32(tx.tdbal) != tx_phys as u32
+            || bank.read32(tx.tdbah) != (tx_phys >> 32) as u32
+            || bank.read32(tx.tdlen) != 512
+            || bank.read32(tx.tdh) != 0
+            || bank.read32(tx.tdt) != 0
+            || bank.read32(tx.txdctl) & TXDCTL_ENABLE == 0
+        {
+            return TestResult::Fail("TX multi-queue conversation wrong");
+        }
+        if bank.read32(rx.rdbal) != rx_phys as u32
+            || bank.read32(rx.rdbah) != (rx_phys >> 32) as u32
+            || bank.read32(rx.rdlen) != 512
+            || bank.read32(rx.rdh) != 0
+            || bank.read32(rx.rdt) != 31
+            || bank.read32(rx.srrctl) != (SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY)
+            || bank.read32(rx.rxdctl) & RXDCTL_ENABLE == 0
+        {
+            return TestResult::Fail("RX multi-queue conversation wrong");
+        }
+    }
+    let tx63 = match tx_queue_regs(63) {
+        Some(t) => t,
+        None => return TestResult::Fail("tx_queue_regs(63) is None"),
+    };
+    let rx63 = match rx_queue_regs(63) {
+        Some(r) => r,
+        None => return TestResult::Fail("rx_queue_regs(63) is None"),
+    };
+    if bank.read32(tx63.tdbal) != 0x0000_3000
+        || bank.read32(tx63.tdbah) != 0x2
+        || bank.read32(tx63.tdlen) != 512
+        || bank.read32(tx63.txdctl) & TXDCTL_ENABLE == 0
+    {
+        return TestResult::Fail("TX queue-63 conversation wrong");
+    }
+    if bank.read32(rx63.rdbal) != 0x0000_9000
+        || bank.read32(rx63.rdbah) != 0x2
+        || bank.read32(rx63.rdlen) != 512
+        || bank.read32(rx63.rdt) != 31
+        || bank.read32(rx63.rxdctl) & RXDCTL_ENABLE == 0
+    {
+        return TestResult::Fail("RX queue-63 conversation wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_multiqueue_register_conversation
+);
+
+fn smoke_ixgbe_multiqueue_vector_routing_table() -> TestResult {
+    use super::queues::{QueueConfig, RegBank, REG_IVAR_BASE, REG_IVAR_MISC};
+    use super::route_all_queue_vectors;
+    // Asymmetric config (TX 3, RX 5): vectors equal queue indices;
+    // queues 3..4 have RX but no TX, so their TX IVAR fields must
+    // stay zero while their RX fields route. IVAR[0] covers
+    // queues 0..1, IVAR[1] queues 2..3, IVAR[2] queues 4..5.
+    let mut bank = FakeBank::new();
+    let asym = QueueConfig {
+        num_tx: 3,
+        num_rx: 5,
+        ring_len: 32,
+    };
+    route_all_queue_vectors(&mut bank, &asym);
+    // q0 RX+TX v0 -> 0x8080; q1 RX+TX v1 -> 0x81810000.
+    if bank.read32(REG_IVAR_BASE) != 0x8181_8080 {
+        return TestResult::Fail("IVAR[0] asymmetric routing wrong");
+    }
+    // q2 RX+TX v2 -> 0x8282; q3 RX-only v3 -> 0x830000 (TX field 0).
+    if bank.read32(REG_IVAR_BASE + 4) != 0x8300_8282 {
+        return TestResult::Fail("IVAR[1] asymmetric routing wrong");
+    }
+    // q4 RX-only v4 -> 0x0084; q5 nothing -> high half 0.
+    if bank.read32(REG_IVAR_BASE + 8) != 0x0000_0084 {
+        return TestResult::Fail("IVAR[2] asymmetric routing wrong");
+    }
+    if bank.read32(REG_IVAR_BASE + 12) != 0 {
+        return TestResult::Fail("IVAR[3] touched by 5-queue routing");
+    }
+    if bank.read32(REG_IVAR_MISC) != 0x8000 {
+        return TestResult::Fail("IVAR_MISC OTHER routing wrong");
+    }
+    // Symmetric config (TX 4, RX 4): queue 3 now routes TX too.
+    let mut bank2 = FakeBank::new();
+    let sym = QueueConfig {
+        num_tx: 4,
+        num_rx: 4,
+        ring_len: 32,
+    };
+    route_all_queue_vectors(&mut bank2, &sym);
+    // q2 0x8282; q3 RX+TX v3 -> 0x83830000.
+    if bank2.read32(REG_IVAR_BASE + 4) != 0x8383_8282 {
+        return TestResult::Fail("IVAR[1] symmetric routing wrong");
+    }
+    if bank2.read32(REG_IVAR_MISC) != 0x8000 {
+        return TestResult::Fail("IVAR_MISC symmetric routing wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_multiqueue_vector_routing_table
+);
+
+fn smoke_ixgbe_multiqueue_config() -> TestResult {
+    use super::queues::{QueueConfig, QueueError};
+    let ok = [
+        QueueConfig {
+            num_tx: 4,
+            num_rx: 4,
+            ring_len: 64,
+        },
+        QueueConfig {
+            num_tx: 64,
+            num_rx: 64,
+            ring_len: 4096,
+        },
+        QueueConfig {
+            num_tx: 64,
+            num_rx: 1,
+            ring_len: 32,
+        },
+        QueueConfig {
+            num_tx: 1,
+            num_rx: 64,
+            ring_len: 32,
+        },
+    ];
+    for cfg in ok {
+        if cfg.validate().is_err() {
+            return TestResult::Fail("valid multi-queue config rejected");
+        }
+    }
+    let bad_len = QueueConfig {
+        num_tx: 2,
+        num_rx: 2,
+        ring_len: 8192,
+    };
+    if bad_len.validate() != Err(QueueError::BadRingLen) {
+        return TestResult::Fail("8192-entry ring accepted");
+    }
+    let zero_len = QueueConfig {
+        num_tx: 2,
+        num_rx: 2,
+        ring_len: 0,
+    };
+    if zero_len.validate() != Err(QueueError::BadRingLen) {
+        return TestResult::Fail("0-entry ring accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_multiqueue_config);
+
+fn smoke_ixgbe_queue_vector_for() -> TestResult {
+    use super::queue_vector_for;
+    use super::queues::QueueConfig;
+    let single = QueueConfig::single();
+    if queue_vector_for(&single, 0) != Some(0) || queue_vector_for(&single, 1).is_some() {
+        return TestResult::Fail("single-queue vector mapping wrong");
+    }
+    let asym = QueueConfig {
+        num_tx: 3,
+        num_rx: 5,
+        ring_len: 32,
+    };
+    if queue_vector_for(&asym, 0) != Some(0)
+        || queue_vector_for(&asym, 2) != Some(2)
+        || queue_vector_for(&asym, 3) != Some(3)
+        || queue_vector_for(&asym, 4) != Some(4)
+        || queue_vector_for(&asym, 5).is_some()
+    {
+        return TestResult::Fail("asymmetric vector mapping wrong");
+    }
+    let full = QueueConfig {
+        num_tx: 64,
+        num_rx: 64,
+        ring_len: 32,
+    };
+    if queue_vector_for(&full, 63) != Some(63) || queue_vector_for(&full, 64).is_some() {
+        return TestResult::Fail("64-queue vector mapping wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_queue_vector_for);

@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
-use narf_ipc::{channel, Consumer, Producer};
+use narf_ipc::{channel, Consumer, Producer, TrySendError};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
@@ -66,17 +66,25 @@ pub(crate) const REG_EIMC: u64 = 0x00888;
 pub(crate) const REG_GPIE: u64 = 0x00898;
 pub(crate) const REG_EIAM: u64 = 0x00890;
 
+// Extended interrupt-mask/auto-mask registers for vectors 32..63
+// (datasheet §8.2; cross-checked against Linux ixgbe_type.h @
+// cbbddb6: IXGBE_EIMS_EX / IXGBE_EIAM_EX).
+pub(crate) const REG_EIMS_EX0: u64 = 0x00AA0;
+pub(crate) const REG_EIMS_EX1: u64 = 0x00AA4;
+pub(crate) const REG_EIAM_EX0: u64 = 0x00AD0;
+
+// EIMS OTHER-cause bit (Linux IXGBE_EIMS_OTHER = IXGBE_EICR_OTHER).
+pub(crate) const EIMS_OTHER_CAUSE: u32 = 1 << 31;
+
 pub(crate) const REG_FCTRL: u64 = 0x05080;
 pub(crate) const REG_RAL0: u64 = 0x0A200; // 82599 receive-address regs §8.2.3.7.9
 pub(crate) const REG_RAH0: u64 = 0x0A204;
 pub(crate) const REG_RXCTRL: u64 = 0x03000;
 pub(crate) const REG_LINKS: u64 = 0x04200;
 
-// Queue-0 tail pointers still used directly by the tx/rx paths; all
-// other queue registers come from queues::rx_queue_regs/tx_queue_regs
-// (datasheet §8.2, stride 0x40 per queue).
-pub(crate) const RX_RDT: u64 = 0x01018;
-pub(crate) const TX_TDT: u64 = 0x06018;
+// All queue registers come from queues::rx_queue_regs/tx_queue_regs
+// (datasheet §8.2, stride 0x40 per queue); the tx/rx paths index
+// them per queue, so no queue-0 tail-pointer constants remain.
 
 // CTRL bits (§8.2.3.1.1).
 pub(crate) const CTRL_RST_MASK: u32 = (1 << 26) | (1 << 3); // RST | LRST
@@ -184,9 +192,9 @@ pub(crate) const RXD_STAT_DD: u8 = 1 << 0;
 #[allow(dead_code)]
 pub(crate) const RXD_STAT_EOP: u8 = 1 << 1;
 
-// Ring sizes — keep small for Stage-3/4 bring-up.
-pub(crate) const TX_RING_LEN: usize = 32;
-pub(crate) const RX_RING_LEN: usize = 32;
+// Ring lengths come from `QueueConfig::ring_len` (32 for the
+// single-queue config, matching the old Stage-3/4 constants).
+// RX_BUF_LEN is a buffer size, not a ring length, and stays fixed.
 pub(crate) const RX_BUF_LEN: usize = 2048;
 
 // ── Descriptor types ───────────────────────────────────────────────
@@ -478,21 +486,58 @@ pub enum IxgbeError {
 
 // ── Driver state ───────────────────────────────────────────────────
 
-pub struct Ixgbe {
-    pub(crate) mmio: MmioRegion,
+/// One TX queue's DMA ring state. Index = queue number.
+pub(crate) struct TxQueueState {
     pub(crate) tx_ring: DmaBuffer,
     /// Persistent per-slot TX frame buffers (audit #4 — pre-fix
     /// `tx()` did `alloc_coherent(4096)` per frame and dropped it
     /// on return). Indexed by descriptor slot.
     pub(crate) tx_pool: Vec<DmaBuffer>,
+    pub(crate) tx_tail: IrqSafeSpinLock<u32>,
+}
+
+impl core::fmt::Debug for TxQueueState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TxQueueState")
+            .field("tx_pool_len", &self.tx_pool.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One RX queue's DMA ring state. Index = queue number.
+pub(crate) struct RxQueueState {
     pub(crate) rx_ring: DmaBuffer,
     /// The DMA buffer currently armed in each RX descriptor slot. Zero-copy RX
     /// (`rx_recv_frame`) hands a filled buffer to the stack as a `Frame` and
     /// swaps a fresh buffer into its slot, so the set rotates rather than
     /// staying fixed — hence the lock (the RX pump mutates it).
     pub(crate) rx_slots: IrqSafeSpinLock<Vec<DmaBuffer>>,
-    pub(crate) tx_tail: IrqSafeSpinLock<u32>,
     pub(crate) rx_head: IrqSafeSpinLock<u32>,
+}
+
+impl core::fmt::Debug for RxQueueState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RxQueueState")
+            .field("rx_slots_len", &self.rx_slots.lock().len())
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct Ixgbe {
+    pub(crate) mmio: MmioRegion,
+    /// Per-queue TX ring state, indexed by queue number; length
+    /// `queue_config.num_tx`. `tx_queues[0]` is the queue-0 state
+    /// the pre-multi-queue driver held as flat fields.
+    pub(crate) tx_queues: Vec<TxQueueState>,
+    /// Per-queue RX ring state, indexed by queue number; length
+    /// `queue_config.num_rx`.
+    pub(crate) rx_queues: Vec<RxQueueState>,
+    /// Stack-facing RX mirror producer, shared by all RX pumps.
+    /// `Producer` is single-owner + `!Sync`, so multi-queue fan-in
+    /// goes through this lock; `try_send` is non-blocking, so a
+    /// full/closed ring drops the mirror copy, never the stack's
+    /// packet — the same semantics as the single-pump path.
+    pub(crate) rx_mirror: IrqSafeSpinLock<Producer<Frame, RX_RING_N>>,
     /// MAC read from the EEPROM at bring-up.
     pub mac: [u8; 6],
     /// True after the MAC was successfully programmed into RAH/RAL
@@ -500,8 +545,10 @@ pub struct Ixgbe {
     pub link_up: IrqSafeSpinLock<bool>,
     /// Recorded device id (drives `name()`).
     pub did: u16,
-    /// Live queue configuration (multi-queue keystone: 1/1 at
-    /// bring-up; register addressing + IVAR routing cover up to 64).
+    /// Live queue configuration: the counts `tx_queues` /
+    /// `rx_queues` were built for, and the ring length their rings
+    /// use. `bring_up` builds 1/1; `bring_up_with_config` builds
+    /// any validated config (up to 64/64).
     pub queue_config: queues::QueueConfig,
     /// Programmed RSS state, if `configure_rss` ran.
     pub rss_cfg: IrqSafeSpinLock<Option<rss::IxgbeRss>>,
@@ -539,29 +586,115 @@ impl core::fmt::Debug for Ixgbe {
             .field("mac", &self.mac)
             .field("link_up", &*self.link_up.lock())
             .field("did", &format_args!("0x{:04X}", self.did))
+            .field("num_tx_queues", &self.queue_config.num_tx)
+            .field("num_rx_queues", &self.queue_config.num_rx)
             .finish_non_exhaustive()
     }
 }
 
+/// Program one TX queue's descriptor ring (base, length, head/tail,
+/// queue-enable) on any [`RegBank`]. Shared by bring-up (via
+/// [`queues::MmioBank`]) and the fake-bank fixtures, so the
+/// register conversation the fixtures pin is the one the hardware
+/// sees. Panics for an out-of-range queue; callers pass validated
+/// queue counts, so this is unreachable in bring-up.
+fn program_tx_queue(bank: &mut impl RegBank, q: usize, phys: u64, ring_len: usize) {
+    let txq = queues::tx_queue_regs(q).expect("validated queue count is in range");
+    bank.write32(txq.tdbal, phys as u32);
+    bank.write32(txq.tdbah, (phys >> 32) as u32);
+    bank.write32(txq.tdlen, (ring_len * 16) as u32);
+    bank.write32(txq.tdh, 0);
+    bank.write32(txq.tdt, 0);
+    bank.set_bits(txq.txdctl, TXDCTL_ENABLE);
+}
+
+/// Program one RX queue's descriptor ring (base, length, head/tail,
+/// SRRCTL 2K legacy buffers, queue-enable) on any [`RegBank`].
+/// Same sharing note as [`program_tx_queue`].
+fn program_rx_queue(bank: &mut impl RegBank, q: usize, phys: u64, ring_len: usize) {
+    let rxq = queues::rx_queue_regs(q).expect("validated queue count is in range");
+    bank.write32(rxq.rdbal, phys as u32);
+    bank.write32(rxq.rdbah, (phys >> 32) as u32);
+    bank.write32(rxq.rdlen, (ring_len * 16) as u32);
+    bank.write32(rxq.rdh, 0);
+    bank.write32(rxq.rdt, ring_len.saturating_sub(1) as u32);
+    bank.write32(rxq.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY);
+    bank.set_bits(rxq.rxdctl, RXDCTL_ENABLE);
+}
+
+/// Route every configured queue to its own MSI-X vector (vector =
+/// queue index; RX and TX of one queue share it) plus the OTHER
+/// cause to vector 0. Shared by `enable_msix_queue_vectors` (via
+/// [`queues::MmioBank`]) and the fake-bank routing-table fixtures.
+/// Callers pass a validated `QueueConfig` (see
+/// `QueueConfig::validate`); counts above 64 would truncate the
+/// vector cast. Asymmetric configs route only the directions that
+/// exist: a queue with no TX ring leaves its TX IVAR field
+/// unprogrammed, and vice versa.
+fn route_all_queue_vectors(bank: &mut impl RegBank, config: &queues::QueueConfig) {
+    let n = config.num_tx.max(config.num_rx);
+    for q in 0..n {
+        if q < config.num_tx && q < config.num_rx {
+            queues::route_queue_vector(bank, q, q as u8);
+        } else if q < config.num_tx {
+            queues::route_queue_vector_dir(bank, q, q as u8, true);
+        } else {
+            queues::route_queue_vector_dir(bank, q, q as u8, false);
+        }
+    }
+    queues::route_misc_vector(bank, 0);
+}
+
+/// MSI-X vector for queue `q` under `config` (vector = queue
+/// index), or `None` when neither direction of `q` is configured.
+/// Counts are validated to 1..=64, so a `Some` vector is always
+/// 0..=63. The single source for `queue_affinity`'s `irq` field.
+pub(crate) fn queue_vector_for(config: &queues::QueueConfig, q: usize) -> Option<u8> {
+    if q < config.num_tx.max(config.num_rx) {
+        Some(q as u8)
+    } else {
+        None
+    }
+}
+
 impl Ixgbe {
-    /// Bring the controller up: PCI MMIO map, master reset, MAC
-    /// read, TX/RX rings programmed, link enabled. MSI-X gets wired
-    /// up by `enable_msix_vector()` once the bus side has been
-    /// validated.
+    /// Bring the controller up with the single-queue config: PCI
+    /// MMIO map, master reset, MAC read, queue-0 TX/RX rings
+    /// programmed, link enabled. MSI-X gets wired up by
+    /// `enable_msix_vector()` once the bus side has been validated.
+    /// See [`Self::bring_up_with_config`] for multi-queue bring-up.
     ///
     /// # Safety
     /// Caller owns the device's BAR0 exclusively for the duration of
     /// init.
     pub unsafe fn bring_up(
         device: &BusDevice,
+        cap: &Cap<BusDeviceCap, Write>,
+    ) -> Result<Arc<Self>, IxgbeError> {
+        // SAFETY: same caller-authority as `bring_up_with_config`.
+        unsafe { Self::bring_up_with_config(device, cap, queues::QueueConfig::single()) }
+    }
+
+    /// Bring the controller up with `queue_config`: same steps as
+    /// [`Self::bring_up`], but TX/RX DMA rings are allocated and
+    /// programmed for every configured queue (not just queue 0)
+    /// and a per-queue pump set is spawned. An invalid config
+    /// (zero queues, >64 queues, bad ring length) is rejected
+    /// before any register is touched. MSI-X routing for the
+    /// queues is still a separate step
+    /// (`enable_msix_queue_vectors`), mirroring the single-vector
+    /// path's split between bring-up and `enable_msix_vector`.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR0 exclusively for the duration of
+    /// init.
+    pub unsafe fn bring_up_with_config(
+        device: &BusDevice,
         _cap: &Cap<BusDeviceCap, Write>,
+        queue_config: queues::QueueConfig,
     ) -> Result<Arc<Self>, IxgbeError> {
         // SAFETY: caller-authority over the device.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| IxgbeError::BarMapFailed)?;
-        // The single-queue config is valid by construction; validate
-        // anyway so a future multi-queue bring-up cannot silently
-        // program an out-of-range queue count.
-        let queue_config = queues::QueueConfig::single();
         queue_config
             .validate()
             .map_err(|_| IxgbeError::Other("invalid queue config"))?;
@@ -623,89 +756,97 @@ impl Ixgbe {
             mmio.write32(REG_CTRL_EXT, cur | CTRL_EXT_DRV_LOAD | CTRL_EXT_NS_DIS);
         }
 
-        // 6. Set up the TX ring (queue 0) + persistent per-slot
-        //    frame buffers (audit #4).
-        let tx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
-        let tx_phys = tx_ring.dma_addr().raw();
-        let mut tx_pool: Vec<DmaBuffer> = Vec::with_capacity(TX_RING_LEN);
-        for _ in 0..TX_RING_LEN {
-            tx_pool
-                .push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?);
-        }
-        // SAFETY: identity-mapped DMA.
-        unsafe {
-            for i in 0..(TX_RING_LEN * 16) {
-                core::ptr::write_volatile(tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
-            }
-        }
-        // Queue-0 registers come from the multi-queue addressing
-        // helpers (queues.rs), which the fixtures prove equal to the
-        // datasheet queue-0 addresses.
-        let txq = queues::tx_queue_regs(0).expect("queue 0 is in range");
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            mmio.write32(txq.tdbal, tx_phys as u32);
-            mmio.write32(txq.tdbah, (tx_phys >> 32) as u32);
-            mmio.write32(txq.tdlen, (TX_RING_LEN * 16) as u32);
-            mmio.write32(txq.tdh, 0);
-            mmio.write32(txq.tdt, 0);
-            // Enable TX queue.
-            let dctl = mmio.read32(txq.txdctl);
-            mmio.write32(txq.txdctl, dctl | TXDCTL_ENABLE);
-        }
-        // Poll for queue-enable to take effect (§7.2.3.4.1).
-        // responsive_spin_until ticks sleep_pumps; failure is
-        // non-fatal here (queue may come up later), matching prior
-        // behaviour. 100 ms wall-clock budget.
-        let _ = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { mmio.read32(txq.txdctl) } & TXDCTL_ENABLE != 0,
-            narf_time::Deadline::after_ms(100),
-        );
-
-        // 7. RX ring + pool.
-        let rx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
-        let rx_ring_phys = rx_ring.dma_addr().raw();
-        let mut rx_pool = Vec::with_capacity(RX_RING_LEN);
-        for i in 0..RX_RING_LEN {
-            let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
-            let bp = buf.dma_addr().raw();
-            let desc = RxDesc {
-                addr: bp,
-                length: 0,
-                csum: 0,
-                status: 0,
-                errors: 0,
-                special: 0,
-            };
-            // SAFETY: identity-mapped DMA ring page.
-            unsafe {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(rx_ring_phys + (i * 16) as u64)
-                        .kernel_mut_ptr::<RxDesc>(),
-                    desc,
+        // 6. TX rings + persistent per-slot frame buffers (audit
+        //    #4), one per TX queue. Queue 0's sequence is the
+        //    pre-multi-queue one verbatim (same registers, same
+        //    values, via `tx_queue_regs(0)`); queues 1.. repeat it
+        //    at their own 0x40-strided blocks.
+        let ring_len = queue_config.ring_len;
+        let ring_bytes = ring_len * 16;
+        let ring_alloc = ring_bytes.div_ceil(4096) * 4096;
+        let mut tx_queues: Vec<TxQueueState> = Vec::with_capacity(queue_config.num_tx);
+        for q in 0..queue_config.num_tx {
+            let tx_ring =
+                alloc_coherent(ring_alloc, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
+            let tx_phys = tx_ring.dma_addr().raw();
+            let mut tx_pool: Vec<DmaBuffer> = Vec::with_capacity(ring_len);
+            for _ in 0..ring_len {
+                tx_pool.push(
+                    alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?,
                 );
             }
-            rx_pool.push(buf);
+            // SAFETY: identity-mapped DMA.
+            unsafe {
+                for i in 0..ring_bytes {
+                    core::ptr::write_volatile(tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
+                }
+            }
+            let txq = queues::tx_queue_regs(q).expect("validated queue count is in range");
+            {
+                let mut bank = queues::MmioBank::new(&mmio);
+                program_tx_queue(&mut bank, q, tx_phys, ring_len);
+            }
+            // Poll for queue-enable to take effect (§7.2.3.4.1).
+            // responsive_spin_until ticks sleep_pumps; failure is
+            // non-fatal here (queue may come up later), matching prior
+            // behaviour. 100 ms wall-clock budget.
+            let _ = narf_scheduler::responsive_spin_until(
+                // SAFETY: identity-mapped MMIO.
+                || unsafe { mmio.read32(txq.txdctl) } & TXDCTL_ENABLE != 0,
+                narf_time::Deadline::after_ms(100),
+            );
+            tx_queues.push(TxQueueState {
+                tx_ring,
+                tx_pool,
+                tx_tail: IrqSafeSpinLock::new(0),
+            });
         }
-        // Queue-0 registers come from the multi-queue addressing
-        // helpers (queues.rs).
-        let rxq = queues::rx_queue_regs(0).expect("queue 0 is in range");
+
+        // 7. RX rings + pools, one per RX queue (queue 0's sequence
+        //    verbatim, as for TX).
+        let mut rx_queues: Vec<RxQueueState> = Vec::with_capacity(queue_config.num_rx);
+        for q in 0..queue_config.num_rx {
+            let rx_ring =
+                alloc_coherent(ring_alloc, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
+            let rx_ring_phys = rx_ring.dma_addr().raw();
+            let mut rx_pool = Vec::with_capacity(ring_len);
+            for i in 0..ring_len {
+                let buf =
+                    alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
+                let bp = buf.dma_addr().raw();
+                let desc = RxDesc {
+                    addr: bp,
+                    length: 0,
+                    csum: 0,
+                    status: 0,
+                    errors: 0,
+                    special: 0,
+                };
+                // SAFETY: identity-mapped DMA ring page.
+                unsafe {
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(rx_ring_phys + (i * 16) as u64)
+                            .kernel_mut_ptr::<RxDesc>(),
+                        desc,
+                    );
+                }
+                rx_pool.push(buf);
+            }
+            {
+                let mut bank = queues::MmioBank::new(&mmio);
+                program_rx_queue(&mut bank, q, rx_ring_phys, ring_len);
+            }
+            rx_queues.push(RxQueueState {
+                rx_ring,
+                rx_slots: IrqSafeSpinLock::new(rx_pool),
+                rx_head: IrqSafeSpinLock::new(0),
+            });
+        }
+        // Promiscuous + broadcast accept; master RX enable (global,
+        // once — not per queue).
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            mmio.write32(rxq.rdbal, rx_ring_phys as u32);
-            mmio.write32(rxq.rdbah, (rx_ring_phys >> 32) as u32);
-            mmio.write32(rxq.rdlen, (RX_RING_LEN * 16) as u32);
-            mmio.write32(rxq.rdh, 0);
-            mmio.write32(rxq.rdt, (RX_RING_LEN - 1) as u32);
-            // SRRCTL: 2K legacy buffers.
-            mmio.write32(rxq.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY);
-            // Enable RX queue.
-            let dctl = mmio.read32(rxq.rxdctl);
-            mmio.write32(rxq.rxdctl, dctl | RXDCTL_ENABLE);
-            // Promiscuous + broadcast accept.
             mmio.write32(REG_FCTRL, FCTRL_BAM | FCTRL_UPE | FCTRL_MPE);
-            // Master RX enable.
             mmio.write32(REG_RXCTRL, RXCTRL_RXEN);
         }
 
@@ -716,15 +857,26 @@ impl Ixgbe {
 
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
         let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+        // Per-queue TX channels, only for multi-TX-queue configs:
+        // the dispatcher round-robins stack frames across them and
+        // each queue's TX pump drains its own. Single-TX-queue
+        // setups keep the direct pump (see `spawn_pumps`), so no
+        // per-queue channel exists there at all.
+        let mut tx_prods: Vec<Producer<Frame, TX_RING_N>> = Vec::new();
+        let mut tx_cons_q: Vec<Consumer<Frame, TX_RING_N>> = Vec::new();
+        if queue_config.num_tx > 1 {
+            for _ in 0..queue_config.num_tx {
+                let (p, c) = channel::<Frame, TX_RING_N>();
+                tx_prods.push(p);
+                tx_cons_q.push(c);
+            }
+        }
 
         let ixgbe = Arc::new(Self {
             mmio,
-            tx_ring,
-            tx_pool,
-            rx_ring,
-            rx_slots: IrqSafeSpinLock::new(rx_pool),
-            tx_tail: IrqSafeSpinLock::new(0),
-            rx_head: IrqSafeSpinLock::new(0),
+            tx_queues,
+            rx_queues,
+            rx_mirror: IrqSafeSpinLock::new(rx_prod),
             mac,
             link_up: IrqSafeSpinLock::new(link_up),
             did: device.id.device,
@@ -742,9 +894,10 @@ impl Ixgbe {
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
 
-        // Spawn the device's only pump pair — probe spawns none, so the
-        // pair fed here is the pair whose halves occupy the ring slots.
-        spawn_pumps(ixgbe.clone(), rx_prod, tx_cons);
+        // Spawn the device's per-queue pump set — probe spawns none,
+        // so the set fed here is the set whose halves occupy the
+        // ring slots.
+        spawn_pumps(ixgbe.clone(), tx_cons, tx_prods, tx_cons_q);
 
         Ok(ixgbe)
     }
@@ -754,15 +907,25 @@ impl Ixgbe {
         read_mac(&self.mmio)
     }
 
-    /// Transmit a single frame, polling the descriptor's DD bit.
-    /// Honors `TxMeta`: TSO (IPv4/TCP, up to `TX_TSO_MAX_TX` bytes
+    /// Transmit a single frame on queue 0, polling the descriptor's
+    /// DD bit. Honors `TxMeta`: TSO (IPv4/TCP, up to `TX_TSO_MAX_TX` bytes
     /// — the per-slot copy-buffer size) and VLAN insertion (tag
     /// from the context descriptor + VLE on the data descriptor).
-    /// Non-TSO frames keep the 1518 cap.
+    /// Non-TSO frames keep the 1518 cap. See [`Self::tx_on_queue`].
     pub fn tx(&self, frame: &[u8], meta: &TxMeta) -> Result<(), IxgbeError> {
+        self.tx_on_queue(0, frame, meta)
+    }
+
+    /// Transmit a single frame on TX queue `q`, polling the
+    /// descriptor's DD bit. `q` must be a configured TX queue.
+    pub fn tx_on_queue(&self, q: usize, frame: &[u8], meta: &TxMeta) -> Result<(), IxgbeError> {
         if *self.quiesced.lock() {
             return Err(IxgbeError::Other("device quiesced"));
         }
+        let queue = self
+            .tx_queues
+            .get(q)
+            .ok_or(IxgbeError::Other("bad TX queue"))?;
         if frame.is_empty() {
             return Err(IxgbeError::FrameTooLong);
         }
@@ -776,26 +939,27 @@ impl Ixgbe {
         if frame.len() > limit {
             return Err(IxgbeError::FrameTooLong);
         }
+        let ring_len = self.queue_config.ring_len;
         // Persistent per-slot buffer (audit #4).
-        let mut tail_g = self.tx_tail.lock();
-        let slot = (*tail_g) as usize % TX_RING_LEN;
-        let phys = self.tx_pool[slot].dma_addr().raw();
+        let mut tail_g = queue.tx_tail.lock();
+        let slot = (*tail_g) as usize % ring_len;
+        let phys = queue.tx_pool[slot].dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer; bounds-checked above
         // (len <= 4096 = slot size for TSO, <= 1518 otherwise).
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
+                core::ptr::write_volatile(queue.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
         }
         // Pure descriptor planning (no I/O); safe under the tail lock.
         let (ctxt, desc) = tx_plan(phys, frame.len(), frame, meta)?;
-        let ring_phys = self.tx_ring.dma_addr().raw();
+        let ring_phys = queue.tx_ring.dma_addr().raw();
         // Context first (if any), then the data descriptor; the tail
         // advances past both. DD is polled on the data descriptor
         // only (context descriptors carry no DD write-back).
         let has_ctxt = ctxt.is_some();
         let data_slot = if has_ctxt {
-            (slot + 1) % TX_RING_LEN
+            (slot + 1) % ring_len
         } else {
             slot
         };
@@ -815,11 +979,12 @@ impl Ixgbe {
             );
         }
         let used = 1 + has_ctxt as u32;
-        let next_tail = (*tail_g + used) % (TX_RING_LEN as u32);
+        let next_tail = (*tail_g + used) % (ring_len as u32);
         compiler_fence(Ordering::SeqCst);
+        let txq = queues::tx_queue_regs(q).expect("validated queue count is in range");
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            self.mmio.write32(TX_TDT, next_tail);
+            self.mmio.write32(txq.tdt, next_tail);
         }
         *tail_g = next_tail;
         drop(tail_g);
@@ -840,19 +1005,30 @@ impl Ixgbe {
         Ok(())
     }
 
-    /// Zero-copy transmit (P-F): post the TX descriptor pointing straight at
-    /// the `Frame`'s own DMA buffer — no copy into a per-slot buffer, unlike
-    /// [`Self::tx`]. The stack built the frame into that buffer, so DMA it in
-    /// place. Honors the frame's `TxMeta` (TSO / checksum offload / VLAN
+    /// Zero-copy transmit (P-F) on queue 0: post the TX descriptor
+    /// pointing straight at the `Frame`'s own DMA buffer — no copy
+    /// into a per-slot buffer, unlike [`Self::tx`]. The stack built
+    /// the frame into that buffer, so DMA it in place. Honors the
+    /// frame's `TxMeta` (TSO / checksum offload / VLAN
     /// insertion). TSO frames run to `TX_TSO_MAX_TX_FRAME` (the
     /// per-descriptor data length); non-TSO frames keep the 1518 cap.
     /// ixgbe TX is synchronous (polls DD), so the device is done the
     /// moment this returns and the caller may drop or recycle the
-    /// buffer immediately.
+    /// buffer immediately. See [`Self::tx_frame_on_queue`].
     pub fn tx_frame(&self, frame: &Frame) -> Result<(), IxgbeError> {
+        self.tx_frame_on_queue(0, frame)
+    }
+
+    /// Zero-copy transmit (P-F) on TX queue `q`. `q` must be a
+    /// configured TX queue.
+    pub fn tx_frame_on_queue(&self, q: usize, frame: &Frame) -> Result<(), IxgbeError> {
         if *self.quiesced.lock() {
             return Err(IxgbeError::Other("device quiesced"));
         }
+        let queue = self
+            .tx_queues
+            .get(q)
+            .ok_or(IxgbeError::Other("bad TX queue"))?;
         let len = frame.len() as usize;
         if len == 0 {
             return Err(IxgbeError::FrameTooLong);
@@ -866,6 +1042,7 @@ impl Ixgbe {
         if len > limit {
             return Err(IxgbeError::FrameTooLong);
         }
+        let ring_len = self.queue_config.ring_len;
         let phys = frame.buf().dma_addr_at(frame.offset() as u64).raw();
         // Stack copy of the header region for TSO parsing: headers
         // span at most 14 + 60 + 60 = 134 bytes. The frame owns its
@@ -881,9 +1058,9 @@ impl Ixgbe {
                 *slot = core::ptr::read_volatile(base.add(i));
             }
         }
-        let mut tail_g = self.tx_tail.lock();
-        let slot = (*tail_g) as usize % TX_RING_LEN;
-        let ring_phys = self.tx_ring.dma_addr().raw();
+        let mut tail_g = queue.tx_tail.lock();
+        let slot = (*tail_g) as usize % ring_len;
+        let ring_phys = queue.tx_ring.dma_addr().raw();
         // Pure descriptor planning (no I/O); safe under the tail lock.
         let (ctxt, desc) = tx_plan(phys, len, &head[..head_len], &meta)?;
         // Context first (if any), then the data descriptor; the tail
@@ -891,7 +1068,7 @@ impl Ixgbe {
         // only (context descriptors carry no DD write-back).
         let has_ctxt = ctxt.is_some();
         let data_slot = if has_ctxt {
-            (slot + 1) % TX_RING_LEN
+            (slot + 1) % ring_len
         } else {
             slot
         };
@@ -911,11 +1088,12 @@ impl Ixgbe {
             );
         }
         let used = 1 + has_ctxt as u32;
-        let next_tail = (*tail_g + used) % (TX_RING_LEN as u32);
+        let next_tail = (*tail_g + used) % (ring_len as u32);
         compiler_fence(Ordering::SeqCst);
+        let txq = queues::tx_queue_regs(q).expect("validated queue count is in range");
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            self.mmio.write32(TX_TDT, next_tail);
+            self.mmio.write32(txq.tdt, next_tail);
         }
         *tail_g = next_tail;
         drop(tail_g);
@@ -932,14 +1110,26 @@ impl Ixgbe {
         Ok(())
     }
 
-    /// Drain one RX frame into `out`. Returns 0 if nothing pending.
+    /// Drain one RX frame from queue 0 into `out`. Returns 0 if
+    /// nothing pending. See [`Self::rx_recv_on_queue`].
     pub fn rx_recv(&self, out: &mut [u8]) -> usize {
+        self.rx_recv_on_queue(0, out)
+    }
+
+    /// Drain one RX frame from RX queue `q` into `out`. Returns 0
+    /// if nothing pending, or if `q` is not a configured RX queue.
+    pub fn rx_recv_on_queue(&self, q: usize, out: &mut [u8]) -> usize {
         if *self.quiesced.lock() {
             return 0;
         }
-        let mut head_g = self.rx_head.lock();
+        let queue = match self.rx_queues.get(q) {
+            Some(queue) => queue,
+            None => return 0,
+        };
+        let ring_len = self.queue_config.ring_len;
+        let mut head_g = queue.rx_head.lock();
         let head = (*head_g) as usize;
-        let ring_phys = self.rx_ring.dma_addr().raw();
+        let ring_phys = queue.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
         let desc = unsafe {
@@ -977,30 +1167,43 @@ impl Ixgbe {
             );
         }
         compiler_fence(Ordering::SeqCst);
+        let rxq = queues::rx_queue_regs(q).expect("validated queue count is in range");
         // SAFETY: MMIO.
         unsafe {
-            self.mmio.write32(RX_RDT, head as u32);
+            self.mmio.write32(rxq.rdt, head as u32);
         }
-        let new_head = ((head + 1) % RX_RING_LEN) as u32;
+        let new_head = ((head + 1) % ring_len) as u32;
         *head_g = new_head;
         let _ = RXD_STAT_EOP;
         len
     }
 
-    /// Zero-copy receive (P-F): hand the descriptor's own DMA buffer to the
-    /// stack as a `Frame` and swap a fresh buffer into its slot — no copy into
-    /// a scratch buffer and then into a freshly-allocated frame, unlike the
-    /// pump's old `rx_recv` + `Frame::new` + `copy_from_slice`. Returns `None`
-    /// when no frame is pending, or when the refill allocation fails — in which
-    /// case the received frame is left in its descriptor (head not advanced) to
-    /// be retried, rather than dropped with no buffer to replace it.
+    /// Zero-copy receive (P-F) from queue 0: hand the descriptor's
+    /// own DMA buffer to the stack as a `Frame` and swap a fresh
+    /// buffer into its slot — no copy into a scratch buffer and then
+    /// into a freshly-allocated frame, unlike the pump's old
+    /// `rx_recv` + `Frame::new` + `copy_from_slice`. Returns `None`
+    /// when no frame is pending, or when the refill allocation fails
+    /// — in which case the received frame is left in its descriptor
+    /// (head not advanced) to be retried, rather than dropped with
+    /// no buffer to replace it. See
+    /// [`Self::rx_recv_frame_on_queue`].
     pub fn rx_recv_frame(&self) -> Option<Frame> {
+        self.rx_recv_frame_on_queue(0)
+    }
+
+    /// Zero-copy receive (P-F) from RX queue `q`. Returns `None`
+    /// when no frame is pending, when the refill allocation fails,
+    /// or when `q` is not a configured RX queue.
+    pub fn rx_recv_frame_on_queue(&self, q: usize) -> Option<Frame> {
         if *self.quiesced.lock() {
             return None;
         }
-        let mut head_g = self.rx_head.lock();
+        let queue = self.rx_queues.get(q)?;
+        let ring_len = self.queue_config.ring_len;
+        let mut head_g = queue.rx_head.lock();
         let head = (*head_g) as usize;
-        let ring_phys = self.rx_ring.dma_addr().raw();
+        let ring_phys = queue.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
         let desc = unsafe {
@@ -1016,7 +1219,7 @@ impl Ixgbe {
         let replacement = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
         let repl_phys = replacement.dma_addr().raw();
         let filled = {
-            let mut slots = self.rx_slots.lock();
+            let mut slots = queue.rx_slots.lock();
             core::mem::replace(&mut slots[head], replacement)
         };
         let new_desc = RxDesc {
@@ -1035,20 +1238,33 @@ impl Ixgbe {
             );
         }
         compiler_fence(Ordering::SeqCst);
+        let rxq = queues::rx_queue_regs(q).expect("validated queue count is in range");
         // SAFETY: MMIO.
         unsafe {
-            self.mmio.write32(RX_RDT, head as u32);
+            self.mmio.write32(rxq.rdt, head as u32);
         }
-        *head_g = ((head + 1) % RX_RING_LEN) as u32;
+        *head_g = ((head + 1) % ring_len) as u32;
         Some(Frame::new(filled, len as u32))
     }
 
+    /// Whether queue 0 has a completed RX descriptor. See
+    /// [`Self::rx_has_pending_on_queue`].
     pub fn rx_has_pending(&self) -> bool {
+        self.rx_has_pending_on_queue(0)
+    }
+
+    /// Whether RX queue `q` has a completed RX descriptor;
+    /// `false` when `q` is not a configured RX queue.
+    pub fn rx_has_pending_on_queue(&self, q: usize) -> bool {
         if *self.quiesced.lock() {
             return false;
         }
-        let head = (*self.rx_head.lock()) as usize;
-        let ring_phys = self.rx_ring.dma_addr().raw();
+        let queue = match self.rx_queues.get(q) {
+            Some(queue) => queue,
+            None => return false,
+        };
+        let head = (*queue.rx_head.lock()) as usize;
+        let ring_phys = queue.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
         let status = unsafe {
@@ -1109,6 +1325,68 @@ impl Ixgbe {
             })?;
         }
         *self.dcb_cfg.lock() = Some(cfg);
+        Ok(())
+    }
+
+    /// Enable MSI-X with one vector per queue: RX queue `q` and TX
+    /// queue `q` share vector `q` (the Linux q_vector shape), and
+    /// the OTHER cause shares vector 0 with queue 0. Queue causes
+    /// are unmasked via EIMS_EX (Linux `ixgbe_irq_enable_queues`
+    /// for 82599/X540/X550: low qmask word to EIMS_EX(0), high
+    /// word to EIMS_EX(1)); the OTHER cause is unmasked via EIMS
+    /// bit 31 (EIMS_OTHER). EIAM/EIAM_EX0 auto-mask the same
+    /// vector sets. The datapath stays polled — no production path
+    /// consumes these interrupts yet — so this is routing +
+    /// unmasking, not ISR wire-up. Alternative to
+    /// [`Self::enable_msix_vector`] (single shared misc vector);
+    /// do not call both (each owns the full mask state).
+    pub fn enable_msix_queue_vectors(
+        &mut self,
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<(), IxgbeError> {
+        let table = enable_msix(cap, device).map_err(|_| IxgbeError::MsixUnavailable)?;
+        let cfg = self.queue_config;
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            route_all_queue_vectors(&mut bank, &cfg);
+        }
+        let n = cfg.num_tx.max(cfg.num_rx);
+        // Vector masks: low word covers vectors 0..31, high word
+        // 32..63. `n` is 1..=64 (validated), so no shift below
+        // reaches the word width.
+        let low: u32 = if n >= 32 {
+            0xFFFF_FFFF
+        } else {
+            (1u32 << n) - 1
+        };
+        let high: u32 = if n >= 64 {
+            0xFFFF_FFFF
+        } else if n > 32 {
+            (1u32 << (n - 32)) - 1
+        } else {
+            0
+        };
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            // GPIE: enable multiple-MSIX, auto-mask, no EIAME yet
+            // (same bits as the single-vector path).
+            self.mmio.write32(REG_GPIE, (1 << 4) | (1 << 5) | (1 << 6));
+            // EIAM: auto-mask for the routed vectors.
+            self.mmio.write32(REG_EIAM, low);
+            if high != 0 {
+                self.mmio.write32(REG_EIAM_EX0, high);
+            }
+            // Unmask the OTHER cause + the routed queue vectors.
+            self.mmio.write32(REG_EIMS, EIMS_OTHER_CAUSE);
+            if low != 0 {
+                self.mmio.write32(REG_EIMS_EX0, low);
+            }
+            if high != 0 {
+                self.mmio.write32(REG_EIMS_EX1, high);
+            }
+        }
+        self.msix = Some(table);
         Ok(())
     }
 
@@ -1334,49 +1612,63 @@ impl Ixgbe {
         // The rebuild programs cfg.ring_len descriptors per queue
         // into the rings bring-up allocated; a mismatch would
         // over- or under-fill ring memory, so refuse rather than
-        // guess.
-        if cfg.ring_len != TX_RING_LEN || cfg.ring_len != RX_RING_LEN {
-            return Err(IxgbeError::Other(
-                "queue ring length != allocated ring length",
-            ));
+        // guess. Bring-up builds each queue's ring for exactly
+        // cfg.ring_len descriptors, so the per-queue state itself
+        // is the allocated length to check against — not the old
+        // single-ring constants (TX_RING_LEN/RX_RING_LEN were 32)
+        // and not TX_RING_N/RX_RING_N (1024: Frame channel
+        // capacities, a different quantity entirely).
+        if self.tx_queues.len() != cfg.num_tx || self.rx_queues.len() != cfg.num_rx {
+            return Err(IxgbeError::Other("queue count != configured queue count"));
+        }
+        for q in self.tx_queues.iter() {
+            if q.tx_pool.len() != cfg.ring_len {
+                return Err(IxgbeError::Other("tx pool size != ring length"));
+            }
         }
         // A slot-count mismatch means the ring and the slot table
         // disagree; refuse before touching anything rather than
         // arm a descriptor with no backing buffer.
-        if self.rx_slots.lock().len() != RX_RING_LEN {
-            return Err(IxgbeError::Other("rx slot count != ring length"));
+        for q in self.rx_queues.iter() {
+            if q.rx_slots.lock().len() != cfg.ring_len {
+                return Err(IxgbeError::Other("rx slot count != ring length"));
+            }
         }
-        // 1. Zero the TX ring: stale descriptors must not reach
+        // 1. Zero each TX ring: stale descriptors must not reach
         // the device after re-enable.
         // SAFETY: identity-mapped DMA ring page.
         unsafe {
-            for i in 0..(TX_RING_LEN * 16) {
-                core::ptr::write_volatile(self.tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
+            for q in self.tx_queues.iter() {
+                for i in 0..(cfg.ring_len * 16) {
+                    core::ptr::write_volatile(q.tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
+                }
             }
         }
         // 2. Re-arm every RX descriptor from the buffer its slot
         // currently owns (slots rotate as frames are handed up, so
         // the current contents — not the bring-up pool order — are
-        // the truth).
-        let rx_phys = self.rx_ring.dma_addr().raw();
-        {
-            let slots = self.rx_slots.lock();
-            for (i, buf) in slots.iter().enumerate() {
-                let desc = RxDesc {
-                    addr: buf.dma_addr().raw(),
-                    length: 0,
-                    csum: 0,
-                    status: 0,
-                    errors: 0,
-                    special: 0,
-                };
-                // SAFETY: identity-mapped DMA ring page.
-                unsafe {
-                    core::ptr::write_volatile(
-                        narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
-                            .kernel_mut_ptr::<RxDesc>(),
-                        desc,
-                    );
+        // the truth), one queue at a time.
+        for q in self.rx_queues.iter() {
+            let rx_phys = q.rx_ring.dma_addr().raw();
+            {
+                let slots = q.rx_slots.lock();
+                for (i, buf) in slots.iter().enumerate() {
+                    let desc = RxDesc {
+                        addr: buf.dma_addr().raw(),
+                        length: 0,
+                        csum: 0,
+                        status: 0,
+                        errors: 0,
+                        special: 0,
+                    };
+                    // SAFETY: identity-mapped DMA ring page.
+                    unsafe {
+                        core::ptr::write_volatile(
+                            narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
+                                .kernel_mut_ptr::<RxDesc>(),
+                            desc,
+                        );
+                    }
                 }
             }
         }
@@ -1385,16 +1677,33 @@ impl Ixgbe {
         // RX pump's re-arm path).
         compiler_fence(Ordering::SeqCst);
         // 3. Reprogram rings + enables, one entry per queue.
+        // resume_rebuild_plan validates the base counts against
+        // cfg.num_tx / cfg.num_rx itself, so a vector/cfg skew
+        // fails here before any register is written.
         {
+            let tx_bases: Vec<u64> = self
+                .tx_queues
+                .iter()
+                .map(|q| q.tx_ring.dma_addr().raw())
+                .collect();
+            let rx_bases: Vec<u64> = self
+                .rx_queues
+                .iter()
+                .map(|q| q.rx_ring.dma_addr().raw())
+                .collect();
             let mut bank = queues::MmioBank::new(&self.mmio);
-            pm::resume_rebuild_plan(&mut bank, cfg, &[self.tx_ring.dma_addr().raw()], &[rx_phys])
+            pm::resume_rebuild_plan(&mut bank, cfg, &tx_bases, &rx_bases)
                 .map_err(IxgbeError::Other)?;
         }
         // 4. Reset the pump cursors to the rebuilt state, then
         // unquiesce last, so no pump runs against a half-rebuilt
         // ring.
-        *self.tx_tail.lock() = 0;
-        *self.rx_head.lock() = 0;
+        for q in self.tx_queues.iter() {
+            *q.tx_tail.lock() = 0;
+        }
+        for q in self.rx_queues.iter() {
+            *q.rx_head.lock() = 0;
+        }
         *self.quiesced.lock() = false;
         // SAFETY: identity-mapped MMIO.
         let links = unsafe { self.mmio.read32(REG_LINKS) };
@@ -1517,6 +1826,15 @@ impl narf_net::Interface for Ixgbe {
     fn num_tx_queues(&self) -> u16 {
         self.queue_config.num_tx as u16
     }
+    fn queue_affinity(&self, q: u16) -> narf_net::rss::QueueAffinity {
+        // Pumps are spawned unpinned, so every queue reports the
+        // boot CPU; the `irq` field carries this lane's routing
+        // (vector = queue index) for configured queues.
+        narf_net::rss::QueueAffinity {
+            core: 0,
+            irq: queue_vector_for(&self.queue_config, q as usize),
+        }
+    }
     fn rss(&self) -> Option<narf_net::rss::RssConfig> {
         self.rss_config()
     }
@@ -1569,11 +1887,17 @@ impl crate::HwNic for Ixgbe {
     fn num_tx_queues(&self) -> u16 {
         self.queue_config.num_tx as u16
     }
+    fn queue_affinity(&self, q: u16) -> narf_net::rss::QueueAffinity {
+        narf_net::rss::QueueAffinity {
+            core: 0,
+            irq: queue_vector_for(&self.queue_config, q as usize),
+        }
+    }
     fn rss(&self) -> Option<narf_net::rss::RssConfig> {
         self.rss_config()
     }
     fn ring_capacity(&self) -> usize {
-        TX_RING_LEN
+        self.queue_config.ring_len
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         &self.rx_ipc_ring
@@ -1615,6 +1939,13 @@ impl narf_net::Interface for IxgbeNic {
     }
     fn num_tx_queues(&self) -> u16 {
         with_controller(|c| c.queue_config.num_tx as u16).unwrap_or(1)
+    }
+    fn queue_affinity(&self, q: u16) -> narf_net::rss::QueueAffinity {
+        with_controller(|c| narf_net::rss::QueueAffinity {
+            core: 0,
+            irq: queue_vector_for(&c.queue_config, q as usize),
+        })
+        .unwrap_or_default()
     }
     fn rss(&self) -> Option<narf_net::rss::RssConfig> {
         with_controller(|c| c.rss_config()).flatten()
@@ -1823,10 +2154,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         let _ = narf_net::registry().register(&auth, IxgbeNic);
     }
 
-    // No pump spawn here: `bring_up` spawned the device's single RX/TX
-    // pump pair, fed by the channel pair whose halves occupy the
+    // No pump spawn here: `bring_up` spawned the device's per-queue
+    // pump set, fed by the channel pairs whose halves occupy the
     // `rx_ipc_ring`/`tx_ipc_ring` slots (igc's discipline). A second
-    // pair spawned from probe would drain the same descriptor ring
+    // set spawned from probe would drain the same descriptor rings
     // while its mirror sink's consumer is overwritten away — silently
     // losing frames an attached ring consumer must see.
 
@@ -1835,54 +2166,79 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
 fn spawn_pumps(
     device: Arc<Ixgbe>,
-    rx_prod: Producer<Frame, RX_RING_N>,
-    tx_cons: Consumer<Frame, TX_RING_N>,
+    stack_tx_cons: Consumer<Frame, TX_RING_N>,
+    tx_prods: Vec<Producer<Frame, TX_RING_N>>,
+    tx_cons: Vec<Consumer<Frame, TX_RING_N>>,
 ) {
-    let d1 = device.clone();
-    narf_scheduler::spawn(async move {
-        ixgbe_rx_pump(d1, rx_prod).await;
-    });
-
-    let d2 = device;
-    narf_scheduler::spawn(async move {
-        ixgbe_tx_pump(d2, tx_cons).await;
-    });
+    let cfg = device.queue_config;
+    for q in 0..cfg.num_rx {
+        let d = device.clone();
+        // Only queue 0's pump observes the link — one publisher
+        // for carrier transitions, as before.
+        let observe_link = q == 0;
+        narf_scheduler::spawn(async move {
+            ixgbe_rx_pump(d, q, observe_link).await;
+        });
+    }
+    if cfg.num_tx == 1 {
+        // Single TX queue keeps the direct pump: the stack channel
+        // feeds queue 0's pump with no dispatcher hop — the exact
+        // 1/1 topology.
+        let d = device.clone();
+        narf_scheduler::spawn(async move {
+            ixgbe_tx_pump(d, 0, stack_tx_cons).await;
+        });
+    } else {
+        let mut prods = tx_prods;
+        narf_scheduler::spawn(async move {
+            ixgbe_tx_dispatch(stack_tx_cons, &mut prods).await;
+        });
+        for (q, c) in tx_cons.into_iter().enumerate() {
+            let d = device.clone();
+            narf_scheduler::spawn(async move {
+                ixgbe_tx_pump(d, q, c).await;
+            });
+        }
+    }
 }
 
-async fn ixgbe_rx_pump(device: Arc<Ixgbe>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+async fn ixgbe_rx_pump(device: Arc<Ixgbe>, q: usize, observe_link: bool) {
     // Zero-copy (P-F): take the device-filled DMA buffer straight out of the RX
     // descriptor as a Frame (refilling the slot), with no copy through a scratch
     // buffer + freshly-allocated frame.
     //
     // Carrier refresh (issue #791): the datapath is polled — MSI-X is
     // enabled in bring-up but no production path consumes link
-    // interrupts — so this already-running pump is the family's link
-    // observer. It re-reads LINKS each pass and republishes only on a
-    // transition, so `iface` metadata tracks cable pull/replug instead
-    // of staying a probe-time photograph. Seeded from the probe-time
-    // sample so a steady link publishes nothing.
+    // interrupts — so queue 0's already-running pump is the family's
+    // link observer. It re-reads LINKS each pass and republishes only
+    // on a transition, so `iface` metadata tracks cable pull/replug
+    // instead of staying a probe-time photograph. Seeded from the
+    // probe-time sample so a steady link publishes nothing.
     let mut last_sample = ixgbe_link_sample(device.read_links());
     loop {
-        let sample = ixgbe_link_sample(device.read_links());
-        if sample != last_sample {
-            last_sample = sample;
-            crate::publish::publish_link(ixgbe_ifname(), sample);
+        if observe_link {
+            let sample = ixgbe_link_sample(device.read_links());
+            if sample != last_sample {
+                last_sample = sample;
+                crate::publish::publish_link(ixgbe_ifname(), sample);
+            }
         }
-        match device.rx_recv_frame() {
+        match device.rx_recv_frame_on_queue(q) {
             Some(mut frame) => {
                 // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
                 // shape via the shared helper: an attached ring
                 // consumer gets a pristine pre-dispatch copy; the
                 // original goes to the kernel stack in place. The
                 // mirror is non-blocking — a full/closed ring drops
-                // its copy, never the stack's packet.
+                // its copy, never the stack's packet. All RX pumps
+                // fan into the one mirror producer on the device.
                 let name = ixgbe_ifname();
                 crate::publish::dispatch_rx(
                     name,
                     &mut frame,
                     crate::publish::rx_mirror_attached(name),
                     |mirror| {
-                        let _ = rx_prod.try_send(mirror);
+                        let _ = device.rx_mirror.lock().try_send(mirror);
                     },
                 );
             }
@@ -1891,12 +2247,50 @@ async fn ixgbe_rx_pump(device: Arc<Ixgbe>, mut rx_prod: Producer<Frame, RX_RING_
     }
 }
 
-async fn ixgbe_tx_pump(device: Arc<Ixgbe>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+async fn ixgbe_tx_pump(device: Arc<Ixgbe>, q: usize, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     // Zero-copy (P-F): DMA each frame straight out of its own buffer and honor
     // the TxMeta the stack set, instead of copying the payload into a per-slot
     // buffer and forcing plain metadata.
     while let Ok(frame) = tx_cons.recv().await {
-        let _ = device.tx_frame(&frame);
+        let _ = device.tx_frame_on_queue(q, &frame);
+    }
+}
+
+/// Round-robin TX dispatcher for multi-queue setups: moves frames
+/// from the stack-facing channel to per-queue channels, one queue
+/// per frame. No flow steering — queue choice is position, not
+/// hash (RSS steering is `configure_rss`'s job and stays opt-in);
+/// ordering across queues is NOT preserved, matching multi-queue
+/// TX semantics. A full target queue is skipped for the next one;
+/// all-full yields and retries rather than dropping.
+async fn ixgbe_tx_dispatch(
+    mut stack_cons: Consumer<Frame, TX_RING_N>,
+    prods: &mut [Producer<Frame, TX_RING_N>],
+) {
+    let n = prods.len();
+    if n == 0 {
+        return;
+    }
+    let mut next = 0usize;
+    while let Ok(mut frame) = stack_cons.recv().await {
+        // Labeled break, not a `placed` flag: the flag's value correlates
+        // with whether `frame` was moved, which the borrow checker cannot
+        // track across the retry loop (E0382). The moved path exits the
+        // loop outright, so every path that reaches the next retry still
+        // owns `frame` (recovered from Full/Closed).
+        'place: loop {
+            for _ in 0..n {
+                let q = next;
+                next = (next + 1) % n;
+                match prods[q].try_send(frame) {
+                    Ok(()) => break 'place,
+                    Err(TrySendError::Full(f)) | Err(TrySendError::Closed(f)) => {
+                        frame = f;
+                    }
+                }
+            }
+            narf_scheduler::yield_now().await;
+        }
     }
 }
 
