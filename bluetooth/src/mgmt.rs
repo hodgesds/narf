@@ -1,22 +1,35 @@
 //! Linux Bluetooth Management (mgmt) API — the `HCI_CHANNEL_CONTROL` protocol
 //! that `bluetoothd` / `btmgmt` drive adapters through.
 //!
-//! This is a software-contract implementation over the native controller
-//! registry ([`crate::controller`]); real HCI remains hardware-gated. The
-//! read commands (adapter enumeration + info) let userspace discover the
-//! controllers the native stack brought up.
+//! Settings are no longer fiction (issue #815): every set-mode op
+//! issues its HCI command through the controller's transport and
+//! only records the setting once the controller accepts it. When
+//! the controller is powered off, a setting is recorded and applied
+//! on the next power-on (the Linux model, mgmt(7)); power-on runs
+//! HCI_Reset + the event mask + a re-apply of every recorded
+//! HCI-backed setting, so the bitmap and the controller agree.
+//! READ_INFO reports the dev_class / name / short_name the
+//! controller (or userspace, via SET_DEV_CLASS / SET_LOCAL_NAME)
+//! actually holds. Discovery is the landed GAP central initiator
+//! (#1312); pairing is the landed SMP initiator (#888), LE-only
+//! Just Works, with the async Linux completion model (Command
+//! Status now, Command Complete when the pairing finishes).
 //!
 //! Wire format and status codes follow `/usr/src/linux`
 //! `net/bluetooth/mgmt.c` + `include/net/bluetooth/mgmt.h`.
+//! Behavioural notes cite `mgmt(7)` (BlueZ) where the reply or
+//! error shape is not obvious from the header alone.
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::controller;
+use crate::controller::{self, BringupError};
+use crate::opcode as op;
 
 /// `struct mgmt_hdr` size: opcode(le16) + index(le16) + len(le16).
 pub const MGMT_HDR_SIZE: usize = 6;
@@ -36,6 +49,14 @@ const OP_SET_BONDABLE: u16 = 0x0009;
 const OP_SET_LINK_SECURITY: u16 = 0x000a;
 const OP_SET_SSP: u16 = 0x000b;
 const OP_SET_LE: u16 = 0x000d;
+const OP_SET_DEV_CLASS: u16 = 0x000e;
+const OP_SET_LOCAL_NAME: u16 = 0x000f;
+const OP_GET_CONNECTIONS: u16 = 0x0015;
+const OP_PAIR_DEVICE: u16 = 0x0019;
+const OP_UNPAIR_DEVICE: u16 = 0x001b;
+const OP_START_DISCOVERY: u16 = 0x0023;
+const OP_STOP_DISCOVERY: u16 = 0x0024;
+const OP_SET_SCAN_PARAMS: u16 = 0x002c;
 const OP_SET_SECURE_CONN: u16 = 0x002d;
 
 // Events (mgmt.h MGMT_EV_*).
@@ -44,12 +65,41 @@ const EV_CMD_STATUS: u16 = 0x0002;
 const EV_INDEX_ADDED: u16 = 0x0004;
 const EV_INDEX_REMOVED: u16 = 0x0005;
 const EV_NEW_SETTINGS: u16 = 0x0006;
+const EV_CLASS_OF_DEV_CHANGED: u16 = 0x0007;
+const EV_LOCAL_NAME_CHANGED: u16 = 0x0008;
+const EV_DEVICE_FOUND: u16 = 0x0012;
+const EV_DISCOVERING: u16 = 0x0013;
+const EV_DEVICE_UNPAIRED: u16 = 0x0016;
 
-// Status codes (mgmt.h MGMT_STATUS_*).
-const STATUS_SUCCESS: u8 = 0x00;
+// Status codes (mgmt.h MGMT_STATUS_*). The three the pump's
+// pairing-completion hooks report are `pub(crate)`.
+pub(crate) const STATUS_SUCCESS: u8 = 0x00;
 const STATUS_UNKNOWN_COMMAND: u8 = 0x01;
+const STATUS_NOT_CONNECTED: u8 = 0x02;
+const STATUS_FAILED: u8 = 0x03;
+pub(crate) const STATUS_AUTH_FAILED: u8 = 0x05;
+const STATUS_TIMEOUT: u8 = 0x08;
+const STATUS_BUSY: u8 = 0x0a;
+const STATUS_REJECTED: u8 = 0x0b;
+const STATUS_NOT_SUPPORTED: u8 = 0x0c;
 const STATUS_INVALID_PARAMS: u8 = 0x0d;
+pub(crate) const STATUS_DISCONNECTED: u8 = 0x0e;
+const STATUS_NOT_POWERED: u8 = 0x0f;
 const STATUS_INVALID_INDEX: u8 = 0x11;
+const STATUS_ALREADY_PAIRED: u8 = 0x13;
+
+// Address types (mgmt.h `struct mgmt_addr_info`, mgmt(7)).
+const ADDR_BREDR: u8 = 0x00;
+const ADDR_LE_PUBLIC: u8 = 0x01;
+const ADDR_LE_RANDOM: u8 = 0x02;
+
+// Discovery types (mgmt(7) Start Discovery): a bitmask, not an
+// enum — bit 0 BR/EDR, bit 1 LE public, bit 2 LE random.
+const DISC_BREDR: u8 = 0x01;
+const DISC_LE_RANDOM: u8 = 0x04;
+
+// Device Found flags (mgmt.h MGMT_DEV_FOUND_*).
+const DEV_FOUND_NOT_CONNECTABLE: u32 = 0x04;
 
 // Controller settings bitmap (mgmt.h MGMT_SETTING_*).
 const SETTING_POWERED: u32 = 1 << 0;
@@ -69,6 +119,54 @@ const SETTING_SECURE_CONN: u32 = 1 << 11;
 static SETTINGS: IrqSafeSpinLock<BTreeMap<u16, u32>> = IrqSafeSpinLock::new(BTreeMap::new());
 const DEFAULT_SETTINGS: u32 = SETTING_BREDR | SETTING_LE;
 
+/// Active mgmt discovery, keyed by HCI index: the discovery type
+/// byte passed to START_DISCOVERY. The pump's central scan is the
+/// mechanism; this map is the mgmt-level record (it gates
+/// DEVICE_FOUND publication and validates STOP_DISCOVERY).
+static DISCOVERING: IrqSafeSpinLock<BTreeMap<u16, u8>> = IrqSafeSpinLock::new(BTreeMap::new());
+
+/// LE scan parameters recorded by SET_SCAN_PARAMS, keyed by HCI
+/// index: (interval, window) in 0.625 ms units. Used by the next
+/// START_DISCOVERY; unset means the GAP default (30 ms / 30 ms).
+static SCAN_PARAMS: IrqSafeSpinLock<BTreeMap<u16, (u16, u16)>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Pairings started by mgmt PAIR_DEVICE and still awaiting their
+/// async completion: (index, peer `[address_type, bd_addr]`). The
+/// pump clears an entry (and publishes the Command Complete) when
+/// the initiator session ends; responder pairings and direct
+/// `pump::smp_initiate_pairing` calls never create one.
+static PENDING_PAIR: IrqSafeSpinLock<BTreeSet<(u16, [u8; 7])>> =
+    IrqSafeSpinLock::new(BTreeSet::new());
+
+/// Controllers whose local name / Class of Device userspace set via
+/// mgmt (SET_LOCAL_NAME / SET_DEV_CLASS). Power-on re-writes those
+/// stored values after HCI_Reset instead of re-reading the
+/// controller's defaults (mgmt(7): the values "will be remembered
+/// when switching the controller off and back on again").
+static NAME_SET: IrqSafeSpinLock<BTreeSet<u16>> = IrqSafeSpinLock::new(BTreeSet::new());
+static CLASS_SET: IrqSafeSpinLock<BTreeSet<u16>> = IrqSafeSpinLock::new(BTreeSet::new());
+
+/// Controllers whose discoverable was enabled with a timeout
+/// (mgmt(7): a timeout-based discoverable expires when the
+/// controller is powered off). The timeout itself is accepted but
+/// never enforced — there is no mgmt timer yet; see the remainder
+/// note on the issue.
+static DISCOV_TIMEOUT: IrqSafeSpinLock<BTreeSet<u16>> = IrqSafeSpinLock::new(BTreeSet::new());
+
+/// Test-only: drain all mgmt state (settings, discovery, scan
+/// parameters, pending pairings, userspace-set identity).
+#[doc(hidden)]
+pub fn __test_reset() {
+    SETTINGS.lock().clear();
+    DISCOVERING.lock().clear();
+    SCAN_PARAMS.lock().clear();
+    PENDING_PAIR.lock().clear();
+    NAME_SET.lock().clear();
+    CLASS_SET.lock().clear();
+    DISCOV_TIMEOUT.lock().clear();
+}
+
 fn current_settings(index: u16) -> u32 {
     *SETTINGS.lock().entry(index).or_insert(DEFAULT_SETTINGS)
 }
@@ -82,6 +180,600 @@ fn set_setting_bit(index: u16, bit: u32, on: bool) -> u32 {
         *settings &= !bit;
     }
     *settings
+}
+
+/// A mode-setting command (`SET_CONNECTABLE` / `SET_SSP` / …):
+/// validate the index + the mode value, then push the new state to
+/// the controller and record it only once the controller accepts
+/// it. `max_val` is 1 for on/off modes, 2 for limited discoverable
+/// (SET_SECURE_CONN also takes 2, but 0x02 SC-Only is rejected as
+/// NOT_SUPPORTED below — the SMP side cannot enforce it, #818 area).
+///
+/// Couplings, from mgmt(7):
+/// - SET_DISCOVERABLE(on) while connectable is off → REJECTED.
+/// - SET_CONNECTABLE(0) also switches discoverable off (and
+///   expires a discoverable timeout); switching connectable back
+///   on does not restore discoverable.
+/// - When the controller is not powered, the setting is recorded
+///   and applied on the next power-on (no HCI now) — except a
+///   discoverable-with-timeout, which is NOT_POWERED while off.
+/// A failed HCI write leaves the bitmap unchanged and replies
+/// CMD_STATUS with the failure (FAILED, or TIMEOUT when the
+/// Command Complete never arrived).
+fn set_mode(index: u16, opcode: u16, params: &[u8], bit: u32, max_val: u8) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, opcode, STATUS_INVALID_INDEX);
+    }
+    if params.is_empty() || params[0] > max_val {
+        return cmd_status(index, opcode, STATUS_INVALID_PARAMS);
+    }
+    let on = params[0] != 0;
+    if bit == SETTING_SECURE_CONN && params[0] == 2 {
+        // SC-Only mode: valid value, but the SMP side cannot enforce
+        // "Secure Connections only" yet — NOT_SUPPORTED, not a lie.
+        return cmd_status(index, opcode, STATUS_NOT_SUPPORTED);
+    }
+    let current = current_settings(index);
+    if bit == SETTING_DISCOVERABLE && on && current & SETTING_CONNECTABLE == 0 {
+        return cmd_status(index, opcode, STATUS_REJECTED);
+    }
+    // Prospective bitmap, couplings included.
+    let mut new = current;
+    if on {
+        new |= bit;
+    } else {
+        new &= !bit;
+    }
+    if bit == SETTING_CONNECTABLE && !on {
+        new &= !SETTING_DISCOVERABLE;
+    }
+    let powered = current & SETTING_POWERED != 0;
+    if powered {
+        // Issue the HCI first; record only on success.
+        let result = if bit == SETTING_DISCOVERABLE || bit == SETTING_CONNECTABLE {
+            apply_scan_enable(index, new)
+        } else if bit == SETTING_BONDABLE {
+            // Host policy only — no HCI command exists for bondable.
+            Ok(())
+        } else {
+            apply_single_setting(index, bit, on)
+        };
+        if let Err(status) = result {
+            return cmd_status(index, opcode, status);
+        }
+    } else if bit == SETTING_DISCOVERABLE && on && params.len() >= 3 {
+        // Discoverable with a timeout while unpowered → NOT_POWERED
+        // (mgmt(7)). A timeout-less discoverable is recorded like
+        // any other setting.
+        let timeout = u16::from_le_bytes([params[1], params[2]]);
+        if timeout != 0 {
+            return cmd_status(index, opcode, STATUS_NOT_POWERED);
+        }
+    }
+    // Commit the prospective bitmap (the coupling may have changed
+    // two bits) and tell every mgmt socket the new state.
+    {
+        let mut table = SETTINGS.lock();
+        *table.entry(index).or_insert(DEFAULT_SETTINGS) = new;
+    }
+    if bit == SETTING_DISCOVERABLE {
+        if on && params.len() >= 3 && u16::from_le_bytes([params[1], params[2]]) != 0 {
+            DISCOV_TIMEOUT.lock().insert(index);
+        } else {
+            DISCOV_TIMEOUT.lock().remove(&index);
+        }
+    } else if bit == SETTING_CONNECTABLE && !on {
+        // The coupling switched discoverable off: its timeout (if
+        // any) expires with it.
+        DISCOV_TIMEOUT.lock().remove(&index);
+    }
+    narf_filesystem::bluetooth::publish_mgmt_event(&new_settings(index, new));
+    cmd_complete(index, opcode, STATUS_SUCCESS, &new.to_le_bytes())
+}
+
+/// Power the controller on: HCI_Reset, the default event mask, the
+/// identity (re-written when userspace set it, else re-read from
+/// the controller — a reset restores the controller's defaults),
+/// then every HCI-backed setting recorded in the bitmap. Any
+/// failure aborts the power-on; POWERED stays off.
+fn power_on_apply(index: u16) -> Result<(), u8> {
+    issue(index, op::HCI_RESET, &[])?;
+    issue(
+        index,
+        op::HCI_SET_EVENT_MASK,
+        &controller::DEFAULT_EVENT_MASK,
+    )?;
+    let Some(ctrl) = controller(index) else {
+        return Err(STATUS_INVALID_INDEX);
+    };
+    // Identity: re-write what userspace set (and re-announce it),
+    // else re-read what the reset left and refresh the stored copy
+    // (announcing only a change).
+    if NAME_SET.lock().contains(&index) {
+        let info = ctrl.info();
+        issue(index, op::HCI_WRITE_LOCAL_NAME, &info.local_name)?;
+        let mut name249 = [0u8; 249];
+        name249[..248].copy_from_slice(&info.local_name);
+        narf_filesystem::bluetooth::publish_mgmt_event(&local_name_changed(index, &name249));
+    } else {
+        let ret = issue(index, op::HCI_READ_LOCAL_NAME, &[])?;
+        if ret.len() < 249 {
+            return Err(STATUS_FAILED);
+        }
+        let mut name = [0u8; 248];
+        name.copy_from_slice(&ret[1..249]);
+        let old = ctrl.info();
+        let short = old.short_name;
+        if old.local_name != name {
+            let mut name249 = [0u8; 249];
+            name249[..248].copy_from_slice(&name);
+            narf_filesystem::bluetooth::publish_mgmt_event(&local_name_changed(index, &name249));
+        }
+        ctrl.set_local_name(name, short);
+    }
+    if CLASS_SET.lock().contains(&index) {
+        let class = ctrl.info().dev_class;
+        issue(index, op::HCI_WRITE_CLASS_OF_DEVICE, &class)?;
+        narf_filesystem::bluetooth::publish_mgmt_event(&class_of_dev_changed(index, class));
+    } else {
+        let ret = issue(index, op::HCI_READ_CLASS_OF_DEVICE, &[])?;
+        if ret.len() < 4 {
+            return Err(STATUS_FAILED);
+        }
+        let mut class = [0u8; 3];
+        class.copy_from_slice(&ret[1..4]);
+        if ctrl.info().dev_class != class {
+            narf_filesystem::bluetooth::publish_mgmt_event(&class_of_dev_changed(index, class));
+        }
+        ctrl.set_dev_class(class);
+    }
+    // Recorded settings, in one place so power-on and set-mode
+    // cannot drift apart: scan state, then the single settings.
+    let settings = current_settings(index);
+    apply_scan_enable(index, settings)?;
+    apply_single_setting(
+        index,
+        SETTING_LINK_SECURITY,
+        settings & SETTING_LINK_SECURITY != 0,
+    )?;
+    apply_single_setting(index, SETTING_SSP, settings & SETTING_SSP != 0)?;
+    apply_single_setting(index, SETTING_LE, settings & SETTING_LE != 0)?;
+    apply_single_setting(
+        index,
+        SETTING_SECURE_CONN,
+        settings & SETTING_SECURE_CONN != 0,
+    )?;
+    apply_single_setting(
+        index,
+        SETTING_FAST_CONNECTABLE,
+        settings & SETTING_FAST_CONNECTABLE != 0,
+    )?;
+    Ok(())
+}
+
+/// Stop an active mgmt discovery without reporting a failure:
+/// the LE scan must not outlive power-off. Best-effort — the scan
+/// may already be stopped (a connect is in flight, or the pump is
+/// gone); the mgmt state is cleared either way.
+fn stop_discovery_quiet(index: u16) {
+    if let Some(disc_type) = DISCOVERING.lock().remove(&index) {
+        let _ = crate::pump::central_stop_scan(index as usize);
+        narf_filesystem::bluetooth::publish_mgmt_event(&discovering(index, disc_type, false));
+    }
+}
+
+/// The power transition behind SET_POWERED and the HCIDEVUP/DOWN
+/// ioctls. `Ok(settings)` is the post-transition bitmap;
+/// `Err(status)` leaves the bitmap untouched (a failed power-on
+/// keeps POWERED off; a failed power-off never happens — power-off
+/// is host-side state, and its HCI is best-effort).
+fn set_powered_inner(index: u16, on: bool) -> Result<u32, u8> {
+    if (index as usize) >= controller::controller_count() {
+        return Err(STATUS_INVALID_INDEX);
+    }
+    let current = current_settings(index);
+    let powered = current & SETTING_POWERED != 0;
+    if on == powered {
+        return Ok(current);
+    }
+    if on {
+        power_on_apply(index)?;
+        let settings = set_setting_bit(index, SETTING_POWERED, true);
+        narf_filesystem::bluetooth::publish_mgmt_event(&new_settings(index, settings));
+        Ok(settings)
+    } else {
+        stop_discovery_quiet(index);
+        // Quiesce BR/EDR scans; best-effort — there is no HCI
+        // power-off command in Core 5.3, and power-off must succeed
+        // even against a wedged controller.
+        let _ = issue(index, op::HCI_WRITE_SCAN_ENABLE, &[0]);
+        let mut settings = set_setting_bit(index, SETTING_POWERED, false);
+        // A timeout-based discoverable expires on power-off (mgmt(7)).
+        if DISCOV_TIMEOUT.lock().remove(&index) {
+            settings = set_setting_bit(index, SETTING_DISCOVERABLE, false);
+        }
+        narf_filesystem::bluetooth::publish_mgmt_event(&new_settings(index, settings));
+        Ok(settings)
+    }
+}
+
+/// SET_DEV_CLASS (0x000e): `major, minor` (2 bytes). The stored
+/// service byte is kept — the mgmt command carries no service
+/// classes. Powered: write to the controller, store, announce,
+/// reply the 3-byte class. Unpowered: store only; the reply is
+/// 0x000000 and the value is announced on power-on (mgmt(7)).
+fn set_dev_class(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_SET_DEV_CLASS, STATUS_INVALID_INDEX);
+    }
+    if params.len() < 2 {
+        return cmd_status(index, OP_SET_DEV_CLASS, STATUS_INVALID_PARAMS);
+    }
+    let Some(ctrl) = controller(index) else {
+        return cmd_status(index, OP_SET_DEV_CLASS, STATUS_INVALID_INDEX);
+    };
+    let mut class = ctrl.info().dev_class;
+    class[1] = params[0];
+    class[2] = params[1];
+    if current_settings(index) & SETTING_POWERED != 0 {
+        if let Err(status) = issue(index, op::HCI_WRITE_CLASS_OF_DEVICE, &class) {
+            return cmd_status(index, OP_SET_DEV_CLASS, status);
+        }
+        ctrl.set_dev_class(class);
+        CLASS_SET.lock().insert(index);
+        narf_filesystem::bluetooth::publish_mgmt_event(&class_of_dev_changed(index, class));
+    } else {
+        ctrl.set_dev_class(class);
+        CLASS_SET.lock().insert(index);
+        // No event, no HCI: the reply is the zeroed class and the
+        // value is announced when the controller powers on.
+        return cmd_complete(index, OP_SET_DEV_CLASS, STATUS_SUCCESS, &[0, 0, 0]);
+    }
+    cmd_complete(index, OP_SET_DEV_CLASS, STATUS_SUCCESS, &class)
+}
+
+/// SET_LOCAL_NAME (0x000f): 249-byte name + 11-byte short name.
+/// Both must be NUL-terminated (mgmt(7)) or the command is
+/// INVALID_PARAMS. Powered: write to the controller, store,
+/// announce, echo both. Unpowered: store only, echo both, no
+/// HCI/event — the name is announced on power-on.
+fn set_local_name(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_SET_LOCAL_NAME, STATUS_INVALID_INDEX);
+    }
+    if params.len() < MGMT_MAX_NAME_LENGTH + MGMT_MAX_SHORT_NAME_LENGTH {
+        return cmd_status(index, OP_SET_LOCAL_NAME, STATUS_INVALID_PARAMS);
+    }
+    let name = &params[..MGMT_MAX_NAME_LENGTH];
+    let short = &params[MGMT_MAX_NAME_LENGTH..MGMT_MAX_NAME_LENGTH + MGMT_MAX_SHORT_NAME_LENGTH];
+    if name[MGMT_MAX_NAME_LENGTH - 1] != 0 || short[MGMT_MAX_SHORT_NAME_LENGTH - 1] != 0 {
+        return cmd_status(index, OP_SET_LOCAL_NAME, STATUS_INVALID_PARAMS);
+    }
+    let Some(ctrl) = controller(index) else {
+        return cmd_status(index, OP_SET_LOCAL_NAME, STATUS_INVALID_INDEX);
+    };
+    let mut name248 = [0u8; 248];
+    name248.copy_from_slice(&name[..248]);
+    let mut short10 = [0u8; 10];
+    short10.copy_from_slice(&short[..10]);
+    if current_settings(index) & SETTING_POWERED != 0 {
+        if let Err(status) = issue(index, op::HCI_WRITE_LOCAL_NAME, &name248) {
+            return cmd_status(index, OP_SET_LOCAL_NAME, status);
+        }
+        ctrl.set_local_name(name248, short10);
+        NAME_SET.lock().insert(index);
+        let mut name249 = [0u8; 249];
+        name249.copy_from_slice(name);
+        narf_filesystem::bluetooth::publish_mgmt_event(&local_name_changed(index, &name249));
+    } else {
+        ctrl.set_local_name(name248, short10);
+        NAME_SET.lock().insert(index);
+    }
+    // Echo: name (249) + short name (11), exactly as sent.
+    let mut echo = Vec::with_capacity(MGMT_MAX_NAME_LENGTH + MGMT_MAX_SHORT_NAME_LENGTH);
+    echo.extend_from_slice(name);
+    echo.extend_from_slice(short);
+    cmd_complete(index, OP_SET_LOCAL_NAME, STATUS_SUCCESS, &echo)
+}
+
+/// SET_SCAN_PARAMS (0x002c): `interval, window` (LE, 0.625 ms
+/// units). Bounds are the HCI LE scan bounds (§7.8.10):
+/// 0x0004..=0x4000, window ≤ interval. No power gate — the
+/// parameters are stored for the next START_DISCOVERY.
+fn set_scan_params(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_SET_SCAN_PARAMS, STATUS_INVALID_INDEX);
+    }
+    if params.len() < 4 {
+        return cmd_status(index, OP_SET_SCAN_PARAMS, STATUS_INVALID_PARAMS);
+    }
+    let interval = u16::from_le_bytes([params[0], params[1]]);
+    let window = u16::from_le_bytes([params[2], params[3]]);
+    if !(0x0004..=0x4000).contains(&interval)
+        || !(0x0004..=0x4000).contains(&window)
+        || window > interval
+    {
+        return cmd_status(index, OP_SET_SCAN_PARAMS, STATUS_INVALID_PARAMS);
+    }
+    SCAN_PARAMS.lock().insert(index, (interval, window));
+    cmd_complete(index, OP_SET_SCAN_PARAMS, STATUS_SUCCESS, &[])
+}
+
+/// START_DISCOVERY (0x0023): `type` is a bitmask (mgmt(7)):
+/// 0x01 BR/EDR, 0x02 LE public, 0x04 LE random; 0x06 is the
+/// usual LE scan, 0x07 interleaved. Powered-only. BR/EDR and LE
+/// random are NOT_SUPPORTED (Classic inquiry/EIR is lane 1's,
+/// #1315; there is no random-address backend). LE public goes to
+/// the GAP central initiator (#1312) with the stored scan
+/// parameters; a second start while discovering is BUSY.
+fn start_discovery(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_START_DISCOVERY, STATUS_INVALID_INDEX);
+    }
+    if params.is_empty() {
+        return cmd_status(index, OP_START_DISCOVERY, STATUS_INVALID_PARAMS);
+    }
+    let disc_type = params[0];
+    if disc_type == 0 || disc_type > 0x07 {
+        return cmd_status(index, OP_START_DISCOVERY, STATUS_INVALID_PARAMS);
+    }
+    if disc_type & DISC_BREDR != 0 || disc_type & DISC_LE_RANDOM != 0 {
+        return cmd_status(index, OP_START_DISCOVERY, STATUS_NOT_SUPPORTED);
+    }
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return cmd_status(index, OP_START_DISCOVERY, STATUS_NOT_POWERED);
+    }
+    if DISCOVERING.lock().contains_key(&index) {
+        return cmd_status(index, OP_START_DISCOVERY, STATUS_BUSY);
+    }
+    let mut scan_params = crate::gap::ScanParameters::default();
+    if let Some((interval, window)) = SCAN_PARAMS.lock().get(&index).copied() {
+        scan_params.scan_interval = interval;
+        scan_params.scan_window = window;
+    }
+    match crate::pump::central_start_scan(index as usize, scan_params) {
+        Ok(()) => {
+            DISCOVERING.lock().insert(index, disc_type);
+            narf_filesystem::bluetooth::publish_mgmt_event(&discovering(index, disc_type, true));
+            cmd_complete(index, OP_START_DISCOVERY, STATUS_SUCCESS, &[disc_type])
+        }
+        Err(crate::pump::CentralError::NoPump) | Err(crate::pump::CentralError::Transport) => {
+            cmd_status(index, OP_START_DISCOVERY, STATUS_FAILED)
+        }
+        Err(crate::pump::CentralError::WrongPhase) => {
+            cmd_status(index, OP_START_DISCOVERY, STATUS_BUSY)
+        }
+        Err(crate::pump::CentralError::Busy) => cmd_status(index, OP_START_DISCOVERY, STATUS_BUSY),
+    }
+}
+
+/// STOP_DISCOVERY (0x0024): `type` must match the active
+/// discovery. Powered-only. A pump that already stopped the scan
+/// (e.g. a connect is in flight) counts as stopped: the state is
+/// cleared and the reply is still success.
+fn stop_discovery(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_STOP_DISCOVERY, STATUS_INVALID_INDEX);
+    }
+    if params.is_empty() {
+        return cmd_status(index, OP_STOP_DISCOVERY, STATUS_INVALID_PARAMS);
+    }
+    let disc_type = params[0];
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return cmd_status(index, OP_STOP_DISCOVERY, STATUS_NOT_POWERED);
+    }
+    match DISCOVERING.lock().get(&index).copied() {
+        None => cmd_status(index, OP_STOP_DISCOVERY, STATUS_REJECTED),
+        Some(active) if active != disc_type => {
+            cmd_status(index, OP_STOP_DISCOVERY, STATUS_INVALID_PARAMS)
+        }
+        Some(active) => {
+            // WrongPhase here usually means the central is no
+            // longer scanning (a connect took over, or power-off
+            // already stopped it) — treat as already stopped. The
+            // exception is a scan still starting (parameters sent,
+            // enable pending): the disable cannot be issued yet, so
+            // the stop is BUSY and the DISCOVERING record stays —
+            // a retry lands once the scan is up (or fails, and the
+            // phase returns to Idle).
+            match crate::pump::central_stop_scan(index as usize) {
+                Ok(()) | Err(crate::pump::CentralError::NoPump) => {
+                    DISCOVERING.lock().remove(&index);
+                    narf_filesystem::bluetooth::publish_mgmt_event(&discovering(
+                        index, active, false,
+                    ));
+                    cmd_complete(index, OP_STOP_DISCOVERY, STATUS_SUCCESS, &[disc_type])
+                }
+                Err(crate::pump::CentralError::Busy) => {
+                    cmd_status(index, OP_STOP_DISCOVERY, STATUS_BUSY)
+                }
+                Err(crate::pump::CentralError::Transport) => {
+                    cmd_status(index, OP_STOP_DISCOVERY, STATUS_FAILED)
+                }
+                Err(crate::pump::CentralError::WrongPhase) => {
+                    if crate::pump::central_phase(index as usize)
+                        == Some(crate::gap::CentralPhase::ParametersSent)
+                    {
+                        cmd_status(index, OP_STOP_DISCOVERY, STATUS_BUSY)
+                    } else {
+                        DISCOVERING.lock().remove(&index);
+                        narf_filesystem::bluetooth::publish_mgmt_event(&discovering(
+                            index, active, false,
+                        ));
+                        cmd_complete(index, OP_STOP_DISCOVERY, STATUS_SUCCESS, &[disc_type])
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// GET_CONNECTIONS (0x0015): count + one mgmt_addr_info per live
+/// pump connection (mgmt.h `mgmt_rp_get_connections`). Powered-only;
+/// an unattached pump reports an empty list.
+fn get_connections(index: u16) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_GET_CONNECTIONS, STATUS_INVALID_INDEX);
+    }
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return cmd_status(index, OP_GET_CONNECTIONS, STATUS_NOT_POWERED);
+    }
+    let conns = crate::pump::connections(index as usize).unwrap_or_default();
+    let mut data = Vec::with_capacity(2 + 7 * conns.len());
+    data.extend_from_slice(&(conns.len() as u16).to_le_bytes());
+    for conn in conns {
+        data.extend_from_slice(&conn.peer_addr[1..7]);
+        data.push(if conn.le {
+            match conn.peer_addr[0] {
+                0 => ADDR_LE_PUBLIC,
+                _ => ADDR_LE_RANDOM,
+            }
+        } else {
+            ADDR_BREDR
+        });
+    }
+    cmd_complete(index, OP_GET_CONNECTIONS, STATUS_SUCCESS, &data)
+}
+
+/// PAIR_DEVICE (0x0019): `addr (6) + type (1) + io_cap (1)`.
+/// Powered-only; LE setting off → REJECTED. BR/EDR is
+/// NOT_SUPPORTED (no legacy pairing initiator; Classic is lane
+/// 1's, #1315). The initiator only speaks NoInputNoOutput
+/// (Just Works, #888) — any other io_cap is NOT_SUPPORTED, and a
+/// peer that is not connected is NOT_CONNECTED. A bonded peer is
+/// ALREADY_PAIRED. Success is asynchronous per mgmt(7): the reply
+/// is Command Status now, and the Command Complete arrives via
+/// [`pairing_complete`] when the SMP session ends.
+fn pair_device(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_PAIR_DEVICE, STATUS_INVALID_INDEX);
+    }
+    if params.len() < 8 {
+        return cmd_status(index, OP_PAIR_DEVICE, STATUS_INVALID_PARAMS);
+    }
+    let addr_type = params[6];
+    let io_cap = params[7];
+    if addr_type == ADDR_BREDR {
+        return cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_SUPPORTED);
+    }
+    if addr_type != ADDR_LE_PUBLIC && addr_type != ADDR_LE_RANDOM {
+        return cmd_status(index, OP_PAIR_DEVICE, STATUS_INVALID_PARAMS);
+    }
+    if io_cap != crate::smp::IoCapability::NoInputNoOutput as u8 {
+        return cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_SUPPORTED);
+    }
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_POWERED);
+    }
+    if current_settings(index) & SETTING_LE == 0 {
+        return cmd_status(index, OP_PAIR_DEVICE, STATUS_REJECTED);
+    }
+    let mut peer = [0u8; 7];
+    peer[0] = match addr_type {
+        ADDR_LE_PUBLIC => 0,
+        _ => 1,
+    };
+    peer[1..7].copy_from_slice(&params[..6]);
+    match crate::pump::has_bond(index as usize, &peer) {
+        Some(true) => return cmd_status(index, OP_PAIR_DEVICE, STATUS_ALREADY_PAIRED),
+        None => return cmd_status(index, OP_PAIR_DEVICE, STATUS_FAILED),
+        Some(false) => {}
+    }
+    // The SMP initiator takes a connection handle: resolve the
+    // peer first. A peer with no live connection is NOT_CONNECTED
+    // (mgmt pairs an existing connection; connect-then-pair is a
+    // remainder).
+    let conns = match crate::pump::connections(index as usize) {
+        Some(conns) => conns,
+        None => return cmd_status(index, OP_PAIR_DEVICE, STATUS_FAILED),
+    };
+    let Some(handle) = conns.iter().find(|c| c.peer_addr == peer).map(|c| c.handle) else {
+        return cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_CONNECTED);
+    };
+    match crate::pump::smp_initiate_pairing(index as usize, handle) {
+        Some(Ok(())) => {
+            PENDING_PAIR.lock().insert((index, peer));
+            cmd_status(index, OP_PAIR_DEVICE, STATUS_SUCCESS)
+        }
+        Some(Err(crate::pump::SmpInitiateError::AlreadyPairing)) => {
+            cmd_status(index, OP_PAIR_DEVICE, STATUS_BUSY)
+        }
+        Some(Err(crate::pump::SmpInitiateError::UnknownHandle)) => {
+            // Raced: the connection dropped between the snapshot
+            // and the initiation.
+            cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_CONNECTED)
+        }
+        Some(Err(crate::pump::SmpInitiateError::NotLe)) => {
+            cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_SUPPORTED)
+        }
+        None => cmd_status(index, OP_PAIR_DEVICE, STATUS_FAILED),
+    }
+}
+
+/// UNPAIR_DEVICE (0x001b): `addr (6) + type (1) + disconnect (1)`.
+/// Powered-only. Removing a bond is idempotent — an unknown peer
+/// still replies success. `disconnect=1` with a live connection is
+/// NOT_SUPPORTED: there is no host-initiated disconnect backend
+/// (the remainder; the bond itself is left untouched).
+fn unpair_device(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_UNPAIR_DEVICE, STATUS_INVALID_INDEX);
+    }
+    if params.len() < 8 {
+        return cmd_status(index, OP_UNPAIR_DEVICE, STATUS_INVALID_PARAMS);
+    }
+    let addr_type = params[6];
+    let disconnect = params[7];
+    if addr_type != ADDR_BREDR && addr_type != ADDR_LE_PUBLIC && addr_type != ADDR_LE_RANDOM {
+        return cmd_status(index, OP_UNPAIR_DEVICE, STATUS_INVALID_PARAMS);
+    }
+    if disconnect > 1 {
+        return cmd_status(index, OP_UNPAIR_DEVICE, STATUS_INVALID_PARAMS);
+    }
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return cmd_status(index, OP_UNPAIR_DEVICE, STATUS_NOT_POWERED);
+    }
+    // The bond store is keyed by the LE peer `[hci_addr_type,
+    // addr]`; BR/EDR bonds are never stored (no legacy pairing
+    // backend), so a BR/EDR unpair has nothing to forget and must
+    // never touch an LE bond for the same address.
+    let is_le = addr_type != ADDR_BREDR;
+    let mut peer = [0u8; 7];
+    peer[0] = match addr_type {
+        ADDR_LE_PUBLIC => 0,
+        ADDR_LE_RANDOM => 1,
+        _ => 0,
+    };
+    peer[1..7].copy_from_slice(&params[..6]);
+    if disconnect == 1 {
+        let live = crate::pump::connections(index as usize)
+            .map(|conns| {
+                conns.iter().any(|c| {
+                    c.peer_addr[1..7] == params[..6]
+                        && c.le == is_le
+                        && (!is_le || c.peer_addr[0] == peer[0])
+                })
+            })
+            .unwrap_or(false);
+        if live {
+            return cmd_status(index, OP_UNPAIR_DEVICE, STATUS_NOT_SUPPORTED);
+        }
+    }
+    let had_bond = if is_le {
+        crate::pump::forget_bond(index as usize, &peer).unwrap_or(false)
+    } else {
+        false
+    };
+    if had_bond {
+        let mut addr_info = [0u8; 7];
+        addr_info[..6].copy_from_slice(&params[..6]);
+        addr_info[6] = addr_type;
+        narf_filesystem::bluetooth::publish_mgmt_event(&device_unpaired(index, &addr_info));
+    }
+    let mut data = Vec::with_capacity(7);
+    data.extend_from_slice(&params[..6]);
+    data.push(addr_type);
+    cmd_complete(index, OP_UNPAIR_DEVICE, STATUS_SUCCESS, &data)
 }
 
 /// Advertised mgmt protocol version/revision (`MGMT_VERSION` / `MGMT_REVISION`).
@@ -144,33 +836,196 @@ fn read_info_rp(info: &controller::ControllerInfo, current: u32) -> Vec<u8> {
     d.extend_from_slice(&info.manufacturer.to_le_bytes());
     d.extend_from_slice(&SUPPORTED_SETTINGS.to_le_bytes());
     d.extend_from_slice(&current.to_le_bytes());
-    d.extend_from_slice(&[0u8; 3]); // dev_class
-    d.extend_from_slice(&[0u8; MGMT_MAX_NAME_LENGTH]);
-    d.extend_from_slice(&[0u8; MGMT_MAX_SHORT_NAME_LENGTH]);
+    // Real identity, not zeros: the Class of Device and local name
+    // the bring-up read from the controller (or userspace wrote via
+    // SET_DEV_CLASS / SET_LOCAL_NAME). A zeroed field here means the
+    // value was never learned, never a fabricated one.
+    d.extend_from_slice(&info.dev_class);
+    d.extend_from_slice(&info.local_name);
+    d.push(0); // NUL-terminate the 248-byte name into 249 bytes.
+    d.extend_from_slice(&info.short_name);
+    d.push(0); // NUL-terminate the 10-byte short name into 11 bytes.
     d
 }
 
-/// A mode-setting command (`SET_POWERED`/`SET_CONNECTABLE`/…): validate the
-/// index + the `mgmt_mode` value, toggle `bit`, and reply with the new
-/// current-settings bitmap. `max_val` is 1 for on/off modes, 2 for the
-/// limited-discoverable case.
-fn set_mode(index: u16, opcode: u16, params: &[u8], bit: u32, max_val: u8) -> Vec<u8> {
-    if !controller::is_live(index as usize) {
-        return cmd_status(index, opcode, STATUS_INVALID_INDEX);
+/// Map a controller HCI failure onto a mgmt status. A command that
+/// timed out waiting for its Command Complete is TIMEOUT; every
+/// other issuance failure (transport error, bad status, opcode
+/// mismatch) is FAILED.
+fn hci_status(err: &BringupError) -> u8 {
+    match err {
+        BringupError::Transport(crate::transport::TransportError::Timeout) => STATUS_TIMEOUT,
+        _ => STATUS_FAILED,
     }
-    if params.is_empty() || params[0] > max_val {
-        return cmd_status(index, opcode, STATUS_INVALID_PARAMS);
+}
+
+/// Resolve a controller by mgmt index.
+fn controller(index: u16) -> Option<Arc<controller::Controller>> {
+    controller::controllers().get(index as usize).cloned()
+}
+
+/// Issue one HCI command on controller `index` and wait for its
+/// Command Complete. `Err` is the mgmt status to report (see
+/// [`hci_status`]).
+fn issue(index: u16, opcode: u16, params: &[u8]) -> Result<Vec<u8>, u8> {
+    let Some(ctrl) = controller(index) else {
+        return Err(STATUS_INVALID_INDEX);
+    };
+    ctrl.issue_command(opcode, params)
+        .map_err(|e| hci_status(&e))
+}
+
+/// The Write_Scan_Enable byte for a settings bitmap (Core 5.3
+/// §7.3.14): bit 0 inquiry scan (discoverable), bit 1 page scan
+/// (connectable).
+fn scan_enable_byte(settings: u32) -> u8 {
+    let mut byte = 0u8;
+    if settings & SETTING_DISCOVERABLE != 0 {
+        byte |= 0x01;
     }
-    let settings = set_setting_bit(index, bit, params[0] != 0);
-    // Notify every mgmt socket of the new state (MGMT_EV_NEW_SETTINGS). The
-    // requester also gets the CMD_COMPLETE below.
-    narf_filesystem::bluetooth::publish_mgmt_event(&new_settings(index, settings));
-    cmd_complete(index, opcode, STATUS_SUCCESS, &settings.to_le_bytes())
+    if settings & SETTING_CONNECTABLE != 0 {
+        byte |= 0x02;
+    }
+    byte
+}
+
+/// Push a settings bitmap's scan state to the controller
+/// (HCI_Write_Scan_Enable). The discoverable/connectable pair
+/// shares this one command, so both ops (and power-on) go through
+/// here with the *prospective* bitmap.
+fn apply_scan_enable(index: u16, settings: u32) -> Result<(), u8> {
+    issue(
+        index,
+        op::HCI_WRITE_SCAN_ENABLE,
+        &[scan_enable_byte(settings)],
+    )
+    .map(|_| ())
+}
+
+/// Push one HCI-backed single setting to the controller. `bit` is
+/// one of FAST_CONNECTABLE / LINK_SECURITY / SSP / LE /
+/// SECURE_CONN; BONDABLE has no HCI command and never reaches here.
+fn apply_single_setting(index: u16, bit: u32, on: bool) -> Result<(), u8> {
+    let v = on as u8;
+    match bit {
+        SETTING_FAST_CONNECTABLE => {
+            // Interlaced page scan (§7.3.44) when fast-connectable.
+            issue(index, op::HCI_WRITE_PAGE_SCAN_TYPE, &[v]).map(|_| ())
+        }
+        SETTING_LINK_SECURITY => {
+            issue(index, op::HCI_WRITE_AUTHENTICATION_ENABLE, &[v]).map(|_| ())
+        }
+        SETTING_SSP => issue(index, op::HCI_WRITE_SIMPLE_PAIRING_MODE, &[v]).map(|_| ()),
+        SETTING_LE => {
+            // LE_Host_Supported + Simultaneous_LE_Host_Supported
+            // (always 0: no simultaneous LE host, §7.3.66).
+            issue(index, op::HCI_WRITE_LE_HOST_SUPPORT, &[v, 0]).map(|_| ())
+        }
+        SETTING_SECURE_CONN => {
+            issue(index, op::HCI_WRITE_SECURE_CONNECTIONS_HOST_SUPPORT, &[v]).map(|_| ())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// `MGMT_EV_NEW_SETTINGS` carrying the controller's current settings bitmap.
 pub fn new_settings(index: u16, settings: u32) -> Vec<u8> {
     frame(EV_NEW_SETTINGS, index, &settings.to_le_bytes())
+}
+
+/// `MGMT_EV_DISCOVERING`: discovery type + whether discovery is
+/// running (mgmt.h `mgmt_ev_discovering`).
+pub fn discovering(index: u16, disc_type: u8, active: bool) -> Vec<u8> {
+    frame(EV_DISCOVERING, index, &[disc_type, active as u8])
+}
+
+/// `MGMT_EV_CLASS_OF_DEV_CHANGED` carrying the 3-byte class.
+pub fn class_of_dev_changed(index: u16, class: [u8; 3]) -> Vec<u8> {
+    frame(EV_CLASS_OF_DEV_CHANGED, index, &class)
+}
+
+/// `MGMT_EV_LOCAL_NAME_CHANGED` carrying the 249-byte (NUL-ended)
+/// name.
+pub fn local_name_changed(index: u16, name: &[u8; 249]) -> Vec<u8> {
+    frame(EV_LOCAL_NAME_CHANGED, index, name)
+}
+
+/// `MGMT_EV_DEVICE_UNPAIRED` for `addr` (mgmt_addr_info).
+pub fn device_unpaired(index: u16, addr: &[u8; 7]) -> Vec<u8> {
+    frame(EV_DEVICE_UNPAIRED, index, addr)
+}
+
+/// Whether controller `index` has an active mgmt discovery, and its
+/// type byte. The pump consults this before publishing
+/// DEVICE_FOUND for a scan report.
+pub fn discovery_active(index: usize) -> Option<u8> {
+    DISCOVERING.lock().get(&(index as u16)).copied()
+}
+
+/// Publish a `MGMT_EV_DEVICE_FOUND` for one LE advertising report,
+/// when (and only when) an mgmt discovery is active on this
+/// controller. `address_type` / `event_type` are the HCI LE report
+/// values; the frame carries the mgmt addr_info + rssi + flags +
+/// EIR (the report's advertising data, already EIR-formatted).
+pub fn publish_device_found(
+    index: usize,
+    address_type: u8,
+    address: [u8; 6],
+    rssi: i8,
+    event_type: u8,
+    eir: &[u8],
+) {
+    if DISCOVERING.lock().get(&(index as u16)).is_none() {
+        return;
+    }
+    // HCI LE report address type (0 public / 1 random) → mgmt.
+    let mgmt_type = match address_type {
+        0 => ADDR_LE_PUBLIC,
+        _ => ADDR_LE_RANDOM,
+    };
+    // LE Advertising Report event types (§7.7.65.2): 0x00 ADV_IND,
+    // 0x01 ADV_DIRECT_IND, 0x02 ADV_SCAN_IND, 0x03 ADV_NONCONN_IND,
+    // 0x04 SCAN_RSP. Scan-ind and non-connectable reports are the
+    // not-connectable ones.
+    let flags = if event_type == 0x02 || event_type == 0x03 {
+        DEV_FOUND_NOT_CONNECTABLE
+    } else {
+        0
+    };
+    let mut body = Vec::with_capacity(6 + 1 + 1 + 4 + 2 + eir.len());
+    body.extend_from_slice(&address);
+    body.push(mgmt_type);
+    body.push(rssi as u8);
+    body.extend_from_slice(&flags.to_le_bytes());
+    body.extend_from_slice(&(eir.len() as u16).to_le_bytes());
+    body.extend_from_slice(eir);
+    narf_filesystem::bluetooth::publish_mgmt_event(&frame(EV_DEVICE_FOUND, index as u16, &body));
+}
+
+/// Complete a mgmt-initiated pairing: called by the pump when an
+/// initiator session ends. Only a pairing PAIR_DEVICE started (an
+/// entry in PENDING_PAIR) gets a Command Complete — responder
+/// pairings and direct `pump::smp_initiate_pairing` calls do not.
+/// `status` is SUCCESS on a completed pairing, AUTH_FAILED on an
+/// SMP failure, DISCONNECTED when the link died mid-pairing.
+pub fn pairing_complete(index: usize, peer: [u8; 7], status: u8) {
+    if !PENDING_PAIR.lock().remove(&(index as u16, peer)) {
+        return;
+    }
+    // Pending pairings are LE-only (BR/EDR is rejected at
+    // PAIR_DEVICE), so peer[0] is the LE address type.
+    let mut data = Vec::with_capacity(7);
+    data.extend_from_slice(&peer[1..7]);
+    data.push(match peer[0] {
+        0 => ADDR_LE_PUBLIC,
+        _ => ADDR_LE_RANDOM,
+    });
+    narf_filesystem::bluetooth::publish_mgmt_event(&cmd_complete(
+        index as u16,
+        OP_PAIR_DEVICE,
+        status,
+        &data,
+    ));
 }
 
 /// Handle one mgmt command frame (as received on an `HCI_CHANNEL_CONTROL`
@@ -216,6 +1071,14 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
                 OP_SET_LINK_SECURITY,
                 OP_SET_SSP,
                 OP_SET_LE,
+                OP_SET_DEV_CLASS,
+                OP_SET_LOCAL_NAME,
+                OP_GET_CONNECTIONS,
+                OP_PAIR_DEVICE,
+                OP_UNPAIR_DEVICE,
+                OP_START_DISCOVERY,
+                OP_STOP_DISCOVERY,
+                OP_SET_SCAN_PARAMS,
                 OP_SET_SECURE_CONN,
             ];
             let events = [
@@ -224,6 +1087,11 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
                 EV_INDEX_ADDED,
                 EV_INDEX_REMOVED,
                 EV_NEW_SETTINGS,
+                EV_CLASS_OF_DEV_CHANGED,
+                EV_LOCAL_NAME_CHANGED,
+                EV_DEVICE_FOUND,
+                EV_DISCOVERING,
+                EV_DEVICE_UNPAIRED,
             ];
             let mut data = Vec::new();
             data.extend_from_slice(&(ops.len() as u16).to_le_bytes());
@@ -257,7 +1125,22 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
             }
             None => alloc::vec![cmd_status(index, opcode, STATUS_INVALID_INDEX)],
         },
-        OP_SET_POWERED => alloc::vec![set_mode(index, opcode, params, SETTING_POWERED, 1)],
+        OP_SET_POWERED => {
+            if params.is_empty() || params[0] > 1 {
+                return alloc::vec![cmd_status(index, opcode, STATUS_INVALID_PARAMS)];
+            }
+            match set_powered_inner(index, params[0] != 0) {
+                Ok(settings) => {
+                    alloc::vec![cmd_complete(
+                        index,
+                        opcode,
+                        STATUS_SUCCESS,
+                        &settings.to_le_bytes()
+                    )]
+                }
+                Err(status) => alloc::vec![cmd_status(index, opcode, status)],
+            }
+        }
         OP_SET_CONNECTABLE => {
             alloc::vec![set_mode(index, opcode, params, SETTING_CONNECTABLE, 1)]
         }
@@ -271,12 +1154,32 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
         OP_SET_SSP => alloc::vec![set_mode(index, opcode, params, SETTING_SSP, 1)],
         OP_SET_LE => alloc::vec![set_mode(index, opcode, params, SETTING_LE, 1)],
         OP_SET_SECURE_CONN => {
-            alloc::vec![set_mode(index, opcode, params, SETTING_SECURE_CONN, 1)]
+            // Valid values 0x00/0x01/0x02; 0x02 (SC-Only) is rejected
+            // as NOT_SUPPORTED inside set_mode.
+            alloc::vec![set_mode(index, opcode, params, SETTING_SECURE_CONN, 2)]
         }
-        // Limited discoverable (val 2) is accepted; the timeout field is ignored.
         OP_SET_DISCOVERABLE => {
+            // `val (1) + timeout (2)`: val 0x00 with a timeout, and
+            // val 0x02 (limited) without one, are INVALID_PARAMS
+            // (mgmt(7)); the timeout itself is accepted but never
+            // enforced — see DISCOV_TIMEOUT.
+            if params.len() < 3 {
+                return alloc::vec![cmd_status(index, opcode, STATUS_INVALID_PARAMS)];
+            }
+            let timeout = u16::from_le_bytes([params[1], params[2]]);
+            if (params[0] == 0 && timeout != 0) || (params[0] == 2 && timeout == 0) {
+                return alloc::vec![cmd_status(index, opcode, STATUS_INVALID_PARAMS)];
+            }
             alloc::vec![set_mode(index, opcode, params, SETTING_DISCOVERABLE, 2)]
         }
+        OP_SET_DEV_CLASS => alloc::vec![set_dev_class(index, params)],
+        OP_SET_LOCAL_NAME => alloc::vec![set_local_name(index, params)],
+        OP_SET_SCAN_PARAMS => alloc::vec![set_scan_params(index, params)],
+        OP_START_DISCOVERY => alloc::vec![start_discovery(index, params)],
+        OP_STOP_DISCOVERY => alloc::vec![stop_discovery(index, params)],
+        OP_GET_CONNECTIONS => alloc::vec![get_connections(index)],
+        OP_PAIR_DEVICE => alloc::vec![pair_device(index, params)],
+        OP_UNPAIR_DEVICE => alloc::vec![unpair_device(index, params)],
         _ => alloc::vec![cmd_status(index, opcode, STATUS_UNKNOWN_COMMAND)],
     }
 }
@@ -288,9 +1191,12 @@ pub fn is_powered(index: u16) -> bool {
 }
 
 /// Set controller `index`'s powered setting (the legacy HCIDEVUP/HCIDEVDOWN
-/// ioctls map onto the same state as mgmt SET_POWERED).
-pub fn set_powered(index: u16, on: bool) {
-    set_setting_bit(index, SETTING_POWERED, on);
+/// ioctls map onto the same state as mgmt SET_POWERED). Returns
+/// false for an unknown index or a failed transition — the caller
+/// (HCIDEVUP) reports that as an ioctl error instead of claiming
+/// the controller is up.
+pub fn set_powered(index: u16, on: bool) -> bool {
+    set_powered_inner(index, on).is_ok()
 }
 
 /// Forget controller `index`'s settings on detach, so a later
@@ -314,10 +1220,173 @@ pub fn index_removed(index: u16) -> Vec<u8> {
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
+    use crate::event::EventCode;
+    use crate::hci::Event;
+    use crate::transport::LoopbackTransport;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn mgmt_cmd(opcode: u16, index: u16, params: &[u8]) -> Vec<u8> {
         frame(opcode, index, params)
+    }
+
+    /// Command Complete event for `opcode` (`ret` follows the
+    /// status byte, as on the wire).
+    fn cc(opcode: u16, status: u8, ret: &[u8]) -> Event {
+        let mut params = alloc::vec![0x01u8];
+        params.extend_from_slice(&opcode.to_le_bytes());
+        params.push(status);
+        params.extend_from_slice(ret);
+        Event {
+            code: EventCode::CommandComplete as u8,
+            params,
+        }
+    }
+
+    /// Enqueue the Command Completes a power-on consumes, in order
+    /// (Reset, Set Event Mask, identity, then the six setting
+    /// writes). The identity is re-read (`rewrite_* = false`,
+    /// `name`/`class` are what the reads return) or re-written
+    /// (`rewrite_* = true`, the write's CC is enqueued instead)
+    /// depending on whether userspace set it.
+    fn enqueue_power_on_ccs(
+        lt: &LoopbackTransport,
+        name: &[u8; 248],
+        class: &[u8; 3],
+        rewrite_name: bool,
+        rewrite_class: bool,
+    ) {
+        lt.enqueue_event(cc(op::HCI_RESET, 0, &[]));
+        lt.enqueue_event(cc(op::HCI_SET_EVENT_MASK, 0, &[]));
+        if rewrite_name {
+            lt.enqueue_event(cc(op::HCI_WRITE_LOCAL_NAME, 0, &[]));
+        } else {
+            lt.enqueue_event(cc(op::HCI_READ_LOCAL_NAME, 0, name));
+        }
+        if rewrite_class {
+            lt.enqueue_event(cc(op::HCI_WRITE_CLASS_OF_DEVICE, 0, &[]));
+        } else {
+            lt.enqueue_event(cc(op::HCI_READ_CLASS_OF_DEVICE, 0, class));
+        }
+        lt.enqueue_event(cc(op::HCI_WRITE_SCAN_ENABLE, 0, &[]));
+        lt.enqueue_event(cc(op::HCI_WRITE_AUTHENTICATION_ENABLE, 0, &[]));
+        lt.enqueue_event(cc(op::HCI_WRITE_SIMPLE_PAIRING_MODE, 0, &[]));
+        lt.enqueue_event(cc(op::HCI_WRITE_LE_HOST_SUPPORT, 0, &[]));
+        lt.enqueue_event(cc(op::HCI_WRITE_SECURE_CONNECTIONS_HOST_SUPPORT, 0, &[]));
+        lt.enqueue_event(cc(op::HCI_WRITE_PAGE_SCAN_TYPE, 0, &[]));
+    }
+
+    /// Enqueue the Command Complete a power-off consumes (the
+    /// best-effort Write_Scan_Enable quiesce).
+    fn enqueue_power_off_cc(lt: &LoopbackTransport) {
+        lt.enqueue_event(cc(op::HCI_WRITE_SCAN_ENABLE, 0, &[]));
+    }
+
+    /// Fresh controller + mgmt state for a fixture: registers `info`
+    /// on a LoopbackTransport and returns the transport (for
+    /// scripting CCs and reading sent commands) and the mgmt index.
+    /// The pump is reset too, so the slot `register_ready_transport`
+    /// creates is fresh.
+    fn setup_controller(info: controller::ControllerInfo) -> (Arc<LoopbackTransport>, u16) {
+        crate::transport::__test_reset();
+        controller::__test_reset_controllers();
+        crate::pump::__test_reset();
+        __test_reset();
+        CAPTURED.lock().clear();
+        let lb = Arc::new(LoopbackTransport::new("mgmt-fixture"));
+        let transport: Arc<dyn crate::transport::HciTransport> = lb.clone();
+        crate::transport::register(transport.clone());
+        let index = controller::register_ready_transport(transport, info) as u16;
+        (lb, index)
+    }
+
+    fn cleanup_mgmt() {
+        crate::transport::__test_reset();
+        controller::__test_reset_controllers();
+        crate::pump::__test_reset();
+        __test_reset();
+        CAPTURED.lock().clear();
+    }
+
+    /// Power `index` on (enqueueing the CCs first) and check the
+    /// reply is CMD_COMPLETE/SUCCESS with POWERED set.
+    fn power_on(
+        lt: &LoopbackTransport,
+        index: u16,
+        name: &[u8; 248],
+        class: &[u8; 3],
+        rewrite_name: bool,
+        rewrite_class: bool,
+    ) -> bool {
+        enqueue_power_on_ccs(lt, name, class, rewrite_name, rewrite_class);
+        let r = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
+        is_cmd_complete(&r, OP_SET_POWERED, STATUS_SUCCESS)
+            && u32::from_le_bytes([r[0][9], r[0][10], r[0][11], r[0][12]]) & SETTING_POWERED != 0
+    }
+
+    /// True when `reply` is a single CMD_COMPLETE for `opcode` with
+    /// `status`.
+    fn is_cmd_complete(reply: &[Vec<u8>], opcode: u16, status: u8) -> bool {
+        reply.len() == 1
+            && reply[0].len() >= 9
+            && u16::from_le_bytes([reply[0][0], reply[0][1]]) == EV_CMD_COMPLETE
+            && u16::from_le_bytes([reply[0][6], reply[0][7]]) == opcode
+            && reply[0][8] == status
+    }
+
+    /// True when `reply` is a single CMD_STATUS for `opcode` with
+    /// `status`.
+    fn is_cmd_status(reply: &[Vec<u8>], opcode: u16, status: u8) -> bool {
+        reply.len() == 1
+            && reply[0].len() >= 9
+            && u16::from_le_bytes([reply[0][0], reply[0][1]]) == EV_CMD_STATUS
+            && u16::from_le_bytes([reply[0][6], reply[0][7]]) == opcode
+            && reply[0][8] == status
+    }
+
+    /// LE Connection Complete (LeMeta 0x01) for `peer`, role
+    /// Peripheral (we accepted) — the pump tracks it as an LE
+    /// connection.
+    fn le_conn_complete_event(handle: u16, peer: [u8; 6]) -> Event {
+        let mut params = alloc::vec![0x01, 0x00];
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.push(0x01); // role: Peripheral
+        params.push(0x00); // peer address type: public
+        params.extend_from_slice(&peer);
+        params.extend_from_slice(&0x0028u16.to_le_bytes());
+        params.extend_from_slice(&0u16.to_le_bytes());
+        params.extend_from_slice(&0x01F4u16.to_le_bytes());
+        params.push(0x00); // central clock accuracy
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
+    /// Disconnection Complete (§7.7.5): status, handle, reason
+    /// (0x13 Remote User Terminated Connection).
+    fn disconnection_complete_event(handle: u16) -> Event {
+        Event {
+            code: EventCode::DisconnectionComplete as u8,
+            params: alloc::vec![0x00, (handle & 0xFF) as u8, (handle >> 8) as u8, 0x13],
+        }
+    }
+
+    /// LE Advertising Report (LeMeta 0x02) with one ADV_IND report.
+    fn le_advertising_report_event(peer: [u8; 6], data: &[u8], rssi: i8) -> Event {
+        let mut params = alloc::vec![
+            crate::event::LeSubevent::AdvertisingReport as u8,
+            0x01, // num_reports
+            0x00, // event_type: ADV_IND
+            0x00, // address_type: public
+        ];
+        params.extend_from_slice(&peer);
+        params.push(data.len() as u8);
+        params.extend_from_slice(data);
+        params.push(rssi as u8);
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
     }
 
     fn smoke_mgmt_read_version() -> TestResult {
@@ -378,10 +1447,11 @@ mod tests {
 
         crate::transport::__test_reset();
         controller::__test_reset_controllers();
-        SETTINGS.lock().clear();
+        crate::pump::__test_reset();
+        __test_reset();
 
-        let transport: Arc<dyn crate::transport::HciTransport> =
-            Arc::new(LoopbackTransport::new("mgmt-set"));
+        let lb = Arc::new(LoopbackTransport::new("mgmt-set"));
+        let transport: Arc<dyn crate::transport::HciTransport> = lb.clone();
         crate::transport::register(transport.clone());
         let index =
             controller::register_ready_transport(transport, controller::ControllerInfo::default())
@@ -390,10 +1460,15 @@ mod tests {
         let cleanup = || {
             crate::transport::__test_reset();
             controller::__test_reset_controllers();
-            SETTINGS.lock().clear();
+            crate::pump::__test_reset();
+            __test_reset();
         };
 
         // SET_POWERED(1) → CMD_COMPLETE carrying the new settings with POWERED.
+        // Power-on issues real HCI now (issue #815): the CCs are
+        // scripted first (identity re-reads return zeros, matching
+        // the default ControllerInfo).
+        enqueue_power_on_ccs(&lb, &[0u8; 248], &[0u8; 3], false, false);
         let on = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
         let r = &on[0];
         let powered_on = u16::from_le_bytes([r[0], r[1]]) == EV_CMD_COMPLETE
@@ -408,6 +1483,7 @@ mod tests {
         let info_powered = current & SETTING_POWERED != 0;
 
         // SET_POWERED(0) clears it.
+        enqueue_power_off_cc(&lb);
         let off = handle(&mgmt_cmd(OP_SET_POWERED, index, &[0]));
         let o = &off[0];
         let powered_off = u32::from_le_bytes([o[9], o[10], o[11], o[12]]) & SETTING_POWERED == 0;
@@ -447,13 +1523,14 @@ mod tests {
 
         crate::transport::__test_reset();
         controller::__test_reset_controllers();
-        SETTINGS.lock().clear();
+        crate::pump::__test_reset();
+        __test_reset();
         CAPTURED.lock().clear();
         let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
 
         // Registering a controller publishes MGMT_EV_INDEX_ADDED.
-        let transport: Arc<dyn crate::transport::HciTransport> =
-            Arc::new(LoopbackTransport::new("mgmt-ev"));
+        let lb = Arc::new(LoopbackTransport::new("mgmt-ev"));
+        let transport: Arc<dyn crate::transport::HciTransport> = lb.clone();
         crate::transport::register(transport.clone());
         let index =
             controller::register_ready_transport(transport, controller::ControllerInfo::default())
@@ -465,7 +1542,9 @@ mod tests {
         });
 
         // SET_POWERED publishes MGMT_EV_NEW_SETTINGS with the POWERED bit.
+        // (Power-on issues real HCI now: script its CCs first.)
         CAPTURED.lock().clear();
+        enqueue_power_on_ccs(&lb, &[0u8; 248], &[0u8; 3], false, false);
         let _ = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
         let saw_new_settings = CAPTURED.lock().iter().any(|e| {
             e.len() >= 10
@@ -480,7 +1559,8 @@ mod tests {
         }
         crate::transport::__test_reset();
         controller::__test_reset_controllers();
-        SETTINGS.lock().clear();
+        crate::pump::__test_reset();
+        __test_reset();
 
         if !saw_index_added {
             return TestResult::Fail("INDEX_ADDED was not published on controller registration");
@@ -491,4 +1571,507 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/mgmt", smoke_mgmt_event_fanout);
+
+    /// #815: READ_INFO reports the controller's real identity — the
+    /// dev_class and name the bring-up read (or userspace wrote),
+    /// not zeros. A controller that never learned a name reports
+    /// zeros: truthful, never fabricated.
+    fn smoke_mgmt_read_info_real_identity() -> TestResult {
+        let mut name = [0u8; 248];
+        name[..9].copy_from_slice(b"narf-mgmt");
+        let mut short = [0u8; 10];
+        short[..4].copy_from_slice(b"narf");
+        let info = controller::ControllerInfo {
+            bd_addr: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+            dev_class: [0x04, 0x0C, 0x02],
+            local_name: name,
+            short_name: short,
+            ..controller::ControllerInfo::default()
+        };
+        let (_lt, index) = setup_controller(info);
+        let r = handle(&mgmt_cmd(OP_READ_INFO, index, &[]));
+        let f = &r[0];
+        // Frame: [ev(2), index(2), len(2), opcode(2), status(1),
+        // bd_addr(6), version(1), manufacturer(2), supported(4),
+        // current(4), dev_class(3), name(249), short_name(11)].
+        let ok = is_cmd_complete(&r, OP_READ_INFO, STATUS_SUCCESS)
+            && f[9..15] == [0x11, 0x22, 0x33, 0x44, 0x55, 0x66][..]
+            && f[26..29] == [0x04, 0x0C, 0x02][..]
+            && f[29..38] == b"narf-mgmt"[..]
+            && f[278..282] == b"narf"[..];
+        let (_lt2, index2) = setup_controller(controller::ControllerInfo::default());
+        let r2 = handle(&mgmt_cmd(OP_READ_INFO, index2, &[]));
+        let g = &r2[0];
+        let zero_ok = g[26..29] == [0, 0, 0][..] && g[29..278].iter().all(|b| *b == 0);
+        cleanup_mgmt();
+        if !ok {
+            return TestResult::Fail("READ_INFO did not report the real dev_class/name");
+        }
+        if !zero_ok {
+            return TestResult::Fail("READ_INFO on a default controller was not zeroed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_read_info_real_identity);
+
+    /// #815: set-mode ops issue their HCI commands and record the
+    /// setting only once the controller accepts it; a failed HCI
+    /// write leaves the bitmap unchanged. While unpowered a setting
+    /// is recorded with no HCI and programmed on the next power-on.
+    fn smoke_mgmt_set_mode_issues_hci() -> TestResult {
+        let (lt, index) = setup_controller(controller::ControllerInfo::default());
+        let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
+        // SET_CONNECTABLE(1) → WRITE_SCAN_ENABLE [0x02] (page only).
+        let r = handle(&mgmt_cmd(OP_SET_CONNECTABLE, index, &[1]));
+        let conn_ok = is_cmd_complete(&r, OP_SET_CONNECTABLE, STATUS_SUCCESS);
+        let scan_conn = lt
+            .sent_commands()
+            .last()
+            .map(|c| c.opcode == op::HCI_WRITE_SCAN_ENABLE && c.params == [0x02])
+            .unwrap_or(false);
+        // SET_SSP(1) → WRITE_SIMPLE_PAIRING_MODE [0x01].
+        let r = handle(&mgmt_cmd(OP_SET_SSP, index, &[1]));
+        let ssp_ok = is_cmd_complete(&r, OP_SET_SSP, STATUS_SUCCESS);
+        let ssp_sent = lt
+            .sent_commands()
+            .last()
+            .map(|c| c.opcode == op::HCI_WRITE_SIMPLE_PAIRING_MODE && c.params == [0x01])
+            .unwrap_or(false);
+        // SET_DISCOVERABLE(1, timeout 0) → WRITE_SCAN_ENABLE [0x03].
+        let r = handle(&mgmt_cmd(OP_SET_DISCOVERABLE, index, &[1, 0, 0]));
+        let disc_ok = is_cmd_complete(&r, OP_SET_DISCOVERABLE, STATUS_SUCCESS);
+        let scan_both = lt
+            .sent_commands()
+            .last()
+            .map(|c| c.opcode == op::HCI_WRITE_SCAN_ENABLE && c.params == [0x03])
+            .unwrap_or(false);
+        // SET_CONNECTABLE(0) also switches discoverable off:
+        // WRITE_SCAN_ENABLE [0x00].
+        let r = handle(&mgmt_cmd(OP_SET_CONNECTABLE, index, &[0]));
+        let conn_off_ok = is_cmd_complete(&r, OP_SET_CONNECTABLE, STATUS_SUCCESS);
+        let scan_none = lt
+            .sent_commands()
+            .last()
+            .map(|c| c.opcode == op::HCI_WRITE_SCAN_ENABLE && c.params == [0x00])
+            .unwrap_or(false);
+        // HCI failure: a refused Write_Authentication_Enable leaves
+        // LINK_SECURITY clear in the bitmap.
+        lt.enqueue_event(cc(op::HCI_WRITE_AUTHENTICATION_ENABLE, 0x0C, &[]));
+        let bad = handle(&mgmt_cmd(OP_SET_LINK_SECURITY, index, &[1]));
+        let fail_ok = is_cmd_status(&bad, OP_SET_LINK_SECURITY, STATUS_FAILED);
+        let info = handle(&mgmt_cmd(OP_READ_INFO, index, &[]));
+        let current = u32::from_le_bytes([info[0][22], info[0][23], info[0][24], info[0][25]]);
+        let bit_unchanged = current & SETTING_LINK_SECURITY == 0;
+        // Unpowered: SET_SSP is recorded with no HCI, and the
+        // recorded value is programmed on the next power-on.
+        enqueue_power_off_cc(&lt);
+        let _ = handle(&mgmt_cmd(OP_SET_POWERED, index, &[0]));
+        let sent_before = lt.sent_commands().len();
+        let r = handle(&mgmt_cmd(OP_SET_SSP, index, &[1]));
+        let recorded = is_cmd_complete(&r, OP_SET_SSP, STATUS_SUCCESS)
+            && lt.sent_commands().len() == sent_before;
+        let powered2 = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
+        let ssp_applied = lt.sent_commands()[sent_before..]
+            .iter()
+            .any(|c| c.opcode == op::HCI_WRITE_SIMPLE_PAIRING_MODE && c.params == [0x01]);
+        cleanup_mgmt();
+        if !powered || !powered2 {
+            return TestResult::Fail("power-on failed");
+        }
+        if !conn_ok || !scan_conn {
+            return TestResult::Fail("SET_CONNECTABLE did not issue WRITE_SCAN_ENABLE [0x02]");
+        }
+        if !ssp_ok || !ssp_sent {
+            return TestResult::Fail("SET_SSP did not issue WRITE_SIMPLE_PAIRING_MODE [0x01]");
+        }
+        if !disc_ok || !scan_both {
+            return TestResult::Fail("SET_DISCOVERABLE did not issue WRITE_SCAN_ENABLE [0x03]");
+        }
+        if !conn_off_ok || !scan_none {
+            return TestResult::Fail("SET_CONNECTABLE(0) did not clear discoverable (scan [0x00])");
+        }
+        if !fail_ok || !bit_unchanged {
+            return TestResult::Fail("failed HCI write changed the settings bitmap");
+        }
+        if !recorded {
+            return TestResult::Fail("unpowered SET_SSP issued HCI instead of recording");
+        }
+        if !ssp_applied {
+            return TestResult::Fail("recorded SSP was not programmed on power-on");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_set_mode_issues_hci);
+
+    /// #815: settings recorded while unpowered are programmed on
+    /// power-on, in order; discoverable while connectable is off
+    /// is REJECTED; a power-on whose Reset is refused fails closed
+    /// (POWERED stays off).
+    fn smoke_mgmt_set_powered_reapplies_settings() -> TestResult {
+        let (lt, index) = setup_controller(controller::ControllerInfo::default());
+        let rej = handle(&mgmt_cmd(OP_SET_DISCOVERABLE, index, &[1, 0, 0]));
+        let rejected = is_cmd_status(&rej, OP_SET_DISCOVERABLE, STATUS_REJECTED);
+        let _ = handle(&mgmt_cmd(OP_SET_CONNECTABLE, index, &[1]));
+        let _ = handle(&mgmt_cmd(OP_SET_DISCOVERABLE, index, &[1, 0, 0]));
+        let _ = handle(&mgmt_cmd(OP_SET_SSP, index, &[1]));
+        let _ = handle(&mgmt_cmd(OP_SET_LINK_SECURITY, index, &[1]));
+        let recorded_quiet = lt.sent_commands().is_empty();
+        let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
+        let sent = lt.sent_commands();
+        let want: [(u16, &[u8]); 10] = [
+            (op::HCI_RESET, &[]),
+            (
+                op::HCI_SET_EVENT_MASK,
+                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00],
+            ),
+            (op::HCI_READ_LOCAL_NAME, &[]),
+            (op::HCI_READ_CLASS_OF_DEVICE, &[]),
+            (op::HCI_WRITE_SCAN_ENABLE, &[0x03]),
+            (op::HCI_WRITE_AUTHENTICATION_ENABLE, &[0x01]),
+            (op::HCI_WRITE_SIMPLE_PAIRING_MODE, &[0x01]),
+            (op::HCI_WRITE_LE_HOST_SUPPORT, &[0x01, 0x00]),
+            (op::HCI_WRITE_SECURE_CONNECTIONS_HOST_SUPPORT, &[0x00]),
+            (op::HCI_WRITE_PAGE_SCAN_TYPE, &[0x00]),
+        ];
+        let order_ok = sent.len() == want.len()
+            && sent
+                .iter()
+                .zip(want.iter())
+                .all(|(c, (o, p))| c.opcode == *o && c.params.as_slice() == *p);
+        cleanup_mgmt();
+        let (lt2, index2) = setup_controller(controller::ControllerInfo::default());
+        lt2.enqueue_event(cc(op::HCI_RESET, 0x0C, &[]));
+        let failed = handle(&mgmt_cmd(OP_SET_POWERED, index2, &[1]));
+        let failed_closed = is_cmd_status(&failed, OP_SET_POWERED, STATUS_FAILED);
+        let info = handle(&mgmt_cmd(OP_READ_INFO, index2, &[]));
+        let current = u32::from_le_bytes([info[0][22], info[0][23], info[0][24], info[0][25]]);
+        let still_off = current & SETTING_POWERED == 0;
+        cleanup_mgmt();
+        if !rejected {
+            return TestResult::Fail("SET_DISCOVERABLE with connectable off was not REJECTED");
+        }
+        if !recorded_quiet {
+            return TestResult::Fail("unpowered settings issued HCI");
+        }
+        if !powered || !order_ok {
+            return TestResult::Fail("power-on did not program the recorded settings in order");
+        }
+        if !failed_closed || !still_off {
+            return TestResult::Fail("refused power-on did not fail closed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_set_powered_reapplies_settings);
+
+    /// #815: SET_DEV_CLASS / SET_LOCAL_NAME write the controller
+    /// while powered (announcing the change), store with no HCI
+    /// while unpowered (zeroed class reply), and are re-written —
+    /// not re-read — on the next power-on.
+    fn smoke_mgmt_set_dev_class_and_local_name() -> TestResult {
+        let mut name = [0u8; 248];
+        name[..9].copy_from_slice(b"narf-mgmt");
+        let info = controller::ControllerInfo {
+            dev_class: [0x04, 0x0C, 0x02],
+            local_name: name,
+            ..controller::ControllerInfo::default()
+        };
+        let (lt, index) = setup_controller(info);
+        let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
+        let powered = power_on(&lt, index, &name, &[0x04, 0x0C, 0x02], false, false);
+        CAPTURED.lock().clear();
+        let r = handle(&mgmt_cmd(OP_SET_DEV_CLASS, index, &[0x0C, 0x02]));
+        let class_ok = is_cmd_complete(&r, OP_SET_DEV_CLASS, STATUS_SUCCESS)
+            && r[0][9..12] == [0x04, 0x0C, 0x02][..];
+        let wrote_class = lt
+            .sent_commands()
+            .iter()
+            .any(|c| c.opcode == op::HCI_WRITE_CLASS_OF_DEVICE && c.params == [0x04, 0x0C, 0x02]);
+        let announced_class = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 9
+                && u16::from_le_bytes([e[0], e[1]]) == EV_CLASS_OF_DEV_CHANGED
+                && e[6..9] == [0x04, 0x0C, 0x02][..]
+        });
+        let mut params = [0u8; 260];
+        params[..12].copy_from_slice(b"narf-renamed");
+        params[249..253].copy_from_slice(b"narf");
+        CAPTURED.lock().clear();
+        let r = handle(&mgmt_cmd(OP_SET_LOCAL_NAME, index, &params));
+        let name_ok = is_cmd_complete(&r, OP_SET_LOCAL_NAME, STATUS_SUCCESS)
+            && r[0][9..21] == b"narf-renamed"[..]
+            && r[0][258..262] == b"narf"[..];
+        let wrote_name = lt
+            .sent_commands()
+            .iter()
+            .any(|c| c.opcode == op::HCI_WRITE_LOCAL_NAME && c.params[..12] == b"narf-renamed"[..]);
+        let announced_name = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 6 + 249
+                && u16::from_le_bytes([e[0], e[1]]) == EV_LOCAL_NAME_CHANGED
+                && e[6..18] == b"narf-renamed"[..]
+        });
+        let mut bad_params = [0u8; 260];
+        bad_params[..249].fill(b'x');
+        let bad = handle(&mgmt_cmd(OP_SET_LOCAL_NAME, index, &bad_params));
+        let bad_rejected = is_cmd_status(&bad, OP_SET_LOCAL_NAME, STATUS_INVALID_PARAMS);
+        enqueue_power_off_cc(&lt);
+        let _ = handle(&mgmt_cmd(OP_SET_POWERED, index, &[0]));
+        let sent_before = lt.sent_commands().len();
+        CAPTURED.lock().clear();
+        let r = handle(&mgmt_cmd(OP_SET_DEV_CLASS, index, &[0x08, 0x01]));
+        let unpowered_class = is_cmd_complete(&r, OP_SET_DEV_CLASS, STATUS_SUCCESS)
+            && r[0][9..12] == [0, 0, 0][..]
+            && lt.sent_commands().len() == sent_before
+            && CAPTURED.lock().is_empty();
+        let r = handle(&mgmt_cmd(OP_SET_LOCAL_NAME, index, &params));
+        let unpowered_name = is_cmd_complete(&r, OP_SET_LOCAL_NAME, STATUS_SUCCESS)
+            && lt.sent_commands().len() == sent_before;
+        let powered2 = power_on(&lt, index, &[0u8; 248], &[0u8; 3], true, true);
+        let rewrote = lt.sent_commands()[sent_before..]
+            .iter()
+            .any(|c| c.opcode == op::HCI_WRITE_LOCAL_NAME && c.params[..12] == b"narf-renamed"[..])
+            && lt.sent_commands()[sent_before..].iter().any(|c| {
+                c.opcode == op::HCI_WRITE_CLASS_OF_DEVICE && c.params == [0x04, 0x08, 0x01]
+            });
+        let info = handle(&mgmt_cmd(OP_READ_INFO, index, &[]));
+        let read_back =
+            info[0][26..29] == [0x04, 0x08, 0x01][..] && info[0][29..41] == b"narf-renamed"[..];
+        if let Some(prev) = previous {
+            narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+        }
+        cleanup_mgmt();
+        if !powered || !powered2 {
+            return TestResult::Fail("power-on failed");
+        }
+        if !class_ok || !wrote_class || !announced_class {
+            return TestResult::Fail("powered SET_DEV_CLASS did not write + announce + reply");
+        }
+        if !name_ok || !wrote_name || !announced_name {
+            return TestResult::Fail("powered SET_LOCAL_NAME did not write + announce + echo");
+        }
+        if !bad_rejected {
+            return TestResult::Fail("unterminated SET_LOCAL_NAME was not INVALID_PARAMS");
+        }
+        if !unpowered_class || !unpowered_name {
+            return TestResult::Fail(
+                "unpowered SET_DEV_CLASS/SET_LOCAL_NAME issued HCI or an event",
+            );
+        }
+        if !rewrote || !read_back {
+            return TestResult::Fail("stored name/class were not re-written on power-on");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_set_dev_class_and_local_name);
+
+    /// #815: START_DISCOVERY drives the GAP central scan
+    /// (parameters → enable → reports → disable), with
+    /// DISCOVERING / DEVICE_FOUND published; a stop while the scan
+    /// is still starting is BUSY; reports after the stop are dropped.
+    fn smoke_mgmt_discovery_start_stop() -> TestResult {
+        let (lt, index) = setup_controller(controller::ControllerInfo::default());
+        let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
+        let np = handle(&mgmt_cmd(OP_START_DISCOVERY, index, &[0x02]));
+        let not_powered = is_cmd_status(&np, OP_START_DISCOVERY, STATUS_NOT_POWERED);
+        let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
+        let bad0 = handle(&mgmt_cmd(OP_START_DISCOVERY, index, &[0x00]));
+        let bad0_ok = is_cmd_status(&bad0, OP_START_DISCOVERY, STATUS_INVALID_PARAMS);
+        let bredr = handle(&mgmt_cmd(OP_START_DISCOVERY, index, &[0x01]));
+        let bredr_ok = is_cmd_status(&bredr, OP_START_DISCOVERY, STATUS_NOT_SUPPORTED);
+        let rand = handle(&mgmt_cmd(OP_START_DISCOVERY, index, &[0x04]));
+        let rand_ok = is_cmd_status(&rand, OP_START_DISCOVERY, STATUS_NOT_SUPPORTED);
+        CAPTURED.lock().clear();
+        let start = handle(&mgmt_cmd(OP_START_DISCOVERY, index, &[0x02]));
+        let start_ok =
+            is_cmd_complete(&start, OP_START_DISCOVERY, STATUS_SUCCESS) && start[0][9] == 0x02;
+        // Default scan parameters: passive, 0x0030/0x0030, public,
+        // accept-all (ScanParameters::encode: type, interval LE,
+        // window LE, own type, filter policy).
+        let params_sent = lt.sent_commands().iter().any(|c| {
+            c.opcode == op::HCI_LE_SET_SCAN_PARAMETERS
+                && c.params == [0x00, 0x30, 0x00, 0x30, 0x00, 0x00, 0x00]
+        });
+        let discovering_on = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 8
+                && u16::from_le_bytes([e[0], e[1]]) == EV_DISCOVERING
+                && e[6] == 0x02
+                && e[7] == 1
+        });
+        let phase_starting = crate::pump::central_phase(index as usize)
+            == Some(crate::gap::CentralPhase::ParametersSent);
+        let busy = handle(&mgmt_cmd(OP_STOP_DISCOVERY, index, &[0x02]));
+        let busy_ok = is_cmd_status(&busy, OP_STOP_DISCOVERY, STATUS_BUSY);
+        lt.enqueue_event(cc(op::HCI_LE_SET_SCAN_PARAMETERS, 0, &[]));
+        let _ = crate::pump::pump_once(index as usize);
+        let phase_scanning =
+            crate::pump::central_phase(index as usize) == Some(crate::gap::CentralPhase::Scanning);
+        let enable_sent = lt
+            .sent_commands()
+            .iter()
+            .any(|c| c.opcode == op::HCI_LE_SET_SCAN_ENABLE && c.params == [0x01, 0x00]);
+        CAPTURED.lock().clear();
+        let peer = [0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
+        let ad = [0x02, 0x01, 0x06];
+        lt.enqueue_event(le_advertising_report_event(peer, &ad, -50));
+        let _ = crate::pump::pump_once(index as usize);
+        let found = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 23
+                && u16::from_le_bytes([e[0], e[1]]) == EV_DEVICE_FOUND
+                && e[6..12] == peer[..]
+                && e[12] == 0x01
+                && e[13] == (-50i8) as u8
+                && u32::from_le_bytes([e[14], e[15], e[16], e[17]]) == 0
+                && u16::from_le_bytes([e[18], e[19]]) == 3
+                && e[20..23] == ad[..]
+        });
+        let stop = handle(&mgmt_cmd(OP_STOP_DISCOVERY, index, &[0x02]));
+        let stop_ok = is_cmd_complete(&stop, OP_STOP_DISCOVERY, STATUS_SUCCESS);
+        let disable_sent = lt
+            .sent_commands()
+            .iter()
+            .any(|c| c.opcode == op::HCI_LE_SET_SCAN_ENABLE && c.params == [0x00, 0x00]);
+        let discovering_off = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 8
+                && u16::from_le_bytes([e[0], e[1]]) == EV_DISCOVERING
+                && e[6] == 0x02
+                && e[7] == 0
+        });
+        lt.enqueue_event(cc(op::HCI_LE_SET_SCAN_ENABLE, 0, &[]));
+        let _ = crate::pump::pump_once(index as usize);
+        let phase_idle =
+            crate::pump::central_phase(index as usize) == Some(crate::gap::CentralPhase::Idle);
+        CAPTURED.lock().clear();
+        lt.enqueue_event(le_advertising_report_event(peer, &ad, -50));
+        let _ = crate::pump::pump_once(index as usize);
+        let dropped_after_stop = !CAPTURED
+            .lock()
+            .iter()
+            .any(|e| e.len() >= 2 && u16::from_le_bytes([e[0], e[1]]) == EV_DEVICE_FOUND);
+        if let Some(prev) = previous {
+            narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+        }
+        cleanup_mgmt();
+        if !not_powered || !powered {
+            return TestResult::Fail("START_DISCOVERY power gating failed");
+        }
+        if !bad0_ok || !bredr_ok || !rand_ok {
+            return TestResult::Fail("START_DISCOVERY type validation failed");
+        }
+        if !start_ok || !params_sent || !discovering_on || !phase_starting {
+            return TestResult::Fail("START_DISCOVERY did not start the central scan");
+        }
+        if !busy_ok {
+            return TestResult::Fail("STOP_DISCOVERY during scan-start was not BUSY");
+        }
+        if !phase_scanning || !enable_sent {
+            return TestResult::Fail("scan did not reach Scanning on parameters complete");
+        }
+        if !found {
+            return TestResult::Fail("DEVICE_FOUND was not published for a scan report");
+        }
+        if !stop_ok || !disable_sent || !discovering_off || !phase_idle {
+            return TestResult::Fail("STOP_DISCOVERY did not stop the scan");
+        }
+        if !dropped_after_stop {
+            return TestResult::Fail("DEVICE_FOUND published after discovery stopped");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_discovery_start_stop);
+
+    /// #815: GET_CONNECTIONS lists live pump connections;
+    /// PAIR_DEVICE is async (Command Status now, Command Complete
+    /// on terminal outcome) with the Linux error map; UNPAIR_DEVICE
+    /// is idempotent, and disconnect=1 on a live connection is
+    /// NOT_SUPPORTED (no host disconnect backend).
+    fn smoke_mgmt_pair_unpair_and_get_connections() -> TestResult {
+        let (lt, index) = setup_controller(controller::ControllerInfo::default());
+        let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
+        crate::pump::test_entropy::install_stream(0x0123_4567_89AB_CDEF);
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut pair_params = [0u8; 8];
+        pair_params[..6].copy_from_slice(&peer6);
+        pair_params[6] = 0x01; // LE public
+        pair_params[7] = 0x03; // NoInputNoOutput
+        let np = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &pair_params));
+        let np_ok = is_cmd_status(&np, OP_PAIR_DEVICE, STATUS_NOT_POWERED);
+        let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
+        let conns = handle(&mgmt_cmd(OP_GET_CONNECTIONS, index, &[]));
+        let conns_empty = is_cmd_complete(&conns, OP_GET_CONNECTIONS, STATUS_SUCCESS)
+            && u16::from_le_bytes([conns[0][9], conns[0][10]]) == 0;
+        let nc = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &pair_params));
+        let nc_ok = is_cmd_status(&nc, OP_PAIR_DEVICE, STATUS_NOT_CONNECTED);
+        let mut bredr_params = pair_params;
+        bredr_params[6] = 0x00;
+        let br = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &bredr_params));
+        let br_ok = is_cmd_status(&br, OP_PAIR_DEVICE, STATUS_NOT_SUPPORTED);
+        let mut mitm_params = pair_params;
+        mitm_params[7] = 0x01; // DisplayYesNo
+        let mitm = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &mitm_params));
+        let mitm_ok = is_cmd_status(&mitm, OP_PAIR_DEVICE, STATUS_NOT_SUPPORTED);
+        let mut unpair_params = [0u8; 8];
+        unpair_params[..6].copy_from_slice(&peer6);
+        unpair_params[6] = 0x01;
+        unpair_params[7] = 0x00;
+        let un = handle(&mgmt_cmd(OP_UNPAIR_DEVICE, index, &unpair_params));
+        let un_ok = is_cmd_complete(&un, OP_UNPAIR_DEVICE, STATUS_SUCCESS);
+        lt.enqueue_event(le_conn_complete_event(0x0040, peer6));
+        let _ = crate::pump::pump_once(index as usize);
+        let connected = crate::pump::connection_count(index as usize) == Some(1);
+        let conns = handle(&mgmt_cmd(OP_GET_CONNECTIONS, index, &[]));
+        let conns_one = is_cmd_complete(&conns, OP_GET_CONNECTIONS, STATUS_SUCCESS)
+            && u16::from_le_bytes([conns[0][9], conns[0][10]]) == 1
+            && conns[0][11..17] == peer6[..]
+            && conns[0][17] == 0x01;
+        CAPTURED.lock().clear();
+        let pair = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &pair_params));
+        let pair_ok = is_cmd_status(&pair, OP_PAIR_DEVICE, STATUS_SUCCESS);
+        let pair2 = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &pair_params));
+        let pair_busy = is_cmd_status(&pair2, OP_PAIR_DEVICE, STATUS_BUSY);
+        let mut unpair_disc = unpair_params;
+        unpair_disc[7] = 0x01;
+        let ud = handle(&mgmt_cmd(OP_UNPAIR_DEVICE, index, &unpair_disc));
+        let ud_ok = is_cmd_status(&ud, OP_UNPAIR_DEVICE, STATUS_NOT_SUPPORTED);
+        lt.enqueue_event(disconnection_complete_event(0x0040));
+        let _ = crate::pump::pump_once(index as usize);
+        let disconnected = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 16
+                && u16::from_le_bytes([e[0], e[1]]) == EV_CMD_COMPLETE
+                && u16::from_le_bytes([e[6], e[7]]) == OP_PAIR_DEVICE
+                && e[8] == STATUS_DISCONNECTED
+                && e[9..15] == peer6[..]
+                && e[15] == 0x01
+        });
+        crate::pump::test_entropy::clear();
+        if let Some(prev) = previous {
+            narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+        }
+        cleanup_mgmt();
+        if !np_ok || !powered {
+            return TestResult::Fail("PAIR_DEVICE power gating failed");
+        }
+        if !conns_empty || !nc_ok {
+            return TestResult::Fail("PAIR_DEVICE without a connection was not NOT_CONNECTED");
+        }
+        if !br_ok || !mitm_ok {
+            return TestResult::Fail("PAIR_DEVICE BR/EDR / MITM was not NOT_SUPPORTED");
+        }
+        if !un_ok {
+            return TestResult::Fail("UNPAIR_DEVICE of an unknown peer was not success");
+        }
+        if !connected || !conns_one {
+            return TestResult::Fail("GET_CONNECTIONS did not list the live connection");
+        }
+        if !pair_ok || !pair_busy {
+            return TestResult::Fail("PAIR_DEVICE async start / BUSY failed");
+        }
+        if !ud_ok {
+            return TestResult::Fail(
+                "UNPAIR_DEVICE disconnect=1 on a live connection was not NOT_SUPPORTED",
+            );
+        }
+        if !disconnected {
+            return TestResult::Fail("mid-pairing disconnect did not complete as DISCONNECTED");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_pair_unpair_and_get_connections);
 }

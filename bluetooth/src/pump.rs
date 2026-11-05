@@ -1609,6 +1609,14 @@ struct SmpFeedOutcome {
     /// Peripheral cannot), and Phase 3 needs the encrypted link.
     /// `None` for every other outcome.
     auto_encrypt: Option<[u8; 16]>,
+    /// Terminal state of a mgmt-initiated pairing: `Some(true)`
+    /// when an initiator session just completed (Done),
+    /// `Some(false)` when one just failed; `None` for responder
+    /// sessions and non-terminal initiator outcomes. The pump
+    /// reports it to mgmt ([`crate::mgmt::pairing_complete`]),
+    /// which only acts when a PAIR_DEVICE started the pairing
+    /// (issue #815).
+    initiator_terminal: Option<bool>,
 }
 
 /// Map a state-machine error to its Pairing Failed reason byte
@@ -1938,6 +1946,18 @@ impl PumpCore {
                                 &r.data,
                                 r.rssi,
                             );
+                            // mgmt DEVICE_FOUND, one per report
+                            // (issue #815): published only while a
+                            // mgmt discovery is active — the mgmt
+                            // layer drops it otherwise.
+                            crate::mgmt::publish_device_found(
+                                self.index,
+                                r.address_type,
+                                r.address,
+                                r.rssi,
+                                r.event_type,
+                                &r.data,
+                            );
                         }
                     }
                 }
@@ -2022,6 +2042,22 @@ impl PumpCore {
             code if code == EventCode::DisconnectionComplete as u8 => {
                 if let Some(dc) = DisconnectionComplete::parse(event) {
                     self.release_handle_claims(dc.handle);
+                    // A mgmt-initiated pairing dies with the link:
+                    // complete it as DISCONNECTED before the
+                    // connection (and its session) is dropped
+                    // (issue #815). mgmt ignores it when no
+                    // PAIR_DEVICE started the pairing.
+                    let dropped_peer = self
+                        .connections
+                        .iter()
+                        .find(|c| c.handle == dc.handle)
+                        .and_then(|c| {
+                            if matches!(c.smp, Some(SmpSession::Initiator(_))) {
+                                Some(c.peer_addr)
+                            } else {
+                                None
+                            }
+                        });
                     self.connections.retain(|c| c.handle != dc.handle);
                     self.sysfs_track_disconnect(dc.handle);
                     if self.central.connected_handle == Some(dc.handle) {
@@ -2029,6 +2065,13 @@ impl PumpCore {
                     }
                     if self.classic.connected_handle == Some(dc.handle) {
                         self.classic.note_disconnected();
+                    }
+                    if let Some(peer) = dropped_peer {
+                        crate::mgmt::pairing_complete(
+                            self.index,
+                            peer,
+                            crate::mgmt::STATUS_DISCONNECTED,
+                        );
                     }
                 }
             }
@@ -2066,9 +2109,14 @@ impl PumpCore {
                     let ok = p[0] == 0;
                     let enabled = p[3] != 0;
                     // Capture distribution output before acting
-                    // (the session borrow must end first).
-                    let (outs, bond) = match self.connection_mut(handle) {
-                        None => (Vec::new(), None),
+                    // (the session borrow must end first). The
+                    // third element is the terminal outcome of a
+                    // mgmt-initiated pairing, if this event ended
+                    // one: `Some(true)` when an initiator session
+                    // just completed (Done), `Some(false)` when
+                    // one just failed.
+                    let (outs, bond, initiator_done) = match self.connection_mut(handle) {
+                        None => (Vec::new(), None, None),
                         Some(conn) => {
                             if ok {
                                 conn.encrypted = enabled;
@@ -2083,12 +2131,13 @@ impl PumpCore {
                                 None => false,
                             };
                             if !is_auth_complete {
-                                (Vec::new(), None)
+                                (Vec::new(), None, None)
                             } else if ok && enabled {
                                 // The link is encrypted: Phase 3
                                 // may start. On completion the bond
                                 // is stored and the session cleared.
-                                let (outs, bond) = match conn.smp.as_mut().unwrap() {
+                                let (outs, bond, initiator_done) = match conn.smp.as_mut().unwrap()
+                                {
                                     SmpSession::Responder(r) => {
                                         let outs = r.begin_distribution();
                                         let bond =
@@ -2107,7 +2156,7 @@ impl PumpCore {
                                             } else {
                                                 None
                                             };
-                                        (outs, bond)
+                                        (outs, bond, None)
                                     }
                                     SmpSession::Initiator(i) => {
                                         let outs = i.begin_distribution();
@@ -2127,13 +2176,21 @@ impl PumpCore {
                                         } else {
                                             None
                                         };
-                                        (outs, bond)
+                                        // Done here is terminal
+                                        // (nothing was expected
+                                        // from the peer); a
+                                        // non-bonded Done
+                                        // lingers in the
+                                        // session table, but
+                                        // the pairing itself
+                                        // completed.
+                                        (outs, bond, Some(i.state == smp::PairingState::Done))
                                     }
                                 };
                                 if bond.is_some() {
                                     conn.smp = None;
                                 }
-                                (outs, bond)
+                                (outs, bond, initiator_done)
                             } else {
                                 // Encryption failed or was switched
                                 // off mid-pairing: no bond forms. The
@@ -2141,13 +2198,35 @@ impl PumpCore {
                                 // this is a silent clear, not a
                                 // Pairing Failed — there is nothing
                                 // left to fail.
+                                let was_initiator =
+                                    matches!(conn.smp, Some(SmpSession::Initiator(_)));
                                 conn.smp = None;
-                                (Vec::new(), None)
+                                (
+                                    Vec::new(),
+                                    None,
+                                    if was_initiator { Some(false) } else { None },
+                                )
                             }
                         }
                     };
                     if let Some(bond) = bond {
                         self.bonds.store(bond);
+                    }
+                    // Terminal initiator outcome: complete a
+                    // mgmt-initiated pairing (issue #815). mgmt
+                    // ignores it when no PAIR_DEVICE started this
+                    // pairing; a second fire is a no-op (the
+                    // pending entry is already gone).
+                    if let Some(done) = initiator_done {
+                        if let Some(conn) = self.connections.iter().find(|c| c.handle == handle) {
+                            let peer = conn.peer_addr;
+                            let status = if done {
+                                crate::mgmt::STATUS_SUCCESS
+                            } else {
+                                crate::mgmt::STATUS_AUTH_FAILED
+                            };
+                            crate::mgmt::pairing_complete(self.index, peer, status);
+                        }
                     }
                     let le = self
                         .connections
@@ -2418,6 +2497,7 @@ impl PumpCore {
                             fail_reason: None,
                             clear: done,
                             auto_encrypt: None,
+                            initiator_terminal: None,
                         }
                     }
                     Err(PairingError::PeerFailed(_)) => SmpFeedOutcome {
@@ -2427,6 +2507,7 @@ impl PumpCore {
                         fail_reason: None,
                         clear: true,
                         auto_encrypt: None,
+                        initiator_terminal: None,
                     },
                     Err(err) => SmpFeedOutcome {
                         outs: Vec::new(),
@@ -2435,6 +2516,7 @@ impl PumpCore {
                         fail_reason: Some(smp_fail_reason(&err)),
                         clear: true,
                         auto_encrypt: None,
+                        initiator_terminal: None,
                     },
                 },
                 SmpSession::Initiator(i) => match i.feed(pdu) {
@@ -2469,6 +2551,13 @@ impl PumpCore {
                             } else {
                                 None
                             },
+                            // Done here is terminal: the peer's
+                            // distribution completed the pairing
+                            // (the other terminal path is
+                            // begin_distribution in the
+                            // EncryptionChange arm, when nothing
+                            // was expected from the peer).
+                            initiator_terminal: if done { Some(true) } else { None },
                         }
                     }
                     Err(PairingError::PeerFailed(_)) => SmpFeedOutcome {
@@ -2478,6 +2567,7 @@ impl PumpCore {
                         fail_reason: None,
                         clear: true,
                         auto_encrypt: None,
+                        initiator_terminal: Some(false),
                     },
                     Err(err) => SmpFeedOutcome {
                         outs: Vec::new(),
@@ -2486,6 +2576,7 @@ impl PumpCore {
                         fail_reason: Some(smp_fail_reason(&err)),
                         clear: true,
                         auto_encrypt: None,
+                        initiator_terminal: Some(false),
                     },
                 },
             }
@@ -2498,6 +2589,18 @@ impl PumpCore {
         }
         if let Some(bond) = outcome.bond {
             self.bonds.store(bond);
+        }
+        // Terminal initiator outcome: complete a mgmt-initiated
+        // pairing (issue #815). mgmt ignores it when no
+        // PAIR_DEVICE started this pairing.
+        if let Some(done) = outcome.initiator_terminal {
+            let peer = self.connections[conn_idx].peer_addr;
+            let status = if done {
+                crate::mgmt::STATUS_SUCCESS
+            } else {
+                crate::mgmt::STATUS_AUTH_FAILED
+            };
+            crate::mgmt::pairing_complete(self.index, peer, status);
         }
         for out in outcome.outs {
             self.queue_frame(handle, le, &BFrame::new(CID_SMP, out.encode()));
@@ -3274,8 +3377,8 @@ fn with_pump_core<T>(index: usize, f: impl FnOnce(&mut PumpCore) -> T) -> Result
 
 /// Begin LE discovery on controller `index`: issue LE Set Scan
 /// Parameters; Set Scan Enable(1) follows on completion. Only from
-/// Idle. This is the trigger surface a future mgmt/userspace lane
-/// will call; today it is fixture-driven.
+/// Idle. This is the trigger mgmt START_DISCOVERY calls (issue
+/// #815); it is also fixture-driven.
 pub fn central_start_scan(index: usize, params: gap::ScanParameters) -> Result<(), CentralError> {
     with_pump_core(index, |core| core.central_start_scan(params))?
 }
@@ -3532,6 +3635,43 @@ pub fn bond_count(index: usize) -> Option<usize> {
     let pumps = PUMPS.lock();
     let slot = pumps.iter().find(|s| s.index == index)?;
     slot.core.as_ref().map(|c| c.bond_count())
+}
+
+/// One live ACL connection, as mgmt GET_CONNECTIONS reports it
+/// (issue #815). `peer_addr` is `[address_type, bd_addr]`;
+/// `le` distinguishes LE from BR/EDR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PumpConnectionInfo {
+    pub handle: u16,
+    pub peer_addr: [u8; 7],
+    pub le: bool,
+}
+
+/// Live connections on controller `index`, if it has a pump.
+/// Read-only snapshot (same discipline as [`central_peers`]).
+pub fn connections(index: usize) -> Option<Vec<PumpConnectionInfo>> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| {
+            c.connections
+                .iter()
+                .map(|conn| PumpConnectionInfo {
+                    handle: conn.handle,
+                    peer_addr: conn.peer_addr,
+                    le: conn.le,
+                })
+                .collect()
+        })
+}
+
+/// Whether controller `index` holds a bond for `peer_addr`, if it
+/// has a pump.
+pub fn has_bond(index: usize, peer_addr: &[u8; 7]) -> Option<bool> {
+    with_core(index, |core| core.bonds.lookup(peer_addr).is_some())
 }
 
 // ── The step ────────────────────────────────────────────────────────
@@ -4079,6 +4219,13 @@ mod tests {
             &[0, 0xFE, 0x03, 64, 0x08, 0x00, 0x04, 0x00],
         ));
         fake.enqueue_event(cc(op::HCI_SET_EVENT_MASK, &[0]));
+        // Identity reads (§7.4.14/§7.4.23): the name/class mgmt
+        // READ_INFO reports (issue #815). `cc`'s `ret` starts with
+        // the status byte, so the name payload is 1 + 248 bytes.
+        let mut name_ret = alloc::vec![0u8; 249];
+        name_ret[1..10].copy_from_slice(b"narf-pump");
+        fake.enqueue_event(cc(op::HCI_READ_LOCAL_NAME, &name_ret));
+        fake.enqueue_event(cc(op::HCI_READ_CLASS_OF_DEVICE, &[0, 0x04, 0x0C, 0x02]));
     }
 
     fn le_connection_complete(handle: u16, peer: [u8; 6]) -> Event {
@@ -4123,13 +4270,16 @@ mod tests {
             reset_all();
             return TestResult::Fail("bring-up against fake controller failed");
         }
-        // Exact mandatory command order (Vol 4 Part E §3).
+        // Exact mandatory command order (Vol 4 Part E §3), plus the
+        // identity reads (issue #815).
         let expected = [
             op::HCI_RESET,
             op::HCI_READ_LOCAL_VERSION,
             op::HCI_READ_BD_ADDR,
             op::HCI_READ_BUFFER_SIZE,
             op::HCI_SET_EVENT_MASK,
+            op::HCI_READ_LOCAL_NAME,
+            op::HCI_READ_CLASS_OF_DEVICE,
         ];
         if fake.sent_opcodes() != expected {
             reset_all();
@@ -8671,6 +8821,383 @@ mod tests {
         "bluetooth/pump",
         smoke_pump_smp_initiator_bonding_full_exchange
     );
+
+    /// mgmt opcodes/events used by the mgmt-driven pairing fixture
+    /// (bluetooth/src/mgmt.rs; kept local so the pump fixture does
+    /// not depend on mgmt's private consts).
+    const MGMT_OP_SET_POWERED: u16 = 0x0005;
+    const MGMT_OP_PAIR_DEVICE: u16 = 0x0019;
+    const MGMT_EV_CMD_COMPLETE: u16 = 0x0001;
+    const MGMT_EV_CMD_STATUS: u16 = 0x0002;
+
+    /// One mgmt command frame: header (opcode/index/len) + params.
+    fn mgmt_frame(opcode: u16, index: u16, params: &[u8]) -> Vec<u8> {
+        let mut f = Vec::with_capacity(6 + params.len());
+        f.extend_from_slice(&opcode.to_le_bytes());
+        f.extend_from_slice(&index.to_le_bytes());
+        f.extend_from_slice(&(params.len() as u16).to_le_bytes());
+        f.extend_from_slice(params);
+        f
+    }
+
+    /// mgmt event capture for the pairing fixture.
+    static MGMT_CAPTURED: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+    fn mgmt_capture_sink(event: &[u8]) {
+        MGMT_CAPTURED.lock().push(event.to_vec());
+    }
+
+    /// Enqueue the Command Completes a mgmt power-on consumes on
+    /// the scripted transport. The identity re-reads return the
+    /// bring-up values ("narf-pump" / 0x040C02), so the refresh is
+    /// a no-op and no change event fires.
+    fn enqueue_mgmt_power_on_ccs(fake: &ScriptedTransport) {
+        fake.enqueue_event(cc(op::HCI_RESET, &[0]));
+        fake.enqueue_event(cc(op::HCI_SET_EVENT_MASK, &[0]));
+        let mut name_ret = alloc::vec![0u8; 249];
+        name_ret[1..10].copy_from_slice(b"narf-pump");
+        fake.enqueue_event(cc(op::HCI_READ_LOCAL_NAME, &name_ret));
+        fake.enqueue_event(cc(op::HCI_READ_CLASS_OF_DEVICE, &[0, 0x04, 0x0C, 0x02]));
+        fake.enqueue_event(cc(op::HCI_WRITE_SCAN_ENABLE, &[0]));
+        fake.enqueue_event(cc(op::HCI_WRITE_AUTHENTICATION_ENABLE, &[0]));
+        fake.enqueue_event(cc(op::HCI_WRITE_SIMPLE_PAIRING_MODE, &[0]));
+        fake.enqueue_event(cc(op::HCI_WRITE_LE_HOST_SUPPORT, &[0]));
+        fake.enqueue_event(cc(op::HCI_WRITE_SECURE_CONNECTIONS_HOST_SUPPORT, &[0]));
+        fake.enqueue_event(cc(op::HCI_WRITE_PAGE_SCAN_TYPE, &[0]));
+    }
+
+    /// #815: the mgmt end of initiator pairing. PAIR_DEVICE via
+    /// `mgmt::handle` returns Command Status now, and the full SMP
+    /// exchange — the same scripted peer as
+    /// `smoke_pump_smp_initiator_bonding_full_exchange`, initiated
+    /// via mgmt instead of the pump API — ends with a Command
+    /// Complete (PAIR_DEVICE, SUCCESS) on the mgmt event sink.
+    fn smoke_mgmt_pair_device_full_exchange() -> TestResult {
+        reset_all();
+        crate::mgmt::__test_reset();
+        MGMT_CAPTURED.lock().clear();
+        let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(mgmt_capture_sink);
+        let sbox = build_sbox();
+        if let Err(m) = peer_model_self_check(&sbox) {
+            if let Some(prev) = previous {
+                narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+            }
+            return TestResult::Fail(m);
+        }
+        test_entropy::install_stream(0x0123_4567_89AB_CDEF);
+        // `previous` is Option<fn> (Copy), so the `move` closure
+        // copies it and the outer binding stays usable for the
+        // success-path restore below.
+        let fail = move |msg: &'static str| -> TestResult {
+            test_entropy::clear();
+            if let Some(prev) = previous {
+                narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+            }
+            reset_all();
+            crate::mgmt::__test_reset();
+            TestResult::Fail(msg)
+        };
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(m) = smp888_bring_up_connect(&fake) {
+            return fail(m);
+        }
+        // Power the controller on through mgmt: the power-on CCs
+        // are scripted first (identity re-reads return the
+        // bring-up values).
+        enqueue_mgmt_power_on_ccs(&fake);
+        let on = crate::mgmt::handle(&mgmt_frame(MGMT_OP_SET_POWERED, 0, &[1]));
+        if on.len() != 1
+            || u16::from_le_bytes([on[0][0], on[0][1]]) != MGMT_EV_CMD_COMPLETE
+            || u16::from_le_bytes([on[0][6], on[0][7]]) != MGMT_OP_SET_POWERED
+            || on[0][8] != 0
+        {
+            return fail("mgmt power-on failed");
+        }
+        // PAIR_DEVICE via mgmt: Command Status (SUCCESS) now — the
+        // pairing runs async and completes on the event sink.
+        let mut pair_params = [0u8; 8];
+        pair_params[..6].copy_from_slice(&SMP888_PEER6);
+        pair_params[6] = 0x01; // LE public
+        pair_params[7] = 0x03; // NoInputNoOutput
+        let pair = crate::mgmt::handle(&mgmt_frame(MGMT_OP_PAIR_DEVICE, 0, &pair_params));
+        if pair.len() != 1
+            || u16::from_le_bytes([pair[0][0], pair[0][1]]) != MGMT_EV_CMD_STATUS
+            || u16::from_le_bytes([pair[0][6], pair[0][7]]) != MGMT_OP_PAIR_DEVICE
+            || pair[0][8] != 0
+        {
+            return fail("mgmt PAIR_DEVICE did not return Command Status SUCCESS");
+        }
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let req = frames
+            .iter()
+            .find(|(h, f)| *h == SMP888_HANDLE && f.cid == CID_SMP)
+            .map(|(_, f)| f.payload.clone());
+        // Byte-exact Pairing Request: NoInputNoOutput (0x03 per
+        // Part H §3.5.1 — NOT 0x00, which is DisplayOnly),
+        // bonding|SC, IdKey|Sign offered and requested.
+        if req
+            != Some(alloc::vec![
+                0x01,
+                smp::IoCapability::NoInputNoOutput as u8,
+                0x00,
+                0x09,
+                16,
+                0x06,
+                0x06
+            ])
+        {
+            return fail("mgmt-initiated Pairing Request bytes wrong");
+        }
+        // Peer (responder) answers: NoInputNoOutput (0x03 per
+        // Part H §3.5.1), bonding|SC, IdKey|Sign both directions.
+        let rsp = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_PAIRING_RESPONSE,
+                &[
+                    smp::IoCapability::NoInputNoOutput as u8,
+                    0x00,
+                    0x09,
+                    16,
+                    0x06,
+                    0x06,
+                ],
+            )],
+            SMP888_HANDLE,
+        );
+        if rsp.len() != 1 || rsp[0].len() != 65 || rsp[0][0] != smp::SMP_PAIRING_PUBLIC_KEY {
+            return fail("initiator did not answer Response with a public key");
+        }
+        let mut pump_pk_x = [0u8; 32];
+        let mut pump_pk_y = [0u8; 32];
+        pump_pk_x.copy_from_slice(&rsp[0][1..33]);
+        pump_pk_y.copy_from_slice(&rsp[0][33..65]);
+        if pump_pk_x == [0u8; 32] {
+            return fail("initiator public key is zero (entropy seam not live)");
+        }
+        let peer_dh = peer_dhkey_wire(SMP888_PEER_PRIV, &pump_pk_x, &pump_pk_y);
+        let (peer_px, peer_py) = peer_public(SMP888_PEER_PRIV);
+        let peer_pk_x = fe_to_wire(&peer_px);
+        let peer_pk_y = fe_to_wire(&peer_py);
+        let mut peer_pk_payload = Vec::with_capacity(64);
+        peer_pk_payload.extend_from_slice(&peer_pk_x);
+        peer_pk_payload.extend_from_slice(&peer_pk_y);
+        let ca_frames = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_PAIRING_PUBLIC_KEY,
+                &peer_pk_payload,
+            )],
+            SMP888_HANDLE,
+        );
+        if ca_frames.len() != 1
+            || ca_frames[0].len() != 17
+            || ca_frames[0][0] != smp::SMP_PAIRING_CONFIRM
+        {
+            return fail("initiator did not answer public key with Confirm");
+        }
+        let ca = &ca_frames[0][1..17];
+        // Peer commits Cb and reveals Nb.
+        let nb: [u8; 16] = [0xBB; 16];
+        let cb = peer_f4(&sbox, &peer_pk_x, &pump_pk_x, &nb, 0);
+        let na_ea = smp888_step_acls(
+            &fake,
+            &[
+                smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_CONFIRM, &cb),
+                smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_RANDOM, &nb),
+            ],
+            SMP888_HANDLE,
+        );
+        if na_ea.len() != 2
+            || na_ea[0].len() != 17
+            || na_ea[0][0] != smp::SMP_PAIRING_RANDOM
+            || na_ea[1].len() != 17
+            || na_ea[1][0] != smp::SMP_PAIRING_DHKEY_CHECK
+        {
+            return fail("initiator did not answer Random with [Random, DHKey Check]");
+        }
+        let mut na = [0u8; 16];
+        na.copy_from_slice(&na_ea[0][1..17]);
+        if na == [0u8; 16] {
+            return fail("initiator nonce is zero (entropy seam not live)");
+        }
+        // Peer verifies Ca and Ea against the independent model —
+        // a wrong production f4/f6 fails the fixture here, not in
+        // a later byte comparison.
+        let want_ca = peer_f4(&sbox, &pump_pk_x, &peer_pk_x, &na, 0);
+        if ca != &want_ca[..] {
+            return fail("Ca mismatch: production f4 disagrees with the peer model");
+        }
+        let mac_key = peer_f5_mac_key(
+            &sbox,
+            &peer_dh,
+            &na,
+            &nb,
+            &SMP888_LOCAL_ADDR,
+            &SMP888_PEER_ADDR,
+        );
+        let want_ltk = peer_f5_ltk(
+            &sbox,
+            &peer_dh,
+            &na,
+            &nb,
+            &SMP888_LOCAL_ADDR,
+            &SMP888_PEER_ADDR,
+        );
+        let iocap_a: [u8; 3] = [
+            smp::AUTH_BONDING | smp::AUTH_SC,
+            0x00,
+            smp::IoCapability::NoInputNoOutput as u8,
+        ];
+        let want_ea = peer_f6(
+            &sbox,
+            &mac_key,
+            &F6Inputs {
+                n1: &na,
+                n2: &nb,
+                r: &[0u8; 16],
+                iocap: &iocap_a,
+                a1: &SMP888_LOCAL_ADDR,
+                a2: &SMP888_PEER_ADDR,
+            },
+        );
+        if na_ea[1][1..17] != want_ea[..] {
+            return fail("Ea mismatch: production f6 disagrees with the peer model");
+        }
+        // Peer answers with Eb. The initiator parks at
+        // AuthComplete and auto-starts encryption — no bond yet.
+        let iocap_b: [u8; 3] = [
+            smp::AUTH_BONDING | smp::AUTH_SC,
+            0x00,
+            smp::IoCapability::NoInputNoOutput as u8,
+        ];
+        let eb = peer_f6(
+            &sbox,
+            &mac_key,
+            &F6Inputs {
+                n1: &nb,
+                n2: &na,
+                r: &[0u8; 16],
+                iocap: &iocap_b,
+                a1: &SMP888_PEER_ADDR,
+                a2: &SMP888_LOCAL_ADDR,
+            },
+        );
+        let cmds_before = fake.sent_commands().len();
+        let eb_out = smp888_step_acls(
+            &fake,
+            &[smp888_acl(SMP888_HANDLE, smp::SMP_PAIRING_DHKEY_CHECK, &eb)],
+            SMP888_HANDLE,
+        );
+        if !eb_out.is_empty() {
+            return fail("initiator sent SMP PDUs at AuthComplete (must wait for encryption)");
+        }
+        if bond_count(0) != Some(0) {
+            return fail("bond stored before distribution (must wait for Phase 3)");
+        }
+        let new_cmds = &fake.sent_commands()[cmds_before..];
+        let start_enc = new_cmds
+            .iter()
+            .find(|c| c.opcode == op::HCI_LE_START_ENCRYPTION);
+        let mut want_start_enc = Vec::with_capacity(26);
+        want_start_enc.extend_from_slice(&SMP888_HANDLE.to_le_bytes());
+        want_start_enc.extend_from_slice(&[0u8; 8]);
+        want_start_enc.extend_from_slice(&0u16.to_le_bytes());
+        want_start_enc.extend_from_slice(&want_ltk);
+        match start_enc {
+            Some(cmd) if cmd.params == want_start_enc => {}
+            _ => return fail("initiator did not auto-start encryption with the f5 LTK"),
+        }
+        // Encryption reported: the initiator still sends nothing —
+        // the Peripheral (peer) distributes first (§3.6.1).
+        let after_enc = smp888_step_event(
+            &fake,
+            smp888_encryption_change_event(SMP888_HANDLE, 0, 1),
+            SMP888_HANDLE,
+        );
+        if !after_enc.is_empty() {
+            return fail("initiator distributed before the responder (order is Peripheral first)");
+        }
+        smp888_replenish(&fake, SMP888_HANDLE);
+        // Peer distributes IRK, identity address, CSRK in order;
+        // the first two steps emit nothing, the third releases
+        // the host's own distribution PDUs — and the initiator
+        // reaches Done, completing the mgmt pairing.
+        let irk_pin: [u8; 16] = [0xC0; 16];
+        let csrk_pin: [u8; 16] = [0xD0; 16];
+        let step1 = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_IDENTITY_INFORMATION,
+                &irk_pin,
+            )],
+            SMP888_HANDLE,
+        );
+        if !step1.is_empty() {
+            return fail("initiator answered Identity Information early");
+        }
+        let step2 = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_IDENTITY_ADDRESS_INFORMATION,
+                &SMP888_PEER_ADDR,
+            )],
+            SMP888_HANDLE,
+        );
+        if !step2.is_empty() {
+            return fail("initiator answered Identity Address early");
+        }
+        let step3 = smp888_step_acls(
+            &fake,
+            &[smp888_acl(
+                SMP888_HANDLE,
+                smp::SMP_SIGNING_INFORMATION,
+                &csrk_pin,
+            )],
+            SMP888_HANDLE,
+        );
+        if step3.len() != 3
+            || step3[0].len() != 17
+            || step3[0][0] != smp::SMP_IDENTITY_INFORMATION
+            || step3[0][1..17] == [0u8; 16]
+            || step3[1].len() != 8
+            || step3[1][0] != smp::SMP_IDENTITY_ADDRESS_INFORMATION
+            || step3[1][1..8] != SMP888_LOCAL_ADDR
+            || step3[2].len() != 17
+            || step3[2][0] != smp::SMP_SIGNING_INFORMATION
+            || step3[2][1..17] == [0u8; 16]
+        {
+            return fail("initiator distribution PDUs wrong (order/length/address/randomness)");
+        }
+        if bond_count(0) != Some(1) {
+            return fail("bond not stored after distribution completed");
+        }
+        // The mgmt sink must have received the async completion:
+        // Command Complete (PAIR_DEVICE, SUCCESS) echoing the peer.
+        let completed = MGMT_CAPTURED.lock().iter().any(|e| {
+            e.len() >= 16
+                && u16::from_le_bytes([e[0], e[1]]) == MGMT_EV_CMD_COMPLETE
+                && u16::from_le_bytes([e[6], e[7]]) == MGMT_OP_PAIR_DEVICE
+                && e[8] == 0
+                && e[9..15] == SMP888_PEER6[..]
+                && e[15] == 0x01
+        });
+        test_entropy::clear();
+        if let Some(prev) = previous {
+            narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+        }
+        reset_all();
+        crate::mgmt::__test_reset();
+        if !completed {
+            return TestResult::Fail("mgmt sink never got PAIR_DEVICE Command Complete SUCCESS");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_mgmt_pair_device_full_exchange);
 
     /// #888: responder pairing with distribution. The LTK Request
     /// that arrives while the session is AuthComplete is answered

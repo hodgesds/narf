@@ -250,9 +250,46 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   disables the scan first and issues LE Create Connection (§7.8.12) on
   the disable completion (or directly from Idle), and LE Connection
   Complete lands the connection like any other pump connection.
-  `pump::central_phase` exposes the initiator phase. Out of scope
-  here: pairing initiation (#888), host-initiated disconnect, and
-  any mgmt/userspace trigger for these calls (future lane).
+  `pump::central_phase` exposes the initiator phase. Pairing
+  initiation (issue #888) is `pump::smp_initiate_pairing` (LE
+  Just Works initiator + bond store); host-initiated disconnect
+  remains out of scope (no backend — the mgmt DISCONNECT
+  remainder).
+- `mgmt` — the Linux Bluetooth Management API
+  (`HCI_CHANNEL_CONTROL`, issue #815). Set-mode ops issue real
+  HCI through the controller transport and record the setting
+  only once the controller accepts it: power on/off (HCI_Reset +
+  event mask + identity refresh + re-apply of every recorded
+  HCI-backed setting), discoverable/connectable
+  (HCI_Write_Scan_Enable, with the Linux couplings —
+  discoverable-on while connectable-off is REJECTED,
+  connectable-off also switches discoverable off),
+  fast-connectable (Write_Page_Scan_Type), link-security
+  (Write_Authentication_Enable), SSP (Write_Simple_Pairing_Mode),
+  LE (Write_LE_Host_Support), secure-conn
+  (Write_Secure_Connections_Host_Support; SC-Only is
+  NOT_SUPPORTED), bondable (host policy, no HCI command exists).
+  While unpowered a setting is recorded and applied on the next
+  power-on (the Linux model); power-on re-writes a userspace-set
+  name/class and otherwise re-reads the controller's. READ_INFO
+  reports the real dev_class / local name / short name (the
+  bring-up reads them from the controller; the short name stays
+  empty until SET_LOCAL_NAME sets one). START/STOP_DISCOVERY
+  drive the GAP central initiator above (LE public only; BR/EDR
+  and LE random are NOT_SUPPORTED pending #1315 / a random-address
+  backend) and publish DISCOVERING / DEVICE_FOUND per report;
+  SET_SCAN_PARAMS stores the LE scan parameters (HCI §7.8.10
+  bounds). PAIR_DEVICE (LE Just Works only, existing connection
+  required) returns Command Status now and Command Complete when
+  the initiator session ends (SUCCESS / AUTH_FAILED /
+  DISCONNECTED); UNPAIR_DEVICE forgets the bond (idempotent) and
+  refuses disconnect=1 on a live connection (NOT_SUPPORTED).
+  Known limits: mgmt issues its HCI synchronously, so while the
+  pump task is draining the same transport a completion can be
+  consumed by the pump instead (a single command path via the
+  pump/CmdQueue is the follow-up); the discoverable timeout is
+  accepted but never enforced (no mgmt timer); power-off does not
+  drop live pump connections.
   GATT client (issue #1313): `pump::gatt_client_discover_services` /
   `discover_characteristics` / `discover_descriptors` / `read` /
   `write` / `subscribe` issue ATT requests over a central-role

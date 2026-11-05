@@ -87,7 +87,9 @@ fn smoke_e2e_hci_mandatory_sequence_order() -> TestResult {
 
     // §3 (Vol 4 Part E) mandates Reset → Read Local Version →
     // Read BD_ADDR → Read Buffer Size → Set Event Mask before any
-    // higher-layer traffic. Verify our controller fires exactly that
+    // higher-layer traffic; the informational Read Local Name +
+    // Read Class of Device follow (issue #815: the identity mgmt
+    // READ_INFO reports). Verify our controller fires exactly that
     // chain in order.
     let lt = Arc::new(LoopbackTransport::new("e2e-mandatory"));
     lt.enqueue_event(cc(op::HCI_RESET, 0x00, &[]));
@@ -104,6 +106,10 @@ fn smoke_e2e_hci_mandatory_sequence_order() -> TestResult {
         &[0x40, 0x01, 0x40, 0x10, 0x00, 0x08, 0x00],
     ));
     lt.enqueue_event(cc(op::HCI_SET_EVENT_MASK, 0x00, &[]));
+    let mut name_ret = [0u8; 248];
+    name_ret[..7].copy_from_slice(b"narf-hc");
+    lt.enqueue_event(cc(op::HCI_READ_LOCAL_NAME, 0x00, &name_ret));
+    lt.enqueue_event(cc(op::HCI_READ_CLASS_OF_DEVICE, 0x00, &[0x04, 0x0C, 0x02]));
 
     let controller = Controller::new(lt.clone());
     let cap = bootstrap_bluetooth_authority();
@@ -118,6 +124,12 @@ fn smoke_e2e_hci_mandatory_sequence_order() -> TestResult {
     if info.bd_addr != bd_addr {
         return TestResult::Fail("BD_ADDR not captured");
     }
+    if info.local_name[..7] != *b"narf-hc" {
+        return TestResult::Fail("local name not captured");
+    }
+    if info.dev_class != [0x04, 0x0C, 0x02] {
+        return TestResult::Fail("Class of Device not captured");
+    }
     let sent = lt.sent_commands();
     let want = [
         op::HCI_RESET,
@@ -125,6 +137,8 @@ fn smoke_e2e_hci_mandatory_sequence_order() -> TestResult {
         op::HCI_READ_BD_ADDR,
         op::HCI_READ_BUFFER_SIZE,
         op::HCI_SET_EVENT_MASK,
+        op::HCI_READ_LOCAL_NAME,
+        op::HCI_READ_CLASS_OF_DEVICE,
     ];
     if sent.len() != want.len() {
         return TestResult::Fail("wrong command count");
@@ -158,6 +172,10 @@ fn smoke_e2e_hci_set_event_mask_payload() -> TestResult {
     lt.enqueue_event(cc(op::HCI_READ_BD_ADDR, 0x00, &[0; 6]));
     lt.enqueue_event(cc(op::HCI_READ_BUFFER_SIZE, 0x00, &[0; 7]));
     lt.enqueue_event(cc(op::HCI_SET_EVENT_MASK, 0x00, &[]));
+    // Bring-up continues past the event mask (issue #815): the
+    // identity reads must be scripted or the sequence stalls.
+    lt.enqueue_event(cc(op::HCI_READ_LOCAL_NAME, 0x00, &[0; 248]));
+    lt.enqueue_event(cc(op::HCI_READ_CLASS_OF_DEVICE, 0x00, &[0; 3]));
 
     let controller = Controller::new(lt.clone());
     let cap = bootstrap_bluetooth_authority();
