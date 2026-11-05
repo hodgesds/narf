@@ -13,8 +13,8 @@
 
 use super::initvals::*;
 use super::initvals_ar9462::*;
-use super::initvals_ar9565::*;
 use super::initvals_ar9485::*;
+use super::initvals_ar9565::*;
 use super::initvals_ar9580::*;
 use super::{eeprom::Identity, Chip, Revision};
 
