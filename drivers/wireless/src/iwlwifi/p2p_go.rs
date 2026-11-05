@@ -1,6 +1,6 @@
 //! P2P GO wire identity and source-owned native NoA projection.
 //! Actual role/receive/publication owners precede native NoA authority.
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 

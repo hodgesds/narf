@@ -843,6 +843,7 @@ pub fn detach_all_bindings(controller: u8) {
     crate::cdc_ncm::detach_all_ncm(controller);
     crate::r8152::detach_all_r8152(controller);
     crate::cdc_ecm::detach_all_ecm(controller);
+    crate::ax88179::detach_all_ax(controller);
     crate::uvc::detach_all_uvc(controller);
     HUBS.of(controller).lock().clear();
 }

@@ -29,7 +29,8 @@ use super::super::wmi::{
     PdevCap, Ready, ServiceMap, ServiceReadyExt, TargetCaps, WMI_HOST_WLAN_2G_CAP,
     WMI_HOST_WLAN_5G_CAP,
 };
-use super::{ahb_drain, ahb_send_context, register_ahb, AhbChip, AHB_ACTIVE};
+use super::{ahb_drain, ahb_send_context, register_ahb, AHB_ACTIVE};
+use crate::ath11k::ahb::AhbChip;
 
 /// Locally-administered test MAC, distinct from every in-tree fixture
 /// MAC (integration tests use `02:00:00:00:00:02`-style addresses only

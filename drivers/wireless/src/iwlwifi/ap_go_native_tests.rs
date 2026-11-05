@@ -724,7 +724,7 @@ fn go_ps() -> R {
     f.admin.set_link(false).map_err(|_| "GO PS bad DOWN")?;
     f.device().set_iftype(9).map_err(|_| "GO PS bad role")?;
     f.admin.set_link(true).map_err(|_| "GO PS bad UP")?;
-    let (config, mut settings) = config(true);
+    let (config, mut settings) = self::config(true);
     settings.p2p_go = Some(narf_wireless::P2pGoPowerSave {
         ctwindow_tu: Some(200),
         opportunistic: Some(true),
@@ -745,7 +745,7 @@ fn go_ps() -> R {
     let f = Fixture::new(None, None)?;
     f.admin.set_link(false).map_err(|_| "AP PS DOWN")?;
     f.admin.set_link(true).map_err(|_| "AP PS UP")?;
-    let (config, mut settings) = config(true);
+    let (config, mut settings) = self::config(true);
     settings.p2p_go = Some(narf_wireless::P2pGoPowerSave {
         ctwindow_tu: Some(4),
         opportunistic: Some(true),

@@ -43,6 +43,17 @@ impl Function {
     }
 }
 
+impl From<super::transport::Function> for Function {
+    fn from(f: super::transport::Function) -> Self {
+        match f {
+            super::transport::Function::Bus => Function::Bus,
+            super::transport::Function::Backplane => Function::Backplane,
+            super::transport::Function::Wlan => Function::Wlan,
+            super::transport::Function::Bt => Function::Bt,
+        }
+    }
+}
+
 /// Direction bit of the command word (datasheet §6.4 Figure 6-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {

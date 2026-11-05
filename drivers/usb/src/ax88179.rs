@@ -744,6 +744,7 @@ async fn auto_detach_best_effort(dev: &USBDevice) {
 /// Bound AX88179 device record (mirrors the r8152 record shape).
 #[derive(Debug)]
 pub struct AxDevice {
+    pub controller: u8,
     pub slot_id: u8,
     /// Owning xHCI controller id ([`Xhci::id`]): slot ids are only
     /// unique within one controller, so TX and detach resolve the
@@ -781,14 +782,14 @@ pub struct AxDevice {
 pub static AX_DEVICES: IrqSafeSpinLock<Vec<AxDevice>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Resolve a device-record index to its TX target
-/// `(slot_id, bulk_out_dci, out_max_packet)`. The send trampoline
+/// `(controller, slot_id, bulk_out_dci, out_max_packet)`. The send trampoline
 /// routes through this — and only this — so a frame can never be
 /// emitted on a different device's endpoint.
-pub fn tx_target(idx: usize) -> Option<(u8, u8, u16)> {
+pub fn tx_target(idx: usize) -> Option<(u8, u8, u8, u16)> {
     let g = AX_DEVICES.lock();
     g.get(idx)
         .filter(|d| !d.detached)
-        .map(|d| (d.slot_id, d.bulk_out_dci, d.out_max_packet))
+        .map(|d| (d.controller, d.slot_id, d.bulk_out_dci, d.out_max_packet))
 }
 
 /// Ship one built TX segment on the device's bulk-OUT endpoint.
@@ -1197,6 +1198,7 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         let mut g = AX_DEVICES.lock();
         let idx = g.len();
         g.push(AxDevice {
+            controller: device.controller().id(),
             slot_id: device.slot_id(),
             controller: device.controller().id(),
             mac,
@@ -1387,14 +1389,17 @@ pub fn detach_ax_slot(controller: u8, slot_id: u8) -> Result<(), ()> {
 
 /// Wholesale variant of [`detach_ax_slot`] for controller
 /// recovery (`attach::detach_all_bindings`): tombstone every
-/// AX88179 binding and unregister every net iface, regardless of
-/// slot. Infallible and idempotent, same pump-exit and
+/// AX88179 binding on `controller` and unregister its net iface,
+/// regardless of slot. Infallible and idempotent, same pump-exit and
 /// never-remove reasoning as [`detach_ax_slot`].
-pub fn detach_all_ax() {
+pub fn detach_all_ax(controller: u8) {
     let ifaces: Vec<String> = {
         let mut g = AX_DEVICES.lock();
         let mut names = Vec::new();
-        for dev in g.iter_mut().filter(|d| !d.detached) {
+        for dev in g
+            .iter_mut()
+            .filter(|d| d.controller == controller && !d.detached)
+        {
             dev.detached = true;
             dev.pump_running = false;
             names.push(dev.iface_name.clone());

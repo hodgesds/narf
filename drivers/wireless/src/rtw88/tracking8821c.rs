@@ -12,6 +12,7 @@ use narf_firmware::FirmwareBlob;
 use narf_lib::sync::IrqSafeSpinLock;
 #[path = "tracking8821c/program.rs"]
 mod program;
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) use program::mcs_indices;
 pub(super) use program::Tracker;
 

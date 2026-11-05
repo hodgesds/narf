@@ -1916,8 +1916,8 @@ impl Igb {
     pub fn vlan_filter_add(&self, vid: u16) -> bool {
         // VMDq-aware path (lock order vt -> vlan_filter).
         {
-            let mut vt = self.vt.lock();
-            if let Some(vt) = vt.as_mut() {
+            let mut vt_guard = self.vt.lock();
+            if let Some(vt) = vt_guard.as_mut() {
                 let mut filter = self.vlan_filter.lock();
                 let bit_set = filter.contains(vid);
                 let Ok(out) = vt.vfta_set(vid, vmdq::pf_pool(vt.num_vfs), true, vid != 0, bit_set)
@@ -1935,7 +1935,7 @@ impl Igb {
                     let word = vfta_word(vid);
                     let value = filter.word(word);
                     drop(filter);
-                    drop(vt);
+                    drop(vt_guard);
                     // SAFETY: mapped MMIO; VFTA word `word` is within
                     // the 128-word table for any valid VID.
                     unsafe {
@@ -1970,8 +1970,8 @@ impl Igb {
     pub fn vlan_filter_remove(&self, vid: u16) -> bool {
         // VMDq-aware path (lock order vt -> vlan_filter).
         {
-            let mut vt = self.vt.lock();
-            if let Some(vt) = vt.as_mut() {
+            let mut vt_guard = self.vt.lock();
+            if let Some(vt) = vt_guard.as_mut() {
                 let mut filter = self.vlan_filter.lock();
                 let bit_set = filter.contains(vid);
                 let Ok(out) = vt.vfta_set(vid, vmdq::pf_pool(vt.num_vfs), false, true, bit_set)
@@ -2011,7 +2011,7 @@ impl Igb {
                     let word = vfta_word(vid);
                     let value = filter.word(word);
                     drop(filter);
-                    drop(vt);
+                    drop(vt_guard);
                     // SAFETY: mapped MMIO; see `vlan_filter_add`.
                     unsafe {
                         self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);

@@ -121,21 +121,22 @@ fn smoke_copy_jobs_range_alias_cache_and_epoch_refusals() -> TestResult {
         Some(FsError::InvalidData)
     );
     assert!(CopyRequest::new(source.clone(), 0, source.clone(), 8192, 4096).is_ok());
-    let wc = gem
-        .object(
-            gem.create_placed(
-                4096,
-                None,
-                crate::intel_gpu_gem::Placement::SystemWc,
-                |_, _| Ok(()),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    assert_eq!(
-        CopyRequest::new(wc, 0, destination.clone(), 0, 4096).err(),
-        Some(FsError::Unsupported)
-    );
+    let wc = match gem.create_placed(
+        4096,
+        None,
+        crate::intel_gpu_gem::Placement::SystemWc,
+        |_, _| Ok(()),
+    ) {
+        Ok(handle) => Some(gem.object(handle).unwrap()),
+        Err(FsError::NotImplemented) if cfg!(target_arch = "aarch64") => None,
+        Err(e) => panic!("create_placed SystemWc: {e:?}"),
+    };
+    if let Some(wc) = wc {
+        assert_eq!(
+            CopyRequest::new(wc, 0, destination.clone(), 0, 4096).err(),
+            Some(FsError::Unsupported)
+        );
+    }
     // SAFETY: `source` retains this owned allocator frame throughout pinning
     // and the temporary USERPTR object's lifetime.
     let pin = unsafe {
