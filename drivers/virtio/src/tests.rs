@@ -1645,6 +1645,75 @@ kernel_test_in!(
     smoke_virtio_net_pci_set_mac_round_trip
 );
 
+/// Runtime MTU change through the stack-facing `DeviceControl`
+/// hook (audit gap 11): `configure` with a new MTU retargets the
+/// controller's live MTU, an above-ceiling value is refused with
+/// errno 22 and leaves the live MTU untouched, and the original
+/// MTU is restored so later smokes see the probe-time value.
+/// The ceiling is device-dependent (1500 without MRG, 9000 with),
+/// so it is probed from the controller rather than assumed.
+fn smoke_virtio_net_pci_set_mtu_round_trip() -> TestResult {
+    use crate::net_pci;
+    use narf_net::iface::DeviceControl;
+    if !net_pci::is_probed() {
+        return TestResult::Skip("virtio-net-pci not present in this QEMU config");
+    }
+    let original = match net_pci::with_controller(|c| c.mtu()) {
+        Some(m) => m,
+        None => return TestResult::Skip("primary virtio-net iface controller missing"),
+    };
+    // Pin the wiring itself: without a registered hook,
+    // `try_set_mtu` would succeed registry-only and the driver
+    // would never learn the new MTU.
+    if narf_net::iface::device_control(crate::net_pci::primary_iface_name()).is_none() {
+        return TestResult::Fail("DeviceControl hook not registered for primary iface");
+    }
+    let ceiling = match net_pci::with_controller(|c| c.max_mtu()) {
+        Some(m) => m,
+        None => return TestResult::Skip("primary virtio-net iface controller vanished"),
+    };
+    if ceiling < 1400 {
+        return TestResult::Skip("device MTU ceiling below 1400");
+    }
+    let mac = match net_pci::with_controller(|c| c.mac()) {
+        Some(m) => m,
+        None => return TestResult::Skip("primary virtio-net iface controller vanished"),
+    };
+    let config = |mtu: u32| narf_net::iface::DeviceConfig {
+        mac,
+        mtu,
+        promiscuous: false,
+        all_multicast: false,
+        addresses: alloc::vec::Vec::new(),
+    };
+    if net_pci::with_controller(|c| c.configure(&config(1400))) != Some(Ok(())) {
+        return TestResult::Fail("configure(1400) rejected");
+    }
+    if net_pci::with_controller(|c| c.mtu()) != Some(1400) {
+        let _ = net_pci::with_controller(|c| c.configure(&config(original)));
+        return TestResult::Fail("mtu() didn't reflect configure(1400)");
+    }
+    // Restore before the rejection check so a failure there can't
+    // leak the lowered MTU into later smokes.
+    if net_pci::with_controller(|c| c.configure(&config(original))) != Some(Ok(())) {
+        return TestResult::Fail("configure(original) restore rejected");
+    }
+    if net_pci::with_controller(|c| c.mtu()) != Some(original) {
+        return TestResult::Fail("mtu() didn't reflect restore");
+    }
+    if net_pci::with_controller(|c| c.configure(&config(ceiling + 1))) != Some(Err(22)) {
+        return TestResult::Fail("configure above ceiling did not report EINVAL");
+    }
+    if net_pci::with_controller(|c| c.mtu()) != Some(original) {
+        return TestResult::Fail("rejected configure clobbered live MTU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_pci_set_mtu_round_trip
+);
+
 fn smoke_virtio_net_pci_dhcp_acquire() -> TestResult {
     // End-to-end DHCP exchange against QEMU's built-in user-mode
     // SLIRP server, which always offers `10.0.2.15` as the lease.

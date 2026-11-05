@@ -22,7 +22,7 @@
 //! parallel callers don't serialise on a single virtqueue lock,
 //! and each RX pair gets its own forwarder.
 
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Latency policy for TX notification. EVENT_IDX suppression (default) lets the
 /// device (QEMU/SLIRP) tell us when to skip a notify VM-exit — great for
@@ -392,6 +392,11 @@ pub const MAX_RX_FRAME: usize = 1518 + VIRTIO_NET_HDR_LEN;
 /// RX header grows to 20 bytes with HASH_REPORT.
 const MAX_RX_FRAME_PAYLOAD: usize = MAX_RX_FRAME - VIRTIO_NET_HDR_LEN;
 
+/// Minimum runtime MTU (Linux `virtio_net.c`: `dev->min_mtu =
+/// ETH_MIN_MTU` = 68). Probe keeps its own `>= 64` gate for
+/// device-advertised values (below 64 falls back to 1500);
+/// runtime changes enforce the Linux 68 floor instead.
+const MIN_MTU: u32 = 68;
 /// Largest MTU honestly advertisable without MRG_RXBUF: a standard
 /// frame (1500 MTU + Ethernet header + VLAN tag). A device advertising
 /// more while MRG is off gets clamped to this at probe — previously
@@ -594,9 +599,19 @@ pub struct VirtioNetPci {
     /// `vlan_add` / `vlan_del` short-circuit with NoQueues when
     /// this is false rather than firing a doomed CTRL_VQ command.
     has_ctrl_vlan: bool,
-    /// Last-read MTU from device-cfg (when `VIRTIO_NET_F_MTU`
-    /// negotiated). Default 1500 otherwise.
-    mtu: u32,
+    /// Current MTU: probe-time device value clamped by
+    /// `clamp_mtu`, retargetable at runtime via `set_mtu`.
+    /// `AtomicU32` so the TX/RX paths read the live value per
+    /// frame with no lock, and `DeviceControl::configure`
+    /// (which takes `&self`) can commit a change.
+    mtu: AtomicU32,
+    /// Raw device-advertised MTU from device-cfg (1500 when
+    /// `VIRTIO_NET_F_MTU` wasn't negotiated or the value was
+    /// below 64). Immutable after probe; the runtime ceiling is
+    /// `clamp_mtu(device_mtu, mrg_rxbuf)` — the device value is
+    /// the ceiling (Linux `dev->max_mtu = mtu`), further capped
+    /// by what the datapath can deliver.
+    device_mtu: u32,
     /// True when `VIRTIO_NET_F_STATUS` was negotiated. Without it
     /// the spec says treat link as always up.
     has_status: bool,
@@ -1747,6 +1762,10 @@ impl VirtioNetPci {
         // and TX rejected past 1518 — the stack sized frames the
         // driver could never move. With MRG the jumbo cap applies.
         // A no-op at the QEMU default (1500) either way.
+        // Keep the raw advertised value: it is the runtime ceiling
+        // (Linux `dev->max_mtu`), while `mtu` is the clamped live
+        // value `set_mtu` retargets within that ceiling.
+        let device_mtu = mtu;
         mtu = clamp_mtu(mtu, want_mrg);
         // Stash an initial link-state guess on the controller so
         // accessors don't need to re-read MMIO on every poll.
@@ -1772,7 +1791,8 @@ impl VirtioNetPci {
             has_ctrl_mac_addr: want_ctrl_mac_addr,
             has_ctrl_rx: want_ctrl_rx,
             has_ctrl_vlan: want_ctrl_vlan,
-            mtu,
+            mtu: AtomicU32::new(mtu),
+            device_mtu,
             has_status: want_status,
             has_guest_announce: want_guest_announce,
             has_rss: want_rss,
@@ -2221,7 +2241,7 @@ impl VirtioNetPci {
                 &mut slice[VIRTIO_NET_HDR_LEN..total_len],
                 meta,
                 self.tx_offload_profile(),
-                max_frame_for_mtu(self.mtu),
+                max_frame_for_mtu(self.mtu()),
             )?;
             write_tx_header(&mut slice[..VIRTIO_NET_HDR_LEN], header);
         }
@@ -2357,11 +2377,43 @@ impl VirtioNetPci {
 
     /// Negotiated MTU. Defaults to 1500 when `VIRTIO_NET_F_MTU`
     /// wasn't offered. Always clamped to what the datapath can
-    /// deliver (see the probe-time `clamp_mtu` call).
+    /// deliver (see the probe-time `clamp_mtu` call); retargeted
+    /// at runtime by `set_mtu` within `max_mtu()`.
     pub fn mtu(&self) -> u32 {
-        self.mtu
+        self.mtu.load(Ordering::Acquire)
     }
 
+    /// Runtime MTU ceiling: the device-advertised MTU, capped by
+    /// what the datapath can deliver (`clamp_mtu`). Linux sets
+    /// `dev->max_mtu` to the device MTU when `VIRTIO_NET_F_MTU`
+    /// is negotiated; NARF additionally caps at the no-MRG (1500)
+    /// / MRG (9000) datapath bound, so `set_mtu` can never
+    /// advertise a value the datapath would reject.
+    pub fn max_mtu(&self) -> u32 {
+        clamp_mtu(self.device_mtu, self.mrg_rxbuf)
+    }
+
+    /// Change the MTU at runtime (Linux `ndo_change_mtu` analog;
+    /// virtio-net has no MTU-set control command — the device MTU
+    /// is advisory and the guest stack value is what matters, so
+    /// Linux's generic `eth_change_mtu` likewise just sets
+    /// `dev->mtu`).
+    ///
+    /// Valid range is `MIN_MTU..=max_mtu()` (68..=device ceiling);
+    /// anything else is `InvalidArgument` and the live MTU is
+    /// untouched. No stop/reset dance (unlike igc): there is no
+    /// MTU register to program — the TX plain-frame cap and the
+    /// RX reassembly bound both read the live `mtu()` per frame,
+    /// so the new value applies to subsequently submitted frames
+    /// only and in-flight frames complete under the old bound.
+    /// No control-queue command is issued.
+    pub fn set_mtu(&self, mtu: u32) -> Result<(), VirtioPciError> {
+        if !(MIN_MTU..=self.max_mtu()).contains(&mtu) {
+            return Err(VirtioPciError::InvalidArgument);
+        }
+        self.mtu.store(mtu, Ordering::Release);
+        Ok(())
+    }
     /// True when `VIRTIO_NET_F_RSS` was negotiated.
     pub fn has_rss(&self) -> bool {
         self.has_rss
@@ -3151,7 +3203,7 @@ impl VirtioNetPci {
                 len0 as usize,
                 &cont_lens,
                 num_buffers,
-                self.mtu,
+                self.mtu(),
                 self.rx_hdr_len,
             )
         };
@@ -3535,6 +3587,26 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
+/// Stack MTU/MAC admin (`try_set_mtu` / `try_set_mac` /
+/// `dev_set_promiscuity` / `dev_set_allmulti` all funnel here via
+/// `configure_device`). Applies the MTU delta only: the device has
+/// no MTU-set command and no other field has a driver-side apply
+/// path in this lane. MAC / promisc / allmulti / addresses are
+/// deliberately NOT applied here — `configure_device` still
+/// commits them to the registry entry, exactly as the pre-hook
+/// registry-only path did, so wiring this hook changes no
+/// MAC/promisc behaviour. (MAC via the control queue exists as
+/// `set_mac` but is not wired to the registry path; that is a
+/// separate gap.)
+impl narf_net::iface::DeviceControl for VirtioNetPci {
+    fn configure(&self, desired: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+        if desired.mtu != self.mtu() {
+            self.set_mtu(desired.mtu).map_err(|_| 22)?;
+        }
+        Ok(())
+    }
+}
+
 /// Build a `VirtioNet` from the controller at `idx`, register it
 /// with `narf_net::registry()` under `name`, and spawn the RX/TX
 /// forwarder tasks scoped to that controller's index.
@@ -3593,6 +3665,12 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
         // `gro_flush` before it parks, so this interface can safely opt into
         // the stack's per-interface software GRO path.
         let _ = narf_net::iface::set_software_gro(name, true);
+        // Publish the clamped probe MTU to the legacy registry so
+        // the stack segments at the MTU the driver enforces (the
+        // entry otherwise keeps its 1500 default even for a
+        // 1400-MTU device, and the driver would reject the
+        // stack's 1500-byte frames).
+        let _ = narf_net::iface::set_mtu(name, mtu);
         *PRIMARY_IFNAME.lock() = Some(name);
         // Opt into zero-copy TX with one recycler per TX pair. `tx_acquire`
         // records its selected queue in the frame, and the reaper returns the
@@ -3633,7 +3711,8 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     // already told us its virtio-net link is up, so NetworkManager sees an
     // unavailable device and never starts DHCP.
     narf_net::iface::set_link_metadata(&name, link_up, None, None);
-    let iface = narf_net::virtio_net::VirtioNet::new(name, mac, mtu, link_up, tx_prod, rx_cons);
+    let iface =
+        narf_net::virtio_net::VirtioNet::new(name.clone(), mac, mtu, link_up, tx_prod, rx_cons);
     let authority = narf_net::bootstrap_authority();
     // Registration failure leaks the iface (returned by-value into
     // the registry would have moved it) — we constructed it above
@@ -3642,6 +3721,18 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     // to nothing useful, so bail.
     if narf_net::registry().register(&authority, iface).is_err() {
         return;
+    }
+    if idx == 0 {
+        // Route stack MTU admin through the controller so a runtime
+        // `try_set_mtu` retargets the driver's live MTU (and its
+        // TX/RX caps) instead of only stamping the registry entry.
+        // Clone the Arc out, then drop the lock before the call
+        // (see the CONTROLLERS doc comment).
+        let ctrl = CONTROLLERS.lock().get(idx).and_then(|o| o.clone());
+        if let Some(ctrl) = ctrl {
+            let ops: Arc<dyn narf_net::iface::DeviceControl> = ctrl;
+            let _ = narf_net::iface::set_device_control(&name, ops);
+        }
     }
     // Wrap the rx_prod in an Arc<IrqSafeSpinLock> so all N RX
     // forwarders can push to it. Producer is !Sync (narf_ipc SPSC);
@@ -4518,7 +4609,8 @@ mod tx_tests {
                 has_ctrl_mac_addr: false,
                 has_ctrl_rx: false,
                 has_ctrl_vlan: false,
-                mtu: 1500,
+                mtu: AtomicU32::new(1500),
+                device_mtu: 1500,
                 has_status: false,
                 has_guest_announce: false,
                 has_rss: false,
@@ -5112,7 +5204,7 @@ mod tx_tests {
             // Jumbo-cap MTU so the 1518 + 50 payload fits the shape
             // check; the fixture's 1500 would reject it under both
             // old and new code.
-            fixture.dev.mtu = 9000;
+            fixture.dev.mtu.store(9000, Ordering::Release);
             // Segment 0 is the fixture's posted buffer: find its
             // slot, then rewrite it as a 20-byte header (num_buffers
             // 2, distinctive hash fields) + 1518 bytes of payload.
@@ -5301,6 +5393,66 @@ mod tx_tests {
             Err(e) => TestResult::Fail(e),
         }
     }
+
+    /// Runtime `set_mtu` (audit gap 11): bounds, live-MTU
+    /// retarget, and the TX plain-frame cap following the live
+    /// value. Fixture: device MTU 1500, no MRG — ceiling 1500.
+    /// The cap check goes through `tx_header_for_frame` with the
+    /// same `max_frame_for_mtu(dev.mtu())` bound the submit path
+    /// passes, so it pins the live TX boundary, not a copy of it.
+    fn smoke_virtio_net_mtu_set_runtime() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let fixture = TxFixture::new()?;
+            let dev = &fixture.dev;
+            if dev.mtu() != 1500 || dev.max_mtu() != 1500 {
+                return Err("fixture MTU/ceiling is not 1500");
+            }
+            if dev.set_mtu(1400).is_err() || dev.mtu() != 1400 {
+                return Err("set_mtu(1400) did not take");
+            }
+            let profile = dev.tx_offload_profile();
+            let mut frame = [0u8; 1419];
+            if tx_header_for_frame(
+                &mut frame[..1418],
+                narf_net::TxMeta::plain(),
+                profile,
+                max_frame_for_mtu(dev.mtu()),
+            )
+            .is_err()
+            {
+                return Err("1418-byte frame rejected at MTU 1400");
+            }
+            if tx_header_for_frame(
+                &mut frame,
+                narf_net::TxMeta::plain(),
+                profile,
+                max_frame_for_mtu(dev.mtu()),
+            )
+            .is_ok()
+            {
+                return Err("1419-byte frame accepted at MTU 1400");
+            }
+            // Bounds: Linux floor 68; above the ceiling rejected;
+            // a rejected change leaves the live MTU untouched.
+            if dev.set_mtu(67).is_ok() || dev.mtu() != 1400 {
+                return Err("MTU 67 accepted or clobbered live MTU");
+            }
+            if dev.set_mtu(1501).is_ok() || dev.mtu() != 1400 {
+                return Err("MTU above ceiling accepted or clobbered live MTU");
+            }
+            if dev.set_mtu(68).is_err() || dev.mtu() != 68 {
+                return Err("set_mtu(68) did not take");
+            }
+            if dev.set_mtu(1500).is_err() || dev.mtu() != 1500 {
+                return Err("set_mtu(1500) restore did not take");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
     kernel_test_in!(
         "drivers/virtio/net-pci",
         smoke_virtio_net_vlan_filter_gating
@@ -5407,6 +5559,7 @@ mod tx_tests {
         }
     }
     kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_mtu_clamp);
+    kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_mtu_set_runtime);
 
     fn smoke_virtio_net_tx_plain_cap_follows_mtu() -> TestResult {
         let run = || -> Result<(), &'static str> {
@@ -5566,7 +5719,8 @@ mod tx_tests {
                 has_ctrl_mac_addr: false,
                 has_ctrl_rx: false,
                 has_ctrl_vlan: false,
-                mtu: 1500,
+                mtu: AtomicU32::new(1500),
+                device_mtu: 1500,
                 has_status: false,
                 has_guest_announce: false,
                 tx_checksum: true,
