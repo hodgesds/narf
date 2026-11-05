@@ -1164,7 +1164,7 @@ impl Ixgbe {
             return 0;
         }
         let len = (desc.length as usize).min(out.len()).min(RX_BUF_LEN);
-        let buf_phys = self.rx_slots.lock()[head].dma_addr().raw();
+        let buf_phys = queue.rx_slots.lock()[head].dma_addr().raw();
         for (i, b) in out[..len].iter_mut().enumerate() {
             // SAFETY: identity-mapped DMA buffer; `buf_phys` is the
             // descriptor-published frame address and `i < len <= RX_BUF_LEN`,
