@@ -744,7 +744,6 @@ async fn auto_detach_best_effort(dev: &USBDevice) {
 /// Bound AX88179 device record (mirrors the r8152 record shape).
 #[derive(Debug)]
 pub struct AxDevice {
-    pub controller: u8,
     pub slot_id: u8,
     /// Owning xHCI controller id ([`Xhci::id`]): slot ids are only
     /// unique within one controller, so TX and detach resolve the
@@ -814,8 +813,7 @@ fn ax_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<(),
     if !ax_tx_meta_accepted(meta) {
         return Err(());
     }
-    let (slot_id, bulk_out_dci, out_max_packet) = tx_target(idx).ok_or(())?;
-    let controller = AX_DEVICES.lock().get(idx).ok_or(())?.controller;
+    let (controller, slot_id, bulk_out_dci, out_max_packet) = tx_target(idx).ok_or(())?;
     let seg = build_tx_segment(frame, out_max_packet);
     ax_send_segment(controller, slot_id, bulk_out_dci, &seg)
 }
@@ -1200,7 +1198,6 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         g.push(AxDevice {
             controller: device.controller().id(),
             slot_id: device.slot_id(),
-            controller: device.controller().id(),
             mac,
             bulk_in_dci,
             bulk_out_dci,
@@ -1331,7 +1328,7 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
 /// one-line follow-up once 1790 is proven on silicon.
 const MATCHES: &[UsbClassMatch] = &[UsbClassMatch::vid_pid(0x0B95, 0x1790)];
 
-fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
+fn probe(device: Arc<USBDevice>, _hub_port: Option<(u8, u8)>) -> Result<(), UsbProbeError> {
     // The registry probe is synchronous, but bind needs async
     // control transfers — spawn it (xpad precedent, same as r8152).
     narf_scheduler::spawn_stackful(async move {
