@@ -35,10 +35,13 @@
 //!    `observe_data_report` for completions.
 //!
 //! What this owner deliberately does NOT own (later steps):
-//! - Interrupt config/mask (`irq_be`) and the C2H completion path.
-//!   H2C buffers are retained in `h2c_retained` until that path
-//!   lands and releases them; the retention point is named here so
-//!   the C2H lane has somewhere to free from.
+//! - The C2H completion path. H2C buffers are retained in
+//!   `h2c_retained` until that path lands and releases them; the
+//!   retention point is named here so the C2H lane has somewhere to
+//!   free from. Interrupt config/mask (`irq_be`, chip-row step 6)
+//!   IS owned here: `irq_start` arms one MSI vector + the v2 mask
+//!   and `irq_service` / `irq_rearm` run the worker half, so the
+//!   C2H lane has classified events to consume.
 //! - FWCMD header framing for H2C bodies (type/category/class/func/
 //!   sequence): the station owner builds CCTL/BA-CAM/RA bodies and
 //!   this owner moves caller-framed buffers across CH12.
@@ -57,8 +60,10 @@
 //! RPQ will ever arrive for it); the owner stays usable for the
 //! remaining slots.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use narf_bus::MmioRegion;
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
+use narf_capabilities::{Cap, Write};
 use narf_io::DmaBuffer;
 
 use super::bacam_v1;
@@ -67,6 +72,8 @@ use super::dma_8922a;
 use super::dma_be::{self, Regs};
 use super::efuse_be::BeFactory;
 use super::eht::{EhtOperation, EhtStation, EHT_8922A};
+use super::irq_be::BindingBe;
+use super::power;
 use super::ra_mask::{self, StationCaps};
 use super::station_8922a::{self, Request, Station};
 use super::tx_8922a::{self, H2cPrepared, PrepareArgs, Prepared, Retained};
@@ -106,6 +113,16 @@ pub(super) enum Error {
     NoOwner,
     /// Capability invoke failed (authority lapsed).
     Authority,
+    /// Interrupt bind failed (no free vector, MSI programming
+    /// failed). `Unsupported` cannot occur for BE: the v2 mask is
+    /// infallible, unlike the AX `Mask::config` refusal.
+    Irq(super::irq::Error),
+    /// `irq_start` with a binding already installed.
+    AlreadyArmed,
+    /// MMIO failure during an interrupt start/service/rearm step.
+    /// Unreachable through `MmioRegs` (infallible); reachable only
+    /// through a failing [`super::irq::Regs`] in tests.
+    IrqIo(power::Error),
 }
 
 impl From<dma_8922a::Error> for Error {
@@ -155,6 +172,20 @@ impl Regs for MmioRegs<'_> {
     }
 }
 
+/// [`super::irq::Regs`] over the same BAR2 window, for the v2
+/// interrupt mask/enable/disable/recognize programs. Infallible:
+/// BAR2 MMIO cannot fail, so every op reports `Ok`.
+impl super::irq::Regs for MmioRegs<'_> {
+    fn read32(&mut self, address: u32) -> Result<u32, power::Error> {
+        Ok(<Self as Regs>::read32(self, address))
+    }
+
+    fn write32(&mut self, address: u32, value: u32) -> Result<(), power::Error> {
+        <Self as Regs>::write32(self, address, value);
+        Ok(())
+    }
+}
+
 /// The prepared 8922A device: factory identity, admitted stations,
 /// BE data + H2C transport owners, and ring state. Constructed by
 /// `pci::bring_up` for a probed 8922A device and retained on
@@ -168,6 +199,10 @@ pub(super) struct Prepared8922a {
     data: tx_8922a::DataTx,
     h2c: tx_8922a::H2cTx,
     rings_programmed: bool,
+    /// Installed v2 interrupt binding, if `irq_start` armed one.
+    /// `None` until then: no MSI is delivered and `irq_service`
+    /// reports nothing (polled mode).
+    irq: Option<BindingBe>,
     /// Submitted data frames' DMA buffers, keyed by
     /// (header DMA, frame DMA); freed on RPQ release.
     data_retained: Vec<(u64, u64, DmaBuffer, DmaBuffer)>,
@@ -190,6 +225,7 @@ impl Prepared8922a {
             data: tx_8922a::DataTx::new()?,
             h2c: tx_8922a::H2cTx::new(tx_8922a::DATA_RING_DEPTH)?,
             rings_programmed: false,
+            irq: None,
             data_retained: Vec::new(),
             h2c_retained: Vec::new(),
         })
@@ -222,6 +258,85 @@ impl Prepared8922a {
     /// True once `program_rings` has run and `stop_dma` has not.
     pub(super) fn rings_programmed(&self) -> bool {
         self.rings_programmed
+    }
+
+    /// True once `irq_start` has armed an interrupt binding.
+    pub(super) fn irq_armed(&self) -> bool {
+        self.irq.is_some()
+    }
+
+    /// `rtw89_pci_request_irq` + `rtw89_pci_ops_start` for the
+    /// admitted 8922A device: bind one MSI vector to `line` and
+    /// enable the v2 interrupt mask. Returns the CPU vector.
+    /// Refused when a binding is already installed or the rings
+    /// are not programmed yet — the future mac_pre_init/start
+    /// owner calls this after `program_rings` + `post_init_dma`,
+    /// so completions can only fire for rings that exist. A
+    /// bind failure leaves no binding behind; a mask-enable
+    /// failure releases the just-bound vector again.
+    pub(super) fn irq_start(
+        &mut self,
+        device: &BusDevice,
+        authority: &Cap<BusDeviceCap, Write>,
+        line: &Arc<super::irq::Line>,
+        regs: &mut impl super::irq::Regs,
+    ) -> Result<u8, Error> {
+        if self.irq.is_some() {
+            return Err(Error::AlreadyArmed);
+        }
+        if !self.rings_programmed {
+            return Err(Error::NotProgrammed);
+        }
+        let binding = BindingBe::bind(device, authority, line).map_err(Error::Irq)?;
+        if let Err(error) = binding.start(&mut *regs) {
+            binding.release(&mut *regs, authority);
+            return Err(Error::IrqIo(error));
+        }
+        let vector = binding.vector();
+        self.irq = Some(binding);
+        Ok(vector)
+    }
+
+    /// Worker half of the Linux hard/threaded handlers: mask, then
+    /// recognize and acknowledge enabled sources. Without a binding
+    /// the worker is in polled mode and nothing is reported. The
+    /// classified events are the C2H lane's input: `rpq` / `rx`
+    /// schedule the RPQ / RXQ drain, `rx_unavailable` re-arms RX,
+    /// and a fatal event ends the current run.
+    pub(super) fn irq_service(
+        &mut self,
+        regs: &mut impl super::irq::Regs,
+    ) -> Result<super::irq::Events, Error> {
+        let Some(binding) = self.irq.as_ref() else {
+            return Ok(super::irq::Events::default());
+        };
+        binding
+            .service(regs)
+            .map(|isrs| isrs.events())
+            .map_err(Error::IrqIo)
+    }
+
+    /// NAPI-completion re-enable after RPQ/RXQ were drained.
+    /// Without a binding this is a no-op.
+    pub(super) fn irq_rearm(&mut self, regs: &mut impl super::irq::Regs) -> Result<(), Error> {
+        let Some(binding) = self.irq.as_ref() else {
+            return Ok(());
+        };
+        binding.rearm(regs).map_err(Error::IrqIo)
+    }
+
+    /// `rtw89_pci_ops_stop` + `rtw89_pci_free_irq`: HIMR off, MSI
+    /// off, then drain and return the vector (or quarantine it when
+    /// MSI cannot be proven disabled). Idempotent: releasing an
+    /// unarmed owner is a no-op.
+    pub(super) fn irq_release(
+        &mut self,
+        regs: &mut impl super::irq::Regs,
+        authority: &Cap<BusDeviceCap, Write>,
+    ) {
+        if let Some(binding) = self.irq.take() {
+            binding.release(regs, authority);
+        }
     }
 
     /// Pre-init DMA, first half (`pci_be.c:493`, before the caller's

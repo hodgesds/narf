@@ -39,6 +39,10 @@ use narf_lib::id::DomainId;
 pub struct Rtw89Device {
     /// Retained bus identity; a repeat probe must not park the active owner.
     pub(crate) bus_addr: narf_bus::BusAddr,
+    /// Retained PCI function identity for MSI binding (irq_be step 6).
+    /// `BusDevice` is `Copy`; the MSI enable path needs the function,
+    /// not just its address.
+    pub(crate) device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
     /// BAR2 MMIO mapping — the only BAR rtw89 silicon exposes.
     pub mmio_bar2: MmioRegion,
@@ -327,6 +331,7 @@ unsafe fn bring_up_registers(
     };
     Ok(Rtw89Device {
         bus_addr: device.addr,
+        device: *device,
         cap: *cap,
         mmio_bar2,
         mac,
@@ -750,6 +755,111 @@ impl Rtw89Device {
         let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
         let completed = owner.observe_data_rp(regs, channel)?;
         Ok(completed.into_iter().map(|done| done.resource).collect())
+    }
+
+    /// BE interrupt arm for a probed 8922A device: `rtw89_pci_request_irq`
+    /// + `rtw89_pci_ops_start` through the Prepared owner — bind one
+    /// MSI vector to `line` and enable the v2 mask. Returns the CPU
+    /// vector; the caller (the future start/worker owner) records it
+    /// and drives `irq_service_8922a` / `irq_rearm_8922a` from the
+    /// line's wakeups. Refused until the rings are programmed.
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as [`Self::submit_be_data`].
+    pub(super) unsafe fn irq_start_8922a(
+        &self,
+        line: &Arc<super::irq::Line>,
+    ) -> Result<u8, super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller's live initialized ring/no-reset contract.
+            unsafe { self.irq_start_8922a_authorized(line) }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn irq_start_8922a_authorized(
+        &self,
+        line: &Arc<super::irq::Line>,
+    ) -> Result<u8, super::prepared_8922a::Error> {
+        use super::prepared_8922a::Error;
+        let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
+        let mut owner = owner_lock.lock();
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        owner.irq_start(&self.device, &self.cap, line, regs)
+    }
+
+    /// BE interrupt service for a probed 8922A device: mask, then
+    /// recognize and acknowledge enabled v2 sources, classified for
+    /// the completion worker. Without an armed binding this reports
+    /// no events (polled mode).
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as [`Self::submit_be_data`].
+    pub(super) unsafe fn irq_service_8922a(
+        &self,
+    ) -> Result<super::irq::Events, super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller's live initialized ring/no-reset contract.
+            unsafe { self.irq_service_8922a_authorized() }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn irq_service_8922a_authorized(
+        &self,
+    ) -> Result<super::irq::Events, super::prepared_8922a::Error> {
+        use super::prepared_8922a::Error;
+        let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
+        let mut owner = owner_lock.lock();
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        owner.irq_service(regs)
+    }
+
+    /// BE interrupt re-arm for a probed 8922A device: re-enable the
+    /// v2 mask after the worker drained RPQ/RXQ. Without an armed
+    /// binding this is a no-op.
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as [`Self::submit_be_data`].
+    pub(super) unsafe fn irq_rearm_8922a(&self) -> Result<(), super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller's live initialized ring/no-reset contract.
+            unsafe { self.irq_rearm_8922a_authorized() }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn irq_rearm_8922a_authorized(&self) -> Result<(), super::prepared_8922a::Error> {
+        use super::prepared_8922a::Error;
+        let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
+        let mut owner = owner_lock.lock();
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        owner.irq_rearm(regs)
+    }
+
+    /// BE interrupt release for a probed 8922A device:
+    /// `rtw89_pci_ops_stop` + `rtw89_pci_free_irq` through the
+    /// Prepared owner. Idempotent when unarmed.
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as [`Self::submit_be_data`]:
+    /// no reset/removal can race, and the device can no longer
+    /// target the vector once this returns.
+    pub(super) unsafe fn irq_release_8922a(&self) -> Result<(), super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller's live initialized ring/no-reset contract.
+            unsafe { self.irq_release_8922a_authorized() }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn irq_release_8922a_authorized(&self) -> Result<(), super::prepared_8922a::Error> {
+        use super::prepared_8922a::Error;
+        let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
+        let mut owner = owner_lock.lock();
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        owner.irq_release(regs, &self.cap);
+        Ok(())
     }
 }
 
