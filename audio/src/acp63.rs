@@ -1,7 +1,8 @@
 //! Phoenix ACP 6.3 PDM capture, native (no DSP firmware).
 //! References: Linux sound/soc/amd/ps/{pci-ps,ps-common,ps-pdm-dma}.c
 //! and include/sound/acp63_chip_offset_byte.h. SoundWire-only configurations
-//! are left unbound; HDA remains an independent PCI function.
+//! are bound by the ACP 6.3 SDW manager driver in [`crate::acp63_sdw`]
+//! (audio spec §3.2); HDA remains an independent PCI function.
 use crate::{
     native_irq::{Kind, Route, State},
     native_pcm::Ring,

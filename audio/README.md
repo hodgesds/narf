@@ -37,8 +37,9 @@ shared memory, PCI/bus enumeration, ACPI/AML (to confirm ACP identity
 and pin configuration), interrupts, firmware loading, the scheduler and
 timekeeping, plus `drivers/virtio` and `drivers/sound`. The implemented
 native profile is analog HDA plus ACP PDM, with the ATI HDMI codec
-side (`hda::hdmi`) for display audio; SoundWire, vendor smart-amplifier
-fixups, and DSP firmware execution are out of this profile. The crate
+side (`hda::hdmi`) for display audio and SoundWire manager + codec
+attachment for ACP platforms (audio spec §3.2); vendor smart-amplifier
+fixups and DSP firmware execution are out of this profile. The crate
 is `no_std`.
 
 - Spec: [`specification/spec.md`](./specification/spec.md)
