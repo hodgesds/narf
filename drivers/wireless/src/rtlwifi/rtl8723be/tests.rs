@@ -1671,3 +1671,494 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_coex_owner_lps_c2h_watchdog_halt
 );
+
+// ── Signed envelopes (`rtl8723be/envelope.rs`) ───────────────────────────
+
+/// Test board factory (synthetic values, not any board's).
+fn be_factory() -> crate::rtlwifi::efuse::Factory {
+    crate::rtlwifi::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x87, 0x23, 0xbe],
+        logical: [0u8; 512],
+    }
+}
+
+/// Build a NAPC envelope from the documented layout (header 96, rows of
+/// 388 bytes: channel/band/bandwidth/offset + three 64-entry curves).
+/// `rows` are (channel, bandwidth, offset, curve-value fn) for v2, or
+/// (channel, 20, 0, fn) for v1. The identity is the board's factory
+/// identity; the MAC matches the factory. The curve fn takes the curve
+/// index (0 CCK, 1 OFDM, 2 HT) and the TXAGC index.
+fn be_napc_fixture(
+    version: u16,
+    antenna: i16,
+    qualified: i16,
+    rows: &[(u8, u8, u8, fn(u8, u8) -> i16)],
+) -> Vec<u8> {
+    let factory = be_factory();
+    let identity = crate::rtlwifi::radio::factory_identity(&factory);
+    let total = 96 + rows.len() * 388;
+    let mut bytes = vec![0u8; total];
+    bytes[0..4].copy_from_slice(b"NAPC");
+    bytes[4..6].copy_from_slice(&version.to_le_bytes());
+    bytes[6..8].copy_from_slice(&96u16.to_le_bytes());
+    bytes[8..12].copy_from_slice(&(total as u32).to_le_bytes());
+    bytes[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    bytes[14..16].copy_from_slice(&0xb723u16.to_le_bytes());
+    bytes[16..48].copy_from_slice(&identity);
+    bytes[48..54].copy_from_slice(&factory.mac);
+    bytes[56..58].copy_from_slice(&antenna.to_le_bytes());
+    bytes[58..60].copy_from_slice(&qualified.to_le_bytes());
+    bytes[60..62].copy_from_slice(&(rows.len() as u16).to_le_bytes());
+    bytes[62..64].copy_from_slice(&(if version == 1 { 20u16 } else { 0u16 }).to_le_bytes());
+    for (i, (channel, bandwidth, offset, curve)) in rows.iter().enumerate() {
+        let row = &mut bytes[96 + i * 388..96 + (i + 1) * 388];
+        row[0] = *channel;
+        if version == 2 {
+            row[1] = 0;
+            row[2] = *bandwidth;
+            row[3] = *offset;
+        }
+        for curve_idx in 0..3u8 {
+            for idx in 0..64u8 {
+                let at = 4 + (usize::from(curve_idx) * 64 + usize::from(idx)) * 2;
+                row[at..at + 2].copy_from_slice(&curve(curve_idx, idx).to_le_bytes());
+            }
+        }
+    }
+    bytes
+}
+
+/// Flat rising curves: output `2 * index` quarter dBm, so a 20 dBm
+/// ceiling with antenna 0 admits index 40 on every rate.
+fn be_rising(_curve: u8, idx: u8) -> i16 {
+    i16::from(idx) * 2
+}
+
+/// HT curve unmeasured: MCS rates can never be admitted.
+fn be_no_ht(curve: u8, idx: u8) -> i16 {
+    if curve == 2 {
+        i16::MAX
+    } else {
+        i16::from(idx) * 2
+    }
+}
+
+/// US 2.4 GHz domain: 2402-2472 MHz, 40 MHz, 20 dBm.
+fn be_us_domain() -> narf_wireless::reg::RegulatoryDomain {
+    use narf_wireless::reg::*;
+    RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: 40,
+            max_power_dbm: 20,
+            flags: RegFlags::empty(),
+        }],
+    }
+}
+
+/// v1 parse + permission (all 20 rates admitted, index 40), tampered
+/// variants, the masking-defeating multi-row v2 case, and grant minting
+/// with the Linux factory-index cap.
+fn smoke_rtl8723be_envelope_parse_permission_and_grant() -> TestResult {
+    use envelope::*;
+    let factory = be_factory();
+    let domain = be_us_domain();
+    let bytes = be_napc_fixture(1, 0, 80, &[(6, 20, 0, be_rising)]);
+    let cal = match Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8723BE envelope v1 parse"),
+    };
+    if !cal.measures(Operating::twenty(6)) || cal.measures(Operating::twenty(7)) {
+        return TestResult::Fail("8723BE envelope v1 rows");
+    }
+    let perm = match cal.permission_for(&domain, Operating::twenty(6)) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("8723BE envelope v1 permission"),
+    };
+    if perm.admitted_rates() != 0xfffff
+        || perm.eirp_limit_qdbm() != 80
+        || STATION_RATES.into_iter().any(|r| perm.index(r) != 40)
+    {
+        return TestResult::Fail("8723BE envelope v1 permission values");
+    }
+    // Tampered variants: each must be refused.
+    let mut bad = bytes.clone();
+    bad[0] = b'X';
+    if Calibration::from_verified(&bad, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8723BE envelope bad magic admitted");
+    }
+    let mut bad = bytes.clone();
+    bad[14..16].copy_from_slice(&0x8723u16.to_le_bytes());
+    if Calibration::from_verified(&bad, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8723BE envelope wrong device admitted");
+    }
+    if Calibration::from_verified(&bytes, None, &factory).is_ok() {
+        return TestResult::Fail("8723BE envelope unsigned admitted");
+    }
+    let mut other = be_factory();
+    other.mac[5] = 0xbf;
+    if Calibration::from_verified(&bytes, Some([0xabu8; 32]), &other).is_ok() {
+        return TestResult::Fail("8723BE envelope identity mismatch admitted");
+    }
+    // v2: a 5 GHz row is a format failure even after a valid row, and
+    // unordered rows are refused.
+    let v2 = be_napc_fixture(2, 0, 80, &[(6, 20, 0, be_rising), (36, 20, 0, be_rising)]);
+    let mut v2bad = v2.clone();
+    v2bad[96 + 388 + 1] = 1;
+    if Calibration::from_verified(&v2bad, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8723BE envelope 5 GHz row admitted");
+    }
+    let unordered = be_napc_fixture(2, 0, 80, &[(6, 20, 0, be_rising), (5, 20, 0, be_rising)]);
+    if Calibration::from_verified(&unordered, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8723BE envelope unordered rows admitted");
+    }
+    // An HT-unmeasured board cannot admit the point at all.
+    let no_ht = be_napc_fixture(1, 0, 80, &[(6, 20, 0, be_no_ht)]);
+    let cal_no_ht = match Calibration::from_verified(&no_ht, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8723BE envelope no-HT parse"),
+    };
+    if cal_no_ht
+        .permission_for(&domain, Operating::twenty(6))
+        .is_ok()
+    {
+        return TestResult::Fail("8723BE envelope unmeasured HT admitted");
+    }
+    // Grant minting with the factory cap engaged on every rate:
+    // crafted EFUSE (CCK bases 0x10, BW40 bases 0x08, zero diffs) with
+    // regulatory 2 (by-rate diff skipped) gives Linux indices
+    // CCK 16 / OFDM 8 / MCS 8 — all below the measured fit 40.
+    let mut map = vec![0u8; 0x20];
+    map[0x10..0x16].copy_from_slice(&[0x10; 6]);
+    map[0x16..0x1b].copy_from_slice(&[0x08; 5]);
+    let efuse = match txpower::Efuse::from_logical(&map) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("8723BE grant EFUSE"),
+    };
+    let by_rate = txpower::ByRate::from_table();
+    let grant = match cal.grant_for(&domain, &efuse, &by_rate, 2, Operating::twenty(6)) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("8723BE grant mint"),
+    };
+    let expected: [u8; 20] = [
+        16, 16, 16, 16, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    ];
+    if grant.channel() != 6
+        || grant.forty()
+        || grant.prime_sc() != 0
+        || grant.indices() != &expected
+        || grant.identity() != crate::rtlwifi::radio::factory_identity(&factory)
+    {
+        return TestResult::Fail("8723BE grant values / factory cap");
+    }
+    // 40 MHz grant: primary 3 above → wide channel 5, prime_sc 1.
+    let v2cal = be_napc_fixture(
+        2,
+        0,
+        80,
+        &[
+            (6, 20, 0, be_rising),
+            (3, 40, 1, be_rising),
+            (9, 40, 2, be_rising),
+        ],
+    );
+    let cal2 = match Calibration::from_verified(&v2cal, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8723BE envelope v2 parse"),
+    };
+    let op40 = Operating {
+        width: Width::W40Above,
+        channel: 3,
+    };
+    let grant40 = match cal2.grant_for(&domain, &efuse, &by_rate, 2, op40) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("8723BE 40 MHz grant mint"),
+    };
+    if grant40.channel() != 5 || !grant40.forty() || grant40.prime_sc() != 1 {
+        return TestResult::Fail("8723BE 40 MHz grant shape");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_envelope_parse_permission_and_grant
+);
+
+// ── Packet owner (`rtl8723be/packet.rs`) ──────────────────────────────────
+
+/// Admitted packet owner for the tests: v1 rising calibration on
+/// channel 6, grant from the provisioned test map (regulatory 0).
+fn be_packet_owner() -> Option<(packet::Owner, envelope::Permission, channel::Grant)> {
+    use envelope::*;
+    let factory = be_factory();
+    let domain = be_us_domain();
+    let bytes = be_napc_fixture(1, 0, 80, &[(6, 20, 0, be_rising)]);
+    let cal = Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory).ok()?;
+    let perm = cal.permission_for(&domain, Operating::twenty(6)).ok()?;
+    let efuse = txpower::Efuse::from_logical(&provisioned()).ok()?;
+    let by_rate = txpower::ByRate::from_table();
+    let grant = cal
+        .grant_for(&domain, &efuse, &by_rate, 0, Operating::twenty(6))
+        .ok()?;
+    let info = crate::rtlwifi::firmware_transport::Info {
+        version: 0x1234,
+        subversion: 0,
+        payload: 0,
+    };
+    let owner = packet::Owner::admit(info, perm, grant).ok()?;
+    Some((owner, perm, grant))
+}
+
+/// Admission gates, TX descriptor golden bytes (hand-computed from the
+/// `trx::TxDesc::fill` rules, not from running the fill), the RTS
+/// variant, and refusal-before-write.
+fn smoke_rtl8723be_packet_admission_and_desc() -> TestResult {
+    use packet::*;
+    let Some((owner, perm, grant)) = be_packet_owner() else {
+        return TestResult::Fail("8723BE packet owner admit");
+    };
+    if owner.firmware_version() != 0x1234 || owner.permission() != perm || owner.grant() != grant {
+        return TestResult::Fail("8723BE packet owner accessors");
+    }
+    // Admission mismatch: a grant for another point, or a permission
+    // from another board, cannot construct an owner.
+    let domain = be_us_domain();
+    let factory = be_factory();
+    let bytes = be_napc_fixture(1, 0, 80, &[(6, 20, 0, be_rising)]);
+    let cal = match envelope::Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8723BE packet cal"),
+    };
+    let efuse = match txpower::Efuse::from_logical(&provisioned()) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("8723BE packet EFUSE"),
+    };
+    let by_rate = txpower::ByRate::from_table();
+    // Mint the mismatch as permission on 6 + grant on 6 from another
+    // board identity (a grant for channel 7 cannot exist here: the
+    // calibration carries no row for 7, so that grant_for fails).
+    let mut other = be_factory();
+    other.mac[5] = 0xbf;
+    let bytes_other = {
+        let mut b = be_napc_fixture(1, 0, 80, &[(6, 20, 0, be_rising)]);
+        let id = crate::rtlwifi::radio::factory_identity(&other);
+        b[16..48].copy_from_slice(&id);
+        b[48..54].copy_from_slice(&other.mac);
+        b
+    };
+    let cal_other =
+        match envelope::Calibration::from_verified(&bytes_other, Some([0xabu8; 32]), &other) {
+            Ok(c) => c,
+            Err(_) => return TestResult::Fail("8723BE packet cal other"),
+        };
+    let grant_other =
+        match cal_other.grant_for(&domain, &efuse, &by_rate, 0, envelope::Operating::twenty(6)) {
+            Ok(g) => g,
+            Err(_) => return TestResult::Fail("8723BE packet grant other"),
+        };
+    let info = crate::rtlwifi::firmware_transport::Info {
+        version: 0x1234,
+        subversion: 0,
+        payload: 0,
+    };
+    if packet::Owner::admit(info, perm, grant_other).is_ok() {
+        return TestResult::Fail("8723BE packet admit mismatch refused");
+    }
+    let tx = TxFrame {
+        op: envelope::Operating::twenty(6),
+        class: FrameClass::Data { priority: 0 },
+        len: 100,
+        buf_addr: 0x4000,
+        rate: 12,
+        seq: 0x123,
+        short: false,
+        bmc: false,
+        rts: None,
+        next_desc: 0x8000,
+    };
+    let mut slot = trx::TxDesc::default();
+    if owner.fill_tx_slot(&mut slot, &tx).is_err() {
+        return TestResult::Fail("8723BE packet fill admitted");
+    }
+    // Golden bytes, hand-computed from `trx::TxDesc::fill`:
+    // dw0 = offset 40<<16 | len 100 | firstseg<<27 | lastseg<<26
+    // (OWN clear); dw3 = seq<<12 | use_driver_rate<<8; dw4 = rate 12 |
+    // 0x1f<<8 | 0xf<<13 (= 0x1ff0c); dw7 = len; dw9 = seq<<12;
+    // dw10 = buffer.
+    if slot.dw[0] != 0x0c28_0064
+        || slot.dw[1] != 0
+        || slot.dw[2] != 0
+        || slot.dw[3] != 0x0012_3100
+        || slot.dw[4] != 0x0001_ff0c
+        || slot.dw[5] != 0
+        || slot.dw[6] != 0
+        || slot.dw[7] != 100
+        || slot.dw[8] != 0
+        || slot.dw[9] != 0x0012_3000
+        || slot.dw[10] != 0x4000
+        || slot.dw[12] != 0x8000
+        || slot.own()
+        || slot.pkt_size() != 100
+        || slot.queue_sel() != 0
+        || slot.tx_rate() != 12
+        || slot.data_bw() != 0
+        || slot.sub_carrier() != 0
+    {
+        return TestResult::Fail("8723BE packet TX descriptor bytes");
+    }
+    // Beacon queue selector.
+    let beacon = TxFrame {
+        class: FrameClass::Beacon,
+        rate: 0,
+        ..tx
+    };
+    let mut bslot = trx::TxDesc::default();
+    if owner.fill_tx_slot(&mut bslot, &beacon).is_err() || bslot.queue_sel() != trx::QSLT_BEACON {
+        return TestResult::Fail("8723BE packet beacon queuesel");
+    }
+    // RTS variant: rts_en bit 12, RTS rate in dw4, SC + short in dw5.
+    let rts_tx = TxFrame {
+        rts: Some(Rts {
+            rts_enable: true,
+            cts_enable: false,
+            rts_short: true,
+            rts_rate: 4,
+            rts_sc: 2,
+        }),
+        ..tx
+    };
+    let mut rslot = trx::TxDesc::default();
+    if owner.fill_tx_slot(&mut rslot, &rts_tx).is_err()
+        || rslot.dw[3] != 0x0012_4100
+        || rslot.dw[4] != 0x041f_f00c
+        || rslot.dw[5] != 0x0000_5000
+    {
+        return TestResult::Fail("8723BE packet RTS descriptor bytes");
+    }
+    // Refusal before any byte is written: sentinel slot unchanged.
+    let refused = |mut frame: TxFrame| -> bool {
+        let mut s = trx::TxDesc {
+            dw: [0xdead_beef; 16],
+        };
+        if owner.fill_tx_slot(&mut s, &mut frame).is_ok() {
+            return false;
+        }
+        s.dw == [0xdead_beef; 16]
+    };
+    if !refused(TxFrame {
+        op: envelope::Operating::twenty(7),
+        ..tx
+    }) || !refused(TxFrame { rate: 20, ..tx })
+        || !refused(TxFrame { len: 0, ..tx })
+        || !refused(TxFrame { len: 0x10000, ..tx })
+    {
+        return TestResult::Fail("8723BE packet refused frame wrote");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_packet_admission_and_desc
+);
+
+/// RX dispatch: normal frames, hardware-owned slots, C2H BT info / BT
+/// MP / TX report through the coexistence owner, and the watchdog /
+/// EAPOL delegations.
+fn smoke_rtl8723be_packet_rx_c2h_and_notify() -> TestResult {
+    use crate::rtlwifi::btcoex::btc::{ChipInterface, ChipType, HwPg, BT_SEQ_GET_BT_VERSION};
+    use packet::*;
+    let Some((mut owner, _, _)) = be_packet_owner() else {
+        return TestResult::Fail("8723BE RX packet owner admit");
+    };
+    let pg = HwPg {
+        bt_exist: true,
+        ant_num: 2,
+        single_ant_path: 0,
+        chip_type: ChipType::Rtl8723b,
+        package_type: 0,
+        rfe_type: 0,
+        interface: ChipInterface::Pci,
+    };
+    let io = reg_log();
+    let mut coex = coex::Owner::bind(pg);
+    // Normal frame: length 100 at offset 32.
+    let mut buffer = vec![0u8; 200];
+    let dw = [100u32, 0, 0, 0, 0, 0, 0, 0];
+    let out = narf_scheduler::block_on(owner.service_rx(&io, &mut coex, &dw, &buffer));
+    if !matches!(out, Ok(RxOutcome::Frame { status, payload })
+        if !status.c2h && status.length == 100 && payload.len() == 100)
+        || owner.c2h_queued() != 0
+    {
+        return TestResult::Fail("8723BE RX normal frame");
+    }
+    // Hardware-owned slot: not ready.
+    let dw_own = [1u32 << 31, 0, 0, 0, 0, 0, 0, 0];
+    if narf_scheduler::block_on(owner.service_rx(&io, &mut coex, &dw_own, &buffer))
+        != Err(Error::NotReady)
+    {
+        return TestResult::Fail("8723BE RX own bit");
+    }
+    // C2H BT info → coexistence notify, consumed, queue drained.
+    let info = [c2h::C2H_BT_INFO, 0, 0, 7, 0, 0, 0, 0, 0];
+    buffer[32..41].copy_from_slice(&info);
+    let dw_c2h = [9u32, 0, 1 << 28, 0, 0, 0, 0, 0];
+    let n = coex.btc.statistics.cnt_bt_info_notify;
+    if narf_scheduler::block_on(owner.service_rx(&io, &mut coex, &dw_c2h, &buffer))
+        != Ok(RxOutcome::Consumed)
+        || coex.btc.statistics.cnt_bt_info_notify != n + 1
+        || owner.c2h_queued() != 0
+    {
+        return TestResult::Fail("8723BE RX C2H BT info");
+    }
+    // C2H BT MP outside a wait → btmpinfo only, consumed.
+    let mp = [
+        c2h::C2H_BT_MP,
+        0,
+        1,
+        0,
+        BT_SEQ_GET_BT_VERSION << 4,
+        0x34,
+        0x12,
+        7,
+    ];
+    buffer[32..40].copy_from_slice(&mp);
+    let dw_mp = [8u32, 0, 1 << 28, 0, 0, 0, 0, 0];
+    if narf_scheduler::block_on(owner.service_rx(&io, &mut coex, &dw_mp, &buffer))
+        != Ok(RxOutcome::Consumed)
+        || coex.btc.bt_info.bt_real_fw_ver != 0x1234
+        || coex.btc.bt_info.bt_fw_ver != 7
+        || owner.c2h_queued() != 0
+    {
+        return TestResult::Fail("8723BE RX C2H BT MP");
+    }
+    // C2H TX report → returned to the caller.
+    let rep = [c2h::C2H_TX_REPORT, 0, 0x40, 0, 3, 0, 0, 0, 7];
+    buffer[32..41].copy_from_slice(&rep);
+    if narf_scheduler::block_on(owner.service_rx(&io, &mut coex, &dw_c2h, &buffer))
+        != Ok(RxOutcome::TxReport {
+            sn: 7,
+            st: 0x40,
+            retry: 3,
+        })
+        || owner.c2h_queued() != 0
+    {
+        return TestResult::Fail("8723BE RX C2H TX report");
+    }
+    // EAPOL + watchdog delegations through the packet owner.
+    owner.eapol(&mut coex, 0);
+    if !coex.btc.wifi.in_4way {
+        return TestResult::Fail("8723BE packet eapol delegation");
+    }
+    if narf_scheduler::block_on(owner.watchdog(&io, &mut coex, 0)) != Ok(true)
+        || narf_scheduler::block_on(owner.watchdog(&io, &mut coex, 1999)) != Ok(false)
+    {
+        return TestResult::Fail("8723BE packet watchdog delegation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_packet_rx_c2h_and_notify
+);
