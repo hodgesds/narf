@@ -14,6 +14,7 @@
 
 use alloc::vec::Vec;
 
+use crate::event::InquiryResultEntry;
 use crate::hci::Command;
 use crate::opcode as op;
 
@@ -37,6 +38,13 @@ pub fn build_inquiry(lap: [u8; 3], inquiry_length: u8, num_responses: u8) -> Com
         op::HCI_INQUIRY,
         &[lap[0], lap[1], lap[2], inquiry_length, num_responses],
     )
+}
+
+/// Build an `HCI_Inquiry_Cancel` command (§7.1.2). No parameters;
+/// the controller answers with Command Complete and then an
+/// Inquiry Complete event (§7.7.1) ending the inquiry window.
+pub fn build_inquiry_cancel() -> Command {
+    Command::with_params(op::HCI_INQUIRY_CANCEL, &[])
 }
 
 // ── Create Connection ──────────────────────────────────────────────
@@ -246,6 +254,136 @@ pub fn build_write_local_name(name: &[u8]) -> Command {
     let n = name.len().min(247); // leave room for NUL terminator.
     p[..n].copy_from_slice(&name[..n]);
     Command::with_params(op::HCI_WRITE_LOCAL_NAME, &p)
+}
+
+// ── Classic central initiator state machine ───────────────────────
+// Issue #1315: mirrors `gap::Central` (LE, #1312) for BR/EDR. The
+// pump owns command issuance; this type is transport-free
+// record-keeping so the phase transitions are auditable and the
+// pump fixtures can drive them through the scripted controller.
+
+/// Phases the Classic central walks during inquiry + paging.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ClassicPhase {
+    /// Initial state, no inquiry or page in progress.
+    #[default]
+    Idle,
+    /// HCI_Inquiry issued, awaiting Inquiry Complete (§7.7.1).
+    Inquiring,
+    /// HCI_Inquiry_Cancel issued, awaiting Inquiry Complete.
+    InquiryStopping,
+    /// HCI_Create_Connection issued, awaiting Connection Complete (§7.7.3).
+    Paging,
+    /// Connection complete; controller holds the ACL link.
+    Connected,
+}
+
+/// A peer discovered by inquiry (§7.7.2). PSRM + clock offset are
+/// the paging parameters HCI_Create_Connection needs (§7.1.5); the
+/// class of device is recorded for the trigger layer (profile
+/// selection lives in a later lane).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ClassicPeer {
+    pub bd_addr: [u8; 6],
+    pub page_scan_repetition_mode: u8,
+    pub class_of_device: [u8; 3],
+    pub clock_offset: u16,
+}
+
+/// Parameters for one deferred page: the peer's paging parameters
+/// captured at connect time, issued once inquiry ends.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PageRequest {
+    pub bd_addr: [u8; 6],
+    pub page_scan_repetition_mode: u8,
+    pub clock_offset: u16,
+}
+
+/// Lightweight Classic central state machine. Pass inquiry results
+/// in, pull phase transitions out for the pump to act on.
+#[derive(Debug, Default)]
+pub struct ClassicCentral {
+    pub phase: ClassicPhase,
+    pub peers: Vec<ClassicPeer>,
+    pub connected_handle: Option<u16>,
+    /// Last Write_Scan_Enable mode the controller accepted (0 = off,
+    /// 1 = inquiry, 2 = page, 3 = both). 0 until one succeeds.
+    pub scan_mode: u8,
+}
+
+impl ClassicCentral {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a discovered peer (or refresh its paging parameters).
+    /// A re-report of the same BD_ADDR refreshes PSRM / class /
+    /// clock offset in place; it never duplicates the entry.
+    pub fn report_inquiry_result(&mut self, entry: &InquiryResultEntry) {
+        if let Some(p) = self.peers.iter_mut().find(|p| p.bd_addr == entry.bd_addr) {
+            p.page_scan_repetition_mode = entry.page_scan_repetition_mode;
+            p.class_of_device = entry.class_of_device;
+            p.clock_offset = entry.clock_offset;
+            return;
+        }
+        self.peers.push(ClassicPeer {
+            bd_addr: entry.bd_addr,
+            page_scan_repetition_mode: entry.page_scan_repetition_mode,
+            class_of_device: entry.class_of_device,
+            clock_offset: entry.clock_offset,
+        });
+    }
+
+    /// The discovered peer with this BD_ADDR, if inquiry saw it.
+    pub fn peer(&self, bd_addr: &[u8; 6]) -> Option<&ClassicPeer> {
+        self.peers.iter().find(|p| &p.bd_addr == bd_addr)
+    }
+
+    /// Mark phase after the host has just emitted HCI_Inquiry.
+    pub fn note_inquiry_started(&mut self) {
+        self.phase = ClassicPhase::Inquiring;
+    }
+
+    /// Mark phase after the host has just emitted HCI_Inquiry_Cancel
+    /// to pre-empt a page.
+    pub fn note_inquiry_stopping(&mut self) {
+        self.phase = ClassicPhase::InquiryStopping;
+    }
+
+    /// Mark phase after the host has just emitted
+    /// HCI_Create_Connection.
+    pub fn note_paging(&mut self) {
+        self.phase = ClassicPhase::Paging;
+    }
+
+    /// Apply a Connection Complete event — clears any in-flight
+    /// page, records the connection handle, advances the state.
+    pub fn note_connection_complete(&mut self, status: u8, handle: u16) {
+        if status == 0x00 {
+            self.connected_handle = Some(handle);
+            self.phase = ClassicPhase::Connected;
+        } else {
+            // Failed page: drop back to Idle. The host can retry.
+            self.connected_handle = None;
+            self.phase = ClassicPhase::Idle;
+        }
+    }
+
+    /// Apply a Disconnection Complete event — clears connection state.
+    pub fn note_disconnected(&mut self) {
+        self.connected_handle = None;
+        self.phase = ClassicPhase::Idle;
+    }
+
+    /// Record a Write_Scan_Enable mode the controller accepted.
+    pub fn note_scan_enable(&mut self, mode: u8) {
+        self.scan_mode = mode;
+    }
+
+    /// Return to Idle (inquiry refused / ended, page refused).
+    pub fn note_idle(&mut self) {
+        self.phase = ClassicPhase::Idle;
+    }
 }
 
 // ── Encoded inquiry command helpers ──────────────────────────────
