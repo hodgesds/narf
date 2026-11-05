@@ -59,21 +59,17 @@
 //! `PFVFSPOOF` anti-spoofing is not programmed), and DCB+VT
 //! combinations.
 //!
-//! KNOWN REGISTER CONFLICT — MRQC (read before touching RSS):
-//! this module programs `MRQC` at 0x05818 (Linux). The in-tree
-//! `rss.rs` programs `MRQC` at 0x0EC80 (datasheet-cited), and its
-//! RETA/RSSRK (0x0EB00/0x0EB80) likewise disagree with Linux
-//! (0x05C00/0x05C80). Linux's block is coherent (RXCSUM/FCTRL/
-//! VLNCTRL/MTA/RAL/PSRTYPE/MRQC/RETA/RSSRK all in 0x05000–0x05FFF)
-//! and ships on 82599 hardware, so this module follows Linux — but
-//! one of the two blocks programs the wrong registers on silicon.
-//! Until that conflict is resolved (separate reconciliation lane),
-//! `configure_rss` and `configure_vmdq` do NOT compose: they write
-//! different `MRQC` registers, and neither mode can be assumed to
-//! hold after the other runs. Likewise the MRQE value here is
-//! `VMDQEN` (0x8, "64 pools no RSS"), while Linux's SR-IOV path
-//! uses `VMDQRSS64EN` (0xB) because it always pairs RSS; switching
-//! to 0xB is part of the RSS+VMDq composition follow-up.
+//! Register map (settled by #1397): this module programs `MRQC`
+//! through the shared authority `regs::REG_MRQC` (canonical
+//! 0x05818, the Linux/compat alias; the datasheet dual-maps it
+//! to 0x0EC80, and `rss.rs` programs the same canonical address
+//! through `regs.rs`). `configure_rss` and `configure_vmdq`
+//! therefore write the SAME `MRQC` register. What still does
+//! NOT compose is the MRQE mode + tables: the MRQE value here
+//! is `VMDQEN` (0x8, "64 pools no RSS"), while Linux's SR-IOV
+//! path uses `VMDQRSS64EN` (0xB) because it always pairs RSS;
+//! switching to 0xB + per-pool RETA is the RSS+VMDq
+//! composition follow-up, not done here.
 //!
 //! RAR 16 note: VF 15's primary slot (RAR 16, 0x0A200) coincides
 //! with the driver's `REG_RAL0` fallback-read address. That path
@@ -108,8 +104,10 @@ pub const MTQC_64VF: u32 = 0x4;
 pub const REG_RTTDCS: u64 = 0x04900;
 /// `RTTDCS` arbiter-disable bit (set while programming `MTQC`).
 pub const RTTDCS_ARBDIS: u32 = 0x40;
-/// Multiple Receive Queues Command.
-pub const REG_MRQC: u64 = 0x05818;
+/// Multiple Receive Queues Command — shared authority, see `regs.rs`.
+/// Re-exported (not redefined) so the VMDq path and the RSS path
+/// program the same canonical address (`regs::REG_MRQC`).
+pub use super::regs::REG_MRQC;
 /// `MRQC` receive-mode field (bits 3:0).
 pub const MRQC_MRQE_MASK: u32 = 0xF;
 /// `MRQC` VMDq2, 64 pools, no RSS.
