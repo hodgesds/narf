@@ -27,8 +27,9 @@ use super::chan::{
 use super::datapath::{consume_rx_bd, stage_tx, RxChannelState, TxChannelState};
 use super::dma::{
     addr_set_for, addr_set_for_chip, pack_idx, split_idx, RingState, AX_DMA_ADDR_SET,
-    AX_V1_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT, RING_IDX_HW_MASK,
-    RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM, TX_BD_SIZE,
+    AX_V1_DMA_ADDR_SET, BE_DMA_ADDR_SET, DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, RING_IDX_HOST_SHIFT,
+    RING_IDX_HW_MASK, RXCH_NUM, RXCH_RPQ, RXCH_RXQ, RX_BD_SIZE, TXCH_ACH0, TXCH_CH12, TXCH_NUM,
+    TX_BD_SIZE,
 };
 use super::efuse::{mac_is_valid, EfuseError};
 use super::fw::{expected_blob_name, FwError};
@@ -598,18 +599,20 @@ fn smoke_rtw89_dma_addr_set_for_chip() -> TestResult {
     if s4.tx[0].desa_l != AX_V1_DMA_ADDR_SET.tx[0].desa_l {
         return TestResult::Fail("8852C not on V1 layout");
     }
-    // 8922A (BE) reuses V1 in our mapping.
+    // 8922A (BE) uses the true BE (TYPE2) address set: 0xB-page
+    // registers, per `rtw8922a_pci_info.dma_addr_set` (the earlier
+    // V1 alias was wrong for every register in the set).
     let s5 = addr_set_for_chip(ChipId::Rtl8922A);
-    if s5.tx[0].desa_l != AX_V1_DMA_ADDR_SET.tx[0].desa_l {
-        return TestResult::Fail("8922A not on V1 layout");
+    if s5.tx[0].desa_l != BE_DMA_ADDR_SET.tx[0].desa_l {
+        return TestResult::Fail("8922A not on BE layout");
     }
-    // generation-only dispatch: Ax → baseline, Be → V1.
+    // generation-only dispatch: Ax → baseline, Be → BE set.
     let g_ax = addr_set_for(ChipGeneration::Ax);
     if g_ax.tx[0].idx != AX_DMA_ADDR_SET.tx[0].idx {
         return TestResult::Fail("addr_set_for(Ax) wrong");
     }
     let g_be = addr_set_for(ChipGeneration::Be);
-    if g_be.tx[0].desa_l != AX_V1_DMA_ADDR_SET.tx[0].desa_l {
+    if g_be.tx[0].desa_l != BE_DMA_ADDR_SET.tx[0].desa_l {
         return TestResult::Fail("addr_set_for(Be) wrong");
     }
     TestResult::Pass

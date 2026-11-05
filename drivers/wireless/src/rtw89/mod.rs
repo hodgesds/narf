@@ -79,6 +79,9 @@ mod command_queue;
 pub mod datapath;
 mod ddv;
 pub mod dma;
+mod dma_8922a;
+#[cfg(any(test, feature = "kernel-test"))]
+mod dma_8922a_tests;
 mod dma_be;
 #[cfg(any(test, feature = "kernel-test"))]
 mod dma_be_tests;
@@ -176,6 +179,9 @@ pub(super) mod station_control;
 mod station_lifecycle;
 mod track;
 mod tssi;
+mod tx_8922a;
+#[cfg(any(test, feature = "kernel-test"))]
+mod tx_8922a_tests;
 mod tx_amsdu;
 pub mod tx_transport;
 mod txpower_8922a;

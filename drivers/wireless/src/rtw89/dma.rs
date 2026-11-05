@@ -8,9 +8,16 @@
 //!   `R_AX_*_TXBD_DESA_{L,H}` page (`pci.h:557..586`).
 //! - **AX v1** (8852C): same channels, regs shifted to the `_V1`
 //!   page (`pci.h:550..616`).
-//! - **BE** (8922A): same channels, BE-specific offsets used by
-//!   `mac_be.c`; we keep them under a `_V1` alias here because the
-//!   physical offsets coincide for the registers we drive.
+//! - **BE** (8922A): same channels, BE-specific offsets in the
+//!   `0xB0xx`/`0xB1xx`/`0xB2xx`/`0xB3xx` pages
+//!   (`rtw89_pci_ch_dma_addr_set_be`, `pci.c:1139`), transcribed
+//!   as [`BE_DMA_ADDR_SET`]. Earlier revisions mapped 8922A onto
+//!   the AX-V1 set; that alias was wrong for every register this
+//!   set carries (Linux BE TXBD_IDX starts at `0xB100`, DESA at
+//!   `0xB200`, NUM at `0xB030`, versus AX-V1 `0x1058`/`0x1230`/
+//!   `0x1024`) and is corrected by this module. BE sets are
+//!   TYPE2: `bdram` is 0 for every channel (no per-channel
+//!   BDRAM_CTRL programming; `bd_ram_table` is NULL for 8922AE).
 //!
 //! For each ring we encode the doorbell + descriptor base + ring-size
 //! registers as a single struct. Linux uses
@@ -218,6 +225,68 @@ pub const AX_V1_DMA_ADDR_SET: DmaAddrSet = DmaAddrSet {
     ],
 };
 
+const fn txring_be(idx: u64, desa_l: u64, desa_h: u64, num: u64) -> TxRingRegs {
+    TxRingRegs {
+        idx,
+        desa_l,
+        desa_h,
+        num,
+        // TYPE2 (`pci.c:1041`): no per-channel BDRAM_CTRL register.
+        bdram: 0,
+    }
+}
+
+const fn rxring_be(idx: u64, desa_l: u64, desa_h: u64, num: u64) -> RxRingRegs {
+    RxRingRegs {
+        idx,
+        desa_l,
+        desa_h,
+        num,
+    }
+}
+
+/// BE ring addresses (`rtw89_pci_ch_dma_addr_set_be`,
+/// `pci.c:1139`, `DEF_TXCHADDRS_TYPE2(BE, …, _V1)` /
+/// `DEF_RXCHADDRS(BE, …, _V1)`). Use for 8922A
+/// (`rtw8922a_pci_info.dma_addr_set`, `rtw8922ae.c:62`).
+/// Register values from `pci.h:785..885` (`R_BE_*_V1`).
+pub const BE_DMA_ADDR_SET: DmaAddrSet = DmaAddrSet {
+    tx: [
+        // ACH0: BE, band 0.
+        txring_be(0xB100, 0xB200, 0xB204, 0xB030),
+        // ACH1: BK, band 0.
+        txring_be(0xB104, 0xB208, 0xB20C, 0xB032),
+        // ACH2: VI, band 0.
+        txring_be(0xB108, 0xB210, 0xB214, 0xB034),
+        // ACH3: VO, band 0.
+        txring_be(0xB10C, 0xB218, 0xB21C, 0xB036),
+        // ACH4: BE, band 1.
+        txring_be(0xB110, 0xB220, 0xB224, 0xB038),
+        // ACH5: BK, band 1.
+        txring_be(0xB114, 0xB228, 0xB22C, 0xB03A),
+        // ACH6: VI, band 1.
+        txring_be(0xB118, 0xB230, 0xB234, 0xB03C),
+        // ACH7: VO, band 1.
+        txring_be(0xB11C, 0xB238, 0xB23C, 0xB03E),
+        // CH8: MGMT band 0.
+        txring_be(0xB120, 0xB240, 0xB244, 0xB040),
+        // CH9: HI band 0.
+        txring_be(0xB124, 0xB248, 0xB24C, 0xB042),
+        // CH10: MGMT band 1.
+        txring_be(0xB128, 0xB250, 0xB254, 0xB044),
+        // CH11: HI band 1.
+        txring_be(0xB12C, 0xB258, 0xB25C, 0xB046),
+        // CH12: FW command.
+        txring_be(0xB130, 0xB260, 0xB264, 0xB048),
+    ],
+    rx: [
+        // RXQ — main data RX.
+        rxring_be(0xB160, 0xB300, 0xB304, 0xB050),
+        // RPQ — TX-completion reports.
+        rxring_be(0xB164, 0xB308, 0xB30C, 0xB052),
+    ],
+};
+
 /// Pick the ring address-set for the given chip generation.
 /// Mirrors `chip->pci_info.dma_addr_set` resolution in
 /// `rtw89_chip_setup`.
@@ -228,8 +297,9 @@ pub const fn addr_set_for(gen: ChipGeneration) -> &'static DmaAddrSet {
         // generation-only enum because the chip-id is what drives the
         // choice; callers that need V1 should branch on chip_id.
         ChipGeneration::Ax => &AX_DMA_ADDR_SET,
-        // 8922A (BE) uses the V1 layout for the registers we drive.
-        ChipGeneration::Be => &AX_V1_DMA_ADDR_SET,
+        // 8922A (BE) uses the BE set (`rtw8922a_pci_info`,
+        // `rtw8922ae.c:62`).
+        ChipGeneration::Be => &BE_DMA_ADDR_SET,
     }
 }
 
@@ -243,8 +313,12 @@ pub const fn addr_set_for_chip(chip: super::mac::ChipId) -> &'static DmaAddrSet 
         ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8851B => &AX_DMA_ADDR_SET,
         // 8852C uses the AX V1 layout.
         ChipId::Rtl8852C => &AX_V1_DMA_ADDR_SET,
-        // 8922A (BE) reuses the V1 layout for our purposes.
-        ChipId::Rtl8922A => &AX_V1_DMA_ADDR_SET,
+        // 8922A (BE) uses the BE set (`rtw8922a_pci_info`,
+        // `rtw8922ae.c:62`). The old V1 alias was wrong for every
+        // register in the set; it was unreachable in production
+        // (every 8922A path through this lookup is refused
+        // upstream), so correcting it changes no live behavior.
+        ChipId::Rtl8922A => &BE_DMA_ADDR_SET,
     }
 }
 
