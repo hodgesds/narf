@@ -198,7 +198,7 @@ fn write_fw<I: Io + ?Sized>(io: &I, payload: &[u8]) -> Result<(), Error> {
 /// the counter stays below `POLL_CHECKSUM`; then `MCUFWDL_RDY` is set.
 /// A missing report is an error here (Linux logs and continues into
 /// `rtl92d_fw_init` anyway).
-fn free_to_go<I: Io + ?Sized>(io: &I) -> Result<(), Error> {
+async fn free_to_go<I: Io + ?Sized>(io: &I) -> Result<(), Error> {
     let mut ok = false;
     for _ in 0..POLL_CHECKSUM {
         if mcu32(io)? & FWDL_CHKSUM_RPT != 0 {
@@ -222,7 +222,7 @@ fn free_to_go<I: Io + ?Sized>(io: &I) -> Result<(), Error> {
 /// satisfies this stage. The per-function refinement belongs to the
 /// future `Prepared::Chip::Rtl8192de` integration, which knows the
 /// function.
-fn fw_init<I: Io + ?Sized>(io: &I) -> Result<(), Error> {
+async fn fw_init<I: Io + ?Sized>(io: &I) -> Result<(), Error> {
     for _ in 0..POLL_READY {
         if io.read8(FW_MAC0_READY)? & MAC_READY != 0 || io.read8(FW_MAC1_READY)? & MAC_READY != 0 {
             return Ok(());
