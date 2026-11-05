@@ -21,7 +21,10 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
     indicator + body framing). Used by `h4`.
   - **Vol 4 Part D** — Three-Wire UART Transport Layer (H5). §3
     (4-byte link header + payload), §4 (SLIP escape), §5 (link
-    establishment), §6 (CRC-CCITT). Used by `h5`.
+    establishment), §6 (CRC-CCITT). Used by `h5` (codec) and
+    `h5_transport` (link-establishment state machine, sliding
+    window, retransmission — `H5Transport: HciTransport` over a
+    byte port; issue #1555).
 
 ### L2CAP
 
@@ -177,6 +180,17 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
 
 - `controller::bring_up_all(cap)` runs the mandatory synchronous HCI sequence
   for transports registered before the Stage::Late bring-up initcall.
+- `h5_transport::H5Transport` implements `HciTransport` over a
+  `transport::BytePort`: SYNC / CONFIG link establishment (Vol 4
+  Part D §5), sequence numbers + sliding window + retransmission
+  (§6, §12 timing). `H5Transport::from_uart_info` rebuilds the
+  8250 handle from a serial registry entry; `bind_named(name)`
+  establishes the link and registers the transport for
+  `bring_up_all`. No boot initcall yet: claiming a UART at boot
+  would steal it from the `/dev/ttyS<N>` data ttys, so the boot
+  bind is a follow-up. The H4 lane's `H4BytePort` does not exist
+  on main; when it lands, H4 should adopt the shared `BytePort`
+  trait and the two transports should share one 8250 adapter.
 - `controller::register_ready_transport(transport, info)` adopts a controller
   whose late-discovered driver completed that same sequence on a native async
   transport path. Registration is idempotent by transport identity and returns

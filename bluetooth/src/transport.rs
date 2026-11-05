@@ -51,6 +51,38 @@ pub enum TransportError {
     Transient,
 }
 
+// ── Byte port ───────────────────────────────────────────────────────
+
+/// A byte-at-a-time serial port backing a UART HCI transport (H4 /
+/// H5). The UART HCI transports share this shape instead of each
+/// inventing a port binding: a UART HCI transport holds an
+/// `Arc<dyn BytePort>` and frames bytes over it.
+///
+/// The serial registry (`narf_drivers_serial::registry`) publishes
+/// descriptors only — base, stride, clock, IRQ, name, baud — so a
+/// byte port is built by rebuilding the UART handle from the
+/// descriptor, the same shape `filesystem::console_tty` uses for
+/// probed-UART ttys (`Uart8250::new` / `new_mmio` + polled
+/// `write_byte` / `read_byte`). [`crate::h5_transport::Uart8250BytePort`]
+/// is the 8250 implementation; fixtures substitute a scripted peer
+/// behind this trait.
+pub trait BytePort: Send + Sync + Debug {
+    /// Write bytes to the port. May block briefly on the UART's
+    /// transmit-holding-empty bit (the 8250 implementation spins on
+    /// THRE, like the console tty's polled backend); it never waits
+    /// for the peer.
+    fn write_bytes(&self, bytes: &[u8]);
+
+    /// Read one received byte, if one is available. Returns `None`
+    /// when dry — never blocks. Callers poll this from their drive
+    /// step; there is no IRQ wake behind a polled port.
+    fn read_byte(&self) -> Option<u8>;
+
+    /// Stable port name for diagnostics (e.g. the registry entry's
+    /// name, "COM2").
+    fn name(&self) -> &'static str;
+}
+
 /// HCI transport interface. One instance per Bluetooth controller.
 ///
 /// Stage 2 extends the trait with optional `send_sco` / `recv_sco`

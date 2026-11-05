@@ -920,6 +920,7 @@ dependencies = [
  "narf-console",
  "narf-crypto",
  "narf-drivers",
+ "narf-drivers-serial",
  "narf-efi",
  "narf-filesystem",
  "narf-firmware",

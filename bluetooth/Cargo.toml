@@ -20,6 +20,7 @@ narf-firmware     = { path = "../firmware" }
 narf-efi          = { path = "../efi" }
 narf-console      = { path = "../console" }
 narf-drivers      = { path = "../drivers" }
+narf-drivers-serial = { path = "../drivers/serial" }
 narf-filesystem   = { path = "../filesystem" }
 narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
