@@ -337,8 +337,8 @@ pub(super) fn weighted_avg(state: &mut NhmState) -> u8 {
     let mut weight = [0u8; NHM_RPT_NUM];
     let weight_zero = (u16::from(state.th[0]).saturating_sub(u16::from(NHM_WEIGHT_OFFSET)))
         .min(u16::from(u8::MAX)) as u8;
-    for i in 0..NHM_RPT_NUM {
-        weight[i] = if i == 0 {
+    for (i, slot) in weight.iter_mut().enumerate() {
+        *slot = if i == 0 {
             weight_zero
         } else if i == NHM_RPT_NUM - 1 {
             state.th[i - 1].saturating_add(NHM_WEIGHT_OFFSET)
@@ -354,8 +354,8 @@ pub(super) fn weighted_avg(state: &mut NhmState) -> u8 {
     state.result[0] = state.result[0].saturating_add(state.result[NHM_RPT_NUM - 1]);
     state.result[NHM_RPT_NUM - 1] = 0;
     let mut weighted_sum: u32 = 0;
-    for i in 0..NHM_RPT_NUM {
-        weighted_sum += u32::from(state.result[i]) * u32::from(weight[i]);
+    for (counter, w) in state.result.iter().zip(weight.iter()) {
+        weighted_sum += u32::from(*counter) * u32::from(*w);
     }
     ((weighted_sum / state.sum) >> NHM_TH_FACTOR) as u8
 }
@@ -484,11 +484,11 @@ pub(super) fn get_result(io: &mut impl Regs, state: &mut NhmState) -> Result<Opt
         return Ok(None);
     }
     let mut sum: u32 = 0;
-    for i in 0..NHM_RPT_NUM {
-        let value = io.read32(NHM_RPT[i].addr)? & NHM_RPT[i].mask;
-        let shift = NHM_RPT[i].mask.trailing_zeros();
+    for (slot, rpt) in state.result.iter_mut().zip(NHM_RPT.iter()) {
+        let value = io.read32(rpt.addr)? & rpt.mask;
+        let shift = rpt.mask.trailing_zeros();
         let counter = (value >> shift) as u16;
-        state.result[i] = counter;
+        *slot = counter;
         sum += u32::from(counter);
     }
     state.sum = sum;

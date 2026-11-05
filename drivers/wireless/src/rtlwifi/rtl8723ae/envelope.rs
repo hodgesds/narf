@@ -500,5 +500,5 @@ fn span_ceiling(
             limit = Some(limit.map_or(ceiling, |old: i16| old.min(ceiling)));
         }
     }
-    Ok(limit.ok_or(Error::Policy)?)
+    limit.ok_or(Error::Policy)
 }
