@@ -710,6 +710,77 @@ fn virtio_test_ipv4_tcp_frame(frame: &mut [u8]) {
     frame[tcp + 13] = 0x18; // PSH | ACK, deliberately not ECN.
 }
 
+/// Construct the Ethernet/IPv6/TCP layout: 40-byte fixed header, no
+/// extension headers (the driver's layout validator rejects extension
+/// headers fail-closed, so the encoder never sees them).
+fn virtio_test_ipv6_tcp_frame(frame: &mut [u8]) {
+    const ETH: usize = 14;
+    const IP6: usize = 40;
+    const TCP: usize = 20;
+    assert!(frame.len() >= ETH + IP6 + TCP);
+    let payload_len = (frame.len() - ETH - IP6) as u16;
+    frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    frame[ETH] = 0x60;
+    frame[ETH + 4..ETH + 6].copy_from_slice(&payload_len.to_be_bytes());
+    frame[ETH + 6] = 6;
+    frame[ETH + 7] = 64;
+    frame[ETH + 8..ETH + 24]
+        .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    frame[ETH + 24..ETH + 40]
+        .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let tcp = ETH + IP6;
+    frame[tcp..tcp + 2].copy_from_slice(&1234u16.to_be_bytes());
+    frame[tcp + 2..tcp + 4].copy_from_slice(&443u16.to_be_bytes());
+    frame[tcp + 12] = (TCP as u8 / 4) << 4;
+    frame[tcp + 13] = 0x18; // PSH | ACK, deliberately not ECN.
+}
+
+/// Construct the Ethernet/IPv4/UDP layout. The UDP length field describes
+/// the whole super-frame payload, as the USO template convention requires;
+/// the device rewrites it per segment.
+fn virtio_test_ipv4_udp_frame(frame: &mut [u8]) {
+    const ETH: usize = 14;
+    const IP: usize = 20;
+    const UDP: usize = 8;
+    assert!(frame.len() >= ETH + IP + UDP);
+    let ip_len = (frame.len() - ETH) as u16;
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    frame[ETH] = 0x45;
+    frame[ETH + 2..ETH + 4].copy_from_slice(&ip_len.to_be_bytes());
+    frame[ETH + 8] = 64;
+    frame[ETH + 9] = 17;
+    frame[ETH + 12..ETH + 16].copy_from_slice(&[192, 0, 2, 10]);
+    frame[ETH + 16..ETH + 20].copy_from_slice(&[198, 51, 100, 20]);
+    let udp = ETH + IP;
+    frame[udp..udp + 2].copy_from_slice(&1234u16.to_be_bytes());
+    frame[udp + 2..udp + 4].copy_from_slice(&53u16.to_be_bytes());
+    frame[udp + 4..udp + 6].copy_from_slice(&(ip_len - IP as u16).to_be_bytes());
+}
+
+/// Construct the Ethernet/IPv6/UDP layout, same template convention as v4.
+fn virtio_test_ipv6_udp_frame(frame: &mut [u8]) {
+    const ETH: usize = 14;
+    const IP6: usize = 40;
+    const UDP: usize = 8;
+    assert!(frame.len() >= ETH + IP6 + UDP);
+    let payload_len = (frame.len() - ETH - IP6) as u16;
+    frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    frame[ETH] = 0x60;
+    frame[ETH + 4..ETH + 6].copy_from_slice(&payload_len.to_be_bytes());
+    frame[ETH + 6] = 17;
+    frame[ETH + 7] = 64;
+    frame[ETH + 8..ETH + 24]
+        .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    frame[ETH + 24..ETH + 40]
+        .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let udp = ETH + IP6;
+    frame[udp..udp + 2].copy_from_slice(&1234u16.to_be_bytes());
+    frame[udp + 2..udp + 4].copy_from_slice(&53u16.to_be_bytes());
+    // The UDP length field equals the IPv6 payload length (UDP header +
+    // data), as `l4_checksum_layout` validates — not payload minus header.
+    frame[udp + 4..udp + 6].copy_from_slice(&payload_len.to_be_bytes());
+}
+
 fn smoke_virtio_net_tx_tso_header_is_feature_gated_and_well_formed() -> TestResult {
     use crate::net_pci::{tx_header_for_frame, TxOffloadProfile};
     use narf_net::TxMeta;
@@ -722,6 +793,8 @@ fn smoke_virtio_net_tx_tso_header_is_feature_gated_and_well_formed() -> TestResu
         TxOffloadProfile {
             checksum: true,
             tso4: true,
+            tso6: false,
+            uso: false,
         },
     ) {
         Ok(hdr) => hdr,
@@ -757,6 +830,168 @@ kernel_test_in!(
     smoke_virtio_net_tx_tso_header_is_feature_gated_and_well_formed
 );
 
+fn smoke_virtio_net_tx_tso6_header_is_feature_gated_and_well_formed() -> TestResult {
+    use crate::net_pci::{ipv6_pseudo_seed, tx_header_for_frame, TxOffloadProfile};
+    use narf_net::TxMeta;
+
+    // Cross-check the driver-local v6 seed helper against the oracle:
+    // 2001:db8::1 -> 2001:db8::2, TCP, zero length folds to 0x5b7b.
+    if ipv6_pseudo_seed(
+        &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        6,
+    ) != 0x5b7b
+    {
+        return TestResult::Fail("virtio-net IPv6 pseudo seed mismatch");
+    }
+    let mut frame = [0u8; 1514];
+    virtio_test_ipv6_tcp_frame(&mut frame);
+    let hdr = match tx_header_for_frame(
+        &mut frame,
+        TxMeta::with_tso(1200),
+        TxOffloadProfile {
+            checksum: true,
+            tso4: false,
+            tso6: true,
+            uso: false,
+        },
+    ) {
+        Ok(hdr) => hdr,
+        Err(_) => return TestResult::Fail("virtio-net rejected negotiated TCPv6 TSO"),
+    };
+    if hdr.flags != 1
+        || hdr.gso_type != 4
+        || u16::from_le(hdr.hdr_len) != 74
+        || u16::from_le(hdr.gso_size) != 1200
+        || u16::from_le(hdr.csum_start) != 54
+        || u16::from_le(hdr.csum_offset) != 16
+    {
+        return TestResult::Fail("virtio-net TSO6 header has wrong offsets or GSO fields");
+    }
+    if frame[70..72] != 0x5b7bu16.to_be_bytes() {
+        return TestResult::Fail("virtio-net TSO6 did not prepare zero-length pseudo-header seed");
+    }
+    // The old mislabeling path must be gone: a v6 TCP GSO frame with only
+    // TSO4 negotiated is rejected, not emitted as TCPV4.
+    if tx_header_for_frame(
+        &mut frame,
+        TxMeta::with_tso(1200),
+        TxOffloadProfile {
+            checksum: true,
+            tso4: true,
+            tso6: false,
+            uso: false,
+        },
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("virtio-net emitted TCPv6 TSO under a TSO4-only profile");
+    }
+    // ECN-marked v6 TCP GSO stays refused (HOST_ECN not negotiated).
+    frame[54 + 13] |= 0x40;
+    if tx_header_for_frame(
+        &mut frame,
+        TxMeta::with_tso(1200),
+        TxOffloadProfile {
+            checksum: true,
+            tso4: false,
+            tso6: true,
+            uso: false,
+        },
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("virtio-net accepted ECN-marked TCPv6 GSO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_tx_tso6_header_is_feature_gated_and_well_formed
+);
+
+fn smoke_virtio_net_tx_uso_header_is_feature_gated_and_well_formed() -> TestResult {
+    use crate::net_pci::{ipv4_pseudo_seed, tx_header_for_frame, TxOffloadProfile};
+    use narf_net::{L4CsumKind, TxMeta};
+
+    // Cross-checks against the Python oracle: v4 UDP seed for
+    // 192.0.2.10 -> 198.51.100.20 folds to 0xec63, and the v4 helper
+    // with proto TCP reproduces the in-tree TCP seed exactly.
+    if ipv4_pseudo_seed([192, 0, 2, 10], [198, 51, 100, 20], 17) != 0xec63
+        || ipv4_pseudo_seed([192, 0, 2, 10], [198, 51, 100, 20], 6)
+            != narf_net::pkt_tcp::ipv4_tcp_pseudo_seed([192, 0, 2, 10], [198, 51, 100, 20], 0)
+    {
+        return TestResult::Fail("virtio-net IPv4 pseudo seed mismatch");
+    }
+    let uso_meta = TxMeta {
+        csum_l4: Some(L4CsumKind::Udp),
+        tso_mss: Some(1200),
+        ..Default::default()
+    };
+    let uso_profile = TxOffloadProfile {
+        checksum: true,
+        tso4: false,
+        tso6: false,
+        uso: true,
+    };
+    let mut frame = [0u8; 1500];
+    virtio_test_ipv4_udp_frame(&mut frame);
+    let hdr = match tx_header_for_frame(&mut frame, uso_meta, uso_profile) {
+        Ok(hdr) => hdr,
+        Err(_) => return TestResult::Fail("virtio-net rejected negotiated IPv4 USO"),
+    };
+    if hdr.flags != 1
+        || hdr.gso_type != 5
+        || u16::from_le(hdr.hdr_len) != 42
+        || u16::from_le(hdr.gso_size) != 1200
+        || u16::from_le(hdr.csum_start) != 34
+        || u16::from_le(hdr.csum_offset) != 6
+    {
+        return TestResult::Fail("virtio-net USO header has wrong offsets or GSO fields");
+    }
+    if frame[40..42] != 0xec63u16.to_be_bytes() {
+        return TestResult::Fail("virtio-net USO did not prepare zero-length pseudo-header seed");
+    }
+    // v6 USO: same GSO type, v6 header geometry, v6 UDP seed 0x5b86.
+    let mut frame6 = [0u8; 1500];
+    virtio_test_ipv6_udp_frame(&mut frame6);
+    let hdr6 = match tx_header_for_frame(&mut frame6, uso_meta, uso_profile) {
+        Ok(hdr) => hdr,
+        Err(_) => return TestResult::Fail("virtio-net rejected negotiated IPv6 USO"),
+    };
+    if hdr6.flags != 1
+        || hdr6.gso_type != 5
+        || u16::from_le(hdr6.hdr_len) != 62
+        || u16::from_le(hdr6.gso_size) != 1200
+        || u16::from_le(hdr6.csum_start) != 54
+        || u16::from_le(hdr6.csum_offset) != 6
+    {
+        return TestResult::Fail("virtio-net IPv6 USO header has wrong offsets or GSO fields");
+    }
+    if frame6[60..62] != 0x5b86u16.to_be_bytes() {
+        return TestResult::Fail(
+            "virtio-net IPv6 USO did not prepare zero-length pseudo-header seed",
+        );
+    }
+    // Rejections: no USO feature, and mss 0.
+    if tx_header_for_frame(&mut frame, uso_meta, TxOffloadProfile::default()).is_ok() {
+        return TestResult::Fail("virtio-net accepted USO without negotiated feature");
+    }
+    let zero_mss = TxMeta {
+        csum_l4: Some(L4CsumKind::Udp),
+        tso_mss: Some(0),
+        ..Default::default()
+    };
+    if tx_header_for_frame(&mut frame, zero_mss, uso_profile).is_ok() {
+        return TestResult::Fail("virtio-net accepted USO with mss 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/net-pci",
+    smoke_virtio_net_tx_uso_header_is_feature_gated_and_well_formed
+);
+
 fn smoke_virtio_net_tx_checksum_header_is_feature_gated() -> TestResult {
     use crate::net_pci::{tx_header_for_frame, TxOffloadProfile};
     use narf_net::{L4CsumKind, TxMeta};
@@ -769,6 +1004,8 @@ fn smoke_virtio_net_tx_checksum_header_is_feature_gated() -> TestResult {
         TxOffloadProfile {
             checksum: true,
             tso4: false,
+            tso6: false,
+            uso: false,
         },
     ) {
         Ok(hdr) => hdr,

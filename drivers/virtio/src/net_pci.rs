@@ -124,6 +124,20 @@ const VIRTIO_NET_F_MAC: u64 = 5;
 /// the feature a guest driver negotiates before placing a TCPv4 GSO packet on
 /// its transmit queue.
 const VIRTIO_NET_F_HOST_TSO4: u64 = 11;
+/// The device can segment a driver-supplied IPv6/TCP GSO packet.
+/// Linux `include/uapi/linux/virtio_net.h`: `VIRTIO_NET_F_HOST_TSO6 12`.
+const VIRTIO_NET_F_HOST_TSO6: u64 = 12;
+/// The device can segment a driver-supplied UDP GSO packet (USO): each
+/// segment carries its own UDP header, unlike legacy UFO fragmentation.
+/// Linux `include/uapi/linux/virtio_net.h`: `VIRTIO_NET_F_HOST_USO 56`.
+/// Note the high half: unlike every other virtio-net bit negotiated here,
+/// USO lives above bit 32, so it is acknowledged through the second
+/// feature word (see `bring_up`). HOST_UFO (bit 14) is deliberately NOT
+/// negotiated: UFO fragments one UDP datagram at the IP layer, while
+/// `TxMeta`'s `(mss, Udp)` requests segmentation (one UDP header per
+/// segment) — different application-visible behavior, and no meta kind
+/// exists to express the fragmentation choice.
+const VIRTIO_NET_F_HOST_USO: u64 = 56;
 const VIRTIO_NET_F_STATUS: u64 = 16;
 const VIRTIO_NET_F_CTRL_VQ: u64 = 17;
 /// VirtIO 1.2 §5.1.3 — VIRTIO_NET_F_CTRL_RX (bit 18). Required for
@@ -325,11 +339,20 @@ pub(crate) const VIRTIO_NET_HDR_F_DATA_VALID: u8 = 2;
 pub(crate) const VIRTIO_NET_HDR_HASH_LEN: usize = VIRTIO_NET_HDR_LEN + 8;
 const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
 const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+/// GSO type values from Linux `include/uapi/linux/virtio_net.h`
+/// (`struct virtio_net_hdr_v1`): UDP here is 3, the legacy UFO
+/// fragmentation type — deliberately unused (see `VIRTIO_NET_F_HOST_USO`
+/// above). TCPv6 is 4; USO is 5 (`GSO_UDP_L4`, IPv4 and IPv6 UDP).
+const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+const VIRTIO_NET_HDR_GSO_UDP_L4: u8 = 5;
 const ETH_HDR_LEN: usize = 14;
 const IPV4_MIN_HDR_LEN: usize = 20;
+const IPV6_HDR_LEN: usize = 40;
 const TCP_MIN_HDR_LEN: usize = 20;
 const TCP_CSUM_OFFSET: usize = 16;
+const UDP_HDR_LEN: usize = 8;
 const IP_PROTO_TCP: u8 = 6;
+const IP_PROTO_UDP: u8 = 17;
 const TCP_ECE_OR_CWR: u8 = 0xc0;
 
 /// Maximum frame we'll accept on RX. Standard MTU + Ethernet header + the
@@ -540,6 +563,8 @@ pub struct VirtioNetPci {
     /// request a partial checksum or GSO packet the transport did not accept.
     tx_checksum: bool,
     tx_tso4: bool,
+    tx_tso6: bool,
+    tx_uso: bool,
     /// True when `VIRTIO_NET_F_GUEST_CSUM` was negotiated. The RX
     /// forwarder then enforces the DATA_VALID verdict (see
     /// `rx_csum_deliver`); when false the device never reports
@@ -617,21 +642,36 @@ impl core::fmt::Debug for VirtioNetPci {
 pub(crate) struct TxOffloadProfile {
     pub checksum: bool,
     pub tso4: bool,
+    pub tso6: bool,
+    pub uso: bool,
 }
 
 impl TxOffloadProfile {
-    /// Virtio's TCPv4 GSO format always carries a partial checksum. Keep this
-    /// implication explicit even though probe constructs only valid profiles,
-    /// so a future feature-negotiation refactor cannot advertise TSO alone.
+    /// Virtio's TCP GSO formats always carry a partial checksum. Keep these
+    /// implications explicit even though probe constructs only valid
+    /// profiles, so a future feature-negotiation refactor cannot advertise
+    /// GSO alone.
     const fn tso4_enabled(self) -> bool {
         self.checksum && self.tso4
+    }
+
+    const fn tso6_enabled(self) -> bool {
+        self.checksum && self.tso6
+    }
+
+    const fn uso_enabled(self) -> bool {
+        self.checksum && self.uso
     }
 
     const fn advertised(self) -> narf_net::OffloadCapabilities {
         narf_net::OffloadCapabilities {
             tx_checksum: self.checksum,
             rx_checksum: false,
-            max_tso_bytes: if self.tso4_enabled() {
+            // TCP TSO capability only. USO deliberately does not raise
+            // this: the TCP stack gates TSO on it regardless of IP
+            // version, and a USO-only device must not be promised TCP
+            // segmentation. No UDP producer reads this value yet.
+            max_tso_bytes: if self.tso4_enabled() || self.tso6_enabled() {
                 MAX_TX_TSO_FRAME as u32
             } else {
                 0
@@ -936,6 +976,45 @@ pub(crate) fn copy_frame_with_vlan(dst: &mut [u8], frame: &[u8], tag: u16) -> Op
     Some(new_len)
 }
 
+/// The IPv4 GSO checksum seed for any L4 protocol: the folded
+/// one's-complement sum of the pseudo-header (src, dst, proto, zero length)
+/// — the same convention as `narf_net::pkt_tcp::ipv4_tcp_pseudo_seed`
+/// (which hardcodes TCP and returns the double-negated sum, i.e. the sum
+/// itself). The device adds the per-segment length when it completes the
+/// checksum, so the seed carries length zero. Used for USO; TCPv4 GSO keeps
+/// calling the in-tree helper directly.
+pub(crate) fn ipv4_pseudo_seed(src: [u8; 4], dst: [u8; 4], proto: u8) -> u16 {
+    let mut sum: u32 = 0;
+    for addr in [src, dst] {
+        sum += u32::from(u16::from_be_bytes([addr[0], addr[1]]));
+        sum += u32::from(u16::from_be_bytes([addr[2], addr[3]]));
+    }
+    sum += u32::from(proto);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum as u16
+}
+
+/// The IPv6 GSO checksum seed (RFC 2460 §8.1): the folded
+/// one's-complement sum of the pseudo-header (src, dst, zero 32-bit length,
+/// next header) — the v6 analog of [`ipv4_pseudo_seed`]. The length word
+/// contributes zero and is omitted. The device adds the per-segment length
+/// when it completes the checksum.
+pub(crate) fn ipv6_pseudo_seed(src: &[u8; 16], dst: &[u8; 16], next_header: u8) -> u16 {
+    let mut sum: u32 = 0;
+    for addr in [src, dst] {
+        for pair in addr.chunks_exact(2) {
+            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        }
+    }
+    sum += u32::from(next_header);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum as u16
+}
+
 /// Prepare the virtio-net header for one transmit. This is deliberately
 /// feature-gated: a frame carrying partial checksum data or GSO metadata must
 /// never reach a device that did not negotiate the matching virtio feature.
@@ -957,14 +1036,13 @@ pub(crate) fn tx_header_for_frame(
 
     match (meta.tso_mss, meta.csum_l4) {
         (Some(_), Some(narf_net::L4CsumKind::Tcp)) => {
-            if !profile.tso4_enabled() || frame.len() > MAX_TX_TSO_FRAME {
+            if frame.len() > MAX_TX_TSO_FRAME {
                 return Err(malformed_tx());
             }
             let (l4, csum_offset) = l4_checksum_layout(frame, narf_net::L4CsumKind::Tcp)?;
-            let ip = ETH_HDR_LEN;
             // ECN GSO needs the separately negotiated HOST_ECN feature. NARF
             // does not advertise ECN today, so reject instead of emitting an
-            // invalid TCPv4 GSO header if a future caller requests it.
+            // invalid TCP GSO header if a future caller requests it.
             if frame[l4 + 13] & TCP_ECE_OR_CWR != 0 {
                 return Err(malformed_tx());
             }
@@ -974,26 +1052,126 @@ pub(crate) fn tx_header_for_frame(
             if mss == 0 || frame.len() <= header_len {
                 return Err(malformed_tx());
             }
-            // For TCP GSO the partial checksum is the pseudo-header with a
-            // zero TCP length. The device fills each segment's length before
-            // completing the checksum, matching the 8254x TSO preparation.
-            let src = [
-                frame[ip + 12],
-                frame[ip + 13],
-                frame[ip + 14],
-                frame[ip + 15],
-            ];
-            let dst = [
-                frame[ip + 16],
-                frame[ip + 17],
-                frame[ip + 18],
-                frame[ip + 19],
-            ];
-            let seed = narf_net::pkt_tcp::ipv4_tcp_pseudo_seed(src, dst, 0);
+            // The stack gates TSO only on `max_tso_bytes`, not on IP
+            // version, so a v6 TCP flow can arrive here. Dispatch on
+            // ethertype: previously every TCP GSO frame took the v4
+            // path, mislabeling v6 super-frames as TCPV4 with a seed
+            // read from the wrong offsets. A v6 frame with only TSO4
+            // negotiated is now rejected instead of mis-emitted.
+            let ip = ETH_HDR_LEN;
+            match u16::from_be_bytes([frame[12], frame[13]]) {
+                0x0800 => {
+                    if !profile.tso4_enabled() {
+                        return Err(malformed_tx());
+                    }
+                    // For TCP GSO the partial checksum is the pseudo-header
+                    // with a zero TCP length. The device fills each
+                    // segment's length before completing the checksum,
+                    // matching the 8254x TSO preparation.
+                    let src = [
+                        frame[ip + 12],
+                        frame[ip + 13],
+                        frame[ip + 14],
+                        frame[ip + 15],
+                    ];
+                    let dst = [
+                        frame[ip + 16],
+                        frame[ip + 17],
+                        frame[ip + 18],
+                        frame[ip + 19],
+                    ];
+                    let seed = narf_net::pkt_tcp::ipv4_tcp_pseudo_seed(src, dst, 0);
+                    frame[l4 + csum_offset..l4 + csum_offset + 2]
+                        .copy_from_slice(&seed.to_be_bytes());
+                    Ok(VirtioNetHdr {
+                        flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
+                        gso_type: VIRTIO_NET_HDR_GSO_TCPV4,
+                        hdr_len: (header_len as u16).to_le(),
+                        gso_size: mss.to_le(),
+                        csum_start: (l4 as u16).to_le(),
+                        csum_offset: (csum_offset as u16).to_le(),
+                        num_buffers: 0,
+                    })
+                }
+                0x86dd => {
+                    if !profile.tso6_enabled() {
+                        return Err(malformed_tx());
+                    }
+                    // IPv6 header: 8 bytes of version/traffic/flow +
+                    // payload-length + next-header + hop-limit, then the
+                    // 16-byte source and destination addresses.
+                    let mut src = [0u8; 16];
+                    let mut dst = [0u8; 16];
+                    src.copy_from_slice(&frame[ip + 8..ip + 24]);
+                    dst.copy_from_slice(&frame[ip + 24..ip + IPV6_HDR_LEN]);
+                    let seed = ipv6_pseudo_seed(&src, &dst, IP_PROTO_TCP);
+                    frame[l4 + csum_offset..l4 + csum_offset + 2]
+                        .copy_from_slice(&seed.to_be_bytes());
+                    Ok(VirtioNetHdr {
+                        flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
+                        gso_type: VIRTIO_NET_HDR_GSO_TCPV6,
+                        hdr_len: (header_len as u16).to_le(),
+                        gso_size: mss.to_le(),
+                        csum_start: (l4 as u16).to_le(),
+                        csum_offset: (csum_offset as u16).to_le(),
+                        num_buffers: 0,
+                    })
+                }
+                _ => Err(malformed_tx()),
+            }
+        }
+        (Some(_), Some(narf_net::L4CsumKind::Udp)) => {
+            // USO: the device segments one large UDP payload into
+            // several datagrams, each carrying a UDP header
+            // (`GSO_UDP_L4`), with `gso_size` payload bytes per
+            // segment. Same partial-checksum contract as TCP GSO: the
+            // checksum field carries the zero-length pseudo-header
+            // seed and the device completes it per segment. No
+            // in-tree producer emits USO metadata yet (the TCP stack
+            // is the only GSO producer); this is the device side,
+            // header-encoder- and burst-tested, awaiting a UDP GSO
+            // producer. The template's UDP length field describes
+            // the whole super-frame payload, as `l4_checksum_layout`
+            // validates; the device rewrites it per segment.
+            if !profile.uso_enabled() || frame.len() > MAX_TX_TSO_FRAME {
+                return Err(malformed_tx());
+            }
+            let (l4, csum_offset) = l4_checksum_layout(frame, narf_net::L4CsumKind::Udp)?;
+            let header_len = l4 + UDP_HDR_LEN;
+            let mss = meta.tso_mss.expect("matched Some UDP USO metadata");
+            if mss == 0 || frame.len() <= header_len {
+                return Err(malformed_tx());
+            }
+            let ip = ETH_HDR_LEN;
+            let seed = match u16::from_be_bytes([frame[12], frame[13]]) {
+                0x0800 => ipv4_pseudo_seed(
+                    [
+                        frame[ip + 12],
+                        frame[ip + 13],
+                        frame[ip + 14],
+                        frame[ip + 15],
+                    ],
+                    [
+                        frame[ip + 16],
+                        frame[ip + 17],
+                        frame[ip + 18],
+                        frame[ip + 19],
+                    ],
+                    IP_PROTO_UDP,
+                ),
+                0x86dd => {
+                    let mut src = [0u8; 16];
+                    let mut dst = [0u8; 16];
+                    src.copy_from_slice(&frame[ip + 8..ip + 24]);
+                    dst.copy_from_slice(&frame[ip + 24..ip + IPV6_HDR_LEN]);
+                    ipv6_pseudo_seed(&src, &dst, IP_PROTO_UDP)
+                }
+                _ => return Err(malformed_tx()),
+            };
             frame[l4 + csum_offset..l4 + csum_offset + 2].copy_from_slice(&seed.to_be_bytes());
             Ok(VirtioNetHdr {
                 flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
-                gso_type: VIRTIO_NET_HDR_GSO_TCPV4,
+                gso_type: VIRTIO_NET_HDR_GSO_UDP_L4,
                 hdr_len: (header_len as u16).to_le(),
                 gso_size: mss.to_le(),
                 csum_start: (l4 as u16).to_le(),
@@ -1071,17 +1249,22 @@ impl VirtioNetPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         // Opportunistic negotiation: take F_MAC / F_STATUS / F_MTU and the
-        // checksum/GSO profile when the device offers it. HOST_TSO4 depends
-        // on CSUM: a GSO packet must carry VIRTIO_NET_HDR_F_NEEDS_CSUM, and
-        // accepting either feature means the matching TX header is emitted
-        // below. Do not acknowledge an offload feature merely to inspect it;
-        // that would permit a partial packet to reach a device that was never
-        // told how to complete it.
+        // checksum/GSO profile when the device offers it. Every HOST_* GSO
+        // feature depends on CSUM: a GSO packet must carry
+        // VIRTIO_NET_HDR_F_NEEDS_CSUM, and accepting any of them means the
+        // matching TX header is emitted below. Do not acknowledge an
+        // offload feature merely to inspect it; that would permit a
+        // partial packet to reach a device that was never told how to
+        // complete it. HOST_UFO is not taken (see
+        // `VIRTIO_NET_F_HOST_USO`): its fragmentation semantics do not
+        // match the segmentation `TxMeta` requests.
         let want_mac = feats & (1u64 << VIRTIO_NET_F_MAC) != 0;
         let want_status = feats & (1u64 << VIRTIO_NET_F_STATUS) != 0;
         let want_mtu = feats & (1u64 << VIRTIO_NET_F_MTU) != 0;
         let want_csum = feats & (1u64 << VIRTIO_NET_F_CSUM) != 0;
         let want_tso4 = want_csum && feats & (1u64 << VIRTIO_NET_F_HOST_TSO4) != 0;
+        let want_tso6 = want_csum && feats & (1u64 << VIRTIO_NET_F_HOST_TSO6) != 0;
+        let want_uso = want_csum && feats & (1u64 << VIRTIO_NET_F_HOST_USO) != 0;
         // GUEST_CSUM is independent of the TX profile: the device
         // validates RX checksums and reports DATA_VALID per frame.
         // Negotiating it never changes a TX header (the RX verdict
@@ -1110,13 +1293,15 @@ impl VirtioNetPci {
         let want_event_idx = feats & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         // virtio-net F_* bits we care about live in the low 32
         // (max is F_CTRL_MAC_ADDR = 23; RING_F_EVENT_IDX = 29) except
-        // F_HASH_REPORT = 57 and F_RSS = 60, which live in the high
-        // half; only F_VERSION_1 = 32 is also up there.
+        // the high half, which carries F_VERSION_1 = 32 (high-half
+        // bit 0), F_HOST_USO = 56 (high-half bit 24),
+        // F_HASH_REPORT = 57 and F_RSS = 60 — see drv_hi.
         let drv_lo = ((1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32))
             | ((1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32))
             | ((1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32))
             | ((1u32 << VIRTIO_NET_F_GUEST_CSUM) * (want_guest_csum as u32))
             | ((1u32 << VIRTIO_NET_F_HOST_TSO4) * (want_tso4 as u32))
+            | ((1u32 << VIRTIO_NET_F_HOST_TSO6) * (want_tso6 as u32))
             | ((1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32))
             | ((1u32 << VIRTIO_NET_F_MQ) * (want_mq as u32))
@@ -1125,6 +1310,7 @@ impl VirtioNetPci {
             | ((1u32 << VIRTIO_NET_F_CTRL_VLAN) * (want_ctrl_vlan as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_MAC_ADDR) * (want_ctrl_mac_addr as u32));
         let drv_hi = (1u32 << (VIRTIO_F_VERSION_1 - 32))
+            | ((1u32 << (VIRTIO_NET_F_HOST_USO - 32)) * (want_uso as u32))
             | ((1u32 << (VIRTIO_NET_F_HASH_REPORT - 32)) * (want_hash_report as u32))
             | ((1u32 << (VIRTIO_NET_F_RSS - 32)) * (want_rss as u32));
         // SAFETY: same.
@@ -1440,6 +1626,8 @@ impl VirtioNetPci {
             rx_hdr_len,
             tx_checksum: want_csum,
             tx_tso4: want_tso4,
+            tx_tso6: want_tso6,
+            tx_uso: want_uso,
             rx_guest_csum: want_guest_csum,
             ctrl_qidx,
             ctrl,
@@ -1647,6 +1835,8 @@ impl VirtioNetPci {
         TxOffloadProfile {
             checksum: self.tx_checksum,
             tso4: self.tx_tso4,
+            tso6: self.tx_tso6,
+            uso: self.tx_uso,
         }
     }
 
@@ -3725,6 +3915,8 @@ mod tx_tests {
                 rx_hdr_len: VIRTIO_NET_HDR_LEN,
                 tx_checksum: true,
                 tx_tso4: true,
+                tx_tso6: true,
+                tx_uso: true,
                 rx_guest_csum: false,
                 ctrl_qidx: 4,
                 ctrl: None,
@@ -3757,7 +3949,54 @@ mod tx_tests {
                 .map_err(|_| "TSO submit rejected")
         }
 
+        fn submit_v6_tcp(&self, pair: usize, more: bool) -> Result<(), &'static str> {
+            let mut buf = self.dev.tx_buf_acquire_on(pair).ok_or("TX pool starved")?;
+            let frame = &mut buf.as_mut_slice()[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + FRAME_LEN];
+            frame.fill(0);
+            frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+            frame[14] = 0x60;
+            frame[16..18].copy_from_slice(&((FRAME_LEN - 54) as u16).to_be_bytes());
+            frame[20] = 6;
+            frame[22..38]
+                .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            frame[38..54]
+                .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+            frame[66] = 5 << 4;
+            frame[67] = 0x18;
+            self.dev
+                .tx_dma_on_with_meta(
+                    pair,
+                    buf,
+                    FRAME_LEN as u32,
+                    narf_net::TxMeta::with_tso(1024).with_more(more),
+                )
+                .map_err(|_| "TSO6 submit rejected")
+        }
+
+        fn submit_uso(&self, pair: usize, more: bool) -> Result<(), &'static str> {
+            let mut buf = self.dev.tx_buf_acquire_on(pair).ok_or("TX pool starved")?;
+            let frame = &mut buf.as_mut_slice()[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + FRAME_LEN];
+            frame.fill(0);
+            frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            frame[14] = 0x45;
+            frame[16..18].copy_from_slice(&((FRAME_LEN - 14) as u16).to_be_bytes());
+            frame[23] = 17;
+            frame[38..40].copy_from_slice(&((FRAME_LEN - 34) as u16).to_be_bytes());
+            let meta = narf_net::TxMeta {
+                csum_l4: Some(narf_net::L4CsumKind::Udp),
+                tso_mss: Some(1024),
+                ..Default::default()
+            };
+            self.dev
+                .tx_dma_on_with_meta(pair, buf, FRAME_LEN as u32, meta.with_more(more))
+                .map_err(|_| "USO submit rejected")
+        }
+
         fn complete(&self, pair: usize) -> Result<(), &'static str> {
+            self.complete_expected(pair, [1, 1])
+        }
+
+        fn complete_expected(&self, pair: usize, expected: [u8; 2]) -> Result<(), &'static str> {
             let layout = self.layouts[pair];
             let avail = narf_memory::PhysAddr::new(layout.avail_ring).kernel_ptr::<u16>();
             let used = narf_memory::PhysAddr::new(layout.used_ring).kernel_mut_ptr::<u16>();
@@ -3778,7 +4017,7 @@ mod tx_tests {
                     if desc.addr != buf.dma_addr().raw()
                         || desc.len as usize != VIRTIO_NET_HDR_LEN + FRAME_LEN
                         || desc.flags != 0
-                        || buf.as_slice()[..2] != [1, 1]
+                        || buf.as_slice()[..2] != expected
                     {
                         return Err("TSO descriptor/header ownership mismatch");
                     }
@@ -3835,6 +4074,74 @@ mod tx_tests {
     kernel_test_in!(
         "drivers/virtio/net-pci",
         smoke_virtio_net_tso_burst_recovers_exhausted_pool
+    );
+
+    /// §0 seam regression for the new GSO paths: a multi-frame IPv6
+    /// TSO burst and a multi-frame UDP USO burst, each driven to pool
+    /// exhaustion with delayed completions, must recover exactly like
+    /// the TSO4 burst — no buffer reuse before completion, no
+    /// descriptor leak, no buffer crossing queue pairs, and the
+    /// emitted header's GSO type must be TCPV6 (4) / UDP_L4 (5).
+    /// The `more`-hint flush behavior is path-independent (it lives
+    /// in `tx_dma_on_with_meta`, shared by all GSO kinds), so the
+    /// TSO4 more-flush test below continues to cover it.
+    fn smoke_virtio_net_tso6_uso_burst_recovers_exhausted_pool() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let fixture = TxFixture::new()?;
+            for pair in 0..2 {
+                // IPv6 TSO burst to exhaustion, then delayed completion.
+                for i in 0..TX_POOL_CAP {
+                    fixture.submit_v6_tcp(pair, i + 1 < TX_POOL_CAP)?;
+                }
+                if fixture.dev.tx_buf_acquire_on(pair).is_some() {
+                    return Err("uncompleted DMA buffer was reused (TSO6)");
+                }
+                fixture.complete_expected(pair, [1, 4])?;
+                let buf = fixture
+                    .dev
+                    .tx_buf_acquire_on(pair)
+                    .ok_or("completed pool stayed empty (TSO6)")?;
+                let p = &fixture.dev.pairs[pair];
+                if p.tx_pool.available() != TX_POOL_CAP - 1
+                    || p.tx_buffers.lock().iter().any(Option::is_some)
+                    || p.tx_queue.lock().as_ref().unwrap().diagnostic_snapshot().3 != QSIZE
+                    || fixture.dev.pairs[1 - pair].tx_pool.available() != TX_POOL_CAP
+                {
+                    return Err("TSO6 burst leaked buffers/descriptors or crossed queue pools");
+                }
+                fixture.dev.tx_buf_release_on(pair, buf);
+                // UDP USO burst to exhaustion, then delayed completion.
+                for i in 0..TX_POOL_CAP {
+                    fixture.submit_uso(pair, i + 1 < TX_POOL_CAP)?;
+                }
+                if fixture.dev.tx_buf_acquire_on(pair).is_some() {
+                    return Err("uncompleted DMA buffer was reused (USO)");
+                }
+                fixture.complete_expected(pair, [1, 5])?;
+                let buf = fixture
+                    .dev
+                    .tx_buf_acquire_on(pair)
+                    .ok_or("completed pool stayed empty (USO)")?;
+                let p = &fixture.dev.pairs[pair];
+                if p.tx_pool.available() != TX_POOL_CAP - 1
+                    || p.tx_buffers.lock().iter().any(Option::is_some)
+                    || p.tx_queue.lock().as_ref().unwrap().diagnostic_snapshot().3 != QSIZE
+                    || fixture.dev.pairs[1 - pair].tx_pool.available() != TX_POOL_CAP
+                {
+                    return Err("USO burst leaked buffers/descriptors or crossed queue pools");
+                }
+                fixture.dev.tx_buf_release_on(pair, buf);
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_tso6_uso_burst_recovers_exhausted_pool
     );
 
     fn smoke_virtio_net_tso_more_flushes_at_pool_limit() -> TestResult {
