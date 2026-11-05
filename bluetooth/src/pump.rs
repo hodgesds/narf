@@ -59,7 +59,11 @@
 //! - LE Advertising Report (while scanning) → the central peer table.
 //! - Inquiry Result (while inquiring) → the classic peer table;
 //!   Inquiry Complete → the classic phase machine, issuing a
-//!   deferred page when one is waiting.
+//!   deferred page when one is waiting. Inquiry Result with RSSI
+//!   (0x22) and Extended Inquiry Result / EIR (0x2F) feed the
+//!   same table with RSSI and the EIR local name; Remote Name
+//!   Request Complete (0x07) delivers a requested peer name into
+//!   the table.
 //! - BR/EDR Connection Complete (while paging) → the classic phase
 //!   machine + connection table entry.
 //! - Command Complete / Command Status for the scan/connect opcodes
@@ -68,7 +72,9 @@
 //!   refused command drops the phase back to Idle. The same arms
 //!   drive the classic phase machine: a refused Inquiry or Create
 //!   Connection drops it to Idle, a refused Inquiry Cancel returns
-//!   it to Inquiring, an accepted Write Scan Enable records the mode.
+//!   it to Inquiring, an accepted Write Scan Enable records the mode,
+//!   an accepted Write Inquiry Mode records the result format, and
+//!   a refused Remote Name Request frees the pending name slot.
 //!
 //! ## Central initiation (issue #1312)
 //!
@@ -85,16 +91,17 @@
 //! ## Classic initiation (issue #1315)
 //!
 //! [`classic_start_inquiry`] / [`classic_cancel_inquiry`] /
-//! [`classic_connect`] / [`classic_write_scan_enable`] issue the
-//! BR/EDR inquiry + paging commands through the pump's own send
-//! path, sequenced on the controller's completions exactly like the
-//! LE central above (copied pattern: phase machine in
-//! [`classic::ClassicCentral`], deferred connect while the inquiry
+//! [`classic_connect`] / [`classic_write_scan_enable`] /
+//! [`classic_write_inquiry_mode`] / [`classic_request_remote_name`]
+//! issue the BR/EDR inquiry + paging + name commands through the
+//! pump's own send path, sequenced on the controller's completions
+//! exactly like the LE central above (copied pattern: phase machine
+//! in [`classic::ClassicCentral`], deferred connect while the inquiry
 //! is cancelled, fail-closed refusal handling). [`classic_phase`] /
-//! [`classic_peers`] / [`classic_scan_mode`] expose the state for a
-//! future mgmt/userspace trigger lane. What this deliberately does
-//! NOT do: extended inquiry results / EIR + RSSI, Remote Name
-//! Request, SSP pairing initiation on the paged link (#888 covers
+//! [`classic_peers`] / [`classic_scan_mode`] /
+//! [`classic_inquiry_mode`] expose the state for a future
+//! mgmt/userspace trigger lane. What this deliberately does
+//! NOT do: SSP pairing initiation on the paged link (#888 covers
 //! pairing), or SCO setup after connect (#817) — the connection is
 //! tracked like any other pump connection and torn down on
 //! Disconnection Complete.
@@ -127,10 +134,11 @@ use crate::bond_store::{Bond, BondStore};
 use crate::classic::{self, ClassicPhase};
 use crate::controller::ControllerInfo;
 use crate::event::{
-    parse_inquiry_results, parse_le_advertising_reports, ClassicConnectionComplete,
-    CommandComplete, CommandStatus, DisconnectionComplete, EventCode, LeConnectionComplete,
-    LeLongTermKeyRequest, LePeriodicAdvReport, LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost,
-    NumberOfCompletedPackets,
+    parse_extended_inquiry_results, parse_inquiry_results, parse_inquiry_results_with_rssi,
+    parse_le_advertising_reports, ClassicConnectionComplete, CommandComplete, CommandStatus,
+    DisconnectionComplete, EventCode, LeConnectionComplete, LeLongTermKeyRequest,
+    LePeriodicAdvReport, LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost,
+    NumberOfCompletedPackets, RemoteNameRequestComplete,
 };
 use crate::gap::{self, CentralPhase, PeriodicAdvertiserPhase, PeriodicSyncPhase};
 use crate::gatt_client::{self, GattClientError};
@@ -473,6 +481,15 @@ pub struct PumpCore {
     /// Write_Scan_Enable mode awaiting its Command Complete; applied
     /// to `classic.scan_mode` only on success.
     pending_scan_mode: Option<u8>,
+    /// BD_ADDR of the in-flight HCI_Remote_Name_Request, if any.
+    /// Only one name request may be outstanding (the controller
+    /// rejects a second with Command Disallowed); cleared on its
+    /// Remote Name Request Complete, or on a refused Command
+    /// Status (no Complete follows a refusal).
+    pending_name: Option<[u8; 6]>,
+    /// Write_Inquiry_Mode mode awaiting its Command Complete;
+    /// applied to `classic.inquiry_mode` only on success.
+    pending_inquiry_mode: Option<u8>,
     /// Bonds from completed pairings (driver-domain state, never a
     /// global, never exposed to userspace). Survives disconnects;
     /// lost on controller removal or reboot.
@@ -550,6 +567,8 @@ impl PumpCore {
             periodic_sync: gap::PeriodicSync::new(),
             pending_page: None,
             pending_scan_mode: None,
+            pending_name: None,
+            pending_inquiry_mode: None,
             bonds: BondStore::new(),
             claimed: Vec::new(),
             pending_acl: VecDeque::new(),
@@ -1402,6 +1421,11 @@ pub enum ClassicError {
     UnknownPeer,
     /// `classic_write_scan_enable` mode outside 0..=3 (§7.3.18).
     BadScanMode,
+    /// `classic_write_inquiry_mode` mode outside 0..=2 (§7.3.45).
+    BadInquiryMode,
+    /// `classic_request_remote_name` while another name request is
+    /// already in flight — the controller allows only one.
+    NameRequestPending,
 }
 
 impl From<CentralError> for ClassicError {
@@ -1514,11 +1538,63 @@ impl PumpCore {
         Ok(())
     }
 
+    /// Select the inquiry-result format: issue HCI_Write_Inquiry_Mode
+    /// (§7.3.45). No phase gate — host configuration, callable any
+    /// time. The mode is recorded only once the controller accepts
+    /// it (see `on_classic_command_done`). Mode 1 arms Inquiry
+    /// Result with RSSI (0x22); mode 2 additionally arms Extended
+    /// Inquiry Result / EIR (0x2F). Until a mode is accepted the
+    /// controller sends standard results (0x02) only.
+    pub fn classic_write_inquiry_mode(&mut self, mode: u8) -> Result<(), ClassicError> {
+        if mode > 2 {
+            return Err(ClassicError::BadInquiryMode);
+        }
+        let cmd = classic::build_write_inquiry_mode(mode);
+        self.send_command_obj(&cmd)
+            .map_err(|_| ClassicError::Transport)?;
+        self.pending_inquiry_mode = Some(mode);
+        Ok(())
+    }
+
+    /// Ask a discovered peer for its user-friendly name: issue
+    /// HCI_Remote_Name_Request (§7.1.19) with the PSRM + clock
+    /// offset from its inquiry result — never guessed. Only from
+    /// Idle or Connected: the controller rejects a name request
+    /// issued while inquiring (Command Disallowed, 0x0C — the
+    /// radio is busy; Android/Floss starts RNR only after
+    /// Inquiry Complete, and BTstack serialises inquiry, name
+    /// request and page), and a page in flight (Paging) or being
+    /// set up (InquiryStopping) is the same refusal. Only one
+    /// name request may be outstanding at a time. The name lands
+    /// in the peer table on Remote Name Request Complete (§7.7.7).
+    pub fn classic_request_remote_name(&mut self, bd_addr: [u8; 6]) -> Result<(), ClassicError> {
+        let peer = self
+            .classic
+            .peer(&bd_addr)
+            .ok_or(ClassicError::UnknownPeer)?;
+        if self.pending_name.is_some() {
+            return Err(ClassicError::NameRequestPending);
+        }
+        match self.classic.phase {
+            ClassicPhase::Idle | ClassicPhase::Connected => {}
+            _ => return Err(ClassicError::WrongPhase),
+        }
+        let cmd = classic::build_remote_name_request(
+            bd_addr,
+            peer.page_scan_repetition_mode,
+            peer.clock_offset,
+        );
+        self.send_command_obj(&cmd)
+            .map_err(|_| ClassicError::Transport)?;
+        self.pending_name = Some(bd_addr);
+        Ok(())
+    }
+
     /// Advance the classic state machine on a completed
-    /// inquiry/page/scan command. Shared by the Command Complete
-    /// and Command Status arms: Inquiry and Create Connection
-    /// return Status first, Inquiry Cancel and Write Scan Enable
-    /// return Complete.
+    /// inquiry/page/scan/name command. Shared by the Command Complete
+    /// and Command Status arms: Inquiry, Create Connection and
+    /// Remote Name Request return Status first; Inquiry Cancel,
+    /// Write Scan Enable and Write Inquiry Mode return Complete.
     fn on_classic_command_done(&mut self, opcode: u16, status: u8) {
         match opcode {
             op::HCI_INQUIRY => {
@@ -1556,6 +1632,24 @@ impl PumpCore {
                     }
                 } else {
                     self.pending_scan_mode = None;
+                }
+            }
+            op::HCI_WRITE_INQUIRY_MODE => {
+                if status == 0 {
+                    if let Some(mode) = self.pending_inquiry_mode.take() {
+                        self.classic.note_inquiry_mode(mode);
+                    }
+                } else {
+                    self.pending_inquiry_mode = None;
+                }
+            }
+            op::HCI_REMOTE_NAME_REQUEST => {
+                // Refused name request: no Remote Name Request
+                // Complete follows, so the pending slot is freed
+                // here. An accepted request keeps it until the
+                // Complete event arrives (see dispatch_event).
+                if status != 0 {
+                    self.pending_name = None;
                 }
             }
             _ => {}
@@ -1973,6 +2067,35 @@ impl PumpCore {
                     }
                 }
             }
+            code if code == EventCode::InquiryResultWithRssi as u8 => {
+                // §7.7.33: same window and fail-closed discipline
+                // as the standard result, plus the RSSI lands on
+                // the peer entry.
+                if self.classic.phase == ClassicPhase::Inquiring
+                    || self.classic.phase == ClassicPhase::InquiryStopping
+                {
+                    if let Some(results) = parse_inquiry_results_with_rssi(event) {
+                        for r in results {
+                            self.classic.report_inquiry_result_with_rssi(&r);
+                        }
+                    }
+                }
+            }
+            code if code == EventCode::ExtendedInquiryResult as u8 => {
+                // §7.7.38: same window and fail-closed discipline
+                // as the standard result, plus RSSI and the EIR
+                // local name (if the 240-byte block carries one)
+                // land on the peer entry.
+                if self.classic.phase == ClassicPhase::Inquiring
+                    || self.classic.phase == ClassicPhase::InquiryStopping
+                {
+                    if let Some(results) = parse_extended_inquiry_results(event) {
+                        for r in results {
+                            self.classic.report_extended_inquiry_result(&r);
+                        }
+                    }
+                }
+            }
             code if code == EventCode::InquiryComplete as u8 => {
                 // §7.7.1: Status(1). Ends the inquiry window: from
                 // InquiryStopping a deferred page is issued on
@@ -2029,6 +2152,21 @@ impl PumpCore {
                     }
                     if self.classic.connected_handle == Some(dc.handle) {
                         self.classic.note_disconnected();
+                    }
+                }
+            }
+            code if code == EventCode::RemoteNameRequestComplete as u8 => {
+                // §7.7.7: completes the one outstanding Remote Name
+                // Request. A Complete for any other address is
+                // ignored — the pending request is still owed its
+                // own Complete. A failed Complete (non-zero status)
+                // frees the slot but records no name.
+                if let Some(rn) = RemoteNameRequestComplete::parse(event) {
+                    if self.pending_name == Some(rn.bd_addr) {
+                        self.pending_name = None;
+                        if rn.status == 0 {
+                            self.classic.note_remote_name(&rn.bd_addr, rn.name_bytes());
+                        }
                     }
                 }
             }
@@ -3457,6 +3595,22 @@ pub fn classic_write_scan_enable(index: usize, mode: u8) -> Result<(), ClassicEr
     with_pump_core(index, |core| core.classic_write_scan_enable(mode))?
 }
 
+/// Select controller `index`'s inquiry-result format (0 =
+/// standard, 1 = with RSSI, 2 = with RSSI or EIR). Callable any
+/// time; the mode is recorded only once the controller accepts
+/// it.
+pub fn classic_write_inquiry_mode(index: usize, mode: u8) -> Result<(), ClassicError> {
+    with_pump_core(index, |core| core.classic_write_inquiry_mode(mode))?
+}
+
+/// Ask discovered peer `bd_addr` for its user-friendly name from
+/// controller `index`. Only from Idle or Connected, and only one
+/// name request at a time; the name lands in the peer table on
+/// Remote Name Request Complete.
+pub fn classic_request_remote_name(index: usize, bd_addr: [u8; 6]) -> Result<(), ClassicError> {
+    with_pump_core(index, |core| core.classic_request_remote_name(bd_addr))?
+}
+
 /// Current Classic central phase for controller `index`, if its core
 /// is not currently owned by a pump step.
 pub fn classic_phase(index: usize) -> Option<ClassicPhase> {
@@ -3491,6 +3645,18 @@ pub fn classic_scan_mode(index: usize) -> Option<u8> {
         .core
         .as_ref()
         .map(|c| c.classic.scan_mode)
+}
+
+/// Last Write_Inquiry_Mode mode controller `index` accepted, if its
+/// core is not currently owned by a pump step.
+pub fn classic_inquiry_mode(index: usize) -> Option<u8> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| c.classic.inquiry_mode)
 }
 /// Run `f` against controller `index`'s core, taken out of its slot
 /// for the call (same discipline as [`pump_once`]: no
@@ -7516,6 +7682,429 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_classic_failure_and_malformed);
+
+    /// HCI_Inquiry_Result_with_RSSI event (§7.7.33): Num_Responses
+    /// + one 14-byte entry (BD_ADDR, PSRM, Reserved, CoD,
+    /// Clock_Offset, RSSI).
+    fn inquiry_result_with_rssi_event(
+        bd_addr: [u8; 6],
+        psrm: u8,
+        cod: [u8; 3],
+        clock_offset: u16,
+        rssi: i8,
+    ) -> Event {
+        let mut params = alloc::vec![0x01];
+        params.extend_from_slice(&bd_addr);
+        params.push(psrm);
+        params.push(0x00); // reserved
+        params.extend_from_slice(&cod);
+        params.extend_from_slice(&clock_offset.to_le_bytes());
+        params.push(rssi as u8);
+        Event {
+            code: EventCode::InquiryResultWithRssi as u8,
+            params,
+        }
+    }
+
+    /// HCI_Extended_Inquiry_Result event (§7.7.38):
+    /// Num_Responses + one 254-byte entry (14-byte RSSI entry +
+    /// 240-byte EIR).
+    fn extended_inquiry_result_event(
+        bd_addr: [u8; 6],
+        psrm: u8,
+        cod: [u8; 3],
+        clock_offset: u16,
+        rssi: i8,
+        eir: &[u8; 240],
+    ) -> Event {
+        let mut params = alloc::vec![0x01];
+        params.extend_from_slice(&bd_addr);
+        params.push(psrm);
+        params.push(0x00); // reserved
+        params.extend_from_slice(&cod);
+        params.extend_from_slice(&clock_offset.to_le_bytes());
+        params.push(rssi as u8);
+        params.extend_from_slice(eir);
+        Event {
+            code: EventCode::ExtendedInquiryResult as u8,
+            params,
+        }
+    }
+
+    /// HCI_Remote_Name_Request_Complete event (§7.7.7): Status(1)
+    /// + BD_ADDR(6) + Remote_Name(248, NUL-padded).
+    fn remote_name_complete_event(status: u8, bd_addr: [u8; 6], name: &[u8]) -> Event {
+        let mut params = alloc::vec![status];
+        params.extend_from_slice(&bd_addr);
+        let mut field = [0u8; 248];
+        let n = name.len().min(248);
+        field[..n].copy_from_slice(&name[..n]);
+        params.extend_from_slice(&field);
+        Event {
+            code: EventCode::RemoteNameRequestComplete as u8,
+            params,
+        }
+    }
+
+    /// Build a 240-byte EIR block from (AD type, payload) records,
+    /// zero-padded like a controller that sends no further records.
+    fn eir_block(records: &[(u8, &[u8])]) -> [u8; 240] {
+        let mut buf = alloc::vec::Vec::new();
+        for (ad_type, payload) in records {
+            crate::gap::append_record(&mut buf, *ad_type, payload);
+        }
+        let mut eir = [0u8; 240];
+        eir[..buf.len()].copy_from_slice(&buf);
+        eir
+    }
+
+    /// #1315 remainder: EIR + RSSI + Remote Name Request. Inquiry
+    /// mode 2 arms the 0x22/0x2F results; an RSSI result records
+    /// the signal strength, an EIR result records RSSI + the local
+    /// name (Complete wins over Shortened, a nameless re-report
+    /// keeps the old name, a malformed EIR records the peer but no
+    /// name, and a standard re-report keeps the RSSI); the name
+    /// request is pinned byte-for-byte against §7.1.19, is
+    /// single-flight, and delivers the name on Complete.
+    fn smoke_pump_classic_eir_rssi_remote_name() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        // 1. Write Inquiry Mode 2 (RSSI or EIR): accepted on
+        // Command Complete.
+        if classic_write_inquiry_mode(0, 2).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_write_inquiry_mode rejected");
+        }
+        let sent = fake.sent_command_params();
+        if sent.last().map(|(o, p)| (*o, p.as_slice()))
+            != Some((op::HCI_WRITE_INQUIRY_MODE, [0x02].as_slice()))
+        {
+            reset_all();
+            return TestResult::Fail("Write Inquiry Mode bytes mismatch");
+        }
+        fake.enqueue_event(cc(op::HCI_WRITE_INQUIRY_MODE, &[0]));
+        let _ = pump_once(0);
+        if classic_inquiry_mode(0) != Some(2) {
+            reset_all();
+            return TestResult::Fail("accepted inquiry mode did not record mode 2");
+        }
+        // 2. Start inquiry.
+        if classic_start_inquiry(0, crate::classic::GIAC, 8, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_start_inquiry rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_INQUIRY, 0));
+        let _ = pump_once(0);
+        // 3. RSSI result: peer A recorded with its signal strength
+        // and no name yet.
+        let peer_a = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
+        let cod = [0x10, 0x01, 0x00];
+        fake.enqueue_event(inquiry_result_with_rssi_event(
+            peer_a, 0x01, cod, 0x1234, -52,
+        ));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        if peers.len() != 1
+            || peers[0].bd_addr != peer_a
+            || peers[0].rssi != Some(-52)
+            || peers[0].name_len != 0
+        {
+            reset_all();
+            return TestResult::Fail("RSSI result not recorded with RSSI");
+        }
+        // 4. EIR result: peer B recorded with RSSI + the Complete
+        // Local Name (a TX Power record in the same block is
+        // skipped by the AD walker).
+        let peer_b = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let eir = eir_block(&[
+            (crate::gap::AD_COMPLETE_LOCAL_NAME, b"Headset-X"),
+            (crate::gap::AD_TX_POWER_LEVEL, &[17]),
+        ]);
+        fake.enqueue_event(extended_inquiry_result_event(
+            peer_b, 0x02, cod, 0x5678, -70, &eir,
+        ));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        if peers.len() != 2
+            || peers[1].bd_addr != peer_b
+            || peers[1].rssi != Some(-70)
+            || peers[1].name_bytes() != b"Headset-X"
+        {
+            reset_all();
+            return TestResult::Fail("EIR result not recorded with RSSI + name");
+        }
+        // 5. EIR re-report with a Shortened name refreshes the
+        // name and RSSI; a nameless re-report keeps the name.
+        let eir_short = eir_block(&[(crate::gap::AD_SHORTENED_LOCAL_NAME, b"HS-X")]);
+        fake.enqueue_event(extended_inquiry_result_event(
+            peer_b, 0x02, cod, 0x5678, -65, &eir_short,
+        ));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        if peers[1].rssi != Some(-65) || peers[1].name_bytes() != b"HS-X" {
+            reset_all();
+            return TestResult::Fail("EIR re-report did not refresh name + RSSI");
+        }
+        let eir_noname = eir_block(&[(crate::gap::AD_TX_POWER_LEVEL, &[12])]);
+        fake.enqueue_event(extended_inquiry_result_event(
+            peer_b,
+            0x02,
+            cod,
+            0x5678,
+            -60,
+            &eir_noname,
+        ));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        if peers[1].rssi != Some(-60) || peers[1].name_bytes() != b"HS-X" {
+            reset_all();
+            return TestResult::Fail("nameless EIR re-report cleared the name");
+        }
+        // 6. Malformed EIR (first record claims 255 bytes in a
+        // 240-byte block): peer recorded with RSSI, no name.
+        let peer_c = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        let mut bad_eir = [0u8; 240];
+        bad_eir[0] = 0xFF;
+        bad_eir[1] = crate::gap::AD_COMPLETE_LOCAL_NAME;
+        fake.enqueue_event(extended_inquiry_result_event(
+            peer_c, 0x01, cod, 0x1111, -80, &bad_eir,
+        ));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        if peers.len() != 3
+            || peers[2].bd_addr != peer_c
+            || peers[2].rssi != Some(-80)
+            || peers[2].name_len != 0
+        {
+            reset_all();
+            return TestResult::Fail("malformed EIR recorded a name or dropped the peer");
+        }
+        // 7. Standard re-report of peer A keeps its RSSI.
+        fake.enqueue_event(inquiry_result_event(peer_a, 0x03, cod, 0x4321));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        if peers[0].page_scan_repetition_mode != 0x03
+            || peers[0].clock_offset != 0x4321
+            || peers[0].rssi != Some(-52)
+        {
+            reset_all();
+            return TestResult::Fail("standard re-report cleared the RSSI");
+        }
+        // 8. Inquiry Complete ends the scan.
+        fake.enqueue_event(inquiry_complete_event(0));
+        let _ = pump_once(0);
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("inquiry complete did not return to Idle");
+        }
+        // 9. Remote Name Request for peer A: pinned byte-for-byte
+        // against Vol 4 Part E §7.1.19 (BD_ADDR, PSRM 0x03,
+        // reserved 0, clock offset 0x4321).
+        if classic_request_remote_name(0, peer_a).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_request_remote_name rejected from Idle");
+        }
+        let sent = fake.sent_command_params();
+        let expect_name_req: [u8; 10] =
+            [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x03, 0x00, 0x21, 0x43];
+        if sent.last().map(|(o, p)| (*o, p.as_slice()))
+            != Some((op::HCI_REMOTE_NAME_REQUEST, expect_name_req.as_slice()))
+        {
+            reset_all();
+            return TestResult::Fail("HCI_Remote_Name_Request bytes mismatch");
+        }
+        // Accepted Command Status keeps the request in flight: a
+        // second request is refused without issuing a command.
+        fake.enqueue_event(cs(op::HCI_REMOTE_NAME_REQUEST, 0));
+        let _ = pump_once(0);
+        let before = fake.sent_command_params().len();
+        if classic_request_remote_name(0, peer_b) != Err(ClassicError::NameRequestPending)
+            || fake.sent_command_params().len() != before
+        {
+            reset_all();
+            return TestResult::Fail("second name request did not fail NameRequestPending");
+        }
+        // 10. Remote Name Request Complete delivers the name.
+        fake.enqueue_event(remote_name_complete_event(0, peer_a, b"Speaker One"));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        if peers[0].name_bytes() != b"Speaker One" {
+            reset_all();
+            return TestResult::Fail("remote name not delivered to peer table");
+        }
+        // 11. A refused name request frees the slot (retry works),
+        // and a failed Complete records no name.
+        if classic_request_remote_name(0, peer_b).is_err() {
+            reset_all();
+            return TestResult::Fail("name request rejected after previous completed");
+        }
+        fake.enqueue_event(cs(op::HCI_REMOTE_NAME_REQUEST, 0x0C));
+        let _ = pump_once(0);
+        if classic_request_remote_name(0, peer_b).is_err() {
+            reset_all();
+            return TestResult::Fail("refused name request did not free the slot");
+        }
+        fake.enqueue_event(cs(op::HCI_REMOTE_NAME_REQUEST, 0));
+        let _ = pump_once(0);
+        fake.enqueue_event(remote_name_complete_event(0x04, peer_b, b"Should Not Land"));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        let ok = peers[1].name_bytes() == b"HS-X";
+        reset_all();
+        if !ok {
+            return TestResult::Fail("failed name complete overwrote the EIR name");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_classic_eir_rssi_remote_name);
+
+    /// #1315 remainder: name-request guards fail closed — an
+    /// out-of-range inquiry mode is rejected, a refused inquiry
+    /// mode records nothing, an undiscovered peer is refused, a
+    /// request during inquiry is refused, malformed/zero-response
+    /// RSSI/EIR results record nothing, and a Remote Name Request
+    /// Complete for any address other than the pending one is
+    /// ignored without freeing the slot.
+    fn smoke_pump_classic_remote_name_guards() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        // Out-of-range inquiry mode rejected without a command.
+        let before = fake.sent_command_params().len();
+        let ok = classic_write_inquiry_mode(0, 3) == Err(ClassicError::BadInquiryMode)
+            && fake.sent_command_params().len() == before;
+        if !ok {
+            reset_all();
+            return TestResult::Fail("inquiry mode 3 did not fail BadInquiryMode");
+        }
+        // Refused inquiry mode records nothing.
+        if classic_write_inquiry_mode(0, 1).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_write_inquiry_mode rejected");
+        }
+        fake.enqueue_event(cc(op::HCI_WRITE_INQUIRY_MODE, &[0x0C]));
+        let _ = pump_once(0);
+        if classic_inquiry_mode(0) != Some(0) {
+            reset_all();
+            return TestResult::Fail("refused inquiry mode recorded a mode");
+        }
+        // Undiscovered peer: refused, no command issued.
+        let peer = [0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5];
+        let before = fake.sent_command_params().len();
+        if classic_request_remote_name(0, peer) != Err(ClassicError::UnknownPeer)
+            || fake.sent_command_params().len() != before
+        {
+            reset_all();
+            return TestResult::Fail("name request for undiscovered peer did not fail UnknownPeer");
+        }
+        // Start inquiry and discover the peer.
+        if classic_start_inquiry(0, crate::classic::GIAC, 8, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_start_inquiry rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_INQUIRY, 0));
+        let _ = pump_once(0);
+        let cod = [0x10, 0x01, 0x00];
+        fake.enqueue_event(inquiry_result_with_rssi_event(peer, 0x01, cod, 0x0ABC, -40));
+        let _ = pump_once(0);
+        if classic_peers(0).map(|p| p.len()) != Some(1) {
+            reset_all();
+            return TestResult::Fail("RSSI result did not record the peer");
+        }
+        // Name request during inquiry: refused, no command issued.
+        let before = fake.sent_command_params().len();
+        if classic_request_remote_name(0, peer) != Err(ClassicError::WrongPhase)
+            || fake.sent_command_params().len() != before
+        {
+            reset_all();
+            return TestResult::Fail("name request during inquiry did not fail WrongPhase");
+        }
+        // Malformed RSSI result (claims 2 entries, carries 1)
+        // records nothing new.
+        let mut bad = alloc::vec![0x02];
+        bad.extend_from_slice(&[0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5]);
+        bad.extend_from_slice(&[0x01, 0x00, 0x10, 0x01, 0x00, 0x34, 0x12, 0xD0]);
+        fake.enqueue_event(Event {
+            code: EventCode::InquiryResultWithRssi as u8,
+            params: bad,
+        });
+        let _ = pump_once(0);
+        if classic_peers(0).map(|p| p.len()) != Some(1) {
+            reset_all();
+            return TestResult::Fail("malformed RSSI result recorded a peer");
+        }
+        // Malformed EIR result (claims 1 entry, carries 100 bytes
+        // of one) records nothing new.
+        let mut bad_eir = alloc::vec![0x01];
+        bad_eir.extend_from_slice(&[0u8; 100]);
+        fake.enqueue_event(Event {
+            code: EventCode::ExtendedInquiryResult as u8,
+            params: bad_eir,
+        });
+        let _ = pump_once(0);
+        if classic_peers(0).map(|p| p.len()) != Some(1) {
+            reset_all();
+            return TestResult::Fail("malformed EIR result recorded a peer");
+        }
+        // Zero-response RSSI/EIR results record nothing.
+        fake.enqueue_event(Event {
+            code: EventCode::InquiryResultWithRssi as u8,
+            params: alloc::vec![0x00],
+        });
+        let _ = pump_once(0);
+        fake.enqueue_event(Event {
+            code: EventCode::ExtendedInquiryResult as u8,
+            params: alloc::vec![0x00],
+        });
+        let _ = pump_once(0);
+        if classic_peers(0).map(|p| p.len()) != Some(1) {
+            reset_all();
+            return TestResult::Fail("zero-response RSSI/EIR result recorded a peer");
+        }
+        // Inquiry Complete ends the scan.
+        fake.enqueue_event(inquiry_complete_event(0));
+        let _ = pump_once(0);
+        // A Complete for an address nobody requested is ignored.
+        let stranger = [0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5];
+        fake.enqueue_event(remote_name_complete_event(0, stranger, b"Stranger"));
+        let _ = pump_once(0);
+        if classic_peers(0).map(|p| p.len()) != Some(1) {
+            reset_all();
+            return TestResult::Fail("stray name complete recorded a peer");
+        }
+        // Request the real peer's name; a Complete for a different
+        // address is ignored and does NOT free the slot.
+        if classic_request_remote_name(0, peer).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_request_remote_name rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_REMOTE_NAME_REQUEST, 0));
+        let _ = pump_once(0);
+        fake.enqueue_event(remote_name_complete_event(0, stranger, b"Stranger"));
+        let _ = pump_once(0);
+        if classic_request_remote_name(0, peer) != Err(ClassicError::NameRequestPending) {
+            reset_all();
+            return TestResult::Fail("stray name complete freed the pending slot");
+        }
+        // The matching Complete delivers the name.
+        fake.enqueue_event(remote_name_complete_event(0, peer, b"Guard Peer"));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        let ok = peers.len() == 1 && peers[0].name_bytes() == b"Guard Peer";
+        reset_all();
+        if !ok {
+            return TestResult::Fail("matching name complete did not deliver the name");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_classic_remote_name_guards);
 
     /// #1313: bring up the fake controller and land a central-role
     /// connection from Idle (Create issued directly, no scan

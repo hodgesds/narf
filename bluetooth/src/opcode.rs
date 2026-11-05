@@ -97,6 +97,11 @@ mod selftest {
 pub const HCI_INQUIRY: u16 = opcode(OGF_LINK_CONTROL, 0x0001);
 pub const HCI_INQUIRY_CANCEL: u16 = opcode(OGF_LINK_CONTROL, 0x0002);
 pub const HCI_CREATE_CONNECTION: u16 = opcode(OGF_LINK_CONTROL, 0x0005);
+/// HCI_Remote_Name_Request (§7.1.19). 10-byte parameter:
+/// BD_ADDR (6) + Page_Scan_Repetition_Mode (1) + Reserved (1) +
+/// Clock_Offset (2 LE). Returns Command Status; the name arrives
+/// in a Remote Name Request Complete event (§7.7.7, code 0x07).
+pub const HCI_REMOTE_NAME_REQUEST: u16 = opcode(OGF_LINK_CONTROL, 0x0019);
 pub const HCI_ACCEPT_CONNECTION_REQUEST: u16 = opcode(OGF_LINK_CONTROL, 0x0009);
 pub const HCI_REJECT_CONNECTION_REQUEST: u16 = opcode(OGF_LINK_CONTROL, 0x000A);
 pub const HCI_AUTHENTICATION_REQUESTED: u16 = opcode(OGF_LINK_CONTROL, 0x0011);
@@ -225,6 +230,10 @@ mod selftest_ext {
     const _: () = assert!(HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC == 0x2046);
     // §7.1.5: OGF=0x01 OCF=0x0005 → 0x0405.
     const _: () = assert!(HCI_CREATE_CONNECTION == 0x0405);
+    // §7.1.19: OGF=0x01 OCF=0x0019 → 0x0419.
+    const _: () = assert!(HCI_REMOTE_NAME_REQUEST == 0x0419);
+    // §7.3.45: OGF=0x03 OCF=0x0045 → 0x0C45.
+    const _: () = assert!(HCI_WRITE_INQUIRY_MODE == 0x0C45);
     // §7.4.5: OGF=0x04 OCF=0x0005 → 0x1005.
     const _: () = assert!(HCI_READ_BUFFER_SIZE == 0x1005);
 }
