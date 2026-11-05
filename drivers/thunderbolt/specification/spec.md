@@ -118,6 +118,21 @@ such controllers; it never starts, resets, or speaks to the ICM firmware.
   the retimer and unassigns its index; the outcome is read with
   `retimer::auth_status` after re-enumeration). Writes and
   authentication are refused for cable retimers.
+- `retimer::margining_caps`, `hw_margin`, `sw_margin`,
+  `sw_margin_errors` and `sw_margin_errors_ext` are the lane-margining
+  Port Operations (USB4 v2.0 §8.3.2.4: `RDCP`/`RHMG`/`RSMG`/`RDSW`),
+  run against an `SbChannel` — the router port itself or one retimer
+  on the link. `RDCP` reads three capability dwords from the Data
+  register (decoded by `MarginCaps`); the runs stage their parameters
+  in Metadata (`MarginParams`: lanes, time, right/high, upper eye,
+  BER level for hardware, error-counter operation and voltage/time
+  offset for software) and read their results from the Data register
+  (`HwMarginResults` for `RHMG`, one dword for `RSMG`); `RDSW`
+  returns the standard error counters in the completion Metadata
+  (`SwMarginErrors`) and the extended counters in four Data dwords
+  (`SwMarginErrorsExt`). No caller wires these into a margining
+  workflow yet — the operations are the fixture-proved protocol
+  surface, for manufacturing/validation use.
 
 The implementation supports USB4 routers with buffer-allocation parameters,
 USB3 tunneling between parent/child routers, PCIe tunnelling between an
@@ -337,7 +352,9 @@ Retimer remainders: no caller yet supplies a firmware image to the NVM
 surface (image provenance and update policy are unbuilt); enumeration
 covers trained links only, so the link-down path (router offline mode
 plus `SET_INBOUND_SBTX` orchestration before training) is engine-only;
-lane margining Port Operations are not implemented; and `reconcile`
+lane margining Port Operations (`RDCP`/`RHMG`/`RSMG`/`RDSW`) are
+implemented as a fixture-proved protocol surface with no caller wiring
+them into a margining workflow yet; and `reconcile`
 does not yet hard-gate tunnel programming on a port's `retimer_fault` —
 the fault is published typed state that consumers must check.
 PCIe remainders: a pre-activation wait for the PCIe adapters' LTSSM
