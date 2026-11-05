@@ -3455,7 +3455,11 @@ mod tests {
         if crate::sysfs_bridge::hci_kobject(0).is_none() {
             return fail("no controller kobject published for hci0");
         }
-        if !CAPTURED.lock().iter().any(|e| is_mgmt_event(e, EV_INDEX_ADDED, 0)) {
+        if !CAPTURED
+            .lock()
+            .iter()
+            .any(|e| is_mgmt_event(e, EV_INDEX_ADDED, 0))
+        {
             return fail("INDEX_ADDED was not published on registration");
         }
 
@@ -3507,7 +3511,11 @@ mod tests {
         if removed != 1 {
             return fail("INDEX_REMOVED was not published exactly once");
         }
-        if CAPTURED.lock().iter().any(|e| is_mgmt_event(e, EV_INDEX_ADDED, 0)) {
+        if CAPTURED
+            .lock()
+            .iter()
+            .any(|e| is_mgmt_event(e, EV_INDEX_ADDED, 0))
+        {
             return fail("INDEX_ADDED published after detach");
         }
         // READ_INDEX_LIST is empty now.
@@ -3547,7 +3555,11 @@ mod tests {
         {
             return fail("late disconnect resurrected detached state");
         }
-        if CAPTURED.lock().iter().any(|e| is_mgmt_event(e, EV_INDEX_ADDED, 0)) {
+        if CAPTURED
+            .lock()
+            .iter()
+            .any(|e| is_mgmt_event(e, EV_INDEX_ADDED, 0))
+        {
             return fail("late disconnect published INDEX_ADDED");
         }
 

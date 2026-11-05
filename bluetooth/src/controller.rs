@@ -337,7 +337,11 @@ pub fn live_indices() -> alloc::vec::Vec<usize> {
 
 /// Number of live (not detached) controllers.
 pub fn controller_count() -> usize {
-    CONTROLLERS.lock().iter().filter(|c| !c.is_detached()).count()
+    CONTROLLERS
+        .lock()
+        .iter()
+        .filter(|c| !c.is_detached())
+        .count()
 }
 
 /// Adopt a transport whose driver already completed the mandatory HCI
@@ -357,12 +361,9 @@ pub fn controller_count() -> usize {
 /// resurrection of the detached controller's state.
 pub fn register_ready_transport(transport: Arc<dyn HciTransport>, info: ControllerInfo) -> usize {
     let mut controllers = CONTROLLERS.lock();
-    if let Some(index) = controllers
-        .iter()
-        .position(|controller| {
-            !controller.is_detached() && Arc::ptr_eq(&controller.transport, &transport)
-        })
-    {
+    if let Some(index) = controllers.iter().position(|controller| {
+        !controller.is_detached() && Arc::ptr_eq(&controller.transport, &transport)
+    }) {
         return index;
     }
 

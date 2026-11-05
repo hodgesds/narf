@@ -250,15 +250,13 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
             }
             alloc::vec![cmd_complete(index, opcode, STATUS_SUCCESS, &data)]
         }
-        OP_READ_INFO => {
-            match controller::get_live(index as usize) {
-                Some(c) => {
-                    let data = read_info_rp(&c.info(), current_settings(index));
-                    alloc::vec![cmd_complete(index, opcode, STATUS_SUCCESS, &data)]
-                }
-                None => alloc::vec![cmd_status(index, opcode, STATUS_INVALID_INDEX)],
+        OP_READ_INFO => match controller::get_live(index as usize) {
+            Some(c) => {
+                let data = read_info_rp(&c.info(), current_settings(index));
+                alloc::vec![cmd_complete(index, opcode, STATUS_SUCCESS, &data)]
             }
-        }
+            None => alloc::vec![cmd_status(index, opcode, STATUS_INVALID_INDEX)],
+        },
         OP_SET_POWERED => alloc::vec![set_mode(index, opcode, params, SETTING_POWERED, 1)],
         OP_SET_CONNECTABLE => {
             alloc::vec![set_mode(index, opcode, params, SETTING_CONNECTABLE, 1)]
