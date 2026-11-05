@@ -1953,14 +1953,14 @@ impl VirtioNetPci {
     ///   TX completions are reclaimed lazily at submit time (the §0
     ///   design — fire-and-forget + reclaim-before-backpressure),
     ///   and nothing in the driver blocks on a TX completion.
-    /// Cost, stated plainly: a TX completion also wakes the pair's
-    /// RX forwarder, which drains an (empty) RX ring and re-parks —
-    /// one cheap empty drain per TX batch while idle, a no-op while
-    /// the forwarder is fast-polling. Binding after the table is
-    /// enabled is safe: the TX queue was NO_VECTOR until this
-    /// write, so no TX interrupt can be in flight using the old
-    /// value. A rejected share leaves the TX queue unbound
-    /// (NO_VECTOR) — the pre-lane behaviour, not an error.
+    ///   Cost, stated plainly: a TX completion also wakes the pair's
+    ///   RX forwarder, which drains an (empty) RX ring and re-parks —
+    ///   one cheap empty drain per TX batch while idle, a no-op while
+    ///   the forwarder is fast-polling. Binding after the table is
+    ///   enabled is safe: the TX queue was NO_VECTOR until this
+    ///   write, so no TX interrupt can be in flight using the old
+    ///   value. A rejected share leaves the TX queue unbound
+    ///   (NO_VECTOR) — the pre-lane behaviour, not an error.
     fn bind_tx_queue_shares(&self, bindings: &[MsixQueueBinding]) {
         for (k, b) in bindings.iter().enumerate() {
             if let Some(slot) = b.slot {
@@ -5144,8 +5144,8 @@ mod tx_tests {
                 .ok_or("RX pool starved")?;
             {
                 let slice = buf_b.as_mut_slice();
-                for i in 0..50 {
-                    slice[i] = (i as u8).wrapping_add(0x80);
+                for (i, slot) in slice.iter_mut().enumerate().take(50) {
+                    *slot = (i as u8).wrapping_add(0x80);
                 }
             }
             let head_b = {
@@ -5735,19 +5735,40 @@ mod tx_tests {
         }
         let run = || -> Result<(), &'static str> {
             let mut slots: [Option<u16>; 4] = [None; 4];
-            for k in 0..num_pairs {
+            for (k, slot) in slots.iter_mut().enumerate().take(num_pairs) {
                 if rx_vecs.get(k).copied().flatten().is_none() {
                     continue;
                 }
-                let rx = with_at(0, |c| unsafe {
-                    c.common.write16(crate::pci::CC_QUEUE_SELECT, 2 * k as u16);
-                    c.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR)
+                let rx = with_at(0, |c| {
+                    // SAFETY: `c` is the live controller (the `Arc`
+                    // keeps it alive for the closure); `common` is
+                    // its mapped common-cfg MMIO region, and
+                    // CC_QUEUE_SELECT (0x16) / CC_QUEUE_MSIX_VECTOR
+                    // (0x1A) are in-bounds common-cfg registers.
+                    // QUEUE_SELECT writes are safe post-probe: the
+                    // only writer in this driver is probe-time
+                    // `size_q`, and every queue access sets SELECT
+                    // first.
+                    unsafe {
+                        c.common.write16(crate::pci::CC_QUEUE_SELECT, 2 * k as u16);
+                        c.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR)
+                    }
                 })
                 .ok_or("controller vanished")?;
-                let tx = with_at(0, |c| unsafe {
-                    c.common
-                        .write16(crate::pci::CC_QUEUE_SELECT, 2 * k as u16 + 1);
-                    c.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR)
+                let tx = with_at(0, |c| {
+                    // SAFETY: same as the RX readback above: `c` is
+                    // the live controller, `common` is its mapped
+                    // common-cfg MMIO region, and CC_QUEUE_SELECT
+                    // (0x16) / CC_QUEUE_MSIX_VECTOR (0x1A) are
+                    // in-bounds common-cfg registers. QUEUE_SELECT
+                    // writes are safe post-probe: the only writer in
+                    // this driver is probe-time `size_q`, and every
+                    // queue access sets SELECT first.
+                    unsafe {
+                        c.common
+                            .write16(crate::pci::CC_QUEUE_SELECT, 2 * k as u16 + 1);
+                        c.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR)
+                    }
                 })
                 .ok_or("controller vanished")?;
                 if rx == 0xFFFF || tx == 0xFFFF {
@@ -5756,7 +5777,7 @@ mod tx_tests {
                 if rx != tx {
                     return Err("TX queue does not share its pair RX slot");
                 }
-                slots[k] = Some(rx);
+                *slot = Some(rx);
             }
             for a in 0..num_pairs {
                 for b in a + 1..num_pairs {
@@ -5809,8 +5830,13 @@ mod tx_tests {
                     Ok(())
                 }
                 Some(v) => {
-                    let slot = with_at(0, |c| unsafe {
-                        c.common.read16(crate::pci::CC_MSIX_CONFIG)
+                    let slot = with_at(0, |c| {
+                        // SAFETY: `c` is the live controller (the
+                        // `Arc` keeps it alive for the closure);
+                        // `common` is its mapped common-cfg MMIO
+                        // region, and CC_MSIX_CONFIG (0x10) is an
+                        // in-bounds common-cfg register. Read-only.
+                        unsafe { c.common.read16(crate::pci::CC_MSIX_CONFIG) }
                     })
                     .ok_or("controller vanished")?;
                     if slot == 0xFFFF {
@@ -5819,13 +5845,25 @@ mod tx_tests {
                     if slot >= size {
                         return Err("msix_config slot outside the table");
                     }
-                    for k in 0..rx_vecs.len() {
-                        if rx_vecs[k].is_none() {
+                    for (k, v) in rx_vecs.iter().enumerate() {
+                        if v.is_none() {
                             continue;
                         }
-                        let qslot = with_at(0, |c| unsafe {
-                            c.common.write16(crate::pci::CC_QUEUE_SELECT, 2 * k as u16);
-                            c.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR)
+                        let qslot = with_at(0, |c| {
+                            // SAFETY: same as the share smoke above:
+                            // `c` is the live controller, `common`
+                            // is its mapped common-cfg MMIO region,
+                            // and CC_QUEUE_SELECT (0x16) /
+                            // CC_QUEUE_MSIX_VECTOR (0x1A) are
+                            // in-bounds common-cfg registers.
+                            // QUEUE_SELECT writes are safe post-probe:
+                            // the only writer in this driver is
+                            // probe-time `size_q`, and every queue
+                            // access sets SELECT first.
+                            unsafe {
+                                c.common.write16(crate::pci::CC_QUEUE_SELECT, 2 * k as u16);
+                                c.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR)
+                            }
                         })
                         .ok_or("controller vanished")?;
                         if qslot == slot {
@@ -5861,18 +5899,30 @@ mod tx_tests {
     fn smoke_virtio_net_msix_bind_writes() -> TestResult {
         let run = || -> Result<(), &'static str> {
             let fx = TxFixture::new()?;
+            // SAFETY: `fx` is this test's own fixture; `fx.dev.common`
+            // is the RAM-backed common-cfg region over the fixture's
+            // own 4096-byte coherent page, exclusively owned here.
+            // The bind writes queue 1 → slot 3 and reads it back.
             let ok = unsafe { crate::pci::bind_queue_msix_vector(&fx.dev.common, 1, 3) };
             if !ok {
                 return Err("queue bind readback mismatch on RAM region");
             }
+            // SAFETY: same fixture-owned RAM-backed common-cfg region;
+            // read-only read of the in-bounds CC_QUEUE_MSIX_VECTOR
+            // register (0x1A).
             let at = unsafe { fx.dev.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR) };
             if at != 3 {
                 return Err("queue bind did not write the slot");
             }
+            // SAFETY: same fixture-owned RAM-backed common-cfg region;
+            // the bind writes the config slot and reads it back.
             let ok = unsafe { crate::pci::bind_config_msix_vector(&fx.dev.common, 4) };
             if !ok {
                 return Err("config bind readback mismatch on RAM region");
             }
+            // SAFETY: same fixture-owned RAM-backed common-cfg region;
+            // read-only read of the in-bounds CC_MSIX_CONFIG register
+            // (0x10).
             let at = unsafe { fx.dev.common.read16(crate::pci::CC_MSIX_CONFIG) };
             if at != 4 {
                 return Err("config bind did not write the slot");
@@ -5889,14 +5939,26 @@ mod tx_tests {
                 },
             ];
             fx.dev.bind_tx_queue_shares(&bindings[..1]);
+            // SAFETY: same fixture-owned RAM-backed common-cfg region;
+            // read-only reads of the in-bounds CC_QUEUE_SELECT (0x16)
+            // / CC_QUEUE_MSIX_VECTOR (0x1A) registers.
             let sel = unsafe { fx.dev.common.read16(crate::pci::CC_QUEUE_SELECT) };
+            // SAFETY: same fixture-owned RAM-backed common-cfg region;
+            // read-only read of the in-bounds CC_QUEUE_MSIX_VECTOR
+            // register (0x1A).
             let vec = unsafe { fx.dev.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR) };
             if sel != 1 || vec != 0 {
                 return Err("TX-share loop did not bind pair 0 (queue 1, slot 0)");
             }
             // Then pair 1: TX queue 3 → slot 1.
             fx.dev.bind_tx_queue_shares(&bindings);
+            // SAFETY: same fixture-owned RAM-backed common-cfg region;
+            // read-only reads of the in-bounds CC_QUEUE_SELECT (0x16)
+            // / CC_QUEUE_MSIX_VECTOR (0x1A) registers.
             let sel = unsafe { fx.dev.common.read16(crate::pci::CC_QUEUE_SELECT) };
+            // SAFETY: same fixture-owned RAM-backed common-cfg region;
+            // read-only read of the in-bounds CC_QUEUE_MSIX_VECTOR
+            // register (0x1A).
             let vec = unsafe { fx.dev.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR) };
             if sel != 3 || vec != 1 {
                 return Err("TX-share loop did not bind pair 1 (queue 3, slot 1)");
@@ -5922,8 +5984,8 @@ mod tx_tests {
         let run = || -> Result<(), &'static str> {
             let mut table = narf_bus::msix::__synth_msix_table(5);
             let mut slots = [0u16; 5];
-            for i in 0..5 {
-                slots[i] = table.alloc_vector().ok_or("table exhausted early")?.vector;
+            for slot in &mut slots {
+                *slot = table.alloc_vector().ok_or("table exhausted early")?.vector;
             }
             if slots != [0, 1, 2, 3, 4] {
                 return Err("MSI-X slots not allocated in probe order");
@@ -5970,6 +6032,11 @@ mod tx_tests {
             };
             fx.dev.device_cfg = Some(region);
             fx.dev.has_status = true;
+            // SAFETY: `device_cfg` is a region over a freshly
+            // allocated 4096-byte coherent page, set up just above
+            // in this test and exclusively owned by the fixture;
+            // CFG_STATUS (6) is in-bounds (6 + 2 <= 4096), and the
+            // write targets the STATUS word the link watcher decodes.
             unsafe {
                 fx.dev
                     .device_cfg
@@ -5980,6 +6047,9 @@ mod tx_tests {
             if !fx.dev.refresh_link_from_status() {
                 return Err("STATUS LINK_UP did not read as up");
             }
+            // SAFETY: same fixture-owned 4096-byte device_cfg page as
+            // above; CFG_STATUS (6) is in-bounds, and the write clears
+            // the STATUS word the link watcher decodes.
             unsafe {
                 fx.dev
                     .device_cfg
@@ -5990,6 +6060,9 @@ mod tx_tests {
             if fx.dev.refresh_link_from_status() {
                 return Err("STATUS link-down did not read as down");
             }
+            // SAFETY: same fixture-owned 4096-byte device_cfg page as
+            // above; CFG_STATUS (6) is in-bounds, and the write
+            // re-raises the STATUS word the link watcher decodes.
             unsafe {
                 fx.dev
                     .device_cfg
