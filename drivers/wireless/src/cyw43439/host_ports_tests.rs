@@ -7,7 +7,8 @@
 //! under test. Command word, MSB → LSB: RW bit 31, AI bit 30,
 //! FN bits 29-28, ADDR bits 27-11, LENGTH bits 10-0.
 
-use super::*;
+use super::host_ports::*;
+use ::core::fmt;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use narf_drivers_spi::{registry, SpiBus, SpiError, SpiMode};
@@ -25,8 +26,8 @@ struct FakeSpiBus {
     freq: IrqSafeSpinLock<Option<u32>>,
 }
 
-impl core::fmt::Debug for FakeSpiBus {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl fmt::Debug for FakeSpiBus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FakeSpiBus")
             .field("name", &self.name)
             .finish_non_exhaustive()

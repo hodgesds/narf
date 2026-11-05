@@ -365,7 +365,7 @@ pub(super) fn weighted_avg(state: &mut NhmState) -> u8 {
 /// select the 4/8/16/32 µs unit; period is `(ms * 250) >> unit_idx`.
 pub(super) const fn ms_to_period_unit(time_ms: u16) -> (u32, u32) {
     let ms = if time_ms > 2097 { 2097 } else { time_ms };
-    let quotient = 32u32 * u32::from(ms) / 2097;
+    let quotient = 32u32 * (ms as u32) / 2097;
     let idx = if quotient < 4 {
         0
     } else if quotient < 8 {
@@ -375,7 +375,7 @@ pub(super) const fn ms_to_period_unit(time_ms: u16) -> (u32, u32) {
     } else {
         3
     };
-    ((u32::from(ms) * 250) >> idx, idx)
+    (((ms as u32) * 250) >> idx, idx)
 }
 
 /// Racing-level arbitration (`rtw89_phy_ccx_racing_ctrl`, `phy.c:6524..6553`).

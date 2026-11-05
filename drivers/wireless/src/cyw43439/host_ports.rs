@@ -289,8 +289,8 @@ impl GspiTransport {
 
 impl Transport for GspiTransport {
     fn read32(&mut self, function: Function, address: u32) -> Result<u32, TransportError> {
-        let cmd =
-            CommandWord::reg(Direction::Read, function, address).map_err(map_command_error)?;
+        let cmd = CommandWord::reg(Direction::Read, function.into(), address)
+            .map_err(map_command_error)?;
         let mut out = [0u8; 4];
         self.transact(cmd, &[], &mut out)?;
         Ok(u32::from_be_bytes(out))
@@ -302,8 +302,8 @@ impl Transport for GspiTransport {
         address: u32,
         value: u32,
     ) -> Result<(), TransportError> {
-        let cmd =
-            CommandWord::reg(Direction::Write, function, address).map_err(map_command_error)?;
+        let cmd = CommandWord::reg(Direction::Write, function.into(), address)
+            .map_err(map_command_error)?;
         self.transact(cmd, &value.to_be_bytes(), &mut [])?;
         Ok(())
     }
@@ -321,7 +321,7 @@ impl Transport for GspiTransport {
             let cmd = CommandWord::new(
                 Direction::Read,
                 AddrMode::Increment,
-                function,
+                function.into(),
                 address + offset as u32,
                 take as u16,
             )
@@ -346,7 +346,7 @@ impl Transport for GspiTransport {
             let cmd = CommandWord::new(
                 Direction::Write,
                 AddrMode::Increment,
-                function,
+                function.into(),
                 address + offset as u32,
                 take as u16,
             )

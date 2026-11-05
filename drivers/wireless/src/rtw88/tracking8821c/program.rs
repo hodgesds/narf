@@ -56,7 +56,10 @@ pub(super) fn bind(h: &mut narf_crypto::sha256::Sha256) {
 /// (the indices `ht40::write_power` commits to 0x1d0c for C21), else the
 /// HT grant's HT20 tracking indices. Pure over its inputs so the rule is
 /// unit-testable without a Gate.
-pub(super) fn mcs_indices(ht40: Option<&crate::rtw88::ht40::Record>, ht: &[u8; 8]) -> [u8; 8] {
+pub(in crate::rtw88) fn mcs_indices(
+    ht40: Option<&crate::rtw88::ht40::Record>,
+    ht: &[u8; 8],
+) -> [u8; 8] {
     match ht40 {
         Some(r) => r.indices[..8].try_into().expect("HT40 one-stream MCS0..7"),
         None => *ht,
