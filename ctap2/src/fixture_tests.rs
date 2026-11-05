@@ -493,7 +493,7 @@ fn smoke_debug_impls_redact_key_material() -> TestResult {
     let enrolled = try_ok!(enroll_pin(&mut client, PIN), "enroll");
     let salt1 = [0x51; 32];
     let out = try_ok!(
-        derive(&mut client, &enrolled.credential_id, salt1, None, Some(PIN)),
+        derive(&mut client, &enrolled, salt1, None, Some(PIN)),
         "derive one salt"
     );
     // The redacted Debug must name the shape, never the bytes:
