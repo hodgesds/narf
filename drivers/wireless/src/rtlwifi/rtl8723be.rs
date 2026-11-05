@@ -57,6 +57,16 @@
 //!   packet / EAPOL, watchdog, C2H BT info / MP, halt).
 //! - [`dm`] — `_rtl8723be_query_rxphystatus` PWDB and the
 //!   `rtl8723be_dm_refresh_rate_adaptive_mask` thresholds.
+//! - [`envelope`] — signed per-board NAPC power envelopes (2.4 GHz
+//!   only), minting the [`envelope::Permission`] the packet owner
+//!   transmits under and the [`channel::Grant`] that programs the
+//!   channel (measured indices capped at the Linux factory indices).
+//! - [`packet`] — the BE packet owner: single-MPDU TX descriptor fill,
+//!   RX descriptor query, RX C2H dispatch into the coexistence owner
+//!   (BE has no firmware-event mailbox; C2H arrives via `rpt_sel` RX
+//!   statuses), the `C2hSource` queue for the coexistence MP wait,
+//!   and the station-owner notify calls, all under firmware +
+//!   envelope + grant admission.
 
 #![allow(dead_code)]
 
@@ -66,12 +76,14 @@ pub mod c2h;
 pub mod channel;
 pub mod coex;
 pub mod dm;
+pub mod envelope;
 pub mod fw;
 pub mod h2c;
 pub mod init;
 pub mod iqk;
 pub mod llt;
 pub mod mac;
+pub mod packet;
 pub mod phy;
 pub mod pwrseq;
 pub mod tables;
