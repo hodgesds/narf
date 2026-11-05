@@ -43,7 +43,11 @@
 //! | 0x00D0  | IMS  | Interrupt Mask Set/Read           |
 //! | 0x00D8  | IMC  | Interrupt Mask Clear              |
 //! | 0x0100  | RCTL | Receive Control                   |
+//! | 0x0170  | FCTTV| Flow Control Transmit Timer Value |
 //! | 0x0400  | TCTL | Transmit Control                  |
+//! | 0x1000  | PBA  | Packet Buffer Allocation (RXA = RX KB) |
+//! | 0x2160  | FCRTL| Flow Control Receive Threshold Low |
+//! | 0x2168  | FCRTH| Flow Control Receive Threshold High |
 //! | 0x2800  | RDBAL| RX Descriptor Base Low            |
 //! | 0x2804  | RDBAH| RX Descriptor Base High           |
 //! | 0x2808  | RDLEN| RX Descriptor Ring Length         |
@@ -278,6 +282,18 @@ const REG_IMC: u64 = 0x00D8;
 const REG_RCTL: u64 = 0x0100;
 const REG_TCTL: u64 = 0x0400;
 const REG_TIPG: u64 = 0x0410;
+/// Flow Control Transmit Timer Value — pause quanta loaded into
+/// transmitted pause frames (Linux e1000e regs.h `E1000_FCTTV`).
+const REG_FCTTV: u64 = 0x0170;
+/// Packet Buffer Allocation — low 16 bits (RXA) are the RX packet
+/// buffer size in KB (Linux e1000e regs.h `E1000_PBA`).
+const REG_PBA: u64 = 0x1000;
+/// Flow Control Receive Threshold Low (Linux e1000e regs.h
+/// `E1000_FCRTL`).
+const REG_FCRTL: u64 = 0x2160;
+/// Flow Control Receive Threshold High (Linux e1000e regs.h
+/// `E1000_FCRTH`).
+const REG_FCRTH: u64 = 0x2168;
 /// Missed Packets Count — RX frames dropped for want of a descriptor
 /// (receive-FIFO overrun). Clears on read. 8254x SDM §13.
 const REG_MPC: u64 = 0x4010;
@@ -414,14 +430,18 @@ const ANAR_10FULL: u16 = 1 << 6;
 const ANAR_100HALF: u16 = 1 << 7;
 /// ANAR/LPA 100BASE-TX full-duplex bit.
 const ANAR_100FULL: u16 = 1 << 8;
-/// ANAR/LPA symmetric pause bit. Cleared by this lane (gap 7 owns
-/// pause advertisement — see `aneg_anar_next`).
+/// ANAR/LPA symmetric pause bit. Advertised by this driver (gap
+/// 7 landed): symmetric pause is what the datapath implements
+/// (thresholds + RFCE/TFCE).
 const ANAR_PAUSE: u16 = 1 << 10;
-/// ANAR/LPA asymmetric pause bit (same gap-7 note).
+/// ANAR/LPA asymmetric pause bit. NOT advertised: this driver
+/// implements symmetric pause only, and per the IEEE resolution
+/// table the ASM bit changes no outcome once PAUSE is set — so
+/// advertising it would claim a mode we do not distinguish.
 const ANAR_PAUSE_ASYM: u16 = 1 << 11;
 /// ANAR 10/100 speed bits — the field `aneg_anar_next` rewrites.
 const ANAR_SPEED_MASK: u16 = ANAR_10HALF | ANAR_10FULL | ANAR_100HALF | ANAR_100FULL;
-/// ANAR pause bits — cleared with the speed field until gap 7.
+/// ANAR pause bits — the pair the resolution table reads.
 const ANAR_PAUSE_MASK: u16 = ANAR_PAUSE | ANAR_PAUSE_ASYM;
 /// 1000BASE-T control 1000BASE-T half-duplex advertisement bit.
 const GBCR_1000HALF: u16 = 1 << 8;
@@ -481,6 +501,33 @@ const CTRL_SLU: u32 = 1 << 6; // Set Link Up
                               // this driver treats CTRL.VME as the one gate, and the RX path
                               // re-inserts stripped tags, so leaving it set once enabled is safe.
 const CTRL_VME: u32 = 1 << 30; // VLAN Mode Enable
+/// CTRL Receive Flow Control Enable (Linux e1000e defines.h
+/// `E1000_CTRL_RFCE`): honor incoming pause frames.
+const CTRL_RFCE: u32 = 1 << 27;
+/// CTRL Transmit Flow Control Enable (Linux e1000e defines.h
+/// `E1000_CTRL_TFCE`): generate pause frames.
+const CTRL_TFCE: u32 = 1 << 28;
+/// CTRL flow-control bits — the mask `configure_flow_control`
+/// rewrites (read-modify-write preserves SLU, VME, and friends).
+const CTRL_FC_MASK: u32 = CTRL_RFCE | CTRL_TFCE;
+/// Flow-control threshold masks (Linux e1000e defines.h): both
+/// thresholds live in bits 15:3, i.e. 8-byte granularity.
+const FCRTL_RTL_MASK: u32 = 0x0000FFF8;
+const FCRTH_RTH_MASK: u32 = 0x0000FFF8;
+/// FCRTL XON-enable bit (Linux e1000e defines.h
+/// `E1000_FCRTL_XONE`): with it set the MAC transmits an XON
+/// frame when occupancy drops below the low threshold.
+const FCRTL_XONE: u32 = 1 << 31;
+/// PBA RX-allocation field mask (Linux e1000e defines.h
+/// `E1000_PBA_RXA_MASK`): low 16 bits are the RX buffer size in KB.
+const PBA_RXA_MASK: u32 = 0xFFFF;
+/// Pause quanta loaded into transmitted pause frames (Linux
+/// e1000e `E1000_FC_PAUSE_TIME`, 0x0680 quanta ≈ 858 µs at 1 GbE).
+const FC_PAUSE_TIME: u32 = 0x0680;
+/// Largest frame this driver accepts (the existing tx_enqueue
+/// bound): used to cap the high watermark so one full-size frame
+/// still fits below it.
+const FC_MAX_FRAME: u32 = 1518;
 
 // TCTL bits.
 const TCTL_EN: u32 = 1 << 1;
@@ -1466,36 +1513,50 @@ pub enum LinkMode {
     Speed1000Full,
 }
 
+impl LinkMode {
+    /// Full-duplex modes. Flow control is full-duplex-only per
+    /// IEEE 802.3; a half-duplex negotiation forces it off (see
+    /// `resolve_flow_control`).
+    pub const fn is_full_duplex(self) -> bool {
+        matches!(
+            self,
+            LinkMode::Speed10Full | LinkMode::Speed100Full | LinkMode::Speed1000Full
+        )
+    }
+}
+
 /// This driver's auto-negotiation advertisement as (ANAR, GBCR):
-/// 10/100 half+full in ANAR, 1000 full only in GBCR, pause bits
-/// clear. 1000 half is denied exactly as Linux does ("We do not
-/// allow the Phy to advertise 1000 Mb Half Duplex",
-/// `e1000_phy_setup_autoneg`); pause is denied because flow
-/// control is audit gap 7 — advertising pause without FCRTL/FCRTH
-/// + RFCE/TFCE would promise a capability the datapath does not
-/// honor. The flow-control lane sets the pause bits when it lands.
+/// 10/100 half+full in ANAR, 1000 full only in GBCR, symmetric
+/// pause set, asymmetric pause clear. 1000 half is denied exactly
+/// as Linux does ("We do not allow the Phy to advertise 1000 Mb
+/// Half Duplex", `e1000_phy_setup_autoneg`); pause is advertised
+/// because flow control landed (audit gap 7): FCRTL/FCRTH +
+/// RFCE/TFCE are programmed by `configure_flow_control` after
+/// link-up, so the advertisement no longer promises an
+/// unimplemented capability.
 fn aneg_advertisement() -> (u16, u16) {
     (
-        ANAR_SELECTOR_CSMA | ANAR_10HALF | ANAR_10FULL | ANAR_100HALF | ANAR_100FULL,
+        ANAR_SELECTOR_CSMA | ANAR_10HALF | ANAR_10FULL | ANAR_100HALF | ANAR_100FULL | ANAR_PAUSE,
         GBCR_1000FULL,
     )
 }
 
 /// Next ANAR value from the current one, Linux
 /// `e1000_phy_setup_autoneg` shape: clear the 10/100 speed bits and
-/// the pause bits, then set this driver's speeds. The selector is
-/// forced to CSMA rather than preserved from the read: a zero
-/// selector is invalid, so forcing is strictly safer than copying
-/// a broken read. Remote-fault, acknowledge, and next-page bits
-/// are preserved (the PHY owns acknowledge; software must not
-/// clear it mid-negotiation).
+/// the asymmetric-pause bit, then set this driver's speeds +
+/// symmetric pause. The selector is forced to CSMA rather than
+/// preserved from the read: a zero selector is invalid, so forcing
+/// is strictly safer than copying a broken read. Remote-fault,
+/// acknowledge, and next-page bits are preserved (the PHY owns
+/// acknowledge; software must not clear it mid-negotiation).
 fn aneg_anar_next(current: u16) -> u16 {
-    (current & !(ANAR_SPEED_MASK | ANAR_PAUSE_MASK))
+    (current & !(ANAR_SPEED_MASK | ANAR_PAUSE_ASYM))
         | ANAR_SELECTOR_CSMA
         | ANAR_10HALF
         | ANAR_10FULL
         | ANAR_100HALF
         | ANAR_100FULL
+        | ANAR_PAUSE
 }
 
 /// Next GBCR value from the current one: clear both 1000 speed
@@ -1559,6 +1620,81 @@ impl PartnerAbility {
     pub const fn negotiated_mode(&self, our_anar: u16, our_gbcr: u16) -> Option<LinkMode> {
         resolve_negotiated_mode(our_anar, our_gbcr, self.anar, self.stat1000)
     }
+}
+
+/// Negotiated flow control from auto-negotiation (IEEE 802.3ab
+/// pause resolution, table as quoted in Linux e1000e mac.c
+/// `e1000_config_fc_after_link_up`). Naming follows Linux:
+/// TxPause means this station SENDS pause frames (it needs
+/// thresholds + TFCE); RxPause means it HONORS incoming pause
+/// frames (RFCE).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowControl {
+    /// No pause in either direction.
+    Disabled,
+    /// Honor incoming pause frames only (RFCE, no thresholds).
+    RxPause,
+    /// Generate pause frames only (thresholds + TFCE).
+    TxPause,
+    /// Both directions (thresholds + RFCE + TFCE).
+    Full,
+}
+
+/// Resolve flow control from our ANAR word and the link partner's
+/// LPA word. Half duplex forces Disabled per IEEE 802.3 (pause is
+/// a full-duplex-only mechanism). With this driver's advertisement
+/// (PAUSE set, ASM_DIR clear) the only non-Disabled outcome is
+/// Full when the partner also sets PAUSE; the asymmetric arms are
+/// implemented for table completeness and covered by smokes.
+pub fn resolve_flow_control(our_anar: u16, lp_anar: u16, full_duplex: bool) -> FlowControl {
+    if !full_duplex {
+        return FlowControl::Disabled;
+    }
+    let our_pause = our_anar & ANAR_PAUSE != 0;
+    let our_asym = our_anar & ANAR_PAUSE_ASYM != 0;
+    let lp_pause = lp_anar & ANAR_PAUSE != 0;
+    let lp_asym = lp_anar & ANAR_PAUSE_ASYM != 0;
+    if our_pause && lp_pause {
+        FlowControl::Full
+    } else if !our_pause && our_asym && lp_pause && lp_asym {
+        FlowControl::TxPause
+    } else if our_pause && our_asym && !lp_pause && lp_asym {
+        FlowControl::RxPause
+    } else {
+        FlowControl::Disabled
+    }
+}
+
+/// CTRL flow-control bits for a resolved mode (Linux e1000e
+/// `e1000e_force_mac_fc` mapping: Disabled → neither, RxPause →
+/// RFCE, TxPause → TFCE, Full → both).
+pub fn flow_control_ctrl_bits(mode: FlowControl) -> u32 {
+    match mode {
+        FlowControl::Disabled => 0,
+        FlowControl::RxPause => CTRL_RFCE,
+        FlowControl::TxPause => CTRL_TFCE,
+        FlowControl::Full => CTRL_RFCE | CTRL_TFCE,
+    }
+}
+
+/// Flow-control watermarks from the PBA RX allocation, in bytes:
+/// `(low, high)`. High is 90% of the RX buffer capped by one
+/// max-size frame of headroom, low is 80% — the Linux e1000e
+/// generic/pch2lan formulas — both masked to 8-byte granularity.
+/// `None` is fail-closed: PBA 0 (unprogrammed / QEMU default) or a
+/// degenerate result means "do not enable transmit pause" rather
+/// than a threshold that would XOFF immediately.
+pub fn flow_control_watermarks(pba_rxa_kb: u32, max_frame: u32) -> Option<(u32, u32)> {
+    if pba_rxa_kb == 0 {
+        return None;
+    }
+    let bytes = pba_rxa_kb * 1024;
+    let high = core::cmp::min(bytes * 9 / 10, bytes.saturating_sub(max_frame)) & FCRTH_RTH_MASK;
+    let low = (bytes * 8 / 10) & FCRTL_RTL_MASK;
+    if low == 0 || high == 0 || low >= high {
+        return None;
+    }
+    Some((low, high))
 }
 
 /// Read a 16-bit register from the internal PHY via MDIC.
@@ -2058,6 +2194,24 @@ impl E1000 {
         // SAFETY: same.
         let status = unsafe { mmio.read32(REG_STATUS) };
         let link_up = status & STATUS_LU != 0;
+
+        // 6b. Fail-closed flow-control defaults (audit gap 7):
+        // thresholds zero, RFCE/TFCE clear. Reset defaults are
+        // already zero, but an already-programmed device (re-probe
+        // / kexec) could carry stale thresholds — zeroing here
+        // keeps hardware in the known-disabled state until the
+        // post-link `configure_flow_control` enables it, the same
+        // rationale as the VFTA/MTA zeroing above. FCTTV is left
+        // alone: with TFCE clear no pause frames are generated,
+        // and `configure_flow_control` programs it whenever it
+        // sets TFCE.
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(REG_FCRTL, 0);
+            mmio.write32(REG_FCRTH, 0);
+            let ctrl = mmio.read32(REG_CTRL);
+            mmio.write32(REG_CTRL, ctrl & !CTRL_FC_MASK);
+        }
 
         // 7. Try to attach an IRQ delivery path. Mirror the
         //    `xhci.rs` MSI-X → INTx → polled fallback chain.
@@ -4030,6 +4184,64 @@ impl E1000 {
         let partner = self.link_partner_ability()?;
         Ok(partner.negotiated_mode(our_anar, our_gbcr))
     }
+
+    /// Resolve and program flow control after link-up (audit gap
+    /// 7). Reads our ANAR/GBCR + the partner ability, resolves the
+    /// mode (half duplex or no common mode → Disabled), then
+    /// programs FCRTL/FCRTH/FCTTV + the CTRL RFCE/TFCE bits.
+    /// Thresholds are programmed only when we generate pause
+    /// frames (TxPause/Full), exactly as Linux's
+    /// `e1000e_set_fc_watermarks` gates on tx_pause; other modes
+    /// zero the thresholds. A degenerate PBA (0, or too small for
+    /// a frame) degrades TxPause/Full to Disabled rather than
+    /// programming a threshold that would XOFF immediately.
+    /// FCTTV is programmed on every call so repeated configuration
+    /// leaves deterministic state. Same do-not-call-during-bring_up
+    /// constraint as `negotiated_mode` (it uses `phy_read`);
+    /// callers invoke it after `autoneg_complete` reports true.
+    /// Bring-up itself leaves flow control fail-closed
+    /// (thresholds zero, RFCE/TFCE clear); this is the post-link
+    /// step that enables it.
+    pub fn configure_flow_control(&self) -> Result<FlowControl, E1000Error> {
+        let our_anar = self.phy_read(PHY_ANAR)?;
+        let our_gbcr = self.phy_read(PHY_GBCR)?;
+        let partner = self.link_partner_ability()?;
+        let full = partner
+            .negotiated_mode(our_anar, our_gbcr)
+            .is_some_and(|m| m.is_full_duplex());
+        let mut mode = resolve_flow_control(our_anar, partner.anar, full);
+        let mut fcrtl = 0u32;
+        let mut fcrth = 0u32;
+        let mut fcttv = 0u32;
+        if matches!(mode, FlowControl::TxPause | FlowControl::Full) {
+            // SAFETY: mapped MMIO; PBA is a valid 32-bit register
+            // offset within BAR0.
+            let pba = unsafe { self.mmio.read32(REG_PBA) } & PBA_RXA_MASK;
+            match flow_control_watermarks(pba, FC_MAX_FRAME) {
+                Some((low, high)) => {
+                    fcrtl = low | FCRTL_XONE;
+                    fcrth = high;
+                    fcttv = FC_PAUSE_TIME;
+                }
+                // Degenerate PBA: fail closed to Disabled.
+                None => mode = FlowControl::Disabled,
+            }
+        }
+        // SAFETY: mapped MMIO; the FC registers are valid 32-bit
+        // offsets within BAR0, and the CTRL read-modify-write
+        // preserves SLU, VME, and every other bit.
+        unsafe {
+            self.mmio.write32(REG_FCRTL, fcrtl);
+            self.mmio.write32(REG_FCRTH, fcrth);
+            self.mmio.write32(REG_FCTTV, fcttv);
+            let ctrl = self.mmio.read32(REG_CTRL);
+            self.mmio.write32(
+                REG_CTRL,
+                (ctrl & !CTRL_FC_MASK) | flow_control_ctrl_bits(mode),
+            );
+        }
+        Ok(mode)
+    }
 }
 
 mod tests {
@@ -4088,14 +4300,17 @@ mod tests {
     kernel_test_in!("drivers/net/e1000", smoke_link_sample_from_status_decodes);
 
     fn smoke_aneg_advertisement_shape() -> TestResult {
-        // ANAR = selector + 10/100 half+full = 0x01E1; GBCR = 1000
-        // full only = 0x0200; pause bits clear (gap 7 owns them).
+        // ANAR = selector + 10/100 half+full + symmetric pause =
+        // 0x05E1; GBCR = 1000 full only = 0x0200; asymmetric pause
+        // clear (gap 7 landed, symmetric only).
         let (anar, gbcr) = super::aneg_advertisement();
-        if anar != 0x01E1 || gbcr != 0x0200 {
+        if anar != 0x05E1 || gbcr != 0x0200 {
             return TestResult::Fail("e1000 autoneg advertisement word mismatch");
         }
-        if anar & super::ANAR_PAUSE_MASK != 0 {
-            return TestResult::Fail("e1000 autoneg advertisement sets pause bits");
+        if anar & super::ANAR_PAUSE_MASK != super::ANAR_PAUSE {
+            return TestResult::Fail(
+                "e1000 autoneg advertisement pause bits are not symmetric-only",
+            );
         }
         if anar & 0x001F != super::ANAR_SELECTOR_CSMA {
             return TestResult::Fail("e1000 autoneg advertisement selector is not CSMA");
@@ -4106,15 +4321,16 @@ mod tests {
 
     fn smoke_aneg_next_rewrites_only_its_fields() -> TestResult {
         // From zero: exactly the advertisement words.
-        if super::aneg_anar_next(0x0000) != 0x01E1 {
+        if super::aneg_anar_next(0x0000) != 0x05E1 {
             return TestResult::Fail("e1000 aneg_anar_next(0) is not the advertisement");
         }
         if super::aneg_gbcr_next(0x0000) != 0x0200 {
             return TestResult::Fail("e1000 aneg_gbcr_next(0) is not 1000 full");
         }
-        // From all-ones: speeds + pause rewritten, selector forced,
+        // From all-ones: speeds + symmetric pause rewritten,
+        // asymmetric pause cleared, selector forced,
         // reserved/remote-fault/ack/next-page bits preserved.
-        if super::aneg_anar_next(0xFFFF) != 0xF3FF {
+        if super::aneg_anar_next(0xFFFF) != 0xF7FF {
             return TestResult::Fail("e1000 aneg_anar_next(0xFFFF) preserved the wrong bits");
         }
         if super::aneg_gbcr_next(0xFFFF) != 0xFEFF {
@@ -4570,4 +4786,99 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_rx_drop_reason_matrix);
+
+    fn smoke_flow_control_resolve_table() -> TestResult {
+        // Our advertisement: PAUSE set, ASM_DIR clear.
+        let ours = super::ANAR_PAUSE;
+        // Partner symmetric → Full.
+        if super::resolve_flow_control(ours, super::ANAR_PAUSE, true) != super::FlowControl::Full {
+            return TestResult::Fail("e1000 FC resolve missed symmetric Full");
+        }
+        // Partner asymmetric-only → Disabled (table row 1,0,0,DC).
+        if super::resolve_flow_control(ours, super::ANAR_PAUSE_ASYM, true)
+            != super::FlowControl::Disabled
+        {
+            return TestResult::Fail("e1000 FC resolve enabled pause against ASM-only partner");
+        }
+        // Partner none → Disabled.
+        if super::resolve_flow_control(ours, 0x0000, true) != super::FlowControl::Disabled {
+            return TestResult::Fail("e1000 FC resolve enabled pause against no-pause partner");
+        }
+        // Half duplex forces Disabled even with symmetric agreement.
+        if super::resolve_flow_control(ours, super::ANAR_PAUSE, false)
+            != super::FlowControl::Disabled
+        {
+            return TestResult::Fail("e1000 FC resolve enabled pause on half duplex");
+        }
+        // General-table arms (not reachable with our advertisement,
+        // implemented for table completeness):
+        // local ASM-only + partner both → TxPause.
+        let local_asym = super::ANAR_PAUSE_ASYM;
+        let partner_both = super::ANAR_PAUSE | super::ANAR_PAUSE_ASYM;
+        if super::resolve_flow_control(local_asym, partner_both, true)
+            != super::FlowControl::TxPause
+        {
+            return TestResult::Fail("e1000 FC resolve missed ASM-only TxPause arm");
+        }
+        // local both + partner ASM-only → RxPause.
+        if super::resolve_flow_control(partner_both, super::ANAR_PAUSE_ASYM, true)
+            != super::FlowControl::RxPause
+        {
+            return TestResult::Fail("e1000 FC resolve missed RxPause arm");
+        }
+        // local ASM-only + partner PAUSE-only → Disabled (table row).
+        if super::resolve_flow_control(local_asym, super::ANAR_PAUSE, true)
+            != super::FlowControl::Disabled
+        {
+            return TestResult::Fail("e1000 FC resolve enabled pause on ASM/PAUSE-only mismatch");
+        }
+        // local none → Disabled regardless of partner.
+        if super::resolve_flow_control(0x0000, partner_both, true) != super::FlowControl::Disabled {
+            return TestResult::Fail("e1000 FC resolve enabled pause with no local advertisement");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_flow_control_resolve_table);
+
+    fn smoke_flow_control_watermarks() -> TestResult {
+        // PBA 32 KB: high = min(90% = 29491, 32768 − 1518 = 31250)
+        // masked = 29488; low = 80% = 26214 masked = 26208.
+        if super::flow_control_watermarks(32, 1518) != Some((26208, 29488)) {
+            return TestResult::Fail("e1000 FC watermarks wrong at PBA 32K");
+        }
+        // PBA 14 KB: high = min(12902, 12818) masked = 12816;
+        // low = 11468 masked = 11464.
+        if super::flow_control_watermarks(14, 1518) != Some((11464, 12816)) {
+            return TestResult::Fail("e1000 FC watermarks wrong at PBA 14K");
+        }
+        // PBA 0 (unprogrammed) → fail-closed None.
+        if super::flow_control_watermarks(0, 1518).is_some() {
+            return TestResult::Fail("e1000 FC watermarks enabled on PBA 0");
+        }
+        // PBA 1 KB cannot fit a max frame below the high mark → None.
+        if super::flow_control_watermarks(1, 1518).is_some() {
+            return TestResult::Fail("e1000 FC watermarks enabled on degenerate PBA");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_flow_control_watermarks);
+
+    fn smoke_flow_control_ctrl_bits() -> TestResult {
+        if super::flow_control_ctrl_bits(super::FlowControl::Disabled) != 0 {
+            return TestResult::Fail("e1000 FC ctrl bits nonzero for Disabled");
+        }
+        if super::flow_control_ctrl_bits(super::FlowControl::RxPause) != super::CTRL_RFCE {
+            return TestResult::Fail("e1000 FC ctrl bits wrong for RxPause");
+        }
+        if super::flow_control_ctrl_bits(super::FlowControl::TxPause) != super::CTRL_TFCE {
+            return TestResult::Fail("e1000 FC ctrl bits wrong for TxPause");
+        }
+        if super::flow_control_ctrl_bits(super::FlowControl::Full)
+            != super::CTRL_RFCE | super::CTRL_TFCE
+        {
+            return TestResult::Fail("e1000 FC ctrl bits wrong for Full");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_flow_control_ctrl_bits);
 }
