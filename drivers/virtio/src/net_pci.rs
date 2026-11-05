@@ -370,12 +370,6 @@ pub const MAX_RX_FRAME: usize = 1518 + VIRTIO_NET_HDR_LEN;
 /// RX header grows to 20 bytes with HASH_REPORT.
 const MAX_RX_FRAME_PAYLOAD: usize = MAX_RX_FRAME - VIRTIO_NET_HDR_LEN;
 
-/// 802.1Q VLAN tag length. Plain-frame caps carry this headroom so an
-/// inline-tagged MTU-sized frame is neither rejected on TX nor dropped
-/// on RX (RX passes tagged frames with the tag intact; TX rejects only
-/// metadata-tagged frames, see `tx_header_for_frame`).
-const VLAN_TAG_LEN: usize = 4;
-
 /// Largest MTU honestly advertisable without MRG_RXBUF: a standard
 /// frame (1500 MTU + Ethernet header + VLAN tag). A device advertising
 /// more while MRG is off gets clamped to this at probe — previously
@@ -2862,6 +2856,10 @@ impl VirtioNetPci {
             let mut g = pair.rx_queue.lock();
             g.as_mut()?.poll_used()?
         };
+        // `poll_used` reports the used-ring elem id (le32), but
+        // descriptor indices are u16 — same conversion as the
+        // single path (`let head = id as u16`).
+        let head0 = head0 as u16;
         let replacement0 = self.rx_buf_acquire_on(pair_idx)?;
         let buf0 = {
             let mut bufs = pair.rx_buffers.lock();
@@ -2902,6 +2900,8 @@ impl VirtioNetPci {
                 short = true;
                 break;
             };
+            // See segment 0: used-ring ids are le32, indices are u16.
+            let head = head as u16;
             let buf = {
                 let mut bufs = pair.rx_buffers.lock();
                 bufs.get_mut(head as usize).and_then(|s| s.take())
