@@ -4208,7 +4208,7 @@ impl E1000 {
         let partner = self.link_partner_ability()?;
         let full = partner
             .negotiated_mode(our_anar, our_gbcr)
-            .map_or(false, |m| m.is_full_duplex());
+            .is_some_and(|m| m.is_full_duplex());
         let mut mode = resolve_flow_control(our_anar, partner.anar, full);
         let mut fcrtl = 0u32;
         let mut fcrth = 0u32;
