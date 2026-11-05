@@ -79,6 +79,57 @@ pub(super) fn encode_txwd_be(info: &TxwdBeInfo, out: &mut [u8]) -> Option<()> {
     Some(())
 }
 
+// ── BE TXWD_INFO EHT fields ───────────────────────────────────────────
+//
+// The EHT contribution to the BE TXWD_INFO block (`struct
+// rtw89_txwd_info_v2`, 8 dwords, `core.h:1141`): only the two EHT
+// fields, as (info4 bits, info7 bits), for the future BE transport
+// fill to OR into its complete info block. Linux's v2/v3 fill
+// (`core.c::rtw89_core_fill_txdesc_v2/v3`) programs info0/1/2 and
+// info4 = RTS_EN + HW_RTS_EN only, leaving info7 unfilled in this
+// kernel — so these EHT bits have no Linux fill site to copy, and
+// this function encodes exactly the txrx.h positions with
+// caller-supplied values instead of inventing trigger conditions.
+// Composition contract: this is NOT a complete info-block fill —
+// the future fill must OR these bits into its info4/info7 alongside
+// the RTS and UL fields, and the transport keeps BODY0_WDINFO_EN
+// cleared until a complete info block follows, as today.
+
+/// BE TXWD_INFO dword 4 `SW_EHT_NLTF_SWITCH` bit 20 (`txrx.h:307`).
+pub(super) const INFO4_SW_EHT_NLTF_SWITCH: u32 = 1 << 20;
+/// BE TXWD_INFO dword 4 `SW_EHT_NLTF` bits 22:21 (`txrx.h:308`).
+pub(super) const INFO4_SW_EHT_NLTF_MASK: u32 = 0x3 << 21;
+/// BE TXWD_INFO dword 7 `UL_EHT_USR_PRES` bit 16 (`txrx.h:336`).
+pub(super) const INFO7_UL_EHT_USR_PRES: u32 = 1 << 16;
+
+/// EHT field contribution to the BE TXWD_INFO block: the info4
+/// software-NLTF bits and the info7 UL-EHT-user bit for one frame.
+/// `nltf` is the 2-bit software NLTF value; `None` when it does not
+/// fit (fail-closed: no truncated NLTF value is ever encoded).
+/// Firmware honors the NLTF value when the switch bit is set; the
+/// bits are encoded as given either way, and the fail-closed
+/// default (switch off, NLTF 0, no UL user) yields (0, 0).
+pub(super) const fn eht_info_fields(
+    nltf_switch: bool,
+    nltf: u8,
+    ul_eht_usr_pres: bool,
+) -> Option<(u32, u32)> {
+    if nltf > 3 {
+        return None;
+    }
+    let mut info4: u32 = 0;
+    if nltf_switch {
+        info4 |= INFO4_SW_EHT_NLTF_SWITCH;
+    }
+    info4 |= ((nltf as u32) << 21) & INFO4_SW_EHT_NLTF_MASK;
+    let info7: u32 = if ul_eht_usr_pres {
+        INFO7_UL_EHT_USR_PRES
+    } else {
+        0
+    };
+    Some((info4, info7))
+}
+
 // ── BE RXD short v2 (6 dwords) ───────────────────────────────────────
 
 /// BE RXD short v2 size in bytes (`chip_8922a::H2C_DESC_SIZE`).

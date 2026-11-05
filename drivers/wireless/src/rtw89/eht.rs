@@ -27,15 +27,19 @@
 //!   come from `rtw89_phy_get_txsb` (`phy.c`), which is not in the
 //!   local reference. Only the width-to-RFMOD table and the SIFS
 //!   value pairs from `set_channel_mac` are claimed.
-//! - EHT MCS/NSS capability maps are NOT encoded: they come from
-//!   `rtw89_init_eht_cap` (`core.c`), which is not in the local
-//!   reference. The only capability scalar claimed here is
-//!   `max_mpdu_len` = 7991, already carried by `chip_8922a`.
+//! - EHT MCS/NSS capability maps ARE encoded below (`eht_cap`,
+//!   mirroring `rtw89_init_eht_cap` in `core.c` @ 05441d6 — the
+//!   sparse-clone reference, which supersedes the step-1 note
+//!   that `core.c` was not in the local reference). The
+//!   `max_mpdu_len` = 7991 scalar is already carried by
+//!   `chip_8922a`.
 //! - The TXWD_INFO EHT fields (`BE_TXD_INFO4_SW_EHT_NLTF_SWITCH` /
-//!   `SW_EHT_NLTF`, `BE_TXD_INFO7_UL_EHT_USR_PRES` in `txrx.h`) belong
-//!   to the TXWD_INFO block, not the TXWD body `txrx_be.rs` encodes,
-//!   so they are not touched here; the BE DMA transport fills the
-//!   info block when it lands.
+//!   `SW_EHT_NLTF`, `BE_TXD_INFO7_UL_EHT_USR_PRES` in `txrx.h`) are
+//!   encoded by `txrx_be::eht_info_fields` as the EHT contribution
+//!   to the TXWD_INFO block (to be OR'd into the complete info
+//!   block by the future BE transport fill, which also carries
+//!   info0/1/2/4 from Linux's v2 builders); they are not part of
+//!   the TXWD body `txrx_be.rs` encodes.
 //! - The BB bandwidth class carries no Linux numeric value: the
 //!   `RTW89_BB_BW_20_40` / `RTW89_BB_BW_80_160_320` enum lives in a
 //!   header outside the local reference, so only the class
@@ -259,8 +263,8 @@ pub(super) const B_CNT_EHT_CRC_ERR: u32 = 0xFFFF << 16;
 /// tables above all carry an explicit 320MHz arm), and the EHT
 /// maximum MPDU length is `chip_8922a::MAX_EHT_MPDU_CAP` (7991,
 /// `rtw8922a.c:3222`). MCS/NSS capability maps are deliberately NOT
-/// part of this struct: they need `rtw89_init_eht_cap` (`core.c`),
-/// which is not in the local reference. No production caller consumes
+/// part of this struct: they live in `EhtCap` below, computed by
+/// `eht_cap` from the same `rtw89_init_eht_cap` source. No production caller consumes
 /// this profile yet; the future 8922A station owner advertises it
 /// once admission exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,3 +280,271 @@ pub(super) const EHT_8922A: EhtOperation = EhtOperation {
     width_320: true,
     max_mpdu_len: super::chip_8922a::MAX_EHT_MPDU_CAP,
 };
+
+// ── EHT capability (`rtw89_init_eht_cap`, `core.c:6255`) ──────────────
+//
+// Mirrors Linux `rtw89_init_eht_cap` (torvalds/linux @ 05441d6) field
+// for field. Constant source: `include/linux/ieee80211-eht.h`
+// (P802.11be_D2.0 §9.4.2.313.2). The function is band-parameterized
+// exactly like Linux: the only band-dependent behavior is the 320MHz
+// gate, which requires BOTH the 6GHz band AND the 320MHz bit in the
+// chip's `support_bandwidths`.
+//
+// 8922A distinction, stated so the two 320MHz claims in this file are
+// not misread as contradictory: step 1's width programming DOES carry
+// a 320MHz arm (CFGCH code 4, SIFS pairs, BB class), but the
+// advertised EHT capability does NOT carry 320MHz MCS/NSS —
+// `rtw8922a.c:3263` lists `support_bandwidths` as 20/40/80/160 with
+// no 320MHz bit, so Linux's gate leaves the 320 entries unset and
+// the 320MHz PHY bits clear. Programmed widths and advertised
+// capabilities are different things; this function models the
+// advertisement, faithfully including its absence.
+
+/// `IEEE80211_EHT_MCS_NSS_RX` (`ieee80211-eht.h:47`): GENMASK(3, 0).
+pub(super) const EHT_MCS_NSS_RX_MASK: u8 = 0x0F;
+/// `IEEE80211_EHT_MCS_NSS_TX` (`ieee80211-eht.h:48`): GENMASK(7, 4).
+pub(super) const EHT_MCS_NSS_TX_MASK: u8 = 0xF0;
+/// `IEEE80211_EHT_MAC_CAP0_MAX_MPDU_LEN_MASK` (`ieee80211-eht.h:192`):
+/// GENMASK(7, 6).
+pub(super) const EHT_MAC_CAP0_MAX_MPDU_MASK: u8 = 0xC0;
+/// `IEEE80211_EHT_MAC_CAP0_MAX_MPDU_LEN_3895` (`ieee80211-eht.h:193`).
+pub(super) const EHT_MAX_MPDU_3895: usize = 3895;
+/// `IEEE80211_EHT_MAC_CAP0_MAX_MPDU_LEN_7991` (`ieee80211-eht.h:194`).
+pub(super) const EHT_MAX_MPDU_7991: usize = 7991;
+/// `IEEE80211_EHT_MAC_CAP0_MAX_MPDU_LEN_11454` (`ieee80211-eht.h:195`).
+pub(super) const EHT_MAX_MPDU_11454: usize = 11454;
+/// `IEEE80211_EHT_PHY_CAP0_320MHZ_IN_6GHZ` (`ieee80211-eht.h:205`).
+pub(super) const EHT_PHY_CAP0_320MHZ_IN_6GHZ: u8 = 0x02;
+/// `IEEE80211_EHT_PHY_CAP0_NDP_4_EHT_LFT_32_GI` (`ieee80211-eht.h:207`).
+pub(super) const EHT_PHY_CAP0_NDP_4_EHT_LFT_32_GI: u8 = 0x08;
+/// `IEEE80211_EHT_PHY_CAP0_SU_BEAMFORMEE` (`ieee80211-eht.h:210`).
+pub(super) const EHT_PHY_CAP0_SU_BEAMFORMEE: u8 = 0x40;
+/// `IEEE80211_EHT_PHY_CAP0_BEAMFORMEE_SS_80MHZ_MASK`
+/// (`ieee80211-eht.h:213`): bit 7 of byte 0.
+pub(super) const EHT_PHY_CAP0_BF_SS_80_MASK: u8 = 0x80;
+/// `IEEE80211_EHT_PHY_CAP1_BEAMFORMEE_SS_80MHZ_MASK`
+/// (`ieee80211-eht.h:214`): GENMASK(1, 0) of byte 1.
+pub(super) const EHT_PHY_CAP1_BF_SS_80_MASK: u8 = 0x03;
+/// `IEEE80211_EHT_PHY_CAP1_BEAMFORMEE_SS_160MHZ_MASK`
+/// (`ieee80211-eht.h:216`): GENMASK(4, 2) of byte 1.
+pub(super) const EHT_PHY_CAP1_BF_SS_160_MASK: u8 = 0x1C;
+/// `IEEE80211_EHT_PHY_CAP1_BEAMFORMEE_SS_320MHZ_MASK`
+/// (`ieee80211-eht.h:217`): GENMASK(7, 5) of byte 1.
+pub(super) const EHT_PHY_CAP1_BF_SS_320_MASK: u8 = 0xE0;
+/// `IEEE80211_EHT_PHY_CAP3_CODEBOOK_4_2_SU_FDBK`
+/// (`ieee80211-eht.h:227`).
+pub(super) const EHT_PHY_CAP3_CODEBOOK_4_2_SU: u8 = 0x08;
+/// `IEEE80211_EHT_PHY_CAP3_CODEBOOK_7_5_MU_FDBK`
+/// (`ieee80211-eht.h:228`).
+pub(super) const EHT_PHY_CAP3_CODEBOOK_7_5_MU: u8 = 0x10;
+/// `IEEE80211_EHT_PHY_CAP3_TRIG_SU_BF_FDBK` (`ieee80211-eht.h:229`).
+pub(super) const EHT_PHY_CAP3_TRIG_SU_BF: u8 = 0x20;
+/// `IEEE80211_EHT_PHY_CAP3_TRIG_MU_BF_PART_BW_FDBK`
+/// (`ieee80211-eht.h:230`).
+pub(super) const EHT_PHY_CAP3_TRIG_MU_BF_PART_BW: u8 = 0x40;
+/// `IEEE80211_EHT_PHY_CAP4_POWER_BOOST_FACT_SUPP`
+/// (`ieee80211-eht.h:235`).
+pub(super) const EHT_PHY_CAP4_POWER_BOOST_FACT_SUPP: u8 = 0x04;
+/// `IEEE80211_EHT_PHY_CAP4_MAX_NC_MASK` (`ieee80211-eht.h:237`):
+/// GENMASK(7, 4) of byte 4.
+pub(super) const EHT_PHY_CAP4_MAX_NC_MASK: u8 = 0xF0;
+/// `IEEE80211_EHT_PHY_CAP5_COMMON_NOMINAL_PKT_PAD_MASK`
+/// (`ieee80211-eht.h:243`): GENMASK(5, 4) of byte 5.
+pub(super) const EHT_PHY_CAP5_PKT_PAD_MASK: u8 = 0x30;
+/// `IEEE80211_EHT_PHY_CAP5_COMMON_NOMINAL_PKT_PAD_20US`
+/// (`ieee80211-eht.h:247`).
+pub(super) const EHT_PHY_CAP5_PKT_PAD_20US: u8 = 3;
+
+/// Beamformee spatial-stream count Linux hardcodes in
+/// `rtw89_init_eht_cap` (`int sts = 8`).
+pub(super) const EHT_BEAMFORMEE_STS: u8 = 8;
+
+/// Inputs to `eht_cap`, mirroring the Linux values the function
+/// reads: the band, the chip's 320MHz bandwidth bit, the firmware
+/// phycap gates (`hal->no_eht`, `hal->no_mcs_12_13`), the NSS pair,
+/// and the maximum MPDU length in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct EhtCapInputs {
+    /// True for the 6GHz band (`NL80211_BAND_6GHZ`).
+    pub(super) six_ghz: bool,
+    /// True when the chip's `support_bandwidths` carries
+    /// `BIT(NL80211_CHAN_WIDTH_320)`.
+    pub(super) support_320mhz_bandwidth: bool,
+    /// Firmware phycap protocol below 11BE (`hal->no_eht`).
+    pub(super) no_eht: bool,
+    /// Variant + phycap QAM gate (`hal->no_mcs_12_13`).
+    pub(super) no_mcs_12_13: bool,
+    /// Receive spatial streams (`hal->rx_nss`).
+    pub(super) rx_nss: u8,
+    /// Transmit spatial streams (`hal->tx_nss`).
+    pub(super) tx_nss: u8,
+    /// Maximum MPDU length in bytes (3895, 7991, or 11454).
+    pub(super) max_mpdu_len: usize,
+}
+
+/// EHT MCS/NSS support for one bandwidth: the packed
+/// `rx_tx_mcs{9,11,13}_max_nss` byte per MCS group
+/// (`ieee80211_eht_mcs_nss_supp`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct EhtMcsNss {
+    /// MCS 0..9 maximum NSS byte.
+    pub(super) mcs9: u8,
+    /// MCS 0..11 maximum NSS byte.
+    pub(super) mcs11: u8,
+    /// MCS 0..13 maximum NSS byte (0 when MCS 12/13 unsupported).
+    pub(super) mcs13: u8,
+}
+
+/// Advertised EHT capability for one station, as Linux's
+/// `rtw89_init_eht_cap` builds it: MAC/PHY capability bytes plus
+/// the per-bandwidth MCS/NSS maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct EhtCap {
+    /// `eht_cap_elem.mac_cap_info[0..2]`.
+    pub(super) mac_cap_info: [u8; 2],
+    /// `eht_cap_elem.phy_cap_info[0..9]`.
+    pub(super) phy_cap_info: [u8; 9],
+    /// 80MHz MCS/NSS map.
+    pub(super) mcs_nss_80: EhtMcsNss,
+    /// 160MHz MCS/NSS map.
+    pub(super) mcs_nss_160: EhtMcsNss,
+    /// 320MHz MCS/NSS map (all zero when 320MHz is not gated in).
+    pub(super) mcs_nss_320: EhtMcsNss,
+}
+
+/// Compute the advertised EHT capability, mirroring Linux
+/// `rtw89_init_eht_cap` exactly: `None` when EHT is gated off
+/// (`no_eht`, Linux's early return) or when the MPDU length is not
+/// one of the three encoded values (fail-closed: no wrong MPDU cap
+/// is ever advertised). NSS bytes are masked exactly as Linux's
+/// `u8_encode_bits` masks them.
+pub(super) const fn eht_cap(i: EhtCapInputs) -> Option<EhtCap> {
+    if i.no_eht {
+        return None;
+    }
+    let mpdu_enc: u8 = match i.max_mpdu_len {
+        EHT_MAX_MPDU_3895 => 0,
+        EHT_MAX_MPDU_7991 => 1,
+        EHT_MAX_MPDU_11454 => 2,
+        _ => return None,
+    };
+    let support_320mhz = i.six_ghz && i.support_320mhz_bandwidth;
+    let sts_minus_1: u8 = EHT_BEAMFORMEE_STS - 1;
+
+    let mut phy0: u8 = EHT_PHY_CAP0_NDP_4_EHT_LFT_32_GI | EHT_PHY_CAP0_SU_BEAMFORMEE;
+    phy0 |= (sts_minus_1 & 1) << 7;
+    if support_320mhz {
+        phy0 |= EHT_PHY_CAP0_320MHZ_IN_6GHZ;
+    }
+    let mut phy1: u8 = ((sts_minus_1 >> 1) & 0x03) | ((sts_minus_1 << 2) & 0x1C);
+    if support_320mhz {
+        phy1 |= (sts_minus_1 << 5) & 0xE0;
+    }
+
+    let val: u8 = (i.rx_nss & 0x0F) | ((i.tx_nss & 0x0F) << 4);
+    let val_mcs13: u8 = if i.no_mcs_12_13 { 0 } else { val };
+    let mcs_80_160 = EhtMcsNss {
+        mcs9: val,
+        mcs11: val,
+        mcs13: val_mcs13,
+    };
+    let mcs_320 = if support_320mhz {
+        mcs_80_160
+    } else {
+        EhtMcsNss {
+            mcs9: 0,
+            mcs11: 0,
+            mcs13: 0,
+        }
+    };
+
+    Some(EhtCap {
+        mac_cap_info: [(mpdu_enc << 6) & EHT_MAC_CAP0_MAX_MPDU_MASK, 0],
+        phy_cap_info: [
+            phy0,
+            phy1,
+            0,
+            EHT_PHY_CAP3_CODEBOOK_4_2_SU
+                | EHT_PHY_CAP3_CODEBOOK_7_5_MU
+                | EHT_PHY_CAP3_TRIG_SU_BF
+                | EHT_PHY_CAP3_TRIG_MU_BF_PART_BW,
+            EHT_PHY_CAP4_POWER_BOOST_FACT_SUPP | ((1 << 4) & EHT_PHY_CAP4_MAX_NC_MASK),
+            (EHT_PHY_CAP5_PKT_PAD_20US << 4) & EHT_PHY_CAP5_PKT_PAD_MASK,
+            0,
+            0,
+            0,
+        ],
+        mcs_nss_80: mcs_80_160,
+        mcs_nss_160: mcs_80_160,
+        mcs_nss_320: mcs_320,
+    })
+}
+
+/// Capability inputs for the in-tree 8922A target (the 8922AE
+/// variant): BE generation, firmware EHT present, MCS 12/13 gated
+/// off by the variant (`rtw8922ae_vs_variant.no_mcs_12_13`),
+/// 2TX/2RX (`rtw8922a.c:3281..3282`), 7991-byte MPDU cap, and no
+/// 320MHz bandwidth bit (`rtw8922a.c:3263`). The output is
+/// band-independent for this chip (the 320 gate can never open),
+/// so the `six_ghz` slot is false by convention; tests assert all
+/// three bands agree.
+pub(super) const EHT_CAP_8922AE_INPUTS: EhtCapInputs = EhtCapInputs {
+    six_ghz: false,
+    support_320mhz_bandwidth: false,
+    no_eht: false,
+    no_mcs_12_13: true,
+    rx_nss: 2,
+    tx_nss: 2,
+    max_mpdu_len: super::chip_8922a::MAX_EHT_MPDU_CAP,
+};
+
+// ── EHT station owner facet ────────────────────────────────────────────
+//
+// The EHT side of station ownership for 8922A: the advertised
+// capability plus the per-station EHT TX parameters that program
+// the TXWD_INFO EHT fields. This is the facet the future 8922A
+// station owner composes once admission exists (chip row); it does
+// NOT do admission, DMA control, or the firmware/RF/power profile,
+// and it has no production constructor caller yet — the same
+// implemented-but-not-advertised posture as step 1. Fail-closed
+// defaults: TX EHT overrides off, so a facet that has negotiated
+// nothing programs no EHT TX override (info dwords (0, 0)).
+
+/// EHT state owned per 8922A station.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct EhtStation {
+    /// Advertised EHT capability for this station.
+    pub(super) cap: EhtCap,
+    /// TXWD_INFO4 software NLTF override enabled.
+    pub(super) nltf_switch: bool,
+    /// TXWD_INFO4 software NLTF value (2 bits).
+    pub(super) nltf: u8,
+    /// TXWD_INFO7 UL EHT user present (trigger-based UL).
+    pub(super) ul_eht_usr_pres: bool,
+}
+
+impl EhtStation {
+    /// Fail-closed EHT station facet for the 8922AE variant:
+    /// capability from `EHT_CAP_8922AE_INPUTS`, TX EHT overrides
+    /// off. `None` only if the capability itself cannot be built
+    /// (gated EHT or an unmapped MPDU length).
+    pub(super) const fn new_8922ae() -> Option<Self> {
+        match eht_cap(EHT_CAP_8922AE_INPUTS) {
+            Some(cap) => Some(Self {
+                cap,
+                nltf_switch: false,
+                nltf: 0,
+                ul_eht_usr_pres: false,
+            }),
+            None => None,
+        }
+    }
+
+    /// EHT contribution to the BE TXWD_INFO block for this
+    /// station: (info4 bits, info7 bits), via
+    /// `txrx_be::eht_info_fields`. `None` only on an out-of-range
+    /// NLTF value, which fail-closed construction never produces.
+    pub(super) const fn txwd_info_eht(&self) -> Option<(u32, u32)> {
+        super::txrx_be::eht_info_fields(self.nltf_switch, self.nltf, self.ul_eht_usr_pres)
+    }
+}

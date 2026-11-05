@@ -129,3 +129,43 @@ fn smoke_rtw89_be_rxd_decode() -> TestResult {
 }
 
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_be_rxd_decode);
+
+fn smoke_rtw89_be_txwd_info_eht_fields() -> TestResult {
+    // Bit positions pinned from txrx.h, computed here, never by
+    // calling the encoder: SWITCH bit 20, NLTF bits 22:21,
+    // UL_EHT_USR_PRES bit 16.
+    if INFO4_SW_EHT_NLTF_SWITCH != (1 << 20)
+        || INFO4_SW_EHT_NLTF_MASK != (0x3 << 21)
+        || INFO7_UL_EHT_USR_PRES != (1 << 16)
+    {
+        return TestResult::Fail("BE TXWD info EHT bit positions wrong");
+    }
+    // Fail-closed defaults: no override, no UL user -> (0, 0).
+    if eht_info_fields(false, 0, false) != Some((0, 0)) {
+        return TestResult::Fail("BE TXWD info EHT defaults must be (0, 0)");
+    }
+    // Switch + NLTF 2 + UL user: info4 = (1<<20)|(2<<21) = 0x500000,
+    // info7 = 1<<16.
+    if eht_info_fields(true, 2, true) != Some((0x50_0000, 0x1_0000)) {
+        return TestResult::Fail("BE TXWD info EHT full case wrong");
+    }
+    // Switch alone: only bit 20.
+    if eht_info_fields(true, 0, false) != Some((0x10_0000, 0)) {
+        return TestResult::Fail("BE TXWD info EHT switch-only wrong");
+    }
+    // Bits are encoded as given even with the switch clear (the
+    // caller controls both; firmware honors NLTF when SWITCH is set).
+    if eht_info_fields(false, 2, false) != Some((0x40_0000, 0)) {
+        return TestResult::Fail("BE TXWD info EHT switch-clear NLTF wrong");
+    }
+    // Out-of-range NLTF fails closed, never truncated to 2 bits.
+    if eht_info_fields(true, 4, true).is_some() {
+        return TestResult::Fail("BE TXWD info EHT must reject NLTF > 3");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_be_txwd_info_eht_fields
+);
