@@ -744,10 +744,11 @@ pub async fn try_attach_via_hub(
 /// `btusb::register_initcalls`) runs via `dispatch_unbind` in step
 /// 1 above, stopping the pump and unregistering the controller
 /// (mgmt INDEX_REMOVED, sysfs removal, BTUSB_DEVICES removal;
-/// #890). CDC-NCM + r8152 + CDC-ECM are
+/// #890). CDC-NCM + r8152 + CDC-ECM + RNDIS are
 /// NOT in that set: their unbind hooks
 /// (`cdc_ncm::detach_ncm_slot`, `r8152::detach_r8152_slot`,
-/// `cdc_ecm::detach_ecm_slot`, registered in their
+/// `cdc_ecm::detach_ecm_slot`, `rndis::detach_rndis_slot`,
+/// registered in their
 /// `register_initcalls` / `register`) run via `dispatch_unbind`
 /// in step 1 above, tombstoning the slot's binding and
 /// unregistering its net iface. UVC is not in that set either: its
@@ -821,9 +822,11 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
 /// on this path, and classes with neither a pumped clear nor a
 /// wholesale unbind here (UAC / btusb / CCID / CTAP)
 /// keep their class-level registries across recovery — the
-/// documented remainder of #748. CDC-NCM + r8152 + CDC-ECM are
+/// documented remainder of #748. CDC-NCM + r8152 + CDC-ECM +
+/// RNDIS are
 /// NOT in that set: `cdc_ncm::detach_all_ncm`,
-/// `r8152::detach_all_r8152` and `cdc_ecm::detach_all_ecm`
+/// `r8152::detach_all_r8152`, `cdc_ecm::detach_all_ecm` and
+/// `rndis::detach_all_rndis`
 /// tombstone every binding and unregister every net iface, so
 /// re-enumeration cannot append a second live iface for the
 /// same adapter. UVC is not in that set either: `uvc::detach_all_uvc` drops every
@@ -848,6 +851,7 @@ pub fn detach_all_bindings(controller: u8) {
     crate::cdc_ncm::detach_all_ncm(controller);
     crate::r8152::detach_all_r8152(controller);
     crate::cdc_ecm::detach_all_ecm(controller);
+    crate::rndis::detach_all_rndis(controller);
     crate::ax88179::detach_all_ax(controller);
     crate::uvc::detach_all_uvc(controller);
     HUBS.of(controller).lock().clear();
@@ -1122,6 +1126,21 @@ async fn dispatch_after_address(
             .is_ok()
         {
             return AttachOutcome::Mouse;
+        }
+        // RNDIS ethernet — class 0x02 (Comm), subclass 0x02
+        // (ACM), protocol 0xFF. Tried BEFORE CDC-ACM on purpose:
+        // the ACM finder used to be protocol-blind (it matched
+        // any 0x02/0x02 Comm interface) and its bind treats
+        // SET_LINE_CODING failures as non-fatal, so an RNDIS
+        // device would otherwise be claimed as a serial port.
+        // The RNDIS finder requires protocol 0xFF, so a real
+        // modem falls through this attempt untouched; the ACM
+        // finder now also skips 0xFF interfaces as defence in
+        // depth (#1370).
+        if let Ok(_idx) =
+            crate::rndis::try_bind_rndis_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        {
+            return AttachOutcome::NetworkClass;
         }
         // CDC-ACM serial — Comm + Data interface pair (bare or
         // IAD-led composite).

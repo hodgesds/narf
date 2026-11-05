@@ -39,6 +39,7 @@ pub mod lan95xx;
 pub mod msc;
 pub mod ohci;
 pub mod r8152;
+pub mod rndis;
 pub mod serial;
 pub mod uac;
 pub mod uac_card;
@@ -128,6 +129,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "usb-cdc-ecm", || {
         cdc_ecm::register_initcalls();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-rndis", || {
+        rndis::register_initcalls();
         InitResult::Ok
     });
     // MSC binds through the attach cascade, not the class registry;
