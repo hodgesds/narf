@@ -2119,8 +2119,8 @@ fn smoke_ixgbe_eee_aci_desc() -> TestResult {
     use super::aci::{
         desc_datalen, desc_flags, desc_new, desc_opcode, desc_retval, get_link_status_desc,
         get_phy_caps_desc, list_dev_caps_desc, restart_an_desc, set_phy_cfg_desc, should_retry,
-        ACI_FLAG_SI, ACI_OPC_GET_PHY_CAPS, ACI_OPC_LIST_DEV_CAPS, ACI_OPC_RESTART_AN,
-        ACI_OPC_SET_PHY_CFG, ACI_REPORT_ACTIVE_CFG,
+        ACI_FLAG_SI, ACI_OPC_GET_LINK_STATUS, ACI_OPC_GET_PHY_CAPS, ACI_OPC_LIST_DEV_CAPS,
+        ACI_OPC_RESTART_AN, ACI_OPC_SET_PHY_CFG, ACI_REPORT_ACTIVE_CFG,
     };
     let desc = desc_new(ACI_OPC_GET_PHY_CAPS);
     if desc != [0x0600_2000, 0, 0, 0, 0, 0, 0, 0] {
@@ -2675,6 +2675,7 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_status_e610);
 
 fn smoke_ixgbe_eee_lpi_status() -> TestResult {
     use super::eee::lpi_status_read;
+    use super::queues::RegBank;
     use super::regs::{
         EEE_STAT_EEE_NEG, EEE_STAT_RX_LPI_STATUS, EEE_STAT_TX_LPI_STATUS, REG_EEE_RLPIC,
         REG_EEE_STAT, REG_EEE_TLPIC,

@@ -875,7 +875,7 @@ pub fn configure_e610<B: RegBank>(
     // trailing eee_entry_delay field) is always used.
     let mut cfg_buf = aci::build_set_phy_cfg(
         &pcaps,
-        (aci::ACI_PHY_ENA_LINK | aci::ACI_PHY_ENA_AUTO_LINK_UPDT) as u8,
+        (ACI_PHY_ENA_LINK | ACI_PHY_ENA_AUTO_LINK_UPDT) as u8,
         aci_eee_cap(state.advertised),
         true,
     );
