@@ -3,7 +3,10 @@
 //! (`0x0033`, `hw.h::AR9300_DEVID_AR9580`), AR9462 (`0x0034`,
 //! `hw.h::AR9300_DEVID_AR9462`) and AR9565 (`0x0036`,
 //! `hw.h::AR9300_DEVID_AR9565`) probe and dual-band 20 MHz
-//! legacy station owner.
+//! legacy station owner; the AR9485 (`0x0032`,
+//! `hw.h::AR9300_DEVID_AR9485_PCIE`) and AR1111 (`0x0037`,
+//! `hw.h::AR9485_DEVID_AR1111`) probe as single-chain 2.4 GHz-only parts
+//! on the same owner.
 //!
 //! The AR9580 runs the AR9300 path unchanged (Linux `AR_SREV_9300` is true
 //! for it): only its `AR_SREV` revision split, the `ar9580_1p0` INI and
@@ -15,6 +18,12 @@
 //! runs the shared AR9003 path: only its own macVersion, the
 //! `ar9565_1p0`/`ar9565_1p1` INI and gain tables (1.1 owns only its radio
 //! postamble), its one-chain masks and its `N65A` record differ.
+//! The AR9485 likewise
+//! differs only in its `AR_SREV` revision rule (macVersion 0x240, macRev
+//! \>= 1), the `ar9485_1_1` INI and gain tables, and its `N48A` record;
+//! its EEPROM masks are single-chain and its `opFlags` enable 2.4 GHz
+//! only, so the shared `channel_supported` gate already refuses 5 GHz
+//! for it.
 //!
 //! `pci.c::ath_pci_probe` → `hw.c::ath9k_hw_init` order: the chip is
 //! identified through its `AR_SREV` and restored `ar9300_eeprom`
@@ -55,8 +64,9 @@ use super::identity::{self, RegisterIo};
 /// The initial primary the signed record and calibration bind (channel 1).
 const PRIMARY: u16 = 2412;
 /// The highest AR9003 register this owner touches is the last
-/// `ar9300_2p2_radio_core` / `ar9580_1p0_radio_core` row (`0x16bd4`).
-const REQUIRED_BAR: u64 = 0x1_6bd8;
+/// `ar9485_1_1_radio_core` row (`0x16c44`); the 9300/9580 radio cores
+/// end lower (`0x16bd4`).
+const REQUIRED_BAR: u64 = 0x1_6c48;
 /// `reg.h::AR_CFG_LED`.
 const AR_CFG_LED: u64 = 0x1f04;
 /// `reg.h::AR_CR` and `AR_CR_RXE(ah)` for `AR_SREV_9300_20_OR_LATER`.
@@ -69,11 +79,13 @@ const AR_Q_TXE: u64 = 0x0840;
 /// `ath_ani_calibrate` intervals.
 const SUPERVISE_NS: u64 = 500_000_000;
 /// (PCI device, unique bus-match name).
-pub(super) const DEVICES: [(u16, &str); 4] = [
+pub(super) const DEVICES: [(u16, &str); 6] = [
     (0x0030, "ath9k-ar9300"),
     (0x0033, "ath9k-ar9580"),
     (0x0034, "ath9k-ar9462"),
     (0x0036, "ath9k-ar9565"),
+    (0x0032, "ath9k-ar9485"),
+    (0x0037, "ath9k-ar1111"),
 ];
 
 pub(super) struct Owner {

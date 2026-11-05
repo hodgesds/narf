@@ -37,6 +37,16 @@
 //! file name (`ath9k/ar9565-admit-v1-ch<N>-<mac>.bin`); its chain-mask
 //! bytes are the one-chain masks up to 0x1 and its identity binds the
 //! `ar9565_1p0`/`ar9565_1p1` INI preparation.
+//! The AR9485 (`0x0032`) and
+//! AR1111 (`0x0037`) record `N48A` v1 is the same format under its own
+//! magic, label and file name
+//! (`ath9k/ar9485-admit-v1-ch<N>-<mac>.bin`); its identity binds the
+//! `ar9485_1_1` INI preparation, its chain-mask bytes are the
+//! single-chain masks (0x1), and its channel byte is a 2.4 GHz channel
+//! (1..14). The `N48A` magic follows the established
+//! N + first-two-part-digits + A pattern; it is a NARF-side binding,
+//! not a value read from a chip-specific source, and no signed record
+//! is supplied in-tree.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::{
@@ -375,16 +385,18 @@ impl Facts {
     /// AR9003 facts — AR9300 (`0x0030`, record `N93A`), AR9580
     /// (`0x0033`, record `N95A`, the same layout), AR9462 (`0x0034`,
     /// record `N46A`, the same layout) or AR9565 (`0x0036`, record
-    /// `N65A`, the same layout) — for one 20 MHz channel in a band the
+    /// `N65A`, the same layout) or AR9485/AR1111 (`0x0032`/`0x0037`,
+    /// record `N48A`, the same layout) — for one 20 MHz channel in a band the
     /// map's `opFlags` enables: the PCI function, `AR_SREV` revision and
     /// host mode, the restored 1088-byte `ar9300_eeprom` (template and
-    /// version bytes included), the effective (`fixup_chainmask`) masks up
-    /// to 0x7, `ar9003::phy::prepare`'s retained facts at `frequency`
+    /// version bytes included), the effective (`fixup_chainmask`) masks
+    /// (up to 0x7, 0x1 for the single-chain AR9485),
+    /// `ar9003::phy::prepare`'s retained facts at `frequency`
     /// (modes index, `TX_CL_CAL`, APM selfgen mask, gain-array rows) and
     /// the `ath9k_hw_ar9300_set_txpower` plan at the 40 half-dB maximum
     /// for `ctl` (`ath9k_regd_get_ctl`). The channel byte is the IEEE
-    /// channel (2.4 GHz 1..14, 5 GHz 36..165); the factory antenna gain is
-    /// the band's `antennaGain` (a negative value counts as zero).
+    /// channel (2.4 GHz 1..14, 5 GHz 36..165; 2.4 GHz only for the AR9485);
+    /// the factory antenna gain is the band's `antennaGain` (a negative value counts as zero).
     pub(super) fn new_ar9003(
         id: &narf_bus::DeviceId,
         revision: &super::ar9003::Revision,
@@ -417,7 +429,7 @@ impl Facts {
         }
         let plan = power::plan(image, frequency, ctl, 40, identity.tx_chainmask)?;
         // Each part has its own magic, domain label and file name, so an
-        // AR9300 record can never admit an AR9580 or AR9462 or AR9565 or
+        // AR9300 record can never admit an AR9580 or AR9462 or AR9565 or AR9485 or
         // the reverse.
         let (magic, label, recipe, file): (&[u8; 4], &[u8], &[u8], &str) = match revision.chip {
             Chip::Ar9300 => (
@@ -443,6 +455,12 @@ impl Facts {
                 b"NARF AR9565 N65A one-chain ar9300_eeprom legacy20 dual-band board admission v1",
                 b"ar9300_eeprom_restore_internal image; ar9565_1p0/1p1 INI modes column 1 (5G) / 4 (2G), rx/tx gain by txrxgain, 5G fast clock, Japan 2484 CCK FIR; ar9003_hw_override_ini; set_board_values; ath9k_hw_ar9300_set_txpower (PAPRD/TPC off) with calibration_apply; ar9003_hw_init_cal_pcoem AGC/CLC/peak/IQ/NF; ar9003 EDMA",
                 "ar9565",
+            ),
+            Chip::Ar9485 => (
+                b"N48A",
+                b"NARF AR9485 N48A single-chain ar9300_eeprom legacy20 2.4GHz-only board admission v1",
+                b"ar9300_eeprom_restore_internal image; ar9485_1_1 INI modes column 4 (2G), BB pre, allmodes radio postamble, rx/tx gain by txrxgain, Japan 2484 CCK FIR; ar9003_hw_override_ini; set_board_values; ath9k_hw_ar9300_set_txpower (PAPRD/TPC off) with calibration_apply; ar9003_hw_init_cal_pcoem AGC/CLC/peak/IQ/NF; ar9003 EDMA",
+                "ar9485",
             ),
         };
         let mut h = narf_crypto::sha256::Sha256::new();

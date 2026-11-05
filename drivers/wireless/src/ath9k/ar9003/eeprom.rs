@@ -319,6 +319,12 @@ impl Limits {
                 max_length: 1023,
                 first_eeprom_base: AR9300_BASE_ADDR,
             },
+            // `ar9003_eeprom.c::EEPROM_DATA_LEN_9485` (1088) and the 4K
+            // base first, per the doc comment above.
+            Chip::Ar9485 => Self {
+                max_length: 1088,
+                first_eeprom_base: AR9300_BASE_ADDR_4K,
+            },
         }
     }
 }
