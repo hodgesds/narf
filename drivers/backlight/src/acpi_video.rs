@@ -20,7 +20,11 @@
 //! [`crate::brightness_keys`]; that module steps whichever device
 //! owns the panel under the crate's single-owner arbitration — when
 //! this device is the owner, its `step_up` / `step_down` move one
-//! `_BCL` ladder rung.
+//! `_BCL` ladder rung. The handler is registered on this device's
+//! AML path by [`crate::brightness_keys::register_video_notify`],
+//! called from [`init`] below for every discovered device, so the
+//! AML interpreter's `Notify` opcode dispatches straight to it
+//! (#954).
 //!
 //! References (GPL-2.0-or-later):
 //! - `drivers/acpi/acpi_video.c` — `acpi_video_init_brightness`,
@@ -243,7 +247,12 @@ pub fn init() {
                 dev.max_brightness()
             );
             ACPI_VIDEO_DEVS.lock().push(dev.clone());
-            crate::register_backlight(dev as Arc<dyn BacklightDevice>);
+            crate::register_backlight(dev.clone() as Arc<dyn BacklightDevice>);
+            // Wire the brightness-key Notify producer (#954): the AML
+            // interpreter dispatches Notify(0x86/0x87) on this path
+            // to `brightness_keys::handle_notify`, which steps the
+            // elected panel owner and emits the input event.
+            crate::brightness_keys::register_video_notify(&dev.acpi_path);
             index += 1;
         }
     });

@@ -2021,6 +2021,62 @@ kernel_test_in!(
     smoke_thinkpad_hkey_0x1004_brightness_up
 );
 
+/// ThinkPad HKEY 0x1004/0x1005 reach the input ring end to end.
+/// #954 (c): the decode maps to BrightnessUp/Down (smoke above) and
+/// the production notify path (`handle_hkey_notify`, registered on
+/// the HKEY device by `thinkpad_acpi::init`) pushes the press +
+/// release pair into the global input ring — the same ring the
+/// brightness-key Notify handler emits into. HKEY emits events only
+/// and never steps the panel: the video Notify handler is the sole
+/// in-kernel stepper.
+fn smoke_thinkpad_hkey_brightness_reaches_input_ring() -> TestResult {
+    use crate::thinkpad_acpi::{handle_hkey_notify, hotkey_count};
+    use alloc::vec::Vec;
+    use narf_input::KeyCode;
+
+    narf_input::init_global_ring(64);
+    narf_input::__reset_global_ring_for_test();
+
+    let before = hotkey_count();
+    handle_hkey_notify(0x1004);
+    if hotkey_count() != before + 1 {
+        return TestResult::Fail("HKEY 0x1004 did not dispatch");
+    }
+    let mut got = Vec::new();
+    while let Some(ev) = narf_input::pop_key() {
+        got.push((ev.code, ev.pressed));
+    }
+    if got
+        != [
+            (KeyCode::BrightnessUp, true),
+            (KeyCode::BrightnessUp, false),
+        ]
+    {
+        return TestResult::Fail("HKEY 0x1004 did not emit BrightnessUp press+release");
+    }
+
+    handle_hkey_notify(0x1005);
+    let mut got = Vec::new();
+    while let Some(ev) = narf_input::pop_key() {
+        got.push((ev.code, ev.pressed));
+    }
+    if got
+        != [
+            (KeyCode::BrightnessDown, true),
+            (KeyCode::BrightnessDown, false),
+        ]
+    {
+        return TestResult::Fail("HKEY 0x1005 did not emit BrightnessDown press+release");
+    }
+
+    narf_input::__reset_global_ring_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/thinkpad_acpi",
+    smoke_thinkpad_hkey_brightness_reaches_input_ring
+);
+
 /// ThinkPad battery conservation set/get round-trip.
 fn smoke_thinkpad_battery_conservation_round_trip() -> TestResult {
     use crate::thinkpad_acpi::{

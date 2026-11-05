@@ -17,10 +17,14 @@ mod smokes {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     use narf_filesystem::sysfs::__reset_for_test as sysfs_reset;
+    use narf_input::KeyCode;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use crate::acpi_video::{__reset_for_test as av_reset, __test_install};
-    use crate::brightness_keys::{handle_notify, NOTIFY_BRIGHTNESS_DOWN, NOTIFY_BRIGHTNESS_UP};
+    use crate::brightness_keys::{
+        __reset_for_test as bk_reset, handle_notify, register_video_notify, NOTIFY_BRIGHTNESS_DOWN,
+        NOTIFY_BRIGHTNESS_UP,
+    };
     use crate::kbd_backlight::dell_encode_kbd_level;
     use crate::leds::{led_device, register_led, unregister_led, LedDevice, SimpleLed, Trigger};
     use crate::sysfs_bridge::populate_backlight_class;
@@ -211,9 +215,9 @@ mod smokes {
             return TestResult::Fail("step_down did not advance to 25");
         }
 
-        // Key event must have fired (BrightnessDown press + release).
-        // We can't directly inspect the ring without the input crate's
-        // test helpers, so we just verify handle_notify returned true.
+        // Ring delivery of the key pair is asserted end-to-end in
+        // smoke_notify_dispatch_steps_owner_and_emits_key; here only
+        // the step is checked.
 
         av_reset();
         __reset_all_for_test();
@@ -759,5 +763,164 @@ mod smokes {
     kernel_test_in!(
         "drivers/backlight",
         smoke_backlight_composition_registers_initcalls
+    );
+
+    // ── 23. AML Notify dispatch → owner step + input event ────────
+
+    /// Drain all pending key events as (code, pressed) pairs.
+    fn drain_key_pairs() -> Vec<(KeyCode, bool)> {
+        let mut out = Vec::new();
+        while let Some(ev) = narf_input::pop_key() {
+            out.push((ev.code, ev.pressed));
+        }
+        out
+    }
+
+    fn smoke_notify_dispatch_steps_owner_and_emits_key() -> TestResult {
+        __reset_all_for_test();
+        av_reset();
+        narf_aml::sync::__reset_for_test();
+        bk_reset();
+        narf_input::init_global_ring(64);
+        narf_input::__reset_global_ring_for_test();
+
+        // Synthetic panel: 5-rung ladder, primed at 50.
+        let dev = __test_install("acpi_video0", r"\_SB.GFX0.DD0", vec![0, 25, 50, 75, 100]);
+        dev.last.store(50, Ordering::Release);
+        // Production wiring: the handler is registered on the video
+        // device's AML path (what acpi_video::init does per device).
+        register_video_notify(r"\_SB.GFX0.DD0");
+
+        // Notify 0x86 through the REAL AML dispatch table.
+        narf_aml::sync::dispatch_notify(r"\_SB.GFX0.DD0", 0x86);
+        if dev.last.load(Ordering::Acquire) != 75 {
+            return TestResult::Fail("Notify 0x86 did not step the panel to 75");
+        }
+        if drain_key_pairs()
+            != [
+                (KeyCode::BrightnessUp, true),
+                (KeyCode::BrightnessUp, false),
+            ]
+        {
+            return TestResult::Fail("Notify 0x86 did not emit BrightnessUp press+release");
+        }
+
+        // Notify 0x87 steps back down and emits BrightnessDown.
+        narf_aml::sync::dispatch_notify(r"\_SB.GFX0.DD0", 0x87);
+        if dev.last.load(Ordering::Acquire) != 50 {
+            return TestResult::Fail("Notify 0x87 did not step the panel to 50");
+        }
+        if drain_key_pairs()
+            != [
+                (KeyCode::BrightnessDown, true),
+                (KeyCode::BrightnessDown, false),
+            ]
+        {
+            return TestResult::Fail("Notify 0x87 did not emit BrightnessDown press+release");
+        }
+
+        // A non-brightness code on the same path is ignored end to
+        // end: no step, no key event.
+        narf_aml::sync::dispatch_notify(r"\_SB.GFX0.DD0", 0x80);
+        if dev.last.load(Ordering::Acquire) != 50 {
+            return TestResult::Fail("Notify 0x80 stepped the panel");
+        }
+        if !drain_key_pairs().is_empty() {
+            return TestResult::Fail("Notify 0x80 emitted a key event");
+        }
+
+        // A Notify on an unregistered path reaches no handler at all.
+        narf_aml::sync::dispatch_notify(r"\_SB.GFX0.DD9", 0x86);
+        if dev.last.load(Ordering::Acquire) != 50 {
+            return TestResult::Fail("Notify on an unregistered path stepped the panel");
+        }
+        if !drain_key_pairs().is_empty() {
+            return TestResult::Fail("Notify on an unregistered path emitted a key event");
+        }
+
+        narf_aml::sync::__reset_for_test();
+        bk_reset();
+        av_reset();
+        __reset_all_for_test();
+        narf_input::__reset_global_ring_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_notify_dispatch_steps_owner_and_emits_key
+    );
+
+    // ── 24. Double registration steps the panel once ──────────────
+
+    fn smoke_notify_double_registration_steps_once() -> TestResult {
+        __reset_all_for_test();
+        av_reset();
+        narf_aml::sync::__reset_for_test();
+        bk_reset();
+        narf_input::init_global_ring(64);
+        narf_input::__reset_global_ring_for_test();
+
+        let dev = __test_install("acpi_video0", r"\_SB.GFX0.DD0", vec![0, 25, 50, 75, 100]);
+        dev.last.store(50, Ordering::Release);
+        // A re-run of discovery must not double-register: one Notify
+        // moves the panel exactly one rung and emits one key pair.
+        register_video_notify(r"\_SB.GFX0.DD0");
+        register_video_notify(r"\_SB.GFX0.DD0");
+        narf_aml::sync::dispatch_notify(r"\_SB.GFX0.DD0", 0x86);
+        if dev.last.load(Ordering::Acquire) != 75 {
+            return TestResult::Fail("double registration stepped twice (or not at all)");
+        }
+        if drain_key_pairs().len() != 2 {
+            return TestResult::Fail("double registration emitted a duplicate key pair");
+        }
+
+        narf_aml::sync::__reset_for_test();
+        bk_reset();
+        av_reset();
+        __reset_all_for_test();
+        narf_input::__reset_global_ring_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_notify_double_registration_steps_once
+    );
+
+    // ── 25. Notify with no panel owner still emits the key ────────
+
+    fn smoke_notify_without_owner_still_emits_key() -> TestResult {
+        __reset_all_for_test();
+        av_reset();
+        narf_aml::sync::__reset_for_test();
+        bk_reset();
+        narf_input::init_global_ring(64);
+        narf_input::__reset_global_ring_for_test();
+
+        // No panel device registered at all: the step is a no-op, but
+        // the key event must still reach userspace.
+        if panel_owner().is_some() {
+            return TestResult::Fail("panel owner present before any registration");
+        }
+        register_video_notify(r"\_SB.GFX0.DD0");
+        narf_aml::sync::dispatch_notify(r"\_SB.GFX0.DD0", 0x86);
+        if drain_key_pairs()
+            != [
+                (KeyCode::BrightnessUp, true),
+                (KeyCode::BrightnessUp, false),
+            ]
+        {
+            return TestResult::Fail("Notify without an owner did not emit BrightnessUp");
+        }
+
+        narf_aml::sync::__reset_for_test();
+        bk_reset();
+        av_reset();
+        __reset_all_for_test();
+        narf_input::__reset_global_ring_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_notify_without_owner_still_emits_key
     );
 }
