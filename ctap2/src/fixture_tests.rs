@@ -23,10 +23,12 @@
 //!     `smoke_uv_clear_assertion_rejected_under_touch_and_pin`,
 //!     `smoke_uv_clear_assertion_accepted_when_touch_only`,
 //!     `smoke_tampered_sign_count_breaks_assertion_signature`
+//! (h) SEC-C2 (#1295): `smoke_debug_impls_redact_key_material`
 
 extern crate alloc;
 
 use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -37,7 +39,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::cbor::Value;
 use crate::client::{
-    verify_assertion, Client, CredentialRef, GetAssertionParams, HmacSecretOutput, UserVerification,
+    verify_assertion, Client, CredentialRef, GetAssertionParams, HmacSecretOutput,
+    HmacSecretParams, UserVerification,
 };
 use crate::ctaphid::{Channel, HidPipe, REPORT_LEN};
 use crate::enroll::{
@@ -453,7 +456,7 @@ fn smoke_derive_matches_independent_hmac_computation() -> TestResult {
     // module, sharing no code with either the client's or the
     // fixture-token's assertion path.
     check_eq!(
-        out.first,
+        *out.first,
         lib_hmac_sha256(&cred_random, &salt1),
         "output == HMAC(credRandom, salt1)"
     );
@@ -466,22 +469,74 @@ fn smoke_derive_matches_independent_hmac_computation() -> TestResult {
         "derive two salts"
     );
     check_eq!(
-        out2.first,
+        *out2.first,
         lib_hmac_sha256(&cred_random, &salt1),
         "two-salt first output"
     );
     check_eq!(
-        out2.second,
+        out2.second.as_ref().map(|z| **z),
         Some(lib_hmac_sha256(&cred_random, &salt2)),
         "two-salt second output"
     );
     check!(
-        out2.first != out2.second.unwrap_or([0; 32]),
+        *out2.first != out2.second.as_deref().copied().unwrap_or([0; 32]),
         "salt outputs differ"
     );
     TestResult::Pass
 }
 kernel_test_in!("ctap2", smoke_derive_matches_independent_hmac_computation);
+
+// ── (g) SEC-C2 (#1295): Debug redaction ─────────────────────────
+
+fn smoke_debug_impls_redact_key_material() -> TestResult {
+    let (mut client, _token) = try_ok!(fixture_client(0xC3), "connect");
+    let enrolled = try_ok!(enroll_pin(&mut client, PIN), "enroll");
+    let salt1 = [0x51; 32];
+    let out = try_ok!(
+        derive(&mut client, &enrolled.credential_id, salt1, None, Some(PIN)),
+        "derive one salt"
+    );
+    // The redacted Debug must name the shape, never the bytes:
+    // `Zeroizing`'s own derived `Debug` would print them, so
+    // this fails if anyone re-derives Debug on the output type.
+    let debug = format!("{:?}", out);
+    check!(debug.contains("redacted"), "hmac output Debug redacts");
+    let prefix = format!("{:?}", &out.first[..8]);
+    check!(!debug.contains(&prefix), "hmac output Debug leaks bytes");
+
+    // Same for a full assertion: signature + hmac-secret output
+    // must not appear, while the (public) authData still does.
+    let assertion = try_ok!(
+        client.get_assertion(&GetAssertionParams {
+            rp_id: RP_ID,
+            client_data_hash: CDH,
+            allow: &[CredentialRef::new(enrolled.credential_id.clone())],
+            user_verification: UserVerification::Required,
+            hmac_secret: Some(HmacSecretParams { salt1, salt2: None }),
+            pin: Some(PIN),
+        }),
+        "get assertion"
+    );
+    let debug = format!("{:?}", assertion);
+    check!(debug.contains("redacted"), "assertion Debug redacts");
+    let sig_prefix = format!("{:?}", &assertion.signature[..8]);
+    check!(
+        !debug.contains(&sig_prefix),
+        "assertion Debug leaks signature"
+    );
+    let hmac = try_some!(assertion.hmac_secret.as_ref(), "assertion hmac-secret");
+    let hmac_prefix = format!("{:?}", &hmac.first[..8]);
+    check!(
+        !debug.contains(&hmac_prefix),
+        "assertion Debug leaks hmac-secret"
+    );
+    check!(
+        debug.contains("auth_data"),
+        "assertion Debug keeps authData"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("ctap2", smoke_debug_impls_redact_key_material);
 
 // ── (c) PIN failures ───────────────────────────────────────────
 
@@ -808,12 +863,12 @@ fn smoke_backup_token_distinct_credential_and_output() -> TestResult {
         "backup secret"
     );
     check_eq!(
-        out_a.first,
+        *out_a.first,
         lib_hmac_sha256(&secret_a, &salt),
         "primary output cross-check"
     );
     check_eq!(
-        out_b.first,
+        *out_b.first,
         lib_hmac_sha256(&secret_b, &salt),
         "backup output cross-check"
     );

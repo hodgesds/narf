@@ -399,7 +399,12 @@ impl<P: HidPipe, R: RandomSource, U: TokenUserInterface> TokenAnchor<P, R, U> {
                 )
             };
             match result {
-                Ok(output) => return Ok(output.first),
+                // SEC-C2 (#1295): the output is `Zeroizing` in
+                // the client; copying the 32 bytes out here is
+                // the custody seam — the wrap/unwrap call sites
+                // hold the copy `Zeroizing` and wipe it once the
+                // KEK is derived.
+                Ok(output) => return Ok(*output.first),
                 Err(e) if e.is_pin_invalid() => {
                     // The token decremented its own counter; read
                     // the authoritative remainder back and surface
@@ -472,7 +477,11 @@ impl<P: HidPipe + Send, R: RandomSource + Send, U: TokenUserInterface + Send> Ke
                 .fill_random(&mut nonce)
                 .map_err(|_| AnchorError::Failed)?;
         }
-        let output = self.derive_with_ceremony(&credential_id, salt, &public_key)?;
+        // SEC-C2 (#1295): the ceremony output is the hmac-secret
+        // wrapping input — hold it `Zeroizing` so it is wiped
+        // once the KEK is derived, not left in the frame.
+        let output =
+            Zeroizing::new(self.derive_with_ceremony(&credential_id, salt, &public_key)?);
         let kek = Zeroizing::new(slot_kek(&output, ctx.sms_epoch));
         let aad = slot_aad(ctx.sms_epoch, &credential_id);
         let mut ct = [0u8; 32];
@@ -494,7 +503,10 @@ impl<P: HidPipe + Send, R: RandomSource + Send, U: TokenUserInterface + Send> Ke
         if slot.blob.len() != BLOB_LEN {
             return Err(AnchorError::Failed);
         }
-        let output = self.derive_with_ceremony(&credential_id, salt, &public_key)?;
+        // SEC-C2 (#1295): same custody as wrap — the ceremony
+        // output is wiped once the KEK is derived.
+        let output =
+            Zeroizing::new(self.derive_with_ceremony(&credential_id, salt, &public_key)?);
         let kek = Zeroizing::new(slot_kek(&output, ctx.sms_epoch));
         let aad = slot_aad(ctx.sms_epoch, &credential_id);
         let mut nonce = [0u8; NONCE_LEN];

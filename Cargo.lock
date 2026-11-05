@@ -1160,6 +1160,7 @@ dependencies = [
  "aes",
  "narf-crypto",
  "narf-kernel-test",
+ "zeroize",
 ]
 
 [[package]]

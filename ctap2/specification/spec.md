@@ -101,6 +101,14 @@ PIN protocol one (`pin`):
   `change_pin` (pinUvAuthParam = full HMAC(shared, newPinEnc)),
   `get_pin_retries` (standalone). PIN length 4..=63 enforced
   client-side.
+- Secret custody (SEC-C2, #1295): the session shared secret,
+  the pinUvAuthToken (`get_pin_token` returns
+  `Zeroizing<[u8; 32]>`), the padded-PIN buffer, and the
+  hmac-secret outputs are `Zeroizing`-wrapped and wiped on
+  drop; `HmacSecretOutput` and `Assertion` hand-write redacted
+  `Debug` (shape only — `Zeroizing`'s derived `Debug` would
+  print the bytes). No `Debug` is implemented for
+  `PinSession`/`KeyPair` at all.
 
 Enrollment surface (`enroll`) — the P1 seam:
 
@@ -124,6 +132,9 @@ Enrollment surface (`enroll`) — the P1 seam:
   `DeriveParams`): UP always, UV exactly when a PIN is in play,
   and the ES256 signature. A failed verification is
   `Error::Protocol` — no hmac-secret output is returned.
+  The fields are `Zeroizing<[u8; 32]>` (wiped on drop —
+  SEC-C2, #1295); the anchor copies the 32 bytes out at its
+  own custody seam.
 - `enrollment_complete(&[EnrolledToken])` — true only with
   ≥ 2 DISTINCT credential ids (mandatory backup token,
   decisions doc 2026-10-26). Each token wraps independently:
@@ -173,6 +184,16 @@ Protocol(&str), Crypto, Random, Unsupported(&str).
   rewound by any disk writer. The counter's integrity IS
   covered — it sits inside the signed authData, so tampering
   breaks the signature (fixture-pinned).
+- Secrets are wiped on drop, never left in reused slots
+  (SEC-C2, #1295): `PinSession`'s shared secret, `KeyPair`'s
+  scalar (plus the ECDH x-coordinate and the generate seed),
+  PIN hashes and the padded-PIN buffer, HMAC key block/pads,
+  the AEAD ChaCha block-0 buffer, and the SIV failure-path
+  plaintext are all `Zeroizing`-wrapped.
+- `Debug` never prints key material (SEC-C2, #1295):
+  `Assertion` and `HmacSecretOutput` show shape only;
+  `PinSession` and `KeyPair` implement no `Debug` — pinned
+  by `smoke_debug_impls_redact_key_material`.
 
 ## 5. Architecture notes (x86_64, aarch64)
 

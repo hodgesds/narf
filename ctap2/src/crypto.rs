@@ -23,6 +23,7 @@ use alloc::vec::Vec;
 use narf_crypto::p256::point::{scalar_mul, scalar_mul_base};
 use narf_crypto::p256::{AffinePoint, Scalar};
 use narf_crypto::sha256::Sha256;
+use zeroize::Zeroizing;
 
 use crate::{Error, RandomSource};
 
@@ -43,26 +44,29 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 /// HMAC-SHA-256 (RFC 2104) over the concatenation of `parts`.
 pub fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     // RFC 2104: keys longer than the 64-byte block are hashed first.
-    let mut key_block = [0u8; 64];
+    // SEC-C2 (#1295): the key block and pads ARE the key (the PIN
+    // shared secret or the pinUvAuthToken) — `Zeroizing` wipes
+    // them on return instead of leaving key material on the stack.
+    let mut key_block = Zeroizing::new([0u8; 64]);
     if key.len() > 64 {
         key_block[..32].copy_from_slice(&sha256(key));
     } else {
         key_block[..key.len()].copy_from_slice(key);
     }
-    let mut ipad = [0u8; 64];
-    let mut opad = [0u8; 64];
+    let mut ipad = Zeroizing::new([0u8; 64]);
+    let mut opad = Zeroizing::new([0u8; 64]);
     for i in 0..64 {
         ipad[i] = key_block[i] ^ 0x36;
         opad[i] = key_block[i] ^ 0x5C;
     }
     let mut inner = Sha256::new();
-    inner.update(&ipad);
+    inner.update(&ipad[..]);
     for p in parts {
         inner.update(p);
     }
     let inner_hash = inner.finalize();
     let mut outer = Sha256::new();
-    outer.update(&opad);
+    outer.update(&opad[..]);
     outer.update(&inner_hash);
     outer.finalize()
 }
@@ -73,8 +77,14 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 /// A P-256 ephemeral key pair for CTAP2 key agreement.
+///
+/// SEC-C2 (#1295): the secret scalar is `Zeroizing` — a dropped
+/// pair wipes the scalar instead of leaving it in a reused stack
+/// slot. The type is deliberately Clone-free and Debug-free (the
+/// "Clone-free on purpose" discipline `PinSession` documents):
+/// the public half is the only thing a log may ever see.
 pub struct KeyPair {
-    secret: Scalar,
+    secret: Zeroizing<Scalar>,
     /// X || Y, 64 bytes (uncompressed point without the 0x04 tag,
     /// the form COSE carries in its -2/-3 members).
     pub public_encoded: [u8; 64],
@@ -83,18 +93,20 @@ pub struct KeyPair {
 impl KeyPair {
     /// Generate a fresh ephemeral pair from the caller's randomness.
     pub fn generate<R: RandomSource>(rng: &mut R) -> Result<Self, Error> {
-        let mut seed = [0u8; 32];
+        // SEC-C2 (#1295): the raw seed reduces to the scalar and
+        // is then redundant secret material — wipe it.
+        let mut seed = Zeroizing::new([0u8; 32]);
         // Rejection-sample via reduce: a reduced scalar is zero with
         // probability ~2^-256, but never accept it (it would make
         // the public key the point at infinity and the ECDH void).
         loop {
-            rng.fill_random(&mut seed)?;
+            rng.fill_random(&mut seed[..])?;
             let scalar = Scalar::from_bytes_be_reduce(&seed);
             if !scalar.is_zero() {
                 let public = scalar_mul_base(&scalar);
                 let public_encoded = public.to_encoded().ok_or(Error::Crypto)?;
                 return Ok(Self {
-                    secret: scalar,
+                    secret: Zeroizing::new(scalar),
                     public_encoded,
                 });
             }
@@ -111,7 +123,7 @@ impl KeyPair {
         let public = scalar_mul_base(&scalar);
         let public_encoded = public.to_encoded()?;
         Some(Self {
-            secret: scalar,
+            secret: Zeroizing::new(scalar),
             public_encoded,
         })
     }
@@ -122,9 +134,11 @@ impl KeyPair {
         let peer = AffinePoint::from_encoded(peer_encoded).ok_or(Error::Crypto)?;
         let shared = scalar_mul(&self.secret, &peer);
         let enc = shared.to_encoded().ok_or(Error::Crypto)?;
-        let mut x = [0u8; 32];
+        // SEC-C2 (#1295): `x` is the raw ECDH secret — wipe it
+        // once hashed, the same way the scalar itself is wiped.
+        let mut x = Zeroizing::new([0u8; 32]);
         x.copy_from_slice(&enc[..32]);
-        Ok(sha256(&x))
+        Ok(sha256(&x[..]))
     }
 }
 
