@@ -250,6 +250,30 @@ pub(super) struct DataTx {
     queues: Vec<TxQueue<Retained>>,
 }
 
+/// Arguments for [`DataTx::prepare`], grouped so the method
+/// stays under clippy's argument limit. Field order matches
+/// the original parameter order; see `prepare`'s doc comment
+/// for what each field means.
+#[derive(Debug)]
+pub(super) struct PrepareArgs<'a> {
+    /// Data channel (0..12).
+    pub(super) channel: u8,
+    /// Station MACID (0..32).
+    pub(super) mac_id: u8,
+    /// QSEL selecting the channel (must map to `channel`).
+    pub(super) qsel: u8,
+    /// Caller-built 32-byte v2 body.
+    pub(super) body: &'a [u8; TXWD_BODY_V2_SIZE],
+    /// Header DMA address (written into the TXBD).
+    pub(super) header_dma: u64,
+    /// Frame DMA address (retained until RPQ release).
+    pub(super) frame_dma: u64,
+    /// Frame length in bytes (1..=MAX_FRAME_LEN).
+    pub(super) frame_len: usize,
+    /// Channel's descriptor ring slice (indexed by slot).
+    pub(super) bd: &'a mut [TxBd],
+}
+
 impl DataTx {
     /// Twelve empty 256-deep queues (ACH0..7, CH8..11).
     pub(super) fn new() -> Result<Self, Error> {
@@ -261,61 +285,54 @@ impl DataTx {
     }
 
     /// Reserve a slot, build the header, and fill the TXBD —
-    /// without publishing or ringing the doorbell. `bd` is the
+    /// without publishing or ringing the doorbell. `args.bd` is the
     /// channel's descriptor ring slice (indexed by slot).
-    /// `body` is the caller-built 32-byte v2 body (typically
+    /// `args.body` is the caller-built 32-byte v2 body (typically
     /// `txrx_be::encode_txwd_be` output for the station).
-    pub(super) fn prepare(
-        &mut self,
-        channel: u8,
-        mac_id: u8,
-        qsel: u8,
-        body: &[u8; TXWD_BODY_V2_SIZE],
-        header_dma: u64,
-        frame_dma: u64,
-        frame_len: usize,
-        bd: &mut [TxBd],
-    ) -> Result<Prepared, Error> {
-        if channel >= 12 {
+    pub(super) fn prepare(&mut self, args: PrepareArgs<'_>) -> Result<Prepared, Error> {
+        if args.channel >= 12 {
             return Err(Error::BadChannel);
         }
-        if channel_for_qsel(qsel)? != channel {
+        if channel_for_qsel(args.qsel)? != args.channel {
             return Err(Error::BadQsel);
         }
-        if mac_id >= 32 {
+        if args.mac_id >= 32 {
             return Err(Error::BadMacId);
         }
-        if frame_len == 0 || frame_len > MAX_FRAME_LEN {
+        if args.frame_len == 0 || args.frame_len > MAX_FRAME_LEN {
             return Err(Error::BadFrame);
         }
-        if frame_dma > FRAME_DMA_MASK || header_dma > BUFFER_DMA_MASK {
+        if args.frame_dma > FRAME_DMA_MASK || args.header_dma > BUFFER_DMA_MASK {
             return Err(Error::BadDma);
         }
         let queue = self
             .queues
-            .get_mut(channel as usize)
+            .get_mut(args.channel as usize)
             .ok_or(Error::BadChannel)?;
         let ticket = queue
             .reserve(
                 Retained {
-                    header_dma,
-                    frame_dma,
+                    header_dma: args.header_dma,
+                    frame_dma: args.frame_dma,
                 },
-                mac_id,
-                qsel,
+                args.mac_id,
+                args.qsel,
             )
             .map_err(|(error, _)| map_tx_error(error))?;
-        let header = build_header(body, ticket.sequence, frame_dma, frame_len)?;
-        let entry = bd.get_mut(ticket.slot as usize).ok_or(Error::BadIndex)?;
+        let header = build_header(args.body, ticket.sequence, args.frame_dma, args.frame_len)?;
+        let entry = args
+            .bd
+            .get_mut(ticket.slot as usize)
+            .ok_or(Error::BadIndex)?;
         *entry = TxBd {
             length: header.len() as u16,
             opt: TXBD_OPT_LS,
             ..Default::default()
         };
-        entry.set_phys(header_dma);
+        entry.set_phys(args.header_dma);
         Ok(Prepared {
             ticket,
-            channel,
+            channel: args.channel,
             header,
         })
     }
@@ -395,7 +412,7 @@ impl H2cTx {
     /// Empty H2C ring of the given depth (Linux allocates 256
     /// BDs for CH12 like every other TX channel).
     pub(super) fn new(depth: u16) -> Result<Self, Error> {
-        if depth < 2 || depth > 256 {
+        if !(2..=256).contains(&depth) {
             return Err(Error::BadLength);
         }
         Ok(Self {

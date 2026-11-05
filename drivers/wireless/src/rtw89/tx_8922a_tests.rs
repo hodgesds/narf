@@ -159,7 +159,16 @@ fn smoke_rtw89_tx_8922a_submit_cycle() -> TestResult {
     };
     let mut bd = vec![TxBd::default(); 256];
     let mut regs = Model::new();
-    let prepared = match tx.prepare(2, 5, 0x02, &zero_body(), 0x20000, 0x10000, 100, &mut bd) {
+    let prepared = match tx.prepare(PrepareArgs {
+        channel: 2,
+        mac_id: 5,
+        qsel: 0x02,
+        body: &zero_body(),
+        header_dma: 0x20000,
+        frame_dma: 0x10000,
+        frame_len: 100,
+        bd: &mut bd,
+    }) {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("prepare failed"),
     };
@@ -220,19 +229,64 @@ fn smoke_rtw89_tx_8922a_submit_cycle() -> TestResult {
     // oversize frame, DMA above the field.
     let mut bd = vec![TxBd::default(); 256];
     if tx
-        .prepare(12, 5, 0x02, &zero_body(), 0x20000, 0x10000, 100, &mut bd)
+        .prepare(PrepareArgs {
+            channel: 12,
+            mac_id: 5,
+            qsel: 0x02,
+            body: &zero_body(),
+            header_dma: 0x20000,
+            frame_dma: 0x10000,
+            frame_len: 100,
+            bd: &mut bd,
+        })
         .is_ok()
         || tx
-            .prepare(2, 32, 0x02, &zero_body(), 0x20000, 0x10000, 100, &mut bd)
+            .prepare(PrepareArgs {
+                channel: 2,
+                mac_id: 32,
+                qsel: 0x02,
+                body: &zero_body(),
+                header_dma: 0x20000,
+                frame_dma: 0x10000,
+                frame_len: 100,
+                bd: &mut bd,
+            })
             .is_ok()
         || tx
-            .prepare(2, 5, 0x14, &zero_body(), 0x20000, 0x10000, 100, &mut bd)
+            .prepare(PrepareArgs {
+                channel: 2,
+                mac_id: 5,
+                qsel: 0x14,
+                body: &zero_body(),
+                header_dma: 0x20000,
+                frame_dma: 0x10000,
+                frame_len: 100,
+                bd: &mut bd,
+            })
             .is_ok()
         || tx
-            .prepare(2, 5, 0x02, &zero_body(), 0x20000, 0x10000, 0x4000, &mut bd)
+            .prepare(PrepareArgs {
+                channel: 2,
+                mac_id: 5,
+                qsel: 0x02,
+                body: &zero_body(),
+                header_dma: 0x20000,
+                frame_dma: 0x10000,
+                frame_len: 0x4000,
+                bd: &mut bd,
+            })
             .is_ok()
         || tx
-            .prepare(2, 5, 0x02, &zero_body(), 0x20000, 1 << 36, 100, &mut bd)
+            .prepare(PrepareArgs {
+                channel: 2,
+                mac_id: 5,
+                qsel: 0x02,
+                body: &zero_body(),
+                header_dma: 0x20000,
+                frame_dma: 1 << 36,
+                frame_len: 100,
+                bd: &mut bd,
+            })
             .is_ok()
     {
         return TestResult::Fail("prepare accepted a bad input");
