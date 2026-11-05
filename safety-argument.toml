@@ -3325,6 +3325,7 @@ ref = "security-model/specification/spec.md#L93"
 pr = 1113
 commit = "9615be32c3c68279d0dde533c0f29438f94a3090"
 files = ["power/specification/spec.md", "safety-argument.toml"]
+enforces = ["power/src/suspend_service/token_anchor.rs::unwrap", "ctap2/src/enroll.rs::derive_slot_output"]
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"

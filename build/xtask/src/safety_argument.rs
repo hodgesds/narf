@@ -525,29 +525,15 @@ fn enforce_new_entry_linkage(doc: &str, base_doc: &str, report: &mut CheckReport
         .and_then(|v| v.as_array())
     {
         for e in base_entries {
-            if let Some(t) = e.as_table() {
-                let key = (
-                    t.get("ref").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    t.get("argument")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                );
-                *base_counts.entry(key).or_insert(0) += 1;
-            }
+            let key = claim_key(e);
+            *base_counts.entry(key).or_insert(0) += 1;
         }
     }
     for (idx, entry) in entries.iter().enumerate() {
         let Some(t) = entry.as_table() else {
             continue;
         };
-        let key = (
-            t.get("ref").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            t.get("argument")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        );
+        let key = claim_key(entry);
         match base_counts.get_mut(&key) {
             Some(count) if *count > 0 => {
                 *count -= 1; // pre-existing claim, not new
@@ -837,6 +823,14 @@ enforces = ["memory/src/wx.rs::jit_cap_default_policy"]
         enforce_new_entry_linkage(&reworded, &base, &mut report);
         assert_eq!(report.errors.len(), 4, "{:?}", report.errors);
         assert!(report.errors.iter().all(|e| e.contains("new since base")));
+
+        // A legacy-shaped base entry (refs array + claim) normalized to
+        // ref + argument is the same claim, not a new one.
+        let legacy_base = "[safety_argument]\nschema_version = 1\n\n[[invariants_preserved]]\nrefs = [\"security-model/specification/spec.md#L42\"]\nclaim = \"Change touches no cap check and no domain tag.\"\n";
+        let normalized = "[safety_argument]\nschema_version = 2\n\n[[invariants_preserved]]\nref = \"security-model/specification/spec.md#L42\"\nargument = \"Change touches no cap check and no domain tag.\"\npr = 1284\ncommit = \"66beee0a\"\nfiles = [\"memory/src/wx.rs\"]\nenforces = [\"memory/src/wx.rs::jit_mprotect\"]\n";
+        let mut report = CheckReport::default();
+        enforce_new_entry_linkage(normalized, legacy_base, &mut report);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
         let _ = fs::remove_dir_all(&root);
     }
 
