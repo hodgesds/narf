@@ -41,9 +41,14 @@ impl Model {
             (0x5400, 0x33221102),
             (0x5404, 0x80005544),
         ]);
-        m.phy
-            .borrow_mut()
-            .extend([(2, 0x67c9), (3, 0xdc10), (0, 0x0800), (4, 1), (9, 0)]);
+        m.phy.borrow_mut().extend([
+            (1, 0x0024),
+            (2, 0x67c9),
+            (3, 0xdc10),
+            (0, 0x0800),
+            (4, 1),
+            (9, 0),
+        ]);
         m
     }
     fn value(&self, reg: u64) -> u32 {
@@ -411,6 +416,71 @@ fn smoke_igc_negotiated_link_metadata() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_negotiated_link_metadata);
+
+fn smoke_igc_phy_copper_link_detection() -> TestResult {
+    let m = Model::new();
+    // Default model has BMSR = 0x0024 (link up + autoneg complete).
+    check!(
+        hardware::phy_has_link(&m),
+        "phy link should be up with BMSR 0x0024"
+    );
+
+    // Clear link bit (0x0020 = autoneg complete, no link).
+    m.phy.borrow_mut().insert(1, 0x0020);
+    check!(
+        !hardware::phy_has_link(&m),
+        "phy link should be down without BMSR bit 2"
+    );
+
+    // MDIC error should report link down.
+    m.phy.borrow_mut().insert(1, 0x0024);
+    m.mdic_error.set(true);
+    check!(
+        !hardware::phy_has_link(&m),
+        "mdic error should report link down"
+    );
+    m.mdic_error.set(false);
+
+    // Verify latch-low behavior with a stateful model: first read returns latched-down (0x0020),
+    // second read returns restored link (0x0024).
+    struct LatchPhy(Model, core::cell::Cell<u32>);
+    impl Registers for LatchPhy {
+        fn read(&self, reg: u64) -> u32 {
+            let v = self.0.read(reg);
+            if reg == 0x20 && v & 0x04000000 == 0 {
+                let count = self.1.get();
+                self.1.set(count + 1);
+                if count == 0 {
+                    return (v & !0xffff) | 0x0020;
+                } else {
+                    return (v & !0xffff) | 0x0024;
+                }
+            }
+            v
+        }
+        fn write(&self, reg: u64, value: u32) {
+            self.0.write(reg, value);
+        }
+        fn wait(&self, us: u64, ready: impl FnMut() -> bool) -> bool {
+            self.0.wait(us, ready)
+        }
+        fn delay(&self, us: u64) {
+            self.0.delay(us);
+        }
+    }
+    let latch = LatchPhy(Model::new(), core::cell::Cell::new(0));
+    check!(
+        hardware::phy_has_link(&latch),
+        "latch-low double read should observe live link on 2nd read"
+    );
+    check!(
+        latch.1.get() >= 2,
+        "must perform at least two reads for latch-low BMSR"
+    );
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_phy_copper_link_detection);
 
 fn tcp4(payload: usize) -> Vec<u8> {
     let mut b = vec![0; 54 + payload];

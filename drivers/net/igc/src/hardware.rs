@@ -312,6 +312,20 @@ pub(crate) fn phy_reset_blocked(r: &impl Registers) -> bool {
     r.read(0x5820) & 0x40000 != 0
 }
 
+/// Check whether the copper PHY reports link up via MII BMSR (register 1).
+///
+/// Per IEEE 802.3 §22.2.4.2, the BMSR link status bit (bit 2, 0x0004) has
+/// latch-low behavior: if link ever dropped, the bit remains 0 until read.
+/// A second read returns the current live status.
+pub(crate) fn phy_has_link(r: &impl Registers) -> bool {
+    phy_transaction(r, || {
+        let _ = mdio(r, 1, None)?;
+        let status = mdio(r, 1, None)?;
+        Ok(status & 0x0004 != 0)
+    })
+    .unwrap_or(false)
+}
+
 /// PHPM.PHY_RST_COMP polling budget: igc_phy_hw_reset spins
 /// `timeout = 10000` iterations of `udelay(1)`.
 pub(crate) const PHY_RESET_COMPLETE_US: u64 = 10_000;
