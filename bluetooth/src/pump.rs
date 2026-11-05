@@ -57,10 +57,18 @@
 //!   initiating pairing (`smp::Initiator` needs an application policy
 //!   trigger that does not exist yet).
 //! - LE Advertising Report (while scanning) → the central peer table.
+//! - Inquiry Result (while inquiring) → the classic peer table;
+//!   Inquiry Complete → the classic phase machine, issuing a
+//!   deferred page when one is waiting.
+//! - BR/EDR Connection Complete (while paging) → the classic phase
+//!   machine + connection table entry.
 //! - Command Complete / Command Status for the scan/connect opcodes
 //!   → the central phase machine: parameters accepted enables the
 //!   scan, disable accepted issues a deferred Create Connection, a
-//!   refused command drops the phase back to Idle.
+//!   refused command drops the phase back to Idle. The same arms
+//!   drive the classic phase machine: a refused Inquiry or Create
+//!   Connection drops it to Idle, a refused Inquiry Cancel returns
+//!   it to Inquiring, an accepted Write Scan Enable records the mode.
 //!
 //! ## Central initiation (issue #1312)
 //!
@@ -73,6 +81,23 @@
 //! traffic after connect (#1313), pairing initiation (#888), or a
 //! host-initiated disconnect — the connection is tracked like any
 //! other pump connection and torn down on Disconnection Complete.
+//!
+//! ## Classic initiation (issue #1315)
+//!
+//! [`classic_start_inquiry`] / [`classic_cancel_inquiry`] /
+//! [`classic_connect`] / [`classic_write_scan_enable`] issue the
+//! BR/EDR inquiry + paging commands through the pump's own send
+//! path, sequenced on the controller's completions exactly like the
+//! LE central above (copied pattern: phase machine in
+//! [`classic::ClassicCentral`], deferred connect while the inquiry
+//! is cancelled, fail-closed refusal handling). [`classic_phase`] /
+//! [`classic_peers`] / [`classic_scan_mode`] expose the state for a
+//! future mgmt/userspace trigger lane. What this deliberately does
+//! NOT do: extended inquiry results / EIR + RSSI, Remote Name
+//! Request, SSP pairing initiation on the paged link (#888 covers
+//! pairing), or SCO setup after connect (#817) — the connection is
+//! tracked like any other pump connection and torn down on
+//! Disconnection Complete.
 //!
 //! ## Lifecycle
 //!
@@ -97,10 +122,12 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::att;
 use crate::bond_store::{Bond, BondStore};
+use crate::classic::{self, ClassicPhase};
 use crate::controller::ControllerInfo;
 use crate::event::{
-    parse_le_advertising_reports, CommandComplete, CommandStatus, DisconnectionComplete, EventCode,
-    LeConnectionComplete, LeLongTermKeyRequest, NumberOfCompletedPackets,
+    parse_inquiry_results, parse_le_advertising_reports, ClassicConnectionComplete,
+    CommandComplete, CommandStatus, DisconnectionComplete, EventCode, LeConnectionComplete,
+    LeLongTermKeyRequest, NumberOfCompletedPackets,
 };
 use crate::gap::{self, CentralPhase};
 use crate::gatt_client::{self, GattClientError};
@@ -421,6 +448,19 @@ pub struct PumpCore {
     /// completes, so the controller is never asked to initiate
     /// while it is still scanning.
     pending_connect: Option<gap::CreateConnection>,
+    /// Classic BR/EDR central initiator state (issue #1315): inquiry
+    /// discovery + outbound paging. Mirrors the LE `central` field;
+    /// driven by `dispatch_event` and the `classic_*` API.
+    classic: classic::ClassicCentral,
+    /// Page deferred while an inquiry is being cancelled:
+    /// `classic_connect` from Inquiring issues Inquiry_Cancel first
+    /// and only issues Create_Connection once Inquiry Complete
+    /// arrives, so the controller is never asked to page while it
+    /// is still inquiring.
+    pending_page: Option<classic::PageRequest>,
+    /// Write_Scan_Enable mode awaiting its Command Complete; applied
+    /// to `classic.scan_mode` only on success.
+    pending_scan_mode: Option<u8>,
     /// Bonds from completed pairings (driver-domain state, never a
     /// global, never exposed to userspace). Survives disconnects;
     /// lost on controller removal or reboot.
@@ -439,6 +479,7 @@ impl fmt::Debug for PumpCore {
             .field("info", &self.info)
             .field("connections", &self.connections.len())
             .field("central_phase", &self.central.phase)
+            .field("classic_phase", &self.classic.phase)
             .field("bonds", &self.bonds.len())
             .field("pending_acl", &self.pending_acl.len())
             .field("acl_in_flight", &self.acl_in_flight)
@@ -477,6 +518,9 @@ impl PumpCore {
             sdp: SdpServer::new(),
             central: gap::Central::new(),
             pending_connect: None,
+            classic: classic::ClassicCentral::new(),
+            pending_page: None,
+            pending_scan_mode: None,
             bonds: BondStore::new(),
             pending_acl: VecDeque::new(),
             acl_in_flight: 0,
@@ -559,6 +603,14 @@ impl PumpCore {
     fn send_command(&mut self, opcode: u16, params: &[u8]) -> Result<(), TransportError> {
         let cmd = Command::with_params(opcode, params);
         self.transport.send_command(&cmd)?;
+        self.stats.commands_sent += 1;
+        Ok(())
+    }
+
+    /// Send a pre-built [`Command`] (the Classic builders return
+    /// one) and count it like [`send_command`].
+    fn send_command_obj(&mut self, cmd: &Command) -> Result<(), TransportError> {
+        self.transport.send_command(cmd)?;
         self.stats.commands_sent += 1;
         Ok(())
     }
@@ -748,6 +800,186 @@ impl PumpCore {
             op::HCI_LE_CREATE_CONNECTION => {
                 if self.central.phase == CentralPhase::Connecting && status != 0 {
                     self.central.phase = CentralPhase::Idle;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Classic BR/EDR central initiator API (issue #1315) ─────────────
+
+/// Errors from the Classic BR/EDR central initiator API (issue #1315).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ClassicError {
+    /// No pump registered for this controller index.
+    NoPump,
+    /// A pump step currently owns the core; retry after the step.
+    Busy,
+    /// The classic state machine is in a phase that forbids this call.
+    WrongPhase,
+    /// The transport rejected the HCI command.
+    Transport,
+    /// `classic_connect` for an address no inquiry ever reported.
+    /// Paging blind would use guessed PSRM/clock-offset values;
+    /// discover first.
+    UnknownPeer,
+    /// `classic_write_scan_enable` mode outside 0..=3 (§7.3.18).
+    BadScanMode,
+}
+
+impl From<CentralError> for ClassicError {
+    /// `with_pump_core` only ever fails as NoPump/Busy (its own
+    /// slot errors); WrongPhase/Transport map identically so the
+    /// module-level `classic_*` API can use `?` on it.
+    fn from(e: CentralError) -> Self {
+        match e {
+            CentralError::NoPump => ClassicError::NoPump,
+            CentralError::Busy => ClassicError::Busy,
+            CentralError::WrongPhase => ClassicError::WrongPhase,
+            CentralError::Transport => ClassicError::Transport,
+        }
+    }
+}
+
+impl PumpCore {
+    /// Begin BR/EDR discovery: issue HCI_Inquiry (§7.1.1). Only
+    /// from Idle. Results arrive as Inquiry Result events; Inquiry
+    /// Complete ends the scan.
+    pub fn classic_start_inquiry(
+        &mut self,
+        lap: [u8; 3],
+        inquiry_length: u8,
+        num_responses: u8,
+    ) -> Result<(), ClassicError> {
+        if self.classic.phase != ClassicPhase::Idle {
+            return Err(ClassicError::WrongPhase);
+        }
+        let cmd = classic::build_inquiry(lap, inquiry_length, num_responses);
+        self.send_command_obj(&cmd)
+            .map_err(|_| ClassicError::Transport)?;
+        self.classic.note_inquiry_started();
+        Ok(())
+    }
+
+    /// Stop BR/EDR discovery early: issue HCI_Inquiry_Cancel
+    /// (§7.1.2). Only from Inquiring; the phase reaches Idle on
+    /// Inquiry Complete.
+    pub fn classic_cancel_inquiry(&mut self) -> Result<(), ClassicError> {
+        if self.classic.phase != ClassicPhase::Inquiring {
+            return Err(ClassicError::WrongPhase);
+        }
+        self.send_command_obj(&classic::build_inquiry_cancel())
+            .map_err(|_| ClassicError::Transport)?;
+        self.pending_page = None;
+        self.classic.note_inquiry_stopping();
+        Ok(())
+    }
+
+    /// Page a discovered peer (§7.1.5). From Inquiring this first
+    /// issues Inquiry_Cancel and defers Create_Connection until
+    /// Inquiry Complete arrives; from Idle it issues
+    /// Create_Connection directly. Forbidden while a page is
+    /// already in flight or a classic connection is established.
+    /// The PSRM + clock offset come from the peer's inquiry
+    /// result — never guessed.
+    pub fn classic_connect(&mut self, bd_addr: [u8; 6]) -> Result<(), ClassicError> {
+        let peer = self
+            .classic
+            .peer(&bd_addr)
+            .ok_or(ClassicError::UnknownPeer)?;
+        let page = classic::PageRequest {
+            bd_addr,
+            page_scan_repetition_mode: peer.page_scan_repetition_mode,
+            clock_offset: peer.clock_offset,
+        };
+        match self.classic.phase {
+            ClassicPhase::Inquiring => {
+                self.send_command_obj(&classic::build_inquiry_cancel())
+                    .map_err(|_| ClassicError::Transport)?;
+                self.pending_page = Some(page);
+                self.classic.note_inquiry_stopping();
+                Ok(())
+            }
+            ClassicPhase::Idle => self.issue_page(page),
+            _ => Err(ClassicError::WrongPhase),
+        }
+    }
+
+    /// Issue HCI_Create_Connection for a captured page request
+    /// (§7.1.5) and enter Paging. Shared by the direct and deferred
+    /// paths; the caller has already phase-checked.
+    fn issue_page(&mut self, page: classic::PageRequest) -> Result<(), ClassicError> {
+        let cmd = classic::build_create_connection(
+            page.bd_addr,
+            classic::ACL_PACKET_TYPES_DEFAULT,
+            page.page_scan_repetition_mode,
+            page.clock_offset,
+            1, // allow role switch
+        );
+        self.send_command_obj(&cmd)
+            .map_err(|_| ClassicError::Transport)?;
+        self.classic.note_paging();
+        Ok(())
+    }
+
+    /// Make this controller discoverable/connectable: issue
+    /// HCI_Write_Scan_Enable (§7.3.18). No phase gate — host
+    /// configuration, callable any time. The mode is recorded only
+    /// once the controller accepts it (see `on_classic_command_done`).
+    pub fn classic_write_scan_enable(&mut self, mode: u8) -> Result<(), ClassicError> {
+        if mode > 3 {
+            return Err(ClassicError::BadScanMode);
+        }
+        let cmd = classic::build_write_scan_enable(mode);
+        self.send_command_obj(&cmd)
+            .map_err(|_| ClassicError::Transport)?;
+        self.pending_scan_mode = Some(mode);
+        Ok(())
+    }
+
+    /// Advance the classic state machine on a completed
+    /// inquiry/page/scan command. Shared by the Command Complete
+    /// and Command Status arms: Inquiry and Create Connection
+    /// return Status first, Inquiry Cancel and Write Scan Enable
+    /// return Complete.
+    fn on_classic_command_done(&mut self, opcode: u16, status: u8) {
+        match opcode {
+            op::HCI_INQUIRY => {
+                // Refused inquiry: back to Idle, nothing to wait for.
+                if self.classic.phase == ClassicPhase::Inquiring && status != 0 {
+                    self.classic.note_idle();
+                }
+            }
+            op::HCI_INQUIRY_CANCEL => {
+                if self.classic.phase == ClassicPhase::InquiryStopping {
+                    if status == 0 {
+                        // Cancel accepted: Inquiry Complete still
+                        // follows; the deferred page (if any) is
+                        // issued there, never here — the controller
+                        // is inquiring until that event arrives.
+                    } else {
+                        // Cancel refused: the inquiry is still
+                        // running; drop the deferred page rather
+                        // than page against a controller that may
+                        // still be inquiring.
+                        self.pending_page = None;
+                        self.classic.note_inquiry_started();
+                    }
+                }
+            }
+            op::HCI_CREATE_CONNECTION => {
+                if self.classic.phase == ClassicPhase::Paging && status != 0 {
+                    self.classic.note_idle();
+                }
+            }
+            op::HCI_WRITE_SCAN_ENABLE => {
+                if status == 0 {
+                    if let Some(mode) = self.pending_scan_mode.take() {
+                        self.classic.note_scan_enable(mode);
+                    }
+                } else {
+                    self.pending_scan_mode = None;
                 }
             }
             _ => {}
@@ -1133,18 +1365,65 @@ impl PumpCore {
                     }
                 }
             }
+            code if code == EventCode::InquiryResult as u8 => {
+                // §7.7.2: results feed the classic peer table while
+                // the inquiry window is open (Inquiring, or
+                // InquiryStopping until Inquiry Complete lands).
+                // Malformed results parse to None and are dropped,
+                // never recorded.
+                if self.classic.phase == ClassicPhase::Inquiring
+                    || self.classic.phase == ClassicPhase::InquiryStopping
+                {
+                    if let Some(results) = parse_inquiry_results(event) {
+                        for r in results {
+                            self.classic.report_inquiry_result(&r);
+                        }
+                    }
+                }
+            }
+            code if code == EventCode::InquiryComplete as u8 => {
+                // §7.7.1: Status(1). Ends the inquiry window: from
+                // InquiryStopping a deferred page is issued on
+                // success and dropped on failure; from Inquiring the
+                // phase simply returns to Idle.
+                let status = event.params.first().copied().unwrap_or(0xFF);
+                match self.classic.phase {
+                    ClassicPhase::InquiryStopping => match (status, self.pending_page.take()) {
+                        (0, Some(page)) => {
+                            if self.issue_page(page).is_err() {
+                                self.classic.note_idle();
+                            }
+                        }
+                        _ => self.classic.note_idle(),
+                    },
+                    ClassicPhase::Inquiring => self.classic.note_idle(),
+                    _ => {}
+                }
+            }
             code if code == EventCode::ConnectionComplete as u8 => {
                 // §7.7.3: Status(1) Handle(2) BD_ADDR(6) Link_Type(1)
                 // Encryption_Enabled(1).
-                let p = &event.params;
-                if p.len() >= 11 && p[0] == 0 {
-                    let handle = u16::from_le_bytes([p[1], p[2]]) & 0x0FFF;
-                    let mut peer = [0u8; 7];
-                    peer[0] = 0; // BR/EDR addresses are public.
-                    peer[1..7].copy_from_slice(&p[3..9]);
-                    self.connections.retain(|c| c.handle != handle);
-                    self.connections.push(Connection::new(handle, false, peer));
-                    self.sysfs_track_connect(handle, false, &peer);
+                if let Some(cc) = ClassicConnectionComplete::parse(event) {
+                    // Paging-role completions drive the classic
+                    // state machine; inbound connections while Idle
+                    // leave it alone. The role is captured before
+                    // the state machine advances: it is the only
+                    // sound test for whether THIS completion is
+                    // classic-central-role (a stale handle reused
+                    // by a peripheral connection must not flip it).
+                    let classic_completed = self.classic.phase == ClassicPhase::Paging;
+                    if classic_completed {
+                        self.classic
+                            .note_connection_complete(cc.status, cc.handle);
+                    }
+                    if cc.status == 0 {
+                        let mut peer = [0u8; 7];
+                        peer[0] = 0; // BR/EDR addresses are public.
+                        peer[1..7].copy_from_slice(&cc.bd_addr);
+                        self.connections.retain(|c| c.handle != cc.handle);
+                        self.connections.push(Connection::new(cc.handle, false, peer));
+                        self.sysfs_track_connect(cc.handle, false, &peer);
+                    }
                 }
             }
             code if code == EventCode::DisconnectionComplete as u8 => {
@@ -1153,6 +1432,9 @@ impl PumpCore {
                     self.sysfs_track_disconnect(dc.handle);
                     if self.central.connected_handle == Some(dc.handle) {
                         self.central.note_disconnected();
+                    }
+                    if self.classic.connected_handle == Some(dc.handle) {
+                        self.classic.note_disconnected();
                     }
                 }
             }
@@ -1170,12 +1452,14 @@ impl PumpCore {
                 if let Some(cc) = CommandComplete::parse(event) {
                     if let Some(status) = cc.status() {
                         self.on_central_command_done(cc.opcode, status);
+                        self.on_classic_command_done(cc.opcode, status);
                     }
                 }
             }
             code if code == EventCode::CommandStatus as u8 => {
                 if let Some(cs) = CommandStatus::parse(event) {
                     self.on_central_command_done(cs.opcode, cs.status);
+                    self.on_classic_command_done(cs.opcode, cs.status);
                 }
             }
             code if code == EventCode::EncryptionChange as u8 => {
@@ -2227,6 +2511,79 @@ pub fn central_peers(index: usize) -> Option<Vec<gap::DiscoveredPeer>> {
         .core
         .as_ref()
         .map(|c| c.central.peers.clone())
+}
+
+// ── Classic BR/EDR central initiator API (issue #1315) ─────────────
+
+/// Begin BR/EDR discovery on controller `index`: issue HCI_Inquiry
+/// with `lap` (usually [`classic::GIAC`]). Only from Idle. This is
+/// the trigger surface a future mgmt/userspace lane will call; today
+/// it is fixture-driven.
+pub fn classic_start_inquiry(
+    index: usize,
+    lap: [u8; 3],
+    inquiry_length: u8,
+    num_responses: u8,
+) -> Result<(), ClassicError> {
+    with_pump_core(index, |core| {
+        core.classic_start_inquiry(lap, inquiry_length, num_responses)
+    })?
+}
+
+/// Stop BR/EDR discovery early on controller `index`. Only from
+/// Inquiring.
+pub fn classic_cancel_inquiry(index: usize) -> Result<(), ClassicError> {
+    with_pump_core(index, |core| core.classic_cancel_inquiry())?
+}
+
+/// Page a discovered peer from controller `index`. From Inquiring
+/// the inquiry is cancelled first and Create_Connection follows on
+/// Inquiry Complete; from Idle the page is issued directly.
+pub fn classic_connect(index: usize, bd_addr: [u8; 6]) -> Result<(), ClassicError> {
+    with_pump_core(index, |core| core.classic_connect(bd_addr))?
+}
+
+/// Set controller `index`'s scan mode (0 = off, 1 = inquiry,
+/// 2 = page, 3 = both). Callable any time; the mode is recorded
+/// only once the controller accepts it.
+pub fn classic_write_scan_enable(index: usize, mode: u8) -> Result<(), ClassicError> {
+    with_pump_core(index, |core| core.classic_write_scan_enable(mode))?
+}
+
+/// Current Classic central phase for controller `index`, if its core
+/// is not currently owned by a pump step.
+pub fn classic_phase(index: usize) -> Option<ClassicPhase> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| c.classic.phase)
+}
+
+/// Peers discovered by controller `index`'s inquiry, if its core is
+/// not currently owned by a pump step.
+pub fn classic_peers(index: usize) -> Option<Vec<classic::ClassicPeer>> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| c.classic.peers.clone())
+}
+
+/// Last Write_Scan_Enable mode controller `index` accepted, if its
+/// core is not currently owned by a pump step.
+pub fn classic_scan_mode(index: usize) -> Option<u8> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| c.classic.scan_mode)
 }
 /// Run `f` against controller `index`'s core, taken out of its slot
 /// for the call (same discipline as [`pump_once`]: no
@@ -4916,6 +5273,50 @@ mod tests {
         }
     }
 
+    /// One HCI_Inquiry_Result event (§7.7.2) with a single entry:
+    /// Num_Responses, BD_ADDR, PSRM, 2 reserved bytes, Class of
+    /// Device, Clock Offset. Bytes pinned against the spec layout,
+    /// not against `parse_inquiry_results`.
+    fn inquiry_result_event(
+        bd_addr: [u8; 6],
+        psrm: u8,
+        cod: [u8; 3],
+        clock_offset: u16,
+    ) -> Event {
+        let mut params = alloc::vec![0x01];
+        params.extend_from_slice(&bd_addr);
+        params.push(psrm);
+        params.extend_from_slice(&[0x00, 0x00]); // reserved
+        params.extend_from_slice(&cod);
+        params.extend_from_slice(&clock_offset.to_le_bytes());
+        Event {
+            code: EventCode::InquiryResult as u8,
+            params,
+        }
+    }
+
+    /// HCI_Inquiry_Complete event (§7.7.1): Status(1).
+    fn inquiry_complete_event(status: u8) -> Event {
+        Event {
+            code: EventCode::InquiryComplete as u8,
+            params: alloc::vec![status],
+        }
+    }
+
+    /// HCI_Connection_Complete event (§7.7.3) for a BR/EDR ACL link:
+    /// Status, Handle, BD_ADDR, Link_Type 0x01 (ACL),
+    /// Encryption_Enabled 0.
+    fn classic_connection_complete(handle: u16, bd_addr: [u8; 6]) -> Event {
+        let mut params = alloc::vec![0x00];
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.extend_from_slice(&bd_addr);
+        params.extend_from_slice(&[0x01, 0x00]);
+        Event {
+            code: EventCode::ConnectionComplete as u8,
+            params,
+        }
+    }
+
     // ── #888: SMP initiator + bonding fixtures ────────────────────
 
     const SMP888_HANDLE: u16 = 0x0040;
@@ -5324,6 +5725,345 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_central_wrong_phase);
+
+    /// #1315: the full Classic sequence against a scripted
+    /// controller — inquiry → result → complete → scan-enable →
+    /// page/create-connection → complete → disconnect — with the
+    /// outbound command bytes pinned against the Core Specification
+    /// field order, not against the builders under test.
+    fn smoke_pump_classic_inquiry_page_sequence() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        // 1. Start inquiry: HCI_Inquiry, pinned byte-for-byte
+        // against Vol 4 Part E §7.1.1 (GIAC, 8 x 1.28 s, unlimited
+        // responses).
+        if classic_start_inquiry(0, crate::classic::GIAC, 8, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_start_inquiry rejected from Idle");
+        }
+        let sent = fake.sent_command_params();
+        let expect_inquiry: [u8; 5] = [0x33, 0x8B, 0x9E, 0x08, 0x00];
+        if sent.len() != 6
+            || sent[5].0 != op::HCI_INQUIRY
+            || sent[5].1 != expect_inquiry
+        {
+            reset_all();
+            return TestResult::Fail("HCI_Inquiry bytes mismatch");
+        }
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Inquiring) {
+            reset_all();
+            return TestResult::Fail("phase not Inquiring after start_inquiry");
+        }
+        // Command Status (accepted) keeps Inquiring.
+        fake.enqueue_event(cs(op::HCI_INQUIRY, 0));
+        let _ = pump_once(0);
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Inquiring) {
+            reset_all();
+            return TestResult::Fail("accepted Command Status moved phase out of Inquiring");
+        }
+        // 2. Inquiry Result: peer recorded with its paging
+        // parameters; a re-report refreshes instead of duplicating.
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        let cod = [0x10, 0x01, 0x00];
+        fake.enqueue_event(inquiry_result_event(peer, 0x01, cod, 0x1234));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        if peers.len() != 1
+            || peers[0].bd_addr != peer
+            || peers[0].page_scan_repetition_mode != 0x01
+            || peers[0].class_of_device != cod
+            || peers[0].clock_offset != 0x1234
+        {
+            reset_all();
+            return TestResult::Fail("inquiry result not recorded as peer");
+        }
+        fake.enqueue_event(inquiry_result_event(peer, 0x02, cod, 0x5678));
+        let _ = pump_once(0);
+        let peers = classic_peers(0).unwrap_or_default();
+        if peers.len() != 1
+            || peers[0].page_scan_repetition_mode != 0x02
+            || peers[0].clock_offset != 0x5678
+        {
+            reset_all();
+            return TestResult::Fail("peer re-report duplicated instead of refreshing");
+        }
+        // 3. Inquiry Complete ends the scan.
+        fake.enqueue_event(inquiry_complete_event(0));
+        let _ = pump_once(0);
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("inquiry complete did not return to Idle");
+        }
+        // 4. Scan enable (both): accepted on Command Complete.
+        if classic_write_scan_enable(0, 3).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_write_scan_enable rejected");
+        }
+        let sent = fake.sent_command_params();
+        if sent.last().map(|(o, p)| (*o, p.as_slice()))
+            != Some((op::HCI_WRITE_SCAN_ENABLE, [0x03].as_slice()))
+        {
+            reset_all();
+            return TestResult::Fail("Write Scan Enable bytes mismatch");
+        }
+        fake.enqueue_event(cc(op::HCI_WRITE_SCAN_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if classic_scan_mode(0) != Some(3) {
+            reset_all();
+            return TestResult::Fail("accepted scan enable did not record mode 3");
+        }
+        // 5. Page the discovered peer: Create Connection, pinned
+        // byte-for-byte against Vol 4 Part E §7.1.5 (BD_ADDR,
+        // packet types 0xCC18, PSRM 0x02, reserved 0, clock offset
+        // 0x5678, allow role switch).
+        if classic_connect(0, peer).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_connect rejected from Idle");
+        }
+        let sent = fake.sent_command_params();
+        let expect_create: [u8; 13] = [
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x18, 0xCC, 0x02, 0x00, 0x78, 0x56, 0x01,
+        ];
+        if sent.last().map(|(o, p)| (*o, p.as_slice()))
+            != Some((op::HCI_CREATE_CONNECTION, expect_create.as_slice()))
+        {
+            reset_all();
+            return TestResult::Fail("HCI_Create_Connection bytes mismatch");
+        }
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Paging) {
+            reset_all();
+            return TestResult::Fail("phase not Paging after connect");
+        }
+        // Command Status (accepted) keeps Paging; Connection
+        // Complete lands the connection.
+        fake.enqueue_event(cs(op::HCI_CREATE_CONNECTION, 0));
+        let _ = pump_once(0);
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Paging) {
+            reset_all();
+            return TestResult::Fail("accepted Command Status moved phase out of Paging");
+        }
+        let handle = 0x0042;
+        fake.enqueue_event(classic_connection_complete(handle, peer));
+        let _ = pump_once(0);
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Connected)
+            || connection_count(0) != Some(1)
+        {
+            reset_all();
+            return TestResult::Fail("connection complete did not land classic connection");
+        }
+        // 6. Disconnect returns to Idle.
+        fake.enqueue_event(Event {
+            code: EventCode::DisconnectionComplete as u8,
+            params: alloc::vec![0x00, 0x42, 0x00, 0x13],
+        });
+        let _ = pump_once(0);
+        let ok = connection_count(0) == Some(0)
+            && classic_phase(0) == Some(crate::classic::ClassicPhase::Idle);
+        reset_all();
+        if !ok {
+            return TestResult::Fail("disconnect did not return classic to Idle");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_classic_inquiry_page_sequence);
+
+    /// #1315: connecting while inquiring cancels the inquiry and
+    /// defers the page until Inquiry Complete — the controller is
+    /// never asked to page while it is still inquiring. A rejected
+    /// page returns to Idle with no connection, and paging an
+    /// undiscovered address is refused without issuing a command.
+    fn smoke_pump_classic_inquiry_cancel_deferred_page() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        if classic_start_inquiry(0, crate::classic::GIAC, 8, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_start_inquiry rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_INQUIRY, 0));
+        let _ = pump_once(0);
+        let peer = [0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5];
+        fake.enqueue_event(inquiry_result_event(peer, 0x01, [0x10, 0x01, 0x00], 0x0ABC));
+        let _ = pump_once(0);
+        // Connect from Inquiring: Inquiry_Cancel issued, page deferred.
+        if classic_connect(0, peer).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_connect rejected from Inquiring");
+        }
+        let sent = fake.sent_command_params();
+        if sent.last().map(|(o, _)| *o) != Some(op::HCI_INQUIRY_CANCEL)
+            || classic_phase(0) != Some(crate::classic::ClassicPhase::InquiryStopping)
+        {
+            reset_all();
+            return TestResult::Fail("connect did not cancel inquiry first");
+        }
+        // Cancel accepted: still InquiryStopping, no Create yet.
+        fake.enqueue_event(cc(op::HCI_INQUIRY_CANCEL, &[0]));
+        let _ = pump_once(0);
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::InquiryStopping)
+            || fake
+                .sent_command_params()
+                .iter()
+                .any(|(o, _)| *o == op::HCI_CREATE_CONNECTION)
+        {
+            reset_all();
+            return TestResult::Fail("Create issued before Inquiry Complete");
+        }
+        // Inquiry Complete issues the deferred page with the
+        // discovered paging parameters.
+        fake.enqueue_event(inquiry_complete_event(0));
+        let _ = pump_once(0);
+        let sent = fake.sent_command_params();
+        let expect_create: [u8; 13] = [
+            0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0x18, 0xCC, 0x01, 0x00, 0xBC, 0x0A, 0x01,
+        ];
+        if sent.last().map(|(o, p)| (*o, p.as_slice()))
+            != Some((op::HCI_CREATE_CONNECTION, expect_create.as_slice()))
+            || classic_phase(0) != Some(crate::classic::ClassicPhase::Paging)
+        {
+            reset_all();
+            return TestResult::Fail("deferred page not issued on Inquiry Complete");
+        }
+        // Page rejected by Command Status: Idle, no connection.
+        fake.enqueue_event(cs(op::HCI_CREATE_CONNECTION, 0x0C));
+        let _ = pump_once(0);
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Idle)
+            || connection_count(0) != Some(0)
+        {
+            reset_all();
+            return TestResult::Fail("rejected page did not return to Idle");
+        }
+        // Undiscovered address: refused, no command issued.
+        let unknown = [0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5];
+        let before = fake.sent_command_params().len();
+        if classic_connect(0, unknown) != Err(ClassicError::UnknownPeer) {
+            reset_all();
+            return TestResult::Fail("connect to undiscovered peer did not fail UnknownPeer");
+        }
+        if fake.sent_command_params().len() != before {
+            reset_all();
+            return TestResult::Fail("unknown-peer connect issued a command");
+        }
+        // Cancel from Idle is a wrong-phase call.
+        let ok = classic_cancel_inquiry(0) == Err(ClassicError::WrongPhase);
+        reset_all();
+        if !ok {
+            return TestResult::Fail("cancel from Idle did not fail WrongPhase");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_classic_inquiry_cancel_deferred_page
+    );
+
+    /// #1315: failure paths fail closed — a refused inquiry returns
+    /// to Idle without recording anything (and a retry works),
+    /// malformed inquiry results record nothing, a failed inquiry
+    /// drops a deferred page, a refused scan enable records no
+    /// mode, and an out-of-range scan mode is rejected outright.
+    fn smoke_pump_classic_failure_and_malformed() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        if classic_start_inquiry(0, crate::classic::GIAC, 8, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_start_inquiry rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_INQUIRY, 0x0C));
+        let _ = pump_once(0);
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("refused inquiry did not return to Idle");
+        }
+        // Retry works: no wedge from the failure.
+        if classic_start_inquiry(0, crate::classic::GIAC, 8, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("retry start_inquiry rejected after failure");
+        }
+        fake.enqueue_event(cs(op::HCI_INQUIRY, 0));
+        let _ = pump_once(0);
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Inquiring) {
+            reset_all();
+            return TestResult::Fail("retry inquiry did not reach Inquiring");
+        }
+        // Malformed result (claims 2 entries, carries 1) records
+        // nothing and panics nothing.
+        let mut bad = alloc::vec![0x02];
+        bad.extend_from_slice(&[0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5]);
+        bad.extend_from_slice(&[0x01, 0x00, 0x00, 0x10, 0x01, 0x00, 0x34, 0x12]);
+        fake.enqueue_event(Event {
+            code: EventCode::InquiryResult as u8,
+            params: bad,
+        });
+        let _ = pump_once(0);
+        if classic_peers(0).map(|p| p.len()) != Some(0) {
+            reset_all();
+            return TestResult::Fail("malformed inquiry result recorded a peer");
+        }
+        // Zero-response result likewise records nothing.
+        fake.enqueue_event(Event {
+            code: EventCode::InquiryResult as u8,
+            params: alloc::vec![0x00],
+        });
+        let _ = pump_once(0);
+        if classic_peers(0).map(|p| p.len()) != Some(0) {
+            reset_all();
+            return TestResult::Fail("zero-response result recorded a peer");
+        }
+        // Deferred page dropped when the inquiry itself fails.
+        let peer = [0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5];
+        fake.enqueue_event(inquiry_result_event(peer, 0x01, [0x10, 0x01, 0x00], 0x0ABC));
+        let _ = pump_once(0);
+        if classic_connect(0, peer).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_connect rejected from Inquiring");
+        }
+        fake.enqueue_event(cc(op::HCI_INQUIRY_CANCEL, &[0]));
+        let _ = pump_once(0);
+        fake.enqueue_event(inquiry_complete_event(0x0C));
+        let _ = pump_once(0);
+        if classic_phase(0) != Some(crate::classic::ClassicPhase::Idle)
+            || fake
+                .sent_command_params()
+                .iter()
+                .any(|(o, _)| *o == op::HCI_CREATE_CONNECTION)
+        {
+            reset_all();
+            return TestResult::Fail("failed inquiry issued the deferred page");
+        }
+        // Refused scan enable records no mode.
+        if classic_write_scan_enable(0, 2).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_write_scan_enable rejected");
+        }
+        fake.enqueue_event(cc(op::HCI_WRITE_SCAN_ENABLE, &[0x0C]));
+        let _ = pump_once(0);
+        if classic_scan_mode(0) != Some(0) {
+            reset_all();
+            return TestResult::Fail("refused scan enable recorded a mode");
+        }
+        // Out-of-range mode rejected without issuing a command.
+        let before = fake.sent_command_params().len();
+        let ok = classic_write_scan_enable(0, 4) == Err(ClassicError::BadScanMode)
+            && fake.sent_command_params().len() == before;
+        reset_all();
+        if !ok {
+            return TestResult::Fail("scan mode 4 did not fail BadScanMode");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_classic_failure_and_malformed);
 
     /// #1313: bring up the fake controller and land a central-role
     /// connection from Idle (Create issued directly, no scan
