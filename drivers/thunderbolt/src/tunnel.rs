@@ -557,6 +557,50 @@ fn chain(domain: &Domain, input: Endpoint, output: Endpoint) -> Result<Vec<Hop>,
     }
     Ok(hops)
 }
+
+/// Hard-refuse tunnel programming over a retimer-faulted link
+/// (#1122 item 3): every lane port the path traverses is checked
+/// against the typed `Port::retimer_fault` the topology scan
+/// published; any fault refuses the tunnel with
+/// [`Error::RetimerFault`] before any configuration write, so a
+/// faulted link is never half-programmed. Only lane ports
+/// (`kind == 1`) are gated — protocol adapters cannot carry
+/// retimers, and a path that traverses no faulted lane port is
+/// unaffected. A fault the next scan clears (successful
+/// re-enumeration publishes `None`) lets the path program again
+/// on the next pass. Checked here, in `activate`, the one choke
+/// point every tunnel program flows through — `reconcile`'s
+/// USB3/DisplayPort/PCIe paths and the suspend/resume replay —
+/// so no call site needs its own check. A path `chain` cannot
+/// build is left for the protocol activator to refuse as before.
+fn check_retimer_faults(domain: &Domain, input: Endpoint, output: Endpoint) -> Result<(), Error> {
+    use core::fmt::Write as _;
+    let Ok(hops) = chain(domain, input, output) else {
+        return Ok(());
+    };
+    for hop in &hops {
+        for p in [&hop.input, &hop.output] {
+            if p.kind == 1 {
+                if let Some(fault) = p.retimer_fault {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "usb4: domain {}: refusing tunnel (route {:#x} port {} -> route {:#x} port {}) over retimer fault at route {:#x} port {}: {:?}",
+                        domain.id,
+                        input.route,
+                        input.port,
+                        output.route,
+                        output.port,
+                        hop.route,
+                        p.number,
+                        fault
+                    );
+                    return Err(Error::RetimerFault);
+                }
+            }
+        }
+    }
+    Ok(())
+}
 impl Tunnel {
     async fn change(
         &mut self,
@@ -828,6 +872,9 @@ impl Tunnel {
         ctl: &mut impl Config,
         domain: &Domain,
     ) -> Result<(), Error> {
+        // Retimer-fault gate (#1122 item 3): refuse before any
+        // configuration write, for every protocol.
+        check_retimer_faults(domain, self.display.input, self.display.output)?;
         if self.display.protocol == Protocol::Usb3 {
             return self.activate_usb3(ctl, domain).await;
         }
@@ -1650,7 +1697,10 @@ pub(crate) async fn reconcile(
                         tunnels.push(t);
                         return Err(cleanup);
                     }
-                    if !matches!(e, Error::Full | Error::Remote(_)) {
+                    // A faulted link refuses this tunnel only;
+                    // reconcile continues and retries it on a
+                    // later pass, once the scan clears the fault.
+                    if !matches!(e, Error::Full | Error::Remote(_) | Error::RetimerFault) {
                         return Err(e);
                     }
                 }
@@ -1729,7 +1779,11 @@ pub(crate) async fn reconcile(
                                 tunnels.push(tunnel);
                                 return Err(cleanup);
                             }
-                            if !matches!(e, Error::Full | Error::Remote(_)) {
+                            // A faulted link refuses this tunnel
+                            // only; reconcile continues and retries
+                            // it on a later pass, once the scan
+                            // clears the fault.
+                            if !matches!(e, Error::Full | Error::Remote(_) | Error::RetimerFault) {
                                 return Err(e);
                             }
                         }
@@ -1811,7 +1865,10 @@ pub(crate) async fn reconcile(
                         tunnels.push(t);
                         return Err(cleanup);
                     }
-                    if !matches!(e, Error::Full | Error::Remote(_)) {
+                    // A faulted link refuses this tunnel only;
+                    // reconcile continues and retries it on a
+                    // later pass, once the scan clears the fault.
+                    if !matches!(e, Error::Full | Error::Remote(_) | Error::RetimerFault) {
                         return Err(e);
                     }
                 }

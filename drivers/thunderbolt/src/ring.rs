@@ -29,6 +29,10 @@ pub enum Error {
     Failed,
     Timeout,
     Remote(u8),
+    /// A tunnel path was refused before any configuration write
+    /// because a lane port it traverses carries a
+    /// `Port::retimer_fault` (see `tunnel::activate`).
+    RetimerFault,
 }
 
 #[derive(Debug)]
