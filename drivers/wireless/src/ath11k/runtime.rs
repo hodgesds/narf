@@ -3384,7 +3384,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// The transport restart is caller-provided: the PCI path power-cycles MHI
     /// and keeps the QMI session (`Ok(None)`); the AHB path restarts the
     /// remote and supplies a fresh WLFW session (`Ok(Some(qmi))`).
-    async fn rebuild_after_transport_reset<F>
+    async fn rebuild_after_transport_reset<F>(
         &self,
         restart: F,
         record_recovery_failure: bool,
