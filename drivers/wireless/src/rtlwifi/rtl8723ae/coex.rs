@@ -12,7 +12,8 @@
 //! `BtInfo` ingestion exactly per `rtl8723e_dm_bt_parse_bt_info`, the
 //! periodical decision (the shared `btcoex` matrix), and the DM
 //! primitives the trees call. It mirrors the `rtl8821ae/coex.rs` pass-1
-//! precedent: a decision owner with hooks, not the full algorithm.
+//! precedent: a decision owner with hooks. The mechanism trees that
+//! consume those primitives live in `dm.rs`.
 //!
 //! ## What is ported here (grounded)
 //!
@@ -29,32 +30,28 @@
 //! | `hal_btc.c` `rtl8723e_dm_bt_parse_bt_info` | [`Owner::ingest`] |
 //! | `hal_btc.c` c2h dispatch + `btc_periodical` trigger | [`Owner::periodical`] |
 //!
-//! ## Deliberately NOT ported here (follow-up tree lane)
+//! ## Deliberately NOT ported here
 //!
-//! - The full 1-ant / 2-ant mechanism trees (`hal_btc.c` ~1400 lines
-//!   including `query_bt_information`, `bt_hw_counters_monitor`,
-//!   `bt_enable_disable_check`, antenna-config and the `btdm` structure
-//!   reload). The trees consume the primitives above; they are not
-//!   silently dropped, they are a separate lane.
 //! - The RF half of `agc_table`: Linux also programs
 //!   `RF_RX_AGC_HP` / `RF_RX_G1` on `RF90_PATH_A` via `phy_set_rf_reg`.
-//!   NARF `rf.rs` exposes no direct RF-write API, so this pass programs
+//!   NARF `rf.rs` exposes no direct RF-write API, so this module programs
 //!   the MMIO `0xc78` table only and records `agc_rf_pending` so the
-//!   follow-up does not lose the RF half.
-//! - The `_8723a` command sequences behind the all-off wrappers
-//!   (`hal_btc.c:1473-1510`: firmware 3a / TDMA / DAC-swing / retry-index
-//!   commands, coex-table `0x5a5aaaaa` + HW PTA mode, RF LPF corner,
-//!   DAC swing, TX-rate-adapt penalty). [`Owner::coex_all_off`] ports the
-//!   wrappers' idempotent flags plus the two grounded SW sub-commands
-//!   (`agc_table` OFF, `bb_back_off` OFF); the flags are the driver's
-//!   bookkeeping and must not be read as hardware state until the tree
-//!   lane sends the sequences.
+//!   follow-up does not lose the RF half. The mechanism's RF LPF-corner
+//!   step is likewise flagged (`lpf_rf_pending` in `dm.rs`).
 //! - No H2C TDMA push: the shared `btcoex::H2C_BT_TDMA` (`0x66`) is the
 //!   8723B element-id (`rtl8723be/fw.h::H2C_8723B_B_TYPE_TDMA`), not an
 //!   8723A command. The 8723A antenna-sharing actions are `balance`,
 //!   `agc_table` and `bb_back_off` above; the periodical returns the
 //!   matrix decision for the station owner to record, it does not push
 //!   a TDMA pattern the chip would not understand.
+//!
+//! The full 1-ant / 2-ant mechanism trees and the `_8723a` command
+//! sequences behind the all-off wrappers used to be listed here as a
+//! follow-up tree lane; they now live in `dm.rs`. [`Owner::coex_all_off`]
+//! keeps its wrapper semantics (idempotent flags plus the two grounded
+//! SW sub-commands); the tree's full sequences are the separate
+//! `all_off_*` methods, and no reader consults the wrapper flags as
+//! hardware state.
 
 use super::adapter::{AntNum, BtInfo as AdapterBtInfo};
 use super::c2h::BtInfo as C2hBtInfo;
@@ -108,6 +105,8 @@ pub mod state {
     pub const WIFI_RSSI_MEDIUM: u32 = 1 << 5;
     /// Wi-Fi RSSI high.
     pub const WIFI_RSSI_HIGH: u32 = 1 << 6;
+    /// Decrease BT power (live Wi-Fi link).
+    pub const DEC_BT_POWER: u32 = 1 << 7;
     /// Wi-Fi idle.
     pub const WIFI_IDLE: u32 = 1 << 8;
     /// Wi-Fi uplink traffic.
@@ -118,12 +117,34 @@ pub mod state {
     pub const BT_INQ_PAGE: u32 = 1 << 11;
     /// BT idle.
     pub const BT_IDLE: u32 = 1 << 12;
+    /// BT uplink traffic.
+    pub const BT_UPLINK: u32 = 1 << 13;
+    /// BT downlink traffic.
+    pub const BT_DOWNLINK: u32 = 1 << 14;
+    /// Hold for BT operation (inquiry/page/pairing).
+    pub const HOLD_FOR_BT_OPERATION: u32 = 1 << 15;
+    /// BT RSSI low.
+    pub const BT_RSSI_LOW: u32 = 1 << 19;
+    /// BT profile: HID.
+    pub const PROFILE_HID: u32 = 1 << 20;
+    /// BT profile: A2DP.
+    pub const PROFILE_A2DP: u32 = 1 << 21;
+    /// BT profile: PAN.
+    pub const PROFILE_PAN: u32 = 1 << 22;
+    /// BT profile: SCO.
+    pub const PROFILE_SCO: u32 = 1 << 23;
     /// Wi-Fi RSSI-1 low.
     pub const WIFI_RSSI_1_LOW: u32 = 1 << 24;
     /// Wi-Fi RSSI-1 medium.
     pub const WIFI_RSSI_1_MEDIUM: u32 = 1 << 25;
     /// Wi-Fi RSSI-1 high.
     pub const WIFI_RSSI_1_HIGH: u32 = 1 << 26;
+    /// BT-info action: FTP/A2DP.
+    pub const BTINFO_B_FTP_A2DP: u32 = 1 << 29;
+    /// BT-info action: common.
+    pub const BTINFO_COMMON: u32 = 1 << 30;
+    /// BT-info action: HID/SCO/eSCO.
+    pub const BTINFO_B_HID_SCOESCO: u32 = 1 << 31;
 }
 
 /// `hal_bt_coexist.h::BT_RSSI_STATE_*` (shared `btcoex::btc::RssiState`
@@ -172,6 +193,43 @@ pub struct Owner {
     pub req_sent: bool,
     /// `bt_retry_cnt` from the last BT info body.
     pub retry_cnt: u8,
+    /// `c2h_bt_info_original`: body byte 0 of the last BT info, whose
+    /// profile bits the 2-ant dispatch reads (`dm.rs`).
+    pub bt_info_original: u8,
+    /// High-priority BT TX counter (`0x770` low half).
+    pub hp_tx: u32,
+    /// High-priority BT RX counter (`0x770` high half).
+    pub hp_rx: u32,
+    /// Low-priority BT TX counter (`0x774` low half).
+    pub lp_tx: u32,
+    /// Low-priority BT RX counter (`0x774` high half).
+    pub lp_rx: u32,
+    /// Consecutive all-dead counter reads (`bt_active_zero_cnt`).
+    pub bt_active_zero_cnt: u8,
+    /// BT currently counts as disabled (`cur_bt_disabled`).
+    pub cur_bt_disabled: bool,
+    /// Previous disabled state (`pre_bt_disabled`).
+    pub pre_bt_disabled: bool,
+    /// Inquiry/page window start, monotonic ms (`None` = closed).
+    pub inq_page_start_ms: Option<u64>,
+    /// LPS counter for the counter monitor's averaging step
+    /// (`lps_counter`; no in-tree producer bumps it yet).
+    pub lps_counter: u32,
+    /// Last applied mechanism setting (`hal_coex_8723.btdm`, for the
+    /// `set_bt_dm` dedup).
+    pub saved_btdm: super::dm::Btdm,
+    /// Dispatched profile case (`bt_profile_case`).
+    pub profile_case: super::dm::Mech,
+    /// Dispatched profile action (`bt_profile_action`).
+    pub profile_action: super::dm::Mech,
+    /// Hold for BT operation (`hold_for_bt_operation`; no in-tree
+    /// producer sets it yet — `set_bt_dm` honors it when set).
+    pub hold_for_bt_operation: bool,
+    /// Watchdog mechanism initialized (`init_set`).
+    pub mech_init_set: bool,
+    /// An RF LPF-corner write is owed (shrink or resume): no NARF
+    /// RF-write API, so the mechanism flags it instead of writing.
+    pub lpf_rf_pending: bool,
     /// `btcoexist.cstate`.
     pub cstate: u32,
     /// `btcoexist.cstate_h` (BT counter levels live in bits 0..3).
@@ -248,6 +306,22 @@ impl Owner {
             inquiry_page: false,
             req_sent: false,
             retry_cnt: 0,
+            bt_info_original: 0,
+            hp_tx: 0,
+            hp_rx: 0,
+            lp_tx: 0,
+            lp_rx: 0,
+            bt_active_zero_cnt: 0,
+            cur_bt_disabled: false,
+            pre_bt_disabled: false,
+            inq_page_start_ms: None,
+            lps_counter: 0,
+            saved_btdm: super::dm::Btdm::default(),
+            profile_case: super::dm::Mech::None,
+            profile_action: super::dm::Mech::None,
+            hold_for_bt_operation: false,
+            mech_init_set: false,
+            lpf_rf_pending: false,
             cstate: state::BT_IDLE,
             cstate_h: 0,
             prev_cstate: state::BT_IDLE,
@@ -284,6 +358,7 @@ impl Owner {
     pub fn ingest(&mut self, info: &C2hBtInfo) {
         self.req_sent = false;
         self.retry_cnt = info.retry_cnt;
+        self.bt_info_original = info.original;
         self.inquiry_page = info.inquiry_page;
         // Note: the parse grounds `bt_busy` / idle only; it does not
         // touch the `BT_INQ_PAGE` cstate bit, so inquiry state lives in
@@ -504,7 +579,12 @@ impl Owner {
     /// `rtl8723be_fill_h2c_cmd` (`HMETFR` free-box poll, box + extension
     /// split at 3 payload bytes). Payloads longer than 7 bytes or empty
     /// are refused, as in the BE mailbox.
-    async fn h2c_fill<I: Io>(&mut self, io: &I, id: u8, payload: &[u8]) -> Result<(), Error> {
+    pub(crate) async fn h2c_fill<I: Io>(
+        &mut self,
+        io: &I,
+        id: u8,
+        payload: &[u8],
+    ) -> Result<(), Error> {
         if payload.is_empty() || payload.len() > 7 {
             return Err(Error::State);
         }

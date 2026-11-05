@@ -45,6 +45,7 @@
 pub mod adapter;
 pub mod c2h;
 pub mod coex;
+pub mod dm;
 pub mod envelope;
 pub mod fw;
 pub mod packet;

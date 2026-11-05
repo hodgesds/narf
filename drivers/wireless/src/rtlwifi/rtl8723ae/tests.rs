@@ -1210,3 +1210,941 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723ae",
     smoke_rtl8723ae_packet_service_c2h
 );
+
+// ── shared bt_coexistence mechanism trees (`dm.rs`) ────────────────────
+
+/// Reconstruct H2C fills from a `FwFake` write log. Each fill is
+/// `(command id, payload bytes)`: the box content bytes after the id,
+/// followed by the extension bytes written immediately before the box
+/// content (empty for payloads of three bytes or fewer; short payloads
+/// pad the content to three bytes with zeros, matching the box image).
+/// Box rotation is irrelevant: fills are detected by box-base writes.
+fn dm_h2c_fills(writes: &[(u16, u32, u8)]) -> Vec<(u8, Vec<u8>)> {
+    let mut fills = Vec::new();
+    let mut i = 0;
+    while i < writes.len() {
+        let (reg, value, _) = writes[i];
+        if (0x01d0..0x01e0).contains(&reg) && (reg - 0x01d0) % 4 == 0 {
+            let boxnum = usize::from(reg - 0x01d0) / 4;
+            let ext_base = 0x01f0u16 + (boxnum as u16) * 4;
+            // Extension bytes sit consecutively immediately before the
+            // box content; collect them backward, then reverse.
+            let mut ext_rev = Vec::new();
+            let mut j = i;
+            while j > 0 {
+                let (preg, pvalue, _) = writes[j - 1];
+                if (ext_base..ext_base + 4).contains(&preg) {
+                    ext_rev.push(pvalue as u8);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+            ext_rev.reverse();
+            let mut payload = Vec::new();
+            for t in 1..4 {
+                if i + t < writes.len() {
+                    payload.push(writes[i + t].1 as u8);
+                }
+            }
+            payload.extend_from_slice(&ext_rev);
+            fills.push((value as u8, payload));
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    fills
+}
+
+/// Find a fill by command id in a reconstructed fill list.
+fn dm_find<'a>(fills: &'a [(u8, Vec<u8>)], id: u8) -> Option<&'a [u8]> {
+    fills
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, p)| p.as_slice())
+}
+
+/// `hal_btc.c` mechanism init + BT-info query: init zeroes the state,
+/// writes `0x76e = 0x04`, `0x778 = 0x03`, PTA on, and flags the owed RF
+/// origin reads; second init is silent; the query sends H2C `0x38
+/// [0x01]` and marks the request sent.
+fn smoke_rtl8723ae_dm_mech_init_and_query() -> TestResult {
+    use dm::*;
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if owner.mech_init(&io).is_err() {
+        return TestResult::Fail("8723AE dm mech_init error");
+    }
+    if !owner.mech_init_set
+        || !owner.lpf_rf_pending
+        || owner.cstate != 0
+        || owner.saved_btdm != Btdm::default()
+    {
+        return TestResult::Fail("8723AE dm mech_init state");
+    }
+    {
+        let g = io.0.lock();
+        if g.writes.iter().filter(|(r, _, _)| *r == 0x76e).count() != 1
+            || !g.writes.contains(&(0x76e, 0x04, 1))
+            || !g.writes.contains(&(0x778, 0x03, 1))
+            || !g.writes.contains(&(0x40, 0x20, 1))
+        {
+            return TestResult::Fail("8723AE dm mech_init writes");
+        }
+    }
+    let before = io.0.lock().writes.len();
+    if owner.mech_init(&io).is_err() || io.0.lock().writes.len() != before {
+        return TestResult::Fail("8723AE dm mech_init idempotent");
+    }
+    if narf_scheduler::block_on(owner.query_bt_information(&io)).is_err() || !owner.req_sent {
+        return TestResult::Fail("8723AE dm query error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x38) != Some(&[0x01, 0x00, 0x00][..]) {
+        return TestResult::Fail("8723AE dm query H2C 0x38");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_dm_mech_init_and_query
+);
+
+/// `hal_btc.c` counter monitor + enable/disable check + counter
+/// levels: dword split, LPS modulo reset, dead-read counting to
+/// disabled after two, levels 1200/1400/3000, and LEVEL_3 stickiness.
+fn smoke_rtl8723ae_dm_counters_and_levels() -> TestResult {
+    use dm::*;
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    // Preload: hp 0x0002_0001 (tx 1, rx 2), lp 0x0004_0003 (tx 3, rx 4).
+    {
+        let mut g = io.0.lock();
+        g.regs[0x770..0x774].copy_from_slice(&0x0002_0001u32.to_le_bytes());
+        g.regs[0x774..0x778].copy_from_slice(&0x0004_0003u32.to_le_bytes());
+    }
+    if owner.counters_monitor(&io).is_err()
+        || owner.hp_tx != 1
+        || owner.hp_rx != 2
+        || owner.lp_tx != 3
+        || owner.lp_rx != 4
+        || owner.bt_active_zero_cnt != 0
+    {
+        return TestResult::Fail("8723AE dm counters split");
+    }
+    // LPS counter 2: each counter is reduced modulo 2, then reset.
+    owner.lps_counter = 2;
+    if owner.counters_monitor(&io).is_err()
+        || owner.hp_tx != 1
+        || owner.hp_rx != 0
+        || owner.lp_tx != 1
+        || owner.lp_rx != 0
+        || owner.lps_counter != 0
+    {
+        return TestResult::Fail("8723AE dm counters LPS reset");
+    }
+    // Enable/disable: two consecutive dead reads disable BT.
+    {
+        let mut g = io.0.lock();
+        g.regs[0x770..0x774].copy_from_slice(&0u32.to_le_bytes());
+        g.regs[0x774..0x778].copy_from_slice(&0u32.to_le_bytes());
+    }
+    if owner.counters_monitor(&io).is_err() {
+        return TestResult::Fail("8723AE dm enable monitor error");
+    }
+    owner.enable_disable_check();
+    if owner.cur_bt_disabled || owner.bt_active_zero_cnt != 1 {
+        return TestResult::Fail("8723AE dm enable first dead read");
+    }
+    owner.enable_disable_check();
+    if !owner.cur_bt_disabled || owner.bt_active_zero_cnt != 2 {
+        return TestResult::Fail("8723AE dm enable second dead read");
+    }
+    // Alive counters clear the disabled flag and the count.
+    {
+        let mut g = io.0.lock();
+        g.regs[0x770..0x774].copy_from_slice(&0x0001_0001u32.to_le_bytes());
+    }
+    if owner.counters_monitor(&io).is_err() {
+        return TestResult::Fail("8723AE dm enable alive monitor error");
+    }
+    owner.enable_disable_check();
+    if owner.cur_bt_disabled || owner.bt_active_zero_cnt != 0 {
+        return TestResult::Fail("8723AE dm enable alive clears");
+    }
+    // Counter levels and the LEVEL_3 stickiness (Linux omits bit 3
+    // from the clear mask, so the bit sticks once set).
+    owner.hp_tx = 100;
+    owner.hp_rx = 1100;
+    owner.lp_tx = 0;
+    owner.lp_rx = 0;
+    if owner.counter_level() != 1 || owner.cstate_h & CNT_LEVEL_1 == 0 {
+        return TestResult::Fail("8723AE dm counter level 1");
+    }
+    owner.hp_tx = 1500;
+    owner.hp_rx = 1500;
+    if owner.counter_level() != 3 || owner.cstate_h & CNT_LEVEL_3 == 0 {
+        return TestResult::Fail("8723AE dm counter level 3");
+    }
+    owner.hp_tx = 0;
+    owner.hp_rx = 0;
+    if owner.counter_level() != 0
+        || owner.cstate_h & CNT_LEVEL_3 == 0
+        || owner.cstate_h & CNT_LEVEL_0 == 0
+    {
+        return TestResult::Fail("8723AE dm counter level 3 sticks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_dm_counters_and_levels
+);
+
+/// `hal_btc.c` common action: idle+idle → all-off btdm; Wi-Fi busy +
+/// BT idle → low-penalty table `0x5a5aaaaa`/`0xcccc`/`0x3` with dec BT
+/// power on a link; BT busy + no link → shrink table
+/// `0x55555555`/`0xffff`/`0x3`; BT busy + link → not common.
+fn smoke_rtl8723ae_dm_common_action() -> TestResult {
+    use coex::*;
+    use dm::*;
+    let idle = WifiTraffic {
+        busy: false,
+        tx_busy: false,
+        rx_busy: false,
+        legacy: false,
+        bw40: false,
+        bt30: false,
+    };
+    let busy = WifiTraffic {
+        busy: true,
+        tx_busy: true,
+        rx_busy: false,
+        legacy: false,
+        bw40: false,
+        bt30: false,
+    };
+    // Idle + idle: all-off btdm, COMMON bit, coex table + PTA on.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if narf_scheduler::block_on(owner.common_action(
+        &io,
+        MechInputs {
+            wifi: idle,
+            linked: false,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    )) != Ok(true)
+        || owner.profile_action != Mech::None
+        || owner.saved_btdm != Btdm::all_off()
+        || owner.cstate & state::BTINFO_COMMON == 0
+    {
+        return TestResult::Fail("8723AE dm common idle btdm");
+    }
+    {
+        let g = io.0.lock();
+        if !g.writes.contains(&(0x6c0, 0x5a5a_aaaa, 4)) || !g.writes.contains(&(0x40, 0x20, 1)) {
+            return TestResult::Fail("8723AE dm common idle writes");
+        }
+    }
+    // Wi-Fi busy + BT idle + link: low-penalty, dec BT power set.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if narf_scheduler::block_on(owner.common_action(
+        &io,
+        MechInputs {
+            wifi: busy,
+            linked: true,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    )) != Ok(true)
+        || owner.saved_btdm.val_0x6c0 != 0x5a5a_aaaa
+        || owner.saved_btdm.val_0x6c8 != 0xcccc
+        || owner.saved_btdm.val_0x6cc != 0x3
+        || !owner.saved_btdm.low_penalty_rate_adaptive
+        || !owner.saved_btdm.dec_bt_pwr
+        || owner.saved_btdm.rf_rx_lpf_shrink
+    {
+        return TestResult::Fail("8723AE dm common wifi-busy btdm");
+    }
+    // BT busy + no link: shrink table, no dec power.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    owner.bt_busy = true;
+    if narf_scheduler::block_on(owner.common_action(
+        &io,
+        MechInputs {
+            wifi: idle,
+            linked: false,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    )) != Ok(true)
+        || owner.saved_btdm.val_0x6c0 != 0x5555_5555
+        || owner.saved_btdm.val_0x6c8 != 0xffff
+        || owner.saved_btdm.val_0x6cc != 0x3
+        || !owner.saved_btdm.rf_rx_lpf_shrink
+        || owner.saved_btdm.dec_bt_pwr
+    {
+        return TestResult::Fail("8723AE dm common bt-busy btdm");
+    }
+    // BT busy + link: not common — profile actions take over.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    owner.bt_busy = true;
+    if narf_scheduler::block_on(owner.common_action(
+        &io,
+        MechInputs {
+            wifi: idle,
+            linked: true,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    )) != Ok(false)
+    {
+        return TestResult::Fail("8723AE dm common bt-busy-linked not common");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_dm_common_action
+);
+
+/// `hal_btc.c` HID/SCO/eSCO, HT40: PS row by counter level only
+/// (level 2 → `[a3,5,5,2,80]`), AGC off, table `0x55555555`.
+fn smoke_rtl8723ae_dm_hid_sco_esco_ht40() -> TestResult {
+    use coex::*;
+    use dm::*;
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&adapter::BtInfo {
+        coexistence: true,
+        kind: adapter::BT_RTL8723A,
+        ant_num: adapter::AntNum::X2,
+        ant_isolation: 0,
+        radio_shared: 0,
+    });
+    owner.bt_busy = true;
+    owner.bt_info_original = 0x20; // HID bit.
+    owner.hp_tx = 800;
+    owner.hp_rx = 800; // Level 2 (>= 1400).
+    let outcome = narf_scheduler::block_on(owner.coexist_2_ant(
+        &io,
+        MechInputs {
+            wifi: WifiTraffic {
+                busy: true,
+                tx_busy: true,
+                rx_busy: false,
+                legacy: false,
+                bw40: true,
+                bt30: false,
+            },
+            linked: true,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    ));
+    if outcome != Ok(Mech::HidScoEsco)
+        || owner.profile_case != Mech::HidScoEsco
+        || owner.profile_action != Mech::HidScoEsco
+    {
+        return TestResult::Fail("8723AE dm hid ht40 dispatch");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x3a) != Some(&[0xa3, 0x05, 0x05, 0x02, 0x80][..]) {
+        return TestResult::Fail("8723AE dm hid ht40 ps row");
+    }
+    if owner.saved_btdm.val_0x6c0 != 0x5555_5555 || owner.saved_btdm.agc_table_en {
+        return TestResult::Fail("8723AE dm hid ht40 btdm");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_dm_hid_sco_esco_ht40
+);
+
+/// `hal_btc.c` HID/SCO/eSCO, HT20: RSSI high → AGC on + `0x883 =
+/// 0x40` + byte3 `0x83`; RSSI low → AGC off + byte3 `0x02`; level 1 →
+/// row `[a3,a,a,*,80]`.
+fn smoke_rtl8723ae_dm_hid_sco_esco_ht20() -> TestResult {
+    use coex::*;
+    use dm::*;
+    let mk = || {
+        let mut owner = Owner::bind(&adapter::BtInfo {
+            coexistence: true,
+            kind: adapter::BT_RTL8723A,
+            ant_num: adapter::AntNum::X2,
+            ant_isolation: 0,
+            radio_shared: 0,
+        });
+        owner.bt_busy = true;
+        owner.bt_info_original = 0x20; // HID bit.
+        owner.hp_tx = 600;
+        owner.hp_rx = 600; // Level 1 (>= 1200).
+        owner
+    };
+    let wifi = WifiTraffic {
+        busy: true,
+        tx_busy: true,
+        rx_busy: false,
+        legacy: false,
+        bw40: false,
+        bt30: false,
+    };
+    // RSSI high (60 >= 47) and RSSI-1 high (60 >= 27): byte3 0x83.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = mk();
+    if narf_scheduler::block_on(owner.coexist_2_ant(
+        &io,
+        MechInputs {
+            wifi,
+            linked: true,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("8723AE dm hid ht20 high error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x3a) != Some(&[0xa3, 0x0a, 0x0a, 0x83, 0x80][..])
+        || !io.0.lock().writes.contains(&(0x883, 0x40, 1))
+        || !owner.saved_btdm.agc_table_en
+    {
+        return TestResult::Fail("8723AE dm hid ht20 high row");
+    }
+    // RSSI low (20 < 47) and RSSI-1 low (drive to Low first, then 20
+    // stays Low): byte3 0x02, no 0x883 write.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = mk();
+    owner.rssi_state1(20, 2, 27, 0);
+    if narf_scheduler::block_on(owner.coexist_2_ant(
+        &io,
+        MechInputs {
+            wifi,
+            linked: true,
+            pwdb: 20,
+            now_ms: 0,
+            a_cut: false,
+        },
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("8723AE dm hid ht20 low error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x3a) != Some(&[0xa3, 0x0a, 0x0a, 0x02, 0x80][..])
+        || io.0.lock().writes.contains(&(0x883, 0x40, 1))
+        || owner.saved_btdm.agc_table_en
+    {
+        return TestResult::Fail("8723AE dm hid ht20 low row");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_dm_hid_sco_esco_ht20
+);
+
+/// `hal_btc.c` FTP/A2DP, HT40: byte3 `0x81` on RSSI high, `0x00` on
+/// RSSI low; back-off always on; inquiry/level-3 override forces
+/// `[a3,5,5,83,80]`.
+fn smoke_rtl8723ae_dm_ftp_a2dp_ht40() -> TestResult {
+    use coex::*;
+    use dm::*;
+    let mk = || {
+        let mut owner = Owner::bind(&adapter::BtInfo {
+            coexistence: true,
+            kind: adapter::BT_RTL8723A,
+            ant_num: adapter::AntNum::X2,
+            ant_isolation: 0,
+            radio_shared: 0,
+        });
+        owner.bt_busy = true;
+        owner.bt_info_original = 0x40; // A2DP bit.
+        owner.hp_tx = 800;
+        owner.hp_rx = 800; // Level 2.
+        owner
+    };
+    let wifi = WifiTraffic {
+        busy: true,
+        tx_busy: true,
+        rx_busy: false,
+        legacy: false,
+        bw40: true,
+        bt30: false,
+    };
+    let io = fw_fake(false, false, false, false);
+    let mut owner = mk();
+    if narf_scheduler::block_on(owner.coexist_2_ant(
+        &io,
+        MechInputs {
+            wifi,
+            linked: true,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("8723AE dm ftp ht40 high error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x3a) != Some(&[0xa3, 0x05, 0x05, 0x81, 0x80][..])
+        || !owner.saved_btdm.adc_back_off_on
+    {
+        return TestResult::Fail("8723AE dm ftp ht40 high row");
+    }
+    let io = fw_fake(false, false, false, false);
+    let mut owner = mk();
+    if narf_scheduler::block_on(owner.coexist_2_ant(
+        &io,
+        MechInputs {
+            wifi,
+            linked: true,
+            pwdb: 20,
+            now_ms: 0,
+            a_cut: false,
+        },
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("8723AE dm ftp ht40 low error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x3a) != Some(&[0xa3, 0x05, 0x05, 0x00, 0x80][..]) {
+        return TestResult::Fail("8723AE dm ftp ht40 low row");
+    }
+    // Inquiry window open forces the override row even at level 0.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = mk();
+    owner.hp_tx = 0;
+    owner.hp_rx = 0;
+    owner.ingest(&c2h::BtInfo {
+        original: 0x44, // A2DP + INQ_PAGE.
+        retry_cnt: 0,
+        inquiry_page: true,
+        connected: true,
+    });
+    if narf_scheduler::block_on(owner.coexist_2_ant(
+        &io,
+        MechInputs {
+            wifi,
+            linked: true,
+            pwdb: 20,
+            now_ms: 1000,
+            a_cut: false,
+        },
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("8723AE dm ftp inq error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x3a) != Some(&[0xa3, 0x05, 0x05, 0x83, 0x80][..])
+        || owner.inq_page_start_ms != Some(1000)
+    {
+        return TestResult::Fail("8723AE dm ftp inq override row");
+    }
+    // Ten seconds later the window closes.
+    if narf_scheduler::block_on(owner.coexist_2_ant(
+        &io,
+        MechInputs {
+            wifi,
+            linked: true,
+            pwdb: 20,
+            now_ms: 11_000,
+            a_cut: false,
+        },
+    ))
+    .is_err()
+        || owner.inq_page_start_ms.is_some()
+    {
+        return TestResult::Fail("8723AE dm ftp inq window closes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_dm_ftp_a2dp_ht40
+);
+
+/// `hal_btc.c` dispatch: no profile bits → case None but the
+/// HID/SCO/eSCO action still runs (Linux's undefined-case branch);
+/// SCO_ESCO bit alone → HID_SCO_ESCO case.
+fn smoke_rtl8723ae_dm_dispatch_undefined() -> TestResult {
+    use coex::*;
+    use dm::*;
+    let wifi = WifiTraffic {
+        busy: true,
+        tx_busy: true,
+        rx_busy: false,
+        legacy: false,
+        bw40: true,
+        bt30: false,
+    };
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&adapter::BtInfo {
+        coexistence: true,
+        kind: adapter::BT_RTL8723A,
+        ant_num: adapter::AntNum::X2,
+        ant_isolation: 0,
+        radio_shared: 0,
+    });
+    owner.bt_busy = true;
+    owner.bt_info_original = 0x01; // Connection only, no profile.
+    if narf_scheduler::block_on(owner.coexist_2_ant(
+        &io,
+        MechInputs {
+            wifi,
+            linked: true,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    )) != Ok(Mech::None)
+        || owner.profile_case != Mech::None
+        || owner.profile_action != Mech::None
+        || owner.cstate & state::BTINFO_B_HID_SCOESCO == 0
+    {
+        return TestResult::Fail("8723AE dm dispatch undefined case");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x3a).is_none() {
+        return TestResult::Fail("8723AE dm dispatch undefined runs hid");
+    }
+    let mut owner = Owner::bind(&adapter::BtInfo {
+        coexistence: true,
+        kind: adapter::BT_RTL8723A,
+        ant_num: adapter::AntNum::X2,
+        ant_isolation: 0,
+        radio_shared: 0,
+    });
+    owner.bt_busy = true;
+    owner.bt_info_original = 0x02; // SCO_ESCO bit.
+    if narf_scheduler::block_on(owner.coexist_2_ant(
+        &io,
+        MechInputs {
+            wifi,
+            linked: true,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    )) != Ok(Mech::HidScoEsco)
+        || owner.profile_case != Mech::HidScoEsco
+    {
+        return TestResult::Fail("8723AE dm dispatch sco-esco case");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_dm_dispatch_undefined
+);
+
+/// `hal_btc.c` all-off sequences: FW order (ignore, 3a, 2-ant-hid,
+/// tra-tdma on B-cut, tdma, dac, hid-info, retry, wlan-act, dec-pwr),
+/// SW order (AGC off, BB off, penalty, DAC swing), HW order (table,
+/// PTA on); combined is FW then SW then HW.
+fn smoke_rtl8723ae_dm_all_off_sequences() -> TestResult {
+    use coex::*;
+    use dm::*;
+    // A-cut: tra_tdma must NOT appear in the FW sequence.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if narf_scheduler::block_on(owner.all_off_fw(&io, true)).is_err() {
+        return TestResult::Fail("8723AE dm all_off_fw error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    let ids: Vec<u8> = fills.iter().map(|(i, _)| *i).collect();
+    if ids
+        != [
+            0x25, 0x3a, 0x15, 0x26, 0x14, 0x29, 0x24, 0x23, 0x22, 0x11, 0x21,
+        ]
+    {
+        return TestResult::Fail("8723AE dm all_off_fw A-cut ids");
+    }
+    if dm_find(&fills, 0x25) != Some(&[0x00, 0x00, 0x00][..])
+        || dm_find(&fills, 0x22) != Some(&[0x10, 0x00, 0x00][..])
+        || dm_find(&fills, 0x11) != Some(&[0x10, 0x00, 0x00][..])
+        || dm_find(&fills, 0x23) != Some(&[0x02, 0x00, 0x00][..])
+    {
+        return TestResult::Fail("8723AE dm all_off_fw payloads");
+    }
+    // B-cut: tra_tdma 0x33 appears between 2-ant-hid and tdma.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if narf_scheduler::block_on(owner.all_off_fw(&io, false)).is_err() {
+        return TestResult::Fail("8723AE dm all_off_fw B-cut error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    let ids: Vec<u8> = fills.iter().map(|(i, _)| *i).collect();
+    if ids
+        != [
+            0x25, 0x3a, 0x15, 0x33, 0x26, 0x14, 0x29, 0x24, 0x23, 0x22, 0x11, 0x21,
+        ]
+    {
+        return TestResult::Fail("8723AE dm all_off_fw B-cut ids");
+    }
+    // SW: AGC off table, BB off, penalty BIT(0) set + BIT(2) set
+    // (normal), DAC swing 0xc0 at 0x880 top byte.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if owner.all_off_sw(&io).is_err() {
+        return TestResult::Fail("8723AE dm all_off_sw error");
+    }
+    {
+        let g = io.0.lock();
+        if g.writes[..5]
+            != [
+                (REG_AGC_TABLE, 0x641c0001, 4),
+                (REG_AGC_TABLE + 4, 0x631d0001, 4),
+                (REG_AGC_TABLE + 8, 0x621e0001, 4),
+                (REG_AGC_TABLE + 12, 0x611f0001, 4),
+                (REG_AGC_TABLE + 16, 0x60200001, 4),
+            ]
+            || !g.writes.contains(&(REG_BB_BACKOFF, BB_BACKOFF_OFF, 4))
+            || !g.writes.contains(&(0x4fd, 0x05, 1))
+            || !g.writes.contains(&(0x880, 0xc000_0000, 4))
+        {
+            return TestResult::Fail("8723AE dm all_off_sw writes");
+        }
+    }
+    // HW: table 0x5a5aaaaa/0xcc/0x3 + PTA on (Linux's HW all-off
+    // leaves PTA enabled).
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if owner.all_off_hw(&io).is_err() {
+        return TestResult::Fail("8723AE dm all_off_hw error");
+    }
+    {
+        let g = io.0.lock();
+        if !g.writes.contains(&(0x6c0, 0x5a5a_aaaa, 4))
+            || !g.writes.contains(&(0x6c8, 0xcc, 4))
+            || !g.writes.contains(&(0x6cc, 0x03, 1))
+            || !g.writes.contains(&(0x40, 0x20, 1))
+        {
+            return TestResult::Fail("8723AE dm all_off_hw writes");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_dm_all_off_sequences
+);
+
+/// `hal_btc.c` `set_bt_dm` gates: identical btdm → zero writes;
+/// hold → only ignore-wlan-act; all-off btdm → combined sequences;
+/// tra_tdma skipped on A-cut, sent on B-cut (setter level).
+fn smoke_rtl8723ae_dm_set_bt_dm_gates() -> TestResult {
+    use dm::*;
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    // First apply writes; second identical apply writes nothing.
+    if narf_scheduler::block_on(owner.set_bt_dm(&io, Btdm::all_off(), false)).is_err() {
+        return TestResult::Fail("8723AE dm set_bt_dm first error");
+    }
+    let before = io.0.lock().writes.len();
+    if narf_scheduler::block_on(owner.set_bt_dm(&io, Btdm::all_off(), false)).is_err()
+        || io.0.lock().writes.len() != before
+    {
+        return TestResult::Fail("8723AE dm set_bt_dm dedup");
+    }
+    // Hold: only the ignore-wlan-act fill.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    owner.hold_for_bt_operation = true;
+    if narf_scheduler::block_on(owner.set_bt_dm(&io, Btdm::all_off(), false)).is_err() {
+        return TestResult::Fail("8723AE dm set_bt_dm hold error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if fills.len() != 1 || fills[0].0 != 0x25 || fills[0].1[0] != 0x01 {
+        return TestResult::Fail("8723AE dm set_bt_dm hold only ignore");
+    }
+    // All-off btdm: combined sequences (FW first: ignore 0x25 [0x00];
+    // HW last: PTA on).
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if narf_scheduler::block_on(owner.set_bt_dm(&io, Btdm::all_off(), false)).is_err() {
+        return TestResult::Fail("8723AE dm set_bt_dm all_off error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if fills.is_empty() || fills[0].0 != 0x25 || fills[0].1[0] != 0x00 {
+        return TestResult::Fail("8723AE dm set_bt_dm all_off fw first");
+    }
+    if !io.0.lock().writes.contains(&(0x40, 0x20, 1)) {
+        return TestResult::Fail("8723AE dm set_bt_dm all_off hw last");
+    }
+    // Tra-TDMA setter gate.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if narf_scheduler::block_on(owner.set_fw_tra_tdma_ctrl(
+        &io,
+        true,
+        TDMA_2ANT,
+        TDMA_NAV_OFF,
+        true,
+    ))
+    .is_err()
+        || !io.0.lock().writes.is_empty()
+    {
+        return TestResult::Fail("8723AE dm tra_tdma A-cut silent");
+    }
+    if narf_scheduler::block_on(owner.set_fw_tra_tdma_ctrl(
+        &io,
+        true,
+        TDMA_1ANT,
+        TDMA_NAV_ON,
+        false,
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("8723AE dm tra_tdma B-cut error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x33) != Some(&[0x03, 0x01, 0x00][..]) {
+        return TestResult::Fail("8723AE dm tra_tdma B-cut fill");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_dm_set_bt_dm_gates
+);
+
+/// `hal_btc.c` run gates + notifies: no coexistence → ran=false,
+/// zero writes; 1-ant → ran=true, action None, no mechanism writes;
+/// media-status bytes; turn-off-before-LPS zero + combined.
+fn smoke_rtl8723ae_dm_run_gates_and_notifies() -> TestResult {
+    use coex::*;
+    use dm::*;
+    // Fail-closed: coexistence off → nothing runs, nothing written.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&adapter::BtInfo {
+        coexistence: false,
+        kind: adapter::BT_RTL8723A,
+        ant_num: adapter::AntNum::X2,
+        ant_isolation: 0,
+        radio_shared: 0,
+    });
+    let wifi = WifiTraffic {
+        busy: true,
+        tx_busy: true,
+        rx_busy: false,
+        legacy: false,
+        bw40: true,
+        bt30: false,
+    };
+    let outcome = narf_scheduler::block_on(owner.run_mechanism(
+        &io,
+        MechInputs {
+            wifi,
+            linked: true,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    ));
+    if outcome
+        != Ok(RunOutcome {
+            ran: false,
+            action: Mech::None,
+        })
+        || !io.0.lock().writes.is_empty()
+    {
+        return TestResult::Fail("8723AE dm run fail-closed");
+    }
+    // 1-ant: runs, action None, and no set_bt_dm writes — only the
+    // query (0x38), init (0x76e/0x778/0x40), and post-watchdog 0x76e.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt()); // X1.
+    let outcome = narf_scheduler::block_on(owner.run_mechanism(
+        &io,
+        MechInputs {
+            wifi,
+            linked: false,
+            pwdb: 60,
+            now_ms: 0,
+            a_cut: false,
+        },
+    ));
+    if outcome
+        != Ok(RunOutcome {
+            ran: true,
+            action: Mech::None,
+        })
+    {
+        return TestResult::Fail("8723AE dm run 1-ant outcome");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if fills.len() != 1 || fills[0].0 != 0x38 {
+        return TestResult::Fail("8723AE dm run 1-ant only query");
+    }
+    if !io.0.lock().writes.contains(&(0x76e, 0x0c, 1)) {
+        return TestResult::Fail("8723AE dm run 1-ant post-watchdog write");
+    }
+    // Media status: connected + linked + HT40 → [1, ch, 0x30].
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if narf_scheduler::block_on(owner.media_status(&io, true, true, 6, true)).is_err() {
+        return TestResult::Fail("8723AE dm media error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x19) != Some(&[0x01, 0x06, 0x30][..]) {
+        return TestResult::Fail("8723AE dm media bytes");
+    }
+    // Disconnected → [0, 0, 0x20].
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if narf_scheduler::block_on(owner.media_status(&io, false, false, 0, false)).is_err() {
+        return TestResult::Fail("8723AE dm media disc error");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if dm_find(&fills, 0x19) != Some(&[0x00, 0x00, 0x20][..]) {
+        return TestResult::Fail("8723AE dm media disc bytes");
+    }
+    // Turn-off-before-LPS: inactive PS + coexistence → zeroed state +
+    // combined all-off (FW ignore first, HW PTA on present).
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    owner.cstate = 0xffff_ffff;
+    if narf_scheduler::block_on(owner.turn_off_before_lps(&io, false, true)).is_err()
+        || owner.cstate != 0
+    {
+        return TestResult::Fail("8723AE dm turn_off_lps state");
+    }
+    let fills = dm_h2c_fills(&io.0.lock().writes);
+    if fills.is_empty() || fills[0].0 != 0x25 {
+        return TestResult::Fail("8723AE dm turn_off_lps fw first");
+    }
+    if !io.0.lock().writes.contains(&(0x40, 0x20, 1)) {
+        return TestResult::Fail("8723AE dm turn_off_lps hw last");
+    }
+    // PS not inactive → nothing written, state untouched.
+    let io = fw_fake(false, false, false, false);
+    let mut owner = Owner::bind(&coex_bt());
+    if narf_scheduler::block_on(owner.turn_off_before_lps(&io, false, false)).is_err()
+        || !io.0.lock().writes.is_empty()
+    {
+        return TestResult::Fail("8723AE dm turn_off_lps inactive silent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_dm_run_gates_and_notifies
+);
