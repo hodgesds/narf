@@ -20,11 +20,13 @@ use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 use crate::ixgbe::queues::RegBank;
 use crate::ixgbe::rxdesc::{AdvRxDescRead, AdvRxDescWb, ADV_RXD_STAT_DD};
 
+pub mod aci;
 pub mod dcb;
 pub mod eee;
 pub mod ethtool;
 pub mod fcoe;
 pub mod fdir;
+pub mod hic;
 pub mod pm;
 pub mod queues;
 pub mod regs;
@@ -49,11 +51,35 @@ pub const IXGBE_DEV_X550: u16 = 0x1563;
 /// X550EM_x (10G SFP+).
 pub const IXGBE_DEV_X550EM_X: u16 = 0x15AB;
 
+/// X550EM_A 1G_T — EEE-capable via the FW-PHY transport
+/// (Linux `ixgbe_set_eee_capable`; DID from Linux
+/// `ixgbe_type.h`). A different part from X550EM_X
+/// (0x15AB): same vendor, different device id. Note
+/// 0x15E4 under vendor 0x1022 is AMD's MP2 — the PCI
+/// match is vendor+device, so there is no conflict.
+pub const IXGBE_DEV_X550EM_A_1G_T: u16 = 0x15E4;
+/// X550EM_A 1G_T_L — EEE-capable via FW-PHY (Linux).
+pub const IXGBE_DEV_X550EM_A_1G_T_L: u16 = 0x15E5;
+/// E610 backplane — EEE-capable via ACI (Linux).
+pub const IXGBE_DEV_E610_BACKPLANE: u16 = 0x57AE;
+/// E610 SFP — EEE-capable via ACI (Linux).
+pub const IXGBE_DEV_E610_SFP: u16 = 0x57AF;
+/// E610 10G_T — EEE-capable via ACI (Linux).
+pub const IXGBE_DEV_E610_10G_T: u16 = 0x57B0;
+/// E610 2.5G_T — EEE-capable via ACI (Linux).
+pub const IXGBE_DEV_E610_2_5G_T: u16 = 0x57B1;
+
 const ALL_DEV_IDS: &[u16] = &[
     IXGBE_DEV_82599EB,
     IXGBE_DEV_X540,
     IXGBE_DEV_X550,
     IXGBE_DEV_X550EM_X,
+    IXGBE_DEV_X550EM_A_1G_T,
+    IXGBE_DEV_X550EM_A_1G_T_L,
+    IXGBE_DEV_E610_BACKPLANE,
+    IXGBE_DEV_E610_SFP,
+    IXGBE_DEV_E610_10G_T,
+    IXGBE_DEV_E610_2_5G_T,
 ];
 
 // ── Register offsets (BAR0) ────────────────────────────────────────
@@ -447,6 +473,15 @@ pub enum IxgbeError {
     Other(&'static str),
 }
 
+impl From<eee::EeeLiveError> for IxgbeError {
+    fn from(e: eee::EeeLiveError) -> Self {
+        match e {
+            eee::EeeLiveError::NotCapable => IxgbeError::UnsupportedDevice,
+            other => IxgbeError::Other(other.as_str()),
+        }
+    }
+}
+
 // ── Driver state ───────────────────────────────────────────────────
 
 /// One TX queue's DMA ring state. Index = queue number.
@@ -508,6 +543,13 @@ pub struct Ixgbe {
     pub link_up: IrqSafeSpinLock<bool>,
     /// Recorded device id (drives `name()`).
     pub did: u16,
+    /// LAN id: the PCI function number (Linux
+    /// `ixgbe_set_lan_id_multi_port_pcie` sets
+    /// `bus->lan_id = bus->func` for these parts). The
+    /// FW-PHY host-interface commands and the ACI
+    /// commands carry it as the port number. Non-PCIe
+    /// (MMIO) devices report 0.
+    pub lan_id: u8,
     /// Live queue configuration: the counts `tx_queues` /
     /// `rx_queues` were built for, and the ring length their rings
     /// use. `bring_up` builds 1/1; `bring_up_with_config` builds
@@ -534,7 +576,8 @@ pub struct Ixgbe {
     /// Armed WoL config, if `configure_wol` ran and was not disarmed.
     pub wol_armed: IrqSafeSpinLock<Option<wol::WolConfig>>,
     /// Programmed EEE state, if `configure_eee` ran. Always `None`
-    /// on in-tree device ids: Linux marks none of them
+    /// on the non-capable in-tree device ids (82599EB, X540,
+    /// X550, X550EM_X): Linux marks none of them
     /// EEE-capable, so `configure_eee` returns
     /// `UnsupportedDevice` before storing anything (see
     /// `eee.rs`).
@@ -559,6 +602,7 @@ impl core::fmt::Debug for Ixgbe {
             .field("mac", &self.mac)
             .field("link_up", &*self.link_up.lock())
             .field("did", &format_args!("0x{:04X}", self.did))
+            .field("lan_id", &self.lan_id)
             .field("num_tx_queues", &self.queue_config.num_tx)
             .field("num_rx_queues", &self.queue_config.num_rx)
             .finish_non_exhaustive()
@@ -838,6 +882,11 @@ impl Ixgbe {
             }
         }
 
+        let lan_id = match device.addr {
+            narf_bus::BusAddr::Pcie(pci) => pci.function,
+            narf_bus::BusAddr::Mmio(_) => 0,
+        };
+
         let ixgbe = Arc::new(Self {
             mmio,
             tx_queues,
@@ -846,6 +895,7 @@ impl Ixgbe {
             mac,
             link_up: IrqSafeSpinLock::new(link_up),
             did: device.id.device,
+            lan_id,
             queue_config,
             rss_cfg: IrqSafeSpinLock::new(None),
             dcb_cfg: IrqSafeSpinLock::new(None),
@@ -1667,31 +1717,74 @@ impl Ixgbe {
     /// Set EEE enabled/disabled, mirroring Linux `ixgbe_set_eee`:
     /// enabled stores advertised = supported, disabled stores
     /// advertised = empty. Returns `UnsupportedDevice` on every
-    /// in-tree device id (none is EEE-capable per Linux) — the
-    /// stored state only exists for the capable parts
-    /// (X550EM_A 1G_T, E610), whose FW-PHY/ACI transports are
-    /// follow-ups. Unlike Linux, this does NOT reset the link:
-    /// link re-application after a set is a follow-up (see
-    /// `eee.rs` header).
+    /// non-capable device id (82599EB, X540, X550, X550EM_X).
+    /// On the capable parts the set goes live through the
+    /// firmware: the FW-PHY setup-link activity (X550EM_A
+    /// 1G_T/L) or set_phy_cfg + restart-AN (E610). The
+    /// setup-link / restart-AN step IS the link
+    /// re-application; Linux additionally resets the link,
+    /// which this driver does not do. Transport failures
+    /// surface as `Other` with the transport's message.
     pub fn configure_eee(&self, enable: bool) -> Result<(), IxgbeError> {
-        let (supported, advertised) = if eee::is_e610(self.did) {
-            eee::e610_defaults(self.did == eee::DEV_E610_2_5G_T)
-        } else if self.did == eee::DEV_X550EM_A_1G_T || self.did == eee::DEV_X550EM_A_1G_T_L {
-            eee::x550em_a_defaults()
-        } else {
+        if !eee::eee_capable(self.did) {
             return Err(IxgbeError::UnsupportedDevice);
+        }
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        let state = if eee::is_e610(self.did) {
+            let mut caps = alloc::vec![0u8; aci::ACI_MAX_BUFFER_SIZE];
+            eee::configure_e610(&mut bank, self.lan_id, self.did, enable, &mut caps)?
+        } else {
+            eee::configure_fw_phy(&mut bank, self.lan_id, enable)?
         };
-        let mut state = eee::EeeState::new(supported, advertised);
-        state.set_enabled(enable);
         *self.eee_state.lock() = Some(state);
         Ok(())
     }
 
     /// The ethtool-visible EEE snapshot, if `configure_eee` ran.
-    /// `None` on in-tree device ids (never configured) and
-    /// before any configuration.
+    /// `None` on non-capable device ids and before any
+    /// configuration.
     pub fn eee_status(&self) -> Option<eee::EeeStatus> {
         self.eee_state.lock().map(eee::EeeStatus::from)
+    }
+
+    /// Query the live EEE status from the firmware and
+    /// refresh the stored state (Linux `ixgbe_get_eee`):
+    /// UD_2 link-partner modes on the FW-PHY path,
+    /// get_link_info enabled/active bits + the entry
+    /// delay on the ACI path. Works without a prior
+    /// `configure_eee` (the state starts at the
+    /// identification defaults). Returns
+    /// `UnsupportedDevice` on non-capable device ids.
+    pub fn eee_status_live(&self) -> Result<eee::EeeStatus, IxgbeError> {
+        if !eee::eee_capable(self.did) {
+            return Err(IxgbeError::UnsupportedDevice);
+        }
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        let stored = *self.eee_state.lock();
+        let state = if eee::is_e610(self.did) {
+            eee::status_e610(&mut bank, self.lan_id, self.did, stored)?
+        } else {
+            eee::status_fw_phy(&mut bank, self.lan_id, stored)?
+        };
+        *self.eee_state.lock() = Some(state);
+        Ok(eee::EeeStatus::from(state))
+    }
+
+    /// Read the X550 MAC LPI status registers (EEE_STAT +
+    /// TLPIC/RLPIC). Gated to the X550 DID: the block is
+    /// defined for the X550 by its datasheet (rev. 2.7
+    /// §5.3.6, Table 8-26) and the spec-update errata
+    /// disables the feature, so the bits read 0 on X550
+    /// silicon — this is the observation surface, not a
+    /// control path. NOTE: reading TLPIC/RLPIC clears both
+    /// counters. Returns `UnsupportedDevice` on every
+    /// other device id.
+    pub fn eee_lpi_status(&self) -> Result<eee::LpiStatus, IxgbeError> {
+        if self.did != IXGBE_DEV_X550 {
+            return Err(IxgbeError::UnsupportedDevice);
+        }
+        let bank = queues::MmioBank::new(&self.mmio);
+        Ok(eee::lpi_status_read(&bank))
     }
 
     /// Suspend: quiesce the datapath (mask interrupts, RXEN off,
@@ -2435,6 +2528,12 @@ pub fn name_for(did: u16) -> &'static str {
         IXGBE_DEV_X540 => "ixgbe-x540",
         IXGBE_DEV_X550 => "ixgbe-x550",
         IXGBE_DEV_X550EM_X => "ixgbe-x550em",
+        IXGBE_DEV_X550EM_A_1G_T => "ixgbe-x550em-a-1g-t",
+        IXGBE_DEV_X550EM_A_1G_T_L => "ixgbe-x550em-a-1g-t-l",
+        IXGBE_DEV_E610_BACKPLANE => "ixgbe-e610-backplane",
+        IXGBE_DEV_E610_SFP => "ixgbe-e610-sfp",
+        IXGBE_DEV_E610_10G_T => "ixgbe-e610-10g-t",
+        IXGBE_DEV_E610_2_5G_T => "ixgbe-e610-2-5g-t",
         _ => "ixgbe",
     }
 }

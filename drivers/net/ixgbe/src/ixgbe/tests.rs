@@ -20,8 +20,9 @@ use super::{
     ADVTXD_DCMD_DEXT, ADVTXD_DCMD_EOP, ADVTXD_DCMD_IFCS, ADVTXD_DCMD_RS, ADVTXD_DCMD_TSE,
     ADVTXD_DCMD_VLE, ADVTXD_DTYP_CTXT, ADVTXD_DTYP_DATA, ADVTXD_PAYLEN_SHIFT, ADVTXD_POPTS_IXSM,
     ADVTXD_POPTS_TXSM, ADVTXD_TUCMD_IPV4, ADVTXD_TUCMD_L4T_TCP, EERD_START, IXGBE_DEV_82599EB,
-    IXGBE_DEV_X540, IXGBE_DEV_X550, IXGBE_DEV_X550EM_X, IXGBE_VENDOR, SRRCTL_BSIZE_2K,
-    SRRCTL_DESCTYPE_ADV_ONEBUF,
+    IXGBE_DEV_E610_10G_T, IXGBE_DEV_E610_2_5G_T, IXGBE_DEV_E610_BACKPLANE, IXGBE_DEV_E610_SFP,
+    IXGBE_DEV_X540, IXGBE_DEV_X550, IXGBE_DEV_X550EM_A_1G_T, IXGBE_DEV_X550EM_A_1G_T_L,
+    IXGBE_DEV_X550EM_X, IXGBE_VENDOR, SRRCTL_BSIZE_2K, SRRCTL_DESCTYPE_ADV_ONEBUF,
 };
 
 /// In-memory register bank for fixtures: 192 KiB of BAR0 window,
@@ -74,6 +75,12 @@ fn smoke_ixgbe_pci_match_table() -> TestResult {
         IXGBE_DEV_X540,
         IXGBE_DEV_X550,
         IXGBE_DEV_X550EM_X,
+        IXGBE_DEV_X550EM_A_1G_T,
+        IXGBE_DEV_X550EM_A_1G_T_L,
+        IXGBE_DEV_E610_BACKPLANE,
+        IXGBE_DEV_E610_SFP,
+        IXGBE_DEV_E610_10G_T,
+        IXGBE_DEV_E610_2_5G_T,
     ];
     for did in want {
         let matched = registered.iter().any(|m| {
@@ -101,6 +108,24 @@ fn smoke_ixgbe_name_for_known_ids() -> TestResult {
     }
     if name_for(IXGBE_DEV_X550EM_X) != "ixgbe-x550em" {
         return TestResult::Fail("x550em name");
+    }
+    if name_for(IXGBE_DEV_X550EM_A_1G_T) != "ixgbe-x550em-a-1g-t" {
+        return TestResult::Fail("x550em-a-1g-t name");
+    }
+    if name_for(IXGBE_DEV_X550EM_A_1G_T_L) != "ixgbe-x550em-a-1g-t-l" {
+        return TestResult::Fail("x550em-a-1g-t-l name");
+    }
+    if name_for(IXGBE_DEV_E610_BACKPLANE) != "ixgbe-e610-backplane" {
+        return TestResult::Fail("e610-backplane name");
+    }
+    if name_for(IXGBE_DEV_E610_SFP) != "ixgbe-e610-sfp" {
+        return TestResult::Fail("e610-sfp name");
+    }
+    if name_for(IXGBE_DEV_E610_10G_T) != "ixgbe-e610-10g-t" {
+        return TestResult::Fail("e610-10g-t name");
+    }
+    if name_for(IXGBE_DEV_E610_2_5G_T) != "ixgbe-e610-2-5g-t" {
+        return TestResult::Fail("e610-2-5g-t name");
     }
     if name_for(0xFFFF) != "ixgbe" {
         return TestResult::Fail("default name");
@@ -1218,7 +1243,8 @@ fn smoke_ixgbe_eee_capability_table() -> TestResult {
         eee_capable, DEV_E610_10G_T, DEV_E610_2_5G_T, DEV_E610_BACKPLANE, DEV_E610_SFP,
         DEV_X550EM_A_1G_T, DEV_X550EM_A_1G_T_L,
     };
-    // No in-tree device id is EEE-capable per Linux's switch.
+    // The four legacy in-tree device ids are not EEE-capable
+    // per Linux's switch; the six newer ones are.
     for did in [
         IXGBE_DEV_82599EB,
         IXGBE_DEV_X540,
@@ -1430,6 +1456,1304 @@ fn smoke_ixgbe_eee_ls_modes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_ls_modes);
+
+// ── EEE transports: HIC + SWFW semaphore + ACI (§13f) ────────────────
+
+/// Firmware-emulating bank for the HIC/ACI fixtures.
+///
+/// A plain `Vec<u32>` window (0x00000–0x85FFF, covering the
+/// ACI registers at 0x82048–0x85020) plus the firmware side
+/// of both protocols, driven by `FwMode`: on a HICR.C /
+/// PF_HICR.C write the fake answers as the firmware would
+/// (clears C, sets SV, writes the canned response), so the
+/// production transport's poll sees a real completion.
+///
+/// Read side effects are real hardware semantics, not
+/// conveniences, and need interior mutability (`RegBank`
+/// takes `read32` by shared reference): SWSM.SMBI and
+/// SWFW_SYNC.REGSMP are test-and-set on read (a clear read
+/// acquires the bit), TLPIC/RLPIC are cleared on read, and
+/// the ACI completion can be paced by PF_HICR reads (the
+/// retry fixture). All of it lives in one `UnsafeCell`
+/// block: the fake is a test-local value, never shared
+/// across tasks, so no other reference to the state can
+/// exist while a test runs it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum FwMode {
+    Normal,
+    HicNeverComplete,
+    HicBadRetStatus,
+    HicNoSv,
+    HicFwReset,
+    HicTokenRetryTwice,
+    AciNeverComplete,
+    AciBadRetval,
+    AciOpcodeMismatch,
+    AciNoSvEv,
+}
+
+struct FwFakeState {
+    regs: alloc::vec::Vec<u32>,
+    /// Canned FW-PHY response data words (values, before
+    /// the BE encoding the firmware applies on the wire).
+    hic_data: [u32; 4],
+    /// Per-activity response overrides, checked before
+    /// `hic_data`: (activity id, data words).
+    hic_script: alloc::vec::Vec<(u16, [u32; 4])>,
+    /// Canned ACI indirect-response bytes, per opcode
+    /// (written to PF_HIBA on completion). `aci_buf` is
+    /// the fallback for opcodes without a dedicated
+    /// buffer.
+    aci_buf: alloc::vec::Vec<u8>,
+    aci_caps_list: alloc::vec::Vec<u8>,
+    aci_phy_caps: alloc::vec::Vec<u8>,
+    aci_link_status: alloc::vec::Vec<u8>,
+    /// Capability-element count the fake reports for
+    /// list_dev_caps (response descriptor params word 1).
+    aci_caps_count: u32,
+    /// Response descriptor retval the fake reports.
+    aci_retval: u16,
+    /// ACI completion pacing: complete after this many
+    /// PF_HICR reads while C is set (0 = at once, on the
+    /// C write).
+    aci_complete_after: u32,
+    aci_reads: u32,
+    token_retries_left: u32,
+    token_reqs_seen: u32,
+    token_rels_seen: u32,
+    hic_activities_seen: alloc::vec::Vec<u16>,
+    last_hic_data: [u32; 4],
+    aci_opcodes_seen: alloc::vec::Vec<u16>,
+    last_aci_rd_buf: alloc::vec::Vec<u8>,
+    last_aci_rd_len: usize,
+}
+
+struct FwFakeBank {
+    state: core::cell::UnsafeCell<FwFakeState>,
+    mode: FwMode,
+}
+
+impl FwFakeBank {
+    fn new(mode: FwMode) -> Self {
+        Self {
+            state: core::cell::UnsafeCell::new(FwFakeState {
+                regs: alloc::vec![0u32; 0x86000 / 4],
+                hic_data: [0; 4],
+                hic_script: alloc::vec::Vec::new(),
+                aci_buf: alloc::vec::Vec::new(),
+                aci_caps_list: alloc::vec::Vec::new(),
+                aci_phy_caps: alloc::vec::Vec::new(),
+                aci_link_status: alloc::vec::Vec::new(),
+                aci_caps_count: 0,
+                aci_retval: 0,
+                aci_complete_after: 0,
+                aci_reads: 0,
+                token_retries_left: 0,
+                token_reqs_seen: 0,
+                token_rels_seen: 0,
+                hic_activities_seen: alloc::vec::Vec::new(),
+                last_hic_data: [0; 4],
+                aci_opcodes_seen: alloc::vec::Vec::new(),
+                last_aci_rd_buf: alloc::vec::Vec::new(),
+                last_aci_rd_len: 0,
+            }),
+            mode,
+        }
+    }
+
+    /// Shared access to the state (the fake is
+    /// single-threaded test-only; see the struct docs).
+    fn state(&self) -> &FwFakeState {
+        // SAFETY: test-local, never shared across tasks.
+        unsafe { &*self.state.get() }
+    }
+
+    /// Exclusive access to the state.
+    fn state_mut(&self) -> &mut FwFakeState {
+        // SAFETY: test-local, never shared across tasks.
+        unsafe { &mut *self.state.get() }
+    }
+
+    /// Write storage directly, with no firmware side
+    /// effect (pre-setting contention bits, clearing EN,
+    /// seeding counters).
+    fn poke(&self, offset: u64, value: u32) {
+        if offset % 4 != 0 {
+            return;
+        }
+        if let Some(slot) = self.state_mut().regs.get_mut((offset / 4) as usize) {
+            *slot = value;
+        }
+    }
+
+    fn peek(&self, offset: u64) -> u32 {
+        if offset % 4 != 0 {
+            return 0;
+        }
+        self.state()
+            .regs
+            .get((offset / 4) as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn hic_firmware_side(&self) {
+        use super::hic;
+        let st = self.state_mut();
+        if self.mode == FwMode::HicNeverComplete {
+            return;
+        }
+        let base = (hic::REG_FLEX_MNG / 4) as usize;
+        let header = st.regs[base];
+        let cmd = hic::hic_cmd(header);
+        if cmd == hic::FW_PHY_TOKEN_REQ_CMD {
+            let word1 = st.regs[base + 1];
+            let command_type = ((word1 >> 8) & 0xFF) as u8;
+            if command_type == hic::FW_PHY_TOKEN_REQ {
+                st.token_reqs_seen += 1;
+            } else {
+                st.token_rels_seen += 1;
+            }
+            let status = if self.mode == FwMode::HicTokenRetryTwice
+                && command_type == hic::FW_PHY_TOKEN_REQ
+                && st.token_retries_left > 0
+            {
+                st.token_retries_left -= 1;
+                hic::FW_PHY_TOKEN_RETRY
+            } else {
+                hic::FW_PHY_TOKEN_OK
+            };
+            // Token response: header only (no data bytes),
+            // return status in byte2, datasheet checksum.
+            let mut hb = [cmd, 0u8, status, 0u8];
+            hb[3] = hic::hic_checksum(&hb[..3]);
+            st.regs[base] = u32::from_le_bytes(hb);
+            let hicr = st.regs[(hic::REG_HICR / 4) as usize];
+            st.regs[(hic::REG_HICR / 4) as usize] = (hicr & !hic::HICR_C) | hic::HICR_SV;
+            return;
+        }
+        // FW-PHY activity: record the id and the data
+        // words (BE-decoded), then answer with the canned
+        // data (BE-encoded into RAM, as the firmware does).
+        let word1 = st.regs[base + 1];
+        let activity = (word1 >> 16) as u16;
+        st.hic_activities_seen.push(activity);
+        let mut data = [0u32; 4];
+        for i in 0..4 {
+            data[i] = st.regs[base + 2 + i].swap_bytes();
+        }
+        st.last_hic_data = data;
+        let status = if self.mode == FwMode::HicBadRetStatus {
+            0x2
+        } else {
+            hic::HIC_RET_SUCCESS
+        };
+        // The response data: the per-activity script wins,
+        // else the canned default.
+        let mut resp_data = st.hic_data;
+        for (act, d) in &st.hic_script {
+            if *act == activity {
+                resp_data = *d;
+                break;
+            }
+        }
+        let mut sum_input = alloc::vec::Vec::new();
+        sum_input.extend_from_slice(&[cmd, 16u8, status]);
+        for v in resp_data {
+            sum_input.extend_from_slice(&v.to_be_bytes());
+        }
+        let checksum = hic::hic_checksum(&sum_input);
+        let hb = [cmd, 16u8, status, checksum];
+        st.regs[base] = u32::from_le_bytes(hb);
+        for (i, v) in resp_data.iter().enumerate() {
+            st.regs[base + 1 + i] = v.swap_bytes();
+        }
+        let mut hicr = st.regs[(hic::REG_HICR / 4) as usize];
+        hicr &= !hic::HICR_C;
+        if self.mode != FwMode::HicNoSv {
+            hicr |= hic::HICR_SV;
+        }
+        st.regs[(hic::REG_HICR / 4) as usize] = hicr;
+        if self.mode == FwMode::HicFwReset {
+            let fwsts = st.regs[(hic::REG_FWSTS / 4) as usize];
+            st.regs[(hic::REG_FWSTS / 4) as usize] = fwsts | hic::FWSTS_FWRI;
+        }
+    }
+
+    fn aci_firmware_side(&self) {
+        use super::aci;
+        let st = self.state_mut();
+        let hida = (aci::REG_PF_HIDA_BASE / 4) as usize;
+        let hiba = (aci::REG_PF_HIBA_BASE / 4) as usize;
+        let mut req = [0u32; aci::ACI_DESC_DWORDS];
+        for i in 0..aci::ACI_DESC_DWORDS {
+            req[i] = st.regs[hida + i];
+        }
+        let opcode = aci::desc_opcode(&req);
+        st.aci_opcodes_seen.push(opcode);
+        // Capture an RD (host-to-firmware) buffer before
+        // the response overwrites HIBA.
+        if aci::desc_flags(&req) & aci::ACI_FLAG_RD != 0 {
+            let len = aci::desc_datalen(&req) as usize;
+            st.last_aci_rd_len = len;
+            st.last_aci_rd_buf.clear();
+            for i in 0..len.div_ceil(4) {
+                st.last_aci_rd_buf
+                    .extend_from_slice(&st.regs[hiba + i].to_le_bytes());
+            }
+            st.last_aci_rd_buf.truncate(len);
+        }
+        let mut resp = req;
+        let resp_opcode = if self.mode == FwMode::AciOpcodeMismatch {
+            0x9999
+        } else {
+            opcode
+        };
+        resp[0] =
+            ((resp_opcode as u32) << 16) | (aci::ACI_FLAG_SI as u32) | (aci::ACI_FLAG_DD as u32);
+        let retval = if self.mode == FwMode::AciBadRetval {
+            0xE
+        } else {
+            aci::ACI_RC_OK
+        };
+        // The response buffer depends on the opcode; the
+        // reported datalen is the buffer's length. Cloned
+        // so the HIBA write below does not fight the
+        // borrow.
+        let resp_buf: alloc::vec::Vec<u8> = match opcode {
+            aci::ACI_OPC_LIST_DEV_CAPS => st.aci_caps_list.clone(),
+            aci::ACI_OPC_GET_PHY_CAPS => st.aci_phy_caps.clone(),
+            aci::ACI_OPC_GET_LINK_STATUS => st.aci_link_status.clone(),
+            _ => st.aci_buf.clone(),
+        };
+        resp[1] = ((retval as u32) << 16) | (resp_buf.len() as u32);
+        if opcode == aci::ACI_OPC_LIST_DEV_CAPS {
+            resp[5] = st.aci_caps_count;
+        }
+        for (i, chunk) in resp_buf.chunks(4).enumerate() {
+            let mut b = [0u8; 4];
+            b[..chunk.len()].copy_from_slice(chunk);
+            st.regs[hiba + i] = u32::from_le_bytes(b);
+        }
+        for i in 0..aci::ACI_DESC_DWORDS {
+            st.regs[hida + i] = resp[i];
+        }
+        let mut hicr = st.regs[(aci::REG_PF_HICR / 4) as usize];
+        hicr &= !aci::PF_HICR_C;
+        if self.mode != FwMode::AciNoSvEv {
+            hicr |= aci::PF_HICR_SV;
+        }
+        st.regs[(aci::REG_PF_HICR / 4) as usize] = hicr;
+    }
+}
+
+impl super::queues::RegBank for FwFakeBank {
+    fn read32(&self, offset: u64) -> u32 {
+        use super::hic;
+        use super::regs::{REG_EEE_RLPIC, REG_EEE_TLPIC};
+        if offset % 4 != 0 {
+            return 0;
+        }
+        // SWSM.SMBI / SWFW_SYNC.REGSMP are test-and-set on
+        // read: a clear read acquires the bit (the
+        // hardware sets it as the read lands).
+        if offset == hic::REG_SWSM || offset == hic::REG_SWSM_X550EM_A {
+            let st = self.state_mut();
+            let idx = (offset / 4) as usize;
+            let v = st.regs.get(idx).copied().unwrap_or(0);
+            if v & hic::SWSM_SMBI == 0 {
+                if let Some(slot) = st.regs.get_mut(idx) {
+                    *slot = v | hic::SWSM_SMBI;
+                }
+            }
+            return v;
+        }
+        if offset == hic::REG_SWFW_SYNC || offset == hic::REG_SWFW_SYNC_X550EM_A {
+            let st = self.state_mut();
+            let idx = (offset / 4) as usize;
+            let v = st.regs.get(idx).copied().unwrap_or(0);
+            if v & hic::SWFW_REGSMP == 0 {
+                if let Some(slot) = st.regs.get_mut(idx) {
+                    *slot = v | hic::SWFW_REGSMP;
+                }
+            }
+            return v;
+        }
+        // TLPIC/RLPIC are cleared on read.
+        if offset == REG_EEE_TLPIC || offset == REG_EEE_RLPIC {
+            let st = self.state_mut();
+            let idx = (offset / 4) as usize;
+            let v = st.regs.get(idx).copied().unwrap_or(0);
+            if let Some(slot) = st.regs.get_mut(idx) {
+                *slot = 0;
+            }
+            return v;
+        }
+        // PF_HICR reads pace a pending ACI completion.
+        if offset == super::aci::REG_PF_HICR {
+            let (v, should_complete) = {
+                let st = self.state_mut();
+                let idx = (offset / 4) as usize;
+                let v = st.regs.get(idx).copied().unwrap_or(0);
+                let mut should = false;
+                if v & super::aci::PF_HICR_C != 0
+                    && self.mode != FwMode::AciNeverComplete
+                    && st.aci_complete_after > 0
+                {
+                    st.aci_reads += 1;
+                    if st.aci_reads >= st.aci_complete_after {
+                        st.aci_reads = 0;
+                        should = true;
+                    }
+                }
+                (v, should)
+            };
+            if should_complete {
+                self.aci_firmware_side();
+                return self.peek(offset);
+            }
+            return v;
+        }
+        self.peek(offset)
+    }
+
+    fn write32(&mut self, offset: u64, value: u32) {
+        use super::aci;
+        use super::hic;
+        if offset % 4 != 0 {
+            return;
+        }
+        self.poke(offset, value);
+        if offset == hic::REG_HICR && value & hic::HICR_C != 0 {
+            self.hic_firmware_side();
+        } else if offset == aci::REG_PF_HICR && value & aci::PF_HICR_C != 0 {
+            let complete_now = {
+                let st = self.state_mut();
+                st.aci_reads = 0;
+                st.aci_complete_after == 0 && self.mode != FwMode::AciNeverComplete
+            };
+            if complete_now {
+                self.aci_firmware_side();
+            }
+        }
+    }
+}
+
+fn smoke_ixgbe_eee_hic_header() -> TestResult {
+    use super::hic::{
+        hic_buf_len, hic_checksum, hic_cmd, hic_header, hic_ret_status, HIC_CHECKSUM_SKIP,
+    };
+    if hic_header(5, 20) != 0xFF00_1405 {
+        return TestResult::Fail("HIC header packing wrong");
+    }
+    if hic_cmd(0xFF00_1405) != 5 || hic_buf_len(0xFF00_1405) != 20 {
+        return TestResult::Fail("HIC header fields wrong");
+    }
+    if hic_ret_status(0x0001_1405) != 1 {
+        return TestResult::Fail("HIC ret_status field wrong");
+    }
+    if HIC_CHECKSUM_SKIP != 0xFF {
+        return TestResult::Fail("HIC skip-checksum is not 0xFF");
+    }
+    // Datasheet §10.5.3.7: the checksum makes the total sum 0.
+    if hic_checksum(&[5, 20, 0]) != 0xE7 {
+        return TestResult::Fail("HIC checksum wrong");
+    }
+    if (5u16 + 20 + 0 + 0xE7) & 0xFF != 0 {
+        return TestResult::Fail("HIC checksum does not zero the total");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_hic_header);
+
+fn smoke_ixgbe_eee_fw_phy_req_words() -> TestResult {
+    use super::hic::{build_phy_activity_req, parse_phy_activity_resp, HicError};
+    // SETUP_LINK with a realistic setup word (pause RXTX,
+    // HP + AN + EEE flag), lan 0: the six words pinned
+    // byte-for-byte (header, port/activity, four BE data
+    // words).
+    let req = build_phy_activity_req(super::eee::FW_PHY_ACT_SETUP_LINK, 0, [0x005B_0000, 0, 0, 0]);
+    if req != [0xFF00_1405, 0x0002_0000, 0x0000_5B00, 0, 0, 0] {
+        return TestResult::Fail("FW-PHY request words wrong");
+    }
+    // Response round-trip: the firmware's BE words decode
+    // back, and a non-SUCCESS return status fails.
+    let resp = [0x0001_1005u32, 0x0000_5B00, 0, 0, 0];
+    if parse_phy_activity_resp(&resp) != Ok([0x005B_0000, 0, 0, 0]) {
+        return TestResult::Fail("FW-PHY response decode wrong");
+    }
+    let bad = [0x0002_1005u32, 0, 0, 0, 0];
+    if parse_phy_activity_resp(&bad) != Err(HicError::ActivityFailed) {
+        return TestResult::Fail("FW-PHY bad ret_status not rejected");
+    }
+    if parse_phy_activity_resp(&[0u32; 4]) != Err(HicError::BadLength) {
+        return TestResult::Fail("FW-PHY short response not rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_fw_phy_req_words);
+
+fn smoke_ixgbe_eee_hic_round_trip() -> TestResult {
+    use super::hic::fw_phy_activity;
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(super::hic::REG_HICR, super::hic::HICR_EN);
+    bank.state_mut().hic_data = [0x1234_0007, 0x5678, 0, 0];
+    let deadline = narf_time::Deadline::after_ms(500);
+    let data = match fw_phy_activity(
+        &mut bank,
+        0,
+        super::eee::FW_PHY_ACT_GET_PHY_INFO,
+        [0; 4],
+        true,
+        deadline,
+    ) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("FW-PHY activity failed on a healthy fake"),
+    };
+    if data != [0x1234_0007, 0x5678, 0, 0] {
+        return TestResult::Fail("FW-PHY activity data wrong");
+    }
+    if bank.state().hic_activities_seen != [super::eee::FW_PHY_ACT_GET_PHY_INFO] {
+        return TestResult::Fail("FW-PHY activity id not seen by the fake");
+    }
+    // A semaphore still held by a previous (crashed) owner
+    // is visible in the GSSR bits the release clears.
+    if bank.peek(super::hic::REG_SWFW_SYNC_X550EM_A) & super::hic::GSSR_SW_MNG_SM != 0 {
+        return TestResult::Fail("SW_MNG bit leaked after the activity");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_hic_round_trip);
+
+fn smoke_ixgbe_eee_hic_failures() -> TestResult {
+    use super::hic::{fw_phy_activity, HicError};
+    // Bad return status: retried 50 times, then failed.
+    let mut bank = FwFakeBank::new(FwMode::HicBadRetStatus);
+    bank.poke(super::hic::REG_HICR, super::hic::HICR_EN);
+    let deadline = narf_time::Deadline::after_ms(500);
+    if fw_phy_activity(
+        &mut bank,
+        0,
+        super::eee::FW_PHY_ACT_UD_2,
+        [0; 4],
+        true,
+        deadline,
+    ) != Err(HicError::ActivityFailed)
+    {
+        return TestResult::Fail("bad ret_status not reported failed");
+    }
+    // C never clears: the poll times out (short deadline
+    // so the smoke stays fast).
+    let mut bank = FwFakeBank::new(FwMode::HicNeverComplete);
+    bank.poke(super::hic::REG_HICR, super::hic::HICR_EN);
+    let deadline = narf_time::Deadline::after_ms(10);
+    if fw_phy_activity(
+        &mut bank,
+        0,
+        super::eee::FW_PHY_ACT_UD_2,
+        [0; 4],
+        true,
+        deadline,
+    ) != Err(HicError::Timeout)
+    {
+        return TestResult::Fail("stuck C not reported as timeout");
+    }
+    // EN clear: the interface is not provided.
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(super::hic::REG_HICR, 0);
+    let deadline = narf_time::Deadline::after_ms(500);
+    if fw_phy_activity(
+        &mut bank,
+        0,
+        super::eee::FW_PHY_ACT_UD_2,
+        [0; 4],
+        true,
+        deadline,
+    ) != Err(HicError::NotEnabled)
+    {
+        return TestResult::Fail("clear EN not reported not-enabled");
+    }
+    // SV clear: completion without a valid status.
+    let mut bank = FwFakeBank::new(FwMode::HicNoSv);
+    bank.poke(super::hic::REG_HICR, super::hic::HICR_EN);
+    let deadline = narf_time::Deadline::after_ms(500);
+    if fw_phy_activity(
+        &mut bank,
+        0,
+        super::eee::FW_PHY_ACT_UD_2,
+        [0; 4],
+        true,
+        deadline,
+    ) != Err(HicError::NoStatus)
+    {
+        return TestResult::Fail("clear SV not reported no-status");
+    }
+    // FWRI set after the command: the command may have
+    // failed.
+    let mut bank = FwFakeBank::new(FwMode::HicFwReset);
+    bank.poke(super::hic::REG_HICR, super::hic::HICR_EN);
+    let deadline = narf_time::Deadline::after_ms(500);
+    if fw_phy_activity(
+        &mut bank,
+        0,
+        super::eee::FW_PHY_ACT_UD_2,
+        [0; 4],
+        true,
+        deadline,
+    ) != Err(HicError::FwReset)
+    {
+        return TestResult::Fail("set FWRI not reported firmware-reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_hic_failures);
+
+fn smoke_ixgbe_eee_swfw_sync() -> TestResult {
+    use super::hic::{
+        acquire_swfw_sync, release_swfw_sync, GSSR_SW_MNG_SM, REG_SWFW_SYNC, REG_SWSM,
+        SWFW_ACQUIRE_RETRIES,
+    };
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    if acquire_swfw_sync(
+        &mut bank,
+        REG_SWSM,
+        REG_SWFW_SYNC,
+        GSSR_SW_MNG_SM,
+        SWFW_ACQUIRE_RETRIES,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("SWFW acquire failed on a free resource");
+    }
+    if bank.peek(REG_SWFW_SYNC) & GSSR_SW_MNG_SM == 0 {
+        return TestResult::Fail("SW_MNG bit not claimed");
+    }
+    release_swfw_sync(&mut bank, REG_SWSM, REG_SWFW_SYNC, GSSR_SW_MNG_SM);
+    if bank.peek(REG_SWFW_SYNC) & GSSR_SW_MNG_SM != 0 {
+        return TestResult::Fail("SW_MNG bit not released");
+    }
+    if bank.peek(REG_SWSM) & super::hic::SWSM_SMBI != 0 {
+        return TestResult::Fail("SMBI leaked after release");
+    }
+    if bank.peek(REG_SWFW_SYNC) & super::hic::SWFW_REGSMP != 0 {
+        return TestResult::Fail("REGSMP leaked after release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_swfw_sync);
+
+fn smoke_ixgbe_eee_swfw_contention() -> TestResult {
+    use super::hic::HicError;
+    use super::hic::{
+        acquire_swfw_sync, acquire_swfw_sync_semaphore, GSSR_SW_MNG_SM, REG_SWFW_SYNC, REG_SWSM,
+        SWFW_REGSMP, SWSM_SMBI,
+    };
+    // SMBI held by another driver: the semaphore phase
+    // times out (short budget so the smoke stays fast).
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(REG_SWSM, SWSM_SMBI);
+    if acquire_swfw_sync_semaphore(&mut bank, REG_SWSM, REG_SWFW_SYNC, 5)
+        != Err(HicError::SemaphoreBusy)
+    {
+        return TestResult::Fail("held SMBI not reported busy");
+    }
+    // REGSMP held by firmware: same verdict.
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(REG_SWFW_SYNC, SWFW_REGSMP);
+    if acquire_swfw_sync_semaphore(&mut bank, REG_SWSM, REG_SWFW_SYNC, 5)
+        != Err(HicError::SemaphoreBusy)
+    {
+        return TestResult::Fail("held REGSMP not reported busy");
+    }
+    // Another SW holds the resource: the acquire exhausts
+    // its retries and the tail releases the foreign SW
+    // bits before reporting busy.
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(REG_SWFW_SYNC, GSSR_SW_MNG_SM);
+    if acquire_swfw_sync(&mut bank, REG_SWSM, REG_SWFW_SYNC, GSSR_SW_MNG_SM, 2)
+        != Err(HicError::SemaphoreBusy)
+    {
+        return TestResult::Fail("held SW_MNG bit not reported busy");
+    }
+    if bank.peek(REG_SWFW_SYNC) & GSSR_SW_MNG_SM != 0 {
+        return TestResult::Fail("foreign SW_MNG bit not released on expiry");
+    }
+    // Only the FW bit holds the resource: the force-claim
+    // tail claims the SW bit anyway (assumed FW
+    // malfunction).
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(REG_SWFW_SYNC, GSSR_SW_MNG_SM << 5);
+    if acquire_swfw_sync(&mut bank, REG_SWSM, REG_SWFW_SYNC, GSSR_SW_MNG_SM, 2).is_err() {
+        return TestResult::Fail("FW-held resource not force-claimed");
+    }
+    if bank.peek(REG_SWFW_SYNC) & GSSR_SW_MNG_SM == 0 {
+        return TestResult::Fail("force-claim did not set the SW bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_swfw_contention);
+
+fn smoke_ixgbe_eee_phy_token() -> TestResult {
+    use super::hic::{
+        acquire_swfw_sync_x550em_a, release_swfw_sync_x550em_a, GSSR_SW_MNG_SM, GSSR_TOKEN_SM,
+    };
+    let mut bank = FwFakeBank::new(FwMode::HicTokenRetryTwice);
+    bank.poke(super::hic::REG_HICR, super::hic::HICR_EN);
+    bank.state_mut().token_retries_left = 2;
+    if acquire_swfw_sync_x550em_a(&mut bank, 0, GSSR_SW_MNG_SM | GSSR_TOKEN_SM, 5).is_err() {
+        return TestResult::Fail("token acquire failed after RETRYs");
+    }
+    if bank.state().token_reqs_seen != 3 {
+        return TestResult::Fail("token RETRY count wrong");
+    }
+    release_swfw_sync_x550em_a(&mut bank, 0, GSSR_SW_MNG_SM | GSSR_TOKEN_SM);
+    if bank.state().token_rels_seen != 1 {
+        return TestResult::Fail("token not released");
+    }
+    if bank.peek(super::hic::REG_SWFW_SYNC_X550EM_A) & GSSR_SW_MNG_SM != 0 {
+        return TestResult::Fail("SW_MNG bit leaked after token release");
+    }
+    TestResult::Pass
+}
+fn smoke_ixgbe_eee_aci_desc() -> TestResult {
+    use super::aci::{
+        desc_datalen, desc_flags, desc_new, desc_opcode, desc_retval, get_link_status_desc,
+        get_phy_caps_desc, list_dev_caps_desc, restart_an_desc, set_phy_cfg_desc, should_retry,
+        ACI_FLAG_SI, ACI_OPC_GET_PHY_CAPS, ACI_OPC_LIST_DEV_CAPS, ACI_OPC_RESTART_AN,
+        ACI_OPC_SET_PHY_CFG, ACI_REPORT_ACTIVE_CFG,
+    };
+    let desc = desc_new(ACI_OPC_GET_PHY_CAPS);
+    if desc != [0x0600_2000, 0, 0, 0, 0, 0, 0, 0] {
+        return TestResult::Fail("ACI fill-default descriptor wrong");
+    }
+    if desc_opcode(&desc) != ACI_OPC_GET_PHY_CAPS
+        || desc_flags(&desc) != ACI_FLAG_SI
+        || desc_datalen(&desc) != 0
+        || desc_retval(&desc) != 0
+    {
+        return TestResult::Fail("ACI descriptor accessors wrong");
+    }
+    // get_phy_caps: param0 = report mode (+ RQM).
+    if get_phy_caps_desc(false, ACI_REPORT_ACTIVE_CFG)[4] != 0x0004_0000 {
+        return TestResult::Fail("get_phy_caps param0 wrong");
+    }
+    if get_phy_caps_desc(true, ACI_REPORT_ACTIVE_CFG)[4] != 0x0005_0000 {
+        return TestResult::Fail("get_phy_caps RQM bit wrong");
+    }
+    // set_phy_cfg: lport_num in byte0.
+    if set_phy_cfg_desc(1)[4] != 1 {
+        return TestResult::Fail("set_phy_cfg lport wrong");
+    }
+    // get_link_status: LSE_DIS (2) / LSE_ENA (3) in bytes
+    // 2–3, lport in byte0.
+    if get_link_status_desc(false, 0)[4] != 0x0002_0000
+        || get_link_status_desc(true, 1)[4] != 0x0003_0001
+    {
+        return TestResult::Fail("get_link_status cmd wrong");
+    }
+    // restart_an: LINK_RESTART always, LINK_ENABLE when
+    // the link comes up.
+    if restart_an_desc(true, 0)[4] != 0x0006_0000 || restart_an_desc(false, 2)[4] != 0x0002_0002 {
+        return TestResult::Fail("restart_an cmd wrong");
+    }
+    if desc_opcode(&list_dev_caps_desc()) != ACI_OPC_LIST_DEV_CAPS {
+        return TestResult::Fail("list_dev_caps opcode wrong");
+    }
+    if !should_retry(ACI_OPC_GET_PHY_CAPS)
+        || !should_retry(ACI_OPC_GET_LINK_STATUS)
+        || should_retry(ACI_OPC_SET_PHY_CFG)
+        || should_retry(ACI_OPC_RESTART_AN)
+    {
+        return TestResult::Fail("ACI retry-opcode table wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_aci_desc);
+
+/// Build the 560-byte get_phy_caps response the fake
+/// returns: the fields the EEE path reads, at their
+/// struct offsets.
+fn eee_phy_caps_bytes() -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec![0u8; super::aci::PHY_CAPS_DATA_LEN];
+    buf[0..8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+    buf[8..16].copy_from_slice(&0x99AA_BBCC_DDEE_FF00u64.to_le_bytes());
+    buf[16] = 0x1F;
+    buf[17] = 0x02;
+    buf[18..20].copy_from_slice(&0x1804u16.to_le_bytes());
+    buf[20..22].copy_from_slice(&0x0010u16.to_le_bytes());
+    buf[34] = 0x03;
+    buf[35] = 0x01;
+    buf[42..44].copy_from_slice(&0x1234u16.to_le_bytes());
+    buf
+}
+
+fn smoke_ixgbe_eee_aci_round_trip() -> TestResult {
+    use super::aci::{
+        aci_send_cmd, desc_datalen, desc_flags, desc_retval, get_link_status_desc,
+        get_phy_caps_desc, parse_link_status, parse_phy_caps, AciBuf, ACI_FLAG_BUF, ACI_FLAG_LB,
+        ACI_REPORT_ACTIVE_CFG, LINK_STATUS_DATA_LEN, PHY_CAPS_DATA_LEN,
+    };
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(super::aci::REG_PF_HICR, super::aci::PF_HICR_EN);
+    bank.state_mut().aci_phy_caps = eee_phy_caps_bytes();
+    let mut buf = alloc::vec![0u8; PHY_CAPS_DATA_LEN];
+    let mut desc = get_phy_caps_desc(false, ACI_REPORT_ACTIVE_CFG);
+    let mut wrapper = AciBuf {
+        data: &mut buf,
+        len: PHY_CAPS_DATA_LEN,
+        host_to_fw: false,
+    };
+    let sync = narf_time::Deadline::after_ms(50);
+    let async_d = narf_time::Deadline::after_ms(50);
+    if aci_send_cmd(&mut bank, &mut desc, Some(&mut wrapper), sync, async_d).is_err() {
+        return TestResult::Fail("get_phy_caps failed on a healthy fake");
+    }
+    if desc_datalen(&desc) != PHY_CAPS_DATA_LEN as u16
+        || desc_retval(&desc) != 0
+        || desc_flags(&desc) & (ACI_FLAG_BUF | ACI_FLAG_LB) != (ACI_FLAG_BUF | ACI_FLAG_LB)
+    {
+        return TestResult::Fail("get_phy_caps response descriptor wrong");
+    }
+    let pcaps = match parse_phy_caps(&buf) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("get_phy_caps parse failed"),
+    };
+    if pcaps.phy_type_low != 0x1122_3344_5566_7788
+        || pcaps.phy_type_high != 0x99AA_BBCC_DDEE_FF00
+        || pcaps.caps != 0x1F
+        || pcaps.eee_cap != 0x1804
+        || pcaps.eee_entry_delay != 0x1234
+    {
+        return TestResult::Fail("get_phy_caps fields wrong");
+    }
+    // get_link_status: 32-byte response, no LB flag.
+    let mut link = alloc::vec![0u8; LINK_STATUS_DATA_LEN];
+    link[2] = 0x41;
+    link[10..12].copy_from_slice(&0x0080u16.to_le_bytes());
+    link[14] = 0x0C;
+    bank.state_mut().aci_link_status = link;
+    let mut buf = alloc::vec![0u8; LINK_STATUS_DATA_LEN];
+    let mut desc = get_link_status_desc(false, 0);
+    let mut wrapper = AciBuf {
+        data: &mut buf,
+        len: LINK_STATUS_DATA_LEN,
+        host_to_fw: false,
+    };
+    let sync = narf_time::Deadline::after_ms(50);
+    let async_d = narf_time::Deadline::after_ms(50);
+    if aci_send_cmd(&mut bank, &mut desc, Some(&mut wrapper), sync, async_d).is_err() {
+        return TestResult::Fail("get_link_status failed on a healthy fake");
+    }
+    if desc_datalen(&desc) != LINK_STATUS_DATA_LEN as u16 || desc_flags(&desc) & ACI_FLAG_LB != 0 {
+        return TestResult::Fail("get_link_status response descriptor wrong");
+    }
+    let status = match parse_link_status(&buf) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("get_link_status parse failed"),
+    };
+    if status.link_info != 0x41 || status.eee_status != 0x0C || status.link_speed != 0x0080 {
+        return TestResult::Fail("get_link_status fields wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_aci_round_trip);
+
+fn smoke_ixgbe_eee_aci_failures() -> TestResult {
+    use super::aci::{
+        aci_execute, aci_send_cmd, get_link_status_desc, get_phy_caps_desc, AciBuf, AciError,
+        ACI_REPORT_ACTIVE_CFG, PHY_CAPS_DATA_LEN,
+    };
+    // EN clear: the interface is not enabled.
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(super::aci::REG_PF_HICR, 0);
+    let mut desc = get_link_status_desc(false, 0);
+    let sync = narf_time::Deadline::after_ms(50);
+    let async_d = narf_time::Deadline::after_ms(50);
+    if aci_send_cmd(&mut bank, &mut desc, None, sync, async_d) != Err(AciError::NotEnabled) {
+        return TestResult::Fail("clear EN not reported not-enabled");
+    }
+    // C set on entry: EBUSY, retried 3 times, then Busy.
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(
+        super::aci::REG_PF_HICR,
+        super::aci::PF_HICR_EN | super::aci::PF_HICR_C,
+    );
+    let mut desc = get_phy_caps_desc(false, ACI_REPORT_ACTIVE_CFG);
+    let mut buf = alloc::vec![0u8; PHY_CAPS_DATA_LEN];
+    let mut wrapper = AciBuf {
+        data: &mut buf,
+        len: PHY_CAPS_DATA_LEN,
+        host_to_fw: false,
+    };
+    let sync = narf_time::Deadline::after_ms(50);
+    let async_d = narf_time::Deadline::after_ms(50);
+    if aci_send_cmd(&mut bank, &mut desc, Some(&mut wrapper), sync, async_d) != Err(AciError::Busy)
+    {
+        return TestResult::Fail("set C not reported busy");
+    }
+    // C never clears: the poll times out (short deadlines
+    // so the smoke stays fast).
+    let mut bank = FwFakeBank::new(FwMode::AciNeverComplete);
+    bank.poke(super::aci::REG_PF_HICR, super::aci::PF_HICR_EN);
+    let mut desc = get_link_status_desc(false, 0);
+    let sync = narf_time::Deadline::after_ms(10);
+    let async_d = narf_time::Deadline::after_ms(10);
+    if aci_execute(&mut bank, &mut desc, None, sync, async_d) != Err(AciError::Timeout) {
+        return TestResult::Fail("stuck C not reported as timeout");
+    }
+    // Completion with neither SV nor EV set.
+    let mut bank = FwFakeBank::new(FwMode::AciNoSvEv);
+    bank.poke(super::aci::REG_PF_HICR, super::aci::PF_HICR_EN);
+    let mut desc = get_link_status_desc(false, 0);
+    let sync = narf_time::Deadline::after_ms(50);
+    let async_d = narf_time::Deadline::after_ms(50);
+    if aci_execute(&mut bank, &mut desc, None, sync, async_d) != Err(AciError::NoStatus) {
+        return TestResult::Fail("missing SV/EV not reported no-status");
+    }
+    // Non-zero retval.
+    let mut bank = FwFakeBank::new(FwMode::AciBadRetval);
+    bank.poke(super::aci::REG_PF_HICR, super::aci::PF_HICR_EN);
+    let mut desc = get_link_status_desc(false, 0);
+    let sync = narf_time::Deadline::after_ms(50);
+    let async_d = narf_time::Deadline::after_ms(50);
+    if aci_execute(&mut bank, &mut desc, None, sync, async_d) != Err(AciError::Firmware) {
+        return TestResult::Fail("non-zero retval not reported firmware error");
+    }
+    // Opcode mismatch.
+    let mut bank = FwFakeBank::new(FwMode::AciOpcodeMismatch);
+    bank.poke(super::aci::REG_PF_HICR, super::aci::PF_HICR_EN);
+    let mut desc = get_link_status_desc(false, 0);
+    let sync = narf_time::Deadline::after_ms(50);
+    let async_d = narf_time::Deadline::after_ms(50);
+    if aci_execute(&mut bank, &mut desc, None, sync, async_d) != Err(AciError::OpcodeMismatch) {
+        return TestResult::Fail("opcode mismatch not reported");
+    }
+    // Retry success: C is set on entry, the firmware
+    // finishes after a few PF_HICR reads, the second
+    // attempt succeeds.
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(
+        super::aci::REG_PF_HICR,
+        super::aci::PF_HICR_EN | super::aci::PF_HICR_C,
+    );
+    bank.state_mut().aci_complete_after = 3;
+    bank.state_mut().aci_phy_caps = eee_phy_caps_bytes();
+    let mut desc = get_phy_caps_desc(false, ACI_REPORT_ACTIVE_CFG);
+    let mut buf = alloc::vec![0u8; PHY_CAPS_DATA_LEN];
+    let mut wrapper = AciBuf {
+        data: &mut buf,
+        len: PHY_CAPS_DATA_LEN,
+        host_to_fw: false,
+    };
+    let sync = narf_time::Deadline::after_ms(50);
+    let async_d = narf_time::Deadline::after_ms(50);
+    if aci_send_cmd(&mut bank, &mut desc, Some(&mut wrapper), sync, async_d).is_err() {
+        return TestResult::Fail("EBUSY retry did not succeed");
+    }
+    if buf[42..44] != [0x34, 0x12] {
+        return TestResult::Fail("retried get_phy_caps buffer wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_aci_failures);
+
+fn smoke_ixgbe_eee_setup_link_word() -> TestResult {
+    use super::eee::{
+        fw_speed_bits, link_speeds_from_fw, pause_from_link_info, phy_info_decode, setup_link_data,
+        setup_link_is_down, EeeSpeeds, EEE_SPEED_100M, EEE_SPEED_10M, EEE_SPEED_1G,
+        FW_PHY_ACT_SETUP_LINK_PAUSE_NONE, FW_PHY_ACT_SETUP_LINK_PAUSE_RX,
+        FW_PHY_ACT_SETUP_LINK_PAUSE_RXTX, FW_PHY_ACT_SETUP_LINK_PAUSE_TX,
+    };
+    // Pause RXTX + autoneg 10/100/1G + EEE advertised:
+    // 0x30000 | 0x7 | HP | AN | EEE.
+    let word = setup_link_data(
+        EeeSpeeds(EEE_SPEED_100M | EEE_SPEED_1G),
+        FW_PHY_ACT_SETUP_LINK_PAUSE_RXTX,
+        EeeSpeeds(EEE_SPEED_10M | EEE_SPEED_100M | EEE_SPEED_1G),
+    );
+    if word != [0x005B_0007, 0, 0, 0] {
+        return TestResult::Fail("setup-link word wrong");
+    }
+    // No EEE advertised: no EEE flag, HP + AN still set.
+    let word = setup_link_data(
+        EeeSpeeds::EMPTY,
+        FW_PHY_ACT_SETUP_LINK_PAUSE_NONE,
+        EeeSpeeds::EMPTY,
+    );
+    if word != [0x0048_0000, 0, 0, 0] {
+        return TestResult::Fail("setup-link word without EEE wrong");
+    }
+    if pause_from_link_info((1 << 20) | (1 << 21)) != FW_PHY_ACT_SETUP_LINK_PAUSE_RXTX
+        || pause_from_link_info(1 << 20) != FW_PHY_ACT_SETUP_LINK_PAUSE_TX
+        || pause_from_link_info(1 << 21) != FW_PHY_ACT_SETUP_LINK_PAUSE_RX
+        || pause_from_link_info(0) != FW_PHY_ACT_SETUP_LINK_PAUSE_NONE
+    {
+        return TestResult::Fail("pause decode wrong");
+    }
+    let phy = phy_info_decode([0x1234_0007, 0x5678, 0, 0]);
+    if phy.speeds_supported != EeeSpeeds(EEE_SPEED_10M | EEE_SPEED_100M | EEE_SPEED_1G)
+        || phy.autoneg_advertised != phy.speeds_supported
+        || phy.phy_id != 0x1234_5670
+    {
+        return TestResult::Fail("GET_PHY_INFO decode wrong");
+    }
+    if fw_speed_bits(EeeSpeeds(EEE_SPEED_10M | EEE_SPEED_1G)) != 0x5
+        || link_speeds_from_fw(0x5) != EeeSpeeds(EEE_SPEED_10M | EEE_SPEED_1G)
+    {
+        return TestResult::Fail("FW speed-bit map wrong");
+    }
+    if !setup_link_is_down(1) || setup_link_is_down(0) || setup_link_is_down(0x3) {
+        return TestResult::Fail("RSP_DOWN check wrong (equality, not bit test)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_setup_link_word);
+
+fn smoke_ixgbe_eee_configure_fw_phy() -> TestResult {
+    use super::eee::{configure_fw_phy, EeeSpeeds, EEE_SPEED_100M, EEE_SPEED_1G};
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(super::hic::REG_HICR, super::hic::HICR_EN);
+    bank.state_mut().hic_script = alloc::vec![
+        (
+            super::eee::FW_PHY_ACT_GET_PHY_INFO,
+            [0x1234_0007, 0x5678, 0, 0]
+        ),
+        (super::eee::FW_PHY_ACT_GET_LINK_INFO, [0x0030_0000, 0, 0, 0]),
+    ];
+    let state = match configure_fw_phy(&mut bank, 0, true) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("configure_fw_phy failed on a healthy fake"),
+    };
+    if state.supported != EeeSpeeds(EEE_SPEED_100M | EEE_SPEED_1G)
+        || state.advertised != state.supported
+        || !state.enabled()
+        || state.tx_lpi_timer != 0
+    {
+        return TestResult::Fail("configure_fw_phy state wrong");
+    }
+    if bank.state().hic_activities_seen
+        != [
+            super::eee::FW_PHY_ACT_GET_PHY_INFO,
+            super::eee::FW_PHY_ACT_GET_LINK_INFO,
+            super::eee::FW_PHY_ACT_SETUP_LINK,
+        ]
+    {
+        return TestResult::Fail("configure_fw_phy activity sequence wrong");
+    }
+    // The setup-link word: pause RXTX (from GET_LINK_INFO
+    // FC_TX|FC_RX) + autoneg 10/100/1G + HP + AN + EEE.
+    if bank.state().last_hic_data != [0x005B_0007, 0, 0, 0] {
+        return TestResult::Fail("configure_fw_phy setup-link word wrong");
+    }
+    // Disabling clears the advertised set and the EEE flag.
+    let state = match configure_fw_phy(&mut bank, 0, false) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("configure_fw_phy disable failed"),
+    };
+    if state.enabled() || !state.advertised.is_empty() {
+        return TestResult::Fail("configure_fw_phy disable did not clear advertised");
+    }
+    if bank.state().last_hic_data != [0x004B_0007, 0, 0, 0] {
+        return TestResult::Fail("configure_fw_phy disable setup-link word wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_configure_fw_phy);
+
+fn smoke_ixgbe_eee_status_fw_phy() -> TestResult {
+    use super::eee::{
+        status_fw_phy, EeeSpeeds, EeeState, EEE_SPEED_100M, EEE_SPEED_1G, LP_1000BASE_T,
+        LP_100BASE_T,
+    };
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(super::hic::REG_HICR, super::hic::HICR_EN);
+    bank.state_mut().hic_script = alloc::vec![
+        (
+            super::eee::FW_PHY_ACT_GET_PHY_INFO,
+            [0x1234_0007, 0x5678, 0, 0]
+        ),
+        (super::eee::FW_PHY_ACT_UD_2, [0x6, 0, 0, 0]),
+    ];
+    // No stored state: identification defaults, then the
+    // UD_2 partner modes (100M + 1G) activate it.
+    let state = match status_fw_phy(&mut bank, 0, None) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("status_fw_phy failed on a healthy fake"),
+    };
+    if state.supported != EeeSpeeds(EEE_SPEED_100M | EEE_SPEED_1G)
+        || !state.enabled()
+        || !state.active()
+        || state.tx_lpi_timer != 0
+    {
+        return TestResult::Fail("status_fw_phy state wrong");
+    }
+    if state.lp_advertised.0 != (LP_100BASE_T | LP_1000BASE_T) {
+        return TestResult::Fail("status_fw_phy partner modes wrong");
+    }
+    if bank.state().hic_activities_seen
+        != [
+            super::eee::FW_PHY_ACT_GET_PHY_INFO,
+            super::eee::FW_PHY_ACT_UD_2,
+        ]
+    {
+        return TestResult::Fail("status_fw_phy activity sequence wrong");
+    }
+    // With a stored (disabled) state: no re-identification,
+    // and a disabled advertisement stays inactive.
+    let stored = EeeState::new(EeeSpeeds(EEE_SPEED_100M | EEE_SPEED_1G), EeeSpeeds::EMPTY);
+    bank.state_mut().hic_activities_seen.clear();
+    let state = match status_fw_phy(&mut bank, 0, Some(stored)) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("status_fw_phy with stored state failed"),
+    };
+    if bank.state().hic_activities_seen != [super::eee::FW_PHY_ACT_UD_2] {
+        return TestResult::Fail("status_fw_phy re-identified needlessly");
+    }
+    if state.active() {
+        return TestResult::Fail("disabled state wrongly active");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_status_fw_phy);
+
+/// Build the 4096-byte list_dev_caps response the fake
+/// returns: `elements` of (cap id, number) pairs.
+fn eee_caps_list_bytes(elements: &[(u16, u32)]) -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec![0u8; super::aci::ACI_MAX_BUFFER_SIZE];
+    for (i, (cap, number)) in elements.iter().enumerate() {
+        let off = i * 32;
+        buf[off..off + 2].copy_from_slice(&cap.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&number.to_le_bytes());
+    }
+    buf
+}
+
+fn smoke_ixgbe_eee_configure_e610() -> TestResult {
+    use super::aci::ACI_MAX_BUFFER_SIZE;
+    use super::eee::{
+        configure_e610, EeeLiveError, EeeSpeeds, EEE_SPEED_10G, EEE_SPEED_2_5G, EEE_SPEED_5G,
+    };
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(super::aci::REG_PF_HICR, super::aci::PF_HICR_EN);
+    bank.state_mut().aci_caps_list = eee_caps_list_bytes(&[(0x0001, 5), (0x009B, 1), (0x0002, 3)]);
+    bank.state_mut().aci_caps_count = 3;
+    bank.state_mut().aci_phy_caps = eee_phy_caps_bytes();
+    let mut caps_buf = alloc::vec![0u8; ACI_MAX_BUFFER_SIZE];
+    let state = match configure_e610(&mut bank, 0, IXGBE_DEV_E610_10G_T, true, &mut caps_buf) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("configure_e610 failed on a healthy fake"),
+    };
+    if state.supported != EeeSpeeds(EEE_SPEED_2_5G | EEE_SPEED_5G | EEE_SPEED_10G)
+        || state.advertised != state.supported
+        || !state.enabled()
+        || state.tx_lpi_timer != 0x1234
+    {
+        return TestResult::Fail("configure_e610 state wrong");
+    }
+    if bank.state().aci_opcodes_seen
+        != [
+            super::aci::ACI_OPC_LIST_DEV_CAPS,
+            super::aci::ACI_OPC_GET_PHY_CAPS,
+            super::aci::ACI_OPC_SET_PHY_CFG,
+            super::aci::ACI_OPC_RESTART_AN,
+        ]
+    {
+        return TestResult::Fail("configure_e610 ACI sequence wrong");
+    }
+    // The set_phy_cfg buffer the fake received: copied
+    // PHY type, caps masked to 0xEF with LINK +
+    // AUTO_LINK_UPDT, eee_cap for {2.5G,5G,10G}, the
+    // entry delay, 26 bytes.
+    let rd = &bank.state().last_aci_rd_buf;
+    if bank.state().last_aci_rd_len != 26
+        || u64::from_le_bytes(rd[0..8].try_into().unwrap()) != 0x1122_3344_5566_7788
+        || u64::from_le_bytes(rd[8..16].try_into().unwrap()) != 0x99AA_BBCC_DDEE_FF00
+        || rd[16] != 0x2F
+        || u16::from_le_bytes(rd[18..20].try_into().unwrap()) != 0x1804
+        || u16::from_le_bytes(rd[24..26].try_into().unwrap()) != 0x1234
+    {
+        return TestResult::Fail("configure_e610 set_phy_cfg buffer wrong");
+    }
+    // Disabling: advertised clears, eee_cap 0, timer 0.
+    let state = match configure_e610(&mut bank, 0, IXGBE_DEV_E610_10G_T, false, &mut caps_buf) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("configure_e610 disable failed"),
+    };
+    if state.enabled() || state.tx_lpi_timer != 0 {
+        return TestResult::Fail("configure_e610 disable state wrong");
+    }
+    if u16::from_le_bytes(bank.state().last_aci_rd_buf[18..20].try_into().unwrap()) != 0 {
+        return TestResult::Fail("configure_e610 disable eee_cap not zero");
+    }
+    // No EEE support in the device caps: not capable.
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(super::aci::REG_PF_HICR, super::aci::PF_HICR_EN);
+    bank.state_mut().aci_caps_list = eee_caps_list_bytes(&[(0x0001, 5), (0x0002, 3)]);
+    bank.state_mut().aci_caps_count = 2;
+    let mut caps_buf = alloc::vec![0u8; ACI_MAX_BUFFER_SIZE];
+    if configure_e610(&mut bank, 0, IXGBE_DEV_E610_10G_T, true, &mut caps_buf)
+        != Err(EeeLiveError::NotCapable)
+    {
+        return TestResult::Fail("E610 without eee_support not reported incapable");
+    }
+    // EEE element present but number 0: also incapable.
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(super::aci::REG_PF_HICR, super::aci::PF_HICR_EN);
+    bank.state_mut().aci_caps_list = eee_caps_list_bytes(&[(0x009B, 0)]);
+    bank.state_mut().aci_caps_count = 1;
+    let mut caps_buf = alloc::vec![0u8; ACI_MAX_BUFFER_SIZE];
+    if configure_e610(&mut bank, 0, IXGBE_DEV_E610_10G_T, true, &mut caps_buf)
+        != Err(EeeLiveError::NotCapable)
+    {
+        return TestResult::Fail("E610 with zero eee_support not reported incapable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_configure_e610);
+
+fn smoke_ixgbe_eee_status_e610() -> TestResult {
+    use super::eee::{
+        status_e610, EeeSpeeds, EeeState, EEE_SPEED_10G, EEE_SPEED_2_5G, EEE_SPEED_5G,
+    };
+    let mut bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(super::aci::REG_PF_HICR, super::aci::PF_HICR_EN);
+    let mut link = alloc::vec![0u8; super::aci::LINK_STATUS_DATA_LEN];
+    link[2] = 0x41;
+    link[10..12].copy_from_slice(&0x0080u16.to_le_bytes());
+    link[14] = 0x0C;
+    bank.state_mut().aci_link_status = link;
+    bank.state_mut().aci_phy_caps = eee_phy_caps_bytes();
+    // No stored state: defaults, firmware enabled+active,
+    // timer from the entry delay.
+    let state = match status_e610(&mut bank, 0, IXGBE_DEV_E610_10G_T, None) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("status_e610 failed on a healthy fake"),
+    };
+    if state.supported != EeeSpeeds(EEE_SPEED_2_5G | EEE_SPEED_5G | EEE_SPEED_10G)
+        || !state.enabled()
+        || !state.active()
+        || state.tx_lpi_timer != 0x1234
+        || state.fw_active != Some(true)
+    {
+        return TestResult::Fail("status_e610 state wrong");
+    }
+    if bank.state().aci_opcodes_seen
+        != [
+            super::aci::ACI_OPC_GET_LINK_STATUS,
+            super::aci::ACI_OPC_GET_PHY_CAPS,
+        ]
+    {
+        return TestResult::Fail("status_e610 ACI sequence wrong");
+    }
+    // Firmware reports disabled: the model syncs (the
+    // advertised set clears, no PHY-caps query, timer 0).
+    let mut link = alloc::vec![0u8; super::aci::LINK_STATUS_DATA_LEN];
+    link[14] = 0x00;
+    bank.state_mut().aci_link_status = link;
+    bank.state_mut().aci_opcodes_seen.clear();
+    let stored = EeeState::new(
+        EeeSpeeds(EEE_SPEED_2_5G | EEE_SPEED_5G | EEE_SPEED_10G),
+        EeeSpeeds(EEE_SPEED_2_5G | EEE_SPEED_5G | EEE_SPEED_10G),
+    );
+    let state = match status_e610(&mut bank, 0, IXGBE_DEV_E610_10G_T, Some(stored)) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("status_e610 disabled report failed"),
+    };
+    if state.enabled()
+        || state.active()
+        || state.tx_lpi_timer != 0
+        || state.fw_active != Some(false)
+    {
+        return TestResult::Fail("status_e610 disabled sync wrong");
+    }
+    if bank.state().aci_opcodes_seen != [super::aci::ACI_OPC_GET_LINK_STATUS] {
+        return TestResult::Fail("status_e610 queried PHY caps while disabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_status_e610);
+
+fn smoke_ixgbe_eee_lpi_status() -> TestResult {
+    use super::eee::lpi_status_read;
+    use super::regs::{
+        EEE_STAT_EEE_NEG, EEE_STAT_RX_LPI_STATUS, EEE_STAT_TX_LPI_STATUS, REG_EEE_RLPIC,
+        REG_EEE_STAT, REG_EEE_TLPIC,
+    };
+    let mut bank = FakeBank::new();
+    bank.write32(
+        REG_EEE_STAT,
+        EEE_STAT_EEE_NEG | EEE_STAT_RX_LPI_STATUS | EEE_STAT_TX_LPI_STATUS,
+    );
+    bank.write32(REG_EEE_TLPIC, 7);
+    bank.write32(REG_EEE_RLPIC, 3);
+    let status = lpi_status_read(&bank);
+    if !status.negotiated || !status.rx_lpi || !status.tx_lpi {
+        return TestResult::Fail("LPI status bits wrong");
+    }
+    if status.tx_lpi_count != 7 || status.rx_lpi_count != 3 {
+        return TestResult::Fail("LPI counters wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_lpi_status);
+
+fn smoke_ixgbe_eee_lpi_read_clear() -> TestResult {
+    use super::eee::lpi_status_read;
+    use super::regs::{REG_EEE_RLPIC, REG_EEE_STAT, REG_EEE_TLPIC};
+    let bank = FwFakeBank::new(FwMode::Normal);
+    bank.poke(REG_EEE_STAT, 0xE000_0000);
+    bank.poke(REG_EEE_TLPIC, 7);
+    bank.poke(REG_EEE_RLPIC, 3);
+    let first = lpi_status_read(&bank);
+    if first.tx_lpi_count != 7 || first.rx_lpi_count != 3 {
+        return TestResult::Fail("LPI first-read counters wrong");
+    }
+    let second = lpi_status_read(&bank);
+    if second.tx_lpi_count != 0 || second.rx_lpi_count != 0 {
+        return TestResult::Fail("LPI counters not cleared on read");
+    }
+    if !second.negotiated || !second.rx_lpi || !second.tx_lpi {
+        return TestResult::Fail("LPI status bits cleared by the counter read");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_lpi_read_clear);
+
+fn smoke_ixgbe_eee_regs() -> TestResult {
+    use super::regs::{
+        EEER_EEE_FRC_AN, EEER_RX_LPI_EN, EEER_TW_SYSTEM_MASK, EEER_TX_LPI_EN, EEE_STAT_EEE_NEG,
+        EEE_STAT_RX_LPI_STATUS, EEE_STAT_TX_LPI_STATUS, EEE_SU_DTW_MIN_MASK, EEE_SU_TEEE_DLY_MASK,
+        EEE_SU_TW_WAKE_MIN_MASK, EEE_SU_TX_LU_LPI_DLY_MASK, REG_EEER, REG_EEE_RLPIC, REG_EEE_STAT,
+        REG_EEE_SU, REG_EEE_TLPIC,
+    };
+    if REG_EEE_TLPIC != 0x41F4
+        || REG_EEE_RLPIC != 0x41F8
+        || REG_EEE_SU != 0x4380
+        || REG_EEE_STAT != 0x4398
+        || REG_EEER != 0x43A0
+    {
+        return TestResult::Fail("EEE register addresses wrong");
+    }
+    if EEE_STAT_EEE_NEG != (1 << 29)
+        || EEE_STAT_RX_LPI_STATUS != (1 << 30)
+        || EEE_STAT_TX_LPI_STATUS != (1 << 31)
+    {
+        return TestResult::Fail("EEE_STAT bits wrong");
+    }
+    if EEER_TX_LPI_EN != (1 << 16) || EEER_RX_LPI_EN != (1 << 17) || EEER_EEE_FRC_AN != (1 << 28) {
+        return TestResult::Fail("EEER bits wrong");
+    }
+    if EEER_TW_SYSTEM_MASK != 0xFFFF
+        || EEE_SU_DTW_MIN_MASK != 0xFF
+        || EEE_SU_TW_WAKE_MIN_MASK != 0x003F_0000
+        || EEE_SU_TX_LU_LPI_DLY_MASK != 0x0300_0000
+        || EEE_SU_TEEE_DLY_MASK != 0xFC00_0000
+    {
+        return TestResult::Fail("EEE_SU/EEER field masks wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_regs);
 
 // ── Flow Director ────────────────────────────────────────────────────
 

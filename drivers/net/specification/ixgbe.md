@@ -651,7 +651,7 @@ implemented (re-probe restores non-DCB mode).
 Lettering note: §13d anticipates #1398's §13b (VMDq) and
 #1400's §13c (FlowDirector), so the three sections merge
 cleanly regardless of landing order.
-## 13f. EEE control/status (Linux model, no MAC registers)
+## 13f. EEE control/status (X550 MAC registers datasheet-grounded; FW-PHY/ACI live paths)
 
 EEE in Linux ixgbe has no MAC register programming: `get_eee`
 returns `-EOPNOTSUPP` unless the device is EEE-capable AND its
@@ -660,16 +660,19 @@ PHY is firmware-controlled. The driver-side model lives in
 `LpModes`, `EeeState`, `EeeStatus`, `EeeRequest`,
 `validate_request`), wired as `Ixgbe::configure_eee` /
 `Ixgbe::eee_status` / `Ixgbe::eee_capable` with stored state
-in `eee_state`:
+in `eee_state`, plus live paths in `hic.rs` (host-interface
+transport + SW/FW sync + PHY token) and `aci.rs` (ACI
+transport):
 
 - Capability gate, exactly Linux's `ixgbe_set_eee_capable`
   switch: only X550EM_A_1G_T (0x15E4), X550EM_A_1G_T_L
   (0x15E5), and E610_BACKPLANE (0x57AE), E610_SFP (0x57AF),
-  E610_10G_T (0x57B0), E610_2_5G_T (0x57B1) are capable. No
-  in-tree device id (82599EB, X540, X550, X550EM_X — note
-  X550EM_X 0x15AB is a different part from X550EM_A_1G_T)
-  is capable, so `configure_eee` returns `UnsupportedDevice`
-  on every in-tree part today.
+  E610_10G_T (0x57B0), E610_2_5G_T (0x57B1) are capable.
+  All six are now in the probe table (`ALL_DEV_IDS` +
+  `name_for`); `Ixgbe::lan_id` is the PCI function
+  (Linux `ixgbe_set_lan_id_multi_port_pcie`: lan_id =
+  bus.func; Mmio → 0), needed by the FW-PHY port field
+  and the ACI lport field.
 - Enable semantics (Linux `set_eee`): enabled stores
   advertised = supported, disabled stores advertised = empty.
   Validation (Linux `validate_keee`, in check order):
@@ -688,22 +691,111 @@ in `eee_state`:
   100M/1G map to nothing. E610 defaults: 2.5G_T →
   {2.5G}, other E610 → {2.5G, 5G, 10G}.
 
-⚠️ Datasheet grounding NOT met (see the `eee.rs` header):
-no 82599/X540/X550 datasheet copy exists locally; every
-value here is Linux-transcribed. Re-grounding stays a
-follow-up, and the maintainer may bounce this section on
-that ground alone.
+### Datasheet grounding — MET for the X550 MAC block
 
-Remainders: the FW-PHY activity transport (host-interface
-command) and the ACI transport do not exist in-tree, so
-live link-partner queries and live re-application after a
-set (Linux resets the link; the setup-link activity carries
-`FW_PHY_ACT_SETUP_LINK_EEE` BIT(20)) are follow-ups, as is
-landing X550EM_A / E610 device support so any part can
-actually enable EEE. `EthtoolInfo` is unchanged: the
-snapshot cannot populate EEE state from hardware without
-those transports, so EEE status is reported through
-`eee_status()`, not the snapshot.
+- 82599 Datasheet rev. 2.6: **no EEE at all** — zero
+  matches for "Energy Efficient Ethernet", "Low Power
+  Idle", "802.3az", "LPI" in the full text; the implemented
+  spec list cites IEEE 802.3-2005, which predates
+  802.3az. The 82599 MAC has no EEE/LPI registers; EEE
+  would be external-PHY via MDIO Clause 45.
+- X550 Datasheet rev. 2.7, §5.3.6 + Table 8-26: the EEE
+  register block is TLPIC 0x000041F4 (Tx LPI entry
+  counter, read-clear), RLPIC 0x000041F8 (Rx LPI entry
+  counter, read-clear), EEE_SU 0x00004380 (DTW_MIN 7:0,
+  TW_WAKE_MIN 21:16, TX_LU_LPI_DLY 25:24, TEEE_DLY
+  31:26), EEE_STAT 0x00004398 (EEE_NEG bit 29, RX_LPI
+  bit 30, TX_LPI bit 31, all RO), EEER 0x000043A0
+  (TW_SYSTEM 15:0, TX_LPI_EN bit 16, RX_LPI_EN bit 17,
+  EEE_FRC_AN bit 28). Tx LPI entry/exit, auto-neg
+  next-page (Annex 73A), and LLDP Tw update are §5.3.6.1–
+  §5.3.6.4. These registers are in `regs.rs` (EEE section)
+  and read by `lpi_status_read` (gated to DID 0x1563,
+  plain X550 — the only part the X550 datasheet covers).
+- X550 Specification Update errata: "Energy Efficient
+  Ethernet (EEE) is not enabled in the X550. The X550
+  does not negotiate to or transition to EEE mode with a
+  EEE-capable link partner." So the X550 MAC registers
+  exist but the feature is errata-disabled; Linux never
+  programs EEER, and neither does this driver — the live
+  paths are FW-PHY (X550EM_A 1G_T) and ACI (E610).
+- X540: no MAC EEE registers found; Intel ARK for
+  X540-BT2 lists Ethernet Power Management: No; Linux
+  does not include X540 in `ixgbe_set_eee_capable`.
+- Host-interface transport, 82599 §10.5.3 + X550
+  §11.8.2.1: control register HICR 0x15F00 (EN bit 0, C
+  bit 1, SV bit 2), data RAM 0x15800–0x15EFF, flow
+  (check EN → write command block → set C → poll C
+  cleared → SV ⇒ valid status), command/status header
+  (cmd, buf_len, ret_status, checksum; 8-bit inverse
+  checksum summing to 0; buf_len 0xFF means the firmware
+  does not check the checksum). `hic.rs` implements this
+  flow with a 500 ms deadline.
+- ⚠️ `FORCE_TLPI` has **no defined bit position**: it
+  appears only in X550 §5.3.6.1 functional text; the
+  EEER bit table has no FORCE_TLPI bit. It is NOT
+  programmed; this is a recorded remainder, not a guess.
+
+### Live paths (fixture-validated)
+
+- `configure_fw_phy` (X550EM_A 1G_T/L): GET_PHY_INFO →
+  GET_LINK_INFO pause decode (NONE fallback) →
+  SETUP_LINK activity re-apply (pause<<16 | autoneg fw
+  speed bits | HP BIT19 | AN BIT22 | EEE BIT20 iff
+  advertised non-empty; response word0 == RSP_DOWN (1)
+  → error). `status_fw_phy`: stored state or identify
+  defaults → UD_2 partner modes.
+- `configure_e610`: list_dev_caps eee_support gate →
+  get_phy_caps REPORT_ACTIVE_CFG → set_phy_cfg (caps
+  masked 0xEF, LINK + AUTO_LINK_UPDT, `aci_eee_cap`) →
+  restart_an (LINK_RESTART always, LINK_ENABLE when the
+  link comes up) → timer = eee_entry_delay when enabled.
+  `status_e610`: get_link_info (LSE_DIS) → sync
+  advertised to fw_enabled → fw_active from the ACI
+  active bit → timer from get_phy_caps when enabled.
+  `EeeState.fw_active: Option<bool>` carries the
+  firmware-reported active bit (needed because 2.5G/5G
+  have no UD_2 partner bits); None = compute from
+  advertised∩lp.
+- Link re-application after a set is the setup-link
+  activity (FW) / set_phy_cfg + restart_an (ACI) itself;
+  Linux's additional link reset is a vehicle, not an
+  extra EEE step — the NARF driver does not reset the
+  link on EEE set.
+- `eee_status_live` queries the firmware and refreshes
+  the stored snapshot; `eee_status` still returns the
+  stored snapshot. `EthtoolInfo` is unchanged: EEE
+  status is reported through `eee_status()` /
+  `eee_status_live()`, not the snapshot.
+
+### Still Linux-transcribed (no public datasheet)
+
+FWSTS 0x15F0C / FWRI BIT(9) = 0x200, HICR FW_RESET bits
+0x40/0x80, SWSM/SWFW_SYNC addresses (0x10140/0x10160,
+X550EM_a 0x15F70/0x15F78) + PHY-token command 0x0A, and
+the whole ACI surface (PF_HICR 0x82048, PF_HIDA
+0x85000, PF_HIDA_2 0x85020, PF_HIBA 0x84000, opcodes,
+descriptor layout, get/set_phy_caps and get_link_status
+field offsets) are transcribed from Linux ixgbe @
+`cbbddb6`; no public E610 datasheet was available.
+`hic.rs` / `aci.rs` label these values as such.
+NARF deviations are documented in place: ACI sync/async
+wedge deadlines 10 s / 30 s (Linux 100 s / 150 s);
+Linux's `aci_send_cmd` buffer-restore quirk (only its
+first byte is ever copied) is deliberately NOT mirrored
+(EBUSY precedes any mutation).
+
+Remainders: FORCE_TLPI bit position; X550EM_X EEER
+block presence (X550 datasheet covers X550-AT/AT2/BT2
+only); the generic 82599 SWFW acquire variant
+(SMBI+SWESMBI — no in-tree HIC user on those parts);
+non-EEE-capable X550EM_A DIDs (KR 0x15C2, KR_L 0x15C3,
+SFP_N 0x15C4, SGMII 0x15C6, SGMII_L 0x15C7, 10G_T
+0x15C8, SFP 0x15CE), E610_SGMII 0x57B2, X550T1 0x15D1,
+and VFs (0x15C5, 0x57AD) are census-only, not added to
+the probe table. The one-line `eee_lpi_status` DID gate
+in `ixgbe.rs` is review-only (no way to construct
+`Ixgbe` without hardware/BAR mapping).
 
 ## 13g. X540 WoL grounding + X550 LOM opt-in (Linux model)
 
@@ -926,10 +1018,13 @@ Per the v0.1 exclusion list, still open after this stream:
   FSO transmit path; SAN-MAC provisioning from NVM; FC-frame xid
   parsing; live consumer wiring; silicon verification.
 - EEE: model + capability gate + FW-PHY decode + ACI cap
-  computation landed (§13f); remainders are datasheet
-  re-grounding, the FW-PHY activity + ACI transports, live
-  link re-application after a set, and X550EM_A / E610
-  device support.
+  computation + X550 MAC register grounding + FW-PHY
+  activity / ACI transports + live link re-application +
+  X550EM_A / E610 device support landed (§13f).
+  Remainders: FORCE_TLPI bit position (no bit defined
+  in the X550 datasheet), X550EM_X EEER block presence,
+  the generic 82599 SWFW acquire variant, and the
+  census-only non-EEE-capable DIDs (§13f).
 - X540 / X550EM_x WoL grounding + X550 LOM opt-in — landed as
   the Linux-cap-rule model (§13g); remainders are datasheet
   re-grounding, the EEPROM word-0x2c reader, and E610/X550EM_A
