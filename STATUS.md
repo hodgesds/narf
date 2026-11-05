@@ -768,7 +768,9 @@ An unmodified alsa-lib probe exercises HDA/VirtIO playback and HDA capture
 through those syscalls, including linked pause, boundary-mode playback and
 user controls with TLV/events. The implemented ALSA contract is listed in
 [sound §3.1](drivers/sound/specification/spec.md#31-linux-alsa-pcm-and-control-abi).
-SoundWire, vendor smart-amplifier quirks and system power-transition
+SoundWire manager + codec attachment for ACP platforms is implemented
+(audio/specification/spec.md §3.2; #780 as delivered by #878, #870, #871);
+vendor smart-amplifier quirks (#776) and system power-transition
 reinitialization remain open. See
 [audio's implemented contract](audio/specification/spec.md).
 
