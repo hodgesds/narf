@@ -18,12 +18,12 @@
 //!   RW)" — "also mapped to addresses 0x05C80-0x05CA4 ... 82598."
 //! - RETA §8.2.3.7.15: "RETA[n] (0x0EB00 + 4*n / 0x05C00 + 4*n;
 //!   RW)" — "also mapped to addresses 0x05C00-0x05C7C ... 82598."
-//! Linux's shipping ixgbe programs the 0x05 block on 82599
-//! (ixgbe_type.h:376/:417/:419; used by ixgbe_main.c:4219/:4274/
-//! :4427/:4441), which is the silicon proof for the alias side.
-//! The addresses themselves come from the datasheet; Linux is
-//! cited only as the shipping cross-check for which alias to
-//! program, not as copied code.
+//!   Linux's shipping ixgbe programs the 0x05 block on 82599
+//!   (ixgbe_type.h:376/:417/:419; used by ixgbe_main.c:4219/:4274/
+//!   :4427/:4441), which is the silicon proof for the alias side.
+//!   The addresses themselves come from the datasheet; Linux is
+//!   cited only as the shipping cross-check for which alias to
+//!   program, not as copied code.
 //!
 //! Canonical choice: this module programs the 0x05 (Linux/compat)
 //! addresses. Rationale: Linux is the shipping reference on 82599
