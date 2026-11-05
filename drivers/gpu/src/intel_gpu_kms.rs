@@ -2573,6 +2573,7 @@ impl<M: Platform> Guard<'_, M> {
         if let (Some(sf), Some(psr)) = (&selective, self.state.psr.as_mut()) {
             psr.program_sel_fetch_cursor(&self.device.platform, sf);
         }
+        crate::intel_gpu_vrr::on_plane_flip(1, &self.device.platform);
         let stamp = self
             .finish_pending()
             .await?

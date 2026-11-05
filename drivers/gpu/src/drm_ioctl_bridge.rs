@@ -4207,6 +4207,14 @@ fn vrr_enabled_value(
     Ok(value != 0)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VrrRequest {
+    #[cfg(feature = "amdgpu")]
+    Amdgpu(u8, bool),
+    #[cfg(feature = "intel")]
+    Intel(u32, bool),
+}
+
 /// Commit a validated "VRR_ENABLED" value: the CRTC reports it. Returns the
 /// native display to reprogram, which the caller requests after releasing
 /// the card lock (the request takes the display owner's locks).
@@ -4215,21 +4223,17 @@ fn apply_vrr_enabled(
     card: &mut crate::drm::card::Card,
     crtc: u32,
     value: bool,
-) -> Option<(u8, bool)> {
+) -> Option<VrrRequest> {
     if let Some(slot) = card.vrr_enabled.iter_mut().find(|(id, _)| *id == crtc) {
         slot.1 = value;
     }
-    #[cfg(feature = "amdgpu")]
-    {
-        (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
-            .then(|| crate::amdgpu_native_kms::crtc_display(crtc))
-            .flatten()
-            .map(|display| (display, value))
-    }
-    #[cfg(not(feature = "amdgpu"))]
-    {
-        let _ = card_index;
-        None
+    match crate::drm_registry::driver_name(card_index) {
+        #[cfg(feature = "amdgpu")]
+        Some("amdgpu") => crate::amdgpu_native_kms::crtc_display(crtc)
+            .map(|display| VrrRequest::Amdgpu(display, value)),
+        #[cfg(feature = "intel")]
+        Some("intel-gpu") => Some(VrrRequest::Intel(crtc, value)),
+        _ => None,
     }
 }
 
@@ -4415,9 +4419,16 @@ fn handle_set_property(
         let value = vrr_enabled_value(&card, obj_id, value)?;
         let _request = apply_vrr_enabled(card_index, &mut card, obj_id, value);
         drop(card);
-        #[cfg(feature = "amdgpu")]
-        if let Some((display, enabled)) = _request {
-            crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+        match _request {
+            #[cfg(feature = "amdgpu")]
+            Some(VrrRequest::Amdgpu(display, enabled)) => {
+                crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+            }
+            #[cfg(feature = "intel")]
+            Some(VrrRequest::Intel(crtc, enabled)) => {
+                crate::intel_gpu_vrr::request_vrr_enabled(crtc, enabled);
+            }
+            _ => {}
         }
         return Ok(0);
     }
@@ -5763,7 +5774,7 @@ fn atomic_commit(
     let test_only = req.flags & TEST_ONLY != 0;
     let mut prop_index = 0usize;
     // Native VRR changes, requested once the card lock is released.
-    let mut vrr_requests: Vec<(u8, bool)> = Vec::new();
+    let mut vrr_requests: Vec<VrrRequest> = Vec::new();
     // Native CRTC color and connector Colorspace/HDR changes, likewise.
     let mut color_requests: Vec<(u8, CrtcColorRequest)> = Vec::new();
     let mut connector_requests: Vec<ConnectorColorRequest> = Vec::new();
@@ -6667,9 +6678,19 @@ fn atomic_commit(
             Some((presentations, native_presentations))
         }
     };
-    #[cfg(feature = "amdgpu")]
-    for (display, enabled) in vrr_requests {
-        crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+    for request in vrr_requests {
+        match request {
+            #[cfg(feature = "amdgpu")]
+            VrrRequest::Amdgpu(display, enabled) => {
+                crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+            }
+            #[cfg(feature = "intel")]
+            VrrRequest::Intel(crtc, enabled) => {
+                crate::intel_gpu_vrr::request_vrr_enabled(crtc, enabled);
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
     }
     #[cfg(feature = "amdgpu")]
     for (display, request) in color_requests {

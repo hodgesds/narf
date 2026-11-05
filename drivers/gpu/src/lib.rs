@@ -801,6 +801,8 @@ pub(crate) mod intel_gpu_kms;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_media;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_media_gt_sysfs;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_modeset;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_modeset_xelpg;
@@ -858,6 +860,8 @@ pub mod intel_gpu_user;
 pub mod intel_gpu_vbt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_vram;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_vrr;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_wm;
 #[cfg(feature = "intel")]

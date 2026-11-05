@@ -372,6 +372,7 @@ fn populate_card_node(
         crate::intel_gpu_error::populate_card(idx, &kobj);
         crate::intel_gpu_power_controls::populate_card(idx, &kobj);
         crate::intel_gpu_ccs_control::populate_card(idx, &kobj);
+        crate::intel_gpu_media_gt_sysfs::populate_card(idx, &kobj, Some(&dev_kobj));
     }
 
     // ── Optional AMDGPU-specific attrs ───────────────────────────────────

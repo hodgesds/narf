@@ -112,6 +112,14 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn media_gt(&self) -> Option<MediaGtStatus> {
         None
     }
+    /// Confirmed SLPC status (limits, range, profile) for the standalone media GT (GT1).
+    fn media_gt_slpc_status(&self) -> Option<crate::intel_gpu_slpc::Status> {
+        None
+    }
+    /// Accumulated MC6 residency in milliseconds for the standalone media GT (GT1).
+    fn media_gt_rc6_residency_ms(&self) -> Option<u64> {
+        None
+    }
     /// Cached physical automatic global-reset availability for this live user
     /// epoch. Default refusal; discovery alone is not a recovery owner. No I/O.
     fn reset_availability_epoch(&self) -> Option<u64> {
