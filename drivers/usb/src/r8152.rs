@@ -4536,6 +4536,8 @@ pub mod tests {
                 iface_name: alloc::format!("usb-rtl-susp{}", slot_id),
                 pump_running: true,
                 link_byte: 0xFF,
+                mtu: 1500,
+                pending_rms: None,
                 detached,
                 controller: 0,
                 hub_port,

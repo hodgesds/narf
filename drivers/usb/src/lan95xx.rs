@@ -1159,7 +1159,7 @@ const MATCHES: &[UsbClassMatch] = &[
     // internal 10/100 PHY this lane drives.
 ];
 
-fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
+fn probe(device: Arc<USBDevice>, _hub_port: Option<(u8, u8)>) -> Result<(), UsbProbeError> {
     // The registry probe is synchronous, but bind needs async
     // control transfers — spawn it (xpad precedent).
     narf_scheduler::spawn_stackful(async move {
