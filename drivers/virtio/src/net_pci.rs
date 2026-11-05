@@ -3597,7 +3597,8 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     // already told us its virtio-net link is up, so NetworkManager sees an
     // unavailable device and never starts DHCP.
     narf_net::iface::set_link_metadata(&name, link_up, None, None);
-    let iface = narf_net::virtio_net::VirtioNet::new(name, mac, mtu, link_up, tx_prod, rx_cons);
+    let iface =
+        narf_net::virtio_net::VirtioNet::new(name.clone(), mac, mtu, link_up, tx_prod, rx_cons);
     let authority = narf_net::bootstrap_authority();
     // Registration failure leaks the iface (returned by-value into
     // the registry would have moved it) — we constructed it above
