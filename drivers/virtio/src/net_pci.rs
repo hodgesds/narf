@@ -1847,9 +1847,11 @@ impl VirtioNetPci {
         // count from VQ_PAIRS_SET already stands and software
         // affinity keeps working. Best-effort like VQ_PAIRS_SET: a
         // refused config only costs steering, never the device
-        // (all pairs still deliver to the same Interface; a flow
-        // landing on a non-pair-0 forwarder just bypasses software
-        // GRO, the gap-9 limitation MQ already has). The pair
+        // (all pairs still deliver to the same Interface, and
+        // every pair of the primary controller feeds software
+        // GRO through its synchronous tap — #1533: the audit's
+        // gap-9 "pair-0-only GRO" reading misread the
+        // controller-`idx` gate). The pair
         // count programmed is the LIVE count (`this.pairs.len()`),
         // not the pre-truncation request, so a refused pairs-set
         // that truncated to pair 0 cannot resurrect dead pairs
@@ -3661,9 +3663,9 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
         // GSO super-frame, and `tx_header_for_frame` validates it again at the
         // hardware boundary.
         narf_net::iface::set_offloads(name, offloads);
-        // The primary RX forwarder drains complete bursts and calls
-        // `gro_flush` before it parks, so this interface can safely opt into
-        // the stack's per-interface software GRO path.
+        // Every RX forwarder of the primary controller drains complete
+        // bursts and calls `gro_flush` before it parks, so this interface
+        // can safely opt into the stack's per-interface software GRO path.
         let _ = narf_net::iface::set_software_gro(name, true);
         // Publish the clamped probe MTU to the legacy registry so
         // the stack segments at the MTU the driver enforces (the
@@ -3954,11 +3956,14 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                     }
                     // NAPI-complete for this pair: the RX ring drained this round,
                     // so flush any TCP segments GRO coalesced for the frames just
-                    // delivered. Only pair/idx 0 feeds GRO (it owns the synchronous
-                    // tap into the stack), so only it needs draining. This runs on
-                    // the forwarder's own CPU — the same CPU the offers ran on — so
-                    // it drains that CPU's per-CPU coalescer. No-op when that CPU
-                    // holds no GRO flows.
+                    // delivered. Every pair of the primary controller feeds GRO
+                    // (each forwarder owns the synchronous tap into the stack),
+                    // so every forwarder flushes its own CPU's table. `idx` here
+                    // is the controller index, not the pair index (#1533: the
+                    // audit's gap-9 "pair-0-only GRO" reading misread this gate).
+                    // This runs on the forwarder's own CPU — the same CPU the
+                    // offers ran on — so it drains that CPU's per-CPU coalescer.
+                    // No-op when that CPU holds no GRO flows.
                     if idx == 0 {
                         narf_net::tcp_stack::gro_flush();
                     }
