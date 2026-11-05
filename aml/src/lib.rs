@@ -123,7 +123,58 @@ pub enum AmlError {
     /// the boot-time `_PIC` opt-in) can silently skip an absent
     /// method instead of treating it as a parse failure.
     MethodNotFound,
+    /// An AML recursion budget was exhausted: nested method-call
+    /// depth, in-method TermArg / TermList nesting, namespace-build
+    /// nesting, or predicate-skip nesting (see the `MAX_*` bounds
+    /// below). Fail-closed: the evaluation aborts and the caller
+    /// must treat the method as unevaluated, never as a default
+    /// value. SEC-F1 (#1289).
+    RecursionDepthExceeded,
 }
+
+/// Recursion budgets for AML evaluation and namespace build
+/// (SEC-F1, #1289).
+///
+/// ACPI 6.5 §5.7.5 leaves the maximum method-call depth
+/// "implementation defined", and the reference interpreter
+/// (ACPICA) imposes no numeric cap at all — it executes methods
+/// with an explicit walk-state machine, so C-stack recursion is
+/// never the question there. NARF's evaluator *does* recurse in
+/// Rust, on a 32 KiB task stack (`scheduler/src/stackful.rs`,
+/// `DEFAULT_KERNEL_STACK_BYTES`), guarded only by an 8-word
+/// canary tripwire checked on switch-back — there is no guard
+/// page, and the old `evaluate_method` comment's "~64 KiB stack
+/// guard" was wrong on both the size and the mechanism. These
+/// numbers are therefore the policy; the canary is only a
+/// backstop.
+///
+/// Sizing (approximate, worst-case frame accounting, not a
+/// measurement): one live method level nests `evaluate_method` →
+/// `walk_term_list` → `eval_term` → `eval_term_arg`, roughly
+/// 0.6–0.8 KiB of stack, so 16 levels cost at most ~13 KiB;
+/// one nesting level inside a method (`eval_term_arg` /
+/// `walk_term_list` frame) costs roughly 0.1–0.3 KiB, so 32
+/// levels cost at most ~10 KiB. Combined worst case stays
+/// inside the 32 KiB task stack with room for the caller frames
+/// and IRQ nesting on top. Legitimate firmware is far shallower:
+/// real DSDT method-call chains are a handful of helper hops
+/// (`_PRT`/`_DSM`/`_STA` detours), expression nesting rarely
+/// passes ~8, and namespace Scope/Device nesting rarely passes
+/// ~6 — each bound leaves several times headroom over that.
+///
+/// The strict interpreter (`eval::strict`) already enforces the
+/// same method depth of 16 (`DEPTH`); the compat evaluator now
+/// matches it, so the two interpreters share one policy.
+pub(crate) const MAX_METHOD_CALL_DEPTH: u32 = 16;
+/// Maximum live nesting of `eval_term_arg` / `walk_term_list`
+/// frames inside a single method evaluation (expression nesting
+/// such as `Add(Add(...))`, and structural nesting such as
+/// `If`/`While` bodies).
+pub(crate) const MAX_EVAL_NESTING: u32 = 32;
+/// Maximum lexical nesting of Scope/Device/Processor/
+/// PowerResource/ThermalZone/If while building the namespace
+/// from a table.
+pub(crate) const MAX_NAMESPACE_DEPTH: u32 = 16;
 
 impl From<AcpiError> for AmlError {
     fn from(e: AcpiError) -> Self {
@@ -1045,7 +1096,7 @@ unsafe fn walk_aml_table(phys: u64, root_path: &str) -> Result<u32, AmlError> {
 
     let mut p = Parser::new(aml_slice);
     let mut count = 0u32;
-    parse_term_list(&mut p, root_path, &mut count, aml_slice.len(), base)?;
+    parse_term_list(&mut p, root_path, &mut count, aml_slice.len(), base, 0)?;
     Ok(count)
 }
 
@@ -1345,6 +1396,7 @@ fn parse_term_list(
     count: &mut u32,
     end_offset: usize,
     base: usize,
+    depth: u32,
 ) -> Result<(), AmlError> {
     // Soft-fail wrapper: BadNameSegment / Truncated mid-parse return
     // Ok(()) instead of propagating, so the boot-time DSDT walk
@@ -1353,12 +1405,22 @@ fn parse_term_list(
     // contain bytes our limited decoder can't follow (computed
     // TermArgs inside OpRegion offsets, etc.); the caller's pkg-end
     // clamp re-anchors at the next named object.
-    match parse_term_list_inner(p, parent, count, end_offset, base) {
+    //
+    // `RecursionDepthExceeded` is soft-failed the same way, and
+    // deliberately so: the bound (SEC-F1, #1289) stops the walk
+    // descending into the too-deep subtree, whose nodes are then
+    // simply absent from the namespace (later lookups fail with
+    // the already-handled `MethodNotFound`) — while siblings and
+    // the rest of the table still parse. Failing the whole table
+    // on one pathological Scope nest would trade a bounded
+    // firmware bug for a boot without ACPI at all.
+    match parse_term_list_inner(p, parent, count, end_offset, base, depth) {
         Ok(()) => Ok(()),
         Err(AmlError::BadNameSegment) => Ok(()),
         Err(AmlError::Truncated) => Ok(()),
         Err(AmlError::BadPkgLength) => Ok(()),
         Err(AmlError::OutOfPkg) => Ok(()),
+        Err(AmlError::RecursionDepthExceeded) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -1369,7 +1431,17 @@ fn parse_term_list_inner(
     count: &mut u32,
     end_offset: usize,
     base: usize,
+    depth: u32,
 ) -> Result<(), AmlError> {
+    // SEC-F1 (#1289): namespace build recurses into
+    // Scope/Device/If/Else bodies with no depth parameter, so a
+    // table nesting those constructs arbitrarily deep recursed
+    // arbitrarily deep. `depth` counts live nesting levels; the
+    // soft-fail wrapper above turns exhaustion into "skip this
+    // subtree" (see its comment).
+    if depth >= MAX_NAMESPACE_DEPTH {
+        return Err(AmlError::RecursionDepthExceeded);
+    }
     while p.pos < end_offset {
         let op = match p.peek() {
             Some(b) => b,
@@ -1399,7 +1471,7 @@ fn parse_term_list_inner(
                     buffer_field: None,
                 });
                 *count += 1;
-                parse_term_list(p, &path, count, pkg_end, base)?;
+                parse_term_list(p, &path, count, pkg_end, base, depth + 1)?;
                 if p.pos != pkg_end {
                     p.pos = pkg_end;
                 }
@@ -1527,7 +1599,7 @@ fn parse_term_list_inner(
                             buffer_field: None,
                         });
                         *count += 1;
-                        parse_term_list(p, &path, count, pkg_end, base)?;
+                        parse_term_list(p, &path, count, pkg_end, base, depth + 1)?;
                         if p.pos != pkg_end {
                             p.pos = pkg_end;
                         }
@@ -1549,7 +1621,7 @@ fn parse_term_list_inner(
                             buffer_field: None,
                         });
                         *count += 1;
-                        parse_term_list(p, &path, count, pkg_end, base)?;
+                        parse_term_list(p, &path, count, pkg_end, base, depth + 1)?;
                         if p.pos != pkg_end {
                             p.pos = pkg_end;
                         }
@@ -1571,7 +1643,7 @@ fn parse_term_list_inner(
                             buffer_field: None,
                         });
                         *count += 1;
-                        parse_term_list(p, &path, count, pkg_end, base)?;
+                        parse_term_list(p, &path, count, pkg_end, base, depth + 1)?;
                         if p.pos != pkg_end {
                             p.pos = pkg_end;
                         }
@@ -1591,7 +1663,7 @@ fn parse_term_list_inner(
                             buffer_field: None,
                         });
                         *count += 1;
-                        parse_term_list(p, &path, count, pkg_end, base)?;
+                        parse_term_list(p, &path, count, pkg_end, base, depth + 1)?;
                         if p.pos != pkg_end {
                             p.pos = pkg_end;
                         }
@@ -1764,7 +1836,7 @@ fn parse_term_list_inner(
                     // jumping past the whole package — same
                     // behaviour as before this change, just
                     // localised.
-                    if skip_predicate_term_arg(p.buf, &mut p.pos, pkg_end).is_err() {
+                    if skip_predicate_term_arg(p.buf, &mut p.pos, pkg_end, 0).is_err() {
                         p.pos = pkg_end;
                         continue;
                     }
@@ -1774,7 +1846,7 @@ fn parse_term_list_inner(
                 // wrapper so a malformed inner body doesn't
                 // abort the outer walk.
                 if p.pos < pkg_end {
-                    parse_term_list(p, parent, count, pkg_end, base)?;
+                    parse_term_list(p, parent, count, pkg_end, base, depth + 1)?;
                 }
                 // Re-anchor at pkg_end regardless of how far
                 // the inner walk progressed — guards against
@@ -1897,11 +1969,21 @@ fn read_simple_uint(p: &mut Parser<'_>) -> Result<u64, AmlError> {
 /// the entire package and lose body extraction" (the previous
 /// behaviour, still strictly an improvement over bailing the
 /// outer term-list).
+/// `depth` counts live nesting levels (SEC-F1, #1289): predicate
+/// TermArgs nest (`LEqual` inside `LAnd` inside ...), and the
+/// skipper recursed without a bound. Capped at
+/// `MAX_EVAL_NESTING`, the same budget as the evaluator's own
+/// TermArg nesting — a predicate deeper than any expression the
+/// evaluator would accept is not one the builder needs to follow.
 pub(crate) fn skip_predicate_term_arg(
     buf: &[u8],
     cur: &mut usize,
     end: usize,
+    depth: u32,
 ) -> Result<(), AmlError> {
+    if depth >= MAX_EVAL_NESTING {
+        return Err(AmlError::RecursionDepthExceeded);
+    }
     if *cur >= end {
         return Err(AmlError::Truncated);
     }
@@ -1964,8 +2046,8 @@ pub(crate) fn skip_predicate_term_arg(
         // Logical operators with two operands.
         0x90 /* LAnd */ | 0x91 /* LOr */ | 0x93 /* LEqual */
             | 0x94 /* LGreater */ | 0x95 /* LLess */ => {
-            skip_predicate_term_arg(buf, cur, end)?;
-            skip_predicate_term_arg(buf, cur, end)?;
+            skip_predicate_term_arg(buf, cur, end, depth + 1)?;
+            skip_predicate_term_arg(buf, cur, end, depth + 1)?;
             Ok(())
         }
 
@@ -1977,12 +2059,12 @@ pub(crate) fn skip_predicate_term_arg(
                 let next = buf[*cur];
                 if next == 0x93 || next == 0x94 || next == 0x95 {
                     *cur += 1;
-                    skip_predicate_term_arg(buf, cur, end)?;
-                    skip_predicate_term_arg(buf, cur, end)?;
+                    skip_predicate_term_arg(buf, cur, end, depth + 1)?;
+                    skip_predicate_term_arg(buf, cur, end, depth + 1)?;
                     return Ok(());
                 }
             }
-            skip_predicate_term_arg(buf, cur, end)
+            skip_predicate_term_arg(buf, cur, end, depth + 1)
         }
 
         // NameString lead chars — RootChar, ParentPrefix,
@@ -1998,7 +2080,7 @@ pub(crate) fn skip_predicate_term_arg(
             let name = read_name_string_inline(buf, cur, end)?;
             let argc = predefined_method_argcount(&name);
             for _ in 0..argc {
-                skip_predicate_term_arg(buf, cur, end)?;
+                skip_predicate_term_arg(buf, cur, end, depth + 1)?;
             }
             Ok(())
         }
@@ -2011,7 +2093,7 @@ pub(crate) fn skip_predicate_term_arg(
             let name = read_name_string_inline(buf, cur, end)?;
             let argc = predefined_method_argcount(&name);
             for _ in 0..argc {
-                skip_predicate_term_arg(buf, cur, end)?;
+                skip_predicate_term_arg(buf, cur, end, depth + 1)?;
             }
             Ok(())
         }
@@ -2301,6 +2383,6 @@ pub fn __parse_body_for_test(body: &[u8], root: &str) -> Result<u32, AmlError> {
     };
     let mut p = Parser::new(body);
     let mut count = 0u32;
-    parse_term_list(&mut p, root, &mut count, body.len(), base)?;
+    parse_term_list(&mut p, root, &mut count, body.len(), base, 0)?;
     Ok(count)
 }

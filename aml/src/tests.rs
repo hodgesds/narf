@@ -65,6 +65,7 @@ fn smoke_aml_synthetic_scope_and_name() -> TestResult {
                 crate::AmlError::NoDsdt => "no dsdt",
                 crate::AmlError::AmlStoreFull => "aml store full",
                 crate::AmlError::MethodNotFound => "method not found",
+                crate::AmlError::RecursionDepthExceeded => "recursion depth exceeded",
             })
         }
     };
@@ -359,6 +360,302 @@ fn smoke_aml_eval_multiply_arg() -> TestResult {
     }
 }
 kernel_test_in!("aml", smoke_aml_eval_multiply_arg);
+
+// ── AML recursion-budget tests (SEC-F1, #1289) ───────────────────────────────
+//
+/// Encode an ACPI PkgLength for `total` bytes, where `total`
+/// includes the PkgLength bytes themselves. 1-byte form below 64,
+/// 2-byte form below 4096 (ACPI 6.5 §20.2.5.2). Mirrors the
+/// `read_pkg_length` decoder in eval.rs / lib.rs; the
+/// single-byte-only `build_eval_method_blob` above cannot hold
+/// the >63-byte bodies these tests build.
+fn pkg_length_bytes(total: usize) -> alloc::vec::Vec<u8> {
+    if total < 64 {
+        alloc::vec![total as u8]
+    } else {
+        debug_assert!(total < 4096, "pkg length too large for 2-byte form");
+        alloc::vec![0x40 | ((total & 0x0F) as u8), (total >> 4) as u8]
+    }
+}
+
+/// PkgLength for a construct whose bytes after the PkgLength
+/// itself number `payload`. The total depends on the PkgLength
+/// byte count, which depends on the total — iterate to the fixed
+/// point (at most two steps for our sizes: 1 ↔ 2 bytes).
+fn pkg_length_for(payload: usize) -> alloc::vec::Vec<u8> {
+    let mut len = 1usize;
+    loop {
+        let bytes = pkg_length_bytes(len + payload);
+        if bytes.len() == len {
+            return bytes;
+        }
+        len = bytes.len();
+    }
+}
+
+/// Build a `Method(\NAME, flags, body)` blob with a correctly
+/// sized (possibly multi-byte) PkgLength. Same shape as
+/// `build_eval_method_blob`, without its 63-byte ceiling.
+fn build_eval_method_blob_long(name4: &[u8; 4], flags: u8, body: &[u8]) -> alloc::vec::Vec<u8> {
+    // PkgLength covers itself + root char + NameSeg + flags + body.
+    let pkglen = pkg_length_for(1 + 4 + 1 + body.len());
+    let mut blob = alloc::vec::Vec::new();
+    blob.push(0x14); // MethodOp
+    blob.extend_from_slice(&pkglen);
+    blob.push(b'\\');
+    blob.extend_from_slice(name4);
+    blob.push(flags);
+    blob.extend_from_slice(body);
+    blob
+}
+
+fn smoke_aml_eval_self_recursive_method_stops_at_depth_budget() -> TestResult {
+    // Method(\RCR1, 0) { Return(\RCR1) } — direct self-recursion.
+    // Before SEC-F1 this recursed until the stack gave out: the
+    // `While` iteration cap never applied because there is no
+    // loop, and each frame copied the method body. Now the
+    // call-depth budget must stop it with
+    // `RecursionDepthExceeded`, fail-closed (not Integer(0)).
+    let body: &[u8] = &[0xA4, 0x5C, b'R', b'C', b'R', b'1'];
+    let blob = build_eval_method_blob(b"RCR1", 0, body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    match crate::eval::evaluate_method("\\RCR1", &[]) {
+        Err(crate::AmlError::RecursionDepthExceeded) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("self-recursive method returned Ok (bound not enforced)"),
+        Err(_) => TestResult::Fail("self-recursive method failed with the wrong error"),
+    }
+}
+kernel_test_in!(
+    "aml",
+    smoke_aml_eval_self_recursive_method_stops_at_depth_budget
+);
+
+fn smoke_aml_eval_nested_method_chain_under_budget_completes() -> TestResult {
+    // Four-deep helper chain, the shape real DSDTs use
+    // (`_PRT`/`_DSM` detours): \CHN1 → \CHN2 → \CHN3 → \CHN4 → 7.
+    // Must complete well under the 16-level call budget.
+    let leaf: &[u8] = &[0xA4, 0x0A, 0x07]; // Return(7)
+    for (name, next) in [
+        (b"CHN4", None),
+        (b"CHN3", Some(b"CHN4")),
+        (b"CHN2", Some(b"CHN3")),
+        (b"CHN1", Some(b"CHN2")),
+    ] {
+        let body: alloc::vec::Vec<u8> = match next {
+            None => leaf.to_vec(),
+            Some(n) => alloc::vec![0xA4, 0x5C, n[0], n[1], n[2], n[3]],
+        };
+        let blob = build_eval_method_blob(name, 0, &body);
+        if crate::__parse_body_for_test(&blob, "\\").is_err() {
+            return TestResult::Fail("parse failed");
+        }
+    }
+    match crate::eval::evaluate_method("\\CHN1", &[]) {
+        Ok(crate::Value::Integer(7)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("expected Integer(7)"),
+        Err(_) => TestResult::Fail("evaluate_method failed"),
+    }
+}
+kernel_test_in!(
+    "aml",
+    smoke_aml_eval_nested_method_chain_under_budget_completes
+);
+
+/// Build `Add(Add(...Add(1, 2)...), 0, Local0)` nested `levels`
+/// deep, wrapped in `Return(...)`. Each level adds one AddOp
+/// (0x72) + one `BytePrefix 0` operand + one Local0 target.
+fn nested_add_body(levels: usize) -> alloc::vec::Vec<u8> {
+    let mut inner: alloc::vec::Vec<u8> = alloc::vec![0x72, 0x0A, 0x01, 0x0A, 0x02, 0x60];
+    for _ in 1..levels {
+        let mut outer = alloc::vec![0x72];
+        outer.extend_from_slice(&inner);
+        outer.extend_from_slice(&[0x0A, 0x00, 0x60]);
+        inner = outer;
+    }
+    let mut body = alloc::vec![0xA4];
+    body.extend_from_slice(&inner);
+    body
+}
+
+fn smoke_aml_eval_deeply_nested_term_arg_stops() -> TestResult {
+    // 40 nested Adds: expression nesting far past the 32-level
+    // budget. Must fail closed with RecursionDepthExceeded, not
+    // recurse until the stack gives out.
+    let blob = build_eval_method_blob_long(b"ADDX", 0, &nested_add_body(40));
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    match crate::eval::evaluate_method("\\ADDX", &[]) {
+        Err(crate::AmlError::RecursionDepthExceeded) => {}
+        Ok(_) => return TestResult::Fail("40-deep Add nest returned Ok (bound not enforced)"),
+        Err(_) => return TestResult::Fail("40-deep Add nest failed with the wrong error"),
+    }
+    // Control: 8 nested Adds complete with the right value
+    // (innermost 1 + 2 = 3, every outer level adds 0).
+    let blob = build_eval_method_blob_long(b"ADDY", 0, &nested_add_body(8));
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("control parse failed");
+    }
+    match crate::eval::evaluate_method("\\ADDY", &[]) {
+        Ok(crate::Value::Integer(3)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("expected Integer(3) for 8-deep control"),
+        Err(_) => TestResult::Fail("8-deep control failed"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_eval_deeply_nested_term_arg_stops);
+
+/// Build `If(One) { ... If(One) { Return(9) } ... }` nested
+/// `levels` deep. Each level adds IfOp + PkgLength + OneOp
+/// predicate around the inner body.
+fn nested_if_body(levels: usize) -> alloc::vec::Vec<u8> {
+    let mut inner: alloc::vec::Vec<u8> = alloc::vec![0xA4, 0x0A, 0x09];
+    for _ in 0..levels {
+        // PkgLength covers itself + predicate (1) + inner body.
+        let pkglen = pkg_length_for(1 + inner.len());
+        let mut outer = alloc::vec![0xA0];
+        outer.extend_from_slice(&pkglen);
+        outer.push(0x01); // OneOp predicate
+        outer.extend_from_slice(&inner);
+        inner = outer;
+    }
+    inner
+}
+
+fn smoke_aml_eval_nested_if_stops_at_nesting_budget() -> TestResult {
+    // 40 nested Ifs: TermList nesting far past the 32-level
+    // budget. `If` bodies recurse through `walk_term_list`, not
+    // `eval_term_arg`, so this exercises the second half of the
+    // shared nesting gauge. Must fail closed.
+    let blob = build_eval_method_blob_long(b"IFDX", 0, &nested_if_body(40));
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    match crate::eval::evaluate_method("\\IFDX", &[]) {
+        Err(crate::AmlError::RecursionDepthExceeded) => {}
+        Ok(_) => return TestResult::Fail("40-deep If nest returned Ok (bound not enforced)"),
+        Err(_) => return TestResult::Fail("40-deep If nest failed with the wrong error"),
+    }
+    // Control: 8 nested Ifs complete and return 9.
+    let blob = build_eval_method_blob_long(b"IFDY", 0, &nested_if_body(8));
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("control parse failed");
+    }
+    match crate::eval::evaluate_method("\\IFDY", &[]) {
+        Ok(crate::Value::Integer(9)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("expected Integer(9) for 8-deep control"),
+        Err(_) => TestResult::Fail("8-deep control failed"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_eval_nested_if_stops_at_nesting_budget);
+
+fn smoke_aml_eval_while_calling_recursive_method_stops() -> TestResult {
+    // The audit's headline bypass: a `While` body can invoke
+    // methods, and method self-recursion bypasses the `While`
+    // iteration cap entirely (there is no loop in the recursive
+    // method itself). \WRC2 is self-recursive; \WRC1 calls it
+    // from a `While(One)` body. The evaluation must abort on the
+    // first iteration with RecursionDepthExceeded — not spin
+    // 1,000,000 iterations, and not recurse unboundedly.
+    let rec_body: &[u8] = &[0xA4, 0x5C, b'W', b'R', b'C', b'2'];
+    let blob = build_eval_method_blob(b"WRC2", 0, rec_body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    // While(One) { \WRC2() } Return(One).
+    // WhileOp PkgLength: 1 (PkgLength) + 1 (OneOp pred) + 5
+    // (NameString \WRC2 as a statement) = 7.
+    let body: &[u8] = &[
+        0xA2, 0x07, // WhileOp, PkgLength 7
+        0x01, // OneOp predicate (always true)
+        0x5C, b'W', b'R', b'C', b'2', // statement call \WRC2()
+        0xA4, 0x01, // Return(One)
+    ];
+    let blob = build_eval_method_blob(b"WRC1", 0, body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    match crate::eval::evaluate_method("\\WRC1", &[]) {
+        Err(crate::AmlError::RecursionDepthExceeded) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("While calling recursive method returned Ok"),
+        Err(_) => TestResult::Fail("While calling recursive method failed with the wrong error"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_eval_while_calling_recursive_method_stops);
+
+/// Build `Scope(NAME) { <inner> }` with a correctly sized
+/// (possibly multi-byte) PkgLength. `name4` is a bare 4-byte
+/// NameSeg, resolved relative to the enclosing scope.
+fn scope_blob(name4: &[u8; 4], inner: &[u8]) -> alloc::vec::Vec<u8> {
+    let pkglen = pkg_length_for(4 + inner.len());
+    let mut blob = alloc::vec::Vec::new();
+    blob.push(0x10); // ScopeOp
+    blob.extend_from_slice(&pkglen);
+    blob.extend_from_slice(name4);
+    blob.extend_from_slice(inner);
+    blob
+}
+
+fn smoke_aml_namespace_deep_scope_nesting_stops() -> TestResult {
+    // 20 nested scopes (Z00..Z19), a Method at depth 3
+    // (\Z00.Z01.Z02.ZPK1) and one at depth 20
+    // (\Z00.…Z19.ZPK2). Namespace build must stop descending at
+    // the 16-level budget: the parse itself survives (soft-fail —
+    // one pathological nest must not cost the whole table), the
+    // shallow method registers, and the deep method is absent
+    // (later lookups fail with the already-handled
+    // MethodNotFound). Expected node count: scopes Z00..Z15 (16;
+    // Z15 is registered by its parent before its body walk hits
+    // the budget) + ZPK1 = 17.
+    let deep_method = build_eval_method_blob(b"ZPK2", 0, &[0xA4, 0x0A, 0x02]);
+    let shallow_method = build_eval_method_blob(b"ZPK1", 0, &[0xA4, 0x0A, 0x01]);
+    // Innermost: Scope(Z19) { Method ZPK2 }.
+    let mut inner = scope_blob(b"Z19_", &deep_method);
+    // Wrap Z18..Z03 around it.
+    for i in (3..19).rev() {
+        let name = [b'Z', b'0' + (i / 10) as u8, b'0' + (i % 10) as u8, b'_'];
+        inner = scope_blob(&name, &inner);
+    }
+    // Scope(Z02) { Method ZPK1, Scope(Z03) { ... } }.
+    let mut z02_body = shallow_method;
+    z02_body.extend_from_slice(&inner);
+    inner = scope_blob(b"Z02_", &z02_body);
+    // Wrap Z01, Z00 around it.
+    for i in (0..2).rev() {
+        let name = [b'Z', b'0' + (i / 10) as u8, b'0' + (i % 10) as u8, b'_'];
+        inner = scope_blob(&name, &inner);
+    }
+    let n = match crate::__parse_body_for_test(&inner, "\\") {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("parse failed"),
+    };
+    if n != 17 {
+        return TestResult::Fail("expected 17 nodes (16 scopes + shallow method)");
+    }
+    if crate::find_node("\\Z00.Z01.Z02.ZPK1").is_none() {
+        return TestResult::Fail("shallow method ZPK1 missing");
+    }
+    if crate::find_node("\\Z00.Z01.Z02.Z03.Z04.Z05.Z06.Z07.Z08.Z09.Z10.Z11.Z12.Z13.Z14.Z15")
+        .is_none()
+    {
+        return TestResult::Fail("scope Z15 missing");
+    }
+    if crate::find_node("\\Z00.Z01.Z02.Z03.Z04.Z05.Z06.Z07.Z08.Z09.Z10.Z11.Z12.Z13.Z14.Z15.Z16")
+        .is_some()
+    {
+        return TestResult::Fail("scope Z16 registered past the budget");
+    }
+    if crate::find_node(
+        "\\Z00.Z01.Z02.Z03.Z04.Z05.Z06.Z07.Z08.Z09.Z10.Z11.Z12.Z13.Z14.Z15.Z16.Z17.Z18.Z19.ZPK2",
+    )
+    .is_some()
+    {
+        return TestResult::Fail("deep method ZPK2 registered past the budget");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_namespace_deep_scope_nesting_stops);
 
 // ── Resource template tests ──────────────────────────────────────────────────
 
@@ -1955,7 +2252,7 @@ fn smoke_aml_skip_predicate_term_arg_decodes_lequal_osi() -> TestResult {
         b'_', b'O', b'S', b'I', 0x0D, b'L', b'i', b'n', b'u', b'x', 0x00, 0xFF,
     ];
     let mut cur = 0usize;
-    if crate::skip_predicate_term_arg(buf, &mut cur, buf.len()).is_err() {
+    if crate::skip_predicate_term_arg(buf, &mut cur, buf.len(), 0).is_err() {
         return TestResult::Fail("skip_predicate_term_arg returned Err on LEqual(_OSI, Ones)");
     }
     if cur != buf.len() {
