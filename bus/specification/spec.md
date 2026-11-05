@@ -202,6 +202,20 @@ A driver normally gets one such cap per device it owns; the
 driver's manifest names the device by `DeviceId` and the
 framework matches.
 
+`sriov::read_sriov_caps(cap, device)` decodes the SR-IOV extended
+capability when present (Linux `pci_iov_init`'s probe half).
+`sriov::enable_sriov(cap, device, num_vfs)` is the bus half of
+SR-IOV enablement (Linux `sriov_init` + `sriov_enable`): it
+programs the System Page Size (lowest set Supported Page Sizes
+bit), sizes and programs each VF BAR from the MMIO pool (window =
+per-VF size x TotalVFs), writes NumVFs, re-reads VF Offset /
+Stride, and sets Control VF Enable + VF Memory Space Enable.
+`sriov::disable_sriov(cap, device)` clears VF Enable + MSE and
+NumVFs; the caller must already have removed enumerated VFs. VF
+enumeration (creating `BusDevice`s at the `virtfn_bus` /
+`virtfn_devfn` addresses) is a later lane; the pure geometry
+helpers live in `sriov` for it.
+
 ### 3.4 Config-space access
 
 ```rust
