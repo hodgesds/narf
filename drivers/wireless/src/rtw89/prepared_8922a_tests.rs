@@ -5,6 +5,7 @@ use super::dma_8922a::WP_SEL_BASE;
 use super::dma_be::{Regs, INIT_CFG1};
 use super::efuse_be::BeFactory;
 use super::fw::FwError;
+use super::irq::Line;
 use super::mac::ChipId;
 use super::prepared::{self, Files};
 use super::prepared_8922a::*;
@@ -15,6 +16,8 @@ use super::txrx_be::{encode_txwd_be, TxwdBeInfo};
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
+use narf_bus::{BusDevice, BusDeviceCap, BusKind};
+use narf_capabilities::{object_table, Cap, CapKind, CapSlot, Rights, Write};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// Fixture register bank implementing [`Regs`] (same shape as the
@@ -63,6 +66,53 @@ impl Regs for Model {
 
     fn write16(&mut self, address: u32, value: u16) {
         self.regs16.insert(address, value);
+    }
+}
+
+/// [`super::irq::Regs`] over the same fixture bank, for the v2
+/// interrupt programs. Infallible, like the production `MmioRegs`.
+impl super::irq::Regs for Model {
+    fn read32(&mut self, address: u32) -> Result<u32, super::power::Error> {
+        Ok(<Self as Regs>::read32(self, address))
+    }
+
+    fn write32(&mut self, address: u32, value: u32) -> Result<(), super::power::Error> {
+        <Self as Regs>::write32(self, address, value);
+        Ok(())
+    }
+}
+
+fn test_cap() -> Cap<BusDeviceCap, Write> {
+    let (index, generation) = object_table::register(CapKind::BusDevice);
+    // SAFETY: fresh model object, exact BusDevice/Write rights and generation.
+    unsafe {
+        Cap::mint(CapSlot::new(
+            generation,
+            index,
+            Write::BITS,
+            CapKind::BusDevice as u32,
+        ))
+    }
+}
+
+/// Non-PCI fixture function: MSI discovery must fail without
+/// touching config space (`enable_msi` refuses VirtioMmio first).
+fn mmio_device() -> BusDevice {
+    let base = narf_memory::PhysAddr::new(0);
+    BusDevice {
+        addr: narf_bus::BusAddr::Mmio(base),
+        id: narf_bus::DeviceId {
+            vendor: 0x10ec,
+            device: 0x8922,
+            class: 0x028000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::VirtioMmio {
+            base,
+            len: 0x1000,
+            device_id: 1,
+        },
     }
 }
 
@@ -458,4 +508,104 @@ fn smoke_rtw89_prepared_8922a_refusals() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_prepared_8922a_refusals
+);
+
+fn smoke_rtw89_prepared_8922a_irq_unarmed_is_polled() -> TestResult {
+    let f = factory();
+    let mut owner = match Prepared8922a::new(f, 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    let mut regs = Model::new();
+    if owner.irq_armed() {
+        return TestResult::Fail("fresh owner must not be irq-armed");
+    }
+    // No binding: service reports nothing, rearm/release are no-ops.
+    match owner.irq_service(&mut regs) {
+        Ok(events) if events == super::irq::Events::default() => {}
+        _ => return TestResult::Fail("unarmed irq_service must report default events"),
+    }
+    if owner.irq_rearm(&mut regs).is_err() {
+        return TestResult::Fail("unarmed irq_rearm must succeed");
+    }
+    owner.irq_release(&mut regs, &test_cap());
+    if owner.irq_armed() {
+        return TestResult::Fail("unarmed irq_release must stay unarmed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_irq_unarmed_is_polled
+);
+
+fn smoke_rtw89_prepared_8922a_irq_start_needs_rings() -> TestResult {
+    let f = factory();
+    let mut owner = match Prepared8922a::new(f, 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    let mut regs = Model::new();
+    let line = Line::new();
+    let device = mmio_device();
+    let cap = test_cap();
+    // The gate returns before any MSI/config-space access, so the
+    // non-PCI fixture function is safe here.
+    if owner.irq_start(&device, &cap, &line, &mut regs) != Err(Error::NotProgrammed) {
+        return TestResult::Fail("irq_start before program_rings must be NotProgrammed");
+    }
+    if owner.irq_armed() {
+        return TestResult::Fail("refused irq_start must not arm the owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_irq_start_needs_rings
+);
+
+fn smoke_rtw89_prepared_8922a_irq_bind_fails_cleanly() -> TestResult {
+    let f = factory();
+    let mut owner = match Prepared8922a::new(f, 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    // Program the rings first (same pre-init halves as the
+    // full-sequence test), so the bind is reached.
+    let mut regs = Model::new();
+    if owner
+        .pre_init_dma_before_reset(&mut regs, 256, 256)
+        .is_err()
+    {
+        return TestResult::Fail("pre_init before_reset failed");
+    }
+    let mut regs = Model::new().with32(INIT_CFG1, 0).with_bound_clears();
+    if owner.pre_init_dma_after_reset(&mut regs).is_err() {
+        return TestResult::Fail("pre_init after_reset failed");
+    }
+    let tx_phys: [u64; TXCH_NUM] = core::array::from_fn(|i| 0x1_0000 + (i as u64) * 0x800);
+    let rx_phys: [u64; 2] = [0x2_0000, 0x2_1000];
+    if owner
+        .program_rings(&mut regs, &tx_phys, &rx_phys, 256, 256)
+        .is_err()
+    {
+        return TestResult::Fail("program_rings failed");
+    }
+    // MSI discovery on a non-PCI fixture function fails inside
+    // `enable_msi` before any config-space access, and the owner
+    // must stay unarmed.
+    let line = Line::new();
+    let device = mmio_device();
+    let cap = test_cap();
+    if owner.irq_start(&device, &cap, &line, &mut regs) != Err(Error::Irq(super::irq::Error::Msi)) {
+        return TestResult::Fail("irq_start on a non-PCI function must fail with Irq(Msi)");
+    }
+    if owner.irq_armed() {
+        return TestResult::Fail("failed irq_start must not arm the owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_irq_bind_fails_cleanly
 );

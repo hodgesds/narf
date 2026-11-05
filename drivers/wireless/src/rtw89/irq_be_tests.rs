@@ -13,6 +13,7 @@ struct Fake {
     regs: Vec<(u32, u32)>,
     reads: Vec<u32>,
     writes: Vec<(u32, u32)>,
+    fail_at: Option<u32>,
 }
 
 impl Fake {
@@ -21,6 +22,7 @@ impl Fake {
             regs: Vec::new(),
             reads: Vec::new(),
             writes: Vec::new(),
+            fail_at: None,
         }
     }
     fn set(&mut self, addr: u32, val: u32) {
@@ -41,10 +43,16 @@ impl Fake {
 
 impl Regs for Fake {
     fn read32(&mut self, address: u32) -> Result<u32, power::Error> {
+        if self.fail_at == Some(address) {
+            return Err(power::Error::Access);
+        }
         self.reads.push(address);
         Ok(self.get(address))
     }
     fn write32(&mut self, address: u32, value: u32) -> Result<(), power::Error> {
+        if self.fail_at == Some(address) {
+            return Err(power::Error::Access);
+        }
         self.writes.push((address, value));
         self.set(address, value);
         Ok(())
@@ -178,3 +186,115 @@ fn smoke_rtw89_be_irq_recognize() -> TestResult {
 }
 
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_be_irq_recognize);
+
+fn smoke_rtw89_be_irq_events_classify() -> TestResult {
+    // Expected values are computed here from the Linux `pci_be.c:868`
+    // `rtw89_pci_isr_be` bit positions, never from the module under test.
+    // Full house: RX0P2 + RPQ0 in the DMA word, RDU CH0 in the HAXI
+    // word, HALT + WDT in the halt word.
+    let busy = IsrsBe {
+        ind: (1 << 0) | (1 << 5),
+        halt_c2h: (1 << 21) | (1 << 22),
+        isrs: [(1 << 25), (1 << 16) | (1 << 17)],
+    }
+    .events();
+    if !busy.rx
+        || !busy.rpq
+        || !busy.rx_unavailable
+        || !busy.halt_c2h
+        || !busy.watchdog
+        || !busy.fatal()
+    {
+        return TestResult::Fail("BE v2 event classification wrong for full house");
+    }
+    // RDU alone polls RX without being fatal (threadfn's `isr_rdu`
+    // branch runs before the NAPI schedule, not the SER path).
+    let rdu = IsrsBe {
+        ind: 1 << 5,
+        halt_c2h: 0,
+        isrs: [(1 << 26), 0],
+    }
+    .events();
+    if rdu.rx || rdu.rpq || !rdu.rx_unavailable || rdu.fatal() {
+        return TestResult::Fail("BE v2 RDU must poll RX without being fatal");
+    }
+    // RPQ alone: only the RPQ drain is scheduled.
+    let rpq = IsrsBe {
+        ind: 1 << 5,
+        halt_c2h: 0,
+        isrs: [0, 1 << 17],
+    }
+    .events();
+    if !rpq.rpq || rpq.rx || rpq.rx_unavailable || rpq.fatal() {
+        return TestResult::Fail("BE v2 RPQ-only classification wrong");
+    }
+    // Bits outside the `rtw89_pci_isr_be` sources classify as nothing:
+    // no stuck source exists for v2, and DMA bit 7 is not RX0P2/RPQ0.
+    let noise = IsrsBe {
+        ind: 0,
+        halt_c2h: 1 << 3,
+        isrs: [1 << 2, 1 << 7],
+    }
+    .events();
+    if noise.rx
+        || noise.rpq
+        || noise.rx_unavailable
+        || noise.stuck
+        || noise.halt_c2h
+        || noise.watchdog
+        || noise.fatal()
+    {
+        return TestResult::Fail("BE v2 unrecognized bits must classify as no events");
+    }
+    // Quiet device: nothing pending, nothing fatal.
+    if IsrsBe::default().events() != super::irq::Events::default() {
+        return TestResult::Fail("BE v2 quiet device must report default events");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_be_irq_events_classify);
+
+fn smoke_rtw89_be_irq_service_masks_then_rearms() -> TestResult {
+    let m = MaskBe::config(false, false);
+    let mut fake = Fake::new();
+    if m.enable(&mut fake).is_err() || fake.get(R_BE_PCIE_HIMR0) != m.ind {
+        return TestResult::Fail("BE v2 enable did not program PCIE_HIMR0");
+    }
+    fake.writes.clear();
+    fake.set(R_BE_PCIE_HISR, (1 << 0) | (1 << 5));
+    fake.set(R_BE_HISR0, 0);
+    fake.set(R_BE_HAXI_HISR00, 0);
+    fake.set(R_BE_PCIE_DMA_ISR, 1 << 17);
+    // Same sequence as BindingBe::service, independent of a PCI function.
+    if MaskBe::disable(&mut fake).is_err() {
+        return TestResult::Fail("BE v2 service disable failed");
+    }
+    let Ok(isrs) = m.recognize(&mut fake) else {
+        return TestResult::Fail("BE v2 service recognize failed");
+    };
+    let order: Vec<u32> = fake.writes.iter().map(|(a, _)| *a).collect();
+    if order.get(..2) != Some(&[R_BE_PCIE_HIMR0, R_BE_PCIE_DMA_IMR_0_V1][..])
+        || fake.writes.iter().take(2).any(|(_, v)| *v != 0)
+        || !isrs.events().rpq
+    {
+        return TestResult::Fail("BE v2 service did not mask before acknowledging");
+    }
+    if m.enable(&mut fake).is_err()
+        || fake.get(R_BE_HIMR0) != m.halt_c2h
+        || fake.get(R_BE_PCIE_DMA_IMR_0_V1) != m.intrs[1]
+    {
+        return TestResult::Fail("BE v2 rearm did not restore the mask");
+    }
+    let mut broken = Fake::new();
+    broken.fail_at = Some(R_BE_PCIE_DMA_ISR);
+    if m.recognize(&mut broken).is_ok() {
+        return TestResult::Fail("BE v2 register failure was swallowed");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_be_irq_service_masks_then_rearms
+);
