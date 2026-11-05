@@ -17,7 +17,7 @@
 //! the retained station owner; neither is reset by this sequence.
 use super::*;
 use crate::ath11k::wmi::NloConfig;
-use narf_wireless::{WowlanConfig, WowlanSupport};
+use narf_wireless::{NetDetectConfig, WowlanConfig, WowlanSupport};
 
 /// `ATH10K_FW_FEATURE_WOWLAN_SUPPORT`.
 const FEATURE_WOWLAN: u64 = 1 << 6;
@@ -191,10 +191,11 @@ impl Program {
             events |= 1 << MAGIC;
         }
         let nlo_config = match &config.net_detect {
-            Some(nlo_config) if nlo => {
-                validate_nlo(nlo_config)?;
+            Some(nd) if nlo => {
+                let nlo = nlo_from_net_detect(nd);
+                validate_nlo(&nlo)?;
                 events |= 1 << NLO_DETECTED;
-                Some(nlo_config.clone())
+                Some(nlo)
             }
             Some(_) => return Err(Error::Unsupported),
             None => None,
@@ -236,6 +237,30 @@ impl Program {
             patterns,
             nlo: nlo_config,
         })
+    }
+}
+
+fn nlo_from_net_detect(nd: &NetDetectConfig) -> NloConfig {
+    NloConfig {
+        probe_ssids: nd.probe_ssids.clone(),
+        channels_mhz: nd.frequencies_mhz.clone(),
+        probe_ies: nd.probe_ies.clone(),
+        networks: nd
+            .matches
+            .iter()
+            .map(|m| crate::ath11k::wmi::NloNetwork {
+                ssid: m.ssid.clone(),
+                rssi_threshold_dbm: m.rssi_threshold_dbm,
+                hidden: false,
+            })
+            .collect(),
+        plans: nd
+            .plans
+            .iter()
+            .map(|p| (p.interval_secs, p.iterations))
+            .collect(),
+        delay_secs: nd.delay_secs,
+        random_mac: nd.random_mac,
     }
 }
 
@@ -467,7 +492,7 @@ pub(in crate::ath10k) fn nlo_config_start(vdev: u32, config: &NloConfig) -> Resu
     tlv(&mut out, at, TAG_ARRAY_STRUCT, networks * NLO_NETWORK_LEN);
     at += 4;
     for network in &config.networks {
-        tlv(&mut out, at, TAG_ARRAY_BYTE, NLO_NETWORK_LEN - 4);
+        tlv(&mut out, at, u32::from(TAG_ARRAY_BYTE), NLO_NETWORK_LEN - 4);
         wire::put(&mut out, at + 4, 1);
         wire::put(&mut out, at + 8, network.ssid.len() as u32);
         out[at + 12..at + 12 + network.ssid.len()].copy_from_slice(&network.ssid);

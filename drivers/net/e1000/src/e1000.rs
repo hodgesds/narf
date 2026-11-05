@@ -1521,7 +1521,7 @@ fn aneg_bmcr_restart(current: u16) -> u16 {
 /// does not either), so it can never be the common mode. `None`
 /// means no common mode — the link cannot come up on these
 /// advertisements.
-fn resolve_negotiated_mode(
+const fn resolve_negotiated_mode(
     our_anar: u16,
     our_gbcr: u16,
     lp_anar: u16,

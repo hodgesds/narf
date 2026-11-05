@@ -985,17 +985,20 @@ async fn crash_monitor_task(
                     rt.pre_reconfigure_recovery();
                 }
             }
+            let fresh = live.restart_transport(&p).await.map_err(|e| {
+                TransportError::new(super::runtime::step::RECOVERY_FW, 0, restart_errno(&e))
+            });
+            let mut fresh_slot = Some(fresh);
             let r = shared
-                .recover_after_remote_restart(|_old: &mut AhbWlfw<NarfAhbEnv>| {
-                    alloc::boxed::Box::pin(async {
-                        live.restart_transport(&p).await.map(Some).map_err(|e| {
-                            TransportError::new(
-                                super::runtime::step::RECOVERY_FW,
-                                0,
-                                restart_errno(&e),
-                            )
-                        })
-                    })
+                .recover_after_remote_restart(move |_old: &mut AhbWlfw<NarfAhbEnv>| {
+                    let res = fresh_slot.take().unwrap_or_else(|| {
+                        Err(TransportError::new(
+                            super::runtime::step::RECOVERY_FW,
+                            0,
+                            EBUSY,
+                        ))
+                    });
+                    alloc::boxed::Box::pin(async move { res.map(Some) })
                 })
                 .await;
             match r {

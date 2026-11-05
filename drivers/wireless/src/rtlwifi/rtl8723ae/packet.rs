@@ -266,7 +266,7 @@ pub fn encode_tx_desc(slot: &mut [u32; TX_DESC_DWORDS], tx: &TxFrame) -> Result<
     slot[3] = (u32::from(tx.seq) & 0xfff) << 16;
     // DW4: rtsrate[4:0], cts2self[11], rts_en[12], hwrts_en[13],
     // txsc[21:20], txbw[25]. rtsbw is 0; stbc 0.
-    let (rts_rate, rts_sc, cts2self, rts_en, hwrts_en, rts_stbc) = match tx.rts {
+    let (rts_rate, _rts_sc, cts2self, rts_en, hwrts_en, rts_stbc) = match tx.rts {
         Some(r) => (
             r.rts_rate,
             r.rts_sc,
@@ -338,6 +338,7 @@ pub fn decode_rx_desc(d: &[u32; RX_DESC_DWORDS]) -> RxReport {
 /// The AE packet owner: firmware admission + envelope permission. The
 /// coexistence owner is held by the station owner and passed to
 /// [`Owner::service_c2h`] so the mailbox drain feeds it.
+#[derive(Debug)]
 pub struct Owner {
     /// Firmware download result (proof of admission).
     firmware: Info,
