@@ -48,10 +48,13 @@ use crate::drm_uapi::{
 type CrtcColorRequest = crate::amdgpu_native_kms::CrtcColorRequest;
 #[cfg(not(feature = "amdgpu"))]
 type CrtcColorRequest = core::convert::Infallible;
-#[cfg(feature = "amdgpu")]
-type ConnectorColorRequest = crate::amdgpu_native_kms::ConnectorColorRequest;
-#[cfg(not(feature = "amdgpu"))]
-type ConnectorColorRequest = core::convert::Infallible;
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConnectorColorRequest {
+    #[cfg(feature = "amdgpu")]
+    Amdgpu(crate::amdgpu_native_kms::ConnectorColorRequest),
+    #[cfg(feature = "intel")]
+    Intel(crate::intel_gpu_hdr::IntelConnectorColorRequest),
+}
 /// The GEM buffer a legacy cursor request names (amdgpu only).
 #[cfg(feature = "amdgpu")]
 type CursorBo = Arc<crate::amdgpu_gem::GemObject>;
@@ -4158,29 +4161,53 @@ fn apply_connector_color(
         native.color_format,
     );
     card.collect_blobs();
-    // The committed state above is generic DRM state; turning it
-    // into a native request is the amdgpu KMS's business alone.
-    #[cfg(feature = "amdgpu")]
-    {
-        if after == before || crate::drm_registry::driver_name(card_index) != Some("amdgpu") {
-            return None;
+    match crate::drm_registry::driver_name(card_index) {
+        #[cfg(feature = "amdgpu")]
+        Some("amdgpu") => {
+            if after == before {
+                return None;
+            }
+            let hdr = after
+                .1
+                .filter(|&id| id != 0)
+                .and_then(|id| card.property_blob(id))
+                .map(<[u8]>::to_vec);
+            Some(ConnectorColorRequest::Amdgpu(
+                crate::amdgpu_native_kms::ConnectorColorRequest {
+                    connector,
+                    colorspace: after.0.unwrap_or(0),
+                    color_format: after.2.unwrap_or_default(),
+                    hdr_output_metadata: hdr,
+                },
+            ))
         }
-        let hdr = after
-            .1
-            .filter(|&id| id != 0)
-            .and_then(|id| card.property_blob(id))
-            .map(<[u8]>::to_vec);
-        Some(crate::amdgpu_native_kms::ConnectorColorRequest {
-            connector,
-            colorspace: after.0.unwrap_or(0),
-            color_format: after.2.unwrap_or_default(),
-            hdr_output_metadata: hdr,
-        })
-    }
-    #[cfg(not(feature = "amdgpu"))]
-    {
-        let _ = (before, after, card_index);
-        None
+        #[cfg(feature = "intel")]
+        Some("intel-gpu") => {
+            if after == before {
+                return None;
+            }
+            let hdr = after
+                .1
+                .filter(|&id| id != 0)
+                .and_then(|id| card.property_blob(id))
+                .map(<[u8]>::to_vec);
+            let broadcast_rgb = card
+                .native_output(connector)
+                .and_then(|n| n.broadcast_rgb)
+                .unwrap_or(0);
+            Some(ConnectorColorRequest::Intel(
+                crate::intel_gpu_hdr::IntelConnectorColorRequest {
+                    connector,
+                    colorspace: after.0.unwrap_or(0),
+                    broadcast_rgb,
+                    hdr_output_metadata: hdr,
+                },
+            ))
+        }
+        _ => {
+            let _ = (before, after);
+            None
+        }
     }
 }
 
@@ -4306,14 +4333,15 @@ fn apply_broadcast_rgb(
     connector: u32,
     value: u8,
 ) {
-    #[cfg(not(feature = "amdgpu"))]
-    let _ = card_index;
     if let Some(native) = card.native.iter_mut().find(|n| n.connector == connector) {
         native.broadcast_rgb = Some(value);
     }
-    #[cfg(feature = "amdgpu")]
-    if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
-        crate::amdgpu_native_kms::request_broadcast_rgb(value);
+    match crate::drm_registry::driver_name(card_index) {
+        #[cfg(feature = "amdgpu")]
+        Some("amdgpu") => crate::amdgpu_native_kms::request_broadcast_rgb(value),
+        #[cfg(feature = "intel")]
+        Some("intel-gpu") => crate::intel_gpu_hdr::request_broadcast_rgb(connector, value),
+        _ => {}
     }
 }
 
@@ -4449,9 +4477,16 @@ fn handle_set_property(
         }
         let _request = apply_connector_color(card_index, &mut card, obj_id, color);
         drop(card);
-        #[cfg(feature = "amdgpu")]
-        if let Some(request) = _request {
-            crate::amdgpu_native_kms::request_connector_color(request);
+        match _request {
+            #[cfg(feature = "amdgpu")]
+            Some(ConnectorColorRequest::Amdgpu(request)) => {
+                crate::amdgpu_native_kms::request_connector_color(request);
+            }
+            #[cfg(feature = "intel")]
+            Some(ConnectorColorRequest::Intel(request)) => {
+                crate::intel_gpu_hdr::request_connector_color(request);
+            }
+            _ => {}
         }
         return Ok(0);
     }
@@ -6696,9 +6731,19 @@ fn atomic_commit(
     for (display, request) in color_requests {
         crate::amdgpu_native_kms::request_crtc_color(display, request);
     }
-    #[cfg(feature = "amdgpu")]
     for request in connector_requests {
-        crate::amdgpu_native_kms::request_connector_color(request);
+        match request {
+            #[cfg(feature = "amdgpu")]
+            ConnectorColorRequest::Amdgpu(req) => {
+                crate::amdgpu_native_kms::request_connector_color(req);
+            }
+            #[cfg(feature = "intel")]
+            ConnectorColorRequest::Intel(req) => {
+                crate::intel_gpu_hdr::request_connector_color(req);
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
     }
     send_cursor_requests(cursor_requests);
     #[cfg(feature = "amdgpu")]

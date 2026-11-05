@@ -1677,11 +1677,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 edid: None,
                 timings: alloc::vec::Vec::new(),
                 color_format: None,
-                broadcast_rgb: None,
+                broadcast_rgb: Some(0),
                 vrr_capable: Some(true),
-                colorspace: None,
-                hdr_output_metadata: None,
-                max_bpc: None,
+                colorspace: Some(0),
+                hdr_output_metadata: Some(0),
+                max_bpc: Some(8),
             });
             let index = crate::drm_registry::register_drm_card_with_state(intel_card, kms);
             publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
