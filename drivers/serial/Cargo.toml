@@ -29,8 +29,10 @@ narf-kernel-test  = { path = "../../verification/kernel-test" }
 # The smokes in `src/tests.rs` compile unconditionally (they are pure
 # data checks, safe to link everywhere). The feature exists so the
 # kernel image can forward `kernel-test` uniformly to every driver
-# crate without a special case here.
-kernel-test = []
+# crate without a special case here. It forwards to narf-aml so the
+# ACPI smokes can use the scoped-namespace fixture
+# (`__test_namespace_scope`, same pattern as power/wireless).
+kernel-test = ["narf-aml/kernel-test"]
 
 [lints]
 workspace = true
