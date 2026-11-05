@@ -857,6 +857,7 @@ fn smoke_virtio_net_tx_tso6_header_is_feature_gated_and_well_formed() -> TestRes
             tso6: true,
             uso: false,
         },
+        1518,
     ) {
         Ok(hdr) => hdr,
         Err(_) => return TestResult::Fail("virtio-net rejected negotiated TCPv6 TSO"),
@@ -884,6 +885,7 @@ fn smoke_virtio_net_tx_tso6_header_is_feature_gated_and_well_formed() -> TestRes
             tso6: false,
             uso: false,
         },
+        1518,
     )
     .is_ok()
     {
@@ -900,6 +902,7 @@ fn smoke_virtio_net_tx_tso6_header_is_feature_gated_and_well_formed() -> TestRes
             tso6: true,
             uso: false,
         },
+        1518,
     )
     .is_ok()
     {
@@ -938,7 +941,7 @@ fn smoke_virtio_net_tx_uso_header_is_feature_gated_and_well_formed() -> TestResu
     };
     let mut frame = [0u8; 1500];
     virtio_test_ipv4_udp_frame(&mut frame);
-    let hdr = match tx_header_for_frame(&mut frame, uso_meta, uso_profile) {
+    let hdr = match tx_header_for_frame(&mut frame, uso_meta, uso_profile, 1518) {
         Ok(hdr) => hdr,
         Err(_) => return TestResult::Fail("virtio-net rejected negotiated IPv4 USO"),
     };
@@ -957,7 +960,7 @@ fn smoke_virtio_net_tx_uso_header_is_feature_gated_and_well_formed() -> TestResu
     // v6 USO: same GSO type, v6 header geometry, v6 UDP seed 0x5b86.
     let mut frame6 = [0u8; 1500];
     virtio_test_ipv6_udp_frame(&mut frame6);
-    let hdr6 = match tx_header_for_frame(&mut frame6, uso_meta, uso_profile) {
+    let hdr6 = match tx_header_for_frame(&mut frame6, uso_meta, uso_profile, 1518) {
         Ok(hdr) => hdr,
         Err(_) => return TestResult::Fail("virtio-net rejected negotiated IPv6 USO"),
     };
@@ -976,7 +979,7 @@ fn smoke_virtio_net_tx_uso_header_is_feature_gated_and_well_formed() -> TestResu
         );
     }
     // Rejections: no USO feature, and mss 0.
-    if tx_header_for_frame(&mut frame, uso_meta, TxOffloadProfile::default()).is_ok() {
+    if tx_header_for_frame(&mut frame, uso_meta, TxOffloadProfile::default(), 1518).is_ok() {
         return TestResult::Fail("virtio-net accepted USO without negotiated feature");
     }
     let zero_mss = TxMeta {
@@ -984,7 +987,7 @@ fn smoke_virtio_net_tx_uso_header_is_feature_gated_and_well_formed() -> TestResu
         tso_mss: Some(0),
         ..Default::default()
     };
-    if tx_header_for_frame(&mut frame, zero_mss, uso_profile).is_ok() {
+    if tx_header_for_frame(&mut frame, zero_mss, uso_profile, 1518).is_ok() {
         return TestResult::Fail("virtio-net accepted USO with mss 0");
     }
     TestResult::Pass

@@ -4993,6 +4993,8 @@ mod tx_tests {
             let profile = TxOffloadProfile {
                 checksum: false,
                 tso4: false,
+                tso6: false,
+                uso: false,
             };
             let mut buf = alloc_coherent(9018, DomainId::DRIVER_0).map_err(|_| "jumbo buf")?;
             let frame = &mut buf.as_mut_slice()[..9018];
@@ -5146,7 +5148,10 @@ mod tx_tests {
                 has_status: false,
                 tx_checksum: true,
                 tx_tso4: true,
+                tx_tso6: false,
+                tx_uso: false,
                 rx_guest_csum: guest_csum,
+                mrg_rxbuf: false,
                 has_rss: false,
                 has_hash_report: rx_hdr_len == 20,
                 rss_configured: false,
