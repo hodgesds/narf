@@ -64,11 +64,28 @@ pub mod verb {
     pub const EXECUTE_PIN_SENSE: u32 = 0x709 << 8;
     pub const GET_CONVERTER_STREAM_CHANNEL: u32 = 0xF06 << 8;
     pub const SET_CONVERTER_STREAM_CHANNEL: u32 = 0x706 << 8;
+    /// Set Coefficient Index (HDA §7.3.3.7). 4-bit verb ID + 16-bit
+    /// payload: the coef index lives in the low 16 bits, so the
+    /// constant is shifted `<< 16` like the other 16-bit-payload
+    /// verbs (SET_AMP_GAIN_MUTE), NOT `<< 8`. Linux's
+    /// `AC_VERB_SET_COEF_INDEX` (0x500) is the same encoding.
+    /// Realtek coef writes go to the vendor coef node, nid 0x20
+    /// (Linux `alc_write_coef_idx`), never the AFG.
+    pub const SET_COEF_INDEX: u32 = 0x5 << 16;
+    /// Set Processing Coefficient (HDA §7.3.3.8). Same 4-bit verb +
+    /// 16-bit payload form as SET_COEF_INDEX; Linux's
+    /// `AC_VERB_SET_PROC_COEF` (0x400).
+    pub const SET_PROC_COEF: u32 = 0x4 << 16;
 }
 
 /// Get-Parameter sub-codes (§7.3.4). OR with `verb::GET_PARAMETER`.
 pub mod param {
     pub const VENDOR_ID: u32 = 0x00;
+    /// Subsystem ID (§7.3.4.2): `subvendor << 16 | subdevice`, read
+    /// from the root node (nid 0). Linux reads the same word as
+    /// `AC_VERB_GET_SUBSYSTEM_ID` (0xF01); it is the key the
+    /// Realtek quirk tables match on (#776).
+    pub const SUBSYSTEM_ID: u32 = 0x01;
     pub const REVISION_ID: u32 = 0x02;
     pub const SUBORDINATE_NODE_COUNT: u32 = 0x04;
     pub const FUNCTION_GROUP_TYPE: u32 = 0x05;

@@ -13,16 +13,28 @@
 //! (`alc269_fixup_models[]`, per-chip `alc*_init` sequences), and
 //! they are an asset, not garbage.
 //!
-//! ## Status: staged data, not yet consumed
+//! ## Status: init tables consumed, pin quirks staged (#776)
 //!
-//! The live HDA path ([`super::routing`]) currently routes from BIOS
-//! pin defaults only and applies no vendor fixups — that is #776.
-//! Nothing in the running system reads these tables yet; they are
-//! preserved here, in the live crate that will consume them, so the
-//! #776 lane wires fixups into `routing.rs` against data that
-//! already has a home and a content test. The kernel tests under
-//! `audio/hda-quirks` pin the table contents (counts + spot
-//! entries) so an accidental edit of the data fails loudly.
+//! The live HDA path ([`super::runtime`]) reads the codec subsystem
+//! ID at probe and applies the per-chip init coef tables for the
+//! chips Linux inits with unconditional plain coef writes — the
+//! ALC256 family (`RealtekChip::uses_alc256_init`, Linux
+//! `alc256_init`) — before the widget graph is built, and re-applies
+//! them on resume. The per-laptop pin quirks below are NOT applied:
+//! verification against Linux `sound/hda/codecs/realtek/alc269.c`
+//! (master and v6.6, 2026-11-05) found none of the six subsystem
+//! keys is a codec subsystem ID — 0x17AA22BE is the PCI SSID of the
+//! ThinkPad X1 Carbon 8th (not Gen 7), 0x103C8716 the PCI SSID of
+//! the HP Elite Dragonfly G2 (not EliteBook 845 G8), 0x10431A30 the
+//! PCI SSID of the ASUS X705UD (not ROG Strix), and 0x17AA22F0 /
+//! 0x10280AB9 / 0x14621234 appear nowhere in Linux — and the pin
+//! contents do not match the cited fixups (Linux's
+//! ALC285_FIXUP_THINKPAD_X1_GEN7 re-routes DAC connections, it sets
+//! no pins). Applying them would write other laptops' pins to the
+//! wrong machines. The tables stay here as staged data until they
+//! are re-derived from Linux with correct codec SSIDs; the kernel
+//! tests under `audio/hda-quirks` pin the table contents (counts +
+//! spot entries) so an accidental edit of the data fails loudly.
 
 // ── Chip identity ───────────────────────────────────────────────────
 
@@ -144,6 +156,28 @@ impl RealtekChip {
             RealtekChip::Alc3287 => "ALC3287",
         }
     }
+
+    /// Whether Linux runs `alc256_init` for this chip — the only
+    /// Realtek init hook that issues unconditional plain coef
+    /// writes (Linux `sound/hda/codecs/realtek/alc269.c` init-hook
+    /// dispatch: 0x10ec0230/0235/0236/0255/0256/0257, plus
+    /// 0x19e58326). The other chips' Linux init paths
+    /// (`alc225_init` for ALC285/287/289/295, `alc294_init`,
+    /// `alc222_init`, the `alc282/283_coefs` tables) are jack-sense
+    /// gated or masked read-modify-write sequences NARF does not
+    /// model yet, so their rescued rows stay unwired (#776
+    /// remainder). The live path applies `init_table_for` only for
+    /// chips where this is true.
+    pub const fn uses_alc256_init(self) -> bool {
+        matches!(
+            self,
+            RealtekChip::Alc235
+                | RealtekChip::Alc236
+                | RealtekChip::Alc255
+                | RealtekChip::Alc256
+                | RealtekChip::Alc257
+        )
+    }
 }
 
 // ── Per-chip init coef tables ───────────────────────────────────────
@@ -170,6 +204,13 @@ impl CoefRow {
     }
 }
 
+/// The vendor-defined widget Realtek coef writes address (Linux
+/// `alc_write_coef_idx` → `alc_write_coefex_idx(codec, 0x20, ...)`
+/// in `sound/hda/codecs/realtek/alc269.c`). Coef verbs go here,
+/// never to the AFG node: the AFG does not implement the coef
+/// registers, and a write there is silently dropped.
+pub const COEF_NODE: u8 = 0x20;
+
 /// Pin Widget Control — "Output Enable" (HDA §7.3.3.13, bit 6).
 pub const PIN_WIDGET_OUT: u8 = 0x40;
 /// "Headphone Enable" (HDA §7.3.3.13, bit 7).
@@ -192,8 +233,12 @@ pub const ALC256_INIT: &[CoefRow] = &[
     // instead of PC Beep, and disable 1Ah loopback. Linux:
     // alc_write_coef_idx(codec, 0x36, 0x5757)
     CoefRow::new(0x36, 0x5757),
-    // Clear high-power "ultra-low-power" bit.
-    CoefRow::new(0x46, 0x0000),
+    // NOTE (#776, verified 2026-11-05): the rescued second row,
+    // (0x46, 0x0000) "clear high-power bit", was DELETED — Linux
+    // does a masked update here, alc_update_coef_idx(codec, 0x46,
+    // 3 << 12, 0), not a plain write of 0, and a plain 0 would
+    // clear bits Linux preserves. NARF has no read-modify-write
+    // coef primitive yet; the update is a remainder.
 ];
 
 /// ALC255 init — virtually identical to ALC256.
@@ -207,11 +252,13 @@ pub const ALC233_INIT: &[CoefRow] = &[
 /// ALC235 init — same shape as ALC233.
 pub const ALC235_INIT: &[CoefRow] = &[CoefRow::new(0x36, 0x5757)];
 
-/// ALC236 init — same shape as ALC235 with one extra POP-noise fix.
-pub const ALC236_INIT: &[CoefRow] = &[
-    CoefRow::new(0x36, 0x5757),
-    CoefRow::new(0x1B, 0x0c0b), // pop-noise reduction.
-];
+/// ALC236 init — same shape as ALC235.
+/// NOTE (#776, verified 2026-11-05): the rescued second row,
+/// (0x1B, 0x0c0b) "pop-noise reduction", was DELETED — 0x1b=0x0c0b
+/// is ALC255's value in Linux's `alc255_set_default_jack_type`
+/// (`alc255fw[]`); ALC236 takes 0x0c4b (`alc256fw[]`), and only
+/// under the headset-mode fixup, not unconditional init.
+pub const ALC236_INIT: &[CoefRow] = ALC235_INIT;
 
 /// ALC270 init.
 pub const ALC270_INIT: &[CoefRow] = &[CoefRow::new(0x14, 0x0080)];
@@ -473,6 +520,12 @@ pub const QUIRK_MSI: &[PinOverride] = &[
 // ── Quirk table ─────────────────────────────────────────────────────
 
 /// Static quirk table. Indexed by subsystem ID through `find_quirk`.
+///
+/// VERIFICATION STATUS (#776, 2026-11-05): none of these six keys
+/// verified as a codec subsystem ID against Linux
+/// `sound/hda/codecs/realtek/alc269.c` (master and v6.6) — see the
+/// module docs. The live path does not consult this table until
+/// its entries are re-derived with correct codec SSIDs.
 pub const QUIRK_TABLE: &[Quirk] = &[
     Quirk {
         subsystem_id: 0x17AA_22BE, // Lenovo X1 Carbon Gen 7
@@ -518,8 +571,11 @@ pub fn find_quirk(subsystem_id: u32) -> Option<&'static Quirk> {
     QUIRK_TABLE.iter().find(|q| q.subsystem_id == subsystem_id)
 }
 
-/// Find a quirk for a known chip ignoring subsystem ID. Used by the
-/// bring-up path as a fallback when no exact match exists.
+/// Find a quirk for a known chip ignoring subsystem ID. NOT used by
+/// the live path (#776): Linux has no such fallback, and applying
+/// another laptop's pin overrides to a machine that merely shares
+/// the codec would misroute its pins. Kept for diagnostics and
+/// tests only.
 pub fn first_for_chip(chip: RealtekChip) -> Option<&'static Quirk> {
     QUIRK_TABLE.iter().find(|q| q.chip == chip)
 }

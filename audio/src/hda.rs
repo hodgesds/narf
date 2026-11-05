@@ -265,6 +265,11 @@ pub struct CodecInfo {
     pub vendor_id: u32,
     pub revision_id: u32,
     pub afg_node_id: Option<u8>,
+    /// Codec subsystem ID (`subvendor << 16 | subdevice`, HDA
+    /// §7.3.3.2 verb 0xF01 on the root node) read at probe (#776).
+    /// `None` when the codec reports 0 or the read fails — unknown
+    /// subsystems fail open to generic behavior, never a quirk.
+    pub subsystem_id: Option<u32>,
 }
 
 const HDA_PCI_IDS: &[(&str, u16, u16)] = &[

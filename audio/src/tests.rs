@@ -379,7 +379,10 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
         _ => return TestResult::Fail("first ALC256 quirk must be the Dell entry"),
     }
 
-    // Init tables: the 18 literal tables hold 29 coef rows in total.
+    // Init tables: the 18 literal tables hold 27 coef rows in total
+    // (#776: the rescued (0x46, 0x0000) ALC256 row and (0x1B,
+    // 0x0c0b) ALC236 row were deleted as verified-wrong against
+    // Linux `alc269.c`; see `quirks.rs`).
     const BASE_CHIPS: [RealtekChip; 18] = [
         RealtekChip::Alc256,
         RealtekChip::Alc233,
@@ -401,8 +404,16 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
         RealtekChip::Alc298,
     ];
     let total_rows: usize = BASE_CHIPS.iter().map(|c| init_table_for(*c).len()).sum();
-    if total_rows != 29 {
-        return TestResult::Fail("init tables must hold 29 coef rows in total");
+    if total_rows != 27 {
+        return TestResult::Fail("init tables must hold 27 coef rows in total");
+    }
+    // The corrected ALC256-family tables hold exactly the one
+    // verified Linux plain write (alc256_init: 0x36 = 0x5757).
+    if init_table_for(RealtekChip::Alc256) != [CoefRow::new(0x36, 0x5757)] {
+        return TestResult::Fail("ALC256 init must hold only the verified 0x36 row");
+    }
+    if init_table_for(RealtekChip::Alc236) != init_table_for(RealtekChip::Alc235) {
+        return TestResult::Fail("ALC236 must alias the ALC235 init table");
     }
     if init_table_for(RealtekChip::Alc285)[1] != CoefRow::new(0x6F, 0x0007) {
         return TestResult::Fail("ALC285 init row 1 changed");
