@@ -247,7 +247,7 @@ pub fn init() {
                 dev.max_brightness()
             );
             ACPI_VIDEO_DEVS.lock().push(dev.clone());
-            crate::register_backlight(dev as Arc<dyn BacklightDevice>);
+            crate::register_backlight(dev.clone() as Arc<dyn BacklightDevice>);
             // Wire the brightness-key Notify producer (#954): the AML
             // interpreter dispatches Notify(0x86/0x87) on this path
             // to `brightness_keys::handle_notify`, which steps the
