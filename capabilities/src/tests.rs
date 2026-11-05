@@ -217,13 +217,16 @@ kernel_test_in!("capabilities", smoke_rights_lattice_derive);
 fn smoke_cap_rights_bits_are_distinct_singletons() -> TestResult {
     // Each Rights marker carries a single distinct bit. Catches a
     // refactor that collapses two markers onto the same wire bit.
-    use crate::{Grant, Invoke, Read, Rights, Spend, Write};
+    // `Create` (the SEC-B1 mint authority, #1281) included: its bit
+    // must stay a singleton distinct from the other five.
+    use crate::{Create, Grant, Invoke, Read, Rights, Spend, Write};
     let bits = [
         ("Read", Read::BITS),
         ("Write", Write::BITS),
         ("Grant", Grant::BITS),
         ("Spend", Spend::BITS),
         ("Invoke", Invoke::BITS),
+        ("Create", Create::BITS),
     ];
     for &(_, b) in bits.iter() {
         if b == 0 {
@@ -845,3 +848,191 @@ fn smoke_cap_table_install_transfer() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("capabilities", smoke_cap_table_install_transfer);
+
+// ── creator-gated mint (#1281, SEC-B1) ─────────────────────────────
+//
+// The Stage 4 deferred item: minting through `Cap::bootstrap_with`
+// requires a live `Cap<C, Create>` naming a Task-kind object.
+// `CreatorObj` below models `scheduler::Task` (`KIND == CapKind::Task`)
+// — capabilities/ cannot name that type (no scheduler dependency),
+// so the gate is generic over `C: CapType` with a runtime Task check.
+// The creator caps in these fixtures come from the legacy ungated
+// `bootstrap()`: the root creator's boot provenance is the migration
+// lane's decision (#1538), not this mechanism lane's.
+
+fn smoke_cap_create_bit_value() -> TestResult {
+    // The Create bit is the next free singleton (0b10_0000) per spec
+    // §3 — pinned here, not derived from the implementation, so a
+    // renumber is a visible failure, not a silent drift.
+    use crate::{Create, Rights};
+    if Create::BITS != 0b10_0000 {
+        return TestResult::Fail("Create::BITS != 0b10_0000 (spec §3)");
+    }
+    if Create::BITS.count_ones() != 1 {
+        return TestResult::Fail("Create::BITS is not a singleton");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_create_bit_value);
+
+fn smoke_cap_bootstrap_with_mints_live_cap() -> TestResult {
+    // Positive path: a live creator mints a live cap of the requested
+    // type/rights; distinct mints are distinct objects; the creator
+    // is unaffected; and the minted cap does not depend on the
+    // creator — revoking the creator leaves it live (the creator
+    // authorises the mint, it does not own the minted object).
+    use crate::{object_table, Cap, CapKind, CapType, Create, Write};
+    struct CreatorObj;
+    impl CapType for CreatorObj {
+        const KIND: CapKind = CapKind::Task;
+    }
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let creator: Cap<CreatorObj, Create> = Cap::bootstrap();
+    let minted: Cap<TestObj, Write> = match Cap::bootstrap_with(&creator) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("bootstrap_with refused a live creator"),
+    };
+    if !minted.is_live() {
+        return TestResult::Fail("gated mint produced a dead cap");
+    }
+    let s = minted.slot();
+    if s.rights != Write::BITS || s.type_tag != CapKind::Endpoint as u32 {
+        return TestResult::Fail("gated mint tagged wrong rights/kind");
+    }
+    if object_table::kind_at(s.index) != Some(CapKind::Endpoint) {
+        return TestResult::Fail("object_table lost the gated-minted kind");
+    }
+    let second: Cap<TestObj, Write> = match Cap::bootstrap_with(&creator) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("second gated mint failed"),
+    };
+    if second.slot().index == s.index {
+        return TestResult::Fail("two gated mints shared an object index");
+    }
+    if !creator.is_live() {
+        return TestResult::Fail("creator died from minting");
+    }
+    let killer = creator;
+    killer.revoke();
+    if !minted.is_live() {
+        return TestResult::Fail("minted cap died with its creator");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_bootstrap_with_mints_live_cap);
+
+fn smoke_cap_bootstrap_with_refuses_revoked_creator() -> TestResult {
+    // A revoked creator mints nothing: the epoch check runs before
+    // any registration, so no object-table entry is consumed either.
+    use crate::{Cap, CapError, CapKind, CapType, Create, Write};
+    struct CreatorObj;
+    impl CapType for CreatorObj {
+        const KIND: CapKind = CapKind::Task;
+    }
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let creator: Cap<CreatorObj, Create> = Cap::bootstrap();
+    let dead = creator;
+    dead.revoke();
+    match Cap::<TestObj, Write>::bootstrap_with(&creator) {
+        Err(CapError::Revoked) => {}
+        _ => return TestResult::Fail("revoked creator still minted"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "capabilities",
+    smoke_cap_bootstrap_with_refuses_revoked_creator
+);
+
+fn smoke_cap_bootstrap_with_refuses_wrong_type_creator() -> TestResult {
+    // A live Create cap over a NON-Task object (here Endpoint) must
+    // not mint: the gate is "creator names a Task-kind object", not
+    // merely "creator carries the Create bit".
+    use crate::{Cap, CapError, CapKind, CapType, Create, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let wrong_kind: Cap<TestObj, Create> = Cap::bootstrap();
+    match Cap::<TestObj, Write>::bootstrap_with(&wrong_kind) {
+        Err(CapError::TypeMismatch) => {}
+        _ => return TestResult::Fail("non-Task creator minted"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "capabilities",
+    smoke_cap_bootstrap_with_refuses_wrong_type_creator
+);
+
+fn smoke_cap_bootstrap_with_refuses_forged_rights() -> TestResult {
+    // A hand-forged creator slot: live, Task-kind, but the Create bit
+    // cleared (rights downgraded to Read). Reachable only via unsafe
+    // `Cap::mint`, so this pins the runtime rights check rather than
+    // the type system (which already pins R = Create).
+    use crate::{Cap, CapError, CapKind, CapType, Create, Read, Write};
+    struct CreatorObj;
+    impl CapType for CreatorObj {
+        const KIND: CapKind = CapKind::Task;
+    }
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let real: Cap<CreatorObj, Create> = Cap::bootstrap();
+    let mut slot = real.slot();
+    slot.rights = Read::BITS;
+    // SAFETY: the slot names a live registered object of Task kind;
+    // only the rights field is altered, which is exactly the forgery
+    // under test.
+    let forged: Cap<CreatorObj, Create> = unsafe { Cap::mint(slot) };
+    match Cap::<TestObj, Write>::bootstrap_with(&forged) {
+        Err(CapError::RightsTooWeak) => {}
+        _ => return TestResult::Fail("creator without the Create bit minted"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "capabilities",
+    smoke_cap_bootstrap_with_refuses_forged_rights
+);
+
+fn smoke_cap_creator_derive_reflexive() -> TestResult {
+    // The reflexive lattice edge: a creator can share its own
+    // authority (same object, same rights) via derive::<Create>().
+    // This is sharing, not escalation — and it is the ONLY derive
+    // edge Create has: no SubsetOf impl lets Grant (or any other
+    // right) derive Create, nor Create derive any other right.
+    // Those are compile-time properties (no impl exists), so they
+    // are stated in spec §9.8 rather than exercised here.
+    use crate::{Cap, CapKind, CapType, Create, Write};
+    struct CreatorObj;
+    impl CapType for CreatorObj {
+        const KIND: CapKind = CapKind::Task;
+    }
+    let creator: Cap<CreatorObj, Create> = Cap::bootstrap();
+    let shared: Cap<CreatorObj, Create> = match creator.derive::<Create>() {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("creator could not derive Create reflexively"),
+    };
+    if shared.slot() != creator.slot() {
+        return TestResult::Fail("reflexive creator derive changed the slot");
+    }
+    // The shared creator mints too (same object, same authority).
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    match Cap::<TestObj, Write>::bootstrap_with(&shared) {
+        Ok(_) => {}
+        Err(_) => return TestResult::Fail("shared creator could not mint"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_creator_derive_reflexive);

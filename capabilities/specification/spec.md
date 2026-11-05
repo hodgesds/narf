@@ -41,10 +41,17 @@ pub struct Cap<T, R: Rights> {
 
 pub trait Rights: Sealed { const BITS: u32; }
 pub struct Read; pub struct Write; pub struct Grant;
+pub struct Spend; pub struct Invoke; pub struct Create;
 
 impl<T, R: Rights> Cap<T, R> {
     pub fn derive<R2: Rights + SubsetOf<R>>(&self) -> Result<Cap<T, R2>, CapError>;
     pub fn badge(&self, badge: Badge)          -> Cap<T, R>;
+
+    /// Legacy ungated mint (SEC-B1, #1281) — removal tracked in #1538.
+    pub fn bootstrap() -> Self;
+    /// Creator-gated mint (§9.8): mints only when presented with a
+    /// live `Cap<C, Create>` naming a Task-kind object.
+    pub fn bootstrap_with<C: CapType>(creator: &Cap<C, Create>) -> Result<Self, CapError>;
 
     /// Authority check. Returns `Err(Revoked)` if the stored epoch is
     /// less than the current object epoch. This is the *only* valid
@@ -244,7 +251,10 @@ and, where relevant, the badge value separately.
 ## 4. Invariants & safety properties
 
 - `Cap<T, R>` cannot be constructed outside `capabilities/` — the only
-  way in is derivation from an existing cap or bootstrap at task creation.
+  ways in are derivation from an existing cap, the creator-gated mint
+  (`bootstrap_with`, §9.8), or the legacy ungated `bootstrap()` at
+  task creation (removal tracked in #1538; until it lands, "bootstrap
+  at task creation" is a convention, not an enforced gate — SEC-B1).
 - Derivation never *increases* rights (`SubsetOf` is type-checked).
 - **Type-level rights prove *prior grant*; epoch check proves *current
   validity*.** These are distinct soundness properties. The Rust type
@@ -464,6 +474,46 @@ etc.). Slot 0 in any cap table that doesn't have a
 RootAuthority is the well-known sentinel "null cap" — `invoke`
 on it returns `Err(Revoked)` deterministically.
 
+### 9.8 Creator-gated mint (SEC-B1, #1281)
+
+**Decision:** minting goes through a creator capability:
+`Cap::bootstrap_with(&Cap<C, Create>)` mints a fresh object-table
+entry only when presented with a live creator cap — a `Cap<C, Create>`
+whose slot names a `Task`-kind object (`CapKind::Task`, i.e.
+`scheduler::Task`) and carries the `Create` right bit. Checks, in
+order: creator live (`Revoked`), creator names a Task-kind object
+(`TypeMismatch`), creator slot carries the Create bit
+(`RightsTooWeak` — reachable only via a hand-forged slot, since the
+type system pins `R = Create`).
+
+Why generic `C`: `capabilities/` cannot depend on `scheduler/`, so
+the creator type cannot be named as `scheduler::Task`; the runtime
+`type_tag` check is the gate, and in practice only `scheduler::Task`
+has `KIND == CapKind::Task`.
+
+Why `Create` has no lattice edges: `SubsetOf` has no impl into or
+out of `Create` (beyond the reflexive identity, so a creator can
+share its own authority for the same object). A Grant holder must
+never derive mint authority, and a creator cap must never weaken
+into an operational cap.
+
+The minted cap is independent of the creator: revoking the creator
+does not revoke caps it minted, and minting does not consume the
+creator (sharing semantics, like §9.1 transfer).
+
+Composition with the #1363 wiring (merged PR #1502): a task creator
+mints a task's initial caps with `bootstrap_with` and installs them
+via `CapTable::install_bootstrap`. No second install path, no second
+table, no change to `derive` / `transfer` / `invoke` / `revoke` or
+to the semantics of any existing granted cap.
+
+Remainders (tracked in #1538): the root creator's boot provenance
+(which boot path mints the first `Cap<Task, Create>` and where it is
+held), migration of all 807 `::bootstrap()` call sites (285 files at
+1307de44), and removal of the ungated `bootstrap()`. Until removal
+lands, the gate is a mechanism, not an enforcement: `bootstrap()`
+still mints without authority.
+
 ## 10. ABI versioning
 
 `CAP_ABI_MAJOR = 1`, `CAP_ABI_MINOR = 0` exported via the
@@ -482,4 +532,8 @@ backward-compatible.
 
 ## 11. Open questions
 
-(none — all v0.2 questions resolved in §9)
+- **Scoped creators.** Should a creator mint only certain `CapKind`s
+  (e.g. a driver loader that may mint `Driver`-kind caps but not
+  `Task`-kind ones)? The §9.8 mechanism is all-or-nothing mint
+  authority; per-kind scoping is future work for the migration lane
+  (#1538) or a follow-on.
