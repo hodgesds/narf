@@ -677,11 +677,11 @@ impl Owner {
     /// The `rtl8723e_dm_bt_{fw,sw,hw}_coex_all_off` wrappers: idempotent
     /// (early return when already set), then set. The SW wrapper also
     /// runs its two grounded sub-commands (`agc_table` OFF,
-    /// `bb_back_off` OFF); the remaining `_8723a` sequences (firmware
+    /// `bb_back_off` OFF). The full `_8723a` sequences (firmware
     /// 3a/TDMA/DAC-swing commands, coex-table + HW PTA mode, RF LPF
-    /// corner, DAC swing, TX-rate-adapt penalty) are the tree lane's
-    /// work — see the module caveat. No NARF reader consults these
-    /// flags until that lane lands.
+    /// corner, DAC swing, TX-rate-adapt penalty) live in `dm.rs`
+    /// (`all_off_fw` / `all_off_sw` / `all_off_hw`); this wrapper keeps
+    /// its flag bookkeeping and must not be read as hardware state.
     pub fn coex_all_off<I: Io>(&mut self, io: &I) -> Result<(), Error> {
         if !self.fw_all_off {
             self.fw_all_off = true;
