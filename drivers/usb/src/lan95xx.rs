@@ -856,6 +856,7 @@ async fn reset(dev: &USBDevice, burst_cap: u32) -> Result<([u8; 6], u32, ChipId)
 
 // ── Device records + publication ────────────────────────────────
 
+#[derive(Debug)]
 pub struct Lan95xxDevice {
     pub slot_id: u8,
     /// Owning xHCI controller id ([`Xhci::id`]): slot ids are only

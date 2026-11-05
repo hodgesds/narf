@@ -744,11 +744,11 @@ async fn auto_detach_best_effort(dev: &USBDevice) {
 /// Bound AX88179 device record (mirrors the r8152 record shape).
 #[derive(Debug)]
 pub struct AxDevice {
-    pub slot_id: u8,
     /// Owning xHCI controller id ([`Xhci::id`]): slot ids are only
     /// unique within one controller, so TX and detach resolve the
     /// controller through this field, never a global accessor.
     pub controller: u8,
+    pub slot_id: u8,
     pub mac: [u8; 6],
     pub bulk_in_dci: u8,
     pub bulk_out_dci: u8,

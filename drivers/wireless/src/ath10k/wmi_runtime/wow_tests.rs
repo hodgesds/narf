@@ -355,7 +355,31 @@ fn smoke_ath10k_wow_nlo_config_layout() -> TestResult {
     }
     // Program gates net-detect on the NLO service and sets bit 7.
     let with_nd = WowlanConfig {
-        net_detect: Some(config.clone()),
+        net_detect: Some(narf_wireless::NetDetectConfig {
+            probe_ssids: config.probe_ssids.clone(),
+            frequencies_mhz: config.channels_mhz.clone(),
+            probe_ies: config.probe_ies.clone(),
+            matches: config
+                .networks
+                .iter()
+                .map(|n| narf_wireless::NetDetectMatch {
+                    ssid: n.ssid.clone(),
+                    rssi_threshold_dbm: n.rssi_threshold_dbm,
+                })
+                .collect(),
+            plans: config
+                .plans
+                .iter()
+                .map(
+                    |&(interval_secs, iterations)| narf_wireless::NetDetectScanPlan {
+                        interval_secs,
+                        iterations,
+                    },
+                )
+                .collect(),
+            delay_secs: config.delay_secs,
+            random_mac: config.random_mac,
+        }),
         ..WowlanConfig::default()
     };
     if Program::new(&with_nd, Decap::Raw, false).is_ok() {

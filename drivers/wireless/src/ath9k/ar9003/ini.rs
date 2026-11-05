@@ -381,11 +381,13 @@ impl Tables {
         Self {
             mac_core: AR9565_1P0_MAC_CORE,
             mac_post: AR9565_1P0_MAC_POSTAMBLE,
+            bb_pre: &[],
             bb_core: AR9565_1P0_BASEBAND_CORE,
             bb_post: AR9565_1P0_BASEBAND_POSTAMBLE,
             radio_core: AR9565_1P0_RADIO_CORE,
             radio_post,
             radio_post_sys2ant: &[],
+            radio_post_allmodes: &[],
             soc_pre: AR9565_1P0_SOC_PREAMBLE,
             soc_post: AR9565_1P0_SOC_POSTAMBLE,
             rx_gain,

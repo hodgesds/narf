@@ -32,8 +32,6 @@
 // tables are `[addr, 5G_HT20, 5G_HT40, 2G_HT40, 2G_HT20]`.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
-use super::initvals::*;
-
 /// Linux `ar9485_initvals.h::ar9485_1_1_mac_postamble` (transcribed from `ar9330_1p1_initvals.h::ar9331_1p1_mac_postamble`, the `#define` target).
 pub const AR9485_1_1_MAC_POSTAMBLE: &[[u32; 5]] = &[
     [0x00001030, 0x00000230, 0x00000460, 0x000002c0, 0x00000160],

@@ -4666,8 +4666,8 @@ pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     let initial_reg = rt.core.reg_info.clone();
     let shared = Shared::new(rt, secure_random);
     let mac = super::mac::Mac::new(
-        Port(shared.clone(), 0),
-        Port(shared.clone(), 0),
+        Port(shared.clone(), 0, 0),
+        Port(shared.clone(), 0, 0),
         caps.clone(),
         super::mac::MacConfig::wcn6855(),
         initial_reg.as_deref(),
