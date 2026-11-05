@@ -64,7 +64,11 @@ pub fn evaluate_prt_for(device_path: &str) -> Result<Vec<PrtEntry>, BridgeError>
             // build, so `(offset, length)` already points at the
             // package opcode.
             Some(crate::NameValue::Unparsed { offset, length }) => {
-                let mut body = alloc::vec![0u8; length];
+                // SEC-F4 (#1291): cap the allocation to the bytes
+                // the AML store actually holds at this offset; the
+                // `n < length` check below still rejects the
+                // truncated body.
+                let mut body = alloc::vec![0u8; length.min(crate::aml_remaining_len(offset))];
                 let n = crate::copy_aml_bytes(offset, &mut body);
                 if n < length {
                     return Err(AmlError::Truncated.into());
@@ -100,7 +104,11 @@ pub fn evaluate_crs_for(device_path: &str) -> Result<Vec<ResourceItem>, BridgeEr
         NodeKind::Method => evaluate_method(&crs_path, &[])?,
         NodeKind::Name => match node.value {
             Some(crate::NameValue::Unparsed { offset, length }) => {
-                let mut body = alloc::vec![0u8; length];
+                // SEC-F4 (#1291): cap the allocation to the bytes
+                // the AML store actually holds at this offset; the
+                // `n < length` check below still rejects the
+                // truncated body.
+                let mut body = alloc::vec![0u8; length.min(crate::aml_remaining_len(offset))];
                 let n = crate::copy_aml_bytes(offset, &mut body);
                 if n < length {
                     return Err(AmlError::Truncated.into());
