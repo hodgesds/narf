@@ -128,6 +128,11 @@ pub enum AcpiError {
     NoSrat,
     /// Generic table-header checksum failed.
     BadTableChecksum,
+    /// A table pointer (or its firmware-declared length) lies
+    /// outside the physical window the kernel can reach through
+    /// `PhysAddr::kernel_ptr` (SEC-F2). The pointer is rejected,
+    /// never dereferenced.
+    OutOfMappedWindow,
 }
 
 /// Common SDT header. All ACPI tables (XSDT, MADT, SRAT, MCFG, ...)
@@ -157,6 +162,74 @@ pub fn sig_matches(hdr: &SdtHeader, sig: &[u8; 4]) -> bool {
 /// Compute the 8-bit ACPI checksum: every byte summed mod 256 must be 0.
 fn checksum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0u8, |a, b| a.wrapping_add(*b))
+}
+
+/// Validate that `[phys, phys + len)` lies inside the physical window
+/// the kernel can actually reach through [`PhysAddr::kernel_ptr`]
+/// (SEC-F2). The window end is [`narf_memory::phys_alloc_ceiling`]:
+/// the top of boot-donated RAM, which is also the extent of the
+/// high-half direct map `init_mmu` installs — and, before the direct
+/// map comes up, the early 4 GiB ceiling. Both answer the same
+/// question, "is this address one the kernel can actually reach?",
+/// and the ceiling is fail-closed (0 / uninitialized → everything
+/// is rejected) so a table pointer can never drive a read past the
+/// mapped window.
+///
+/// This is an upper bound only: MMIO below the top of RAM (LAPIC,
+/// PCI hole, ...) still passes it. A per-table `ioremap` would close
+/// that residual; what this closes is the wild-pointer / absurd-length
+/// hole — a firmware-declared `length` of up to 4 GiB, or a child
+/// pointer into unmapped space, faulting the kernel on first touch.
+pub fn check_table_window(phys: u64, len: usize) -> Result<(), AcpiError> {
+    let end = phys
+        .checked_add(len as u64)
+        .ok_or(AcpiError::OutOfMappedWindow)?;
+    if end > narf_memory::phys_alloc_ceiling() {
+        return Err(AcpiError::OutOfMappedWindow);
+    }
+    Ok(())
+}
+
+/// Read an SDT header at `phys` after validating the header *and*
+/// the table's full firmware-declared length against the mapped
+/// window — no byte is read before its range is proven in-window
+/// (SEC-F2). Returns the header; the caller may then slice
+/// `[phys, phys + length)` knowing the range was validated.
+///
+/// # Safety
+/// `phys` must be a physical address (or a test frame's address);
+/// the window check bounds the read, but the window itself is only
+/// as good as the boot memory map it was sized from.
+pub unsafe fn read_table_header(phys: u64) -> Result<SdtHeader, AcpiError> {
+    check_table_window(phys, SDT_HEADER_SIZE)?;
+    let p = narf_memory::PhysAddr::new(phys).kernel_ptr::<SdtHeader>();
+    // SAFETY: header range validated above.
+    let hdr = unsafe { p.read_unaligned() };
+    let total = hdr.length as usize;
+    if total < SDT_HEADER_SIZE {
+        return Err(AcpiError::BadXsdtSignature);
+    }
+    check_table_window(phys, total)?;
+    Ok(hdr)
+}
+
+/// Read an SDT header at `phys`, validate the whole table against
+/// the mapped window, and verify the ACPI 8-bit checksum over the
+/// full firmware-declared length (ACPI 6.5 §5.2: the bytes of the
+/// table must sum to zero mod 256). Returns the header on success.
+///
+/// # Safety
+/// Same precondition as [`read_table_header`].
+pub unsafe fn verify_table_checksum(phys: u64) -> Result<SdtHeader, AcpiError> {
+    let hdr = unsafe { read_table_header(phys)? };
+    let total = hdr.length as usize;
+    let p = narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>();
+    // SAFETY: read_table_header validated phys+total against the window.
+    let body = unsafe { core::slice::from_raw_parts(p, total) };
+    if checksum(body) != 0 {
+        return Err(AcpiError::BadTableChecksum);
+    }
+    Ok(hdr)
 }
 
 /// Scan the legacy BIOS area for an RSDP signature on 16-byte
@@ -245,24 +318,27 @@ pub unsafe fn parse_rsdp(phys: PhysAddr) -> Result<u64, AcpiError> {
 ///
 /// # Safety
 /// `phys` must point at identity-mapped memory covering at least
-/// the table's advertised `length`.
+/// the table's advertised `length`. The XSDT itself and every child
+/// pointer are validated against the mapped window before any byte
+/// is read (SEC-F2): an out-of-window or malformed child entry is
+/// skipped — like the existing zero-pointer skip — never handed to
+/// the callback and never dereferenced.
 pub unsafe fn walk_xsdt<F>(phys: u64, mut f: F) -> Result<(), AcpiError>
 where
     F: FnMut(u64, &SdtHeader),
 {
-    let p = narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>();
-    // SAFETY: caller-asserted readable region.
-    let hdr = unsafe { (p as *const SdtHeader).read_unaligned() };
+    // Header + full-length window validation happens here, before
+    // the first read; the checksum below then runs over the
+    // already-bounded slice.
+    let hdr = unsafe { read_table_header(phys)? };
     let is_xsdt = &hdr.signature == b"XSDT";
     let is_rsdt = &hdr.signature == b"RSDT";
     if !is_xsdt && !is_rsdt {
         return Err(AcpiError::BadXsdtSignature);
     }
     let total = hdr.length as usize;
-    if total < SDT_HEADER_SIZE {
-        return Err(AcpiError::BadXsdtSignature);
-    }
-    // SAFETY: caller-asserted region covers `total`.
+    let p = narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>();
+    // SAFETY: read_table_header validated phys+total against the window.
     let body_bytes = unsafe { core::slice::from_raw_parts(p, total) };
     if checksum(body_bytes) != 0 {
         return Err(AcpiError::BadTableChecksum);
@@ -284,9 +360,13 @@ where
         if phys == 0 {
             continue;
         }
-        // SAFETY: caller-asserted: every XSDT entry is identity-mapped.
-        let child = unsafe {
-            (narf_memory::PhysAddr::new(phys).kernel_ptr::<SdtHeader>()).read_unaligned()
+        // SEC-F2: validate the child header + its full declared
+        // length against the mapped window BEFORE dereferencing
+        // the pointer. Out-of-window / malformed children are
+        // skipped, never passed to the callback.
+        let child = match unsafe { read_table_header(phys) } {
+            Ok(h) => h,
+            Err(_) => continue,
         };
         f(phys, &child);
     }
