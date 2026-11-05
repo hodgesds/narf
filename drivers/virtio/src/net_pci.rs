@@ -4913,9 +4913,9 @@ mod tx_tests {
                 .tx_dma_on_with_meta(0, buf, FRAME_LEN as u32, narf_net::TxMeta::with_tso(1024))
                 .map_err(|_| "untagged TSO submit rejected")?;
             // Tagged TSO submit: same frame with a tag inserted.
-            let mut tagged = vec![0; FRAME_LEN + VLAN_TAG_LEN];
+            let mut tagged = alloc::vec![0; FRAME_LEN + VLAN_TAG_LEN];
             {
-                let mut plain = vec![0; FRAME_LEN];
+                let mut plain = alloc::vec![0; FRAME_LEN];
                 build_untagged(&mut plain);
                 let len =
                     copy_frame_with_vlan(&mut tagged, &plain, 0x1234).ok_or("tag insert failed")?;
@@ -5125,7 +5125,7 @@ mod tx_tests {
                 rx_notify_off: 0,
                 tx_notify_off: 1,
             };
-            let pairs = vec![pair];
+            let pairs = alloc::vec![pair];
             let dev = VirtioNetPci {
                 common: region(),
                 notify: region(),
