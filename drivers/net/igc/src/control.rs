@@ -283,6 +283,22 @@ impl NicControl for Igc {
             }
         })
     }
+    fn set_nvm(&self, magic: u32, offset: u32, data: &[u8]) -> Result<(), i32> {
+        let _control = self.control().map_err(|_| 16)?;
+        let _operation = self.clock_operation()?;
+        // Linux igc_ethtool_set_eeprom (igc_ethtool.c:507-575): len == 0 and
+        // flash-absent i225 both refuse with -EOPNOTSUPP (95); a magic other
+        // than vendor | (device << 16) fails with -EFAULT (14); an
+        // out-of-range write fails with -EINVAL (22).
+        hardware::write_eeprom(&self.hw, magic, self.device.id.device, offset, data).map_err(|e| {
+            match e {
+                IgcError::Other("EEPROM empty" | "no flash") => 95,
+                IgcError::Other("bad EEPROM magic") => 14,
+                IgcError::Other("NVM range") => 22,
+                _ => 5,
+            }
+        })
+    }
     fn diagnostics(&self, offline: bool) -> Result<Vec<Diagnostic>, i32> {
         if offline {
             self.recover().map_err(|_| 5)?;

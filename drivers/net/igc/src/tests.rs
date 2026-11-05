@@ -6,6 +6,7 @@ use crate::{
     hardware::{self, Registers},
     igc::decode_link,
     packet::{rx_metadata, TxPlan},
+    protocol::IgcError,
     queue::{Queue, RxWriteback},
 };
 use alloc::{collections::BTreeMap, vec, vec::Vec};
@@ -24,6 +25,8 @@ struct Model {
     phy: RefCell<BTreeMap<u8, u16>>,
     mmd: RefCell<BTreeMap<(u16, u16), u16>>,
     writes: RefCell<Vec<(u64, u32)>>,
+    /// Shadow-RAM words landed by SRWR writes, backing later EERD reads.
+    shadow: RefCell<BTreeMap<u16, u16>>,
     mmd_dev: Cell<u16>,
     mmd_reg: Cell<u16>,
     stuck_master: Cell<bool>,
@@ -91,7 +94,24 @@ impl Registers for Model {
             value &= !(1 << 25);
         }
         if reg == 0x12014 && !self.stuck_nvm.get() {
-            value = (((value >> 2) ^ 0x5aa5) << 16) | 2;
+            // EERD: ADDR bits 15:2 select the word; a word landed in shadow
+            // RAM by SRWR reads back, otherwise the deterministic pattern.
+            let addr = ((value >> 2) & 0x3fff) as u16;
+            if let Some(word) = self.shadow.borrow().get(&addr) {
+                value = (u32::from(*word) << 16) | 2;
+            } else {
+                value = (((value >> 2) ^ 0x5aa5) << 16) | 2;
+            }
+        }
+        if reg == 0x12018 && !self.stuck_nvm.get() {
+            // SRWR: ADDR bits 15:2, DATA bits 31:16, START bit 0
+            // (igc_regs.h:312, igc_defines.h:205-208). A completed write
+            // lands in shadow RAM and sets DONE bit 1; a stuck NVM leaves
+            // both untouched, so the poll times out.
+            self.shadow
+                .borrow_mut()
+                .insert(((value >> 2) & 0x3fff) as u16, (value >> 16) as u16);
+            value |= 2;
         }
         if reg == 0x20 {
             let index = ((value >> 16) & 31) as u8;
@@ -1622,6 +1642,142 @@ kernel_test_in!(
     "drivers/net/igc",
     smoke_igc_nvm_reads_odd_ranges_without_writes
 );
+fn smoke_igc_nvm_write_edge_words_checksum_and_flash() -> TestResult {
+    let m = Model::new();
+    // EECD: AUTO_RD done + flash detected + flash-update done
+    // (IGC_EECD_FLASH_DETECTED_I225 0x00080000, IGC_EECD_FLUDONE_I225
+    // 0x04000000, igc_defines.h:199-200).
+    m.regs
+        .borrow_mut()
+        .insert(0x10, 0x200 | 0x00080000 | 0x04000000);
+    // Odd offset + odd end: both edge words read-modify-write.
+    // Untouched bytes come from the model pattern word i = i ^ 0x5aa5:
+    // word 1 0x5aa4 -> 0x11a4, word 2 -> 0x3322, word 3 0x5aa6 -> 0x5a44.
+    check!(
+        hardware::write_eeprom(
+            &m,
+            0x8086 | (0x15f3 << 16),
+            0x15f3,
+            3,
+            &[0x11, 0x22, 0x33, 0x44]
+        )
+        .is_ok(),
+        "flash-present NVM write failed"
+    );
+    let mut sum = 0u16;
+    for i in 0..0x3f {
+        let word = match i {
+            1 => 0x11a4,
+            2 => 0x3322,
+            3 => 0x5a44,
+            _ => (i as u16) ^ 0x5aa5,
+        };
+        sum = sum.wrapping_add(word);
+    }
+    let expected_checksum = 0xbaba_u16.wrapping_sub(sum);
+    let srwr: Vec<u32> = m
+        .writes
+        .borrow()
+        .iter()
+        .filter(|(reg, _)| *reg == 0x12018)
+        .map(|(_, v)| *v)
+        .collect();
+    check!(
+        srwr == [
+            (1 << 2) | (0x11a4 << 16) | 1,
+            (2 << 2) | (0x3322 << 16) | 1,
+            (3 << 2) | (0x5a44 << 16) | 1,
+            (0x3f << 2) | (u32::from(expected_checksum) << 16) | 1,
+        ],
+        "SRWR write sequence wrong"
+    );
+    check!(
+        m.writes
+            .borrow()
+            .iter()
+            .any(|(reg, v)| *reg == 0x10 && v & 0x00800000 != 0),
+        "flash commit (EECD FLUPD) not issued"
+    );
+    check!(
+        hardware::read_nvm(&m, 3, 4).unwrap() == [0x11, 0x22, 0x33, 0x44],
+        "written NVM bytes did not read back"
+    );
+    let image = hardware::read_nvm(&m, 0, 128).unwrap();
+    let total = image.chunks_exact(2).fold(0u16, |s, b| {
+        s.wrapping_add(u16::from_le_bytes([b[0], b[1]]))
+    });
+    check!(total == 0xbaba, "NVM checksum invariant broken after write");
+    check!(
+        m.value(0x5b5c) & 1 == 0 && m.value(0x5b50) & 3 == 0,
+        "NVM semaphore not released"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_nvm_write_edge_words_checksum_and_flash
+);
+fn smoke_igc_nvm_write_refusals() -> TestResult {
+    let m = Model::new();
+    m.regs
+        .borrow_mut()
+        .insert(0x10, 0x200 | 0x00080000 | 0x04000000);
+    let magic = 0x8086 | (0x15f3 << 16);
+    let srwr_writes = || {
+        m.writes
+            .borrow()
+            .iter()
+            .filter(|(reg, _)| *reg == 0x12018)
+            .count()
+    };
+    check!(
+        hardware::write_eeprom(&m, magic, 0x15f3, 0, &[]) == Err(IgcError::Other("EEPROM empty"))
+            && srwr_writes() == 0,
+        "empty EEPROM write not refused"
+    );
+    check!(
+        hardware::write_eeprom(&m, 0xdeadbeef, 0x15f3, 0, &[1])
+            == Err(IgcError::Other("bad EEPROM magic"))
+            && srwr_writes() == 0,
+        "bad EEPROM magic not refused"
+    );
+    check!(
+        hardware::write_eeprom(&m, magic, 0x15f3, 127, &[1, 2])
+            == Err(IgcError::Other("NVM range"))
+            && srwr_writes() == 0,
+        "out-of-range EEPROM write not refused"
+    );
+    // Flash-absent i225: no flash detected, write op does not exist.
+    let bare = Model::new();
+    check!(
+        !hardware::flash_present(&bare)
+            && hardware::write_eeprom(&bare, magic, 0x15f3, 0, &[1])
+                == Err(IgcError::Other("no flash"))
+            && bare
+                .writes
+                .borrow()
+                .iter()
+                .filter(|(reg, _)| *reg == 0x12018)
+                .count()
+                == 0,
+        "flash-absent NVM write not refused"
+    );
+    // Stuck NVM: the edge-word read times out, nothing lands in shadow
+    // RAM and no flash commit is issued.
+    m.stuck_nvm.set(true);
+    check!(
+        hardware::write_eeprom(&m, magic, 0x15f3, 3, &[0x11, 0x22]).is_err()
+            && m.shadow.borrow().is_empty()
+            && !m
+                .writes
+                .borrow()
+                .iter()
+                .any(|(reg, v)| *reg == 0x10 && v & 0x00800000 != 0),
+        "stuck NVM write partially landed"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_nvm_write_refusals);
 fn smoke_igc_timestamp_timeout_quarantine_and_clock_rate() -> TestResult {
     let m = Model::new();
     let mut clock = crate::ptp::ClockState::new();

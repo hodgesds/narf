@@ -561,7 +561,7 @@ pub(crate) fn read_nvm(
     length: u32,
 ) -> Result<alloc::vec::Vec<u8>, IgcError> {
     // I225 shadow RAM is read through EERD at 0x12014, never legacy 0x14.
-    let size = 2u32 << (((r.read(0x10) & 0x7800) >> 11) + 6).min(15);
+    let size = nvm_size(r);
     if offset.checked_add(length).is_none_or(|end| end > size) {
         return Err(IgcError::Other("NVM range"));
     }
@@ -581,6 +581,151 @@ pub(crate) fn read_nvm(
         }
         Ok(bytes)
     })
+}
+
+/// NVM size in bytes from EECD SIZE_EX (igc_regs.h:10, igc_defines.h:196-197).
+#[cfg(feature = "builtin")]
+fn nvm_size(r: &impl Registers) -> u32 {
+    2u32 << (((r.read(0x10) & 0x7800) >> 11) + 6).min(15)
+}
+
+/// Flash presence on i225-class silicon: EECD FLASH_DETECTED bit
+/// (IGC_EECD_FLASH_DETECTED_I225 0x00080000, igc_defines.h:200). Linux
+/// refuses the ethtool EEPROM write when no flash is detected on i225
+/// (igc_ethtool.c:520-523); without flash there is no write op at all
+/// (igc_init_nvm_params_i225 leaves ops.write NULL, igc_i225.c:483-491).
+#[cfg(feature = "builtin")]
+pub(crate) fn flash_present(r: &impl Registers) -> bool {
+    r.read(0x10) & 0x00080000 != 0
+}
+
+/// Write words to shadow RAM through SRWR at 0x12018 (igc_regs.h:312).
+/// Linux igc_write_nvm_srwr / igc_write_nvm_srwr_i225 (igc_i225.c:226-309):
+/// per word `(offset << 2) | (data << 16) | START`, polled for the DONE bit
+/// (IGC_NVM_RW_REG_DONE 2, igc_defines.h:206; ADDR shift 2, DATA shift 16,
+/// START 1, igc_defines.h:205-208), in bursts of at most 512 words under
+/// one SW/FW semaphore hold (IGC_EERD_EEWR_MAX_COUNT, igc_defines.h:202).
+/// The checksum is not updated here; Linux warns the shadow RAM most
+/// likely holds an invalid checksum until igc_update_nvm_checksum runs.
+#[cfg(feature = "builtin")]
+pub(crate) fn write_nvm_words(
+    r: &impl Registers,
+    offset: u32,
+    words: &[u16],
+) -> Result<(), IgcError> {
+    let word_size = nvm_size(r) / 2;
+    if words.is_empty() || offset >= word_size || words.len() > (word_size - offset) as usize {
+        return Err(IgcError::Other("NVM range"));
+    }
+    let mut written = 0usize;
+    while written < words.len() {
+        let count = (words.len() - written).min(512);
+        let chunk = &words[written..written + count];
+        let base = offset + written as u32;
+        swfw_transaction(r, 1, || {
+            for (i, word) in chunk.iter().enumerate() {
+                r.write(
+                    0x12018,
+                    ((base + i as u32) << 2) | (u32::from(*word) << 16) | 1,
+                );
+                poll(r, 0x12018, 2, 2)?;
+            }
+            Ok(())
+        })?;
+        written += count;
+    }
+    Ok(())
+}
+
+/// Byte-level NVM write with Linux's ethtool edge-word read-modify-write
+/// (igc_ethtool.c:507-575): an odd start offset preserves the first word's
+/// low byte, an odd end offset preserves the last word's high byte; the
+/// checksum update is a separate step, as in Linux.
+#[cfg(feature = "builtin")]
+pub(crate) fn write_nvm(r: &impl Registers, offset: u32, data: &[u8]) -> Result<(), IgcError> {
+    let size = nvm_size(r);
+    if data.is_empty()
+        || offset
+            .checked_add(data.len() as u32)
+            .is_none_or(|end| end > size)
+    {
+        return Err(IgcError::Other("NVM range"));
+    }
+    let first_word = offset / 2;
+    let last_word = (offset + data.len() as u32 - 1) / 2;
+    let count = (last_word - first_word + 1) as usize;
+    // Linux builds the word buffer by pre-reading the edge words and then
+    // memcpy'ing the payload over them at byte offset (offset & 1): a
+    // payload byte *replaces* the pre-read byte, it is never OR'd into it.
+    let mut bytes = alloc::vec![0u8; count * 2];
+    if offset & 1 != 0 {
+        bytes[..2].copy_from_slice(&read_nvm(r, first_word * 2, 2)?);
+    }
+    if (offset + data.len() as u32) & 1 != 0 {
+        bytes[count * 2 - 2..].copy_from_slice(&read_nvm(r, last_word * 2, 2)?);
+    }
+    bytes[(offset & 1) as usize..(offset & 1) as usize + data.len()].copy_from_slice(data);
+    let words: alloc::vec::Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    write_nvm_words(r, first_word, &words)
+}
+
+/// Recompute the NVM checksum and commit shadow RAM to flash.
+/// Linux igc_update_nvm_checksum_i225 + igc_update_flash_i225
+/// (igc_i225.c:369-455): sum words 0..NVM_CHECKSUM_REG (0x3F, igc_defines.h:213),
+/// store NVM_SUM (0xBABA, igc_defines.h:216) minus the sum at word 0x3F, then
+/// set EECD FLUPD (0x00800000) once FLUDONE (0x04000000) is observed and poll
+/// FLUDONE again (igc_defines.h:198-201, IGC_FLUDONE_ATTEMPTS 20000).
+/// The stored word makes the 64-word sum equal 0xBABA, the invariant
+/// igc_validate_nvm_checksum checks (igc_nvm.c:111-135).
+#[cfg(feature = "builtin")]
+pub(crate) fn update_nvm_checksum(r: &impl Registers) -> Result<(), IgcError> {
+    // Fail fast on an unreadable word 0, as Linux does before acquiring.
+    let _probe = read_nvm(r, 0, 2)?;
+    let bytes = read_nvm(r, 0, 128)?;
+    let mut checksum = 0u16;
+    for i in 0..0x3f {
+        checksum = checksum.wrapping_add(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]));
+    }
+    let checksum = 0xbaba_u16.wrapping_sub(checksum);
+    write_nvm_words(r, 0x3f, &[checksum])?;
+    update_flash(r)
+}
+
+/// Commit shadow RAM to flash (igc_update_flash_i225, igc_i225.c:372-396).
+#[cfg(feature = "builtin")]
+fn update_flash(r: &impl Registers) -> Result<(), IgcError> {
+    poll(r, 0x10, 0x04000000, 0x04000000)?;
+    r.write(0x10, r.read(0x10) | 0x00800000);
+    poll(r, 0x10, 0x04000000, 0x04000000)
+}
+
+/// Linux igc_ethtool_set_eeprom (igc_ethtool.c:507-575): len == 0 and a
+/// flash-absent i225 both refuse with -EOPNOTSUPP; a magic other than
+/// vendor | (device << 16) fails with -EFAULT; a successful write is
+/// followed by the checksum update. Distinct `Other` strings let the
+/// control plane map each refusal to its Linux errno.
+#[cfg(feature = "builtin")]
+pub(crate) fn write_eeprom(
+    r: &impl Registers,
+    magic: u32,
+    device_id: u16,
+    offset: u32,
+    data: &[u8],
+) -> Result<(), IgcError> {
+    if data.is_empty() {
+        return Err(IgcError::Other("EEPROM empty"));
+    }
+    if !flash_present(r) {
+        return Err(IgcError::Other("no flash"));
+    }
+    if magic != 0x8086 | (u32::from(device_id) << 16) {
+        return Err(IgcError::Other("bad EEPROM magic"));
+    }
+    write_nvm(r, offset, data)?;
+    update_nvm_checksum(r)
 }
 
 /// Linux wake flags differ from WUFC. Engines remain DMA-disabled while
