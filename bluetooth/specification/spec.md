@@ -1,7 +1,7 @@
 # narf-bluetooth — Bluetooth HCI core
 
 Clean-room implementation of the Bluetooth Host Controller Interface
-(HCI) packet layer + USB transport binding.
+(HCI) packet layer + USB and H4 UART transport bindings.
 
 ## Sources (public only)
 
@@ -188,9 +188,19 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   establishes the link and registers the transport for
   `bring_up_all`. No boot initcall yet: claiming a UART at boot
   would steal it from the `/dev/ttyS<N>` data ttys, so the boot
-  bind is a follow-up. The H4 lane's `H4BytePort` does not exist
-  on main; when it lands, H4 should adopt the shared `BytePort`
+  bind is a follow-up. The H4 lane's `H4BytePort` is a separate
+  trait from `BytePort`; H4 should adopt the shared `BytePort`
   trait and the two transports should share one 8250 adapter.
+- `h4_transport::H4Transport` — `HciTransport` over a UART byte port
+  (`H4BytePort`: `write_byte` / `read_byte`, implemented for the
+  8250/16550 `Uart8250` in `narf-drivers-serial`). H4 framing is the
+  existing `h4` codec (Vol 4 Part A §2); the transport demultiplexes
+  the single RX byte stream into event / ACL / SCO queues.
+  `h4_transport::bind_uart(name, baud)` looks a port up in the serial
+  registry, programs it, and registers the transport, so the Stage::Late
+  `bluetooth-bringup` initcall picks it up via `bring_up_all`. No
+  auto-bind: nothing in the tree says which UART (if any) has a Bluetooth
+  module attached, and binding the console port (`COM1`) is refused.
 - `controller::register_ready_transport(transport, info)` adopts a controller
   whose late-discovered driver completed that same sequence on a native async
   transport path. Registration is idempotent by transport identity and returns
