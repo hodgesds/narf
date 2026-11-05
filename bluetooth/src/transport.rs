@@ -49,6 +49,13 @@ pub enum TransportError {
     /// Generic catch-all for non-fatal transport errors that should
     /// trigger a retry.
     Transient,
+    /// The transport cannot carry this packet — e.g. SCO over a USB
+    /// controller that offers no isochronous endpoints, a SCO packet
+    /// larger than the selected isoch alternate's budget, or an
+    /// alternate-setting switch the device's endpoint layout does
+    /// not support. Fail-closed: callers must not fall back to
+    /// another endpoint (in particular, never to bulk-OUT).
+    Unsupported,
 }
 
 /// HCI transport interface. One instance per Bluetooth controller.

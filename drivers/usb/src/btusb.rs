@@ -35,9 +35,17 @@
 //!    transfer paths: Reset → version → BD_ADDR → buffer sizes → event mask.
 //! 6. Log `bluetooth: $vendor adapter, HCI v$ver, Bluetooth $bt_ver`.
 //! 7. Register an `HciTransport` against the slot for Stage-1+ users.
+//! 8. SCO/eSCO isochronous transport (issue #817): record the SCO
+//!    isoch endpoints of every alternate setting at bind, select
+//!    the largest-budget alternate (see `BtEndpoints::best_sco_alt`),
+//!    configure its isoch endpoints together with the base three,
+//!    SET_INTERFACE to it after SET_CONFIGURATION, and carry SCO
+//!    packets over isoch (`send_sco` / `recv_sco`). A device with
+//!    no isoch endpoints still binds for ACL/events; its transport
+//!    refuses SCO with `TransportError::Unsupported` instead of
+//!    silently routing SCO to bulk-OUT.
 //!
-//! Out of scope for Stage 0: SCO/eSCO isoch streaming, LE
-//! Advertising, and BR/EDR Inquiry.
+//! Out of scope for Stage 0: LE Advertising and BR/EDR Inquiry.
 //! Those land as separate stages. (The ACL data plane is driven by
 //! the `narf_bluetooth::pump` task registered at bring-up.)
 //!
@@ -58,7 +66,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use narf_bluetooth::controller::ControllerInfo;
 use narf_bluetooth::event::{CommandComplete, CommandStatus, EventCode};
@@ -85,6 +93,64 @@ const REQ_HCI_COMMAND: u8 = 0x00;
 /// Standard USB SET_CONFIGURATION request — USB 2.0 §9.4.7.
 const STD_REQ_SET_CONFIGURATION: u8 = 0x09;
 
+/// Standard USB SET_INTERFACE request — USB 2.0 §9.4.10.
+/// `bmRequestType` 0x01 (Host-to-Device, Standard, Interface),
+/// `wValue` = alternate setting, `wIndex` = interface number.
+const STD_REQ_SET_INTERFACE: u8 = 0x0B;
+/// `bmRequestType` for SET_INTERFACE (Host-to-Device | Standard |
+/// Interface).
+const RT_SET_INTERFACE: u8 = 0x01;
+
+/// Length of an HCI SCO Data packet header (Vol 4 Part E §5.4.3:
+/// 16-bit handle+flags, 8-bit length). The isoch endpoint's
+/// `wMaxPacketSize` must cover header + payload.
+pub const SCO_PACKET_HEADER_LEN: usize = 3;
+
+/// Maximum number of SCO alternate settings recorded per device.
+/// The Bluetooth USB layout is alt 0 (no isoch endpoints) plus
+/// one isoch-carrying alternate per SCO packet size the device
+/// offers; 8 slots cover that shape with a spare. A device
+/// advertising more isoch alternates has its first 8 recorded and
+/// the rest ignored — discovery never fails on a long alt table.
+pub const MAX_SCO_ALT_SETTINGS: usize = 8;
+
+/// One alternate setting of the HCI interface that carries SCO
+/// isochronous endpoints (Vol 4 Part B §2.1: the isoch pair is
+/// optional and appears only under non-zero alternate settings,
+/// one setting per isoch packet budget).
+///
+/// A setting is *selectable* only when both directions are
+/// present — SCO is bidirectional, and a half-populated setting
+/// cannot carry a call. Discovery still records partial settings
+/// so diagnostics can show what the device offered.
+#[derive(Copy, Clone, Debug)]
+pub struct ScoAltSetting {
+    /// `bAlternateSetting` of the interface descriptor that owns
+    /// these endpoints.
+    pub alt_setting: u8,
+    /// Isochronous-IN endpoint carrying SCO data device→host.
+    pub sco_in: Option<EndpointConfig>,
+    /// Isochronous-OUT endpoint carrying SCO data host→device.
+    pub sco_out: Option<EndpointConfig>,
+}
+
+impl ScoAltSetting {
+    /// Both isoch directions present.
+    pub fn is_complete(self) -> bool {
+        self.sco_in.is_some() && self.sco_out.is_some()
+    }
+
+    /// Smallest of the two directions' `wMaxPacketSize` values —
+    /// the per-packet budget a SCO packet must fit in both
+    /// directions. `None` when the setting is incomplete.
+    pub fn packet_budget(self) -> Option<u16> {
+        match (self.sco_in, self.sco_out) {
+            (Some(i), Some(o)) => Some(i.max_packet.min(o.max_packet)),
+            _ => None,
+        }
+    }
+}
+
 /// Endpoints required for a Stage-0 HCI USB transport.
 #[derive(Copy, Clone, Debug)]
 pub struct BtEndpoints {
@@ -98,6 +164,72 @@ pub struct BtEndpoints {
     pub acl_in: EndpointConfig,
     /// Bulk-OUT endpoint carrying ACL data host→device.
     pub acl_out: EndpointConfig,
+    /// SCO isoch alternate settings, in descriptor order. `None`
+    /// slots are unused. Alt 0 (no isoch endpoints) never appears
+    /// here — only settings that carry at least one isoch endpoint.
+    /// Empty when the device offers no SCO transport at all.
+    pub sco_alts: [Option<ScoAltSetting>; MAX_SCO_ALT_SETTINGS],
+}
+
+impl BtEndpoints {
+    /// Number of recorded SCO alternate settings.
+    pub fn sco_alt_count(self) -> usize {
+        self.sco_alts.iter().filter(|a| a.is_some()).count()
+    }
+
+    /// `true` when the device offers any SCO isoch transport.
+    pub fn has_sco(self) -> bool {
+        self.sco_alts.iter().flatten().any(|a| a.is_complete())
+    }
+
+    /// The complete SCO alternate with the largest per-packet
+    /// budget (ties → lowest alternate number). This is the bind-time
+    /// choice: the controller's SCO MTU is only known after
+    /// HCI_Read_Buffer_Size, and the xHC endpoint contexts are
+    /// configured exactly once at bind, so bind configures the
+    /// largest budget — every SCO packet the device offers then
+    /// fits, and `select_sco_alt_setting` can only switch down.
+    pub fn best_sco_alt(self) -> Option<ScoAltSetting> {
+        let mut best: Option<ScoAltSetting> = None;
+        for alt in self.sco_alts.iter().flatten() {
+            if !alt.is_complete() {
+                continue;
+            }
+            let budget = alt.packet_budget().unwrap_or(0);
+            let better = match best {
+                None => true,
+                Some(b) => {
+                    budget > b.packet_budget().unwrap_or(0)
+                        || (budget == b.packet_budget().unwrap_or(0)
+                            && alt.alt_setting < b.alt_setting)
+                }
+            };
+            if better {
+                best = Some(*alt);
+            }
+        }
+        best
+    }
+
+    /// The complete SCO alternate with the smallest budget that
+    /// still fits a SCO packet carrying `payload_len` payload bytes
+    /// (budget ≥ `payload_len + SCO_PACKET_HEADER_LEN`); ties →
+    /// lowest alternate number. `None` when no recorded alternate
+    /// fits — the caller must refuse the packet, never truncate it
+    /// or route it to another endpoint.
+    pub fn sco_alt_for_payload(self, payload_len: usize) -> Option<ScoAltSetting> {
+        // Compared in `usize`: truncating `need` to `u16` would wrap
+        // a huge payload to a small budget and select an alternate
+        // that cannot carry it.
+        let need = payload_len.saturating_add(SCO_PACKET_HEADER_LEN);
+        self.sco_alts
+            .iter()
+            .flatten()
+            .filter(|a| a.is_complete())
+            .filter(|a| a.packet_budget().unwrap_or(0) as usize >= need)
+            .min_by_key(|a| (a.packet_budget().unwrap_or(0), a.alt_setting))
+            .copied()
+    }
 }
 
 /// Errors returned from the bind path.
@@ -131,6 +263,14 @@ pub enum BtUsbError {
 /// if no matching interface exists, or one with the required endpoints
 /// is missing.
 ///
+/// Also records the SCO isochronous endpoints of every alternate
+/// setting of that interface (`BtEndpoints::sco_alts`): alt 0
+/// normally carries only the base three endpoints, and each
+/// non-zero alternate adds an isoch IN/OUT pair with a larger
+/// `wMaxPacketSize` (Vol 4 Part B §2.1). A device with no isoch
+/// endpoint in any alternate still resolves — `sco_alts` is empty
+/// and SCO is refused at the transport, not at discovery.
+///
 /// Wire layout per USB 2.0 §9.6.5 (Interface) / §9.6.6 (Endpoint).
 /// `bmAttributes` low 2 bits = transfer type: 0 control, 1 isoch,
 /// 2 bulk, 3 interrupt.
@@ -146,6 +286,10 @@ pub fn find_bt_endpoints(cfg: &[u8]) -> Result<BtEndpoints, BtUsbError> {
     let mut acl_in: Option<EndpointConfig> = None;
     let mut acl_out: Option<EndpointConfig> = None;
     let mut in_match = false;
+    // `bAlternateSetting` of the interface descriptor most
+    // recently seen while `in_match` is true.
+    let mut alt_setting: u8 = 0;
+    let mut sco_alts: [Option<ScoAltSetting>; MAX_SCO_ALT_SETTINGS] = [None; MAX_SCO_ALT_SETTINGS];
 
     while i + 2 <= cfg.len() {
         let len = cfg[i] as usize;
@@ -161,8 +305,11 @@ pub fn find_bt_endpoints(cfg: &[u8]) -> Result<BtEndpoints, BtUsbError> {
                 in_match = class == USB_CLASS_WIRELESS
                     && sub == USB_SUBCLASS_RF
                     && proto == USB_PROTOCOL_BLUETOOTH;
-                if in_match && interface.is_none() {
-                    interface = Some(cfg[i + 2]);
+                if in_match {
+                    if interface.is_none() {
+                        interface = Some(cfg[i + 2]);
+                    }
+                    alt_setting = cfg[i + 3];
                 }
             }
             // Endpoint Descriptor (§9.6.6).
@@ -200,6 +347,43 @@ pub fn find_bt_endpoints(cfg: &[u8]) -> Result<BtEndpoints, BtUsbError> {
                             interval: 0,
                         });
                     }
+                    // Isochronous — SCO data. Recorded per
+                    // alternate setting, first endpoint per
+                    // direction wins; the base three above are
+                    // unaffected (alternates repeat them).
+                    (1, true) | (1, false) => {
+                        let kind = if is_in {
+                            EndpointKind::IsochIn
+                        } else {
+                            EndpointKind::IsochOut
+                        };
+                        let ep = EndpointConfig {
+                            ep_addr,
+                            max_packet: mps,
+                            kind,
+                            interval: cfg[i + 6],
+                        };
+                        // Find the slot for this alternate, or
+                        // the first free slot. A full table drops
+                        // further alternates — discovery never
+                        // fails on a long alt table.
+                        let slot = sco_alts
+                            .iter()
+                            .position(|a| matches!(a, Some(s) if s.alt_setting == alt_setting))
+                            .or_else(|| sco_alts.iter().position(|a| a.is_none()));
+                        if let Some(slot) = slot {
+                            let entry = sco_alts[slot].get_or_insert(ScoAltSetting {
+                                alt_setting,
+                                sco_in: None,
+                                sco_out: None,
+                            });
+                            if is_in && entry.sco_in.is_none() {
+                                entry.sco_in = Some(ep);
+                            } else if !is_in && entry.sco_out.is_none() {
+                                entry.sco_out = Some(ep);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -214,6 +398,7 @@ pub fn find_bt_endpoints(cfg: &[u8]) -> Result<BtEndpoints, BtUsbError> {
         event_in: event_in.ok_or(BtUsbError::NotBluetooth)?,
         acl_in: acl_in.ok_or(BtUsbError::NotBluetooth)?,
         acl_out: acl_out.ok_or(BtUsbError::NotBluetooth)?,
+        sco_alts,
     })
 }
 
@@ -290,6 +475,15 @@ pub struct UsbHciTransport {
     /// Re-arm flag: set the first time `recv_event` is called so the
     /// interrupt-IN endpoint is pre-armed before the first poll.
     armed: AtomicBool,
+    /// Isochronous SCO endpoints of the bind-selected alternate
+    /// setting. `None` when the device offers no SCO transport (or
+    /// the alternate switch failed) — SCO is refused, never rerouted.
+    sco_in_dci: Option<u8>,
+    sco_out_dci: Option<u8>,
+    /// All recorded SCO alternates, for `select_sco_alt_setting`.
+    sco_alts: [Option<ScoAltSetting>; MAX_SCO_ALT_SETTINGS],
+    /// Currently active SCO alternate setting (`0` = none / alt 0).
+    sco_alt: AtomicU8,
 }
 
 impl fmt::Debug for UsbHciTransport {
@@ -301,7 +495,30 @@ impl fmt::Debug for UsbHciTransport {
             .field("acl_in_dci", &self.acl_in_dci)
             .field("acl_out_dci", &self.acl_out_dci)
             .field("event_max_packet", &self.event_max_packet)
+            .field("sco_in_dci", &self.sco_in_dci)
+            .field("sco_out_dci", &self.sco_out_dci)
+            .field("sco_alt", &self.sco_alt.load(Ordering::Acquire))
             .finish_non_exhaustive()
+    }
+}
+
+/// Test-only transport with no SCO endpoints: exercises the
+/// fail-closed SCO path without a live xHC.
+#[doc(hidden)]
+pub fn __test_transport_without_sco(controller: u8, slot_id: u8) -> UsbHciTransport {
+    UsbHciTransport {
+        controller,
+        slot_id,
+        interface: 0,
+        event_dci: 3,
+        acl_in_dci: 5,
+        acl_out_dci: 4,
+        event_max_packet: 16,
+        armed: AtomicBool::new(false),
+        sco_in_dci: None,
+        sco_out_dci: None,
+        sco_alts: [None; MAX_SCO_ALT_SETTINGS],
+        sco_alt: AtomicU8::new(0),
     }
 }
 
@@ -321,6 +538,109 @@ impl UsbHciTransport {
         )
         .map(|_| ())
         .map_err(|_| TransportError::Transient)
+    }
+
+    /// `true` when this transport can carry SCO (isoch endpoints
+    /// configured for an alternate setting).
+    pub fn sco_available(&self) -> bool {
+        self.sco_in_dci.is_some() && self.sco_out_dci.is_some()
+    }
+
+    /// Active SCO alternate setting, or `None` when the device
+    /// offers no SCO transport.
+    pub fn sco_alt_setting(&self) -> Option<u8> {
+        self.sco_available()
+            .then(|| self.sco_alt.load(Ordering::Acquire))
+    }
+
+    /// `(sco_in_max_packet, sco_out_max_packet)` of the currently
+    /// active SCO alternate, looked up from the recorded table so a
+    /// down-switch is reflected immediately. `None` when no SCO
+    /// alternate is active (or the active alternate vanished from
+    /// the table, which cannot happen — defensive fail-closed).
+    fn sco_budgets(&self) -> Option<(u16, u16)> {
+        if !self.sco_available() {
+            return None;
+        }
+        let alt = self.sco_alt.load(Ordering::Acquire);
+        self.sco_alts
+            .iter()
+            .flatten()
+            .find(|a| a.alt_setting == alt)
+            .and_then(|a| match (a.sco_in, a.sco_out) {
+                (Some(i), Some(o)) => Some((i.max_packet, o.max_packet)),
+                _ => None,
+            })
+    }
+
+    /// Switch the HCI interface to the smallest complete SCO
+    /// alternate whose isoch budget fits a SCO packet carrying
+    /// `payload_len` payload bytes (budget ≥ payload + 3-byte SCO
+    /// header), and return the alternate now active. A no-op when
+    /// that alternate is already active.
+    ///
+    /// Only alternates that reuse the bind-configured isoch
+    /// endpoint addresses can be selected: the xHC endpoint
+    /// contexts were configured exactly once at bind, so an
+    /// alternate that moves the isoch endpoints would leave the
+    /// contexts pointing at dead addresses. Such a switch — and a
+    /// packet no recorded alternate can fit — fails with
+    /// `TransportError::Unsupported` and leaves the active
+    /// alternate unchanged.
+    ///
+    /// Sync-context only (uses `block_on`, like `send_command`).
+    pub fn select_sco_alt_setting(&self, payload_len: usize) -> Result<u8, TransportError> {
+        // Compared in `usize` — see `sco_alt_for_payload`.
+        let need = payload_len.saturating_add(SCO_PACKET_HEADER_LEN);
+        let (Some(cur_in), Some(cur_out)) = (self.sco_in_dci, self.sco_out_dci) else {
+            return Err(TransportError::Unsupported);
+        };
+        let mut target: Option<ScoAltSetting> = None;
+        for alt in self.sco_alts.iter().flatten() {
+            if !alt.is_complete() {
+                continue;
+            }
+            let budget = alt.packet_budget().unwrap_or(0) as usize;
+            if budget < need {
+                continue;
+            }
+            let same_addrs = match (alt.sco_in, alt.sco_out) {
+                (Some(i), Some(o)) => {
+                    ep_dci(i.ep_addr, true) == cur_in && ep_dci(o.ep_addr, false) == cur_out
+                }
+                _ => false,
+            };
+            if !same_addrs {
+                continue;
+            }
+            let better = match target {
+                None => true,
+                Some(t) => {
+                    let t_budget = t.packet_budget().unwrap_or(0) as usize;
+                    budget < t_budget || (budget == t_budget && alt.alt_setting < t.alt_setting)
+                }
+            };
+            if better {
+                target = Some(*alt);
+            }
+        }
+        let target = target.ok_or(TransportError::Unsupported)?;
+        let current = self.sco_alt.load(Ordering::Acquire);
+        if target.alt_setting == current {
+            return Ok(current);
+        }
+        let xhci = self.xhci()?;
+        narf_scheduler::block_on(xhci.control_out(
+            self.slot_id,
+            RT_SET_INTERFACE,
+            STD_REQ_SET_INTERFACE,
+            target.alt_setting as u16,
+            self.interface as u16,
+            &[],
+        ))
+        .map_err(|_| TransportError::Transient)?;
+        self.sco_alt.store(target.alt_setting, Ordering::Release);
+        Ok(target.alt_setting)
     }
 }
 
@@ -376,16 +696,48 @@ impl HciTransport for UsbHciTransport {
     }
 
     fn send_sco(&self, data: &[u8]) -> Result<(), TransportError> {
-        // SCO/eSCO: fall back to bulk-OUT until dedicated isoch
-        // endpoint tracking lands (Stage 3+).
+        // SCO/eSCO rides the isochronous endpoints (Vol 4 Part B
+        // §2.1): one HCI SCO packet — 3-byte header + payload
+        // (`ScoData::encode`, Vol 4 Part E §5.4.3) — per isoch
+        // transfer. A device with no isoch endpoints refuses SCO
+        // with `Unsupported`; the old bulk-OUT fallback misrouted
+        // voice frames onto the ACL pipe, where the controller
+        // cannot interpret them. A packet larger than the active
+        // alternate's isoch budget is refused, never truncated.
+        let (sco_out_dci, budget) = match (self.sco_out_dci, self.sco_budgets()) {
+            (Some(dci), Some((_, out))) => (dci, out),
+            _ => return Err(TransportError::Unsupported),
+        };
+        if data.len() > budget as usize {
+            return Err(TransportError::Unsupported);
+        }
         let xhci = self.xhci()?;
-        narf_scheduler::block_on(xhci.bulk_out(self.slot_id, self.acl_out_dci, data))
+        narf_scheduler::block_on(xhci.isoch_out(self.slot_id, sco_out_dci, data))
             .map_err(|_| TransportError::Transient)?;
         Ok(())
     }
 
-    // recv_sco uses the default no-op implementation — dedicated isoch
-    // IN endpoint tracking is a Stage 3+ concern.
+    fn recv_sco(&self) -> Result<Option<Vec<u8>>, TransportError> {
+        // Mirror `recv_acl`: one isoch-IN transfer per call; an
+        // xHC error or an empty transfer means no SCO data is
+        // ready. The receive buffer is one frame's isoch budget —
+        // a legal SCO packet is at most 3 + 255 bytes (the SCO MTU
+        // is a u8), so the 1024-byte cap never truncates one.
+        // No isoch endpoints → `Unsupported`, not a silent `None`.
+        let (sco_in_dci, budget) = match (self.sco_in_dci, self.sco_budgets()) {
+            (Some(dci), Some((inp, _))) => (dci, inp),
+            _ => return Err(TransportError::Unsupported),
+        };
+        let xhci = self.xhci()?;
+        let buf_len = (budget as usize).clamp(1, 1024);
+        let mut buf = [0u8; 1024];
+        match narf_scheduler::block_on(xhci.isoch_in(self.slot_id, sco_in_dci, &mut buf[..buf_len]))
+        {
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some(buf[..n].to_vec())),
+            Err(_) => Ok(None),
+        }
+    }
 
     fn name(&self) -> &'static str {
         "usb"
@@ -643,11 +995,33 @@ pub async fn try_bind_btusb_already_addressed(
 ) -> Result<(), BtUsbError> {
     let eps = find_bt_endpoints(cfg)?;
 
-    // Configure the xHC-side endpoint contexts for the three required
-    // endpoints. EP0 (default control) is already provisioned by
-    // address_device.
+    // SCO alternate selection (issue #817): the xHC endpoint
+    // contexts are configured exactly once, so bind configures the
+    // largest-budget complete SCO alternate together with the base
+    // three endpoints. The controller's SCO MTU is only known after
+    // Read_Buffer_Size; configuring the largest budget keeps every
+    // SCO packet the device offers usable, and the transport can
+    // switch down to a smaller alternate later via SET_INTERFACE
+    // (`UsbHciTransport::select_sco_alt_setting`).
+    let sco_alt = eps.best_sco_alt();
+    let mut all_eps: Vec<EndpointConfig> = Vec::with_capacity(5);
+    all_eps.push(eps.event_in);
+    all_eps.push(eps.acl_in);
+    all_eps.push(eps.acl_out);
+    if let Some(alt) = sco_alt {
+        if let Some(sco_in) = alt.sco_in {
+            all_eps.push(sco_in);
+        }
+        if let Some(sco_out) = alt.sco_out {
+            all_eps.push(sco_out);
+        }
+    }
+
+    // Configure the xHC-side endpoint contexts for the required
+    // endpoints (+ the SCO isoch pair when offered). EP0 (default
+    // control) is already provisioned by address_device.
     xhci_dev
-        .configure_endpoints(slot_id, &[eps.event_in, eps.acl_in, eps.acl_out])
+        .configure_endpoints(slot_id, &all_eps)
         .await
         .map_err(|_| BtUsbError::EndpointConfig)?;
 
@@ -665,6 +1039,44 @@ pub async fn try_bind_btusb_already_addressed(
         )
         .await
         .map_err(|_| BtUsbError::SetConfiguration)?;
+
+    // Activate the SCO alternate setting (USB 2.0 §9.4.10).
+    // SET_CONFIGURATION leaves alt 0 active, which carries no
+    // isoch endpoints. A refused switch does not fail the bind —
+    // SCO is optional per Vol 4 Part B §2.1 — but the transport is
+    // left without SCO endpoints, so SCO is refused instead of
+    // sent to endpoints the device never activated.
+    let mut sco_active = false;
+    if let Some(alt) = sco_alt {
+        if alt.alt_setting > 0 {
+            match xhci_dev
+                .control_out(
+                    slot_id,
+                    RT_SET_INTERFACE,
+                    STD_REQ_SET_INTERFACE,
+                    alt.alt_setting as u16,
+                    eps.interface as u16,
+                    &[],
+                )
+                .await
+            {
+                Ok(()) => sco_active = true,
+                Err(error) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  btusb: slot={} SET_INTERFACE SCO alt {} failed: {:?}; SCO unavailable",
+                        slot_id,
+                        alt.alt_setting,
+                        error
+                    );
+                }
+            }
+        } else {
+            // Isoch endpoints already live under alt 0.
+            sco_active = true;
+        }
+    }
 
     // ── Stage-0 bring-up dance ────────────────────────────────────
     // Vol 4 Part E §3 — Reset, Read_Local_Version. We stop at
@@ -883,7 +1295,20 @@ pub async fn try_bind_btusb_already_addressed(
 
     // Register a sync-context transport for Stage-1+ callers (L2CAP
     // pump, ACL data plane). Mandatory bring-up is done: every command
-    // it issued used the async helper above.
+    // it issued used the async helper above. The SCO endpoints are
+    // attached only when the alternate switch above succeeded.
+    let (sco_in_dci, sco_out_dci, sco_alt_setting) = if sco_active {
+        match sco_alt {
+            Some(alt) => (
+                alt.sco_in.map(|e| ep_dci(e.ep_addr, true)),
+                alt.sco_out.map(|e| ep_dci(e.ep_addr, false)),
+                alt.alt_setting,
+            ),
+            None => (None, None, 0),
+        }
+    } else {
+        (None, None, 0)
+    };
     let transport: Arc<dyn HciTransport> = Arc::new(UsbHciTransport {
         controller: xhci_dev.id(),
         slot_id,
@@ -893,6 +1318,10 @@ pub async fn try_bind_btusb_already_addressed(
         acl_out_dci,
         event_max_packet: eps.event_in.max_packet,
         armed: AtomicBool::new(true), // already armed by the bring-up
+        sco_in_dci,
+        sco_out_dci,
+        sco_alts: eps.sco_alts,
+        sco_alt: AtomicU8::new(sco_alt_setting),
     });
     narf_bluetooth::transport::register(transport.clone());
     let hci_index = narf_bluetooth::controller::register_ready_transport(transport.clone(), info);
@@ -914,6 +1343,22 @@ pub async fn try_bind_btusb_already_addressed(
                 vendor,
                 info.hci_version,
                 bt_ver
+            );
+        }
+    }
+
+    if sco_active {
+        use core::fmt::Write as _;
+        if let Some(alt) = sco_alt {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btusb: slot={} SCO isoch alt {} in=0x{:02x}/{} out=0x{:02x}/{}",
+                slot_id,
+                alt.alt_setting,
+                alt.sco_in.map(|e| e.ep_addr).unwrap_or(0),
+                alt.sco_in.map(|e| e.max_packet).unwrap_or(0),
+                alt.sco_out.map(|e| e.ep_addr).unwrap_or(0),
+                alt.sco_out.map(|e| e.max_packet).unwrap_or(0),
             );
         }
     }
