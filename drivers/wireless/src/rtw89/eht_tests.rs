@@ -205,6 +205,173 @@ fn smoke_rtw89_eht_operation_profile() -> TestResult {
     TestResult::Pass
 }
 
+fn smoke_rtw89_eht_cap_8922ae() -> TestResult {
+    // 8922AE variant, independently computed from
+    // `rtw89_init_eht_cap` + `ieee80211-eht.h` (see the module docs):
+    // MAC cap0 = 7991-enc(1) << 6 = 0x40; PHY cap0 = NDP(0x08) |
+    // SU_BEAMFORMEE(0x40) | (sts-1 bit0 -> 0x80) = 0xC8; PHY cap1 =
+    // (sts-1 bits 2:1 -> 0x03) | (sts-1 -> 0x1C) = 0x1F; PHY cap3 =
+    // 0x08|0x10|0x20|0x40 = 0x78; PHY cap4 = 0x04 | (MAX_NC 1 -> 0x10)
+    // = 0x14; PHY cap5 = 20US(3) -> 0x30. MCS/NSS val = rx2 | tx2<<4
+    // = 0x22; mcs13 = 0 because the variant gates MCS 12/13 off.
+    let cap = match eht_cap(EHT_CAP_8922AE_INPUTS) {
+        Some(cap) => cap,
+        None => return TestResult::Fail("EHT cap 8922AE unexpectedly None"),
+    };
+    if cap.mac_cap_info != [0x40, 0x00] {
+        return TestResult::Fail("EHT cap 8922AE MAC cap bytes wrong");
+    }
+    if cap.phy_cap_info != [0xC8, 0x1F, 0x00, 0x78, 0x14, 0x30, 0x00, 0x00, 0x00] {
+        return TestResult::Fail("EHT cap 8922AE PHY cap bytes wrong");
+    }
+    if cap.mcs_nss_80.mcs9 != 0x22
+        || cap.mcs_nss_80.mcs11 != 0x22
+        || cap.mcs_nss_80.mcs13 != 0x00
+        || cap.mcs_nss_160.mcs9 != 0x22
+        || cap.mcs_nss_160.mcs11 != 0x22
+        || cap.mcs_nss_160.mcs13 != 0x00
+    {
+        return TestResult::Fail("EHT cap 8922AE 80/160 MCS maps wrong");
+    }
+    // Discriminating case: step 1's width programming carries a 320MHz
+    // arm, but the advertised capability must NOT carry 320MHz MCS —
+    // the chip's support_bandwidths has no 320 bit, so Linux's gate
+    // leaves the 320 entries unset. Programming != advertisement.
+    if cap.mcs_nss_320.mcs9 != 0 || cap.mcs_nss_320.mcs11 != 0 || cap.mcs_nss_320.mcs13 != 0 {
+        return TestResult::Fail("EHT cap 8922AE must not advertise 320MHz MCS");
+    }
+    TestResult::Pass
+}
+
+fn smoke_rtw89_eht_cap_gates() -> TestResult {
+    let base = EHT_CAP_8922AE_INPUTS;
+    // EHT gated off by firmware phycap -> no capability at all.
+    if eht_cap(EhtCapInputs {
+        no_eht: true,
+        ..base
+    })
+    .is_some()
+    {
+        return TestResult::Fail("EHT cap must be None when no_eht");
+    }
+    // MCS 12/13 allowed -> mcs13 carries the same NSS byte.
+    let allowed = match eht_cap(EhtCapInputs {
+        no_mcs_12_13: false,
+        ..base
+    }) {
+        Some(cap) => cap,
+        None => return TestResult::Fail("EHT cap MCS-allowed unexpectedly None"),
+    };
+    if allowed.mcs_nss_80.mcs13 != 0x22 || allowed.mcs_nss_160.mcs13 != 0x22 {
+        return TestResult::Fail("EHT cap mcs13 must carry val when allowed");
+    }
+    // 320 gate needs BOTH 6GHz and the bandwidth bit: 6GHz + bit opens
+    // it (320 MCS = 0x22/0x22/0x00, PHY0 gains 0x02 -> 0xCA, PHY1 gains
+    // 0xE0 -> 0xFF); 5GHz + bit leaves it shut.
+    let wide = match eht_cap(EhtCapInputs {
+        six_ghz: true,
+        support_320mhz_bandwidth: true,
+        ..base
+    }) {
+        Some(cap) => cap,
+        None => return TestResult::Fail("EHT cap 320-gate unexpectedly None"),
+    };
+    if wide.mcs_nss_320.mcs9 != 0x22
+        || wide.mcs_nss_320.mcs11 != 0x22
+        || wide.mcs_nss_320.mcs13 != 0x00
+        || wide.phy_cap_info[0] != 0xCA
+        || wide.phy_cap_info[1] != 0xFF
+    {
+        return TestResult::Fail("EHT cap 320 gate wrong on 6GHz");
+    }
+    let not_wide = match eht_cap(EhtCapInputs {
+        six_ghz: false,
+        support_320mhz_bandwidth: true,
+        ..base
+    }) {
+        Some(cap) => cap,
+        None => return TestResult::Fail("EHT cap 5GHz+320bit unexpectedly None"),
+    };
+    if not_wide.mcs_nss_320.mcs9 != 0
+        || not_wide.mcs_nss_320.mcs11 != 0
+        || not_wide.mcs_nss_320.mcs13 != 0
+        || not_wide.phy_cap_info[0] != 0xC8
+        || not_wide.phy_cap_info[1] != 0x1F
+    {
+        return TestResult::Fail("EHT cap 320 gate must stay shut off 6GHz");
+    }
+    // NSS encode path: 1/1 streams -> 0x11, not 0x22.
+    let one = match eht_cap(EhtCapInputs {
+        rx_nss: 1,
+        tx_nss: 1,
+        no_mcs_12_13: false,
+        ..base
+    }) {
+        Some(cap) => cap,
+        None => return TestResult::Fail("EHT cap 1SS unexpectedly None"),
+    };
+    if one.mcs_nss_80.mcs9 != 0x11 || one.mcs_nss_80.mcs13 != 0x11 {
+        return TestResult::Fail("EHT cap NSS encode wrong for 1SS");
+    }
+    // Unmapped MPDU length fails closed, never advertises a wrong cap.
+    if eht_cap(EhtCapInputs {
+        max_mpdu_len: 5000,
+        ..base
+    })
+    .is_some()
+    {
+        return TestResult::Fail("EHT cap must be None for unknown MPDU len");
+    }
+    // Band-independence for this chip: 2.4/5/6GHz agree because the
+    // 320 gate can never open without the bandwidth bit.
+    let g = match eht_cap(EhtCapInputs {
+        six_ghz: true,
+        ..base
+    }) {
+        Some(cap) => cap,
+        None => return TestResult::Fail("EHT cap 6GHz variant unexpectedly None"),
+    };
+    if g != eht_cap(base).unwrap() {
+        return TestResult::Fail("EHT cap 8922AE must be band-independent");
+    }
+    TestResult::Pass
+}
+
+fn smoke_rtw89_eht_station_facet() -> TestResult {
+    let facet = match EhtStation::new_8922ae() {
+        Some(facet) => facet,
+        None => return TestResult::Fail("EHT station facet unexpectedly None"),
+    };
+    // Capability matches the pinned 8922AE values (spot-check: the
+    // full byte tables are pinned in smoke_rtw89_eht_cap_8922ae).
+    if facet.cap.mac_cap_info != [0x40, 0x00] || facet.cap.mcs_nss_80.mcs13 != 0x00 {
+        return TestResult::Fail("EHT station facet capability wrong");
+    }
+    // Fail-closed defaults: no TX EHT override programmed.
+    if facet.nltf_switch || facet.nltf != 0 || facet.ul_eht_usr_pres {
+        return TestResult::Fail("EHT station facet defaults must be off");
+    }
+    if facet.txwd_info_eht() != Some((0, 0)) {
+        return TestResult::Fail("EHT station facet default info must be (0, 0)");
+    }
+    // Negotiated values flow through to the info dwords.
+    let negotiated = EhtStation {
+        nltf_switch: true,
+        nltf: 2,
+        ul_eht_usr_pres: true,
+        ..facet
+    };
+    if negotiated.txwd_info_eht() != Some((0x50_0000, 0x1_0000)) {
+        return TestResult::Fail("EHT station facet info dwords wrong");
+    }
+    // Out-of-range NLTF fails closed, never truncated.
+    let bad = EhtStation { nltf: 4, ..facet };
+    if bad.txwd_info_eht().is_some() {
+        return TestResult::Fail("EHT station facet must reject NLTF > 3");
+    }
+    TestResult::Pass
+}
+
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_eht_width_tables);
 kernel_test_in!(
     "drivers/wireless/rtw89",
@@ -212,3 +379,6 @@ kernel_test_in!(
 );
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_eht_rx_nss_program);
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_eht_operation_profile);
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_eht_cap_8922ae);
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_eht_cap_gates);
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_eht_station_facet);
