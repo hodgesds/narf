@@ -5,6 +5,8 @@
 //! Reference: <https://datatracker.ietf.org/doc/html/rfc8439#section-2.8>
 //! Reference: <https://en.wikipedia.org/wiki/Poly1305>
 
+use zeroize::Zeroizing;
+
 use crate::chacha20::{chacha20_block, chacha20_init, chacha20_xor};
 use crate::poly1305::Poly1305;
 
@@ -16,8 +18,12 @@ pub fn chacha20_poly1305_seal(
     aad: &[u8],
     plaintext: &mut [u8],
 ) -> [u8; 16] {
-    // 1. Generate Poly1305 key from ChaCha20 block 0
-    let mut poly_key = [0u8; 64];
+    // 1. Generate Poly1305 key from ChaCha20 block 0.
+    // SEC-C2 (#1295): block 0 is the Poly1305 key (first 32
+    // bytes) plus keystream — key material on the stack. It is
+    // `Zeroizing` so the buffer is wiped when seal returns,
+    // instead of lingering until the slot is reused.
+    let mut poly_key = Zeroizing::new([0u8; 64]);
     let state = chacha20_init(key, nonce, 0);
     chacha20_block(&state, &mut poly_key);
 
@@ -53,7 +59,9 @@ pub fn chacha20_poly1305_open(
     tag: &[u8; 16],
 ) -> bool {
     // 1. Generate Poly1305 key
-    let mut poly_key = [0u8; 64];
+    // SEC-C2 (#1295): see seal — block 0 holds the Poly1305
+    // key plus keystream and is wiped on drop.
+    let mut poly_key = Zeroizing::new([0u8; 64]);
     let state = chacha20_init(key, nonce, 0);
     chacha20_block(&state, &mut poly_key);
 

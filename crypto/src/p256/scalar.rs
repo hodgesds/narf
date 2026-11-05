@@ -13,11 +13,28 @@
 
 use core::cmp::Ordering;
 
+use zeroize::Zeroize;
+
 use super::ORDER_N;
 
 /// Scalar mod n. 4 × u64 little-endian, always fully reduced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Scalar(pub [u64; 4]);
+
+/// SEC-C2 (#1295): scalars are secret in every call (private
+/// keys, ECDH ephemerals, SAE nonces) — a dropped scalar must
+/// not leave its limbs in a reused stack slot or heap buffer.
+/// `Zeroizing<Scalar>` (used by `narf-ctap2`'s `KeyPair`) and
+/// `Zeroize::zeroize` both bottom out here. Note this does NOT
+/// redact `Debug`: `Scalar` keeps its derived `Debug` (see the
+/// SEC-C2 remainder issue for the `Debug`-on-secret census —
+/// the secret-holding *wrappers* hand-write redacted `Debug`
+/// instead of deriving it, so no `{:?}` path reaches a scalar).
+impl Zeroize for Scalar {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl Scalar {
     pub const ZERO: Self = Self([0, 0, 0, 0]);

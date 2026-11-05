@@ -11,6 +11,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use zeroize::Zeroizing;
+
 use crate::aes_ctr::ctr_apply;
 use crate::cmac_aes128::cmac_aes128;
 
@@ -105,7 +107,13 @@ pub fn decrypt(key: &[u8; 32], aad: &[&[u8]], input: &[u8]) -> Option<Vec<u8>> {
     let k1: &[u8; 16] = key[..16].try_into().unwrap();
     let k2: &[u8; 16] = key[16..].try_into().unwrap();
     let v: [u8; BLOCK] = input[..BLOCK].try_into().unwrap();
-    let mut plaintext = input[BLOCK..].to_vec();
+    // SEC-C2 (#1295): the CTR-decrypted candidate plaintext is
+    // key-adjacent material until the tag verifies — on a failed
+    // tag it must be wiped, not dropped unwiped into a reused
+    // heap slot. `Zeroizing` wipes on the `None` path; the
+    // success path moves the bytes out with `mem::take` (leaving
+    // an empty Vec behind for the drop to wipe).
+    let mut plaintext = Zeroizing::new(input[BLOCK..].to_vec());
     ctr_apply(k2, ctr_iv(&v), &mut plaintext);
     let expected = s2v(k1, aad, &plaintext);
     // Constant-time tag comparison.
@@ -114,7 +122,9 @@ pub fn decrypt(key: &[u8; 32], aad: &[&[u8]], input: &[u8]) -> Option<Vec<u8>> {
         diff |= a ^ b;
     }
     if diff == 0 {
-        Some(plaintext)
+        // Move the plaintext out: `take` leaves an empty Vec
+        // behind, which is what `Zeroizing` wipes on drop.
+        Some(core::mem::take(&mut *plaintext))
     } else {
         None
     }

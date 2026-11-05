@@ -19,8 +19,12 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt;
+
+use zeroize::Zeroizing;
 
 use narf_crypto::p256::ecdsa::verify_p256;
 
@@ -266,10 +270,29 @@ pub struct HmacSecretParams {
 
 /// hmac-secret extension output: 32 bytes for one salt, 64 (two
 /// independent outputs) when salt2 was given.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// SEC-C2 (#1295): the outputs are the wrapping input for the
+/// suspend slot secret — key material. They are `Zeroizing` so
+/// a dropped output is wiped, and `Debug` is hand-written and
+/// redacted: `Zeroizing`'s own derived `Debug` would print the
+/// bytes, so a derived `Debug` here would leak them into any
+/// debug log. Only presence/length is ever shown.
+#[derive(Clone, PartialEq, Eq)]
 pub struct HmacSecretOutput {
-    pub first: [u8; 32],
-    pub second: Option<[u8; 32]>,
+    pub first: Zeroizing<[u8; 32]>,
+    pub second: Option<Zeroizing<[u8; 32]>>,
+}
+
+impl fmt::Debug for HmacSecretOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HmacSecretOutput")
+            .field("first", &"<redacted: 32 bytes>")
+            .field(
+                "second",
+                &self.second.as_ref().map(|_| "<redacted: 32 bytes>"),
+            )
+            .finish()
+    }
 }
 
 /// Inputs for `get_assertion`.
@@ -285,7 +308,14 @@ pub struct GetAssertionParams<'a> {
 }
 
 /// One assertion (also the shape of getNextAssertion results).
-#[derive(Clone, Debug)]
+///
+/// SEC-C2 (#1295): `Debug` is hand-written and redacted, as
+/// `TokenAnchor` does: the signature and the hmac-secret output
+/// are key-adjacent material and must never reach a debug log.
+/// `auth_data` keeps its derived `Debug` (rpIdHash, flags, sign
+/// count, public attested data — no key material), and the
+/// credential id / user fields are identifiers, not secrets.
+#[derive(Clone)]
 pub struct Assertion {
     pub credential: Option<CredentialRef>,
     pub auth_data: AuthData,
@@ -416,6 +446,35 @@ fn parse_der_integer(sig: &[u8], off: &mut usize) -> Result<[u8; 32], Error> {
     out[32 - bytes.len()..].copy_from_slice(bytes);
     *off += 2 + len;
     Ok(out)
+}
+
+impl fmt::Debug for Assertion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Assertion")
+            .field("credential", &self.credential)
+            .field("auth_data", &self.auth_data)
+            .field(
+                "signature",
+                &format!("<redacted: {} bytes>", self.signature.len()),
+            )
+            .field("user_id", &self.user_id)
+            .field("user_name", &self.user_name)
+            .field("number_of_credentials", &self.number_of_credentials)
+            .field(
+                "hmac_secret",
+                &self.hmac_secret.as_ref().map(|o| {
+                    format!(
+                        "<redacted: 32 bytes{}>",
+                        if o.second.is_some() {
+                            " + 32 bytes"
+                        } else {
+                            ""
+                        }
+                    )
+                }),
+            )
+            .finish()
+    }
 }
 
 /// The CTAP2 client over one CTAPHID channel.
@@ -611,7 +670,7 @@ impl<P: HidPipe, R: RandomSource> Client<P, R> {
         if let Some(pin) = params.pin {
             let session = self.pin_session()?;
             let token = session.get_pin_token(&mut self.channel, pin)?;
-            let auth_param = pin_uv_auth_param(&token, &params.client_data_hash);
+            let auth_param = pin_uv_auth_param(&token[..], &params.client_data_hash);
             map.push((Value::int(8), Value::Bytes(auth_param.to_vec())));
             map.push((Value::int(9), Value::UInt(1)));
         }
@@ -708,7 +767,7 @@ impl<P: HidPipe, R: RandomSource> Client<P, R> {
         if let Some(pin) = params.pin {
             let session = session.as_ref().expect("session established above");
             let token = session.get_pin_token(&mut self.channel, pin)?;
-            let auth_param = pin_uv_auth_param(&token, &params.client_data_hash);
+            let auth_param = pin_uv_auth_param(&token[..], &params.client_data_hash);
             map.push((Value::int(6), Value::Bytes(auth_param.to_vec())));
             map.push((Value::int(7), Value::UInt(1)));
         }
@@ -767,17 +826,20 @@ impl<P: HidPipe, R: RandomSource> Client<P, R> {
                 let session = session.ok_or(Error::Protocol(
                     "getAssertion: hmac-secret output without a session",
                 ))?;
-                let plain = session.decrypt(enc)?;
+                // SEC-C2 (#1295): the decrypted output is the
+                // slot-wrapping secret — wipe the working buffer
+                // once copied into the `Zeroizing` output.
+                let plain = Zeroizing::new(session.decrypt(enc)?);
                 if plain.len() == 32 {
-                    let mut first = [0u8; 32];
+                    let mut first = Zeroizing::new([0u8; 32]);
                     first.copy_from_slice(&plain);
                     hmac_out = Some(HmacSecretOutput {
                         first,
                         second: None,
                     });
                 } else if plain.len() == 64 {
-                    let mut first = [0u8; 32];
-                    let mut second = [0u8; 32];
+                    let mut first = Zeroizing::new([0u8; 32]);
+                    let mut second = Zeroizing::new([0u8; 32]);
                     first.copy_from_slice(&plain[..32]);
                     second.copy_from_slice(&plain[32..]);
                     hmac_out = Some(HmacSecretOutput {

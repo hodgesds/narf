@@ -32,6 +32,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use zeroize::Zeroizing;
+
 use crate::cbor::{self, Value};
 use crate::cose;
 use crate::crypto::{self, KeyPair};
@@ -56,10 +58,13 @@ pub const PIN_MAX_LEN: usize = 63;
 /// An established key-agreement session with one authenticator:
 /// our ephemeral pair plus the derived shared secret. Clone-free
 /// on purpose — the secret must not spray copies around the
-/// client.
+/// client. SEC-C2 (#1295): the shared secret is `Zeroizing`, so
+/// a dropped session wipes it; the ephemeral scalar is wiped by
+/// `KeyPair` the same way. No `Debug` is derived or implemented
+/// for this type — there is nothing safe to print about it.
 pub struct PinSession {
     key_agreement: KeyPair,
-    shared_secret: [u8; 32],
+    shared_secret: Zeroizing<[u8; 32]>,
 }
 
 impl PinSession {
@@ -91,7 +96,7 @@ impl PinSession {
         let shared_secret = key_agreement.shared_secret(&peer)?;
         Ok(Self {
             key_agreement,
-            shared_secret,
+            shared_secret: Zeroizing::new(shared_secret),
         })
     }
 
@@ -100,7 +105,7 @@ impl PinSession {
         let shared_secret = key_agreement.shared_secret(peer)?;
         Ok(Self {
             key_agreement,
-            shared_secret,
+            shared_secret: Zeroizing::new(shared_secret),
         })
     }
 
@@ -154,13 +159,20 @@ impl PinSession {
     /// `getPINToken`: exchange the PIN for a pinUvAuthToken.
     /// A wrong PIN surfaces as [`Error::Ctap`]
     /// `CTAP2_ERR_PIN_INVALID` (0x31) from the authenticator.
+    ///
+    /// SEC-C2 (#1295): the returned token is `Zeroizing` — the
+    /// caller (one `pinUvAuthParam` computation, then drop) never
+    /// holds a plain copy, and a dropped token is wiped. The
+    /// PIN hash and the decrypted token buffer are wiped the
+    /// same way; only the 16-byte ciphertext ever leaves the
+    /// session.
     pub fn get_pin_token<P: HidPipe>(
         &self,
         channel: &mut Channel<P>,
         pin: &[u8],
-    ) -> Result<[u8; 32], Error> {
+    ) -> Result<Zeroizing<[u8; 32]>, Error> {
         check_pin_len(pin)?;
-        let pin_hash = crypto::sha256(pin);
+        let pin_hash = Zeroizing::new(crypto::sha256(pin));
         let pin_hash_enc = self.encrypt(&pin_hash[..16])?;
         let mut params = self.base_request(SUB_GET_PIN_TOKEN);
         params.push((Value::int(6), Value::Bytes(pin_hash_enc)));
@@ -168,11 +180,11 @@ impl PinSession {
         let enc = resp
             .get_int_key_bytes(2)
             .ok_or(Error::Protocol("clientPIN: no pinUvAuthToken"))?;
-        let token = self.decrypt(enc)?;
+        let token = Zeroizing::new(self.decrypt(enc)?);
         if token.len() != 32 {
             return Err(Error::Protocol("clientPIN: pinUvAuthToken length"));
         }
-        let mut out = [0u8; 32];
+        let mut out = Zeroizing::new([0u8; 32]);
         out.copy_from_slice(&token);
         Ok(out)
     }
@@ -205,9 +217,10 @@ impl PinSession {
         check_pin_len(current_pin)?;
         check_pin_len(new_pin)?;
         let new_pin_enc = self.encrypt(&pad_pin(new_pin))?;
-        let pin_hash = crypto::sha256(current_pin);
+        // SEC-C2 (#1295): the current-PIN hash is wiped on return.
+        let pin_hash = Zeroizing::new(crypto::sha256(current_pin));
         let pin_hash_enc = self.encrypt(&pin_hash[..16])?;
-        let auth_param = crypto::hmac_sha256(&self.shared_secret, &new_pin_enc);
+        let auth_param = crypto::hmac_sha256(&self.shared_secret[..], &new_pin_enc);
         let mut params = self.base_request(SUB_CHANGE_PIN);
         params.push((Value::int(4), Value::Bytes(auth_param.to_vec())));
         params.push((Value::int(5), Value::Bytes(new_pin_enc)));
@@ -251,9 +264,11 @@ fn check_pin_len(pin: &[u8]) -> Result<(), Error> {
 }
 
 /// PIN encoding for setPIN/changePIN: the PIN bytes followed by
-/// zero bytes to at least 64 bytes total.
-fn pad_pin(pin: &[u8]) -> Vec<u8> {
-    let mut out = pin.to_vec();
+/// zero bytes to at least 64 bytes total. SEC-C2 (#1295): the
+/// padded PIN is plaintext key material — `Zeroizing` so the
+/// buffer is wiped once encrypted, not left in the heap.
+fn pad_pin(pin: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(pin.to_vec());
     while out.len() < 64 {
         out.push(0);
     }

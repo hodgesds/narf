@@ -11,6 +11,11 @@ release-managed = true
 ## narf-crypto's RFC 6979 P-256 signer (feature-gated upstream).
 narf-crypto = { path = "../crypto", features = ["ecdsa-sign"] }
 aes = { version = "0.8", default-features = false }
+## zeroize 1 (same spec as narf-crypto / block): SEC-C2 (#1295)
+## wraps PIN shared secrets, pinUvAuthTokens and hmac-secret
+## outputs so dropped key material is wiped, not left in
+## reused stack/heap slots.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 narf-kernel-test = { path = "../verification/kernel-test" }
 
 [features]
