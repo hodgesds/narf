@@ -538,7 +538,7 @@ pub fn parse_rx_aggregate(buf: &[u8]) -> RxWalk {
         let align = (4 - ((size + 2) % 4)) % 4;
         let rest = buf.len() - i - RX_HEADER_LEN;
         // size includes the 4-byte FCS and must fit the remainder.
-        if size < 4 || size > MAX_RX_STATUS_LEN || size > rest {
+        if !(4..=MAX_RX_STATUS_LEN).contains(&size) || size > rest {
             break;
         }
         if header & RX_STS_ES_ != 0 {

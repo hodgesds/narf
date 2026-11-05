@@ -975,7 +975,9 @@ async fn ax_link_change(dev: &USBDevice, idx: usize) -> Option<(u32, narf_net::i
             break;
         }
         let mut sts = [0u8; 4];
-        match dev
+        // A failed read counts as still-busy: the budget
+        // expires safely instead of programming blind.
+        if let Ok(4) = dev
             .control_in(
                 AX_REQT_READ,
                 AX_TX_FIFO_STATUS_REQ,
@@ -985,15 +987,10 @@ async fn ax_link_change(dev: &USBDevice, idx: usize) -> Option<(u32, narf_net::i
             )
             .await
         {
-            Ok(n) if n == 4 => {
-                if u32::from_le_bytes(sts) & AX_TX_FIFO_BUSY == 0 {
-                    drained = true;
-                    break;
-                }
+            if u32::from_le_bytes(sts) & AX_TX_FIFO_BUSY == 0 {
+                drained = true;
+                break;
             }
-            // A failed read counts as still-busy: the budget
-            // expires safely instead of programming blind.
-            _ => {}
         }
         narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
     }
@@ -1007,9 +1004,7 @@ async fn ax_link_change(dev: &USBDevice, idx: usize) -> Option<(u32, narf_net::i
     let Ok(physr) = phy_read(dev, GMII_PHY_PHYSR).await else {
         return None;
     };
-    let Some((mode, bulkin, speed, duplex)) = ax_link_mode(link_sts, physr) else {
-        return None;
-    };
+    let (mode, bulkin, speed, duplex) = ax_link_mode(link_sts, physr)?;
     if ax_write(dev, AX_ACCESS_MAC, AX_RX_BULKIN_QCTRL, 5, &bulkin)
         .await
         .is_err()
