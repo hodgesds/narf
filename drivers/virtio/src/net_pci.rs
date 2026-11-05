@@ -3415,6 +3415,61 @@ fn vnet0_send_frame_zc(frame: narf_net::Frame, meta: narf_net::TxMeta) -> Result
 /// those waits fair across the NIC's RSS / flow-steered receive queues.
 static DRAIN_PAIR_RR: AtomicU64 = AtomicU64::new(0);
 
+impl VirtioNetPci {
+    /// Drain one frame from `pair_idx` of this controller: take, apply
+    /// the GUEST_CSUM verdict, deliver or drop-count, recycle, notify.
+    /// Returns true iff a frame was consumed.
+    ///
+    /// This is the body of `vnet0_drain_fn` for a single pair, split out
+    /// so the drain path is directly testable without a probed device
+    /// (see `tx_tests::smoke_virtio_net_drain_enforces_guest_csum`).
+    /// The verdict mirrors the async RX pump exactly: when GUEST_CSUM
+    /// was negotiated, a checksummed segment the device did not verify
+    /// is dropped fail-closed (e1000 drop-on-error precedent) and
+    /// counted via `note_rx_drop`; without negotiation everything
+    /// delivers as before. The payload slice uses the runtime
+    /// `rx_hdr_len` (20 with HASH_REPORT, else 12) — a hardcoded 12
+    /// would parse header-shifted bytes under HASH_REPORT and deliver
+    /// checksummed segments unverified (see `rx_csum_payload`).
+    /// A dropped frame still counts as consumed (returns true) so the
+    /// connect_wait loop keeps draining instead of stalling behind a
+    /// dropped head-of-queue frame, matching the pump's processed_any
+    /// accounting. Recycling targets this controller (the frame's
+    /// source) rather than re-resolving the first live controller.
+    fn drain_one_on(&self, pair_idx: usize) -> bool {
+        let (mut buf, total_len) = match self.rx_take_on(pair_idx) {
+            Some(t) => t,
+            None => return false,
+        };
+        let rx_hdr_len = self.rx_hdr_len();
+        let payload_len = total_len.saturating_sub(rx_hdr_len as u32);
+        let end = (rx_hdr_len + payload_len as usize).min(buf.len());
+        if payload_len != 0 {
+            let mut deliver = true;
+            if self.rx_guest_csum() {
+                let hdr_flags = buf.as_slice().first().copied().unwrap_or(0);
+                let payload = rx_csum_payload(buf.as_slice(), rx_hdr_len, payload_len);
+                if !rx_csum_deliver(hdr_flags, payload) {
+                    narf_net::iface::note_rx_drop(primary_iface_name(), 1);
+                    deliver = false;
+                }
+            }
+            if deliver {
+                // `&mut`: as in the async pump, the program may rewrite header bytes in
+                // place. `buf` is owned here until it is recycled below.
+                narf_net::iface::on_rx_frame_from(
+                    primary_iface_name(),
+                    &mut buf.as_mut_slice()[rx_hdr_len..end],
+                );
+            }
+        }
+        // Recycle the consumed buffer into the RX frame pool instead of freeing.
+        self.rx_buf_release_on(pair_idx, buf);
+        self.rx_notify(pair_idx);
+        true
+    }
+}
+
 /// `iface::DrainFn` — synchronous one-frame drain used by the TCP stack's
 /// in-kernel `connect_wait` busy-wait (kernel callers that cannot park). A caller can
 /// be occupying its executor while it waits, so it cannot rely on the spawned
@@ -3424,6 +3479,9 @@ static DRAIN_PAIR_RR: AtomicU64 = AtomicU64::new(0);
 ///
 /// The buffer stays zero-copy through `iface::on_rx_frame`; we return it to
 /// exactly the pair that supplied it and notify that pair after replenishing.
+/// Each drained frame passes the same GUEST_CSUM verdict as the async RX
+/// pump (see `VirtioNetPci::drain_one_on`); a dropped frame still counts
+/// as processed.
 /// Returns `true` iff a frame was actually processed.
 fn vnet0_drain_fn() -> bool {
     // Fail closed after a primary detach: the hook stays installed
@@ -3433,39 +3491,22 @@ fn vnet0_drain_fn() -> bool {
     if primary_iface_name().is_empty() {
         return false;
     }
-    let taken = with_controller(|c| {
+    // Round-robin cursor advances once per call; pairs are tried in
+    // order from it and the first pair with a frame wins — the same
+    // shape as the previous inline take loop, now delegated to
+    // `drain_one_on` (which also carries the GUEST_CSUM verdict).
+    with_controller(|c| {
         let pairs = c.num_pairs();
         if pairs == 0 {
-            return None;
+            return false;
         }
         let start = (DRAIN_PAIR_RR.fetch_add(1, Ordering::Relaxed) as usize) % pairs;
-        (0..pairs).find_map(|offset| {
+        (0..pairs).any(|offset| {
             let pair_idx = (start + offset) % pairs;
-            c.rx_take_on(pair_idx)
-                .map(|frame| (pair_idx, c.rx_hdr_len(), frame))
+            c.drain_one_on(pair_idx)
         })
     })
-    .flatten();
-    let (pair_idx, rx_hdr_len, (mut buf, total_len)) = match taken {
-        Some(t) => t,
-        None => return false,
-    };
-    let payload_len = total_len.saturating_sub(rx_hdr_len as u32);
-    let end = (rx_hdr_len + payload_len as usize).min(buf.len());
-    if payload_len != 0 {
-        // `&mut`: as in the async pump, the program may rewrite header bytes in
-        // place. `buf` is owned here until it is recycled below.
-        narf_net::iface::on_rx_frame_from(
-            primary_iface_name(),
-            &mut buf.as_mut_slice()[rx_hdr_len..end],
-        );
-    }
-    // Recycle the consumed buffer into the RX frame pool instead of freeing.
-    with_controller(|c| {
-        c.rx_buf_release_on(pair_idx, buf);
-        c.rx_notify(pair_idx);
-    });
-    true
+    .unwrap_or(false)
 }
 
 pub fn register_pci_driver() {
@@ -4172,5 +4213,241 @@ mod tx_tests {
     kernel_test_in!(
         "drivers/virtio/net-pci",
         smoke_virtio_net_vlan_tagged_tso_layout
+    );
+
+    // RX-capable fixture for the drain path: one queue pair whose RX
+    // virtqueue the test drives directly (post a buffer, fake a device
+    // completion), mirroring TxFixture's RAM-backed rings. The fake
+    // device completes only when the test writes the used entry, so
+    // drain behavior never depends on QEMU timing.
+    const RX_POOL_CAP: usize = 4;
+
+    struct RxFixture {
+        dev: VirtioNetPci,
+        _registers: DmaBuffer,
+    }
+
+    impl RxFixture {
+        fn new(rx_hdr_len: usize, guest_csum: bool, hdr_flags: u8) -> Result<Self, &'static str> {
+            let registers =
+                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "register page")?;
+            let region = || VirtioRegion {
+                region: narf_bus::MmioRegion {
+                    phys: registers.phys_addr(),
+                    virt: registers.cpu_ptr::<u8>() as u64,
+                    len: 4096,
+                    kind: narf_bus::BarKind::Mmio32 {
+                        prefetchable: false,
+                    },
+                },
+                virt: registers.cpu_ptr::<u8>() as u64,
+                offset: 0,
+                length: 4096,
+            };
+            let rx_page = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "RX ring page")?;
+            let tx_page = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "TX ring page")?;
+            let layout =
+                VirtqueueLayout::new(QSIZE, rx_page.phys_addr().raw()).ok_or("RX layout")?;
+            // SAFETY: rx_page owns a coherent page containing this entire layout.
+            let mut rx_queue = unsafe { Virtqueue::new(layout) };
+            let rx_pool = DmaPool::new(4096, DomainId::DRIVER_0, RX_POOL_CAP);
+            if rx_pool.prefill(RX_POOL_CAP) != RX_POOL_CAP {
+                return Err("RX pool prefill");
+            }
+            // Device-written buffer: virtio header (flags byte only) +
+            // an IPv4/TCP frame (eth 14 + ip 20 + tcp 20), same field
+            // writes as the tests.rs verdict builder.
+            let mut frame_buf = rx_pool.try_acquire().ok_or("RX pool starved")?;
+            let mut frame = [0u8; 54];
+            frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            frame[14] = 0x45;
+            frame[14 + 2..14 + 4].copy_from_slice(&40u16.to_be_bytes());
+            frame[14 + 8] = 64;
+            frame[14 + 9] = 6;
+            frame[14 + 12..14 + 16].copy_from_slice(&[192, 0, 2, 10]);
+            frame[14 + 16..14 + 20].copy_from_slice(&[198, 51, 100, 20]);
+            frame[34..36].copy_from_slice(&1234u16.to_be_bytes());
+            frame[36..38].copy_from_slice(&443u16.to_be_bytes());
+            frame[34 + 12] = 5 << 4;
+            frame[34 + 13] = 0x18;
+            let total = (rx_hdr_len + 54) as u32;
+            {
+                let slice = frame_buf.as_mut_slice();
+                slice[0] = hdr_flags;
+                slice[rx_hdr_len..rx_hdr_len + 54].copy_from_slice(&frame);
+            }
+            let head = rx_queue
+                .add_buffer(&[VirtqDesc {
+                    addr: frame_buf.dma_addr().raw(),
+                    len: (rx_hdr_len + MAX_RX_FRAME_PAYLOAD) as u32,
+                    flags: VIRTQ_DESC_F_WRITE,
+                    next: 0,
+                }])
+                .ok_or("RX post failed")?;
+            let mut rx_buffers: Vec<Option<DmaBuffer>> = (0..QSIZE).map(|_| None).collect();
+            rx_buffers[head as usize] = Some(frame_buf);
+            // Fake device completion: one used entry, then bump idx.
+            let used = narf_memory::PhysAddr::new(layout.used_ring).kernel_mut_ptr::<u16>();
+            // SAFETY: the fixture exclusively owns this aligned ring page.
+            unsafe {
+                core::ptr::write_volatile(
+                    used.add(2).cast::<VirtqUsedElem>(),
+                    VirtqUsedElem {
+                        id: u32::from(head),
+                        len: total,
+                    },
+                );
+                crate::queue::virtio_wmb();
+                core::ptr::write_volatile(used.add(1), 1);
+            }
+            let pair = QueuePair {
+                rx_qidx: 0,
+                tx_qidx: 1,
+                rx_queue: IrqSafeSpinLock::new(Some(rx_queue)),
+                tx_queue: IrqSafeSpinLock::new(None),
+                rx_buffers: IrqSafeSpinLock::new(rx_buffers),
+                tx_buffers: IrqSafeSpinLock::new(Vec::new()),
+                tx_pool: Arc::new(DmaPool::new(TX_BUF_LEN, DomainId::DRIVER_0, 0)),
+                rx_pool,
+                _rx_q_buf: rx_page,
+                _tx_q_buf: tx_page,
+                rx_qsize: QSIZE,
+                tx_qsize: 0,
+                rx_notify_off: 0,
+                tx_notify_off: 1,
+            };
+            let mut pairs = Vec::new();
+            pairs.push(pair);
+            let dev = VirtioNetPci {
+                common: region(),
+                notify: region(),
+                device_cfg: None,
+                notify_off_multiplier: 2,
+                pairs,
+                tx_rr: AtomicU64::new(0),
+                irq_vector: None,
+                rx_irq_vectors: Vec::new(),
+                flow_affine: false,
+                tx_irq_vector: None,
+                msix: IrqSafeSpinLock::new(None),
+                ready: true,
+                detached: AtomicBool::new(false),
+                suspended: AtomicBool::new(false),
+                ifname: IrqSafeSpinLock::new(None),
+                mac: IrqSafeSpinLock::new([0; 6]),
+                has_ctrl_mac_addr: false,
+                has_ctrl_rx: false,
+                has_ctrl_vlan: false,
+                mtu: 1500,
+                has_status: false,
+                tx_checksum: true,
+                tx_tso4: true,
+                rx_guest_csum: guest_csum,
+                has_rss: false,
+                has_hash_report: rx_hdr_len == 20,
+                rss_configured: false,
+                rx_hdr_len,
+                ctrl_qidx: 2,
+                ctrl: None,
+                cfg_phys: 0,
+            };
+            Ok(Self {
+                dev,
+                _registers: registers,
+            })
+        }
+    }
+
+    /// Restores `PRIMARY_IFNAME` on scope exit so a drain test never
+    /// leaks its fixture name into a later smoke, on any path.
+    struct RestorePrimaryName(Option<&'static str>);
+
+    impl Drop for RestorePrimaryName {
+        fn drop(&mut self) {
+            *super::PRIMARY_IFNAME.lock() = self.0;
+        }
+    }
+
+    /// Regression pin for the drain-path GUEST_CSUM bypass: before the
+    /// fix, `vnet0_drain_fn` delivered every taken frame via
+    /// `on_rx_frame_from` with no verdict at all, so an unverified
+    /// checksummed segment reached the stack through the connect_wait
+    /// drain while the async pump dropped it. The cases below route a
+    /// checksummed segment through the drain's own take → verdict →
+    /// deliver/drop → recycle code (`drain_one_on`, the body of
+    /// `vnet0_drain_fn`) and observe the outcome via the interface
+    /// counters: delivered frames bump rx_packets, dropped frames bump
+    /// rx_drop. The drain-namespace iface ("drain%d") keeps the test
+    /// out of the live eth%d namespace; no controller is installed,
+    /// so no forwarder or later smoke can observe the fixture.
+    fn smoke_virtio_net_drain_enforces_guest_csum() -> TestResult {
+        fn run_case(
+            rx_hdr_len: usize,
+            guest_csum: bool,
+            hdr_flags: u8,
+            expect_delivered: bool,
+        ) -> Result<(), &'static str> {
+            let fixture = RxFixture::new(rx_hdr_len, guest_csum, hdr_flags)?;
+            let name = narf_net::iface::register_static(
+                "drain%d",
+                [0x02, 0, 0, 0, 0, 0x01],
+                super::vnet0_send_fn,
+            );
+            let prev = {
+                let mut g = super::PRIMARY_IFNAME.lock();
+                let prev = *g;
+                *g = Some(name);
+                prev
+            };
+            let _restore = RestorePrimaryName(prev);
+            let counters = |name: &str| {
+                narf_net::iface::snapshot_counters()
+                    .into_iter()
+                    .find(|s| s.name.as_str() == name)
+                    .ok_or("drain iface not registered")
+            };
+            let before = counters(name)?;
+            let drained = fixture.dev.drain_one_on(0);
+            let after = counters(name)?;
+            if !drained {
+                return Err("drain reported no frame");
+            }
+            let delivered =
+                after.rx_packets == before.rx_packets + 1 && after.rx_drop == before.rx_drop;
+            let dropped =
+                after.rx_drop == before.rx_drop + 1 && after.rx_packets == before.rx_packets;
+            if expect_delivered && !delivered {
+                return Err("drain dropped a frame it must deliver");
+            }
+            if !expect_delivered && !dropped {
+                return Err("drain delivered an unverified checksummed segment");
+            }
+            Ok(())
+        }
+        let run = || -> Result<(), &'static str> {
+            // Unverified TCPv4, 12-byte header: the bypass itself.
+            run_case(12, true, 0, false)?;
+            // Unverified TCPv4, 20-byte HASH_REPORT header: pins the
+            // runtime header length — a hardcoded 12 would slice the
+            // header-shifted window (ethertype 0x0000 from the zeroed
+            // dst-MAC bytes) and deliver.
+            run_case(20, true, 0, false)?;
+            // Device-verified TCPv4 under HASH_REPORT: delivers, proving
+            // the harness observes delivery and the verdict does not
+            // over-drop.
+            run_case(20, true, VIRTIO_NET_HDR_F_DATA_VALID, true)?;
+            // GUEST_CSUM not negotiated: the gate holds, everything
+            // delivers as before.
+            run_case(12, false, 0, true)?;
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_drain_enforces_guest_csum
     );
 }
