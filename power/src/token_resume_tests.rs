@@ -332,6 +332,7 @@ fn enroll_on_token(
         TokenAnchorConfig {
             pin_mode,
             enroll_credential: Some(enrolled.credential_id.clone()),
+            enroll_public_key: Some(enrolled.public_key),
             rp_id: SUSPEND_RP_ID,
         },
     );
@@ -352,6 +353,7 @@ fn resume_anchor(
         TokenAnchorConfig {
             pin_mode,
             enroll_credential: None,
+            enroll_public_key: None,
             rp_id: SUSPEND_RP_ID,
         },
     )
@@ -455,6 +457,7 @@ fn smoke_power_token_resume_backup_token() -> TestResult {
         TokenAnchorConfig {
             pin_mode: TokenPinMode::TouchAndPin,
             enroll_credential: None,
+            enroll_public_key: None,
             rp_id: SUSPEND_RP_ID,
         },
         &mut prompt,
@@ -746,3 +749,172 @@ fn smoke_power_token_anchor_wrap_unwrap_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power", smoke_power_token_anchor_wrap_unwrap_round_trip);
+
+// ── Smokes: SEC-C1 (#1285) — verified assertions ────────────────
+
+fn smoke_power_token_resume_forged_assertion_refused() -> TestResult {
+    let world = match sealed_two_token_image(Some(PIN)) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("enrollment/sealing failed"),
+    };
+    // The primary token's next assertion carries a corrupted
+    // signature: the ceremony must refuse the slot, and no
+    // verified fact may be announced.
+    world.primary.lock().corrupt_next_assertion_signature();
+    let ui = ScriptedUi::with_pins(&[PIN]);
+    let anchor = match resume_anchor(&world.primary, ui.clone(), TokenPinMode::TouchAndPin) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("resume anchor connect failed"),
+    };
+    let mut prompt = RecordingPrompt::default();
+    match attempt_resume(&world.store, &[&anchor], &mut prompt) {
+        Err(ResumeRefusal::FactorRefused) => {}
+        Err(_) => return TestResult::Fail("forged assertion gave the wrong refusal class"),
+        Ok(_) => return TestResult::Fail("forged assertion resumed the image"),
+    }
+    if prompt.said_verified() {
+        return TestResult::Fail("forged assertion reached a verified fact line");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power", smoke_power_token_resume_forged_assertion_refused);
+
+fn smoke_power_token_resume_up_clear_refused() -> TestResult {
+    let world = match sealed_two_token_image(Some(PIN)) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("enrollment/sealing failed"),
+    };
+    // The token signs a UP-clear assertion genuinely: only the
+    // presence check can refuse it.
+    world.primary.lock().suppress_next_assertion_up();
+    let ui = ScriptedUi::with_pins(&[PIN]);
+    let anchor = match resume_anchor(&world.primary, ui.clone(), TokenPinMode::TouchAndPin) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("resume anchor connect failed"),
+    };
+    let mut prompt = RecordingPrompt::default();
+    match attempt_resume(&world.store, &[&anchor], &mut prompt) {
+        Err(ResumeRefusal::FactorRefused) => {}
+        Err(_) => return TestResult::Fail("UP-clear assertion gave the wrong refusal class"),
+        Ok(_) => return TestResult::Fail("UP-clear assertion resumed the image"),
+    }
+    if prompt.said_verified() {
+        return TestResult::Fail("UP-clear assertion reached a verified fact line");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power", smoke_power_token_resume_up_clear_refused);
+
+fn smoke_power_token_resume_uv_clear_refused() -> TestResult {
+    let world = match sealed_two_token_image(Some(PIN)) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("enrollment/sealing failed"),
+    };
+    // PIN verified, but the token reports UV clear under the
+    // TouchAndPin policy: the ceremony must refuse.
+    world.primary.lock().suppress_next_assertion_uv();
+    let ui = ScriptedUi::with_pins(&[PIN]);
+    let anchor = match resume_anchor(&world.primary, ui.clone(), TokenPinMode::TouchAndPin) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("resume anchor connect failed"),
+    };
+    let mut prompt = RecordingPrompt::default();
+    match attempt_resume(&world.store, &[&anchor], &mut prompt) {
+        Err(ResumeRefusal::FactorRefused) => {}
+        Err(_) => return TestResult::Fail("UV-clear assertion gave the wrong refusal class"),
+        Ok(_) => return TestResult::Fail("UV-clear assertion resumed the image"),
+    }
+    if prompt.said_verified() {
+        return TestResult::Fail("UV-clear assertion reached a verified fact line");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power", smoke_power_token_resume_uv_clear_refused);
+
+/// Split v2 token slot params in tests: (credential id, salt,
+/// public key). Test-side framing for building malformed
+/// records — the production parse stays the authority.
+fn split_token_params(params: &[u8]) -> Option<(Vec<u8>, [u8; 32], [u8; 64])> {
+    if params.len() < 3 + 32 + 64 || params[0] != 2 {
+        return None;
+    }
+    let cred_len = u16::from_le_bytes([params[1], params[2]]) as usize;
+    if params.len() != 3 + cred_len + 32 + 64 {
+        return None;
+    }
+    let credential_id = params[3..3 + cred_len].to_vec();
+    let mut salt = [0u8; 32];
+    salt.copy_from_slice(&params[3 + cred_len..3 + cred_len + 32]);
+    let mut public_key = [0u8; 64];
+    public_key.copy_from_slice(&params[3 + cred_len + 32..]);
+    Some((credential_id, salt, public_key))
+}
+
+fn smoke_power_token_anchor_v1_params_refused() -> TestResult {
+    let token = make_token(0xE1);
+    let (anchor, _enrolled) = match enroll_on_token(&token, Some(PIN)) {
+        Ok(pair) => pair,
+        Err(_) => return TestResult::Fail("enrollment failed"),
+    };
+    let secret = Secret32::mint([0x77; 32]);
+    let wrapped = match anchor.wrap(&WrapCtx { sms_epoch: 3 }, &secret) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("anchor wrap failed"),
+    };
+    let (cred_id, salt, _pubkey) = match split_token_params(&wrapped.params) {
+        Some(parts) => parts,
+        None => return TestResult::Fail("wrapped params are not v2"),
+    };
+    // Rewrite the record as version-1 params (no public key):
+    // a record no assertion can be verified against must
+    // refuse, never derive unverified.
+    let mut v1 = alloc::vec![1u8];
+    v1.extend_from_slice(&(cred_id.len() as u16).to_le_bytes());
+    v1.extend_from_slice(&cred_id);
+    v1.extend_from_slice(&salt);
+    let mut bad = wrapped.clone();
+    bad.params = v1;
+    let ui = ScriptedUi::with_pins(&[PIN]);
+    let resume_side = match resume_anchor(&token, ui, TokenPinMode::TouchAndPin) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("resume anchor connect failed"),
+    };
+    match resume_side.unwrap(&UnwrapCtx { sms_epoch: 3 }, &bad) {
+        Err(AnchorError::Failed) => {}
+        Err(_) => return TestResult::Fail("v1 params gave the wrong anchor error"),
+        Ok(_) => return TestResult::Fail("v1 params opened"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power", smoke_power_token_anchor_v1_params_refused);
+
+fn smoke_power_token_anchor_tampered_pubkey_refused() -> TestResult {
+    let token = make_token(0xE2);
+    let (anchor, _enrolled) = match enroll_on_token(&token, Some(PIN)) {
+        Ok(pair) => pair,
+        Err(_) => return TestResult::Fail("enrollment failed"),
+    };
+    let secret = Secret32::mint([0x77; 32]);
+    let wrapped = match anchor.wrap(&WrapCtx { sms_epoch: 3 }, &secret) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("anchor wrap failed"),
+    };
+    // Flip a byte of the recorded public key: the token's
+    // genuine assertion no longer verifies against it, so the
+    // slot must not open.
+    let mut bad = wrapped.clone();
+    let last = bad.params.len() - 1;
+    bad.params[last] ^= 0xff;
+    let ui = ScriptedUi::with_pins(&[PIN]);
+    let resume_side = match resume_anchor(&token, ui, TokenPinMode::TouchAndPin) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("resume anchor connect failed"),
+    };
+    match resume_side.unwrap(&UnwrapCtx { sms_epoch: 3 }, &bad) {
+        Err(AnchorError::Failed) => {}
+        Err(_) => return TestResult::Fail("tampered pubkey gave the wrong anchor error"),
+        Ok(_) => return TestResult::Fail("tampered pubkey opened"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power", smoke_power_token_anchor_tampered_pubkey_refused);

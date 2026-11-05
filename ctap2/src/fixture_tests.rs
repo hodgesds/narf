@@ -17,6 +17,12 @@
 //! (d) `smoke_multi_credential_next_assertion`
 //! (e) `smoke_malformed_inputs_are_clean_errors`
 //! (f) `smoke_backup_token_distinct_credential_and_output`
+//! (g) SEC-C1 (#1285): `smoke_assertion_verifies_against_enrolled_key`,
+//!     `smoke_forged_assertion_rejected`,
+//!     `smoke_up_clear_assertion_rejected`,
+//!     `smoke_uv_clear_assertion_rejected_under_touch_and_pin`,
+//!     `smoke_uv_clear_assertion_accepted_when_touch_only`,
+//!     `smoke_tampered_sign_count_breaks_assertion_signature`
 
 extern crate alloc;
 
@@ -30,7 +36,9 @@ use narf_crypto::sha256::Sha256;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::cbor::Value;
-use crate::client::{Client, GetAssertionParams, HmacSecretOutput, UserVerification};
+use crate::client::{
+    verify_assertion, Client, CredentialRef, GetAssertionParams, HmacSecretOutput, UserVerification,
+};
 use crate::ctaphid::{Channel, HidPipe, REPORT_LEN};
 use crate::enroll::{
     derive_slot_output, enroll_token, enrollment_complete, DeriveParams, EnrollParams, PinSetup,
@@ -117,7 +125,7 @@ fn enroll_pin(
 
 fn derive(
     client: &mut Client<FixturePipe, FixtureRng>,
-    credential_id: &[u8],
+    enrolled: &crate::enroll::EnrolledToken,
     salt1: [u8; 32],
     salt2: Option<[u8; 32]>,
     pin: Option<&[u8]>,
@@ -127,12 +135,35 @@ fn derive(
         &DeriveParams {
             client_data_hash: CDH,
             rp_id: RP_ID,
-            credential_id,
+            credential_id: &enrolled.credential_id,
+            public_key: enrolled.public_key,
             salt1,
             salt2,
             pin,
         },
     )
+}
+
+/// One raw assertion for an enrolled credential (no
+/// hmac-secret), for direct `verify_assertion` fixtures.
+fn raw_assertion(
+    client: &mut Client<FixturePipe, FixtureRng>,
+    enrolled: &crate::enroll::EnrolledToken,
+    pin: Option<&[u8]>,
+) -> Result<crate::client::Assertion, Error> {
+    let uv = if pin.is_some() {
+        UserVerification::Required
+    } else {
+        UserVerification::Discouraged
+    };
+    client.get_assertion(&GetAssertionParams {
+        rp_id: RP_ID,
+        client_data_hash: CDH,
+        allow: &[CredentialRef::new(enrolled.credential_id.clone())],
+        user_verification: uv,
+        hmac_secret: None,
+        pin,
+    })
 }
 
 // ── (a) byte-exact scripted makeCredential ─────────────────────
@@ -318,6 +349,10 @@ fn smoke_scripted_make_credential_frame_is_byte_exact() -> TestResult {
     );
     check_eq!(attested.credential_id, unhex("DEADBEEF"), "credential id");
     check_eq!(attested.aaguid, [0x22; 16], "aaguid");
+    let mut expect_key = [0u8; 64];
+    expect_key[..32].fill(0x33);
+    expect_key[32..].fill(0x44);
+    check_eq!(attested.public_key, expect_key, "attested public key");
     check!(result.auth_data.user_present(), "UP flag");
     check!(!result.auth_data.user_verified(), "UV flag clear");
 
@@ -409,7 +444,7 @@ fn smoke_derive_matches_independent_hmac_computation() -> TestResult {
 
     let salt1 = [0x51; 32];
     let out = try_ok!(
-        derive(&mut client, &enrolled.credential_id, salt1, None, Some(PIN)),
+        derive(&mut client, &enrolled, salt1, None, Some(PIN)),
         "derive one salt"
     );
     // Independent computation: CTAP2 §6.4 output is
@@ -427,13 +462,7 @@ fn smoke_derive_matches_independent_hmac_computation() -> TestResult {
     // Two salts → two independent outputs in one call.
     let salt2 = [0x52; 32];
     let out2 = try_ok!(
-        derive(
-            &mut client,
-            &enrolled.credential_id,
-            salt1,
-            Some(salt2),
-            Some(PIN)
-        ),
+        derive(&mut client, &enrolled, salt1, Some(salt2), Some(PIN)),
         "derive two salts"
     );
     check_eq!(
@@ -467,13 +496,7 @@ fn smoke_wrong_pin_counts_retries_and_blocks() -> TestResult {
 
     // Wrong PIN → CTAP2_ERR_PIN_INVALID, counter decrements.
     let err = try_err!(
-        derive(
-            &mut client,
-            &enrolled.credential_id,
-            [1; 32],
-            None,
-            Some(b"9999")
-        ),
+        derive(&mut client, &enrolled, [1; 32], None, Some(b"9999")),
         "wrong PIN must fail"
     );
     check_eq!(
@@ -491,13 +514,7 @@ fn smoke_wrong_pin_counts_retries_and_blocks() -> TestResult {
 
     // Correct PIN still works and resets the counter.
     try_ok!(
-        derive(
-            &mut client,
-            &enrolled.credential_id,
-            [1; 32],
-            None,
-            Some(PIN)
-        ),
+        derive(&mut client, &enrolled, [1; 32], None, Some(PIN)),
         "correct PIN"
     );
     check_eq!(
@@ -509,13 +526,7 @@ fn smoke_wrong_pin_counts_retries_and_blocks() -> TestResult {
     // Exhaust the counter: attempts 1..=7 report PIN_INVALID…
     for _ in 0..7 {
         let err = try_err!(
-            derive(
-                &mut client,
-                &enrolled.credential_id,
-                [1; 32],
-                None,
-                Some(b"9999")
-            ),
+            derive(&mut client, &enrolled, [1; 32], None, Some(b"9999")),
             "wrong PIN must fail"
         );
         check_eq!(
@@ -531,13 +542,7 @@ fn smoke_wrong_pin_counts_retries_and_blocks() -> TestResult {
     );
     // …the 8th wrong attempt blocks the PIN…
     let err = try_err!(
-        derive(
-            &mut client,
-            &enrolled.credential_id,
-            [1; 32],
-            None,
-            Some(b"9999")
-        ),
+        derive(&mut client, &enrolled, [1; 32], None, Some(b"9999")),
         "exhausting attempt must fail"
     );
     check_eq!(
@@ -547,13 +552,7 @@ fn smoke_wrong_pin_counts_retries_and_blocks() -> TestResult {
     );
     // …and even the correct PIN is refused until a power cycle.
     let err = try_err!(
-        derive(
-            &mut client,
-            &enrolled.credential_id,
-            [1; 32],
-            None,
-            Some(PIN)
-        ),
+        derive(&mut client, &enrolled, [1; 32], None, Some(PIN)),
         "blocked PIN refuses even the right PIN"
     );
     check_eq!(
@@ -563,13 +562,7 @@ fn smoke_wrong_pin_counts_retries_and_blocks() -> TestResult {
     );
     token.borrow_mut().power_cycle();
     try_ok!(
-        derive(
-            &mut client,
-            &enrolled.credential_id,
-            [1; 32],
-            None,
-            Some(PIN)
-        ),
+        derive(&mut client, &enrolled, [1; 32], None, Some(PIN)),
         "power cycle restores PIN use"
     );
     TestResult::Pass
@@ -798,11 +791,11 @@ fn smoke_backup_token_distinct_credential_and_output() -> TestResult {
     // wraps with its own per-credential secret. Recovery works
     // per-token: P1 stores one wrapped blob per enrolled token.
     let out_a = try_ok!(
-        derive(&mut client_a, &primary.credential_id, salt, None, Some(PIN)),
+        derive(&mut client_a, &primary, salt, None, Some(PIN)),
         "derive primary"
     );
     let out_b = try_ok!(
-        derive(&mut client_b, &backup.credential_id, salt, None, Some(PIN)),
+        derive(&mut client_b, &backup, salt, None, Some(PIN)),
         "derive backup"
     );
     check!(out_a.first != out_b.first, "outputs differ across tokens");
@@ -952,13 +945,7 @@ fn smoke_change_pin_flow() -> TestResult {
         "changePIN with correct current PIN"
     );
     let err = try_err!(
-        derive(
-            &mut client,
-            &enrolled.credential_id,
-            [4; 32],
-            None,
-            Some(PIN)
-        ),
+        derive(&mut client, &enrolled, [4; 32], None, Some(PIN)),
         "old PIN must stop working"
     );
     check_eq!(
@@ -967,15 +954,214 @@ fn smoke_change_pin_flow() -> TestResult {
         "old PIN invalid"
     );
     try_ok!(
-        derive(
-            &mut client,
-            &enrolled.credential_id,
-            [4; 32],
-            None,
-            Some(b"5678")
-        ),
+        derive(&mut client, &enrolled, [4; 32], None, Some(b"5678")),
         "new PIN works"
     );
     TestResult::Pass
 }
 kernel_test_in!("ctap2", smoke_change_pin_flow);
+
+// ── SEC-C1 (#1285): assertion verification ──────────────────────
+
+fn smoke_assertion_verifies_against_enrolled_key() -> TestResult {
+    let (mut client, _token) = try_ok!(fixture_client(0xA5), "connect");
+    let enrolled = try_ok!(enroll_pin(&mut client, PIN), "enroll");
+    // Enrollment surfaces the attested public key the resume
+    // path verifies against (dropping it was the finding).
+    check!(
+        enrolled.public_key != [0u8; 64],
+        "enrolled public key is present"
+    );
+    let assertion = try_ok!(
+        raw_assertion(&mut client, &enrolled, Some(PIN)),
+        "raw assertion"
+    );
+    check_eq!(assertion.auth_data.sign_count, 1, "first sign count");
+    check!(assertion.auth_data.user_present(), "UP set");
+    check!(assertion.auth_data.user_verified(), "UV set");
+    try_ok!(
+        verify_assertion(&assertion, &CDH, &enrolled.public_key, true),
+        "genuine assertion verifies"
+    );
+    // The same assertion does NOT verify against another
+    // credential's key — wrong-key rejection, not just bad bytes.
+    let (mut client_b, _t) = try_ok!(fixture_client(0xA6), "connect backup");
+    let other = try_ok!(enroll_pin(&mut client_b, PIN), "enroll backup");
+    check!(
+        matches!(
+            verify_assertion(&assertion, &CDH, &other.public_key, true),
+            Err(Error::Protocol(_))
+        ),
+        "wrong enrolled key must fail"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("ctap2", smoke_assertion_verifies_against_enrolled_key);
+
+fn smoke_forged_assertion_rejected() -> TestResult {
+    let (mut client, token) = try_ok!(fixture_client(0xA7), "connect");
+    let enrolled = try_ok!(enroll_pin(&mut client, PIN), "enroll");
+    // Unit level: a flipped signature byte fails verification.
+    let assertion = try_ok!(
+        raw_assertion(&mut client, &enrolled, Some(PIN)),
+        "raw assertion"
+    );
+    let mut forged = assertion.clone();
+    let last = forged.signature.len() - 1;
+    forged.signature[last] ^= 0x01;
+    check!(
+        matches!(
+            verify_assertion(&forged, &CDH, &enrolled.public_key, true),
+            Err(Error::Protocol(_))
+        ),
+        "flipped signature byte must fail"
+    );
+    // A truncated (non-DER) signature fails too.
+    let mut short = assertion.clone();
+    short.signature.truncate(4);
+    check!(
+        matches!(
+            verify_assertion(&short, &CDH, &enrolled.public_key, true),
+            Err(Error::Protocol(_))
+        ),
+        "truncated signature must fail"
+    );
+    // Integration level: the fixture signs with a corrupted
+    // signature — derive_slot_output must refuse the output.
+    token.borrow_mut().corrupt_next_assertion_signature();
+    let err = try_err!(
+        derive(&mut client, &enrolled, [9; 32], None, Some(PIN)),
+        "corrupt signature must fail derive"
+    );
+    check!(
+        matches!(err, Error::Protocol(_)),
+        "forged derive error kind"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("ctap2", smoke_forged_assertion_rejected);
+
+fn smoke_up_clear_assertion_rejected() -> TestResult {
+    let (mut client, token) = try_ok!(fixture_client(0xA8), "connect");
+    let enrolled = try_ok!(enroll_pin(&mut client, PIN), "enroll");
+    // The fixture signs the UP-clear authData genuinely, so
+    // only the presence check can reject it — first directly,
+    // then end to end through derive.
+    token.borrow_mut().suppress_next_assertion_up();
+    let assertion = try_ok!(
+        raw_assertion(&mut client, &enrolled, Some(PIN)),
+        "UP-clear raw assertion"
+    );
+    check!(!assertion.auth_data.user_present(), "UP clear as staged");
+    check!(
+        matches!(
+            verify_assertion(&assertion, &CDH, &enrolled.public_key, true),
+            Err(Error::Protocol(_))
+        ),
+        "UP-clear assertion must fail verification"
+    );
+    token.borrow_mut().suppress_next_assertion_up();
+    let err = try_err!(
+        derive(&mut client, &enrolled, [9; 32], None, Some(PIN)),
+        "UP-clear assertion must fail derive"
+    );
+    check!(matches!(err, Error::Protocol(_)), "UP-clear error kind");
+    TestResult::Pass
+}
+kernel_test_in!("ctap2", smoke_up_clear_assertion_rejected);
+
+fn smoke_uv_clear_assertion_rejected_under_touch_and_pin() -> TestResult {
+    let (mut client, token) = try_ok!(fixture_client(0xA9), "connect");
+    let enrolled = try_ok!(enroll_pin(&mut client, PIN), "enroll");
+    // PIN verified, but the token reports UV clear: the
+    // TouchAndPin ceremony must refuse — the policy is now
+    // enforceable client-side.
+    token.borrow_mut().suppress_next_assertion_uv();
+    let err = try_err!(
+        derive(&mut client, &enrolled, [9; 32], None, Some(PIN)),
+        "UV-clear assertion must fail derive under TouchAndPin"
+    );
+    check!(matches!(err, Error::Protocol(_)), "UV-clear error kind");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "ctap2",
+    smoke_uv_clear_assertion_rejected_under_touch_and_pin
+);
+
+fn smoke_uv_clear_assertion_accepted_when_touch_only() -> TestResult {
+    // Touch-only enrollment: no PIN, no UV — a UV-clear
+    // assertion is the expected shape and must verify.
+    let (mut client, _token) = try_ok!(fixture_client(0xAA), "connect");
+    let enrolled = try_ok!(
+        enroll_token(
+            &mut client,
+            &EnrollParams {
+                client_data_hash: CDH,
+                rp_id: RP_ID,
+                rp_name: None,
+                user_id: &[1, 2, 3],
+                user_name: None,
+                pin_setup: PinSetup::TouchOnly,
+            },
+        ),
+        "touch-only enroll"
+    );
+    let assertion = try_ok!(raw_assertion(&mut client, &enrolled, None), "raw assertion");
+    check!(!assertion.auth_data.user_verified(), "UV clear as expected");
+    try_ok!(
+        verify_assertion(&assertion, &CDH, &enrolled.public_key, false),
+        "UV-clear verifies when UV is not required"
+    );
+    check!(
+        matches!(
+            verify_assertion(&assertion, &CDH, &enrolled.public_key, true),
+            Err(Error::Protocol(_))
+        ),
+        "same assertion must fail when UV is required"
+    );
+    // End to end: derive without a PIN succeeds.
+    try_ok!(
+        derive(&mut client, &enrolled, [9; 32], None, None),
+        "touch-only derive"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("ctap2", smoke_uv_clear_assertion_accepted_when_touch_only);
+
+fn smoke_tampered_sign_count_breaks_assertion_signature() -> TestResult {
+    // The counter lives inside the signed authData: rewriting
+    // it — without touching the signature — must break
+    // verification. This is the premise the sign_count
+    // exemption rests on (see `verify_assertion`'s docs).
+    let (mut client, _token) = try_ok!(fixture_client(0xAB), "connect");
+    let enrolled = try_ok!(enroll_pin(&mut client, PIN), "enroll");
+    let assertion = try_ok!(
+        raw_assertion(&mut client, &enrolled, Some(PIN)),
+        "raw assertion"
+    );
+    let mut raw = assertion.auth_data.raw.clone();
+    // sign_count occupies authData bytes 33..37 (BE u32).
+    raw[36] ^= 0x01;
+    let tampered = try_ok!(
+        crate::client::AuthData::parse(&raw),
+        "tampered authData must still parse"
+    );
+    check_eq!(tampered.sign_count, 0, "counter actually changed");
+    let forged = crate::client::Assertion {
+        auth_data: tampered,
+        ..assertion.clone()
+    };
+    check!(
+        matches!(
+            verify_assertion(&forged, &CDH, &enrolled.public_key, true),
+            Err(Error::Protocol(_))
+        ),
+        "tampered counter must fail signature verification"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "ctap2",
+    smoke_tampered_sign_count_breaks_assertion_signature
+);

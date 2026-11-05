@@ -478,6 +478,17 @@ pub struct FixtureToken {
     // Behaviour knobs (tests)
     grant_hmac: bool,
     corrupt_next_cbor: bool,
+    /// SEC-C1 (#1285) negative-assertion knobs: one-shot
+    /// corruptions of the NEXT assertion built, each consumed
+    /// when used. They make assertions FAIL verification — they
+    /// can never make a bad assertion pass. `corrupt_next_sig`
+    /// flips a byte of the DER signature (still DER-parseable);
+    /// the `suppress_next_*` knobs clear a flag the fixture
+    /// would otherwise set, while still signing the resulting
+    /// authData genuinely — so only the flag check can reject it.
+    corrupt_next_sig: bool,
+    suppress_next_up: bool,
+    suppress_next_uv: bool,
     advertised_extensions: Vec<String>,
 }
 
@@ -511,6 +522,9 @@ impl FixtureToken {
             assertion_rest: Vec::new(),
             grant_hmac: true,
             corrupt_next_cbor: false,
+            corrupt_next_sig: false,
+            suppress_next_up: false,
+            suppress_next_uv: false,
             advertised_extensions: alloc::vec!["hmac-secret".into(), "credProtect".into()],
         }
     }
@@ -574,6 +588,27 @@ impl FixtureToken {
     /// so the client must surface a clean decode error.
     pub fn corrupt_next_cbor_response(&mut self) {
         self.corrupt_next_cbor = true;
+    }
+
+    /// Knob (SEC-C1): flip a byte of the next assertion's DER
+    /// signature. The signature stays DER-parseable but no
+    /// longer verifies — the client must reject the assertion.
+    pub fn corrupt_next_assertion_signature(&mut self) {
+        self.corrupt_next_sig = true;
+    }
+
+    /// Knob (SEC-C1): clear the UP flag on the next assertion
+    /// (still genuinely signed). The client must reject it:
+    /// an assertion without a touch is not an assertion.
+    pub fn suppress_next_assertion_up(&mut self) {
+        self.suppress_next_up = true;
+    }
+
+    /// Knob (SEC-C1): clear the UV flag on the next assertion
+    /// even though the PIN verified (still genuinely signed).
+    /// The client must reject it when the ceremony required UV.
+    pub fn suppress_next_assertion_uv(&mut self) {
+        self.suppress_next_uv = true;
     }
 
     // ── report plumbing ─────────────────────────────────────────
@@ -1377,9 +1412,14 @@ impl FixtureToken {
         cred.sign_count = cred.sign_count.wrapping_add(1);
         let sign_count = cred.sign_count;
         let mut flags = 0x01u8; // UP
-        if uv_verified {
+        if self.suppress_next_up {
+            flags &= !0x01;
+            self.suppress_next_up = false;
+        }
+        if uv_verified && !self.suppress_next_uv {
             flags |= 0x04;
         }
+        self.suppress_next_uv = false;
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha256(cred.rp_id.as_bytes()));
         // hmac-secret output (computed before flags: ED depends on it)
@@ -1408,7 +1448,14 @@ impl FixtureToken {
         }
         let digest = sha256_two(&auth, client_data_hash);
         let (r, s) = sign_p256(&cred.signing_key, &digest).ok_or(0x02u8)?;
-        let signature = der_encode_sig(&r, &s);
+        let mut signature = der_encode_sig(&r, &s);
+        if self.corrupt_next_sig {
+            // Flip the last signature byte: the DER shape stays
+            // parseable, the ECDSA check must fail.
+            let last = signature.len() - 1;
+            signature[last] ^= 0x01;
+            self.corrupt_next_sig = false;
+        }
         let mut entries = alloc::vec![
             (
                 FVal::UInt(1),

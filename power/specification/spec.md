@@ -833,18 +833,27 @@ environment drives for token-factor policies,
   user seam — progress lines out, PIN in (as zeroizing bytes);
   `ConsoleTokenUi` is the production binding (polled console,
   masked echo, empty entry = abandon).
-- Slot record framing (params, version 1): version byte, then
+- Slot record framing (params, version 2): version byte, then
   credential id length (u16 LE) and id, then a fresh 32-byte
-  salt1 for the hmac-secret derivation. The blob is
+  salt1 for the hmac-secret derivation, then the enrolled
+  credential's ES256 public key (64 bytes, X ‖ Y). The blob is
   nonce(12) ‖ ciphertext(32) ‖ tag(16): the epoch SMS
   AEAD-wrapped (ChaCha20-Poly1305) under
   HKDF-SHA256(slot output, `"narf-suspend/token-slot"` ‖ epoch
   LE), with the epoch and credential id as AAD. The hmac-secret
   output is never stored or logged; the SMS is reachable only
-  through a completed ceremony.
+  through a completed ceremony. Version-1 params (no public
+  key) refuse as malformed — no assertion could be verified
+  against them — never as a downgrade to unverified derivation.
+  The AEAD shape and AAD are unchanged by the verification
+  work (SEC-C1, #1285).
 - Ceremony (unwrap): derive the slot output through P3's
   `derive_slot_output` (PIN protocol ONE; `uv` required exactly
-  when a PIN is in play), then open the blob. The failure
+  when a PIN is in play), which verifies the assertion's ES256
+  signature against the slot params' public key, requires UP,
+  and requires UV when a PIN is in play, before returning any
+  output — then open the blob. A failed verification is
+  `AnchorError::Failed`, like any other proof/framing failure.
   mapping is part of the contract: `CTAP2_ERR_PIN_INVALID`
   re-asks, announcing the authenticator's own remaining-retry
   count (read back via `getPinRetries`) — PIN retry state is

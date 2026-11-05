@@ -16,8 +16,14 @@
 //!   (design §4.2) with the epoch and credential id as AAD. The
 //!   hmac-secret output and the KEK exist only inside the call;
 //!   neither is stored anywhere. The slot `params` carry exactly
-//!   what resume needs to repeat the derivation: the credential
-//!   id and the salt.
+//!   what resume needs to repeat the derivation *and verify the
+//!   assertion*: the credential id, the salt, and the enrolled
+//!   credential's ES256 public key (SEC-C1, #1285) —
+//!   `derive_slot_output` verifies the assertion's signature,
+//!   UP, and (for touch+PIN) UV against that key before the
+//!   hmac-secret output is trusted. Version-1 params (no public
+//!   key) refuse as malformed: no assertion could be verified
+//!   against them.
 //! - **Unwrap (resume time, resume environment).** The anchor is
 //!   deliberately *not* bound to one credential: the slot record
 //!   names the credential, and the ceremony asserts against
@@ -202,6 +208,12 @@ pub struct TokenAnchorConfig {
     /// resume-side anchor, which is unwrap-only — the slot
     /// records name the credentials there.
     pub enroll_credential: Option<Vec<u8>>,
+    /// The enrolled credential's ES256 public key (X ‖ Y), from
+    /// the same `enroll_token` output. Wrap records it in the
+    /// slot params so the resume side can verify assertions
+    /// against it (SEC-C1, #1285); `None` alongside
+    /// `enroll_credential: None` for resume-side anchors.
+    pub enroll_public_key: Option<[u8; 64]>,
     /// RP id override; production uses [`SUSPEND_RP_ID`].
     pub rp_id: &'static str,
 }
@@ -211,15 +223,21 @@ impl Default for TokenAnchorConfig {
         Self {
             pin_mode: TokenPinMode::TouchAndPin,
             enroll_credential: None,
+            enroll_public_key: None,
             rp_id: SUSPEND_RP_ID,
         }
     }
 }
 
-/// Slot `params` framing, version 1:
-/// `version(1) ‖ cred_id_len(2, LE) ‖ cred_id ‖ salt(32)`.
-const PARAMS_VERSION: u8 = 1;
+/// Slot `params` framing, version 2:
+/// `version(2) ‖ cred_id_len(2, LE) ‖ cred_id ‖ salt(32) ‖
+/// public_key(64)`. Version 1 carried no public key, so no
+/// assertion could be verified against it — v1 records refuse
+/// as malformed (fail closed), not as a downgrade to
+/// unverified derivation.
+const PARAMS_VERSION: u8 = 2;
 const SALT_LEN: usize = 32;
+const PUBKEY_LEN: usize = 64;
 /// Slot `blob` framing: `nonce(12) ‖ ciphertext(32) ‖ tag(16)`,
 /// the suspend service's AEAD wrap shape.
 const NONCE_LEN: usize = 12;
@@ -229,12 +247,17 @@ const BLOB_LEN: usize = NONCE_LEN + 32 + 16;
 /// interface that never gives up cannot spin the ceremony.
 const MAX_PIN_ATTEMPTS: usize = 16;
 
-fn write_params(credential_id: &[u8], salt: &[u8; SALT_LEN]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(3 + credential_id.len() + SALT_LEN);
+fn write_params(
+    credential_id: &[u8],
+    salt: &[u8; SALT_LEN],
+    public_key: &[u8; PUBKEY_LEN],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + credential_id.len() + SALT_LEN + PUBKEY_LEN);
     out.push(PARAMS_VERSION);
     out.extend_from_slice(&(credential_id.len() as u16).to_le_bytes());
     out.extend_from_slice(credential_id);
     out.extend_from_slice(salt);
+    out.extend_from_slice(public_key);
     out
 }
 
@@ -242,18 +265,20 @@ fn write_params(credential_id: &[u8], salt: &[u8; SALT_LEN]) -> Vec<u8> {
 /// length, non-empty credential. Anything else is a malformed
 /// slot, reported as an anchor failure (the service's no-oracle
 /// discipline: malformed and tampered are one class).
-fn read_params(params: &[u8]) -> Option<(Vec<u8>, [u8; SALT_LEN])> {
-    if params.len() < 3 + SALT_LEN || params[0] != PARAMS_VERSION {
+fn read_params(params: &[u8]) -> Option<(Vec<u8>, [u8; SALT_LEN], [u8; PUBKEY_LEN])> {
+    if params.len() < 3 + SALT_LEN + PUBKEY_LEN || params[0] != PARAMS_VERSION {
         return None;
     }
     let cred_len = u16::from_le_bytes([params[1], params[2]]) as usize;
-    if cred_len == 0 || params.len() != 3 + cred_len + SALT_LEN {
+    if cred_len == 0 || params.len() != 3 + cred_len + SALT_LEN + PUBKEY_LEN {
         return None;
     }
     let credential_id = params[3..3 + cred_len].to_vec();
     let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&params[3 + cred_len..]);
-    Some((credential_id, salt))
+    salt.copy_from_slice(&params[3 + cred_len..3 + cred_len + SALT_LEN]);
+    let mut public_key = [0u8; PUBKEY_LEN];
+    public_key.copy_from_slice(&params[3 + cred_len + SALT_LEN..]);
+    Some((credential_id, salt, public_key))
 }
 
 fn slot_kek(hmac_output: &[u8; 32], epoch: u64) -> [u8; 32] {
@@ -327,11 +352,15 @@ impl<P: HidPipe, R: RandomSource, U: TokenUserInterface> TokenAnchor<P, R, U> {
     /// the ones `attempt_resume` may act on: `Refused` (this
     /// factor did not satisfy — wrong credential, no presence,
     /// PIN blocked or abandoned) vs `Failed` (the conversation
-    /// itself broke — proof or framing invalid).
+    /// itself broke — proof or framing invalid). A failed
+    /// assertion *verification* (forged signature, UP/UV clear)
+    /// is `Failed`: the token answered, but its answer is not
+    /// a genuine assertion for the enrolled credential.
     fn derive_with_ceremony(
         &self,
         credential_id: &[u8],
         salt: [u8; SALT_LEN],
+        public_key: &[u8; PUBKEY_LEN],
     ) -> Result<[u8; 32], AnchorError> {
         {
             let mut ui = self.ui.lock();
@@ -362,6 +391,7 @@ impl<P: HidPipe, R: RandomSource, U: TokenUserInterface> TokenAnchor<P, R, U> {
                         client_data_hash: suspend_client_data_hash(),
                         rp_id: self.config.rp_id,
                         credential_id,
+                        public_key: *public_key,
                         salt1: salt,
                         salt2: None,
                         pin: pin.as_ref().map(|p| p.as_slice()),
@@ -428,6 +458,7 @@ impl<P: HidPipe + Send, R: RandomSource + Send, U: TokenUserInterface + Send> Ke
             .enroll_credential
             .clone()
             .ok_or(AnchorError::Failed)?;
+        let public_key = self.config.enroll_public_key.ok_or(AnchorError::Failed)?;
         let mut salt = [0u8; SALT_LEN];
         let mut nonce = [0u8; NONCE_LEN];
         {
@@ -441,7 +472,7 @@ impl<P: HidPipe + Send, R: RandomSource + Send, U: TokenUserInterface + Send> Ke
                 .fill_random(&mut nonce)
                 .map_err(|_| AnchorError::Failed)?;
         }
-        let output = self.derive_with_ceremony(&credential_id, salt)?;
+        let output = self.derive_with_ceremony(&credential_id, salt, &public_key)?;
         let kek = Zeroizing::new(slot_kek(&output, ctx.sms_epoch));
         let aad = slot_aad(ctx.sms_epoch, &credential_id);
         let mut ct = [0u8; 32];
@@ -452,17 +483,18 @@ impl<P: HidPipe + Send, R: RandomSource + Send, U: TokenUserInterface + Send> Ke
         blob.extend_from_slice(&ct);
         blob.extend_from_slice(&tag);
         Ok(WrappedSlot {
-            params: write_params(&credential_id, &salt),
+            params: write_params(&credential_id, &salt, &public_key),
             blob,
         })
     }
 
     fn unwrap(&self, ctx: &UnwrapCtx, slot: &WrappedSlot) -> Result<Secret32, AnchorError> {
-        let (credential_id, salt) = read_params(&slot.params).ok_or(AnchorError::Failed)?;
+        let (credential_id, salt, public_key) =
+            read_params(&slot.params).ok_or(AnchorError::Failed)?;
         if slot.blob.len() != BLOB_LEN {
             return Err(AnchorError::Failed);
         }
-        let output = self.derive_with_ceremony(&credential_id, salt)?;
+        let output = self.derive_with_ceremony(&credential_id, salt, &public_key)?;
         let kek = Zeroizing::new(slot_kek(&output, ctx.sms_epoch));
         let aad = slot_aad(ctx.sms_epoch, &credential_id);
         let mut nonce = [0u8; NONCE_LEN];
