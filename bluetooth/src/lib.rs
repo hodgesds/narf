@@ -87,6 +87,9 @@ mod tests;
 #[cfg(feature = "kernel-test")]
 mod e2e_tests;
 
+#[cfg(feature = "kernel-test")]
+mod fake_usb_hci;
+
 use narf_capabilities::{Cap, CapKind, CapType, Grant};
 
 /// Cap-type marker for the Bluetooth control surface.
