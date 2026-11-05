@@ -2624,6 +2624,124 @@ fn smoke_ixgbe_vmdq_enable_conversation() -> TestResult {
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_enable_conversation);
 
+/// VMDq+RSS composition (#1489): after VT mode is on,
+/// `enable_vmdq_rss` switches MRQE 0x8 -> 0xB with the hash
+/// fields on, programs the shared key + the per-pool RETA, and
+/// bounds the lookup per pool with PSRTYPE RQPL. Grounding:
+/// datasheet §4.6.10.1.1 ("the redirection table is common to
+/// all the pools and only indicates the queue inside the pool"),
+/// Table 7.3 ("64 pools x 2 RSS"), Table 7.4 (queue = pool +
+/// RSS bit); Linux `ixgbe_setup_mrqc` / `ixgbe_setup_reta` /
+/// `ixgbe_setup_psrtype`. The X550 per-pool registers
+/// (PFVFMRQC/PFVFRETA/PFVFRSSRK) do not exist on 82599, so the
+/// native 0x0E aliases stay unwritten. Fail-closed pins: RSS
+/// before VT, a 4-queue config, and a table entry naming a queue
+/// outside the pool must all refuse before touching a register.
+fn smoke_ixgbe_vmdq_rss_composition() -> TestResult {
+    use super::queues::RegBank;
+    use super::regs::{REG_RETA_BASE, REG_RSSRK_BASE};
+    use super::rss::IxgbeRss;
+    use super::vmdq::{
+        enable_virtualization, enable_vmdq_rss, psrtype, psrtype_word, VmdqConfig, VmdqError,
+        REG_MRQC, REG_MTQC,
+    };
+    let rss = match IxgbeRss::standard(2) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("IxgbeRss::standard(2) failed"),
+    };
+    // 1. RSS before VT mode refuses and touches nothing.
+    let mut bank = FakeBank::new();
+    match enable_vmdq_rss(&mut bank, &rss) {
+        Err(VmdqError::VtNotEnabled) => {}
+        _ => return TestResult::Fail("VMDq RSS accepted without VT mode"),
+    }
+    if bank.read32(REG_MRQC) != 0 || bank.read32(REG_RSSRK_BASE) != 0 {
+        return TestResult::Fail("failed VMDq RSS call touched registers");
+    }
+    // 2. Enable VT, then compose: MRQC 0xB + hash fields, upper
+    // bits preserved (pre-seeded 0xFFFF_0000, as the enable test).
+    bank.write32(REG_MRQC, 0xFFFF_0000);
+    if enable_virtualization(&mut bank, &VmdqConfig::standard()).is_err() {
+        return TestResult::Fail("enable_virtualization failed on a valid config");
+    }
+    if bank.read32(REG_MRQC) != 0xFFFF_0008 {
+        return TestResult::Fail("MRQC VMDQEN word wrong before composition");
+    }
+    if enable_vmdq_rss(&mut bank, &rss).is_err() {
+        return TestResult::Fail("enable_vmdq_rss failed on a valid config");
+    }
+    if bank.read32(REG_MRQC) != 0xFFF3_000B {
+        return TestResult::Fail("MRQC VMDQRSS64EN word wrong");
+    }
+    if bank.read32(REG_MTQC) != 0x6 {
+        return TestResult::Fail("MTQC VT word disturbed by composition");
+    }
+    // 3. Shared key + shared table, canonical addresses only.
+    if bank.read32(REG_RSSRK_BASE) != 0xda56_5a6d {
+        return TestResult::Fail("RSSRK[0] not programmed");
+    }
+    // Per-pool RETA: entries alternate 0,1 (queue inside the pool).
+    if bank.read32(REG_RETA_BASE) != 0x0100_0100 {
+        return TestResult::Fail("RETA[0] not programmed for 2 queues/pool");
+    }
+    if bank.read32(REG_RETA_BASE + 4 * 31) != 0x0100_0100 {
+        return TestResult::Fail("RETA[31] not programmed for 2 queues/pool");
+    }
+    if bank.read32(0x0EC80) != 0 || bank.read32(0x0EB80) != 0 || bank.read32(0x0EB00) != 0 {
+        return TestResult::Fail("composition wrote a native alias address");
+    }
+    // 4. PSRTYPE RQPL = 1 (2 queues/pool) on every pool, both
+    // address blocks (pools 0..15 at 0x05480, 16..63 at 0x0EA00).
+    if psrtype_word(2) != 0x2000_1330 {
+        return TestResult::Fail("psrtype_word(2) wrong");
+    }
+    for pool in [0, 15, 16, 63] {
+        if bank.read32(psrtype(pool)) != 0x2000_1330 {
+            return TestResult::Fail("PSRTYPE RQPL word wrong");
+        }
+    }
+    // 5. Hardware steering agrees with the shared stack-side hash
+    // on the 2-queue table (within-pool offsets).
+    let mut frame = alloc::vec![0u8; 54];
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    frame[14] = 0x45;
+    frame[23] = 6;
+    frame[26..30].copy_from_slice(&[66, 9, 149, 187]);
+    frame[30..34].copy_from_slice(&[161, 142, 100, 80]);
+    frame[34..36].copy_from_slice(&2794u16.to_be_bytes());
+    frame[36..38].copy_from_slice(&1766u16.to_be_bytes());
+    let net_cfg = narf_net::rss::RssConfig::standard(2, 128);
+    if rss.rx_queue(&frame) != net_cfg.rx_queue(&frame) {
+        return TestResult::Fail("composed RSS queue disagrees with net rss");
+    }
+    let mut arp = frame.clone();
+    arp[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    if rss.rx_queue(&arp) != 0 {
+        return TestResult::Fail("non-IP frame did not hash to queue 0");
+    }
+    // 6. Fail-closed: a 4-queue config and an out-of-pool table
+    // entry refuse, and MRQC stays at the VMDQEN word.
+    let rss4 = match IxgbeRss::standard(4) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("IxgbeRss::standard(4) failed"),
+    };
+    match enable_vmdq_rss(&mut bank, &rss4) {
+        Err(VmdqError::BadRssQueues) => {}
+        _ => return TestResult::Fail("VMDq RSS accepted a 4-queue config"),
+    }
+    let mut bad = rss.clone();
+    bad.table[0] = 2;
+    match enable_vmdq_rss(&mut bank, &bad) {
+        Err(VmdqError::BadRssQueues) => {}
+        _ => return TestResult::Fail("VMDq RSS accepted an out-of-pool RETA entry"),
+    }
+    if bank.read32(REG_MRQC) != 0xFFF3_000B {
+        return TestResult::Fail("failed VMDq RSS call rewrote MRQC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_rss_composition);
+
 fn smoke_ixgbe_vmdq_mpsar_rar() -> TestResult {
     use super::queues::RegBank;
     use super::vmdq::{

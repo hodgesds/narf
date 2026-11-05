@@ -227,10 +227,16 @@ aliases are the same physical registers. `ixgbe/regs.rs` is the
 single authority both paths must import (canonical = 0x05
 block, following Linux's shipping map; native aliases kept
 as pinned constants, not programmed), and the alias-map
-fixture pins the pairing. The remaining VMDq+RSS composition
-work is the MRQE mode value (0xB = 64 pools + RSS per
-§8.2.3.7.12) + per-pool RETA, on the VMDq path — not an
-address question.
+fixture pins the pairing. The VMDq+RSS composition is done on
+the VMDq path (`vmdq::enable_vmdq_rss`, `Ixgbe::configure_vmdq_rss`,
+issue #1489): MRQE 0xB (64 pools + RSS per §8.2.3.7.12) with
+the hash fields on, the shared 40-byte key, and the shared
+128-entry RETA whose entries are queue offsets inside the pool
+(datasheet §4.6.10.1.1: the table "is common to all the pools
+and only indicates the queue inside the pool"), bounded per
+pool by `PSRTYPE` RQPL (Linux `ixgbe_setup_psrtype`). The X550
+per-pool registers (`PFVFMRQC` / `PFVFRETA` / `PFVFRSSRK`) do
+not exist on 82599 and are not programmed.
 
 ## 11. VLAN filtering
 
@@ -373,7 +379,9 @@ SR-IOV / VMDq, grounded in Linux ixgbe @ cbbddb6 (no local
 datasheet copy; see the module header for the full grounding note
 and the deliberate deviations). VT mode is 64 pools x 2 queues
 (`MTQC` VT_ENA | 64VF, `MRQC` VMDQEN, `VT_CTL` default pool +
-replication, VEB switching via `PFDTXGSWC`). Pool 0 is the PF's
+replication, VEB switching via `PFDTXGSWC`). RSS composes
+on top via `configure_vmdq_rss` (MRQE 0xB + per-pool RETA,
+see §10). Pool 0 is the PF's
 (queues 0/1, the 1/1 default bring-up, untouched); VF `i` owns
 pool `i+1` (at most 63 VFs — a documented deviation from Linux,
 which numbers VF pools from 0 with the PF after them; pool
@@ -865,8 +873,8 @@ Per the v0.1 exclusion list, still open after this stream:
   the other NACKed message types; 32-VF mode; spoof-check
   enforcement; DCB+VT combinations. The #1397 address question
   is settled (datasheet dual-map; `ixgbe/regs.rs` is the shared
-  authority): what remains is the MRQE 0xB + per-pool RETA
-  composition on the VMDq path.
+  authority), and the MRQE 0xB + per-pool RETA composition is
+  done (#1489).
 - FlowDirector remainders (see §13c): TX sampling hook for ATR
   (packet parser + sample-rate policy + queue binding), IPv6
   perfect filters, persistent filter list with restore on

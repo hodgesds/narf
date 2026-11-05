@@ -1358,8 +1358,16 @@ impl Ixgbe {
 
     /// Program RSS for `queues` RX queues (1..=16, MRQE = 0001
     /// mode). Callers must have RX disabled while reprogramming
-    /// filters; bring-up leaves RSS off until this runs.
+    /// filters; bring-up leaves RSS off until this runs. Refuses
+    /// under VT mode: RSS-only mode would rewrite the `MRQC`
+    /// the VMDq composition owns — use `configure_vmdq_rss`
+    /// once `configure_vmdq` has run.
     pub fn configure_rss(&self, queues: usize) -> Result<(), IxgbeError> {
+        if self.vmdq_cfg.lock().is_some() {
+            return Err(IxgbeError::Other(
+                "RSS-only mode conflicts with VT mode; use configure_vmdq_rss",
+            ));
+        }
         let cfg = rss::IxgbeRss::standard(queues)
             .map_err(|_| IxgbeError::Other("bad RSS queue count"))?;
         {
@@ -1500,6 +1508,27 @@ impl Ixgbe {
                 .map_err(|_| IxgbeError::Other("bad VMDq config"))?;
         }
         *self.vmdq_cfg.lock() = Some(cfg);
+        // VT mode rewrote `MRQC` to VMDQEN: a previously recorded
+        // RSS-only config no longer matches the hardware, so drop
+        // the record (callers re-apply RSS via `configure_vmdq_rss`).
+        *self.rss_cfg.lock() = None;
+        Ok(())
+    }
+
+    /// Program RSS inside VT mode (MRQE 0xB + per-pool RETA).
+    /// Call after `configure_vmdq`; `rss` must be a 2-queue
+    /// config (`rss::IxgbeRss::standard(2)` — one RETA entry per
+    /// queue inside each pool). Callers must have RX disabled
+    /// while reprogramming filters. The composed config is
+    /// recorded like RSS-only mode, so `caps()` gains `RSS` and
+    /// `rss()` exposes the within-pool table.
+    pub fn configure_vmdq_rss(&self, rss: rss::IxgbeRss) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            vmdq::enable_vmdq_rss(&mut bank, &rss)
+                .map_err(|_| IxgbeError::Other("bad VMDq RSS config"))?;
+        }
+        *self.rss_cfg.lock() = Some(rss);
         Ok(())
     }
 
