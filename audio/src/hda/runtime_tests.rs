@@ -51,6 +51,23 @@ struct Model {
     /// ALC287-shaped one; the fixture proves verb traffic +
     /// CodecInfo, not widget semantics.
     alc256: bool,
+    /// Analog variant: answer as an ALC282 codec (vendor
+    /// 0x10ec0282) so the #1496 full-table coef-init path has a
+    /// chip to fix up.
+    alc282: bool,
+    /// Analog variant: answer as a Lenovo Yoga 7 2-in-1 16AKP10
+    /// (ALC287, codec subsystem id 0x17aa391d — the subsystem
+    /// Linux itself matches on in
+    /// `alc287_fixup_yoga9_14iap7_bass_spk_pin`) with the Yoga's
+    /// widget model, so the #1496 verified-quirk path has a
+    /// machine to fix up.
+    yoga9: bool,
+    /// Last SET_COEF_INDEX payload per coef nid (0x20 / 0x53).
+    coef_index: [(u8, u8); 2],
+    /// Coef register file: (nid, index, value). Every coef reads
+    /// 0 until written — like a codec fresh out of reset — unless
+    /// the fixture pre-seeds it.
+    coef: Vec<(u8, u16, u16)>,
 }
 impl Model {
     fn step(&mut self) {
@@ -94,6 +111,8 @@ impl Model {
                     self.navi22_response(command)
                 } else if self.ati {
                     self.ati_response(command)
+                } else if self.yoga9 {
+                    self.yoga9_response(command)
                 } else {
                     response(command)
                 };
@@ -139,6 +158,44 @@ impl Model {
                         (0, 0xf00, 0) => reply = 0x10ec0256,
                         (0, 0xf00, 1) => reply = 0x10280d76,
                         _ => {}
+                    }
+                }
+                if self.alc282 && !self.ati && !self.navi22 {
+                    let nid = (command >> 20) as u8;
+                    let verb = (command >> 8) & 0xfff;
+                    let param = command as u8;
+                    match (nid, verb, param) {
+                        // ALC282 codec id; the subsystem read stays
+                        // 0 (unknown) — `alc282_init` is keyed on
+                        // the chip, not on a subsystem id.
+                        (0, 0xf00, 0) => reply = 0x10ec0282,
+                        _ => {}
+                    }
+                }
+                // Realtek coef registers (#1496): SET_COEF_INDEX
+                // selects the index for the next SET_PROC_COEF
+                // write / GET_PROC_COEF read on the same nid
+                // (Linux `alc_read_coef_idx` /
+                // `alc_write_coef_idx`). The model keeps the
+                // selected index per nid and the written values,
+                // so a masked read-modify-write update is
+                // observable both in the recorded verbs and in
+                // the register file it leaves behind. The 16-bit
+                // coef value spans the verb field's low byte and
+                // the payload byte, so the verb match masks to
+                // the 4-bit verb id (0x500 / 0x400).
+                if !self.ati && !self.navi22 {
+                    let nid = (command >> 20) as u8;
+                    let verb = (command >> 8) & 0xfff;
+                    let payload = command as u8;
+                    if verb & 0xf00 == 0x500 {
+                        let index = (u16::from(verb as u8) << 8) | u16::from(payload);
+                        self.set_coef_index(nid, index);
+                    } else if verb & 0xf00 == 0x400 {
+                        let value = (u16::from(verb as u8) << 8) | u16::from(payload);
+                        self.write_coef(nid, value);
+                    } else if verb == 0xc00 {
+                        reply = u32::from(self.read_coef(nid));
                     }
                 }
                 if command == make_verb(0, 1, VERB_GET_PARAMETER | 0xa) && !self.supports_32 {
@@ -190,6 +247,96 @@ fn response(command: u32) -> u32 {
         (6, 0xf1c, _) => (2 << 20) | 0x20,
         (7, 0xf1c, _) => (0xa << 20) | 0x30,
         _ => 0,
+    }
+}
+impl Model {
+    /// Selected coef index for `nid` (0 if never selected).
+    fn coef_selected(&self, nid: u8) -> u16 {
+        self.coef_index
+            .iter()
+            .find(|(n, _)| *n == nid)
+            .map(|(_, i)| u16::from(*i))
+            .unwrap_or(0)
+    }
+    /// Read the coef value SET_COEF_INDEX last selected for `nid`.
+    fn read_coef(&self, nid: u8) -> u16 {
+        let index = self.coef_selected(nid);
+        self.coef
+            .iter()
+            .find(|(n, i, _)| *n == nid && *i == index)
+            .map(|(_, _, v)| *v)
+            .unwrap_or(0)
+    }
+    /// Write `value` to the coef SET_COEF_INDEX last selected for `nid`.
+    fn write_coef(&mut self, nid: u8, value: u16) {
+        let index = self.coef_selected(nid);
+        if let Some(slot) = self
+            .coef
+            .iter_mut()
+            .find(|(n, i, _)| *n == nid && *i == index)
+        {
+            slot.2 = value;
+        } else {
+            self.coef.push((nid, index, value));
+        }
+    }
+    /// Select the coef index for `nid`. Unknown coef nids keep
+    /// index 0: the driver only ever indexes 0x20/0x53.
+    fn set_coef_index(&mut self, nid: u8, index: u16) {
+        if let Some(slot) = self.coef_index.iter_mut().find(|(n, _)| *n == nid) {
+            slot.1 = index as u8;
+        }
+    }
+
+    /// Lenovo Yoga 7 2-in-1 16AKP10 (ALC287, codec subsystem
+    /// 0x17aa391d): the fixup's model, self-contained — it answers
+    /// every verb `enumerate` and the probe path send, and 0 for
+    /// the rest. The widget model is the fixup's own shape: DACs
+    /// 0x02/0x03/0x06/0x08, speaker pins 0x14/0x17, HP pin 0x21.
+    /// Model choices, not hardware facts (documented because the
+    /// fixture must not be mistaken for a dump):
+    /// - Pin 0x17's hardware list is {0x06, 0x08, 0x02, 0x03} —
+    ///   DAC 0x06 first, matching the Linux reports that without
+    ///   the fixup pin 0x17 lands on DAC 0x06 (which has no volume
+    ///   control); pins 0x14/0x21 list their preferred DAC second,
+    ///   so the preference machinery is load-bearing.
+    /// - Pin 0x17's hardware config 0x411111f0 IS the real BIOS
+    ///   value from the Linux patch description (reported as
+    ///   unconnected); the quirk overrides it to 0x90170121.
+    /// - The 0x06/0x08 "no volume" property is not modeled: no
+    ///   NARF code reads it, so it cannot affect the assertions.
+    /// - All other widget nids read caps 0 (phantom Audio Output
+    ///   widgets with no connections); they create no paths.
+    fn yoga9_response(&mut self, command: u32) -> u32 {
+        let nid = (command >> 20) as u8;
+        let verb = (command >> 8) & 0xfff;
+        let param = command as u8;
+        match (nid, verb, param) {
+            (0, 0xf00, 0) => 0x10ec0287,
+            (0, 0xf00, 1) => 0x17aa391d,
+            (0, 0xf00, 2) => 1,
+            (0, 0xf00, 4) => 0x00010001,
+            (1, 0xf00, 5) => 1,
+            (1, 0xf00, 4) => 0x00020020,
+            (1, 0xf00, 0xa) => (1 << 6) | (1 << 17) | (1 << 20),
+            (1, 0xf00, 0xb) => 1,
+            (_, 0xf00, 0xd | 0x12) => 0x80002010,
+            // DACs: stereo Audio Output with an output amp.
+            (0x02 | 0x03 | 0x06 | 0x08, 0xf00, 9) => 1 | 4,
+            // Speaker pins 0x14/0x17 and HP pin 0x21.
+            (0x14 | 0x17 | 0x21, 0xf00, 9) => (4 << 20) | 0x101 | 4,
+            (0x14 | 0x17 | 0x21, 0xf00, 0xc) => 0x10010,
+            (0x14, 0xf00, 0xe) => 2,
+            (0x17, 0xf00, 0xe) => 4,
+            (0x21, 0xf00, 0xe) => 2,
+            (0x14, 0xf02, _) => 0x0203,
+            (0x17, 0xf02, _) => 0x03020806,
+            (0x21, 0xf02, _) => 0x0302,
+            (0x14, 0xf1c, _) => (2 << 30) | (1 << 20) | 0x10,
+            (0x17, 0xf1c, _) => 0x411111f0,
+            (0x21, 0xf1c, _) => (2 << 20) | 0x20,
+            _ => 0,
+        }
     }
 }
 impl Model {
@@ -368,16 +515,41 @@ impl Fixture {
         Self::build(true, true, true)
     }
     fn build(noncoherent: bool, ati: bool, second_port: bool) -> Result<Self, &'static str> {
-        Self::build_model(noncoherent, ati, second_port, false, false, false)
+        Self::build_model(
+            noncoherent,
+            ati,
+            second_port,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
     }
     /// The analog codec with a line-in pin beside the mic pin, for
     /// jack-driven capture-source switching tests.
     fn line_in() -> Result<Self, &'static str> {
-        Self::build_model(false, false, false, false, true, false)
+        Self::build_model(false, false, false, false, true, false, false, false, false)
     }
     /// The analog codec as an ALC256 (#776 coef-init fixture).
     fn alc256() -> Result<Self, &'static str> {
-        Self::build_model(false, false, false, false, false, true)
+        Self::build_model(false, false, false, false, false, true, false, false, false)
+    }
+    /// The analog codec as an ALC256 with coef 0x46 pre-seeded to
+    /// 0xF5A5 (#1496 RMW fixture): the masked update must preserve
+    /// the bits outside its mask.
+    fn alc256_seeded() -> Result<Self, &'static str> {
+        Self::build_model(false, false, false, false, false, true, false, false, true)
+    }
+    /// The analog codec as an ALC282 (#1496 full-table coef-init fixture).
+    fn alc282() -> Result<Self, &'static str> {
+        Self::build_model(false, false, false, false, false, false, true, false, false)
+    }
+    /// The analog codec as a Lenovo Yoga 7 2-in-1 16AKP10 (ALC287,
+    /// subsystem 0x17aa391d; #1496 verified-quirk fixture).
+    fn yoga9() -> Result<Self, &'static str> {
+        Self::build_model(false, false, false, false, false, false, false, true, false)
     }
     /// The RX 6750 XT's HD-Audio function: 1002:ab28 runs without snoop.
     fn navi22() -> Result<Self, &'static str> {
@@ -386,6 +558,9 @@ impl Fixture {
             true,
             false,
             true,
+            false,
+            false,
+            false,
             false,
             false,
         )
@@ -397,6 +572,9 @@ impl Fixture {
         navi22: bool,
         line_in: bool,
         alc256: bool,
+        alc282: bool,
+        yoga9: bool,
+        seed_alc256_coef: bool,
     ) -> Result<Self, &'static str> {
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
@@ -438,6 +616,14 @@ impl Fixture {
                 mic_plugged: false,
                 line_plugged: false,
                 alc256,
+                alc282,
+                yoga9,
+                coef_index: [(0x20, 0), (0x53, 0)],
+                coef: if seed_alc256_coef {
+                    alloc::vec![(crate::hda::quirks::COEF_NODE, 0x46, 0xF5A5)]
+                } else {
+                    Vec::new()
+                },
             }),
         };
         *MODEL.lock() = &mut *fixture.model as *mut Model as usize;
@@ -2077,3 +2263,270 @@ fn native_hda_pm_reinit_reapplies_coef_init() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/hda", native_hda_pm_reinit_reapplies_coef_init);
+
+// ── #1496: re-derived pin quirks + RMW coef ────────────────────────
+// The expected verbs come from Linux `alc256_init`
+// (`alc_update_coef_idx(codec, 0x46, 3 << 12, 0)` etc.) and from
+// `alc282_coefs` / `alc287_fixup_yoga9_14iap7_bass_spk_pin`, not
+// from the implementation.
+
+/// #1496: the ALC256 init's masked rows are real
+/// read-modify-write updates (Linux `alc_update_coef_idx`), not
+/// plain writes: coef 0x46 is pre-seeded to 0xF5A5, so the
+/// (0x46, mask 0x3000, value 0) update must write back 0xC5A5 —
+/// the bits outside the mask preserved — and each update must be
+/// preceded by a GET_PROC_COEF read of the same index.
+fn native_hda_alc256_coef_rmw_update_applied() -> TestResult {
+    let fixture = match Fixture::alc256_seeded() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x10ec0256 {
+        return TestResult::Fail("fixture codec must be ALC256");
+    }
+    let verbs = &fixture.model.verbs;
+    let idx =
+        |nid: u8, index: u32| make_verb(0, nid, crate::hda_codec::verb::SET_COEF_INDEX | index);
+    let get = |nid: u8| make_verb(0, nid, crate::hda_codec::verb::GET_PROC_COEF);
+    let set =
+        |nid: u8, value: u32| make_verb(0, nid, crate::hda_codec::verb::SET_PROC_COEF | value);
+    // Linux `alc256_init`'s unconditional tail, in Linux's order:
+    // masked 0x46 update, 0x53 set/clear pulse (nid 0x53, not
+    // the coef node), then the plain 0x36 write.
+    let expected: [u32; 14] = [
+        idx(0x20, 0x46),
+        get(0x20),
+        idx(0x20, 0x46),
+        set(0x20, 0xC5A5),
+        idx(0x53, 0x02),
+        get(0x53),
+        idx(0x53, 0x02),
+        set(0x53, 0x8000),
+        idx(0x53, 0x02),
+        get(0x53),
+        idx(0x53, 0x02),
+        set(0x53, 0x0000),
+        idx(0x20, 0x36),
+        set(0x20, 0x5757),
+    ];
+    // The coef verbs are the only traffic on nids 0x20/0x53, and
+    // must be exactly this sequence.
+    let coef_verbs: Vec<u32> = verbs
+        .iter()
+        .copied()
+        .filter(|v| matches!((*v >> 20) & 0xff, 0x20 | 0x53))
+        .collect();
+    if coef_verbs[..] != expected[..] {
+        return TestResult::Fail("ALC256 init must run its 4-op tail in Linux order");
+    }
+    // The register file the updates leave behind: the mask
+    // preserved 0xF5A5's bits outside 0x3000, the pulse cleared.
+    let coef = |nid: u8, index: u16| {
+        fixture
+            .model
+            .coef
+            .iter()
+            .find(|(n, i, _)| *n == nid && *i == index)
+            .map(|(_, _, v)| *v)
+    };
+    if coef(0x20, 0x46) != Some(0xC5A5)
+        || coef(0x53, 0x02) != Some(0x0000)
+        || coef(0x20, 0x36) != Some(0x5757)
+    {
+        return TestResult::Fail("ALC256 coef state must hold the masked updates");
+    }
+    // The init runs before enumeration.
+    let first_pincfg = verbs.iter().position(|v| (**v >> 8) & 0xfff == 0xf1c);
+    let last_coef = verbs
+        .iter()
+        .rposition(|v| matches!((*v >> 20) & 0xff, 0x20 | 0x53));
+    match (first_pincfg, last_coef) {
+        (Some(at), Some(last)) if last < at => {}
+        _ => return TestResult::Fail("ALC256 init must precede enumeration"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_alc256_coef_rmw_update_applied);
+
+/// #1496: an ALC282 codec gets the full verified `alc282_coefs`
+/// table on the live probe path, in Linux's order — 17 plain
+/// writes and 12 masked updates, every masked update preceded by
+/// a GET_PROC_COEF read.
+fn native_hda_alc282_coef_table_applied() -> TestResult {
+    let fixture = match Fixture::alc282() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x10ec0282 {
+        return TestResult::Fail("fixture codec must be ALC282");
+    }
+    if codec.subsystem_id.is_some() {
+        return TestResult::Fail("ALC282 fixture must report no subsystem id");
+    }
+    let verbs = &fixture.model.verbs;
+    let coef_node = u32::from(crate::hda::quirks::COEF_NODE);
+    let coef_verbs: Vec<u32> = verbs
+        .iter()
+        .copied()
+        .filter(|v| (*v >> 20) & 0xff == coef_node)
+        .collect();
+    // 17 plain writes (2 verbs each) + 12 masked updates
+    // (4 verbs each) = 82 verbs, all on the coef node.
+    if coef_verbs.len() != 82 {
+        return TestResult::Fail("ALC282 init must issue 82 coef verbs");
+    }
+    let gets = coef_verbs
+        .iter()
+        .filter(|v| (**v >> 8) & 0xfff == 0xc00)
+        .count();
+    if gets != 12 {
+        return TestResult::Fail("ALC282 init must read before each masked update");
+    }
+    let idx = |index: u32| {
+        make_verb(
+            0,
+            crate::hda::quirks::COEF_NODE,
+            crate::hda_codec::verb::SET_COEF_INDEX | index,
+        )
+    };
+    let set = |value: u32| {
+        make_verb(
+            0,
+            crate::hda::quirks::COEF_NODE,
+            crate::hda_codec::verb::SET_PROC_COEF | value,
+        )
+    };
+    // First op (0x03, 0x0002) and last op (0x6c, 0xfc06).
+    if coef_verbs[0] != idx(0x03) || coef_verbs[1] != set(0x0002) {
+        return TestResult::Fail("ALC282 init must start with the 0x03 write");
+    }
+    if coef_verbs[80] != idx(0x6c) || coef_verbs[81] != set(0xfc06) {
+        return TestResult::Fail("ALC282 init must end with the 0x6c write");
+    }
+    // The table runs before enumeration.
+    let first_pincfg = verbs.iter().position(|v| (**v >> 8) & 0xfff == 0xf1c);
+    let last_coef = verbs.iter().rposition(|v| (*v >> 20) & 0xff == coef_node);
+    match (first_pincfg, last_coef) {
+        (Some(at), Some(last)) if last < at => {}
+        _ => return TestResult::Fail("ALC282 init must precede enumeration"),
+    }
+    // Spot-check the register file: a plain write and a masked
+    // update (0x05, mask 0xff3f, value 0x0700).
+    let coef = |index: u16| {
+        fixture
+            .model
+            .coef
+            .iter()
+            .find(|(n, i, _)| *n == crate::hda::quirks::COEF_NODE && *i == index)
+            .map(|(_, _, v)| *v)
+    };
+    if coef(0x03) != Some(0x0002) || coef(0x05) != Some(0x0700) || coef(0x6c) != Some(0xfc06) {
+        return TestResult::Fail("ALC282 coef state must hold the applied table");
+    }
+    if dev.outputs.is_empty() {
+        return TestResult::Fail("fixed-up codec must still route outputs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_alc282_coef_table_applied);
+
+/// #1496: a Lenovo Yoga 7 2-in-1 16AKP10 (ALC287, codec subsystem
+/// 0x17aa391d) gets the verified YOGA9 fixup on the live probe
+/// path: the 44-verb bass-speaker coef sequence before
+/// enumeration, pin 0x17's config override (without it the pin
+/// reads as unconnected and routes nothing), the connection-list
+/// override (pin 0x17's SET_CONNECTION_SELECT is index 0 — DAC
+/// 0x02 is first in the overridden list, third in the hardware
+/// list), and the preferred DACs (speakers on 0x02, headphones
+/// on 0x03, even though neither preferred DAC is first in its
+/// pin's hardware list).
+fn native_hda_yoga9_bass_speaker_quirk_applied() -> TestResult {
+    let fixture = match Fixture::yoga9() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x10ec0287 {
+        return TestResult::Fail("fixture codec must be ALC287");
+    }
+    if codec.subsystem_id != Some(0x17aa_391d) {
+        return TestResult::Fail("codec subsystem id must be recorded");
+    }
+    let verbs = &fixture.model.verbs;
+    // The 44-verb bass-speaker sequence, verbatim and in order,
+    // is the only coef traffic: ALC287 has no init coef table.
+    let coef_node = u32::from(crate::hda::quirks::COEF_NODE);
+    let coef_verbs: Vec<u32> = verbs
+        .iter()
+        .copied()
+        .filter(|v| (*v >> 20) & 0xff == coef_node)
+        .collect();
+    if coef_verbs.len() != 44 {
+        return TestResult::Fail("YOGA9 quirk must issue exactly its 44-verb sequence");
+    }
+    let expected: Vec<u32> = crate::hda::quirks::QUIRK_YOGA9_BASS_SPK_SEQ
+        .iter()
+        .map(|step| make_verb(0, step.nid, step.verb))
+        .collect();
+    if coef_verbs != expected {
+        return TestResult::Fail("YOGA9 coef sequence must run verbatim in Linux order");
+    }
+    // The sequence runs before enumeration.
+    let first_pincfg = verbs.iter().position(|v| (**v >> 8) & 0xfff == 0xf1c);
+    let last_coef = verbs.iter().rposition(|v| (*v >> 20) & 0xff == coef_node);
+    match (first_pincfg, last_coef) {
+        (Some(at), Some(last)) if last < at => {}
+        _ => return TestResult::Fail("YOGA9 coef sequence must precede enumeration"),
+    }
+    // Exactly the three quirk pins route, each to its preferred DAC.
+    if dev.outputs.len() != 3 {
+        return TestResult::Fail("YOGA9 fixture must route exactly three outputs");
+    }
+    let out = |pin: u8| dev.outputs.iter().find(|p| p.nodes.pin_nid == pin);
+    let Some(bass) = out(0x17) else {
+        return TestResult::Fail("bass pin must route after the pin override");
+    };
+    if bass.nodes.converter_nid != 0x02 {
+        return TestResult::Fail("bass pin must use its preferred DAC 0x02, not 0x06");
+    }
+    let Some(tweeter) = out(0x14) else {
+        return TestResult::Fail("tweeter pin must route");
+    };
+    if tweeter.nodes.converter_nid != 0x02 {
+        return TestResult::Fail("tweeter pin must use its preferred DAC 0x02, not 0x03");
+    }
+    let Some(hp) = out(0x21) else {
+        return TestResult::Fail("headphone pin must route");
+    };
+    if hp.nodes.converter_nid != 0x03 {
+        return TestResult::Fail("headphone pin must use its preferred DAC 0x03, not 0x02");
+    }
+    // Configure the default output path: the connection-select
+    // index pin 0x17 sends is the index into the OVERRIDDEN
+    // list ([0x02, 0x03] → 0), not the hardware list
+    // ([0x06, 0x08, 0x02, 0x03] → 2).
+    if unsafe { dev.setup_default_output_path() }.is_err() {
+        return TestResult::Fail("configure default output path");
+    }
+    let select = make_verb(0, 0x17, (0x701 << 8) | 0);
+    if !fixture.model.verbs.contains(&select) {
+        return TestResult::Fail("bass pin must select index 0 of its overridden list");
+    }
+    let wrong = make_verb(0, 0x17, (0x701 << 8) | 2);
+    if fixture.model.verbs.contains(&wrong) {
+        return TestResult::Fail("bass pin must not select the hardware-list index");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_yoga9_bass_speaker_quirk_applied);

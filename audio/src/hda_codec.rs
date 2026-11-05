@@ -76,6 +76,13 @@ pub mod verb {
     /// 16-bit payload form as SET_COEF_INDEX; Linux's
     /// `AC_VERB_SET_PROC_COEF` (0x400).
     pub const SET_PROC_COEF: u32 = 0x4 << 16;
+    /// Get Processing Coefficient (HDA §7.3.3.8). 12-bit verb ID +
+    /// 8-bit payload, like GET_CONFIG_DEFAULT; Linux's
+    /// `AC_VERB_GET_PROC_COEF` (0xC00). Reads back the coef value
+    /// selected by the preceding SET_COEF_INDEX — the read half of
+    /// Linux's `alc_read_coef_idx`, and what makes a masked
+    /// read-modify-write coef update possible (#1496).
+    pub const GET_PROC_COEF: u32 = 0xC00 << 8;
 }
 
 /// Get-Parameter sub-codes (§7.3.4). OR with `verb::GET_PARAMETER`.
@@ -309,11 +316,59 @@ pub struct Codec {
     pub revision: u32,
     pub afg_nid: u8,
     pub widgets: Vec<Widget>,
+    /// Preferred (pin, DAC) pairs, Linux `spec->gen.preferred_dacs`
+    /// (`sound/hda/codecs/generic.c::get_preferred_dac`): when the
+    /// output path for `pin` is built, that DAC wins over
+    /// connection-list order, and the generic first-match trace is
+    /// only the fallback when the preferred DAC is not reachable.
+    /// Empty for every codec unless a verified quirk sets it (#1496);
+    /// `enumerate` never fills it from the hardware, because the
+    /// hardware has no such concept.
+    pub preferred_dacs: Vec<(u8, u8)>,
 }
 
 impl Codec {
     pub fn widget(&self, nid: u8) -> Option<&Widget> {
         self.widgets.iter().find(|w| w.nid == nid)
+    }
+
+    /// Graph-side pin-config override (Linux
+    /// `snd_hda_codec_set_pincfg` — the value lives in the driver's
+    /// pin cache, higher priority than the hardware's
+    /// Get-Config-Default response; no verb is issued). Replaces
+    /// the decoded `pin_config` of a Pin Complex widget. Returns
+    /// false when the nid is not a pin in this graph, in which case
+    /// nothing changes (fail-closed: a quirk naming a pin the codec
+    /// does not have is ignored, never applied to another pin).
+    pub fn override_pin_config(&mut self, nid: u8, cfg: u32) -> bool {
+        let Some(w) = self.widgets.iter_mut().find(|w| w.nid == nid) else {
+            return false;
+        };
+        if !matches!(w.ty(), WidgetType::PinComplex) {
+            return false;
+        }
+        w.pin_config = Some(PinConfigDefault::decode(cfg));
+        true
+    }
+
+    /// Graph-side connection-list override (Linux
+    /// `snd_hda_override_conn_list` — the list lives in the
+    /// driver's connection cache; no verb is issued, and the
+    /// connection-select index a path later sends is the index into
+    /// this overridden list, exactly as Linux's
+    /// `snd_hda_get_conn_index` reads it from the cache). Replaces
+    /// the decoded `connections` of the named widget. Returns false
+    /// when the nid is missing or the list is overlong, in which
+    /// case nothing changes.
+    pub fn override_conn_list(&mut self, nid: u8, conns: &[u8]) -> bool {
+        if conns.len() > 256 {
+            return false;
+        }
+        let Some(w) = self.widgets.iter_mut().find(|w| w.nid == nid) else {
+            return false;
+        };
+        w.connections = conns.to_vec();
+        true
     }
 }
 
@@ -492,6 +547,7 @@ where
         revision,
         afg_nid,
         widgets,
+        preferred_dacs: Vec::new(),
     }
 }
 
@@ -621,14 +677,64 @@ pub fn find_input_path(c: &Codec) -> Option<AudioPath> {
 
 /// Depth-limited DFS through connection lists to find a converter of
 /// the requested type. `chain` accumulates the mixer/selector path.
+///
+/// A pin with a preferred DAC (`Codec::preferred_dacs`, Linux
+/// `spec->gen.preferred_dacs`) tries that DAC first via a targeted
+/// trace; when the preferred DAC is not reachable the generic
+/// first-match trace is the fallback, exactly as Linux's
+/// `parse_output_paths` falls back to `look_for_dac`.
 fn trace_to_converter(c: &Codec, start: u8, want: WidgetType, depth: usize) -> Option<AudioPath> {
     let mut chain = Vec::new();
+    if let Some(&(_, dac)) = c.preferred_dacs.iter().find(|(pin, _)| *pin == start) {
+        if let Some(found) = trace_step_to(c, start, dac, depth, &mut chain) {
+            return Some(AudioPath {
+                pin_nid: start,
+                chain,
+                converter_nid: found,
+            });
+        }
+        chain.clear();
+    }
     let cur = trace_step(c, start, want, depth, &mut chain)?;
     Some(AudioPath {
         pin_nid: start,
         chain,
         converter_nid: cur,
     })
+}
+
+/// Depth-limited DFS through connection lists to reach one specific
+/// converter NID (the preferred DAC). Same walk rules as
+/// [`trace_step`]: through mixers, selectors and pins only, no
+/// cycles. Returns the target when reached and it is an Audio
+/// Output converter.
+fn trace_step_to(c: &Codec, nid: u8, target: u8, depth: usize, chain: &mut Vec<u8>) -> Option<u8> {
+    if depth == 0 {
+        return None;
+    }
+    let w = c.widget(nid)?;
+    for &child in &w.connections {
+        if child == nid || chain.contains(&child) {
+            continue;
+        }
+        if let Some(cw) = c.widget(child) {
+            if child == target && cw.ty() == WidgetType::AudioOutput {
+                return Some(child);
+            }
+            // Only walk through Mixers / Selectors / Pins.
+            match cw.ty() {
+                WidgetType::AudioMixer | WidgetType::AudioSelector | WidgetType::PinComplex => {
+                    chain.push(child);
+                    if let Some(found) = trace_step_to(c, child, target, depth - 1, chain) {
+                        return Some(found);
+                    }
+                    chain.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 fn trace_step(

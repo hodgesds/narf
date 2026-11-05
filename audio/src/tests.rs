@@ -345,7 +345,8 @@ kernel_test_in!("audio", smoke_audio_format_unsupported_rate_rejects);
 
 fn smoke_hda_quirks_table_contents() -> TestResult {
     use crate::hda::quirks::{
-        find_quirk, first_for_chip, init_table_for, quirk_count, CoefRow, RealtekChip, QUIRK_TABLE,
+        find_quirk, find_verified_quirk, first_for_chip, init_table_for, quirk_count,
+        verified_quirk_count, CoefOp, RealtekChip, QUIRK_TABLE, VERIFIED_QUIRK_TABLE,
     };
 
     // Rescued from drivers/sound/src/codec/{quirks,realtek}.rs (#783):
@@ -379,16 +380,26 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
         _ => return TestResult::Fail("first ALC256 quirk must be the Dell entry"),
     }
 
-    // Init tables: the 18 literal tables hold 27 coef rows in total
+    // Init tables: the 27 base tables hold 96 coef ops in total.
     // (#776: the rescued (0x46, 0x0000) ALC256 row and (0x1B,
     // 0x0c0b) ALC236 row were deleted as verified-wrong against
-    // Linux `alc269.c`; see `quirks.rs`).
-    const BASE_CHIPS: [RealtekChip; 18] = [
+    // Linux `alc269.c`; #1496: the ALC256-family tables now hold
+    // the full unconditional tail — the (0x46, 3<<12) masked
+    // update, the 0x53 set/clear pulse, then (0x36, 0x5757) —
+    // ALC282/283 hold their full verified `alc*_coefs` tables,
+    // and ALC294's rescued rows were deleted: `alc294_init` has
+    // no unconditional static coef ops.)
+    const BASE_CHIPS: [RealtekChip; 27] = [
         RealtekChip::Alc256,
+        RealtekChip::Alc230,
+        RealtekChip::Alc215,
+        RealtekChip::Alc225,
         RealtekChip::Alc233,
         RealtekChip::Alc235,
         RealtekChip::Alc236,
+        RealtekChip::Alc245,
         RealtekChip::Alc270,
+        RealtekChip::Alc274,
         RealtekChip::Alc280,
         RealtekChip::Alc282,
         RealtekChip::Alc283,
@@ -402,24 +413,75 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
         RealtekChip::Alc294,
         RealtekChip::Alc295,
         RealtekChip::Alc298,
+        RealtekChip::Alc299,
+        RealtekChip::Alc300,
+        RealtekChip::Alc623,
+        RealtekChip::Alc700,
     ];
     let total_rows: usize = BASE_CHIPS.iter().map(|c| init_table_for(*c).len()).sum();
-    if total_rows != 27 {
-        return TestResult::Fail("init tables must hold 27 coef rows in total");
+    if total_rows != 96 {
+        return TestResult::Fail("init tables must hold 96 coef ops in total");
     }
-    // The corrected ALC256-family tables hold exactly the one
-    // verified Linux plain write (alc256_init: 0x36 = 0x5757).
-    if init_table_for(RealtekChip::Alc256) != [CoefRow::new(0x36, 0x5757)] {
-        return TestResult::Fail("ALC256 init must hold only the verified 0x36 row");
+    // The ALC256-family tables hold exactly Linux `alc256_init`'s
+    // unconditional tail, in Linux's order: masked 0x46 update,
+    // 0x53 set/clear pulse, then the verified 0x36 write.
+    if init_table_for(RealtekChip::Alc256)
+        != [
+            CoefOp::update(0x46, 0x3000, 0x0000),
+            CoefOp::update_nid(0x53, 0x02, 0x8000, 0x8000),
+            CoefOp::update_nid(0x53, 0x02, 0x8000, 0x0000),
+            CoefOp::write(0x36, 0x5757),
+        ]
+    {
+        return TestResult::Fail("ALC256 init must hold the verified 4-op tail");
     }
     if init_table_for(RealtekChip::Alc236) != init_table_for(RealtekChip::Alc235) {
         return TestResult::Fail("ALC236 must alias the ALC235 init table");
     }
-    if init_table_for(RealtekChip::Alc285)[1] != CoefRow::new(0x6F, 0x0007) {
+    if init_table_for(RealtekChip::Alc230) != init_table_for(RealtekChip::Alc256) {
+        return TestResult::Fail("ALC230 must alias the ALC256 init table");
+    }
+    if init_table_for(RealtekChip::Alc285)[1] != CoefOp::write(0x6F, 0x0007) {
         return TestResult::Fail("ALC285 init row 1 changed");
     }
-    if init_table_for(RealtekChip::Alc287)[2] != CoefRow::new(0x38, 0x4901) {
+    if init_table_for(RealtekChip::Alc287)[2] != CoefOp::write(0x38, 0x4901) {
         return TestResult::Fail("ALC287 init row 2 changed");
+    }
+    // ALC282/283 hold their full verified `alc*_coefs` tables:
+    // 29 and 33 ops, starting with the Power Down Control write
+    // and ending with the Class D amp control write.
+    if init_table_for(RealtekChip::Alc282).len() != 29
+        || init_table_for(RealtekChip::Alc282)[0] != CoefOp::write(0x03, 0x0002)
+        || init_table_for(RealtekChip::Alc282)[28] != CoefOp::write(0x6c, 0xfc06)
+    {
+        return TestResult::Fail("ALC282 init must hold the verified 29-op table");
+    }
+    if init_table_for(RealtekChip::Alc283).len() != 33
+        || init_table_for(RealtekChip::Alc283)[0] != CoefOp::write(0x03, 0x0002)
+        || init_table_for(RealtekChip::Alc283)[32] != CoefOp::update(0x1b, 0x8000, 0x0000)
+    {
+        return TestResult::Fail("ALC283 init must hold the verified 33-op table");
+    }
+    // The 0x53 row is the one `UPDATE_COEFEX` in the ALC283 table:
+    // it addresses nid 0x53, not the coef node.
+    if init_table_for(RealtekChip::Alc283)[13] != CoefOp::update_nid(0x53, 0x01, 0x000f, 0x0008) {
+        return TestResult::Fail("ALC283 init row 13 must be the nid-0x53 update");
+    }
+    // Chips whose Linux init hook issues no unconditional static
+    // coef ops have empty tables.
+    for chip in [
+        RealtekChip::Alc215,
+        RealtekChip::Alc225,
+        RealtekChip::Alc245,
+        RealtekChip::Alc274,
+        RealtekChip::Alc299,
+        RealtekChip::Alc300,
+        RealtekChip::Alc623,
+        RealtekChip::Alc700,
+    ] {
+        if !init_table_for(chip).is_empty() {
+            return TestResult::Fail("alc225/alc294/alc222/default init must be empty");
+        }
     }
     // Alias arms must resolve to the same tables as their base chips.
     if init_table_for(RealtekChip::Alc257) != init_table_for(RealtekChip::Alc256) {
@@ -432,11 +494,94 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
     if RealtekChip::from_vendor_id(0x10EC_0285) != Some(RealtekChip::Alc285) {
         return TestResult::Fail("0x10EC0285 must identify as ALC285");
     }
+    if RealtekChip::from_vendor_id(0x10EC_0230) != Some(RealtekChip::Alc230) {
+        return TestResult::Fail("0x10EC0230 must identify as ALC230");
+    }
+    if RealtekChip::from_vendor_id(0x10EC_0215) != Some(RealtekChip::Alc215)
+        || RealtekChip::from_vendor_id(0x10EC_0225) != Some(RealtekChip::Alc225)
+        || RealtekChip::from_vendor_id(0x10EC_0245) != Some(RealtekChip::Alc245)
+        || RealtekChip::from_vendor_id(0x10EC_0274) != Some(RealtekChip::Alc274)
+        || RealtekChip::from_vendor_id(0x10EC_0299) != Some(RealtekChip::Alc299)
+        || RealtekChip::from_vendor_id(0x10EC_0300) != Some(RealtekChip::Alc300)
+        || RealtekChip::from_vendor_id(0x10EC_0623) != Some(RealtekChip::Alc623)
+        || RealtekChip::from_vendor_id(0x10EC_0700) != Some(RealtekChip::Alc700)
+    {
+        return TestResult::Fail("new RealtekChip variants must identify by device id");
+    }
     if RealtekChip::from_vendor_id(0x10EC_9999).is_some() {
         return TestResult::Fail("unknown Realtek device id must not identify");
     }
     if RealtekChip::Alc295.name() != "ALC295" {
         return TestResult::Fail("ALC295 name changed");
+    }
+    if !RealtekChip::Alc230.uses_alc256_init() || !RealtekChip::Alc230.has_verified_coef_init() {
+        return TestResult::Fail("ALC230 must use alc256_init");
+    }
+    if !RealtekChip::Alc282.has_verified_coef_init()
+        || !RealtekChip::Alc283.has_verified_coef_init()
+        || RealtekChip::Alc287.has_verified_coef_init()
+    {
+        return TestResult::Fail("only the ALC256 family + ALC282/283 have verified coef init");
+    }
+
+    // Verified quirk table (#1496): seven codec subsystem IDs
+    // Linux matches on HDA_CODEC_QUIRK for
+    // ALC287_FIXUP_YOGA9_14IAP7_BASS_SPK_PIN, all sharing the one
+    // fixup's pins / connection list / preferred DACs / coef seq.
+    if verified_quirk_count() != 7 {
+        return TestResult::Fail("verified quirk table must hold 7 entries");
+    }
+    let total_vpins: usize = VERIFIED_QUIRK_TABLE.iter().map(|q| q.pins.len()).sum();
+    if total_vpins != 7 {
+        return TestResult::Fail("verified quirks must hold 7 pin overrides in total");
+    }
+    let yoga = match find_verified_quirk(0x17AA_391D) {
+        Some(q) => q,
+        None => return TestResult::Fail("Yoga 7 16AKP10 quirk missing"),
+    };
+    if yoga.name != "Lenovo Yoga 7 2-in-1 16AKP10" || yoga.chip != RealtekChip::Alc287 {
+        return TestResult::Fail("Yoga 7 16AKP10 quirk identity changed");
+    }
+    if yoga.pins
+        != [crate::hda::quirks::PinOverride {
+            nid: 0x17,
+            cfg: 0x9017_0121,
+        }]
+    {
+        return TestResult::Fail("YOGA9 pin override changed");
+    }
+    if yoga.conns.len() != 1 || yoga.conns[0].nid != 0x17 || yoga.conns[0].conns != [0x02, 0x03] {
+        return TestResult::Fail("YOGA9 connection-list override changed");
+    }
+    if yoga.preferred_dacs
+        != [
+            crate::hda::quirks::PreferredDac {
+                pin: 0x14,
+                dac: 0x02,
+            },
+            crate::hda::quirks::PreferredDac {
+                pin: 0x17,
+                dac: 0x02,
+            },
+            crate::hda::quirks::PreferredDac {
+                pin: 0x21,
+                dac: 0x03,
+            },
+        ]
+    {
+        return TestResult::Fail("YOGA9 preferred DACs changed");
+    }
+    if yoga.coef_seq.len() != 44 {
+        return TestResult::Fail("YOGA9 bass-speaker coef sequence must hold 44 verbs");
+    }
+    // The rescued keys are PCI SSIDs or nonexistent values: none
+    // of them may match the verified table.
+    if find_verified_quirk(0x17AA_22BE).is_some()
+        || find_verified_quirk(0x103C_8716).is_some()
+        || find_verified_quirk(0x1043_1A30).is_some()
+        || find_verified_quirk(0xDEAD_BEEF).is_some()
+    {
+        return TestResult::Fail("rescued/unknown subsystem id must not match a verified quirk");
     }
     TestResult::Pass
 }
