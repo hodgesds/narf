@@ -2694,7 +2694,7 @@ fn smoke_mtl_external_dp_six_bpc_route_from_edid_bpc() -> TestResult {
     // 6 bpc MSA and intel_link_compute_m_n at 18 bpp, TU 64.
     let mn = link_m_n(18 * 16, 4, 148_500, 162_000, false);
     if io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 20) != 2 << 20
-        || io.writes_to(0x7_1030) != [0x150]
+        || io.writes_to(0x7_1030) != [(1 << 23) | 0x150]
         || io.writes_to(0x6_1410) != [0x01]
         || io.writes_to(0x6_1030) != [mn[0]]
         || io.writes_to(0x6_1044) != [mn[3]]
@@ -2727,7 +2727,7 @@ fn smoke_mtl_external_dp_six_bpc_route_from_edid_bpc() -> TestResult {
         _ => return TestResult::Fail("the 8 bpc sink must light at 24 bpp"),
     }
     if !io.writes_to(0x6_1410).is_empty()
-        || io.writes_to(0x7_1030) != [0x100]
+        || io.writes_to(0x7_1030) != [(1 << 23) | 0x100]
         || io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 20) != 0
     {
         return TestResult::Fail("the 8 bpc route must keep its write stream");
