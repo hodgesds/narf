@@ -385,7 +385,7 @@ impl Facts {
     /// AR9003 facts — AR9300 (`0x0030`, record `N93A`), AR9580
     /// (`0x0033`, record `N95A`, the same layout), AR9462 (`0x0034`,
     /// record `N46A`, the same layout) or AR9565 (`0x0036`, record
-/// `N65A`, the same layout) or AR9485/AR1111 (`0x0032`/`0x0037`,
+    /// `N65A`, the same layout) or AR9485/AR1111 (`0x0032`/`0x0037`,
     /// record `N48A`, the same layout) — for one 20 MHz channel in a band the
     /// map's `opFlags` enables: the PCI function, `AR_SREV` revision and
     /// host mode, the restored 1088-byte `ar9300_eeprom` (template and
@@ -429,8 +429,8 @@ impl Facts {
         }
         let plan = power::plan(image, frequency, ctl, 40, identity.tx_chainmask)?;
         // Each part has its own magic, domain label and file name, so an
-// AR9300 record can never admit an AR9580 or AR9462 or AR9565 or AR9485 or
-// the reverse.
+        // AR9300 record can never admit an AR9580 or AR9462 or AR9565 or AR9485 or
+        // the reverse.
         let (magic, label, recipe, file): (&[u8; 4], &[u8], &[u8], &str) = match revision.chip {
             Chip::Ar9300 => (
                 b"N93A",
