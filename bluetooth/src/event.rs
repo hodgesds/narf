@@ -240,6 +240,12 @@ pub enum LeSubevent {
     DirectedAdvertisingReport = 0x0B,
     PhyUpdateComplete = 0x0C,
     ExtendedAdvertisingReport = 0x0D,
+    /// LE Periodic Advertising Sync Established (§7.7.65.15).
+    PeriodicAdvertisingSyncEstablished = 0x0E,
+    /// LE Periodic Advertising Report (§7.7.65.14).
+    PeriodicAdvertisingReport = 0x0F,
+    /// LE Periodic Advertising Sync Lost (§7.7.65.16).
+    PeriodicAdvertisingSyncLost = 0x10,
     ChannelSelectionAlgorithm = 0x14,
 }
 
@@ -257,6 +263,9 @@ impl LeSubevent {
             0x0B => Some(Self::DirectedAdvertisingReport),
             0x0C => Some(Self::PhyUpdateComplete),
             0x0D => Some(Self::ExtendedAdvertisingReport),
+            0x0E => Some(Self::PeriodicAdvertisingSyncEstablished),
+            0x0F => Some(Self::PeriodicAdvertisingReport),
+            0x10 => Some(Self::PeriodicAdvertisingSyncLost),
             0x14 => Some(Self::ChannelSelectionAlgorithm),
             _ => None,
         }
@@ -447,6 +456,188 @@ pub fn parse_le_advertising_reports(event: &Event) -> Option<alloc::vec::Vec<LeA
         });
     }
     Some(out)
+}
+
+// ── LE Periodic Advertising subevents (§7.7.65.14..16) ─────────────
+//
+// Subevent 0x18 (Sync Transfer Received, §7.7.65.21) is the optional
+// remainder and is deliberately NOT decoded here; it needs its own
+// lane. Periodic advertising with responses (PAwR) is likewise out
+// of scope.
+
+/// LE Periodic Advertising Sync Established subevent (§7.7.65.15).
+/// Subevent 0x0E.
+///
+/// Layout (after the 0x3E + subevent-code bytes):
+/// ```text
+///   0:     u8  Status
+///   1..3:  u16 LE Sync_Handle (0x0000..=0x0EFF; NOT a connection
+///               handle — do not mask to 12 bits)
+///   3:     u8  Advertising_SID
+///   4:     u8  Advertiser_Address_Type (0 = public, 1 = random)
+///   5..11: 6  Advertiser_Address (LE order)
+///   11:    u8  Advertiser_PHY (0x01 = 1M, 0x02 = 2M, 0x03 = Coded)
+///   12..14: u16 LE Periodic_Advertising_Interval (1.25 ms units)
+///   14:    u8  Advertiser_Clock_Accuracy
+/// ```
+/// 15 payload bytes. The btmon trace of a real Create Sync shows
+/// plen 16 for this subevent (1 subevent byte + 15), which pins the
+/// length independently of the spec text.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LePeriodicAdvSyncEstablished {
+    pub status: u8,
+    pub sync_handle: u16,
+    pub advertising_sid: u8,
+    pub advertiser_address_type: u8,
+    pub advertiser_address: [u8; 6],
+    pub advertiser_phy: u8,
+    pub periodic_advertising_interval: u16,
+    pub advertiser_clock_accuracy: u8,
+}
+
+impl LePeriodicAdvSyncEstablished {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::LeMeta as u8 {
+            return None;
+        }
+        let p = &event.params;
+        if p.is_empty() || p[0] != LeSubevent::PeriodicAdvertisingSyncEstablished as u8 {
+            return None;
+        }
+        // 1-byte subevent + 15-byte payload = 16 bytes.
+        if p.len() < 16 {
+            return None;
+        }
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&p[6..12]);
+        Some(Self {
+            status: p[1],
+            sync_handle: u16::from_le_bytes([p[2], p[3]]),
+            advertising_sid: p[4],
+            advertiser_address_type: p[5],
+            advertiser_address: addr,
+            advertiser_phy: p[12],
+            periodic_advertising_interval: u16::from_le_bytes([p[13], p[14]]),
+            advertiser_clock_accuracy: p[15],
+        })
+    }
+}
+
+/// `Data_Status` values for an LE Periodic Advertising Report
+/// (§7.7.65.14). Cross-checked against Linux
+/// `include/net/bluetooth/hci.h` (`LE_PA_DATA_COMPLETE` 0x00,
+/// `LE_PA_DATA_MORE_TO_COME` 0x01, `LE_PA_DATA_TRUNCATED` 0x02).
+pub const LE_PA_DATA_COMPLETE: u8 = 0x00;
+pub const LE_PA_DATA_MORE_TO_COME: u8 = 0x01;
+pub const LE_PA_DATA_TRUNCATED: u8 = 0x02;
+
+/// `CTE_Type` values for an LE Periodic Advertising Report
+/// (§7.7.65.14): 0x00 = AoA, 0x01 = AoD 1 µs slots,
+/// 0x02 = AoD 2 µs slots, 0xFF = no CTE.
+pub const LE_PA_CTE_AOA: u8 = 0x00;
+pub const LE_PA_CTE_AOD_1US: u8 = 0x01;
+pub const LE_PA_CTE_AOD_2US: u8 = 0x02;
+pub const LE_PA_CTE_NONE: u8 = 0xFF;
+
+/// One LE Periodic Advertising Report subevent (§7.7.65.14).
+/// Subevent 0x0F.
+///
+/// Layout (after the 0x3E + subevent-code bytes):
+/// ```text
+///   0..2:  u16 LE Sync_Handle
+///   2:     i8  Tx_Power (dBm; 0x7F = unavailable)
+///   3:     i8  RSSI (dBm; 0x7F = unavailable)
+///   4:     u8  CTE_Type (0x00 AoA / 0x01 AoD 1µs / 0x02 AoD 2µs /
+///               0xFF no CTE; other values reserved)
+///   5:     u8  Data_Status (0x00 complete / 0x01 incomplete, more
+///               to come / 0x02 incomplete, truncated)
+///   6:     u8  Data_Length
+///   7..:   Data (Data_Length bytes)
+/// ```
+/// Field order cross-checked against Linux
+/// `struct hci_ev_le_per_adv_report` (`__le16 sync_handle; __u8
+/// tx_power; __u8 rssi; __u8 cte_type; __u8 data_status; __u8
+/// length; __u8 data[]`). A 2026 kernel fix for an out-of-bounds
+/// read in the reassembly path (`hci_le_per_adv_report_evt`) is the
+/// reason this parser validates `Data_Length` against the bytes the
+/// event actually carries before slicing: a controller that reports
+/// a length larger than the received event must yield `None`, never
+/// a truncated read. Reserved `CTE_Type` / `Data_Status` values are
+/// likewise rejected as malformed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LePeriodicAdvReport {
+    pub sync_handle: u16,
+    pub tx_power: i8,
+    pub rssi: i8,
+    pub cte_type: u8,
+    pub data_status: u8,
+    pub data: alloc::vec::Vec<u8>,
+}
+
+impl LePeriodicAdvReport {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::LeMeta as u8 {
+            return None;
+        }
+        let p = &event.params;
+        if p.is_empty() || p[0] != LeSubevent::PeriodicAdvertisingReport as u8 {
+            return None;
+        }
+        // 1-byte subevent + 7-byte fixed part.
+        if p.len() < 8 {
+            return None;
+        }
+        let cte_type = p[5];
+        if cte_type != LE_PA_CTE_AOA
+            && cte_type != LE_PA_CTE_AOD_1US
+            && cte_type != LE_PA_CTE_AOD_2US
+            && cte_type != LE_PA_CTE_NONE
+        {
+            return None;
+        }
+        let data_status = p[6];
+        if data_status > LE_PA_DATA_TRUNCATED {
+            return None;
+        }
+        let dlen = p[7] as usize;
+        if p.len() < 8 + dlen {
+            return None;
+        }
+        Some(Self {
+            sync_handle: u16::from_le_bytes([p[1], p[2]]),
+            tx_power: p[3] as i8,
+            rssi: p[4] as i8,
+            cte_type,
+            data_status,
+            data: p[8..8 + dlen].to_vec(),
+        })
+    }
+}
+
+/// LE Periodic Advertising Sync Lost subevent (§7.7.65.16).
+/// Subevent 0x10. Layout (after the 0x3E + subevent-code bytes):
+/// Sync_Handle (2 LE) only.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LePeriodicAdvSyncLost {
+    pub sync_handle: u16,
+}
+
+impl LePeriodicAdvSyncLost {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::LeMeta as u8 {
+            return None;
+        }
+        let p = &event.params;
+        if p.is_empty() || p[0] != LeSubevent::PeriodicAdvertisingSyncLost as u8 {
+            return None;
+        }
+        if p.len() < 3 {
+            return None;
+        }
+        Some(Self {
+            sync_handle: u16::from_le_bytes([p[1], p[2]]),
+        })
+    }
 }
 
 // ── Stage 2: Classic BR/EDR event decoders ─────────────────────────

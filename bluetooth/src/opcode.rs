@@ -128,6 +128,40 @@ pub const HCI_LE_SET_ADVERTISING_ENABLE: u16 = opcode(OGF_LE_CONTROLLER, 0x000A)
 /// HCI_LE_Set_Random_Address (§7.8.4).
 pub const HCI_LE_SET_RANDOM_ADDRESS: u16 = opcode(OGF_LE_CONTROLLER, 0x0005);
 
+// ── LE Periodic Advertising (§7.8.61..63, §7.8.67..69) ─────────────
+// OCFs cross-checked against Linux `include/net/bluetooth/hci.h`
+// (HCI_OP_LE_SET_PER_ADV_PARAMS 0x203E … HCI_OP_LE_PA_TERM_SYNC
+// 0x2046) and the btmon trace in the kernel's PA-sync commit
+// history: Set Params plen 7, Set Data plen 7, Enable plen 2,
+// Create Sync plen 14, Terminate Sync plen 2. OCF 0x0045 is
+// Create Sync Cancel (§7.8.68), not Terminate Sync — the two are
+// adjacent and easy to confuse; the kernel header settles it.
+//
+// LE Periodic Advertising Sync Transfer Received (§7.7.65.21,
+// subevent 0x18) is deliberately NOT here: it is the optional
+// remainder, tracked separately (see #1560).
+/// HCI_LE_Set_Periodic_Advertising_Parameters (§7.8.61). 7-byte
+/// parameter: advertising_handle (1) + interval_min (2 LE) +
+/// interval_max (2 LE) + properties (2 LE).
+pub const HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS: u16 = opcode(OGF_LE_CONTROLLER, 0x003E);
+/// HCI_LE_Set_Periodic_Advertising_Data (§7.8.62). Variable
+/// parameter: advertising_handle (1) + operation (1) +
+/// advertising_data_length (1) + advertising_data (0..=251).
+pub const HCI_LE_SET_PERIODIC_ADVERTISING_DATA: u16 = opcode(OGF_LE_CONTROLLER, 0x003F);
+/// HCI_LE_Set_Periodic_Advertising_Enable (§7.8.63). 2-byte
+/// parameter: enable (1) + advertising_handle (1).
+pub const HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE: u16 = opcode(OGF_LE_CONTROLLER, 0x0040);
+/// HCI_LE_Periodic_Advertising_Create_Sync (§7.8.67). 14-byte
+/// parameter. Returns Command Status; the outcome is signalled by
+/// an LE Periodic Advertising Sync Established subevent (§7.7.65.15).
+pub const HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC: u16 = opcode(OGF_LE_CONTROLLER, 0x0044);
+/// HCI_LE_Periodic_Advertising_Create_Sync_Cancel (§7.8.68). No
+/// parameters. Cancels a pending Create Sync.
+pub const HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC_CANCEL: u16 = opcode(OGF_LE_CONTROLLER, 0x0045);
+/// HCI_LE_Periodic_Advertising_Terminate_Sync (§7.8.69). 2-byte
+/// parameter: sync_handle (2 LE).
+pub const HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC: u16 = opcode(OGF_LE_CONTROLLER, 0x0046);
+
 // ── LE Filter Accept List (§7.8.14..16) ───────────────────────────
 /// HCI_LE_Add_Device_To_Filter_Accept_List (§7.8.16).
 /// 7-byte param: address_type (1) + address (6).
@@ -177,6 +211,18 @@ mod selftest_ext {
     const _: () = assert!(HCI_LE_ENCRYPT == 0x2017);
     // §7.8.23: OGF=0x08 OCF=0x0018 → 0x2018.
     const _: () = assert!(HCI_LE_RAND == 0x2018);
+    // §7.8.61: OGF=0x08 OCF=0x003E → 0x203E.
+    const _: () = assert!(HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS == 0x203E);
+    // §7.8.62: OGF=0x08 OCF=0x003F → 0x203F.
+    const _: () = assert!(HCI_LE_SET_PERIODIC_ADVERTISING_DATA == 0x203F);
+    // §7.8.63: OGF=0x08 OCF=0x0040 → 0x2040.
+    const _: () = assert!(HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE == 0x2040);
+    // §7.8.67: OGF=0x08 OCF=0x0044 → 0x2044.
+    const _: () = assert!(HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC == 0x2044);
+    // §7.8.68: OGF=0x08 OCF=0x0045 → 0x2045.
+    const _: () = assert!(HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC_CANCEL == 0x2045);
+    // §7.8.69: OGF=0x08 OCF=0x0046 → 0x2046.
+    const _: () = assert!(HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC == 0x2046);
     // §7.1.5: OGF=0x01 OCF=0x0005 → 0x0405.
     const _: () = assert!(HCI_CREATE_CONNECTION == 0x0405);
     // §7.4.5: OGF=0x04 OCF=0x0005 → 0x1005.

@@ -129,9 +129,10 @@ use crate::controller::ControllerInfo;
 use crate::event::{
     parse_inquiry_results, parse_le_advertising_reports, ClassicConnectionComplete,
     CommandComplete, CommandStatus, DisconnectionComplete, EventCode, LeConnectionComplete,
-    LeLongTermKeyRequest, NumberOfCompletedPackets,
+    LeLongTermKeyRequest, LePeriodicAdvReport, LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost,
+    NumberOfCompletedPackets,
 };
-use crate::gap::{self, CentralPhase};
+use crate::gap::{self, CentralPhase, PeriodicAdvertiserPhase, PeriodicSyncPhase};
 use crate::gatt_client::{self, GattClientError};
 use crate::gatt_server::GattServer;
 use crate::hci::{AclData, Command, Event};
@@ -454,6 +455,15 @@ pub struct PumpCore {
     /// discovery + outbound paging. Mirrors the LE `central` field;
     /// driven by `dispatch_event` and the `classic_*` API.
     classic: classic::ClassicCentral,
+    /// LE periodic advertising broadcaster state (issue #1560):
+    /// which advertising handle carries a periodic train and
+    /// whether it is enabled. Driven by `dispatch_event` (command
+    /// completions) and the `periodic_adv_*` API.
+    periodic_adv: gap::PeriodicAdvertiser,
+    /// LE periodic advertising sync receiver state (issue #1560):
+    /// creating / synced / lost. Driven by `dispatch_event` (sync
+    /// subevents + command completions) and the `periodic_adv_*` API.
+    periodic_sync: gap::PeriodicSync,
     /// Page deferred while an inquiry is being cancelled:
     /// `classic_connect` from Inquiring issues Inquiry_Cancel first
     /// and only issues Create_Connection once Inquiry Complete
@@ -494,6 +504,8 @@ impl fmt::Debug for PumpCore {
             .field("connections", &self.connections.len())
             .field("central_phase", &self.central.phase)
             .field("classic_phase", &self.classic.phase)
+            .field("periodic_adv_phase", &self.periodic_adv.phase)
+            .field("periodic_sync_phase", &self.periodic_sync.phase)
             .field("bonds", &self.bonds.len())
             .field("claimed", &self.claimed.len())
             .field("pending_acl", &self.pending_acl.len())
@@ -534,6 +546,8 @@ impl PumpCore {
             central: gap::Central::new(),
             pending_connect: None,
             classic: classic::ClassicCentral::new(),
+            periodic_adv: gap::PeriodicAdvertiser::new(),
+            periodic_sync: gap::PeriodicSync::new(),
             pending_page: None,
             pending_scan_mode: None,
             bonds: BondStore::new(),
@@ -1193,6 +1207,182 @@ impl PumpCore {
     }
 }
 
+// ── LE Periodic Advertising API (issue #1560) ───────────────────────
+
+/// Errors from the periodic advertising API.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PeriodicError {
+    /// No pump registered for this controller index.
+    NoPump,
+    /// A pump step currently owns the core; retry after the step.
+    Busy,
+    /// The periodic advertiser / sync state machine is in a phase
+    /// that forbids this call.
+    WrongPhase,
+    /// The transport rejected the HCI command.
+    Transport,
+    /// A parameter is outside its spec range (interval, data
+    /// length, skip, timeout, CTE type).
+    BadParameter,
+}
+
+impl PumpCore {
+    /// Set periodic advertising parameters for a handle (§7.8.61).
+    /// Callable any time; the handle becomes Configured only once
+    /// the controller accepts the parameters (Command Complete).
+    pub fn periodic_adv_set_parameters(
+        &mut self,
+        params: gap::PeriodicAdvertisingParameters,
+    ) -> Result<(), PeriodicError> {
+        if !params.is_valid() {
+            return Err(PeriodicError::BadParameter);
+        }
+        self.send_command(
+            op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS,
+            &params.encode(),
+        )
+        .map_err(|_| PeriodicError::Transport)?;
+        self.periodic_adv
+            .note_parameters_sent(params.advertising_handle);
+        Ok(())
+    }
+
+    /// Set periodic advertising data for a handle (§7.8.62). Only
+    /// for the configured handle (Configured or Enabled); the
+    /// controller rejects data for any other handle, so the pump
+    /// refuses first. `data.len()` must be <= 251 and empty for the
+    /// Unchanged operation.
+    pub fn periodic_adv_set_data(
+        &mut self,
+        advertising_handle: u8,
+        operation: gap::PeriodicAdvDataOperation,
+        data: &[u8],
+    ) -> Result<(), PeriodicError> {
+        if self.periodic_adv.advertising_handle != Some(advertising_handle)
+            || (self.periodic_adv.phase != PeriodicAdvertiserPhase::Configured
+                && self.periodic_adv.phase != PeriodicAdvertiserPhase::Enabled)
+        {
+            return Err(PeriodicError::WrongPhase);
+        }
+        if data.len() > gap::PER_ADV_DATA_MAX_LEN
+            || (operation == gap::PeriodicAdvDataOperation::Unchanged && !data.is_empty())
+        {
+            return Err(PeriodicError::BadParameter);
+        }
+        let params = gap::encode_periodic_adv_data(advertising_handle, operation, data);
+        self.send_command(op::HCI_LE_SET_PERIODIC_ADVERTISING_DATA, &params)
+            .map_err(|_| PeriodicError::Transport)?;
+        Ok(())
+    }
+
+    /// Enable or disable the periodic advertising train (§7.8.63).
+    /// Enable only from Configured, disable only from Enabled; the
+    /// phase follows only once the controller accepts the command.
+    pub fn periodic_adv_set_enable(&mut self, enable: bool) -> Result<(), PeriodicError> {
+        let handle = match (enable, self.periodic_adv.phase) {
+            (true, PeriodicAdvertiserPhase::Configured) => self.periodic_adv.advertising_handle,
+            (false, PeriodicAdvertiserPhase::Enabled) => self.periodic_adv.advertising_handle,
+            _ => return Err(PeriodicError::WrongPhase),
+        };
+        let handle = match handle {
+            Some(h) => h,
+            None => return Err(PeriodicError::WrongPhase),
+        };
+        self.send_command(
+            op::HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE,
+            &gap::PeriodicAdvertisingEnable {
+                enable,
+                advertising_handle: handle,
+            }
+            .encode(),
+        )
+        .map_err(|_| PeriodicError::Transport)?;
+        self.periodic_adv.note_enable_sent(handle, enable);
+        Ok(())
+    }
+
+    /// Synchronise to a periodic advertising train (§7.8.67). Only
+    /// from Idle — the spec allows a single pending Create Sync at
+    /// a time. The command returns Command Status; the outcome is
+    /// signalled by Sync Established (§7.7.65.15) or a rejection.
+    pub fn periodic_adv_create_sync(
+        &mut self,
+        req: gap::PeriodicAdvertisingCreateSync,
+    ) -> Result<(), PeriodicError> {
+        if self.periodic_sync.phase != PeriodicSyncPhase::Idle {
+            return Err(PeriodicError::WrongPhase);
+        }
+        if !req.is_valid() {
+            return Err(PeriodicError::BadParameter);
+        }
+        self.send_command(op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC, &req.encode())
+            .map_err(|_| PeriodicError::Transport)?;
+        self.periodic_sync.note_create_sync_sent();
+        Ok(())
+    }
+
+    /// Cancel a pending Create Sync (§7.8.68). Only from Creating.
+    pub fn periodic_adv_cancel_create_sync(&mut self) -> Result<(), PeriodicError> {
+        if self.periodic_sync.phase != PeriodicSyncPhase::Creating {
+            return Err(PeriodicError::WrongPhase);
+        }
+        self.send_command(op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC_CANCEL, &[])
+            .map_err(|_| PeriodicError::Transport)?;
+        Ok(())
+    }
+
+    /// Terminate an established sync (§7.8.69). Only from Synced;
+    /// the sync is gone only once the controller accepts the
+    /// command (Command Complete).
+    pub fn periodic_adv_terminate_sync(&mut self) -> Result<(), PeriodicError> {
+        if self.periodic_sync.phase != PeriodicSyncPhase::Synced {
+            return Err(PeriodicError::WrongPhase);
+        }
+        let handle = match self.periodic_sync.sync_handle {
+            Some(h) => h,
+            None => return Err(PeriodicError::WrongPhase),
+        };
+        self.send_command(
+            op::HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC,
+            &gap::build_periodic_adv_terminate_sync(handle),
+        )
+        .map_err(|_| PeriodicError::Transport)?;
+        self.periodic_sync.note_terminate_sent();
+        Ok(())
+    }
+
+    /// Advance the periodic state machines on a completed periodic
+    /// command. Shared by the Command Complete and Command Status
+    /// arms: the §7.8.61..63 broadcaster commands and Terminate
+    /// Sync return Complete, while Create Sync returns Status
+    /// first and completes later via Sync Established.
+    fn on_periodic_command_done(&mut self, opcode: u16, status: u8) {
+        match opcode {
+            op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS => {
+                self.periodic_adv.note_parameters_set(status);
+            }
+            op::HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE => {
+                self.periodic_adv.note_enable_done(status);
+            }
+            op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC => {
+                // A non-zero Command Status means the controller
+                // refused the attempt outright; no Sync Established
+                // will ever follow it.
+                if status != 0 {
+                    self.periodic_sync.note_create_sync_rejected();
+                }
+            }
+            op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC_CANCEL => {
+                self.periodic_sync.note_create_sync_cancelled(status);
+            }
+            op::HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC => {
+                self.periodic_sync.note_terminated(status);
+            }
+            _ => {}
+        }
+    }
+}
+
 // ── Classic BR/EDR central initiator API (issue #1315) ─────────────
 
 /// Errors from the Classic BR/EDR central initiator API (issue #1315).
@@ -1751,6 +1941,21 @@ impl PumpCore {
                         }
                     }
                 }
+                // Periodic advertising sync subevents (§7.7.65.14..16,
+                // issue #1560). Malformed subevents parse to None
+                // and are dropped; the state machine itself ignores
+                // reports for other handles and stale subevents, so
+                // a residual report racing a Sync Lost / Terminate
+                // can neither resurrect state nor panic.
+                if let Some(est) = LePeriodicAdvSyncEstablished::parse(event) {
+                    self.periodic_sync.note_sync_established(&est);
+                }
+                if let Some(report) = LePeriodicAdvReport::parse(event) {
+                    self.periodic_sync.note_report(&report);
+                }
+                if let Some(lost) = LePeriodicAdvSyncLost::parse(event) {
+                    self.periodic_sync.note_sync_lost(&lost);
+                }
             }
             code if code == EventCode::InquiryResult as u8 => {
                 // §7.7.2: results feed the classic peer table while
@@ -1842,6 +2047,7 @@ impl PumpCore {
                     if let Some(status) = cc.status() {
                         self.on_central_command_done(cc.opcode, status);
                         self.on_classic_command_done(cc.opcode, status);
+                        self.on_periodic_command_done(cc.opcode, status);
                     }
                 }
             }
@@ -1849,6 +2055,7 @@ impl PumpCore {
                 if let Some(cs) = CommandStatus::parse(event) {
                     self.on_central_command_done(cs.opcode, cs.status);
                     self.on_classic_command_done(cs.opcode, cs.status);
+                    self.on_periodic_command_done(cs.opcode, cs.status);
                 }
             }
             code if code == EventCode::EncryptionChange as u8 => {
@@ -3114,6 +3321,103 @@ pub fn central_peers(index: usize) -> Option<Vec<gap::DiscoveredPeer>> {
         .core
         .as_ref()
         .map(|c| c.central.peers.clone())
+}
+
+// ── LE Periodic Advertising API (issue #1560) ───────────────────────
+
+/// Run `f` against controller `index`'s core with the slot lock
+/// released — the periodic counterpart of [`with_pump_core`].
+fn with_pump_core_periodic<T>(
+    index: usize,
+    f: impl FnOnce(&mut PumpCore) -> T,
+) -> Result<T, PeriodicError> {
+    let mut core = {
+        let mut pumps = PUMPS.lock();
+        let Some(slot) = find_slot_mut(&mut pumps, index) else {
+            return Err(PeriodicError::NoPump);
+        };
+        match slot.core.take() {
+            Some(core) => core,
+            None => return Err(PeriodicError::Busy),
+        }
+    };
+    let out = f(&mut core);
+    let mut pumps = PUMPS.lock();
+    if let Some(slot) = find_slot_mut(&mut pumps, index) {
+        slot.core = Some(core);
+    }
+    Ok(out)
+}
+
+/// Set periodic advertising parameters on controller `index`
+/// (§7.8.61). This is the trigger surface a future mgmt/userspace
+/// lane will call; today it is fixture-driven.
+pub fn periodic_adv_set_parameters(
+    index: usize,
+    params: gap::PeriodicAdvertisingParameters,
+) -> Result<(), PeriodicError> {
+    with_pump_core_periodic(index, |core| core.periodic_adv_set_parameters(params))?
+}
+
+/// Set periodic advertising data on controller `index` (§7.8.62).
+pub fn periodic_adv_set_data(
+    index: usize,
+    advertising_handle: u8,
+    operation: gap::PeriodicAdvDataOperation,
+    data: &[u8],
+) -> Result<(), PeriodicError> {
+    with_pump_core_periodic(index, |core| {
+        core.periodic_adv_set_data(advertising_handle, operation, data)
+    })?
+}
+
+/// Enable or disable the periodic advertising train on controller
+/// `index` (§7.8.63).
+pub fn periodic_adv_set_enable(index: usize, enable: bool) -> Result<(), PeriodicError> {
+    with_pump_core_periodic(index, |core| core.periodic_adv_set_enable(enable))?
+}
+
+/// Synchronise to a periodic advertising train from controller
+/// `index` (§7.8.67).
+pub fn periodic_adv_create_sync(
+    index: usize,
+    req: gap::PeriodicAdvertisingCreateSync,
+) -> Result<(), PeriodicError> {
+    with_pump_core_periodic(index, |core| core.periodic_adv_create_sync(req))?
+}
+
+/// Cancel a pending Create Sync on controller `index` (§7.8.68).
+pub fn periodic_adv_cancel_create_sync(index: usize) -> Result<(), PeriodicError> {
+    with_pump_core_periodic(index, |core| core.periodic_adv_cancel_create_sync())?
+}
+
+/// Terminate an established sync on controller `index` (§7.8.69).
+pub fn periodic_adv_terminate_sync(index: usize) -> Result<(), PeriodicError> {
+    with_pump_core_periodic(index, |core| core.periodic_adv_terminate_sync())?
+}
+
+/// Current periodic advertiser phase for controller `index`, if its
+/// core is not currently owned by a pump step.
+pub fn periodic_adv_phase(index: usize) -> Option<PeriodicAdvertiserPhase> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| c.periodic_adv.phase)
+}
+
+/// Current periodic-sync state for controller `index`, if its core
+/// is not currently owned by a pump step.
+pub fn periodic_sync_snapshot(index: usize) -> Option<gap::PeriodicSyncSnapshot> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| c.periodic_sync.snapshot())
 }
 
 // ── Classic BR/EDR central initiator API (issue #1315) ─────────────
@@ -9044,4 +9348,506 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_smp_authcomplete_failure_paths);
+
+    /// LE Periodic Advertising Sync Established subevent (§7.7.65.15):
+    /// subevent, status, sync handle, SID, address type, address,
+    /// PHY, interval, clock accuracy.
+    fn le_periodic_adv_sync_established(status: u8, handle: u16, sid: u8, peer: [u8; 6]) -> Event {
+        let mut params = alloc::vec![0x0E, status];
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.push(sid);
+        params.push(0x00); // advertiser address type: public
+        params.extend_from_slice(&peer);
+        params.push(0x01); // advertiser PHY: 1M
+        params.extend_from_slice(&0x0050u16.to_le_bytes()); // interval 100 ms
+        params.push(0x00); // advertiser clock accuracy
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
+    /// LE Periodic Advertising Report subevent (§7.7.65.14): subevent,
+    /// sync handle, Tx Power, RSSI, CTE type (0xFF = none),
+    /// data status, data length, data.
+    fn le_periodic_adv_report(
+        handle: u16,
+        tx_power: i8,
+        rssi: i8,
+        data_status: u8,
+        data: &[u8],
+    ) -> Event {
+        let mut params = alloc::vec![0x0F];
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.push(tx_power as u8);
+        params.push(rssi as u8);
+        params.push(0xFF); // CTE type: none
+        params.push(data_status);
+        params.push(data.len() as u8);
+        params.extend_from_slice(data);
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
+    /// LE Periodic Advertising Sync Lost subevent (§7.7.65.16):
+    /// subevent, sync handle.
+    fn le_periodic_adv_sync_lost(handle: u16) -> Event {
+        let mut params = alloc::vec![0x10];
+        params.extend_from_slice(&handle.to_le_bytes());
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
+    /// #1560: the full periodic advertising conversation against the
+    /// scripted controller — broadcaster parameters / data / enable,
+    /// then receiver Create Sync → Sync Established → complete +
+    /// fragmented + truncated reports → Sync Lost → disable.
+    fn smoke_pump_periodic_adv_sync_flow() -> TestResult {
+        use crate::event::{LE_PA_DATA_COMPLETE, LE_PA_DATA_MORE_TO_COME, LE_PA_DATA_TRUNCATED};
+        use crate::gap::{
+            PeerAddressType, PeriodicAdvDataOperation, PeriodicAdvertisingCreateSync,
+            PeriodicAdvertisingParameters,
+        };
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        // 1. Broadcaster: Set Parameters, pinned byte-for-byte
+        // against §7.8.61 (handle 0x00, 100 ms, Tx Power included).
+        let params = PeriodicAdvertisingParameters::for_handle(0x00);
+        if periodic_adv_set_parameters(0, params).is_err() {
+            reset_all();
+            return TestResult::Fail("periodic_adv_set_parameters rejected");
+        }
+        let sent = fake.sent_command_params();
+        if sent.len() != 6
+            || sent[5].0 != op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS
+            || sent[5].1 != [0x00, 0x50, 0x00, 0x50, 0x00, 0x01, 0x00]
+        {
+            reset_all();
+            return TestResult::Fail("Set Periodic Adv Parameters bytes mismatch");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS, &[0]));
+        let _ = pump_once(0);
+        if periodic_adv_phase(0) != Some(crate::gap::PeriodicAdvertiserPhase::Configured) {
+            reset_all();
+            return TestResult::Fail("phase not Configured after parameters complete");
+        }
+        // 2. Set Data (Complete, Flags 0x06), then Enable.
+        if periodic_adv_set_data(
+            0,
+            0x00,
+            PeriodicAdvDataOperation::Complete,
+            &[0x02, 0x01, 0x06],
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("periodic_adv_set_data rejected from Configured");
+        }
+        let sent = fake.sent_command_params();
+        if sent.len() != 7
+            || sent[6].0 != op::HCI_LE_SET_PERIODIC_ADVERTISING_DATA
+            || sent[6].1 != [0x00, 0x03, 0x03, 0x02, 0x01, 0x06]
+        {
+            reset_all();
+            return TestResult::Fail("Set Periodic Adv Data bytes mismatch");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_PERIODIC_ADVERTISING_DATA, &[0]));
+        let _ = pump_once(0);
+        if periodic_adv_set_enable(0, true).is_err() {
+            reset_all();
+            return TestResult::Fail("periodic_adv_set_enable rejected from Configured");
+        }
+        let sent = fake.sent_command_params();
+        if sent.len() != 8
+            || sent[7].0 != op::HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE
+            || sent[7].1 != [0x01, 0x00]
+        {
+            reset_all();
+            return TestResult::Fail("Set Periodic Adv Enable bytes mismatch");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if periodic_adv_phase(0) != Some(crate::gap::PeriodicAdvertiserPhase::Enabled) {
+            reset_all();
+            return TestResult::Fail("phase not Enabled after enable complete");
+        }
+        // 3. Receiver: Create Sync, pinned byte-for-byte against
+        // §7.8.67 (reporting on, SID 0x01, public peer, 10 s
+        // timeout, no CTE sync).
+        let req = PeriodicAdvertisingCreateSync::to_advertiser(0x01, PeerAddressType::Public, peer);
+        if periodic_adv_create_sync(0, req).is_err() {
+            reset_all();
+            return TestResult::Fail("periodic_adv_create_sync rejected from Idle");
+        }
+        let sent = fake.sent_command_params();
+        let want_create: [u8; 14] = [
+            0x02, 0x01, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x00, 0x00, 0xE8, 0x03, 0xFF,
+        ];
+        if sent.len() != 9
+            || sent[8].0 != op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC
+            || sent[8].1 != want_create
+        {
+            reset_all();
+            return TestResult::Fail("Create Sync bytes mismatch");
+        }
+        if periodic_sync_snapshot(0).map(|s| s.phase)
+            != Some(crate::gap::PeriodicSyncPhase::Creating)
+        {
+            reset_all();
+            return TestResult::Fail("phase not Creating after create sync");
+        }
+        // Command Status (accepted) keeps Creating; Sync Established
+        // lands the sync.
+        fake.enqueue_event(cs(op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC, 0));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase)
+            != Some(crate::gap::PeriodicSyncPhase::Creating)
+        {
+            reset_all();
+            return TestResult::Fail("accepted Command Status moved phase out of Creating");
+        }
+        fake.enqueue_event(le_periodic_adv_sync_established(0x00, 0x0007, 0x01, peer));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0);
+        if snap.as_ref().map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Synced)
+            || snap.as_ref().and_then(|s| s.sync_handle) != Some(0x0007)
+            || snap.as_ref().map(|s| s.periodic_interval) != Some(0x0050)
+        {
+            reset_all();
+            return TestResult::Fail("Sync Established did not land the sync");
+        }
+        // 4. Reports: one complete, one fragmented across two
+        // subevents, one truncated then re-delivered.
+        fake.enqueue_event(le_periodic_adv_report(
+            0x0007,
+            4,
+            -60,
+            LE_PA_DATA_COMPLETE,
+            &[0x02, 0x01, 0x06],
+        ));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0).unwrap();
+        if snap.reports_received != 1 || snap.last_report != [0x02, 0x01, 0x06] {
+            reset_all();
+            return TestResult::Fail("complete report not delivered");
+        }
+        fake.enqueue_event(le_periodic_adv_report(
+            0x0007,
+            4,
+            -60,
+            LE_PA_DATA_MORE_TO_COME,
+            &[0x02, 0x01],
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.reports_received) != Some(1) {
+            reset_all();
+            return TestResult::Fail("partial fragment delivered early");
+        }
+        fake.enqueue_event(le_periodic_adv_report(
+            0x0007,
+            4,
+            -60,
+            LE_PA_DATA_COMPLETE,
+            &[0x06],
+        ));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0).unwrap();
+        if snap.reports_received != 2 || snap.last_report != [0x02, 0x01, 0x06] {
+            reset_all();
+            return TestResult::Fail("fragmented report not reassembled");
+        }
+        fake.enqueue_event(le_periodic_adv_report(
+            0x0007,
+            4,
+            -60,
+            LE_PA_DATA_MORE_TO_COME,
+            &[0x02, 0x01],
+        ));
+        let _ = pump_once(0);
+        fake.enqueue_event(le_periodic_adv_report(
+            0x0007,
+            4,
+            -60,
+            LE_PA_DATA_TRUNCATED,
+            &[0x06],
+        ));
+        let _ = pump_once(0);
+        fake.enqueue_event(le_periodic_adv_report(
+            0x0007,
+            4,
+            -60,
+            LE_PA_DATA_COMPLETE,
+            &[0x09],
+        ));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0).unwrap();
+        if snap.reports_received != 3 || snap.last_report != [0x09] {
+            reset_all();
+            return TestResult::Fail("truncated fragment poisoned reassembly");
+        }
+        // 5. Malformed report (Data_Length overruns the event) and
+        // a report for another handle: both ignored, no panic, no
+        // state change.
+        fake.enqueue_event(Event {
+            code: EventCode::LeMeta as u8,
+            params: alloc::vec![0x0F, 0x07, 0x00, 0x04, 0xC4, 0xFF, 0x00, 0x09, 0x02, 0x01, 0x06],
+        });
+        let _ = pump_once(0);
+        fake.enqueue_event(le_periodic_adv_report(
+            0x0009,
+            4,
+            -60,
+            LE_PA_DATA_COMPLETE,
+            &[0xAA],
+        ));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0).unwrap();
+        if snap.reports_received != 3 || snap.phase != crate::gap::PeriodicSyncPhase::Synced {
+            reset_all();
+            return TestResult::Fail("malformed / foreign report moved sync state");
+        }
+        // 6. Sync Lost ends the sync; the train is then disabled.
+        fake.enqueue_event(le_periodic_adv_sync_lost(0x0007));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0).unwrap();
+        if snap.phase != crate::gap::PeriodicSyncPhase::Idle || snap.sync_handle.is_some() {
+            reset_all();
+            return TestResult::Fail("Sync Lost did not return to Idle");
+        }
+        if periodic_adv_set_enable(0, false).is_err() {
+            reset_all();
+            return TestResult::Fail("periodic_adv_set_enable(false) rejected from Enabled");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE, &[0]));
+        let _ = pump_once(0);
+        let ok = periodic_adv_phase(0) == Some(crate::gap::PeriodicAdvertiserPhase::Configured);
+        reset_all();
+        if !ok {
+            return TestResult::Fail("disable did not return advertiser to Configured");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_periodic_adv_sync_flow);
+
+    /// #1560: failure paths fail closed — out-of-order API calls are
+    /// rejected, out-of-range parameters never reach the controller,
+    /// refused commands return to Idle without wedging the machine,
+    /// and malformed sync subevents change nothing.
+    fn smoke_pump_periodic_adv_failure_and_malformed() -> TestResult {
+        use crate::gap::{
+            PeerAddressType, PeriodicAdvDataOperation, PeriodicAdvertisingCreateSync,
+            PeriodicAdvertisingParameters,
+        };
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        // Data / enable before any parameters: WrongPhase, and no
+        // command reaches the controller.
+        if periodic_adv_set_data(0, 0x00, PeriodicAdvDataOperation::Complete, &[0x02]).is_ok() {
+            reset_all();
+            return TestResult::Fail("set_data accepted before configure");
+        }
+        if periodic_adv_set_enable(0, true).is_ok() {
+            reset_all();
+            return TestResult::Fail("set_enable accepted before configure");
+        }
+        if periodic_adv_terminate_sync(0).is_ok() || periodic_adv_cancel_create_sync(0).is_ok() {
+            reset_all();
+            return TestResult::Fail("terminate/cancel accepted from Idle");
+        }
+        if fake.sent_command_params().len() != 5 {
+            reset_all();
+            return TestResult::Fail("rejected calls emitted commands");
+        }
+        // Out-of-range parameters never reach the controller.
+        let bad_params = PeriodicAdvertisingParameters {
+            advertising_handle: 0x00,
+            interval_min: 0x0005,
+            interval_max: 0x0050,
+            include_tx_power: false,
+            include_adi: false,
+        };
+        if periodic_adv_set_parameters(0, bad_params).is_ok() {
+            reset_all();
+            return TestResult::Fail("out-of-range parameters accepted");
+        }
+        let mut bad_req =
+            PeriodicAdvertisingCreateSync::to_advertiser(0x01, PeerAddressType::Public, peer);
+        bad_req.sync_timeout = 0x0009;
+        if periodic_adv_create_sync(0, bad_req).is_ok() {
+            reset_all();
+            return TestResult::Fail("out-of-range Create Sync accepted");
+        }
+        if fake.sent_command_params().len() != 5 {
+            reset_all();
+            return TestResult::Fail("bad parameters emitted commands");
+        }
+        // Refused parameters change nothing; retry works.
+        if periodic_adv_set_parameters(0, PeriodicAdvertisingParameters::for_handle(0x00)).is_err()
+        {
+            reset_all();
+            return TestResult::Fail("set_parameters rejected");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS, &[0x0C]));
+        let _ = pump_once(0);
+        if periodic_adv_phase(0) != Some(crate::gap::PeriodicAdvertiserPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("refused parameters left Idle");
+        }
+        if periodic_adv_set_parameters(0, PeriodicAdvertisingParameters::for_handle(0x00)).is_err()
+        {
+            reset_all();
+            return TestResult::Fail("retry set_parameters rejected");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS, &[0]));
+        let _ = pump_once(0);
+        if periodic_adv_phase(0) != Some(crate::gap::PeriodicAdvertiserPhase::Configured) {
+            reset_all();
+            return TestResult::Fail("retry parameters did not configure");
+        }
+        // Create Sync rejected by Command Status: Idle, no sync.
+        let req = PeriodicAdvertisingCreateSync::to_advertiser(0x01, PeerAddressType::Public, peer);
+        if periodic_adv_create_sync(0, req).is_err() {
+            reset_all();
+            return TestResult::Fail("create_sync rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC, 0x0C));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("rejected Create Sync did not return to Idle");
+        }
+        // Failed establishment (status != 0): Idle.
+        if periodic_adv_create_sync(0, req).is_err() {
+            reset_all();
+            return TestResult::Fail("retry create_sync rejected");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC, 0));
+        let _ = pump_once(0);
+        // Malformed Sync Established (truncated) while Creating:
+        // ignored, still Creating.
+        fake.enqueue_event(Event {
+            code: EventCode::LeMeta as u8,
+            params: alloc::vec![0x0E, 0x00, 0x07, 0x00, 0x01, 0x00, 0xC0, 0xC1],
+        });
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase)
+            != Some(crate::gap::PeriodicSyncPhase::Creating)
+        {
+            reset_all();
+            return TestResult::Fail("malformed Sync Established moved phase out of Creating");
+        }
+        fake.enqueue_event(le_periodic_adv_sync_established(0x3E, 0x0007, 0x01, peer));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("failed establishment did not return to Idle");
+        }
+        // Establish, then phase guards: no second create, no
+        // cancel while Synced; refused terminate stays Synced.
+        if periodic_adv_create_sync(0, req).is_err() {
+            reset_all();
+            return TestResult::Fail("create_sync rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC, 0));
+        let _ = pump_once(0);
+        fake.enqueue_event(le_periodic_adv_sync_established(0x00, 0x0007, 0x01, peer));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Synced)
+        {
+            reset_all();
+            return TestResult::Fail("establishment did not reach Synced");
+        }
+        if periodic_adv_create_sync(0, req).is_ok() || periodic_adv_cancel_create_sync(0).is_ok() {
+            reset_all();
+            return TestResult::Fail("create/cancel accepted while Synced");
+        }
+        // Malformed Sync Lost (truncated) while Synced: ignored.
+        fake.enqueue_event(Event {
+            code: EventCode::LeMeta as u8,
+            params: alloc::vec![0x10, 0x07],
+        });
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Synced)
+        {
+            reset_all();
+            return TestResult::Fail("malformed Sync Lost moved phase out of Synced");
+        }
+        if periodic_adv_terminate_sync(0).is_err() {
+            reset_all();
+            return TestResult::Fail("terminate_sync rejected from Synced");
+        }
+        let sent = fake.sent_command_params();
+        if sent.last().map(|(o, p)| (*o, p.clone()))
+            != Some((
+                op::HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC,
+                alloc::vec![0x07, 0x00],
+            ))
+        {
+            reset_all();
+            return TestResult::Fail("Terminate Sync bytes mismatch");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC, &[0x0C]));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Synced)
+        {
+            reset_all();
+            return TestResult::Fail("refused terminate did not stay Synced");
+        }
+        if periodic_adv_terminate_sync(0).is_err() {
+            reset_all();
+            return TestResult::Fail("retry terminate_sync rejected");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC, &[0]));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("accepted terminate did not return to Idle");
+        }
+        // Cancel flow: Create → Cancel command → complete → Idle.
+        if periodic_adv_create_sync(0, req).is_err() {
+            reset_all();
+            return TestResult::Fail("create_sync rejected from Idle");
+        }
+        if periodic_adv_cancel_create_sync(0).is_err() {
+            reset_all();
+            return TestResult::Fail("cancel_create_sync rejected from Creating");
+        }
+        let sent = fake.sent_command_params();
+        if sent.last().map(|(o, p)| (*o, p.clone()))
+            != Some((
+                op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC_CANCEL,
+                alloc::vec![],
+            ))
+        {
+            reset_all();
+            return TestResult::Fail("Create Sync Cancel bytes mismatch");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC_CANCEL, &[0]));
+        let _ = pump_once(0);
+        let ok =
+            periodic_sync_snapshot(0).map(|s| s.phase) == Some(crate::gap::PeriodicSyncPhase::Idle);
+        reset_all();
+        if !ok {
+            return TestResult::Fail("accepted cancel did not return to Idle");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_periodic_adv_failure_and_malformed
+    );
 }
