@@ -4546,6 +4546,281 @@ fn smoke_btusb_no_bluetooth_on_qemu() -> TestResult {
 }
 kernel_test_in!("drivers/usb/btusb", smoke_btusb_no_bluetooth_on_qemu);
 
+/// Build a synthetic Configuration Descriptor for a Bluetooth USB
+/// adapter in the shape real adapters use (USB 2.0 §9.6.3 / §9.6.5 /
+/// §9.6.6; Vol 4 Part B §2.1): interface 0 alt 0 carries the base
+/// three endpoints (interrupt-IN events, bulk-IN/OUT ACL); each
+/// further alternate adds an isoch IN/OUT pair at the SAME endpoint
+/// addresses (0x83 IN / 0x03 OUT) with a growing `wMaxPacketSize`.
+///
+/// The sizes are test vectors chosen to exercise alternate
+/// selection (9 / 17 / 25 bytes, including the 3-byte SCO header),
+/// not a capture from a specific device.
+fn btusb_cfg_with_sco_alts() -> alloc::vec::Vec<u8> {
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    cfg.extend_from_slice(&[9, 0x02, 0, 0, 1, 1, 0, 0xC0, 50]);
+    // Interface 0, alt 0, 3 endpoints — no isoch endpoints.
+    cfg.extend_from_slice(&[9, 0x04, 0, 0, 3, 0xE0, 0x01, 0x01, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x03, 0x10, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00]);
+    // Interface 0, alt 1, 5 endpoints — isoch pair, mps 9.
+    cfg.extend_from_slice(&[9, 0x04, 0, 1, 5, 0xE0, 0x01, 0x01, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x03, 0x10, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x83, 0x01, 0x09, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x03, 0x01, 0x09, 0x00, 0x01]);
+    // Interface 0, alt 2, 5 endpoints — isoch pair, mps 17.
+    cfg.extend_from_slice(&[9, 0x04, 0, 2, 5, 0xE0, 0x01, 0x01, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x03, 0x10, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x83, 0x01, 0x11, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x03, 0x01, 0x11, 0x00, 0x01]);
+    // Interface 0, alt 3, 5 endpoints — isoch pair, mps 25.
+    cfg.extend_from_slice(&[9, 0x04, 0, 3, 5, 0xE0, 0x01, 0x01, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x03, 0x10, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x83, 0x01, 0x19, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x03, 0x01, 0x19, 0x00, 0x01]);
+    let total = cfg.len() as u16;
+    cfg[2] = (total & 0xFF) as u8;
+    cfg[3] = (total >> 8) as u8;
+    cfg
+}
+
+/// `find_bt_endpoints` records the SCO isoch endpoints of every
+/// alternate setting — addresses, kinds, max-packet sizes — while
+/// the base three endpoints still resolve from alt 0, and
+/// alternate selection picks the smallest sufficient budget (or
+/// the largest, for the bind-time choice).
+fn smoke_btusb_find_endpoints_records_sco_alts() -> TestResult {
+    use crate::btusb::find_bt_endpoints;
+    use crate::xhci::EndpointKind;
+
+    let cfg = btusb_cfg_with_sco_alts();
+    let eps = match find_bt_endpoints(&cfg) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("find_bt_endpoints did not match SCO descriptor"),
+    };
+    if eps.event_in.ep_addr != 0x81 || eps.acl_in.ep_addr != 0x82 || eps.acl_out.ep_addr != 0x02 {
+        return TestResult::Fail("base endpoints mis-identified under SCO alts");
+    }
+    if eps.sco_alt_count() != 3 || !eps.has_sco() {
+        return TestResult::Fail("expected 3 SCO alternates");
+    }
+    for (idx, (want_alt, want_mps)) in [(1u8, 9u16), (2, 17), (3, 25)].iter().enumerate() {
+        let Some(alt) = eps.sco_alts[idx] else {
+            return TestResult::Fail("missing SCO alternate");
+        };
+        if alt.alt_setting != *want_alt {
+            return TestResult::Fail("SCO alternate number mismatch");
+        }
+        let (Some(sco_in), Some(sco_out)) = (alt.sco_in, alt.sco_out) else {
+            return TestResult::Fail("SCO alternate missing a direction");
+        };
+        if sco_in.ep_addr != 0x83 || !matches!(sco_in.kind, EndpointKind::IsochIn) {
+            return TestResult::Fail("SCO-IN mis-identified");
+        }
+        if sco_out.ep_addr != 0x03 || !matches!(sco_out.kind, EndpointKind::IsochOut) {
+            return TestResult::Fail("SCO-OUT mis-identified");
+        }
+        if sco_in.max_packet != *want_mps || sco_out.max_packet != *want_mps {
+            return TestResult::Fail("SCO max-packet did not round-trip");
+        }
+        if !alt.is_complete() || alt.packet_budget() != Some(*want_mps) {
+            return TestResult::Fail("SCO alternate budget mismatch");
+        }
+    }
+    // Smallest sufficient alternate for each payload size
+    // (packet = payload + 3-byte SCO header).
+    if eps.sco_alt_for_payload(6).map(|a| a.alt_setting) != Some(1) {
+        return TestResult::Fail("6-byte SCO payload did not select alt 1");
+    }
+    if eps.sco_alt_for_payload(14).map(|a| a.alt_setting) != Some(2) {
+        return TestResult::Fail("14-byte SCO payload did not select alt 2");
+    }
+    if eps.sco_alt_for_payload(22).map(|a| a.alt_setting) != Some(3) {
+        return TestResult::Fail("22-byte SCO payload did not select alt 3");
+    }
+    if eps.sco_alt_for_payload(23).is_some() {
+        return TestResult::Fail("oversize SCO payload selected an alternate");
+    }
+    // Bind-time choice: largest budget.
+    if eps.best_sco_alt().map(|a| a.alt_setting) != Some(3) {
+        return TestResult::Fail("bind-time SCO alternate is not alt 3");
+    }
+    if eps.best_sco_alt().and_then(|a| a.packet_budget()) != Some(25) {
+        return TestResult::Fail("bind-time SCO budget mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/btusb",
+    smoke_btusb_find_endpoints_records_sco_alts
+);
+
+/// The minimal Stage-0 descriptor (alt 0 only) still resolves, with
+/// an empty SCO table: a device with no isoch endpoints binds for
+/// ACL/events, and SCO is refused at the transport, not at discovery.
+fn smoke_btusb_find_endpoints_no_sco_alts() -> TestResult {
+    use crate::btusb::find_bt_endpoints;
+
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    cfg.extend_from_slice(&[9, 0x02, 0, 0, 1, 1, 0, 0xC0, 50]);
+    cfg.extend_from_slice(&[9, 0x04, 0, 0, 3, 0xE0, 0x01, 0x01, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x03, 0x10, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00]);
+    let total = cfg.len() as u16;
+    cfg[2] = (total & 0xFF) as u8;
+    cfg[3] = (total >> 8) as u8;
+
+    let eps = match find_bt_endpoints(&cfg) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("find_bt_endpoints did not match"),
+    };
+    if eps.sco_alt_count() != 0 || eps.has_sco() {
+        return TestResult::Fail("alt-0-only descriptor reported SCO alternates");
+    }
+    if eps.best_sco_alt().is_some() || eps.sco_alt_for_payload(0).is_some() {
+        return TestResult::Fail("no-SCO descriptor selected an alternate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_find_endpoints_no_sco_alts);
+
+/// A half-populated alternate (isoch-OUT but no isoch-IN) is
+/// recorded so diagnostics can show what the device offered, but
+/// is never selectable — SCO is bidirectional.
+fn smoke_btusb_sco_partial_alt_not_selectable() -> TestResult {
+    use crate::btusb::find_bt_endpoints;
+
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    cfg.extend_from_slice(&[9, 0x02, 0, 0, 1, 1, 0, 0xC0, 50]);
+    cfg.extend_from_slice(&[9, 0x04, 0, 0, 3, 0xE0, 0x01, 0x01, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x03, 0x10, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00]);
+    // Interface 0, alt 1 — isoch-OUT only, no isoch-IN.
+    cfg.extend_from_slice(&[9, 0x04, 0, 1, 4, 0xE0, 0x01, 0x01, 0]);
+    cfg.extend_from_slice(&[7, 0x05, 0x81, 0x03, 0x10, 0x00, 0x01]);
+    cfg.extend_from_slice(&[7, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00]);
+    cfg.extend_from_slice(&[7, 0x05, 0x03, 0x01, 0x09, 0x00, 0x01]);
+    let total = cfg.len() as u16;
+    cfg[2] = (total & 0xFF) as u8;
+    cfg[3] = (total >> 8) as u8;
+
+    let eps = match find_bt_endpoints(&cfg) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("find_bt_endpoints did not match"),
+    };
+    if eps.sco_alt_count() != 1 {
+        return TestResult::Fail("partial SCO alternate not recorded");
+    }
+    if eps.has_sco() || eps.best_sco_alt().is_some() || eps.sco_alt_for_payload(0).is_some() {
+        return TestResult::Fail("half-populated SCO alternate treated as usable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/btusb",
+    smoke_btusb_sco_partial_alt_not_selectable
+);
+
+/// A transport with no isoch endpoints refuses every SCO operation
+/// with `Unsupported` — without touching the xHC. The old code
+/// answered `Ok(())` on `send_sco` by routing SCO to bulk-OUT.
+fn smoke_btusb_sco_transport_fails_closed_without_isoch() -> TestResult {
+    use crate::btusb::__test_transport_without_sco;
+    use narf_bluetooth::transport::{HciTransport, TransportError};
+
+    let t = __test_transport_without_sco(0, 1);
+    if t.sco_available() || t.sco_alt_setting().is_some() {
+        return TestResult::Fail("no-SCO transport reported SCO available");
+    }
+    if t.send_sco(&[0x01, 0x00, 0x02, 0x11, 0x22]) != Err(TransportError::Unsupported) {
+        return TestResult::Fail("send_sco without isoch endpoints did not fail closed");
+    }
+    if t.recv_sco() != Err(TransportError::Unsupported) {
+        return TestResult::Fail("recv_sco without isoch endpoints did not fail closed");
+    }
+    if t.select_sco_alt_setting(0) != Err(TransportError::Unsupported) {
+        return TestResult::Fail("alt selection without isoch endpoints did not fail closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/btusb",
+    smoke_btusb_sco_transport_fails_closed_without_isoch
+);
+
+/// Scripted SCO conversation against the fixture descriptor: an
+/// outbound `ScoData` packet is encoded, checked against the
+/// selected alternate's isoch budget, and the same wire bytes are
+/// decoded as the inbound packet — the send/recv framing the isoch
+/// endpoints carry, without live hardware.
+fn smoke_btusb_sco_packet_conversation() -> TestResult {
+    use crate::btusb::find_bt_endpoints;
+    use narf_bluetooth::hci::ScoData;
+
+    let cfg = btusb_cfg_with_sco_alts();
+    let eps = match find_bt_endpoints(&cfg) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("find_bt_endpoints did not match SCO descriptor"),
+    };
+    // Outbound: 6 payload bytes on handle 1, correct status.
+    let mut payload: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    payload.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    let out = ScoData {
+        handle: 0x0001,
+        packet_status: 0,
+        data: payload,
+    };
+    let encoded = out.encode();
+    if encoded.len() != 9 || encoded[0] != 0x01 || encoded[1] != 0x00 || encoded[2] != 0x06 {
+        return TestResult::Fail("SCO packet header did not encode");
+    }
+    // Smallest fitting alternate is alt 1 (budget 9); the 9-byte
+    // packet fits exactly, and the bind-time (largest) alternate
+    // fits it with room.
+    let Some(alt1) = eps.sco_alt_for_payload(6) else {
+        return TestResult::Fail("no alternate fits the outbound SCO packet");
+    };
+    if alt1.alt_setting != 1 {
+        return TestResult::Fail("outbound SCO packet picked the wrong alternate");
+    }
+    if encoded.len() > alt1.packet_budget().unwrap_or(0) as usize {
+        return TestResult::Fail("outbound SCO packet exceeds its alternate's budget");
+    }
+    if encoded.len()
+        > eps
+            .best_sco_alt()
+            .and_then(|a| a.packet_budget())
+            .unwrap_or(0) as usize
+    {
+        return TestResult::Fail("outbound SCO packet exceeds the bind-time budget");
+    }
+    // Inbound: the same wire bytes arrive on isoch-IN; decode them.
+    let inbound = match ScoData::decode(&encoded) {
+        Some(p) => p,
+        None => return TestResult::Fail("inbound SCO packet did not decode"),
+    };
+    if inbound.handle != 0x0001 || inbound.packet_status != 0 || inbound.data != out.data {
+        return TestResult::Fail("inbound SCO packet contents mismatch");
+    }
+    // Oversize: a 23-byte payload needs 26 bytes on the wire and
+    // fits no alternate — refused, never truncated.
+    if eps.sco_alt_for_payload(23).is_some() {
+        return TestResult::Fail("oversize SCO packet selected an alternate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/btusb", smoke_btusb_sco_packet_conversation);
+
 /// WCN6855 vendor version data is a fixed 20-byte little-endian record. The
 /// multi-NVM flag combines chip/platform bytes into the board-specific suffix.
 fn smoke_btusb_qca_version_and_board_id() -> TestResult {

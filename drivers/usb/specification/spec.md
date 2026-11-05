@@ -712,7 +712,17 @@ also consult upstream Linux GPL sources.
   the `.hcd` command stream in file order → 250 ms delay); a failed
   vendor setup fails the bind. Firmware pairs are the
   `btusb_quirks::firmware_paths` names under the vendor prefix
-  (`intel/`, `mediatek/`, `rtl_bt/`, `brcm/`).
+  (`intel/`, `mediatek/`, `rtl_bt/`, `brcm/`). SCO/eSCO rides
+  isochronous endpoints (issue #817): `find_bt_endpoints` records
+  the isoch IN/OUT pair of every alternate setting of the HCI
+  interface; bind configures the largest-budget complete alternate
+  together with the base three endpoints and SET_INTERFACEs to it
+  after SET_CONFIGURATION, and the registered transport carries SCO
+  over `isoch_out` / `isoch_in` (`send_sco` / `recv_sco`), with
+  `select_sco_alt_setting` switching down to the smallest alternate
+  that fits a given payload. A device with no isoch endpoints still
+  binds; its transport refuses SCO with
+  `TransportError::Unsupported`, never routing it to bulk-OUT.
 - `MSC_DEVICES` entries are tombstoned on detach, never shifted: a bind
   reuses the first tombstone, so the `usb-msc{idx}` block name is stable
   across unplug/replug. Each entry carries a monotonic bind generation
