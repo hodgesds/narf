@@ -2042,9 +2042,11 @@ fn smoke_igc_ethtool_linux_stats() -> TestResult {
     ]);
     let mut counters = crate::counters::Counters::new();
     counters.sample(&m, 4, false);
-    let mut s = crate::igc::IgcStats::default();
-    s.tx_timeouts = 3;
-    s.tx_rejected = 5;
+    let s = crate::igc::IgcStats {
+        tx_timeouts: 3,
+        tx_rejected: 5,
+        ..Default::default()
+    };
     let stats = crate::igc::control::linux_stats(
         &counters,
         &s,
