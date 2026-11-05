@@ -53,6 +53,7 @@ pub mod eval;
 pub mod gpe;
 pub mod irq_routing;
 pub mod oregion;
+pub mod pnp;
 pub mod prt_crs;
 pub mod resource;
 pub mod sync;

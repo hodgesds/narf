@@ -341,3 +341,169 @@ fn smoke_pci_serial_kt_quirks() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("drivers/serial/pci", smoke_pci_serial_kt_quirks);
+
+// ── ACPI PNP0501 ────────────────────────────────────────────────────
+//
+// The fake-AML builders mirror `narf_aml::pnp`'s fixtures (2-byte
+// PkgLength form, EISA-integer `_HID`); they live here because the
+// serial crate cannot import aml's private test helpers.
+
+/// 2-byte PkgLength form: `opcode | len | payload`.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-test"))]
+fn acpi_pkg(opcode: &[u8], payload: &[u8]) -> alloc::vec::Vec<u8> {
+    let length = payload.len() + 2;
+    assert!(length < 4096);
+    let mut bytes = opcode.to_vec();
+    bytes.push(0x40 | (length as u8 & 15));
+    bytes.push((length >> 4) as u8);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// `DeviceOp(name) { body }`.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-test"))]
+fn acpi_device(name: &[u8; 4], body: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut payload = name.to_vec();
+    payload.extend_from_slice(body);
+    acpi_pkg(&[0x5B, 0x82], &payload)
+}
+
+/// `Name(_HID, <EISA integer>)`. PNP0501 = 0x0105_D041.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-test"))]
+fn acpi_hid_name_eisa(eisa: u32) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec![0x08, b'_', b'H', b'I', b'D', 0x0C];
+    v.extend_from_slice(&eisa.to_le_bytes());
+    v
+}
+
+/// `Name(_HID, "<string>")`.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-test"))]
+fn acpi_hid_name_string(s: &str) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec![0x08, b'_', b'H', b'I', b'D', 0x0D];
+    v.extend_from_slice(s.as_bytes());
+    v.push(0);
+    v
+}
+
+/// `Name(_CRS, Buffer(<size>) { <res_bytes> })`.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-test"))]
+fn acpi_crs_name(res_bytes: &[u8]) -> alloc::vec::Vec<u8> {
+    let pkg_len = res_bytes.len() + 3;
+    assert!(pkg_len < 0x40);
+    let mut v = alloc::vec![0x08, b'_', b'C', b'R', b'S', 0x11];
+    v.push(pkg_len as u8);
+    v.push(0x0A); // BytePrefix: size TermArg
+    v.push(res_bytes.len() as u8);
+    v.extend_from_slice(res_bytes);
+    v
+}
+
+/// COM-port resource template: IO desc (base) + IRQ desc (mask) + EndTag.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-test"))]
+fn acpi_com_resources(base: u16, irq_mask: u16) -> alloc::vec::Vec<u8> {
+    alloc::vec![
+        0x47,
+        0x01, // IO desc, Decode16
+        (base & 0xFF) as u8,
+        (base >> 8) as u8,
+        (base & 0xFF) as u8,
+        (base >> 8) as u8,
+        0x08,
+        0x08, // alignment, length
+        0x22, // IRQ desc
+        (irq_mask & 0xFF) as u8,
+        (irq_mask >> 8) as u8,
+        0x79,
+        0x00, // EndTag
+    ]
+}
+
+/// Fake namespace → registered UARTs, end to end.
+///
+/// Two PNP0501 UARTs at non-legacy bases (the dedup rule skips the
+/// legacy COM1–COM4 bases), one PNP0303 decoy, one `_CRS`-less
+/// PNP0501 device. The empty-namespace call first proves the
+/// graceful no-op. Runs inside a scoped namespace so the boot
+/// namespace is restored on drop.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-test"))]
+fn smoke_acpi_pnp0501_enumerates_fake_uarts() -> TestResult {
+    // SAFETY: serialized namespace scope; restores the boot namespace
+    // on drop. Same pattern as power/wireless namespace fixtures.
+    let _namespace = unsafe { narf_aml::__test_namespace_scope() };
+    let before = crate::registry::count();
+    crate::probe::enumerate_acpi_uarts();
+    if crate::registry::count() != before {
+        return TestResult::Fail("enumerate on empty namespace registered UARTs");
+    }
+    let mut body = alloc::vec::Vec::new();
+    let mut com1 = acpi_hid_name_eisa(0x0105_D041);
+    com1.extend_from_slice(&acpi_crs_name(&acpi_com_resources(0x2E0, 0x0020)));
+    body.extend_from_slice(&acpi_device(b"COM1", &com1));
+    let mut com2 = acpi_hid_name_eisa(0x0105_D041);
+    com2.extend_from_slice(&acpi_crs_name(&acpi_com_resources(0x3E0, 0x0200)));
+    body.extend_from_slice(&acpi_device(b"COM2", &com2));
+    let mut kbd = acpi_hid_name_string("PNP0303");
+    kbd.extend_from_slice(&acpi_crs_name(&acpi_com_resources(0x0060, 0x0002)));
+    body.extend_from_slice(&acpi_device(b"KBD0", &kbd));
+    body.extend_from_slice(&acpi_device(b"COM3", &acpi_hid_name_eisa(0x0105_D041)));
+    if narf_aml::__parse_body_for_test(&body, "\\").is_err() {
+        return TestResult::Fail("fake ACPI namespace parse failed");
+    }
+    crate::probe::enumerate_acpi_uarts();
+    if crate::registry::count() != before + 2 {
+        return TestResult::Fail("expected 2 ACPI UARTs registered");
+    }
+    for (base, irq) in [(0x2E0u16, 5u8), (0x3E0u16, 9u8)] {
+        let found = crate::registry::uarts().into_iter().any(|u| {
+            u.base == crate::uart_8250::UartBase::Io(base)
+                && u.irq == Some(irq)
+                && u.name == "acpi-pnp0501"
+        });
+        if !found {
+            return TestResult::Fail("ACPI UART missing from registry");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "x86_64", feature = "kernel-test"))]
+kernel_test_in!(
+    "drivers/serial/acpi",
+    smoke_acpi_pnp0501_enumerates_fake_uarts
+);
+
+/// Real boot namespace (QEMU q35): the query finds the firmware COM
+/// ports — COM1 at 0x3F8, IRQ 4. Fails (not Skips) when the namespace
+/// is built but holds no PNP0501 device: on QEMU that means the query
+/// itself is broken, and the fake-namespace smokes are the coverage
+/// for genuinely PNP0501-less platforms.
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_pnp0501_real_namespace() -> TestResult {
+    let devs = narf_aml::pnp::pnp_devices(crate::probe::PNP_COM_ID);
+    if devs.is_empty() {
+        return TestResult::Fail("no PNP0501 devices in the boot namespace");
+    }
+    if !devs
+        .iter()
+        .any(|d| d.io_base == Some(0x3F8) && d.irq == Some(4))
+    {
+        return TestResult::Fail("QEMU COM1 (0x3F8 irq 4) not found via PNP0501");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("drivers/serial/acpi", smoke_acpi_pnp0501_real_namespace);
+
+/// Enumerating twice registers nothing the second time: the dedup
+/// rule keeps one physical port to one registry entry.
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_enumerate_idempotent() -> TestResult {
+    crate::probe::enumerate_acpi_uarts();
+    let mid = crate::registry::count();
+    crate::probe::enumerate_acpi_uarts();
+    if crate::registry::count() != mid {
+        return TestResult::Fail("second enumerate registered duplicates");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("drivers/serial/acpi", smoke_acpi_enumerate_idempotent);
