@@ -78,6 +78,8 @@ All registers are 4-byte little-endian (host order). Offsets per
 | 0x04200   | LINKS     | LINK_UP = bit 30                     |
 | 0x04074   | GPRC      | Good Packets Received Count (RC, see §13) |
 | 0x04080   | GPTC      | Good Packets Transmitted Count (RC, see §13) |
+| 0x01030+0x40*n | QPRC[n] | Queue packets received count, RC (n=0..15, see §13i) |
+| 0x06030+0x40*n | QPTC[n] | Queue packets transmitted count, RC (n=0..15, see §13i) |
 | 0x10010   | EERD      | EEPROM Read (legacy 82599 path)      |
 
 Per-queue stride is 0x40 bytes. RX queues 0..63 use the 0x01000
@@ -516,6 +518,42 @@ board configuration; X550EM_A / E610 DIDs (same Linux rule
 applies when they land); the 82599 subdevice table (NARF does
 not track subdevice IDs; the 82599EB datasheet rule stands).
 
+## 13i. Per-queue statistics (QPRC/QPTC)
+
+Datasheet-grounded (82599 rev. 2.0 §8.2.3.23.74/.78), corroborated
+by Linux ixgbe (`ixgbe_type.h:860-861`, `ixgbe_main.c` "16
+register reads" loop, `ixgbe_ethtool.c` register dump):
+
+- QPRC[n] at 0x01030 + 0x40*n, n = 0..15, RC: packets received
+  for the queue. FCoE packets count even when posted only to the
+  DDP queue (no trace in the legacy queue).
+- QPTC[n] at 0x06030 + 0x40*n, n = 0..15, RC: packets transmitted
+  for the queue (forwarded to the MAC and/or the internal Tx-to-Rx
+  switch). Packets dropped by anti-spoofing filtering or VLAN tag
+  validation are NOT counted. The datasheet also maps QPTC at
+  0x08680 + 0x4*n; this driver reads the 82598-compatible
+  0x06030 + 0x40*n mapping, which is the one Linux reads.
+- Both counters are RC (read-clear), like GPRC/GPTC: a snapshot
+  consumes the interval since the last read. `read_queue_stats`
+  reads min(num_rx_queues, 16) QPRC and min(num_tx_queues, 16)
+  QPTC registers into `QueueStats` (arrays of 16 plus
+  `rx_valid`/`tx_valid` counts); `EthtoolInfo` carries it as
+  `queue_stats`, read by the same `ethtool_info` call as the
+  totals, so one snapshot consumes every interval counter.
+  `summary()` keeps the totals line unchanged; per-queue detail
+  lives in the struct field.
+- The 16-queue bound is hardware, not policy: the QPRC block ends
+  where QPRDC begins (0x01430 = 0x01030 + 16*0x40), and Linux
+  reads exactly 16. A 64-queue bring-up therefore reports only
+  the first 16 queues per-queue; queues >= 16 have no per-queue
+  packet counter, and their traffic remains visible only in the
+  GPRC/GPTC totals.
+- Part scope: Linux reads this block for every mac type in the
+  family (82599EB, X540, X550, X550EM_x, x550em_a, e610) with no
+  per-part gating. The 82599 datasheet grounds the addresses;
+  X540/X550 datasheet re-grounding stays open under #1266's
+  remainders.
+
 ## 13l. Resume ring rebuild (issue #1271 decision: rebuild, not re-probe)
 
 Decision: on resume, the driver REBUILDS the DMA rings in
@@ -610,7 +648,9 @@ Per the v0.1 exclusion list, still open after this stream:
   DIDs.
 - IPAV (0x05838 candidate) — datasheet text extraction was
   ambiguous, so it is not programmed; see §12.
-- Per-queue statistics counters (QPRC/QPTC offsets ungrounded).
+- Per-queue statistics counters (QPRC/QPTC) — landed (§13i);
+  QPRDC (per-queue drops) and QBRC/QBTC (per-queue bytes) remain
+  as follow-ups.
 - Resume full-reconfigure (RAR / RSS / VLAN / MSI-X restore)
   for suspends that lose non-DMA state — see §13l.
 - IPv6 TSO (the TSO context constructor is v4-only; the parser

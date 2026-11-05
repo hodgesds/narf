@@ -989,7 +989,9 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_pm_resume_rebuild);
 // ── Ethtool fixtures (commit 6) ──────────────────────────────────
 
 fn smoke_ixgbe_ethtool_snapshot() -> TestResult {
-    use super::ethtool::{read_stats, EthtoolInfo, NicStats, ETHTOOL_DRIVER, ETHTOOL_VERSION};
+    use super::ethtool::{
+        read_stats, EthtoolInfo, NicStats, QueueStats, ETHTOOL_DRIVER, ETHTOOL_VERSION,
+    };
     use super::queues::RegBank;
     if ETHTOOL_DRIVER != "ixgbe" || ETHTOOL_VERSION != "0.1.0" {
         return TestResult::Fail("ethtool driver identity wrong");
@@ -1020,6 +1022,7 @@ fn smoke_ixgbe_ethtool_snapshot() -> TestResult {
         wol_supported: true,
         wol_armed: false,
         stats,
+        queue_stats: QueueStats::default(),
     };
     let summary = info.summary();
     if !summary.contains("ixgbe 0.1.0")
@@ -2100,3 +2103,60 @@ fn smoke_ixgbe_tx_plan() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_plan);
+
+// ── Ethtool per-queue statistics (QPRC/QPTC, §13i) ──────────────
+
+fn smoke_ixgbe_ethtool_queue_stats() -> TestResult {
+    use super::ethtool::{
+        qprc_addr, qptc_addr, read_queue_stats, NUM_QUEUE_COUNTERS, QUEUE_COUNTER_STRIDE,
+        REG_QPRC_BASE, REG_QPTC_BASE,
+    };
+    use super::queues::RegBank;
+    // Address pins (datasheet §8.2.3.23.74/.78; Linux IXGBE_QPRC/QPTC).
+    if NUM_QUEUE_COUNTERS != 16
+        || REG_QPRC_BASE != 0x01030
+        || REG_QPTC_BASE != 0x06030
+        || QUEUE_COUNTER_STRIDE != 0x40
+    {
+        return TestResult::Fail("queue counter bases wrong");
+    }
+    if qprc_addr(0) != Some(0x01030)
+        || qprc_addr(15) != Some(0x013F0)
+        || qprc_addr(16).is_some()
+        || qptc_addr(0) != Some(0x06030)
+        || qptc_addr(15) != Some(0x063F0)
+        || qptc_addr(16).is_some()
+    {
+        return TestResult::Fail("queue counter addressing wrong");
+    }
+    let mut bank = FakeBank::new();
+    bank.write32(0x01030, 10); // QPRC[0]
+    bank.write32(0x01070, 20); // QPRC[1]
+    bank.write32(0x010B0, 99); // QPRC[2] — beyond a 2-queue read, must stay unread
+    bank.write32(0x013F0, 150); // QPRC[15]
+    bank.write32(0x06030, 7); // QPTC[0]
+    bank.write32(0x060B0, 27); // QPTC[2]
+    bank.write32(0x060F0, 33); // QPTC[3] — beyond a 3-queue read, must stay unread
+    let stats = read_queue_stats(&bank, 2, 3);
+    if stats.rx_valid != 2 || stats.tx_valid != 3 {
+        return TestResult::Fail("queue stats valid counts wrong");
+    }
+    if stats.rx_packets[0] != 10
+        || stats.rx_packets[1] != 20
+        || stats.rx_packets[2] != 0
+        || stats.tx_packets[0] != 7
+        || stats.tx_packets[1] != 0
+        || stats.tx_packets[2] != 27
+        || stats.tx_packets[3] != 0
+    {
+        return TestResult::Fail("queue stats interval read wrong");
+    }
+    // A 64-queue bring-up still reports only the first 16 queues:
+    // queues >= 16 have no hardware per-queue counter.
+    let wide = read_queue_stats(&bank, 64, 64);
+    if wide.rx_valid != 16 || wide.tx_valid != 16 || wide.rx_packets[15] != 150 {
+        return TestResult::Fail("queue stats 16-queue cap wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_ethtool_queue_stats);
