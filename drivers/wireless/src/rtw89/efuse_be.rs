@@ -325,17 +325,16 @@ fn write_logical_word(
     max: u32,
     page_offset: u32,
     size: u32,
-    val0: u8,
-    val1: u8,
+    word: [u8; 2],
 ) {
     let base = (log_idx as usize).wrapping_sub(page_offset as usize);
     if log_idx == min && page_offset > min {
-        log_map[base.wrapping_add(1)] = val1;
+        log_map[base.wrapping_add(1)] = word[1];
     } else if log_idx + 2 == max && page_offset + size < max {
-        log_map[base] = val0;
+        log_map[base] = word[0];
     } else {
-        log_map[base] = val0;
-        log_map[base.wrapping_add(1)] = val1;
+        log_map[base] = word[0];
+        log_map[base.wrapping_add(1)] = word[1];
     }
 }
 
@@ -409,7 +408,7 @@ pub(super) fn parse_logical_block(
             if blk_page == page && log_idx >= min && log_idx < max {
                 let val0 = phy_map[phy_idx];
                 let val1 = phy_map[phy_idx + 1];
-                write_logical_word(log_map, log_idx, min, max, page_offset, size, val0, val1);
+                write_logical_word(log_map, log_idx, min, max, page_offset, size, [val0, val1]);
             }
             // The advance is unconditional for present words, even
             // when the block belongs to another page.

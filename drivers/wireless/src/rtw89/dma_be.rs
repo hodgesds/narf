@@ -343,7 +343,7 @@ pub(super) fn mode_op(regs: &mut impl Regs, params: ModeParams) {
     if params.rxbd_mode == RxBdMode::Sep {
         rx_append &= !APPEND_LEN_MASK;
     }
-    init_cfg1 = (init_cfg1 & !MAX_TXDMA_MASK) | ((params.tx_burst << 0) & MAX_TXDMA_MASK);
+    init_cfg1 = (init_cfg1 & !MAX_TXDMA_MASK) | (params.tx_burst & MAX_TXDMA_MASK);
     init_cfg1 = (init_cfg1 & !MAX_RXDMA_MASK) | ((params.rx_burst << 2) & MAX_RXDMA_MASK);
     exp_ctrl = (exp_ctrl & !MAX_TAG_NUM_MASK) | (params.multi_tag_num & MAX_TAG_NUM_MASK);
     init_cfg1 = (init_cfg1 & !CFG_WD_PERIOD_IDLE_MASK)

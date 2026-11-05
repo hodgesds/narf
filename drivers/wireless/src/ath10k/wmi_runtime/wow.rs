@@ -448,19 +448,19 @@ pub(in crate::ath10k) fn add_pattern(
 
 /// `ath10k_wmi_tlv_op_gen_config_pno_start` (`wmi_tlv_wow_nlo_config_cmd`
 /// + ARRAY_STRUCT of ARRAY_BYTE-tagged 76-byte records + ARRAY_UINT32
-/// channels). Layout, all little-endian: WMI header (command 0x18001),
-/// TLV 144 len 112, then flags, vdev, fast max cycles, active/passive
-/// dwell, probe-bundle/rest/max-rest/backoff zeros, fast/slow periods,
-/// SSID count, channel count, start delay, two 8-byte MAC unions
-/// (6-byte address + 2 pad), 8-word zero IE bitmap, zero vendor-OUI and
-/// connected-NLO counts. Each record: TLV 17 len 72, ssid valid + length
+///   channels). Layout, all little-endian: WMI header (command 0x18001),
+///   TLV 144 len 112, then flags, vdev, fast max cycles, active/passive
+///   dwell, probe-bundle/rest/max-rest/backoff zeros, fast/slow periods,
+///   SSID count, channel count, start delay, two 8-byte MAC unions
+///   (6-byte address + 2 pad), 8-word zero IE bitmap, zero vendor-OUI and
+///   connected-NLO counts. Each record: TLV 17 len 72, ssid valid + length
 /// + 32-byte SSID, zero enc/auth params, rssi valid + value (only when
-/// the threshold is nonzero and above -300, as Linux), bcast valid +
-/// hidden 2 / ordinary 0. Channels are centre frequencies in MHz, as
-/// Linux copies `nd_config->channels[].center_freq`.
-/// The start delay is passed through raw: Linux copies
-/// `nd_config->delay` unchanged into the field the struct comment calls
-/// milliseconds, and NARF matches that wire behavior.
+///   the threshold is nonzero and above -300, as Linux), bcast valid +
+///   hidden 2 / ordinary 0. Channels are centre frequencies in MHz, as
+///   Linux copies `nd_config->channels[].center_freq`.
+///   The start delay is passed through raw: Linux copies
+///   `nd_config->delay` unchanged into the field the struct comment calls
+///   milliseconds, and NARF matches that wire behavior.
 pub(in crate::ath10k) fn nlo_config_start(vdev: u32, config: &NloConfig) -> Result<Vec<u8>, Error> {
     let (fast_period, slow_period, fast_cycles) = validate_nlo(config)?;
     let networks = config.networks.len();

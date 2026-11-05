@@ -263,6 +263,7 @@ impl C2hSource for C2hQueue {
 /// channel grant, over the RX C2H queue. The coexistence owner is
 /// held by the station owner (via `Prepared`) and passed to the
 /// methods that need it, so this owner never aliases it.
+#[derive(Debug)]
 pub struct Owner {
     /// Firmware download result (proof of admission).
     firmware: Info,
