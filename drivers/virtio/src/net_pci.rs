@@ -1247,21 +1247,25 @@ fn mrg_num_buffers(hdr: &[u8]) -> Option<u16> {
 }
 
 /// Pure shape check for a merged RX frame (testable without hardware).
-/// `first_len` is the first used entry's length including the 12-byte
-/// virtio header; `cont_lens` are the continuation used lengths (raw
-/// payload, no header). Returns the frame payload length (header
-/// excluded) when the shape is deliverable, else `None`:
+/// `first_len` is the first used entry's length including the
+/// `rx_hdr_len`-byte virtio header (12, or 20 with HASH_REPORT);
+/// `cont_lens` are the continuation used lengths (raw payload, no
+/// header). Returns the frame payload length (header excluded) when
+/// the shape is deliverable, else `None`:
 /// - `num_buffers` in 1..=RX_MRG_MAX_BUFFERS and matching the collected
 ///   segment count (a short collection means the device published
 ///   fewer used entries than promised — fail closed, never deliver
 ///   a prefix as a frame);
-/// - every segment within the posted descriptor length;
+/// - every segment within the posted descriptor length
+///   (`rx_hdr_len + MAX_RX_FRAME_PAYLOAD` — the length the probe,
+///   single-path, and MRG refills all post);
 /// - the reassembled frame within the advertised MTU + headers.
 fn mrg_frame_payload_len(
     first_len: usize,
     cont_lens: &[usize],
     num_buffers: usize,
     mtu: u32,
+    rx_hdr_len: usize,
 ) -> Option<usize> {
     if num_buffers == 0 || num_buffers > RX_MRG_MAX_BUFFERS {
         return None;
@@ -1269,13 +1273,14 @@ fn mrg_frame_payload_len(
     if cont_lens.len() + 1 != num_buffers {
         return None;
     }
-    if first_len < VIRTIO_NET_HDR_LEN || first_len > MAX_RX_FRAME {
+    let posted = rx_hdr_len + MAX_RX_FRAME_PAYLOAD;
+    if first_len < rx_hdr_len || first_len > posted {
         return None;
     }
-    if cont_lens.iter().any(|&l| l > MAX_RX_FRAME) {
+    if cont_lens.iter().any(|&l| l > posted) {
         return None;
     }
-    let payload = first_len - VIRTIO_NET_HDR_LEN + cont_lens.iter().sum::<usize>();
+    let payload = first_len - rx_hdr_len + cont_lens.iter().sum::<usize>();
     if payload > max_frame_for_mtu(mtu) {
         return None;
     }
@@ -2813,9 +2818,13 @@ impl VirtioNetPci {
             return false;
         };
         q.free_chain(head);
+        // Same posted length as probe posting, the single-path
+        // refill, and the RxFixture: the runtime header plus one
+        // max payload. (Previously MAX_RX_FRAME, i.e. 12 + 1518,
+        // which posted 8 bytes short with HASH_REPORT.)
         let descs = [VirtqDesc {
             addr: rep_phys,
-            len: MAX_RX_FRAME as u32,
+            len: (self.rx_hdr_len + MAX_RX_FRAME_PAYLOAD) as u32,
             flags: VIRTQ_DESC_F_WRITE,
             next: 0,
         }];
@@ -2955,7 +2964,13 @@ impl VirtioNetPci {
         let payload_len = if short {
             None
         } else {
-            mrg_frame_payload_len(len0 as usize, &cont_lens, num_buffers, self.mtu)
+            mrg_frame_payload_len(
+                len0 as usize,
+                &cont_lens,
+                num_buffers,
+                self.mtu,
+                self.rx_hdr_len,
+            )
         };
         let Some(payload_len) = payload_len else {
             for (buf, _) in segments {
@@ -2971,7 +2986,15 @@ impl VirtioNetPci {
             // with no copy and no allocation.
             return Some((buf0, len0));
         }
-        let total = VIRTIO_NET_HDR_LEN + payload_len;
+        // Runtime header length, not the 12-byte base form: with
+        // HASH_REPORT the header is 20 bytes, and the drain strips
+        // `rx_hdr_len` from this total. (The copy below is a
+        // contiguous copy of segment 0, so its bytes coincide either
+        // way; threading the same length keeps total ==
+        // rx_hdr_len + payload_len an explicit invariant rather
+        // than an accident of cancelling errors.)
+        let hdr = self.rx_hdr_len;
+        let total = hdr + payload_len;
         let mut merged = match alloc_coherent(total, DomainId::DRIVER_0) {
             Ok(b) => b,
             Err(_) => {
@@ -2997,10 +3020,10 @@ impl VirtioNetPci {
         {
             let dst = merged.as_mut_slice();
             let src0 = buf0.as_slice();
-            dst[..VIRTIO_NET_HDR_LEN].copy_from_slice(&src0[..VIRTIO_NET_HDR_LEN]);
-            let mut off = VIRTIO_NET_HDR_LEN;
-            let first_payload = len0 as usize - VIRTIO_NET_HDR_LEN;
-            dst[off..off + first_payload].copy_from_slice(&src0[VIRTIO_NET_HDR_LEN..len0 as usize]);
+            dst[..hdr].copy_from_slice(&src0[..hdr]);
+            let mut off = hdr;
+            let first_payload = len0 as usize - hdr;
+            dst[off..off + first_payload].copy_from_slice(&src0[hdr..len0 as usize]);
             off += first_payload;
             for (buf, len) in &segments {
                 let s = buf.as_slice();
@@ -4762,40 +4785,81 @@ mod tx_tests {
             // Cap-sized jumbo frame: 1518 first payload + 5 x 1530
             // continuations + 1380 = 9018, exactly the 9000-MTU cap.
             let cont = [1530usize, 1530, 1530, 1530, 1380];
-            if mrg_frame_payload_len(1530, &cont, 6, 9000) != Some(9018) {
+            if mrg_frame_payload_len(1530, &cont, 6, 9000, 12) != Some(9018) {
                 return Err("cap-sized jumbo rejected");
             }
             // One byte over the cap.
             let cont = [1530usize, 1530, 1530, 1530, 1381];
-            if mrg_frame_payload_len(1530, &cont, 6, 9000).is_some() {
+            if mrg_frame_payload_len(1530, &cont, 6, 9000, 12).is_some() {
                 return Err("over-cap jumbo accepted");
             }
             // Standard frame on a standard MTU, unsplit.
-            if mrg_frame_payload_len(1530, &[], 1, 1500) != Some(1518) {
+            if mrg_frame_payload_len(1530, &[], 1, 1500, 12) != Some(1518) {
                 return Err("standard frame rejected");
             }
             // Same frame over a standard MTU with one continuation.
-            if mrg_frame_payload_len(1530, &[100], 2, 1500).is_some() {
+            if mrg_frame_payload_len(1530, &[100], 2, 1500, 12).is_some() {
                 return Err("over-MTU split accepted");
             }
             // Degenerate counts.
-            if mrg_frame_payload_len(1530, &[], 0, 9000).is_some() {
+            if mrg_frame_payload_len(1530, &[], 0, 9000, 12).is_some() {
                 return Err("num_buffers 0 accepted");
             }
-            if mrg_frame_payload_len(1530, &[1530; 16], 17, 9000).is_some() {
+            if mrg_frame_payload_len(1530, &[1530; 16], 17, 9000, 12).is_some() {
                 return Err("num_buffers over cap accepted");
             }
             // Count mismatch (device published fewer than promised).
-            if mrg_frame_payload_len(1530, &[1530], 3, 9000).is_some() {
+            if mrg_frame_payload_len(1530, &[1530], 3, 9000, 12).is_some() {
                 return Err("short collection accepted");
             }
             // Short first segment (no room for the header).
-            if mrg_frame_payload_len(11, &[], 1, 9000).is_some() {
+            if mrg_frame_payload_len(11, &[], 1, 9000, 12).is_some() {
                 return Err("sub-header first segment accepted");
             }
             // Continuation longer than the posted descriptor.
-            if mrg_frame_payload_len(1530, &[1531], 2, 9000).is_some() {
+            if mrg_frame_payload_len(1530, &[1531], 2, 9000, 12).is_some() {
                 return Err("over-descriptor continuation accepted");
+            }
+            // HASH_REPORT form: 20-byte header. Every case below
+            // fails under the old hardcoded-12 shape check, so each
+            // pins the threading rather than the old behavior.
+            // Full first segment on a probe-posted buffer
+            // (20 + 1518 = 1538): old code rejected it (1538 > 1530).
+            if mrg_frame_payload_len(1538, &[], 1, 1500, 20) != Some(1518) {
+                return Err("hash full first segment rejected");
+            }
+            // Split frame with a 20-byte header.
+            if mrg_frame_payload_len(1538, &[100], 2, 9000, 20) != Some(1618) {
+                return Err("hash split frame rejected");
+            }
+            // First segment shorter than the 20-byte header: old
+            // code accepted lengths 12..19 with a bogus payload.
+            if mrg_frame_payload_len(15, &[], 1, 9000, 20).is_some() {
+                return Err("hash sub-header first segment accepted");
+            }
+            if mrg_frame_payload_len(19, &[], 1, 9000, 20).is_some() {
+                return Err("hash 19-byte first segment accepted");
+            }
+            // Header-only first segment is exactly at the floor.
+            if mrg_frame_payload_len(20, &[], 1, 9000, 20) != Some(0) {
+                return Err("hash header-only first segment rejected");
+            }
+            // Cap-sized jumbo with a 20-byte header: 1518 + 4 x 1538
+            // + 1348 = 9018, exactly the 9000-MTU cap. Old code
+            // overcounted the payload by 8 (9026) and rejected it.
+            let cont = [1538usize, 1538, 1538, 1538, 1348];
+            if mrg_frame_payload_len(1538, &cont, 6, 9000, 20) != Some(9018) {
+                return Err("hash cap-sized jumbo rejected");
+            }
+            // One byte over the cap, 20-byte header form.
+            let cont = [1538usize, 1538, 1538, 1538, 1349];
+            if mrg_frame_payload_len(1538, &cont, 6, 9000, 20).is_some() {
+                return Err("hash over-cap jumbo accepted");
+            }
+            // Continuation longer than the 20-byte-header posted
+            // descriptor (20 + 1518 = 1538).
+            if mrg_frame_payload_len(1538, &[1539], 2, 9000, 20).is_some() {
+                return Err("hash over-descriptor continuation accepted");
             }
             Ok(())
         };
@@ -4805,6 +4869,138 @@ mod tx_tests {
         }
     }
     kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_mac_table_payload);
+
+    /// Queue-level pin for the MRG+HASH_REPORT threading: drives
+    /// `rx_take` with a 20-byte RX header split across two posted
+    /// buffers and checks the reassembled bytes exactly. The first
+    /// segment is full (20 + 1518 = 1538 bytes, as on a
+    /// probe-posted buffer), so the old hardcoded-12 shape check
+    /// rejects this frame outright (1538 > 1530) while the threaded
+    /// check delivers it — this smoke fails under the old code and
+    /// passes under the new code, end to end through the take path:
+    /// num_buffers decode, the 20-byte header intact at the head of
+    /// the merged buffer, first payload then continuation in order,
+    /// and total == rx_hdr_len + payload_len for the drain's strip
+    /// math. Reuses the single-frame RxFixture and rewrites its
+    /// posted buffer + used ring into a two-segment completion,
+    /// using the same fake-device primitives `RxFixture::new` uses.
+    fn smoke_virtio_net_mrg_hash_reassembly() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let mut fixture = RxFixture::new(20, false, 0)?;
+            fixture.dev.mrg_rxbuf = true;
+            // Jumbo-cap MTU so the 1518 + 50 payload fits the shape
+            // check; the fixture's 1500 would reject it under both
+            // old and new code.
+            fixture.dev.mtu = 9000;
+            // Segment 0 is the fixture's posted buffer: find its
+            // slot, then rewrite it as a 20-byte header (num_buffers
+            // 2, distinctive hash fields) + 1518 bytes of payload.
+            let head_a = {
+                let bufs = fixture.dev.pairs[0].rx_buffers.lock();
+                bufs.iter()
+                    .position(|b| b.is_some())
+                    .ok_or("no posted buffer")? as u16
+            };
+            {
+                let mut bufs = fixture.dev.pairs[0].rx_buffers.lock();
+                let buf = bufs[head_a as usize].as_mut().ok_or("posted buffer gone")?;
+                let slice = buf.as_mut_slice();
+                slice[..1538].fill(0);
+                slice[10] = 2;
+                slice[11] = 0;
+                slice[12..16].copy_from_slice(&0x11223344u32.to_le_bytes());
+                slice[16..18].copy_from_slice(&0x0007u16.to_le_bytes());
+                for i in 0..1518 {
+                    slice[20 + i] = (i as u8).wrapping_add(0x40);
+                }
+            }
+            // Segment 1: a continuation buffer with 50 bytes of
+            // payload, posted to the same queue and parked in the
+            // slot table like any refill.
+            let mut buf_b = fixture.dev.pairs[0]
+                .rx_pool
+                .try_acquire()
+                .ok_or("RX pool starved")?;
+            {
+                let slice = buf_b.as_mut_slice();
+                for i in 0..50 {
+                    slice[i] = (i as u8).wrapping_add(0x80);
+                }
+            }
+            let head_b = {
+                let mut g = fixture.dev.pairs[0].rx_queue.lock();
+                let q = g.as_mut().ok_or("no rx queue")?;
+                q.add_buffer(&[VirtqDesc {
+                    addr: buf_b.dma_addr().raw(),
+                    len: (20 + MAX_RX_FRAME_PAYLOAD) as u32,
+                    flags: VIRTQ_DESC_F_WRITE,
+                    next: 0,
+                }])
+                .ok_or("RX post failed")?
+            };
+            fixture.dev.pairs[0].rx_buffers.lock()[head_b as usize] = Some(buf_b);
+            // Fake device completion: rewrite used entry 0 (segment
+            // 0, 1538 bytes) and append used entry 1 (continuation,
+            // 50 bytes), then bump idx to 2. Element 1 sits 8 bytes
+            // past element 0, i.e. 6 u16s past the ring base.
+            let used = narf_memory::PhysAddr::new(fixture.rx_used).kernel_mut_ptr::<u16>();
+            // SAFETY: the fixture exclusively owns this aligned ring page.
+            unsafe {
+                core::ptr::write_volatile(
+                    used.add(2).cast::<VirtqUsedElem>(),
+                    VirtqUsedElem {
+                        id: u32::from(head_a),
+                        len: 1538,
+                    },
+                );
+                core::ptr::write_volatile(
+                    used.add(6).cast::<VirtqUsedElem>(),
+                    VirtqUsedElem {
+                        id: u32::from(head_b),
+                        len: 50,
+                    },
+                );
+                crate::queue::virtio_wmb();
+                core::ptr::write_volatile(used.add(1), 2);
+            }
+            let (merged, total) = fixture.dev.rx_take().ok_or("merged take failed")?;
+            if total != 1588 {
+                return Err("merged total wrong");
+            }
+            let got = merged.as_slice();
+            if got.len() < 1588 {
+                return Err("merged buffer short");
+            }
+            // Header: only the written fields are nonzero (the
+            // segment was zero-filled first).
+            let mut header = [0u8; 20];
+            header[10] = 2;
+            header[12..16].copy_from_slice(&0x11223344u32.to_le_bytes());
+            header[16..18].copy_from_slice(&0x0007u16.to_le_bytes());
+            if got[..20] != header[..] {
+                return Err("merged header wrong");
+            }
+            for i in 0..1518 {
+                if got[20 + i] != (i as u8).wrapping_add(0x40) {
+                    return Err("merged first payload wrong");
+                }
+            }
+            for i in 0..50 {
+                if got[1538 + i] != (i as u8).wrapping_add(0x80) {
+                    return Err("merged continuation wrong");
+                }
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_mrg_hash_reassembly
+    );
 
     fn smoke_virtio_net_vlan_filter_gating() -> TestResult {
         let run = || -> Result<(), &'static str> {
@@ -5034,6 +5230,9 @@ mod tx_tests {
     struct RxFixture {
         dev: VirtioNetPci,
         _registers: DmaBuffer,
+        /// Base of the RX used ring, so a merged-take smoke can fake
+        /// a second device completion without rebuilding the fixture.
+        rx_used: u64,
     }
 
     impl RxFixture {
@@ -5165,6 +5364,7 @@ mod tx_tests {
             Ok(Self {
                 dev,
                 _registers: registers,
+                rx_used: layout.used_ring,
             })
         }
     }
