@@ -895,13 +895,19 @@ mod tests {
 
         // Pressure: wacom_wac.c:912
         // t = (data[6] << 3) | ((data[7] & 0xC0) >> 5) | (data[1] & 1)
-        // Pack pressure_raw into data[6] and data[7] upper bits.
+        // Pack pressure_raw into data[6] and data[7] bits 6-7
+        // ((p >> 1) & 0x03); data[7] bit 5 belongs to tilt, not pressure.
         let p = pressure_raw as u32;
         pkt[6] = (p >> 3) as u8;
-        pkt[7] = (((p & 0x07) << 5) as u8) | (((tilt_x as u8 & 0x3F) << 1) & 0x7E);
 
-        // Tilt Y in byte[8].
-        pkt[8] = ((tilt_y as u8).wrapping_add(64)) & 0x7F;
+        // Tilt: wacom_wac.c:917-919 — 7-bit raw values offset by 64, so the
+        // signed tilt range is -64..=63. raw = tilt + 64; data[7] bits 0-5
+        // hold raw >> 1, data[8] bit 7 holds raw & 1 (tilt X LSB), and
+        // data[8] bits 0-6 hold the tilt Y raw value.
+        let raw_x = (tilt_x as i32 + 64) as u8;
+        let raw_y = (tilt_y as i32 + 64) as u8;
+        pkt[7] = ((((p >> 1) & 0x03) << 6) as u8) | ((raw_x >> 1) & 0x3F);
+        pkt[8] = (raw_y & 0x7F) | ((raw_x & 1) << 7);
 
         // Byte[9]: distance (upper 6 bits) + X LSB (bit1) + Y LSB (bit0).
         pkt[9] = 0x00;
