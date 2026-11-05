@@ -234,8 +234,10 @@ pub struct Owner {
     pub cstate: u32,
     /// `btcoexist.cstate_h` (BT counter levels live in bits 0..3).
     pub cstate_h: u32,
-    prev_cstate: u32,
-    prev_cstate_h: u32,
+    /// Previous `cstate`, for [`Owner::is_coexist_state_changed`].
+    pub(crate) prev_cstate: u32,
+    /// Previous `cstate_h`, for [`Owner::is_coexist_state_changed`].
+    pub(crate) prev_cstate_h: u32,
     /// `link_info.tx_busy_traffic`, for [`Owner::is_wifi_up_link`].
     tx_busy: bool,
     /// `btcoexist.bt_pre_rssi_state` (zero-init = High).
