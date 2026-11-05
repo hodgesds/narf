@@ -29,6 +29,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::event::LeExtendedAdvertisingReport;
+
 // ── AD type constants (Assigned Numbers) ───────────────────────────
 
 pub const AD_FLAGS: u8 = 0x01;
@@ -1251,4 +1253,708 @@ pub struct PeriodicSyncSnapshot {
     pub last_report: Vec<u8>,
     pub last_rssi: i8,
     pub last_tx_power: i8,
+}
+
+// ── Extended advertising + extended scanning (Bluetooth 5) ────────
+//
+// Vol 4 Part E §7.8.52..65 define advertising sets and extended
+// scanning. All constants below come from those sections, cross-
+// checked against the Linux kernel header
+// `include/net/bluetooth/hci.h` and the STM32 AN5270 HCI command
+// table (see `opcode.rs`).
+
+/// Largest advertising-data payload one Set Extended Advertising
+/// Data command accepts (§7.8.54; the controller reports its own
+/// smaller limit via §7.8.57, at most 251).
+pub const EXT_ADV_DATA_MAX_LEN: usize = 251;
+
+/// `Advertising_Tx_Power` (§7.8.53) / `Tx_Power` in an extended
+/// report (§7.7.65.13): host has no preference / value unavailable.
+pub const EXT_ADV_TX_POWER_NO_PREFERENCE: i8 = 0x7F;
+
+/// `Advertising_SID` (§7.7.65.13): the report carries no ADI field.
+pub const EXT_ADV_SID_NONE: u8 = 0xFF;
+
+/// `RSSI` in an extended report (§7.7.65.13): value unavailable.
+pub const EXT_ADV_RSSI_UNAVAILABLE: i8 = 0x7F;
+
+/// `Periodic_Advertising_Interval` in an extended report
+/// (§7.7.65.13): no periodic advertising for this set.
+pub const EXT_ADV_PERIODIC_INTERVAL_NONE: u16 = 0x0000;
+
+/// LE PHY values shared by Primary/Secondary Advertising PHY
+/// (§7.8.53) and the report PHY fields (§7.7.65.13).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LePhy {
+    /// LE 1M PHY.
+    OneM = 0x01,
+    /// LE 2M PHY — secondary advertising only, never primary and
+    /// never a scanning PHY.
+    TwoM = 0x02,
+    /// LE Coded PHY.
+    Coded = 0x03,
+}
+
+// ── Advertising_Event_Properties bits (§7.8.53) ────────────────────
+
+pub const ADV_PROP_CONNECTABLE: u16 = 1 << 0;
+pub const ADV_PROP_SCANNABLE: u16 = 1 << 1;
+pub const ADV_PROP_DIRECTED: u16 = 1 << 2;
+pub const ADV_PROP_HIGH_DUTY_CYCLE_DIRECTED: u16 = 1 << 3;
+pub const ADV_PROP_USE_LEGACY_PDUS: u16 = 1 << 4;
+pub const ADV_PROP_ANONYMOUS: u16 = 1 << 5;
+pub const ADV_PROP_INCLUDE_TX_POWER: u16 = 1 << 6;
+
+// ── Primary_Advertising_Channel_Map bits (§7.8.53) ────────────────
+
+pub const ADV_CHANNEL_37: u8 = 1 << 0;
+pub const ADV_CHANNEL_38: u8 = 1 << 1;
+pub const ADV_CHANNEL_39: u8 = 1 << 2;
+pub const ADV_CHANNEL_ALL: u8 = ADV_CHANNEL_37 | ADV_CHANNEL_38 | ADV_CHANNEL_39;
+
+/// `Advertising_Filter_Policy` per §7.8.53.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AdvertisingFilterPolicy {
+    /// Allow scan + connect requests from any device.
+    AllowAll = 0x00,
+    /// Allow scan requests only from the filter accept list;
+    /// connect requests from any.
+    ScanListOnly = 0x01,
+    /// Allow scan requests from any; connect requests only from
+    /// the filter accept list.
+    ConnectListOnly = 0x02,
+    /// Allow scan + connect requests only from the filter accept list.
+    ListOnly = 0x03,
+}
+
+/// `Advertising_SID` range (§7.8.53): 0x00..=0x0F identifies the
+/// set's Advertising Data Info; anything else is rejected by the
+/// controller.
+pub const ADV_SID_MAX: u8 = 0x0F;
+
+/// LE Set Extended Advertising Parameters payload (§7.8.53).
+/// 25 bytes on the wire.
+///
+/// `primary_interval_min` / `primary_interval_max` are 24-bit values
+/// in units of 0.625 ms (range 0x000020..=0xFFFFFF ⇒ 20 ms..=10485.759 s).
+/// `tx_power` is signed dBm; 0x7F (`EXT_ADV_TX_POWER_NO_PREFERENCE`)
+/// lets the controller choose. `sid` is 0x00..=0x0F.
+#[derive(Copy, Clone, Debug)]
+pub struct ExtendedAdvertisingParameters {
+    pub handle: u8,
+    pub event_properties: u16,
+    pub primary_interval_min: u32,
+    pub primary_interval_max: u32,
+    pub primary_channel_map: u8,
+    pub own_address_type: OwnAddressType,
+    pub peer_address_type: PeerAddressType,
+    pub peer_address: [u8; 6],
+    pub filter_policy: AdvertisingFilterPolicy,
+    pub tx_power: i8,
+    pub primary_phy: LePhy,
+    pub secondary_max_skip: u8,
+    pub secondary_phy: LePhy,
+    pub sid: u8,
+    pub scan_request_notification: bool,
+}
+
+impl Default for ExtendedAdvertisingParameters {
+    fn default() -> Self {
+        // Legacy-equivalent connectable undirected advertising on
+        // all three primary channels, 100 ms interval, controller-
+        // chosen Tx power, LE 1M on both PHYs.
+        Self {
+            handle: 0,
+            event_properties: ADV_PROP_CONNECTABLE | ADV_PROP_SCANNABLE | ADV_PROP_USE_LEGACY_PDUS,
+            // 0x00A0 * 0.625 ms = 100 ms.
+            primary_interval_min: 0x00A0,
+            primary_interval_max: 0x00A0,
+            primary_channel_map: ADV_CHANNEL_ALL,
+            own_address_type: OwnAddressType::Public,
+            peer_address_type: PeerAddressType::Public,
+            peer_address: [0; 6],
+            filter_policy: AdvertisingFilterPolicy::AllowAll,
+            tx_power: EXT_ADV_TX_POWER_NO_PREFERENCE,
+            primary_phy: LePhy::OneM,
+            secondary_max_skip: 0,
+            secondary_phy: LePhy::OneM,
+            sid: 0,
+            scan_request_notification: false,
+        }
+    }
+}
+
+impl ExtendedAdvertisingParameters {
+    /// Build the 25-byte parameter block for
+    /// HCI_LE_Set_Extended_Advertising_Parameters.
+    pub fn encode(&self) -> [u8; 25] {
+        let mut out = [0u8; 25];
+        out[0] = self.handle;
+        out[1..3].copy_from_slice(&self.event_properties.to_le_bytes());
+        // 24-bit intervals: low 3 bytes, little-endian.
+        out[3..6].copy_from_slice(&self.primary_interval_min.to_le_bytes()[..3]);
+        out[6..9].copy_from_slice(&self.primary_interval_max.to_le_bytes()[..3]);
+        out[9] = self.primary_channel_map;
+        out[10] = self.own_address_type as u8;
+        out[11] = self.peer_address_type as u8;
+        out[12..18].copy_from_slice(&self.peer_address);
+        out[18] = self.filter_policy as u8;
+        out[19] = self.tx_power as u8;
+        out[20] = self.primary_phy as u8;
+        out[21] = self.secondary_max_skip;
+        out[22] = self.secondary_phy as u8;
+        out[23] = self.sid;
+        out[24] = self.scan_request_notification as u8;
+        out
+    }
+}
+
+/// `Operation` for Set Extended Advertising Data (§7.8.54) and Set
+/// Extended Scan Response Data (§7.8.55).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AdvertisingDataOperation {
+    /// Intermediate fragment of fragmented data.
+    Intermediate = 0x00,
+    /// First fragment of fragmented data.
+    First = 0x01,
+    /// Last fragment of fragmented data.
+    Last = 0x02,
+    /// Complete extended advertising data (single fragment).
+    Complete = 0x03,
+    /// Unchanged data — only the advertising DID is updated.
+    Unchanged = 0x04,
+}
+
+/// `Fragment_Preference` for Set Extended Advertising Data (§7.8.54)
+/// and Set Extended Scan Response Data (§7.8.55).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FragmentPreference {
+    /// The controller may fragment the data.
+    MayFragment = 0x00,
+    /// The controller should not fragment / should minimise
+    /// fragmentation.
+    MinimizeFragmentation = 0x01,
+}
+
+/// LE Set Extended Advertising Data (§7.8.54) / LE Set Extended Scan
+/// Response Data (§7.8.55) payload. The two commands share one
+/// layout — handle, operation, fragment preference, length, data —
+/// and differ only in opcode, so one encoder serves both; the call
+/// site picks the opcode.
+///
+/// `data` is at most [`EXT_ADV_DATA_MAX_LEN`] bytes (251); the
+/// controller's own limit from §7.8.57 may be smaller.
+#[derive(Clone, Debug)]
+pub struct ExtendedAdvertisingData<'a> {
+    pub handle: u8,
+    pub operation: AdvertisingDataOperation,
+    pub fragment_preference: FragmentPreference,
+    pub data: &'a [u8],
+}
+
+impl<'a> ExtendedAdvertisingData<'a> {
+    /// Build the parameter block: 4-byte header + `data`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.data.len());
+        out.push(self.handle);
+        out.push(self.operation as u8);
+        out.push(self.fragment_preference as u8);
+        out.push(self.data.len() as u8);
+        out.extend_from_slice(self.data);
+        out
+    }
+}
+
+/// LE Set Extended Advertising Enable payload (§7.8.56).
+///
+/// `sets` is one `(advertising_handle, duration, max_events)` tuple
+/// per set: `duration` is units of 10 ms (0x0000 = no timeout),
+/// `max_events` is the maximum number of extended advertising events
+/// (0x00 = no limit). `Enable = 0x00` with an empty set list disables
+/// all advertising sets.
+#[derive(Clone, Debug)]
+pub struct ExtendedAdvertisingEnable<'a> {
+    pub enable: bool,
+    pub sets: &'a [(u8, u16, u8)],
+}
+
+impl<'a> ExtendedAdvertisingEnable<'a> {
+    /// Build the parameter block: 2-byte header + 4 bytes per set.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.sets.len() * 4);
+        out.push(self.enable as u8);
+        out.push(self.sets.len() as u8);
+        for (handle, duration, max_events) in self.sets {
+            out.push(*handle);
+            out.extend_from_slice(&duration.to_le_bytes());
+            out.push(*max_events);
+        }
+        out
+    }
+
+    /// Disable-all payload: `[Enable=0, Number_of_Sets=0]`.
+    pub fn disable_all() -> [u8; 2] {
+        [0x00, 0x00]
+    }
+
+    /// Enable-one-set payload for `handle` with no duration limit
+    /// and no event cap.
+    pub fn enable_one(handle: u8) -> [u8; 6] {
+        [0x01, 0x01, handle, 0x00, 0x00, 0x00]
+    }
+
+    /// Disable-one-set payload for `handle`.
+    pub fn disable_one(handle: u8) -> [u8; 6] {
+        [0x00, 0x01, handle, 0x00, 0x00, 0x00]
+    }
+}
+
+/// LE Set Advertising Set Random Address payload (§7.8.52). 7 bytes:
+/// advertising_handle (1) + random_address (6). Only valid after
+/// the set is created (Set Extended Advertising Parameters) and
+/// while it is not enabled.
+#[derive(Copy, Clone, Debug)]
+pub struct AdvertisingSetRandomAddress {
+    pub handle: u8,
+    pub address: [u8; 6],
+}
+
+impl AdvertisingSetRandomAddress {
+    pub fn encode(&self) -> [u8; 7] {
+        let mut out = [0u8; 7];
+        out[0] = self.handle;
+        out[1..7].copy_from_slice(&self.address);
+        out
+    }
+}
+
+// ── Extended scanning (§7.8.64, §7.8.65) ───────────────────────────
+
+/// `Scanning_PHYs` bits (§7.8.64). The field reuses the generic PHY
+/// bit positions (bit 0 = LE 1M, bit 1 = LE 2M, bit 2 = LE Coded)
+/// but only LE 1M and LE Coded are scanning PHYs — 2M is not a
+/// scanning PHY and is ignored by the controller.
+pub const SCAN_PHY_1M: u8 = 0x01;
+pub const SCAN_PHY_CODED: u8 = 0x04;
+
+/// Per-PHY scan parameters inside LE Set Extended Scan Parameters
+/// (§7.8.64): scan_type (1) + scan_interval (2 LE) + scan_window
+/// (2 LE). Interval/window are units of 0.625 ms, range
+/// 0x0004..=0x4000.
+#[derive(Copy, Clone, Debug)]
+pub struct ExtendedScanPhyParams {
+    pub scan_type: ScanType,
+    pub scan_interval: u16,
+    pub scan_window: u16,
+}
+
+impl Default for ExtendedScanPhyParams {
+    fn default() -> Self {
+        Self {
+            scan_type: ScanType::Passive,
+            // 0x0030 * 0.625 ms = 30 ms.
+            scan_interval: 0x0030,
+            scan_window: 0x0030,
+        }
+    }
+}
+
+/// LE Set Extended Scan Parameters payload (§7.8.64). Variable
+/// length: 3-byte header + 5 bytes per scanning PHY, in ascending
+/// bit order — LE 1M first, then LE Coded. At least one PHY must be
+/// set; a `None` pair means "scan on LE 1M only" by default.
+#[derive(Copy, Clone, Debug)]
+pub struct ExtendedScanParameters {
+    pub own_address_type: OwnAddressType,
+    pub scanning_filter_policy: ScanFilterPolicy,
+    pub phys_1m: Option<ExtendedScanPhyParams>,
+    pub phys_coded: Option<ExtendedScanPhyParams>,
+}
+
+impl Default for ExtendedScanParameters {
+    fn default() -> Self {
+        Self {
+            own_address_type: OwnAddressType::Public,
+            scanning_filter_policy: ScanFilterPolicy::AcceptAll,
+            phys_1m: Some(ExtendedScanPhyParams::default()),
+            phys_coded: None,
+        }
+    }
+}
+
+impl ExtendedScanParameters {
+    /// Build the parameter block for
+    /// HCI_LE_Set_Extended_Scan_Parameters.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut phys = 0u8;
+        if self.phys_1m.is_some() {
+            phys |= SCAN_PHY_1M;
+        }
+        if self.phys_coded.is_some() {
+            phys |= SCAN_PHY_CODED;
+        }
+        let mut out = Vec::with_capacity(3 + 5 * 2);
+        out.push(self.own_address_type as u8);
+        out.push(self.scanning_filter_policy as u8);
+        out.push(phys);
+        for p in [self.phys_1m, self.phys_coded].into_iter().flatten() {
+            out.push(p.scan_type as u8);
+            out.extend_from_slice(&p.scan_interval.to_le_bytes());
+            out.extend_from_slice(&p.scan_window.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// `Filter_Duplicates` for LE Set Extended Scan Enable (§7.8.65).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ExtendedDuplicateFilter {
+    /// Duplicate filtering disabled.
+    Disabled = 0x00,
+    /// Duplicate filtering enabled.
+    Enabled = 0x01,
+    /// Duplicate filtering enabled; the duplicate list is reset at
+    /// the start of each scan period.
+    EnabledResetEachPeriod = 0x02,
+}
+
+/// LE Set Extended Scan Enable payload (§7.8.65). 6 bytes.
+///
+/// `duration` is units of 10 ms (0x0000 = scan until disabled);
+/// `period` is units of 1.28 s (0x0000 = no periodic scanning — scan
+/// continuously for `duration`, or until disabled when that is 0).
+#[derive(Copy, Clone, Debug)]
+pub struct ExtendedScanEnable {
+    pub enable: bool,
+    pub filter_duplicates: ExtendedDuplicateFilter,
+    pub duration: u16,
+    pub period: u16,
+}
+
+impl ExtendedScanEnable {
+    pub fn encode(&self) -> [u8; 6] {
+        let d = self.duration.to_le_bytes();
+        let p = self.period.to_le_bytes();
+        [
+            self.enable as u8,
+            self.filter_duplicates as u8,
+            d[0],
+            d[1],
+            p[0],
+            p[1],
+        ]
+    }
+}
+
+/// LE Extended Advertising support (§7.8.3): bit 12 of the 64-bit LE
+/// feature set — octet 1, bit 4 (0x10). The octet-1 bits are the
+/// Linux `HCI_LE_EXT_ADV 0x10` value in `include/net/bluetooth/hci.h`.
+/// Hosts must check this (from LE Read Local Supported Features)
+/// before issuing any extended advertising/scan command: a
+/// controller without the bit rejects them with Unknown HCI Command.
+pub fn supports_extended_advertising(le_features: &[u8; 8]) -> bool {
+    le_features[1] & 0x10 != 0
+}
+
+// ── Extended report Event_Type bits (§7.7.65.13) ───────────────────
+
+pub const EXT_EVT_CONNECTABLE: u16 = 1 << 0;
+pub const EXT_EVT_SCANNABLE: u16 = 1 << 1;
+pub const EXT_EVT_DIRECTED: u16 = 1 << 2;
+pub const EXT_EVT_SCAN_RESPONSE: u16 = 1 << 3;
+pub const EXT_EVT_LEGACY: u16 = 1 << 4;
+/// Data-status field: bits 5..6 of `Event_Type`.
+pub const EXT_EVT_DATA_STATUS_MASK: u16 = 0x0060;
+
+// ── Extended scanner state machine ────────────────────────────────
+
+/// Phases the extended scanner walks during discovery.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ExtendedScannerPhase {
+    /// Initial state, no scan in progress.
+    #[default]
+    Idle,
+    /// Set Extended Scan Parameters issued, awaiting Command Complete.
+    ParametersSent,
+    /// Set Extended Scan Enable(enable=1) issued, controller is scanning.
+    Scanning,
+    /// Set Extended Scan Enable(enable=0) issued.
+    ScanStopping,
+}
+
+/// A discovered peer from the extended scanner. Keyed by
+/// (address_type, address, SID): one advertiser may run several
+/// advertising sets, and each set's data is tracked separately so
+/// fragment reassembly never mixes sets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtendedDiscoveredPeer {
+    pub address_type: u8,
+    pub address: [u8; 6],
+    pub primary_phy: u8,
+    pub secondary_phy: u8,
+    pub sid: u8,
+    pub tx_power: i8,
+    pub periodic_interval: u16,
+    pub last_rssi: i8,
+    pub event_type: u16,
+    /// Latest complete advertisement data (AD records). Empty while
+    /// the first fragments are still arriving.
+    pub ad_data: Vec<u8>,
+    /// The last report for this set was truncated (§7.7.65.13 data
+    /// status 0x02): `ad_data` is partial, no more fragments follow.
+    pub data_truncated: bool,
+    /// Fragments of one advertisement are still arriving (data
+    /// status 0x01 seen, complete not yet seen).
+    pub reassembling: bool,
+    /// Fragments accumulated so far for the in-flight advertisement.
+    pub pending_fragments: Vec<u8>,
+}
+
+/// Extended scanner: drives LE Set Extended Scan Parameters/Enable
+/// and consumes LE Extended Advertising Reports (§7.7.65.13),
+/// reassembling advertisements the controller split across several
+/// reports. Transport-free like [`Central`]: the caller issues the
+/// HCI commands and feeds parsed reports in.
+#[derive(Debug, Default)]
+pub struct ExtendedScanner {
+    pub phase: ExtendedScannerPhase,
+    pub peers: Vec<ExtendedDiscoveredPeer>,
+}
+
+impl ExtendedScanner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one parsed extended advertising report. Fragmented
+    /// advertisements (§7.7.65.13: data status "incomplete, more data
+    /// to come" on every report but the last) are accumulated per
+    /// (address, SID) and published only when the complete report
+    /// lands; a truncated report publishes the partial data and
+    /// marks it truncated. A reserved data-status value (0x03) is
+    /// treated as truncated — terminal and partial, never trusted
+    /// as complete.
+    pub fn report(&mut self, r: &LeExtendedAdvertisingReport) {
+        let pos = self.peers.iter().position(|p| {
+            p.address == r.address && p.address_type == r.address_type && p.sid == r.sid
+        });
+        let idx = match pos {
+            Some(i) => i,
+            None => {
+                self.peers.push(ExtendedDiscoveredPeer {
+                    address_type: r.address_type,
+                    address: r.address,
+                    primary_phy: r.primary_phy,
+                    secondary_phy: r.secondary_phy,
+                    sid: r.sid,
+                    tx_power: r.tx_power,
+                    periodic_interval: r.periodic_interval,
+                    last_rssi: r.rssi,
+                    event_type: r.event_type,
+                    ad_data: Vec::new(),
+                    data_truncated: false,
+                    reassembling: false,
+                    pending_fragments: Vec::new(),
+                });
+                self.peers.len() - 1
+            }
+        };
+        let peer = &mut self.peers[idx];
+        peer.primary_phy = r.primary_phy;
+        peer.secondary_phy = r.secondary_phy;
+        peer.tx_power = r.tx_power;
+        peer.periodic_interval = r.periodic_interval;
+        peer.last_rssi = r.rssi;
+        peer.event_type = r.event_type;
+        match r.data_status() {
+            Some(crate::event::ExtAdvDataStatus::IncompleteMoreToCome) => {
+                peer.pending_fragments.extend_from_slice(&r.data);
+                peer.reassembling = true;
+            }
+            Some(crate::event::ExtAdvDataStatus::IncompleteTruncated) | None => {
+                peer.ad_data = peer.pending_fragments.clone();
+                peer.ad_data.extend_from_slice(&r.data);
+                peer.pending_fragments.clear();
+                peer.reassembling = false;
+                peer.data_truncated = true;
+            }
+            Some(crate::event::ExtAdvDataStatus::Complete) => {
+                peer.ad_data = peer.pending_fragments.clone();
+                peer.ad_data.extend_from_slice(&r.data);
+                peer.pending_fragments.clear();
+                peer.reassembling = false;
+                peer.data_truncated = false;
+            }
+        }
+    }
+
+    /// Mark phase after the host has just emitted Set Extended Scan
+    /// Parameters.
+    pub fn note_parameters_sent(&mut self) {
+        self.phase = ExtendedScannerPhase::ParametersSent;
+    }
+
+    /// Mark phase after the host has just emitted Set Extended Scan
+    /// Enable(1).
+    pub fn note_scanning(&mut self) {
+        self.phase = ExtendedScannerPhase::Scanning;
+    }
+
+    /// Mark phase after the host has just emitted Set Extended Scan
+    /// Enable(0).
+    pub fn note_scan_stopping(&mut self) {
+        self.phase = ExtendedScannerPhase::ScanStopping;
+    }
+
+    /// Apply a failed scan-command completion — back to Idle.
+    pub fn note_failed(&mut self) {
+        self.phase = ExtendedScannerPhase::Idle;
+    }
+
+    /// Apply an LE Scan Timeout subevent (§7.7.65.17): the scan
+    /// duration expired, the controller stopped scanning on its own.
+    pub fn note_scan_timeout(&mut self) {
+        if self.phase == ExtendedScannerPhase::Scanning {
+            self.phase = ExtendedScannerPhase::Idle;
+        }
+    }
+}
+
+// ── Advertising-set state machine ─────────────────────────────────
+
+/// Phases one advertising set walks from creation to teardown.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum AdvertisingSetPhase {
+    /// Initial state: set not created (no parameters issued).
+    #[default]
+    Idle,
+    /// Set Extended Advertising Parameters issued, awaiting Command
+    /// Complete.
+    ParametersSent,
+    /// Parameters accepted; advertising data / scan response data /
+    /// enable are being issued in turn.
+    Configuring,
+    /// Set Extended Advertising Enable(enable=1) issued, awaiting
+    /// Command Complete.
+    Enabling,
+    /// Set Extended Advertising Enable(enable=1) completed; the
+    /// controller is advertising this set.
+    Advertising,
+    /// Set Extended Advertising Enable(enable=0) issued for this set.
+    Disabling,
+}
+
+/// One advertising set's host-side state. Transport-free like
+/// [`Central`]: the caller issues the HCI commands in the order
+/// parameters → data → (scan response) → enable and feeds completions
+/// and the Advertising Set Terminated subevent back in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdvertisingSet {
+    pub handle: u8,
+    pub phase: AdvertisingSetPhase,
+    /// Tx power the controller selected for the set (§7.8.53 return
+    /// params), once parameters complete.
+    pub selected_tx_power: Option<i8>,
+    /// Last Advertising Set Terminated subevent (§7.7.65.18):
+    /// (status, connection_handle, num_completed_events).
+    pub last_termination: Option<(u8, u16, u8)>,
+    /// Last Scan Request Received subevent (§7.7.65.19):
+    /// (scanner_address_type, scanner_address).
+    pub last_scan_request: Option<(u8, [u8; 6])>,
+}
+
+impl AdvertisingSet {
+    pub fn new(handle: u8) -> Self {
+        Self {
+            handle,
+            phase: AdvertisingSetPhase::Idle,
+            selected_tx_power: None,
+            last_termination: None,
+            last_scan_request: None,
+        }
+    }
+
+    /// Mark phase after the host has just emitted Set Extended
+    /// Advertising Parameters for this set.
+    pub fn note_parameters_sent(&mut self) {
+        self.phase = AdvertisingSetPhase::ParametersSent;
+    }
+
+    /// Apply the parameters' Command Complete. Status 0 advances to
+    /// Configuring (data/enable follow); any other status drops the
+    /// set back to Idle — the set was never created.
+    pub fn note_parameters_complete(&mut self, status: u8, selected_tx_power: i8) {
+        if status == 0 {
+            self.selected_tx_power = Some(selected_tx_power);
+            self.phase = AdvertisingSetPhase::Configuring;
+        } else {
+            self.phase = AdvertisingSetPhase::Idle;
+        }
+    }
+
+    /// Mark phase after the host has just emitted Set Extended
+    /// Advertising Enable(enable=1) for this set. The enable's
+    /// Command Complete advances the set via
+    /// [`AdvertisingSet::note_enable_complete`].
+    pub fn note_enabling(&mut self) {
+        self.phase = AdvertisingSetPhase::Enabling;
+    }
+
+    /// Apply the enable's Command Complete. Status 0 confirms
+    /// Advertising; any other status drops the set back to Idle.
+    pub fn note_enable_complete(&mut self, status: u8) {
+        if status == 0 {
+            self.phase = AdvertisingSetPhase::Advertising;
+        } else {
+            self.phase = AdvertisingSetPhase::Idle;
+        }
+    }
+
+    /// Mark phase after the host has just emitted Set Extended
+    /// Advertising Enable(enable=0) for this set.
+    pub fn note_disabling(&mut self) {
+        self.phase = AdvertisingSetPhase::Disabling;
+    }
+
+    /// Apply the disable's Command Complete. Status 0 confirms the
+    /// set stopped; a refused disable leaves the set Advertising —
+    /// the host must not claim it stopped.
+    pub fn note_disable_complete(&mut self, status: u8) {
+        if status == 0 {
+            self.phase = AdvertisingSetPhase::Idle;
+        } else {
+            self.phase = AdvertisingSetPhase::Advertising;
+        }
+    }
+
+    /// Apply any failed step while creating/configuring the set —
+    /// back to Idle, the set is not usable.
+    pub fn note_failed(&mut self) {
+        self.phase = AdvertisingSetPhase::Idle;
+    }
+
+    /// Apply an LE Advertising Set Terminated subevent (§7.7.65.18):
+    /// the controller ended the set (duration / max-events reached,
+    /// or a connection was created from it). Records the termination
+    /// and returns the set to Idle.
+    pub fn note_terminated(&mut self, status: u8, connection_handle: u16, num_completed: u8) {
+        self.last_termination = Some((status, connection_handle, num_completed));
+        self.phase = AdvertisingSetPhase::Idle;
+    }
+
+    /// Record an LE Scan Request Received subevent (§7.7.65.19): a
+    /// scanner asked this set for a scan response. Informational —
+    /// the phase is unchanged.
+    pub fn note_scan_request_received(
+        &mut self,
+        scanner_address_type: u8,
+        scanner_address: [u8; 6],
+    ) {
+        self.last_scan_request = Some((scanner_address_type, scanner_address));
+    }
 }

@@ -260,8 +260,30 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   disables the scan first and issues LE Create Connection (§7.8.12) on
   the disable completion (or directly from Idle), and LE Connection
   Complete lands the connection like any other pump connection.
-  `pump::central_phase` exposes the initiator phase. Pairing
-  initiation (issue #888) is `pump::smp_initiate_pairing` (LE
+  `pump::central_phase` exposes the initiator phase. GAP extended
+  advertising / scanning (issue #823): `pump::ext_central_start_scan(index,
+  params)` issues LE Set Extended Scan Parameters (§7.8.64) with LE
+  Set Extended Scan Enable(1) (§7.8.65) following on completion; LE
+  Extended Advertising Reports (§7.7.65.13) received while scanning
+  feed the `gap::ExtendedScanner` peer table (`pump::ext_central_peers`)
+  with fragment reassembly per (address, SID), and LE Scan Timeout
+  (§7.7.65.17) ends the scan on its own. `pump::ext_adv_start(index,
+  params, data, scan_response)` drives one advertising set through
+  Set Extended Advertising Parameters (§7.8.53) → Set Extended
+  Advertising Data (§7.8.54) → optional Set Extended Scan Response
+  Data (§7.8.55) → Set Extended Advertising Enable(1) (§7.8.56),
+  each step only on the previous step's Command Complete; the
+  controller-selected Tx power lands on the set
+  (`pump::ext_adv_selected_tx_power`), LE Advertising Set Terminated
+  (§7.7.65.18) and LE Scan Request Received (§7.7.65.19) land on the
+  set's host-side state, and `pump::ext_adv_stop` disables a set.
+  `gap::supports_extended_advertising` is the §7.8.3 bit-12 capability
+  gate (LE Read Local Supported Features, octet 1 bit 4) the host must
+  check before issuing extended commands. Out of scope here: periodic
+  advertising (§7.8.61..63) and LE Extended Create Connection (§7.8.66)
+  — follow-ups to #823 — and any mgmt/userspace trigger for these
+  calls (future lane).
+  Pairing initiation (issue #888) is `pump::smp_initiate_pairing` (LE
   Just Works initiator + bond store); host-initiated disconnect
   remains out of scope (no backend — the mgmt DISCONNECT
   remainder).

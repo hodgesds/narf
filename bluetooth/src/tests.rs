@@ -1741,6 +1741,277 @@ fn smoke_hci_le_advertising_report_parse() -> TestResult {
 }
 kernel_test_in!("bluetooth/hci", smoke_hci_le_advertising_report_parse);
 
+fn smoke_hci_le_ext_adv_report_parse_two_reports() -> TestResult {
+    use crate::event::{parse_le_extended_advertising_reports, ExtAdvDataStatus};
+    use crate::hci::Event;
+    // Two reports in one LE Meta event (§7.7.65.13), bytes pinned
+    // against the spec layout — not against the parser under test.
+    // Report 1: legacy ADV_IND, complete, no ADI (SID 0xFF), Tx
+    // power / periodic interval sentinels. Report 2: extended
+    // connectable+scannable on LE Coded primary / LE 2M secondary,
+    // SID 0x07, periodic interval 0x0080, directed at a public
+    // address.
+    let p = vec![
+        0x0Du8, // subevent = ExtendedAdvertisingReport
+        0x02,   // num_reports
+        // Report 1: Event_Type 0x0010 (legacy, data status complete).
+        0x10, 0x00, // event_type LE
+        0x00, // address type = public
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, // address
+        0x01, // primary PHY = LE 1M
+        0x00, // secondary PHY = no packets
+        0xFF, // SID = no ADI field
+        0x7F, // Tx power = unavailable
+        0xC4, // RSSI = -60
+        0x00, 0x00, // periodic interval = none
+        0xFF, // direct address type = none
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // direct address
+        0x03, // data length
+        0x02, 0x01, 0x06, // AD record: Flags=0x06
+        // Report 2: Event_Type 0x0003 (connectable + scannable).
+        0x03, 0x00, // event_type LE
+        0x01, // address type = random
+        0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, // address
+        0x03, // primary PHY = LE Coded
+        0x02, // secondary PHY = LE 2M
+        0x07, // SID
+        0xF6, // Tx power = -10 dBm
+        0xBA, // RSSI = -70 dBm
+        0x80, 0x00, // periodic interval = 0x0080
+        0x00, // direct address type = public
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // direct address
+        0x05, // data length
+        0x05, 0x09, b'N', b'A', b'R', // AD record: complete name "NAR"
+    ];
+    let event = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: p,
+    };
+    let reports = parse_le_extended_advertising_reports(&event).expect("parse");
+    if reports.len() != 2 {
+        return TestResult::Fail("expected 2 reports");
+    }
+    let r1 = &reports[0];
+    if r1.event_type != 0x0010
+        || !r1.is_legacy()
+        || r1.data_status() != Some(ExtAdvDataStatus::Complete)
+    {
+        return TestResult::Fail("report 1 event type / legacy / status wrong");
+    }
+    if r1.address != [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5] || r1.sid != 0xFF {
+        return TestResult::Fail("report 1 address / SID wrong");
+    }
+    if r1.tx_power != 0x7F || r1.rssi != -60 || r1.periodic_interval != 0 {
+        return TestResult::Fail("report 1 Tx power / RSSI / interval wrong");
+    }
+    if r1.data != [0x02, 0x01, 0x06] {
+        return TestResult::Fail("report 1 AD bytes wrong");
+    }
+    let r2 = &reports[1];
+    if r2.event_type != 0x0003 || r2.is_legacy() {
+        return TestResult::Fail("report 2 event type / legacy wrong");
+    }
+    if r2.primary_phy != 0x03 || r2.secondary_phy != 0x02 || r2.sid != 0x07 {
+        return TestResult::Fail("report 2 PHYs / SID wrong");
+    }
+    if r2.tx_power != -10 || r2.rssi != -70 || r2.periodic_interval != 0x0080 {
+        return TestResult::Fail("report 2 Tx power / RSSI / interval wrong");
+    }
+    if r2.direct_address_type != 0x00 || r2.direct_address != [0x01, 0x02, 0x03, 0x04, 0x05, 0x06] {
+        return TestResult::Fail("report 2 direct address wrong");
+    }
+    if r2.data != [0x05, 0x09, b'N', b'A', b'R'] {
+        return TestResult::Fail("report 2 AD bytes wrong");
+    }
+    // Data-status decoding from Event_Type bits 5..6: 0x0040 is
+    // truncated, 0x0020 is more-to-come, 0x0060 is reserved.
+    if ExtAdvDataStatus::from_event_type(0x0040) != Some(ExtAdvDataStatus::IncompleteTruncated) {
+        return TestResult::Fail("0x0040 should decode as truncated");
+    }
+    if ExtAdvDataStatus::from_event_type(0x0020) != Some(ExtAdvDataStatus::IncompleteMoreToCome) {
+        return TestResult::Fail("0x0020 should decode as more-to-come");
+    }
+    if ExtAdvDataStatus::from_event_type(0x0060).is_some() {
+        return TestResult::Fail("0x0060 (reserved status) should decode as None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/hci",
+    smoke_hci_le_ext_adv_report_parse_two_reports
+);
+
+fn smoke_hci_le_ext_adv_report_malformed_rejected() -> TestResult {
+    use crate::event::parse_le_extended_advertising_reports;
+    use crate::hci::Event;
+    // Wrong subevent: legacy advertising report (0x02) is not an
+    // extended report.
+    let not_ext = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: vec![0x02, 0x01, 0x00, 0x00],
+    };
+    if parse_le_extended_advertising_reports(&not_ext).is_some() {
+        return TestResult::Fail("legacy subevent must not parse as extended report");
+    }
+    // Wrong event code entirely.
+    let not_meta = Event {
+        code: crate::event::EventCode::CommandComplete as u8,
+        params: vec![0x0D, 0x01],
+    };
+    if parse_le_extended_advertising_reports(&not_meta).is_some() {
+        return TestResult::Fail("non-LE-Meta event must not parse");
+    }
+    // Header truncated mid-report (10 bytes of the 24-byte fixed
+    // header present).
+    let short_header = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: vec![
+            0x0D, 0x01, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01,
+        ],
+    };
+    if parse_le_extended_advertising_reports(&short_header).is_some() {
+        return TestResult::Fail("truncated report header must not parse");
+    }
+    // Data_Length overruns the event: header complete, length says
+    // 10, only 3 bytes follow.
+    let mut p = vec![0x0Du8, 0x01];
+    p.extend_from_slice(&[0x00, 0x00, 0x00]); // event_type + addr type
+    p.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // address
+    p.extend_from_slice(&[0x01, 0x01, 0x00, 0x7F, 0xC4]); // phys, sid, tx, rssi
+    p.extend_from_slice(&[0x00, 0x00]); // periodic interval
+    p.push(0xFF); // direct addr type
+    p.extend_from_slice(&[0x00; 6]); // direct address
+    p.push(0x0A); // data length = 10, but only 3 bytes follow
+    p.extend_from_slice(&[0x02, 0x01, 0x06]);
+    let overrun = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: p,
+    };
+    if parse_le_extended_advertising_reports(&overrun).is_some() {
+        return TestResult::Fail("data-length overrun must not parse");
+    }
+    // Num_Reports=2 but only one report present.
+    let one_of_two = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: vec![
+            0x0D, 0x02, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01, 0x01, 0x00,
+            0x7F, 0xC4, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ],
+    };
+    if parse_le_extended_advertising_reports(&one_of_two).is_some() {
+        return TestResult::Fail("missing second report must not parse");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/hci",
+    smoke_hci_le_ext_adv_report_malformed_rejected
+);
+
+fn smoke_hci_le_ext_adv_set_terminated_and_scan_events() -> TestResult {
+    use crate::event::{LeAdvertisingSetTerminated, LeScanRequestReceived, LeScanTimeout};
+    use crate::hci::Event;
+    // §7.7.65.18: subevent, status, handle, connection handle LE,
+    // num completed events. Handle field is masked to 12 bits.
+    let term = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: vec![0x12, 0x00, 0x02, 0x34, 0x12, 0x07],
+    };
+    let t = LeAdvertisingSetTerminated::parse(&term).expect("parse terminated");
+    if t.status != 0x00
+        || t.handle != 0x02
+        || t.connection_handle != 0x0234
+        || t.num_completed_events != 0x07
+    {
+        return TestResult::Fail("Advertising Set Terminated fields wrong");
+    }
+    // Truncated terminated event must not parse.
+    let short = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: vec![0x12, 0x00],
+    };
+    if LeAdvertisingSetTerminated::parse(&short).is_some() {
+        return TestResult::Fail("truncated terminated event must not parse");
+    }
+    // §7.7.65.19: subevent, handle, scanner address type, scanner
+    // address.
+    let req = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: vec![0x13, 0x01, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+    };
+    let r = LeScanRequestReceived::parse(&req).expect("parse scan request");
+    if r.handle != 0x01
+        || r.scanner_address_type != 0x01
+        || r.scanner_address != [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
+    {
+        return TestResult::Fail("Scan Request Received fields wrong");
+    }
+    // §7.7.65.17: subevent only, no parameters.
+    let timeout = Event {
+        code: crate::event::EventCode::LeMeta as u8,
+        params: vec![0x11],
+    };
+    if LeScanTimeout::parse(&timeout).is_none() {
+        return TestResult::Fail("Scan Timeout should parse");
+    }
+    if LeScanTimeout::parse(&term).is_some() {
+        return TestResult::Fail("terminated event must not parse as timeout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/hci",
+    smoke_hci_le_ext_adv_set_terminated_and_scan_events
+);
+
+fn smoke_hci_le_ext_adv_return_params() -> TestResult {
+    use crate::event::{
+        parse_ext_adv_selected_tx_power, parse_max_adv_data_length, parse_num_supported_adv_sets,
+        CommandComplete,
+    };
+    use crate::opcode as op;
+    // §7.8.53: Status + Selected_Tx_Power (-10 dBm).
+    let cc = CommandComplete {
+        num_hci_command_packets: 1,
+        opcode: op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS,
+        return_params: &[0x00, 0xF6],
+    };
+    if parse_ext_adv_selected_tx_power(&cc) != Some(-10) {
+        return TestResult::Fail("selected Tx power decode wrong");
+    }
+    // §7.8.57: Status + Maximum_Advertising_Data_Length (251).
+    let cc = CommandComplete {
+        num_hci_command_packets: 1,
+        opcode: op::HCI_LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH,
+        return_params: &[0x00, 0xFB, 0x00],
+    };
+    if parse_max_adv_data_length(&cc) != Some(251) {
+        return TestResult::Fail("max advertising data length decode wrong");
+    }
+    // §7.8.58: Status + Num_Supported_Advertising_Sets (8).
+    let cc = CommandComplete {
+        num_hci_command_packets: 1,
+        opcode: op::HCI_LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS,
+        return_params: &[0x00, 0x08],
+    };
+    if parse_num_supported_adv_sets(&cc) != Some(8) {
+        return TestResult::Fail("num supported advertising sets decode wrong");
+    }
+    // Too-short return params decode to None, never a guessed value.
+    let short = CommandComplete {
+        num_hci_command_packets: 1,
+        opcode: op::HCI_LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH,
+        return_params: &[0x00],
+    };
+    if parse_max_adv_data_length(&short).is_some()
+        || parse_ext_adv_selected_tx_power(&short).is_some()
+    {
+        return TestResult::Fail("short return params must decode to None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hci", smoke_hci_le_ext_adv_return_params);
+
 // ── GAP Central — scan + connect command builders + state ──────────
 
 fn smoke_gap_scan_parameters_encoding() -> TestResult {
@@ -1879,6 +2150,406 @@ kernel_test_in!(
     "bluetooth/gap",
     smoke_gap_central_state_machine_walks_scan_connect
 );
+
+// ── LE extended advertising / scanning (#823) ──────────────────────
+
+fn smoke_opcode_extended_advertising_scan_values() -> TestResult {
+    use crate::opcode as op;
+    // Vol 4 Part E §7.8.52..60, §7.8.64/65: OGF 0x08 + OCF.
+    let expect: [(u16, u16); 11] = [
+        (op::HCI_LE_SET_ADVERTISING_SET_RANDOM_ADDRESS, 0x2035),
+        (op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS, 0x2036),
+        (op::HCI_LE_SET_EXTENDED_ADVERTISING_DATA, 0x2037),
+        (op::HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA, 0x2038),
+        (op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE, 0x2039),
+        (op::HCI_LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH, 0x203A),
+        (op::HCI_LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS, 0x203B),
+        (op::HCI_LE_REMOVE_ADVERTISING_SET, 0x203C),
+        (op::HCI_LE_CLEAR_ADVERTISING_SETS, 0x203D),
+        (op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS, 0x2041),
+        (op::HCI_LE_SET_EXTENDED_SCAN_ENABLE, 0x2042),
+    ];
+    for (got, want) in expect {
+        if got != want {
+            return TestResult::Fail("extended opcode value mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gap",
+    smoke_opcode_extended_advertising_scan_values
+);
+
+fn smoke_gap_ext_adv_parameters_encoding() -> TestResult {
+    use crate::gap::{
+        AdvertisingFilterPolicy, ExtendedAdvertisingParameters, LePhy, OwnAddressType,
+        PeerAddressType, ADV_PROP_CONNECTABLE, ADV_PROP_INCLUDE_TX_POWER, ADV_PROP_SCANNABLE,
+    };
+    let p = ExtendedAdvertisingParameters {
+        handle: 0x02,
+        event_properties: ADV_PROP_CONNECTABLE | ADV_PROP_SCANNABLE | ADV_PROP_INCLUDE_TX_POWER,
+        primary_interval_min: 0x000080,
+        primary_interval_max: 0x000100,
+        primary_channel_map: 0x07,
+        own_address_type: OwnAddressType::Random,
+        peer_address_type: PeerAddressType::Random,
+        peer_address: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+        filter_policy: AdvertisingFilterPolicy::ConnectListOnly,
+        tx_power: -12,
+        primary_phy: LePhy::Coded,
+        secondary_max_skip: 0x02,
+        secondary_phy: LePhy::TwoM,
+        sid: 0x05,
+        scan_request_notification: true,
+    };
+    // Pinned byte-for-byte against Vol 4 Part E §7.8.53: handle,
+    // properties LE, 24-bit intervals LE, channel map, address
+    // types, peer address, filter policy, Tx power, PHYs, SID,
+    // scan-request notification.
+    let expect: [u8; 25] = [
+        0x02, 0x43, 0x00, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x07, 0x01, 0x01, 0xAA, 0xBB, 0xCC,
+        0xDD, 0xEE, 0xFF, 0x02, 0xF4, 0x03, 0x02, 0x02, 0x05, 0x01,
+    ];
+    if p.encode() != expect {
+        return TestResult::Fail("Set Extended Advertising Parameters bytes mismatch");
+    }
+    // Default is the legacy-equivalent connectable set on all three
+    // primary channels at 100 ms, controller-chosen Tx power.
+    let d = ExtendedAdvertisingParameters::default();
+    let raw = d.encode();
+    if raw.len() != 25 || raw[0] != 0x00 || u16::from_le_bytes([raw[1], raw[2]]) != 0x0013 {
+        return TestResult::Fail("default extended advertising parameters wrong");
+    }
+    if raw[3..6] != [0xA0, 0x00, 0x00] || raw[9] != 0x07 || raw[19] != 0x7F {
+        return TestResult::Fail("default intervals / channel map / Tx power wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_ext_adv_parameters_encoding);
+
+fn smoke_gap_ext_adv_data_encoding() -> TestResult {
+    use crate::gap::{AdvertisingDataOperation, ExtendedAdvertisingData, FragmentPreference};
+    let data: [u8; 9] = [0x02, 0x01, 0x06, 0x05, 0x09, b'N', b'A', b'R', b'F'];
+    let enc = ExtendedAdvertisingData {
+        handle: 0x00,
+        operation: AdvertisingDataOperation::Complete,
+        fragment_preference: FragmentPreference::MinimizeFragmentation,
+        data: &data,
+    }
+    .encode();
+    // §7.8.54: handle, operation=Complete (0x03), fragment
+    // preference=Minimize (0x01), length, data.
+    let expect: [u8; 13] = [
+        0x00, 0x03, 0x01, 0x09, 0x02, 0x01, 0x06, 0x05, 0x09, b'N', b'A', b'R', b'F',
+    ];
+    if enc != expect {
+        return TestResult::Fail("Set Extended Advertising Data bytes mismatch");
+    }
+    // First fragment of a split payload carries operation 0x01.
+    let first = ExtendedAdvertisingData {
+        handle: 0x01,
+        operation: AdvertisingDataOperation::First,
+        fragment_preference: FragmentPreference::MayFragment,
+        data: &[0x02, 0x01, 0x06],
+    }
+    .encode();
+    if first != [0x01, 0x01, 0x00, 0x03, 0x02, 0x01, 0x06] {
+        return TestResult::Fail("first-fragment advertising data bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_ext_adv_data_encoding);
+
+fn smoke_gap_ext_adv_enable_encoding() -> TestResult {
+    use crate::gap::ExtendedAdvertisingEnable;
+    let enc = ExtendedAdvertisingEnable {
+        enable: true,
+        sets: &[(0x00, 0x0000, 0x00), (0x01, 0x0064, 0x05)],
+    }
+    .encode();
+    // §7.8.56: Enable(1), Number_of_Sets(2), then per set handle /
+    // Duration LE / Max_Extended_Advertising_Events.
+    let expect: [u8; 10] = [0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x05];
+    if enc != expect {
+        return TestResult::Fail("Set Extended Advertising Enable bytes mismatch");
+    }
+    if ExtendedAdvertisingEnable::disable_all() != [0x00, 0x00] {
+        return TestResult::Fail("disable-all should be [Enable=0, NumSets=0]");
+    }
+    if ExtendedAdvertisingEnable::enable_one(0x02) != [0x01, 0x01, 0x02, 0x00, 0x00, 0x00] {
+        return TestResult::Fail("enable_one bytes wrong");
+    }
+    if ExtendedAdvertisingEnable::disable_one(0x02) != [0x00, 0x01, 0x02, 0x00, 0x00, 0x00] {
+        return TestResult::Fail("disable_one bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_ext_adv_enable_encoding);
+
+fn smoke_gap_ext_adv_set_random_address_encoding() -> TestResult {
+    use crate::gap::AdvertisingSetRandomAddress;
+    let enc = AdvertisingSetRandomAddress {
+        handle: 0x01,
+        address: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+    }
+    .encode();
+    // §7.8.52: handle + 6-byte random address.
+    if enc != [0x01, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66] {
+        return TestResult::Fail("Set Advertising Set Random Address bytes mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gap",
+    smoke_gap_ext_adv_set_random_address_encoding
+);
+
+fn smoke_gap_ext_scan_parameters_encoding() -> TestResult {
+    use crate::gap::{
+        ExtendedScanParameters, ExtendedScanPhyParams, OwnAddressType, ScanFilterPolicy, ScanType,
+    };
+    // Default: 1M only, passive 30 ms / 30 ms, public, accept-all.
+    let raw = ExtendedScanParameters::default().encode();
+    // §7.8.64: own address type, filter policy, Scanning_PHYs=0x01,
+    // then one 5-byte per-PHY entry.
+    if raw != [0x00, 0x00, 0x01, 0x00, 0x30, 0x00, 0x30, 0x00] {
+        return TestResult::Fail("default extended scan parameters bytes wrong");
+    }
+    // Dual PHY: 1M active + Coded passive. Scanning_PHYs is 0x05
+    // (bit 0 = 1M, bit 2 = Coded; 0x02 2M is not a scanning PHY),
+    // entries in ascending bit order: 1M first, then Coded.
+    let p = ExtendedScanParameters {
+        own_address_type: OwnAddressType::Random,
+        scanning_filter_policy: ScanFilterPolicy::AcceptListOnly,
+        phys_1m: Some(ExtendedScanPhyParams {
+            scan_type: ScanType::Active,
+            scan_interval: 0x0012,
+            scan_window: 0x0012,
+        }),
+        phys_coded: Some(ExtendedScanPhyParams {
+            scan_type: ScanType::Passive,
+            scan_interval: 0x0040,
+            scan_window: 0x0020,
+        }),
+    };
+    let expect: [u8; 13] = [
+        0x01, 0x01, 0x05, 0x01, 0x12, 0x00, 0x12, 0x00, 0x00, 0x40, 0x00, 0x20, 0x00,
+    ];
+    if p.encode() != expect {
+        return TestResult::Fail("dual-PHY extended scan parameters bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_ext_scan_parameters_encoding);
+
+fn smoke_gap_ext_scan_enable_encoding() -> TestResult {
+    use crate::gap::{ExtendedDuplicateFilter, ExtendedScanEnable};
+    let raw = ExtendedScanEnable {
+        enable: true,
+        filter_duplicates: ExtendedDuplicateFilter::EnabledResetEachPeriod,
+        duration: 0x00C8,
+        period: 0x0005,
+    }
+    .encode();
+    // §7.8.65: Enable(1), Filter_Duplicates(0x02), Duration LE
+    // (2000 ms), Period LE.
+    if raw != [0x01, 0x02, 0xC8, 0x00, 0x05, 0x00] {
+        return TestResult::Fail("Set Extended Scan Enable bytes mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_ext_scan_enable_encoding);
+
+fn smoke_gap_le_features_extended_advertising_bit() -> TestResult {
+    use crate::gap::supports_extended_advertising;
+    // §7.8.3 bit 12: octet 1, bit 4 (0x10).
+    let mut f = [0u8; 8];
+    if supports_extended_advertising(&f) {
+        return TestResult::Fail("zero features must not claim extended advertising");
+    }
+    f[1] = 0x10;
+    if !supports_extended_advertising(&f) {
+        return TestResult::Fail("octet 1 bit 4 must claim extended advertising");
+    }
+    // Periodic advertising alone (octet 1 bit 5) is not extended
+    // advertising; an all-ones octet 0 is not either.
+    f = [0xFF, 0x20, 0, 0, 0, 0, 0, 0];
+    if supports_extended_advertising(&f) {
+        return TestResult::Fail("periodic-only features must not claim extended advertising");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gap",
+    smoke_gap_le_features_extended_advertising_bit
+);
+
+fn smoke_gap_ext_scanner_state_machine() -> TestResult {
+    use crate::gap::{ExtendedScanner, ExtendedScannerPhase};
+    let mut s = ExtendedScanner::new();
+    if s.phase != ExtendedScannerPhase::Idle {
+        return TestResult::Fail("extended scanner starts at Idle");
+    }
+    s.note_parameters_sent();
+    if s.phase != ExtendedScannerPhase::ParametersSent {
+        return TestResult::Fail("phase did not advance to ParametersSent");
+    }
+    s.note_scanning();
+    if s.phase != ExtendedScannerPhase::Scanning {
+        return TestResult::Fail("phase did not advance to Scanning");
+    }
+    // A scan timeout from Scanning ends the scan on its own.
+    s.note_scan_timeout();
+    if s.phase != ExtendedScannerPhase::Idle {
+        return TestResult::Fail("scan timeout should return to Idle");
+    }
+    // A timeout while Idle is a no-op, not a phase jump.
+    s.note_scan_timeout();
+    if s.phase != ExtendedScannerPhase::Idle {
+        return TestResult::Fail("scan timeout from Idle moved phase");
+    }
+    s.note_scanning();
+    s.note_scan_stopping();
+    if s.phase != ExtendedScannerPhase::ScanStopping {
+        return TestResult::Fail("phase did not advance to ScanStopping");
+    }
+    s.note_failed();
+    if s.phase != ExtendedScannerPhase::Idle {
+        return TestResult::Fail("failed scan command should return to Idle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_ext_scanner_state_machine);
+
+fn smoke_gap_adv_set_state_machine() -> TestResult {
+    use crate::gap::{AdvertisingSet, AdvertisingSetPhase};
+    let mut s = AdvertisingSet::new(0x02);
+    if s.phase != AdvertisingSetPhase::Idle || s.selected_tx_power.is_some() {
+        return TestResult::Fail("advertising set starts Idle with no Tx power");
+    }
+    s.note_parameters_sent();
+    if s.phase != AdvertisingSetPhase::ParametersSent {
+        return TestResult::Fail("phase did not advance to ParametersSent");
+    }
+    // Failed parameters completion drops the set: never created.
+    s.note_parameters_complete(0x05, 0);
+    if s.phase != AdvertisingSetPhase::Idle {
+        return TestResult::Fail("failed parameters should return to Idle");
+    }
+    s.note_parameters_sent();
+    s.note_parameters_complete(0x00, -8);
+    if s.phase != AdvertisingSetPhase::Configuring || s.selected_tx_power != Some(-8) {
+        return TestResult::Fail("parameters complete should record Tx power + Configuring");
+    }
+    s.note_enabling();
+    if s.phase != AdvertisingSetPhase::Enabling {
+        return TestResult::Fail("phase did not advance to Enabling");
+    }
+    s.note_enable_complete(0x00);
+    if s.phase != AdvertisingSetPhase::Advertising {
+        return TestResult::Fail("enable complete should reach Advertising");
+    }
+    // A refused disable leaves the set Advertising — the host must
+    // not claim it stopped.
+    s.note_disabling();
+    s.note_disable_complete(0x0C);
+    if s.phase != AdvertisingSetPhase::Advertising {
+        return TestResult::Fail("refused disable should stay Advertising");
+    }
+    s.note_disabling();
+    s.note_disable_complete(0x00);
+    if s.phase != AdvertisingSetPhase::Idle {
+        return TestResult::Fail("accepted disable should reach Idle");
+    }
+    // Termination records the outcome and returns to Idle.
+    s.note_parameters_sent();
+    s.note_parameters_complete(0x00, 0);
+    s.note_enabling();
+    s.note_enable_complete(0x00);
+    s.note_terminated(0x00, 0x0042, 3);
+    if s.phase != AdvertisingSetPhase::Idle || s.last_termination != Some((0x00, 0x0042, 3)) {
+        return TestResult::Fail("termination should record outcome + Idle");
+    }
+    // Scan-request receipt is informational only.
+    s.note_scan_request_received(0x01, [1, 2, 3, 4, 5, 6]);
+    if s.last_scan_request != Some((0x01, [1, 2, 3, 4, 5, 6]))
+        || s.phase != AdvertisingSetPhase::Idle
+    {
+        return TestResult::Fail("scan request should record scanner, not move phase");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_adv_set_state_machine);
+
+fn smoke_gap_ext_scanner_reassembly() -> TestResult {
+    use crate::event::LeExtendedAdvertisingReport;
+    use crate::gap::ExtendedScanner;
+    // Build one report for peer A / SID 0x03 with the given
+    // Event_Type and data bytes.
+    fn report(event_type: u16, sid: u8, data: &[u8]) -> LeExtendedAdvertisingReport {
+        LeExtendedAdvertisingReport {
+            event_type,
+            address_type: 0x00,
+            address: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            primary_phy: 0x01,
+            secondary_phy: 0x02,
+            sid,
+            tx_power: -10,
+            periodic_interval: 0,
+            direct_address_type: 0xFF,
+            direct_address: [0; 6],
+            data: data.to_vec(),
+            rssi: -60,
+        }
+    }
+    let mut s = ExtendedScanner::new();
+    s.note_scanning();
+    // Fragment 1 of A/0x03: connectable + more-to-come (0x0021).
+    s.report(&report(0x0021, 0x03, &[0x02, 0x01, 0x06]));
+    if s.peers.len() != 1 {
+        return TestResult::Fail("first fragment should create the peer");
+    }
+    let a = &s.peers[0];
+    if !a.ad_data.is_empty() || !a.reassembling || a.data_truncated {
+        return TestResult::Fail("first fragment must pend, not publish");
+    }
+    if a.pending_fragments != [0x02, 0x01, 0x06] {
+        return TestResult::Fail("pending fragments wrong after first fragment");
+    }
+    // Fragment 2: complete (0x0001). Publishes the reassembled data.
+    s.report(&report(0x0001, 0x03, &[0x05, 0x09, b'N', b'A', b'R', b'F']));
+    let a = &s.peers[0];
+    if a.ad_data != [0x02, 0x01, 0x06, 0x05, 0x09, b'N', b'A', b'R', b'F']
+        || a.reassembling
+        || a.data_truncated
+        || !a.pending_fragments.is_empty()
+    {
+        return TestResult::Fail("complete fragment should publish reassembled data");
+    }
+    // Truncated report for the same set: partial data, terminal.
+    s.report(&report(0x0040, 0x03, &[0x02, 0x01, 0x06]));
+    let a = &s.peers[0];
+    if a.ad_data != [0x02, 0x01, 0x06] || !a.data_truncated || a.reassembling {
+        return TestResult::Fail("truncated report should publish partial data");
+    }
+    // Same address, different SID: a distinct set, never mixed into
+    // the first set's reassembly.
+    s.report(&report(0x0001, 0x04, &[0x09]));
+    if s.peers.len() != 2 || s.peers[1].sid != 0x04 || s.peers[1].ad_data != [0x09] {
+        return TestResult::Fail("different SID must be a distinct peer");
+    }
+    // Reserved data status (0x0060) is treated as truncated, never
+    // trusted as complete.
+    let mut other = report(0x0060, 0x03, &[0x07]);
+    other.address = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    s.report(&other);
+    if s.peers.len() != 3 || !s.peers[2].data_truncated || s.peers[2].ad_data != [0x07] {
+        return TestResult::Fail("reserved data status must be treated as truncated");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_ext_scanner_reassembly);
 
 fn smoke_transport_registry_round_trip() -> TestResult {
     crate::transport::__test_reset();

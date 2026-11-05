@@ -201,6 +201,47 @@ pub const HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC_CANCEL: u16 = opcode(OGF_LE_CO
 /// HCI_LE_Periodic_Advertising_Terminate_Sync (§7.8.69). 2-byte
 /// parameter: sync_handle (2 LE).
 pub const HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC: u16 = opcode(OGF_LE_CONTROLLER, 0x0046);
+// ── LE Extended Advertising (§7.8.52..7.8.60) ──────────────────────
+//
+// Bluetooth 5 advertising sets (issue #823). OCFs 0x0035..0x003D
+// per Vol 4 Part E §7.8.52..60; opcode values cross-checked against
+// the Linux kernel header `include/net/bluetooth/hci.h`
+// (HCI_OP_LE_SET_EXT_ADV_PARAMS 0x2036 .. HCI_OP_LE_CLEAR_ADV_SETS
+// 0x203d) and the STM32 AN5270 HCI command table. Periodic
+// advertising (§7.8.61..63, OCF 0x003E..0x0040) lives in the block
+// above; LE Extended Create Connection (§7.8.66, OCF 0x0043) is
+// deliberately NOT here: extended connection establishment is out of
+// scope for #823; it is a follow-up issue.
+
+/// HCI_LE_Set_Advertising_Set_Random_Address (§7.8.52). 7-byte
+/// param: advertising_handle (1) + random_address (6).
+pub const HCI_LE_SET_ADVERTISING_SET_RANDOM_ADDRESS: u16 = opcode(OGF_LE_CONTROLLER, 0x0035);
+/// HCI_LE_Set_Extended_Advertising_Parameters (§7.8.53). 25-byte param.
+pub const HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS: u16 = opcode(OGF_LE_CONTROLLER, 0x0036);
+/// HCI_LE_Set_Extended_Advertising_Data (§7.8.54).
+pub const HCI_LE_SET_EXTENDED_ADVERTISING_DATA: u16 = opcode(OGF_LE_CONTROLLER, 0x0037);
+/// HCI_LE_Set_Extended_Scan_Response_Data (§7.8.55).
+pub const HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA: u16 = opcode(OGF_LE_CONTROLLER, 0x0038);
+/// HCI_LE_Set_Extended_Advertising_Enable (§7.8.56).
+pub const HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE: u16 = opcode(OGF_LE_CONTROLLER, 0x0039);
+/// HCI_LE_Read_Maximum_Advertising_Data_Length (§7.8.57). No params;
+/// returns Status + Maximum_Advertising_Data_Length (2 LE).
+pub const HCI_LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH: u16 = opcode(OGF_LE_CONTROLLER, 0x003A);
+/// HCI_LE_Read_Number_Of_Supported_Advertising_Sets (§7.8.58). No
+/// params; returns Status + Num_Supported_Advertising_Sets (1).
+pub const HCI_LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS: u16 = opcode(OGF_LE_CONTROLLER, 0x003B);
+/// HCI_LE_Remove_Advertising_Set (§7.8.59). 1-byte param:
+/// advertising_handle.
+pub const HCI_LE_REMOVE_ADVERTISING_SET: u16 = opcode(OGF_LE_CONTROLLER, 0x003C);
+/// HCI_LE_Clear_Advertising_Sets (§7.8.60). No params.
+pub const HCI_LE_CLEAR_ADVERTISING_SETS: u16 = opcode(OGF_LE_CONTROLLER, 0x003D);
+
+// ── LE Extended Scanning (§7.8.64, §7.8.65) ───────────────────────
+/// HCI_LE_Set_Extended_Scan_Parameters (§7.8.64). Variable length:
+/// 3-byte header + 5 bytes per scanning PHY.
+pub const HCI_LE_SET_EXTENDED_SCAN_PARAMETERS: u16 = opcode(OGF_LE_CONTROLLER, 0x0041);
+/// HCI_LE_Set_Extended_Scan_Enable (§7.8.65). 6-byte param.
+pub const HCI_LE_SET_EXTENDED_SCAN_ENABLE: u16 = opcode(OGF_LE_CONTROLLER, 0x0042);
 
 // ── LE Filter Accept List (§7.8.14..16) ───────────────────────────
 /// HCI_LE_Add_Device_To_Filter_Accept_List (§7.8.16).
@@ -283,4 +324,26 @@ mod selftest_ext {
     const _: () = assert!(HCI_WRITE_LE_HOST_SUPPORT == 0x0C6D);
     // §7.3.76: OGF=0x03 OCF=0x007A → 0x0C7A.
     const _: () = assert!(HCI_WRITE_SECURE_CONNECTIONS_HOST_SUPPORT == 0x0C7A);
+    // §7.8.52: OGF=0x08 OCF=0x0035 → 0x2035.
+    const _: () = assert!(HCI_LE_SET_ADVERTISING_SET_RANDOM_ADDRESS == 0x2035);
+    // §7.8.53: OGF=0x08 OCF=0x0036 → 0x2036.
+    const _: () = assert!(HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS == 0x2036);
+    // §7.8.54: OGF=0x08 OCF=0x0037 → 0x2037.
+    const _: () = assert!(HCI_LE_SET_EXTENDED_ADVERTISING_DATA == 0x2037);
+    // §7.8.55: OGF=0x08 OCF=0x0038 → 0x2038.
+    const _: () = assert!(HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA == 0x2038);
+    // §7.8.56: OGF=0x08 OCF=0x0039 → 0x2039.
+    const _: () = assert!(HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE == 0x2039);
+    // §7.8.57: OGF=0x08 OCF=0x003A → 0x203A.
+    const _: () = assert!(HCI_LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH == 0x203A);
+    // §7.8.58: OGF=0x08 OCF=0x003B → 0x203B.
+    const _: () = assert!(HCI_LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS == 0x203B);
+    // §7.8.59: OGF=0x08 OCF=0x003C → 0x203C.
+    const _: () = assert!(HCI_LE_REMOVE_ADVERTISING_SET == 0x203C);
+    // §7.8.60: OGF=0x08 OCF=0x003D → 0x203D.
+    const _: () = assert!(HCI_LE_CLEAR_ADVERTISING_SETS == 0x203D);
+    // §7.8.64: OGF=0x08 OCF=0x0041 → 0x2041.
+    const _: () = assert!(HCI_LE_SET_EXTENDED_SCAN_PARAMETERS == 0x2041);
+    // §7.8.65: OGF=0x08 OCF=0x0042 → 0x2042.
+    const _: () = assert!(HCI_LE_SET_EXTENDED_SCAN_ENABLE == 0x2042);
 }
