@@ -764,7 +764,7 @@ impl TxQueueState {
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct RxDesc {
+pub struct RxDesc {
     pub addr: u64,
     pub length: u16,
     pub csum: u16,
