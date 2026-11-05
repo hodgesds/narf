@@ -519,8 +519,6 @@ pub struct Ixgbe {
     pub dcb_cfg: IrqSafeSpinLock<Option<dcb::DcbConfig>>,
     /// Programmed VLAN filter, if `configure_vlan` ran.
     pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
-    /// Programmed Flow Director config, if `configure_fdir` ran.
-    pub fdir_cfg: IrqSafeSpinLock<Option<fdir::FdirConfig>>,
     /// Programmed VMDq config, if `configure_vmdq` ran.
     pub vmdq_cfg: IrqSafeSpinLock<Option<vmdq::VmdqConfig>>,
     /// FCoE RX queues programmed by `configure_fcoe`, if it ran
@@ -528,6 +526,11 @@ pub struct Ixgbe {
     /// round-robin set; DDP contexts themselves are consumer
     /// state (no FCoE consumer in-tree) and live in `fcoe`.
     pub fcoe_queues: IrqSafeSpinLock<Vec<u32>>,
+    /// Persistent Flow Director state (init config, input masks,
+    /// IP6AT address, recorded filters) for restore after reinit /
+    /// reset / resume. Recorded by the `configure_fdir*` / add
+    /// methods; replayed by `fdir_restore` and `fdir_reinit`.
+    pub fdir_state: IrqSafeSpinLock<fdir::FdirState>,
     /// Armed WoL config, if `configure_wol` ran and was not disarmed.
     pub wol_armed: IrqSafeSpinLock<Option<wol::WolConfig>>,
     /// Programmed EEE state, if `configure_eee` ran. Always `None`
@@ -847,9 +850,9 @@ impl Ixgbe {
             rss_cfg: IrqSafeSpinLock::new(None),
             dcb_cfg: IrqSafeSpinLock::new(None),
             vlan_filter: IrqSafeSpinLock::new(None),
-            fdir_cfg: IrqSafeSpinLock::new(None),
             vmdq_cfg: IrqSafeSpinLock::new(None),
             fcoe_queues: IrqSafeSpinLock::new(Vec::new()),
+            fdir_state: IrqSafeSpinLock::new(fdir::FdirState::default()),
             wol_armed: IrqSafeSpinLock::new(None),
             eee_state: IrqSafeSpinLock::new(None),
             wol_board_cap: IrqSafeSpinLock::new(wol::WolBoardCap::default()),
@@ -1406,7 +1409,7 @@ impl Ixgbe {
                 }
             }
         }
-        *self.fdir_cfg.lock() = Some(cfg);
+        self.fdir_state.lock().config = Some(cfg);
         Ok(())
     }
 
@@ -1420,10 +1423,41 @@ impl Ixgbe {
             fdir::set_input_mask(&mut bank, mask, sctp)
                 .map_err(|e| IxgbeError::Other(e.as_str()))?;
         }
+        self.fdir_state.lock().mask = Some(*mask);
+        Ok(())
+    }
+
+    /// Program the IPv6 mask register (FDIRIP6M). `sipm` masks the
+    /// source IPv6 address per byte, `dipm` the destination per byte
+    /// (hash/signature only — never the perfect-match destination
+    /// compare; see fdir.rs). The pair is recorded for restore.
+    pub fn configure_fdir_ip6_mask(&self, sipm: u16, dipm: u16) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::set_ip6_mask(&mut bank, sipm, dipm);
+        }
+        self.fdir_state.lock().ip6_mask = Some((sipm, dipm));
+        Ok(())
+    }
+
+    /// Program the destination-IPv6 match address (IP6AT) used by
+    /// perfect-match IPv6 filters, and record it for restore.
+    /// IP6AT is the WoL table (datasheet §8.2.3.24.6), shared with
+    /// directed-IPv6 wake-up: programming it here also changes the
+    /// WoL address — use one writer (`wol::program_ipv6`) for that
+    /// reason. The address is meaningful only when FDIRM.DIPv6 is
+    /// clear (`FdirMask::dst_ipv6_match`).
+    pub fn configure_fdir_ipv6_dst(&self, addr: [u8; 16]) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            wol::program_ipv6(&mut bank, addr);
+        }
+        self.fdir_state.lock().ip6at = Some(addr);
         Ok(())
     }
 
     /// Add a perfect-match filter (IPv4 only; see fdir.rs docs).
+    /// Recorded on success for restore after reinit / reset / resume.
     pub fn fdir_add_perfect(
         &self,
         input: &fdir::FdirPerfectInput,
@@ -1435,22 +1469,50 @@ impl Ixgbe {
             fdir::add_perfect(&mut bank, input, soft_id, queue)
                 .map_err(|e| IxgbeError::Other(e.as_str()))?;
         }
+        self.fdir_state
+            .lock()
+            .record_perfect(*input, soft_id, queue);
+        Ok(())
+    }
+
+    /// Add an IPv6 perfect-match filter (see fdir.rs docs: source
+    /// IPv6 gets a full per-filter match; the destination compares
+    /// against the global IP6AT entry, gated by FDIRM.DIPv6 and
+    /// FDIRCMD.IPv6DMatch). Recorded on success for restore.
+    pub fn fdir_add_perfect_ipv6(
+        &self,
+        input: &fdir::FdirPerfectInput6,
+        soft_id: u16,
+        queue: u8,
+    ) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::add_perfect_ipv6(&mut bank, input, soft_id, queue)
+                .map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        self.fdir_state
+            .lock()
+            .record_perfect6(*input, soft_id, queue);
         Ok(())
     }
 
     /// Erase a perfect-match filter (query first, remove if present).
+    /// Forgotten from the recorded state on success, so a later
+    /// restore does not resurrect it.
     pub fn fdir_erase_perfect(&self, bkt_hash: u16, soft_id: u16) -> Result<(), IxgbeError> {
         {
             let mut bank = queues::MmioBank::new(&self.mmio);
             fdir::erase_perfect(&mut bank, bkt_hash, soft_id)
                 .map_err(|e| IxgbeError::Other(e.as_str()))?;
         }
+        self.fdir_state.lock().forget_perfect(bkt_hash, soft_id);
         Ok(())
     }
 
     /// Add a signature filter — the ATR primitive (see fdir.rs docs).
     /// `input` is the flow/vm/VLAN word, `common` the compressed
     /// dword, `flow_type` carries the tunnel bit (0x10).
+    /// Recorded on success for restore after reinit / reset / resume.
     pub fn fdir_add_signature(
         &self,
         input: u32,
@@ -1463,16 +1525,43 @@ impl Ixgbe {
             fdir::add_signature(&mut bank, input, common, flow_type, queue)
                 .map_err(|e| IxgbeError::Other(e.as_str()))?;
         }
+        self.fdir_state
+            .lock()
+            .record_signature(input, common, flow_type, queue);
         Ok(())
     }
 
-    /// Reinitialize the Flow Director tables. NOTE: programmed
-    /// filters do not survive a reinit (no filter list is kept);
-    /// callers must re-add afterwards.
+    /// Reinitialize the Flow Director tables and re-program the
+    /// recorded filters (masks, IP6AT, filters — see fdir.rs
+    /// `replay`). FDIRCTRL mode is preserved by the reinit itself,
+    /// so no full init is needed.
     pub fn fdir_reinit(&self) -> Result<(), IxgbeError> {
+        let sctp = self.did == IXGBE_DEV_X550 || self.did == IXGBE_DEV_X550EM_X;
+        // Snapshot the state first: the replay polls MMIO and must
+        // not run under the IrqSafeSpinLock.
+        let state = self.fdir_state.lock().clone();
         {
             let mut bank = queues::MmioBank::new(&self.mmio);
             fdir::reinit_tables(&mut bank).map_err(|e| IxgbeError::Other(e.as_str()))?;
+            fdir::replay(&mut bank, &state, sctp).map_err(|e| IxgbeError::Other(e.as_str()))?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the Flow Director tables from the recorded state
+    /// (full init + masks + IP6AT + filters) — used after reset /
+    /// resume, which clear the tables. No-op when nothing was ever
+    /// configured. A restore failure returns `Err` (fail-closed:
+    /// the device must not resume with a silently missing filter
+    /// set).
+    pub fn fdir_restore(&self) -> Result<(), IxgbeError> {
+        let sctp = self.did == IXGBE_DEV_X550 || self.did == IXGBE_DEV_X550EM_X;
+        // Snapshot the state first: the restore polls MMIO and must
+        // not run under the IrqSafeSpinLock.
+        let state = self.fdir_state.lock().clone();
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            fdir::restore(&mut bank, &state, sctp).map_err(|e| IxgbeError::Other(e.as_str()))?;
         }
         Ok(())
     }
@@ -1631,7 +1720,9 @@ impl Ixgbe {
     /// a reset would wipe RAR/RSS/VLAN/IVAR state this rebuild
     /// does not restore, while the rebuild overwrites exactly the
     /// datapath state it owns, so it is correct whether or not
-    /// the suspend actually lost device state).
+    /// the suspend actually lost device state). Step 3b rebuilds
+    /// the Flow Director tables from the recorded state (suspend
+    /// clears programmed filters).
     ///
     /// Fail-closed: every validation runs before any register or
     /// ring memory is touched. On `Err` the device stays quiesced
@@ -1720,6 +1811,12 @@ impl Ixgbe {
             pm::resume_rebuild_plan(&mut bank, cfg, &tx_bases, &rx_bases)
                 .map_err(IxgbeError::Other)?;
         }
+        // 3b. Rebuild the Flow Director tables from the recorded
+        // state (suspend / reset clears programmed filters). A
+        // failure returns Err here — before step 4 — so the device
+        // stays quiesced rather than resuming with a silently
+        // missing filter set.
+        self.fdir_restore()?;
         // 4. Reset the pump cursors to the rebuilt state, then
         // unquiesce last, so no pump runs against a half-rebuilt
         // ring.
