@@ -168,6 +168,7 @@ mod scheduler_mailbox;
 mod secure;
 mod startup;
 mod station;
+mod station_8922a;
 #[cfg(feature = "kernel-test")]
 mod station_composition_tests;
 pub(super) mod station_control;
@@ -269,6 +270,9 @@ mod ra_v1_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod txrx_be_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod station_8922a_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod nhm_tests;

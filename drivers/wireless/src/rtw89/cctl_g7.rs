@@ -43,11 +43,13 @@ pub(super) struct DefaultCmac {
     pub m: [u32; 16],
 }
 
-/// Errors from the default CMAC builder.
+/// Errors from the CMAC builders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
     /// MAC ID exceeds the 7-bit C0_MACID field.
     BadMacId,
+    /// An assoc field exceeds its bitfield width (port, AID, padding).
+    BadValue,
 }
 
 /// `CCTLINFO_G7_C0_MACID` GENMASK(6, 0) + `C0_OP` BIT(7)
@@ -109,6 +111,28 @@ const W8_ALL: u32 = 0xFFFF;
 const W14_ALL: u32 = 0xFFFF_FFFF;
 /// `CCTLINFO_G7_W15_ALL` (`fw.h:1545`).
 const W15_ALL: u32 = 0x0FFF_FFFF;
+/// `CCTLINFO_G7_W0_DISRTSFB` BIT(25) (`fw.h:1453`).
+const W0_DISRTSFB: u32 = 1 << 25;
+/// `CCTLINFO_G7_W0_DISDATAFB` BIT(26) (`fw.h:1454`).
+const W0_DISDATAFB: u32 = 1 << 26;
+/// `CCTLINFO_G7_W2_DATA_TXCNT_LMT_SEL` BIT(6) (`fw.h:1464`).
+const W2_DATA_TXCNT_LMT_SEL: u32 = 1 << 6;
+/// `CCTLINFO_G7_W3_RTS_TXCNT_LMT_SEL` BIT(30) (`fw.h:1487`).
+const W3_RTS_TXCNT_LMT_SEL: u32 = 1 << 30;
+/// `CCTLINFO_G7_W4_MULTI_PORT_ID` GENMASK(2, 0) (`fw.h:1490`).
+const W4_MULTI_PORT_ID_MASK: u32 = 0x7;
+/// `CCTLINFO_G7_W4_DATA_DCM` BIT(8) (`fw.h:1493`).
+const W4_DATA_DCM: u32 = 1 << 8;
+/// `CCTLINFO_G7_W6_AID12_PAID` GENMASK(11, 0) (`fw.h:1511`).
+const W6_AID12_PAID_MASK: u32 = 0xFFF;
+/// `CCTLINFO_G7_W6_ULDL` BIT(31) (`fw.h:1513`).
+const W6_ULDL: u32 = 1 << 31;
+/// `CCTLINFO_G7_W8_BSR_QUEUE_SIZE_FORMAT` BIT(1) (`fw.h:1527`).
+const W8_BSR_QUEUE_SIZE_FORMAT: u32 = 1 << 1;
+/// `RTW89_HW_RATE_CCK1` = 0x0 (`core.h:348`).
+const HW_RATE_CCK1: u32 = 0x0;
+/// `RTW89_HW_RATE_OFDM6` = 0x4 (`core.h:352`).
+const HW_RATE_OFDM6: u32 = 0x4;
 
 /// Build the default CMAC table for `macid`.
 /// `mgq_rpt_en` is Linux's `rtwdev->hci.tx_rpt_enabled`.
@@ -145,6 +169,99 @@ pub(super) fn build_default(macid: u32, mgq_rpt_en: bool) -> Result<DefaultCmac,
     // w14, w15: current-rate fields zero; masks ALL.
     m[14] = W14_ALL;
     m[15] = W15_ALL;
+    Ok(DefaultCmac {
+        c0: macid | C0_OP,
+        w,
+        m,
+    })
+}
+
+/// Build the association CMAC table for `macid`.
+///
+/// Mirrors Linux `rtw89/fw.c` `rtw89_fw_h2c_assoc_cmac_tbl_g7`
+/// (torvalds/linux @ 05441d6). This is a SEPARATE H2C from the
+/// default table: only the words below carry masks; every other
+/// word/mask pair stays zero, so firmware keeps whatever the
+/// default H2C programmed there.
+///
+/// Field map (Linux order):
+/// - w0: DISRTSFB + DISDATAFB; m0: those two bits.
+/// - w1: RTS retry lowest rate — CCK1 on 2.4 GHz (non-P2P),
+///   OFDM6 otherwise (P2P is always OFDM6); m1: the 4-bit field.
+/// - w2/w3: TX-count-limit selectors, both zero; m2/m3: their bits.
+/// - w4: multi-port id; m4: the port field, plus DATA_DCM in
+///   AP mode (value zero) and ACT_SUBCH_CBW = ~`punctured`
+///   when EHT is supported (the default table's all-ones
+///   subchannel mask is NOT reused here — Linux writes the
+///   live puncturing bitmap instead).
+/// - w5: nominal packet padding per width (20/40/80/160/320),
+///   2 bits each, caller-supplied from the peer's PPE thresholds
+///   (zero when the peer has neither EHT nor HE caps — Linux
+///   memsets the pads and only fills them from EHT/HE caps);
+///   m5: all five padding fields. PPE parsing from peer IEs is
+///   NOT done here; the caller supplies the pads.
+/// - w6: AID (12 bits) + ULDL (station mode); m6: both fields.
+/// - w8: BSR queue-size format = peer HE support; m8: its bit.
+///
+/// The returned struct is the same c0+w+m payload shape as
+/// [`DefaultCmac`]; the two H2C commands share one wire format.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_assoc(
+    macid: u32,
+    band_2g: bool,
+    p2p: bool,
+    port: u32,
+    ap_mode: bool,
+    eht_support: bool,
+    punctured: u16,
+    pads: [u8; 5],
+    aid: u16,
+    station_mode: bool,
+    has_he: bool,
+) -> Result<DefaultCmac, Error> {
+    if macid > 0x7F {
+        return Err(Error::BadMacId);
+    }
+    if port > W4_MULTI_PORT_ID_MASK || aid > W6_AID12_PAID_MASK as u16 {
+        return Err(Error::BadValue);
+    }
+    if pads.iter().any(|p| *p > 3) {
+        return Err(Error::BadValue);
+    }
+    let mut w = [0u32; 16];
+    let mut m = [0u32; 16];
+    w[0] = W0_DISRTSFB | W0_DISDATAFB;
+    m[0] = W0_DISRTSFB | W0_DISDATAFB;
+    let lowest_rate = if band_2g && !p2p {
+        HW_RATE_CCK1
+    } else {
+        HW_RATE_OFDM6
+    };
+    w[1] = (lowest_rate << 28) & W1_RTS_RTY_LOWEST_RATE_MASK;
+    m[1] = W1_RTS_RTY_LOWEST_RATE_MASK;
+    // w2, w3: selector values zero, masks set (Linux literal).
+    m[2] = W2_DATA_TXCNT_LMT_SEL;
+    m[3] = W3_RTS_TXCNT_LMT_SEL;
+    w[4] = port & W4_MULTI_PORT_ID_MASK;
+    m[4] = W4_MULTI_PORT_ID_MASK;
+    if ap_mode {
+        // DATA_DCM value zero; only its mask bit is set.
+        m[4] |= W4_DATA_DCM;
+    }
+    if eht_support {
+        w[4] |= ((!punctured as u32) << 16) & W4_ACT_SUBCH_CBW_MASK;
+        m[4] |= W4_ACT_SUBCH_CBW_MASK;
+    }
+    w[5] = (pads[0] as u32)
+        | ((pads[1] as u32) << 2)
+        | ((pads[2] as u32) << 4)
+        | ((pads[3] as u32) << 6)
+        | ((pads[4] as u32) << 8);
+    m[5] = W5_PADDING_MASK;
+    w[6] = (aid as u32 & W6_AID12_PAID_MASK) | ((station_mode as u32) << 31);
+    m[6] = W6_AID12_PAID_MASK | W6_ULDL;
+    w[8] = (has_he as u32) << 1;
+    m[8] = W8_BSR_QUEUE_SIZE_FORMAT;
     Ok(DefaultCmac {
         c0: macid | C0_OP,
         w,
