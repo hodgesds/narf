@@ -317,8 +317,8 @@ fn he_ra_mask(he: &HeCaps, width_mhz: u32) -> u64 {
 /// NSS-cap trim removes bit 63 (no EHT table covers it).
 fn eht_mcs_ra_mask(max_nss: &[u8], start_mcs: u32, n_nss: usize) -> Result<u64, Error> {
     let mut mask = 0u64;
-    for i in 0..n_nss {
-        let nss = max_nss[i] & 0x0F;
+    for (i, &nss_raw) in max_nss[..n_nss].iter().enumerate() {
+        let nss = nss_raw & 0x0F;
         if nss == 0 {
             continue;
         }
@@ -477,8 +477,8 @@ pub(super) fn compute(caps: &StationCaps) -> Result<Computed, Error> {
     // bit, false for legacy-only modes (1, 2, 3).
     if mode >= MODE_HT {
         let mut cap = 0u64;
-        for i in 0..caps.tx_nss as usize {
-            cap |= high_masks[i];
+        for &m in &high_masks[..caps.tx_nss as usize] {
+            cap |= m;
         }
         if mode & MODE_OFDM != 0 {
             cap |= MASK_SUBOFDM;
