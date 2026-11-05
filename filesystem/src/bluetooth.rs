@@ -175,3 +175,352 @@ pub fn publish_mgmt_event(event: &[u8]) {
     let f: MgmtEventSink = unsafe { core::mem::transmute::<usize, MgmtEventSink>(h) };
     f(event);
 }
+
+// ── L2CAP / RFCOMM channel-socket bridge (issue #814) ───────────────
+//
+// The socket layer (narf-userspace) cannot depend on narf-bluetooth
+// (that would cycle through narf-audio), so the channel operations
+// the pump owns are exposed here as fn pointers installed by
+// narf-bluetooth at bring-up, in the same shape as the mgmt/HCI
+// handlers above. Every forward returns the "no stack" value when
+// nothing is installed, so a socket op on a stack-less boot fails
+// closed instead of touching an absent pump.
+
+/// Outcome of registering a PSM for a listening L2CAP socket.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BtRegisterStatus {
+    /// The PSM is now served by the generic staging server.
+    Registered,
+    /// An in-kernel service (SDP/RFCOMM) or another listener already
+    /// owns this PSM.
+    InUse,
+    /// No pump exists for this controller index.
+    NoPump,
+}
+
+/// Errors sending on an L2CAP/RFCOMM channel.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BtSendError {
+    /// No pump exists for this controller index.
+    NoPump,
+    /// A pump step currently owns the core; retry after the step.
+    Busy,
+    /// No such open channel (closed by the peer, or never opened).
+    NoChannel,
+    /// LE CoC peer-credit budget exhausted; retry after the peer
+    /// grants Flow Control Credit.
+    NoCredits,
+    /// SDU larger than the peer's MTU (LE CoC).
+    TooBig,
+    /// Channel belongs to an in-kernel service (SDP/RFCOMM), not a
+    /// socket — use the service path, not `send`.
+    WrongService,
+}
+
+/// One pending channel, as claimed by `accept`: ACL handle, our local
+/// CID, the peer's CID, and the peer address (`[type, bdaddr...]`).
+pub type BtPendingChannel = (u16, u16, u16, [u8; 7]);
+/// One pending RFCOMM DLC, as claimed by `accept`: ACL handle, our
+/// local CID, the peer's CID, the DLCI, and the peer address.
+pub type BtPendingRfcomm = (u16, u16, u16, u8, [u8; 7]);
+
+pub type BtRegisterPsmHandler = fn(dev: u16, psm: u16, le: bool) -> BtRegisterStatus;
+pub type BtUnregisterPsmHandler = fn(dev: u16, psm: u16, le: bool);
+pub type BtTakePendingChannelHandler = fn(dev: u16, psm: u16, le: bool) -> Option<BtPendingChannel>;
+pub type BtPendingChannelHandler = fn(dev: u16, psm: u16, le: bool) -> bool;
+pub type BtSendChannelHandler =
+    fn(dev: u16, handle: u16, cid: u16, payload: &[u8]) -> Result<usize, BtSendError>;
+pub type BtDrainChannelHandler = fn(dev: u16, handle: u16, cid: u16) -> Option<Vec<Vec<u8>>>;
+pub type BtChannelRxPendingHandler = fn(dev: u16, handle: u16, cid: u16) -> bool;
+pub type BtDisconnectChannelHandler = fn(dev: u16, handle: u16, cid: u16) -> bool;
+pub type BtTakePendingRfcommHandler = fn(dev: u16, channel: u8) -> Option<BtPendingRfcomm>;
+pub type BtPendingRfcommHandler = fn(dev: u16, channel: u8) -> bool;
+pub type BtSendRfcommHandler =
+    fn(dev: u16, handle: u16, cid: u16, dlci: u8, payload: &[u8]) -> Result<usize, BtSendError>;
+pub type BtDrainRfcommHandler =
+    fn(dev: u16, handle: u16, cid: u16, dlci: u8) -> Option<Vec<Vec<u8>>>;
+pub type BtRfcommRxPendingHandler = fn(dev: u16, handle: u16, cid: u16, dlci: u8) -> bool;
+pub type BtCloseRfcommHandler = fn(dev: u16, handle: u16, cid: u16, dlci: u8) -> bool;
+
+static BT_REGISTER_PSM: AtomicUsize = AtomicUsize::new(0);
+static BT_UNREGISTER_PSM: AtomicUsize = AtomicUsize::new(0);
+static BT_TAKE_PENDING_CHANNEL: AtomicUsize = AtomicUsize::new(0);
+static BT_PENDING_CHANNEL: AtomicUsize = AtomicUsize::new(0);
+static BT_SEND_CHANNEL: AtomicUsize = AtomicUsize::new(0);
+static BT_DRAIN_CHANNEL: AtomicUsize = AtomicUsize::new(0);
+static BT_CHANNEL_RX_PENDING: AtomicUsize = AtomicUsize::new(0);
+static BT_DISCONNECT_CHANNEL: AtomicUsize = AtomicUsize::new(0);
+static BT_TAKE_PENDING_RFCOMM: AtomicUsize = AtomicUsize::new(0);
+static BT_PENDING_RFCOMM: AtomicUsize = AtomicUsize::new(0);
+static BT_SEND_RFCOMM: AtomicUsize = AtomicUsize::new(0);
+static BT_DRAIN_RFCOMM: AtomicUsize = AtomicUsize::new(0);
+static BT_RFCOMM_RX_PENDING: AtomicUsize = AtomicUsize::new(0);
+static BT_CLOSE_RFCOMM: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the L2CAP channel handlers (narf_bluetooth::pump).
+/// Each handler type is distinct, so a swapped argument is a
+/// compile error, not a silent misroute.
+#[allow(clippy::too_many_arguments)]
+pub fn install_bt_l2cap_handlers(
+    register: BtRegisterPsmHandler,
+    unregister: BtUnregisterPsmHandler,
+    take_pending: BtTakePendingChannelHandler,
+    pending: BtPendingChannelHandler,
+    send: BtSendChannelHandler,
+    drain: BtDrainChannelHandler,
+    rx_pending: BtChannelRxPendingHandler,
+    disconnect: BtDisconnectChannelHandler,
+) {
+    BT_REGISTER_PSM.store(register as usize, Ordering::Release);
+    BT_UNREGISTER_PSM.store(unregister as usize, Ordering::Release);
+    BT_TAKE_PENDING_CHANNEL.store(take_pending as usize, Ordering::Release);
+    BT_PENDING_CHANNEL.store(pending as usize, Ordering::Release);
+    BT_SEND_CHANNEL.store(send as usize, Ordering::Release);
+    BT_DRAIN_CHANNEL.store(drain as usize, Ordering::Release);
+    BT_CHANNEL_RX_PENDING.store(rx_pending as usize, Ordering::Release);
+    BT_DISCONNECT_CHANNEL.store(disconnect as usize, Ordering::Release);
+}
+
+/// Install the RFCOMM channel handlers (narf_bluetooth::pump).
+pub fn install_bt_rfcomm_handlers(
+    take_pending: BtTakePendingRfcommHandler,
+    pending: BtPendingRfcommHandler,
+    send: BtSendRfcommHandler,
+    drain: BtDrainRfcommHandler,
+    rx_pending: BtRfcommRxPendingHandler,
+    close: BtCloseRfcommHandler,
+) {
+    BT_TAKE_PENDING_RFCOMM.store(take_pending as usize, Ordering::Release);
+    BT_PENDING_RFCOMM.store(pending as usize, Ordering::Release);
+    BT_SEND_RFCOMM.store(send as usize, Ordering::Release);
+    BT_DRAIN_RFCOMM.store(drain as usize, Ordering::Release);
+    BT_RFCOMM_RX_PENDING.store(rx_pending as usize, Ordering::Release);
+    BT_CLOSE_RFCOMM.store(close as usize, Ordering::Release);
+}
+
+/// Register `psm` on controller `dev`'s pump for a listening socket
+/// (`le`: LE CoC PSM vs BR/EDR PSM). `NoPump` when no stack is
+/// installed.
+pub fn bt_register_psm(dev: u16, psm: u16, le: bool) -> BtRegisterStatus {
+    let h = BT_REGISTER_PSM.load(Ordering::Acquire);
+    if h == 0 {
+        return BtRegisterStatus::NoPump;
+    }
+    // SAFETY: only ever stored as `BtRegisterPsmHandler as usize`.
+    let f: BtRegisterPsmHandler = unsafe { core::mem::transmute::<usize, BtRegisterPsmHandler>(h) };
+    f(dev, psm, le)
+}
+
+/// Release a PSM registered by [`bt_register_psm`]. No-op when no
+/// stack is installed or the PSM is service-owned.
+pub fn bt_unregister_psm(dev: u16, psm: u16, le: bool) {
+    let h = BT_UNREGISTER_PSM.load(Ordering::Acquire);
+    if h == 0 {
+        return;
+    }
+    // SAFETY: only ever stored as `BtUnregisterPsmHandler as usize`.
+    let f: BtUnregisterPsmHandler =
+        unsafe { core::mem::transmute::<usize, BtUnregisterPsmHandler>(h) };
+    f(dev, psm, le)
+}
+
+/// Claim the oldest unclaimed channel opened by a peer to `psm` on
+/// controller `dev` (`le`: LE CoC vs BR/EDR). `None` when nothing is
+/// pending or no stack is installed.
+pub fn bt_take_pending_channel(dev: u16, psm: u16, le: bool) -> Option<BtPendingChannel> {
+    let h = BT_TAKE_PENDING_CHANNEL.load(Ordering::Acquire);
+    if h == 0 {
+        return None;
+    }
+    // SAFETY: only ever stored as `BtTakePendingChannelHandler as usize`.
+    let f: BtTakePendingChannelHandler =
+        unsafe { core::mem::transmute::<usize, BtTakePendingChannelHandler>(h) };
+    f(dev, psm, le)
+}
+
+/// Whether an unclaimed channel to `psm` is pending on controller
+/// `dev` (non-consuming peek for poll/accept readiness).
+pub fn bt_pending_channel(dev: u16, psm: u16, le: bool) -> bool {
+    let h = BT_PENDING_CHANNEL.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `BtPendingChannelHandler as usize`.
+    let f: BtPendingChannelHandler =
+        unsafe { core::mem::transmute::<usize, BtPendingChannelHandler>(h) };
+    f(dev, psm, le)
+}
+
+/// Send `payload` as one SDU on the open channel (`handle`, `cid`)
+/// of controller `dev`. Returns the bytes sent.
+pub fn bt_send_channel(
+    dev: u16,
+    handle: u16,
+    cid: u16,
+    payload: &[u8],
+) -> Result<usize, BtSendError> {
+    let h = BT_SEND_CHANNEL.load(Ordering::Acquire);
+    if h == 0 {
+        return Err(BtSendError::NoPump);
+    }
+    // SAFETY: only ever stored as `BtSendChannelHandler as usize`.
+    let f: BtSendChannelHandler = unsafe { core::mem::transmute::<usize, BtSendChannelHandler>(h) };
+    f(dev, handle, cid, payload)
+}
+
+/// Drain staged inbound SDUs for the open channel (`handle`, `cid`).
+/// `None` when no such channel exists or no stack is installed.
+pub fn bt_drain_channel(dev: u16, handle: u16, cid: u16) -> Option<Vec<Vec<u8>>> {
+    let h = BT_DRAIN_CHANNEL.load(Ordering::Acquire);
+    if h == 0 {
+        return None;
+    }
+    // SAFETY: only ever stored as `BtDrainChannelHandler as usize`.
+    let f: BtDrainChannelHandler =
+        unsafe { core::mem::transmute::<usize, BtDrainChannelHandler>(h) };
+    f(dev, handle, cid)
+}
+
+/// Whether staged inbound data awaits on the open channel
+/// (`handle`, `cid`) — non-consuming peek for poll readability.
+pub fn bt_channel_rx_pending(dev: u16, handle: u16, cid: u16) -> bool {
+    let h = BT_CHANNEL_RX_PENDING.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `BtChannelRxPendingHandler as usize`.
+    let f: BtChannelRxPendingHandler =
+        unsafe { core::mem::transmute::<usize, BtChannelRxPendingHandler>(h) };
+    f(dev, handle, cid)
+}
+
+/// Tear down the open channel (`handle`, `cid`) on controller `dev`:
+/// remove it and send the peer a Disconnection Request. `false` when
+/// no stack is installed or no such channel exists.
+pub fn bt_disconnect_channel(dev: u16, handle: u16, cid: u16) -> bool {
+    let h = BT_DISCONNECT_CHANNEL.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `BtDisconnectChannelHandler as usize`.
+    let f: BtDisconnectChannelHandler =
+        unsafe { core::mem::transmute::<usize, BtDisconnectChannelHandler>(h) };
+    f(dev, handle, cid)
+}
+
+/// Claim the oldest unclaimed RFCOMM DLC opened by a peer to server
+/// `channel` on controller `dev`. `None` when nothing is pending or
+/// no stack is installed.
+pub fn bt_take_pending_rfcomm(dev: u16, channel: u8) -> Option<BtPendingRfcomm> {
+    let h = BT_TAKE_PENDING_RFCOMM.load(Ordering::Acquire);
+    if h == 0 {
+        return None;
+    }
+    // SAFETY: only ever stored as `BtTakePendingRfcommHandler as usize`.
+    let f: BtTakePendingRfcommHandler =
+        unsafe { core::mem::transmute::<usize, BtTakePendingRfcommHandler>(h) };
+    f(dev, channel)
+}
+
+/// Whether an unclaimed RFCOMM DLC to server `channel` is pending on
+/// controller `dev` (non-consuming peek for poll/accept readiness).
+pub fn bt_pending_rfcomm(dev: u16, channel: u8) -> bool {
+    let h = BT_PENDING_RFCOMM.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `BtPendingRfcommHandler as usize`.
+    let f: BtPendingRfcommHandler =
+        unsafe { core::mem::transmute::<usize, BtPendingRfcommHandler>(h) };
+    f(dev, channel)
+}
+
+/// Send `payload` as one UIH frame on the open RFCOMM DLC
+/// (`handle`, `cid`, `dlci`) of controller `dev`.
+pub fn bt_send_rfcomm(
+    dev: u16,
+    handle: u16,
+    cid: u16,
+    dlci: u8,
+    payload: &[u8],
+) -> Result<usize, BtSendError> {
+    let h = BT_SEND_RFCOMM.load(Ordering::Acquire);
+    if h == 0 {
+        return Err(BtSendError::NoPump);
+    }
+    // SAFETY: only ever stored as `BtSendRfcommHandler as usize`.
+    let f: BtSendRfcommHandler = unsafe { core::mem::transmute::<usize, BtSendRfcommHandler>(h) };
+    f(dev, handle, cid, dlci, payload)
+}
+
+/// Drain staged inbound UIH payloads for the open RFCOMM DLC
+/// (`handle`, `cid`, `dlci`). `None` when no such DLC exists or no
+/// stack is installed.
+pub fn bt_drain_rfcomm(dev: u16, handle: u16, cid: u16, dlci: u8) -> Option<Vec<Vec<u8>>> {
+    let h = BT_DRAIN_RFCOMM.load(Ordering::Acquire);
+    if h == 0 {
+        return None;
+    }
+    // SAFETY: only ever stored as `BtDrainRfcommHandler as usize`.
+    let f: BtDrainRfcommHandler = unsafe { core::mem::transmute::<usize, BtDrainRfcommHandler>(h) };
+    f(dev, handle, cid, dlci)
+}
+
+/// Whether staged inbound data awaits on the open RFCOMM DLC
+/// (`handle`, `cid`, `dlci`) — non-consuming peek for poll.
+pub fn bt_rfcomm_rx_pending(dev: u16, handle: u16, cid: u16, dlci: u8) -> bool {
+    let h = BT_RFCOMM_RX_PENDING.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `BtRfcommRxPendingHandler as usize`.
+    let f: BtRfcommRxPendingHandler =
+        unsafe { core::mem::transmute::<usize, BtRfcommRxPendingHandler>(h) };
+    f(dev, handle, cid, dlci)
+}
+
+/// Close the open RFCOMM DLC (`handle`, `cid`, `dlci`) on controller
+/// `dev`: send the peer a DISC and forget the DLC. The L2CAP
+/// channel (shared mux) survives. `false` when no stack is installed
+/// or no such DLC exists.
+pub fn bt_close_rfcomm(dev: u16, handle: u16, cid: u16, dlci: u8) -> bool {
+    let h = BT_CLOSE_RFCOMM.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `BtCloseRfcommHandler as usize`.
+    let f: BtCloseRfcommHandler = unsafe { core::mem::transmute::<usize, BtCloseRfcommHandler>(h) };
+    f(dev, handle, cid, dlci)
+}
+
+/// Channel-event wake sink. The pump publishes whenever a peer opens
+/// a socket-claimable channel or stages data on one; the socket
+/// layer installs a sink that wakes parked poll/accept waiters
+/// (a bare readiness-generation bump — waiters re-run their
+/// readiness scan, which peeks the pump). A no-op until installed.
+pub type BtChannelEventSink = fn();
+static BT_CHANNEL_EVENT_SINK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the channel-event sink (the socket layer's waker),
+/// returning the previously installed one.
+pub fn install_bt_channel_sink(sink: BtChannelEventSink) -> Option<BtChannelEventSink> {
+    let prev = BT_CHANNEL_EVENT_SINK.swap(sink as usize, Ordering::AcqRel);
+    if prev == 0 {
+        None
+    } else {
+        // SAFETY: only ever stored as `BtChannelEventSink as usize`.
+        Some(unsafe { core::mem::transmute::<usize, BtChannelEventSink>(prev) })
+    }
+}
+
+/// Publish a channel event to the installed sink. No-op until the
+/// socket layer has installed one.
+pub fn publish_bt_channel_event() {
+    let h = BT_CHANNEL_EVENT_SINK.load(Ordering::Acquire);
+    if h == 0 {
+        return;
+    }
+    // SAFETY: only ever stored as `BtChannelEventSink as usize`.
+    let f: BtChannelEventSink = unsafe { core::mem::transmute::<usize, BtChannelEventSink>(h) };
+    f()
+}

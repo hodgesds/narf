@@ -448,6 +448,12 @@ mod secure_boot;
 #[cfg(feature = "kernel-test")]
 mod wx_smp;
 
+/// AF_BLUETOOTH L2CAP socket over the real pump (issue #814). Lives
+/// here rather than in `userspace/` because the fixture needs the
+/// real narf-bluetooth stack too, and only `frame/` depends on both.
+#[cfg(feature = "kernel-test")]
+mod bt_l2cap_socket_e2e;
+
 /// Called from the arch-specific boot stub once the CPU is in a state
 /// capable of executing Rust: stack set up, appropriate privilege level,
 /// long mode (on x86_64), and a `RawBootInfo` packed from the bootloader's

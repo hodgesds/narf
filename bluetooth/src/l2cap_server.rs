@@ -110,6 +110,21 @@ impl ServerRegistry {
             .find(|(p, _)| *p == psm)
             .map(|(_, kind)| *kind)
     }
+
+    /// Release a `Generic` (socket-listener) registration. Service
+    /// entries (SDP/RFCOMM) are never removed: a socket that
+    /// listened on a service PSM was refused at registration, so
+    /// there is no Generic entry to remove for them.
+    pub fn unregister_bredr(&mut self, psm: u16) {
+        self.bredr
+            .retain(|(p, kind)| !(*p == psm && *kind == ServerKind::Generic));
+    }
+
+    /// Release a `Generic` (socket-listener) LE registration.
+    pub fn unregister_le(&mut self, psm: u16) {
+        self.le
+            .retain(|(p, kind)| !(*p == psm && *kind == ServerKind::Generic));
+    }
 }
 
 /// Largest SDU staged on an LE COC channel (implementation choice).
@@ -198,6 +213,51 @@ impl LeCocChannel {
     /// Take a pending top-up grant owed to the peer (0 = none).
     pub fn take_top_up(&mut self) -> u16 {
         core::mem::take(&mut self.top_up_due)
+    }
+
+    /// Segment one SDU into K-frame payloads for transmission (§4.22:
+    /// the first K-frame carries the 2-byte LE length prefix, later
+    /// K-frames carry raw segments; each K-frame is at most
+    /// `peer_mps`). All-or-nothing: `None` when the SDU exceeds the
+    /// peer's MTU or the peer-credit budget cannot cover every
+    /// K-frame — no credit is spent and no partial SDU is ever sent,
+    /// so a `WouldBlock` send leaves the peer's reassembly untouched.
+    /// On `Some`, the spent credits are deducted here.
+    pub fn take_send_frames(&mut self, sdu: &[u8]) -> Option<Vec<Vec<u8>>> {
+        if sdu.len() > self.peer_mtu as usize {
+            return None;
+        }
+        let mps = self.peer_mps as usize;
+        if mps < 2 {
+            // An MPS below the length prefix cannot carry even the
+            // first K-frame; the peer's open parameters were
+            // unacceptable, so refuse rather than emit a malformed
+            // frame. (Open refuses MPS 0; MPS 1 is refused here.)
+            return None;
+        }
+        // K-frames: first carries the 2-byte prefix + up to mps-2
+        // payload bytes; the rest carry up to mps bytes each.
+        let first_capacity = mps - 2;
+        let remaining = sdu.len().saturating_sub(first_capacity);
+        let extra = remaining.div_ceil(mps);
+        let needed = 1usize + extra;
+        if (self.peer_credits as usize) < needed {
+            return None;
+        }
+        self.peer_credits -= needed as u16;
+        let mut frames = Vec::with_capacity(needed);
+        let first_len = core::cmp::min(sdu.len(), first_capacity);
+        let mut first = Vec::with_capacity(2 + first_len);
+        first.extend_from_slice(&(sdu.len() as u16).to_le_bytes());
+        first.extend_from_slice(&sdu[..first_len]);
+        frames.push(first);
+        let mut idx = first_len;
+        while idx < sdu.len() {
+            let end = core::cmp::min(idx + mps, sdu.len());
+            frames.push(sdu[idx..end].to_vec());
+            idx = end;
+        }
+        Some(frames)
     }
 
     /// Drain completed SDUs (clears the queue).
@@ -375,4 +435,100 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/l2cap-server", le_coc_credit_and_reassembly);
+
+    /// #814: LE CoC send segmentation — K-frame layout, credit
+    /// deduction, all-or-nothing refusal when the budget or the
+    /// peer MTU cannot cover the SDU.
+    fn le_coc_send_segmentation_and_credits() -> TestResult {
+        // Peer MTU 1024, MPS 256, 8 credits.
+        let mut ch = LeCocChannel::new(0x0040, 0x0041, 0x0080, 1024, 256, 8);
+        // 5-byte SDU: one K-frame (2-byte prefix + 5 payload).
+        let frames = match ch.take_send_frames(b"hello") {
+            Some(f) => f,
+            None => return TestResult::Fail("small SDU should segment"),
+        };
+        if frames.len() != 1 || frames[0] != alloc::vec![0x05, 0x00, b'h', b'e', b'l', b'l', b'o'] {
+            return TestResult::Fail("single-K-frame layout mismatch");
+        }
+        if ch.peer_credits != 7 {
+            return TestResult::Fail("one credit should be spent");
+        }
+        // 300-byte SDU: first K-frame carries 254 payload bytes
+        // (256 - 2 prefix), second carries the remaining 46.
+        let sdu = alloc::vec![0xAB; 300];
+        let frames = match ch.take_send_frames(&sdu) {
+            Some(f) => f,
+            None => return TestResult::Fail("300-byte SDU should segment"),
+        };
+        if frames.len() != 2 || frames[0].len() != 256 || frames[1].len() != 46 {
+            return TestResult::Fail("two-K-frame split mismatch");
+        }
+        if frames[0][0] != 0x2C || frames[0][1] != 0x01 {
+            return TestResult::Fail("length prefix should be 300 LE");
+        }
+        if ch.peer_credits != 5 {
+            return TestResult::Fail("two more credits should be spent");
+        }
+        // Oversize vs peer MTU: refused, no credit spent.
+        let big = alloc::vec![0x00; 1025];
+        if ch.take_send_frames(&big).is_some() {
+            return TestResult::Fail("SDU over peer MTU should refuse");
+        }
+        if ch.peer_credits != 5 {
+            return TestResult::Fail("refused SDU must not spend credit");
+        }
+        // Credit exhaustion: a 5-K-frame SDU needs 5 credits, 5 are
+        // left — succeeds and drains the budget; the next send (any
+        // size) refuses with the budget at zero.
+        let sdu = alloc::vec![0xCD; 1024];
+        let frames = match ch.take_send_frames(&sdu) {
+            Some(f) => f,
+            None => return TestResult::Fail("1024-byte SDU should take 5 credits"),
+        };
+        if frames.len() != 5 || ch.peer_credits != 0 {
+            return TestResult::Fail("budget should drain to zero");
+        }
+        if ch.take_send_frames(b"x").is_some() {
+            return TestResult::Fail("zero-credit send should refuse");
+        }
+        // Granting credits re-opens the budget.
+        ch.grant_credits(2);
+        if ch.take_send_frames(b"hi").is_none() || ch.peer_credits != 1 {
+            return TestResult::Fail("granted credits should fund a send");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/l2cap-server",
+        le_coc_send_segmentation_and_credits
+    );
+
+    /// #814: the registry releases only Generic (socket-listener)
+    /// entries; service entries survive unregister.
+    fn server_registry_unregister_keeps_services() -> TestResult {
+        let mut reg = ServerRegistry::new();
+        if reg.lookup_bredr(crate::l2cap::PSM_SDP) != Some(ServerKind::Sdp) {
+            return TestResult::Fail("SDP should be pre-registered");
+        }
+        reg.register_bredr(0x0101, ServerKind::Generic);
+        reg.register_le(0x0080, ServerKind::Generic);
+        reg.unregister_bredr(crate::l2cap::PSM_SDP);
+        reg.unregister_bredr(crate::l2cap::PSM_RFCOMM);
+        reg.unregister_bredr(0x0101);
+        reg.unregister_le(0x0080);
+        if reg.lookup_bredr(crate::l2cap::PSM_SDP) != Some(ServerKind::Sdp) {
+            return TestResult::Fail("unregister must not remove SDP");
+        }
+        if reg.lookup_bredr(crate::l2cap::PSM_RFCOMM) != Some(ServerKind::Rfcomm) {
+            return TestResult::Fail("unregister must not remove RFCOMM");
+        }
+        if reg.lookup_bredr(0x0101).is_some() || reg.lookup_le(0x0080).is_some() {
+            return TestResult::Fail("Generic entries should be released");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/l2cap-server",
+        server_registry_unregister_keeps_services
+    );
 }

@@ -148,10 +148,53 @@ impl Default for ScoSockState {
     }
 }
 
+/// Listener half of a connection-oriented AF_BLUETOOTH socket
+/// (L2CAP/RFCOMM; issue #814).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BtListenState {
+    /// Controller index the PSM/server channel is registered on.
+    pub dev: u16,
+    /// L2CAP PSM (BTPROTO_L2CAP) or RFCOMM server channel
+    /// (BTPROTO_RFCOMM, 1..=30).
+    pub psm: u16,
+    /// True for LE CoC listeners (L2CAP only).
+    pub le: bool,
+}
+
+/// An accepted L2CAP/RFCOMM channel (issue #814). A socket holds at
+/// most one: `accept` fills it, `shutdown`/drop clears it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BtChannelState {
+    /// Controller index the channel lives on.
+    pub dev: u16,
+    /// ACL connection handle.
+    pub handle: u16,
+    /// Our local CID (the CID the peer sends to).
+    pub local_cid: u16,
+    /// The peer's CID (the CID we send to).
+    pub peer_cid: u16,
+    /// LE CoC PSM or BR/EDR PSM (0x0003 for RFCOMM).
+    pub psm: u16,
+    /// True for LE CoC channels.
+    pub le: bool,
+    /// RFCOMM DLCI (BTPROTO_RFCOMM only; 0 for L2CAP).
+    pub dlci: u8,
+    /// Peer address (`[address type, bdaddr...]`).
+    pub peer_addr: [u8; 7],
+}
+
 /// Listening SCO sockets by local bdaddr (`sco_sk_list` +
 /// `__sco_get_sock_listen_by_addr`); a dropped socket's entry is pruned on
 /// the next lookup.
 static SCO_LISTENERS: IrqSafeSpinLock<Vec<([u8; 6], alloc::sync::Weak<SocketFile>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Listening RFCOMM sockets by (controller, server channel);
+/// a dropped socket's entry is pruned on the next lookup. L2CAP
+/// listeners need no socket-side registry — the pump's PSM
+/// registry is the authority and refuses a second listener with
+/// EADDRINUSE.
+static RFCOMM_LISTENERS: IrqSafeSpinLock<Vec<(u16, u8, alloc::sync::Weak<SocketFile>)>> =
     IrqSafeSpinLock::new(Vec::new());
 
 /// `hci_get_route` found something: a registered controller that is up
@@ -1589,11 +1632,17 @@ enum SocketState {
     },
     /// Connection-oriented AF_BLUETOOTH protocols (L2CAP/RFCOMM/SCO; the
     /// protocol is `self.protocol`). `bound` holds the raw sockaddr body set
-    /// by bind; `sco` the SCO per-socket state. Connecting is hardware-gated
-    /// (a controller and a peer), so a socket is never CONNECTED here.
+    /// by bind; `sco` the SCO per-socket state. `listen` is an L2CAP/RFCOMM
+    /// listen registration (issue #814); `channel` is an accepted channel.
+    /// `connect()` still has no backend — the outbound channel-open
+    /// exchange is #889's — so a socket is never CONNECTED by connect.
     BluetoothConn {
         bound: Option<Vec<u8>>,
         sco: ScoSockState,
+        listen: Option<BtListenState>,
+        channel: Option<BtChannelState>,
+        /// Staged inbound SDUs / RFCOMM payloads awaiting recv.
+        rx: VecDeque<Vec<u8>>,
     },
 }
 
@@ -1983,6 +2032,9 @@ impl SocketFile {
             SocketState::BluetoothConn {
                 bound: None,
                 sco: ScoSockState::default(),
+                listen: None,
+                channel: None,
+                rx: VecDeque::new(),
             }
         } else {
             SocketState::Fresh
@@ -2064,6 +2116,10 @@ impl SocketFile {
             // Install the mgmt-event fan-out once; the native stack publishes
             // INDEX_ADDED / NEW_SETTINGS through the filesystem broker.
             narf_filesystem::bluetooth::install_mgmt_event_sink(Self::broadcast_bluetooth_mgmt);
+            // Install the channel-event wake once; the pump publishes
+            // when a peer opens a socket-claimable channel or stages
+            // data on one (issue #814).
+            narf_filesystem::bluetooth::install_bt_channel_sink(Self::wake_bt_channel_event);
             BLUETOOTH_SOCKETS.lock().push(Arc::downgrade(&socket));
         }
         if domain == AF_INET || domain == AF_INET6 {
@@ -4915,10 +4971,60 @@ impl SocketFile {
                 bits
             }
             // `bt_sock_poll`: a listening socket reports only pending
-            // connections (`bt_accept_poll`), and none can arrive without a
-            // controller. Otherwise there is no live connection yet: writable.
-            SocketState::BluetoothConn { sco, .. } if sco.listening => 0,
-            SocketState::BluetoothConn { .. } => narf_filesystem::POLL_OUT,
+            // connections (`bt_accept_poll`); a channel socket reports
+            // POLL_IN when staged data awaits (local queue or pump)
+            // and is always writable. A listening SCO socket reports
+            // nothing — no connection can ever arrive (#817).
+            SocketState::BluetoothConn {
+                listen,
+                channel,
+                rx,
+                sco,
+                ..
+            } => {
+                if sco.listening {
+                    0
+                } else if let Some(l) = listen {
+                    let ready = if self.protocol == BTPROTO_RFCOMM {
+                        narf_filesystem::bluetooth::bt_pending_rfcomm(l.dev, l.psm as u8)
+                    } else {
+                        narf_filesystem::bluetooth::bt_pending_channel(l.dev, l.psm, l.le)
+                    };
+                    // Reconcile the durable accept cell against this
+                    // level so it clears once accept drains the
+                    // pending channel (else a re-arm spuriously
+                    // returns Ready and a timed poll spins).
+                    self.set_listener_readiness(ready);
+                    if ready {
+                        narf_filesystem::POLL_IN
+                    } else {
+                        0
+                    }
+                } else if let Some(ch) = channel {
+                    let mut bits = narf_filesystem::POLL_OUT;
+                    let staged = !rx.is_empty()
+                        || if self.protocol == BTPROTO_RFCOMM {
+                            narf_filesystem::bluetooth::bt_rfcomm_rx_pending(
+                                ch.dev,
+                                ch.handle,
+                                ch.local_cid,
+                                ch.dlci,
+                            )
+                        } else {
+                            narf_filesystem::bluetooth::bt_channel_rx_pending(
+                                ch.dev,
+                                ch.handle,
+                                ch.local_cid,
+                            )
+                        };
+                    if staged {
+                        bits |= narf_filesystem::POLL_IN;
+                    }
+                    bits
+                } else {
+                    narf_filesystem::POLL_OUT
+                }
+            }
         }
     }
 
@@ -4967,6 +5073,10 @@ impl SocketFile {
             | SocketState::NetlinkNetfilter { replies }
             | SocketState::NetlinkAudit { replies } => replies.front().map(Vec::len).unwrap_or(0),
             SocketState::Packet { sock } => sock.inq(),
+            // An accepted L2CAP/RFCOMM channel reports its staged
+            // inbound bytes; a listener or unconnected socket has
+            // nothing queued.
+            SocketState::BluetoothConn { rx, .. } => rx.iter().map(Vec::len).sum(),
             // A non-member of the kernel uevent group has nothing queued to
             // report, so SIOCINQ is 0 — matching the EAGAIN its recv gives.
             SocketState::NetlinkUevent { reader }
@@ -5361,6 +5471,7 @@ impl SocketFile {
         let SocketState::BluetoothConn {
             bound: Some(src),
             sco,
+            ..
         } = &mut *state
         else {
             return SocketOpResult::Err(SockError::BadFdState);
@@ -5395,7 +5506,7 @@ impl SocketFile {
                 .ok_or(SockError::InvalidArg)
         };
         let mut state = self.state.lock();
-        let SocketState::BluetoothConn { bound, sco } = &mut *state else {
+        let SocketState::BluetoothConn { bound, sco, .. } = &mut *state else {
             return SocketOpResult::Err(SockError::InvalidArg);
         };
         // Reachable SCO states here: OPEN (unbound), BOUND, LISTEN.
@@ -5455,7 +5566,7 @@ impl SocketFile {
             SocketOpResult::OptValue { n }
         };
         let state = self.state.lock();
-        let SocketState::BluetoothConn { bound, sco } = &*state else {
+        let SocketState::BluetoothConn { bound, sco, .. } = &*state else {
             return SocketOpResult::Err(SockError::InvalidArg);
         };
         if level == SOL_SCO {
@@ -5513,6 +5624,8 @@ impl SocketFile {
                 }
             }
             SocketOp::Listen { .. } if self.protocol == BTPROTO_SCO => self.sco_listen(),
+            SocketOp::Listen { .. } if self.protocol == BTPROTO_L2CAP => self.bt_listen_l2cap(),
+            SocketOp::Listen { .. } if self.protocol == BTPROTO_RFCOMM => self.bt_listen_rfcomm(),
             // `sco_sock_accept`: only a listener accepts, and with no
             // controller no connection ever arrives to accept.
             SocketOp::Accept if self.protocol == BTPROTO_SCO => match &*self.state.lock() {
@@ -5521,6 +5634,31 @@ impl SocketFile {
                 }
                 _ => SocketOpResult::Err(SockError::BadFdState),
             },
+            SocketOp::Accept
+                if self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM =>
+            {
+                self.bt_accept()
+            }
+            SocketOp::Send { buf, addr, .. }
+                if self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM =>
+            {
+                self.bt_send(buf, addr)
+            }
+            SocketOp::Recv { buf, flags }
+                if self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM =>
+            {
+                self.bt_recv(buf, flags)
+            }
+            SocketOp::GetPeerName
+                if self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM =>
+            {
+                self.bt_getpeername()
+            }
+            SocketOp::Shutdown { .. }
+                if self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM =>
+            {
+                self.bt_shutdown()
+            }
             SocketOp::SetSockOpt { level, name, value }
                 if self.protocol == BTPROTO_SCO && level != SOL_SOCKET =>
             {
@@ -5548,10 +5686,406 @@ impl SocketFile {
             }
             SocketOp::GetSockOpt { level, name, buf } => self.handle_getsockopt(level, name, buf),
             SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
-            // Connecting/listening an L2CAP/RFCOMM/SCO channel requires a live
-            // controller and a reachable peer — hardware-gated.
+            // connect() for L2CAP/RFCOMM needs the outbound
+            // channel-open exchange (#889) and for SCO the SCO
+            // transport (#817); neither backend exists, so the
+            // honest error stays. Anything else this dispatcher
+            // does not know is NotSupported.
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
+    }
+
+    /// Route a bound local bdaddr to a controller index
+    /// (`hci_get_route` + `hci_dev_get`): the controller whose
+    /// `hci_dev_info` reports that bdaddr; BDADDR_ANY (all zeros)
+    /// routes to the first registered controller. Returns None
+    /// when no controller matches (no device — ENODEV). No power
+    /// requirement: listening does not need the controller up.
+    fn bt_route_controller(bdaddr: &[u8; 6]) -> Option<u16> {
+        if *bdaddr == [0u8; 6] {
+            return if narf_filesystem::bluetooth::hci_dev_count() > 0 {
+                Some(0)
+            } else {
+                None
+            };
+        }
+        (0..narf_filesystem::bluetooth::hci_dev_count()).find_map(|dev| {
+            narf_filesystem::bluetooth::hci_dev_info(dev as u16)
+                .and_then(|info| info.get(10..16).map(|a| a == bdaddr.as_slice()))
+                .unwrap_or(false)
+                .then_some(dev as u16)
+        })
+    }
+
+    /// `l2cap_sock_listen` (issue #814): bind the socket's PSM to
+    /// the pump's Generic staging server on the routed controller.
+    /// SOCK_STREAM or SOCK_SEQPACKET only; the bound PSM must be
+    /// non-zero with CID 0; a service PSM (SDP/RFCOMM) or a second
+    /// listener on the same PSM reports EADDRINUSE; no matching
+    /// controller reports ENODEV.
+    fn bt_listen_l2cap(self: &Arc<Self>) -> SocketOpResult {
+        if self.kind != SOCK_STREAM && self.kind != SOCK_SEQPACKET {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let mut state = self.state.lock();
+        let SocketState::BluetoothConn { bound, listen, .. } = &mut *state else {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        };
+        let Some(body) = bound.clone() else {
+            return SocketOpResult::Err(SockError::BadFdState);
+        };
+        if body.len() < 11 {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        if listen.is_some() {
+            return SocketOpResult::Err(SockError::BadFdState);
+        }
+        let psm = u16::from_le_bytes([body[0], body[1]]);
+        let cid = u16::from_le_bytes([body[8], body[9]]);
+        // Address type: 0 BR/EDR, 1 LE public, 2 LE random; anything
+        // else is not a real address type.
+        let le = match body[10] {
+            0 => false,
+            1 | 2 => true,
+            _ => return SocketOpResult::Err(SockError::InvalidArg),
+        };
+        if psm == 0 || cid != 0 {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let mut bdaddr = [0u8; 6];
+        bdaddr.copy_from_slice(&body[2..8]);
+        let Some(dev) = Self::bt_route_controller(&bdaddr) else {
+            return SocketOpResult::Err(SockError::NoDevice);
+        };
+        match narf_filesystem::bluetooth::bt_register_psm(dev, psm, le) {
+            narf_filesystem::bluetooth::BtRegisterStatus::Registered => {
+                *listen = Some(BtListenState { dev, psm, le });
+                SocketOpResult::Ok(0)
+            }
+            narf_filesystem::bluetooth::BtRegisterStatus::InUse => {
+                SocketOpResult::Err(SockError::AddrInUse)
+            }
+            narf_filesystem::bluetooth::BtRegisterStatus::NoPump => {
+                SocketOpResult::Err(SockError::NoDevice)
+            }
+        }
+    }
+
+    /// `rfcomm_sock_listen` (issue #814): register the socket's
+    /// server channel (1..=30) on the routed controller. SOCK_STREAM
+    /// only. The pump's responder session answers any server
+    /// channel, so the socket layer is the authority for channel
+    /// conflicts — a second live listener on the same
+    /// (controller, channel) reports EADDRINUSE.
+    fn bt_listen_rfcomm(self: &Arc<Self>) -> SocketOpResult {
+        if self.kind != SOCK_STREAM {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let mut state = self.state.lock();
+        let SocketState::BluetoothConn { bound, listen, .. } = &mut *state else {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        };
+        let Some(body) = bound.clone() else {
+            return SocketOpResult::Err(SockError::BadFdState);
+        };
+        if body.len() < 7 {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        if listen.is_some() {
+            return SocketOpResult::Err(SockError::BadFdState);
+        }
+        let channel = body[6];
+        if !(1..=30).contains(&channel) {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let mut bdaddr = [0u8; 6];
+        bdaddr.copy_from_slice(&body[0..6]);
+        let Some(dev) = Self::bt_route_controller(&bdaddr) else {
+            return SocketOpResult::Err(SockError::NoDevice);
+        };
+        {
+            let mut listeners = RFCOMM_LISTENERS.lock();
+            listeners.retain(|(_, _, w)| w.upgrade().is_some());
+            if listeners.iter().any(|(d, c, _)| *d == dev && *c == channel) {
+                return SocketOpResult::Err(SockError::AddrInUse);
+            }
+            listeners.push((dev, channel, Arc::downgrade(self)));
+        }
+        *listen = Some(BtListenState {
+            dev,
+            psm: channel as u16,
+            le: false,
+        });
+        SocketOpResult::Ok(0)
+    }
+
+    /// `l2cap_sock_accept` / `rfcomm_sock_accept` (issue #814):
+    /// claim the oldest peer-opened channel for this listener's
+    /// PSM/server channel and hand back a fresh socket carrying
+    /// it. No pending channel → EAGAIN (the caller parks and the
+    /// channel-event sink wakes it when one arrives).
+    fn bt_accept(self: &Arc<Self>) -> SocketOpResult {
+        let (dev, psm, le) = {
+            let state = self.state.lock();
+            let SocketState::BluetoothConn { listen, .. } = &*state else {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            };
+            let Some(l) = *listen else {
+                return SocketOpResult::Err(SockError::BadFdState);
+            };
+            (l.dev, l.psm, l.le)
+        };
+        let accepted = if self.protocol == BTPROTO_RFCOMM {
+            let Some((handle, local_cid, peer_cid, dlci, peer_addr)) =
+                narf_filesystem::bluetooth::bt_take_pending_rfcomm(dev, psm as u8)
+            else {
+                return SocketOpResult::Err(SockError::WouldBlock);
+            };
+            BtChannelState {
+                dev,
+                handle,
+                local_cid,
+                peer_cid,
+                psm: 0x0003,
+                le: false,
+                dlci,
+                peer_addr,
+            }
+        } else {
+            let Some((handle, local_cid, peer_cid, peer_addr)) =
+                narf_filesystem::bluetooth::bt_take_pending_channel(dev, psm, le)
+            else {
+                return SocketOpResult::Err(SockError::WouldBlock);
+            };
+            BtChannelState {
+                dev,
+                handle,
+                local_cid,
+                peer_cid,
+                psm,
+                le,
+                dlci: 0,
+                peer_addr,
+            }
+        };
+        let child = SocketFile::with_protocol(AF_BLUETOOTH, self.kind, self.protocol);
+        {
+            let mut state = child.state.lock();
+            if let SocketState::BluetoothConn { channel, bound, .. } = &mut *state {
+                *channel = Some(accepted);
+                *bound = Some(self.bt_accepted_sockaddr_body(&accepted));
+            }
+        }
+        // Reconcile the durable accept cell against the post-claim
+        // pending state, so it clears once accept drains the last
+        // pending channel.
+        let _ = self.poll_readiness();
+        SocketOpResult::Accepted {
+            socket: child,
+            peer: Some(self.bt_channel_peer_sockaddr(&accepted)),
+        }
+    }
+
+    /// Local sockaddr body for an accepted channel: the listener's
+    /// bound body with the L2CAP CID field replaced by the local
+    /// CID (RFCOMM has no CID field — the body is unchanged).
+    fn bt_accepted_sockaddr_body(&self, ch: &BtChannelState) -> Vec<u8> {
+        let state = self.state.lock();
+        let SocketState::BluetoothConn {
+            bound: Some(body), ..
+        } = &*state
+        else {
+            return alloc::vec![0u8; 11];
+        };
+        let mut body = body.clone();
+        if self.protocol == BTPROTO_L2CAP && body.len() >= 10 {
+            body[8..10].copy_from_slice(&ch.local_cid.to_le_bytes());
+        }
+        body
+    }
+
+    /// Peer sockaddr for an accepted channel: L2CAP psm + bdaddr +
+    /// peer CID + address type; RFCOMM bdaddr + server channel.
+    fn bt_channel_peer_sockaddr(&self, ch: &BtChannelState) -> SockAddr {
+        let mut body = alloc::vec![];
+        if self.protocol == BTPROTO_RFCOMM {
+            body.extend_from_slice(&ch.peer_addr[1..7]);
+            body.push(ch.psm as u8);
+        } else {
+            body.extend_from_slice(&ch.psm.to_le_bytes());
+            body.extend_from_slice(&ch.peer_addr[1..7]);
+            body.extend_from_slice(&ch.peer_cid.to_le_bytes());
+            body.push(ch.peer_addr[0]);
+        }
+        SockAddr {
+            family: AF_BLUETOOTH,
+            body,
+        }
+    }
+
+    /// Send on an accepted L2CAP/RFCOMM channel (issue #814). A
+    /// destination address is rejected (connected socket); no
+    /// channel is ENOTCONN; a transiently-busy pump or an exhausted
+    /// LE CoC credit budget is EAGAIN; an oversize LE CoC SDU is
+    /// EMSGSIZE. Returns the bytes accepted by the pump.
+    fn bt_send(self: &Arc<Self>, buf: &[u8], addr: Option<SockAddr>) -> SocketOpResult {
+        if addr.is_some() {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let ch = {
+            let state = self.state.lock();
+            let SocketState::BluetoothConn { channel, .. } = &*state else {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            };
+            let Some(ch) = *channel else {
+                return SocketOpResult::Err(SockError::NotConnected);
+            };
+            ch
+        };
+        let result = if self.protocol == BTPROTO_RFCOMM {
+            narf_filesystem::bluetooth::bt_send_rfcomm(
+                ch.dev,
+                ch.handle,
+                ch.local_cid,
+                ch.dlci,
+                buf,
+            )
+        } else {
+            narf_filesystem::bluetooth::bt_send_channel(ch.dev, ch.handle, ch.local_cid, buf)
+        };
+        match result {
+            Ok(n) => SocketOpResult::Ok(n as u64),
+            Err(narf_filesystem::bluetooth::BtSendError::NoPump)
+            | Err(narf_filesystem::bluetooth::BtSendError::NoChannel) => {
+                SocketOpResult::Err(SockError::NotConnected)
+            }
+            Err(narf_filesystem::bluetooth::BtSendError::Busy)
+            | Err(narf_filesystem::bluetooth::BtSendError::NoCredits) => {
+                SocketOpResult::Err(SockError::WouldBlock)
+            }
+            Err(narf_filesystem::bluetooth::BtSendError::TooBig) => {
+                SocketOpResult::Err(SockError::MsgSize)
+            }
+            Err(narf_filesystem::bluetooth::BtSendError::WrongService) => {
+                SocketOpResult::Err(SockError::InvalidArg)
+            }
+        }
+    }
+
+    /// Recv on an accepted L2CAP/RFCOMM channel (issue #814).
+    /// Drains the pump into the local queue first, then returns one
+    /// SDU (SEQPACKET/DGRAM) or a STREAM prefix — a partial STREAM
+    /// read leaves the remainder staged at the front. MSG_PEEK does
+    /// not consume. Empty → EAGAIN; no channel → ENOTCONN.
+    fn bt_recv(self: &Arc<Self>, buf: &mut [u8], flags: u32) -> SocketOpResult {
+        let mut state = self.state.lock();
+        let SocketState::BluetoothConn { channel, rx, .. } = &mut *state else {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        };
+        let Some(ch) = *channel else {
+            return SocketOpResult::Err(SockError::NotConnected);
+        };
+        let drained = if self.protocol == BTPROTO_RFCOMM {
+            narf_filesystem::bluetooth::bt_drain_rfcomm(ch.dev, ch.handle, ch.local_cid, ch.dlci)
+        } else {
+            narf_filesystem::bluetooth::bt_drain_channel(ch.dev, ch.handle, ch.local_cid)
+        };
+        rx.extend(drained.unwrap_or_default());
+        let Some(sdu) = rx.front().cloned() else {
+            return SocketOpResult::Err(SockError::WouldBlock);
+        };
+        let take = buf.len().min(sdu.len());
+        buf[..take].copy_from_slice(&sdu[..take]);
+        if flags & MSG_PEEK == 0 {
+            if self.kind == SOCK_STREAM && take < sdu.len() {
+                let rest = sdu[take..].to_vec();
+                rx[0] = rest;
+            } else {
+                rx.pop_front();
+            }
+        }
+        let peer = Some(self.bt_channel_peer_sockaddr(&ch));
+        if take < sdu.len() {
+            SocketOpResult::ReceivedTruncated {
+                copied: take,
+                full_len: sdu.len(),
+                peer,
+            }
+        } else {
+            SocketOpResult::Received { n: take, peer }
+        }
+    }
+
+    /// `getpeername` on an accepted L2CAP/RFCOMM channel (issue
+    /// #814). No channel → ENOTCONN.
+    fn bt_getpeername(self: &Arc<Self>) -> SocketOpResult {
+        let state = self.state.lock();
+        let SocketState::BluetoothConn { channel, .. } = &*state else {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        };
+        let Some(ch) = *channel else {
+            return SocketOpResult::Err(SockError::NotConnected);
+        };
+        SocketOpResult::Addr(self.bt_channel_peer_sockaddr(&ch))
+    }
+
+    /// `shutdown` on an L2CAP/RFCOMM socket (issue #814): drop the
+    /// accepted channel (peer gets a Disconnection Request / DISC)
+    /// and/or the listen registration, then report success.
+    fn bt_shutdown(self: &Arc<Self>) -> SocketOpResult {
+        self.bt_teardown();
+        SocketOpResult::Ok(0)
+    }
+
+    /// Release the L2CAP/RFCOMM channel and/or listen registration
+    /// (issue #814). Idempotent: bridge calls are no-ops when the
+    /// pump no longer knows the channel, and the RFCOMM registry
+    /// entry is pruned (dead entries included — during Drop our own
+    /// Weak no longer upgrades). Called from shutdown and Drop.
+    fn bt_teardown(&self) {
+        let (listen, channel) = {
+            let mut state = self.state.lock();
+            let SocketState::BluetoothConn {
+                listen, channel, ..
+            } = &mut *state
+            else {
+                return;
+            };
+            (listen.take(), channel.take())
+        };
+        if let Some(ch) = channel {
+            if self.protocol == BTPROTO_RFCOMM {
+                narf_filesystem::bluetooth::bt_close_rfcomm(
+                    ch.dev,
+                    ch.handle,
+                    ch.local_cid,
+                    ch.dlci,
+                );
+            } else {
+                narf_filesystem::bluetooth::bt_disconnect_channel(ch.dev, ch.handle, ch.local_cid);
+            }
+        }
+        if let Some(l) = listen {
+            if self.protocol == BTPROTO_RFCOMM {
+                let mut listeners = RFCOMM_LISTENERS.lock();
+                listeners.retain(|(_, _, w)| {
+                    w.upgrade()
+                        .is_some_and(|s| Arc::as_ptr(&s) != self as *const SocketFile)
+                });
+            } else {
+                narf_filesystem::bluetooth::bt_unregister_psm(l.dev, l.psm, l.le);
+            }
+        }
+    }
+
+    /// Channel-event wake sink (issue #814). The pump publishes
+    /// whenever a peer opens a socket-claimable channel or stages
+    /// data on one; this bare readiness-generation bump wakes
+    /// parked poll/accept waiters, which re-run their readiness
+    /// scan (peeking the pump) on wake. Installed once per
+    /// AF_BLUETOOTH socket creation.
+    fn wake_bt_channel_event() {
+        narf_net::readiness::notify(0);
     }
 
     /// `AF_NETLINK` / `NETLINK_ROUTE` (rtnetlink) dispatcher. A `send` of an
@@ -10007,6 +10541,15 @@ impl Drop for SocketFile {
         }
         if let SocketState::Packet { sock } = &*self.state.lock() {
             sock.release();
+        }
+        // L2CAP/RFCOMM: dropping a listener unregisters its PSM /
+        // server channel and dropping an accepted socket disconnects
+        // its channel (issue #814). Idempotent — a socket that was
+        // already shut down has nothing left to release.
+        if self.domain == AF_BLUETOOTH
+            && (self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM)
+        {
+            self.bt_teardown();
         }
         let bypass_state = match &*self.state.lock() {
             SocketState::Bypass { state } => Some(state.clone()),

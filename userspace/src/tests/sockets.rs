@@ -1849,3 +1849,755 @@ fn smoke_socket_stack_errno_passthrough() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_socket_stack_errno_passthrough);
+
+// ── AF_BLUETOOTH L2CAP/RFCOMM channel sockets (issue #814) ──────────────
+//
+// Exercise the `SocketFile::dispatch_op` surface against a scripted
+// fake bridge installed into `narf_filesystem::bluetooth`: the fake
+// plays the pump's role (PSM registry, pending channels, staged
+// inbound data, send recording) so the tests prove the socket state
+// machine and the broker contract. The real pump is covered by the
+// pump fixture tests in `narf-bluetooth` and the frame e2e fixture;
+// this layer never touches a real controller.
+
+/// Scripted fake for the L2CAP/RFCOMM bridge + HCI ioctl providers.
+struct FakeBt {
+    /// The fixture controller's bdaddr (hci_dev_info bytes 10..16).
+    dev_bdaddr: [u8; 6],
+    /// Registered listening PSMs: (dev, psm, le).
+    registered: alloc::vec::Vec<(u16, u16, bool)>,
+    /// Peer-opened channels awaiting accept: (dev, psm, le, channel).
+    pending: alloc::vec::Vec<(u16, u16, bool, narf_filesystem::bluetooth::BtPendingChannel)>,
+    /// Peer-opened RFCOMM DLCs awaiting accept: (dev, channel, dlc).
+    pending_rfcomm: alloc::vec::Vec<(u16, u8, narf_filesystem::bluetooth::BtPendingRfcomm)>,
+    /// Claimed L2CAP channels: (handle, local cid).
+    open: alloc::vec::Vec<(u16, u16)>,
+    /// Claimed RFCOMM DLCs: (handle, local cid, dlci).
+    open_rfcomm: alloc::vec::Vec<(u16, u16, u8)>,
+    /// Staged inbound L2CAP SDUs: (handle, local cid, sdu).
+    rx: alloc::vec::Vec<(u16, u16, alloc::vec::Vec<u8>)>,
+    /// Staged inbound RFCOMM payloads: (handle, local cid, dlci, data).
+    rx_rfcomm: alloc::vec::Vec<(u16, u16, u8, alloc::vec::Vec<u8>)>,
+    /// Recorded L2CAP sends: (handle, local cid, payload).
+    sent: alloc::vec::Vec<(u16, u16, alloc::vec::Vec<u8>)>,
+    /// Recorded RFCOMM sends: (handle, local cid, dlci, payload).
+    sent_rfcomm: alloc::vec::Vec<(u16, u16, u8, alloc::vec::Vec<u8>)>,
+    /// Recorded L2CAP disconnects: (handle, local cid).
+    disconnected: alloc::vec::Vec<(u16, u16)>,
+    /// Recorded RFCOMM closes: (handle, local cid, dlci).
+    closed_rfcomm: alloc::vec::Vec<(u16, u16, u8)>,
+}
+
+impl FakeBt {
+    const fn new() -> Self {
+        Self {
+            dev_bdaddr: [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5],
+            registered: alloc::vec::Vec::new(),
+            pending: alloc::vec::Vec::new(),
+            pending_rfcomm: alloc::vec::Vec::new(),
+            open: alloc::vec::Vec::new(),
+            open_rfcomm: alloc::vec::Vec::new(),
+            rx: alloc::vec::Vec::new(),
+            rx_rfcomm: alloc::vec::Vec::new(),
+            sent: alloc::vec::Vec::new(),
+            sent_rfcomm: alloc::vec::Vec::new(),
+            disconnected: alloc::vec::Vec::new(),
+            closed_rfcomm: alloc::vec::Vec::new(),
+        }
+    }
+}
+
+static FAKE_BT: IrqSafeSpinLock<FakeBt> = IrqSafeSpinLock::new(FakeBt::new());
+
+fn fake_bt_hci_dev_count() -> usize {
+    1
+}
+
+fn fake_bt_hci_dev_info(dev: u16) -> Option<alloc::vec::Vec<u8>> {
+    if dev != 0 {
+        return None;
+    }
+    let mut info = alloc::vec![0u8; 24];
+    info[0..2].copy_from_slice(&0u16.to_le_bytes());
+    info[2..10].copy_from_slice(b"hci0\0\0\0\0");
+    info[10..16].copy_from_slice(&FAKE_BT.lock().dev_bdaddr);
+    info[16..20].copy_from_slice(&1u32.to_le_bytes());
+    Some(info)
+}
+
+fn fake_bt_hci_dev_power(_dev: u16, _on: bool) -> bool {
+    true
+}
+
+fn fake_bt_register_psm(
+    dev: u16,
+    psm: u16,
+    le: bool,
+) -> narf_filesystem::bluetooth::BtRegisterStatus {
+    use narf_filesystem::bluetooth::BtRegisterStatus;
+    if psm == 0x0001 || psm == 0x0003 {
+        return BtRegisterStatus::InUse;
+    }
+    let mut fake = FAKE_BT.lock();
+    if fake
+        .registered
+        .iter()
+        .any(|(d, p, l)| *d == dev && *p == psm && *l == le)
+    {
+        return BtRegisterStatus::InUse;
+    }
+    fake.registered.push((dev, psm, le));
+    BtRegisterStatus::Registered
+}
+
+fn fake_bt_unregister_psm(dev: u16, psm: u16, le: bool) {
+    FAKE_BT
+        .lock()
+        .registered
+        .retain(|(d, p, l)| !(*d == dev && *p == psm && *l == le));
+}
+
+fn fake_bt_take_pending_channel(
+    dev: u16,
+    psm: u16,
+    le: bool,
+) -> Option<narf_filesystem::bluetooth::BtPendingChannel> {
+    let mut fake = FAKE_BT.lock();
+    let idx = fake
+        .pending
+        .iter()
+        .position(|(d, p, l, _)| *d == dev && *p == psm && *l == le)?;
+    let (_, _, _, ch) = fake.pending.remove(idx);
+    fake.open.push((ch.0, ch.1));
+    Some(ch)
+}
+
+fn fake_bt_pending_channel(dev: u16, psm: u16, le: bool) -> bool {
+    FAKE_BT
+        .lock()
+        .pending
+        .iter()
+        .any(|(d, p, l, _)| *d == dev && *p == psm && *l == le)
+}
+
+fn fake_bt_send_channel(
+    _dev: u16,
+    handle: u16,
+    cid: u16,
+    payload: &[u8],
+) -> Result<usize, narf_filesystem::bluetooth::BtSendError> {
+    use narf_filesystem::bluetooth::BtSendError;
+    let mut fake = FAKE_BT.lock();
+    if !fake.open.iter().any(|(h, c)| *h == handle && *c == cid) {
+        return Err(BtSendError::NoChannel);
+    }
+    fake.sent.push((handle, cid, payload.to_vec()));
+    Ok(payload.len())
+}
+
+fn fake_bt_drain_channel(
+    _dev: u16,
+    handle: u16,
+    cid: u16,
+) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
+    let mut fake = FAKE_BT.lock();
+    if !fake.open.iter().any(|(h, c)| *h == handle && *c == cid) {
+        return None;
+    }
+    let mut out = alloc::vec::Vec::new();
+    fake.rx.retain(|(h, c, p)| {
+        if *h == handle && *c == cid {
+            out.push(p.clone());
+            false
+        } else {
+            true
+        }
+    });
+    Some(out)
+}
+
+fn fake_bt_channel_rx_pending(_dev: u16, handle: u16, cid: u16) -> bool {
+    let fake = FAKE_BT.lock();
+    fake.open.iter().any(|(h, c)| *h == handle && *c == cid)
+        && fake.rx.iter().any(|(h, c, _)| *h == handle && *c == cid)
+}
+
+fn fake_bt_disconnect_channel(_dev: u16, handle: u16, cid: u16) -> bool {
+    let mut fake = FAKE_BT.lock();
+    let was_open = fake.open.iter().any(|(h, c)| *h == handle && *c == cid);
+    fake.open.retain(|(h, c)| !(*h == handle && *c == cid));
+    fake.disconnected.push((handle, cid));
+    was_open
+}
+
+fn fake_bt_take_pending_rfcomm(
+    dev: u16,
+    channel: u8,
+) -> Option<narf_filesystem::bluetooth::BtPendingRfcomm> {
+    let mut fake = FAKE_BT.lock();
+    let idx = fake
+        .pending_rfcomm
+        .iter()
+        .position(|(d, c, _)| *d == dev && *c == channel)?;
+    let (_, _, dlc) = fake.pending_rfcomm.remove(idx);
+    fake.open_rfcomm.push((dlc.0, dlc.1, dlc.3));
+    Some(dlc)
+}
+
+fn fake_bt_pending_rfcomm(dev: u16, channel: u8) -> bool {
+    FAKE_BT
+        .lock()
+        .pending_rfcomm
+        .iter()
+        .any(|(d, c, _)| *d == dev && *c == channel)
+}
+
+fn fake_bt_send_rfcomm(
+    _dev: u16,
+    handle: u16,
+    cid: u16,
+    dlci: u8,
+    payload: &[u8],
+) -> Result<usize, narf_filesystem::bluetooth::BtSendError> {
+    use narf_filesystem::bluetooth::BtSendError;
+    let mut fake = FAKE_BT.lock();
+    if !fake
+        .open_rfcomm
+        .iter()
+        .any(|(h, c, d)| *h == handle && *c == cid && *d == dlci)
+    {
+        return Err(BtSendError::NoChannel);
+    }
+    fake.sent_rfcomm.push((handle, cid, dlci, payload.to_vec()));
+    Ok(payload.len())
+}
+
+fn fake_bt_drain_rfcomm(
+    _dev: u16,
+    handle: u16,
+    cid: u16,
+    dlci: u8,
+) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
+    let mut fake = FAKE_BT.lock();
+    if !fake
+        .open_rfcomm
+        .iter()
+        .any(|(h, c, d)| *h == handle && *c == cid && *d == dlci)
+    {
+        return None;
+    }
+    let mut out = alloc::vec::Vec::new();
+    fake.rx_rfcomm.retain(|(h, c, d, p)| {
+        if *h == handle && *c == cid && *d == dlci {
+            out.push(p.clone());
+            false
+        } else {
+            true
+        }
+    });
+    Some(out)
+}
+
+fn fake_bt_rfcomm_rx_pending(_dev: u16, handle: u16, cid: u16, dlci: u8) -> bool {
+    let fake = FAKE_BT.lock();
+    fake.open_rfcomm
+        .iter()
+        .any(|(h, c, d)| *h == handle && *c == cid && *d == dlci)
+        && fake
+            .rx_rfcomm
+            .iter()
+            .any(|(h, c, d, _)| *h == handle && *c == cid && *d == dlci)
+}
+
+fn fake_bt_close_rfcomm(_dev: u16, handle: u16, cid: u16, dlci: u8) -> bool {
+    let mut fake = FAKE_BT.lock();
+    let was_open = fake
+        .open_rfcomm
+        .iter()
+        .any(|(h, c, d)| *h == handle && *c == cid && *d == dlci);
+    fake.open_rfcomm
+        .retain(|(h, c, d)| !(*h == handle && *c == cid && *d == dlci));
+    fake.closed_rfcomm.push((handle, cid, dlci));
+    was_open
+}
+
+/// Reset the fake and install it as the bridge + HCI providers.
+fn install_fake_bt_bridge() {
+    *FAKE_BT.lock() = FakeBt::new();
+    narf_filesystem::bluetooth::install_hci_ioctl_handlers(
+        fake_bt_hci_dev_count,
+        fake_bt_hci_dev_info,
+        fake_bt_hci_dev_power,
+    );
+    narf_filesystem::bluetooth::install_bt_l2cap_handlers(
+        fake_bt_register_psm,
+        fake_bt_unregister_psm,
+        fake_bt_take_pending_channel,
+        fake_bt_pending_channel,
+        fake_bt_send_channel,
+        fake_bt_drain_channel,
+        fake_bt_channel_rx_pending,
+        fake_bt_disconnect_channel,
+    );
+    narf_filesystem::bluetooth::install_bt_rfcomm_handlers(
+        fake_bt_take_pending_rfcomm,
+        fake_bt_pending_rfcomm,
+        fake_bt_send_rfcomm,
+        fake_bt_drain_rfcomm,
+        fake_bt_rfcomm_rx_pending,
+        fake_bt_close_rfcomm,
+    );
+}
+
+/// Script a peer-opened LE/BR-EDR channel for `psm` (peer bdaddr
+/// B0:B1:B2:B3:B4:B5, address type 1 for LE).
+fn fake_bt_script_channel(psm: u16, le: bool, handle: u16, local_cid: u16, peer_cid: u16) {
+    FAKE_BT.lock().pending.push((
+        0,
+        psm,
+        le,
+        (
+            handle,
+            local_cid,
+            peer_cid,
+            [1, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5],
+        ),
+    ));
+}
+
+/// Script a peer-opened RFCOMM DLC for `channel` (DLCI `2*channel+1`).
+fn fake_bt_script_rfcomm(channel: u8, handle: u16, local_cid: u16, peer_cid: u16, dlci: u8) {
+    FAKE_BT.lock().pending_rfcomm.push((
+        0,
+        channel,
+        (
+            handle,
+            local_cid,
+            peer_cid,
+            dlci,
+            [0, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5],
+        ),
+    ));
+}
+
+fn fake_bt_stage_rx(handle: u16, cid: u16, payload: &[u8]) {
+    FAKE_BT.lock().rx.push((handle, cid, payload.to_vec()));
+}
+
+fn fake_bt_stage_rfcomm_rx(handle: u16, cid: u16, dlci: u8, payload: &[u8]) {
+    FAKE_BT
+        .lock()
+        .rx_rfcomm
+        .push((handle, cid, dlci, payload.to_vec()));
+}
+
+fn bt_l2cap_addr(psm: u16, bdaddr: [u8; 6], addr_type: u8) -> crate::socket::SockAddr {
+    let mut body = alloc::vec![];
+    body.extend_from_slice(&psm.to_le_bytes());
+    body.extend_from_slice(&bdaddr);
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.push(addr_type);
+    crate::socket::SockAddr {
+        family: crate::socket::AF_BLUETOOTH,
+        body,
+    }
+}
+
+fn bt_rfcomm_addr(bdaddr: [u8; 6], channel: u8) -> crate::socket::SockAddr {
+    let mut body = alloc::vec![];
+    body.extend_from_slice(&bdaddr);
+    body.push(channel);
+    crate::socket::SockAddr {
+        family: crate::socket::AF_BLUETOOTH,
+        body,
+    }
+}
+
+/// L2CAP LE CoC: bind → listen → accept (EAGAIN, then a scripted
+/// peer open) → getpeername → recv a staged SDU → send → shutdown
+/// disconnects. The send/recv cross the broker into the fake.
+fn smoke_bt_l2cap_listen_accept_send_recv() -> TestResult {
+    install_fake_bt_bridge();
+    let server =
+        crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+    let addr = bt_l2cap_addr(0x0080, [0; 6], 1);
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("L2CAP bind failed");
+    }
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("L2CAP listen failed");
+    }
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Accept),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock)
+    ) {
+        return TestResult::Fail("accept with no pending channel should be EAGAIN");
+    }
+    fake_bt_script_channel(0x0080, true, 0x0041, 0x0040, 0x0041);
+    let child = match server.dispatch_op(crate::socket::SocketOp::Accept) {
+        crate::socket::SocketOpResult::Accepted { socket, peer } => {
+            let mut expected = alloc::vec![];
+            expected.extend_from_slice(&0x0080u16.to_le_bytes());
+            expected.extend_from_slice(&[0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5]);
+            expected.extend_from_slice(&0x0041u16.to_le_bytes());
+            expected.push(1);
+            match peer {
+                Some(crate::socket::SockAddr { family, body })
+                    if family == crate::socket::AF_BLUETOOTH && body == expected => {}
+                _ => return TestResult::Fail("accept peer sockaddr mismatch"),
+            }
+            socket
+        }
+        _ => return TestResult::Fail("accept did not return Accepted"),
+    };
+    match child.dispatch_op(crate::socket::SocketOp::GetPeerName) {
+        crate::socket::SocketOpResult::Addr(addr) if addr.body.len() == 11 => {}
+        _ => return TestResult::Fail("getpeername failed on accepted channel"),
+    }
+    fake_bt_stage_rx(0x0041, 0x0040, b"ping");
+    let mut out = [0u8; 16];
+    match child.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    }) {
+        crate::socket::SocketOpResult::Received { n, .. } if n == 4 && &out[..4] == b"ping" => {}
+        _ => return TestResult::Fail("recv did not return the staged SDU"),
+    }
+    if !matches!(
+        child.dispatch_op(crate::socket::SocketOp::Recv {
+            buf: &mut out,
+            flags: 0,
+        }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock)
+    ) {
+        return TestResult::Fail("recv on empty channel should be EAGAIN");
+    }
+    match child.dispatch_op(crate::socket::SocketOp::Send {
+        buf: b"pong",
+        flags: 0,
+        addr: None,
+    }) {
+        crate::socket::SocketOpResult::Ok(4) => {}
+        _ => return TestResult::Fail("send did not report 4 bytes"),
+    }
+    if FAKE_BT.lock().sent != alloc::vec![(0x0041u16, 0x0040u16, b"pong".to_vec())] {
+        return TestResult::Fail("send did not reach the fake bridge");
+    }
+    if !matches!(
+        child.dispatch_op(crate::socket::SocketOp::Shutdown { how: 0 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("shutdown failed");
+    }
+    if !FAKE_BT
+        .lock()
+        .disconnected
+        .contains(&(0x0041u16, 0x0040u16))
+    {
+        return TestResult::Fail("shutdown did not disconnect the channel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_bt_l2cap_listen_accept_send_recv);
+
+/// L2CAP listen/accept/send/recv/connect error paths: unbound
+/// listen, unlistened accept, send/recv without a channel,
+/// connect() (no backend — #889), unroutable bdaddr, service PSM,
+/// and a second listener on the same PSM.
+fn smoke_bt_l2cap_listen_errors() -> TestResult {
+    install_fake_bt_bridge();
+    let s = crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::BadFdState)
+    ) {
+        return TestResult::Fail("listen without bind should be EBADFD");
+    }
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Accept),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::BadFdState)
+    ) {
+        return TestResult::Fail("accept without listen should be EBADFD");
+    }
+    let mut out = [0u8; 8];
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Send {
+            buf: b"x",
+            flags: 0,
+            addr: None,
+        }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::NotConnected)
+    ) {
+        return TestResult::Fail("send without a channel should be ENOTCONN");
+    }
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Recv {
+            buf: &mut out,
+            flags: 0,
+        }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::NotConnected)
+    ) {
+        return TestResult::Fail("recv without a channel should be ENOTCONN");
+    }
+    let addr = bt_l2cap_addr(0x0080, [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5], 1);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::NotSupported)
+    ) {
+        return TestResult::Fail("connect should stay EOPNOTSUPP without #889");
+    }
+    // Unroutable local bdaddr: no controller — ENODEV.
+    let s2 =
+        crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+    let addr = bt_l2cap_addr(0x0080, [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5], 1);
+    if !matches!(
+        s2.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("bind for the unroutable-addr case failed");
+    }
+    if !matches!(
+        s2.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::NoDevice)
+    ) {
+        return TestResult::Fail("listen on an unroutable bdaddr should be ENODEV");
+    }
+    // Service PSM (SDP 0x0001): EADDRINUSE.
+    let s3 =
+        crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+    let addr = bt_l2cap_addr(0x0001, [0; 6], 0);
+    if !matches!(
+        s3.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("bind for the service-PSM case failed");
+    }
+    if !matches!(
+        s3.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::AddrInUse)
+    ) {
+        return TestResult::Fail("listen on SDP PSM 0x0001 should be EADDRINUSE");
+    }
+    // Second listener on the same PSM: EADDRINUSE.
+    let s4 =
+        crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+    let addr = bt_l2cap_addr(0x0080, [0; 6], 1);
+    if !matches!(
+        s4.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("bind for the second-listener case failed");
+    }
+    if !matches!(
+        s4.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("first listen on PSM 0x0080 failed");
+    }
+    let s5 =
+        crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+    let addr = bt_l2cap_addr(0x0080, [0; 6], 1);
+    if !matches!(
+        s5.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("bind for the second listener failed");
+    }
+    if !matches!(
+        s5.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::AddrInUse)
+    ) {
+        return TestResult::Fail("second listen on the same PSM should be EADDRINUSE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_bt_l2cap_listen_errors);
+
+/// RFCOMM: channel 0 invalid, channel 5 listen → second listener
+/// EADDRINUSE → accept a scripted DLC → recv a staged payload →
+/// send → shutdown closes the DLC. Dropping the listener frees
+/// the channel for a fresh listener.
+fn smoke_bt_rfcomm_listen_accept_send_recv() -> TestResult {
+    install_fake_bt_bridge();
+    let server = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_BLUETOOTH,
+        crate::socket::SOCK_STREAM,
+        crate::socket::BTPROTO_RFCOMM,
+    );
+    let addr = bt_rfcomm_addr([0; 6], 0);
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("RFCOMM bind failed");
+    }
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InvalidArg)
+    ) {
+        return TestResult::Fail("listen on server channel 0 should be EINVAL");
+    }
+    let addr = bt_rfcomm_addr([0; 6], 5);
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("RFCOMM bind on channel 5 failed");
+    }
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("RFCOMM listen on channel 5 failed");
+    }
+    let server2 = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_BLUETOOTH,
+        crate::socket::SOCK_STREAM,
+        crate::socket::BTPROTO_RFCOMM,
+    );
+    let addr = bt_rfcomm_addr([0; 6], 5);
+    if !matches!(
+        server2.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("second RFCOMM bind failed");
+    }
+    if !matches!(
+        server2.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::AddrInUse)
+    ) {
+        return TestResult::Fail("second RFCOMM listener on channel 5 should be EADDRINUSE");
+    }
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Accept),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock)
+    ) {
+        return TestResult::Fail("RFCOMM accept with no pending DLC should be EAGAIN");
+    }
+    fake_bt_script_rfcomm(5, 0x0041, 0x0040, 0x0041, 11);
+    let child = match server.dispatch_op(crate::socket::SocketOp::Accept) {
+        crate::socket::SocketOpResult::Accepted { socket, peer } => {
+            let mut expected = alloc::vec![];
+            expected.extend_from_slice(&[0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5]);
+            expected.push(5);
+            match peer {
+                Some(crate::socket::SockAddr { family, body })
+                    if family == crate::socket::AF_BLUETOOTH && body == expected => {}
+                _ => return TestResult::Fail("RFCOMM accept peer sockaddr mismatch"),
+            }
+            socket
+        }
+        _ => return TestResult::Fail("RFCOMM accept did not return Accepted"),
+    };
+    fake_bt_stage_rfcomm_rx(0x0041, 0x0040, 11, b"hello");
+    let mut out = [0u8; 16];
+    match child.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    }) {
+        crate::socket::SocketOpResult::Received { n, .. } if n == 5 && &out[..5] == b"hello" => {}
+        _ => return TestResult::Fail("RFCOMM recv did not return the staged payload"),
+    }
+    match child.dispatch_op(crate::socket::SocketOp::Send {
+        buf: b"world",
+        flags: 0,
+        addr: None,
+    }) {
+        crate::socket::SocketOpResult::Ok(5) => {}
+        _ => return TestResult::Fail("RFCOMM send did not report 5 bytes"),
+    }
+    if FAKE_BT.lock().sent_rfcomm != alloc::vec![(0x0041u16, 0x0040u16, 11u8, b"world".to_vec())] {
+        return TestResult::Fail("RFCOMM send did not reach the fake bridge");
+    }
+    if !matches!(
+        child.dispatch_op(crate::socket::SocketOp::Shutdown { how: 0 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("RFCOMM shutdown failed");
+    }
+    if !FAKE_BT
+        .lock()
+        .closed_rfcomm
+        .contains(&(0x0041u16, 0x0040u16, 11u8))
+    {
+        return TestResult::Fail("RFCOMM shutdown did not close the DLC");
+    }
+    // Dropping the listener frees the channel: a fresh listener on
+    // channel 5 succeeds (dead registry entries prune on lookup).
+    drop(server);
+    let server3 = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_BLUETOOTH,
+        crate::socket::SOCK_STREAM,
+        crate::socket::BTPROTO_RFCOMM,
+    );
+    let addr = bt_rfcomm_addr([0; 6], 5);
+    if !matches!(
+        server3.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("RFCOMM rebind after drop failed");
+    }
+    if !matches!(
+        server3.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("RFCOMM listen after drop should succeed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_bt_rfcomm_listen_accept_send_recv);
+
+/// Drop teardown: dropping an accepted L2CAP socket disconnects
+/// its channel, and dropping the listener unregisters its PSM.
+fn smoke_bt_l2cap_drop_teardown() -> TestResult {
+    install_fake_bt_bridge();
+    {
+        let server =
+            crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+        let addr = bt_l2cap_addr(0x0080, [0; 6], 1);
+        if !matches!(
+            server.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+            crate::socket::SocketOpResult::Ok(_)
+        ) {
+            return TestResult::Fail("bind for the drop case failed");
+        }
+        if !matches!(
+            server.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+            crate::socket::SocketOpResult::Ok(_)
+        ) {
+            return TestResult::Fail("listen for the drop case failed");
+        }
+        if !FAKE_BT.lock().registered.contains(&(0u16, 0x0080u16, true)) {
+            return TestResult::Fail("listen did not register the PSM");
+        }
+        fake_bt_script_channel(0x0080, true, 0x0041, 0x0040, 0x0041);
+        let child = match server.dispatch_op(crate::socket::SocketOp::Accept) {
+            crate::socket::SocketOpResult::Accepted { socket, .. } => socket,
+            _ => return TestResult::Fail("accept for the drop case failed"),
+        };
+        drop(child);
+        if !FAKE_BT
+            .lock()
+            .disconnected
+            .contains(&(0x0041u16, 0x0040u16))
+        {
+            return TestResult::Fail("dropping the accepted socket did not disconnect");
+        }
+    }
+    if FAKE_BT
+        .lock()
+        .registered
+        .iter()
+        .any(|(_, p, _)| *p == 0x0080)
+    {
+        return TestResult::Fail("dropping the listener did not unregister the PSM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_bt_l2cap_drop_teardown);
