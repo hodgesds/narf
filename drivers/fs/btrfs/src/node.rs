@@ -170,6 +170,43 @@ macro_rules! admin_op {
     }};
 }
 
+/// A running mutation of one inode's shared metadata
+/// ([`BtrfsNode::begin_inode_update`]).
+struct InodeUpdate<'a>(&'a crate::volume::MmapAnchor);
+
+impl<'a> InodeUpdate<'a> {
+    fn begin(anchor: &'a crate::volume::MmapAnchor) -> Self {
+        let _cached = anchor.inode.lock();
+        anchor
+            .update_seq
+            .fetch_add(1, core::sync::atomic::Ordering::Release);
+        Self(anchor)
+    }
+}
+
+impl Drop for InodeUpdate<'_> {
+    fn drop(&mut self) {
+        let _cached = self.0.inode.lock();
+        self.0
+            .update_seq
+            .fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A running mutation of one file's content
+/// ([`BtrfsNode::begin_content_update`]).
+struct ContentUpdate<'a, B: BlockDevice + 'static> {
+    _inode: InodeUpdate<'a>,
+    node: &'a BtrfsNode<B>,
+    vol: &'a BtrfsVolume<B>,
+}
+
+impl<B: BlockDevice + 'static> Drop for ContentUpdate<'_, B> {
+    fn drop(&mut self) {
+        self.node.bump_cache_generation(self.vol);
+    }
+}
+
 /// Run the lock-free read `$body` against `$root`, the root `$node` samples,
 /// and retry it from the tree's current root if it failed with `InvalidData`
 /// while the root moved underneath it: a block of the sampled tree was freed
@@ -276,19 +313,74 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         *self.anchor.inode.lock()
     }
 
+    /// Publish `inode`, as a mutator under the operation lock.
     fn cache_inode(&self, inode: InodeItem) {
-        *self.anchor.inode.lock() = inode;
+        let mut cached = self.anchor.inode.lock();
+        *cached = inode;
         self.anchor
             .live_size
             .store(inode.size, core::sync::atomic::Ordering::Release);
     }
 
+    /// Publish what a lock-free refresh read from the tree, unless a mutation
+    /// of this inode is running or moved `seq` since the refresh began: the
+    /// mutation owns the shared metadata then, and this read may predate it.
+    pub(crate) fn publish_refreshed(&self, seq: u64, inode: InodeItem) -> bool {
+        let mut cached = self.anchor.inode.lock();
+        if seq & 1 != 0
+            || self
+                .anchor
+                .update_seq
+                .load(core::sync::atomic::Ordering::Acquire)
+                != seq
+        {
+            return false;
+        }
+        *cached = inode;
+        self.anchor
+            .live_size
+            .store(inode.size, core::sync::atomic::Ordering::Release);
+        true
+    }
+
+    /// The inode's current update sequence (see `MmapAnchor::update_seq`).
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn update_seq(&self) -> u64 {
+        self.anchor
+            .update_seq
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// `stat`'s view of the tree. Like `btrfs_getattr` this never waits for a
+    /// transaction: the shared inode stays authoritative while a mutation of
+    /// it runs.
     async fn refresh_inode(&self) -> Result<InodeItem, FsError> {
         let vol = self.volume()?;
-        let _op = vol.op_lock().lock().await;
+        let _reader = vol.begin_reader();
+        let seq = self
+            .anchor
+            .update_seq
+            .load(core::sync::atomic::Ordering::Acquire);
         let inode = with_root_retry!(self, vol, |root| vol.load_inode_in(root, self.ino).await)?;
-        self.cache_inode(inode);
+        self.publish_refreshed(seq, inode);
         Ok(inode)
+    }
+
+    /// Mark a mutation of this inode's metadata in flight, under the
+    /// operation lock (which keeps these from nesting).
+    fn begin_inode_update(&self) -> InodeUpdate<'_> {
+        InodeUpdate::begin(&self.anchor)
+    }
+
+    /// [`Self::begin_inode_update`] for a mutation of the file's bytes or
+    /// length: also moves the page-fill epoch on both sides of it.
+    fn begin_content_update<'a>(&'a self, vol: &'a BtrfsVolume<B>) -> ContentUpdate<'a, B> {
+        self.bump_cache_generation(vol);
+        ContentUpdate {
+            _inode: self.begin_inode_update(),
+            node: self,
+            vol,
+        }
     }
 
     /// Change mode / owners / timestamps of this inode and refresh the cache
@@ -301,6 +393,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         autogrow!(
             vol,
             async {
+                let _update = self.begin_inode_update();
                 let updated = crate::write::set_inode_attrs(&vol, self.ino, change).await?;
                 self.cache_inode(updated);
                 Ok(())
@@ -740,6 +833,31 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             .ok_or(FsError::NotFound)
     }
 
+    /// `btrfs_lookup`: resolve `name` to a node holding its inode, without
+    /// waiting for a writer or a commit (Linux takes the directory's
+    /// `i_rwsem` shared, which a transaction commit never holds).
+    ///
+    /// Each namespace operation stages atomically, so the tree shows a name
+    /// before or after it, never between. What the lock used to rule out is
+    /// the inode going away between the two reads here: an unlink or
+    /// replacing rename plus final eviction. The anchor `load_child` takes
+    /// stops an eviction that has not begun; one already past that point
+    /// moved `eviction_count`, so start over against the current tree.
+    async fn lookup_child(&self, name: &str) -> Result<Arc<BtrfsNode<B>>, FsError> {
+        let vol = self.volume()?;
+        let _reader = vol.begin_reader();
+        loop {
+            let evictions = vol.eviction_count();
+            let result = match self.find_child(name).await {
+                Ok(entry) => self.load_child(&vol, &entry).await,
+                Err(error) => Err(error),
+            };
+            if vol.eviction_count() == evictions {
+                return result;
+            }
+        }
+    }
+
     /// Load the node named by `entry`. An `INODE_ITEM` location is an inode in
     /// this same tree; a `ROOT_ITEM` location is a nested subvolume — resolve its
     /// tree in the root tree and enter it at its root directory (inode 256).
@@ -807,14 +925,15 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let vol = self.volume()?;
-            let _op = vol.op_lock().lock().await;
+            // No operation lock: a read never waits for a writer or a commit,
+            // as `btrfs_file_read_iter` never waits for a transaction. Size
+            // and extents come from one root, so the read sees a whole
+            // operation or none of it, and the reader guard keeps what that
+            // root names on disk until it is done.
+            let _reader = vol.begin_reader();
             with_root_retry!(self, vol, |root| {
-                // The size is re-read from the tree: this node's cached inode
-                // predates any write made through it (or through another open
-                // file of the same inode).
                 match vol.load_inode_in(root, self.ino).await {
                     Ok(inode) => {
-                        self.cache_inode(inode);
                         crate::extent::read_file(&vol, root, self.ino, inode.size, offset, buf)
                             .await
                     }
@@ -838,11 +957,11 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             autogrow!(
                 vol,
                 async {
-                    // Invalidate after acquiring op_lock, before bytes move.
-                    // Otherwise a reader can tag old bytes with the epoch a
-                    // queued writer will leave current after changing them.
+                    // Invalidate before bytes move and again after: a page
+                    // fill runs beside this write, and bytes it read at
+                    // either epoch must not stay current once it is done.
                     // Partial errors must invalidate retained pages too.
-                    self.bump_cache_generation(&vol);
+                    let _update = self.begin_content_update(&vol);
                     let result =
                         crate::write::cow_write_file(&vol, self.ino, &self.inode(), offset, buf)
                             .await;
@@ -869,24 +988,31 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 async {
                     // The epoch, visible EOF and PTE revoke all belong to
                     // this serialized mutation, before retiring its extents.
-                    self.bump_cache_generation(&vol);
+                    let update = self.begin_content_update(&vol);
                     let old_size = self
                         .anchor
                         .live_size
                         .load(core::sync::atomic::Ordering::Relaxed);
-                    if len < old_size {
+                    let shrinks = len < old_size;
+                    if shrinks {
                         self.anchor
                             .live_size
                             .store(len, core::sync::atomic::Ordering::Relaxed);
                         if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
-                            // op_lock is already held; refresh_inode would
-                            // try to acquire it recursively.
                             self.cache_inode(vol.load_inode(self.ino).await?);
                             return Err(error);
                         }
                     }
                     let result = crate::write::truncate_file(&vol, self.ino, len).await;
                     self.cache_inode(vol.load_inode(self.ino).await?);
+                    drop(update);
+                    // Twice, as `truncate_pagecache` unmaps twice: a fault
+                    // that passed its EOF check before the store above is
+                    // not excluded by any lock and may have installed a
+                    // retired page since the first pass.
+                    if shrinks {
+                        narf_filesystem::unmap_mapping_range(self, len)?;
+                    }
                     result
                 }
                 .await
@@ -907,10 +1033,10 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             autogrow!(
                 vol,
                 async {
-                    // Serialize the epoch with readers as for write. A
-                    // staged fallocate can change bytes before returning an
-                    // error, so invalidate before its first stage.
-                    self.bump_cache_generation(&vol);
+                    // Epochs as for write. A staged fallocate can change
+                    // bytes before returning an error, so invalidate before
+                    // its first stage.
+                    let _update = self.begin_content_update(&vol);
                     let result =
                         crate::write::fallocate_file(&vol, self.ino, mode, offset, len).await;
                     self.cache_inode(vol.load_inode(self.ino).await?);
@@ -1237,21 +1363,12 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move {
-            let vol = self.volume()?;
-            let _op = vol.op_lock().lock().await;
-            let entry = self.find_child(name).await?;
-            let node = self.load_child(&vol, &entry).await?;
-            Ok(node as Arc<dyn FileOps>)
-        })
+        Box::pin(async move { Ok(self.lookup_child(name).await? as Arc<dyn FileOps>) })
     }
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
-            let vol = self.volume()?;
-            let _op = vol.op_lock().lock().await;
-            let entry = self.find_child(name).await?;
-            let node = self.load_child(&vol, &entry).await?;
+            let node = self.lookup_child(name).await?;
             if !node.inode().is_dir() {
                 return Err(FsError::NotFound);
             }

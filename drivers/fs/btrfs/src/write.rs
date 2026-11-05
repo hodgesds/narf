@@ -1189,11 +1189,14 @@ fn fs_commit_from(out: CowOut, gen: u64, csum_type: u16) -> Result<FsCommit, FsE
 /// then a writeout of the whole extent + csum + root + free-space set. Those
 /// costs are per *transaction*, not per operation, so batching amortises them.
 ///
-/// The bound is what a crash may discard and how long the pinned set withholds
-/// freed space, so it cannot simply grow: this is the same trade-off Linux
-/// makes with its 30-second commit interval, expressed in operations because
-/// NARF has no wall clock in the commit path.
-const MAX_BATCH_OPS: usize = 8;
+/// Linux bounds a transaction by time and space pressure, and `fsync` covers
+/// whoever cannot wait. All three exist here ([`spawn_commit_timer`],
+/// [`commit_meta_reserve`], [`BtrfsVolume::sync_to_disk`]), so this is only a
+/// cap on what one commit must process, and a low one is not free: a commit
+/// on a real root takes hundreds of milliseconds and every writer queues behind
+/// it, and at a commit per eight operations a desktop session starting up ran
+/// them back to back, at some thirty write operations a second system-wide.
+pub(crate) const MAX_BATCH_OPS: usize = 64;
 
 /// Operations accumulated into one not-yet-committed transaction.
 ///
@@ -5164,6 +5167,32 @@ fn commit_phase(phase: u32) {
     COMMIT_PHASE.store(phase, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Commits per [`note_commit_time`] line.
+const COMMIT_TIME_WINDOW: u64 = 256;
+static COMMIT_TIME_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static COMMIT_TIME_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static COMMIT_TIME_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// What transactions cost on this machine: one console line per
+/// [`COMMIT_TIME_WINDOW`] commits, since every mutator waits for them and only
+/// a real root shows their size.
+fn note_commit_time(gen: u64, cycles: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    COMMIT_TIME_TOTAL.fetch_add(cycles, Relaxed);
+    COMMIT_TIME_MAX.fetch_max(cycles, Relaxed);
+    if (COMMIT_TIME_COUNT.fetch_add(1, Relaxed) + 1) % COMMIT_TIME_WINDOW == 0 {
+        use core::fmt::Write as _;
+        let total = COMMIT_TIME_TOTAL.swap(0, Relaxed);
+        let max = COMMIT_TIME_MAX.swap(0, Relaxed);
+        let _ = writeln!(
+            narf_console::Writer,
+            "btrfs: {COMMIT_TIME_WINDOW} commits to generation {gen}: avg {} us, max {} us",
+            narf_time::wall::cycles_to_ns(total / COMMIT_TIME_WINDOW) / 1000,
+            narf_time::wall::cycles_to_ns(max) / 1000,
+        );
+    }
+}
+
 fn commit_txn<'a, B: BlockDevice + 'static>(
     vol: &'a BtrfsVolume<B>,
     gen: u64,
@@ -5172,7 +5201,9 @@ fn commit_txn<'a, B: BlockDevice + 'static>(
 ) -> BoxFut<'a, ()> {
     Box::pin(async move {
         commit_phase(1);
+        let started = narf_time::now_cycles();
         let result = commit_txn_inner(vol, gen, alloc, txn).await;
+        note_commit_time(gen, narf_time::now_cycles().saturating_sub(started));
         if let Err(error) = &result {
             use core::fmt::Write as _;
             let phase = match COMMIT_PHASE.load(core::sync::atomic::Ordering::Relaxed) {

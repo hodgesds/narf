@@ -222,6 +222,75 @@ impl<B: BlockDevice> Drop for RootPin<B> {
     }
 }
 
+/// What the lock-free read side keeps the allocator from reusing.
+///
+/// A reader takes no operation lock (Linux reads a page-cache folio and walks
+/// the btree without waiting for a transaction, and neither may NARF: a commit
+/// lasts hundreds of milliseconds on a real root). The tree it walks is immutable
+/// COW state, but a commit frees blocks and extents that tree still names, and
+/// the next transaction may reallocate them while the reader's I/O is on its
+/// way. Linux closes that with the folio lock against truncate and with commit
+/// roots; here every commit's freed ranges stay withheld until each reader that
+/// started before that commit has finished, RCU-style.
+#[derive(Debug, Default)]
+pub(crate) struct ReaderEpochs {
+    /// Advanced by every durable commit ([`VolCore::unpin_all`]).
+    current: u64,
+    /// Running readers per the epoch they started in.
+    active: BTreeMap<u64, u32>,
+    /// Ranges a commit released while older readers ran: `(last epoch that
+    /// can reference it, start, len)`.
+    retired: alloc::vec::Vec<(u64, u64, u64)>,
+}
+
+impl ReaderEpochs {
+    fn enter(&mut self) -> u64 {
+        *self.active.entry(self.current).or_insert(0) += 1;
+        self.current
+    }
+
+    fn exit(&mut self, epoch: u64) {
+        if let Some(count) = self.active.get_mut(&epoch) {
+            *count -= 1;
+            if *count == 0 {
+                self.active.remove(&epoch);
+            }
+        }
+        self.prune();
+    }
+
+    /// A commit made these ranges unreachable from every tree a reader
+    /// starting from now on can sample.
+    fn retire(&mut self, ranges: alloc::vec::Vec<(u64, u64)>) {
+        if !self.active.is_empty() {
+            let epoch = self.current;
+            self.retired
+                .extend(ranges.into_iter().map(|(start, len)| (epoch, start, len)));
+        }
+        self.current += 1;
+    }
+
+    fn prune(&mut self) {
+        match self.active.keys().next().copied() {
+            Some(oldest) => self.retired.retain(|&(epoch, _, _)| epoch >= oldest),
+            None => self.retired.clear(),
+        }
+    }
+}
+
+/// A running lock-free read ([`VolCore::begin_reader`]).
+#[derive(Debug)]
+pub(crate) struct ReaderGuard<B: BlockDevice> {
+    core: Arc<VolCore<B>>,
+    epoch: u64,
+}
+
+impl<B: BlockDevice> Drop for ReaderGuard<B> {
+    fn drop(&mut self) {
+        self.core.reader_epochs.lock().exit(self.epoch);
+    }
+}
+
 /// Guard of [`VolCore::hold_commits`]; releases the hold when dropped (also
 /// when the operation's future is dropped mid-way).
 #[derive(Debug)]
@@ -318,11 +387,13 @@ impl<B: BlockDevice> VolCore<B> {
     /// create landing a new file on a (possibly recycled) inode
     /// number. Assigns a fresh tick rather than incrementing, so the
     /// value afterwards names the new instance / epoch and no earlier
-    /// tenant's. Content mutations issue their epoch
-    /// under the operation lock before changing bytes or length, so a
-    /// reader cannot fill old bytes under a queued writer's new epoch.
+    /// tenant's. Content mutations issue an epoch before changing bytes
+    /// or length and another once they are done (a fill runs concurrently
+    /// with them, so one sampled in between may hold old bytes and must not
+    /// outlive the mutation; the same seqcount shape as Linux's
+    /// `mapping->invalidate_lock`/`filemap_invalidate_lock` fill exclusion).
     /// An allocating operation may retry after ENOSPC; each attempt gets
-    /// its own epoch, including attempts that end in partial errors.
+    /// its own epochs, including attempts that end in partial errors.
     pub(crate) fn bump_cache_generation(&self, tree: u64, ino: u64) {
         let mut generations = self.cache_generations.lock();
         let generation = generations.fresh_tick();
@@ -359,6 +430,7 @@ impl<B: BlockDevice> VolCore<B> {
             _ino: ino,
             inode: IrqSafeSpinLock::new(inode),
             live_size: core::sync::atomic::AtomicU64::new(inode.size),
+            update_seq: core::sync::atomic::AtomicU64::new(0),
         });
         anchors.insert((tree, ino), Arc::downgrade(&anchor));
         anchor
@@ -379,7 +451,13 @@ impl<B: BlockDevice> VolCore<B> {
             .get(&(tree, ino))
             .and_then(Weak::upgrade);
         if let Some(anchor) = anchor {
-            anchor.inode.lock().nlink = 0;
+            let mut inode = anchor.inode.lock();
+            inode.nlink = 0;
+            // Refuse a racing refresh that read the pre-unlink tree. By two:
+            // an in-flight mutation keeps the sequence odd.
+            anchor
+                .update_seq
+                .fetch_add(2, core::sync::atomic::Ordering::Release);
         }
     }
 
@@ -434,6 +512,12 @@ pub(crate) struct MmapAnchor {
     _ino: u64,
     pub(crate) inode: IrqSafeSpinLock<InodeItem>,
     pub(crate) live_size: core::sync::atomic::AtomicU64,
+    /// Sequence of the owning side's updates to `inode`/`live_size`, written
+    /// under the `inode` lock: odd while a mutation of this inode is in
+    /// flight. A lock-free `stat` refresh samples it before reading the tree
+    /// and publishes only if it did not move, so a tree read that lost a
+    /// race never overwrites what the mutation published.
+    pub(crate) update_seq: core::sync::atomic::AtomicU64,
 }
 
 /// Content-generation counters for one filesystem instance, backing
@@ -531,6 +615,11 @@ pub struct VolCore<B: BlockDevice> {
     /// directory index for two names). Linux holds the parent directory's
     /// `i_rwsem` and the btree path locks for the same span; one lock per
     /// filesystem is the coarse equivalent.
+    ///
+    /// It also spans whatever commit such an operation forces, so it can be
+    /// held for hundreds of milliseconds at a time. Nothing on the read side
+    /// (`read`, `lookup`, `stat`) may take it, exactly as no Linux reader
+    /// waits for a transaction: see [`ReaderEpochs`] and `evictions`.
     op_lock: Mutex<()>,
     /// Raw `flags` word of the selected superblock (for [`crate::rw_gate`]).
     super_flags: u64,
@@ -605,6 +694,16 @@ pub struct VolCore<B: BlockDevice> {
     /// as wrong file contents in the SMP racing-writers test). The allocator
     /// withholds these addresses ([`crate::allocator::Allocator::build`]).
     reader_roots: IrqSafeSpinLock<BTreeMap<u64, u32>>,
+    /// Which committed-free ranges a running lock-free reader may still be
+    /// reading ([`ReaderEpochs`]).
+    reader_epochs: IrqSafeSpinLock<ReaderEpochs>,
+    /// Inodes final eviction has started on. A lookup takes no operation
+    /// lock, so it can resolve a name to an inode that an unlink and the
+    /// orphan reaper then destroy before the lookup's anchor exists: the
+    /// reaper counts here before its last open check, the lookup reads this
+    /// after publishing its anchor, and whichever loses that race notices
+    /// (the reaper skips the inode, the lookup starts over).
+    evictions: core::sync::atomic::AtomicU64,
     /// Metadata node cache, keyed by logical address.
     ///
     /// A commit path-COWs the extent tree once per fixed-point round, and a
@@ -1931,6 +2030,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             reader_roots: IrqSafeSpinLock::new(BTreeMap::new()),
+            reader_epochs: IrqSafeSpinLock::new(ReaderEpochs::default()),
+            evictions: core::sync::atomic::AtomicU64::new(0),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
             aborted: core::sync::atomic::AtomicBool::new(false),
             quota_override: core::sync::atomic::AtomicBool::new(false),
@@ -2570,9 +2671,46 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         }
     }
 
-    /// The currently pinned ranges, for the allocator to subtract.
+    /// The currently pinned ranges, plus what earlier commits released while
+    /// readers that may still reference it are running, for the allocator to
+    /// subtract.
     pub(crate) fn pinned_ranges(&self) -> alloc::vec::Vec<(u64, u64)> {
-        self.pinned.lock().clone()
+        let mut ranges = self.pinned.lock().clone();
+        ranges.extend(
+            self.reader_epochs
+                .lock()
+                .retired
+                .iter()
+                .map(|&(_, start, len)| (start, len)),
+        );
+        ranges
+    }
+
+    /// Enter the lock-free read side. Call before sampling any root: nothing
+    /// freed from that moment on is reallocated until the guard drops.
+    pub(crate) fn begin_reader(&self) -> ReaderGuard<B> {
+        let epoch = self.reader_epochs.lock().enter();
+        ReaderGuard {
+            core: self.core.clone(),
+            epoch,
+        }
+    }
+
+    /// See [`VolCore::evictions`]: read it before resolving a name and again
+    /// after the resolved node exists.
+    pub(crate) fn eviction_count(&self) -> u64 {
+        self.evictions.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Claim `(tree, ino)` for final eviction: false when a lookup or mapping
+    /// holds it, and the only way a racing lookup learns it must retry.
+    pub(crate) fn claim_for_eviction(&self, tree: u64, ino: u64) -> bool {
+        if self.inode_is_open(tree, ino) {
+            return false;
+        }
+        self.evictions
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        !self.inode_is_open(tree, ino)
     }
 
     /// The roots lock-free readers are walking from, as `(addr, nodesize)`
@@ -2587,7 +2725,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// entire point of pinning, so calling this earlier reintroduces exactly
     /// the corruption the set prevents.
     pub(crate) fn unpin_all(&self) {
-        self.pinned.lock().clear();
+        let ranges = core::mem::take(&mut *self.pinned.lock());
+        self.reader_epochs.lock().retire(ranges);
     }
 
     /// Publish a node this volume has just written, so the read that follows
