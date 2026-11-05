@@ -25,7 +25,8 @@ alone does not establish which codec or amplifier a laptop contains.
 - A successful probe owns the function and its register/DMA engines.
 - Probe brings PCI D1/D2/D3hot into D0 before command/BAR setup; platform
   D3cold power resources must already be available.
-- HDA pin defaults and connection lists describe usable analog routes.
+- HDA pin defaults and connection lists describe usable analog routes,
+  except where a verified codec quirk overrides them (§3.2).
 - ACP is 1022:15e2, revision 0x63, multimedia class 0x048000. The ACPI
   companion has a child with _ADR=2 and standard device-properties _DSD
   `acp-audio-device-type=2`; _WOV, when present, must be nonzero.
@@ -66,8 +67,23 @@ the existing S16Le and F32Le variants. Backend support remains explicit.
 The unused standalone `acp6`, `codec`, `hda_tests`, `i2s`, `realtek_alc`
 and `wm8960` model modules are retired. Native HDA and ACP controller paths
 continue to register through the sound-card surface below. Preserved Realtek
-identification and quirk tables live in `hda::quirks`; these tables are staged
-data and do not by themselves enable a runtime codec fixup.
+identification and quirk tables live in `hda::quirks`. The rescued
+pin-quirk table is staged data only and is never consulted by the
+live path: none of its keys verified as a codec subsystem ID
+(#1496). The live path applies only the re-derived
+`VERIFIED_QUIRK_TABLE`, keyed on codec subsystem IDs Linux matches
+on `HDA_CODEC_QUIRK`, and the verified per-chip init coef tables
+(`CoefOp`: plain writes and masked read-modify-write updates,
+Linux `alc_write_coef_idx` / `alc_update_coef_idx`). A quirk
+applies only when the subsystem ID and the chip both match. Its
+coef sequence runs before enumeration; its pin, connection-list
+and preferred-DAC overrides patch the decoded graph after
+enumeration (Linux's driver-side caches — no verbs are issued for
+them), so the connection-select index a path later sends is the
+index into the overridden list. Coef state is volatile across
+controller reset, so reinit re-applies the init table and the
+quirk sequence; the graph-side overrides survive in the retained
+graph.
 
 HDA registers one sound card per usable controller with at most one exclusive
 playback lease and one exclusive capture lease. Both directions support

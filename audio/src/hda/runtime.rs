@@ -303,16 +303,18 @@ impl IntelHda {
             if vendor == 0 || vendor == u32::MAX {
                 continue;
             }
-            // #776: read the codec subsystem ID (HDA §7.3.3.2, verb
-            // 0xF01 on the root node — the same word Linux matches
-            // its Realtek quirk tables on) and apply the verified
-            // per-chip init coef sequence before the widget graph is
-            // built, so the graph is enumerated on the fixed-up
-            // codec. A failed or zero read fails open: unknown
-            // subsystem, generic behavior — the codec still
-            // enumerates. Pin quirks are NOT applied here: none of
-            // the rescued `hda::quirks` entries verified as a codec
-            // subsystem ID (see `quirks.rs`).
+            // #776 / #1496: read the codec subsystem ID (HDA
+            // §7.3.3.2, verb 0xF01 on the root node — the same word
+            // Linux matches its Realtek quirk tables on) and apply
+            // the verified per-chip init coef sequence and any
+            // verified pin quirk for that subsystem ID before the
+            // widget graph is built, so the graph is enumerated on
+            // the fixed-up codec. A failed or zero read fails open:
+            // unknown subsystem, generic behavior — the codec still
+            // enumerates. Only the re-derived `VERIFIED_QUIRK_TABLE`
+            // is consulted: none of the rescued `hda::quirks`
+            // entries verified as a codec subsystem ID (see
+            // `quirks.rs`).
             let subsystem_id = unsafe {
                 dev.send_verb(make_verb(
                     cad,
@@ -322,13 +324,31 @@ impl IntelHda {
             }
             .ok()
             .filter(|&v| v != 0);
-            if let Some(chip) = super::quirks::RealtekChip::from_vendor_id(vendor) {
-                if chip.uses_alc256_init() {
+            // #1496: verified codec fixups. The init coef table and
+            // a quirk's chained coef sequence run before the widget
+            // graph is built (Linux PRE_PROBE), so the graph is
+            // enumerated on the fixed-up codec; the pin /
+            // connection-list / preferred-DAC overrides patch the
+            // decoded graph afterwards (Linux's driver-side caches —
+            // `snd_hda_codec_set_pincfg` /
+            // `snd_hda_override_conn_list` — issue no verbs). A
+            // quirk matches only when BOTH the codec subsystem ID
+            // and the chip agree; anything else fails open to
+            // generic behavior.
+            let chip = super::quirks::RealtekChip::from_vendor_id(vendor);
+            if let Some(chip) = chip {
+                if chip.has_verified_coef_init() {
                     dev.apply_coef_init(cad, chip)?;
                 }
             }
+            let quirk = subsystem_id
+                .and_then(super::quirks::find_verified_quirk)
+                .filter(|q| Some(q.chip) == chip);
+            if let Some(quirk) = quirk {
+                dev.apply_quirk_seq(cad, quirk)?;
+            }
             let mut error = None;
-            let graph = crate::hda_codec::enumerate(cad, |command| {
+            let mut graph = crate::hda_codec::enumerate(cad, |command| {
                 if error.is_some() {
                     return 0;
                 }
@@ -343,6 +363,9 @@ impl IntelHda {
             });
             if let Some(e) = error {
                 return Err(e);
+            }
+            if let Some(quirk) = quirk {
+                Self::apply_quirk_to_graph(&mut graph, quirk);
             }
             dev.codecs.push(CodecInfo {
                 addr: cad,
@@ -382,28 +405,110 @@ impl IntelHda {
         Ok(dev)
     }
 
-    /// #776: issue a chip's init coef table as
-    /// SET_COEF_INDEX + SET_PROC_COEF verb pairs to the Realtek
-    /// coef node (nid 0x20, Linux `alc_write_coef_idx`). Caller
-    /// gates on `RealtekChip::uses_alc256_init`: only the ALC256
-    /// family has verified unconditional plain-write rows, and the
-    /// rescued tables for other chips stay unwired. A verb failure
-    /// propagates — this runs during probe/reinit where a dead
-    /// command transport already fails the bring-up.
+    /// #776 / #1496: issue a chip's init coef table as
+    /// SET_COEF_INDEX + SET_PROC_COEF verb pairs (plain writes) or
+    /// read-modify-write updates (masked rows) to the addressed
+    /// coef node — usually nid 0x20, Linux `alc_write_coef_idx` /
+    /// `alc_update_coef_idx`, but `CoefOp` carries the nid because
+    /// a few rows address another widget (ALC283's 0x53 row,
+    /// ALC256's 0x53 pulse). Caller gates on
+    /// `RealtekChip::has_verified_coef_init`: only verified
+    /// unconditional tables are applied, in Linux's order. A verb
+    /// failure propagates — this runs during probe/reinit where a
+    /// dead command transport already fails the bring-up. A failed
+    /// coef read inside a masked update instead skips that write,
+    /// exactly as Linux's `__alc_update_coefex_idx` does when the
+    /// read returns -1.
     fn apply_coef_init(&self, cad: u8, chip: super::quirks::RealtekChip) -> Result<(), HdaError> {
-        for row in super::quirks::init_table_for(chip) {
-            self.verb(
-                cad,
-                super::quirks::COEF_NODE,
-                crate::hda_codec::verb::SET_COEF_INDEX | u32::from(row.idx),
-            )?;
-            self.verb(
-                cad,
-                super::quirks::COEF_NODE,
-                crate::hda_codec::verb::SET_PROC_COEF | u32::from(row.value),
-            )?;
+        for op in super::quirks::init_table_for(chip) {
+            if op.is_write() {
+                self.verb(
+                    cad,
+                    op.nid,
+                    crate::hda_codec::verb::SET_COEF_INDEX | u32::from(op.idx),
+                )?;
+                self.verb(
+                    cad,
+                    op.nid,
+                    crate::hda_codec::verb::SET_PROC_COEF | u32::from(op.value),
+                )?;
+            } else {
+                self.update_coef_idx(cad, op.nid, op.idx, op.mask, op.value)?;
+            }
         }
         Ok(())
+    }
+
+    /// Read one coef value: SET_COEF_INDEX then GET_PROC_COEF
+    /// (Linux `alc_read_coef_idx`).
+    fn read_coef_idx(&self, cad: u8, nid: u8, idx: u16) -> Result<u32, HdaError> {
+        self.verb(
+            cad,
+            nid,
+            crate::hda_codec::verb::SET_COEF_INDEX | u32::from(idx),
+        )?;
+        self.verb(cad, nid, crate::hda_codec::verb::GET_PROC_COEF)
+    }
+
+    /// Masked coef update (Linux `alc_update_coef_idx` /
+    /// `alc_update_coefex_idx`): `new = (old & ~mask) | value`.
+    /// A failed read skips the write and returns Ok — Linux writes
+    /// nothing when the read returns -1.
+    fn update_coef_idx(
+        &self,
+        cad: u8,
+        nid: u8,
+        idx: u16,
+        mask: u16,
+        value: u16,
+    ) -> Result<(), HdaError> {
+        let Ok(current) = self.read_coef_idx(cad, nid, idx) else {
+            return Ok(());
+        };
+        let next = (current & !u32::from(mask)) | u32::from(value);
+        self.verb(
+            cad,
+            nid,
+            crate::hda_codec::verb::SET_COEF_INDEX | u32::from(idx),
+        )?;
+        self.verb(
+            cad,
+            nid,
+            crate::hda_codec::verb::SET_PROC_COEF | (next & 0xFFFF),
+        )?;
+        Ok(())
+    }
+
+    /// Issue a verified quirk's chained coef verb sequence
+    /// verbatim, in order (Linux `HDA_FIXUP_VERBS`). Runs before
+    /// enumeration at probe, and again at reinit — a controller
+    /// reset drops the coef state the sequence programs.
+    fn apply_quirk_seq(&self, cad: u8, quirk: &super::quirks::Quirk) -> Result<(), HdaError> {
+        for step in quirk.coef_seq {
+            self.verb(cad, step.nid, step.verb)?;
+        }
+        Ok(())
+    }
+
+    /// Patch a decoded codec graph with a verified quirk's
+    /// driver-side overrides (Linux's pin cache, connection cache
+    /// and preferred-DAC list — `snd_hda_codec_set_pincfg`,
+    /// `snd_hda_override_conn_list`, `spec->gen.preferred_dacs`).
+    /// Graph-side only: no verbs. Overrides naming a nid the
+    /// graph does not have are skipped — the graph is the authority
+    /// on what the codec actually contains.
+    fn apply_quirk_to_graph(graph: &mut crate::hda_codec::Codec, quirk: &super::quirks::Quirk) {
+        for pin in quirk.pins {
+            graph.override_pin_config(pin.nid, pin.cfg);
+        }
+        for conn in quirk.conns {
+            graph.override_conn_list(conn.nid, conn.conns);
+        }
+        graph.preferred_dacs = quirk
+            .preferred_dacs
+            .iter()
+            .map(|p| (p.pin, p.dac))
+            .collect();
     }
 
     fn acquire_command(&self) -> Result<CommandLease<'_>, HdaError> {
@@ -835,16 +940,27 @@ impl IntelHda {
         // describes the transport.
         self.irq.failed.store(false, Ordering::Release);
         self.set_codec_power(false)?;
-        // #776: the controller reset dropped the codecs' coef state
-        // (Linux re-runs the init hook on resume for the same
-        // reason), so re-apply the probe-time init before the
+        // #776 / #1496: the controller reset dropped the codecs'
+        // coef state (Linux re-runs the init hook on resume for the
+        // same reason), so re-apply the probe-time init before the
         // controller is marked active — otherwise suspend/resume
         // silently loses the fixup. The chip is re-derived from the
-        // stored vendor id; the same gate as probe applies.
+        // stored vendor id; the same gate as probe applies. A
+        // quirk's chained coef sequence is re-applied for the same
+        // reason; its graph-side overrides (pins, connections,
+        // preferred DACs) survive in the retained graph and need no
+        // re-application.
         for codec in &self.codecs {
             if let Some(chip) = super::quirks::RealtekChip::from_vendor_id(codec.vendor_id) {
-                if chip.uses_alc256_init() {
+                if chip.has_verified_coef_init() {
                     self.apply_coef_init(codec.addr, chip)?;
+                }
+                if let Some(quirk) = codec
+                    .subsystem_id
+                    .and_then(super::quirks::find_verified_quirk)
+                    .filter(|q| q.chip == chip)
+                {
+                    self.apply_quirk_seq(codec.addr, quirk)?;
                 }
             }
         }
