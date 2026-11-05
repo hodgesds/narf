@@ -7593,7 +7593,7 @@ fn uac2_selector_clock_mixer_config_with(pins: &[u8], controls: u8) -> alloc::ve
     add(&[9, 0x24, 0x01, 0x00, 0x02, 0x09, 55, 0, 0]); // HEADER v2
     add(&[8, 0x24, 0x0A, 9, 2, 0x03, 1, 0]); // CLOCK_SOURCE 9, programmable
     add(&[8, 0x24, 0x0A, 11, 0, 0x01, 0, 0]); // CLOCK_SOURCE 11, fixed
-    // CLOCK_SELECTOR 10: bLength 7+p, pins, bmControls, iSelector.
+                                              // CLOCK_SELECTOR 10: bLength 7+p, pins, bmControls, iSelector.
     let mut sel = alloc::vec![7 + pins.len() as u8, 0x24, 0x0B, 10, pins.len() as u8];
     sel.extend_from_slice(pins);
     sel.push(controls);
@@ -7602,8 +7602,8 @@ fn uac2_selector_clock_mixer_config_with(pins: &[u8], controls: u8) -> alloc::ve
     add(&[
         18, 0x24, 0x02, 1, 0x01, 0x01, 0, 2, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ]); // IT 1
-    // MIXER_UNIT 4 (v2, Table 4-11): bLength 13+p+N = 15, p = 1,
-    // m = 2, bitmap 0xF0 = all 4 (2 in x 2 out) gains programmable.
+        // MIXER_UNIT 4 (v2, Table 4-11): bLength 13+p+N = 15, p = 1,
+        // m = 2, bitmap 0xF0 = all 4 (2 in x 2 out) gains programmable.
     add(&[15, 0x24, 0x04, 4, 1, 1, 2, 0x03, 0, 0, 0, 0, 0xF0, 0, 0]);
     add(&[
         18, 0x24, 0x06, 2, 4, 0x0F, 0, 0, 0, 0x0C, 0, 0, 0, 0x0C, 0, 0, 0, 0,
@@ -7625,9 +7625,7 @@ fn uac2_selector_clock_mixer_config() -> alloc::vec::Vec<u8> {
 fn smoke_uac_mixer_unit_decodes_gain_matrix() -> TestResult {
     use crate::uac::{MixerUnit, SelectorUnit, UacVersion};
     // UAC2 mixer (Table 4-11): unit 4, p = 1, m = 2, bitmap 0xF0.
-    let v2 = [
-        15, 0x24, 0x04, 4, 1, 1, 2, 0x03, 0, 0, 0, 0, 0xF0, 0, 0,
-    ];
+    let v2 = [15, 0x24, 0x04, 4, 1, 1, 2, 0x03, 0, 0, 0, 0, 0xF0, 0, 0];
     let m = match MixerUnit::parse(&v2, UacVersion::V2) {
         Ok(m) => m,
         Err(_) => return TestResult::Fail("UAC2 mixer parse"),
@@ -7680,10 +7678,7 @@ fn smoke_uac_mixer_unit_decodes_gain_matrix() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/uac",
-    smoke_uac_mixer_unit_decodes_gain_matrix
-);
+kernel_test_in!("drivers/usb/uac", smoke_uac_mixer_unit_decodes_gain_matrix);
 
 fn smoke_uac_topology_walk_uac2_mixer_clock_selector() -> TestResult {
     use crate::uac::UacTopology;
@@ -7795,10 +7790,7 @@ fn smoke_uac_bind_plan_uac2_clock_selector() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/uac",
-    smoke_uac_bind_plan_uac2_clock_selector
-);
+kernel_test_in!("drivers/usb/uac", smoke_uac_bind_plan_uac2_clock_selector);
 
 fn smoke_uac_selector_pin_switch_needed() -> TestResult {
     use crate::uac::{record_response, selector_pin_switch_needed, BindOutcome, ResponseSlot};
@@ -7835,10 +7827,7 @@ fn smoke_uac_selector_pin_switch_needed() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/usb/uac",
-    smoke_uac_selector_pin_switch_needed
-);
+kernel_test_in!("drivers/usb/uac", smoke_uac_selector_pin_switch_needed);
 
 fn smoke_uac_bind_plan_uac2_clock_selector_skips() -> TestResult {
     use crate::uac::{build_bind_plan, ResponseSlot, UacTopology};
@@ -7894,8 +7883,8 @@ fn uac1_mixer_selector_config() -> alloc::vec::Vec<u8> {
     add(&[9, 0x04, 0, 0, 0, 0x01, 0x01, 0x00, 0]); // iface 0 AC (UAC1)
     add(&[10, 0x24, 0x01, 0x00, 0x01, 62, 0, 2, 1, 2]); // AC HEADER
     add(&[12, 0x24, 0x02, 1, 0x01, 0x01, 0, 2, 0x03, 0x00, 0, 0]); // IT 1
-    // MIXER_UNIT 7 (v1, Table 4-5): bLength 10+p+N = 13, p = 2,
-    // m = 2, bitmap 0xFC = all 6 (3 in x 2 out) gains programmable.
+                                                                   // MIXER_UNIT 7 (v1, Table 4-5): bLength 10+p+N = 13, p = 2,
+                                                                   // m = 2, bitmap 0xFC = all 6 (3 in x 2 out) gains programmable.
     add(&[13, 0x24, 0x04, 7, 2, 1, 4, 2, 0x03, 0, 0, 0xFC, 0]);
     add(&[
         13, 0x24, 0x06, 2, 7, 2, 0x03, 0x00, 0x02, 0x00, 0x02, 0x00, 0,
