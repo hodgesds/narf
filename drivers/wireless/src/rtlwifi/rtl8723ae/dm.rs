@@ -283,11 +283,12 @@ impl Default for Btdm {
 impl Btdm {
     /// `rtl8723e_dm_bt_btdm_structure_reload_all_off` (`hal_btc.c:264`).
     pub fn all_off() -> Self {
-        let mut btdm = Self::default();
-        btdm.all_off = true;
-        btdm.pta_on = false;
-        btdm.wlan_act_hi = 0x10;
-        btdm
+        Self {
+            all_off: true,
+            pta_on: false,
+            wlan_act_hi: 0x10,
+            ..Default::default()
+        }
     }
 }
 
@@ -505,11 +506,9 @@ impl Owner {
     /// bit); 10 s later the window closes and the bit clears. Times are
     /// the caller's monotonic milliseconds.
     pub fn inq_page_monitor(&mut self, now_ms: u64) {
-        if self.inquiry_page {
-            if self.inq_page_start_ms.is_none() {
-                self.cstate |= state::BT_INQ_PAGE;
-                self.inq_page_start_ms = Some(now_ms);
-            }
+        if self.inquiry_page && self.inq_page_start_ms.is_none() {
+            self.cstate |= state::BT_INQ_PAGE;
+            self.inq_page_start_ms = Some(now_ms);
         }
         if let Some(start) = self.inq_page_start_ms {
             if now_ms.wrapping_sub(start) >= INQ_PAGE_TIMEOUT_MS {
@@ -604,10 +603,12 @@ impl Owner {
     /// (27, writing `0x883 = 0x40` when high). An open inquiry/page
     /// window or counter level 3 forces `[a3,5,5,2,80]`.
     pub async fn hid_sco_esco<I: Io>(&mut self, io: &I, inputs: MechInputs) -> Result<(), Error> {
-        let mut btdm = Btdm::default();
-        btdm.rf_rx_lpf_shrink = true;
-        btdm.low_penalty_rate_adaptive = true;
-        btdm.reject_aggre_pkt = false;
+        let mut btdm = Btdm {
+            rf_rx_lpf_shrink: true,
+            low_penalty_rate_adaptive: true,
+            reject_aggre_pkt: false,
+            ..Default::default()
+        };
         let cnt_lvl = self.counter_level();
         btdm.val_0x6c0 = 0x55555555;
         btdm.val_0x6c8 = 0xffff;
@@ -664,10 +665,12 @@ impl Owner {
     /// row's `0x81` bit off RSSI-1 (27, writing `0x883 = 0x40` when
     /// high). The inquiry/level-3 override forces `[a3,5,5,83,80]`.
     pub async fn ftp_a2dp<I: Io>(&mut self, io: &I, inputs: MechInputs) -> Result<(), Error> {
-        let mut btdm = Btdm::default();
-        btdm.rf_rx_lpf_shrink = true;
-        btdm.low_penalty_rate_adaptive = true;
-        btdm.reject_aggre_pkt = false;
+        let mut btdm = Btdm {
+            rf_rx_lpf_shrink: true,
+            low_penalty_rate_adaptive: true,
+            reject_aggre_pkt: false,
+            ..Default::default()
+        };
         let cnt_lvl = self.counter_level();
         btdm.val_0x6c0 = 0x55555555;
         btdm.val_0x6c8 = 0xffff;
