@@ -63,6 +63,7 @@ fn smoke_aml_synthetic_scope_and_name() -> TestResult {
                 crate::AmlError::Acpi(_) => "acpi err",
                 crate::AmlError::BadNameSegment => "bad nameseg",
                 crate::AmlError::NoDsdt => "no dsdt",
+                crate::AmlError::AmlStoreFull => "aml store full",
                 crate::AmlError::MethodNotFound => "method not found",
             })
         }
@@ -3285,3 +3286,273 @@ fn smoke_aml_sec1291_store_remaining_cap() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("aml", smoke_aml_sec1291_store_remaining_cap);
+
+// ── SEC-F2 (#1290): DSDT/SSDT checksum, mapped-window bound, store cap ───────
+//
+// Fixtures are built from the specification, not from the
+// implementation: table layout + 8-bit checksum from ACPI 6.5 §5.2
+// (36-byte header, length covers the whole table, all bytes sum to
+// zero mod 256), PkgLength from §20.2.4. Tables live in real frames
+// — a heap buffer's address is a kernel VA, not a phys, and the
+// window check rightly rejects it.
+
+/// Build a complete ACPI table: 36-byte header (ACPI 6.5 §5.2) +
+/// body. The checksum byte (offset 9) is set so the 8-bit sum over
+/// the whole table is zero when `good_checksum`; otherwise it is
+/// off by one and the table must be rejected.
+fn sdt_table(sig: &[u8; 4], revision: u8, body: &[u8], good_checksum: bool) -> alloc::vec::Vec<u8> {
+    let mut t = alloc::vec::Vec::new();
+    t.extend_from_slice(sig);
+    let total = (36 + body.len()) as u32;
+    t.extend_from_slice(&total.to_le_bytes());
+    t.push(revision);
+    t.push(0); // checksum placeholder
+    t.extend_from_slice(b"NARFCO"); // OEM ID
+    t.extend_from_slice(b"NARFTBL_"); // OEM table ID
+    t.extend_from_slice(&0u32.to_le_bytes()); // OEM revision
+    t.extend_from_slice(&0u32.to_le_bytes()); // creator ID
+    t.extend_from_slice(&0u32.to_le_bytes()); // creator revision
+    debug_assert_eq!(t.len(), 36);
+    t.extend_from_slice(body);
+    let sum: u8 = t.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    let mut cksum = (0u8).wrapping_sub(sum);
+    if !good_checksum {
+        cksum = cksum.wrapping_add(1);
+    }
+    t[9] = cksum;
+    t
+}
+
+/// Copy a synthetic table into a real frame; returns the frame plus
+/// its physical address. The caller frees the frame on every path.
+fn write_table_to_frame(
+    bytes: &[u8],
+) -> Result<(narf_memory::frame::PhysFrame, u64), &'static str> {
+    if bytes.len() > 4096 {
+        return Err("table does not fit in one frame");
+    }
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return Err("alloc_frame"),
+    };
+    let phys = frame.start_address().raw();
+    // SAFETY: exclusively-owned frame, reached through the direct map.
+    let dst = frame.start_address().kernel_mut_ptr::<u8>();
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+    }
+    Ok((frame, phys))
+}
+
+/// Synthetic DSDT/SSDT body: Scope(\T1) { Name(_HID, DWord 0x12345678) }.
+/// Same shape as smoke_aml_synthetic_scope_and_name, distinct scope
+/// name so it cannot collide with the boot DSDT.
+fn dsdt_test_body() -> alloc::vec::Vec<u8> {
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    body.push(0x10); // ScopeOp
+    let pkg_len_pos = body.len();
+    body.push(0); // placeholder
+    body.push(b'\\');
+    body.extend_from_slice(b"T1__");
+    body.push(0x08); // NameOp
+    body.extend_from_slice(b"_HID");
+    body.push(0x0C); // DWord prefix
+    body.extend_from_slice(&0x12345678u32.to_le_bytes());
+    // PkgLength covers from pkg_len_pos to end of body (NOT
+    // including ScopeOp byte). Single-byte form, fits.
+    let pkg_total = body.len() - pkg_len_pos;
+    body[pkg_len_pos] = pkg_total as u8;
+    body
+}
+
+/// Build a MethodOp blob of exactly `total_len` bytes (ACPI 6.5
+/// §20.2.4 PkgLength). The method body is zeros; the parser skips
+/// it via PkgLength, so the bytes are never decoded — only the
+/// store grows. Used to fill the store to the cap.
+fn method_blob_exact(total_len: usize) -> alloc::vec::Vec<u8> {
+    // Layout: MethodOp(1) + PkgLength(n) + '\'(1) + "FILL"(4) +
+    // flags(1) + body. PkgLength value = total_len - 1 (everything
+    // after MethodOp). Byte count from the value's bit length:
+    // 1 byte covers < 64, then 4 + 8*(n-1) bits.
+    let pkg_val = total_len - 1;
+    let n = if pkg_val < 64 {
+        1
+    } else if pkg_val < 4096 {
+        2
+    } else if pkg_val < (1 << 20) {
+        3
+    } else {
+        4
+    };
+    let mut blob: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    blob.push(0x14); // MethodOp
+    if n == 1 {
+        blob.push((pkg_val & 0x3F) as u8);
+    } else {
+        blob.push(((pkg_val & 0x0F) as u8) | (((n - 1) as u8) << 6));
+        for i in 0..n - 1 {
+            blob.push(((pkg_val >> (4 + 8 * i)) & 0xFF) as u8);
+        }
+    }
+    blob.push(b'\\');
+    blob.extend_from_slice(b"FILL");
+    blob.push(0x00); // MethodFlags: 0 args
+    blob.resize(total_len, 0);
+    blob
+}
+
+/// A valid DSDT and a valid SSDT both load via walk_aml_table:
+/// nodes register, the AML store grows by exactly the body bytes.
+fn smoke_aml_sec1290_dsdt_valid_loads() -> TestResult {
+    crate::__reset_for_test();
+    let body = dsdt_test_body();
+
+    let table = sdt_table(b"DSDT", 2, &body, true);
+    let (frame, phys) = match write_table_to_frame(&table) {
+        Ok(v) => v,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let n = match unsafe { crate::walk_aml_table(phys, "\\") } {
+        Ok(n) => n,
+        Err(_) => {
+            narf_memory::frame::free_frame(frame);
+            return TestResult::Fail("valid DSDT rejected");
+        }
+    };
+    narf_memory::frame::free_frame(frame);
+    if n != 2 {
+        return TestResult::Fail("expected 2 nodes (Scope + Name) from DSDT");
+    }
+    if crate::aml_total_len() != body.len() {
+        return TestResult::Fail("store did not grow by exactly the DSDT body");
+    }
+    match crate::find_node("\\T1._HID") {
+        Some(node) => match node.value {
+            Some(crate::NameValue::Integer(0x12345678)) => {}
+            _ => return TestResult::Fail("_HID value didn't decode"),
+        },
+        None => return TestResult::Fail("\\T1._HID missing after DSDT walk"),
+    }
+
+    // Same body as an SSDT: same path, no integer-width side effect.
+    let table = sdt_table(b"SSDT", 1, &body, true);
+    let (frame, phys) = match write_table_to_frame(&table) {
+        Ok(v) => v,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let n = match unsafe { crate::walk_aml_table(phys, "\\") } {
+        Ok(n) => n,
+        Err(_) => {
+            narf_memory::frame::free_frame(frame);
+            return TestResult::Fail("valid SSDT rejected");
+        }
+    };
+    narf_memory::frame::free_frame(frame);
+    if n != 2 {
+        return TestResult::Fail("expected 2 nodes (Scope + Name) from SSDT");
+    }
+    if crate::aml_total_len() != 2 * body.len() {
+        return TestResult::Fail("store did not grow by exactly both bodies");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_sec1290_dsdt_valid_loads);
+
+/// A DSDT whose 8-bit checksum is off by one is rejected
+/// fail-closed: BadTableChecksum, and the store does not grow.
+fn smoke_aml_sec1290_dsdt_bad_checksum_rejected() -> TestResult {
+    crate::__reset_for_test();
+    let body = dsdt_test_body();
+    let table = sdt_table(b"DSDT", 2, &body, false);
+    let (frame, phys) = match write_table_to_frame(&table) {
+        Ok(v) => v,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let r = unsafe { crate::walk_aml_table(phys, "\\") };
+    narf_memory::frame::free_frame(frame);
+    match r {
+        Err(crate::AmlError::Acpi(narf_acpi::AcpiError::BadTableChecksum)) => {}
+        Ok(_) => return TestResult::Fail("bad-checksum DSDT accepted"),
+        Err(_) => return TestResult::Fail("bad-checksum DSDT failed with the wrong error"),
+    }
+    if crate::aml_total_len() != 0 || crate::node_count() != 0 {
+        return TestResult::Fail("rejected table grew the store or registered nodes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_sec1290_dsdt_bad_checksum_rejected);
+
+/// Table pointers outside the mapped window are rejected before any
+/// byte is dereferenced: the window end itself, and a pointer whose
+/// length addition overflows.
+fn smoke_aml_sec1290_table_out_of_window_rejected() -> TestResult {
+    crate::__reset_for_test();
+    let ceiling = narf_memory::phys_alloc_ceiling();
+    if ceiling == 0 {
+        return TestResult::Fail("phys_alloc_ceiling is 0 (allocator not initialized?)");
+    }
+    for phys in [ceiling, u64::MAX] {
+        match unsafe { crate::walk_aml_table(phys, "\\") } {
+            Err(crate::AmlError::Acpi(narf_acpi::AcpiError::OutOfMappedWindow)) => {}
+            Ok(_) => return TestResult::Fail("out-of-window table accepted"),
+            Err(_) => return TestResult::Fail("out-of-window table failed with the wrong error"),
+        }
+    }
+    if crate::aml_total_len() != 0 {
+        return TestResult::Fail("rejected table grew the store");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_sec1290_table_out_of_window_rejected);
+
+/// The total store cap is enforced at the single append choke
+/// point: fill the store to exactly one DSDT payload short of the
+/// cap, then a further append and a valid DSDT walk both fail with
+/// AmlStoreFull and the store does not grow.
+fn smoke_aml_sec1290_store_cap_enforced() -> TestResult {
+    crate::__reset_for_test();
+    let payload = dsdt_test_body().len();
+    let target = crate::MAX_AML_STORE_BYTES - payload + 1;
+    while crate::aml_total_len() < target {
+        let want = (target - crate::aml_total_len()).min(64 * 1024);
+        if want < 8 {
+            return TestResult::Fail("fill remainder too small for a Method blob");
+        }
+        let blob = method_blob_exact(want);
+        if blob.len() != want {
+            return TestResult::Fail("fill blob size mismatch");
+        }
+        if crate::__parse_body_for_test(&blob, "\\").is_err() {
+            return TestResult::Fail("fill parse failed");
+        }
+    }
+    if crate::aml_total_len() != target {
+        return TestResult::Fail("fill did not reach exactly the target");
+    }
+    // One more body append past the cap must fail at the same choke point.
+    let over = method_blob_exact(64);
+    match crate::__parse_body_for_test(&over, "\\") {
+        Err(crate::AmlError::AmlStoreFull) => {}
+        _ => return TestResult::Fail("over-cap body append not rejected"),
+    }
+    // A valid DSDT that would exceed the cap is rejected, store untouched.
+    let table = sdt_table(b"DSDT", 2, &dsdt_test_body(), true);
+    let (frame, phys) = match write_table_to_frame(&table) {
+        Ok(v) => v,
+        Err(m) => return TestResult::Fail(m),
+    };
+    let before = crate::aml_total_len();
+    let r = unsafe { crate::walk_aml_table(phys, "\\") };
+    narf_memory::frame::free_frame(frame);
+    match r {
+        Err(crate::AmlError::AmlStoreFull) => {}
+        Ok(_) => return TestResult::Fail("over-cap DSDT accepted"),
+        Err(_) => return TestResult::Fail("over-cap DSDT failed with the wrong error"),
+    }
+    if crate::aml_total_len() != before {
+        return TestResult::Fail("rejected DSDT grew the store");
+    }
+    crate::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_sec1290_store_cap_enforced);
