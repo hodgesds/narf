@@ -881,7 +881,7 @@ fn smoke_cap_bootstrap_with_mints_live_cap() -> TestResult {
     // is unaffected; and the minted cap does not depend on the
     // creator — revoking the creator leaves it live (the creator
     // authorises the mint, it does not own the minted object).
-    use crate::{object_table, Cap, CapKind, CapType, Create, Write};
+    use crate::{object_table, Cap, CapKind, CapType, Create, Rights, Write};
     struct CreatorObj;
     impl CapType for CreatorObj {
         const KIND: CapKind = CapKind::Task;
@@ -976,7 +976,7 @@ fn smoke_cap_bootstrap_with_refuses_forged_rights() -> TestResult {
     // cleared (rights downgraded to Read). Reachable only via unsafe
     // `Cap::mint`, so this pins the runtime rights check rather than
     // the type system (which already pins R = Create).
-    use crate::{Cap, CapError, CapKind, CapType, Create, Read, Write};
+    use crate::{Cap, CapError, CapKind, CapType, Create, Read, Rights, Write};
     struct CreatorObj;
     impl CapType for CreatorObj {
         const KIND: CapKind = CapKind::Task;
