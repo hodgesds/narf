@@ -93,7 +93,8 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::pci::{
-    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion, CC_DEVICE_FEATURE,
+    alloc_msix_config_vector, bind_config_msix_vector, bind_queue_msix_vector, discover, map_cap,
+    MsixQueueBinding, VirtioCaps, VirtioPciError, VirtioRegion, CC_DEVICE_FEATURE,
     CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS, CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT,
     CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE, CC_QUEUE_NOTIFY_OFF,
     CC_QUEUE_SELECT, CC_QUEUE_SIZE,
@@ -485,10 +486,16 @@ pub struct VirtioNetPci {
     /// `[0; 6]`, MTU to 1500, link assumed up in that case.
     device_cfg: Option<VirtioRegion>,
     notify_off_multiplier: u32,
-    /// Active RX/TX queue pairs. Always non-empty post-bring_up;
-    /// pair index 0 is the "primary" pair (still bound to MSI-X for
-    /// RX-arrival wakeups). Pairs 1..N rely on the 16 ms polling
-    /// fallback for now — per-queue MSI-X for MQ is a follow-up.
+    /// Active RX/TX queue pairs. Always non-empty post-bring_up.
+    /// Each pair owns one MSI-X vector under `partition` (see
+    /// `enable_rx_msix_all`): the pair's RX queue (2K) is bound to
+    /// it, and its TX queue (2K+1) shares the same slot — one
+    /// vector per pair, which VirtIO 1.2 §4.1.5.2 permits — so the
+    /// pair's RX forwarder is the ISR consumer for both queues.
+    /// Without `partition` only pair 0 gets a vector and pairs
+    /// 1..N poll: a deliberate, measured perf gate (an extra
+    /// queue's IRQ interrupts the busy worker core on a shared
+    /// core), not a gap.
     pairs: Vec<QueuePair>,
     /// Round-robin TX-pair selector. `tx_dma` increments this then
     /// mods by `pairs.len()` to pick which TX virtqueue gets the
@@ -516,10 +523,14 @@ pub struct VirtioNetPci {
     /// overhead and round-robin's even packet spread is better — so we fall
     /// back to round-robin, matching pre-RSS behaviour exactly (zero cost).
     flow_affine: bool,
-    /// Per-queue MSI-X vector for TX completions on pair 0. `None`
-    /// = caller hasn't called `enable_tx_msix` yet, TX uses polled
-    /// used-ring drain.
-    pub tx_irq_vector: Option<u8>,
+    /// IDT vector bound to the device-config-change MSI-X vector
+    /// (`msix_config`, common-cfg 0x10). `None` = the table had no
+    /// free slot (or the device rejected the binding) and link
+    /// state stays poll-based via `link_up()`; `Some(v)` means the
+    /// config-change watcher parks on `v` and republishes link
+    /// metadata on every config-change interrupt. Routed to the
+    /// BSP: config changes are rare, no per-pair affinity applies.
+    pub config_irq_vector: Option<u8>,
     /// MSI-X table handle, retained across suspend so resume can
     /// re-enable the same programmed vectors without the probe-time
     /// `Cap` + `BusDevice`. Lock-guarded (rather than plain) because
@@ -1719,7 +1730,7 @@ impl VirtioNetPci {
             irq_vector: None,
             rx_irq_vectors: alloc::vec::Vec::new(),
             flow_affine: false,
-            tx_irq_vector: None,
+            config_irq_vector: None,
             msix: IrqSafeSpinLock::new(None),
             ready: true,
             detached: AtomicBool::new(false),
@@ -1827,33 +1838,16 @@ impl VirtioNetPci {
         self.cfg_phys
     }
 
-    /// Bind the receiveq pair-0 (queue 0) to a fresh MSI-X vector.
-    /// After this call, frame-arrival on the primary pair is
-    /// observable via
-    /// `narf_interrupts::wait_for_irq(self.irq_vector.unwrap())`.
-    /// RX pairs 1..N rely on the 16 ms polling fallback in their
-    /// forwarders — per-queue MSI-X for the MQ case is a follow-up.
-    ///
-    /// # Safety
-    /// Caller owns the device's BAR + cfg-space exclusively.
-    pub unsafe fn enable_msix(
-        &mut self,
-        cap: &Cap<BusDeviceCap, Write>,
-        device: &BusDevice,
-    ) -> Result<u8, VirtioPciError> {
-        // SAFETY: caller-owns the device.
-        let (v, table) = unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, 0) }?;
-        self.irq_vector = Some(v);
-        *self.msix.lock() = Some(table);
-        Ok(v)
-    }
-
     /// Bind EVERY active RX queue pair to its own MSI-X vector, each routed
     /// to the CPU its forwarder will run on, so no forwarder has to fall
     /// back to a blind 2ms poll sleep between sparse frames. This is the
-    /// multi-queue completion of [`Self::enable_msix`] (which wired only
-    /// pair 0). The per-pair routing CPU mirrors the forwarder placement in
-    /// the RX-forwarder spawn (`partition` ⇒ pair K → CPU K, else CPU 0) so
+    /// multi-queue completion of the old pair-0-only MSI-X setup.
+    /// Each pair's TX queue (2K+1) shares its RX queue's (2K) table
+    /// slot — one vector per pair, which VirtIO 1.2 §4.1.5.2
+    /// permits — so the pair's RX forwarder is the ISR consumer for
+    /// both queues (see `bind_tx_queue_shares`). The per-pair
+    /// routing CPU mirrors the forwarder placement in the
+    /// RX-forwarder spawn (`partition` ⇒ pair K → CPU K, else CPU 0) so
     /// the RX IRQ lands locally on the core that services the queue.
     ///
     /// Best-effort per pair: a pair that can't get a vector (MSI-X table
@@ -1900,33 +1894,93 @@ impl VirtioNetPci {
             targets.push((2 * k as u16, apic));
         }
         // SAFETY: caller owns the device exclusively.
-        let (table, vectors) =
+        let (table, bindings) =
             unsafe { crate::pci::enable_msix_rx_queues(&self.common, cap, device, &targets) }?;
-        self.irq_vector = vectors.first().copied().flatten();
-        self.rx_irq_vectors = vectors;
+        // Share each pair's vector with its TX queue (see
+        // `bind_tx_queue_shares`): one vector per pair, not per queue.
+        self.bind_tx_queue_shares(&bindings);
+        self.irq_vector = bindings.first().and_then(|b| b.idt_vector);
+        self.rx_irq_vectors = bindings.iter().map(|b| b.idt_vector).collect();
         *self.msix.lock() = Some(table);
         Ok(())
     }
 
-    /// TX-queue MSI-X for pair 0 (queue index 1). Reuses the
-    /// existing `MsixTable` if RX MSI-X is already enabled — both
-    /// vectors land on the same MSI-X table.
+    /// Point each pair's TX queue (2K+1) at the same MSI-X table
+    /// slot as its RX queue (2K). VirtIO 1.2 §4.1.5.2 permits
+    /// several queues sharing one vector, and one vector per pair
+    /// (not per queue) is the point of this shape:
+    /// - Table economy: the device needs N+1 slots (pairs +
+    ///   config) instead of 2N+1, so the config vector survives
+    ///   even on a short table (QEMU's MQ default is 2N+2, but a
+    ///   stingy table still fits).
+    /// - The pair's RX forwarder — already parking on the vector —
+    ///   is the ISR consumer for both queues, so no vector is ever
+    ///   programmed without a waiter. A separate TX vector would
+    ///   only add host MSI traffic for a vector nobody parks on:
+    ///   TX completions are reclaimed lazily at submit time (the §0
+    ///   design — fire-and-forget + reclaim-before-backpressure),
+    ///   and nothing in the driver blocks on a TX completion.
+    /// Cost, stated plainly: a TX completion also wakes the pair's
+    /// RX forwarder, which drains an (empty) RX ring and re-parks —
+    /// one cheap empty drain per TX batch while idle, a no-op while
+    /// the forwarder is fast-polling. Binding after the table is
+    /// enabled is safe: the TX queue was NO_VECTOR until this
+    /// write, so no TX interrupt can be in flight using the old
+    /// value. A rejected share leaves the TX queue unbound
+    /// (NO_VECTOR) — the pre-lane behaviour, not an error.
+    fn bind_tx_queue_shares(&self, bindings: &[MsixQueueBinding]) {
+        for (k, b) in bindings.iter().enumerate() {
+            if let Some(slot) = b.slot {
+                // SAFETY: caller owns the device exclusively; the
+                // slot was just programmed by `enable_msix_rx_queues`.
+                let _ = unsafe { bind_queue_msix_vector(&self.common, 2 * k as u16 + 1, slot) };
+            }
+        }
+    }
+
+    /// Bind the device-config-change MSI-X vector (`msix_config`,
+    /// common-cfg 0x10, VirtIO 1.2 §4.1.5.2) to a fresh IDT vector
+    /// routed to the BSP, so link/config changes arrive as an
+    /// interrupt instead of waiting for a `link_up()` poll. Uses
+    /// the table retained by `enable_rx_msix_all` — never
+    /// re-discovers it (a fresh `enable_msix` resets the slot
+    /// allocator to 0 and would reprogram slot 0 underneath the
+    /// live pair bindings). If no table is retained yet (RX MSI-X
+    /// never enabled), acquires one and enables it here. The
+    /// config vector is allocated AFTER the pair vectors, so on a
+    /// short table it is the config vector that degrades (link
+    /// stays poll-based) while the pairs keep theirs. Best-effort
+    /// at probe: `Err` leaves `config_irq_vector` unset.
     ///
     /// # Safety
-    /// Caller owns the device's BAR + cfg-space exclusively.
-    pub unsafe fn enable_tx_msix(
+    /// Caller owns the device's BAR + cfg-space exclusively (probe,
+    /// before the controller is shared into `CONTROLLERS`).
+    pub unsafe fn enable_config_msix(
         &mut self,
         cap: &Cap<BusDeviceCap, Write>,
         device: &BusDevice,
     ) -> Result<u8, VirtioPciError> {
-        // SAFETY: caller-owns the device.
-        let (v, table) = unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, 1) }?;
-        self.tx_irq_vector = Some(v);
-        // Replace the MSI-X table handle with the latest one
-        // (enable_msix_queue allocates a fresh slot in the
-        // existing table; there's only one table per device,
-        // and the new handle keeps both vectors live).
-        *self.msix.lock() = Some(table);
+        // Config changes are rare; route to the BSP.
+        let apic = narf_interrupts::apic_id_at(0).unwrap_or(0);
+        let mut guard = self.msix.lock();
+        if guard.is_none() {
+            // SAFETY: caller owns the device.
+            let table = narf_bus::msix::enable_msix(cap, device)
+                .map_err(|_| VirtioPciError::BarMapFailed)?;
+            *guard = Some(table);
+        }
+        let table = guard.as_mut().ok_or(VirtioPciError::BarMapFailed)?;
+        // SAFETY: caller owns the device's BAR exclusively.
+        let (v, slot) = unsafe { alloc_msix_config_vector(&mut *table, apic) }?;
+        // SAFETY: caller owns the common-cfg region exclusively.
+        if !unsafe { bind_config_msix_vector(&self.common, slot) } {
+            return Err(VirtioPciError::BarMapFailed);
+        }
+        // Idempotent when the table is already enabled (the RX path
+        // enabled it); required when this call acquired a fresh table.
+        // SAFETY: caller owns the device's config space.
+        unsafe { table.enable() }.map_err(|_| VirtioPciError::BarMapFailed)?;
+        self.config_irq_vector = Some(v);
         Ok(v)
     }
 
@@ -2323,6 +2377,21 @@ impl VirtioNetPci {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let s = unsafe { r.read16(CFG_STATUS) };
         s & VIRTIO_NET_S_LINK_UP != 0
+    }
+
+    /// Re-read live link state and republish it to the interface
+    /// registry. The config-change watcher's per-fire action (and
+    /// the resume path's shape): `link_up()` reads STATUS when
+    /// F_STATUS was negotiated, else assumes up. Returns the link
+    /// state. A controller with no registered name (probe never
+    /// reached `register_net_interface`) still returns the state
+    /// but publishes nothing.
+    pub fn refresh_link_from_status(&self) -> bool {
+        let link = self.link_up();
+        if let Some(name) = self.ifname.lock().as_deref() {
+            narf_net::iface::set_link_metadata(name, link, None, None);
+        }
+        link
     }
 
     // ── Power management and detach ──────────────────────────────────
@@ -3315,8 +3384,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // forwarder. Bind a per-queue MSI-X vector to EVERY RX pair (routed
     // to each pair's forwarder CPU) so no forwarder blind-sleeps between
     // sparse frames; single-queue NICs just get pair 0 as before.
+    // Each pair's TX queue shares its RX vector (one vector per
+    // pair — see `bind_tx_queue_shares`).
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { dev.enable_rx_msix_all(&cap, &device) };
+    // SAFETY: probe-time caller owns the device. Best-effort —
+    // failure leaves link state poll-based via `link_up()`, as
+    // before. Allocated after the pair vectors so a short table
+    // degrades config (not the pairs).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { dev.enable_config_msix(&cap, &device) };
     let idx = {
         let mut g = CONTROLLERS.lock();
         let i = g.len();
@@ -3355,30 +3432,36 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 ///   `narf_ipc::Consumer<Frame>`; no lock contention on the consumer
 ///   half (narf_ipc is SPSC and we hold the single S/C side).
 /// - N RX forwarders, one per pair. Each pair has its own used-ring
-///   to drain; pair 0 waits on MSI-X, pairs 1..N fall back to a
-///   16 ms poll. All N RX forwarders push into the same shared
+///   to drain; each pair parks on its own MSI-X vector under
+///   `partition` (pairs without a vector fall back to the polled
+///   cadence). All N RX forwarders push into the same shared
 ///   `Producer<Frame>`, behind an `Arc<IrqSafeSpinLock<...>>` —
 ///   `narf_ipc::Producer` is `!Sync` so the lock is required to
 ///   serialise the multiple producer halves. Push frequency is
 ///   low (one short critical section per frame, no awaits held
 ///   under the lock) so contention is bounded even on a 4-pair
 ///   line-rate workload.
+/// - One config-change watcher per device (when the config vector
+///   was bound): parks on the config MSI-X vector and republishes
+///   link metadata on every config-change interrupt.
 fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
-    let (mac, mtu, link_up, rx_irq_vectors, num_pairs, offloads) = match with_at(idx, |c| {
-        (
-            c.mac(),
-            c.mtu(),
-            c.link_up(),
-            c.rx_irq_vectors.clone(),
-            c.num_pairs(),
-            c.tx_offload_profile().advertised(),
-        )
-    }) {
-        Some(t) => t,
-        None => return,
-    };
+    let (mac, mtu, link_up, rx_irq_vectors, config_irq_vector, num_pairs, offloads) =
+        match with_at(idx, |c| {
+            (
+                c.mac(),
+                c.mtu(),
+                c.link_up(),
+                c.rx_irq_vectors.clone(),
+                c.config_irq_vector,
+                c.num_pairs(),
+                c.tx_offload_profile().advertised(),
+            )
+        }) {
+            Some(t) => t,
+            None => return,
+        };
     // One device name for both registries, `eth%d` as Linux
     // `dev_alloc_name` picks it. The primary controller is the legacy L3
     // registry's device (the TCP stack sends through `vnet0_send_fn`); the
@@ -3779,6 +3862,28 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
             },
             target_cpu,
         );
+    }
+
+    // Config-change watcher: one task per device, parked on the
+    // config MSI-X vector. A fire means the device changed its
+    // configuration (VirtIO 1.2 §4.1.5.2 routes config-change
+    // interrupts to `msix_config` exclusively, so the vector itself
+    // is the discriminator — no ISR read needed, matching Linux's
+    // `vp_config_changed`). Each fire re-reads live STATUS and
+    // republishes link metadata; the republish is idempotent, so a
+    // spurious fire is harmless. No vector (table exhausted at
+    // probe) → no watcher; link state stays poll-based via
+    // `link_up()`, as before. Exits when the controller vanishes
+    // (detach tombstone).
+    if let Some(cfg_v) = config_irq_vector {
+        narf_scheduler::spawn_stackful(async move {
+            loop {
+                let _ = narf_interrupts::wait_for_irq(cfg_v).await;
+                if with_at(idx, |c| c.refresh_link_from_status()).is_none() {
+                    return;
+                }
+            }
+        });
     }
 
     // Single TX forwarder per device. Drains the tx_consumer once
@@ -4288,7 +4393,7 @@ mod tx_tests {
                 irq_vector: None,
                 rx_irq_vectors: Vec::new(),
                 flow_affine: false,
-                tx_irq_vector: None,
+                config_irq_vector: None,
                 msix: IrqSafeSpinLock::new(None),
                 ready: true,
                 detached: AtomicBool::new(false),
@@ -5335,7 +5440,7 @@ mod tx_tests {
                 irq_vector: None,
                 rx_irq_vectors: Vec::new(),
                 flow_affine: false,
-                tx_irq_vector: None,
+                config_irq_vector: None,
                 msix: IrqSafeSpinLock::new(None),
                 ready: true,
                 detached: AtomicBool::new(false),
@@ -5493,5 +5598,300 @@ mod tx_tests {
     kernel_test_in!(
         "drivers/virtio/net-pci",
         smoke_virtio_net_rx_recycle_drops_oversized
+    );
+
+    /// Per-pair MSI-X, live-device readback (gap 10): on the real
+    /// QEMU common cfg, every pair's TX queue (2K+1) must point at
+    /// the same table slot as its RX queue (2K), and pairs with
+    /// vectors must hold distinct slots. Read-only: QUEUE_SELECT
+    /// writes are safe post-probe — the only writer in this driver
+    /// is probe-time `size_q`, and every queue access sets SELECT
+    /// first. Skips when no virtio-net controller is bound or
+    /// MSI-X never came up at probe.
+    fn smoke_virtio_net_msix_tx_shares_rx_slot() -> TestResult {
+        let Some((num_pairs, rx_vecs)) = with_at(0, |c| (c.num_pairs(), c.rx_irq_vectors.clone()))
+        else {
+            return TestResult::Skip("no virtio-net controller");
+        };
+        if rx_vecs.iter().all(|v| v.is_none()) {
+            return TestResult::Skip("MSI-X not enabled at probe");
+        }
+        let run = || -> Result<(), &'static str> {
+            let mut slots: [Option<u16>; 4] = [None; 4];
+            for k in 0..num_pairs {
+                if rx_vecs.get(k).copied().flatten().is_none() {
+                    continue;
+                }
+                let rx = with_at(0, |c| unsafe {
+                    c.common.write16(crate::pci::CC_QUEUE_SELECT, 2 * k as u16);
+                    c.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR)
+                })
+                .ok_or("controller vanished")?;
+                let tx = with_at(0, |c| unsafe {
+                    c.common
+                        .write16(crate::pci::CC_QUEUE_SELECT, 2 * k as u16 + 1);
+                    c.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR)
+                })
+                .ok_or("controller vanished")?;
+                if rx == 0xFFFF || tx == 0xFFFF {
+                    return Err("pair queue left NO_VECTOR despite an IRQ vector");
+                }
+                if rx != tx {
+                    return Err("TX queue does not share its pair RX slot");
+                }
+                slots[k] = Some(rx);
+            }
+            for a in 0..num_pairs {
+                for b in a + 1..num_pairs {
+                    if let (Some(x), Some(y)) = (slots[a], slots[b]) {
+                        if x == y {
+                            return Err("two pairs share one MSI-X slot");
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_msix_tx_shares_rx_slot
+    );
+
+    /// Config MSI-X vector, live-device readback (gap 10): when a
+    /// config vector was bound, `msix_config` must hold a slot
+    /// inside the table, distinct from every pair slot, with an
+    /// IDT vector distinct from every pair's. When none was bound,
+    /// that is legitimate only if the table is full (every slot
+    /// went to a pair). Same Skip conditions as the share smoke.
+    fn smoke_virtio_net_msix_config_vector() -> TestResult {
+        let Some((rx_vecs, cfg_v, table_size)) = with_at(0, |c| {
+            (
+                c.rx_irq_vectors.clone(),
+                c.config_irq_vector,
+                c.msix.lock().as_ref().map(|t| t.size()),
+            )
+        }) else {
+            return TestResult::Skip("no virtio-net controller");
+        };
+        if rx_vecs.iter().all(|v| v.is_none()) {
+            return TestResult::Skip("MSI-X not enabled at probe");
+        }
+        let run = || -> Result<(), &'static str> {
+            let used = rx_vecs.iter().filter(|v| v.is_some()).count() as u16;
+            let size = table_size.ok_or("MSI-X table not retained")?;
+            match cfg_v {
+                None => {
+                    if size > used {
+                        return Err("config vector missing despite free table slots");
+                    }
+                    Ok(())
+                }
+                Some(v) => {
+                    let slot = with_at(0, |c| unsafe {
+                        c.common.read16(crate::pci::CC_MSIX_CONFIG)
+                    })
+                    .ok_or("controller vanished")?;
+                    if slot == 0xFFFF {
+                        return Err("msix_config reads NO_VECTOR despite a bound vector");
+                    }
+                    if slot >= size {
+                        return Err("msix_config slot outside the table");
+                    }
+                    for k in 0..rx_vecs.len() {
+                        if rx_vecs[k].is_none() {
+                            continue;
+                        }
+                        let qslot = with_at(0, |c| unsafe {
+                            c.common.write16(crate::pci::CC_QUEUE_SELECT, 2 * k as u16);
+                            c.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR)
+                        })
+                        .ok_or("controller vanished")?;
+                        if qslot == slot {
+                            return Err("config vector shares a pair queue slot");
+                        }
+                    }
+                    if rx_vecs.iter().flatten().any(|&rv| rv == v) {
+                        return Err("config IDT vector collides with a pair vector");
+                    }
+                    Ok(())
+                }
+            }
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_msix_config_vector
+    );
+
+    /// MSI-X common-cfg bind writes on the RAM-backed fixture:
+    /// the real production helpers (`bind_queue_msix_vector`,
+    /// `bind_config_msix_vector`) must write the slot and read it
+    /// back, and `bind_tx_queue_shares` must walk the pairs in
+    /// order, binding TX queue 2K+1 per pair (pair 0 → queue 1,
+    /// pair 1 → queue 3). Flat RAM cannot emulate per-queue SELECT
+    /// semantics, so the per-queue mapping itself is pinned by
+    /// the live-device smokes above; this pins the write path and
+    /// the queue-index arithmetic.
+    fn smoke_virtio_net_msix_bind_writes() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let fx = TxFixture::new()?;
+            let ok = unsafe { crate::pci::bind_queue_msix_vector(&fx.dev.common, 1, 3) };
+            if !ok {
+                return Err("queue bind readback mismatch on RAM region");
+            }
+            let at = unsafe { fx.dev.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR) };
+            if at != 3 {
+                return Err("queue bind did not write the slot");
+            }
+            let ok = unsafe { crate::pci::bind_config_msix_vector(&fx.dev.common, 4) };
+            if !ok {
+                return Err("config bind readback mismatch on RAM region");
+            }
+            let at = unsafe { fx.dev.common.read16(crate::pci::CC_MSIX_CONFIG) };
+            if at != 4 {
+                return Err("config bind did not write the slot");
+            }
+            // Pair 0 first: TX queue 1 → slot 0.
+            let bindings = [
+                crate::pci::MsixQueueBinding {
+                    idt_vector: Some(40),
+                    slot: Some(0),
+                },
+                crate::pci::MsixQueueBinding {
+                    idt_vector: Some(41),
+                    slot: Some(1),
+                },
+            ];
+            fx.dev.bind_tx_queue_shares(&bindings[..1]);
+            let sel = unsafe { fx.dev.common.read16(crate::pci::CC_QUEUE_SELECT) };
+            let vec = unsafe { fx.dev.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR) };
+            if sel != 1 || vec != 0 {
+                return Err("TX-share loop did not bind pair 0 (queue 1, slot 0)");
+            }
+            // Then pair 1: TX queue 3 → slot 1.
+            fx.dev.bind_tx_queue_shares(&bindings);
+            let sel = unsafe { fx.dev.common.read16(crate::pci::CC_QUEUE_SELECT) };
+            let vec = unsafe { fx.dev.common.read16(crate::pci::CC_QUEUE_MSIX_VECTOR) };
+            if sel != 3 || vec != 1 {
+                return Err("TX-share loop did not bind pair 1 (queue 3, slot 1)");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_msix_bind_writes);
+
+    /// MSI-X slot allocation order (gap 10): probe allocates pair
+    /// slots first, in pair order, then the config slot — on a
+    /// 5-slot table (4 pairs + config, the shared-per-pair shape)
+    /// the slots come out 0..4 and a 6th allocation fails; on a
+    /// 1-slot table pair 0 takes the only slot and the config
+    /// allocation fails. Exercises the real `MsixTable` allocator
+    /// via the synthetic table (no MMIO: `program_vector` is
+    /// hardware-only, covered by the live-device smokes).
+    fn smoke_virtio_net_msix_alloc_order() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let mut table = narf_bus::msix::__synth_msix_table(5);
+            let mut slots = [0u16; 5];
+            for i in 0..5 {
+                slots[i] = table.alloc_vector().ok_or("table exhausted early")?.vector;
+            }
+            if slots != [0, 1, 2, 3, 4] {
+                return Err("MSI-X slots not allocated in probe order");
+            }
+            if table.alloc_vector().is_some() {
+                return Err("MSI-X table over-allocated past its size");
+            }
+            let mut tiny = narf_bus::msix::__synth_msix_table(1);
+            let _ = tiny.alloc_vector().ok_or("1-slot table gave nothing")?;
+            if tiny.alloc_vector().is_some() {
+                return Err("1-slot table gave a second vector");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_msix_alloc_order);
+
+    /// Config-change link republish (gap 10 + gap 12 mechanism):
+    /// `refresh_link_from_status` must follow the device-cfg
+    /// STATUS word (VirtIO 1.2 §5.1.4: bit 0 = LINK_UP) on every
+    /// call — up, down, up again. The fixture has no registered
+    /// name, so nothing is published to the registry; only the
+    /// STATUS decode the watcher relies on is pinned.
+    fn smoke_virtio_net_config_change_republishes_link() -> TestResult {
+        let run = || -> Result<(), &'static str> {
+            let mut fx = TxFixture::new()?;
+            let page = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "cfg page")?;
+            let region = VirtioRegion {
+                region: narf_bus::MmioRegion {
+                    phys: page.phys_addr(),
+                    virt: page.cpu_ptr::<u8>() as u64,
+                    len: 4096,
+                    kind: narf_bus::BarKind::Mmio32 {
+                        prefetchable: false,
+                    },
+                },
+                virt: page.cpu_ptr::<u8>() as u64,
+                offset: 0,
+                length: 4096,
+            };
+            fx.dev.device_cfg = Some(region);
+            fx.dev.has_status = true;
+            unsafe {
+                fx.dev
+                    .device_cfg
+                    .as_ref()
+                    .ok_or("no device_cfg")?
+                    .write16(CFG_STATUS, VIRTIO_NET_S_LINK_UP);
+            }
+            if !fx.dev.refresh_link_from_status() {
+                return Err("STATUS LINK_UP did not read as up");
+            }
+            unsafe {
+                fx.dev
+                    .device_cfg
+                    .as_ref()
+                    .ok_or("no device_cfg")?
+                    .write16(CFG_STATUS, 0);
+            }
+            if fx.dev.refresh_link_from_status() {
+                return Err("STATUS link-down did not read as down");
+            }
+            unsafe {
+                fx.dev
+                    .device_cfg
+                    .as_ref()
+                    .ok_or("no device_cfg")?
+                    .write16(CFG_STATUS, VIRTIO_NET_S_LINK_UP);
+            }
+            if !fx.dev.refresh_link_from_status() {
+                return Err("STATUS LINK_UP did not read as up on re-raise");
+            }
+            Ok(())
+        };
+        match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        }
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_config_change_republishes_link
     );
 }
