@@ -268,3 +268,139 @@ pub(super) fn build_assoc(
         m,
     })
 }
+
+/// `CCTLINFO_G7_W2_DATA_TX_CNT_LMT` GENMASK(5, 0) (`fw.h:1463`).
+const W2_DATA_TX_CNT_LMT_MASK: u32 = 0x3F;
+/// `CCTLINFO_G7_W2_AMPDU_MAX_TIME` GENMASK(31, 28) (`fw.h:1474`).
+const W2_AMPDU_MAX_TIME_MASK: u32 = 0xF000_0000;
+/// `CCTLINFO_G7_W3_BA_BMAP` GENMASK(14, 12) (`fw.h:1479`).
+const W3_BA_BMAP_MASK: u32 = 0x7000;
+/// `CCTLINFO_G7_W3_AMPDU_TIME_SEL` BIT(28) (`fw.h:1485`).
+const W3_AMPDU_TIME_SEL: u32 = 1 << 28;
+
+/// Build the AMPDU update CMAC table for `macid`.
+///
+/// Mirrors Linux `rtw89/fw.c` `rtw89_fw_h2c_ampdu_cmac_tbl_g7`
+/// (torvalds/linux @ 05441d6). Only w3 carries a value+mask;
+/// every other word/mask pair stays zero, so firmware keeps
+/// whatever the default/assoc H2C programmed there.
+///
+/// `agg_nums` is the per-TID aggregation count for each TID
+/// with an active BlockAck session (Linux iterates the set
+/// bits of `ampdu_map`); the update uses the MINIMUM across
+/// them. An empty slice means no active session, which Linux
+/// reads as `agg_num` 0 — and 0 falls in the first bucket
+/// below, so it still programs `ba_bmap` 3.
+///
+/// Bucket map (Linux thresholds, literal): agg_num <= 0x20
+/// → 3; <= 0x40 → 0; <= 0x80 → 1; <= 0x100 → 2; <= 0x200
+/// → 4; <= 0x400 → 5; above 0x400 → 0 (Linux leaves
+/// `ba_bmap` at its zero initializer).
+pub(super) fn build_ampdu(macid: u32, agg_nums: &[u16]) -> Result<DefaultCmac, Error> {
+    if macid > 0x7F {
+        return Err(Error::BadMacId);
+    }
+    let agg_num = agg_nums.iter().copied().min().unwrap_or(0);
+    let ba_bmap = if agg_num <= 0x20 {
+        3
+    } else if agg_num <= 0x40 {
+        0
+    } else if agg_num <= 0x80 {
+        1
+    } else if agg_num <= 0x100 {
+        2
+    } else if agg_num <= 0x200 {
+        4
+    } else if agg_num <= 0x400 {
+        5
+    } else {
+        0
+    };
+    let mut w = [0u32; 16];
+    let mut m = [0u32; 16];
+    w[3] = (ba_bmap << 12) & W3_BA_BMAP_MASK;
+    m[3] = W3_BA_BMAP_MASK;
+    Ok(DefaultCmac {
+        c0: macid | C0_OP,
+        w,
+        m,
+    })
+}
+
+/// Build the TX-time / TX-retry-limit update CMAC table for
+/// `macid`.
+///
+/// Mirrors Linux `rtw89/fw.c` `rtw89_fw_h2c_txtime_cmac_tbl_g7`
+/// (torvalds/linux @ 05441d6). The two Linux boolean gates
+/// are `Option` here: `None` means the gate is off and its
+/// words stay zero-masked, exactly as Linux leaves them.
+///
+/// - `Some(ampdu_max_time)`: w3 AMPDU_TIME_SEL set, w2
+///   AMPDU_MAX_TIME = the value (4-bit field).
+/// - `Some(data_tx_cnt_lmt)`: w2 DATA_TXCNT_LMT_SEL set,
+///   w2 DATA_TX_CNT_LMT = the value (6-bit field).
+///
+/// Out-of-field values are rejected (`BadValue`); Linux
+/// would silently truncate them with `le32_encode_bits`.
+pub(super) fn build_txtime(
+    macid: u32,
+    ampdu_max_time: Option<u8>,
+    data_tx_cnt_lmt: Option<u8>,
+) -> Result<DefaultCmac, Error> {
+    if macid > 0x7F {
+        return Err(Error::BadMacId);
+    }
+    if let Some(t) = ampdu_max_time {
+        if t as u32 > W2_AMPDU_MAX_TIME_MASK >> 28 {
+            return Err(Error::BadValue);
+        }
+    }
+    if let Some(l) = data_tx_cnt_lmt {
+        if l as u32 > W2_DATA_TX_CNT_LMT_MASK {
+            return Err(Error::BadValue);
+        }
+    }
+    let mut w = [0u32; 16];
+    let mut m = [0u32; 16];
+    if let Some(t) = ampdu_max_time {
+        w[3] |= W3_AMPDU_TIME_SEL;
+        m[3] |= W3_AMPDU_TIME_SEL;
+        w[2] |= (t as u32) << 28;
+        m[2] |= W2_AMPDU_MAX_TIME_MASK;
+    }
+    if let Some(l) = data_tx_cnt_lmt {
+        w[2] |= W2_DATA_TXCNT_LMT_SEL | (l as u32 & W2_DATA_TX_CNT_LMT_MASK);
+        m[2] |= W2_DATA_TXCNT_LMT_SEL | W2_DATA_TX_CNT_LMT_MASK;
+    }
+    Ok(DefaultCmac {
+        c0: macid | C0_OP,
+        w,
+        m,
+    })
+}
+
+/// Build the punctured-subchannel update CMAC table.
+///
+/// Mirrors Linux `rtw89/fw.c` `rtw89_fw_h2c_punctured_cmac_tbl_g7`
+/// (torvalds/linux @ 05441d6): w4 ACT_SUBCH_CBW = the bitwise
+/// NOT of the puncturing bitmap, masked to the 16-bit field;
+/// m4 = the field mask; every other pair stays zero.
+///
+/// NOTE the MAC-ID difference from the other builders: Linux
+/// addresses this update by the VIF MAC ID
+/// (`rtwvif_link->mac_id`), not the station MACID — so the
+/// caller passes the VIF id here.
+pub(super) fn build_punctured(macid_vif: u32, punctured: u16) -> Result<DefaultCmac, Error> {
+    if macid_vif > 0x7F {
+        return Err(Error::BadMacId);
+    }
+    let mut w = [0u32; 16];
+    let mut m = [0u32; 16];
+    w[4] = ((!punctured as u32) & 0xFFFF) << 16;
+    m[4] = W4_ACT_SUBCH_CBW_MASK;
+    Ok(DefaultCmac {
+        c0: macid_vif | C0_OP,
+        w,
+        m,
+    })
+}
