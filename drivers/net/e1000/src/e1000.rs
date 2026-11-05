@@ -524,12 +524,25 @@ const TXD_CTX_CMD_TSE: u32 = 1 << 26;
 const TXD_CTX_CMD_DEXT: u32 = 1 << 29;
 const TXD_CTX_PAYLEN_MASK: u32 = (1 << 20) - 1;
 
-// RX descriptor checksum status bits (e1000_hw.h E1000_RXD_STAT_IPCS /
-// E1000_RXD_STAT_TCPCS and E1000_RXD_ERR_IPE / E1000_RXD_ERR_TCPE).
+// RX descriptor status/error bits (Linux e1000_hw.h E1000_RXD_STAT_* /
+// E1000_RXD_ERR_*). Status: IPCS = IP checksum calculated, TCPCS = TCP
+// checksum calculated, UDPCS = UDP checksum calculated, IXSM = checksum
+// ignored by hardware. Errors: IPE / TCPE = IP / TCP-UDP checksum error;
+// CE / SE / SEQ / CXE / RXE = frame errors Linux drops unless RXALL
+// (e1000e FRAME_ERR_MASK).
 pub const RXD_STAT_IPCS: u8 = 1 << 6;
 pub const RXD_STAT_TCPCS: u8 = 1 << 5;
+pub const RXD_STAT_UDPCS: u8 = 1 << 4;
+pub const RXD_STAT_IXSM: u8 = 1 << 2;
 pub const RXD_ERR_IPE: u8 = 1 << 6;
 pub const RXD_ERR_TCPE: u8 = 1 << 5;
+pub const RXD_ERR_CE: u8 = 1 << 0;
+pub const RXD_ERR_SE: u8 = 1 << 1;
+pub const RXD_ERR_SEQ: u8 = 1 << 2;
+pub const RXD_ERR_CXE: u8 = 1 << 4;
+pub const RXD_ERR_RXE: u8 = 1 << 7;
+pub const RXD_ERR_FRAME_MASK: u8 =
+    RXD_ERR_CE | RXD_ERR_SE | RXD_ERR_SEQ | RXD_ERR_CXE | RXD_ERR_RXE;
 
 /// RX checksum verification result decoded from a legacy e1000 RxDesc.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -751,7 +764,7 @@ impl TxQueueState {
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct RxDesc {
+pub struct RxDesc {
     pub addr: u64,
     pub length: u16,
     pub csum: u16,
@@ -1141,20 +1154,81 @@ fn prepare_ipv4_tso(frame: &mut [u8], mss: u16) -> Result<TxContextDesc, E1000Er
 
 impl RxDesc {
     /// Decode the RX checksum result from the legacy e1000 descriptor
-    /// status and errors bytes.
-    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
+    /// status and errors bytes, in Linux `e1000e_rx_checksum` order:
+    /// IXSM first (hardware ignored the checksum — no verdict), then
+    /// error bits, then computed bits. Errors win over computed bits:
+    /// a UDP frame reports its checksum via UDPCS, not TCPCS, so the
+    /// old computed-first order returned `None` for a UDPCS-only frame
+    /// carrying TCPE and missed a real checksum failure.
     pub fn csum_result(&self) -> RxCsumResult {
-        let ip_computed = self.status & RXD_STAT_IPCS != 0;
-        let tcp_computed = self.status & RXD_STAT_TCPCS != 0;
-        if !ip_computed && !tcp_computed {
+        if self.status & RXD_STAT_IXSM != 0 {
             return RxCsumResult::None;
         }
-        let ip_err = self.errors & RXD_ERR_IPE != 0;
-        let tcp_err = self.errors & RXD_ERR_TCPE != 0;
-        if ip_err || tcp_err {
-            RxCsumResult::Fail
-        } else {
-            RxCsumResult::Ok
+        if self.errors & (RXD_ERR_IPE | RXD_ERR_TCPE) != 0 {
+            return RxCsumResult::Fail;
+        }
+        if self.status & (RXD_STAT_IPCS | RXD_STAT_TCPCS | RXD_STAT_UDPCS) != 0 {
+            return RxCsumResult::Ok;
+        }
+        RxCsumResult::None
+    }
+
+    /// `true` if the descriptor carries a frame error Linux drops
+    /// (CRC / symbol / sequence / carrier-extension / RX-data error),
+    /// independent of the checksum verdict.
+    pub fn has_frame_error(&self) -> bool {
+        self.errors & RXD_ERR_FRAME_MASK != 0
+    }
+}
+
+/// Why a received descriptor's frame must be dropped before delivery.
+/// Pure decision helper over the descriptor bytes so the matrix is
+/// fixture-pinned; both RX paths consult it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RxDropReason {
+    /// CRC error — reported via `note_rx_crc_error` (its own counter,
+    /// also counted toward `rx_errs`).
+    CrcError,
+    /// Non-CRC frame error (symbol, sequence, carrier-extension, or
+    /// RX-data). Linux drops these unless RXALL; NARF has no RXALL
+    /// mode, so they are always dropped. Reported via `note_rx_drop`.
+    FrameError,
+    /// Hardware computed a checksum and it failed. Deliberate
+    /// difference from Linux `e1000e`, which delivers the frame and
+    /// lets the stack re-verify: NARF's stack would drop it anyway
+    /// (`tcp_stack::handle_ipv4` / transport checksum verification),
+    /// so dropping in-driver is fail-closed with the same end state —
+    /// a bad frame never reaches a socket. The stack's
+    /// `rx_csum::*_ERRORS` counters do not increment for these;
+    /// the driver reports them via `note_rx_drop` instead.
+    CsumFail,
+}
+
+/// Drop decision for one completed RX descriptor: CRC first (its own
+/// counter), then other frame errors (their checksum bits are
+/// meaningless on a corrupt frame), then the checksum verdict.
+/// `None` means deliver.
+pub fn rx_drop_reason(desc: &RxDesc) -> Option<RxDropReason> {
+    if desc.errors & RXD_ERR_CE != 0 {
+        return Some(RxDropReason::CrcError);
+    }
+    if desc.has_frame_error() {
+        return Some(RxDropReason::FrameError);
+    }
+    if desc.csum_result() == RxCsumResult::Fail {
+        return Some(RxDropReason::CsumFail);
+    }
+    None
+}
+
+/// Report one RX-verdict drop to the stack counters.
+fn count_rx_drop(reason: RxDropReason) {
+    match reason {
+        RxDropReason::CrcError => {
+            narf_net::iface::note_rx_crc_error(e1000_ifname(), 1);
+        }
+        RxDropReason::FrameError | RxDropReason::CsumFail => {
+            narf_net::iface::note_rx_drop(e1000_ifname(), 1);
         }
     }
 }
@@ -2721,73 +2795,125 @@ impl E1000 {
     /// frame is currently pending. After consuming, the descriptor
     /// is rearmed and RDT is bumped so the device sees the freshly-
     /// available slot.
+    /// Copy one received frame out of the ring, skipping (and counting)
+    /// descriptors the RX verdict drops — frame errors and checksum
+    /// failures — so a caller that polls for one frame never stalls on
+    /// a bad frame at the head. Returns 0 when the ring holds no
+    /// deliverable frame. Descriptors consumed by drops are re-armed
+    /// and handed back via RDT exactly like delivered ones.
     pub fn rx_recv(&self, out: &mut [u8]) -> usize {
         if !self.datapath_open() {
             return 0;
         }
         let mut head_g = self.rx_head.lock();
-        let head = (*head_g) as usize;
+        let mut head = (*head_g) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (head * 16) as u64;
-        // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
-        let desc = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>())
-        };
-        if desc.status & RXD_STAT_DD == 0 {
-            return 0;
-        }
-        // Copy out the payload.
-        let len = (desc.length as usize).min(out.len()).min(RX_BUF_LEN);
-        let buf_phys = desc.addr;
-        for (i, b) in out.iter_mut().enumerate().take(len) {
-            // SAFETY: the RX buffer at `buf_phys` is an identity-mapped DMA
-            // page the device filled; `i < len <= RX_BUF_LEN`, so the byte
-            // address `buf_phys + i` stays within that page.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe {
+        // Count, not head comparison: a full ring of drops wraps `head`
+        // back to its start, which a comparison would misread as "none".
+        let mut dropped = 0usize;
+        loop {
+            let desc_addr = ring_phys + (head * 16) as u64;
+            // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
+            let desc = unsafe {
                 core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
+                    narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>(),
                 )
             };
+            if desc.status & RXD_STAT_DD == 0 {
+                // Ring empty. If drops were consumed above, hand those
+                // descriptors back before returning; otherwise RDT is
+                // already at the last freed slot.
+                if dropped != 0 {
+                    let last_freed = (head + RX_RING_LEN - 1) % RX_RING_LEN;
+                    compiler_fence(Ordering::SeqCst);
+                    // SAFETY: identity-mapped MMIO.
+                    unsafe {
+                        self.mmio.write32(REG_RDT, last_freed as u32);
+                    }
+                    *head_g = head as u32;
+                }
+                return 0;
+            }
+            if let Some(reason) = rx_drop_reason(&desc) {
+                count_rx_drop(reason);
+                // Rearm the dropped descriptor: clear status, leave
+                // addr as-is. RDT advances below once a deliverable
+                // frame is found, or on the empty-exit above.
+                let new_desc = RxDesc {
+                    addr: desc.addr,
+                    length: 0,
+                    csum: 0,
+                    status: 0,
+                    errors: 0,
+                    special: 0,
+                };
+                // SAFETY: identity-mapped DMA ring.
+                unsafe {
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                        new_desc,
+                    );
+                }
+                head = (head + 1) % RX_RING_LEN;
+                dropped += 1;
+                continue;
+            }
+            // Copy out the payload.
+            let len = (desc.length as usize).min(out.len()).min(RX_BUF_LEN);
+            let buf_phys = desc.addr;
+            for (i, b) in out.iter_mut().enumerate().take(len) {
+                // SAFETY: the RX buffer at `buf_phys` is an identity-mapped DMA
+                // page the device filled; `i < len <= RX_BUF_LEN`, so the byte
+                // address `buf_phys + i` stays within that page.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
+                *b = unsafe {
+                    core::ptr::read_volatile(
+                        narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
+                    )
+                };
+            }
+            // VLAN: hardware stripped the tag and recorded the TCI in
+            // `special` (SDM §3.2). Restore the wire format in the
+            // caller's buffer when it has room; otherwise deliver the
+            // stripped frame (documented corner — the polled path's
+            // caller owns the buffer size).
+            let len = if desc.special != 0 {
+                vlan_reinsert_tag(out, len, desc.special).unwrap_or(len)
+            } else {
+                len
+            };
+            // Rearm the descriptor: clear status, leave addr as-is.
+            let new_desc = RxDesc {
+                addr: buf_phys,
+                length: 0,
+                csum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            };
+            // SAFETY: identity-mapped DMA ring.
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                    new_desc,
+                );
+            }
+            // Bump RDT to the just-freed slot. After consuming descriptor
+            // `head`, the most recently freed slot is `head` itself —
+            // RDT points at the last available slot for the device.
+            // Dropped slots before it are freed by the same write: slots
+            // are consumed in ring order, so every slot up to `head`
+            // is available.
+            let new_head = ((head + 1) % RX_RING_LEN) as u32;
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: identity-mapped MMIO.
+            unsafe {
+                self.mmio.write32(REG_RDT, head as u32);
+            }
+            *head_g = new_head;
+            let _ = RXD_STAT_EOP; // EOP-multi-descriptor frames land in a follow-up.
+            return len;
         }
-        // VLAN: hardware stripped the tag and recorded the TCI in
-        // `special` (SDM §3.2). Restore the wire format in the
-        // caller's buffer when it has room; otherwise deliver the
-        // stripped frame (documented corner — the polled path's
-        // caller owns the buffer size).
-        let len = if desc.special != 0 {
-            vlan_reinsert_tag(out, len, desc.special).unwrap_or(len)
-        } else {
-            len
-        };
-        // Rearm the descriptor: clear status, leave addr as-is.
-        let new_desc = RxDesc {
-            addr: buf_phys,
-            length: 0,
-            csum: 0,
-            status: 0,
-            errors: 0,
-            special: 0,
-        };
-        // SAFETY: identity-mapped DMA ring.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
-                new_desc,
-            );
-        }
-        // Bump RDT to the just-freed slot. After consuming descriptor
-        // `head`, the most recently freed slot is `head` itself —
-        // RDT points at the last available slot for the device.
-        let new_head = ((head + 1) % RX_RING_LEN) as u32;
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio.write32(REG_RDT, head as u32);
-        }
-        *head_g = new_head;
-        let _ = RXD_STAT_EOP; // EOP-multi-descriptor frames land in a follow-up.
-        len
     }
 
     /// Process up to `budget` received frames **in place** from their RX DMA
@@ -2795,6 +2921,9 @@ impl E1000 {
     /// doorbell. The device has set DD before each callback and a descriptor is
     /// re-armed only after its callback returns, so processing cannot race a
     /// device write. A bounded batch also keeps the cooperative executor fair.
+    /// Returns the number of descriptors consumed — delivered frames plus
+    /// verdict-dropped frames. The async pump treats nonzero as "ring
+    /// activity, keep draining"; dropped frames never reach `f`.
     fn rx_drain_in_place<F: FnMut(&mut [u8])>(&self, budget: usize, mut f: F) -> usize {
         if !self.datapath_open() {
             return 0;
@@ -2818,47 +2947,56 @@ impl E1000 {
             if desc.status & RXD_STAT_DD == 0 {
                 break;
             }
-            let len = (desc.length as usize).min(RX_BUF_LEN);
-            // Descriptor `head` is backed by `rx_pool[head]` at probe and
-            // re-armed in place (the buffer address never changes), so the
-            // pairing is stable for the device's lifetime. Hand the stack a
-            // mutable slice straight into that identity-mapped page.
-            // SAFETY: the page is device-filled (DD set) and not concurrently
-            // written (we re-arm only after `f` returns); it is identity-mapped
-            // and `len <= RX_BUF_LEN <= page size`, so the slice stays within
-            // the buffer. An XDP rewrite in `f` writes the DMA page we own.
-            // VLAN: when CTRL.VME is set, hardware strips the tag and
-            // records the TCI in `special` (SDM §3.2). Re-tag in place
-            // before the stack sees the frame; the DMA page holds
-            // RX_BUF_LEN bytes, so a stripped frame with room for 4
-            // more bytes is restored to wire format. `special == 0`
-            // is delivered as-is: either untagged, or a priority-only
-            // tag (VID 0, priority 0, CFI 0), which carries no VLAN
-            // membership and is indistinguishable from untagged in
-            // the legacy descriptor. A frame that exactly fills the
-            // buffer cannot be re-tagged in place and is delivered
-            // stripped (documented corner).
-            let page = self.rx_pool[head].cpu_mut_ptr_at::<u8>(0);
-            let deliver_len = if desc.special != 0 {
-                // SAFETY: `page` is the base of the `rx_pool[head]` DMA page
-                // (one page per descriptor, RX_BUF_LEN bytes consumed), which
-                // the driver owns; DD is set, so the device has finished
-                // writing it, and we re-arm only after `f` returns, so no
-                // concurrent device write aliases this slice. RX_BUF_LEN is
-                // within the page, so the slice is in-bounds and non-null.
-                let page_slice = unsafe { core::slice::from_raw_parts_mut(page, RX_BUF_LEN) };
-                vlan_reinsert_tag(page_slice, len, desc.special).unwrap_or(len)
+            // Verdict gate: dropped frames are re-armed and counted
+            // below exactly like delivered ones (so `drained` still
+            // counts consumed descriptors and the single RDT doorbell
+            // hands them back), but `f` — and therefore the stack and
+            // the RX mirror — never sees them.
+            if let Some(reason) = rx_drop_reason(&desc) {
+                count_rx_drop(reason);
             } else {
-                len
-            };
-            // SAFETY: same `rx_pool[head]` page as above; `deliver_len <=
-            // RX_BUF_LEN` because `vlan_reinsert_tag` returns `None`
-            // (falling back to `len`) unless `len + 4` fits in the
-            // RX_BUF_LEN slice, and `len` itself is clamped to RX_BUF_LEN.
-            // The slice ends before the descriptor is re-armed below, so
-            // the device cannot write it concurrently while `f` runs.
-            let frame = unsafe { core::slice::from_raw_parts_mut(page, deliver_len) };
-            f(frame);
+                let len = (desc.length as usize).min(RX_BUF_LEN);
+                // Descriptor `head` is backed by `rx_pool[head]` at probe and
+                // re-armed in place (the buffer address never changes), so the
+                // pairing is stable for the device's lifetime. Hand the stack a
+                // mutable slice straight into that identity-mapped page.
+                // SAFETY: the page is device-filled (DD set) and not concurrently
+                // written (we re-arm only after `f` returns); it is identity-mapped
+                // and `len <= RX_BUF_LEN <= page size`, so the slice stays within
+                // the buffer. An XDP rewrite in `f` writes the DMA page we own.
+                // VLAN: when CTRL.VME is set, hardware strips the tag and
+                // records the TCI in `special` (SDM §3.2). Re-tag in place
+                // before the stack sees the frame; the DMA page holds
+                // RX_BUF_LEN bytes, so a stripped frame with room for 4
+                // more bytes is restored to wire format. `special == 0`
+                // is delivered as-is: either untagged, or a priority-only
+                // tag (VID 0, priority 0, CFI 0), which carries no VLAN
+                // membership and is indistinguishable from untagged in
+                // the legacy descriptor. A frame that exactly fills the
+                // buffer cannot be re-tagged in place and is delivered
+                // stripped (documented corner).
+                let page = self.rx_pool[head].cpu_mut_ptr_at::<u8>(0);
+                let deliver_len = if desc.special != 0 {
+                    // SAFETY: `page` is the base of the `rx_pool[head]` DMA page
+                    // (one page per descriptor, RX_BUF_LEN bytes consumed), which
+                    // the driver owns; DD is set, so the device has finished
+                    // writing it, and we re-arm only after `f` returns, so no
+                    // concurrent device write aliases this slice. RX_BUF_LEN is
+                    // within the page, so the slice is in-bounds and non-null.
+                    let page_slice = unsafe { core::slice::from_raw_parts_mut(page, RX_BUF_LEN) };
+                    vlan_reinsert_tag(page_slice, len, desc.special).unwrap_or(len)
+                } else {
+                    len
+                };
+                // SAFETY: same `rx_pool[head]` page as above; `deliver_len <=
+                // RX_BUF_LEN` because `vlan_reinsert_tag` returns `None`
+                // (falling back to `len`) unless `len + 4` fits in the
+                // RX_BUF_LEN slice, and `len` itself is clamped to RX_BUF_LEN.
+                // The slice ends before the descriptor is re-armed below, so
+                // the device cannot write it concurrently while `f` runs.
+                let frame = unsafe { core::slice::from_raw_parts_mut(page, deliver_len) };
+                f(frame);
+            }
             // Re-arm the descriptor: clear status, keep the same buffer
             // address. The final compiler fence orders every descriptor write
             // before the single tail doorbell below.
@@ -2896,7 +3034,8 @@ impl E1000 {
     /// Process one received frame **in place** from its RX DMA page — zero
     /// copy — then re-arm the descriptor. This is the single-frame public API;
     /// the asynchronous pump uses `rx_drain_in_place` to amortize its RDT
-    /// doorbell across a burst. Returns `true` iff a frame was processed.
+    /// doorbell across a burst. Returns `true` iff a descriptor was
+    /// consumed (a frame delivered to `f`, or a verdict-dropped frame).
     pub fn rx_recv_in_place<F: FnMut(&mut [u8])>(&self, f: F) -> bool {
         self.rx_drain_in_place(1, f) != 0
     }
@@ -3374,9 +3513,9 @@ fn e1000_send_frame_zc(mut frame: narf_net::Frame, meta: narf_net::TxMeta) -> Re
 }
 
 /// Drain one frame from the RX ring + dispatch it through the
-/// network stack's RX handler. Returns true iff a frame was
-/// processed. Called from a kernel-side polling task spawned at
-/// boot.
+/// network stack's RX handler. Returns true iff the ring advanced (a
+/// frame was delivered, or a verdict-dropped frame was consumed).
+/// Called from a kernel-side polling task spawned at boot.
 pub fn rx_pump_step() -> bool {
     // Zero-copy: dispatch the frame straight out of its RX DMA page rather than
     // copying it into a scratch buffer first (P-F). Same lock discipline as
@@ -4307,7 +4446,6 @@ mod tests {
         "drivers/net/e1000",
         smoke_suspend_words_preserve_bringup_config
     );
-
     fn smoke_mdic_command_words() -> TestResult {
         // Read of PHYSID1 (reg 2): OP_READ | phy 1 | reg 2.
         if super::mdic_read_cmd(super::PHY_ID1) != 0x0822_0000 {
@@ -4354,4 +4492,82 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_bmsr_link_decode);
+
+    fn smoke_rx_csum_result_matrix() -> TestResult {
+        // Pin the descriptor bit values against the Linux literals
+        // (e1000_hw.h), not the module's own constants, so a
+        // mistranscribed constant cannot pass its own test.
+        if super::RXD_STAT_IPCS != 0x40
+            || super::RXD_STAT_TCPCS != 0x20
+            || super::RXD_STAT_UDPCS != 0x10
+            || super::RXD_STAT_IXSM != 0x04
+            || super::RXD_ERR_IPE != 0x40
+            || super::RXD_ERR_TCPE != 0x20
+        {
+            return TestResult::Fail("e1000 RX descriptor bit constants drifted from Linux");
+        }
+        // (status, errors) -> expected verdict. Status bits: DD 0x01,
+        // IXSM 0x04, UDPCS 0x10, TCPCS 0x20, IPCS 0x40; error bits:
+        // TCPE 0x20, IPE 0x40.
+        let cases: [(u8, u8, super::RxCsumResult); 13] = [
+            (0x00, 0x00, super::RxCsumResult::None),
+            (0x40, 0x00, super::RxCsumResult::Ok),
+            (0x20, 0x00, super::RxCsumResult::Ok),
+            (0x10, 0x00, super::RxCsumResult::Ok),
+            (0x60, 0x00, super::RxCsumResult::Ok),
+            (0x40, 0x40, super::RxCsumResult::Fail),
+            (0x20, 0x20, super::RxCsumResult::Fail),
+            // The UDP hole the old computed-first order missed: UDPCS
+            // only, carrying TCPE, must fail, not report None.
+            (0x10, 0x20, super::RxCsumResult::Fail),
+            // Errors win even with no computed bit set.
+            (0x00, 0x20, super::RxCsumResult::Fail),
+            (0x00, 0x40, super::RxCsumResult::Fail),
+            (0x60, 0x60, super::RxCsumResult::Fail),
+            // IXSM wins over everything: hardware ignored the checksum.
+            (0x44, 0x00, super::RxCsumResult::None),
+            (0x04, 0x20, super::RxCsumResult::None),
+        ];
+        for (status, errors, want) in cases {
+            let desc = super::RxDesc {
+                status,
+                errors,
+                ..Default::default()
+            };
+            if desc.csum_result() != want {
+                return TestResult::Fail("e1000 csum_result matrix mismatch");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_rx_csum_result_matrix);
+
+    fn smoke_rx_drop_reason_matrix() -> TestResult {
+        // Error bits: CE 0x01, SE 0x02, SEQ 0x04, CXE 0x10, TCPE 0x20,
+        // IPE 0x40, RXE 0x80. Status bits as in the csum matrix.
+        let cases: [(u8, u8, Option<super::RxDropReason>); 10] = [
+            (0x00, 0x01, Some(super::RxDropReason::CrcError)),
+            (0x40, 0x41, Some(super::RxDropReason::CrcError)),
+            (0x00, 0x02, Some(super::RxDropReason::FrameError)),
+            (0x00, 0x04, Some(super::RxDropReason::FrameError)),
+            (0x00, 0x10, Some(super::RxDropReason::FrameError)),
+            (0x00, 0x80, Some(super::RxDropReason::FrameError)),
+            (0x40, 0x20, Some(super::RxDropReason::CsumFail)),
+            (0x10, 0x20, Some(super::RxDropReason::CsumFail)),
+            (0x40, 0x00, None),
+            (0x00, 0x00, None),
+        ];
+        for (status, errors, want) in cases {
+            let desc = super::RxDesc {
+                status,
+                errors,
+                ..Default::default()
+            };
+            if super::rx_drop_reason(&desc) != want {
+                return TestResult::Fail("e1000 rx_drop_reason matrix mismatch");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_rx_drop_reason_matrix);
 }
