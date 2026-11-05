@@ -72,6 +72,16 @@ impl Settings {
     }
 }
 
+/// MAC Merge statistics (Linux `ethtool_mm_stats`): the five counters
+/// `igc_ethtool_get_mm_stats` reports. HOLD_COUNT is not reported by igc.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MmStats {
+    pub reassembly_errors: u64,
+    pub smd_errors: u64,
+    pub reassembly_ok: u64,
+    pub rx_frag_count: u64,
+    pub tx_frag_count: u64,
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EeeStatus {
     pub advertised: u32,
@@ -179,6 +189,53 @@ pub trait NicControl: core::fmt::Debug + Send + Sync {
     }
     fn registers(&self) -> Result<Vec<u32>> {
         Err(95)
+    }
+    /// Linux `ETHTOOL_GMSGLVL`: the driver's `msg_enable` bitmap.
+    fn msglevel(&self) -> Result<u32> {
+        Err(95)
+    }
+    /// Linux `ETHTOOL_SMSGLVL`.
+    fn set_msglevel(&self, _: u32) -> Result<()> {
+        Err(95)
+    }
+    /// Linux `ETHTOOL_GPFLAGS`: the driver's private-flags bitmap.
+    fn priv_flags(&self) -> Result<u32> {
+        Err(95)
+    }
+    /// Linux `ETHTOOL_SPFLAGS`.
+    fn set_priv_flags(&self, _: u32) -> Result<()> {
+        Err(95)
+    }
+    /// Private-flag names in `ETHTOOL_GSTRINGS` (sset 2) order; the count is
+    /// `ETHTOOL_GDRVINFO`'s `n_priv_flags`. Empty when the driver has none.
+    fn priv_flag_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// Linux `ETHTOOL_GRXFH` (`ethtool_rxfh_fields.data`): the RSS hash
+    /// fields for `flow_type` (uapi `TCP_V4_FLOW` etc.), as RXH bits.
+    fn rxfh_fields(&self, _: u8) -> Result<u32> {
+        Err(95)
+    }
+    /// Linux `ETHTOOL_SRXFH`.
+    fn set_rxfh_fields(&self, _: u8, _: u32) -> Result<()> {
+        Err(95)
+    }
+    /// Linux `ETHTOOL_MSG_MM_GET` with `ETHTOOL_FLAG_STATS`: the MAC Merge
+    /// statistics. `Err(95)` omits the stats nest from the reply.
+    fn mm_stats(&self) -> Result<MmStats> {
+        Err(95)
+    }
+    /// `ETHTOOL_GREGS` version word. Linux igc reports
+    /// `(2 << 24) | (revision << 16) | device_id`; the default 1 matches the
+    /// previous codec behaviour for drivers that do not override it.
+    fn registers_version(&self) -> u32 {
+        1
+    }
+    /// Linux `igc_ethtool_set_coalesce` validation for one rx/tx usecs pair.
+    /// The default accepts everything; the shared `Settings` cap still
+    /// bounds the committed value.
+    fn check_coalesce(&self, _: u32, _: u32) -> Result<()> {
+        Ok(())
     }
     fn nvm_info(&self) -> Result<(u32, u32)> {
         Err(95)
@@ -429,6 +486,7 @@ mod tests {
             (29, 8, 4),
             (26, 16, 12),
             (48, 192, 184),
+            (0x38, 8, 4),
         ] {
             let mut b = alloc::vec![0;size];
             put(&mut b, 0, cmd);
@@ -445,6 +503,134 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("net", smoke_ethtool_variable_requests_are_bounded);
+    fn smoke_ethtool_igc_surface_roundtrip() -> TestResult {
+        let (name, m) = setup();
+        // The test Model keeps the NicControl defaults: msglevel, priv
+        // flags and RXFH fields are unimplemented, so the new commands
+        // surface as -EOPNOTSUPP rather than silently succeeding.
+        for cmd in [0x07u32, 0x08, 0x27, 0x28] {
+            let mut b = alloc::vec![0; 8];
+            put(&mut b, 0, cmd);
+            if crate::ethtool::execute(&name.0, &mut b) != Err(95) {
+                return TestResult::Fail("unimplemented ethtool value command accepted");
+            }
+        }
+        let mut rxfh = alloc::vec![0; 192];
+        put(&mut rxfh, 0, 0x29);
+        put(&mut rxfh, 4, 1);
+        if crate::ethtool::execute(&name.0, &mut rxfh) != Err(95) {
+            return TestResult::Fail("unimplemented GRXFH accepted");
+        }
+        put(&mut rxfh, 0, 0x2a);
+        put(&mut rxfh, 8, 0xf0);
+        if crate::ethtool::execute(&name.0, &mut rxfh) != Err(95) {
+            return TestResult::Fail("unimplemented SRXFH accepted");
+        }
+        // Legacy RXFH indirection: GET with size 0 reports the table size;
+        // SET requires exactly 128 entries and in-range queues.
+        let mut indir = alloc::vec![0; 8];
+        put(&mut indir, 0, 0x38);
+        if crate::ethtool::execute(&name.0, &mut indir).is_err() || get(&indir, 4) != 128 {
+            return TestResult::Fail("GRXFHINDIR size query failed");
+        }
+        let mut indir = alloc::vec![0; 16];
+        put(&mut indir, 0, 0x38);
+        put(&mut indir, 4, 2);
+        if crate::ethtool::execute(&name.0, &mut indir).is_err()
+            || get(&indir, 8) != 0
+            || get(&indir, 12) != 1
+        {
+            return TestResult::Fail("GRXFHINDIR entries wrong");
+        }
+        let mut set = alloc::vec![0; 520];
+        put(&mut set, 0, 0x39);
+        put(&mut set, 4, 128);
+        put(&mut set, 8, 99);
+        if crate::ethtool::execute(&name.0, &mut set) != Err(22) {
+            return TestResult::Fail("SRXFHINDIR accepted an out-of-range queue");
+        }
+        let mut set = alloc::vec![0; 264];
+        put(&mut set, 0, 0x39);
+        put(&mut set, 4, 64);
+        if crate::ethtool::execute(&name.0, &mut set) != Err(22) {
+            return TestResult::Fail("SRXFHINDIR accepted a short table");
+        }
+        // Channels: Linux NON_Q_VECTORS is 1.
+        let mut ch = alloc::vec![0; 36];
+        put(&mut ch, 0, 0x3c);
+        if crate::ethtool::execute(&name.0, &mut ch).is_err()
+            || get(&ch, 12) != 1
+            || get(&ch, 28) != 1
+            || get(&ch, 32) != 2
+        {
+            return TestResult::Fail("GCHANNELS other_count wrong");
+        }
+        put(&mut ch, 0, 0x3d);
+        put(&mut ch, 28, 0);
+        if crate::ethtool::execute(&name.0, &mut ch) != Err(22) {
+            return TestResult::Fail("SCHANNELS accepted other_count 0");
+        }
+        put(&mut ch, 28, 1);
+        put(&mut ch, 32, 2);
+        if crate::ethtool::execute(&name.0, &mut ch).is_err() || m.0.lock().channels != 2 {
+            return TestResult::Fail("SCHANNELS with other_count 1 rejected");
+        }
+        // TS info: i225 reports TX_SOFTWARE as well as TX/RX_HARDWARE.
+        let mut ts = alloc::vec![0; 44];
+        put(&mut ts, 0, 0x41);
+        if crate::ethtool::execute(&name.0, &mut ts).is_err() || get(&ts, 4) != 0x47 {
+            return TestResult::Fail("GET_TS_INFO missing TX_SOFTWARE");
+        }
+        // Coalesce: non-usecs fields are ignored (Linux), not -EOPNOTSUPP.
+        let mut coal = alloc::vec![0; 92];
+        put(&mut coal, 0, 0x0f);
+        put(&mut coal, 4, 166);
+        put(&mut coal, 8, 5);
+        put(&mut coal, 20, 166);
+        put(&mut coal, 24, 7);
+        if crate::ethtool::execute(&name.0, &mut coal).is_err() || m.0.lock().coalesce_us != 166 {
+            return TestResult::Fail("SET_COALESCE rejected non-usecs fields");
+        }
+        // GSSET_INFO mask bit 2 reports the priv-flag count (0 here).
+        let mut info = alloc::vec![0; 28];
+        put(&mut info, 0, 0x37);
+        put(&mut info, 8, 6);
+        if crate::ethtool::execute(&name.0, &mut info).is_err()
+            || get(&info, 8) != 6
+            || get(&info, 16) != 1
+            || get(&info, 20) != 0
+        {
+            return TestResult::Fail("GSSET_INFO priv-flag count wrong");
+        }
+        // GSTRINGS sset 2 (priv flags) with no flags reports count 0.
+        let mut strings = alloc::vec![0; 12];
+        put(&mut strings, 0, 0x1b);
+        put(&mut strings, 4, 2);
+        if crate::ethtool::execute(&name.0, &mut strings).is_err() || get(&strings, 8) != 0 {
+            return TestResult::Fail("GSTRINGS priv-flag count wrong");
+        }
+        // Link ksettings: a too-small mask reports the required 2 words in
+        // the nwords byte; a set with the wrong count is -EINVAL.
+        let mut link = alloc::vec![0; 48];
+        put(&mut link, 0, 0x4c);
+        if crate::ethtool::execute(&name.0, &mut link).is_err() || link[15] != 2 {
+            return TestResult::Fail("GLINKSETTINGS did not report 2 mask words");
+        }
+        link[15] = 2;
+        if crate::ethtool::execute(&name.0, &mut link).is_err()
+            || get(&link, 48) & (1 << 7) == 0
+            || get(&link, 56) & 0xc0 != 0xc0
+        {
+            return TestResult::Fail("GLINKSETTINGS masks wrong");
+        }
+        put(&mut link, 0, 0x4d);
+        link[15] = 1;
+        if crate::ethtool::execute(&name.0, &mut link) != Err(22) {
+            return TestResult::Fail("SLINKSETTINGS accepted a short mask");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net", smoke_ethtool_igc_surface_roundtrip);
     fn smoke_umem_dma_lease_revocation_and_duplicates() -> TestResult {
         let umem = crate::bypass::umem::Umem::register(4096, 2048).unwrap();
         let read = umem.frame_bytes(0).unwrap();

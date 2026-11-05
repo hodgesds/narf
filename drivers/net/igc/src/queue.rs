@@ -94,6 +94,12 @@ struct Rx {
     packets: u64,
     bytes: u64,
     drops: u64,
+    /// Completed frames whose descriptor reported an L3/L4 checksum error
+    /// (Linux `rx_queue_%u_csum_err`).
+    csum_err: u64,
+    /// Frames dropped because no RX buffer could be allocated (Linux
+    /// `rx_queue_%u_alloc_failed`).
+    alloc_failed: u64,
 }
 
 #[derive(Debug)]
@@ -150,6 +156,8 @@ impl Queue {
                 packets: 0,
                 bytes: 0,
                 drops: 0,
+                csum_err: 0,
+                alloc_failed: 0,
             }),
         };
         // SAFETY: newly allocated queues have never been exposed to the device.
@@ -166,7 +174,7 @@ impl Queue {
         (self.tx_count, self.rx_count)
     }
 
-    pub(crate) fn statistics(&self) -> [u64; 8] {
+    pub(crate) fn statistics(&self) -> [u64; 10] {
         let t = self.tx.lock();
         let r = self.rx.lock();
         [
@@ -178,6 +186,8 @@ impl Queue {
             r.packets,
             r.bytes,
             r.drops,
+            r.csum_err,
+            r.alloc_failed,
         ]
     }
 
@@ -757,6 +767,7 @@ impl Queue {
                             rx.dropping = true;
                         }
                     } else {
+                        rx.alloc_failed += 1;
                         rx.dropping = true;
                     }
                 } else {
@@ -804,6 +815,10 @@ impl Queue {
                             rx.partial = Some(frame);
                         }
                     } else {
+                        // Reachable only when the assembly allocation just
+                        // above failed: `rx.partial` is assigned from
+                        // `allocate(..).ok()` and taken immediately after.
+                        rx.alloc_failed += 1;
                         rx.dropping = true;
                     }
                 }
@@ -812,6 +827,15 @@ impl Queue {
             rx.head = (slot + 1) % self.rx_count;
             consumed += 1;
             if eop {
+                // Linux igc_rx_checksum counts one csum_err per completed
+                // frame whose descriptor reports an L3/L4 checksum error
+                // (IPE/L4E), except when IXSM says the checksum result is
+                // not meaningful (same gate as rx_metadata). The 60-byte
+                // SCTP errata exception is not applied: NARF has no
+                // per-ring SCTP checksum flag to condition it on.
+                if status & 4 == 0 && status & 0x60000000 != 0 {
+                    rx.csum_err += 1;
+                }
                 if rx.dropping {
                     drops += 1;
                 }

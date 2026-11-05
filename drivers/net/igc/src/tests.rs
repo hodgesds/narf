@@ -397,7 +397,7 @@ fn smoke_igc_queue_enable_and_rss() -> TestResult {
         "global DMA not enabled after queue configuration"
     );
     check!(
-        m.value(0x5004) == 9238 && m.value(0x5818) == 0x00f70002,
+        m.value(0x5004) == 9238 && m.value(0x5818) == 0x00370002,
         "jumbo/RSS control wrong"
     );
     for word in 0..32 {
@@ -1144,7 +1144,7 @@ fn smoke_igc_gate_validation_and_cbs_registers() -> TestResult {
         schedule.base == 20000,
         "past base not advanced to next cycle"
     );
-    schedule.apply(&m, 2, true);
+    schedule.apply(&m, 2, true, false);
     check!(
         m.value(0x3324) == 0
             && m.value(0x3334) == 4000
@@ -1155,6 +1155,21 @@ fn smoke_igc_gate_validation_and_cbs_registers() -> TestResult {
     check!(
         m.value(0x3004) == 0x4000098a && m.value(0x3344) == 0x86 && m.value(0x300c) == 0x8004a81c,
         "CBS credits/slope wrong"
+    );
+    check!(
+        m.value(0x3354) == 0,
+        "TX arbitration written without the reverse flag"
+    );
+    schedule.apply(&m, 2, true, true);
+    check!(
+        m.value(0x3354) == 0x1b,
+        "reverse TX arbitration not programmed"
+    );
+    let idle = crate::traffic::Schedule::validate(Default::default(), 2, 15000).unwrap();
+    idle.apply(&m, 2, true, true);
+    check!(
+        m.value(0x3354) == 0xe4,
+        "disabled TSN did not restore default TX arbitration"
     );
     let mut bad = config;
     bad.gates = vec![
@@ -1826,3 +1841,262 @@ kernel_test_in!(
     "drivers/net/igc",
     smoke_igc_timestamp_timeout_quarantine_and_clock_rate
 );
+
+fn smoke_igc_ethtool_regs_dump_layout() -> TestResult {
+    let m = Model::new();
+    m.regs.borrow_mut().extend([
+        (0, 0x1111_1111),
+        (8, 0x2222_2222),
+        (0x18, 0x3333_3333),
+        (0x20, 0x4444_4444),
+        (0x1520, 0x66),
+        (0x1504, 0x77),
+        (0x4000, 5),
+        (0x4074, 7),
+        (0x4088, 0x1234_5678),
+        (0x4100, 9),
+        (0x4148, 3),
+        (0x414c, 4),
+        (0xc08c, 0xaa),
+        (0x5488, 0xb2),
+        (0xc040, 0xc1),
+        (0xe0e8, 0xd3),
+        (0x1680, 0xe0),
+        (0x16a4, 0xe9),
+        (0x5400, 0xa0),
+        (0x5404, 0xb0),
+        (0x5404 + 4 * 8, 0xb4),
+        (0xe000, 0xc0),
+        (0x55b0, 0x55),
+        (0x5ccc, 0xe7),
+    ]);
+    let mut counters = crate::counters::Counters::new();
+    counters.sample(&m, 4, false);
+    // Live-register values changed after sampling must not leak into the
+    // dump: statistics words come from the accumulated counters.
+    m.regs.borrow_mut().insert(0x4000, 0x77);
+    m.regs.borrow_mut().insert(0x4100, 0x77);
+    let dump = crate::igc::control::regs_dump(&m, &counters);
+    check!(dump.len() == 740, "register dump is not 740 words");
+    check!(
+        dump[0] == 0x1111_1111
+            && dump[1] == 0x2222_2222
+            && dump[2] == 0x3333_3333
+            && dump[3] == 0x4444_4444,
+        "general registers wrong"
+    );
+    check!(
+        dump[6] == 0x66 && dump[7] == 0x66 && dump[12] == 0x77 && dump[13] == 0x77,
+        "interrupt shadow words wrong"
+    );
+    check!(dump[16] == 9, "IAC word did not use the accumulated value");
+    check!(
+        dump[30] == 5 && dump[56] == 7 && dump[60] == 0x1234_5678,
+        "statistics words did not use the accumulated counters"
+    );
+    check!(
+        dump[32] == 0 && dump[42] == 0 && dump[89] == 0 && dump[90] == 0,
+        "never-accumulated statistics words not zero"
+    );
+    check!(dump[213] == 3 && dump[214] == 4, "LPI counter words wrong");
+    check!(
+        dump[93] == 0xaa && dump[97] == 0xb2 && dump[100] == 0xc1 && dump[171] == 0xd3,
+        "per-queue registers wrong"
+    );
+    check!(dump[123] == 0xe0 && dump[132] == 0xe9, "EITR words wrong");
+    check!(
+        dump[133..139].iter().all(|v| *v == 0),
+        "reserved words 133..138 not zero"
+    );
+    check!(
+        dump[139] == 0xa0 && dump[145] == 0xb0 && dump[149] == 0xc0,
+        "RAL/RAH/TDBAL overlap quirk not reproduced"
+    );
+    check!(
+        dump[172] == 0xa0 && dump[188] == 0xb0,
+        "second RAL/RAH copies wrong"
+    );
+    check!(
+        dump[204] == 0x55 && dump[212] == 0xe7,
+        "VLANPQF/ETQF words wrong"
+    );
+    check!(
+        dump[215..].iter().all(|v| *v == 0),
+        "trailing words 215..739 not zero"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_ethtool_regs_dump_layout);
+
+fn smoke_igc_ethtool_mm_stats() -> TestResult {
+    let m = Model::new();
+    m.regs.borrow_mut().extend([
+        (0x42a0, 0x0102_0304),
+        (0x4284, 11),
+        (0x4298, 12),
+        (0x429c, 13),
+    ]);
+    let mut counters = crate::counters::Counters::new();
+    counters.sample(&m, 4, false);
+    let stats = counters.mm_stats();
+    check!(
+        stats.reassembly_errors == 6
+            && stats.smd_errors == 4
+            && stats.reassembly_ok == 11
+            && stats.tx_frag_count == 12
+            && stats.rx_frag_count == 13,
+        "MAC merge statistics wrong"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_ethtool_mm_stats);
+
+fn smoke_igc_ethtool_fw_version() -> TestResult {
+    let m = Model::new();
+    m.phy.borrow_mut().insert(30, 0x1234);
+    check!(
+        hardware::fw_version(&m) == Some(alloc::string::String::from("5aa0:1234")),
+        "firmware version format wrong"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_ethtool_fw_version);
+
+fn smoke_igc_ethtool_coalesce_rule() -> TestResult {
+    use crate::igc::control::check_coalesce_usecs;
+    check!(
+        check_coalesce_usecs(0).is_ok()
+            && check_coalesce_usecs(1).is_ok()
+            && check_coalesce_usecs(3).is_ok()
+            && check_coalesce_usecs(10).is_ok()
+            && check_coalesce_usecs(10_000).is_ok(),
+        "valid coalesce usecs rejected"
+    );
+    check!(
+        check_coalesce_usecs(2).is_err()
+            && check_coalesce_usecs(4).is_err()
+            && check_coalesce_usecs(9).is_err()
+            && check_coalesce_usecs(10_001).is_err(),
+        "invalid coalesce usecs accepted"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_ethtool_coalesce_rule);
+
+fn smoke_igc_ethtool_rxfh_fields() -> TestResult {
+    use crate::igc::control::{rxfh_field_data, rxfh_field_flags};
+    check!(
+        rxfh_field_data(0x01, false, false) == Ok(0xf0)
+            && rxfh_field_data(0x05, false, false) == Ok(0xf0)
+            && rxfh_field_data(0x03, false, false) == Ok(0x30)
+            && rxfh_field_data(0x10, false, false) == Ok(0x30),
+        "TCP/SCTP/IP RSS hash fields wrong"
+    );
+    check!(
+        rxfh_field_data(0x02, false, false) == Ok(0x30)
+            && rxfh_field_data(0x02, true, false) == Ok(0xf0)
+            && rxfh_field_data(0x06, false, true) == Ok(0xf0)
+            && rxfh_field_data(0x06, false, false) == Ok(0x30),
+        "UDP RSS hash fields did not follow the UDP flags"
+    );
+    check!(
+        rxfh_field_data(0x12, false, false).is_err()
+            && rxfh_field_data(0xff, false, false).is_err(),
+        "unreportable flow type accepted"
+    );
+    check!(
+        rxfh_field_flags(0x01, 0xf0, false, false) == Ok((false, false))
+            && rxfh_field_flags(0x01, 0x30, false, false).is_err(),
+        "TCP field validation wrong"
+    );
+    check!(
+        rxfh_field_flags(0x02, 0x30, true, false) == Ok((false, false))
+            && rxfh_field_flags(0x02, 0xf0, false, true) == Ok((true, true))
+            && rxfh_field_flags(0x02, 0x70, false, false).is_err(),
+        "UDP field validation wrong"
+    );
+    check!(
+        rxfh_field_flags(0x09, 0x30, false, false) == Ok((false, false))
+            && rxfh_field_flags(0x09, 0xf0, false, false).is_err()
+            && rxfh_field_flags(0x10, 0x30, false, false).is_err(),
+        "AH/IP field validation wrong"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_ethtool_rxfh_fields);
+
+fn smoke_igc_ethtool_linux_stats() -> TestResult {
+    let m = Model::new();
+    m.regs.borrow_mut().extend([
+        (0x4000, 5),
+        (0x4004, 6),
+        (0x400c, 7),
+        (0x40a4, 8),
+        (0x40ac, 9),
+        (0x4010, 11),
+        (0x4018, 2),
+        (0x4020, 3),
+        (0x4028, 3),
+        (0x402c, 4),
+        (0xc030, 13),
+    ]);
+    let mut counters = crate::counters::Counters::new();
+    counters.sample(&m, 4, false);
+    let mut s = crate::igc::IgcStats::default();
+    s.tx_timeouts = 3;
+    s.tx_rejected = 5;
+    let stats = crate::igc::control::linux_stats(
+        &counters,
+        &s,
+        7,
+        &[
+            [100, 200, 0, 300, 400, 13, 2, 1],
+            [101, 201, 0, 301, 401, 0, 0, 0],
+        ],
+    );
+    let get = |name: &str| {
+        stats
+            .iter()
+            .find(|stat| stat.name == name)
+            .map(|stat| stat.value)
+    };
+    check!(
+        stats.len() == 38 + 9 + 16,
+        "Linux statistics table has the wrong length"
+    );
+    check!(
+        get("collisions") == Some(7)
+            && get("rx_errors") == Some(35)
+            && get("tx_errors") == Some(5)
+            && get("rx_fifo_errors") == Some(24)
+            && get("tx_timeout_count") == Some(3)
+            && get("tx_dropped") == Some(5)
+            && get("tx_hwtstamp_skipped") == Some(7),
+        "Linux global/net statistics formulas wrong"
+    );
+    check!(
+        get("tx_queue_0_packets") == Some(100)
+            && get("tx_queue_0_restart") == Some(0)
+            && get("rx_queue_0_drops") == Some(13)
+            && get("rx_queue_0_csum_err") == Some(2)
+            && get("rx_queue_1_bytes") == Some(401),
+        "Linux per-queue statistics wrong"
+    );
+    check!(
+        get("rx_packets").is_none() && get("tx_packets").is_none(),
+        "Linux statistics table duplicated names the caller reports"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_ethtool_linux_stats);
+
+fn smoke_igc_ethtool_queue_statistics_shape() -> TestResult {
+    let q = crate::queue::Queue::new().unwrap();
+    let values = q.statistics();
+    check!(
+        values.len() == 10 && values[8] == 0 && values[9] == 0,
+        "queue statistics not extended with csum_err/alloc_failed"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_ethtool_queue_statistics_shape);

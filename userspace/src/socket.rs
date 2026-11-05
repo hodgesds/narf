@@ -2266,8 +2266,13 @@ impl SocketFile {
                     36,
                     version.unwrap_or(crate::handlers::UTS_RELEASE),
                 );
+                if let Some(fw) = narf_net::iface::driver_fw_version(name) {
+                    put(&mut info, 68, &fw);
+                }
                 put(&mut info, 100, &bus_info);
                 let _ = narf_net::nic::with_control(name, |driver| {
+                    info[176..180]
+                        .copy_from_slice(&(driver.priv_flag_names().len() as u32).to_ne_bytes());
                     if let Ok(stats) = driver.statistics() {
                         info[180..184].copy_from_slice(&(stats.len() as u32).to_ne_bytes());
                     }

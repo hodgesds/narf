@@ -17,6 +17,7 @@ pub fn header_size(cmd: u32) -> Option<usize> {
         0x01 | 0x02 => 44,
         0x05 | 0x06 => 20,
         0x04 => 12,
+        0x07 | 0x08 | 0x27 | 0x28 => 8,
         0x0b | 0x0c => 16,
         0x09 => 4,
         0x0e | 0x0f => 92,
@@ -26,8 +27,9 @@ pub fn header_size(cmd: u32) -> Option<usize> {
         0x1b => 12,
         0x1d => 8,
         0x1a => 16,
-        0x2e..=0x32 => 192,
+        0x29 | 0x2a | 0x2e..=0x32 => 192,
         0x37 => 16,
+        0x38 | 0x39 => 8,
         0x41 => 44,
         0x44 | 0x45 => 40,
         0x46 | 0x47 => 24,
@@ -52,7 +54,14 @@ pub fn request_size(header: &[u8]) -> nic::Result<usize> {
         0x1d => (get(header, 4) as usize).checked_mul(8).ok_or(22)?,
         0x1a => (get(header, 12) as usize).checked_mul(8).ok_or(22)?,
         0x37 => {
-            (u64::from_ne_bytes(header[8..16].try_into().unwrap()) & 3).count_ones() as usize * 4
+            (u64::from_ne_bytes(header[8..16].try_into().unwrap()) & 7).count_ones() as usize * 4
+        }
+        0x38 | 0x39 => {
+            let size = get(header, 4) as usize;
+            if size > 128 {
+                return Err(22);
+            }
+            size.checked_mul(4).ok_or(22)?
         }
         0x46 | 0x47 => {
             let indir = get(header, 8);
@@ -100,7 +109,7 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
             0x04 => {
                 let regs = driver.registers()?;
                 let bytes = (get(b, 8) as usize).min(regs.len() * 4);
-                put(b, 4, 1);
+                put(b, 4, driver.registers_version());
                 put(b, 8, bytes as u32);
                 for i in 0..bytes {
                     b[12 + i] = regs[i / 4].to_ne_bytes()[i % 4];
@@ -178,6 +187,32 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                 }
                 return Ok(());
             }
+            0x07 => {
+                put(b, 4, driver.msglevel()?);
+                return Ok(());
+            }
+            0x08 => {
+                return driver.set_msglevel(get(b, 4));
+            }
+            0x27 => {
+                put(b, 4, driver.priv_flags()?);
+                return Ok(());
+            }
+            0x28 => {
+                return driver.set_priv_flags(get(b, 4));
+            }
+            0x29 | 0x2a => {
+                // struct ethtool_rxnfc: cmd(0), flow_type(4), data(8).
+                let flow_type = u8::try_from(get(b, 4)).map_err(|_| 22)?;
+                if cmd == 0x29 {
+                    put64(b, 8, u64::from(driver.rxfh_fields(flow_type)?));
+                } else {
+                    let data = u64::from_ne_bytes(b[8..16].try_into().unwrap());
+                    let data = u32::try_from(data).map_err(|_| 22)?;
+                    driver.set_rxfh_fields(flow_type, data)?;
+                }
+                return Ok(());
+            }
             0x09 => return driver.restart_link(),
             0x1b | 0x1d | 0x37 => {
                 if cmd == 0x1b && get(b, 4) == 0 {
@@ -194,11 +229,25 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                     }
                     return Ok(());
                 }
+                if cmd == 0x1b && get(b, 4) == 2 {
+                    let names = driver.priv_flag_names();
+                    let requested = get(b, 8) as usize;
+                    if requested != 0 && requested < names.len() {
+                        return Err(22);
+                    }
+                    put(b, 8, names.len() as u32);
+                    for (i, name) in names.iter().take(requested).enumerate() {
+                        let text = name.as_bytes();
+                        let n = text.len().min(31);
+                        b[12 + i * 32..12 + i * 32 + n].copy_from_slice(&text[..n]);
+                    }
+                    return Ok(());
+                }
                 let stats = driver.statistics()?;
                 let count = stats.len() as u32;
                 if cmd == 0x37 {
                     let mask = u64::from_ne_bytes(b[8..16].try_into().unwrap());
-                    put64(b, 8, mask & 3);
+                    put64(b, 8, mask & 7);
                     let mut at = 16;
                     if mask & 1 != 0 {
                         put(b, at, driver.diagnostics(false)?.len() as u32);
@@ -206,6 +255,10 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                     }
                     if mask & 2 != 0 {
                         put(b, at, count);
+                        at += 4;
+                    }
+                    if mask & 4 != 0 {
+                        put(b, at, driver.priv_flag_names().len() as u32);
                     }
                     return Ok(());
                 }
@@ -245,7 +298,9 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
             }
             0x41 => {
                 b[4..].fill(0);
-                put(b, 4, (1 << 0) | (1 << 2) | (1 << 6));
+                // i225: TX_SOFTWARE | TX_HARDWARE | RX_HARDWARE | RAW_HARDWARE
+                // (Linux igc_ethtool_get_ts_info).
+                put(b, 4, (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6));
                 put(b, 8, driver.clock_index() as u32);
                 put(b, 12, 3);
                 put(b, 28, 3);
@@ -303,14 +358,12 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                 put(b, 20, s.coalesce_us);
             }
             0x0f => {
-                if get(b, 4) != get(b, 20)
-                    || (8..92)
-                        .step_by(4)
-                        .filter(|i| *i != 20)
-                        .any(|i| get(b, i) != 0)
-                {
+                if get(b, 4) != get(b, 20) {
                     return Err(95);
                 }
+                // Linux igc_ethtool_set_coalesce ignores every field other
+                // than rx/tx usecs; the driver hook validates the pair.
+                driver.check_coalesce(get(b, 4), get(b, 20))?;
                 s.coalesce_us = get(b, 4);
                 changed = true;
             }
@@ -344,11 +397,15 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
             }
             0x3c => {
                 b[4..].fill(0);
+                put(b, 12, 1);
                 put(b, 16, 4);
+                put(b, 28, 1);
                 put(b, 32, u32::from(s.channels));
             }
             0x3d => {
-                if [20, 24, 28].iter().any(|i| get(b, *i) != 0) {
+                // Linux igc_ethtool_set_channels: no separate rx/tx vectors,
+                // and other_count must stay NON_Q_VECTORS (1).
+                if [20, 24].iter().any(|i| get(b, *i) != 0) || get(b, 28) != 1 {
                     return Err(22);
                 }
                 let count = get(b, 32);
@@ -370,8 +427,46 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                 put(b, 24, u32::from(status.tx_lpi));
             }
             0x45 => {
-                s.eee = get(b, 20) != 0;
+                // Linux igc_ethtool_set_eee: while EEE is enabled, tx-lpi
+                // cannot change and the LPI timer is not implemented; while
+                // it is disabled, a set that does not enable EEE is rejected.
+                let enabled = get(b, 20) != 0;
+                let tx_lpi = get(b, 24) != 0;
+                let timer = get(b, 28);
+                if s.eee {
+                    let current_lpi = driver.eee_status().map(|st| st.tx_lpi).unwrap_or(false);
+                    if tx_lpi != current_lpi || timer != 0 {
+                        return Err(22);
+                    }
+                } else if !enabled {
+                    return Err(22);
+                }
+                s.eee = enabled;
                 changed = true;
+            }
+            0x38 | 0x39 => {
+                // Legacy RXFH indirection (struct ethtool_rxfh_indir: cmd,
+                // size, then size u32 queue indices). A GET with size 0
+                // reports the table size (128) with no entries.
+                let size = get(b, 4) as usize;
+                if cmd == 0x38 {
+                    put(b, 4, 128);
+                    for i in 0..size {
+                        put(b, 8 + i * 4, u32::from(s.rss.indirection[i]));
+                    }
+                } else {
+                    if size != 128 {
+                        return Err(22);
+                    }
+                    for i in 0..128 {
+                        let q = get(b, 8 + i * 4);
+                        if q >= u32::from(s.channels) {
+                            return Err(22);
+                        }
+                        s.rss.indirection[i] = q as u8;
+                    }
+                    changed = true;
+                }
             }
             0x46 | 0x47 => {
                 if get(b, 4) != 0 || b[17] != 0 || (b[16] != 0 && b[16] != 1) {
@@ -414,7 +509,11 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                     if cmd == 0x4d {
                         return Err(22);
                     }
-                    b[15] = (-2i8) as u8;
+                    // Linux returns -E2BIG with the required word count when
+                    // the caller's mask buffer is too small; this codec can
+                    // only carry the count back on success, so report 2
+                    // words and let the caller retry.
+                    b[15] = 2;
                     return Ok(());
                 }
                 if cmd == 0x4c {
@@ -422,34 +521,52 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                     put(b, 4, link.speed_mbps.unwrap_or(u32::MAX));
                     b[8] = u8::from(link.duplex == Some(crate::iface::LinkDuplex::Full));
                     b[11] = u8::from(s.link.autoneg);
+                    // ksettings word 0: speed bits (native bit 4 is
+                    // 1000baseT_Full, ksettings bit 5), Autoneg (6), TP (7),
+                    // Pause (13). Word 1 bit 15 is 2500baseT_Full.
+                    let supported = driver.supported_link_modes();
                     put(
                         b,
                         48,
-                        legacy_modes(driver.supported_link_modes()) | (1 << 6),
+                        legacy_modes(supported) | (1 << 6) | (1 << 7) | (1 << 13),
                     );
-                    put(
-                        b,
-                        52,
-                        if driver.supported_link_modes() & 0x20 != 0 {
-                            1 << 15
-                        } else {
-                            0
-                        },
-                    );
-                    put(b, 56, legacy_modes(s.link.advertised));
-                    put(
-                        b,
-                        60,
+                    put(b, 52, if supported & 0x20 != 0 { 1 << 15 } else { 0 });
+                    // Advertising: TP always; speeds, Autoneg and
+                    // Pause/Asym_Pause only while autoneg is on (Linux
+                    // igc_ethtool_get_link_ksettings). Pause follows the
+                    // flow-control mode: full -> Pause, rx-only -> Pause +
+                    // Asym_Pause, tx-only -> Asym_Pause.
+                    let mut adv_w0 = 1 << 7;
+                    let mut adv_w1 = 0;
+                    if s.link.autoneg {
+                        adv_w0 |= (1 << 6) | legacy_modes(s.link.advertised);
                         if s.link.advertised & 0x20 != 0 {
-                            1 << 15
-                        } else {
-                            0
-                        },
-                    );
+                            adv_w1 |= 1 << 15;
+                        }
+                        match (s.pause.rx, s.pause.tx) {
+                            (true, true) => adv_w0 |= 1 << 13,
+                            (true, false) => adv_w0 |= (1 << 13) | (1 << 14),
+                            (false, true) => adv_w0 |= 1 << 14,
+                            (false, false) => {}
+                        }
+                    }
+                    put(b, 56, adv_w0);
+                    put(b, 60, adv_w1);
                     put(b, 64, 0);
                     put(b, 68, 0);
                 } else {
-                    if get(b, 60) & !(1 << 15) != 0 {
+                    // Advertised modes must be a subset of supported: the
+                    // driver's speeds, plus TP / Autoneg / Pause /
+                    // Asym_Pause (Linux advertises Asym_Pause although it
+                    // is not in the supported mask, so it is allowed here).
+                    let supported = driver.supported_link_modes();
+                    let sup_w0 =
+                        legacy_modes(supported) | (1 << 6) | (1 << 7) | (1 << 13) | (1 << 14);
+                    let sup_w1 = if supported & 0x20 != 0 { 1 << 15 } else { 0 };
+                    if get(b, 56) & !sup_w0 != 0 || get(b, 60) & !sup_w1 != 0 {
+                        return Err(22);
+                    }
+                    if b[11] != 0 && b[11] != 1 {
                         return Err(22);
                     }
                     s.link = LinkSettings {
@@ -555,6 +672,8 @@ pub const ETHTOOL_A_HEADER_DEV_INDEX: u16 = 1;
 pub const ETHTOOL_A_HEADER_DEV_NAME: u16 = 2;
 pub const ETHTOOL_A_HEADER_FLAGS: u16 = 3;
 
+pub const ETHTOOL_FLAG_STATS: u32 = 1 << 2;
+
 pub const ETHTOOL_A_MM_HEADER: u16 = 1;
 pub const ETHTOOL_A_MM_PMAC_ENABLED: u16 = 2;
 pub const ETHTOOL_A_MM_TX_ENABLED: u16 = 3;
@@ -565,6 +684,13 @@ pub const ETHTOOL_A_MM_VERIFY_ENABLED: u16 = 7;
 pub const ETHTOOL_A_MM_VERIFY_STATUS: u16 = 8;
 pub const ETHTOOL_A_MM_VERIFY_TIME: u16 = 9;
 pub const ETHTOOL_A_MM_MAX_VERIFY_TIME: u16 = 10;
+pub const ETHTOOL_A_MM_STATS: u16 = 11;
+
+pub const ETHTOOL_A_MM_STAT_REASSEMBLY_ERRORS: u16 = 2;
+pub const ETHTOOL_A_MM_STAT_SMD_ERRORS: u16 = 3;
+pub const ETHTOOL_A_MM_STAT_REASSEMBLY_OK: u16 = 4;
+pub const ETHTOOL_A_MM_STAT_RX_FRAG_COUNT: u16 = 5;
+pub const ETHTOOL_A_MM_STAT_TX_FRAG_COUNT: u16 = 6;
 
 pub const ETHTOOL_MM_VERIFY_STATUS_INITIAL: u8 = 0;
 pub const ETHTOOL_MM_VERIFY_STATUS_VERIFYING: u8 = 1;
@@ -637,9 +763,10 @@ fn walk_nla<'a>(
     Ok(())
 }
 
-fn parse_header_dev(raw: &[u8], net_ns_id: u64) -> Result<(u32, alloc::string::String), i32> {
+fn parse_header_dev(raw: &[u8], net_ns_id: u64) -> Result<(u32, alloc::string::String, u32), i32> {
     let mut dev_index: Option<u32> = None;
     let mut dev_name: Option<alloc::string::String> = None;
+    let mut flags: u32 = 0;
     walk_nla(raw, |kind, payload| {
         match kind {
             ETHTOOL_A_HEADER_DEV_INDEX => {
@@ -660,6 +787,7 @@ fn parse_header_dev(raw: &[u8], net_ns_id: u64) -> Result<(u32, alloc::string::S
                 if payload.len() != 4 {
                     return Err(22);
                 }
+                flags = u32::from_ne_bytes(payload.try_into().map_err(|_| 22)?);
             }
             _ => return Err(22),
         }
@@ -670,16 +798,35 @@ fn parse_header_dev(raw: &[u8], net_ns_id: u64) -> Result<(u32, alloc::string::S
         if name != "lo" && crate::iface::lookup_in(net_ns_id, &name).is_none() {
             return Err(19);
         }
-        return Ok((ifindex, name));
+        return Ok((ifindex, name, flags));
     }
     if let Some(name) = dev_name {
         if name != "lo" && crate::iface::lookup_in(net_ns_id, &name).is_none() {
             return Err(19);
         }
         let ifindex = crate::netlink_route::ifindex_for_name(&name).ok_or(19)?;
-        return Ok((ifindex, name));
+        return Ok((ifindex, name, flags));
     }
     Err(22)
+}
+
+/// Request-header flags for a dump, where the device spec is ignored.
+/// Returns 0 when the header is absent.
+fn header_flags(raw: Option<&[u8]>) -> Result<u32, i32> {
+    let Some(raw) = raw else {
+        return Ok(0);
+    };
+    let mut flags: u32 = 0;
+    walk_nla(raw, |kind, payload| {
+        if kind == ETHTOOL_A_HEADER_FLAGS {
+            if payload.len() != 4 {
+                return Err(22);
+            }
+            flags = u32::from_ne_bytes(payload.try_into().map_err(|_| 22)?);
+        }
+        Ok(())
+    })?;
+    Ok(flags)
 }
 
 fn encode_mm_reply(
@@ -687,6 +834,7 @@ fn encode_mm_reply(
     name: &str,
     cfg: nic::Preemption,
     status: nic::PreemptionStatus,
+    stats: Option<nic::MmStats>,
 ) -> crate::netlink_generic::GenlReply {
     let mut hdr = alloc::vec::Vec::new();
     push_nla(&mut hdr, ETHTOOL_A_HEADER_DEV_INDEX, &ifindex.to_ne_bytes());
@@ -731,7 +879,8 @@ fn encode_mm_reply(
     push_nla(
         &mut attrs,
         ETHTOOL_A_MM_RX_MIN_FRAG_SIZE,
-        &64u32.to_ne_bytes(),
+        // Linux IGC_RX_MIN_FRAG_SIZE (igc_tsn.h).
+        &60u32.to_ne_bytes(),
     );
     push_nla(
         &mut attrs,
@@ -749,6 +898,37 @@ fn encode_mm_reply(
         ETHTOOL_A_MM_MAX_VERIFY_TIME,
         &128u32.to_ne_bytes(),
     );
+    // Linux igc reports the five MACMerge counters only when the request
+    // asked for stats; HOLD_COUNT is not reported by igc.
+    if let Some(stats) = stats {
+        let mut nest = alloc::vec::Vec::new();
+        push_nla(
+            &mut nest,
+            ETHTOOL_A_MM_STAT_REASSEMBLY_ERRORS,
+            &stats.reassembly_errors.to_ne_bytes(),
+        );
+        push_nla(
+            &mut nest,
+            ETHTOOL_A_MM_STAT_SMD_ERRORS,
+            &stats.smd_errors.to_ne_bytes(),
+        );
+        push_nla(
+            &mut nest,
+            ETHTOOL_A_MM_STAT_REASSEMBLY_OK,
+            &stats.reassembly_ok.to_ne_bytes(),
+        );
+        push_nla(
+            &mut nest,
+            ETHTOOL_A_MM_STAT_RX_FRAG_COUNT,
+            &stats.rx_frag_count.to_ne_bytes(),
+        );
+        push_nla(
+            &mut nest,
+            ETHTOOL_A_MM_STAT_TX_FRAG_COUNT,
+            &stats.tx_frag_count.to_ne_bytes(),
+        );
+        push_nla(&mut attrs, ETHTOOL_A_MM_STATS | NLA_F_NESTED, &nest);
+    }
     crate::netlink_generic::GenlReply {
         command: ETHTOOL_MSG_MM_GET_REPLY,
         attrs,
@@ -763,18 +943,6 @@ fn handle_genl(
 ) -> Result<alloc::vec::Vec<crate::netlink_generic::GenlReply>, i32> {
     match command {
         ETHTOOL_MSG_MM_GET => {
-            if dump {
-                let mut out = alloc::vec::Vec::new();
-                for snap in crate::iface::snapshot_all() {
-                    if snap.net_ns_id != context.net_ns_id {
-                        continue;
-                    }
-                    if let Ok((cfg, status)) = nic::with_control(&snap.name, |d| d.preemption()) {
-                        out.push(encode_mm_reply(snap.ifindex, &snap.name, cfg, status));
-                    }
-                }
-                return Ok(out);
-            }
             let mut header_raw: Option<&[u8]> = None;
             walk_nla(attrs, |kind, payload| {
                 if kind == ETHTOOL_A_MM_HEADER {
@@ -784,9 +952,41 @@ fn handle_genl(
                     Err(22)
                 }
             })?;
-            let (ifindex, name) = parse_header_dev(header_raw.ok_or(22)?, context.net_ns_id)?;
+            if dump {
+                let flags = header_flags(header_raw)?;
+                let mut out = alloc::vec::Vec::new();
+                for snap in crate::iface::snapshot_all() {
+                    if snap.net_ns_id != context.net_ns_id {
+                        continue;
+                    }
+                    if let Ok((cfg, status)) = nic::with_control(&snap.name, |d| d.preemption()) {
+                        let stats = if flags & ETHTOOL_FLAG_STATS != 0 {
+                            nic::with_control(&snap.name, |d| d.mm_stats()).ok()
+                        } else {
+                            None
+                        };
+                        out.push(encode_mm_reply(
+                            snap.ifindex,
+                            &snap.name,
+                            cfg,
+                            status,
+                            stats,
+                        ));
+                    }
+                }
+                return Ok(out);
+            }
+            let (ifindex, name, flags) =
+                parse_header_dev(header_raw.ok_or(22)?, context.net_ns_id)?;
             let (cfg, status) = nic::with_control(&name, |d| d.preemption())?;
-            Ok(alloc::vec![encode_mm_reply(ifindex, &name, cfg, status)])
+            let stats = if flags & ETHTOOL_FLAG_STATS != 0 {
+                nic::with_control(&name, |d| d.mm_stats()).ok()
+            } else {
+                None
+            };
+            Ok(alloc::vec![encode_mm_reply(
+                ifindex, &name, cfg, status, stats,
+            )])
         }
         ETHTOOL_MSG_MM_SET => {
             let mut header_raw: Option<&[u8]> = None;
@@ -835,7 +1035,7 @@ fn handle_genl(
                 }
                 Ok(())
             })?;
-            let (_ifindex, name) = parse_header_dev(header_raw.ok_or(22)?, context.net_ns_id)?;
+            let (_ifindex, name, _) = parse_header_dev(header_raw.ok_or(22)?, context.net_ns_id)?;
             if !context.capable {
                 let admin = context.admin.ok_or(1)?;
                 admin

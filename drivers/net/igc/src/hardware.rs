@@ -475,7 +475,9 @@ pub(crate) fn configure_tables(
         );
     }
     r.write(0x5000, (1 << 13) | (1 << 11) | (1 << 9) | (1 << 8)); // PCSD + TUOFL
-    r.write(0x5818, 2 | 0x00f70000); // IPv4/v6 TCP/UDP RSS
+
+    // IPv4/v6 TCP RSS; UDP L4 hashing off by default (Linux igc_setup_mrqc).
+    r.write(0x5818, 2 | 0x00370000);
     r.write(0x410, 8 | (8 << 10) | (6 << 20));
     // Multicast accept supports IPv6 and joined groups. Unicast promiscuity
     // is enabled only through the explicit receive-mode control.
@@ -726,6 +728,37 @@ pub(crate) fn write_eeprom(
     }
     write_nvm(r, offset, data)?;
     update_nvm_checksum(r)
+}
+
+/// Firmware version in Linux `igc_ethtool_get_drvinfo` shape: `"%x:%x"` of
+/// the NVM image version (word 5, IGC_NVM_DEV_STARTER) and the gPHY firmware
+/// version (PHY register 0x1E, IGC_GPHY_VERSION, read through plain MDIC:
+/// `igc_read_phy_reg_gpy` takes the MDIC path when no MMD device is encoded).
+/// Best-effort: `None` when the NVM read fails; a failed PHY read reports 0,
+/// as Linux's `igc_read_phy_fw_version` does. Never fails probe.
+#[cfg(feature = "builtin")]
+pub(crate) fn fw_version(r: &impl Registers) -> Option<alloc::string::String> {
+    let nvm = read_nvm(r, 10, 2).ok()?;
+    let nvm_version = u16::from_le_bytes([nvm[0], nvm[1]]);
+    let gphy = mdio(r, 0x1e, None).unwrap_or(0);
+    Some(alloc::format!("{nvm_version:x}:{gphy:x}"))
+}
+
+/// Update the MRQC UDP RSS field bits (Linux `igc_ethtool_set_rxfh_fields`):
+/// the IPv4/IPv6/TCP base bits are always set and the UDP bits follow the
+/// ethtool RXFH field flags. Live read-modify-write, no restart.
+#[cfg(feature = "builtin")]
+pub(crate) fn set_rss_fields(r: &impl Registers, udp4: bool, udp6: bool) {
+    let mut mrqc = r.read(0x5818);
+    mrqc |= 0x10000 | 0x20000 | 0x100000 | 0x200000;
+    mrqc &= !(0x400000 | 0x800000);
+    if udp4 {
+        mrqc |= 0x400000;
+    }
+    if udp6 {
+        mrqc |= 0x800000;
+    }
+    r.write(0x5818, mrqc);
 }
 
 /// Linux wake flags differ from WUFC. Engines remain DMA-disabled while

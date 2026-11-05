@@ -192,8 +192,15 @@ impl NicControl for Igc {
     }
     fn statistics(&self) -> Result<Vec<Statistic>, i32> {
         let _control = self.control().map_err(|_| 16)?;
+        // Linux igc_ethtool_get_stats updates the hardware counters first.
+        self.sample_counters();
         let s = self.stats();
-        let mut out = self.counters.lock().snapshot();
+        let counters = self.counters.lock();
+        let mut out = counters.snapshot();
+        let (timeouts, skipped) = {
+            let p = self.ptp.lock();
+            (p.timeouts, p.skipped)
+        };
         for (name, value) in [
             ("rx_packets", s.rx_packets),
             ("tx_packets", s.tx_packets),
@@ -204,17 +211,19 @@ impl NicControl for Igc {
             ("rx_dropped", s.rx_drops),
             ("tx_rejected", s.tx_rejected),
             ("resets", s.resets),
-            ("tx_hwtstamp_timeouts", self.ptp.lock().timeouts),
+            ("tx_hwtstamp_timeouts", timeouts),
         ] {
             out.push(Statistic {
                 name: alloc::string::String::from(name),
                 value,
             });
         }
+        let hw_drops = counters.drops;
         let history = *self.queue_history.lock();
         let queues = self.queues();
+        let mut linux_queues = Vec::new();
         for (q, retired) in history.iter().enumerate() {
-            let mut values = queues.get(q).map_or([0; 8], |q| q.statistics());
+            let mut values = queues.get(q).map_or([0; 10], |q| q.statistics());
             for (i, value) in values.iter_mut().enumerate() {
                 if i != 4 {
                     *value += retired[i];
@@ -229,6 +238,8 @@ impl NicControl for Igc {
                 "rx_packets",
                 "rx_bytes",
                 "rx_dropped",
+                "rx_csum_err",
+                "rx_alloc_failed",
             ]
             .into_iter()
             .zip(values)
@@ -238,27 +249,87 @@ impl NicControl for Igc {
                     value,
                 });
             }
+            // Linux per-queue values: tx packets/bytes/restart, rx
+            // packets/bytes/drops/csum_err/alloc_failed. The drops are the
+            // hardware RQDPC drops, not the receive-path drops above.
+            linux_queues.push([
+                values[1],
+                values[2],
+                0,
+                values[5],
+                values[6],
+                hw_drops[q],
+                values[8],
+                values[9],
+            ]);
         }
+        out.extend(linux_stats(&counters, &s, skipped, &linux_queues));
         Ok(out)
     }
     fn registers(&self) -> Result<Vec<u32>, i32> {
         let _operation = self.clock_operation()?;
-        // Interrupt and statistics registers are intentionally excluded:
-        // reading a diagnostic snapshot must not acknowledge/clear them.
-        let mut out = Vec::new();
-        for reg in [
-            0, 8, 0x10, 0x18, 0x100, 0x400, 0xe14, 0xe30, 0xe38, 0x5000, 0x5004, 0x5818,
-        ] {
-            out.push(self.hw.read(reg));
+        // Linux igc_ethtool_get_stats updates the hardware counters first;
+        // the dump reports the same accumulated values.
+        self.sample_counters();
+        let counters = self.counters.lock();
+        Ok(regs_dump(&self.hw, &counters).to_vec())
+    }
+    fn msglevel(&self) -> Result<u32, i32> {
+        Ok(*self.msglevel.lock())
+    }
+    fn set_msglevel(&self, level: u32) -> Result<(), i32> {
+        *self.msglevel.lock() = level;
+        Ok(())
+    }
+    fn priv_flags(&self) -> Result<u32, i32> {
+        Ok(*self.priv_flags.lock())
+    }
+    fn set_priv_flags(&self, flags: u32) -> Result<(), i32> {
+        // Linux igc_ethtool_set_priv_flags silently masks unknown bits and
+        // reinitializes only when a known flag changed and the device runs.
+        let _control = self.control().map_err(|_| 16)?;
+        let mut current = self.priv_flags.lock();
+        let next = flags & 0x3;
+        if next == *current {
+            return Ok(());
         }
-        for q in 0..self.num_queues() {
-            for base in [0xc000, 0xe000] {
-                for off in [0, 4, 8, 0x10, 0x18, 0x28] {
-                    out.push(self.hw.read(base + q as u64 * 0x40 + off));
-                }
-            }
+        *current = next;
+        drop(current);
+        if self.ready() {
+            self.stop().map_err(|_| 16)?;
+            self.reset_and_start().map_err(|_| 5)?;
         }
-        Ok(out)
+        Ok(())
+    }
+    fn priv_flag_names(&self) -> &'static [&'static str] {
+        &["legacy-rx", "reverse-tsn-txq-prio"]
+    }
+    fn rxfh_fields(&self, flow_type: u8) -> Result<u32, i32> {
+        let (udp4, udp6) = *self.rss_udp.lock();
+        rxfh_field_data(flow_type, udp4, udp6)
+    }
+    fn set_rxfh_fields(&self, flow_type: u8, data: u32) -> Result<(), i32> {
+        let _control = self.control().map_err(|_| 16)?;
+        let mut flags = self.rss_udp.lock();
+        let (udp4, udp6) = rxfh_field_flags(flow_type, data, flags.0, flags.1)?;
+        if (udp4, udp6) != *flags {
+            *flags = (udp4, udp6);
+            // Live MRQC rewrite (no restart), as in Linux.
+            hardware::set_rss_fields(&self.hw, udp4, udp6);
+        }
+        Ok(())
+    }
+    fn mm_stats(&self) -> Result<narf_net::nic::MmStats, i32> {
+        let _control = self.control().map_err(|_| 16)?;
+        Ok(self.counters.lock().mm_stats())
+    }
+    fn registers_version(&self) -> u32 {
+        // Linux igc_ethtool_get_regs: (2 << 24) | (revision << 16) | device_id.
+        (2 << 24) | (u32::from(self.pci_revision) << 16) | u32::from(self.device.id.device)
+    }
+    fn check_coalesce(&self, rx_usecs: u32, tx_usecs: u32) -> Result<(), i32> {
+        check_coalesce_usecs(rx_usecs)?;
+        check_coalesce_usecs(tx_usecs)
     }
     fn nvm_info(&self) -> Result<(u32, u32), i32> {
         let _op = self.clock_operation()?;
@@ -512,6 +583,319 @@ impl NicControl for Igc {
     fn runtime_resume(&self) -> Result<(), i32> {
         narf_power::device_pm::DevicePmOps::resume(self).map_err(|_| 5)
     }
+}
+
+/// Linux `igc_ethtool_set_coalesce` validation for one usecs value:
+/// IGC_MIN_ITR_USECS=10, IGC_MAX_ITR_USECS=10000; 2 and 4..9 are invalid.
+/// 0 disables ITR. (The shared `Settings` cap of 8388us — the EITR
+/// register max — still bounds the committed value at set_settings time.)
+pub(crate) fn check_coalesce_usecs(usecs: u32) -> Result<(), i32> {
+    if usecs > 10_000 || usecs == 2 || (3 < usecs && usecs < 10) {
+        return Err(22);
+    }
+    Ok(())
+}
+
+/// Linux `igc_ethtool_get_rxfh_fields`: the RSS hash fields for one flow
+/// type, as RXH bits (uapi ethtool.h: IP_SRC 0x10, IP_DST 0x20, L4_B_0_1
+/// 0x40, L4_B_2_3 0x80). TCP always hashes L4; UDP hashes L4 only when its
+/// UDP flag is set; AH/ESP/SCTP/IP hash IP only.
+pub(crate) fn rxfh_field_data(flow_type: u8, udp4: bool, udp6: bool) -> Result<u32, i32> {
+    Ok(match flow_type {
+        0x01 | 0x05 => 0xf0,
+        0x02 => 0x30 | if udp4 { 0xc0 } else { 0 },
+        0x06 => 0x30 | if udp6 { 0xc0 } else { 0 },
+        0x03 | 0x04 | 0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c | 0x10 | 0x11 => 0x30,
+        _ => return Err(22),
+    })
+}
+
+/// Linux `igc_ethtool_set_rxfh_fields` validation: returns the new UDP
+/// flags. TCP requires all four bits; UDP requires the IP bits with the L4
+/// bits both or neither; AH/ESP/SCTP require the IP bits and no L4 bits.
+/// IP and Ethernet flows are not settable.
+pub(crate) fn rxfh_field_flags(
+    flow_type: u8,
+    data: u32,
+    udp4: bool,
+    udp6: bool,
+) -> Result<(bool, bool), i32> {
+    if data & !0xf0 != 0 {
+        return Err(22);
+    }
+    match flow_type {
+        0x01 | 0x05 => {
+            if data != 0xf0 {
+                return Err(22);
+            }
+        }
+        0x02 => {
+            if data & 0x30 != 0x30 {
+                return Err(22);
+            }
+            return Ok((
+                match data & 0xc0 {
+                    0 => false,
+                    0xc0 => true,
+                    _ => return Err(22),
+                },
+                udp6,
+            ));
+        }
+        0x06 => {
+            if data & 0x30 != 0x30 {
+                return Err(22);
+            }
+            return Ok((
+                udp4,
+                match data & 0xc0 {
+                    0 => false,
+                    0xc0 => true,
+                    _ => return Err(22),
+                },
+            ));
+        }
+        0x03 | 0x04 | 0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c => {
+            if data & 0x30 != 0x30 || data & 0xc0 != 0 {
+                return Err(22);
+            }
+        }
+        _ => return Err(22),
+    }
+    Ok((udp4, udp6))
+}
+
+/// Linux `igc_gstrings_stats` + `igc_gstrings_net_stats` + per-queue stats,
+/// in `igc_ethtool_get_strings` order, skipping the names the caller
+/// already reports. Pure over the sampled counters so tests can drive it
+/// with a fake register model. Per-queue values are `[tx packets, tx bytes,
+/// tx restart, rx packets, rx bytes, rx drops, rx csum_err, rx
+/// alloc_failed]`; tx restart is always 0 — NARF never stops a TX ring
+/// and restarts it; a full ring rejects instead.
+pub(crate) fn linux_stats(
+    counters: &crate::counters::Counters,
+    s: &IgcStats,
+    tx_hwtstamp_skipped: u64,
+    per_queue: &[[u64; 8]],
+) -> Vec<Statistic> {
+    let mut out = Vec::new();
+    for (name, value) in [
+        ("rx_broadcast", counters.value(0x4078)),
+        ("tx_broadcast", counters.value(0x40f4)),
+        ("rx_multicast", counters.value(0x407c)),
+        ("tx_multicast", counters.value(0x40f0)),
+        ("multicast", counters.value(0x407c)),
+        (
+            "collisions",
+            counters.value(0x4028) + counters.value(0x402c),
+        ),
+        ("rx_no_buffer_count", counters.value(0x40a0)),
+        ("tx_aborted_errors", counters.value(0x4018)),
+        ("tx_carrier_errors", counters.value(0x4034)),
+        ("tx_window_errors", counters.value(0x4020)),
+        ("tx_abort_late_coll", counters.value(0x4020)),
+        ("tx_deferred_ok", counters.value(0x4030)),
+        ("tx_single_coll_ok", counters.value(0x4014)),
+        ("tx_multi_coll_ok", counters.value(0x401c)),
+        ("tx_timeout_count", s.tx_timeouts),
+        ("rx_long_length_errors", counters.value(0x40ac)),
+        ("rx_short_length_errors", counters.value(0x40a4)),
+        ("rx_align_errors", counters.value(0x4004)),
+        ("tx_tcp_seg_good", counters.value(0x40f8)),
+        // tsctfc is never assigned in Linux igc.
+        ("tx_tcp_seg_failed", 0),
+        ("rx_flow_control_xon", counters.value(0x4048)),
+        ("rx_flow_control_xoff", counters.value(0x4050)),
+        ("tx_flow_control_xon", counters.value(0x404c)),
+        ("tx_flow_control_xoff", counters.value(0x4054)),
+        ("rx_long_byte_count", counters.value(0x4088)),
+        // doosync is only incremented on driver-detected TX DMA
+        // out-of-sync events; NARF has no such detection.
+        ("tx_dma_out_of_sync", 0),
+        ("tx_smbus", counters.value(0x40bc)),
+        ("rx_smbus", counters.value(0x40b4)),
+        ("dropped_smbus", counters.value(0x40b8)),
+        // os2bmc_* are never assigned in Linux igc.
+        ("os2bmc_rx_by_bmc", 0),
+        ("os2bmc_tx_by_bmc", 0),
+        ("os2bmc_tx_by_host", 0),
+        ("os2bmc_rx_by_host", 0),
+        ("tx_hwtstamp_skipped", tx_hwtstamp_skipped),
+        // rx_hwtstamp_cleared is never incremented in Linux igc.
+        ("rx_hwtstamp_cleared", 0),
+        ("tx_lpi_counter", counters.value(0x4148)),
+        ("rx_lpi_counter", counters.value(0x414c)),
+        // NARF advances a past Qbv base_time to the next cycle instead of
+        // erroring (Schedule::validate), so this stays 0.
+        ("qbv_config_change_errors", 0),
+    ] {
+        out.push(Statistic {
+            name: alloc::string::String::from(name),
+            value,
+        });
+    }
+    // Net stats (Linux igc_update_stats formulas; cexterr, rx_over_errors,
+    // tx_fifo_errors and tx_heartbeat_errors are never assigned in Linux
+    // igc, so they are 0).
+    let fifo = counters.drops.iter().sum::<u64>() + counters.value(0x4010);
+    for (name, value) in [
+        (
+            "rx_errors",
+            counters.value(0x400c)
+                + counters.value(0x4000)
+                + counters.value(0x4004)
+                + counters.value(0x40a4)
+                + counters.value(0x40ac),
+        ),
+        ("tx_errors", counters.value(0x4018) + counters.value(0x4020)),
+        // Linux tx_dropped counts max-SDU drops; the closest NARF quantity
+        // is rejected TX submissions.
+        ("tx_dropped", s.tx_rejected),
+        (
+            "rx_length_errors",
+            counters.value(0x40a4) + counters.value(0x40ac),
+        ),
+        ("rx_over_errors", 0),
+        ("rx_frame_errors", counters.value(0x4004)),
+        ("rx_fifo_errors", fifo),
+        ("tx_fifo_errors", 0),
+        ("tx_heartbeat_errors", 0),
+    ] {
+        out.push(Statistic {
+            name: alloc::string::String::from(name),
+            value,
+        });
+    }
+    for (q, v) in per_queue.iter().enumerate() {
+        for (name, value) in [
+            (alloc::format!("tx_queue_{q}_packets"), v[0]),
+            (alloc::format!("tx_queue_{q}_bytes"), v[1]),
+            (alloc::format!("tx_queue_{q}_restart"), v[2]),
+            (alloc::format!("rx_queue_{q}_packets"), v[3]),
+            (alloc::format!("rx_queue_{q}_bytes"), v[4]),
+            (alloc::format!("rx_queue_{q}_drops"), v[5]),
+            (alloc::format!("rx_queue_{q}_csum_err"), v[6]),
+            (alloc::format!("rx_queue_{q}_alloc_failed"), v[7]),
+        ] {
+            out.push(Statistic { name, value });
+        }
+    }
+    out
+}
+
+/// Linux `igc_ethtool_get_regs` (IGC_REGS_LEN=740) as a pure function over
+/// the register accessor and the accumulated counters, so tests can drive it
+/// with a fake register model. The dump is built by sequential writes in
+/// Linux's order, reproducing the RAL/RAH overlap quirk (the second RAL/RAH
+/// copies preserve the ABI). Statistics words 30..90 and 213..214 come from
+/// the accumulated counters, never from a live read: the registers are
+/// clear-on-read and a live read would corrupt the accumulation. The
+/// interrupt-cause words use the set/shadow copies (EICS/ICS) so the
+/// snapshot never acknowledges an interrupt. IAC (word 16) is the one
+/// exception to a live read: it is clear-on-read and already accumulated,
+/// so the dump reports the accumulated value instead of stealing it.
+pub(crate) fn regs_dump(
+    r: &impl crate::hardware::Registers,
+    counters: &crate::counters::Counters,
+) -> [u32; 740] {
+    let mut out = [0u32; 740];
+    // General registers.
+    out[0] = r.read(0);
+    out[1] = r.read(8);
+    out[2] = r.read(0x18);
+    out[3] = r.read(0x20);
+    out[4] = r.read(0x34);
+    // NVM register.
+    out[5] = r.read(0x10);
+    // Interrupt (EICS/ICS shadows, never clear-on-read).
+    out[6] = r.read(0x1520);
+    out[7] = r.read(0x1520);
+    out[8] = r.read(0x1524);
+    out[9] = r.read(0x1528);
+    out[10] = r.read(0x152c);
+    out[11] = r.read(0x1530);
+    out[12] = r.read(0x1504);
+    out[13] = r.read(0x1504);
+    out[14] = r.read(0x1508);
+    out[15] = r.read(0x150c);
+    out[16] = counters.value(0x4100) as u32;
+    out[17] = r.read(0x1510);
+    // Flow control.
+    out[18] = r.read(0x28);
+    out[19] = r.read(0x2c);
+    out[20] = r.read(0x170);
+    out[21] = r.read(0x2160);
+    out[22] = r.read(0x2168);
+    out[23] = r.read(0x2460);
+    // Receive / transmit.
+    out[24] = r.read(0x100);
+    out[25] = r.read(0x5000);
+    out[26] = r.read(0x5004);
+    out[27] = r.read(0x5008);
+    out[28] = r.read(0x400);
+    out[29] = r.read(0x410);
+    // Statistics 30..90 from the accumulated counters. The 0 entries are
+    // symerrs (32), sec (42), scvpc (89) and hrmpc (90): Linux
+    // igc_update_stats never accumulates them, so they are always 0.
+    const STAT_REGS: [u64; 61] = [
+        0x4000, 0x4004, 0, 0x400c, 0x4010, 0x4014, 0x4018, 0x401c, 0x4020, 0x4028, 0x4030, 0x4034,
+        0, 0x403c, 0x4040, 0x4048, 0x404c, 0x4050, 0x4054, 0x4058, 0x405c, 0x4060, 0x4064, 0x4068,
+        0x406c, 0x4070, 0x4074, 0x4078, 0x407c, 0x4080, 0x4088, 0x4090, 0x40a0, 0x40a4, 0x40a8,
+        0x40ac, 0x40b0, 0x40b4, 0x40b8, 0x40bc, 0x40c0, 0x40c8, 0x40d0, 0x40d4, 0x40d8, 0x40dc,
+        0x40e0, 0x40e4, 0x40e8, 0x40ec, 0x40f0, 0x40f4, 0x40f8, 0x4100, 0x4104, 0x4118, 0x4128,
+        0x4130, 0x4138, 0, 0,
+    ];
+    for (i, reg) in STAT_REGS.iter().enumerate() {
+        out[30 + i] = if *reg == 0 {
+            0
+        } else {
+            counters.value(*reg) as u32
+        };
+    }
+    // Per-queue registers, always 4 queues in the Linux dump.
+    for q in 0..4 {
+        out[91 + q] = r.read(0xc00c + q as u64 * 0x40);
+        out[95 + q] = r.read(0x5480 + q as u64 * 4);
+        out[99 + q] = r.read(0xc000 + q as u64 * 0x40);
+        out[103 + q] = r.read(0xc004 + q as u64 * 0x40);
+        out[107 + q] = r.read(0xc008 + q as u64 * 0x40);
+        out[111 + q] = r.read(0xc010 + q as u64 * 0x40);
+        out[115 + q] = r.read(0xc018 + q as u64 * 0x40);
+        out[119 + q] = r.read(0xc028 + q as u64 * 0x40);
+    }
+    for i in 0..10 {
+        out[123 + i] = r.read(0x1680 + i as u64 * 4);
+    }
+    // 133..138 stay zero, as in Linux.
+    for i in 0..16 {
+        out[139 + i] = r.read(0x5400 + i as u64 * 8);
+    }
+    for i in 0..16 {
+        out[145 + i] = r.read(0x5404 + i as u64 * 8);
+    }
+    for q in 0..4 {
+        out[149 + q] = r.read(0xe000 + q as u64 * 0x40);
+        out[152 + q] = r.read(0xe004 + q as u64 * 0x40);
+        out[156 + q] = r.read(0xe008 + q as u64 * 0x40);
+        out[160 + q] = r.read(0xe010 + q as u64 * 0x40);
+        out[164 + q] = r.read(0xe018 + q as u64 * 0x40);
+        out[168 + q] = r.read(0xe028 + q as u64 * 0x40);
+    }
+    // Second RAL/RAH copies preserve the ABI after the overlap above.
+    for i in 0..16 {
+        out[172 + i] = r.read(0x5400 + i as u64 * 8);
+    }
+    for i in 0..16 {
+        out[188 + i] = r.read(0x5404 + i as u64 * 8);
+    }
+    out[204] = r.read(0x55b0);
+    for i in 0..8 {
+        out[205 + i] = r.read(0x5cb0 + i as u64 * 4);
+    }
+    out[213] = counters.value(0x4148) as u32;
+    out[214] = counters.value(0x414c) as u32;
+    // 215..739 stay zero.
+    out
 }
 
 impl narf_bus::pcie_recovery::ErrorCallback for Igc {
