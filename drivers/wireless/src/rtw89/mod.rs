@@ -140,6 +140,7 @@ mod power_regs;
 mod power_tables;
 mod prepared;
 mod qos;
+mod ra_mask;
 mod ra_v1;
 mod radio_51;
 mod radio_assets;
@@ -177,6 +178,7 @@ mod track;
 mod tssi;
 mod tx_amsdu;
 pub mod tx_transport;
+mod txpower_8922a;
 pub mod txrx;
 mod txrx_be;
 mod wow_security;
@@ -266,6 +268,9 @@ mod eht_tests;
 mod irq_be_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
+mod ra_mask_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
 mod ra_v1_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -273,6 +278,9 @@ mod txrx_be_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod station_8922a_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod txpower_8922a_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod nhm_tests;
