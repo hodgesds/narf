@@ -33,6 +33,12 @@ fn reconf_response(
     switch: u16,
     dur: u32,
 ) -> Vec<u8> {
+    // NOTE (#1553 remainder): this helper builds the engine's internal
+    // framing (add/remove masks + TTLM element), NOT the Linux wire
+    // layout (`count` status duples + group key data, `mlme.c:10985`).
+    // It exists so the engine's state machine stays fixture-tested
+    // while the layout is unadvertised; only the action code (12) is
+    // wire-verified.
     let mut frame = alloc::vec![PROT_EHT_CATEGORY, PROT_EHT_ML_RECONF_RESPONSE, token];
     frame.extend_from_slice(&add.to_le_bytes());
     frame.extend_from_slice(&remove.to_le_bytes());
@@ -78,6 +84,53 @@ fn smoke_iwl_mld_negotiated_ttlm_frames() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/mlo",
     smoke_iwl_mld_negotiated_ttlm_frames
+);
+
+fn smoke_iwl_mld_negotiated_ttlm_wire_values_verified() -> TestResult {
+    // Wire values verified #1553 against Linux
+    // `include/linux/ieee80211-eht.h` `enum ieee80211_protected_eht_actioncode`
+    // (lines 446-458) and `WLAN_CATEGORY_PROTECTED_EHT`
+    // (`include/linux/ieee80211.h:1867`). The ML reconfiguration values
+    // were corrected from 3/4 (EPCS enable request/response) to 11/12.
+    if PROT_EHT_CATEGORY != 37
+        || PROT_EHT_TTLM_REQUEST != 0
+        || PROT_EHT_TTLM_RESPONSE != 1
+        || PROT_EHT_TTLM_TEARDOWN != 2
+        || PROT_EHT_ML_RECONF_REQUEST != 11
+        || PROT_EHT_ML_RECONF_RESPONSE != 12
+    {
+        return TestResult::Fail(
+            "Protected EHT action values differ from the Linux-verified values",
+        );
+    }
+    // The ML reconfiguration builders emit the corrected action codes.
+    let req = build_ml_reconf_request(0x5a, 0, 0, &m1(), 0, 0);
+    if req.len() < 3 || req[0] != 37 || req[1] != 11 || req[2] != 0x5a {
+        return TestResult::Fail(
+            "ML Reconfiguration Request does not start with category/action/token",
+        );
+    }
+    let resp = reconf_response(0x5a, 0, 0, &m1(), 0, 0);
+    if resp.len() < 3 || resp[0] != 37 || resp[1] != 12 || resp[2] != 0x5a {
+        return TestResult::Fail(
+            "ML Reconfiguration Response fixture does not start with category/action/token",
+        );
+    }
+    // Advertisement: TTLM negotiation SAME (0x20: the 0x0060 field with
+    // value 1, `ieee80211-eht.h:537-540`). The link reconfiguration
+    // support bit (0x2000, `ieee80211-eht.h:544`) must stay clear — the
+    // ML reconf wire layout is unverified (#1553 remainder).
+    if MLD_CAP_OP_TTLM_NEG_SAME != 0x0020 {
+        return TestResult::Fail("advertised TTLM negotiation bits differ from the verified value");
+    }
+    if MLD_CAP_OP_TTLM_NEG_SAME & 0x2000 != 0 {
+        return TestResult::Fail("advertised TTLM bits claim link reconfiguration support");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/mlo",
+    smoke_iwl_mld_negotiated_ttlm_wire_values_verified
 );
 
 fn smoke_iwl_mld_negotiated_ttlm_exchange() -> TestResult {

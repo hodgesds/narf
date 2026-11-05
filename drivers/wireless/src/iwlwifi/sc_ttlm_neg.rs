@@ -27,19 +27,42 @@
 //! links is the negotiation); the advertised parser requires every TID on
 //! the same set.
 //!
-//! UNVERIFIED WIRE VALUES. The Protected EHT Action field values below
-//! and the ML reconfiguration variable layout (accepted add/remove link
-//! masks followed by the accepted TTLM element) are NOT yet confirmed
-//! against IEEE 802.11be or Linux `net/mac80211/ieee80211_i.h`: the
-//! values used here follow the order Linux's `ieee80211_mgmt` action
-//! union lists the frames (ttlm_req, ttlm_res, ttlm_tear_down,
-//! ml_reconf_req, ml_reconf_resp). Until they are confirmed, support is
-//! NOT advertised: `device.rs` keeps `mld_capa_and_ops` at 0 and the
-//! association request carries no negotiation bits. The state machine
-//! itself is fully fixture-verified end to end through these builders,
-//! so confirming the values is a one-spot change plus the advertisement
-//! flip. The MLME action-frame receive/transmit transport that would
-//! call this engine is also still missing (same standing as other
+//! WIRE VALUES, VERIFIED (#1553). The Protected EHT Action values below
+//! are confirmed against Linux `include/linux/ieee80211-eht.h`
+//! `enum ieee80211_protected_eht_actioncode` (ref tree
+//! `~/workspace/scratch/wifi-wcn6750-linux`): TTLM request 0, TTLM
+//! response 1, TTLM teardown 2 (lines 446-448), ML reconfiguration
+//! request 11 and response 12 (lines 457-458). The category 37 is Linux
+//! `WLAN_CATEGORY_PROTECTED_EHT` (`include/linux/ieee80211.h:1867`),
+//! and the frame shapes match `struct ieee80211_mgmt`'s Protected EHT
+//! Action members (`ieee80211.h:1160-1178`) and the mac80211 send sites
+//! (`net/mac80211/mlme.c`: TTLM request 8609, response 8678, teardown
+//! 8919). The TTLM element framing (ext id 109, control byte, presence
+//! indicator, switch time, expected duration, per-TID link maps) is
+//! Linux `WLAN_EID_EXT_TID_TO_LINK_MAPPING` (`ieee80211.h:1827`) and
+//! `ieee80211_tid_to_link_map_size_ok` (`ieee80211-eht.h:1201`).
+//! Negotiated TTLM is therefore ADVERTISED: `device.rs` sets the
+//! TID-to-link-map negotiation SAME bit in `mld_capa_and_ops`
+//! (`MLD_CAP_OP_TTLM_NEG_SAME`), matching this engine's single
+//! both-directions map.
+//!
+//! ML RECONFIGURATION REMAINDER (#1553). The action values were
+//! corrected by this verification (the code previously used 3/4, which
+//! Linux assigns to EPCS enable request/response,
+//! `ieee80211-eht.h:449-450`), but the variable layout this engine
+//! builds and parses — accepted add/remove link masks followed by the
+//! accepted TTLM element — does NOT match Linux and is NOT advertised:
+//! the request carries a Multi-Link element of type RECONF with
+//! per-station profiles (`mlme.c` ~11320), and the response carries a
+//! `count` of `struct ieee80211_ml_reconf_status` duples (link id +
+//! status, `ieee80211.h:1225`) plus group key data (`mlme.c:10985`,
+//! `rx.c:3901`), with no add/remove masks and no TTLM element.
+//! `device.rs` therefore leaves `IEEE80211_MLD_CAP_OP_LINK_RECONF_SUPPORT`
+//! (0x2000, `ieee80211-eht.h:544`) clear. Reworking the ML
+//! reconfiguration builders and parsers to the real layout is the
+//! remaining #1553 work; until then the engine's ML reconf path is
+//! fixture-only. The MLME action-frame receive/transmit transport that
+//! would call this engine is also still missing (same standing as other
 //! no-production-caller limitations): the engine is driven by
 //! `Connection::service_ttlm` at switch time and by its fixtures.
 //!
@@ -69,16 +92,33 @@ use super::sc_emlsr::{
 };
 use alloc::vec::Vec;
 
-/// Linux `WLAN_CATEGORY_PROTECTED_EHT` (`include/linux/ieee80211.h`).
+/// Linux `WLAN_CATEGORY_PROTECTED_EHT` (`include/linux/ieee80211.h:1867`),
+/// verified #1553.
 pub(super) const PROT_EHT_CATEGORY: u8 = 37;
 
-/// UNVERIFIED (see module docs): Protected EHT Action field values, in
-/// the order Linux's `ieee80211_mgmt` action union lists the frames.
+/// Protected EHT Action field values, verified #1553 against Linux
+/// `include/linux/ieee80211-eht.h` `enum ieee80211_protected_eht_actioncode`:
+/// TTLM request/response/teardown (lines 446-448) and ML reconfiguration
+/// request/response (lines 457-458). The ML reconfiguration values were
+/// corrected from 3/4, which Linux assigns to EPCS enable
+/// request/response (lines 449-450); the ML reconfiguration variable
+/// layout itself is still non-conformant, see the module docs.
 pub(super) const PROT_EHT_TTLM_REQUEST: u8 = 0;
 pub(super) const PROT_EHT_TTLM_RESPONSE: u8 = 1;
 pub(super) const PROT_EHT_TTLM_TEARDOWN: u8 = 2;
-pub(super) const PROT_EHT_ML_RECONF_REQUEST: u8 = 3;
-pub(super) const PROT_EHT_ML_RECONF_RESPONSE: u8 = 4;
+pub(super) const PROT_EHT_ML_RECONF_REQUEST: u8 = 11;
+pub(super) const PROT_EHT_ML_RECONF_RESPONSE: u8 = 12;
+
+/// MLD Capabilities and Operations bit advertised in the association
+/// request (`device.rs`), verified #1553 against Linux
+/// `include/linux/ieee80211-eht.h:537-540`. The TID-to-link-map
+/// negotiation field (mask 0x0060) with value SUPP_SAME (1) is 1 << 5:
+/// this engine carries one map for both directions, so SAME is the
+/// honest claim (DIFF would promise per-direction maps). The link
+/// reconfiguration support bit (`IEEE80211_MLD_CAP_OP_LINK_RECONF_SUPPORT`,
+/// 0x2000, `ieee80211-eht.h:544`) is deliberately NOT set: the ML
+/// reconfiguration wire layout is unverified, see the module docs.
+pub(super) const MLD_CAP_OP_TTLM_NEG_SAME: u16 = 0x0020;
 
 /// A parsed negotiated TTLM element body (after the extension id).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +254,12 @@ pub(super) fn build_ttlm_teardown() -> Vec<u8> {
 /// Build an ML Reconfiguration Request action frame body. `add` and
 /// `remove` are link masks; the carried element is the mapping the
 /// reconfigured link set should use.
+///
+/// NOTE (#1553 remainder): this add/remove-masks + TTLM-element layout
+/// is the engine's internal framing, NOT the Linux wire layout (a
+/// Multi-Link element of type RECONF with per-station profiles,
+/// `net/mac80211/mlme.c` ~11320). The action code is verified (11) but
+/// the frame is not advertised until the layout is reworked.
 pub(super) fn build_ml_reconf_request(
     token: u8,
     add: u16,
@@ -395,6 +441,12 @@ impl NegotiatedTtlm {
     /// response echoes the accepted add/remove masks, then the accepted
     /// TTLM element. Returns the link set after the reconfiguration so
     /// the caller can update its link state.
+    ///
+    /// NOTE (#1553 remainder): this accepted-masks + TTLM-element layout
+    /// is the engine's internal framing, NOT the Linux wire layout
+    /// (`count` status duples + group key data, `mlme.c:10985`). The
+    /// action code is verified (12) but the frame is not advertised
+    /// until the layout is reworked.
     pub(super) fn handle_reconf_response(
         &mut self,
         frame: &[u8],

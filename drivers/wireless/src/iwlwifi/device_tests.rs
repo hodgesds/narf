@@ -415,3 +415,35 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/policy",
     smoke_iwl_device_current_policy_closes_queued_tx_copied_rx_and_retains_stop
 );
+
+fn smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_only() -> TestResult {
+    // The station MLD Capabilities and Operations field advertises
+    // negotiated TTLM (SAME, #1553 verified) and nothing else: link
+    // reconfiguration stays unadvertised until its wire layout is
+    // reworked. `supports_mlo` keys off `phy.eht`, which the model
+    // fixture leaves clear, so enable it on this device.
+    let mut fixture = Fixture::new(false);
+    let caps = {
+        let device = Arc::get_mut(fixture.device.as_mut().unwrap())
+            .expect("device fixture has outstanding references");
+        device.phy.eht = true;
+        narf_wireless::WirelessNetIface::iftype_extended_capabilities(device)
+    };
+    if caps.len() != 1 {
+        return TestResult::Fail(
+            "MLO device did not report exactly one station extended-capability record",
+        );
+    }
+    let cap = &caps[0];
+    if cap.iftype != 2
+        || cap.mld_capa_and_ops != super::super::sc_ttlm_neg::MLD_CAP_OP_TTLM_NEG_SAME
+        || cap.ext_mld_capa_and_ops != 0
+    {
+        return TestResult::Fail("station MLD capabilities do not advertise TTLM negotiation only");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/mlo",
+    smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_only
+);
