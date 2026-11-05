@@ -2423,6 +2423,7 @@ impl Igb {
         // SAFETY: mapped MMIO; MBVFICR/VFLRE have no read side
         // effects (both are write-1-to-clear).
         let mbvficr = unsafe { self.mmio.read32(vmdq::REG_MBVFICR) };
+        // SAFETY: mapped MMIO; VFLRE has no read side effects (write-1-to-clear).
         let vflre = unsafe { self.mmio.read32(vmdq::REG_VFLRE) };
         let reqs = mbvficr & vmdq::MBVFICR_VFREQ_MASK & vf_mask;
         let acks = (mbvficr & vmdq::MBVFICR_VFACK_MASK) >> 16 & vf_mask;
@@ -3503,6 +3504,7 @@ mod tests {
         // vt_allocate unmasks the mailbox (Linux `igb_irq_enable`).
         // SAFETY: fixture-owned MMIO backing.
         let mbvfimr = unsafe { igb.mmio.read32(vmdq::REG_MBVFIMR) };
+        // SAFETY: fixture-owned MMIO backing; IMS is a mapped status-register read.
         let ims = unsafe { igb.mmio.read32(REG_IMS) };
         if mbvfimr != vmdq::MBVFIMR_ALL_VFS || ims & IMS_VMMB == 0 {
             return TestResult::Fail("vt_allocate did not unmask MBVFIMR / IMS.VMMB");
@@ -3519,6 +3521,7 @@ mod tests {
         }
         // SAFETY: fixture-owned MMIO backing.
         let reply0 = unsafe { igb.mmio.read32(vmdq::vmbmem_addr(0, 0)) };
+        // SAFETY: fixture-owned MMIO backing; P2V mailbox for VF 0 is an in-bounds register read.
         let p2v = unsafe { igb.mmio.read32(vmdq::p2vmailbox_addr(0)) };
         if reply0 != vmdq::VF_RESET | vmdq::VT_MSGTYPE_NACK {
             return TestResult::Fail("RESET reply was not NACK (no MAC set)");
@@ -3528,6 +3531,7 @@ mod tests {
         }
         // The plain backing store keeps the last MBVFICR write: the
         // request clear (0x01) then the reply flush (0x0001_0001).
+        // SAFETY: fixture-owned MMIO backing; MBVFICR has no read side effects (write-1-to-clear).
         let mbvficr = unsafe { igb.mmio.read32(vmdq::REG_MBVFICR) };
         if mbvficr != 0x0001_0001 {
             return TestResult::Fail("MBVFICR clear/flush write sequence drift");
@@ -3550,7 +3554,9 @@ mod tests {
         }
         // SAFETY: fixture-owned MMIO backing.
         let reply0 = unsafe { igb.mmio.read32(vmdq::vmbmem_addr(0, 0)) };
+        // SAFETY: fixture-owned MMIO backing; P2V mailbox for VF 0 is an in-bounds register read.
         let p2v = unsafe { igb.mmio.read32(vmdq::p2vmailbox_addr(0)) };
+        // SAFETY: fixture-owned MMIO backing; RAL(31) is an in-bounds receive-address register read.
         let ral31 = unsafe { igb.mmio.read32(vmdq::ral_addr(31)) };
         if reply0 != vmdq::VF_SET_MAC_ADDR | vmdq::VT_MSGTYPE_CTS | vmdq::VT_MSGTYPE_ACK {
             return TestResult::Fail("SET_MAC_ADDR reply was not ACK");
@@ -3579,7 +3585,9 @@ mod tests {
         }
         // SAFETY: fixture-owned MMIO backing.
         let reply0 = unsafe { igb.mmio.read32(vmdq::vmbmem_addr(0, 0)) };
+        // SAFETY: fixture-owned MMIO backing; P2V mailbox for VF 0 is an in-bounds register read.
         let p2v = unsafe { igb.mmio.read32(vmdq::p2vmailbox_addr(0)) };
+        // SAFETY: fixture-owned MMIO backing; MBVFICR has no read side effects (write-1-to-clear).
         let mbvficr = unsafe { igb.mmio.read32(vmdq::REG_MBVFICR) };
         if reply0 != vmdq::VF_SET_MAC_ADDR | vmdq::VT_MSGTYPE_ACK {
             return TestResult::Fail("already-processed message was overwritten");
@@ -3623,6 +3631,7 @@ mod tests {
         }
         // SAFETY: fixture-owned MMIO backing.
         let vflre = unsafe { igb.mmio.read32(vmdq::REG_VFLRE) };
+        // SAFETY: fixture-owned MMIO backing; VMOLR(1) is an in-bounds per-pool register read.
         let vmolr1 = unsafe { igb.mmio.read32(vmdq::vmolr_addr(1)) };
         if vflre != 0x02 {
             return TestResult::Fail("VFLRE clear-write drift");
