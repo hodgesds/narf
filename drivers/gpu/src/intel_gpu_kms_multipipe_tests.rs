@@ -31,6 +31,10 @@ pub(super) fn external() -> res::PipeRequest {
         port_clock_khz: 270_000,
         combo_phy: Some(1),
         dsc: None,
+        src_w: None,
+        src_h: None,
+        scaler: None,
+        bigjoiner_slave: None,
     }
 }
 

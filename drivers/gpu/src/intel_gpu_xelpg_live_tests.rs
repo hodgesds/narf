@@ -189,6 +189,10 @@ fn pipe_req(
         port_clock_khz: port,
         combo_phy: Some(phy),
         dsc: None,
+        src_w: None,
+        src_h: None,
+        scaler: None,
+        bigjoiner_slave: None,
     }
 }
 

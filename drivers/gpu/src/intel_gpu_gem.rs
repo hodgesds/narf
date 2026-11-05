@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use narf_filesystem::dma_buf::{dma_resv_usage_rw, DmaBufObject, DmaResvFence, DmaResvUsage};
-use narf_filesystem::{FsError, MmapBacking};
+use narf_filesystem::{FsError, IoctlContext, MmapBacking};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::frame::{alloc_frame, free_frame, PhysFrame};
 
@@ -58,6 +58,8 @@ pub struct GemObject {
     charged: bool,
     offset: u64,
     vm_owner: Option<u64>,
+    read_only: bool,
+    pat_index: Option<u8>,
     /// Serializes kernel CPU copies; never forms references to mapped data.
     cpu: IrqSafeSpinLock<()>,
     pub(crate) dma_buf: DmaBufObject,
@@ -105,6 +107,8 @@ impl GemObject {
             charged: true,
             offset,
             vm_owner: None,
+            read_only: false,
+            pat_index: None,
             cpu: IrqSafeSpinLock::new(()),
             dma_buf: DmaBufObject::new(),
         };
@@ -244,6 +248,38 @@ impl GemObject {
         object.pins = pins;
         object.vm_owner = Some(vm);
         Ok(Arc::new(object))
+    }
+
+    /// An i915 USERPTR object over `pins`, charged like owned storage.
+    pub(crate) fn from_userptr_pins(
+        pins: Vec<narf_memory::address_space::UserPagePin>,
+        read_only: bool,
+    ) -> Result<Arc<Self>, FsError> {
+        let size = (pins.len() as u64)
+            .checked_mul(PAGE)
+            .filter(|size| *size != 0)
+            .ok_or(FsError::InvalidData)?;
+        let mut object = Self::allocate(0, 0)?;
+        charge(size)?;
+        object.size = size;
+        object.pins = pins;
+        object.read_only = read_only;
+        object.vm_owner = None;
+        Ok(Arc::new(object))
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_pat_index(&mut self, pat: u8) {
+        self.pat_index = Some(pat);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn pat_index(&self) -> Option<u8> {
+        self.pat_index
     }
 
     pub(crate) fn is_userptr(&self) -> bool {
@@ -464,6 +500,13 @@ impl GemObject {
                 *byte = unsafe { core::ptr::read_volatile(alias) };
                 continue;
             }
+            if self.is_userptr() {
+                let pin = &self.pins[(at / PAGE) as usize];
+                let base = pin.phys().kernel_ptr::<u8>();
+                // SAFETY: userptr pages remain pinned and mapped into kernel direct map; volatile access tolerates concurrent mappings.
+                *byte = unsafe { core::ptr::read_volatile(base.add((at % PAGE) as usize)) };
+                continue;
+            }
             let base = self.system_frames()[(at / PAGE) as usize]
                 .start_address()
                 .kernel_ptr::<u8>();
@@ -535,6 +578,9 @@ impl GemObject {
         if self.is_gpu_only() {
             return Err(FsError::Unsupported);
         }
+        if self.is_read_only() {
+            return Err(FsError::PermissionDenied);
+        }
         self.range(offset, bytes.len())?;
         let snapshot = self.dma_buf.resv.snapshot();
         let _reservation = RESERVATIONS.lock();
@@ -548,6 +594,13 @@ impl GemObject {
             if let Some(alias) = self.vram_byte(at) {
                 // SAFETY: range checked; the allocation's WC alias is live.
                 unsafe { core::ptr::write_volatile(alias, *byte) };
+                continue;
+            }
+            if self.is_userptr() {
+                let pin = &self.pins[(at / PAGE) as usize];
+                let base = pin.phys().kernel_mut_ptr::<u8>();
+                // SAFETY: userptr pages remain pinned and mapped into kernel direct map; volatile write tolerates concurrent mappings.
+                unsafe { core::ptr::write_volatile(base.add((at % PAGE) as usize), *byte) };
                 continue;
             }
             let base = self.system_frames()[(at / PAGE) as usize]
@@ -828,6 +881,18 @@ impl GemState {
         placement: Placement<'_>,
         report: impl FnOnce(u32, u64) -> Result<(), FsError>,
     ) -> Result<u32, FsError> {
+        self.create_with_pat(size, owner, placement, None, report)
+    }
+
+    /// As `create_placed`, optionally programming a PAT index on the created object.
+    pub(crate) fn create_with_pat(
+        &self,
+        size: u64,
+        owner: Option<u64>,
+        placement: Placement<'_>,
+        pat: Option<u8>,
+        report: impl FnOnce(u32, u64) -> Result<(), FsError>,
+    ) -> Result<u32, FsError> {
         if matches!(placement, Placement::Vram(..)) {
             // Only the asynchronous private-clear transaction may publish
             // local memory. A sync compatibility call cannot bypass its
@@ -872,12 +937,109 @@ impl GemState {
             (None, _) => GemObject::allocate(size, offset)?,
         };
         object.vm_owner = owner;
+        if let Some(p) = pat {
+            object.pat_index = Some(p);
+        }
         let object = Arc::new(object);
         let handle = handles.next;
         report(handle, size)?;
         handles.objects.insert(handle, object);
         handles.next = next;
         handles.bytes += size;
+        Ok(handle)
+    }
+
+    /// `i915_gem_userptr_ioctl`: allocate a GEM buffer object over user-provided
+    /// memory addresses. The range must be page-aligned and within user virtual
+    /// address limits.
+    pub fn userptr(
+        &self,
+        user_ptr: u64,
+        user_size: u64,
+        flags: u32,
+        user: &dyn IoctlContext,
+    ) -> Result<u32, FsError> {
+        use crate::intel_gpu_uapi as abi;
+        if flags
+            & !(abi::I915_USERPTR_READ_ONLY
+                | abi::I915_USERPTR_PROBE
+                | abi::I915_USERPTR_UNSYNCHRONIZED)
+            != 0
+        {
+            return Err(FsError::InvalidData);
+        }
+        if (user_ptr | user_size) % PAGE != 0 || user_size == 0 || user_size > MAX_FILE_BYTES {
+            return Err(FsError::InvalidData);
+        }
+        let end = user_ptr.checked_add(user_size).ok_or(FsError::BadAddress)?;
+        #[cfg(not(target_arch = "aarch64"))]
+        const USER_VA_LIMIT: u64 = (1 << 47) - 4096;
+        #[cfg(target_arch = "aarch64")]
+        const USER_VA_LIMIT: u64 = (1 << 48) - 4096;
+        if end > USER_VA_LIMIT {
+            return Err(FsError::BadAddress);
+        }
+        let handles = self.handles.lock();
+        if !self.capacity(&handles, user_size) {
+            return Err(FsError::OutOfMemory);
+        }
+        drop(handles);
+
+        let read_only = flags & abi::I915_USERPTR_READ_ONLY != 0;
+        let pages = user_size / PAGE;
+
+        let notifier = if flags & abi::I915_USERPTR_UNSYNCHRONIZED == 0 {
+            user.mmu_interval_notifier(
+                user_ptr,
+                user_size,
+                Arc::new(crate::intel_gpu_xe_vm::UserptrNotifier),
+            )
+            .ok()
+        } else {
+            None
+        };
+
+        let seq = notifier.as_ref().map(|n| n.read_begin()).unwrap_or(0);
+        let pins = match user.pin_user_pages(user_ptr, pages, !read_only) {
+            Ok(pins) => pins,
+            Err(FsError::Unsupported) => {
+                if let Some(space) = narf_scheduler::current_address_space() {
+                    let mut pins = Vec::new();
+                    pins.try_reserve_exact(pages as usize)
+                        .map_err(|_| FsError::OutOfMemory)?;
+                    for i in 0..pages {
+                        let va = user_ptr + i * PAGE;
+                        let at = narf_memory::VirtAddr::new(va);
+                        // SAFETY: caller address space is active; resolving page table entry writability.
+                        let writable = unsafe { space.user_page_writable_or_resolve(at) };
+                        if !read_only && !writable {
+                            return Err(FsError::BadAddress);
+                        }
+                        pins.push(space.pin_user_page(at).ok_or(FsError::BadAddress)?);
+                    }
+                    pins
+                } else {
+                    return Err(FsError::Unsupported);
+                }
+            }
+            Err(e) => return Err(e),
+        };
+
+        if let Some(n) = &notifier {
+            if n.read_retry(seq) {
+                return Err(FsError::Busy);
+            }
+        }
+
+        let object = GemObject::from_userptr_pins(pins, read_only)?;
+        let mut handles = self.handles.lock();
+        if !self.capacity(&handles, user_size) {
+            return Err(FsError::OutOfMemory);
+        }
+        let handle = handles.next;
+        handles.next = handle.checked_add(1).ok_or(FsError::OutOfMemory)?;
+        handles.objects.insert(handle, object);
+        handles.bytes += user_size;
         Ok(handle)
     }
 
@@ -1013,7 +1175,7 @@ impl GemState {
 
     pub(crate) fn export_object(&self, handle: u32) -> Result<Arc<GemObject>, FsError> {
         let object = self.object(handle)?;
-        if object.vm_owner.is_some() {
+        if object.vm_owner.is_some() || object.is_userptr() {
             return Err(FsError::InvalidData);
         }
         // Importers expect host pages; VRAM would need migration or P2P.
@@ -1059,7 +1221,7 @@ impl GemState {
 
     pub fn mmap_offset(&self, handle: u32) -> Result<u64, FsError> {
         let object = self.object(handle)?;
-        if object.is_gpu_only() || object.private_staging {
+        if object.is_gpu_only() || object.private_staging || object.is_userptr() {
             return Err(FsError::Unsupported);
         }
         Ok(object.offset)

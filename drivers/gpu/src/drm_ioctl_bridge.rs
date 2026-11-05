@@ -1897,16 +1897,17 @@ pub(crate) unsafe fn copy_out(uptr: usize, bytes: &[u8]) -> Result<(), FsError> 
     unsafe { guarded_copy(uptr as *mut u8, bytes.as_ptr(), bytes.len()) }
 }
 
-/// First address above the user half of the 48-bit canonical VA space on
-/// both supported architectures. The syscall layer's `validate_user_range`
-/// splits at the same bit, so an ioctl pointer the trap layer would accept
-/// through [`IoctlContext`] is accepted here and nothing else is.
-const USER_VA_LIMIT: u64 = 1 << 47; // linux: n/a (NARF user/kernel split, = userspace USER_VA_LIMIT)
+/// First address above the user half of the canonical VA space on
+/// supported architectures ((1 << 47) - 4096 on x86_64, (1 << 48) - 4096 on aarch64).
+#[cfg(not(target_arch = "aarch64"))]
+const USER_VA_LIMIT: u64 = (1 << 47) - 4096;
+#[cfg(target_arch = "aarch64")]
+const USER_VA_LIMIT: u64 = (1 << 48) - 4096;
 
 /// Linux `__access_ok` (`arch/x86/include/asm/uaccess_64.h`): the sum
-/// `addr + size` must not wrap and must stay inside the user half. Null is
-/// rejected too (every DRM pointer field this guards treats 0 as "absent"
-/// before calling, so a null that reaches here is a fault, as before).
+/// `addr + size` must not wrap and must stay inside the user half.
+/// Null passes access_ok (faults during copy if len > 0, succeeds if len == 0),
+/// exactly as in Linux.
 ///
 /// A canonical *kernel* pointer is rejected here rather than left to SMAP:
 /// the guarded copy runs inside STAC/CLAC, and SMAP never faults a
@@ -1914,9 +1915,6 @@ const USER_VA_LIMIT: u64 = 1 << 47; // linux: n/a (NARF user/kernel split, = use
 /// GEM_METADATA buffer or a VERSION name pointer aimed at kernel memory
 /// would be an arbitrary kernel read/write.
 fn access_ok(addr: u64, len: usize) -> bool {
-    if addr == 0 {
-        return false;
-    }
     let Some(end) = addr.checked_add(len as u64) else {
         return false;
     };

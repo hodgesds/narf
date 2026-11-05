@@ -79,6 +79,13 @@ pub(crate) struct PipeRequest {
     /// The pipe's VDSC term when it compresses (`intel_vdsc_min_cdclk`
     /// and `intel_vdsc_prefill_lines`).
     pub(crate) dsc: Option<crate::intel_gpu_xelpg_dsc::DscTerm>,
+    /// Panel fitter scaler source size (`src_w` x `src_h`), when smaller than native timing.
+    pub(crate) src_w: Option<u16>,
+    pub(crate) src_h: Option<u16>,
+    /// Scaler allocation when panel fitting is active.
+    pub(crate) scaler: Option<crate::intel_gpu_xelpg_scaler::PipeScaler>,
+    /// Bigjoiner slave pipe when two pipes are joined to drive one output.
+    pub(crate) bigjoiner_slave: Option<crate::intel_gpu_pipes::Pipe>,
 }
 
 /// The complete new configuration.
@@ -229,7 +236,7 @@ pub(crate) fn compute_ip_vblank(
     latency: &Latency,
     vblank_start: [Option<u16>; PIPES],
 ) -> Result<State, ResourceError> {
-    let active = request
+    let mut active = request
         .pipes
         .iter()
         .enumerate()
@@ -237,6 +244,19 @@ pub(crate) fn compute_ip_vblank(
         .fold(0u8, |m, (i, _)| m | (1 << i));
     if active == 0 {
         return Err(ResourceError::Unsupported);
+    }
+    for (pipe, p) in request.pipes.iter().enumerate() {
+        let Some(p) = p else { continue };
+        if let Some(slave) = p.bigjoiner_slave {
+            let slave_idx = slave as usize;
+            if slave_idx == pipe || slave_idx >= PIPES {
+                return Err(ResourceError::Unsupported);
+            }
+            if request.pipes[slave_idx].is_some() || (active & (1 << slave_idx)) != 0 {
+                return Err(ResourceError::Unsupported);
+            }
+            active |= 1 << slave_idx;
+        }
     }
     let num_active = active.count_ones();
     let mut inputs: [Option<PipeInput>; PIPES] = [None; PIPES];
@@ -261,12 +281,14 @@ pub(crate) fn compute_ip_vblank(
         let t = timing(p, vblank_start[pipe]);
         let mut planes = [None; PLANES];
         let mut plane_wm = [PlaneWm::default(); PLANES];
+        let max_w = p.src_w.unwrap_or(p.hdisplay);
+        let max_h = p.src_h.unwrap_or(p.vdisplay);
+        if max_w == 0 || max_h == 0 || max_w > p.hdisplay || max_h > p.vdisplay {
+            return Err(ResourceError::Unsupported);
+        }
         for (i, plane) in p.planes.iter().enumerate() {
             let Some(plane) = plane else { continue };
-            if plane.width == 0
-                || plane.height == 0
-                || plane.width > p.hdisplay
-                || plane.height > p.vdisplay
+            if plane.width == 0 || plane.height == 0 || plane.width > max_w || plane.height > max_h
             {
                 return Err(ResourceError::Unsupported);
             }
@@ -311,6 +333,15 @@ pub(crate) fn compute_ip_vblank(
             cursor_alloc: wm::cursor_allocation_ip(ip, t, latency, num_active)?,
             cursor_wm,
         });
+        if let Some(slave) = p.bigjoiner_slave {
+            let slave_idx = slave as usize;
+            inputs[slave_idx] = Some(PipeInput {
+                hdisplay: p.hdisplay / 2,
+                planes,
+                cursor_alloc: wm::cursor_allocation_ip(ip, t, latency, num_active)?,
+                cursor_wm,
+            });
+        }
         // intel_crtc_min_cdclk: pixel rate, "Maximum Pipe Read Bandwidth"
         // and intel_vdsc_min_cdclk.
         min_cdclk = min_cdclk.max(cdclk::pixel_rate_to_cdclk(p.pixel_rate_khz));

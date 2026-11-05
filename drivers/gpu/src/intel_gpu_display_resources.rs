@@ -138,6 +138,10 @@ pub(crate) fn request_dsc(
         port_clock_khz: MAX_PORT_CLOCK_KHZ,
         combo_phy: Some(0),
         dsc,
+        src_w: None,
+        src_h: None,
+        scaler: None,
+        bigjoiner_slave: None,
     });
     res::Request {
         pipes,
