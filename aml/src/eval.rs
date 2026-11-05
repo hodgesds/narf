@@ -182,7 +182,11 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
     if length == 0 {
         return Ok(Value::Integer(0));
     }
-    let mut body = alloc::vec![0u8; length];
+    // SEC-F4 (#1291): cap the allocation to the AML store's actual
+    // remaining length at this offset. The `copied < length` check
+    // below still rejects a truncated body — it just cannot drive a
+    // firmware-sized allocation first.
+    let mut body = alloc::vec![0u8; length.min(crate::aml_remaining_len(offset))];
     let copied = crate::copy_aml_bytes(offset, &mut body);
     if copied < length {
         return Err(AmlError::Truncated);
@@ -1406,7 +1410,11 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
         BUFFER_OP => {
             let pkg_start = *cur;
             let pkg_len = read_pkg_length(buf, cur)?;
-            let pkg_end = pkg_start + pkg_len;
+            // SEC-F4 (#1291): clamp pkg_end to the enclosing buffer
+            // end so `data_len` below — and the capacity it sizes —
+            // cannot exceed the bytes actually present. No-op when
+            // the length is honest.
+            let pkg_end = pkg_start.saturating_add(pkg_len).min(buf.len());
             // Size is a TermArg (may be any integer).
             let _size = eval_term_arg(buf, cur, state)?.as_integer();
             // Collect remaining bytes as the buffer payload.
@@ -1427,7 +1435,10 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
         PACKAGE_OP => {
             let pkg_start = *cur;
             let pkg_len = read_pkg_length(buf, cur)?;
-            let pkg_end = pkg_start + pkg_len;
+            // SEC-F4 (#1291): clamp pkg_end to the enclosing buffer
+            // end (same clamp as BufferOp above). The element count
+            // stays a single u8 — safe as-is, do not churn it.
+            let pkg_end = pkg_start.saturating_add(pkg_len).min(buf.len());
             let num_elems = next_u8(buf, cur)? as usize;
             let mut items = Vec::with_capacity(num_elems);
             // Evaluate up to num_elems TermArgs within pkg bounds.
@@ -1447,9 +1458,15 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
         VAR_PACKAGE_OP => {
             let pkg_start = *cur;
             let pkg_len = read_pkg_length(buf, cur)?;
-            let pkg_end = pkg_start + pkg_len;
+            // SEC-F4 (#1291): clamp pkg_end to the enclosing buffer
+            // end, then cap the reservation by the bytes actually
+            // present — each element is >= 1 byte, so the count
+            // cannot exceed `pkg_end - cur`. A lying NumElements
+            // TermArg (a full u64) can no longer reserve a
+            // firmware-sized Vec.
+            let pkg_end = pkg_start.saturating_add(pkg_len).min(buf.len());
             let num_elems = eval_term_arg(buf, cur, state)?.as_integer() as usize;
-            let mut items = Vec::with_capacity(num_elems);
+            let mut items = Vec::with_capacity(num_elems.min(pkg_end.saturating_sub(*cur)));
             while *cur < pkg_end && items.len() < num_elems {
                 let item = eval_term_arg(buf, cur, state)?;
                 items.push(item);
@@ -1462,7 +1479,9 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
         IF_OP => {
             let pkg_start = *cur;
             let pkg_len = read_pkg_length(buf, cur)?;
-            let pkg_end = pkg_start + pkg_len;
+            // SEC-F4 (#1291): clamp pkg_end (and the Else end
+            // below) to the enclosing buffer end.
+            let pkg_end = pkg_start.saturating_add(pkg_len).min(buf.len());
             let pred = eval_term_arg(buf, cur, state)?.as_integer();
             if pred != 0 {
                 // Return last value produced by body — walk and collect.
@@ -1475,7 +1494,7 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
                     *cur += 1;
                     let es = *cur;
                     let el = read_pkg_length(buf, cur)?;
-                    *cur = es + el;
+                    *cur = es.saturating_add(el).min(buf.len());
                 }
                 last
             } else {
@@ -1485,7 +1504,7 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
                     *cur += 1;
                     let es = *cur;
                     let el = read_pkg_length(buf, cur)?;
-                    let ee = es + el;
+                    let ee = es.saturating_add(el).min(buf.len());
                     while *cur < ee {
                         last = eval_term_arg(buf, cur, state)?;
                     }
@@ -1564,7 +1583,13 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
                             Value::Package(p.into_iter().map(name_value_to_value).collect())
                         }
                         Some(NameValue::Unparsed { offset, length }) if length > 0 => {
-                            let mut body = alloc::vec![0u8; length];
+                            // SEC-F4 (#1291): cap the allocation to
+                            // the bytes the AML store actually holds
+                            // at this offset; the `n < length` check
+                            // below still yields Integer(0) for a
+                            // truncated body.
+                            let mut body =
+                                alloc::vec![0u8; length.min(crate::aml_remaining_len(offset))];
                             let n = crate::copy_aml_bytes(offset, &mut body);
                             if n < length {
                                 Value::Integer(0)
@@ -1837,7 +1862,11 @@ fn name_value_to_value(nv: NameValue) -> Value {
         NameValue::Buffer(b) => Value::Buffer(b),
         NameValue::Package(p) => Value::Package(p.into_iter().map(name_value_to_value).collect()),
         NameValue::Unparsed { offset, length } if length > 0 => {
-            let mut body = alloc::vec![0u8; length];
+            // SEC-F4 (#1291): cap the allocation to the bytes the
+            // AML store actually holds at this offset; the `n <
+            // length` check below still yields Integer(0) for a
+            // truncated body.
+            let mut body = alloc::vec![0u8; length.min(crate::aml_remaining_len(offset))];
             let n = crate::copy_aml_bytes(offset, &mut body);
             if n < length {
                 Value::Integer(0)

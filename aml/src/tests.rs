@@ -2958,3 +2958,330 @@ fn smoke_ec_shared_gate_try_acquire() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("aml", smoke_ec_shared_gate_try_acquire);
+
+// ── SEC-F4 (#1291): unclamped PkgLength / element counts ────────────────────
+//
+// A lying PkgLength (up to ~256 MiB in the 4-byte form) used to flow
+// unclamped into pkg_end, method body lengths, and Vec capacities.
+// These tests pin the clamped behaviour: a malicious length is cut
+// to the bytes actually present, and the honest case decodes exactly
+// as before (the clamp is a no-op for honest lengths).
+//
+// PkgLength 0x10000 in 4-byte form: first byte 0xC0 (3 follow
+// bytes), then 0x00, 0x10, 0x00 (len |= 0x10 << 12).
+
+/// Lying MethodOp PkgLength must clamp the recorded body length to
+/// the bytes actually present (pre-fix: body_len 65526, and
+/// evaluate_method allocated vec![0u8; 65526] before failing).
+/// Honest MethodOp with the same body shape must record the same
+/// length — the clamp is a no-op for honest lengths.
+fn smoke_aml_sec1291_method_pkglength_clamped() -> TestResult {
+    crate::__reset_for_test();
+
+    // Method(\LY1, 0) { Return(One) } with PkgLength claiming 0x10000.
+    let lying: &[u8] = &[
+        0x14, // MethodOp
+        0xC0, 0x00, 0x10, 0x00, // PkgLength = 0x10000 (lying)
+        b'\\', b'L', b'Y', b'1', b'_', // NameString \LY1_
+        0x00, // MethodFlags: 0 args
+        0xA4, 0x01, // ReturnOp OneOp
+    ];
+    if crate::__parse_body_for_test(lying, "\\").is_err() {
+        return TestResult::Fail("lying method parse failed");
+    }
+    let m = match crate::find_node("\\LY1") {
+        Some(m) => m,
+        None => return TestResult::Fail("Method \\LY1 missing"),
+    };
+    if m.method_body != (11, 2) {
+        return TestResult::Fail("lying method body length not clamped to remaining bytes");
+    }
+    match crate::eval::evaluate_method("\\LY1", &[]) {
+        Ok(crate::Value::Integer(1)) => {}
+        Ok(_) => return TestResult::Fail("lying method evaluated to wrong value"),
+        Err(_) => return TestResult::Fail("lying method evaluation failed"),
+    }
+
+    // Honest twin: Method(\LY2, 0) { Return(One) }, PkgLength = 9.
+    let honest: &[u8] = &[
+        0x14, // MethodOp
+        0x09, // PkgLength = 9 (honest: 1 + 5 + 1 + 2)
+        b'\\', b'L', b'Y', b'2', b'_', // NameString \LY2_
+        0x00, // MethodFlags: 0 args
+        0xA4, 0x01, // ReturnOp OneOp
+    ];
+    if crate::__parse_body_for_test(honest, "\\").is_err() {
+        return TestResult::Fail("honest method parse failed");
+    }
+    let m = match crate::find_node("\\LY2") {
+        Some(m) => m,
+        None => return TestResult::Fail("Method \\LY2 missing"),
+    };
+    if m.method_body.1 != 2 {
+        return TestResult::Fail("honest method body length changed by clamp");
+    }
+    match crate::eval::evaluate_method("\\LY2", &[]) {
+        Ok(crate::Value::Integer(1)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("honest method evaluated to wrong value"),
+        Err(_) => TestResult::Fail("honest method evaluation failed"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_sec1291_method_pkglength_clamped);
+
+/// Lying ScopeOp PkgLength must not derail the namespace walk:
+/// the scope and its child Name still register, and the walk
+/// re-anchors at the buffer end.
+fn smoke_aml_sec1291_scope_pkglength_clamped() -> TestResult {
+    crate::__reset_for_test();
+
+    // Scope(\X) { Name(_HID, DWord 0x12345678) }, PkgLength lying (0x10000).
+    let body: &[u8] = &[
+        0x10, // ScopeOp
+        0xC0, 0x00, 0x10, 0x00, // PkgLength = 0x10000 (lying)
+        b'\\', b'X', b'_', b'_', b'_', // NameString \X___
+        0x08, // NameOp
+        b'_', b'H', b'I', b'D', // NameString _HID
+        0x0C, // DWordPrefix
+        0x78, 0x56, 0x34, 0x12,
+    ];
+    let n = match crate::__parse_body_for_test(body, "\\") {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("lying scope parse failed"),
+    };
+    if n != 2 {
+        return TestResult::Fail("expected 2 nodes (Scope + Name)");
+    }
+    match crate::find_node("\\X._HID") {
+        Some(node) => match node.value {
+            Some(crate::NameValue::Integer(0x12345678)) => TestResult::Pass,
+            _ => TestResult::Fail("_HID value didn't decode"),
+        },
+        None => TestResult::Fail("\\X._HID missing"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_sec1291_scope_pkglength_clamped);
+
+/// Lying BankFieldOp PkgLength must not panic: pre-fix,
+/// parse_bank_field_body sliced `&p.buf[pre..pkg_end]` with the
+/// unclamped end (65538 into an 18-byte buffer) — an index panic.
+/// Post-fix the clamp keeps the slice in bounds and the parse
+/// completes.
+fn smoke_aml_sec1291_bankfield_pkglength_clamped() -> TestResult {
+    crate::__reset_for_test();
+
+    // BankField(\RGN, \BNK, Zero, 0) { } with PkgLength lying (0x10000).
+    let body: &[u8] = &[
+        0x5B, 0x87, // BankFieldOp (extended)
+        0xC0, 0x00, 0x10, 0x00, // PkgLength = 0x10000 (lying)
+        b'\\', b'R', b'G', b'N', b'_', // RegionName \RGN_
+        b'\\', b'B', b'N', b'K', b'_', // BankName \BNK_
+        0x00, // BankValue: ZeroOp
+        0x00, // FieldFlags
+    ];
+    let n = match crate::__parse_body_for_test(body, "\\") {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("lying bankfield parse failed"),
+    };
+    if n != 1 {
+        return TestResult::Fail("expected exactly 1 Field node");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_sec1291_bankfield_pkglength_clamped);
+
+/// Lying BufferOp PkgLength inside a method must yield the short
+/// buffer actually present (pre-fix: Vec::with_capacity over the
+/// lying data_len). Honest BufferOp with the same payload must
+/// decode identically.
+fn smoke_aml_sec1291_bufferop_pkglength_clamped() -> TestResult {
+    // Method(\BF1, 0) { Return(Buffer(0x10000-lying) { 0xAA, 0xBB }) }.
+    let lying_body: &[u8] = &[
+        0xA4, // ReturnOp
+        0x11, // BufferOp
+        0xC0, 0x00, 0x10, 0x00, // PkgLength = 0x10000 (lying)
+        0x0A, 0x02, // SizeTermArg = 2
+        0xAA, 0xBB, // payload
+    ];
+    let blob = build_eval_method_blob(b"BF1_", 0, lying_body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("lying buffer method parse failed");
+    }
+    match crate::eval::evaluate_method("\\BF1", &[]) {
+        Ok(crate::Value::Buffer(b)) if b == alloc::vec![0xAA, 0xBB] => {}
+        Ok(_) => return TestResult::Fail("lying buffer decoded wrong"),
+        Err(_) => return TestResult::Fail("lying buffer evaluation failed"),
+    }
+
+    // Honest twin: BufferOp PkgLength = 5 (1 + 2 + 2).
+    let honest_body: &[u8] = &[
+        0xA4, // ReturnOp
+        0x11, // BufferOp
+        0x05, // PkgLength = 5 (honest)
+        0x0A, 0x02, // SizeTermArg = 2
+        0xAA, 0xBB, // payload
+    ];
+    let blob = build_eval_method_blob(b"BF2_", 0, honest_body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("honest buffer method parse failed");
+    }
+    match crate::eval::evaluate_method("\\BF2", &[]) {
+        Ok(crate::Value::Buffer(b)) if b == alloc::vec![0xAA, 0xBB] => TestResult::Pass,
+        Ok(_) => TestResult::Fail("honest buffer decoded wrong"),
+        Err(_) => TestResult::Fail("honest buffer evaluation failed"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_sec1291_bufferop_pkglength_clamped);
+
+/// Lying VarPackageOp element count (a full u64 TermArg) must not
+/// drive Vec::with_capacity(u64::MAX) — pre-fix that is a capacity
+/// overflow panic. Post-fix the reservation is capped by the bytes
+/// actually present (each element >= 1 byte) and the package holds
+/// exactly the elements present. Honest VarPackage with the same
+/// elements must decode identically.
+fn smoke_aml_sec1291_varpackage_count_capped() -> TestResult {
+    // Method(\VP1, 0) { Return(VarPackage(Qword MAX) { One, One }) }.
+    let lying_body: &[u8] = &[
+        0xA4, // ReturnOp
+        0x13, // VarPackageOp
+        0x0C, // PkgLength = 12 (1 + 9 + 2)
+        0x0E, // QwordPrefix
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // NumElements = u64::MAX
+        0x01, 0x01, // One, One
+    ];
+    let blob = build_eval_method_blob(b"VP1_", 0, lying_body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("lying varpackage method parse failed");
+    }
+    match crate::eval::evaluate_method("\\VP1", &[]) {
+        Ok(crate::Value::Package(items)) => {
+            if items.len() != 2 {
+                return TestResult::Fail("lying varpackage held wrong element count");
+            }
+            if items.iter().any(|v| v.as_integer() != 1) {
+                return TestResult::Fail("lying varpackage elements wrong");
+            }
+        }
+        Ok(_) => return TestResult::Fail("lying varpackage decoded wrong"),
+        Err(_) => return TestResult::Fail("lying varpackage evaluation failed"),
+    }
+
+    // Honest twin: NumElements = BytePrefix 2.
+    let honest_body: &[u8] = &[
+        0xA4, // ReturnOp
+        0x13, // VarPackageOp
+        0x05, // PkgLength = 5 (1 + 2 + 2)
+        0x0A, 0x02, // NumElements = 2
+        0x01, 0x01, // One, One
+    ];
+    let blob = build_eval_method_blob(b"VP2_", 0, honest_body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("honest varpackage method parse failed");
+    }
+    match crate::eval::evaluate_method("\\VP2", &[]) {
+        Ok(crate::Value::Package(items)) => {
+            if items.len() != 2 {
+                return TestResult::Fail("honest varpackage held wrong element count");
+            }
+            if items.iter().any(|v| v.as_integer() != 1) {
+                return TestResult::Fail("honest varpackage elements wrong");
+            }
+            TestResult::Pass
+        }
+        Ok(_) => TestResult::Fail("honest varpackage decoded wrong"),
+        Err(_) => TestResult::Fail("honest varpackage evaluation failed"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_sec1291_varpackage_count_capped);
+
+/// A Name holding a Buffer whose PkgLength lies records an
+/// `Unparsed` length far beyond the AML store. Consumers must cap
+/// the allocation to the store's actual remaining length and report
+/// truncation (None / Integer(0)) instead of allocating the lying
+/// length. Covers read_name_as_buffer (lib.rs), the eval_term_arg
+/// Unparsed read and name_value_to_value (eval.rs). Honest twin
+/// must decode to the real buffer.
+fn smoke_aml_sec1291_unparsed_alloc_capped() -> TestResult {
+    // Name(\Z9A, Buffer(0x10000-lying) { 0xAA, 0xBB }).
+    let lying: &[u8] = &[
+        0x08, // NameOp
+        b'\\', b'Z', b'9', b'A', b'_', // NameString \Z9A_
+        0x11, // BufferOp
+        0xC0, 0x00, 0x10, 0x00, // PkgLength = 0x10000 (lying)
+        0x0A, 0x02, // SizeTermArg = 2
+        0xAA, 0xBB, // payload
+    ];
+    if crate::__parse_body_for_test(lying, "\\").is_err() {
+        return TestResult::Fail("lying unparsed name parse failed");
+    }
+    if crate::read_name_as_buffer("\\Z9A").is_some() {
+        return TestResult::Fail("lying unparsed buffer must report truncation (None)");
+    }
+    // Method(\Z9M, 0) { Return(\Z9A) } — eval_term_arg Unparsed path.
+    let method_body: &[u8] = &[0xA4, b'\\', b'Z', b'9', b'A', b'_'];
+    let blob = build_eval_method_blob(b"Z9M_", 0, method_body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("unparsed reader method parse failed");
+    }
+    match crate::eval::evaluate_method("\\Z9M", &[]) {
+        Ok(crate::Value::Integer(0)) => {}
+        Ok(_) => return TestResult::Fail("lying unparsed read must yield Integer(0)"),
+        Err(_) => return TestResult::Fail("lying unparsed read evaluation failed"),
+    }
+    // evaluate_object on the Name itself — name_value_to_value path.
+    match crate::eval::evaluate_object("\\Z9A", &[]) {
+        Ok(crate::Value::Integer(0)) => {}
+        Ok(_) => return TestResult::Fail("lying unparsed object must yield Integer(0)"),
+        Err(_) => return TestResult::Fail("lying unparsed object evaluation failed"),
+    }
+
+    // Honest twin: Name(\Z9B, Buffer(5-honest) { 0xAA, 0xBB }).
+    let honest: &[u8] = &[
+        0x08, // NameOp
+        b'\\', b'Z', b'9', b'B', b'_', // NameString \Z9B_
+        0x11, // BufferOp
+        0x05, // PkgLength = 5 (honest)
+        0x0A, 0x02, // SizeTermArg = 2
+        0xAA, 0xBB, // payload
+    ];
+    if crate::__parse_body_for_test(honest, "\\").is_err() {
+        return TestResult::Fail("honest unparsed name parse failed");
+    }
+    match crate::read_name_as_buffer("\\Z9B") {
+        Some(b) if b == alloc::vec![0xAA, 0xBB] => TestResult::Pass,
+        Some(_) => TestResult::Fail("honest unparsed buffer decoded wrong"),
+        None => TestResult::Fail("honest unparsed buffer must decode"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_sec1291_unparsed_alloc_capped);
+
+/// The cap helper itself: remaining length at an offset is the
+/// store length minus the offset (saturating to 0 past the end).
+fn smoke_aml_sec1291_store_remaining_cap() -> TestResult {
+    crate::__reset_for_test();
+    let body: &[u8] = &[
+        0x08, // NameOp
+        b'\\', b'Z', b'9', b'C', b'_', // NameString \Z9C_
+        0x00, // ZeroOp
+    ];
+    if crate::__parse_body_for_test(body, "\\").is_err() {
+        return TestResult::Fail("remaining-cap setup parse failed");
+    }
+    let total = crate::aml_total_len();
+    if total != body.len() {
+        return TestResult::Fail("store length must equal parsed body length");
+    }
+    if crate::aml_remaining_len(0) != total {
+        return TestResult::Fail("remaining at 0 must equal total");
+    }
+    if crate::aml_remaining_len(total - 1) != 1 {
+        return TestResult::Fail("remaining at total-1 must be 1");
+    }
+    if crate::aml_remaining_len(total) != 0 {
+        return TestResult::Fail("remaining at total must be 0");
+    }
+    if crate::aml_remaining_len(total + 4096) != 0 {
+        return TestResult::Fail("remaining past total must saturate to 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_sec1291_store_remaining_cap);

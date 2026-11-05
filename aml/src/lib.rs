@@ -250,6 +250,19 @@ pub fn aml_total_len() -> usize {
     NAMESPACE.lock().aml.len()
 }
 
+/// Bytes of the AML store remaining at `offset`.
+///
+/// SEC-F4 (#1291): firmware-driven lengths (a lying `PkgLength`,
+/// an inflated `Unparsed` body) must never size an allocation.
+/// Callers allocate at most this many bytes and keep their
+/// existing `copied < length` truncation check against the
+/// *recorded* length, so a malformed table still fails exactly
+/// as before — it just cannot drive a firmware-sized allocation
+/// first.
+pub(crate) fn aml_remaining_len(offset: usize) -> usize {
+    aml_total_len().saturating_sub(offset)
+}
+
 /// Snapshot of the current namespace. Returns the count.
 pub fn copy_nodes(out: &mut Vec<AmlNode>) -> usize {
     let g = NAMESPACE.lock();
@@ -790,7 +803,11 @@ pub fn evaluate_s5() -> Option<(u8, u8)> {
         NameValue::Unparsed { offset, length } if length > 0 => (offset, length),
         _ => return None,
     };
-    let mut body = alloc::vec![0u8; length];
+    // SEC-F4 (#1291): cap the allocation to the bytes the AML store
+    // actually holds at this offset. The `n < length` check below
+    // still rejects the truncated body — it just cannot drive a
+    // firmware-sized allocation first.
+    let mut body = alloc::vec![0u8; length.min(aml_remaining_len(offset))];
     let n = copy_aml_bytes(offset, &mut body);
     if n < length {
         return None;
@@ -1319,7 +1336,14 @@ fn parse_term_list_inner(
                 p.skip(1)?;
                 let pkg_start = p.pos;
                 let pkg_len = read_pkg_length(p)?;
-                let pkg_end = pkg_start + pkg_len;
+                // SEC-F4 (#1291): clamp pkg_end to the enclosing
+                // buffer end so a lying PkgLength cannot inflate
+                // pkg_end (and anything derived from it — method
+                // body lengths, field slices, eval loop bounds)
+                // past the bytes actually present. Same clamp at
+                // every pkg_end site in this function; IfOp already
+                // had it. No-op when the length is honest.
+                let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
                 let name = read_name_string(p, parent)?;
                 let path = full_path(name, parent);
                 push_node(AmlNode {
@@ -1422,7 +1446,7 @@ fn parse_term_list_inner(
                 p.skip(1)?;
                 let pkg_start = p.pos;
                 let pkg_len = read_pkg_length(p)?;
-                let pkg_end = pkg_start + pkg_len;
+                let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
                 let name = read_name_string(p, parent)?;
                 let path = full_path(name, parent);
                 // 1 byte MethodFlags follows the name.
@@ -1447,7 +1471,7 @@ fn parse_term_list_inner(
                     EXT_DEVICE_OP => {
                         let pkg_start = p.pos;
                         let pkg_len = read_pkg_length(p)?;
-                        let pkg_end = pkg_start + pkg_len;
+                        let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
                         let name = read_name_string(p, parent)?;
                         let path = full_path(name, parent);
                         push_node(AmlNode {
@@ -1467,7 +1491,7 @@ fn parse_term_list_inner(
                     EXT_PROCESSOR_OP => {
                         let pkg_start = p.pos;
                         let pkg_len = read_pkg_length(p)?;
-                        let pkg_end = pkg_start + pkg_len;
+                        let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
                         let name = read_name_string(p, parent)?;
                         let path = full_path(name, parent);
                         // ProcID(1) + PblkAddr(4) + PblkLen(1) = 6 bytes.
@@ -1489,7 +1513,7 @@ fn parse_term_list_inner(
                     EXT_POWER_RES_OP => {
                         let pkg_start = p.pos;
                         let pkg_len = read_pkg_length(p)?;
-                        let pkg_end = pkg_start + pkg_len;
+                        let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
                         let name = read_name_string(p, parent)?;
                         let path = full_path(name, parent);
                         // SystemLevel(1) + ResourceOrder(2) = 3 bytes.
@@ -1511,7 +1535,7 @@ fn parse_term_list_inner(
                     EXT_THERMAL_ZONE_OP => {
                         let pkg_start = p.pos;
                         let pkg_len = read_pkg_length(p)?;
-                        let pkg_end = pkg_start + pkg_len;
+                        let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
                         let name = read_name_string(p, parent)?;
                         let path = full_path(name, parent);
                         push_node(AmlNode {
@@ -1583,7 +1607,7 @@ fn parse_term_list_inner(
                     EXT_FIELD_OP => {
                         let pkg_start = p.pos;
                         let pkg_len = read_pkg_length(p)?;
-                        let pkg_end = pkg_start + pkg_len;
+                        let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
                         // Parse individual field entries and register them.
                         // parse_field_body pushes a real Field node per
                         // NameSeg so find_node can resolve them.
@@ -1599,7 +1623,7 @@ fn parse_term_list_inner(
                         // oregion::read_field/write_field.
                         let pkg_start = p.pos;
                         let pkg_len = read_pkg_length(p)?;
-                        let pkg_end = pkg_start + pkg_len;
+                        let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
                         let _ = oregion::parse_index_field_body(p, parent, pkg_end);
                         p.pos = pkg_end;
                         push_node(AmlNode {
@@ -1615,7 +1639,7 @@ fn parse_term_list_inner(
                     EXT_BANK_FIELD_OP => {
                         let pkg_start = p.pos;
                         let pkg_len = read_pkg_length(p)?;
-                        let pkg_end = pkg_start + pkg_len;
+                        let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
                         let _ = oregion::parse_bank_field_body(p, parent, pkg_end);
                         p.pos = pkg_end;
                         push_node(AmlNode {
@@ -2114,7 +2138,10 @@ pub fn read_name_as_buffer(path: &str) -> Option<alloc::vec::Vec<u8>> {
     let buf = match node.value? {
         NameValue::Buffer(b) => b,
         NameValue::Unparsed { offset, length } if length > 0 => {
-            let mut body = alloc::vec![0u8; length];
+            // SEC-F4 (#1291): cap the allocation to the bytes the
+            // AML store actually holds at this offset; the `n <
+            // length` check below still rejects the truncated body.
+            let mut body = alloc::vec![0u8; length.min(aml_remaining_len(offset))];
             let n = copy_aml_bytes(offset, &mut body);
             if n < length {
                 return None;
