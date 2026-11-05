@@ -1240,3 +1240,28 @@ kernel_test_in!(
     "filesystem/procfs/sys_net",
     smoke_sysctl_write_ranges_match_linux
 );
+
+/// Verify that `register_all()` publishes `/proc/sys/net/ipv4/conf/default/forwarding`,
+/// `/proc/sys/net/ipv4/conf/all/forwarding`, and `/proc/sys/net/core/netdev_max_backlog`.
+/// Without these, NetworkManager reports "can't read default forwarding value" and
+/// systemd-sysctl fails to apply netdev_max_backlog on boot.
+fn smoke_default_and_core_sysctls_registered() -> TestResult {
+    register_all();
+    let default_fwd = lookup_registry(&["sys", "net", "ipv4", "conf", "default", "forwarding"]);
+    if !matches!(default_fwd, Some(ProcNodeSnapshot::File(_))) {
+        return TestResult::Fail("/proc/sys/net/ipv4/conf/default/forwarding not registered");
+    }
+    let all_fwd = lookup_registry(&["sys", "net", "ipv4", "conf", "all", "forwarding"]);
+    if !matches!(all_fwd, Some(ProcNodeSnapshot::File(_))) {
+        return TestResult::Fail("/proc/sys/net/ipv4/conf/all/forwarding not registered");
+    }
+    let netdev_max = lookup_registry(&["sys", "net", "core", "netdev_max_backlog"]);
+    if !matches!(netdev_max, Some(ProcNodeSnapshot::File(_))) {
+        return TestResult::Fail("/proc/sys/net/core/netdev_max_backlog not registered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_net",
+    smoke_default_and_core_sysctls_registered
+);

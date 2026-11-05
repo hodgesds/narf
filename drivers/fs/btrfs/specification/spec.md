@@ -59,20 +59,41 @@ BtrfsVolume::sync_fs(&self) -> Result<(), FsError>  // syncfs: commit + superblo
 ```
 
 Every node for one `(filesystem core, fs-tree id, inode)` retains shared inode
-metadata, size, and mapping identity. Creation and lookup acquire that reference
-before releasing the operation mutex. `stat_async` and `statx_async` refresh
-metadata from the current tree; writes and size changes publish shared metadata
-before releasing the same mutex. Reads serialize with mutation and eviction.
+metadata, size, and mapping identity. Creation acquires that reference before
+releasing the operation mutex. Mutators hold the mutex from their first tree
+read to staging, and the commit they may force is inside that span, so it can
+be held for hundreds of milliseconds.
+
+No read-side operation takes the operation mutex: `read`, `lookup_async`,
+`lookup_dir_async`, `stat_async`, `statx_async`, `enumerate_async` and the xattr
+reads never wait for a mutator or a commit, as no Linux reader waits for a
+transaction. Each namespace operation stages atomically and a read takes the
+inode and its extents from one root, so it observes an operation whole or not
+at all. Three rules replace the mutex on that side:
+
+- **Space.** `begin_reader` opens a reader epoch before any root is sampled;
+  what a commit releases stays withheld from the allocator until every reader
+  that started before that commit has ended (`ReaderEpochs`).
+- **Eviction.** `claim_for_eviction` counts an eviction before its last open
+  check; `lookup_child` compares that count across resolving the name and
+  publishing its anchor, and starts over if it moved.
+- **Metadata.** `stat_async` and `statx_async` refresh metadata from the current
+  tree, publishing it only if the inode's `update_seq` did not move and no
+  mutation of the inode is in flight (odd). Writes and size changes publish
+  shared metadata before releasing the mutex.
+
 Content generations advance after acquiring that mutex and before changing
-bytes or length. A queued mutation cannot publish the epoch that would let a
-reader retain old bytes as current after the mutation completes. Shrinking
-truncate publishes EOF and revokes mappings under the same operation lock,
-before retiring extents; a failed revoke restores the cached inode there.
+bytes or length, and again when the mutation ends. A fill runs beside the
+mutation, so a generation sampled in between may tag old bytes; the second
+advance keeps them from staying current. Shrinking truncate publishes EOF and
+revokes mappings under the operation lock before retiring extents, and revokes
+again afterwards (`truncate_pagecache`), since a fault past its EOF check is
+excluded by no lock; a failed revoke restores the cached inode there.
 
 File-content reads seek to the extent at or before the requested offset and
 walk only the requested window. A small read must not collect the inode's
-entire extent list. The existing operation lock, checksum verification,
-compressed-extent cache and zero filling of holes still cover these reads.
+entire extent list. Reader epochs, checksum verification, the compressed-extent
+cache and zero filling of holes still cover these reads.
 
 Last-link unlink and file replacement remove the name and persist `nlink=0`
 with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private

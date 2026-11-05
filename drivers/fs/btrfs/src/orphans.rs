@@ -36,11 +36,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         Ok(())
     }
 
-    /// Caller holds the core's operation mutex. Lookups register their anchor
-    /// under that same mutex, closing lookup-versus-final-eviction races.
+    /// Caller holds the core's operation mutex. Lookups run without it and
+    /// register their anchor against [`Self::claim_for_eviction`], which
+    /// closes the lookup-versus-final-eviction race.
     pub(crate) async fn reap_orphans(&self) -> Result<(), FsError> {
         for (tree, ino) in self.orphan_snapshot() {
-            if self.inode_is_open(tree, ino) {
+            if !self.claim_for_eviction(tree, ino) {
                 continue;
             }
             let view = Self::view_for_tree(self.core(), tree);

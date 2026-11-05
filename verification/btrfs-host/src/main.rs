@@ -560,7 +560,7 @@ fn regress_inline_falloc() -> Vec<Op> {
 fn regress_atomic() -> Vec<Op> {
     let mut ops = vec![Op::Sync { sub: 0 }];
     for target in ["trunc", "extend"] {
-        for _ in 0..7 {
+        for _ in 0..63 {
             ops.push(Op::Chmod {
                 sub: 0,
                 path: p("pad"),

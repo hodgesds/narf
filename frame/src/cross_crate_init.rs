@@ -460,6 +460,8 @@ fn install_procfs_net_hooks() {
     );
     // Register the actual /proc/net/* files on the procfs registry.
     pn::register_all();
+    // Register the system-wide /proc/sys/net/* sysctl keys.
+    narf_filesystem::procfs::sys_net::register_all();
 
     // The reverse direction: let `narf-net` publish each interface's
     // `/proc/sys/net/ipv4/conf/<dev>/*` keys as it registers the interface.
