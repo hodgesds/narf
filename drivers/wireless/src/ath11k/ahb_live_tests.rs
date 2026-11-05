@@ -51,7 +51,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use super::super::ahb::find_ahb_devices;
 use super::super::ahb::AhbChip;
 use super::super::ahb_hif::AhbLine;
-use super::super::ahb_probe::{bring_up, AhbPlatform, BringUpStep};
+use super::super::ahb_probe::{bring_up, AhbBringUp, AhbPlatform, BringUpStep};
 use super::super::qmi::{
     decode_tlvs, encode_message, split_message, tlv_i32, tlv_u32, tlv_u8, tlv_var_struct_array,
     LenSize, QmiError, QmiResponse, StructReader, TlvWriter, QMI_INDICATION, QMI_RESPONSE,
@@ -60,8 +60,13 @@ use super::super::qmi_client::QrtrPipe;
 use super::super::qmi_wlfw::*;
 use super::super::qrtr::*;
 use super::super::qrtr_glink::{GlinkBus, GlinkQrtr, QRTR_GLINK_CHANNEL};
+use super::super::runtime::{
+    recovery_gated, ATH11K_RESET_MAX_FAIL_COUNT_FINAL, ATH11K_RESET_MAX_FAIL_COUNT_FIRST,
+};
 use super::super::wlfw::{step, CoherentMem, DmaAllocator, FirmwareLoader, Wlfw, WlfwConfig};
 use super::*;
+use narf_drivers_qcom_soc::q6v5::{Crash, Q6Event};
+use narf_drivers_qcom_soc::smp2p::{FLAGS_RESTART_ACK_BIT, FLAGS_RESTART_DONE_BIT};
 
 static CLOCK: AtomicU64 = AtomicU64::new(0);
 /// Every read of the fixture clock advances it 50 ms, so QMI timeouts
@@ -1493,4 +1498,173 @@ fn smoke_ath11k_ahb_live_wcn6750_wlfw_server() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_ahb_live_wcn6750_wlfw_server
+);
+
+// ── post-boot SMP2P crash monitoring / recovery ─────────────────────
+
+/// Boot the IPQ6018 fixture remote to `Running` without the WLFW leg
+/// (no server behind the GLINK edge): the state a post-boot crash
+/// monitor observes. Step failures surface at the caller's `Running`
+/// assertion.
+fn booted_live() -> (Box<LiveAhb<Env>>, Box<AhbPlatform>) {
+    let blob: &'static [u8] =
+        Box::leak(ipq6018_wifi_dt("qcom,ipq6018-wifi", &SPIS).into_boxed_slice());
+    let node = find_ahb_devices(blob)[0].0.clone();
+    let p = Box::new(AhbPlatform::probe(blob, &node).unwrap());
+    // fatal 0, ready 1, handover 2, stop-ack 3.
+    let env = env_for(&p, (1 << 1) | (1 << 2), 1 << 3);
+    let mut live = Box::new(LiveAhb::new(*env, blob));
+    let _ = live.hal_ce_alloc(&p);
+    let _ = live.qmi_init_service(&p);
+    let _ = run(live.rproc_irqs(&p));
+    let _ = run(live.rproc_boot(&p));
+    let _ = run(live.glink_start(&p));
+    (live, p)
+}
+
+/// The fixture remote's `slave-kernel` value word.
+fn slave_kernel_word(live: &LiveAhb<Env>) -> u32 {
+    live.env.remote + 20 + 16
+}
+
+/// Post-boot crash monitor: no crash while the remote runs clean, then
+/// the remote's SMP2P `fatal` bit is observed as `Crash::Fatal` and the
+/// remoteproc latches `Crashed`.
+fn smoke_ath11k_ahb_live_smp2p_crash_fatal() -> TestResult {
+    let (mut live, p) = booted_live();
+    kt_assert_eq!(live.rproc_state(), Some(RprocState::Running));
+    kt_assert!(live.monitor_tick(&p).is_none(), "clean while running");
+    let word = slave_kernel_word(&live);
+    live.env.smem.set(word, (1 << 1) | (1 << 2) | (1 << 0));
+    kt_assert_eq!(live.monitor_tick(&p), Some(Crash::Fatal), "fatal observed");
+    kt_assert_eq!(live.rproc_state(), Some(RprocState::Crashed));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_live_smp2p_crash_fatal
+);
+
+/// Same, for the `wdog` GIC line: the IRQ handler's effect is simulated
+/// by signalling the Q6 directly (the fixture binds the line but has no
+/// GIC to raise it), and the monitor observes `Crash::Watchdog`.
+fn smoke_ath11k_ahb_live_smp2p_crash_wdog() -> TestResult {
+    let (mut live, p) = booted_live();
+    kt_assert_eq!(live.rproc_state(), Some(RprocState::Running));
+    kt_assert!(live.rproc.is_some(), "remoteproc exists after boot");
+    let q6 = match &live.rproc {
+        Some(super::Rproc::Wcss { w, .. }) => w.q6,
+        Some(super::Rproc::Pas { p: pas, .. }) => pas.q6,
+        None => unreachable!("remoteproc exists"),
+    };
+    q6.signal(Q6Event::Wdog);
+    kt_assert_eq!(
+        live.monitor_tick(&p),
+        Some(Crash::Watchdog),
+        "wdog observed"
+    );
+    kt_assert_eq!(live.rproc_state(), Some(RprocState::Crashed));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_live_smp2p_crash_wdog
+);
+
+/// Crash recovery through the remote restart: after a `fatal` crash the
+/// restart shuts the dead remote down, boots it again (the fixture
+/// remote re-asserts `ready` on the next boot) and re-registers GLINK;
+/// the WLFW leg then times out — there is no WLFW server behind the
+/// fixture edge (that fixture is the WLFW lane's) — so the restart
+/// reports the timeout while the remote is back `Running`.
+fn smoke_ath11k_ahb_live_smp2p_crash_restart() -> TestResult {
+    let (mut live, p) = booted_live();
+    kt_assert_eq!(live.rproc_state(), Some(RprocState::Running));
+    let word = slave_kernel_word(&live);
+    live.env.smem.set(word, (1 << 1) | (1 << 2) | (1 << 0));
+    kt_assert_eq!(live.monitor_tick(&p), Some(Crash::Fatal));
+    kt_assert_eq!(live.rproc_state(), Some(RprocState::Crashed));
+    // Script the fake remote for the next boot: its item value drops
+    // (the restarted remote recreates it) and the tick script restarts
+    // so `ready` is re-asserted on the re-boot's second tick. The
+    // shutdown from `Crashed` runs no pump, so the ticks survive it.
+    live.env.smem.set(word, 0);
+    live.env.ticks.store(0, Ordering::Relaxed);
+    let r = run(live.restart_transport(&p));
+    kt_assert!(
+        matches!(r, Some(Err(AhbError::Failed(_)))),
+        "WLFW leg times out without a server"
+    );
+    kt_assert_eq!(
+        live.rproc_state(),
+        Some(RprocState::Running),
+        "remote restarted"
+    );
+    // `glink_start` re-ran: the GLINK descriptor is allocated.
+    let smem = Smem::probe(live.env.smem, live.env.smem_size).unwrap();
+    kt_assert!(
+        smem.get(live.env.pid, SMEM_GLINK_NATIVE_XPRT_DESCRIPTOR)
+            .is_ok(),
+        "glink re-registered"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_live_smp2p_crash_restart
+);
+
+/// SMP2P SSR restart ack: when the restarted remote raises
+/// `RESTART_DONE`, the monitor's edge pass raises the host's
+/// `RESTART_ACK` bit (Linux `qcom_smp2p_do_ssr_ack`), without
+/// reporting a crash.
+fn smoke_ath11k_ahb_live_smp2p_ssr_ack() -> TestResult {
+    let (mut live, p) = booted_live();
+    kt_assert_eq!(live.rproc_state(), Some(RprocState::Running));
+    live.env
+        .smem
+        .set(live.env.remote + 16, 1 << FLAGS_RESTART_DONE_BIT);
+    kt_assert!(live.monitor_tick(&p).is_none(), "ack is not a crash");
+    let out_off = {
+        let g = live.edges.lock();
+        g[0].smp2p.outbound_item().offset
+    };
+    kt_assert_eq!(
+        live.env.smem.get(out_off + 16) & (1 << FLAGS_RESTART_ACK_BIT),
+        1 << FLAGS_RESTART_ACK_BIT,
+        "SSR ack bit set"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_live_smp2p_ssr_ack
+);
+
+/// The `ath11k_core_reset` failure gate, shared by the runtime loop and
+/// the AHB crash monitor: FINAL gates regardless of the window, FIRST
+/// gates only inside it, and the window boundary itself does not gate.
+fn smoke_ath11k_ahb_live_recovery_gated() -> TestResult {
+    kt_assert!(!recovery_gated(0, 20_000, 0), "zero failures");
+    kt_assert!(
+        !recovery_gated(ATH11K_RESET_MAX_FAIL_COUNT_FIRST - 1, 20_000, 0),
+        "below FIRST"
+    );
+    kt_assert!(
+        recovery_gated(ATH11K_RESET_MAX_FAIL_COUNT_FIRST, 20_000, 19_999),
+        "FIRST inside window"
+    );
+    kt_assert!(
+        !recovery_gated(ATH11K_RESET_MAX_FAIL_COUNT_FIRST, 20_000, 20_000),
+        "window boundary does not gate"
+    );
+    kt_assert!(
+        recovery_gated(ATH11K_RESET_MAX_FAIL_COUNT_FINAL, 20_000, 999_999),
+        "FINAL gates regardless of window"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_live_recovery_gated
 );

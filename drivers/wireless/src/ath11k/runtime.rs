@@ -106,6 +106,14 @@ pub const ATH11K_RESET_MAX_FAIL_COUNT_FIRST: u32 = 3;
 pub const ATH11K_RESET_MAX_FAIL_COUNT_FINAL: u32 = 5;
 /// `ATH11K_RESET_FAIL_TIMEOUT_HZ` (20 s).
 pub const ATH11K_RESET_FAIL_TIMEOUT_MS: u64 = 20_000;
+
+/// Linux `ath11k_core_reset`'s failure gate, shared by the runtime loop's
+/// `fw_notify` and the AHB SMP2P crash monitor: no further reset once
+/// `fail_cont_count` reached FINAL, or FIRST within the fail window.
+pub fn recovery_gated(fail_cont_count: u32, reset_fail_timeout: u64, now_ms: u64) -> bool {
+    fail_cont_count >= ATH11K_RESET_MAX_FAIL_COUNT_FINAL
+        || (fail_cont_count >= ATH11K_RESET_MAX_FAIL_COUNT_FIRST && now_ms < reset_fail_timeout)
+}
 pub const ESHUTDOWN: i32 = 108;
 
 pub const ETIMEDOUT: i32 = 110;
@@ -1776,11 +1784,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         }
         if let FwNotice::Reset(_) = n {
             let fails = self.reset.fail_cont_count;
-            let now = self.now_ms();
-            if fails >= ATH11K_RESET_MAX_FAIL_COUNT_FINAL
-                || (fails >= ATH11K_RESET_MAX_FAIL_COUNT_FIRST
-                    && now < self.reset.reset_fail_timeout)
-            {
+            if recovery_gated(fails, self.reset.reset_fail_timeout, self.now_ms()) {
                 TransportError::new(step::RECOVERY_LIMIT, fails, ETIMEDOUT)
                     .report("ath11k reset (too many failed recoveries)");
                 return;
@@ -2682,6 +2686,16 @@ struct VdevBinding {
     mac: [u8; 6],
 }
 
+/// Boxed transport-restart future: the restart closure's future borrows
+/// the `&mut Q` it is passed, so it cannot name a single concrete future
+/// type — it is boxed with the borrow's lifetime (same idiom as the
+/// `VirtualRecover` fn type in `iface.rs`).
+type RestartFut<'a, Q> = core::pin::Pin<
+    alloc::boxed::Box<
+        dyn core::future::Future<Output = Result<Option<Q>, TransportError>> + Send + 'a,
+    >,
+>;
+
 impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     pub fn new(rt: Rt<Io, Irq, Q>, rng: fn(&mut [u8]) -> Result<(), i32>) -> Arc<Self> {
         let irq = rt.core.hif.irq.clone();
@@ -3300,8 +3314,19 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         notice: FwNotice,
         pdev_id: u32,
     ) -> Result<Recovered, TransportError> {
+        let power_cycle = matches!(notice, FwNotice::Reset(_));
         self.rebuild_after_transport_reset(
-            matches!(notice, FwNotice::Reset(_)),
+            move |qmi: &mut Q| {
+                alloc::boxed::Box::pin(async move {
+                    qmi.recover(power_cycle).await.map(|()| None).map_err(|e| {
+                        TransportError::new(
+                            step::RECOVERY_FW,
+                            (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                            e.errno,
+                        )
+                    })
+                })
+            },
             true,
             matches!(notice, FwNotice::Reset(MhiNotify::EeRddm)),
             pdev_id,
@@ -3314,7 +3339,39 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// `restart_work`, but it must not count toward the crash-reset failure
     /// throttling or be reported as a firmware failure.
     pub async fn resume_after_system_suspend(&self) -> Result<Recovered, TransportError> {
-        self.rebuild_after_transport_reset(true, false, false, 0)
+        self.rebuild_after_transport_reset(
+            move |qmi: &mut Q| {
+                alloc::boxed::Box::pin(async move {
+                    qmi.recover(true).await.map(|()| None).map_err(|e| {
+                        TransportError::new(
+                            step::RECOVERY_FW,
+                            (e.step & 0xffff) << 16 | (e.detail & 0xffff),
+                            e.errno,
+                        )
+                    })
+                })
+            },
+            false,
+            false,
+            0,
+        )
+        .await
+    }
+
+    /// AHB remote-restart recovery for the SMP2P crash monitor: the
+    /// caller-provided transport restart (remote shutdown + boot + a
+    /// fresh WLFW session) replaces the PCI MHI power cycle; the
+    /// reconstruction tail, failure throttling and park-on-failure are
+    /// shared. A crash counts toward the reset throttle; no coredump is
+    /// collected on this path (AHB coredump capture is not implemented).
+    pub async fn recover_after_remote_restart<F>(
+        &self,
+        restart: F,
+    ) -> Result<Recovered, TransportError>
+    where
+        F: for<'a> FnOnce(&'a mut Q) -> RestartFut<'a, Q>,
+    {
+        self.rebuild_after_transport_reset(restart, true, false, 0)
             .await
     }
 
@@ -3324,13 +3381,19 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// the unsafe runtime, but never consume reset-throttle budget.
     /// `pdev_id` selects the radio whose caps the returned [`Recovered`]
     /// carries (0 = the legacy pdev-0 caps, as system resume uses).
-    async fn rebuild_after_transport_reset(
+    /// The transport restart is caller-provided: the PCI path power-cycles MHI
+    /// and keeps the QMI session (`Ok(None)`); the AHB path restarts the
+    /// remote and supplies a fresh WLFW session (`Ok(Some(qmi))`).
+    async fn rebuild_after_transport_reset<F>(
         &self,
-        power_cycle: bool,
+        restart: F,
         record_recovery_failure: bool,
         collect_crash_dump: bool,
         pdev_id: u32,
-    ) -> Result<Recovered, TransportError> {
+    ) -> Result<Recovered, TransportError>
+    where
+        F: for<'a> FnOnce(&'a mut Q) -> RestartFut<'a, Q>,
+    {
         // Firmware lost all pdev state. Recreated MAC instances must elect a
         // fresh first opener rather than inheriting the old open-vif count.
         self.radio_mac_users.store(0, Ordering::Release);
@@ -3366,18 +3429,17 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
                 self.publish_firmware_crash_dump(dump);
             }
         }
-        if let Err(e) = rt.core.qmi.recover(power_cycle).await {
-            let te = TransportError::new(
-                step::RECOVERY_FW,
-                (e.step & 0xffff) << 16 | (e.detail & 0xffff),
-                e.errno,
-            );
-            te.report("ath11k recovery: firmware");
-            if record_recovery_failure {
-                Self::recovery_failed(&mut rt);
+        match restart(&mut rt.core.qmi).await {
+            Ok(Some(q)) => rt.core.qmi = q,
+            Ok(None) => {}
+            Err(te) => {
+                te.report("ath11k recovery: firmware");
+                if record_recovery_failure {
+                    Self::recovery_failed(&mut rt);
+                }
+                self.park(alloc::boxed::Box::new(rt));
+                return Err(te);
             }
-            self.park(alloc::boxed::Box::new(rt));
-            return Err(te);
         }
         // restart_work → ath11k_core_reconfigure_on_crash.
         let Rt {
