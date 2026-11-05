@@ -745,6 +745,10 @@ async fn auto_detach_best_effort(dev: &USBDevice) {
 #[derive(Debug)]
 pub struct AxDevice {
     pub slot_id: u8,
+    /// Owning xHCI controller id ([`Xhci::id`]): slot ids are only
+    /// unique within one controller, so TX and detach resolve the
+    /// controller through this field, never a global accessor.
+    pub controller: u8,
     pub mac: [u8; 6],
     pub bulk_in_dci: u8,
     pub bulk_out_dci: u8,
@@ -792,8 +796,8 @@ pub fn tx_target(idx: usize) -> Option<(u8, u8, u16)> {
 /// via block_on (called from TX paths that are not inside an
 /// executor poll — same contract as r8152's send). No lock is held
 /// across the block_on (the lock rule in `AGENTS.md`).
-fn ax_send_segment(slot_id: u8, bulk_out_dci: u8, seg: &[u8]) -> Result<(), ()> {
-    let c = crate::xhci::controller().ok_or(())?;
+fn ax_send_segment(controller: u8, slot_id: u8, bulk_out_dci: u8, seg: &[u8]) -> Result<(), ()> {
+    let c = crate::xhci::controller_by_id(controller).ok_or(())?;
     narf_scheduler::block_on(async move { c.bulk_out(slot_id, bulk_out_dci, seg).await })
         .map_err(|_| ())?;
     Ok(())
@@ -810,8 +814,9 @@ fn ax_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<(),
         return Err(());
     }
     let (slot_id, bulk_out_dci, out_max_packet) = tx_target(idx).ok_or(())?;
+    let controller = AX_DEVICES.lock().get(idx).ok_or(())?.controller;
     let seg = build_tx_segment(frame, out_max_packet);
-    ax_send_segment(slot_id, bulk_out_dci, &seg)
+    ax_send_segment(controller, slot_id, bulk_out_dci, &seg)
 }
 
 /// `SendCtxFn` trampoline: the cookie is the device-record index
@@ -1193,6 +1198,7 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         let idx = g.len();
         g.push(AxDevice {
             slot_id: device.slot_id(),
+            controller: device.controller().id(),
             mac,
             bulk_in_dci,
             bulk_out_dci,
@@ -1359,11 +1365,14 @@ fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
 /// Infallible bookkeeping, adapted to the [`UsbUnbindFn`]
 /// contract with an unconditional `Ok(())` (#893: a hook
 /// reports failure with `Err(())`, never by panicking).
-pub fn detach_ax_slot(slot_id: u8) -> Result<(), ()> {
+pub fn detach_ax_slot(controller: u8, slot_id: u8) -> Result<(), ()> {
     let ifaces: Vec<String> = {
         let mut g = AX_DEVICES.lock();
         let mut names = Vec::new();
-        for dev in g.iter_mut().filter(|d| d.slot_id == slot_id && !d.detached) {
+        for dev in g
+            .iter_mut()
+            .filter(|d| d.controller == controller && d.slot_id == slot_id && !d.detached)
+        {
             dev.detached = true;
             dev.pump_running = false;
             names.push(dev.iface_name.clone());

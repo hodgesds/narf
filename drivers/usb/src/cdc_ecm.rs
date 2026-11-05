@@ -763,7 +763,7 @@ pub async fn try_bind_ecm_already_addressed(
 /// surfaces as persistent errors) or when the record vanishes
 /// or is detached.
 async fn ecm_rx_pump(idx: usize) {
-    let (slot_id, bulk_in_dci, name, buf_len, hub_port) = {
+    let (slot_id, bulk_in_dci, name, buf_len, hub_port, controller) = {
         let g = CDC_ECM_DEVICES.lock();
         let Some(dev) = g.get(idx).filter(|d| !d.detached) else {
             return;
@@ -774,6 +774,7 @@ async fn ecm_rx_pump(idx: usize) {
             dev.iface_name.clone(),
             ecm_rx_buf_len(dev.max_segment_size as u32),
             dev.hub_port,
+            dev.controller,
         )
     };
     let Some(c) = controller_of(idx) else {
@@ -820,7 +821,7 @@ async fn ecm_rx_pump(idx: usize) {
                     // Real traffic keeps the port's idle clock
                     // fresh (#1256); empty transfers never mark.
                     if let Some((hub_slot, port)) = hub_port {
-                        crate::attach::mark_port_activity(hub_slot, port);
+                        crate::attach::mark_port_activity(controller, hub_slot, port);
                     }
                 } else {
                     narf_scheduler::yield_now().await;
@@ -965,19 +966,21 @@ fn demand_resume(idx: usize) -> Result<bool, EcmError> {
             if d.detached {
                 None
             } else {
-                d.hub_port.filter(|_| d.suspended)
+                d.hub_port
+                    .filter(|_| d.suspended)
+                    .map(|hp| (hp, d.controller))
             }
         })
     };
-    let Some((hub_slot, port)) = resume_needed else {
+    let Some(((hub_slot, port), controller)) = resume_needed else {
         return Ok(true);
     };
-    let c = crate::xhci::controller().ok_or(EcmError::NoController)?;
+    let c = controller_of(idx).ok_or(EcmError::NoController)?;
     if narf_scheduler::block_on(resume_ecm_port(&c, hub_slot, port)) {
         // Waking for demand opens a fresh idle window, so a
         // burst does not flap the port straight back into
         // suspend.
-        crate::attach::mark_port_activity(hub_slot, port);
+        crate::attach::mark_port_activity(controller, hub_slot, port);
         Ok(true)
     } else {
         Ok(false)
@@ -1221,7 +1224,7 @@ async fn suspend_ecm_port(hub_slot: u8, port: u8) -> crate::class_registry::Susp
                 if d.suspended {
                     Some(None)
                 } else {
-                    Some(Some(d.slot_id))
+                    Some(Some((d.slot_id, d.controller)))
                 }
             } else {
                 None
@@ -1231,10 +1234,10 @@ async fn suspend_ecm_port(hub_slot: u8, port: u8) -> crate::class_registry::Susp
     let Some(target) = target else {
         return SuspendOutcome::NotMine;
     };
-    let Some(slot_id) = target else {
+    let Some((slot_id, controller)) = target else {
         return SuspendOutcome::Parked;
     };
-    let Some(c) = crate::xhci::controller() else {
+    let Some(c) = crate::xhci::controller_by_id(controller) else {
         return SuspendOutcome::ParkFailed;
     };
     let setup = crate::control::set_feature_device_remote_wakeup();
@@ -1276,7 +1279,7 @@ pub async fn resume_ecm_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port: u
         return false;
     };
     crate::attach::resume_port(xhci_dev, hub_slot, port).await;
-    if crate::attach::hub_port_is_suspended(hub_slot, port) {
+    if crate::attach::hub_port_is_suspended(xhci_dev.id(), hub_slot, port) {
         return false;
     }
     let mut g = CDC_ECM_DEVICES.lock();
