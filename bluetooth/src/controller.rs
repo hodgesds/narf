@@ -7,7 +7,7 @@
 
 use alloc::sync::Arc;
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use narf_capabilities::{Cap, CapError, Grant, NoopOp};
 
 use crate::event::CommandComplete;
@@ -91,6 +91,12 @@ pub struct Controller {
     transport: Arc<dyn HciTransport>,
     phase: AtomicU8,
     info: narf_lib::sync::IrqSafeSpinLock<ControllerInfo>,
+    /// Set by [`unregister_controller`] before anything else is torn
+    /// down. The registry slot stays in place (HCI ordinals are
+    /// index-stable — see `CONTROLLERS`) so a detached controller
+    /// never shifts a live controller's index; the flag is what
+    /// makes the slot dead. A later registration reuses the slot.
+    detached: AtomicBool,
 }
 
 impl Controller {
@@ -99,7 +105,17 @@ impl Controller {
             transport,
             phase: AtomicU8::new(BringupPhase::Reset as u8),
             info: narf_lib::sync::IrqSafeSpinLock::new(ControllerInfo::default()),
+            detached: AtomicBool::new(false),
         }
+    }
+
+    /// Whether [`unregister_controller`] has detached this controller.
+    /// A detached controller's pump is gone, its transport is
+    /// unregistered, and its sysfs node is removed; only the
+    /// registry slot (and this flag) survives, until a later
+    /// registration reuses the index.
+    pub fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
     }
 
     pub fn phase(&self) -> BringupPhase {
@@ -270,17 +286,58 @@ impl Controller {
 // ── Brought-up controller registry ──────────────────────────────────
 
 /// Controllers that have completed [`Controller::bring_up`].
+///
+/// Index-stable by position: the HCI ordinal is the slot position,
+/// and detaching a controller tombstones its slot (see
+/// [`Controller::is_detached`]) instead of removing it, so a
+/// detach never shifts a live controller's ordinal. A later
+/// registration reuses the first tombstoned slot, so the vector is
+/// bounded by the peak number of simultaneously-live controllers.
+/// [`controllers`] returns every slot including tombstoned ones;
+/// use [`get_live`] / [`live_indices`] when only live controllers
+/// may be observed.
 static CONTROLLERS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<Arc<Controller>>> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-/// Every controller brought up so far.
+/// Every controller brought up so far, by HCI ordinal — including
+/// detached (tombstoned) slots. Index-stable: `controllers()[i]`
+/// is always the controller for ordinal `i`, live or detached.
 pub fn controllers() -> alloc::vec::Vec<Arc<Controller>> {
     CONTROLLERS.lock().clone()
 }
 
-/// Number of controllers that reached [`BringupPhase::Ready`].
+/// The live controller at ordinal `index`, or `None` when the slot
+/// is out of range or its controller has been detached.
+pub fn get_live(index: usize) -> Option<Arc<Controller>> {
+    let controllers = CONTROLLERS.lock();
+    let controller = controllers.get(index)?;
+    if controller.is_detached() {
+        return None;
+    }
+    Some(controller.clone())
+}
+
+/// Whether ordinal `index` currently names a live controller.
+pub fn is_live(index: usize) -> bool {
+    get_live(index).is_some()
+}
+
+/// Ordinals of the live controllers, in order. This is what mgmt
+/// `READ_INDEX_LIST` reports: a detached ordinal disappears from
+/// the list instead of shifting the ordinals after it.
+pub fn live_indices() -> alloc::vec::Vec<usize> {
+    CONTROLLERS
+        .lock()
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_detached())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Number of live (not detached) controllers.
 pub fn controller_count() -> usize {
-    CONTROLLERS.lock().len()
+    CONTROLLERS.lock().iter().filter(|c| !c.is_detached()).count()
 }
 
 /// Adopt a transport whose driver already completed the mandatory HCI
@@ -293,12 +350,18 @@ pub fn controller_count() -> usize {
 /// performs the same command sequence on its native async transfer path and
 /// registers the resulting ready controller here.
 ///
-/// Idempotent by transport pointer identity. Returns the stable HCI ordinal.
+/// Idempotent by transport pointer identity among LIVE controllers.
+/// Returns the stable HCI ordinal. A detached slot is reused for a
+/// fresh registration (same ordinal, fresh controller) — a
+/// re-registration of a detached transport is a new bind, never a
+/// resurrection of the detached controller's state.
 pub fn register_ready_transport(transport: Arc<dyn HciTransport>, info: ControllerInfo) -> usize {
     let mut controllers = CONTROLLERS.lock();
     if let Some(index) = controllers
         .iter()
-        .position(|controller| Arc::ptr_eq(&controller.transport, &transport))
+        .position(|controller| {
+            !controller.is_detached() && Arc::ptr_eq(&controller.transport, &transport)
+        })
     {
         return index;
     }
@@ -308,8 +371,16 @@ pub fn register_ready_transport(transport: Arc<dyn HciTransport>, info: Controll
     controller
         .phase
         .store(BringupPhase::Ready as u8, Ordering::Release);
-    let index = controllers.len();
-    controllers.push(controller);
+    let index = match controllers.iter().position(|c| c.is_detached()) {
+        Some(slot) => {
+            controllers[slot] = controller;
+            slot
+        }
+        None => {
+            controllers.push(controller);
+            controllers.len() - 1
+        }
+    };
     drop(controllers);
     // Publish /sys/class/bluetooth/hci<index> (Linux hci_register_dev also
     // creates the sysfs device on registration).
@@ -365,8 +436,18 @@ pub fn bring_up_all(cap: &Cap<Bluetooth, Grant>) -> alloc::vec::Vec<BringupOutco
         if let Ok(info) = &result {
             let info = *info;
             let mut controllers = CONTROLLERS.lock();
-            let index = controllers.len();
-            controllers.push(controller);
+            // Reuse a tombstoned slot when one exists, so the
+            // vector stays bounded and the ordinal is stable.
+            let index = match controllers.iter().position(|c| c.is_detached()) {
+                Some(slot) => {
+                    controllers[slot] = controller;
+                    slot
+                }
+                None => {
+                    controllers.push(controller);
+                    controllers.len() - 1
+                }
+            };
             drop(controllers);
             // Mirror the controller into /sys/class/bluetooth/hci<index>.
             let _ = crate::sysfs_bridge::register_hci_controller(index, info, &[]);
@@ -379,6 +460,63 @@ pub fn bring_up_all(cap: &Cap<Bluetooth, Grant>) -> alloc::vec::Vec<BringupOutco
         });
     }
     out
+}
+
+/// Detach composition (issue #890): tear a controller down in full
+/// when its USB device is unbound.
+///
+/// Order is load-bearing and fail-closed:
+///
+/// 1. Tombstone the registry slot FIRST (the linearization point).
+///    From here on the controller is invisible to every live-only
+///    lookup (`get_live`, `is_live`, `live_indices`,
+///    `controller_count`, mgmt, hci_sock, the pump), so an event
+///    arriving mid-teardown — a Disconnection Complete, a
+///    re-registration of the same transport — cannot resurrect
+///    it: the pump core is dropped with its connection table, and
+///    a re-registration lands as a FRESH controller reusing the
+///    slot, never as the detached one's state coming back.
+/// 2. Stop + remove the pump: the task observes the missing slot
+///    (`stop_requested` is true when no slot exists) and exits at
+///    its next iteration boundary; a step already in flight
+///    finishes against the detached core and then drops it when
+///    the slot is gone, so the transport is quiescent afterwards.
+/// 3. Unregister the transport, so a later [`bring_up_all`] pass
+///    cannot re-bring-up the dead transport.
+/// 4. Remove the sysfs node, then forget the mgmt settings.
+/// 5. Publish mgmt `INDEX_REMOVED` LAST, so a userspace observer
+///    that sees the event already finds everything gone.
+///
+/// Idempotent: detaching an unknown or already-detached ordinal
+/// returns `false` and changes nothing. Returns `true` when this
+/// call performed the detach.
+///
+/// This removes the controller from the Bluetooth side only. The
+/// USB-side registry entry (`BTUSB_DEVICES`) is removed by the
+/// btusb detach hook, which calls this after dropping its entry.
+pub fn unregister_controller(index: usize) -> bool {
+    // 1. Tombstone first.
+    let transport = {
+        let controllers = CONTROLLERS.lock();
+        let Some(controller) = controllers.get(index) else {
+            return false;
+        };
+        if controller.detached.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        controller.transport.clone()
+    };
+    // 2. Pump teardown (quiesce + drop the core).
+    crate::pump::stop_pump(index);
+    let _ = crate::pump::remove_pump(index);
+    // 3. Transport unregistration.
+    let _ = crate::transport::unregister(&transport);
+    // 4. Sysfs node + mgmt settings.
+    let _ = crate::sysfs_bridge::unregister_hci_controller(index);
+    crate::mgmt::forget_settings(index as u16);
+    // 5. INDEX_REMOVED, last.
+    narf_filesystem::bluetooth::publish_mgmt_event(&crate::mgmt::index_removed(index as u16));
+    true
 }
 
 #[doc(hidden)]

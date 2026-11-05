@@ -103,9 +103,10 @@
 //!
 //! [`stop_pump`] asks the task to exit at its next iteration. It does
 //! not unregister the controller: full detach composition (registry
-//! removal, sysfs teardown, mgmt INDEX_REMOVED) is the detach work
-//! tracked separately; the pump is the piece that must stop first so
-//! the transport is quiescent when that lands.
+//! removal, sysfs teardown, mgmt INDEX_REMOVED) is
+//! [`crate::controller::unregister_controller`], which calls [`stop_pump`]
+//! and then [`remove_pump`] so the transport is quiescent before
+//! anything else is torn down.
 //!
 //! Spec: Bluetooth Core 5.3 Vol 3 Part A (L2CAP), Part F (ATT),
 //! Part G (GATT), Part H (SMP); Vol 4 Part E (HCI).
@@ -2283,7 +2284,7 @@ pub fn notify_controller_ready(index: usize) {
             start_task_if_enabled(index);
             return;
         }
-        let Some(controller) = crate::controller::controllers().get(index).cloned() else {
+        let Some(controller) = crate::controller::get_live(index) else {
             return;
         };
         pumps.push(PumpSlot {
@@ -2311,7 +2312,7 @@ fn find_slot_mut(pumps: &mut [PumpSlot], index: usize) -> Option<&mut PumpSlot> 
 /// and adopt every controller that is already ready.
 pub fn enable_spawning() {
     SPAWN_ENABLED.store(true, Ordering::Release);
-    for index in 0..crate::controller::controller_count() {
+    for index in crate::controller::live_indices() {
         notify_controller_ready(index);
     }
 }
@@ -2372,13 +2373,36 @@ fn pump_task(index: usize) {
 }
 
 /// Ask controller `index`'s pump task to stop at its next iteration.
-/// The controller stays registered; this is the quiesce step a future
-/// detach path performs before unregistering anything.
+/// The controller stays registered; this is the quiesce step the
+/// detach path (`controller::unregister_controller`) performs
+/// before unregistering anything.
 pub fn stop_pump(index: usize) {
     let mut pumps = PUMPS.lock();
     if let Some(slot) = find_slot_mut(&mut pumps, index) {
         slot.stop = true;
     }
+}
+
+/// Remove controller `index`'s pump slot outright, dropping its core
+/// (connection table, bonds, queued ACL) and its raw-socket fan-out
+/// queue. The driver task, if running, observes the missing slot —
+/// [`stop_requested`] is true when no slot exists — and exits at
+/// its next iteration boundary; a step already in flight finishes
+/// against the detached core and drops it when the slot is gone
+/// (see [`pump_once`]'s restore), so no step can run on after this
+/// returns. Returns `true` when a slot was removed.
+///
+/// Called by [`crate::controller::unregister_controller`] after
+/// [`stop_pump`]; the flag is set again here so a task that reads
+/// the slot between the two calls still sees the stop request.
+pub fn remove_pump(index: usize) -> bool {
+    let mut pumps = PUMPS.lock();
+    let Some(pos) = pumps.iter().position(|s| s.index == index) else {
+        return false;
+    };
+    pumps[pos].stop = true;
+    pumps.swap_remove(pos);
+    true
 }
 
 /// Whether a pump is actively draining controller `index`'s events.
@@ -3373,6 +3397,187 @@ mod tests {
     kernel_test_in!(
         "bluetooth/pump",
         smoke_pump_sysfs_connection_child_lifecycle
+    );
+
+    /// #890: detach composition — attach → bring-up → pump → USB
+    /// removal tears everything down: the pump slot is gone, the
+    /// controller is unregistered, the transport is unregistered,
+    /// the sysfs `hci<N>` node is gone, mgmt `INDEX_REMOVED` is
+    /// published, and `READ_INDEX_LIST` is empty. A Disconnection
+    /// Complete arriving during teardown must not resurrect the
+    /// controller, and re-registering the same transport afterwards
+    /// is a fresh controller reusing the ordinal — never the
+    /// detached state coming back.
+    fn smoke_pump_detach_teardown_publishes_index_removed() -> TestResult {
+        use narf_filesystem::sysfs::__reset_for_test as sysfs_reset;
+
+        // mgmt event opcodes (mgmt.h MGMT_EV_*); the constants are
+        // private to the mgmt module.
+        const EV_INDEX_ADDED: u16 = 0x0004;
+        const EV_INDEX_REMOVED: u16 = 0x0005;
+        const OP_READ_INDEX_LIST: u16 = 0x0003;
+        const MGMT_INDEX_NONE: u16 = 0xffff;
+
+        static CAPTURED: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+        fn capture_sink(event: &[u8]) {
+            CAPTURED.lock().push(event.to_vec());
+        }
+        fn is_mgmt_event(frame: &[u8], opcode: u16, index: u16) -> bool {
+            frame.len() >= 6
+                && u16::from_le_bytes([frame[0], frame[1]]) == opcode
+                && u16::from_le_bytes([frame[2], frame[3]]) == index
+        }
+
+        sysfs_reset();
+        reset_all();
+        CAPTURED.lock().clear();
+        let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
+        let fail = |msg: &'static str| -> TestResult {
+            if let Some(prev) = previous {
+                narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+            }
+            reset_all();
+            sysfs_reset();
+            TestResult::Fail(msg)
+        };
+
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport.clone());
+        script_successful_bringup(&fake);
+
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            return fail("bring-up against fake controller failed");
+        }
+        // Attach published the sysfs node and INDEX_ADDED.
+        if crate::sysfs_bridge::hci_kobject(0).is_none() {
+            return fail("no controller kobject published for hci0");
+        }
+        if !CAPTURED.lock().iter().any(|e| is_mgmt_event(e, EV_INDEX_ADDED, 0)) {
+            return fail("INDEX_ADDED was not published on registration");
+        }
+
+        // Pump a live LE connection, mirrored into sysfs.
+        let handle = 0x0040;
+        fake.enqueue_event(le_connection_complete(
+            handle,
+            [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5],
+        ));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            return fail("pump did not track the LE connection");
+        }
+        let hci_kobj = match crate::sysfs_bridge::hci_kobject(0) {
+            Some(k) => k,
+            None => return fail("controller kobject vanished before detach"),
+        };
+        if hci_kobj.get_child("hci0:64").is_none() {
+            return fail("hci0:64 child missing before detach");
+        }
+
+        // ── USB removal ──────────────────────────────────────────
+        CAPTURED.lock().clear();
+        if !crate::controller::unregister_controller(0) {
+            return fail("unregister_controller refused a live controller");
+        }
+        if crate::controller::controller_count() != 0 {
+            return fail("controller registry not empty after detach");
+        }
+        if crate::transport::transport_count() != 0 {
+            return fail("transport registry not empty after detach");
+        }
+        if crate::controller::is_live(0) {
+            return fail("detached controller still reports live");
+        }
+        if connection_count(0).is_some() || !pump_once(0).is_idle() {
+            return fail("pump slot survived detach");
+        }
+        if crate::sysfs_bridge::hci_kobject(0).is_some() {
+            return fail("sysfs hci0 node survived detach");
+        }
+        // INDEX_REMOVED exactly once, and no INDEX_ADDED after the
+        // removal point.
+        let removed = CAPTURED
+            .lock()
+            .iter()
+            .filter(|e| is_mgmt_event(e, EV_INDEX_REMOVED, 0))
+            .count();
+        if removed != 1 {
+            return fail("INDEX_REMOVED was not published exactly once");
+        }
+        if CAPTURED.lock().iter().any(|e| is_mgmt_event(e, EV_INDEX_ADDED, 0)) {
+            return fail("INDEX_ADDED published after detach");
+        }
+        // READ_INDEX_LIST is empty now.
+        let list = crate::mgmt::handle(&[
+            (OP_READ_INDEX_LIST & 0xFF) as u8,
+            (OP_READ_INDEX_LIST >> 8) as u8,
+            (MGMT_INDEX_NONE & 0xFF) as u8,
+            (MGMT_INDEX_NONE >> 8) as u8,
+            0,
+            0,
+        ]);
+        let count = list
+            .first()
+            .filter(|r| r.len() >= 11)
+            .map(|r| u16::from_le_bytes([r[9], r[10]]));
+        if count != Some(0) {
+            return fail("READ_INDEX_LIST not empty after detach");
+        }
+        // Detaching again is an idempotent no-op.
+        if crate::controller::unregister_controller(0) {
+            return fail("second detach reported success");
+        }
+
+        // ── Race: disconnect arriving during teardown ───────────
+        // The event sits in the dead transport's queue; nothing
+        // drains it into a resurrected controller.
+        fake.enqueue_event(Event {
+            code: EventCode::DisconnectionComplete as u8,
+            params: alloc::vec![0x00, 0x40, 0x00, 0x13],
+        });
+        if !pump_once(0).is_idle() {
+            return fail("pump step ran on a detached controller");
+        }
+        if crate::controller::controller_count() != 0
+            || crate::transport::transport_count() != 0
+            || crate::sysfs_bridge::hci_kobject(0).is_some()
+        {
+            return fail("late disconnect resurrected detached state");
+        }
+        if CAPTURED.lock().iter().any(|e| is_mgmt_event(e, EV_INDEX_ADDED, 0)) {
+            return fail("late disconnect published INDEX_ADDED");
+        }
+
+        // ── Replug: same transport, fresh controller ─────────────
+        // The detached slot is reused (ordinal 0 again) with fresh
+        // state: no connections, no stale pump core.
+        let index = crate::controller::register_ready_transport(
+            transport,
+            crate::controller::ControllerInfo::default(),
+        );
+        if index != 0 || crate::controller::controller_count() != 1 {
+            return fail("re-registration did not reuse the detached slot");
+        }
+        if !crate::controller::is_live(0) || connection_count(0) != Some(0) {
+            return fail("re-registered controller is not fresh and live");
+        }
+        if crate::sysfs_bridge::hci_kobject(0).is_none() {
+            return fail("re-registered controller published no sysfs node");
+        }
+
+        if let Some(prev) = previous {
+            narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+        }
+        reset_all();
+        sysfs_reset();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_detach_teardown_publishes_index_removed
     );
 
     /// Init failure: the controller NAKs HCI_Reset (status 0x0C,

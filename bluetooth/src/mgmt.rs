@@ -155,7 +155,7 @@ fn read_info_rp(info: &controller::ControllerInfo, current: u32) -> Vec<u8> {
 /// current-settings bitmap. `max_val` is 1 for on/off modes, 2 for the
 /// limited-discoverable case.
 fn set_mode(index: u16, opcode: u16, params: &[u8], bit: u32, max_val: u8) -> Vec<u8> {
-    if (index as usize) >= controller::controller_count() {
+    if !controller::is_live(index as usize) {
         return cmd_status(index, opcode, STATUS_INVALID_INDEX);
     }
     if params.is_empty() || params[0] > max_val {
@@ -240,17 +240,18 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
             if index != MGMT_INDEX_NONE {
                 return alloc::vec![cmd_status(index, opcode, STATUS_INVALID_INDEX)];
             }
-            let count = controller::controller_count();
-            let mut data = Vec::with_capacity(2 + 2 * count);
-            data.extend_from_slice(&(count as u16).to_le_bytes());
-            for i in 0..count {
+            // Live ordinals only: a detached controller disappears
+            // from the list instead of shifting later ordinals.
+            let live = controller::live_indices();
+            let mut data = Vec::with_capacity(2 + 2 * live.len());
+            data.extend_from_slice(&(live.len() as u16).to_le_bytes());
+            for i in live {
                 data.extend_from_slice(&(i as u16).to_le_bytes());
             }
             alloc::vec![cmd_complete(index, opcode, STATUS_SUCCESS, &data)]
         }
         OP_READ_INFO => {
-            let controllers = controller::controllers();
-            match controllers.get(index as usize) {
+            match controller::get_live(index as usize) {
                 Some(c) => {
                     let data = read_info_rp(&c.info(), current_settings(index));
                     alloc::vec![cmd_complete(index, opcode, STATUS_SUCCESS, &data)]
@@ -292,6 +293,14 @@ pub fn is_powered(index: u16) -> bool {
 /// ioctls map onto the same state as mgmt SET_POWERED).
 pub fn set_powered(index: u16, on: bool) {
     set_setting_bit(index, SETTING_POWERED, on);
+}
+
+/// Forget controller `index`'s settings on detach, so a later
+/// controller reusing the ordinal starts from the defaults instead
+/// of inheriting the detached controller's POWERED / discoverable
+/// state. Called by [`controller::unregister_controller`].
+pub fn forget_settings(index: u16) {
+    SETTINGS.lock().remove(&index);
 }
 
 /// `MGMT_EV_INDEX_ADDED` for a newly-registered controller (no parameters).

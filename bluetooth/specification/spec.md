@@ -181,6 +181,25 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   whose late-discovered driver completed that same sequence on a native async
   transport path. Registration is idempotent by transport identity and returns
   the stable `hci<N>` ordinal.
+- Detach composition (issue #890): `controller::unregister_controller(index)`
+  tears a controller down in full — tombstone the registry slot first
+  (the linearization point: from there the controller is invisible to
+  every live-only lookup, so an event arriving mid-teardown cannot
+  resurrect it), stop + remove the pump (`pump::stop_pump` /
+  `pump::remove_pump`, dropping the core with its connection table),
+  unregister the transport (`transport::unregister`, by pointer
+  identity, so a later `bring_up_all` cannot re-bring-up the dead
+  transport), remove the sysfs node
+  (`sysfs_bridge::unregister_hci_controller`), forget the mgmt
+  settings (`mgmt::forget_settings`), and publish mgmt
+  `INDEX_REMOVED` last. Idempotent: a second detach returns `false`.
+  Ordinals are index-stable — detaching never shifts a live
+  controller's ordinal; a later registration reuses the first
+  tombstoned slot. `controller::controller_count()` counts live
+  controllers only; `controller::is_live` / `get_live` /
+  `live_indices` are the live-only views mgmt (`READ_INDEX_LIST`
+  lists live ordinals), hci_sock, and the pump use, so a detached
+  ordinal disappears instead of shifting later ones.
 - `sysfs_bridge::register_hci_controller(index, info, connections)` publishes
   a ready controller under `/sys/class/bluetooth/hci<N>` and records its
   kobject for the pump's connection mirroring. `sysfs_bridge::add_connection`
@@ -206,7 +225,9 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   AES-CMAC / hardware RNG), signalling channels answered per §L2CAP.
   Connection tracking also mirrors into sysfs: connect gains the
   `hci<N>:<handle>` child, disconnect removes it (issue #891).
-  `pump::stop_pump(index)` quiesces a controller's task ahead of detach.
+  `pump::stop_pump(index)` quiesces a controller's task ahead of detach;
+  `pump::remove_pump(index)` drops the pump slot outright (the detach
+  half — see the detach-composition bullet above).
   GAP central initiation (issue #1312): `pump::central_start_scan(index,
   params)` issues LE Set Scan Parameters (§7.8.10) with LE Set Scan
   Enable(1) (§7.8.11) following on the parameters' Command Complete;
