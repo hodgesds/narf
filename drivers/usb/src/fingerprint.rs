@@ -1758,9 +1758,13 @@ mod tests {
 
     // ── FpFileNode pure surface ───────────────────────────────
     // stat/ino need no controller; read/write without a bound
-    // controller must fail closed (Io), never panic. Transfer
-    // conversations themselves need a transport seam (PR #1238's
-    // FpTransport) and are NOT simulated here — see the PR body.
+    // controller must fail closed (Io), never panic. The node is
+    // built over the production transport for its controller id
+    // (PR #1238's FpTransport seam): controller 0 is unbound in a
+    // host test, so the read/write paths fail at controller
+    // lookup before any transfer is attempted. The control-
+    // transfer surface itself is covered by the smoke in
+    // tests.rs, which drives it through its own fake transport.
 
     fn make_test_device(slot_id: u8) -> Arc<FingerprintDevice> {
         Arc::new(FingerprintDevice {
@@ -1776,9 +1780,10 @@ mod tests {
 
     #[test]
     fn fp_node_stat_and_ino() {
-        use narf_filesystem::{FileType, Mode};
+        use narf_filesystem::{FileOps, FileType, Mode};
         let node = FpFileNode {
             dev: make_test_device(0),
+            transport: Arc::new(XhciFpTransport(0)),
         };
         let stat = node.stat();
         assert_eq!(
@@ -1791,6 +1796,7 @@ mod tests {
         assert_eq!(node.ino(), 0xf9_0001);
         let node1 = FpFileNode {
             dev: make_test_device(1),
+            transport: Arc::new(XhciFpTransport(0)),
         };
         assert_eq!(node1.ino(), 0xf9_0002);
     }
@@ -1804,10 +1810,12 @@ mod tests {
     #[test]
     fn fp_node_io_without_controller_fails_closed() {
         use core::task::{Context, Poll, Waker};
+        use narf_filesystem::FileOps;
         // No host test binds a controller, so the global
         // controller() is None and both directions fail with Io.
         let node = FpFileNode {
             dev: make_test_device(0),
+            transport: Arc::new(XhciFpTransport(0)),
         };
         let waker = Waker::from(Arc::new(NoopWaker));
         let mut cx = Context::from_waker(&waker);
