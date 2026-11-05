@@ -302,10 +302,60 @@ impl<T, R: Rights> Cap<T, R> {
         self.check_live().is_ok()
     }
 
-    /// Invoke an operation. Wave 2 does the epoch gate; each `CapOp`
-    /// supplies its own `execute` body.
-    pub fn invoke<O: CapOp<T, R>>(&self, op: O) -> Result<O::Output, CapError> {
-        self.check_live()?;
+    /// Invoke an operation. SEC-B2 (#1282): the epoch gate alone is
+    /// not enough — a hand-forged slot (reachable via unsafe
+    /// `Cap::mint`, the only way to build a `Cap` outside the
+    /// mint/derive/transfer paths) could name a live object of the
+    /// wrong kind or claim rights it was never granted, and the old
+    /// epoch-only check would have run `execute` anyway. Checks, in
+    /// order:
+    /// 1. Epoch: the object's current epoch equals the slot's
+    ///    generation snapshot, else `Revoked` (checked first, so a
+    ///    revoked cap reports `Revoked` regardless of its other
+    ///    fields — the pre-#1282 observable behaviour).
+    /// 2. Object kind: `object_table`'s recorded kind for the slot's
+    ///    index equals `T::KIND`, else `TypeMismatch`. This is the
+    ///    cross-check a slot-local `type_tag` compare cannot do: it
+    ///    catches a slot whose `type_tag` says `T` but whose index
+    ///    aliases a different-kind object.
+    /// 3. Slot type tag: `slot.type_tag == T::KIND`, else
+    ///    `TypeMismatch`.
+    /// 4. Slot rights: `slot.rights` covers `R::BITS`, else
+    ///    `RightsTooWeak`.
+    ///
+    /// Steps 1–2 run as a single object-table read
+    /// (`epoch_and_kind`): exactly one table lock acquisition per
+    /// `invoke`, the same as the old epoch-only path — the kind
+    /// lookup adds no lock, per the #1282 perf bar (a second
+    /// acquisition would have failed it). Steps 3–4 are same-slot
+    /// integer compares, no lock, no table touch.
+    ///
+    /// What this does NOT check: the caller's domain (spec §8
+    /// step 5). Neither the cap nor the object-table entry records
+    /// a domain, and no per-op required-domain table exists yet
+    /// (the #1363 wiring's stated remainder) — so there is nothing
+    /// authoritative for `invoke` to compare against. That check
+    /// belongs at dispatch, where the calling task's domain is
+    /// known; tracked as a follow-up issue (see spec §9.9).
+    /// `DomainMismatch` therefore remains unproduced by this path.
+    pub fn invoke<O: CapOp<T, R>>(&self, op: O) -> Result<O::Output, CapError>
+    where
+        T: CapType,
+    {
+        let (epoch, kind) =
+            object_table::epoch_and_kind(self.slot.index).ok_or(CapError::Revoked)?;
+        if epoch != self.slot.generation {
+            return Err(CapError::Revoked);
+        }
+        if kind != T::KIND {
+            return Err(CapError::TypeMismatch);
+        }
+        if self.slot.type_tag != T::KIND as u32 {
+            return Err(CapError::TypeMismatch);
+        }
+        if self.slot.rights & R::BITS != R::BITS {
+            return Err(CapError::RightsTooWeak);
+        }
         op.execute(self)
     }
 
@@ -477,6 +527,21 @@ pub mod object_table {
         let t = TABLE.lock();
         t.get(index as usize)
             .map(|e| e.epoch.load(Ordering::Acquire))
+    }
+
+    /// One locked read of an entry's epoch AND kind (SEC-B2,
+    /// #1282). `Cap::invoke` needs both facts for the same index,
+    /// and taking them under one lock hold keeps `invoke` at exactly
+    /// one object-table lock acquisition — the same as the old
+    /// epoch-only path. Two separate calls (`current_epoch` then
+    /// `kind_at`) would have added a second acquisition, which the
+    /// #1282 perf bar fails outright. `None` iff `index` names no
+    /// entry; the caller maps a stale epoch to `Revoked` and a
+    /// wrong kind to `TypeMismatch`.
+    pub fn epoch_and_kind(index: u32) -> Option<(u32, CapKind)> {
+        let t = TABLE.lock();
+        t.get(index as usize)
+            .map(|e| (e.epoch.load(Ordering::Acquire), e.kind))
     }
 
     pub fn bump_epoch(index: u32) -> Option<u32> {
