@@ -21,6 +21,8 @@ extern crate alloc;
 
 // Per-driver module re-exports. Each is an optional dependency selected by a
 // same-named feature; `default` enables them all.
+#[cfg(feature = "aqc1xx")]
+pub use narf_drivers_net_aqc1xx::aqc113;
 #[cfg(feature = "atheros")]
 pub use narf_drivers_net_atheros::atheros;
 #[cfg(feature = "bnxt")]
@@ -61,6 +63,7 @@ pub use narf_drivers_net_core::*;
 // present — gate on all driver features. `default` enables them all, so
 // standard builds compile the full suite.
 #[cfg(all(
+    feature = "aqc1xx",
     feature = "atheros",
     feature = "bnxt",
     feature = "cxgb4",
@@ -134,6 +137,7 @@ pub fn register_late_firmware_initcalls() {
 /// four of its drivers from one entry.
 pub fn register_initcalls() {
     #[cfg(any(
+        feature = "aqc1xx",
         feature = "atheros",
         feature = "bnxt",
         feature = "cxgb4",
@@ -154,6 +158,11 @@ pub fn register_initcalls() {
     #[cfg(feature = "cxgb4")]
     narf_init::register(Stage::Subsys, "cxgb4", || {
         narf_drivers_net_cxgb4::register();
+        InitResult::Ok
+    });
+    #[cfg(feature = "aqc1xx")]
+    narf_init::register(Stage::Subsys, "aqc1xx", || {
+        narf_drivers_net_aqc1xx::register();
         InitResult::Ok
     });
     #[cfg(all(feature = "e1000", not(feature = "e1000-module-only")))]

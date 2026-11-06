@@ -1,0 +1,54 @@
+# aqc1xx — Aquantia/Marvell AQC1xx (Atlantic) NIC family, dual-build.
+#
+# AQC113 first (hw_atl2 generation): the common modern 2.5–10 GbE chip
+# in laptops, mini-PCs and docks. The older AQC100/107/108/109/111/112
+# (hw_atl B1) and D-series (hw_atl A0/B0) generations use a different
+# register backend and are a remainder (see the driver docs).
+# See narf-drivers-net-e1000 for the reference shape.
+
+[package]
+name         = "narf-drivers-net-aqc1xx"
+description  = "Aquantia/Marvell AQC113 (Atlantic) NIC family — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_net_aqc1xx"
+path = "src/lib.rs"
+
+[features]
+default = ["builtin"]
+builtin = [
+    "dep:narf-drivers-net-core", "dep:narf-arch", "dep:narf-bus",
+    "dep:narf-capabilities", "dep:narf-console", "dep:narf-driver-runtime",
+    "dep:narf-drivers", "dep:narf-firmware", "dep:narf-interrupts",
+    "dep:narf-io", "dep:narf-ipc", "dep:narf-kernel-test", "dep:narf-lib",
+    "dep:narf-memory", "dep:narf-net", "dep:narf-scheduler", "dep:narf-time",
+]
+module = []
+
+[dependencies]
+narf-driver-macros = { path = "../../../driver-macros" }
+narf-drivers-net-core = { path = "../core", optional = true }
+narf-arch         = { path = "../../../arch", optional = true }
+narf-bus          = { path = "../../../bus", optional = true }
+narf-capabilities = { path = "../../../capabilities", optional = true }
+narf-console      = { path = "../../../console", optional = true }
+narf-driver-runtime = { path = "../../runtime", optional = true, default-features = false, features = ["kernel"] }
+narf-drivers      = { path = "../..", optional = true }
+narf-firmware     = { path = "../../../firmware", optional = true }
+narf-interrupts   = { path = "../../../interrupts", optional = true }
+narf-io           = { path = "../../../io", optional = true }
+narf-ipc          = { path = "../../../ipc", optional = true }
+narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+narf-memory       = { path = "../../../memory", optional = true }
+narf-net          = { path = "../../../net", optional = true }
+narf-scheduler    = { path = "../../../scheduler", optional = true }
+narf-time         = { path = "../../../time", optional = true }
+
+[lints]
+workspace = true

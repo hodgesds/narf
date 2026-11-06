@@ -27,6 +27,7 @@ narf-aml          = { path = "../../aml" }
 narf-drivers      = { path = "../" }
 narf-drivers-net-core = { path = "core" }
 # Per-driver crates — each an optional dependency behind a same-named feature.
+narf-drivers-net-aqc1xx    = { path = "aqc1xx", optional = true }
 narf-drivers-net-atheros   = { path = "atheros", optional = true }
 narf-drivers-net-bnxt      = { path = "bnxt", optional = true }
 narf-drivers-net-cxgb4     = { path = "cxgb4", optional = true }
@@ -55,6 +56,7 @@ narf-time        = { path = "../../time" }
 # (e.g. `--no-default-features --features e1000,igc`) to build a leaner kernel,
 # or add an out-of-tree driver crate the same way.
 default = [
+    "aqc1xx",
     "atheros",
     "bnxt",
     "cxgb4",
@@ -71,6 +73,7 @@ default = [
     "tg3",
     "vmxnet3",
 ]
+aqc1xx = ["dep:narf-drivers-net-aqc1xx"]
 atheros = ["dep:narf-drivers-net-atheros"]
 bnxt = ["dep:narf-drivers-net-bnxt"]
 cxgb4 = ["dep:narf-drivers-net-cxgb4"]

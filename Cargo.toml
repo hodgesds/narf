@@ -63,6 +63,7 @@ members = [
     "drivers/nvme",
     "drivers/net",
     "drivers/net/core",
+    "drivers/net/aqc1xx",
     "drivers/net/atheros",
     "drivers/net/bnxt",
     "drivers/net/cxgb4",
