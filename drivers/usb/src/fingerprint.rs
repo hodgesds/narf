@@ -1416,7 +1416,6 @@ pub async fn try_bridge_wbdi_already_addressed(
     let mut dev = device_from_endpoints(slot_id, FpVendor::Wbdi, &eps);
     dev.controller = transport.controller_id();
     let dev = Arc::new(dev);
-    let dev = Arc::new(dev);
     {
         use core::fmt::Write as _;
         let _ = writeln!(
