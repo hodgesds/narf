@@ -1480,7 +1480,7 @@ mod tests {
             Ok(pcm) => pcm,
             Err(_) => return TestResult::Fail("RT711 playback open failed"),
         };
-        if card.open(false, 1) != Err(SoundError::NoSuchDevice) {
+        if !matches!(card.open(false, 1), Err(SoundError::NoSuchDevice)) {
             return TestResult::Fail("RT711 playback device 1 must not exist");
         }
         let mut capture0 = match card.open(true, 0) {
@@ -1491,7 +1491,7 @@ mod tests {
             Ok(pcm) => pcm,
             Err(_) => return TestResult::Fail("RT711 capture 1 open failed"),
         };
-        if card.open(true, 2) != Err(SoundError::NoSuchDevice) {
+        if !matches!(card.open(true, 2), Err(SoundError::NoSuchDevice)) {
             return TestResult::Fail("RT711 capture device 2 must not exist");
         }
         for pcm in [&mut playback, &mut capture0, &mut capture1] {
@@ -1532,7 +1532,7 @@ mod tests {
             Ok(pcm) => pcm,
             Err(_) => return TestResult::Fail("RT1316 capture open failed"),
         };
-        if card.open(true, 1) != Err(SoundError::NoSuchDevice) {
+        if !matches!(card.open(true, 1), Err(SoundError::NoSuchDevice)) {
             return TestResult::Fail("RT1316 capture device 1 must not exist");
         }
         for pcm in [&mut playback, &mut capture] {
