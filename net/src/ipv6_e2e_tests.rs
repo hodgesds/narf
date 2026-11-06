@@ -1292,10 +1292,14 @@ kernel_test_in!(
 // comes from RFC 4443 / RFC 4861 / RFC 8200, never from the code
 // under test.
 
-/// Decode a captured Ethernet frame into (eth dst, eth src, IPv6
-/// header, L4 body). Returns `None` when the frame is not a
-/// well-formed Ethernet + IPv6 frame.
-fn decode_v6_frame(frame: &[u8]) -> Option<([u8; 6], [u8; 6], Ipv6Header, Vec<u8>)> {
+/// A decoded captured Ethernet + IPv6 frame: (ethernet destination MAC,
+/// ethernet source MAC, IPv6 header, L4 body bytes).
+type DecodedV6Frame = ([u8; 6], [u8; 6], Ipv6Header, Vec<u8>);
+
+/// Decode a captured Ethernet frame into a [`DecodedV6Frame`].
+/// Returns `None` when the frame is not a well-formed Ethernet + IPv6
+/// frame.
+fn decode_v6_frame(frame: &[u8]) -> Option<DecodedV6Frame> {
     if frame.len() < ETH_HDR_LEN + IPV6_HDR_LEN + 4 {
         return None;
     }
