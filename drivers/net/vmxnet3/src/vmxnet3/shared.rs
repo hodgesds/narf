@@ -486,6 +486,11 @@ impl Vmxnet3RxCompDesc {
         u32::from_le(self.dword2) & RCD_LEN_MASK
     }
 
+    /// `true` when the received length is zero.
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
     /// Error flag (`vmxnet3_defs.h`: `err:1` at dword2 bit 14).
     /// An EOP completion with `err` set is dropped by
     /// `vmxnet3_drv.c::vmxnet3_rq_rx_complete` (`vmxnet3_rx_error`).
