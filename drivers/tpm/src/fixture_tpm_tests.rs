@@ -19,14 +19,20 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use crate::devfs_bridge::TpmTransport;
 use crate::fixture_tpm::{sha256, started_fixture, FixtureTpm};
 use crate::tpm2::commands as cmds;
-use crate::tpm2::nv::{NvIndex, NARF_SUSPEND_EPOCH_NV, NV_ATTR_PLATFORM_RW};
+use crate::tpm2::nv::{
+    NvIndex, NARF_SUSPEND_EPOCH_NV, NV_ATTR_AUTH_RW, NV_ATTR_GLOBALLOCK, NV_ATTR_PLATFORM_RW,
+    NV_ATTR_READ_STCLEAR, NV_ATTR_TYPE_BITS, NV_ATTR_TYPE_EXTEND, NV_ATTR_WRITEDEFINE,
+    NV_ATTR_WRITE_STCLEAR, NV_ATTR_WRITTEN,
+};
 use crate::tpm2::{
-    TPM_ALG_SHA256, TPM_CAP_TPM_PROPERTIES, TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
-    TPM_CC_DICTIONARY_ATTACK_PARAMETERS, TPM_CC_NV_INCREMENT, TPM_CC_POLICY_GET_DIGEST,
-    TPM_PT_LOCKOUT_COUNTER, TPM_RC_AUTH_FAIL, TPM_RC_BAD_AUTH, TPM_RC_FAILURE, TPM_RC_HANDLE,
-    TPM_RC_LOCKOUT, TPM_RC_NV_DEFINED, TPM_RC_NV_UNINITIALIZED, TPM_RC_POLICY_FAIL, TPM_RC_SUCCESS,
-    TPM_RH_NULL, TPM_RH_PLATFORM, TPM_RS_PW, TPM_SE_POLICY, TPM_SE_TRIAL, TPM_SU_CLEAR,
-    TPM_SU_STATE,
+    TPM_ALG_ECDSA, TPM_ALG_SHA256, TPM_CAP_TPM_PROPERTIES, TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
+    TPM_CC_DICTIONARY_ATTACK_PARAMETERS, TPM_CC_NV_INCREMENT, TPM_CC_POLICY_AUTHORIZE,
+    TPM_CC_POLICY_GET_DIGEST, TPM_GENERATED_VALUE, TPM_PT_LOCKOUT_COUNTER, TPM_RC_ATTRIBUTES,
+    TPM_RC_AUTH_FAIL, TPM_RC_BAD_AUTH, TPM_RC_FAILURE, TPM_RC_HANDLE, TPM_RC_LOCKOUT,
+    TPM_RC_NV_DEFINED, TPM_RC_NV_LOCKED, TPM_RC_NV_UNINITIALIZED, TPM_RC_POLICY,
+    TPM_RC_POLICY_FAIL, TPM_RC_SIZE, TPM_RC_SUCCESS, TPM_RC_TAG, TPM_RC_VALUE, TPM_RH_NULL,
+    TPM_RH_OWNER, TPM_RH_PLATFORM, TPM_RS_PW, TPM_SE_POLICY, TPM_SE_TRIAL, TPM_ST_ATTEST_QUOTE,
+    TPM_SU_CLEAR, TPM_SU_STATE,
 };
 
 const POLICY_MASK: [u8; 3] = [0xFF, 0x06, 0x00];
@@ -720,3 +726,628 @@ kernel_test_in!(
     "drivers/tpm/fixture",
     smoke_fixture_clear_flushes_owner_world
 );
+
+// ── #941 remainder conversations ──────────────────────────────────
+
+fn smoke_fixture_quote_round_trip() -> TestResult {
+    let t = started_fixture();
+    let event = [0x5A; 64];
+    // PCR 0 starts at zero; one event makes its value
+    // independently computable: H(0^32 ‖ H(event)).
+    if ok_submit(&t, &cmds::pcr_event(0, &event)).is_err() {
+        return TestResult::Fail("PCR_Event failed");
+    }
+    let mut input = Vec::new();
+    input.extend_from_slice(&[0u8; 32]);
+    input.extend_from_slice(&sha256(&event));
+    let expected_digest = sha256(&sha256(&input));
+    let qualifying = [0xC0, 0xFF, 0xEE, 0x01];
+    let primary = match primary(&t) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("create_primary failed"),
+    };
+    for sign_handle in [primary, TPM_RH_NULL] {
+        let resp = match ok_submit(
+            &t,
+            &cmds::quote(
+                sign_handle,
+                &qualifying,
+                (TPM_ALG_ECDSA, TPM_ALG_SHA256),
+                &[(TPM_ALG_SHA256, &[0x01, 0x00, 0x00])],
+            ),
+        ) {
+            Ok(r) => r,
+            Err(_) => return TestResult::Fail("Quote failed"),
+        };
+        let quoted = match cmds::parse_quote_response(&resp) {
+            Ok(q) => q,
+            Err(_) => return TestResult::Fail("Quote response did not parse"),
+        };
+        if quoted.info.magic != TPM_GENERATED_VALUE {
+            return TestResult::Fail("attest magic != TPM_GENERATED_VALUE");
+        }
+        if quoted.info.attest_type != TPM_ST_ATTEST_QUOTE {
+            return TestResult::Fail("attest type != QUOTE");
+        }
+        if quoted.info.extra_data != qualifying.to_vec() {
+            return TestResult::Fail("extraData != qualifying data");
+        }
+        if !quoted.info.clock_info.safe {
+            return TestResult::Fail("clock safe != true");
+        }
+        let qi = match &quoted.info.quote {
+            Some(q) => q,
+            None => return TestResult::Fail("no quote union in attestation"),
+        };
+        if qi.pcr_digest != expected_digest.to_vec() {
+            return TestResult::Fail("pcrDigest != recomputed composite");
+        }
+        if qi.pcr_select != alloc::vec![(TPM_ALG_SHA256, alloc::vec![0x01, 0x00, 0x00])] {
+            return TestResult::Fail("pcrSelect echo wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/tpm/fixture", smoke_fixture_quote_round_trip);
+
+fn smoke_fixture_pcr_event() -> TestResult {
+    let t = started_fixture();
+    let event = [0xAB; 16];
+    let resp = match ok_submit(&t, &cmds::pcr_event(0, &event)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("PCR_Event failed"),
+    };
+    let digests = match cmds::parse_pcr_event_response(&resp) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("PCR_Event response did not parse"),
+    };
+    if digests != alloc::vec![(TPM_ALG_SHA256, sha256(&event).to_vec())] {
+        return TestResult::Fail("PCR_Event digests != H(event)");
+    }
+    // PCR 0 is now H(0^32 ‖ H(event)) — read back through the
+    // production PCR_Read path.
+    let mut input = Vec::new();
+    input.extend_from_slice(&[0u8; 32]);
+    input.extend_from_slice(&sha256(&event));
+    let expected = sha256(&input);
+    let resp = match ok_submit(&t, &cmds::pcr_read(TPM_ALG_SHA256, &[0x01, 0x00, 0x00])) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("PCR_Read failed"),
+    };
+    let read = match cmds::parse_pcr_read_response(&resp) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("PCR_Read response did not parse"),
+    };
+    if read.digests.len() != 1 || read.digests[0] != expected.to_vec() {
+        return TestResult::Fail("PCR 0 != H(old ‖ H(event)) after PCR_Event");
+    }
+    // TPM_RH_NULL hashes without extending.
+    let resp = match ok_submit(&t, &cmds::pcr_event(TPM_RH_NULL, &event)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("PCR_Event on TPM_RH_NULL failed"),
+    };
+    let digests = match cmds::parse_pcr_event_response(&resp) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("RH_NULL PCR_Event response did not parse"),
+    };
+    if digests != alloc::vec![(TPM_ALG_SHA256, sha256(&event).to_vec())] {
+        return TestResult::Fail("RH_NULL PCR_Event digests wrong");
+    }
+    let resp = match ok_submit(&t, &cmds::pcr_read(TPM_ALG_SHA256, &[0x01, 0x00, 0x00])) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("PCR_Read failed"),
+    };
+    let read = match cmds::parse_pcr_read_response(&resp) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("PCR_Read response did not parse"),
+    };
+    if read.digests.len() != 1 || read.digests[0] != expected.to_vec() {
+        return TestResult::Fail("TPM_RH_NULL event extended a PCR");
+    }
+    // An event over 1024 bytes is refused.
+    let resp = t
+        .submit(&cmds::pcr_event(0, &[0u8; 1025]))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_SIZE {
+        return TestResult::Fail("1025-byte event was not TPM_RC_SIZE");
+    }
+    // There is no PCR 24.
+    let resp = t.submit(&cmds::pcr_event(24, &event)).unwrap_or_default();
+    if rc(&resp) != TPM_RC_HANDLE {
+        return TestResult::Fail("PCR_Event on PCR 24 was not TPM_RC_HANDLE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/tpm/fixture", smoke_fixture_pcr_event);
+
+fn smoke_fixture_pcr_allocate() -> TestResult {
+    let t = started_fixture();
+    // All 24 SHA-256 PCRs: 768 octets needed of 768 available.
+    let resp = match ok_submit(
+        &t,
+        &cmds::pcr_allocate(&[(TPM_ALG_SHA256, &[0xFF, 0xFF, 0xFF])]),
+    ) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("PCR_Allocate failed"),
+    };
+    let out = match cmds::parse_pcr_allocate_response(&resp) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("PCR_Allocate response did not parse"),
+    };
+    if !out.allocation_success
+        || out.max_pcr != 24
+        || out.size_needed != 768
+        || out.size_available != 768
+    {
+        return TestResult::Fail("full-bank allocation outputs wrong");
+    }
+    // A SHA-1 selection cannot be satisfied by the SHA-256 bank.
+    let resp = match ok_submit(&t, &cmds::pcr_allocate(&[(0x0004, &[0xFF, 0x00, 0x00])])) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("PCR_Allocate (SHA-1) failed"),
+    };
+    let out = match cmds::parse_pcr_allocate_response(&resp) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("PCR_Allocate (SHA-1) response did not parse"),
+    };
+    if out.allocation_success {
+        return TestResult::Fail("SHA-1 allocation reported success");
+    }
+    // PCR 24 does not exist: one PCR, 32 octets, not satisfiable.
+    let resp = match ok_submit(
+        &t,
+        &cmds::pcr_allocate(&[(TPM_ALG_SHA256, &[0x00, 0x00, 0x00, 0x01])]),
+    ) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("PCR_Allocate (PCR 24) failed"),
+    };
+    let out = match cmds::parse_pcr_allocate_response(&resp) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("PCR_Allocate (PCR 24) response did not parse"),
+    };
+    if out.allocation_success || out.size_needed != 32 {
+        return TestResult::Fail("PCR 24 allocation outputs wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/tpm/fixture", smoke_fixture_pcr_allocate);
+
+fn smoke_fixture_policy_authorize_trial() -> TestResult {
+    let t = started_fixture();
+    let resp = match ok_submit(
+        &t,
+        &cmds::start_auth_session(
+            TPM_RH_NULL,
+            TPM_RH_NULL,
+            &[7u8; 32],
+            &[],
+            TPM_SE_TRIAL,
+            TPM_ALG_SHA256,
+        ),
+    ) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("trial session failed"),
+    };
+    let (session, _) = match cmds::parse_start_auth_session_response(&resp) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("session parse failed"),
+    };
+    let resp = match ok_submit(&t, &cmds::policy_get_digest(session)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("policy_get_digest failed"),
+    };
+    let current = match cmds::parse_policy_get_digest_response(&resp) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("digest parse failed"),
+    };
+    let mut key_sign = Vec::new();
+    key_sign.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+    key_sign.extend_from_slice(&[0x33; 32]);
+    let policy_ref = [0x42; 8];
+    let ticket = cmds::null_verified_ticket();
+    // Part 3 §23.2.3: the digest resets to zero, then two
+    // hashes — size fields excluded. Computed here, from the
+    // spec formula, not by asking the fixture.
+    let mut step1 = Vec::new();
+    step1.extend_from_slice(&[0u8; 32]);
+    step1.extend_from_slice(&TPM_CC_POLICY_AUTHORIZE.to_be_bytes());
+    step1.extend_from_slice(&key_sign);
+    let d1 = sha256(&step1);
+    let mut step2 = Vec::new();
+    step2.extend_from_slice(&d1);
+    step2.extend_from_slice(&policy_ref);
+    let expected = sha256(&step2);
+    if ok_submit(
+        &t,
+        &cmds::policy_authorize(session, &current, &policy_ref, &key_sign, &ticket),
+    )
+    .is_err()
+    {
+        return TestResult::Fail("trial PolicyAuthorize failed");
+    }
+    let resp = match ok_submit(&t, &cmds::policy_get_digest(session)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("policy_get_digest failed"),
+    };
+    let digest = match cmds::parse_policy_get_digest_response(&resp) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("digest parse failed"),
+    };
+    if digest != expected.to_vec() {
+        return TestResult::Fail("policy digest != §23.2.3 value");
+    }
+    // approvedPolicy must be the CURRENT digest: the stale one
+    // is refused.
+    let resp = t
+        .submit(&cmds::policy_authorize(
+            session,
+            &current,
+            &policy_ref,
+            &key_sign,
+            &ticket,
+        ))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_VALUE {
+        return TestResult::Fail("stale approvedPolicy was not TPM_RC_VALUE");
+    }
+    // A ticket whose tag is not TPM_ST_VERIFIED is refused.
+    let mut bad_ticket = ticket;
+    bad_ticket[1] = 0x01; // TPM_ST_NO_SESSIONS
+    let resp = t
+        .submit(&cmds::policy_authorize(
+            session,
+            &expected,
+            &policy_ref,
+            &key_sign,
+            &bad_ticket,
+        ))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_TAG {
+        return TestResult::Fail("bad ticket tag was not TPM_RC_TAG");
+    }
+    // A non-trial session cannot have its ticket validated here
+    // — the fixture holds no proof value — so it fails closed.
+    let resp = match ok_submit(
+        &t,
+        &cmds::start_auth_session(
+            TPM_RH_NULL,
+            TPM_RH_NULL,
+            &[7u8; 32],
+            &[],
+            TPM_SE_POLICY,
+            TPM_ALG_SHA256,
+        ),
+    ) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("policy session failed"),
+    };
+    let (policy_session, _) = match cmds::parse_start_auth_session_response(&resp) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("session parse failed"),
+    };
+    let resp = match ok_submit(&t, &cmds::policy_get_digest(policy_session)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("policy_get_digest failed"),
+    };
+    let current = match cmds::parse_policy_get_digest_response(&resp) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("digest parse failed"),
+    };
+    let resp = t
+        .submit(&cmds::policy_authorize(
+            policy_session,
+            &current,
+            &policy_ref,
+            &key_sign,
+            &ticket,
+        ))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_POLICY {
+        return TestResult::Fail("non-trial PolicyAuthorize was not TPM_RC_POLICY");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/tpm/fixture", smoke_fixture_policy_authorize_trial);
+
+fn smoke_fixture_nv_read_public() -> TestResult {
+    let t = started_fixture();
+    // An undefined index has no public area.
+    let resp = t
+        .submit(&cmds::nv_read_public(0x0150_0010))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_HANDLE {
+        return TestResult::Fail("NV_ReadPublic of an undefined index was not TPM_RC_HANDLE");
+    }
+    let idx = NvIndex::new(0x0150_0010, 32, NV_ATTR_AUTH_RW);
+    if ok_submit(&t, &idx.define_space_cmd()).is_err() {
+        return TestResult::Fail("define failed");
+    }
+    let resp = match ok_submit(&t, &cmds::nv_read_public(0x0150_0010)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("NV_ReadPublic failed"),
+    };
+    let out = match cmds::parse_nv_read_public_response(&resp) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("NV_ReadPublic response did not parse"),
+    };
+    if out.public.len() < 14 {
+        return TestResult::Fail("public area too short");
+    }
+    if u32::from_be_bytes([out.public[0], out.public[1], out.public[2], out.public[3]])
+        != 0x0150_0010
+    {
+        return TestResult::Fail("public nvIndex wrong");
+    }
+    let attrs = u32::from_be_bytes([out.public[6], out.public[7], out.public[8], out.public[9]]);
+    if attrs & NV_ATTR_WRITTEN != 0 {
+        return TestResult::Fail("unwritten index reports WRITTEN");
+    }
+    let mut expected_name = Vec::new();
+    expected_name.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+    expected_name.extend_from_slice(&sha256(&out.public));
+    if out.name != expected_name {
+        return TestResult::Fail("name != alg ‖ H(live public)");
+    }
+    let name_before = out.name.clone();
+    // Writing flips WRITTEN in the live attributes — and the
+    // name with it (Part 3 §23.20 NOTE_2).
+    if ok_submit(&t, &cmds::nv_write(0x0150_0010, &[0xAA; 32], 0)).is_err() {
+        return TestResult::Fail("NV_Write failed");
+    }
+    let resp = match ok_submit(&t, &cmds::nv_read_public(0x0150_0010)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("NV_ReadPublic failed after write"),
+    };
+    let out = match cmds::parse_nv_read_public_response(&resp) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("NV_ReadPublic response did not parse"),
+    };
+    let attrs = u32::from_be_bytes([out.public[6], out.public[7], out.public[8], out.public[9]]);
+    if attrs & NV_ATTR_WRITTEN == 0 {
+        return TestResult::Fail("written index does not report WRITTEN");
+    }
+    if out.name == name_before {
+        return TestResult::Fail("name did not change after write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/tpm/fixture", smoke_fixture_nv_read_public);
+
+fn smoke_fixture_nv_extend() -> TestResult {
+    let t = started_fixture();
+    let idx = NvIndex::new(0x0150_0011, 32, NV_ATTR_TYPE_EXTEND | NV_ATTR_AUTH_RW);
+    if ok_submit(&t, &idx.define_space_cmd()).is_err() {
+        return TestResult::Fail("define failed");
+    }
+    let data = [1, 2, 3];
+    if ok_submit(&t, &cmds::nv_extend(0x0150_0011, &data)).is_err() {
+        return TestResult::Fail("NV_Extend failed");
+    }
+    // An unwritten index extends from the Zero Digest.
+    let mut input = Vec::new();
+    input.extend_from_slice(&[0u8; 32]);
+    input.extend_from_slice(&data);
+    let expected = sha256(&input);
+    let resp = match ok_submit(&t, &cmds::nv_read(0x0150_0011, 32, 0)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("NV_Read failed"),
+    };
+    let v = match cmds::parse_nv_read_response(&resp) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("NV_Read response did not parse"),
+    };
+    if v != expected.to_vec() {
+        return TestResult::Fail("extend value != H(zero ‖ data)");
+    }
+    // A second extend chains from the first result.
+    if ok_submit(&t, &cmds::nv_extend(0x0150_0011, &[4])).is_err() {
+        return TestResult::Fail("second NV_Extend failed");
+    }
+    let mut input = Vec::new();
+    input.extend_from_slice(&expected);
+    input.push(4);
+    let expected2 = sha256(&input);
+    let resp = match ok_submit(&t, &cmds::nv_read(0x0150_0011, 32, 0)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("NV_Read failed"),
+    };
+    let v = match cmds::parse_nv_read_response(&resp) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("NV_Read response did not parse"),
+    };
+    if v != expected2.to_vec() {
+        return TestResult::Fail("second extend value != H(prev ‖ data)");
+    }
+    // An ordinary index is not an extend index.
+    let ordinary = NvIndex::new(0x0150_0012, 32, NV_ATTR_AUTH_RW);
+    if ok_submit(&t, &ordinary.define_space_cmd()).is_err() {
+        return TestResult::Fail("define of ordinary index failed");
+    }
+    let resp = t
+        .submit(&cmds::nv_extend(0x0150_0012, &[1]))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_ATTRIBUTES {
+        return TestResult::Fail("extend of an ordinary index was not TPM_RC_ATTRIBUTES");
+    }
+    // A digest-mis-sized extend index surfaces its define-time
+    // error here, not at define time.
+    let small = NvIndex::new(0x0150_0013, 16, NV_ATTR_TYPE_EXTEND | NV_ATTR_AUTH_RW);
+    if ok_submit(&t, &small.define_space_cmd()).is_err() {
+        return TestResult::Fail("define of 16-byte extend index failed");
+    }
+    let resp = t
+        .submit(&cmds::nv_extend(0x0150_0013, &[1]))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_VALUE {
+        return TestResult::Fail("extend of a 16-byte index was not TPM_RC_VALUE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/tpm/fixture", smoke_fixture_nv_extend);
+
+fn smoke_fixture_nv_set_bits() -> TestResult {
+    let t = started_fixture();
+    let idx = NvIndex::new(0x0150_0014, 8, NV_ATTR_TYPE_BITS | NV_ATTR_AUTH_RW);
+    if ok_submit(&t, &idx.define_space_cmd()).is_err() {
+        return TestResult::Fail("define failed");
+    }
+    if ok_submit(&t, &cmds::nv_set_bits(0x0150_0014, 0x05)).is_err() {
+        return TestResult::Fail("NV_SetBits failed");
+    }
+    let resp = match ok_submit(&t, &cmds::nv_read(0x0150_0014, 8, 0)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("NV_Read failed"),
+    };
+    let v = match cmds::parse_nv_read_response(&resp) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("NV_Read response did not parse"),
+    };
+    if v != alloc::vec![0, 0, 0, 0, 0, 0, 0, 5] {
+        return TestResult::Fail("SetBits value != 5");
+    }
+    // SetBits ORs: 5 | 10 = 15.
+    if ok_submit(&t, &cmds::nv_set_bits(0x0150_0014, 0x0A)).is_err() {
+        return TestResult::Fail("second NV_SetBits failed");
+    }
+    let resp = match ok_submit(&t, &cmds::nv_read(0x0150_0014, 8, 0)) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("NV_Read failed"),
+    };
+    let v = match cmds::parse_nv_read_response(&resp) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("NV_Read response did not parse"),
+    };
+    if v != alloc::vec![0, 0, 0, 0, 0, 0, 0, 0x0F] {
+        return TestResult::Fail("SetBits did not OR");
+    }
+    // An ordinary index is not a bit-field index.
+    let ordinary = NvIndex::new(0x0150_0015, 8, NV_ATTR_AUTH_RW);
+    if ok_submit(&t, &ordinary.define_space_cmd()).is_err() {
+        return TestResult::Fail("define of ordinary index failed");
+    }
+    let resp = t
+        .submit(&cmds::nv_set_bits(0x0150_0015, 1))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_ATTRIBUTES {
+        return TestResult::Fail("SetBits on an ordinary index was not TPM_RC_ATTRIBUTES");
+    }
+    // A bit-field index must be 8 bytes.
+    let wide = NvIndex::new(0x0150_0016, 16, NV_ATTR_TYPE_BITS | NV_ATTR_AUTH_RW);
+    if ok_submit(&t, &wide.define_space_cmd()).is_err() {
+        return TestResult::Fail("define of 16-byte bits index failed");
+    }
+    let resp = t
+        .submit(&cmds::nv_set_bits(0x0150_0016, 1))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_VALUE {
+        return TestResult::Fail("SetBits on a 16-byte index was not TPM_RC_VALUE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/tpm/fixture", smoke_fixture_nv_set_bits);
+
+fn smoke_fixture_nv_locks() -> TestResult {
+    let t = started_fixture();
+    // A: WRITE_STCLEAR + READ_STCLEAR — locks clear on a CLEAR
+    // reset. B: WRITEDEFINE — its lock survives one. C:
+    // GLOBALLOCK. D: plain.
+    let a = NvIndex::new(
+        0x0150_0020,
+        32,
+        NV_ATTR_AUTH_RW | NV_ATTR_WRITE_STCLEAR | NV_ATTR_READ_STCLEAR,
+    );
+    let b = NvIndex::new(0x0150_0021, 32, NV_ATTR_AUTH_RW | NV_ATTR_WRITEDEFINE);
+    let c = NvIndex::new(0x0150_0022, 32, NV_ATTR_AUTH_RW | NV_ATTR_GLOBALLOCK);
+    let d = NvIndex::new(0x0150_0023, 32, NV_ATTR_AUTH_RW);
+    for idx in [&a, &b, &c, &d] {
+        if ok_submit(&t, &idx.define_space_cmd()).is_err() {
+            return TestResult::Fail("define failed");
+        }
+    }
+    // Attribute rejections first: plain D cannot be locked.
+    let resp = t
+        .submit(&cmds::nv_write_lock(0x0150_0023))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_ATTRIBUTES {
+        return TestResult::Fail("write lock of a plain index was not TPM_RC_ATTRIBUTES");
+    }
+    let resp = t
+        .submit(&cmds::nv_read_lock(0x0150_0023))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_ATTRIBUTES {
+        return TestResult::Fail("read lock of a plain index was not TPM_RC_ATTRIBUTES");
+    }
+    // Write A, lock it both ways, and check the enforcement.
+    if ok_submit(&t, &cmds::nv_write(0x0150_0020, &[0x11; 32], 0)).is_err() {
+        return TestResult::Fail("write A failed");
+    }
+    if ok_submit(&t, &cmds::nv_write_lock(0x0150_0020)).is_err() {
+        return TestResult::Fail("write lock A failed");
+    }
+    let resp = t
+        .submit(&cmds::nv_write(0x0150_0020, &[0x22; 32], 0))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_NV_LOCKED {
+        return TestResult::Fail("write to a write-locked index was not TPM_RC_NV_LOCKED");
+    }
+    if ok_submit(&t, &cmds::nv_read_lock(0x0150_0020)).is_err() {
+        return TestResult::Fail("read lock A failed");
+    }
+    let resp = t
+        .submit(&cmds::nv_read(0x0150_0020, 32, 0))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_NV_LOCKED {
+        return TestResult::Fail("read of a read-locked index was not TPM_RC_NV_LOCKED");
+    }
+    // Lock B too, then a STATE cycle: locks survive it.
+    if ok_submit(&t, &cmds::nv_write_lock(0x0150_0021)).is_err() {
+        return TestResult::Fail("write lock B failed");
+    }
+    if ok_submit(&t, &cmds::shutdown(TPM_SU_STATE)).is_err() {
+        return TestResult::Fail("shutdown STATE failed");
+    }
+    if ok_submit(&t, &cmds::startup(TPM_SU_STATE)).is_err() {
+        return TestResult::Fail("startup STATE failed");
+    }
+    let resp = t
+        .submit(&cmds::nv_write(0x0150_0020, &[0x22; 32], 0))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_NV_LOCKED {
+        return TestResult::Fail("write lock did not survive a STATE cycle");
+    }
+    // The global lock: C locks; D (no GLOBALLOCK) does not.
+    if ok_submit(&t, &cmds::nv_global_write_lock(TPM_RH_OWNER)).is_err() {
+        return TestResult::Fail("global write lock failed");
+    }
+    let resp = t
+        .submit(&cmds::nv_write(0x0150_0022, &[0x33; 32], 0))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_NV_LOCKED {
+        return TestResult::Fail("global lock did not lock C");
+    }
+    if ok_submit(&t, &cmds::nv_write(0x0150_0023, &[0x33; 32], 0)).is_err() {
+        return TestResult::Fail("global lock wrongly locked D");
+    }
+    // A CLEAR reset: A's STCLEAR locks clear; B's WRITEDEFINE
+    // lock survives.
+    if ok_submit(&t, &cmds::shutdown(TPM_SU_CLEAR)).is_err() {
+        return TestResult::Fail("shutdown CLEAR failed");
+    }
+    if ok_submit(&t, &cmds::startup(TPM_SU_CLEAR)).is_err() {
+        return TestResult::Fail("startup CLEAR failed");
+    }
+    if ok_submit(&t, &cmds::nv_write(0x0150_0020, &[0x44; 32], 0)).is_err() {
+        return TestResult::Fail("A write lock survived a CLEAR reset");
+    }
+    if ok_submit(&t, &cmds::nv_read(0x0150_0020, 32, 0)).is_err() {
+        return TestResult::Fail("A read lock survived a CLEAR reset");
+    }
+    let resp = t
+        .submit(&cmds::nv_write(0x0150_0021, &[0x44; 32], 0))
+        .unwrap_or_default();
+    if rc(&resp) != TPM_RC_NV_LOCKED {
+        return TestResult::Fail("B write lock did not survive a CLEAR reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/tpm/fixture", smoke_fixture_nv_locks);

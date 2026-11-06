@@ -63,6 +63,35 @@ pub const NV_ATTR_POLICYREAD: u32 = 1 << 19;
 pub const NV_ATTR_NO_DA: u32 = 1 << 25;
 /// Index is created by platform hierarchy (`TPMA_NV_PLATFORMCREATE`).
 pub const NV_ATTR_PLATFORMCREATE: u32 = 1 << 30;
+/// Reads of the index are blocked until the next
+/// `Startup(TPM_SU_CLEAR)` once set by `NV_ReadLock`
+/// (`TPMA_NV_READLOCKED`, Part 2 §13.4 bit 28).
+pub const NV_ATTR_READLOCKED: u32 = 1 << 28;
+/// The index has been written (`TPMA_NV_WRITTEN`, Part 2 §13.4
+/// bit 29). SET by a successful write / extend / set-bits /
+/// increment; CLEAR at define time.
+pub const NV_ATTR_WRITTEN: u32 = 1 << 29;
+/// `NV_ReadLock` may SET `READLOCKED` on this index
+/// (`TPMA_NV_READ_STCLEAR`, Part 2 §13.4 bit 31).
+pub const NV_ATTR_READ_STCLEAR: u32 = 1 << 31;
+/// Writes to the index are blocked once set by `NV_WriteLock` or
+/// `NV_GlobalWriteLock` (`TPMA_NV_WRITELOCKED`, Part 2 §13.4
+/// bit 11).
+pub const NV_ATTR_WRITELOCKED: u32 = 1 << 11;
+/// `NV_WriteLock` may SET `WRITELOCKED` on this index
+/// (`TPMA_NV_WRITEDEFINE`, Part 2 §13.4 bit 13). A lock set under
+/// this attribute survives `Startup(TPM_SU_CLEAR)` while the
+/// index is written — only undefine clears it.
+pub const NV_ATTR_WRITEDEFINE: u32 = 1 << 13;
+/// `NV_WriteLock` may SET `WRITELOCKED` until the next TPM Reset
+/// / Restart (`TPMA_NV_WRITE_STCLEAR`, Part 2 §13.4 bit 14).
+pub const NV_ATTR_WRITE_STCLEAR: u32 = 1 << 14;
+/// `NV_GlobalWriteLock` SETs `WRITELOCKED` on this index
+/// (`TPMA_NV_GLOBALLOCK`, Part 2 §13.4 bit 15).
+pub const NV_ATTR_GLOBALLOCK: u32 = 1 << 15;
+/// `TPMA_NV_WRITTEN` is CLEARed by TPM Reset or Restart
+/// (`TPMA_NV_CLEAR_STCLEAR`, Part 2 §13.4 bit 27).
+pub const NV_ATTR_CLEAR_STCLEAR: u32 = 1 << 27;
 
 // ── Convenience attribute sets ────────────────────────────────────────
 
@@ -133,6 +162,41 @@ impl NvIndex {
     /// Build a `TPM2_NV_UndefineSpace` command for this index.
     pub fn undefine_cmd(&self) -> alloc::vec::Vec<u8> {
         super::commands::nv_undefine_space(self.handle)
+    }
+
+    /// Build a `TPM2_NV_ReadPublic` command for this index
+    /// (Part 3 §31.6): no authorization, returns the index's
+    /// public area and its name.
+    pub fn read_public_cmd(&self) -> alloc::vec::Vec<u8> {
+        super::commands::nv_read_public(self.handle)
+    }
+
+    /// Build a `TPM2_NV_Extend` command for this index
+    /// (Part 3 §31.9): the index must be a `TPMA_NV_TYPE_EXTEND`
+    /// index; the new value is `H(nameAlg ‖ old ‖ data)`.
+    pub fn extend_cmd(&self, data: &[u8]) -> alloc::vec::Vec<u8> {
+        super::commands::nv_extend(self.handle, data)
+    }
+
+    /// Build a `TPM2_NV_SetBits` command for this index
+    /// (Part 3 §31.10): the index must be a `TPMA_NV_TYPE_BITS`
+    /// index; `bits` are ORed into its contents.
+    pub fn set_bits_cmd(&self, bits: u64) -> alloc::vec::Vec<u8> {
+        super::commands::nv_set_bits(self.handle, bits)
+    }
+
+    /// Build a `TPM2_NV_WriteLock` command for this index
+    /// (Part 3 §31.11): requires `WRITEDEFINE` or `WRITE_STCLEAR`
+    /// in the index attributes.
+    pub fn write_lock_cmd(&self) -> alloc::vec::Vec<u8> {
+        super::commands::nv_write_lock(self.handle)
+    }
+
+    /// Build a `TPM2_NV_ReadLock` command for this index
+    /// (Part 3 §31.14): requires `READ_STCLEAR` in the index
+    /// attributes.
+    pub fn read_lock_cmd(&self) -> alloc::vec::Vec<u8> {
+        super::commands::nv_read_lock(self.handle)
     }
 }
 

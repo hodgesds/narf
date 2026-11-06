@@ -843,6 +843,318 @@ mod smokes {
     }
     kernel_test_in!("drivers/tpm/nv", smoke_nv_read_cmd_structure);
 
+    // ── #941 remainder builders ───────────────────────────────────────
+
+    fn smoke_tpm2_remainder_builders_encode() -> TestResult {
+        use crate::tpm2::commands as cmds;
+        use crate::tpm2::*;
+        let cc = |cmd: &[u8]| u32::from_be_bytes([cmd[6], cmd[7], cmd[8], cmd[9]]);
+        let tag = |cmd: &[u8]| u16::from_be_bytes([cmd[0], cmd[1]]);
+        let size_ok =
+            |cmd: &[u8]| u32::from_be_bytes([cmd[2], cmd[3], cmd[4], cmd[5]]) as usize == cmd.len();
+
+        // Quote: SESSIONS, password session, qualifying data,
+        // ECDSA/SHA-256 scheme, one SHA-256 selection — 47 bytes.
+        // The frame must be byte-identical to the canonical
+        // codec's: this layer delegates, it does not re-encode.
+        let cmd = cmds::quote(
+            0x8000_1000,
+            &[0xAA; 4],
+            (TPM_ALG_ECDSA, TPM_ALG_SHA256),
+            &[(TPM_ALG_SHA256, &[0x01, 0x00, 0x00])],
+        );
+        if tag(&cmd) != TPM_ST_SESSIONS || cc(&cmd) != TPM_CC_QUOTE || !size_ok(&cmd) {
+            return TestResult::Fail("Quote header wrong");
+        }
+        if cmd.len() != 47
+            || u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != 0x8000_1000
+            || u32::from_be_bytes([cmd[18], cmd[19], cmd[20], cmd[21]]) != TPM_RS_PW
+            || u16::from_be_bytes([cmd[27], cmd[28]]) != 4
+            || u16::from_be_bytes([cmd[33], cmd[34]]) != TPM_ALG_ECDSA
+            || u16::from_be_bytes([cmd[35], cmd[36]]) != TPM_ALG_SHA256
+            || u32::from_be_bytes([cmd[37], cmd[38], cmd[39], cmd[40]]) != 1
+        {
+            return TestResult::Fail("Quote frame shape wrong");
+        }
+        let canonical = narf_tpm::commands::CommandBuilder::quote(
+            0x8000_1000,
+            &[0xAA; 4],
+            (TPM_ALG_ECDSA, TPM_ALG_SHA256),
+            &[(TPM_ALG_SHA256, &[0x01, 0x00, 0x00])],
+        );
+        if cmd != canonical {
+            return TestResult::Fail("Quote != canonical codec bytes");
+        }
+        // TPM_ALG_NULL scheme is a lone word: 45 bytes.
+        let cmd = cmds::quote(
+            0x8000_1000,
+            &[],
+            (TPM_ALG_NULL, TPM_ALG_SHA256),
+            &[(TPM_ALG_SHA256, &[0x01, 0x00, 0x00])],
+        );
+        if cmd.len() != 45 || u16::from_be_bytes([cmd[27], cmd[28]]) != TPM_ALG_NULL {
+            return TestResult::Fail("Quote NULL-scheme frame wrong");
+        }
+        if cmd
+            != narf_tpm::commands::CommandBuilder::quote(
+                0x8000_1000,
+                &[],
+                (TPM_ALG_NULL, TPM_ALG_SHA256),
+                &[(TPM_ALG_SHA256, &[0x01, 0x00, 0x00])],
+            )
+        {
+            return TestResult::Fail("Quote NULL-scheme != canonical bytes");
+        }
+        // PCR_Event: SESSIONS, PCR handle + password session +
+        // TPM2B_EVENT — 32 bytes for a 3-byte event.
+        let cmd = cmds::pcr_event(4, &[1, 2, 3]);
+        if tag(&cmd) != TPM_ST_SESSIONS || cc(&cmd) != TPM_CC_PCR_EVENT || !size_ok(&cmd) {
+            return TestResult::Fail("PCR_Event header wrong");
+        }
+        if cmd.len() != 32
+            || u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != 4
+            || u16::from_be_bytes([cmd[27], cmd[28]]) != 3
+            || cmd[29..32] != [1, 2, 3]
+        {
+            return TestResult::Fail("PCR_Event frame shape wrong");
+        }
+        // PCR_Allocate: SESSIONS, TPM_RH_PLATFORM + password
+        // session + TPML_PCR_SELECTION — 37 bytes.
+        let cmd = cmds::pcr_allocate(&[(TPM_ALG_SHA256, &[0xFF, 0x00, 0x00])]);
+        if tag(&cmd) != TPM_ST_SESSIONS || cc(&cmd) != TPM_CC_PCR_ALLOCATE || !size_ok(&cmd) {
+            return TestResult::Fail("PCR_Allocate header wrong");
+        }
+        if cmd.len() != 37
+            || u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != TPM_RH_PLATFORM
+            || u32::from_be_bytes([cmd[27], cmd[28], cmd[29], cmd[30]]) != 1
+            || u16::from_be_bytes([cmd[31], cmd[32]]) != TPM_ALG_SHA256
+        {
+            return TestResult::Fail("PCR_Allocate frame shape wrong");
+        }
+        // NULL verified ticket: <TPM_ST_VERIFIED, TPM_RH_NULL, 0>.
+        let ticket = cmds::null_verified_ticket();
+        if ticket != [0x80, 0x22, 0x40, 0x00, 0x00, 0x07, 0x00, 0x00] {
+            return TestResult::Fail("null_verified_ticket bytes wrong");
+        }
+        // PolicyAuthorize: NO_SESSIONS — the session is an
+        // operand, not an authorizer — 98 bytes for the operands
+        // below, the NULL ticket verbatim at the tail.
+        let mut key_sign = alloc::vec::Vec::new();
+        key_sign.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+        key_sign.extend_from_slice(&[0x33; 32]);
+        let cmd = cmds::policy_authorize(0x0200_0001, &[0x11; 32], &[0x22; 4], &key_sign, &ticket);
+        if tag(&cmd) != TPM_ST_NO_SESSIONS || cc(&cmd) != TPM_CC_POLICY_AUTHORIZE || !size_ok(&cmd)
+        {
+            return TestResult::Fail("PolicyAuthorize header wrong");
+        }
+        if cmd.len() != 98
+            || u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != 0x0200_0001
+            || u16::from_be_bytes([cmd[14], cmd[15]]) != 32
+            || u16::from_be_bytes([cmd[48], cmd[49]]) != 4
+            || u16::from_be_bytes([cmd[54], cmd[55]]) != 34
+            || cmd[90..98] != ticket
+        {
+            return TestResult::Fail("PolicyAuthorize frame shape wrong");
+        }
+        // NV_ReadPublic: NO_SESSIONS, one handle, 14 bytes.
+        let cmd = cmds::nv_read_public(0x0150_0000);
+        if tag(&cmd) != TPM_ST_NO_SESSIONS
+            || cc(&cmd) != TPM_CC_NV_READ_PUBLIC
+            || cmd.len() != 14
+            || u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != 0x0150_0000
+        {
+            return TestResult::Fail("NV_ReadPublic frame wrong");
+        }
+        // NV_Extend: SESSIONS, self-auth, TPM2B data — 37 bytes
+        // for a 4-byte extend.
+        let cmd = cmds::nv_extend(0x0150_0000, &[5, 6, 7, 8]);
+        if tag(&cmd) != TPM_ST_SESSIONS || cc(&cmd) != TPM_CC_NV_EXTEND || !size_ok(&cmd) {
+            return TestResult::Fail("NV_Extend header wrong");
+        }
+        if cmd.len() != 37
+            || u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != 0x0150_0000
+            || u32::from_be_bytes([cmd[14], cmd[15], cmd[16], cmd[17]]) != 0x0150_0000
+            || u16::from_be_bytes([cmd[31], cmd[32]]) != 4
+            || cmd[33..37] != [5, 6, 7, 8]
+        {
+            return TestResult::Fail("NV_Extend frame shape wrong");
+        }
+        // NV_SetBits: SESSIONS, self-auth, trailing u64 — 39 bytes.
+        let cmd = cmds::nv_set_bits(0x0150_0000, 0x5);
+        if tag(&cmd) != TPM_ST_SESSIONS || cc(&cmd) != TPM_CC_NV_SET_BITS || !size_ok(&cmd) {
+            return TestResult::Fail("NV_SetBits header wrong");
+        }
+        if cmd.len() != 39
+            || u64::from_be_bytes([
+                cmd[31], cmd[32], cmd[33], cmd[34], cmd[35], cmd[36], cmd[37], cmd[38],
+            ]) != 5
+        {
+            return TestResult::Fail("NV_SetBits frame shape wrong");
+        }
+        // NV_WriteLock / NV_ReadLock: SESSIONS, self-auth, no
+        // parameters — 31 bytes.
+        let cmd = cmds::nv_write_lock(0x0150_0000);
+        if tag(&cmd) != TPM_ST_SESSIONS
+            || cc(&cmd) != TPM_CC_NV_WRITE_LOCK
+            || cmd.len() != 31
+            || u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != 0x0150_0000
+        {
+            return TestResult::Fail("NV_WriteLock frame wrong");
+        }
+        let cmd = cmds::nv_read_lock(0x0150_0000);
+        if tag(&cmd) != TPM_ST_SESSIONS
+            || cc(&cmd) != TPM_CC_NV_READ_LOCK
+            || cmd.len() != 31
+            || u32::from_be_bytes([cmd[14], cmd[15], cmd[16], cmd[17]]) != 0x0150_0000
+        {
+            return TestResult::Fail("NV_ReadLock frame wrong");
+        }
+        // NV_GlobalWriteLock: SESSIONS, the hierarchy handle is a
+        // parameter — 27 bytes.
+        let cmd = cmds::nv_global_write_lock(TPM_RH_OWNER);
+        if tag(&cmd) != TPM_ST_SESSIONS
+            || cc(&cmd) != TPM_CC_NV_GLOBAL_WRITE_LOCK
+            || cmd.len() != 27
+            || u32::from_be_bytes([cmd[10], cmd[11], cmd[12], cmd[13]]) != TPM_RH_OWNER
+        {
+            return TestResult::Fail("NV_GlobalWriteLock frame wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/tpm2", smoke_tpm2_remainder_builders_encode);
+
+    fn smoke_tpm2_remainder_parsers() -> TestResult {
+        use crate::tpm2::commands as cmds;
+        use crate::tpm2::*;
+        fn sessions_frame(params: &[u8]) -> alloc::vec::Vec<u8> {
+            let mut r = alloc::vec::Vec::new();
+            r.extend_from_slice(&TPM_ST_SESSIONS.to_be_bytes());
+            r.extend_from_slice(&0u32.to_be_bytes()); // size, patched below
+            r.extend_from_slice(&0u32.to_be_bytes()); // rc = SUCCESS
+            r.extend_from_slice(&(params.len() as u32).to_be_bytes());
+            r.extend_from_slice(params);
+            r.extend_from_slice(&[0u8; 5]); // auth area
+            let n = r.len() as u32;
+            r[2..6].copy_from_slice(&n.to_be_bytes());
+            r
+        }
+        fn no_sessions_frame(params: &[u8]) -> alloc::vec::Vec<u8> {
+            let mut r = alloc::vec::Vec::new();
+            r.extend_from_slice(&TPM_ST_NO_SESSIONS.to_be_bytes());
+            r.extend_from_slice(&0u32.to_be_bytes()); // size, patched below
+            r.extend_from_slice(&0u32.to_be_bytes()); // rc = SUCCESS
+            r.extend_from_slice(params);
+            let n = r.len() as u32;
+            r[2..6].copy_from_slice(&n.to_be_bytes());
+            r
+        }
+        fn tpm2b(data: &[u8]) -> alloc::vec::Vec<u8> {
+            let mut v = alloc::vec::Vec::new();
+            v.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            v.extend_from_slice(data);
+            v
+        }
+
+        // PCR_Allocate: success byte + maxPCR + sizeNeeded +
+        // sizeAvailable.
+        let mut params = alloc::vec::Vec::new();
+        params.push(1);
+        params.extend_from_slice(&24u32.to_be_bytes());
+        params.extend_from_slice(&64u32.to_be_bytes());
+        params.extend_from_slice(&768u32.to_be_bytes());
+        let out = match cmds::parse_pcr_allocate_response(&sessions_frame(&params)) {
+            Ok(o) => o,
+            Err(_) => return TestResult::Fail("PCR_Allocate parse failed"),
+        };
+        if !out.allocation_success
+            || out.max_pcr != 24
+            || out.size_needed != 64
+            || out.size_available != 768
+        {
+            return TestResult::Fail("PCR_Allocate outputs wrong");
+        }
+        // PCR_Event: TPML_DIGEST_VALUES with one SHA-256 digest.
+        let mut params = alloc::vec::Vec::new();
+        params.extend_from_slice(&1u32.to_be_bytes());
+        params.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+        params.extend_from_slice(&tpm2b(&[0xAB; 32]));
+        let out = match cmds::parse_pcr_event_response(&sessions_frame(&params)) {
+            Ok(o) => o,
+            Err(_) => return TestResult::Fail("PCR_Event parse failed"),
+        };
+        if out.len() != 1 || out[0].0 != TPM_ALG_SHA256 || out[0].1 != alloc::vec![0xAB; 32] {
+            return TestResult::Fail("PCR_Event outputs wrong");
+        }
+        // NV_ReadPublic: TPM2B_NV_PUBLIC + TPM2B_NAME.
+        let mut params = alloc::vec::Vec::new();
+        params.extend_from_slice(&tpm2b(&[0x01, 0x02, 0x03, 0x04]));
+        params.extend_from_slice(&tpm2b(&[0x05, 0x06]));
+        let out = match cmds::parse_nv_read_public_response(&no_sessions_frame(&params)) {
+            Ok(o) => o,
+            Err(_) => return TestResult::Fail("NV_ReadPublic parse failed"),
+        };
+        if out.public != alloc::vec![0x01, 0x02, 0x03, 0x04] || out.name != alloc::vec![0x05, 0x06]
+        {
+            return TestResult::Fail("NV_ReadPublic outputs wrong");
+        }
+        // Truncation must fail, not panic or misread.
+        if cmds::parse_pcr_allocate_response(&sessions_frame(&[1, 0])).is_ok() {
+            return TestResult::Fail("short PCR_Allocate response must fail");
+        }
+        if cmds::parse_pcr_event_response(&sessions_frame(&[0, 0, 0, 1])).is_ok() {
+            return TestResult::Fail("short PCR_Event response must fail");
+        }
+        if cmds::parse_nv_read_public_response(&no_sessions_frame(&[0, 2, 0xAA])).is_ok() {
+            return TestResult::Fail("short NV_ReadPublic response must fail");
+        }
+        // Quote: a short frame and a failure-RC frame must both
+        // fail — the canonical parser's two error classes map
+        // onto the two messages.
+        if cmds::parse_quote_response(&[0u8; 10]).is_ok() {
+            return TestResult::Fail("short Quote response must fail");
+        }
+        let mut failed = sessions_frame(&[]);
+        failed[6..10].copy_from_slice(&0x0000_0101u32.to_be_bytes()); // TPM_RC_FAILURE
+        if cmds::parse_quote_response(&failed).is_ok() {
+            return TestResult::Fail("failed Quote response must fail");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/tpm2", smoke_tpm2_remainder_parsers);
+
+    fn smoke_tpm2_remainder_convenience_helpers() -> TestResult {
+        use crate::tpm2::commands as cmds;
+        use crate::tpm2::nv::{NvIndex, NV_ATTR_AUTH_RW, NV_IDX_DISK_KEY};
+        use crate::tpm2::pcr::{build_allocate_cmd, build_event_cmd, HashBank};
+        use crate::tpm2::TPM_ALG_SHA256;
+        let idx = NvIndex::new(NV_IDX_DISK_KEY, 32, NV_ATTR_AUTH_RW);
+        if idx.read_public_cmd() != cmds::nv_read_public(NV_IDX_DISK_KEY) {
+            return TestResult::Fail("NvIndex::read_public_cmd != nv_read_public");
+        }
+        if idx.extend_cmd(&[9, 9]) != cmds::nv_extend(NV_IDX_DISK_KEY, &[9, 9]) {
+            return TestResult::Fail("NvIndex::extend_cmd != nv_extend");
+        }
+        if idx.set_bits_cmd(0xFF) != cmds::nv_set_bits(NV_IDX_DISK_KEY, 0xFF) {
+            return TestResult::Fail("NvIndex::set_bits_cmd != nv_set_bits");
+        }
+        if idx.write_lock_cmd() != cmds::nv_write_lock(NV_IDX_DISK_KEY) {
+            return TestResult::Fail("NvIndex::write_lock_cmd != nv_write_lock");
+        }
+        if idx.read_lock_cmd() != cmds::nv_read_lock(NV_IDX_DISK_KEY) {
+            return TestResult::Fail("NvIndex::read_lock_cmd != nv_read_lock");
+        }
+        if build_event_cmd(7, &[3, 3, 3]) != cmds::pcr_event(7, &[3, 3, 3]) {
+            return TestResult::Fail("build_event_cmd != pcr_event");
+        }
+        let sels: &[(u16, &[u8])] = &[(TPM_ALG_SHA256, &[0xFF, 0x00, 0x00])];
+        if build_allocate_cmd(sels) != cmds::pcr_allocate(sels) {
+            return TestResult::Fail("build_allocate_cmd != pcr_allocate");
+        }
+        let _ = HashBank::Sha256;
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/tpm/tpm2", smoke_tpm2_remainder_convenience_helpers);
+
     // ── Key type algorithm IDs ────────────────────────────────────────
 
     fn smoke_key_type_alg_ids() -> TestResult {
