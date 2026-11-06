@@ -538,6 +538,24 @@ fn already_brought_up(transport: &Arc<dyn HciTransport>) -> bool {
         .any(|c| Arc::ptr_eq(&c.transport, transport))
 }
 
+/// HCI index of the live controller backed by `transport`, if any
+/// (issue #1576).
+///
+/// The PCIe driver registers its transport at firmware-load time
+/// but its HCI index only exists once `bring_up_all` has run the
+/// mandatory HCI bring-up over it, so the PCIe device-PM ops
+/// resolve the index lazily through this lookup instead of
+/// capturing one at registration time. Returns `None` when the
+/// transport backs no live controller (bring-up not run yet, or
+/// failed) — the caller must still do its hardware work and only
+/// skip the index-keyed park flags.
+pub fn index_of_transport(transport: &Arc<dyn HciTransport>) -> Option<usize> {
+    CONTROLLERS
+        .lock()
+        .iter()
+        .position(|c| !c.is_detached() && Arc::ptr_eq(&c.transport, transport))
+}
+
 /// Outcome of one controller's bring-up, for the boot transcript.
 #[derive(Debug)]
 pub struct BringupOutcome {

@@ -398,6 +398,10 @@ impl Rings {
         self.write_u16(Self::ia_off(self.layout.tr_hia, queue), v);
     }
 
+    fn set_tr_tia(&self, queue: usize, v: u16) {
+        self.write_u16(Self::ia_off(self.layout.tr_tia, queue), v);
+    }
+
     /// Transfer-ring tail index — advanced by the device.
     pub fn tr_tia(&self, queue: usize) -> u16 {
         self.read_u16(Self::ia_off(self.layout.tr_tia, queue))
@@ -406,6 +410,10 @@ impl Rings {
     /// Completion-ring head index — advanced by the device.
     pub fn cr_hia(&self, queue: usize) -> u16 {
         self.read_u16(Self::ia_off(self.layout.cr_hia, queue))
+    }
+
+    fn set_cr_hia(&self, queue: usize, v: u16) {
+        self.write_u16(Self::ia_off(self.layout.cr_hia, queue), v);
     }
 
     /// Completion-ring tail index — advanced by the driver.
@@ -533,6 +541,31 @@ impl Rings {
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // SAFETY: caller-asserted mapped CSR window.
         unsafe { csr.write32(CSR_HBUS_TARG_WRPTR, doorbell(0, RX_DB_VEC)) };
+    }
+
+    /// Re-arm the rings after a D3→D0 transition (issue #1576).
+    ///
+    /// Linux `btintel_pcie_reset_ia` + `btintel_pcie_start_rx` on
+    /// the GP0 D3→D0 path: the device does not preserve ring
+    /// positions across its D3 sleep state, so every index array
+    /// goes back to zero, every FRBD is re-posted, and the RX
+    /// doorbell is rung again. The TX descriptors themselves are
+    /// left alone — `prepare_tx` zeroes a TFD before reusing it,
+    /// so a stale one is never transmitted.
+    ///
+    /// # Safety
+    /// `csr` must be this controller's mapped BAR0.
+    pub unsafe fn rearm_rx(&self, csr: &MmioRegion) {
+        for q in 0..NUM_QUEUES {
+            self.set_tr_hia(q, 0);
+            self.set_tr_tia(q, 0);
+            self.set_cr_hia(q, 0);
+            self.set_cr_tia(q, 0);
+        }
+        self.arm_all_rx();
+        // SAFETY: caller-asserted mapped CSR window; re-posts the
+        // full RX ring exactly as bring-up does.
+        unsafe { self.start_rx(csr) };
     }
 
     /// Pop one received packet, if the device has completed one.
