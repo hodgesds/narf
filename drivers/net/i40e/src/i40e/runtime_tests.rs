@@ -258,6 +258,7 @@ impl Fixture {
                     .map(|q| IrqSafeSpinLock::new(ring::QueuePair::alloc(q).unwrap()))
                     .collect(),
             ),
+            mtu: IrqSafeSpinLock::new(mtu::STD_MTU),
             rss: rss::RssConfig::default(),
             reset_discarded: 0,
             interrupts: Some(interrupts::Interrupts::simulated(csr, queues)),

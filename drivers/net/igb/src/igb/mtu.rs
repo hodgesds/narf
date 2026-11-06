@@ -120,7 +120,6 @@ pub const fn mtu_transition(mtu: u32) -> Result<MtuProgram, MtuError> {
     })
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
 
