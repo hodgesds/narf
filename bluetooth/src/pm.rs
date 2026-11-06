@@ -44,11 +44,16 @@
 //! `power` — the park flags are the contract; the drivers that own
 //! each cause do their own hardware work around them.
 //!
-//! PCIe controllers (`btintel_pcie`) are not covered yet: they
-//! never enter the HCI controller registry (their transport is
-//! registered but `register_ready_transport` is never called), so
-//! there is no HCI index to key this state off. Wiring PCIe PM is
-//! a follow-up (see the #820 PR body).
+//! PCIe controllers (`btintel_pcie`) are covered since #1576:
+//! their transport enters the registry through `bring_up_all`
+//! (which runs after the firmware download), and
+//! `btintel_pcie::BtIntelPciePm` drives `suspend_controller` /
+//! `resume_controller` from the device-PM fan-out, resolving the
+//! HCI index lazily by transport identity. The one gap left is a
+//! power cut across suspend: the controller comes back in its ROM
+//! bootloader, resume records `firmware_lost` and stays parked,
+//! and reloading the firmware from a post-resume task is a
+//! follow-up (see the #1576 PR body).
 
 extern crate alloc;
 

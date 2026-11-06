@@ -64,6 +64,25 @@
 //! completion rings' index arrays say the same thing the completion
 //! interrupts would.
 //!
+//! ## Power management (#1576)
+//!
+//! Once operational firmware is running, `load_firmware` registers
+//! the transport and the device-PM ops (`BtIntelPciePm`,
+//! `btintel-pcie`). Suspend parks the HCI pump via
+//! `crate::pm::suspend_controller` — the HCI index is resolved
+//! lazily by transport identity, because the index only exists once
+//! `bring_up_all` has run the mandatory HCI bring-up over the
+//! transport — and writes `POWER_STATE_D3_HOT` to `IPC_SLEEP_CTL`,
+//! waiting for `BOOT_STAGE_D3_STATE_READY`. Resume writes `D0`,
+//! waits for the bit to clear, re-arms the DMA rings, and unparks
+//! the pump. No firmware reload on resume: Linux's GP0 D3→D0 path
+//! only re-arms RX, the operational image stays resident across the
+//! firmware's own D3 sleep state. A power cut is different — the
+//! controller comes back in its ROM bootloader — and resume detects
+//! that (`BOOT_STAGE` without `OPFW`), records it, and stays
+//! parked; reloading firmware from a post-resume task is a
+//! follow-up (see the #1576 PR body).
+//!
 //! No [`crate::transport::HciTransport`] is registered yet. The HCI
 //! core's bring-up sequence assumes a controller running operational
 //! firmware, and pointing it at a bootloader would have it time out
@@ -76,7 +95,7 @@ pub mod fw;
 pub mod rings;
 pub mod transport;
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
@@ -275,6 +294,14 @@ pub const MAC_ACCESS_TIMEOUT_MS: u64 = 20;
 /// `BTINTEL_DEFAULT_INTR_TIMEOUT_MS` — how long the device is given
 /// to reach its ROM bootloader after `MAC_INIT`.
 pub const ALIVE_TIMEOUT_MS: u64 = 3_000;
+
+/// Host-side budget for the firmware to acknowledge a D-state write
+/// by raising (D3) or clearing (D0) `BOOT_STAGE_D3_STATE_READY`
+/// (issue #1576). Not a spec value: the firmware only has to
+/// quiesce its DMA, so a second is generous; a timeout is reported
+/// as `DriverError` and the suspend orchestrator aborts the cycle
+/// (fail-closed, same as the NVMe shutdown-notification timeout).
+pub const D3_TRANSITION_TIMEOUT_MS: u64 = 1_000;
 
 // ── Errors ──────────────────────────────────────────────────────────
 
@@ -656,6 +683,186 @@ pub fn boot_stage_flags(stage: u32) -> alloc::string::String {
     s
 }
 
+/// `true` when `BOOT_STAGE` reports the firmware's D3 sleep state
+/// (`BOOT_STAGE_D3_STATE_READY`): the device has quiesced into D3.
+/// Linux `btintel_pcie_in_d3`.
+pub const fn is_d3_ready(stage: u32) -> bool {
+    stage & BOOT_STAGE_D3_STATE_READY != 0
+}
+
+/// `true` when `BOOT_STAGE` reports the operational image running.
+/// Linux `btintel_pcie_in_op`.
+pub const fn is_opfw(stage: u32) -> bool {
+    stage & BOOT_STAGE_OPFW != 0
+}
+
+// ── System suspend/resume (#1576) ───────────────────────────────────
+
+/// The power-state seam of a PCIe controller.
+///
+/// Split out so the suspend/resume handshake can be exercised
+/// without a controller: everything the device-PM ops do is a
+/// decision about a `BOOT_STAGE` word and a D-state write, and none
+/// of it needs DMA — the same split as `rings::RxQueues`, whose
+/// demultiplexing is testable without hardware. `BtIntelPcie` is
+/// the production implementation; fixtures script the `BOOT_STAGE`
+/// transitions the firmware's D3 sleep state produces.
+pub(crate) trait PciePowerRegs: Send + Sync + core::fmt::Debug {
+    /// Write the host-side D-state (`POWER_STATE_D0` /
+    /// `POWER_STATE_D3_HOT`) to `IPC_SLEEP_CTL`.
+    fn write_power_state(&self, state: u32);
+    /// Current `BOOT_STAGE`.
+    fn boot_stage(&self) -> u32;
+    /// Re-arm the DMA rings after a D3→D0 transition.
+    fn rearm_rx(&self);
+}
+
+impl PciePowerRegs for BtIntelPcie {
+    fn write_power_state(&self, state: u32) {
+        self.set_power_state(state);
+    }
+
+    fn boot_stage(&self) -> u32 {
+        self.current_boot_stage()
+    }
+
+    fn rearm_rx(&self) {
+        // SAFETY: `self.mmio` is this device's mapped CSR window.
+        unsafe { self.rings.rearm_rx(&self.mmio) };
+    }
+}
+
+/// Sticky flag: the controller came back from suspend in its ROM
+/// bootloader, so the operational firmware is gone (power cut).
+/// Set by the resume path; cleared by a successful `load_firmware`.
+/// While set, suspend skips the D3 handshake (nothing to quiesce)
+/// and resume stays parked — the reload follow-up owns recovery.
+static FIRMWARE_LOST: AtomicBool = AtomicBool::new(false);
+
+/// `true` when the controller lost its firmware across a suspend
+/// (power cut) and is waiting for a reload.
+pub(crate) fn firmware_lost() -> bool {
+    FIRMWARE_LOST.load(Ordering::Acquire)
+}
+
+/// Device-PM ops for one bound PCIe Bluetooth controller (#1576).
+///
+/// Suspend parks the HCI pump (flag stores only — the handler runs
+/// on the boot CPU with interrupts gated, so no scheduling) and
+/// then asks the firmware for its D3 sleep state via
+/// `IPC_SLEEP_CTL`; resume writes D0 back, waits for the firmware
+/// to leave D3, re-arms the DMA rings, and unparks the pump. The
+/// HCI index is resolved lazily by transport identity: the ops are
+/// registered at firmware-load time, before `bring_up_all` has run
+/// the mandatory HCI bring-up that assigns the index.
+///
+/// Firmware is NOT re-downloaded on resume: Linux's GP0 D3→D0 path
+/// only re-arms RX — the operational image stays resident across
+/// the firmware's own D3 sleep state. What the firmware does NOT
+/// survive is a power cut (PCI D3cold / platform power-off in S3):
+/// then the controller comes back in its ROM bootloader and the
+/// resume below detects it (`BOOT_STAGE` without `OPFW`), records
+/// [`firmware_lost`], and leaves the pump parked. Re-downloading
+/// firmware needs the firmware registry and long spin waits, which
+/// cannot run inside a device-PM handler — that reload path is a
+/// follow-up; see the #1576 PR body.
+#[derive(Debug)]
+pub(crate) struct BtIntelPciePm {
+    regs: alloc::sync::Arc<dyn PciePowerRegs>,
+    transport: alloc::sync::Arc<dyn crate::transport::HciTransport>,
+}
+
+impl BtIntelPciePm {
+    /// Build the ops for a controller whose firmware is running.
+    pub(crate) fn new(
+        regs: alloc::sync::Arc<dyn PciePowerRegs>,
+        transport: alloc::sync::Arc<dyn crate::transport::HciTransport>,
+    ) -> Self {
+        Self { regs, transport }
+    }
+}
+
+impl narf_power::device_pm::DevicePmOps for BtIntelPciePm {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        use core::fmt::Write as _;
+        use narf_power::device_pm::DeviceSuspendError as PmErr;
+        // A controller that already lost its firmware (power cut on
+        // an earlier cycle) has no DMA left to quiesce and no D3
+        // handshake to ack: park the pump and report success so a
+        // dead controller cannot veto every later suspend.
+        if firmware_lost() {
+            if let Some(index) = crate::controller::index_of_transport(&self.transport) {
+                crate::pm::suspend_controller(index);
+            }
+            return Ok(());
+        }
+        // Park first: the pump must not issue HCI into a device
+        // that is about to sleep.
+        if let Some(index) = crate::controller::index_of_transport(&self.transport) {
+            crate::pm::suspend_controller(index);
+        } else {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: suspend with no HCI index (bring-up not run); park skipped, D3 still requested",
+            );
+        }
+        self.regs.write_power_state(POWER_STATE_D3_HOT);
+        let ready = narf_scheduler::responsive_spin_until(
+            || is_d3_ready(self.regs.boot_stage()),
+            narf_time::Deadline::after_ms(D3_TRANSITION_TIMEOUT_MS),
+        );
+        if !ready {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: D3 not acknowledged within {} ms; suspend aborted, pump stays parked for rollback",
+                D3_TRANSITION_TIMEOUT_MS,
+            );
+            return Err(PmErr::DriverError);
+        }
+        Ok(())
+    }
+
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        use core::fmt::Write as _;
+        use narf_power::device_pm::DeviceSuspendError as PmErr;
+        self.regs.write_power_state(POWER_STATE_D0);
+        let back = narf_scheduler::responsive_spin_until(
+            || !is_d3_ready(self.regs.boot_stage()),
+            narf_time::Deadline::after_ms(D3_TRANSITION_TIMEOUT_MS),
+        );
+        if !back {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: D0 not acknowledged within {} ms; controller stays parked",
+                D3_TRANSITION_TIMEOUT_MS,
+            );
+            return Err(PmErr::DriverError);
+        }
+        // The firmware's D3 sleep state keeps the operational image
+        // resident; a power cut does not. A controller back in its
+        // ROM bootloader needs a full firmware download, which
+        // cannot run here — record the loss, stay parked, and let
+        // the follow-up reload path (or a reboot) recover it.
+        let stage = self.regs.boot_stage();
+        if !is_opfw(stage) {
+            FIRMWARE_LOST.store(true, Ordering::Release);
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: firmware lost across suspend (BOOT_STAGE {:#010x}); controller stays parked until firmware is reloaded",
+                stage,
+            );
+            return Err(PmErr::DriverError);
+        }
+        // Re-arm before unparking: the pump must not transmit
+        // before the device has RX buffers again.
+        self.regs.rearm_rx();
+        if let Some(index) = crate::controller::index_of_transport(&self.transport) {
+            crate::pm::resume_controller(index);
+        }
+        Ok(())
+    }
+}
+
 // ── Driver-match registration ───────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<alloc::sync::Arc<BtIntelPcie>>> =
@@ -778,6 +985,10 @@ pub fn load_firmware() {
             // failure would look like a broken HCI core rather than
             // an unfinished firmware load.
             if ver.img_type == fw::IMG_OP {
+                // Operational firmware is running again — clear any
+                // firmware-loss recorded by an earlier suspend cycle
+                // (the reload follow-up re-runs this path).
+                FIRMWARE_LOST.store(false, Ordering::Release);
                 register_transport(&controller);
             } else {
                 let _ = writeln!(
@@ -802,6 +1013,12 @@ pub fn load_firmware() {
 /// Idempotent: the initcall that calls this runs once, but the flag
 /// keeps a re-probe or a test-driven second pass from installing a
 /// duplicate transport for the same controller.
+///
+/// Also registers the device-PM ops (#1576): the suspend/resume
+/// pair lives next to the transport because both are keyed off the
+/// same controller, and the ops resolve the HCI index lazily by
+/// transport identity — the index only exists once `bring_up_all`
+/// has run the mandatory HCI bring-up over this transport.
 fn register_transport(controller: &alloc::sync::Arc<BtIntelPcie>) {
     use core::fmt::Write as _;
     use core::sync::atomic::AtomicBool;
@@ -811,8 +1028,13 @@ fn register_transport(controller: &alloc::sync::Arc<BtIntelPcie>) {
         return;
     }
 
-    let t = alloc::sync::Arc::new(transport::BtIntelPcieTransport::new(controller.clone()));
-    crate::transport::register(t);
+    let t: alloc::sync::Arc<dyn crate::transport::HciTransport> =
+        alloc::sync::Arc::new(transport::BtIntelPcieTransport::new(controller.clone()));
+    crate::transport::register(t.clone());
+    narf_power::device_pm::register_device_pm_ops(
+        "btintel-pcie",
+        alloc::sync::Arc::new(BtIntelPciePm::new(controller.clone(), t)),
+    );
     let _ = writeln!(
         narf_console::Writer,
         "  btintel-pcie: HCI transport registered ({} total)",
@@ -849,4 +1071,5 @@ pub fn with_controller<R>(f: impl FnOnce(&BtIntelPcie) -> R) -> Option<R> {
 /// end-state.
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
+    FIRMWARE_LOST.store(false, Ordering::Release);
 }
