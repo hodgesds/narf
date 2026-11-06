@@ -741,12 +741,18 @@ pub static UVC_DEVICES: IrqSafeSpinLock<Vec<UvcDevice>> = IrqSafeSpinLock::new(V
 /// `crate::tests`) runs the *same* bind / negotiate / activate /
 /// deactivate / pump code against a modelled device implementing this
 /// trait, so the composition is validated without silicon. The seam is
-/// deliberately narrow — five operations, no controller state — so a
+/// deliberately narrow — six operations, no controller state — so a
 /// modelled transport stays a faithful device conversation (control
 /// transfers, endpoint configuration, isochronous packets, bulk
 /// transfers), not a
 /// re-implementation of the composition itself.
-pub trait UvcTransport {
+///
+/// Transports are shared across pump tasks (the live controller
+/// behind an `Arc`, the modelled device behind an `Arc` in the
+/// fixture), so the trait requires `Sync`: the pipelined receive
+/// keeps several transfers in flight at once, each borrowing the
+/// transport, and the owned-buffer adapter below must be `Send`.
+pub trait UvcTransport: Sync {
     /// Index of the controller this transport drives
     /// ([`crate::xhci::Xhci::id`]); fixtures are controller 0.
     fn controller_id(&self) -> u8 {
@@ -786,6 +792,52 @@ pub trait UvcTransport {
         dci: u8,
         out: &'a mut [u8],
     ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a;
+    /// Maximum number of concurrent `isoch_in` transfers this
+    /// transport can serve on one endpoint — the pipeline depth the
+    /// capture pump may keep in flight (#808).
+    ///
+    /// A transport returning N > 1 promises that N concurrent
+    /// `isoch_in` calls on the same endpoint run against
+    /// independent buffers and complete in submission order, so the
+    /// pump can refill slots as they complete without reordering
+    /// packets. The default is 1 (single-shot): the real xHCI
+    /// transport keeps it — one isochronous TRB per endpoint shares
+    /// the endpoint's single 4096-byte DMA page, and Transfer Events
+    /// carry slot + endpoint identity only, so concurrent calls
+    /// would overwrite each other's payloads. True multi-TRB
+    /// pipelining with per-transfer buffers and TRB identity is
+    /// #885's work, not this method's.
+    fn isoch_pipeline_depth(&self) -> usize {
+        1
+    }
+    /// Owned-buffer form of [`UvcTransport::isoch_in`]: takes a
+    /// packet buffer by value and returns it alongside the byte
+    /// count, so the pipelined pump can own one buffer per
+    /// in-flight transfer instead of borrowing a shared ring.
+    /// Borrowing the ring fails borrowck: several simultaneous
+    /// `&mut` borrows into one ring cannot be held across loop
+    /// iterations (the container's destructor extends each borrow
+    /// to the container's scope), while owned buffers move in and
+    /// out of the ring freely and the futures borrow only the
+    /// shared `&self`.
+    ///
+    /// The default adapts the single-shot call, so a transport
+    /// whose `isoch_in` calls are already independent (the modelled
+    /// device: each call parks on its own staged packet) pipelines
+    /// with no extra code. A transport with shared per-endpoint
+    /// state must keep [`UvcTransport::isoch_pipeline_depth`] at 1
+    /// so the pump never calls this concurrently on one endpoint.
+    fn isoch_in_owned<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        mut out: Vec<u8>,
+    ) -> impl Future<Output = (Vec<u8>, Result<usize, crate::xhci::XhciError>)> + Send + 'a {
+        async move {
+            let received = self.isoch_in(slot_id, dci, &mut out).await;
+            (out, received)
+        }
+    }
     /// Receive one bulk IN transfer into `out`; returns the byte
     /// count (0 = empty transfer; a short transfer ends at the
     /// device's packet boundary). Bulk transfers carry the same UVC
@@ -862,6 +914,17 @@ impl UvcTransport for crate::xhci::Xhci {
         out: &'a mut [u8],
     ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a {
         crate::xhci::Xhci::isoch_in(self, slot_id, dci, out)
+    }
+
+    fn isoch_pipeline_depth(&self) -> usize {
+        // Single-shot only: `Xhci::isoch_in` stages every transfer
+        // in the endpoint's single 4096-byte DMA page and matches
+        // completions by slot + endpoint, so two concurrent calls
+        // would DMA into the same page (see #885). The pump's
+        // pipelined receive still runs for transports that advertise
+        // depth > 1; this transport advertises 1 until #885 lands
+        // per-transfer buffers and TRB identity.
+        1
     }
 
     fn bulk_in<'a>(
@@ -1550,11 +1613,15 @@ fn take_pump_exit_request(idx: usize, generation: u64) -> bool {
 /// #808 seam: the receive call site in this loop — one transfer outstanding
 /// at a time, dispatching on the active endpoint's transport
 /// (`isoch_in` for isochronous streams, `bulk_in` for bulk
-/// streams). The depth-4 `IsocScheduler` pipelining work slots in
-/// behind this seam (a pipelined transport receive) without
-/// changing negotiation, activation, the stop protocol, or frame
-/// delivery; nothing here bakes in a single-shot assumption beyond
-/// that one call.
+/// streams). Isochronous streams whose transport advertises
+/// `isoch_pipeline_depth() > 1` leave this loop for the pipelined
+/// receive ([`pump_video_frames_pipelined`], which adopts the
+/// video crate's depth-4 `IsocScheduler`); bulk streams and
+/// depth-1 transports (the real xHCI path, until #885) stay on
+/// the single-shot receive below. Negotiation, activation, the
+/// stop protocol, and frame delivery are unchanged by the split;
+/// nothing here bakes in a single-shot assumption beyond that one
+/// call.
 ///
 /// Lifecycle: the loop exits cleanly with `Ok(())` when
 /// [`take_pump_exit_request`] fires — checked at every loop top, and
@@ -1582,6 +1649,24 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
     let packet_size = usize::try_from(endpoint.max_payload_size)
         .unwrap_or(4096)
         .clamp(1, 4096);
+    // #808: isochronous streams run pipelined when the transport can
+    // serve concurrent transfers; bulk streams and depth-1 transports
+    // (the real xHCI path, until #885) stay on the single-shot loop
+    // below.
+    if endpoint.transport == UvcStreamingTransport::Isochronous
+        && transport.isoch_pipeline_depth() > 1
+    {
+        return pump_video_frames_pipelined(
+            idx,
+            transport,
+            generation,
+            slot_id,
+            endpoint,
+            video_node,
+            packet_size,
+        )
+        .await;
+    }
     let mut packet = alloc::vec![0u8; packet_size];
     let mut reassembler = UvcFrameReassembler::new();
     let mut consecutive_errors = 0u8;
@@ -1629,6 +1714,166 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
             }
         }
     }
+}
+
+/// Pipelined isochronous receive for the capture pump (#808).
+///
+/// The single-shot loop awaits one `isoch_in` at a time, so a slow
+/// service interval stalls the whole stream. This loop keeps up to
+/// `IsocScheduler::depth` transfers in flight against a transport
+/// that advertises `isoch_pipeline_depth() > 1`, polling them
+/// round-robin with a no-op waker (the btrfs `noop_waker` idiom:
+/// the futures here are IRQ/self-waking, and the loop re-polls
+/// after every `yield_now`, so no wake is ever lost) and feeding
+/// completed packets to the reassembler strictly in submission
+/// order. Only the ring head is ever consumed, so a late packet
+/// can never overtake an earlier one and frames complete in order.
+///
+/// Polling starts at the head each round, so the head slot always
+/// gets first claim on the next completion — the modelled
+/// transport serves concurrent calls from one FIFO queue, and
+/// head-first polling is what makes its completions land in ring
+/// order the way a controller's Transfer Events do. A non-head
+/// completion is buffered until its turn, never fed early.
+///
+/// The scheduler is the depth counter: a slot launches only while
+/// `should_submit()`, each launch calls `on_submit()`, each
+/// completion calls `on_complete()`. Depth is capped at
+/// `ISOC_DEPTH` (4, the video crate's scheduler depth) and at the
+/// transport's advertised depth. Each slot owns its packet buffer
+/// (`Vec` moved into the owned-buffer receive and returned with
+/// the result), so no slot ever aliases another's buffer.
+///
+/// Lifecycle mirrors the single-shot loop: exit is checked at every
+/// loop top and again after a transfer completes, before its packet
+/// is fed — a packet completing from a transfer that straddled
+/// STREAMOFF is dropped, never delivered into the successor
+/// stream's reset queues. Errors count in consumption order;
+/// eight consecutive errors end the pump with `CaptureFailed`,
+/// same as the single-shot loop.
+async fn pump_video_frames_pipelined<T: UvcTransport>(
+    idx: usize,
+    transport: &T,
+    generation: u64,
+    slot_id: u8,
+    endpoint: UvcStreamingEndpoint,
+    video_node: usize,
+    packet_size: usize,
+) -> Result<(), UvcError> {
+    use core::task::{Context, Poll};
+    use narf_drivers_video::uvc::{IsocScheduler, ISOC_DEPTH};
+
+    let depth = transport.isoch_pipeline_depth().clamp(1, ISOC_DEPTH);
+    let mut scheduler = IsocScheduler::new();
+    scheduler.depth = depth;
+
+    // One owned packet buffer per ring slot, handed to the
+    // owned-buffer receive on launch and returned with the result.
+    let mut bufs: [Option<Vec<u8>>; ISOC_DEPTH] =
+        core::array::from_fn(|_| Some(alloc::vec![0u8; packet_size]));
+    type IsochFut<'a> = core::pin::Pin<
+        alloc::boxed::Box<
+            dyn Future<Output = (Vec<u8>, Result<usize, crate::xhci::XhciError>)> + Send + 'a,
+        >,
+    >;
+    let mut in_flight: [Option<IsochFut<'_>>; ISOC_DEPTH] = [None, None, None, None];
+    let mut completed: [Option<(Vec<u8>, Result<usize, crate::xhci::XhciError>)>; ISOC_DEPTH] =
+        [None, None, None, None];
+    let mut head = 0usize;
+    let mut reassembler = UvcFrameReassembler::new();
+    let mut consecutive_errors = 0u8;
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    loop {
+        if take_pump_exit_request(idx, generation) {
+            return Ok(());
+        }
+        // Refill: launch into every free slot while the scheduler
+        // has room. A free slot always holds its buffer: the buffer
+        // returns to the slot with its completed result.
+        for (i, slot) in in_flight.iter_mut().enumerate().take(depth) {
+            if slot.is_none() && completed[i].is_none() && scheduler.should_submit() {
+                if let Some(buf) = bufs[i].take() {
+                    *slot = Some(Box::pin(transport.isoch_in_owned(
+                        slot_id,
+                        endpoint.dci,
+                        buf,
+                    )));
+                    scheduler.on_submit();
+                }
+            }
+        }
+        // Poll every in-flight transfer once, head first.
+        for k in 0..depth {
+            let i = (head + k) % depth;
+            if let Some(fut) = in_flight[i].as_mut() {
+                if let Poll::Ready((buf, result)) = fut.as_mut().poll(&mut cx) {
+                    completed[i] = Some((buf, result));
+                    in_flight[i] = None;
+                    scheduler.on_complete();
+                }
+            }
+        }
+        // Consume the ring head — and only the head — so packets
+        // feed the reassembler in submission order.
+        let Some((buf, result)) = completed[head].take() else {
+            narf_scheduler::yield_now().await;
+            continue;
+        };
+        // The transfer that completed this packet may have straddled
+        // STREAMOFF: re-check before feeding, and drop the packet
+        // rather than deliver a stale frame into the successor
+        // stream. This check subsumes the single-shot loop's
+        // pre-delivery check — delivery follows the feed with no
+        // await between, so nothing can interleave a stop there.
+        if take_pump_exit_request(idx, generation) {
+            return Ok(());
+        }
+        match result {
+            Ok(received) if received != 0 => {
+                consecutive_errors = 0;
+                // Clamp, don't trust: a transport reporting more
+                // bytes than its buffer held must not panic the pump.
+                let n = received.min(buf.len());
+                if reassembler.push(&buf[..n]) == ReassemblerOutcome::FrameComplete {
+                    let frame = reassembler.take_frame();
+                    let device = narf_drivers_video::devfs_bridge::get_device(video_node)
+                        .ok_or(UvcError::CaptureFailed)?;
+                    device.lock().deliver_frame(frame);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                if consecutive_errors >= 8 {
+                    return Err(UvcError::CaptureFailed);
+                }
+            }
+        }
+        bufs[head] = Some(buf);
+        head = (head + 1) % depth;
+    }
+}
+
+/// A waker that does nothing, for the single in-place polls in
+/// [`pump_video_frames_pipelined`] (same idiom as btrfs'
+/// `noop_waker`: the polled futures are IRQ/self-waking and the
+/// loop re-polls after every `yield_now`, so the wake itself is
+/// never load-bearing).
+fn noop_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    fn raw() -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        raw()
+    }
+    unsafe fn noop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: the vtable never dereferences the (null) data pointer.
+    unsafe { Waker::from_raw(raw()) }
 }
 
 /// Pull one video transfer from the bound UVC device: one iso-IN
