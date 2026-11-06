@@ -959,6 +959,192 @@ pub fn build_periodic_adv_terminate_sync(sync_handle: u16) -> [u8; 2] {
     sync_handle.to_le_bytes()
 }
 
+// ── Sender side: Periodic Advertising Sync Transfer (§7.8.89..92) ────
+//
+// Issue #1654. The receiver half (Sync Transfer Received subevent
+// 0x18, §7.7.65.21) is #1575; these commands make the controller
+// *send* sync information to a connected device, or set how
+// received sync information is processed. All layouts below are
+// from Vol 4 Part E §7.8.89..92 (Core 6.1 text, read in-session),
+// not from the issue: the issue only pins §7.8.89's parameters,
+// and the §7.8.90..92 layouts (Advertising_Handle, Mode / Skip /
+// Sync_Timeout / CTE_Type, Status-only return for §7.8.92) come
+// from the spec sections themselves.
+
+/// `Connection_Handle` / `Sync_Handle` bounds (§7.8.89..91):
+/// 12 bits meaningful, 0x0000..=0x0EFF.
+pub const PA_SYNC_HANDLE_MAX: u16 = 0x0EFF;
+
+/// `Advertising_Handle` bound for Set Info Transfer (§7.8.90):
+/// 0x00..=0xEF.
+pub const PA_ADV_HANDLE_MAX: u8 = 0xEF;
+
+/// `Mode` values for Set (Default) Periodic Advertising Sync
+/// Transfer Parameters (§7.8.91/§7.8.92): what the controller does
+/// when periodic advertising sync information arrives over a
+/// connection.
+pub const PA_SYNC_TRANSFER_MODE_IGNORE: u8 = 0x00;
+pub const PA_SYNC_TRANSFER_MODE_REPORTS_DISABLED: u8 = 0x01;
+pub const PA_SYNC_TRANSFER_MODE_REPORTS_NO_DUP_FILTER: u8 = 0x02;
+pub const PA_SYNC_TRANSFER_MODE_REPORTS_DUP_FILTER: u8 = 0x03;
+
+/// `CTE_Type` bits for §7.8.91/§7.8.92 (a bit set means "do not
+/// sync to packets with that Constant Tone Extension"): bit 0 AoA,
+/// bit 1 AoD with 1 µs slots, bit 2 AoD with 2 µs slots, bit 4
+/// packets without a Constant Tone Extension. Bits 3, 5, 6, 7 are
+/// reserved; setting all four non-reserved bits (0x17) makes the
+/// controller refuse with Command Disallowed (0x0C).
+pub const PA_SYNC_TRANSFER_CTE_AOA: u8 = 0x01;
+pub const PA_SYNC_TRANSFER_CTE_AOD_1US: u8 = 0x02;
+pub const PA_SYNC_TRANSFER_CTE_AOD_2US: u8 = 0x04;
+pub const PA_SYNC_TRANSFER_CTE_NO_CTE: u8 = 0x10;
+pub const PA_SYNC_TRANSFER_CTE_RESERVED_MASK: u8 = 0xE8;
+pub const PA_SYNC_TRANSFER_CTE_ALL: u8 = 0x17;
+
+/// LE Periodic Advertising Sync Transfer parameter block (§7.8.89).
+/// 6 bytes: connection_handle (2 LE) + service_data (2 LE) +
+/// sync_handle (2 LE). Service_Data is a host-provided value for
+/// the peer host; the controller does not use it.
+pub fn build_periodic_adv_sync_transfer(
+    connection_handle: u16,
+    service_data: u16,
+    sync_handle: u16,
+) -> [u8; 6] {
+    let mut out = [0u8; 6];
+    out[0..2].copy_from_slice(&connection_handle.to_le_bytes());
+    out[2..4].copy_from_slice(&service_data.to_le_bytes());
+    out[4..6].copy_from_slice(&sync_handle.to_le_bytes());
+    out
+}
+
+/// LE Periodic Advertising Set Info Transfer parameter block
+/// (§7.8.90). 5 bytes: connection_handle (2 LE) + service_data
+/// (2 LE) + advertising_handle (1). Transfers sync information
+/// about the periodic advertising in one of our own advertising
+/// sets; if the set's parameters changed since the train was first
+/// enabled, the current parameters are sent.
+pub fn build_periodic_adv_set_info_transfer(
+    connection_handle: u16,
+    service_data: u16,
+    advertising_handle: u8,
+) -> [u8; 5] {
+    let mut out = [0u8; 5];
+    out[0..2].copy_from_slice(&connection_handle.to_le_bytes());
+    out[2..4].copy_from_slice(&service_data.to_le_bytes());
+    out[4] = advertising_handle;
+    out
+}
+
+/// LE Set Periodic Advertising Sync Transfer Parameters (§7.8.91).
+/// 8 bytes: connection_handle (2 LE) + mode (1) + skip (2 LE) +
+/// sync_timeout (2 LE) + cte_type (1). Specifies how the
+/// controller processes sync information received over one
+/// connection; it overrides the §7.8.92 defaults (and any earlier
+/// §7.8.91 values) for that connection, and does not affect sync
+/// information already received.
+#[derive(Copy, Clone, Debug)]
+pub struct PeriodicAdvertisingSyncTransferParameters {
+    pub connection_handle: u16,
+    pub mode: u8,
+    pub skip: u16,
+    pub sync_timeout: u16,
+    pub cte_type: u8,
+}
+
+impl PeriodicAdvertisingSyncTransferParameters {
+    /// Spec range check (§7.8.91): handle <= 0x0EFF, mode
+    /// 0x00..=0x03, skip <= 0x01F3, timeout 0x000A..=0x4000, no
+    /// reserved CTE_Type bits, and not all non-reserved CTE_Type
+    /// bits set (the controller refuses that with 0x0C). Mode
+    /// 0x03 additionally needs the controller's Periodic
+    /// Advertising ADI Support feature; the host cannot know that,
+    /// so a 0x11 rejection from the controller is possible even
+    /// for a valid struct.
+    pub fn is_valid(&self) -> bool {
+        self.connection_handle <= PA_SYNC_HANDLE_MAX
+            && self.mode <= PA_SYNC_TRANSFER_MODE_REPORTS_DUP_FILTER
+            && self.skip <= PA_SYNC_SKIP_MAX
+            && self.sync_timeout >= PA_SYNC_TIMEOUT_MIN
+            && self.sync_timeout <= PA_SYNC_TIMEOUT_MAX
+            && self.cte_type & PA_SYNC_TRANSFER_CTE_RESERVED_MASK == 0
+            && self.cte_type != PA_SYNC_TRANSFER_CTE_ALL
+    }
+
+    /// Build the 8-byte parameter block for
+    /// HCI_LE_Set_Periodic_Advertising_Sync_Transfer_Parameters.
+    pub fn encode(&self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0..2].copy_from_slice(&self.connection_handle.to_le_bytes());
+        out[2] = self.mode;
+        out[3..5].copy_from_slice(&self.skip.to_le_bytes());
+        out[5..7].copy_from_slice(&self.sync_timeout.to_le_bytes());
+        out[7] = self.cte_type;
+        out
+    }
+}
+
+/// LE Set Default Periodic Advertising Sync Transfer Parameters
+/// (§7.8.92). 6 bytes: mode (1) + skip (2 LE) + sync_timeout
+/// (2 LE) + cte_type (1). No connection handle: the values are the
+/// initial mode / skip / timeout / CTE type for all subsequent LE
+/// connections, and the command does not affect existing
+/// connections. Mode 0x00 is the default (ignore transfers).
+#[derive(Copy, Clone, Debug)]
+pub struct PeriodicAdvertisingDefaultSyncTransferParameters {
+    pub mode: u8,
+    pub skip: u16,
+    pub sync_timeout: u16,
+    pub cte_type: u8,
+}
+
+impl PeriodicAdvertisingDefaultSyncTransferParameters {
+    /// Spec range check (§7.8.92): same bounds as §7.8.91 minus
+    /// the connection handle.
+    pub fn is_valid(&self) -> bool {
+        self.mode <= PA_SYNC_TRANSFER_MODE_REPORTS_DUP_FILTER
+            && self.skip <= PA_SYNC_SKIP_MAX
+            && self.sync_timeout >= PA_SYNC_TIMEOUT_MIN
+            && self.sync_timeout <= PA_SYNC_TIMEOUT_MAX
+            && self.cte_type & PA_SYNC_TRANSFER_CTE_RESERVED_MASK == 0
+            && self.cte_type != PA_SYNC_TRANSFER_CTE_ALL
+    }
+
+    /// Build the 6-byte parameter block for
+    /// HCI_LE_Set_Default_Periodic_Advertising_Sync_Transfer_Parameters.
+    pub fn encode(&self) -> [u8; 6] {
+        let mut out = [0u8; 6];
+        out[0] = self.mode;
+        out[1..3].copy_from_slice(&self.skip.to_le_bytes());
+        out[3..5].copy_from_slice(&self.sync_timeout.to_le_bytes());
+        out[5] = self.cte_type;
+        out
+    }
+}
+
+/// Outcome of the most recent §7.8.89..92 sync-transfer command,
+/// as reported by its Command Complete. The transfer commands
+/// change no phase — the sync stays Synced, the train stays
+/// Enabled — so the pump records the completion here (see
+/// `PumpCore::last_sync_transfer`) instead of in either state
+/// machine; the pump API / fixtures read it via
+/// `periodic_sync_transfer_last_outcome`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SyncTransferOutcome {
+    /// Opcode of the completed command (0x205A..=0x205D).
+    pub opcode: u16,
+    /// Command Complete status: 0x00 means the sync information
+    /// was queued for transmission (not that the peer handled it);
+    /// 0x42 Unknown Advertising Identifier, 0x02 Unknown
+    /// Connection Identifier, 0x1A Unsupported Remote Feature,
+    /// 0x0C Command Disallowed, 0x11 Unsupported Feature or
+    /// Parameter Value — see §7.8.89..92 for which apply where.
+    pub status: u8,
+    /// Connection_Handle echoed by the Command Complete, for
+    /// 0x005A/0x005B/0x005C; `None` for 0x005D (Status only) and
+    /// for a short return.
+    pub connection_handle: Option<u16>,
+}
+
 // ── Broadcaster side ────────────────────────────────────────────────
 
 /// Phases the periodic advertiser walks during train setup.
