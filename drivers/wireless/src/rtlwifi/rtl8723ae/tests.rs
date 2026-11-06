@@ -1270,6 +1270,7 @@ fn dm_find<'a>(fills: &'a [(u8, Vec<u8>)], id: u8) -> Option<&'a [u8]> {
 /// origin reads; second init is silent; the query sends H2C `0x38
 /// [0x01]` and marks the request sent.
 fn smoke_rtl8723ae_dm_mech_init_and_query() -> TestResult {
+    use coex::*;
     use dm::*;
     let io = fw_fake(false, false, false, false);
     let mut owner = Owner::bind(&coex_bt());
@@ -1315,6 +1316,7 @@ kernel_test_in!(
 /// levels: dword split, LPS modulo reset, dead-read counting to
 /// disabled after two, levels 1200/1400/3000, and LEVEL_3 stickiness.
 fn smoke_rtl8723ae_dm_counters_and_levels() -> TestResult {
+    use coex::*;
     use dm::*;
     let io = fw_fake(false, false, false, false);
     let mut owner = Owner::bind(&coex_bt());
@@ -1951,6 +1953,7 @@ kernel_test_in!(
 /// hold → only ignore-wlan-act; all-off btdm → combined sequences;
 /// tra_tdma skipped on A-cut, sent on B-cut (setter level).
 fn smoke_rtl8723ae_dm_set_bt_dm_gates() -> TestResult {
+    use coex::*;
     use dm::*;
     let io = fw_fake(false, false, false, false);
     let mut owner = Owner::bind(&coex_bt());
