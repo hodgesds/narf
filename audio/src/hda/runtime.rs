@@ -324,6 +324,9 @@ impl IntelHda {
             // is consulted: none of the rescued `hda::quirks`
             // entries verified as a codec subsystem ID (see
             // `quirks.rs`).
+            // SAFETY: Read-only subsystem-ID parameter read on the root node of
+            // codec `cad` (present per the STATESTS mask above); this controller
+            // exclusively owns the command transport and the lease serializes it.
             let subsystem_id = unsafe {
                 dev.send_verb(make_verb(
                     cad,

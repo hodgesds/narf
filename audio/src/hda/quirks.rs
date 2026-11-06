@@ -535,11 +535,11 @@ pub const ALC292_INIT: &[CoefOp] = &[CoefOp::write(0x6, 0x2104)];
 /// ALC293 init.
 pub const ALC293_INIT: &[CoefOp] = &[CoefOp::write(0x35, 0x0000)];
 
-/// ALC294 init — see the empty verified table above: the rescued
-/// rows (0x36, 0x5757), (0x67, 0x4060) are NOT restored here.
-/// Linux's `alc294_init` has no unconditional static coef ops
-/// (depop poll loop + sense-gated default init), so the table is
-/// empty; the rescued rows stay deleted as unverified (#776).
+// ALC294 init — see the empty verified table above: the rescued
+// rows (0x36, 0x5757), (0x67, 0x4060) are NOT restored here.
+// Linux's `alc294_init` has no unconditional static coef ops
+// (depop poll loop + sense-gated default init), so the table is
+// empty; the rescued rows stay deleted as unverified (#776).
 
 /// ALC295 init (Linux `alc269.c::alc295_init`).
 pub const ALC295_INIT: &[CoefOp] = &[
@@ -1081,45 +1081,45 @@ pub const QUIRK_YOGA9_BASS_SPK_SEQ: &[SeqVerb] = &[
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x41),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x0c),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x1a),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x0f),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x42),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x10),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x40),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x02),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x24),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x46),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x0c),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x2a),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x0f),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x46),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x10),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x44),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x02),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
 ];
 
