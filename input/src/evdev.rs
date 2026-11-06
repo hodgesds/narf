@@ -1461,6 +1461,66 @@ pub fn dispatch_pointer_wheel_to_node(
     node.dispatch(EvdevEvent::syn_report(now));
 }
 
+/// Dispatch one Synaptics absolute-pointer frame — absolute
+/// `ABS_X`/`ABS_Y` position (when `moved`), `ABS_PRESSURE`,
+/// `BTN_TOUCH` on hysteresis edges, button transitions — to `node`
+/// as a single evdev frame with one `SYN_REPORT`. This is how a
+/// PS/2 Synaptics pad in absolute mode reports (Linux
+/// `synaptics_process_packet`: `ABS_X`, `ABS_Y` inverted, `z > 30`
+/// / `z < 25` for `BTN_TOUCH`, pressure on every packet). The
+/// pressure event is emitted on every call: absolute mode streams
+/// packets continuously while the finger is near the pad, and the
+/// pressure value is the liveness signal.
+pub fn dispatch_synaptics_abs_to_node(
+    node: &DeviceNode,
+    abs_x: i32,
+    abs_y: i32,
+    pressure: i32,
+    moved: bool,
+    touch: Option<bool>,
+    btn_changes: &[(u16, bool)],
+) {
+    // Monotonic NANOSECONDS — see the note in `dispatch_pointer_to_node`.
+    let now = narf_time::monotonic_ns();
+    if moved {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Abs,
+            code: abs::ABS_X,
+            value: abs_x,
+        });
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Abs,
+            code: abs::ABS_Y,
+            value: abs_y,
+        });
+    }
+    node.dispatch(EvdevEvent {
+        time: now,
+        type_: EventType::Abs,
+        code: abs::ABS_PRESSURE,
+        value: pressure,
+    });
+    if let Some(pressed) = touch {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Key,
+            code: key::BTN_TOUCH,
+            value: if pressed { 1 } else { 0 },
+        });
+    }
+    for &(code, pressed) in btn_changes {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Key,
+            code,
+            value: if pressed { 1 } else { 0 },
+        });
+    }
+    node.dispatch(EvdevEvent::syn_report(now));
+}
+
 // ── Multi-touch (slot protocol B) frame dispatch ────────────────────────────
 
 /// One contact's state in a multi-touch frame, already resolved to an

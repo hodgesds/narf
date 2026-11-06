@@ -11,9 +11,15 @@
 //! * Synaptics / ALPS touchpad *detection* — the magic knocks from
 //!   Linux `synaptics_detect` (`drivers/input/mouse/synaptics.c`) and
 //!   `Documentation/input/alps.txt` ("E6 report" / "E7 report").
-//!   A detected pad keeps working in relative mode (both vendors
-//!   emulate a standard PS/2 mouse until told otherwise); absolute-mode
-//!   enablement is a follow-up lane, not attempted here.
+//!   A detected pad keeps working in relative mode (all three vendors
+//!   emulate a standard PS/2 mouse until told otherwise).
+//! * Synaptics absolute-mode *enablement* — the hardware queries from
+//!   Linux `synaptics_query_hardware` (`__synaptics_init` order:
+//!   identify → model → firmware → board → capability → resolution)
+//!   and the mode byte from Linux `synaptics_set_mode`, sent with
+//!   `synaptics_mode_cmd` (sliced mode byte + `SETRATE(0x14)`).
+//!   A negotiated pad runs 6-byte absolute packets reporting `ABS_X` /
+//!   `ABS_Y` / `ABS_PRESSURE` + `BTN_TOUCH` (see `i8042_mouse`).
 //! * Elantech touchpad *detection* + absolute mode (v1–v4) —
 //!   the magic knock from Linux `elantech_detect`
 //!   (`drivers/input/mouse/elantech.c`): `RESET_DIS`, `DISABLE`,
@@ -29,10 +35,12 @@
 //!   packet checks, verbatim from the same file.
 //! * Synaptics absolute-packet *decoders* (NEWABS / OLDABS, from Linux
 //!   `synaptics_parse_hw_state` + `synaptics_validate_byte`) as pure
-//!   functions with spec fixtures. They are not wired to the IRQ path
-//!   yet — enabling absolute mode needs the Synaptics query/mode
-//!   constants (`SYN_QUE_*`, `SYN_PS_SET_MODE2`, `SYN_BIT_*` from
-//!   `synaptics.h`), which were not verifiable in-session.
+//!   functions with spec fixtures. The wrap rule follows Linux
+//!   (`X_MAX_POSITIVE` 8176: `== 8176` clamps to 6143, above it wraps
+//!   negative).
+//!
+//! MT / AGM is out of scope here: no AGM mode set, no `w == 2` decode,
+//! single-finger SGM only.
 //!
 //! Probe order follows Linux `psmouse_extensions()`: Synaptics, then
 //! ALPS, then Elantech, then a full reset to defaults (the vendor probes
@@ -50,16 +58,28 @@
 //!   200/80/40 Explorer 4.0 tilt enable), `psmouse_process_byte`
 //!   (wheel = `-(signed char)packet[3]` for IMPS; the `packet[3] & 0xC0`
 //!   switch for IMEX), `psmouse_extensions` probe order,
-//!   `psmouse_initialize` (sample rate restored to 100 after probing).
-//! * Linux `drivers/input/mouse/synaptics.c` — `synaptics_detect`
-//!   (4x `SETRES(0)` + `GETINFO`, 2nd response byte `0x47`),
+//!   `psmouse_initialize` (sample rate restored to 100 after probing),
+//!   `psmouse_sliced_command` (`0xE6`, then `0xE8` + each 2-bit
+//!   slice, most significant first).
+//! * Linux `drivers/input/mouse/synaptics.h` — `SYN_QUE_*`,
+//!   `SYN_BIT_*`, `SYN_MODEL_*`, `SYN_CAP_*`, `SYN_ID_*`,
+//!   `SYN_PS_SET_MODE2 = 0x14`.
+//! * Linux `drivers/input/mouse/synaptics.c` — `synaptics_detect`,
+//!   `synaptics_send_cmd`, `synaptics_query_hardware`,
+//!   `synaptics_set_mode`, `synaptics_mode_cmd`,
 //!   `synaptics_parse_hw_state`, `synaptics_validate_byte`,
-//!   `synaptics_invert_y`.
+//!   `synaptics_process_packet` (BTN_TOUCH hysteresis `z > 30` /
+//!   `z < 25`, X/Y reported only when `z > 0 && x > 1`),
+//!   `synaptics_invert_y`, `__synaptics_init`.
 //! * Linux `Documentation/input/alps.txt` — "E6 report"
 //!   (`E8-E6-E6-E6-E9` → `00-00-0A` or `00-00-64`) and "E7 report"
 //!   (`E8-E7-E7-E7-E9` → model signature, `0x73...` for v3/v4).
-
-extern crate alloc;
+//! * Synaptics TouchPad Interfacing Guide, 2nd ed. — §2.3 absolute
+//!   packet contents, §2.4 queries, §2.5 mode byte (Fig 2-14/2-15),
+//!   §3.5.1 information queries, §3.5.2 mode setting sequence
+//!   (`$F3, $14` commit, e.g. `$C1` = Absolute + high rate + W),
+//!   §3.6.2 absolute packet format (Fig 3-18 NEWABS, Fig 3-20
+//!   OLDABS).
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -76,7 +96,7 @@ pub const CMD_GET_ID: u8 = 0xF2;
 pub const CMD_GET_INFO: u8 = 0xE9;
 /// Set resolution (0xE8) — takes one resolution byte.
 pub const CMD_SET_RES: u8 = 0xE8;
-/// Set scaling 1:1 (0xE6).
+/// Set scaling 1:1 (0xE6) — first byte of a sliced command.
 pub const CMD_SET_SCALE11: u8 = 0xE6;
 /// Set scaling 2:1 (0xE7).
 pub const CMD_SET_SCALE21: u8 = 0xE7;
@@ -116,6 +136,153 @@ pub const RESTORE_RATE: u8 = 100;
 /// Second byte of the `GETINFO` reply from a Synaptics pad
 /// (Linux `synaptics_detect`: `param[1] != 0x47` → not Synaptics).
 pub const SYNAPTICS_ID_BYTE: u8 = 0x47;
+
+// ── Synaptics queries (Linux `synaptics.h`) ───────────────────────────────
+//
+// Query numbers are the 8-bit argument encoded as a sliced command
+// (§3.5.1 of the Interfacing Guide: $00 Identify, $01 Read Modes,
+// $02 Read Capabilities, $03 Read Model ID, $08 Read Resolutions;
+// Linux added $06/$07 serial, $09 ext caps, $0a firmware ID,
+// $0c ext caps 0x0c, $0d/$0f max/min coords).
+
+/// Identify TouchPad.
+pub const SYN_QUE_IDENTIFY: u8 = 0x00;
+/// Read TouchPad modes (board ID rides in this response).
+pub const SYN_QUE_MODES: u8 = 0x01;
+/// Read capability bits.
+pub const SYN_QUE_CAPABILITIES: u8 = 0x02;
+/// Read model ID.
+pub const SYN_QUE_MODEL: u8 = 0x03;
+/// Read serial number prefix.
+pub const SYN_QUE_SERIAL_NUMBER_PREFIX: u8 = 0x06;
+/// Read serial number suffix.
+pub const SYN_QUE_SERIAL_NUMBER_SUFFIX: u8 = 0x07;
+/// Read X/Y resolutions (units/mm).
+pub const SYN_QUE_RESOLUTION: u8 = 0x08;
+/// Read extended capabilities.
+pub const SYN_QUE_EXT_CAPAB: u8 = 0x09;
+/// Read firmware ID.
+pub const SYN_QUE_FIRMWARE_ID: u8 = 0x0a;
+/// Read extended capabilities 0x0c (clickpad / AGM / image sensor).
+pub const SYN_QUE_EXT_CAPAB_0C: u8 = 0x0c;
+/// Read maximum reported coordinates.
+pub const SYN_QUE_EXT_MAX_COORDS: u8 = 0x0d;
+/// Read minimum reported coordinates.
+pub const SYN_QUE_EXT_MIN_COORDS: u8 = 0x0f;
+
+// ── Synaptics mode byte bits (Linux `synaptics.h` / Guide Fig 2-14) ───────
+
+/// Absolute mode (bit 7).
+pub const SYN_BIT_ABSOLUTE_MODE: u8 = 0x80;
+/// High packet rate, ~80/s instead of ~40/s (bit 6).
+pub const SYN_BIT_HIGH_RATE: u8 = 0x40;
+/// Sleep mode (bit 3; PS/2 only, relative mode only).
+pub const SYN_BIT_SLEEP_MODE: u8 = 0x08;
+/// Disable tap/drag gesture detection (bit 2; major version >= 4).
+pub const SYN_BIT_DISABLE_GESTURE: u8 = 0x04;
+/// Four-byte pass-through client (bit 1).
+pub const SYN_BIT_FOUR_BYTE_CLIENT: u8 = 0x02;
+/// W mode: enhanced absolute packets carrying the W value (bit 0).
+pub const SYN_BIT_W_MODE: u8 = 0x01;
+
+// ── Synaptics special commands (Linux `synaptics.h`) ──────────────────────
+
+/// `SETRATE` argument that commits a sliced mode byte
+/// (Guide §3.5.2: `Set Sample Rate 20 ($F3, $14)`).
+pub const SYN_PS_SET_MODE2: u8 = 0x14;
+/// `SETRATE` argument for the pass-through port.
+pub const SYN_PS_CLIENT_CMD: u8 = 0x28;
+
+/// Sample rate the pad runs at after reset (PS/2 default); the
+/// mode byte takes `HIGH_RATE` when the rate is >= 80 (Linux
+/// `synaptics_set_mode` / `synaptics_set_rate`).
+pub const SYNAPTICS_RATE: u32 = 100;
+
+/// BTN_TOUCH hysteresis (Linux `synaptics_process_packet`):
+/// touch asserts when `z > 30`, releases when `z < 25`.
+pub const SYN_TOUCH_ON_Z: u8 = 30;
+pub const SYN_TOUCH_OFF_Z: u8 = 25;
+
+// ── Synaptics identity / model / capability decodes ────────────────────────
+
+/// `SYN_MODEL_NEWABS(m)`: model-ID bit 7 — new absolute packet format.
+pub const fn syn_model_newabs(model_id: u32) -> bool {
+    model_id & (1 << 7) != 0
+}
+
+/// `SYN_MODEL_PEN(m)`: model-ID bit 6 — pen sensing.
+pub const fn syn_model_pen(model_id: u32) -> bool {
+    model_id & (1 << 6) != 0
+}
+
+/// `SYN_CAP_EXTENDED(c)`: capability bit 23 — extended capability
+/// bits present, which also means W mode is supported.
+pub const fn syn_cap_extended(capabilities: u32) -> bool {
+    capabilities & (1 << 23) != 0
+}
+
+/// `SYN_CAP_SUBMODEL_ID(c)`: capability bits 15–8.
+pub const fn syn_cap_submodel_id(capabilities: u32) -> u32 {
+    (capabilities & 0x00ff00) >> 8
+}
+
+/// `SYN_EXT_CAP_REQUESTS(c)`: capability bits 22–20 — how many
+/// extended-capability queries the pad answers.
+pub const fn syn_ext_cap_requests(capabilities: u32) -> u32 {
+    (capabilities & 0x700000) >> 20
+}
+
+/// `SYN_CAP_MULTI_BUTTON_NO(ec)`: extended-capability bits 15–12.
+pub const fn syn_cap_multi_button_no(ext_cap: u32) -> u32 {
+    (ext_cap & 0x00f000) >> 12
+}
+
+/// `SYN_CAP_MAX_DIMENSIONS(ex0c)`: ext-cap-0x0c bit 17 — the pad
+/// answers the max-coordinates query (0x0d).
+pub const fn syn_cap_max_dimensions(ext_cap_0c: u32) -> bool {
+    ext_cap_0c & 0x020000 != 0
+}
+
+/// `SYN_CAP_MIN_DIMENSIONS(ex0c)`: ext-cap-0x0c bit 13 — the pad
+/// answers the min-coordinates query (0x0f).
+pub const fn syn_cap_min_dimensions(ext_cap_0c: u32) -> bool {
+    ext_cap_0c & 0x002000 != 0
+}
+
+/// `SYN_CAP_ADV_GESTURE(ex0c)`: ext-cap-0x0c bit 19.
+pub const fn syn_cap_adv_gesture(ext_cap_0c: u32) -> bool {
+    ext_cap_0c & 0x080000 != 0
+}
+
+/// `SYN_CAP_IMAGE_SENSOR(ex0c)`: ext-cap-0x0c bit 11.
+pub const fn syn_cap_image_sensor(ext_cap_0c: u32) -> bool {
+    ext_cap_0c & 0x000800 != 0
+}
+
+/// `SYN_ID_MAJOR(i)`: identify low nibble of the third byte.
+pub const fn syn_id_major(identity: u32) -> u32 {
+    identity & 0x0f
+}
+
+/// `SYN_ID_MINOR(i)`: identify first byte.
+pub const fn syn_id_minor(identity: u32) -> u32 {
+    (identity >> 16) & 0xff
+}
+
+/// `SYN_ID_FULL(i)`: `(major << 8) | minor`.
+pub const fn syn_id_full(identity: u32) -> u32 {
+    (syn_id_major(identity) << 8) | syn_id_minor(identity)
+}
+
+/// `SYN_ID_IS_SYNAPTICS(i)`: identify middle byte is `0x47`.
+pub const fn syn_id_is_synaptics(identity: u32) -> bool {
+    ((identity >> 8) & 0xff) == 0x47
+}
+
+/// `SYN_ID_DISGEST_SUPPORTED(i)`: major version >= 4.
+pub const fn syn_id_disgest_supported(identity: u32) -> bool {
+    syn_id_major(identity) >= 4
+}
 
 /// First byte of an ALPS "E7 report" model signature (v3/v4 pads
 /// answer `73-02-64`; newer pads `73-03-50` / `73-03-0A`).
@@ -161,7 +328,9 @@ pub const ETP_YMAX_V2: u32 = 768;
 /// What the vendor probes found behind the AUX channel. Distinct
 /// from [`PsmouseProtocol`]: a Synaptics pad can still run the
 /// IntelliMouse packet protocol in relative mode (Linux keeps a
-/// `synaptics_hardware` flag alongside `psmouse->type`).
+/// `synaptics_hardware` flag alongside `psmouse->type`);
+/// absolute mode is a separate protocol variant, enabled after the
+/// relative-mode negotiation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PsmouseHardware {
@@ -206,6 +375,12 @@ pub enum PsmouseProtocol {
     ElantechV1 = 6,
     /// Elantech hardware versions 2–4: 6-byte absolute packets.
     Elantech = 7,
+    /// Synaptics absolute mode: 6-byte packets.
+    ///
+    /// Discriminant 8: 6 was already taken by `ElantechV1` when this
+    /// variant landed (PR #1689 merged first), so Synaptics takes the
+    /// next free value rather than colliding.
+    SynapticsAbsolute = 8,
 }
 
 impl PsmouseProtocol {
@@ -217,7 +392,7 @@ impl PsmouseProtocol {
             | PsmouseProtocol::Explorer
             | PsmouseProtocol::ExplorerTilt
             | PsmouseProtocol::ElantechV1 => 4,
-            PsmouseProtocol::Elantech => 6,
+            PsmouseProtocol::Elantech | PsmouseProtocol::SynapticsAbsolute => 6,
         }
     }
 
@@ -229,6 +404,7 @@ impl PsmouseProtocol {
             PsmouseProtocol::ExplorerTilt => "ImExPS/2-4.0",
             PsmouseProtocol::ElantechV1 => "ETPS/2-v1",
             PsmouseProtocol::Elantech => "ETPS/2",
+            PsmouseProtocol::SynapticsAbsolute => "SynPS/2",
         }
     }
 }
@@ -255,11 +431,12 @@ pub fn protocol() -> PsmouseProtocol {
         5 => PsmouseProtocol::ExplorerTilt,
         6 => PsmouseProtocol::ElantechV1,
         7 => PsmouseProtocol::Elantech,
+        8 => PsmouseProtocol::SynapticsAbsolute,
         _ => PsmouseProtocol::Standard,
     }
 }
 
-/// Packet length for the active protocol (3 or 4 bytes).
+/// Packet length for the active protocol (3, 4, or 6 bytes).
 pub fn packet_len() -> usize {
     protocol().packet_len()
 }
@@ -276,7 +453,7 @@ pub fn set_detected(hw: PsmouseHardware, proto: PsmouseProtocol) {
     }
 }
 
-/// Test-only: force a protocol (lets packet fixtures feed 4-byte
+/// Test-only: force a protocol (lets packet fixtures feed 4- or 6-byte
 /// packets without a device). `__reset_for_test` in `i8042_mouse`
 /// restores `Standard`.
 pub fn set_protocol_for_test(proto: PsmouseProtocol) {
@@ -457,7 +634,7 @@ pub trait Ps2Transport {
     /// then `0xE8` + each 2-bit slice of `command`, most significant
     /// first — wire bytes `E6 E8 rr E8 ss E8 tt E8 uu` where
     /// `(rr*64)+(ss*16)+(tt*4)+uu` is the command. Used by the
-    /// Synaptics/Elantech query mechanism.
+    /// Synaptics query / mode-set mechanism.
     fn sliced_command(&mut self, command: u8) -> bool {
         if !self.send(CMD_SET_SCALE11) {
             return false;
@@ -494,6 +671,234 @@ fn detect_synaptics<T: Ps2Transport>(t: &mut T) -> bool {
         return false;
     }
     resp[1] == SYNAPTICS_ID_BYTE
+}
+
+// ── Query + mode set ───────────────────────────────────────────────────────
+
+/// Hardware identity read back by [`synaptics_query_hardware`]
+/// (Linux `struct synaptics_data` fields this lane uses). Zero
+/// means "unqueried / unsupported" for the optional fields
+/// (`x_res`/`y_res`, `x_min`/`x_max`/`y_min`/`y_max`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SynapticsHw {
+    /// Identify triple as one 24-bit value.
+    pub identity: u32,
+    /// Model-ID triple as one 24-bit value.
+    pub model_id: u32,
+    /// Firmware-ID triple as one 24-bit value.
+    pub firmware_id: u32,
+    /// Board ID (from the QUERY MODES response).
+    pub board_id: u32,
+    /// Capability triple as one 24-bit value.
+    pub capabilities: u32,
+    /// Extended capabilities (0x09 query) as one 24-bit value.
+    pub ext_cap: u32,
+    /// Extended capabilities 0x0c as one 24-bit value.
+    pub ext_cap_0c: u32,
+    /// X resolution in units/mm (0 if the pad does not answer).
+    pub x_res: u32,
+    /// Y resolution in units/mm (0 if the pad does not answer).
+    pub y_res: u32,
+    /// Queried minimum X (0 if unqueried — use the nominal edge).
+    pub x_min: u32,
+    /// Queried maximum X (0 if unqueried — use the nominal edge).
+    pub x_max: u32,
+    /// Queried minimum Y (0 if unqueried — use the nominal edge).
+    pub y_min: u32,
+    /// Queried maximum Y (0 if unqueried — use the nominal edge).
+    pub y_max: u32,
+    /// Packet flavour selected by `SYN_MODEL_NEWABS(model_id)`.
+    pub newabs: bool,
+    /// Mode byte actually programmed (Linux `priv->mode`).
+    pub mode: u8,
+}
+
+/// Why absolute-mode enablement failed. Any failure leaves the pad
+/// in relative mode (the caller keeps the 3-byte protocol); only
+/// `ModeSet` needs the best-effort re-assert of mode 0, which
+/// [`synaptics_enable_absolute`] performs before returning.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SynapticsEnableError {
+    /// The Synaptics knock did not match (not a Synaptics pad).
+    Detect,
+    /// A hardware query failed or answered inconsistently.
+    Query,
+    /// The mode-set sequence was not accepted.
+    ModeSet,
+}
+
+/// One Synaptics query (Linux `synaptics_send_cmd`): the query
+/// number as a sliced command, then `GETINFO`, which returns the
+/// 3-byte response.
+pub fn synaptics_send_cmd<T: Ps2Transport>(t: &mut T, query: u8, resp: &mut [u8; 3]) -> bool {
+    if !t.sliced_command(query) {
+        return false;
+    }
+    if !t.send(CMD_GET_INFO) {
+        return false;
+    }
+    t.recv_exact(resp)
+}
+
+/// Read the touchpad hardware (Linux `synaptics_query_hardware`,
+/// in `__synaptics_init` order): identify → model → firmware →
+/// board → capability → resolution. The identify/model/firmware/
+/// board/capability queries are fatal on failure; the resolution
+/// and extended-coordinate queries are best-effort, exactly as in
+/// Linux (a pad that does not answer them simply reports 0).
+pub fn synaptics_query_hardware<T: Ps2Transport>(
+    t: &mut T,
+) -> Result<SynapticsHw, SynapticsEnableError> {
+    let mut hw = SynapticsHw::default();
+    let mut r = [0u8; 3];
+
+    // Identify.
+    if !synaptics_send_cmd(t, SYN_QUE_IDENTIFY, &mut r) {
+        return Err(SynapticsEnableError::Query);
+    }
+    hw.identity = ((r[0] as u32) << 16) | ((r[1] as u32) << 8) | r[2] as u32;
+    if !syn_id_is_synaptics(hw.identity) {
+        return Err(SynapticsEnableError::Query);
+    }
+
+    // Model ID.
+    if !synaptics_send_cmd(t, SYN_QUE_MODEL, &mut r) {
+        return Err(SynapticsEnableError::Query);
+    }
+    hw.model_id = ((r[0] as u32) << 16) | ((r[1] as u32) << 8) | r[2] as u32;
+    hw.newabs = syn_model_newabs(hw.model_id);
+
+    // Firmware ID.
+    if !synaptics_send_cmd(t, SYN_QUE_FIRMWARE_ID, &mut r) {
+        return Err(SynapticsEnableError::Query);
+    }
+    hw.firmware_id = ((r[0] as u32) << 16) | ((r[1] as u32) << 8) | r[2] as u32;
+
+    // Board ID (encoded in the QUERY MODES response).
+    if !synaptics_send_cmd(t, SYN_QUE_MODES, &mut r) {
+        return Err(SynapticsEnableError::Query);
+    }
+    hw.board_id = (((r[0] & 0xfc) as u32) << 6) | r[1] as u32;
+
+    // Capabilities.
+    if !synaptics_send_cmd(t, SYN_QUE_CAPABILITIES, &mut r) {
+        return Err(SynapticsEnableError::Query);
+    }
+    hw.capabilities = ((r[0] as u32) << 16) | ((r[1] as u32) << 8) | r[2] as u32;
+    // Older firmwares had submodel ID fixed to 0x47.
+    if syn_id_full(hw.identity) < 0x705 && syn_cap_submodel_id(hw.capabilities) != 0x47 {
+        return Err(SynapticsEnableError::Query);
+    }
+    // Unless capExtended is set the rest of the flags should be ignored.
+    if !syn_cap_extended(hw.capabilities) {
+        hw.capabilities = 0;
+    }
+    if syn_ext_cap_requests(hw.capabilities) >= 1 {
+        // A pad that claims extended capabilities but does not
+        // answer only loses the extended bits (Linux warns and
+        // continues).
+        if synaptics_send_cmd(t, SYN_QUE_EXT_CAPAB, &mut r) {
+            hw.ext_cap = ((r[0] as u32) << 16) | ((r[1] as u32) << 8) | r[2] as u32;
+            // If nExtBtn is greater than 8 it should be considered
+            // invalid and treated as 0.
+            if syn_cap_multi_button_no(hw.ext_cap) > 8 {
+                hw.ext_cap &= 0xff0fff;
+            }
+        }
+    }
+    if syn_ext_cap_requests(hw.capabilities) >= 4 {
+        if synaptics_send_cmd(t, SYN_QUE_EXT_CAPAB_0C, &mut r) {
+            hw.ext_cap_0c = ((r[0] as u32) << 16) | ((r[1] as u32) << 8) | r[2] as u32;
+        }
+    }
+
+    // Resolution and reported coordinate limits (major >= 4 only).
+    if syn_id_major(hw.identity) >= 4 {
+        if synaptics_send_cmd(t, SYN_QUE_RESOLUTION, &mut r) {
+            if r[0] != 0 && (r[1] & 0x80) != 0 && r[2] != 0 {
+                hw.x_res = r[0] as u32;
+                hw.y_res = r[2] as u32;
+            }
+        }
+        if syn_ext_cap_requests(hw.capabilities) >= 5
+            && syn_cap_max_dimensions(hw.ext_cap_0c)
+            && synaptics_send_cmd(t, SYN_QUE_EXT_MAX_COORDS, &mut r)
+        {
+            hw.x_max = ((r[0] as u32) << 5) | (((r[1] & 0x0f) as u32) << 1);
+            hw.y_max = ((r[2] as u32) << 5) | (((r[1] & 0xf0) as u32) >> 3);
+        }
+        if syn_ext_cap_requests(hw.capabilities) >= 7
+            && syn_cap_min_dimensions(hw.ext_cap_0c)
+            && synaptics_send_cmd(t, SYN_QUE_EXT_MIN_COORDS, &mut r)
+        {
+            hw.x_min = ((r[0] as u32) << 5) | (((r[1] & 0x0f) as u32) << 1);
+            hw.y_min = ((r[2] as u32) << 5) | (((r[1] & 0xf0) as u32) >> 3);
+        }
+    }
+
+    Ok(hw)
+}
+
+/// Set the touchpad mode byte by special commands (Linux
+/// `synaptics_mode_cmd`): the mode byte as a sliced command, then
+/// `SETRATE(SYN_PS_SET_MODE2)` commits it.
+pub fn synaptics_mode_cmd<T: Ps2Transport>(t: &mut T, mode: u8) -> bool {
+    if !t.sliced_command(mode) {
+        return false;
+    }
+    t.send_param(CMD_SET_RATE, SYN_PS_SET_MODE2)
+}
+
+/// Compose the absolute-mode byte (Linux `synaptics_set_mode`):
+/// `ABSOLUTE`, plus `HIGH_RATE` when the report rate is >= 80,
+/// plus `W_MODE` when the pad reports extended capabilities, plus
+/// `DISABLE_GESTURE` when the identity major version is >= 4
+/// (Linux sets `disable_gesture` for those pads in
+/// `__synaptics_init`). Typical modern pad at rate 100:
+/// `0x80 | 0x40 | 0x01 | 0x04 = 0xC5` (Guide Fig 2-15 `$C1`
+/// plus the Linux gesture bit).
+pub fn synaptics_mode_byte(hw: &SynapticsHw, rate: u32) -> u8 {
+    let mut mode = SYN_BIT_ABSOLUTE_MODE;
+    if syn_id_disgest_supported(hw.identity) {
+        mode |= SYN_BIT_DISABLE_GESTURE;
+    }
+    if rate >= 80 {
+        mode |= SYN_BIT_HIGH_RATE;
+    }
+    if syn_cap_extended(hw.capabilities) {
+        mode |= SYN_BIT_W_MODE;
+    }
+    mode
+}
+
+/// Full absolute-mode enablement (Linux `__synaptics_init` minus
+/// the reset, which the caller already performed): detect → query
+/// hardware → set the absolute mode byte.
+///
+/// Precondition: the device was reset and set to defaults, and
+/// data reporting is still disabled (the Guide requires the pad
+/// to be disabled before the mode-set sequence; the caller sends
+/// Enable `0xF4` afterwards to start the 6-byte packet stream).
+/// On any error the pad stays in relative mode and the caller
+/// keeps the 3-byte protocol.
+pub fn synaptics_enable_absolute<T: Ps2Transport>(
+    t: &mut T,
+    rate: u32,
+) -> Result<SynapticsHw, SynapticsEnableError> {
+    if !detect_synaptics(t) {
+        return Err(SynapticsEnableError::Detect);
+    }
+    let mut hw = synaptics_query_hardware(t)?;
+    let mode = synaptics_mode_byte(&hw, rate);
+    if !synaptics_mode_cmd(t, mode) {
+        // Best-effort: force the pad back to relative mode so a
+        // half-committed mode byte cannot leave the IRQ path
+        // parsing 3-byte packets from an absolute-mode pad.
+        let _ = synaptics_mode_cmd(t, 0);
+        return Err(SynapticsEnableError::ModeSet);
+    }
+    hw.mode = mode;
+    Ok(hw)
 }
 
 /// ALPS "E6 report" (Linux `Documentation/input/alps.txt`): wire
@@ -1558,13 +1963,23 @@ pub fn decode_elantech_v4(
 /// Synaptics absolute-mode coordinate limits (Interfacing Guide §2.3.2).
 pub const SYN_X_MAX: i32 = 6143;
 pub const SYN_Y_MAX: i32 = 6143;
-/// Nominal (unqueried) edges, used by the Y inversion.
+/// Nominal (unqueried) edges, used by the Y inversion and by the
+/// evdev `ABS_X`/`ABS_Y` ranges.
 pub const SYN_X_MIN_NOMINAL: i32 = 1472;
 pub const SYN_X_MAX_NOMINAL: i32 = 5472;
 pub const SYN_Y_MIN_NOMINAL: i32 = 1408;
 pub const SYN_Y_MAX_NOMINAL: i32 = 4448;
-/// Wrap-around limit: `((1 << 13) + 6143) / 2 = 7167`.
-pub const SYN_MAX_POSITIVE: i32 = ((1 << 13) + 6143) / 2;
+/// Wrap-around limit (Linux `X_MAX_POSITIVE` / `Y_MAX_POSITIVE`):
+/// values above this are negative values truncated to the 13-bit
+/// reporting range, and a value exactly equal to it means the
+/// finger is at the edge whose precise position cannot be
+/// determined, so it clamps to the axis maximum (6143).
+///
+/// NOTE: an earlier draft used a 7167 midpoint rule here
+/// (`((1 << 13) + 6143) / 2`); that deviates from Linux, which
+/// uses 8176 with the `== 8176 → XMAX` clamp. This lane follows
+/// Linux.
+pub const SYN_MAX_POSITIVE: i32 = 8176;
 /// Absolute position is 13 bits wide.
 pub const SYN_ABS_POS_BITS: u32 = 13;
 
@@ -1586,9 +2001,14 @@ pub struct SynapticsHwState {
     pub right: bool,
 }
 
+/// Wrap-around conversion (Linux `synaptics_parse_hw_state` tail):
+/// above `SYN_MAX_POSITIVE` the value is a truncated negative;
+/// exactly at the limit it is the edge-indeterminate maximum.
 fn synaptics_wrap(value: i32) -> i32 {
     if value > SYN_MAX_POSITIVE {
         value - (1 << SYN_ABS_POS_BITS)
+    } else if value == SYN_MAX_POSITIVE {
+        SYN_X_MAX
     } else {
         value
     }
@@ -1645,13 +2065,48 @@ pub fn decode_synaptics_oldabs(buf: &[u8; 6]) -> SynapticsHwState {
 }
 
 /// Synaptics absolute packet flavour, for byte validation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SynapticsPktType {
-    NewAbs,
-    NewAbsStrict,
-    NewAbsRelaxed,
-    OldAbs,
+    /// NEWABS, not yet classified strict/relaxed (validates with
+    /// the relaxed masks, as Linux does for `SYN_NEWABS`).
+    NewAbs = 0,
+    /// NEWABS, strict masks.
+    NewAbsStrict = 1,
+    /// NEWABS, relaxed masks.
+    NewAbsRelaxed = 2,
+    /// OLDABS.
+    OldAbs = 3,
 }
+
+impl SynapticsPktType {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => SynapticsPktType::NewAbsStrict,
+            2 => SynapticsPktType::NewAbsRelaxed,
+            3 => SynapticsPktType::OldAbs,
+            _ => SynapticsPktType::NewAbs,
+        }
+    }
+
+    /// Initial streaming packet type for a pad (Linux
+    /// `__synaptics_init`: `SYN_MODEL_NEWABS(model_id) ?
+    /// SYN_NEWABS : SYN_OLDABS`).
+    pub fn initial(newabs: bool) -> Self {
+        if newabs {
+            SynapticsPktType::NewAbs
+        } else {
+            SynapticsPktType::OldAbs
+        }
+    }
+}
+
+/// Per-byte validation (Linux `synaptics_validate_byte`).
+/// Only bytes 0..=4 are validated (the 6th byte completes the
+/// packet); `idx` outside that range is invalid.
+/// Masks/results, verbatim from Linux:
+/// * NEWABS strict: mask `{0xC8,0,0,0xC8,0}`, result `{0x80,0,0,0xC0,0}`
+/// * NEWABS relaxed: mask `{0xC0,0,0,0xC0,0}`, result `{0x80,0,0,0xC0,0}`
+/// * OLDABS: mask `{0xC0,0x60,0,0xC0,0x60}`, result `{0xC0,0,0,0x80,0}`
 
 /// Per-byte validation (Linux `synaptics_validate_byte`).
 /// Only bytes 0..=4 are validated (the 6th byte completes the
@@ -1679,6 +2134,18 @@ pub fn synaptics_validate_byte(buf: &[u8; 6], idx: usize, pkt_type: SynapticsPkt
         ),
     };
     (buf[idx] & mask[idx]) == rslt[idx]
+}
+
+/// Classify a NEWABS pad as strict or relaxed from its first
+/// full packet (Linux `synaptics_detect_pkt_type`): strict when
+/// all five validated bytes pass the strict masks.
+pub fn synaptics_detect_pkt_type(buf: &[u8; 6]) -> SynapticsPktType {
+    for i in 0..5 {
+        if !synaptics_validate_byte(buf, i, SynapticsPktType::NewAbsStrict) {
+            return SynapticsPktType::NewAbsRelaxed;
+        }
+    }
+    SynapticsPktType::NewAbsStrict
 }
 
 pub fn register_initcalls() {
