@@ -37,19 +37,34 @@
 //!
 //! Stage cut: bring up the host controller, supply a 400 kHz init
 //! clock, run the SD identification sequence (CMD0 / CMD8 /
-//! ACMD41 / CMD2 / CMD3 / CMD7), then negotiate the data path
-//! (#837): raise the SD clock to the 25 MHz default-speed maximum
-//! from the Capabilities base clock, switch the card + host to a
-//! 4-bit bus (ACMD51 SCR probe, ACMD6 SET_BUS_WIDTH), and serve
+//! ACMD41 with S18R / CMD2 / CMD3 / CMD7), then negotiate the data
+//! path (#837): raise the SD clock to the 25 MHz default-speed
+//! maximum from the Capabilities base clock, switch the card + host
+//! to a 4-bit bus (ACMD51 SCR probe, ACMD6 SET_BUS_WIDTH), and serve
 //! multi-block CMD18 / CMD25 transfers — SDMA / ADMA2 through a
 //! host-owned coherent bounce buffer when the Capabilities say the
 //! host can, PIO multi-block otherwise. Single-block CMD17 / CMD24
 //! PIO (`read_block` / `write_block`) remains for 1-block callers.
 //!
-//! What stays out: UHS-I timing modes and 1.8 V signalling
-//! (#838 — needs CMD6 switch + tuning); eMMC-specific paths
-//! (#827). High-speed 50 MHz (CMD6 switch-function) is likewise a
-//! follow-on, not part of this data path.
+//! UHS-I (#838): when the card reports S18A in its ACMD41 OCR and
+//! the host Capabilities report 1.8 V support, the driver issues
+//! CMD11 and runs the Linux `sdhci_do_start_signal_voltage_switch`
+//! sequence (stop SD clock, DAT[3:0] == 0 check, HOST_CONTROL2
+//! 1.8 V signalling enable, 5 ms settle, restart clock, DAT[3:0]
+//! == 1 check), then queries the card's UHS modes with CMD6
+//! (check) and switches to the best mode the card, the host
+//! Capabilities_1, and the base clock all admit (SDR104 > DDR50 >
+//! SDR50 > SDR25; SDR12-only cards stay at 3.3 V default speed),
+//! executing CMD19 tuning where the mode needs it. A voltage-switch
+//! failure power-cycles the card and re-runs identification +
+//! negotiation without UHS, so the card stays usable at 3.3 V.
+//!
+//! What stays out: eMMC-specific paths (#827, incl. HS200/HS400);
+//! 3.3 V High-Speed 50 MHz (CMD6 switch-function at 3.3 V) is a
+//! follow-on, not part of this data path; CMD6 driver-strength /
+//! current-limit selection is not programmed (cards stay at their
+//! default); re-tuning (SDHCI Capabilities re-tuning modes/timer)
+//! is not wired — tuning runs once at bring-up.
 
 use core::sync::atomic::AtomicBool;
 
@@ -60,7 +75,8 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::req_gate::ReqGate;
-use narf_drivers_storage_core::sd_proto::{R1Status, Scr};
+use narf_drivers_storage_core::sd_proto::{R1Status, Scr, SwitchStatus};
+use narf_drivers_storage_core::sd_proto::{ACMD41_S18R, OCR_S18A};
 
 // SDHCI is a PCI class 0x08 / subclass 0x05 device. Each silicon
 // vendor has its own VID/DID, but the class triple is universally
@@ -97,6 +113,12 @@ const REG_ADMA_ERROR: u64 = 0x54;
 const REG_ADMA_ADDR: u64 = 0x58;
 const REG_ADMA_ADDR_HI: u64 = 0x5C;
 const REG_HOST_VERSION: u64 = 0xFE;
+/// Host Control 2 (§2.2.15; bit values shared with
+/// `drivers/sdio/src/sdhci/regs.rs`, same SDHCI lineage).
+const REG_HOST_CONTROL_2: u64 = 0x3E;
+/// Capabilities 1 — the high dword of the 64-bit Capabilities
+/// register (§2.2.25): UHS mode support + re-tuning fields.
+const REG_CAPABILITIES_1: u64 = 0x44;
 
 // Capabilities register bits (§2.2.24; bit values shared with
 // `drivers/sdio/src/sdhci/regs.rs`, same SDHCI lineage).
@@ -106,6 +128,33 @@ const CAPS_CLOCK_BASE_MASK_V2: u32 = 0x0000_3F00; // spec ≤ 2.00, bits [13:8].
 const CAPS_CAN_DO_ADMA2: u32 = 0x0008_0000;
 const CAPS_CAN_DO_SDMA: u32 = 0x0040_0000;
 const CAPS_CAN_64BIT: u32 = 0x1000_0000;
+/// Capabilities bit 26 — the host can supply 1.8 V signalling
+/// (SDHCI 3.00 §2.2.24; Linux `SDHCI_CAN_VDD_180`, gated by
+/// `sdhci_do_start_signal_voltage_switch`'s `SDHCI_SIGNALING_180`).
+const CAPS_CAN_VDD_180: u32 = 0x0400_0000;
+
+// Capabilities 1 bits (§2.2.25; bit values shared with
+// `drivers/sdio/src/sdhci/regs.rs`).
+/// Host supports UHS SDR50 (Capabilities bit 32).
+const CAPS1_SUPPORT_SDR50: u32 = 0x0000_0001;
+/// Host supports UHS SDR104 (Capabilities bit 33).
+const CAPS1_SUPPORT_SDR104: u32 = 0x0000_0002;
+/// Host supports UHS DDR50 (Capabilities bit 34).
+const CAPS1_SUPPORT_DDR50: u32 = 0x0000_0004;
+/// "Use Tuning for SDR50" (Capabilities bit 45): SDR50 needs
+/// CMD19 tuning on this host (Linux `SDHCI_SDR50_NEEDS_TUNING`).
+const CAPS1_TUNING_SDR50: u32 = 0x0000_2000;
+
+// Host Control 2 bits (§2.2.15; bit values shared with
+// `drivers/sdio/src/sdhci/regs.rs`).
+/// UHS Mode Select field, bits [2:0].
+const HC2_UHS_MASK: u16 = 0x0007;
+/// 1.8 V Signalling Enable, bit 3.
+const HC2_VDD_180: u16 = 0x0008;
+/// Execute Tuning, bit 6.
+const HC2_EXEC_TUNING: u16 = 0x0040;
+/// Sampling Clock Select / tuned clock, bit 7.
+const HC2_TUNED_CLK: u16 = 0x0080;
 
 // Host version (low byte of REG_HOST_VERSION): 0 = 1.00, 1 = 2.00,
 // 2 = 3.00, 3 = 4.00.
@@ -137,8 +186,30 @@ const SDMA_BOUNDARY_ARG: u16 = 7;
 /// SD clock targets.
 const INIT_CLOCK_HZ: u32 = 400_000;
 /// Default-speed maximum (SD Physical Layer Spec: default-speed
-/// mode runs to 25 MHz; 50 MHz needs the high-speed switch, #838).
+/// mode runs to 25 MHz; above that the card needs the UHS-I switch
+/// in `negotiate_uhs`, or the 3.3 V high-speed switch follow-on).
 const DATA_CLOCK_HZ: u32 = 25_000_000;
+
+/// UHS-I voltage-switch waits (Linux
+/// `sdhci_do_start_signal_voltage_switch` `usleep_range` values;
+/// the simplified SD spec leaves §4.2.4.2 timing blank).
+/// 5 ms after enabling 1.8 V signalling, before restarting the
+/// SD clock; 1 ms after restarting it, before the DAT[3:0] check.
+const VOLTAGE_SWITCH_SETTLE_MS: u64 = 5;
+const VOLTAGE_SWITCH_DAT_MS: u64 = 1;
+/// Power-cycle wait in the voltage-switch failure path (Linux:
+/// "Wait for 1ms as per the spec").
+const POWER_CYCLE_MS: u64 = 1;
+
+/// CMD19 tuning (Linux `sdhci_execute_tuning`,
+/// `MAX_TUNING_LOOP`): the host may ask for up to 40 CMD19s, and
+/// the total time the card spends responding must stay under
+/// 150 ms (SDHCI spec; Linux `timeout = 150`).
+const TUNING_MAX_LOOPS: usize = 40;
+const TUNING_BUDGET_MS: u64 = 150;
+/// CMD19 tuning-block length in bytes (SD Physical Layer Spec
+/// §4.2.4.5; fixed, CMD16 not required).
+const TUNING_BLOCK_LEN: usize = 64;
 /// Largest divisor the 10-bit divider field encodes (spec 3.00+).
 const MAX_DIV_SPEC_300: u32 = 2046;
 /// Largest divisor for spec ≤ 2.00.
@@ -171,6 +242,11 @@ const POWER_3V3: u8 = 0b111 << 1; // 3.3V
 // Present state bits (§2.2.9).
 const PSTATE_CMD_INHIBIT: u32 = 1 << 0;
 const PSTATE_DAT_INHIBIT: u32 = 1 << 1;
+/// DAT Line Signal Level, bits [23:20] — the live level of
+/// DAT[3:0], read by the voltage-switch sequence (Linux
+/// `SDHCI_DATA_LVL_MASK`, shift 20).
+const PSTATE_DAT_LVL_MASK: u32 = 0x00F0_0000;
+const PSTATE_DAT_LVL_SHIFT: u32 = 20;
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PSTATE_BUFFER_READ_EN: u32 = 1 << 11;
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
@@ -249,6 +325,19 @@ pub enum SdhciError {
     AdmaError(u16),
     /// A DMA transfer never reached Transfer Complete.
     DmaTimeout,
+    /// CMD11 was rejected with an R1 error: the card never started
+    /// the voltage switch and is still at 3.3 V — no recovery is
+    /// needed, UHS is simply skipped.
+    VoltageSwitchRejected,
+    /// The voltage switch failed after CMD11 was accepted (a DAT
+    /// line check failed, or CMD11 itself timed out): the card's
+    /// signalling state is unknown, so the caller must power-cycle
+    /// the card and re-identify (Linux returns `-EAGAIN` here and
+    /// the core retries with S18R = 0).
+    VoltageSwitchFailed,
+    /// CMD19 tuning never completed (Execute Tuning stayed set past
+    /// the loop/budget limit, or the tuned-clock bit never set).
+    TuningFailed,
 }
 
 /// Host data-path DMA mode, selected from Capabilities at bring-up
@@ -309,6 +398,123 @@ pub const fn select_dma_mode(spec_version: u8, caps: u32) -> Option<DmaMode> {
     }
     if caps & CAPS_CAN_DO_SDMA != 0 && !bits64 {
         return Some(DmaMode::Sdma);
+    }
+    None
+}
+
+/// UHS-I bus speed mode (SD Physical Layer Spec §4.2.4 /
+/// Table 4-10, Function Group 1 access mode; Linux
+/// `UHS_*_BUS_SPEED` + `SD_MODE_UHS_*`).
+///
+/// The `u8` values are the CMD6 Function Group 1 function numbers
+/// (0 = SDR12, 1 = SDR25, 2 = SDR50, 3 = SDR104, 4 = DDR50) and
+/// double as the HOST_CONTROL2 UHS Mode Select values (§2.2.15) —
+/// the two encodings agree by spec design.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UhsMode {
+    Sdr12,
+    Sdr25,
+    Sdr50,
+    Sdr104,
+    Ddr50,
+}
+
+impl UhsMode {
+    /// CMD6 Function Group 1 function number (== HOST_CONTROL2
+    /// UHS Mode Select value).
+    pub const fn function(self) -> u8 {
+        match self {
+            Self::Sdr12 => 0,
+            Self::Sdr25 => 1,
+            Self::Sdr50 => 2,
+            Self::Sdr104 => 3,
+            Self::Ddr50 => 4,
+        }
+    }
+
+    /// Maximum SD clock for the mode (SD Physical Layer Spec
+    /// §4.2.4 / Linux `UHS_*_MAX_DTR`): SDR12 25 MHz, SDR25
+    /// 50 MHz, SDR50 100 MHz, SDR104 208 MHz, DDR50 50 MHz.
+    pub const fn max_clock_hz(self) -> u32 {
+        match self {
+            Self::Sdr12 => 25_000_000,
+            Self::Sdr25 => 50_000_000,
+            Self::Sdr50 => 100_000_000,
+            Self::Sdr104 => 208_000_000,
+            Self::Ddr50 => 50_000_000,
+        }
+    }
+
+    /// HOST_CONTROL2 UHS Mode Select value for this mode.
+    pub const fn host_control2(self) -> u16 {
+        self.function() as u16
+    }
+
+    /// Whether the mode needs CMD19 tuning on this host (Linux
+    /// `sdhci_execute_tuning`): SDR104 always; SDR50 / DDR50
+    /// only when the host reports "Use Tuning for SDR50"
+    /// (Capabilities bit 45). SDR12 / SDR25 use fixed sampling.
+    pub const fn needs_tuning(self, caps1_tuning_sdr50: bool) -> bool {
+        match self {
+            Self::Sdr104 => true,
+            Self::Sdr50 | Self::Ddr50 => caps1_tuning_sdr50,
+            Self::Sdr12 | Self::Sdr25 => false,
+        }
+    }
+}
+
+/// CMD6 (SWITCH_FUNC) argument (SD Physical Layer Spec §4.3.10;
+/// Linux `drivers/mmc/core/sd_ops.c` `mmc_sd_switch` lineage):
+/// bit 31 is the mode (0 = check, 1 = switch), each function
+/// group occupies 4 bits (group 1 in [3:0], group 2 in [7:4],
+/// …), and every group except the target keeps 0xF ("no change").
+pub const fn cmd6_arg(switch: bool, group: u8, value: u8) -> u32 {
+    let mode = if switch { 1u32 << 31 } else { 0 };
+    let shift = (group as u32) * 4;
+    let others = 0x00FF_FFFFu32 & !(0xFu32 << shift);
+    mode | others | ((value as u32 & 0xF) << shift)
+}
+
+/// Pick the best UHS-I mode the card, the host, and the base clock
+/// all admit (Linux `sd_update_bus_speed_mode` preference order:
+/// SDR104 > DDR50 > SDR50 > SDR25).
+///
+/// `card_support` is the CMD6 status[13] Function Group 1
+/// bitmask; `caps1` is the Capabilities_1 register; `base_hz` is
+/// the host base clock. A mode is admitted only when the card
+/// reports it, the host Capabilities_1 reports it (SDR25 needs no
+/// Capabilities_1 bit — it is the baseline 1.8 V mode of a v3.00+
+/// host), and the base clock can actually reach the mode's maximum
+/// rate (a slower clock would make the mode no faster than the one
+/// below it). SDR12 is never picked: it runs at the same 25 MHz as
+/// default speed, so switching voltage for it buys nothing.
+/// Returns `None` when no UHS mode is admissible — the caller
+/// stays at 3.3 V default speed.
+pub const fn select_uhs_mode(card_support: u8, caps1: u32, base_hz: u32) -> Option<UhsMode> {
+    // SDR104: card bit 3 + host bit + 208 MHz base.
+    if card_support & (1 << 3) != 0
+        && caps1 & CAPS1_SUPPORT_SDR104 != 0
+        && base_hz >= UhsMode::Sdr104.max_clock_hz()
+    {
+        return Some(UhsMode::Sdr104);
+    }
+    // DDR50: card bit 4 + host bit + 50 MHz base.
+    if card_support & (1 << 4) != 0
+        && caps1 & CAPS1_SUPPORT_DDR50 != 0
+        && base_hz >= UhsMode::Ddr50.max_clock_hz()
+    {
+        return Some(UhsMode::Ddr50);
+    }
+    // SDR50: card bit 2 + host bit + 100 MHz base.
+    if card_support & (1 << 2) != 0
+        && caps1 & CAPS1_SUPPORT_SDR50 != 0
+        && base_hz >= UhsMode::Sdr50.max_clock_hz()
+    {
+        return Some(UhsMode::Sdr50);
+    }
+    // SDR25: card bit 1 + 50 MHz base (no host Capabilities_1 bit).
+    if card_support & (1 << 1) != 0 && base_hz >= UhsMode::Sdr25.max_clock_hz() {
+        return Some(UhsMode::Sdr25);
     }
     None
 }
@@ -486,15 +692,19 @@ pub struct DataPath {
     pub bus_width: u8,
     /// DMA mode admitted at bring-up; `None` is PIO.
     pub dma_mode: Option<DmaMode>,
+    /// UHS-I mode negotiated at bring-up; `None` is default speed
+    /// at 3.3 V signalling.
+    pub uhs_mode: Option<UhsMode>,
 }
 
 impl DataPath {
-    /// The identification profile: 400 kHz, 1-bit, PIO.
+    /// The identification profile: 400 kHz, 1-bit, PIO, 3.3 V.
     pub const fn identification() -> Self {
         Self {
             clock_hz: INIT_CLOCK_HZ,
             bus_width: 1,
             dma_mode: None,
+            uhs_mode: None,
         }
     }
 }
@@ -526,6 +736,11 @@ pub struct SdCard {
     /// CCS bit from ACMD41 — 1 = SDHC/SDXC (block-addressed),
     /// 0 = SDSC (byte-addressed).
     pub ccs: bool,
+    /// S18A bit from the ACMD41 OCR (bit 24) — the card accepts a
+    /// switch to 1.8 V signalling (SD Physical Layer Spec
+    /// §4.2.4.1). The gate for CMD11: a card that reports 0 here
+    /// must never be sent CMD11.
+    pub s18a: bool,
     /// Card capacity in 512-byte blocks.
     pub capacity_blocks: u64,
 }
@@ -707,8 +922,10 @@ impl Sdhci {
         // 7. Run the SD identification sequence.
         // SAFETY: `me.io` is the SDHCI register window set up above
         // and `identify_sequence` runs here at bring-up (its other
-        // call site is resume re-identification, #839), with no
-        // transfer in flight.
+        // call sites are resume re-identification, #839, and the
+        // voltage-switch recovery path after a power cycle),
+        // satisfying its single-caller ownership precondition,
+        // with no transfer in flight.
         let card = unsafe { me.identify_sequence() }?;
         *me.card.lock() = Some(card);
         // Negotiate the data path (clock raise, bus width, DMA).
@@ -834,8 +1051,10 @@ impl Sdhci {
     /// Run the SD identification sequence.
     ///
     /// # Safety
-    /// MMIO ownership; called once at bring-up and again on resume
-    /// re-identification (#839), with no transfer in flight.
+    /// MMIO ownership; called at bring-up, again on resume
+    /// re-identification (#839), and after a power cycle by the
+    /// voltage-switch recovery path — never concurrently, never
+    /// while a transfer is in flight.
     unsafe fn identify_sequence(&self) -> Result<SdCard, SdhciError> {
         // CMD0 (GO_IDLE_STATE) — no response.
         let _ = self.cmd(0, 0, RESP_NONE, false, 0, 0, 0)?;
@@ -852,6 +1071,12 @@ impl Sdhci {
         // ACMD41 (SD_SEND_OP_COND): repeat CMD55 + CMD41 until
         // the response's busy bit (bit 31) is set.
         let mut acmd41_arg = 0x4000_0000u32; // HCS=1 (host supports SDHC).
+        // S18R=1: ask the card whether it accepts a switch to
+        // 1.8 V signalling (SD Physical Layer Spec §4.2.4.1; Linux
+        // sets it whenever the host supports a UHS-I mode). Inert
+        // for cards that do not support the switch — they answer
+        // S18A=0 and the driver never sends CMD11.
+        acmd41_arg |= ACMD41_S18R;
         if if_cond_match {
             acmd41_arg |= 0x0030_0000;
         } // 3.3V window.
@@ -871,6 +1096,7 @@ impl Sdhci {
             return Err(SdhciError::CmdTimeout);
         }
         let ccs = ocr & 0x4000_0000 != 0;
+        let s18a = ocr & OCR_S18A != 0;
 
         // CMD2 (ALL_SEND_CID) — 136-bit response.
         let _ = self.cmd(2, 0, RESP_136, false, 0, 0, 0)?;
@@ -899,6 +1125,7 @@ impl Sdhci {
             cid,
             if_cond_match,
             ccs,
+            s18a,
             capacity_blocks,
         })
     }
@@ -1025,17 +1252,385 @@ impl Sdhci {
         Ok(())
     }
 
+    /// Spin for `ms` milliseconds while ticking the sleep pumps
+    /// (the `responsive_spin_until(|| false, …)` delay pattern the
+    /// SDIO stack uses for its microsecond delays).
+    fn sleep_ms(ms: u64) {
+        let _ = narf_scheduler::responsive_spin_until(
+            || false,
+            narf_time::Deadline::after_ms(ms),
+        );
+    }
+
+    /// Issue CMD6 (SWITCH_FUNC) and read back the 64-byte switch
+    /// status (SD Physical Layer Spec §4.3.10; Linux
+    /// `mmc_sd_switch`). `switch` selects mode 1 (install the
+    /// function) vs mode 0 (query); `group` is the 0-based function
+    /// group (0 = access mode / bus speed), `value` the function.
+    /// The card must be selected (CMD7 done).
+    fn cmd6_status(&self, switch: bool, group: u8, value: u8) -> Result<SwitchStatus, SdhciError> {
+        let arg = cmd6_arg(switch, group, value);
+        // Block size 64 + the SDMA boundary field, as Linux
+        // programs `SDHCI_MAKE_BLKSZ(7, 64)` for its 64-byte
+        // switch/tuning transfers.
+        let blksz = ((SDMA_BOUNDARY_ARG & 0x7) << 12) | 64;
+        let r = self.cmd(6, arg, RESP_48, true, TM_DATA_DIR_READ, blksz, 1)?;
+        if (R1Status { raw: r }).has_error() {
+            return Err(SdhciError::DeviceError(r as u16));
+        }
+        let mut bytes = [0u8; 64];
+        self.read_data_pio(&mut bytes)?;
+        Ok(SwitchStatus::parse(&bytes))
+    }
+
+    /// Power-cycle the card after a failed voltage switch (Linux
+    /// failure arm): POWER_ON off, 1 ms, POWER_ON on, preserving
+    /// the 3.3 V field. Returns the recovery-required error.
+    fn voltage_switch_power_cycle(&self) -> SdhciError {
+        let pwr = self.io.read8(REG_POWER_CONTROL);
+        self.io.write8(REG_POWER_CONTROL, pwr & !POWER_ON);
+        Self::sleep_ms(POWER_CYCLE_MS);
+        self.io.write8(REG_POWER_CONTROL, pwr | POWER_ON);
+        SdhciError::VoltageSwitchFailed
+    }
+
+    /// Run the 1.8 V signalling switch on the host side, after
+    /// CMD11 was accepted (Linux
+    /// `sdhci_do_start_signal_voltage_switch`, 1.8 V arm): stop
+    /// the SD clock, check DAT[3:0] == 0, enable 1.8 V signalling
+    /// in HOST_CONTROL2, wait 5 ms, restart the SD clock, wait
+    /// 1 ms, check DAT[3:0] == 1.
+    ///
+    /// POWER_CONTROL is deliberately untouched: the card supply
+    /// stays 3.3 V (the SD card's operating range is 2.7–3.6 V);
+    /// the 1.8 V signalling rail is the controller's own
+    /// HOST_CONTROL2-switched rail (on AMD FCH hosts Linux leaves
+    /// vqmmc unmodelled and the switch is exactly this register
+    /// dance). On failure the card is power-cycled by
+    /// `voltage_switch_power_cycle` and `VoltageSwitchFailed` is
+    /// returned; the caller must re-identify.
+    fn switch_signal_voltage(&self) -> Result<(), SdhciError> {
+        use core::fmt::Write as _;
+        // Stop the SD clock, keeping the divider + internal clock.
+        let clk = self.io.read16(REG_CLOCK_CONTROL);
+        self.io.write16(REG_CLOCK_CONTROL, clk & !CLK_SD_EN);
+        // The card drives DAT[3:0] low after accepting CMD11.
+        let pstate = self.io.read32(REG_PRESENT_STATE);
+        if (pstate & PSTATE_DAT_LVL_MASK) >> PSTATE_DAT_LVL_SHIFT != 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  sdhci: DAT lines not low after CMD11; power-cycling",
+            );
+            return Err(self.voltage_switch_power_cycle());
+        }
+        // Enable 1.8 V signalling.
+        let ctrl2 = self.io.read16(REG_HOST_CONTROL_2);
+        self.io.write16(REG_HOST_CONTROL_2, ctrl2 | HC2_VDD_180);
+        // Wait 5 ms for the rail to settle.
+        Self::sleep_ms(VOLTAGE_SWITCH_SETTLE_MS);
+        // The enable must have stuck.
+        let ctrl2 = self.io.read16(REG_HOST_CONTROL_2);
+        if ctrl2 & HC2_VDD_180 == 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  sdhci: 1.8 V signalling enable did not stick; power-cycling",
+            );
+            return Err(self.voltage_switch_power_cycle());
+        }
+        // Restart the SD clock and wait 1 ms.
+        let clk = self.io.read16(REG_CLOCK_CONTROL);
+        self.io.write16(REG_CLOCK_CONTROL, clk | CLK_SD_EN);
+        Self::sleep_ms(VOLTAGE_SWITCH_DAT_MS);
+        // Completion is checked by DAT[3:0] high (SD Physical
+        // Layer Spec §4.2.4.1: any bit may be checked; Linux
+        // requires all four).
+        let pstate = self.io.read32(REG_PRESENT_STATE);
+        if (pstate & PSTATE_DAT_LVL_MASK) == PSTATE_DAT_LVL_MASK {
+            return Ok(());
+        }
+        let _ = writeln!(
+            narf_console::Writer,
+            "  sdhci: DAT lines not high after 1.8 V switch; power-cycling",
+        );
+        Err(self.voltage_switch_power_cycle())
+    }
+
+    /// Program the HOST_CONTROL2 UHS Mode Select field for `mode`,
+    /// preserving the 1.8 V signalling enable and the tuning bits.
+    fn set_uhs_host_mode(&self, mode: UhsMode) {
+        let ctrl2 = self.io.read16(REG_HOST_CONTROL_2);
+        self.io
+            .write16(REG_HOST_CONTROL_2, (ctrl2 & !HC2_UHS_MASK) | mode.host_control2());
+    }
+
+    /// Execute CMD19 tuning for `mode` (Linux
+    /// `sdhci_execute_tuning`): set Execute Tuning in
+    /// HOST_CONTROL2, issue CMD19 (64-byte tuning block) until the
+    /// host clears Execute Tuning or the 40-iteration / 150 ms
+    /// budget is spent, then require the tuned-clock bit. Modes
+    /// that do not need tuning return `Ok` immediately. On failure
+    /// Execute Tuning + Tuned Clock are cleared (fixed sampling)
+    /// and `TuningFailed` is returned.
+    fn execute_tuning(&self, mode: UhsMode, caps1: u32) -> Result<(), SdhciError> {
+        use core::fmt::Write as _;
+        if !mode.needs_tuning(caps1 & CAPS1_TUNING_SDR50 != 0) {
+            return Ok(());
+        }
+        let ctrl2 = self.io.read16(REG_HOST_CONTROL_2);
+        self.io.write16(REG_HOST_CONTROL_2, ctrl2 | HC2_EXEC_TUNING);
+        let budget = narf_time::Deadline::after_ms(TUNING_BUDGET_MS);
+        let mut tuned = false;
+        for _ in 0..TUNING_MAX_LOOPS {
+            // CMD19: R1 + 64-byte tuning block, PIO, DMA off,
+            // multi-block off — the block-size register carries
+            // the boundary field as for CMD6.
+            let blksz = ((SDMA_BOUNDARY_ARG & 0x7) << 12) | 64;
+            let ok = match self.cmd(19, 0, RESP_48, true, TM_DATA_DIR_READ, blksz, 1) {
+                Ok(r) if !(R1Status { raw: r }).has_error() => true,
+                _ => false,
+            };
+            if ok {
+                let mut block = [0u8; TUNING_BLOCK_LEN];
+                if self.read_data_pio(&mut block).is_ok() {
+                    let ctrl2 = self.io.read16(REG_HOST_CONTROL_2);
+                    if ctrl2 & HC2_EXEC_TUNING == 0 {
+                        tuned = ctrl2 & HC2_TUNED_CLK != 0;
+                        break;
+                    }
+                }
+            }
+            if budget.expired() {
+                break;
+            }
+        }
+        if tuned {
+            return Ok(());
+        }
+        // Fall back to fixed sampling: clear both tuning bits.
+        let ctrl2 = self.io.read16(REG_HOST_CONTROL_2);
+        self.io
+            .write16(REG_HOST_CONTROL_2, ctrl2 & !(HC2_EXEC_TUNING | HC2_TUNED_CLK));
+        let _ = writeln!(
+            narf_console::Writer,
+            "  sdhci: tuning failed for {:?}; fixed sampling",
+            mode,
+        );
+        Err(SdhciError::TuningFailed)
+    }
+
+    /// Negotiate UHS-I after the bus-width step (Linux
+    /// `mmc_sd_init_uhs_card` order: bus width, then mode select,
+    /// then bus-speed switch, then tuning).
+    ///
+    /// Returns `Ok` for every outcome except a voltage-switch
+    /// failure that needs a power-cycle + re-identification, which
+    /// is `Err(VoltageSwitchFailed)` (the card was already
+    /// power-cycled by `switch_signal_voltage` /
+    /// `voltage_switch_power_cycle`).
+    fn negotiate_uhs(
+        &self,
+        caps: u32,
+        caps1: u32,
+        spec_version: u8,
+        base_hz: u32,
+        path: &mut DataPath,
+    ) -> Result<(), SdhciError> {
+        use core::fmt::Write as _;
+        // Gates: v3.00+ host, 1.8 V-capable host, a base clock to
+        // raise from, and a card that accepts the switch (S18A).
+        // Any gate closed leaves the card at 3.3 V default speed.
+        if spec_version < SPEC_300 || caps & CAPS_CAN_VDD_180 == 0 || base_hz == 0 {
+            return Ok(());
+        }
+        let s18a = self.card.lock().map(|c| c.s18a).unwrap_or(false);
+        if !s18a {
+            return Ok(());
+        }
+        // 1. CMD11: the card starts the voltage switch on an R1.
+        match self.cmd(11, 0, RESP_48, false, 0, 0, 0) {
+            Ok(r) if !(R1Status { raw: r }).has_error() => {}
+            Ok(_) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  sdhci: CMD11 rejected; staying 3.3 V",
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                // No response to CMD11: the spec says power-cycle
+                // (SD Physical Layer Spec §4.2.4.4).
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  sdhci: CMD11 timed out; power-cycling",
+                );
+                return Err(self.voltage_switch_power_cycle());
+            }
+        }
+        // 2. Host-side switch (clock stop, DAT checks, 1.8 V
+        // enable, clock restart). Failure already power-cycled.
+        self.switch_signal_voltage()?;
+        // 3. CMD6 check: which UHS modes does the card offer at
+        // 1.8 V? (At 3.3 V the SDR50/SDR104/DDR50 bits read 0 —
+        // Linux queries only after the switch for this reason.)
+        let support = match self.cmd6_status(false, 0, 0) {
+            Ok(status) => status.group1_support(),
+            Err(_) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  sdhci: CMD6 query failed; staying SDR12 at 1.8 V",
+                );
+                path.uhs_mode = Some(UhsMode::Sdr12);
+                return Ok(());
+            }
+        };
+        let Some(mode) = select_uhs_mode(support, caps1, base_hz) else {
+            // No mode above SDR12 is admissible (SDR12-only card,
+            // or the base clock cannot reach SDR25): stay in the
+            // post-switch default, SDR12 at 1.8 V.
+            path.uhs_mode = Some(UhsMode::Sdr12);
+            return Ok(());
+        };
+        // 4. CMD6 switch to the mode; on rejection fall back to
+        // SDR25, then to the SDR12 the switch already left us in.
+        let mut settled = mode;
+        match self.cmd6_status(true, 0, mode.function()) {
+            Ok(status) if status.group1_function() == mode.function() => {}
+            _ => match self.cmd6_status(true, 0, UhsMode::Sdr25.function()) {
+                Ok(status) if status.group1_function() == UhsMode::Sdr25.function() => {
+                    settled = UhsMode::Sdr25;
+                }
+                _ => {
+                    settled = UhsMode::Sdr12;
+                }
+            },
+        }
+        // 5. Host side: UHS mode bits, then the mode clock
+        // (Linux `sd_set_bus_speed_mode`: switch, timing, clock).
+        // A clock that cannot be confirmed leaves the UHS state
+        // unproven — power-cycle and re-identify at 3.3 V rather
+        // than serve I/O at an unconfirmed rate.
+        self.set_uhs_host_mode(settled);
+        match self.set_clock(settled.max_clock_hz()) {
+            Ok(actual) if actual != 0 => path.clock_hz = actual,
+            _ => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  sdhci: UHS clock raise unconfirmed; power-cycling",
+                );
+                return Err(self.voltage_switch_power_cycle());
+            }
+        }
+        // 6. Tuning where the mode needs it. A tuning failure in
+        // SDR50/SDR104 falls back to SDR25 (re-switch + re-clock,
+        // confirmed by the status read); DDR50 keeps fixed
+        // sampling with a warning, as Linux does. If even the
+        // SDR25 re-switch cannot be confirmed, the card is left in
+        // an untuned high mode — power-cycle and re-identify at
+        // 3.3 V instead of serving I/O on an unproven sampling
+        // point.
+        if settled.needs_tuning(caps1 & CAPS1_TUNING_SDR50 != 0) {
+            match self.execute_tuning(settled, caps1) {
+                Ok(()) => {}
+                Err(_) if settled == UhsMode::Ddr50 => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  sdhci: DDR50 tuning failed; fixed sampling",
+                    );
+                }
+                Err(_) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  sdhci: tuning failed; falling back to SDR25",
+                    );
+                    let confirmed = matches!(
+                        self.cmd6_status(true, 0, UhsMode::Sdr25.function()),
+                        Ok(status) if status.group1_function() == UhsMode::Sdr25.function()
+                    );
+                    if !confirmed {
+                        return Err(self.voltage_switch_power_cycle());
+                    }
+                    self.set_uhs_host_mode(UhsMode::Sdr25);
+                    match self.set_clock(UhsMode::Sdr25.max_clock_hz()) {
+                        Ok(actual) if actual != 0 => path.clock_hz = actual,
+                        _ => {
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  sdhci: SDR25 fallback clock unconfirmed; power-cycling",
+                            );
+                            return Err(self.voltage_switch_power_cycle());
+                        }
+                    }
+                    settled = UhsMode::Sdr25;
+                }
+            }
+        }
+        path.uhs_mode = Some(settled);
+        let _ = writeln!(
+            narf_console::Writer,
+            "  sdhci: UHS-I {:?} at {} kHz",
+            settled,
+            path.clock_hz / 1000,
+        );
+        Ok(())
+    }
+
     /// Negotiate the post-identification data path, in the order
     /// Linux's `mmc_sd_init_card` uses: raise the clock, then
-    /// read the SCR and widen the bus, then admit DMA. Best-effort
-    /// throughout — any step that fails logs and leaves the
-    /// identification profile for that dimension in place, so the
-    /// card stays usable at 400 kHz / 1-bit / PIO. Returns the
-    /// negotiated profile and records it on the controller.
+    /// read the SCR and widen the bus, then negotiate UHS-I, then
+    /// admit DMA. Best-effort throughout — any step that fails
+    /// logs and leaves the identification profile for that
+    /// dimension in place, so the card stays usable at 400 kHz /
+    /// 1-bit / PIO. A voltage-switch failure is the one exception:
+    /// it power-cycles the card and re-runs identification +
+    /// negotiation without UHS (see `negotiate_data_path_inner`).
+    /// Returns the negotiated profile and records it on the
+    /// controller.
     pub fn negotiate_data_path(&self) -> DataPath {
+        use core::fmt::Write as _;
+        let (path, needs_recovery) = self.negotiate_data_path_inner(true);
+        if !needs_recovery {
+            return path;
+        }
+        // Recovery: the card was already power-cycled. Bring it
+        // back at 3.3 V: clear the 1.8 V signalling enable,
+        // restart the init clock, re-identify, and negotiate the
+        // data path without UHS.
+        let ctrl2 = self.io.read16(REG_HOST_CONTROL_2);
+        self.io.write16(REG_HOST_CONTROL_2, ctrl2 & !HC2_VDD_180);
+        let _ = self.set_clock(INIT_CLOCK_HZ);
+        // SAFETY: same MMIO ownership as the bring-up call; the
+        // power cycle returned the card to idle, and this runs
+        // exactly once for this failure, never concurrently with
+        // another identify or transfer.
+        match unsafe { self.identify_sequence() } {
+            Ok(card) => {
+                *self.card.lock() = Some(card);
+                let (path, _) = self.negotiate_data_path_inner(false);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  sdhci: recovered at 3.3 V after voltage-switch failure",
+                );
+                path
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  sdhci: re-identify after voltage-switch failure failed: {:?}",
+                    e,
+                );
+                path
+            }
+        }
+    }
+
+    /// The negotiate steps shared by the first attempt (with UHS)
+    /// and the post-failure recovery (without). Returns the profile
+    /// plus whether the caller must run the recovery path.
+    fn negotiate_data_path_inner(&self, try_uhs: bool) -> (DataPath, bool) {
         use core::fmt::Write as _;
         // Capabilities + spec version are read-only registers.
         let caps = self.io.read32(REG_CAPABILITIES);
+        let caps1 = self.io.read32(REG_CAPABILITIES_1);
         let spec_version = (self.io.read16(REG_HOST_VERSION) & 0xFF) as u8;
         let base_hz = Self::caps_base_clock_hz(caps, spec_version);
         let mut path = DataPath::identification();
@@ -1087,28 +1682,44 @@ impl Sdhci {
             }
         }
 
-        // 3. DMA admission: ADMA preferred, SDMA, else PIO.
-        if let Some(mode) = select_dma_mode(spec_version, caps) {
-            match DmaEngine::new(mode) {
-                Ok(engine) => {
-                    *self.dma.lock() = Some(engine);
-                    path.dma_mode = Some(mode);
-                }
-                Err(()) => {
-                    // ADMA allocation failure falls back to SDMA
-                    // when the caps allow it on a 32-bit host.
-                    if mode.is_adma() && caps & CAPS_CAN_DO_SDMA != 0 && caps & CAPS_CAN_64BIT == 0
-                    {
-                        if let Ok(engine) = DmaEngine::new(DmaMode::Sdma) {
-                            *self.dma.lock() = Some(engine);
-                            path.dma_mode = Some(DmaMode::Sdma);
-                        }
+        // 3. UHS-I: CMD11 voltage switch + CMD6 mode switch +
+        // CMD19 tuning. A failure here either leaves the card at
+        // 3.3 V (rejection) or needs the recovery path.
+        if try_uhs {
+            if let Err(e) = self.negotiate_uhs(caps, caps1, spec_version, base_hz, &mut path) {
+                debug_assert_eq!(e, SdhciError::VoltageSwitchFailed);
+                return (path, true);
+            }
+        }
+
+        // 4. DMA admission: ADMA preferred, SDMA, else PIO.
+        // Guarded by `is_none` so a recovery re-negotiation never
+        // admits a second engine over the first.
+        if self.dma.lock().is_none() {
+            if let Some(mode) = select_dma_mode(spec_version, caps) {
+                match DmaEngine::new(mode) {
+                    Ok(engine) => {
+                        *self.dma.lock() = Some(engine);
+                        path.dma_mode = Some(mode);
                     }
-                    if path.dma_mode.is_none() {
-                        let _ = writeln!(
-                            narf_console::Writer,
-                            "  sdhci: DMA buffers unavailable; PIO data path",
-                        );
+                    Err(()) => {
+                        // ADMA allocation failure falls back to SDMA
+                        // when the caps allow it on a 32-bit host.
+                        if mode.is_adma()
+                            && caps & CAPS_CAN_DO_SDMA != 0
+                            && caps & CAPS_CAN_64BIT == 0
+                        {
+                            if let Ok(engine) = DmaEngine::new(DmaMode::Sdma) {
+                                *self.dma.lock() = Some(engine);
+                                path.dma_mode = Some(DmaMode::Sdma);
+                            }
+                        }
+                        if path.dma_mode.is_none() {
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  sdhci: DMA buffers unavailable; PIO data path",
+                            );
+                        }
                     }
                 }
             }
@@ -1119,12 +1730,13 @@ impl Sdhci {
         }
         let _ = writeln!(
             narf_console::Writer,
-            "  sdhci: data path {} kHz, {}-bit, {:?}",
+            "  sdhci: data path {} kHz, {}-bit, {:?}, UHS {:?}",
             path.clock_hz / 1000,
             path.bus_width,
             path.dma_mode,
+            path.uhs_mode,
         );
-        path
+        (path, false)
     }
 
     /// Set (or clear) the HOST_CONTROL DMA select for a transfer.

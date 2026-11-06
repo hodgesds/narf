@@ -46,6 +46,30 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use super::*;
 
+/// CMD19 tuning block, 4-bit bus (SD Physical Layer Spec
+/// §4.2.4.5; Linux `drivers/mmc/core/mmc_ops.c`
+/// `tuning_blk_pattern_4bit`, the spec's fixed pattern the card
+/// returns for CMD19). The driver drains it via the Buffer Data
+/// Port; the host tuning engine — not the driver — verifies it.
+const TUNING_PATTERN_4BIT: [u8; 64] = [
+    0xff, 0x0f, 0xff, 0x00, 0xff, 0xcc, 0xc3, 0xcc, 0xc3, 0x3c, 0xcc, 0xff, 0xfe, 0xff, 0xfe, 0xef,
+    0xff, 0xdf, 0xff, 0xdd, 0xff, 0xfb, 0xff, 0xfb, 0xbf, 0xff, 0x7f, 0xff, 0x77, 0xf7, 0xbd, 0xef,
+    0xff, 0xf0, 0xff, 0xf0, 0x0f, 0xfc, 0xcc, 0x3c, 0xcc, 0x33, 0xcc, 0xcf, 0xff, 0xef, 0xff, 0xee,
+    0xff, 0xfd, 0xff, 0xfd, 0xdf, 0xff, 0xbf, 0xff, 0xbb, 0xff, 0xf7, 0xff, 0xf7, 0x7f, 0x7b, 0xde,
+];
+
+/// Build a 64-byte CMD6 switch status block (SD Physical Layer
+/// Spec §4.3.10 layout, as `sd_proto::SwitchStatus` parses it):
+/// `support` in byte 13 (Function Group 1 support bitmask),
+/// `current_function` in byte 16's low nibble; every other field
+/// is zero (no current-limit claim, no other function groups).
+fn switch_status_bytes(support: u8, current_function: u8) -> [u8; 64] {
+    let mut status = [0u8; 64];
+    status[13] = support;
+    status[16] = current_function & 0x0F;
+    status
+}
+
 /// RCA the fixture card answers CMD3 with.
 const FIXTURE_RCA: u16 = 0x0001;
 
@@ -58,6 +82,14 @@ const FIXTURE_SCR: [u8; 8] = [0x02, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 /// ADMA2, VDD 3.3 V (SDHCI 3.00 §2.2.24; bit values shared with
 /// `drivers/sdio/src/sdhci/regs.rs`).
 const FIXTURE_CAPS: u32 = (50u32 << 8) | 0x0040_0000 | 0x0008_0000 | 0x0100_0000;
+/// Fixture Capabilities with a 1.8 V signalling rail (UHS-I host).
+const FIXTURE_CAPS_UHS: u32 = FIXTURE_CAPS | 0x0400_0000;
+/// Fixture Capabilities_1 bits (SDHCI 3.00 §2.2.25): UHS mode
+/// support + "Use Tuning for SDR50" (bit 45 → CAPS1 bit 13).
+const FIXTURE_CAPS1_SDR50: u32 = 0x0000_0001;
+const FIXTURE_CAPS1_SDR104: u32 = 0x0000_0002;
+const FIXTURE_CAPS1_DDR50: u32 = 0x0000_0004;
+const FIXTURE_CAPS1_TUNING_SDR50: u32 = 0x0000_2000;
 /// Fixture Capabilities with 64-bit DMA addressing.
 const FIXTURE_CAPS_64BIT: u32 = FIXTURE_CAPS | 0x1000_0000;
 /// Fixture Capabilities with SDMA only (no ADMA2).
@@ -76,9 +108,6 @@ const FIXTURE_ADMA_ATTR_END: u16 = 0x02;
 const FIXTURE_ADMA_ATTR_ACT_TRAN: u16 = 0x20;
 /// SDMA buffer boundary (512 KiB).
 const FIXTURE_SDMA_BOUNDARY: u64 = 512 * 1024;
-
-/// RCA the fixture card answers CMD3 with.
-const FIXTURE_RCA: u16 = 0x0001;
 
 /// CID register bytes (15; the CRC7 + end byte are the
 /// controller's to strip) of the fixture card: MID 0x03,
@@ -218,6 +247,30 @@ struct FixtureState {
     sdma_boundary_once: bool,
     /// SDMA transfer waiting on a boundary restart.
     sdma_pending: Option<SdmaPending>,
+    /// ACMD41 answers with S18A (OCR bit 24): the card accepts
+    /// a 1.8 V switch.
+    s18a: bool,
+    /// Function Group 1 support bitmask the card reports in a
+    /// CMD6 switch-status block (byte 13).
+    switch_support: u8,
+    /// The card's current Function Group 1 function, installed
+    /// by a mode-1 CMD6 (0 = SDR12 after power-on / power cycle).
+    current_function: u8,
+    /// DAT[3:0] level the PRESENT_STATE register reports.
+    dat_level: u8,
+    /// CMD11 ran and the card is waiting for the clock restart
+    /// to drive DAT[3:0] high.
+    voltage_switch_pending: bool,
+    /// CMD19 executions before the tuning engine reports done.
+    tuning_iters: u32,
+    /// CMD19 executions so far.
+    tuning_count: u32,
+    /// The tuning engine never completes.
+    tuning_never: bool,
+    /// DAT[3:0] stay low after the clock restart.
+    voltage_switch_fail: bool,
+    /// CMD11 answers with an R1 error instead of switching.
+    cmd11_r1_error: bool,
 }
 
 impl FixtureState {
@@ -378,8 +431,55 @@ impl FixtureState {
             // CMD8 — R7 echoes the voltage + check-pattern bits.
             8 => self.set32(REG_RESPONSE_0, arg & 0x0000_0FFF),
             // ACMD41 — R3 OCR: busy set, CCS set (SDHC), the
-            // 3.3 V operating window.
-            41 => self.set32(REG_RESPONSE_0, 0x8000_0000 | 0x4000_0000 | 0x00FF_8000),
+            // 3.3 V operating window; S18A (bit 24) when the
+            // card accepts a 1.8 V switch.
+            41 => {
+                let mut ocr = 0x8000_0000 | 0x4000_0000 | 0x00FF_8000;
+                if self.s18a {
+                    ocr |= 0x0100_0000;
+                }
+                self.set32(REG_RESPONSE_0, ocr);
+            }
+            // CMD11 — R1: the card drives DAT[3:0] low and waits
+            // for the clock restart; an R1 error (knob) rejects
+            // the switch outright.
+            11 => {
+                if self.cmd11_r1_error {
+                    self.set32(REG_RESPONSE_0, 1 << 22);
+                } else {
+                    self.set32(REG_RESPONSE_0, 0);
+                    self.voltage_switch_pending = true;
+                    self.dat_level = 0;
+                }
+            }
+            // CMD6 — stage the 64-byte switch status; a mode-1
+            // switch installs the Function Group 1 value
+            // (argument bits [3:0]) first.
+            6 => {
+                if arg & 0x8000_0000 != 0 {
+                    self.current_function = (arg & 0x0F) as u8;
+                }
+                self.read_stage =
+                    switch_status_bytes(self.switch_support, self.current_function).to_vec();
+                self.read_cursor = 0;
+                nis |= NIS_BUFFER_READ_READY | NIS_TRANSFER_COMPLETE;
+            }
+            // CMD19 — stage the 64-byte tuning block; the tuning
+            // engine clears EXEC_TUNING and sets TUNED_CLK once
+            // the modelled iteration count is reached.
+            19 => {
+                self.read_stage = TUNING_PATTERN_4BIT.to_vec();
+                self.read_cursor = 0;
+                self.tuning_count += 1;
+                if !self.tuning_never && self.tuning_count >= self.tuning_iters {
+                    let hc2 = self.get16(REG_HOST_CONTROL_2);
+                    self.set16(
+                        REG_HOST_CONTROL_2,
+                        (hc2 & !HC2_EXEC_TUNING) | HC2_TUNED_CLK,
+                    );
+                }
+                nis |= NIS_BUFFER_READ_READY | NIS_TRANSFER_COMPLETE;
+            }
             // CMD2 — R2 CID.
             2 => self.set_response_136(r2_to_response_words(&FIXTURE_CID)),
             // CMD3 — R6: RCA in the high half.
@@ -420,7 +520,7 @@ impl FixtureState {
                 self.write_stage = alloc::vec![0u8; block_size * block_count.max(1)];
                 nis |= NIS_BUFFER_WRITE_READY | NIS_TRANSFER_COMPLETE;
             }
-            // CMD0 / CMD6 / CMD7 / CMD16 / CMD55 and everything else:
+            // CMD0 / CMD7 / CMD16 / CMD55 and everything else:
             // a plain completion with a zero response.
             _ => {}
         }
@@ -461,6 +561,16 @@ impl FixtureTransport {
                 walked: Vec::new(),
                 sdma_boundary_once: false,
                 sdma_pending: None,
+                s18a: false,
+                switch_support: 0,
+                current_function: 0,
+                dat_level: 0xF,
+                voltage_switch_pending: false,
+                tuning_iters: 1,
+                tuning_count: 0,
+                tuning_never: false,
+                voltage_switch_fail: false,
+                cmd11_r1_error: false,
             }),
         }
     }
@@ -471,6 +581,43 @@ impl FixtureTransport {
         let mut st = self.state.lock();
         st.regs[0x40..0x44].copy_from_slice(&caps.to_le_bytes());
         st.regs[0xFE] = spec_version;
+    }
+
+    /// Override the modelled Capabilities_1 register (the
+    /// UHS-mode support / tuning bits the driver reads).
+    pub fn set_caps1(&self, caps1: u32) {
+        let mut st = self.state.lock();
+        st.regs[0x44..0x48].copy_from_slice(&caps1.to_le_bytes());
+    }
+
+    /// The card answers ACMD41 with S18A set and CMD6 with
+    /// `group1_support` (Function Group 1 support bitmask).
+    pub fn set_uhs_card(&self, group1_support: u8) {
+        let mut st = self.state.lock();
+        st.s18a = true;
+        st.switch_support = group1_support;
+    }
+
+    /// The tuning engine needs `iters` CMD19 executions before
+    /// it reports EXEC_TUNING clear + TUNED_CLK set.
+    pub fn set_tuning_iters(&self, iters: u32) {
+        self.state.lock().tuning_iters = iters;
+    }
+
+    /// The tuning engine never completes (EXEC_TUNING stays set).
+    pub fn set_tuning_never(&self) {
+        self.state.lock().tuning_never = true;
+    }
+
+    /// DAT[3:0] stay low after the voltage-switch clock restart.
+    pub fn set_voltage_switch_fail(&self) {
+        self.state.lock().voltage_switch_fail = true;
+    }
+
+    /// CMD11 answers with an R1 error (ILLEGAL_COMMAND) instead
+    /// of completing the switch.
+    pub fn set_cmd11_r1_error(&self) {
+        self.state.lock().cmd11_r1_error = true;
     }
 
     /// Make the next SDMA transfer stop at a 512 KiB boundary
@@ -561,8 +708,13 @@ impl SdhciTransport for FixtureTransport {
                 }
                 w
             }
-            // A card is always inserted in the fixture.
-            REG_PRESENT_STATE => st.get32(offset) | PSTATE_CARD_INSERTED,
+            // A card is always inserted in the fixture; the DAT
+            // level bits track the modelled card state (low
+            // during a voltage switch, high otherwise).
+            REG_PRESENT_STATE => {
+                let base = st.get32(offset) & !PSTATE_DAT_LVL_MASK;
+                base | ((st.dat_level as u32) << PSTATE_DAT_LVL_SHIFT) | PSTATE_CARD_INSERTED
+            }
             _ => st.get32(offset),
         }
     }
@@ -576,6 +728,14 @@ impl SdhciTransport for FixtureTransport {
         } else {
             st.regs[offset as usize] = value;
         }
+        // Power off resets the card's UHS state: the card comes
+        // back at 3.3 V, SDR12, DAT[3:0] high.
+        if offset == REG_POWER_CONTROL && value & POWER_ON == 0 {
+            st.dat_level = 0xF;
+            st.current_function = 0;
+            st.voltage_switch_pending = false;
+            st.tuning_count = 0;
+        }
     }
 
     fn write16(&self, offset: u64, value: u16) {
@@ -588,12 +748,23 @@ impl SdhciTransport for FixtureTransport {
                 st.set16(offset, cur & !value);
             }
             // Enabling the internal clock asserts the stable bit.
+            // A clock restart after CMD11 completes the voltage
+            // switch: the card drives DAT[3:0] high (unless the
+            // failure knob holds them low).
             REG_CLOCK_CONTROL => {
                 let mut v = value;
                 if v & CLK_INTERNAL_EN != 0 {
                     v |= CLK_INTERNAL_STABLE;
                 }
                 st.set16(offset, v);
+                if v & CLK_SD_EN != 0
+                    && st.voltage_switch_pending
+                    && st.get16(REG_HOST_CONTROL_2) & HC2_VDD_180 != 0
+                    && !st.voltage_switch_fail
+                {
+                    st.dat_level = 0xF;
+                    st.voltage_switch_pending = false;
+                }
             }
             // A Command write runs the staged command.
             REG_COMMAND => {
@@ -1315,4 +1486,513 @@ fn fixture_sdhci_multiblock_block_device() -> TestResult {
 kernel_test_in!(
     "drivers/storage/sdhci/fixture",
     fixture_sdhci_multiblock_block_device
+);
+
+// ── #838: UHS-I (1.8 V switch + tuning) ─────────────────────────
+
+/// UHS fixture Capabilities with a 100 MHz base clock.
+const UHS_CAPS_100: u32 = (100u32 << 8) | 0x0040_0000 | 0x0008_0000 | 0x0100_0000 | 0x0400_0000;
+/// UHS fixture Capabilities with a 208 MHz base clock.
+const UHS_CAPS_208: u32 = (208u32 << 8) | 0x0040_0000 | 0x0008_0000 | 0x0100_0000 | 0x0400_0000;
+
+fn uhs_cmd_count(indices: &[u8], want: u8) -> usize {
+    indices.iter().filter(|&&i| i == want).count()
+}
+
+fn fixture_sdhci_uhs_pure() -> TestResult {
+    // CMD6 argument encodings (SD Physical Layer Spec §4.3.10):
+    // mode bit 31 + per-group 4-bit fields, 0xF = no change.
+    if cmd6_arg(false, 0, 0) != 0x00FFFFF0 {
+        return Err("CMD6 check of group 1 must be 0x00FFFFF0");
+    }
+    if cmd6_arg(true, 0, 2) != 0x80FFFFF2 {
+        return Err("CMD6 switch to SDR50 must be 0x80FFFFF2");
+    }
+    if cmd6_arg(true, 0, 1) != 0x80FFFFF1 {
+        return Err("CMD6 switch to SDR25 must be 0x80FFFFF1");
+    }
+    if cmd6_arg(true, 2, 3) != 0x80FFFF3F {
+        return Err("CMD6 switch of group 2 to 3 must be 0x80FFFF3F");
+    }
+    // Switch-status parsing: support in byte 13, current
+    // function in byte 16's low nibble.
+    let status = SwitchStatus::parse(&switch_status_bytes(0x1F, 3));
+    if status.group1_support() != 0x1F {
+        return Err("SwitchStatus must report byte 13 as group-1 support");
+    }
+    if status.group1_function() != 3 {
+        return Err("SwitchStatus must report byte 16 low nibble as current function");
+    }
+    if !status.supports_function(3) || status.supports_function(4) {
+        return Err("SwitchStatus supports_function must match the support bits");
+    }
+    // Mode table: function values, max clocks, HOST_CONTROL2
+    // UHS Mode Select values, tuning requirement.
+    if UhsMode::Sdr25.function() != 1
+        || UhsMode::Sdr25.max_clock_hz() != 50_000_000
+        || UhsMode::Sdr25.host_control2() != 0x1
+        || UhsMode::Sdr25.needs_tuning(false)
+    {
+        return Err("SDR25 table row wrong");
+    }
+    if UhsMode::Sdr50.function() != 2
+        || UhsMode::Sdr50.max_clock_hz() != 100_000_000
+        || UhsMode::Sdr50.host_control2() != 0x2
+        || UhsMode::Sdr50.needs_tuning(false)
+        || !UhsMode::Sdr50.needs_tuning(true)
+    {
+        return Err("SDR50 table row wrong");
+    }
+    if UhsMode::Sdr104.function() != 3
+        || UhsMode::Sdr104.max_clock_hz() != 208_000_000
+        || UhsMode::Sdr104.host_control2() != 0x3
+        || !UhsMode::Sdr104.needs_tuning(false)
+    {
+        return Err("SDR104 table row wrong");
+    }
+    if UhsMode::Ddr50.function() != 4
+        || UhsMode::Ddr50.max_clock_hz() != 50_000_000
+        || UhsMode::Ddr50.host_control2() != 0x4
+        || UhsMode::Ddr50.needs_tuning(false)
+        || !UhsMode::Ddr50.needs_tuning(true)
+    {
+        return Err("DDR50 table row wrong");
+    }
+    if UhsMode::Sdr12.function() != 0
+        || UhsMode::Sdr12.max_clock_hz() != 25_000_000
+        || UhsMode::Sdr12.host_control2() != 0x0
+        || UhsMode::Sdr12.needs_tuning(true)
+    {
+        return Err("SDR12 table row wrong");
+    }
+    // Mode selection matrix (Linux `sd_update_bus_speed_mode`
+    // preference: SDR104 > DDR50 > SDR50 > SDR25).
+    let cases: [(u8, u32, u32, Option<UhsMode>); 8] = [
+        (0x1F, 0x7, 50_000_000, Some(UhsMode::Sdr25)),
+        (0x1F, 0x7, 100_000_000, Some(UhsMode::Sdr50)),
+        (0x1F, 0x7, 208_000_000, Some(UhsMode::Sdr104)),
+        (0x1F, 0x4, 50_000_000, Some(UhsMode::Ddr50)),
+        (0x1F, 0x5, 100_000_000, Some(UhsMode::Ddr50)),
+        (0x03, 0x7, 208_000_000, Some(UhsMode::Sdr25)),
+        (0x01, 0x7, 208_000_000, None),
+        (0x1F, 0x0, 208_000_000, Some(UhsMode::Sdr25)),
+    ];
+    for (support, caps1, base, want) in cases {
+        if select_uhs_mode(support, caps1, base) != want {
+            return Err("select_uhs_mode matrix row wrong");
+        }
+    }
+    // The tuning block is the spec's fixed 64-byte pattern.
+    if TUNING_PATTERN_4BIT.len() != 64 || TUNING_PATTERN_4BIT[0] != 0xFF {
+        return Err("tuning pattern must be the 64-byte spec pattern");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/sdhci/fixture", fixture_sdhci_uhs_pure);
+
+fn fixture_sdhci_uhs_sdr25() -> TestResult {
+    let (transport, saved) = install(BTreeMap::new());
+    transport.set_caps(FIXTURE_CAPS_UHS, FIXTURE_SPEC_VERSION);
+    transport.set_uhs_card(0x03); // SDR12 | SDR25
+
+    let result = (|| {
+        let (_card, path) = identify_negotiate_and_publish()?;
+        if path.uhs_mode != Some(UhsMode::Sdr25) {
+            return Err("UHS mode must be SDR25 for an SDR12|SDR25 card on a 50 MHz base");
+        }
+        if path.clock_hz != 50_000_000 {
+            return Err("SDR25 clock must be 50 MHz");
+        }
+        if path.bus_width != 4 || path.dma_mode != Some(DmaMode::Adma32) {
+            return Err("SDR25 path must keep the 4-bit bus and ADMA2");
+        }
+        let indices = transport.cmd_indices();
+        if !indices.contains(&11) {
+            return Err("SDR25 negotiate must issue CMD11");
+        }
+        if uhs_cmd_count(&indices, 6) != 3 {
+            return Err("SDR25 negotiate must issue three CMD6s (ACMD6 + query + switch)");
+        }
+        // HOST_CONTROL2: VDD_180 + SDR25.
+        if transport.reg16(REG_HOST_CONTROL_2) != 0x0009 {
+            return Err("HOST_CONTROL2 must be VDD_180 | SDR25 after SDR25 negotiate");
+        }
+        // I/O still works at the negotiated speed.
+        let dev = narf_block::registry::find_block_device("sdhci0")
+            .ok_or("sdhci0 not registered after publish")?;
+        let mut buf = [0u8; 512];
+        dev.read(0, 1, &mut buf)
+            .map_err(|_| "post-UHS read failed")?;
+        if buf != [0u8; 512] {
+            return Err("post-UHS read of a blank card must be zeros");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/storage/sdhci/fixture", fixture_sdhci_uhs_sdr25);
+
+fn fixture_sdhci_uhs_sdr50_tuning() -> TestResult {
+    let (transport, saved) = install(BTreeMap::new());
+    transport.set_caps(UHS_CAPS_100, FIXTURE_SPEC_VERSION);
+    transport.set_caps1(FIXTURE_CAPS1_SDR50 | FIXTURE_CAPS1_TUNING_SDR50);
+    transport.set_uhs_card(0x07); // SDR12 | SDR25 | SDR50
+    transport.set_tuning_iters(3);
+
+    let result = (|| {
+        let (_card, path) = identify_negotiate_and_publish()?;
+        if path.uhs_mode != Some(UhsMode::Sdr50) {
+            return Err("UHS mode must be SDR50 for an SDR50 card on a 100 MHz base");
+        }
+        if path.clock_hz != 100_000_000 {
+            return Err("SDR50 clock must be 100 MHz");
+        }
+        let indices = transport.cmd_indices();
+        if uhs_cmd_count(&indices, 19) != 3 {
+            return Err("SDR50 tuning must run exactly 3 CMD19s for this fixture");
+        }
+        // TUNED_CLK set, EXEC_TUNING clear.
+        let hc2 = transport.reg16(REG_HOST_CONTROL_2);
+        if hc2 & 0x0080 == 0 {
+            return Err("TUNED_CLK must be set after successful SDR50 tuning");
+        }
+        if hc2 & 0x0040 != 0 {
+            return Err("EXEC_TUNING must be clear after successful SDR50 tuning");
+        }
+        if hc2 & 0x0007 != 0x2 {
+            return Err("HOST_CONTROL2 UHS bits must select SDR50");
+        }
+        // I/O still works after tuning.
+        let dev = narf_block::registry::find_block_device("sdhci0")
+            .ok_or("sdhci0 not registered after publish")?;
+        let mut buf = [0u8; 512];
+        dev.read(0, 1, &mut buf)
+            .map_err(|_| "post-tuning read failed")?;
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_sdhci_uhs_sdr50_tuning
+);
+
+fn fixture_sdhci_uhs_sdr104() -> TestResult {
+    let (transport, saved) = install(BTreeMap::new());
+    transport.set_caps(UHS_CAPS_208, FIXTURE_SPEC_VERSION);
+    transport.set_caps1(FIXTURE_CAPS1_SDR104);
+    transport.set_uhs_card(0x1F); // SDR12 | SDR25 | SDR50 | SDR104 | DDR50
+    transport.set_tuning_iters(2);
+
+    let result = (|| {
+        let (_card, path) = identify_negotiate_and_publish()?;
+        if path.uhs_mode != Some(UhsMode::Sdr104) {
+            return Err("UHS mode must be SDR104 for a full-UHS card on a 208 MHz base");
+        }
+        if path.clock_hz != 208_000_000 {
+            return Err("SDR104 clock must be 208 MHz");
+        }
+        let indices = transport.cmd_indices();
+        if uhs_cmd_count(&indices, 19) != 2 {
+            return Err("SDR104 tuning must run exactly 2 CMD19s for this fixture");
+        }
+        if transport.reg16(REG_HOST_CONTROL_2) & 0x0007 != 0x3 {
+            return Err("HOST_CONTROL2 UHS bits must select SDR104");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/storage/sdhci/fixture", fixture_sdhci_uhs_sdr104);
+
+fn fixture_sdhci_uhs_ddr50() -> TestResult {
+    let (transport, saved) = install(BTreeMap::new());
+    transport.set_caps(FIXTURE_CAPS_UHS, FIXTURE_SPEC_VERSION);
+    transport.set_caps1(FIXTURE_CAPS1_DDR50);
+    transport.set_uhs_card(0x17); // SDR12 | SDR25 | SDR50 | DDR50
+
+    let result = (|| {
+        let (_card, path) = identify_negotiate_and_publish()?;
+        // DDR50 beats SDR50 in the preference order when both
+        // are supported, and needs no tuning unless the SDR50
+        // tuning bit is set.
+        if path.uhs_mode != Some(UhsMode::Ddr50) {
+            return Err("UHS mode must be DDR50 when card and host support it");
+        }
+        if path.clock_hz != 50_000_000 {
+            return Err("DDR50 clock must be 50 MHz");
+        }
+        let indices = transport.cmd_indices();
+        if indices.contains(&19) {
+            return Err("DDR50 without the tuning bit must not run CMD19");
+        }
+        if transport.reg16(REG_HOST_CONTROL_2) != 0x000C {
+            return Err("HOST_CONTROL2 must be VDD_180 | DDR50 after DDR50 negotiate");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/storage/sdhci/fixture", fixture_sdhci_uhs_ddr50);
+
+fn fixture_sdhci_uhs_no_1v8_host() -> TestResult {
+    let (transport, saved) = install(BTreeMap::new());
+    // Default caps: no VDD_180 bit. The card would accept a
+    // switch, but the host cannot offer one.
+    transport.set_uhs_card(0x03);
+
+    let result = (|| {
+        let (_card, path) = identify_negotiate_and_publish()?;
+        if path.uhs_mode.is_some() {
+            return Err("a host without VDD_180 must not negotiate UHS");
+        }
+        if path.clock_hz != 25_000_000 {
+            return Err("a non-UHS host must stay at the 25 MHz default speed");
+        }
+        let indices = transport.cmd_indices();
+        if indices.contains(&11) {
+            return Err("a non-UHS host must never issue CMD11");
+        }
+        if uhs_cmd_count(&indices, 6) != 1 {
+            return Err("a non-UHS negotiate must issue only the ACMD6 bus-width CMD6");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_sdhci_uhs_no_1v8_host
+);
+
+fn fixture_sdhci_uhs_no_s18a() -> TestResult {
+    let (transport, saved) = install(BTreeMap::new());
+    transport.set_caps(FIXTURE_CAPS_UHS, FIXTURE_SPEC_VERSION);
+    // No set_uhs_card: the fixture card answers ACMD41 without
+    // S18A, so no switch is attempted.
+
+    let result = (|| {
+        let (_card, path) = identify_negotiate_and_publish()?;
+        if path.uhs_mode.is_some() {
+            return Err("a card without S18A must not negotiate UHS");
+        }
+        if path.clock_hz != 25_000_000 {
+            return Err("a non-S18A card must stay at the 25 MHz default speed");
+        }
+        let indices = transport.cmd_indices();
+        if indices.contains(&11) {
+            return Err("a non-S18A card must never see CMD11");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!("drivers/storage/sdhci/fixture", fixture_sdhci_uhs_no_s18a);
+
+fn fixture_sdhci_uhs_sdr12_only() -> TestResult {
+    let (transport, saved) = install(BTreeMap::new());
+    transport.set_caps(FIXTURE_CAPS_UHS, FIXTURE_SPEC_VERSION);
+    transport.set_uhs_card(0x01); // SDR12 only
+
+    let result = (|| {
+        let (_card, path) = identify_negotiate_and_publish()?;
+        // The switch itself runs (the card allows it), but there
+        // is no faster mode to move to: SDR12 at 25 MHz is the
+        // same rate the card already had at 3.3 V.
+        if path.uhs_mode != Some(UhsMode::Sdr12) {
+            return Err("an SDR12-only card must record SDR12 after the switch");
+        }
+        if path.clock_hz != 25_000_000 {
+            return Err("an SDR12-only card must stay at 25 MHz");
+        }
+        let indices = transport.cmd_indices();
+        if !indices.contains(&11) {
+            return Err("an SDR12-only card must still see CMD11 (the switch runs)");
+        }
+        if uhs_cmd_count(&indices, 6) != 2 {
+            return Err("an SDR12-only negotiate must issue two CMD6s (ACMD6 + query)");
+        }
+        // 1.8 V rail on, UHS bits SDR12.
+        if transport.reg16(REG_HOST_CONTROL_2) != 0x0008 {
+            return Err("HOST_CONTROL2 must be VDD_180 only for SDR12");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_sdhci_uhs_sdr12_only
+);
+
+fn fixture_sdhci_uhs_voltage_switch_fail() -> TestResult {
+    let (transport, saved) = install(BTreeMap::new());
+    transport.set_caps(FIXTURE_CAPS_UHS, FIXTURE_SPEC_VERSION);
+    transport.set_uhs_card(0x03);
+    transport.set_voltage_switch_fail();
+
+    let result = (|| {
+        let (_card, path) = identify_negotiate_and_publish()?;
+        // Recovery: the card power-cycled back to 3.3 V and was
+        // re-identified without UHS — and it still works.
+        if path.uhs_mode.is_some() {
+            return Err("after a failed switch the card must come back with no UHS mode");
+        }
+        if path.clock_hz != 25_000_000 || path.bus_width != 4 {
+            return Err("after a failed switch the card must come back at 25 MHz, 4-bit");
+        }
+        let indices = transport.cmd_indices();
+        if uhs_cmd_count(&indices, 0) != 2 {
+            return Err("recovery must re-run the identify sequence (two CMD0s)");
+        }
+        if uhs_cmd_count(&indices, 11) != 1 {
+            return Err("recovery must not retry CMD11");
+        }
+        if !transport.wrote(REG_POWER_CONTROL, 0x0E) {
+            return Err("recovery must power-cycle the card (POWER_CONTROL off)");
+        }
+        if transport.reg16(REG_HOST_CONTROL_2) & HC2_VDD_180 != 0 {
+            return Err("recovery must leave VDD_180 clear");
+        }
+        let dev = narf_block::registry::find_block_device("sdhci0")
+            .ok_or("sdhci0 not registered after recovery")?;
+        let mut buf = [0u8; 512];
+        dev.read(0, 1, &mut buf)
+            .map_err(|_| "post-recovery read failed")?;
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_sdhci_uhs_voltage_switch_fail
+);
+
+fn fixture_sdhci_uhs_tuning_fail_fallback() -> TestResult {
+    let (transport, saved) = install(BTreeMap::new());
+    transport.set_caps(UHS_CAPS_100, FIXTURE_SPEC_VERSION);
+    transport.set_caps1(FIXTURE_CAPS1_SDR50 | FIXTURE_CAPS1_TUNING_SDR50);
+    transport.set_uhs_card(0x07);
+    transport.set_tuning_never();
+
+    let result = (|| {
+        let (_card, path) = identify_negotiate_and_publish()?;
+        // Tuning exhausted its 40-iteration budget and fell back
+        // to SDR25 — never I/O on an unproven sampling point.
+        if path.uhs_mode != Some(UhsMode::Sdr25) {
+            return Err("a tuning failure must fall back to SDR25");
+        }
+        if path.clock_hz != 50_000_000 {
+            return Err("the SDR25 fallback clock must be 50 MHz");
+        }
+        let indices = transport.cmd_indices();
+        if uhs_cmd_count(&indices, 19) != 40 {
+            return Err("tuning must run exactly 40 CMD19s before giving up");
+        }
+        let hc2 = transport.reg16(REG_HOST_CONTROL_2);
+        if hc2 & 0x0080 != 0 {
+            return Err("TUNED_CLK must be clear after a tuning failure");
+        }
+        if hc2 & 0x0040 != 0 {
+            return Err("EXEC_TUNING must be clear after a tuning failure");
+        }
+        let dev = narf_block::registry::find_block_device("sdhci0")
+            .ok_or("sdhci0 not registered after tuning fallback")?;
+        let mut buf = [0u8; 512];
+        dev.read(0, 1, &mut buf)
+            .map_err(|_| "post-fallback read failed")?;
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_sdhci_uhs_tuning_fail_fallback
+);
+
+fn fixture_sdhci_uhs_cmd11_rejected() -> TestResult {
+    let (transport, saved) = install(BTreeMap::new());
+    transport.set_caps(FIXTURE_CAPS_UHS, FIXTURE_SPEC_VERSION);
+    transport.set_uhs_card(0x03);
+    transport.set_cmd11_r1_error();
+
+    let result = (|| {
+        let (_card, path) = identify_negotiate_and_publish()?;
+        // An R1 error on CMD11 means the card refused the switch
+        // and is still at 3.3 V: no power cycle, no re-identify.
+        if path.uhs_mode.is_some() {
+            return Err("a rejected CMD11 must leave no UHS mode");
+        }
+        if path.clock_hz != 25_000_000 {
+            return Err("a rejected CMD11 must leave the 25 MHz default speed");
+        }
+        let indices = transport.cmd_indices();
+        if uhs_cmd_count(&indices, 0) != 1 {
+            return Err("a rejected CMD11 must not re-run identify");
+        }
+        if transport.wrote(REG_POWER_CONTROL, 0x0E) {
+            return Err("a rejected CMD11 must not power-cycle the card");
+        }
+        let dev = narf_block::registry::find_block_device("sdhci0")
+            .ok_or("sdhci0 not registered after a rejected CMD11")?;
+        let mut buf = [0u8; 512];
+        dev.read(0, 1, &mut buf)
+            .map_err(|_| "read after a rejected CMD11 failed")?;
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_sdhci_uhs_cmd11_rejected
 );

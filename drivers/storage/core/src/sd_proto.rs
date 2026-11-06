@@ -19,6 +19,14 @@
 pub const OCR_BUSY: u32 = 1 << 31;
 /// OCR bit 30 — Card Capacity Status. 1 = SDHC/SDXC, 0 = SDSC.
 pub const OCR_CCS: u32 = 1 << 30;
+/// OCR bit 24 — S18A: the card accepts a switch to 1.8 V signalling
+/// (SD Physical Layer Spec §4.2.4.1; Linux `SD_ROCR_S18A`).
+pub const OCR_S18A: u32 = 1 << 24;
+/// ACMD41 argument bit 24 — S18R: the host requests a switch to
+/// 1.8 V signalling (SD Physical Layer Spec §4.2.4.1; Linux
+/// `SD_OCR_S18R`). Same bit position as [`OCR_S18A`]; inert for
+/// cards that do not support the switch.
+pub const ACMD41_S18R: u32 = 1 << 24;
 /// OCR voltage window 3.2..3.3 V (bit 20).
 pub const OCR_3V3: u32 = 1 << 20;
 
@@ -274,5 +282,49 @@ impl Csd {
             }
             _ => None,
         }
+    }
+}
+
+/// Decoded CMD6 (SWITCH_FUNC) 512-bit status block (SD Physical
+/// Layer Spec §4.3.10; Linux `drivers/mmc/core/sd.c` `mmc_read_switch`
+/// / `sd_set_bus_speed_mode` lineage).
+///
+/// The 64-byte block arrives MSB-first over the data lines; byte
+/// indices below are wire order (byte 0 = status bits [511:504]):
+///
+/// - `status[13]` — Function Group 1 (access mode) support bitmask:
+///   bit 0 = SDR12, bit 1 = SDR25 / High Speed, bit 2 = SDR50,
+///   bit 3 = SDR104, bit 4 = DDR50 (Linux `SD_MODE_UHS_*`).
+/// - `status[16]` low nibble — Function Group 1 function currently
+///   selected (the value a mode-1 CMD6 switch just installed;
+///   Linux verifies `(status[16] & 0xF) == value`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SwitchStatus {
+    /// The 64-byte status block in wire order.
+    pub raw: [u8; 64],
+}
+
+impl SwitchStatus {
+    /// Parse the 64-byte CMD6 status block in wire order.
+    pub fn parse(bytes: &[u8; 64]) -> Self {
+        Self { raw: *bytes }
+    }
+
+    /// Function Group 1 support bitmask (`status[13]`).
+    pub const fn group1_support(self) -> u8 {
+        self.raw[13]
+    }
+
+    /// Function Group 1 function currently selected
+    /// (`status[16]` low nibble).
+    pub const fn group1_function(self) -> u8 {
+        self.raw[16] & 0x0F
+    }
+
+    /// True when Function Group 1 reports support for the function
+    /// value `function` (0 = SDR12, 1 = SDR25, 2 = SDR50,
+    /// 3 = SDR104, 4 = DDR50).
+    pub const fn supports_function(self, function: u8) -> bool {
+        function < 8 && self.group1_support() & (1 << function) != 0
     }
 }
