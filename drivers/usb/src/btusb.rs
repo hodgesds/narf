@@ -2115,6 +2115,7 @@ mod tests {
                     kind: EndpointKind::BulkOut,
                     interval: 0,
                 },
+                sco_alts: [None; MAX_SCO_ALT_SETTINGS],
             },
             transport: Arc::new(LoopbackTransport::new("test-btusb")),
             info: ControllerInfo::default(),
