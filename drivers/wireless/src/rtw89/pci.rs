@@ -837,6 +837,78 @@ impl Rtw89Device {
         owner.irq_rearm(regs)
     }
 
+    /// BE completion worker for a probed 8922A device: drain the
+    /// RPQ/RXQ rings for the `events` `irq_service_8922a`
+    /// classified, in Linux `rtw89_pci_napi_poll` order, over the
+    /// probe-allocated RX buffers. TX completions free their
+    /// retained DMA buffers; WIFI frames arrive admitted for a
+    /// retained station; C2H messages arrive parsed and routed.
+    /// When `Outcome::rearm` is true the caller runs
+    /// `irq_rearm_8922a` (it cannot run inside this call: the
+    /// capability park is not re-entrant).
+    ///
+    /// # Safety
+    /// Same live-ring/no-reset contract as [`Self::submit_be_data`].
+    pub(super) unsafe fn complete_8922a(
+        &self,
+        events: super::irq::Events,
+        budget: usize,
+    ) -> Result<super::completion_8922a::Outcome, super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller guarantees an acquired BE RPQ/RXQ and
+            // a live ring, as for `submit_be_data`.
+            unsafe { self.complete_8922a_authorized(events, budget) }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn complete_8922a_authorized(
+        &self,
+        events: super::irq::Events,
+        budget: usize,
+    ) -> Result<super::completion_8922a::Outcome, super::prepared_8922a::Error> {
+        use super::dma::{RXCH_RPQ, RXCH_RXQ};
+        use super::prepared_8922a::Error;
+        let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
+        let mut owner = owner_lock.lock();
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        // The worker reads plain slices: sync each probe-allocated
+        // RX buffer for the CPU first, then hand it a mutable
+        // slice over exactly its bytes. The slices die before the
+        // buffers are synced back for the device.
+        let mut rxq: Vec<&mut [u8]> = Vec::new();
+        for buf in &self.rx_buffers[RXCH_RXQ as usize] {
+            buf.sync(0, buf.as_slice().len());
+            // SAFETY: `buf` is a fresh probe-allocated coherent
+            // buffer; `as_mut_ptr` + length covers exactly its
+            // bytes, and the slice is dropped below before any
+            // other access to the buffer.
+            let slice = unsafe {
+                core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.as_slice().len())
+            };
+            rxq.push(slice);
+        }
+        let mut rpq: Vec<&mut [u8]> = Vec::new();
+        for buf in &self.rx_buffers[RXCH_RPQ as usize] {
+            buf.sync(0, buf.as_slice().len());
+            // SAFETY: same probe-allocation contract as above.
+            let slice = unsafe {
+                core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.as_slice().len())
+            };
+            rpq.push(slice);
+        }
+        let outcome = owner.complete(regs, events, &mut rxq, &mut rpq, budget)?;
+        drop(rxq);
+        drop(rpq);
+        for buf in &self.rx_buffers[RXCH_RXQ as usize] {
+            buf.sync(0, buf.as_slice().len());
+        }
+        for buf in &self.rx_buffers[RXCH_RPQ as usize] {
+            buf.sync(0, buf.as_slice().len());
+        }
+        Ok(outcome)
+    }
+
     /// BE interrupt release for a probed 8922A device:
     /// `rtw89_pci_ops_stop` + `rtw89_pci_free_irq` through the
     /// Prepared owner. Idempotent when unarmed.

@@ -76,6 +76,9 @@ mod cold;
 mod cold_native;
 mod command_native;
 mod command_queue;
+mod completion_8922a;
+#[cfg(any(test, feature = "kernel-test"))]
+mod completion_8922a_tests;
 pub mod datapath;
 mod ddv;
 pub mod dma;

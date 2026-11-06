@@ -35,16 +35,14 @@
 //!    `observe_data_report` for completions.
 //!
 //! What this owner deliberately does NOT own (later steps):
-//! - The C2H completion path. H2C buffers are retained in
-//!   `h2c_retained` until that path lands and releases them; the
-//!   retention point is named here so the C2H lane has somewhere to
-//!   free from. Interrupt config/mask (`irq_be`, chip-row step 6)
-//!   IS owned here: `irq_start` arms one MSI vector + the v2 mask
-//!   and `irq_service` / `irq_rearm` run the worker half, so the
-//!   C2H lane has classified events to consume.
 //! - FWCMD header framing for H2C bodies (type/category/class/func/
 //!   sequence): the station owner builds CCTL/BA-CAM/RA bodies and
-//!   this owner moves caller-framed buffers across CH12.
+//!   this owner moves caller-framed buffers across CH12. The C2H
+//!   completion path IS owned here now (`complete`, chip-row step
+//!   7): it drains RPQ/RXQ for serviced interrupt events and
+//!   routes C2H messages, but H2C buffers are still retained in
+//!   `h2c_retained` — no ack can be matched to one until the
+//!   FWCMD framing lane records a sequence per retained buffer.
 //! - The TXWD_INFO v2 fill: `prepare_data` clears BODY0 bit 22
 //!   (WDINFO_EN) via `tx_8922a::build_header`, as in pass 1.
 //! - 6 GHz admission, MLO multi-link, legacy-mode admission.
@@ -67,7 +65,8 @@ use narf_capabilities::{Cap, Write};
 use narf_io::DmaBuffer;
 
 use super::bacam_v1;
-use super::dma::{TxBd, TXCH_NUM};
+use super::completion_8922a;
+use super::dma::{TxBd, DEFAULT_RXBD_NUM, TXCH_NUM};
 use super::dma_8922a;
 use super::dma_be::{self, Regs};
 use super::efuse_be::BeFactory;
@@ -117,6 +116,9 @@ pub(super) enum Error {
     /// failed). `Unsupported` cannot occur for BE: the v2 mask is
     /// infallible, unlike the AX `Mask::config` refusal.
     Irq(super::irq::Error),
+    /// C2H completion worker failure (ring desync, fatal
+    /// firmware state, bad budget, unprogrammed rings).
+    Completion(completion_8922a::Error),
     /// `irq_start` with a binding already installed.
     AlreadyArmed,
     /// MMIO failure during an interrupt start/service/rearm step.
@@ -208,6 +210,10 @@ pub(super) struct Prepared8922a {
     data_retained: Vec<(u64, u64, DmaBuffer, DmaBuffer)>,
     /// Submitted H2C buffers; freed by the future C2H path.
     h2c_retained: Vec<DmaBuffer>,
+    /// C2H completion worker state (RPQ/RXQ host write pointers
+    /// + RXQ assembly). Rebuilt by `program_rings` at the
+    /// programmed depths, reset by `stop_dma`.
+    completion: completion_8922a::Worker,
 }
 
 impl Prepared8922a {
@@ -228,6 +234,8 @@ impl Prepared8922a {
             irq: None,
             data_retained: Vec::new(),
             h2c_retained: Vec::new(),
+            completion: completion_8922a::Worker::new(DEFAULT_RXBD_NUM, DEFAULT_RXBD_NUM)
+                .map_err(Error::Completion)?,
         })
     }
 
@@ -325,6 +333,74 @@ impl Prepared8922a {
         binding.rearm(regs).map_err(Error::IrqIo)
     }
 
+    /// C2H completion worker (chip-row step 7): drain the RPQ
+    /// then RXQ rings for the `events` `irq_service` classified,
+    /// in Linux `rtw89_pci_napi_poll` order, over the
+    /// caller-supplied probe-allocated RX buffers (`rxq` /
+    /// `rpq`, exactly the programmed depths each). The caller
+    /// syncs each buffer for the CPU before the call and back
+    /// for the device after; the worker clears consumed
+    /// RXBD-info headers itself. TX completions free their
+    /// retained DMA buffers here; WIFI frames arrive admitted
+    /// for a retained station only. `Outcome::rearm` tells the
+    /// caller to run `irq_rearm` when work done is under
+    /// budget. Refused unless the rings are programmed; a
+    /// fatal event (`halt_c2h` / watchdog) drains nothing.
+    pub(super) fn complete(
+        &mut self,
+        regs: &mut impl Regs,
+        events: super::irq::Events,
+        rxq: &mut [&mut [u8]],
+        rpq: &mut [&mut [u8]],
+        budget: usize,
+    ) -> Result<completion_8922a::Outcome, Error> {
+        if !self.rings_programmed {
+            return Err(Error::NotProgrammed);
+        }
+        if events.fatal() {
+            return Err(Error::Completion(completion_8922a::Error::Halted));
+        }
+        if budget == 0 || budget > 256 {
+            return Err(Error::Completion(completion_8922a::Error::Budget));
+        }
+        let mut outcome = completion_8922a::Outcome::default();
+        outcome.rx_unavailable = events.rx_unavailable;
+        let mut remaining = budget;
+        if events.rpq {
+            let rpq_out = self
+                .completion
+                .drain_rpq(regs, rpq, remaining, &mut self.data)
+                .map_err(Error::Completion)?;
+            outcome.dropped += rpq_out.dropped_records + rpq_out.dropped_buffers;
+            for done in rpq_out.completions {
+                let receipt = completion_8922a::TxReceipt {
+                    header_dma: done.resource.header_dma,
+                    frame_dma: done.resource.frame_dma,
+                    status: done.status,
+                };
+                self.release_data(receipt.header_dma, receipt.frame_dma);
+                outcome.tx.push(receipt);
+            }
+            remaining = remaining.saturating_sub(rpq_out.work);
+            outcome.work_done += rpq_out.work;
+        }
+        if events.rx {
+            let admitted: Vec<u8> =
+                self.stations.iter().map(|station| station.macid).collect();
+            let rxq_out = self
+                .completion
+                .drain_rxq(regs, rxq, remaining, &admitted)
+                .map_err(Error::Completion)?;
+            outcome.dropped += rxq_out.dropped;
+            outcome.frames.extend(rxq_out.frames);
+            outcome.c2h.extend(rxq_out.c2h);
+            outcome.ppdu.extend(rxq_out.ppdu);
+            outcome.work_done += rxq_out.work;
+        }
+        outcome.rearm = outcome.work_done < budget;
+        Ok(outcome)
+    }
+
     /// `rtw89_pci_ops_stop` + `rtw89_pci_free_irq`: HIMR off, MSI
     /// off, then drain and return the vector (or quarantine it when
     /// MSI cannot be proven disabled). Idempotent: releasing an
@@ -368,7 +444,10 @@ impl Prepared8922a {
     /// Marks the rings programmed; a later `stop_dma` clears the
     /// mark. `tx_phys` / `rx_phys` are the probe-allocated ring
     /// bases; `tx_len` / `rx_len` are the ring depths (Linux maxima
-    /// 256 unless the caller deliberately sizes smaller).
+    /// 256 unless the caller deliberately sizes smaller). The
+    /// completion worker is rebuilt at the programmed RX depths
+    /// before any register is written, so a bad depth refuses
+    /// without touching hardware.
     pub(super) fn program_rings(
         &mut self,
         regs: &mut impl Regs,
@@ -377,7 +456,10 @@ impl Prepared8922a {
         tx_len: u16,
         rx_len: u16,
     ) -> Result<(), Error> {
+        let worker =
+            completion_8922a::Worker::new(rx_len, rx_len).map_err(Error::Completion)?;
         dma_8922a::reset_trx_rings(regs, tx_phys, rx_phys, tx_len, rx_len)?;
+        self.completion = worker;
         self.rings_programmed = true;
         Ok(())
     }
@@ -388,6 +470,7 @@ impl Prepared8922a {
         let result = dma_8922a::stop_dma(regs).map_err(Error::Dma);
         if result.is_ok() {
             self.rings_programmed = false;
+            self.completion.reset();
         }
         result
     }
