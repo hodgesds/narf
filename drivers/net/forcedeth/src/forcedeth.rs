@@ -1201,6 +1201,10 @@ impl ForcedethNic {
         let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { self.mmio.read32(REG_XMIT_STATUS) } & XMIT_STATUS_BUSY == 0
+                // SAFETY: `REG_RCV_STATUS` (0x098) is a 4-byte-aligned status
+                // register inside the mapped BAR, so `offset + 4 <= len`
+                // holds; the volatile read only samples the RX BUSY bit
+                // and has no clear-on-read side effect.
                 && unsafe { self.mmio.read32(REG_RCV_STATUS) } & RCV_STATUS_BUSY == 0,
             narf_time::Deadline::after_ms(100),
         );
