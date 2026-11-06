@@ -39,6 +39,7 @@ pub mod battery;
 pub mod button;
 pub mod device_pm;
 pub mod laptop_state;
+pub mod monitor;
 pub mod orderly;
 pub mod pci_firmware;
 pub mod pci_wake;
@@ -293,18 +294,21 @@ pub fn register_initcalls() {
         }
     });
     narf_init::register(Stage::Late, "power-monitor", || {
-        // BISECT-DISABLED: list_sources() + src.capacity_percent()
-        // can evaluate AML methods (_BST etc.) on real silicon
-        // which can be slow or hang. Disabled in the current
-        // bisect step to isolate the wedge.
+        // Re-enabled (Refs #750): the watcher task polls the fused
+        // snapshot from task context (see `monitor`); the initcall
+        // itself only spawns, so no AML method is ever evaluated on
+        // the boot path — the slow / hangy EC evaluation that earned
+        // the old BISECT-DISABLED stub cannot wedge boot.
+        monitor::start_watcher();
         InitResult::Ok
     });
     // ACPI battery / thermal-zone / AC adapter discovery. These walk
     // the AML namespace for typed §10 / §11 devices and log what they
     // find — they do NOT poll the live methods on the boot path,
     // because real-silicon EC reads via the AML interpreter can be
-    // slow / hangy (see the power-monitor BISECT-DISABLED comment
-    // above). The platform-driver layer (`drivers/platform/{ac,
+    // slow / hangy (the `power-monitor` watcher polls from task
+    // context, via `monitor`, for exactly this reason). The
+    // platform-driver layer (`drivers/platform/{ac,
     // battery,thermal}.rs`) sets up the polling tasks.
     narf_init::register(Stage::Late, "acpi-battery-enum", || {
         let n = battery::enumerate().len();
