@@ -75,6 +75,25 @@ impl Sealed for Grant {}
 impl Sealed for Spend {}
 impl Sealed for Invoke {}
 
+/// Create: authority to **mint fresh capabilities**. Held only by the
+/// kernel's creator (boot / task creation) as `Cap<Task, Create>`
+/// (`scheduler::Task`, `CapKind::Task`) and presented to
+/// `Cap::bootstrap_with` — the creator-gated mint (SEC-B1, #1281;
+/// the Stage 4 deferred item, `capabilities/` §9.8).
+///
+/// `Create` is deliberately orthogonal in the `SubsetOf` lattice: it
+/// has NO edges to or from any other right (beyond the reflexive
+/// identity, so a creator can share its own authority via
+/// `derive::<Create>()` for the same object). In particular there
+/// is no `SubsetOf<Grant> for Create` — a Grant holder for an object
+/// must never be able to derive mint authority over it — and no
+/// `SubsetOf<Create> for X` — a creator cap cannot be weakened into
+/// an operational cap; it exists only to gate minting.
+#[derive(Copy, Clone, Debug)]
+pub struct Create;
+
+impl Sealed for Create {}
+
 impl Rights for Read {
     const BITS: u32 = 0b0_0001;
 }
@@ -89,6 +108,9 @@ impl Rights for Spend {
 }
 impl Rights for Invoke {
     const BITS: u32 = 0b1_0000;
+}
+impl Rights for Create {
+    const BITS: u32 = 0b10_0000;
 }
 
 /// Authority to derive R2 from R.
@@ -119,6 +141,12 @@ impl SubsetOf<Invoke> for Read {}
 // it's debiting. `Cap<CpuBudget, Spend>` → `Cap<CpuBudget, Read>`
 // for budget-status readouts without giving up the debit cap.
 impl SubsetOf<Spend> for Read {}
+
+// Create ⊂ nothing, nothing ⊂ Create: the mint authority has no
+// lattice edges at all (beyond the reflexive identity, so a creator
+// can share its own authority for the same object). A Grant holder
+// must never derive mint authority, and a creator cap must never
+// weaken into an operational cap — see `Create`'s docs and spec §9.8.
 
 // ── CapSlot ─────────────────────────────────────────────────────────
 
@@ -325,13 +353,64 @@ impl<T: CapType> Cap<T, Grant> {
 }
 
 impl<T: CapType, R: Rights> Cap<T, R> {
-    /// Safe mint: allocates a fresh object-table entry with
+    /// Legacy ungated mint: allocates a fresh object-table entry with
     /// `T::KIND` and produces a cap with `R::BITS`.
+    ///
+    /// This is the SEC-B1 hole (#1281): any caller can mint any cap,
+    /// so until it is removed every `Cap` parameter at a trust
+    /// boundary is advisory only. New code must use
+    /// [`bootstrap_with`]; removal of this
+    /// function once all call sites migrate is tracked in #1538.
     pub fn bootstrap() -> Self {
         let (index, generation) = object_table::register(T::KIND);
         let slot = CapSlot::new(generation, index, R::BITS, T::KIND as u32);
         // SAFETY: the operation upholds its documented invariant (see surrounding context).
         unsafe { Self::mint(slot) }
+    }
+
+    /// Creator-gated mint (SEC-B1 mechanism, #1281; the Stage 4
+    /// deferred item, spec §9.8). Mints a fresh object-table entry
+    /// for `T` with `R::BITS` — but only when the caller presents a
+    /// live creator capability: a `Cap<C, Create>` whose slot names
+    /// a `Task`-kind object (`CapKind::Task`) and carries the
+    /// `Create` right bit. An ungated caller cannot mint through
+    /// this path: there is no other way to obtain the creator
+    /// argument, and `Create` is not derivable from any other right
+    /// (spec §3 lattice — no `SubsetOf` edges into `Create`).
+    ///
+    /// The creator type is generic (`C: CapType`) rather than
+    /// naming `scheduler::Task` because `capabilities/` cannot
+    /// depend on `scheduler/`; the runtime `type_tag` check is the
+    /// gate, and in practice only `scheduler::Task` has
+    /// `KIND == CapKind::Task`. Checks, in order: creator live
+    /// (`check_live`, else `Revoked`), creator names a Task-kind
+    /// object (else `TypeMismatch`), creator slot carries the
+    /// `Create` bit (else `RightsTooWeak` — reachable only via a
+    /// hand-forged slot, since the type system pins `R = Create`).
+    ///
+    /// The minted cap is independent of the creator: revoking the
+    /// creator does not revoke caps it minted (the creator
+    /// authorises the mint; it does not own the minted object),
+    /// and the creator itself is unaffected (sharing semantics,
+    /// like `transfer`).
+    ///
+    /// Composes with the #1363 wiring (merged PR #1502): a task
+    /// creator mints a task's initial caps with this function and
+    /// installs them via `CapTable::install_bootstrap` — this
+    /// function adds no second install path and no second table.
+    pub fn bootstrap_with<C: CapType>(creator: &Cap<C, Create>) -> Result<Self, CapError> {
+        creator.check_live()?;
+        if creator.slot().type_tag != CapKind::Task as u32 {
+            return Err(CapError::TypeMismatch);
+        }
+        if creator.slot().rights & Create::BITS == 0 {
+            return Err(CapError::RightsTooWeak);
+        }
+        let (index, generation) = object_table::register(T::KIND);
+        let slot = CapSlot::new(generation, index, R::BITS, T::KIND as u32);
+        // SAFETY: the slot was just registered on the TCB-authorised
+        // creator-gated path and its type_tag/rights match T and R.
+        unsafe { Ok(Self::mint(slot)) }
     }
 }
 

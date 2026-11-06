@@ -10,7 +10,10 @@ table, so forgery, aliasing-without-permission, and UAF are type errors.
   (128-bit, CMPXCHG16B-sized) + `Rights` + full `CapKind` wire
   registry. Wave 2 added the object-epoch table, `check_live` /
   `invoke` / `revoke` fast path, and the `bootstrap()` safe mint path.
-  Deferred to Stage 4: `Cap<Task, Create>`-gated bootstrap, badge
-  storage field in `CapSlot`, RCU-backed object-table reader, slot
-  reuse, in-kernel `CapKind` dispatcher for the `abi/` submission
-  surface.
+  Deferred to Stage 4: badge storage field in `CapSlot`,
+  RCU-backed object-table reader, slot reuse, in-kernel `CapKind`
+  dispatcher for the `abi/` submission surface. The Stage 4
+  `Cap<Task, Create>`-gated bootstrap has landed as
+  `Cap::bootstrap_with` (spec §9.8, #1281 mechanism); the legacy
+  ungated `bootstrap()` remains until the migration tracked in
+  #1538 removes it.
