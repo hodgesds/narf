@@ -243,7 +243,7 @@ mod tests {
         if wol_supported(&board, 1) {
             return TestResult::Fail("NVM WoL-disabled bit for this port must gate WoL off");
         }
-        if wol_supported(&board, 0) != true {
+        if !wol_supported(&board, 0) {
             return TestResult::Fail("NVM bit for another port must not gate this port off");
         }
         // Port beyond the NVM word: unsupported.

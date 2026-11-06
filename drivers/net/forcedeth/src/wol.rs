@@ -92,6 +92,7 @@ pub trait RegBank {
 }
 
 /// Live `RegBank` over an `MmioRegion`.
+#[derive(Debug)]
 pub struct MmioRegBank<'a>(pub &'a MmioRegion);
 
 impl RegBank for MmioRegBank<'_> {
@@ -274,7 +275,7 @@ mod tests {
         if !set_wol(WAKE_MAGIC | 0x01, false) {
             return TestResult::Fail("WAKE_MAGIC|other did not set the enable");
         }
-        if set_wol(0x01, true) != true || set_wol(0x01, false) != false {
+        if !set_wol(0x01, true) || set_wol(0x01, false) {
             return TestResult::Fail("non-magic wolopts changed the stored enable");
         }
         if wol_opts(true) != WAKE_MAGIC || wol_opts(false) != 0 {

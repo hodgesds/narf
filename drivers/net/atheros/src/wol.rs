@@ -188,6 +188,7 @@ pub trait RegBank {
 }
 
 /// Live `RegBank` over an `MmioRegion`.
+#[derive(Debug)]
 pub struct MmioRegBank<'a>(pub &'a MmioRegion);
 
 impl RegBank for MmioRegBank<'_> {
@@ -514,7 +515,7 @@ mod tests {
             _ => return TestResult::Fail("WAKE_MAGIC did not map to magic-only"),
         }
         match wol_filters_from_opts(WAKE_PHY) {
-            Ok(f) if f.magic == false && f.link_change => {}
+            Ok(f) if !f.magic && f.link_change => {}
             _ => return TestResult::Fail("WAKE_PHY did not map to link-change-only"),
         }
         match wol_filters_from_opts(WAKE_MAGIC | WAKE_PHY) {

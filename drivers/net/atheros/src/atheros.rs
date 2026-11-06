@@ -768,9 +768,8 @@ impl AtlNic {
     /// Live wake-status decode from `REG_WOL_CTRL`.
     pub fn wol_status(&self) -> crate::wol::WakeStatus {
         // SAFETY: identity-mapped MMIO.
-        crate::wol::WakeStatus {
-            raw: unsafe { self.mmio.read32(crate::wol::REG_WOL_CTRL) },
-        }
+        let raw = unsafe { self.mmio.read32(crate::wol::REG_WOL_CTRL) };
+        crate::wol::WakeStatus { raw }
     }
 
     /// Renegotiate the PHY down to the lowest mode the link partner
