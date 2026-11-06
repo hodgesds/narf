@@ -395,10 +395,10 @@ fn smoke_intel_aux_backlight_pwm_mode_panel_switches_to_dpcd_at_probe() -> TestR
     panel.set(0x702, 2 | 32);
     panel.set(MODE, 0x08);
     panel.set(FREQUENCY, 73);
-    let owner = owner(&panel);
+    let dynamic_owner = owner(&panel);
     assert_eq!(panel.get(MODE), 0x0A);
-    assert_eq!(owner.profile.mode, 0x0A);
-    assert_eq!(owner.profile.frequency, Some(73));
+    assert_eq!(dynamic_owner.profile.mode, 0x0A);
+    assert_eq!(dynamic_owner.profile.frequency, Some(73));
     assert_eq!(panel.writes_to(MODE).len(), 1);
     // A panel already in DPCD mode is left untouched: the RMW writes
     // back only when the byte changes.
