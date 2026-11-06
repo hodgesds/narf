@@ -259,6 +259,7 @@ static BL_PM_STATE: IrqSafeSpinLock<Option<BlPmState>> = IrqSafeSpinLock::new(No
 /// - `delay_ms` busy-waits via the calibrated TSC delay the
 ///   amdgpu bring-up paths use — the PM fan-out runs with
 ///   interrupts gated and must not sleep on the scheduler.
+#[derive(Debug)]
 pub struct AmdgpuEdpPanelHw {
     pwm_ok: bool,
 }
@@ -275,6 +276,16 @@ impl AmdgpuEdpPanelHw {
     }
 }
 
+impl Default for AmdgpuEdpPanelHw {
+    // `Default` is `new()`, not a derived `Default`: a fresh
+    // adapter has attempted no PWM write, so `pwm_ok` starts true
+    // — a derived impl would start it false and misreport a
+    // failure that never happened.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EdpPanelHw for AmdgpuEdpPanelHw {
     fn set_vdd(&mut self, _on: bool) {
         // Firmware-owned rail — see the struct docs.
@@ -285,6 +296,14 @@ impl EdpPanelHw for AmdgpuEdpPanelHw {
     }
 
     fn set_pwm(&mut self, user_level: u16) {
+        // SAFETY: `with_controller_mut` yields the probed controller
+        // under its lock; probe established exclusive BAR5 ownership
+        // for it — the same authority the `set_backlight` call in
+        // `set_brightness` relies on. `set_pwm_user_level` itself
+        // refuses (Err) before any MMIO when no mode is programmed
+        // yet, the ASIC has no discovery-resolvable DCN base, or the
+        // chip is Navi4; a refused write is recorded in `pwm_ok`
+        // because the trait cannot return one.
         let applied =
             crate::amdgpu::with_controller_mut(|gpu| unsafe { gpu.set_pwm_user_level(user_level) });
         if !matches!(applied, Some(Ok(()))) {
@@ -577,7 +596,7 @@ mod tests {
             return TestResult::Fail("resume from Off did not apply the saved level");
         }
         // VDD was asserted on the way up (the full chain ran).
-        if !hw.log.iter().any(|e| *e == ("vdd", 1)) {
+        if !hw.log.contains(&("vdd", 1)) {
             return TestResult::Fail("resume from Off skipped the VDD step");
         }
         TestResult::Pass
