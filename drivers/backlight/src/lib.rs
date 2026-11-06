@@ -74,6 +74,9 @@ pub mod kbd_backlight;
 pub mod leds;
 pub mod sysfs_bridge;
 
+#[cfg(any(test, feature = "kernel-test"))]
+mod fixture_dsdt;
+
 mod tests;
 
 use alloc::borrow::ToOwned;
