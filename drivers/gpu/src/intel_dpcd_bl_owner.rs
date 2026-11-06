@@ -22,6 +22,15 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 const NAME: &str = "intel_aux_backlight";
 const MODE: u32 = 0x721;
+/// `BACKLIGHT_MODE` (0x721) control-mode field (Linux b90c984d
+/// `drm_dp.h`: `DP_EDP_BACKLIGHT_CONTROL_MODE_MASK`).
+const MODE_MASK: u8 = 0x07;
+/// Control-mode selectors (Linux b90c984d `drm_dp.h`:
+/// `DP_EDP_BACKLIGHT_CONTROL_MODE_{PWM,PRESET,DPCD,PRODUCT}`).
+const MODE_PWM: u8 = 0;
+const MODE_PRESET: u8 = 1;
+const MODE_DPCD: u8 = 2;
+const MODE_PRODUCT: u8 = 3;
 const CONTROL: u32 = 0x720;
 const LEVEL: u32 = 0x722;
 const PWM_BITS: u32 = 0x724;
@@ -281,12 +290,28 @@ impl Profile {
             return Err(AuxError::UnknownStatus);
         }
         let mode = read(channel, MODE)?;
-        // Capture only already-DPCD firmware state: never infer an initial
-        // level from a PWM/preset register or switch a mixed-control panel.
-        if mode & !8 != 2 || (mode & 8 != 0 && caps[2] & 32 == 0) {
+        // Linux `intel_dp_aux_backlight` (`drm_edp_backlight_enable`,
+        // MIT Linux b90c984d): a full-AUX panel left in PWM, preset or
+        // product control mode is switched into DPCD mode by RMW on the
+        // control-mode field only — clear `MODE_MASK`, set `MODE_DPCD`,
+        // preserving the dynamic-frequency bit and every other bit.
+        // The post-switch byte is validated, and the frequency divider
+        // (when the post-switch mode needs one) proved nonzero, BEFORE
+        // any write, so a refused profile is never written; the write
+        // itself goes through `checked` (write + readback) and only
+        // when the byte actually changes. Reserved selectors (4..=7)
+        // have no pinned meaning and are refused, as are stray high
+        // bits and a dynamic bit without the dynamic cap. Never infer
+        // an initial level from a PWM/preset register.
+        let switched = match mode & MODE_MASK {
+            MODE_PWM | MODE_PRESET | MODE_PRODUCT => (mode & !MODE_MASK) | MODE_DPCD,
+            MODE_DPCD => mode,
+            _ => return Err(AuxError::UnknownStatus),
+        };
+        if switched & !8 != MODE_DPCD || (switched & 8 != 0 && caps[2] & 32 == 0) {
             return Err(AuxError::UnknownStatus);
         }
-        let frequency = if mode & 8 != 0 {
+        let frequency = if switched & 8 != 0 {
             let divider = read(channel, FREQUENCY)?;
             if divider == 0 {
                 return Err(AuxError::UnknownStatus);
@@ -295,6 +320,10 @@ impl Profile {
         } else {
             None
         };
+        if switched != mode {
+            checked(channel, MODE, switched)?;
+        }
+        let mode = switched;
         Ok(Self {
             caps,
             hdr,

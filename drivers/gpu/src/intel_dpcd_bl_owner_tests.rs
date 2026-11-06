@@ -329,8 +329,11 @@ fn smoke_intel_aux_backlight_unsupported_profiles_never_write_panel_controls() -
         (0x702, 3),
         (0x702, 10),
         (0x703, 16),
-        (MODE, 0),
-        (MODE, 3),
+        // (MODE, 0) and (MODE, 3) are no longer refusals: a full-AUX
+        // panel in PWM/product control mode is switched into DPCD mode
+        // at probe (issue #1219) — see the mode-select test below.
+        (MODE, 5),
+        (MODE, 8),
         (MODE, 0x82),
         (PWM_BITS, 9),
         (PWM_BITS + 1, 9),
@@ -353,6 +356,79 @@ fn smoke_intel_aux_backlight_unsupported_profiles_never_write_panel_controls() -
 kernel_test_in!(
     "drivers/gpu/intel_gpu_aux",
     smoke_intel_aux_backlight_unsupported_profiles_never_write_panel_controls
+);
+
+fn smoke_intel_aux_backlight_pwm_mode_panel_switches_to_dpcd_at_probe() -> TestResult {
+    let _registry = Registry::save();
+    // Full-AUX panels left in PWM, preset or product control mode are
+    // switched into DPCD mode at probe by RMW on the 0x721 mode field
+    // only (Linux `intel_dp_aux_backlight`, issue #1219): the write
+    // carries exactly the switched byte, and only when the byte
+    // changes. The switched panel then drives brightness normally.
+    for (initial, expected) in [(0u8, 2u8), (1, 2), (3, 2)] {
+        let panel = Panel::new(false, 8);
+        panel.set(MODE, initial);
+        let owner = owner(&panel);
+        assert_eq!(panel.get(MODE), expected);
+        let writes = panel.writes_to(MODE);
+        assert_eq!(
+            writes.len(),
+            1,
+            "probe must issue exactly one MODE write for mode {initial}"
+        );
+        assert_eq!(
+            writes[0].as_slice(),
+            &[0x80, 0x07, 0x21, 0x00, expected][..],
+            "MODE write must be one 1-byte NATIVE_WRITE at 0x721"
+        );
+        assert_eq!(owner.max_brightness(), 255);
+        assert_eq!(owner.register(), Ownership::Owner);
+        owner.set_brightness(200);
+        run(owner.process());
+        assert_eq!(owner.current_brightness(), 200);
+        assert_eq!(panel.get(MODE), expected);
+        narf_drivers_backlight::unregister_backlight(NAME);
+    }
+    // Dynamic PWM mode keeps its frequency bit across the switch when
+    // the panel advertises the dynamic cap, and the divider is kept.
+    let panel = Panel::new(false, 8);
+    panel.set(0x702, 2 | 32);
+    panel.set(MODE, 0x08);
+    panel.set(FREQUENCY, 73);
+    let owner = owner(&panel);
+    assert_eq!(panel.get(MODE), 0x0A);
+    assert_eq!(owner.profile.mode, 0x0A);
+    assert_eq!(owner.profile.frequency, Some(73));
+    assert_eq!(panel.writes_to(MODE).len(), 1);
+    // A panel already in DPCD mode is left untouched: the RMW writes
+    // back only when the byte changes.
+    let panel = Panel::new(false, 8);
+    let _owner = owner(&panel);
+    assert_eq!(panel.get(MODE), 2);
+    assert!(
+        panel.writes_to(MODE).is_empty(),
+        "probe must not write MODE on an already-DPCD panel"
+    );
+    // Reserved selectors and a dynamic bit without the dynamic cap are
+    // refused before any write, like every other unsupported profile.
+    for mode in [5u8, 8] {
+        let panel = Panel::new(false, 8);
+        panel.set(MODE, mode);
+        assert!(Vesa::probe(NAME, Channel(panel.clone())).is_err());
+        assert!(panel.0.lock().wires.iter().all(|wire| wire[0] >> 4 == 9));
+    }
+    // A dynamic panel with a zero divider is refused before the switch
+    // write, even though its mode field alone would switch.
+    let panel = Panel::new(false, 8);
+    panel.set(0x702, 2 | 32);
+    panel.set(MODE, 0x08);
+    assert!(Vesa::probe(NAME, Channel(panel.clone())).is_err());
+    assert!(panel.0.lock().wires.iter().all(|wire| wire[0] >> 4 == 9));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_aux",
+    smoke_intel_aux_backlight_pwm_mode_panel_switches_to_dpcd_at_probe
 );
 
 fn smoke_intel_aux_backlight_suspend_relight_waits_t8_and_replays_latest_intent() -> TestResult {
