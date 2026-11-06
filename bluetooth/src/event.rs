@@ -250,6 +250,12 @@ pub enum LeSubevent {
     PeriodicAdvertisingReport = 0x0F,
     /// LE Periodic Advertising Sync Lost (§7.7.65.16).
     PeriodicAdvertisingSyncLost = 0x10,
+    /// LE Scan Timeout (§7.7.65.17).
+    ScanTimeout = 0x11,
+    /// LE Advertising Set Terminated (§7.7.65.18).
+    AdvertisingSetTerminated = 0x12,
+    /// LE Scan Request Received (§7.7.65.19).
+    ScanRequestReceived = 0x13,
     ChannelSelectionAlgorithm = 0x14,
 }
 
@@ -270,6 +276,9 @@ impl LeSubevent {
             0x0E => Some(Self::PeriodicAdvertisingSyncEstablished),
             0x0F => Some(Self::PeriodicAdvertisingReport),
             0x10 => Some(Self::PeriodicAdvertisingSyncLost),
+            0x11 => Some(Self::ScanTimeout),
+            0x12 => Some(Self::AdvertisingSetTerminated),
+            0x13 => Some(Self::ScanRequestReceived),
             0x14 => Some(Self::ChannelSelectionAlgorithm),
             _ => None,
         }
@@ -576,6 +585,275 @@ pub fn parse_le_advertising_reports(event: &Event) -> Option<alloc::vec::Vec<LeA
         });
     }
     Some(out)
+}
+
+// ── LE Extended Advertising Report (§7.7.65.13) ────────────────────
+//
+// Subevent 0x0D. One LE Meta event carries `Num_Reports` reports;
+// each report is a fixed 24-byte header plus variable data:
+//
+// ```text
+//   Event_Type (2 LE) — bits: 0 connectable, 1 scannable, 2 directed,
+//       3 scan response, 4 legacy PDUs, 5..6 data status (00 complete,
+//       01 incomplete-more-to-come, 10 incomplete-truncated), 7..15 RFU
+//   Address_Type (1), Address (6)
+//   Primary_PHY (1): 0x01 LE 1M, 0x03 LE Coded
+//   Secondary_PHY (1): 0x00 no packets, 0x01 LE 1M, 0x02 LE 2M, 0x03 LE Coded
+//   Advertising_SID (1): 0x00..0x0F, 0xFF = no ADI field
+//   Tx_Power (1, signed dBm; 0x7F = unavailable)
+//   RSSI (1, signed dBm; 0x7F = unavailable)
+//   Periodic_Advertising_Interval (2 LE, 1.25 ms units; 0x0000 = none)
+//   Direct_Address_Type (1), Direct_Address (6)
+//   Data_Length (1), Data (Data_Length)
+// ```
+//
+// Layout cross-checked against the Linux kernel header
+// `include/net/bluetooth/hci.h` (`struct hci_ev_le_ext_adv_info`).
+
+/// Data-status values in an extended report's `Event_Type` bits 5..6
+/// (§7.7.65.13). The controller may split one advertisement across
+/// several reports: every report but the last carries
+/// `IncompleteMoreToCome`; the last carries `Complete`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ExtAdvDataStatus {
+    Complete = 0x00,
+    IncompleteMoreToCome = 0x01,
+    IncompleteTruncated = 0x02,
+}
+
+impl ExtAdvDataStatus {
+    pub fn from_event_type(event_type: u16) -> Option<Self> {
+        match (event_type >> 5) & 0x03 {
+            0x00 => Some(Self::Complete),
+            0x01 => Some(Self::IncompleteMoreToCome),
+            0x02 => Some(Self::IncompleteTruncated),
+            _ => None,
+        }
+    }
+}
+
+/// One report inside an LE Extended Advertising Report subevent
+/// (§7.7.65.13).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeExtendedAdvertisingReport {
+    pub event_type: u16,
+    pub address_type: u8,
+    pub address: [u8; 6],
+    pub primary_phy: u8,
+    pub secondary_phy: u8,
+    pub sid: u8,
+    pub tx_power: i8,
+    pub rssi: i8,
+    pub periodic_interval: u16,
+    pub direct_address_type: u8,
+    pub direct_address: [u8; 6],
+    pub data: alloc::vec::Vec<u8>,
+}
+
+impl LeExtendedAdvertisingReport {
+    /// Data status from `event_type` bits 5..6 (§7.7.65.13).
+    pub fn data_status(&self) -> Option<ExtAdvDataStatus> {
+        ExtAdvDataStatus::from_event_type(self.event_type)
+    }
+
+    /// Legacy-PDU bit (bit 4): the report came from a legacy
+    /// advertising PDU, so primary/secondary PHY, SID, Tx power and
+    /// periodic interval carry the spec's legacy sentinels.
+    pub fn is_legacy(&self) -> bool {
+        self.event_type & (1 << 4) != 0
+    }
+}
+
+/// Parse an LE Extended Advertising Report subevent into the
+/// contained reports. Returns `None` if the event isn't a well-formed
+/// LE Meta / Extended Advertising Report — including a report whose
+/// `Data_Length` runs past the end of the event, so a truncated
+/// controller frame can never be mistaken for a short advertisement.
+pub fn parse_le_extended_advertising_reports(
+    event: &Event,
+) -> Option<alloc::vec::Vec<LeExtendedAdvertisingReport>> {
+    if event.code != EventCode::LeMeta as u8 {
+        return None;
+    }
+    let p = &event.params;
+    if p.len() < 2 || p[0] != LeSubevent::ExtendedAdvertisingReport as u8 {
+        return None;
+    }
+    let n = p[1] as usize;
+    let mut out = alloc::vec::Vec::with_capacity(n);
+    let mut i = 2;
+    for _ in 0..n {
+        // Fixed 24-byte header per report.
+        if i + 24 > p.len() {
+            return None;
+        }
+        let event_type = u16::from_le_bytes([p[i], p[i + 1]]);
+        let address_type = p[i + 2];
+        let mut address = [0u8; 6];
+        address.copy_from_slice(&p[i + 3..i + 9]);
+        let primary_phy = p[i + 9];
+        let secondary_phy = p[i + 10];
+        let sid = p[i + 11];
+        let tx_power = p[i + 12] as i8;
+        let rssi = p[i + 13] as i8;
+        let periodic_interval = u16::from_le_bytes([p[i + 14], p[i + 15]]);
+        let direct_address_type = p[i + 16];
+        let mut direct_address = [0u8; 6];
+        direct_address.copy_from_slice(&p[i + 17..i + 23]);
+        let dlen = p[i + 23] as usize;
+        i += 24;
+        if i + dlen > p.len() {
+            return None;
+        }
+        let data = p[i..i + dlen].to_vec();
+        i += dlen;
+        out.push(LeExtendedAdvertisingReport {
+            event_type,
+            address_type,
+            address,
+            primary_phy,
+            secondary_phy,
+            sid,
+            tx_power,
+            rssi,
+            periodic_interval,
+            direct_address_type,
+            direct_address,
+            data,
+        });
+    }
+    Some(out)
+}
+
+/// LE Scan Timeout subevent (§7.7.65.17). Subevent 0x11, no
+/// parameters: the scan `Duration` from LE Set Extended Scan Enable
+/// (§7.8.65) expired, so the controller stopped scanning on its own.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LeScanTimeout;
+
+impl LeScanTimeout {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::LeMeta as u8 {
+            return None;
+        }
+        let p = &event.params;
+        if p.is_empty() || p[0] != LeSubevent::ScanTimeout as u8 {
+            return None;
+        }
+        Some(Self)
+    }
+}
+
+/// LE Advertising Set Terminated subevent (§7.7.65.18). Subevent 0x12.
+///
+/// Layout (after the 0x3E + subevent-code bytes):
+/// ```text
+///   0:    u8  Status
+///   1:    u8  Advertising_Handle
+///   2..4: u16 LE Connection_Handle (0 if no connection was created)
+///   4:    u8  Num_Completed_Extended_Advertising_Events
+/// ```
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LeAdvertisingSetTerminated {
+    pub status: u8,
+    pub handle: u8,
+    pub connection_handle: u16,
+    pub num_completed_events: u8,
+}
+
+impl LeAdvertisingSetTerminated {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::LeMeta as u8 {
+            return None;
+        }
+        let p = &event.params;
+        if p.is_empty() || p[0] != LeSubevent::AdvertisingSetTerminated as u8 {
+            return None;
+        }
+        if p.len() < 1 + 5 {
+            return None;
+        }
+        Some(Self {
+            status: p[1],
+            handle: p[2],
+            connection_handle: u16::from_le_bytes([p[3], p[4]]) & 0x0FFF,
+            num_completed_events: p[5],
+        })
+    }
+}
+
+/// LE Scan Request Received subevent (§7.7.65.19). Subevent 0x13.
+///
+/// Layout (after the 0x3E + subevent-code bytes):
+/// ```text
+///   0:    u8  Advertising_Handle
+///   1:    u8  Scanner_Address_Type
+///   2..8: 6   Scanner_Address
+/// ```
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LeScanRequestReceived {
+    pub handle: u8,
+    pub scanner_address_type: u8,
+    pub scanner_address: [u8; 6],
+}
+
+impl LeScanRequestReceived {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::LeMeta as u8 {
+            return None;
+        }
+        let p = &event.params;
+        if p.is_empty() || p[0] != LeSubevent::ScanRequestReceived as u8 {
+            return None;
+        }
+        if p.len() < 1 + 8 {
+            return None;
+        }
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&p[3..9]);
+        Some(Self {
+            handle: p[1],
+            scanner_address_type: p[2],
+            scanner_address: addr,
+        })
+    }
+}
+
+// ── Extended advertising / scan Command Complete return params ─────
+
+/// LE Set Extended Advertising Parameters return params (§7.8.53):
+/// Status (1) + Selected_Tx_Power (1, signed dBm) — the Tx power the
+/// controller actually selected for the set. Returns `None` when the
+/// Command Complete is too short to carry the power byte.
+pub fn parse_ext_adv_selected_tx_power(cc: &CommandComplete) -> Option<i8> {
+    if cc.return_params.len() < 2 {
+        return None;
+    }
+    Some(cc.return_params[1] as i8)
+}
+
+/// LE Read Maximum Advertising Data Length return params (§7.8.57):
+/// Status (1) + Maximum_Advertising_Data_Length (2 LE). The largest
+/// advertising-data length the controller accepts in one Set Extended
+/// Advertising Data command (at most 251, §7.8.54).
+pub fn parse_max_adv_data_length(cc: &CommandComplete) -> Option<u16> {
+    if cc.return_params.len() < 3 {
+        return None;
+    }
+    Some(u16::from_le_bytes([
+        cc.return_params[1],
+        cc.return_params[2],
+    ]))
+}
+
+/// LE Read Number of Supported Advertising Sets return params
+/// (§7.8.58): Status (1) + Num_Supported_Advertising_Sets (1).
+pub fn parse_num_supported_adv_sets(cc: &CommandComplete) -> Option<u8> {
+    if cc.return_params.len() < 2 {
+        return None;
+    }
+    Some(cc.return_params[1])
 }
 
 // ── LE Periodic Advertising subevents (§7.7.65.14..16) ─────────────

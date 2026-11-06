@@ -88,6 +88,25 @@
 //! host-initiated disconnect — the connection is tracked like any
 //! other pump connection and torn down on Disconnection Complete.
 //!
+//! ## Extended advertising / scanning (issue #823)
+//!
+//! [`ext_central_start_scan`] / [`ext_central_stop_scan`] issue the
+//! LE Set Extended Scan Parameters / Enable commands (§7.8.64/65)
+//! through the same sequenced send path; LE Extended Advertising
+//! Reports (§7.7.65.13) received while scanning feed the
+//! [`gap::ExtendedScanner`] peer table with fragment reassembly, and
+//! LE Scan Timeout (§7.7.65.17) ends the scan on its own.
+//! [`ext_adv_start`] / [`ext_adv_stop`] drive one advertising set
+//! through parameters → data → (scan response) → enable (§7.8.53..56),
+//! chained on Command Completes; LE Advertising Set Terminated
+//! (§7.7.65.18) and LE Scan Request Received (§7.7.65.19) land on
+//! the set's host-side state. [`ext_central_phase`] /
+//! [`ext_central_peers`] / [`ext_adv_phase`] /
+//! [`ext_adv_selected_tx_power`] expose the state for a future
+//! mgmt/userspace trigger lane. What this deliberately does NOT do:
+//! periodic advertising (§7.8.61..63) or LE Extended Create
+//! Connection (§7.8.66) — both are follow-ups to #823.
+//!
 //! ## Classic initiation (issue #1315)
 //!
 //! [`classic_start_inquiry`] / [`classic_cancel_inquiry`] /
@@ -134,14 +153,19 @@ use crate::bond_store::{Bond, BondStore};
 use crate::classic::{self, ClassicPhase};
 use crate::controller::ControllerInfo;
 use crate::event::{
-    parse_extended_inquiry_results, parse_inquiry_results, parse_inquiry_results_with_rssi,
-    parse_le_advertising_reports, ClassicConnectionComplete, CommandComplete, CommandStatus,
-    DisconnectionComplete, EventCode, LeChannelSelectionAlgorithm, LeConnectionComplete,
-    LeEnhancedConnectionComplete, LeLongTermKeyRequest, LePeriodicAdvReport,
-    LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost, NumberOfCompletedPackets,
+    parse_ext_adv_selected_tx_power, parse_extended_inquiry_results, parse_inquiry_results,
+    parse_inquiry_results_with_rssi, parse_le_advertising_reports,
+    parse_le_extended_advertising_reports, ClassicConnectionComplete, CommandComplete,
+    CommandStatus, DisconnectionComplete, EventCode, LeAdvertisingSetTerminated,
+    LeChannelSelectionAlgorithm, LeConnectionComplete, LeEnhancedConnectionComplete,
+    LeLongTermKeyRequest, LePeriodicAdvReport, LePeriodicAdvSyncEstablished,
+    LePeriodicAdvSyncLost, LeScanRequestReceived, LeScanTimeout, NumberOfCompletedPackets,
     RemoteNameRequestComplete,
 };
-use crate::gap::{self, CentralPhase, PeriodicAdvertiserPhase, PeriodicSyncPhase};
+use crate::gap::{
+    self, AdvertisingSetPhase, CentralPhase, ExtendedScannerPhase, PeriodicAdvertiserPhase,
+    PeriodicSyncPhase,
+};
 use crate::gatt_client::{self, GattClientError};
 use crate::gatt_server::GattServer;
 use crate::hci::{AclData, Command, Event};
@@ -461,11 +485,28 @@ pub struct PumpCore {
     /// outbound issuance.
     central: gap::Central,
     /// Connection parameters waiting on scan-disable completion:
+    /// Connection parameters waiting on scan-disable completion:
     /// `central_connect` / `central_connect_ext` from Scanning
     /// issue Set_Scan_Enable(0) first and only issue the create
     /// command once the disable completes, so the controller is
     /// never asked to initiate while it is still scanning.
     pending_connect: Option<PendingConnect>,
+    /// GAP extended scanner state (issue #823): extended scan
+    /// discovery. Mirrors the legacy `central` field; driven by
+    /// `dispatch_event` for inbound extended reports / scan timeout
+    /// and by the `ext_central_*` API for outbound issuance.
+    ext_central: gap::ExtendedScanner,
+    /// Advertising sets owned by this controller (issue #823), keyed
+    /// by handle. Driven by `dispatch_event` (Advertising Set
+    /// Terminated, Scan Request Received) and the `ext_adv_*` API.
+    ext_adv_sets: Vec<gap::AdvertisingSet>,
+    /// Advertising payloads waiting on the parameters completion of
+    /// an `ext_adv_start` chain: `ext_adv_start` issues parameters
+    /// first and the data / scan-response / enable commands follow
+    /// on successive Command Completes. Only one chain runs at a
+    /// time — a second `ext_adv_start` while one is in flight is
+    /// refused — so the completion arms can find their set by phase.
+    pending_ext_adv: Option<PendingExtAdv>,
     /// Classic BR/EDR central initiator state (issue #1315): inquiry
     /// discovery + outbound paging. Mirrors the LE `central` field;
     /// driven by `dispatch_event` and the `classic_*` API.
@@ -527,6 +568,8 @@ impl fmt::Debug for PumpCore {
             .field("info", &self.info)
             .field("connections", &self.connections.len())
             .field("central_phase", &self.central.phase)
+            .field("ext_central_phase", &self.ext_central.phase)
+            .field("ext_adv_sets", &self.ext_adv_sets.len())
             .field("classic_phase", &self.classic.phase)
             .field("periodic_adv_phase", &self.periodic_adv.phase)
             .field("periodic_sync_phase", &self.periodic_sync.phase)
@@ -569,6 +612,9 @@ impl PumpCore {
             sdp: SdpServer::new(),
             central: gap::Central::new(),
             pending_connect: None,
+            ext_central: gap::ExtendedScanner::new(),
+            ext_adv_sets: Vec::new(),
+            pending_ext_adv: None,
             classic: classic::ClassicCentral::new(),
             periodic_adv: gap::PeriodicAdvertiser::new(),
             periodic_sync: gap::PeriodicSync::new(),
@@ -1116,6 +1162,9 @@ pub enum CentralError {
     /// PHY, an unsupported PHY bit, a missing per-PHY block, or an
     /// inverted interval / connection-event-length range (§7.8.66).
     BadParams,
+    /// Advertising data or scan-response data exceeds the 251-byte
+    /// extended maximum (§7.8.54).
+    BadData,
 }
 
 impl PumpCore {
@@ -1490,6 +1539,363 @@ impl PumpCore {
     }
 }
 
+// ── GAP extended advertising / scanning (issue #823) ───────────────
+
+/// Advertising payloads waiting on the parameters completion of an
+/// `ext_adv_start` chain.
+#[derive(Clone, Debug)]
+struct PendingExtAdv {
+    handle: u8,
+    data: Vec<u8>,
+    scan_response: Option<Vec<u8>>,
+}
+
+impl PumpCore {
+    /// Begin extended LE discovery: issue LE Set Extended Scan
+    /// Parameters (Vol 4 Part E §7.8.64). The follow-up LE Set
+    /// Extended Scan Enable(1) is issued from `dispatch_event` once
+    /// the parameters complete successfully, so the controller never
+    /// receives Enable before its parameters are accepted. Only from
+    /// Idle. At least one PHY must be set in `params` — an empty
+    /// mask is rejected by the controller and the phase returns to
+    /// Idle on the failed completion.
+    pub fn ext_central_start_scan(
+        &mut self,
+        params: gap::ExtendedScanParameters,
+    ) -> Result<(), CentralError> {
+        if self.ext_central.phase != ExtendedScannerPhase::Idle {
+            return Err(CentralError::WrongPhase);
+        }
+        self.send_command(op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS, &params.encode())
+            .map_err(|_| CentralError::Transport)?;
+        self.ext_central.note_parameters_sent();
+        Ok(())
+    }
+
+    /// Stop extended LE discovery: issue LE Set Extended Scan
+    /// Enable(0) (§7.8.65). Only from Scanning; completion returns
+    /// the phase to Idle. A scan whose duration expired ends on its
+    /// own via LE Scan Timeout (§7.7.65.17) instead.
+    pub fn ext_central_stop_scan(&mut self) -> Result<(), CentralError> {
+        if self.ext_central.phase != ExtendedScannerPhase::Scanning {
+            return Err(CentralError::WrongPhase);
+        }
+        self.send_command(
+            op::HCI_LE_SET_EXTENDED_SCAN_ENABLE,
+            &gap::ExtendedScanEnable {
+                enable: false,
+                filter_duplicates: gap::ExtendedDuplicateFilter::Disabled,
+                duration: 0,
+                period: 0,
+            }
+            .encode(),
+        )
+        .map_err(|_| CentralError::Transport)?;
+        self.ext_central.note_scan_stopping();
+        Ok(())
+    }
+
+    /// Begin advertising set `params.handle`: issue LE Set Extended
+    /// Advertising Parameters (§7.8.53). On the parameters'
+    /// Command Complete the pump issues Set Extended Advertising
+    /// Data (§7.8.54) with `data`, then — if `scan_response` is
+    /// given — Set Extended Scan Response Data (§7.8.55), then Set
+    /// Extended Advertising Enable(enable=1) (§7.8.56), each step
+    /// only on the previous step's success. Any failed step drops
+    /// the set to Idle and clears the chain. Only from Idle, and
+    /// only one set may be mid-chain at a time.
+    pub fn ext_adv_start(
+        &mut self,
+        params: gap::ExtendedAdvertisingParameters,
+        data: &[u8],
+        scan_response: Option<&[u8]>,
+    ) -> Result<(), CentralError> {
+        if data.len() > gap::EXT_ADV_DATA_MAX_LEN
+            || scan_response.is_some_and(|s| s.len() > gap::EXT_ADV_DATA_MAX_LEN)
+        {
+            return Err(CentralError::BadData);
+        }
+        // One configuration chain at a time: a second start while a
+        // set is mid-chain would make the completion arms ambiguous.
+        if self.pending_ext_adv.is_some()
+            || self.ext_adv_sets.iter().any(|s| {
+                s.phase == AdvertisingSetPhase::ParametersSent
+                    || s.phase == AdvertisingSetPhase::Configuring
+                    || s.phase == AdvertisingSetPhase::Enabling
+            })
+        {
+            return Err(CentralError::WrongPhase);
+        }
+        let handle = params.handle;
+        if self.ext_adv_set(handle).phase != AdvertisingSetPhase::Idle {
+            return Err(CentralError::WrongPhase);
+        }
+        self.send_command(
+            op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS,
+            &params.encode(),
+        )
+        .map_err(|_| CentralError::Transport)?;
+        self.pending_ext_adv = Some(PendingExtAdv {
+            handle,
+            data: data.to_vec(),
+            scan_response: scan_response.map(|s| s.to_vec()),
+        });
+        self.ext_adv_set_mut(handle).note_parameters_sent();
+        Ok(())
+    }
+
+    /// Stop advertising set `handle`: issue LE Set Extended
+    /// Advertising Enable(enable=0) for that set (§7.8.56). Only
+    /// from Advertising; completion returns the set to Idle. A set
+    /// whose duration / max-events expired ends on its own via LE
+    /// Advertising Set Terminated (§7.7.65.18) instead.
+    pub fn ext_adv_stop(&mut self, handle: u8) -> Result<(), CentralError> {
+        let phase = self
+            .ext_adv_sets
+            .iter()
+            .find(|s| s.handle == handle)
+            .map(|s| s.phase);
+        if phase != Some(AdvertisingSetPhase::Advertising) {
+            return Err(CentralError::WrongPhase);
+        }
+        self.send_command(
+            op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE,
+            &gap::ExtendedAdvertisingEnable::disable_one(handle),
+        )
+        .map_err(|_| CentralError::Transport)?;
+        self.ext_adv_set_mut(handle).note_disabling();
+        Ok(())
+    }
+
+    /// Host-side state for advertising set `handle`, creating it in
+    /// Idle when this controller has never configured the set.
+    fn ext_adv_set(&mut self, handle: u8) -> &gap::AdvertisingSet {
+        if self.ext_adv_sets.iter().all(|s| s.handle != handle) {
+            self.ext_adv_sets.push(gap::AdvertisingSet::new(handle));
+        }
+        self.ext_adv_sets
+            .iter()
+            .find(|s| s.handle == handle)
+            .expect("set just created")
+    }
+
+    /// Mutable host-side state for advertising set `handle`,
+    /// creating it in Idle when this controller has never configured
+    /// the set.
+    fn ext_adv_set_mut(&mut self, handle: u8) -> &mut gap::AdvertisingSet {
+        if self.ext_adv_sets.iter().all(|s| s.handle != handle) {
+            self.ext_adv_sets.push(gap::AdvertisingSet::new(handle));
+        }
+        self.ext_adv_sets
+            .iter_mut()
+            .find(|s| s.handle == handle)
+            .expect("set just created")
+    }
+
+    /// Advance the extended scanner on a completed extended scan
+    /// command. Shared by the Command Complete and Command Status
+    /// arms: scan commands return Complete.
+    fn on_ext_central_command_done(&mut self, opcode: u16, status: u8) {
+        match opcode {
+            op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS => {
+                if self.ext_central.phase == ExtendedScannerPhase::ParametersSent {
+                    if status == 0 {
+                        // Parameters accepted: enable scanning now.
+                        if self
+                            .send_command(
+                                op::HCI_LE_SET_EXTENDED_SCAN_ENABLE,
+                                &gap::ExtendedScanEnable {
+                                    enable: true,
+                                    filter_duplicates: gap::ExtendedDuplicateFilter::Disabled,
+                                    duration: 0,
+                                    period: 0,
+                                }
+                                .encode(),
+                            )
+                            .is_ok()
+                        {
+                            self.ext_central.note_scanning();
+                        } else {
+                            self.ext_central.phase = ExtendedScannerPhase::Idle;
+                        }
+                    } else {
+                        self.ext_central.phase = ExtendedScannerPhase::Idle;
+                    }
+                }
+            }
+            op::HCI_LE_SET_EXTENDED_SCAN_ENABLE => {
+                // The enable(1) completion while Scanning changes
+                // nothing on success; the disable completion while
+                // ScanStopping ends the scan. A rejected enable
+                // leaves the phase where the controller actually is:
+                // enable rejected while Scanning means scanning never
+                // started (back to Idle); disable rejected while
+                // ScanStopping means the controller is still scanning.
+                if status != 0 {
+                    match self.ext_central.phase {
+                        ExtendedScannerPhase::ScanStopping => {
+                            self.ext_central.phase = ExtendedScannerPhase::Scanning;
+                        }
+                        ExtendedScannerPhase::Scanning => {
+                            self.ext_central.phase = ExtendedScannerPhase::Idle;
+                        }
+                        _ => {}
+                    }
+                } else if self.ext_central.phase == ExtendedScannerPhase::ScanStopping {
+                    self.ext_central.phase = ExtendedScannerPhase::Idle;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Issue the enable step of an advertising-set chain for
+    /// `handle`: Set Extended Advertising Enable(enable=1) with no
+    /// duration limit and no event cap (§7.8.56).
+    fn send_ext_adv_enable(&mut self, handle: u8) -> Result<(), TransportError> {
+        self.send_command(
+            op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE,
+            &gap::ExtendedAdvertisingEnable::enable_one(handle),
+        )
+    }
+
+    /// Advance the advertising-set chain on a completed extended
+    /// advertising command. `selected_tx_power` is the §7.8.53
+    /// return parameter, present only on the parameters' Command
+    /// Complete; Command Status completions pass `None`.
+    fn on_ext_adv_command_done(&mut self, opcode: u16, status: u8, selected_tx_power: Option<i8>) {
+        match opcode {
+            op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS => {
+                let Some(handle) = self
+                    .ext_adv_sets
+                    .iter()
+                    .find(|s| s.phase == AdvertisingSetPhase::ParametersSent)
+                    .map(|s| s.handle)
+                else {
+                    return;
+                };
+                if status != 0 {
+                    self.ext_adv_set_mut(handle).note_failed();
+                    self.pending_ext_adv = None;
+                    return;
+                }
+                let tx = selected_tx_power.unwrap_or(gap::EXT_ADV_TX_POWER_NO_PREFERENCE);
+                self.ext_adv_set_mut(handle)
+                    .note_parameters_complete(status, tx);
+                let Some(pending) = self.pending_ext_adv.clone() else {
+                    self.ext_adv_set_mut(handle).note_failed();
+                    return;
+                };
+                let data = gap::ExtendedAdvertisingData {
+                    handle: pending.handle,
+                    operation: gap::AdvertisingDataOperation::Complete,
+                    fragment_preference: gap::FragmentPreference::MinimizeFragmentation,
+                    data: &pending.data,
+                };
+                if self
+                    .send_command(op::HCI_LE_SET_EXTENDED_ADVERTISING_DATA, &data.encode())
+                    .is_err()
+                {
+                    self.ext_adv_set_mut(handle).note_failed();
+                    self.pending_ext_adv = None;
+                }
+            }
+            op::HCI_LE_SET_EXTENDED_ADVERTISING_DATA => {
+                let Some(handle) = self
+                    .ext_adv_sets
+                    .iter()
+                    .find(|s| s.phase == AdvertisingSetPhase::Configuring)
+                    .map(|s| s.handle)
+                else {
+                    return;
+                };
+                if status != 0 {
+                    self.ext_adv_set_mut(handle).note_failed();
+                    self.pending_ext_adv = None;
+                    return;
+                }
+                let Some(pending) = self.pending_ext_adv.clone() else {
+                    self.ext_adv_set_mut(handle).note_failed();
+                    return;
+                };
+                match &pending.scan_response {
+                    Some(sr) => {
+                        let sr_data = gap::ExtendedAdvertisingData {
+                            handle: pending.handle,
+                            operation: gap::AdvertisingDataOperation::Complete,
+                            fragment_preference: gap::FragmentPreference::MinimizeFragmentation,
+                            data: sr,
+                        };
+                        if self
+                            .send_command(
+                                op::HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA,
+                                &sr_data.encode(),
+                            )
+                            .is_err()
+                        {
+                            self.ext_adv_set_mut(handle).note_failed();
+                            self.pending_ext_adv = None;
+                        }
+                    }
+                    None => {
+                        if self.send_ext_adv_enable(pending.handle).is_err() {
+                            self.ext_adv_set_mut(handle).note_failed();
+                            self.pending_ext_adv = None;
+                        } else {
+                            self.ext_adv_set_mut(handle).note_enabling();
+                        }
+                    }
+                }
+            }
+            op::HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA => {
+                let Some(handle) = self
+                    .ext_adv_sets
+                    .iter()
+                    .find(|s| s.phase == AdvertisingSetPhase::Configuring)
+                    .map(|s| s.handle)
+                else {
+                    return;
+                };
+                if status != 0 {
+                    self.ext_adv_set_mut(handle).note_failed();
+                    self.pending_ext_adv = None;
+                    return;
+                }
+                let Some(pending) = self.pending_ext_adv.clone() else {
+                    self.ext_adv_set_mut(handle).note_failed();
+                    return;
+                };
+                if self.send_ext_adv_enable(pending.handle).is_err() {
+                    self.ext_adv_set_mut(handle).note_failed();
+                    self.pending_ext_adv = None;
+                } else {
+                    self.ext_adv_set_mut(handle).note_enabling();
+                }
+            }
+            op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE => {
+                if let Some(handle) = self
+                    .ext_adv_sets
+                    .iter()
+                    .find(|s| s.phase == AdvertisingSetPhase::Enabling)
+                    .map(|s| s.handle)
+                {
+                    // Enable step of a configuration chain.
+                    self.ext_adv_set_mut(handle).note_enable_complete(status);
+                    self.pending_ext_adv = None;
+                } else if let Some(handle) = self
+                    .ext_adv_sets
+                    .iter()
+                    .find(|s| s.phase == AdvertisingSetPhase::Disabling)
+                    .map(|s| s.handle)
+                {
+                    self.ext_adv_set_mut(handle).note_disable_complete(status);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // ── Classic BR/EDR central initiator API (issue #1315) ─────────────
 
 /// Errors from the Classic BR/EDR central initiator API (issue #1315).
@@ -1514,6 +1920,10 @@ pub enum ClassicError {
     /// `classic_request_remote_name` while another name request is
     /// already in flight — the controller allows only one.
     NameRequestPending,
+    /// Extended advertising data passed through a classic entry
+    /// point exceeds the 251-byte maximum (§7.8.54). Only reachable
+    /// via the shared `with_pump_core` error conversion.
+    BadData,
 }
 
 impl From<CentralError> for ClassicError {
@@ -1531,6 +1941,7 @@ impl From<CentralError> for ClassicError {
             // flows into the classic API. Mapped to WrongPhase to
             // keep the match exhaustive.
             CentralError::BadParams => ClassicError::WrongPhase,
+            CentralError::BadData => ClassicError::BadData,
         }
     }
 }
@@ -2202,6 +2613,54 @@ impl PumpCore {
                 if let Some(lost) = LePeriodicAdvSyncLost::parse(event) {
                     self.periodic_sync.note_sync_lost(&lost);
                 }
+                // Extended discovery reports feed the extended scanner
+                // peer table while extended scanning (§7.7.65.13),
+                // with fragment reassembly in `gap::ExtendedScanner`.
+                // Malformed reports parse to None and are dropped.
+                if self.ext_central.phase == ExtendedScannerPhase::Scanning {
+                    if let Some(reports) = parse_le_extended_advertising_reports(event) {
+                        for r in reports {
+                            self.ext_central.report(&r);
+                        }
+                    }
+                }
+                // LE Scan Timeout (§7.7.65.17): the scan duration
+                // expired, so the controller stopped scanning on its
+                // own.
+                if LeScanTimeout::parse(event).is_some() {
+                    self.ext_central.note_scan_timeout();
+                }
+                // LE Advertising Set Terminated (§7.7.65.18): the
+                // controller ended the set (duration / max-events
+                // reached, or a connection was created from it).
+                if let Some(term) = LeAdvertisingSetTerminated::parse(event) {
+                    if let Some(set) = self
+                        .ext_adv_sets
+                        .iter_mut()
+                        .find(|s| s.handle == term.handle)
+                    {
+                        set.note_terminated(
+                            term.status,
+                            term.connection_handle,
+                            term.num_completed_events,
+                        );
+                    }
+                }
+                // LE Scan Request Received (§7.7.65.19): a scanner
+                // asked this set for a scan response. Recorded on
+                // the set; the phase is unchanged.
+                if let Some(req) = LeScanRequestReceived::parse(event) {
+                    if let Some(set) = self
+                        .ext_adv_sets
+                        .iter_mut()
+                        .find(|s| s.handle == req.handle)
+                    {
+                        set.note_scan_request_received(
+                            req.scanner_address_type,
+                            req.scanner_address,
+                        );
+                    }
+                }
             }
             code if code == EventCode::InquiryResult as u8 => {
                 // §7.7.2: results feed the classic peer table while
@@ -2361,6 +2820,12 @@ impl PumpCore {
                         self.on_central_command_done(cc.opcode, status);
                         self.on_classic_command_done(cc.opcode, status);
                         self.on_periodic_command_done(cc.opcode, status);
+                        self.on_ext_central_command_done(cc.opcode, status);
+                        self.on_ext_adv_command_done(
+                            cc.opcode,
+                            status,
+                            parse_ext_adv_selected_tx_power(&cc),
+                        );
                     }
                 }
             }
@@ -2369,6 +2834,8 @@ impl PumpCore {
                     self.on_central_command_done(cs.opcode, cs.status);
                     self.on_classic_command_done(cs.opcode, cs.status);
                     self.on_periodic_command_done(cs.opcode, cs.status);
+                    self.on_ext_central_command_done(cs.opcode, cs.status);
+                    self.on_ext_adv_command_done(cs.opcode, cs.status, None);
                 }
             }
             code if code == EventCode::EncryptionChange as u8 => {
@@ -3816,6 +4283,102 @@ pub fn connection_channel_selection(index: usize, handle: u16) -> Option<Option<
         .core
         .as_ref()
         .and_then(|c| c.connection_channel_selection(handle))
+}
+
+// ── GAP extended advertising / scanning API (issue #823) ────────────
+
+/// Begin extended LE discovery on controller `index`: issue LE Set
+/// Extended Scan Parameters; Set Extended Scan Enable(1) follows on
+/// completion. Only from Idle. This is the trigger surface a future
+/// mgmt/userspace lane will call; today it is fixture-driven.
+pub fn ext_central_start_scan(
+    index: usize,
+    params: gap::ExtendedScanParameters,
+) -> Result<(), CentralError> {
+    with_pump_core(index, |core| core.ext_central_start_scan(params))?
+}
+
+/// Stop extended LE discovery on controller `index`. Only from
+/// Scanning.
+pub fn ext_central_stop_scan(index: usize) -> Result<(), CentralError> {
+    with_pump_core(index, |core| core.ext_central_stop_scan())?
+}
+
+/// Current GAP extended scanner phase for controller `index`, if its
+/// core is not currently owned by a pump step.
+pub fn ext_central_phase(index: usize) -> Option<gap::ExtendedScannerPhase> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| c.ext_central.phase)
+}
+
+/// Peers discovered by controller `index`'s extended scan, if its
+/// core is not currently owned by a pump step.
+pub fn ext_central_peers(index: usize) -> Option<Vec<gap::ExtendedDiscoveredPeer>> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .map(|c| c.ext_central.peers.clone())
+}
+
+/// Begin advertising set `params.handle` on controller `index`:
+/// parameters → data → (scan response) → enable, chained on Command
+/// Completes. Only from Idle, and only one set may be mid-chain at a
+/// time. This is the trigger surface a future mgmt/userspace lane
+/// will call; today it is fixture-driven.
+pub fn ext_adv_start(
+    index: usize,
+    params: gap::ExtendedAdvertisingParameters,
+    data: &[u8],
+    scan_response: Option<&[u8]>,
+) -> Result<(), CentralError> {
+    with_pump_core(index, |core| {
+        core.ext_adv_start(params, data, scan_response)
+    })?
+}
+
+/// Stop advertising set `handle` on controller `index`. Only from
+/// Advertising.
+pub fn ext_adv_stop(index: usize, handle: u8) -> Result<(), CentralError> {
+    with_pump_core(index, |core| core.ext_adv_stop(handle))?
+}
+
+/// Current phase of advertising set `handle` on controller `index`,
+/// if its core is not currently owned by a pump step.
+pub fn ext_adv_phase(index: usize, handle: u8) -> Option<gap::AdvertisingSetPhase> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()?
+        .ext_adv_sets
+        .iter()
+        .find(|s| s.handle == handle)
+        .map(|s| s.phase)
+}
+
+/// Tx power the controller selected for advertising set `handle` on
+/// controller `index` (§7.8.53 return params), once parameters
+/// complete; `None` before that.
+pub fn ext_adv_selected_tx_power(index: usize, handle: u8) -> Option<i8> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()?
+        .ext_adv_sets
+        .iter()
+        .find(|s| s.handle == handle)?
+        .selected_tx_power
 }
 
 // ── Classic BR/EDR central initiator API (issue #1315) ─────────────
@@ -7252,6 +7815,42 @@ mod tests {
         }
     }
 
+    /// One LE Extended Advertising Report subevent (§7.7.65.13) with a
+    /// single report: subevent, Num_Reports=1, then the 24-byte fixed
+    /// header + data. Bytes pinned against the spec layout, not
+    /// against `parse_le_extended_advertising_reports`.
+    #[allow(clippy::too_many_arguments)]
+    fn le_ext_advertising_report(
+        event_type: u16,
+        address_type: u8,
+        address: [u8; 6],
+        primary_phy: u8,
+        secondary_phy: u8,
+        sid: u8,
+        tx_power: i8,
+        rssi: i8,
+        data: &[u8],
+    ) -> Event {
+        let mut params = alloc::vec![0x0D, 0x01];
+        params.extend_from_slice(&event_type.to_le_bytes());
+        params.push(address_type);
+        params.extend_from_slice(&address);
+        params.push(primary_phy);
+        params.push(secondary_phy);
+        params.push(sid);
+        params.push(tx_power as u8);
+        params.push(rssi as u8);
+        params.extend_from_slice(&0x0000u16.to_le_bytes()); // periodic interval: none
+        params.push(0xFF); // direct address type: none
+        params.extend_from_slice(&[0x00; 6]); // direct address
+        params.push(data.len() as u8);
+        params.extend_from_slice(data);
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
     /// LE Connection Complete as seen by the Central role (§7.7.65.1):
     /// same layout as the peripheral helper, but role byte 0x00.
     fn le_connection_complete_central(handle: u16, peer: [u8; 6]) -> Event {
@@ -8174,6 +8773,503 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_central_wrong_phase);
+
+    /// #823: the full extended-scan sequence against a scripted
+    /// controller — parameters → enable → fragmented extended
+    /// reports (reassembled) → second peer → scan timeout → stop —
+    /// with the outbound command bytes pinned against the Core
+    /// Specification field order, not against the encoders under test.
+    fn smoke_pump_ext_central_scan_reports() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        // 1. Start extended scan: LE Set Extended Scan Parameters,
+        // pinned byte-for-byte against Vol 4 Part E §7.8.64 (1M
+        // only, passive, 30 ms / 30 ms, public, accept-all).
+        if ext_central_start_scan(0, crate::gap::ExtendedScanParameters::default()).is_err() {
+            reset_all();
+            return TestResult::Fail("ext_central_start_scan rejected from Idle");
+        }
+        let sent = fake.sent_command_params();
+        let expect_params: [u8; 8] = [0x00, 0x00, 0x01, 0x00, 0x30, 0x00, 0x30, 0x00];
+        if sent.len() != 6
+            || sent[5].0 != op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS
+            || sent[5].1 != expect_params
+        {
+            reset_all();
+            return TestResult::Fail("Set Extended Scan Parameters bytes mismatch");
+        }
+        if ext_central_phase(0) != Some(crate::gap::ExtendedScannerPhase::ParametersSent) {
+            reset_all();
+            return TestResult::Fail("phase not ParametersSent after ext start_scan");
+        }
+        // 2. Parameters complete -> Enable(1) issued by the pump.
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS, &[0]));
+        let _ = pump_once(0);
+        let sent = fake.sent_command_params();
+        if sent.len() != 7
+            || sent[6].0 != op::HCI_LE_SET_EXTENDED_SCAN_ENABLE
+            || sent[6].1 != [0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+        {
+            reset_all();
+            return TestResult::Fail(
+                "Set Extended Scan Enable(1) not issued on parameters complete",
+            );
+        }
+        if ext_central_phase(0) != Some(crate::gap::ExtendedScannerPhase::Scanning) {
+            reset_all();
+            return TestResult::Fail("phase not Scanning after ext enable");
+        }
+        // Enable complete itself changes nothing.
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_SCAN_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if ext_central_phase(0) != Some(crate::gap::ExtendedScannerPhase::Scanning) {
+            reset_all();
+            return TestResult::Fail("ext enable complete moved phase out of Scanning");
+        }
+        // 3. Fragmented extended report: first fragment (more to
+        // come) pends, second (complete) publishes reassembled data.
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        fake.enqueue_event(le_ext_advertising_report(
+            0x0021,
+            0x00,
+            peer,
+            0x01,
+            0x02,
+            0x03,
+            -10,
+            -60,
+            &[0x02, 0x01, 0x06],
+        ));
+        let _ = pump_once(0);
+        let peers = ext_central_peers(0).unwrap_or_default();
+        if peers.len() != 1 || !peers[0].ad_data.is_empty() || !peers[0].reassembling {
+            reset_all();
+            return TestResult::Fail("first fragment should pend, not publish");
+        }
+        fake.enqueue_event(le_ext_advertising_report(
+            0x0001,
+            0x00,
+            peer,
+            0x01,
+            0x02,
+            0x03,
+            -10,
+            -55,
+            &[0x05, 0x09, b'N', b'A', b'R', b'F'],
+        ));
+        let _ = pump_once(0);
+        let peers = ext_central_peers(0).unwrap_or_default();
+        if peers.len() != 1
+            || peers[0].ad_data != [0x02, 0x01, 0x06, 0x05, 0x09, b'N', b'A', b'R', b'F']
+            || peers[0].last_rssi != -55
+            || peers[0].primary_phy != 0x01
+            || peers[0].secondary_phy != 0x02
+            || peers[0].sid != 0x03
+            || peers[0].tx_power != -10
+            || peers[0].reassembling
+        {
+            reset_all();
+            return TestResult::Fail("complete fragment did not publish reassembled peer");
+        }
+        // Second peer (legacy extended report, SID 0xFF): distinct.
+        fake.enqueue_event(le_ext_advertising_report(
+            0x0010,
+            0x01,
+            [0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5],
+            0x01,
+            0x00,
+            0xFF,
+            0x7F,
+            -70,
+            &[0x02, 0x01, 0x06],
+        ));
+        let _ = pump_once(0);
+        if ext_central_peers(0).map(|p| p.len()) != Some(2) {
+            reset_all();
+            return TestResult::Fail("second extended peer not recorded");
+        }
+        // 4. Scan timeout ends the scan on its own.
+        fake.enqueue_event(Event {
+            code: EventCode::LeMeta as u8,
+            params: alloc::vec![0x11],
+        });
+        let _ = pump_once(0);
+        if ext_central_phase(0) != Some(crate::gap::ExtendedScannerPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("scan timeout should return to Idle");
+        }
+        // 5. Restart, then stop: disable issued, completion to Idle.
+        if ext_central_start_scan(0, crate::gap::ExtendedScanParameters::default()).is_err() {
+            reset_all();
+            return TestResult::Fail("ext restart rejected from Idle");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS, &[0]));
+        let _ = pump_once(0);
+        if ext_central_phase(0) != Some(crate::gap::ExtendedScannerPhase::Scanning) {
+            reset_all();
+            return TestResult::Fail("ext restart did not reach Scanning");
+        }
+        if ext_central_stop_scan(0).is_err() {
+            reset_all();
+            return TestResult::Fail("ext_central_stop_scan rejected from Scanning");
+        }
+        let sent = fake.sent_command_params();
+        let last = sent.last().cloned();
+        if last
+            != Some((
+                op::HCI_LE_SET_EXTENDED_SCAN_ENABLE,
+                alloc::vec![0, 0, 0, 0, 0, 0],
+            ))
+        {
+            reset_all();
+            return TestResult::Fail("stop did not issue Set Extended Scan Enable(0)");
+        }
+        if ext_central_phase(0) != Some(crate::gap::ExtendedScannerPhase::ScanStopping) {
+            reset_all();
+            return TestResult::Fail("phase not ScanStopping after ext stop");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_SCAN_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if ext_central_phase(0) != Some(crate::gap::ExtendedScannerPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("disable complete should return to Idle");
+        }
+        // 6. A rejected enable(1) leaves the scanner Idle — scanning
+        // never started — instead of stranding it in Scanning.
+        if ext_central_start_scan(0, crate::gap::ExtendedScanParameters::default()).is_err() {
+            reset_all();
+            return TestResult::Fail("ext restart rejected from Idle");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS, &[0]));
+        let _ = pump_once(0);
+        if ext_central_phase(0) != Some(crate::gap::ExtendedScannerPhase::Scanning) {
+            reset_all();
+            return TestResult::Fail("ext restart did not reach Scanning");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_SCAN_ENABLE, &[0x0C]));
+        let _ = pump_once(0);
+        if ext_central_phase(0) != Some(crate::gap::ExtendedScannerPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("rejected ext enable should return to Idle");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_ext_central_scan_reports);
+
+    /// #823: the full advertising-set chain against a scripted
+    /// controller — parameters → data → scan response → enable →
+    /// terminated → restart (no scan response) → stop — with the
+    /// outbound command bytes pinned against the Core Specification
+    /// field order, not against the encoders under test.
+    fn smoke_pump_ext_adv_start_chain() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let data: [u8; 9] = [0x02, 0x01, 0x06, 0x05, 0x09, b'N', b'A', b'R', b'F'];
+        let scan_rsp: [u8; 3] = [0x02, 0x01, 0x06];
+        // 1. Start set 0: LE Set Extended Advertising Parameters,
+        // pinned byte-for-byte against Vol 4 Part E §7.8.53
+        // (default: legacy connectable, 100 ms, all channels,
+        // controller-chosen Tx power).
+        if ext_adv_start(
+            0,
+            crate::gap::ExtendedAdvertisingParameters::default(),
+            &data,
+            Some(&scan_rsp),
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("ext_adv_start rejected from Idle");
+        }
+        let sent = fake.sent_command_params();
+        let expect_params: [u8; 25] = [
+            0x00, 0x13, 0x00, 0xA0, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x01, 0x00, 0x01, 0x00, 0x00,
+        ];
+        if sent.len() != 6
+            || sent[5].0 != op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS
+            || sent[5].1 != expect_params
+        {
+            reset_all();
+            return TestResult::Fail("Set Extended Advertising Parameters bytes mismatch");
+        }
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::ParametersSent) {
+            reset_all();
+            return TestResult::Fail("phase not ParametersSent after ext_adv_start");
+        }
+        if ext_adv_selected_tx_power(0, 0).is_some() {
+            reset_all();
+            return TestResult::Fail("Tx power must be None before parameters complete");
+        }
+        // 2. Parameters complete (selected Tx power -10) -> data.
+        fake.enqueue_event(cc(
+            op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS,
+            &[0, 0xF6],
+        ));
+        let _ = pump_once(0);
+        let sent = fake.sent_command_params();
+        let expect_data: [u8; 13] = [
+            0x00, 0x03, 0x01, 0x09, 0x02, 0x01, 0x06, 0x05, 0x09, b'N', b'A', b'R', b'F',
+        ];
+        if sent.len() != 7
+            || sent[6].0 != op::HCI_LE_SET_EXTENDED_ADVERTISING_DATA
+            || sent[6].1 != expect_data
+        {
+            reset_all();
+            return TestResult::Fail(
+                "Set Extended Advertising Data not issued on parameters complete",
+            );
+        }
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::Configuring)
+            || ext_adv_selected_tx_power(0, 0) != Some(-10)
+        {
+            reset_all();
+            return TestResult::Fail("phase not Configuring / Tx power not recorded");
+        }
+        // 3. Data complete -> scan response data.
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_ADVERTISING_DATA, &[0]));
+        let _ = pump_once(0);
+        let sent = fake.sent_command_params();
+        if sent.len() != 8
+            || sent[7].0 != op::HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA
+            || sent[7].1 != [0x00, 0x03, 0x01, 0x03, 0x02, 0x01, 0x06]
+        {
+            reset_all();
+            return TestResult::Fail("Set Extended Scan Response Data not issued on data complete");
+        }
+        // 4. Scan response complete -> enable.
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA, &[0]));
+        let _ = pump_once(0);
+        let sent = fake.sent_command_params();
+        if sent.len() != 9
+            || sent[8].0 != op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE
+            || sent[8].1 != [0x01, 0x01, 0x00, 0x00, 0x00, 0x00]
+        {
+            reset_all();
+            return TestResult::Fail(
+                "Set Extended Advertising Enable not issued on scan-response complete",
+            );
+        }
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::Enabling) {
+            reset_all();
+            return TestResult::Fail("phase not Enabling after enable issued");
+        }
+        // 5. Enable complete -> Advertising. A scan request received
+        // while advertising leaves the phase alone.
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::Advertising) {
+            reset_all();
+            return TestResult::Fail("enable complete should reach Advertising");
+        }
+        fake.enqueue_event(Event {
+            code: EventCode::LeMeta as u8,
+            params: alloc::vec![0x13, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+        });
+        let _ = pump_once(0);
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::Advertising) {
+            reset_all();
+            return TestResult::Fail("scan request must not move the advertising phase");
+        }
+        // 6. Set terminated (duration/max-events reached) -> Idle.
+        fake.enqueue_event(Event {
+            code: EventCode::LeMeta as u8,
+            params: alloc::vec![0x12, 0x00, 0x00, 0x00, 0x00, 0x03],
+        });
+        let _ = pump_once(0);
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("set terminated should return to Idle");
+        }
+        // 7. Restart without scan response: data complete goes
+        // straight to enable.
+        if ext_adv_start(
+            0,
+            crate::gap::ExtendedAdvertisingParameters::default(),
+            &data,
+            None,
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("ext_adv_start restart rejected from Idle");
+        }
+        fake.enqueue_event(cc(
+            op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS,
+            &[0, 0x00],
+        ));
+        let _ = pump_once(0);
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_ADVERTISING_DATA, &[0]));
+        let _ = pump_once(0);
+        let sent = fake.sent_command_params();
+        let last = sent.last().cloned();
+        if last
+            != Some((
+                op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE,
+                alloc::vec![0x01, 0x01, 0x00, 0x00, 0x00, 0x00],
+            ))
+        {
+            reset_all();
+            return TestResult::Fail("restart without scan response should enable after data");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::Advertising) {
+            reset_all();
+            return TestResult::Fail("restart enable complete should reach Advertising");
+        }
+        // 8. Stop: disable issued, completion to Idle.
+        if ext_adv_stop(0, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("ext_adv_stop rejected from Advertising");
+        }
+        let sent = fake.sent_command_params();
+        let last = sent.last().cloned();
+        if last
+            != Some((
+                op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE,
+                alloc::vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+            ))
+        {
+            reset_all();
+            return TestResult::Fail("stop did not issue disable-one for the set");
+        }
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::Disabling) {
+            reset_all();
+            return TestResult::Fail("phase not Disabling after ext_adv_stop");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("disable complete should return to Idle");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_ext_adv_start_chain);
+
+    /// #823: extended failure + wrong-phase handling — oversize data
+    /// is refused before any command, a second start mid-chain is
+    /// refused, and a failed parameters completion drops the set so
+    /// a later start can retry.
+    fn smoke_pump_ext_adv_failure_and_wrong_phase() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        if ext_central_stop_scan(0) != Err(CentralError::WrongPhase) {
+            reset_all();
+            return TestResult::Fail("ext stop from Idle must be WrongPhase");
+        }
+        if ext_adv_stop(0, 0) != Err(CentralError::WrongPhase) {
+            reset_all();
+            return TestResult::Fail("ext_adv_stop with no set must be WrongPhase");
+        }
+        // 252-byte payload exceeds the 251-byte extended maximum.
+        let big = [0u8; 252];
+        if ext_adv_start(
+            0,
+            crate::gap::ExtendedAdvertisingParameters::default(),
+            &big,
+            None,
+        ) != Err(CentralError::BadData)
+        {
+            reset_all();
+            return TestResult::Fail("oversize advertising data must be BadData");
+        }
+        if fake.sent_command_params().len() != 5 {
+            reset_all();
+            return TestResult::Fail("BadData start must not issue a command");
+        }
+        // Start set 0; a second start (any handle) mid-chain is
+        // refused, as is a stop while still configuring.
+        let data: [u8; 3] = [0x02, 0x01, 0x06];
+        if ext_adv_start(
+            0,
+            crate::gap::ExtendedAdvertisingParameters::default(),
+            &data,
+            None,
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("ext_adv_start rejected from Idle");
+        }
+        let mut params1 = crate::gap::ExtendedAdvertisingParameters::default();
+        params1.handle = 0x01;
+        if ext_adv_start(0, params1, &data, None) != Err(CentralError::WrongPhase) {
+            reset_all();
+            return TestResult::Fail("second start mid-chain must be WrongPhase");
+        }
+        if ext_adv_stop(0, 0) != Err(CentralError::WrongPhase) {
+            reset_all();
+            return TestResult::Fail("stop while configuring must be WrongPhase");
+        }
+        // Failed parameters completion drops the set to Idle and
+        // clears the chain, so a retry works.
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS, &[0x05]));
+        let _ = pump_once(0);
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("failed parameters should return to Idle");
+        }
+        if ext_adv_start(
+            0,
+            crate::gap::ExtendedAdvertisingParameters::default(),
+            &data,
+            None,
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("retry after failed parameters rejected");
+        }
+        // Extended scan failure: refused parameters drop to Idle.
+        fake.enqueue_event(cc(
+            op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS,
+            &[0, 0x00],
+        ));
+        let _ = pump_once(0);
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_ADVERTISING_DATA, &[0]));
+        let _ = pump_once(0);
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if ext_adv_phase(0, 0) != Some(crate::gap::AdvertisingSetPhase::Advertising) {
+            reset_all();
+            return TestResult::Fail("retry chain should reach Advertising");
+        }
+        if ext_central_start_scan(0, crate::gap::ExtendedScanParameters::default()).is_err() {
+            reset_all();
+            return TestResult::Fail("ext scan start rejected from Idle");
+        }
+        if ext_central_start_scan(0, crate::gap::ExtendedScanParameters::default())
+            != Err(CentralError::WrongPhase)
+        {
+            reset_all();
+            return TestResult::Fail("second ext scan start must be WrongPhase");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS, &[0x0C]));
+        let _ = pump_once(0);
+        if ext_central_phase(0) != Some(crate::gap::ExtendedScannerPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("failed ext scan parameters should return to Idle");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_ext_adv_failure_and_wrong_phase);
 
     /// #1315: the full Classic sequence against a scripted
     /// controller — inquiry → result → complete → scan-enable →

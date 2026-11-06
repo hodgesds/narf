@@ -553,6 +553,10 @@ fn start_discovery(index: u16, params: &[u8]) -> Vec<u8> {
         Err(crate::pump::CentralError::BadParams) => {
             cmd_status(index, OP_START_DISCOVERY, STATUS_INVALID_PARAMS)
         }
+        // BadData is only produced by `ext_adv_start` — unreachable here.
+        Err(crate::pump::CentralError::BadData) => {
+            cmd_status(index, OP_START_DISCOVERY, STATUS_INVALID_PARAMS)
+        }
     }
 }
 
@@ -601,6 +605,10 @@ fn stop_discovery(index: u16, params: &[u8]) -> Vec<u8> {
                 }
                 // BadParams is only produced by `central_connect_ext` — unreachable here.
                 Err(crate::pump::CentralError::BadParams) => {
+                    cmd_status(index, OP_STOP_DISCOVERY, STATUS_INVALID_PARAMS)
+                }
+                // BadData is only produced by `ext_adv_start` — unreachable here.
+                Err(crate::pump::CentralError::BadData) => {
                     cmd_status(index, OP_STOP_DISCOVERY, STATUS_INVALID_PARAMS)
                 }
                 Err(crate::pump::CentralError::WrongPhase) => {
