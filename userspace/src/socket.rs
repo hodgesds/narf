@@ -5685,7 +5685,7 @@ impl SocketFile {
             SocketOp::Connect { addr }
                 if self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM =>
             {
-                self.bt_connect(addr)
+                self.bt_connect(&addr)
             }
             SocketOp::Send { buf, addr, .. }
                 if self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM =>
