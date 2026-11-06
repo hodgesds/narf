@@ -410,6 +410,8 @@ mod tests {
     extern crate alloc;
 
     use super::*;
+    use alloc::borrow::ToOwned;
+    use alloc::boxed::Box;
     use alloc::vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_lib::sync::IrqSafeSpinLock;
