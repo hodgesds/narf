@@ -255,7 +255,7 @@ pub fn resume_locked(ctrl: &Sdhci) -> Result<(), DeviceSuspendError> {
                 // freshly identified card needs publishing, exactly
                 // as at probe — otherwise the driver would hold a
                 // card no block device reaches.
-                publish_card(fresh.capacity_blocks, fresh.ccs);
+                publish_card(fresh.capacity_blocks);
             }
             *ctrl.card.lock() = Some(fresh);
             // A runtime gate (if any) is subsumed by the resume.
@@ -420,7 +420,7 @@ mod tests {
         // bring-up / resume, with no transfer in flight.
         let card = unsafe { ctrl.identify_sequence() }.map_err(|_| "identify_sequence failed")?;
         *ctrl.card.lock() = Some(card);
-        publish_card(card.capacity_blocks, card.ccs);
+        publish_card(card.capacity_blocks);
         Ok(card)
     }
 

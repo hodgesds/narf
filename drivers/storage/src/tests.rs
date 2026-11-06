@@ -1418,6 +1418,72 @@ fn smoke_emmc_pre_eol_warning_decoded() -> TestResult {
 }
 kernel_test_in!("drivers/storage/emmc", smoke_emmc_pre_eol_warning_decoded);
 
+fn smoke_emmc_gp_partition_size_formula() -> TestResult {
+    use crate::emmc::ExtCsd;
+    // JESD84-B51 §7.4.89: GP size = GP_SIZE_MULT (24-bit LE) ×
+    // HC_WP_GRP_SIZE × HC_ERASE_GRP_SIZE × 512 KiB. The offsets
+    // below are literal Table 93 values: GP_SIZE_MULT_1..4 at
+    // 143/146/149/152, HC_WP_GRP_SIZE at 221, HC_ERASE_GRP_SIZE
+    // at 224.
+    fn put_u24(buf: &mut [u8; 512], off: usize, v: u32) {
+        buf[off] = (v & 0xFF) as u8;
+        buf[off + 1] = ((v >> 8) & 0xFF) as u8;
+        buf[off + 2] = ((v >> 16) & 0xFF) as u8;
+    }
+    let mut buf = [0u8; 512];
+    put_u24(&mut buf, 143, 8);
+    put_u24(&mut buf, 146, 4);
+    put_u24(&mut buf, 149, 0);
+    put_u24(&mut buf, 152, 2);
+    buf[221] = 1;
+    buf[224] = 1;
+    let ext = ExtCsd::parse(&buf).expect("parse");
+    if ext.gp_partition_bytes(0) != 4 * 1024 * 1024
+        || ext.gp_partition_bytes(1) != 2 * 1024 * 1024
+        || ext.gp_partition_bytes(2) != 0
+        || ext.gp_partition_bytes(3) != 1024 * 1024
+    {
+        return TestResult::Fail("GP sizes must follow the §7.4.89 formula");
+    }
+    if ext.gp_partition_blocks(0) != 8192 || ext.gp_partition_blocks(3) != 2048 {
+        return TestResult::Fail("GP block counts must follow the §7.4.89 formula");
+    }
+    // Second case: the group sizes multiply, they do not add —
+    // mult 1 × WP 3 × ERASE 2 × 512 KiB = 3 MiB.
+    let mut buf2 = [0u8; 512];
+    put_u24(&mut buf2, 143, 1);
+    buf2[221] = 3;
+    buf2[224] = 2;
+    let ext2 = ExtCsd::parse(&buf2).expect("parse");
+    if ext2.gp_partition_bytes(0) != 3 * 1024 * 1024 {
+        return TestResult::Fail("GP size must multiply the group sizes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_emmc_gp_partition_size_formula);
+
+fn smoke_emmc_partitioning_support_offsets() -> TestResult {
+    use crate::emmc::ExtCsd;
+    // JESD84-B51 Table 93: PARTITIONING_SUPPORT is byte 160 and
+    // RST_n_FUNCTION is byte 162 (an earlier draft of this driver
+    // had them at 162/168). Literal offsets, not decoder constants.
+    let mut buf = [0u8; 512];
+    buf[160] = 0xA5;
+    buf[162] = 0x5A;
+    let ext = ExtCsd::parse(&buf).expect("parse");
+    if ext.partitioning_support != 0xA5 {
+        return TestResult::Fail("PARTITIONING_SUPPORT must decode from byte 160");
+    }
+    if ext.rst_n_function != 0x5A {
+        return TestResult::Fail("RST_n_FUNCTION must decode from byte 162");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/emmc",
+    smoke_emmc_partitioning_support_offsets
+);
+
 // ── UFS / UFSHCI 3.0 ──────────────────────────────────────────────
 
 fn smoke_ufs_utrd_round_trip() -> TestResult {

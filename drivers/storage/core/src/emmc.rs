@@ -3,22 +3,25 @@
 //! References (public-only):
 //! - JEDEC Standard JESD84-B51 — "Embedded Multi-Media Card (e•MMC)
 //!   Electrical Standard (5.1)". Public document. §7.4 (EXT_CSD
-//!   register: 512 bytes, indexed by byte offset).
+//!   register: 512 bytes, indexed by byte offset; Table 93).
 //!   <https://www.jedec.org/standards-documents/docs/jesd84-b51>
-//! - JESD84-B51 §7.3 — `BUS_WIDTH` setting via CMD6 (SWITCH).
-//! - JESD84-B51 §6.6.5 — High-Speed timings (HS200, HS400) and the
-//!   `HS_TIMING` byte's encoding.
+//! - JESD84-B51 §6.6.1 — SWITCH (CMD6) argument layout and the
+//!   R1b + CMD13 completion rule; §6.6.2 — HS200/HS400 selection
+//!   and the SWITCH_ERROR bit; §6.4.2 — CMD1 OCR / access-mode
+//!   validation; §7.4.89 — GP partition size formula.
 //!
 //! No GPL Linux source consulted.
 //!
-//! ## EXT_CSD layout (excerpt; offsets in decimal per §7.4 Table 39)
+//! ## EXT_CSD layout (excerpt; offsets in decimal per §7.4 Table 93)
 //!
 //! ```text
-//!   162  PARTITIONING_SUPPORT
-//!   168  RST_n_FUNCTION
+//!   143..146  GP_SIZE_MULT_1 (24-bit LE; GP2 at 146, GP3 at 149, GP4 at 152)
+//!   160  PARTITIONING_SUPPORT
+//!   162  RST_n_FUNCTION
+//!   168  RPMB_SIZE_MULT
 //!   175  ERASE_GROUP_DEF
-//!   177  PARTITION_CONFIG
-//!   179  BOOT_BUS_WIDTH
+//!   177  BOOT_BUS_CONDITIONS
+//!   179  PARTITION_CONFIG
 //!   183  BUS_WIDTH
 //!   185  HS_TIMING
 //!   187  POWER_CLASS
@@ -26,10 +29,9 @@
 //!   194  CSD_STRUCTURE
 //!   196  CARD_TYPE
 //!   212..216  SEC_COUNT (32-bit LE — capacity in 512-byte sectors)
-//!   217  MIN_PERF_W_8_52
-//!   220  PWR_CL_52_360
-//!   222  PWR_CL_26_195
-//!   226  HC_ERASE_GRP_SIZE
+//!   221  HC_WP_GRP_SIZE
+//!   224  HC_ERASE_GRP_SIZE
+//!   226  BOOT_SIZE_MULT
 //!   267  PRE_EOL_INFO
 //!   268  DEVICE_LIFE_TIME_EST_TYP_A
 //!   269  DEVICE_LIFE_TIME_EST_TYP_B
@@ -43,12 +45,16 @@ use core::convert::TryInto;
 /// Size of the EXT_CSD register, in bytes.
 pub const EXT_CSD_SIZE: usize = 512;
 
-// Byte offsets (§7.4 Table 39).
-pub const EXT_CSD_PARTITIONING_SUPPORT: usize = 162;
-pub const EXT_CSD_RST_N_FUNCTION: usize = 168;
+// Byte offsets (§7.4 Table 93).
+pub const EXT_CSD_GP_SIZE_MULT_1: usize = 143;
+pub const EXT_CSD_GP_SIZE_MULT_2: usize = 146;
+pub const EXT_CSD_GP_SIZE_MULT_3: usize = 149;
+pub const EXT_CSD_GP_SIZE_MULT_4: usize = 152;
+pub const EXT_CSD_PARTITIONING_SUPPORT: usize = 160;
+pub const EXT_CSD_RST_N_FUNCTION: usize = 162;
 pub const EXT_CSD_ERASE_GROUP_DEF: usize = 175;
 pub const EXT_CSD_PARTITION_CONFIG: usize = 179;
-pub const EXT_CSD_BOOT_BUS_WIDTH: usize = 177;
+pub const EXT_CSD_BOOT_BUS_CONDITIONS: usize = 177;
 pub const EXT_CSD_BUS_WIDTH: usize = 183;
 pub const EXT_CSD_HS_TIMING: usize = 185;
 pub const EXT_CSD_POWER_CLASS: usize = 187;
@@ -56,6 +62,7 @@ pub const EXT_CSD_REV: usize = 192;
 pub const EXT_CSD_CSD_STRUCTURE: usize = 194;
 pub const EXT_CSD_CARD_TYPE: usize = 196;
 pub const EXT_CSD_SEC_COUNT: usize = 212;
+pub const EXT_CSD_HC_WP_GRP_SIZE: usize = 221;
 pub const EXT_CSD_HC_ERASE_GRP_SIZE: usize = 224;
 pub const EXT_CSD_BOOT_SIZE_MULT: usize = 226;
 pub const EXT_CSD_PRE_EOL_INFO: usize = 267;
@@ -97,6 +104,34 @@ pub const PARTITION_CONFIG_BOOT_PARTITION_ENABLE_MASK: u8 = 0b0011_1000;
 pub const PARTITION_CONFIG_BOOT_PARTITION_ENABLE_SHIFT: u8 = 3;
 pub const PARTITION_CONFIG_PARTITION_ACCESS_MASK: u8 = 0b0000_0111;
 
+/// PARTITION_CONFIG [179] access values (§7.4.69).
+pub const PARTITION_ACCESS_USER: u8 = 0;
+pub const PARTITION_ACCESS_BOOT1: u8 = 1;
+pub const PARTITION_ACCESS_BOOT2: u8 = 2;
+pub const PARTITION_ACCESS_RPMB: u8 = 3;
+pub const PARTITION_ACCESS_GP1: u8 = 4;
+pub const PARTITION_ACCESS_GP2: u8 = 5;
+pub const PARTITION_ACCESS_GP3: u8 = 6;
+pub const PARTITION_ACCESS_GP4: u8 = 7;
+
+// CMD1 (SEND_OP_COND) OCR argument / response (§6.4.2): the device
+// answers 0x00FF8080 (≤2 GiB) or 0x40FF8080 (>2 GiB) while busy,
+// and 0x80FF8080 / 0xC0FF8080 once ready. The host must set the
+// sector-mode bit or a >2 GiB device goes Inactive; the
+// access-mode bits are only valid in the final (ready) response.
+pub const MMC_OCR_BUSY: u32 = 1 << 31;
+pub const MMC_OCR_SECTOR_MODE: u32 = 1 << 30;
+/// Host voltage window for CMD1: 2.7–3.6 V (OCR bits [23:15]).
+pub const MMC_OCR_VOLTAGE_2V7_3V6: u32 = 0x00FF_8000;
+/// CMD1 argument: sector-mode request + 2.7–3.6 V window.
+pub const MMC_CMD1_ARG: u32 = MMC_OCR_SECTOR_MODE | MMC_OCR_VOLTAGE_2V7_3V6;
+
+// Device status (R1) bits used to verify a SWITCH (§6.13 Table
+// 68): bit 7 SWITCH_ERROR, bits [12:9] CURRENT_STATE (4 = Tran),
+// bit 8 READY_FOR_DATA.
+pub const CARD_STATUS_SWITCH_ERROR: u32 = 1 << 7;
+pub const CARD_STATE_TRAN: u8 = 4;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EmmcError {
     /// Buffer must be exactly 512 bytes.
@@ -113,9 +148,15 @@ pub struct ExtCsd {
     pub hs_timing: u8,
     pub power_class: u8,
     pub partition_config: u8,
+    pub partitioning_support: u8,
+    pub rst_n_function: u8,
+    pub erase_group_def: u8,
     pub boot_size_mult: u8,
     pub rpmb_size_mult: u8,
     pub hc_erase_grp_size: u8,
+    pub hc_wp_grp_size: u8,
+    /// GP_SIZE_MULT_1..4 as 24-bit values (§7.4.89).
+    pub gp_size_mult: [u32; 4],
     /// Capacity in 512-byte sectors. 0 ⇒ legacy CSD-derived capacity.
     pub sec_count: u32,
     pub pre_eol_info: u8,
@@ -134,6 +175,10 @@ impl ExtCsd {
                 .try_into()
                 .expect("len 4"),
         );
+        // GP_SIZE_MULT_x is a 24-bit little-endian value (§7.4.89).
+        let gp_at = |base: usize| -> u32 {
+            (buf[base] as u32) | ((buf[base + 1] as u32) << 8) | ((buf[base + 2] as u32) << 16)
+        };
         Ok(Self {
             revision: buf[EXT_CSD_REV],
             csd_structure: buf[EXT_CSD_CSD_STRUCTURE],
@@ -142,13 +187,21 @@ impl ExtCsd {
             hs_timing: buf[EXT_CSD_HS_TIMING],
             power_class: buf[EXT_CSD_POWER_CLASS],
             partition_config: buf[EXT_CSD_PARTITION_CONFIG],
+            partitioning_support: buf[EXT_CSD_PARTITIONING_SUPPORT],
+            rst_n_function: buf[EXT_CSD_RST_N_FUNCTION],
+            erase_group_def: buf[EXT_CSD_ERASE_GROUP_DEF],
             boot_size_mult: buf[EXT_CSD_BOOT_SIZE_MULT],
-            // RPMB_SIZE_MULT lives at offset 168 (same as RST_n_FUNCTION
-            // is offset 168 in earlier revisions; the spec moved it to
-            // 168 as RPMB_SIZE_MULT in 5.0). For B51 the canonical
-            // location is byte 168 — surfaced here as `rpmb_size_mult`.
+            // RPMB_SIZE_MULT is byte 168; RST_n_FUNCTION is byte 162
+            // (§7.4 Table 93) — the two are distinct fields.
             rpmb_size_mult: buf[EXT_CSD_RPMB_SIZE_MULT],
             hc_erase_grp_size: buf[EXT_CSD_HC_ERASE_GRP_SIZE],
+            hc_wp_grp_size: buf[EXT_CSD_HC_WP_GRP_SIZE],
+            gp_size_mult: [
+                gp_at(EXT_CSD_GP_SIZE_MULT_1),
+                gp_at(EXT_CSD_GP_SIZE_MULT_2),
+                gp_at(EXT_CSD_GP_SIZE_MULT_3),
+                gp_at(EXT_CSD_GP_SIZE_MULT_4),
+            ],
             sec_count,
             pre_eol_info: buf[EXT_CSD_PRE_EOL_INFO],
             life_time_est_a: buf[EXT_CSD_DEVICE_LIFE_TIME_EST_TYP_A],
@@ -170,6 +223,23 @@ impl ExtCsd {
     /// RPMB partition size per JESD84-B51 §7.4.84: RPMB_SIZE_MULT × 128 KiB.
     pub fn rpmb_partition_bytes(self) -> u64 {
         (self.rpmb_size_mult as u64) * 128 * 1024
+    }
+
+    /// General-purpose partition size per JESD84-B51 §7.4.89:
+    /// `GP_SIZE_MULT × HC_WP_GRP_SIZE × HC_ERASE_GRP_SIZE × 512 KiB`.
+    /// The formula is stated in terms of the high-capacity erase /
+    /// write-protect group sizes, i.e. it applies when
+    /// ERASE_GROUP_DEF is set; callers must not apply it under the
+    /// legacy CSD group definition. `index` is 0..4 (GP1..GP4);
+    /// out of range is 0.
+    pub fn gp_partition_bytes(self, index: usize) -> u64 {
+        let mult = self.gp_size_mult.get(index).copied().unwrap_or(0) as u64;
+        mult * (self.hc_wp_grp_size as u64) * (self.hc_erase_grp_size as u64) * 512 * 1024
+    }
+
+    /// GP partition size in 512-byte sectors.
+    pub fn gp_partition_blocks(self, index: usize) -> u64 {
+        self.gp_partition_bytes(index) / 512
     }
 
     pub fn supports_hs200(self) -> bool {
