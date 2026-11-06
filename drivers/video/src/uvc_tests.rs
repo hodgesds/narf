@@ -16,6 +16,14 @@
 //! 9.  Frame reassembly: 3 payloads same FID → one frame, EOF closes it
 //!     9b. Frame-based (1.5) header decode + H.264 reassembly (mirrored
 //!     in the drivers/usb tests, including GET_CUR version validation)
+//!     9c. Stream-based (#1334) length completion, no EOF (buffer
+//!     fullness at the negotiated dwMaxVideoFrameSize)
+//!     9d. Stream-based (#1334) accumulation cap (clamp + drop count)
+//!     9e. Stream-based (#1334) bmFramingInfo gating (D0/D1)
+//!     9f. Frame-based bound (#1334): EOF machine unchanged, length
+//!     completion as safety net; legacy `new()` unbounded
+//!     9g. Stream-based format descriptor parse + walker
+//!     9h. StreamHandle with a stream-based config completes on length
 //! 10. Brightness control GET_MIN/MAX/RES round-trip
 //! 11. Format negotiation: 1280×720 MJPEG @ 30 fps → nearest supported
 //! 12. Probe UVC: config blob with VC + VS interfaces
@@ -501,6 +509,332 @@ fn smoke_uvc_frame_based_h264_reassembly() -> TestResult {
     }
     TestResult::Pass
 }
+// ── Smoke 9c: Stream-based (#1334) length completion, no EOF ────────
+// UVC 1.5 §2.4.3.7: stream-based boundaries are in-band, FID/EOF
+// optional; with bmFramingInfo = 0 neither bit is meaningful, so the
+// frame must complete on buffer fullness alone at the negotiated
+// dwMaxVideoFrameSize — never at EOF, never unbounded.
+
+fn smoke_uvc_stream_based_completes_on_length_no_eof() -> TestResult {
+    use crate::uvc::payload::{FrameReassembler, PushResult, ReassemblyConfig, BFH_EOH, BFH_FID};
+
+    let mut r = FrameReassembler::with_config(ReassemblyConfig::stream_based(16, 0));
+
+    // Four 4-byte payloads, constant FID=0, no EOF anywhere.
+    let p1 = [2u8, BFH_EOH, 0xA0, 0xA1, 0xA2, 0xA3];
+    if r.push(&p1) != PushResult::Appended {
+        return TestResult::Fail("first stream packet must Append");
+    }
+    if r.buffer.len() != 4 {
+        return TestResult::Fail("buffer must hold 4 bytes after first packet");
+    }
+    let p2 = [2u8, BFH_EOH, 0xA4, 0xA5, 0xA6, 0xA7];
+    if r.push(&p2) != PushResult::Appended {
+        return TestResult::Fail("second stream packet must Append");
+    }
+    // Masking-defeating: 8 of 16 bytes is NOT a frame — no early
+    // completion, and a FID flip mid-segment must NOT reset the
+    // accumulation when bmFramingInfo D0 is clear (FID ignored).
+    if r.frames_completed != 0 {
+        return TestResult::Fail("no frame may complete before the bound");
+    }
+    let p3 = [2u8, BFH_EOH | BFH_FID, 0xA8, 0xA9, 0xAA, 0xAB];
+    if r.push(&p3) != PushResult::Appended {
+        return TestResult::Fail("FID flip must be ignored (D0 clear), not reset");
+    }
+    if r.buffer.len() != 12 || r.buffer[0] != 0xA0 {
+        return TestResult::Fail("FID flip must not drop accumulated bytes");
+    }
+    let p4 = [2u8, BFH_EOH, 0xAC, 0xAD, 0xAE, 0xAF];
+    if r.push(&p4) != PushResult::FrameComplete {
+        return TestResult::Fail("16th byte must complete the frame on length");
+    }
+    let frame = r.take_frame();
+    if frame
+        != [
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ]
+    {
+        return TestResult::Fail("length-completed frame bytes wrong");
+    }
+    if r.frames_completed != 1 {
+        return TestResult::Fail("frames_completed should be 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/video/uvc",
+    smoke_uvc_stream_based_completes_on_length_no_eof
+);
+
+// ── Smoke 9d: Stream-based (#1334) accumulation cap ─────────────────
+// A push past the negotiated max is clamped to the bound, the frame
+// completes at the bound, and the excess bytes are dropped + counted.
+
+fn smoke_uvc_stream_based_buffer_cap() -> TestResult {
+    use crate::uvc::payload::{FrameReassembler, PushResult, ReassemblyConfig, BFH_EOH};
+
+    let mut r = FrameReassembler::with_config(ReassemblyConfig::stream_based(8, 0));
+
+    let p1 = [2u8, BFH_EOH, 1, 2, 3, 4, 5, 6];
+    if r.push(&p1) != PushResult::Appended {
+        return TestResult::Fail("first packet must Append");
+    }
+    if r.buffer.len() != 6 || r.bytes_dropped_overflow != 0 {
+        return TestResult::Fail("no bytes may drop below the bound");
+    }
+    // 6 more bytes would take the buffer to 12; only 2 fit.
+    let p2 = [2u8, BFH_EOH, 7, 8, 9, 10, 11, 12];
+    if r.push(&p2) != PushResult::FrameComplete {
+        return TestResult::Fail("push past the bound must complete the frame");
+    }
+    if r.buffer.len() != 8 {
+        return TestResult::Fail("buffer must never exceed the bound");
+    }
+    if r.take_frame() != [1, 2, 3, 4, 5, 6, 7, 8] {
+        return TestResult::Fail("capped frame must hold exactly the bound bytes");
+    }
+    if r.bytes_dropped_overflow != 4 {
+        return TestResult::Fail("4 excess bytes must be counted as dropped");
+    }
+    // The next packet starts a fresh frame.
+    let p3 = [2u8, BFH_EOH, 0xAA, 0xBB];
+    if r.push(&p3) != PushResult::Appended {
+        return TestResult::Fail("packet after a capped frame must Append");
+    }
+    if r.buffer != [0xAA, 0xBB] {
+        return TestResult::Fail("new frame must start clean after the cap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video/uvc", smoke_uvc_stream_based_buffer_cap);
+
+// ── Smoke 9e: Stream-based (#1334) bmFramingInfo gating ─────────────
+// With D0|D1 set, FID flips and EOF are the low-latency path and
+// length completion is only the fallback; with D1 alone, EOF is
+// honoured but FID ignored; with D0 alone, EOF is ignored.
+
+fn smoke_uvc_stream_based_framing_bits() -> TestResult {
+    use crate::uvc::payload::{
+        FrameReassembler, PushResult, ReassemblyConfig, BFH_EOF, BFH_EOH, BFH_FID, FRAMING_EOF,
+        FRAMING_FID,
+    };
+
+    // D0|D1: FID flip drops the partial, EOF completes early.
+    let mut r = FrameReassembler::with_config(ReassemblyConfig::stream_based(
+        64,
+        FRAMING_FID | FRAMING_EOF,
+    ));
+    if r.push(&[2u8, BFH_EOH, 0x11, 0x22]) != PushResult::Appended {
+        return TestResult::Fail("D0|D1: first packet must Append");
+    }
+    if r.push(&[2u8, BFH_EOH | BFH_FID, 0x33]) != PushResult::FidReset {
+        return TestResult::Fail("D0|D1: FID flip must FidReset");
+    }
+    if r.buffer != [0x33] {
+        return TestResult::Fail("D0|D1: flip must drop the partial frame");
+    }
+    if r.push(&[2u8, BFH_EOH | BFH_FID | BFH_EOF, 0x44]) != PushResult::FrameComplete {
+        return TestResult::Fail("D0|D1: EOF must complete before the bound");
+    }
+    if r.take_frame() != [0x33, 0x44] {
+        return TestResult::Fail("D0|D1: EOF-completed frame bytes wrong");
+    }
+
+    // D1 alone (D0 clear): FID ignored, EOF honoured.
+    let mut r = FrameReassembler::with_config(ReassemblyConfig::stream_based(64, FRAMING_EOF));
+    if r.push(&[2u8, BFH_EOH, 0x11]) != PushResult::Appended {
+        return TestResult::Fail("D1-only: first packet must Append");
+    }
+    if r.push(&[2u8, BFH_EOH | BFH_FID, 0x22]) != PushResult::Appended {
+        return TestResult::Fail("D1-only: FID flip must be ignored, not reset");
+    }
+    if r.push(&[2u8, BFH_EOH | BFH_FID | BFH_EOF, 0x33]) != PushResult::FrameComplete {
+        return TestResult::Fail("D1-only: EOF must complete");
+    }
+    if r.take_frame() != [0x11, 0x22, 0x33] {
+        return TestResult::Fail("D1-only: frame must hold all three payloads");
+    }
+
+    // D0 alone: EOF ignored, FID flip resets, length is the fallback.
+    let mut r = FrameReassembler::with_config(ReassemblyConfig::stream_based(64, FRAMING_FID));
+    if r.push(&[2u8, BFH_EOH, 0x11, 0x22]) != PushResult::Appended {
+        return TestResult::Fail("D0-only: first packet must Append");
+    }
+    if r.push(&[2u8, BFH_EOH | BFH_EOF, 0x33, 0x44]) != PushResult::Appended {
+        return TestResult::Fail("D0-only: EOF must be ignored, not complete");
+    }
+    if r.buffer.len() != 4 {
+        return TestResult::Fail("D0-only: ignored EOF must still accumulate");
+    }
+    // 60-byte flip packet: drops the 4-byte partial, accumulates 60.
+    let mut p3 = alloc::vec![2u8, BFH_EOH | BFH_FID];
+    p3.extend([0x55u8; 60]);
+    if r.push(&p3) != PushResult::FidReset {
+        return TestResult::Fail("D0-only: FID flip must FidReset");
+    }
+    if r.buffer.len() != 60 {
+        return TestResult::Fail("D0-only: flipped frame must hold 60 bytes");
+    }
+    if r.push(&[2u8, BFH_EOH | BFH_FID, 0x66, 0x77, 0x88, 0x99]) != PushResult::FrameComplete {
+        return TestResult::Fail("D0-only: 64th byte must complete on length");
+    }
+    if r.frames_completed != 1 {
+        return TestResult::Fail("D0-only: frames_completed should be 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video/uvc", smoke_uvc_stream_based_framing_bits);
+
+// ── Smoke 9f: Frame-based bound (#1334) is a safety net, not a change ─
+// The legacy FID/EOF machine is unchanged when a bound is configured:
+// EOF still completes early, and length completion only fires when
+// EOF never arrives. `new()` (no bound) never completes on length.
+
+fn smoke_uvc_frame_based_bound_caps_legacy_machine() -> TestResult {
+    use crate::uvc::payload::{FrameReassembler, PushResult, ReassemblyConfig, BFH_EOF, BFH_EOH};
+
+    let mut r = FrameReassembler::with_config(ReassemblyConfig::bounded(8));
+    if r.push(&[2u8, BFH_EOH, 1, 2, 3]) != PushResult::Appended {
+        return TestResult::Fail("bounded: first packet must Append");
+    }
+    if r.push(&[2u8, BFH_EOH | BFH_EOF, 4, 5, 6]) != PushResult::FrameComplete {
+        return TestResult::Fail("bounded: EOF must still complete early");
+    }
+    if r.take_frame() != [1, 2, 3, 4, 5, 6] {
+        return TestResult::Fail("bounded: EOF-completed frame bytes wrong");
+    }
+
+    let mut r = FrameReassembler::with_config(ReassemblyConfig::bounded(8));
+    if r.push(&[2u8, BFH_EOH, 1, 2, 3, 4, 5]) != PushResult::Appended {
+        return TestResult::Fail("bounded: 5 bytes must Append");
+    }
+    if r.push(&[2u8, BFH_EOH, 6, 7, 8, 9, 10]) != PushResult::FrameComplete {
+        return TestResult::Fail("bounded: 8th byte must complete without EOF");
+    }
+    if r.take_frame() != [1, 2, 3, 4, 5, 6, 7, 8] {
+        return TestResult::Fail("bounded: length-completed frame bytes wrong");
+    }
+    if r.bytes_dropped_overflow != 2 {
+        return TestResult::Fail("bounded: 2 excess bytes must be counted");
+    }
+
+    // Legacy `new()`: no bound, no length completion.
+    let mut r = FrameReassembler::new();
+    let mut big = alloc::vec![2u8, BFH_EOH];
+    big.extend([0xAAu8; 20]);
+    if r.push(&big) != PushResult::Appended {
+        return TestResult::Fail("legacy: 20 bytes without EOF must Append");
+    }
+    if r.buffer.len() != 20 {
+        return TestResult::Fail("legacy: unbounded buffer must hold 20 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/video/uvc",
+    smoke_uvc_frame_based_bound_caps_legacy_machine
+);
+
+// ── Smoke 9g: Stream-based format descriptor (#1334) ────────────────
+// VS_FORMAT_STREAM_BASED (0x12, Stream Based Payload §3.1.1 Table 3-1):
+// 24-byte descriptor, guidFormat + dwPacketLength; the walker yields
+// a StreamBased format with no frame modes (frame size is negotiated).
+
+fn smoke_uvc_stream_based_format_descriptor() -> TestResult {
+    use crate::uvc::{parse_streaming_descriptors, FormatStreamBased, PixelFmt};
+
+    let mut blob = alloc::vec![24u8, 0x24, 0x12, 1];
+    blob.extend_from_slice(b"STREAM-BASED-FIX");
+    blob.extend_from_slice(&188u32.to_le_bytes());
+    let f = match FormatStreamBased::parse(&blob) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("stream-based format descriptor must parse"),
+    };
+    if f.format_index != 1 {
+        return TestResult::Fail("format_index must be 1");
+    }
+    if f.guid_format != *b"STREAM-BASED-FIX" {
+        return TestResult::Fail("guid_format must round-trip");
+    }
+    if f.packet_length != 188 {
+        return TestResult::Fail("dwPacketLength must be 188 (packet-oriented)");
+    }
+    // Masking-defeating: short blob and wrong subtype must fail.
+    if FormatStreamBased::parse(&blob[..23]).is_ok() {
+        return TestResult::Fail("23-byte descriptor must not parse");
+    }
+    let mut wrong = blob.clone();
+    wrong[2] = 0x06;
+    if FormatStreamBased::parse(&wrong).is_ok() {
+        return TestResult::Fail("MJPEG subtype must not parse as stream-based");
+    }
+
+    // The walker: VS_INPUT_HEADER + the stream-based format descriptor.
+    let mut vs_blob = alloc::vec![14u8, 0x24, 0x01, 1, 38, 0, 0x81, 0, 1, 0, 0, 0, 1, 0];
+    vs_blob.extend_from_slice(&blob);
+    let formats = match parse_streaming_descriptors(&vs_blob) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("walker must accept a stream-based blob"),
+    };
+    if formats.len() != 1 {
+        return TestResult::Fail("walker must yield exactly one format");
+    }
+    if formats[0].pixel_fmt != PixelFmt::StreamBased {
+        return TestResult::Fail("format must classify as StreamBased");
+    }
+    if formats[0].format_index != 1 || !formats[0].frames.is_empty() {
+        return TestResult::Fail("stream-based format must have no frame modes");
+    }
+    if formats[0].find_frame(640, 480, 30).is_some() {
+        return TestResult::Fail("stream-based format must match no frame mode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/video/uvc",
+    smoke_uvc_stream_based_format_descriptor
+);
+
+// ── Smoke 9h: StreamHandle with a stream-based config (#1334) ───────
+// The video-side pump path completes on length through `ingest_packet`.
+
+fn smoke_uvc_stream_handle_completes_on_length() -> TestResult {
+    use crate::uvc::payload::BFH_EOH;
+    use crate::uvc::{ReassemblyConfig, StreamHandle, TransferMode};
+
+    let mut h = StreamHandle::new_with_config(
+        TransferMode::Bulk,
+        7,
+        3,
+        ReassemblyConfig::stream_based(8, 0),
+    );
+    h.ingest_packet(&[2u8, BFH_EOH, 1, 2, 3, 4]);
+    if h.pending_frames() != 0 {
+        return TestResult::Fail("4 of 8 bytes must not deliver a frame");
+    }
+    h.ingest_packet(&[2u8, BFH_EOH, 5, 6, 7, 8]);
+    if h.pending_frames() != 1 {
+        return TestResult::Fail("8th byte must deliver exactly one frame");
+    }
+    let frame = match h.take_frame() {
+        Some(f) => f,
+        None => return TestResult::Fail("completed frame must be dequeueable"),
+    };
+    if frame.data != [1, 2, 3, 4, 5, 6, 7, 8] || frame.sequence != 1 {
+        return TestResult::Fail("delivered frame bytes / sequence wrong");
+    }
+    if h.stats.frames_delivered != 1 {
+        return TestResult::Fail("frames_delivered should be 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/video/uvc",
+    smoke_uvc_stream_handle_completes_on_length
+);
+
 kernel_test_in!("drivers/video/uvc", smoke_uvc_frame_based_h264_reassembly);
 
 // ── Smoke 10: Brightness control GET_MIN/MAX/RES round-trip ─────────
