@@ -29,13 +29,21 @@
 //! Modelled per spec: CRB locality grant on LOC_CTRL request,
 //! host-programmed buffer registers fetched at GO time, CMD_READY
 //! → GO → self-clearing START discipline, CANCEL of a wedged
-//! command; TIS locality request/grant, EXPECT-gated FIFO writes,
-//! GO execution, DATA_AVAIL drain, and the commandReady discipline
-//! (the TPM clears commandReady when a command is taken; the host
-//! must re-assert it before the next command — TIS §5.6, and the
-//! behaviour Linux's `tpm_tis_ready` implements). Commands other
+//! command, go-idle returning the device to `CTRL_STS.tpmIdle`
+//! and locality relinquish clearing `LOC_STATE.locAssigned`
+//! (PTP §6.5.2 — the per-command release the production submit
+//! path performs, #942); TIS locality request/grant, EXPECT-gated
+//! FIFO writes, GO execution, DATA_AVAIL drain, the commandReady
+//! discipline (the TPM clears commandReady when a command is
+//! taken; the host must re-assert it before the next command —
+//! TIS §5.6, and the behaviour Linux's `tpm_tis_ready`
+//! implements), and locality relinquish on `TPM_ACCESS`
+//! activeLocality after every command (#942). Commands other
 //! than TPM2_Startup are rejected with `TPM_RC_INITIALIZE` until
-//! Startup, exactly as a powered-on TPM behaves. PCR_Extend
+//! Startup, exactly as a powered-on TPM behaves. `TPM2_SelfTest`
+//! (Part 3 §9.5) answers success for both operand forms and
+//! `TPM_RC_FAILURE` in failure mode (entered only through the
+//! `set_self_test_failure` test hook). PCR_Extend
 //! parses the sessions-tagged frame of Part 3 §22.2 (TPM_RS_PW
 //! authorization area included) and applies
 //! `PCR = SHA256(PCR || digest)` (Part 1 §17.4).
@@ -102,6 +110,7 @@ use crate::tpm::{self, CrbRegs};
 // (PTP rev 1.05 §6, TIS v1.21 §5.6).
 
 const CRB_CTRL_REQ_CMD_READY: u32 = 1 << 0;
+const CRB_CTRL_REQ_GO_IDLE: u32 = 1 << 1;
 const CRB_CTRL_STS_TPM_IDLE: u32 = 1 << 1;
 const CRB_CTRL_START_GO: u32 = 1 << 0;
 
@@ -409,6 +418,13 @@ struct DeviceState {
     go_count: u32,
     dropped_fifo_bytes: u32,
     bad_buffer_addr: bool,
+    /// Whether `TPM2_SelfTest` has run in this power cycle
+    /// (Part 3 §9.5).
+    self_test_done: bool,
+    /// Failure mode (Part 1 §11), entered only through the
+    /// `set_self_test_failure` test hook: while set, SelfTest
+    /// answers `TPM_RC_FAILURE`.
+    self_test_failure: bool,
     // TIS conversation state.
     tis_cmd_ready: bool,
     tis_locality: bool,
@@ -479,6 +495,8 @@ impl FakeTpmDevice {
             go_count: 0,
             dropped_fifo_bytes: 0,
             bad_buffer_addr: false,
+            self_test_done: false,
+            self_test_failure: false,
             tis_cmd_ready: true,
             tis_locality: false,
             tis_rx: Vec::new(),
@@ -561,6 +579,30 @@ impl FakeTpmDevice {
     fn is_started(&self) -> bool {
         self.state.lock().started
     }
+    /// Whether the CRB locality is currently assigned to the host
+    /// (PTP §6 `LOC_STATE.locAssigned`).
+    fn loc_assigned(&self) -> bool {
+        self.state.lock().get32(tpm::REG_LOC_STATE) & tpm::LOC_STATE_LOC_ASSIGNED != 0
+    }
+    /// Whether the CRB device currently reports idle
+    /// (`CTRL_STS.tpmIdle`).
+    fn ctrl_idle(&self) -> bool {
+        self.state.lock().get32(tpm::REG_CRB_CTRL_STS) & CRB_CTRL_STS_TPM_IDLE != 0
+    }
+    /// Whether the TIS locality is currently held by the host.
+    fn tis_locality(&self) -> bool {
+        self.state.lock().tis_locality
+    }
+    /// Whether `TPM2_SelfTest` has run in this power cycle.
+    fn self_test_done(&self) -> bool {
+        self.state.lock().self_test_done
+    }
+    /// Put the model into / out of failure mode for SelfTest
+    /// (test hook — on silicon the mode is entered by a failed
+    /// self-test and cleared only by a TPM Reset).
+    fn set_self_test_failure(&self, failure: bool) {
+        self.state.lock().self_test_failure = failure;
+    }
 
     // ── Command core ─────────────────────────────────────────────
 
@@ -632,6 +674,24 @@ impl FakeTpmDevice {
                     return err(RC_SIZE);
                 }
                 self.state.lock().started = false;
+                ok(&[])
+            }
+            x if x == narf_tpm::tpm2::TPM_CC_SELF_TEST => {
+                // Part 3 §9.5: one TPMI_YES_NO byte follows the
+                // header (11-byte frame). `fullTest=YES` runs the
+                // full test, `NO` runs only the tests not yet run;
+                // both answer SUCCESS when the tests pass, and a
+                // TPM in failure mode answers TPM_RC_FAILURE.
+                if cmd.len() != 11 {
+                    return err(RC_SIZE);
+                }
+                if cmd[10] > 1 {
+                    return err(RC_VALUE);
+                }
+                if self.state.lock().self_test_failure {
+                    return err(RC_FAILURE);
+                }
+                self.state.lock().self_test_done = true;
                 ok(&[])
             }
             x if x == narf_tpm::tpm2::TPM_CC_PCR_EXTEND => self.exec_pcr_extend(tag, cmd),
@@ -1603,10 +1663,17 @@ impl CrbRegs for FakeTpmDevice {
             match offset {
                 x if x == tpm::REG_LOC_CTRL => {
                     // Locality grant: LOC_STATE.locAssigned follows
-                    // a LOC_CTRL request (PTP §6.5).
+                    // a LOC_CTRL request (PTP §6.5); relinquish
+                    // clears it (PTP §6.5.2 — the production
+                    // submit path releases the locality after
+                    // every command, #942).
                     if value & tpm::LOC_CTRL_REQ_ACCESS != 0 {
                         let cur = st.get32(tpm::REG_LOC_STATE);
                         st.set32(tpm::REG_LOC_STATE, cur | tpm::LOC_STATE_LOC_ASSIGNED);
+                    }
+                    if value & tpm::LOC_CTRL_RELINQUISH != 0 {
+                        let cur = st.get32(tpm::REG_LOC_STATE);
+                        st.set32(tpm::REG_LOC_STATE, cur & !tpm::LOC_STATE_LOC_ASSIGNED);
                     }
                 }
                 x if x == tpm::REG_CRB_CTRL_REQ => {
@@ -1615,6 +1682,13 @@ impl CrbRegs for FakeTpmDevice {
                         // The TPM leaves idle for command-ready.
                         let cur = st.get32(tpm::REG_CRB_CTRL_STS);
                         st.set32(tpm::REG_CRB_CTRL_STS, cur & !CRB_CTRL_STS_TPM_IDLE);
+                    }
+                    if value & CRB_CTRL_REQ_GO_IDLE != 0 {
+                        // The TPM returns to idle (PTP §6.5.2 —
+                        // the production submit path writes
+                        // go-idle after every command, #942).
+                        let cur = st.get32(tpm::REG_CRB_CTRL_STS);
+                        st.set32(tpm::REG_CRB_CTRL_STS, cur | CRB_CTRL_STS_TPM_IDLE);
                     }
                 }
                 x if x == tpm::REG_CRB_CTRL_START => {
@@ -1678,6 +1752,13 @@ impl CrbRegs for FakeTpmDevice {
                     x if x == tpm::REG_TIS_ACCESS => {
                         if value & TIS_ACCESS_REQUEST_USE != 0 {
                             st.tis_locality = true;
+                        }
+                        if value & TIS_ACCESS_ACTIVE != 0 {
+                            // Host releases the locality (TIS
+                            // §5.6 step 7 — the production submit
+                            // path relinquishes after every
+                            // command, #942).
+                            st.tis_locality = false;
                         }
                         return;
                     }
@@ -1945,6 +2026,17 @@ fn smoke_tpm_crb_submit_conversation() -> TestResult {
     if dev.bad_buffer_addr() {
         return TestResult::Fail("device saw an unresolvable buffer address");
     }
+
+    // (7) Per-command release (#942): after the last submit the
+    // device is back in idle and the locality is released. The
+    // conversation above already proves the next submit
+    // re-acquires it at its head (seven submits, one GO each).
+    if !dev.ctrl_idle() {
+        return TestResult::Fail("device not idle after the conversation");
+    }
+    if dev.loc_assigned() {
+        return TestResult::Fail("locality still assigned after the conversation");
+    }
     let _ = (cmd_mem, rsp_mem);
     TestResult::Pass
 }
@@ -1963,8 +2055,9 @@ fn smoke_tpm_tis_submit_conversation() -> TestResult {
 
     // The first-command conversation, end to end over the
     // production TIS path: locality request → FIFO bytes under
-    // EXPECT → GO → DATA_AVAIL drain. A powered-on TPM presents
-    // commandReady set, so this conversation is well-formed.
+    // EXPECT → GO → DATA_AVAIL drain → locality release. A
+    // powered-on TPM presents commandReady set, so this
+    // conversation is well-formed.
     //
     // The conversation deliberately stops at one command. The
     // model enforces the TIS commandReady discipline (TIS
@@ -1973,12 +2066,9 @@ fn smoke_tpm_tis_submit_conversation() -> TestResult {
     // implements): the TPM clears commandReady when it takes a
     // command at GO, FIFO writes outside the ready state are
     // dropped, and the host must write STS.commandReady to
-    // re-enter the ready state. The production submit path never
-    // writes commandReady (audit §2.3 item 5), so from the second
-    // command on, its bytes are dropped by a spec-shaped device
-    // and the command cannot complete — the multi-command TIS
+    // re-enter the ready state. The multi-command TIS
     // conversation is the lifecycle lane's acceptance test
-    // (#942), and this model is ready to serve it unchanged.
+    // (#942) for that discipline, and this model serves it.
     let startup = narf_tpm::tpm2::startup(narf_tpm::tpm2::TPM_SU_CLEAR);
     let resp = match narf_scheduler::block_on_spin(tpm::submit_tis_over(&dev, &startup)) {
         Ok(r) => r,
@@ -1996,6 +2086,10 @@ fn smoke_tpm_tis_submit_conversation() -> TestResult {
     // locality granted / commandReady state the model requires).
     if dev.dropped_fifo_bytes() != 0 {
         return TestResult::Fail("device dropped FIFO bytes during the conversation");
+    }
+    // ...and the locality was released after the command (#942).
+    if dev.tis_locality() {
+        return TestResult::Fail("TIS locality still held after the command");
     }
     TestResult::Pass
 }
@@ -2035,6 +2129,15 @@ fn smoke_tpm_crb_submit_wedged_device_cancels() -> TestResult {
     }
     if !dev.cancel_seen() {
         return TestResult::Fail("production submit did not CANCEL the wedged command");
+    }
+    // The timed-out submit still releases the device (#942): a
+    // wedged command must not leave the locality held or the
+    // device out of idle for the next command.
+    if dev.loc_assigned() {
+        return TestResult::Fail("wedged submit left the locality assigned");
+    }
+    if !dev.ctrl_idle() {
+        return TestResult::Fail("wedged submit left the device out of idle");
     }
     let _ = (cmd_mem, rsp_mem);
     TestResult::Pass
@@ -2420,6 +2523,14 @@ fn smoke_tpm_tis_multi_command_conversation() -> TestResult {
     if dev.dropped_fifo_bytes() != 0 {
         return TestResult::Fail("device dropped FIFO bytes — commandReady discipline missing");
     }
+    // ...and the locality was released after the last command
+    // (#942): the conversation holds no locality across
+    // commands, so a peer locality could be granted between
+    // submits — and the seven submits above already prove the
+    // next command re-requests it.
+    if dev.tis_locality() {
+        return TestResult::Fail("TIS locality still held after the conversation");
+    }
     if !dev.is_started() {
         return TestResult::Fail("device not started after the conversation");
     }
@@ -2436,13 +2547,15 @@ fn smoke_tpm_probe_startup_extend_conversation() -> TestResult {
     // The boot-path lifecycle conversation: the composition
     // `try_init_default` performs on real silicon — device,
     // registry publication, registry dispatch — with the
-    // lifecycle edge this lane adds: the registered handle is
+    // lifecycle edges this lane adds: the registered handle is
     // started through the trait's `startup`, the call the
     // production probe now makes between probe and registration,
-    // before the first extend is dispatched. The keystone's
-    // discovery fixture covers the same composition with Startup
-    // submitted as a hand-built raw frame; this one pins the
-    // trait surface production actually uses.
+    // self-tested through the trait's `self_test`, the call the
+    // probe makes after Startup and before the first extend is
+    // dispatched. The keystone's discovery fixture covers the same
+    // composition with Startup submitted as a hand-built raw
+    // frame; this one pins the trait surface production actually
+    // uses.
     let mut dev = FakeTpmDevice::crb();
     let mut cmd_mem = alloc::vec![0u8; 4096];
     let mut rsp_mem = alloc::vec![0u8; 4096];
@@ -2471,11 +2584,11 @@ fn smoke_tpm_probe_startup_extend_conversation() -> TestResult {
     });
     narf_tpm::registry::register(adapter);
     let digest: [u8; 32] = [0x5A; 32];
-    let stages = Arc::new(IrqSafeSpinLock::new([false; 4]));
+    let stages = Arc::new(IrqSafeSpinLock::new([false; 5]));
     let stages_in = stages.clone();
     narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async move {
-        let mut s = [false; 4];
+        let mut s = [false; 5];
         if let Some(handle) = narf_tpm::registry::list().first().cloned() {
             // 1. Before Startup, the registry dispatch is
             //    rejected exactly as `frame::measure` observes it.
@@ -2485,12 +2598,15 @@ fn smoke_tpm_probe_startup_extend_conversation() -> TestResult {
             );
             // 2. The lifecycle call.
             s[1] = handle.startup(narf_tpm::StartupType::Clear).await.is_ok();
-            // 3. The extend now lands.
-            s[2] = handle.extend_pcr(4, &digest).await.is_ok();
-            // 4. Read-back through the registry handle matches the
+            // 3. The self-test call (#942): the incremental form
+            //    the production probe submits after Startup.
+            s[2] = handle.self_test(false).await.is_ok();
+            // 4. The extend now lands.
+            s[3] = handle.extend_pcr(4, &digest).await.is_ok();
+            // 5. Read-back through the registry handle matches the
             //    device-side chain.
             let want = pcr_extend_value(&[0u8; 32], &digest);
-            s[3] = matches!(handle.read_pcr(4).await, Ok(v) if v == want.to_vec());
+            s[4] = matches!(handle.read_pcr(4).await, Ok(v) if v == want.to_vec());
         }
         *stages_in.lock() = s;
     });
@@ -2500,7 +2616,7 @@ fn smoke_tpm_probe_startup_extend_conversation() -> TestResult {
     let pcr_ok = dev.pcr(4) == pcr_extend_value(&[0u8; 32], &digest);
     narf_tpm::registry::__reset_for_test();
     let _ = (cmd_mem, rsp_mem);
-    if stages != [true; 4] {
+    if stages != [true; 5] {
         return TestResult::Fail("probe/startup/extend stage failed (see stage order in source)");
     }
     if !started || !pcr_ok {
@@ -2511,6 +2627,186 @@ fn smoke_tpm_probe_startup_extend_conversation() -> TestResult {
 kernel_test_in!(
     "drivers/platform/tpm-startup",
     smoke_tpm_probe_startup_extend_conversation
+);
+
+/// Self-test conversation (#942, Part 3 §9.5) through the trait
+/// over the production CRB submit path: the pre-Startup gate, the
+/// incremental and full forms, and the failure-mode answer — the
+/// three behaviours the production probe depends on when it
+/// self-tests after Startup and refuses to register a device
+/// that fails.
+fn smoke_tpm_self_test_conversation() -> TestResult {
+    use narf_tpm::types::TpmRc;
+
+    let mut dev = FakeTpmDevice::crb();
+    let mut cmd_mem = alloc::vec![0u8; 4096];
+    let mut rsp_mem = alloc::vec![0u8; 4096];
+    let cmd_ptr = cmd_mem.as_mut_ptr();
+    let rsp_ptr = rsp_mem.as_mut_ptr();
+    dev.attach_buffers(cmd_ptr, 4096, rsp_ptr, 4096);
+    let dev = Arc::new(dev);
+    if tpm::crb_acquire_and_program(
+        dev.as_ref(),
+        cmd_ptr as u64,
+        4096,
+        rsp_ptr as u64,
+        4096,
+        narf_time::Deadline::after_ms(750),
+    )
+    .is_err()
+    {
+        return TestResult::Fail("CRB bring-up failed against the model");
+    }
+    let adapter: Arc<dyn TpmDevice> = Arc::new(ModelDevice {
+        dev: dev.clone(),
+        cmd_ptr,
+        rsp_ptr,
+        tis: false,
+    });
+    let stages = Arc::new(IrqSafeSpinLock::new([false; 6]));
+    let stages_in = stages.clone();
+    let dev_in = dev.clone();
+    narf_scheduler::__reset_queues_for_test();
+    narf_scheduler::spawn(async move {
+        let mut s = [false; 6];
+        // 1. Before Startup, SelfTest is gated like every other
+        //    command.
+        s[0] = matches!(
+            adapter.self_test(false).await,
+            Err(HighLevelTpmError::Rc(TpmRc::Initialize))
+        );
+        // 2. Startup.
+        s[1] = adapter.startup(narf_tpm::StartupType::Clear).await.is_ok();
+        // 3. Incremental SelfTest — the form the probe submits.
+        s[2] = adapter.self_test(false).await.is_ok();
+        // 4. Full SelfTest.
+        s[3] = adapter.self_test(true).await.is_ok();
+        // 5. Failure mode answers TPM_RC_FAILURE, surfaced as
+        //    the typed Rc — the answer the probe refuses to
+        //    register on.
+        dev_in.set_self_test_failure(true);
+        s[4] = matches!(
+            adapter.self_test(false).await,
+            Err(HighLevelTpmError::Rc(TpmRc::Failure))
+        );
+        // 6. Leaving failure mode restores the success path.
+        dev_in.set_self_test_failure(false);
+        s[5] = adapter.self_test(false).await.is_ok();
+        *stages_in.lock() = s;
+    });
+    narf_scheduler::run_until_empty();
+    let stages = *stages.lock();
+    let done = dev.self_test_done();
+    let _ = (cmd_mem, rsp_mem);
+    if stages != [true; 6] {
+        return TestResult::Fail("self-test stage failed (see stage order in source)");
+    }
+    if !done {
+        return TestResult::Fail("device did not record the self-test");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-self-test",
+    smoke_tpm_self_test_conversation
+);
+
+/// Teardown conversation (#942): the platform shutdown hook's
+/// device half, driven through the same trait surface —
+///
+///   1. Startup + SelfTest, the probe's order;
+///   2. `shutdown(CLEAR)`, the teardown form the hook submits
+///      (the suspend path owns Shutdown(STATE), #1003);
+///   3. after Shutdown the device refuses commands with
+///      TPM_RC_INITIALIZE and is no longer started;
+///   4. `registry::unregister` removes exactly that device, and
+///      a second removal is a no-op.
+///
+/// The hook's remaining halves — the singleton take and the devfs
+/// unregisters — have no fixture seam (the singleton is real
+/// MMIO), so they are covered by the `devfs_bridge` unregisters'
+/// own tests and the registry test in `narf_tpm`, not here.
+fn smoke_tpm_teardown_conversation() -> TestResult {
+    use narf_tpm::types::TpmRc;
+
+    narf_tpm::registry::__reset_for_test();
+    let mut dev = FakeTpmDevice::crb();
+    let mut cmd_mem = alloc::vec![0u8; 4096];
+    let mut rsp_mem = alloc::vec![0u8; 4096];
+    let cmd_ptr = cmd_mem.as_mut_ptr();
+    let rsp_ptr = rsp_mem.as_mut_ptr();
+    dev.attach_buffers(cmd_ptr, 4096, rsp_ptr, 4096);
+    let dev = Arc::new(dev);
+    if tpm::crb_acquire_and_program(
+        dev.as_ref(),
+        cmd_ptr as u64,
+        4096,
+        rsp_ptr as u64,
+        4096,
+        narf_time::Deadline::after_ms(750),
+    )
+    .is_err()
+    {
+        narf_tpm::registry::__reset_for_test();
+        return TestResult::Fail("CRB bring-up failed against the model");
+    }
+    let adapter: Arc<dyn TpmDevice> = Arc::new(ModelDevice {
+        dev: dev.clone(),
+        cmd_ptr,
+        rsp_ptr,
+        tis: false,
+    });
+    narf_tpm::registry::register(adapter.clone());
+    let digest: [u8; 32] = [0x5A; 32];
+    let stages = Arc::new(IrqSafeSpinLock::new([false; 5]));
+    let stages_in = stages.clone();
+    narf_scheduler::__reset_queues_for_test();
+    narf_scheduler::spawn(async move {
+        let mut s = [false; 5];
+        if let Some(handle) = narf_tpm::registry::list().first().cloned() {
+            s[0] = handle.startup(narf_tpm::StartupType::Clear).await.is_ok();
+            s[1] = handle.self_test(false).await.is_ok();
+            // The teardown Shutdown: CLEAR discards state.
+            s[2] = handle.shutdown(narf_tpm::StartupType::Clear).await.is_ok();
+            // After Shutdown the device refuses commands until
+            // the next Startup, exactly as after a power loss.
+            s[3] = matches!(
+                handle.extend_pcr(4, &digest).await,
+                Err(HighLevelTpmError::Rc(TpmRc::Initialize))
+            );
+            // ...and a fresh Startup brings it back, proving the
+            // Shutdown was orderly rather than a wedge.
+            s[4] = handle.startup(narf_tpm::StartupType::Clear).await.is_ok();
+        }
+        *stages_in.lock() = s;
+    });
+    narf_scheduler::run_until_empty();
+    let stages = *stages.lock();
+    if stages != [true; 5] {
+        narf_tpm::registry::__reset_for_test();
+        return TestResult::Fail("teardown stage failed (see stage order in source)");
+    }
+    // Unregister removes exactly this device; a second removal
+    // is a no-op false; the registry is empty afterwards.
+    if !narf_tpm::registry::unregister(&adapter) {
+        narf_tpm::registry::__reset_for_test();
+        return TestResult::Fail("unregister did not remove the device");
+    }
+    if narf_tpm::registry::unregister(&adapter) {
+        narf_tpm::registry::__reset_for_test();
+        return TestResult::Fail("second unregister reported removing the device");
+    }
+    if !narf_tpm::registry::list().is_empty() {
+        narf_tpm::registry::__reset_for_test();
+        return TestResult::Fail("registry not empty after teardown unregister");
+    }
+    narf_tpm::registry::__reset_for_test();
+    let _ = (cmd_mem, rsp_mem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/tpm-teardown",
+    smoke_tpm_teardown_conversation
 );
 
 // ── Userspace publication (#940): devfs + sysfs over the model ────

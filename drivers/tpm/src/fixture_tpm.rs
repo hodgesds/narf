@@ -33,6 +33,14 @@
 //!   §31.13: a `TPMA_NV_COUNTER` index changes only via
 //!   `NV_Increment`; a defined-but-never-written index reads
 //!   back `TPM_RC_NV_UNINITIALIZED`, even at size zero.
+//! - **Self-test (#942, Part 3 §9.5).** `TPM2_SelfTest`
+//!   answers success for both operand forms (`fullTest=YES`
+//!   runs the full test, `NO` runs only the tests not yet run
+//!   in this power cycle); a bad operand value is
+//!   `TPM_RC_VALUE`, and a TPM in failure mode — entered only
+//!   through the `set_failure_mode` test hook — answers
+//!   `TPM_RC_FAILURE`. The global failure-mode gate (other
+//!   commands failing too) is not modelled.
 //! - **Startup gating:** every command before `TPM2_Startup`
 //!   fails with `TPM_RC_INITIALIZE`.
 //! - **Power-state sequencing (#1003).** `TPM2_Shutdown`
@@ -86,7 +94,7 @@ use crate::tpm2::{
     TPM_CC_GET_CAPABILITY, TPM_CC_GET_RANDOM, TPM_CC_LOAD, TPM_CC_NV_DEFINE_SPACE,
     TPM_CC_NV_INCREMENT, TPM_CC_NV_READ, TPM_CC_NV_UNDEFINE_SPACE, TPM_CC_NV_WRITE,
     TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_GET_DIGEST, TPM_CC_POLICY_PCR,
-    TPM_CC_SHUTDOWN, TPM_CC_STARTUP, TPM_CC_START_AUTH_SESSION, TPM_CC_UNSEAL,
+    TPM_CC_SELF_TEST, TPM_CC_SHUTDOWN, TPM_CC_STARTUP, TPM_CC_START_AUTH_SESSION, TPM_CC_UNSEAL,
     TPM_PT_LOCKOUT_COUNTER, TPM_PT_LOCKOUT_INTERVAL, TPM_PT_LOCKOUT_RECOVERY, TPM_PT_MANUFACTURER,
     TPM_PT_MAX_AUTH_FAIL, TPM_RC_AUTH_FAIL, TPM_RC_BAD_AUTH, TPM_RC_COMMAND_CODE, TPM_RC_FAILURE,
     TPM_RC_HANDLE, TPM_RC_INITIALIZE, TPM_RC_LOCKOUT, TPM_RC_NV_DEFINED, TPM_RC_NV_UNINITIALIZED,
@@ -353,6 +361,17 @@ const DA_INTERVAL_DEFAULT: u32 = 600;
 
 struct State {
     started: bool,
+    /// Whether `TPM2_SelfTest` has run in this power cycle
+    /// (Part 3 §9.5): the incremental form (`fullTest=NO`) runs
+    /// only the tests not yet run, so a second incremental
+    /// SelfTest after a completed one is a no-op success.
+    self_test_done: bool,
+    /// Failure mode (Part 1 §11): when set, `TPM2_SelfTest`
+    /// answers `TPM_RC_FAILURE`. Set only by the `set_failure_mode`
+    /// test hook — the global failure-mode gate (every other
+    /// command failing too) is deliberately *not* modelled, so no
+    /// fixture can mistake this flag for a full failure-mode TPM.
+    failure_mode: bool,
     /// The `TPM_SU` operand of the last orderly Shutdown not
     /// yet consumed by a Startup (Part 3 §9.2/§9.3 sequencing):
     /// `Startup(TPM_SU_STATE)` is valid only when this is
@@ -389,6 +408,8 @@ impl State {
     fn new() -> Self {
         Self {
             started: false,
+            self_test_done: false,
+            failure_mode: false,
             last_shutdown: None,
             pcrs: [[0u8; 32]; 24],
             sessions: BTreeMap::new(),
@@ -504,6 +525,21 @@ impl FixtureTpm {
         self.state.lock().started
     }
 
+    /// Whether `TPM2_SelfTest` has run in this power cycle (test
+    /// introspection).
+    pub fn self_test_done(&self) -> bool {
+        self.state.lock().self_test_done
+    }
+
+    /// Put the fixture into / out of failure mode (test
+    /// introspection — on silicon the mode is entered by a failed
+    /// self-test and cleared only by a TPM Reset). While set,
+    /// `TPM2_SelfTest` answers `TPM_RC_FAILURE`; see the
+    /// `failure_mode` field for what is deliberately not modelled.
+    pub fn set_failure_mode(&self, failure: bool) {
+        self.state.lock().failure_mode = failure;
+    }
+
     /// Simulate a power cycle with no orderly Shutdown
     /// (test introspection): volatile state — sessions, loaded
     /// objects — is gone, and any previously saved state stays
@@ -551,6 +587,7 @@ impl FixtureTpm {
         match cc {
             TPM_CC_STARTUP => Self::startup(&mut st, tag, body),
             TPM_CC_SHUTDOWN => Self::shutdown(&mut st, tag, body),
+            TPM_CC_SELF_TEST => Self::self_test(&mut st, tag, body),
             TPM_CC_CLEAR => Self::clear(&mut st, tag, body),
             TPM_CC_DICTIONARY_ATTACK_LOCK_RESET => Self::da_lock_reset(&mut st, tag, body),
             TPM_CC_DICTIONARY_ATTACK_PARAMETERS => Self::da_parameters(&mut st, tag, body),
@@ -609,6 +646,30 @@ impl FixtureTpm {
         st.last_shutdown = None;
         st.sessions.clear();
         st.loaded.clear();
+        ok(tag, &[])
+    }
+
+    /// `TPM2_SelfTest` — Part 3 §9.5: `fullTest=YES` runs the full
+    /// self-test, `fullTest=NO` runs only the tests not yet run in
+    /// this power cycle (a second incremental SelfTest after a
+    /// completed one is a no-op success). A TPM in failure mode
+    /// answers `TPM_RC_FAILURE`. The operand is one TPMI_YES_NO
+    /// byte: any other value is `TPM_RC_VALUE`, and a malformed
+    /// frame is `TPM_RC_FAILURE` (the same malformed-parameter
+    /// treatment as `startup` / `shutdown`).
+    fn self_test(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
+        let mut c = Cursor::new(body);
+        let full = match c.u8() {
+            Ok(v) => v,
+            Err(()) => return fail(tag, TPM_RC_FAILURE),
+        };
+        if full > 1 {
+            return fail(tag, TPM_RC_VALUE);
+        }
+        if st.failure_mode {
+            return fail(tag, TPM_RC_FAILURE);
+        }
+        st.self_test_done = true;
         ok(tag, &[])
     }
 

@@ -129,10 +129,10 @@ pub(crate) const REG_CRB_RSP_LO: u64 = 0x6C;
 pub(crate) const REG_CRB_RSP_HI: u64 = 0x70;
 
 pub(crate) const LOC_CTRL_REQ_ACCESS: u32 = 1 << 0;
+pub(crate) const LOC_CTRL_RELINQUISH: u32 = 1 << 1;
 pub(crate) const LOC_STATE_LOC_ASSIGNED: u32 = 1 << 1;
 
 const CTRL_REQ_CMD_READY: u32 = 1 << 0;
-#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CTRL_REQ_GO_IDLE: u32 = 1 << 1;
 const CTRL_STS_ERROR: u32 = 1 << 0;
 const CTRL_STS_TPM_IDLE: u32 = 1 << 1;
@@ -500,13 +500,18 @@ impl SendBufPtr {
 unsafe impl Send for SendBufPtr {}
 
 /// The CRB submit sequence (PTP §6.5) over an abstract register
-/// window: set CMD_READY, copy the command into the host-owned
-/// command buffer, kick CTRL_START.GO, poll for completion
-/// (CANCEL on timeout), then read the response out of the
-/// host-owned response buffer. Factored out of `Tpm::submit_crb`
-/// so kernel-test fixtures can drive the identical sequence
-/// against a register-level device model (#946); the method is a
-/// thin wrapper passing the device's probe-time DMA buffers.
+/// window: request locality 0, set CMD_READY, copy the command into
+/// the host-owned command buffer, kick CTRL_START.GO, poll for
+/// completion (CANCEL on timeout), read the response out of the
+/// host-owned response buffer, then return the device to idle
+/// (`CTRL_REQ.goIdle`) and relinquish the locality — the per-command
+/// discipline PTP §6.5.2 and Linux `tpm_crb.c` (`crb_go_idle()` +
+/// `crb_relinquish_locality()`) implement, and the pre-#942 path
+/// omitted: it acquired locality once at probe and held it for the
+/// device's lifetime, and never wrote GO_IDLE. Factored out of
+/// `Tpm::submit_crb` so kernel-test fixtures can drive the identical
+/// sequence against a register-level device model (#946); the method
+/// is a thin wrapper passing the device's probe-time DMA buffers.
 ///
 /// # Safety
 /// The pointers inside `cmd_buf` / `rsp_buf` must each point
@@ -525,6 +530,23 @@ pub(crate) async fn submit_crb_over<R: CrbRegs>(
 ) -> Result<Vec<u8>, TpmError> {
     if cmd.is_empty() || cmd.len() > cmd_buf_len {
         return Err(TpmError::BadResponse);
+    }
+    // 0. Request locality 0. Probe already acquired it once
+    // (and programmed the buffers under it), so on the common
+    // path this is a re-request of a held locality; a device
+    // that lost the grant between commands — a peer locality
+    // seized it, or the previous submit released it — is
+    // re-acquired here instead of submitting without one.
+    // 750 ms TIMEOUT_A, the same budget the probe's bring-up
+    // uses for the locality grant.
+    regs.wr32(REG_LOC_CTRL, LOC_CTRL_REQ_ACCESS);
+    let granted = poll_yielding_until(
+        || regs.rd32(REG_LOC_STATE) & LOC_STATE_LOC_ASSIGNED != 0,
+        narf_time::Deadline::after_ms(750),
+    )
+    .await;
+    if !granted {
+        return Err(TpmError::LocalityTimeout);
     }
     // 1. Set CMD_READY.
     regs.wr32(REG_CRB_CTRL_REQ, CTRL_REQ_CMD_READY);
@@ -559,11 +581,15 @@ pub(crate) async fn submit_crb_over<R: CrbRegs>(
     .await;
     if !done {
         // Cancel the wedged command before reporting, mirroring
-        // `drivers/tpm/src/crb.rs::run_command`.
+        // `drivers/tpm/src/crb.rs::run_command`, then release
+        // the locality like every other exit below — a wedged
+        // command must not leave the device held.
         regs.wr32(REG_CRB_CTRL_CANCEL, 1);
+        crb_release(regs).await;
         return Err(TpmError::BusyTimeout);
     }
     if regs.rd32(REG_CRB_CTRL_STS) & CTRL_STS_ERROR != 0 {
+        crb_release(regs).await;
         return Err(TpmError::BadResponse);
     }
     // 5. Read response from the host-owned response buffer. The
@@ -580,6 +606,7 @@ pub(crate) async fn submit_crb_over<R: CrbRegs>(
     }
     let resp_size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
     if resp_size < 10 || resp_size as usize > rsp_buf_len {
+        crb_release(regs).await;
         return Err(TpmError::BadResponse);
     }
     let mut out = alloc::vec![0u8; resp_size as usize];
@@ -589,15 +616,43 @@ pub(crate) async fn submit_crb_over<R: CrbRegs>(
         // buffer.
         *byte = unsafe { core::ptr::read_volatile(rsp_buf.0.add(i)) };
     }
+    // 6. Return the device to idle and relinquish the locality
+    // (#942) — every exit after the acquire runs this, so no
+    // command, success or failure, leaves the CRB block held.
+    crb_release(regs).await;
     Ok(out)
+}
+
+/// Return a CRB device to idle and relinquish locality 0 (PTP
+/// §6.5.2): write `CTRL_REQ.goIdle`, wait for `CTRL_STS.tpmIdle`
+/// (750 ms TIMEOUT_A — the outcome is ignored, mirroring the
+/// CMD_READY wait: a TPM that never reports idle still takes the
+/// next command's CMD_READY write), then write
+/// `LOC_CTRL.relinquish`. The next submit re-requests the
+/// locality at its head, so a release here never strands a
+/// later command.
+async fn crb_release<R: CrbRegs>(regs: &R) {
+    regs.wr32(REG_CRB_CTRL_REQ, CTRL_REQ_GO_IDLE);
+    let _ = poll_yielding_until(
+        || regs.rd32(REG_CRB_CTRL_STS) & CTRL_STS_TPM_IDLE != 0,
+        narf_time::Deadline::after_ms(750),
+    )
+    .await;
+    regs.wr32(REG_LOC_CTRL, LOC_CTRL_RELINQUISH);
 }
 
 /// The TIS submit sequence (TIS v1.21) over an abstract register
 /// window: request locality 0, assert STS.commandReady and observe
 /// it set, push the command into DATA_FIFO under EXPECT flow
 /// control, issue STS.GO, then drain the response FIFO while
-/// DATA_AVAIL asserts. Factored out of `Tpm::submit_tis` for the
-/// same fixture seam as [`submit_crb_over`] (#946).
+/// DATA_AVAIL asserts, and release the locality — the step the
+/// pre-#942 path omitted (the function ended after the drain,
+/// holding locality 0 across commands, which on real TIS silicon
+/// stalls or fails the second and later commands). Every exit
+/// after the locality request relinquishes it, success or failure,
+/// so no command leaves the locality held. Factored out of
+/// `Tpm::submit_tis` for the same fixture seam as [`submit_crb_over`]
+/// (#946).
 pub(crate) async fn submit_tis_over<R: CrbRegs>(regs: &R, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
     // 1. Request locality 0.
     regs.wr8(REG_TIS_ACCESS, TIS_ACCESS_REQUEST_USE);
@@ -625,6 +680,9 @@ pub(crate) async fn submit_tis_over<R: CrbRegs>(regs: &R, cmd: &[u8]) -> Result<
     )
     .await;
     if !ready {
+        // No command was written, but the locality was
+        // requested: release it before reporting (#942).
+        tis_release(regs);
         return Err(TpmError::BusyTimeout);
     }
     // 3. Write command into the FIFO.
@@ -651,6 +709,7 @@ pub(crate) async fn submit_tis_over<R: CrbRegs>(regs: &R, cmd: &[u8]) -> Result<
     )
     .await;
     if !done {
+        tis_release(regs);
         return Err(TpmError::BusyTimeout);
     }
     // 6. Drain FIFO until DATA_AVAIL clears.
@@ -663,10 +722,26 @@ pub(crate) async fn submit_tis_over<R: CrbRegs>(regs: &R, cmd: &[u8]) -> Result<
         let b = regs.rd8(REG_TIS_DATA_FIFO);
         out.push(b);
         if out.len() > 0x1000 {
+            tis_release(regs);
             return Err(TpmError::BadResponse);
         }
     }
+    // 7. Release locality (#942): write TPM_ACCESS.activeLocality
+    // (TIS v1.21 §5.6 step 7; Linux `tpm_tis_release_locality`,
+    // called after every recv). The next submit re-requests the
+    // locality at its head, so a release here never strands a
+    // later command.
+    tis_release(regs);
     Ok(out)
+}
+
+/// Release TIS locality 0: write `TPM_ACCESS.activeLocality`,
+/// which self-clears the bit in the TPM. A write when the
+/// locality is not active is ignored by the device, so this is
+/// safe on every exit path, including the locality-request
+/// timeout.
+fn tis_release<R: CrbRegs>(regs: &R) {
+    regs.wr8(REG_TIS_ACCESS, TIS_ACCESS_ACTIVE);
 }
 
 impl Tpm {
@@ -831,17 +906,24 @@ pub(crate) fn discovered_base() -> Option<u64> {
 /// fixture can drive the same decision the initcall drives, #946.)
 ///
 /// On a successful probe the device is started (TPM2_Startup,
-/// #942) and then published through two handles on the SAME
-/// `Arc<Tpm>`: this crate's singleton (backing `with_tpm` /
-/// `is_present` / `kind`) and `narf_tpm::registry` — the dispatch
-/// target `frame::measure` consults for hardware PCR extends.
-/// The same success path also composes the userspace surface
-/// (#940): [`publish_userspace_surface`] installs a transport over
-/// the registered device into the `drivers/tpm` bridges, which
-/// instantiate `/dev/tpm0`, `/dev/tpmrm0` and
-/// `/sys/class/tpm/tpm0`. Publication happens exactly once, on the
-/// None→Some transition guarded by the early return above, so a
-/// repeated initcall can never double-register the device.
+/// #942), self-tested (TPM2_SelfTest, #942), and then published
+/// through two handles on the SAME `Arc<Tpm>`: this crate's
+/// singleton (backing `with_tpm` / `is_present` / `kind`) and
+/// `narf_tpm::registry` — the dispatch target `frame::measure`
+/// consults for hardware PCR extends. The same success path also
+/// composes the userspace surface (#940): [`publish_userspace_surface`]
+/// installs a transport over the registered device into the
+/// `drivers/tpm` bridges, which instantiate `/dev/tpm0`,
+/// `/dev/tpmrm0` and `/sys/class/tpm/tpm0`. Publication happens
+/// exactly once, on the None→Some transition guarded by the early
+/// return above, so a repeated initcall can never double-register
+/// the device. The success path also registers the power-off /
+/// reboot shutdown hook ([`tpm_shutdown_hook`], #942), which is
+/// the device's teardown: TPM2_Shutdown(CLEAR) + unregister.
+///
+/// A probed device that fails Startup or SelfTest is published
+/// through neither handle — `hardware_dispatch_active()` stays
+/// honest — and the failure is logged on the console.
 pub fn try_init_default() {
     if !cfg!(target_arch = "x86_64") {
         return;
@@ -875,65 +957,121 @@ pub fn try_init_default() {
         // statement), and the submit paths are self-waking register
         // polls — `block_on_spin` is the correct bridge, the same
         // one the fixture seams use to drive these submit paths.
-        match narf_scheduler::block_on_spin(dev.startup(narf_tpm::StartupType::Clear)) {
-            Ok(()) => {
-                // Identity (#941): read the TPM's own
-                // manufacturer / firmware / spec revision via
-                // TPM2_GetCapability while the device is still
-                // unpublished, so `get_info` answers with real
-                // values from first visibility. A failed query is
-                // not fatal — the device works without its
-                // identity — so log it and keep the unqueried
-                // defaults rather than withholding a started TPM.
-                match narf_scheduler::block_on_spin(dev.query_info()) {
-                    Ok(info) => dev.set_info(info),
-                    Err(e) => {
-                        use core::fmt::Write as _;
-                        let _ = writeln!(
-                            narf_console::Writer,
-                            "  tpm: TPM2_GetCapability failed ({e:?}); device info defaults retained"
-                        );
-                    }
-                }
-                narf_tpm::registry::register(dev.clone());
-                // Userspace publication (#940): the devfs/sysfs
-                // bridges, composed onto the same started device
-                // the registry now dispatches through.
-                publish_userspace_surface(dev.clone());
-                // Attestation (#945): provision the AK now, while
-                // the boot is already paying TPM latencies, so the
-                // first quote request does not. Log-only on
-                // failure — attestation is additive surface; a TPM
-                // that cannot provision still registers, publishes,
-                // and anchors measured boot. On a firmware-started
-                // TPM whose AK a previous boot persisted, this is
-                // one ReadPublic round-trip.
-                if let Err(e) =
-                    narf_scheduler::block_on_spin(crate::tpm_attestation::ensure_ak(&*dev))
-                {
-                    use core::fmt::Write as _;
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "  tpm: AK provisioning failed ({e:?}); attestation unavailable"
-                    );
-                }
-                *TPM.lock() = Some(dev);
-            }
+        //
+        // Each lifecycle step below fails closed: a device that
+        // would not start, or that fails its self-test, is
+        // published through neither handle — every command on it
+        // would fail, so publishing it would let measured boot
+        // claim a hardware anchor that cannot extend.
+        if let Err(e) = narf_scheduler::block_on_spin(dev.startup(narf_tpm::StartupType::Clear)) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  tpm: TPM2_Startup failed ({e:?}); device not registered"
+            );
+            return;
+        }
+        // Self-test (#942): the incremental form — only the tests
+        // not yet run in this power cycle. A TPM in failure mode
+        // answers TPM_RC_FAILURE here, at probe, instead of
+        // failing every later command with an unexplained error.
+        if let Err(e) = narf_scheduler::block_on_spin(dev.self_test(false)) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  tpm: TPM2_SelfTest failed ({e:?}); device not registered"
+            );
+            return;
+        }
+        // Identity (#941): read the TPM's own
+        // manufacturer / firmware / spec revision via
+        // TPM2_GetCapability while the device is still
+        // unpublished, so `get_info` answers with real
+        // values from first visibility. A failed query is
+        // not fatal — the device works without its
+        // identity — so log it and keep the unqueried
+        // defaults rather than withholding a started TPM.
+        match narf_scheduler::block_on_spin(dev.query_info()) {
+            Ok(info) => dev.set_info(info),
             Err(e) => {
-                // Probed but would not start: every command would
-                // fail with TPM_RC_INITIALIZE, so publishing the
-                // device would let measured boot claim a hardware
-                // anchor that cannot extend. Publish neither handle
-                // — `hardware_dispatch_active()` stays honest — and
-                // say so on the console.
                 use core::fmt::Write as _;
                 let _ = writeln!(
                     narf_console::Writer,
-                    "  tpm: TPM2_Startup failed ({e:?}); device not registered"
+                    "  tpm: TPM2_GetCapability failed ({e:?}); device info defaults retained"
                 );
             }
         }
+        narf_tpm::registry::register(dev.clone());
+        // Userspace publication (#940): the devfs/sysfs
+        // bridges, composed onto the same started device
+        // the registry now dispatches through.
+        publish_userspace_surface(dev.clone());
+        // Attestation (#945): provision the AK now, while
+        // the boot is already paying TPM latencies, so the
+        // first quote request does not. Log-only on
+        // failure — attestation is additive surface; a TPM
+        // that cannot provision still registers, publishes,
+        // and anchors measured boot. On a firmware-started
+        // TPM whose AK a previous boot persisted, this is
+        // one ReadPublic round-trip.
+        if let Err(e) = narf_scheduler::block_on_spin(crate::tpm_attestation::ensure_ak(&*dev)) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  tpm: AK provisioning failed ({e:?}); attestation unavailable"
+            );
+        }
+        // Teardown (#942): the reboot / power-off shutdown hook
+        // (Shutdown(CLEAR) + unregister) runs on every transition
+        // out of this boot, so the device is never left registered
+        // past the point its state is discarded.
+        narf_power::system::register_shutdown_hook("tpm", tpm_shutdown_hook);
+        *TPM.lock() = Some(dev);
     }
+}
+
+/// Power-off / reboot shutdown hook (#942): the TPM's teardown.
+///
+/// Runs with the system otherwise idle, after the pre-shutdown
+/// filesystem sync and the persistent-log flush, in reverse probe
+/// order with the other device hooks (Linux `device_shutdown`).
+/// The hook must be bounded and must not sleep on the scheduler:
+/// the submit is a self-waking register poll driven through
+/// `block_on_spin`, the same bridge `try_init_default` uses, and
+/// the Shutdown itself is a millisecond-scale command.
+///
+/// The order is the point: `TPM2_Shutdown(TPM_SU_CLEAR)` first,
+/// while the device is still registered and dispatchable, then
+/// the unregisters — the registry (so `frame::measure` stops
+/// dispatching hardware extends to a shut-down TPM), the devfs
+/// transport (so `/dev/tpm0` writes fail cleanly instead of
+/// submitting to a shut-down TPM), and the devfs nodes. CLEAR is
+/// the power-off form: the machine is going away, so no state is
+/// saved for a resume — the suspend path owns Shutdown(STATE)
+/// (#1003) and never goes through this hook. A refused Shutdown
+/// still unregisters: a shut-down-or-gone TPM must not stay
+/// dispatchable.
+///
+/// The sysfs node (`/sys/class/tpm/tpm0`) has no unregister API
+/// in-tree, so it stays registered past teardown; its attribute
+/// closures hold their own transport `Arc`, and nothing reads
+/// sysfs after the shutdown hooks run. Removing it needs a
+/// filesystem-side class-device unregister first.
+fn tpm_shutdown_hook() {
+    let Some(dev) = TPM.lock().take() else {
+        return;
+    };
+    if let Err(e) = narf_scheduler::block_on_spin(dev.shutdown(narf_tpm::StartupType::Clear)) {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  tpm: TPM2_Shutdown(CLEAR) failed ({e:?}) at power-off; unregistering anyway"
+        );
+    }
+    let dev_dyn: Arc<dyn narf_tpm::TpmDevice> = dev;
+    let _ = narf_tpm::registry::unregister(&dev_dyn);
+    narf_drivers_tpm::devfs_bridge::unregister_transport();
+    narf_drivers_tpm::devfs_bridge::unregister_dev_nodes();
 }
 
 // ── Userspace publication (#940) ─────────────────────────────────────

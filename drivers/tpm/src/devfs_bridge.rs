@@ -530,9 +530,10 @@ pub fn register_dev_nodes() {
 }
 
 /// Uninstall the `/dev/tpm0` and `/dev/tpmrm0` delegates, restoring
-/// the no-TPM devfs state. Production registration is boot-lifetime
-/// (there is no production unregister, mirroring the registry's);
-/// this exists for kernel-test fixture hygiene.
+/// the no-TPM devfs state. Production caller: the platform probe's
+/// teardown path (#942) — the reboot / power-off shutdown hook
+/// calls this after `TPM2_Shutdown(CLEAR)` — and kernel-test
+/// fixture hygiene.
 pub fn unregister_dev_nodes() {
     narf_filesystem::unregister_tpm();
 }

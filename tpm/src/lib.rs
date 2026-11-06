@@ -101,6 +101,50 @@ pub trait TpmDevice: Send + Sync {
         }
     }
 
+    /// Submit `TPM2_SelfTest` (TCG Part 3 §9.5) — the lifecycle
+    /// edge that proves the TPM can execute commands before any
+    /// consumer depends on it. `full` is the TPMI_YES_NO operand:
+    /// `true` runs the full self-test, `false` runs only the tests
+    /// not yet run in this power cycle. A TPM in failure mode
+    /// answers `TPM_RC_FAILURE`, which propagates as
+    /// `TpmError::Rc(TpmRc::Failure)` — the production probe
+    /// submits this (incremental form) after Startup and refuses
+    /// to register a device that fails it, so a failure-mode TPM
+    /// surfaces at probe with a named error instead of as
+    /// unexplained command failures later (#942). Like `startup`,
+    /// a provided method over the canonical codec.
+    async fn self_test(&self, full: bool) -> Result<(), TpmError> {
+        let req = crate::tpm2::self_test(full);
+        let resp = self.submit_raw(&req).await?;
+        match crate::commands::ResponseParser::new(&resp) {
+            Ok(_) if resp.len() == 10 => Ok(()),
+            Ok(_) => Err(TpmError::BadResponse),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Submit `TPM2_Shutdown` (TCG Part 3 §9.4) — the lifecycle
+    /// edge that prepares the TPM for power loss. The operand
+    /// reuses [`StartupType`]: `Clear` discards state (the
+    /// reboot / power-off teardown the platform shutdown hook
+    /// submits, #942), `State` saves it for a resume. The
+    /// `State` form's sequencing — Shutdown(STATE) on suspend
+    /// entry, Startup(STATE) on resume, and the CLEAR fallback
+    /// when the state-saving shutdown fails — is owned by the
+    /// power-suspend program (#1003) and lives in the suspend
+    /// service, not here; this method is the raw operation, with
+    /// no response-code folding. Provided, over the canonical
+    /// codec, like `startup`.
+    async fn shutdown(&self, shutdown_type: StartupType) -> Result<(), TpmError> {
+        let req = crate::tpm2::shutdown(shutdown_type.su());
+        let resp = self.submit_raw(&req).await?;
+        match crate::commands::ResponseParser::new(&resp) {
+            Ok(_) if resp.len() == 10 => Ok(()),
+            Ok(_) => Err(TpmError::BadResponse),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Query the TPM's identity live via TPM2_GetCapability
     /// (TCG Part 3 §24.2) and return it as a [`TpmInfo`].
     ///
@@ -198,6 +242,22 @@ pub mod registry {
 
     pub fn register(device: Arc<dyn TpmDevice>) {
         REGISTRY.lock().push(device);
+    }
+
+    /// Remove `device` from the registry, by `Arc` identity.
+    /// Returns whether a registration was removed. Production
+    /// caller: the platform probe's teardown path (#942) — after
+    /// `TPM2_Shutdown(CLEAR)` on the reboot / power-off hook, a
+    /// shut-down device must stop being a dispatch target for
+    /// `frame::measure`; removing a device that was never
+    /// registered (or was already removed) is a no-op `false`,
+    /// never an error. Fixtures use `__reset_for_test` for the
+    /// whole-registry reset; this is the per-device removal.
+    pub fn unregister(device: &Arc<dyn TpmDevice>) -> bool {
+        let mut g = REGISTRY.lock();
+        let before = g.len();
+        g.retain(|d| !Arc::ptr_eq(d, device));
+        g.len() != before
     }
 
     pub fn list() -> Vec<Arc<dyn TpmDevice>> {
@@ -344,6 +404,54 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("tpm", smoke_tpm_registry_register_list_and_reset);
+
+    fn smoke_tpm_registry_unregister() -> TestResult {
+        // Per-device removal (#942): unregister drops exactly
+        // the named device by Arc identity, reports whether
+        // anything was removed, and leaves the other devices
+        // dispatchable. Reset on entry AND exit — the registry
+        // is global, and a leaked mock would silently become
+        // the dispatch target for later smokes.
+        registry::__reset_for_test();
+        if !registry::list().is_empty() {
+            return TestResult::Fail("registry not empty after reset");
+        }
+        let first: Arc<dyn TpmDevice> = Arc::new(MockTpm::new());
+        let second: Arc<dyn TpmDevice> = Arc::new(MockTpm::new());
+        let absent: Arc<dyn TpmDevice> = Arc::new(MockTpm::new());
+        registry::register(first.clone());
+        registry::register(second.clone());
+        // Removing a device that was never registered is a
+        // no-op false, never an error.
+        if registry::unregister(&absent) {
+            registry::__reset_for_test();
+            return TestResult::Fail("unregister reported removing an unregistered device");
+        }
+        if registry::list().len() != 2 {
+            registry::__reset_for_test();
+            return TestResult::Fail("unregister of absent device mutated the registry");
+        }
+        if !registry::unregister(&first) {
+            registry::__reset_for_test();
+            return TestResult::Fail("unregister did not report removing the device");
+        }
+        let list = registry::list();
+        if list.len() != 1 || !Arc::ptr_eq(&list[0], &second) {
+            registry::__reset_for_test();
+            return TestResult::Fail("unregister removed the wrong device");
+        }
+        // A second removal of the same device is a no-op false.
+        if registry::unregister(&first) {
+            registry::__reset_for_test();
+            return TestResult::Fail("second unregister reported removing the device");
+        }
+        registry::__reset_for_test();
+        if !registry::list().is_empty() {
+            return TestResult::Fail("registry not empty after final reset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm", smoke_tpm_registry_unregister);
 
     // ── TPM2_Startup lifecycle policy smokes (#942) ───────────────
     //
@@ -509,6 +617,179 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("tpm/startup", smoke_tpm_startup_propagates_failure_rc);
+
+    // ── TPM2_SelfTest / TPM2_Shutdown lifecycle smokes (#942) ─────
+    //
+    // `LifecycleProbeTpm` is spec-shaped silicon for the two
+    // commands the trait's `self_test` / `shutdown` submit: it
+    // records every submitted command code (and the SelfTest
+    // fullTest byte / Shutdown TPM_SU operand) and answers per
+    // Part 3 §9.5 / §9.4 — a 10-byte success frame, or
+    // TPM_RC_FAILURE for SelfTest when the failure-mode flag is
+    // set. The fixtures pin the trait methods' framing and
+    // error propagation: which bytes go on the wire, and that a
+    // failure-mode SelfTest surfaces as `TpmRc::Failure`
+    // instead of being folded or retried.
+    struct LifecycleProbeTpm {
+        fail_self_test: AtomicU32,
+        submitted: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u32, u16)>>,
+    }
+
+    impl LifecycleProbeTpm {
+        fn new(fail_self_test: bool) -> Self {
+            Self {
+                fail_self_test: AtomicU32::new(fail_self_test as u32),
+                submitted: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            }
+        }
+
+        fn response(rc: u32) -> Vec<u8> {
+            let mut frame = alloc::vec![0u8; 10];
+            frame[0..2].copy_from_slice(&crate::tpm2::TPM_ST_NO_SESSIONS.to_be_bytes());
+            frame[2..6].copy_from_slice(&10u32.to_be_bytes());
+            frame[6..10].copy_from_slice(&rc.to_be_bytes());
+            frame
+        }
+
+        fn submitted(&self) -> alloc::vec::Vec<(u32, u16)> {
+            self.submitted.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TpmDevice for LifecycleProbeTpm {
+        fn get_info(&self) -> TpmInfo {
+            TpmInfo {
+                manufacturer: 0,
+                version: 1,
+                spec_level: 2,
+            }
+        }
+
+        async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
+            let header = crate::tpm2::Header::decode(cmd).map_err(|_| TpmError::BadResponse)?;
+            let operand = match header.code {
+                crate::tpm2::TPM_CC_SELF_TEST if cmd.len() == 11 => cmd[10] as u16,
+                crate::tpm2::TPM_CC_SHUTDOWN if cmd.len() == 12 => {
+                    u16::from_be_bytes([cmd[10], cmd[11]])
+                }
+                _ => 0,
+            };
+            self.submitted.lock().push((header.code, operand));
+            if header.code == crate::tpm2::TPM_CC_SELF_TEST
+                && self.fail_self_test.load(Ordering::SeqCst) != 0
+            {
+                return Ok(Self::response(0x101)); // TPM_RC_FAILURE
+            }
+            Ok(Self::response(0))
+        }
+
+        async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, TpmError> {
+            Ok(alloc::vec![0u8; bytes as usize])
+        }
+
+        async fn extend_pcr(&self, _pcr: u32, _digest: &[u8]) -> Result<(), TpmError> {
+            Ok(())
+        }
+
+        async fn read_pcr(&self, _pcr: u32) -> Result<Vec<u8>, TpmError> {
+            Ok(alloc::vec![0u8; 32])
+        }
+    }
+
+    fn smoke_tpm_self_test_frames_and_succeeds() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let mock = Arc::new(LifecycleProbeTpm::new(false));
+        let outcome = Arc::new(AtomicU32::new(0));
+        let m = mock.clone();
+        let o = outcome.clone();
+        narf_scheduler::spawn(async move {
+            // Incremental first (the form the production probe
+            // submits), then the full form: both must succeed.
+            let mut bits = 0u32;
+            if m.self_test(false).await.is_ok() {
+                bits |= 1;
+            }
+            if m.self_test(true).await.is_ok() {
+                bits |= 2;
+            }
+            o.store(bits, Ordering::SeqCst);
+        });
+        narf_scheduler::run_until_empty();
+        if outcome.load(Ordering::SeqCst) != 3 {
+            return TestResult::Fail("self_test(false) / self_test(true) did not succeed");
+        }
+        // The wire frames: TPM_CC_SELF_TEST with the fullTest
+        // byte 0 then 1 (Part 3 §9.5).
+        if mock.submitted()
+            != alloc::vec![
+                (crate::tpm2::TPM_CC_SELF_TEST, 0),
+                (crate::tpm2::TPM_CC_SELF_TEST, 1),
+            ]
+        {
+            return TestResult::Fail("self_test frames do not carry the fullTest operand");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/lifecycle", smoke_tpm_self_test_frames_and_succeeds);
+
+    fn smoke_tpm_self_test_failure_mode_propagates() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let mock = Arc::new(LifecycleProbeTpm::new(true));
+        let outcome = Arc::new(AtomicU32::new(0));
+        let m = mock.clone();
+        let o = outcome.clone();
+        narf_scheduler::spawn(async move {
+            match m.self_test(false).await {
+                Err(TpmError::Rc(types::TpmRc::Failure)) => o.store(1, Ordering::SeqCst),
+                _ => o.store(2, Ordering::SeqCst),
+            }
+        });
+        narf_scheduler::run_until_empty();
+        if outcome.load(Ordering::SeqCst) != 1 {
+            return TestResult::Fail("failure-mode SelfTest did not propagate TPM_RC_FAILURE");
+        }
+        if mock.submitted() != alloc::vec![(crate::tpm2::TPM_CC_SELF_TEST, 0)] {
+            return TestResult::Fail("failure RC must not be retried");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/lifecycle", smoke_tpm_self_test_failure_mode_propagates);
+
+    fn smoke_tpm_shutdown_frames_and_succeeds() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        let mock = Arc::new(LifecycleProbeTpm::new(false));
+        let outcome = Arc::new(AtomicU32::new(0));
+        let m = mock.clone();
+        let o = outcome.clone();
+        narf_scheduler::spawn(async move {
+            let mut bits = 0u32;
+            // CLEAR is the teardown form; STATE is the suspend
+            // form — the trait method is the raw operation for
+            // both, so both must frame and succeed here.
+            if m.shutdown(StartupType::Clear).await.is_ok() {
+                bits |= 1;
+            }
+            if m.shutdown(StartupType::State).await.is_ok() {
+                bits |= 2;
+            }
+            o.store(bits, Ordering::SeqCst);
+        });
+        narf_scheduler::run_until_empty();
+        if outcome.load(Ordering::SeqCst) != 3 {
+            return TestResult::Fail("shutdown(Clear) / shutdown(State) did not succeed");
+        }
+        if mock.submitted()
+            != alloc::vec![
+                (crate::tpm2::TPM_CC_SHUTDOWN, crate::tpm2::TPM_SU_CLEAR),
+                (crate::tpm2::TPM_CC_SHUTDOWN, crate::tpm2::TPM_SU_STATE),
+            ]
+        {
+            return TestResult::Fail("shutdown frames do not carry the TPM_SU operand");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("tpm/lifecycle", smoke_tpm_shutdown_frames_and_succeeds);
 
     // ── TPM2_GetCapability / query_info smokes (#941) ─────────────
     //
