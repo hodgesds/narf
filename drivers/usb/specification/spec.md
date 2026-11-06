@@ -475,8 +475,14 @@ also consult upstream Linux GPL sources.
   fail closed to drop. The v1 RX walk follows Linux `rx_bottom`:
   the `opts1` length counts frame + FCS (`ETH_FCS_LEN` = 4), the
   walk delivers length − 4 bytes, and the next descriptor starts
-  at the next 8-byte boundary (`RX_ALIGN`). The RTL8157 v2
-  descriptor layout is not decoded. RX VLAN tags are delivered in-band: with VLAN
+  at the next 8-byte boundary (`RX_ALIGN`). The RTL8157 (VER_16)
+  uses the v2 descriptor layout instead (16-byte `rx_desc_v2` /
+  `tx_desc_v2`): RX length in `opts1` bits 17..31 counting frame
+  + FCS (the walk strips the FCS and aligns segments to 16
+  bytes), VLAN present-bit in `opts1` bit 3 with the TCI in the
+  high half of `opts2`, all checksum report/fail bits in `opts3`;
+  TX adds `opts3 = len << 4` and `opts4 = TX_SIG` with a tighter
+  checksum transport-offset cap (0x3FF). RX VLAN tags are delivered in-band: with VLAN
   receive enabled the driver splices the tag reported in the RX
   descriptor back into the frame for the stack. Wake-on-LAN options are snapshotted from the device
   at bind and programmed through the `PLA_CRWECR` config window
