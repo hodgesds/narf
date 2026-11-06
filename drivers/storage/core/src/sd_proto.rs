@@ -298,10 +298,20 @@ impl Csd {
 /// - `status[16]` low nibble — Function Group 1 function currently
 ///   selected (the value a mode-1 CMD6 switch just installed;
 ///   Linux verifies `(status[16] & 0xF) == value`).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SwitchStatus {
     /// The 64-byte status block in wire order.
     pub raw: [u8; 64],
+}
+
+// NOTE: no derived `Default` — on the pinned toolchain arrays only
+// implement `Default` up to 32 elements, so `#[derive(Default)]` on
+// the `[u8; 64]` field fails with E0277. Do not re-add it to the
+// derive; extend this manual impl instead.
+impl Default for SwitchStatus {
+    fn default() -> Self {
+        Self { raw: [0; 64] }
+    }
 }
 
 impl SwitchStatus {

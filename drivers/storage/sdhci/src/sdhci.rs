@@ -1069,11 +1069,11 @@ impl Sdhci {
         // ACMD41 (SD_SEND_OP_COND): repeat CMD55 + CMD41 until
         // the response's busy bit (bit 31) is set.
         let mut acmd41_arg = 0x4000_0000u32; // HCS=1 (host supports SDHC).
-        // S18R=1: ask the card whether it accepts a switch to
-        // 1.8 V signalling (SD Physical Layer Spec §4.2.4.1; Linux
-        // sets it whenever the host supports a UHS-I mode). Inert
-        // for cards that do not support the switch — they answer
-        // S18A=0 and the driver never sends CMD11.
+                                             // S18R=1: ask the card whether it accepts a switch to
+                                             // 1.8 V signalling (SD Physical Layer Spec §4.2.4.1; Linux
+                                             // sets it whenever the host supports a UHS-I mode). Inert
+                                             // for cards that do not support the switch — they answer
+                                             // S18A=0 and the driver never sends CMD11.
         acmd41_arg |= ACMD41_S18R;
         if if_cond_match {
             acmd41_arg |= 0x0030_0000;
@@ -1254,10 +1254,7 @@ impl Sdhci {
     /// (the `responsive_spin_until(|| false, …)` delay pattern the
     /// SDIO stack uses for its microsecond delays).
     fn sleep_ms(ms: u64) {
-        let _ = narf_scheduler::responsive_spin_until(
-            || false,
-            narf_time::Deadline::after_ms(ms),
-        );
+        let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(ms));
     }
 
     /// Issue CMD6 (SWITCH_FUNC) and read back the 64-byte switch
@@ -1357,8 +1354,10 @@ impl Sdhci {
     /// preserving the 1.8 V signalling enable and the tuning bits.
     fn set_uhs_host_mode(&self, mode: UhsMode) {
         let ctrl2 = self.io.read16(REG_HOST_CONTROL_2);
-        self.io
-            .write16(REG_HOST_CONTROL_2, (ctrl2 & !HC2_UHS_MASK) | mode.host_control2());
+        self.io.write16(
+            REG_HOST_CONTROL_2,
+            (ctrl2 & !HC2_UHS_MASK) | mode.host_control2(),
+        );
     }
 
     /// Execute CMD19 tuning for `mode` (Linux
@@ -1406,8 +1405,10 @@ impl Sdhci {
         }
         // Fall back to fixed sampling: clear both tuning bits.
         let ctrl2 = self.io.read16(REG_HOST_CONTROL_2);
-        self.io
-            .write16(REG_HOST_CONTROL_2, ctrl2 & !(HC2_EXEC_TUNING | HC2_TUNED_CLK));
+        self.io.write16(
+            REG_HOST_CONTROL_2,
+            ctrl2 & !(HC2_EXEC_TUNING | HC2_TUNED_CLK),
+        );
         let _ = writeln!(
             narf_console::Writer,
             "  sdhci: tuning failed for {:?}; fixed sampling",
