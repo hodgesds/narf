@@ -80,6 +80,9 @@ mod bulk_stop_native;
 mod completion;
 mod event_wait;
 #[cfg(feature = "kernel-test")]
+#[path = "isoch_tests.rs"]
+mod isoch_tests;
+#[cfg(feature = "kernel-test")]
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
 pub use bulk_owner::{Direction as BulkDirection, Token as BulkToken, Token as IsochToken};
@@ -2804,6 +2807,24 @@ impl Xhci {
         ]
     }
 
+    /// Isoch TRB words (xHCI 1.2 §6.4.1.3, Table 6-49): d0/d1 are
+    /// the 64-bit Data Buffer Pointer, d2 is the Transfer Length
+    /// (bits 16:0; TD Size / Interrupter Target stay 0 for a
+    /// single-packet one-shot), d3 packs the producer cycle bit,
+    /// IOC, TRB Type 5 (Isoch), and SIA so the controller
+    /// schedules in the next available frame. TBC (bits 7-8),
+    /// TLBPC (bits 16-19), and Frame ID (bits 20-30) all stay 0.
+    /// Kept pure so the in-kernel harness can pin the encoding
+    /// without a controller.
+    fn isoch_trb_words(phys: u64, len: u32, pcs: u32) -> [u32; 4] {
+        [
+            phys as u32,
+            (phys >> 32) as u32,
+            len,
+            (TRB_TYPE_ISOCH << TRB_TYPE_SHIFT) | TRB_IOC | TRB_SIA | (pcs & TRB_CYCLE_BIT),
+        ]
+    }
+
     /// Read back one endpoint's output-context state + TR Dequeue
     /// Pointer under the caller's claim — the Stop profile's
     /// context step, shared with halt recovery.
@@ -4647,7 +4668,7 @@ impl Xhci {
         }
         let ep = device
             .eps
-            .get_mut(dci.saturating_sub(2) as usize)
+            .get_mut(dci_ep_index(dci)?)
             .and_then(Option::as_mut)
             .ok_or(XhciError::CmdFailed(0xFA))?;
         if ep.bulk.active() {
@@ -5215,17 +5236,18 @@ impl Xhci {
         if len == 0 || len > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
-        let phys = self.ep_dma_phys(slot_id, dci, EndpointKind::InterruptIn)?;
         // Zero the prefix so a stale page doesn't masquerade as
-        // device data.
-        // SAFETY: identity-mapped DMA page; bounds-checked above.
-        unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
-                0,
-                len as usize,
-            );
-        }
+        // device data, and clean it so a dirty line cannot later
+        // be evicted over the device's report (#886).
+        let phys = self.with_ep_dma_buf(slot_id, dci, EndpointKind::InterruptIn, |dma_buf| {
+            // SAFETY: identity-mapped DMA page; bounds-checked above.
+            unsafe {
+                core::ptr::write_bytes(dma_buf.cpu_mut_ptr::<u8>(), 0, len as usize);
+            }
+            dma_buf.sync(0, len as usize);
+            device_dma_barrier();
+            dma_buf.dma_addr().raw()
+        })?;
         self.ep_enqueue_normal(slot_id, dci, phys, len)?;
         self.ring_slot_doorbell(slot_id, dci as u32);
         Ok(phys)
@@ -5289,19 +5311,19 @@ impl Xhci {
         }
         let residue = ev[2] & 0x00FF_FFFF;
         let xferred = (out.len() as u32).saturating_sub(residue) as usize;
-        let phys = self.ep_dma_phys(slot_id, dci, EndpointKind::InterruptIn)?;
         let copy = xferred.min(out.len());
-        for (i, slot) in out[..copy].iter_mut().enumerate() {
-            // SAFETY: `phys` is this endpoint's identity-mapped DMA
-            // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
-            // read inside that page, aligned for a `u8`.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            *slot = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_ptr::<u8>(),
-                )
-            };
-        }
+        // Invalidate the posted range before the CPU reads the
+        // report — the bulk path's `complete_bulk` discipline (#886).
+        self.with_ep_dma_buf(slot_id, dci, EndpointKind::InterruptIn, |dma_buf| {
+            dma_buf.sync(0, out.len());
+            device_dma_barrier();
+            // SAFETY: `dma_buf` is this endpoint's identity-mapped
+            // DMA page; `copy ≤ out.len() ≤ 4096` keeps the read
+            // inside that page, aligned for a `u8`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(dma_buf.cpu_ptr::<u8>(), out.as_mut_ptr(), copy);
+            }
+        })?;
         // Re-arm for the next report.
         self.arm_interrupt_in(slot_id, dci, out.len() as u32)?;
         Ok(Some(xferred))
@@ -5313,27 +5335,27 @@ impl Xhci {
     /// host-to-device direction: HID class drivers with an output
     /// channel (FIDO/CTAPHID) stage one report per call and learn
     /// of completion through [`Xhci::poll_interrupt_out`]. The
-    /// payload is copied into the endpoint's DMA page before the
-    /// TRB is published, ordered by the same DMA barrier the rest
-    /// of the layer uses.
+    /// payload is copied into the endpoint's DMA page and cleaned
+    /// to the point of coherency before the TRB is published, the
+    /// bulk path's `begin_bulk` discipline (#886).
     pub fn arm_interrupt_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<(), XhciError> {
         if data.is_empty() || data.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
-        let phys = self.ep_dma_phys(slot_id, dci, EndpointKind::InterruptOut)?;
-        for (i, b) in data.iter().enumerate() {
-            // SAFETY: `phys` is this endpoint's identity-mapped DMA
-            // page; `i < data.len() ≤ 4096` keeps the write inside
-            // that page, aligned for a `u8`.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
+        let phys = self.with_ep_dma_buf(slot_id, dci, EndpointKind::InterruptOut, |dma_buf| {
+            // SAFETY: identity-mapped DMA page; `data.len() ≤ 4096`
+            // keeps the write inside that page, aligned for a `u8`.
             unsafe {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                    *b,
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    dma_buf.cpu_mut_ptr::<u8>(),
+                    data.len(),
                 );
             }
-        }
-        device_dma_barrier();
+            dma_buf.sync(0, data.len());
+            device_dma_barrier();
+            dma_buf.dma_addr().raw()
+        })?;
         self.ep_enqueue_normal(slot_id, dci, phys, data.len() as u32)?;
         self.ring_slot_doorbell(slot_id, dci as u32);
         Ok(())
@@ -5384,8 +5406,19 @@ impl Xhci {
         Ok(Some((len).saturating_sub(residue) as usize))
     }
 
-    /// Resolve the persistent DMA buffer phys for an endpoint.
-    fn ep_dma_phys(&self, slot_id: u8, dci: u8, kind: EndpointKind) -> Result<u64, XhciError> {
+    /// Resolve an endpoint's persistent DMA buffer and run `f` on
+    /// it while the device table is locked, so staging, cache
+    /// maintenance, and the phys lookup cannot interleave with a
+    /// reconfiguration. Validation: slot present, endpoint present,
+    /// DCI in 2..=31, no configuration in flight, kind matches,
+    /// and no bulk TD owns the page.
+    fn with_ep_dma_buf<R>(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        kind: EndpointKind,
+        f: impl FnOnce(&DmaBuffer) -> R,
+    ) -> Result<R, XhciError> {
         let g = self.devices.lock();
         let dev = g
             .get(slot_id as usize)
@@ -5405,7 +5438,7 @@ impl Xhci {
         {
             return Err(XhciError::NotReady);
         }
-        Ok(ep.dma_buf.dma_addr().raw())
+        Ok(f(&ep.dma_buf))
     }
 
     /// Compatibility transmit wait. Error or cancellation does not reopen
@@ -5494,6 +5527,22 @@ impl Drop for EndpointConfiguration<'_> {
     }
 }
 
+/// Endpoint-array index for a DCI. xHCI §4.8.1 encodes
+/// DCI = (endpoint number × 2) + (1 if IN else 0); DCI 1 is the
+/// default control endpoint (its state lives on the device, not in
+/// `eps`), so transfer endpoints are DCI 2..=31 and `eps` is
+/// indexed `dci - 2`. A raw `saturating_sub(2)` would silently map
+/// DCI 0 — and DCI 1 — onto DCI 2's ring state and doorbell
+/// target instead of failing (#886 F4). Rejected with the same
+/// invalid-argument code `begin_bulk` uses for an out-of-range DCI.
+fn dci_ep_index(dci: u8) -> Result<usize, XhciError> {
+    if (2..=31).contains(&dci) {
+        Ok(usize::from(dci - 2))
+    } else {
+        Err(XhciError::CmdFailed(0xF9))
+    }
+}
+
 fn enqueue_normal_on(tr: &DmaBuffer, pcs: &mut u32, enq: &mut usize, phys: u64, len: u32) -> u64 {
     // Slot CTRL_TR_TRBS-1 is the Link TRB planted at ring
     // construction. When enq reaches it, follow the link:
@@ -5567,25 +5616,21 @@ fn enqueue_isoch_on(tr: &DmaBuffer, pcs: &mut u32, enq: &mut usize, phys: u64, l
     }
     let trb_off = (*enq * 16) as u64;
     let trb_addr = tr.dma_addr().raw() + trb_off;
-    // Isoch TRB d3 (§6.4.1.3):
-    //   bit 0 = cycle (matches pcs)
-    //   bit 5 = IOC (interrupt on completion)
-    //   bits 10-15 = TRB Type (5 = Isoch)
-    //   bit 31 = SIA (Start Isochronous ASAP)
-    // TBC (bits 7-8), TLBPC (bits 16-19), Frame ID (bits 20-30)
-    // all stay 0.
-    let d3 = (TRB_TYPE_ISOCH << TRB_TYPE_SHIFT) | TRB_IOC | TRB_SIA | (*pcs & TRB_CYCLE_BIT);
+    // TRB words from the pure encoder (xHCI 1.2 §6.4.1.3), pinned
+    // by the isoch tests — same words the branch's
+    // `ep_enqueue_isoch` wrote before #1703's free-fn split.
+    let words = Xhci::isoch_trb_words(phys, len, *pcs);
     // SAFETY: identity-mapped DMA; offset in-page.
     unsafe {
-        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off), phys as u32);
-        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 4), (phys >> 32) as u32);
-        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 8), len);
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off), words[0]);
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 4), words[1]);
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 8), words[2]);
     }
     tr.sync(trb_off as usize, 16);
     device_dma_barrier();
     // SAFETY: same.
     unsafe {
-        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 12), d3);
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 12), words[3]);
     }
     compiler_fence(Ordering::SeqCst);
     tr.sync(trb_off as usize, 16);
