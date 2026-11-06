@@ -256,9 +256,16 @@ struct SessionNet {
 /// DSS payloads are service-defined byte streams (modem logs, NMEA,
 /// ...); the NTB datagram is transport framing only, so RX flattens
 /// datagrams into a per-datagram queue the port drains in order.
+/// `active` tracks the modem-side MBIM_CID_DSS_CONNECT state: the
+/// stream is active between `activate_dss_stream` and
+/// `deactivate_dss_stream`. An inactive stream's port goes stale
+/// (send/recv fail `NotReady`, RX is dropped + counted) but the
+/// registry port itself is never removed, and re-activation flips
+/// the same stream — and its port — active again.
 struct DssStream {
     session: u8,
     queue: Vec<Vec<u8>>,
+    active: bool,
 }
 
 /// One registered bearer (one modem data channel).
@@ -455,7 +462,12 @@ impl WwanPort for DssStreamPort {
             let Some(rec) = g.get_mut(self.bearer) else {
                 return Err(WwanError::NotReady);
             };
-            if rec.detached || !rec.dss_streams.iter().any(|s| s.session == self.session) {
+            if rec.detached
+                || !rec
+                    .dss_streams
+                    .iter()
+                    .any(|s| s.session == self.session && s.active)
+            {
                 return Err(WwanError::NotReady);
             }
             let seq = rec.next_sequence;
@@ -474,7 +486,7 @@ impl WwanPort for DssStreamPort {
         let Some(stream) = rec
             .dss_streams
             .iter_mut()
-            .find(|s| s.session == self.session)
+            .find(|s| s.session == self.session && s.active)
         else {
             return Err(WwanError::NotReady);
         };
@@ -494,16 +506,16 @@ impl WwanPort for DssStreamPort {
 
 /// Register a DSS stream port for `(bearer, session)`, idempotent:
 /// re-registering returns the existing port name without duplicating
-/// the port or the stream. Port name: `wwan{bearer}dss{session}`.
+/// the port or the stream — and re-activates an inactive stream, so
+/// a deactivated stream's port works again after re-activation.
+/// Port name: `wwan{bearer}dss{session}`.
 ///
-/// This is the DATAPATH half of #1143 only. It does not activate
-/// anything on the modem: the MBIM_CID_DSS_CONNECT command values
-/// (service UUID, CID, payload layout) did not ground from any
-/// source reachable for this lane (MBIM 1.0 §10.5.38 text and
-/// libmbim's mbim-cid.h/mbim-uuid.h DSS entries were both
-/// unobtainable), so no connect command is built here rather than
-/// a guessed one. A stream registered here still demultiplexes
-/// device-initiated DSS traffic correctly.
+/// This is the DATAPATH half of #1143: it registers the port but
+/// does not activate anything on the modem. The full activation —
+/// MBIM_CID_DSS_CONNECT (DSS service UUID `MBIM_UUID_DSS`, CID 1,
+/// 24-byte MBIM_DSS_CONNECT, MBIM 1.0 §10.5.38, verified against
+/// libmbim 1.31.2) — is [`activate_dss_stream`]. A stream registered
+/// here still demultiplexes device-initiated DSS traffic correctly.
 pub fn register_dss_stream(bearer: usize, session: u8) -> Result<String, WwanError> {
     let name = alloc::format!("wwan{}dss{}", bearer, session);
     {
@@ -512,12 +524,14 @@ pub fn register_dss_stream(bearer: usize, session: u8) -> Result<String, WwanErr
         if rec.detached {
             return Err(WwanError::NotReady);
         }
-        if rec.dss_streams.iter().any(|s| s.session == session) {
+        if let Some(stream) = rec.dss_streams.iter_mut().find(|s| s.session == session) {
+            stream.active = true;
             return Ok(name);
         }
         rec.dss_streams.push(DssStream {
             session,
             queue: Vec::new(),
+            active: true,
         });
     }
     crate::register_port(Arc::new(DssStreamPort {
@@ -526,6 +540,48 @@ pub fn register_dss_stream(bearer: usize, session: u8) -> Result<String, WwanErr
         name: name.clone(),
     }));
     Ok(name)
+}
+
+/// Activate a DSS stream: issue MBIM_CID_DSS_CONNECT (activate) for
+/// (`link`, `session`) on the modem, then register the stream port
+/// that receives its datagrams.
+///
+/// On any failure — including the modem refusing the connect with a
+/// non-success MBIM_STATUS — no port is registered; the error names
+/// the modem's status code. (If registration itself fails after a
+/// successful connect, the modem link stays active with no consumer
+/// and its RX datagrams are dropped + counted — the same shape as
+/// [`activate_session`]'s publish failure.)
+pub async fn activate_dss_stream<T: crate::session::MbimTransport>(
+    modem: &mut MbimModem<T>,
+    bearer: usize,
+    link: &crate::mbim::MbimUuid,
+    session: u8,
+) -> Result<String, WwanError> {
+    modem.dss_connect(link, session as u32).await?;
+    register_dss_stream(bearer, session)
+}
+
+/// Deactivate a DSS stream: modem disconnect, then mark the stream
+/// inactive so its registry port goes stale (send/recv fail
+/// `NotReady`, RX is dropped + counted) without removing the port
+/// itself — the same registered-but-stale state a detached modem's
+/// port reports. Re-activation flips the same stream active again.
+pub async fn deactivate_dss_stream<T: crate::session::MbimTransport>(
+    modem: &mut MbimModem<T>,
+    bearer: usize,
+    link: &crate::mbim::MbimUuid,
+    session: u8,
+) -> Result<(), WwanError> {
+    modem.dss_disconnect(link, session as u32).await?;
+    let mut g = BEARERS.lock();
+    if let Some(rec) = g.get_mut(bearer) {
+        if let Some(stream) = rec.dss_streams.iter_mut().find(|s| s.session == session) {
+            stream.active = false;
+            stream.queue.clear();
+        }
+    }
+    Ok(())
 }
 
 /// The `SendCtxFn` trampoline for every MBIM session netdev. The
@@ -601,7 +657,11 @@ pub fn deliver_ntb(bearer: usize, ntb: &[u8]) -> Result<(), WwanError> {
         if let NdpStream::Dss(session) = dg.stream {
             let mut g = BEARERS.lock();
             if let Some(rec) = g.get_mut(bearer) {
-                if let Some(stream) = rec.dss_streams.iter_mut().find(|s| s.session == session) {
+                if let Some(stream) = rec
+                    .dss_streams
+                    .iter_mut()
+                    .find(|s| s.session == session && s.active)
+                {
                     stream.queue.push(dg.data.to_vec());
                 } else {
                     rec.dropped_dss_no_consumer_rx += 1;
