@@ -3368,9 +3368,32 @@ chip diagnostic (no firmware owner is built for it yet).
   transcribed verbatim via generator + independent checker. Firmware
   image name `rtlwifi/rtl8192defw.bin`. Per-function EFUSE identity
   (function 0 / 1 → MAC offsets `0x55` / `0x5b`) already lives in
-  `efuse.rs`. Still open: power-on sequence, firmware header parse +
-  transport admission, station chains, bands/HT/QoS/lifecycle, signed
-  envelope, TX-power levels.
+  `efuse.rs`. Steps 2–4 delivered the firmware header parse + paged
+  download + transport admission (`run_8192de`), the signed NAPC
+  envelope (2.4 GHz, v1/v2), the packet owner and descriptors, the
+  power-on sequence + MAC init, the station chains, bands/HT/QoS/
+  lifecycle, the TX-power levels and the DE factory table
+  (`txpower::linux_indices`, `phy::PgStore`). Step 5 completes the
+  envelope: NAPC v3 rows carry four curves (CCK, OFDM, HT MCS0-7,
+  HT MCS8-15) on both bands (`rtl8192de-cal-v3-<mac>.bin`, loaded
+  before v2/v1; v1/v2 parsing unchanged), with the 5 GHz row plan
+  taken from `channel::CHANNEL_ALL[59]` — 45 × 20 MHz primaries plus
+  the +/-2 pairing at 40 MHz (42 above, 42 below; 154 v3 rows total
+  with the 2.4 GHz plan) — strictly ordered by (band, bandwidth,
+  offset, channel), and 5 GHz rows leaving the CCK curve unmeasured
+  (mirroring rtl8821ae). `permission_for` requires every legacy rate
+  of the band (CCK + OFDM + MCS0-7 on 2.4 GHz, OFDM + MCS0-7 on
+  5 GHz); MCS8-15 are admitted when measured, never required, and
+  `ht::two_stream` admits local two-stream TX only on `RF_2T2R`
+  (dual-dual 1T1R functions never transmit two streams). The 5 GHz
+  ceiling is the spanning-rule ceiling capped by the `regd.c`
+  5140-5360 / 5460-5860 MHz 30 dBm blocks (DFS/NO_IR/indoor rules
+  refuse); `domain_ceiling` stays 2.4 GHz-only. Still open:
+  `Prepared::Chip::Rtl8192de` integration + the production
+  `rtl92de_hw_init` orchestrator, AMPDU aggregation / RDG/HTC / LPS
+  hardware sequence numbers / encryption sectype / TX-report requests
+  / multi-station rate-id / MAC-id, card disable / power-off adapter,
+  and the H2C rate-mask send.
 
 ## 4. Invariants
 

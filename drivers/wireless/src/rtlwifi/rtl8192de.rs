@@ -15,9 +15,10 @@
 //! table [`rate`], the H2C mailbox [`h2c`]), bands/HT/QoS/lifecycle
 //! ([`channel`], [`lifecycle`]), the TX-power levels ([`txpower`]) and
 //! the DE factory table ([`phy::PgStore`]) plus the BB/RF access they
-//! need ([`phy`]). It is not admitted yet (probe keeps it diagnostic); the
-//! 5 GHz envelope rows + 2SS HT rates, the `Prepared` integration and the
-//! production `rtl92de_hw_init` orchestrator are remainders.
+//! need ([`phy`]). Step 5 adds the 5 GHz envelope rows (NAPC v3) and
+//! the 2SS HT rates ([`ht`]). It is not admitted yet (probe keeps it diagnostic); the
+//! `Prepared` integration and the production `rtl92de_hw_init`
+//! orchestrator are remainders.
 //!
 //! Per-function EFUSE identity already lives in-tree: `efuse.rs` maps
 //! function 0 / 1 to MAC offsets `0x55` / `0x5b` (497 physical bytes, 256
@@ -47,6 +48,8 @@
 //!   check-BSSID, BSSID, basic rate, AID, beacon registers, interrupt
 //!   mask, suspend/resume, and the `set_hw_reg` / `get_hw_reg` cases.
 //! - [`rate`] — the station rate table (`REG_ARFR0`).
+//! - [`ht`] — the HT station profile: MCS8-15 two-stream admission
+//!   (`two_stream`), gated on the envelope permission and `RF_2T2R`.
 //! - [`h2c`] — the host-to-firmware mailbox + join-bss report.
 //! - [`channel`] — bands, channel switching, bandwidth mode, the
 //!   BB/RF band-switch configuration.
@@ -61,6 +64,7 @@ pub mod channel;
 pub mod envelope;
 pub mod fw;
 pub mod h2c;
+pub mod ht;
 pub mod lifecycle;
 pub mod llt;
 pub mod mac;
