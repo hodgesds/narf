@@ -473,10 +473,7 @@ impl FixtureState {
                 self.tuning_count += 1;
                 if !self.tuning_never && self.tuning_count >= self.tuning_iters {
                     let hc2 = self.get16(REG_HOST_CONTROL_2);
-                    self.set16(
-                        REG_HOST_CONTROL_2,
-                        (hc2 & !HC2_EXEC_TUNING) | HC2_TUNED_CLK,
-                    );
+                    self.set16(REG_HOST_CONTROL_2, (hc2 & !HC2_EXEC_TUNING) | HC2_TUNED_CLK);
                 }
                 nis |= NIS_BUFFER_READ_READY | NIS_TRANSFER_COMPLETE;
             }
