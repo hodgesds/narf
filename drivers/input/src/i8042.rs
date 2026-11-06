@@ -34,7 +34,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_arch::x86_64::io_port::{inb, outb};
 use narf_input::{
-    evdev::{dispatch_key_to_node, key, led, DeviceCaps, DeviceNode, ROUTER},
+    evdev::{dispatch_key_to_node, key, led, DeviceCaps, DeviceId, DeviceNode, ROUTER},
     push_key, KeyCode,
 };
 
@@ -123,6 +123,13 @@ pub static STATE: State = State::new();
 
 /// Evdev `DeviceNode` for the i8042 keyboard. Registered in `init()`.
 static KBD_EVDEV_NODE: narf_lib::sync::IrqSafeSpinLock<Option<Arc<DeviceNode>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Evdev id of the registered keyboard node, if any. `init()`
+/// used to discard it (`let (_dev_id, node)`), so no production
+/// path could ever unregister the keyboard — the re-probe hook
+/// (issue #771) needs it.
+static KBD_EVDEV_ID: narf_lib::sync::IrqSafeSpinLock<Option<DeviceId>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Cached raw pointer to the DeviceNode for lock-free IRQ access.
@@ -451,10 +458,11 @@ pub unsafe fn init() -> Result<(), InitError> {
     caps.add_led(led::LED_CAPSL);
     caps.add_led(led::LED_SCROLLL);
     let _ = key::KEY_A; // ensure import is used
-    let (_dev_id, node_arc) = ROUTER.register_device(caps);
+    let (dev_id, node_arc) = ROUTER.register_device(caps);
     node_arc.set_led_sink(on_led_state);
     KBD_NODE_PTR.store(Arc::as_ptr(&node_arc) as *mut DeviceNode, Ordering::Release);
     *KBD_EVDEV_NODE.lock() = Some(node_arc);
+    *KBD_EVDEV_ID.lock() = Some(dev_id);
 
     Ok(())
 }
@@ -556,6 +564,69 @@ pub fn register_device_pm() {
 /// Return the evdev `DeviceNode` for the i8042 keyboard if registered.
 pub fn kbd_evdev_node() -> Option<Arc<DeviceNode>> {
     KBD_EVDEV_NODE.lock().clone()
+}
+
+/// Unregister the stale keyboard node (if any) and clear the
+/// probe state, so a fresh `init()` re-probes the controller.
+/// Shared by `reprobe()` and the test hook below — this is the
+/// half of re-probe that does not touch the I/O ports.
+fn drop_stale_registration() {
+    if let Some(id) = KBD_EVDEV_ID.lock().take() {
+        ROUTER.unregister_device(id);
+    }
+    *KBD_EVDEV_NODE.lock() = None;
+    KBD_NODE_PTR.store(core::ptr::null_mut(), Ordering::Release);
+    // A power-cycled keyboard forgets its LED state and any
+    // half-decoded escape sequence; the fresh probe starts clean.
+    *LED_TX.lock() = LedTx::new();
+    STATE.extended.store(false, Ordering::Release);
+    STATE.e1_stage.store(E1_IDLE, Ordering::Release);
+    STATE.initialized.store(false, Ordering::Release);
+}
+
+/// Re-probe the PS/2 keyboard channel after boot (issue #771).
+/// The boot probe runs once and never revisits the ports; a
+/// keyboard power-cycled by the EC (or a docked/undocked one)
+/// stays dead until this runs. Unregisters the stale evdev node
+/// first — the device is gone, so its node must go with it
+/// (router + sysfs, via the router's `Removed` hook) — then
+/// re-runs the full `init()` probe, which registers a fresh node
+/// on success. A failed probe leaves no node behind and leaves
+/// `initialized` clear, so a later re-probe can retry.
+///
+/// # Safety
+/// Same contract as `init()`: the caller must ensure no other
+/// agent is concurrently driving the 8042 ports, and must call
+/// from task context, never IRQ context. Note IRQ 1 is already
+/// routed (unlike at boot): a scancode arriving mid-probe may be
+/// consumed by a probe wait — treated as a missing ACK, which
+/// fails that probe step but still registers a node — or decoded
+/// normally by the IRQ handler. Either way no key is duplicated.
+///
+/// REMAINDER: held-modifier state is not cleared — a key held
+/// across the power-cycle still reads as held until its release
+/// arrives (or never arrives, if the keyboard forgot it).
+pub unsafe fn reprobe() -> Result<(), InitError> {
+    drop_stale_registration();
+    // SAFETY: same exclusive-port-ownership contract as `init`;
+    // the caller upholds it.
+    unsafe { init() }
+}
+
+/// Test hook: seed a keyboard registration the way `init()` does,
+/// so fixtures can exercise the re-probe bookkeeping without
+/// touching the I/O ports.
+#[doc(hidden)]
+pub fn __seed_kbd_registration_for_test(id: DeviceId, node: Arc<DeviceNode>) {
+    KBD_NODE_PTR.store(Arc::as_ptr(&node) as *mut DeviceNode, Ordering::Release);
+    *KBD_EVDEV_NODE.lock() = Some(node);
+    *KBD_EVDEV_ID.lock() = Some(id);
+}
+
+/// Test hook: run exactly the unregister half of `reprobe()`.
+#[doc(hidden)]
+pub fn __drop_stale_kbd_registration_for_test() {
+    drop_stale_registration();
 }
 
 // ── Keyboard LED output (PS/2 Set LEDs, command 0xED) ────────────
@@ -922,4 +993,11 @@ pub fn __reset_for_test() {
     narf_input::__reset_modifiers_for_test();
     *LED_TX.lock() = LedTx::new();
     LED_TX_LOG.lock().clear();
+    // Seeded registrations are fixture-owned: the fixture that
+    // seeds one unregisters it via the drop hook. Clear the
+    // cached pointer here so a later decode test cannot dispatch
+    // into a fixture node.
+    KBD_NODE_PTR.store(core::ptr::null_mut(), Ordering::Release);
+    *KBD_EVDEV_NODE.lock() = None;
+    *KBD_EVDEV_ID.lock() = None;
 }

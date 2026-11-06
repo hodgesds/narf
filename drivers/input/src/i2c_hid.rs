@@ -156,6 +156,50 @@ impl From<I2cError> for I2cHidError {
     }
 }
 
+/// Bounded retry policy for I2C-HID bring-up and recovery (issue
+/// #771). Every bound below is grounded in an in-tree precedent,
+/// not invented here:
+///
+/// * `max_attempts = 3` — USB CCID's `MAX_RETRIES = 3`
+///   (`drivers/usb/src/ccid.rs`): the tree's standing bound for
+///   "transient bus errors before escalating".
+/// * Backoff shape — start 100 ms, double per attempt, cap
+///   30 000 ms — the i40e port-recovery loop
+///   (`drivers/net/i40e/src/i40e/runtime.rs`).
+///
+/// The pump's report-loop recovery (`PumpRecovery`, in
+/// `i2c_hid_bind`) reuses the same shape: transient bus errors
+/// back off, then escalate to RESET, then give up boundedly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Total attempts per operation (first try + retries).
+    pub max_attempts: u32,
+    /// Backoff before the first retry; doubled per attempt.
+    pub base_backoff_ms: u64,
+    /// Cap on any single backoff.
+    pub max_backoff_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_backoff_ms: 100,
+            max_backoff_ms: 30_000,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Backoff before retry number `attempt` (0-based: 0 is the
+    /// wait after the first failure). Doubling, saturating, capped
+    /// — the i40e shape.
+    pub fn backoff_ms(&self, attempt: u32) -> u64 {
+        let doubled = self.base_backoff_ms.saturating_mul(1u64 << attempt.min(62));
+        doubled.min(self.max_backoff_ms)
+    }
+}
+
 /// One HID-over-I2C device sitting on an I2C bus at a 7-bit slave
 /// address. Cheap to construct; the real work happens in `start()`
 /// (descriptor read + RESET + protocol bring-up).
@@ -223,6 +267,51 @@ impl I2cHidDriver {
         // Reset took too long — surface as a bus timeout. Caller
         // typically retries once before giving up on the device.
         Err(I2cHidError::Bus(I2cError::Timeout))
+    }
+
+    /// RESET with bounded retry + backoff (issue #771). Attempts
+    /// `reset()` up to `policy.max_attempts` times, sleeping
+    /// `policy.backoff_ms(attempt)` between attempts. Returns the
+    /// first success, or the last error once the budget is spent.
+    /// A device that cannot RESET after this is wedged; callers
+    /// must not loop on it forever.
+    pub async fn reset_with_retry(&self, policy: &RetryPolicy) -> Result<(), I2cHidError> {
+        let mut last_err = I2cHidError::Bus(I2cError::Timeout);
+        for attempt in 0..policy.max_attempts.max(1) {
+            match self.reset().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < policy.max_attempts.max(1) {
+                        narf_time::sleep_ms(policy.backoff_ms(attempt)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Full bring-up: descriptor read + RESET (bounded retry) +
+    /// POWER_ON. Returns the descriptor on success.
+    ///
+    /// SET_POWER failure is best-effort: some devices ignore it
+    /// and still report, so a failed POWER_ON is logged and does
+    /// not fail bring-up (pre-#771 behaviour preserved). A
+    /// descriptor or RESET failure fails bring-up — a device that
+    /// cannot be identified or reset cannot be driven, and the
+    /// caller must give up boundedly rather than limp on with a
+    /// wedged device.
+    pub async fn bring_up(&mut self, policy: &RetryPolicy) -> Result<HidDescriptor, I2cHidError> {
+        let desc = self.read_descriptor().await?;
+        self.reset_with_retry(policy).await?;
+        if let Err(e) = self.set_power(POWER_ON).await {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i2c-hid: SET_POWER(ON) failed ({:?}); continuing, device may stay asleep",
+                e
+            );
+        }
+        Ok(desc)
     }
 
     /// Read one input report into `buf`. Returns the number of bytes
@@ -448,14 +537,22 @@ async fn write_command(
 impl Driver for I2cHidDriver {
     fn start<'a>(&'a mut self, _env: DriverEnv<'a>) -> DriverFuture<'a> {
         Box::pin(async move {
-            // Read descriptor first; without it we can't talk to
-            // any of the operating registers.
-            let _ = self.read_descriptor().await;
-            // Then RESET to a known state. Failure is logged and
-            // swallowed — the input-pump task can retry later.
-            let _ = self.reset().await;
-            // Power up explicitly. Some devices ship asleep.
-            let _ = self.set_power(POWER_ON).await;
+            // Bring-up is bounded-retry now (issue #771): the old
+            // code swallowed a single-shot RESET failure silently.
+            // The trait contract returns `()` so a terminal
+            // failure is logged, not returned — the pump path
+            // (`i2c_hid_bind`) is the live bring-up and does get
+            // the error.
+            match self.bring_up(&RetryPolicy::default()).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  i2c-hid: bring-up failed after bounded retries ({:?}); device not started",
+                        e
+                    );
+                }
+            }
         })
     }
 
