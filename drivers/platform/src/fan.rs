@@ -846,7 +846,7 @@ pub fn decode_dt_pwm_fan(blob: &[u8], path: &str) -> Option<PwmFanDesc> {
         if found {
             return;
         }
-        if node_path_string(&node_path) != path {
+        if node_path_string(node_path) != path {
             return;
         }
         found = true;
