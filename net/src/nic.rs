@@ -140,7 +140,7 @@ pub struct TrafficSchedule {
 
 /// Linux `IGC_MAX_RXNFC_RULES` (igc.h): 16 MAC + 8 ethertype + 32 flex
 /// + 8 VLAN-priority + 1 default-queue rule. The location space is 65
-/// even though each hardware table behind it is smaller.
+///   even though each hardware table behind it is smaller.
 pub const MAX_RXNFC_RULES: u16 = 65;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
