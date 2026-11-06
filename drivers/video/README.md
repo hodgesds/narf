@@ -13,8 +13,17 @@ The crate targets the integrated camera ISPs that appear on current
 x86 laptops: Intel IPU3 (Skylake-era pixel visual core), Intel IPU6
 across its Tiger Lake through Meteor Lake variants (each with its own
 firmware blob name), and the AMD MP2 ISP. Each is matched by PCI ID
-and carries its firmware-name constants. Alongside the ISPs are
-drivers for the MIPI-CSI camera sensors those pipelines drive — Sony
+and carries its firmware-name constants — but none of them is a
+driver yet: every ISP probe declines its devices with
+`ProbeError::NotForThisDriver` before touching the hardware
+(`#811`, honest probe refusal instead of placeholder registration),
+so no ISP is ever recorded as bound and no video node is registered
+for one. The PCI matches stay registered so the refusal itself is
+observable (each probe logs its per-platform reason on boot), and
+the declined device stays available to the next claimant — for the
+MP2 IDs that is the AMD SFH sensor-hub driver (arbitration tracked
+in #1046, untouched here). Alongside the ISPs are drivers for the
+MIPI-CSI camera sensors those pipelines drive — Sony
 IMX219 and several OmniVision parts (OV01A1S, OV02C10, OV05C10) —
 behind a common CSI-2 sensor-driver interface, plus a USB Video Class
 (UVC) driver for ordinary USB webcams (descriptor parsing, format and
@@ -29,11 +38,18 @@ it.
 This is an early-stage scaffold. Stage 0 established the crate skeleton
 — PCI ID tables, firmware-name constants, buffer-queue and
 pixel-format types, and the sensor trait — and Stage 1 added PCI probe
-registration, BAR mapping, firmware-name resolution, and the
-bound-driver record. The heavier work is deferred: firmware load over
+registration. The ISP probes register their PCI matches and then
+decline every device honestly (#811): no BAR mapping, no PCI
+command enable, no bound-driver record, no video node. Each
+platform's refusal carries its own reason (IPU6 names the variant
+and the firmware blob with no loader, IPU3 names the missing CSS
+pipeline, MP2 names the generation and the missing SFH IPC
+bring-up), so coverage inventories stop counting the ISPs as
+drivers. The heavier work is deferred: firmware load over
 the PSP/CSE paths, MIPI-CSI receiver bring-up, per-sensor I2C
 configuration, the DMA scatter-gather ring, and the full V4L2 buffer
-dequeue path.
+dequeue path — all pending Daniel's hardware confirmation that the
+internal webcams are ISP-attached at all (#811).
 
 The crate is `no_std`. It depends on the driver runtime and
 `narf-bus`/`narf-drivers` for the device model, `narf-drivers-i2c` for

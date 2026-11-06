@@ -1,4 +1,21 @@
-//! Intel IPU3 (Pixel Visual Core) driver scaffold — Stage-0/1.
+//! Intel IPU3 (Pixel Visual Core) — explicit refusal marker (#811).
+//!
+//! The IPU3 CSS pipeline bring-up is NOT implemented: there is no
+//! CSS pipeline programming, no IMGU DMA pool, and no IRQ arming.
+//! Probe therefore declines the IPU3 device with
+//! `ProbeError::NotForThisDriver` *before touching the hardware* (no
+//! PCI command enable, no BAR0 map, no bound-driver record, no video
+//! node), so the device is never presented as bound and stays
+//! available to the next claimant in the bus arbitration walk
+//! (bus spec §9.3). This replaces the earlier probe-shaped stub,
+//! which mapped BAR0, recorded a bound driver, and logged "probed"
+//! for a camera that could never stream.
+//!
+//! Per-platform scoping lives in [`refusal_reason`]. The CSS
+//! micro-firmware is embedded in the driver (there is no separate
+//! blob to load), so the missing piece here is the pipeline itself,
+//! not a firmware loader — unlike IPU6/MP2. Full CSS bring-up is
+//! out of scope here; it needs Daniel's hardware confirmation (#811).
 //!
 //! ## Reference (Linux GPL, post 2026-05-20 relicense)
 //!
@@ -13,20 +30,14 @@
 //! |--------|--------|----------------------|
 //! | 0x8086 | 0x1919 | Skylake-Y / Skylake-U |
 //!
-//! ## Stage-1 scope
+//! ## Deferred (Stage-2, needs hardware confirmation)
 //!
-//! 1. Claim the PCIe device (exact VID:DID match).
-//! 2. Map BAR0 (IMGU register window).
-//! 3. Resolve firmware name (IPU3 has no separate user-loaded FW;
-//!    the CSS micro-firmware is embedded in the driver).
-//! 4. Record a bound-driver entry so observability can enumerate it.
-//!
-//! No CSS pipeline programming, ISP register writes, or DMA rings
-//! are attempted at this stage.
+//! CSS pipeline programming, ISP register writes, and DMA rings.
+//! Until then probe refuses (see above) and the [`Camera`] methods
+//! below are unreachable — no instance can exist without a
+//! successful probe.
 
-extern crate alloc;
-
-use narf_driver_runtime::{map_bar, BusDevice, BusDeviceCap, Cap, Write};
+use narf_driver_runtime::{BusDevice, BusDeviceCap, Cap, Write};
 
 use crate::{BufferQueue, Camera, CameraError, PixelFormat, Result};
 
@@ -43,9 +54,24 @@ pub const IPU3_DID: u16 = 0x1919;
 /// PCI ID table entry for registration/testing.
 pub const PCI_IDS: &[(u16, u16)] = &[(INTEL_VENDOR, IPU3_DID)];
 
-/// BAR index for the IMGU register window.
-/// Linux: `ipu3.c` references `pci_resource_start(pdev, 0)`.
-const BAR_REGS: u8 = 0;
+// ── Refusal reason (per-platform scoping, #811) ───────────────────
+
+/// Why probe refuses the IPU3 device ID.
+///
+/// Returns `None` for any other device ID. Unlike IPU6/MP2 there
+/// is no firmware blob to name: the CSS micro-firmware is embedded
+/// in the driver, and the missing piece is the CSS pipeline and
+/// IMGU DMA pool to run it through.
+pub fn refusal_reason(did: u16) -> Option<&'static str> {
+    if did != IPU3_DID {
+        return None;
+    }
+    Some(
+        "intel-ipu3 (Skylake Y/U): CSS pipeline programming and the \
+         IMGU DMA pool are not implemented, so the embedded CSS \
+         micro-firmware has no pipeline to run through (#811)",
+    )
+}
 
 // ── Firmware ────────────────────────────────────────────────────────
 
@@ -57,6 +83,9 @@ pub const FIRMWARE_NAME: Option<&str> = None;
 // ── Driver state ────────────────────────────────────────────────────
 
 /// Probed IPU3 instance.
+///
+/// Unreachable while [`probe`] refuses: no instance can exist
+/// without a successful probe. Kept as the Stage-2 skeleton.
 #[derive(Debug)]
 pub struct Ipu3 {
     /// Vendor ID from PCI config space (always `INTEL_VENDOR`).
@@ -79,18 +108,20 @@ impl Camera for Ipu3 {
     }
 
     fn set_format(&self, _fmt: PixelFormat, _w: u32, _h: u32) -> Result<()> {
-        // Stage-2: program IPU3 CSS pipeline format. CSS micro-FW
-        // must be loaded first; the `ipu3_css_set_parameters` path
-        // requires a working IMGU DMA pool.
+        // Unreachable while probe refuses (#811): no instance can
+        // exist without the CSS pipeline and IMGU DMA pool.
+        // Stage-2 programs the format via `ipu3_css_set_parameters`.
         Err(CameraError::NotImplemented)
     }
 
     fn start_streaming(&self) -> Result<()> {
-        // Stage-2: arm the IMGU CSS input-system and enable IRQs.
+        // Unreachable while probe refuses (#811). Stage-2 arms the
+        // IMGU CSS input-system and enables IRQs.
         Err(CameraError::NotImplemented)
     }
 
     fn stop_streaming(&self) -> Result<()> {
+        // Unreachable while probe refuses (#811).
         Err(CameraError::NotImplemented)
     }
 }
@@ -101,70 +132,58 @@ static CONTROLLER: narf_lib::sync::IrqSafeSpinLock<Option<Ipu3>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Return `true` if an IPU3 was successfully probed at boot.
+///
+/// Always `false` while probe refuses (#811); kept as the
+/// observable "never bound" predicate for tests and for Stage-2.
 pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
-/// PCI probe entry-point.
+/// PCI probe entry-point — explicit refusal (#811).
+///
+/// Declines the IPU3 device with `ProbeError::NotForThisDriver`
+/// *before touching the hardware*: no PCI command enable, no BAR0
+/// map, no singleton install, no bound-driver record. The bus
+/// dispatcher returns the device to the candidate list so another
+/// driver may claim it (bus spec §9.3). The per-platform reason is
+/// logged so the refusal is visible on boot instead of silent;
+/// unknown IDs decline silently as before.
 ///
 /// # Safety
 ///
 /// Caller must hold exclusive BAR access for the duration of probe
-/// (enforced by the bus framework's ownership model).
+/// (enforced by the bus framework's ownership model). No BAR is
+/// touched while refusing, so this is vacuous today; Stage-2
+/// re-enables the mapping and the contract applies again.
 pub fn probe(
     device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
+    _cap: Cap<BusDeviceCap, Write>,
 ) -> core::result::Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
-        return Ok(());
-    }
     if device.id.vendor != INTEL_VENDOR || device.id.device != IPU3_DID {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
-    // Enable MMIO + bus-master.
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-
-    // Map BAR0: IMGU register window.
-    let regs =
-        // SAFETY: exclusive BAR ownership held by the bus probe contract.
-        unsafe { map_bar(&device, BAR_REGS) }.map_err(|_| narf_bus::ProbeError::BadDevice)?;
-
-    let ipu3 = Ipu3 {
-        vid: device.id.vendor,
-        did: device.id.device,
-        regs,
-        queue: BufferQueue::new(),
-    };
-
-    *CONTROLLER.lock() = Some(ipu3);
-
-    narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("intel-ipu3"),
-        kind: narf_drivers::BoundKind::Media,
-        pci_vid: Some(device.id.vendor),
-        pci_did: Some(device.id.device),
-        domain: narf_drivers::BoundKind::Media.default_domain(),
-    });
+    let reason = refusal_reason(device.id.device).ok_or(narf_bus::ProbeError::NotForThisDriver)?;
 
     {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "  intel-ipu3: probed (0x{:04X}:0x{:04X}), no user firmware blob required",
+            "  intel-ipu3: refusing 0x{:04X}:0x{:04X} — {}",
             device.id.vendor,
             device.id.device,
+            reason,
         );
     }
 
-    Ok(())
+    Err(narf_bus::ProbeError::NotForThisDriver)
 }
 
 /// Register the IPU3 driver with the PCI bus.
+///
+/// The match stays registered so the bus framework routes the IPU3
+/// device to [`probe`], which declines it honestly with the
+/// per-platform reason — removing the match would leave the device
+/// silently unclaimed with no trace of the refusal.
 pub fn register_pci_driver() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {
         name: "intel-ipu3",

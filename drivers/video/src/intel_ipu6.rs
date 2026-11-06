@@ -1,4 +1,20 @@
-//! Intel IPU6 Image Signal Processor driver scaffold — Stage-0/1.
+//! Intel IPU6 Image Signal Processor — explicit refusal marker (#811).
+//!
+//! The IPU6 firmware/CSI bring-up is NOT implemented: there is no CPD
+//! image parser, no firmware load, no ISYS stream configuration, and
+//! no DMA ring. Probe therefore declines every IPU6 device with
+//! `ProbeError::NotForThisDriver` *before touching the hardware* (no
+//! PCI command enable, no BAR0 map, no bound-driver record, no video
+//! node), so the device is never presented as bound and stays
+//! available to the next claimant in the bus arbitration walk
+//! (bus spec §9.3). This replaces the earlier probe-shaped stub,
+//! which mapped BAR0, recorded a bound driver, and logged "probed"
+//! for a camera that could never stream.
+//!
+//! Per-platform scoping lives in [`refusal_reason`]: each variant
+//! gets its own reason naming the platform and the firmware blob
+//! that has no loader yet. Full firmware/CSI bring-up is out of
+//! scope here — it needs Daniel's hardware confirmation (#811).
 //!
 //! ## References (Linux GPL, post 2026-05-20 relicense)
 //!
@@ -18,19 +34,15 @@
 //! | IPU6EP (ADN) | 0x8086 | 0x462E  | Alder Lake-N      | intel/ipu/ipu6epadln_fw.bin |
 //! | IPU6EP (MTL) | 0x8086 | 0x7D19  | Meteor Lake       | intel/ipu/ipu6epmtl_fw.bin |
 //!
-//! ## Stage-1 scope
-//!
-//! 1. Claim the PCIe device (exact VID:DID match per entry above).
-//! 2. Map BAR0 (IPU6 register / MMIO aperture).
-//! 3. Resolve firmware blob name for this device ID and log it.
-//! 4. Record a bound-driver entry.
+//! ## Deferred (Stage-2, needs hardware confirmation)
 //!
 //! Firmware loading requires the IPU6 Complex Peripheral Device (CPD)
-//! image parser (`ipu6-cpd.c`) and is deferred to Stage-2.
+//! image parser (`ipu6-cpd.c`); ISYS/CSI bring-up and the DMA ring
+//! come after it. Until then probe refuses (see above) and the
+//! [`Camera`] methods below are unreachable — no instance can exist
+//! without a successful probe.
 
-extern crate alloc;
-
-use narf_driver_runtime::{map_bar, BusDevice, BusDeviceCap, Cap, Write};
+use narf_driver_runtime::{BusDevice, BusDeviceCap, Cap, Write};
 
 use crate::{BufferQueue, Camera, CameraError, PixelFormat, Result};
 
@@ -121,15 +133,46 @@ impl Ipu6Variant {
     }
 }
 
-// ── BAR layout ───────────────────────────────────────────────────────
+// ── Refusal reason (per-platform scoping, #811) ───────────────────
 
-/// BAR0: IPU6 register window (MMIO).
-/// Source: ipu6.c `pci_iomap(isp->pdev, 0, ...)`.
-const BAR_REGS: u8 = 0;
+/// Why probe refuses this IPU6 device ID, naming the platform and
+/// the firmware blob that has no loader yet.
+///
+/// Returns `None` for unknown device IDs. The reason is the
+/// per-platform scoping contract: the refusal for a Tiger Lake part
+/// must name `ipu6_fw.bin`, not another variant's blob.
+pub fn refusal_reason(did: u16) -> Option<&'static str> {
+    match Ipu6Variant::from_did(did)? {
+        Ipu6Variant::Ipu6 => Some(
+            "intel-ipu6 (Tiger Lake, firmware intel/ipu/ipu6_fw.bin): \
+             no CPD firmware loader and no ISYS/CSI bring-up yet (#811)",
+        ),
+        Ipu6Variant::Ipu6Se => Some(
+            "intel-ipu6 (Jasper Lake SE, firmware intel/ipu/ipu6se_fw.bin): \
+             no CPD firmware loader and no ISYS/CSI bring-up yet (#811)",
+        ),
+        Ipu6Variant::Ipu6Ep => Some(
+            "intel-ipu6 (Alder Lake-P / Raptor Lake-P, firmware intel/ipu/ipu6ep_fw.bin): \
+             no CPD firmware loader and no ISYS/CSI bring-up yet (#811)",
+        ),
+        Ipu6Variant::Ipu6EpAdln => Some(
+            "intel-ipu6 (Alder Lake-N, firmware intel/ipu/ipu6epadln_fw.bin): \
+             no CPD firmware loader and no ISYS/CSI bring-up yet (#811)",
+        ),
+        Ipu6Variant::Ipu6EpMtl => Some(
+            "intel-ipu6 (Meteor Lake, firmware intel/ipu/ipu6epmtl_fw.bin): \
+             no CPD firmware loader and no ISYS/CSI bring-up yet (#811)",
+        ),
+    }
+}
 
 // ── Driver state ─────────────────────────────────────────────────────
 
 /// Probed IPU6 instance.
+///
+/// Unreachable while [`probe`] refuses: no instance can exist
+/// without a successful probe. Kept as the Stage-2 skeleton — when
+/// firmware/CSI bring-up lands, probe constructs this again.
 #[derive(Debug)]
 pub struct Ipu6 {
     /// Vendor ID (always `INTEL_VENDOR`).
@@ -156,17 +199,20 @@ impl Camera for Ipu6 {
     }
 
     fn set_format(&self, _fmt: PixelFormat, _w: u32, _h: u32) -> Result<()> {
-        // Stage-2: program ISYS format via IPU6 firmware IPC.
-        // Requires firmware loaded, ISYS streams configured.
+        // Unreachable while probe refuses (#811): no instance can
+        // exist without firmware loaded and ISYS streams configured.
+        // Stage-2 programs the ISYS format via IPU6 firmware IPC.
         Err(CameraError::NotImplemented)
     }
 
     fn start_streaming(&self) -> Result<()> {
-        // Stage-2: send STREAM_START IPC message to IPU6 firmware.
+        // Unreachable while probe refuses (#811). Stage-2 sends
+        // STREAM_START IPC to the IPU6 firmware.
         Err(CameraError::NotImplemented)
     }
 
     fn stop_streaming(&self) -> Result<()> {
+        // Unreachable while probe refuses (#811).
         Err(CameraError::NotImplemented)
     }
 }
@@ -177,77 +223,59 @@ static CONTROLLER: narf_lib::sync::IrqSafeSpinLock<Option<Ipu6>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Return `true` if an IPU6 was successfully probed at boot.
+///
+/// Always `false` while probe refuses (#811); kept as the
+/// observable "never bound" predicate for tests and for Stage-2,
+/// when a successful probe will set it again.
 pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
-/// Probe function for all IPU6 device IDs.
+/// Probe function for all IPU6 device IDs — explicit refusal (#811).
+///
+/// Declines every known IPU6 device with
+/// `ProbeError::NotForThisDriver` *before touching the hardware*:
+/// no PCI command enable, no BAR0 map, no singleton install, no
+/// bound-driver record. The bus dispatcher returns the device to
+/// the candidate list so another driver may claim it (bus spec
+/// §9.3). The per-platform reason is logged so the refusal is
+/// visible on boot instead of silent; unknown IDs decline silently
+/// as before (they were never this driver's device).
 ///
 /// # Safety
 ///
 /// Exclusive BAR access must be held by the bus probe framework.
+/// No BAR is touched while refusing, so this is vacuous today;
+/// Stage-2 re-enables the mapping and the contract applies again.
 pub fn probe(
     device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
+    _cap: Cap<BusDeviceCap, Write>,
 ) -> core::result::Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
-        return Ok(());
-    }
     if device.id.vendor != INTEL_VENDOR {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
-    let variant =
-        Ipu6Variant::from_did(device.id.device).ok_or(narf_bus::ProbeError::NotForThisDriver)?;
-    let firmware_name =
-        firmware_for(device.id.device).ok_or(narf_bus::ProbeError::NotForThisDriver)?;
-
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-
-    // Map BAR0: IPU6 register window.
-    let regs =
-        // SAFETY: exclusive BAR ownership held by bus probe contract.
-        unsafe { map_bar(&device, BAR_REGS) }.map_err(|_| narf_bus::ProbeError::BadDevice)?;
-
-    let ipu6 = Ipu6 {
-        vid: device.id.vendor,
-        did: device.id.device,
-        variant,
-        firmware_name,
-        regs,
-        queue: BufferQueue::new(),
-    };
-
-    *CONTROLLER.lock() = Some(ipu6);
-
-    narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("intel-ipu6"),
-        kind: narf_drivers::BoundKind::Media,
-        pci_vid: Some(device.id.vendor),
-        pci_did: Some(device.id.device),
-        domain: narf_drivers::BoundKind::Media.default_domain(),
-    });
+    let reason = refusal_reason(device.id.device).ok_or(narf_bus::ProbeError::NotForThisDriver)?;
 
     {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "  intel-ipu6: probed (0x{:04X}:0x{:04X}, variant {:?}), firmware={}",
+            "  intel-ipu6: refusing 0x{:04X}:0x{:04X} — {}",
             device.id.vendor,
             device.id.device,
-            variant,
-            firmware_name,
+            reason,
         );
     }
 
-    Ok(())
+    Err(narf_bus::ProbeError::NotForThisDriver)
 }
 
 /// Register one PCI match entry per known IPU6 device ID.
+///
+/// The matches stay registered so the bus framework routes each
+/// IPU6 device to [`probe`], which declines it honestly with the
+/// per-platform reason — removing the matches would leave the
+/// device silently unclaimed with no trace of the refusal.
 pub fn register_pci_driver() {
     // Register a separate exact-match entry for each known DID so the
     // bus framework can log each one individually in the probe trace.
