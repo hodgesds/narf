@@ -21,6 +21,7 @@ narf-memory       = { path = "../../memory" }
 narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
 narf-input        = { path = "../../input" }
+narf-input-driver = { path = "../input" }
 narf-hid          = { path = "../../hid" }
 narf-interrupts   = { path = "../../interrupts" }
 narf-acpi         = { path = "../../acpi" }

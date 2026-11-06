@@ -57,6 +57,16 @@ pub enum AttachOutcome {
     /// Device bound as a HID Precision Touchpad (PTP). Slot stays
     /// alive; entry was added to `hid::touchpad::TOUCHPADS`.
     Touchpad,
+    /// Device bound as a USB-HID RMI4 / Elan touchpad (Synaptics /
+    /// Elan vendor HID protocols, issue #1681). Slot stays alive;
+    /// entry was added to `hid::rmi_elan::RMI_ELAN_DEVICES`.
+    RmiElanTouchpad,
+    /// Device bound as a generic HID interface — the last-resort
+    /// fallback when no specific HID class driver claimed it, or
+    /// when a vendor probe (RMI/Elan, #1681) failed and fell back.
+    /// Slot stays alive; entry was added to
+    /// `hid::generic::GENERIC_DEVICES`.
+    GenericHid,
     /// Device bound as a HID Consumer Control interface (Usage Page
     /// 0x0C: volume, media transport, brightness, sleep). Slot stays
     /// alive; entry added to `hid::consumer::CONSUMER_DEVICES`.
@@ -767,6 +777,7 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
     hid::keyboard::unregister_keyboard_evdev(controller, slot_id);
     mouse::detach_mouse(controller, slot_id);
     hid::touchpad::unregister_touchpad_evdev(controller, slot_id);
+    hid::rmi_elan::unregister_rmi_elan_evdev(controller, slot_id);
     hid::consumer::detach_consumer(controller, slot_id);
     hid::generic::unregister_generic_evdev(controller, slot_id);
     crate::cdc_acm::detach_acm(controller, slot_id);
@@ -812,7 +823,7 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
 ///
 /// What this drops, exactly: the supervisor-pumped classes are
 /// cleared from their own registries (boot + report keyboards,
-/// mouse, touchpad, consumer, generic, ACM, xpad), every bound
+/// mouse, touchpad, RMI/Elan touchpad, consumer, generic, ACM, xpad), every bound
 /// MSC device is removed from `MSC_DEVICES` and unpublished via
 /// `msc::unbind_all_msc`, every bound fingerprint reader (including
 /// WBDI-bridged sensors) is removed and unpublished via
@@ -841,6 +852,7 @@ pub fn detach_all_bindings(controller: u8) {
     hid::keyboard::unregister_all_keyboards(controller);
     mouse::clear_mice(controller);
     hid::touchpad::unregister_all_touchpads(controller);
+    hid::rmi_elan::unregister_all_rmi_elan(controller);
     hid::consumer::clear_consumers(controller);
     hid::generic::unregister_all_generic(controller);
     crate::cdc_acm::clear_acm(controller);
@@ -1092,6 +1104,27 @@ async fn dispatch_after_address(
             {
                 return AttachOutcome::Touchpad;
             }
+        }
+        // USB-HID RMI4 / Elan touchpad — Synaptics / Elan silicon
+        // that speaks the vendor RMI4-over-HID / Elan HID protocols
+        // instead of PTP (issue #1681). VID/PID-classified; runs
+        // after PTP so a PTP-shaped device keeps its PTP bind, and
+        // a failed vendor probe falls back to generic HID inside
+        // the binder, so the device is never dropped here.
+        if let Ok(outcome) = hid::rmi_elan::try_bind_rmi_elan_already_addressed(
+            xhci_dev,
+            slot_id,
+            dev_vid,
+            dev_pid,
+            &cfg_blob,
+            hid::identity::BindTopology {
+                port,
+                hub_port: parent_hub_slot.map(|slot| (slot, port)),
+            },
+        )
+        .await
+        {
+            return outcome;
         }
         // HID Consumer Control — Usage Page 0x0C (volume / media /
         // brightness). Runs after touchpad (same HID class, different
