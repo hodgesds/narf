@@ -3920,6 +3920,170 @@ kernel_test_in!(
     smoke_i8042_led_exchange_tracks_midflight_change
 );
 
+// ── i8042 device power management (issue #770) ───────────────────
+// The PM hooks touch real ports only when the controller
+// initialised (init() never runs in the harness), so these
+// fixtures pin the port-free contract: registration in the
+// device-PM registry, suspend/resume as a no-op Ok when
+// uninitialised, and the decode/LED/mouse state resume resets.
+// The shared port sequences themselves are the same helpers
+// `init()` already exercises on real hardware.
+
+fn smoke_i8042_pm_registers_in_device_pm() -> TestResult {
+    use crate::i8042;
+    // Isolate the global registry so other suites' entries can't
+    // leak into the count (restored on guard drop).
+    let _guard = narf_power::device_pm::__test_isolate_registry();
+    i8042::register_device_pm();
+    let names: alloc::vec::Vec<alloc::string::String> = narf_power::device_pm::registered_devices()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    if names.iter().filter(|n| n.as_str() == "i8042").count() != 1 {
+        return TestResult::Fail("\"i8042\" must be registered exactly once");
+    }
+    // Re-registration is idempotent on the name.
+    i8042::register_device_pm();
+    if narf_power::device_pm::device_count() != 1 {
+        return TestResult::Fail("re-registering \"i8042\" must not duplicate the entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_pm_registers_in_device_pm);
+
+fn smoke_i8042_pm_suspend_resume_noop_when_uninitialised() -> TestResult {
+    use crate::i8042;
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, KeyCode,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+    crate::i8042_mouse::__reset_for_test();
+
+    // Suspend + resume must succeed with no port I/O when the
+    // controller never initialised.
+    if i8042::pm_suspend().is_err() {
+        return TestResult::Fail("suspend must be Ok when uninitialised");
+    }
+    if i8042::pm_resume().is_err() {
+        return TestResult::Fail("resume must be Ok when uninitialised");
+    }
+
+    // Resume drops a stale E0 latch: 0xE0 fed pre-resume, then
+    // 0x47 post-resume must decode as plain keypad 7, not Home
+    // (E0 0x47).
+    i8042::feed_bytes_for_test(&[0xE0]);
+    if i8042::pm_resume().is_err() {
+        return TestResult::Fail("second resume must be Ok when uninitialised");
+    }
+    i8042::feed_bytes_for_test(&[0x47]);
+    match pop_global() {
+        Some(InputEvent::Key(k)) if k.code == KeyCode::Kp7 && k.pressed => {}
+        _ => return TestResult::Fail("0x47 after resume must decode as Kp7, not Home"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_pm_suspend_resume_noop_when_uninitialised
+);
+
+fn smoke_i8042_pm_resume_parks_inflight_led_exchange() -> TestResult {
+    use crate::i8042;
+    use narf_input::evdev::led;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring};
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    // Start an exchange (Caps Lock on): 0xED written, machine
+    // awaiting its ACK.
+    i8042::on_led_state(1 << led::LED_CAPSL);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED] {
+        return TestResult::Fail("exchange must start with exactly [0xED]");
+    }
+    if i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("exchange must be in flight before resume");
+    }
+    // Resume parks it: the keyboard was reset, so the ACK will
+    // never arrive — the machine must return to Idle instead of
+    // blocking every later LED update.
+    if i8042::pm_resume().is_err() {
+        return TestResult::Fail("resume must be Ok when uninitialised");
+    }
+    if !i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("resume must park the LED exchange at Idle");
+    }
+    // A late ACK byte must NOT be consumed as an LED response
+    // (no data byte written); it falls through to scancode
+    // decode instead.
+    i8042::feed_bytes_for_test(&[0xFA]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED] {
+        return TestResult::Fail("late ACK must not resume the parked exchange");
+    }
+    // The desired bitmap survived the park: a fresh sink call
+    // starts a clean exchange for it.
+    i8042::on_led_state(1 << led::LED_CAPSL);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED] {
+        return TestResult::Fail("fresh exchange must start after the park");
+    }
+    i8042::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_pm_resume_parks_inflight_led_exchange
+);
+
+fn smoke_i8042_pm_resume_drops_partial_mouse_packet() -> TestResult {
+    use crate::i8042;
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, PointerButtons,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    crate::i8042_mouse::__reset_for_test();
+
+    // A complete packet first, to prove the accumulator works.
+    crate::i8042_mouse::feed_byte_for_test(0x09);
+    crate::i8042_mouse::feed_byte_for_test(5);
+    crate::i8042_mouse::feed_byte_for_test(3);
+    if crate::i8042_mouse::take_rel_delta() != (5, -3) {
+        return TestResult::Fail("baseline packet must decode to (5, -3)");
+    }
+    // Split packet: first byte only, then suspend/resume.
+    crate::i8042_mouse::feed_byte_for_test(0x09);
+    if i8042::pm_resume().is_err() {
+        return TestResult::Fail("resume must be Ok when uninitialised");
+    }
+    // Stale deltas are zero and the phase machine is reset: a
+    // fresh full packet decodes cleanly instead of completing
+    // the split one with garbage bytes.
+    if crate::i8042_mouse::take_rel_delta() != (0, 0) {
+        return TestResult::Fail("resume must zero the stale relative deltas");
+    }
+    crate::i8042_mouse::feed_byte_for_test(0x09);
+    crate::i8042_mouse::feed_byte_for_test(5);
+    crate::i8042_mouse::feed_byte_for_test(3);
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != 5 || p.dy != -3 {
+                return TestResult::Fail("post-resume packet must decode to (5, -3)");
+            }
+            if !p.buttons.contains(PointerButtons::LEFT) {
+                return TestResult::Fail("post-resume packet lost the LEFT button bit");
+            }
+        }
+        _ => return TestResult::Fail("post-resume packet produced no PointerEvent"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_pm_resume_drops_partial_mouse_packet
+);
+
 fn smoke_i8042_led_sink_wired_from_core_dispatch() -> TestResult {
     use crate::i8042;
     use narf_input::evdev::{key, led, DeviceCaps, EvdevEvent, EventType, ROUTER};

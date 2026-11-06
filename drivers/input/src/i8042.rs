@@ -207,74 +207,24 @@ fn flush_output() {
     }
 }
 
-/// Initialise the controller and the keyboard. Returns `Ok` once the
-/// keyboard is enabled + scanning. Idempotent.
+/// Re-enable the keyboard channel after the controller is known good:
+/// enable the channel, restore the IRQ + translation config byte,
+/// reset the keyboard, select scancode set 1, enable scanning.
+/// Returns whether the keyboard is genuinely scanning — the same
+/// `scanning_ok` signal `init()` reports via `I8042_KBD_SCANNING_OK`
+/// (a controller that passes self-test with no keyboard behind the
+/// channel is `Ok(false)`, not an error). A timeout in the
+/// controller-side config exchange is an `Err`, matching `init()`.
 ///
-/// # Safety
-/// Caller must ensure no other agent is concurrently driving the
-/// 8042 ports (BSP-only at boot time satisfies this).
-pub unsafe fn init() -> Result<(), InitError> {
-    if STATE.initialized.load(Ordering::Acquire) {
-        return Ok(());
-    }
-
-    // 1. Disable channels so init bytes don't race with stray scancodes.
-    wait_input_clear_ms(CONFIG_WAIT_MS)?;
-    // SAFETY: 0x64 is the cmd port.
-    unsafe {
-        outb(PS2_CMD, CMD_DISABLE_KBD);
-    }
-    wait_input_clear_ms(CONFIG_WAIT_MS)?;
-    // SAFETY: `out` to cmd port `0x64`; CPL0 + the fn's `# Safety`
-    // contract gives us exclusive ownership of the 8042 ports, and
-    // the input buffer was just drained.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    unsafe {
-        outb(PS2_CMD, CMD_DISABLE_AUX);
-    }
-
-    // 2. Drain anything pending.
-    flush_output();
-
-    // 3. Read the config byte, clear translate + IRQs while we configure.
-    wait_input_clear_ms(CONFIG_WAIT_MS)?;
-    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
-    // contract; input buffer cleared by the wait above.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    unsafe {
-        outb(PS2_CMD, CMD_READ_CONFIG);
-    }
-    let mut conf = wait_output_byte_ms(CONFIG_WAIT_MS).ok_or(InitError::Timeout)?;
-    conf &= !(CONF_KBD_TRANSLATE | CONF_KBD_IRQ | CONF_AUX_IRQ);
-    wait_input_clear_ms(CONFIG_WAIT_MS)?;
-    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
-    // contract; input buffer cleared by the wait above.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    unsafe {
-        outb(PS2_CMD, CMD_WRITE_CONFIG);
-    }
-    wait_input_clear_ms(CONFIG_WAIT_MS)?;
-    // SAFETY: `out` to data port `0x60` delivering the config byte
-    // for the WRITE_CONFIG command issued above; CPL0 + exclusive
-    // ownership; input buffer cleared by the wait.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    unsafe {
-        outb(PS2_DATA, conf);
-    }
-
-    // 4. Self-test.
-    wait_input_clear_ms(CONFIG_WAIT_MS)?;
-    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
-    // contract; input buffer cleared by the wait above.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    unsafe {
-        outb(PS2_CMD, CMD_SELF_TEST);
-    }
-    let st = wait_output_byte_ms(CONFIG_WAIT_MS).ok_or(InitError::Timeout)?;
-    if st != 0x55 {
-        return Err(InitError::SelfTestFailed);
-    }
-
+/// Shared verbatim by `init()` (steps 5-6) and `resume()` (#770):
+/// resume re-runs exactly this bring-up instead of a second,
+/// drift-prone copy of the sequence.
+///
+/// Exclusive-access contract (same as `init()`): no other agent
+/// may be driving the 8042 ports concurrently. `resume()` runs
+/// under the device-PM fan-out contract (boot CPU, other CPUs
+/// quiesced); `init()` runs BSP-only at boot.
+fn enable_keyboard_channel() -> Result<bool, InitError> {
     // 5. Re-enable the keyboard channel + arm IRQ 1.
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
@@ -402,6 +352,80 @@ pub unsafe fn init() -> Result<(), InitError> {
     }
 
     narf_input::I8042_KBD_SCANNING_OK.store(scanning_ok, Ordering::Release);
+    Ok(scanning_ok)
+}
+
+/// Initialise the controller and the keyboard. Returns `Ok` once the
+/// keyboard is enabled + scanning. Idempotent.
+///
+/// # Safety
+/// Caller must ensure no other agent is concurrently driving the
+/// 8042 ports (BSP-only at boot time satisfies this).
+pub unsafe fn init() -> Result<(), InitError> {
+    if STATE.initialized.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    // 1. Disable channels so init bytes don't race with stray scancodes.
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: 0x64 is the cmd port.
+    unsafe {
+        outb(PS2_CMD, CMD_DISABLE_KBD);
+    }
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + the fn's `# Safety`
+    // contract gives us exclusive ownership of the 8042 ports, and
+    // the input buffer was just drained.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        outb(PS2_CMD, CMD_DISABLE_AUX);
+    }
+
+    // 2. Drain anything pending.
+    flush_output();
+
+    // 3. Read the config byte, clear translate + IRQs while we configure.
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
+    // contract; input buffer cleared by the wait above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        outb(PS2_CMD, CMD_READ_CONFIG);
+    }
+    let mut conf = wait_output_byte_ms(CONFIG_WAIT_MS).ok_or(InitError::Timeout)?;
+    conf &= !(CONF_KBD_TRANSLATE | CONF_KBD_IRQ | CONF_AUX_IRQ);
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
+    // contract; input buffer cleared by the wait above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        outb(PS2_CMD, CMD_WRITE_CONFIG);
+    }
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to data port `0x60` delivering the config byte
+    // for the WRITE_CONFIG command issued above; CPL0 + exclusive
+    // ownership; input buffer cleared by the wait.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        outb(PS2_DATA, conf);
+    }
+
+    // 4. Self-test.
+    wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
+    // contract; input buffer cleared by the wait above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        outb(PS2_CMD, CMD_SELF_TEST);
+    }
+    let st = wait_output_byte_ms(CONFIG_WAIT_MS).ok_or(InitError::Timeout)?;
+    if st != 0x55 {
+        return Err(InitError::SelfTestFailed);
+    }
+
+    // 5-6. Re-enable the keyboard channel + reset the keyboard.
+    // Shared with `resume()`; see `enable_keyboard_channel`.
+    enable_keyboard_channel()?;
     STATE.initialized.store(true, Ordering::Release);
 
     // Register the i8042 keyboard as an evdev device.
@@ -433,6 +457,100 @@ pub unsafe fn init() -> Result<(), InitError> {
     *KBD_EVDEV_NODE.lock() = Some(node_arc);
 
     Ok(())
+}
+
+// ── Device power management (#770) ─────────────────────────────
+//
+// The i8042 controller is pure sync port I/O, so unlike I2C-HID
+// it registers with the synchronous `device_pm` fan-out
+// directly. Registration happens in `register_i8042_initcalls`
+// (lib.rs) once keyboard init succeeds; the mouse channel is
+// covered by the same "i8042" entry because both channels share
+// the one controller.
+//
+// Suspend: disable both channels (so no IRQ-1/IRQ-12 bytes arrive
+// while the machine sleeps) + drain the output buffer — mirrors
+// `init()` steps 1-2.
+// Resume: drop stale decode state (a partial scancode frame can
+// never complete — the keyboard is reset below), park any
+// in-flight LED exchange (its ACK will never arrive post-reset),
+// then re-run the channel bring-up `init()` used: keyboard
+// channel re-enable (enable + config + reset + scancode set 1 +
+// scanning) and the mouse channel re-enable. IRQ routing is NOT
+// redone here: the platform resume path restores IRQ masks /
+// IOAPIC routing (`power/src/suspend.rs::restore_irq_masks`).
+// The evdev nodes are NOT re-registered: they survive suspend.
+//
+// The handlers run under the device-PM contract (boot CPU, other
+// CPUs quiesced, interrupts gated), which supplies the exclusive
+// port ownership `init()` requires from its caller.
+
+/// device-PM suspend hook: quiesce both PS/2 channels.
+pub(crate) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    if !STATE.initialized.load(Ordering::Acquire) && !crate::i8042_mouse::is_initialized() {
+        return Ok(());
+    }
+    suspend_channels();
+    Ok(())
+}
+
+/// device-PM resume hook: re-scan + re-enable both channels.
+pub(crate) fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    resume_decode_state();
+    if STATE.initialized.load(Ordering::Acquire) {
+        if enable_keyboard_channel().is_err() {
+            return Err(narf_power::device_pm::DeviceSuspendError::DriverError);
+        }
+        // The keyboard reset cleared its LED state; re-drive the
+        // desired bitmap if any LED is lit (the keyboard now
+        // shows all-off regardless of what `inflight` recorded).
+        let desired = LED_TX.lock().desired;
+        if desired != 0 {
+            on_led_state(desired);
+        }
+    }
+    crate::i8042_mouse::resume();
+    Ok(())
+}
+
+/// Disable both PS/2 channels + drain the output buffer. Best
+/// effort — a wedged controller must not fail suspend.
+fn suspend_channels() {
+    let _ = wait_input_clear_ms(CONFIG_WAIT_MS);
+    // SAFETY: 0x64 is the cmd port; the device-PM contract gives
+    // this handler exclusive ownership of the 8042 ports.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        outb(PS2_CMD, CMD_DISABLE_KBD);
+    }
+    let _ = wait_input_clear_ms(CONFIG_WAIT_MS);
+    // SAFETY: same.
+    unsafe {
+        outb(PS2_CMD, CMD_DISABLE_AUX);
+    }
+    flush_output();
+}
+
+/// Reset the port-free decode state resume invalidates: the E0
+/// latch + E1 (Pause) matcher (a partial frame can never
+/// complete once the keyboard is reset), and park any in-flight
+/// LED exchange at Idle — its ACK will never arrive, and leaving
+/// the phase at AwaitCmdAck/AwaitDataAck would block every later
+/// LED update. The desired bitmap is preserved so resume can
+/// re-drive it (see `pm_resume`).
+fn resume_decode_state() {
+    STATE.extended.store(false, Ordering::Release);
+    STATE.e1_stage.store(E1_IDLE, Ordering::Release);
+    let mut tx = LED_TX.lock();
+    tx.phase = LedPhase::Idle;
+    tx.retries = 0;
+}
+
+/// Register the "i8042" suspend/resume hooks with the device-PM
+/// registry. Called once from `register_i8042_initcalls` after
+/// keyboard init succeeds; idempotent on the name.
+pub fn register_device_pm() {
+    narf_power::device_pm::register_device_pm("i8042", pm_suspend, pm_resume);
 }
 
 /// Return the evdev `DeviceNode` for the i8042 keyboard if registered.
