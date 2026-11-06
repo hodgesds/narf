@@ -4137,6 +4137,9 @@ impl<M: Platform> Guard<'_, M> {
             return Err(error);
         }
         let stamp = self.finish_color().await?.ok_or(FsError::NoDevice)?;
+        if primary.is_some() {
+            crate::intel_gpu_vrr::on_plane_flip(1, &self.device.platform);
+        }
         if coefficients.is_none()
             && lut.is_none()
             && degamma.is_none()

@@ -31,6 +31,10 @@ pub const TRANS_VRR_FLIPLINE_OFFSET: u64 = 0x438;
 pub const TRANS_VRR_VSYNC_OFFSET: u64 = 0x078;
 pub const EMP_AS_SDP_TL_OFFSET: u64 = 0x204;
 pub const TRANS_PUSH_OFFSET: u64 = 0xa70;
+pub const TRANS_CMRR_M_LO_OFFSET: u64 = 0x4f0;
+pub const TRANS_CMRR_M_HI_OFFSET: u64 = 0x4f4;
+pub const TRANS_CMRR_N_LO_OFFSET: u64 = 0x4f8;
+pub const TRANS_CMRR_N_HI_OFFSET: u64 = 0x4fc;
 
 // ── Transcoder Base Addresses ────────────────────────────────────────────────
 
@@ -48,6 +52,7 @@ pub const VRR_CTL_FLIP_LINE_EN: u32 = 1 << 29;
 pub const VRR_CTL_CMRR_ENABLE: u32 = 1 << 27;
 pub const VRR_CTL_GUARDBAND_MASK: u32 = 0xffff;
 
+pub const VRR_STATUS_CMRR_EN_LIVE: u32 = 1 << 28;
 pub const VRR_STATUS_VRR_EN_LIVE: u32 = 1 << 27;
 pub const VRR_STATUS_FLIP_BEING_PUSHED: u32 = 1 << 26;
 
@@ -138,6 +143,11 @@ impl DisplayVrrIp {
     /// Whether `VRR_CTL_IGN_MAX_STRETCH` is supported (display 13).
     pub const fn uses_ign_max_stretch(self) -> bool {
         matches!(self, Self::Display13)
+    }
+
+    /// Whether Content-Matched Refresh Rate (CMRR) is supported (display 14+).
+    pub const fn supports_cmrr(self) -> bool {
+        matches!(self, Self::Display14 | Self::Display20 | Self::Display30)
     }
 }
 
@@ -244,6 +254,123 @@ impl VrrTimings {
         };
 
         Some(Self {
+            vmin,
+            vmax,
+            flipline,
+            guardband,
+            vsync_start,
+            vsync_end,
+        })
+    }
+}
+
+// ── CMRR (Content-Matched Refresh Rate) ──────────────────────────────────────
+
+/// Target content frame rate for Content-Matched Refresh Rate (CMRR).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmrrRate {
+    /// 23.976 Hz (24000/1001) - Standard NTSC film rate.
+    Fps23_976,
+    /// 24.000 Hz - Cinema standard film rate.
+    Fps24,
+    /// 25.000 Hz - PAL standard video rate.
+    Fps25,
+    /// 29.970 Hz (30000/1001) - Standard NTSC video rate.
+    Fps29_970,
+    /// 30.000 Hz - Standard progressive rate.
+    Fps30,
+    /// 48.000 Hz - High frame rate cinema.
+    Fps48,
+    /// 50.000 Hz - PAL progressive rate.
+    Fps50,
+    /// 59.940 Hz (60000/1001) - Standard NTSC high rate.
+    Fps59_940,
+    /// 60.000 Hz - Standard display refresh rate.
+    Fps60,
+    /// Custom rational frame rate: `num / den` in Hz.
+    Custom { num: u32, den: u32 },
+}
+
+impl CmrrRate {
+    /// Returns the exact rational representation (numerator, denominator) of the frame rate.
+    pub const fn fraction(self) -> (u64, u64) {
+        match self {
+            Self::Fps23_976 => (24_000, 1001),
+            Self::Fps24 => (24, 1),
+            Self::Fps25 => (25, 1),
+            Self::Fps29_970 => (30_000, 1001),
+            Self::Fps30 => (30, 1),
+            Self::Fps48 => (48, 1),
+            Self::Fps50 => (50, 1),
+            Self::Fps59_940 => (60_000, 1001),
+            Self::Fps60 => (60, 1),
+            Self::Custom { num, den } => (num as u64, den as u64),
+        }
+    }
+}
+
+/// Content-Matched Refresh Rate timing parameters programmed into the transcoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CmrrTimings {
+    pub cmrr_m: u64,
+    pub cmrr_n: u64,
+    pub vmin: u32,
+    pub vmax: u32,
+    pub flipline: u32,
+    pub guardband: u16,
+    pub vsync_start: u32,
+    pub vsync_end: u32,
+}
+
+impl CmrrTimings {
+    /// Compute transcoder CMRR M and N dividers and timing registers for a given mode and content frame rate.
+    pub fn compute(mode: &Mode, rate: CmrrRate, ip: DisplayVrrIp) -> Option<Self> {
+        if !ip.supports_cmrr() {
+            return None;
+        }
+        if mode.h_total == 0 || mode.v_total == 0 || mode.pixel_clock_khz == 0 {
+            return None;
+        }
+        if mode.v_total <= mode.v_active || mode.v_sync_start > mode.v_total {
+            return None;
+        }
+        let (fps_num, fps_den) = rate.fraction();
+        if fps_num == 0 || fps_den == 0 {
+            return None;
+        }
+
+        let pixel_clock_hz = u64::from(mode.pixel_clock_khz) * 1000;
+        let htotal = u64::from(mode.h_total);
+        let vtotal = u64::from(mode.v_total);
+
+        // Fixed precision multiplier (1_000_000_000)
+        let cmrr_n = 1_000_000_000u64;
+        let num =
+            u128::from(htotal) * u128::from(vtotal) * u128::from(fps_num) * u128::from(cmrr_n);
+        let den = u128::from(pixel_clock_hz) * u128::from(fps_den);
+        if den == 0 {
+            return None;
+        }
+        let cmrr_m = u64::try_from(num / den).ok()?;
+
+        let vmin = u32::from(mode.v_total);
+        let vmax = vmin;
+        let flipline = vmin;
+
+        let vsync_start = u32::from(mode.v_total.saturating_sub(mode.v_sync_start));
+        let vsync_end = u32::from(mode.v_total.saturating_sub(mode.v_sync_end));
+
+        let guardband = if ip.uses_guardband_in_ctl() {
+            let guard = u64::from(vsync_start + 1).max(8);
+            let max_guard = u64::from(mode.v_total.saturating_sub(mode.v_active)).min(0xffff);
+            u16::try_from(guard.min(max_guard)).unwrap_or(8)
+        } else {
+            0
+        };
+
+        Some(Self {
+            cmrr_m,
+            cmrr_n,
             vmin,
             vmax,
             flipline,
@@ -375,12 +502,152 @@ pub fn is_vrr_active(io: &(impl MmioWindow + ?Sized), trans: VrrTranscoder) -> b
     ctl != u32::MAX && (ctl & VRR_CTL_VRR_ENABLE != 0)
 }
 
+/// Program the transcoder CMRR M and N registers (`TRANS_CMRR_M_LO/HI`, `TRANS_CMRR_N_LO/HI`)
+/// and the associated VRR timing limits.
+pub fn program_cmrr_timings(
+    io: &(impl MmioWindow + ?Sized),
+    trans: VrrTranscoder,
+    ip: DisplayVrrIp,
+    timings: &CmrrTimings,
+) -> Result<(), FsError> {
+    let base = trans.base();
+    let vrr_timings = VrrTimings {
+        vmin: timings.vmin,
+        vmax: timings.vmax,
+        flipline: timings.flipline,
+        guardband: timings.guardband,
+        vsync_start: timings.vsync_start,
+        vsync_end: timings.vsync_end,
+    };
+    program_vrr_timings(io, trans, ip, &vrr_timings)?;
+
+    io.write32(base + TRANS_CMRR_M_LO_OFFSET, timings.cmrr_m as u32);
+    io.write32(base + TRANS_CMRR_M_HI_OFFSET, (timings.cmrr_m >> 32) as u32);
+    io.write32(base + TRANS_CMRR_N_LO_OFFSET, timings.cmrr_n as u32);
+    io.write32(base + TRANS_CMRR_N_HI_OFFSET, (timings.cmrr_n >> 32) as u32);
+
+    if io.display_access_ok() {
+        Ok(())
+    } else {
+        Err(FsError::NoDevice)
+    }
+}
+
+/// Enable CMRR on the specified transcoder: arms `TRANS_PUSH` and writes `TRANS_VRR_CTL` with
+/// `VRR_CTL_VRR_ENABLE` and `VRR_CTL_CMRR_ENABLE`.
+pub fn cmrr_enable(
+    io: &(impl MmioWindow + ?Sized),
+    trans: VrrTranscoder,
+    ip: DisplayVrrIp,
+    guardband: u16,
+) -> Result<(), FsError> {
+    let base = trans.base();
+    io.write32(base + TRANS_PUSH_OFFSET, TRANS_PUSH_EN);
+
+    let mut ctl = VRR_CTL_VRR_ENABLE | VRR_CTL_CMRR_ENABLE | VRR_CTL_FLIP_LINE_EN;
+    if ip.uses_guardband_in_ctl() {
+        ctl |= u32::from(guardband) & VRR_CTL_GUARDBAND_MASK;
+    }
+
+    io.write32(base + TRANS_VRR_CTL_OFFSET, ctl);
+    if io.display_access_ok() {
+        Ok(())
+    } else {
+        Err(FsError::NoDevice)
+    }
+}
+
+/// Disable CMRR on the specified transcoder: clears `VRR_CTL_VRR_ENABLE` and `VRR_CTL_CMRR_ENABLE`,
+/// waits for live status to clear, and resets `TRANS_PUSH`.
+pub fn cmrr_disable(
+    io: &(impl MmioWindow + ?Sized),
+    trans: VrrTranscoder,
+    _ip: DisplayVrrIp,
+) -> Result<(), FsError> {
+    let base = trans.base();
+    let ctl = io.read32(base + TRANS_VRR_CTL_OFFSET);
+    if ctl == u32::MAX || !io.display_access_ok() {
+        return Err(FsError::NoDevice);
+    }
+    if ctl & (VRR_CTL_VRR_ENABLE | VRR_CTL_CMRR_ENABLE) == 0 {
+        return Ok(());
+    }
+
+    let new_ctl = (ctl & !(VRR_CTL_VRR_ENABLE | VRR_CTL_CMRR_ENABLE)) | VRR_CTL_FLIP_LINE_EN;
+    io.write32(base + TRANS_VRR_CTL_OFFSET, new_ctl);
+
+    for _ in 0..10_000 {
+        let status = io.read32(base + TRANS_VRR_STATUS_OFFSET);
+        if status == u32::MAX || !io.display_access_ok() {
+            return Err(FsError::NoDevice);
+        }
+        if status & (VRR_STATUS_VRR_EN_LIVE | VRR_STATUS_CMRR_EN_LIVE) == 0 {
+            break;
+        }
+    }
+
+    io.write32(base + TRANS_PUSH_OFFSET, 0);
+    if io.display_access_ok() {
+        Ok(())
+    } else {
+        Err(FsError::NoDevice)
+    }
+}
+
+/// Query whether CMRR is currently active in hardware on the transcoder.
+pub fn is_cmrr_active(io: &(impl MmioWindow + ?Sized), trans: VrrTranscoder) -> bool {
+    let ctl = io.read32(trans.base() + TRANS_VRR_CTL_OFFSET);
+    ctl != u32::MAX
+        && (ctl & (VRR_CTL_VRR_ENABLE | VRR_CTL_CMRR_ENABLE)
+            == (VRR_CTL_VRR_ENABLE | VRR_CTL_CMRR_ENABLE))
+}
+
+/// Program fixed refresh rate timings using the VRR timing generator (Display 20/30 architecture).
+pub fn program_fixed_rr_timings(
+    io: &(impl MmioWindow + ?Sized),
+    trans: VrrTranscoder,
+    ip: DisplayVrrIp,
+    mode: &Mode,
+) -> Result<(), FsError> {
+    let vtotal = u32::from(mode.v_total);
+    if vtotal == 0 || mode.v_sync_start > mode.v_total || mode.v_sync_end > mode.v_total {
+        return Err(FsError::InvalidData);
+    }
+    let base = trans.base();
+    let val = if ip.uses_vtotal_minus_one() {
+        vtotal.saturating_sub(1)
+    } else {
+        vtotal
+    };
+    io.write32(base + TRANS_VRR_VMIN_OFFSET, val);
+    io.write32(base + TRANS_VRR_VMAX_OFFSET, val);
+    io.write32(base + TRANS_VRR_FLIPLINE_OFFSET, val);
+
+    if ip.has_vrr_vsync() {
+        let vsync_start = u32::from(mode.v_total.saturating_sub(mode.v_sync_start));
+        let vsync_end = u32::from(mode.v_total.saturating_sub(mode.v_sync_end));
+        let vsync_val = ((vsync_end & 0x1fff) << 16) | (vsync_start & 0x1fff);
+        io.write32(base + TRANS_VRR_VSYNC_OFFSET, vsync_val);
+    }
+    if ip.has_emp_as_sdp() {
+        let vsync_start = u32::from(mode.v_total.saturating_sub(mode.v_sync_start));
+        io.write32(base + EMP_AS_SDP_TL_OFFSET, vsync_start & 0x1fff);
+    }
+    if io.display_access_ok() {
+        Ok(())
+    } else {
+        Err(FsError::NoDevice)
+    }
+}
+
 // ── Global Driver VRR State ──────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct VrrState {
     enabled: [AtomicBool; 4],
+    cmrr_enabled: [AtomicBool; 4],
     timings: [IrqSafeSpinLock<Option<VrrTimings>>; 4],
+    cmrr_timings: [IrqSafeSpinLock<Option<CmrrTimings>>; 4],
     range: [IrqSafeSpinLock<Option<VrrRange>>; 4],
 }
 
@@ -399,7 +666,19 @@ impl VrrState {
                 AtomicBool::new(false),
                 AtomicBool::new(false),
             ],
+            cmrr_enabled: [
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+            ],
             timings: [
+                IrqSafeSpinLock::new(None),
+                IrqSafeSpinLock::new(None),
+                IrqSafeSpinLock::new(None),
+                IrqSafeSpinLock::new(None),
+            ],
+            cmrr_timings: [
                 IrqSafeSpinLock::new(None),
                 IrqSafeSpinLock::new(None),
                 IrqSafeSpinLock::new(None),
@@ -433,6 +712,18 @@ impl VrrState {
             .unwrap_or(false)
     }
 
+    pub fn set_cmrr_enabled(&self, crtc_id: u32, enabled: bool) {
+        if let Some(idx) = Self::crtc_index(crtc_id) {
+            self.cmrr_enabled[idx].store(enabled, Ordering::SeqCst);
+        }
+    }
+
+    pub fn is_cmrr_enabled(&self, crtc_id: u32) -> bool {
+        Self::crtc_index(crtc_id)
+            .map(|idx| self.cmrr_enabled[idx].load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
     pub fn set_timings(&self, crtc_id: u32, timings: Option<VrrTimings>) {
         if let Some(idx) = Self::crtc_index(crtc_id) {
             *self.timings[idx].lock() = timings;
@@ -441,6 +732,16 @@ impl VrrState {
 
     pub fn timings(&self, crtc_id: u32) -> Option<VrrTimings> {
         Self::crtc_index(crtc_id).and_then(|idx| *self.timings[idx].lock())
+    }
+
+    pub fn set_cmrr_timings(&self, crtc_id: u32, timings: Option<CmrrTimings>) {
+        if let Some(idx) = Self::crtc_index(crtc_id) {
+            *self.cmrr_timings[idx].lock() = timings;
+        }
+    }
+
+    pub fn cmrr_timings(&self, crtc_id: u32) -> Option<CmrrTimings> {
+        Self::crtc_index(crtc_id).and_then(|idx| *self.cmrr_timings[idx].lock())
     }
 
     pub fn set_range(&self, crtc_id: u32, range: Option<VrrRange>) {
@@ -476,9 +777,28 @@ pub fn request_vrr_enabled(crtc_id: u32, enabled: bool) {
     });
 }
 
-/// Invoked on a completed/armed primary plane flip to trigger dynamic VRR push.
+/// Retain and apply a CRTC's CMRR request.
+pub fn request_cmrr_enabled(crtc_id: u32, enabled: bool) {
+    VRR_STATE.set_cmrr_enabled(crtc_id, enabled);
+
+    let trans = VrrTranscoder::for_crtc(crtc_id);
+    crate::intel_gpu::with_controller(|dev| {
+        let ip = DisplayVrrIp::from_generation(dev.chip.generation);
+        let io = dev.mode_window();
+        if enabled {
+            if let Some(timings) = VRR_STATE.cmrr_timings(crtc_id) {
+                let _ = program_cmrr_timings(&io, trans, ip, &timings);
+                let _ = cmrr_enable(&io, trans, ip, timings.guardband);
+            }
+        } else {
+            let _ = cmrr_disable(&io, trans, ip);
+        }
+    });
+}
+
+/// Invoked on a completed/armed primary plane flip to trigger dynamic VRR/CMRR push.
 pub fn on_plane_flip(crtc_id: u32, io: &(impl MmioWindow + ?Sized)) {
-    if VRR_STATE.is_enabled(crtc_id) {
+    if VRR_STATE.is_enabled(crtc_id) || VRR_STATE.is_cmrr_enabled(crtc_id) {
         let trans = VrrTranscoder::for_crtc(crtc_id);
         let _ = vrr_send_push(io, trans);
     }

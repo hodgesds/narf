@@ -8,12 +8,14 @@ use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_modeset::Mode,
     intel_gpu_vrr::{
-        is_vrr_active, mode_vrefresh, on_plane_flip, program_vrr_timings, vrr_disable, vrr_enable,
-        vrr_send_push, DisplayVrrIp, VrrRange, VrrTimings, VrrTranscoder, EMP_AS_SDP_TL_OFFSET,
-        TRANSCODER_A_BASE, TRANS_PUSH_EN, TRANS_PUSH_OFFSET, TRANS_VRR_CTL_OFFSET,
-        TRANS_VRR_FLIPLINE_OFFSET, TRANS_VRR_VMAX_OFFSET, TRANS_VRR_VMIN_OFFSET,
-        TRANS_VRR_VSYNC_OFFSET, VRR_CTL_FLIP_LINE_EN, VRR_CTL_IGN_MAX_STRETCH, VRR_CTL_VRR_ENABLE,
-        VRR_STATE,
+        cmrr_disable, cmrr_enable, is_cmrr_active, is_vrr_active, mode_vrefresh, on_plane_flip,
+        program_cmrr_timings, program_fixed_rr_timings, program_vrr_timings, vrr_disable,
+        vrr_enable, vrr_send_push, CmrrRate, CmrrTimings, DisplayVrrIp, VrrRange, VrrTimings,
+        VrrTranscoder, EMP_AS_SDP_TL_OFFSET, TRANSCODER_A_BASE, TRANS_CMRR_M_HI_OFFSET,
+        TRANS_CMRR_M_LO_OFFSET, TRANS_CMRR_N_HI_OFFSET, TRANS_CMRR_N_LO_OFFSET, TRANS_PUSH_EN,
+        TRANS_PUSH_OFFSET, TRANS_VRR_CTL_OFFSET, TRANS_VRR_FLIPLINE_OFFSET, TRANS_VRR_VMAX_OFFSET,
+        TRANS_VRR_VMIN_OFFSET, TRANS_VRR_VSYNC_OFFSET, VRR_CTL_CMRR_ENABLE, VRR_CTL_FLIP_LINE_EN,
+        VRR_CTL_IGN_MAX_STRETCH, VRR_CTL_VRR_ENABLE, VRR_STATE,
     },
 };
 
@@ -356,4 +358,192 @@ fn smoke_intel_vrr_state_and_plane_flip() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_vrr",
     smoke_intel_vrr_state_and_plane_flip
+);
+
+// ── Test 7: CMRR Rate Fractions & Timings Computation ─────────────────────────
+
+fn smoke_intel_cmrr_rate_fractions_and_timings_computation() -> TestResult {
+    // Standard rates fractions
+    assert_eq!(CmrrRate::Fps23_976.fraction(), (24_000, 1001));
+    assert_eq!(CmrrRate::Fps24.fraction(), (24, 1));
+    assert_eq!(CmrrRate::Fps25.fraction(), (25, 1));
+    assert_eq!(CmrrRate::Fps29_970.fraction(), (30_000, 1001));
+    assert_eq!(CmrrRate::Fps30.fraction(), (30, 1));
+    assert_eq!(CmrrRate::Fps48.fraction(), (48, 1));
+    assert_eq!(CmrrRate::Fps50.fraction(), (50, 1));
+    assert_eq!(CmrrRate::Fps59_940.fraction(), (60_000, 1001));
+    assert_eq!(CmrrRate::Fps60.fraction(), (60, 1));
+    assert_eq!(CmrrRate::Custom { num: 120, den: 1 }.fraction(), (120, 1));
+
+    // Generation support: Gen12 and Display 13 do not support CMRR
+    assert!(!DisplayVrrIp::Gen12.supports_cmrr());
+    assert!(!DisplayVrrIp::Display13.supports_cmrr());
+    assert!(DisplayVrrIp::Display14.supports_cmrr());
+    assert!(DisplayVrrIp::Display20.supports_cmrr());
+    assert!(DisplayVrrIp::Display30.supports_cmrr());
+
+    let m = mode_1080p60();
+    assert_eq!(
+        CmrrTimings::compute(&m, CmrrRate::Fps60, DisplayVrrIp::Gen12),
+        None
+    );
+    assert_eq!(
+        CmrrTimings::compute(&m, CmrrRate::Fps60, DisplayVrrIp::Display13),
+        None
+    );
+
+    // 1080p60 on Display 14 at exact 60 Hz: M == N
+    let t60 = CmrrTimings::compute(&m, CmrrRate::Fps60, DisplayVrrIp::Display14)
+        .expect("Display 14 60Hz CMRR");
+    assert_eq!(t60.cmrr_n, 1_000_000_000);
+    assert_eq!(t60.cmrr_m, 1_000_000_000);
+    assert_eq!(t60.vmin, 1125);
+    assert_eq!(t60.vmax, 1125);
+    assert_eq!(t60.flipline, 1125);
+    assert_eq!(t60.guardband, 42);
+
+    // 1080p60 on Display 20 at 59.940 Hz: M = 999_000_999
+    let t59 = CmrrTimings::compute(&m, CmrrRate::Fps59_940, DisplayVrrIp::Display20)
+        .expect("Display 20 59.940Hz CMRR");
+    assert_eq!(t59.cmrr_n, 1_000_000_000);
+    assert_eq!(t59.cmrr_m, 999_000_999);
+
+    // 1080p60 on Display 30 at 24 Hz: M = 400_000_000
+    let t24 = CmrrTimings::compute(&m, CmrrRate::Fps24, DisplayVrrIp::Display30)
+        .expect("Display 30 24Hz CMRR");
+    assert_eq!(t24.cmrr_n, 1_000_000_000);
+    assert_eq!(t24.cmrr_m, 400_000_000);
+
+    // 1080p60 on Display 30 at 23.976 Hz: M = 399_600_399
+    let t23 = CmrrTimings::compute(&m, CmrrRate::Fps23_976, DisplayVrrIp::Display30)
+        .expect("Display 30 23.976Hz CMRR");
+    assert_eq!(t23.cmrr_n, 1_000_000_000);
+    assert_eq!(t23.cmrr_m, 399_600_399);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_cmrr_rate_fractions_and_timings_computation
+);
+
+// ── Test 8: CMRR Register Programming & Sequencing ───────────────────────────
+
+fn smoke_intel_cmrr_register_programming_and_sequencing() -> TestResult {
+    let io = MockMmio::new();
+    let trans = VrrTranscoder::A;
+    let base = trans.base();
+    let m = mode_1080p60();
+
+    let timings = CmrrTimings::compute(&m, CmrrRate::Fps59_940, DisplayVrrIp::Display14).unwrap();
+
+    // Program CMRR registers
+    program_cmrr_timings(&io, trans, DisplayVrrIp::Display14, &timings).unwrap();
+    assert_eq!(
+        io.written(base + TRANS_CMRR_M_LO_OFFSET),
+        vec![timings.cmrr_m as u32]
+    );
+    assert_eq!(
+        io.written(base + TRANS_CMRR_M_HI_OFFSET),
+        vec![(timings.cmrr_m >> 32) as u32]
+    );
+    assert_eq!(
+        io.written(base + TRANS_CMRR_N_LO_OFFSET),
+        vec![timings.cmrr_n as u32]
+    );
+    assert_eq!(
+        io.written(base + TRANS_CMRR_N_HI_OFFSET),
+        vec![(timings.cmrr_n >> 32) as u32]
+    );
+
+    // Enable CMRR
+    assert!(!is_cmrr_active(&io, trans));
+    cmrr_enable(&io, trans, DisplayVrrIp::Display14, timings.guardband).unwrap();
+    assert_eq!(io.written(base + TRANS_PUSH_OFFSET), vec![TRANS_PUSH_EN]);
+    let expected_ctl = VRR_CTL_VRR_ENABLE | VRR_CTL_CMRR_ENABLE | VRR_CTL_FLIP_LINE_EN | 42;
+    assert_eq!(io.written(base + TRANS_VRR_CTL_OFFSET), vec![expected_ctl]);
+    assert!(is_cmrr_active(&io, trans));
+
+    // Disable CMRR
+    cmrr_disable(&io, trans, DisplayVrrIp::Display14).unwrap();
+    let expected_disable_ctl = VRR_CTL_FLIP_LINE_EN | 42;
+    assert_eq!(
+        io.written(base + TRANS_VRR_CTL_OFFSET),
+        vec![expected_ctl, expected_disable_ctl]
+    );
+    assert_eq!(io.written(base + TRANS_PUSH_OFFSET), vec![TRANS_PUSH_EN, 0]);
+    assert!(!is_cmrr_active(&io, trans));
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_cmrr_register_programming_and_sequencing
+);
+
+// ── Test 9: Fixed Refresh Rate over VRR Timing Generator ─────────────────────
+
+fn smoke_intel_vrr_fixed_rr_timings_programming() -> TestResult {
+    let io = MockMmio::new();
+    let trans = VrrTranscoder::A;
+    let base = trans.base();
+    let m = mode_1080p60();
+
+    // Display 20 / 30: fixed refresh uses vtotal - 1 = 1124
+    program_fixed_rr_timings(&io, trans, DisplayVrrIp::Display30, &m).unwrap();
+    assert_eq!(io.written(base + TRANS_VRR_VMIN_OFFSET), vec![1124]);
+    assert_eq!(io.written(base + TRANS_VRR_VMAX_OFFSET), vec![1124]);
+    assert_eq!(io.written(base + TRANS_VRR_FLIPLINE_OFFSET), vec![1124]);
+
+    // TRANS_VRR_VSYNC: start = 1125 - 1084 = 41, end = 1125 - 1089 = 36
+    let expected_vsync = (36 << 16) | 41;
+    assert_eq!(
+        io.written(base + TRANS_VRR_VSYNC_OFFSET),
+        vec![expected_vsync]
+    );
+
+    // EMP_AS_SDP_TL: vsync_start = 41
+    assert_eq!(io.written(base + EMP_AS_SDP_TL_OFFSET), vec![41]);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_fixed_rr_timings_programming
+);
+
+// ── Test 10: Global CMRR State & Dynamic Flip Push ───────────────────────────
+
+fn smoke_intel_vrr_cmrr_state_and_flip_push() -> TestResult {
+    let io = MockMmio::new();
+    let crtc_id = 1;
+    let m = mode_1080p60();
+    let timings = CmrrTimings::compute(&m, CmrrRate::Fps23_976, DisplayVrrIp::Display30).unwrap();
+
+    assert!(!VRR_STATE.is_cmrr_enabled(crtc_id));
+    assert_eq!(VRR_STATE.cmrr_timings(crtc_id), None);
+
+    VRR_STATE.set_cmrr_timings(crtc_id, Some(timings));
+    assert_eq!(VRR_STATE.cmrr_timings(crtc_id), Some(timings));
+
+    VRR_STATE.set_cmrr_enabled(crtc_id, true);
+    assert!(VRR_STATE.is_cmrr_enabled(crtc_id));
+
+    // Flip push triggers under CMRR enabled state
+    on_plane_flip(crtc_id, &io);
+    assert_eq!(
+        io.written(TRANSCODER_A_BASE + TRANS_PUSH_OFFSET),
+        vec![TRANS_PUSH_EN]
+    );
+
+    // Clean up
+    VRR_STATE.set_cmrr_enabled(crtc_id, false);
+    VRR_STATE.set_cmrr_timings(crtc_id, None);
+    assert!(!VRR_STATE.is_cmrr_enabled(crtc_id));
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_cmrr_state_and_flip_push
 );
