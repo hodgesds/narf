@@ -1196,7 +1196,7 @@ fn fs_commit_from(out: CowOut, gen: u64, csum_type: u16) -> Result<FsCommit, FsE
 /// on a real root takes hundreds of milliseconds and every writer queues behind
 /// it, and at a commit per eight operations a desktop session starting up ran
 /// them back to back, at some thirty write operations a second system-wide.
-pub(crate) const MAX_BATCH_OPS: usize = 64;
+pub(crate) const MAX_BATCH_OPS: usize = 512;
 
 /// Operations accumulated into one not-yet-committed transaction.
 ///
