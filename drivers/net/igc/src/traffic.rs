@@ -354,9 +354,9 @@ fn write_flex_filter(r: &impl Registers, f: &FlowRule, index: usize) {
     }
     fn add_masked(data: &mut [u8; 128], mask: &mut [u8; 16], src: &[u8], offset: usize, m: &[u8]) {
         data[offset..offset + src.len()].copy_from_slice(src);
-        for i in 0..src.len() {
+        for (i, &m_byte) in m.iter().enumerate().take(src.len()) {
             let idx = i + offset;
-            if m[i] != 0 {
+            if m_byte != 0 {
                 mask[idx / 8] |= 1 << (idx % 8);
             }
         }
@@ -414,14 +414,14 @@ fn write_flex_filter(r: &impl Registers, f: &FlowRule, index: usize) {
     r.write(0x5808, wufc);
     let queuing = 32u32 | ((u32::from(f.queue) & 7) << 8);
     r.write(fhft + 0xfc, queuing);
-    for i in 0..16 {
+    for (i, &mask_byte) in mask.iter().enumerate() {
         let off = i * 8;
         let dw0 = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
         let dw1 = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
         let row = fhft + i as u64 * 16;
         r.write(row, dw0);
         r.write(row + 4, dw1);
-        let m = r.read(row + 8) & !0xff | u32::from(mask[i]);
+        let m = r.read(row + 8) & !0xff | u32::from(mask_byte);
         r.write(row + 8, m);
     }
     if index >= 8 {
