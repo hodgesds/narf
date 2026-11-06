@@ -29,6 +29,11 @@ pub struct I40eNic {
     runtime: IrqSafeSpinLock<Runtime>,
     tx_rejected: AtomicU64,
     rx_dropped: AtomicU64,
+    /// WoL state (issue #792): the stored enable plus the
+    /// platform-supplied board record.
+    wol: IrqSafeSpinLock<wol::WolState>,
+    /// True while the PF is suspended (datapath gate).
+    suspended: AtomicBool,
     pub(super) rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     pub(super) tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     /// The `eth%d` name `iface::register` assigned at probe (issue
@@ -65,6 +70,8 @@ impl I40eNic {
             }),
             tx_rejected: AtomicU64::new(0),
             rx_dropped: AtomicU64::new(0),
+            wol: IrqSafeSpinLock::new(wol::WolState::default()),
+            suspended: AtomicBool::new(false),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx)),
             ifname: crate::publish::IfName::new(),
@@ -116,14 +123,21 @@ impl I40eNic {
         frame: &[u8],
         meta: narf_net::TxMeta,
     ) -> Result<(), I40eError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(I40eError::Suspended);
+        }
         let (hw, _) = self.lease().ok_or(I40eError::DeviceFailed)?;
         hw.transmit_with_meta(frame, meta, self.rss.tx_queue(frame, self.queues))
     }
     pub fn transmit(&self, frame: &[u8]) -> Result<(), I40eError> {
         self.transmit_with_meta(frame, narf_net::TxMeta::plain())
     }
-    /// Compatibility polling across all hardware queues.
+    /// Compatibility polling across all hardware queues. Returns
+    /// `None` while the PF is suspended.
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        if self.suspended.load(Ordering::Acquire) {
+            return None;
+        }
         let (hw, _) = self.lease()?;
         if hw.irq().failed() {
             return None;
@@ -135,6 +149,99 @@ impl I40eNic {
             }
         }
         None
+    }
+
+    // ── Wake-on-LAN (issue #792) ────────────────────────────────────
+
+    /// Install the platform-supplied WoL board record (Linux's NVM
+    /// word + partition + capability discovery, once that lane
+    /// lands). Until then the default record reports WoL
+    /// unsupported.
+    pub fn set_wol_board(&self, board: wol::WolBoard) {
+        self.wol.lock().board = board;
+    }
+
+    /// Read the WoL surface (Linux `i40e_get_wol`):
+    /// `(supported, wolopts)`.
+    pub fn get_wol(&self) -> (u32, u32) {
+        let state = self.wol.lock();
+        (
+            wol::wol_supported_opts(&state.board, self.port_num),
+            wol::wol_opts(&state.board, self.port_num, state.enabled),
+        )
+    }
+
+    /// Set the WoL enable (Linux `i40e_set_wol` semantics):
+    /// `Err(I40eError::WolUnsupported)` when the board record does
+    /// not permit WoL on this PF or the word carries anything but
+    /// `WAKE_MAGIC`.
+    pub fn set_wol(&self, wolopts: u32) -> Result<(), I40eError> {
+        let mut state = self.wol.lock();
+        let enabled = wol::set_wol(&state.board, self.port_num, wolopts)
+            .map_err(|_| I40eError::WolUnsupported)?;
+        state.enabled = enabled;
+        Ok(())
+    }
+
+    /// Suspend the PF for system sleep (Linux `i40e_io_suspend`
+    /// order): when WoL is enabled and the board record reports
+    /// the `WOL_MC_MAGIC_PKT_WAKE` capability, program the
+    /// firmware magic-wake filters, then write the PFPM arming
+    /// words — which happen regardless of the AQ outcome, as in
+    /// Linux — and publish link down. Idempotent: a second
+    /// suspend is a no-op. The PCI PME enable is the platform
+    /// power layer's job (`narf_bus::pci_pme`); this programs
+    /// only the device-side wake filtering. A failed
+    /// magic-wake AQ command is reported (Linux ignores it) but
+    /// does not stop the PFPM arming.
+    ///
+    /// Deviation from Linux, documented: Linux's suspend also
+    /// tears the queues down (`i40e_prep_for_reset`) and its
+    /// resume rebuilds the PF (`i40e_reset_and_rebuild`). NARF
+    /// suspend leaves the queues programmed and resume only
+    /// clears the arming; a rebuild-on-resume goes through the
+    /// existing recovery path and is follow-up work (see the PR
+    /// body).
+    pub fn suspend(&self) -> Result<(), I40eError> {
+        let (hw, _) = self.lease().ok_or(I40eError::DeviceFailed)?;
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let (enabled, mc_magic) = {
+            let state = self.wol.lock();
+            (state.enabled, state.board.mc_magic_wake)
+        };
+        let mut aq_err = Ok(());
+        if enabled && mc_magic {
+            if let Err(e) = hw.enable_mc_magic_wake() {
+                aq_err = Err(e);
+            }
+        }
+        hw.set_wol_pfpm(enabled);
+        crate::publish::publish_link(self.ifname(), crate::publish::LinkSample::DOWN);
+        aq_err
+    }
+
+    /// Resume a suspended PF: clear the PFPM arming words and the
+    /// datapath gate, and republish link. Resuming a running PF is
+    /// a no-op. The gate is cleared even when the hardware lease
+    /// fails, so a failed device never wedges the datapath after
+    /// recovery. See [`Self::suspend`] for the documented
+    /// deviation from Linux's rebuild-on-resume.
+    pub fn resume(&self) -> Result<(), I40eError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = match self.lease() {
+            Some((hw, _)) => {
+                hw.set_wol_pfpm(false);
+                Ok(())
+            }
+            None => Err(I40eError::DeviceFailed),
+        };
+        self.suspended.store(false, Ordering::Release);
+        crate::publish::publish_link(self.ifname(), link_sample(self.link_status()));
+        result
     }
 }
 

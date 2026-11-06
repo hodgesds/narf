@@ -18,7 +18,9 @@
 //! | offset | name              | description                              |
 //! |--------|-------------------|------------------------------------------|
 //! | 0x1400 | MASTER_CTRL       | Master reset, clock select               |
+//! | 0x140C | GPHY_CTRL         | PHY control — hibernate, reset, IDDQ     |
 //! | 0x1480 | MAC_CTRL          | MAC config — RX/TX enable, duplex, FC    |
+//! | 0x14A0 | WOL_CTRL          | Wake-on-LAN control + status (#792)      |
 //! | 0x1488 | MAC_STA_ADDR_HI   | Station address high 16 bits             |
 //! | 0x148C | MAC_STA_ADDR_LO   | Station address low 32 bits              |
 //! | 0x1414 | MDIO_CTRL         | MII PHY register access                  |
@@ -43,7 +45,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 use narf_driver_runtime::{
@@ -278,6 +280,10 @@ pub enum NicError {
     TxRingFull,
     TxTimeout,
     EepromTimeout,
+    /// `set_wol` asked for a wake filter this family cannot arm.
+    WolUnsupported,
+    /// The datapath was used while the device is suspended.
+    Suspended,
 }
 
 // ── Driver state ────────────────────────────────────────────────────
@@ -297,6 +303,14 @@ pub struct AtlNic {
     pub link_up: bool,
     pub speed_1000: bool,
     pub duplex_full: bool,
+    /// WoL filters the suspend sequence will arm (issue #792).
+    wol_filters: IrqSafeSpinLock<crate::wol::WolFilters>,
+    /// True while the device is suspended (datapath gate).
+    suspended: AtomicBool,
+    /// AR8161 (`0x2060`) at revision `0xc1`: magic-packet arming
+    /// must also enable the pattern matcher (Linux `atl1c_hw.c`:
+    /// `nic_type == athr_l2c_b && revision_id == L2CB_V11`).
+    is_l2cb_v11: bool,
 
     // IPC integration
     rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -304,13 +318,14 @@ pub struct AtlNic {
 }
 
 // SAFETY: every mutable field is either confined to the driver thread that
-// owns the device or guarded by an `IrqSafeSpinLock`; `MmioRegion` and the
-// `DmaBuffer` rings are raw device-memory handles with no thread affinity,
-// so moving an `AtlNic` between threads is sound.
+// owns the device or guarded by an `IrqSafeSpinLock` / `AtomicBool`;
+// `MmioRegion` and the `DmaBuffer` rings are raw device-memory handles
+// with no thread affinity, so moving an `AtlNic` between threads is sound.
 unsafe impl Send for AtlNic {}
-// SAFETY: all interior mutability (ring heads and IPC endpoints) is behind
-// `IrqSafeSpinLock`; the remaining fields are read-only after `bring_up`, so
-// `&AtlNic` can be shared across threads without data races.
+// SAFETY: all interior mutability (ring heads, IPC endpoints, WoL
+// filters, suspended flag) is behind `IrqSafeSpinLock` / `AtomicBool`;
+// the remaining fields are read-only after `bring_up`, so `&AtlNic`
+// can be shared across threads without data races.
 unsafe impl Sync for AtlNic {}
 
 impl core::fmt::Debug for AtlNic {
@@ -338,11 +353,22 @@ impl AtlNic {
     /// Caller owns the device's BAR + cfg windows exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, NicError> {
         // BAR0 carries the operational register block.
         // SAFETY: caller-asserted exclusive ownership.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| NicError::BarMapFailed)?;
+
+        // PCI revision id for the L2CB pattern quirk: config offset
+        // 0x08 holds the revision in its low byte (Linux
+        // `hw->revision_id`). A device that has fallen off the bus
+        // reads all-ones; 0xFF is not the quirk revision, so the
+        // quirk stays off either way.
+        let device_id = device.id.device;
+        let revision = narf_bus::pci::read_config32(cap, device, 0x08)
+            .map(|v| (v & 0xFF) as u8)
+            .unwrap_or(0xFF);
+        let is_l2cb_v11 = device_id == ATL_DEV_AR8161 && revision == crate::wol::L2CB_V11_REV;
 
         // 1. Software reset. Linux pulls `MASTER_CTRL_SOFT_RST` and
         //    waits up to ~50 µs (`AT_HW_MAX_IDLE_DELAY = 10` * 50 µs);
@@ -499,6 +525,9 @@ impl AtlNic {
             link_up,
             speed_1000: an_complete,
             duplex_full: true,
+            wol_filters: IrqSafeSpinLock::new(crate::wol::WolFilters::default()),
+            suspended: AtomicBool::new(false),
+            is_l2cb_v11,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
@@ -512,6 +541,9 @@ impl AtlNic {
 
     /// Transmit a single Ethernet frame. Polled completion.
     pub fn transmit(&self, frame: &[u8]) -> Result<(), NicError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(NicError::Suspended);
+        }
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
         }
@@ -591,8 +623,12 @@ impl AtlNic {
     }
 
     /// Drain one received frame from the RRS ring.  Returns `Some` if
-    /// a descriptor is ready, `None` if the head is still NIC-owned.
+    /// a descriptor is ready, `None` if the head is still NIC-owned
+    /// — or while the device is suspended.
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        if self.suspended.load(Ordering::Acquire) {
+            return None;
+        }
         let mut head_g = self.rrs_head.lock();
         let slot = (*head_g) as usize % RRS_RING_LEN;
         let ring_phys = self.rrs_ring.dma_addr().raw();
@@ -695,6 +731,168 @@ impl AtlNic {
         // SAFETY: identity-mapped MMIO.
         unsafe { read_phy(&self.mmio, reg) }
     }
+
+    /// Write a PHY register over MDIO.
+    pub fn phy_write(&self, reg: u8, value: u16) -> Result<(), NicError> {
+        // SAFETY: identity-mapped MMIO.
+        unsafe { write_phy(&self.mmio, reg, value) }
+    }
+
+    // ── Wake-on-LAN (issue #792) ────────────────────────────────────
+
+    /// Set the WoL filters (Linux `atl1c_set_wol` semantics):
+    /// `Err(NicError::WolUnsupported)` for a filter this family
+    /// cannot arm. The stored filters are what [`Self::suspend`]
+    /// arms.
+    pub fn set_wol(&self, wolopts: u32) -> Result<(), NicError> {
+        let filters =
+            crate::wol::wol_filters_from_opts(wolopts).map_err(|_| NicError::WolUnsupported)?;
+        *self.wol_filters.lock() = filters;
+        Ok(())
+    }
+
+    /// Read the WoL surface (Linux `atl1c_get_wol`):
+    /// `(supported, wolopts)`.
+    pub fn get_wol(&self) -> (u32, u32) {
+        (
+            crate::wol::wol_supported_opts(),
+            crate::wol::wol_opts(*self.wol_filters.lock()),
+        )
+    }
+
+    /// Current WoL filter set.
+    pub fn wol_filters(&self) -> crate::wol::WolFilters {
+        *self.wol_filters.lock()
+    }
+
+    /// Live wake-status decode from `REG_WOL_CTRL`.
+    pub fn wol_status(&self) -> crate::wol::WakeStatus {
+        // SAFETY: identity-mapped MMIO.
+        crate::wol::WakeStatus {
+            raw: unsafe { self.mmio.read32(crate::wol::REG_WOL_CTRL) },
+        }
+    }
+
+    /// Renegotiate the PHY down to the lowest mode the link partner
+    /// claims (Linux `atl1c_phy_to_ps_link`), and return the
+    /// `(speed_1000, duplex_full)` the WoL program should encode.
+    /// Best-effort throughout: a failed advertisement write or a
+    /// link that never comes back up inside the 10 s window still
+    /// yields the LPA-derived target (Linux keeps its `SPEED_0`
+    /// fallback in that corner; NARF uses the advertised mode
+    /// instead — see `wol::ps_link_target`).
+    fn phy_to_ps_link(&self) -> (bool, bool) {
+        let link_up = self.live_link_up();
+        let lpa = if link_up {
+            self.phy_read(crate::wol::MII_LPA).unwrap_or(0)
+        } else {
+            0
+        };
+        let target = crate::wol::ps_link_target(link_up, lpa);
+        if let Some(adv) = target.advertise {
+            let _ = self.phy_write(crate::wol::MII_ADVERTISE, adv);
+            let _ = self.phy_write(
+                MII_BMCR,
+                crate::wol::BMCR_RESET | crate::wol::BMCR_ANENABLE | crate::wol::BMCR_ANRESTART,
+            );
+            // Linux polls link up to `AT_SUSPEND_LINK_TIMEOUT` (100)
+            // × 100 ms after the restart; the responsive spin ticks
+            // the sleep pumps while waiting.
+            let _ = narf_scheduler::responsive_spin_until(
+                || self.live_link_up(),
+                narf_time::Deadline::after_ms(10_000),
+            );
+        }
+        (target.speed_1000, target.duplex_full)
+    }
+
+    /// Suspend the device for system sleep (Linux `atl1c_suspend`
+    /// order): mask IRQs, stop the datapath gate, renegotiate the
+    /// PHY down to the lowest partner mode when WoL is armed
+    /// (`atl1c_phy_to_ps_link`), run the power-saving program
+    /// (`atl1c_power_saving`), and publish link down. Idempotent:
+    /// a second suspend is a no-op. The PCI PME enable is the
+    /// platform power layer's job (`narf_bus::pci_pme`); this
+    /// programs only the device-side wake filtering.
+    pub fn suspend(&self) {
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_IMR, 0);
+        }
+        let wufc = self.wol_filters.lock().to_wufc();
+        let (speed_1000, duplex_full) = if wufc != 0 {
+            self.phy_to_ps_link()
+        } else {
+            (self.speed_1000, self.duplex_full)
+        };
+        // SAFETY: identity-mapped MMIO.
+        let (master, mac, gphy) = unsafe {
+            (
+                self.mmio.read32(crate::wol::REG_MASTER_CTRL),
+                self.mmio.read32(crate::wol::REG_MAC_CTRL),
+                self.mmio.read32(crate::wol::REG_GPHY_CTRL),
+            )
+        };
+        let program = crate::wol::power_saving_program(
+            master,
+            mac,
+            gphy,
+            wufc,
+            speed_1000,
+            duplex_full,
+            self.is_l2cb_v11,
+        );
+        if wufc != 0 {
+            // PHY-side wake setup, before the MMIO writes (Linux
+            // order): link-change arms the PHY interrupt; either
+            // way a pending PHY interrupt is cleared. Best-effort
+            // — Linux only logs a failed `MII_IER` write.
+            if crate::wol::phy_wake_setup(wufc) {
+                let _ = self.phy_write(crate::wol::MII_IER, crate::wol::IER_LINK_UP);
+            }
+            let _ = self.phy_read(crate::wol::MII_ISR);
+        }
+        let mut bank = crate::wol::MmioRegBank(&self.mmio);
+        crate::wol::apply_power_saving(&mut bank, &program);
+        crate::publish::publish_link(atheros_ifname(), crate::publish::LinkSample::DOWN);
+    }
+
+    /// Resume a suspended device (Linux `atl1c_resume` order,
+    /// adapted): clear WOL_CTRL, restart PHY autoneg, restore the
+    /// bring-up MAC_CTRL word, and republish link. Resuming a
+    /// running device is a no-op.
+    ///
+    /// Deviation from Linux, documented: Linux resets the MAC and
+    /// re-initialises the PHY + rings (`reset_mac`, `phy_init`,
+    /// `atl1c_up`). NARF retains the rings across the sleep, so
+    /// resume restores the programmed MAC word instead of
+    /// resetting the MAC; the rings need no rebuild. Interrupt
+    /// re-enable stays the caller's job via [`Self::enable_irqs`]
+    /// — resume leaves IMR masked, the bring-up default.
+    pub fn resume(&self) {
+        if !self.suspended.load(Ordering::Acquire) {
+            return;
+        }
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(crate::wol::REG_WOL_CTRL, 0);
+            self.mmio.write32(REG_MAC_CTRL, default_mac_ctrl_value());
+        }
+        // PHY re-init: restart autoneg (Linux `phy_init` re-runs
+        // it; the igb resume uses the same ANENABLE|ANRESTART word).
+        let _ = self.phy_write(
+            MII_BMCR,
+            crate::wol::BMCR_ANENABLE | crate::wol::BMCR_ANRESTART,
+        );
+        self.suspended.store(false, Ordering::Release);
+        crate::publish::publish_link(
+            atheros_ifname(),
+            crate::publish::LinkSample::carrier_only(self.live_link_up()),
+        );
+    }
 }
 
 // ── PHY MDIO helper ─────────────────────────────────────────────────
@@ -721,6 +919,29 @@ unsafe fn read_phy(mmio: &MmioRegion, reg: u8) -> Result<u16, NicError> {
     // SAFETY: same.
     let v = unsafe { mmio.read32(REG_MDIO_CTRL) };
     Ok((v & MDIO_DATA_MASK) as u16)
+}
+
+/// Issue a Clause-22 write against the PHY through MDIO_CTRL.
+/// Mirrors `atl1c_write_phy_reg` — set REG_ADDR + data (no READ
+/// bit) + START, poll BUSY low.
+///
+/// # Safety
+/// Caller must own the device's MMIO BAR.
+unsafe fn write_phy(mmio: &MmioRegion, reg: u8, value: u16) -> Result<(), NicError> {
+    let cmd = ((reg as u32) << MDIO_REG_SHIFT) | ((value as u32) & MDIO_DATA_MASK) | MDIO_START;
+    // SAFETY: caller-asserted ownership.
+    unsafe {
+        mmio.write32(REG_MDIO_CTRL, cmd);
+    }
+    let done = narf_scheduler::responsive_spin_until(
+        // SAFETY: same.
+        || unsafe { mmio.read32(REG_MDIO_CTRL) } & MDIO_BUSY == 0,
+        narf_time::Deadline::after_ms(50),
+    );
+    if !done {
+        return Err(NicError::ResetTimeout);
+    }
+    Ok(())
 }
 
 // ── EEPROM read helper (Linux atl1c_get_permanent_address) ──────────
