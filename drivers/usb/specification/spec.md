@@ -754,6 +754,26 @@ also consult upstream Linux GPL sources.
   one 4096-byte DMA page per endpoint and completions carry slot +
   endpoint identity only — so multi-TRB pipelining on hardware
   awaits #885 (per-transfer buffers and TRB identity).
+- UVC suspend/resume (#807): the binders take the device's hub
+  context — (parent hub slot id, downstream port), `None` on a root
+  port — and `UvcDevice` records it as `hub_port`, the device-accepted
+  PROBE/COMMIT values as `last_stream`, and the stream live at
+  suspend as `suspended_stream`. System suspend runs the async
+  system-PM hook (`uvc::register_pm`, `narf_power::system_pm`):
+  prepare latches the quiesce flag (STREAMON then fails busy) and
+  runs the STREAMOFF teardown (pump stop + alternate setting 0) for
+  every streaming camera, recording its parameters; resume
+  re-negotiates (PROBE/COMMIT) and re-activates each recorded stream
+  and respawns its pump. A synchronous device-PM backstop
+  (`narf_power::device_pm`, same registration) only latches the flag
+  and stop-requests the pumps — it cannot do I/O, so it never selects
+  alternate setting 0. Hub idle-suspend: the pump feeds
+  `attach::mark_port_activity` on every completed transfer (a
+  streaming camera never idles), the class suspend hook
+  (`uvc::register`, `class_registry::register_suspend_hook`) vetoes
+  gating a live stream (`ParkFailed`) and parks an idle camera
+  (`Parked`), and STREAMON resumes a gated port before negotiating
+  (`ensure_uvc_port_awake`).
 - UVC payload headers (1.5 §2.4.3.3) are decoded by
   `uvc::UvcPayloadHeader::parse` (mirrored by `narf-drivers-video`'s
   `PayloadHeader::decode`) for every format class: frame-based
