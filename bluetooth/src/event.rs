@@ -397,6 +397,122 @@ impl LeConnectionComplete {
     }
 }
 
+/// LE Enhanced Connection Complete subevent (§7.7.65.10, v1).
+/// Subevent 0x0A. Generated (instead of the legacy 0x01 subevent)
+/// when a connection is created by HCI_LE_Extended_Create_Connection
+/// (§7.8.66) — and, when unmasked, in place of the legacy event for
+/// HCI_LE_Create_Connection too.
+///
+/// Layout (after the 0x3E + subevent-code bytes):
+/// ```text
+///   0:     u8  Status
+///   1..3:  u16 LE Connection_Handle
+///   3:     u8  Role (0 = central / 1 = peripheral)
+///   4:     u8  Peer_Address_Type (0 = public, 1 = random,
+///              2 = public identity, 3 = random static identity)
+///   5..11: 6  Peer_Address (LE order)
+///   11..17: 6 Local_Resolvable_Private_Address
+///   17..23: 6 Peer_Resolvable_Private_Address
+///   23..25: u16 LE Connection_Interval (units of 1.25 ms)
+///   25..27: u16 LE Peripheral_Latency
+///   27..29: u16 LE Supervision_Timeout (units of 10 ms)
+///   29:    u8  Central_Clock_Accuracy
+/// ```
+/// v2 (subevent 0x29, + Advertising_Handle/Sync_Handle) is only
+/// generated for connections from periodic advertising with
+/// responses, which the v1 command cannot create; it is not parsed
+/// here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeEnhancedConnectionComplete {
+    pub status: u8,
+    pub handle: u16,
+    pub role: u8,
+    pub peer_address_type: u8,
+    pub peer_address: [u8; 6],
+    pub local_rpa: [u8; 6],
+    pub peer_rpa: [u8; 6],
+    pub connection_interval: u16,
+    pub peripheral_latency: u16,
+    pub supervision_timeout: u16,
+    pub central_clock_accuracy: u8,
+}
+
+impl LeEnhancedConnectionComplete {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::LeMeta as u8 {
+            return None;
+        }
+        let p = &event.params;
+        if p.is_empty() || p[0] != LeSubevent::EnhancedConnectionComplete as u8 {
+            return None;
+        }
+        // 1-byte subevent + 30-byte payload = 31 bytes.
+        if p.len() < 31 {
+            return None;
+        }
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&p[6..12]);
+        let mut local_rpa = [0u8; 6];
+        local_rpa.copy_from_slice(&p[12..18]);
+        let mut peer_rpa = [0u8; 6];
+        peer_rpa.copy_from_slice(&p[18..24]);
+        Some(Self {
+            status: p[1],
+            handle: u16::from_le_bytes([p[2], p[3]]) & 0x0FFF,
+            role: p[4],
+            peer_address_type: p[5],
+            peer_address: addr,
+            local_rpa,
+            peer_rpa,
+            connection_interval: u16::from_le_bytes([p[24], p[25]]),
+            peripheral_latency: u16::from_le_bytes([p[26], p[27]]),
+            supervision_timeout: u16::from_le_bytes([p[28], p[29]]),
+            central_clock_accuracy: p[30],
+        })
+    }
+}
+
+/// LE Channel Selection Algorithm event (§7.7.65.20). Subevent 0x14.
+/// Generated immediately after a successful LE Enhanced Connection
+/// Complete (§7.8.66). Layout (after the 0x3E + subevent-code bytes):
+/// ```text
+///   0..2: u16 Connection_Handle
+///   2:    u8  Channel_Selection_Algorithm (0x00 = #1, 0x01 = #2)
+/// ```
+/// Any other algorithm value is reserved for future use and is
+/// rejected by the parser.
+pub const CHANNEL_SELECTION_ALGORITHM_1: u8 = 0x00;
+pub const CHANNEL_SELECTION_ALGORITHM_2: u8 = 0x01;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeChannelSelectionAlgorithm {
+    pub handle: u16,
+    pub algorithm: u8,
+}
+
+impl LeChannelSelectionAlgorithm {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::LeMeta as u8 {
+            return None;
+        }
+        let p = &event.params;
+        if p.is_empty() || p[0] != LeSubevent::ChannelSelectionAlgorithm as u8 {
+            return None;
+        }
+        // 1-byte subevent + 3-byte payload = 4 bytes.
+        if p.len() < 4 {
+            return None;
+        }
+        if p[3] != CHANNEL_SELECTION_ALGORITHM_1 && p[3] != CHANNEL_SELECTION_ALGORITHM_2 {
+            return None;
+        }
+        Some(Self {
+            handle: u16::from_le_bytes([p[1], p[2]]) & 0x0FFF,
+            algorithm: p[3],
+        })
+    }
+}
+
 /// One report inside an LE Advertising Report subevent (§7.7.65.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeAdvertisingReport {

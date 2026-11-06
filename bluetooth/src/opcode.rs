@@ -74,6 +74,13 @@ pub const HCI_LE_SET_SCAN_ENABLE: u16 = opcode(OGF_LE_CONTROLLER, 0x000C);
 pub const HCI_LE_CREATE_CONNECTION: u16 = opcode(OGF_LE_CONTROLLER, 0x000D);
 /// HCI_LE_Create_Connection_Cancel (§7.8.13). No parameters.
 pub const HCI_LE_CREATE_CONNECTION_CANCEL: u16 = opcode(OGF_LE_CONTROLLER, 0x000E);
+/// HCI_LE_Extended_Create_Connection (§7.8.66, v1). Variable-length
+/// parameter block: 10-byte header + 16 bytes per initiating PHY
+/// (26 bytes for one PHY, 42 for two). Returns Command Status; the
+/// connection outcome is signalled by an LE Enhanced Connection
+/// Complete subevent (§7.7.65.10), immediately followed on success
+/// by an LE Channel Selection Algorithm event (§7.7.65.20).
+pub const HCI_LE_EXTENDED_CREATE_CONNECTION: u16 = opcode(OGF_LE_CONTROLLER, 0x0043);
 
 // ── Link Control (§7.1) — generic link teardown ───────────────────
 /// HCI_Disconnect (§7.1.6). 3-byte parameter:
@@ -99,6 +106,8 @@ mod selftest {
     const _: () = assert!(HCI_LE_SET_SCAN_ENABLE == 0x200C);
     // §7.8.12: OGF=0x08, OCF=0x000D → 0x200D.
     const _: () = assert!(HCI_LE_CREATE_CONNECTION == 0x200D);
+    // §7.8.66 (v1): OGF=0x08, OCF=0x0043 → 0x2043.
+    const _: () = assert!(HCI_LE_EXTENDED_CREATE_CONNECTION == 0x2043);
     // §7.1.6: OGF=0x01, OCF=0x0006 → 0x0406.
     const _: () = assert!(HCI_DISCONNECT == 0x0406);
 }

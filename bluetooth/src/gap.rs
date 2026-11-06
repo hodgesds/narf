@@ -421,6 +421,173 @@ impl CreateConnection {
     }
 }
 
+// ── LE Extended Create Connection (§7.8.66, v1 OCF 0x0043) ──────────
+//
+// The v1 command takes one 16-byte parameter block per initiating
+// PHY, in ascending bit order (LE 1M first, then LE Coded). The v2
+// form (OCF 0x0085, + Advertising_Handle/Subevent for a periodic
+// advertising train) is out of scope — periodic advertising is
+// tracked separately (#1560).
+
+/// Initiating PHYs (§7.8.66): bit 0 = LE 1M, bit 2 = LE Coded —
+/// the PHYs on which connectable advertisements are scanned and
+/// for which connection parameters are provided. Bit 1 (LE 2M)
+/// is deliberately NOT offered here: §7.8.66 assigns it connection
+/// parameters only — no scanning PHY — and its scan interval/window
+/// are ignored by the controller; a 2M link is reached via PHY
+/// update after a 1M/Coded connect. At least one scanning PHY
+/// (bit 0 or bit 2) must be set, or the controller rejects the
+/// command with Invalid HCI Command Parameters (0x12).
+pub const INITIATING_PHY_LE_1M: u8 = 0x01;
+pub const INITIATING_PHY_LE_CODED: u8 = 0x04;
+/// Valid initiating-PHY bits for this lane: 1M | Coded.
+pub const INITIATING_PHY_MASK: u8 = INITIATING_PHY_LE_1M | INITIATING_PHY_LE_CODED;
+
+/// Per-PHY initiation parameters for one bit of `Initiating_PHYs`
+/// (§7.8.66). 16 bytes on the wire, in this field order.
+/// `scan_interval` / `scan_window` are 0.625 ms units
+/// (0x0004..=0xFFFF); `conn_interval_min/max` are 1.25 ms units
+/// (0x0006..=0x0C80); `supervision_timeout` is 10 ms units
+/// (0x000A..=0x0C80); `min_ce_length` / `max_ce_length` are
+/// 0.625 ms units.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ExtConnPhyParams {
+    pub scan_interval: u16,
+    pub scan_window: u16,
+    pub conn_interval_min: u16,
+    pub conn_interval_max: u16,
+    pub max_latency: u16,
+    pub supervision_timeout: u16,
+    pub min_ce_length: u16,
+    pub max_ce_length: u16,
+}
+
+impl Default for ExtConnPhyParams {
+    fn default() -> Self {
+        // Same defaults as the legacy `CreateConnection::to_peer`:
+        // 30 ms scan, 30..50 ms connection interval, 4 s
+        // supervision timeout.
+        Self {
+            scan_interval: 0x0030,
+            scan_window: 0x0030,
+            conn_interval_min: 0x0018,
+            conn_interval_max: 0x0028,
+            max_latency: 0x0000,
+            supervision_timeout: 0x0190,
+            min_ce_length: 0,
+            max_ce_length: 0,
+        }
+    }
+}
+
+/// LE Extended Create Connection payload (§7.8.66, v1). 10-byte
+/// header + 16 bytes per initiating PHY: 26 bytes for one PHY,
+/// 42 for both.
+#[derive(Clone, Debug)]
+pub struct ExtendedCreateConnection {
+    pub initiator_filter_policy: InitiatorFilterPolicy,
+    pub peer_address_type: PeerAddressType,
+    pub peer_address: [u8; 6],
+    pub own_address_type: OwnAddressType,
+    /// Initiating PHYs bitmask: `INITIATING_PHY_LE_1M` (0x01)
+    /// and/or `INITIATING_PHY_LE_CODED` (0x04).
+    pub phys: u8,
+    /// Parameters for the LE 1M PHY; required when bit 0 is set.
+    pub phy_1m: Option<ExtConnPhyParams>,
+    /// Parameters for the LE Coded PHY; required when bit 2 is set.
+    pub phy_coded: Option<ExtConnPhyParams>,
+}
+
+impl ExtendedCreateConnection {
+    /// Defaults for a typical Central connection to a known peer
+    /// on the LE 1M PHY: 30 ms scan, public-address peer, 30..50 ms
+    /// connection interval, 4 s supervision timeout.
+    pub fn to_peer(peer_address_type: PeerAddressType, peer_address: [u8; 6]) -> Self {
+        Self {
+            initiator_filter_policy: InitiatorFilterPolicy::PeerAddress,
+            peer_address_type,
+            peer_address,
+            own_address_type: OwnAddressType::Public,
+            phys: INITIATING_PHY_LE_1M,
+            phy_1m: Some(ExtConnPhyParams::default()),
+            phy_coded: None,
+        }
+    }
+
+    /// Same as [`Self::to_peer`] but initiating on the LE Coded
+    /// PHY only (long-range connectable advertisements).
+    pub fn to_peer_coded(peer_address_type: PeerAddressType, peer_address: [u8; 6]) -> Self {
+        Self {
+            initiator_filter_policy: InitiatorFilterPolicy::PeerAddress,
+            peer_address_type,
+            peer_address,
+            own_address_type: OwnAddressType::Public,
+            phys: INITIATING_PHY_LE_CODED,
+            phy_1m: None,
+            phy_coded: Some(ExtConnPhyParams::default()),
+        }
+    }
+
+    /// Same as [`Self::to_peer`] but initiating on both the LE 1M
+    /// and LE Coded PHYs: the controller scans both and the
+    /// connection is created on whichever PHY hears the peer first
+    /// (§7.8.66: scanning on any other PHY terminates once a
+    /// connection request is sent on one PHY).
+    pub fn to_peer_dual_phy(peer_address_type: PeerAddressType, peer_address: [u8; 6]) -> Self {
+        Self {
+            initiator_filter_policy: InitiatorFilterPolicy::PeerAddress,
+            peer_address_type,
+            peer_address,
+            own_address_type: OwnAddressType::Public,
+            phys: INITIATING_PHY_LE_1M | INITIATING_PHY_LE_CODED,
+            phy_1m: Some(ExtConnPhyParams::default()),
+            phy_coded: Some(ExtConnPhyParams::default()),
+        }
+    }
+
+    /// Encode the parameter block, or `None` when the request is
+    /// malformed: no scanning PHY set, a bit outside
+    /// `INITIATING_PHY_MASK`, a missing per-PHY parameter block,
+    /// or an inverted connection-interval / connection-event-length
+    /// range (§7.8.66: min shall not exceed max).
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        if self.phys == 0 || (self.phys & !INITIATING_PHY_MASK) != 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(10 + 16 * 2);
+        out.push(self.initiator_filter_policy as u8);
+        out.push(self.own_address_type as u8);
+        out.push(self.peer_address_type as u8);
+        out.extend_from_slice(&self.peer_address);
+        out.push(self.phys);
+        // Per-PHY blocks in ascending bit order (§7.8.66: "The
+        // array elements ... are ordered in the same order as the
+        // set bits in the Initiating_PHYs parameter, starting
+        // from bit 0").
+        for (bit, params) in [
+            (INITIATING_PHY_LE_1M, self.phy_1m),
+            (INITIATING_PHY_LE_CODED, self.phy_coded),
+        ] {
+            if (self.phys & bit) == 0 {
+                continue;
+            }
+            let p = params?;
+            if p.conn_interval_min > p.conn_interval_max || p.min_ce_length > p.max_ce_length {
+                return None;
+            }
+            out.extend_from_slice(&p.scan_interval.to_le_bytes());
+            out.extend_from_slice(&p.scan_window.to_le_bytes());
+            out.extend_from_slice(&p.conn_interval_min.to_le_bytes());
+            out.extend_from_slice(&p.conn_interval_max.to_le_bytes());
+            out.extend_from_slice(&p.max_latency.to_le_bytes());
+            out.extend_from_slice(&p.supervision_timeout.to_le_bytes());
+            out.extend_from_slice(&p.min_ce_length.to_le_bytes());
+            out.extend_from_slice(&p.max_ce_length.to_le_bytes());
+        }
+        Some(out)
+    }
+}
+
 /// HCI_Disconnect (§7.1.6) parameter block. 3 bytes:
 /// `connection_handle` (2 LE) + `reason` (1).
 ///

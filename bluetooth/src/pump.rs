@@ -136,9 +136,10 @@ use crate::controller::ControllerInfo;
 use crate::event::{
     parse_extended_inquiry_results, parse_inquiry_results, parse_inquiry_results_with_rssi,
     parse_le_advertising_reports, ClassicConnectionComplete, CommandComplete, CommandStatus,
-    DisconnectionComplete, EventCode, LeConnectionComplete, LeLongTermKeyRequest,
-    LePeriodicAdvReport, LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost,
-    NumberOfCompletedPackets, RemoteNameRequestComplete,
+    DisconnectionComplete, EventCode, LeChannelSelectionAlgorithm, LeConnectionComplete,
+    LeEnhancedConnectionComplete, LeLongTermKeyRequest, LePeriodicAdvReport,
+    LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost, NumberOfCompletedPackets,
+    RemoteNameRequestComplete,
 };
 use crate::gap::{self, CentralPhase, PeriodicAdvertiserPhase, PeriodicSyncPhase};
 use crate::gatt_client::{self, GattClientError};
@@ -393,6 +394,11 @@ struct Connection {
     /// connection's peer has been attached as a HID device
     /// (issue #1314, via `hogp_attach`).
     hogp: Option<HogpClient>,
+    /// Channel Selection Algorithm (§7.7.65.20) reported for this
+    /// connection, if the controller has sent one: 0x00 = #1,
+    /// 0x01 = #2. Extended-create connections always get one
+    /// immediately after Enhanced Connection Complete (§7.8.66).
+    channel_selection_algorithm: Option<u8>,
     /// LTK from a completed pairing. When the pairing was bonded
     /// the same LTK also lives in the pump's bond store, which is
     /// what answers reconnects; this field is the live
@@ -415,6 +421,7 @@ impl Connection {
             smp: None,
             client: None,
             hogp: None,
+            channel_selection_algorithm: None,
             ltk: None,
             encrypted: false,
             cid_alloc: CidAllocator::new(),
@@ -454,11 +461,11 @@ pub struct PumpCore {
     /// outbound issuance.
     central: gap::Central,
     /// Connection parameters waiting on scan-disable completion:
-    /// `central_connect` from Scanning issues Set_Scan_Enable(0)
-    /// first and only issues LE_Create_Connection once the disable
-    /// completes, so the controller is never asked to initiate
-    /// while it is still scanning.
-    pending_connect: Option<gap::CreateConnection>,
+    /// `central_connect` / `central_connect_ext` from Scanning
+    /// issue Set_Scan_Enable(0) first and only issue the create
+    /// command once the disable completes, so the controller is
+    /// never asked to initiate while it is still scanning.
+    pending_connect: Option<PendingConnect>,
     /// Classic BR/EDR central initiator state (issue #1315): inquiry
     /// discovery + outbound paging. Mirrors the LE `central` field;
     /// driven by `dispatch_event` and the `classic_*` API.
@@ -583,6 +590,16 @@ impl PumpCore {
 
     pub fn connection_count(&self) -> usize {
         self.connections.len()
+    }
+
+    /// Channel Selection Algorithm recorded for `handle`
+    /// (§7.7.65.20): outer `None` = no such connection; inner
+    /// `None` = no CSA event received yet for it.
+    pub fn connection_channel_selection(&self, handle: u16) -> Option<Option<u8>> {
+        self.connections
+            .iter()
+            .find(|c| c.handle == handle)
+            .map(|c| c.channel_selection_algorithm)
     }
 
     pub fn stats(&self) -> PumpStats {
@@ -1072,6 +1089,18 @@ impl PumpCore {
     }
 }
 
+/// A deferred connection initiation, waiting on scan-disable
+/// completion. The legacy (§7.8.12) and extended (§7.8.66) forms
+/// share the same phase discipline; the enum keeps every site
+/// that issues a deferred connect honest about both forms.
+#[derive(Clone, Debug)]
+enum PendingConnect {
+    /// Legacy LE Create Connection (§7.8.12).
+    Legacy(gap::CreateConnection),
+    /// Extended LE Create Connection (§7.8.66).
+    Extended(gap::ExtendedCreateConnection),
+}
+
 /// Errors from the GAP central initiator API (issue #1312).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CentralError {
@@ -1083,6 +1112,10 @@ pub enum CentralError {
     WrongPhase,
     /// The transport rejected the HCI command.
     Transport,
+    /// The extended-create request cannot be encoded: no scanning
+    /// PHY, an unsupported PHY bit, a missing per-PHY block, or an
+    /// inverted interval / connection-event-length range (§7.8.66).
+    BadParams,
 }
 
 impl PumpCore {
@@ -1142,9 +1175,8 @@ impl PumpCore {
                     .encode(),
                 )
                 .map_err(|_| CentralError::Transport)?;
-                self.pending_connect = Some(gap::CreateConnection::to_peer(
-                    peer_address_type,
-                    peer_address,
+                self.pending_connect = Some(PendingConnect::Legacy(
+                    gap::CreateConnection::to_peer(peer_address_type, peer_address),
                 ));
                 self.central.note_scan_stopping();
                 Ok(())
@@ -1157,6 +1189,67 @@ impl PumpCore {
                 Ok(())
             }
             _ => Err(CentralError::WrongPhase),
+        }
+    }
+
+    /// Connect to a peer with LE Extended Create Connection
+    /// (§7.8.66). Same phase discipline as [`Self::central_connect`]:
+    /// from Scanning the scan is disabled first and the extended
+    /// create follows on the disable completion; from Idle it is
+    /// issued directly. Forbidden while a setup is already in
+    /// flight or a central connection is established. `BadParams`
+    /// when the request cannot be encoded — the parameters are
+    /// validated before anything is sent, so a malformed request
+    /// never disables a scan in progress.
+    pub fn central_connect_ext(
+        &mut self,
+        params: gap::ExtendedCreateConnection,
+    ) -> Result<(), CentralError> {
+        let encoded = params.encode().ok_or(CentralError::BadParams)?;
+        match self.central.phase {
+            CentralPhase::Scanning => {
+                self.send_command(
+                    op::HCI_LE_SET_SCAN_ENABLE,
+                    &gap::ScanEnable {
+                        enable: false,
+                        filter_duplicates: false,
+                    }
+                    .encode(),
+                )
+                .map_err(|_| CentralError::Transport)?;
+                self.pending_connect = Some(PendingConnect::Extended(params));
+                self.central.note_scan_stopping();
+                Ok(())
+            }
+            CentralPhase::Idle => {
+                self.send_command(op::HCI_LE_EXTENDED_CREATE_CONNECTION, &encoded)
+                    .map_err(|_| CentralError::Transport)?;
+                self.central.note_connecting();
+                Ok(())
+            }
+            _ => Err(CentralError::WrongPhase),
+        }
+    }
+
+    /// Issue a deferred connection command taken from
+    /// `pending_connect`; on any failure the phase returns to Idle
+    /// rather than leaving a half-issued initiation behind.
+    fn issue_pending_connect(&mut self, pending: PendingConnect) {
+        let issued = match &pending {
+            PendingConnect::Legacy(cc) => self
+                .send_command(op::HCI_LE_CREATE_CONNECTION, &cc.encode())
+                .is_ok(),
+            PendingConnect::Extended(ecc) => match ecc.encode() {
+                Some(params) => self
+                    .send_command(op::HCI_LE_EXTENDED_CREATE_CONNECTION, &params)
+                    .is_ok(),
+                None => false,
+            },
+        };
+        if issued {
+            self.central.note_connecting();
+        } else {
+            self.central.phase = CentralPhase::Idle;
         }
     }
 
@@ -1195,16 +1288,7 @@ impl PumpCore {
                 if self.central.phase == CentralPhase::ScanStopping {
                     if status == 0 {
                         match self.pending_connect.take() {
-                            Some(cc) => {
-                                if self
-                                    .send_command(op::HCI_LE_CREATE_CONNECTION, &cc.encode())
-                                    .is_ok()
-                                {
-                                    self.central.note_connecting();
-                                } else {
-                                    self.central.phase = CentralPhase::Idle;
-                                }
-                            }
+                            Some(pending) => self.issue_pending_connect(pending),
                             None => self.central.phase = CentralPhase::Idle,
                         }
                     } else {
@@ -1216,7 +1300,11 @@ impl PumpCore {
                     }
                 }
             }
-            op::HCI_LE_CREATE_CONNECTION => {
+            // Legacy (§7.8.12) and extended (§7.8.66) creates both
+            // return Command Status first and complete later via an
+            // LE (Enhanced) Connection Complete subevent; a refused
+            // status returns the phase to Idle in either case.
+            op::HCI_LE_CREATE_CONNECTION | op::HCI_LE_EXTENDED_CREATE_CONNECTION => {
                 if self.central.phase == CentralPhase::Connecting && status != 0 {
                     self.central.phase = CentralPhase::Idle;
                 }
@@ -1438,6 +1526,11 @@ impl From<CentralError> for ClassicError {
             CentralError::Busy => ClassicError::Busy,
             CentralError::WrongPhase => ClassicError::WrongPhase,
             CentralError::Transport => ClassicError::Transport,
+            // Unreachable through this conversion: BadParams is
+            // only produced by `central_connect_ext`, which never
+            // flows into the classic API. Mapped to WrongPhase to
+            // keep the match exhaustive.
+            CentralError::BadParams => ClassicError::WrongPhase,
         }
     }
 }
@@ -1929,43 +2022,82 @@ impl PumpCore {
         let _ = crate::sysfs_bridge::remove_connection_for(self.index, handle);
     }
 
+    /// Apply an LE (Enhanced) Connection Complete to the central
+    /// state machine and the connection table. Shared by the legacy
+    /// (§7.7.65.1) and enhanced (§7.7.65.10) subevents: the enhanced
+    /// form is what an LE Extended Create Connection (§7.8.66)
+    /// completes with.
+    fn handle_le_connection_complete(
+        &mut self,
+        status: u8,
+        handle: u16,
+        peer_address_type: u8,
+        peer_address: &[u8; 6],
+    ) {
+        // Initiator-role completions drive the central state
+        // machine; inbound (peripheral-role) connections while Idle
+        // leave it alone. The role is captured before the state
+        // machine advances: it is the only sound test for whether
+        // THIS completion is central-role (connected_handle alone
+        // could match a stale handle reused by a peripheral
+        // connection).
+        let central_completed = self.central.phase == CentralPhase::Connecting;
+        if central_completed {
+            self.central.note_connection_complete(status, handle);
+        }
+        if status == 0 {
+            let mut peer = [0u8; 7];
+            peer[0] = peer_address_type;
+            peer[1..7].copy_from_slice(peer_address);
+            // New-main (detach lane) behaviour: drop any stale
+            // handle claims before recording the connection.
+            self.release_handle_claims(handle);
+            self.connections.retain(|c| c.handle != handle);
+            self.connections.push(Connection::new(handle, true, peer));
+            // Central-role connections gain a GATT client record
+            // (#1313); peripheral-role connections keep
+            // server-only dispatch.
+            if central_completed {
+                if let Some(conn) = self.connections.last_mut() {
+                    conn.client = Some(gatt_client::Client::new());
+                }
+            }
+            self.sysfs_track_connect(handle, true, &peer);
+        }
+    }
+
     /// Handle one HCI event. Socket fan-out happens in `pump_once`;
     /// this is only the host-stack dispatch.
     fn dispatch_event(&mut self, event: &Event) {
         match event.code {
             code if code == EventCode::LeMeta as u8 => {
                 if let Some(cc) = LeConnectionComplete::parse(event) {
-                    // Initiator-role completions drive the central
-                    // state machine; inbound (peripheral-role)
-                    // connections while Idle leave it alone. The
-                    // role is captured before the state machine
-                    // advances: it is the only sound test for
-                    // whether THIS completion is central-role
-                    // (connected_handle alone could match a stale
-                    // handle reused by a peripheral connection).
-                    let central_completed = self.central.phase == CentralPhase::Connecting;
-                    if central_completed {
-                        self.central.note_connection_complete(cc.status, cc.handle);
-                    }
-                    if cc.status == 0 {
-                        let mut peer = [0u8; 7];
-                        peer[0] = cc.peer_address_type;
-                        peer[1..7].copy_from_slice(&cc.peer_address);
-                        self.release_handle_claims(cc.handle);
-                        self.connections.retain(|c| c.handle != cc.handle);
-                        self.connections
-                            .push(Connection::new(cc.handle, true, peer));
-                        // Central-role connections gain a GATT
-                        // client record (#1313); peripheral-role
-                        // connections keep server-only dispatch.
-                        if central_completed {
-                            if let Some(conn) = self.connections.last_mut() {
-                                conn.client = Some(gatt_client::Client::new());
-                            }
-                        }
-                        self.sysfs_track_connect(cc.handle, true, &peer);
-                    }
+                    self.handle_le_connection_complete(
+                        cc.status,
+                        cc.handle,
+                        cc.peer_address_type,
+                        &cc.peer_address,
+                    );
                     return;
+                }
+                if let Some(cc) = LeEnhancedConnectionComplete::parse(event) {
+                    self.handle_le_connection_complete(
+                        cc.status,
+                        cc.handle,
+                        cc.peer_address_type,
+                        &cc.peer_address,
+                    );
+                    return;
+                }
+                if let Some(csa) = LeChannelSelectionAlgorithm::parse(event) {
+                    // §7.7.65.20: recorded on the connection it
+                    // names. An event for an unknown handle (or a
+                    // stale one) is dropped, never recorded
+                    // against the wrong link.
+                    if let Some(conn) = self.connections.iter_mut().find(|c| c.handle == csa.handle)
+                    {
+                        conn.channel_selection_algorithm = Some(csa.algorithm);
+                    }
                 }
                 if let Some(req) = LeLongTermKeyRequest::parse(event) {
                     // Answer order (Vol 4 Part E §7.8.25, Part H
@@ -3540,6 +3672,19 @@ pub fn central_connect(
     })?
 }
 
+/// Connect to a discovered peer from controller `index` with LE
+/// Extended Create Connection (§7.8.66). From Scanning the scan is
+/// disabled first and the extended create follows on the disable
+/// completion; from Idle it is issued directly. This is the trigger
+/// surface a future mgmt/userspace lane will call; today it is
+/// fixture-driven.
+pub fn central_connect_ext(
+    index: usize,
+    params: gap::ExtendedCreateConnection,
+) -> Result<(), CentralError> {
+    with_pump_core(index, |core| core.central_connect_ext(params))?
+}
+
 /// Current GAP central phase for controller `index`, if its core is
 /// not currently owned by a pump step.
 pub fn central_phase(index: usize) -> Option<CentralPhase> {
@@ -3659,6 +3804,18 @@ pub fn periodic_sync_snapshot(index: usize) -> Option<gap::PeriodicSyncSnapshot>
         .core
         .as_ref()
         .map(|c| c.periodic_sync.snapshot())
+}
+
+/// Channel Selection Algorithm recorded for `handle` on controller
+/// `index` (see `PumpCore::connection_channel_selection`).
+pub fn connection_channel_selection(index: usize, handle: u16) -> Option<Option<u8>> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .and_then(|c| c.connection_channel_selection(handle))
 }
 
 // ── Classic BR/EDR central initiator API (issue #1315) ─────────────
@@ -7459,6 +7616,463 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_central_failure_and_malformed);
+
+    /// LE Enhanced Connection Complete as seen by the Central role
+    /// (§7.7.65.10, v1 subevent 0x0A): Status, Handle, Role 0x00,
+    /// Peer_Address_Type, Peer_Address, Local_RPA, Peer_RPA,
+    /// Connection_Interval, Peripheral_Latency,
+    /// Supervision_Timeout, Central_Clock_Accuracy.
+    fn le_enhanced_connection_complete_central(status: u8, handle: u16, peer: [u8; 6]) -> Event {
+        let mut params = alloc::vec![0x0A, status];
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.push(0x00); // role: Central (we initiated)
+        params.push(0x00); // peer address type: public
+        params.extend_from_slice(&peer);
+        params.extend_from_slice(&[0u8; 6]); // local RPA (public own address)
+        params.extend_from_slice(&[0u8; 6]); // peer RPA
+        params.extend_from_slice(&0x0028u16.to_le_bytes()); // interval 50 ms
+        params.extend_from_slice(&0u16.to_le_bytes()); // latency
+        params.extend_from_slice(&0x01F4u16.to_le_bytes()); // timeout 5 s
+        params.push(0x00); // central clock accuracy
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
+    /// LE Channel Selection Algorithm event (§7.7.65.20, subevent
+    /// 0x14): Handle + algorithm (0x00 = #1, 0x01 = #2).
+    fn le_channel_selection_event(handle: u16, algorithm: u8) -> Event {
+        let mut params = alloc::vec![0x14];
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.push(algorithm);
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
+    /// #1561: the extended-create encoder and the two new event
+    /// parsers, pinned byte-for-byte against Vol 4 Part E §7.8.66 /
+    /// §7.7.65.10 / §7.7.65.20. Malformed variants are rejected:
+    /// no scanning PHY, a 2M/reserved PHY bit, a missing per-PHY
+    /// block, inverted interval/CE ranges, truncated events, and a
+    /// reserved channel-selection algorithm.
+    fn smoke_gap_ext_create_connection_encode() -> TestResult {
+        // Opcode: OGF 0x08, OCF 0x0043 → 0x2043.
+        if op::HCI_LE_EXTENDED_CREATE_CONNECTION != 0x2043 {
+            return TestResult::Fail("LE Extended Create Connection opcode is not 0x2043");
+        }
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        // 1M only: 10-byte header + one 16-byte PHY block = 26.
+        let expect_1m: [u8; 26] = [
+            0x00, 0x00, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x01, 0x30, 0x00, 0x30, 0x00,
+            0x18, 0x00, 0x28, 0x00, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let one_m = crate::gap::ExtendedCreateConnection::to_peer(
+            crate::gap::PeerAddressType::Public,
+            peer,
+        );
+        if one_m.encode().as_deref() != Some(&expect_1m[..]) {
+            return TestResult::Fail("1M extended-create bytes mismatch");
+        }
+        // Coded only: same block, phys 0x04.
+        let mut expect_coded = expect_1m;
+        expect_coded[9] = 0x04;
+        let coded = crate::gap::ExtendedCreateConnection::to_peer_coded(
+            crate::gap::PeerAddressType::Public,
+            peer,
+        );
+        if coded.encode().as_deref() != Some(&expect_coded[..]) {
+            return TestResult::Fail("Coded extended-create bytes mismatch");
+        }
+        // Dual PHY with distinct Coded parameters: the 1M block
+        // comes first (§7.8.66: blocks in ascending bit order).
+        let mut dual = crate::gap::ExtendedCreateConnection::to_peer_dual_phy(
+            crate::gap::PeerAddressType::Public,
+            peer,
+        );
+        dual.phy_coded = Some(crate::gap::ExtConnPhyParams {
+            scan_interval: 0x0040,
+            scan_window: 0x0020,
+            conn_interval_min: 0x0020,
+            conn_interval_max: 0x0030,
+            max_latency: 0x0001,
+            supervision_timeout: 0x0200,
+            min_ce_length: 0x0010,
+            max_ce_length: 0x0020,
+        });
+        let expect_dual: [u8; 42] = [
+            0x00, 0x00, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x05, 0x30, 0x00, 0x30, 0x00,
+            0x18, 0x00, 0x28, 0x00, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+            0x20, 0x00, 0x20, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 0x02, 0x10, 0x00, 0x20, 0x00,
+        ];
+        if dual.encode().as_deref() != Some(&expect_dual[..]) {
+            return TestResult::Fail("dual-PHY extended-create bytes mismatch");
+        }
+        // Malformed encoder inputs are all rejected.
+        let mut bad = one_m.clone();
+        bad.phys = 0x00;
+        if bad.encode().is_some() {
+            return TestResult::Fail("phys=0 accepted");
+        }
+        bad = one_m.clone();
+        bad.phys = 0x02; // LE 2M: parameters only, no scanning PHY
+        if bad.encode().is_some() {
+            return TestResult::Fail("phys=0x02 (LE 2M) accepted");
+        }
+        bad = one_m.clone();
+        bad.phys = 0x08; // reserved bit
+        if bad.encode().is_some() {
+            return TestResult::Fail("phys with reserved bit accepted");
+        }
+        bad = one_m.clone();
+        bad.phys = 0x05;
+        bad.phy_coded = None;
+        if bad.encode().is_some() {
+            return TestResult::Fail("dual PHY with missing Coded block accepted");
+        }
+        bad = one_m.clone();
+        bad.phy_1m = None;
+        if bad.encode().is_some() {
+            return TestResult::Fail("1M PHY with missing block accepted");
+        }
+        bad = one_m.clone();
+        bad.phy_1m = Some(crate::gap::ExtConnPhyParams {
+            conn_interval_min: 0x0028,
+            conn_interval_max: 0x0018,
+            ..crate::gap::ExtConnPhyParams::default()
+        });
+        if bad.encode().is_some() {
+            return TestResult::Fail("inverted connection interval accepted");
+        }
+        bad = one_m.clone();
+        bad.phy_1m = Some(crate::gap::ExtConnPhyParams {
+            min_ce_length: 0x0010,
+            max_ce_length: 0x0000,
+            ..crate::gap::ExtConnPhyParams::default()
+        });
+        if bad.encode().is_some() {
+            return TestResult::Fail("inverted CE length accepted");
+        }
+        // Enhanced Connection Complete: full field decode.
+        let ev = le_enhanced_connection_complete_central(0x00, 0x0041, peer);
+        let Some(cc) = LeEnhancedConnectionComplete::parse(&ev) else {
+            return TestResult::Fail("valid Enhanced Connection Complete did not parse");
+        };
+        if cc.status != 0x00
+            || cc.handle != 0x0041
+            || cc.role != 0x00
+            || cc.peer_address_type != 0x00
+            || cc.peer_address != peer
+            || cc.local_rpa != [0u8; 6]
+            || cc.peer_rpa != [0u8; 6]
+            || cc.connection_interval != 0x0028
+            || cc.peripheral_latency != 0x0000
+            || cc.supervision_timeout != 0x01F4
+            || cc.central_clock_accuracy != 0x00
+        {
+            return TestResult::Fail("Enhanced Connection Complete fields mismatch");
+        }
+        // Truncated enhanced event (30 bytes) is rejected.
+        let mut truncated = ev.clone();
+        truncated.params.truncate(30);
+        if LeEnhancedConnectionComplete::parse(&truncated).is_some() {
+            return TestResult::Fail("truncated Enhanced Connection Complete parsed");
+        }
+        // Legacy subevent byte in a 31-byte body is not enhanced.
+        let mut wrong = ev.clone();
+        wrong.params[0] = 0x01;
+        if LeEnhancedConnectionComplete::parse(&wrong).is_some() {
+            return TestResult::Fail("legacy subevent parsed as Enhanced Complete");
+        }
+        // Channel Selection Algorithm: valid, truncated, reserved.
+        let csa = le_channel_selection_event(0x0041, 0x01);
+        let Some(parsed) = LeChannelSelectionAlgorithm::parse(&csa) else {
+            return TestResult::Fail("valid Channel Selection Algorithm did not parse");
+        };
+        if parsed.handle != 0x0041 || parsed.algorithm != 0x01 {
+            return TestResult::Fail("Channel Selection Algorithm fields mismatch");
+        }
+        let mut short = csa.clone();
+        short.params.truncate(3);
+        if LeChannelSelectionAlgorithm::parse(&short).is_some() {
+            return TestResult::Fail("truncated Channel Selection Algorithm parsed");
+        }
+        let reserved = le_channel_selection_event(0x0041, 0x02);
+        if LeChannelSelectionAlgorithm::parse(&reserved).is_some() {
+            return TestResult::Fail("reserved CSA algorithm value parsed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_gap_ext_create_connection_encode);
+
+    /// #1561: end-to-end extended connect on the LE 1M PHY from
+    /// Idle — opcode + 26-byte parameters pinned, Command Status
+    /// accepted, LE Enhanced Connection Complete lands the
+    /// connection, and the immediately-following Channel Selection
+    /// Algorithm event (§7.8.66) is recorded on the link.
+    fn smoke_pump_ext_create_connection_1m() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        if central_connect_ext(
+            0,
+            crate::gap::ExtendedCreateConnection::to_peer(
+                crate::gap::PeerAddressType::Public,
+                peer,
+            ),
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("central_connect_ext rejected from Idle");
+        }
+        let sent = fake.sent_command_params();
+        let expect_params: [u8; 26] = [
+            0x00, 0x00, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x01, 0x30, 0x00, 0x30, 0x00,
+            0x18, 0x00, 0x28, 0x00, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        if sent.len() != 6
+            || sent[5].0 != op::HCI_LE_EXTENDED_CREATE_CONNECTION
+            || sent[5].1 != expect_params
+        {
+            reset_all();
+            return TestResult::Fail("LE Extended Create Connection bytes mismatch");
+        }
+        if central_phase(0) != Some(crate::gap::CentralPhase::Connecting) {
+            reset_all();
+            return TestResult::Fail("phase not Connecting after extended create");
+        }
+        // Command Status (accepted) keeps Connecting; the Enhanced
+        // Connection Complete lands the connection.
+        fake.enqueue_event(cs(op::HCI_LE_EXTENDED_CREATE_CONNECTION, 0));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Connecting) {
+            reset_all();
+            return TestResult::Fail("accepted Command Status moved phase out of Connecting");
+        }
+        let handle = 0x0041;
+        fake.enqueue_event(le_enhanced_connection_complete_central(0x00, handle, peer));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Connected)
+            || connection_count(0) != Some(1)
+        {
+            reset_all();
+            return TestResult::Fail("Enhanced Connection Complete did not land connection");
+        }
+        // No CSA event yet: nothing recorded for the handle.
+        if connection_channel_selection(0, handle) != Some(None) {
+            reset_all();
+            return TestResult::Fail("CSA recorded before any CSA event");
+        }
+        // CSA #2 follows the completion (§7.8.66); a CSA for an
+        // unknown handle is dropped, never mis-recorded.
+        fake.enqueue_event(le_channel_selection_event(handle, 0x01));
+        let _ = pump_once(0);
+        fake.enqueue_event(le_channel_selection_event(0x0042, 0x00));
+        let _ = pump_once(0);
+        if connection_channel_selection(0, handle) != Some(Some(0x01))
+            || connection_channel_selection(0, 0x0042).is_some()
+        {
+            reset_all();
+            return TestResult::Fail("Channel Selection Algorithm not recorded correctly");
+        }
+        // Disconnect returns to Idle.
+        fake.enqueue_event(Event {
+            code: EventCode::DisconnectionComplete as u8,
+            params: alloc::vec![0x00, 0x41, 0x00, 0x13],
+        });
+        let _ = pump_once(0);
+        let ok = connection_count(0) == Some(0)
+            && central_phase(0) == Some(crate::gap::CentralPhase::Idle);
+        reset_all();
+        if !ok {
+            return TestResult::Fail("disconnect did not return central to Idle");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_ext_create_connection_1m);
+
+    /// #1561: deferred extended connect from Scanning (scan
+    /// disabled first, dual-PHY create follows on completion),
+    /// Command Status refusal and Enhanced Complete failure
+    /// (0x3E) both fail closed with a working retry, and the
+    /// Coded-PHY retry completes with CSA #1 recorded.
+    fn smoke_pump_ext_create_connection_deferred_coded() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        // A malformed request is rejected before anything is sent.
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        let mut bad = crate::gap::ExtendedCreateConnection::to_peer(
+            crate::gap::PeerAddressType::Public,
+            peer,
+        );
+        bad.phys = 0x02;
+        let sent_before = fake.sent_command_params().len();
+        if central_connect_ext(0, bad) != Err(CentralError::BadParams)
+            || central_phase(0) != Some(crate::gap::CentralPhase::Idle)
+            || fake.sent_command_params().len() != sent_before
+        {
+            reset_all();
+            return TestResult::Fail("malformed extended create not rejected cleanly");
+        }
+        // Scan, discover the peer, then connect dual-PHY.
+        if central_start_scan(0, crate::gap::ScanParameters::default()).is_err() {
+            reset_all();
+            return TestResult::Fail("central_start_scan rejected from Idle");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_SCAN_PARAMETERS, &[0]));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Scanning) {
+            reset_all();
+            return TestResult::Fail("phase not Scanning after enable");
+        }
+        let ad: [u8; 3] = [0x02, 0x01, 0x06];
+        fake.enqueue_event(le_advertising_report(0x00, 0x00, peer, &ad, -60));
+        let _ = pump_once(0);
+        if central_peers(0).map(|p| p.len()) != Some(1) {
+            reset_all();
+            return TestResult::Fail("peer not recorded before extended connect");
+        }
+        if central_connect_ext(
+            0,
+            crate::gap::ExtendedCreateConnection::to_peer_dual_phy(
+                crate::gap::PeerAddressType::Public,
+                peer,
+            ),
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("central_connect_ext rejected from Scanning");
+        }
+        let sent = fake.sent_command_params();
+        if sent.last().map(|(o, _)| *o) != Some(op::HCI_LE_SET_SCAN_ENABLE)
+            || central_phase(0) != Some(crate::gap::CentralPhase::ScanStopping)
+        {
+            reset_all();
+            return TestResult::Fail("extended connect did not disable scan first");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_SCAN_ENABLE, &[0]));
+        let _ = pump_once(0);
+        let sent = fake.sent_command_params();
+        // Dual-PHY create: 10-byte header + two identical default
+        // 16-byte blocks = 42 bytes, phys 0x05.
+        let expect_dual: [u8; 42] = [
+            0x00, 0x00, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x05, 0x30, 0x00, 0x30, 0x00,
+            0x18, 0x00, 0x28, 0x00, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00, 0x30, 0x00,
+            0x30, 0x00, 0x18, 0x00, 0x28, 0x00, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        if sent.last().map(|(o, _)| *o) != Some(op::HCI_LE_EXTENDED_CREATE_CONNECTION)
+            || sent.last().map(|(_, p)| p.as_slice()) != Some(&expect_dual[..])
+            || central_phase(0) != Some(crate::gap::CentralPhase::Connecting)
+        {
+            reset_all();
+            return TestResult::Fail("dual-PHY extended create bytes mismatch");
+        }
+        // A second initiation while Connecting is a phase error.
+        if central_connect_ext(
+            0,
+            crate::gap::ExtendedCreateConnection::to_peer_coded(
+                crate::gap::PeerAddressType::Public,
+                peer,
+            ),
+        ) != Err(CentralError::WrongPhase)
+        {
+            reset_all();
+            return TestResult::Fail("second extended connect accepted while Connecting");
+        }
+        // Command Status refusal (0x0C) returns to Idle, no link.
+        fake.enqueue_event(cs(op::HCI_LE_EXTENDED_CREATE_CONNECTION, 0x0C));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Idle)
+            || connection_count(0) != Some(0)
+        {
+            reset_all();
+            return TestResult::Fail("refused extended create did not return to Idle");
+        }
+        // Retry on Coded only, from Idle: 26 bytes, phys 0x04.
+        if central_connect_ext(
+            0,
+            crate::gap::ExtendedCreateConnection::to_peer_coded(
+                crate::gap::PeerAddressType::Public,
+                peer,
+            ),
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("Coded retry rejected from Idle");
+        }
+        let sent = fake.sent_command_params();
+        let expect_coded: [u8; 26] = [
+            0x00, 0x00, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x04, 0x30, 0x00, 0x30, 0x00,
+            0x18, 0x00, 0x28, 0x00, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        if sent.last().map(|(o, _)| *o) != Some(op::HCI_LE_EXTENDED_CREATE_CONNECTION)
+            || sent.last().map(|(_, p)| p.as_slice()) != Some(&expect_coded[..])
+        {
+            reset_all();
+            return TestResult::Fail("Coded extended-create bytes mismatch");
+        }
+        // Enhanced Complete failure (0x3E, Connection Failed to
+        // be Established) returns to Idle with no connection.
+        fake.enqueue_event(cs(op::HCI_LE_EXTENDED_CREATE_CONNECTION, 0));
+        let _ = pump_once(0);
+        let handle = 0x0041;
+        fake.enqueue_event(le_enhanced_connection_complete_central(0x3E, handle, peer));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Idle)
+            || connection_count(0) != Some(0)
+        {
+            reset_all();
+            return TestResult::Fail("failed Enhanced Complete did not return to Idle");
+        }
+        // Retry again: success, CSA #1 recorded.
+        if central_connect_ext(
+            0,
+            crate::gap::ExtendedCreateConnection::to_peer_coded(
+                crate::gap::PeerAddressType::Public,
+                peer,
+            ),
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("second Coded retry rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_EXTENDED_CREATE_CONNECTION, 0));
+        let _ = pump_once(0);
+        fake.enqueue_event(le_enhanced_connection_complete_central(0x00, handle, peer));
+        let _ = pump_once(0);
+        if central_phase(0) != Some(crate::gap::CentralPhase::Connected)
+            || connection_count(0) != Some(1)
+        {
+            reset_all();
+            return TestResult::Fail("Coded retry Enhanced Complete did not land connection");
+        }
+        fake.enqueue_event(le_channel_selection_event(handle, 0x00));
+        let _ = pump_once(0);
+        let ok = connection_channel_selection(0, handle) == Some(Some(0x00));
+        reset_all();
+        if !ok {
+            return TestResult::Fail("CSA #1 not recorded on Coded connection");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_ext_create_connection_deferred_coded
+    );
 
     /// #1312: phase guards reject out-of-order API calls instead of
     /// issuing commands the controller cannot honour.
