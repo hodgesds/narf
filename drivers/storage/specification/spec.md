@@ -106,6 +106,16 @@ All driver code is derived strictly from the references below.
   error), PIO multi-block otherwise. Single-block PIO `read_block` /
   `write_block` on top of CMD17 / CMD24 remains for 1-block callers;
   error reporting via NIS_ERROR + EIS (+ ADMA Error Status).
+  UHS-I (#838, stacked on #837): after the bus-width step, ACMD41
+  S18R + CMD11 1.8 V signalling switch (HOST_CONTROL2 VDD_180, DAT
+  checks, 5 ms / 1 ms Linux settles), CMD6 switch-function query
+  then mode switch (SDR12 / SDR25 / SDR50 / SDR104 / DDR50, picked
+  by card support + Capabilities_1 + base clock, SDR104 > DDR50 >
+  SDR50 > SDR25), CMD19 tuning (40-iteration / 150 ms budget) for
+  SDR50/SDR104 with SDR25 fallback on failure, DDR50 tuning failure
+  non-fatal; a failed switch power-cycles the card and re-identifies
+  at 3.3 V without UHS. Fixture-validated end to end (S18A, switch
+  status, tuning engine, DAT levels, power-cycle recovery).
   Identified cards are published as `sdhci0` with a partition scan
   (`sdhci0p<m>`) (#834). Register access runs through an
   `SdhciTransport` seam (BAR0 MMIO in production), so the
@@ -134,8 +144,10 @@ All driver code is derived strictly from the references below.
   smoke tests independent of MMIO.
 
 ### Out of scope (deferred)
-- High-Speed / DDR / SDR50 / SDR104 timing modes (need CMD6 switch
-  + tuning, #838; the 50 MHz high-speed switch is the follow-on to
-  the 25 MHz data-path raise in #837).
+- 3.3 V High-Speed 50 MHz switch (the follow-on to the UHS-I work
+  in #838); CMD6 driver-strength / current-limit selection (cards
+  stay at default strength); re-tuning (Capabilities retuning modes
+  / timer not wired — tuning runs once at bring-up); HS200 / HS400
+  for eMMC (needs the eMMC driver, #827).
 - eMMC EXT_CSD (JEDEC JESD84-B51) — landed when an eMMC fabric is
   exercised end-to-end.

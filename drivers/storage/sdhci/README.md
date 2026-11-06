@@ -11,7 +11,11 @@ identification handshake — then negotiates the data path (#837):
 (ACMD51 SCR probe + ACMD6), and multi-block CMD18/CMD25 with
 Auto-CMD12 over SDMA/ADMA2 (coherent bounce buffer, PIO fallback),
 with response and register decoding borrowed from
-`narf-drivers-storage-core` (`sd_proto`).
+`narf-drivers-storage-core` (`sd_proto`). UHS-I (#838, stacked on
+#837) follows the bus-width step: ACMD41 S18R + CMD11 1.8 V
+signalling switch, CMD6 mode switch (SDR12/SDR25/SDR50/SDR104/DDR50),
+and CMD19 tuning with SDR25 fallback — a failed switch power-cycles
+the card and re-identifies at 3.3 V without UHS.
 
 The implementation lives in `src/sdhci.rs` (`Sdhci`, `SdCard`,
 `SdhciTransport` with its `MmioTransport`, `SdhciError`, `probe()`),
