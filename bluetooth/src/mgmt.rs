@@ -60,6 +60,7 @@ const OP_SET_SSP: u16 = 0x000b;
 const OP_SET_LE: u16 = 0x000d;
 const OP_SET_DEV_CLASS: u16 = 0x000e;
 const OP_SET_LOCAL_NAME: u16 = 0x000f;
+const OP_DISCONNECT: u16 = 0x0014;
 const OP_GET_CONNECTIONS: u16 = 0x0015;
 const OP_PIN_CODE_REPLY: u16 = 0x0016;
 const OP_PIN_CODE_NEG_REPLY: u16 = 0x0017;
@@ -101,7 +102,7 @@ const EV_PASSKEY_NOTIFY: u16 = 0x0017;
 pub(crate) const STATUS_SUCCESS: u8 = 0x00;
 const STATUS_UNKNOWN_COMMAND: u8 = 0x01;
 const STATUS_NOT_CONNECTED: u8 = 0x02;
-const STATUS_FAILED: u8 = 0x03;
+pub(crate) const STATUS_FAILED: u8 = 0x03;
 pub(crate) const STATUS_AUTH_FAILED: u8 = 0x05;
 const STATUS_TIMEOUT: u8 = 0x08;
 const STATUS_BUSY: u8 = 0x0a;
@@ -200,6 +201,19 @@ pub(crate) fn remote_oob(index: u16, peer: &[u8; 7]) -> Option<crate::smp::OobDa
         .and_then(|m| m.get(peer).copied())
 }
 
+/// Disconnects started by mgmt DISCONNECT and still awaiting
+/// their async completion: (index, handle) → the mgmt addr_info
+/// (`bd_addr` + type) to echo in the Command Complete (issue
+/// #1527). The pump clears an entry (and publishes the Command
+/// Complete) when the Disconnection Complete lands, or when the
+/// HCI Disconnect is refused by Command Status; direct
+/// `pump::disconnect` calls (e.g. UNPAIR_DEVICE disconnect=1)
+/// never create one. At most one disconnect is pending per
+/// controller — a second DISCONNECT while one is pending is BUSY
+/// (Linux `pending_find(MGMT_OP_DISCONNECT, hdev)`).
+static PENDING_DISCONNECT: IrqSafeSpinLock<BTreeMap<(u16, u16), [u8; 7]>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
 /// Controllers whose local name / Class of Device userspace set via
 /// mgmt (SET_LOCAL_NAME / SET_DEV_CLASS). Power-on re-writes those
 /// stored values after HCI_Reset instead of re-reading the
@@ -216,8 +230,8 @@ static CLASS_SET: IrqSafeSpinLock<BTreeSet<u16>> = IrqSafeSpinLock::new(BTreeSet
 static DISCOV_TIMEOUT: IrqSafeSpinLock<BTreeSet<u16>> = IrqSafeSpinLock::new(BTreeSet::new());
 
 /// Test-only: drain all mgmt state (settings, discovery, scan
-/// parameters, pending pairings, userspace-set identity, IO
-/// capability, remote OOB data).
+/// parameters, pending pairings, pending disconnects,
+/// userspace-set identity, IO capability, remote OOB data).
 #[doc(hidden)]
 pub fn __test_reset() {
     SETTINGS.lock().clear();
@@ -226,6 +240,7 @@ pub fn __test_reset() {
     PENDING_PAIR.lock().clear();
     IO_CAPABILITY.lock().clear();
     REMOTE_OOB.lock().clear();
+    PENDING_DISCONNECT.lock().clear();
     NAME_SET.lock().clear();
     CLASS_SET.lock().clear();
     DISCOV_TIMEOUT.lock().clear();
@@ -720,6 +735,86 @@ fn get_connections(index: u16) -> Vec<u8> {
     cmd_complete(index, OP_GET_CONNECTIONS, STATUS_SUCCESS, &data)
 }
 
+/// Handle of the live pump connection for `peer`
+/// (`[address_type, bd_addr]`, HCI address type in [0]) on
+/// transport `le`, if any. `None` covers both "no pump" and
+/// "no such connection".
+fn connection_handle(index: u16, peer: &[u8; 7], le: bool) -> Option<u16> {
+    crate::pump::connections(index as usize).and_then(|conns| {
+        conns
+            .iter()
+            .find(|c| c.peer_addr == *peer && c.le == le)
+            .map(|c| c.handle)
+    })
+}
+
+/// DISCONNECT (0x0014): `addr (6) + type (1)`. Powered-only;
+/// the reply echoes the address (BlueZ mgmt-api.txt,
+/// "Disconnect Command"; Linux `disconnect()` in
+/// net/bluetooth/mgmt.c). The reply is a Command Complete on
+/// success *or* failure: synchronous failures (bad type, not
+/// powered, a disconnect already pending, not connected) are
+/// Command Completes carrying the error status and echoing the
+/// address. The success path is async like PAIR_DEVICE: no
+/// reply now; the pump issues HCI Disconnect (reason Remote
+/// User Terminated Connection 0x13) and [`disconnect_complete`]
+/// publishes the Command Complete when the Disconnection
+/// Complete lands (or FAILED when the controller refuses the
+/// HCI command). A second DISCONNECT while one is pending on
+/// the controller is BUSY.
+fn disconnect_device(index: u16, params: &[u8]) -> Vec<Vec<u8>> {
+    if (index as usize) >= controller::controller_count() {
+        return alloc::vec![cmd_status(index, OP_DISCONNECT, STATUS_INVALID_INDEX)];
+    }
+    if params.len() < 7 {
+        return alloc::vec![cmd_status(index, OP_DISCONNECT, STATUS_INVALID_PARAMS)];
+    }
+    let mut addr_info = [0u8; 7];
+    addr_info[..6].copy_from_slice(&params[..6]);
+    addr_info[6] = params[6];
+    let echo = |status: u8| alloc::vec![cmd_complete(index, OP_DISCONNECT, status, &addr_info)];
+    let addr_type = params[6];
+    if addr_type != ADDR_BREDR && addr_type != ADDR_LE_PUBLIC && addr_type != ADDR_LE_RANDOM {
+        return echo(STATUS_INVALID_PARAMS);
+    }
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return echo(STATUS_NOT_POWERED);
+    }
+    if PENDING_DISCONNECT
+        .lock()
+        .keys()
+        .any(|(idx, _)| *idx == index)
+    {
+        return echo(STATUS_BUSY);
+    }
+    let is_le = addr_type != ADDR_BREDR;
+    let mut peer = [0u8; 7];
+    peer[0] = match addr_type {
+        ADDR_LE_PUBLIC => 0,
+        ADDR_LE_RANDOM => 1,
+        _ => 0,
+    };
+    peer[1..7].copy_from_slice(&params[..6]);
+    let Some(handle) = connection_handle(index, &peer, is_le) else {
+        return echo(STATUS_NOT_CONNECTED);
+    };
+    match crate::pump::disconnect(index as usize, handle) {
+        Some(Ok(())) => {
+            PENDING_DISCONNECT.lock().insert((index, handle), addr_info);
+            Vec::new()
+        }
+        Some(Err(crate::pump::DisconnectError::UnknownHandle)) => {
+            // Raced: the connection dropped between the lookup
+            // and the disconnect.
+            echo(STATUS_NOT_CONNECTED)
+        }
+        Some(Err(crate::pump::DisconnectError::AlreadyDisconnecting)) => echo(STATUS_BUSY),
+        // No pump, or the core is owned by a pump step right
+        // now: the disconnect could not be issued.
+        Some(Err(crate::pump::DisconnectError::Transport)) | None => echo(STATUS_FAILED),
+    }
+}
+
 /// PAIR_DEVICE (0x0019): `addr (6) + type (1) + io_cap (1)`.
 /// Powered-only; LE setting off → REJECTED. BR/EDR is
 /// NOT_SUPPORTED (no legacy pairing initiator; Classic is lane
@@ -879,9 +974,12 @@ fn cancel_pair_device(index: u16, params: &[u8]) -> Vec<u8> {
 
 /// UNPAIR_DEVICE (0x001b): `addr (6) + type (1) + disconnect (1)`.
 /// Powered-only. Removing a bond is idempotent — an unknown peer
-/// still replies success. `disconnect=1` with a live connection is
-/// NOT_SUPPORTED: there is no host-initiated disconnect backend
-/// (the remainder; the bond itself is left untouched).
+/// still replies success. `disconnect=1` with a live connection
+/// disconnects it first via the pump backend (issue #1527) and
+/// then forgets the bond; the unpair reply does not wait for the
+/// link to come down. A disconnect that cannot be issued
+/// (transport failure, pump busy) fails the unpair and leaves
+/// the bond untouched, so userspace can retry.
 fn unpair_device(index: u16, params: &[u8]) -> Vec<u8> {
     if (index as usize) >= controller::controller_count() {
         return cmd_status(index, OP_UNPAIR_DEVICE, STATUS_INVALID_INDEX);
@@ -913,17 +1011,21 @@ fn unpair_device(index: u16, params: &[u8]) -> Vec<u8> {
     };
     peer[1..7].copy_from_slice(&params[..6]);
     if disconnect == 1 {
-        let live = crate::pump::connections(index as usize)
-            .map(|conns| {
-                conns.iter().any(|c| {
-                    c.peer_addr[1..7] == params[..6]
-                        && c.le == is_le
-                        && (!is_le || c.peer_addr[0] == peer[0])
-                })
-            })
-            .unwrap_or(false);
-        if live {
-            return cmd_status(index, OP_UNPAIR_DEVICE, STATUS_NOT_SUPPORTED);
+        if let Some(handle) = connection_handle(index, &peer, is_le) {
+            match crate::pump::disconnect(index as usize, handle) {
+                Some(Ok(())) => {}
+                // Raced: the connection dropped between the
+                // lookup and the disconnect — nothing left to
+                // tear down; forget the bond as requested.
+                Some(Err(crate::pump::DisconnectError::UnknownHandle)) => {}
+                // A disconnect is already in flight for this
+                // handle: the link is going away; forget the
+                // bond as requested.
+                Some(Err(crate::pump::DisconnectError::AlreadyDisconnecting)) => {}
+                Some(Err(crate::pump::DisconnectError::Transport)) | None => {
+                    return cmd_status(index, OP_UNPAIR_DEVICE, STATUS_FAILED);
+                }
+            }
         }
     }
     let had_bond = if is_le {
@@ -1385,6 +1487,26 @@ pub fn publish_device_found(
     narf_filesystem::bluetooth::publish_mgmt_event(&frame(EV_DEVICE_FOUND, index as u16, &body));
 }
 
+/// Complete a mgmt-initiated disconnect: called by the pump
+/// when the Disconnection Complete for a disconnecting handle
+/// lands, or when the HCI Disconnect is refused by Command
+/// Status. Only a disconnect DISCONNECT started (an entry in
+/// PENDING_DISCONNECT) gets a Command Complete — direct
+/// `pump::disconnect` calls (e.g. UNPAIR_DEVICE disconnect=1)
+/// do not. `status` is SUCCESS when the link came down, FAILED
+/// when the controller refused the disconnect.
+pub fn disconnect_complete(index: usize, handle: u16, status: u8) {
+    let Some(addr_info) = PENDING_DISCONNECT.lock().remove(&(index as u16, handle)) else {
+        return;
+    };
+    narf_filesystem::bluetooth::publish_mgmt_event(&cmd_complete(
+        index as u16,
+        OP_DISCONNECT,
+        status,
+        &addr_info,
+    ));
+}
+
 /// Complete a mgmt-initiated pairing: called by the pump when an
 /// initiator session ends. Only a pairing PAIR_DEVICE started (an
 /// entry in PENDING_PAIR) gets a Command Complete — responder
@@ -1512,6 +1634,7 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
                 OP_SET_LE,
                 OP_SET_DEV_CLASS,
                 OP_SET_LOCAL_NAME,
+                OP_DISCONNECT,
                 OP_GET_CONNECTIONS,
                 OP_PIN_CODE_REPLY,
                 OP_PIN_CODE_NEG_REPLY,
@@ -1632,6 +1755,7 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
         OP_SET_SCAN_PARAMS => alloc::vec![set_scan_params(index, params)],
         OP_START_DISCOVERY => alloc::vec![start_discovery(index, params)],
         OP_STOP_DISCOVERY => alloc::vec![stop_discovery(index, params)],
+        OP_DISCONNECT => disconnect_device(index, params),
         OP_GET_CONNECTIONS => alloc::vec![get_connections(index)],
         OP_PIN_CODE_REPLY => alloc::vec![pin_code_reply(index, opcode, params)],
         OP_PIN_CODE_NEG_REPLY => alloc::vec![pin_code_reply(index, opcode, params)],
@@ -1723,6 +1847,17 @@ mod tests {
         Event {
             code: EventCode::CommandComplete as u8,
             params,
+        }
+    }
+
+    /// Command Status event for `opcode` (`status`, 1 Num_HCI_
+    /// Command_Packets, opcode LE) — the HCI_Disconnect (§7.1.6)
+    /// response shape, built from the spec, not from impl
+    /// constants.
+    fn command_status_event(opcode: u16, status: u8) -> Event {
+        Event {
+            code: EventCode::CommandStatus as u8,
+            params: alloc::vec![status, 0x01, (opcode & 0xFF) as u8, (opcode >> 8) as u8],
         }
     }
 
@@ -2542,8 +2677,8 @@ mod tests {
     /// #815: GET_CONNECTIONS lists live pump connections;
     /// PAIR_DEVICE is async (Command Status now, Command Complete
     /// on terminal outcome) with the Linux error map; UNPAIR_DEVICE
-    /// is idempotent, and disconnect=1 on a live connection is
-    /// NOT_SUPPORTED (no host disconnect backend).
+    /// is idempotent, and disconnect=1 on a live connection
+    /// issues HCI Disconnect and succeeds (issue #1527).
     fn smoke_mgmt_pair_unpair_and_get_connections() -> TestResult {
         let (lt, index) = setup_controller(controller::ControllerInfo::default());
         let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
@@ -2593,7 +2728,12 @@ mod tests {
         let mut unpair_disc = unpair_params;
         unpair_disc[7] = 0x01;
         let ud = handle(&mgmt_cmd(OP_UNPAIR_DEVICE, index, &unpair_disc));
-        let ud_ok = is_cmd_status(&ud, OP_UNPAIR_DEVICE, STATUS_NOT_SUPPORTED);
+        let ud_ok = is_cmd_complete(&ud, OP_UNPAIR_DEVICE, STATUS_SUCCESS)
+            && lt
+                .sent_commands()
+                .last()
+                .map(|c| c.opcode == op::HCI_DISCONNECT && c.params == [0x40, 0x00, 0x13])
+                .unwrap_or(false);
         lt.enqueue_event(disconnection_complete_event(0x0040));
         let _ = crate::pump::pump_once(index as usize);
         let disconnected = CAPTURED.lock().iter().any(|e| {
@@ -2631,7 +2771,7 @@ mod tests {
         }
         if !ud_ok {
             return TestResult::Fail(
-                "UNPAIR_DEVICE disconnect=1 on a live connection was not NOT_SUPPORTED",
+                "UNPAIR_DEVICE disconnect=1 on a live connection did not issue HCI Disconnect + succeed",
             );
         }
         if !disconnected {
@@ -2824,12 +2964,12 @@ mod tests {
         let br_ok = is_cmd_status(&br, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_PARAMS);
         let bad_index = handle(&mgmt_cmd(OP_CANCEL_PAIR_DEVICE, 0x00ff, &cancel_params));
         let bad_index_ok = is_cmd_status(&bad_index, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_INDEX);
-        // 0x001a is advertised by READ_COMMANDS now (32 opcodes).
+        // 0x001a is advertised by READ_COMMANDS now (33 opcodes).
         let cmds = handle(&mgmt_cmd(OP_READ_COMMANDS, MGMT_INDEX_NONE, &[]));
         let cmds_ok = cmds.len() == 1
-            && u16::from_le_bytes([cmds[0][9], cmds[0][10]]) == 32
-            && cmds[0].len() >= 13 + 32 * 2
-            && (0..32).any(|i| {
+            && u16::from_le_bytes([cmds[0][9], cmds[0][10]]) == 33
+            && cmds[0].len() >= 13 + 33 * 2
+            && (0..33).any(|i| {
                 u16::from_le_bytes([cmds[0][13 + 2 * i], cmds[0][14 + 2 * i]])
                     == OP_CANCEL_PAIR_DEVICE
             });
@@ -2899,4 +3039,220 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/mgmt", smoke_mgmt_cancel_pair_device);
+
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_pair_unpair_and_get_connections);
+
+    /// #1527: mgmt DISCONNECT tears a connection down by
+    /// handle. The command is async: no immediate reply, HCI
+    /// Disconnect (0x0406, handle + reason 0x13) on the wire, a
+    /// second DISCONNECT while one is pending is BUSY, the
+    /// Command Status alone does not complete it, and the
+    /// Disconnection Complete publishes the Command Complete
+    /// echoing the address. A later DISCONNECT for the now-gone
+    /// peer is NOT_CONNECTED.
+    fn smoke_mgmt_disconnect_by_handle() -> TestResult {
+        let (lt, index) = setup_controller(controller::ControllerInfo::default());
+        let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
+        let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
+        let peer6 = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
+        let mut disc_params = [0u8; 7];
+        disc_params[..6].copy_from_slice(&peer6);
+        disc_params[6] = 0x01; // LE public
+        lt.enqueue_event(le_conn_complete_event(0x0040, peer6));
+        let _ = crate::pump::pump_once(index as usize);
+        let connected = crate::pump::connection_count(index as usize) == Some(1);
+        CAPTURED.lock().clear();
+        let reply = handle(&mgmt_cmd(OP_DISCONNECT, index, &disc_params));
+        let no_immediate_reply = reply.is_empty();
+        let hci_sent = lt
+            .sent_commands()
+            .last()
+            .map(|c| c.opcode == op::HCI_DISCONNECT && c.params == [0x40, 0x00, 0x13])
+            .unwrap_or(false);
+        // A second DISCONNECT while one is pending is BUSY
+        // (Command Complete, echoing the address).
+        let busy = handle(&mgmt_cmd(OP_DISCONNECT, index, &disc_params));
+        let busy_ok = is_cmd_complete(&busy, OP_DISCONNECT, STATUS_BUSY)
+            && busy[0][9..15] == peer6[..]
+            && busy[0][15] == 0x01;
+        // The Command Status (accepted) does not complete it.
+        lt.enqueue_event(command_status_event(op::HCI_DISCONNECT, 0x00));
+        let _ = crate::pump::pump_once(index as usize);
+        let still_pending = !CAPTURED.lock().iter().any(|e| {
+            e.len() >= 8
+                && u16::from_le_bytes([e[0], e[1]]) == EV_CMD_COMPLETE
+                && u16::from_le_bytes([e[6], e[7]]) == OP_DISCONNECT
+        }) && crate::pump::connection_count(index as usize) == Some(1);
+        // The Disconnection Complete lands the Command Complete.
+        lt.enqueue_event(disconnection_complete_event(0x0040));
+        let _ = crate::pump::pump_once(index as usize);
+        let completed = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 16
+                && u16::from_le_bytes([e[0], e[1]]) == EV_CMD_COMPLETE
+                && u16::from_le_bytes([e[6], e[7]]) == OP_DISCONNECT
+                && e[8] == STATUS_SUCCESS
+                && e[9..15] == peer6[..]
+                && e[15] == 0x01
+        });
+        let gone = crate::pump::connection_count(index as usize) == Some(0);
+        let conns = handle(&mgmt_cmd(OP_GET_CONNECTIONS, index, &[]));
+        let conns_empty = is_cmd_complete(&conns, OP_GET_CONNECTIONS, STATUS_SUCCESS)
+            && u16::from_le_bytes([conns[0][9], conns[0][10]]) == 0;
+        let again = handle(&mgmt_cmd(OP_DISCONNECT, index, &disc_params));
+        let nc_ok = is_cmd_complete(&again, OP_DISCONNECT, STATUS_NOT_CONNECTED)
+            && again[0][9..15] == peer6[..]
+            && again[0][15] == 0x01;
+        if let Some(prev) = previous {
+            narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+        }
+        cleanup_mgmt();
+        if !powered || !connected {
+            return TestResult::Fail("fixture connection did not come up");
+        }
+        if !no_immediate_reply || !hci_sent {
+            return TestResult::Fail("DISCONNECT did not issue HCI Disconnect with no reply");
+        }
+        if !busy_ok {
+            return TestResult::Fail("second DISCONNECT while pending was not BUSY");
+        }
+        if !still_pending {
+            return TestResult::Fail("Command Status completed the pending DISCONNECT early");
+        }
+        if !completed || !gone || !conns_empty {
+            return TestResult::Fail("Disconnection Complete did not land the disconnect");
+        }
+        if !nc_ok {
+            return TestResult::Fail("DISCONNECT for a gone peer was not NOT_CONNECTED");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_disconnect_by_handle);
+
+    /// #1527: DISCONNECT rejections are Command Completes
+    /// echoing the address (Linux `disconnect()`): bad address
+    /// type → INVALID_PARAMS, unpowered → NOT_POWERED, no
+    /// connection → NOT_CONNECTED. A bad index / short params
+    /// stay Command Status (the general mgmt rule). DISCONNECT
+    /// is advertised in READ_COMMANDS.
+    fn smoke_mgmt_disconnect_rejections() -> TestResult {
+        let (lt, index) = setup_controller(controller::ControllerInfo::default());
+        let peer6 = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
+        let mut disc_params = [0u8; 7];
+        disc_params[..6].copy_from_slice(&peer6);
+        disc_params[6] = 0x01; // LE public
+        let echo_ok = |r: &[Vec<u8>]| r[0][9..15] == peer6[..] && r[0][15] == 0x01;
+        let bad_idx = handle(&mgmt_cmd(OP_DISCONNECT, 0x00ff, &disc_params));
+        let bad_idx_ok = is_cmd_status(&bad_idx, OP_DISCONNECT, STATUS_INVALID_INDEX);
+        let short = handle(&mgmt_cmd(OP_DISCONNECT, index, &[0xA0, 0xA1, 0xA2]));
+        let short_ok = is_cmd_status(&short, OP_DISCONNECT, STATUS_INVALID_PARAMS);
+        let mut bad_type = disc_params;
+        bad_type[6] = 0x03;
+        let bt = handle(&mgmt_cmd(OP_DISCONNECT, index, &bad_type));
+        let bt_ok = is_cmd_complete(&bt, OP_DISCONNECT, STATUS_INVALID_PARAMS) && echo_ok(&bt);
+        let np = handle(&mgmt_cmd(OP_DISCONNECT, index, &disc_params));
+        let np_ok = is_cmd_complete(&np, OP_DISCONNECT, STATUS_NOT_POWERED) && echo_ok(&np);
+        let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
+        let nc = handle(&mgmt_cmd(OP_DISCONNECT, index, &disc_params));
+        let nc_ok = is_cmd_complete(&nc, OP_DISCONNECT, STATUS_NOT_CONNECTED) && echo_ok(&nc);
+        let cmds = handle(&mgmt_cmd(OP_READ_COMMANDS, MGMT_INDEX_NONE, &[]));
+        let advertised = {
+            let c = &cmds[0];
+            let n = u16::from_le_bytes([c[9], c[10]]) as usize;
+            (0..n).any(|i| u16::from_le_bytes([c[13 + 2 * i], c[14 + 2 * i]]) == OP_DISCONNECT)
+        };
+        cleanup_mgmt();
+        if !bad_idx_ok || !short_ok {
+            return TestResult::Fail("DISCONNECT bad index / short params was not CMD_STATUS");
+        }
+        if !bt_ok {
+            return TestResult::Fail("DISCONNECT bad address type was not INVALID_PARAMS echo");
+        }
+        if !np_ok || !powered {
+            return TestResult::Fail("DISCONNECT power gating failed");
+        }
+        if !nc_ok {
+            return TestResult::Fail("DISCONNECT with no connection was not NOT_CONNECTED");
+        }
+        if !advertised {
+            return TestResult::Fail("READ_COMMANDS does not advertise DISCONNECT");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_disconnect_rejections);
+
+    /// #1527: a refused HCI Disconnect Command Status
+    /// completes the pending DISCONNECT as FAILED (no
+    /// Disconnection Complete follows a refusal) and the
+    /// connection stays up; a later DISCONNECT is accepted
+    /// again once the refusal cleared the pending record.
+    fn smoke_mgmt_disconnect_refused_command_status() -> TestResult {
+        let (lt, index) = setup_controller(controller::ControllerInfo::default());
+        let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
+        let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
+        let peer6 = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
+        let mut disc_params = [0u8; 7];
+        disc_params[..6].copy_from_slice(&peer6);
+        disc_params[6] = 0x01; // LE public
+        lt.enqueue_event(le_conn_complete_event(0x0040, peer6));
+        let _ = crate::pump::pump_once(index as usize);
+        let connected = crate::pump::connection_count(index as usize) == Some(1);
+        CAPTURED.lock().clear();
+        let reply = handle(&mgmt_cmd(OP_DISCONNECT, index, &disc_params));
+        let accepted = reply.is_empty();
+        // Refused (Unknown Connection 0x02): FAILED, link stays up.
+        lt.enqueue_event(command_status_event(op::HCI_DISCONNECT, 0x02));
+        let _ = crate::pump::pump_once(index as usize);
+        let failed = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 16
+                && u16::from_le_bytes([e[0], e[1]]) == EV_CMD_COMPLETE
+                && u16::from_le_bytes([e[6], e[7]]) == OP_DISCONNECT
+                && e[8] == STATUS_FAILED
+                && e[9..15] == peer6[..]
+                && e[15] == 0x01
+        });
+        let still_up = crate::pump::connection_count(index as usize) == Some(1);
+        // A fresh DISCONNECT is accepted again after the refusal.
+        CAPTURED.lock().clear();
+        let reply2 = handle(&mgmt_cmd(OP_DISCONNECT, index, &disc_params));
+        let accepted2 = reply2.is_empty();
+        lt.enqueue_event(command_status_event(op::HCI_DISCONNECT, 0x00));
+        let _ = crate::pump::pump_once(index as usize);
+        let still_pending = !CAPTURED.lock().iter().any(|e| {
+            e.len() >= 8
+                && u16::from_le_bytes([e[0], e[1]]) == EV_CMD_COMPLETE
+                && u16::from_le_bytes([e[6], e[7]]) == OP_DISCONNECT
+        });
+        lt.enqueue_event(disconnection_complete_event(0x0040));
+        let _ = crate::pump::pump_once(index as usize);
+        let completed = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 16
+                && u16::from_le_bytes([e[0], e[1]]) == EV_CMD_COMPLETE
+                && u16::from_le_bytes([e[6], e[7]]) == OP_DISCONNECT
+                && e[8] == STATUS_SUCCESS
+                && e[9..15] == peer6[..]
+                && e[15] == 0x01
+        });
+        let gone = crate::pump::connection_count(index as usize) == Some(0);
+        if let Some(prev) = previous {
+            narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+        }
+        cleanup_mgmt();
+        if !powered || !connected {
+            return TestResult::Fail("fixture connection did not come up");
+        }
+        if !accepted || !failed || !still_up {
+            return TestResult::Fail("refused Command Status did not fail the DISCONNECT");
+        }
+        if !accepted2 || !still_pending {
+            return TestResult::Fail("DISCONNECT was not accepted again after the refusal");
+        }
+        if !completed || !gone {
+            return TestResult::Fail("retry DISCONNECT did not land on Disconnection Complete");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/mgmt",
+        smoke_mgmt_disconnect_refused_command_status
+    );
 }
