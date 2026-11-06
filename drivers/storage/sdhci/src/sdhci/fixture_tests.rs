@@ -592,10 +592,11 @@ impl SdhciTransport for FixtureTransport {
                     st.write_lba
                 };
                 let block = st.write_stage;
-                if st.current_access == 0 {
+                let access = st.current_access;
+                if access == 0 {
                     st.image.insert(lba, block);
                 } else {
-                    st.part_image.insert((st.current_access, lba), block);
+                    st.part_image.insert((access, lba), block);
                 }
             }
         } else {
@@ -886,9 +887,9 @@ fn fixture_emmc_identify_publish_partitions() -> TestResult {
         // Reads land in the partition they name: user, boot 1/2,
         // GP1 (first and last block), GP2, GP4.
         let mut buf = [0u8; 512];
-        let read_pat = |dev: &alloc::sync::Arc<dyn narf_block::registry::BlockDeviceSync>,
-                        lba: u64,
-                        want: u8|
+        let mut read_pat = |dev: &alloc::sync::Arc<dyn narf_block::registry::BlockDeviceSync>,
+                            lba: u64,
+                            want: u8|
          -> Result<(), &'static str> {
             dev.read(lba, 1, &mut buf)
                 .map_err(|_| "partition read failed")?;
