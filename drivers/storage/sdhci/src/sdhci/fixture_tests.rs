@@ -32,6 +32,18 @@
 //!   model. An SDMA transfer can be made to stop at a 512 KiB
 //!   boundary once (`set_sdma_boundary_once`), completing only
 //!   when the driver reprograms the address, as real silicon does.
+//!   block word-by-word on CMD17 and captures it on CMD24.
+//! - Present State (§2.2.9) reports a card inserted — and Card
+//!   State Stable with it (the model debounces instantly; the
+//!   controller's debounce is what the bit models). `insert_card`
+//!   / `remove_card` move the modelled card and raise the
+//!   corresponding present-change edge in Normal Interrupt Status
+//!   (§2.2.18) — but only when the matching enable bit is set in
+//!   Normal Interrupt Status Enable, as the spec gates the status
+//!   bit itself on the enable. A test that wants edges must enable
+//!   them first, as `bring_up` step 5 does.
+//! - Software Reset (§2.2.16) self-clears all three reset bits,
+//!   not just SRST_ALL.
 //!
 //! The card model speaks the SD identification conversation (SD
 //! Physical Layer Simplified Specification §4) and stores blocks
@@ -219,6 +231,9 @@ struct SdmaPending {
 struct FixtureState {
     /// The 0x100-byte register file, byte-addressed.
     regs: [u8; 0x100],
+    /// Whether a card is in the modelled slot. Drives Present
+    /// State (§2.2.9) and the present-change edges (§2.2.18).
+    card_present: bool,
     /// Sparse card storage, keyed by block index.
     image: BTreeMap<u32, [u8; 512]>,
     /// Bytes staged for the Buffer Data Port by the current read
@@ -419,6 +434,28 @@ impl FixtureState {
         self.read_cursor = 0;
     }
 
+    /// Move the modelled card and raise the present-change edge
+    /// (§2.2.18) for the transition — gated on the matching Normal
+    /// Interrupt Status Enable bit, as the spec gates the status
+    /// bit itself on the enable. A no-op when the slot already
+    /// holds (or lacks) a card: no edge, no bounce.
+    fn set_card_present(&mut self, present: bool) {
+        if self.card_present == present {
+            return;
+        }
+        self.card_present = present;
+        let en = self.get16(REG_NORMAL_INT_EN);
+        let edge = if present {
+            NIS_CARD_INSERTION
+        } else {
+            NIS_CARD_REMOVAL
+        };
+        if en & edge != 0 {
+            let cur = self.get16(REG_NORMAL_INT_STS);
+            self.set16(REG_NORMAL_INT_STS, cur | edge);
+        }
+    }
+
     /// Execute the command staged by a Command-register write.
     fn exec_cmd(&mut self, index: u8) {
         let arg = self.get32(REG_ARGUMENT);
@@ -540,7 +577,9 @@ impl core::fmt::Debug for FixtureTransport {
 }
 
 impl FixtureTransport {
-    /// A controller with a card whose storage is `image`.
+    /// A controller with a card whose storage is `image`. The card
+    /// starts present in the slot; use `insert_card` /
+    /// `remove_card` to move it.
     pub fn with_image(image: BTreeMap<u32, [u8; 512]>) -> Self {
         let mut regs = [0u8; 0x100];
         regs[0x40..0x44].copy_from_slice(&FIXTURE_CAPS.to_le_bytes());
@@ -548,6 +587,7 @@ impl FixtureTransport {
         FixtureTransport {
             state: IrqSafeSpinLock::new(FixtureState {
                 regs,
+                card_present: true,
                 image,
                 read_stage: Vec::new(),
                 read_cursor: 0,
@@ -622,6 +662,17 @@ impl FixtureTransport {
     /// once (see `run_dma`).
     pub fn set_sdma_boundary_once(&self) {
         self.state.lock().sdma_boundary_once = true;
+    }
+    /// Insert a card into the modelled slot (raises the Card
+    /// Insertion edge when the driver enabled it).
+    pub fn insert_card(&self) {
+        self.state.lock().set_card_present(true);
+    }
+
+    /// Remove the card from the modelled slot (raises the Card
+    /// Removal edge when the driver enabled it).
+    pub fn remove_card(&self) {
+        self.state.lock().set_card_present(false);
     }
 
     /// Every SD command index the controller ran, in order.
@@ -706,12 +757,20 @@ impl SdhciTransport for FixtureTransport {
                 }
                 w
             }
-            // A card is always inserted in the fixture; the DAT
-            // level bits track the modelled card state (low
-            // during a voltage switch, high otherwise).
+            // Present State (§2.2.9): Card Inserted + Card State
+            // Stable follow the modelled card; both clear when the
+            // slot is empty. The DAT level bits track the modelled
+            // card state (low during a voltage switch, high
+            // otherwise).
             REG_PRESENT_STATE => {
-                let base = st.get32(offset) & !PSTATE_DAT_LVL_MASK;
-                base | ((st.dat_level as u32) << PSTATE_DAT_LVL_SHIFT) | PSTATE_CARD_INSERTED
+                let base = st.get32(offset)
+                    & !(PSTATE_CARD_INSERTED | PSTATE_CARD_STATE_STABLE | PSTATE_DAT_LVL_MASK);
+                let with_dat = base | ((st.dat_level as u32) << PSTATE_DAT_LVL_SHIFT);
+                if st.card_present {
+                    with_dat | PSTATE_CARD_INSERTED | PSTATE_CARD_STATE_STABLE
+                } else {
+                    with_dat
+                }
             }
             _ => st.get32(offset),
         }
@@ -1993,4 +2052,165 @@ fn fixture_sdhci_uhs_cmd11_rejected() -> TestResult {
 kernel_test_in!(
     "drivers/storage/sdhci/fixture",
     fixture_sdhci_uhs_cmd11_rejected
+);
+
+// ── Card detect (#836) ────────────────────────────────────────────
+
+/// Empty slot → insert → identify + publish → remove → unpublish
+/// → re-insert → re-probe, all through the production
+/// `poll_card_slot` path. The controller itself stays installed
+/// throughout: only the card state toggles.
+fn fixture_card_detect_insert_remove_reprobe() -> TestResult {
+    let (transport, saved) = install(partitioned_image());
+    // As bring_up step 5 does: enable all normal-interrupt status,
+    // so the present-change edges can set.
+    transport.write16(REG_NORMAL_INT_EN, 0xFFFF);
+    transport.remove_card();
+
+    let result = (|| {
+        // Empty slot: the poll is a no-op.
+        poll_card_slot();
+        if narf_block::registry::find_block_device("sdhci0").is_some() {
+            return Err("empty slot must not publish sdhci0");
+        }
+        // Insert: the present-change edge sets, then the poll
+        // identifies the card and publishes it + partitions.
+        transport.insert_card();
+        if transport.read16(REG_NORMAL_INT_STS) & NIS_CARD_INSERTION == 0 {
+            return Err("insertion must set the Card Insertion status bit");
+        }
+        poll_card_slot();
+        if transport.read16(REG_NORMAL_INT_STS) & NIS_CARD_INSERTION != 0 {
+            return Err("poll must acknowledge (clear) the Card Insertion status bit");
+        }
+        let p1 = narf_block::registry::find_block_device("sdhci0p1")
+            .ok_or("sdhci0p1 not registered after insertion")?;
+        if p1.capacity() != 4096 {
+            return Err("sdhci0p1 capacity must be the MBR sector count (4096)");
+        }
+        // A read through the freshly published card lands on the
+        // right card block.
+        let mut buf = [0u8; 512];
+        p1.read(0, 1, &mut buf)
+            .map_err(|_| "p1 read after insertion failed")?;
+        if buf != partition_pattern(0xA1) {
+            return Err("sdhci0p1 block 0 must be card block 2048 after insertion");
+        }
+        // A second poll with the card already known re-identifies
+        // nothing: the identify conversation runs exactly once per
+        // insertion.
+        let cmds_before = transport.cmd_indices().len();
+        poll_card_slot();
+        if transport.cmd_indices().len() != cmds_before {
+            return Err("poll with a known card must not re-run identify");
+        }
+        // Removal withdraws parent + partitions together, and the
+        // controller forgets the card — but stays installed.
+        transport.remove_card();
+        if transport.read16(REG_NORMAL_INT_STS) & NIS_CARD_REMOVAL == 0 {
+            return Err("removal must set the Card Removal status bit");
+        }
+        poll_card_slot();
+        for name in ["sdhci0", "sdhci0p1", "sdhci0p2"] {
+            if narf_block::registry::find_block_device(name).is_some() {
+                return Err("removed card's devices must be unregistered");
+            }
+        }
+        let ctrl = probed_sdhci().ok_or("controller must stay installed after removal")?;
+        if ctrl.card.lock().is_some() {
+            return Err("controller must forget the card on removal");
+        }
+        // A further poll on the empty slot is a no-op, and
+        // re-insertion re-probes the card end to end.
+        poll_card_slot();
+        transport.insert_card();
+        poll_card_slot();
+        let p1 = narf_block::registry::find_block_device("sdhci0p1")
+            .ok_or("sdhci0p1 not registered after re-insertion")?;
+        if p1.capacity() != 4096 {
+            return Err("re-probed sdhci0p1 capacity must be the MBR sector count (4096)");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_card_detect_insert_remove_reprobe
+);
+
+/// A command's blanket NIS clear (`cmd()` writes 0xFFFF to
+/// REG_NORMAL_INT_STS at the start of every command) can wipe a
+/// pending present-change edge before the poller sees it. The
+/// Present State level — not the edge — must still drive the
+/// identify.
+fn fixture_card_detect_level_fallback_when_edge_wiped() -> TestResult {
+    let (transport, saved) = install(partitioned_image());
+    transport.write16(REG_NORMAL_INT_EN, 0xFFFF);
+    transport.remove_card();
+
+    let result = (|| {
+        poll_card_slot();
+        transport.insert_card();
+        // Simulate the race: a command clears all NIS bits.
+        transport.write16(REG_NORMAL_INT_STS, 0xFFFF);
+        if transport.read16(REG_NORMAL_INT_STS) & NIS_CARD_INSERTION != 0 {
+            return Err("test setup: the insertion edge must be wiped before the poll");
+        }
+        poll_card_slot();
+        if narf_block::registry::find_block_device("sdhci0").is_none() {
+            return Err(
+                "card must still identify from the Present State level after the edge was wiped",
+            );
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_card_detect_level_fallback_when_edge_wiped
+);
+
+/// Insertion followed by removal before any poll: no card was ever
+/// identified, so the poll must publish nothing and withdraw
+/// nothing — and the controller stays installed for the next card.
+fn fixture_card_detect_insert_then_remove_before_poll() -> TestResult {
+    let (transport, saved) = install(partitioned_image());
+    transport.write16(REG_NORMAL_INT_EN, 0xFFFF);
+    transport.remove_card();
+
+    let result = (|| {
+        poll_card_slot();
+        transport.insert_card();
+        transport.remove_card();
+        poll_card_slot();
+        if narf_block::registry::find_block_device("sdhci0").is_some() {
+            return Err("card removed before any poll must never publish sdhci0");
+        }
+        if probed_sdhci().is_none() {
+            return Err("controller must stay installed after an unpolled insert/remove");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_card_detect_insert_then_remove_before_poll
 );
