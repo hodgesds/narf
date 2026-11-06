@@ -568,6 +568,11 @@ impl Connection {
 /// One established SCO/eSCO link: the Synchronous Connection
 /// Complete's handle + negotiated lengths, the ACL handle it rides
 /// on, and staged inbound frames.
+///
+/// Negotiated link state (`voice_setting`, `tx_packet_length`,
+/// `rx_packet_length`) is recorded for future SCO_CONNINFO
+/// reporting; no reader exists yet.
+#[allow(dead_code)]
 #[derive(Debug)]
 struct ScoLink {
     /// SCO connection handle (from Synchronous Connection Complete).
@@ -2075,6 +2080,17 @@ impl PumpCore {
             // and the completion) — nothing to stage it on.
             return;
         };
+        // Voice setting the link was opened with: the pending setup's
+        // BT_VOICE when this completion answers our outbound setup.
+        // Synchronous Connection Complete carries no voice setting,
+        // so a peer-initiated link (no matching pending setup)
+        // records the CVSD default — the same default a socket
+        // starts with.
+        let voice_setting = self
+            .pending_sco
+            .as_ref()
+            .filter(|_| pending_matches)
+            .map_or(classic::SCO_VOICE_SETTING_CVSD, |p| p.voice_setting);
         if pending_matches {
             self.pending_sco = None;
         }
@@ -2085,6 +2101,7 @@ impl PumpCore {
             handle: sc.handle,
             acl_handle,
             peer: sc.bd_addr,
+            voice_setting,
             tx_packet_length: sc.tx_packet_length,
             rx_packet_length: sc.rx_packet_length,
             mtu: self.sco_mtu(),
