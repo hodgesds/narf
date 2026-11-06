@@ -789,7 +789,7 @@ async fn scan_link_down_inner(
     let auth = read_auth_statuses(ctl, route, port).await;
     let mut opened = Vec::new();
     for index in 1..=MAX_RETIMERS {
-        if set_inbound_sbtx(ctl, route, port, index).is_ok() {
+        if set_inbound_sbtx(ctl, route, port, index).await.is_ok() {
             opened.push(index);
         }
     }
