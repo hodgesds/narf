@@ -463,7 +463,7 @@ mod tests {
             }
             // Baseline I/O works and returns the MBR entry's block.
             let first = read_sdhci0_block(2048)?;
-            if first[0] != (0xA1 ^ 0) {
+            if first[0] != 0xA1 {
                 return Err("baseline read must return the fixture block");
             }
             let cmds_before = transport.cmd_indices();
