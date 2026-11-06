@@ -398,7 +398,6 @@ impl Rtl8139 {
 
 // ── HwNic adapter ───────────────────────────────────────────────────
 
-#[derive(Debug)]
 /// One probed port, as the net stack sees it.
 ///
 /// This owns its `Arc<Rtl8139>` rather than looking the controller up
