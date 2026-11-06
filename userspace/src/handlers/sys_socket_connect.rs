@@ -116,7 +116,7 @@ fn inet_wait_for_connect(
 /// Nothing spins: the CPU idles while the HCI setup runs.
 fn sco_wait_for_connect(
     ctx: &mut dyn TrapContext,
-    sock: &crate::socket::SocketFile,
+    sock: &alloc::sync::Arc<crate::socket::SocketFile>,
     errno: i64,
     resumed: Option<u64>,
 ) {
