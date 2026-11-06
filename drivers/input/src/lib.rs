@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod alps;
 pub mod amd_sfh;
 pub mod goodix;
 pub mod hid_elan;
