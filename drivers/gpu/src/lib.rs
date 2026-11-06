@@ -628,6 +628,8 @@ pub mod amdgpu_dp_bridge;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_vcn;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_smu_apu_telemetry;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_navi48;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_navi48_telemetry;
