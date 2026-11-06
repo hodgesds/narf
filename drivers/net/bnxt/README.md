@@ -1,14 +1,18 @@
 # drivers/net/bnxt — Broadcom NetXtreme-C/E NIC
 
-Early bring-up only for the Broadcom BCM573xx/BCM574xx/BCM575xx
-series. `bnxt.rs` maps BAR0, reads the version register, asserts a
-MAC reset and polls for it to clear; `register_pci_driver` matches a
-single device, the BCM57414. There is no TX/RX path, no `HwNic`
-implementation, and probe notes it would normally register with the
-net registry — the datapath is still to come.
+Explicit refusal marker, not a driver (issue #798). The real datapath
+is NOT implemented and is deferred out of desktop scope: there is no
+TX/RX path and no `HwNic` implementation. `bnxt.rs` probe declines
+every BCM57414 with `ProbeError::NotForThisDriver` before touching
+the hardware (no BAR0 map, no MAC reset), so the device is never
+presented as bound and stays available to the next claimant in the
+bus arbitration walk (bus spec §9.3). This replaces the earlier
+probe-shaped stub (BAR0 map + reset-bit pulse + "would normally
+register to net registry here"), so coverage inventories stop
+counting bnxt as a driver.
 
-Dual-build: the built-in build compiles the driver in `bnxt.rs`; the
+Dual-build: the built-in build compiles the refusal in `bnxt.rs`; the
 `.ko` build registers through the `narf_register_pci_driver` KSYMTAB
-export and is registration-only until the device datapath ABI lands.
+export and its probe thunk returns `-ENOSYS` for the same reason.
 
 - Spec: [drivers/net specification](../specification/spec.md)

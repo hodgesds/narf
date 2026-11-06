@@ -1,75 +1,30 @@
-//! Cisco VIC (enic) Ethernet driver.
+//! Cisco VIC (enic) Ethernet driver — explicit refusal marker.
 //!
-//! Provides support for the Cisco Virtual Interface Card (VIC) Ethernet
-//! controllers, typically found in Cisco UCS environments.
+//! The real datapath is NOT implemented and is deferred out of the
+//! desktop scope (issue #798): there is no TX/RX path and no `HwNic`
+//! implementation. Probe declines every device with
+//! `ProbeError::NotForThisDriver` *before touching the hardware*, so
+//! the device is never presented as bound and stays available to the
+//! next claimant in the bus arbitration walk (bus spec §9.3).
 //!
 //! References: `linux/drivers/net/ethernet/cisco/enic/`
 
-extern crate alloc;
-
-use alloc::sync::Arc;
-use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BusDevice, BusDeviceCap, ProbeError};
 use narf_capabilities::{Cap, Write};
 
 const ENIC_PCI_VENDOR: u16 = 0x1137; // Cisco Systems
 const ENIC_PCI_DEVICE_VIC: u16 = 0x0043;
 
-// Basic ENIC registers
-const ENIC_DEVCMD: u64 = 0x00;
-const ENIC_DEVCMD_STAT: u64 = 0x04;
-const ENIC_CMD_RESET: u32 = 0x01;
-
-#[derive(Debug)]
-pub struct EnicNic {
-    mmio: MmioRegion,
-}
-
-impl EnicNic {
-    pub fn new(mmio: MmioRegion) -> Self {
-        let nic = Self { mmio };
-        nic.init();
-        nic
-    }
-
-    fn read_u32(&self, offset: u64) -> u32 {
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { self.mmio.read32(offset) }
-    }
-
-    fn write_u32(&self, offset: u64, val: u32) {
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { self.mmio.write32(offset, val) }
-    }
-
-    fn init(&self) {
-        // Issue firmware reset command
-        self.write_u32(ENIC_DEVCMD, ENIC_CMD_RESET);
-
-        let mut timeout = 100_000;
-        while (self.read_u32(ENIC_DEVCMD_STAT) & 0x1) == 0 {
-            timeout -= 1;
-            if timeout == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-    }
-}
-
-pub fn probe(
-    device: BusDevice,
-    _cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let mmio = match unsafe { narf_bus::map_bar(&device, 0) } {
-        // Enic uses BAR0 for vNIC config
-        Ok(m) => m,
-        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
-    };
-
-    let _nic = Arc::new(EnicNic::new(mmio));
-    // Would normally register to net registry here
-    Ok(())
+/// Probe entry — installed via `bus::register_pci_driver`.
+///
+/// Explicit refusal, not a driver: the enic datapath is deferred out
+/// of desktop scope (#798), so this always declines with
+/// `NotForThisDriver`. The dispatcher returns the device to the
+/// candidate list and attempts the next-most-specific match. No BAR
+/// is mapped and no reset is issued — declining must not disturb
+/// hardware another driver may later claim.
+pub fn probe(_device: BusDevice, _cap: Cap<BusDeviceCap, Write>) -> Result<(), ProbeError> {
+    Err(ProbeError::NotForThisDriver)
 }
 
 pub fn register_pci_driver() {

@@ -2309,3 +2309,115 @@ kernel_test_in!(
     "drivers/net/core",
     smoke_netdev_single_pump_construction_r8169
 );
+
+// ── bnxt / enic explicit refusal (#798) ────────────────────────────
+//
+// Both drivers are refusal markers, not drivers: probe declines with
+// `ProbeError::NotForThisDriver` before touching the hardware. The
+// dispatcher then offers the device to the next claimant (bus spec
+// §9.3), so a synthetic device carrying the driver's real PCI ids must
+// end up bound by a fallback claimant registered behind it — never by
+// the driver itself. The ids below are the drivers' own match-table
+// ids, stated independently here so the fixture does not just agree
+// with the code on a shared constant (Broadcom 0x14E4 / BCM57414
+// 0x16D7; Cisco 0x1137 / VIC 0x0043).
+
+static REFUSAL_FALLBACK_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Fallback claimant for the refusal fixtures: binds anything it is
+/// offered, so a hit proves the refusing driver left the device
+/// available to the next candidate in the walk.
+fn refusal_fallback_probe(
+    _device: narf_bus::BusDevice,
+    _cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    REFUSAL_FALLBACK_HITS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+fn smoke_refusal_probe_declines(vendor: u16, device: u16, register_driver: fn()) -> TestResult {
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{
+        append_devices, bootstrap_registry_authority, probe_all_pci, register_pci_driver,
+        registered_pci_drivers, BusAddr, BusDevice, BusKind, DeviceId, MatchKind, PciMatch,
+        PcieAddr,
+    };
+
+    // Synthetic device carrying the driver's real PCI ids. The
+    // cfg_phys is never dereferenced: the refusing probe declines
+    // before mapping anything and the fallback is pure (same
+    // reasoning as the bus arbitration fixtures in bus/src/tests.rs).
+    // No in-tree driver class-matches base class 0x02, so only the
+    // driver itself and the fallback below can ever claim it.
+    let addr = PcieAddr::new(0, 0x02, 0, 0);
+    append_devices(alloc::vec![BusDevice {
+        addr: BusAddr::Pcie(addr),
+        id: DeviceId {
+            vendor,
+            device,
+            class: 0x020000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    }]);
+
+    __reset_for_test();
+    register_driver();
+    // Pin the match-table wiring too: the driver must claim exactly
+    // this id, or the refusal below would be vacuous.
+    let matched = registered_pci_drivers().iter().any(|m| {
+        matches!(
+            m.kind,
+            MatchKind::VendorDevice {
+                vendor: v,
+                device: d
+            } if v == vendor && d == device
+        )
+    });
+    if !matched {
+        return TestResult::Fail("refusing driver did not register its PCI id");
+    }
+    // Fallback claimant for exactly this id, registered behind the
+    // driver: same VendorDevice specificity, so registration order
+    // attempts it second — only after the driver declines.
+    register_pci_driver(PciMatch {
+        name: "refusal-fallback",
+        kind: MatchKind::VendorDevice { vendor, device },
+        probe: refusal_fallback_probe,
+    });
+
+    let before = REFUSAL_FALLBACK_HITS.load(core::sync::atomic::Ordering::SeqCst);
+    let authority = bootstrap_registry_authority();
+    let bound = match probe_all_pci(&authority) {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("probe_all_pci failed"),
+    };
+    let hits = REFUSAL_FALLBACK_HITS.load(core::sync::atomic::Ordering::SeqCst) - before;
+    if bound != 1 {
+        return TestResult::Fail("refusal walk bound != 1 device");
+    }
+    if hits != 1 {
+        return TestResult::Fail("refusing driver claimed the device or the fallback never ran");
+    }
+    TestResult::Pass
+}
+
+fn smoke_bnxt_probe_refuses_and_leaves_device_claimable() -> TestResult {
+    smoke_refusal_probe_declines(0x14E4, 0x16D7, crate::bnxt::register_pci_driver)
+}
+kernel_test_in!(
+    "drivers/net/bnxt",
+    smoke_bnxt_probe_refuses_and_leaves_device_claimable
+);
+
+fn smoke_enic_probe_refuses_and_leaves_device_claimable() -> TestResult {
+    smoke_refusal_probe_declines(0x1137, 0x0043, crate::enic::register_pci_driver)
+}
+kernel_test_in!(
+    "drivers/net/enic",
+    smoke_enic_probe_refuses_and_leaves_device_claimable
+);
