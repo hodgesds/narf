@@ -45,6 +45,7 @@
 //!   0x07 VS_FRAME_MJPEG
 //!   0x10 VS_FORMAT_FRAME_BASED   — H.264 etc.
 //!   0x11 VS_FRAME_FRAME_BASED
+//!   0x12 VS_FORMAT_STREAM_BASED   — MPEG-2 TS etc. (Table A-6)
 
 use alloc::vec::Vec;
 
@@ -75,6 +76,7 @@ pub const VS_FORMAT_MJPEG: u8 = 0x06;
 pub const VS_FRAME_MJPEG: u8 = 0x07;
 pub const VS_FORMAT_FRAME_BASED: u8 = 0x10;
 pub const VS_FRAME_FRAME_BASED: u8 = 0x11;
+pub const VS_FORMAT_STREAM_BASED: u8 = 0x12;
 
 // Terminal types (table A-1) — selected.
 pub const TT_VENDOR_SPECIFIC: u16 = 0x0100;
@@ -698,6 +700,14 @@ pub struct UvcDevice {
     /// Endpoint whose xHCI context has been configured and whose
     /// alternate setting has been selected, if streaming is active.
     pub active_stream: Option<UvcStreamingEndpoint>,
+    /// Device-accepted Probe/Commit control from the last successful
+    /// negotiation (set by
+    /// [`negotiate_and_activate_video_stream_with`], cleared by
+    /// [`deactivate_video_stream_with`]). The capture pump derives
+    /// its reassembler configuration from it — the negotiated
+    /// `dwMaxVideoFrameSize` bound and `bmFramingInfo` — so the
+    /// pump never reassembles against stale stream parameters.
+    pub negotiated: Option<VsProbeCommit>,
     /// `/dev/video<N>` minor registered for this camera.
     pub video_node: usize,
     /// Generation of the current stream: bumped by every successful
@@ -733,6 +743,33 @@ pub struct UvcDevice {
 /// System-wide registry of bound UVC devices (records carry their
 /// controller).
 pub static UVC_DEVICES: IrqSafeSpinLock<Vec<UvcDevice>> = IrqSafeSpinLock::new(Vec::new());
+
+impl UvcDevice {
+    /// Reassembler configuration for the currently negotiated stream
+    /// (#1334): the negotiated `dwMaxVideoFrameSize` bounds
+    /// accumulation and completes stream-based segments on buffer
+    /// fullness (UVC 1.5 §2.4.3.7); `stream_based` is true exactly
+    /// when the negotiated format index names a
+    /// `VS_FORMAT_STREAM_BASED` entry in the retained format table,
+    /// in which case FID/EOF are honoured only per the negotiated
+    /// `bmFramingInfo`. With no negotiation on record the legacy
+    /// config is returned (FID/EOF machine, unbounded) — the pump
+    /// then behaves exactly as before this lane.
+    pub(crate) fn reassembly_config(&self) -> ReassemblyConfig {
+        let Some(negotiated) = self.negotiated else {
+            return ReassemblyConfig::default();
+        };
+        let stream_based = self.formats.iter().any(|f| {
+            f.format_index == negotiated.format_index
+                && f.pixel_fmt == narf_drivers_video::uvc::PixelFmt::StreamBased
+        });
+        ReassemblyConfig {
+            max_frame_size: negotiated.max_video_frame_size,
+            stream_based,
+            framing_info: negotiated.framing_info,
+        }
+    }
+}
 
 /// The slice of the xHCI surface the UVC streaming composition needs.
 ///
@@ -975,6 +1012,7 @@ pub async fn try_bind_video_with_transport<T: UvcTransport>(
         streaming_endpoints,
         formats: stream_formats,
         active_stream: None,
+        negotiated: None,
         video_node,
         stream_generation: 0,
         capture_pump_generation: 0,
@@ -1303,6 +1341,9 @@ pub async fn deactivate_video_stream_with<T: UvcTransport>(
         let mut devices = UVC_DEVICES.lock();
         let device = devices.get_mut(idx).ok_or(UvcError::NotVideo)?;
         device.capture_stop_requested = true;
+        // The negotiated control goes with the stream: a later pump
+        // must never reassemble against superseded parameters.
+        device.negotiated = None;
         (device.slot_id, device.active_stream.take())
     };
     if let Some(endpoint) = active {
@@ -1328,6 +1369,16 @@ pub async fn deactivate_video_stream_with<T: UvcTransport>(
 pub struct UvcNegotiatedStream {
     pub control: VsProbeCommit,
     pub endpoint: UvcStreamingEndpoint,
+}
+
+/// Store the device-accepted Probe/Commit control on the device
+/// record (see [`UvcDevice::negotiated`]) after a successful
+/// negotiation + activation, so the capture pump can derive its
+/// reassembler configuration from the negotiated stream parameters.
+fn retain_negotiated_stream(idx: usize, accepted: VsProbeCommit) {
+    if let Some(device) = UVC_DEVICES.lock().get_mut(idx) {
+        device.negotiated = Some(accepted);
+    }
 }
 
 /// Run the version-aware negotiation sequence (26-byte UVC 1.0,
@@ -1452,6 +1503,11 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
             return Err(e);
         }
     };
+    // Retain the device-accepted control before returning: the
+    // capture pump derives its reassembler configuration from it.
+    // `VsProbeCommit` is `Copy`, so `accepted` is still available
+    // for the return value below.
+    retain_negotiated_stream(idx, accepted);
     Ok(UvcNegotiatedStream {
         control: accepted,
         endpoint,
@@ -1570,20 +1626,28 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
     transport: &T,
     generation: u64,
 ) -> Result<(), UvcError> {
-    let (slot_id, endpoint, video_node) = {
+    let (slot_id, endpoint, video_node, reassembly) = {
         let devices = UVC_DEVICES.lock();
         let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
         (
             device.slot_id,
             device.active_stream.ok_or(UvcError::NoStreamingEndpoint)?,
             device.video_node,
+            // Snapshot the negotiated stream parameters with the
+            // endpoint: the reassembler completes stream-based
+            // segments on buffer fullness at the negotiated
+            // dwMaxVideoFrameSize and caps accumulation there (#1334).
+            // A stream negotiated before this lane (or a fixture pump
+            // with no negotiation on record) yields the legacy
+            // config, so the pump behaves exactly as before.
+            device.reassembly_config(),
         )
     };
     let packet_size = usize::try_from(endpoint.max_payload_size)
         .unwrap_or(4096)
         .clamp(1, 4096);
     let mut packet = alloc::vec![0u8; packet_size];
-    let mut reassembler = UvcFrameReassembler::new();
+    let mut reassembler = UvcFrameReassembler::with_config(reassembly);
     let mut consecutive_errors = 0u8;
 
     loop {
@@ -1883,6 +1947,7 @@ fn video_stream_stop(node: usize) -> narf_drivers_video::v4l2_ioctl::StreamHookF
                     if let Some(device) = devices.get_mut(idx) {
                         device.capture_stop_requested = true;
                         device.active_stream = None;
+                        device.negotiated = None;
                     }
                 }
                 Ok(())
@@ -2200,6 +2265,62 @@ impl VsProbeCommit {
     }
 }
 
+/// `bmFramingInfo` D0 (UVC 1.5 §4.3.1.1 Table 4-47): the FID field is
+/// required in the payload header; the sender must toggle FID at
+/// least every `dwMaxVideoFrameSize` bytes.
+pub const FRAMING_FID: u8 = 0x01;
+/// `bmFramingInfo` D1: the EOF field may be present in the payload
+/// header. It is a device error to specify D1 without D0; the
+/// reassembler tolerates it (EOF is still honoured) rather than
+/// failing the stream.
+pub const FRAMING_EOF: u8 = 0x02;
+
+/// How a reassembler completes frames and bounds its buffer.
+///
+/// Mirror of `narf_drivers_video::uvc::payload::ReassemblyConfig`:
+/// the default is the legacy frame-based machine (FID/EOF completion,
+/// no bound). A stream-based stream configures the negotiated
+/// `dwMaxVideoFrameSize` bound plus `bmFramingInfo`, so segments
+/// complete on buffer fullness (UVC 1.5 §2.4.3.7) when the device
+/// sends no usable FID/EOF. A frame-based stream may also configure
+/// a bound: the FID/EOF machine is unchanged and the bound acts as a
+/// safety net (length completion + cap) if EOF is lost.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReassemblyConfig {
+    /// Negotiated `dwMaxVideoFrameSize` in bytes: the maximum frame
+    /// (frame-based) or codec-specific segment (stream-based) size.
+    /// 0 = unbounded (legacy behaviour: no length completion, no cap).
+    pub max_frame_size: u32,
+    /// True for `VS_FORMAT_STREAM_BASED` streams.
+    pub stream_based: bool,
+    /// Negotiated `bmFramingInfo` (D0 = FID required, D1 = EOF may be
+    /// present). Consulted only when `stream_based` is true — for
+    /// known frame-based formats the field is ignored (§4.3.1.1).
+    pub framing_info: u8,
+}
+
+impl ReassemblyConfig {
+    /// Stream-based configuration: complete on buffer fullness at
+    /// `max_frame_size`, honour FID/EOF only per `framing_info`.
+    pub fn stream_based(max_frame_size: u32, framing_info: u8) -> Self {
+        Self {
+            max_frame_size,
+            stream_based: true,
+            framing_info,
+        }
+    }
+
+    /// Frame-based configuration with a bound: the FID/EOF machine
+    /// plus length completion and the cap at `max_frame_size`.
+    pub fn bounded(max_frame_size: u32) -> Self {
+        Self {
+            max_frame_size,
+            stream_based: false,
+            framing_info: 0,
+        }
+    }
+}
+
 // ── Frame reassembler ──────────────────────────────────────────────
 //
 // Drives a sequence of iso payloads through the FID/EOF state
@@ -2213,6 +2334,15 @@ impl VsProbeCommit {
 // boundaries come from the FID toggle with EOF completion
 // (§2.4.3.7). The payload-specific D4 bit and the STI/intra-coded
 // bit are decoded on the header but do not drive completion.
+//
+// Stream-based formats (`VS_FORMAT_STREAM_BASED`) use the same
+// machine with a [`ReassemblyConfig`]: FID/EOF are honoured only
+// when the negotiated `bmFramingInfo` says they are meaningful, and
+// a segment completes when the accumulated payload reaches the
+// negotiated `dwMaxVideoFrameSize` (buffer-fullness completion,
+// §2.4.3.7) — so a stream that signals neither bit still completes
+// frames instead of growing the buffer without bound. The bound
+// also caps accumulation in every mode (see [`push`](UvcFrameReassembler::push)).
 
 #[derive(Debug)]
 pub struct UvcFrameReassembler {
@@ -2225,28 +2355,62 @@ pub struct UvcFrameReassembler {
     pub frame_errored: bool,
     /// Sequence number incremented on each completed frame.
     pub frames_completed: u64,
+    /// Total frames dropped due to error since creation.
+    pub frames_dropped: u64,
+    /// Completion / cap configuration (default: legacy FID/EOF
+    /// machine, unbounded).
+    pub config: ReassemblyConfig,
+    /// Payload bytes dropped because a push would have grown the
+    /// buffer past `config.max_frame_size` (0 when unbounded).
+    pub bytes_dropped_overflow: u64,
 }
 
 impl UvcFrameReassembler {
     pub fn new() -> Self {
+        Self::with_config(ReassemblyConfig::default())
+    }
+
+    /// Build a reassembler with an explicit completion/cap config.
+    pub fn with_config(config: ReassemblyConfig) -> Self {
         Self {
             buffer: Vec::new(),
             current_fid: false,
             frame_errored: false,
             frames_completed: 0,
+            frames_dropped: 0,
+            config,
+            bytes_dropped_overflow: 0,
         }
     }
 
     /// What the reassembler did with the just-pushed packet.
+    ///
+    /// Completion, in order: a meaningful EOF; the accumulation
+    /// reaching `config.max_frame_size` (buffer-fullness completion,
+    /// the stream-based rule when the device signals no boundary);
+    /// a meaningful FID flip, which drops any partial frame and
+    /// starts a new one. When a bound is configured the append is
+    /// clamped to the remaining room: the buffer never exceeds
+    /// `max_frame_size`, the frame completes at the bound, and the
+    /// excess bytes of that packet are dropped (counted in
+    /// `bytes_dropped_overflow`).
     pub fn push(&mut self, packet: &[u8]) -> ReassemblerOutcome {
         let hdr = match UvcPayloadHeader::parse(packet) {
             Ok(h) => h,
             Err(_) => return ReassemblerOutcome::Skipped,
         };
         let payload = &packet[hdr.length as usize..];
+        // In stream-based mode FID/EOF are meaningful only when the
+        // negotiated bmFramingInfo says so (Stream Based Payload 1.5
+        // §2.1; core §4.3.1.1). For known frame-based formats the
+        // field is ignored, so both bits are always meaningful there.
+        let fid_meaningful =
+            !self.config.stream_based || self.config.framing_info & FRAMING_FID != 0;
+        let eof_meaningful =
+            !self.config.stream_based || self.config.framing_info & FRAMING_EOF != 0;
         // FID flip means we're entering a new frame — drop the
         // in-flight buffer (it never saw EOF).
-        if hdr.fid() != self.current_fid {
+        if fid_meaningful && hdr.fid() != self.current_fid {
             self.buffer.clear();
             self.frame_errored = false;
             self.current_fid = hdr.fid();
@@ -2254,11 +2418,23 @@ impl UvcFrameReassembler {
         if hdr.is_error() {
             self.frame_errored = true;
         }
-        self.buffer.extend_from_slice(payload);
-        if hdr.is_eof() {
+        let room = if self.config.max_frame_size == 0 {
+            payload.len()
+        } else {
+            (self.config.max_frame_size as usize).saturating_sub(self.buffer.len())
+        };
+        let take = payload.len().min(room);
+        self.buffer.extend_from_slice(&payload[..take]);
+        self.bytes_dropped_overflow += (payload.len() - take) as u64;
+
+        let eof = eof_meaningful && hdr.is_eof();
+        let full = self.config.max_frame_size != 0
+            && self.buffer.len() >= self.config.max_frame_size as usize;
+        if eof || full {
             if self.frame_errored {
                 self.buffer.clear();
                 self.frame_errored = false;
+                self.frames_dropped += 1;
                 ReassemblerOutcome::Errored
             } else {
                 self.frames_completed += 1;

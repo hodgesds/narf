@@ -38,14 +38,14 @@ pub mod xfer;
 
 // Re-export the most commonly used types.
 pub use descriptor::{
-    DescError, ExtensionUnit, FormatFrameBased, FormatMjpeg, FormatUncompressed, FrameFrameBased,
-    FrameMjpeg, FrameUncompressed, InputTerminal, OutputTerminal, ProcessingUnit, SelectorUnit,
-    VcHeader, VsInputHeader, CS_INTERFACE, GUID_FORMAT_NV12, GUID_FORMAT_YUY2, ITT_CAMERA,
-    OTT_VENDOR_SPECIFIC, TT_STREAMING, USB_CLASS_VIDEO, USB_VIDEO_SUBCLASS_VIDEOCONTROL,
-    USB_VIDEO_SUBCLASS_VIDEOSTREAMING, VC_EXTENSION_UNIT, VC_HEADER, VC_INPUT_TERMINAL,
-    VC_OUTPUT_TERMINAL, VC_PROCESSING_UNIT, VC_SELECTOR_UNIT, VS_FORMAT_FRAME_BASED,
-    VS_FORMAT_MJPEG, VS_FORMAT_UNCOMPRESSED, VS_FRAME_FRAME_BASED, VS_FRAME_MJPEG,
-    VS_FRAME_UNCOMPRESSED, VS_INPUT_HEADER,
+    DescError, ExtensionUnit, FormatFrameBased, FormatMjpeg, FormatStreamBased, FormatUncompressed,
+    FrameFrameBased, FrameMjpeg, FrameUncompressed, InputTerminal, OutputTerminal, ProcessingUnit,
+    SelectorUnit, VcHeader, VsInputHeader, CS_INTERFACE, GUID_FORMAT_NV12, GUID_FORMAT_YUY2,
+    ITT_CAMERA, OTT_VENDOR_SPECIFIC, TT_STREAMING, USB_CLASS_VIDEO,
+    USB_VIDEO_SUBCLASS_VIDEOCONTROL, USB_VIDEO_SUBCLASS_VIDEOSTREAMING, VC_EXTENSION_UNIT,
+    VC_HEADER, VC_INPUT_TERMINAL, VC_OUTPUT_TERMINAL, VC_PROCESSING_UNIT, VC_SELECTOR_UNIT,
+    VS_FORMAT_FRAME_BASED, VS_FORMAT_MJPEG, VS_FORMAT_STREAM_BASED, VS_FORMAT_UNCOMPRESSED,
+    VS_FRAME_FRAME_BASED, VS_FRAME_MJPEG, VS_FRAME_UNCOMPRESSED, VS_INPUT_HEADER,
 };
 
 pub use control::{
@@ -64,8 +64,8 @@ pub use streaming::{
 pub use probe::{is_video_interface, probe_uvc, EndpointInfo, ProbeError, UvcProbeResult};
 
 pub use payload::{
-    FrameReassembler, PayloadError, PayloadHeader, PushResult, BFH_EOF, BFH_EOH, BFH_ERR, BFH_FID,
-    BFH_PTS, BFH_SCR, BFH_STI,
+    FrameReassembler, PayloadError, PayloadHeader, PushResult, ReassemblyConfig, BFH_EOF, BFH_EOH,
+    BFH_ERR, BFH_FID, BFH_PTS, BFH_SCR, BFH_STI, FRAMING_EOF, FRAMING_FID,
 };
 
 pub use xfer::{

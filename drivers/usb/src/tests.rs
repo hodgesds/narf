@@ -3765,6 +3765,222 @@ kernel_test_in!(
     smoke_usb_uvc_reassembler_drops_errored_frame
 );
 
+// ── drivers/usb/uvc: stream-based reassembly (#1334) ───────────────
+// Mirror of the drivers/video smokes 9c–9e, through the USB
+// reassembler: length completion on buffer fullness, the accumulation
+// cap, and bmFramingInfo gating.
+
+fn smoke_usb_uvc_stream_based_completes_on_length_no_eof() -> TestResult {
+    use crate::uvc::{bfh, ReassemblerOutcome, ReassemblyConfig, UvcFrameReassembler};
+    let mut r = UvcFrameReassembler::with_config(ReassemblyConfig::stream_based(16, 0));
+    // Four 4-byte payloads, constant FID=0, no EOF anywhere.
+    let p1 = [2, bfh::EOH, 0xA0, 0xA1, 0xA2, 0xA3];
+    if r.push(&p1) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("first stream packet must Append");
+    }
+    let p2 = [2, bfh::EOH, 0xA4, 0xA5, 0xA6, 0xA7];
+    if r.push(&p2) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("second stream packet must Append");
+    }
+    if r.frames_completed != 0 {
+        return TestResult::Fail("no frame may complete before the bound");
+    }
+    // FID flip mid-segment must be ignored when D0 is clear.
+    let p3 = [2, bfh::EOH | bfh::FID, 0xA8, 0xA9, 0xAA, 0xAB];
+    if r.push(&p3) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("FID flip must be ignored (D0 clear), not reset");
+    }
+    if r.buffer.len() != 12 || r.buffer[0] != 0xA0 {
+        return TestResult::Fail("FID flip must not drop accumulated bytes");
+    }
+    let p4 = [2, bfh::EOH, 0xAC, 0xAD, 0xAE, 0xAF];
+    if r.push(&p4) != ReassemblerOutcome::FrameComplete {
+        return TestResult::Fail("16th byte must complete the frame on length");
+    }
+    if r.take_frame()
+        != alloc::vec![
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ]
+    {
+        return TestResult::Fail("length-completed frame bytes wrong");
+    }
+    if r.frames_completed != 1 {
+        return TestResult::Fail("frames_completed should be 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_stream_based_completes_on_length_no_eof
+);
+
+fn smoke_usb_uvc_stream_based_buffer_cap() -> TestResult {
+    use crate::uvc::{bfh, ReassemblerOutcome, ReassemblyConfig, UvcFrameReassembler};
+    let mut r = UvcFrameReassembler::with_config(ReassemblyConfig::stream_based(8, 0));
+    let p1 = [2, bfh::EOH, 1, 2, 3, 4, 5, 6];
+    if r.push(&p1) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("first packet must Append");
+    }
+    if r.buffer.len() != 6 || r.bytes_dropped_overflow != 0 {
+        return TestResult::Fail("no bytes may drop below the bound");
+    }
+    // 6 more bytes would take the buffer to 12; only 2 fit.
+    let p2 = [2, bfh::EOH, 7, 8, 9, 10, 11, 12];
+    if r.push(&p2) != ReassemblerOutcome::FrameComplete {
+        return TestResult::Fail("push past the bound must complete the frame");
+    }
+    if r.buffer.len() != 8 {
+        return TestResult::Fail("buffer must never exceed the bound");
+    }
+    if r.take_frame() != alloc::vec![1, 2, 3, 4, 5, 6, 7, 8] {
+        return TestResult::Fail("capped frame must hold exactly the bound bytes");
+    }
+    if r.bytes_dropped_overflow != 4 {
+        return TestResult::Fail("4 excess bytes must be counted as dropped");
+    }
+    let p3 = [2, bfh::EOH, 0xAA, 0xBB];
+    if r.push(&p3) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("packet after a capped frame must Append");
+    }
+    if r.buffer != alloc::vec![0xAA, 0xBB] {
+        return TestResult::Fail("new frame must start clean after the cap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_stream_based_buffer_cap);
+
+fn smoke_usb_uvc_stream_based_framing_bits() -> TestResult {
+    use crate::uvc::{
+        bfh, ReassemblerOutcome, ReassemblyConfig, UvcFrameReassembler, FRAMING_EOF, FRAMING_FID,
+    };
+    // D0|D1: FID flip drops the partial, EOF completes early.
+    let mut r = UvcFrameReassembler::with_config(ReassemblyConfig::stream_based(
+        64,
+        FRAMING_FID | FRAMING_EOF,
+    ));
+    if r.push(&[2, bfh::EOH, 0x11, 0x22]) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("D0|D1: first packet must Append");
+    }
+    if r.push(&[2, bfh::EOH | bfh::FID, 0x33]) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("D0|D1: FID flip must drop the partial frame");
+    }
+    if r.buffer != alloc::vec![0x33] {
+        return TestResult::Fail("D0|D1: flip must drop the partial frame's bytes");
+    }
+    if r.push(&[2, bfh::EOH | bfh::FID | bfh::EOF, 0x44]) != ReassemblerOutcome::FrameComplete {
+        return TestResult::Fail("D0|D1: EOF must complete before the bound");
+    }
+    if r.take_frame() != alloc::vec![0x33, 0x44] {
+        return TestResult::Fail("D0|D1: EOF-completed frame bytes wrong");
+    }
+    // D1 alone (D0 clear): FID ignored, EOF honoured.
+    let mut r = UvcFrameReassembler::with_config(ReassemblyConfig::stream_based(64, FRAMING_EOF));
+    if r.push(&[2, bfh::EOH, 0x11]) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("D1-only: first packet must Append");
+    }
+    if r.push(&[2, bfh::EOH | bfh::FID, 0x22]) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("D1-only: FID flip must be ignored, not reset");
+    }
+    if r.push(&[2, bfh::EOH | bfh::FID | bfh::EOF, 0x33]) != ReassemblerOutcome::FrameComplete {
+        return TestResult::Fail("D1-only: EOF must complete");
+    }
+    if r.take_frame() != alloc::vec![0x11, 0x22, 0x33] {
+        return TestResult::Fail("D1-only: frame must hold all three payloads");
+    }
+    // D0 alone: EOF ignored, FID flip resets, length is the fallback.
+    let mut r = UvcFrameReassembler::with_config(ReassemblyConfig::stream_based(64, FRAMING_FID));
+    if r.push(&[2, bfh::EOH, 0x11, 0x22]) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("D0-only: first packet must Append");
+    }
+    if r.push(&[2, bfh::EOH | bfh::EOF, 0x33, 0x44]) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("D0-only: EOF must be ignored, not complete");
+    }
+    if r.buffer.len() != 4 {
+        return TestResult::Fail("D0-only: ignored EOF must still accumulate");
+    }
+    let mut p3 = alloc::vec![2u8, bfh::EOH | bfh::FID];
+    p3.extend([0x55u8; 60]);
+    if r.push(&p3) != ReassemblerOutcome::Appended {
+        return TestResult::Fail("D0-only: FID flip must drop the partial frame");
+    }
+    if r.buffer.len() != 60 {
+        return TestResult::Fail("D0-only: flipped frame must hold 60 bytes");
+    }
+    if r.push(&[2, bfh::EOH | bfh::FID, 0x66, 0x77, 0x88, 0x99])
+        != ReassemblerOutcome::FrameComplete
+    {
+        return TestResult::Fail("D0-only: 64th byte must complete on length");
+    }
+    if r.frames_completed != 1 {
+        return TestResult::Fail("D0-only: frames_completed should be 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_stream_based_framing_bits);
+
+// The pump's config derivation: the negotiated control + the retained
+// format table select stream-based mode only for the negotiated
+// stream-based format index; anything else (or no negotiation) gets
+// the legacy config.
+fn smoke_usb_uvc_reassembly_config_from_negotiated() -> TestResult {
+    use crate::uvc::{ReassemblyConfig, UvcDevice, VsProbeCommit};
+    use narf_drivers_video::uvc::{PixelFmt, StreamFormat};
+    let stream_format = StreamFormat {
+        format_index: 1,
+        pixel_fmt: PixelFmt::StreamBased,
+        default_frame_index: 0,
+        frames: alloc::vec![],
+    };
+    let device = UvcDevice {
+        slot_id: 7,
+        vc_iface: 0,
+        vs_iface: 1,
+        streaming_endpoints: alloc::vec![],
+        formats: alloc::vec![stream_format],
+        active_stream: None,
+        negotiated: Some(VsProbeCommit {
+            format_index: 1,
+            max_video_frame_size: 16,
+            framing_info: 0,
+            ..VsProbeCommit::default()
+        }),
+        video_node: 0,
+        stream_generation: 1,
+        capture_pump_generation: 0,
+        capture_stop_requested: false,
+        uvc_version: 0x0150,
+        clock_frequency: 48_000_000,
+        controller: 0,
+    };
+    let config = device.reassembly_config();
+    if config != ReassemblyConfig::stream_based(16, 0) {
+        return TestResult::Fail("negotiated stream-based format must yield a stream config");
+    }
+    // A negotiated format index with no stream-based entry is frame-based.
+    let mut other = device.clone();
+    other.negotiated = Some(VsProbeCommit {
+        format_index: 2,
+        max_video_frame_size: 614_400,
+        framing_info: 0,
+        ..VsProbeCommit::default()
+    });
+    if other.reassembly_config() != ReassemblyConfig::bounded(614_400) {
+        return TestResult::Fail("non-stream format must yield a bounded frame config");
+    }
+    // No negotiation on record: the legacy config, exactly as before.
+    let mut none = device.clone();
+    none.negotiated = None;
+    if none.reassembly_config() != ReassemblyConfig::default() {
+        return TestResult::Fail("no negotiation must yield the legacy config");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_reassembly_config_from_negotiated
+);
+
 // ── drivers/usb/uac (sample rate + PCM ring) ───────────────────────
 
 fn smoke_usb_uac_encode_sampling_freq_48k() -> TestResult {
@@ -8517,6 +8733,14 @@ struct FixtureState {
     /// instead of echoing the host's 0x10 declaration. None = the
     /// default 0x10/0x10/0x10 answer.
     versions: Option<(u8, u8, u8)>,
+    /// Override for the GET_CUR(PROBE) `bmFramingInfo` byte (1.1+
+    /// extension block), when the test models a device declaring
+    /// which FID/EOF bits it uses. Default 0 = neither bit.
+    framing_info: u8,
+    /// Override for the GET_CUR(PROBE) `dwMaxVideoFrameSize`, when
+    /// the test models a device negotiating a smaller frame/segment
+    /// size. None = the default 614_400.
+    max_video_frame_size: Option<u32>,
     fail_probe: bool,
     fail_set_interface: bool,
     packets: VecDeque<Vec<u8>>,
@@ -8541,6 +8765,8 @@ impl FixtureTransport {
                 probe: None,
                 clock_frequency: 0,
                 versions: None,
+                framing_info: 0,
+                max_video_frame_size: None,
                 fail_probe,
                 fail_set_interface,
                 packets: packets.into(),
@@ -8565,6 +8791,22 @@ impl FixtureTransport {
     /// the #1244 GET_CUR version-validation tests.
     fn set_versions(&self, preferred: u8, min: u8, max: u8) {
         self.state.lock().versions = Some((preferred, min, max));
+    }
+
+    /// Set the modelled device's GET_CUR(PROBE) `bmFramingInfo`
+    /// byte, answered in the 1.1+ extension block instead of the
+    /// default 0. Used to model a stream-based device declaring
+    /// which FID/EOF bits it uses (#1334).
+    fn set_framing_info(&self, framing_info: u8) {
+        self.state.lock().framing_info = framing_info;
+    }
+
+    /// Set the modelled device's GET_CUR(PROBE)
+    /// `dwMaxVideoFrameSize`, answered instead of the default
+    /// 614_400. Used to model a device negotiating a small
+    /// frame/segment size (#1334).
+    fn set_max_video_frame_size(&self, size: u32) {
+        self.state.lock().max_video_frame_size = Some(size);
     }
 
     /// Stage a packet for the modelled device to source, as if it
@@ -8670,16 +8912,18 @@ impl crate::uvc::UvcTransport for FixtureTransport {
             state.log.push(FixtureXfer::GetCurProbe);
             let mut accepted = state.probe.clone().unwrap_or_default();
             // The device fills in its own frame size + payload size.
+            let max_frame_size = state.max_video_frame_size.unwrap_or(614_400);
             if accepted.len() >= 26 {
-                accepted[18..22].copy_from_slice(&614_400u32.to_le_bytes());
+                accepted[18..22].copy_from_slice(&max_frame_size.to_le_bytes());
                 accepted[22..26].copy_from_slice(&1024u32.to_le_bytes());
             }
             // A 1.1+ device answers the extension block: its clock and
             // the 1.0 payload versions it accepts — or the version
-            // triple the test staged via set_versions.
+            // triple the test staged via set_versions — plus the
+            // bmFramingInfo the test staged via set_framing_info.
             if accepted.len() >= 34 {
                 accepted[26..30].copy_from_slice(&state.clock_frequency.to_le_bytes());
-                accepted[30] = 0;
+                accepted[30] = state.framing_info;
                 let (preferred, min, max) = state.versions.unwrap_or((0x10, 0x10, 0x10));
                 accepted[31] = preferred;
                 accepted[32] = min;
@@ -8803,6 +9047,42 @@ fn uvc_fixture_config_blob_versioned(bcd_uvc: u16, clock_hz: u32) -> Vec<u8> {
 /// through the bulk fallback, never through the isochronous gate.
 fn uvc_fixture_config_blob_bulk_only() -> Vec<u8> {
     uvc_fixture_config_blob_inner(0x0100, 0x0047_9C40, 0x02, 0x0200, 0)
+}
+
+/// Stream-based modelled camera (#1334): same VC + endpoint layout
+/// as the isochronous fixture, but the VS interface carries a single
+/// VS_FORMAT_STREAM_BASED format descriptor (index 1,
+/// packet-oriented, dwPacketLength 188) and no frame descriptors —
+/// frame size is negotiated in Probe/Commit. bcdUVC 1.5, so GET_CUR
+/// answers the 34-byte form (framing_info + versions).
+fn uvc_fixture_config_blob_stream_based() -> Vec<u8> {
+    let mut cfg = alloc::vec::Vec::new();
+    // Configuration header (wTotalLength patched at the end).
+    cfg.extend_from_slice(&[9, 2, 0, 0, 2, 1, 0, 0x80, 50]);
+    // Interface 0: VideoControl.
+    cfg.extend_from_slice(&[9, 4, 0, 0, 0, 0x0E, 0x01, 0x00, 0]);
+    // VC_HEADER (13 bytes): bcdUVC 0x0150, wTotalLength 13,
+    // dwClockFrequency 48 MHz, one streaming interface (1).
+    let mut vc_header = [13u8, 0x24, 0x01, 0, 0, 13, 0, 0, 0, 0, 0, 1, 1];
+    vc_header[3..5].copy_from_slice(&0x0150u16.to_le_bytes());
+    vc_header[7..11].copy_from_slice(&48_000_000u32.to_le_bytes());
+    cfg.extend_from_slice(&vc_header);
+    // Interface 1 alt 0: VideoStreaming, zero bandwidth.
+    cfg.extend_from_slice(&[9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0]);
+    // VS_INPUT_HEADER: 1 format, CS total 38 (14 + 24), endpoint 0x81,
+    // terminal 1.
+    cfg.extend_from_slice(&[14, 0x24, 0x01, 1, 38, 0, 0x81, 0, 1, 0, 0, 0, 1, 0]);
+    // VS_FORMAT_STREAM_BASED: index 1, fixture GUID, dwPacketLength 188.
+    cfg.extend_from_slice(&[24, 0x24, 0x12, 1]);
+    cfg.extend_from_slice(b"STREAM-BASED-FIX");
+    cfg.extend_from_slice(&188u32.to_le_bytes());
+    // Interface 1 alt 1: isochronous IN endpoint (0x81, 1024-byte
+    // packets, interval 1).
+    cfg.extend_from_slice(&[9, 4, 1, 1, 1, 0x0E, 0x02, 0x00, 0]);
+    cfg.extend_from_slice(&[7, 5, 0x81, 0x01, 0x00, 0x04, 1]);
+    let total = cfg.len() as u16;
+    cfg[2..4].copy_from_slice(&total.to_le_bytes());
+    cfg
 }
 
 fn uvc_fixture_config_blob_inner(
@@ -9266,6 +9546,145 @@ fn smoke_uvc_streamon_composition_e2e() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_composition_e2e);
+
+// ── Stream-based pump (#1334): length completion end-to-end ─────────
+// A modelled stream-based camera negotiates 16-byte segments with no
+// framing bits; the capture pump must deliver a 16-byte frame after
+// four 4-byte payloads that carry neither EOF nor a FID toggle —
+// never before the 16th byte, never unbounded.
+
+fn smoke_usb_uvc_stream_based_pump_completes_on_length() -> TestResult {
+    use crate::uvc::VsProbeCommit;
+    narf_drivers_video::devfs_bridge::__reset_for_test();
+    crate::uvc::__reset_uvc_for_test();
+    let transport = Arc::new(FixtureTransport::new(false, false, alloc::vec![]));
+    transport.set_max_video_frame_size(16);
+    transport.set_framing_info(0);
+    let blob = uvc_fixture_config_blob_stream_based();
+    let idx = match narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        7,
+        &blob,
+    )) {
+        Ok(idx) => idx,
+        Err(_) => {
+            return TestResult::Fail("bind against the modelled stream-based camera failed");
+        }
+    };
+    // The retained format table must classify the format as stream-based.
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = match devices.get(idx) {
+            Some(d) => d,
+            None => return TestResult::Fail("bound device missing"),
+        };
+        if device.formats.len() != 1
+            || device.formats[0].pixel_fmt != narf_drivers_video::uvc::PixelFmt::StreamBased
+        {
+            return TestResult::Fail("bind must retain one stream-based format");
+        }
+    }
+    // Stream-based formats have no V4L2 fourcc, so STREAMON cannot
+    // select them yet (#1334 remainder): negotiate directly with a
+    // hand-built desired control, as the #1244 tests do.
+    let desired = VsProbeCommit {
+        hint: 1,
+        format_index: 1,
+        frame_index: 1,
+        frame_interval: 333_333,
+        ..VsProbeCommit::default()
+    };
+    let negotiated = match narf_scheduler::block_on(
+        crate::uvc::negotiate_and_activate_video_stream_with(&*transport, idx, desired),
+    ) {
+        Ok(n) => n,
+        Err(_) => {
+            return TestResult::Fail("negotiation with the stream-based camera failed");
+        }
+    };
+    if negotiated.control.max_video_frame_size != 16 || negotiated.control.framing_info != 0 {
+        return TestResult::Fail("negotiated control must carry the 16-byte / no-framing stream");
+    }
+    // The pump must derive its config from the retained negotiation.
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = match devices.get(idx) {
+            Some(d) => d,
+            None => return TestResult::Fail("bound device missing"),
+        };
+        let config = device.reassembly_config();
+        if !config.stream_based || config.max_frame_size != 16 || config.framing_info != 0 {
+            return TestResult::Fail("pump config must be stream-based, bound 16, framing 0");
+        }
+        if device.negotiated.is_none() {
+            return TestResult::Fail("negotiation must retain the accepted control");
+        }
+    }
+    let video_node = crate::uvc::UVC_DEVICES.lock()[idx].video_node;
+    let dev = match narf_drivers_video::devfs_bridge::get_device(video_node) {
+        Some(d) => d,
+        None => return TestResult::Fail("registered video device missing"),
+    };
+    let generation = crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    let mut pump = Box::pin(crate::uvc::pump_video_frames_with(
+        idx,
+        &*transport,
+        generation,
+    ));
+    // Four 4-byte payloads, constant FID=0, no EOF anywhere.
+    let packets: [Vec<u8>; 4] = [
+        alloc::vec![2u8, 0x80, 0xA0, 0xA1, 0xA2, 0xA3],
+        alloc::vec![2u8, 0x80, 0xA4, 0xA5, 0xA6, 0xA7],
+        alloc::vec![2u8, 0x80, 0xA8, 0xA9, 0xAA, 0xAB],
+        alloc::vec![2u8, 0x80, 0xAC, 0xAD, 0xAE, 0xAF],
+    ];
+    for (i, packet) in packets.into_iter().enumerate() {
+        transport.stage_packet(packet);
+        for _ in 0..100 {
+            let _ = fixture_poll(pump.as_mut());
+        }
+        if transport.pending_packets() != 0 {
+            return TestResult::Fail("pump must consume each staged packet");
+        }
+        let has = dev.lock().has_frame();
+        if i < 3 && has {
+            return TestResult::Fail("pump must not deliver before the 16th byte");
+        }
+        if i == 3 && !has {
+            return TestResult::Fail("pump must deliver at the 16th byte");
+        }
+    }
+    let frame = match dev.lock().pop_frame() {
+        Some(f) => f,
+        None => return TestResult::Fail("delivered frame must be dequeueable"),
+    };
+    if frame.data
+        != alloc::vec![
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ]
+    {
+        return TestResult::Fail("pump-delivered frame bytes wrong");
+    }
+    // COMMIT must carry the device-accepted stream parameters.
+    let commit = transport.log().iter().find_map(|x| match x {
+        FixtureXfer::SetCurCommit { payload } => Some(payload.clone()),
+        _ => None,
+    });
+    match commit {
+        Some(p)
+            if p.len() >= 34
+                && u32::from_le_bytes(p[18..22].try_into().unwrap()) == 16
+                && p[30] == 0 => {}
+        _ => return TestResult::Fail("COMMIT must carry max frame size 16 + framing 0"),
+    }
+    drop(pump);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_stream_based_pump_completes_on_length
+);
 
 /// The bulk fallback's selection rules, pinned without hardware:
 /// the isochronous gate rejects a PROBE figure above its interval
