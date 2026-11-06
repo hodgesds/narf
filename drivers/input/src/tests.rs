@@ -5390,13 +5390,19 @@ mod psmouse_smokes {
 mod smbus_rmi_smokes {
     use alloc::vec::Vec;
     use narf_drivers_platform::smbus::SmbusError;
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_pointer, pop_touch, PointerButtons,
+        TouchState,
+    };
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_lib::sync::IrqSafeSpinLock;
 
-    use crate::rmi4_core::{decode_f12_data1, probe_device, Rmi4Transport};
+    use crate::rmi4_core::{decode_f12_data1, probe_device, Rmi4PumpState, Rmi4Transport};
     use crate::smbus_rmi::{
-        probe_at, SmbusIo, SmbusRmiTransport, SmbusRmiVersion, SMBUS_RMI_DEFAULT_ADDR,
+        probe_at, probe_at_with_state, SmbusIo, SmbusRmiTransport, SmbusRmiVersion,
+        SMBUS_RMI_DEFAULT_ADDR,
     };
+    use crate::smbus_rmi_attn::{f01_bringup, service_attn};
 
     /// Operation codes for the fake's read/write logs.
     const OP_READ_BYTE: u8 = 0;
@@ -5536,6 +5542,37 @@ mod smbus_rmi_smokes {
         ]);
         mem[0x20..0x22].copy_from_slice(&[0x48, 0x08]);
         mem[0x03..0x0B].copy_from_slice(&[0x01, 0x00, 0x10, 0x00, 0x20, 0x80, 0x05, 0x06]);
+        mem
+    }
+
+    /// ATTN-fixture page-0 image with non-overlapping register
+    /// blocks. The shared [`synaptics_page0`] packs the F$12
+    /// data block against the F$01 query, so a 5-object
+    /// (40-byte) F$12 read would decode query bytes as phantom
+    /// fingers; this image lays the blocks out separately:
+    /// PDT entries (F$12 @ 0xE9, F$01 @ 0xE3, F$30 @ 0xDD,
+    /// terminator @ 0xD7), the F$01 query (manufacturer 1) at
+    /// 0x10, the F$30 query (8 lines) at 0x20, F$01 data
+    /// (device status 0x13, interrupt status 0x14), F$12 Data 1
+    /// (5 objects) at 0x40, F$30 data at 0x70. `status` is the
+    /// F$01 interrupt-status byte; `f30_data` the F$30 button
+    /// bitmap (active-low).
+    fn attn_page0(status: u8, f30_data: u8) -> [u8; 256] {
+        let mut mem = [0u8; 256];
+        // Entry layout: [query, cmd, ctrl, data, intr|ver, func].
+        mem[0xE9..0xEF].copy_from_slice(&[0x00, 0x01, 0x02, 0x40, 0x01, 0x12]);
+        mem[0xE3..0xE9].copy_from_slice(&[0x10, 0x11, 0x12, 0x13, 0x01, 0x01]);
+        mem[0xDD..0xE3].copy_from_slice(&[0x20, 0x21, 0x22, 0x70, 0x01, 0x30]);
+        // Terminator at 0xD7 stays zero (function 0x00).
+        mem[0x10..0x1B].copy_from_slice(&[
+            0x01, 0x00, 0x02, 0x01, 0x20, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01,
+        ]);
+        mem[0x20..0x22].copy_from_slice(&[0x48, 0x08]);
+        // One F$12 finger object at data base 0x40; the other
+        // four object slots stay zero (no object).
+        mem[0x40..0x48].copy_from_slice(&[0x01, 0x00, 0x10, 0x00, 0x20, 0x80, 0x05, 0x06]);
+        mem[0x14] = status;
+        mem[0x70] = f30_data;
         mem
     }
 
@@ -5776,4 +5813,218 @@ mod smbus_rmi_smokes {
         TestResult::Pass
     }
     kernel_test_in!("drivers/input/smbus-rmi", smoke_smbus_rmi_f12_data_decode);
+
+    // ── ATTN pump (issue #1682) ─────────────────────────────────
+    //
+    // The fake device is the attention source here: the F$01
+    // interrupt-status byte at 0x14 plays the role of the ATTN
+    // line (set bit = line asserted), and the F$12 / F$30 data
+    // registers hold the report the pump must deliver. No GPIO
+    // or IRQ hardware is involved — the routing layer is
+    // exercised by the pump task on real firmware, while
+    // `service_attn` (the unit under test) is transport-neutral
+    // and runs end-to-end against the fake.
+
+    fn smoke_smbus_rmi_attn_f12_finger_down_and_lift() -> TestResult {
+        // F$12 source set (bit 0), no buttons (all lines high).
+        let fake = FakeSmbus::new(attn_page0(0x01, 0xFF), 0x00); // v1
+        let (_version, probe) = match probe_at(&fake, SMBUS_RMI_DEFAULT_ADDR) {
+            Some(p) => p,
+            None => return TestResult::Fail("v1 probe declined the Synaptics image"),
+        };
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        let mut state = Rmi4PumpState::new();
+        let n_reads_before = fake.reads.lock().len();
+        let pushed = match service_attn(&mut t, &probe, &mut state, None) {
+            Ok(n) => n,
+            Err(_) => return TestResult::Fail("ATTN service failed"),
+        };
+        if pushed < 1 {
+            return TestResult::Fail("ATTN service pushed 0 events");
+        }
+        match pop_touch() {
+            Some(t) if t.state == TouchState::Down && t.x == 0x1000 && t.y == 0x2000 => {}
+            Some(_) => return TestResult::Fail("expected Down at 0x1000/0x2000"),
+            None => return TestResult::Fail("no TouchEvent in ring after ATTN"),
+        }
+        // The service's first bus read after the probe must be
+        // the F$01 interrupt-status byte at data_base + 1
+        // (0x14) — not the device-status byte at 0x13.
+        let reads = fake.reads.lock();
+        let post_probe = &reads[n_reads_before..];
+        if post_probe.first() != Some(&(OP_READ_BYTE, 0x14)) {
+            return TestResult::Fail(
+                "ATTN service must read the F$01 interrupt status at 0x14 first",
+            );
+        }
+        drop(reads);
+        // Lift: clear the finger object, keep the F$12 source
+        // set — the next ATTN must surface an Up.
+        fake.mem.lock()[0x40] = 0x00;
+        if service_attn(&mut t, &probe, &mut state, None).is_err() {
+            return TestResult::Fail("lift ATTN service failed");
+        }
+        match pop_touch() {
+            Some(t) if t.state == TouchState::Up => {}
+            Some(_) => return TestResult::Fail("expected Up after finger lift"),
+            None => return TestResult::Fail("no TouchEvent in ring after lift ATTN"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_attn_f12_finger_down_and_lift
+    );
+
+    fn smoke_smbus_rmi_attn_f30_button_only() -> TestResult {
+        // F$30 source set (bit 2), GPIO 0 low = clickpad pressed.
+        let fake = FakeSmbus::new(attn_page0(0x04, 0xFE), 0x00); // v1
+        let (_version, probe) = match probe_at(&fake, SMBUS_RMI_DEFAULT_ADDR) {
+            Some(p) => p,
+            None => return TestResult::Fail("v1 probe declined the Synaptics image"),
+        };
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        let mut state = Rmi4PumpState::new();
+        if service_attn(&mut t, &probe, &mut state, None).is_err() {
+            return TestResult::Fail("button ATTN service failed");
+        }
+        // Buttons-only ATTN: no touch events, but BTN_LEFT must
+        // still reach the ring as a PointerEvent (the HID pump
+        // drops this frame; the SMBus pump delivers it).
+        if pop_touch().is_some() {
+            return TestResult::Fail("button-only ATTN must not push TouchEvents");
+        }
+        match pop_pointer() {
+            Some(p) if p.buttons == PointerButtons::LEFT => {}
+            Some(_) => return TestResult::Fail("expected LEFT button"),
+            None => return TestResult::Fail("no PointerEvent in ring after button ATTN"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_attn_f30_button_only
+    );
+
+    fn smoke_smbus_rmi_attn_no_sources_is_noop() -> TestResult {
+        let fake = FakeSmbus::new(attn_page0(0x00, 0xFF), 0x00); // v1
+        let (_version, probe) = match probe_at(&fake, SMBUS_RMI_DEFAULT_ADDR) {
+            Some(p) => p,
+            None => return TestResult::Fail("v1 probe declined the Synaptics image"),
+        };
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        let mut state = Rmi4PumpState::new();
+        let n_reads_before = fake.reads.lock().len();
+        let pushed = match service_attn(&mut t, &probe, &mut state, None) {
+            Ok(n) => n,
+            Err(_) => return TestResult::Fail("zero-source ATTN service failed"),
+        };
+        if pushed != 0 {
+            return TestResult::Fail("zero-source ATTN must push nothing");
+        }
+        if pop_touch().is_some() || pop_pointer().is_some() {
+            return TestResult::Fail("zero-source ATTN must leave the ring empty");
+        }
+        // Only the one status-byte read after the probe — no
+        // F$12 / F$30 data reads on a spurious wake.
+        let reads = fake.reads.lock();
+        if reads[n_reads_before..] != [(OP_READ_BYTE, 0x14)] {
+            return TestResult::Fail("zero-source ATTN must issue exactly one status read");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_attn_no_sources_is_noop
+    );
+
+    fn smoke_smbus_rmi_attn_v2_state_roundtrip() -> TestResult {
+        let fake = FakeSmbus::new(attn_page0(0x00, 0xFF), 0x01); // v2
+        let (version, _probe, state) = match probe_at_with_state(&fake, SMBUS_RMI_DEFAULT_ADDR) {
+            Some(p) => p,
+            None => return TestResult::Fail("v2 probe declined the Synaptics image"),
+        };
+        if version != SmbusRmiVersion::V2 {
+            return TestResult::Fail("version byte 0x01 must negotiate v2");
+        }
+        // Mapping-table program writes (block writes to
+        // 0x80..0x87) after the probe.
+        let map_writes = || {
+            fake.writes
+                .lock()
+                .iter()
+                .filter(|(op, cmd, _)| *op == OP_WRITE_BLOCK && *cmd >= 0x80)
+                .count()
+        };
+        let n0 = map_writes();
+        // First F$12 read from the captured state programs the
+        // slots for (0x40, 32) and (0x60, 8).
+        let mut t = SmbusRmiTransport::from_state(&fake, SMBUS_RMI_DEFAULT_ADDR, state);
+        let mut buf = [0u8; 40];
+        if t.read_block(0x40, &mut buf).is_err() {
+            return TestResult::Fail("v2 F$12 read failed");
+        }
+        if decode_f12_data1(&buf, 1).is_err() {
+            return TestResult::Fail("v2 F$12 data did not decode");
+        }
+        let state2 = t.into_state();
+        let n1 = map_writes();
+        if n1 <= n0 {
+            return TestResult::Fail("first F$12 read must program mapping slots");
+        }
+        // Second pass from the round-tripped state reuses both
+        // slots — no further mapping-table programs.
+        let mut t2 = SmbusRmiTransport::from_state(&fake, SMBUS_RMI_DEFAULT_ADDR, state2);
+        if t2.read_block(0x40, &mut buf).is_err() {
+            return TestResult::Fail("v2 repeat F$12 read failed");
+        }
+        if map_writes() != n1 {
+            return TestResult::Fail("repeat F$12 read must reuse the mapping slots");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_attn_v2_state_roundtrip
+    );
+
+    fn smoke_smbus_rmi_attn_f01_bringup_writes_configured() -> TestResult {
+        let fake = FakeSmbus::new(synaptics_page0(), 0x00); // v1
+        let (_version, probe) = match probe_at(&fake, SMBUS_RMI_DEFAULT_ADDR) {
+            Some(p) => p,
+            None => return TestResult::Fail("v1 probe declined the Synaptics image"),
+        };
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        if f01_bringup(&mut t, &probe).is_err() {
+            return TestResult::Fail("F$01 bring-up failed");
+        }
+        // F$01 control base is 0x12; the byte is SLEEP_NORMAL |
+        // CONFIGURED = 0x80.
+        if fake.mem.lock()[0x12] != 0x80 {
+            return TestResult::Fail("F$01 control byte must be 0x80 (configured)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_attn_f01_bringup_writes_configured
+    );
 }

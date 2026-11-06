@@ -33,6 +33,7 @@ pub mod intel_ish;
 pub mod psmouse;
 pub mod rmi4_core;
 pub mod smbus_rmi;
+pub mod smbus_rmi_attn;
 pub mod wacom;
 pub mod wbdi;
 
@@ -82,6 +83,13 @@ pub fn register_initcalls() {
     // RMI4-over-SMBus transport probe (issue #765) — runs once
     // the platform SMBus controller is up (Stage::Subsys).
     smbus_rmi::register_initcalls();
+
+    // SMBus RMI4 attention pump (issue #1682) — Stage::Late
+    // bind: routes the ATTN GPIO/IRQ from the touchpad's ACPI
+    // `GpioInt` (or falls back to a coordinated status poll)
+    // and spawns the report pump. Late so the GPIO controller
+    // probes and the transport probe have both run.
+    smbus_rmi_attn::register_initcalls();
 
     wacom::register_usb_driver();
     goodix::register_initcalls();
