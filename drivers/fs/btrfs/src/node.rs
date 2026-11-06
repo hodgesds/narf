@@ -931,14 +931,18 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             // operation or none of it, and the reader guard keeps what that
             // root names on disk until it is done.
             let _reader = vol.begin_reader();
-            with_root_retry!(self, vol, |root| {
-                match vol.load_inode_in(root, self.ino).await {
-                    Ok(inode) => {
-                        crate::extent::read_file(&vol, root, self.ino, inode.size, offset, buf)
-                            .await
-                    }
-                    Err(error) => Err(error),
+            let mut size = self
+                .anchor
+                .live_size
+                .load(core::sync::atomic::Ordering::Acquire);
+            if offset >= size {
+                // If past cached EOF, check if a concurrent write or tree change grew the file.
+                if let Ok(inode) = self.refresh_inode().await {
+                    size = inode.size;
                 }
+            }
+            with_root_retry!(self, vol, |root| {
+                crate::extent::read_file(&vol, root, self.ino, size, offset, buf).await
             })
         })
     }
