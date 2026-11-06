@@ -57,6 +57,7 @@ struct Hardware {
     deliveries: u32,
     pte_installs: usize,
     pte_clears: usize,
+    display_ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
     refuse_ptes: bool,
     refuse_console: bool,
     refuse_status_restore: bool,
@@ -161,6 +162,7 @@ impl MockPlatform {
                 deliveries: 0,
                 pte_installs: 0,
                 pte_clears: 0,
+                display_ip: None,
                 refuse_ptes: false,
                 refuse_console: false,
                 refuse_status_restore: false,
@@ -200,6 +202,10 @@ impl MockPlatform {
         );
         platform.gen12_defaults();
         platform
+    }
+    pub(crate) fn with_display_ip(self, ip: crate::intel_gpu_xe2lpd::DisplayIp) -> Self {
+        self.0.lock().display_ip = Some(ip);
+        self
     }
     pub(crate) fn tiger(&self) -> Device<Self> {
         self.gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
@@ -1054,6 +1060,10 @@ unsafe impl DisplayAccess for MockPlatform {
     fn access_ok(&self) -> bool {
         let hw = self.0.lock();
         (!self.reset_lost() || self.2) && hw.allowed && hw.powered
+    }
+
+    fn display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
+        self.0.lock().display_ip
     }
 }
 impl Platform for MockPlatform {

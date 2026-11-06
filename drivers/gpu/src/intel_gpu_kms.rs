@@ -43,10 +43,10 @@ fn x_tiled_profile(
 }
 /// The display IP the KMS owner of `generation` proves its resources on.
 fn resource_ip(generation: Generation) -> crate::intel_gpu_xe2lpd::DisplayIp {
-    if generation == Generation::LunarLake {
-        crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd
-    } else {
-        crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp
+    match generation {
+        Generation::LunarLake => crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd,
+        Generation::PantherLake => crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd,
+        _ => crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
     }
 }
 /// The tiled primary's admission; the proved display IP, `None` on Gen12.
@@ -1224,9 +1224,9 @@ pub(crate) fn install(
     console: ActiveScanout,
 ) {
     // Panther Lake is owned only as display 30.00 behind the opted-in
-    // route, which holds Pipe A for its eDP panel: linear primary flips on
-    // the console's Pipe A. Cursor, CTM/LUTs (double-buffered on display
-    // >= 30), DSB, tiled primaries, XR30, FBC and PSR are not offered.
+    // route, which holds Pipe A for its eDP panel: linear primary flips,
+    // the 64x64 cursor, CTM and double-buffered LUTs, and DSB transactions
+    // on the console's Pipe A. Tiled primaries, XR30, FBC and PSR are not offered.
     let display30 = if generation == Generation::PantherLake {
         if !crate::intel_gpu_xe2lpd::route_owns_pipe_a() {
             return;
@@ -1290,7 +1290,10 @@ pub(crate) fn install(
         let mut card = card.lock();
         card.native_atomic = true;
         card.intel_display = true;
-        if matches!(generation, Generation::MeteorLake | Generation::LunarLake) {
+        if matches!(
+            generation,
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
+        ) {
             if let Some(crtc) = card.crtcs.first().map(|c| c.id) {
                 card.intel_ctm = true;
                 if card.crtc_color(crtc).is_none() {
@@ -1327,7 +1330,7 @@ pub(crate) fn refresh_formats_after_publication(bar: &narf_bus::MmioRegion, epoc
     };
     if !matches!(
         display.generation,
-        Generation::MeteorLake | Generation::LunarLake
+        Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
     ) || display.platform.published_epoch() != Some(epoch)
     {
         return true;
@@ -3267,6 +3270,7 @@ impl<M: Platform> Guard<'_, M> {
             self.device.generation,
             Generation::MeteorLake
                 | Generation::LunarLake
+                | Generation::PantherLake
                 | Generation::TigerLake
                 | Generation::AlderLake
         ) || !timing.valid()
@@ -3305,7 +3309,7 @@ impl<M: Platform> Guard<'_, M> {
         } else {
             if !matches!(
                 self.device.generation,
-                Generation::MeteorLake | Generation::LunarLake
+                Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
             ) {
                 return Err(FsError::Unsupported);
             }
@@ -3793,7 +3797,7 @@ impl<M: Platform> Guard<'_, M> {
         // a Card capability alone cannot authorize a command or scanout write.
         if !matches!(
             self.device.generation,
-            Generation::MeteorLake | Generation::LunarLake
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
         ) && (self.device.platform.gen12_family().is_none()
             || primary.as_ref().is_some_and(|target| {
                 target.view.layout == crate::intel_gpu_scanout::Layout::Tile4

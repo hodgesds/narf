@@ -20,7 +20,7 @@ use crate::{
     intel_gpu_gem::{GemObject, GemState, Placement},
     intel_gpu_ggtt_ranges::{Lease, Ledger},
     intel_gpu_gtt::{PteFormat, GGTT_ARRAY_BASE},
-    intel_gpu_scanout_io::{display_pat_programmed, display_pte, DisplayAccess},
+    intel_gpu_scanout_io::{display_pat_programmed_ip, display_pte_ip, DisplayAccess},
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{fence, Ordering};
@@ -220,7 +220,10 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         bar_len: u64,
         generation: Generation,
     ) -> Result<Self, FsError> {
-        if !matches!(generation, Generation::MeteorLake | Generation::LunarLake) {
+        if !matches!(
+            generation,
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
+        ) {
             return Err(FsError::Unsupported);
         }
         Self::reserve_profile(io, bar_len, None, generation, false)
@@ -252,8 +255,8 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         generation: Generation,
         vblank_start: bool,
     ) -> Result<Self, FsError> {
-        let pte = display_pte(generation).ok_or(FsError::Unsupported)?;
-        if !io.access_ok() || !display_pat_programmed(&io, generation) {
+        let pte = display_pte_ip(generation, io.display_ip()).ok_or(FsError::Unsupported)?;
+        if !io.access_ok() || !display_pat_programmed_ip(&io, generation, io.display_ip()) {
             return Err(FsError::NoDevice);
         }
         let key = io.ggtt_key().ok_or(FsError::Unsupported)?;

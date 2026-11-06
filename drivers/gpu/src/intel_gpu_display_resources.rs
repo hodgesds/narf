@@ -344,11 +344,39 @@ impl Profile {
         io: &(impl MmioWindow + ?Sized),
         timing: crate::intel_gpu_dsb::Timing,
     ) -> Result<Self, FsError> {
+        let vsync = read(io, 0x60014).unwrap_or(0);
+        let (v_sync_start, v_sync_end) = if vsync != 0 && vsync != u32::MAX {
+            let start = ((vsync & 0xffff) + 1) as u16;
+            let end = (((vsync >> 16) & 0xffff) + 1) as u16;
+            if start <= timing.vtotal && end <= timing.vtotal && start >= timing.height {
+                (start, end)
+            } else {
+                (timing.height + 1, timing.height + 2)
+            }
+        } else {
+            (timing.height + 1, timing.height + 2)
+        };
+        let hsync = read(io, 0x60008).unwrap_or(0);
+        let (h_sync_start, h_sync_end) = if hsync != 0 && hsync != u32::MAX {
+            let start = ((hsync & 0xffff) + 1) as u16;
+            let end = (((hsync >> 16) & 0xffff) + 1) as u16;
+            if start <= timing.htotal && end <= timing.htotal && start >= timing.width {
+                (start, end)
+            } else {
+                (timing.width + 1, timing.width + 2)
+            }
+        } else {
+            (timing.width + 1, timing.width + 2)
+        };
         let mode = Mode {
             pixel_clock_khz: timing.clock,
             h_active: timing.width,
+            h_sync_start,
+            h_sync_end,
             h_total: timing.htotal,
             v_active: timing.height,
+            v_sync_start,
+            v_sync_end,
             v_total: timing.vtotal,
             ..Mode::VESA_1024X768_60
         };

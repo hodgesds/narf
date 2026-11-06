@@ -19,7 +19,7 @@ use crate::{
     intel_gpu_gem::{GemObject, GemState, Placement},
     intel_gpu_ggtt_ranges::{Lease, Ledger},
     intel_gpu_gtt::{PteFormat, GGTT_ARRAY_BASE},
-    intel_gpu_scanout_io::{display_pat_programmed, display_pte, DisplayAccess},
+    intel_gpu_scanout_io::{display_pat_programmed_ip, display_pte_ip, DisplayAccess},
 };
 use alloc::{sync::Arc, vec::Vec};
 use narf_filesystem::FsError;
@@ -63,7 +63,10 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         timing: Timing,
         generation: Generation,
     ) -> Result<Self, FsError> {
-        if !matches!(generation, Generation::MeteorLake | Generation::LunarLake) {
+        if !matches!(
+            generation,
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
+        ) {
             return Err(FsError::Unsupported);
         }
         Self::new_profile(io, bar_len, timing, None, generation)
@@ -88,8 +91,8 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         family: Option<crate::intel_gpu_gt::Gen12Platform>,
         generation: Generation,
     ) -> Result<Self, FsError> {
-        let pte = display_pte(generation).ok_or(FsError::Unsupported)?;
-        if !io.access_ok() || !display_pat_programmed(&io, generation) {
+        let pte = display_pte_ip(generation, io.display_ip()).ok_or(FsError::Unsupported)?;
+        if !io.access_ok() || !display_pat_programmed_ip(&io, generation, io.display_ip()) {
             return Err(FsError::NoDevice);
         }
         if io.read32(0x70080) != 0 || (family.is_some() && io.read32(0x700a0) != 0) {
@@ -139,7 +142,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
                 | (1 << 31)
                 | match generation {
                     Generation::MeteorLake => (1 << 25) | (1 << 18) | (1 << 24),
-                    Generation::LunarLake => 1 << 18,
+                    Generation::LunarLake | Generation::PantherLake => 1 << 18,
                     _ => 1 << 25,
                 },
             pte,
