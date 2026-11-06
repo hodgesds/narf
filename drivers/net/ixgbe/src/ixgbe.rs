@@ -2874,12 +2874,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(
-            &auth,
-            IxgbeNic {
-                nic: dev.clone(),
-            },
-        );
+        let _ = narf_net::registry().register(&auth, IxgbeNic { nic: dev.clone() });
     }
 
     // No pump spawn here: `bring_up` spawned the device's per-queue

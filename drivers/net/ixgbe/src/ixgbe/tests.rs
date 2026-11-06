@@ -446,16 +446,14 @@ fn smoke_ixgbe_multi_instance_cookie_dispatch() -> TestResult {
     if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrl) {
         return TestResult::Fail("re-probe replaced controller(0)");
     }
-    let ring_ptr =
-        narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+    let ring_ptr = narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
     if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
         return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
     }
     if ctrl.rx_ipc_ring.lock().is_none() {
         return TestResult::Fail("attach took the NIC's RX ring");
     }
-    let tx_ptr =
-        narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+    let tx_ptr = narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
     if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
         return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
     }

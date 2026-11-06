@@ -1900,12 +1900,7 @@ impl Igb {
         // vector yet and is ignored; IMS is programmed below, so no
         // cause can fire before the device is up.
         if let Some(v) = irq_vector {
-            narf_interrupts::dispatch::install_handler_named(
-                v,
-                "igb",
-                u64::from(v),
-                igb_isr,
-            );
+            narf_interrupts::dispatch::install_handler_named(v, "igb", u64::from(v), igb_isr);
         }
 
         // 9. Program the extended interrupt block. Queue 0 RX and TX
@@ -3602,12 +3597,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // while the parked syscall spins. Mirrors e1000's probe. The send
     // hook carries this instance's `CONTROLLERS` index as its cookie,
     // so each port's outbound frames resolve to its own NIC.
-    let name = crate::publish::publish_netdev_with_context(
-        mac,
-        index as u64,
-        igb_send_frame,
-        link_sample,
-    );
+    let name =
+        crate::publish::publish_netdev_with_context(mac, index as u64, igb_send_frame, link_sample);
     let bus_info = match device.addr {
         narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
         narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),

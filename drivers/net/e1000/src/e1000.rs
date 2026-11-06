@@ -2005,7 +2005,6 @@ impl core::fmt::Debug for E1000 {
 /// it, re-samples STATUS, and republishes the iface link metadata.
 /// A module-level flag could only name one NIC's transition
 /// (issue #791 vs #795).
-
 /// Decode a STATUS word into a publication sample. Shared by probe
 /// (initial state) and the RX pump's LSC drain (every transition).
 fn link_sample_from_status(status: u32) -> crate::publish::LinkSample {
@@ -2329,12 +2328,7 @@ impl E1000 {
         // vector yet and is ignored; IMS is programmed below, so no
         // cause can fire before the device is up.
         if let Some(v) = irq_vector {
-            narf_interrupts::dispatch::install_handler_named(
-                v,
-                "e1000",
-                u64::from(v),
-                e1000_isr,
-            );
+            narf_interrupts::dispatch::install_handler_named(v, "e1000", u64::from(v), e1000_isr);
         }
 
         // 8. Adjust the PCI Command register based on which IRQ path
@@ -3888,13 +3882,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(
-            &auth,
-            E1000Nic {
-                nic: dev.clone(),
-                name: "",
-            },
-        );
+        let _ = narf_net::registry().register(&auth, E1000Nic { nic: dev.clone() });
     }
 
     Ok(())
@@ -4048,7 +4036,11 @@ fn e1000_send_frame(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result
 /// controller's index in `CONTROLLERS` (see `enable_zero_copy_tx_context`
 /// in probe); resolving it here is what keeps a second port's
 /// zero-copy frames out of the first port's pool.
-fn e1000_send_frame_zc(cookie: u64, mut frame: narf_net::Frame, meta: narf_net::TxMeta) -> Result<(), ()> {
+fn e1000_send_frame_zc(
+    cookie: u64,
+    mut frame: narf_net::Frame,
+    meta: narf_net::TxMeta,
+) -> Result<(), ()> {
     let ctrl = live_controller(cookie as usize).ok_or(())?;
     let context = match meta.tso_mss {
         Some(mss) => match prepare_ipv4_tso(frame.payload_mut(), mss) {
@@ -4297,14 +4289,12 @@ fn name_for(did: u16) -> &'static str {
 /// module-level `CONTROLLER` singleton, so a second 8254x's
 /// interface reported the first port's MAC, link state, and rings
 /// (issue #795). The rings are borrowed from the NIC's own
-/// `rx_ipc_ring` / `tx_ipc_ring` fields. `name` is the fallback
-/// returned before probe publishes the interface name; it is never
-/// used after publish, so probe passes `""` (matching the old
-/// `e1000_ifname()` default).
+/// `rx_ipc_ring` / `tx_ipc_ring` fields. The name always comes from
+/// `E1000::ifname()`, which is `""` before probe publishes it
+/// (matching the old `e1000_ifname()` default).
 #[derive(Debug)]
 pub struct E1000Nic {
     nic: Arc<E1000>,
-    name: &'static str,
 }
 
 impl narf_net::Interface for E1000Nic {
@@ -4373,14 +4363,21 @@ impl crate::HwNic for E1000Nic {
 /// True iff at least one controller is live (probed and not
 /// detached).
 pub fn is_probed() -> bool {
-    CONTROLLERS.lock().iter().any(|c| !c.detached.load(Ordering::Acquire))
+    CONTROLLERS
+        .lock()
+        .iter()
+        .any(|c| !c.detached.load(Ordering::Acquire))
 }
 
 /// Number of live controllers. The index of a controller in
 /// `CONTROLLERS` is its send-path cookie; the vec never shrinks, so
 /// a live controller's cookie is stable for the kernel lifetime.
 pub fn instance_count() -> usize {
-    CONTROLLERS.lock().iter().filter(|c| !c.detached.load(Ordering::Acquire)).count()
+    CONTROLLERS
+        .lock()
+        .iter()
+        .filter(|c| !c.detached.load(Ordering::Acquire))
+        .count()
 }
 
 /// Clone the controller handle at `index`, holding `CONTROLLERS`
@@ -4460,7 +4457,8 @@ pub async fn tx_async(index: usize, frame: &[u8]) -> Result<(), E1000Error> {
         Some(v) => v,
         None => {
             // No IRQ wired — synchronous path is the only option.
-            return with_controller(index, |c| c.tx(frame)).unwrap_or(Err(E1000Error::UnsupportedDevice));
+            return with_controller(index, |c| c.tx(frame))
+                .unwrap_or(Err(E1000Error::UnsupportedDevice));
         }
     };
     // Construct the future first, then enqueue. If the device
