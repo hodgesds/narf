@@ -137,6 +137,30 @@ pub fn match_device(vendor: u16, product: u16) -> Option<&'static ElanDeviceMatc
         .find(|m| m.vendor == vendor && m.product == product)
 }
 
+/// Classify a HID device as an Elan vendor-format touchpad for
+/// the bind layers. A table hit returns that row (with its bus +
+/// quirks). Failing that, an Elan VID (`0x04F3`) or an ACPI
+/// `_HID` with the `ELAN` / `ETD` vendor prefix also classifies
+/// as Elan on the I2C-HID bus with no quirks — the Lenovo / Acer
+/// / MSI touchpads that present the same wire format but never
+/// made it into Linux's `elan_devices[]`. Returns `None` for
+/// anything else, so a non-matching device is rejected by the
+/// bind layer instead of being claimed as Elan.
+pub fn classify_device(acpi_hid: &str, vendor: u16, product: u16) -> Option<ElanDeviceMatch> {
+    if let Some(m) = match_device(vendor, product) {
+        return Some(*m);
+    }
+    if vendor == USB_VENDOR_ID_ELAN || acpi_hid.starts_with("ELAN") || acpi_hid.starts_with("ETD") {
+        return Some(ElanDeviceMatch {
+            vendor,
+            product,
+            bus: ElanBus::I2cHid,
+            quirks: ElanQuirks::empty(),
+        });
+    }
+    None
+}
+
 // ── Report IDs ────────────────────────────────────────────────────
 
 /// USB report id for the single-finger report (Linux

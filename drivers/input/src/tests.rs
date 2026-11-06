@@ -2952,6 +2952,337 @@ mod i2c_hid_touch_smokes {
         "drivers/input/i2c-hid",
         smoke_fake_i2c_hid_touchscreen_end_to_end
     );
+
+    // ── End-to-end FakeI2cHid Elan bind ──────────────────────────
+    //
+    // Stages an Elan HID descriptor (VID 0x04F3, as
+    // `make_descriptor_bytes` builds), the absolute-mode +
+    // parameter-query exchange, and one synthetic 0x5D i2c-HID
+    // multi-finger report; verifies an Elan device decodes and
+    // binds through the HID path (classify → probe → decode →
+    // pump) and a TouchEvent lands on the ring.
+
+    fn smoke_fake_i2c_hid_elan_end_to_end() -> TestResult {
+        use super::i2c_hid_smokes::{make_descriptor_bytes, run_async, MockBus};
+        use crate::hid_elan::{classify_device, ElanReport};
+        use crate::i2c_hid::{I2cHidDriver, POWER_ON};
+        use alloc::sync::Arc;
+        use narf_drivers_i2c::I2cBus;
+        use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch, TouchState};
+
+        let bus = Arc::new(MockBus::new());
+        let mut hid_desc = make_descriptor_bytes();
+        let put16 = |buf: &mut [u8], off: usize, v: u16| {
+            buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        put16(&mut hid_desc, 10, 64); // wMaxInputLength
+        put16(&mut hid_desc, 14, 32); // wMaxOutputLength
+                                      // (1) HID descriptor. (2) RESET sentinel.
+        bus.stage_read(hid_desc);
+        bus.stage_read(alloc::vec![0u8; 2]);
+        // (3)-(5) Parameter GET responses: [len=7][5-byte report].
+        // MAX_X = 0x1234, MAX_Y = 0x0500, RES x/y = 0x10/0x10.
+        for resp in [
+            [0x0D, 0x05, 0x03, 0x34, 0x12],
+            [0x0D, 0x05, 0x03, 0x00, 0x05],
+            [0x0D, 0x05, 0x03, 0x10, 0x10],
+        ] {
+            bus.stage_read(alloc::vec![0x07, 0x00]);
+            bus.stage_read(resp.to_vec());
+        }
+        // (6) One 0x5D i2c-HID report: finger 0 present, no click.
+        // Finger record mirrors the ElanFinger unit fixture:
+        // X = 0x1AB, raw Y = 0x234 → y = 0x500 - 0x234 = 0x2CC.
+        let mut report = [0u8; 32];
+        report[0] = 0x5D;
+        report[1] = 0x08; // finger 0 present (bit 3), btn released
+        report[2..7].copy_from_slice(&[0x12, 0xAB, 0x34, 0x45, 0x80]);
+        let total_len = report.len() as u16 + 2;
+        let mut framed = alloc::vec![0u8; total_len as usize];
+        framed[0..2].copy_from_slice(&total_len.to_le_bytes());
+        framed[2..].copy_from_slice(&report);
+        bus.stage_read(framed);
+
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x10, 0x0001);
+
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+
+        run_async(async move {
+            if drv.read_descriptor().await.is_err() {
+                return TestResult::Fail("HID descriptor read failed");
+            }
+            if drv.reset().await.is_err() {
+                return TestResult::Fail("RESET failed");
+            }
+            if drv.set_power(POWER_ON).await.is_err() {
+                return TestResult::Fail("SET_POWER(ON) failed");
+            }
+            let desc = match drv.descriptor() {
+                Some(d) => d,
+                None => return TestResult::Fail("no descriptor after read"),
+            };
+            // Classify: Elan VID under a generic PNP0C50 _HID.
+            if classify_device("PNP0C50", desc.w_vendor_id, desc.w_product_id).is_none() {
+                return TestResult::Fail("Elan device did not classify");
+            }
+            if classify_device("PNP0C50", 0x1234, 0x5678).is_some() {
+                return TestResult::Fail("non-Elan device classified as Elan");
+            }
+            let params = match crate::i2c_hid_bind::elan_probe(&drv).await {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail("Elan probe failed"),
+            };
+            if params.max_x != 0x1234 || params.max_y != 0x0500 {
+                return TestResult::Fail("Elan params wrong");
+            }
+            let mut buf = alloc::vec![0u8; 64];
+            let n = match drv.read_input_report(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => return TestResult::Fail("read_input_report failed"),
+            };
+            if n == 0 {
+                return TestResult::Fail("input report returned 0 bytes");
+            }
+            let payload = &buf[..n];
+            let decoded = match ElanReport::decode_i2c(payload, params.max_y) {
+                Some(r) => r,
+                None => return TestResult::Fail("decode_i2c rejected the 0x5D report"),
+            };
+            if decoded.fingers.is_empty() || !decoded.fingers[0].present {
+                return TestResult::Fail("finger 0 missing after decode");
+            }
+            if decoded.fingers[0].x != 0x1AB || decoded.fingers[0].y != 0x2CC {
+                return TestResult::Fail("finger coordinates wrong after decode");
+            }
+            let contacts: alloc::vec::Vec<crate::rmi4_core::Rmi4Contact> = decoded
+                .fingers
+                .iter()
+                .map(|f| crate::rmi4_core::Rmi4Contact {
+                    present: f.present,
+                    x: f.x as i32,
+                    y: f.y as i32,
+                    pressure: f.pressure as i32,
+                })
+                .collect();
+            let mut state = crate::rmi4_core::Rmi4PumpState::new();
+            let pushed = state.pump_contacts(
+                None,
+                &contacts,
+                Some(decoded.btn_left),
+                0,
+                params.max_x as i32,
+                0,
+                params.max_y as i32,
+            );
+            if pushed < 1 {
+                return TestResult::Fail("pump pushed 0 events");
+            }
+            match pop_touch() {
+                Some(t) if t.state == TouchState::Down => {}
+                Some(_) => return TestResult::Fail("expected Down on first contact"),
+                None => return TestResult::Fail("no TouchEvent in ring after pump"),
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!("drivers/input/i2c-hid", smoke_fake_i2c_hid_elan_end_to_end);
+
+    // ── End-to-end FakeI2cHid RMI4-over-HID bind ─────────────────
+    //
+    // Stages a Synaptics HID descriptor (VID 0x06CB), the RMI
+    // mode-set + PDT walk + F$01/F$30 queries a real device
+    // answers, and F$12 ATTN reports; verifies an RMI4 F$12
+    // device decodes and binds through the HID path (classify →
+    // session probe → ATTN pump) and TouchEvents land on the ring.
+    // Phase 1 is the single-source fast path (F$12 data decoded
+    // in place from the ATTN); phase 2 carries both the F$12 and
+    // F$30 sources, exercising the register-read fallback and
+    // the F$30 clickpad button (observed as a LEFT PointerEvent).
+
+    fn smoke_fake_i2c_hid_rmi4_f12_end_to_end() -> TestResult {
+        use super::i2c_hid_smokes::{make_descriptor_bytes, run_async, MockBus};
+        use crate::hid_rmi::{classify_device, AttnReport, HidRmiSession};
+        use crate::i2c_hid::{I2cHidDriver, POWER_ON};
+        use alloc::sync::Arc;
+        use narf_drivers_i2c::I2cBus;
+        use narf_input::{
+            __reset_global_ring_for_test, init_global_ring, pop_pointer, pop_touch, PointerButtons,
+            TouchState,
+        };
+
+        // Fake PDT, page 0, in scan order (offsets 0xE9 down):
+        //   0xE9 F$12 (query 0x00, data 0x03, 1 source)
+        //   0xE3 F$01 (query 0x10, 1 source)
+        //   0xDD F$30 (query 0x20, data 0x23, 1 source)
+        //   0xD7 terminator (function 0x00)
+        // Interrupt map: F$12 → bit 0, F$01 → bit 1, F$30 → bit 2.
+        fn pdt_entry(query: u8, cmd: u8, ctrl: u8, data: u8, sources: u8, func: u8) -> [u8; 6] {
+            [query, cmd, ctrl, data, sources, func]
+        }
+        // One length-prefixed RMI_READ_DATA_REPORT (0x0B) carrying
+        // `body` bytes: [len][0x0B][count][body...].
+        fn read_data_report(body: &[u8]) -> alloc::vec::Vec<u8> {
+            let mut framed = alloc::vec![0u8; body.len() + 4];
+            framed[0..2].copy_from_slice(&((body.len() + 4) as u16).to_le_bytes());
+            framed[2] = 0x0B;
+            framed[3] = body.len() as u8;
+            framed[4..].copy_from_slice(body);
+            framed
+        }
+
+        let bus = Arc::new(MockBus::new());
+        let mut hid_desc = make_descriptor_bytes();
+        let put16 = |buf: &mut [u8], off: usize, v: u16| {
+            buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        put16(&mut hid_desc, 10, 64); // wMaxInputLength
+        put16(&mut hid_desc, 14, 32); // wMaxOutputLength
+        put16(&mut hid_desc, 20, 0x06CB); // wVendorID (Synaptics)
+        put16(&mut hid_desc, 22, 0x0000); // wProductID
+                                          // (1) HID descriptor. (2) RESET sentinel.
+        bus.stage_read(hid_desc);
+        bus.stage_read(alloc::vec![0u8; 2]);
+        // (3)-(6) Probe reads, in the session's order: three PDT
+        // entries, the terminator, the F$01 query, the F$30 query.
+        bus.stage_read(read_data_report(&pdt_entry(
+            0x00, 0x01, 0x02, 0x03, 0x01, 0x12,
+        )));
+        bus.stage_read(read_data_report(&pdt_entry(
+            0x10, 0x11, 0x12, 0x13, 0x01, 0x01,
+        )));
+        bus.stage_read(read_data_report(&pdt_entry(
+            0x20, 0x21, 0x22, 0x23, 0x01, 0x30,
+        )));
+        bus.stage_read(read_data_report(&[0u8; 6]));
+        bus.stage_read(read_data_report(&[
+            0x01, 0x00, 0x02, 0x01, 0x20, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01,
+        ]));
+        bus.stage_read(read_data_report(&[0x48, 0x08]));
+        // (7)-(8) Phase-2 fallback reads, consumed by the
+        // multi-source ATTN below — in the order the pump issues
+        // them (F$30 button read first, then the F$12 Data 1
+        // read): the F$30 data byte (0xFE: GPIO 0 low = clickpad
+        // pressed), then F$12 Data 1 (40 bytes = 5 objects,
+        // first a finger at 0x1000/0x2000).
+        bus.stage_read(read_data_report(&[0xFE]));
+        let mut f12_data = [0u8; 40];
+        f12_data[0] = 0x01; // FINGER
+        f12_data[1..3].copy_from_slice(&0x1000u16.to_le_bytes());
+        f12_data[3..5].copy_from_slice(&0x2000u16.to_le_bytes());
+        f12_data[5] = 0x80;
+        bus.stage_read(read_data_report(&f12_data));
+
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x10, 0x0001);
+
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+
+        run_async(async move {
+            if drv.read_descriptor().await.is_err() {
+                return TestResult::Fail("HID descriptor read failed");
+            }
+            if drv.reset().await.is_err() {
+                return TestResult::Fail("RESET failed");
+            }
+            if drv.set_power(POWER_ON).await.is_err() {
+                return TestResult::Fail("SET_POWER(ON) failed");
+            }
+            let desc = match drv.descriptor() {
+                Some(d) => d,
+                None => return TestResult::Fail("no descriptor after read"),
+            };
+            let quirks = match classify_device("SYNA8002", desc.w_vendor_id, desc.w_product_id) {
+                Some(q) => q,
+                None => return TestResult::Fail("Synaptics device did not classify as RMI4"),
+            };
+            if classify_device("PNP0C50", 0x1234, 0x5678).is_some() {
+                return TestResult::Fail("non-Synaptics device classified as RMI4");
+            }
+            let mut session = HidRmiSession::new(&drv, 32, quirks);
+            let probe = match session.probe().await {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail("RMI4 probe failed"),
+            };
+            if !probe.product.is_synaptics() {
+                return TestResult::Fail("probe product is not Synaptics");
+            }
+            if probe.f12.is_none() || probe.f30.is_none() {
+                return TestResult::Fail("probe missed F$12 or F$30");
+            }
+            if probe.source_mask_for(0x12) != 0x01 || probe.source_mask_for(0x30) != 0x04 {
+                return TestResult::Fail("interrupt map wrong");
+            }
+            // The probe issued one read-addr output report per
+            // register read (4 PDT + F$01 query + F$30 query)
+            // plus one set-page output report.
+            let writes = bus.writes();
+            let is_out =
+                |w: &alloc::vec::Vec<u8>, id: u8| w.len() >= 9 && (w[2] >> 4) == 0x02 && w[8] == id;
+            if writes.iter().filter(|w| is_out(w, 0x0A)).count() != 6 {
+                return TestResult::Fail("probe must issue 6 read-addr output reports");
+            }
+            if writes.iter().filter(|w| is_out(w, 0x09)).count() != 1 {
+                return TestResult::Fail("probe must issue 1 set-page output report");
+            }
+            let caps =
+                crate::i2c_hid_touch::build_rmi_caps(&probe, &narf_input::evdev::DeviceCaps::new());
+            let (evdev_id, node) = narf_input::evdev::ROUTER.register_device(caps);
+            let mut state = crate::rmi4_core::Rmi4PumpState::new();
+            // Phase 1: single-source ATTN (F$12 only) — fast path.
+            let mut attn1 = [0u8; 10];
+            attn1[0] = 0x0C;
+            attn1[1] = 0x01;
+            attn1[2] = 0x01; // FINGER
+            attn1[3..5].copy_from_slice(&0x1000u16.to_le_bytes());
+            attn1[5..7].copy_from_slice(&0x2000u16.to_le_bytes());
+            attn1[7] = 0x80;
+            let attn1 = match AttnReport::decode(&attn1) {
+                Some(a) => a,
+                None => return TestResult::Fail("ATTN decode failed"),
+            };
+            crate::i2c_hid_bind::pump_rmi_attn(&mut session, &probe, &attn1, &mut state, &node)
+                .await;
+            match pop_touch() {
+                Some(t) if t.state == TouchState::Down && t.x == 0x1000 && t.y == 0x2000 => {}
+                Some(_) => return TestResult::Fail("phase 1: expected Down at 0x1000/0x2000"),
+                None => return TestResult::Fail("phase 1: no TouchEvent in ring"),
+            }
+            // Phase 2: multi-source ATTN (F$12 + F$30) — the
+            // register-read fallback + clickpad button.
+            let mut attn2 = [0u8; 10];
+            attn2[0] = 0x0C;
+            attn2[1] = 0x05; // F$12 bit 0 + F$30 bit 2
+            attn2[2] = 0x01;
+            attn2[3..5].copy_from_slice(&0x1000u16.to_le_bytes());
+            attn2[5..7].copy_from_slice(&0x2000u16.to_le_bytes());
+            attn2[7] = 0x80;
+            let attn2 = match AttnReport::decode(&attn2) {
+                Some(a) => a,
+                None => return TestResult::Fail("ATTN decode failed (phase 2)"),
+            };
+            crate::i2c_hid_bind::pump_rmi_attn(&mut session, &probe, &attn2, &mut state, &node)
+                .await;
+            match pop_touch() {
+                Some(t) if t.state == TouchState::Move => {}
+                Some(_) => return TestResult::Fail("phase 2: expected Move on held contact"),
+                None => return TestResult::Fail("phase 2: no TouchEvent in ring"),
+            }
+            match pop_pointer() {
+                Some(p) if p.buttons == PointerButtons::LEFT => {}
+                Some(_) => return TestResult::Fail("phase 2: expected LEFT button"),
+                None => return TestResult::Fail("phase 2: no PointerEvent in ring"),
+            }
+            narf_input::evdev::ROUTER.unregister_device(evdev_id);
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_fake_i2c_hid_rmi4_f12_end_to_end
+    );
 }
 
 // ─── RMI4 core protocol smoke tests ────────────────────────────────
@@ -3761,6 +4092,41 @@ kernel_test_in!(
     smoke_hid_rmi_device_id_table_covers_canonical_vids
 );
 
+fn smoke_hid_rmi_classify_synaptics_prefix_and_reject() -> TestResult {
+    use crate::hid_rmi::{classify_device, USB_VENDOR_ID_SYNAPTICS};
+    // Table hit (Acer Switch 5) classifies with its quirks.
+    match classify_device("PNP0C50", USB_VENDOR_ID_SYNAPTICS, 0x81A7) {
+        Some(q) => {
+            use crate::hid_rmi::DeviceQuirks;
+            if !q.contains(DeviceQuirks::OUTPUT_SET_REPORT) {
+                return TestResult::Fail("table-hit quirks lost in classify");
+            }
+        }
+        None => return TestResult::Fail("table hit must classify"),
+    }
+    // SYNA ACPI prefix classifies even with an unlisted PID.
+    if classify_device("SYNA8002", USB_VENDOR_ID_SYNAPTICS, 0x8002).is_none() {
+        return TestResult::Fail("SYNA prefix must classify as RMI4");
+    }
+    // Synaptics VID classifies even under a generic PNP0C50 _HID.
+    if classify_device("PNP0C50", USB_VENDOR_ID_SYNAPTICS, 0x0000).is_none() {
+        return TestResult::Fail("Synaptics VID must classify as RMI4");
+    }
+    // Anything else is rejected — an Elan device must never be
+    // claimed as RMI4, and neither must an unknown VID/PID.
+    if classify_device("ELAN09BD", 0x04F3, 0x09BD).is_some() {
+        return TestResult::Fail("Elan device must not classify as RMI4");
+    }
+    if classify_device("PNP0C50", 0x1234, 0x5678).is_some() {
+        return TestResult::Fail("unknown device must not classify as RMI4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-rmi",
+    smoke_hid_rmi_classify_synaptics_prefix_and_reject
+);
+
 fn smoke_hid_rmi_set_page_output_report_layout() -> TestResult {
     use crate::hid_rmi::{encode_set_page, rmi_page, RMI_WRITE_REPORT_ID};
     if rmi_page(0x0142) != 1 {
@@ -3879,6 +4245,45 @@ fn smoke_hid_elan_device_id_table_at_least_five() -> TestResult {
 kernel_test_in!(
     "drivers/input/hid-elan",
     smoke_hid_elan_device_id_table_at_least_five
+);
+
+fn smoke_hid_elan_classify_prefix_and_reject() -> TestResult {
+    use crate::hid_elan::{classify_device, ElanBus, USB_VENDOR_ID_ELAN};
+    // Table hit (Toshiba Click L9W) keeps its I2cHid bus.
+    match classify_device("PNP0C50", USB_VENDOR_ID_ELAN, 0x0401) {
+        Some(m) => {
+            if m.bus != ElanBus::I2cHid {
+                return TestResult::Fail("table-hit bus lost in classify");
+            }
+        }
+        None => return TestResult::Fail("table hit must classify"),
+    }
+    // ELAN ACPI prefix classifies even with an unlisted PID.
+    match classify_device("ELAN09BD", USB_VENDOR_ID_ELAN, 0x09BD) {
+        Some(m) => {
+            if m.bus != ElanBus::I2cHid {
+                return TestResult::Fail("prefix-classified device must be I2cHid");
+            }
+        }
+        None => return TestResult::Fail("ELAN prefix must classify"),
+    }
+    // Elan VID classifies even under a generic PNP0C50 _HID.
+    if classify_device("PNP0C50", USB_VENDOR_ID_ELAN, 0x0000).is_none() {
+        return TestResult::Fail("Elan VID must classify");
+    }
+    // Anything else is rejected — a Synaptics device must never
+    // be claimed as Elan, and neither must an unknown VID/PID.
+    if classify_device("SYNA8002", 0x06CB, 0x8002).is_some() {
+        return TestResult::Fail("Synaptics device must not classify as Elan");
+    }
+    if classify_device("PNP0C50", 0x1234, 0x5678).is_some() {
+        return TestResult::Fail("unknown device must not classify as Elan");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_classify_prefix_and_reject
 );
 
 fn smoke_hid_elan_param_query_round_trip() -> TestResult {
@@ -4972,4 +5377,403 @@ mod psmouse_smokes {
         TestResult::Pass
     }
     kernel_test_in!("drivers/input/psmouse", smoke_synaptics_oldabs_decode);
+}
+
+// ─── RMI4-over-SMBus transport smoke tests ──────────────────────────
+//
+// The fake below is a miniature RMI4-over-SMBus device: a 256-byte
+// page-0 register image, a protocol-version byte, and a v2 mapping
+// table it maintains from the host's mapping writes — so the
+// transport's framing is validated against device behaviour, not
+// against its own constants.
+
+mod smbus_rmi_smokes {
+    use alloc::vec::Vec;
+    use narf_drivers_platform::smbus::SmbusError;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    use crate::rmi4_core::{decode_f12_data1, probe_device, Rmi4Transport};
+    use crate::smbus_rmi::{
+        probe_at, SmbusIo, SmbusRmiTransport, SmbusRmiVersion, SMBUS_RMI_DEFAULT_ADDR,
+    };
+
+    /// Operation codes for the fake's read/write logs.
+    const OP_READ_BYTE: u8 = 0;
+    const OP_WRITE_BYTE: u8 = 1;
+    const OP_READ_WORD: u8 = 2;
+    const OP_WRITE_WORD: u8 = 3;
+    const OP_READ_BLOCK: u8 = 4;
+    const OP_WRITE_BLOCK: u8 = 5;
+
+    /// Faithful miniature RMI4-over-SMBus device (see the module
+    /// docs). Page-0 only; reads on any other page return zero.
+    #[derive(Debug)]
+    struct FakeSmbus {
+        mem: IrqSafeSpinLock<[u8; 256]>,
+        page: IrqSafeSpinLock<u8>,
+        version: u8,
+        map: IrqSafeSpinLock<[(u16, u8); 8]>,
+        writes: IrqSafeSpinLock<Vec<(u8, u8, Vec<u8>)>>,
+        reads: IrqSafeSpinLock<Vec<(u8, u8)>>,
+    }
+
+    impl FakeSmbus {
+        fn new(mem: [u8; 256], version: u8) -> Self {
+            Self {
+                mem: IrqSafeSpinLock::new(mem),
+                page: IrqSafeSpinLock::new(0),
+                version,
+                map: IrqSafeSpinLock::new([(0, 0); 8]),
+                writes: IrqSafeSpinLock::new(Vec::new()),
+                reads: IrqSafeSpinLock::new(Vec::new()),
+            }
+        }
+
+        fn read_mem(&self, addr: u16) -> u8 {
+            if *self.page.lock() != 0 || addr >= 256 {
+                return 0;
+            }
+            self.mem.lock()[addr as usize]
+        }
+
+        fn write_mem(&self, addr: u16, value: u8) {
+            if *self.page.lock() != 0 || addr >= 256 {
+                return;
+            }
+            self.mem.lock()[addr as usize] = value;
+        }
+    }
+
+    impl SmbusIo for FakeSmbus {
+        fn read_byte_data(&self, _addr: u8, cmd: u8) -> Result<u8, SmbusError> {
+            self.reads.lock().push((OP_READ_BYTE, cmd));
+            if cmd == 0xFD {
+                return Ok(self.version);
+            }
+            Ok(self.read_mem(cmd as u16))
+        }
+        fn write_byte_data(&self, _addr: u8, cmd: u8, value: u8) -> Result<(), SmbusError> {
+            self.writes
+                .lock()
+                .push((OP_WRITE_BYTE, cmd, alloc::vec![value]));
+            if cmd == 0xFF {
+                *self.page.lock() = value;
+                return Ok(());
+            }
+            self.write_mem(cmd as u16, value);
+            Ok(())
+        }
+        fn read_word_data(&self, _addr: u8, cmd: u8) -> Result<u16, SmbusError> {
+            self.reads.lock().push((OP_READ_WORD, cmd));
+            let lo = self.read_mem(cmd as u16);
+            let hi = self.read_mem(cmd.wrapping_add(1) as u16);
+            Ok(u16::from_le_bytes([lo, hi]))
+        }
+        fn write_word_data(&self, _addr: u8, cmd: u8, value: u16) -> Result<(), SmbusError> {
+            self.writes
+                .lock()
+                .push((OP_WRITE_WORD, cmd, value.to_le_bytes().to_vec()));
+            let [lo, hi] = value.to_le_bytes();
+            self.write_mem(cmd as u16, lo);
+            self.write_mem(cmd.wrapping_add(1) as u16, hi);
+            Ok(())
+        }
+        fn read_block_data(&self, _addr: u8, cmd: u8, buf: &mut [u8]) -> Result<usize, SmbusError> {
+            self.reads.lock().push((OP_READ_BLOCK, cmd));
+            if cmd >= 8 {
+                return Err(SmbusError::Failed);
+            }
+            let (rmiaddr, count) = self.map.lock()[cmd as usize];
+            if count as usize > buf.len() {
+                return Err(SmbusError::Failed);
+            }
+            for i in 0..count as usize {
+                buf[i] = self.read_mem(rmiaddr.wrapping_add(i as u16));
+            }
+            Ok(count as usize)
+        }
+        fn write_block_data(&self, _addr: u8, cmd: u8, data: &[u8]) -> Result<(), SmbusError> {
+            self.writes
+                .lock()
+                .push((OP_WRITE_BLOCK, cmd, data.to_vec()));
+            if cmd >= 0x80 {
+                // Mapping-table write: [cmd, rmiaddr_lo,
+                // rmiaddr_hi, readcount, flags].
+                if data.len() != 5 || data[0] != cmd {
+                    return Err(SmbusError::Failed);
+                }
+                let rmiaddr = u16::from_le_bytes([data[1], data[2]]);
+                self.map.lock()[(cmd - 0x80) as usize] = (rmiaddr, data[3]);
+                return Ok(());
+            }
+            // Data write: data[0] echoes the command code.
+            if cmd >= 8 || data.is_empty() || data[0] != cmd {
+                return Err(SmbusError::Failed);
+            }
+            let (rmiaddr, _) = self.map.lock()[cmd as usize];
+            for (i, b) in data.iter().skip(1).enumerate() {
+                self.write_mem(rmiaddr.wrapping_add(i as u16), *b);
+            }
+            Ok(())
+        }
+    }
+
+    /// Standard Synaptics page-0 image shared by the fixtures:
+    /// PDT entries (F$12 @ 0xE9, F$01 @ 0xE3, F$30 @ 0xDD,
+    /// terminator @ 0xD7), the F$01 query (manufacturer 1) at
+    /// 0x10, the F$30 query (8 lines) at 0x20, and one F$12
+    /// finger object at data base 0x03.
+    fn synaptics_page0() -> [u8; 256] {
+        let mut mem = [0u8; 256];
+        // Entry layout: [query, cmd, ctrl, data, intr|ver, func].
+        mem[0xE9..0xEF].copy_from_slice(&[0x00, 0x01, 0x02, 0x03, 0x01, 0x12]);
+        mem[0xE3..0xE9].copy_from_slice(&[0x10, 0x11, 0x12, 0x13, 0x01, 0x01]);
+        mem[0xDD..0xE3].copy_from_slice(&[0x20, 0x21, 0x22, 0x23, 0x01, 0x30]);
+        // Terminator at 0xD7 stays zero (function 0x00).
+        mem[0x10..0x1B].copy_from_slice(&[
+            0x01, 0x00, 0x02, 0x01, 0x20, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01,
+        ]);
+        mem[0x20..0x22].copy_from_slice(&[0x48, 0x08]);
+        mem[0x03..0x0B].copy_from_slice(&[0x01, 0x00, 0x10, 0x00, 0x20, 0x80, 0x05, 0x06]);
+        mem
+    }
+
+    fn smoke_smbus_rmi_v1_probe_and_pdt_walk() -> TestResult {
+        let fake = FakeSmbus::new(synaptics_page0(), 0x00); // v1
+        let (version, probe) = match probe_at(&fake, SMBUS_RMI_DEFAULT_ADDR) {
+            Some(p) => p,
+            None => return TestResult::Fail("v1 probe declined the Synaptics image"),
+        };
+        if version != SmbusRmiVersion::V1 {
+            return TestResult::Fail("version byte 0x00 must negotiate v1");
+        }
+        if !probe.product.is_synaptics() {
+            return TestResult::Fail("probe product is not Synaptics");
+        }
+        if probe.f12.is_none() || probe.f30.is_none() {
+            return TestResult::Fail("probe missed F$12 or F$30");
+        }
+        if probe.f11.is_some() {
+            return TestResult::Fail("image has no F$11");
+        }
+        // Page-select write ({0xFF, 0x00}) must precede the reads.
+        let writes = fake.writes.lock();
+        if !writes
+            .iter()
+            .any(|(op, cmd, data)| *op == OP_WRITE_BYTE && *cmd == 0xFF && data == &[0])
+        {
+            return TestResult::Fail("v1 probe must page-select to 0");
+        }
+        // The 6-byte PDT entry at 0xE9 is assembled from word
+        // reads at 0xE9 / 0xEB / 0xED (no plain block-read op on
+        // the ICH host — see the transport docs).
+        let reads = fake.reads.lock();
+        for cmd in [0xE9u8, 0xEB, 0xED] {
+            if !reads.iter().any(|(op, c)| *op == OP_READ_WORD && *c == cmd) {
+                return TestResult::Fail("PDT entry must be read as words at 0xE9/0xEB/0xED");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_v1_probe_and_pdt_walk
+    );
+
+    fn smoke_smbus_rmi_v1_read_write_round_trip() -> TestResult {
+        let fake = FakeSmbus::new(synaptics_page0(), 0x00); // v1
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        // Reads/writes before version negotiation are refused.
+        let mut tmp = [0u8; 1];
+        if t.read_block(0x40, &mut tmp).is_ok() {
+            return TestResult::Fail("read before probe_version must fail");
+        }
+        if t.probe_version().is_err() {
+            return TestResult::Fail("probe_version failed on the v1 image");
+        }
+        if t.write_block(0x40, &[0xAA, 0xBB, 0xCC]).is_err() {
+            return TestResult::Fail("v1 write failed");
+        }
+        let mut back = [0u8; 3];
+        if t.read_block(0x40, &mut back).is_err() {
+            return TestResult::Fail("v1 read failed");
+        }
+        if back != [0xAA, 0xBB, 0xCC] {
+            return TestResult::Fail("v1 write/read round trip mismatch");
+        }
+        // The 3-byte write is three byte-data writes to
+        // incrementing addresses (no plain multi-byte write op).
+        let writes = fake.writes.lock();
+        let byte_writes: Vec<(u8, u8)> = writes
+            .iter()
+            .filter(|(op, cmd, _)| *op == OP_WRITE_BYTE && *cmd >= 0x40 && *cmd <= 0x42)
+            .map(|(_, cmd, data)| (*cmd, data[0]))
+            .collect();
+        if byte_writes != alloc::vec![(0x40, 0xAA), (0x41, 0xBB), (0x42, 0xCC)] {
+            return TestResult::Fail("v1 multi-byte write must be sequential byte writes");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_v1_read_write_round_trip
+    );
+
+    fn smoke_smbus_rmi_v2_mapping_table_and_block_read() -> TestResult {
+        let fake = FakeSmbus::new(synaptics_page0(), 0x01); // v2
+        let (version, probe) = match probe_at(&fake, SMBUS_RMI_DEFAULT_ADDR) {
+            Some(p) => p,
+            None => return TestResult::Fail("v2 probe declined the Synaptics image"),
+        };
+        if version != SmbusRmiVersion::V2 {
+            return TestResult::Fail("version byte 0x01 must negotiate v2");
+        }
+        if probe.f12.is_none() {
+            return TestResult::Fail("v2 probe missed F$12");
+        }
+        // First mapping write programs slot 0 for the PDT read
+        // at 0xE9 (6 bytes): [0x80, 0xE9, 0x00, 0x06, 0x01].
+        let writes = fake.writes.lock();
+        if !writes.iter().any(|(op, cmd, data)| {
+            *op == OP_WRITE_BLOCK && *cmd == 0x80 && data == &[0x80, 0xE9, 0x00, 0x06, 0x01]
+        }) {
+            return TestResult::Fail("first v2 mapping write wrong");
+        }
+        let n_slot0 = writes
+            .iter()
+            .filter(|(op, cmd, _)| *op == OP_WRITE_BLOCK && *cmd == 0x80)
+            .count();
+        drop(writes);
+        // A repeat read of the same (address, length) through
+        // one transport reuses slot 0 — no second mapping write
+        // for it.
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v2 probe_version failed on repeat");
+        }
+        let mut buf = [0u8; 6];
+        if t.read_block(0xE9, &mut buf).is_err() {
+            return TestResult::Fail("v2 repeat read failed");
+        }
+        if buf != [0x00, 0x01, 0x02, 0x03, 0x01, 0x12] {
+            return TestResult::Fail("v2 repeat read returned the wrong PDT entry");
+        }
+        let writes = fake.writes.lock();
+        let n_slot0_after = writes
+            .iter()
+            .filter(|(op, cmd, _)| *op == OP_WRITE_BLOCK && *cmd == 0x80)
+            .count();
+        if n_slot0_after != n_slot0 + 1 {
+            return TestResult::Fail("first repeat read must program slot 0 once");
+        }
+        drop(writes);
+        if t.read_block(0xE9, &mut buf).is_err() {
+            return TestResult::Fail("v2 second repeat read failed");
+        }
+        let writes = fake.writes.lock();
+        let n_slot0_final = writes
+            .iter()
+            .filter(|(op, cmd, _)| *op == OP_WRITE_BLOCK && *cmd == 0x80)
+            .count();
+        if n_slot0_final != n_slot0_after {
+            return TestResult::Fail("second repeat read must reuse the mapping slot");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_v2_mapping_table_and_block_read
+    );
+
+    fn smoke_smbus_rmi_v2_write_chunks_at_31() -> TestResult {
+        let fake = FakeSmbus::new(synaptics_page0(), 0x01); // v2
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v2 probe_version failed");
+        }
+        // 40 bytes → chunks of 31 + 9 (the echoed command code
+        // is the 32nd block byte).
+        if t.write_block(0x03, &[0x55; 40]).is_err() {
+            return TestResult::Fail("v2 write failed");
+        }
+        let writes = fake.writes.lock();
+        let data_writes: Vec<&(u8, u8, Vec<u8>)> = writes
+            .iter()
+            .filter(|(op, cmd, _)| *op == OP_WRITE_BLOCK && *cmd < 8)
+            .collect();
+        if data_writes.len() != 2 {
+            return TestResult::Fail("40-byte v2 write must be two block writes");
+        }
+        if data_writes[0].2.len() != 32 || data_writes[1].2.len() != 10 {
+            return TestResult::Fail("v2 write chunks must be 32 and 10 bytes on the wire");
+        }
+        if data_writes[0].2[0] != data_writes[0].1 || data_writes[1].2[0] != data_writes[1].1 {
+            return TestResult::Fail("v2 block writes must echo the command code first");
+        }
+        drop(writes);
+        // The fake device applied both chunks to its image.
+        let mem = fake.mem.lock();
+        if mem[0x03..0x2B].iter().any(|b| *b != 0x55) {
+            return TestResult::Fail("v2 write did not land in the device image");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_v2_write_chunks_at_31
+    );
+
+    fn smoke_smbus_rmi_rejects_unknown_version_and_vendor() -> TestResult {
+        // Version byte 0x05 → version 6: unrecognised.
+        let fake = FakeSmbus::new(synaptics_page0(), 0x05);
+        if probe_at(&fake, SMBUS_RMI_DEFAULT_ADDR).is_some() {
+            return TestResult::Fail("unknown SMBus version must be declined");
+        }
+        // Non-Synaptics manufacturer (0x42) is declined even
+        // though the PDT walk succeeds.
+        let mut mem = synaptics_page0();
+        mem[0x10] = 0x42;
+        let fake = FakeSmbus::new(mem, 0x00);
+        if probe_at(&fake, SMBUS_RMI_DEFAULT_ADDR).is_some() {
+            return TestResult::Fail("non-Synaptics device must be declined");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_rejects_unknown_version_and_vendor
+    );
+
+    fn smoke_smbus_rmi_f12_data_decode() -> TestResult {
+        let fake = FakeSmbus::new(synaptics_page0(), 0x00); // v1
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        let probe = match probe_device(&mut t) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("PDT walk failed on the v1 image"),
+        };
+        let f12 = match probe.f12 {
+            Some(f) => f,
+            None => return TestResult::Fail("probe missed F$12"),
+        };
+        let mut buf = [0u8; 8];
+        if t.read_block(f12.data_base as u16, &mut buf).is_err() {
+            return TestResult::Fail("F$12 data read failed");
+        }
+        let objs = match decode_f12_data1(&buf, 1) {
+            Ok(o) => o,
+            Err(_) => return TestResult::Fail("F$12 decode failed"),
+        };
+        if objs.len() != 1 || !objs[0].present || !objs[0].is_touching_finger() {
+            return TestResult::Fail("expected one touching finger");
+        }
+        if objs[0].x != 0x1000 || objs[0].y != 0x2000 || objs[0].z != 0x80 {
+            return TestResult::Fail("F$12 object coordinates wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/smbus-rmi", smoke_smbus_rmi_f12_data_decode);
 }

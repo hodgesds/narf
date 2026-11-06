@@ -742,6 +742,94 @@ async fn pump_task_inner(
         consumer.is_some(),
     );
 
+    // Vendor touchpad transports (issue #765). A Synaptics RMI4
+    // or Elan device in vendor format presents no PTP collection,
+    // so the generic branches below would never fire for it —
+    // without this step the pad binds as a silent generic device.
+    // Detection keys off the ACPI _HID prefix and the HID
+    // descriptor VID/PID; a failed vendor probe falls back to
+    // the generic routing instead of dropping the device.
+    let mut rmi_session: Option<crate::hid_rmi::HidRmiSession<'_>> = None;
+    let mut rmi_probe: Option<crate::rmi4_core::Rmi4DeviceProbe> = None;
+    let mut rmi_node: Option<Arc<narf_input::evdev::DeviceNode>> = None;
+    let mut rmi_state = crate::rmi4_core::Rmi4PumpState::new();
+    let mut elan_params: Option<crate::hid_elan::ElanDeviceParams> = None;
+    let mut elan_node: Option<Arc<narf_input::evdev::DeviceNode>> = None;
+    let mut elan_state = crate::rmi4_core::Rmi4PumpState::new();
+    if let Some(quirks) = crate::hid_rmi::classify_device(
+        &identity.acpi_hid,
+        hid_desc.w_vendor_id,
+        hid_desc.w_product_id,
+    ) {
+        let mut session = crate::hid_rmi::HidRmiSession::new(
+            &driver,
+            hid_desc.w_max_output_length as usize,
+            quirks,
+        );
+        match session.probe().await {
+            Ok(probe) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  i2c-hid-pump: {}: RMI4-over-HID bound (manufacturer={}, f11={}, f12={}, f30={})",
+                    path,
+                    probe.product.manufacturer_id,
+                    probe.f11.is_some(),
+                    probe.f12.is_some(),
+                    probe.f30.is_some(),
+                );
+                let caps = crate::i2c_hid_touch::build_rmi_caps(
+                    &probe,
+                    &identity.caps("Touchpad", &hid_desc),
+                );
+                let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
+                rmi_node = Some(node);
+                rmi_probe = Some(probe);
+                rmi_session = Some(session);
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  i2c-hid-pump: {}: RMI4 probe failed ({:?}); falling back to generic HID",
+                    path,
+                    e
+                );
+            }
+        }
+    } else if crate::hid_elan::classify_device(
+        &identity.acpi_hid,
+        hid_desc.w_vendor_id,
+        hid_desc.w_product_id,
+    )
+    .is_some()
+    {
+        match elan_probe(&driver).await {
+            Ok(params) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  i2c-hid-pump: {}: Elan vendor-format bound (max_x={}, max_y={})",
+                    path,
+                    params.max_x,
+                    params.max_y,
+                );
+                let caps = crate::i2c_hid_touch::build_elan_caps(
+                    &params,
+                    &identity.caps("Touchpad", &hid_desc),
+                );
+                let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
+                elan_node = Some(node);
+                elan_params = Some(params);
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  i2c-hid-pump: {}: Elan probe failed ({:?}); falling back to generic HID",
+                    path,
+                    e
+                );
+            }
+        }
+    }
+
     // Register an evdev device node for the keyboard (and, if present,
     // the consumer row) so EV_KEY events reach `/dev/input/event*`
     // consumers — the same path the i8042 PS/2 driver uses. Every
@@ -972,6 +1060,48 @@ async fn pump_task_inner(
                 }
             }
         }
+        // Vendor transports: their report IDs never collide with
+        // PTP / touchscreen / pen IDs on the same device, and a
+        // vendor-format device must not fall through to the
+        // generic PTP decoder (its bytes are not PTP reports).
+        // A report the vendor path does not recognise falls
+        // through to the generic branches below (combo devices).
+        if let (Some(session), Some(probe), Some(node)) = (&mut rmi_session, &rmi_probe, &rmi_node)
+        {
+            if payload.first() == Some(&crate::hid_rmi::RMI_ATTN_REPORT_ID) {
+                if let Some(attn) = crate::hid_rmi::AttnReport::decode(payload) {
+                    pump_rmi_attn(session, probe, &attn, &mut rmi_state, node).await;
+                }
+                continue;
+            }
+        }
+        if let (Some(params), Some(node)) = (&elan_params, &elan_node) {
+            if payload.first() == Some(&crate::hid_elan::ELAN_MT_I2C) {
+                if let Some(report) = crate::hid_elan::ElanReport::decode_i2c(payload, params.max_y)
+                {
+                    let contacts: Vec<crate::rmi4_core::Rmi4Contact> = report
+                        .fingers
+                        .iter()
+                        .map(|f| crate::rmi4_core::Rmi4Contact {
+                            present: f.present,
+                            x: f.x as i32,
+                            y: f.y as i32,
+                            pressure: f.pressure as i32,
+                        })
+                        .collect();
+                    elan_state.pump_contacts(
+                        Some(node.as_ref()),
+                        &contacts,
+                        Some(report.btn_left),
+                        0,
+                        params.max_x as i32,
+                        0,
+                        params.max_y as i32,
+                    );
+                }
+                continue;
+            }
+        }
         if let Some(profile) = &ptp {
             if payload.first() == Some(&profile.input_report_id) {
                 if let Ok(decoded) = narf_hid::ptp::decode_input(profile, payload) {
@@ -1150,6 +1280,189 @@ pub enum PtpModeSetResult {
     /// SET_FEATURE write hit a bus error. The device probably stays
     /// in mouse-emulation mode; caller may retry.
     BusFailed(I2cHidError),
+}
+
+// ── Vendor-transport probe + pump helpers (issue #765) ─────────────
+
+/// Elan probe over the async I2C-HID driver: switch the device
+/// into absolute multi-touch mode, then run the SET+GET parameter
+/// cycle for max-X / max-Y / resolution. Mirrors
+/// `hid_elan::read_device_params` / `enable_absolute_mode`, which
+/// are written against the sync `ElanHidIo` trait the async
+/// driver cannot implement. A failure here means the device does
+/// not answer the vendor protocol; the caller falls back to
+/// generic HID routing.
+pub(crate) async fn elan_probe(
+    driver: &I2cHidDriver,
+) -> Result<crate::hid_elan::ElanDeviceParams, I2cHidError> {
+    use crate::hid_elan::{
+        convert_resolution, encode_absolute_mode_feature, encode_param_query, param,
+        ElanDeviceParams, ELAN_FEATURE_REPORT, ELAN_FEATURE_SIZE,
+    };
+    let abs_body = encode_absolute_mode_feature();
+    driver
+        .set_feature_report(ELAN_FEATURE_REPORT, &abs_body[1..])
+        .await?;
+    let max_x = elan_read_one_param(driver, param::MAX_X).await?;
+    let max_y = elan_read_one_param(driver, param::MAX_Y).await?;
+    let set = encode_param_query(param::RES);
+    driver
+        .set_feature_report(ELAN_FEATURE_REPORT, &set[1..])
+        .await?;
+    let resp = driver.get_feature_report(ELAN_FEATURE_REPORT).await?;
+    if resp.len() < ELAN_FEATURE_SIZE {
+        return Err(I2cHidError::ShortReport);
+    }
+    let res_x = convert_resolution(resp[3]);
+    let res_y = convert_resolution(resp[4]);
+    Ok(ElanDeviceParams {
+        max_x,
+        max_y,
+        res_x_dots_per_mm: res_x,
+        res_y_dots_per_mm: res_y,
+    })
+}
+
+/// One SET+GET parameter cycle (Linux `elan_get_device_param()`,
+/// `hid-elan.c:79-107`). The GET response is the 5-byte feature
+/// report with the value LE at bytes [4:3].
+async fn elan_read_one_param(driver: &I2cHidDriver, param_code: u8) -> Result<u16, I2cHidError> {
+    use crate::hid_elan::{decode_param_response_le16, encode_param_query, ELAN_FEATURE_REPORT};
+    let set = encode_param_query(param_code);
+    driver
+        .set_feature_report(ELAN_FEATURE_REPORT, &set[1..])
+        .await?;
+    let resp = driver.get_feature_report(ELAN_FEATURE_REPORT).await?;
+    decode_param_response_le16(&resp).ok_or(I2cHidError::ShortReport)
+}
+
+/// Route one RMI4 ATTN report through the F$11 / F$12 decoders
+/// and the shared contact pump.
+///
+/// Packing contract: an ATTN report whose interrupt mask has
+/// exactly one bit set — the 2D sensor's — carries only that
+/// function's packed data, decoded in place from `attn.data`.
+/// When several functions fired at once (touch + button, or a
+/// status change alongside the touch), the packed layout depends
+/// on PDT order, so the 2D data is read back from its data
+/// register instead — correct regardless of packing. Buttons
+/// always come from an F$30 register read when the F$30 source
+/// bit is set, never from the packed tail.
+pub(crate) async fn pump_rmi_attn(
+    session: &mut crate::hid_rmi::HidRmiSession<'_>,
+    probe: &crate::rmi4_core::Rmi4DeviceProbe,
+    attn: &crate::hid_rmi::AttnReport<'_>,
+    state: &mut crate::rmi4_core::Rmi4PumpState,
+    node: &narf_input::evdev::DeviceNode,
+) {
+    use crate::rmi4_core::{
+        decode_f12_data1, Rmi4Contact, F11_2D_TOUCHPAD, F12_2D_TOUCHPAD_NEXT, F12_OBJECT_SIZE,
+    };
+    use narf_input::rmi4::TouchpadReport;
+
+    let sources = attn.interrupt_sources;
+    let f12_mask = probe.source_mask_for(F12_2D_TOUCHPAD_NEXT);
+    let f11_mask = probe.source_mask_for(F11_2D_TOUCHPAD);
+    let btn_left = read_rmi_buttons(session, probe, sources).await;
+
+    // F$12 (modern 2D sensor) takes precedence — a device never
+    // exposes both F$11 and F$12 as its touch sensor.
+    if f12_mask != 0 && sources & f12_mask != 0 {
+        if let Some(f12) = &probe.f12 {
+            let single_source = sources == f12_mask;
+            let nobj = attn.data.len() / F12_OBJECT_SIZE;
+            let decoded = if single_source && nobj > 0 {
+                decode_f12_data1(attn.data, nobj).ok()
+            } else {
+                // Multi-source ATTN: read Data 1 back from the
+                // register (5 objects; the true object count
+                // comes from the F$12 query at probe time —
+                // remainder).
+                let mut buf = alloc::vec![0u8; 5 * F12_OBJECT_SIZE];
+                match session.read_block(f12.data_base as u16, &mut buf).await {
+                    Ok(()) => decode_f12_data1(&buf, 5).ok(),
+                    Err(_) => None,
+                }
+            };
+            if let Some(objs) = decoded {
+                let contacts: Vec<Rmi4Contact> = objs
+                    .iter()
+                    .map(|o| Rmi4Contact {
+                        present: o.present && o.is_touching_finger(),
+                        x: o.x as i32,
+                        y: o.y as i32,
+                        pressure: o.z as i32,
+                    })
+                    .collect();
+                state.pump_contacts(Some(node), &contacts, btn_left, 0, 0xFFFF, 0, 0xFFFF);
+            }
+        }
+        return;
+    }
+    if f11_mask != 0 && sources & f11_mask != 0 {
+        if let Some(f11) = &probe.f11 {
+            let single_source = sources == f11_mask;
+            // F$11 frame: 1 finger-state byte + 5 bytes per finger.
+            let max_fingers = 5usize;
+            let decoded = if single_source {
+                TouchpadReport::parse(attn.data, max_fingers).ok()
+            } else {
+                let mut buf = alloc::vec![0u8; 1 + max_fingers * 5];
+                match session.read_block(f11.data_base as u16, &mut buf).await {
+                    Ok(()) => TouchpadReport::parse(&buf, max_fingers).ok(),
+                    Err(_) => None,
+                }
+            };
+            if let Some(rep) = decoded {
+                let contacts: Vec<Rmi4Contact> = rep
+                    .fingers
+                    .iter()
+                    .map(|f| Rmi4Contact {
+                        present: f.present,
+                        x: f.x as i32,
+                        y: f.y as i32,
+                        pressure: 0,
+                    })
+                    .collect();
+                state.pump_contacts(Some(node), &contacts, btn_left, 0, 0x0FFF, 0, 0x0FFF);
+            }
+        }
+    }
+}
+
+/// Read the F$30 button bitmap when the F$30 source bit fired in
+/// this ATTN. Returns `Some(BTN_LEFT)` on a successful read and
+/// `None` when the button state is unknown this frame (no F$30
+/// function, no F$30 source, or the register read failed) — the
+/// pump then holds the previous button state instead of
+/// synthesising a release.
+async fn read_rmi_buttons(
+    session: &mut crate::hid_rmi::HidRmiSession<'_>,
+    probe: &crate::rmi4_core::Rmi4DeviceProbe,
+    sources: u8,
+) -> Option<bool> {
+    use crate::hid_rmi::clickpad_btn_left;
+    use crate::rmi4_core::{decode_f30_buttons, F30_GPIO_LED};
+    let f30 = probe.f30.as_ref()?;
+    if sources & probe.source_mask_for(F30_GPIO_LED) == 0 {
+        return None;
+    }
+    // F$30 data registers: one bit per GPIO, active-low. Read
+    // enough bytes for the probe-time GPIO/LED line count
+    // (capped at 32 lines / 4 bytes).
+    let nbytes = (probe.f30_gpio_count.min(32) as usize).div_ceil(8).max(1);
+    let mut buf = alloc::vec![0u8; nbytes];
+    if session
+        .read_block(f30.data_base as u16, &mut buf)
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    match decode_f30_buttons(&buf, probe.f30_gpio_count) {
+        Ok(bitmap) => Some(clickpad_btn_left(bitmap)),
+        Err(_) => None,
+    }
 }
 
 /// Send the Microsoft Precision Touchpad SET_FEATURE(Device Mode =

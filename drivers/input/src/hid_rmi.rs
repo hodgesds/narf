@@ -46,7 +46,12 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::rmi4_core::{Rmi4Transport, TransportError};
+use crate::i2c_hid::{I2cHidDriver, I2cHidError};
+use crate::rmi4_core::{
+    build_interrupt_map, find_function, F01ProductInfo, F30Query, PdtEntry, Rmi4DeviceProbe,
+    Rmi4Transport, TransportError, F01_DEVICE_CONTROL, F11_2D_TOUCHPAD, F12_2D_TOUCHPAD_NEXT,
+    F30_GPIO_LED, PDT_ENTRY_SIZE, PDT_FIRST_SLOT_OFFSET, PDT_LAST_SLOT_OFFSET,
+};
 
 // ── Device ID table ────────────────────────────────────────────────
 //
@@ -142,6 +147,26 @@ pub fn match_device(vendor: u16, product: u16) -> Option<&'static DeviceMatch> {
     RMI_DEVICE_TABLE
         .iter()
         .find(|m| m.vendor == vendor && m.product == product)
+}
+
+/// Classify a HID device as an RMI4 touchpad for the bind layers.
+///
+/// A table hit returns that row's quirks. Failing that, a
+/// Synaptics VID (`0x06CB`) or an ACPI `_HID` with the `SYNA`
+/// vendor prefix also classifies as RMI4 with no quirks — modern
+/// Synaptics OEM touchpads (ThinkPad, Yoga, Surface, MSI laptops)
+/// bind through the HID-group route on the wire, not specific USB
+/// VIDs, and their ACPI nodes carry `SYNAxxxx` `_HID`s. Returns
+/// `None` for anything else, so a non-matching device is rejected
+/// by the bind layer instead of being claimed as RMI4.
+pub fn classify_device(acpi_hid: &str, vendor: u16, product: u16) -> Option<DeviceQuirks> {
+    if let Some(m) = match_device(vendor, product) {
+        return Some(m.quirks);
+    }
+    if vendor == USB_VENDOR_ID_SYNAPTICS || acpi_hid.starts_with("SYNA") {
+        return Some(DeviceQuirks::empty());
+    }
+    None
 }
 
 // ── HID Report IDs ─────────────────────────────────────────────────
@@ -442,6 +467,228 @@ pub fn is_clickpad(has_phys_buttons_quirk: bool, mech_mouse_btns: u8) -> bool {
 /// state directly.
 pub fn clickpad_btn_left(f30_bitmap: u32) -> bool {
     (f30_bitmap & 1) != 0
+}
+
+// ── Async RMI4-over-HID session (I2C-HID bind path) ────────────────
+//
+// The synchronous [`HidRmiTransport`] covers transports whose
+// `HidIo` is sync (a future USB-HID backend). I2C-HID is async,
+// so this session re-drives the same pure encoders
+// (`encode_set_rmi_mode`, `encode_set_page`, `encode_read_addr`,
+// `encode_write_block`) against the async [`I2cHidDriver`]
+// instead of duplicating the wire format. The bind pump owns the
+// session: it probes once (mode-set + PDT walk + F$01 query),
+// then routes ATTN reports through the F$11 / F$12 decoders.
+//
+// Read-drain note: while waiting for a `RMI_READ_DATA_REPORT`
+// the session polls the input register; ATTN reports that arrive
+// interleaved are skipped — and therefore dropped — rather than
+// buffered. That loses at most one touch frame on a concurrent
+// button transition (the next ATTN carries current state); the
+// probe path never races the pump loop, so no frame is lost
+// there.
+
+/// Map an [`I2cHidError`] onto the transport error the RMI4 core
+/// reports. Bus timeouts stay timeouts; short / undersized
+/// reports stay `Short`; everything else is a protocol error,
+/// and an uninitialised driver is `NotReady`.
+fn map_hid_error(e: I2cHidError) -> TransportError {
+    use narf_drivers_i2c::I2cError;
+    match e {
+        I2cHidError::Bus(I2cError::Timeout) => TransportError::Timeout,
+        I2cHidError::Bus(_) => TransportError::Protocol,
+        I2cHidError::ShortReport | I2cHidError::BufferTooSmall => TransportError::Short,
+        I2cHidError::NotInitialised => TransportError::NotReady,
+        I2cHidError::BadDescriptor | I2cHidError::BadPowerState => TransportError::Protocol,
+    }
+}
+
+/// Async RMI4-over-HID session bound to one [`I2cHidDriver`].
+/// Holds only a shared reference — the bind pump keeps calling
+/// `driver.read_input_report` directly for its report loop, which
+/// is fine because every driver method takes `&self`.
+pub struct HidRmiSession<'d> {
+    driver: &'d I2cHidDriver,
+    output_report_size: usize,
+    /// Last page we wrote — `Some(page)` only after `set_page`
+    /// succeeded. Mirrors the [`HidRmiTransport`] cache.
+    current_page: Option<u8>,
+    quirks: DeviceQuirks,
+}
+
+impl<'d> HidRmiSession<'d> {
+    /// Construct a session. `output_report_size` comes from the
+    /// HID descriptor's `wMaxOutputLength`; a zero value falls
+    /// back to 19 (one report-id byte + 3-byte header + payload,
+    /// the typical Synaptics size).
+    pub fn new(driver: &'d I2cHidDriver, output_report_size: usize, quirks: DeviceQuirks) -> Self {
+        Self {
+            driver,
+            output_report_size: if output_report_size == 0 {
+                19
+            } else {
+                output_report_size
+            },
+            current_page: None,
+            quirks,
+        }
+    }
+
+    pub fn quirks(&self) -> DeviceQuirks {
+        self.quirks
+    }
+
+    /// Switch into RMI mode by writing the Set_RMI_Mode Feature
+    /// report (Linux `rmi_set_mode()`, `hid-rmi.c:143-163`).
+    pub async fn set_mode(&mut self, mode: u8) -> Result<(), TransportError> {
+        self.driver
+            .set_feature_report(RMI_SET_RMI_MODE_REPORT_ID, &[mode])
+            .await
+            .map_err(map_hid_error)
+    }
+
+    /// Switch RMI page; cached so repeated reads in the same page
+    /// don't re-issue (Linux `rmi_set_page()`, `hid-rmi.c:121`).
+    pub async fn set_page(&mut self, page: u8) -> Result<(), TransportError> {
+        if self.current_page == Some(page) {
+            return Ok(());
+        }
+        let buf = encode_set_page(page, self.output_report_size);
+        self.driver
+            .set_output_report(RMI_WRITE_REPORT_ID, &buf[1..])
+            .await
+            .map_err(map_hid_error)?;
+        self.current_page = Some(page);
+        Ok(())
+    }
+
+    /// Read `dst.len()` bytes from RMI4 register `addr`.
+    /// Mirrors `rmi_hid_read_block()` (`hid-rmi.c:188-257`): the
+    /// output report carries the address+length request; the
+    /// device echoes data back via `RMI_READ_DATA_REPORT` input
+    /// reports, chunked at the input-report size (body starts at
+    /// byte 2 of each report: byte 0 = report id, byte 1 = chunk
+    /// length).
+    pub async fn read_block(&mut self, addr: u16, dst: &mut [u8]) -> Result<(), TransportError> {
+        let page = rmi_page(addr);
+        self.set_page(page).await?;
+        let req = encode_read_addr(addr, dst.len() as u16, self.output_report_size);
+        self.driver
+            .set_output_report(RMI_READ_ADDR_REPORT_ID, &req[1..])
+            .await
+            .map_err(map_hid_error)?;
+        let max_input = self.driver.max_input_length().max(2);
+        let mut buf = alloc::vec![0u8; max_input];
+        let mut written = 0usize;
+        for _retry in 0..16 {
+            let n = self
+                .driver
+                .read_input_report(&mut buf)
+                .await
+                .map_err(map_hid_error)?;
+            if n == 0 {
+                narf_scheduler::yield_now().await;
+                continue;
+            }
+            if n < 2 || buf[0] != RMI_READ_DATA_REPORT_ID {
+                // Not our read data — likely an ATTN report that
+                // arrived interleaved (see the drain note above).
+                narf_scheduler::yield_now().await;
+                continue;
+            }
+            let chunk_len = buf[1] as usize;
+            let body_end = (2 + chunk_len).min(n);
+            let body = &buf[2..body_end];
+            let want = dst.len() - written;
+            let take = body.len().min(want);
+            dst[written..written + take].copy_from_slice(&body[..take]);
+            written += take;
+            if written >= dst.len() {
+                return Ok(());
+            }
+        }
+        Err(TransportError::Timeout)
+    }
+
+    /// Write `src` bytes to RMI4 register `addr`. Mirrors
+    /// `rmi_hid_write_block()` (`hid-rmi.c:259`).
+    pub async fn write_block(&mut self, addr: u16, src: &[u8]) -> Result<(), TransportError> {
+        let page = rmi_page(addr);
+        self.set_page(page).await?;
+        let buf = encode_write_block(addr, src, self.output_report_size);
+        self.driver
+            .set_output_report(RMI_WRITE_REPORT_ID, &buf[1..])
+            .await
+            .map_err(map_hid_error)
+    }
+
+    /// Probe the device: set RMI mode with ATTN reports, walk the
+    /// page-0 PDT, and read the F$01 product-info query block.
+    /// Returns the shared [`Rmi4DeviceProbe`] the bind pump and
+    /// the SMBus transport both consume. Fails when the device
+    /// does not answer in RMI mode or has no F$01 function — the
+    /// caller then falls back to generic HID routing.
+    pub async fn probe(&mut self) -> Result<Rmi4DeviceProbe, TransportError> {
+        self.set_mode(RMI_MODE_ATTN_REPORTS).await?;
+        // PDT walk, page 0 — same high-to-low scan and
+        // termination rules as `walk_pdt_page` in rmi4_core.
+        let mut table = Vec::new();
+        let mut offset = PDT_LAST_SLOT_OFFSET;
+        let mut buf = [0u8; PDT_ENTRY_SIZE];
+        while offset >= PDT_FIRST_SLOT_OFFSET {
+            self.read_block(offset, &mut buf).await?;
+            if buf[5] == 0x00 {
+                break;
+            }
+            match PdtEntry::decode(&buf) {
+                Ok(Some(entry)) => table.push(entry),
+                Ok(None) => {} // 0xFF empty slot — skip and continue.
+                Err(_) => break,
+            }
+            if offset < PDT_FIRST_SLOT_OFFSET + PDT_ENTRY_SIZE as u16 {
+                break;
+            }
+            offset -= PDT_ENTRY_SIZE as u16;
+        }
+        let f01 = find_function(&table, F01_DEVICE_CONTROL)
+            .copied()
+            .ok_or(TransportError::Protocol)?;
+        let mut query = [0u8; 11];
+        self.read_block(f01.query_base as u16, &mut query).await?;
+        let product = F01ProductInfo::decode(&query).map_err(|_| TransportError::Short)?;
+        let f11 = find_function(&table, F11_2D_TOUCHPAD).copied();
+        let f12 = find_function(&table, F12_2D_TOUCHPAD_NEXT).copied();
+        let f30 = find_function(&table, F30_GPIO_LED).copied();
+        if f11.is_none() && f12.is_none() {
+            return Err(TransportError::Protocol);
+        }
+        // F$30 GPIO/LED line count from its query registers;
+        // defaults to 8 (one button byte) when the function
+        // exists but the query read fails, 0 with no F$30.
+        let mut f30_gpio_count = if f30.is_some() { 8 } else { 0 };
+        if let Some(f30e) = &f30 {
+            let mut qbuf = [0u8; 2];
+            if self
+                .read_block(f30e.query_base as u16, &mut qbuf)
+                .await
+                .is_ok()
+            {
+                if let Ok(q) = F30Query::decode(&qbuf) {
+                    f30_gpio_count = q.gpio_led_count;
+                }
+            }
+        }
+        let interrupt_map = build_interrupt_map(&table);
+        Ok(Rmi4DeviceProbe {
+            table,
+            product,
+            f11,
+            f12,
+            f30,
+            f30_gpio_count,
+            interrupt_map,
+        })
+    }
 }
 
 // ── Initcall registration ──────────────────────────────────────────
