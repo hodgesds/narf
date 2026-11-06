@@ -7632,8 +7632,8 @@ fn uac2_dac_config() -> alloc::vec::Vec<u8> {
     add(&[9, 0x24, 0x01, 0x00, 0x02, 0x09, 55, 0, 0]); // HEADER v2
     add(&[8, 0x24, 0x0A, 9, 2, 0x03, 1, 0]); // CLOCK_SOURCE 9, programmable
     add(&[
-        18, 0x24, 0x02, 1, 0x01, 0x01, 0, 2, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ]); // IT 1
+        17, 0x24, 0x02, 1, 0x01, 0x01, 0, 9, 2, 0x03, 0, 0, 0, 0, 0, 0, 0,
+    ]); // IT 1 (Table 4-9: bCSourceID 9, stereo, FL/FR)
     add(&[
         18, 0x24, 0x06, 2, 1, 0x0F, 0, 0, 0, 0x0C, 0, 0, 0, 0x0C, 0, 0, 0, 0,
     ]); // FU 2
@@ -7704,6 +7704,13 @@ fn smoke_uac_topology_walk_uac2_clock() -> TestResult {
     }
     if topo.terminals.len() != 2 || topo.feature_units.len() != 1 {
         return TestResult::Fail("UAC2 terminal / FU counts");
+    }
+    let it = match topo.terminals.iter().find(|t| t.id == 1) {
+        Some(t) => t,
+        None => return TestResult::Fail("UAC2 IT 1 present"),
+    };
+    if it.clock_source_id != 9 || it.nr_channels != 2 {
+        return TestResult::Fail("UAC2 IT 1 bCSourceID 9, stereo");
     }
     if topo.clocks.len() != 1 {
         return TestResult::Fail("UAC2 clock count");
@@ -7848,9 +7855,9 @@ kernel_test_in!("drivers/usb/uac", smoke_uac_bind_plan_uac2_clock);
 // Modelled device: a UAC2 playback DAC whose stream clock runs
 // through a clock selector and whose Feature Unit sits behind a
 // Mixer Unit. The descriptor bytes are spec-shaped (Audio20
-// Tables 4-7 / 4-11, §5.2.5.2.1, Table A-18); the Input Terminal
-// bytes follow the in-tree #777 layout (see the `InputTerminal2`
-// note — the bCSourceID deviation is a separate lane).
+// Tables 4-7 / 4-9 / 4-11, §5.2.5.2.1, Table A-18); IT 1's
+// bCSourceID names the clock selector (10), whose pin 2 selects
+// source 9 — the source associated with IT 1.
 //
 //   CLOCK_SOURCE 9 (programmable, assoc IT 1) + CLOCK_SOURCE 11
 //   (fixed) → CLOCK_SELECTOR 10, pins [11, 9], programmable →
@@ -7875,8 +7882,8 @@ fn uac2_selector_clock_mixer_config_with(pins: &[u8], controls: u8) -> alloc::ve
     sel.push(0);
     add(&sel);
     add(&[
-        18, 0x24, 0x02, 1, 0x01, 0x01, 0, 2, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ]); // IT 1
+        17, 0x24, 0x02, 1, 0x01, 0x01, 0, 10, 2, 0x03, 0, 0, 0, 0, 0, 0, 0,
+    ]); // IT 1 (Table 4-9: bCSourceID 10 = clock selector, stereo)
         // MIXER_UNIT 4 (v2, Table 4-11): bLength 13+p+N = 15, p = 1,
         // m = 2, bitmap 0xF0 = all 4 (2 in x 2 out) gains programmable.
     add(&[15, 0x24, 0x04, 4, 1, 1, 2, 0x03, 0, 0, 0, 0, 0xF0, 0, 0]);
@@ -7955,6 +7962,49 @@ fn smoke_uac_mixer_unit_decodes_gain_matrix() -> TestResult {
 }
 kernel_test_in!("drivers/usb/uac", smoke_uac_mixer_unit_decodes_gain_matrix);
 
+fn smoke_uac2_input_terminal_table_4_9() -> TestResult {
+    use crate::uac::InputTerminal2;
+    // Spec-shaped 17-byte IT (Table 4-9): terminal 1, USB
+    // streaming, assoc 0, bCSourceID 9, stereo, FL/FR. The
+    // clock-source ID (9) differs from the channel count (2):
+    // the old parse read byte 7 as the channel count and would
+    // report 9 channels here.
+    let dac = [
+        17, 0x24, 0x02, 1, 0x01, 0x01, 0, 9, 2, 0x03, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let t = match InputTerminal2::parse(&dac) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("UAC2 IT parse"),
+    };
+    if t.terminal_id != 1 || t.terminal_type != 0x0101 || t.assoc_terminal != 0 {
+        return TestResult::Fail("UAC2 IT id / type / assoc");
+    }
+    if t.clock_source_id != 9 || t.nr_channels != 2 {
+        return TestResult::Fail("UAC2 IT bCSourceID 9, stereo (not 9 channels)");
+    }
+    if t.channel_config != 0x03 || t.controls != 0 {
+        return TestResult::Fail("UAC2 IT channel config / controls");
+    }
+    // Mono mic on clock 7: the channel count is 1, not 7.
+    let mic = [
+        17, 0x24, 0x02, 4, 0x01, 0x02, 0, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let m = match InputTerminal2::parse(&mic) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("UAC2 mic IT parse"),
+    };
+    if m.clock_source_id != 7 || m.nr_channels != 1 {
+        return TestResult::Fail("UAC2 mic IT bCSourceID 7, mono (not 7 channels)");
+    }
+    // 16 bytes — missing iTerminal — must fail: Table 4-9 is a
+    // fixed 17-byte layout.
+    if InputTerminal2::parse(&dac[..16]).is_ok() {
+        return TestResult::Fail("truncated UAC2 IT must fail");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac2_input_terminal_table_4_9);
+
 fn smoke_uac_topology_walk_uac2_mixer_clock_selector() -> TestResult {
     use crate::uac::UacTopology;
     let cfg = uac2_selector_clock_mixer_config();
@@ -7980,6 +8030,13 @@ fn smoke_uac_topology_walk_uac2_mixer_clock_selector() -> TestResult {
     }
     if topo.clocks.len() != 3 {
         return TestResult::Fail("UAC2 clock count (2 sources + selector)");
+    }
+    let it = match topo.terminals.iter().find(|t| t.id == 1) {
+        Some(t) => t,
+        None => return TestResult::Fail("UAC2 IT 1 present"),
+    };
+    if it.clock_source_id != 10 || it.nr_channels != 2 {
+        return TestResult::Fail("UAC2 IT 1 bCSourceID 10 (selector), stereo");
     }
     let clock = match topo.clock_for_terminal(1) {
         Some(c) => c,

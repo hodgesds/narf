@@ -1123,8 +1123,6 @@ the USB download itself remains a target-silicon gate.
 - UAC3 (protocol byte 0x30; descriptor layouts differ again).
 - Runtime clock-selector switching after bind (bind now selects the
   pin for the resolved source); mixer gain (MCN) programming at
-  bind/prepare; and the `InputTerminal2` bCSourceID parse deviation
-  (#1520 — the parser reads the clock-source ID as the channel
-  count; clock resolution uses the source's `assoc_terminal` instead).
+  bind/prepare.
 - Non-QCA Bluetooth vendor firmware protocols (Intel, Realtek, MediaTek,
   Broadcom).
