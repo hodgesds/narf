@@ -41,6 +41,17 @@
 //! `write_block(lba, data)` API on top of CMD17 / CMD24 with PIO
 //! transfer (no SDMA / ADMA scatter-gather yet — single 512-byte
 //! block per call through the Buffer Data Port).
+//!
+//! Card detect (#836): an empty slot at probe is not a failure —
+//! the controller installs with no card known, and a Stage::Late
+//! poll task (`spawn_card_poll_task`, 500 ms cadence, mirroring
+//! RTSX) reconciles the Present State card level with the known
+//! card: identify-on-insert, teardown-on-remove. The Card
+//! Insertion / Card Removal interrupt status bits (§2.2.18) are
+//! enabled and acknowledged, but the Present State level is
+//! authoritative — `cmd()`'s blanket NIS clear can wipe an edge
+//! before the poller sees it. This driver registers no IRQ
+//! handler, so polling is the detect mechanism, as in RTSX.
 
 use core::sync::atomic::AtomicBool;
 
@@ -86,9 +97,7 @@ const REG_CAPABILITIES: u64 = 0x40;
 
 // Software-reset bits (§2.2.16): write-1 self-clearing.
 const SRST_ALL: u8 = 1 << 0;
-#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const SRST_CMD: u8 = 1 << 1;
-#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const SRST_DAT: u8 = 1 << 2;
 
 // Clock control bits (§2.2.14).
@@ -108,12 +117,23 @@ const PSTATE_BUFFER_READ_EN: u32 = 1 << 11;
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PSTATE_BUFFER_WRITE_EN: u32 = 1 << 10;
 const PSTATE_CARD_INSERTED: u32 = 1 << 16;
+// Card State Stable (§2.2.9): set when the card-detect pin level
+// has settled — the controller's own debounce. A card is only
+// identified once inserted AND stable.
+const PSTATE_CARD_STATE_STABLE: u32 = 1 << 17;
 
 // Normal interrupt status bits (§2.2.18).
 const NIS_CMD_COMPLETE: u16 = 1 << 0;
 const NIS_TRANSFER_COMPLETE: u16 = 1 << 1;
 const NIS_BUFFER_READ_READY: u16 = 1 << 5;
 const NIS_BUFFER_WRITE_READY: u16 = 1 << 4;
+// Card Insertion / Card Removal (§2.2.18) — the present-change
+// edges. Bit values cross-checked against the in-tree SDIO
+// driver's copy of the same register (`INT_CARD_INSERT` /
+// `INT_CARD_REMOVE` in `drivers/sdio/src/sdhci/regs.rs`, same
+// SDHCI lineage).
+const NIS_CARD_INSERTION: u16 = 1 << 6;
+const NIS_CARD_REMOVAL: u16 = 1 << 7;
 const NIS_ERROR: u16 = 1 << 15;
 
 // Command response types (§2.2.6).
@@ -158,7 +178,8 @@ pub enum SdhciError {
     BarMapFailed,
     /// Software reset never cleared within the spin budget.
     ResetTimeout,
-    /// Card-presence bit was 0 after power-up.
+    /// No card is known — the slot is empty, the card was removed,
+    /// or identify has not run yet.
     NoCard,
     /// CMD line stayed busy past CMD_INHIBIT.
     CmdInhibitTimeout,
@@ -186,6 +207,17 @@ pub struct SdCard {
     pub ccs: bool,
     /// Card capacity in 512-byte blocks.
     pub capacity_blocks: u64,
+}
+
+/// What one card-detect service step decided (#836).
+/// Registration / unregistration happens outside the request gate,
+/// mirroring RTSX's `SlotAction`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CardDetectAction {
+    /// A card was inserted and identified; publish it.
+    Inserted(SdCard),
+    /// A previously published card was removed; unpublish it.
+    Removed,
 }
 
 /// Register-access seam for the SDHCI register file.
@@ -266,8 +298,17 @@ impl core::fmt::Debug for Sdhci {
 
 impl Sdhci {
     /// Bring up the host controller: software reset, supply 400 kHz
-    /// init clock, set 3.3V, run the SD identification sequence.
-    /// Returns the populated `SdCard`.
+    /// init clock, set 3.3V, and — if a card is present and
+    /// identifies — run the SD identification sequence.
+    ///
+    /// An empty slot is NOT a failure (#836): the controller
+    /// installs with no card known, and the card-detect poll task
+    /// identifies a card inserted later. Likewise a card that fails
+    /// identify at bring-up leaves the slot empty (logged here) for
+    /// the poll to retry, instead of bricking the slot. Only
+    /// controller failures (BAR map, reset timeout) fail bring-up.
+    /// Returns the controller; the identified card, if any, is in
+    /// `me.card`.
     ///
     /// # Safety
     /// Caller owns BAR0 exclusively for the duration of init.
@@ -360,18 +401,35 @@ impl Sdhci {
         me.io.write16(REG_NORMAL_INT_EN, 0xFFFF);
         me.io.write16(REG_ERROR_INT_EN, 0xFFFF);
 
-        // 7. Card-present check.
+        // 7. Card-present check. An empty slot is not a failure:
+        //    install the controller with no card known — the
+        //    card-detect poll identifies a later insertion (#836).
+        //    Power and the init clock stay up across the empty slot
+        //    (powering the slot down is #839 PM policy, not detect).
         let pstate = me.io.read32(REG_PRESENT_STATE);
-        if pstate & PSTATE_CARD_INSERTED == 0 {
-            return Err(SdhciError::NoCard);
+        if pstate & PSTATE_CARD_INSERTED != 0 {
+            // 8. Run the SD identification sequence. A failure here
+            //    leaves the slot empty for the card-detect poll to
+            //    retry — a reseat is an insertion, and the poll owns
+            //    retries from here on.
+            //
+            // SAFETY: `me.io` is the SDHCI register window set up
+            // above and `identify_sequence` runs here at bring-up
+            // under exclusive ownership, satisfying its
+            // single-caller precondition (re-probes go through the
+            // request gate instead — see `service_card_slot`).
+            match unsafe { me.identify_sequence() } {
+                Ok(card) => *me.card.lock() = Some(card),
+                Err(e) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  sdhci: identify failed at bring-up: {:?} — slot left empty, card-detect poll will retry",
+                        e,
+                    );
+                }
+            }
         }
-
-        // 8. Run the SD identification sequence.
-        // SAFETY: `me.io` is the SDHCI register window set up above
-        // and `identify_sequence` runs exactly once here at
-        // bring-up, satisfying its single-call ownership precondition.
-        let card = unsafe { me.identify_sequence() }?;
-        *me.card.lock() = Some(card);
         Ok(me)
     }
 
@@ -465,7 +523,13 @@ impl Sdhci {
     /// Run the SD identification sequence.
     ///
     /// # Safety
-    /// MMIO ownership; called only once at bring-up.
+    /// MMIO ownership; called at bring-up (exclusive ownership)
+    /// and on card re-probe (callers hold the request gate — see
+    /// `service_card_slot`), never concurrently. The init clock
+    /// precondition holds on both paths: bring-up leaves the
+    /// controller at the ≤400 kHz init clock, and no lane raises
+    /// the operating clock yet — a future clock-raise lane (#837)
+    /// must drop back to the init clock before re-probe.
     unsafe fn identify_sequence(&self) -> Result<SdCard, SdhciError> {
         // CMD0 (GO_IDLE_STATE) — no response.
         let _ = self.cmd(0, 0, RESP_NONE, false, 0, 0, 0)?;
@@ -620,6 +684,85 @@ impl Sdhci {
         self.io.write16(REG_NORMAL_INT_STS, NIS_TRANSFER_COMPLETE);
         Ok(())
     }
+
+    // ── Card detect (#836) ───────────────────────────────────────
+
+    /// Present-state card level: inserted AND debounced (Card
+    /// State Stable, §2.2.9). The stable bit is the controller's
+    /// own debounce — only once it is set has the detect pin
+    /// settled, so a bouncing insertion cannot start an identify.
+    /// A controller that never sets the stable bit (spec quirk)
+    /// would never identify; that is a quirk to handle when real
+    /// hardware shows it, as the AMD reset quirk in `bring_up`.
+    pub fn card_inserted(&self) -> bool {
+        let pstate = self.io.read32(REG_PRESENT_STATE);
+        pstate & (PSTATE_CARD_INSERTED | PSTATE_CARD_STATE_STABLE)
+            == (PSTATE_CARD_INSERTED | PSTATE_CARD_STATE_STABLE)
+    }
+
+    /// Acknowledge any pending present-change interrupt status
+    /// (Card Insertion / Card Removal, §2.2.18, write-1-to-clear)
+    /// and return which edges were pending. The edges are a hint
+    /// only: `cmd()`'s blanket NIS clear can wipe one before the
+    /// poller sees it, so the Present State level — not the edge —
+    /// decides the transition in `service_card_slot`.
+    fn ack_card_events(&self) -> u16 {
+        let nis = self.io.read16(REG_NORMAL_INT_STS);
+        let edges = nis & (NIS_CARD_INSERTION | NIS_CARD_REMOVAL);
+        if edges != 0 {
+            self.io.write16(REG_NORMAL_INT_STS, edges);
+        }
+        edges
+    }
+
+    /// One card-detect service step: reconcile `card` with the
+    /// physical slot. On insertion (level says present + stable,
+    /// no card known) this re-runs the identification sequence and
+    /// returns `Inserted` for the caller to publish; on removal it
+    /// quiesces the command/data lines, drops the known card, and
+    /// returns `Removed` for the caller to unpublish. A failed
+    /// re-identify leaves the slot empty and publishes nothing —
+    /// the next poll retries (the RTSX `SlotState::Error`
+    /// behaviour).
+    ///
+    /// Runs under the request gate (via `with_controller`), so no
+    /// transfer is in flight while the card state changes, and the
+    /// gate is what serialises this against `read_block` /
+    /// `write_block` (which see `card == None` and fail `NoCard`
+    /// once the card is dropped).
+    fn service_card_slot(&self) -> Option<CardDetectAction> {
+        // Acknowledge any present-change edges first; the level
+        // below is authoritative.
+        let _edges = self.ack_card_events();
+        if self.card_inserted() {
+            if self.card.lock().is_some() {
+                return None;
+            }
+            // SAFETY: MMIO ownership; called on card re-probe
+            // under the request gate, never concurrently — see
+            // `identify_sequence`.
+            match unsafe { self.identify_sequence() } {
+                Ok(card) => {
+                    *self.card.lock() = Some(card);
+                    Some(CardDetectAction::Inserted(card))
+                }
+                Err(_) => None,
+            }
+        } else if self.card.lock().take().is_some() {
+            // Quiesce the lines a torn transfer may have left
+            // inhibited; best-effort — the next insertion's
+            // identify surfaces a timeout if a line stays stuck.
+            // (Linux resets CMD/DAT on the same path.)
+            self.io.write8(REG_SOFT_RESET, SRST_CMD | SRST_DAT);
+            let _ = narf_scheduler::responsive_spin_until(
+                || self.io.read8(REG_SOFT_RESET) & (SRST_CMD | SRST_DAT) == 0,
+                narf_time::Deadline::after_ms(100),
+            );
+            Some(CardDetectAction::Removed)
+        } else {
+            None
+        }
+    }
 }
 
 // ── Driver-match registration ────────────────────────────────────────
@@ -649,6 +792,12 @@ static CONTROLLER: IrqSafeSpinLock<Option<Sdhci>> = IrqSafeSpinLock::new(None);
 /// "support hot-unplug" change would silently invalidate. There is no
 /// `&mut` path into the slot at all — every `Sdhci` method takes
 /// `&self` (card state lives behind its own inner lock).
+///
+/// Card hotplug (#836) does NOT touch this slot: insertion and
+/// removal only toggle `Sdhci::card` behind its own lock, never the
+/// `CONTROLLER` cell — the controller stays installed for the life
+/// of the boot and this address-stability invariant still holds.
+/// The smoke test above pins exactly that.
 fn probed_sdhci() -> Option<&'static Sdhci> {
     let ptr: *const Sdhci = {
         let g = CONTROLLER.lock();
@@ -744,6 +893,53 @@ fn publish_card(capacity_blocks: u64, ccs: bool) {
     });
     narf_block::registry::register_block_device("sdhci0", block_dev.clone());
     let _ = narf_block::partition::scan_and_register_partitions(block_dev, "sdhci0");
+}
+
+/// Withdraw `sdhci0` and its `sdhci0p<N>` children from the block
+/// registry — the removal half of `publish_card`. Children first:
+/// they borrow the card's I/O path and the registry has no cascade
+/// (RTSX's `unregister_card` does the same snapshot-then-remove
+/// dance).
+fn unpublish_card() {
+    let children: Vec<&'static str> = narf_block::registry::block_devices()
+        .iter()
+        .filter(|e| e.parent == Some("sdhci0"))
+        .map(|e| e.name)
+        .collect();
+    for child in children {
+        narf_block::registry::unregister_block_device(child);
+    }
+    narf_block::registry::unregister_block_device("sdhci0");
+}
+
+/// Service the global controller's slot once, performing any block
+/// registry registration/unregistration the service step produced.
+/// Called from the card-poll task; a card already inserted at probe
+/// time is identified by `bring_up` instead, so this is purely the
+/// post-boot detect path.
+pub fn poll_card_slot() {
+    let action = with_controller(|ctrl| ctrl.service_card_slot()).flatten();
+    match action {
+        Some(CardDetectAction::Inserted(card)) => publish_card(card.capacity_blocks, card.ccs),
+        Some(CardDetectAction::Removed) => unpublish_card(),
+        None => {}
+    }
+}
+
+/// Spawn the card-detect poll task (Stage::Late; production wiring
+/// lives in the storage facade). This driver has no IRQ handler
+/// registered, so it polls the Present State card level on a 500 ms
+/// cadence instead — the same trade RTSX's `spawn_card_poll_task`
+/// makes (Linux learns about insertion from the Card Insertion /
+/// Card Removal interrupt status, §2.2.18, which this driver
+/// enables and acknowledges but has no handler for).
+pub fn spawn_card_poll_task() {
+    narf_scheduler::spawn_stackful(async {
+        loop {
+            poll_card_slot();
+            narf_time::sleep_cycles(narf_time::ns_to_cycles(500_000_000)).await;
+        }
+    });
 }
 
 struct SdhciBlockDevice {
