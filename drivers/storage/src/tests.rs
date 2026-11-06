@@ -1459,6 +1459,160 @@ kernel_test_in!(
     smoke_emmc_partitioning_support_offsets
 );
 
+// ── RPMB authenticated frames (JESD84-B51 §6.6.22) ───────────────
+
+fn smoke_rpmb_frame_layout() -> TestResult {
+    use crate::rpmb::RpmbFrame;
+    // JESD84-B51 Table 17, in buffer (wire) order — literal
+    // offsets, not codec constants: stuff [0..196], MAC
+    // [196..228], data [228..484], nonce [484..500], write
+    // counter [500..504], address [504..506], block count
+    // [506..508], result [508..510], type [510..512]. All
+    // multi-byte integer fields are big-endian.
+    let mut f = RpmbFrame::data_write(0x1234_5678, 0x0010, &[0xAA; 256]);
+    f.set_nonce(&[0x5A; 16]);
+    f.set_mac(&[0xC3; 32]);
+    if f.bytes[0..196].iter().any(|&b| b != 0) {
+        return TestResult::Fail("stuff bytes must be zero");
+    }
+    if f.bytes[196..228].iter().any(|&b| b != 0xC3) {
+        return TestResult::Fail("MAC must sit at bytes [196..228]");
+    }
+    if f.bytes[228..484].iter().any(|&b| b != 0xAA) {
+        return TestResult::Fail("data must sit at bytes [228..484]");
+    }
+    if f.bytes[484..500].iter().any(|&b| b != 0x5A) {
+        return TestResult::Fail("nonce must sit at bytes [484..500]");
+    }
+    if f.bytes[500..504] != [0x12, 0x34, 0x56, 0x78] {
+        return TestResult::Fail("write counter must be big-endian at [500..504]");
+    }
+    if f.bytes[504..506] != [0x00, 0x10] {
+        return TestResult::Fail("address must be big-endian at [504..506]");
+    }
+    if f.bytes[506..508] != [0x00, 0x01] {
+        return TestResult::Fail("block count must be big-endian at [506..508]");
+    }
+    if f.bytes[508..510] != [0x00, 0x00] {
+        return TestResult::Fail("result must be big-endian at [508..510]");
+    }
+    if f.bytes[510..512] != [0x00, 0x03] {
+        return TestResult::Fail("type must be big-endian at [510..512]");
+    }
+    // The MAC input is bytes [228..512] (284 bytes, §6.6.22.3).
+    if f.mac_message().len() != 284 || f.mac_message() != &f.bytes[228..512] {
+        return TestResult::Fail("MAC message must be frame bytes [228..512]");
+    }
+    // Round-trip through the accessors.
+    if f.write_counter() != 0x1234_5678
+        || f.address() != 0x0010
+        || f.block_count() != 1
+        || f.result() != 0
+        || f.req_type() != 0x0003
+        || f.nonce() != [0x5A; 16]
+        || f.mac() != [0xC3; 32]
+    {
+        return TestResult::Fail("frame accessors must round-trip the fields");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_rpmb_frame_layout);
+
+fn smoke_rpmb_mac_example_message() -> TestResult {
+    use crate::rpmb::RpmbFrame;
+    // JESD84-B51 §6.6.22.3, Table 21 worked example: write
+    // counter 0x12345678, address 0x0010, two half-sectors —
+    // the first 256 bytes of 0xAA, the second 256 bytes of
+    // 0xBB — block count 2, type 0x0003. The spec lists the
+    // SHA-256 message as frame 1's bytes [283:0] followed by
+    // frame 2's bytes [283:0]; in buffer order that is each
+    // frame's bytes [228..512]. (The spec gives no key or MAC
+    // value for the example, so this pins the message
+    // construction, not the HMAC itself — the HMAC is covered
+    // by the fixture round-trip, which verifies a real MAC
+    // both ways.)
+    let mut f1 = RpmbFrame::data_write(0x1234_5678, 0x0010, &[0xAA; 256]);
+    let mut f2 = RpmbFrame::data_write(0x1234_5678, 0x0010, &[0xBB; 256]);
+    // In every packet the block count is the total count of the
+    // half-sectors (§6.6.22.4.3), so both frames carry 2.
+    f1.set_block_count(2);
+    f2.set_block_count(2);
+    let mut want = [0u8; 568];
+    want[0..256].copy_from_slice(&[0xAA; 256]);
+    // Nonce zero, counter 0x12345678, address 0x0010, block
+    // count 0x0002, result 0x0000, type 0x0003.
+    want[256 + 16..256 + 20].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+    want[256 + 20..256 + 22].copy_from_slice(&[0x00, 0x10]);
+    want[256 + 22..256 + 24].copy_from_slice(&[0x00, 0x02]);
+    want[256 + 24..256 + 26].copy_from_slice(&[0x00, 0x00]);
+    want[256 + 26..256 + 28].copy_from_slice(&[0x00, 0x03]);
+    want[284..284 + 256].copy_from_slice(&[0xBB; 256]);
+    want[284 + 256 + 16..284 + 256 + 20].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+    want[284 + 256 + 20..284 + 256 + 22].copy_from_slice(&[0x00, 0x10]);
+    want[284 + 256 + 22..284 + 256 + 24].copy_from_slice(&[0x00, 0x02]);
+    want[284 + 256 + 24..284 + 256 + 26].copy_from_slice(&[0x00, 0x00]);
+    want[284 + 256 + 26..284 + 256 + 28].copy_from_slice(&[0x00, 0x03]);
+    let mut got = [0u8; 568];
+    got[0..284].copy_from_slice(f1.mac_message());
+    got[284..568].copy_from_slice(f2.mac_message());
+    if got != want {
+        return TestResult::Fail("MAC message must match the §6.6.22.3 Table 21 example");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_rpmb_mac_example_message);
+
+fn smoke_rpmb_result_decoding() -> TestResult {
+    use crate::rpmb::{
+        response_type_for, RpmbError, RpmbFrame, RPMB_REQ_READ, RPMB_REQ_READ_COUNTER,
+        RPMB_REQ_RESULT_READ, RPMB_REQ_WRITE, RPMB_RESP_READ, RPMB_RESP_READ_COUNTER,
+        RPMB_RESP_WRITE,
+    };
+    // Table 18: responses are the request value in the high
+    // byte; the result read has no response type of its own.
+    if response_type_for(RPMB_REQ_READ_COUNTER) != Some(RPMB_RESP_READ_COUNTER)
+        || response_type_for(RPMB_REQ_WRITE) != Some(RPMB_RESP_WRITE)
+        || response_type_for(RPMB_REQ_READ) != Some(RPMB_RESP_READ)
+        || response_type_for(RPMB_REQ_RESULT_READ).is_some()
+    {
+        return TestResult::Fail("response types must follow Table 18");
+    }
+    // Table 20: every result code maps, including the
+    // counter-expired variants (bit 7) and the key-not-
+    // programmed value; an unknown code is BadResult.
+    if RpmbError::from_result(0x0000).is_err()
+        || RpmbError::from_result(0x0080).is_err()
+        || RpmbError::from_result(0x0085) != Err(RpmbError::WriteFailure)
+        || RpmbError::from_result(0x0007) != Err(RpmbError::KeyNotProgrammed)
+        || RpmbError::from_result(0x0002) != Err(RpmbError::AuthenticationFailure)
+        || RpmbError::from_result(0x0003) != Err(RpmbError::CounterFailure)
+        || RpmbError::from_result(0x0042) != Err(RpmbError::BadResult(0x0042))
+    {
+        return TestResult::Fail("result codes must map per Table 20");
+    }
+    // The expired bit is orthogonal to the code (Table 19).
+    if !crate::rpmb::counter_expired(0x0080) || crate::rpmb::counter_expired(0x0000) {
+        return TestResult::Fail("counter-expired bit must be bit 7 of the result");
+    }
+    // A response frame checks type + result; a wrong MAC
+    // fails verification and the frame's own MAC passes it.
+    let mut f = RpmbFrame::new();
+    f.set_req_type(RPMB_RESP_READ);
+    f.set_result(0x0000);
+    f.set_mac(&[0xAB; 32]);
+    if f.check_response_type_and_result(RPMB_RESP_READ).is_err() {
+        return TestResult::Fail("matching type + OK result must pass");
+    }
+    if f.check_response_type_and_result(RPMB_RESP_WRITE).is_ok() {
+        return TestResult::Fail("wrong response type must fail");
+    }
+    if f.verify_mac(&[0xAB; 32]).is_err() || f.verify_mac(&[0xAC; 32]).is_ok() {
+        return TestResult::Fail("MAC verification must accept its own MAC and reject others");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_rpmb_result_decoding);
+
 // ── UFS / UFSHCI 3.0 ──────────────────────────────────────────────
 
 fn smoke_ufs_utrd_round_trip() -> TestResult {

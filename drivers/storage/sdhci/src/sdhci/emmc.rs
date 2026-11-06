@@ -43,11 +43,14 @@
 //! cached, so back-to-back I/O to one partition costs no switch.
 //!
 //! RPMB is decoded and sized but deliberately NOT published as a
-//! plain block device: JESD84-B51 §6.15 admits only authenticated
-//! request/response frames (CMD23 + CMD17/CMD24 carrying a MAC and
+//! plain block device: JESD84-B51 §6.6.22 admits only authenticated
+//! request/response frames (CMD23 + CMD18/CMD25 carrying a MAC and
 //! a nonce / write counter) — a plain block read would return a
 //! frame, and a plain write would be rejected by the device. The
-//! authenticated-frame protocol is a follow-up; see the PR body.
+//! authenticated-frame protocol is implemented in `super::rpmb`
+//! (program key, authenticated counter read / data read / data
+//! write, all single-frame); RPMB is exposed only through those
+//! authenticated methods.
 
 use alloc::sync::Arc;
 
@@ -220,7 +223,7 @@ impl Sdhci {
     /// Read the 512-byte EXT_CSD register via CMD8 (SEND_EXT_CSD).
     fn read_ext_csd(&self) -> Result<ExtCsd, SdhciError> {
         let mut buf = [0u8; 512];
-        self.read_pio_block(8, 0, &mut buf)?;
+        self.read_pio_block(8, 0, false, &mut buf)?;
         ExtCsd::parse(&buf).map_err(|_| SdhciError::BadExtCsd)
     }
 
@@ -404,7 +407,7 @@ impl narf_block::registry::BlockDeviceSync for EmmcBlockDevice {
                 };
                 let offset = i as usize * 512;
                 let mut buf = [0u8; 512];
-                ctrl.read_pio_block(17, arg, &mut buf)
+                ctrl.read_pio_block(17, arg, false, &mut buf)
                     .map_err(|_| narf_block::registry::BlockIoError::DriverError)?;
                 out[offset..offset + 512].copy_from_slice(&buf);
             }
@@ -443,7 +446,7 @@ impl narf_block::registry::BlockDeviceSync for EmmcBlockDevice {
                 let offset = i as usize * 512;
                 let mut buf = [0u8; 512];
                 buf.copy_from_slice(&data[offset..offset + 512]);
-                ctrl.write_pio_block(24, arg, &buf)
+                ctrl.write_pio_block(24, arg, false, &buf)
                     .map_err(|_| narf_block::registry::BlockIoError::DriverError)?;
             }
             Ok(())
