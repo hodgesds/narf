@@ -1127,16 +1127,21 @@ async fn dispatch_after_address(
         {
             return AttachOutcome::Mouse;
         }
-        // RNDIS ethernet — class 0x02 (Comm), subclass 0x02
-        // (ACM), protocol 0xFF. Tried BEFORE CDC-ACM on purpose:
-        // the ACM finder used to be protocol-blind (it matched
-        // any 0x02/0x02 Comm interface) and its bind treats
-        // SET_LINE_CODING failures as non-fatal, so an RNDIS
-        // device would otherwise be claimed as a serial port.
-        // The RNDIS finder requires protocol 0xFF, so a real
-        // modem falls through this attempt untouched; the ACM
-        // finder now also skips 0xFF interfaces as defence in
-        // depth (#1370).
+        // RNDIS ethernet — any of the four RNDIS triples
+        // (classic 0x02/0x02/0xFF, wireless 0xE0/0x01/0x03,
+        // ActiveSync 0xEF/0x01/0x01, Misc WWAN 0xEF/0x04/0x01;
+        // see rndis::RNDIS_VARIANTS). Tried BEFORE CDC-ACM on
+        // purpose: the ACM finder used to be protocol-blind
+        // (it matched any 0x02/0x02 Comm interface) and its
+        // bind treats SET_LINE_CODING failures as non-fatal,
+        // so an RNDIS device would otherwise be claimed as a
+        // serial port. The RNDIS finder requires an RNDIS
+        // triple, so a real modem falls through this attempt
+        // untouched; the ACM finder now also skips 0xFF
+        // interfaces as defence in depth (#1370). Bluetooth
+        // (0xE0/0x01/0x01) and the other later attempts are
+        // equally safe: the wireless triple's protocol byte
+        // (0x03) separates it from Bluetooth (0x01).
         if let Ok(_idx) =
             crate::rndis::try_bind_rndis_already_addressed(xhci_dev, slot_id, &cfg_blob).await
         {

@@ -8,6 +8,21 @@
 //!   Formats").
 //!   <https://learn.microsoft.com/en-us/windows-hardware/drivers/network/remote-ndis-concepts-and-definitions>
 //!   <https://learn.microsoft.com/en-us/windows-hardware/drivers/network/multipacket-messages>
+//! - **[MS-RNDIS] Remote Network Driver Interface
+//!   Specification (RNDIS) Protocol, v20140501** (Microsoft).
+//!   Public. Cited below as `[MS-RNDIS]` for the normative
+//!   details the Learn pages summarise: §2.2.9
+//!   (`INITIALIZE_CMPLT`, `Medium` MUST be 802.3,
+//!   `PacketAlignmentFactor` is an exponent of 2), §2.2.14
+//!   (multipacket padding + `MaxPacketsPerTransfer` /
+//!   `MaxTransferSize` MUST be respected), §3.1.1.2 (host
+//!   `KeepAliveTimer`: USB SHOULD be 5 s; `ControlTimeoutTimer`:
+//!   USB SHOULD be 10 s), §3.1.5.4/§3.1.5.5/§3.1.6 (keepalive
+//!   failure and timer expiry MUST issue `RESET`; `RESET_CMPLT`
+//!   success returns the host to `RNDIS_BUS_INITIALIZED`, and
+//!   `AddressingReset = 1` requires re-sending addressing
+//!   information), §3.2.5.5 (a reset keeps the data and
+//!   control channels intact).
 //! - **USB Class Definitions for Communications Devices,
 //!   Revision 1.2** (USB-IF). Public. §6.2 (encapsulated
 //!   commands: `SEND_ENCAPSULATED_COMMAND` /
@@ -111,29 +126,64 @@
 //! `0xFF`, so it can only claim RNDIS devices), and the ACM
 //! finder now skips Comm interfaces whose protocol is `0xFF`
 //! (`0xFF` is not a valid ACM protocol per CDC PSTN 1.2 §6.3;
-//! ACM protocols are `0x00`–`0x06`). The wireless RNDIS
-//! variant (class `0xE0` / subclass `1` / protocol `3`,
-//! some ZTE WWAN modules) is NOT matched: no NARF WLAN
-//! stack consumes it yet; filed as a remainder, not silently
-//! claimed.
+//! ACM protocols are `0x00`–`0x06`).
+//!
+//! ## Matched variants (#1517)
+//!
+//! The classic triple is not the only RNDIS shape on the
+//! wire. [`RNDIS_VARIANTS`] matches all four triples in
+//! Linux `drivers/net/usb/rndis_host.c` `products[]` (and
+//! the ActiveSync triple from #1517):
+//!
+//! | Variant | Triple | Seen on |
+//! | ------- | ------ | ------- |
+//! | Classic | `0x02 / 0x02 / 0xFF` | Android tethering, LTE dongles |
+//! | Wireless | `0xE0 / 0x01 / 0x03` | ZTE WWAN modules, Mediatek tethering phones |
+//! | ActiveSync | `0xEF / 0x01 / 0x01` | Windows Mobile / ActiveSync devices |
+//! | Misc WWAN | `0xEF / 0x04 / 0x01` | Novatel USB730L, Telit FN990A |
+//!
+//! All four run the *same* RNDIS message protocol over the
+//! same CDC-Data bulk pair: [MS-RNDIS] §2.2.9 requires
+//! `INITIALIZE_CMPLT`'s `Medium` to be `0x00000000`
+//! (IEEE 802.3) for every variant — the wireless/WWAN nature
+//! lives in the OIDs, not the medium field — so bring-up,
+//! the packet filter, and the data path are identical and the
+//! existing `BadMedium` check stands. Claimant safety holds
+//! for the new triples too: Bluetooth matches
+//! `0xE0 / 0x01 / 0x01` (protocol differs from wireless
+//! RNDIS's `0x03`), ACM matches class `0x02` only, and no
+//! in-tree driver claims the `0xEF` triples; the RNDIS bind
+//! attempt still runs before ACM and Bluetooth in the
+//! attach cascade.
 //!
 //! ## Remainders (stated, not hidden)
 //!
-//! - `RESET` is implemented at the message layer only; no
-//!   recovery path re-runs bring-up after a reset yet — the RX
-//!   pump exits after a bounded run of transfer errors and
-//!   detach/re-enumeration recovers the device (the NCM/ECM
-//!   pattern).
-//! - No periodic KEEPALIVE task is spawned; the message layer
-//!   and a `send_keepalive` trampoline exist, and link state
-//!   is tracked via `MEDIA_CONNECT_STATUS` + the notification
-//!   pump. A supervisor-driven keepalive policy is future
-//!   work.
-//! - TX sends one frame per bulk transfer. Multipacket TX
-//!   batching (concatenating `PACKET_MSG`s to the negotiated
-//!   `PacketAlignmentFactor`) is a throughput optimisation,
-//!   not a correctness requirement — the device accepts
-//!   single-packet transfers. RX walks multipacket buffers.
+//! - The wireless variant is bound as an Ethernet net device
+//!   (`usb-rndisN`); no NARF WLAN stack consumes 802.11 OIDs
+//!   yet, so association on a wireless RNDIS device must
+//!   already be established by its firmware. 802.11 OID
+//!   support is a WLAN-stack remainder, not a claim in this
+//!   lane.
+//! - TX batching is an explicit API ([`send_frames_batched`]
+//!   / [`RndisIface::send_batched`]): the net stack's
+//!   per-frame send path still sends one `PACKET_MSG` per
+//!   bulk transfer (spec-correct; the device accepts it).
+//!   Frames are never implicitly queued, so no caller can
+//!   have a frame delayed by a batching window.
+//! - The keepalive pump runs on a fixed 5 s cadence and is
+//!   not reset by traffic: a stricter-than-spec liveness
+//!   check ([MS-RNDIS] only requires a keepalive after an
+//!   idle period), safe because `KEEPALIVE` is idempotent
+//!   and must be answered in RNDIS-data-initialized.
+//! - A station address that changed across a soft reset is
+//!   recorded but not re-published to the net registry:
+//!   devices do not change their station address on reset,
+//!   and no re-publish path exists for any family.
+//! - The `ControlTimeoutTimer` ([MS-RNDIS] §3.1.1.2: USB
+//!   SHOULD be 10 s) is recorded as a policy constant but
+//!   not enforced as a wall-clock timeout: the control
+//!   exchange bounds its wait as a poll count
+//!   (`MAX_RESPONSE_POLLS`), not in milliseconds.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -243,6 +293,153 @@ pub const RNDIS_SUBCLASS_ACM: u8 = 0x02;
 /// CDC-Comm protocol for RNDIS (vendor-specific, "MSFT RNDIS").
 pub const RNDIS_PROTOCOL: u8 = 0xFF;
 
+/// Wireless Controller class for the wireless RNDIS
+/// variant (Linux `USB_CLASS_WIRELESS_CONTROLLER`).
+pub const RNDIS_CLASS_WIRELESS: u8 = 0xE0;
+/// RF subclass for the wireless RNDIS variant.
+pub const RNDIS_SUBCLASS_RF: u8 = 0x01;
+/// Protocol for the wireless RNDIS variant (Linux
+/// `rndis_host.c`: `USB_INTERFACE_INFO(USB_CLASS_WIRELESS_CONTROLLER, 1, 3)`).
+pub const RNDIS_PROTOCOL_WIRELESS: u8 = 0x03;
+
+/// Miscellaneous Device class for the ActiveSync and
+/// Misc-WWAN RNDIS variants (`USB_CLASS_MISC`).
+pub const RNDIS_CLASS_MISC: u8 = 0xEF;
+/// Subclass for the ActiveSync RNDIS variant.
+pub const RNDIS_SUBCLASS_ACTIVESYNC: u8 = 0x01;
+/// Protocol for the ActiveSync RNDIS variant.
+pub const RNDIS_PROTOCOL_ACTIVESYNC: u8 = 0x01;
+/// Subclass for the Misc-WWAN RNDIS variant (Novatel
+/// USB730L, Telit FN990A; Linux `rndis_host.c`:
+/// `USB_INTERFACE_INFO(USB_CLASS_MISC, 4, 1)`).
+pub const RNDIS_SUBCLASS_MISC_WWAN: u8 = 0x04;
+/// Protocol for the Misc-WWAN RNDIS variant.
+pub const RNDIS_PROTOCOL_MISC_WWAN: u8 = 0x01;
+
+/// Which RNDIS wire shape a bound device presented.
+/// All four run the same RNDIS message protocol and the
+/// same bring-up ([MS-RNDIS] §2.2.9: `Medium` MUST be
+/// 802.3 for every variant); the variant is recorded for
+/// diagnostics and for the claimant checks in the attach
+/// cascade, not for protocol dispatch.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RndisVariant {
+    /// Classic triple: class `0x02` / subclass `0x02` /
+    /// protocol `0xFF`.
+    Classic,
+    /// Wireless triple: class `0xE0` / subclass `1` /
+    /// protocol `3` (ZTE WWAN modules, Mediatek tethering).
+    Wireless,
+    /// ActiveSync triple: class `0xEF` / subclass `1` /
+    /// protocol `1`.
+    ActiveSync,
+    /// Misc-WWAN triple: class `0xEF` / subclass `4` /
+    /// protocol `1` (Novatel USB730L, Telit FN990A).
+    MiscWwan,
+}
+
+impl RndisVariant {
+    /// The (class, subclass, protocol) triple this variant
+    /// matches.
+    pub fn triple(self) -> (u8, u8, u8) {
+        match self {
+            RndisVariant::Classic => (USB_CLASS_CDC_COMM, RNDIS_SUBCLASS_ACM, RNDIS_PROTOCOL),
+            RndisVariant::Wireless => (
+                RNDIS_CLASS_WIRELESS,
+                RNDIS_SUBCLASS_RF,
+                RNDIS_PROTOCOL_WIRELESS,
+            ),
+            RndisVariant::ActiveSync => (
+                RNDIS_CLASS_MISC,
+                RNDIS_SUBCLASS_ACTIVESYNC,
+                RNDIS_PROTOCOL_ACTIVESYNC,
+            ),
+            RndisVariant::MiscWwan => (
+                RNDIS_CLASS_MISC,
+                RNDIS_SUBCLASS_MISC_WWAN,
+                RNDIS_PROTOCOL_MISC_WWAN,
+            ),
+        }
+    }
+}
+
+/// Every matched RNDIS interface triple, as
+/// (class, subclass, protocol, variant). Mirrors Linux
+/// `drivers/net/usb/rndis_host.c` `products[]` plus the
+/// ActiveSync triple from #1517.
+pub const RNDIS_VARIANTS: [(u8, u8, u8, RndisVariant); 4] = [
+    (
+        USB_CLASS_CDC_COMM,
+        RNDIS_SUBCLASS_ACM,
+        RNDIS_PROTOCOL,
+        RndisVariant::Classic,
+    ),
+    (
+        RNDIS_CLASS_WIRELESS,
+        RNDIS_SUBCLASS_RF,
+        RNDIS_PROTOCOL_WIRELESS,
+        RndisVariant::Wireless,
+    ),
+    (
+        RNDIS_CLASS_MISC,
+        RNDIS_SUBCLASS_ACTIVESYNC,
+        RNDIS_PROTOCOL_ACTIVESYNC,
+        RndisVariant::ActiveSync,
+    ),
+    (
+        RNDIS_CLASS_MISC,
+        RNDIS_SUBCLASS_MISC_WWAN,
+        RNDIS_PROTOCOL_MISC_WWAN,
+        RndisVariant::MiscWwan,
+    ),
+];
+
+/// Map an interface triple to its RNDIS variant, or
+/// `None` when the triple is not an RNDIS shape. The
+/// Bluetooth triple (`0xE0 / 0x01 / 0x01`) and the plain
+/// ACM modem triple (`0x02 / 0x02 / 0x01`) both map to
+/// `None` — the protocol byte is what separates them from
+/// RNDIS.
+pub fn rndis_variant_of(class: u8, subclass: u8, protocol: u8) -> Option<RndisVariant> {
+    RNDIS_VARIANTS
+        .iter()
+        .find(|&&(c, s, p, _)| c == class && s == subclass && p == protocol)
+        .map(|&(_, _, _, v)| v)
+}
+
+// ── Keepalive / recovery policy ([MS-RNDIS] §3.1) ────────────────
+
+/// Host `KeepAliveTimer` period in milliseconds.
+/// [MS-RNDIS] §3.1.1.2: for a USB bus the period SHOULD be
+/// 5 seconds. The pump sends a `KEEPALIVE` on this cadence
+/// while the device is in RNDIS-data-initialized.
+pub const RNDIS_KEEPALIVE_INTERVAL_MS: u64 = 5_000;
+/// Host `ControlTimeoutTimer` in milliseconds.
+/// [MS-RNDIS] §3.1.1.2: for a USB bus the timeout SHOULD be
+/// 10 seconds. It bounds waiting for a control-channel
+/// response other than `KEEPALIVE`. Recorded here as the
+/// policy value; the control exchange currently bounds that
+/// wait as a poll count (`MAX_RESPONSE_POLLS`), not as a
+/// wall-clock timeout — a wall-clock enforcement is a stated
+/// gap, not a claim in this lane.
+pub const RNDIS_CONTROL_TIMEOUT_MS: u64 = 10_000;
+/// Maximum consecutive bulk-IN transfer errors the RX pump
+/// tolerates before attempting reset recovery (previously
+/// an unnamed literal `16` at the pump's exit).
+pub const MAX_CONSECUTIVE_RX_ERRORS: u32 = 16;
+/// Maximum reset-recovery attempts per bound device.
+/// Driver policy (the spec does not bound retries): after
+/// this many failed recoveries the pumps stop and only
+/// detach/re-enumeration can recover the device.
+pub const MAX_RECOVERY_ATTEMPTS: u32 = 3;
+
+/// True while another reset-recovery attempt may still be
+/// started for a device that has already used `used`
+/// attempts. Pure so the bound is fixture-pinned.
+pub fn recovery_attempt_allowed(used: u32) -> bool {
+    used < MAX_RECOVERY_ATTEMPTS
+}
+
 // ── Errors ─────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -273,6 +470,10 @@ pub enum RndisError {
     BadDeviceFlags,
     /// A TX frame exceeds the negotiated maximum frame size.
     FrameTooLarge,
+    /// A multipacket TX batch exceeds the negotiated
+    /// `MaxPacketsPerTransfer` or `MaxTransferSize`, or its
+    /// alignment cannot be satisfied.
+    BatchTooLarge,
     /// Control or bulk transfer failed / timed out waiting for
     /// the matching encapsulated response.
     Transfer,
@@ -763,6 +964,92 @@ pub fn parse_multipacket<'a>(buf: &'a [u8], frames: &mut Vec<&'a [u8]>) -> bool 
     true
 }
 
+/// Concatenate `frames` into one multipacket TX transfer: a
+/// run of `PACKET_MSG`s in a single bulk-OUT transfer
+/// ([MS-RNDIS] §2.2.14).
+///
+/// Rules, all from the spec section:
+/// - Every element is one [`encode_packet_msg`] output.
+/// - All but the last element are zero-padded so the next
+///   element starts at a multiple of `2 ^ alignment_factor`
+///   bytes ([MS-RNDIS] §2.2.9: "the host uses
+///   `2 ^ PacketAlignmentFactor` as the alignment value").
+///   The padding is part of the element, so the element's
+///   `MessageLength` is raised to include it — a receiver
+///   walking by `MessageLength` (like [`parse_multipacket`])
+///   lands exactly on the next element.
+/// - `max_packets_per_transfer` caps the element count (0 =
+///   the device imposes no count cap; the host applies its
+///   own — here, none beyond the transfer-size cap).
+/// - `max_transfer_size` caps the whole transfer (0 = the
+///   device reported no usable value; the host offer
+///   [`HOST_MAX_TRANSFER_SIZE`] is used instead, the same
+///   fallback as the RX sizing).
+/// - Every frame is still capped by `max_frame_size`
+///   ([`RndisError::FrameTooLarge`]).
+///
+/// A one-frame batch is byte-identical to
+/// [`encode_packet_msg`] (no padding is ever needed after
+/// the last element). An empty batch is a caller error
+/// ([`RndisError::BadLength`]).
+pub fn encode_multipacket_tx(
+    frames: &[&[u8]],
+    alignment_factor: u32,
+    max_packets_per_transfer: u32,
+    max_transfer_size: u32,
+    max_frame_size: u32,
+) -> Result<Vec<u8>, RndisError> {
+    if frames.is_empty() {
+        return Err(RndisError::BadLength);
+    }
+    if max_packets_per_transfer != 0 && frames.len() as u32 > max_packets_per_transfer {
+        return Err(RndisError::BatchTooLarge);
+    }
+    let cap = if max_transfer_size == 0 {
+        HOST_MAX_TRANSFER_SIZE
+    } else {
+        max_transfer_size
+    } as usize;
+    // Alignment is only needed between elements; a
+    // single-frame batch never pays for an absurd factor.
+    let alignment: Option<usize> = if frames.len() > 1 {
+        Some(
+            1usize
+                .checked_shl(alignment_factor)
+                .ok_or(RndisError::BatchTooLarge)?,
+        )
+    } else {
+        None
+    };
+    let mut out: Vec<u8> = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        if frame.len() as u32 > max_frame_size {
+            return Err(RndisError::FrameTooLarge);
+        }
+        let mut elem = encode_packet_msg(frame);
+        let last = i + 1 == frames.len();
+        if !last {
+            if let Some(alignment) = alignment {
+                if alignment > 1 {
+                    let rem = elem.len() % alignment;
+                    if rem != 0 {
+                        let pad = alignment - rem;
+                        elem.resize(elem.len() + pad, 0);
+                        // MessageLength covers header, payload
+                        // AND padding ([MS-RNDIS] §2.2.14).
+                        put_u32le(&mut elem, 4, elem.len() as u32);
+                    }
+                }
+            }
+        }
+        if out.len() + elem.len() > cap {
+            return Err(RndisError::BatchTooLarge);
+        }
+        out.extend_from_slice(&elem);
+    }
+    Ok(out)
+}
+
 // ── Packet filter (NDIS_PACKET_TYPE_* bitmap) ───────────────────────
 
 /// Packet-filter bitmap for `OID_GEN_CURRENT_PACKET_FILTER`.
@@ -1089,6 +1376,115 @@ impl RndisBringup {
     }
 }
 
+// ── Reset recovery (pure — no hardware) ─────────────────────────────
+//
+// Drives the recovery sequence [MS-RNDIS] §3.1.5.4/§3.1.5.5/
+// §3.1.6 prescribes: on a keepalive failure or a timer
+// expiry the host MUST issue `RESET`; on a successful
+// `RESET_CMPLT` the host MUST transition to
+// `RNDIS_BUS_INITIALIZED` — i.e. re-run bring-up — and when
+// `AddressingReset` is set it MUST re-send the addressing
+// information (the packet-filter SET that bring-up ends
+// with). A reset keeps the data and control channels intact
+// (§3.2.5.5), so recovery never re-configures endpoints.
+//
+// The machine is the same request/response shape as
+// [`RndisBringup`]: `next_request()` yields the bytes to
+// send, `handle_response()` consumes the reply. The async
+// recovery loop feeds it through xHCI; the fixtures feed it
+// through the scripted fake device.
+
+#[derive(Debug)]
+enum RecoveryStep {
+    SendReset,
+    AwaitResetComplete,
+    Rebringup,
+    Done,
+}
+
+/// Pure driver of the RNDIS reset-recovery exchange:
+/// `RESET` → `RESET_CMPLT` → full bring-up.
+#[derive(Debug)]
+pub struct RndisRecovery {
+    step: RecoveryStep,
+    bringup: RndisBringup,
+    addressing_reset: bool,
+}
+
+impl RndisRecovery {
+    /// Start a recovery whose re-bring-up offers
+    /// `max_transfer_size` in INITIALIZE.
+    pub fn new(max_transfer_size: u32) -> Self {
+        Self {
+            step: RecoveryStep::SendReset,
+            bringup: RndisBringup::new(max_transfer_size),
+            addressing_reset: false,
+        }
+    }
+
+    /// True once the reset completed and the re-bring-up's
+    /// filter SET completed — the device is back in
+    /// RNDIS-data-initialized and the datapath may resume.
+    pub fn is_done(&self) -> bool {
+        self.step == RecoveryStep::Done
+    }
+
+    /// Whether the device's `RESET_CMPLT` reported
+    /// `AddressingReset = 1` — the addressing information
+    /// was lost in the reset and the re-bring-up's filter
+    /// SET (which always runs) is what restores it.
+    pub fn addressing_reset(&self) -> bool {
+        self.addressing_reset
+    }
+
+    /// Negotiated parameters once the re-bring-up finished.
+    pub fn negotiated(&self) -> Option<RndisNegotiated> {
+        self.bringup.negotiated()
+    }
+
+    /// Station address once the re-bring-up finished.
+    pub fn mac(&self) -> Option<[u8; 6]> {
+        self.bringup.mac()
+    }
+
+    /// Next control message to send, or `None` when done.
+    /// The first request is the `RESET` message (which
+    /// carries no `RequestId`); afterwards this delegates
+    /// to the inner bring-up.
+    pub fn next_request(&mut self) -> Option<Vec<u8>> {
+        match self.step {
+            RecoveryStep::SendReset => {
+                self.step = RecoveryStep::AwaitResetComplete;
+                Some(encode_reset_msg().to_vec())
+            }
+            RecoveryStep::Rebringup => self.bringup.next_request(),
+            _ => None,
+        }
+    }
+
+    /// Feed one device response. Validates the
+    /// `RESET_CMPLT` (a non-success status aborts the
+    /// recovery — the device did not reset), then delegates
+    /// to the inner bring-up.
+    pub fn handle_response(&mut self, resp: &[u8]) -> Result<(), RndisError> {
+        match self.step {
+            RecoveryStep::AwaitResetComplete => {
+                self.addressing_reset = decode_reset_complete(resp)?;
+                self.step = RecoveryStep::Rebringup;
+                Ok(())
+            }
+            RecoveryStep::Rebringup => {
+                self.bringup.handle_response(resp)?;
+                if self.bringup.is_done() {
+                    self.step = RecoveryStep::Done;
+                }
+                Ok(())
+            }
+            _ => Err(RndisError::BadMessageType),
+        }
+    }
+}
+
 // ── CDC notification decoder (CDC 1.2 §6.3) ────────────────────────
 
 /// `NETWORK_CONNECTION` notification code.
@@ -1163,13 +1559,16 @@ impl RndisNotification {
 // `cdc_ecm` / `cdc_ncm`: `len` guards every step; a malformed
 // block ends the walk instead of panicking.
 
-/// Find the first CDC-Comm interface with subclass ACM (`0x02`)
-/// **and protocol `0xFF`** (RNDIS) in `cfg`. Returns its
-/// `bInterfaceNumber`. A real modem (protocol `0x00`–`0x06`)
+/// Find the first interface whose (class, subclass,
+/// protocol) triple is one of [`RNDIS_VARIANTS`] in `cfg`.
+/// Returns its `bInterfaceNumber` and which variant it is.
+/// A real modem (classic triple with protocol `0x00`–`0x06`)
 /// does not match — this is what keeps the RNDIS binder from
 /// claiming ACM devices — and neither do NCM (`0x0D`) or ECM
-/// (`0x06`) Comm interfaces.
-pub fn find_rndis_comm_interface(cfg: &[u8]) -> Option<u8> {
+/// (`0x06`) Comm interfaces, nor Bluetooth
+/// (`0xE0 / 0x01 / 0x01`). See [`find_rndis_comm_interface`]
+/// for the interface-number-only form.
+pub fn find_rndis_comm_interface_full(cfg: &[u8]) -> Option<(u8, RndisVariant)> {
     let mut i = 0;
     while i + 2 <= cfg.len() {
         let len = cfg[i] as usize;
@@ -1180,13 +1579,22 @@ pub fn find_rndis_comm_interface(cfg: &[u8]) -> Option<u8> {
             let cls = cfg[i + 5];
             let sub = cfg[i + 6];
             let proto = cfg[i + 7];
-            if cls == USB_CLASS_CDC_COMM && sub == RNDIS_SUBCLASS_ACM && proto == RNDIS_PROTOCOL {
-                return Some(cfg[i + 2]);
+            if let Some(variant) = rndis_variant_of(cls, sub, proto) {
+                return Some((cfg[i + 2], variant));
             }
         }
         i += len;
     }
     None
+}
+
+/// Find the RNDIS Comm interface number in `cfg`, or `None`
+/// when no interface carries an RNDIS triple. Accepts any of
+/// the four [`RNDIS_VARIANTS`] triples; a Bluetooth
+/// (`0xE0 / 0x01 / 0x01`) or plain-ACM (`0x02 / 0x02 / 0x01`)
+/// interface never matches.
+pub fn find_rndis_comm_interface(cfg: &[u8]) -> Option<u8> {
+    find_rndis_comm_interface_full(cfg).map(|(iface, _)| iface)
 }
 
 /// One CDC-Data interface's bulk pair as seen while walking.
@@ -1360,7 +1768,14 @@ pub fn find_rndis_data_alt_setting(cfg: &[u8]) -> Option<(u8, u8)> {
 /// in `cfg`, if the device carries one. `None` is not fatal:
 /// the control exchange polls `GET_ENCAPSULATED_RESPONSE`
 /// directly, and link-state updates just stop arriving.
-pub fn find_rndis_notif_endpoint(cfg: &[u8], comm_iface: u8) -> Option<EndpointConfig> {
+/// `comm_class` is the matched variant's interface class
+/// (classic `0x02`, wireless `0xE0`, misc `0xEF`) — the
+/// endpoint belongs to the Comm interface of that class.
+pub fn find_rndis_notif_endpoint(
+    cfg: &[u8],
+    comm_iface: u8,
+    comm_class: u8,
+) -> Option<EndpointConfig> {
     let mut current_iface: Option<u8> = None;
     let mut current_class: u8 = 0;
     let mut i = 0usize;
@@ -1378,7 +1793,7 @@ pub fn find_rndis_notif_endpoint(cfg: &[u8], comm_iface: u8) -> Option<EndpointC
             let attrs = cfg[i + 3];
             let max_packet = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]);
             if current_iface == Some(comm_iface)
-                && current_class == USB_CLASS_CDC_COMM
+                && current_class == comm_class
                 && attrs & 0x03 == 3
                 && ep_addr & 0x80 != 0
             {
@@ -1416,8 +1831,19 @@ pub struct RndisDevice {
     link_up: bool,
     next_request_id: u32,
     iface_name: String,
+    /// Which RNDIS wire shape this device presented.
+    variant: RndisVariant,
     pump_running: bool,
     notif_running: bool,
+    keepalive_running: bool,
+    /// A reset-recovery exchange is in flight; at most one
+    /// owner (RX pump or keepalive pump) may recover a device
+    /// at a time, so concurrent failures cannot run two
+    /// interleaved resets over one control channel.
+    recovering: bool,
+    /// Reset-recovery attempts used since bind, bounded by
+    /// [`MAX_RECOVERY_ATTEMPTS`].
+    recoveries: u32,
     detached: bool,
     controller: u8,
 }
@@ -1553,13 +1979,205 @@ async fn run_bringup(
     }
 }
 
+// ── Reset recovery (async) ───────────────────────────────────────────
+
+/// Send one `RESET` message and wait for its `RESET_CMPLT`.
+///
+/// `RESET` carries no `RequestId`, so unlike
+/// [`rndis_command`] the poll matches on the completion type
+/// alone. Returns the raw completion bytes; the caller
+/// decodes them with [`decode_reset_complete`].
+async fn reset_exchange(
+    xhci_dev: &crate::xhci::Xhci,
+    slot_id: u8,
+    comm_iface: u8,
+) -> Result<Vec<u8>, RndisError> {
+    let msg = encode_reset_msg();
+    xhci_dev
+        .control_out(
+            slot_id,
+            RT_HOST_TO_DEV_CLASS_IFACE,
+            REQ_SEND_ENCAPSULATED_COMMAND,
+            0,
+            comm_iface as u16,
+            &msg,
+        )
+        .await
+        .map_err(|_| RndisError::Transfer)?;
+    let mut buf = alloc::vec![0u8; 4096];
+    for _ in 0..MAX_RESPONSE_POLLS {
+        match xhci_dev
+            .control_in(
+                slot_id,
+                RT_DEV_TO_HOST_CLASS_IFACE,
+                REQ_GET_ENCAPSULATED_RESPONSE,
+                0,
+                comm_iface as u16,
+                &mut buf,
+            )
+            .await
+        {
+            Ok(n) if n >= 16 => {
+                let got = &buf[..n];
+                if let Ok((CMPLT_RESET, _)) = message_prefix(got) {
+                    return Ok(got.to_vec());
+                }
+                narf_scheduler::yield_now().await;
+            }
+            Ok(_) => narf_scheduler::yield_now().await,
+            Err(_) => narf_scheduler::yield_now().await,
+        }
+    }
+    Err(RndisError::Transfer)
+}
+
+/// Run the [`RndisRecovery`] exchange over the control
+/// channel: `RESET` → `RESET_CMPLT` → full bring-up.
+/// Returns the re-negotiated parameters, the station
+/// address, and whether the device reported
+/// `AddressingReset` (addressing re-send required — the
+/// re-bring-up's filter SET is what restores it).
+async fn run_recovery(
+    xhci_dev: &crate::xhci::Xhci,
+    slot_id: u8,
+    comm_iface: u8,
+) -> Result<(RndisNegotiated, [u8; 6], bool), RndisError> {
+    let mut recovery = RndisRecovery::new(HOST_MAX_TRANSFER_SIZE);
+    while !recovery.is_done() {
+        let request = match recovery.next_request() {
+            Some(r) => r,
+            None => break,
+        };
+        let (msg_type, _) = message_prefix(&request).map_err(|_| RndisError::BadMessageType)?;
+        let resp = if msg_type == MSG_RESET {
+            reset_exchange(xhci_dev, slot_id, comm_iface).await?
+        } else {
+            let expected = match msg_type {
+                MSG_INITIALIZE => CMPLT_INITIALIZE,
+                MSG_QUERY => CMPLT_QUERY,
+                MSG_SET => CMPLT_SET,
+                _ => return Err(RndisError::BadMessageType),
+            };
+            rndis_command(xhci_dev, slot_id, comm_iface, &request, expected).await?
+        };
+        recovery.handle_response(&resp)?;
+    }
+    match (recovery.negotiated(), recovery.mac()) {
+        (Some(n), Some(mac)) => Ok((n, mac, recovery.addressing_reset())),
+        _ => Err(RndisError::NoMacAddress),
+    }
+}
+
+/// Outcome of attempting to claim the reset-recovery
+/// ownership for a device.
+enum RecoveryClaim {
+    /// This caller owns the recovery; it must run
+    /// [`reset_and_rebringup`], which releases the claim.
+    Claimed,
+    /// Another pump already owns a recovery; the caller
+    /// must not start a second one.
+    InProgress,
+    /// No recovery may start: the record is missing,
+    /// detached, or the [`MAX_RECOVERY_ATTEMPTS`] budget is
+    /// spent.
+    Unavailable,
+}
+
+/// Claim the reset-recovery ownership for `idx`. At most
+/// one owner at a time, and at most [`MAX_RECOVERY_ATTEMPTS`]
+/// attempts per bound device.
+fn try_begin_recovery(idx: usize) -> RecoveryClaim {
+    let mut g = RNDIS_DEVICES.lock();
+    let Some(dev) = g.get_mut(idx).filter(|d| !d.detached) else {
+        return RecoveryClaim::Unavailable;
+    };
+    if dev.recovering {
+        return RecoveryClaim::InProgress;
+    }
+    if !recovery_attempt_allowed(dev.recoveries) {
+        return RecoveryClaim::Unavailable;
+    }
+    dev.recovering = true;
+    dev.recoveries += 1;
+    RecoveryClaim::Claimed
+}
+
+/// Reset the device at `idx` and re-run bring-up, then
+/// refresh the record with the re-negotiated parameters and
+/// station address and respawn any pump that already exited.
+///
+/// The caller must own the claim from [`try_begin_recovery`];
+/// this function releases it on every exit. The reset keeps
+/// the data and control channels intact ([MS-RNDIS]
+/// §3.2.5.5), so no endpoint re-configuration is needed —
+/// the pumps keep their DCIs and resume on the same pipes.
+/// A station address that changed across the reset is
+/// recorded but not re-published to the net registry (see
+/// the module remainders).
+async fn reset_and_rebringup(idx: usize) -> Result<(), RndisError> {
+    let outcome = reset_and_rebringup_inner(idx).await;
+    let mut g = RNDIS_DEVICES.lock();
+    if let Some(dev) = g.get_mut(idx) {
+        dev.recovering = false;
+    }
+    outcome
+}
+
+async fn reset_and_rebringup_inner(idx: usize) -> Result<(), RndisError> {
+    let (slot_id, comm_iface, notif_dci) = {
+        let g = RNDIS_DEVICES.lock();
+        let dev = g
+            .get(idx)
+            .filter(|d| !d.detached)
+            .ok_or(RndisError::NotBound)?;
+        (dev.slot_id, dev.comm_iface, dev.notif_dci)
+    };
+    let c = controller_of(idx).ok_or(RndisError::NoController)?;
+    let (negotiated, mac, _addressing_reset) = run_recovery(&c, slot_id, comm_iface).await?;
+    let mut respawn_rx = false;
+    let mut respawn_notif = false;
+    {
+        let mut g = RNDIS_DEVICES.lock();
+        let Some(dev) = g.get_mut(idx).filter(|d| !d.detached) else {
+            return Err(RndisError::NotBound);
+        };
+        dev.max_transfer_size = negotiated.max_transfer_size;
+        dev.max_packets_per_transfer = negotiated.max_packets_per_transfer;
+        dev.packet_alignment_factor = negotiated.packet_alignment_factor;
+        dev.max_frame_size = negotiated.max_frame_size;
+        dev.media_connected = negotiated.media_connected;
+        dev.link_up = negotiated.media_connected.unwrap_or(dev.link_up);
+        dev.mac = mac;
+        respawn_rx = !dev.pump_running;
+        respawn_notif = notif_dci != 0 && !dev.notif_running;
+        if respawn_rx {
+            dev.pump_running = true;
+        }
+        if respawn_notif {
+            dev.notif_running = true;
+        }
+    }
+    if respawn_rx {
+        narf_scheduler::spawn(async move {
+            rndis_rx_pump(idx).await;
+        });
+    }
+    if respawn_notif {
+        narf_scheduler::spawn(async move {
+            rndis_notif_pump(idx).await;
+        });
+    }
+    Ok(())
+}
+
 // ── Bind ───────────────────────────────────────────────────────────
 
 /// Post-address RNDIS bind: caller has already issued
 /// port_reset + enable_slot + address_device. We pull the
-/// config descriptor, match the Comm (0x02/0x02/0xFF) +
-/// Data interface pair, configure the bulk endpoints, then run
-/// the bring-up exchange (INITIALIZE → QUERY MAC / max frame /
+/// config descriptor, match the Comm interface (any
+/// [`RNDIS_VARIANTS`] triple) + Data interface pair,
+/// configure the bulk endpoints, then run the bring-up
+/// exchange (INITIALIZE → QUERY MAC / max frame /
 /// media-connect → SET packet filter) and register the device
 /// with the net-iface registry under `usb-rndisN`.
 ///
@@ -1570,7 +2188,8 @@ pub async fn try_bind_rndis_already_addressed(
     slot_id: u8,
     cfg: &[u8],
 ) -> Result<usize, RndisError> {
-    let comm_iface = find_rndis_comm_interface(cfg).ok_or(RndisError::NotRndis)?;
+    let (comm_iface, variant) = find_rndis_comm_interface_full(cfg).ok_or(RndisError::NotRndis)?;
+    let comm_class = variant.triple().0;
     let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
     if xhci_dev
         .control_out(
@@ -1598,7 +2217,7 @@ pub async fn try_bind_rndis_already_addressed(
                 .await;
         }
     }
-    let notif_ep = find_rndis_notif_endpoint(cfg, comm_iface);
+    let notif_ep = find_rndis_notif_endpoint(cfg, comm_iface, comm_class);
     let mut ep_list = alloc::vec![bulk_in_ep, bulk_out_ep];
     if let Some(notif) = notif_ep {
         ep_list.push(notif);
@@ -1639,8 +2258,12 @@ pub async fn try_bind_rndis_already_addressed(
             link_up: negotiated.media_connected.unwrap_or(false),
             next_request_id: 0,
             iface_name: alloc::format!("usb-rndis{}", idx),
+            variant,
             pump_running: false,
             notif_running: false,
+            keepalive_running: false,
+            recovering: false,
+            recoveries: 0,
             detached: false,
             controller: xhci_dev.id(),
         });
@@ -1652,6 +2275,7 @@ pub async fn try_bind_rndis_already_addressed(
         g[idx].iface_name = assigned;
         g[idx].pump_running = true;
         g[idx].notif_running = notif_dci != 0;
+        g[idx].keepalive_running = true;
     }
     // Pre-arm the notification endpoint so the controller starts
     // polling the device for link events. Failure only disables
@@ -1676,16 +2300,20 @@ pub async fn try_bind_rndis_already_addressed(
             rndis_notif_pump(idx).await;
         });
     }
+    narf_scheduler::spawn(async move {
+        rndis_keepalive_pump(idx).await;
+    });
     Ok(idx)
 }
 
 /// Supervised RX pump for one bound RNDIS device: post bulk-IN
 /// reads sized by the negotiated MaxTransferSize, walk each
 /// transfer as a (possibly multipacket) run of `PACKET_MSG`s,
-/// and hand each Ethernet frame to the network stack. Stops
-/// after a bounded run of consecutive transfer errors (a
-/// removed device surfaces as persistent errors) or when the
-/// record vanishes or is detached.
+/// and hand each Ethernet frame to the network stack. After a
+/// bounded run of consecutive transfer errors it attempts
+/// reset recovery ([`reset_and_rebringup`]) and resumes on
+/// the same pipes; it stops only when the record vanishes,
+/// is detached, or recovery is unavailable / exhausted.
 async fn rndis_rx_pump(idx: usize) {
     let (slot_id, bulk_in_dci, name, buf_len) = {
         let g = RNDIS_DEVICES.lock();
@@ -1730,8 +2358,21 @@ async fn rndis_rx_pump(idx: usize) {
             }
             Err(_) => {
                 errors += 1;
-                if errors >= 16 {
-                    break;
+                if errors >= MAX_CONSECUTIVE_RX_ERRORS {
+                    match try_begin_recovery(idx) {
+                        RecoveryClaim::Claimed => match reset_and_rebringup(idx).await {
+                            Ok(()) => errors = 0,
+                            Err(_) => break,
+                        },
+                        // Another pump owns a recovery; the
+                        // fault may clear under it. Re-arm
+                        // the counter and re-evaluate.
+                        RecoveryClaim::InProgress => errors = 0,
+                        // Budget spent, or the record is gone
+                        // / detached: a removed device surfaces
+                        // as persistent errors.
+                        RecoveryClaim::Unavailable => break,
+                    }
                 }
                 narf_scheduler::yield_now().await;
             }
@@ -1811,6 +2452,57 @@ async fn rndis_notif_pump(idx: usize) {
     }
 }
 
+/// Keepalive pump for one bound RNDIS device: the host side
+/// of the [MS-RNDIS] §3.1.1.2 `KeepAliveTimer`. While the
+/// device is in RNDIS-data-initialized, a `KEEPALIVE` goes
+/// out every [`RNDIS_KEEPALIVE_INTERVAL_MS`] (5 s, the USB
+/// SHOULD value); a successful `KEEPALIVE_CMPLT` resets the
+/// timer and nothing else happens (§3.1.5.4). A failed
+/// keepalive — non-success status or a stalled control
+/// exchange — means the host MUST issue `RESET` (§3.1.5.4,
+/// §3.1.6), so the pump claims reset recovery and re-runs
+/// bring-up; it stops only when the record vanishes, is
+/// detached, or recovery is unavailable / exhausted.
+///
+/// The cadence is fixed rather than reset by traffic: a
+/// stricter-than-spec liveness check (the spec only
+/// requires a keepalive after an idle period), safe because
+/// `KEEPALIVE` is idempotent and must be answered in
+/// RNDIS-data-initialized. Uses the async exchange directly
+/// — this task runs inside the executor, where the sync
+/// [`send_keepalive`] trampoline's `block_on` would panic.
+async fn rndis_keepalive_pump(idx: usize) {
+    loop {
+        narf_time::sleep_ms(RNDIS_KEEPALIVE_INTERVAL_MS).await;
+        {
+            let g = RNDIS_DEVICES.lock();
+            if g.get(idx).map(|d| d.detached).unwrap_or(true) {
+                break;
+            }
+        }
+        match send_keepalive_async(idx).await {
+            Ok(()) => {}
+            Err(_) => match try_begin_recovery(idx) {
+                RecoveryClaim::Claimed => {
+                    if reset_and_rebringup(idx).await.is_err() {
+                        break;
+                    }
+                }
+                // Another pump owns a recovery; re-check on
+                // the next tick.
+                RecoveryClaim::InProgress => {}
+                // Budget spent, or the record is gone /
+                // detached.
+                RecoveryClaim::Unavailable => break,
+            },
+        }
+    }
+    let mut g = RNDIS_DEVICES.lock();
+    if let Some(dev) = g.get_mut(idx) {
+        dev.keepalive_running = false;
+    }
+}
+
 // ── TX / RX trampolines + detach ─────────────────────────────────────
 
 /// Resolve a device-record index to its TX target
@@ -1860,6 +2552,49 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, RndisError> {
     }
 }
 
+/// Send several Ethernet frames via the bound RNDIS device in
+/// one bulk-OUT transfer, as a multipacket batch built by
+/// [`encode_multipacket_tx`] against the negotiated
+/// `PacketAlignmentFactor`, `MaxPacketsPerTransfer` and
+/// `MaxTransferSize`.
+///
+/// This is an explicit batching API for callers that hold
+/// several frames at once. The net stack's per-frame send
+/// path ([`send_frame`]) stays single-packet: frames are
+/// never implicitly queued, so no caller can have a frame
+/// delayed by a batching window.
+pub fn send_frames_batched(idx: usize, frames: &[&[u8]]) -> Result<usize, RndisError> {
+    let (slot_id, bulk_out_dci, alignment_factor, max_packets, max_transfer, max_frame) = {
+        let g = RNDIS_DEVICES.lock();
+        let dev = g
+            .get(idx)
+            .filter(|d| !d.detached)
+            .ok_or(RndisError::NotBound)?;
+        (
+            dev.slot_id,
+            dev.bulk_out_dci,
+            dev.packet_alignment_factor,
+            dev.max_packets_per_transfer,
+            dev.max_transfer_size,
+            dev.max_frame_size,
+        )
+    };
+    let batch = encode_multipacket_tx(
+        frames,
+        alignment_factor,
+        max_packets,
+        max_transfer,
+        max_frame,
+    )?;
+    let c = controller_of(idx).ok_or(RndisError::NoController)?;
+    let outcome =
+        narf_scheduler::block_on(async move { c.bulk_out(slot_id, bulk_out_dci, &batch).await });
+    match outcome {
+        Ok(n) => Ok(n),
+        Err(_) => Err(RndisError::Transfer),
+    }
+}
+
 /// Pull Ethernet frames off the bound RNDIS device's bulk-IN
 /// endpoint into `scratch`, returning the frames as slices of
 /// `scratch`. One transfer may hold several frames
@@ -1893,10 +2628,10 @@ pub fn recv_frames(idx: usize, scratch: &mut [u8]) -> Result<Vec<&[u8]>, RndisEr
 
 /// Issue a `KEEPALIVE` on the control channel and wait for its
 /// completion. The request id is allocated from the device
-/// record so concurrent callers cannot reuse an id. Called
-/// from non-executor contexts (same `block_on` contract as
-/// [`send_frame`]).
-pub fn send_keepalive(idx: usize) -> Result<(), RndisError> {
+/// record so concurrent callers cannot reuse an id. This is
+/// the async core, also used by the keepalive pump; the sync
+/// trampoline is [`send_keepalive`].
+async fn send_keepalive_async(idx: usize) -> Result<(), RndisError> {
     let (slot_id, comm_iface, req_id) = {
         let mut g = RNDIS_DEVICES.lock();
         let dev = g
@@ -1908,49 +2643,54 @@ pub fn send_keepalive(idx: usize) -> Result<(), RndisError> {
     };
     let c = controller_of(idx).ok_or(RndisError::NoController)?;
     let msg = encode_keepalive_msg(req_id);
-    let outcome = narf_scheduler::block_on(async {
-        if c.control_out(
-            slot_id,
-            RT_HOST_TO_DEV_CLASS_IFACE,
-            REQ_SEND_ENCAPSULATED_COMMAND,
-            0,
-            comm_iface as u16,
-            &msg,
-        )
-        .await
-        .is_err()
+    if c.control_out(
+        slot_id,
+        RT_HOST_TO_DEV_CLASS_IFACE,
+        REQ_SEND_ENCAPSULATED_COMMAND,
+        0,
+        comm_iface as u16,
+        &msg,
+    )
+    .await
+    .is_err()
+    {
+        return Err(RndisError::Transfer);
+    }
+    let mut buf = [0u8; 64];
+    for _ in 0..MAX_RESPONSE_POLLS {
+        match c
+            .control_in(
+                slot_id,
+                RT_DEV_TO_HOST_CLASS_IFACE,
+                REQ_GET_ENCAPSULATED_RESPONSE,
+                0,
+                comm_iface as u16,
+                &mut buf,
+            )
+            .await
         {
-            return Err(RndisError::Transfer);
-        }
-        let mut buf = [0u8; 64];
-        for _ in 0..MAX_RESPONSE_POLLS {
-            match c
-                .control_in(
-                    slot_id,
-                    RT_DEV_TO_HOST_CLASS_IFACE,
-                    REQ_GET_ENCAPSULATED_RESPONSE,
-                    0,
-                    comm_iface as u16,
-                    &mut buf,
-                )
-                .await
-            {
-                Ok(n) if n >= 16 => {
-                    let got = &buf[..n];
-                    if let Ok((CMPLT_KEEPALIVE, _)) = message_prefix(got) {
-                        if request_id(got).ok() == Some(req_id) {
-                            return decode_keepalive_complete(got, req_id).map(|_| ());
-                        }
+            Ok(n) if n >= 16 => {
+                let got = &buf[..n];
+                if let Ok((CMPLT_KEEPALIVE, _)) = message_prefix(got) {
+                    if request_id(got).ok() == Some(req_id) {
+                        return decode_keepalive_complete(got, req_id).map(|_| ());
                     }
                 }
-                Ok(_) => {}
-                Err(_) => {}
             }
-            narf_scheduler::yield_now().await;
+            Ok(_) => {}
+            Err(_) => {}
         }
-        Err(RndisError::Transfer)
-    });
-    outcome
+        narf_scheduler::yield_now().await;
+    }
+    Err(RndisError::Transfer)
+}
+
+/// Issue a `KEEPALIVE` on the control channel and wait for its
+/// completion. Called from non-executor contexts (same
+/// `block_on` contract as [`send_frame`]); the keepalive pump
+/// calls [`send_keepalive_async`] directly instead.
+pub fn send_keepalive(idx: usize) -> Result<(), RndisError> {
+    narf_scheduler::block_on(send_keepalive_async(idx))
 }
 
 /// Detach hook for a slot: tombstone every RNDIS record bound
@@ -1990,6 +2730,9 @@ pub fn detach_rndis_slot(controller: u8, slot_id: u8) -> Result<(), ()> {
         {
             dev.detached = true;
             dev.pump_running = false;
+            dev.notif_running = false;
+            dev.keepalive_running = false;
+            dev.recovering = false;
             names.push(dev.iface_name.clone());
         }
         names
@@ -2017,6 +2760,9 @@ pub fn detach_all_rndis(controller: u8) {
         {
             dev.detached = true;
             dev.pump_running = false;
+            dev.notif_running = false;
+            dev.keepalive_running = false;
+            dev.recovering = false;
             names.push(dev.iface_name.clone());
         }
         names
@@ -2067,10 +2813,23 @@ impl RndisIface {
         Some(Self { idx, mac: dev.mac })
     }
 
+    /// Which RNDIS wire shape this device presented
+    /// ([`RndisVariant`]). `None` if the record is detached.
+    pub fn variant(&self) -> Option<RndisVariant> {
+        let g = RNDIS_DEVICES.lock();
+        g.get(self.idx).filter(|d| !d.detached).map(|d| d.variant)
+    }
+
     /// Send `eth_frame` via the bound RNDIS device, wrapped in
     /// a single `PACKET_MSG` (see [`send_frame`]).
     pub fn send(&self, eth_frame: &[u8]) -> Result<usize, RndisError> {
         send_frame(self.idx, eth_frame)
+    }
+
+    /// Send several frames in one bulk-OUT transfer, as a
+    /// multipacket batch (see [`send_frames_batched`]).
+    pub fn send_batched(&self, frames: &[&[u8]]) -> Result<usize, RndisError> {
+        send_frames_batched(self.idx, frames)
     }
 
     /// Receive the next frames off the bulk-IN endpoint.
@@ -2088,14 +2847,38 @@ impl RndisIface {
 
 // ── Class-registry wiring ────────────────────────────────────────────
 
-pub static RNDIS_MATCH: [crate::class_registry::UsbClassMatch; 1] = [
-    // Class 2 (Comm), Subclass 2 (ACM), Protocol 0xFF (RNDIS).
+pub static RNDIS_MATCH: [crate::class_registry::UsbClassMatch; 4] = [
+    // Classic: Class 2 (Comm), Subclass 2 (ACM), Protocol 0xFF.
     crate::class_registry::UsbClassMatch {
         vendor_id: 0,
         product_id: 0,
         class: Some(2),
         subclass: Some(2),
         protocol: Some(0xFF),
+    },
+    // Wireless: Class 0xE0, Subclass 1 (RF), Protocol 3.
+    crate::class_registry::UsbClassMatch {
+        vendor_id: 0,
+        product_id: 0,
+        class: Some(0xE0),
+        subclass: Some(1),
+        protocol: Some(3),
+    },
+    // ActiveSync: Class 0xEF (Misc), Subclass 1, Protocol 1.
+    crate::class_registry::UsbClassMatch {
+        vendor_id: 0,
+        product_id: 0,
+        class: Some(0xEF),
+        subclass: Some(1),
+        protocol: Some(1),
+    },
+    // Misc WWAN: Class 0xEF (Misc), Subclass 4, Protocol 1.
+    crate::class_registry::UsbClassMatch {
+        vendor_id: 0,
+        product_id: 0,
+        class: Some(0xEF),
+        subclass: Some(4),
+        protocol: Some(1),
     },
 ];
 
@@ -2133,11 +2916,21 @@ pub mod tests {
     // ── Modelled descriptors ─────────────────────────────────────────
 
     fn modelled_rndis_cfg() -> Vec<u8> {
+        modelled_rndis_cfg_with_triple(0x02, 0x02, 0xFF)
+    }
+
+    /// Same modelled config, but with the Comm interface
+    /// carrying the given (class, subclass, protocol) triple
+    /// — the wireless / ActiveSync / Misc-WWAN shapes are the
+    /// classic layout with a different triple (Linux
+    /// `rndis_host.c`: the wireless pair is `e0/01/03` +
+    /// `10/00/00`, i.e. the same CDC-Data interface).
+    fn modelled_rndis_cfg_with_triple(class: u8, subclass: u8, protocol: u8) -> Vec<u8> {
         #[rustfmt::skip]
         let cfg: &[u8] = &[
             9, 2, 0, 0, 2, 1, 0, 0x80, 0x32, // config (len patched below)
-            // Comm interface 0, class 2 / subclass ACM / protocol RNDIS, 1 endpoint
-            9, 4, 0, 0, 1, 0x02, 0x02, 0xFF, 0,
+            // Comm interface 0, class / subclass / protocol, 1 endpoint
+            9, 4, 0, 0, 1, class, subclass, protocol, 0,
             // Header functional descriptor, CDC 1.2
             5, 0x24, 0x00, 0x20, 0x01,
             // Union { ctrl=0, sub=1 }
@@ -2202,6 +2995,13 @@ pub mod tests {
         fail_initialize: bool,
         fail_current_address: bool,
         current_address_invalid: bool,
+        /// `AddressingReset` the fake reports in `RESET_CMPLT`
+        /// (default true: pins the addressing-reconfigure path
+        /// of recovery — the re-bring-up must re-SET the
+        /// packet filter).
+        addressing_reset: bool,
+        /// Answer `RESET` with a failure status.
+        fail_reset: bool,
     }
 
     impl FakeRndisDevice {
@@ -2217,6 +3017,8 @@ pub mod tests {
                 fail_initialize: false,
                 fail_current_address: false,
                 current_address_invalid: false,
+                addressing_reset: true,
+                fail_reset: false,
             }
         }
 
@@ -2295,8 +3097,16 @@ pub mod tests {
                     let mut out = alloc::vec![0u8; 16];
                     put_u32le(&mut out, 0, CMPLT_RESET);
                     put_u32le(&mut out, 4, 16);
-                    put_u32le(&mut out, 8, STATUS_SUCCESS);
-                    put_u32le(&mut out, 12, 0);
+                    put_u32le(
+                        &mut out,
+                        8,
+                        if self.fail_reset {
+                            STATUS_FAILURE
+                        } else {
+                            STATUS_SUCCESS
+                        },
+                    );
+                    put_u32le(&mut out, 12, u32::from(self.addressing_reset));
                     out
                 }
                 _ => Vec::new(),
@@ -2341,6 +3151,23 @@ pub mod tests {
             bringup.handle_response(&resp)?;
         }
         Ok(bringup)
+    }
+
+    /// Drive a reset recovery against the fake device,
+    /// request by request: `RESET` → `RESET_CMPLT` → the
+    /// full bring-up exchange again, exactly as the async
+    /// recovery loop does over xHCI.
+    fn drive_recovery(fake: &FakeRndisDevice) -> Result<RndisRecovery, RndisError> {
+        let mut recovery = RndisRecovery::new(HOST_MAX_TRANSFER_SIZE);
+        while !recovery.is_done() {
+            let req = recovery.next_request().ok_or(RndisError::BadMessageType)?;
+            let resp = fake.handle(&req);
+            if resp.is_empty() {
+                return Err(RndisError::Transfer);
+            }
+            recovery.handle_response(&resp)?;
+        }
+        Ok(recovery)
     }
 
     // ── Message-layer fixtures ─────────────────────────────────────
@@ -2720,7 +3547,7 @@ pub mod tests {
             return TestResult::Fail("RNDIS data alt setting not found");
         }
         // Notification endpoint on the Comm interface.
-        let notif = match find_rndis_notif_endpoint(&cfg, 0) {
+        let notif = match find_rndis_notif_endpoint(&cfg, 0, USB_CLASS_CDC_COMM) {
             Some(n) => n,
             None => return TestResult::Fail("RNDIS notification endpoint not found"),
         };
@@ -2870,4 +3697,235 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/rndis", smoke_rndis_tx_frame_cap);
+
+    // ── #1517 remainders ─────────────────────────────────────────────
+
+    fn smoke_rndis_variant_matching() -> TestResult {
+        // The match table holds exactly the four triples from
+        // Linux rndis_host.c products[] + the ActiveSync
+        // triple from #1517 — and the table agrees with the
+        // variant mapping, so a table/finder drift cannot
+        // silently drop a variant.
+        if RNDIS_VARIANTS.len() != 4 {
+            return TestResult::Fail("RNDIS_VARIANTS must hold four triples");
+        }
+        for &(c, s, p, v) in RNDIS_VARIANTS.iter() {
+            if rndis_variant_of(c, s, p) != Some(v) || v.triple() != (c, s, p) {
+                return TestResult::Fail("RNDIS_VARIANTS disagrees with rndis_variant_of");
+            }
+            if !RNDIS_MATCH
+                .iter()
+                .any(|m| m.class == Some(c) && m.subclass == Some(s) && m.protocol == Some(p))
+            {
+                return TestResult::Fail("RNDIS_MATCH is missing a variant triple");
+            }
+        }
+        // Each variant's modelled config is found, with the
+        // right variant, and its bulk pair + notification
+        // endpoint resolve under its own Comm class.
+        let cases: [(u8, u8, u8, RndisVariant); 4] = [
+            (0x02, 0x02, 0xFF, RndisVariant::Classic),
+            (0xE0, 0x01, 0x03, RndisVariant::Wireless),
+            (0xEF, 0x01, 0x01, RndisVariant::ActiveSync),
+            (0xEF, 0x04, 0x01, RndisVariant::MiscWwan),
+        ];
+        for (class, sub, proto, want) in cases {
+            let cfg = modelled_rndis_cfg_with_triple(class, sub, proto);
+            if find_rndis_comm_interface_full(&cfg) != Some((0, want)) {
+                return TestResult::Fail("variant config not matched with the right variant");
+            }
+            if find_rndis_comm_interface(&cfg) != Some(0) {
+                return TestResult::Fail("variant comm interface not found");
+            }
+            if find_rndis_bulk_endpoints(&cfg, 0).is_none() {
+                return TestResult::Fail("variant bulk pair not found");
+            }
+            if find_rndis_notif_endpoint(&cfg, 0, class).is_none() {
+                return TestResult::Fail("variant notification endpoint not found");
+            }
+        }
+        // Negatives: Bluetooth (0xE0/0x01/0x01) and a plain
+        // ACM modem (0x02/0x02/0x01) must NOT match — the
+        // protocol byte is the separator.
+        let bt = modelled_rndis_cfg_with_triple(0xE0, 0x01, 0x01);
+        if find_rndis_comm_interface(&bt).is_some() {
+            return TestResult::Fail("Bluetooth triple must not match RNDIS finder");
+        }
+        if rndis_variant_of(0xE0, 0x01, 0x01).is_some() {
+            return TestResult::Fail("Bluetooth triple must not map to a variant");
+        }
+        let modem = modelled_rndis_cfg_with_triple(0x02, 0x02, 0x01);
+        if find_rndis_comm_interface(&modem).is_some() {
+            return TestResult::Fail("ACM modem triple must not match RNDIS finder");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/rndis", smoke_rndis_variant_matching);
+
+    fn smoke_rndis_multipacket_tx_encode() -> TestResult {
+        // Three frames, alignment factor 2 (align 4): the
+        // fake negotiates factor 3, so use its values as the
+        // realistic case below; here the numbers are chosen
+        // so the padding is visible by hand.
+        let f1 = [0xAAu8; 60];
+        let f2 = [0xBBu8; 61];
+        let f3 = [0xCCu8; 100];
+        let frames: [&[u8]; 3] = [&f1, &f2, &f3];
+        let batch = match encode_multipacket_tx(&frames, 2, 8, 16384, 1518) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("multipacket TX encode failed"),
+        };
+        // Element 1: 44 + 60 = 104, already a multiple of 4:
+        // no padding. Element 2: 44 + 61 = 105 → padded to
+        // 108. Element 3 (last): 44 + 100 = 144, no padding.
+        if batch.len() != 104 + 108 + 144 {
+            return TestResult::Fail("multipacket TX total length wrong");
+        }
+        // The padding is inside element 2's MessageLength, so
+        // a receiver walking by MessageLength lands exactly
+        // on element 3 — the round-trip through the RX walker
+        // is what proves the padding rule.
+        let mut walked: Vec<&[u8]> = Vec::new();
+        if !parse_multipacket(&batch, &mut walked) {
+            return TestResult::Fail("multipacket TX batch does not walk cleanly");
+        }
+        if walked.len() != 3 || walked[0] != &f1[..] || walked[1] != &f2[..] || walked[2] != &f3[..]
+        {
+            return TestResult::Fail("multipacket TX round-trip frames differ");
+        }
+        // Factor 0 (alignment 1): no padding at all.
+        let batch0 = match encode_multipacket_tx(&frames, 0, 8, 16384, 1518) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("factor-0 multipacket TX failed"),
+        };
+        if batch0.len() != (44 + 60) + (44 + 61) + (44 + 100) {
+            return TestResult::Fail("factor-0 batch must have no padding");
+        }
+        // One frame: byte-identical to the single-packet
+        // encoder, whatever the factor.
+        let single = match encode_multipacket_tx(&[&f1[..]], 3, 8, 16384, 1518) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("single-frame batch failed"),
+        };
+        if single != encode_packet_msg(&f1) {
+            return TestResult::Fail("single-frame batch differs from encode_packet_msg");
+        }
+        // Caps: count, transfer size, frame size, empty.
+        if !matches!(
+            encode_multipacket_tx(&frames, 2, 2, 16384, 1518),
+            Err(RndisError::BatchTooLarge)
+        ) {
+            return TestResult::Fail("batch over MaxPacketsPerTransfer accepted");
+        }
+        if !matches!(
+            encode_multipacket_tx(&frames, 2, 8, 200, 1518),
+            Err(RndisError::BatchTooLarge)
+        ) {
+            return TestResult::Fail("batch over MaxTransferSize accepted");
+        }
+        let big = [0u8; 1519];
+        if !matches!(
+            encode_multipacket_tx(&[&big[..]], 2, 8, 16384, 1518),
+            Err(RndisError::FrameTooLarge)
+        ) {
+            return TestResult::Fail("oversize frame in batch not refused");
+        }
+        let empty: [&[u8]; 0] = [];
+        if !matches!(
+            encode_multipacket_tx(&empty, 2, 8, 16384, 1518),
+            Err(RndisError::BadLength)
+        ) {
+            return TestResult::Fail("empty batch accepted");
+        }
+        // Realistic case: the fake's negotiated values
+        // (factor 3 → align 8, 8 packets, 16384 bytes).
+        let fake = FakeRndisDevice::new();
+        let many: [&[u8]; 4] = [&f1, &f2, &f3, &f1];
+        let real = match encode_multipacket_tx(
+            &many,
+            fake.packet_alignment_factor,
+            fake.max_packets_per_transfer,
+            fake.max_transfer_size,
+            fake.max_frame_size,
+        ) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("batch under fake-negotiated values failed"),
+        };
+        let mut walked2: Vec<&[u8]> = Vec::new();
+        if !parse_multipacket(&real, &mut walked2) || walked2.len() != 4 {
+            return TestResult::Fail("fake-negotiated batch does not round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/rndis", smoke_rndis_multipacket_tx_encode);
+
+    fn smoke_rndis_recovery_end_to_end() -> TestResult {
+        let fake = FakeRndisDevice::new();
+        let recovery = match drive_recovery(&fake) {
+            Ok(r) => r,
+            Err(_) => return TestResult::Fail("recovery against spec fake failed"),
+        };
+        if !recovery.is_done() {
+            return TestResult::Fail("recovery did not finish");
+        }
+        // The fake reports AddressingReset=1: the re-bring-up
+        // must have run to data-initialized (its filter SET
+        // is the addressing re-send the spec requires).
+        if !recovery.addressing_reset() {
+            return TestResult::Fail("recovery missed the fake's AddressingReset=1");
+        }
+        if recovery.mac() != Some(fake.mac) {
+            return TestResult::Fail("recovered MAC differs from fake device MAC");
+        }
+        let n = match recovery.negotiated() {
+            Some(n) => n,
+            None => return TestResult::Fail("recovery has no negotiated parameters"),
+        };
+        if n.medium != MEDIUM_802_3
+            || n.device_flags != DF_CONNECTIONLESS
+            || n.max_packets_per_transfer != fake.max_packets_per_transfer
+            || n.max_transfer_size != fake.max_transfer_size
+            || n.packet_alignment_factor != fake.packet_alignment_factor
+            || n.max_frame_size != fake.max_frame_size
+            || n.media_connected != Some(true)
+        {
+            return TestResult::Fail("re-negotiated parameters differ from fake device");
+        }
+        // A failed RESET_CMPLT aborts the recovery instead
+        // of running bring-up against an un-reset device.
+        let mut failing = FakeRndisDevice::new();
+        failing.fail_reset = true;
+        if drive_recovery(&failing).is_ok() {
+            return TestResult::Fail("failed RESET_CMPLT did not abort recovery");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/rndis", smoke_rndis_recovery_end_to_end);
+
+    fn smoke_rndis_keepalive_policy() -> TestResult {
+        // [MS-RNDIS] §3.1.1.2 SHOULD values for a USB bus:
+        // KeepAliveTimer 5 s, ControlTimeoutTimer 10 s.
+        if RNDIS_KEEPALIVE_INTERVAL_MS != 5_000 {
+            return TestResult::Fail("KeepAliveTimer interval is not the spec 5 s");
+        }
+        if RNDIS_CONTROL_TIMEOUT_MS != 10_000 {
+            return TestResult::Fail("ControlTimeoutTimer is not the spec 10 s");
+        }
+        if MAX_RECOVERY_ATTEMPTS != 3 {
+            return TestResult::Fail("recovery budget is not 3 attempts");
+        }
+        for used in 0..MAX_RECOVERY_ATTEMPTS {
+            if !recovery_attempt_allowed(used) {
+                return TestResult::Fail("recovery wrongly disallowed inside the budget");
+            }
+        }
+        if recovery_attempt_allowed(MAX_RECOVERY_ATTEMPTS) {
+            return TestResult::Fail("recovery wrongly allowed past the budget");
+        }
+        if MAX_CONSECUTIVE_RX_ERRORS != 16 {
+            return TestResult::Fail("RX error bound changed from the established 16");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/rndis", smoke_rndis_keepalive_policy);
 }
