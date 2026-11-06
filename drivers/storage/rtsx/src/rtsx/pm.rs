@@ -229,10 +229,8 @@ fn suspend_all() -> Result<(), DeviceSuspendError> {
     // power-off failure aborts the suspend (Busy) instead of
     // powering down over a live card. The flag stays set and the
     // orchestrator's abort path runs the resume handlers.
-    if !matches!(ctrl.sd_slot, SlotState::Empty) {
-        if ctrl.disable_sd_slot().is_err() {
-            return Err(DeviceSuspendError::Busy);
-        }
+    if !matches!(ctrl.sd_slot, SlotState::Empty) && ctrl.disable_sd_slot().is_err() {
+        return Err(DeviceSuspendError::Busy);
     }
     chip_power_down(ctrl);
     Ok(())
@@ -313,7 +311,8 @@ mod tests {
         SSC_POWER_DOWN,
     };
     use super::super::{
-        __install_for_test, __reset_for_test as reset_controller, poll_card_slot, with_controller,
+        RtsxTransport, __install_for_test, __reset_for_test as reset_controller, poll_card_slot,
+        with_controller,
     };
     use super::*;
 
