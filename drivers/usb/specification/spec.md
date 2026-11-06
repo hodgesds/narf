@@ -382,6 +382,27 @@ also consult upstream Linux GPL sources.
   `USBDevice` bulk operations reject stale slot generations. Periodic transfer
   methods cannot target bulk endpoints. The xHCI layer owns DMA cache
   maintenance and device barriers, including outer-shareable ordering on ARM.
+- Isochronous transfers (`Xhci::isoch_in` / `Xhci::isoch_out`, #885) carry
+  the same completion-identity contract as bulk: `begin_isoch_in` /
+  `begin_isoch_out` submit one 1..4096-byte Isoch TD (SIA, IOC set,
+  xHCI 1.2 §6.4.1.3) and return an `IsochToken` naming the slot
+  generation, endpoint, private submission serial, direction, and
+  originating Isoch TRB; only that TRB's exact Transfer Event
+  (§6.4.2.1: TRB Pointer, Completion Code, residue) can retire the
+  submission, latched into the endpoint's own owner state by the
+  event demux — never the lossy shared transfer-event queue. Short
+  Packet (CC 13) is a normal completion in either direction for
+  isochronous transfers. At most one isoch TD is in flight per
+  endpoint; a second begin is `NotReady` before touching the scratch
+  page or ring. The compatibility `isoch_in` / `isoch_out` wait the
+  token, and on timeout retire the posted TRB first — Stop Endpoint
+  + Set TR Dequeue Pointer via the same coordinator as `stop_bulk`
+  (`Xhci::stop_isoch`, also callable directly) — then report the
+  timeout, so a late completion can never alias the next transfer.
+  A failed stop keeps the endpoint claim closed rather than risking
+  silent misattribution. Multi-TRB isoch pipelining (depth > 1) is
+  out of scope here: the one-shot path stays depth-1, which is what
+  the UVC pump seam (#1672) advertises.
 - `Xhci::configure_endpoints` accepts new, distinct endpoint DCIs and refuses
   replacement of an existing endpoint without quiescence. It serializes slot
   configuration with new bulk submissions and preserves the highest existing

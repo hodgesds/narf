@@ -82,7 +82,7 @@ mod event_wait;
 #[cfg(feature = "kernel-test")]
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
-pub use bulk_owner::{Direction as BulkDirection, Token as BulkToken};
+pub use bulk_owner::{Direction as BulkDirection, Token as BulkToken, Token as IsochToken};
 pub mod cap;
 pub mod cmd_ring;
 pub mod dcbaa;
@@ -604,6 +604,12 @@ pub struct Device {
 #[derive(Debug)]
 pub struct EndpointState {
     bulk: bulk_owner::State,
+    /// One retained isochronous TD per endpoint (#885). The bulk
+    /// state is never begun on an isochronous endpoint (its kind
+    /// check refuses it), so isochronous completions get their own
+    /// owner state: pointer-matched latching, one-in-flight
+    /// exclusion, and the Stop + Set TR Dequeue retirement path.
+    isoch: bulk_owner::State,
     pub dci: u8,
     pub max_packet: u16,
     pub kind: EndpointKind,
@@ -2498,7 +2504,18 @@ impl Xhci {
             .eps
             .get_mut(usize::from(dci - 2))
             .and_then(Option::as_mut)
-            .is_some_and(|endpoint| endpoint.bulk.record(event))
+            .is_some_and(|endpoint| {
+                // Isochronous endpoints latch into their own owner
+                // state (#885); every other non-control endpoint
+                // uses the bulk state. The kind is fixed at
+                // configure time, so exactly one state can hold a
+                // pending TD for this endpoint.
+                if endpoint.kind.is_isochronous() {
+                    endpoint.isoch.record(event)
+                } else {
+                    endpoint.bulk.record(event)
+                }
+            })
     }
 
     fn take_matching_event(
@@ -2526,6 +2543,13 @@ impl Xhci {
                 for endpoint in device.eps.iter_mut().flatten() {
                     if let Some(event) =
                         endpoint.bulk.take_matching(predicate).map_err(bulk_error)?
+                    {
+                        return Ok(Some(event));
+                    }
+                    if let Some(event) = endpoint
+                        .isoch
+                        .take_matching(predicate)
+                        .map_err(bulk_error)?
                     {
                         return Ok(Some(event));
                     }
@@ -4479,6 +4503,7 @@ impl Xhci {
             tr.sync(0, tr.len());
             new_eps.push(EndpointState {
                 bulk: bulk_owner::State::new(),
+                isoch: bulk_owner::State::new(),
                 dci,
                 max_packet: params.max_packet,
                 kind: ep.kind,
@@ -4632,79 +4657,6 @@ impl Xhci {
         Ok(())
     }
 
-    /// Enqueue an Isoch TRB on the slot/dci endpoint. Same ring +
-    /// link-wrap logic as `ep_enqueue_normal`; differs only in the
-    /// TRB type (5 = Isoch) and the SIA bit set so the controller
-    /// schedules in the next available frame instead of waiting
-    /// for a host-specified Frame ID. TBC/TLBPC stay 0 (single
-    /// burst, single packet per burst) — enough for the bring-up
-    /// targets that use 1-packet-per-bInterval (USB 2.0 full-speed).
-    fn ep_enqueue_isoch(&self, slot_id: u8, dci: u8, phys: u64, len: u32) -> Result<(), XhciError> {
-        let mut g = self.devices.lock();
-        let dev = g
-            .get_mut(slot_id as usize)
-            .and_then(|s| s.as_mut())
-            .ok_or(XhciError::CmdFailed(0xFC))?;
-        let idx = (dci as usize).saturating_sub(2);
-        let ep = dev
-            .eps
-            .get_mut(idx)
-            .and_then(|s| s.as_mut())
-            .ok_or(XhciError::CmdFailed(0xFA))?;
-        // Link-wrap (mirrors the Normal path).
-        if ep.enq == CTRL_TR_TRBS - 1 {
-            let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
-            let link_addr = ep.tr.dma_addr().raw() + link_off;
-            let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
-            // SAFETY: identity-mapped DMA, offset in-page.
-            unsafe {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(link_addr + 12).kernel_mut_ptr::<u32>(),
-                    link_d3,
-                );
-            }
-            compiler_fence(Ordering::SeqCst);
-            ep.enq = 0;
-            ep.pcs ^= 1;
-        }
-        let trb_off = (ep.enq * 16) as u64;
-        let trb_addr = ep.tr.dma_addr().raw() + trb_off;
-        // Iso TRB d3:
-        //   bit 0 = cycle (matches ep.pcs)
-        //   bit 5 = IOC (interrupt on completion)
-        //   bits 10-15 = TRB Type (5 = Isoch)
-        //   bit 31 = SIA (Start Isochronous ASAP)
-        // TBC (bits 7-8), TLBPC (bits 16-19), Frame ID (bits 20-30)
-        // all stay 0.
-        let d3 = (TRB_TYPE_ISOCH << TRB_TYPE_SHIFT) | TRB_IOC | TRB_SIA | (ep.pcs & TRB_CYCLE_BIT);
-        // SAFETY: identity-mapped DMA; offset in-page.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(trb_addr).kernel_mut_ptr::<u32>(),
-                phys as u32,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(trb_addr + 4).kernel_mut_ptr::<u32>(),
-                (phys >> 32) as u32,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(trb_addr + 8).kernel_mut_ptr::<u32>(),
-                len,
-            );
-        }
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: same.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(trb_addr + 12).kernel_mut_ptr::<u32>(),
-                d3,
-            );
-        }
-        compiler_fence(Ordering::SeqCst);
-        ep.enq += 1;
-        Ok(())
-    }
-
     /// Submit a single iso-OUT transfer (host→device, e.g. UAC PCM
     /// playback packet). Caller's `data` is staged into the
     /// per-endpoint persistent DMA buffer; controller picks the
@@ -4715,96 +4667,283 @@ impl Xhci {
     /// many iso TRBs and doesn't wait per-packet; this one-shot
     /// variant is the building block + the path the test smokes
     /// exercise.
+    ///
+    /// Completion identity (#885): the wait pointer-matches the
+    /// originating Isoch TRB (not just type + slot + DCI), at most
+    /// one isoch TD is in flight per endpoint, and a timeout
+    /// retires the posted TRB (Stop Endpoint + Set TR Dequeue
+    /// Pointer) before the timeout is reported, so a late
+    /// completion can never alias the next transfer.
     pub async fn isoch_out(&self, slot_id: u8, dci: u8, data: &[u8]) -> Result<usize, XhciError> {
         if data.is_empty() || data.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
-        let phys = self.ep_dma_phys(slot_id, dci, EndpointKind::IsochOut)?;
-        // SAFETY: identity-mapped DMA page; size bounded above.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
-                data.len(),
-            );
+        let generation = self
+            .device_generation(slot_id)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        let token = self.begin_isoch_out(slot_id, dci, generation, data)?;
+        match self.wait_isoch_out(&token).await {
+            Ok(n) => Ok(n),
+            Err(XhciError::CmdTimeout) => {
+                self.retire_timed_out_isoch(&token).await;
+                Err(XhciError::CmdTimeout)
+            }
+            Err(error) => Err(error),
         }
-        compiler_fence(Ordering::SeqCst);
-        self.ep_enqueue_isoch(slot_id, dci, phys, data.len() as u32)?;
-        self.ring_slot_doorbell(slot_id, dci as u32);
-        // Wait for the Transfer Event (slot + ep filter, same shape
-        // as bulk_out).
-        let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
-        let want_slot = (slot_id as u32) << 24;
-        let want_ep = (dci as u32) << 16;
-        let ev = self
-            .await_event(|t| {
-                (t[3] & TRB_TYPE_MASK) == xfer
-                    && (t[3] & 0xFF00_0000) == want_slot
-                    && (t[3] & 0x001F_0000) == want_ep
-            })
-            .await?;
-        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
-        // CC 1 = Success; CC 13 = Short Packet (acceptable on iso
-        // OUT — controller transmitted fewer bytes than requested
-        // because the device's iso budget for this frame was
-        // smaller, common on under-clocked endpoints).
-        if ccode != 1 && ccode != 13 {
-            return Err(XhciError::CmdFailed(ccode));
-        }
-        let residue = ev[2] & 0x00FF_FFFF;
-        Ok((data.len() as u32).saturating_sub(residue) as usize)
     }
 
     /// Submit a single iso-IN transfer (device→host, e.g. UVC
     /// frame packet, UAC mic capture packet). Posts a receive
     /// buffer + waits for the Transfer Event; returns bytes
     /// received into `out`.
+    ///
+    /// Same completion-identity contract as [`Xhci::isoch_out`]:
+    /// pointer-matched wait, one TD in flight per endpoint, and
+    /// Stop + Set TR Dequeue retirement of the posted TRB on
+    /// timeout (#885).
     pub async fn isoch_in(&self, slot_id: u8, dci: u8, out: &mut [u8]) -> Result<usize, XhciError> {
         if out.is_empty() || out.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
-        let phys = self.ep_dma_phys(slot_id, dci, EndpointKind::IsochIn)?;
-        // Zero only the prefix we'll read — stale data in the
-        // persistent buffer mustn't masquerade as device payload.
-        // SAFETY: identity-mapped DMA page; bounds-checked above.
-        unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
-                0,
-                out.len(),
-            );
+        let generation = self
+            .device_generation(slot_id)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        let token = self.begin_isoch_in(slot_id, dci, generation, out.len())?;
+        match self.wait_isoch_in(&token, out).await {
+            Ok(n) => Ok(n),
+            Err(XhciError::CmdTimeout) => {
+                self.retire_timed_out_isoch(&token).await;
+                Err(XhciError::CmdTimeout)
+            }
+            Err(error) => Err(error),
         }
-        self.ep_enqueue_isoch(slot_id, dci, phys, out.len() as u32)?;
-        self.ring_slot_doorbell(slot_id, dci as u32);
-        let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
-        let want_slot = (slot_id as u32) << 24;
-        let want_ep = (dci as u32) << 16;
-        let ev = self
-            .await_event(|t| {
-                (t[3] & TRB_TYPE_MASK) == xfer
-                    && (t[3] & 0xFF00_0000) == want_slot
-                    && (t[3] & 0x001F_0000) == want_ep
-            })
-            .await?;
-        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
-        if ccode != 1 && ccode != 13 {
-            return Err(XhciError::CmdFailed(ccode));
+    }
+
+    /// Retire a timed-out isoch TD: Stop Endpoint + Set TR Dequeue
+    /// Pointer, queued-event purge, claim release — the same
+    /// coordinator as [`Xhci::stop_bulk`]. Without it the posted
+    /// Isoch TRB stays live, still pointing at the endpoint's
+    /// single shared DMA page, and its late completion would
+    /// satisfy the next transfer's wait (#885). Best-effort by
+    /// design: a failed stop keeps the endpoint claim closed
+    /// (`NotReady` on the next call) rather than risking silent
+    /// misattribution, and the timeout stays the reported error.
+    async fn retire_timed_out_isoch(&self, token: &IsochToken) {
+        let _ = self.stop_isoch(token).await;
+    }
+
+    /// Begin one bounded isoch TD. Mirrors [`Xhci::begin_bulk`]:
+    /// the endpoint retains its DMA page until the exact
+    /// originating Isoch TRB completes; dropping the receipt is
+    /// not a cancellation or permission to overwrite that page.
+    /// A second begin while one is in flight is `NotReady`
+    /// (one-in-flight exclusion, #885).
+    fn begin_isoch(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        generation: u64,
+        direction: BulkDirection,
+        length: usize,
+        data: &[u8],
+    ) -> Result<IsochToken, XhciError> {
+        if !(2..=31).contains(&dci)
+            || !(1..=4096).contains(&length)
+            || (direction == BulkDirection::Out && data.len() != length)
+        {
+            return Err(XhciError::CmdFailed(0xF9));
         }
-        let residue = ev[2] & 0x00FF_FFFF;
-        let xferred = (out.len() as u32).saturating_sub(residue) as usize;
-        let copy = xferred.min(out.len());
-        for (i, slot) in out[..copy].iter_mut().enumerate() {
-            // SAFETY: `phys` is this endpoint's identity-mapped DMA
-            // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
-            // read inside that page, aligned for a `u8`.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            *slot = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_ptr::<u8>(),
-                )
+        let token = {
+            let mut devices = self.devices.lock();
+            let device = devices
+                .get_mut(slot_id as usize)
+                .and_then(Option::as_mut)
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            if generation == 0 || device.generation != generation {
+                return Err(XhciError::CmdFailed(0xFD));
+            }
+            if device.endpoint_configuration {
+                return Err(XhciError::NotReady);
+            }
+            let ep = device
+                .eps
+                .get_mut(usize::from(dci - 2))
+                .and_then(Option::as_mut)
+                .ok_or(XhciError::CmdFailed(0xFA))?;
+            let expected = match direction {
+                BulkDirection::In => EndpointKind::IsochIn,
+                BulkDirection::Out => EndpointKind::IsochOut,
             };
+            if ep.kind != expected {
+                return Err(XhciError::CmdFailed(0xF8));
+            }
+            let EndpointState {
+                isoch,
+                tr,
+                dma_buf,
+                pcs,
+                enq,
+                ..
+            } = ep;
+            isoch
+                .begin(
+                    bulk_owner::Endpoint {
+                        generation,
+                        slot: slot_id,
+                        dci,
+                    },
+                    direction,
+                    length,
+                    || {
+                        // SAFETY: the ownership claim is recorded before this closure;
+                        // a single endpoint owns this page, and length is <= 4096.
+                        unsafe {
+                            if direction == BulkDirection::In {
+                                core::ptr::write_bytes(dma_buf.cpu_mut_ptr::<u8>(), 0, length);
+                            } else {
+                                core::ptr::copy_nonoverlapping(
+                                    data.as_ptr(),
+                                    dma_buf.cpu_mut_ptr::<u8>(),
+                                    length,
+                                );
+                            }
+                        }
+                        dma_buf.sync(0, length);
+                        device_dma_barrier();
+                        enqueue_isoch_on(tr, pcs, enq, dma_buf.dma_addr().raw(), length as u32)
+                    },
+                )
+                .map_err(bulk_error)?
+        };
+        {
+            let devices = self.devices.lock();
+            let device = devices
+                .get(usize::from(slot_id))
+                .and_then(Option::as_ref)
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            let ep = device
+                .eps
+                .get(usize::from(dci - 2))
+                .and_then(Option::as_ref)
+                .ok_or(XhciError::CmdFailed(0xFA))?;
+            ep.isoch
+                .validate(device.generation, &token)
+                .map_err(bulk_error)?;
+            self.ring_slot_doorbell(slot_id, u32::from(dci));
         }
-        Ok(xferred)
+        Ok(token)
+    }
+
+    /// Submit an iso-IN TD without imposing a receive timeout.
+    pub fn begin_isoch_in(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        generation: u64,
+        length: usize,
+    ) -> Result<IsochToken, XhciError> {
+        self.begin_isoch(slot_id, dci, generation, BulkDirection::In, length, &[])
+    }
+
+    /// Stage and submit an iso-OUT TD with retained scratch ownership.
+    pub fn begin_isoch_out(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        generation: u64,
+        data: &[u8],
+    ) -> Result<IsochToken, XhciError> {
+        self.begin_isoch(
+            slot_id,
+            dci,
+            generation,
+            BulkDirection::Out,
+            data.len(),
+            data,
+        )
+    }
+
+    /// Explicit cancellation of a retained isoch TD. A successful return
+    /// proves Stop + Set TR Dequeue completion and output-context readback;
+    /// errors/cancellation keep the endpoint/page and slot claim closed.
+    pub async fn stop_isoch(&self, token: &IsochToken) -> Result<(), XhciError> {
+        bulk_stop::run(self, token).await
+    }
+
+    fn validate_isoch(&self, token: &IsochToken) -> Result<(), XhciError> {
+        let devices = self.devices.lock();
+        let device = devices
+            .get(usize::from(token.slot()))
+            .and_then(Option::as_ref)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        let ep = device
+            .eps
+            .get(usize::from(token.endpoint() - 2))
+            .and_then(Option::as_ref)
+            .ok_or(XhciError::CmdFailed(0xFA))?;
+        ep.isoch
+            .validate(device.generation, token)
+            .map_err(bulk_error)
+    }
+
+    fn complete_isoch(
+        &self,
+        token: &IsochToken,
+        event: &[u32; 4],
+        out: Option<&mut [u8]>,
+    ) -> Result<Option<usize>, XhciError> {
+        let mut devices = self.devices.lock();
+        let device = devices
+            .get_mut(usize::from(token.slot()))
+            .and_then(Option::as_mut)
+            .ok_or(XhciError::CmdFailed(0xFD))?;
+        let ep = device
+            .eps
+            .get_mut(usize::from(token.endpoint() - 2))
+            .and_then(Option::as_mut)
+            .ok_or(XhciError::CmdFailed(0xFA))?;
+        let EndpointState { isoch, dma_buf, .. } = ep;
+        isoch
+            .complete_isoch(device.generation, token, event, |length| {
+                if let Some(out) = out {
+                    dma_buf.sync(0, token.length());
+                    device_dma_barrier();
+                    // SAFETY: the exact terminal event retires device writes;
+                    // caller capacity is checked before removing any event.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            dma_buf.cpu_ptr::<u8>(),
+                            out.as_mut_ptr(),
+                            length,
+                        );
+                    }
+                }
+            })
+            .map_err(bulk_error)
+    }
+
+    pub(crate) async fn wait_isoch_in(
+        &self,
+        token: &IsochToken,
+        out: &mut [u8],
+    ) -> Result<usize, XhciError> {
+        if token.direction() != BulkDirection::In || out.len() < token.length() {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        self.validate_isoch(token)?;
+        let event = self.await_event(|event| token.matches(event)).await?;
+        self.complete_isoch(token, &event, Some(out))?
+            .ok_or(XhciError::NotReady)
+    }
+
+    pub(crate) async fn wait_isoch_out(&self, token: &IsochToken) -> Result<usize, XhciError> {
+        if token.direction() != BulkDirection::Out {
+            return Err(XhciError::CmdFailed(0xF8));
+        }
+        self.validate_isoch(token)?;
+        let event = self.await_event(|event| token.matches(event)).await?;
+        self.complete_isoch(token, &event, None)?
+            .ok_or(XhciError::NotReady)
     }
 
     /// Begin one bounded bulk TD. The endpoint retains its DMA page until
@@ -5262,6 +5401,7 @@ impl Xhci {
             || dev.endpoint_configuration
             || ep.kind != kind
             || ep.bulk.active()
+            || ep.isoch.active()
         {
             return Err(XhciError::NotReady);
         }
@@ -5381,6 +5521,60 @@ fn enqueue_normal_on(tr: &DmaBuffer, pcs: &mut u32, enq: &mut usize, phys: u64, 
     let trb_off = (*enq * 16) as u64;
     let trb_addr = tr.dma_addr().raw() + trb_off;
     let d3 = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC | (*pcs & TRB_CYCLE_BIT);
+    // SAFETY: identity-mapped DMA; offset in-page.
+    unsafe {
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off), phys as u32);
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 4), (phys >> 32) as u32);
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 8), len);
+    }
+    tr.sync(trb_off as usize, 16);
+    device_dma_barrier();
+    // SAFETY: same.
+    unsafe {
+        core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off + 12), d3);
+    }
+    compiler_fence(Ordering::SeqCst);
+    tr.sync(trb_off as usize, 16);
+    device_dma_barrier();
+    *enq += 1;
+    trb_addr
+}
+
+/// Enqueue an Isoch TRB on a transfer ring. Same ring + link-wrap
+/// logic as [`enqueue_normal_on`]; differs only in the TRB type
+/// (5 = Isoch, xHCI 1.2 §6.4.1.3 Table 6-49) and the SIA bit set
+/// so the controller schedules in the next available frame instead
+/// of waiting for a host-specified Frame ID. TBC/TLBPC stay 0
+/// (single burst, single packet per burst) — enough for the
+/// bring-up targets that use 1-packet-per-bInterval (USB 2.0
+/// full-speed). Returns the Isoch TRB's address: the Transfer
+/// Event for this transfer points back at it (§6.4.2.1), which is
+/// what the isoch owner state pointer-matches on (#885).
+fn enqueue_isoch_on(tr: &DmaBuffer, pcs: &mut u32, enq: &mut usize, phys: u64, len: u32) -> u64 {
+    // Slot CTRL_TR_TRBS-1 is the Link TRB planted at ring
+    // construction; same wrap rule as the Normal path.
+    if *enq == CTRL_TR_TRBS - 1 {
+        let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
+        let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (*pcs & TRB_CYCLE_BIT);
+        // SAFETY: identity-mapped DMA, offset in-page.
+        unsafe {
+            core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(link_off + 12), link_d3);
+        }
+        tr.sync(link_off as usize, 16);
+        device_dma_barrier();
+        *enq = 0;
+        *pcs ^= 1;
+    }
+    let trb_off = (*enq * 16) as u64;
+    let trb_addr = tr.dma_addr().raw() + trb_off;
+    // Isoch TRB d3 (§6.4.1.3):
+    //   bit 0 = cycle (matches pcs)
+    //   bit 5 = IOC (interrupt on completion)
+    //   bits 10-15 = TRB Type (5 = Isoch)
+    //   bit 31 = SIA (Start Isochronous ASAP)
+    // TBC (bits 7-8), TLBPC (bits 16-19), Frame ID (bits 20-30)
+    // all stay 0.
+    let d3 = (TRB_TYPE_ISOCH << TRB_TYPE_SHIFT) | TRB_IOC | TRB_SIA | (*pcs & TRB_CYCLE_BIT);
     // SAFETY: identity-mapped DMA; offset in-page.
     unsafe {
         core::ptr::write_volatile(tr.cpu_mut_ptr_at::<u32>(trb_off), phys as u32);

@@ -100,6 +100,108 @@ kernel_test_in!(
     smoke_xhci_bulk_matches_td_and_generation
 );
 
+/// Isochronous completion identity (#885): the Transfer Event
+/// must pointer-match the originating Isoch TRB — a same
+/// slot/DCI event for another TRB, or an Event Data record, never
+/// retires the TD — and at most one isoch TD is in flight per
+/// endpoint. The event words are built from the xHCI 1.2 §6.4.2.1
+/// Transfer Event layout (TRB Pointer in dwords 0..1, Completion
+/// Code in dword 2 bits 31:24, residue in bits 23:0, type 32 in
+/// dword 3 bits 15:10, endpoint in bits 20:16, slot in bits
+/// 31:24), not from the driver's own constants.
+fn smoke_xhci_isoch_completion_identity() -> TestResult {
+    let mut state = State::new();
+    let publications = Cell::new(0);
+    let token = state
+        .begin(id(), Direction::Out, 512, || {
+            publications.set(publications.get() + 1);
+            0x1234_5000
+        })
+        .unwrap();
+    // One-in-flight: a second begin is Busy and never publishes.
+    if !matches!(
+        state.begin(id(), Direction::Out, 512, || panic!("second isoch publish")),
+        Err(Error::Busy)
+    ) || publications.get() != 1
+        || !state.active()
+    {
+        return TestResult::Fail("second isoch TD published over a live one");
+    }
+    // A stale event — wrong TRB pointer, wrong slot, wrong
+    // endpoint, or Event Data — never retires the TD.
+    let good = event(&token, 1, 0);
+    for index in 0..5 {
+        let mut bad = good;
+        match index {
+            0 => bad[0] += 16,
+            1 => bad[1] += 1,
+            2 => bad[3] ^= 1 << 24,
+            3 => bad[3] ^= 1 << 16,
+            _ => bad[3] |= 1 << 2,
+        }
+        if state.complete_isoch(42, &token, &bad, |_| ()) != Ok(None) || !state.active() {
+            return TestResult::Fail("another TD/event-data record completed isoch transfer");
+        }
+    }
+    // Short Packet is a normal isoch completion for OUT (and IN):
+    // the device's per-frame budget cut the packet short.
+    let consumed = Cell::new(0);
+    if state.complete_isoch(42, &token, &event(&token, 13, 12), |bytes| {
+        consumed.set(bytes)
+    }) != Ok(Some(500))
+        || consumed.get() != 500
+        || state.active()
+    {
+        return TestResult::Fail("isoch OUT short packet did not complete");
+    }
+    // A retired receipt never matches a reused ring address.
+    let next = state
+        .begin(id(), Direction::In, 512, || 0x1234_5000)
+        .unwrap();
+    if state.complete_isoch(42, &token, &good, |_| ()) != Err(Error::Stale)
+        || !state.active()
+        || state.complete_isoch(42, &next, &event(&next, 13, 0), |_| ()) != Ok(Some(512))
+    {
+        return TestResult::Fail("retired isoch receipt released a reused ring address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_isoch_completion_identity);
+
+/// Isochronous error discipline: error completions and malformed
+/// residue poison the endpoint (the TD stays retained, the next
+/// begin stays Busy) instead of reopening the scratch page.
+/// Unlike bulk, CC 13 is not an error here in either direction.
+fn smoke_xhci_isoch_ambiguous_errors_keep_endpoint_poisoned() -> TestResult {
+    for (direction, code, residue, error) in [
+        (Direction::In, 6, 0, Error::Completion(6)),
+        (Direction::Out, 6, 0, Error::Completion(6)),
+        (Direction::In, 1, 513, Error::Malformed),
+        (Direction::Out, 1, 513, Error::Malformed),
+    ] {
+        let mut state = State::new();
+        let token = state.begin(id(), direction, 512, || 0x1000).unwrap();
+        let consumed = Cell::new(false);
+        if state.complete_isoch(42, &token, &event(&token, code, residue), |_| {
+            consumed.set(true)
+        }) != Err(error)
+            || consumed.get()
+            || !state.active()
+            || !matches!(
+                state.begin(id(), direction, 512, || panic!("reuse after error")),
+                Err(Error::Busy)
+            )
+        {
+            return TestResult::Fail("ambiguous isoch failure reopened scratch DMA");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_isoch_ambiguous_errors_keep_endpoint_poisoned
+);
+
 fn smoke_xhci_bulk_ambiguous_errors_keep_endpoint_poisoned() -> TestResult {
     for (direction, code, residue, error) in [
         (Direction::In, 6, 0, Error::Completion(6)),
