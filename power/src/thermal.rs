@@ -3,10 +3,16 @@
 //! Spec: `power/specification/spec.md` (Stage-4 deliverable per
 //! ROADMAP). A `ThermalZone` groups a sensor + its critical
 //! temperature + an optional hysteresis band, and emits
-//! `ThermalEvent`s when the sensor crosses those thresholds. The
-//! idle-governor / DVFS path can subscribe to events and reduce
-//! clock frequency or park cores before the hardware's own
-//! protection trips.
+//! `ThermalEvent`s when the sensor crosses those thresholds.
+//! Actuation is the inline active-cooling governor: on a band
+//! crossing `record_temp` runs the installed `CoolingPolicy`
+//! (default `StepPolicy`) and drives every registered
+//! `CoolingDevice` — fans for active cooling, the cpufreq device
+//! for passive (ACPI 6.5 §11.3) throttling — without going through
+//! the event bus, so no subscriber callback can re-enter the
+//! registry lock. `subscribe()` is the observer surface for async
+//! consumers (logging, userspace notification); it is not the
+//! actuation path (#914).
 //!
 //! Stage-4 scope here:
 //! - Data types + registry. No real sensor plumbing — `arch/`
@@ -261,6 +267,10 @@ pub fn register_zone(
 /// topic. Replaces the old callback-list `subscribe(cap, cb)`. The
 /// caller drains in its own async task via
 /// `Subscriber::next().await`.
+///
+/// Observer surface only: cooling actuation is the inline governor
+/// in `record_temp` (#914), so a subscriber must not drive
+/// `set_cooling_level` — that would duplicate the governor.
 pub fn subscribe(
     reg: &Cap<TopicRegistry, Read>,
 ) -> Result<BusSubscriber<ThermalEvent>, ThermalError> {
