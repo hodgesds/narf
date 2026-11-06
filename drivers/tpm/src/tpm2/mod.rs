@@ -38,6 +38,16 @@ pub const TPM_ST_NO_SESSIONS: u16 = 0x8001;
 pub const TPM_ST_SESSIONS: u16 = 0x8002;
 /// `TPM_ST_NULL` — null structure tag.
 pub const TPM_ST_NULL: u16 = 0x8000;
+/// `TPM_ST_ATTEST_QUOTE` — the TPMS_ATTEST type for TPM2_Quote
+/// (Part 2 §6.9).
+pub const TPM_ST_ATTEST_QUOTE: u16 = 0x8018;
+/// `TPM_ST_VERIFIED` — the TPMT_TK_VERIFIED ticket tag, including
+/// the NULL ticket `<TPM_ST_VERIFIED, TPM_RH_NULL, empty>`
+/// (Part 2 §6.9, Table 97).
+pub const TPM_ST_VERIFIED: u16 = 0x8022;
+/// `TPM_GENERATED_VALUE` — the TPMS_ATTEST magic: 0xFF followed
+/// by ASCII "TCG" (Part 2 §10.12.8).
+pub const TPM_GENERATED_VALUE: u32 = 0xFF54_4347;
 
 // ── Command codes (TPM_CC) — Part 2 §6.5.2 ──────────────────────────
 
@@ -84,6 +94,19 @@ pub const TPM_CC_POLICY_GET_DIGEST: u32 = 0x0000_0189;
 // logic itself is Part 1 §19).
 pub const TPM_CC_DICTIONARY_ATTACK_LOCK_RESET: u32 = 0x0000_0139;
 pub const TPM_CC_DICTIONARY_ATTACK_PARAMETERS: u32 = 0x0000_013A;
+// TPM command-set remainder (#941): Quote (drivers-layer
+// delegation to the canonical codec), PCR event / allocation,
+// PolicyAuthorize, and the NV completion set. All values from
+// TCG Part 2 Rev 1.59 §6.5.2 Table 12.
+pub const TPM_CC_PCR_ALLOCATE: u32 = 0x0000_012B;
+pub const TPM_CC_NV_GLOBAL_WRITE_LOCK: u32 = 0x0000_0132;
+pub const TPM_CC_NV_SET_BITS: u32 = 0x0000_0135;
+pub const TPM_CC_NV_EXTEND: u32 = 0x0000_0136;
+pub const TPM_CC_NV_WRITE_LOCK: u32 = 0x0000_0138;
+pub const TPM_CC_PCR_EVENT: u32 = 0x0000_013C;
+pub const TPM_CC_NV_READ_LOCK: u32 = 0x0000_014F;
+pub const TPM_CC_NV_READ_PUBLIC: u32 = 0x0000_0169;
+pub const TPM_CC_POLICY_AUTHORIZE: u32 = 0x0000_016A;
 
 // ── TPM_SU values — Part 2 §6.9 ─────────────────────────────────────
 
@@ -182,6 +205,29 @@ pub const TPM_RC_POLICY_FAIL: u32 = 0x0000_099D;
 pub const TPM_RC_NV_UNINITIALIZED: u32 = 0x0000_014A;
 /// NV index is already defined (Part 2 §6.6).
 pub const TPM_RC_NV_DEFINED: u32 = 0x0000_014C;
+/// NV access is locked: `TPMA_NV_WRITELOCKED` /
+/// `TPMA_NV_READLOCKED` (or the global write lock) blocks the
+/// access (Part 2 §6.6, version-one code 0x48).
+pub const TPM_RC_NV_LOCKED: u32 = 0x0000_0148;
+/// Inconsistent attributes — e.g. NV_Extend on a non-extend index
+/// or NV_WriteLock on an index with neither WRITEDEFINE nor
+/// WRITE_STCLEAR (Part 2 §6.6, format-one base 0x02; a parameter
+/// number may be OR-ed in).
+pub const TPM_RC_ATTRIBUTES: u32 = 0x0000_0082;
+/// Invalid ticket (Part 2 §6.6, format-one base 0x20).
+pub const TPM_RC_TICKET: u32 = 0x0000_00A0;
+/// Hash algorithm not supported or not appropriate (Part 2 §6.6,
+/// format-one base 0x03).
+pub const TPM_RC_HASH: u32 = 0x0000_0083;
+/// Structure is the wrong size (Part 2 §6.6, format-one base
+/// 0x15).
+pub const TPM_RC_SIZE: u32 = 0x0000_0095;
+/// Incorrect structure tag (Part 2 §6.6, format-one base 0x17).
+pub const TPM_RC_TAG: u32 = 0x0000_0097;
+/// Policy failure (Part 2 §6.6, version-one code 0x26) — the
+/// PolicyAuthorize refusal when the presented ticket cannot be
+/// validated (Part 3 §23.16).
+pub const TPM_RC_POLICY: u32 = 0x0000_0126;
 
 // ── Well-known handles ───────────────────────────────────────────────
 
