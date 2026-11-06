@@ -2251,12 +2251,23 @@ impl Sdhci {
     /// MMIO ownership; called only once at bring-up (or once per
     /// fixture install in tests).
     pub(crate) unsafe fn identify_any(&self) -> Result<(), SdhciError> {
+        // SAFETY: `identify_sequence` requires exclusive MMIO ownership
+        // and a single call at bring-up. Both are part of `identify_any`'s
+        // own safety contract, upheld by its callers: `bring_up` owns
+        // BAR0 exclusively and runs this once, and fixture installs run
+        // it once per installed controller.
         match unsafe { self.identify_sequence() } {
             Ok(card) => {
                 *self.card.lock() = Some(card);
                 Ok(())
             }
             Err(SdhciError::NotSdCard) => {
+                // SAFETY: `identify_emmc_sequence` requires the same
+                // exclusive-MMIO, single-call contract as the SD
+                // sequence above, discharged by `identify_any`'s
+                // callers; reaching this arm means the SD probe failed
+                // with `NotSdCard`, so the card is not SD and the eMMC
+                // sequence is the correct fallback.
                 let emmc = unsafe { self.identify_emmc_sequence() }?;
                 *self.emmc.lock() = Some(emmc);
                 Ok(())

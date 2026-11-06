@@ -62,7 +62,7 @@ use super::{with_controller, Sdhci, SdhciError, RESP_136, RESP_48, RESP_48_BUSY,
 
 /// An identified eMMC card.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct EmmcCard {
+pub struct EmmcCard {
     /// Relative card address assigned by CMD3 (1, the JEDEC
     /// default — §6.4.1).
     pub rca: u16,
