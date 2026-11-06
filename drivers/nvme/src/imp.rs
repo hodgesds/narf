@@ -660,8 +660,7 @@ impl Queue {
             if deadline.expired() {
                 return Err(NvmeError::CompletionTimeout);
             }
-            let remaining_ms =
-                narf_time::cycles_to_ns(deadline.remaining_cycles()) / 1_000_000;
+            let remaining_ms = narf_time::cycles_to_ns(deadline.remaining_cycles()) / 1_000_000;
             // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
             let cqe = unsafe {
                 wait_cqe_ms(
@@ -1549,9 +1548,8 @@ impl Controller {
         // on change events; `Queue::submit_raw_ms` is CID-aware so
         // a stray AER completion can never be mistaken for an admin
         // command's CQE while the slots are outstanding.
-        let _ = self.set_features_async_event_config(
-            admin::AEC_SMART_HEALTH | admin::AEC_NS_ATTR_CHANGED,
-        );
+        let _ = self
+            .set_features_async_event_config(admin::AEC_SMART_HEALTH | admin::AEC_NS_ATTR_CHANGED);
         let _ = self.post_aer_commands(AER_POST_COUNT);
         self.dead = false;
         Ok(())
@@ -2175,9 +2173,9 @@ impl Controller {
 
         for i in 0..granted {
             let qid = i + 1; // NVMe Base Spec §4.1.4: I/O qids ≥ 1
-            // Install the per-queue handler before the CQ exists,
-            // so a completion can never land on a vector with no
-            // handler (spurious) — same order as `create_io_queue`.
+                             // Install the per-queue handler before the CQ exists,
+                             // so a completion can never land on a vector with no
+                             // handler (spurious) — same order as `create_io_queue`.
             narf_interrupts::install_handler(vectors[i as usize], nvme_io_irq);
             match self.create_one_msix_queue(qid, io_base + i, admin_stride) {
                 Ok(q) => queues.push(q),
@@ -3105,14 +3103,7 @@ impl Controller {
         lba: u64,
         n_blocks: u16,
         buf: &DmaBuffer,
-    ) -> Result<
-        (
-            usize,
-            u8,
-            narf_time::Timeout<narf_interrupts::WaitForIrq>,
-        ),
-        NvmeError,
-    > {
+    ) -> Result<(usize, u8, narf_time::Timeout<narf_interrupts::WaitForIrq>), NvmeError> {
         if self.io_queues.is_empty() {
             return Err(NvmeError::NoIoQueue);
         }
