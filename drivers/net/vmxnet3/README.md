@@ -1,0 +1,17 @@
+# drivers/net/vmxnet3 — VMware vmxnet3 paravirtual NIC
+
+Paravirtual driver for guests on VMware ESX/Workstation. `vmxnet3.rs`
+implements the documented bring-up sequence (Stages 0–2): map the two
+4 KiB BARs — BAR0 for doorbells, BAR1 for the control plane — negotiate
+the revision and UPT version, allocate the `Vmxnet3_DriverShared`
+structure in DMA-coherent memory, and wire TX/RX rings (Stage 2 wires
+ring 1 only). `vmxnet3/regs.rs` holds register offsets and command
+codes; `vmxnet3/shared.rs` holds the shared structure and descriptor
+types. There is no `HwNic` implementation yet, and the interrupt
+subsystem is left for a follow-up stage.
+
+Dual-build: the built-in build compiles the real driver; the `.ko`
+build registers through the `narf_register_pci_driver` KSYMTAB export
+and is registration-only until the device datapath ABI lands.
+
+- Spec: [drivers/net specification](../specification/spec.md)
