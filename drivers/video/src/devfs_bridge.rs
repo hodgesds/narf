@@ -92,7 +92,19 @@ pub struct VideoDevice {
     /// Supported pixel formats for `VIDIOC_ENUM_FMT`.
     pub formats: Vec<crate::v4l2_ioctl::FmtEntry>,
     /// User controls (`VIDIOC_QUERYCTRL` / `G_CTRL` / `S_CTRL`).
+    ///
+    /// Synthetic nodes start with the invented
+    /// [`crate::v4l2_ioctl::default_controls`] table; a UVC-bound
+    /// node has it replaced at bind with the control list built
+    /// from the device's real PU/CT descriptors (see
+    /// [`set_controls`]) — a camera whose descriptors advertise no
+    /// controls advertises none.
     pub controls: Vec<crate::v4l2_ioctl::ControlState>,
+    /// Hardware control hooks installed by the owning class driver
+    /// (see [`crate::v4l2_ioctl::ControlOps`]). `None` for synthetic
+    /// nodes with no hardware behind them: G_CTRL/S_CTRL then keep
+    /// their cache-only behaviour.
+    pub control_ops: Option<crate::v4l2_ioctl::ControlOps>,
     /// Whether `VIDIOC_STREAMON` is active.
     pub streaming: bool,
     /// Hardware streaming hooks installed by the owning class driver
@@ -131,6 +143,7 @@ impl VideoDevice {
             format,
             formats,
             controls: crate::v4l2_ioctl::default_controls(),
+            control_ops: None,
             streaming: false,
             stream_ops: None,
             buffers: Vec::new(),
@@ -259,6 +272,38 @@ pub fn set_stream_ops(index: usize, ops: crate::v4l2_ioctl::StreamOps) -> bool {
     match get_device(index) {
         Some(dev) => {
             dev.lock().stream_ops = Some(ops);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Replace a registered video device's control list with the one
+/// built from the device's real PU/CT descriptors (ranges read from
+/// the hardware at bind). Called by the class driver that bound the
+/// hardware, right after registration. An empty list is a real
+/// outcome — a camera whose descriptors advertise no controls
+/// advertises none — and replaces the synthetic
+/// [`crate::v4l2_ioctl::default_controls`] table the node started
+/// with. Returns `false` when no device with `index` is registered.
+pub fn set_controls(index: usize, controls: Vec<crate::v4l2_ioctl::ControlState>) -> bool {
+    match get_device(index) {
+        Some(dev) => {
+            dev.lock().controls = controls;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Install hardware control hooks on a registered video device (see
+/// [`crate::v4l2_ioctl::ControlOps`]). Called by the class driver
+/// that bound the hardware, right after registration. Returns
+/// `false` when no device with `index` is registered.
+pub fn set_control_ops(index: usize, ops: crate::v4l2_ioctl::ControlOps) -> bool {
+    match get_device(index) {
+        Some(dev) => {
+            dev.lock().control_ops = Some(ops);
             true
         }
         None => false,
@@ -1048,6 +1093,215 @@ pub mod v4l2_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/video/v4l2", s_ctrl_clamps_and_queryctrl);
+
+    /// Fake hardware behind [`crate::v4l2_ioctl::ControlOps`]: `fn`
+    /// pointers cannot capture, so the hooks resolve this static —
+    /// the same pattern the USB crate's fixture transport uses.
+    /// `sets` records `(id, value)` SET_CUR calls; `gets` records
+    /// GET_CUR ids; `get_value` is the value GET_CUR answers;
+    /// `fail` makes both hooks return EIO.
+    struct FakeCtrlState {
+        sets: Vec<(u32, i32)>,
+        gets: Vec<u32>,
+        get_value: i32,
+        fail: bool,
+    }
+    static FAKE_CTRL: IrqSafeSpinLock<FakeCtrlState> = IrqSafeSpinLock::new(FakeCtrlState {
+        sets: Vec::new(),
+        gets: Vec::new(),
+        get_value: 0,
+        fail: false,
+    });
+
+    fn fake_ctrl_reset(get_value: i32, fail: bool) {
+        let mut s = FAKE_CTRL.lock();
+        s.sets.clear();
+        s.gets.clear();
+        s.get_value = get_value;
+        s.fail = fail;
+    }
+
+    fn fake_ctrl_get(_node: usize, id: u32) -> crate::v4l2_ioctl::ControlHookFuture {
+        Box::pin(async move {
+            let s = FAKE_CTRL.lock();
+            if s.fail {
+                return Err(5); // EIO
+            }
+            let v = s.get_value;
+            drop(s);
+            FAKE_CTRL.lock().gets.push(id);
+            Ok(v)
+        })
+    }
+
+    fn fake_ctrl_set(_node: usize, id: u32, value: i32) -> crate::v4l2_ioctl::ControlHookFuture {
+        Box::pin(async move {
+            let fail = FAKE_CTRL.lock().fail;
+            if fail {
+                return Err(5); // EIO
+            }
+            FAKE_CTRL.lock().sets.push((id, value));
+            Ok(value)
+        })
+    }
+
+    fn fake_control_ops() -> crate::v4l2_ioctl::ControlOps {
+        crate::v4l2_ioctl::ControlOps {
+            get: fake_ctrl_get,
+            set: fake_ctrl_set,
+        }
+    }
+
+    /// S_CTRL reaches the hardware hook with the clamped value and
+    /// the cache follows the device-confirmed value; G_CTRL reads
+    /// the device, not the cache (#809).
+    fn s_ctrl_routes_to_hardware_via_control_ops() -> TestResult {
+        const BRIGHTNESS: u32 = 0x0098_0900;
+        let dev = fresh("c");
+        fake_ctrl_reset(0, false);
+        let idx = dev.lock().index;
+        if !set_control_ops(idx, fake_control_ops()) {
+            return TestResult::Fail("installing fake control ops should succeed");
+        }
+        let m = Mock::new(true);
+        // S_CTRL brightness = 10 → hook called with (brightness, 10).
+        m.put_u32(0, BRIGHTNESS);
+        m.put_u32(4, 10);
+        if ioctl(&dev, &m, ioc(DIR_WR, 28, 8)) != 0 || m.get_i32(4) != 10 {
+            return TestResult::Fail("S_CTRL should succeed and report 10");
+        }
+        {
+            let s = FAKE_CTRL.lock();
+            if s.sets != alloc::vec![(BRIGHTNESS, 10)] {
+                return TestResult::Fail("S_CTRL must issue exactly one SET_CUR(10)");
+            }
+        }
+        // The device now reports 42; G_CTRL must return 42 (hardware),
+        // not the cached 10.
+        fake_ctrl_reset(42, false);
+        m.put_u32(0, BRIGHTNESS);
+        m.put_u32(4, 0);
+        if ioctl(&dev, &m, ioc(DIR_WR, 27, 8)) != 0 || m.get_i32(4) != 42 {
+            return TestResult::Fail("G_CTRL should return the hardware value 42");
+        }
+        {
+            let s = FAKE_CTRL.lock();
+            if s.gets != alloc::vec![BRIGHTNESS] {
+                return TestResult::Fail("G_CTRL must issue exactly one GET_CUR");
+            }
+        }
+        if dev.lock().controls[0].value != 42 {
+            return TestResult::Fail("G_CTRL should refresh the cache from hardware");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/video/v4l2",
+        s_ctrl_routes_to_hardware_via_control_ops
+    );
+
+    /// A failed SET_CUR/GET_CUR fails the ioctl with EIO and leaves
+    /// the cache at the previous value — never the value the
+    /// hardware never took (#809's silently-lying cache).
+    fn s_ctrl_hardware_failure_leaves_cache() -> TestResult {
+        const BRIGHTNESS: u32 = 0x0098_0900;
+        let dev = fresh("c");
+        fake_ctrl_reset(0, true);
+        let idx = dev.lock().index;
+        set_control_ops(idx, fake_control_ops());
+        let m = Mock::new(true);
+        m.put_u32(0, BRIGHTNESS);
+        m.put_u32(4, 10);
+        if ioctl(&dev, &m, ioc(DIR_WR, 28, 8)) != eno(5) {
+            return TestResult::Fail("failed SET_CUR should be EIO");
+        }
+        if dev.lock().controls[0].value != 0 {
+            return TestResult::Fail("failed S_CTRL must not change the cache");
+        }
+        m.put_u32(0, BRIGHTNESS);
+        m.put_u32(4, 0);
+        if ioctl(&dev, &m, ioc(DIR_WR, 27, 8)) != eno(5) {
+            return TestResult::Fail("failed GET_CUR should be EIO");
+        }
+        if dev.lock().controls[0].value != 0 {
+            return TestResult::Fail("failed G_CTRL must not change the cache");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/video/v4l2", s_ctrl_hardware_failure_leaves_cache);
+
+    /// An unknown control id is EINVAL before any hardware is
+    /// touched, with or without hooks installed.
+    fn s_ctrl_unknown_id_never_reaches_hardware() -> TestResult {
+        let dev = fresh("c");
+        fake_ctrl_reset(0, false);
+        let idx = dev.lock().index;
+        set_control_ops(idx, fake_control_ops());
+        let m = Mock::new(true);
+        m.put_u32(0, 0xDEAD_BEEF);
+        m.put_u32(4, 10);
+        if ioctl(&dev, &m, ioc(DIR_WR, 28, 8)) != eno(22) {
+            return TestResult::Fail("unknown S_CTRL id should be EINVAL");
+        }
+        if !FAKE_CTRL.lock().sets.is_empty() {
+            return TestResult::Fail("unknown id must not reach the hardware hook");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/video/v4l2",
+        s_ctrl_unknown_id_never_reaches_hardware
+    );
+
+    /// Replacing the control list (what bind does with the
+    /// descriptor-built table) withdraws every control the
+    /// descriptors lack: QUERYCTRL/S_CTRL for a dropped control is
+    /// EINVAL even though the synthetic default table had it.
+    fn set_controls_withdraws_undescribed_controls() -> TestResult {
+        const BRIGHTNESS: u32 = 0x0098_0900;
+        const SATURATION: u32 = 0x0098_0902;
+        let dev = fresh("c");
+        let idx = dev.lock().index;
+        // A descriptor set advertising brightness only, with a
+        // device-reported range (not the invented default range).
+        if !set_controls(
+            idx,
+            alloc::vec![crate::v4l2_ioctl::ControlState {
+                id: BRIGHTNESS,
+                name: "Brightness",
+                min: -10,
+                max: 10,
+                step: 1,
+                default: 0,
+                value: 0,
+            }],
+        ) {
+            return TestResult::Fail("installing the descriptor control list failed");
+        }
+        let m = Mock::new(true);
+        // QUERYCTRL brightness → the descriptor range.
+        m.put_u32(0, BRIGHTNESS);
+        if ioctl(&dev, &m, ioc(DIR_WR, 36, 68)) != 0 || m.get_i32(40) != -10 || m.get_i32(44) != 10
+        {
+            return TestResult::Fail("QUERYCTRL should report the descriptor range");
+        }
+        // QUERYCTRL saturation → EINVAL (descriptors lack it).
+        m.put_u32(0, SATURATION);
+        if ioctl(&dev, &m, ioc(DIR_WR, 36, 68)) != eno(22) {
+            return TestResult::Fail("undescribed QUERYCTRL id should be EINVAL");
+        }
+        // S_CTRL saturation → EINVAL.
+        m.put_u32(0, SATURATION);
+        m.put_u32(4, 5);
+        if ioctl(&dev, &m, ioc(DIR_WR, 28, 8)) != eno(22) {
+            return TestResult::Fail("undescribed S_CTRL id should be EINVAL");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/video/v4l2",
+        set_controls_withdraws_undescribed_controls
+    );
 
     fn unknown_ioctl_is_enotty() -> TestResult {
         let dev = fresh("c");
