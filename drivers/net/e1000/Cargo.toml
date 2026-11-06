@@ -53,6 +53,7 @@ builtin = [
     "dep:narf-acpi",
     "dep:narf-aml",
     "dep:narf-time",
+    "dep:narf-power",
 ]
 # Module: NO kernel crates. The only undefined symbols in the `.ko` are the
 # C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
@@ -71,6 +72,7 @@ narf-io           = { path = "../../../io", optional = true }
 narf-ipc          = { path = "../../../ipc", optional = true }
 narf-lib          = { path = "../../../lib", optional = true }
 narf-net          = { path = "../../../net", optional = true }
+narf-power        = { path = "../../../power", optional = true }
 narf-scheduler    = { path = "../../../scheduler", optional = true }
 narf-drivers      = { path = "../..", optional = true }
 narf-interrupts   = { path = "../../../interrupts", optional = true }

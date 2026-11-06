@@ -2013,6 +2013,22 @@ impl Ixgbe {
     }
 }
 
+impl narf_power::device_pm::DevicePmOps for Ixgbe {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        // System suspend with no WoL arming: the `suspend` plan
+        // disarms the wake filters. Arming a configured WoL policy
+        // on system suspend is a follow-up (e1000's gap-6 shape);
+        // the runtime `suspend(Some(cfg))` path stays for callers
+        // that already hold a `WolConfig`.
+        self.suspend(None)
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+}
+
 // ── HwNic impl (Stage 6) ───────────────────────────────────────────
 
 impl narf_net::Interface for Ixgbe {
@@ -2267,6 +2283,7 @@ pub fn detach_controller() {
     if !name.is_empty() {
         crate::publish::clear_rx_mirror_attached(name);
         let _ = narf_net::iface::unregister(name);
+        narf_power::device_pm::unregister_device_pm(name);
     }
 }
 
@@ -2359,6 +2376,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         },
     );
     IXGBE_IFNAME.set(name);
+
+    // Device-PM registration (#793): system suspend fans out
+    // through `Ixgbe::suspend(None)` / `Ixgbe::resume` via the
+    // `DevicePmOps` impl above. The registry is idempotent on the
+    // interface name; detach withdraws the entry. The suspend/resume
+    // register plans are fixture-pinned in `ixgbe::pm` (`tests.rs`).
+    narf_power::device_pm::register_device_pm_ops(ixgbe_ifname(), dev.clone());
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {

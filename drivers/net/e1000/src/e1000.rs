@@ -3328,14 +3328,10 @@ impl E1000 {
         if self.suspended.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        // SAFETY: identity-mapped MMIO; IMC is write-1-to-clear and
-        // the ICR read drains any cause bits already latched.
-        unsafe {
-            self.mmio.write32(REG_IMC, !0u32);
-            let _ = self.mmio.read32(REG_ICR);
-            self.mmio.write32(REG_TCTL, Self::TCTL_SUSPEND_OFF);
-            self.mmio.write32(REG_RCTL, Self::RCTL_SUSPEND_OFF);
-        }
+        // The register program lives in `pm::suspend_plan` so
+        // fixtures drive the exact conversation against a fake
+        // bank (issue #793); the live path runs it via `MmioBank`.
+        pm::suspend_plan(&mut pm::MmioBank::new(&self.mmio));
         LSC_PENDING.store(false, Ordering::Release);
         crate::publish::publish_link(e1000_ifname(), crate::publish::LinkSample::DOWN);
         Ok(())
@@ -3356,22 +3352,15 @@ impl E1000 {
         if !self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
-        // SAFETY: identity-mapped MMIO; the words below are exactly
-        // the bring-up program (RCTL at bring-up step 7, TCTL at
+        // The register program lives in `pm::resume_plan` so
+        // fixtures drive the exact conversation against a fake
+        // bank (issue #793); the words below are exactly the
+        // bring-up program (RCTL at bring-up step 7, TCTL at
         // step 6), so resume cannot drift from bring-up.
-        unsafe {
-            self.mmio.write32(
-                REG_RCTL,
-                RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
-            );
-            self.mmio.write32(
-                REG_TCTL,
-                TCTL_EN | TCTL_PSP | TCTL_CT_15 | TCTL_COLD_63 | TCTL_RTLC,
-            );
-            if self.irq_vector.is_some() {
-                self.mmio.write32(REG_IMS, IMS_DEFAULT);
-            }
-        }
+        pm::resume_plan(
+            &mut pm::MmioBank::new(&self.mmio),
+            self.irq_vector.is_some(),
+        );
         self.suspended.store(false, Ordering::Release);
         let status = self.read_status();
         crate::publish::publish_link(e1000_ifname(), link_sample_from_status(status));
@@ -3393,6 +3382,107 @@ impl E1000 {
             self.mmio.write32(REG_RCTL, Self::RCTL_SUSPEND_OFF);
             self.mmio.write32(REG_TCTL, Self::TCTL_SUSPEND_OFF);
         }
+    }
+}
+
+// ── Suspend/resume register plans (issue #793) ───────────────────────
+//
+// The register conversation `E1000::suspend` / `E1000::resume` run,
+// factored over a minimal bank so fixtures drive the exact program
+// against a fake bank (end-to-end register writes, no silicon) while
+// the live path runs it against BAR0 via [`MmioBank`]. Same shape as
+// ixgbe's `pm` + `queues::RegBank`. No new constants: every word is
+// the driver's existing bring-up / suspend word, so the plan cannot
+// drift from the live sequence it factors out of.
+//
+// Deliberate deltas (unchanged from the methods above): no PCI
+// power-state transition — the bus layer owns PCI config, this
+// driver never power-gates the function; no full reset/reinit on
+// resume — the rings persist across suspend (only the EN bits gate
+// DMA); no PHY power-down — the PHY is never powered down, so its
+// autoneg advertisement persists and resume re-links without an AN
+// restart; no WoL arming — WoL (audit gap 6) lands as its own item.
+mod pm {
+    use super::{
+        MmioRegion, IMS_DEFAULT, RCTL_BAM, RCTL_BSIZE_2K, RCTL_EN, RCTL_MPE, RCTL_SECRC, RCTL_UPE,
+        REG_ICR, REG_IMC, REG_IMS, REG_RCTL, REG_STATUS, REG_TCTL, TCTL_COLD_63, TCTL_CT_15,
+        TCTL_EN, TCTL_PSP, TCTL_RTLC,
+    };
+    use crate::e1000::E1000;
+
+    /// Minimal 32-bit register-bank abstraction so the register
+    /// conversation can be exercised against a fake bank in fixtures
+    /// and against real MMIO in the driver via [`MmioBank`].
+    pub trait RegBank {
+        fn read32(&self, offset: u64) -> u32;
+        fn write32(&mut self, offset: u64, value: u32);
+    }
+
+    /// [`RegBank`] over a real BAR0 mapping.
+    #[derive(Debug)]
+    pub struct MmioBank<'a> {
+        mmio: &'a MmioRegion,
+    }
+
+    impl<'a> MmioBank<'a> {
+        pub fn new(mmio: &'a MmioRegion) -> Self {
+            Self { mmio }
+        }
+    }
+
+    impl RegBank for MmioBank<'_> {
+        fn read32(&self, offset: u64) -> u32 {
+            // SAFETY: the driver owns BAR0 exclusively; the caller
+            // guarantees `offset` is a valid device register.
+            unsafe { self.mmio.read32(offset) }
+        }
+        fn write32(&mut self, offset: u64, value: u32) {
+            // SAFETY: same as above.
+            unsafe { self.mmio.write32(offset, value) }
+        }
+    }
+
+    /// Suspend register program: mask interrupts (IMC is
+    /// write-1-to-clear; the ICR read drains any cause bits already
+    /// latched), then stop the TX/RX DMA engines with the EN bits
+    /// cleared and all filter/config bits kept, so resume restores
+    /// exactly what bring-up programmed.
+    pub fn suspend_plan(bank: &mut impl RegBank) {
+        bank.write32(REG_IMC, !0u32);
+        let _ = bank.read32(REG_ICR);
+        bank.write32(REG_TCTL, E1000::TCTL_SUSPEND_OFF);
+        bank.write32(REG_RCTL, E1000::RCTL_SUSPEND_OFF);
+    }
+
+    /// Resume register program: restore the bring-up RCTL/TCTL
+    /// words, re-arm the interrupt mask only when a vector is bound
+    /// (polled devices keep the all-masked state bring-up left them
+    /// in), then sample live STATUS so the caller can republish link
+    /// from hardware rather than from a stale snapshot.
+    pub fn resume_plan(bank: &mut impl RegBank, irq_bound: bool) -> u32 {
+        bank.write32(
+            REG_RCTL,
+            RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
+        );
+        bank.write32(
+            REG_TCTL,
+            TCTL_EN | TCTL_PSP | TCTL_CT_15 | TCTL_COLD_63 | TCTL_RTLC,
+        );
+        if irq_bound {
+            bank.write32(REG_IMS, IMS_DEFAULT);
+        }
+        bank.read32(REG_STATUS)
+    }
+}
+
+impl narf_power::device_pm::DevicePmOps for E1000 {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.suspend()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
     }
 }
 
@@ -3419,6 +3509,7 @@ pub fn e1000_detach() {
     crate::publish::publish_link(name, crate::publish::LinkSample::DOWN);
     crate::publish::clear_rx_mirror_attached(name);
     let _ = narf_net::iface::unregister(name);
+    narf_power::device_pm::unregister_device_pm(name);
     *E1000_IFNAME.lock() = None;
 }
 
@@ -3480,6 +3571,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         },
     );
     *E1000_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
+    // Device-PM registration (#793): system suspend fans out
+    // through `E1000::suspend` / `E1000::resume` via the
+    // `DevicePmOps` impl above. The registry is idempotent on the
+    // interface name; detach withdraws the entry.
+    narf_power::device_pm::register_device_pm_ops(e1000_ifname(), dev.clone());
     narf_net::iface::install_rx_drain(rx_pump_step);
     // The legacy e1000 has one RX queue and delivers ordinary MTU-sized
     // descriptors, so software GRO is what amortizes the shared stack work at
@@ -4881,4 +4977,114 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_flow_control_ctrl_bits);
+
+    /// In-memory register bank for the PM fixtures: 16 KiB of BAR0
+    /// window, covering every register the suspend/resume plans
+    /// touch (highest is TCTL at 0x400; STATUS at 0x8, ICR at 0xC0,
+    /// IMS/IMC at 0xD0/0xD8, RCTL at 0x100).
+    struct FakeBank {
+        regs: alloc::vec::Vec<u32>,
+    }
+
+    impl FakeBank {
+        fn new() -> Self {
+            Self {
+                regs: alloc::vec![0u32; 0x1000 / 4],
+            }
+        }
+        fn value(&self, offset: u64) -> u32 {
+            self.regs.get((offset / 4) as usize).copied().unwrap_or(0)
+        }
+    }
+
+    impl super::pm::RegBank for FakeBank {
+        fn read32(&self, offset: u64) -> u32 {
+            self.value(offset)
+        }
+        fn write32(&mut self, offset: u64, value: u32) {
+            if let Some(slot) = self.regs.get_mut((offset / 4) as usize) {
+                *slot = value;
+            }
+        }
+    }
+
+    fn smoke_e1000_pm_suspend_stops_dma() -> TestResult {
+        // Bring-up state: DMA engines on, interrupts armed.
+        let mut bank = FakeBank::new();
+        bank.write32(
+            super::REG_RCTL,
+            super::RCTL_EN | super::RCTL_BAM | super::RCTL_SECRC,
+        );
+        bank.write32(super::REG_TCTL, super::TCTL_EN | super::TCTL_PSP);
+        bank.write32(super::REG_IMS, super::IMS_DEFAULT);
+        super::pm::suspend_plan(&mut bank);
+        if bank.value(super::REG_IMC) != !0u32 {
+            return TestResult::Fail("e1000 suspend did not mask interrupts");
+        }
+        if bank.value(super::REG_TCTL) != super::E1000::TCTL_SUSPEND_OFF
+            || bank.value(super::REG_TCTL) & super::TCTL_EN != 0
+        {
+            return TestResult::Fail("e1000 suspend did not stop TX DMA");
+        }
+        if bank.value(super::REG_RCTL) != super::E1000::RCTL_SUSPEND_OFF
+            || bank.value(super::REG_RCTL) & super::RCTL_EN != 0
+        {
+            return TestResult::Fail("e1000 suspend did not stop RX DMA");
+        }
+        // Suspend words keep the filter/config bits so resume
+        // restores exactly what bring-up programmed.
+        if bank.value(super::REG_RCTL) & super::RCTL_BAM == 0
+            || bank.value(super::REG_TCTL) & super::TCTL_PSP == 0
+        {
+            return TestResult::Fail("e1000 suspend words lost bring-up config bits");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_e1000_pm_suspend_stops_dma);
+
+    fn smoke_e1000_pm_resume_restores_and_relinks() -> TestResult {
+        let mut bank = FakeBank::new();
+        super::pm::suspend_plan(&mut bank);
+        // Live link: STATUS reports LU at 1000 Full.
+        bank.write32(
+            super::REG_STATUS,
+            super::STATUS_LU | super::STATUS_SPEED_1000 | super::STATUS_FD,
+        );
+        let status = super::pm::resume_plan(&mut bank, true);
+        if bank.value(super::REG_RCTL) & super::RCTL_EN == 0
+            || bank.value(super::REG_TCTL) & super::TCTL_EN == 0
+        {
+            return TestResult::Fail("e1000 resume did not re-enable DMA engines");
+        }
+        if bank.value(super::REG_IMS) != super::IMS_DEFAULT {
+            return TestResult::Fail("e1000 resume did not re-arm the interrupt mask");
+        }
+        if status & super::STATUS_LU == 0 {
+            return TestResult::Fail("e1000 resume did not sample live STATUS");
+        }
+        let sample = super::link_sample_from_status(status);
+        if !sample.carrier || sample.speed_mbps != Some(1000) {
+            return TestResult::Fail("e1000 resume link sample lost carrier/speed");
+        }
+        // Polled device: no vector bound, mask stays as bring-up left it.
+        let mut polled = FakeBank::new();
+        super::pm::suspend_plan(&mut polled);
+        let _ = super::pm::resume_plan(&mut polled, false);
+        if polled.value(super::REG_IMS) != 0 {
+            return TestResult::Fail("e1000 resume armed IMS on a polled device");
+        }
+        // Suspend → resume → suspend is stable: a second cycle
+        // programs the same words (idempotent fan-out).
+        super::pm::suspend_plan(&mut bank);
+        if bank.value(super::REG_RCTL) != super::E1000::RCTL_SUSPEND_OFF
+            || bank.value(super::REG_TCTL) != super::E1000::TCTL_SUSPEND_OFF
+        {
+            return TestResult::Fail("e1000 second suspend drifted from the first");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/e1000",
+        smoke_e1000_pm_resume_restores_and_relinks
+    );
 }

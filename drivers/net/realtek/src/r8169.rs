@@ -67,7 +67,7 @@
 //! Bring-up sequence per §7 "Driver Programming Note": program C+CR
 //! first, then CR (TE|RE), then the rest. RST is self-clearing.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 use narf_ipc::{channel, Consumer, Producer};
@@ -237,6 +237,9 @@ pub enum NicError {
     TxTimeout,
     /// MSI-X table couldn't be brought up.
     MsixSetup,
+    /// The device is suspended for system suspend (issue #793):
+    /// the datapath gates refuse TX and RX while suspended.
+    Suspended,
     /// The requested TX offload cannot be programmed for this
     /// frame (unparseable transport header, SCTP, MSS/offset
     /// overflow, or TSO on a chip that cannot take it).
@@ -344,6 +347,9 @@ pub struct RtlNic {
     /// True when PHYStatus.LinkSts read 1 at bring-up. We don't yet
     /// re-poll on LinkChg interrupts.
     pub link_up: bool,
+    /// Set by `suspend`, cleared by `resume`: the datapath gates
+    /// refuse TX and RX while this is set (issue #793).
+    suspended: AtomicBool,
     /// IDT vector wired to MSI-X entry 0, when MSI-X is enabled.
     pub irq_vector: Option<u8>,
     /// Live MSI-X table — kept alive so the device's MSI-X enable
@@ -616,6 +622,7 @@ impl RtlNic {
             mtu: IrqSafeSpinLock::new(1500),
             wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
             link_up,
+            suspended: AtomicBool::new(false),
             irq_vector: None,
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
@@ -673,6 +680,9 @@ impl RtlNic {
     /// `[1, 1518]` bytes (no jumbo); the chip pads frames < 64 bytes
     /// itself per §6.1.
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(NicError::Suspended);
+        }
         if frame.is_empty() || frame.len() > self.max_frame() as usize {
             return Err(NicError::FrameTooLong);
         }
@@ -810,6 +820,9 @@ impl RtlNic {
     /// Like [`RtlNic::receive`], plus the chip's RX checksum
     /// verification result decoded from the returned descriptor.
     pub fn receive_with_meta(&self) -> Option<(alloc::vec::Vec<u8>, RxCsumResult)> {
+        if self.suspended.load(Ordering::Acquire) {
+            return None;
+        }
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -1026,6 +1039,49 @@ impl RtlNic {
         up
     }
 
+    /// Suspend the device for system suspend (issue #793): mask
+    /// interrupts, acknowledge pending causes, stop the TX/RX DMA
+    /// engines via the shared `pm` plan, and publish link down. A
+    /// second suspend is a no-op success. The PHY stays powered
+    /// (its autoneg advertisement persists), and the descriptor
+    /// rings persist — only the CR EN bits gate DMA.
+    pub fn suspend(&self) -> Result<(), NicError> {
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        crate::pm::suspend_plan(&crate::pm::MmioBank::new(&self.mmio), crate::pm::IMR_LEGACY);
+        crate::publish::publish_link(r8169_ifname(), crate::publish::LinkSample::DOWN);
+        Ok(())
+    }
+
+    /// Resume a suspended device (issue #793): re-kick the PHY so
+    /// the link re-negotiates after the DMA stop, restore the DMA
+    /// engines + interrupt mask via the shared `pm` plan, and
+    /// republish link from live PHYStatus. Resuming a running
+    /// device is a no-op success. The PHY re-kick is best-effort:
+    /// a failed MDIO read leaves the advertisement as it was, and
+    /// the link still comes back on its own.
+    pub fn resume(&self) -> Result<(), NicError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let phy = crate::phy_access::PhyAccess::new(&self.mmio);
+        if let Ok(bmcr) = phy.phyar_read(crate::phy_access::MII_BMCR_REG) {
+            if let Some(word) = crate::phy_access::bmcr_restart_value(bmcr) {
+                let _ = phy.phyar_write(crate::phy_access::MII_BMCR_REG, word);
+            }
+        }
+        crate::pm::resume_plan(
+            &crate::pm::MmioBank::new(&self.mmio),
+            crate::pm::IMR_LEGACY,
+            (INT_ROK | INT_TOK | INT_LINKCHG | INT_RDU | INT_TDU) as u32,
+            self.irq_vector.is_some(),
+        );
+        self.suspended.store(false, Ordering::Release);
+        crate::publish::publish_link(r8169_ifname(), r8169_link_sample(self.phy_status()));
+        Ok(())
+    }
+
     /// Async-friendly transmit. Stages the frame into the ring (no
     /// polling), rings the doorbell, and awaits MSI-X delivery via
     /// [`narf_interrupts::wait_for_irq`] before draining the TX
@@ -1036,6 +1092,9 @@ impl RtlNic {
     /// Caller must have brought MSI-X up via [`enable_msix`]; on a
     /// controller without MSI-X this returns `MsixSetup`.
     pub async fn transmit_irq_async(&self, frame: &[u8]) -> Result<(), NicError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(NicError::Suspended);
+        }
         if frame.is_empty() || frame.len() > self.max_frame() as usize {
             return Err(NicError::FrameTooLong);
         }
@@ -1180,6 +1239,17 @@ fn r8169_link_sample(status: u8) -> crate::publish::LinkSample {
     crate::publish::LinkSample::carrier_only(status & PHYSTAT_LINKSTS != 0)
 }
 
+impl narf_power::device_pm::DevicePmOps for RtlNic {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.suspend()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+}
+
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -1227,6 +1297,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let status = with_controller(|c| c.phy_status()).unwrap_or(0);
     let name = crate::publish::publish_netdev(mac, r8169_send_frame, r8169_link_sample(status));
     R8169_IFNAME.set(name);
+
+    // Device-PM registration (#793): system suspend fans out
+    // through `RtlNic::suspend` / `RtlNic::resume` via the
+    // `DevicePmOps` impl above. The registry is idempotent on the
+    // interface name. There is no r8169 detach path to withdraw
+    // the entry from yet — the CONTROLLER slot is never drained
+    // either, so the entry lives as long as the device does.
+    narf_power::device_pm::register_device_pm_ops(r8169_ifname(), dev.clone());
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {

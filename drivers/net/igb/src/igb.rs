@@ -2481,34 +2481,11 @@ impl Igb {
         if self.suspended.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let q0 = queue_regs(0);
-        // SAFETY: mapped MMIO.
-        unsafe {
-            self.mmio.write32(REG_IMC, !0u32);
-            self.mmio.write32(REG_EIMC, !0u32);
-            self.mmio.write32(q0.txdctl, 0);
-            self.mmio.write32(q0.rxdctl, 0);
-        }
-        let filters = *self.wol_filters.lock();
-        let program = wol_suspend_program(filters, self.link_up(), runtime);
-        // SAFETY: mapped MMIO. Transmit DMA stops in both branches
-        // (`__igb_close` has already stopped the TX unit before Linux
-        // arms wake filtering); only the receive side differs.
-        unsafe {
-            self.mmio.write32(REG_TCTL, TCTL_SUSPEND_OFF);
-            if program.wufc != 0 {
-                self.mmio.write32(REG_RCTL, RCTL_SUSPEND_ARMED);
-                let ctrl = self.mmio.read32(REG_CTRL);
-                self.mmio.write32(REG_CTRL, ctrl | CTRL_ADVD3WUC);
-                self.mmio.write32(REG_WUC, program.wuc);
-                self.mmio.write32(REG_WUFC, program.wufc);
-            } else {
-                self.mmio.write32(REG_WUC, 0);
-                self.mmio.write32(REG_WUFC, 0);
-                self.mmio.write32(REG_RCTL, RCTL_SUSPEND_OFF);
-                Self::phy_write(&self.mmio, PHY_BMCR, PHY_BMCR_PWRDOWN);
-            }
-        }
+        // The register program lives in `pm::suspend_plan` so
+        // fixtures drive the exact conversation against a fake
+        // bank (issue #793); the live path runs it via `MmioBank`.
+        let program = wol_suspend_program(*self.wol_filters.lock(), self.link_up(), runtime);
+        pm::suspend_plan(&pm::MmioBank::new(&self.mmio), &program);
         crate::publish::publish_link(igb_ifname(), crate::publish::LinkSample::DOWN);
         Ok(())
     }
@@ -2527,62 +2504,18 @@ impl Igb {
         if !self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
-        let q0 = queue_regs(0);
-        // SAFETY: mapped MMIO.
-        unsafe {
-            self.mmio.write32(REG_WUS, wus_clear_word());
-            self.mmio.write32(REG_WUC, 0);
-            self.mmio.write32(REG_WUFC, 0);
-            Self::phy_write(&self.mmio, PHY_BMCR, PHY_BMCR_ANENABLE | PHY_BMCR_ANRESTART);
-            self.mmio.write32(
-                REG_RCTL,
-                RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
-            );
-            self.mmio.write32(REG_TCTL, TCTL_EN | TCTL_PSP);
-            let txdctl = queue_enable_word(self.mmio.read32(q0.txdctl));
-            self.mmio.write32(q0.txdctl, txdctl);
-            let rxdctl = queue_enable_word(self.mmio.read32(q0.rxdctl));
-            self.mmio.write32(q0.rxdctl, rxdctl);
-        }
-        let tx_on = narf_scheduler::responsive_spin_until(
-            // SAFETY: mapped MMIO.
-            || unsafe { queue_enable_reflected(self.mmio.read32(q0.txdctl)) },
-            narf_time::Deadline::after_ms(100),
-        );
-        let rx_on = narf_scheduler::responsive_spin_until(
-            // SAFETY: mapped MMIO.
-            || unsafe { queue_enable_reflected(self.mmio.read32(q0.rxdctl)) },
-            narf_time::Deadline::after_ms(100),
-        );
-        if !tx_on || !rx_on {
-            return Err(IgbError::QueueEnableTimeout);
-        }
-        // Unmask the MSI-X block (same program as bring-up step 9).
-        if self.irq_vector.is_some() {
-            // SAFETY: mapped MMIO.
-            unsafe {
-                self.mmio.write32(
-                    REG_GPIE,
-                    GPIE_NSICR | GPIE_MULTIPLE_MSIX | GPIE_EIAME | GPIE_PBA,
-                );
-                self.mmio.write32(REG_IVAR0, ivar0_shared_vector(0));
-                self.mmio.write32(REG_IVAR_MISC, ivar_misc_shared_vector(0));
-                self.mmio.write32(REG_EITR0, EITR_START | EITR_CNT_IGNR);
-                self.mmio.write32(REG_EIAC, MSIX_VECTOR0_MASK);
-                self.mmio.write32(REG_EIAM, MSIX_VECTOR0_MASK);
-                self.mmio.write32(REG_EIMS, MSIX_VECTOR0_MASK);
-                // Re-arm the mailbox cause when VT is allocated
-                // (Linux `igb_irq_enable` adds VMMB and unmasks
-                // MBVFIMR only with VFs; a D3 transition may have
-                // reset both).
-                if self.vt.lock().is_some() {
-                    self.mmio.write32(vmdq::REG_MBVFIMR, vmdq::MBVFIMR_ALL_VFS);
-                    self.mmio.write32(REG_IMS, IMS_DEFAULT | IMS_VMMB);
-                } else {
-                    self.mmio.write32(REG_IMS, IMS_DEFAULT);
-                }
-            }
-        }
+        // The register program lives in `pm::resume_plan` so
+        // fixtures drive the exact conversation against a fake
+        // bank (issue #793); the live path runs it via `MmioBank`.
+        // A handshake that never reflects leaves the device
+        // suspended and reports `QueueEnableTimeout`.
+        let vt_allocated = self.vt.lock().is_some();
+        pm::resume_plan(
+            &pm::MmioBank::new(&self.mmio),
+            self.irq_vector.is_some(),
+            vt_allocated,
+        )
+        .map_err(|_| IgbError::QueueEnableTimeout)?;
         self.suspended.store(false, Ordering::Release);
         crate::publish::publish_link(igb_ifname(), igb_link_sample(self));
         Ok(())
@@ -3144,6 +3077,186 @@ impl crate::HwNic for IgbNic {
     }
 }
 
+// ── Suspend/resume register plans (issue #793) ───────────────────────
+//
+// The register conversation `Igb::suspend` / `Igb::resume` run,
+// factored over a minimal bank so fixtures drive the exact program
+// against a fake bank (end-to-end register writes, no silicon) while
+// the live path runs it against BAR0 via [`MmioBank`]. Same shape as
+// igc's `hardware::Registers` (read/write/wait/delay over `&self`,
+// so the wait predicate can read the bank it polls) and ixgbe's
+// `pm` plans. No new constants: every word is the driver's existing
+// bring-up / suspend word, so the plan cannot drift from the live
+// sequence it factors out of.
+//
+// Deliberate deltas (unchanged from the methods above, spec §3):
+// no PCI power-state transition — the bus layer owns PCI config;
+// suspend arms WoL or stops DMA and powers the PHY down; resume
+// clears WUS, re-kicks the PHY (ANENABLE + ANRESTART), restores
+// RCTL/TCTL, re-runs the queue-0 ENABLE handshake, and unmasks
+// MSI-X. A handshake that never reflects leaves the device
+// suspended.
+mod pm {
+    use super::vmdq;
+    use super::{
+        ivar0_shared_vector, ivar_misc_shared_vector, queue_enable_reflected, queue_enable_word,
+        queue_regs, wus_clear_word, MmioRegion, WolSuspendProgram, CTRL_ADVD3WUC, EITR_CNT_IGNR,
+        EITR_START, GPIE_EIAME, GPIE_MULTIPLE_MSIX, GPIE_NSICR, GPIE_PBA, IMS_DEFAULT, IMS_VMMB,
+        MDIC_OP_WRITE, MDIC_PHY_ADDR, MDIC_READY, MSIX_VECTOR0_MASK, PHY_BMCR, PHY_BMCR_ANENABLE,
+        PHY_BMCR_ANRESTART, PHY_BMCR_PWRDOWN, RCTL_BAM, RCTL_BSIZE_2K, RCTL_EN, RCTL_MPE,
+        RCTL_SECRC, RCTL_SUSPEND_ARMED, RCTL_SUSPEND_OFF, RCTL_UPE, REG_CTRL, REG_EIAC, REG_EIAM,
+        REG_EIMC, REG_EIMS, REG_EITR0, REG_GPIE, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC,
+        REG_MDIC, REG_RCTL, REG_TCTL, REG_WUC, REG_WUFC, REG_WUS, TCTL_EN, TCTL_PSP,
+        TCTL_SUSPEND_OFF,
+    };
+
+    /// Minimal register-bank abstraction so the register conversation
+    /// can be exercised against a fake bank in fixtures and against
+    /// real MMIO in the driver via [`MmioBank`]. All access is
+    /// through `&self` (igc shape): the live bank's MMIO handle is
+    /// `Copy`-like and the fixture bank uses interior mutability, so
+    /// a wait predicate can read the bank it polls.
+    pub trait RegBank {
+        fn read32(&self, offset: u64) -> u32;
+        fn write32(&self, offset: u64, value: u32);
+        /// Bounded wait for `ready` to become true. Live banks spin
+        /// to the deadline; fixtures evaluate the predicate once
+        /// (the fake models the device acking on the command write).
+        fn wait(&self, us: u64, ready: impl FnMut() -> bool) -> bool;
+    }
+
+    /// [`RegBank`] over a real BAR0 mapping.
+    #[derive(Debug)]
+    pub struct MmioBank<'a> {
+        mmio: &'a MmioRegion,
+    }
+
+    impl<'a> MmioBank<'a> {
+        pub fn new(mmio: &'a MmioRegion) -> Self {
+            Self { mmio }
+        }
+    }
+
+    impl RegBank for MmioBank<'_> {
+        fn read32(&self, offset: u64) -> u32 {
+            // SAFETY: the driver owns BAR0 exclusively; the caller
+            // guarantees `offset` is a valid device register.
+            unsafe { self.mmio.read32(offset) }
+        }
+        fn write32(&self, offset: u64, value: u32) {
+            // SAFETY: same as above.
+            unsafe { self.mmio.write32(offset, value) }
+        }
+        fn wait(&self, us: u64, ready: impl FnMut() -> bool) -> bool {
+            narf_scheduler::responsive_spin_until(ready, narf_time::Deadline::after_us(us))
+        }
+    }
+
+    /// MDIC PHY write over the bank: command word, then a bounded
+    /// wait for the transaction to retire (READY set). QEMU
+    /// completes synchronously; a short bounded spin covers real
+    /// silicon. The fixture bank models the synchronous completion,
+    /// so the wait returns at once there.
+    fn phy_write(bank: &impl RegBank, reg: u32, data: u16) {
+        let cmd = (data as u32) | ((reg & 0x1F) << 16) | MDIC_PHY_ADDR | MDIC_OP_WRITE;
+        bank.write32(REG_MDIC, cmd);
+        let _ = bank.wait(10_000, || bank.read32(REG_MDIC) & MDIC_READY != 0);
+    }
+
+    /// Suspend register program (Linux `igb_suspend` order): mask
+    /// legacy + extended interrupts, disable the queue-0 DMA
+    /// engines, then arm WoL or stop DMA and power the PHY down.
+    /// Transmit DMA stops in both branches (`__igb_close` has
+    /// already stopped the TX unit before Linux arms wake
+    /// filtering); only the receive side differs.
+    pub fn suspend_plan(bank: &impl RegBank, program: &WolSuspendProgram) {
+        let q0 = queue_regs(0);
+        bank.write32(REG_IMC, !0u32);
+        bank.write32(REG_EIMC, !0u32);
+        bank.write32(q0.txdctl, 0);
+        bank.write32(q0.rxdctl, 0);
+        bank.write32(REG_TCTL, TCTL_SUSPEND_OFF);
+        if program.wufc != 0 {
+            bank.write32(REG_RCTL, RCTL_SUSPEND_ARMED);
+            let ctrl = bank.read32(REG_CTRL);
+            bank.write32(REG_CTRL, ctrl | CTRL_ADVD3WUC);
+            bank.write32(REG_WUC, program.wuc);
+            bank.write32(REG_WUFC, program.wufc);
+        } else {
+            bank.write32(REG_WUC, 0);
+            bank.write32(REG_WUFC, 0);
+            bank.write32(REG_RCTL, RCTL_SUSPEND_OFF);
+            phy_write(bank, PHY_BMCR, PHY_BMCR_PWRDOWN);
+        }
+    }
+
+    /// Resume register program (Linux `igb_resume` order): clear
+    /// WUS, re-kick the PHY out of power-down (ANENABLE +
+    /// ANRESTART, so the link re-negotiates), restore RCTL/TCTL,
+    /// re-run the queue-0 ENABLE handshake, then unmask the MSI-X
+    /// block (same program as bring-up step 9) — re-arming the
+    /// mailbox cause only when VT is allocated. A handshake that
+    /// never reflects returns `Err` before any unmasking, so the
+    /// caller leaves the device suspended.
+    pub fn resume_plan(bank: &impl RegBank, irq_bound: bool, vt_allocated: bool) -> Result<(), ()> {
+        let q0 = queue_regs(0);
+        bank.write32(REG_WUS, wus_clear_word());
+        bank.write32(REG_WUC, 0);
+        bank.write32(REG_WUFC, 0);
+        phy_write(bank, PHY_BMCR, PHY_BMCR_ANENABLE | PHY_BMCR_ANRESTART);
+        bank.write32(
+            REG_RCTL,
+            RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
+        );
+        bank.write32(REG_TCTL, TCTL_EN | TCTL_PSP);
+        let txdctl = queue_enable_word(bank.read32(q0.txdctl));
+        bank.write32(q0.txdctl, txdctl);
+        let rxdctl = queue_enable_word(bank.read32(q0.rxdctl));
+        bank.write32(q0.rxdctl, rxdctl);
+        let tx_on = bank.wait(100_000, || queue_enable_reflected(bank.read32(q0.txdctl)));
+        let rx_on = bank.wait(100_000, || queue_enable_reflected(bank.read32(q0.rxdctl)));
+        if !tx_on || !rx_on {
+            return Err(());
+        }
+        if irq_bound {
+            bank.write32(
+                REG_GPIE,
+                GPIE_NSICR | GPIE_MULTIPLE_MSIX | GPIE_EIAME | GPIE_PBA,
+            );
+            bank.write32(REG_IVAR0, ivar0_shared_vector(0));
+            bank.write32(REG_IVAR_MISC, ivar_misc_shared_vector(0));
+            bank.write32(REG_EITR0, EITR_START | EITR_CNT_IGNR);
+            bank.write32(REG_EIAC, MSIX_VECTOR0_MASK);
+            bank.write32(REG_EIAM, MSIX_VECTOR0_MASK);
+            bank.write32(REG_EIMS, MSIX_VECTOR0_MASK);
+            // Re-arm the mailbox cause when VT is allocated
+            // (Linux `igb_irq_enable` adds VMMB and unmasks
+            // MBVFIMR only with VFs; a D3 transition may have
+            // reset both).
+            if vt_allocated {
+                bank.write32(vmdq::REG_MBVFIMR, vmdq::MBVFIMR_ALL_VFS);
+                bank.write32(REG_IMS, IMS_DEFAULT | IMS_VMMB);
+            } else {
+                bank.write32(REG_IMS, IMS_DEFAULT);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl narf_power::device_pm::DevicePmOps for Igb {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        // System suspend: not a runtime suspend, so the caller's
+        // WoL filters apply (minus link-change when the link is up).
+        self.suspend(false)
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+}
+
 // ── Driver-match registration ────────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Igb>>> = IrqSafeSpinLock::new(None);
@@ -3194,6 +3307,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         },
     );
     *IGB_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
+    // Device-PM registration (#793): system suspend fans out
+    // through `Igb::suspend(false)` / `Igb::resume` via the
+    // `DevicePmOps` impl above. The registry is idempotent on the
+    // interface name; detach withdraws the entry.
+    narf_power::device_pm::register_device_pm_ops(igb_ifname(), dev.clone());
     narf_net::iface::install_rx_drain(igb_rx_pump_step);
 
     // Stage-4 registry (cap-gated) — the newer `Interface` consumer path.
@@ -3245,6 +3363,7 @@ pub fn igb_detach() {
     crate::publish::publish_link(name, crate::publish::LinkSample::DOWN);
     crate::publish::clear_rx_mirror_attached(name);
     let _ = narf_net::iface::unregister(name);
+    narf_power::device_pm::unregister_device_pm(name);
     *IGB_IFNAME.lock() = None;
 }
 
@@ -4409,4 +4528,191 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_pm_gates_and_words);
+
+    /// In-memory register bank for the PM fixtures: 24 KiB of BAR0
+    /// window, covering every register the suspend/resume plans
+    /// touch (highest is WUS at 0x5810). Device behaviour the plans
+    /// poll on is modelled, not stubbed: an MDIC write completes
+    /// synchronously (READY set, as QEMU does — see `phy_write`),
+    /// and a queue-enable write reflects at once unless the bank is
+    /// told the queue is stuck, in which case ENABLE never reflects.
+    struct FakeBank {
+        regs: core::cell::RefCell<alloc::vec::Vec<u32>>,
+        stuck_queue: core::cell::Cell<bool>,
+    }
+
+    impl FakeBank {
+        fn new() -> Self {
+            Self {
+                regs: core::cell::RefCell::new(alloc::vec![0u32; 0x6000 / 4]),
+                stuck_queue: core::cell::Cell::new(false),
+            }
+        }
+        fn value(&self, offset: u64) -> u32 {
+            self.regs
+                .borrow()
+                .get((offset / 4) as usize)
+                .copied()
+                .unwrap_or(0)
+        }
+        fn mdic_cmd(data: u16) -> u32 {
+            (data as u32) | super::MDIC_PHY_ADDR | super::MDIC_OP_WRITE
+        }
+    }
+
+    impl super::pm::RegBank for FakeBank {
+        fn read32(&self, offset: u64) -> u32 {
+            self.value(offset)
+        }
+        fn write32(&self, offset: u64, value: u32) {
+            let q0 = super::queue_regs(0);
+            let mut value = value;
+            if offset == super::REG_MDIC {
+                // Synchronous MDIC completion (QEMU behaviour).
+                value |= super::MDIC_READY;
+            }
+            if self.stuck_queue.get() && (offset == q0.txdctl || offset == q0.rxdctl) {
+                value &= !super::QUEUE_ENABLE;
+            }
+            if let Some(slot) = self.regs.borrow_mut().get_mut((offset / 4) as usize) {
+                *slot = value;
+            }
+        }
+        fn wait(&self, _us: u64, mut ready: impl FnMut() -> bool) -> bool {
+            ready()
+        }
+    }
+
+    fn smoke_igb_pm_suspend_unarmed_powers_phy_down() -> TestResult {
+        let bank = FakeBank::new();
+        let none = super::WolFilters {
+            link_change: false,
+            magic: false,
+            directed_exact: false,
+            multicast: false,
+            broadcast: false,
+        };
+        let program = super::wol_suspend_program(none, false, false);
+        if !program.power_down_link || program.wufc != 0 {
+            return TestResult::Fail("igb unarmed suspend program did not select power-down");
+        }
+        super::pm::suspend_plan(&bank, &program);
+        let q0 = super::queue_regs(0);
+        if bank.value(super::REG_IMC) != !0u32 || bank.value(super::REG_EIMC) != !0u32 {
+            return TestResult::Fail("igb suspend did not mask interrupts");
+        }
+        if bank.value(q0.txdctl) != 0 || bank.value(q0.rxdctl) != 0 {
+            return TestResult::Fail("igb suspend did not disable queue 0");
+        }
+        if bank.value(super::REG_TCTL) != super::TCTL_SUSPEND_OFF
+            || bank.value(super::REG_RCTL) != super::RCTL_SUSPEND_OFF
+        {
+            return TestResult::Fail("igb suspend did not stop DMA with the suspend words");
+        }
+        if bank.value(super::REG_WUC) != 0 || bank.value(super::REG_WUFC) != 0 {
+            return TestResult::Fail("igb unarmed suspend left WoL filters armed");
+        }
+        if bank.value(super::REG_MDIC) != FakeBank::mdic_cmd(super::PHY_BMCR_PWRDOWN) {
+            return TestResult::Fail("igb unarmed suspend did not power the PHY down");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/igb",
+        smoke_igb_pm_suspend_unarmed_powers_phy_down
+    );
+
+    fn smoke_igb_pm_suspend_armed_keeps_receive() -> TestResult {
+        let bank = FakeBank::new();
+        let program = super::wol_suspend_program(super::WolFilters::magic_only(), false, false);
+        if program.wufc != super::WUFC_MAG || program.power_down_link {
+            return TestResult::Fail("igb armed suspend program did not select magic-only");
+        }
+        super::pm::suspend_plan(&bank, &program);
+        if bank.value(super::REG_RCTL) != super::RCTL_SUSPEND_ARMED {
+            return TestResult::Fail("igb armed suspend did not keep receive on");
+        }
+        if bank.value(super::REG_CTRL) & super::CTRL_ADVD3WUC == 0 {
+            return TestResult::Fail("igb armed suspend did not set CTRL.ADVD3WUC");
+        }
+        if bank.value(super::REG_WUC) != super::WUC_PME_EN
+            || bank.value(super::REG_WUFC) != super::WUFC_MAG
+        {
+            return TestResult::Fail("igb armed suspend did not program WUC/WUFC");
+        }
+        if bank.value(super::REG_MDIC) == FakeBank::mdic_cmd(super::PHY_BMCR_PWRDOWN) {
+            return TestResult::Fail("igb armed suspend powered the PHY down");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_pm_suspend_armed_keeps_receive);
+
+    fn smoke_igb_pm_resume_renegotiates_and_unmasks() -> TestResult {
+        let bank = FakeBank::new();
+        let none = super::WolFilters {
+            link_change: false,
+            magic: false,
+            directed_exact: false,
+            multicast: false,
+            broadcast: false,
+        };
+        super::pm::suspend_plan(&bank, &super::wol_suspend_program(none, false, false));
+        if super::pm::resume_plan(&bank, true, false).is_err() {
+            return TestResult::Fail("igb resume failed on a reflecting queue");
+        }
+        let q0 = super::queue_regs(0);
+        if bank.value(super::REG_WUS) != super::wus_clear_word()
+            || bank.value(super::REG_WUC) != 0
+            || bank.value(super::REG_WUFC) != 0
+        {
+            return TestResult::Fail("igb resume did not clear wake status");
+        }
+        let anrestart = super::PHY_BMCR_ANENABLE | super::PHY_BMCR_ANRESTART;
+        if bank.value(super::REG_MDIC) != FakeBank::mdic_cmd(anrestart) {
+            return TestResult::Fail("igb resume did not re-kick the PHY (AN restart)");
+        }
+        if bank.value(super::REG_RCTL) & super::RCTL_EN == 0
+            || bank.value(super::REG_TCTL) & super::TCTL_EN == 0
+        {
+            return TestResult::Fail("igb resume did not restore RCTL/TCTL");
+        }
+        if !super::queue_enable_reflected(bank.value(q0.txdctl))
+            || !super::queue_enable_reflected(bank.value(q0.rxdctl))
+        {
+            return TestResult::Fail("igb resume did not re-enable queue 0");
+        }
+        if bank.value(super::REG_IMS) != super::IMS_DEFAULT {
+            return TestResult::Fail("igb resume did not unmask MSI-X");
+        }
+        // Polled device: no vector bound, mask stays as suspend left it.
+        let polled = FakeBank::new();
+        super::pm::suspend_plan(&polled, &super::wol_suspend_program(none, false, false));
+        if super::pm::resume_plan(&polled, false, false).is_err()
+            || polled.value(super::REG_IMS) != 0
+        {
+            return TestResult::Fail("igb resume armed IMS on a polled device");
+        }
+        // VT allocated: mailbox cause re-armed alongside IMS.
+        let vt = FakeBank::new();
+        super::pm::suspend_plan(&vt, &super::wol_suspend_program(none, false, false));
+        if super::pm::resume_plan(&vt, true, true).is_err()
+            || vt.value(super::REG_IMS) != super::IMS_DEFAULT | super::IMS_VMMB
+            || vt.value(super::vmdq::REG_MBVFIMR) != super::vmdq::MBVFIMR_ALL_VFS
+        {
+            return TestResult::Fail("igb resume did not re-arm the VT mailbox cause");
+        }
+        // Stuck queue: handshake never reflects, resume fails closed
+        // before unmasking.
+        let stuck = FakeBank::new();
+        stuck.stuck_queue.set(true);
+        super::pm::suspend_plan(&stuck, &super::wol_suspend_program(none, false, false));
+        if super::pm::resume_plan(&stuck, true, false).is_ok() || stuck.value(super::REG_IMS) != 0 {
+            return TestResult::Fail("igb resume unmasked MSI-X with a stuck queue");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/igb",
+        smoke_igb_pm_resume_renegotiates_and_unmasks
+    );
 }

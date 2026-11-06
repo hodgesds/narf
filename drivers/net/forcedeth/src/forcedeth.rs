@@ -92,7 +92,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 use narf_driver_runtime::{
@@ -250,6 +250,209 @@ pub const TXRXCTL_DESC_1: u32 = 0;
 pub const TXRXCTL_DESC_2: u32 = 0x002100;
 pub const TXRXCTL_DESC_3: u32 = 0xC02200;
 
+// ── Suspend / resume register plans (issue #793) ────────────────────
+
+/// Suspend / resume register plans over a minimal bank so fixtures
+/// drive the exact program against a fake bank (end-to-end register
+/// writes, no silicon) while the live path runs it against BAR0 via
+/// [`MmioBank`]. Same shape as e1000's inline `pm` module.
+///
+/// * Suspend: mask interrupts (IRQ_MASK = 0), acknowledge pending
+///   causes (IRQ_STATUS = all-ones — the same pair bring-up writes),
+///   stop the RX/TX paths (RCV_CTL = 0, XMIT_CTL = 0 — the symmetric
+///   stop of bring-up step 10's `nv_start_rxtx` enable), then run
+///   the `nv_txrx_reset` dance (raise RESET | BIT2 | txrxctl_bits,
+///   2 ms settle, lower by writing BIT2 | txrxctl_bits — the reset
+///   bit is dropped by the explicit lowering write, per bring-up
+///   step 1) to drain any in-flight DMA. The descriptor rings and
+///   their programmed bases persist.
+/// * Resume: re-enable the RX/TX paths (RCV_CTL =
+///   RX_PATH_EN | START, XMIT_CTL = TX_PATH_EN | START). The
+///   interrupt mask is NOT restored: the driver runs polled
+///   (bring-up leaves IRQ_MASK = 0; no vector is wired), so
+///   re-arming `IRQMASK_THROUGHPUT` would arm interrupts no
+///   handler is wired to.
+///
+/// PHY: no PHY power-down. The PHY re-negotiation (BMCR
+/// ANENABLE | ANRESTART via `mii_rw`) lives in `resume`, next to
+/// the link re-read: it needs a live MDIO transaction, which the
+/// register plan does not do.
+mod pm {
+    use super::{
+        RCV_CTL_RX_PATH_EN, RCV_CTL_START, REG_IRQ_MASK, REG_IRQ_STATUS, REG_RCV_CTL,
+        REG_TX_RX_CONTROL, REG_XMIT_CTL, TXRXCTL_BIT2, TXRXCTL_RESET, XMIT_CTL_START,
+        XMIT_CTL_TX_PATH_EN,
+    };
+    use narf_bus::MmioRegion;
+
+    /// Minimal register-bank abstraction so the register
+    /// conversation can be exercised against a fake bank in
+    /// fixtures and against real MMIO in the driver via
+    /// [`MmioBank`]. The `delay_ms` step is the `nv_txrx_reset`
+    /// settle: bring-up implements it as a pure delay via
+    /// `responsive_spin_until(|| false, …)`.
+    pub trait RegBank {
+        fn read32(&self, offset: u64) -> u32;
+        fn write32(&self, offset: u64, value: u32);
+        fn delay_ms(&self, ms: u64);
+    }
+
+    /// [`RegBank`] over a real BAR0 mapping.
+    #[derive(Debug)]
+    pub struct MmioBank<'a> {
+        mmio: &'a MmioRegion,
+    }
+
+    impl<'a> MmioBank<'a> {
+        pub fn new(mmio: &'a MmioRegion) -> Self {
+            Self { mmio }
+        }
+    }
+
+    impl RegBank for MmioBank<'_> {
+        fn read32(&self, offset: u64) -> u32 {
+            // SAFETY: the driver owns BAR0 exclusively; the caller
+            // guarantees `offset` is a valid device register.
+            unsafe { self.mmio.read32(offset) }
+        }
+        fn write32(&self, offset: u64, value: u32) {
+            // SAFETY: same as above.
+            unsafe { self.mmio.write32(offset, value) }
+        }
+        fn delay_ms(&self, ms: u64) {
+            // Pure delay, mirroring bring-up's reset settle.
+            narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(ms));
+        }
+    }
+
+    /// The `nv_txrx_reset` dance (bring-up step 1): raise RESET,
+    /// flush-by-read, settle 2 ms, lower by writing BIT2 |
+    /// txrxctl_bits, flush-by-read.
+    fn txrx_reset(bank: &impl RegBank, txrxctl_bits: u32) {
+        bank.write32(
+            REG_TX_RX_CONTROL,
+            TXRXCTL_BIT2 | TXRXCTL_RESET | txrxctl_bits,
+        );
+        let _ = bank.read32(REG_TX_RX_CONTROL);
+        bank.delay_ms(2);
+        bank.write32(REG_TX_RX_CONTROL, TXRXCTL_BIT2 | txrxctl_bits);
+        let _ = bank.read32(REG_TX_RX_CONTROL);
+    }
+
+    /// Suspend register program: mask interrupts, acknowledge
+    /// pending causes, stop the RX/TX paths, drain in-flight DMA
+    /// with the `nv_txrx_reset` dance.
+    pub fn suspend_plan(bank: &impl RegBank, txrxctl_bits: u32) {
+        bank.write32(REG_IRQ_MASK, 0);
+        bank.write32(REG_IRQ_STATUS, 0xFFFF_FFFF);
+        bank.write32(REG_RCV_CTL, 0);
+        bank.write32(REG_XMIT_CTL, 0);
+        txrx_reset(bank, txrxctl_bits);
+    }
+
+    /// Resume register program: re-enable the RX/TX paths.
+    pub fn resume_plan(bank: &impl RegBank) {
+        bank.write32(REG_RCV_CTL, RCV_CTL_RX_PATH_EN | RCV_CTL_START);
+        bank.write32(REG_XMIT_CTL, XMIT_CTL_TX_PATH_EN | XMIT_CTL_START);
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    mod tests {
+        use super::*;
+        use narf_kernel_test::{kernel_test_in, TestResult};
+
+        /// In-memory register bank for the PM fixtures: 1 KiB of
+        /// BAR0 window, covering IRQ_STATUS/MASK (0x00/0x04),
+        /// XMIT_CTL (0x84), RCV_CTL (0x94) and TX_RX_CONTROL
+        /// (0x144). Records the settle delays.
+        struct FakeBank {
+            regs: core::cell::RefCell<alloc::vec::Vec<u32>>,
+            delays_ms: core::cell::RefCell<alloc::vec::Vec<u64>>,
+        }
+
+        impl FakeBank {
+            fn new() -> Self {
+                Self {
+                    regs: core::cell::RefCell::new(alloc::vec![0u32; 0x400 / 4]),
+                    delays_ms: core::cell::RefCell::new(alloc::vec::Vec::new()),
+                }
+            }
+            fn get(&self, offset: u64) -> u32 {
+                *self.regs.borrow().get((offset / 4) as usize).unwrap_or(&0)
+            }
+        }
+
+        impl RegBank for FakeBank {
+            fn read32(&self, offset: u64) -> u32 {
+                self.get(offset)
+            }
+            fn write32(&self, offset: u64, value: u32) {
+                if let Some(slot) = self.regs.borrow_mut().get_mut((offset / 4) as usize) {
+                    *slot = value;
+                }
+            }
+            fn delay_ms(&self, ms: u64) {
+                self.delays_ms.borrow_mut().push(ms);
+            }
+        }
+
+        fn smoke_forcedeth_pm_suspend_stops_paths() -> TestResult {
+            let bank = FakeBank::new();
+            // Bring-up state: paths enabled, interrupts armed.
+            bank.write32(REG_RCV_CTL, RCV_CTL_RX_PATH_EN | RCV_CTL_START);
+            bank.write32(REG_XMIT_CTL, XMIT_CTL_TX_PATH_EN | XMIT_CTL_START);
+            bank.write32(REG_IRQ_MASK, super::super::IRQMASK_THROUGHPUT);
+            suspend_plan(&bank, super::super::TXRXCTL_DESC_2);
+            if bank.read32(REG_RCV_CTL) != 0 || bank.read32(REG_XMIT_CTL) != 0 {
+                return TestResult::Fail("forcedeth suspend did not stop the RX/TX paths");
+            }
+            if bank.read32(REG_IRQ_MASK) != 0 || bank.read32(REG_IRQ_STATUS) != 0xFFFF_FFFF {
+                return TestResult::Fail("forcedeth suspend did not mask/ack interrupts");
+            }
+            // The reset dance ran: RESET raised, 2 ms settle, lowered.
+            if bank.read32(REG_TX_RX_CONTROL) != TXRXCTL_BIT2 | super::super::TXRXCTL_DESC_2 {
+                return TestResult::Fail("forcedeth suspend left TXRXCTL in the reset state");
+            }
+            if *bank.delays_ms.borrow() != [2u64] {
+                return TestResult::Fail("forcedeth suspend did not run the 2 ms reset settle");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!(
+            "drivers/net/forcedeth",
+            smoke_forcedeth_pm_suspend_stops_paths
+        );
+
+        fn smoke_forcedeth_pm_resume_restores_paths() -> TestResult {
+            let bank = FakeBank::new();
+            bank.write32(REG_RCV_CTL, RCV_CTL_RX_PATH_EN | RCV_CTL_START);
+            bank.write32(REG_XMIT_CTL, XMIT_CTL_TX_PATH_EN | XMIT_CTL_START);
+            suspend_plan(&bank, super::super::TXRXCTL_DESC_2);
+            resume_plan(&bank);
+            if bank.read32(REG_RCV_CTL) != RCV_CTL_RX_PATH_EN | RCV_CTL_START {
+                return TestResult::Fail("forcedeth resume did not re-enable the RX path");
+            }
+            if bank.read32(REG_XMIT_CTL) != XMIT_CTL_TX_PATH_EN | XMIT_CTL_START {
+                return TestResult::Fail("forcedeth resume did not re-enable the TX path");
+            }
+            // Polled device: the mask stays as suspend left it.
+            if bank.read32(REG_IRQ_MASK) != 0 {
+                return TestResult::Fail("forcedeth resume armed interrupts on a polled device");
+            }
+            // Suspend → resume → suspend is stable.
+            suspend_plan(&bank, super::super::TXRXCTL_DESC_2);
+            if bank.read32(REG_RCV_CTL) != 0 || bank.read32(REG_XMIT_CTL) != 0 {
+                return TestResult::Fail("forcedeth second suspend drifted from the first");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!(
+            "drivers/net/forcedeth",
+            smoke_forcedeth_pm_resume_restores_paths
+        );
+    }
+}
+
 /// `RingSizes` field encoding. The chip wants (count − 1) in the two
 /// low halfwords, low half = RX, high half = TX.
 pub const RINGSZ_TXSHIFT: u32 = 0;
@@ -361,6 +564,9 @@ pub enum NicError {
     TxRingFull,
     /// `transmit` polled too long for VALID to clear.
     TxTimeout,
+    /// The device is suspended for system suspend (issue #793):
+    /// the datapath gates refuse TX and RX while suspended.
+    Suspended,
 }
 
 // ── Descriptor in-memory shape ──────────────────────────────────────
@@ -440,6 +646,9 @@ pub struct ForcedethNic {
     /// Linux carries this in `np->txrxctl_bits` so every write to
     /// REG_TX_RX_CONTROL can OR in the persistent state.
     txrxctl_bits: u32,
+    /// Set by `suspend`, cleared by `resume`: the datapath gates
+    /// refuse TX and RX while this is set (issue #793).
+    suspended: AtomicBool,
 
     // IPC integration
     rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -711,6 +920,7 @@ impl ForcedethNic {
             link_up,
             phy_addr,
             txrxctl_bits,
+            suspended: AtomicBool::new(false),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
@@ -725,6 +935,9 @@ impl ForcedethNic {
     /// Transmit a single Ethernet frame, polled. Frame must be in
     /// `[1, 1518]` bytes; padding for runt frames is the chip's job.
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(NicError::Suspended);
+        }
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
         }
@@ -810,6 +1023,9 @@ impl ForcedethNic {
     /// when a descriptor's AVAIL bit reads 0 (chip handed it back)
     /// and `None` when the head is still chip-owned.
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        if self.suspended.load(Ordering::Acquire) {
+            return None;
+        }
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -885,6 +1101,49 @@ impl ForcedethNic {
         let up = (bmsr as u16) & BMSR_LINK_UP != 0;
         self.link_up = up;
         up
+    }
+
+    /// Suspend the device for system suspend (issue #793): mask
+    /// interrupts, stop the RX/TX paths and drain in-flight DMA via
+    /// the `pm` plan, and publish link down. A second suspend is a
+    /// no-op success. The PHY stays powered (its autoneg
+    /// advertisement persists), and the descriptor rings persist.
+    pub fn suspend(&self) -> Result<(), NicError> {
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        pm::suspend_plan(&pm::MmioBank::new(&self.mmio), self.txrxctl_bits);
+        crate::publish::publish_link(forcedeth_ifname(), crate::publish::LinkSample::DOWN);
+        Ok(())
+    }
+
+    /// Resume a suspended device (issue #793): re-kick the PHY so
+    /// the link re-negotiates after the path stop (BMCR
+    /// ANENABLE | ANRESTART via `mii_rw` — the same write bring-up
+    /// uses, minus the soft reset), re-enable the RX/TX paths via
+    /// the `pm` plan, and republish link from a live BMSR sample.
+    /// Resuming a running device is a no-op success. The PHY
+    /// re-kick is best-effort and skipped entirely when no PHY
+    /// responded at bring-up (`phy_addr == 32`): a failed MDIO
+    /// transaction leaves the advertisement as it was, and the
+    /// link still comes back on its own.
+    pub fn resume(&self) -> Result<(), NicError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.phy_addr < 32 {
+            if let Ok(bmcr) = mii_rw(&self.mmio, self.phy_addr, MII_BMCR, None) {
+                let word = (bmcr as u16) | BMCR_AUTONEG_EN | BMCR_AUTONEG_RESTART;
+                let _ = mii_rw(&self.mmio, self.phy_addr, MII_BMCR, Some(word as u32));
+            }
+        }
+        pm::resume_plan(&pm::MmioBank::new(&self.mmio));
+        self.suspended.store(false, Ordering::Release);
+        crate::publish::publish_link(
+            forcedeth_ifname(),
+            crate::publish::LinkSample::carrier_only(self.live_link_up()),
+        );
+        Ok(())
     }
 
     /// Read + write-1-clear the IRQ status. Stage-3 wires this into an
@@ -982,6 +1241,17 @@ pub fn forcedeth_ifname() -> &'static str {
     FORCEDETH_IFNAME.get()
 }
 
+impl narf_power::device_pm::DevicePmOps for ForcedethNic {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.suspend()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+}
+
 /// SendFn registered with `narf_net::iface` at probe time. Routes the
 /// kernel-side TCP stack's outbound frames through
 /// `ForcedethNic::transmit`. The Arc is cloned out rather than holding
@@ -1044,6 +1314,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         crate::publish::LinkSample::carrier_only(nic.live_link_up()),
     );
     FORCEDETH_IFNAME.set(name);
+
+    // Device-PM registration (#793): system suspend fans out
+    // through `ForcedethNic::suspend` / `ForcedethNic::resume` via
+    // the `DevicePmOps` impl below. The registry is idempotent on
+    // the interface name. There is no forcedeth detach path to
+    // withdraw the entry from yet — the CONTROLLER slot is never
+    // drained either, so the entry lives as long as the device does.
+    narf_power::device_pm::register_device_pm_ops(forcedeth_ifname(), nic.clone());
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
