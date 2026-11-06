@@ -1270,10 +1270,10 @@ impl PumpCore {
         } else {
             match self.classic_connect(addr6) {
                 Ok(()) => {}
-                Err(classic::ClassicError::UnknownPeer) => {
+                Err(ClassicError::UnknownPeer) => {
                     return BtConnectStatus::UnknownPeer;
                 }
-                Err(classic::ClassicError::WrongPhase) | Err(classic::ClassicError::Transport) => {
+                Err(ClassicError::WrongPhase) | Err(ClassicError::Transport) => {
                     return BtConnectStatus::Busy;
                 }
                 Err(_) => return BtConnectStatus::Failed,
