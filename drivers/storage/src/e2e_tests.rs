@@ -1055,10 +1055,6 @@ kernel_test_in!(
 /// fake's W1C write path models the hardware.
 fn smoke_ahci_two_hba_irq_completion() -> TestResult {
     use crate::ahci::{ahci_isr, ahci_isr_regs, hba_enable_irq, hba_finish_init};
-    use core::{
-        future::Future,
-        task::{Context, Waker},
-    };
     use narf_interrupts::IrqStatus;
 
     // D2H Register FIS interrupt, AHCI 1.3.1 §3.3.6 bit 0: the
@@ -1183,44 +1179,50 @@ fn smoke_ahci_two_hba_irq_routing(
     let fc_a0 = narf_interrupts::dispatch::fire_count(v_a);
     let fc_b0 = narf_interrupts::dispatch::fire_count(v_b);
     let noop = Waker::noop();
-    let mut wait_a = core::pin::pin!(narf_interrupts::wait_for_irq(v_a));
-    let mut wait_b = core::pin::pin!(narf_interrupts::wait_for_irq(v_b));
-    if wait_a
-        .as_mut()
-        .poll(&mut Context::from_waker(&noop))
-        .is_ready()
-        || wait_b
+    // The waiters live in this block so they actually drop at its end:
+    // dropping the `pin!` futures runs `WaitForIrq::Drop`, which clears
+    // their waker slots before the negative control below re-fires the
+    // vector. (`drop()` on the `Pin<&mut _>` handles would NOT do that —
+    // the handles don't own the future, so dropping one only ends the
+    // borrow; clippy rightly rejects it as `drop_non_drop`.)
+    {
+        let mut wait_a = core::pin::pin!(narf_interrupts::wait_for_irq(v_a));
+        let mut wait_b = core::pin::pin!(narf_interrupts::wait_for_irq(v_b));
+        if wait_a
             .as_mut()
-            .poll(&mut Context::from_waker(&noop))
+            .poll(&mut Context::from_waker(noop))
             .is_ready()
-    {
-        return TestResult::Fail("waiters must start Pending");
-    }
+            || wait_b
+                .as_mut()
+                .poll(&mut Context::from_waker(noop))
+                .is_ready()
+        {
+            return TestResult::Fail("waiters must start Pending");
+        }
 
-    // Fire HBA-B's vector only: HBA-B's completion.
-    narf_interrupts::dispatch::on_irq(v_b);
-    if narf_interrupts::dispatch::fire_count(v_b) != fc_b0 + 1 {
-        return TestResult::Fail("HBA-B vector fire_count must advance by exactly 1");
+        // Fire HBA-B's vector only: HBA-B's completion.
+        narf_interrupts::dispatch::on_irq(v_b);
+        if narf_interrupts::dispatch::fire_count(v_b) != fc_b0 + 1 {
+            return TestResult::Fail("HBA-B vector fire_count must advance by exactly 1");
+        }
+        if narf_interrupts::dispatch::fire_count(v_a) != fc_a0 {
+            return TestResult::Fail("HBA-A vector fire_count must not move on HBA-B's IRQ");
+        }
+        if wait_b
+            .as_mut()
+            .poll(&mut Context::from_waker(noop))
+            .is_pending()
+        {
+            return TestResult::Fail("HBA-B waiter must resolve on HBA-B's IRQ");
+        }
+        if wait_a
+            .as_mut()
+            .poll(&mut Context::from_waker(noop))
+            .is_ready()
+        {
+            return TestResult::Fail("HBA-A waiter must stay Pending on HBA-B's IRQ");
+        }
     }
-    if narf_interrupts::dispatch::fire_count(v_a) != fc_a0 {
-        return TestResult::Fail("HBA-A vector fire_count must not move on HBA-B's IRQ");
-    }
-    if wait_b
-        .as_mut()
-        .poll(&mut Context::from_waker(&noop))
-        .is_pending()
-    {
-        return TestResult::Fail("HBA-B waiter must resolve on HBA-B's IRQ");
-    }
-    if wait_a
-        .as_mut()
-        .poll(&mut Context::from_waker(&noop))
-        .is_ready()
-    {
-        return TestResult::Fail("HBA-A waiter must stay Pending on HBA-B's IRQ");
-    }
-    drop(wait_a);
-    drop(wait_b);
 
     // Negative control: with HBA-B drained, the same fire is
     // spurious — the production handler ran, saw an empty IS,
