@@ -3280,7 +3280,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     let mac = dev.mac;
     let link_sample = igb_link_sample(&dev);
-    *CONTROLLER.lock() = Some(dev);
+    *CONTROLLER.lock() = Some(dev.clone());
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,

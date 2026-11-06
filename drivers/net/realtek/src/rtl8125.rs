@@ -1786,7 +1786,6 @@ fn rtl8125_link_sample(status: u8) -> crate::publish::LinkSample {
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
-
 impl narf_power::device_pm::DevicePmOps for RtlNic {
     fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
         self.suspend()

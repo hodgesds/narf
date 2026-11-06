@@ -2622,7 +2622,6 @@ fn rtl8127_link_sample(status: u8) -> crate::publish::LinkSample {
 }
 
 /// Probe entry — installed via `bus::register_pci_driver`.
-
 impl narf_power::device_pm::DevicePmOps for Rtl8127Nic {
     fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
         self.suspend()

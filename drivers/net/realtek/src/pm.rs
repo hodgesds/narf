@@ -154,7 +154,7 @@ pub fn resume_plan(bank: &impl RegBank, imr: ImrPort, imr_word: u32, irq_bound: 
     cr
 }
 
-#[cfg(any(test, feature = "kernel-test"))]
+#[cfg(any(test, feature = "builtin"))]
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};

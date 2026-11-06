@@ -1774,7 +1774,7 @@ fn smoke_i40e_pm_suspend_disables_queues_and_masks() -> TestResult {
     use super::ring::{
         reg_gllan_txpre_qdis, reg_qrx_ena, reg_qtx_ena, QENA_REQ, TXPRE_QDIS_SET_QDIS,
     };
-    let bank = FakeBank::new();
+    let mut bank = FakeBank::new();
     bank.live_queues();
     super::pm::suspend_plan(&bank, 0, &[0, 1]);
     // Interrupt delivery masked (Shared::mask program).
@@ -1811,7 +1811,7 @@ fn smoke_i40e_pm_resume_reenables_and_rearms() -> TestResult {
     use super::ring::{
         reg_qrx_ena, reg_qrx_tail, reg_qtx_ena, reg_qtx_head, QENA_REQ, RX_TAIL_INIT,
     };
-    let bank = FakeBank::new();
+    let mut bank = FakeBank::new();
     bank.live_queues();
     super::pm::suspend_plan(&bank, 0, &[0, 1]);
     if super::pm::resume_plan(&bank, 0, &[0, 1]).is_err() {
@@ -1851,7 +1851,7 @@ kernel_test_in!(
 
 fn smoke_i40e_pm_resume_fails_closed() -> TestResult {
     use super::irq::REG_PFINT_ICR0;
-    let bank = FakeBank::new();
+    let mut bank = FakeBank::new();
     bank.live_queues();
     super::pm::suspend_plan(&bank, 0, &[0, 1]);
     // A fatal cause in ICR0 refuses resume before any re-enable.
@@ -1863,7 +1863,7 @@ fn smoke_i40e_pm_resume_fails_closed() -> TestResult {
     }
     // A queue whose STAT never follows REQ fails the enable wait
     // before interrupts re-arm.
-    let stuck = FakeBank::new();
+    let mut stuck = FakeBank::new();
     stuck.live_queues();
     stuck.stuck_queue.set(true);
     super::pm::suspend_plan(&stuck, 0, &[0, 1]);
