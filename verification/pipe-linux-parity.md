@@ -40,8 +40,7 @@ cargo xtask test --arch=aarch64 --features user-mode-e2e --subsystem verificatio
   `user-mode-e2e`, on both targets.
   Host `--all-targets` Clippy also passes for `narf-lib` and the pipe fixture.
 * Host `narf-lib` unit tests: **39 pass**; one ignored doctest. Workspace and
-  standalone fixture formatting, diff whitespace, and safety-argument TOML
-  plus invariant-reference checks pass.
+  standalone fixture formatting and diff-whitespace checks pass.
 
 The literal bare-metal `clippy --all-targets` command cannot build Rust's
 host-style `test` crate (`E0463`). Kernel unit tests instead run in QEMU through
