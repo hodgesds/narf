@@ -6751,10 +6751,7 @@ fn fitrim_fixture() -> Option<(
     use narf_block::ram::RamBlockDevice;
     use narf_lib::id::DomainId;
     let device = alloc::sync::Arc::new(RecordingDiscardBlock {
-        inner: alloc::sync::Arc::new(RamBlockDevice::from_image(
-            512,
-            build_ext2_image(b"page cache"),
-        )),
+        inner: RamBlockDevice::from_image(512, build_ext2_image(b"page cache")),
         discards: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
     });
     let volume = poll_once(crate::volume::Ext2Volume::mount(
@@ -6891,10 +6888,7 @@ fn smoke_ext2_fitrim_rejects_unsupported_device_and_bad_ranges() -> TestResult {
     use narf_block::ram::RamBlockDevice;
     use narf_lib::id::DomainId;
     // Plain RamBlockDevice never claims Discard.
-    let device = alloc::sync::Arc::new(RamBlockDevice::from_image(
-        512,
-        build_ext2_image(b"page cache"),
-    ));
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"page cache"));
     let volume = match poll_once(crate::volume::Ext2Volume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(volume)) => volume,
         _ => return TestResult::Fail("fitrim error-fixture mount failed"),
@@ -6994,7 +6988,7 @@ impl narf_filesystem::IoctlContext for FitrimTestCtx {
 /// (`FileOps::ioctl_user`). Both report the same trimmed bytes,
 /// and the discards land on the driver trim hook.
 fn smoke_ext2_fitrim_ioctl_paths() -> TestResult {
-    use narf_filesystem::{DirOps, FileOps, FsInstance};
+    use narf_filesystem::FsInstance;
     let (device, volume) = match fitrim_fixture() {
         Some(pair) => pair,
         None => return TestResult::Fail("fitrim fixture mount failed"),
