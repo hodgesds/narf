@@ -269,7 +269,7 @@ mod pm {
         mac_ctrl
     }
 
-    #[cfg(any(test, feature = "kernel-test"))]
+    #[cfg(any(test, feature = "builtin"))]
     mod tests {
         use super::*;
         use narf_kernel_test::{kernel_test_in, TestResult};

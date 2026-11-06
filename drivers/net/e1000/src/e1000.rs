@@ -4790,6 +4790,7 @@ mod tests {
 
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    use super::pm::RegBank;
     use super::{
         alloc_coherent, channel, mta_bit, mta_word, multicast_hash12, rar_encode, rar_slot_ok,
         vfta_bit, vfta_word, vlan_reinsert_tag, vlan_tci_parts, DmaBuffer, DmaPool, Frame,

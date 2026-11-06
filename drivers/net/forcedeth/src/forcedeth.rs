@@ -357,7 +357,7 @@ mod pm {
         bank.write32(REG_XMIT_CTL, XMIT_CTL_TX_PATH_EN | XMIT_CTL_START);
     }
 
-    #[cfg(any(test, feature = "kernel-test"))]
+    #[cfg(any(test, feature = "builtin"))]
     mod tests {
         use super::*;
         use narf_kernel_test::{kernel_test_in, TestResult};

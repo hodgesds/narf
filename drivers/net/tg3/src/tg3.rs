@@ -131,8 +131,6 @@ const REG_GRC_MISC_CFG: u64 = 0x6804;
 // All bit positions mirror Linux `tg3.h`.
 
 // MISC_HOST_CTRL (0x0068).
-const MISC_HOST_CTRL_BYTE_SWAP: u32 = 0x0000_0004;
-const MISC_HOST_CTRL_WORD_SWAP: u32 = 0x0000_0008;
 const MISC_HOST_CTRL_PCISTATE_RW: u32 = 0x0000_0010;
 const MISC_HOST_CTRL_CLKREG_RW: u32 = 0x0000_0020;
 const MISC_HOST_CTRL_INDIR_ACCESS: u32 = 0x0000_0080;
@@ -280,6 +278,7 @@ mod pm {
     /// 5. Program GRC_MODE (host stackup).
     /// 6. Program the MII clock divider, then settle ~1 ms before
     ///    the MI bus is stable.
+    ///
     /// Returns whether the core-clock reset bit cleared in time.
     /// The post-reset programming runs regardless — a timed-out
     /// reset still leaves the host-side registers programmed.
@@ -297,7 +296,7 @@ mod pm {
         cleared
     }
 
-    #[cfg(any(test, feature = "kernel-test"))]
+    #[cfg(any(test, feature = "builtin"))]
     mod tests {
         use super::*;
         use narf_kernel_test::{kernel_test_in, TestResult};
