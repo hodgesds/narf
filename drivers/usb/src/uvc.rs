@@ -1783,9 +1783,6 @@ async fn pump_video_frames_pipelined<T: UvcTransport>(
     let mut reassembler = UvcFrameReassembler::new();
     let mut consecutive_errors = 0u8;
 
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-
     loop {
         if take_pump_exit_request(idx, generation) {
             return Ok(());
@@ -1805,14 +1802,26 @@ async fn pump_video_frames_pipelined<T: UvcTransport>(
                 }
             }
         }
-        // Poll every in-flight transfer once, head first.
-        for k in 0..depth {
-            let i = (head + k) % depth;
-            if let Some(fut) = in_flight[i].as_mut() {
-                if let Poll::Ready((buf, result)) = fut.as_mut().poll(&mut cx) {
-                    completed[i] = Some((buf, result));
-                    in_flight[i] = None;
-                    scheduler.on_complete();
+        // Poll every in-flight transfer once, head first. The poll
+        // context lives only in this block: `core::task::Context`
+        // is unconditionally `!Send` on this toolchain (it carries
+        // a `LocalWaker` and a `&mut dyn Any` extension), so holding
+        // it across the `yield_now().await` below would make the
+        // whole pump future `!Send` and unspawnable via
+        // `narf_scheduler::spawn`. The waker is a stateless no-op
+        // and the loop re-polls after every yield, so rebuilding it
+        // each round loses no wake.
+        {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            for k in 0..depth {
+                let i = (head + k) % depth;
+                if let Some(fut) = in_flight[i].as_mut() {
+                    if let Poll::Ready((buf, result)) = fut.as_mut().poll(&mut cx) {
+                        completed[i] = Some((buf, result));
+                        in_flight[i] = None;
+                        scheduler.on_complete();
+                    }
                 }
             }
         }
