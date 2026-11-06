@@ -2154,7 +2154,7 @@ fn native_hda_realtek256_coef_init_applied() -> TestResult {
     // The fixups run before the graph build: the first
     // GET_CONFIG_DEFAULT the enumerator sends for a pin must come
     // after both coef verbs.
-    let first_pincfg = verbs.iter().position(|v| (**v >> 8) & 0xfff == 0xf1c);
+    let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
     match first_pincfg {
         Some(at) if at_coef < at => {}
         _ => return TestResult::Fail("coef init must precede enumeration"),
@@ -2190,7 +2190,7 @@ fn native_hda_unknown_subsystem_fails_open() -> TestResult {
         .model
         .verbs
         .iter()
-        .any(|v| (**v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
+        .any(|v| (*v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
     {
         return TestResult::Fail("unwired chip must get no coef verbs");
     }
@@ -2222,7 +2222,7 @@ fn native_hda_non_realtek_gets_no_fixups() -> TestResult {
         .model
         .verbs
         .iter()
-        .any(|v| (**v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
+        .any(|v| (*v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
     {
         return TestResult::Fail("non-Realtek codec must get no coef verbs");
     }
@@ -2340,7 +2340,7 @@ fn native_hda_alc256_coef_rmw_update_applied() -> TestResult {
         return TestResult::Fail("ALC256 coef state must hold the masked updates");
     }
     // The init runs before enumeration.
-    let first_pincfg = verbs.iter().position(|v| (**v >> 8) & 0xfff == 0xf1c);
+    let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
     let last_coef = verbs
         .iter()
         .rposition(|v| matches!((*v >> 20) & 0xff, 0x20 | 0x53));
@@ -2412,7 +2412,7 @@ fn native_hda_alc282_coef_table_applied() -> TestResult {
         return TestResult::Fail("ALC282 init must end with the 0x6c write");
     }
     // The table runs before enumeration.
-    let first_pincfg = verbs.iter().position(|v| (**v >> 8) & 0xfff == 0xf1c);
+    let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
     let last_coef = verbs.iter().rposition(|v| (*v >> 20) & 0xff == coef_node);
     match (first_pincfg, last_coef) {
         (Some(at), Some(last)) if last < at => {}
@@ -2483,7 +2483,7 @@ fn native_hda_yoga9_bass_speaker_quirk_applied() -> TestResult {
         return TestResult::Fail("YOGA9 coef sequence must run verbatim in Linux order");
     }
     // The sequence runs before enumeration.
-    let first_pincfg = verbs.iter().position(|v| (**v >> 8) & 0xfff == 0xf1c);
+    let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
     let last_coef = verbs.iter().rposition(|v| (*v >> 20) & 0xff == coef_node);
     match (first_pincfg, last_coef) {
         (Some(at), Some(last)) if last < at => {}
