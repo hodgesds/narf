@@ -791,6 +791,8 @@ mod intel_gpu_guc_wa;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_hdr;
+#[cfg(feature = "intel")]
 mod intel_gpu_huc;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hwconfig;
@@ -800,6 +802,8 @@ mod intel_gpu_hwmon;
 pub(crate) mod intel_gpu_kms;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_media;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_media_gt_sysfs;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_modeset;
 #[cfg(feature = "intel")]
@@ -858,6 +862,8 @@ pub mod intel_gpu_user;
 pub mod intel_gpu_vbt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_vram;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_vrr;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_wm;
 #[cfg(feature = "intel")]

@@ -1304,3 +1304,488 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xe3lpd_modeset",
     smoke_xe3lpd_probe_window_flush_follows_media_step
 );
+
+// ── Display 30 Cursor, DSB and Double-Buffered LUTs ──────────────
+
+#[cfg(target_arch = "x86_64")]
+fn display30_resources(
+    platform: &crate::intel_gpu_kms::tests::MockPlatform,
+) -> crate::intel_gpu_dsb::Timing {
+    let timing = platform.dsb_timing();
+    let rung = CDCLK_TABLE[8];
+    assert_eq!(
+        (rung.cdclk_khz, rung.ratio, rung.waveform),
+        (307_200, 16, 0xffff)
+    );
+    for (r, v) in [
+        (0x510a0, 30 << 22),
+        (0x480c, 0x3c),
+        (0x70008, 0),
+        (0x70180, 0),
+        (0x46070, 0xc000_0010),
+        (0x46008, 0x8f00_ffff),
+        (
+            0x46000,
+            crate::intel_gpu_xelpg_cdclk::ctl_value_ip(DisplayIp::Xe3Lpd, rung),
+        ),
+    ] {
+        platform.set(r, v);
+    }
+    let mode = crate::intel_gpu_modeset::Mode {
+        pixel_clock_khz: timing.clock,
+        h_active: timing.width,
+        h_sync_start: timing.width + 10,
+        h_sync_end: timing.width + 20,
+        h_total: timing.htotal,
+        v_active: timing.height,
+        v_sync_start: timing.height + 5,
+        v_sync_end: timing.height + 10,
+        v_total: timing.vtotal,
+        ..crate::intel_gpu_modeset::Mode::VESA_1024X768_60
+    };
+    crate::intel_gpu_display_resources::initialize(platform, &mode, 307_200)
+        .unwrap()
+        .expect("display 30 resource profile");
+    platform.set(0x70008, 3 << 30);
+    platform.set(0x70180, 0x8400_0000);
+    timing
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe3lpd_cursor_and_dsb_pages_map_xe3_pat3() -> TestResult {
+    use crate::intel_gpu_gtt::{PteFormat, GGTT_ARRAY_BASE};
+    use crate::intel_gpu_kms::{tests::MockPlatform, Platform};
+    use crate::intel_gpu_scanout_io::{display_pat_programmed_ip, display_pte_ip};
+    use narf_filesystem::FsError;
+
+    let platform = MockPlatform::new().with_display_ip(DisplayIp::Xe3Lpd);
+    let timing = platform.dsb_timing();
+
+    // Verify display_pte_ip and display_pat_programmed_ip for Panther Lake.
+    assert_eq!(
+        display_pte_ip(Generation::PantherLake, Some(DisplayIp::Xe3Lpd)),
+        Some((PteFormat::Xe2, 3))
+    );
+    assert_eq!(display_pte_ip(Generation::PantherLake, None), None);
+    assert!(!display_pat_programmed_ip(
+        &platform,
+        Generation::PantherLake,
+        Some(DisplayIp::Xe3Lpd)
+    ));
+    platform.set(0x480c, 0x3c);
+    assert!(display_pat_programmed_ip(
+        &platform,
+        Generation::PantherLake,
+        Some(DisplayIp::Xe3Lpd)
+    ));
+
+    // Reserve DSB and arm.
+    let mut dsb = crate::intel_gpu_dsb::Owner::reserve_for(
+        platform.clone(),
+        0x100_0000,
+        Generation::PantherLake,
+    )
+    .unwrap();
+    dsb.arm(timing, &[(0x49028, 0)], None, platform.now())
+        .unwrap();
+
+    // Verify 4 DSB pages mapped with Xe2 PTE at PAT index 3.
+    let pages = platform.dsb_mappings();
+    assert_eq!(pages.len(), 8);
+    for (r, v) in pages {
+        if r % 8 == 0 {
+            assert_eq!(v & 1, 1, "DSB PTE valid {r:#x}");
+        } else {
+            assert_eq!((v >> 20) & 3, 3, "DSB PTE PAT index 3 {r:#x}");
+        }
+    }
+
+    // Reserve Cursor and stage an image.
+    let gem = crate::intel_gpu_gem::GemState::new();
+    let handle = gem.create(16384, |_, _| Ok(())).unwrap();
+    let image = gem.object(handle).unwrap();
+    let mut cursor = crate::intel_gpu_cursor::Owner::new_for(
+        platform.clone(),
+        0x100_0000,
+        timing,
+        Generation::PantherLake,
+    )
+    .unwrap();
+    let regs = cursor
+        .stage_with(|_| Vec::new(), Some(&image), true, Some((0, 0)))
+        .unwrap();
+    let base = regs.iter().find(|(r, _)| *r == 0x70084).unwrap().1;
+    assert_ne!(base, 0);
+
+    // Verify 8 cursor pages mapped with Xe2 PTE at PAT index 3.
+    for page in 0..8u64 {
+        let r = GGTT_ARRAY_BASE + (u64::from(base) / 4096 + page) * 8;
+        assert_eq!(platform.read32(r) & 1, 1, "cursor page {page} valid");
+        assert_eq!(
+            (platform.read32(r + 4) >> 20) & 3,
+            3,
+            "cursor page {page} PAT index 3"
+        );
+    }
+    cursor.cancel_unarmed();
+
+    // Refusal without PAT3.
+    let unprog = MockPlatform::new().with_display_ip(DisplayIp::Xe3Lpd);
+    assert!(matches!(
+        crate::intel_gpu_dsb::Owner::reserve_for(
+            unprog.clone(),
+            0x100_0000,
+            Generation::PantherLake
+        ),
+        Err(FsError::NoDevice)
+    ));
+    assert!(matches!(
+        crate::intel_gpu_cursor::Owner::new_for(
+            unprog.clone(),
+            0x100_0000,
+            timing,
+            Generation::PantherLake
+        ),
+        Err(FsError::NoDevice)
+    ));
+
+    // Refusal when headless (display_ip is None).
+    let headless = MockPlatform::new();
+    headless.set(0x480c, 0x3c);
+    assert!(matches!(
+        crate::intel_gpu_dsb::Owner::reserve_for(
+            headless.clone(),
+            0x100_0000,
+            Generation::PantherLake
+        ),
+        Err(FsError::Unsupported)
+    ));
+    assert!(matches!(
+        crate::intel_gpu_cursor::Owner::new_for(
+            headless.clone(),
+            0x100_0000,
+            timing,
+            Generation::PantherLake
+        ),
+        Err(FsError::Unsupported)
+    ));
+
+    TestResult::Pass
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe3lpd_double_buffered_luts_and_color_arm() -> TestResult {
+    use crate::intel_gpu_color::{
+        has_double_buffered_lut, has_double_buffered_lut_ip, DegammaLut, Lut, GAMMA, MODE,
+    };
+    use crate::intel_gpu_kms::{tests::MockPlatform, Platform};
+
+    assert!(has_double_buffered_lut(Generation::PantherLake));
+    assert!(has_double_buffered_lut_ip(DisplayIp::Xe3Lpd));
+    assert!(!has_double_buffered_lut(Generation::MeteorLake));
+    assert!(!has_double_buffered_lut(Generation::LunarLake));
+
+    let platform = MockPlatform::new().with_display_ip(DisplayIp::Xe3Lpd);
+    platform.set(0x480c, 0x3c);
+    let timing = platform.dsb_timing();
+
+    // Capture initial color state.
+    let mut owner =
+        crate::intel_gpu_color::Owner::capture(&platform, Generation::PantherLake).unwrap();
+    assert!(owner.double_buffered_lut());
+
+    // Reserve DSB.
+    let mut dsb = crate::intel_gpu_dsb::Owner::reserve_for(
+        platform.clone(),
+        0x100_0000,
+        Generation::PantherLake,
+    )
+    .unwrap();
+
+    // Create 129-entry degamma and 1024-entry gamma LUTs.
+    let degamma_raw: Vec<u8> = (0..129u16)
+        .flat_map(|i| {
+            let ch = (i as u64 * 65535 / 128) as u16;
+            let mut b = [0u8; 8];
+            b[..2].copy_from_slice(&ch.to_le_bytes());
+            b[2..4].copy_from_slice(&ch.to_le_bytes());
+            b[4..6].copy_from_slice(&ch.to_le_bytes());
+            b
+        })
+        .collect();
+    let degamma =
+        DegammaLut::decode_profile(&degamma_raw, crate::intel_gpu_color::Profile::Mtl).unwrap();
+
+    let gamma_raw: Vec<u8> = (0..1024u16)
+        .flat_map(|i| {
+            let ch = (i as u64 * 65535 / 1023) as u16;
+            let mut b = [0u8; 8];
+            b[..2].copy_from_slice(&ch.to_le_bytes());
+            b[2..4].copy_from_slice(&ch.to_le_bytes());
+            b[4..6].copy_from_slice(&ch.to_le_bytes());
+            b
+        })
+        .collect();
+    let lut = Lut::decode_profile(&gamma_raw, crate::intel_gpu_color::Profile::Mtl).unwrap();
+
+    // Prepare stages and arm DSB.
+    let update = owner
+        .prepare_stages(&platform, None, Some(lut.clone()), Some(degamma.clone()))
+        .unwrap();
+    assert!(update.registers.iter().any(|(r, _)| *r == GAMMA));
+    assert!(update.registers.iter().any(|(r, _)| *r == MODE));
+
+    dsb.arm_color(
+        timing,
+        &update.registers,
+        update.lut(),
+        update.degamma(),
+        platform.now(),
+    )
+    .unwrap();
+
+    // Complete DSB poll.
+    while dsb.armed() && !dsb.poll(platform.now()).unwrap() {
+        platform.step();
+    }
+
+    TestResult::Pass
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe3lpd_cursor_staging_and_dsb_arm() -> TestResult {
+    use crate::intel_gpu_kms::{tests::MockPlatform, Platform};
+
+    let platform = MockPlatform::new().with_display_ip(DisplayIp::Xe3Lpd);
+    let timing = display30_resources(&platform);
+    let profile =
+        crate::intel_gpu_display_resources::Profile::capture_timing(&platform, timing).unwrap();
+
+    let gem = crate::intel_gpu_gem::GemState::new();
+    let handle = gem.create(16384, |_, _| Ok(())).unwrap();
+    let image = gem.object(handle).unwrap();
+
+    let mut cursor = crate::intel_gpu_cursor::Owner::new_for(
+        platform.clone(),
+        0x100_0000,
+        timing,
+        Generation::PantherLake,
+    )
+    .unwrap();
+
+    // Stage cursor at (10, 20).
+    let regs = cursor
+        .stage_with(
+            |e| profile.cursor_registers(e),
+            Some(&image),
+            true,
+            Some((10, 20)),
+        )
+        .unwrap();
+
+    // Check CUR_CTL = 0x27 (MCURSOR_MODE_64_ARGB_AX).
+    let ctl = regs.iter().find(|(r, _)| *r == 0x70080).unwrap().1;
+    assert_eq!(ctl, 0x27);
+
+    // Check CUR_POS = 10 | (20 << 16).
+    let pos = regs.iter().find(|(r, _)| *r == 0x70088).unwrap().1;
+    assert_eq!(pos, 10 | (20 << 16));
+
+    // Check CUR_BASE is non-zero.
+    let base = regs.iter().find(|(r, _)| *r == 0x70084).unwrap().1;
+    assert_ne!(base, 0);
+
+    // Arm through DSB.
+    let mut dsb = crate::intel_gpu_dsb::Owner::reserve_for(
+        platform.clone(),
+        0x100_0000,
+        Generation::PantherLake,
+    )
+    .unwrap();
+    dsb.arm(timing, &regs, None, platform.now()).unwrap();
+
+    while dsb.armed() && !dsb.poll(platform.now()).unwrap() {
+        platform.step();
+    }
+    cursor.complete().unwrap();
+    dsb.shutdown().unwrap();
+
+    // Verify cursor register latching.
+    assert_eq!(platform.read32(0x70080), 0x27);
+    assert_eq!(platform.read32(0x70088), 10 | (20 << 16));
+    assert_eq!(platform.read32(0x70084), base);
+
+    // Stage cursor hidden (image = None).
+    let hide_regs = cursor
+        .stage_with(|e| profile.cursor_registers(e), None, true, None)
+        .unwrap();
+    let hide_ctl = hide_regs.iter().find(|(r, _)| *r == 0x70080).unwrap().1;
+    assert_eq!(hide_ctl, 0);
+
+    dsb.arm(timing, &hide_regs, None, platform.now()).unwrap();
+    while dsb.armed() && !dsb.poll(platform.now()).unwrap() {
+        platform.step();
+    }
+    cursor.complete().unwrap();
+    dsb.shutdown().unwrap();
+    assert_eq!(platform.read32(0x70080), 0);
+
+    TestResult::Pass
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe3lpd_gt_scanout_create_flag_follows_display_profile() -> TestResult {
+    use crate::intel_gpu_gt::GtPlatform;
+    use narf_filesystem::FsError;
+    let info = |platform, display: Option<bool>| crate::intel_gpu_render::DeviceInfo {
+        device_id: 0xb080,
+        platform,
+        memory_bytes: 0x8000_0000,
+        hwconfig: None,
+        topology: None,
+        vram: None,
+        backend: display.map(|display| {
+            alloc::sync::Arc::new(crate::intel_gpu_xe2lpd::gt_tests::ProfileBackend(display))
+                as alloc::sync::Arc<dyn crate::intel_gpu_user::UserBackend>
+        }),
+    };
+    let ptl = GtPlatform::from_pci(0x8086, 0xb080).unwrap();
+    let gem = crate::intel_gpu_gem::GemState::new();
+    let display = info(ptl, Some(true));
+    let handle = crate::intel_gpu_xe2lpd::gt_tests::xe_gem_create(&display, &gem, 2, 2).unwrap();
+    let object = gem.object(handle).unwrap();
+    assert!(object.scanout() && object.is_wc());
+    assert_eq!(
+        crate::intel_gpu_xe2lpd::gt_tests::xe_gem_create(&display, &gem, 2, 1),
+        Err(FsError::InvalidData)
+    );
+    assert_eq!(
+        crate::intel_gpu_xe2lpd::gt_tests::xe_gem_create(&info(ptl, Some(false)), &gem, 2, 2),
+        Err(FsError::InvalidData)
+    );
+    TestResult::Pass
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe3lpd_kms_tile4_and_x_flips_through_owned_dpt() -> TestResult {
+    use crate::intel_gpu_gtt::{GEM_SCANOUT_GTT_END, GEM_SCANOUT_GTT_START, GGTT_ARRAY_BASE};
+    use crate::intel_gpu_kms::tests::MockPlatform;
+    use crate::intel_gpu_scanout::{Geometry, Layout, View};
+
+    let platform = MockPlatform::new().with_display_ip(DisplayIp::Xe3Lpd);
+    let timing = display30_resources(&platform);
+    let geometry = crate::intel_gpu_kms::tests::geometry();
+    crate::intel_gpu_kms::tile4_profile(&platform, geometry, timing).unwrap();
+    let device = platform.panther();
+    let fb = crate::intel_gpu_kms::tests::object(true).unwrap();
+    let frames: Vec<u64> = fb.pages().collect();
+    assert_eq!(frames.len(), 2);
+    let view = View {
+        layout: Layout::Tile4,
+        ..View::default()
+    };
+    {
+        let mut session = crate::intel_gpu_kms::tests::complete(device.session()).unwrap();
+        crate::intel_gpu_kms::tests::complete(session.present_color(
+            fb.clone(),
+            geometry,
+            view,
+            None,
+            Default::default(),
+            timing,
+        ))
+        .unwrap();
+    }
+    assert_eq!(platform.read32(0x70180), 0x8400_1400);
+    assert_eq!(platform.read32(0x70188), 2);
+    let surface = platform.read32(0x701ac);
+    assert_eq!(platform.read32(0x7019c), surface);
+    assert_eq!(surface % (2 << 20), 0);
+    assert!((GEM_SCANOUT_GTT_START..GEM_SCANOUT_GTT_END).contains(&u64::from(surface)));
+    let pte = GGTT_ARRAY_BASE + u64::from(surface) / 4096 * 8;
+    let (low, high) = (platform.read32(pte), platform.read32(pte + 4));
+    assert_eq!(low & 1, 1);
+    assert_eq!((high >> 20) & 3, 3);
+    assert_eq!(platform.read32(pte + 8), 0);
+    let table = (u64::from(low) | (u64::from(high) << 32)) & crate::intel_gpu_gtt::PTE_PHYS_MASK;
+    let entry = |index: u64| -> u64 {
+        // SAFETY: the presenter retains this DPT page, mapped by the PTE
+        // just read, for the surface's lifetime.
+        unsafe {
+            narf_memory::PhysAddr::new(table + index * 8)
+                .kernel_ptr::<u64>()
+                .read_volatile()
+        }
+    };
+    for (index, phys) in frames.iter().enumerate() {
+        assert_eq!(entry(index as u64), phys | 1 | (3 << 52), "entry {index}");
+    }
+    for index in 2..512 {
+        assert_eq!(entry(index), 0, "padding {index}");
+    }
+    assert!(platform.all_writes().iter().all(|&(r, _)| r != 0x7026c));
+
+    // X-tiled flip through DPT at 512 pitch.
+    let platform_x = MockPlatform::new().with_display_ip(DisplayIp::Xe3Lpd);
+    let timing_x = display30_resources(&platform_x);
+    let geom_x = Geometry {
+        width: 64,
+        height: 32,
+        pitch: 512,
+    };
+    let device_x = platform_x.panther_pitch(512);
+    let fb_x = crate::intel_gpu_kms::tests::object_sized(true, 16384).unwrap();
+    let view_x = View {
+        layout: Layout::X,
+        ..View::default()
+    };
+    {
+        let mut session = crate::intel_gpu_kms::tests::complete(device_x.session()).unwrap();
+        crate::intel_gpu_kms::tests::complete(session.present_color(
+            fb_x.clone(),
+            geom_x,
+            view_x,
+            None,
+            Default::default(),
+            timing_x,
+        ))
+        .unwrap();
+    }
+    assert_eq!(platform_x.read32(0x70180), 0x8400_0400);
+    assert_eq!(platform_x.read32(0x70188), 1);
+    let surface_x = platform_x.read32(0x701ac);
+    assert_eq!(platform_x.read32(0x7019c), surface_x);
+    assert_eq!(surface_x % (2 << 20), 0);
+    let pte_x = GGTT_ARRAY_BASE + u64::from(surface_x) / 4096 * 8;
+    let (low_x, high_x) = (platform_x.read32(pte_x), platform_x.read32(pte_x + 4));
+    assert_eq!(low_x & 1, 1);
+    assert_eq!((high_x >> 20) & 3, 3);
+
+    TestResult::Pass
+}
+
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3lpd",
+    smoke_xe3lpd_cursor_and_dsb_pages_map_xe3_pat3
+);
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3lpd",
+    smoke_xe3lpd_double_buffered_luts_and_color_arm
+);
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3lpd",
+    smoke_xe3lpd_cursor_staging_and_dsb_arm
+);
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3lpd",
+    smoke_xe3lpd_gt_scanout_create_flag_follows_display_profile
+);
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3lpd",
+    smoke_xe3lpd_kms_tile4_and_x_flips_through_owned_dpt
+);

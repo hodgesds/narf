@@ -57,6 +57,7 @@ struct Hardware {
     deliveries: u32,
     pte_installs: usize,
     pte_clears: usize,
+    display_ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
     refuse_ptes: bool,
     refuse_console: bool,
     refuse_status_restore: bool,
@@ -161,6 +162,7 @@ impl MockPlatform {
                 deliveries: 0,
                 pte_installs: 0,
                 pte_clears: 0,
+                display_ip: None,
                 refuse_ptes: false,
                 refuse_console: false,
                 refuse_status_restore: false,
@@ -200,6 +202,10 @@ impl MockPlatform {
         );
         platform.gen12_defaults();
         platform
+    }
+    pub(crate) fn with_display_ip(self, ip: crate::intel_gpu_xe2lpd::DisplayIp) -> Self {
+        self.0.lock().display_ip = Some(ip);
+        self
     }
     pub(crate) fn tiger(&self) -> Device<Self> {
         self.gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
@@ -310,11 +316,20 @@ impl MockPlatform {
     pub(crate) fn meteor(&self) -> Device<Self> {
         Device::new(self.clone(), Generation::MeteorLake, 0x1000000, console())
     }
+    pub(crate) fn panther(&self) -> Device<Self> {
+        Device::new(self.clone(), Generation::PantherLake, 0x1000000, console())
+    }
     pub(crate) fn meteor_pitch(&self, pitch: u32) -> Device<Self> {
         self.set(0x70188, pitch / 64);
         let mut saved = console();
         saved.stride_bytes = pitch;
         Device::new(self.clone(), Generation::MeteorLake, 0x1000000, saved)
+    }
+    pub(crate) fn panther_pitch(&self, pitch: u32) -> Device<Self> {
+        self.set(0x70188, pitch / 64);
+        let mut saved = console();
+        saved.stride_bytes = pitch;
+        Device::new(self.clone(), Generation::PantherLake, 0x1000000, saved)
     }
     pub(crate) fn xr30_source(&self, device: Option<u16>) {
         self.0.lock().xr30_pci = device;
@@ -1055,6 +1070,10 @@ unsafe impl DisplayAccess for MockPlatform {
         let hw = self.0.lock();
         (!self.reset_lost() || self.2) && hw.allowed && hw.powered
     }
+
+    fn display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
+        self.0.lock().display_ip
+    }
 }
 impl Platform for MockPlatform {
     fn published_epoch(&self) -> Option<u64> {
@@ -1239,7 +1258,7 @@ fn console() -> ActiveScanout {
         phys_base: 0x100000,
     }
 }
-fn geometry() -> Geometry {
+pub(crate) fn geometry() -> Geometry {
     Geometry {
         width: 64,
         height: 32,
@@ -1252,20 +1271,23 @@ fn device(platform: &MockPlatform) -> Device<MockPlatform> {
 fn once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
 }
-fn complete<F: Future>(future: F) -> F::Output {
+pub(crate) fn complete<F: Future>(future: F) -> F::Output {
     let mut future = Box::pin(future);
-    for _ in 0..128 {
+    for _ in 0..1024 {
         if let Poll::Ready(result) = once(future.as_mut()) {
             return result;
         }
     }
     panic!("native KMS conversation did not finish");
 }
-fn object(wc: bool) -> Result<Arc<GemObject>, FsError> {
+pub(crate) fn object(wc: bool) -> Result<Arc<GemObject>, FsError> {
+    object_sized(wc, 8192)
+}
+pub(crate) fn object_sized(wc: bool, size: u64) -> Result<Arc<GemObject>, FsError> {
     use crate::intel_gpu_gem::{GemState, Placement};
     let gem = GemState::new();
     let handle = gem.create_placed(
-        8192,
+        size,
         None,
         if wc {
             Placement::SystemWc

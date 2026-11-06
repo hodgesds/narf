@@ -144,6 +144,20 @@ impl Image {
                 .all(|(&r, v)| io.read32(r) == v)
     }
 }
+/// Whether `generation` supports double-buffered LUT registers (display >= 30,
+/// `HAS_DOUBLE_BUFFERED_LUT`).
+#[allow(dead_code)]
+pub(crate) const fn has_double_buffered_lut(generation: Generation) -> bool {
+    matches!(generation, Generation::PantherLake)
+}
+
+/// Whether `ip` supports double-buffered LUT registers (display >= 30,
+/// `HAS_DOUBLE_BUFFERED_LUT`).
+#[allow(dead_code)]
+pub(crate) const fn has_double_buffered_lut_ip(ip: crate::intel_gpu_xe2lpd::DisplayIp) -> bool {
+    matches!(ip, crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd)
+}
+
 /// MTL/Arrow's native post-CSC LUT: 1024 RGB entries, ten bits/channel.
 /// This profile has no monotonic/equal-channel restriction (XE_LPDP_FEATURES).
 pub(crate) const LUT_SIZE: usize = 1024;
@@ -471,6 +485,8 @@ pub(crate) struct Owner {
     /// Arbitration/family is never inferred from a later readable format.
     original_primary_control: u32,
     primary_control: u32,
+    #[allow(dead_code)]
+    generation: Option<Generation>,
     gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
     /// None admits common CTM only. Gen12 requires a retained internal-pipe
     /// resource witness before this profile may be qualified.
@@ -494,7 +510,7 @@ impl Owner {
             Generation::TigerLake => {
                 Self::capture_gen12(io, crate::intel_gpu_gt::Gen12Platform::TigerLake)
             }
-            Generation::MeteorLake | Generation::LunarLake => {
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
                 Self::capture_control(io, generation, None, 0x84000000)
             }
             // AlderLake alone cannot distinguish display12 ADLS from
@@ -545,9 +561,13 @@ impl Owner {
             original,
             original_primary_control: primary_control,
             primary_control,
+            generation: Some(generation),
             gen12_family,
-            profile: matches!(generation, Generation::MeteorLake | Generation::LunarLake)
-                .then_some(Profile::Mtl),
+            profile: matches!(
+                generation,
+                Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
+            )
+            .then_some(Profile::Mtl),
             gamma,
             expected: original,
             expected_gamma: gamma,
@@ -580,6 +600,11 @@ impl Owner {
     }
     pub(crate) fn owns_unreadable_ram(&self) -> bool {
         self.profile == Some(Profile::Display12) && self.palette_dirty
+    }
+    /// Whether this display IP supports double-buffered LUT registers (display >= 30).
+    #[allow(dead_code)]
+    pub(crate) fn double_buffered_lut(&self) -> bool {
+        self.generation.is_some_and(has_double_buffered_lut)
     }
     fn check_luts(&self, lut: Option<&Lut>, pre: Option<&DegammaLut>) -> Result<(), FsError> {
         if lut.is_none() && pre.is_none() {

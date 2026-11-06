@@ -43,10 +43,10 @@ fn x_tiled_profile(
 }
 /// The display IP the KMS owner of `generation` proves its resources on.
 fn resource_ip(generation: Generation) -> crate::intel_gpu_xe2lpd::DisplayIp {
-    if generation == Generation::LunarLake {
-        crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd
-    } else {
-        crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp
+    match generation {
+        Generation::LunarLake => crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd,
+        Generation::PantherLake => crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd,
+        _ => crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
     }
 }
 /// The tiled primary's admission; the proved display IP, `None` on Gen12.
@@ -634,7 +634,7 @@ impl Physical {
             card.intel_tile4 = false;
             if matches!(
                 self.generation,
-                Generation::MeteorLake | Generation::LunarLake
+                Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
             ) {
                 if let Some(mode) = card.crtcs.first().and_then(|c| c.mode) {
                     if (mode.width, mode.height) != (geometry.width, geometry.height) {
@@ -1224,9 +1224,9 @@ pub(crate) fn install(
     console: ActiveScanout,
 ) {
     // Panther Lake is owned only as display 30.00 behind the opted-in
-    // route, which holds Pipe A for its eDP panel: linear primary flips on
-    // the console's Pipe A. Cursor, CTM/LUTs (double-buffered on display
-    // >= 30), DSB, tiled primaries, XR30, FBC and PSR are not offered.
+    // route, which holds Pipe A for its eDP panel: linear, X-tiled and Tile4
+    // primary flips through DPT, the 64x64 cursor, CTM and double-buffered LUTs,
+    // and DSB transactions on the console's Pipe A. XR30, FBC and PSR are not offered.
     let display30 = if generation == Generation::PantherLake {
         if !crate::intel_gpu_xe2lpd::route_owns_pipe_a() {
             return;
@@ -1290,7 +1290,10 @@ pub(crate) fn install(
         let mut card = card.lock();
         card.native_atomic = true;
         card.intel_display = true;
-        if matches!(generation, Generation::MeteorLake | Generation::LunarLake) {
+        if matches!(
+            generation,
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
+        ) {
             if let Some(crtc) = card.crtcs.first().map(|c| c.id) {
                 card.intel_ctm = true;
                 if card.crtc_color(crtc).is_none() {
@@ -1298,6 +1301,40 @@ pub(crate) fn install(
                 }
             }
         }
+    }
+    // Seed default VRR & CMRR timings for Pipe A on CRTC 1
+    let (width, height) = (console.width as u16, console.height as u16);
+    let default_mode = crate::intel_gpu_modeset::Mode {
+        pixel_clock_khz: (u32::from(width) * u32::from(height) * 60) / 1000,
+        h_active: width,
+        h_total: width + 160,
+        h_sync_start: width + 48,
+        h_sync_end: width + 80,
+        v_active: height,
+        v_total: height + 40,
+        v_sync_start: height + 3,
+        v_sync_end: height + 9,
+        h_sync_positive: false,
+        v_sync_positive: false,
+    };
+    let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_generation(generation);
+    let vrr_range = crate::intel_gpu_vrr::VrrRange {
+        min_hz: 48,
+        max_hz: 60,
+    };
+    crate::intel_gpu_vrr::VRR_STATE.set_mode(1, Some(default_mode));
+    crate::intel_gpu_vrr::VRR_STATE.set_range(1, Some(vrr_range));
+    if let Some(timings) = crate::intel_gpu_vrr::VrrTimings::compute(&default_mode, vrr_range, ip) {
+        crate::intel_gpu_vrr::VRR_STATE.set_timings(1, Some(timings));
+    }
+    if let Some(cmrr_timings) = crate::intel_gpu_vrr::CmrrTimings::compute(
+        &default_mode,
+        crate::intel_gpu_vrr::CmrrRate::Fps59_940,
+        ip,
+    ) {
+        crate::intel_gpu_vrr::VRR_STATE
+            .set_cmrr_rate(1, Some(crate::intel_gpu_vrr::CmrrRate::Fps59_940));
+        crate::intel_gpu_vrr::VRR_STATE.set_cmrr_timings(1, Some(cmrr_timings));
     }
     display.platform.console_published(&console);
 }
@@ -1327,7 +1364,7 @@ pub(crate) fn refresh_formats_after_publication(bar: &narf_bus::MmioRegion, epoc
     };
     if !matches!(
         display.generation,
-        Generation::MeteorLake | Generation::LunarLake
+        Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
     ) || display.platform.published_epoch() != Some(epoch)
     {
         return true;
@@ -2573,6 +2610,7 @@ impl<M: Platform> Guard<'_, M> {
         if let (Some(sf), Some(psr)) = (&selective, self.state.psr.as_mut()) {
             psr.program_sel_fetch_cursor(&self.device.platform, sf);
         }
+        crate::intel_gpu_vrr::on_plane_flip(1, &self.device.platform);
         let stamp = self
             .finish_pending()
             .await?
@@ -3266,6 +3304,7 @@ impl<M: Platform> Guard<'_, M> {
             self.device.generation,
             Generation::MeteorLake
                 | Generation::LunarLake
+                | Generation::PantherLake
                 | Generation::TigerLake
                 | Generation::AlderLake
         ) || !timing.valid()
@@ -3304,7 +3343,7 @@ impl<M: Platform> Guard<'_, M> {
         } else {
             if !matches!(
                 self.device.generation,
-                Generation::MeteorLake | Generation::LunarLake
+                Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
             ) {
                 return Err(FsError::Unsupported);
             }
@@ -3792,7 +3831,7 @@ impl<M: Platform> Guard<'_, M> {
         // a Card capability alone cannot authorize a command or scanout write.
         if !matches!(
             self.device.generation,
-            Generation::MeteorLake | Generation::LunarLake
+            Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
         ) && (self.device.platform.gen12_family().is_none()
             || primary.as_ref().is_some_and(|target| {
                 target.view.layout == crate::intel_gpu_scanout::Layout::Tile4
@@ -4132,6 +4171,9 @@ impl<M: Platform> Guard<'_, M> {
             return Err(error);
         }
         let stamp = self.finish_color().await?.ok_or(FsError::NoDevice)?;
+        if primary.is_some() {
+            crate::intel_gpu_vrr::on_plane_flip(1, &self.device.platform);
+        }
         if coefficients.is_none()
             && lut.is_none()
             && degamma.is_none()

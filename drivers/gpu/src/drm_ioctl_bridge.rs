@@ -48,10 +48,13 @@ use crate::drm_uapi::{
 type CrtcColorRequest = crate::amdgpu_native_kms::CrtcColorRequest;
 #[cfg(not(feature = "amdgpu"))]
 type CrtcColorRequest = core::convert::Infallible;
-#[cfg(feature = "amdgpu")]
-type ConnectorColorRequest = crate::amdgpu_native_kms::ConnectorColorRequest;
-#[cfg(not(feature = "amdgpu"))]
-type ConnectorColorRequest = core::convert::Infallible;
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConnectorColorRequest {
+    #[cfg(feature = "amdgpu")]
+    Amdgpu(crate::amdgpu_native_kms::ConnectorColorRequest),
+    #[cfg(feature = "intel")]
+    Intel(crate::intel_gpu_hdr::IntelConnectorColorRequest),
+}
 /// The GEM buffer a legacy cursor request names (amdgpu only).
 #[cfg(feature = "amdgpu")]
 type CursorBo = Arc<crate::amdgpu_gem::GemObject>;
@@ -4158,29 +4161,53 @@ fn apply_connector_color(
         native.color_format,
     );
     card.collect_blobs();
-    // The committed state above is generic DRM state; turning it
-    // into a native request is the amdgpu KMS's business alone.
-    #[cfg(feature = "amdgpu")]
-    {
-        if after == before || crate::drm_registry::driver_name(card_index) != Some("amdgpu") {
-            return None;
+    match crate::drm_registry::driver_name(card_index) {
+        #[cfg(feature = "amdgpu")]
+        Some("amdgpu") => {
+            if after == before {
+                return None;
+            }
+            let hdr = after
+                .1
+                .filter(|&id| id != 0)
+                .and_then(|id| card.property_blob(id))
+                .map(<[u8]>::to_vec);
+            Some(ConnectorColorRequest::Amdgpu(
+                crate::amdgpu_native_kms::ConnectorColorRequest {
+                    connector,
+                    colorspace: after.0.unwrap_or(0),
+                    color_format: after.2.unwrap_or_default(),
+                    hdr_output_metadata: hdr,
+                },
+            ))
         }
-        let hdr = after
-            .1
-            .filter(|&id| id != 0)
-            .and_then(|id| card.property_blob(id))
-            .map(<[u8]>::to_vec);
-        Some(crate::amdgpu_native_kms::ConnectorColorRequest {
-            connector,
-            colorspace: after.0.unwrap_or(0),
-            color_format: after.2.unwrap_or_default(),
-            hdr_output_metadata: hdr,
-        })
-    }
-    #[cfg(not(feature = "amdgpu"))]
-    {
-        let _ = (before, after, card_index);
-        None
+        #[cfg(feature = "intel")]
+        Some("intel-gpu") => {
+            if after == before {
+                return None;
+            }
+            let hdr = after
+                .1
+                .filter(|&id| id != 0)
+                .and_then(|id| card.property_blob(id))
+                .map(<[u8]>::to_vec);
+            let broadcast_rgb = card
+                .native_output(connector)
+                .and_then(|n| n.broadcast_rgb)
+                .unwrap_or(0);
+            Some(ConnectorColorRequest::Intel(
+                crate::intel_gpu_hdr::IntelConnectorColorRequest {
+                    connector,
+                    colorspace: after.0.unwrap_or(0),
+                    broadcast_rgb,
+                    hdr_output_metadata: hdr,
+                },
+            ))
+        }
+        _ => {
+            let _ = (before, after);
+            None
+        }
     }
 }
 
@@ -4207,6 +4234,14 @@ fn vrr_enabled_value(
     Ok(value != 0)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VrrRequest {
+    #[cfg(feature = "amdgpu")]
+    Amdgpu(u8, bool),
+    #[cfg(feature = "intel")]
+    Intel(u32, bool),
+}
+
 /// Commit a validated "VRR_ENABLED" value: the CRTC reports it. Returns the
 /// native display to reprogram, which the caller requests after releasing
 /// the card lock (the request takes the display owner's locks).
@@ -4215,21 +4250,17 @@ fn apply_vrr_enabled(
     card: &mut crate::drm::card::Card,
     crtc: u32,
     value: bool,
-) -> Option<(u8, bool)> {
+) -> Option<VrrRequest> {
     if let Some(slot) = card.vrr_enabled.iter_mut().find(|(id, _)| *id == crtc) {
         slot.1 = value;
     }
-    #[cfg(feature = "amdgpu")]
-    {
-        (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
-            .then(|| crate::amdgpu_native_kms::crtc_display(crtc))
-            .flatten()
-            .map(|display| (display, value))
-    }
-    #[cfg(not(feature = "amdgpu"))]
-    {
-        let _ = card_index;
-        None
+    match crate::drm_registry::driver_name(card_index) {
+        #[cfg(feature = "amdgpu")]
+        Some("amdgpu") => crate::amdgpu_native_kms::crtc_display(crtc)
+            .map(|display| VrrRequest::Amdgpu(display, value)),
+        #[cfg(feature = "intel")]
+        Some("intel-gpu") => Some(VrrRequest::Intel(crtc, value)),
+        _ => None,
     }
 }
 
@@ -4302,14 +4333,15 @@ fn apply_broadcast_rgb(
     connector: u32,
     value: u8,
 ) {
-    #[cfg(not(feature = "amdgpu"))]
-    let _ = card_index;
     if let Some(native) = card.native.iter_mut().find(|n| n.connector == connector) {
         native.broadcast_rgb = Some(value);
     }
-    #[cfg(feature = "amdgpu")]
-    if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
-        crate::amdgpu_native_kms::request_broadcast_rgb(value);
+    match crate::drm_registry::driver_name(card_index) {
+        #[cfg(feature = "amdgpu")]
+        Some("amdgpu") => crate::amdgpu_native_kms::request_broadcast_rgb(value),
+        #[cfg(feature = "intel")]
+        Some("intel-gpu") => crate::intel_gpu_hdr::request_broadcast_rgb(connector, value),
+        _ => {}
     }
 }
 
@@ -4415,9 +4447,16 @@ fn handle_set_property(
         let value = vrr_enabled_value(&card, obj_id, value)?;
         let _request = apply_vrr_enabled(card_index, &mut card, obj_id, value);
         drop(card);
-        #[cfg(feature = "amdgpu")]
-        if let Some((display, enabled)) = _request {
-            crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+        match _request {
+            #[cfg(feature = "amdgpu")]
+            Some(VrrRequest::Amdgpu(display, enabled)) => {
+                crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+            }
+            #[cfg(feature = "intel")]
+            Some(VrrRequest::Intel(crtc, enabled)) => {
+                crate::intel_gpu_vrr::request_vrr_enabled(crtc, enabled);
+            }
+            _ => {}
         }
         return Ok(0);
     }
@@ -4438,9 +4477,16 @@ fn handle_set_property(
         }
         let _request = apply_connector_color(card_index, &mut card, obj_id, color);
         drop(card);
-        #[cfg(feature = "amdgpu")]
-        if let Some(request) = _request {
-            crate::amdgpu_native_kms::request_connector_color(request);
+        match _request {
+            #[cfg(feature = "amdgpu")]
+            Some(ConnectorColorRequest::Amdgpu(request)) => {
+                crate::amdgpu_native_kms::request_connector_color(request);
+            }
+            #[cfg(feature = "intel")]
+            Some(ConnectorColorRequest::Intel(request)) => {
+                crate::intel_gpu_hdr::request_connector_color(request);
+            }
+            _ => {}
         }
         return Ok(0);
     }
@@ -5763,7 +5809,7 @@ fn atomic_commit(
     let test_only = req.flags & TEST_ONLY != 0;
     let mut prop_index = 0usize;
     // Native VRR changes, requested once the card lock is released.
-    let mut vrr_requests: Vec<(u8, bool)> = Vec::new();
+    let mut vrr_requests: Vec<VrrRequest> = Vec::new();
     // Native CRTC color and connector Colorspace/HDR changes, likewise.
     let mut color_requests: Vec<(u8, CrtcColorRequest)> = Vec::new();
     let mut connector_requests: Vec<ConnectorColorRequest> = Vec::new();
@@ -6667,17 +6713,37 @@ fn atomic_commit(
             Some((presentations, native_presentations))
         }
     };
-    #[cfg(feature = "amdgpu")]
-    for (display, enabled) in vrr_requests {
-        crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+    for request in vrr_requests {
+        match request {
+            #[cfg(feature = "amdgpu")]
+            VrrRequest::Amdgpu(display, enabled) => {
+                crate::amdgpu_native_kms::request_vrr_enabled(display, enabled);
+            }
+            #[cfg(feature = "intel")]
+            VrrRequest::Intel(crtc, enabled) => {
+                crate::intel_gpu_vrr::request_vrr_enabled(crtc, enabled);
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
     }
     #[cfg(feature = "amdgpu")]
     for (display, request) in color_requests {
         crate::amdgpu_native_kms::request_crtc_color(display, request);
     }
-    #[cfg(feature = "amdgpu")]
     for request in connector_requests {
-        crate::amdgpu_native_kms::request_connector_color(request);
+        match request {
+            #[cfg(feature = "amdgpu")]
+            ConnectorColorRequest::Amdgpu(req) => {
+                crate::amdgpu_native_kms::request_connector_color(req);
+            }
+            #[cfg(feature = "intel")]
+            ConnectorColorRequest::Intel(req) => {
+                crate::intel_gpu_hdr::request_connector_color(req);
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
     }
     send_cursor_requests(cursor_requests);
     #[cfg(feature = "amdgpu")]

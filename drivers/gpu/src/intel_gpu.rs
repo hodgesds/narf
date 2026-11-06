@@ -1638,6 +1638,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Some(mode) => {
             use crate::drm::card::{
                 Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
+                NativeOutput,
             };
             let kms_mode = crate::Mode {
                 width: mode.width,
@@ -1654,6 +1655,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 x: 0,
                 y: 0,
             });
+            kms.vrr_enabled.push((1, false));
             kms.encoders.push(Encoder {
                 id: 2,
                 // i915 reports DP encoders as TMDS to userspace.
@@ -1669,6 +1671,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 status: ConnectorStatus::Connected,
                 encoder_id: Some(2),
                 modes: alloc::vec![kms_mode],
+            });
+            kms.native.push(NativeOutput {
+                connector: 3,
+                edid: None,
+                timings: alloc::vec::Vec::new(),
+                color_format: None,
+                broadcast_rgb: Some(0),
+                vrr_capable: Some(true),
+                colorspace: Some(0),
+                hdr_output_metadata: Some(0),
+                max_bpc: Some(8),
             });
             let index = crate::drm_registry::register_drm_card_with_state(intel_card, kms);
             publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
