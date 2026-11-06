@@ -405,6 +405,205 @@ fn smoke_i8042_mouse_drops_unsynced_byte() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_i8042_mouse_drops_unsynced_byte);
 
+fn smoke_i8042_mouse_intellimouse_wheel_reports_scroll() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::PsmouseProtocol;
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, PointerButtons,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    i8042_mouse::set_protocol_for_test(PsmouseProtocol::IntelliMouse);
+
+    // 4-byte packet, no motion, wheel byte 0x01. Linux reports
+    // REL_WHEEL = -(signed char)packet[3] = -1 (one click up).
+    i8042_mouse::feed_byte_for_test(0x08);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x01);
+
+    // The motion half still rides the Pointer channel (dx=dy=0).
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != 0 || p.dy != 0 {
+                return TestResult::Fail("wheel packet motion should be zero");
+            }
+            if !p.buttons.is_empty() {
+                return TestResult::Fail("wheel packet should carry no buttons");
+            }
+        }
+        _ => return TestResult::Fail("no PointerEvent for wheel packet"),
+    }
+    match pop_global() {
+        Some(InputEvent::Scroll(s)) => {
+            if s.dx != 0 || s.dy != -1 {
+                return TestResult::Fail("wheel 0x01 should scroll dy=-1");
+            }
+        }
+        _ => return TestResult::Fail("no ScrollEvent for wheel packet"),
+    }
+    // Wheel byte 0xFF = -1 signed -> REL_WHEEL = +1 (one click down).
+    i8042_mouse::feed_byte_for_test(0x08);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0xFF);
+    let _ = pop_global(); // Pointer half
+    match pop_global() {
+        Some(InputEvent::Scroll(s)) => {
+            if s.dx != 0 || s.dy != 1 {
+                return TestResult::Fail("wheel 0xFF should scroll dy=+1");
+            }
+        }
+        _ => return TestResult::Fail("no ScrollEvent for wheel 0xFF"),
+    }
+    let (wheel, hwheel) = i8042_mouse::take_wheel_delta();
+    if wheel != 0 || hwheel != 0 {
+        return TestResult::Fail("wheel accumulator should read (-1+1, 0) = (0, 0)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_intellimouse_wheel_reports_scroll
+);
+
+fn smoke_i8042_mouse_explorer_side_extra_buttons() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::PsmouseProtocol;
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, PointerButtons,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    i8042_mouse::set_protocol_for_test(PsmouseProtocol::Explorer);
+
+    // 4th byte 0x10: 4th button (bit 4) pressed, wheel nibble 0.
+    // 0x30: 4th + 5th. 0x00: both released. No wheel motion anywhere.
+    for b3 in [0x10u8, 0x30, 0x00] {
+        i8042_mouse::feed_byte_for_test(0x08);
+        i8042_mouse::feed_byte_for_test(0x00);
+        i8042_mouse::feed_byte_for_test(0x00);
+        i8042_mouse::feed_byte_for_test(b3);
+    }
+    let want: [PointerButtons; 3] = [
+        PointerButtons::SIDE,
+        PointerButtons::SIDE | PointerButtons::EXTRA,
+        PointerButtons::EMPTY,
+    ];
+    for (i, w) in want.iter().enumerate() {
+        match pop_global() {
+            Some(InputEvent::Pointer(p)) => {
+                if p.buttons != *w {
+                    return TestResult::Fail("Explorer side/extra button state wrong");
+                }
+            }
+            _ => return TestResult::Fail("missing PointerEvent in Explorer button sequence"),
+        }
+        // Wheel is zero in all three packets: no ScrollEvent follows.
+        if pop_global().is_some() {
+            return TestResult::Fail("wheel-zero Explorer packet leaked a ScrollEvent");
+        }
+        let _ = i;
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_explorer_side_extra_buttons
+);
+
+fn smoke_i8042_mouse_explorer_tilt_hwheel() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::PsmouseProtocol;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, InputEvent};
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    i8042_mouse::set_protocol_for_test(PsmouseProtocol::ExplorerTilt);
+
+    // 4th byte 0x41: top bits 0x40 = Explorer 4.0 horizontal scroll,
+    // value (0x41 & 32) - (0x41 & 31) = 31 on REL_HWHEEL.
+    i8042_mouse::feed_byte_for_test(0x08);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x41);
+    let _ = pop_global(); // Pointer half
+    match pop_global() {
+        Some(InputEvent::Scroll(s)) => {
+            if s.dx != 31 || s.dy != 0 {
+                return TestResult::Fail("tilt 0x41 should scroll dx=+31");
+            }
+        }
+        _ => return TestResult::Fail("no ScrollEvent for tilt packet"),
+    }
+    // 0x81: top bits 0x80 = vertical tilt scroll, value -1 on REL_WHEEL.
+    i8042_mouse::feed_byte_for_test(0x08);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x81);
+    let _ = pop_global(); // Pointer half
+    match pop_global() {
+        Some(InputEvent::Scroll(s)) => {
+            if s.dx != 0 || s.dy != -1 {
+                return TestResult::Fail("tilt 0x81 should scroll dy=-1");
+            }
+        }
+        _ => return TestResult::Fail("no ScrollEvent for vertical tilt packet"),
+    }
+    let (wheel, hwheel) = i8042_mouse::take_wheel_delta();
+    if wheel != -1 || hwheel != 31 {
+        return TestResult::Fail("wheel accumulator should read (-1, 31)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_mouse_explorer_tilt_hwheel);
+
+fn smoke_i8042_mouse_3byte_fallback_stream_stays_in_sync() -> TestResult {
+    use crate::i8042_mouse;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, InputEvent};
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    // Protocol stays Standard (failed knock): 3-byte packets.
+
+    // Packet 1, then a stray 0x01 (a wheel byte from a 4-byte
+    // stream) — no sync bit, so it must drop, not shift the
+    // stream — then packet 2.
+    for b in [0x08u8, 5, 3, 0x01, 0x08, 1, 1] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != 5 || p.dy != -3 {
+                return TestResult::Fail("first 3-byte packet decoded wrong");
+            }
+        }
+        _ => return TestResult::Fail("first packet missing"),
+    }
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != 1 || p.dy != -1 {
+                return TestResult::Fail("stray wheel byte desynced the 3-byte stream");
+            }
+        }
+        _ => return TestResult::Fail("second packet missing after stray byte"),
+    }
+    if pop_global().is_some() {
+        return TestResult::Fail("no ScrollEvent may appear in 3-byte mode");
+    }
+    let (dx, dy) = i8042_mouse::take_rel_delta();
+    if dx != 6 || dy != -4 {
+        return TestResult::Fail("rel accumulator wrong after fallback stream");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_3byte_fallback_stream_stays_in_sync
+);
+
 fn smoke_virtio_input_decode_synthetic() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
     use narf_input::{
@@ -3959,3 +4158,317 @@ kernel_test_in!(
     "drivers/input",
     smoke_i8042_led_sink_wired_from_core_dispatch
 );
+
+// ── psmouse protocol negotiation + Synaptics decoders ──────────────────────
+//
+// Fixtures are built from the cited specs, never from the impl:
+// knock byte sequences from Linux `psmouse-base.c` / Chapweske,
+// Synaptics packet layouts from Linux `synaptics_parse_hw_state`.
+// The fake transport records every byte the driver sends and replays
+// canned replies, so the negotiation fixtures pin the exact wire
+// order of the whole probe sequence.
+
+mod psmouse_smokes {
+    use alloc::collections::VecDeque;
+    use alloc::vec::Vec;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use crate::psmouse::{
+        decode_synaptics_newabs, decode_synaptics_oldabs, negotiate_protocol, synaptics_invert_y,
+        synaptics_validate_byte, Ps2Transport, PsmouseHardware, PsmouseProtocol, SynapticsPktType,
+    };
+
+    /// Fake PS/2 device: records every byte sent, replays canned
+    /// reply bytes in order. `send` always ACKs (the real ACK wait
+    /// is a transport detail); `recv` pops the next canned byte.
+    struct FakePs2 {
+        sent: Vec<u8>,
+        replies: VecDeque<u8>,
+    }
+
+    impl FakePs2 {
+        fn new(replies: &[u8]) -> Self {
+            Self {
+                sent: Vec::new(),
+                replies: replies.iter().copied().collect(),
+            }
+        }
+    }
+
+    impl Ps2Transport for FakePs2 {
+        fn send(&mut self, byte: u8) -> bool {
+            self.sent.push(byte);
+            true
+        }
+
+        fn recv(&mut self) -> Option<u8> {
+            self.replies.pop_front()
+        }
+    }
+
+    /// SETRATE(rate) wire bytes: [0xF3, rate].
+    fn set_rate(rate: u8) -> [u8; 2] {
+        [0xF3, rate]
+    }
+
+    /// The shared probe prefix every negotiation runs: Synaptics
+    /// detect (4x SETRES(0) + GETINFO, answered "not Synaptics"),
+    /// ALPS E6 report (answered "not ALPS"), then reset (BAT + ID).
+    /// Returns the bytes the driver must have sent, and consumes
+    /// the matching replies from the fake.
+    fn probe_prefix_sent() -> Vec<u8> {
+        let mut sent = Vec::new();
+        // Synaptics: SETRES(0) x4, GETINFO.
+        for _ in 0..4 {
+            sent.extend_from_slice(&[0xE8, 0x00]);
+        }
+        sent.push(0xE9);
+        // ALPS E6: SETRES(0xE6), SETSCALE11, SETSCALE11, GETINFO.
+        sent.extend_from_slice(&[0xE8, 0xE6, 0xE6, 0xE6, 0xE9]);
+        // Reset.
+        sent.push(0xFF);
+        sent
+    }
+
+    fn smoke_psmouse_intellimouse_knock_sequence() -> TestResult {
+        // Replies, in order: Synaptics GETINFO [0,0,0] (not Synaptics),
+        // ALPS E6 GETINFO [0,0,0] (not ALPS), reset BAT+ID, Intelli
+        // prefix GETID=0x03, Explorer GETID=0x00 (not Explorer),
+        // standalone Intelli GETID=0x03.
+        let replies = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0x00, 0x03, 0x00, 0x03,
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Generic {
+            return TestResult::Fail("plain mouse must not detect vendor hardware");
+        }
+        if proto != PsmouseProtocol::IntelliMouse {
+            return TestResult::Fail("ID 0x03 after 200/100/80 must negotiate IntelliMouse");
+        }
+        // Exact wire order: probe prefix, Intelli knock + GETID,
+        // Explorer knock + GETID, Intelli knock + GETID again
+        // (Linux tries Explorer first, then IntelliMouse standalone).
+        let mut want = probe_prefix_sent();
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        if fake.sent != want {
+            return TestResult::Fail("IntelliMouse knock wire sequence wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_intellimouse_knock_sequence
+    );
+
+    fn smoke_psmouse_explorer_knock_sequence() -> TestResult {
+        // Replies: Synaptics no, ALPS no, reset BAT+ID, Intelli prefix
+        // GETID=0x03, Explorer GETID=0x04, then the 4.0 tilt knock
+        // (200/80/40) with no further replies.
+        let replies = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0x00, 0x03, 0x04];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Generic || proto != PsmouseProtocol::ExplorerTilt {
+            return TestResult::Fail("ID 0x04 after 200/200/80 must negotiate ExplorerTilt");
+        }
+        let mut want = probe_prefix_sent();
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        // Tilt enable: 200, 80, 40 — and no standalone Intelli knock
+        // afterwards (Explorer already won).
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(80));
+        want.extend_from_slice(&set_rate(40));
+        if fake.sent != want {
+            return TestResult::Fail("Explorer knock wire sequence wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_explorer_knock_sequence
+    );
+
+    fn smoke_psmouse_standard_fallback_knock() -> TestResult {
+        // Plain mouse: every GETID answers 0x00.
+        let replies = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Generic || proto != PsmouseProtocol::Standard {
+            return TestResult::Fail("ID 0x00 everywhere must fall back to Standard");
+        }
+        // No tilt knock may appear after a failed Explorer attempt.
+        if fake.sent.windows(2).any(|w| w[0] == 0xF3 && w[1] == 40) {
+            return TestResult::Fail("tilt knock must not run without ID 0x04");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_standard_fallback_knock
+    );
+
+    fn smoke_psmouse_synaptics_detect_knock() -> TestResult {
+        // Synaptics pad in relative mode: GETINFO answers [?, 0x47, ?],
+        // then it also answers the IntelliMouse knock (pads emulate
+        // IMPS in relative mode — Linux records Synaptics hardware
+        // AND negotiates the wheel protocol).
+        let replies = [0x00, 0x47, 0x00, 0xAA, 0x00, 0x03, 0x00, 0x03];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Synaptics {
+            return TestResult::Fail("GETINFO byte 0x47 must detect Synaptics");
+        }
+        if proto != PsmouseProtocol::IntelliMouse {
+            return TestResult::Fail("Synaptics pad must still negotiate IntelliMouse wheel");
+        }
+        // ALPS must NOT be probed once Synaptics matched (the ALPS
+        // E6 knock would confuse the pad — Linux skips it too).
+        let mut want: Vec<u8> = Vec::new();
+        for _ in 0..4 {
+            want.extend_from_slice(&[0xE8, 0x00]);
+        }
+        want.push(0xE9);
+        want.push(0xFF);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        if fake.sent != want {
+            return TestResult::Fail("Synaptics wire sequence wrong (ALPS must be skipped)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_synaptics_detect_knock
+    );
+
+    fn smoke_psmouse_alps_detect_knock() -> TestResult {
+        // ALPS pad: Synaptics GETINFO no, E6 report 00-00-0A, E7
+        // report 73-02-64 (v3 signature), then plain-mouse IDs.
+        let replies = [
+            0x00, 0x00, 0x00, // Synaptics GETINFO
+            0x00, 0x00, 0x0A, // ALPS E6 report
+            0x73, 0x02, 0x64, // ALPS E7 report
+            0xAA, 0x00, // reset BAT+ID
+            0x00, 0x00, 0x00, // GETIDs
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Alps {
+            return TestResult::Fail("E6/E7 reports must detect ALPS");
+        }
+        if proto != PsmouseProtocol::Standard {
+            return TestResult::Fail("ALPS pad answering ID 0x00 must stay Standard");
+        }
+        // Wire order: Synaptics knock, ALPS E6 (E8-E6-E6-E6-E9),
+        // ALPS E7 (E8-E7-E7-E7-E9), reset, then the wheel knocks.
+        let mut want: Vec<u8> = Vec::new();
+        for _ in 0..4 {
+            want.extend_from_slice(&[0xE8, 0x00]);
+        }
+        want.push(0xE9);
+        want.extend_from_slice(&[0xE8, 0xE6, 0xE6, 0xE6, 0xE9]);
+        want.extend_from_slice(&[0xE8, 0xE7, 0xE7, 0xE7, 0xE9]);
+        want.push(0xFF);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        if fake.sent != want {
+            return TestResult::Fail("ALPS wire sequence wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/psmouse", smoke_psmouse_alps_detect_knock);
+
+    fn smoke_synaptics_newabs_decode() -> TestResult {
+        // NEWABS packet built from the Linux layout for x=1000,
+        // y=2000, z=50, w=1, left pressed:
+        //   b0 = 0x81 (sync + left), b1 = 0x73 (x hi 0x3, y hi 0x7),
+        //   b2 = 50 (z), b3 = 0xC4 (sync + w bit), b4 = 0xE8 (x lo),
+        //   b5 = 0xD0 (y lo).
+        let buf: [u8; 6] = [0x81, 0x73, 50, 0xC4, 0xE8, 0xD0];
+        for idx in 0..5 {
+            if !synaptics_validate_byte(&buf, idx, SynapticsPktType::NewAbsStrict) {
+                return TestResult::Fail("NEWABS strict validation must pass this packet");
+            }
+        }
+        let hw = decode_synaptics_newabs(&buf);
+        if hw.x != 1000 || hw.y != 2000 || hw.z != 50 || hw.w != 1 {
+            return TestResult::Fail("NEWABS x/y/z/w decode wrong");
+        }
+        if !hw.left || hw.right {
+            return TestResult::Fail("NEWABS button bits wrong");
+        }
+        if synaptics_invert_y(hw.y) != 5856 - 2000 {
+            return TestResult::Fail("Y inversion must be 5856 - y");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/psmouse", smoke_synaptics_newabs_decode);
+
+    fn smoke_synaptics_oldabs_decode() -> TestResult {
+        // OLDABS packet for x=1000, y=2000, z=50, w=2, left pressed:
+        //   b0 = 0xC5 (sync + w bit + left), b1 = 0x03 (x hi),
+        //   b2 = 0xE8 (x lo), b3 = 0xB2 (sync + z lo 0x32),
+        //   b4 = 0x07 (y hi), b5 = 0xD0 (y lo).
+        let buf: [u8; 6] = [0xC5, 0x03, 0xE8, 0xB2, 0x07, 0xD0];
+        for idx in 0..5 {
+            if !synaptics_validate_byte(&buf, idx, SynapticsPktType::OldAbs) {
+                return TestResult::Fail("OLDABS validation must pass this packet");
+            }
+        }
+        let hw = decode_synaptics_oldabs(&buf);
+        if hw.x != 1000 || hw.y != 2000 || hw.z != 50 || hw.w != 2 {
+            return TestResult::Fail("OLDABS x/y/z/w decode wrong");
+        }
+        if !hw.left || hw.right {
+            return TestResult::Fail("OLDABS button bits wrong");
+        }
+        // A NEWABS-strict check must reject an OLDABS packet
+        // (byte 0 fails the NEWABS mask), so the two flavours can
+        // never be confused by the packet-type probe.
+        if synaptics_validate_byte(&buf, 0, SynapticsPktType::NewAbsStrict) {
+            return TestResult::Fail("NEWABS validation must reject OLDABS byte 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/psmouse", smoke_synaptics_oldabs_decode);
+}
