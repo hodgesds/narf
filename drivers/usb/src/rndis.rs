@@ -1509,15 +1509,13 @@ async fn rndis_command(
                         continue;
                     }
                 };
-                if msg_type == expected_complete {
-                    if request_id(got).ok() == Some(expected_rid) {
-                        return Ok(got.to_vec());
-                    }
-                    // Right type, wrong request — a stale reply
-                    // for an earlier request; keep polling.
+                if msg_type == expected_complete && request_id(got).ok() == Some(expected_rid) {
+                    return Ok(got.to_vec());
                 }
-                // Wrong type (e.g. an unsolicited INDICATE_STATUS
-                // queued ahead of the reply) — keep polling.
+                // Right type, wrong request — a stale reply for an
+                // earlier request — or wrong type (e.g. an
+                // unsolicited INDICATE_STATUS queued ahead of the
+                // reply); either way, keep polling.
                 narf_scheduler::yield_now().await;
             }
             Ok(_) => narf_scheduler::yield_now().await,
@@ -1868,7 +1866,7 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, RndisError> {
 /// (multipacket). Caller polls this periodically; on real
 /// silicon the RX pump (not this call) is what streams frames
 /// in.
-pub fn recv_frames<'a>(idx: usize, scratch: &'a mut [u8]) -> Result<Vec<&'a [u8]>, RndisError> {
+pub fn recv_frames(idx: usize, scratch: &mut [u8]) -> Result<Vec<&[u8]>, RndisError> {
     let (slot_id, bulk_in_dci) = {
         let g = RNDIS_DEVICES.lock();
         let dev = g
@@ -2307,8 +2305,9 @@ pub mod tests {
 
         fn query_ok(rid: u32, info: &[u8]) -> Vec<u8> {
             let mut out = alloc::vec![0u8; 24 + info.len()];
+            let len = out.len() as u32;
             put_u32le(&mut out, 0, CMPLT_QUERY);
-            put_u32le(&mut out, 4, out.len() as u32);
+            put_u32le(&mut out, 4, len);
             put_u32le(&mut out, 8, rid);
             put_u32le(&mut out, 12, STATUS_SUCCESS);
             put_u32le(&mut out, 16, info.len() as u32);

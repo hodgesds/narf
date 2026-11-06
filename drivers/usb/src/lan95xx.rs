@@ -73,7 +73,7 @@
 //!   transfers are ignored, exactly like the reference.
 //! - The PHY interrupt sources are armed in reset via
 //!   `PHY_INT_MASK` = `PHY_INT_MASK_DEFAULT` (autoneg-complete
-//!   + link-down, Linux `smsc95xx.h`); without it the endpoint
+//!   \+ link-down, Linux `smsc95xx.h`); without it the endpoint
 //!   would never fire on real silicon. The handler acknowledges
 //!   the PHY interrupt by reading `PHY_INT_SRC` (best-effort).
 //! - Multicast is programmed through the stack's
