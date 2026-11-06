@@ -41,6 +41,8 @@ mod native_pci;
 mod native_pcm;
 pub mod sbc;
 pub mod soundwire;
+pub mod soundwire_rt1316;
+pub mod soundwire_rt711;
 
 mod hda_tests;
 mod tests;

@@ -50,6 +50,14 @@ pub mod regs {
     /// SCP device number: the manager writes the assigned number here
     /// while the peripheral still listens on the enumeration address.
     pub const SCP_DEVNUMBER: u32 = 0x0046;
+    /// SCP address page 1: high bits [30:23] of a paged register
+    /// address (Linux `SDW_SCP_ADDRPAGE1`). Programmed, with
+    /// `SCP_ADDRPAGE2`, before a transfer whose address is at or
+    /// above `SDW_REG_NO_PAGE`; see `crate::soundwire_rt1316`.
+    pub const SCP_ADDRPAGE1: u32 = 0x0048;
+    /// SCP address page 2: address bits [22:15] of a paged register
+    /// address (Linux `SDW_SCP_ADDRPAGE2`).
+    pub const SCP_ADDRPAGE2: u32 = 0x0049;
     /// Mask of the device-number field in `SCP_DEVNUMBER`.
     pub const SCP_DEVNUMBER_MASK: u8 = 0xF;
     /// First of the six DevID registers (`SCP_DEVID_0..=SCP_DEVID_5`).
@@ -382,16 +390,20 @@ pub struct PortProfile {
 }
 
 /// The generic codec conversation's view of a peripheral: one sink
-/// port (playback) and/or one source port (capture). Vendor codecs
-/// with richer topologies layer their own profiles on the same bus;
-/// the generic profile is what an otherwise-unknown SDW codec is
-/// driven with.
+/// port (playback) and/or one or two source ports (capture). Vendor
+/// codecs with richer topologies layer their own profiles on the same
+/// bus; the generic profile is what an otherwise-unknown SDW codec is
+/// driven with. A second source port covers codecs with two capture
+/// DAIs (RT711: AIF1's DP4 alongside AIF2's DP2); the card exposes
+/// it as capture device 1.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CodecProfile {
     /// Playback (sink) port, if the codec can render.
     pub sink: Option<PortProfile>,
     /// Capture (source) port, if the codec can record.
     pub source: Option<PortProfile>,
+    /// Second capture (source) port, if the codec exposes one.
+    pub source2: Option<PortProfile>,
 }
 
 /// The near-universal SDW codec arrangement: DP1 is the primary audio
@@ -407,7 +419,71 @@ pub const GENERIC_CODEC_PROFILE: CodecProfile = CodecProfile {
         max_channels: 2,
         max_word: 32,
     }),
+    source2: None,
 };
+
+/// Realtek MIPI manufacturer ID (0x025D), as in the DevID registers
+/// and Linux's `SDW_SLAVE_ENTRY_EXT(0x025d, ...)` codec tables.
+pub const REALTEK_MFG_ID: u16 = 0x025D;
+
+/// RT711 headset codec (Linux `sound/soc/codecs/rt711-sdw.c`,
+/// `rt711_read_prop` + `rt711_dai`): AIF1 plays through DP3 and
+/// captures through DP4; AIF2 captures through DP2. Formats
+/// S16/S20_3/S24/S8, so the widest word is 24 bits. The jack-detect
+/// and init sequences for this profile live in
+/// [`crate::soundwire_rt711`].
+pub const RT711_CODEC_PROFILE: CodecProfile = CodecProfile {
+    sink: Some(PortProfile {
+        port: 3,
+        max_channels: 2,
+        max_word: 24,
+    }),
+    source: Some(PortProfile {
+        port: 4,
+        max_channels: 2,
+        max_word: 24,
+    }),
+    source2: Some(PortProfile {
+        port: 2,
+        max_channels: 2,
+        max_word: 24,
+    }),
+};
+
+/// RT1316 smart amplifier (Linux `sound/soc/codecs/rt1316-sdw.c`,
+/// `rt1316_read_prop` + `rt1316_sdw_dai`): DP1 playback, DP2 capture
+/// (IV-sense feedback). Formats S20_3/S16/S24, widest word 24 bits,
+/// 48 kHz only. The init and amp power sequences for this profile
+/// live in [`crate::soundwire_rt1316`].
+pub const RT1316_CODEC_PROFILE: CodecProfile = CodecProfile {
+    sink: Some(PortProfile {
+        port: 1,
+        max_channels: 2,
+        max_word: 24,
+    }),
+    source: Some(PortProfile {
+        port: 2,
+        max_channels: 2,
+        max_word: 24,
+    }),
+    source2: None,
+};
+
+/// Select the codec profile for an enumerated peripheral by
+/// manufacturer + part ID; unknown codecs keep the generic
+/// conversation. Version, class and unique-ID bytes are not matched:
+/// they vary by strap and silicon revision, and the two profiles
+/// here are distinguished by part alone.
+pub fn profile_for(id: &SlaveId) -> CodecProfile {
+    if id.mfg_id != REALTEK_MFG_ID {
+        return GENERIC_CODEC_PROFILE;
+    }
+    match id.part_id {
+        0x0711 => RT711_CODEC_PROFILE,
+        0x1316 => RT1316_CODEC_PROFILE,
+        _ => GENERIC_CODEC_PROFILE,
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Direction {
@@ -480,6 +556,7 @@ pub struct CodecCard<T: Transport> {
     stream: StreamConfig,
     playback_claimed: Arc<IrqSafeSpinLock<bool>>,
     capture_claimed: Arc<IrqSafeSpinLock<bool>>,
+    capture_claimed2: Arc<IrqSafeSpinLock<bool>>,
     payload_factory: Option<Arc<dyn PayloadEngineFactory>>,
 }
 
@@ -498,8 +575,16 @@ impl<T: Transport> CodecCard<T> {
             stream,
             playback_claimed: Arc::new(IrqSafeSpinLock::new(false)),
             capture_claimed: Arc::new(IrqSafeSpinLock::new(false)),
+            capture_claimed2: Arc::new(IrqSafeSpinLock::new(false)),
             payload_factory: None,
         }
+    }
+
+    /// The codec profile this card was built with (vendor profiles
+    /// select their own ports; the ACP binding reports the card's
+    /// endpoint counts from it).
+    pub fn profile(&self) -> CodecProfile {
+        self.profile
     }
 
     /// Install the platform payload engine factory. The ACP binding
@@ -510,10 +595,14 @@ impl<T: Transport> CodecCard<T> {
         self.payload_factory = Some(factory);
     }
 
-    fn port_for(&self, direction: Direction) -> Option<PortProfile> {
-        match direction {
-            Direction::Playback => self.profile.sink,
-            Direction::Capture => self.profile.source,
+    fn port_for(&self, direction: Direction, device: u32) -> Option<PortProfile> {
+        match (direction, device) {
+            (Direction::Playback, 0) => self.profile.sink,
+            (Direction::Capture, 0) => self.profile.source,
+            // A codec with two capture DAIs (RT711 AIF2) exposes
+            // its second source port as capture device 1.
+            (Direction::Capture, 1) => self.profile.source2,
+            _ => None,
         }
     }
 }
@@ -544,13 +633,22 @@ impl<T: Transport + 'static> PcmDevice for CodecCard<T> {
         } else {
             Direction::Playback
         };
-        if device != 0 || self.port_for(direction).is_none() {
-            return Err(SoundError::NoSuchDevice);
-        }
-        let claim = if capture {
-            self.capture_claimed.clone()
-        } else {
-            self.playback_claimed.clone()
+        // The profile decides which (direction, device) pairs exist:
+        // playback is device 0 only; capture is device 0, plus
+        // device 1 when the profile carries a second source port.
+        let port = match self.port_for(direction, device) {
+            Some(port) => port,
+            None => return Err(SoundError::NoSuchDevice),
+        };
+        let claim = match direction {
+            Direction::Playback => self.playback_claimed.clone(),
+            Direction::Capture => {
+                if device == 0 {
+                    self.capture_claimed.clone()
+                } else {
+                    self.capture_claimed2.clone()
+                }
+            }
         };
         {
             let mut claimed = claim.lock();
@@ -566,7 +664,7 @@ impl<T: Transport + 'static> PcmDevice for CodecCard<T> {
                 stream: self.stream,
             },
             claim,
-            port: self.port_for(direction).unwrap().port,
+            port: port.port,
             params: None,
             prepared: false,
             enabled: false,
@@ -1298,4 +1396,160 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/soundwire", sdw_pcm_without_engine_reports_bad_state);
+
+    fn profile_selection_by_manufacturer_and_part() -> TestResult {
+        // The tree's fixture identities select their vendor
+        // profiles; anything else keeps the generic conversation.
+        let rt711 = SlaveId {
+            mfg_id: 0x025D,
+            part_id: 0x0711,
+            class_id: 0,
+            unique_id: 0,
+            sdw_version: 1,
+        };
+        if profile_for(&rt711) != RT711_CODEC_PROFILE {
+            return TestResult::Fail("RT711 identity must select the RT711 profile");
+        }
+        let rt1316 = SlaveId {
+            mfg_id: 0x025D,
+            part_id: 0x1316,
+            class_id: 0,
+            unique_id: 1,
+            sdw_version: 1,
+        };
+        if profile_for(&rt1316) != RT1316_CODEC_PROFILE {
+            return TestResult::Fail("RT1316 identity must select the RT1316 profile");
+        }
+        // Unknown Realtek part, unknown manufacturer: generic.
+        let unknown_part = SlaveId {
+            part_id: 0x9999,
+            ..rt711
+        };
+        let unknown_mfg = SlaveId {
+            mfg_id: 0x1234,
+            ..rt711
+        };
+        if profile_for(&unknown_part) != GENERIC_CODEC_PROFILE
+            || profile_for(&unknown_mfg) != GENERIC_CODEC_PROFILE
+        {
+            return TestResult::Fail("unknown codec must keep the generic profile");
+        }
+        // The vendor port topologies, as in the Linux drivers:
+        // RT711 plays DP3, captures DP4 (AIF1) and DP2 (AIF2);
+        // RT1316 plays DP1, captures DP2 (IV sense).
+        if RT711_CODEC_PROFILE.sink.map(|port| port.port) != Some(3)
+            || RT711_CODEC_PROFILE.source.map(|port| port.port) != Some(4)
+            || RT711_CODEC_PROFILE.source2.map(|port| port.port) != Some(2)
+            || RT1316_CODEC_PROFILE.sink.map(|port| port.port) != Some(1)
+            || RT1316_CODEC_PROFILE.source.map(|port| port.port) != Some(2)
+            || RT1316_CODEC_PROFILE.source2.is_some()
+        {
+            return TestResult::Fail("vendor port topology mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/soundwire",
+        profile_selection_by_manufacturer_and_part
+    );
+
+    fn vendor_profile_card_routing() -> TestResult {
+        // An RT711 card routes playback to DP3, capture device 0
+        // to DP4 and capture device 1 to DP2; an RT1316 card
+        // routes playback to DP1 and capture to DP2. The port
+        // prepare conversation pins the routing: word length 16
+        // lands as BLOCKCTRL1 15 on the routed port's block.
+        let stream = StreamConfig {
+            word_length: 16,
+            sample_interval: 100,
+        };
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        let card = CodecCard::new(
+            Arc::new(IrqSafeSpinLock::new(bus)),
+            1,
+            RT711_CODEC_PROFILE,
+            stream,
+        );
+        // Playback device 0 must prepare DP3; playback device 1
+        // does not exist; capture device 1 (DP2) opens alongside
+        // capture device 0 (DP4).
+        let mut playback = match card.open(false, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("RT711 playback open failed"),
+        };
+        if card.open(false, 1) != Err(SoundError::NoSuchDevice) {
+            return TestResult::Fail("RT711 playback device 1 must not exist");
+        }
+        let mut capture0 = match card.open(true, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("RT711 capture 0 open failed"),
+        };
+        let mut capture1 = match card.open(true, 1) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("RT711 capture 1 open failed"),
+        };
+        if card.open(true, 2) != Err(SoundError::NoSuchDevice) {
+            return TestResult::Fail("RT711 capture device 2 must not exist");
+        }
+        for pcm in [&mut playback, &mut capture0, &mut capture1] {
+            if pcm.configure(card.default_params(false)) != Ok(()) || pcm.prepare() != Ok(()) {
+                return TestResult::Fail("RT711 prepare failed");
+            }
+        }
+        let log = card.bus.lock().transport().log();
+        // Each prepare writes BLOCKCTRL1 on its port's block: DP3
+        // (0x0403), DP4 (0x0503), DP2 (0x0303), in open order.
+        let blockctrl: Vec<u32> = log
+            .iter()
+            .filter(|xfer| xfer.write == Some(15))
+            .map(|xfer| xfer.addr)
+            .collect();
+        if blockctrl != [0x0403, 0x0503, 0x0303] {
+            return TestResult::Fail("RT711 port routing mismatch");
+        }
+        drop(playback);
+        drop(capture0);
+        drop(capture1);
+        // RT1316: DP1 playback, DP2 capture.
+        let mut bus = Bus::new(ModelTransport::new(&[RT1316]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        let card = CodecCard::new(
+            Arc::new(IrqSafeSpinLock::new(bus)),
+            1,
+            RT1316_CODEC_PROFILE,
+            stream,
+        );
+        let mut playback = match card.open(false, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("RT1316 playback open failed"),
+        };
+        let mut capture = match card.open(true, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("RT1316 capture open failed"),
+        };
+        if card.open(true, 1) != Err(SoundError::NoSuchDevice) {
+            return TestResult::Fail("RT1316 capture device 1 must not exist");
+        }
+        for pcm in [&mut playback, &mut capture] {
+            if pcm.configure(card.default_params(false)) != Ok(()) || pcm.prepare() != Ok(()) {
+                return TestResult::Fail("RT1316 prepare failed");
+            }
+        }
+        let log = card.bus.lock().transport().log();
+        let blockctrl: Vec<u32> = log
+            .iter()
+            .filter(|xfer| xfer.write == Some(15))
+            .map(|xfer| xfer.addr)
+            .collect();
+        if blockctrl != [0x0103, 0x0203] {
+            return TestResult::Fail("RT1316 port routing mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire", vendor_profile_card_routing);
 }

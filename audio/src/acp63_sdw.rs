@@ -24,15 +24,20 @@
 //!   publishes any codecs found alongside the PDM capture card
 //!   (#871). SDW presence on a PDM wiring is determined by
 //!   enumeration alone — there is no SDW pin bit to consult.
-//! - Enumerated codecs are published as sound cards with the generic
-//!   codec conversation; the ACP SDW DMA engine that moves PCM
-//!   payload between host memory and the manager lives in
+//! - Enumerated codecs are published as sound cards with the
+//!   profile their identity selects (`soundwire::profile_for`:
+//!   RT711/RT1316 vendor profiles, generic otherwise), and the
+//!   vendor codecs run their attach-time init
+//!   (`soundwire_rt711::io_init` / `soundwire_rt1316::io_init`)
+//!   before any card is published. The ACP SDW DMA engine that
+//!   moves PCM payload between host memory and the manager lives in
 //!   [`crate::acp63_sdw_dma`] and is installed on each card at probe.
 
 use crate::acp63_sdw_dma::AcpSdwDmaFactory;
 use crate::soundwire::{
-    Bus, CodecCard, SdwError, StreamConfig, Transport, BROADCAST_DEV_NUM, GENERIC_CODEC_PROFILE,
+    profile_for, Bus, CodecCard, Peripheral, SdwError, StreamConfig, Transport, BROADCAST_DEV_NUM,
 };
+use crate::{soundwire_rt1316, soundwire_rt711};
 use alloc::{sync::Arc, vec::Vec};
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
@@ -406,10 +411,7 @@ fn compose_cards(
     }
     let mut bus = Bus::new(transport);
     let enumerated = match bus.enumerate() {
-        Ok(found) => found
-            .iter()
-            .map(|peripheral| peripheral.dev_num)
-            .collect::<Vec<u8>>(),
+        Ok(found) => found.to_vec(),
         Err(_) => {
             bus.transport().disable_manager();
             return Err(ProbeError::BadDevice);
@@ -419,6 +421,14 @@ fn compose_cards(
         // Fail closed: no codec answered, publish nothing.
         bus.transport().disable_manager();
         return Err(ProbeError::NotForThisDriver);
+    }
+    // Attach-time vendor init, before any card is published: a
+    // codec whose init fails is not published half-initialised.
+    for peripheral in &enumerated {
+        if init_codec(&bus, peripheral).is_err() {
+            bus.transport().disable_manager();
+            return Err(ProbeError::BadDevice);
+        }
     }
     // Generic-profile stream parameters for the manager's default
     // clocking: 50×10 frame = 500 bit-slots per frame at a 4.8 MHz
@@ -430,12 +440,31 @@ fn compose_cards(
     };
     let shared = Arc::new(IrqSafeSpinLock::new(bus));
     let mut cards = Vec::new();
-    for dev_num in enumerated {
-        let mut card = CodecCard::new(shared.clone(), dev_num, GENERIC_CODEC_PROFILE, stream);
+    for peripheral in enumerated {
+        let profile = profile_for(&peripheral.id);
+        let mut card = CodecCard::new(shared.clone(), peripheral.dev_num, profile, stream);
         card.set_payload_engine(Arc::new(AcpSdwDmaFactory::new(mmio)));
         cards.push(Arc::new(card));
     }
     Ok(cards)
+}
+
+/// Run an enumerated peripheral's vendor attach-time init, if it
+/// has one (RT711: `soundwire_rt711::io_init`; RT1316:
+/// `soundwire_rt1316::io_init`). Unknown codecs need none: the
+/// generic conversation is all they get. Jack-detect arming
+/// (`soundwire_rt711::jack_init`) is deliberately not run here —
+/// it belongs to the jack consumer, which does not exist yet.
+fn init_codec<T: Transport>(bus: &Bus<T>, peripheral: &Peripheral) -> Result<(), SdwError> {
+    match (peripheral.id.mfg_id, peripheral.id.part_id) {
+        (crate::soundwire::REALTEK_MFG_ID, 0x0711) => {
+            soundwire_rt711::io_init(bus, peripheral.dev_num)
+        }
+        (crate::soundwire::REALTEK_MFG_ID, 0x1316) => {
+            soundwire_rt1316::io_init(bus, peripheral.dev_num)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Publish `cards` through the sound registry under the standard SDW
@@ -446,13 +475,15 @@ fn register_cards(cards: Vec<Arc<CodecCard<AcpSdwTransport>>>, addr: narf_bus::B
     let mut capture_card = None;
     let mut registered = Vec::new();
     for card in cards {
+        let profile = card.profile();
         let info = narf_drivers_sound::CardInfo {
             index: 0,
             driver: "acp63-sdw",
             id: "ACP63SDW",
             name: "AMD ACP 6.3 SoundWire Codec",
-            playback_count: u32::from(GENERIC_CODEC_PROFILE.sink.is_some()),
-            capture_count: u32::from(GENERIC_CODEC_PROFILE.source.is_some()),
+            playback_count: u32::from(profile.sink.is_some()),
+            capture_count: u32::from(profile.source.is_some())
+                + u32::from(profile.source2.is_some()),
         };
         let index = narf_drivers_sound::register_hardware_card_at(info, card.clone(), Some(addr));
         if capture_card.is_none() {
@@ -823,6 +854,17 @@ mod tests {
         }
         if fixture.model.assigned != Some(1) {
             return TestResult::Fail("enumeration did not assign device 1");
+        }
+        // The enumerated codec is an RT711, so compose ran its
+        // attach-time init: the pin widget, a config default, the
+        // final power-D3 write and the last index write must have
+        // landed on the peripheral model.
+        if fixture.model.regs.get(&0xb721).copied() != Some(0xc0)
+            || fixture.model.regs.get(&0x4f12).copied() != Some(0x91)
+            || fixture.model.regs.get(&0xb501).copied() != Some(0x03)
+            || fixture.model.regs.get(&0x8420).copied() != Some(0x49)
+        {
+            return TestResult::Fail("RT711 attach-time init did not land");
         }
         if fixture.model.read(POWER_STATUS) != 0
             || fixture.model.read(CONTROL) != 1

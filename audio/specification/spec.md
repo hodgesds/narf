@@ -211,7 +211,10 @@ word length, `DPn_SAMPLECTRL1/2` sample interval), writes `DPn_PREPARE`
 and polls its NotFinished bits under a bounded wait, then sets
 `DPn_CHANNELEN` to enable and clears it to disable, clearing
 `DPN_PREPARE` on deprepare. Streams are configured while stopped;
-glitchless bank switching mid-stream is out of scope.
+glitchless bank switching mid-stream is out of scope. SDCA register
+access at or above 0x8000 is paged through SCP_ADDRPAGE1/2 (Linux
+`sdw_fill_msg`); peripherals that declare no paging support (RT711)
+address their verb registers directly.
 
 `acp63_sdw::probe`, `register_pci_driver`, `is_probed`, `capture_card`
 bind the ACP 6.3 function's SDW0 manager for pin configurations without
@@ -227,8 +230,21 @@ enumeration, not a pin bit, and a failed composition just means
 PDM-only. Probe powers the ACP up, initialises the manager (enable,
 bus reset, 50×10 frame shape, interrupt masks), enumerates, and
 publishes one sound card per enumerated codec through the registry,
-using the generic codec profile (DP1 sink + DP1 source, stereo S16LE
-48 kHz). A bus with no answering codec publishes nothing. The card
+selecting the codec profile per peripheral from its SoundWire ID
+(`soundwire::profile_for`): RT711 gets DP3 playback with DP4 + DP2
+capture, RT1316 gets DP1 playback with DP2 capture, and anything
+else keeps the generic profile (DP1 sink + DP1 source, stereo S16LE
+48 kHz). Vendor init runs at attach before the card is published —
+RT711 I/O init (HDA-verb-over-SoundWire sequences, jack setup) and
+RT1316 I/O init (SDCA blind-write table) — and a failed init fails
+the bind closed with no half-initialised card published. A bus with
+no answering codec publishes nothing. The RT711 jack state machine
+(`soundwire_rt711::jack_detect`, polled — pin sense plus combo-jack
+auto-detect status, since the bus layer has no interrupt dispatch)
+and the RT1316 smart-amp power/mute sequences
+(`soundwire_rt1316::amp_enable` / `amp_disable`) are available to
+consumers; RT711 clock configuration (`clock_config`) is implemented
+but not yet wired into stream setup (see #1606). The card
 implements the PCM lifecycle against the bus (configure/prepare/enable/
 disable/deprepare) and moves PCM payload through the ACP SDW DMA engine
 (`acp63_sdw_dma::SdwDma`, installed on each card at probe): one ring
@@ -348,8 +364,12 @@ Physical validation must establish the actual HDA codec, BIOS route quality,
 jack behavior and whether speaker amplifiers need a model-specific quirk.
 HDMI/DP and system power-transition reinitialization remain separate
 implementation work. SoundWire follow-ups to #780 remain: Intel
-DSP/SOF-owned SoundWire links, and vendor codec profiles (jack/amp
-sequences) beyond the generic conversation. The ACP SDW DMA payload
+DSP/SOF-owned SoundWire links. The vendor codec profiles (jack/amp
+sequences) beyond the generic conversation landed in #1514 (RT711
+jack, RT1316 smart-amp); their remainders — RT711 DC-offset
+calibration, headset buttons, clock-config wiring, RT1316 BQ params,
+SDCA reads, SDW interrupt dispatch for jack detection — are tracked
+in #1606. The ACP SDW DMA payload
 engine has landed (#870), but its channel programming still needs
 validation on silicon against the Linux `ps-sdw-dma.c` register map
 (see §3.2). PCM pause/resume preserves DMA buffers and position.
