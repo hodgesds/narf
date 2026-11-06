@@ -16,7 +16,10 @@
 //!   for R2 — the register content with CRC7 + end bit stripped,
 //!   which is the shifted layout `sd_proto` parses.
 //! - The Buffer Data Port (§2.2.4) streams the addressed card
-//!   block word-by-word on CMD17 and captures it on CMD24.
+//!   block word-by-word on CMD17 and captures it on CMD24; CMD18
+//!   / CMD25 do the same for multi-block transfers with a CMD23
+//!   pre-defined count, which is how the RPMB partition moves
+//!   frames (§6.6.22.4).
 //! - Present State (§2.2.9) reports a card inserted.
 //!
 //! The card model speaks the SD identification conversation (SD
@@ -29,6 +32,15 @@ use alloc::vec::Vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
+
+use crate::rpmb::{
+    RpmbFrame, RPMB_FRAME_SIZE, RPMB_LEN_DATA, RPMB_REQ_CONFIG_WRITE, RPMB_REQ_KEY_PROGRAM,
+    RPMB_REQ_READ, RPMB_REQ_READ_COUNTER, RPMB_REQ_RESULT_READ, RPMB_REQ_WRITE,
+    RPMB_RESP_KEY_PROGRAM, RPMB_RESP_READ, RPMB_RESP_READ_COUNTER, RPMB_RESP_WRITE,
+    RPMB_RESULT_ADDRESS_FAILURE, RPMB_RESULT_AUTH_FAILURE, RPMB_RESULT_COUNTER_EXPIRED,
+    RPMB_RESULT_COUNTER_FAILURE, RPMB_RESULT_GENERAL_FAILURE, RPMB_RESULT_KEY_NOT_PROGRAMMED,
+    RPMB_RESULT_OK, RPMB_RESULT_WRITE_FAILURE,
+};
 
 use super::*;
 
@@ -252,6 +264,28 @@ struct FixtureState {
     /// When `Some(n)`, the CMD13 after the nth CMD6 reports
     /// SWITCH_ERROR. `None` means no switch ever fails.
     switch_error_on: Option<u32>,
+    /// RPMB authentication key, once programmed (write-once,
+    /// §6.6.22.2). `None` until a key-program request lands.
+    rpmb_key: Option<[u8; 32]>,
+    /// RPMB write counter: increments per successful
+    /// authenticated write (§6.6.22.2).
+    rpmb_counter: u32,
+    /// RPMB data store: 256-byte half-sectors by address
+    /// (unwritten half-sectors read back as zero).
+    rpmb_store: BTreeMap<u16, [u8; RPMB_LEN_DATA]>,
+    /// Response frame staged for the next CMD18, if a request
+    /// produced one.
+    rpmb_response: Option<[u8; RPMB_FRAME_SIZE]>,
+    /// Result-read response staged by the last programming
+    /// access (key program / data write), fetched by a
+    /// result-read request (§6.6.22.4.1/§6.6.22.4.3).
+    rpmb_result_response: Option<[u8; RPMB_FRAME_SIZE]>,
+    /// CMD23 pre-defined block count state (§6.6.7.1/§6.6.8.1):
+    /// armed by CMD23 for the immediately following CMD18 /
+    /// CMD25, with its count and reliable-write bit.
+    cmd23_armed: bool,
+    cmd23_count: u16,
+    cmd23_reliable: bool,
 }
 
 impl FixtureState {
@@ -291,14 +325,26 @@ impl FixtureState {
         if self.emmc && !self.selected && (index == 8 || index == 55) {
             return;
         }
+        // CMD23 arms the pre-defined block count for the
+        // immediately following CMD18 / CMD25 only (§6.6.7.1 /
+        // §6.6.8.1): any other command in between disarms it.
+        // CMD18 / CMD25 consume the arm in their own arms below
+        // (CMD25's check runs at the buffer-port commit, after
+        // the data lands, so its arm must survive the push).
+        if index != 23 && index != 18 && index != 25 {
+            self.cmd23_armed = false;
+        }
         let mut nis = NIS_CMD_COMPLETE;
         match index {
             // CMD0 — reset: deselect, back to the user area, and
-            // drop any SWITCH CMD13 has not confirmed yet.
+            // drop any SWITCH CMD13 has not confirmed yet, any
+            // CMD23 arm, and any in-flight RPMB response.
             0 => {
                 self.selected = false;
                 self.current_access = 0;
                 self.pending_access = None;
+                self.cmd23_armed = false;
+                self.rpmb_response = None;
             }
             // CMD1 — SEND_OP_COND (eMMC only): busy for the first
             // two polls, then ready. §6.4.2 fixed patterns:
@@ -405,8 +451,74 @@ impl FixtureState {
                 self.read_cursor = 0;
                 nis |= NIS_BUFFER_READ_READY | NIS_TRANSFER_COMPLETE;
             }
+            // CMD18 — READ MULTIPLE BLOCK with a CMD23
+            // pre-defined count (§6.6.7.1). On the RPMB
+            // partition the staged block is the RPMB model's
+            // pending response frame — or a General Failure
+            // frame when no CMD23 (count 1) preceded it or no
+            // request produced a response. Elsewhere the
+            // addressed block, as for CMD17 (open-ended
+            // multi-block reads are legitimate there).
+            18 => {
+                let armed = self.cmd23_armed;
+                self.cmd23_armed = false;
+                if self.current_access == 3 {
+                    let ok = armed && self.cmd23_count == 1;
+                    self.read_stage = if ok {
+                        match self.rpmb_response.take() {
+                            Some(frame) => frame,
+                            None => {
+                                self.rpmb_response_frame(
+                                    RPMB_RESP_READ,
+                                    RPMB_RESULT_GENERAL_FAILURE,
+                                )
+                                .bytes
+                            }
+                        }
+                    } else {
+                        self.rpmb_response_frame(RPMB_RESP_READ, RPMB_RESULT_GENERAL_FAILURE)
+                            .bytes
+                    };
+                } else {
+                    let block_addr = if self.emmc && !self.sector_mode {
+                        arg / 512
+                    } else {
+                        arg
+                    };
+                    let block = if self.current_access == 0 {
+                        self.image.get(&block_addr).copied().unwrap_or([0u8; 512])
+                    } else {
+                        self.part_image
+                            .get(&(self.current_access, block_addr))
+                            .copied()
+                            .unwrap_or([0u8; 512])
+                    };
+                    self.read_stage = block;
+                }
+                self.read_cursor = 0;
+                nis |= NIS_BUFFER_READ_READY | NIS_TRANSFER_COMPLETE;
+            }
+            // CMD23 — SET_BLOCK_COUNT (§6.6.7.1/§6.6.8.1): arm
+            // the pre-defined block count for the immediately
+            // following CMD18 / CMD25. Bits [15:0] are the
+            // count; bit 31 is the reliable-write request.
+            23 => {
+                self.cmd23_armed = true;
+                self.cmd23_count = (arg & 0xFFFF) as u16;
+                self.cmd23_reliable = arg & (1 << 31) != 0;
+                self.set32(REG_RESPONSE_0, 0x900);
+            }
             // CMD24 — arm the Buffer Data Port capture.
             24 => {
+                self.write_lba = arg;
+                self.write_cursor = 0;
+                nis |= NIS_BUFFER_WRITE_READY | NIS_TRANSFER_COMPLETE;
+            }
+            // CMD25 — WRITE MULTIPLE BLOCK: arm the Buffer Data
+            // Port capture. The commit path routes RPMB frames
+            // to the model; the CMD23 arm survives the push and
+            // is consumed there.
+            25 => {
                 self.write_lba = arg;
                 self.write_cursor = 0;
                 nis |= NIS_BUFFER_WRITE_READY | NIS_TRANSFER_COMPLETE;
@@ -420,6 +532,235 @@ impl FixtureState {
         }
         let cur = self.get16(REG_NORMAL_INT_STS);
         self.set16(REG_NORMAL_INT_STS, cur | nis);
+    }
+
+    /// RPMB capacity in 256-byte half-sectors, from the EXT_CSD
+    /// RPMB_SIZE_MULT (§7.4.84: mult × 128 KiB).
+    fn rpmb_capacity_half_sectors(&self) -> u32 {
+        crate::emmc::ExtCsd::parse(&self.ext_csd)
+            .map(|e| (e.rpmb_partition_bytes() / RPMB_LEN_DATA as u64) as u32)
+            .unwrap_or(0)
+    }
+
+    /// A response frame of `resp_type` and `result`, MAC'd under
+    /// the programmed key when one exists (the device MACs every
+    /// response it can; before key programming the MAC field
+    /// stays zero).
+    fn rpmb_response_frame(&self, resp_type: u16, result: u16) -> RpmbFrame {
+        let mut f = RpmbFrame::new();
+        f.set_req_type(resp_type);
+        f.set_result(result);
+        if let Some(key) = &self.rpmb_key {
+            let mac = narf_crypto::hkdf::hmac_sha256(key, f.mac_message());
+            f.set_mac(&mac);
+        }
+        f
+    }
+
+    /// Stage a failure response for `req_type`: the matching
+    /// response type (a read response when the request has
+    /// none), the result, MAC'd when a key is programmed.
+    fn rpmb_stage_failure(&mut self, req_type: u16, result: u16) {
+        let resp_type = crate::rpmb::response_type_for(req_type).unwrap_or(RPMB_RESP_READ);
+        let f = self.rpmb_response_frame(resp_type, result);
+        self.rpmb_response = Some(f.bytes);
+    }
+
+    /// Stage the result-read response for a programming access:
+    /// `resp_type` (0x0100 key program / 0x0300 write), the
+    /// current counter, the address, the result — MAC'd under
+    /// `key` when one is supplied (the key-program result is
+    /// un-MAC'd, Table 24).
+    fn rpmb_stage_result_response(
+        &mut self,
+        resp_type: u16,
+        result: u16,
+        address: u16,
+        key: Option<&[u8; 32]>,
+    ) {
+        let mut f = RpmbFrame::new();
+        f.set_req_type(resp_type);
+        f.set_write_counter(self.rpmb_counter);
+        f.set_address(address);
+        f.set_result(result);
+        if let Some(key) = key {
+            let mac = narf_crypto::hkdf::hmac_sha256(key, f.mac_message());
+            f.set_mac(&mac);
+        }
+        self.rpmb_result_response = Some(f.bytes);
+    }
+
+    /// Process one 512-byte RPMB request frame pushed by CMD25
+    /// while the RPMB partition is accessed: validate the CMD23
+    /// pre-conditions, run the request through the §6.6.22.4
+    /// check order, and stage the response (or the result-read
+    /// response for a programming access). The request frame
+    /// itself is never stored as a plain block.
+    fn rpmb_process_request(&mut self, frame: &[u8; RPMB_FRAME_SIZE]) {
+        let req = RpmbFrame::from_bytes(*frame);
+        // CMD23 must immediately precede the CMD25, with count
+        // 1 (§6.6.22.4.1–§6.6.22.4.4); programming accesses
+        // also need the reliable-write bit (§6.6.8.1).
+        let reliable_needed = matches!(
+            req.req_type(),
+            RPMB_REQ_KEY_PROGRAM | RPMB_REQ_WRITE | RPMB_REQ_CONFIG_WRITE
+        );
+        if !self.cmd23_armed || self.cmd23_count != 1 || (reliable_needed && !self.cmd23_reliable) {
+            self.rpmb_stage_failure(req.req_type(), RPMB_RESULT_GENERAL_FAILURE);
+            return;
+        }
+        self.cmd23_armed = false;
+        match req.req_type() {
+            RPMB_REQ_KEY_PROGRAM => self.rpmb_key_program(&req),
+            RPMB_REQ_READ_COUNTER => self.rpmb_counter_read(&req),
+            RPMB_REQ_WRITE => self.rpmb_data_write(&req),
+            RPMB_REQ_READ => self.rpmb_data_read(&req),
+            RPMB_REQ_RESULT_READ => self.rpmb_result_read_req(),
+            // Device-configuration accesses (0x0006/0x0007) and
+            // anything else: not modelled, General failure.
+            _ => self.rpmb_stage_failure(req.req_type(), RPMB_RESULT_GENERAL_FAILURE),
+        }
+    }
+
+    /// Key programming (§6.6.22.4.1): the key is write-once
+    /// (§6.6.22.2) — a second attempt fails. The result is
+    /// reported through the result-read, not here.
+    fn rpmb_key_program(&mut self, req: &RpmbFrame) {
+        if self.rpmb_key.is_some() {
+            self.rpmb_stage_failure(RPMB_REQ_KEY_PROGRAM, RPMB_RESULT_GENERAL_FAILURE);
+            return;
+        }
+        self.rpmb_key = Some(req.mac());
+        // The key-program result is un-MAC'd (Table 24 shows a
+        // zero MAC field), so no key is passed.
+        self.rpmb_stage_result_response(RPMB_RESP_KEY_PROGRAM, RPMB_RESULT_OK, 0, None);
+    }
+
+    /// Counter read (§6.6.22.4.2): the request carries no MAC;
+    /// the response echoes the nonce, carries the counter, and
+    /// is MAC'd. Before key programming the only valid result
+    /// is 0x0007 (Table 20 note).
+    fn rpmb_counter_read(&mut self, req: &RpmbFrame) {
+        let Some(key) = self.rpmb_key else {
+            self.rpmb_stage_failure(RPMB_REQ_READ_COUNTER, RPMB_RESULT_KEY_NOT_PROGRAMMED);
+            return;
+        };
+        let mut f = RpmbFrame::new();
+        f.set_req_type(RPMB_RESP_READ_COUNTER);
+        f.set_nonce(&req.nonce());
+        f.set_write_counter(self.rpmb_counter);
+        let result = if self.rpmb_counter == u32::MAX {
+            RPMB_RESULT_OK | RPMB_RESULT_COUNTER_EXPIRED
+        } else {
+            RPMB_RESULT_OK
+        };
+        f.set_result(result);
+        let mac = narf_crypto::hkdf::hmac_sha256(&key, f.mac_message());
+        f.set_mac(&mac);
+        self.rpmb_response = Some(f.bytes);
+    }
+
+    /// Authenticated data write (§6.6.22.4.3), in the spec's
+    /// check order: counter expired, address, MAC, counter
+    /// match. The outcome is reported through the result-read
+    /// (0x0300); the immediate CMD18 after a write has nothing
+    /// to return.
+    fn rpmb_data_write(&mut self, req: &RpmbFrame) {
+        let Some(key) = self.rpmb_key else {
+            self.rpmb_stage_result_response(
+                RPMB_RESP_WRITE,
+                RPMB_RESULT_KEY_NOT_PROGRAMMED,
+                req.address(),
+                None,
+            );
+            return;
+        };
+        if self.rpmb_counter == u32::MAX {
+            self.rpmb_stage_result_response(
+                RPMB_RESP_WRITE,
+                RPMB_RESULT_WRITE_FAILURE | RPMB_RESULT_COUNTER_EXPIRED,
+                req.address(),
+                Some(&key),
+            );
+            return;
+        }
+        if (req.address() as u32) >= self.rpmb_capacity_half_sectors() || req.block_count() != 1 {
+            self.rpmb_stage_result_response(
+                RPMB_RESP_WRITE,
+                RPMB_RESULT_ADDRESS_FAILURE,
+                req.address(),
+                Some(&key),
+            );
+            return;
+        }
+        let expect = narf_crypto::hkdf::hmac_sha256(&key, req.mac_message());
+        if req.mac() != expect {
+            self.rpmb_stage_result_response(
+                RPMB_RESP_WRITE,
+                RPMB_RESULT_AUTH_FAILURE,
+                req.address(),
+                Some(&key),
+            );
+            return;
+        }
+        if req.write_counter() != self.rpmb_counter {
+            self.rpmb_stage_result_response(
+                RPMB_RESP_WRITE,
+                RPMB_RESULT_COUNTER_FAILURE,
+                req.address(),
+                Some(&key),
+            );
+            return;
+        }
+        let mut slot = [0u8; RPMB_LEN_DATA];
+        slot.copy_from_slice(req.data());
+        self.rpmb_store.insert(req.address(), slot);
+        self.rpmb_counter += 1;
+        self.rpmb_stage_result_response(RPMB_RESP_WRITE, RPMB_RESULT_OK, req.address(), Some(&key));
+    }
+
+    /// Authenticated data read (§6.6.22.4.4): the address is
+    /// checked first, then the request MAC authenticates the
+    /// reader before any data is served. The response echoes
+    /// the nonce, carries the data, and is MAC'd; its write
+    /// counter is 0x00 by spec.
+    fn rpmb_data_read(&mut self, req: &RpmbFrame) {
+        let Some(key) = self.rpmb_key else {
+            self.rpmb_stage_failure(RPMB_REQ_READ, RPMB_RESULT_KEY_NOT_PROGRAMMED);
+            return;
+        };
+        if (req.address() as u32) >= self.rpmb_capacity_half_sectors() {
+            self.rpmb_stage_failure(RPMB_REQ_READ, RPMB_RESULT_ADDRESS_FAILURE);
+            return;
+        }
+        let expect = narf_crypto::hkdf::hmac_sha256(&key, req.mac_message());
+        if req.mac() != expect {
+            // Authentication failure; the data is not served.
+            self.rpmb_stage_failure(RPMB_REQ_READ, RPMB_RESULT_AUTH_FAILURE);
+            return;
+        }
+        let mut f = RpmbFrame::new();
+        f.set_req_type(RPMB_RESP_READ);
+        f.set_nonce(&req.nonce());
+        f.set_address(req.address());
+        f.set_block_count(1);
+        f.set_result(RPMB_RESULT_OK);
+        if let Some(data) = self.rpmb_store.get(&req.address()) {
+            f.set_data(data);
+        }
+        let mac = narf_crypto::hkdf::hmac_sha256(&key, f.mac_message());
+        f.set_mac(&mac);
+        self.rpmb_response = Some(f.bytes);
+    }
+
+    /// Result-register read (§6.6.22.4.1/§6.6.22.4.3): fetch
+    /// the pending programming result. Without one there is
+    /// nothing to report.
+    fn rpmb_result_read_req(&mut self) {
+        match self.rpmb_result_response.take() {
+            Some(frame) => self.rpmb_response = Some(frame),
+            None => self.rpmb_stage_failure(RPMB_REQ_RESULT_READ, RPMB_RESULT_GENERAL_FAILURE),
+        }
     }
 }
 
@@ -459,6 +800,14 @@ impl FixtureTransport {
                 switch_args: Vec::new(),
                 switch_count: 0,
                 switch_error_on: None,
+                rpmb_key: None,
+                rpmb_counter: 0,
+                rpmb_store: BTreeMap::new(),
+                rpmb_response: None,
+                rpmb_result_response: None,
+                cmd23_armed: false,
+                cmd23_count: 0,
+                cmd23_reliable: false,
             }),
         }
     }
@@ -496,6 +845,14 @@ impl FixtureTransport {
                 switch_args: Vec::new(),
                 switch_count: 0,
                 switch_error_on,
+                rpmb_key: None,
+                rpmb_counter: 0,
+                rpmb_store: BTreeMap::new(),
+                rpmb_response: None,
+                rpmb_result_response: None,
+                cmd23_armed: false,
+                cmd23_count: 0,
+                cmd23_reliable: false,
             }),
         }
     }
@@ -519,6 +876,16 @@ impl FixtureTransport {
     /// written (`access` is the PARTITION_CONFIG access value).
     pub fn stored_part_block(&self, access: u8, block: u32) -> Option<[u8; 512]> {
         self.state.lock().part_image.get(&(access, block)).copied()
+    }
+
+    /// A half-sector from the modelled RPMB store, if written.
+    pub fn stored_rpmb_half_sector(&self, address: u16) -> Option<[u8; RPMB_LEN_DATA]> {
+        self.state.lock().rpmb_store.get(&address).copied()
+    }
+
+    /// The modelled RPMB write counter.
+    pub fn rpmb_counter(&self) -> u32 {
+        self.state.lock().rpmb_counter
     }
 }
 
@@ -577,12 +944,20 @@ impl SdhciTransport for FixtureTransport {
     fn write32(&self, offset: u64, value: u32) {
         let mut st = self.state.lock();
         if offset == REG_BUFFER_PORT {
-            // CMD24 capture: commit the block once all 128 words
-            // have landed, into the currently accessed partition.
+            // CMD24 / CMD25 capture: commit the block once all
+            // 128 words have landed, into the currently accessed
+            // partition — except on the RPMB partition, where
+            // the block is a request frame for the RPMB model,
+            // never a plain block.
             let cur = st.write_cursor;
             st.write_stage[cur..cur + 4].copy_from_slice(&value.to_le_bytes());
             st.write_cursor += 4;
             if st.write_cursor == 512 {
+                if st.emmc && st.current_access == 3 {
+                    let frame = st.write_stage;
+                    st.rpmb_process_request(&frame);
+                    return;
+                }
                 // The CMD24 argument is a block address, except on
                 // a byte-addressed eMMC card where it is a byte
                 // address (mirror the CMD17 staging above).
@@ -1127,4 +1502,415 @@ fn fixture_emmc_unpartitioned_user_area() -> TestResult {
 kernel_test_in!(
     "drivers/storage/sdhci/fixture",
     fixture_emmc_unpartitioned_user_area
+);
+
+/// Fixed test key for the RPMB fixture: bytes 0x00..0x1F. It is
+/// a test-only key for a modelled card, never a production key.
+const FIXTURE_RPMB_KEY: [u8; 32] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+];
+
+/// One RPMB half-sector (256 bytes) filled with an
+/// offset-sensitive pattern derived from `tag`.
+fn rpmb_data_pattern(tag: u8) -> [u8; RPMB_LEN_DATA] {
+    let mut b = [0u8; RPMB_LEN_DATA];
+    for (i, x) in b.iter_mut().enumerate() {
+        *x = tag ^ (i as u8);
+    }
+    b
+}
+
+/// Send one RPMB request frame on the raw command path: CMD23
+/// (count 1, reliable-write when `reliable`) + CMD25
+/// (argument 0). The caller must have switched the card to the
+/// RPMB partition first.
+fn rpmb_send_raw(
+    ctrl: &Sdhci,
+    frame: &[u8; RPMB_FRAME_SIZE],
+    reliable: bool,
+) -> Result<(), &'static str> {
+    let arg = 1u32 | if reliable { 1 << 31 } else { 0 };
+    let _ = ctrl
+        .cmd(23, arg, RESP_48, false, 0, 0, 0)
+        .map_err(|_| "CMD23 failed")?;
+    ctrl.write_pio_block(25, 0, true, frame)
+        .map_err(|_| "CMD25 failed")?;
+    Ok(())
+}
+
+/// Receive one RPMB response frame on the raw command path:
+/// CMD23 (count 1) + CMD18 (argument 0).
+fn rpmb_recv_raw(ctrl: &Sdhci) -> Result<RpmbFrame, &'static str> {
+    let _ = ctrl
+        .cmd(23, 1, RESP_48, false, 0, 0, 0)
+        .map_err(|_| "CMD23 failed")?;
+    let mut raw = [0u8; RPMB_FRAME_SIZE];
+    ctrl.read_pio_block(18, 0, true, &mut raw)
+        .map_err(|_| "CMD18 failed")?;
+    Ok(RpmbFrame::from_bytes(raw))
+}
+
+/// A raw result-register read: the type-0x0005 request, then
+/// the response frame.
+fn rpmb_result_read_raw(ctrl: &Sdhci) -> Result<RpmbFrame, &'static str> {
+    rpmb_send_raw(ctrl, &RpmbFrame::result_read().bytes, false)?;
+    rpmb_recv_raw(ctrl)
+}
+
+/// RPMB authenticated round-trip end to end: program the key,
+/// read the counter (0), write one half-sector, read the
+/// counter (1), read the half-sector back, and read an
+/// unwritten half-sector (zero). The command conversation is
+/// CMD23 + CMD18/CMD25 throughout (§6.6.22.4), the card
+/// switches to the RPMB partition and back to the user area
+/// for every operation, and RPMB still publishes no plain
+/// block device.
+fn fixture_emmc_rpmb_auth_round_trip() -> TestResult {
+    let (transport, saved) = install_emmc(
+        partitioned_image(),
+        fixture_part_image(),
+        fixture_ext_csd(16_777_216),
+        true,
+        None,
+    );
+
+    let result = (|| {
+        let _card = identify_emmc_and_publish()?;
+        if narf_block::registry::find_block_device("emmc0rpmb").is_some() {
+            return Err("RPMB must not publish as a plain block device");
+        }
+        let key = &FIXTURE_RPMB_KEY;
+        let data = rpmb_data_pattern(0x11);
+        with_controller(|ctrl| -> Result<(), &'static str> {
+            ctrl.rpmb_program_key(key)
+                .map_err(|_| "program key failed")?;
+            let counter = ctrl
+                .rpmb_read_counter(key)
+                .map_err(|_| "counter read failed")?;
+            if counter != 0 {
+                return Err("counter must start at 0");
+            }
+            ctrl.rpmb_write(key, 0x0010, &data)
+                .map_err(|_| "authenticated write failed")?;
+            let counter = ctrl
+                .rpmb_read_counter(key)
+                .map_err(|_| "counter read failed")?;
+            if counter != 1 {
+                return Err("counter must be 1 after one write");
+            }
+            let mut out = [0u8; RPMB_LEN_DATA];
+            ctrl.rpmb_read(key, 0x0010, &mut out)
+                .map_err(|_| "authenticated read failed")?;
+            if out != data {
+                return Err("authenticated read must return the written half-sector");
+            }
+            ctrl.rpmb_read(key, 0x0011, &mut out)
+                .map_err(|_| "read of an unwritten half-sector failed")?;
+            if out != [0u8; RPMB_LEN_DATA] {
+                return Err("unwritten half-sector must read back as zero");
+            }
+            Ok(())
+        })
+        .ok_or("no controller")??;
+        // The card is back on the user area after every op.
+        let ctrl = probed_sdhci().ok_or("fixture controller not installed")?;
+        if *ctrl.emmc_access.lock() != 0 {
+            return Err("card must be back on the user area after the RPMB ops");
+        }
+        // The conversation, counted: program key (3×CMD23,
+        // 2×CMD25, 1×CMD18), counter read (2, 1, 1), write
+        // (counter 2/1/1 + send 1/1/0 + result 2/1/1), counter
+        // read (2, 1, 1), read (2, 1, 1) = 14 CMD23, 8 CMD25,
+        // 6 CMD18 — and no CMD17/CMD24 at all on the RPMB path.
+        let indices = transport.cmd_indices();
+        let count = |idx: u8| indices.iter().filter(|&&i| i == idx).count();
+        if count(23) != 14 || count(25) != 8 || count(18) != 6 {
+            return Err("RPMB conversation must be CMD23 + CMD18/CMD25 (14/8/6)");
+        }
+        // Eleven SWITCHes: the identify pin to the user area,
+        // then to RPMB (0x0B) and back (0x08) for each of the
+        // five operations.
+        let switches = transport.switch_args();
+        let switch_arg = |value: u8| (3u32 << 24) | (179u32 << 16) | ((value as u32) << 8);
+        if switches.len() != 11 || !switches.contains(&switch_arg(0x0B)) {
+            return Err("each RPMB op must switch to RPMB and back to the user area");
+        }
+        // The model saw the write land exactly once.
+        match transport.stored_rpmb_half_sector(0x0010) {
+            Some(b) if b == data => {}
+            _ => return Err("modelled RPMB store must hold the written half-sector"),
+        }
+        if transport.rpmb_counter() != 1 {
+            return Err("modelled RPMB counter must be 1");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_emmc_rpmb_auth_round_trip
+);
+
+/// A write (and a read) under the wrong key fails, the counter
+/// never moves, and nothing is stored: the device's MAC check
+/// rejects the request, and the driver's MAC check rejects a
+/// response that is not under the caller's key.
+fn fixture_emmc_rpmb_wrong_key_rejected() -> TestResult {
+    let (transport, saved) = install_emmc(
+        partitioned_image(),
+        fixture_part_image(),
+        fixture_ext_csd(16_777_216),
+        true,
+        None,
+    );
+
+    let result = (|| {
+        let _card = identify_emmc_and_publish()?;
+        let wrong = [0x77u8; 32];
+        let data = rpmb_data_pattern(0x22);
+        with_controller(|ctrl| -> Result<(), &'static str> {
+            ctrl.rpmb_program_key(&FIXTURE_RPMB_KEY)
+                .map_err(|_| "program key failed")?;
+            if ctrl.rpmb_write(&wrong, 0x0010, &data).is_ok() {
+                return Err("write under the wrong key must fail");
+            }
+            let counter = ctrl
+                .rpmb_read_counter(&FIXTURE_RPMB_KEY)
+                .map_err(|_| "counter read failed")?;
+            if counter != 0 {
+                return Err("rejected write must not advance the counter");
+            }
+            let mut out = [0u8; RPMB_LEN_DATA];
+            if ctrl.rpmb_read(&wrong, 0x0010, &mut out).is_ok() {
+                return Err("read under the wrong key must fail");
+            }
+            Ok(())
+        })
+        .ok_or("no controller")??;
+        if transport.stored_rpmb_half_sector(0x0010).is_some() {
+            return Err("rejected write must not store data");
+        }
+        if transport.rpmb_counter() != 0 {
+            return Err("modelled RPMB counter must stay 0");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_emmc_rpmb_wrong_key_rejected
+);
+
+/// Replay protection on the raw command path: a well-formed
+/// write frame succeeds once (result 0x0000, counter 1), the
+/// identical frame replayed reports Counter failure (0x0003),
+/// and an out-of-range write with a fresh counter and a valid
+/// MAC reports Address failure (0x0004). The write-result
+/// response MAC is verified under the key, proving the model's
+/// MAC is a real HMAC-SHA-256 and not a placeholder.
+fn fixture_emmc_rpmb_replay_and_address_rejected() -> TestResult {
+    let (transport, saved) = install_emmc(
+        partitioned_image(),
+        fixture_part_image(),
+        fixture_ext_csd(16_777_216),
+        true,
+        None,
+    );
+
+    let result = (|| {
+        let _card = identify_emmc_and_publish()?;
+        with_controller(|ctrl| -> Result<(), &'static str> {
+            ctrl.rpmb_program_key(&FIXTURE_RPMB_KEY)
+                .map_err(|_| "program key failed")?;
+            Ok(())
+        })
+        .ok_or("no controller")??;
+        // A well-formed write frame at counter 0.
+        let mut frame = RpmbFrame::data_write(0, 0x0020, &rpmb_data_pattern(0x22));
+        let mac = narf_crypto::hkdf::hmac_sha256(&FIXTURE_RPMB_KEY, frame.mac_message());
+        frame.set_mac(&mac);
+        let frame_bytes = frame.bytes;
+        let first = with_controller(|ctrl| -> Result<RpmbFrame, &'static str> {
+            ctrl.ensure_partition_access(3)
+                .map_err(|_| "switch to RPMB failed")?;
+            rpmb_send_raw(ctrl, &frame_bytes, true)?;
+            rpmb_result_read_raw(ctrl)
+        })
+        .ok_or("no controller")??;
+        if first.req_type() != RPMB_RESP_WRITE
+            || first.result() != RPMB_RESULT_OK
+            || first.write_counter() != 1
+        {
+            return Err("first write must report success at counter 1");
+        }
+        let expect = narf_crypto::hkdf::hmac_sha256(&FIXTURE_RPMB_KEY, first.mac_message());
+        if first.mac() != expect {
+            return Err("write result MAC must verify under the key");
+        }
+        // Replay the identical frame.
+        let replay = with_controller(|ctrl| -> Result<RpmbFrame, &'static str> {
+            rpmb_send_raw(ctrl, &frame_bytes, true)?;
+            rpmb_result_read_raw(ctrl)
+        })
+        .ok_or("no controller")??;
+        if replay.req_type() != RPMB_RESP_WRITE || replay.result() != RPMB_RESULT_COUNTER_FAILURE {
+            return Err("replayed write must report counter failure (0x0003)");
+        }
+        // Out of range with a fresh counter and a valid MAC.
+        let mut oob = RpmbFrame::data_write(1, 0x4000, &rpmb_data_pattern(0x33));
+        let mac = narf_crypto::hkdf::hmac_sha256(&FIXTURE_RPMB_KEY, oob.mac_message());
+        oob.set_mac(&mac);
+        let oob_bytes = oob.bytes;
+        let oob_resp = with_controller(|ctrl| -> Result<RpmbFrame, &'static str> {
+            rpmb_send_raw(ctrl, &oob_bytes, true)?;
+            rpmb_result_read_raw(ctrl)
+        })
+        .ok_or("no controller")??;
+        if oob_resp.req_type() != RPMB_RESP_WRITE
+            || oob_resp.result() != RPMB_RESULT_ADDRESS_FAILURE
+        {
+            return Err("out-of-range write must report address failure (0x0004)");
+        }
+        with_controller(|ctrl| -> Result<(), &'static str> {
+            ctrl.ensure_partition_access(0)
+                .map_err(|_| "switch to user failed")?;
+            Ok(())
+        })
+        .ok_or("no controller")??;
+        // The first write landed; the replay and the
+        // out-of-range write did not move the counter.
+        match transport.stored_rpmb_half_sector(0x0020) {
+            Some(b) if b == rpmb_data_pattern(0x22) => {}
+            _ => return Err("modelled RPMB store must hold the first write"),
+        }
+        if transport.rpmb_counter() != 1 {
+            return Err("modelled RPMB counter must be 1 after one write");
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_emmc_rpmb_replay_and_address_rejected
+);
+
+/// Before the key is programmed every RPMB access reports
+/// KeyNotProgrammed (0x0007) — the only valid result until
+/// the key exists (Table 20 note) — and no MAC is involved.
+fn fixture_emmc_rpmb_key_not_programmed() -> TestResult {
+    let (_transport, saved) = install_emmc(
+        partitioned_image(),
+        fixture_part_image(),
+        fixture_ext_csd(16_777_216),
+        true,
+        None,
+    );
+
+    let result = (|| {
+        let _card = identify_emmc_and_publish()?;
+        with_controller(|ctrl| -> Result<(), &'static str> {
+            if ctrl.rpmb_read_counter(&FIXTURE_RPMB_KEY).is_ok() {
+                return Err("counter read before key programming must fail");
+            }
+            let mut out = [0u8; RPMB_LEN_DATA];
+            if ctrl.rpmb_read(&FIXTURE_RPMB_KEY, 0, &mut out).is_ok() {
+                return Err("read before key programming must fail");
+            }
+            if ctrl
+                .rpmb_write(&FIXTURE_RPMB_KEY, 0, &[0u8; RPMB_LEN_DATA])
+                .is_ok()
+            {
+                return Err("write before key programming must fail");
+            }
+            Ok(())
+        })
+        .ok_or("no controller")??;
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_emmc_rpmb_key_not_programmed
+);
+
+/// The driver validates the half-sector address before
+/// touching the card: reads and writes past the 4 MiB RPMB
+/// partition (16384 half-sectors) fail without issuing a
+/// CMD25, and the last valid half-sector (0x3FFF) writes.
+/// CMD25 count: 2 for the key program + 3 for the one
+/// successful write.
+fn fixture_emmc_rpmb_out_of_range() -> TestResult {
+    let (transport, saved) = install_emmc(
+        partitioned_image(),
+        fixture_part_image(),
+        fixture_ext_csd(16_777_216),
+        true,
+        None,
+    );
+
+    let result = (|| {
+        let _card = identify_emmc_and_publish()?;
+        with_controller(|ctrl| -> Result<(), &'static str> {
+            ctrl.rpmb_program_key(&FIXTURE_RPMB_KEY)
+                .map_err(|_| "program key failed")?;
+            let mut out = [0u8; RPMB_LEN_DATA];
+            if ctrl.rpmb_read(&FIXTURE_RPMB_KEY, 0x4000, &mut out).is_ok() {
+                return Err("read past the RPMB partition must fail");
+            }
+            if ctrl
+                .rpmb_write(&FIXTURE_RPMB_KEY, 0x4000, &[0u8; RPMB_LEN_DATA])
+                .is_ok()
+            {
+                return Err("write past the RPMB partition must fail");
+            }
+            ctrl.rpmb_write(&FIXTURE_RPMB_KEY, 0x3FFF, &[0x5Au8; RPMB_LEN_DATA])
+                .map_err(|_| "write to the last half-sector failed")?;
+            Ok(())
+        })
+        .ok_or("no controller")??;
+        let indices = transport.cmd_indices();
+        if indices.iter().filter(|&&i| i == 25).count() != 5 {
+            return Err("out-of-range attempts must not issue CMD25");
+        }
+        match transport.stored_rpmb_half_sector(0x3FFF) {
+            Some(b) if b == [0x5Au8; RPMB_LEN_DATA] => {}
+            _ => return Err("last half-sector write must land in the model"),
+        }
+        Ok(())
+    })();
+
+    restore(saved);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/sdhci/fixture",
+    fixture_emmc_rpmb_out_of_range
 );
