@@ -18,6 +18,9 @@
 //! - Surfacing a small fragment reassembly buffer (RFC 8200 §4.5).
 //! - Building outbound IPv6 + ICMPv6 frames + computing the pseudo
 //!   checksum.
+//! - Originating ICMPv6 messages on an interface (Echo Request/Reply,
+//!   solicited + unsolicited Neighbor Advertisement, RFC 4443 error
+//!   messages) — the transmit surface; see [`send_icmp6_in`].
 
 extern crate alloc;
 
@@ -32,10 +35,11 @@ use crate::ipv6::{icmp6_sock, ndp, slaac};
 use crate::pkt::{ip_checksum, write_eth_header, ETHERTYPE_IPV6, ETH_HDR_LEN};
 use crate::pkt_ipv6::{
     pseudo_checksum, Icmpv6Header, Ipv6Header, ICMPV6_ECHO_REPLY, ICMPV6_ECHO_REQUEST,
-    ICMPV6_NEIGHBOR_ADVERTISEMENT, ICMPV6_NEIGHBOR_SOLICITATION, ICMPV6_PACKET_TOO_BIG,
-    ICMPV6_REDIRECT, ICMPV6_ROUTER_ADVERTISEMENT, ICMPV6_ROUTER_SOLICITATION, IPV6_HDR_LEN,
-    NEXT_HEADER_DESTINATION_OPTIONS, NEXT_HEADER_FRAGMENT, NEXT_HEADER_HBH, NEXT_HEADER_ICMPV6,
-    NEXT_HEADER_ROUTING, NEXT_HEADER_TCP, NEXT_HEADER_UDP,
+    ICMPV6_HDR_LEN, ICMPV6_NEIGHBOR_ADVERTISEMENT, ICMPV6_NEIGHBOR_SOLICITATION,
+    ICMPV6_PACKET_TOO_BIG, ICMPV6_REDIRECT, ICMPV6_ROUTER_ADVERTISEMENT,
+    ICMPV6_ROUTER_SOLICITATION, IPV6_HDR_LEN, NEXT_HEADER_DESTINATION_OPTIONS,
+    NEXT_HEADER_FRAGMENT, NEXT_HEADER_HBH, NEXT_HEADER_ICMPV6, NEXT_HEADER_ROUTING,
+    NEXT_HEADER_TCP, NEXT_HEADER_UDP,
 };
 
 /// Result of walking the next-header chain.
@@ -351,6 +355,22 @@ pub fn neighbor_resolved(net_ns_id: u64, iface_name: &str, neighbor: [u8; 16], m
         }
         *queue = retained;
     }
+    let mut ready_icmp6 = Vec::new();
+    {
+        let mut queue = PENDING_ICMP6.lock();
+        let mut retained = VecDeque::new();
+        while let Some(packet) = queue.pop_front() {
+            if packet.net_ns_id == net_ns_id
+                && packet.iface == iface_name
+                && packet.neighbor == neighbor
+            {
+                ready_icmp6.push(packet);
+            } else {
+                retained.push_back(packet);
+            }
+        }
+        *queue = retained;
+    }
     let Some(iface) = crate::iface::lookup_in(net_ns_id, iface_name) else {
         return;
     };
@@ -367,10 +387,23 @@ pub fn neighbor_resolved(net_ns_id: u64, iface_name: &str, neighbor: [u8; 16], m
             packet.may_fragment,
         );
     }
+    for packet in ready_icmp6 {
+        let _ = emit_icmp6_frame(
+            &iface,
+            mac,
+            packet.source,
+            packet.destination,
+            packet.hop_limit,
+            &packet.body,
+        );
+    }
 }
 
 pub(crate) fn remove_namespace(net_ns_id: u64) {
     PENDING_UDP6
+        .lock()
+        .retain(|packet| packet.net_ns_id != net_ns_id);
+    PENDING_ICMP6
         .lock()
         .retain(|packet| packet.net_ns_id != net_ns_id);
     PMTU.lock().retain(|(ns, _), _| *ns != net_ns_id);
@@ -396,6 +429,47 @@ pub fn __pending_udp6_test_insert(net_ns_id: u64, iface: &str, neighbor: [u8; 16
 #[doc(hidden)]
 pub fn __pending_udp6_test_count(net_ns_id: u64) -> usize {
     PENDING_UDP6
+        .lock()
+        .iter()
+        .filter(|packet| packet.net_ns_id == net_ns_id)
+        .count()
+}
+
+/// A complete ICMPv6 message awaiting neighbor resolution — the
+/// ICMPv6 half of the UDP pending queue above (`send_icmp6_in`
+/// queues here; `neighbor_resolved` flushes). ICMPv6 messages are
+/// never fragmented, so there is no MTU/fragment state to carry.
+#[derive(Debug)]
+struct PendingIcmp6 {
+    net_ns_id: u64,
+    iface: String,
+    neighbor: [u8; 16],
+    source: [u8; 16],
+    destination: [u8; 16],
+    hop_limit: u8,
+    body: Vec<u8>,
+}
+
+const MAX_PENDING_ICMP6_PACKETS: usize = 256;
+const MAX_PENDING_ICMP6_BYTES: usize = 1024 * 1024;
+static PENDING_ICMP6: IrqSafeSpinLock<VecDeque<PendingIcmp6>> =
+    IrqSafeSpinLock::new(VecDeque::new());
+
+fn queue_icmp6(packet: PendingIcmp6) -> Result<(), Icmp6SendError> {
+    let mut queue = PENDING_ICMP6.lock();
+    let bytes: usize = queue.iter().map(|entry| entry.body.len()).sum();
+    if queue.len() >= MAX_PENDING_ICMP6_PACKETS
+        || bytes.saturating_add(packet.body.len()) > MAX_PENDING_ICMP6_BYTES
+    {
+        return Err(Icmp6SendError::QueueFull);
+    }
+    queue.push_back(packet);
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn __pending_icmp6_test_count(net_ns_id: u64) -> usize {
+    PENDING_ICMP6
         .lock()
         .iter()
         .filter(|packet| packet.net_ns_id == net_ns_id)
@@ -560,7 +634,7 @@ pub fn send_udp(
                 may_fragment,
             })?;
         }
-        start_neighbor_resolution(net_ns_id, &iface_name, &iface, source, neighbor_ip);
+        start_neighbor_resolution(net_ns_id, &iface_name, source, neighbor_ip);
         return Ok(payload.len());
     };
 
@@ -675,13 +749,7 @@ pub fn __fragment_udp6_for_test(udp: &[u8], mtu: u32, id: u32) -> Option<Vec<Vec
     fragment_udp6(udp, mtu, id).ok()
 }
 
-fn start_neighbor_resolution(
-    net_ns_id: u64,
-    iface_name: &str,
-    iface: &crate::iface::NetIfaceSnapshot,
-    source: [u8; 16],
-    target: [u8; 16],
-) {
+fn start_neighbor_resolution(net_ns_id: u64, iface_name: &str, source: [u8; 16], target: [u8; 16]) {
     let now = narf_scheduler::narf_time::monotonic_ns();
     if let Some(existing) = crate::ipv6::ndp::neigh_list_in(net_ns_id)
         .into_iter()
@@ -703,30 +771,10 @@ fn start_neighbor_resolution(
             deadline_ns: now.saturating_add(1_000_000_000),
         },
     );
-    let destination = crate::ipv6::addrs::solicited_node_multicast(&target);
-    let destination_mac = [
-        0x33,
-        0x33,
-        destination[12],
-        destination[13],
-        destination[14],
-        destination[15],
-    ];
-    let body = build_ns_packet(source, destination, target, iface.mac);
-    let mut frame = Vec::new();
-    build_frame(
-        &mut frame,
-        Ipv6FrameSpec {
-            src_mac: iface.mac,
-            dst_mac: destination_mac,
-            src_ip: source,
-            dst_ip: destination,
-            next_header: NEXT_HEADER_ICMPV6,
-            hop_limit: 255,
-            body: &body,
-        },
-    );
-    let _ = iface.xmit(&frame);
+    // The solicitation itself goes out through the ICMPv6 transmit
+    // surface (same frame as before: solicited-node multicast dst,
+    // hop limit 255, Source LL Address option).
+    let _ = send_ns_in(net_ns_id, iface_name, source, target);
 }
 
 /// Build an ICMPv6 Echo Request, set the checksum, return the body.
@@ -769,6 +817,435 @@ pub fn build_dad_ns_packet(target: [u8; 16]) -> Vec<u8> {
     body[2] = (cks >> 8) as u8;
     body[3] = (cks & 0xFF) as u8;
     body
+}
+
+// ── ICMPv6 transmit surface (#1536) ─────────────────────────────────
+//
+// The stack side of the virtio-net gap-13 remainder: until this lane,
+// nothing could originate an ICMPv6 packet on an interface — the
+// solicited NS→NA reply body and the Echo Reply body were both built
+// and dropped in `handle_icmp6`. The entry point is `send_icmp6_in`;
+// the typed wrappers below cover the messages the stack originates
+// itself (Echo Request, Neighbor Solicitation, solicited +
+// unsolicited Neighbor Advertisement, RFC 4443 errors).
+//
+// References (public-only):
+// - RFC 4443 — ICMPv6. §2.2 (reply source determination), §2.3
+//   (pseudo-header checksum), §2.4(c) (error truncation to the
+//   minimum IPv6 MTU) + (e) (when an error must NOT be originated)
+//   + (f) (error rate limiting — NOT implemented here, see
+//   `send_icmp6_error_in`), §3 (error formats), §4 (echo).
+//   <https://datatracker.ietf.org/doc/html/rfc4443>
+// - RFC 4861 — Neighbor Discovery. §7.2.2 (sending NS), §7.2.4
+//   (solicited NA), §7.2.6 (unsolicited NA).
+//   <https://datatracker.ietf.org/doc/html/rfc4861>
+// - RFC 8200 — IPv6. §3 (header), §8.1 (pseudo-header checksum).
+//   <https://datatracker.ietf.org/doc/html/rfc8200>
+
+/// Hop limit for originated ICMPv6 echo / error messages (Linux
+/// `ip6_dst_hoplimit` default). ND messages use 255 instead — a
+/// receiver discards them with any other value (RFC 4861 §7.1.1,
+/// §7.1.2) — so the ND wrappers pass [`ICMPV6_ND_HOP_LIMIT`].
+pub const ICMPV6_ORIGIN_HOP_LIMIT: u8 = 64;
+
+/// Hop limit for originated ND messages (NS / NA). RFC 4861 §7.1.1,
+/// §7.1.2: receivers MUST discard ND messages with hop limit != 255.
+pub const ICMPV6_ND_HOP_LIMIT: u8 = 255;
+
+/// Errors from the ICMPv6 transmit path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Icmp6SendError {
+    /// No usable source address on the interface.
+    NoSourceAddress,
+    /// Unicast destination has no neighbor-cache entry: the packet was
+    /// queued and resolution started (RFC 4861 §7.2.2); it is not on
+    /// the wire yet. It is emitted when the NA arrives
+    /// ([`neighbor_resolved`]).
+    NeighborPending,
+    /// Interface (or its namespace) does not exist.
+    NetworkUnreachable,
+    /// Frame exceeds the interface MTU, or the body is shorter than
+    /// the 4-byte ICMPv6 header. ICMPv6 messages are never fragmented
+    /// by this path.
+    MessageTooLong,
+    /// The device refused the frame.
+    DeviceFailure,
+    /// The pending-resolution queue is full; the packet was dropped.
+    QueueFull,
+    /// RFC 4443 §2.4(e): an error message must not be originated for
+    /// this invoking packet. Nothing was queued or sent.
+    ErrorSuppressed,
+}
+
+/// Emit one ICMPv6 message on an already-resolved interface: stamp
+/// the pseudo-header checksum (bytes 2..4 are zeroed first, so a body
+/// whose checksum a builder already filled is re-stamped, not
+/// double-counted), build the Ethernet + IPv6 frame, and hand it to
+/// the device.
+fn emit_icmp6_frame(
+    iface: &crate::iface::NetIfaceSnapshot,
+    dst_mac: [u8; 6],
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    hop_limit: u8,
+    body: &[u8],
+) -> Result<(), Icmp6SendError> {
+    if body.len() < ICMPV6_HDR_LEN || ETH_HDR_LEN + IPV6_HDR_LEN + body.len() > iface.mtu as usize {
+        return Err(Icmp6SendError::MessageTooLong);
+    }
+    let mut body = body.to_vec();
+    // RFC 4443 §2.3 / RFC 8200 §8.1: the checksum covers the ICMPv6
+    // message plus the IPv6 pseudo-header (next header 58), with the
+    // checksum field zeroed while computing.
+    body[2] = 0;
+    body[3] = 0;
+    let cks = pseudo_checksum(src_ip, dst_ip, NEXT_HEADER_ICMPV6, &body);
+    body[2] = (cks >> 8) as u8;
+    body[3] = (cks & 0xFF) as u8;
+    let mut frame = Vec::new();
+    build_frame(
+        &mut frame,
+        Ipv6FrameSpec {
+            src_mac: iface.mac,
+            dst_mac,
+            src_ip,
+            dst_ip,
+            next_header: NEXT_HEADER_ICMPV6,
+            hop_limit,
+            body: &body,
+        },
+    );
+    iface
+        .xmit(&frame)
+        .map_err(|_| Icmp6SendError::DeviceFailure)
+}
+
+/// Originate one ICMPv6 message on `iface_name`: resolve the
+/// link-layer destination (RFC 2464 §7 multicast mapping for
+/// ff00::/8, neighbor-cache lookup otherwise), build the frame, and
+/// transmit it through the interface's device path. A unicast
+/// destination with no cache entry queues the complete message and
+/// starts neighbor resolution (RFC 4861 §7.2.2); the caller gets
+/// `NeighborPending` and the message is emitted when the NA arrives.
+/// `body` carries a zero checksum field — it is stamped here.
+pub fn send_icmp6(
+    iface_name: &str,
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    body: &[u8],
+    hop_limit: u8,
+) -> Result<(), Icmp6SendError> {
+    let net_ns_id = crate::iface::lookup(iface_name)
+        .map(|entry| entry.net_ns_id)
+        .unwrap_or(0);
+    send_icmp6_in(net_ns_id, iface_name, src_ip, dst_ip, body, hop_limit)
+}
+
+pub fn send_icmp6_in(
+    net_ns_id: u64,
+    iface_name: &str,
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    body: &[u8],
+    hop_limit: u8,
+) -> Result<(), Icmp6SendError> {
+    let iface =
+        crate::iface::lookup_in(net_ns_id, iface_name).ok_or(Icmp6SendError::NetworkUnreachable)?;
+    if ETH_HDR_LEN + IPV6_HDR_LEN + body.len() > iface.mtu as usize {
+        return Err(Icmp6SendError::MessageTooLong);
+    }
+    let dst_mac = if dst_ip[0] == 0xff {
+        // RFC 2464 §7: multicast IPv6 → 33:33:<low 32 bits>.
+        [0x33, 0x33, dst_ip[12], dst_ip[13], dst_ip[14], dst_ip[15]]
+    } else if let Some(mac) = crate::ipv6::ndp::neigh_lookup_in(net_ns_id, iface_name, &dst_ip) {
+        mac
+    } else {
+        // No cache entry: queue the message and solicit the neighbor
+        // (same pattern as the UDP pending queue in `send_udp`).
+        queue_icmp6(PendingIcmp6 {
+            net_ns_id,
+            iface: String::from(iface_name),
+            neighbor: dst_ip,
+            source: src_ip,
+            destination: dst_ip,
+            hop_limit,
+            body: body.to_vec(),
+        })?;
+        start_neighbor_resolution(net_ns_id, iface_name, src_ip, dst_ip);
+        return Err(Icmp6SendError::NeighborPending);
+    };
+    emit_icmp6_frame(&iface, dst_mac, src_ip, dst_ip, hop_limit, body)
+}
+
+/// Originate an ICMPv6 Echo Request (RFC 4443 §4.1) to `dst` from the
+/// interface's scope-matched source address. Returns the payload
+/// length on success, mirroring `send_udp`. A cold neighbor cache
+/// queues the request and returns `NeighborPending`.
+pub fn send_echo_request(
+    iface_name: &str,
+    dst: [u8; 16],
+    id: u16,
+    seq: u16,
+    payload: &[u8],
+) -> Result<usize, Icmp6SendError> {
+    let net_ns_id = crate::iface::lookup(iface_name)
+        .map(|entry| entry.net_ns_id)
+        .unwrap_or(0);
+    send_echo_request_in(net_ns_id, iface_name, dst, id, seq, payload)
+}
+
+pub fn send_echo_request_in(
+    net_ns_id: u64,
+    iface_name: &str,
+    dst: [u8; 16],
+    id: u16,
+    seq: u16,
+    payload: &[u8],
+) -> Result<usize, Icmp6SendError> {
+    let source = crate::ipv6::addrs::pick_source_in(net_ns_id, iface_name, &dst)
+        .ok_or(Icmp6SendError::NoSourceAddress)?;
+    let body = icmp6_sock::build_echo_request(id, seq, payload);
+    send_icmp6_in(
+        net_ns_id,
+        iface_name,
+        source,
+        dst,
+        &body,
+        ICMPV6_ORIGIN_HOP_LIMIT,
+    )?;
+    Ok(payload.len())
+}
+
+/// Originate a Neighbor Solicitation for `target` from `src_ip`
+/// (RFC 4861 §7.2.2): destination is the target's solicited-node
+/// multicast, hop limit 255, Source LL Address option = iface MAC.
+pub fn send_ns(iface_name: &str, src_ip: [u8; 16], target: [u8; 16]) -> Result<(), Icmp6SendError> {
+    let net_ns_id = crate::iface::lookup(iface_name)
+        .map(|entry| entry.net_ns_id)
+        .unwrap_or(0);
+    send_ns_in(net_ns_id, iface_name, src_ip, target)
+}
+
+pub fn send_ns_in(
+    net_ns_id: u64,
+    iface_name: &str,
+    src_ip: [u8; 16],
+    target: [u8; 16],
+) -> Result<(), Icmp6SendError> {
+    let iface =
+        crate::iface::lookup_in(net_ns_id, iface_name).ok_or(Icmp6SendError::NetworkUnreachable)?;
+    let dst_ip = crate::ipv6::addrs::solicited_node_multicast(&target);
+    let body = build_ns_packet(src_ip, dst_ip, target, iface.mac);
+    send_icmp6_in(
+        net_ns_id,
+        iface_name,
+        src_ip,
+        dst_ip,
+        &body,
+        ICMPV6_ND_HOP_LIMIT,
+    )
+}
+
+/// Originate one unsolicited Neighbor Advertisement for `target` on
+/// `iface_name` (RFC 4861 §7.2.6): Solicited clear, Override set,
+/// Target LL Address option = iface MAC, IPv6 source = `target`,
+/// destination ff02::1 (all-nodes), hop limit 255. This is the emit
+/// surface the virtio-net gap-13 remainder (#1536) was missing: the
+/// driver announce path calls [`send_unsolicited_na`] (below)
+/// alongside the existing IPv4 gratuitous ARP.
+pub fn send_unsolicited_na_for(iface_name: &str, target: [u8; 16]) -> Result<(), Icmp6SendError> {
+    let net_ns_id = crate::iface::lookup(iface_name)
+        .map(|entry| entry.net_ns_id)
+        .unwrap_or(0);
+    send_unsolicited_na_for_in(net_ns_id, iface_name, target)
+}
+
+pub fn send_unsolicited_na_for_in(
+    net_ns_id: u64,
+    iface_name: &str,
+    target: [u8; 16],
+) -> Result<(), Icmp6SendError> {
+    let iface =
+        crate::iface::lookup_in(net_ns_id, iface_name).ok_or(Icmp6SendError::NetworkUnreachable)?;
+    let body = ndp::build_unsolicited_na(target, iface.mac);
+    send_icmp6_in(
+        net_ns_id,
+        iface_name,
+        target,
+        crate::ipv6::addrs::ALL_NODES_MULTICAST,
+        &body,
+        ICMPV6_ND_HOP_LIMIT,
+    )
+}
+
+/// Originate one unsolicited Neighbor Advertisement per usable address
+/// on `iface_name` (Linux analog: `netdev_notify_peers` →
+/// `ndisc_notify`). Returns the number of advertisements emitted.
+/// Only Preferred/Deprecated addresses are announced — a Tentative
+/// address is still owned by DAD and must not be advertised.
+///
+/// NOTE (RFC 4861 §7.2.6 SHOULD): a node with several addresses
+/// SHOULD introduce a small delay between the advertisements to
+/// reduce the probability of loss from congestion. This call emits
+/// synchronously, one per address, with no pacing — callers that
+/// need pacing should drive [`send_unsolicited_na_for`] per address
+/// from a timer instead.
+pub fn send_unsolicited_na(iface_name: &str) -> usize {
+    let net_ns_id = crate::iface::lookup(iface_name)
+        .map(|entry| entry.net_ns_id)
+        .unwrap_or(0);
+    send_unsolicited_na_in(net_ns_id, iface_name)
+}
+
+pub fn send_unsolicited_na_in(net_ns_id: u64, iface_name: &str) -> usize {
+    use crate::ipv6::addrs::AddrState;
+    let mut sent = 0usize;
+    for entry in crate::ipv6::addrs::list_iface_in(net_ns_id, iface_name) {
+        if !matches!(entry.state, AddrState::Preferred | AddrState::Deprecated) {
+            continue;
+        }
+        if send_unsolicited_na_for_in(net_ns_id, iface_name, entry.addr).is_ok() {
+            sent += 1;
+        }
+    }
+    sent
+}
+
+/// Which ICMPv6 error message to originate (RFC 4443 §3).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Icmp6ErrorKind {
+    /// Type 1. Code: 0 no route, 1 administratively prohibited,
+    /// 2 beyond scope of source, 3 address unreachable, 4 port
+    /// unreachable, 5 source failed ingress/egress policy, 6 reject
+    /// route. (RFC 4443 §3.1; there is no code 7.)
+    DestinationUnreachable(u8),
+    /// Type 2, code 0. Carries the MTU of the next-hop link
+    /// (RFC 4443 §3.2).
+    PacketTooBig(u32),
+    /// Type 3. Code: 0 hop limit exceeded in transit, 1 fragment
+    /// reassembly time exceeded (RFC 4443 §3.3).
+    TimeExceeded(u8),
+    /// Type 4. (Code, Pointer): 0 erroneous header field,
+    /// 1 unrecognized Next Header, 2 unrecognized IPv6 option;
+    /// Pointer is the octet offset of the problem within the
+    /// invoking packet (RFC 4443 §3.4).
+    ParameterProblem(u8, u32),
+}
+
+impl Icmp6ErrorKind {
+    fn body(self, invoking: &[u8]) -> Vec<u8> {
+        match self {
+            Icmp6ErrorKind::DestinationUnreachable(code) => {
+                crate::pkt_ipv6::destination_unreachable(code, invoking)
+            }
+            Icmp6ErrorKind::PacketTooBig(mtu) => crate::pkt_ipv6::packet_too_big(mtu, invoking),
+            Icmp6ErrorKind::TimeExceeded(code) => crate::pkt_ipv6::time_exceeded(code, invoking),
+            Icmp6ErrorKind::ParameterProblem(code, pointer) => {
+                crate::pkt_ipv6::parameter_problem(code, pointer, invoking)
+            }
+        }
+    }
+
+    /// The two §2.4(e.3) exceptions that MAY answer a
+    /// multicast-destined packet: Packet Too Big, and Parameter
+    /// Problem code 2.
+    fn allows_multicast_dst(self) -> bool {
+        matches!(
+            self,
+            Icmp6ErrorKind::PacketTooBig(_) | Icmp6ErrorKind::ParameterProblem(2, _)
+        )
+    }
+}
+
+/// Whether an error message of `kind` may be originated for
+/// `invoking` (RFC 4443 §2.4(e)). `invoking` is the offending packet
+/// starting at its IPv6 header; shorter than a header, or with a
+/// non-identifying source, fails closed (no error is sent).
+fn error_may_originate(kind: Icmp6ErrorKind, invoking: &[u8]) -> bool {
+    if invoking.len() < IPV6_HDR_LEN {
+        return false;
+    }
+    let src: [u8; 16] = invoking[8..24].try_into().unwrap();
+    let dst: [u8; 16] = invoking[24..40].try_into().unwrap();
+    // (e.6) The source must uniquely identify a single node: not
+    // the Unspecified Address, not a multicast address.
+    if src == [0; 16] || src[0] == 0xff {
+        return false;
+    }
+    // (e.3) No error for a multicast-destined packet, except Packet
+    // Too Big and Parameter Problem code 2.
+    if dst[0] == 0xff && !kind.allows_multicast_dst() {
+        return false;
+    }
+    // (e.1)/(e.2) No error in response to an ICMPv6 error message or
+    // a Redirect. Walk the extension chain to the L4 header; an
+    // unidentifiable L4 is not provably either, so it does not
+    // suppress on this ground.
+    let nh = invoking[6];
+    if let Some(l4) = skip_extension_headers(nh, &invoking[IPV6_HDR_LEN..]) {
+        if l4.proto == NEXT_HEADER_ICMPV6 {
+            let off = IPV6_HDR_LEN + l4.offset;
+            if off < invoking.len() {
+                let typ = invoking[off];
+                if typ < 128 || typ == ICMPV6_REDIRECT {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Originate an ICMPv6 error message for `invoking` (RFC 4443 §3).
+/// `src_ip` is this node's address the error is sent from (the
+/// address the invoking packet was destined to); the error's
+/// destination is copied from the invoking packet's source (RFC 4443
+/// §3, "Destination Address"). The invoking packet is quoted up to
+/// the minimum-IPv6-MTU bound (RFC 4443 §2.4(c)) and the §2.4(e)
+/// suppression rules are applied — a suppressed error returns
+/// `ErrorSuppressed` and sends nothing.
+///
+/// NOT implemented (RFC 4443 §2.4(f)): rate limiting of originated
+/// errors. A token bucket is a separate lane; until it lands, callers
+/// must only originate errors for packets the stack itself drops for
+/// a specific reason, never per-packet on a fast path. Likewise the
+/// (e.4)/(e.5) link-layer multicast/broadcast checks need the RX path
+/// to forward the L2 destination, which it currently strips — callers
+/// answering a link-layer multicast/broadcast frame must suppress
+/// themselves.
+pub fn send_icmp6_error(
+    iface_name: &str,
+    src_ip: [u8; 16],
+    kind: Icmp6ErrorKind,
+    invoking: &[u8],
+) -> Result<(), Icmp6SendError> {
+    let net_ns_id = crate::iface::lookup(iface_name)
+        .map(|entry| entry.net_ns_id)
+        .unwrap_or(0);
+    send_icmp6_error_in(net_ns_id, iface_name, src_ip, kind, invoking)
+}
+
+pub fn send_icmp6_error_in(
+    net_ns_id: u64,
+    iface_name: &str,
+    src_ip: [u8; 16],
+    kind: Icmp6ErrorKind,
+    invoking: &[u8],
+) -> Result<(), Icmp6SendError> {
+    if !error_may_originate(kind, invoking) {
+        return Err(Icmp6SendError::ErrorSuppressed);
+    }
+    // §3: the error's destination is the invoking packet's source.
+    let dst_ip: [u8; 16] = invoking[8..24].try_into().unwrap();
+    let body = kind.body(invoking);
+    send_icmp6_in(
+        net_ns_id,
+        iface_name,
+        src_ip,
+        dst_ip,
+        &body,
+        ICMPV6_ORIGIN_HOP_LIMIT,
+    )
 }
 
 // ── Inbound dispatch ────────────────────────────────────────────────
@@ -938,31 +1415,97 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
             true
         }
         ICMPV6_ECHO_REQUEST => {
-            // Build a matching Echo Reply.
+            // Build a matching Echo Reply and transmit it (RFC 4443
+            // §4.2: id, sequence and data are echoed unmodified).
+            // Per Linux icmpv6_rcv(): the kernel answers Echo Requests
+            // itself; raw/ping sockets do not see inbound type 128.
             if body.len() < 8 {
                 return false;
+            }
+            // No reply is addressable to the Unspecified Address or
+            // to a multicast source.
+            if src_ip == [0; 16] || src_ip[0] == 0xff {
+                return true;
             }
             let id = u16::from_be_bytes([body[4], body[5]]);
             let seq = u16::from_be_bytes([body[6], body[7]]);
             let payload = &body[8..];
-            let mut reply = icmp6_sock::build_echo_reply(id, seq, payload);
-            let cks = pseudo_checksum(dst_ip, src_ip, NEXT_HEADER_ICMPV6, &reply);
-            reply[2] = (cks >> 8) as u8;
-            reply[3] = (cks & 0xFF) as u8;
-            // Per Linux icmpv6_rcv(): kernel answers Echo Requests
-            // itself; raw/ping sockets do not see inbound type 128.
-            // We don't synchronously transmit here; the kernel send
-            // path is iface-aware. For tests, the reply body is the
-            // important artifact.
-            let _ = reply;
+            let reply = icmp6_sock::build_echo_reply(id, seq, payload);
+            let net_ns_id = crate::iface::lookup(iface)
+                .map(|entry| entry.net_ns_id)
+                .unwrap_or(0);
+            // RFC 4443 §2.2(a)/(b) + §4.2: a unicast request is
+            // answered from the address it was sent to; a
+            // multicast/anycast request from a unicast address of
+            // the receiving interface.
+            let src = if dst_ip[0] == 0xff {
+                match crate::ipv6::addrs::pick_source_in(net_ns_id, iface, &src_ip) {
+                    Some(addr) => addr,
+                    None => return true,
+                }
+            } else {
+                dst_ip
+            };
+            // A cold neighbor cache queues the reply (NeighborPending)
+            // and solicits; any other send failure drops it silently
+            // — the request itself was already consumed.
+            let _ = send_icmp6_in(
+                net_ns_id,
+                iface,
+                src,
+                src_ip,
+                &reply,
+                ICMPV6_ORIGIN_HOP_LIMIT,
+            );
             true
         }
         ICMPV6_ECHO_REPLY => {
             icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
             true
         }
-        ICMPV6_NEIGHBOR_SOLICITATION => match ndp::on_ns(iface, None, body) {
-            ndp::NdRxResult::SendBody(_) => true,
+        ICMPV6_NEIGHBOR_SOLICITATION => match ndp::on_ns(iface, src_ip, None, body) {
+            ndp::NdRxResult::SendBody {
+                body: na_body,
+                src_ip: na_src,
+                dst_ip: na_dst,
+                dst_mac,
+            } => {
+                // Transmit the solicited NA (RFC 4861 §7.2.4). When the
+                // solicitation carried a Source LL Address option the
+                // link-layer destination is known and the NA goes
+                // straight to it; otherwise the transmit path resolves
+                // it via the neighbor cache (queueing + soliciting on
+                // a miss) or maps it for a multicast destination
+                // (the DAD-probe reply to ff02::1).
+                let net_ns_id = crate::iface::lookup(iface)
+                    .map(|entry| entry.net_ns_id)
+                    .unwrap_or(0);
+                match dst_mac {
+                    Some(mac) => {
+                        if let Some(snap) = crate::iface::lookup_in(net_ns_id, iface) {
+                            let _ = emit_icmp6_frame(
+                                &snap,
+                                mac,
+                                na_src,
+                                na_dst,
+                                ICMPV6_ND_HOP_LIMIT,
+                                &na_body,
+                            );
+                        }
+                    }
+                    None => {
+                        let _ = send_icmp6_in(
+                            net_ns_id,
+                            iface,
+                            na_src,
+                            na_dst,
+                            &na_body,
+                            ICMPV6_ND_HOP_LIMIT,
+                        );
+                    }
+                }
+                true
+            }
             ndp::NdRxResult::Updated => true,
             ndp::NdRxResult::DadConflict(addr) => {
                 slaac::dad_failed(iface, &addr);
@@ -1027,4 +1570,5 @@ pub fn raw_checksum(buf: &[u8]) -> u16 {
 pub fn __reset_for_test() {
     FRAGS.lock().clear();
     PMTU.lock().clear();
+    PENDING_ICMP6.lock().clear();
 }
