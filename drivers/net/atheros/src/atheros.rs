@@ -187,6 +187,171 @@ pub const fn default_intr_mask() -> u32 {
     INT_TX_PKT | INT_RX_PKT0 | INT_GPHY | INT_PHY_LINKDOWN
 }
 
+// ── Suspend / resume register plans (issue #793) ────────────────────
+
+/// Suspend / resume register plans over a minimal bank so fixtures
+/// drive the exact program against a fake bank (end-to-end register
+/// writes, no silicon) while the live path runs it against BAR0 via
+/// [`MmioBank`]. Same shape as e1000's inline `pm` module.
+///
+/// * Suspend: mask interrupts (IMR = 0), acknowledge pending causes
+///   (ISR = all-ones, write-1-to-clear — the same pair bring-up
+///   writes), then stop the MAC by clearing MAC_CTRL TX_EN|RX_EN,
+///   preserving the flow-control / duplex / speed / broadcast bits.
+///   The descriptor rings and their programmed bases persist — only
+///   the EN bits gate the MAC.
+/// * Resume: re-enable MAC TX/RX, preserving the rest of MAC_CTRL.
+///   The interrupt mask is NOT restored: `enable_irqs` is never
+///   called (the driver runs polled; bring-up leaves IMR = 0), so
+///   re-arming `default_intr_mask()` here would arm interrupts no
+///   handler is wired to.
+///
+/// PHY: no PHY power-down. The PHY stays powered, so its autoneg
+/// advertisement persists and the link re-establishes once the MAC
+/// re-enables; resume re-samples BMSR (double-read, the established
+/// `live_link_up` pattern — the link bit is latched-low) and
+/// republishes link. The plan itself performs no PHY write; the
+/// driver's live resume (issue #792) restarts autoneg via
+/// `write_phy`, the tree's MDIO write path.
+mod pm {
+    use super::{MAC_CTRL_RX_EN, MAC_CTRL_TX_EN};
+    use super::{REG_IMR, REG_ISR, REG_MAC_CTRL};
+    use narf_bus::MmioRegion;
+
+    /// Minimal register-bank abstraction so the register
+    /// conversation can be exercised against a fake bank in
+    /// fixtures and against real MMIO in the driver via
+    /// [`MmioBank`].
+    pub trait RegBank {
+        fn read32(&self, offset: u64) -> u32;
+        fn write32(&self, offset: u64, value: u32);
+    }
+
+    /// [`RegBank`] over a real BAR0 mapping.
+    #[derive(Debug)]
+    pub struct MmioBank<'a> {
+        mmio: &'a MmioRegion,
+    }
+
+    impl<'a> MmioBank<'a> {
+        pub fn new(mmio: &'a MmioRegion) -> Self {
+            Self { mmio }
+        }
+    }
+
+    impl RegBank for MmioBank<'_> {
+        fn read32(&self, offset: u64) -> u32 {
+            // SAFETY: the driver owns BAR0 exclusively; the caller
+            // guarantees `offset` is a valid device register.
+            unsafe { self.mmio.read32(offset) }
+        }
+        fn write32(&self, offset: u64, value: u32) {
+            // SAFETY: same as above.
+            unsafe { self.mmio.write32(offset, value) }
+        }
+    }
+
+    /// Suspend register program: mask interrupts, acknowledge
+    /// pending causes, stop the MAC.
+    pub fn suspend_plan(bank: &impl RegBank) {
+        bank.write32(REG_IMR, 0);
+        bank.write32(REG_ISR, 0xFFFF_FFFF);
+        let mac_ctrl = bank.read32(REG_MAC_CTRL);
+        bank.write32(REG_MAC_CTRL, mac_ctrl & !(MAC_CTRL_TX_EN | MAC_CTRL_RX_EN));
+    }
+
+    /// Resume register program: re-enable MAC TX/RX, preserving
+    /// the rest of MAC_CTRL. Returns the live MAC_CTRL word so
+    /// the caller can confirm the MAC came back on.
+    pub fn resume_plan(bank: &impl RegBank) -> u32 {
+        let mac_ctrl = bank.read32(REG_MAC_CTRL) | MAC_CTRL_TX_EN | MAC_CTRL_RX_EN;
+        bank.write32(REG_MAC_CTRL, mac_ctrl);
+        mac_ctrl
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    mod tests {
+        use super::*;
+        use narf_kernel_test::{kernel_test_in, TestResult};
+
+        /// In-memory register bank for the PM fixtures: 8 KiB of
+        /// BAR0 window, covering MAC_CTRL (0x1480), IMR (0x1604)
+        /// and ISR (0x1608).
+        struct FakeBank {
+            regs: core::cell::RefCell<alloc::vec::Vec<u32>>,
+        }
+
+        impl FakeBank {
+            fn new() -> Self {
+                Self {
+                    regs: core::cell::RefCell::new(alloc::vec![0u32; 0x2000 / 4]),
+                }
+            }
+            fn get(&self, offset: u64) -> u32 {
+                *self.regs.borrow().get((offset / 4) as usize).unwrap_or(&0)
+            }
+        }
+
+        impl RegBank for FakeBank {
+            fn read32(&self, offset: u64) -> u32 {
+                self.get(offset)
+            }
+            fn write32(&self, offset: u64, value: u32) {
+                if let Some(slot) = self.regs.borrow_mut().get_mut((offset / 4) as usize) {
+                    *slot = value;
+                }
+            }
+        }
+
+        fn smoke_atl_pm_suspend_stops_mac() -> TestResult {
+            let bank = FakeBank::new();
+            // Bring-up state: MAC on, interrupts armed.
+            bank.write32(
+                REG_MAC_CTRL,
+                MAC_CTRL_TX_EN | MAC_CTRL_RX_EN | super::super::MAC_CTRL_DUPLEX,
+            );
+            bank.write32(REG_IMR, super::super::default_intr_mask());
+            suspend_plan(&bank);
+            if bank.read32(REG_MAC_CTRL) & (MAC_CTRL_TX_EN | MAC_CTRL_RX_EN) != 0 {
+                return TestResult::Fail("atl suspend did not stop the MAC");
+            }
+            // Flow/duplex bits survive the EN clear.
+            if bank.read32(REG_MAC_CTRL) & super::super::MAC_CTRL_DUPLEX == 0 {
+                return TestResult::Fail("atl suspend clobbered MAC_CTRL config bits");
+            }
+            if bank.read32(REG_IMR) != 0 || bank.read32(REG_ISR) != 0xFFFF_FFFF {
+                return TestResult::Fail("atl suspend did not mask/ack interrupts");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!("drivers/net/atheros", smoke_atl_pm_suspend_stops_mac);
+
+        fn smoke_atl_pm_resume_restores_mac() -> TestResult {
+            let bank = FakeBank::new();
+            bank.write32(
+                REG_MAC_CTRL,
+                MAC_CTRL_TX_EN | MAC_CTRL_RX_EN | super::super::MAC_CTRL_DUPLEX,
+            );
+            suspend_plan(&bank);
+            let mac_ctrl = resume_plan(&bank);
+            if mac_ctrl & (MAC_CTRL_TX_EN | MAC_CTRL_RX_EN) != MAC_CTRL_TX_EN | MAC_CTRL_RX_EN {
+                return TestResult::Fail("atl resume did not re-enable the MAC");
+            }
+            // Polled device: the mask stays as suspend left it.
+            if bank.read32(REG_IMR) != 0 {
+                return TestResult::Fail("atl resume armed interrupts on a polled device");
+            }
+            // Suspend → resume → suspend is stable.
+            suspend_plan(&bank);
+            if bank.read32(REG_MAC_CTRL) & (MAC_CTRL_TX_EN | MAC_CTRL_RX_EN) != 0 {
+                return TestResult::Fail("atl second suspend drifted from the first");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!("drivers/net/atheros", smoke_atl_pm_resume_restores_mac);
+    }
+}
+
 // ── Descriptor in-memory shapes ─────────────────────────────────────
 
 /// TX packet descriptor (TPD) — 16 bytes. Per `atl1c_main.c`'s
@@ -283,6 +448,8 @@ pub enum NicError {
     /// `set_wol` asked for a wake filter this family cannot arm.
     WolUnsupported,
     /// The datapath was used while the device is suspended.
+    /// The device is suspended for system suspend (issue #793):
+    /// the datapath gates refuse TX and RX while suspended.
     Suspended,
 }
 
@@ -822,21 +989,27 @@ impl AtlNic {
     }
 
     /// Suspend the device for system sleep (Linux `atl1c_suspend`
-    /// order): mask IRQs, stop the datapath gate, renegotiate the
-    /// PHY down to the lowest partner mode when WoL is armed
-    /// (`atl1c_phy_to_ps_link`), run the power-saving program
-    /// (`atl1c_power_saving`), and publish link down. Idempotent:
-    /// a second suspend is a no-op. The PCI PME enable is the
-    /// platform power layer's job (`narf_bus::pci_pme`); this
-    /// programs only the device-side wake filtering.
-    pub fn suspend(&self) {
+    /// order, issue #792): mask IRQs, stop the datapath gate,
+    /// renegotiate the PHY down to the lowest partner mode when WoL
+    /// is armed (`atl1c_phy_to_ps_link`), run the power-saving
+    /// program (`atl1c_power_saving`), and publish link down.
+    /// Idempotent: a second suspend is a no-op success. The PCI PME
+    /// enable is the platform power layer's job
+    /// (`narf_bus::pci_pme`); this programs only the device-side
+    /// wake filtering.
+    ///
+    /// Issue #793: the `pm::suspend_plan` runs first — it masks
+    /// IMR, acknowledges pending interrupt causes (ISR), and clears
+    /// the MAC_CTRL TX/RX_EN bits. The power-saving program below
+    /// re-reads the live MAC word and drops those bits itself, so
+    /// the plan's MAC effect is subsumed; the plan stays live
+    /// because its ISR acknowledge is the one place that write
+    /// happens.
+    pub fn suspend(&self) -> Result<(), NicError> {
         if self.suspended.swap(true, Ordering::AcqRel) {
-            return;
+            return Ok(());
         }
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio.write32(REG_IMR, 0);
-        }
+        pm::suspend_plan(&pm::MmioBank::new(&self.mmio));
         let wufc = self.wol_filters.lock().to_wufc();
         let (speed_1000, duplex_full) = if wufc != 0 {
             self.phy_to_ps_link()
@@ -872,13 +1045,14 @@ impl AtlNic {
         }
         let mut bank = crate::wol::MmioRegBank(&self.mmio);
         crate::wol::apply_power_saving(&mut bank, &program);
-        crate::publish::publish_link(atheros_ifname(), crate::publish::LinkSample::DOWN);
+        crate::publish::publish_link(self.ifname(), crate::publish::LinkSample::DOWN);
+        Ok(())
     }
 
     /// Resume a suspended device (Linux `atl1c_resume` order,
-    /// adapted): clear WOL_CTRL, restart PHY autoneg, restore the
-    /// bring-up MAC_CTRL word, and republish link. Resuming a
-    /// running device is a no-op.
+    /// adapted, issue #792): clear WOL_CTRL, restart PHY autoneg,
+    /// restore the bring-up MAC_CTRL word, and republish link.
+    /// Resuming a running device is a no-op success.
     ///
     /// Deviation from Linux, documented: Linux resets the MAC and
     /// re-initialises the PHY + rings (`reset_mac`, `phy_init`,
@@ -887,9 +1061,14 @@ impl AtlNic {
     /// resetting the MAC; the rings need no rebuild. Interrupt
     /// re-enable stays the caller's job via [`Self::enable_irqs`]
     /// — resume leaves IMR masked, the bring-up default.
-    pub fn resume(&self) {
+    ///
+    /// Issue #793: the `pm::resume_plan` (re-enable MAC TX/RX_EN)
+    /// is subsumed — the bring-up MAC_CTRL word restored here
+    /// already carries TX_EN | RX_EN — so the live path does not
+    /// call it; the plan stays fixture-tested in `mod pm`.
+    pub fn resume(&self) -> Result<(), NicError> {
         if !self.suspended.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -904,9 +1083,10 @@ impl AtlNic {
         );
         self.suspended.store(false, Ordering::Release);
         crate::publish::publish_link(
-            atheros_ifname(),
+            self.ifname(),
             crate::publish::LinkSample::carrier_only(self.live_link_up()),
         );
+        Ok(())
     }
 }
 
@@ -1047,6 +1227,17 @@ impl AtlNic {
     }
 }
 
+impl narf_power::device_pm::DevicePmOps for AtlNic {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.suspend()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+}
+
 // ── Driver-match registration ───────────────────────────────────────
 
 /// Every probed controller, by probe order. The index is the cookie
@@ -1126,6 +1317,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         crate::publish::LinkSample::carrier_only(dev.live_link_up()),
     );
     dev.ifname.set(name);
+
+    // Device-PM registration (#793): system suspend fans out
+    // through `AtlNic::suspend` / `AtlNic::resume` via the
+    // `DevicePmOps` impl below. The registry is idempotent on the
+    // interface name. There is no atheros detach path to withdraw
+    // the entry from yet — the CONTROLLER slot is never drained
+    // either, so the entry lives as long as the device does.
+    narf_power::device_pm::register_device_pm_ops(dev.ifname(), dev.clone());
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {

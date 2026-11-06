@@ -116,6 +116,26 @@ impl I40eNic {
     pub fn link_up(&self) -> bool {
         self.link_status().link_up
     }
+    /// Suspend this PF for system suspend (issue #793): quiesce
+    /// the hardware via [`super::Hardware::suspend`] and publish
+    /// link down. The queue/TX pumps idle on the `suspended` gate
+    /// until resume.
+    pub fn suspend(&self) -> Result<(), I40eError> {
+        let (hw, _) = self.lease().ok_or(I40eError::DeviceFailed)?;
+        hw.suspend()?;
+        crate::publish::publish_link(self.ifname(), crate::publish::LinkSample::DOWN);
+        Ok(())
+    }
+    /// Resume a suspended PF (issue #793): re-enable the hardware
+    /// via [`super::Hardware::resume`] and republish link from the
+    /// cached status sample — the ARQ pump refreshes it from
+    /// link-status events once interrupts re-arm.
+    pub fn resume(&self) -> Result<(), I40eError> {
+        let (hw, _) = self.lease().ok_or(I40eError::DeviceFailed)?;
+        hw.resume()?;
+        crate::publish::publish_link(self.ifname(), link_sample(hw.link_status()));
+        Ok(())
+    }
     /// Submit using a stable Toeplitz flow hash. Recovery returns DeviceFailed
     /// until every queue and interrupt route has been restored.
     pub fn transmit_with_meta(
@@ -139,7 +159,7 @@ impl I40eNic {
             return None;
         }
         let (hw, _) = self.lease()?;
-        if hw.irq().failed() {
+        if hw.irq().failed() || hw.suspended() {
             return None;
         }
         for queue in hw.queues.iter() {
@@ -242,6 +262,17 @@ impl I40eNic {
         self.suspended.store(false, Ordering::Release);
         crate::publish::publish_link(self.ifname(), link_sample(self.link_status()));
         result
+    }
+}
+
+impl narf_power::device_pm::DevicePmOps for I40eNic {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.suspend()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
     }
 }
 
@@ -472,7 +503,10 @@ async fn queue_pump(
             delay(10).await;
             continue;
         };
-        if hw.irq().failed() {
+        // A suspended PF's queues are disabled and its interrupts
+        // masked: idle here instead of re-arming a masked vector or
+        // draining a stopped ring (issue #793).
+        if hw.irq().failed() || hw.suspended() {
             drop(hw);
             delay(10).await;
             continue;
@@ -575,7 +609,9 @@ async fn tx_pump(device: Arc<I40eNic>, mut tx: Consumer<Frame, TX_RING_N>) {
                 delay(10).await;
                 continue;
             };
-            if hw.irq().failed() {
+            // A suspended PF's queues are disabled: idle here instead
+            // of submitting to a stopped ring (issue #793).
+            if hw.irq().failed() || hw.suspended() {
                 drop(hw);
                 delay(10).await;
                 continue;

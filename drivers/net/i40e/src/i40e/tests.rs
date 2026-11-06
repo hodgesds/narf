@@ -1691,3 +1691,188 @@ fn smoke_i40e_frame_metadata_ring_roundtrip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/i40e", smoke_i40e_frame_metadata_ring_roundtrip);
+
+// ── Suspend/resume register plans (issue #793) ───────────────────────
+
+/// In-memory register bank for the PM fixtures: a sparse map, since
+/// the CSR window spans 0x100000..0x128000. Device behaviour the
+/// plans poll on is modelled, not stubbed: a `QENA_REQ` write makes
+/// `QENA_STAT` follow at once, as the device acks it — unless the
+/// bank is told the queue is stuck, in which case STAT never
+/// follows and the enable wait must fail closed.
+struct FakeBank {
+    regs: core::cell::RefCell<alloc::collections::BTreeMap<u64, u32>>,
+    stuck_queue: core::cell::Cell<bool>,
+}
+
+impl FakeBank {
+    fn new() -> Self {
+        Self {
+            regs: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
+            stuck_queue: core::cell::Cell::new(false),
+        }
+    }
+    fn value(&self, offset: u64) -> u32 {
+        self.regs.borrow().get(&offset).copied().unwrap_or(0)
+    }
+    /// Seed two live queues (PF-relative 0 and 1) the way
+    /// bring-up + `QueuePair::enable` leaves them: REQ and STAT
+    /// set, RX tails armed, interrupts unmasked and re-armed.
+    fn live_queues(&mut self) {
+        use super::irq::{REG_PFINT_DYN_CTL0, REG_PFINT_ICR0_ENA};
+        use super::ring::{
+            reg_qrx_ena, reg_qrx_tail, reg_qtx_ena, QENA_REQ, QENA_STAT, RX_TAIL_INIT,
+        };
+        for q in [0u16, 1] {
+            self.regs
+                .borrow_mut()
+                .insert(reg_qtx_ena(q), QENA_REQ | QENA_STAT);
+            self.regs
+                .borrow_mut()
+                .insert(reg_qrx_ena(q), QENA_REQ | QENA_STAT);
+            self.regs
+                .borrow_mut()
+                .insert(reg_qrx_tail(q), RX_TAIL_INIT as u32);
+        }
+        self.regs.borrow_mut().insert(
+            REG_PFINT_ICR0_ENA,
+            super::interrupts::ADMINQ | super::interrupts::FATAL,
+        );
+        self.regs
+            .borrow_mut()
+            .insert(REG_PFINT_DYN_CTL0, 1 | 2 | 24);
+    }
+}
+
+impl super::pm::RegBank for FakeBank {
+    fn read32(&self, offset: u64) -> u32 {
+        self.value(offset)
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        use super::ring::{reg_qrx_ena, reg_qtx_ena, QENA_REQ, QENA_STAT};
+        let mut value = value;
+        // QENA_STAT follows QENA_REQ at once (device ack), unless
+        // the queue is stuck.
+        let is_qena = (0..128u16).any(|q| offset == reg_qtx_ena(q) || offset == reg_qrx_ena(q));
+        if is_qena {
+            if self.stuck_queue.get() {
+                // Stuck queue: STAT never follows REQ.
+                value &= !QENA_STAT;
+            } else {
+                value = (value & !QENA_STAT) | if value & QENA_REQ != 0 { QENA_STAT } else { 0 };
+            }
+        }
+        self.regs.borrow_mut().insert(offset, value);
+    }
+    fn wait(&self, _us: u64, mut ready: impl FnMut() -> bool) -> bool {
+        ready()
+    }
+}
+
+fn smoke_i40e_pm_suspend_disables_queues_and_masks() -> TestResult {
+    use super::irq::{reg_pfint_dyn_ctln, REG_PFINT_DYN_CTL0, REG_PFINT_ICR0_ENA};
+    use super::ring::{
+        reg_gllan_txpre_qdis, reg_qrx_ena, reg_qtx_ena, QENA_REQ, TXPRE_QDIS_SET_QDIS,
+    };
+    let bank = FakeBank::new();
+    bank.live_queues();
+    super::pm::suspend_plan(&bank, 0, &[0, 1]);
+    // Interrupt delivery masked (Shared::mask program).
+    if bank.value(REG_PFINT_ICR0_ENA) != 0
+        || bank.value(REG_PFINT_DYN_CTL0) != 24
+        || bank.value(reg_pfint_dyn_ctln(0)) != 24
+        || bank.value(reg_pfint_dyn_ctln(1)) != 24
+    {
+        return TestResult::Fail("i40e suspend did not mask interrupts");
+    }
+    // Both queues disabled: REQ clear on TX and RX.
+    for q in [0u16, 1] {
+        if bank.value(reg_qtx_ena(q)) & QENA_REQ != 0 || bank.value(reg_qrx_ena(q)) & QENA_REQ != 0
+        {
+            return TestResult::Fail("i40e suspend did not disable a LAN queue");
+        }
+    }
+    // TXPRE disable set for the last-programmed queue (block 0,
+    // index 1): the register holds one queue's word at a time.
+    if bank.value(reg_gllan_txpre_qdis(0)) & TXPRE_QDIS_SET_QDIS == 0
+        || bank.value(reg_gllan_txpre_qdis(0)) & 0x7FF != 1
+    {
+        return TestResult::Fail("i40e suspend did not set TXPRE queue-disable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_pm_suspend_disables_queues_and_masks
+);
+
+fn smoke_i40e_pm_resume_reenables_and_rearms() -> TestResult {
+    use super::irq::{reg_pfint_dyn_ctln, REG_PFINT_DYN_CTL0, REG_PFINT_ICR0_ENA};
+    use super::ring::{
+        reg_qrx_ena, reg_qrx_tail, reg_qtx_ena, reg_qtx_head, QENA_REQ, RX_TAIL_INIT,
+    };
+    let bank = FakeBank::new();
+    bank.live_queues();
+    super::pm::suspend_plan(&bank, 0, &[0, 1]);
+    if super::pm::resume_plan(&bank, 0, &[0, 1]).is_err() {
+        return TestResult::Fail("i40e resume failed on reflecting queues");
+    }
+    for q in [0u16, 1] {
+        if bank.value(reg_qtx_ena(q)) & QENA_REQ == 0 || bank.value(reg_qrx_ena(q)) & QENA_REQ == 0
+        {
+            return TestResult::Fail("i40e resume did not re-enable a LAN queue");
+        }
+        if bank.value(reg_qtx_head(q)) != 0 {
+            return TestResult::Fail("i40e resume did not zero the TX head");
+        }
+        if bank.value(reg_qrx_tail(q)) != RX_TAIL_INIT as u32 {
+            return TestResult::Fail("i40e resume did not re-arm the RX tail");
+        }
+        if bank.value(reg_pfint_dyn_ctln(q)) != 27 {
+            return TestResult::Fail("i40e resume did not re-arm a queue vector");
+        }
+    }
+    if bank.value(REG_PFINT_ICR0_ENA) != super::interrupts::ADMINQ | super::interrupts::FATAL
+        || bank.value(REG_PFINT_DYN_CTL0) != 27
+    {
+        return TestResult::Fail("i40e resume did not re-arm interrupts");
+    }
+    // Suspend → resume → suspend is stable.
+    super::pm::suspend_plan(&bank, 0, &[0, 1]);
+    if bank.value(reg_qtx_ena(0)) & QENA_REQ != 0 || bank.value(REG_PFINT_ICR0_ENA) != 0 {
+        return TestResult::Fail("i40e second suspend drifted from the first");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/i40e",
+    smoke_i40e_pm_resume_reenables_and_rearms
+);
+
+fn smoke_i40e_pm_resume_fails_closed() -> TestResult {
+    use super::irq::REG_PFINT_ICR0;
+    let bank = FakeBank::new();
+    bank.live_queues();
+    super::pm::suspend_plan(&bank, 0, &[0, 1]);
+    // A fatal cause in ICR0 refuses resume before any re-enable.
+    bank.regs
+        .borrow_mut()
+        .insert(REG_PFINT_ICR0, super::interrupts::FATAL);
+    if super::pm::resume_plan(&bank, 0, &[0, 1]).is_ok() {
+        return TestResult::Fail("i40e resume re-enabled a fatally wedged PF");
+    }
+    // A queue whose STAT never follows REQ fails the enable wait
+    // before interrupts re-arm.
+    let stuck = FakeBank::new();
+    stuck.live_queues();
+    stuck.stuck_queue.set(true);
+    super::pm::suspend_plan(&stuck, 0, &[0, 1]);
+    if super::pm::resume_plan(&stuck, 0, &[0, 1]).is_ok() {
+        return TestResult::Fail("i40e resume succeeded with a stuck queue");
+    }
+    if stuck.value(super::irq::REG_PFINT_ICR0_ENA) != 0 {
+        return TestResult::Fail("i40e failed resume re-armed interrupts");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_pm_resume_fails_closed);

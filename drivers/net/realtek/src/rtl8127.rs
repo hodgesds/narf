@@ -1587,7 +1587,7 @@ pub const fn cr_reset_value() -> u8 {
 
 // ── Live driver state ────────────────────────────────────────────────
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 use narf_driver_runtime::{
@@ -1605,6 +1605,9 @@ pub enum NicError {
     TxRingFull,
     TxTimeout,
     MsixSetup,
+    /// The device is suspended for system suspend (issue #793):
+    /// the datapath gates refuse TX and RX while suspended.
+    Suspended,
     /// The requested TX offload cannot be programmed for this
     /// frame (unparseable transport header, SCTP, MSS/offset
     /// overflow, or an invalid RSS queue count).
@@ -1632,6 +1635,9 @@ pub struct Rtl8127Nic {
     wol_opts: IrqSafeSpinLock<crate::features::WolOpts>,
     /// True when PHYStatus.LinkSts read 1 at bring-up.
     pub link_up: bool,
+    /// Set by `suspend`, cleared by `resume`: the datapath gates
+    /// refuse TX and RX while this is set (issue #793).
+    suspended: AtomicBool,
     /// IDT vector wired to MSI-X entry 0, when MSI-X is enabled.
     pub irq_vector: Option<u8>,
     /// IDT vector per MSI-X entry (entry q → vector), when MSI-X
@@ -1977,6 +1983,7 @@ impl Rtl8127Nic {
             mac_version,
             wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
             link_up,
+            suspended: AtomicBool::new(false),
             irq_vector: None,
             irq_vectors: alloc::vec::Vec::new(),
             msix: None,
@@ -2048,6 +2055,9 @@ impl Rtl8127Nic {
 
     /// Transmit a single Ethernet frame (polled completion).
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(NicError::Suspended);
+        }
         if frame.is_empty() || frame.len() > TX_BUF_LEN {
             return Err(NicError::FrameTooLong);
         }
@@ -2158,6 +2168,9 @@ impl Rtl8127Nic {
     /// Queue 0 in the current format (legacy when single-queue,
     /// RSS format when multi-queue).
     pub fn receive_with_meta(&self) -> Option<(alloc::vec::Vec<u8>, RxCsumResult)> {
+        if self.suspended.load(Ordering::Acquire) {
+            return None;
+        }
         self.receive_on_queue(0).map(|(buf, csum, _)| (buf, csum))
     }
 
@@ -2405,6 +2418,49 @@ impl Rtl8127Nic {
         self.link_up = up;
         up
     }
+
+    /// Suspend the device for system suspend (issue #793): mask
+    /// interrupts, acknowledge pending causes, stop the TX/RX DMA
+    /// engines via the shared `pm` plan, and publish link down. A
+    /// second suspend is a no-op success. The PHY stays powered
+    /// (its autoneg advertisement persists), and the descriptor
+    /// rings persist — only the CR EN bits gate DMA.
+    pub fn suspend(&self) -> Result<(), NicError> {
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        crate::pm::suspend_plan(&crate::pm::MmioBank::new(&self.mmio), crate::pm::IMR_WIDE);
+        crate::publish::publish_link(self.ifname(), crate::publish::LinkSample::DOWN);
+        Ok(())
+    }
+
+    /// Resume a suspended device (issue #793): re-kick the PHY so
+    /// the link re-negotiates after the DMA stop, restore the DMA
+    /// engines + interrupt mask via the shared `pm` plan, and
+    /// republish link from live PHYStatus. Resuming a running
+    /// device is a no-op success. The PHY re-kick is best-effort:
+    /// a failed MDIO read leaves the advertisement as it was, and
+    /// the link still comes back on its own.
+    pub fn resume(&self) -> Result<(), NicError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let phy = crate::phy_access::PhyAccess::new(&self.mmio);
+        if let Ok(bmcr) = phy.phyar_read(crate::phy_access::MII_BMCR_REG) {
+            if let Some(word) = crate::phy_access::bmcr_restart_value(bmcr) {
+                let _ = phy.phyar_write(crate::phy_access::MII_BMCR_REG, word);
+            }
+        }
+        crate::pm::resume_plan(
+            &crate::pm::MmioBank::new(&self.mmio),
+            crate::pm::IMR_WIDE,
+            INT32_ROK | INT32_TOK | INT32_LINKCHG | INT32_RDU | INT32_TDU,
+            self.irq_vector.is_some(),
+        );
+        self.suspended.store(false, Ordering::Release);
+        crate::publish::publish_link(self.ifname(), rtl8127_link_sample(self.phy_status()));
+        Ok(())
+    }
 }
 
 /// Load the PHY firmware patch if it is present, then apply
@@ -2623,6 +2679,17 @@ fn rtl8127_link_sample_with_phy(device: &Rtl8127Nic, status: u8) -> crate::publi
     }
 }
 
+impl narf_power::device_pm::DevicePmOps for Rtl8127Nic {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.suspend()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+}
+
 /// Probe entry — installed via `bus::register_pci_driver`. A second
 /// probe of the SAME function is a no-op success (the old idempotent
 /// behaviour): the bus re-walks devices, and rebuilding a second
@@ -2733,6 +2800,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         rtl8127_link_sample_with_phy(&dev, status),
     );
     dev.ifname.set(name);
+
+    // Device-PM registration (#793): system suspend fans out
+    // through `suspend` / `resume` via the `DevicePmOps` impl
+    // above. The registry is idempotent on the interface name.
+    // There is no detach path to withdraw the entry from yet —
+    // the CONTROLLER slot is never drained either, so the entry
+    // lives as long as the device does.
+    narf_power::device_pm::register_device_pm_ops(dev.ifname(), dev.clone());
 
     let auth = match narf_net::trusted_net_authority() {
         Some(a) => a.derive().ok(),
