@@ -1,6 +1,28 @@
 # drivers/gpu/amdgpu — Specification
 
-> Status: **v0.10** (Stage 10 — DCN HUBP/OPP/OTG modeset codec).
+> Status: **v0.11** (Stage 10 — DCN HUBP/OPP/OTG modeset codec).
+>
+> ### v0.11 changes vs v0.10
+>
+> - **Panel backlight suspend/resume** (`amdgpu_panel_backlight`,
+>   #955 AMD scope): probe registers an `amdgpu-bl` device-PM
+>   entry beside the existing `amdgpu` one. Suspend saves the
+>   panel's last programmed level (percent space; a never-
+>   programmed panel saves nothing) and fades the PWM through
+>   the eDP sequencer; resume — which runs after the `amdgpu`
+>   resume re-programs the Mode — relights through the
+>   sequencer at the saved level. A resume with no saved level
+>   programs nothing and leaves the panel at its firmware
+>   default. The sequencer's `power_on_backlight` now also
+>   accepts `BacklightOff` as a predecessor (the DPMS /
+>   platform-VDD relight, without cycling VDD). The production
+>   `EdpPanelHw` drives the BL_PWM half for real; the VDD/BL_EN
+>   rails stay platform-firmware-owned (DMUB/EC sequencing;
+>   the ATOM GPIO LUT is decode-only) and are modeled, not
+>   driven — a real rail drive is the filed remainder.
+>   `AmdGpu::set_pwm_user_level` is the sequencer-facing raw
+>   USER_LEVEL form of `set_backlight`, deliberately duplicated
+>   rather than refactored pending the #948 lane.
 >
 > ### v0.10 changes vs v0.9
 >
@@ -388,10 +410,24 @@ impl AmdGpu {
     pub unsafe fn bring_up(device, cap) -> Result<Self, AmdgpuError>;
     pub unsafe fn load_firmware(&mut self, fw_auth) -> Result<(), AmdgpuError>;
     pub unsafe fn set_mode(&mut self, mode: Mode) -> Result<(), AmdgpuError>;
+    pub unsafe fn set_backlight(&mut self, percent: u8) -> Result<(), AmdgpuError>;
+    pub(crate) unsafe fn set_pwm_user_level(&mut self, level: u16) -> Result<(), AmdgpuError>;
     pub fn vram_info(&self) -> VramInfo;
     pub fn chip_info(&self) -> ChipInfo;
     pub fn is_ready(&self) -> bool;
 }
+
+/// Panel backlight PM (`amdgpu_panel_backlight`, #955 AMD scope).
+/// `register_panel_owner` (APU probe) registers the `amdgpu_bl0`
+/// `BacklightDevice` and the `amdgpu-bl` device-PM entry:
+/// suspend saves `last_programmed_level()` and fades the PWM via
+/// `EdpPanelSequencer::power_off_backlight`; resume relights via
+/// the sequencer at the saved level (full `power_on_video` →
+/// `power_on_backlight` chain from `Off`, direct relight from
+/// `VideoValid` / `BacklightOff`, in-place PWM re-apply from
+/// `BacklightOn`). No saved level → resume programs nothing.
+/// `AmdgpuEdpPanelHw` is the production `EdpPanelHw`: real PWM,
+/// firmware-owned VDD/BL_EN rails (modeled, not driven).
 ```
 
 ## 8. Out of scope (Stage 3+)
