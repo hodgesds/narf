@@ -40,10 +40,10 @@
 //!
 //! - **Frame rings** — `Vmxnet3Iface` implements `narf_net::Interface`
 //!   + `HwNic` and registers with the cap-gated registry, so the
-//!   stack daemon / XDP consumers see the device. The TX pump drains
-//!   the TX consumer into `transmit`; the RX pump drains the RX
-//!   completion ring and fans frames out through `dispatch_rx_frame`
-//!   (ring mirror + kernel-stack delivery, e1000's shape).
+//!     stack daemon / XDP consumers see the device. The TX pump drains
+//!     the TX consumer into `transmit`; the RX pump drains the RX
+//!     completion ring and fans frames out through `dispatch_rx_frame`
+//!     (ring mirror + kernel-stack delivery, e1000's shape).
 //! - **Netdev publication** — probe registers an `eth%d` netdev via
 //!   `narf_drivers_net_core::publish::publish_netdev` and stamps the
 //!   initial link sample from the `GET_LINK` reply. Carrier stops
