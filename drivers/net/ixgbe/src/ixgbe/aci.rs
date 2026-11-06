@@ -207,6 +207,7 @@ impl AciError {
 /// writes the buffer to the firmware, as set_phy_cfg
 /// does); without it the buffer is firmware-to-host (as
 /// get_phy_caps / get_link_status do).
+#[derive(Debug)]
 pub struct AciBuf<'a> {
     pub data: &'a mut [u8],
     pub len: usize,
