@@ -1834,8 +1834,248 @@ impl AmdGpu {
             crate::amdgpu_dcn::execute_modeset(&self.regs, &seq);
         }
 
+        // Display-audio resume: re-run the saved enable writes for
+        // the last applied external plan when this modeset
+        // re-programs the same timing (the PM-resume re-run — the
+        // resume handler calls `set_mode`, which takes the non-KMS
+        // path). A different timing means the mode changed since
+        // the plan was applied — drop the stale audio instead of
+        // programming a DTO built for another pixel clock. Empty
+        // snapshot: no external audio was ever applied, no-op.
+        // The video sequence above ends with OTG_MASTER_EN, so
+        // scanout is live before audio starts.
+        let replay = {
+            let mut saved = SAVED_DISPLAY_AUDIO.lock();
+            match saved.as_ref() {
+                Some(s) if s.timing == timing => Some(s.writes.clone()),
+                Some(_) => {
+                    *saved = None;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(audio) = replay {
+            // SAFETY: caller-asserted exclusive ownership of BAR5.
+            unsafe {
+                crate::amdgpu_dcn::execute_modeset(&self.regs, &audio);
+            }
+        }
+
         self.mode = Some(mode);
         Ok(())
+    }
+
+    /// Execute a KMS modeset plan against live MMIO — the
+    /// production caller the plan layer lacked. The video writes
+    /// run first, then the plan's display-audio writes, through
+    /// `amdgpu_dcn::execute_modeset_chained`: audio starts only
+    /// once scanout is live (the video sequence ends with
+    /// OTG_MASTER_EN). KMS bookkeeping follows
+    /// (`commit_modeset_full` + `mark_active`), and the audio
+    /// half is snapshotted so `set_mode` (including the PM-resume
+    /// re-run) restores it after re-programming video for the
+    /// same timing.
+    ///
+    /// The caller owns the plan: it was built by
+    /// `amdgpu_modeset::plan_modeset` against this GPU's KMS
+    /// state, with the DCN BASE_IDX 2 segment resolved, so the
+    /// write addresses are absolute and no base resolution
+    /// happens here. A plan built for another family or another
+    /// device is a caller bug — the plan carries no family tag
+    /// to check.
+    ///
+    /// # Safety
+    /// Caller owns BAR0 + BAR5 exclusively.
+    pub unsafe fn apply_modeset_plan(
+        &mut self,
+        kms: &mut crate::amdgpu_modeset::KmsState,
+        plan: &crate::amdgpu_modeset::ModesetPlan,
+        stride_pixels: u32,
+        surface_phys: u64,
+    ) -> Result<(), AmdgpuError> {
+        if self.chip.family == Family::Navi4 {
+            return Err(AmdgpuError::UnknownAsic);
+        }
+        if !self.fw_loaded {
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+        // SAFETY: caller-asserted exclusive ownership of BAR5.
+        unsafe {
+            crate::amdgpu_dcn::execute_modeset_chained(
+                &self.regs,
+                &plan.writes,
+                &plan.audio_writes,
+            );
+        }
+        crate::amdgpu_modeset::commit_modeset_full(kms, plan, stride_pixels, surface_phys);
+        crate::amdgpu_modeset::mark_active(kms, plan.crtc_idx);
+        // Snapshot the audio half (only when the plan carries
+        // one — an internal-panel plan must not clear another
+        // connector's live audio).
+        if !plan.audio_writes.is_empty() {
+            *SAVED_DISPLAY_AUDIO.lock() = Some(SavedDisplayAudio {
+                timing: plan.timing,
+                connector_idx: plan.connector_idx,
+                writes: plan.audio_writes.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Execute the display-audio teardown writes for a connector.
+    /// Call this BEFORE the video teardown's OTG master-enable
+    /// clear: the sequence mutes and disables the endpoint while
+    /// scanout is still live, the mirror of
+    /// `apply_modeset_plan` starting audio after it.
+    ///
+    /// Returns `Ok(true)` when disable writes executed,
+    /// `Ok(false)` when the connector has no audio endpoint on
+    /// this path or the DCN BASE_IDX 2 segment is undiscoverable
+    /// (audio cannot be live without it — the enable sequence
+    /// needs the same segment). The saved audio for this
+    /// connector is cleared whenever the segment resolves,
+    /// whether or not disable writes execute — a binding that is
+    /// already gone has nothing left to tear down, but its
+    /// snapshot must not survive to resurrect on a later
+    /// `set_mode`.
+    ///
+    /// # Safety
+    /// Caller owns BAR0 + BAR5 exclusively.
+    pub unsafe fn disable_display_audio(
+        &mut self,
+        kms: &crate::amdgpu_modeset::KmsState,
+        connector_idx: u8,
+    ) -> Result<bool, AmdgpuError> {
+        if self.chip.family == Family::Navi4 {
+            return Err(AmdgpuError::UnknownAsic);
+        }
+        if !self.fw_loaded {
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+        let Some(dcn_base) = self.ip_block_base(amdgpu_discovery::HW_ID_DCN, 0) else {
+            return Ok(false);
+        };
+        let Some(dcn_base2) = self.ip_block_base_idx(amdgpu_discovery::HW_ID_DCN, 0, 2) else {
+            return Ok(false);
+        };
+        clear_saved_display_audio(connector_idx);
+        let Some(writes) =
+            crate::amdgpu_modeset::plan_audio_disable(kms, connector_idx, dcn_base, dcn_base2)
+        else {
+            return Ok(false);
+        };
+        if writes.is_empty() {
+            return Ok(false);
+        }
+        // SAFETY: caller-asserted exclusive ownership of BAR5.
+        unsafe {
+            crate::amdgpu_dcn::execute_modeset(&self.regs, &writes);
+        }
+        Ok(true)
+    }
+
+    /// The audio half of an HPD disconnect for one connector.
+    /// Computes the audio action from the PRE-transition state,
+    /// applies the status change (which drops the CRTC binding),
+    /// then executes the disable writes — the mute/disable lands
+    /// while scanout is still live; the caller's video teardown
+    /// (OTG master-enable clear) follows. Returns the action
+    /// applied (`DisableAudio` when teardown writes ran, `None`
+    /// otherwise).
+    ///
+    /// The IH dispatch calls this (not bare
+    /// `HpdEngine::apply_to_kms`) for disconnects, so the status
+    /// transition and the audio teardown stay ordered. Connects
+    /// need a mode before a plan can be built, so the connect
+    /// half stays with the caller: `hotplug_audio_action` →
+    /// `plan_modeset` → `apply_modeset_plan`.
+    ///
+    /// # Safety
+    /// Caller owns BAR0 + BAR5 exclusively.
+    pub unsafe fn apply_hotplug_disconnect(
+        &mut self,
+        kms: &mut crate::amdgpu_modeset::KmsState,
+        connector_idx: u8,
+    ) -> Result<crate::amdgpu_modeset::HotplugAudioAction, AmdgpuError> {
+        if self.chip.family == Family::Navi4 {
+            return Err(AmdgpuError::UnknownAsic);
+        }
+        if !self.fw_loaded {
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+        // Undiscoverable bases mean no audio was ever programmed
+        // through this GPU; the action still computes (it degrades
+        // to `None`) and the status transition still applies.
+        let dcn_base = self
+            .ip_block_base(amdgpu_discovery::HW_ID_DCN, 0)
+            .unwrap_or(0);
+        let dcn_base2 = self
+            .ip_block_base_idx(amdgpu_discovery::HW_ID_DCN, 0, 2)
+            .unwrap_or(0);
+        let action = crate::amdgpu_modeset::hotplug_audio_action(
+            kms,
+            connector_idx,
+            crate::amdgpu_modeset::ConnectorStatus::Disconnected,
+            dcn_base,
+            dcn_base2,
+        );
+        // Status transition AFTER computing the action (disconnect
+        // drops the CRTC binding, so a disable computed after the
+        // transition would find nothing to tear down). The saved
+        // audio for this connector is cleared on every disconnect
+        // application, whether or not disable writes execute.
+        kms.set_status(
+            connector_idx,
+            crate::amdgpu_modeset::ConnectorStatus::Disconnected,
+        );
+        clear_saved_display_audio(connector_idx);
+        if let crate::amdgpu_modeset::HotplugAudioAction::DisableAudio { writes } = &action {
+            // SAFETY: caller-asserted exclusive ownership of BAR5.
+            unsafe {
+                crate::amdgpu_dcn::execute_modeset(&self.regs, writes);
+            }
+        }
+        Ok(action)
+    }
+
+    /// Re-execute the display-audio enable writes for every
+    /// still-Connected external connector with a programmed mode,
+    /// for the PM resume handler to run AFTER `set_mode`
+    /// re-programs video (audio starts only once scanout is
+    /// live). This is the multi-connector resume path; the
+    /// `set_mode` snapshot re-run covers the last applied plan
+    /// when no KMS state is at hand. Returns `Ok(true)` when
+    /// writes executed, `Ok(false)` when nothing was live or the
+    /// DCN bases are undiscoverable.
+    ///
+    /// # Safety
+    /// Caller owns BAR0 + BAR5 exclusively.
+    pub unsafe fn resume_display_audio(
+        &mut self,
+        kms: &crate::amdgpu_modeset::KmsState,
+    ) -> Result<bool, AmdgpuError> {
+        if self.chip.family == Family::Navi4 {
+            return Err(AmdgpuError::UnknownAsic);
+        }
+        if !self.fw_loaded {
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+        let Some(dcn_base) = self.ip_block_base(amdgpu_discovery::HW_ID_DCN, 0) else {
+            return Ok(false);
+        };
+        let Some(dcn_base2) = self.ip_block_base_idx(amdgpu_discovery::HW_ID_DCN, 0, 2) else {
+            return Ok(false);
+        };
+        let writes = crate::amdgpu_modeset::resume_display_audio_writes(kms, dcn_base, dcn_base2);
+        if writes.is_empty() {
+            return Ok(false);
+        }
+        // SAFETY: caller-asserted exclusive ownership of BAR5.
+        unsafe {
+            crate::amdgpu_dcn::execute_modeset(&self.regs, &writes);
+        }
+        Ok(true)
     }
 
     /// Program the panel backlight to `percent` (0–100). Caller's
@@ -2551,6 +2791,50 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// yet (e.g. pre-firmware-load).
 static SAVED_MODE: narf_lib::sync::IrqSafeSpinLock<Option<Mode>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Display-audio enable writes of the last applied external plan
+/// (`AmdGpu::apply_modeset_plan`), keyed by the plan's timing and
+/// connector. `set_mode` re-executes them after re-programming
+/// video when the timing matches — the PM-resume re-run — and
+/// drops them when the mode changed since the plan was applied
+/// (stale audio must never resurrect on a different pixel clock)
+/// or the connector is torn down (`disable_display_audio` /
+/// `apply_hotplug_disconnect` clear their own connector's entry).
+///
+/// The snapshot covers the last applied plan only. A
+/// multi-connector resume rebuilds every connector's writes
+/// through `AmdGpu::resume_display_audio` instead; the snapshot
+/// is the single-plan path for when no KMS state is at hand.
+struct SavedDisplayAudio {
+    timing: crate::amdgpu_dcn::ModeTiming,
+    connector_idx: u8,
+    writes: Vec<crate::amdgpu_dcn::DcnWrite>,
+}
+
+static SAVED_DISPLAY_AUDIO: narf_lib::sync::IrqSafeSpinLock<Option<SavedDisplayAudio>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Drop the saved audio for one connector, leaving other
+/// connectors' snapshots alone. Teardown paths call this when
+/// tearing a connector down, whether or not disable writes
+/// execute, so a later `set_mode` cannot resurrect audio for a
+/// disconnected output.
+fn clear_saved_display_audio(connector_idx: u8) {
+    let mut saved = SAVED_DISPLAY_AUDIO.lock();
+    if let Some(s) = saved.as_ref() {
+        if s.connector_idx == connector_idx {
+            *saved = None;
+        }
+    }
+}
+
+/// Test-only reset for the saved display-audio snapshot. The
+/// snapshot is kernel-global, so fixtures that share it reset it
+/// up front instead of depending on run order.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn reset_saved_display_audio_for_test() {
+    *SAVED_DISPLAY_AUDIO.lock() = None;
+}
 static PM_SUSPENDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
