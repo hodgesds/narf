@@ -152,6 +152,11 @@ pub(crate) const TXDCTL_ENABLE: u32 = 1 << 25;
 // DESCTYPE 001 (ADV_ONEBUF, Linux ixgbe_type.h:2462) selects advanced
 // one-buffer descriptors; 000 (legacy) cannot report stripped VLAN
 // tags (datasheet §7.1.6 requires DESCTYPE != 000 for advanced).
+// `SRRCTL_BSIZE_2K` is used only by the x86_64-only test module
+// (`ixgbe/tests.rs`, `#![cfg(target_arch = "x86_64")]`); production
+// code programs SRRCTL via `mtu::srrctl_bsize(frame)` instead. Without
+// this, aarch64 clippy reports the const as dead code (`-D warnings`).
+#[allow(dead_code)]
 pub(crate) const SRRCTL_BSIZE_2K: u32 = 2; // bits[4:0]
 pub(crate) const SRRCTL_DESCTYPE_ADV_ONEBUF: u32 = 1 << 25;
 
