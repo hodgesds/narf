@@ -57,6 +57,16 @@ impl<T, R: Rights> Cap<T, R> {
     /// less than the current object epoch. This is the *only* valid
     /// way to access the underlying object — never dereference from
     /// the slot directly.
+    ///
+    /// `invoke` is also the in-kernel enforcement point for the
+    /// runtime checks behind §8 steps 3–4 (SEC-B2, #1282): epoch
+    /// (`Revoked`), object-table kind cross-check (`TypeMismatch`),
+    /// slot `type_tag` (`TypeMismatch`), slot rights cover `R::BITS`
+    /// (`RightsTooWeak`) — in that order, under a single
+    /// object-table lock acquisition (`epoch_and_kind`). §8 step 5
+    /// (domain-tag match) is NOT checked here: no domain is recorded
+    /// on the cap or the object-table entry and no per-op
+    /// required-domain table exists yet (remainder #1547).
     pub fn invoke<O: CapOp<T, R>>(&self, op: O) -> Result<O::Output, CapError>;
 
     /// Destroy this cap *and* bump the object's epoch so every other
@@ -272,6 +282,9 @@ and, where relevant, the badge value separately.
 - **Type-level rights prove *prior grant*; epoch check proves *current
   validity*.** These are distinct soundness properties. The Rust type
   system enforces the first; `invoke` + object epoch enforces the second.
+  `invoke` additionally cross-checks the object-table kind and the
+  slot's `type_tag` / `rights` at runtime (SEC-B2, #1282, §9.9) —
+  the type alone never proves a forged slot is authorised.
   Callers that dereference without going through `invoke` are in
   undefined territory.
 - Revocation is atomic from a single CPU's view; parallel invocations
@@ -346,6 +359,17 @@ A cap arriving over the wire is **always** revalidated by:
    `Err(DomainMismatch)` if mismatched.
 
 All five steps are mandatory; skipping any is a soundness bug.
+
+Enforcement split, as implemented (SEC-B2, #1282, §9.9): at the ABI
+boundary, `CapTable::lookup` performs steps 1–4 against the
+submitting task's own table (the #1363 wiring, merged PR #1502); in
+the kernel, `Cap::invoke` performs the runtime equivalents of steps
+3–4 for the typed path — epoch, object-table kind cross-check,
+slot `type_tag`, slot rights — before `execute` runs. Step 5
+(domain-tag match) is implemented nowhere yet: no per-op
+required-domain table exists, and neither the cap nor the
+object-table entry records a domain. That is a tracked remainder
+(#1547), not a silent skip.
 
 ## 9. Resolved decisions
 
@@ -526,6 +550,73 @@ held), migration of all 807 `::bootstrap()` call sites (285 files at
 1307de44), and removal of the ungated `bootstrap()`. Until removal
 lands, the gate is a mechanism, not an enforcement: `bootstrap()`
 still mints without authority.
+
+### 9.9 Invoke-time kind/rights checks (SEC-B2, #1282)
+
+**Decision:** `Cap::invoke` verifies more than the epoch before
+`execute` runs. Checks, in order: epoch against the slot's
+generation snapshot (`Revoked` — checked first, preserving the
+pre-#1282 observable behaviour that a revoked cap reports
+`Revoked` regardless of its other fields), object-table kind
+equals `T::KIND` (`TypeMismatch`), slot `type_tag` equals
+`T::KIND` (`TypeMismatch`), slot `rights` covers `R::BITS`
+(`RightsTooWeak`).
+
+Why both a kind check and a `type_tag` check: the slot-local
+`type_tag` compare cannot catch a slot whose `type_tag` says `T`
+but whose index aliases a live object of a different kind; only
+the object-table cross-check (`kind_at(index) == T::KIND`)
+catches that forgery. The two `TypeMismatch` sources are distinct
+forgeries and are pinned separately in fixtures.
+
+Why one lock acquisition: the epoch and kind facts come from a
+single locked read (`object_table::epoch_and_kind`), so `invoke`
+still performs exactly one object-table lock acquisition — the
+same as the old epoch-only path. A naive `current_epoch` +
+`kind_at` sequence would have added a second acquisition, which
+the #1282 perf bar fails outright (see below). The `type_tag` /
+rights legs are same-slot integer compares: no lock, no table
+touch. `check_live` keeps its epoch-only contract for
+`derive` / `transfer` / `install_bootstrap`, which do their own
+type checks where needed.
+
+Why no domain check here: neither the cap nor the object-table
+entry records a domain, the wire format is frozen (§8), and no
+per-op required-domain table exists yet (the #1363 wiring's
+stated remainder, merged PR #1502) — so there is nothing
+authoritative for `invoke` to compare a caller domain against,
+and `capabilities/` cannot name the `DomainId` type (namespace
+owned by security-model/ §4.1). The step-5 check belongs at
+dispatch, where the calling task's active domain is known;
+tracked as #1547. `DomainMismatch` therefore remains unproduced
+by any production path.
+
+Composition with the #1363 wiring (merged PR #1502): that PR owns
+`CapTable::lookup` and the ABI dispatch gate (§8 steps 1–4 at the
+boundary); this change owns the in-kernel typed path and does not
+touch `lookup`, `install_transfer`, the scheduler wiring, or any
+`invoke` call site — every existing caller passes a legitimately
+minted or derived cap, whose slot already carries the right kind,
+type tag, and rights. Composition with the #1281 mechanism (merged
+PR #1542): `bootstrap_with`-minted caps carry the same slot
+shape, so they pass the new legs unchanged. Note: #1542 landed first with §9.8 (creator-gated mint), so this section is §9.9.
+
+Perf class (b) — hot path, unmeasured, with measurement plan:
+`check_live` is documented as "the hot-path check for every op."
+Measure per-`invoke` cycle cost of epoch-only vs
+epoch+kind+rights on real hardware (x86_64 + aarch64 CI runners,
+NOT TCG — TCG numbers are never perf claims), across a JIT-alloc
+loop and an audio-stream `invoke` loop. Regression bar: no
+measurable regression in `invoke` throughput beyond noise, since
+the added checks are same-cache-line integer compares once the
+kind table is consulted; the single-lock design above is what
+keeps the bar attainable — if measurement shows the kind lookup
+still costs a lock acquisition beyond the old path, the table
+must become lock-free-read first. No measurement was possible in
+this lane (no real hardware); the plan is the explicit close
+condition for #1282.
+
+Remainders: §8 step 5, tracked in #1547.
 
 ## 10. ABI versioning
 

@@ -1036,3 +1036,145 @@ fn smoke_cap_creator_derive_reflexive() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("capabilities", smoke_cap_creator_derive_reflexive);
+
+// ── invoke-time kind/rights checks (#1282, SEC-B2) ──────────────────
+//
+// Before this fix `Cap::invoke` checked only the epoch: a hand-forged
+// slot (via unsafe `Cap::mint` — the only way to build a `Cap`
+// outside mint/derive/transfer) naming a live object of the wrong
+// kind, or claiming rights it was never granted, still ran `execute`.
+// The fixtures forge exactly those slots and pin the error each
+// check produces. Forged slots are built from a live bootstrap cap
+// so the epoch is current and only the field under test is wrong;
+// the object-table kind cross-check is what distinguishes the
+// wrong-kind-object case (slot type_tag right, index wrong) from the
+// wrong-type-tag case (index right, type_tag wrong).
+
+fn smoke_cap_invoke_refuses_wrong_type_tag() -> TestResult {
+    // Live Endpoint object, correct rights, but the slot's type_tag
+    // claims Domain: the slot-local check reports TypeMismatch.
+    // The object-table kind still matches (the index is honest), so
+    // this pins the type_tag leg, not the kind leg.
+    use crate::{Cap, CapError, CapKind, CapType, NoopOp, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let real: Cap<TestObj, Write> = Cap::bootstrap();
+    let mut slot = real.slot();
+    slot.type_tag = CapKind::Domain as u32;
+    // SAFETY: the slot names a live registered Endpoint object; only
+    // the type_tag field is altered, which is exactly the forgery
+    // under test.
+    let forged: Cap<TestObj, Write> = unsafe { Cap::mint(slot) };
+    match forged.invoke(NoopOp) {
+        Err(CapError::TypeMismatch) => {}
+        _ => return TestResult::Fail("invoke accepted a wrong-type-tag cap"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_invoke_refuses_wrong_type_tag);
+
+fn smoke_cap_invoke_refuses_wrong_object_kind() -> TestResult {
+    // The aliasing forgery: slot.type_tag says Endpoint and the
+    // rights are right, but the index names a live Domain-kind
+    // object. Only the object-table kind cross-check catches this —
+    // a slot-local type_tag compare would pass. Must report
+    // TypeMismatch, and must not run the op (NoopOp cannot observe
+    // execution, so the error itself is the pin: an epoch-only
+    // invoke would have returned Ok).
+    use crate::{Cap, CapError, CapKind, CapSlot, CapType, NoopOp, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    struct OtherObj;
+    impl CapType for OtherObj {
+        const KIND: CapKind = CapKind::Domain;
+    }
+    let other: Cap<OtherObj, Write> = Cap::bootstrap();
+    let o = other.slot();
+    let aliased = CapSlot::new(o.generation, o.index, o.rights, CapKind::Endpoint as u32);
+    // SAFETY: the slot names a live registered object (of Domain
+    // kind); the type_tag/index mismatch is exactly the forgery
+    // under test.
+    let forged: Cap<TestObj, Write> = unsafe { Cap::mint(aliased) };
+    match forged.invoke(NoopOp) {
+        Err(CapError::TypeMismatch) => {}
+        _ => return TestResult::Fail("invoke accepted a cap aliasing a wrong-kind object"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_invoke_refuses_wrong_object_kind);
+
+fn smoke_cap_invoke_refuses_insufficient_rights() -> TestResult {
+    // Live Endpoint object, correct type tag, but the slot carries
+    // only the Read bit while the cap type demands Write: the
+    // rights leg reports RightsTooWeak. Reachable only via a
+    // hand-forged slot, since the type system pins R = Write.
+    use crate::{Cap, CapError, CapKind, CapType, NoopOp, Read, Rights, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let real: Cap<TestObj, Write> = Cap::bootstrap();
+    let mut slot = real.slot();
+    slot.rights = Read::BITS;
+    // SAFETY: the slot names a live registered Endpoint object; only
+    // the rights field is altered, which is exactly the forgery
+    // under test.
+    let forged: Cap<TestObj, Write> = unsafe { Cap::mint(slot) };
+    match forged.invoke(NoopOp) {
+        Err(CapError::RightsTooWeak) => {}
+        _ => return TestResult::Fail("invoke accepted a cap without the required right"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_invoke_refuses_insufficient_rights);
+
+fn smoke_cap_invoke_accepts_derived_cap() -> TestResult {
+    // Positive path for the narrowed case: a Grant cap derives a
+    // Read cap over the same object, and the derived cap invokes.
+    // The derived slot's rights are exactly Read::BITS and its
+    // type_tag/kind are the parent's, so every new leg passes; this
+    // guards against the checks rejecting legitimate derived caps.
+    use crate::{Cap, CapKind, CapType, Grant, NoopOp, Read};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let parent: Cap<TestObj, Grant> = Cap::bootstrap();
+    let derived: Cap<TestObj, Read> = match parent.derive::<Read>() {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("derive of a live cap failed"),
+    };
+    if derived.invoke(NoopOp).is_err() {
+        return TestResult::Fail("invoke refused a legitimately derived cap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_invoke_accepts_derived_cap);
+
+fn smoke_cap_epoch_and_kind_single_read() -> TestResult {
+    // Pins the `invoke` helper directly: a fresh registration reads
+    // back epoch 1 with its registered kind, and an unknown index
+    // reads back None. The single-lock-acquisition property itself
+    // is structural (one lock hold in the implementation, same as
+    // the old `check_live`-only path) and is stated in spec §9.9
+    // rather than exercised here — no fixture can count lock holds.
+    use crate::{object_table, Cap, CapKind, CapType, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let cap: Cap<TestObj, Write> = Cap::bootstrap();
+    match object_table::epoch_and_kind(cap.slot().index) {
+        Some((1, CapKind::Endpoint)) => {}
+        _ => return TestResult::Fail("epoch_and_kind did not return (1, Endpoint)"),
+    }
+    if object_table::epoch_and_kind(u32::MAX).is_some() {
+        return TestResult::Fail("epoch_and_kind resolved an unknown index");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_epoch_and_kind_single_read);
