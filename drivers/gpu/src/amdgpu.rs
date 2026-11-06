@@ -1885,6 +1885,11 @@ impl AmdGpu {
             let pct = match self.backlight_percent {
                 Some(pct) => pct,
                 None => {
+                    // SAFETY: `set_mode`'s caller owns BAR0 + BAR5
+                    // exclusively, discharging
+                    // `readback_brightness_percent`'s BAR5 requirement;
+                    // the readback only reads the DCN BL_PWM registers
+                    // inside the window `ip_block_base` resolves.
                     let pct = unsafe { self.readback_brightness_percent() }.unwrap_or(100);
                     self.backlight_percent = Some(pct);
                     pct
@@ -2195,6 +2200,8 @@ impl AmdGpu {
                 dcn_base + crate::amdgpu_backlight::BL_PWM_PERIOD_CNTL,
             )
         };
+        // SAFETY: caller-asserted BAR5 ownership; the register is
+        // inside the DCN window `ip_block_base` resolved.
         let cntl = unsafe { mm_read(&self.regs, dcn_base + crate::amdgpu_backlight::BL_PWM_CNTL) };
         if cntl & crate::amdgpu_backlight::BL_PWM_EN == 0 {
             return None;
