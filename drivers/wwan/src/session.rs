@@ -30,9 +30,10 @@ use alloc::vec::Vec;
 use crate::mbim::{
     self, ConnectInfo, ConnectSetParams, DeviceCapsInfo, IpConfigurationInfo, MbimHeader,
     MbimMessageType, MbimUuid, PacketServiceInfo, RadioStateInfo, SubscriberReadyInfo, CID_CONNECT,
-    CID_DEVICE_CAPS, CID_IP_CONFIGURATION_INFO, CID_PACKET_SERVICE, CID_RADIO_STATE,
-    CID_SUBSCRIBER_READY_STATUS, COMMAND_TYPE_QUERY, COMMAND_TYPE_SET, MBIM_STATUS_SUCCESS,
-    MBIM_UUID_BASIC_CONNECT,
+    CID_DEVICE_CAPS, CID_DSS_CONNECT, CID_IP_CONFIGURATION_INFO, CID_PACKET_SERVICE,
+    CID_RADIO_STATE, CID_SUBSCRIBER_READY_STATUS, COMMAND_TYPE_QUERY, COMMAND_TYPE_SET,
+    DSS_LINK_ACTIVATE, DSS_LINK_DEACTIVATE, MBIM_STATUS_SUCCESS, MBIM_UUID_BASIC_CONNECT,
+    MBIM_UUID_DSS,
 };
 use crate::WwanError;
 
@@ -84,6 +85,9 @@ pub struct MbimModem<T: MbimTransport> {
     /// Last known activation state per session id, from connect /
     /// disconnect responses and unsolicited events.
     session_states: Vec<(u32, u32)>,
+    /// Last known DSS link state per (link GUID, session id), from
+    /// DSS connect / disconnect responses (mbim::DSS_LINK_*).
+    dss_states: Vec<(MbimUuid, u32, u32)>,
 }
 
 impl<T: MbimTransport> core::fmt::Debug for MbimModem<T> {
@@ -94,6 +98,7 @@ impl<T: MbimTransport> core::fmt::Debug for MbimModem<T> {
             .field("max_control_transfer", &self.max_control_transfer)
             .field("pending_connect_event", &self.pending_connect_event)
             .field("session_states", &self.session_states)
+            .field("dss_states", &self.dss_states)
             .finish_non_exhaustive()
     }
 }
@@ -108,6 +113,7 @@ impl<T: MbimTransport> MbimModem<T> {
             max_control_transfer: 4096,
             pending_connect_event: None,
             session_states: Vec::new(),
+            dss_states: Vec::new(),
         }
     }
 
@@ -146,6 +152,27 @@ impl<T: MbimTransport> MbimModem<T> {
             slot.1 = state;
         } else {
             self.session_states.push((session_id, state));
+        }
+    }
+
+    /// Last known DSS link state for (`link`, `session_id`)
+    /// (mbim::DSS_LINK_*), if ever observed.
+    pub fn dss_link_state(&self, link: &MbimUuid, session_id: u32) -> Option<u32> {
+        self.dss_states
+            .iter()
+            .find(|(l, id, _)| l == link && *id == session_id)
+            .map(|(_, _, state)| *state)
+    }
+
+    fn note_dss_state(&mut self, link: &MbimUuid, session_id: u32, state: u32) {
+        if let Some(slot) = self
+            .dss_states
+            .iter_mut()
+            .find(|(l, id, _)| l == link && *id == session_id)
+        {
+            slot.2 = state;
+        } else {
+            self.dss_states.push((*link, session_id, state));
         }
     }
 
@@ -376,17 +403,28 @@ impl<T: MbimTransport> MbimModem<T> {
         }
     }
 
-    /// Run a command that must succeed; map a non-success status to
-    /// `WwanError::ModemStatus`.
+    /// Run a Basic Connect command that must succeed; map a
+    /// non-success status to `WwanError::ModemStatus`.
     async fn command_ok(
         &mut self,
         cid: u32,
         command_type: u32,
         info: &[u8],
     ) -> Result<Vec<u8>, WwanError> {
-        let (status, buf) = self
-            .command(&MBIM_UUID_BASIC_CONNECT, cid, command_type, info)
-            .await?;
+        self.command_ok_svc(&MBIM_UUID_BASIC_CONNECT, cid, command_type, info)
+            .await
+    }
+
+    /// Run a command in `service` that must succeed; map a
+    /// non-success status to `WwanError::ModemStatus`.
+    async fn command_ok_svc(
+        &mut self,
+        service: &MbimUuid,
+        cid: u32,
+        command_type: u32,
+        info: &[u8],
+    ) -> Result<Vec<u8>, WwanError> {
+        let (status, buf) = self.command(service, cid, command_type, info).await?;
         if status != MBIM_STATUS_SUCCESS {
             return Err(WwanError::ModemStatus(status));
         }
@@ -502,5 +540,38 @@ impl<T: MbimTransport> MbimModem<T> {
             .command_ok(CID_IP_CONFIGURATION_INFO, COMMAND_TYPE_QUERY, &query)
             .await?;
         IpConfigurationInfo::parse(&buf).map_err(|_| WwanError::MalformedFrame)
+    }
+
+    /// Activate a DSS link (MBIM_CID_DSS_CONNECT set with
+    /// DssLinkState = ACTIVATE) for `link` on DSS session
+    /// `session_id` (MBIM 1.0 §10.5.38).
+    ///
+    /// The DSS_CONNECT response carries no information-buffer fields,
+    /// so success is the status code alone; the modem then delivers
+    /// the link's stream on the DSS-signed NDP for the session, which
+    /// the bearer routes to the stream port registered by
+    /// [`crate::bearer::activate_dss_stream`]. DSS_CONNECT has no
+    /// query form — activation state is tracked here, not re-queried.
+    pub async fn dss_connect(&mut self, link: &MbimUuid, session_id: u32) -> Result<(), WwanError> {
+        let info = mbim::build_dss_connect_set(link, session_id, DSS_LINK_ACTIVATE);
+        self.command_ok_svc(&MBIM_UUID_DSS, CID_DSS_CONNECT, COMMAND_TYPE_SET, &info)
+            .await?;
+        self.note_dss_state(link, session_id, DSS_LINK_ACTIVATE);
+        Ok(())
+    }
+
+    /// Deactivate a DSS link (MBIM_CID_DSS_CONNECT set with
+    /// DssLinkState = DEACTIVATE) for `link` on DSS session
+    /// `session_id`.
+    pub async fn dss_disconnect(
+        &mut self,
+        link: &MbimUuid,
+        session_id: u32,
+    ) -> Result<(), WwanError> {
+        let info = mbim::build_dss_disconnect_set(link, session_id);
+        self.command_ok_svc(&MBIM_UUID_DSS, CID_DSS_CONNECT, COMMAND_TYPE_SET, &info)
+            .await?;
+        self.note_dss_state(link, session_id, DSS_LINK_DEACTIVATE);
+        Ok(())
     }
 }
