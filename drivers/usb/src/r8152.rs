@@ -2652,7 +2652,7 @@ fn phy_init_ops_8157_ver16() -> Vec<PhyInitOp> {
 /// The VER_17 arm of `r8157_hw_phy_cfg`.
 fn phy_init_ops_8157_ver17() -> Vec<PhyInitOp> {
     use PhyInitOp::*;
-    let mut ops = vec![
+    let ops = vec![
         // Disable bypass turn off clk in ALDPS.
         PlaByteClrBits {
             addr: 0xD3C8,
