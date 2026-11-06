@@ -29,6 +29,7 @@ narf-aml            = { path = "../../aml" }
 narf-fb             = { path = "../../fb" }
 narf-console        = { path = "../../console" }
 narf-drivers-virtio = { path = "../virtio" }
+narf-drivers-platform = { path = "../platform" }
 narf-kernel-test    = { path = "../../verification/kernel-test" }
 narf-bus            = { path = "../../bus" }
 narf-driver-runtime = { path = "../runtime" }
