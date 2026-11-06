@@ -22,6 +22,7 @@ pub mod hid_sensor_pub;
 pub mod i2c_hid;
 pub mod i2c_hid_bind;
 pub mod i2c_hid_keyboard;
+pub mod i2c_hid_pm;
 pub mod i2c_hid_touch;
 #[cfg(target_arch = "x86_64")]
 pub mod i8042;
@@ -101,6 +102,10 @@ fn register_i8042_initcalls() {
         if !init_ok {
             return InitResult::NotPresent;
         }
+        // Device-PM registration (#770): suspend disables both PS/2
+        // channels, resume re-scans + re-enables them. Covers the
+        // mouse channel too (same controller, same "i8042" entry).
+        i8042::register_device_pm();
         // SAFETY: ISA IRQ → IOAPIC routing call; the handler is
         // `pub unsafe fn on_irq1` because the i8042 read it does
         // is unsafe at module level, but installation through the
