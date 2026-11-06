@@ -150,6 +150,7 @@ fn navi22_rom_bank_is_selected_before_hardware_access() -> TestResult {
         chip: crate::amdgpu::__test_chip_info_for_pci_id(0x1002, crate::amdgpu::NAVI22).unwrap(),
         vram: Default::default(),
         mode: None,
+        backlight_percent: None,
         fw_loaded: false,
         gc_info: None,
         vbios: None,

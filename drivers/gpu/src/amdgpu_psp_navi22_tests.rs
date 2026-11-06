@@ -727,6 +727,7 @@ fn gpu(regs: &mut [u32]) -> AmdGpu {
         )
         .unwrap(),
         mode: None,
+        backlight_percent: None,
         fw_loaded: false,
         vbios: None,
         gc_info: None,

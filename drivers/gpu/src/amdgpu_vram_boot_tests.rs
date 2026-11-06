@@ -505,6 +505,7 @@ fn vram_boot_revalidates_pci_authority_before_mmio() -> TestResult {
         },
         vram: Default::default(),
         mode: None,
+        backlight_percent: None,
         fw_loaded: false,
         ip_blocks: vec![IpBlock {
             hw_id: HW_ID_DCN,
@@ -576,6 +577,7 @@ fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
             visible_size: 256 * MIB,
         },
         mode: None,
+        backlight_percent: None,
         fw_loaded: false,
         gc_info: None,
         ip_blocks: [
@@ -773,6 +775,7 @@ fn vram_boot_loader_construction_does_not_modify_hardware() -> TestResult {
         },
         vram: Default::default(),
         mode: None,
+        backlight_percent: None,
         fw_loaded: false,
         ip_blocks: vec![IpBlock {
             hw_id: HW_ID_DCN,
@@ -862,6 +865,7 @@ fn navi48_vram_checks_gmc12_dcn4_and_training() -> TestResult {
             visible_size: 256 * MIB,
         },
         mode: None,
+        backlight_percent: None,
         fw_loaded: false,
         gc_info: None,
         ip_blocks: [

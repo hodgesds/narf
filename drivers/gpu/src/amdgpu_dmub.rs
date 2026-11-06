@@ -517,6 +517,7 @@ pub(crate) mod tests {
             },
             vram: Default::default(),
             mode: None,
+            backlight_percent: None,
             fw_loaded: false,
             ip_blocks: alloc::vec![],
             vbios: None,

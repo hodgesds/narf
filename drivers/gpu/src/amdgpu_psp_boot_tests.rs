@@ -813,6 +813,7 @@ fn gpu() -> AmdGpu {
             visible_size: map().len,
         },
         mode: None,
+        backlight_percent: None,
         fw_loaded: false,
         vbios: None,
         gc_info: None,
