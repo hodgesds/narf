@@ -1500,28 +1500,28 @@ fn fixture_sdhci_uhs_pure() -> TestResult {
     // CMD6 argument encodings (SD Physical Layer Spec §4.3.10):
     // mode bit 31 + per-group 4-bit fields, 0xF = no change.
     if cmd6_arg(false, 0, 0) != 0x00FFFFF0 {
-        return Err("CMD6 check of group 1 must be 0x00FFFFF0");
+        return TestResult::Fail("CMD6 check of group 1 must be 0x00FFFFF0");
     }
     if cmd6_arg(true, 0, 2) != 0x80FFFFF2 {
-        return Err("CMD6 switch to SDR50 must be 0x80FFFFF2");
+        return TestResult::Fail("CMD6 switch to SDR50 must be 0x80FFFFF2");
     }
     if cmd6_arg(true, 0, 1) != 0x80FFFFF1 {
-        return Err("CMD6 switch to SDR25 must be 0x80FFFFF1");
+        return TestResult::Fail("CMD6 switch to SDR25 must be 0x80FFFFF1");
     }
     if cmd6_arg(true, 2, 3) != 0x80FFFF3F {
-        return Err("CMD6 switch of group 2 to 3 must be 0x80FFFF3F");
+        return TestResult::Fail("CMD6 switch of group 2 to 3 must be 0x80FFFF3F");
     }
     // Switch-status parsing: support in byte 13, current
     // function in byte 16's low nibble.
     let status = SwitchStatus::parse(&switch_status_bytes(0x1F, 3));
     if status.group1_support() != 0x1F {
-        return Err("SwitchStatus must report byte 13 as group-1 support");
+        return TestResult::Fail("SwitchStatus must report byte 13 as group-1 support");
     }
     if status.group1_function() != 3 {
-        return Err("SwitchStatus must report byte 16 low nibble as current function");
+        return TestResult::Fail("SwitchStatus must report byte 16 low nibble as current function");
     }
     if !status.supports_function(3) || status.supports_function(4) {
-        return Err("SwitchStatus supports_function must match the support bits");
+        return TestResult::Fail("SwitchStatus supports_function must match the support bits");
     }
     // Mode table: function values, max clocks, HOST_CONTROL2
     // UHS Mode Select values, tuning requirement.
@@ -1530,7 +1530,7 @@ fn fixture_sdhci_uhs_pure() -> TestResult {
         || UhsMode::Sdr25.host_control2() != 0x1
         || UhsMode::Sdr25.needs_tuning(false)
     {
-        return Err("SDR25 table row wrong");
+        return TestResult::Fail("SDR25 table row wrong");
     }
     if UhsMode::Sdr50.function() != 2
         || UhsMode::Sdr50.max_clock_hz() != 100_000_000
@@ -1538,14 +1538,14 @@ fn fixture_sdhci_uhs_pure() -> TestResult {
         || UhsMode::Sdr50.needs_tuning(false)
         || !UhsMode::Sdr50.needs_tuning(true)
     {
-        return Err("SDR50 table row wrong");
+        return TestResult::Fail("SDR50 table row wrong");
     }
     if UhsMode::Sdr104.function() != 3
         || UhsMode::Sdr104.max_clock_hz() != 208_000_000
         || UhsMode::Sdr104.host_control2() != 0x3
         || !UhsMode::Sdr104.needs_tuning(false)
     {
-        return Err("SDR104 table row wrong");
+        return TestResult::Fail("SDR104 table row wrong");
     }
     if UhsMode::Ddr50.function() != 4
         || UhsMode::Ddr50.max_clock_hz() != 50_000_000
@@ -1553,14 +1553,14 @@ fn fixture_sdhci_uhs_pure() -> TestResult {
         || UhsMode::Ddr50.needs_tuning(false)
         || !UhsMode::Ddr50.needs_tuning(true)
     {
-        return Err("DDR50 table row wrong");
+        return TestResult::Fail("DDR50 table row wrong");
     }
     if UhsMode::Sdr12.function() != 0
         || UhsMode::Sdr12.max_clock_hz() != 25_000_000
         || UhsMode::Sdr12.host_control2() != 0x0
         || UhsMode::Sdr12.needs_tuning(true)
     {
-        return Err("SDR12 table row wrong");
+        return TestResult::Fail("SDR12 table row wrong");
     }
     // Mode selection matrix (Linux `sd_update_bus_speed_mode`
     // preference: SDR104 > DDR50 > SDR50 > SDR25).
@@ -1576,12 +1576,12 @@ fn fixture_sdhci_uhs_pure() -> TestResult {
     ];
     for (support, caps1, base, want) in cases {
         if select_uhs_mode(support, caps1, base) != want {
-            return Err("select_uhs_mode matrix row wrong");
+            return TestResult::Fail("select_uhs_mode matrix row wrong");
         }
     }
     // The tuning block is the spec's fixed 64-byte pattern.
     if TUNING_PATTERN_4BIT.len() != 64 || TUNING_PATTERN_4BIT[0] != 0xFF {
-        return Err("tuning pattern must be the 64-byte spec pattern");
+        return TestResult::Fail("tuning pattern must be the 64-byte spec pattern");
     }
     TestResult::Pass
 }
