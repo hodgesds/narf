@@ -3958,6 +3958,13 @@ mod tests {
             ready: false,
             _msix: Some(__synth_msix_table(1)),
             irq_vector: None,
+            // Fixture-owned MMIO backing is this instance's address;
+            // no second fixture shares it, so the probe-time
+            // duplicate-bind refusal can never fire here.
+            addr: narf_bus::BusAddr::Mmio(backing.phys_addr()),
+            ifname: crate::publish::IfName::new(),
+            lsc_pending: AtomicBool::new(false),
+            mb_pending: AtomicBool::new(false),
             rx_ipc_ring: IrqSafeSpinLock::new(None),
             tx_ipc_ring: IrqSafeSpinLock::new(None),
         };
