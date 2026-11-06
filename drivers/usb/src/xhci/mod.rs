@@ -2577,6 +2577,41 @@ impl Xhci {
         }
     }
 
+    /// Await a Command Completion Event for a submitted command
+    /// TRB (`command` is the phys address `submit_command_record`
+    /// returned). On timeout the receipt is retired (#884): the
+    /// waiter gives up the ring entry instead of leaving it
+    /// reserved forever, which would wedge the ring at wrap and
+    /// keep `soft_recover` refusing while `active()`. Only
+    /// `CmdTimeout` retires — a consumed event already released
+    /// the receipt, and other errors leave the receipt for the
+    /// recovery paths to clear.
+    async fn await_command_event(
+        &self,
+        command: u64,
+        predicate: impl FnMut(&[u32; 4]) -> bool,
+    ) -> Result<[u32; 4], XhciError> {
+        match self.await_event(predicate).await {
+            Ok(event) => Ok(event),
+            Err(XhciError::CmdTimeout) => {
+                self.retire_command_receipt(command);
+                Err(XhciError::CmdTimeout)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Drop the command-ring receipt for `command` and purge any
+    /// already-queued CCE naming it (one the ISR demuxed after
+    /// the waiter's last scan). A CCE that arrives later still is
+    /// swallowed by the tombstone `retire_pointer` leaves behind.
+    fn retire_command_receipt(&self, command: u64) {
+        self.command_completions.lock().retire_pointer(command);
+        self.cmd_events
+            .lock()
+            .retain(|event| !event_wait::command_pointer_matches(event, command));
+    }
+
     /// Issue an Enable Slot command (§4.6.3) and wait for the
     /// completion event. Returns the assigned slot id (1..=MaxSlots)
     /// on success.
@@ -2597,7 +2632,9 @@ impl Xhci {
         let trb_type = TRB_TYPE_ENABLE_SLOT_CMD << TRB_TYPE_SHIFT;
         let command = self.submit_command_record(0, 0, 0, trb_type)?;
         let ev = self
-            .await_event(|event| bulk_owner::command_pointer_matches(event, command))
+            .await_command_event(command, |event| {
+                bulk_owner::command_pointer_matches(event, command)
+            })
             .await?;
         // CCE layout (§6.4.2.2):
         //   dword0..1 = command-TRB phys addr
@@ -2638,7 +2675,9 @@ impl Xhci {
         let d3 = (TRB_TYPE_DISABLE_SLOT_CMD << TRB_TYPE_SHIFT) | (u32::from(slot_id) << 24);
         let command = self.submit_command_record(0, 0, 0, d3)?;
         let ev = self
-            .await_event(|event| bulk_owner::command_matches(event, slot_id, command))
+            .await_command_event(command, |event| {
+                bulk_owner::command_matches(event, slot_id, command)
+            })
             .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
@@ -3260,7 +3299,9 @@ impl Xhci {
         let command =
             self.submit_command_record(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
         let ev = self
-            .await_event(|event| bulk_owner::command_matches(event, slot_id, command))
+            .await_command_event(command, |event| {
+                bulk_owner::command_matches(event, slot_id, command)
+            })
             .await?;
         let ccode = (ev[2] >> 24) as u8;
         if ccode != 1 {
@@ -3383,7 +3424,9 @@ impl Xhci {
         let command =
             self.submit_command_record(input_phys as u32, (input_phys >> 32) as u32, 0, d3)?;
         let ev = self
-            .await_event(|event| bulk_owner::command_matches(event, claim.slot, command))
+            .await_command_event(command, |event| {
+                bulk_owner::command_matches(event, claim.slot, command)
+            })
             .await?;
         let code = (ev[2] >> 24) as u8;
         if code != 1 {
@@ -4568,7 +4611,9 @@ impl Xhci {
         let command_trb =
             self.submit_command_record(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
         let ev = self
-            .await_event(|event| bulk_owner::command_matches(event, slot_id, command_trb))
+            .await_command_event(command_trb, |event| {
+                bulk_owner::command_matches(event, slot_id, command_trb)
+            })
             .await?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
