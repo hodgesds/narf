@@ -53,6 +53,7 @@
 //! before the poller sees it. This driver registers no IRQ
 //! handler, so polling is the detect mechanism, as in RTSX.
 
+use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
@@ -193,7 +194,7 @@ pub enum SdhciError {
     BadLength,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SdCard {
     /// Card RCA (relative card address) negotiated via CMD3.
     pub rca: u16,
