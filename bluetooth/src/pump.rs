@@ -145,7 +145,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_filesystem::bluetooth::{BtRegisterStatus, BtSendError};
+use narf_filesystem::bluetooth::{BtConnectStatus, BtRegisterStatus, BtSendError};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::att;
@@ -386,6 +386,95 @@ impl PumpStep {
     }
 }
 
+/// What an outbound channel-open (#1532) is opening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutboundKind {
+    /// LE credit-based channel to `psm`.
+    LeCoc { psm: u16 },
+    /// BR/EDR generic channel to `psm`.
+    BrEdr { psm: u16 },
+    /// RFCOMM DLC to server `channel` (mux open + SABM exchange).
+    Rfcomm { channel: u8 },
+}
+
+/// Progress of one outbound channel-open (#1532). The record lives
+/// in `PumpCore::outbound` from the socket's first `connect()` call
+/// until the socket takes the completed (or refused) outcome; the
+/// pump drives it from HCI events and signalling responses. A
+/// record in `Open` owns its channel (already socket-claimed, so
+/// `accept` can never steal it); a record in `Refused`/`Failed`
+/// carries the terminal outcome for one poll, then is taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutboundState {
+    /// No ACL link yet; the HCI connection is being established.
+    AclPending,
+    /// Channel-open request sent; awaiting the peer's response.
+    RequestSent,
+    /// BR/EDR Connection Response accepted; Configure Request sent.
+    Configuring,
+    /// RFCOMM mux channel open; SABM on DLCI 0 sent.
+    MuxSabmSent,
+    /// Mux open; SABM on the target DLCI sent.
+    DlcSabmSent,
+    /// Channel/DLC open and socket-claimed; takeable by `connect`.
+    Open,
+    /// Peer refused the open; the value is the L2CAP result code.
+    Refused(u16),
+    /// Failed below L2CAP (link failure, DM, Command Reject).
+    Failed,
+}
+
+/// One in-flight outbound channel-open (#1532).
+#[derive(Clone, Copy, Debug)]
+struct OutboundOpen {
+    /// Peer address: `[address type, bdaddr...]`.
+    peer: [u8; 7],
+    kind: OutboundKind,
+    state: OutboundState,
+    /// Signalling identifier of the outstanding request (0 = none).
+    ident: u8,
+    /// Second identifier (BR/EDR Configure Request).
+    ident2: u8,
+    /// ACL handle once the link exists (0 while waiting for it).
+    handle: u16,
+    /// Our local CID once allocated.
+    local_cid: u16,
+    /// The peer's CID once the open succeeds.
+    peer_cid: u16,
+    /// RFCOMM DLCI once the DLC opens (0 for L2CAP).
+    dlci: u8,
+}
+
+impl OutboundOpen {
+    fn new(peer: [u8; 7], kind: OutboundKind) -> Self {
+        Self {
+            peer,
+            kind,
+            state: OutboundState::AclPending,
+            ident: 0,
+            ident2: 0,
+            handle: 0,
+            local_cid: 0,
+            peer_cid: 0,
+            dlci: 0,
+        }
+    }
+
+    /// Whether this record is the open the socket is polling for
+    /// (`psm` is the PSM, or the RFCOMM server channel).
+    fn matches(&self, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool {
+        if self.peer != peer {
+            return false;
+        }
+        match (self.kind, rfcomm) {
+            (OutboundKind::LeCoc { psm: p }, false) => le && p == psm,
+            (OutboundKind::BrEdr { psm: p }, false) => !le && p == psm,
+            (OutboundKind::Rfcomm { channel }, true) => !le && channel as u16 == psm,
+            _ => false,
+        }
+    }
+}
+
 // ── Per-connection state ────────────────────────────────────────────
 
 /// One side of a pairing: the pump drives a responder for
@@ -553,6 +642,13 @@ pub struct PumpCore {
     /// channel-removal site releases, so a reused CID is never
     /// shadowed by a stale claim.
     claimed: Vec<(u16, u16, u8)>,
+    /// In-flight outbound channel-opens (issue #1532), driven by
+    /// HCI events and signalling responses; see [`OutboundOpen`].
+    outbound: Vec<OutboundOpen>,
+    /// Next L2CAP signalling identifier for outbound requests.
+    /// 0 is never issued (it marks commands that expect no
+    /// response); the counter cycles 1..=255.
+    next_signal_ident: u8,
     /// Encoded outbound ACL packets awaiting flow-control credits.
     pending_acl: VecDeque<Vec<u8>>,
     /// Controller-wide ACL packets currently with the controller.
@@ -574,6 +670,7 @@ impl fmt::Debug for PumpCore {
             .field("periodic_sync_phase", &self.periodic_sync.phase)
             .field("bonds", &self.bonds.len())
             .field("claimed", &self.claimed.len())
+            .field("outbound", &self.outbound.len())
             .field("pending_acl", &self.pending_acl.len())
             .field("acl_in_flight", &self.acl_in_flight)
             .finish_non_exhaustive()
@@ -623,6 +720,8 @@ impl PumpCore {
             pending_inquiry_mode: None,
             bonds: BondStore::new(),
             claimed: Vec::new(),
+            outbound: Vec::new(),
+            next_signal_ident: 0,
             pending_acl: VecDeque::new(),
             acl_in_flight: 0,
             stats: PumpStats::default(),
@@ -939,9 +1038,9 @@ impl PumpCore {
     }
 
     /// Send one UIH frame on the open RFCOMM DLC (`handle`,
-    /// `local_cid`, `dlci`). We are the responder, so C/R is 0
-    /// (TS 07.10 §5.1.1: the initiator sets C/R=1, the responder
-    /// 0). Returns the bytes sent.
+    /// `local_cid`, `dlci`). C/R follows the DLC's side (TS 07.10
+    /// §5.1.1): initiator-opened DLCs (#1532) send C/R=1,
+    /// responder-side DLCs C/R=0. Returns the bytes sent.
     pub fn send_rfcomm(
         &mut self,
         handle: u16,
@@ -961,9 +1060,13 @@ impl PumpCore {
             Some(p) => p,
             None => return Err(BtSendError::NoChannel),
         };
-        let (peer_cid, open) = match &self.connections[conn_idx].channels[pos] {
+        let (peer_cid, open, initiator) = match &self.connections[conn_idx].channels[pos] {
             Channel::BrEdr(ch) => match &ch.service {
-                ChannelService::Rfcomm(session) => (ch.peer_cid, session.is_dlc_open(dlci)),
+                ChannelService::Rfcomm(session) => (
+                    ch.peer_cid,
+                    session.is_dlc_open(dlci),
+                    session.is_dlc_initiator(dlci),
+                ),
                 _ => return Err(BtSendError::WrongService),
             },
             Channel::Le(_) => return Err(BtSendError::WrongService),
@@ -971,7 +1074,7 @@ impl PumpCore {
         if !open {
             return Err(BtSendError::NoChannel);
         }
-        let frame = crate::rfcomm::Frame::uih(dlci, false, payload.to_vec());
+        let frame = crate::rfcomm::Frame::uih(dlci, initiator, payload.to_vec());
         self.queue_frame(handle, le, &BFrame::new(peer_cid, frame.encode()));
         self.flush_acl();
         Ok(payload.len())
@@ -997,9 +1100,10 @@ impl PumpCore {
 
     /// Close the open RFCOMM DLC (`handle`, `local_cid`, `dlci`)
     /// from our side: forget the DLC in the session and send the
-    /// peer a DISC (C/R 0 — responder). The L2CAP channel (shared
-    /// mux) survives, as do its other DLCs. `false` when no such
-    /// channel/DLC exists.
+    /// peer a DISC (C/R follows the DLC's side — 1 for
+    /// initiator-opened DLCs, 0 for responder-side ones). The L2CAP
+    /// channel (shared mux) survives, as do its other DLCs. `false`
+    /// when no such channel/DLC exists.
     pub fn close_rfcomm_dlc(&mut self, handle: u16, local_cid: u16, dlci: u8) -> bool {
         let Some(conn_idx) = self.connections.iter().position(|c| c.handle == handle) else {
             return false;
@@ -1007,22 +1111,29 @@ impl PumpCore {
         let Some(pos) = self.connections[conn_idx].channel_pos(local_cid) else {
             return false;
         };
-        let (peer_cid, le, was_open) = match &mut self.connections[conn_idx].channels[pos] {
-            Channel::BrEdr(ch) => match &mut ch.service {
-                ChannelService::Rfcomm(session) => {
-                    let was_open = session.is_dlc_open(dlci);
-                    session.close_dlc(dlci);
-                    (ch.peer_cid, self.connections[conn_idx].le, was_open)
-                }
-                _ => return false,
-            },
-            Channel::Le(_) => return false,
-        };
+        let (peer_cid, le, was_open, initiator) =
+            match &mut self.connections[conn_idx].channels[pos] {
+                Channel::BrEdr(ch) => match &mut ch.service {
+                    ChannelService::Rfcomm(session) => {
+                        let was_open = session.is_dlc_open(dlci);
+                        let initiator = session.is_dlc_initiator(dlci);
+                        session.close_dlc(dlci);
+                        (
+                            ch.peer_cid,
+                            self.connections[conn_idx].le,
+                            was_open,
+                            initiator,
+                        )
+                    }
+                    _ => return false,
+                },
+                Channel::Le(_) => return false,
+            };
         if !was_open {
             return false;
         }
         self.release_dlc_claim(handle, local_cid, dlci);
-        let frame = crate::rfcomm::Frame::disc(dlci, false);
+        let frame = crate::rfcomm::Frame::disc(dlci, initiator);
         self.queue_frame(handle, le, &BFrame::new(peer_cid, frame.encode()));
         self.flush_acl();
         true
@@ -1056,6 +1167,680 @@ impl PumpCore {
                 _ => Some(Vec::new()),
             },
             _ => Some(Vec::new()),
+        }
+    }
+
+    // ── Outbound channel-open client (issue #1532) ───────────────
+    //
+    // `connect()` from our side: LE credit-based Connection Request
+    // initiation (+ credit flow), BR/EDR Connection Request
+    // initiation, and RFCOMM session/DLC establishment initiated by
+    // us (SABM on DLCI 0, then DLC open). The socket layer polls
+    // `connect_outbound` until the open completes or fails; the
+    // pump drives the record from HCI events (ACL establishment)
+    // and signalling responses. SCO connect is NOT here (#817).
+
+    /// Next signalling identifier for an outbound request. 0 is
+    /// never issued (it marks commands that expect no response);
+    /// the counter cycles 1..=255.
+    fn next_signal_ident(&mut self) -> u8 {
+        self.next_signal_ident = self.next_signal_ident.wrapping_add(1);
+        if self.next_signal_ident == 0 {
+            self.next_signal_ident = 1;
+        }
+        self.next_signal_ident
+    }
+
+    /// Start (or poll) an outbound open to `peer` (`psm` is the
+    /// LE/BR-EDR PSM, or the RFCOMM server channel when `rfcomm`).
+    /// The first call starts the open and reports `Pending`; later
+    /// calls report the live state, and `Open`/`Refused`/`Failed`
+    /// consume the record — a second poll after one finds nothing
+    /// pending. `Busy` means nothing was started (retry the call).
+    pub fn connect_outbound(
+        &mut self,
+        peer: [u8; 7],
+        psm: u16,
+        le: bool,
+        rfcomm: bool,
+    ) -> BtConnectStatus {
+        // A connect() retry while one is in flight (or after it
+        // finished) polls the live record.
+        if let Some(pos) = self
+            .outbound
+            .iter()
+            .position(|o| o.matches(peer, psm, le, rfcomm))
+        {
+            // A record whose link is gone can never complete: the
+            // Disconnection Complete hook marks these Failed, but a
+            // handle-reuse race is closed here as well.
+            let stale = {
+                let rec = &self.outbound[pos];
+                rec.handle != 0 && !self.connections.iter().any(|c| c.handle == rec.handle)
+            };
+            if stale {
+                self.outbound[pos].state = OutboundState::Failed;
+            }
+            return self.take_outbound_status(pos, rfcomm);
+        }
+        // Validate before starting anything: RFCOMM is BR/EDR-only
+        // on server channels 1..=30; L2CAP needs a non-zero PSM.
+        let kind = if rfcomm {
+            if le || psm == 0 || psm > 30 {
+                return BtConnectStatus::Failed;
+            }
+            OutboundKind::Rfcomm { channel: psm as u8 }
+        } else if psm == 0 {
+            return BtConnectStatus::Failed;
+        } else if le {
+            OutboundKind::LeCoc { psm }
+        } else {
+            OutboundKind::BrEdr { psm }
+        };
+        // A live ACL to the peer takes the channel-open exchange
+        // straight away; otherwise the HCI link is established
+        // first and the exchange follows on Connection Complete.
+        if let Some(handle) = self
+            .connections
+            .iter()
+            .find(|c| c.peer_addr == peer && c.le == le)
+            .map(|c| c.handle)
+        {
+            self.outbound.push(OutboundOpen::new(peer, kind));
+            let pos = self.outbound.len() - 1;
+            self.outbound[pos].handle = handle;
+            self.advance_outbound(pos);
+            return self.take_outbound_status(pos, rfcomm);
+        }
+        let mut addr6 = [0u8; 6];
+        addr6.copy_from_slice(&peer[1..7]);
+        if le {
+            let peer_type = if peer[0] == 2 {
+                gap::PeerAddressType::Random
+            } else {
+                gap::PeerAddressType::Public
+            };
+            match self.central_connect(peer_type, addr6) {
+                Ok(()) => {}
+                Err(CentralError::WrongPhase) | Err(CentralError::Transport) => {
+                    return BtConnectStatus::Busy;
+                }
+                Err(_) => return BtConnectStatus::Failed,
+            }
+        } else {
+            match self.classic_connect(addr6) {
+                Ok(()) => {}
+                Err(classic::ClassicError::UnknownPeer) => {
+                    return BtConnectStatus::UnknownPeer;
+                }
+                Err(classic::ClassicError::WrongPhase) | Err(classic::ClassicError::Transport) => {
+                    return BtConnectStatus::Busy;
+                }
+                Err(_) => return BtConnectStatus::Failed,
+            }
+        }
+        self.outbound.push(OutboundOpen::new(peer, kind));
+        BtConnectStatus::Pending
+    }
+
+    /// Whether an outbound open to `peer` has completed and is
+    /// ready to take (non-consuming peek for poll writability).
+    pub fn connect_outbound_ready(&self, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool {
+        self.outbound
+            .iter()
+            .any(|o| o.matches(peer, psm, le, rfcomm) && o.state == OutboundState::Open)
+    }
+
+    /// Abandon an in-flight outbound open to `peer` (socket close):
+    /// drop the record and tear down any half-opened channel, so no
+    /// half-open channel survives the socket that asked for it.
+    /// `false` when nothing is in flight.
+    pub fn cancel_outbound(&mut self, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool {
+        let Some(pos) = self
+            .outbound
+            .iter()
+            .position(|o| o.matches(peer, psm, le, rfcomm))
+        else {
+            return false;
+        };
+        let rec = self.outbound.remove(pos);
+        if rec.local_cid == 0 || rec.handle == 0 {
+            return true;
+        }
+        if rfcomm && rec.dlci != 0 {
+            // DLC open: close it; the shared mux survives.
+            self.close_rfcomm_dlc(rec.handle, rec.local_cid, rec.dlci);
+        } else if rfcomm {
+            // Mux channel, no DLC yet: drop it only when nothing
+            // uses it — a peer-opened mux (or one serving peer
+            // DLCs) stays for its owner.
+            let drop_mux = match self
+                .connections
+                .iter()
+                .find(|c| c.handle == rec.handle)
+                .and_then(|c| c.channels.iter().find(|ch| ch.local_cid() == rec.local_cid))
+            {
+                Some(Channel::BrEdr(ch)) => match &ch.service {
+                    ChannelService::Rfcomm(session) => {
+                        session.open_dlcs().is_empty() && !session.is_mux_open()
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if drop_mux {
+                self.disconnect_channel(rec.handle, rec.local_cid);
+            }
+        } else {
+            // A client-opened L2CAP channel is ours alone.
+            self.disconnect_channel(rec.handle, rec.local_cid);
+        }
+        true
+    }
+
+    /// Report (and consume, when terminal) one outbound record's
+    /// state. `Open`/`Refused`/`Failed` remove the record; any
+    /// other state reports `Pending` and keeps it.
+    fn take_outbound_status(&mut self, pos: usize, rfcomm: bool) -> BtConnectStatus {
+        match self.outbound[pos].state {
+            OutboundState::Open => {
+                let rec = self.outbound.remove(pos);
+                if rfcomm {
+                    BtConnectStatus::OpenRfcomm((
+                        rec.handle,
+                        rec.local_cid,
+                        rec.peer_cid,
+                        rec.dlci,
+                        rec.peer,
+                    ))
+                } else {
+                    BtConnectStatus::Open((rec.handle, rec.local_cid, rec.peer_cid, rec.peer))
+                }
+            }
+            OutboundState::Refused(result) => {
+                self.outbound.remove(pos);
+                BtConnectStatus::Refused(result)
+            }
+            OutboundState::Failed => {
+                self.outbound.remove(pos);
+                BtConnectStatus::Failed
+            }
+            _ => BtConnectStatus::Pending,
+        }
+    }
+
+    /// Drive one outbound record whose ACL link exists: send the
+    /// channel-open request (or the RFCOMM SABM, reusing a live mux
+    /// when one exists). Called from `connect_outbound` and from
+    /// the Connection Complete hooks.
+    fn advance_outbound(&mut self, pos: usize) {
+        let (kind, handle) = {
+            let rec = &self.outbound[pos];
+            (rec.kind, rec.handle)
+        };
+        let Some(conn_idx) = self.connections.iter().position(|c| c.handle == handle) else {
+            self.outbound[pos].state = OutboundState::Failed;
+            return;
+        };
+        let le = self.connections[conn_idx].le;
+        match kind {
+            OutboundKind::LeCoc { psm } => {
+                let Some(local_cid) = self.connections[conn_idx].cid_alloc.alloc_le() else {
+                    self.outbound[pos].state = OutboundState::Failed;
+                    return;
+                };
+                let ident = self.next_signal_ident();
+                let cmd = l2cap::build_le_credit_based_connection_request(
+                    ident,
+                    psm,
+                    local_cid,
+                    LE_COC_MTU,
+                    LE_COC_MPS,
+                    LE_COC_INITIAL_CREDITS,
+                );
+                let mut payload = Vec::new();
+                cmd.encode(&mut payload);
+                self.queue_frame(handle, le, &BFrame::new(CID_LE_SIGNALLING, payload));
+                let rec = &mut self.outbound[pos];
+                rec.ident = ident;
+                rec.local_cid = local_cid;
+                rec.state = OutboundState::RequestSent;
+            }
+            OutboundKind::BrEdr { psm } => {
+                let Some(local_cid) = self.connections[conn_idx].cid_alloc.alloc_bredr() else {
+                    self.outbound[pos].state = OutboundState::Failed;
+                    return;
+                };
+                // The BR/EDR allocator wraps without tracking the
+                // open set: refuse rather than alias an open channel.
+                if self.connections[conn_idx].channel_pos(local_cid).is_some() {
+                    self.outbound[pos].state = OutboundState::Failed;
+                    return;
+                }
+                let ident = self.next_signal_ident();
+                let cmd = l2cap::build_connection_request(ident, psm, local_cid);
+                let mut payload = Vec::new();
+                cmd.encode(&mut payload);
+                self.queue_frame(handle, le, &BFrame::new(CID_SIGNALLING, payload));
+                let rec = &mut self.outbound[pos];
+                rec.ident = ident;
+                rec.local_cid = local_cid;
+                rec.state = OutboundState::RequestSent;
+            }
+            OutboundKind::Rfcomm { .. } => {
+                self.advance_outbound_rfcomm(pos, conn_idx);
+            }
+        }
+    }
+
+    /// RFCOMM leg of [`Self::advance_outbound`]: reuse a live mux
+    /// channel on this link when one exists (SABM on DLCI 0), or
+    /// open the mux (BR/EDR Connection Request to PSM 0x0003)
+    /// first and SABM once it opens.
+    fn advance_outbound_rfcomm(&mut self, pos: usize, conn_idx: usize) {
+        let handle = self.connections[conn_idx].handle;
+        let le = self.connections[conn_idx].le;
+        let mux = self.connections[conn_idx]
+            .channels
+            .iter()
+            .find_map(|c| match c {
+                Channel::BrEdr(ch)
+                    if ch.psm == l2cap::PSM_RFCOMM
+                        && matches!(ch.service, ChannelService::Rfcomm(_)) =>
+                {
+                    Some((ch.local_cid, ch.peer_cid))
+                }
+                _ => None,
+            });
+        match mux {
+            Some((local_cid, peer_cid)) => {
+                // Initiator SABM on DLCI 0 (C/R=1, TS 07.10 §5.1.1).
+                let frame = crate::rfcomm::Frame::sabm(0, true);
+                self.queue_frame(handle, le, &BFrame::new(peer_cid, frame.encode()));
+                let rec = &mut self.outbound[pos];
+                rec.local_cid = local_cid;
+                rec.peer_cid = peer_cid;
+                rec.state = OutboundState::MuxSabmSent;
+            }
+            None => {
+                let Some(local_cid) = self.connections[conn_idx].cid_alloc.alloc_bredr() else {
+                    self.outbound[pos].state = OutboundState::Failed;
+                    return;
+                };
+                if self.connections[conn_idx].channel_pos(local_cid).is_some() {
+                    self.outbound[pos].state = OutboundState::Failed;
+                    return;
+                }
+                let ident = self.next_signal_ident();
+                let cmd = l2cap::build_connection_request(ident, l2cap::PSM_RFCOMM, local_cid);
+                let mut payload = Vec::new();
+                cmd.encode(&mut payload);
+                self.queue_frame(handle, le, &BFrame::new(CID_SIGNALLING, payload));
+                let rec = &mut self.outbound[pos];
+                rec.ident = ident;
+                rec.local_cid = local_cid;
+                rec.state = OutboundState::RequestSent;
+            }
+        }
+    }
+
+    /// Drive outbound opens waiting on the ACL link `handle` to
+    /// `peer`: a fresh link replaces any stale record for the
+    /// handle (its channel died with the old link), then
+    /// `AclPending` records for the peer send their open request.
+    fn advance_outbound_on_acl(&mut self, handle: u16, peer: [u8; 7], le: bool) {
+        for rec in self.outbound.iter_mut() {
+            if rec.handle == handle && rec.state != OutboundState::AclPending {
+                rec.state = OutboundState::Failed;
+            }
+        }
+        let mut pos = 0;
+        while pos < self.outbound.len() {
+            let (pending, is_le, rec_peer) = {
+                let rec = &self.outbound[pos];
+                (
+                    rec.state == OutboundState::AclPending,
+                    matches!(rec.kind, OutboundKind::LeCoc { .. }),
+                    rec.peer,
+                )
+            };
+            if pending && is_le == le && rec_peer == peer {
+                self.outbound[pos].handle = handle;
+                self.advance_outbound(pos);
+            }
+            pos += 1;
+        }
+    }
+
+    /// Fail every outbound open still waiting on an ACL link of
+    /// this transport: the HCI initiation was refused (Command
+    /// Status or a failed deferred issue), so no link — and no
+    /// channel request — will ever arrive for them.
+    fn fail_outbound_acl_pending(&mut self, le: bool) {
+        for rec in self.outbound.iter_mut() {
+            if rec.state == OutboundState::AclPending {
+                let is_le = matches!(rec.kind, OutboundKind::LeCoc { .. });
+                if is_le == le {
+                    rec.state = OutboundState::Failed;
+                }
+            }
+        }
+    }
+
+    /// Fail every outbound record on `handle`: the link is gone, so
+    /// a pending open can never complete and a completed one lost
+    /// its channel. The socket polls the failure once.
+    fn fail_outbound_for_handle(&mut self, handle: u16) {
+        for rec in self.outbound.iter_mut() {
+            if rec.handle == handle {
+                rec.state = OutboundState::Failed;
+            }
+        }
+    }
+
+    /// Fail an outbound open that already created its channel
+    /// (BR/EDR `Configuring`, or an RFCOMM mux open): remove the
+    /// channel, tell the peer with a Disconnection Request, and
+    /// mark the record with the terminal state.
+    fn fail_outbound_open(&mut self, pos: usize, terminal: OutboundState) {
+        let (handle, local_cid, peer_cid) = {
+            let rec = &self.outbound[pos];
+            (rec.handle, rec.local_cid, rec.peer_cid)
+        };
+        let le = self
+            .connections
+            .iter()
+            .find(|c| c.handle == handle)
+            .map(|c| c.le);
+        if local_cid != 0 {
+            if let Some(conn_idx) = self.connections.iter().position(|c| c.handle == handle) {
+                if let Some(ch_pos) = self.connections[conn_idx].channel_pos(local_cid) {
+                    self.connections[conn_idx].channels.remove(ch_pos);
+                }
+            }
+            self.release_claims(handle, local_cid);
+            if peer_cid != 0 {
+                if let Some(le) = le {
+                    let cmd = l2cap::build_disconnection_request(0, peer_cid, local_cid);
+                    let mut payload = Vec::new();
+                    cmd.encode(&mut payload);
+                    self.queue_frame(handle, le, &BFrame::new(CID_SIGNALLING, payload));
+                }
+            }
+        }
+        self.outbound[pos].state = terminal;
+    }
+
+    /// Answer one LE Credit-Based Connection Response (§4.23) to our
+    /// request: success creates the channel (claimed for the
+    /// connecting socket); any other result is the peer's refusal.
+    fn answer_le_coc_response(&mut self, conn_idx: usize, cmd: &l2cap::SignallingCommand) {
+        let handle = self.connections[conn_idx].handle;
+        let Some(pos) = self.outbound.iter().position(|o| {
+            o.handle == handle
+                && o.ident == cmd.identifier
+                && o.state == OutboundState::RequestSent
+                && matches!(o.kind, OutboundKind::LeCoc { .. })
+        }) else {
+            return;
+        };
+        // §4.23 response: Dest_CID + Source_CID + Result + MTU +
+        // MPS + Initial_Credits = 12 bytes.
+        let (dest_cid, source_cid, result, mtu, mps, credits) = if cmd.data.len() >= 12 {
+            (
+                u16::from_le_bytes([cmd.data[0], cmd.data[1]]),
+                u16::from_le_bytes([cmd.data[2], cmd.data[3]]),
+                u16::from_le_bytes([cmd.data[4], cmd.data[5]]),
+                u16::from_le_bytes([cmd.data[6], cmd.data[7]]),
+                u16::from_le_bytes([cmd.data[8], cmd.data[9]]),
+                u16::from_le_bytes([cmd.data[10], cmd.data[11]]),
+            )
+        } else {
+            self.outbound[pos].state = OutboundState::Failed;
+            return;
+        };
+        let (kind, local_cid) = {
+            let rec = &self.outbound[pos];
+            (rec.kind, rec.local_cid)
+        };
+        let OutboundKind::LeCoc { psm } = kind else {
+            self.outbound[pos].state = OutboundState::Failed;
+            return;
+        };
+        // The response echoes our Source_CID; a mismatch is not
+        // our open.
+        if source_cid != local_cid {
+            self.outbound[pos].state = OutboundState::Failed;
+            return;
+        }
+        if result != l2cap::LE_COC_RESULT_SUCCESS {
+            self.outbound[pos].state = OutboundState::Refused(result);
+            return;
+        }
+        // A success with unusable parameters cannot carry data.
+        if mtu == 0 || mps == 0 {
+            self.outbound[pos].state = OutboundState::Failed;
+            return;
+        }
+        self.connections[conn_idx]
+            .channels
+            .push(Channel::Le(LeCocChannel::new(
+                local_cid, dest_cid, psm, mtu, mps, credits,
+            )));
+        // The channel is the connecting socket's from here: claim
+        // it so accept can never steal it, and wake parked waiters.
+        self.claimed.push((handle, local_cid, 0));
+        let rec = &mut self.outbound[pos];
+        rec.peer_cid = dest_cid;
+        rec.state = OutboundState::Open;
+        narf_filesystem::bluetooth::publish_bt_channel_event();
+    }
+
+    /// Answer one BR/EDR Connection Response (§4.3) to our
+    /// request. Result 1 (pending) is not terminal — a second
+    /// response with the same identifier follows. On success a
+    /// plain channel goes to configuration, while an RFCOMM mux
+    /// open goes straight to SABM on DLCI 0.
+    fn answer_bredr_conn_response(&mut self, conn_idx: usize, cmd: &l2cap::SignallingCommand) {
+        let handle = self.connections[conn_idx].handle;
+        let Some(pos) = self.outbound.iter().position(|o| {
+            o.handle == handle
+                && o.ident == cmd.identifier
+                && o.state == OutboundState::RequestSent
+                && matches!(
+                    o.kind,
+                    OutboundKind::BrEdr { .. } | OutboundKind::Rfcomm { .. }
+                )
+        }) else {
+            return;
+        };
+        // §4.3 response: Dest_CID + Source_CID + Result + Status
+        // = 8 bytes.
+        let (dest_cid, source_cid, result) = if cmd.data.len() >= 8 {
+            (
+                u16::from_le_bytes([cmd.data[0], cmd.data[1]]),
+                u16::from_le_bytes([cmd.data[2], cmd.data[3]]),
+                u16::from_le_bytes([cmd.data[4], cmd.data[5]]),
+            )
+        } else {
+            self.outbound[pos].state = OutboundState::Failed;
+            return;
+        };
+        let (kind, local_cid) = {
+            let rec = &self.outbound[pos];
+            (rec.kind, rec.local_cid)
+        };
+        if source_cid != local_cid {
+            self.outbound[pos].state = OutboundState::Failed;
+            return;
+        }
+        if result == l2cap::CONN_RESULT_PENDING {
+            return;
+        }
+        if result != l2cap::CONN_RESULT_SUCCESS {
+            self.outbound[pos].state = OutboundState::Refused(result);
+            return;
+        }
+        let le = self.connections[conn_idx].le;
+        match kind {
+            OutboundKind::BrEdr { psm } => {
+                self.connections[conn_idx]
+                    .channels
+                    .push(Channel::BrEdr(BrEdrChannel::new(
+                        local_cid,
+                        dest_cid,
+                        psm,
+                        ServerKind::Generic,
+                    )));
+                // Configuration follows the connection (§4.4): the
+                // channel opens once the peer accepts it.
+                let ident2 = self.next_signal_ident();
+                let cmd = l2cap::build_configure_request(ident2, dest_cid, false, &[]);
+                let mut payload = Vec::new();
+                cmd.encode(&mut payload);
+                self.queue_frame(handle, le, &BFrame::new(CID_SIGNALLING, payload));
+                let rec = &mut self.outbound[pos];
+                rec.peer_cid = dest_cid;
+                rec.ident2 = ident2;
+                rec.state = OutboundState::Configuring;
+            }
+            OutboundKind::Rfcomm { .. } => {
+                self.connections[conn_idx]
+                    .channels
+                    .push(Channel::BrEdr(BrEdrChannel::new(
+                        local_cid,
+                        dest_cid,
+                        l2cap::PSM_RFCOMM,
+                        ServerKind::Rfcomm,
+                    )));
+                // The mux is open: SABM on DLCI 0 (initiator,
+                // C/R=1) starts the RFCOMM session.
+                let frame = crate::rfcomm::Frame::sabm(0, true);
+                self.queue_frame(handle, le, &BFrame::new(dest_cid, frame.encode()));
+                let rec = &mut self.outbound[pos];
+                rec.peer_cid = dest_cid;
+                rec.state = OutboundState::MuxSabmSent;
+            }
+            OutboundKind::LeCoc { .. } => {
+                self.outbound[pos].state = OutboundState::Failed;
+            }
+        }
+    }
+
+    /// Answer one BR/EDR Configure Response (§4.5) to our
+    /// Configure Request: success opens the channel (claimed for
+    /// the connecting socket); a refusal tears the channel down
+    /// and reports the peer's result code.
+    fn answer_bredr_config_response(&mut self, conn_idx: usize, cmd: &l2cap::SignallingCommand) {
+        let handle = self.connections[conn_idx].handle;
+        let Some(pos) = self.outbound.iter().position(|o| {
+            o.handle == handle
+                && o.ident2 == cmd.identifier
+                && o.state == OutboundState::Configuring
+                && matches!(o.kind, OutboundKind::BrEdr { .. })
+        }) else {
+            return;
+        };
+        // §4.5 response: Source_CID(2) Flags(2) Result(2). The
+        // source is the CID the request named — the peer's CID.
+        let (source_cid, result) = if cmd.data.len() >= 6 {
+            (
+                u16::from_le_bytes([cmd.data[0], cmd.data[1]]),
+                u16::from_le_bytes([cmd.data[4], cmd.data[5]]),
+            )
+        } else {
+            self.fail_outbound_open(pos, OutboundState::Failed);
+            return;
+        };
+        let (local_cid, peer_cid) = {
+            let rec = &self.outbound[pos];
+            (rec.local_cid, rec.peer_cid)
+        };
+        if source_cid != peer_cid {
+            self.fail_outbound_open(pos, OutboundState::Failed);
+            return;
+        }
+        if result != 0 {
+            self.fail_outbound_open(pos, OutboundState::Refused(result));
+            return;
+        }
+        if let Some(ch_pos) = self.connections[conn_idx].channel_pos(local_cid) {
+            if let Channel::BrEdr(ch) = &mut self.connections[conn_idx].channels[ch_pos] {
+                ch.configured = true;
+            }
+        }
+        self.claimed.push((handle, local_cid, 0));
+        self.outbound[pos].state = OutboundState::Open;
+        narf_filesystem::bluetooth::publish_bt_channel_event();
+    }
+
+    /// Drive one intercepted RFCOMM UA/DM (#1532): the peer's
+    /// answer to our SABM. UA on DLCI 0 opens the mux and sends
+    /// the DLC SABM; UA on the target DLCI opens the DLC; DM
+    /// refuses either leg.
+    fn answer_outbound_rfcomm_frame(&mut self, handle: u16, le: bool, fr: crate::rfcomm::Frame) {
+        use crate::rfcomm::{FRAME_DM, FRAME_UA};
+        let Some(pos) = self.outbound.iter().position(|o| {
+            o.handle == handle
+                && match o.state {
+                    OutboundState::MuxSabmSent => fr.dlci == 0,
+                    OutboundState::DlcSabmSent => fr.dlci == o.dlci,
+                    _ => false,
+                }
+        }) else {
+            return;
+        };
+        let (state, kind, local_cid, peer_cid) = {
+            let rec = &self.outbound[pos];
+            (rec.state, rec.kind, rec.local_cid, rec.peer_cid)
+        };
+        match (state, fr.frame_type) {
+            (OutboundState::MuxSabmSent, FRAME_UA) => {
+                let OutboundKind::Rfcomm { channel } = kind else {
+                    self.outbound[pos].state = OutboundState::Failed;
+                    return;
+                };
+                // Mark the mux open in the session, then SABM the
+                // target DLCI (initiator DLCI 2*channel+1, C/R=1).
+                if let Some(conn_idx) = self.connections.iter().position(|c| c.handle == handle) {
+                    if let Some(ch_pos) = self.connections[conn_idx].channel_pos(local_cid) {
+                        if let Channel::BrEdr(ch) = &mut self.connections[conn_idx].channels[ch_pos]
+                        {
+                            if let ChannelService::Rfcomm(session) = &mut ch.service {
+                                session.mux_opened();
+                            }
+                        }
+                    }
+                }
+                let dlci = 2 * channel + 1;
+                let sabm = crate::rfcomm::Frame::sabm(dlci, true);
+                self.queue_frame(handle, le, &BFrame::new(peer_cid, sabm.encode()));
+                let rec = &mut self.outbound[pos];
+                rec.dlci = dlci;
+                rec.state = OutboundState::DlcSabmSent;
+            }
+            (OutboundState::MuxSabmSent, FRAME_DM) => {
+                self.outbound[pos].state = OutboundState::Failed;
+            }
+            (OutboundState::DlcSabmSent, FRAME_UA) => {
+                if let Some(conn_idx) = self.connections.iter().position(|c| c.handle == handle) {
+                    if let Some(ch_pos) = self.connections[conn_idx].channel_pos(local_cid) {
+                        if let Channel::BrEdr(ch) = &mut self.connections[conn_idx].channels[ch_pos]
+                        {
+                            if let ChannelService::Rfcomm(session) = &mut ch.service {
+                                session.dlc_opened(fr.dlci);
+                            }
+                        }
+                    }
+                }
+                self.claimed.push((handle, local_cid, fr.dlci));
+                self.outbound[pos].state = OutboundState::Open;
+                narf_filesystem::bluetooth::publish_bt_channel_event();
+            }
+            (OutboundState::DlcSabmSent, FRAME_DM) => {
+                self.outbound[pos].state = OutboundState::Failed;
+            }
+            _ => {}
         }
     }
 
@@ -1298,6 +2083,9 @@ impl PumpCore {
             self.central.note_connecting();
         } else {
             self.central.phase = CentralPhase::Idle;
+            // The deferred create never went out: any outbound
+            // open waiting on it can never complete.
+            self.fail_outbound_acl_pending(true);
         }
     }
 
@@ -1355,6 +2143,9 @@ impl PumpCore {
             op::HCI_LE_CREATE_CONNECTION | op::HCI_LE_EXTENDED_CREATE_CONNECTION => {
                 if self.central.phase == CentralPhase::Connecting && status != 0 {
                     self.central.phase = CentralPhase::Idle;
+                    // The controller refused the create: the link
+                    // — and any outbound open waiting on it — is dead.
+                    self.fail_outbound_acl_pending(true);
                 }
             }
             _ => {}
@@ -2126,6 +2917,9 @@ impl PumpCore {
             op::HCI_CREATE_CONNECTION => {
                 if self.classic.phase == ClassicPhase::Paging && status != 0 {
                     self.classic.note_idle();
+                    // The controller refused the page: the link —
+                    // and any outbound open waiting on it — is dead.
+                    self.fail_outbound_acl_pending(false);
                 }
             }
             op::HCI_WRITE_SCAN_ENABLE => {
@@ -2473,6 +3267,12 @@ impl PumpCore {
                 }
             }
             self.sysfs_track_connect(handle, true, &peer);
+            // An outbound open waiting on this link sends its
+            // channel-open request now (#1532).
+            self.advance_outbound_on_acl(handle, peer, true);
+        } else if central_completed {
+            // The central initiation failed: no link, no channel open.
+            self.fail_outbound_acl_pending(true);
         }
     }
 
@@ -2717,9 +3517,18 @@ impl PumpCore {
                         (0, Some(page)) => {
                             if self.issue_page(page).is_err() {
                                 self.classic.note_idle();
+                                // The deferred page never went out:
+                                // any outbound open waiting on it
+                                // can never complete.
+                                self.fail_outbound_acl_pending(false);
                             }
                         }
-                        _ => self.classic.note_idle(),
+                        _ => {
+                            self.classic.note_idle();
+                            // The deferred page was dropped with the
+                            // failed inquiry cancel/complete.
+                            self.fail_outbound_acl_pending(false);
+                        }
                     },
                     ClassicPhase::Inquiring => self.classic.note_idle(),
                     _ => {}
@@ -2749,12 +3558,22 @@ impl PumpCore {
                         self.connections
                             .push(Connection::new(cc.handle, false, peer));
                         self.sysfs_track_connect(cc.handle, false, &peer);
+                        // An outbound open waiting on this link
+                        // sends its channel-open request now (#1532).
+                        self.advance_outbound_on_acl(cc.handle, peer, false);
+                    } else if classic_completed {
+                        // The page failed: no link, no channel open.
+                        self.fail_outbound_acl_pending(false);
                     }
                 }
             }
             code if code == EventCode::DisconnectionComplete as u8 => {
                 if let Some(dc) = DisconnectionComplete::parse(event) {
                     self.release_handle_claims(dc.handle);
+                    // A pending outbound open on this link can never
+                    // complete, and a completed one lost its
+                    // channel (#1532).
+                    self.fail_outbound_for_handle(dc.handle);
                     // A mgmt-initiated pairing dies with the link:
                     // complete it as DISCONNECTED before the
                     // connection (and its session) is dropped
@@ -3090,6 +3909,49 @@ impl PumpCore {
         // may be waiting on: the pump publishes a channel event so
         // parked poll/accept waiters re-run their readiness scan.
         let mut staged = false;
+        // RFCOMM initiator interception (#1532): decode the payload
+        // once, before the session borrow, and pull out any UA/DM
+        // answering our SABM — the responder feed would swallow
+        // them, and the outbound state machine needs them. The feed
+        // loop below reuses the decoded remainder.
+        let is_rfcomm = matches!(
+            &self.connections[conn_idx].channels[pos],
+            Channel::BrEdr(ch) if matches!(ch.service, ChannelService::Rfcomm(_))
+        );
+        let mut rfcomm_frames: Vec<crate::rfcomm::Frame> = Vec::new();
+        let mut intercepted: Vec<crate::rfcomm::Frame> = Vec::new();
+        if is_rfcomm {
+            let mut buf = &frame.payload[..];
+            while !buf.is_empty() {
+                match crate::rfcomm::Frame::decode(buf) {
+                    Ok((decoded, n)) => {
+                        buf = &buf[n..];
+                        // A UA/DM for a DLCI our outbound SABM
+                        // named is the peer's answer to us, not
+                        // responder traffic: intercept it.
+                        let ours = (decoded.frame_type == crate::rfcomm::FRAME_UA
+                            || decoded.frame_type == crate::rfcomm::FRAME_DM)
+                            && self.outbound.iter().any(|o| {
+                                o.handle == handle
+                                    && o.local_cid == frame.cid
+                                    && match o.state {
+                                        OutboundState::MuxSabmSent => decoded.dlci == 0,
+                                        OutboundState::DlcSabmSent => decoded.dlci == o.dlci,
+                                        _ => false,
+                                    }
+                            });
+                        if ours {
+                            intercepted.push(decoded);
+                        } else {
+                            rfcomm_frames.push(decoded);
+                        }
+                    }
+                    // Corrupt tail: drop the rest of this B-frame's
+                    // payload.
+                    Err(_) => break,
+                }
+            }
+        }
         {
             let conn = &mut self.connections[conn_idx];
             match &mut conn.channels[pos] {
@@ -3104,17 +3966,8 @@ impl PumpCore {
                 }
                 Channel::BrEdr(ch) => match &mut ch.service {
                     ChannelService::Rfcomm(session) => {
-                        let mut buf = &frame.payload[..];
-                        while !buf.is_empty() {
-                            match crate::rfcomm::Frame::decode(buf) {
-                                Ok((decoded, n)) => {
-                                    responses.extend(session.feed(&decoded));
-                                    buf = &buf[n..];
-                                }
-                                // Corrupt tail: drop the rest of
-                                // this B-frame's payload.
-                                Err(_) => break,
-                            }
+                        for decoded in &rfcomm_frames {
+                            responses.extend(session.feed(decoded));
                         }
                         // A fed frame may have opened a DLC (accept
                         // wake) or staged UIH data (recv wake); the
@@ -3162,6 +4015,11 @@ impl PumpCore {
         }
         for rsp in responses {
             self.queue_frame(handle, le, &BFrame::new(frame.cid, rsp.encode()));
+        }
+        // Intercepted RFCOMM answers to our SABM (#1532): drive the
+        // outbound state machine now that the session borrow ended.
+        for fr in intercepted {
+            self.answer_outbound_rfcomm_frame(handle, le, fr);
         }
     }
 
@@ -3384,6 +4242,28 @@ impl PumpCore {
             }
             Some(SignallingCode::LeCreditBasedConnectionRequest) => {
                 self.answer_le_coc_request(conn_idx, cmd, out);
+            }
+            Some(SignallingCode::LeCreditBasedConnectionResponse) => {
+                // Our outbound CoC request's answer (#1532); an
+                // unmatched response is ignored, never answered.
+                self.answer_le_coc_response(conn_idx, cmd);
+            }
+            Some(SignallingCode::ConnectionParameterUpdateResponse) => {
+                // We never send update requests; ignore.
+            }
+            Some(SignallingCode::CommandReject) => {
+                // A rejected outbound request fails the open; any
+                // other reject is ignored (never answer a response
+                // with a reject).
+                let handle = self.connections[conn_idx].handle;
+                if let Some(pos) = self.outbound.iter().position(|o| {
+                    o.handle == handle
+                        && o.ident == cmd.identifier
+                        && o.state == OutboundState::RequestSent
+                        && matches!(o.kind, OutboundKind::LeCoc { .. })
+                }) {
+                    self.outbound[pos].state = OutboundState::Failed;
+                }
             }
             Some(SignallingCode::FlowControlCredit) => {
                 if cmd.data.len() >= 4 {
@@ -3643,6 +4523,37 @@ impl PumpCore {
                             .encode(out);
                         }
                     },
+                }
+            }
+            Some(SignallingCode::ConnectionResponse) => {
+                // Our outbound Connection Request's answer (#1532);
+                // an unmatched response is ignored, never answered.
+                self.answer_bredr_conn_response(conn_idx, cmd);
+            }
+            Some(SignallingCode::ConfigureResponse) => {
+                // Our outbound Configure Request's answer (#1532);
+                // an unmatched response is ignored, never answered.
+                self.answer_bredr_config_response(conn_idx, cmd);
+            }
+            Some(SignallingCode::CommandReject) => {
+                // A rejected outbound request (or configure) fails
+                // the open and tears its channel down; any other
+                // reject is ignored (never answer a response with
+                // a reject).
+                let handle = self.connections[conn_idx].handle;
+                if let Some(pos) = self.outbound.iter().position(|o| {
+                    o.handle == handle
+                        && (o.ident == cmd.identifier || o.ident2 == cmd.identifier)
+                        && matches!(
+                            o.state,
+                            OutboundState::RequestSent | OutboundState::Configuring
+                        )
+                        && matches!(
+                            o.kind,
+                            OutboundKind::BrEdr { .. } | OutboundKind::Rfcomm { .. }
+                        )
+                }) {
+                    self.fail_outbound_open(pos, OutboundState::Failed);
                 }
             }
             Some(SignallingCode::ConfigureRequest) => {
@@ -4077,6 +4988,56 @@ pub fn drain_rfcomm_rx(dev: u16, handle: u16, cid: u16, dlci: u8) -> Option<Vec<
     let mut pumps = PUMPS.lock();
     let slot = find_slot_mut(&mut pumps, dev as usize)?;
     slot.core.as_mut()?.drain_rfcomm_rx(handle, cid, dlci)
+}
+
+// ── AF_BLUETOOTH outbound-connect API (issue #1532) ─────────────────
+//
+// The socket layer's `connect()` reaches the pump's outbound client
+// through these, via the filesystem broker. `psm` is the LE/BR-EDR
+// PSM, or the RFCOMM server channel when `rfcomm` is true.
+
+/// Start (or poll) an outbound L2CAP/RFCOMM channel open on
+/// controller `dev`. See [`PumpCore::connect_outbound`]. `NoPump`
+/// when no pump is registered for the controller; a core busy with
+/// a pump step reports `Busy`.
+pub fn connect(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> BtConnectStatus {
+    if !pump_registered(dev) {
+        return BtConnectStatus::NoPump;
+    }
+    with_core(dev as usize, |core| {
+        core.connect_outbound(peer, psm, le, rfcomm)
+    })
+    .unwrap_or(BtConnectStatus::Busy)
+}
+
+/// Whether an outbound open to `peer` has completed and is ready
+/// to take (non-consuming peek for poll writability).
+pub fn connect_ready(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool {
+    let pumps = PUMPS.lock();
+    let Some(slot) = pumps.iter().find(|s| s.index == dev as usize) else {
+        return false;
+    };
+    slot.core
+        .as_ref()
+        .map(|c| c.connect_outbound_ready(peer, psm, le, rfcomm))
+        .unwrap_or(false)
+}
+
+/// Abandon an in-flight outbound open to `peer` (socket close).
+/// See [`PumpCore::cancel_outbound`].
+pub fn cancel_connect(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool {
+    with_core(dev as usize, |core| {
+        core.cancel_outbound(peer, psm, le, rfcomm)
+    })
+    .unwrap_or(false)
+}
+
+/// Whether a pump slot is registered for controller `dev` (a slot
+/// with its core temporarily taken out by a pump step still
+/// counts — it is registered, just busy).
+fn pump_registered(dev: u16) -> bool {
+    let pumps = PUMPS.lock();
+    pumps.iter().any(|s| s.index == dev as usize)
 }
 
 /// Cumulative pump statistics for controller `index`.
@@ -7263,6 +8224,805 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_bt_socket_le_coc_path);
+
+    /// #1532: outbound LE CoC connect — HCI create, CoC Request,
+    /// peer response, data round-trip, disconnect — against the
+    /// scripted-controller harness. Fixture PSM 0x0080 is an
+    /// arbitrary value, not an assigned SPSM.
+    fn smoke_pump_bt_connect_le_coc() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0040;
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut peer = [0u8; 7];
+        peer[0] = 1; // LE public
+        peer[1..7].copy_from_slice(&peer6);
+        // Start: LE_Create_Connection goes out, open is pending.
+        if connect(0, peer, 0x0080, true, false) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("first connect should report Pending");
+        }
+        if !fake.sent_opcodes().contains(&op::HCI_LE_CREATE_CONNECTION) {
+            reset_all();
+            return TestResult::Fail("LE_Create_Connection not issued");
+        }
+        // Command Status (accepted) + LE Connection Complete
+        // (central role).
+        fake.enqueue_event(cs(op::HCI_LE_CREATE_CONNECTION, 0x00));
+        fake.enqueue_event(le_connection_complete_central(handle, peer6));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("LE connection not tracked");
+        }
+        // Exact CoC Request bytes: code 0x14, id 0x01, len 10, PSM
+        // 0x0080, source CID 0x0040 (first LE alloc), MTU 1024,
+        // MPS 256, 16 initial credits.
+        let expected_req: Vec<u8> = alloc::vec![
+            0x14, 0x01, 0x0A, 0x00, 0x80, 0x00, 0x40, 0x00, 0x00, 0x04, 0x00, 0x01, 0x10, 0x00,
+        ];
+        let frames = fake.sent_acl_frames();
+        let req_ok = frames
+            .iter()
+            .any(|(_, f)| f.cid == CID_LE_SIGNALLING && f.payload == expected_req);
+        if !req_ok {
+            reset_all();
+            return TestResult::Fail("LE CoC request bytes mismatch");
+        }
+        // Still pending until the peer answers.
+        if connect(0, peer, 0x0080, true, false) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("connect should stay Pending before the response");
+        }
+        // Peer answers: success, peer CID 0x0041, MTU 1024, MPS
+        // 256, 8 credits.
+        let rsp =
+            l2cap::build_le_credit_based_connection_response(0x01, 0x0040, 0x0041, 0, 1024, 256, 8);
+        let mut payload = Vec::new();
+        rsp.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_LE_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        if !connect_ready(0, peer, 0x0080, true, false) {
+            reset_all();
+            return TestResult::Fail("completed open should read ready");
+        }
+        match connect(0, peer, 0x0080, true, false) {
+            BtConnectStatus::Open((h, local, peer_cid, addr)) => {
+                if h != handle || local != 0x0040 || peer_cid != 0x0041 || addr != peer {
+                    reset_all();
+                    return TestResult::Fail("opened channel handle/CID/peer mismatch");
+                }
+            }
+            _ => {
+                reset_all();
+                return TestResult::Fail("connect should report Open after the response");
+            }
+        }
+        // The open is consumed: the readiness peek clears.
+        if connect_ready(0, peer, 0x0080, true, false) {
+            reset_all();
+            return TestResult::Fail("taken open must not read ready again");
+        }
+        // Socket send: one K-frame ("pong" + length prefix) on the
+        // peer CID 0x0041, credits deducted (8 granted - 1 spent).
+        match send_channel(0, handle, 0x0040, b"pong") {
+            Ok(4) => {}
+            _ => {
+                reset_all();
+                return TestResult::Fail("LE COC send should report 4 bytes");
+            }
+        }
+        let frames = fake.sent_acl_frames();
+        let send_ok = frames.iter().any(|(h, f)| {
+            *h == handle
+                && f.cid == 0x0041
+                && f.payload == alloc::vec![0x04, 0x00, b'p', b'o', b'n', b'g']
+        });
+        if !send_ok {
+            reset_all();
+            return TestResult::Fail("LE COC send K-frame missing from the wire");
+        }
+        // Peer data: single-K-frame SDU "hi" on our local CID.
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, alloc::vec![0x02, 0x00, b'h', b'i']),
+        ));
+        let _ = pump_once(0);
+        if drain_channel_rx(0, handle, 0x0040) != Some(alloc::vec![alloc::vec![b'h', b'i']]) {
+            reset_all();
+            return TestResult::Fail("LE COC SDU not staged for the socket");
+        }
+        // Socket close: Disconnection Request on LE signalling,
+        // then the channel is gone for good.
+        if !disconnect_channel(0, handle, 0x0040) {
+            reset_all();
+            return TestResult::Fail("disconnect should tear the channel down");
+        }
+        let frames = fake.sent_acl_frames();
+        let disc_ok = frames.iter().any(|(_, f)| {
+            f.cid == CID_LE_SIGNALLING
+                && f.payload == alloc::vec![0x06, 0x00, 0x04, 0x00, 0x41, 0x00, 0x40, 0x00]
+        });
+        if !disc_ok {
+            reset_all();
+            return TestResult::Fail("disconnect request missing from the wire");
+        }
+        if drain_channel_rx(0, handle, 0x0040).is_some() {
+            reset_all();
+            return TestResult::Fail("disconnected channel must be gone");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_bt_connect_le_coc);
+
+    /// #1532: outbound LE CoC connect against a link that already
+    /// exists (peripheral-role ACL) — no HCI create is issued and
+    /// the CoC Request goes out on the first call.
+    fn smoke_pump_bt_connect_le_coc_existing_acl() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0040;
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut peer = [0u8; 7];
+        peer[0] = 1;
+        peer[1..7].copy_from_slice(&peer6);
+        // Peripheral-role link already up (peer connected to us).
+        fake.enqueue_event(le_connection_complete(handle, peer6));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("LE connection not tracked");
+        }
+        if connect(0, peer, 0x0080, true, false) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("connect on a live ACL should report Pending");
+        }
+        // No HCI create: the link already exists.
+        if fake.sent_opcodes().contains(&op::HCI_LE_CREATE_CONNECTION) {
+            reset_all();
+            return TestResult::Fail("connect on a live ACL must not create a link");
+        }
+        // The CoC Request went out synchronously with the call
+        // (queue_frame + the pump's own flush in send paths is not
+        // involved — check via a pump step's flush).
+        let _ = pump_once(0);
+        let frames = fake.sent_acl_frames();
+        let req_ok = frames
+            .iter()
+            .any(|(_, f)| f.cid == CID_LE_SIGNALLING && f.payload.first() == Some(&0x14));
+        if !req_ok {
+            reset_all();
+            return TestResult::Fail("CoC Request missing on a live ACL");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_bt_connect_le_coc_existing_acl);
+
+    /// #1532: outbound LE CoC refusal + link failure. A peer
+    /// refusal carries its §4.23 result code; a failed HCI link
+    /// reports Failed.
+    fn smoke_pump_bt_connect_le_coc_refused_and_failed() -> TestResult {
+        // Refusal: peer answers PSM-not-supported (0x0002).
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0040;
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut peer = [0u8; 7];
+        peer[0] = 1;
+        peer[1..7].copy_from_slice(&peer6);
+        if connect(0, peer, 0x0080, true, false) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("first connect should report Pending");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_CREATE_CONNECTION, 0x00));
+        fake.enqueue_event(le_connection_complete_central(handle, peer6));
+        let _ = pump_once(0);
+        let rsp = l2cap::build_le_credit_based_connection_response(
+            0x01,
+            0,
+            0x0040,
+            l2cap::LE_COC_RESULT_PSM_NOT_SUPPORTED,
+            0,
+            0,
+            0,
+        );
+        let mut payload = Vec::new();
+        rsp.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_LE_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        if connect(0, peer, 0x0080, true, false)
+            != BtConnectStatus::Refused(l2cap::LE_COC_RESULT_PSM_NOT_SUPPORTED)
+        {
+            reset_all();
+            return TestResult::Fail("refused CoC should report Refused(0x0002)");
+        }
+        // Link failure: the create completes with status 0x3C
+        // (Connection Failed to be Established).
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        if connect(0, peer, 0x0080, true, false) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("first connect should report Pending");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_CREATE_CONNECTION, 0x00));
+        let mut params = alloc::vec![0x01, 0x3C];
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.push(0x00); // role: Central
+        params.push(0x00); // peer address type: public
+        params.extend_from_slice(&peer6);
+        params.extend_from_slice(&0x0028u16.to_le_bytes());
+        params.extend_from_slice(&0u16.to_le_bytes());
+        params.extend_from_slice(&0x01F4u16.to_le_bytes());
+        params.push(0x00);
+        fake.enqueue_event(Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        });
+        let _ = pump_once(0);
+        if connect(0, peer, 0x0080, true, false) != BtConnectStatus::Failed {
+            reset_all();
+            return TestResult::Fail("failed LE link should report Failed");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_bt_connect_le_coc_refused_and_failed
+    );
+
+    /// #1532: cancelling an in-flight LE connect drops the record
+    /// — the link still comes up, but no CoC Request is ever sent
+    /// on it.
+    fn smoke_pump_bt_connect_cancel() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0040;
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut peer = [0u8; 7];
+        peer[0] = 1;
+        peer[1..7].copy_from_slice(&peer6);
+        if connect(0, peer, 0x0080, true, false) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("first connect should report Pending");
+        }
+        if !cancel_connect(0, peer, 0x0080, true, false) {
+            reset_all();
+            return TestResult::Fail("cancel should drop the in-flight open");
+        }
+        if cancel_connect(0, peer, 0x0080, true, false) {
+            reset_all();
+            return TestResult::Fail("second cancel should find nothing in flight");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_CREATE_CONNECTION, 0x00));
+        fake.enqueue_event(le_connection_complete_central(handle, peer6));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("LE connection not tracked");
+        }
+        let frames = fake.sent_acl_frames();
+        if frames.iter().any(|(_, f)| f.cid == CID_LE_SIGNALLING) {
+            reset_all();
+            return TestResult::Fail("cancelled connect must send no CoC Request");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_bt_connect_cancel);
+
+    /// #1532: outbound BR/EDR connect — inquiry, page, Connection
+    /// Request (with a pending-then-success response), Configure
+    /// Request/Response, data round-trip, disconnect — against the
+    /// scripted-controller harness. Fixture PSM 0x1001 is an
+    /// arbitrary dynamic PSM (odd, >= 0x1001).
+    fn smoke_pump_bt_connect_bredr() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0040;
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut peer = [0u8; 7];
+        peer[0] = 0; // BR/EDR public
+        peer[1..7].copy_from_slice(&peer6);
+        // Undiscovered peer: no paging parameters, honest refusal.
+        if connect(0, peer, 0x1001, false, false) != BtConnectStatus::UnknownPeer {
+            reset_all();
+            return TestResult::Fail("undiscovered BR/EDR peer should report UnknownPeer");
+        }
+        // Discover the peer: GIAC inquiry, one result, complete.
+        if classic_start_inquiry(0, [0x33, 0x8B, 0x9E], 8, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("inquiry start failed");
+        }
+        fake.enqueue_event(inquiry_result_event(peer6, 1, [0x04, 0x0C, 0x02], 0x1234));
+        let _ = pump_once(0);
+        fake.enqueue_event(inquiry_complete_event(0));
+        let _ = pump_once(0);
+        // Start: HCI_Create_Connection goes out, open is pending.
+        if connect(0, peer, 0x1001, false, false) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("first connect should report Pending");
+        }
+        if !fake.sent_opcodes().contains(&op::HCI_CREATE_CONNECTION) {
+            reset_all();
+            return TestResult::Fail("HCI_Create_Connection not issued");
+        }
+        fake.enqueue_event(cs(op::HCI_CREATE_CONNECTION, 0x00));
+        fake.enqueue_event(classic_connection_complete(handle, peer6));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("BR/EDR connection not tracked");
+        }
+        // Exact Connection Request bytes: code 0x02, id 0x01, len
+        // 4, PSM 0x1001, source CID 0x0040 (first BR/EDR alloc).
+        let expected_req: Vec<u8> = alloc::vec![0x02, 0x01, 0x04, 0x00, 0x01, 0x10, 0x40, 0x00];
+        let frames = fake.sent_acl_frames();
+        let req_ok = frames
+            .iter()
+            .any(|(_, f)| f.cid == CID_SIGNALLING && f.payload == expected_req);
+        if !req_ok {
+            reset_all();
+            return TestResult::Fail("BR/EDR Connection Request bytes mismatch");
+        }
+        // Peer answers pending first (§4.3 result 1): still
+        // pending, no Configure Request yet.
+        let pending =
+            l2cap::build_connection_response(0x01, 0x0040, 0x0041, l2cap::CONN_RESULT_PENDING, 0);
+        let mut payload = Vec::new();
+        pending.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        if connect(0, peer, 0x1001, false, false) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("pending response should keep the open Pending");
+        }
+        let frames = fake.sent_acl_frames();
+        if frames
+            .iter()
+            .any(|(_, f)| f.cid == CID_SIGNALLING && f.payload.first() == Some(&0x04))
+        {
+            reset_all();
+            return TestResult::Fail("Configure Request must wait for the final response");
+        }
+        // Final response: success, peer CID 0x0041.
+        let rsp = l2cap::build_connection_response(
+            0x01,
+            0x0040,
+            0x0041,
+            l2cap::CONN_RESULT_SUCCESS,
+            l2cap::CONN_STATUS_NO_INFORMATION,
+        );
+        let mut payload = Vec::new();
+        rsp.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        // Exact Configure Request bytes: code 0x04, id 0x02, len
+        // 4, dest CID 0x0041, flags 0, no options.
+        let expected_cfg: Vec<u8> = alloc::vec![0x04, 0x02, 0x04, 0x00, 0x41, 0x00, 0x00, 0x00];
+        let frames = fake.sent_acl_frames();
+        let cfg_ok = frames
+            .iter()
+            .any(|(_, f)| f.cid == CID_SIGNALLING && f.payload == expected_cfg);
+        if !cfg_ok {
+            reset_all();
+            return TestResult::Fail("Configure Request bytes mismatch");
+        }
+        // Still pending until the peer accepts the configuration.
+        if connect(0, peer, 0x1001, false, false) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("connect should stay Pending before Configure Response");
+        }
+        // Peer accepts: source 0x0041, flags 0, result 0.
+        let cfg_rsp = l2cap::SignallingCommand {
+            code: l2cap::SignallingCode::ConfigureResponse as u8,
+            identifier: 0x02,
+            data: alloc::vec![0x41, 0x00, 0x00, 0x00, 0x00, 0x00],
+        };
+        let mut payload = Vec::new();
+        cfg_rsp.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        match connect(0, peer, 0x1001, false, false) {
+            BtConnectStatus::Open((h, local, peer_cid, addr)) => {
+                if h != handle || local != 0x0040 || peer_cid != 0x0041 || addr != peer {
+                    reset_all();
+                    return TestResult::Fail("opened channel handle/CID/peer mismatch");
+                }
+            }
+            _ => {
+                reset_all();
+                return TestResult::Fail("connect should report Open after Configure Response");
+            }
+        }
+        // Data round-trip on the generic channel.
+        match send_channel(0, handle, 0x0040, b"ping") {
+            Ok(4) => {}
+            _ => {
+                reset_all();
+                return TestResult::Fail("BR/EDR send should report 4 bytes");
+            }
+        }
+        let frames = fake.sent_acl_frames();
+        let send_ok = frames.iter().any(|(h, f)| {
+            *h == handle && f.cid == 0x0041 && f.payload == alloc::vec![b'p', b'i', b'n', b'g']
+        });
+        if !send_ok {
+            reset_all();
+            return TestResult::Fail("BR/EDR send B-frame missing from the wire");
+        }
+        fake.enqueue_acl(acl_packet(
+            handle,
+            &BFrame::new(0x0040, alloc::vec![b'p', b'o', b'n', b'g']),
+        ));
+        let _ = pump_once(0);
+        if drain_channel_rx(0, handle, 0x0040)
+            != Some(alloc::vec![alloc::vec![b'p', b'o', b'n', b'g']])
+        {
+            reset_all();
+            return TestResult::Fail("BR/EDR SDU not staged for the socket");
+        }
+        // Socket close: Disconnection Request on signalling, then
+        // the channel is gone for good.
+        if !disconnect_channel(0, handle, 0x0040) {
+            reset_all();
+            return TestResult::Fail("disconnect should tear the channel down");
+        }
+        let frames = fake.sent_acl_frames();
+        let disc_ok = frames.iter().any(|(_, f)| {
+            f.cid == CID_SIGNALLING
+                && f.payload == alloc::vec![0x06, 0x00, 0x04, 0x00, 0x41, 0x00, 0x40, 0x00]
+        });
+        if !disc_ok {
+            reset_all();
+            return TestResult::Fail("disconnect request missing from the wire");
+        }
+        if drain_channel_rx(0, handle, 0x0040).is_some() {
+            reset_all();
+            return TestResult::Fail("disconnected channel must be gone");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_bt_connect_bredr);
+
+    /// #1532: outbound BR/EDR refusal — the peer refuses the PSM
+    /// and the open reports its §4.3 result code.
+    fn smoke_pump_bt_connect_bredr_refused() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0040;
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut peer = [0u8; 7];
+        peer[0] = 0;
+        peer[1..7].copy_from_slice(&peer6);
+        // Live ACL (peripheral-role link) so no paging is needed.
+        fake.enqueue_event(classic_connection_complete(handle, peer6));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("BR/EDR connection not tracked");
+        }
+        if connect(0, peer, 0x1001, false, false) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("connect on a live ACL should report Pending");
+        }
+        let rsp = l2cap::build_connection_response(
+            0x01,
+            0,
+            0x0040,
+            l2cap::CONN_RESULT_REFUSED_PSM_NOT_SUPPORTED,
+            l2cap::CONN_STATUS_NO_INFORMATION,
+        );
+        let mut payload = Vec::new();
+        rsp.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        if connect(0, peer, 0x1001, false, false)
+            != BtConnectStatus::Refused(l2cap::CONN_RESULT_REFUSED_PSM_NOT_SUPPORTED)
+        {
+            reset_all();
+            return TestResult::Fail("refused BR/EDR open should report Refused(0x0002)");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_bt_connect_bredr_refused);
+
+    /// #1532: outbound RFCOMM connect — page, mux open, SABM on
+    /// DLCI 0, SABM on the target DLCI, data round-trip with
+    /// initiator C/R=1, DISC — against the scripted-controller
+    /// harness. Fixture server channel 5 → DLCI 11 (2*5+1).
+    fn smoke_pump_bt_connect_rfcomm() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0040;
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut peer = [0u8; 7];
+        peer[0] = 0; // BR/EDR public
+        peer[1..7].copy_from_slice(&peer6);
+        // Discover the peer first (paging needs inquiry data).
+        if classic_start_inquiry(0, [0x33, 0x8B, 0x9E], 8, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("inquiry start failed");
+        }
+        fake.enqueue_event(inquiry_result_event(peer6, 1, [0x04, 0x0C, 0x02], 0x1234));
+        let _ = pump_once(0);
+        fake.enqueue_event(inquiry_complete_event(0));
+        let _ = pump_once(0);
+        if connect(0, peer, 5, false, true) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("first connect should report Pending");
+        }
+        fake.enqueue_event(cs(op::HCI_CREATE_CONNECTION, 0x00));
+        fake.enqueue_event(classic_connection_complete(handle, peer6));
+        let _ = pump_once(0);
+        // Exact mux Connection Request bytes: code 0x02, id 0x01,
+        // len 4, PSM 0x0003 (RFCOMM), source CID 0x0040.
+        let expected_req: Vec<u8> = alloc::vec![0x02, 0x01, 0x04, 0x00, 0x03, 0x00, 0x40, 0x00];
+        let frames = fake.sent_acl_frames();
+        let req_ok = frames
+            .iter()
+            .any(|(_, f)| f.cid == CID_SIGNALLING && f.payload == expected_req);
+        if !req_ok {
+            reset_all();
+            return TestResult::Fail("RFCOMM mux Connection Request bytes mismatch");
+        }
+        // Peer accepts the mux.
+        let rsp = l2cap::build_connection_response(
+            0x01,
+            0x0040,
+            0x0041,
+            l2cap::CONN_RESULT_SUCCESS,
+            l2cap::CONN_STATUS_NO_INFORMATION,
+        );
+        let mut payload = Vec::new();
+        rsp.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        // SABM on DLCI 0, initiator C/R=1, on the peer CID.
+        let frames = fake.sent_acl_frames();
+        let sabm0_ok = frames.iter().any(|(_, f)| {
+            f.cid == 0x0041
+                && crate::rfcomm::Frame::decode(&f.payload)
+                    .map(|(fr, _)| {
+                        fr.dlci == 0 && fr.frame_type == crate::rfcomm::FRAME_SABM && fr.cr
+                    })
+                    .unwrap_or(false)
+        });
+        if !sabm0_ok {
+            reset_all();
+            return TestResult::Fail("mux SABM(DLCI 0, C/R=1) missing from the wire");
+        }
+        if connect(0, peer, 5, false, true) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("connect should stay Pending before the mux UA");
+        }
+        // Peer answers the mux SABM with UA.
+        let ua0 = crate::rfcomm::Frame::ua(0, false);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(0x0040, ua0.encode())));
+        let _ = pump_once(0);
+        // SABM on DLCI 11 (2*5+1), initiator C/R=1.
+        let frames = fake.sent_acl_frames();
+        let sabm_ok = frames.iter().any(|(_, f)| {
+            f.cid == 0x0041
+                && crate::rfcomm::Frame::decode(&f.payload)
+                    .map(|(fr, _)| {
+                        fr.dlci == 11 && fr.frame_type == crate::rfcomm::FRAME_SABM && fr.cr
+                    })
+                    .unwrap_or(false)
+        });
+        if !sabm_ok {
+            reset_all();
+            return TestResult::Fail("DLC SABM(DLCI 11, C/R=1) missing from the wire");
+        }
+        // Peer answers the DLC SABM with UA: the DLC is open.
+        let ua = crate::rfcomm::Frame::ua(11, false);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(0x0040, ua.encode())));
+        let _ = pump_once(0);
+        if !connect_ready(0, peer, 5, false, true) {
+            reset_all();
+            return TestResult::Fail("completed RFCOMM open should read ready");
+        }
+        match connect(0, peer, 5, false, true) {
+            BtConnectStatus::OpenRfcomm((h, local, peer_cid, dlci, addr)) => {
+                if h != handle
+                    || local != 0x0040
+                    || peer_cid != 0x0041
+                    || dlci != 11
+                    || addr != peer
+                {
+                    reset_all();
+                    return TestResult::Fail("opened DLC handle/CID/DLCI/peer mismatch");
+                }
+            }
+            _ => {
+                reset_all();
+                return TestResult::Fail("connect should report OpenRfcomm after the DLC UA");
+            }
+        }
+        // Data: our UIH carries C/R=1 (initiator).
+        match send_rfcomm(0, handle, 0x0040, 11, b"hi") {
+            Ok(2) => {}
+            _ => {
+                reset_all();
+                return TestResult::Fail("RFCOMM send should report 2 bytes");
+            }
+        }
+        let frames = fake.sent_acl_frames();
+        let uih_ok = frames.iter().any(|(_, f)| {
+            f.cid == 0x0041
+                && crate::rfcomm::Frame::decode(&f.payload)
+                    .map(|(fr, _)| {
+                        fr.dlci == 11
+                            && fr.frame_type == crate::rfcomm::FRAME_UIH
+                            && fr.cr
+                            && fr.info == alloc::vec![b'h', b'i']
+                    })
+                    .unwrap_or(false)
+        });
+        if !uih_ok {
+            reset_all();
+            return TestResult::Fail("RFCOMM UIH(DLCI 11, C/R=1, 'hi') missing");
+        }
+        // Peer data stages on the DLC.
+        let peer_uih = crate::rfcomm::Frame::uih(11, false, alloc::vec![b'y', b'o']);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(0x0040, peer_uih.encode())));
+        let _ = pump_once(0);
+        if drain_rfcomm_rx(0, handle, 0x0040, 11) != Some(alloc::vec![alloc::vec![b'y', b'o']]) {
+            reset_all();
+            return TestResult::Fail("RFCOMM payload not staged for the socket");
+        }
+        // Socket close: DISC on DLCI 11 with C/R=1 (initiator).
+        if !close_rfcomm_dlc(0, handle, 0x0040, 11) {
+            reset_all();
+            return TestResult::Fail("RFCOMM close should succeed");
+        }
+        let frames = fake.sent_acl_frames();
+        let disc_ok = frames.iter().any(|(_, f)| {
+            f.cid == 0x0041
+                && crate::rfcomm::Frame::decode(&f.payload)
+                    .map(|(fr, _)| {
+                        fr.dlci == 11 && fr.frame_type == crate::rfcomm::FRAME_DISC && fr.cr
+                    })
+                    .unwrap_or(false)
+        });
+        if !disc_ok {
+            reset_all();
+            return TestResult::Fail("RFCOMM DISC(DLCI 11, C/R=1) missing");
+        }
+        if drain_rfcomm_rx(0, handle, 0x0040, 11) != Some(alloc::vec![]) {
+            reset_all();
+            return TestResult::Fail("closed DLC must drain empty");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_bt_connect_rfcomm);
+
+    /// #1532: outbound RFCOMM refusal — the peer answers DM to the
+    /// mux SABM and the open reports Failed.
+    fn smoke_pump_bt_connect_rfcomm_dm() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            reset_all();
+            return TestResult::Fail("bring-up against fake controller failed");
+        }
+        let handle = 0x0040;
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut peer = [0u8; 7];
+        peer[0] = 0;
+        peer[1..7].copy_from_slice(&peer6);
+        // Live ACL so no paging is needed.
+        fake.enqueue_event(classic_connection_complete(handle, peer6));
+        let _ = pump_once(0);
+        if connect(0, peer, 5, false, true) != BtConnectStatus::Pending {
+            reset_all();
+            return TestResult::Fail("connect on a live ACL should report Pending");
+        }
+        let rsp = l2cap::build_connection_response(
+            0x01,
+            0x0040,
+            0x0041,
+            l2cap::CONN_RESULT_SUCCESS,
+            l2cap::CONN_STATUS_NO_INFORMATION,
+        );
+        let mut payload = Vec::new();
+        rsp.encode(&mut payload);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
+        let _ = pump_once(0);
+        // Peer refuses the mux with DM.
+        let dm = crate::rfcomm::Frame::dm(0, false);
+        fake.enqueue_acl(acl_packet(handle, &BFrame::new(0x0040, dm.encode())));
+        let _ = pump_once(0);
+        if connect(0, peer, 5, false, true) != BtConnectStatus::Failed {
+            reset_all();
+            return TestResult::Fail("DM to the mux SABM should report Failed");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_bt_connect_rfcomm_dm);
 
     /// #814: the AF_BLUETOOTH socket path over a scripted BR/EDR
     /// generic-PSM conversation — service PSMs refuse registration,

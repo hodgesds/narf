@@ -1886,6 +1886,21 @@ struct FakeBt {
     disconnected: alloc::vec::Vec<(u16, u16)>,
     /// Recorded RFCOMM closes: (handle, local cid, dlci).
     closed_rfcomm: alloc::vec::Vec<(u16, u16, u8)>,
+    /// Scripted outbound-connect outcomes, in call order:
+    /// (dev, peer, psm, le, rfcomm, status). Each `bt_connect`
+    /// call pops the first matching entry; no entry → Pending.
+    connect_script: alloc::vec::Vec<(
+        u16,
+        [u8; 7],
+        u16,
+        bool,
+        bool,
+        narf_filesystem::bluetooth::BtConnectStatus,
+    )>,
+    /// Recorded outbound-connect calls: (dev, peer, psm, le, rfcomm).
+    connect_calls: alloc::vec::Vec<(u16, [u8; 7], u16, bool, bool)>,
+    /// Recorded outbound-connect cancels: (dev, peer, psm, le, rfcomm).
+    connect_cancels: alloc::vec::Vec<(u16, [u8; 7], u16, bool, bool)>,
 }
 
 impl FakeBt {
@@ -1903,6 +1918,9 @@ impl FakeBt {
             sent_rfcomm: alloc::vec::Vec::new(),
             disconnected: alloc::vec::Vec::new(),
             closed_rfcomm: alloc::vec::Vec::new(),
+            connect_script: alloc::vec::Vec::new(),
+            connect_calls: alloc::vec::Vec::new(),
+            connect_cancels: alloc::vec::Vec::new(),
         }
     }
 }
@@ -2121,6 +2139,72 @@ fn fake_bt_close_rfcomm(_dev: u16, handle: u16, cid: u16, dlci: u8) -> bool {
     was_open
 }
 
+/// Outbound-connect fake (#1532): pop the first scripted outcome
+/// for this open (default Pending), recording the call. An Open
+/// outcome claims the channel in the fake, so send/recv work
+/// after connect().
+fn fake_bt_connect(
+    dev: u16,
+    peer: [u8; 7],
+    psm: u16,
+    le: bool,
+    rfcomm: bool,
+) -> narf_filesystem::bluetooth::BtConnectStatus {
+    use narf_filesystem::bluetooth::BtConnectStatus;
+    let mut fake = FAKE_BT.lock();
+    fake.connect_calls.push((dev, peer, psm, le, rfcomm));
+    let idx = fake.connect_script.iter().position(|(d, p, s, l, r, _)| {
+        *d == dev && *p == peer && *s == psm && *l == le && *r == rfcomm
+    });
+    match idx {
+        Some(i) => {
+            let (_, _, _, _, _, st) = fake.connect_script.remove(i);
+            match st {
+                BtConnectStatus::Open((h, local, _, _)) => {
+                    fake.open.push((h, local));
+                }
+                BtConnectStatus::OpenRfcomm((h, local, _, dlci, _)) => {
+                    fake.open_rfcomm.push((h, local, dlci));
+                }
+                _ => {}
+            }
+            st
+        }
+        None => BtConnectStatus::Pending,
+    }
+}
+
+/// Whether a scripted Open outcome awaits for this open
+/// (non-consuming peek, mirroring the pump's `connect_ready`).
+fn fake_bt_connect_ready(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool {
+    use narf_filesystem::bluetooth::BtConnectStatus;
+    FAKE_BT
+        .lock()
+        .connect_script
+        .iter()
+        .any(|(d, p, s, l, r, st)| {
+            *d == dev
+                && *p == peer
+                && *s == psm
+                && *l == le
+                && *r == rfcomm
+                && matches!(
+                    st,
+                    BtConnectStatus::Open(_) | BtConnectStatus::OpenRfcomm(_)
+                )
+        })
+}
+
+/// Cancel a scripted outbound open (#1532): drop its scripted
+/// outcomes and record the cancel.
+fn fake_bt_cancel_connect(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) {
+    let mut fake = FAKE_BT.lock();
+    fake.connect_cancels.push((dev, peer, psm, le, rfcomm));
+    fake.connect_script.retain(|(d, p, s, l, r, _)| {
+        !(*d == dev && *p == peer && *s == psm && *l == le && *r == rfcomm)
+    });
+}
+
 /// Reset the fake and install it as the bridge + HCI providers.
 fn install_fake_bt_bridge() {
     *FAKE_BT.lock() = FakeBt::new();
@@ -2147,6 +2231,27 @@ fn install_fake_bt_bridge() {
         fake_bt_rfcomm_rx_pending,
         fake_bt_close_rfcomm,
     );
+    narf_filesystem::bluetooth::install_bt_connect_handlers(
+        fake_bt_connect,
+        fake_bt_connect_ready,
+        fake_bt_cancel_connect,
+    );
+}
+
+/// Script one outbound-connect outcome for the next matching
+/// `connect()` call (#1532).
+fn fake_bt_script_connect(
+    dev: u16,
+    peer: [u8; 7],
+    psm: u16,
+    le: bool,
+    rfcomm: bool,
+    status: narf_filesystem::bluetooth::BtConnectStatus,
+) {
+    FAKE_BT
+        .lock()
+        .connect_script
+        .push((dev, peer, psm, le, rfcomm, status));
 }
 
 /// Script a peer-opened LE/BR-EDR channel for `psm` (peer bdaddr
@@ -2308,8 +2413,9 @@ kernel_test_in!("userspace", smoke_bt_l2cap_listen_accept_send_recv);
 
 /// L2CAP listen/accept/send/recv/connect error paths: unbound
 /// listen, unlistened accept, send/recv without a channel,
-/// connect() (no backend — #889), unroutable bdaddr, service PSM,
-/// and a second listener on the same PSM.
+/// connect() (in flight — #1532, EINPROGRESS until the peer
+/// answers), unroutable bdaddr, service PSM, and a second
+/// listener on the same PSM.
 fn smoke_bt_l2cap_listen_errors() -> TestResult {
     install_fake_bt_bridge();
     let s = crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
@@ -2348,9 +2454,9 @@ fn smoke_bt_l2cap_listen_errors() -> TestResult {
     let addr = bt_l2cap_addr(0x0080, [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5], 1);
     if !matches!(
         s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
-        crate::socket::SocketOpResult::Err(crate::socket::SockError::NotSupported)
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InProgress)
     ) {
-        return TestResult::Fail("connect should stay EOPNOTSUPP without #889");
+        return TestResult::Fail("connect should be EINPROGRESS while the open is in flight");
     }
     // Unroutable local bdaddr: no controller — ENODEV.
     let s2 =
@@ -2601,3 +2707,382 @@ fn smoke_bt_l2cap_drop_teardown() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_bt_l2cap_drop_teardown);
+
+/// #1532: L2CAP LE CoC connect — first call EINPROGRESS, readiness
+/// flips when the peer answers, the retry completes into the
+/// channel, and send/recv/getpeername/shutdown work on it.
+fn smoke_bt_l2cap_connect_pending_then_open() -> TestResult {
+    install_fake_bt_bridge();
+    let s = crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+    let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+    let mut peer = [0u8; 7];
+    peer[0] = 1;
+    peer[1..7].copy_from_slice(&peer6);
+    // First call: the fake has no scripted outcome → Pending.
+    let addr = bt_l2cap_addr(0x0080, peer6, 1);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InProgress)
+    ) {
+        return TestResult::Fail("first connect should be EINPROGRESS");
+    }
+    // Not ready yet: no Open outcome scripted.
+    if narf_filesystem::bluetooth::bt_connect_ready(0, peer, 0x0080, true, false) {
+        return TestResult::Fail("pending open must not read ready");
+    }
+    // The peer answers: script the Open, readiness flips, the
+    // retry completes into the channel.
+    fake_bt_script_connect(
+        0,
+        peer,
+        0x0080,
+        true,
+        false,
+        narf_filesystem::bluetooth::BtConnectStatus::Open((0x0041, 0x0040, 0x0041, peer)),
+    );
+    if !narf_filesystem::bluetooth::bt_connect_ready(0, peer, 0x0080, true, false) {
+        return TestResult::Fail("completed open should read ready");
+    }
+    let addr = bt_l2cap_addr(0x0080, peer6, 1);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("connect retry should complete the open");
+    }
+    // A connected socket refuses a second connect.
+    let addr = bt_l2cap_addr(0x0080, peer6, 1);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::AlreadyConnected)
+    ) {
+        return TestResult::Fail("connect on a connected socket should be EISCONN");
+    }
+    // getpeername reports the peer.
+    match s.dispatch_op(crate::socket::SocketOp::GetPeerName) {
+        crate::socket::SocketOpResult::Addr(addr) => {
+            let mut expected = alloc::vec![];
+            expected.extend_from_slice(&0x0080u16.to_le_bytes());
+            expected.extend_from_slice(&peer6);
+            expected.extend_from_slice(&0x0041u16.to_le_bytes());
+            expected.push(1);
+            if addr.body != expected {
+                return TestResult::Fail("getpeername body mismatch after connect");
+            }
+        }
+        _ => return TestResult::Fail("getpeername failed on a connected socket"),
+    }
+    fake_bt_stage_rx(0x0041, 0x0040, b"hi");
+    let mut out = [0u8; 16];
+    match s.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    }) {
+        crate::socket::SocketOpResult::Received { n, .. } if n == 2 && &out[..2] == b"hi" => {}
+        _ => return TestResult::Fail("recv did not return the staged SDU"),
+    }
+    match s.dispatch_op(crate::socket::SocketOp::Send {
+        buf: b"yo",
+        flags: 0,
+        addr: None,
+    }) {
+        crate::socket::SocketOpResult::Ok(2) => {}
+        _ => return TestResult::Fail("send did not report 2 bytes"),
+    }
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Shutdown { how: 0 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("shutdown failed");
+    }
+    if !FAKE_BT
+        .lock()
+        .disconnected
+        .contains(&(0x0041u16, 0x0040u16))
+    {
+        return TestResult::Fail("shutdown did not disconnect the channel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_bt_l2cap_connect_pending_then_open);
+
+/// #1532: RFCOMM connect — first call EINPROGRESS, the retry
+/// completes into the DLC, and send/recv/shutdown work on it.
+fn smoke_bt_rfcomm_connect_open() -> TestResult {
+    install_fake_bt_bridge();
+    let s = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_BLUETOOTH,
+        crate::socket::SOCK_STREAM,
+        crate::socket::BTPROTO_RFCOMM,
+    );
+    let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+    let mut peer = [0u8; 7];
+    peer[0] = 0;
+    peer[1..7].copy_from_slice(&peer6);
+    let addr = bt_rfcomm_addr(peer6, 5);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InProgress)
+    ) {
+        return TestResult::Fail("first RFCOMM connect should be EINPROGRESS");
+    }
+    fake_bt_script_connect(
+        0,
+        peer,
+        5,
+        false,
+        true,
+        narf_filesystem::bluetooth::BtConnectStatus::OpenRfcomm((0x0041, 0x0040, 0x0041, 11, peer)),
+    );
+    let addr = bt_rfcomm_addr(peer6, 5);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("RFCOMM connect retry should complete the open");
+    }
+    // getpeername reports the peer + server channel 5.
+    match s.dispatch_op(crate::socket::SocketOp::GetPeerName) {
+        crate::socket::SocketOpResult::Addr(addr) => {
+            let mut expected = alloc::vec![];
+            expected.extend_from_slice(&peer6);
+            expected.push(5);
+            if addr.body != expected {
+                return TestResult::Fail("RFCOMM getpeername body mismatch after connect");
+            }
+        }
+        _ => return TestResult::Fail("RFCOMM getpeername failed on a connected socket"),
+    }
+    fake_bt_stage_rfcomm_rx(0x0041, 0x0040, 11, b"hello");
+    let mut out = [0u8; 16];
+    match s.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    }) {
+        crate::socket::SocketOpResult::Received { n, .. } if n == 5 && &out[..5] == b"hello" => {}
+        _ => return TestResult::Fail("RFCOMM recv did not return the staged payload"),
+    }
+    match s.dispatch_op(crate::socket::SocketOp::Send {
+        buf: b"world",
+        flags: 0,
+        addr: None,
+    }) {
+        crate::socket::SocketOpResult::Ok(5) => {}
+        _ => return TestResult::Fail("RFCOMM send did not report 5 bytes"),
+    }
+    if FAKE_BT.lock().sent_rfcomm != alloc::vec![(0x0041u16, 0x0040u16, 11u8, b"world".to_vec())] {
+        return TestResult::Fail("RFCOMM send did not reach the fake bridge");
+    }
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Shutdown { how: 0 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("RFCOMM shutdown failed");
+    }
+    if !FAKE_BT
+        .lock()
+        .closed_rfcomm
+        .contains(&(0x0041u16, 0x0040u16, 11u8))
+    {
+        return TestResult::Fail("RFCOMM shutdown did not close the DLC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_bt_rfcomm_connect_open);
+
+/// #1532: connect failure mapping — a refused open is
+/// ECONNREFUSED, a failed link or an undiscovered BR/EDR peer is
+/// ENETUNREACH, and a failed open leaves no pending state behind
+/// (a fresh connect starts cleanly).
+fn smoke_bt_connect_refused_failed() -> TestResult {
+    install_fake_bt_bridge();
+    let s = crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+    let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+    let mut peer = [0u8; 7];
+    peer[0] = 1;
+    peer[1..7].copy_from_slice(&peer6);
+    // Refusal: script it, then the first call reports it.
+    fake_bt_script_connect(
+        0,
+        peer,
+        0x0080,
+        true,
+        false,
+        narf_filesystem::bluetooth::BtConnectStatus::Refused(0x0002),
+    );
+    let addr = bt_l2cap_addr(0x0080, peer6, 1);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::ConnectionRefused)
+    ) {
+        return TestResult::Fail("refused connect should be ECONNREFUSED");
+    }
+    // Link failure: same socket, fresh open.
+    fake_bt_script_connect(
+        0,
+        peer,
+        0x0080,
+        true,
+        false,
+        narf_filesystem::bluetooth::BtConnectStatus::Failed,
+    );
+    let addr = bt_l2cap_addr(0x0080, peer6, 1);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::NetUnreach)
+    ) {
+        return TestResult::Fail("failed connect should be ENETUNREACH");
+    }
+    // Undiscovered BR/EDR peer: same mapping.
+    fake_bt_script_connect(
+        0,
+        peer,
+        0x1001,
+        false,
+        false,
+        narf_filesystem::bluetooth::BtConnectStatus::UnknownPeer,
+    );
+    let addr = bt_l2cap_addr(0x1001, peer6, 0);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::NetUnreach)
+    ) {
+        return TestResult::Fail("unknown-peer connect should be ENETUNREACH");
+    }
+    // A failed open leaves no pending state: a fresh connect
+    // starts cleanly (EINPROGRESS, not a stale refusal).
+    let addr = bt_l2cap_addr(0x0080, peer6, 1);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InProgress)
+    ) {
+        return TestResult::Fail("connect after a failure should start a fresh open");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_bt_connect_refused_failed);
+
+/// #1532: connect argument/state errors — bad PSM / address type /
+/// server channel, a listening socket, a retry to a different peer
+/// while one is in flight, and SCO connect (still EOPNOTSUPP,
+/// #817).
+fn smoke_bt_connect_errors() -> TestResult {
+    install_fake_bt_bridge();
+    let s = crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+    // PSM 0 is not a connectable PSM.
+    let addr = bt_l2cap_addr(0x0000, [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5], 1);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InvalidArg)
+    ) {
+        return TestResult::Fail("connect to PSM 0 should be EINVAL");
+    }
+    // Address type 3 is not a real address type.
+    let addr = bt_l2cap_addr(0x0080, [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5], 3);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InvalidArg)
+    ) {
+        return TestResult::Fail("connect with address type 3 should be EINVAL");
+    }
+    // RFCOMM server channel 31 is out of range.
+    let r = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_BLUETOOTH,
+        crate::socket::SOCK_STREAM,
+        crate::socket::BTPROTO_RFCOMM,
+    );
+    let addr = bt_rfcomm_addr([0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5], 31);
+    if !matches!(
+        r.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InvalidArg)
+    ) {
+        return TestResult::Fail("connect to RFCOMM channel 31 should be EINVAL");
+    }
+    // A retry to a different peer while one is in flight stays
+    // EINPROGRESS (it does not start a second open).
+    let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+    let addr = bt_l2cap_addr(0x0080, peer6, 1);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InProgress)
+    ) {
+        return TestResult::Fail("first connect should be EINPROGRESS");
+    }
+    let other = bt_l2cap_addr(0x0080, [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5], 1);
+    if !matches!(
+        s.dispatch_op(crate::socket::SocketOp::Connect { addr: other }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::InProgress)
+    ) {
+        return TestResult::Fail(
+            "connect to a different peer while in flight should be EINPROGRESS",
+        );
+    }
+    // A listening socket refuses connect.
+    let l = crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+    let addr = bt_l2cap_addr(0x0080, [0; 6], 1);
+    if !matches!(
+        l.dispatch_op(crate::socket::SocketOp::Bind { addr }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("bind for the listening-socket case failed");
+    }
+    if !matches!(
+        l.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("listen for the listening-socket case failed");
+    }
+    let addr = bt_l2cap_addr(0x0080, peer6, 1);
+    if !matches!(
+        l.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::BadFdState)
+    ) {
+        return TestResult::Fail("connect on a listening socket should be EBADFD");
+    }
+    // SCO connect is still EOPNOTSUPP (#817 — out of scope here).
+    let sco = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_BLUETOOTH,
+        crate::socket::SOCK_STREAM,
+        crate::socket::BTPROTO_SCO,
+    );
+    let addr = bt_rfcomm_addr(peer6, 0);
+    if !matches!(
+        sco.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::NotSupported)
+    ) {
+        return TestResult::Fail("SCO connect should stay EOPNOTSUPP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_bt_connect_errors);
+
+/// #1532: dropping a socket with an in-flight connect cancels the
+/// open — no half-open channel survives the socket.
+fn smoke_bt_connect_drop_cancels() -> TestResult {
+    install_fake_bt_bridge();
+    let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+    let mut peer = [0u8; 7];
+    peer[0] = 1;
+    peer[1..7].copy_from_slice(&peer6);
+    {
+        let s =
+            crate::socket::SocketFile::new(crate::socket::AF_BLUETOOTH, crate::socket::SOCK_STREAM);
+        let addr = bt_l2cap_addr(0x0080, peer6, 1);
+        if !matches!(
+            s.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+            crate::socket::SocketOpResult::Err(crate::socket::SockError::InProgress)
+        ) {
+            return TestResult::Fail("first connect should be EINPROGRESS");
+        }
+        drop(s);
+    }
+    if !FAKE_BT
+        .lock()
+        .connect_cancels
+        .contains(&(0u16, peer, 0x0080u16, true, false))
+    {
+        return TestResult::Fail("dropping a connecting socket did not cancel the open");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_bt_connect_drop_cancels);

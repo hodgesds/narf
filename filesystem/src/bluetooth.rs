@@ -298,6 +298,112 @@ pub fn install_bt_rfcomm_handlers(
     BT_CLOSE_RFCOMM.store(close as usize, Ordering::Release);
 }
 
+// ── L2CAP / RFCOMM outbound-connect bridge (issue #1532) ───────────
+//
+// The socket layer's `connect()` reaches the pump's outbound
+// channel-open client through these handlers, installed by
+// narf-bluetooth at bring-up like the server-side handlers above.
+// `psm` is the LE/BR-EDR PSM for L2CAP, or the RFCOMM server
+// channel (1..=30) when `rfcomm` is true; `le` is false for
+// RFCOMM. `peer` is `[address type, bdaddr...]` (type 0 BR/EDR,
+// 1 LE public, 2 LE random).
+
+/// Outcome of one outbound-open poll. `connect` is start-or-poll:
+/// the first call starts the open (ACL establishment when needed,
+/// then the channel-open exchange) and reports `Pending`; later
+/// calls report the live state. `Open` consumes the completed
+/// record — a second poll after `Open` finds nothing pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BtConnectStatus {
+    /// The open is in flight (ACL establishment and/or the
+    /// channel-open exchange awaiting the peer's answer).
+    Pending,
+    /// L2CAP channel open: (ACL handle, local CID, peer CID, peer
+    /// address).
+    Open(BtPendingChannel),
+    /// RFCOMM DLC open: (ACL handle, local CID, peer CID, DLCI,
+    /// peer address).
+    OpenRfcomm(BtPendingRfcomm),
+    /// The peer refused the channel open; the value is the L2CAP
+    /// result code (BR/EDR §4.3 / LE CoC §4.23) when the peer sent
+    /// one.
+    Refused(u16),
+    /// The open failed below L2CAP: the ACL link failed, the peer
+    /// answered DM to an RFCOMM SABM, or the peer rejected a
+    /// signalling command outright (Command Reject).
+    Failed,
+    /// No pump exists for this controller index.
+    NoPump,
+    /// A pump step currently owns the core, or the controller's
+    /// initiator is busy with another link setup; retry after the
+    /// step / link completes. Nothing was started.
+    Busy,
+    /// BR/EDR only: the peer was never discovered by inquiry, so
+    /// the pump has no paging parameters for it (it never guesses
+    /// them). Discover the peer first.
+    UnknownPeer,
+}
+
+pub type BtConnectHandler =
+    fn(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> BtConnectStatus;
+pub type BtConnectReadyHandler =
+    fn(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool;
+pub type BtCancelConnectHandler = fn(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool);
+
+static BT_CONNECT: AtomicUsize = AtomicUsize::new(0);
+static BT_CONNECT_READY: AtomicUsize = AtomicUsize::new(0);
+static BT_CANCEL_CONNECT: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the outbound-connect handlers (narf_bluetooth::pump).
+pub fn install_bt_connect_handlers(
+    connect: BtConnectHandler,
+    ready: BtConnectReadyHandler,
+    cancel: BtCancelConnectHandler,
+) {
+    BT_CONNECT.store(connect as usize, Ordering::Release);
+    BT_CONNECT_READY.store(ready as usize, Ordering::Release);
+    BT_CANCEL_CONNECT.store(cancel as usize, Ordering::Release);
+}
+
+/// Start (or poll) an outbound L2CAP/RFCOMM channel open to `peer`
+/// on controller `dev`. See [`BtConnectStatus`].
+pub fn bt_connect(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> BtConnectStatus {
+    let h = BT_CONNECT.load(Ordering::Acquire);
+    if h == 0 {
+        return BtConnectStatus::NoPump;
+    }
+    // SAFETY: only ever stored as `BtConnectHandler as usize`.
+    let f: BtConnectHandler = unsafe { core::mem::transmute::<usize, BtConnectHandler>(h) };
+    f(dev, peer, psm, le, rfcomm)
+}
+
+/// Whether an outbound open to `peer` has completed and is ready
+/// to take (non-consuming peek for poll writability).
+pub fn bt_connect_ready(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool {
+    let h = BT_CONNECT_READY.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `BtConnectReadyHandler as usize`.
+    let f: BtConnectReadyHandler =
+        unsafe { core::mem::transmute::<usize, BtConnectReadyHandler>(h) };
+    f(dev, peer, psm, le, rfcomm)
+}
+
+/// Abandon an in-flight outbound open to `peer` (socket close):
+/// drop the record and tear down any half-opened channel. No-op
+/// when no stack is installed or nothing is in flight.
+pub fn bt_cancel_connect(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) {
+    let h = BT_CANCEL_CONNECT.load(Ordering::Acquire);
+    if h == 0 {
+        return;
+    }
+    // SAFETY: only ever stored as `BtCancelConnectHandler as usize`.
+    let f: BtCancelConnectHandler =
+        unsafe { core::mem::transmute::<usize, BtCancelConnectHandler>(h) };
+    f(dev, peer, psm, le, rfcomm)
+}
+
 /// Register `psm` on controller `dev`'s pump for a listening socket
 /// (`le`: LE CoC PSM vs BR/EDR PSM). `NoPump` when no stack is
 /// installed.
