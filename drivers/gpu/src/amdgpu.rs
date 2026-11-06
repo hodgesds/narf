@@ -821,6 +821,14 @@ pub struct AmdGpu {
     pub vram: VramInfo,
     /// Currently-programmed mode, if `set_mode` has run.
     pub mode: Option<Mode>,
+    /// Panel backlight level in percent (0–100), stored on the
+    /// modeset state. `None` until the first successful `set_mode`
+    /// on an APU initialises it from the period/readback state;
+    /// every modeset then (re-)applies it via `set_backlight`, and
+    /// every successful `set_backlight` refreshes it — so the
+    /// stored level is always the last level actually programmed.
+    /// Discrete GPUs have no panel and leave this `None`.
+    pub backlight_percent: Option<u8>,
     pub fw_loaded: bool,
     /// IP blocks enumerated from the on-die discovery table (top
     /// of VRAM, parsed at probe time). Empty when the silicon
@@ -1030,6 +1038,7 @@ impl AmdGpu {
             chip,
             vram,
             mode: None,
+            backlight_percent: None,
             fw_loaded: false,
             gc_info,
             ip_blocks,
@@ -1863,6 +1872,31 @@ impl AmdGpu {
         }
 
         self.mode = Some(mode);
+        // Panel brightness (#948): the mode is programmed, so the
+        // panel must leave modeset at a defined brightness instead
+        // of VBIOS residue. On an APU the first modeset
+        // initialises the stored level from the period/readback
+        // state (full brightness when no trustworthy readback
+        // exists) and every modeset (re-)applies it via
+        // `set_backlight` — which also covers the PM resume path,
+        // the only other `set_mode` caller. Discrete GPUs have no
+        // panel: the level stays unset and nothing is programmed.
+        if self.is_apu() {
+            let pct = match self.backlight_percent {
+                Some(pct) => pct,
+                None => {
+                    let pct = unsafe { self.readback_brightness_percent() }.unwrap_or(100);
+                    self.backlight_percent = Some(pct);
+                    pct
+                }
+            };
+            // Best-effort: the mode is programmed regardless, so a
+            // failed apply must not misreport the modeset. The
+            // level stays stored, so the next modeset or
+            // `set_brightness` retries it.
+            // SAFETY: caller-asserted exclusive ownership of BAR5.
+            let _ = unsafe { self.set_backlight(pct) };
+        }
         Ok(())
     }
 
@@ -2124,7 +2158,51 @@ impl AmdGpu {
                 mm_write(&self.regs, dcn_base + w.addr, w.value);
             }
         }
+        // Record the programmed level on the modeset state, so a
+        // later modeset (including the PM resume re-modeset)
+        // re-applies the level the user last set instead of the
+        // level the first modeset read back (#948).
+        self.backlight_percent = Some(percent);
         Ok(())
+    }
+
+    /// Read the panel's current brightness back out of the DCN
+    /// BL_PWM registers, as a percentage (0–100) — the inverse of
+    /// what `set_backlight` programs, via
+    /// [`crate::amdgpu_backlight::percent_for_active_count`].
+    ///
+    /// Returns `None` when the PWM is not enabled (`BL_PWM_EN`
+    /// clear, so the duty field holds no live level), when no DCN
+    /// base resolves, or when the period carries no duty to scale
+    /// against. Callers fall back to full brightness rather than
+    /// inventing a level from a dead register.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively.
+    pub unsafe fn readback_brightness_percent(&self) -> Option<u8> {
+        if self.chip.family == Family::Navi4 {
+            return None;
+        }
+        let dcn_base = self.ip_block_base(amdgpu_discovery::HW_ID_DCN, 0)?;
+        // The duty count is scaled against the period VBIOS
+        // programmed, so both registers have to be read back —
+        // neither value is one this driver chooses.
+        // SAFETY: caller-asserted BAR5 ownership; the registers
+        // are inside the DCN window `ip_block_base` resolved.
+        let period_cntl = unsafe {
+            mm_read(
+                &self.regs,
+                dcn_base + crate::amdgpu_backlight::BL_PWM_PERIOD_CNTL,
+            )
+        };
+        let cntl = unsafe { mm_read(&self.regs, dcn_base + crate::amdgpu_backlight::BL_PWM_CNTL) };
+        if cntl & crate::amdgpu_backlight::BL_PWM_EN == 0 {
+            return None;
+        }
+        crate::amdgpu_backlight::percent_for_active_count(
+            cntl & crate::amdgpu_backlight::BL_ACTIVE_INT_FRAC_CNT_MASK,
+            period_cntl,
+        )
     }
 
     /// MP1 (SMU) register-window base. Reads IP discovery first;
