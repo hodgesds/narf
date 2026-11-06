@@ -1046,7 +1046,7 @@ pub async fn try_bind_uvc_already_addressed(
     slot_id: u8,
     cfg: &[u8],
 ) -> Result<usize, UvcError> {
-    try_bind_video_already_addressed(xhci_dev, slot_id, cfg).await
+    try_bind_video_already_addressed(xhci_dev, slot_id, cfg, None).await
 }
 
 /// Retain every bulk/isochronous IN endpoint together with the
