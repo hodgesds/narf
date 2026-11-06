@@ -423,6 +423,29 @@ pub struct Vmxnet3TxCompDesc {
 }
 const _: () = assert!(core::mem::size_of::<Vmxnet3TxCompDesc>() == 16);
 
+impl Vmxnet3TxCompDesc {
+    /// Index of the EOP TX descriptor this completion frees
+    /// (`vmxnet3_defs.h`: `txdIdx:12` at dword0 bits[11:0]).
+    pub const fn txd_idx(self) -> u32 {
+        use super::regs::TCD_TXIDX_MASK;
+        u32::from_le(self.dword0) & TCD_TXIDX_MASK
+    }
+
+    /// Generation bit (`vmxnet3_defs.h`: `gen:1` at dword3 bit 31).
+    pub const fn gen(self) -> u32 {
+        use super::regs::TCD_GEN_SHIFT;
+        (u32::from_le(self.dword3) >> TCD_GEN_SHIFT) & 1
+    }
+
+    /// `true` when the device has written this completion for the
+    /// driver's current completion-ring generation — the exact test
+    /// `vmxnet3_drv.c::vmxnet3_tq_tx_complete` runs
+    /// (`VMXNET3_TCD_GET_GEN(&gdesc->tcd) == tq->comp_ring.gen`).
+    pub const fn is_ready(self, expected_gen: u32) -> bool {
+        self.gen() == (expected_gen & 1)
+    }
+}
+
 /// `Vmxnet3_RxCompDesc`. 16 bytes, written by device for each
 /// completed RX descriptor.
 #[repr(C, align(16))]
@@ -434,3 +457,63 @@ pub struct Vmxnet3RxCompDesc {
     pub dword3: u32, // csum:16, tuc:1, udp:1, tcp:1, ipc:1, v6:1, v4:1, frg:1, fcs:1, type:7, gen:1
 }
 const _: () = assert!(core::mem::size_of::<Vmxnet3RxCompDesc>() == 16);
+
+impl Vmxnet3RxCompDesc {
+    /// Index of the RX descriptor holding the received bytes
+    /// (`vmxnet3_defs.h`: `rxdIdx:12` at dword0 bits[11:0]).
+    pub const fn rxd_idx(self) -> u32 {
+        use super::regs::RCD_RXD_IDX_MASK;
+        u32::from_le(self.dword0) & RCD_RXD_IDX_MASK
+    }
+
+    /// End Of Packet (`vmxnet3_defs.h`: `eop:1` at dword0 bit 14).
+    /// A single-buffer frame has both `sop` and `eop` set.
+    pub const fn eop(self) -> bool {
+        use super::regs::RCD_EOP_SHIFT;
+        (u32::from_le(self.dword0) >> RCD_EOP_SHIFT) & 1 != 0
+    }
+
+    /// Start Of Packet (`vmxnet3_defs.h`: `sop:1` at dword0 bit 15).
+    pub const fn sop(self) -> bool {
+        use super::regs::RCD_SOP_SHIFT;
+        (u32::from_le(self.dword0) >> RCD_SOP_SHIFT) & 1 != 0
+    }
+
+    /// Received length in bytes (`vmxnet3_defs.h`: `len:14` at
+    /// dword2 bits[13:0]).
+    pub const fn len(self) -> u32 {
+        use super::regs::RCD_LEN_MASK;
+        u32::from_le(self.dword2) & RCD_LEN_MASK
+    }
+
+    /// Error flag (`vmxnet3_defs.h`: `err:1` at dword2 bit 14).
+    /// An EOP completion with `err` set is dropped by
+    /// `vmxnet3_drv.c::vmxnet3_rq_rx_complete` (`vmxnet3_rx_error`).
+    pub const fn err(self) -> bool {
+        use super::regs::RCD_ERR_SHIFT;
+        (u32::from_le(self.dword2) >> RCD_ERR_SHIFT) & 1 != 0
+    }
+
+    /// Generation bit (`vmxnet3_defs.h`: `gen:1` at dword3 bit 31).
+    pub const fn gen(self) -> u32 {
+        use super::regs::RCD_GEN_SHIFT;
+        (u32::from_le(self.dword3) >> RCD_GEN_SHIFT) & 1
+    }
+
+    /// `true` when the device has written this completion for the
+    /// driver's current completion-ring generation — the exact test
+    /// `vmxnet3_drv.c::vmxnet3_rq_rx_complete` runs
+    /// (`rcd->gen == rq->comp_ring.gen`).
+    pub const fn is_ready(self, expected_gen: u32) -> bool {
+        self.gen() == (expected_gen & 1)
+    }
+}
+
+/// Build an RX descriptor `flags` word from its fields
+/// (`vmxnet3_defs.h` `Vmxnet3_RxDesc`: `len:14 | btype:1 | dtype:1 |
+/// rsvd:15 | gen:1`). Used for the initial fill and every refill so
+/// the packing rule lives in exactly one place.
+pub const fn rx_desc_flags(len: u32, btype: u32, gen: u32) -> u32 {
+    use super::regs::{RXD_BTYPE_SHIFT, RXD_GEN_SHIFT, RXD_LEN_MASK};
+    (len & RXD_LEN_MASK) | ((btype & 1) << RXD_BTYPE_SHIFT) | ((gen & 1) << RXD_GEN_SHIFT)
+}
