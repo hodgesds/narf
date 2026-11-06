@@ -461,7 +461,7 @@ pub fn ingest_firmware_event_log() -> Result<FirmwareIngest, FirmwareIngestError
 }
 
 fn ingest_firmware_event_log_inner() -> Result<FirmwareIngest, FirmwareIngestError> {
-    use narf_efi::tcg2 as tcg2;
+    use narf_efi::tcg2;
     let handoff = narf_boot::firmware::firmware_handoff();
     let systab = handoff
         .efi_system_table
@@ -484,8 +484,9 @@ fn ingest_firmware_event_log_inner() -> Result<FirmwareIngest, FirmwareIngestErr
         if !read_firmware_phys(addr, &mut header) {
             return Err(FirmwareIngestError::UnreadableFirmwareMemory);
         }
-        let log_header = tcg2::decode_linux_tpm_event_log_header(&header)
-            .ok_or(FirmwareIngestError::BadMainLog(tcg2::Tcg2LogError::UnsupportedLogVersion))?;
+        let log_header = tcg2::decode_linux_tpm_event_log_header(&header).ok_or(
+            FirmwareIngestError::BadMainLog(tcg2::Tcg2LogError::UnsupportedLogVersion),
+        )?;
         if log_header.size as usize > tcg2::MAX_TCG2_LOG_BYTES {
             return Err(FirmwareIngestError::MainLogTooLarge);
         }
@@ -522,8 +523,8 @@ fn ingest_firmware_event_log_inner() -> Result<FirmwareIngest, FirmwareIngestErr
         // sized by the event count (4 KiB per event is far above
         // any real firmware record) and walk exactly
         // `number_of_events` records out of it.
-        let window_len = ((table_header.number_of_events as usize) * 4096)
-            .min(tcg2::MAX_TCG2_LOG_BYTES);
+        let window_len =
+            ((table_header.number_of_events as usize) * 4096).min(tcg2::MAX_TCG2_LOG_BYTES);
         let mut window = alloc::vec![0u8; window_len];
         if window_len > 0 {
             let Some(events_addr) = addr.checked_add(16) else {
@@ -1484,11 +1485,26 @@ fn fw_event2_record(pcr: u32, event_type: u32, sha256: [u8; 32], event: &[u8]) -
 fn fw_synthetic_log() -> Vec<u8> {
     let mut log = fw_spec_id_record();
     // CRTM measurement into PCR 0.
-    log.extend_from_slice(&fw_event2_record(0, 0x0000_0008, [0x21u8; 32], b"CRTM version"));
+    log.extend_from_slice(&fw_event2_record(
+        0,
+        0x0000_0008,
+        [0x21u8; 32],
+        b"CRTM version",
+    ));
     // Separator into PCR 0.
-    log.extend_from_slice(&fw_event2_record(0, EV_SEPARATOR, [0x22u8; 32], b"separator"));
+    log.extend_from_slice(&fw_event2_record(
+        0,
+        EV_SEPARATOR,
+        [0x22u8; 32],
+        b"separator",
+    ));
     // Informational NO_ACTION event on PCR 7 — recorded, never extended.
-    log.extend_from_slice(&fw_event2_record(7, EV_NO_ACTION, [0x23u8; 32], b"informational"));
+    log.extend_from_slice(&fw_event2_record(
+        7,
+        EV_NO_ACTION,
+        [0x23u8; 32],
+        b"informational",
+    ));
     log
 }
 
@@ -1502,8 +1518,10 @@ fn smoke_measure_firmware_ingest_replays_spec_log() -> TestResult {
     if info.number_of_algorithms != 2 || parsed.len() != 4 {
         return TestResult::Fail("synthetic log parsed wrong");
     }
-    let events: Vec<ParsedFirmwareEvent> =
-        parsed.into_iter().map(ParsedFirmwareEvent::from_tcg2).collect();
+    let events: Vec<ParsedFirmwareEvent> = parsed
+        .into_iter()
+        .map(ParsedFirmwareEvent::from_tcg2)
+        .collect();
     let outcome = match apply_firmware_replay(&events, 4, 0, true) {
         Ok(o) => o,
         Err(_) => return TestResult::Fail("firmware replay refused"),
@@ -1575,7 +1593,10 @@ fn smoke_measure_firmware_ingest_replays_spec_log() -> TestResult {
     __reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("frame/measure", smoke_measure_firmware_ingest_replays_spec_log);
+kernel_test_in!(
+    "frame/measure",
+    smoke_measure_firmware_ingest_replays_spec_log
+);
 
 fn smoke_measure_firmware_ingest_absent_without_efi() -> TestResult {
     // The kernel-test environment has no EFI system table
@@ -1592,7 +1613,10 @@ fn smoke_measure_firmware_ingest_absent_without_efi() -> TestResult {
     __reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("frame/measure", smoke_measure_firmware_ingest_absent_without_efi);
+kernel_test_in!(
+    "frame/measure",
+    smoke_measure_firmware_ingest_absent_without_efi
+);
 
 fn smoke_measure_firmware_cross_check_matches_and_mismatches() -> TestResult {
     narf_tpm::registry::__reset_for_test();
@@ -1611,8 +1635,10 @@ fn smoke_measure_firmware_cross_check_matches_and_mismatches() -> TestResult {
         __reset_for_test();
         return TestResult::Fail("synthetic TCG2 log rejected");
     };
-    let events: Vec<ParsedFirmwareEvent> =
-        parsed.into_iter().map(ParsedFirmwareEvent::from_tcg2).collect();
+    let events: Vec<ParsedFirmwareEvent> = parsed
+        .into_iter()
+        .map(ParsedFirmwareEvent::from_tcg2)
+        .collect();
     if apply_firmware_replay(&events, 4, 0, true).is_err() {
         narf_tpm::registry::__reset_for_test();
         __reset_for_test();
@@ -1673,4 +1699,7 @@ fn smoke_measure_firmware_cross_check_matches_and_mismatches() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("frame/measure", smoke_measure_firmware_cross_check_matches_and_mismatches);
+kernel_test_in!(
+    "frame/measure",
+    smoke_measure_firmware_cross_check_matches_and_mismatches
+);

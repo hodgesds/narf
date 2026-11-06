@@ -452,7 +452,7 @@ fn smoke_tcg2_table_headers_decode() -> TestResult {
 kernel_test_in!("efi/tcg2", smoke_tcg2_table_headers_decode);
 
 fn smoke_tcg2_log_parses_spec_stream() -> TestResult {
-    use crate::tcg2::parse_tcg2_log;
+    use crate::tcg2::{parse_tcg2_log, SPEC_ID_SIGNATURE};
     let algs = [(0x0004u16, 20u16), (0x000Bu16, 32u16)];
     let mut log = tcg2_spec_id_record(&algs);
     // EV_S_CRTM_VERSION (0x8) into PCR 0, SHA-1 + SHA-256 digests.
@@ -490,7 +490,7 @@ fn smoke_tcg2_log_parses_spec_stream() -> TestResult {
     if events[0].event_type != 0x0000_0003 || events[0].sha256_digest.is_some() {
         return TestResult::Fail("Spec ID record misparsed");
     }
-    if &events[0].event[0..16] != b"Spec ID Event03" {
+    if &events[0].event[0..16] != SPEC_ID_SIGNATURE {
         return TestResult::Fail("Spec ID signature not carried");
     }
     if events[1].sha256_digest != Some([0x22u8; 32]) || events[1].event != b"v1.0" {
@@ -601,8 +601,7 @@ fn smoke_tcg2_final_events_parse() -> TestResult {
         return TestResult::Fail("mid-record preboot skip accepted");
     }
     // A prefix longer than the table overruns it.
-    if parse_final_events(&body, 2, Some(2), body.len() + 1) != Err(Tcg2LogError::BadPrebootSize)
-    {
+    if parse_final_events(&body, 2, Some(2), body.len() + 1) != Err(Tcg2LogError::BadPrebootSize) {
         return TestResult::Fail("overrunning preboot skip accepted");
     }
     // Fewer records than NumberOfEvents.

@@ -192,8 +192,7 @@ mod tests {
         mem[0x2000..0x2010].copy_from_slice(&smbios3);
         mem[0x2010..0x2018].copy_from_slice(&0x5000u64.to_le_bytes());
         // Entry 1: the final-events table.
-        mem[0x2018..0x2028]
-            .copy_from_slice(&narf_efi::tcg2::EFI_TCG2_FINAL_EVENTS_TABLE_GUID.0);
+        mem[0x2018..0x2028].copy_from_slice(&narf_efi::tcg2::EFI_TCG2_FINAL_EVENTS_TABLE_GUID.0);
         mem[0x2028..0x2030].copy_from_slice(&0x3000u64.to_le_bytes());
         // Entry 2: the Linux main-log table.
         mem[0x2030..0x2040].copy_from_slice(&narf_efi::tcg2::LINUX_EFI_TPM_EVENT_LOG_GUID.0);

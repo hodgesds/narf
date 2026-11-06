@@ -98,8 +98,9 @@ pub const EV_NO_ACTION: u32 = 0x0000_0003;
 pub const MAX_PCR_INDEX: u32 = 23;
 
 /// Signature opening every TCG2 log's Spec ID event
-/// (`TCG_SPECID_SIG`).
-pub const SPEC_ID_SIGNATURE: &[u8; 16] = b"Spec ID Event03";
+/// (`TCG_SPECID_SIG`): the 15 ASCII bytes plus the NUL terminator
+/// the spec counts as the 16th signature byte.
+pub const SPEC_ID_SIGNATURE: &[u8; 16] = b"Spec ID Event03\0";
 
 /// The Spec ID event's `specVersionMajor` for a TPM 2.0 log.
 pub const SPEC_ID_VERSION_MAJOR: u8 = 2;
@@ -477,8 +478,7 @@ pub fn parse_tcg2_log(buf: &[u8]) -> Result<(SpecIdInfo, Vec<Tcg2Event<'_>>), Tc
         if events.len() >= MAX_TCG2_LOG_EVENTS {
             return Err(Tcg2LogError::TooManyEvents);
         }
-        let (ev, n) =
-            parse_event2_record(&buf[off..], Some(info.number_of_algorithms))?;
+        let (ev, n) = parse_event2_record(&buf[off..], Some(info.number_of_algorithms))?;
         events.push(ev);
         off += n;
     }
