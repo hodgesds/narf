@@ -30,8 +30,8 @@
 //! | `create_primary`      | 0x131       | §12.2         |
 //! | `flush_context`       | 0x165       | §11.4         |
 //! | `start_auth_session`  | 0x176       | §11.1         |
-//! | `policy_pcr`          | 0x19F       | §19.7         |
-//! | `read_public`         | 0x169       | §23           |
+//! | `policy_pcr`          | 0x17F       | §19.7         |
+//! | `read_public`         | 0x173       | §23           |
 //!
 //! Structured response parsers (the pre-#941 layer had only
 //! GetRandom's): `parse_create_response`,

@@ -67,13 +67,13 @@ pub const TPM_CC_CREATE_PRIMARY: u32 = 0x0000_0131;
 pub const TPM_CC_EVICT_CONTROL: u32 = 0x0000_0120;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x0000_0165;
 pub const TPM_CC_START_AUTH_SESSION: u32 = 0x0000_0176;
-pub const TPM_CC_POLICY_PCR: u32 = 0x0000_019F;
+pub const TPM_CC_POLICY_PCR: u32 = 0x0000_017F;
 // Attestation (#945): Quote is built by the canonical codec in
 // narf-tpm (it is a `TpmDevice` operation there); the code is named
 // here for this layer's capability surface. ReadPublic is the AK
 // provisioning probe composed in drivers/platform.
 pub const TPM_CC_QUOTE: u32 = 0x0000_0158;
-pub const TPM_CC_READ_PUBLIC: u32 = 0x0000_0169;
+pub const TPM_CC_READ_PUBLIC: u32 = 0x0000_0173;
 // Sealing-minimum completion (#1002): the two command codes the
 // suspend anchor's conversation still had no constants for.
 pub const TPM_CC_NV_INCREMENT: u32 = 0x0000_0134;
@@ -181,7 +181,7 @@ pub const TPM_RC_POLICY_FAIL: u32 = 0x0000_099D;
 /// `TPMA_NV_WRITTEN` is CLEAR (Part 2 §6.6; Part 3 §31.13).
 pub const TPM_RC_NV_UNINITIALIZED: u32 = 0x0000_014A;
 /// NV index is already defined (Part 2 §6.6).
-pub const TPM_RC_NV_DEFINED: u32 = 0x0000_014B;
+pub const TPM_RC_NV_DEFINED: u32 = 0x0000_014C;
 
 // ── Well-known handles ───────────────────────────────────────────────
 

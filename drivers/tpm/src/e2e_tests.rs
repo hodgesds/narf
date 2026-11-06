@@ -176,11 +176,13 @@ mod smokes {
     const FAKE_SESSION_HANDLE: u32 = 0x0200_0001;
 
     // Additional command codes kept local to the fake.
-    // (#941 note: this block previously defined TPM_CC_POLICY_PCR
-    // as 0x0000_017F — the wrong code; Part 2 §6.5.2 assigns
-    // PolicyPCR 0x0000_019F. The block was self-consistent, so the
-    // session smokes passed against a code silicon would not
-    // dispatch; the constants now come from the tpm2 module.)
+    // (#1630 note: this block previously defined TPM_CC_POLICY_PCR
+    // as 0x0000_017F — which IS the spec value (Part 2 §6.5.2
+    // Table 12 assigns PolicyPCR 0x0000_017F). #1066 changed the
+    // module constant to 0x0000_019F, a code that does not exist in
+    // Rev 1.59; the block was self-consistent, so the session
+    // smokes passed against a code silicon would not dispatch.
+    // The constants now come from the tpm2 module, corrected.)
     const TPM_CC_START_AUTH_SESSION: u32 = 0x0000_0176;
     const TPM_CC_CREATE: u32 = 0x0000_0153;
     const TPM_CC_LOAD: u32 = 0x0000_0157;
@@ -1550,7 +1552,7 @@ mod smokes {
         }
 
         // PolicyPCR against PCR 7 with the production builder
-        // (command code 0x19F — see the const note at the fake).
+        // (command code 0x17F — see the const note at the fake).
         let mut mask = [0u8; 3];
         mask[0] = 1 << 7;
         let policy = cmds::policy_pcr(session, &[], &[(crate::tpm2::TPM_ALG_SHA256, &mask)]);
