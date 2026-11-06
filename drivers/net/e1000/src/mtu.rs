@@ -49,14 +49,8 @@ pub const STD_MTU: u32 = 1500;
 /// Largest MTU on the classic 82540/82544/82545 parts (Linux `e1000`).
 pub const CLASSIC_MAX_MTU: u32 = 16110;
 
-/// Largest frame on the classic parts: MTU + ETH_HLEN + ETH_FCS_LEN.
-pub const CLASSIC_MAX_FRAME: u32 = 16128;
-
 /// Largest MTU on the e1000e parts (82574L, I217/I218/I219 PCH).
 pub const E1000E_MAX_MTU: u32 = 9000;
-
-/// Largest frame on the e1000e parts: MTU + VLAN_ETH_HLEN + ETH_FCS_LEN.
-pub const E1000E_MAX_FRAME: u32 = 9022;
 
 /// RX buffer bytes per descriptor: covers the classic max frame
 /// (16128) with the RCTL.BSIZE 16K step. Allocated once at probe.
@@ -81,18 +75,6 @@ pub const fn max_mtu(did: u16) -> u32 {
         CLASSIC_MAX_MTU
     } else {
         E1000E_MAX_MTU
-    }
-}
-
-/// Largest TX wire frame for `did`: MTU + ETH_HLEN + ETH_FCS_LEN.
-pub const fn max_frame(did: u16) -> u32 {
-    if is_classic(did) {
-        CLASSIC_MAX_FRAME
-    } else {
-        // e1000e TX frames never carry the VLAN tag inline (the tag
-        // comes from the context descriptor), so the TX cap is the
-        // +18 size even though the RX-side frame is +22.
-        E1000E_MAX_MTU + 14 + 4
     }
 }
 
