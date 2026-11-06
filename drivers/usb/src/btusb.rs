@@ -516,6 +516,7 @@ const BTUSB_CLASS_MATCH: [crate::class_registry::UsbClassMatch; 1] =
 /// `msc_registry_probe`.)
 fn btusb_registry_probe(
     _device: alloc::sync::Arc<crate::device::USBDevice>,
+    _match_interface: Option<(u8, u8)>,
 ) -> Result<(), crate::class_registry::UsbProbeError> {
     Err(crate::class_registry::UsbProbeError::BindFailed)
 }
@@ -1171,7 +1172,7 @@ pub async fn try_bind_btusb_already_addressed(
                 )
                 .await
             {
-                Ok(()) => sco_active = true,
+                Ok(_) => sco_active = true,
                 Err(error) => {
                     use core::fmt::Write as _;
                     let _ = writeln!(

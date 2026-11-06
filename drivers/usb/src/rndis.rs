@@ -411,8 +411,9 @@ impl InitializeComplete {
 /// header; `0` when there is no input buffer.
 pub fn encode_query_msg(request_id: u32, oid: u32, input: &[u8]) -> Vec<u8> {
     let mut out = alloc::vec![0u8; 28 + input.len()];
+    let total_len = out.len() as u32;
     put_u32le(&mut out, 0, MSG_QUERY);
-    put_u32le(&mut out, 4, out.len() as u32);
+    put_u32le(&mut out, 4, total_len);
     put_u32le(&mut out, 8, request_id);
     put_u32le(&mut out, 12, oid);
     put_u32le(&mut out, 16, input.len() as u32);
@@ -433,8 +434,9 @@ pub fn encode_query_msg(request_id: u32, oid: u32, input: &[u8]) -> Vec<u8> {
 /// own field (byte 20): `28 - 20 = 8`.
 pub fn encode_set_msg(request_id: u32, oid: u32, value: &[u8]) -> Vec<u8> {
     let mut out = alloc::vec![0u8; 28 + value.len()];
+    let total_len = out.len() as u32;
     put_u32le(&mut out, 0, MSG_SET);
-    put_u32le(&mut out, 4, out.len() as u32);
+    put_u32le(&mut out, 4, total_len);
     put_u32le(&mut out, 8, request_id);
     put_u32le(&mut out, 12, oid);
     put_u32le(&mut out, 16, value.len() as u32);
@@ -695,8 +697,9 @@ impl<'a> IndicateStatus<'a> {
 /// multipacket message).
 pub fn encode_packet_msg(frame: &[u8]) -> Vec<u8> {
     let mut out = alloc::vec![0u8; 44 + frame.len()];
+    let total_len = out.len() as u32;
     put_u32le(&mut out, 0, MSG_PACKET);
-    put_u32le(&mut out, 4, out.len() as u32);
+    put_u32le(&mut out, 4, total_len);
     put_u32le(&mut out, 8, 36);
     put_u32le(&mut out, 12, frame.len() as u32);
     // OOB / per-packet-info / VcHandle / Reserved stay zero.
@@ -1396,6 +1399,7 @@ pub fn find_rndis_notif_endpoint(cfg: &[u8], comm_iface: u8) -> Option<EndpointC
 
 /// One bound RNDIS device.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct RndisDevice {
     slot_id: u8,
     comm_iface: u8,
@@ -1851,7 +1855,7 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, RndisError> {
     // an executor poll.
     let c = controller_of(idx).ok_or(RndisError::NoController)?;
     let outcome =
-        narf_scheduler::block_on(async move { c.bulk_out(slot_id, bulk_out_dci, frame).await });
+        narf_scheduler::block_on(async move { c.bulk_out(slot_id, bulk_out_dci, &frame).await });
     match outcome {
         Ok(n) => Ok(n),
         Err(_) => Err(RndisError::Transfer),
@@ -1895,7 +1899,7 @@ pub fn recv_frames<'a>(idx: usize, scratch: &'a mut [u8]) -> Result<Vec<&'a [u8]
 /// from non-executor contexts (same `block_on` contract as
 /// [`send_frame`]).
 pub fn send_keepalive(idx: usize) -> Result<(), RndisError> {
-    let (slot_id, comm_iface, request_id) = {
+    let (slot_id, comm_iface, req_id) = {
         let mut g = RNDIS_DEVICES.lock();
         let dev = g
             .get_mut(idx)
@@ -1905,7 +1909,7 @@ pub fn send_keepalive(idx: usize) -> Result<(), RndisError> {
         (dev.slot_id, dev.comm_iface, dev.next_request_id)
     };
     let c = controller_of(idx).ok_or(RndisError::NoController)?;
-    let msg = encode_keepalive_msg(request_id);
+    let msg = encode_keepalive_msg(req_id);
     let outcome = narf_scheduler::block_on(async {
         if c.control_out(
             slot_id,
@@ -1936,8 +1940,8 @@ pub fn send_keepalive(idx: usize) -> Result<(), RndisError> {
                 Ok(n) if n >= 16 => {
                     let got = &buf[..n];
                     if let Ok((CMPLT_KEEPALIVE, _)) = message_prefix(got) {
-                        if request_id(got).ok() == Some(request_id) {
-                            return decode_keepalive_complete(got, request_id).map(|_| ());
+                        if request_id(got).ok() == Some(req_id) {
+                            return decode_keepalive_complete(got, req_id).map(|_| ());
                         }
                     }
                 }
@@ -2099,6 +2103,7 @@ pub static RNDIS_MATCH: [crate::class_registry::UsbClassMatch; 1] = [
 
 pub fn probe(
     _device: alloc::sync::Arc<crate::device::USBDevice>,
+    _match_interface: Option<(u8, u8)>,
 ) -> Result<(), crate::class_registry::UsbProbeError> {
     use core::fmt::Write;
     let _ = writeln!(narf_console::Writer, "  usb: RNDIS device bound!");

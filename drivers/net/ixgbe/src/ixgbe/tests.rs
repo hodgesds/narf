@@ -1512,6 +1512,7 @@ struct FwFakeState {
     /// list_dev_caps (response descriptor params word 1).
     aci_caps_count: u32,
     /// Response descriptor retval the fake reports.
+    #[allow(dead_code)]
     aci_retval: u16,
     /// ACI completion pacing: complete after this many
     /// PF_HICR reads while C is set (0 = at once, on the
@@ -2115,6 +2116,8 @@ fn smoke_ixgbe_eee_phy_token() -> TestResult {
     }
     TestResult::Pass
 }
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_phy_token);
+
 fn smoke_ixgbe_eee_aci_desc() -> TestResult {
     use super::aci::{
         desc_datalen, desc_flags, desc_new, desc_opcode, desc_retval, get_link_status_desc,

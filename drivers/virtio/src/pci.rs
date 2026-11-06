@@ -508,7 +508,7 @@ pub unsafe fn enable_msix_queue(
 /// and its consumer falls back to polling. The slot is returned
 /// alongside the vector so a caller can point a second queue at
 /// the same slot (a TX queue sharing its pair's RX vector).
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MsixQueueBinding {
     pub idt_vector: Option<u8>,
     pub slot: Option<u16>,
