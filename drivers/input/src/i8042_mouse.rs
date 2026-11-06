@@ -44,6 +44,31 @@
 //!       `BTN_SIDE`) and 5th button (bit 5, `BTN_EXTRA`).
 //! ```
 //!
+//! Elantech absolute packets (after the magic knock + firmware
+//! signature in `crate::psmouse::detect_elantech`, which also
+//! enables absolute mode via the register writes in
+//! `elantech_set_absolute_mode`):
+//!
+//! ```
+//!   v1 — 4 bytes: byte 0 finger count + parity bits + buttons,
+//!     byte 1 high coordinate bits, bytes 2/3 low X/Y.
+//!   v2/v3/v4 — 6 bytes: byte 0 finger count (+ traces for v4),
+//!     bytes 1/2 X (+ pressure high nibble), byte 3 width /
+//!     packet-type bits, bytes 4/5 Y (+ pressure low nibble).
+//!     v3 two-finger reports arrive as head + tail packet pairs;
+//!     v4 adds per-finger head packets, delta motion packets,
+//!     and status packets (finger bitmap). See `psmouse.rs` for
+//!     the Linux-grounded layouts and the per-version checks.
+//! ```
+//!
+//! Elantech packets have no `0x08` sync bit in byte 0, so the
+//! relative path's resync rule does not apply to them — validity
+//! comes from the per-version packet checks instead, and an
+//! invalid packet is dropped whole (`PSMOUSE_BAD_DATA`).
+//! Decoded frames ride the global ring as `AbsoluteEvent`
+//! (`ABS_X`/`ABS_Y`, primary contact) + per-slot `TouchEvent`s,
+//! and the evdev node as one protocol-B MT frame per packet.
+//!
 //! Init sequence:
 //!   1. Enable the AUX channel via cmd 0xA8.
 //!   2. Set bit 1 (AUX IRQ) in the controller config; clear bit 5
@@ -53,20 +78,30 @@
 //!      a system without a PS/2 mouse won't ack but the kernel
 //!      keeps booting.
 //!   4. Negotiate the protocol (`psmouse::negotiate_protocol`):
-//!      Synaptics/ALPS vendor probes, a reset to defaults, then
-//!      the IntelliMouse/Explorer knocks. On failure the device
-//!      stays a 3-byte standard mouse.
+//!      Synaptics/ALPS/Elantech vendor probes, a reset to defaults,
+//!      then the IntelliMouse/Explorer knocks. On failure the
+//!      device stays a 3-byte standard mouse. An Elantech match
+//!      returns before the reset/knocks, with absolute mode
+//!      already enabled.
 //!   5. Restore the sample rate to 100 (the knocks leave it at 80,
 //!      or 40 after the Explorer tilt knock; Linux
 //!      `psmouse_initialize` does the same), then 0xD4 + 0xF4
-//!      (enable data reporting).
+//!      (enable data reporting). The restore is skipped for
+//!      Elantech — a rate set loses register 0x07 on v4 hardware
+//!      (Linux `elantech_set_rate_restore_reg_07`).
 
 use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
 use narf_arch::x86_64::io_port::{inb, outb};
 use narf_input::{
-    evdev::{dispatch_pointer_wheel_to_node, key, rel, DeviceCaps, DeviceNode, ROUTER},
-    push_global, InputEvent, PointerButtons, PointerEvent, ScrollEvent,
+    abs,
+    btn::{BTN_TOOL_DOUBLETAP, BTN_TOOL_QUADTAP, BTN_TOOL_TRIPLETAP},
+    evdev::{
+        dispatch_pointer_wheel_to_node, key, prop, rel, DeviceCaps, DeviceNode, MtContactUpdate,
+        MtEvdevState, ROUTER,
+    },
+    push_global, AbsoluteEvent, AxisInfo, InputEvent, PointerButtons, PointerEvent, ScrollEvent,
+    TouchEvent, TouchState,
 };
 
 extern crate alloc;
@@ -100,12 +135,13 @@ const MOUSE_BAT_OK: u8 = 0xAA;
 
 #[derive(Debug)]
 pub struct State {
-    /// Bytes 0..=3 of the in-flight packet. `phase` tracks how many
+    /// Bytes 0..=5 of the in-flight packet. `phase` tracks how many
     /// bytes we've collected. When phase reaches the negotiated
-    /// packet length (3 standard, 4 IntelliMouse/Explorer — see
-    /// `crate::psmouse::packet_len`), we emit the PointerEvent /
-    /// ScrollEvent + reset to 0.
-    pkt: [AtomicU8; 4],
+    /// packet length (3 standard, 4 IntelliMouse/Explorer/Elantech
+    /// v1, 6 Elantech v2–v4 — see `crate::psmouse::packet_len`), we
+    /// emit the PointerEvent / ScrollEvent / absolute frame + reset
+    /// to 0.
+    pkt: [AtomicU8; 6],
     phase: AtomicU8,
     rel_dx_acc: AtomicI32,
     rel_dy_acc: AtomicI32,
@@ -124,6 +160,8 @@ impl State {
     pub const fn new() -> Self {
         Self {
             pkt: [
+                AtomicU8::new(0),
+                AtomicU8::new(0),
                 AtomicU8::new(0),
                 AtomicU8::new(0),
                 AtomicU8::new(0),
@@ -155,6 +193,22 @@ static MOUSE_EVDEV_NODE: narf_lib::sync::IrqSafeSpinLock<Option<Arc<DeviceNode>>
 /// Raw pointer cache for lock-free IRQ access.
 static MOUSE_NODE_PTR: core::sync::atomic::AtomicPtr<DeviceNode> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Elantech decode state (v3 head stash, v4 finger slots, v1
+/// jumpy-cursor counter). Only ever taken on the IRQ/test feed
+/// path, so IRQ context is safe.
+static ELANTECH_STATE: narf_lib::sync::IrqSafeSpinLock<psmouse::ElantechState> =
+    narf_lib::sync::IrqSafeSpinLock::new(psmouse::ElantechState::new());
+/// Previous Elantech touch slots, for `TouchEvent` Down/Move/Up
+/// derivation on the global ring.
+static ELANTECH_PREV: narf_lib::sync::IrqSafeSpinLock<[psmouse::ElantechSlot; 5]> =
+    narf_lib::sync::IrqSafeSpinLock::new([psmouse::ElantechSlot::new(); 5]);
+/// Evdev protocol-B MT emitter for the Elantech pad (5 slots).
+/// Created in `init()` once the protocol is known; `None` in
+/// tests that only force the protocol (global-ring assertions
+/// still run there).
+static ELANTECH_MT: narf_lib::sync::IrqSafeSpinLock<Option<MtEvdevState>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn take_rel_delta() -> (i32, i32) {
     let dx = STATE.rel_dx_acc.swap(0, Ordering::AcqRel);
@@ -335,12 +389,14 @@ pub unsafe fn init() -> Result<(), InitError> {
     }
 
     if reporting_ok {
-        // 4b. Negotiate the protocol: Synaptics/ALPS vendor probes,
-        // a reset to defaults, then the IntelliMouse/Explorer knocks
-        // (see `crate::psmouse`). On any failure the device stays a
-        // 3-byte standard mouse — the packet parser below keys off
-        // the negotiated length, so a failed knock can never
-        // corrupt the stream.
+        // 4b. Negotiate the protocol: Synaptics/ALPS/Elantech
+        // vendor probes, a reset to defaults, then the
+        // IntelliMouse/Explorer knocks (see `crate::psmouse`). On
+        // any failure the device stays a 3-byte standard mouse —
+        // the packet parser below keys off the negotiated length,
+        // so a failed knock can never corrupt the stream. An
+        // Elantech match returns before the reset/knocks, with
+        // absolute mode already enabled.
         let (hw, proto) = psmouse::negotiate_protocol(&mut AuxTransport);
         psmouse::set_detected(hw, proto);
     }
@@ -350,7 +406,17 @@ pub unsafe fn init() -> Result<(), InitError> {
         // `psmouse_initialize`): the knocks leave it at 80, or 40
         // after the Explorer tilt knock. Best-effort — a missed
         // restore only costs report rate, not correctness.
-        let _ = aux_send_param(psmouse::CMD_SET_RATE, psmouse::RESTORE_RATE);
+        // Skipped for Elantech: a rate set loses register 0x07 on
+        // v4 hardware (Linux `elantech_set_rate_restore_reg_07`
+        // exists for exactly this reason), and absolute mode does
+        // not need a 100 Hz sample rate.
+        let proto = psmouse::protocol();
+        if !matches!(
+            proto,
+            psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech
+        ) {
+            let _ = aux_send_param(psmouse::CMD_SET_RATE, psmouse::RESTORE_RATE);
+        }
     }
 
     if reporting_ok {
@@ -370,10 +436,17 @@ pub unsafe fn init() -> Result<(), InitError> {
     // `REL_WHEEL`, Explorer mice add `REL_HWHEEL` (4.0 tilt) plus
     // the 4th/5th buttons (`BTN_SIDE`/`BTN_EXTRA`). A Synaptics or
     // ALPS pad detected by the vendor probes keeps its vendor name
-    // but reports relative packets until absolute mode lands.
+    // but reports relative packets until absolute mode lands. An
+    // Elantech pad reports absolute packets (`ABS_X`/`ABS_Y` +
+    // protocol-B MT slots) and no relative axes at all.
     let proto = psmouse::protocol();
     let hw = psmouse::hardware();
+    let is_elantech = matches!(
+        proto,
+        psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech
+    );
     let name = match (hw, proto) {
+        (psmouse::PsmouseHardware::Elantech, _) => "PS/2 Elantech TouchPad",
         (psmouse::PsmouseHardware::Synaptics, _) => "PS/2 Synaptics TouchPad",
         (psmouse::PsmouseHardware::Alps, _) => "PS/2 ALPS TouchPad",
         (_, psmouse::PsmouseProtocol::IntelliMouse) => "PS/2 Wheel Mouse",
@@ -390,8 +463,10 @@ pub unsafe fn init() -> Result<(), InitError> {
         narf_input::evdev::InputId::new(narf_input::evdev::bus::I8042, 0x0002, 0x0001, 0),
     );
     caps.add_prop(narf_input::evdev::prop::POINTER);
-    caps.add_rel(rel::REL_X);
-    caps.add_rel(rel::REL_Y);
+    if !is_elantech {
+        caps.add_rel(rel::REL_X);
+        caps.add_rel(rel::REL_Y);
+    }
     caps.add_key(key::BTN_LEFT);
     caps.add_key(key::BTN_RIGHT);
     caps.add_key(key::BTN_MIDDLE);
@@ -411,6 +486,48 @@ pub unsafe fn init() -> Result<(), InitError> {
             caps.add_key(key::BTN_EXTRA);
         }
         psmouse::PsmouseProtocol::Standard => {}
+        // Elantech absolute caps are declared in the `is_elantech`
+        // block just below (ABS_X/Y + MT slots, no REL axes).
+        psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech => {}
+    }
+    if is_elantech {
+        // Absolute axes + protocol-B MT slots, same shape as the
+        // I2C-HID touch driver (`add_mt_axes`): `ABS_X`/`ABS_Y`
+        // span the negotiated device ranges, `ABS_MT_SLOT` spans
+        // the 5 v4 slots, and pressure/width ride only when the
+        // firmware reports them.
+        if let Some(info) = psmouse::elantech_info() {
+            let axis = |max: u32| AxisInfo {
+                min: 0,
+                max: max as i32,
+                fuzz: 0,
+                flat: 0,
+                res: 0,
+            };
+            caps.add_abs_info(abs::ABS_X, axis(info.x_max));
+            caps.add_abs_info(abs::ABS_Y, axis(info.y_max));
+            caps.add_abs_info(abs::ABS_MT_SLOT, axis(4));
+            caps.add_abs_info(abs::ABS_MT_TRACKING_ID, axis(0xFFFF));
+            caps.add_abs_info(abs::ABS_MT_POSITION_X, axis(info.x_max));
+            caps.add_abs_info(abs::ABS_MT_POSITION_Y, axis(info.y_max));
+            if info.reports_pressure {
+                let pressure = axis(255);
+                caps.add_abs_info(abs::ABS_PRESSURE, pressure);
+                caps.add_abs_info(abs::ABS_TOOL_WIDTH, axis(15));
+                caps.add_abs_info(abs::ABS_MT_PRESSURE, pressure);
+            }
+            caps.add_key(key::BTN_TOUCH);
+            caps.add_key(key::BTN_TOOL_FINGER);
+            caps.add_key(BTN_TOOL_DOUBLETAP);
+            caps.add_key(BTN_TOOL_TRIPLETAP);
+            if info.hw_version >= 2 {
+                caps.add_key(BTN_TOOL_QUADTAP);
+            }
+            if info.buttonpad {
+                caps.add_prop(prop::BUTTONPAD);
+            }
+            *ELANTECH_MT.lock() = Some(MtEvdevState::new(5));
+        }
     }
     let (_dev_id, node_arc) = ROUTER.register_device(caps);
     MOUSE_NODE_PTR.store(Arc::as_ptr(&node_arc) as *mut DeviceNode, Ordering::Release);
@@ -488,7 +605,201 @@ fn dispatch_packet_to_evdev(dx: i32, dy: i32, wheel: i32, hwheel: i32, buttons: 
 /// handler and the test feed — a single decode path, so a 4-byte
 /// packet can never be parsed as 3-byte in one path and 4-byte in
 /// the other (that would corrupt the stream, not just fail a test).
+/// Elantech absolute packets take their own branch: byte 0 carries
+/// finger counts / traces / parity, not the PS/2 sync bit, so the
+/// `0x08` resync below would drop live v2/v3/v4 packets.
 fn feed_byte(byte: u8) {
+    match psmouse::protocol() {
+        psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech => {
+            feed_elantech_byte(byte)
+        }
+        _ => feed_relative_byte(byte),
+    }
+}
+
+/// Elantech absolute-packet feed: collect `packet_len` bytes with
+/// no sync-bit filtering, then run the per-version packet check
+/// and decode (Linux `elantech_process_byte`). An invalid packet
+/// is dropped and the phase resets (`PSMOUSE_BAD_DATA`); a
+/// debounce packet is ignored whole; a v3 head packet only
+/// stashes its finger and produces no frame yet.
+fn feed_elantech_byte(byte: u8) {
+    let len = psmouse::packet_len() as u8;
+    let phase = STATE.phase.load(Ordering::Acquire);
+    STATE.pkt[phase as usize].store(byte, Ordering::Release);
+    let next = phase + 1;
+    if next < len {
+        STATE.phase.store(next, Ordering::Release);
+        return;
+    }
+    STATE.phase.store(0, Ordering::Release);
+    let mut raw = [0u8; 6];
+    for (i, b) in raw.iter_mut().enumerate().take(len as usize) {
+        *b = STATE.pkt[i].load(Ordering::Acquire);
+    }
+    let Some(info) = psmouse::elantech_info() else {
+        return;
+    };
+    let frame = {
+        let mut state = ELANTECH_STATE.lock();
+        match psmouse::protocol() {
+            psmouse::PsmouseProtocol::ElantechV1 => {
+                let p4 = [raw[0], raw[1], raw[2], raw[3]];
+                if !psmouse::elantech_packet_check_v1(&p4, info.fw_version) {
+                    return;
+                }
+                psmouse::decode_elantech_v1(
+                    &mut state,
+                    &p4,
+                    info.fw_version,
+                    info.y_max,
+                    info.jumpy_cursor,
+                )
+            }
+            _ => {
+                if info.hw_version == 2 {
+                    // Ignore debounce.
+                    if psmouse::elantech_is_debounce_v2(&raw) {
+                        return;
+                    }
+                    if !psmouse::elantech_packet_check_v2(&raw, info.reports_pressure) {
+                        return;
+                    }
+                    Some(psmouse::decode_elantech_v2(&mut state, &raw, info.y_max))
+                } else if info.hw_version == 3 {
+                    match psmouse::elantech_packet_check_v3(&raw, info.crc_enabled) {
+                        psmouse::ElantechPacket::Unknown
+                        | psmouse::ElantechPacket::Debounce
+                        | psmouse::ElantechPacket::Trackpoint => return,
+                        t => psmouse::decode_elantech_v3(
+                            &mut state,
+                            &raw,
+                            t,
+                            info.y_max,
+                            info.buttonpad,
+                        ),
+                    }
+                } else {
+                    match psmouse::elantech_packet_check_v4(
+                        &raw,
+                        info.crc_enabled,
+                        info.fw_version,
+                        info.samples_1,
+                        info.has_trackpoint,
+                    ) {
+                        psmouse::ElantechPacket::Unknown | psmouse::ElantechPacket::Trackpoint => {
+                            return
+                        }
+                        t => psmouse::decode_elantech_v4(
+                            &mut state,
+                            &raw,
+                            t,
+                            info.y_max,
+                            info.width,
+                            info.buttonpad,
+                        ),
+                    }
+                }
+            }
+        }
+    };
+    let Some(frame) = frame else {
+        return;
+    };
+    narf_input::I8042_MOUSE_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
+    dispatch_elantech_frame(&frame, &info);
+}
+
+/// Route one decoded Elantech frame: absolute X/Y for the primary
+/// contact plus per-slot `TouchEvent`s (Down/Move/Up from the
+/// previous frame) on the global ring, and one protocol-B MT frame
+/// on the evdev node (`ABS_X`/`ABS_Y` follow the lowest live slot,
+/// `BTN_TOUCH` tracks any contact, integrated buttons ride as
+/// `BTN_LEFT`/`BTN_RIGHT` edges — `MtEvdevState` owns those wire
+/// rules; a no-change frame emits nothing there).
+fn dispatch_elantech_frame(frame: &psmouse::ElantechFrame, info: &psmouse::ElantechInfo) {
+    if frame.fingers != 0 {
+        let primary = frame.slots[0];
+        let _ = push_global(InputEvent::Absolute(AbsoluteEvent {
+            axis: abs::ABS_X,
+            value: primary.x as i32,
+        }));
+        let _ = push_global(InputEvent::Absolute(AbsoluteEvent {
+            axis: abs::ABS_Y,
+            value: primary.y as i32,
+        }));
+    }
+    let mut prev = ELANTECH_PREV.lock();
+    for (slot, s) in frame.slots.iter().enumerate() {
+        let was = prev[slot].active;
+        let state = match (was, s.active) {
+            (false, true) => Some(TouchState::Down),
+            (true, true) => Some(TouchState::Move),
+            (true, false) => Some(TouchState::Up),
+            (false, false) => None,
+        };
+        if let Some(state) = state {
+            // A release reports the last known position.
+            let (x, y) = if s.active {
+                (s.x, s.y)
+            } else {
+                (prev[slot].x, prev[slot].y)
+            };
+            let _ = push_global(InputEvent::Touch(TouchEvent {
+                slot: slot as u8,
+                tracking_id: if s.active { Some(slot as i32) } else { None },
+                id: slot as u16,
+                x: x as i32,
+                y: y as i32,
+                pressure: if info.reports_pressure {
+                    s.pressure as i32
+                } else {
+                    0
+                },
+                state,
+            }));
+        }
+    }
+    *prev = frame.slots;
+    drop(prev);
+    let raw = MOUSE_NODE_PTR.load(Ordering::Acquire);
+    if raw.is_null() {
+        return;
+    }
+    let mut mt = ELANTECH_MT.lock();
+    let Some(mt) = mt.as_mut() else {
+        return;
+    };
+    // SAFETY: `raw` is the `Arc::as_ptr` of the node stored once in `init()`
+    // before IRQ 12 is armed; the Arc is held alive in `MOUSE_EVDEV_NODE`,
+    // so the pointee outlives this borrow. Non-null checked just above.
+    let node_ref: &DeviceNode = unsafe { &*raw };
+    let mut updates = [MtContactUpdate {
+        slot: 0,
+        active: false,
+        tracking_id: 0,
+        x: 0,
+        y: 0,
+        pressure: None,
+    }; 5];
+    for (slot, s) in frame.slots.iter().enumerate() {
+        updates[slot] = MtContactUpdate {
+            slot,
+            active: s.active,
+            tracking_id: slot as i32,
+            x: s.x as i32,
+            y: s.y as i32,
+            pressure: if info.reports_pressure && s.active {
+                Some(s.pressure as i32)
+            } else {
+                None
+            },
+        };
+    }
+    mt.dispatch_frame(node_ref, &updates, frame.left, frame.right);
+}
+
+fn feed_relative_byte(byte: u8) {
     // Packet length comes from the negotiated protocol (3 standard,
     // 4 IntelliMouse/Explorer). A failed knock leaves it at 3, so
     // a plain mouse can never be mis-parsed as a wheel mouse.
@@ -547,6 +858,9 @@ fn feed_byte(byte: u8) {
             (w.wheel, w.hwheel)
         }
         psmouse::PsmouseProtocol::Standard => (0, 0),
+        // Elantech never reaches this function (`feed_byte`
+        // routes it to `feed_elantech_byte`).
+        psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech => (0, 0),
     };
 
     STATE.rel_dx_acc.fetch_add(dx, Ordering::Relaxed);
@@ -612,6 +926,9 @@ pub fn __reset_for_test() {
     STATE.rel_wheel_acc.store(0, Ordering::Release);
     STATE.rel_hwheel_acc.store(0, Ordering::Release);
     STATE.prev_buttons.store(0, Ordering::Release);
+    *ELANTECH_STATE.lock() = psmouse::ElantechState::new();
+    *ELANTECH_PREV.lock() = [psmouse::ElantechSlot::new(); 5];
+    *ELANTECH_MT.lock() = None;
     psmouse::set_detected(
         psmouse::PsmouseHardware::Generic,
         psmouse::PsmouseProtocol::Standard,
@@ -622,6 +939,14 @@ pub fn __reset_for_test() {
 /// feed 4-byte packets without a device). Restored to `Standard`
 /// by `__reset_for_test`.
 pub fn set_protocol_for_test(proto: psmouse::PsmouseProtocol) {
+    psmouse::set_protocol_for_test(proto);
+}
+
+/// Test-only: force an Elantech protocol + info pair (lets
+/// absolute-packet fixtures feed without a device). Restored by
+/// `__reset_for_test` (which clears the info via `set_detected`).
+pub fn set_elantech_for_test(proto: psmouse::PsmouseProtocol, info: &psmouse::ElantechInfo) {
+    psmouse::set_elantech_info_for_test(info);
     psmouse::set_protocol_for_test(proto);
 }
 
