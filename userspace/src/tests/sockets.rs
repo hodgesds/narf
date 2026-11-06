@@ -2196,13 +2196,16 @@ fn fake_bt_connect_ready(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bo
 }
 
 /// Cancel a scripted outbound open (#1532): drop its scripted
-/// outcomes and record the cancel.
-fn fake_bt_cancel_connect(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) {
+/// outcomes and record the cancel. `true` when a scripted outcome
+/// was dropped, `false` when nothing was in flight.
+fn fake_bt_cancel_connect(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool {
     let mut fake = FAKE_BT.lock();
     fake.connect_cancels.push((dev, peer, psm, le, rfcomm));
+    let before = fake.connect_script.len();
     fake.connect_script.retain(|(d, p, s, l, r, _)| {
         !(*d == dev && *p == peer && *s == psm && *l == le && *r == rfcomm)
     });
+    fake.connect_script.len() != before
 }
 
 /// Reset the fake and install it as the bridge + HCI providers.

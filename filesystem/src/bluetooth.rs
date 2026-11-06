@@ -348,7 +348,13 @@ pub type BtConnectHandler =
     fn(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> BtConnectStatus;
 pub type BtConnectReadyHandler =
     fn(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool;
-pub type BtCancelConnectHandler = fn(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool);
+/// Cancel handler: `true` when an in-flight outbound open was
+/// dropped, `false` when nothing was in flight. Matches
+/// `narf_bluetooth::pump::cancel_connect`; the other connect handlers
+/// carry their results the same way (`BtDisconnectChannelHandler`,
+/// `BtCloseRfcommHandler`).
+pub type BtCancelConnectHandler =
+    fn(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool;
 
 static BT_CONNECT: AtomicUsize = AtomicUsize::new(0);
 static BT_CONNECT_READY: AtomicUsize = AtomicUsize::new(0);
@@ -392,7 +398,9 @@ pub fn bt_connect_ready(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: boo
 
 /// Abandon an in-flight outbound open to `peer` (socket close):
 /// drop the record and tear down any half-opened channel. No-op
-/// when no stack is installed or nothing is in flight.
+/// when no stack is installed or nothing is in flight. The
+/// handler's "anything dropped" result is fire-and-forget here;
+/// socket close does not act on it.
 pub fn bt_cancel_connect(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) {
     let h = BT_CANCEL_CONNECT.load(Ordering::Acquire);
     if h == 0 {
@@ -401,7 +409,7 @@ pub fn bt_cancel_connect(dev: u16, peer: [u8; 7], psm: u16, le: bool, rfcomm: bo
     // SAFETY: only ever stored as `BtCancelConnectHandler as usize`.
     let f: BtCancelConnectHandler =
         unsafe { core::mem::transmute::<usize, BtCancelConnectHandler>(h) };
-    f(dev, peer, psm, le, rfcomm)
+    let _ = f(dev, peer, psm, le, rfcomm);
 }
 
 /// Register `psm` on controller `dev`'s pump for a listening socket
