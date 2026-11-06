@@ -149,6 +149,9 @@ const REG_TDT: u64 = 0x3818;
 const REG_TXDCTL0: u64 = 0x3828;
 const REG_RAL0: u64 = 0x5400;
 const REG_RAH0: u64 = 0x5404;
+/// Receive Address High: Address Valid (same register/bit as
+/// e1000's `RAH_AV`; 82575/82576 RAH layout).
+const RAH_AV: u32 = 1 << 31;
 /// SRRCTL — Split-and-Replication Receive Control, queue 0.
 /// Linux: drivers/net/ethernet/intel/igb/e1000_regs.h E1000_SRRCTL.
 const REG_SRRCTL_Q0: u64 = 0x280C;
@@ -892,16 +895,22 @@ pub struct EthtoolStats {
     pub tx_packets: u64,
     pub tx_bytes: u64,
     pub tx_errors: u64,
+    /// TX stall recoveries (Linux `tx_timeout_count`).
+    pub tx_timeouts: u64,
+    /// Controller resets performed by [`Igb::recover`].
+    pub tx_resets: u64,
 }
 
 /// Statistic names in snapshot order (Linux `igb_get_strings` shape,
 /// restricted to the counters this driver actually maintains).
-pub const IGB_STAT_NAMES: [&str; 5] = [
+pub const IGB_STAT_NAMES: [&str; 7] = [
     "rx_packets",
     "rx_bytes",
     "tx_packets",
     "tx_bytes",
     "tx_errors",
+    "tx_timeouts",
+    "tx_resets",
 ];
 
 /// Whole ethtool read surface for one igb device.
@@ -944,6 +953,8 @@ pub struct IgbStats {
     tx_packets: AtomicU64,
     tx_bytes: AtomicU64,
     tx_errors: AtomicU64,
+    tx_timeouts: AtomicU64,
+    tx_resets: AtomicU64,
 }
 
 impl IgbStats {
@@ -961,6 +972,14 @@ impl IgbStats {
         self.tx_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn note_tx_timeout(&self) {
+        self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_tx_reset(&self) {
+        self.tx_resets.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> EthtoolStats {
         EthtoolStats {
             rx_packets: self.rx_packets.load(Ordering::Relaxed),
@@ -968,6 +987,8 @@ impl IgbStats {
             tx_packets: self.tx_packets.load(Ordering::Relaxed),
             tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
             tx_errors: self.tx_errors.load(Ordering::Relaxed),
+            tx_timeouts: self.tx_timeouts.load(Ordering::Relaxed),
+            tx_resets: self.tx_resets.load(Ordering::Relaxed),
         }
     }
 }
@@ -1089,6 +1110,14 @@ const TXD_STAT_DD: u8 = 1 << 0;
 // Ring sizes — must be a multiple of 8.
 const TX_RING_LEN: usize = 8;
 const TX_RING_USABLE: usize = TX_RING_LEN - 1;
+
+/// TX watchdog timeout (Linux `dev->watchdog_timeo` is 5 s by
+/// default, and igc's supervisor uses the same 5 s): a TX descriptor
+/// posted longer ago than this with no DD is a wedged ring, not
+/// congestion.
+const TX_TIMEOUT_NS: u64 = 5_000_000_000;
+/// Watchdog supervisor cadence, matching igc's 10 ms maintenance tick.
+const TX_WATCHDOG_POLL_NS: u64 = 10_000_000;
 const RX_RING_LEN: usize = 256;
 const FRAME_SIZE: usize = 2048;
 
@@ -1308,6 +1337,12 @@ pub struct AdvTxDataDesc {
 struct TxTicket {
     slot: usize,
     generation: u64,
+    /// Ring epoch at reservation time: a watchdog recovery resets
+    /// the cursor and advances the epoch, so a ticket from before
+    /// the reset never compares as completed — its frame was dropped
+    /// with the ring, and its `wait_for_tx` must time out rather
+    /// than report a success it did not earn.
+    epoch: u64,
 }
 
 /// Producer/consumer bookkeeping for the queue-0 TX ring. One descriptor is
@@ -1327,6 +1362,14 @@ struct TxRingCursor {
     in_flight: usize,
     generations: [u64; TX_RING_LEN],
     is_context: [bool; TX_RING_LEN],
+    /// Cycle counter at which each slot was posted (`0` = no
+    /// descriptor outstanding). The watchdog treats an aged entry
+    /// as a wedged ring.
+    posted_at: [u64; TX_RING_LEN],
+    /// Ring epoch, advanced by [`TxRingCursor::reset`] on every
+    /// watchdog recovery. A ticket from an earlier epoch belongs to
+    /// a ring whose descriptors were discarded with the reset.
+    epoch: u64,
 }
 
 impl TxRingCursor {
@@ -1337,10 +1380,35 @@ impl TxRingCursor {
             in_flight: 0,
             generations: [0; TX_RING_LEN],
             is_context: [false; TX_RING_LEN],
+            posted_at: [0; TX_RING_LEN],
+            epoch: 0,
         }
     }
 
+    /// Reset after the device was reset: no posted descriptor will
+    /// ever complete, so every slot is free again, no post time
+    /// survives, and no slot is a stale context descriptor. The
+    /// epoch advances so tickets issued before the reset never
+    /// compare as completed — their frames were dropped with the
+    /// ring. Generations are preserved: a stale ticket's generation
+    /// still matches only if its slot was never re-reserved, and the
+    /// epoch gate in `tx_ticket_done` decides the rest.
+    fn reset(&mut self) {
+        self.next_to_use = 0;
+        self.next_to_clean = 0;
+        self.in_flight = 0;
+        self.is_context = [false; TX_RING_LEN];
+        self.posted_at = [0; TX_RING_LEN];
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
     fn reserve(&mut self) -> Option<TxTicket> {
+        self.reserve_at(narf_time::now_cycles())
+    }
+
+    /// Reserve with an explicit post time, so the fixture can age a
+    /// descriptor without waiting out a real 5 s stall.
+    fn reserve_at(&mut self, now: u64) -> Option<TxTicket> {
         if self.in_flight >= TX_RING_USABLE {
             return None;
         }
@@ -1349,9 +1417,11 @@ impl TxRingCursor {
         self.in_flight += 1;
         self.generations[slot] = self.generations[slot].wrapping_add(1);
         self.is_context[slot] = false;
+        self.posted_at[slot] = now;
         Some(TxTicket {
             slot,
             generation: self.generations[slot],
+            epoch: self.epoch,
         })
     }
 
@@ -1360,6 +1430,11 @@ impl TxRingCursor {
     /// pair may wrap across the ring end (context in the last slot,
     /// data in slot 0).
     fn reserve_pair(&mut self) -> Option<(TxTicket, TxTicket)> {
+        self.reserve_pair_at(narf_time::now_cycles())
+    }
+
+    /// Reserve a pair with an explicit post time (see `reserve_at`).
+    fn reserve_pair_at(&mut self, now: u64) -> Option<(TxTicket, TxTicket)> {
         if self.in_flight + 2 > TX_RING_USABLE {
             return None;
         }
@@ -1371,14 +1446,18 @@ impl TxRingCursor {
         self.generations[data_slot] = self.generations[data_slot].wrapping_add(1);
         self.is_context[ctx_slot] = true;
         self.is_context[data_slot] = false;
+        self.posted_at[ctx_slot] = now;
+        self.posted_at[data_slot] = now;
         Some((
             TxTicket {
                 slot: ctx_slot,
                 generation: self.generations[ctx_slot],
+                epoch: self.epoch,
             },
             TxTicket {
                 slot: data_slot,
                 generation: self.generations[data_slot],
+                epoch: self.epoch,
             },
         ))
     }
@@ -1392,12 +1471,23 @@ impl TxRingCursor {
     fn complete_oldest(&mut self) {
         debug_assert!(self.in_flight != 0);
         self.is_context[self.next_to_clean] = false;
+        self.posted_at[self.next_to_clean] = 0;
         self.next_to_clean = (self.next_to_clean + 1) % TX_RING_LEN;
         self.in_flight -= 1;
     }
 
+    /// True when any posted descriptor has waited longer than
+    /// `timeout` cycles for its DD bit — the ring is wedged (igc
+    /// `Queue::stalled` shape, per-slot so a later post cannot mask
+    /// an older stuck one).
+    fn stalled(&self, now: u64, timeout: u64) -> bool {
+        self.posted_at
+            .iter()
+            .any(|&posted| posted != 0 && now.wrapping_sub(posted) > timeout)
+    }
+
     fn ticket_was_reused(&self, ticket: TxTicket) -> bool {
-        self.generations[ticket.slot] != ticket.generation
+        ticket.epoch == self.epoch && self.generations[ticket.slot] != ticket.generation
     }
 }
 
@@ -1556,6 +1646,11 @@ pub struct Igb {
     /// Datapath gates (see [`datapath_allowed`]).
     suspended: AtomicBool,
     detached: AtomicBool,
+    /// Set while [`Igb::recover`] owns the reset sequence: TX posts
+    /// fail fast instead of racing the ring reprogram (the fresh
+    /// ring's TDT is re-zeroed by recovery, so a post landing
+    /// mid-reset would be silently dropped).
+    recovering: AtomicBool,
     rx_head: IrqSafeSpinLock<u16>,
     /// Reject nested/concurrent drains while an RX callback owns the current
     /// descriptor. A callback may synchronously transmit, whose responsive
@@ -1841,6 +1936,7 @@ impl Igb {
             wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
             suspended: AtomicBool::new(false),
             detached: AtomicBool::new(false),
+            recovering: AtomicBool::new(false),
             rx_head: IrqSafeSpinLock::new(0),
             rx_draining: AtomicBool::new(false),
             ready: true,
@@ -2611,6 +2707,244 @@ impl Igb {
         }
     }
 
+    /// TX stall recoveries (Linux `tx_timeout_count`).
+    pub fn tx_timeouts(&self) -> u64 {
+        self.stats.tx_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Controller resets performed by [`Igb::recover`].
+    pub fn tx_resets(&self) -> u64 {
+        self.stats.tx_resets.load(Ordering::Relaxed)
+    }
+
+    /// One watchdog pass (shared by the supervisor task and the
+    /// fixture): if the link is up and a TX descriptor has waited
+    /// past the timeout, count the timeout and recover. Returns
+    /// true when recovery fired.
+    fn check_tx_watchdog_at(&self, now: u64) -> bool {
+        if self.detached.load(Ordering::Acquire)
+            || self.suspended.load(Ordering::Acquire)
+            || self.recovering.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        if !self.link_up() {
+            return false;
+        }
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        if !self.tx_state.lock().stalled(now, timeout) {
+            return false;
+        }
+        self.stats.note_tx_timeout();
+        self.recover().is_ok()
+    }
+
+    /// TX-timeout recovery (Linux `igb_tx_timeout` + `igb_reset`
+    /// shape): stop the queue-0 DMA engines and the TX/RX units,
+    /// master-reset the MAC, reprogram the rings and filters from
+    /// the bring-up values and the live shadows, and restart. The
+    /// TX cursor is reset — descriptors posted before the reset
+    /// will never complete. A reset that never self-clears reports
+    /// `ResetTimeout`; a queue whose ENABLE never reflects reports
+    /// `QueueEnableTimeout`; a concurrent recovery reports `Other`
+    /// without touching the device. VT state is left untouched,
+    /// matching `resume()`: a VF reset event arriving mid-recovery
+    /// is handled by the mailbox pump once the queues are back.
+    pub fn recover(&self) -> Result<(), IgbError> {
+        if self.detached.load(Ordering::Acquire) || self.suspended.load(Ordering::Acquire) {
+            return Err(IgbError::Other("igb device detached or suspended"));
+        }
+        if self.recovering.swap(true, Ordering::AcqRel) {
+            return Err(IgbError::Other("igb TX recovery already in progress"));
+        }
+        let result = self.recover_inner();
+        self.recovering.store(false, Ordering::Release);
+        if result.is_ok() {
+            self.stats.note_tx_reset();
+        }
+        result
+    }
+
+    fn recover_inner(&self) -> Result<(), IgbError> {
+        let q0 = queue_regs(0);
+        // 1. Stop the queue-0 DMA engines and the TX/RX units, and
+        // mask interrupts (suspend order).
+        // SAFETY: mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_IMC, !0u32);
+            self.mmio.write32(REG_EIMC, !0u32);
+            self.mmio.write32(
+                q0.txdctl,
+                queue_disable_word(self.mmio.read32(q0.txdctl)),
+            );
+            self.mmio.write32(
+                q0.rxdctl,
+                queue_disable_word(self.mmio.read32(q0.rxdctl)),
+            );
+            self.mmio.write32(REG_TCTL, TCTL_SUSPEND_OFF);
+            self.mmio.write32(REG_RCTL, RCTL_SUSPEND_OFF);
+        }
+        // 2. Master reset (CTRL.RST = 1; cleared by hardware after
+        // reset). I210 datasheet §3.3.1: RST self-clears within
+        // ~1 ms; 100 ms is the wedge threshold (same bound as
+        // bring-up).
+        // SAFETY: mapped MMIO.
+        unsafe {
+            let ctrl = self.mmio.read32(REG_CTRL);
+            self.mmio.write32(REG_CTRL, ctrl | CTRL_RST);
+        }
+        let cleared = narf_scheduler::responsive_spin_until(
+            // SAFETY: mapped MMIO.
+            || unsafe { self.mmio.read32(REG_CTRL) } & CTRL_RST == 0,
+            narf_time::Deadline::after_ms(100),
+        );
+        if !cleared {
+            return Err(IgbError::ResetTimeout);
+        }
+        // 3. Reprogram the station address and restart link
+        // (bring-up steps 3–4): CTRL.RST reloads RAL0/RAH0 from
+        // EEPROM, but re-writing the live MAC keeps recovery
+        // identical to bring-up, and re-kicks autonegotiation.
+        let ral = self.mac[0] as u32
+            | ((self.mac[1] as u32) << 8)
+            | ((self.mac[2] as u32) << 16)
+            | ((self.mac[3] as u32) << 24);
+        let rah = self.mac[4] as u32 | ((self.mac[5] as u32) << 8) | RAH_AV;
+        // SAFETY: mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_RAL0, ral);
+            self.mmio.write32(REG_RAH0, rah);
+            let ctrl = self.mmio.read32(REG_CTRL);
+            self.mmio.write32(
+                REG_CTRL,
+                ctrl | CTRL_SLU | CTRL_FD | CTRL_SPEED_1000 | CTRL_FRCSPD | CTRL_FRCDPLX,
+            );
+            Self::phy_write(
+                &self.mmio,
+                PHY_BMCR,
+                PHY_BMCR_ANENABLE | PHY_BMCR_ANRESTART,
+            );
+        }
+        // Bounded wait for link (bring-up step 3); the result is
+        // ignored — a wedged cable must not fail the recovery.
+        narf_scheduler::responsive_spin_until(
+            // SAFETY: mapped MMIO.
+            || unsafe { self.mmio.read32(REG_STATUS) } & (1 << 1) != 0,
+            narf_time::Deadline::after_ms(50),
+        );
+        // 4. Zero the TX ring (stale DD bits would make a fresh
+        // post look instantly complete) and reprogram the TX ring
+        // + per-queue ENABLE handshake (bring-up step 6).
+        // SAFETY: coherent DMA ring via the kernel direct map.
+        unsafe {
+            for i in 0..(TX_RING_LEN * 16) {
+                core::ptr::write_volatile(self.tx_ring_buf.cpu_mut_ptr_at::<u8>(i as u64), 0);
+            }
+        }
+        let tx_phys = self.tx_ring_buf.dma_addr().raw();
+        // SAFETY: mapped MMIO.
+        unsafe {
+            self.mmio.write32(q0.tdbal, (tx_phys & 0xFFFF_FFFF) as u32);
+            self.mmio.write32(q0.tdbah, (tx_phys >> 32) as u32);
+            self.mmio.write32(q0.tdlen, (TX_RING_LEN * 16) as u32);
+            self.mmio.write32(q0.tdh, 0);
+            self.mmio.write32(q0.tdt, 0);
+            self.mmio.write32(REG_TCTL, TCTL_EN | TCTL_PSP);
+            let txdctl = queue_enable_word(self.mmio.read32(q0.txdctl));
+            self.mmio.write32(q0.txdctl, txdctl);
+        }
+        let tx_on = narf_scheduler::responsive_spin_until(
+            // SAFETY: mapped MMIO.
+            || unsafe { queue_enable_reflected(self.mmio.read32(q0.txdctl)) },
+            narf_time::Deadline::after_ms(100),
+        );
+        if !tx_on {
+            return Err(IgbError::QueueEnableTimeout);
+        }
+        // 5. Re-prime the RX descriptors from the pool and
+        // reprogram the RX ring + SRRCTL + RCTL + VET + VFTA
+        // (bring-up step 7), then the RX ENABLE handshake.
+        let rx_phys = self.rx_ring_buf.dma_addr().raw();
+        {
+            let pool = self.rx_buf_pool.lock();
+            for (i, buf) in pool.iter().enumerate().take(RX_RING_LEN) {
+                let desc = narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
+                    .kernel_mut_ptr::<AdvRxDescRead>();
+                // SAFETY: mapped DMA; slot bounded.
+                unsafe {
+                    core::ptr::write_volatile(
+                        desc,
+                        AdvRxDescRead {
+                            pkt_addr: buf.dma_addr().raw(),
+                            hdr_addr: 0,
+                        },
+                    );
+                }
+            }
+        }
+        // SAFETY: mapped MMIO.
+        unsafe {
+            self.mmio.write32(q0.rdbal, (rx_phys & 0xFFFF_FFFF) as u32);
+            self.mmio.write32(q0.rdbah, (rx_phys >> 32) as u32);
+            self.mmio.write32(q0.rdlen, (RX_RING_LEN * 16) as u32);
+            self.mmio.write32(q0.rdh, 0);
+            self.mmio.write32(q0.rdt, (RX_RING_LEN - 1) as u32);
+            let mut srrctl = self.mmio.read32(q0.srrctl);
+            srrctl &= !(SRRCTL_BSIZEPKT_MASK | SRRCTL_DESCTYPE_MASK);
+            srrctl |= ((FRAME_SIZE as u32) >> SRRCTL_BSIZEPKT_SHIFT) & SRRCTL_BSIZEPKT_MASK;
+            srrctl |= SRRCTL_DESCTYPE_ADV_ONEBUF;
+            self.mmio.write32(q0.srrctl, srrctl);
+            self.mmio.write32(
+                REG_RCTL,
+                RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
+            );
+            self.mmio.write32(REG_VET, VET_8021Q);
+            for word in 0..VFTA_WORDS {
+                self.mmio.write32(
+                    REG_VFTA_BASE + word as u64 * 4,
+                    self.vlan_filter.lock().word(word),
+                );
+            }
+            let rxdctl = queue_enable_word(self.mmio.read32(q0.rxdctl));
+            self.mmio.write32(q0.rxdctl, rxdctl);
+        }
+        let rx_on = narf_scheduler::responsive_spin_until(
+            // SAFETY: mapped MMIO.
+            || unsafe { queue_enable_reflected(self.mmio.read32(q0.rxdctl)) },
+            narf_time::Deadline::after_ms(100),
+        );
+        if !rx_on {
+            return Err(IgbError::QueueEnableTimeout);
+        }
+        // 6. Re-enable the interrupt block (resume order) and reset
+        // the software cursors now that the rings are fresh.
+        if self.irq_vector.is_some() {
+            // SAFETY: mapped MMIO.
+            unsafe {
+                self.mmio.write32(
+                    REG_GPIE,
+                    GPIE_NSICR | GPIE_MULTIPLE_MSIX | GPIE_EIAME | GPIE_PBA,
+                );
+                self.mmio.write32(REG_IVAR0, ivar0_shared_vector(0));
+                self.mmio.write32(REG_IVAR_MISC, ivar_misc_shared_vector(0));
+                self.mmio.write32(REG_EITR0, EITR_START | EITR_CNT_IGNR);
+                self.mmio.write32(REG_EIAC, MSIX_VECTOR0_MASK);
+                self.mmio.write32(REG_EIAM, MSIX_VECTOR0_MASK);
+                self.mmio.write32(REG_EIMS, MSIX_VECTOR0_MASK);
+                if self.vt.lock().is_some() {
+                    self.mmio.write32(vmdq::REG_MBVFIMR, vmdq::MBVFIMR_ALL_VFS);
+                    self.mmio.write32(REG_IMS, IMS_DEFAULT | IMS_VMMB);
+                } else {
+                    self.mmio.write32(REG_IMS, IMS_DEFAULT);
+                }
+            }
+        }
+        self.tx_state.lock().reset();
+        *self.rx_head.lock() = 0;
+        crate::publish::publish_link(igb_ifname(), igb_link_sample(self));
+        Ok(())
+    }
+
     pub fn link_up(&self) -> bool {
         // SAFETY: mapped MMIO; STATUS bit 1 = LU (link up).
         let s = unsafe { self.mmio.read32(REG_STATUS) };
@@ -2700,8 +3034,15 @@ impl Igb {
     }
 
     fn tx_ticket_done(&self, ticket: TxTicket) -> bool {
-        let reused = self.tx_state.lock().ticket_was_reused(ticket);
-        reused || self.tx_desc_done(ticket.slot)
+        let state = self.tx_state.lock();
+        // A ticket from before a watchdog recovery belongs to a ring
+        // whose descriptors were discarded: its frame never went
+        // out, and no later frame's DD bit on the same slot may
+        // stand in for it. It stays "not done" so its `wait_for_tx`
+        // times out honestly instead of reporting a success it did
+        // not earn.
+        ticket.epoch == state.epoch
+            && (state.ticket_was_reused(ticket) || self.tx_desc_done(ticket.slot))
     }
 
     fn wait_for_tx(&self, ticket: TxTicket) -> Result<(), IgbError> {
@@ -2726,6 +3067,9 @@ impl Igb {
             self.suspended.load(Ordering::Acquire),
         ) {
             return Err(IgbError::Other("igb device suspended or detached"));
+        }
+        if self.recovering.load(Ordering::Acquire) {
+            return Err(IgbError::Other("igb TX recovery in progress"));
         }
         if frame.is_empty() || frame.len() > FRAME_SIZE {
             return Err(IgbError::QueueTooSmall);
@@ -3327,8 +3671,14 @@ fn spawn_tx_pump(device: Arc<Igb>, tx_cons: Consumer<Frame, TX_RING_N>) {
         igb_rx_pump(d_rx).await;
     });
 
+    let d_tx = device.clone();
     narf_scheduler::spawn(async move {
-        igb_tx_pump(device, tx_cons).await;
+        igb_tx_pump(d_tx, tx_cons).await;
+    });
+
+    let d_wd = device;
+    narf_scheduler::spawn(async move {
+        igb_watchdog_pump(d_wd).await;
     });
 }
 
@@ -3390,34 +3740,52 @@ async fn igb_tx_pump(device: Arc<Igb>, mut tx_cons: Consumer<Frame, TX_RING_N>) 
     }
 }
 
+/// TX-timeout supervisor (igc maintenance-task shape): every 10 ms
+/// run one watchdog pass; a queue stalled 5 s with carrier up is
+/// recovered and counted. The pass itself gates on detach/suspend
+/// and on an in-flight recovery, so this loop is only a timer.
+async fn igb_watchdog_pump(device: Arc<Igb>) {
+    let tick = narf_time::ns_to_cycles(TX_WATCHDOG_POLL_NS);
+    loop {
+        narf_time::sleep_cycles(tick).await;
+        device.check_tx_watchdog_at(narf_time::now_cycles());
+    }
+}
+
 #[cfg(any(test, feature = "builtin"))]
 mod tests {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use super::{
-        datapath_allowed, eitr_reg, eitr_to_usecs, ivar0_shared_vector, ivar_apply,
-        ivar_misc_shared_vector, ivar_rx, ivar_scheme_for_device, ivar_tx, max_queues_for_device,
-        mrqc_word, previous_rx_slot, queue_disable_word, queue_enable_reflected, queue_enable_word,
-        queue_pairs, queue_regs, reta_entry, reta_reg, reta_shift, reta_table, reta_word,
-        rss_key_word, rss_queue_for_hash, rssrk_reg, rxcsum_rss_word, rxdctl_word,
-        strip_vlan_tag_in_place, txdctl_word, usecs_to_eitr, vfta_bit, vfta_word, wol_supported,
-        wol_suspend_program, wus_clear_word, wus_delivered_wake_packet, AdvRxDescRead, AdvRxDescWb,
-        AdvTxCtxtDesc, AdvTxDataDesc, IgbStats, IvarScheme, TxRingCursor, VlanFilter, WolFilters,
-        ADVTXD_DCMD_DEXT, ADVTXD_DTYP_CTXT, ADV_RXD_STAT_VP, CTRL_ADVD3WUC, EEPROM_APME,
-        EITR_CNT_IGNR, EITR_START, IGB_82576, IGB_82576_NS, IGB_DRIVER_VERSION, IGB_I210_COPPER,
-        IGB_I211_COPPER, IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575,
-        IGB_MAX_QUEUES_I211, IGB_STAT_NAMES, IVAR_VALID, MRQC_ENABLE_RSS_MQ, MRQC_ENABLE_VMDQ,
+        alloc_coherent, channel, datapath_allowed, eitr_reg, eitr_to_usecs, ivar0_shared_vector,
+        ivar_apply, ivar_misc_shared_vector, ivar_rx, ivar_scheme_for_device, ivar_tx,
+        max_queues_for_device, mrqc_word, previous_rx_slot, queue_disable_word,
+        queue_enable_reflected, queue_enable_word, queue_pairs, queue_regs, reta_entry, reta_reg,
+        reta_shift, reta_table, reta_word, rss_key_word, rss_queue_for_hash, rssrk_reg,
+        rxcsum_rss_word, rxdctl_word, strip_vlan_tag_in_place, txdctl_word, usecs_to_eitr,
+        vfta_bit, vfta_word, wol_supported, wol_suspend_program, wus_clear_word,
+        wus_delivered_wake_packet, AdvRxDescRead, AdvRxDescWb, AdvTxCtxtDesc, AdvTxDataDesc,
+        DmaBuffer, DomainId, Frame, Igb, IgbStats, IrqSafeSpinLock, IvarScheme, MmioRegion,
+        TxMeta, TxRingCursor, VlanFilter, WolFilters, ADVTXD_DCMD_DEXT, ADVTXD_DTYP_CTXT,
+        ADV_RXD_STAT_VP, CTRL_ADVD3WUC, CTRL_RST, EEPROM_APME, EITR_CNT_IGNR, EITR_START,
+        IGB_82576, IGB_82576_NS, IGB_DRIVER_VERSION, IGB_I210_COPPER, IGB_I211_COPPER,
+        IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575, IGB_MAX_QUEUES_I211,
+        IGB_STAT_NAMES, IVAR_VALID, MRQC_ENABLE_RSS_MQ, MRQC_ENABLE_VMDQ,
         MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4, MRQC_FIELD_IPV4_TCP, MRQC_FIELD_IPV4_UDP,
         MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP, MRQC_FIELD_IPV6_TCP_EX, MRQC_FIELD_IPV6_UDP,
-        PHY_BMCR_PWRDOWN, QUEUE_ENABLE, RCTL_BAM, RCTL_EN, RCTL_MPE, RCTL_SECRC,
-        RCTL_SUSPEND_ARMED, RCTL_SUSPEND_OFF, RCTL_UPE, REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS,
-        REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_MRQC, REG_RDBAH,
-        REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT, REG_RETA_BASE, REG_RSSRK_BASE, REG_RXCSUM,
-        REG_RXDCTL0, REG_SRRCTL_Q0, REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0,
-        REG_VET, REG_VFTA_BASE, REG_WUC, REG_WUFC, REG_WUS, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE,
-        RXCSUM_CRCOFL, RXCSUM_PCSD, RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF, TCTL_EN, TCTL_PSP,
-        TCTL_SUSPEND_OFF, TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_USABLE,
-        VET_8021Q, VFTA_WORDS, WUC_PME_EN, WUFC_LNKC, WUFC_MAG, WUFC_MC, WUS_ARPD, WUS_IPV6,
+        PHY_BMCR_PWRDOWN, QUEUE_ENABLE, RAH_AV, RCTL_BAM, RCTL_EN, RCTL_MPE, RCTL_SECRC,
+        RCTL_SUSPEND_ARMED, RCTL_SUSPEND_OFF, RCTL_UPE, REG_CTRL, REG_EIAC, REG_EIAM, REG_EIMC,
+        REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_MRQC,
+        REG_RAL0, REG_RAH0, REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT, REG_RETA_BASE,
+        REG_RSSRK_BASE, REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0, REG_STATUS, REG_TDBAH, REG_TDBAL,
+        REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0, REG_VET, REG_VFTA_BASE, REG_WUC, REG_WUFC,
+        REG_WUS, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE, RXCSUM_CRCOFL, RXCSUM_PCSD, RX_RING_LEN,
+        RX_RING_N, SRRCTL_DESCTYPE_ADV_ONEBUF, TCTL_EN, TCTL_PSP, TCTL_SUSPEND_OFF,
+        TXD_STAT_DD, TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_N,
+        TX_RING_USABLE, TX_TIMEOUT_NS, VET_8021Q, VFTA_WORDS, WUC_PME_EN, WUFC_LNKC, WUFC_MAG,
+        WUFC_MC, WUS_ARPD, WUS_IPV6,
     };
 
     fn smoke_igb_extended_interrupt_layout() -> TestResult {
@@ -3484,6 +3852,7 @@ mod tests {
             wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
             suspended: AtomicBool::new(false),
             detached: AtomicBool::new(false),
+            recovering: AtomicBool::new(false),
             rx_head: IrqSafeSpinLock::new(0),
             rx_draining: AtomicBool::new(false),
             ready: false,
@@ -4348,9 +4717,11 @@ mod tests {
         if TX_RING_LEN != 8 || TX_RING_USABLE != 7 || RX_RING_LEN != 256 {
             return TestResult::Fail("igb ethtool ring-parameter drift");
         }
-        if IGB_STAT_NAMES.len() != 5
+        if IGB_STAT_NAMES.len() != 7
             || IGB_STAT_NAMES[0] != "rx_packets"
             || IGB_STAT_NAMES[4] != "tx_errors"
+            || IGB_STAT_NAMES[5] != "tx_timeouts"
+            || IGB_STAT_NAMES[6] != "tx_resets"
         {
             return TestResult::Fail("igb ethtool statistic-name drift");
         }
@@ -4371,12 +4742,17 @@ mod tests {
         stats.note_rx(64);
         stats.note_tx_ok(1500);
         stats.note_tx_error();
+        stats.note_tx_timeout();
+        stats.note_tx_reset();
         let snap = stats.snapshot();
         if snap.rx_packets != 2 || snap.rx_bytes != 1564 {
             return TestResult::Fail("igb ethtool RX counter drift");
         }
         if snap.tx_packets != 1 || snap.tx_bytes != 1500 || snap.tx_errors != 1 {
             return TestResult::Fail("igb ethtool TX counter drift");
+        }
+        if snap.tx_timeouts != 1 || snap.tx_resets != 1 {
+            return TestResult::Fail("igb ethtool TX timeout/reset counter drift");
         }
         TestResult::Pass
     }
@@ -4410,4 +4786,357 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_pm_gates_and_words);
+
+    fn smoke_igb_tx_stall_detection() -> TestResult {
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        let mut cursor = TxRingCursor::new();
+        if cursor.stalled(1_000_000, timeout) {
+            return TestResult::Fail("igb idle TX ring reported stalled");
+        }
+        let now = 10_000_000u64;
+        if cursor.reserve_at(now).is_none() {
+            return TestResult::Fail("igb TX reserve failed on an empty ring");
+        }
+        if cursor.stalled(now + timeout, timeout) {
+            return TestResult::Fail("igb TX stall fired at exactly the timeout");
+        }
+        if !cursor.stalled(now + timeout + 1, timeout) {
+            return TestResult::Fail("igb TX stall did not fire past the timeout");
+        }
+        // A second, later post does not mask the older stuck one...
+        if cursor.reserve_at(now + 100).is_none() {
+            return TestResult::Fail("igb TX reserve failed with room left");
+        }
+        if !cursor.stalled(now + timeout + 1, timeout) {
+            return TestResult::Fail("igb later TX post masked the stuck descriptor");
+        }
+        // ...and completing the oldest clears the stall once nothing
+        // aged remains.
+        cursor.complete_oldest();
+        if cursor.stalled(now + timeout + 1, timeout) {
+            return TestResult::Fail("igb TX stall survived completing the stuck slot");
+        }
+        cursor.complete_oldest();
+        if cursor.stalled(now + timeout + 1, timeout) {
+            return TestResult::Fail("igb empty TX ring reported stalled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_tx_stall_detection);
+
+    fn smoke_igb_tx_stall_pair_detection() -> TestResult {
+        // A VLAN pair stamps both slots: the stall fires on the
+        // pair's post time, and completing the pair clears it.
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        let mut cursor = TxRingCursor::new();
+        let now = 10_000_000u64;
+        let Some((first, _second)) = cursor.reserve_pair_at(now) else {
+            return TestResult::Fail("igb TX pair reserve failed on an empty ring");
+        };
+        if !cursor.stalled(now + timeout + 1, timeout) {
+            return TestResult::Fail("igb TX pair stall did not fire past the timeout");
+        }
+        cursor.complete_oldest();
+        cursor.complete_oldest();
+        if cursor.stalled(now + timeout + 1, timeout) {
+            return TestResult::Fail("igb TX pair stall survived completing the pair");
+        }
+        if cursor.in_flight != 0 {
+            return TestResult::Fail("igb TX pair left the ring non-empty");
+        }
+        // A reset advances the ring epoch, so the pre-reset ticket
+        // is not "reused": its frame (dropped with the ring) can
+        // never compare as completed.
+        cursor.reset();
+        if cursor.ticket_was_reused(first) {
+            return TestResult::Fail("igb pre-reset TX ticket compared as reused after reset");
+        }
+        if cursor.stalled(now + timeout + 1, timeout) {
+            return TestResult::Fail("igb TX stall survived the reset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_tx_stall_pair_detection);
+
+    /// Fake I210 for the TX-timeout fixture: a 128 KiB MMIO backing
+    /// page plus a sleep-pump that emulates the two hardware
+    /// behaviours recovery depends on — CTRL.RST self-clear (I210
+    /// datasheet §3.3.1) and TX descriptor completion (DD) once the
+    /// test arms it. Built from the spec (register offsets, reset
+    /// semantics), never from the implementation's constants.
+    static FIXTURE_MMIO: AtomicU64 = AtomicU64::new(0);
+    static FIXTURE_COMPLETE_TX: AtomicBool = AtomicBool::new(false);
+    static FIXTURE_PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+    fn fixture_pump() {
+        let base = FIXTURE_MMIO.load(Ordering::Acquire);
+        if base == 0 {
+            return;
+        }
+        // SAFETY: fixture-owned fake MMIO; base is published by the
+        // fixture and cleared on drop. The backing page is 128 KiB,
+        // so every register offset below is in bounds.
+        unsafe {
+            let ctrl = core::ptr::read_volatile((base + REG_CTRL) as *const u32);
+            if ctrl & CTRL_RST != 0 {
+                core::ptr::write_volatile(
+                    (base + REG_CTRL) as *mut u32,
+                    ctrl & !CTRL_RST,
+                );
+            }
+            if FIXTURE_COMPLETE_TX.load(Ordering::Acquire) {
+                let tdbal = core::ptr::read_volatile((base + REG_TDBAL) as *const u32) as u64;
+                let tdbah = core::ptr::read_volatile((base + REG_TDBAH) as *const u32) as u64;
+                let ring = (tdbah << 32) | tdbal;
+                if ring != 0 {
+                    for slot in 0..TX_RING_LEN {
+                        let desc = narf_memory::PhysAddr::new(
+                            ring + (slot * core::mem::size_of::<AdvTxDataDesc>()) as u64,
+                        );
+                        // SAFETY: fixture-owned DMA ring; slot bounded.
+                        let addr = core::ptr::read_volatile(desc.kernel_ptr::<u64>());
+                        if addr != 0 {
+                            let status = desc.kernel_mut_ptr::<u8>().add(12);
+                            let s = core::ptr::read_volatile(status);
+                            core::ptr::write_volatile(status, s | TXD_STAT_DD);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct TxTimeoutFixture {
+        device: Igb,
+        _mmio_mem: DmaBuffer,
+    }
+
+    impl TxTimeoutFixture {
+        fn new() -> Self {
+            // 128 KiB fake BAR0.
+            let mut mem = alloc_coherent(128 * 1024, DomainId::DRIVER_0).unwrap();
+            mem.as_mut_slice().fill(0);
+            let csr = MmioRegion {
+                phys: mem.phys_addr(),
+                virt: mem.as_mut_ptr() as u64,
+                len: mem.len() as u64,
+                kind: narf_bus::BarKind::Mmio32 {
+                    prefetchable: false,
+                },
+            };
+            // SAFETY: fixture-owned MMIO backing.
+            unsafe {
+                csr.write32(REG_STATUS, 1 << 1);
+            }
+            FIXTURE_MMIO.store(csr.virt, Ordering::Release);
+            if !FIXTURE_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
+                narf_scheduler::sleep_pumps::register_nested_only(fixture_pump);
+            }
+            let tx_ring_buf = alloc_coherent(4096, DomainId::DRIVER_0).unwrap();
+            let rx_ring_buf = alloc_coherent(4096, DomainId::DRIVER_0).unwrap();
+            let mut tx_buf_pool = alloc::vec::Vec::with_capacity(TX_RING_LEN);
+            for _ in 0..TX_RING_LEN {
+                tx_buf_pool.push(
+                    alloc_coherent(super::FRAME_SIZE, DomainId::DRIVER_0).unwrap(),
+                );
+            }
+            let mut rx_buf_pool = alloc::vec::Vec::with_capacity(RX_RING_LEN);
+            for _ in 0..RX_RING_LEN {
+                rx_buf_pool.push(
+                    alloc_coherent(super::FRAME_SIZE, DomainId::DRIVER_0).unwrap(),
+                );
+            }
+            let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+            let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+            let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+            let device = Igb {
+                mmio: csr,
+                mac,
+                tx_ring_buf,
+                rx_ring_buf,
+                rx_buf_pool: IrqSafeSpinLock::new(rx_buf_pool),
+                tx_buf_pool,
+                tx_state: IrqSafeSpinLock::new(TxRingCursor::new()),
+                vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
+                device_id: IGB_I210_COPPER,
+                vt: IrqSafeSpinLock::new(None),
+                stats: IgbStats::default(),
+                wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
+                suspended: AtomicBool::new(false),
+                detached: AtomicBool::new(false),
+                recovering: AtomicBool::new(false),
+                rx_head: IrqSafeSpinLock::new(0),
+                rx_draining: AtomicBool::new(false),
+                ready: true,
+                _msix: None,
+                irq_vector: None,
+                rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+                tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+            };
+            // Bring-up register program (steps 3, 6–7), minus the
+            // IRQ install: link up, rings, filters.
+            let q0 = queue_regs(0);
+            let ral = mac[0] as u32
+                | ((mac[1] as u32) << 8)
+                | ((mac[2] as u32) << 16)
+                | ((mac[3] as u32) << 24);
+            let rah = mac[4] as u32 | ((mac[5] as u32) << 8) | RAH_AV;
+            let tx_phys = device.tx_ring_buf.dma_addr().raw();
+            let rx_phys = device.rx_ring_buf.dma_addr().raw();
+            // SAFETY: fixture-owned fake MMIO.
+            unsafe {
+                device.mmio.write32(REG_RAL0, ral);
+                device.mmio.write32(REG_RAH0, rah);
+                let ctrl = device.mmio.read32(REG_CTRL);
+                device.mmio.write32(
+                    REG_CTRL,
+                    ctrl | super::CTRL_SLU
+                        | super::CTRL_FD
+                        | super::CTRL_SPEED_1000
+                        | super::CTRL_FRCSPD
+                        | super::CTRL_FRCDPLX,
+                );
+                device.mmio.write32(q0.tdbal, (tx_phys & 0xFFFF_FFFF) as u32);
+                device.mmio.write32(q0.tdbah, (tx_phys >> 32) as u32);
+                device
+                    .mmio
+                    .write32(q0.tdlen, (TX_RING_LEN * 16) as u32);
+                device.mmio.write32(q0.tdh, 0);
+                device.mmio.write32(q0.tdt, 0);
+                device.mmio.write32(super::REG_TCTL, TCTL_EN | TCTL_PSP);
+                let txdctl = queue_enable_word(device.mmio.read32(q0.txdctl));
+                device.mmio.write32(q0.txdctl, txdctl);
+                device.mmio.write32(q0.rdbal, (rx_phys & 0xFFFF_FFFF) as u32);
+                device.mmio.write32(q0.rdbah, (rx_phys >> 32) as u32);
+                device
+                    .mmio
+                    .write32(q0.rdlen, (RX_RING_LEN * 16) as u32);
+                device.mmio.write32(q0.rdh, 0);
+                device
+                    .mmio
+                    .write32(q0.rdt, (RX_RING_LEN - 1) as u32);
+                let mut srrctl = device.mmio.read32(q0.srrctl);
+                srrctl &= !(super::SRRCTL_BSIZEPKT_MASK | super::SRRCTL_DESCTYPE_MASK);
+                srrctl |= ((super::FRAME_SIZE as u32) >> super::SRRCTL_BSIZEPKT_SHIFT)
+                    & super::SRRCTL_BSIZEPKT_MASK;
+                srrctl |= super::SRRCTL_DESCTYPE_ADV_ONEBUF;
+                device.mmio.write32(q0.srrctl, srrctl);
+                device.mmio.write32(
+                    super::REG_RCTL,
+                    super::RCTL_EN
+                        | super::RCTL_BAM
+                        | super::RCTL_UPE
+                        | super::RCTL_MPE
+                        | super::RCTL_SECRC
+                        | super::RCTL_BSIZE_2K,
+                );
+                device
+                    .mmio
+                    .write32(super::REG_VET, super::VET_8021Q);
+            }
+            // Prime the RX descriptors from the pool (bring-up step 7).
+            {
+                let pool = device.rx_buf_pool.lock();
+                for (i, buf) in pool.iter().enumerate().take(RX_RING_LEN) {
+                    let desc = narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
+                        .kernel_mut_ptr::<AdvRxDescRead>();
+                    // SAFETY: fixture-owned DMA ring.
+                    unsafe {
+                        core::ptr::write_volatile(
+                            desc,
+                            AdvRxDescRead {
+                                pkt_addr: buf.dma_addr().raw(),
+                                hdr_addr: 0,
+                            },
+                        );
+                    }
+                }
+            }
+            core::mem::drop(rx_prod);
+            core::mem::drop(tx_cons);
+            Self {
+                device,
+                _mmio_mem: mem,
+            }
+        }
+    }
+
+    impl Drop for TxTimeoutFixture {
+        fn drop(&mut self) {
+            FIXTURE_COMPLETE_TX.store(false, Ordering::Release);
+            FIXTURE_MMIO.store(0, Ordering::Release);
+        }
+    }
+
+    fn smoke_igb_tx_timeout_recovery_fixture() -> TestResult {
+        let fixture = TxTimeoutFixture::new();
+        let device = &fixture.device;
+        let frame = [0xAAu8; 64];
+        // 1. Stall: the fake device never completes the descriptor,
+        // so the synchronous post times out — the wedged ring, as
+        // the field sees it.
+        if device.tx(&frame, &TxMeta::plain()).is_ok() {
+            return TestResult::Fail("igb TX completed against a wedged fake device");
+        }
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        let posted = device.tx_state.lock().posted_at[0];
+        if posted == 0 {
+            return TestResult::Fail("igb TX post did not stamp a post time");
+        }
+        // 2. The watchdog does not fire inside the grace period...
+        if device.check_tx_watchdog_at(posted + timeout) {
+            return TestResult::Fail("igb watchdog fired at exactly the timeout");
+        }
+        if device.tx_resets() != 0 || device.tx_timeouts() != 0 {
+            return TestResult::Fail("igb watchdog counted a recovery it did not fire");
+        }
+        // ...but fires past it, resets the controller, and the ring
+        // comes back.
+        if !device.check_tx_watchdog_at(posted + timeout + 1) {
+            return TestResult::Fail("igb watchdog did not fire past the timeout");
+        }
+        if device.tx_timeouts() != 1 || device.tx_resets() != 1 {
+            return TestResult::Fail("igb watchdog recovery was not counted");
+        }
+        let q0 = queue_regs(0);
+        // SAFETY: fixture-owned fake MMIO.
+        unsafe {
+            if device.mmio.read32(q0.tdt) != 0 {
+                return TestResult::Fail("igb recovery left a stale TX tail");
+            }
+            if device.mmio.read32(super::REG_TCTL) & TCTL_EN == 0 {
+                return TestResult::Fail("igb recovery left TX disabled");
+            }
+            if device.mmio.read32(super::REG_RCTL) & RCTL_EN == 0 {
+                return TestResult::Fail("igb recovery left RX disabled");
+            }
+            if device.mmio.read32(q0.rdt) != (RX_RING_LEN - 1) as u32 {
+                return TestResult::Fail("igb recovery left the RX tail unprimed");
+            }
+        }
+        if device.tx_state.lock().stalled(posted + timeout + 1, timeout) {
+            return TestResult::Fail("igb TX stall survived the recovery");
+        }
+        // 3. Traffic resumes: with the fake device completing
+        // descriptors again, a fresh post completes, and the
+        // counters are visible on the ethtool surface.
+        FIXTURE_COMPLETE_TX.store(true, Ordering::Release);
+        if device.tx(&frame, &TxMeta::plain()).is_err() {
+            return TestResult::Fail("igb TX did not resume after recovery");
+        }
+        let snap = device.stats.snapshot();
+        if snap.tx_timeouts != 1 || snap.tx_resets != 1 {
+            return TestResult::Fail("igb recovery counters missing from ethtool snapshot");
+        }
+        // The completed frame was reclaimed, so nothing aged
+        // remains for the watchdog to fire on.
+        if device.tx_state.lock().in_flight != 0 {
+            return TestResult::Fail("igb completed TX was not reclaimed");
+        }
+        if device.check_tx_watchdog_at(narf_time::now_cycles()) {
+            return TestResult::Fail("igb watchdog fired on an empty ring");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_tx_timeout_recovery_fixture);
 }
