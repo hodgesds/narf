@@ -1037,7 +1037,8 @@ pub fn encode_multipacket_tx(
                         elem.resize(elem.len() + pad, 0);
                         // MessageLength covers header, payload
                         // AND padding ([MS-RNDIS] §2.2.14).
-                        put_u32le(&mut elem, 4, elem.len() as u32);
+                        let elem_len = elem.len() as u32;
+                        put_u32le(&mut elem, 4, elem_len);
                     }
                 }
             }
@@ -1394,7 +1395,7 @@ impl RndisBringup {
 // recovery loop feeds it through xHCI; the fixtures feed it
 // through the scripted fake device.
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum RecoveryStep {
     SendReset,
     AwaitResetComplete,
@@ -2114,7 +2115,12 @@ fn try_begin_recovery(idx: usize) -> RecoveryClaim {
 /// A station address that changed across the reset is
 /// recorded but not re-published to the net registry (see
 /// the module remainders).
-async fn reset_and_rebringup(idx: usize) -> Result<(), RndisError> {
+///
+/// Returns `(respawn_rx, respawn_notif)`: whether the RX /
+/// notification pump had already exited and must be respawned
+/// by the caller. The respawn spawn lives in the caller, not
+/// here — see `reset_and_rebringup_inner`.
+async fn reset_and_rebringup(idx: usize) -> Result<(bool, bool), RndisError> {
     let outcome = reset_and_rebringup_inner(idx).await;
     let mut g = RNDIS_DEVICES.lock();
     if let Some(dev) = g.get_mut(idx) {
@@ -2123,7 +2129,7 @@ async fn reset_and_rebringup(idx: usize) -> Result<(), RndisError> {
     outcome
 }
 
-async fn reset_and_rebringup_inner(idx: usize) -> Result<(), RndisError> {
+async fn reset_and_rebringup_inner(idx: usize) -> Result<(bool, bool), RndisError> {
     let (slot_id, comm_iface, notif_dci) = {
         let g = RNDIS_DEVICES.lock();
         let dev = g
@@ -2134,9 +2140,11 @@ async fn reset_and_rebringup_inner(idx: usize) -> Result<(), RndisError> {
     };
     let c = controller_of(idx).ok_or(RndisError::NoController)?;
     let (negotiated, mac, _addressing_reset) = run_recovery(&c, slot_id, comm_iface).await?;
-    let mut respawn_rx = false;
-    let mut respawn_notif = false;
-    {
+    // The initial `false` values were never read: the block below
+    // overwrites both on every path that reaches the respawn
+    // checks (`unused_assignments`, an error under `-D warnings`),
+    // so the block returns the flags directly instead.
+    let (respawn_rx, respawn_notif) = {
         let mut g = RNDIS_DEVICES.lock();
         let Some(dev) = g.get_mut(idx).filter(|d| !d.detached) else {
             return Err(RndisError::NotBound);
@@ -2148,26 +2156,23 @@ async fn reset_and_rebringup_inner(idx: usize) -> Result<(), RndisError> {
         dev.media_connected = negotiated.media_connected;
         dev.link_up = negotiated.media_connected.unwrap_or(dev.link_up);
         dev.mac = mac;
-        respawn_rx = !dev.pump_running;
-        respawn_notif = notif_dci != 0 && !dev.notif_running;
+        let respawn_rx = !dev.pump_running;
+        let respawn_notif = notif_dci != 0 && !dev.notif_running;
         if respawn_rx {
             dev.pump_running = true;
         }
         if respawn_notif {
             dev.notif_running = true;
         }
-    }
-    if respawn_rx {
-        narf_scheduler::spawn(async move {
-            rndis_rx_pump(idx).await;
-        });
-    }
-    if respawn_notif {
-        narf_scheduler::spawn(async move {
-            rndis_notif_pump(idx).await;
-        });
-    }
-    Ok(())
+        (respawn_rx, respawn_notif)
+    };
+    // Return the respawn decision instead of spawning here:
+    // spawning the pumps from this function made its future
+    // !Send — this function is awaited (via
+    // `reset_and_rebringup`) by `rndis_rx_pump`, so a spawn of
+    // `rndis_rx_pump` inside it closes a cycle the compiler
+    // cannot prove `Send` through. The caller spawns instead.
+    Ok((respawn_rx, respawn_notif))
 }
 
 // ── Bind ───────────────────────────────────────────────────────────
@@ -2361,7 +2366,25 @@ async fn rndis_rx_pump(idx: usize) {
                 if errors >= MAX_CONSECUTIVE_RX_ERRORS {
                     match try_begin_recovery(idx) {
                         RecoveryClaim::Claimed => match reset_and_rebringup(idx).await {
-                            Ok(()) => errors = 0,
+                            Ok((_respawn_rx, respawn_notif)) => {
+                                errors = 0;
+                                // `respawn_rx` is always false on
+                                // this path: `pump_running` is true
+                                // while this pump runs (set at bind,
+                                // cleared only on pump exit /
+                                // detach), so there is no RX pump
+                                // to respawn here — only a dead
+                                // notification pump can need one.
+                                // Do not spawn `rndis_rx_pump`
+                                // from this body either: it would
+                                // re-introduce the !Send cycle
+                                // this restructure removes.
+                                if respawn_notif {
+                                    narf_scheduler::spawn(async move {
+                                        rndis_notif_pump(idx).await;
+                                    });
+                                }
+                            }
                             Err(_) => break,
                         },
                         // Another pump owns a recovery; the
@@ -2484,8 +2507,27 @@ async fn rndis_keepalive_pump(idx: usize) {
             Ok(()) => {}
             Err(_) => match try_begin_recovery(idx) {
                 RecoveryClaim::Claimed => {
-                    if reset_and_rebringup(idx).await.is_err() {
-                        break;
+                    match reset_and_rebringup(idx).await {
+                        Ok((respawn_rx, respawn_notif)) => {
+                            // Respawn dead pumps here, not in
+                            // `reset_and_rebringup_inner`: the
+                            // keepalive pump is never spawned by
+                            // the recovery path, so spawning from
+                            // here breaks the !Send cycle (inner
+                            // spawned `rndis_rx_pump` while
+                            // `rndis_rx_pump` awaited inner).
+                            if respawn_rx {
+                                narf_scheduler::spawn(async move {
+                                    rndis_rx_pump(idx).await;
+                                });
+                            }
+                            if respawn_notif {
+                                narf_scheduler::spawn(async move {
+                                    rndis_notif_pump(idx).await;
+                                });
+                            }
+                        }
+                        Err(_) => break,
                     }
                 }
                 // Another pump owns a recovery; re-check on
