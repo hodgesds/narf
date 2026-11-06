@@ -54,4 +54,13 @@ pub fn register_initcalls() {
         register();
         InitResult::Ok
     });
+    // AER supervisor (#928): spawn once the executor is up, so
+    // namespace-change AERs are drained + rescanned without any
+    // I/O having to happen first. Stage::Late runs after
+    // scheduler::init; spawning earlier would panic. Idempotent —
+    // the spawn itself guards against a second task.
+    narf_init::register(Stage::Late, "nvme-aer-supervisor", || {
+        imp::spawn_aer_supervisor();
+        InitResult::Ok
+    });
 }
