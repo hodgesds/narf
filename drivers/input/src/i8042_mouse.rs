@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
 use narf_arch::x86_64::io_port::{inb, outb};
 use narf_input::{
-    evdev::{dispatch_pointer_to_node, key, rel, DeviceCaps, DeviceNode, ROUTER},
+    evdev::{dispatch_pointer_to_node, key, rel, DeviceCaps, DeviceId, DeviceNode, ROUTER},
     push_global, InputEvent, PointerButtons, PointerEvent,
 };
 
@@ -110,6 +110,12 @@ pub static STATE: State = State::new();
 
 /// Evdev device node for the PS/2 mouse. Registered in `init()`.
 static MOUSE_EVDEV_NODE: narf_lib::sync::IrqSafeSpinLock<Option<Arc<DeviceNode>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Evdev id of the registered mouse node, if any. `init()` used
+/// to discard it, so no production path could ever unregister the
+/// mouse — the re-probe hook (issue #771) needs it.
+static MOUSE_EVDEV_ID: narf_lib::sync::IrqSafeSpinLock<Option<DeviceId>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Raw pointer cache for lock-free IRQ access.
@@ -300,9 +306,10 @@ pub unsafe fn init() -> Result<(), InitError> {
     caps.add_key(key::BTN_LEFT);
     caps.add_key(key::BTN_RIGHT);
     caps.add_key(key::BTN_MIDDLE);
-    let (_dev_id, node_arc) = ROUTER.register_device(caps);
+    let (dev_id, node_arc) = ROUTER.register_device(caps);
     MOUSE_NODE_PTR.store(Arc::as_ptr(&node_arc) as *mut DeviceNode, Ordering::Release);
     *MOUSE_EVDEV_NODE.lock() = Some(node_arc);
+    *MOUSE_EVDEV_ID.lock() = Some(dev_id);
 
     Ok(())
 }
@@ -310,6 +317,61 @@ pub unsafe fn init() -> Result<(), InitError> {
 /// Return the evdev `DeviceNode` for the PS/2 mouse if registered.
 pub fn mouse_evdev_node() -> Option<Arc<DeviceNode>> {
     MOUSE_EVDEV_NODE.lock().clone()
+}
+
+/// Unregister the stale mouse node (if any) and clear the probe
+/// state, so a fresh `init()` re-probes the AUX channel. Shared
+/// by `reprobe()` and the test hook below — this is the half of
+/// re-probe that does not touch the I/O ports.
+fn drop_stale_registration() {
+    if let Some(id) = MOUSE_EVDEV_ID.lock().take() {
+        ROUTER.unregister_device(id);
+    }
+    *MOUSE_EVDEV_NODE.lock() = None;
+    MOUSE_NODE_PTR.store(core::ptr::null_mut(), Ordering::Release);
+    // A power-cycled mouse forgets any half-assembled packet and
+    // any accumulated delta; the fresh probe starts clean.
+    STATE.phase.store(0, Ordering::Release);
+    STATE.rel_dx_acc.store(0, Ordering::Release);
+    STATE.rel_dy_acc.store(0, Ordering::Release);
+    STATE.prev_buttons.store(0, Ordering::Release);
+    STATE.initialized.store(false, Ordering::Release);
+}
+
+/// Re-probe the PS/2 mouse (AUX) channel after boot (issue
+/// #771). Same shape as the keyboard hook in `i8042::reprobe`:
+/// unregister the stale evdev node first, then re-run the full
+/// `init()` probe, which registers a fresh node on success. A
+/// failed probe leaves no node behind and leaves `initialized`
+/// clear, so a later re-probe can retry.
+///
+/// # Safety
+/// Same contract as `init()`: no other agent concurrently
+/// driving the 8042 ports; call from task context, never IRQ
+/// context. IRQ 12 is already routed, so a packet byte arriving
+/// mid-probe may be consumed by a probe wait (failing that
+/// probe step) or decoded normally by the IRQ handler.
+pub unsafe fn reprobe() -> Result<(), InitError> {
+    drop_stale_registration();
+    // SAFETY: same exclusive-port-ownership contract as `init`;
+    // the caller upholds it.
+    unsafe { init() }
+}
+
+/// Test hook: seed a mouse registration the way `init()` does,
+/// so fixtures can exercise the re-probe bookkeeping without
+/// touching the I/O ports.
+#[doc(hidden)]
+pub fn __seed_mouse_registration_for_test(id: DeviceId, node: Arc<DeviceNode>) {
+    MOUSE_NODE_PTR.store(Arc::as_ptr(&node) as *mut DeviceNode, Ordering::Release);
+    *MOUSE_EVDEV_NODE.lock() = Some(node);
+    *MOUSE_EVDEV_ID.lock() = Some(id);
+}
+
+/// Test hook: run exactly the unregister half of `reprobe()`.
+#[doc(hidden)]
+pub fn __drop_stale_mouse_registration_for_test() {
+    drop_stale_registration();
 }
 
 /// Route a decoded packet (`dx`/`dy` motion + raw button byte `b0`) to the
@@ -423,6 +485,12 @@ pub fn __reset_for_test() {
     STATE.phase.store(0, Ordering::Release);
     STATE.rel_dx_acc.store(0, Ordering::Release);
     STATE.rel_dy_acc.store(0, Ordering::Release);
+    // Seeded registrations are fixture-owned (see the kbd hook);
+    // clear the cached pointer so a later packet test cannot
+    // dispatch into a fixture node.
+    MOUSE_NODE_PTR.store(core::ptr::null_mut(), Ordering::Release);
+    *MOUSE_EVDEV_NODE.lock() = None;
+    *MOUSE_EVDEV_ID.lock() = None;
 }
 
 /// Test-only synthetic packet feed: same logic as the IRQ handler
