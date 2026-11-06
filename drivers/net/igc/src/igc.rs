@@ -268,6 +268,10 @@ pub struct IgcStats {
 #[derive(Clone, Debug)]
 struct Config {
     mac: [u8; 6],
+    /// Linux `dev->perm_addr`: the probe-time RAL0 address from NVM.
+    /// `set_mac` rewrites `mac` (and RAL0) but never this, so
+    /// `ETHTOOL_GPERMADDR` keeps returning the factory address.
+    permanent_mac: [u8; 6],
     mtu: u32,
     promiscuous: bool,
     all_multicast: bool,
@@ -399,6 +403,7 @@ impl Igc {
             device: *device,
             config: IrqSafeSpinLock::new(Config {
                 mac,
+                permanent_mac: mac,
                 mtu: 1500,
                 promiscuous: false,
                 all_multicast: true,
@@ -1122,6 +1127,7 @@ impl narf_net::iface::DeviceControl for Igc {
         let old = self.config.lock().clone();
         let next = Config {
             mac: desired.mac,
+            permanent_mac: old.permanent_mac,
             mtu: desired.mtu,
             promiscuous: desired.promiscuous,
             all_multicast: desired.all_multicast,
