@@ -2860,7 +2860,7 @@ impl E1000 {
         if let Some(e) = self.gate_error() {
             return Err(e);
         }
-        if frame.is_empty() || frame.len() > crate::mtu::frame_size(*self.mtu.lock()) {
+        if frame.is_empty() || frame.len() > crate::mtu::frame_size(*self.mtu.lock()) as usize {
             return Err(E1000Error::FrameTooLong);
         }
         let mut ticket = None;
