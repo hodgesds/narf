@@ -9908,7 +9908,7 @@ fn uvc_fixture_control_table() -> Vec<FixtureControl> {
             res: 1,
             def: 0,
             cur: 0
-        },,
+        },
         FixtureControl {
             unit: 2,
             selector: 0x03,
@@ -9918,7 +9918,7 @@ fn uvc_fixture_control_table() -> Vec<FixtureControl> {
             res: 1,
             def: 32,
             cur: 32
-        },,
+        },
         FixtureControl {
             unit: 2,
             selector: 0x04,
@@ -9928,7 +9928,7 @@ fn uvc_fixture_control_table() -> Vec<FixtureControl> {
             res: 1,
             def: 0,
             cur: 0
-        },,
+        },
         FixtureControl {
             unit: 2,
             selector: 0x06,
@@ -9938,7 +9938,7 @@ fn uvc_fixture_control_table() -> Vec<FixtureControl> {
             res: 1,
             def: 0,
             cur: 0
-        },,
+        },
         FixtureControl {
             unit: 2,
             selector: 0x07,
@@ -9959,7 +9959,7 @@ fn uvc_fixture_control_table() -> Vec<FixtureControl> {
             res: 1,
             def: 156,
             cur: 156
-        },,
+        },
         FixtureControl {
             unit: 1,
             selector: 0x06,
@@ -9969,7 +9969,7 @@ fn uvc_fixture_control_table() -> Vec<FixtureControl> {
             res: 1,
             def: 0,
             cur: 0
-        },,
+        },
         FixtureControl {
             unit: 1,
             selector: 0x08,
@@ -9979,7 +9979,7 @@ fn uvc_fixture_control_table() -> Vec<FixtureControl> {
             res: 1,
             def: 1,
             cur: 1
-        },,
+        },
         FixtureControl {
             unit: 1,
             selector: 0x0B,
