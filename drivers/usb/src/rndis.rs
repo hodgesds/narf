@@ -1037,7 +1037,11 @@ pub fn encode_multipacket_tx(
                         elem.resize(elem.len() + pad, 0);
                         // MessageLength covers header, payload
                         // AND padding ([MS-RNDIS] §2.2.14).
-                        put_u32le(&mut elem, 4, elem.len() as u32);
+                        // Hoist the length: `put_u32le` takes
+                        // `&mut elem`, so `elem.len()` cannot be
+                        // read in the same call (E0502).
+                        let elem_len = elem.len() as u32;
+                        put_u32le(&mut elem, 4, elem_len);
                     }
                 }
             }
@@ -1394,7 +1398,7 @@ impl RndisBringup {
 // recovery loop feeds it through xHCI; the fixtures feed it
 // through the scripted fake device.
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum RecoveryStep {
     SendReset,
     AwaitResetComplete,
@@ -2102,6 +2106,34 @@ fn try_begin_recovery(idx: usize) -> RecoveryClaim {
     RecoveryClaim::Claimed
 }
 
+/// Spawn any pump that already exited, after a recovery re-bind.
+///
+/// Deliberately SYNC, not `async`: the pumps are spawned by the
+/// recovery, and the RX pump itself calls the recovery
+/// (`rndis_rx_pump` → `reset_and_rebringup` →
+/// `reset_and_rebringup_inner`). Spawning `rndis_rx_pump` from
+/// inside that async recovery makes the recovery future's type
+/// self-referential (the spawned task's future transitively
+/// contains the recovery future), and rustc cannot prove `Send`
+/// for a cyclic future type — the `narf_scheduler::spawn` bound
+/// then fails with "future cannot be sent between threads
+/// safely", pointing at the recovery await. A sync helper keeps
+/// the spawned futures off every async frame, so no cycle forms;
+/// each spawned future is Send on its own (verified by the
+/// `cargo test -p narf-drivers-usb --lib` build).
+fn respawn_pumps(idx: usize, rx: bool, notif: bool) {
+    if rx {
+        narf_scheduler::spawn(async move {
+            rndis_rx_pump(idx).await;
+        });
+    }
+    if notif {
+        narf_scheduler::spawn(async move {
+            rndis_notif_pump(idx).await;
+        });
+    }
+}
+
 /// Reset the device at `idx` and re-run bring-up, then
 /// refresh the record with the re-negotiated parameters and
 /// station address and respawn any pump that already exited.
@@ -2157,16 +2189,7 @@ async fn reset_and_rebringup_inner(idx: usize) -> Result<(), RndisError> {
             dev.notif_running = true;
         }
     }
-    if respawn_rx {
-        narf_scheduler::spawn(async move {
-            rndis_rx_pump(idx).await;
-        });
-    }
-    if respawn_notif {
-        narf_scheduler::spawn(async move {
-            rndis_notif_pump(idx).await;
-        });
-    }
+    respawn_pumps(idx, respawn_rx, respawn_notif);
     Ok(())
 }
 
