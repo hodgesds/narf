@@ -1198,6 +1198,7 @@ dependencies = [
 name = "narf-drivers-backlight"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "narf-aml",
  "narf-capabilities",
  "narf-console",
@@ -1209,6 +1210,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-pwm",
  "narf-scheduler",
  "narf-time",
 ]

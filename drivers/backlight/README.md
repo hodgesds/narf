@@ -38,7 +38,12 @@ the crate's former AMD bridge module, which encoded a pre-fix `BL_PWM` register
 scheme, was deleted rather than wired (#951). The Intel path is a real BXT PWM
 device over the frequency/duty registers, installed from the Intel GPU probe —
 the only Intel backlight path; the GPU dispatcher's duplicate Intel backend
-was retired with it (#1021). Keyboard backlight is driven through vendor
+was retired with it (#1021). The generic PWM path is a `pwm_bl`-style
+device binding a panel to a `narf-pwm` channel — Linux
+`compute_duty_cycle` duty mapping (levels table or linear scale, with
+the low-threshold floor) and power-on/power-off enable sequencing —
+registered into the same arbitration from a panel probe (#957).
+Keyboard backlight is driven through vendor
 WMI and registered as a PWM-backed LED in the LED class. The brightness-key
 handler subscribes to ACPI Notify events and, on the standard
 brightness-up/brightness-down notifications (0x86/0x87), steps the arbitrated
