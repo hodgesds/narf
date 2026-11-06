@@ -11,6 +11,8 @@
 //!   AHCI  9..14 — HBA reset → port detect → cmd-list/FIS setup →
 //!                 IDENTIFY DEVICE → READ/WRITE DMA EXT → block registry
 //!   Integ 15..16 — GPT partition resolution for NVMe + AHCI devices
+//!   AHCI 17..18 — multi-port + two-HBA bring-up (#980), two-HBA
+//!                 per-controller ISR + IRQ completion routing (#979)
 //!
 //! Linux references (GPL-2.0-or-later, adapted under NARF post-2026-05-20):
 //!   NVMe:  linux/drivers/nvme/host/pci.c (queue setup, doorbell stride)
@@ -784,12 +786,12 @@ kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_register_block_device);
 /// AHCI HBA register offsets (AHCI 1.3.1 §3.1).
 const AHCI_HBA_CAP: usize = 0x00;
 const AHCI_HBA_GHC: usize = 0x04;
-#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const AHCI_HBA_IS: usize = 0x08;
 const AHCI_HBA_PI: usize = 0x0C;
 const AHCI_HBA_VS: usize = 0x10;
 
 const AHCI_GHC_HR: u32 = 1 << 0;
+const AHCI_GHC_IE: u32 = 1 << 1;
 const AHCI_GHC_AE: u32 = 1 << 31;
 
 /// Per-port register base (0x100 + 0x80 * port).
@@ -802,7 +804,6 @@ const PORT_CLB: usize = 0x00; // Command List Base Low
 const PORT_CLBU: usize = 0x04; // Command List Base High
 const PORT_FB: usize = 0x08; // FIS Receive Base Low
 const PORT_FBU: usize = 0x0C; // FIS Receive Base High
-#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PORT_IS: usize = 0x10; // Interrupt Status
 const PORT_CMD: usize = 0x18;
 const PORT_TFD: usize = 0x20;
@@ -889,8 +890,42 @@ impl FakeAhciMmio {
         m
     }
 
+    /// Host-side register write. HBA `IS` (AHCI 1.3.1 §3.1.3) and
+    /// per-port `PORT_IS` (§3.3.5) are write-1-to-clear: writing a
+    /// 1 clears that bit, writing a 0 leaves it. Every other
+    /// register takes the value as written.
     fn write32(&mut self, off: usize, val: u32) {
+        if off == AHCI_HBA_IS || Self::is_port_is(off) {
+            let cur = self.read32(off);
+            self.write32_raw(off, cur & !val);
+            return;
+        }
+        self.write32_raw(off, val);
+    }
+
+    /// Raw backing-store write, bypassing the W1C rule: the device
+    /// side (`raise_irq`) asserting interrupt state, not a host write.
+    fn write32_raw(&mut self, off: usize, val: u32) {
         self.mem[off..off + 4].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Whether `off` is a per-port `PORT_IS` register.
+    fn is_port_is(off: usize) -> bool {
+        off >= 0x100 && (off - 0x100) % 0x80 == PORT_IS
+    }
+
+    /// Model the device asserting an interrupt on `port`: set the
+    /// given `PORT_IS` event bits and the port's bit in HBA `IS`
+    /// (AHCI 1.3.1 §3.1.3/§3.3.5 — this is what the HBA presents
+    /// to the host once `PORT_IE` unmasks the event). Bypasses the
+    /// W1C host-write path: this is the device side, not a host
+    /// write.
+    fn raise_irq(&mut self, port: u8, port_is_bits: u32) {
+        let p = port_off(port);
+        let pis = self.read32(p + PORT_IS) | port_is_bits;
+        self.write32_raw(p + PORT_IS, pis);
+        let is = self.read32(AHCI_HBA_IS) | (1u32 << port);
+        self.write32_raw(AHCI_HBA_IS, is);
     }
 
     fn read32(&self, off: usize) -> u32 {
@@ -980,6 +1015,236 @@ fn smoke_ahci_multi_port_bring_up_two_hba() -> TestResult {
 kernel_test_in!(
     "drivers/storage/ahci-e2e",
     smoke_ahci_multi_port_bring_up_two_hba
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Smoke 18: AHCI two-HBA per-controller ISR + IRQ completion ──────
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// #979: per-controller ISR state for multi-HBA interrupt-driven
+/// completion.
+///
+/// Two fake ABARs (HBA-A: port 0; HBA-B: ports 0+1) model the
+/// post-`bring_up_ports` state. Three links of the endpoint are
+/// proven with production code throughout:
+///
+/// 1. Per-controller drain — the production ISR drain
+///    (`ahci::ahci_isr_regs`) run against each fake clears only
+///    that HBA's `IS` / `PORT_IS` (W1C) and leaves the other HBA
+///    untouched; an idle HBA returns `IrqStatus::None`
+///    (shared-INTx pass-along).
+/// 2. Per-controller master gate — `hba_enable_irq` on HBA-B sets
+///    `GHC.IE` on HBA-B only; HBA-A's gate stays clear.
+/// 3. Completion routing — the production ISR (`ahci::ahci_isr`,
+///    cookie = fake ABAR address) installed on two allocated
+///    vectors: firing HBA-B's vector bumps only HBA-B's
+///    `fire_count` and resolves only a waiter on HBA-B's vector.
+///    Draining HBA-B first makes the same fire count as spurious,
+///    proving the production handler is really in the chain and
+///    its `Handled` / `None` verdict is observed by dispatch.
+///
+/// Spec: AHCI 1.3.1 §3.1.2 (`GHC.IE` master gate), §3.1.3 (HBA
+/// `IS`, W1C), §3.3.5 (`PORT_IS`, W1C), §3.3.6 (`PORT_IE` event
+/// bits — D2H Register FIS is bit 0).
+///
+/// NOTE on the dispatch half: the ISR's volatile writes land in
+/// the fake's plain RAM, where a write-1-to-clear register is
+/// just memory — the bits stay set instead of clearing. That half
+/// therefore asserts fire counts / waiter resolution only, never
+/// register clearing; clearing is the drain half's job, where the
+/// fake's W1C write path models the hardware.
+fn smoke_ahci_two_hba_irq_completion() -> TestResult {
+    use crate::ahci::{ahci_isr, ahci_isr_regs, hba_enable_irq, hba_finish_init};
+    use core::{
+        future::Future,
+        task::{Context, Waker},
+    };
+    use narf_interrupts::IrqStatus;
+
+    // D2H Register FIS interrupt, AHCI 1.3.1 §3.3.6 bit 0: the
+    // completion-bearing event for a finished command.
+    const D2H_REG_FIS: u32 = 1 << 0;
+
+    let hba_a = AhciRegsFake(core::cell::RefCell::new(FakeAhciMmio::new_with_sata_ports(
+        &[0],
+    )));
+    let hba_b = AhciRegsFake(core::cell::RefCell::new(FakeAhciMmio::new_with_sata_ports(
+        &[0, 1],
+    )));
+
+    // ── Per-controller master gate (GHC.IE) ─────────────────────
+    hba_finish_init(&hba_a);
+    hba_finish_init(&hba_b);
+    hba_enable_irq(&hba_b);
+    let ghc_a = hba_a.0.borrow().read32(AHCI_HBA_GHC);
+    let ghc_b = hba_b.0.borrow().read32(AHCI_HBA_GHC);
+    if ghc_a & AHCI_GHC_IE != 0 {
+        return TestResult::Fail("HBA-A GHC.IE must stay clear (its vector is not routed yet)");
+    }
+    if ghc_b & AHCI_GHC_IE == 0 {
+        return TestResult::Fail("HBA-B GHC.IE must be set after hba_enable_irq");
+    }
+
+    // ── Per-controller drain ────────────────────────────────────
+    // Device side: HBA-A port 0 completes; HBA-B ports 0 AND 1
+    // complete (two pending ports in one ISR call defeats a
+    // single-entry drain that happens to look right).
+    hba_a.0.borrow_mut().raise_irq(0, D2H_REG_FIS);
+    hba_b.0.borrow_mut().raise_irq(0, D2H_REG_FIS);
+    hba_b.0.borrow_mut().raise_irq(1, D2H_REG_FIS);
+
+    // Draining HBA-B must clear both of its ports and its HBA IS,
+    // and leave HBA-A's pending state untouched (routing isolation).
+    if ahci_isr_regs(&hba_b) != IrqStatus::Handled {
+        return TestResult::Fail("HBA-B ISR must report Handled with pending ports");
+    }
+    if hba_b.0.borrow().read32(AHCI_HBA_IS) != 0
+        || hba_b.0.borrow().read32(port_off(0) + PORT_IS) != 0
+        || hba_b.0.borrow().read32(port_off(1) + PORT_IS) != 0
+    {
+        return TestResult::Fail("HBA-B ISR must drain HBA IS + both ports' PORT_IS");
+    }
+    if hba_a.0.borrow().read32(AHCI_HBA_IS) == 0
+        || hba_a.0.borrow().read32(port_off(0) + PORT_IS) == 0
+    {
+        return TestResult::Fail("HBA-B ISR must not touch HBA-A's pending interrupt");
+    }
+
+    // Now drain HBA-A; a second call on the drained HBA is idle.
+    if ahci_isr_regs(&hba_a) != IrqStatus::Handled {
+        return TestResult::Fail("HBA-A ISR must report Handled with a pending port");
+    }
+    if hba_a.0.borrow().read32(AHCI_HBA_IS) != 0 {
+        return TestResult::Fail("HBA-A ISR must drain HBA IS");
+    }
+    if ahci_isr_regs(&hba_a) != IrqStatus::None {
+        return TestResult::Fail("idle HBA ISR must report None (shared-line pass-along)");
+    }
+
+    // Tampered variant: an HBA-IS bit with no PORT_IS behind it
+    // still drains the HBA bit (and only that bit).
+    hba_b.0.borrow_mut().raise_irq(1, 0);
+    if ahci_isr_regs(&hba_b) != IrqStatus::Handled {
+        return TestResult::Fail("HBA-IS-only pending state must still report Handled");
+    }
+    if hba_b.0.borrow().read32(AHCI_HBA_IS) != 0 {
+        return TestResult::Fail("HBA-IS-only drain must clear the HBA IS bit");
+    }
+
+    // ── Completion routing through dispatch ─────────────────────
+    let v_a = match narf_interrupts::vector::alloc() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("vector::alloc for HBA-A"),
+    };
+    let v_b = match narf_interrupts::vector::alloc() {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = narf_interrupts::vector::free(v_a);
+            return TestResult::Fail("vector::alloc for HBA-B");
+        }
+    };
+    // Cookie = the fake ABAR's address: `FakeAhciMmio`'s only
+    // field is its backing store, so the struct address is the
+    // ABAR base the production ISR dereferences.
+    let base_a = &*hba_a.0.borrow() as *const FakeAhciMmio as u64;
+    let base_b = &*hba_b.0.borrow() as *const FakeAhciMmio as u64;
+    narf_interrupts::dispatch::install_handler_named(v_a, "ahci", base_a, ahci_isr);
+    narf_interrupts::dispatch::install_handler_named(v_b, "ahci", base_b, ahci_isr);
+
+    let result = smoke_ahci_two_hba_irq_routing(v_a, v_b, &hba_a, &hba_b);
+
+    // Cleanup: no handler or vector may outlive the fakes they
+    // point at.
+    narf_interrupts::dispatch::clear_handler(v_a);
+    narf_interrupts::dispatch::clear_handler(v_b);
+    let _ = narf_interrupts::vector::free(v_a);
+    let _ = narf_interrupts::vector::free(v_b);
+    result
+}
+
+/// Dispatch half of [`smoke_ahci_two_hba_irq_completion`], split
+/// out so the caller owns handler/vector cleanup on every path.
+fn smoke_ahci_two_hba_irq_routing(
+    v_a: u8,
+    v_b: u8,
+    hba_a: &AhciRegsFake,
+    hba_b: &AhciRegsFake,
+) -> TestResult {
+    use core::{
+        future::Future,
+        task::{Context, Waker},
+    };
+    const D2H_REG_FIS: u32 = 1 << 0;
+
+    // Re-raise on both HBAs: the drain half cleared them.
+    hba_a.0.borrow_mut().raise_irq(0, D2H_REG_FIS);
+    hba_b.0.borrow_mut().raise_irq(0, D2H_REG_FIS);
+
+    let fc_a0 = narf_interrupts::dispatch::fire_count(v_a);
+    let fc_b0 = narf_interrupts::dispatch::fire_count(v_b);
+    let noop = Waker::noop();
+    let mut wait_a = core::pin::pin!(narf_interrupts::wait_for_irq(v_a));
+    let mut wait_b = core::pin::pin!(narf_interrupts::wait_for_irq(v_b));
+    if wait_a
+        .as_mut()
+        .poll(&mut Context::from_waker(&noop))
+        .is_ready()
+        || wait_b
+            .as_mut()
+            .poll(&mut Context::from_waker(&noop))
+            .is_ready()
+    {
+        return TestResult::Fail("waiters must start Pending");
+    }
+
+    // Fire HBA-B's vector only: HBA-B's completion.
+    narf_interrupts::dispatch::on_irq(v_b);
+    if narf_interrupts::dispatch::fire_count(v_b) != fc_b0 + 1 {
+        return TestResult::Fail("HBA-B vector fire_count must advance by exactly 1");
+    }
+    if narf_interrupts::dispatch::fire_count(v_a) != fc_a0 {
+        return TestResult::Fail("HBA-A vector fire_count must not move on HBA-B's IRQ");
+    }
+    if wait_b
+        .as_mut()
+        .poll(&mut Context::from_waker(&noop))
+        .is_pending()
+    {
+        return TestResult::Fail("HBA-B waiter must resolve on HBA-B's IRQ");
+    }
+    if wait_a
+        .as_mut()
+        .poll(&mut Context::from_waker(&noop))
+        .is_ready()
+    {
+        return TestResult::Fail("HBA-A waiter must stay Pending on HBA-B's IRQ");
+    }
+    drop(wait_a);
+    drop(wait_b);
+
+    // Negative control: with HBA-B drained, the same fire is
+    // spurious — the production handler ran, saw an empty IS,
+    // and returned None. This proves the handler is really in
+    // the chain (not just the fire_count moving on its own).
+    use crate::ahci::ahci_isr_regs;
+    use narf_interrupts::IrqStatus;
+    if ahci_isr_regs(hba_b) != IrqStatus::Handled {
+        return TestResult::Fail("re-drain of HBA-B must report Handled before the control");
+    }
+    let sp_b0 = narf_interrupts::dispatch::spurious_count(v_b);
+    let fc_b1 = narf_interrupts::dispatch::fire_count(v_b);
+    narf_interrupts::dispatch::on_irq(v_b);
+    if narf_interrupts::dispatch::fire_count(v_b) != fc_b1 + 1 {
+        return TestResult::Fail("control fire must still advance HBA-B fire_count");
+    }
+    if narf_interrupts::dispatch::spurious_count(v_b) != sp_b0 + 1 {
+        return TestResult::Fail("idle-HBA fire must count as spurious (handler returned None)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci-e2e",
+    smoke_ahci_two_hba_irq_completion
 );
 
 // ═══════════════════════════════════════════════════════════════════

@@ -14,6 +14,13 @@
 //! - The ISR walks HBA `IS` to find ports with pending events
 //!   (§3.1.3), drains each port's `PORT_IS` (W1C), then clears the
 //!   port bit in HBA `IS` (also W1C).
+//! - Per-controller ISR state (#979): every installed HBA negotiates
+//!   its own vector and installs its own handler — the handler's
+//!   cookie is that HBA's ABAR address, so the ISR drains only its
+//!   own HBA and returns `IrqStatus::None` when its `IS` is empty
+//!   (shared-INTx chaining). Each HBA's `GHC.IE` is enabled only
+//!   once its own vector is routed. A controller with no vector
+//!   (`irq_vector == 0`) falls back to sync polling.
 //! - `narf_interrupts::on_irq` (called from the registered sync
 //!   handler via the dispatch table) bumps a per-vector `fire_count`
 //!   and wakes any task awaiting `wait_for_irq`. Async I/O paths
@@ -56,7 +63,7 @@
 //! | +0x34   | SACT  | SATA Active                     |
 //! | +0x38   | CI    | Command Issue                   |
 
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
 
 use crate::req_gate::ReqGate;
 
@@ -445,13 +452,19 @@ pub struct Ahci {
     /// controller and the resume handler revalidating it (#932).
     /// The block surface refuses I/O with `DeviceRemoved` while set.
     suspended: AtomicBool,
-    /// MSI vector the shared ISR serves for this controller, 0 when
-    /// this controller has none. Only the FIRST installed HBA gets
-    /// the vector: `ahci_isr` + the `AHCI_MMIO_BASE` /
-    /// `AHCI_IRQ_VECTOR` globals are a single-controller design;
-    /// later HBAs poll (their completion waits use the deadline
-    /// fallback) — see `probe`.
+    /// MSI/MSI-X/INTx vector this controller's ISR is installed on,
+    /// 0 when no IRQ path was negotiated for it (#979: one vector
+    /// per controller; each HBA's handler is keyed by its own ABAR
+    /// cookie). A controller with `irq_vector == 0` completes
+    /// commands by polling (its async waits take the deadline
+    /// fallback).
     irq_vector: u8,
+    /// MSI-X table backing for this controller, kept alive for its
+    /// lifetime so its physical pages aren't reclaimed underneath
+    /// the programmed table (#979: one table per controller; the
+    /// pre-#979 single static held only the first HBA's table).
+    /// `None` when this controller negotiated MSI or INTx instead.
+    msix: Option<MsixTable>,
 }
 
 impl core::fmt::Debug for Ahci {
@@ -1046,6 +1059,7 @@ impl Ahci {
             disks: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             suspended: AtomicBool::new(false),
             irq_vector: 0,
+            msix: None,
         };
 
         // Seed every FIS area's D2H Register FIS status (RFIS + 0x40 + 2)
@@ -1106,9 +1120,11 @@ impl Ahci {
         bit: u32,
     ) -> Result<(), AhciError> {
         let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
-        // Per-controller vector (#931): only the first installed HBA
-        // owns the shared ISR; a later HBA must not await an IRQ
-        // that can only ever describe the first controller's ports.
+        // Per-controller vector (#979): each installed HBA owns its
+        // own vector + ISR (keyed by its ABAR cookie), so awaiting
+        // this controller's vector can only ever describe this
+        // controller's ports. A controller with no vector (0) must
+        // not await at all — see the `vector == 0` branch below.
         let vector = self.irq_vector;
 
         if vector == 0 {
@@ -2340,8 +2356,8 @@ pub unsafe fn ahci_read_lba_xfer(
 /// [`ahci_isr`] instead of by the host spin-polling PORT_CI.
 ///
 /// Falls back to spin-polling when no IRQ path is wired (i.e. when
-/// `AHCI_IRQ_VECTOR` is 0). This keeps the function safe to call
-/// even when MSI-X / MSI / INTx negotiation failed at probe.
+/// this controller's `irq_vector` is 0). This keeps the function safe
+/// to call even when MSI-X / MSI / INTx negotiation failed at probe.
 ///
 /// # Safety
 /// Same as [`ahci_read_lba`].
@@ -4168,42 +4184,45 @@ pub fn dbg_device_addr() -> Option<usize> {
         .map(|d| &**d as *const Ahci as usize)
 }
 
-/// IDT vector our ISR is installed on, or 0 if no IRQ path was
-/// successfully negotiated. Loaded by both ISR and async waiters.
-/// Stays at 0 until `try_setup_irq` succeeds.
-static AHCI_IRQ_VECTOR: AtomicU8 = AtomicU8::new(0);
-
-/// MMIO base for the registered HBA. Stored as `usize` so the ISR
-/// can reach it without locking (the ISR runs in IRQ context where
-/// taking `IrqSafeSpinLock` would deadlock if the lock was already
-/// held by the path that triggered the IRQ).
-/// The ABAR's mapped kernel VA (not its physical address): the ISR
-/// dereferences it with no further translation step.
-static AHCI_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
-
-/// MSI-X table backing — kept alive for the life of the controller
-/// so its physical pages aren't reclaimed underneath us.
-static AHCI_MSIX: IrqSafeSpinLock<Option<MsixTable>> = IrqSafeSpinLock::new(None);
-
-/// Synchronous AHCI ISR. Called by `narf_interrupts::dispatch::on_irq`
-/// before the per-vector `fire_count` increment + waker fan-out. Job:
-/// drain the level-triggered IRQ source so the next event is allowed
+/// Synchronous AHCI ISR, one registration per installed HBA (#979).
+/// Called by `narf_interrupts::dispatch::on_irq` before the
+/// per-vector `fire_count` increment + waker fan-out. Job: drain
+/// the level-triggered IRQ source so the next event is allowed
 /// to fire.
+///
+/// The `cookie` is the owning HBA's ABAR mapped kernel VA (not its
+/// physical address), stashed at probe time when the handler is
+/// installed. It stays valid for the handler's lifetime: an
+/// installed `Ahci` is never moved, replaced or dropped (see
+/// `probed_ahci`), and the `MmioRegion` it owns lives as long as
+/// the controller. The ISR reaches the registers without locking —
+/// it runs in IRQ context where taking `IrqSafeSpinLock` would
+/// deadlock if the lock was already held by the path that triggered
+/// the IRQ.
+///
+/// Returns `Handled` when this HBA had pending interrupt state to
+/// drain, `None` when its `IS` is empty — the pass-along a shared
+/// INTx line needs so the next chained handler gets its turn and
+/// `on_irq` only records the fire as spurious when NO handler
+/// claimed it.
 ///
 /// Bounded work: HBA `IS` is a 32-bit per-port bitmap, so at worst
 /// we walk 32 ports per fire (AHCI 1.3.1 §3.1.3). Each port's
 /// `PORT_IS` is also a fixed 32-bit register. No unbounded loops.
-fn ahci_isr() {
-    let base = AHCI_MMIO_BASE.load(Ordering::Acquire);
-    if base == 0 {
-        return;
+pub fn ahci_isr(cookie: u64) -> narf_interrupts::IrqStatus {
+    if cookie == 0 {
+        return narf_interrupts::IrqStatus::None;
     }
-    // SAFETY: `base` is the ABAR's mapped kernel VA, stashed
-    // post-bring-up and owned by the AHCI driver.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let is = unsafe { core::ptr::read_volatile((base as u64 + HBA_IS) as *const u32) };
+    ahci_isr_regs(&VolatileAbar(cookie))
+}
+
+/// The ISR's drain over the [`AhciRegs`] trait, so the same code
+/// drives the real ABAR and the register model in the kernel tests
+/// (same split as [`hba_global_init`]).
+pub fn ahci_isr_regs(regs: &impl AhciRegs) -> narf_interrupts::IrqStatus {
+    let is = regs.read32(HBA_IS);
     if is == 0 {
-        return;
+        return narf_interrupts::IrqStatus::None;
     }
     // Clear each port's per-port IS first (W1C inside the port,
     // §3.3.5), then clear the HBA-wide IS bit (W1C, §3.1.3). Order
@@ -4216,18 +4235,33 @@ fn ahci_isr() {
             continue;
         }
         let off = PORT_BASE_OFF + (n as u64) * PORT_STRIDE;
-        // SAFETY: same identity-mapped MMIO window.
-        let pis = unsafe { core::ptr::read_volatile((base as u64 + off + PORT_IS) as *mut u32) };
+        let pis = regs.read32(off + PORT_IS);
         if pis != 0 {
-            // SAFETY: same.
-            unsafe {
-                core::ptr::write_volatile((base as u64 + off + PORT_IS) as *mut u32, pis);
-            }
+            regs.write32(off + PORT_IS, pis);
         }
     }
-    // SAFETY: same.
-    unsafe {
-        core::ptr::write_volatile((base as u64 + HBA_IS) as *mut u32, is);
+    regs.write32(HBA_IS, is);
+    narf_interrupts::IrqStatus::Handled
+}
+
+/// Volatile-backed [`AhciRegs`] over a raw ABAR address: the
+/// production side of [`ahci_isr_regs`]. The address is the ABAR's
+/// mapped kernel VA (identity-mapped window or ioremap window, per
+/// `MmioRegion::virt`); every offset used by the drain is inside
+/// the HBA's register block.
+struct VolatileAbar(u64);
+
+impl AhciRegs for VolatileAbar {
+    fn read32(&self, off: u64) -> u32 {
+        // SAFETY: `self.0` is the ABAR's mapped kernel VA, stashed
+        // post-bring-up and owned by the AHCI driver; `off` is an
+        // HBA register offset inside that window.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { core::ptr::read_volatile((self.0 + off) as *const u32) }
+    }
+    fn write32(&self, off: u64, val: u32) {
+        // SAFETY: as in `read32`.
+        unsafe { core::ptr::write_volatile((self.0 + off) as *mut u32, val) }
     }
 }
 
@@ -4310,25 +4344,49 @@ fn try_install_intx_ahci(_cap: &Cap<BusDeviceCap, Write>, _device: &BusDevice) -
     None
 }
 
-/// Negotiate an IRQ delivery path (MSI-X → MSI → INTx). On success,
-/// installs `ahci_isr` on the chosen vector + records the vector in
-/// `AHCI_IRQ_VECTOR`. On total failure leaves `AHCI_IRQ_VECTOR` at
-/// 0 — async paths will fall back to sync polling.
-fn try_setup_irq(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) {
+/// Outcome of one controller's IRQ negotiation: the vector its
+/// ISR is installed on (0 when no path could be negotiated) and
+/// the MSI-X table backing to keep alive for that controller's
+/// lifetime (`None` when it negotiated MSI or INTx instead).
+#[derive(Debug)]
+pub struct IrqSetup {
+    pub vector: u8,
+    pub msix: Option<MsixTable>,
+}
+
+/// Negotiate an IRQ delivery path (MSI-X → MSI → INTx) for ONE
+/// controller (#979: every installed HBA negotiates its own path).
+/// On success installs [`ahci_isr`] on the chosen vector with the
+/// controller's ABAR address as the handler cookie, so the ISR
+/// drains only this HBA. On total failure returns vector 0 — the
+/// controller's async paths will fall back to sync polling.
+/// GHC.IE stays clear until the caller enables it, so no IRQ can
+/// be delivered before the handler is installed.
+fn try_setup_irq(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice, mmio_base: u64) -> IrqSetup {
     if let Some((tbl, v)) = try_enable_msix_ahci(cap, device) {
-        narf_interrupts::install_handler(v, ahci_isr);
-        *AHCI_MSIX.lock() = Some(tbl);
-        AHCI_IRQ_VECTOR.store(v, Ordering::Release);
-        return;
+        narf_interrupts::dispatch::install_handler_named(v, "ahci", mmio_base, ahci_isr);
+        return IrqSetup {
+            vector: v,
+            msix: Some(tbl),
+        };
     }
     if let Some(v) = try_enable_msi_ahci(cap, device) {
-        narf_interrupts::install_handler(v, ahci_isr);
-        AHCI_IRQ_VECTOR.store(v, Ordering::Release);
-        return;
+        narf_interrupts::dispatch::install_handler_named(v, "ahci", mmio_base, ahci_isr);
+        return IrqSetup {
+            vector: v,
+            msix: None,
+        };
     }
     if let Some(v) = try_install_intx_ahci(cap, device) {
-        narf_interrupts::install_handler(v, ahci_isr);
-        AHCI_IRQ_VECTOR.store(v, Ordering::Release);
+        narf_interrupts::dispatch::install_handler_named(v, "ahci", mmio_base, ahci_isr);
+        return IrqSetup {
+            vector: v,
+            msix: None,
+        };
+    }
+    IrqSetup {
+        vector: 0,
+        msix: None,
     }
 }
 
@@ -4544,7 +4602,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if controller_installed(device.addr) {
         return Ok(());
     }
-    let first = controller_count() == 0;
     // Enable MEM_SPACE + BUS_MASTER. We leave INTX_DISABLE clear so
     // that the legacy INTx fallback is reachable; if MSI / MSI-X
     // negotiation succeeds, the device's INTx pin is still inert
@@ -4592,31 +4649,24 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         dev.capacity = first_disk.sectors;
     }
     dev.set_disks(disks);
-    if first {
-        // The shared ISR (`ahci_isr` + the `AHCI_MMIO_BASE` /
-        // `AHCI_IRQ_VECTOR` globals) is a single-controller
-        // design, so only the FIRST installed HBA negotiates an
-        // IRQ. Later HBAs poll: their async completion waits take
-        // the `irq_vector == 0` deadline path (correct, just not
-        // interrupt-driven). Lifting this means per-controller ISR
-        // state — a follow-up, not silently half-done here.
-        //
-        // Stash the MMIO base for the ISR before any IRQ can fire.
-        // The ISR dereferences this directly, so stash the mapped
-        // VA, not the BAR's physical address — `MmioRegion::virt`
-        // is the ioremap window for above-map BARs and equals the
-        // PA only for identity-mapped ones.
-        AHCI_MMIO_BASE.store(dev.mmio.virt as usize, Ordering::Release);
-        // Negotiate IRQ delivery (MSI-X → MSI → INTx). Best-effort —
-        // failure leaves the driver in sync-poll mode.
-        try_setup_irq(&cap, &device);
-        dev.irq_vector = AHCI_IRQ_VECTOR.load(Ordering::Acquire);
-        // Only now may the HBA interrupt: the ISR is installed and
-        // the vector routed. Without a route GHC.IE stays clear
-        // and the driver polls.
-        if dev.irq_vector != 0 {
-            hba_enable_irq(&Abar(&dev.mmio));
-        }
+    // Per-controller IRQ (#979): every installed HBA negotiates
+    // its own delivery path and installs its own ISR, keyed by
+    // this HBA's ABAR address. Negotiate IRQ delivery (MSI-X →
+    // MSI → INTx). Best-effort — failure leaves the driver in
+    // sync-poll mode.
+    //
+    // The handler cookie is the mapped VA, not the BAR's physical
+    // address — `MmioRegion::virt` is the ioremap window for
+    // above-map BARs and equals the PA only for identity-mapped
+    // ones.
+    let setup = try_setup_irq(&cap, &device, dev.mmio.virt);
+    dev.irq_vector = setup.vector;
+    dev.msix = setup.msix;
+    // Only now may the HBA interrupt: the ISR is installed and
+    // the vector routed. Without a route GHC.IE stays clear
+    // and the driver polls.
+    if dev.irq_vector != 0 {
+        hba_enable_irq(&Abar(&dev.mmio));
     }
     let ctrl = install_controller(dev);
     // #932: join the device_pm suspend/resume fan-out (idempotent
