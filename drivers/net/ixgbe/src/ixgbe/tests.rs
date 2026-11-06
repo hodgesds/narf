@@ -1222,6 +1222,7 @@ fn smoke_ixgbe_ethtool_snapshot() -> TestResult {
         vlan_filter_enabled: true,
         wol_supported: true,
         wol_armed: false,
+        eee: None,
         stats,
         queue_stats: QueueStats::default(),
     };
@@ -1229,6 +1230,7 @@ fn smoke_ixgbe_ethtool_snapshot() -> TestResult {
     if !summary.contains("ixgbe 0.1.0")
         || !summary.contains("rx_pkts=123")
         || !summary.contains("tx_pkts=456")
+        || !summary.contains("eee=n/a")
     {
         return TestResult::Fail("ethtool summary missing fields");
     }
@@ -1299,6 +1301,52 @@ fn smoke_ixgbe_eee_defaults() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_defaults);
+
+fn smoke_ixgbe_eee_default_state() -> TestResult {
+    use super::eee::{
+        default_state, eee_capable, EeeSpeeds, DEV_E610_10G_T, DEV_E610_2_5G_T, DEV_X550EM_A_1G_T,
+        EEE_SPEED_100M, EEE_SPEED_10G, EEE_SPEED_1G, EEE_SPEED_2_5G, EEE_SPEED_5G,
+    };
+    // Capable parts get their identification defaults; the state
+    // starts enabled (advertised == supported), timer 0, no
+    // firmware active bit — the baseline `set_eee` validates
+    // against before any configuration.
+    let x550 = match default_state(DEV_X550EM_A_1G_T) {
+        Some(s) => s,
+        None => return TestResult::Fail("X550EM_A has no default EEE state"),
+    };
+    if x550.supported != EeeSpeeds(EEE_SPEED_100M | EEE_SPEED_1G)
+        || x550.advertised != x550.supported
+        || !x550.enabled()
+        || x550.tx_lpi_timer != 0
+        || x550.fw_active.is_some()
+    {
+        return TestResult::Fail("X550EM_A default EEE state wrong");
+    }
+    let e610 = match default_state(DEV_E610_2_5G_T) {
+        Some(s) => s,
+        None => return TestResult::Fail("E610 2.5G_T has no default EEE state"),
+    };
+    if e610.supported != EeeSpeeds(EEE_SPEED_2_5G) || e610.advertised != e610.supported {
+        return TestResult::Fail("E610 2.5G_T default EEE state wrong");
+    }
+    let e610_10g = match default_state(DEV_E610_10G_T) {
+        Some(s) => s,
+        None => return TestResult::Fail("E610 10G_T has no default EEE state"),
+    };
+    if e610_10g.supported != EeeSpeeds(EEE_SPEED_2_5G | EEE_SPEED_5G | EEE_SPEED_10G) {
+        return TestResult::Fail("E610 10G_T default EEE state wrong");
+    }
+    // Non-capable parts (and unknown ids) get no default state —
+    // `set_eee` on them fails before validation, never after.
+    for did in [IXGBE_DEV_82599EB, IXGBE_DEV_X540, IXGBE_DEV_X550, 0xFFFF] {
+        if !eee_capable(did) && default_state(did).is_some() {
+            return TestResult::Fail("non-capable device id got a default EEE state");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eee_default_state);
 
 fn smoke_ixgbe_eee_state_machine() -> TestResult {
     use super::eee::{

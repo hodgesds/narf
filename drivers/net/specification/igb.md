@@ -197,6 +197,43 @@ Existing PF-only paths (VFTA, RETA, WoL) are unaffected with 0 VFs:
 `vt_allocate` is opt-in, and `vlan_filter_add` / `vlan_filter_remove`
 take the PF-only path until it runs.
 
+### 4.8 EEE control/status (issue #794)
+
+EEE advertisement + ethtool get/set for the copper parts, in
+`drivers/net/igb/src/igb/eee.rs` (`EeeRegs` trait + `MmioEeeRegs`
+real impl, pure word helpers, scripted `FakeRegs` fixture) with
+wiring as `Igb::eee_status` / `Igb::set_eee` and an `eee` field
+on `EthtoolInfo` (populated from a live read; `None` while the
+part is not EEE-capable or the PHY does not answer).
+
+- Capability gate: copper device ids only — I210 copper /
+  flashless, I211 copper, 82576, 82576_NS, I350 copper.
+  Fiber/SerDes/SGMII parts have no copper PHY to negotiate
+  EEE on, and return an error.
+- Set (mirrors igc's `setup_link` EEE block, Linux
+  `igb_set_eee`): MMD 7/60 = 100M bit 1 + 1G bit 2, MMD
+  7/62 = 2.5G bit 0 (Linux `igb_set_eee` / igc
+  `igc_setup_link` EEE sequence), IPCNFG 0x0E38 bits 12
+  (100M) + 14 (1G) — the e1000-generation layout, NOT
+  igc's I225 bits 2–4 — EEER 0x0E30 TX/RX-LPI-EN + the
+  0x70000 wait/delay bits, then a BMCR restart
+  (0x1200) so the new advertisement goes on the wire.
+  Supported set is 100M + 1G only; 2.5G request bits are
+  masked out of the IPCNFG word.
+- Get: MMD 7/60 + 7/62 (advertised), MMD 7/61 + 7/63
+  (partner), EEER bit 16 (TX-LPI on), STATUS bit 1
+  (link-up). `active` = link-up and advertised ∩ partner
+  non-empty, with the shared bit encoding 8 = 100M,
+  16 = 1G, 32 = 2.5G.
+- Caveat: the MAC forces 1G full-duplex
+  (CTRL_FRCSPD/FRCDPLX), so the programmed advertisement
+  is negotiated by the PHY autoneg the BMCR restart
+  kicks; `active` stays false until a partner negotiates
+  EEE. Set is the exception to the "no set-side ethtool
+  ops" rule: unlike ring/RETA changes it needs no
+  stop/reconfigure sequence — Linux applies it live the
+  same way.
+
 ## 5. Remainders (not silently dropped)
 
 - **PCI SR-IOV config-space enablement + VF BAR exposure.** Needs a
