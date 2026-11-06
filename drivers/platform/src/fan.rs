@@ -24,11 +24,17 @@
 //! (`DEVID_FAN_BOOST`). Each wrapper maps the governor's 0..=255
 //! level onto the vendor driver's own discrete ladder.
 //!
-//! `PwmFan` remains unconstructed in production: nothing in the
-//! tree can supply it a `PwmDevice` — `narf_pwm` has no controller
-//! registry and no production `PwmDevice` implementor, and no
-//! ACPI/DT description of a PWM fan is parsed anywhere. Wiring it
-//! waits on a board description source (the DT/embedded stack).
+//! `PwmFan` is constructed from its board description: a DT
+//! `pwm-fan` node (`compatible = "pwm-fan"`, `pwms = <&pwm
+//! channel period_ns [flags]>`, optional `cooling-levels` ladder;
+//! Linux `Documentation/devicetree/bindings/hwmon/pwm-fan.yaml`)
+//! is claimed through the bus DT-match registry
+//! ([`register_dt_driver`]) and its `pwms` phandle resolves to a
+//! `PwmDevice` through the `narf_pwm` controller registry, which
+//! PWM controller drivers populate as they land. No production
+//! PWM controller driver exists yet, so on real hardware the probe
+//! defers until one registers — the fan construction itself is
+//! wired and fixture-validated end to end.
 
 extern crate alloc;
 
@@ -43,8 +49,9 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_aml::eval::{evaluate_method, evaluate_object};
 use narf_aml::{device_hid, for_each_node_of_kind, NodeKind, Value};
+use narf_bus::ProbeError;
 use narf_power::bootstrap_thermal_authority;
-use narf_power::thermal::{register_cooling_device, CoolingDevice};
+use narf_power::thermal::{register_cooling_device, CoolingDevice, ThermalError};
 use narf_pwm::{Polarity, PwmConfig, PwmDevice};
 
 // ── ACPI Fan (_HID = PNP0C0B) ───────────────────────────────────────
@@ -528,12 +535,65 @@ pub fn register_asus_fan() {
 
 // ── PWM Fan ─────────────────────────────────────────────────────────
 
+/// Board description of a PWM fan, decoded from its Devicetree
+/// `pwm-fan` node (Linux
+/// `Documentation/devicetree/bindings/hwmon/pwm-fan.yaml`:
+/// `compatible = "pwm-fan"`, `pwms` required, `cooling-levels`
+/// optional with each entry ≤ 255, `#cooling-cells = <2>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PwmFanDesc {
+    /// Phandle of the PWM controller node the fan's `pwms`
+    /// specifier points at. Used to resolve the `PwmDevice` from
+    /// the controller registry; not a fan property itself.
+    pub controller: u32,
+    /// Channel index within the controller (`pwms` cell 1).
+    pub channel: u32,
+    /// PWM period in nanoseconds (`pwms` cell 2). The worker
+    /// derives the frequency from this, so a board that declares
+    /// a non-25 kHz period gets its own period.
+    pub period_ns: u64,
+    /// Output polarity (`pwms` flags cell bit 0, when the
+    /// controller declares `#pwm-cells = <3>`: 0 normal, 1
+    /// inverted — `PWM_POLARITY_INVERTED` in
+    /// `include/dt-bindings/pwm/pwm.h`).
+    pub polarity: Polarity,
+    /// `cooling-levels` ladder: PWM duty values (0..=255) per
+    /// thermal cooling state, most to least heat dissipation.
+    /// Empty = no ladder declared: the governor level maps
+    /// linearly onto duty.
+    pub cooling_levels: Vec<u8>,
+}
+
+impl PwmFanDesc {
+    /// Description with no board data: the pre-DT default — the
+    /// standard PC / Intel 4-wire fan 25 kHz period (40_000 ns),
+    /// normal polarity, linear level→duty.
+    pub fn linear(channel: u32) -> Self {
+        Self {
+            controller: 0,
+            channel,
+            period_ns: 40_000,
+            polarity: Polarity::Normal,
+            cooling_levels: Vec::new(),
+        }
+    }
+}
+
 /// Generic PWM-controlled fan. Used on platforms that expose the fan
 /// via a PWM controller (DT-described boards, embedded SBC laptops).
 pub struct PwmFan {
     name: &'static str,
     pwm: Arc<dyn PwmDevice>,
     channel: u32,
+    /// PWM period in nanoseconds, from the board description
+    /// (`PwmFanDesc::linear` supplies the 25 kHz default).
+    period_ns: u64,
+    /// Output polarity from the board description.
+    polarity: Polarity,
+    /// `cooling-levels` ladder, if the board declared one.
+    /// Immutable after construction, so the worker takes a clone
+    /// of this `Arc` instead of another raw pointer.
+    cooling_levels: Arc<[u8]>,
     /// Coalesce target. set_level stores the latest requested
     /// level here; the worker reads + applies it. Pre-fix every
     /// set_level spawned a fresh task — a thermal loop oscillating
@@ -559,10 +619,24 @@ impl core::fmt::Debug for PwmFan {
 
 impl PwmFan {
     pub fn new(name: &'static str, pwm: Arc<dyn PwmDevice>, channel: u32) -> Self {
+        Self::from_description(name, pwm, PwmFanDesc::linear(channel))
+    }
+
+    /// Construct from a board description: the DT probe's path.
+    /// A zero period is normalised to the 25 kHz default — a
+    /// `PwmFan` must never divide by its own period.
+    pub fn from_description(
+        name: &'static str,
+        pwm: Arc<dyn PwmDevice>,
+        desc: PwmFanDesc,
+    ) -> Self {
         Self {
             name,
             pwm,
-            channel,
+            channel: desc.channel,
+            period_ns: if desc.period_ns == 0 { 40_000 } else { desc.period_ns },
+            polarity: desc.polarity,
+            cooling_levels: Arc::from(desc.cooling_levels),
             target_level: core::sync::atomic::AtomicU8::new(0),
             worker_inflight: core::sync::atomic::AtomicBool::new(false),
         }
@@ -595,6 +669,11 @@ impl CoolingDevice for PwmFan {
         // before clearing the in-flight flag.
         let p = self.pwm.clone();
         let ch = self.channel;
+        // Board timing is immutable after construction, so the
+        // worker takes copies instead of more raw pointers.
+        let period_ns = self.period_ns;
+        let polarity = self.polarity;
+        let levels = self.cooling_levels.clone();
         // SAFETY: target_level + worker_inflight are read by the
         // worker via raw pointer below. They live in `self` which
         // is held by an Arc kept alive by the fan registry; the
@@ -615,16 +694,23 @@ impl CoolingDevice for PwmFan {
             // properly aligned for the whole loop below.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             let inflight = unsafe { &*(inflight_ptr as *const core::sync::atomic::AtomicBool) };
-            // Standard PC / Intel 4-wire fan: 25 kHz PWM.
-            const FREQ: u32 = 25_000;
-            const PERIOD_NS: u64 = 1_000_000_000u64 / FREQ as u64;
             loop {
                 let lvl = target.load(Ordering::Acquire);
-                let duty_ns = (PERIOD_NS * lvl as u64) / 255;
+                // Board ladder first: `cooling-levels[i]` is the
+                // PWM duty for cooling state `i`, so the governor
+                // level picks its state by index; without a ladder
+                // the level IS the duty (linear, as before).
+                let duty_value: u64 = if levels.is_empty() {
+                    lvl as u64
+                } else {
+                    let idx = (lvl as usize * (levels.len() - 1)) / 255;
+                    levels[idx] as u64
+                };
+                let duty_ns = (period_ns * duty_value) / 255;
                 let cfg = PwmConfig {
-                    frequency_hz: FREQ,
+                    frequency_hz: (1_000_000_000u64 / period_ns) as u32,
                     duty_cycle_ns: duty_ns,
-                    polarity: Polarity::Normal,
+                    polarity,
                 };
                 let _ = p.set_config(ch, &cfg).await;
                 if lvl > 0 {
@@ -658,13 +744,207 @@ impl CoolingDevice for PwmFan {
     }
 }
 
+/// Construct a [`PwmFan`] from its board description and register
+/// it as a cooling device. Called by the DT probe
+/// ([`dt_pwm_fan_probe`]) once the `pwms` phandle resolves to a
+/// registered controller; direct callers pass
+/// [`PwmFanDesc::linear`] for the pre-DT default. Returns the
+/// registration outcome so the probe can leave the node unbound
+/// (deferred probe) when registration fails. Registration failure
+/// is logged, never swallowed silently.
+pub fn register_pwm_fan(
+    pwm: Arc<dyn PwmDevice>,
+    desc: PwmFanDesc,
+) -> Result<(), ThermalError> {
+    let cap = bootstrap_thermal_authority();
+    let channel = desc.channel;
+    let period_ns = desc.period_ns;
+    let n_levels = desc.cooling_levels.len();
+    match register_cooling_device(
+        &cap,
+        Arc::new(PwmFan::from_description("pwm-fan", pwm, desc)),
+    ) {
+        Ok(()) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  pwm-fan: registered (channel={}, period_ns={}, cooling-levels={})",
+                channel, period_ns, n_levels
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  pwm-fan: cooling-device registration failed: {:?}",
+                e
+            );
+            Err(e)
+        }
+    }
+}
+
+// ── Devicetree `pwm-fan` probe ────────────────────────────────────────
+
+/// The bus DT driver-match name.
+pub const PWM_FAN_DT_DRIVER: &str = "pwm-fan";
+
+/// `module_platform_driver` analogue: register the `pwm-fan`
+/// compatible with the bus DT match table
+/// (`narf_bus::register_dt_driver`). The Stage::Device
+/// `probe_all_dt` walk then binds every enabled `pwm-fan` node;
+/// the probe resolves its PWM controller and registers the fan.
+/// Called from the platform `Stage::Subsys` initcall.
+pub fn register_dt_driver() {
+    narf_bus::register_dt_driver(narf_bus::DtMatch {
+        name: PWM_FAN_DT_DRIVER,
+        compatible: &["pwm-fan"],
+        probe: dt_pwm_fan_probe,
+    });
+}
+
+/// Render an FDT walk [`narf_firmware_fdt::Path`] as the `/a/b`
+/// string the bus DT walk hands probes.
+fn node_path_string(path: &narf_firmware_fdt::Path<'_>) -> String {
+    let mut p = String::new();
+    for i in 0..path.depth() as usize {
+        p.push('/');
+        p.push_str(path.segment(i).unwrap_or(""));
+    }
+    if p.is_empty() {
+        p.push('/');
+    }
+    p
+}
+
+/// Decode the `pwm-fan` node at `path` in `blob` into its board
+/// description. `None` when the node is absent, its `compatible`
+/// does not carry `pwm-fan`, or any part of the description is
+/// malformed — the probe maps that to `BadDevice` and the node
+/// stays unbound.
+///
+/// Decoding follows the two bindings, not the code's convenience:
+/// - `pwms` is one specifier, `<phandle channel period_ns
+///   [flags]>`. How many cells follow the phandle comes from the
+///   controller node's `#pwm-cells` (generic PWM binding: 2 =
+///   channel + period, 3 = + flags; absent defaults to 2 — a
+///   controller node that declares anything else is malformed).
+/// - `cooling-levels` is the optional PWM-duty ladder, one u32
+///   per thermal cooling state (`pwm-fan.yaml`: each ≤ 255).
+/// - `status` is already enforced by the bus walk, which only
+///   probes enabled nodes; `#cooling-cells` belongs to the
+///   thermal-zone `cooling-maps` reference, not to this driver,
+///   so it is neither read nor required here.
+pub fn decode_dt_pwm_fan(blob: &[u8], path: &str) -> Option<PwmFanDesc> {
+    // 1) Find the node at `path` and collect its properties.
+    let mut pwms: Option<&[u8]> = None;
+    let mut cooling_levels: Option<&[u8]> = None;
+    let mut compatible_ok = false;
+    let mut found = false;
+    narf_firmware_fdt::walk_nodes(blob, |node_path, props| {
+        if found {
+            return;
+        }
+        if node_path_string(&node_path) != path {
+            return;
+        }
+        found = true;
+        for (name, value) in props {
+            match name {
+                "compatible" => {
+                    compatible_ok =
+                        narf_firmware_fdt::compatible_matches(value, "pwm-fan");
+                }
+                "pwms" => pwms = Some(value),
+                "cooling-levels" => cooling_levels = Some(value),
+                _ => {}
+            }
+        }
+    });
+    if !found || !compatible_ok {
+        return None;
+    }
+    let pwms = pwms?;
+    if pwms.len() < 12 || pwms.len() % 4 != 0 {
+        return None;
+    }
+    let be = |i: usize| {
+        u32::from_be_bytes([pwms[4 * i], pwms[4 * i + 1], pwms[4 * i + 2], pwms[4 * i + 3]])
+    };
+    let controller = be(0);
+    // 2) The controller node's `#pwm-cells` says how many cells
+    // follow the phandle. The `pwms` property must carry exactly
+    // one specifier (the binding caps it at `maxItems: 1`).
+    let mut cells = 2u32;
+    narf_firmware_fdt::for_phandle(blob, controller, |_, props, _| {
+        if let Some(c) = narf_firmware_fdt::prop_u32(props, "#pwm-cells") {
+            cells = c;
+        }
+    });
+    if !(2..=3).contains(&cells) {
+        return None;
+    }
+    if pwms.len() != 4 * (1 + cells as usize) {
+        return None;
+    }
+    let channel = be(1);
+    let period_ns = be(2) as u64;
+    if period_ns == 0 {
+        return None;
+    }
+    let polarity = if cells == 3 && be(3) & 1 != 0 {
+        Polarity::Inversed
+    } else {
+        Polarity::Normal
+    };
+    // 3) `cooling-levels`: optional PWM-duty ladder, one u32 per
+    // thermal cooling state. A present-but-empty or ragged array
+    // is malformed; absent means linear.
+    let mut levels = Vec::new();
+    if let Some(raw) = cooling_levels {
+        if raw.is_empty() || raw.len() % 4 != 0 {
+            return None;
+        }
+        for chunk in raw.chunks_exact(4) {
+            let v = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if v > 255 {
+                return None;
+            }
+            levels.push(v as u8);
+        }
+    }
+    Some(PwmFanDesc {
+        controller,
+        channel,
+        period_ns,
+        polarity,
+        cooling_levels: levels,
+    })
+}
+
+/// The DT probe: decode the node, resolve its PWM controller from
+/// the registry, and register the fan. An unresolvable controller
+/// is a deferred probe — the error leaves the node unbound so a
+/// later `probe_all_dt` walk retries it once the controller driver
+/// has registered (Linux deferred probe; a controller must register
+/// by Stage::Device for the fan to bind at boot).
+pub fn dt_pwm_fan_probe(blob: &'static [u8], path: &str) -> Result<(), ProbeError> {
+    let desc = decode_dt_pwm_fan(blob, path).ok_or(ProbeError::BadDevice)?;
+    let pwm = narf_pwm::lookup_controller(desc.controller)
+        .ok_or(ProbeError::Other("pwm-fan: PWM controller not registered"))?;
+    register_pwm_fan(pwm, desc)
+        .map_err(|_| ProbeError::Other("pwm-fan: cooling-device registration failed"))
+}
+
 // ── Smoke tests ─────────────────────────────────────────────────────
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use core::sync::atomic::{AtomicU8, Ordering};
     use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_lib::sync::IrqSafeSpinLock;
+    use narf_pwm::PwmError;
 
     /// Fake cooling device that records the last-set level. Mirrors
     /// the shape of `PwmFan`/`AcpiFan` without touching real hardware.
@@ -1292,4 +1572,425 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers-platform-fan", smoke_acpi_fan_binary_only);
+
+    // ── PWM fan fixtures ────────────────────────────────────────
+    //
+    // The fixtures below are hand-encoded FDT blobs in the shape a
+    // real DTB carries (header + struct block + strings block,
+    // big-endian cells). They are parsed by the real FDT walker
+    // and driven through the production `decode_dt_pwm_fan` /
+    // `dt_pwm_fan_probe` — the fake is the firmware, not a mock of
+    // the driver. The node contents follow the Linux pwm-fan
+    // binding (`Documentation/devicetree/bindings/hwmon/pwm-fan.yaml`:
+    // `compatible = "pwm-fan"`, `pwms = <&pwm channel period>`,
+    // `cooling-levels` entries ≤ 255) and the generic PWM binding
+    // (`pwms` cells after the phandle: channel, period in ns,
+    // optional flags with bit 0 = inverted polarity).
+
+    /// Test-only `PwmDevice` recording every config/enable call,
+    /// so the `PwmFan` worker's output is observable without
+    /// hardware. Mirrors `narf_pwm`'s `MockPwm` (which is
+    /// test-gated inside its own crate and not reachable here).
+    struct FakePwm {
+        state: IrqSafeSpinLock<Vec<(u32, PwmConfig, bool)>>,
+        channels: u32,
+    }
+
+    impl FakePwm {
+        fn new(channels: u32) -> Self {
+            Self {
+                state: IrqSafeSpinLock::new(Vec::new()),
+                channels,
+            }
+        }
+
+        /// The last `(config, enabled)` recorded for `channel`.
+        fn last(&self, channel: u32) -> Option<(PwmConfig, bool)> {
+            self.state
+                .lock()
+                .iter()
+                .rev()
+                .find(|(ch, _, _)| *ch == channel)
+                .map(|(_, cfg, en)| (*cfg, *en))
+        }
+    }
+
+    #[async_trait]
+    impl PwmDevice for FakePwm {
+        async fn set_config(&self, channel: u32, config: &PwmConfig) -> Result<(), PwmError> {
+            if channel >= self.channels {
+                return Err(PwmError::InvalidChannel);
+            }
+            let mut state = self.state.lock();
+            if let Some(c) = state.iter_mut().find(|(ch, _, _)| *ch == channel) {
+                c.1 = *config;
+            } else {
+                state.push((channel, *config, false));
+            }
+            Ok(())
+        }
+
+        async fn enable(&self, channel: u32) -> Result<(), PwmError> {
+            if channel >= self.channels {
+                return Err(PwmError::InvalidChannel);
+            }
+            let mut state = self.state.lock();
+            if let Some(c) = state.iter_mut().find(|(ch, _, _)| *ch == channel) {
+                c.2 = true;
+            } else {
+                state.push((
+                    channel,
+                    PwmConfig {
+                        frequency_hz: 0,
+                        duty_cycle_ns: 0,
+                        polarity: Polarity::Normal,
+                    },
+                    true,
+                ));
+            }
+            Ok(())
+        }
+
+        async fn disable(&self, channel: u32) -> Result<(), PwmError> {
+            if channel >= self.channels {
+                return Err(PwmError::InvalidChannel);
+            }
+            let mut state = self.state.lock();
+            if let Some(c) = state.iter_mut().find(|(ch, _, _)| *ch == channel) {
+                c.2 = false;
+            } else {
+                state.push((
+                    channel,
+                    PwmConfig {
+                        frequency_hz: 0,
+                        duty_cycle_ns: 0,
+                        polarity: Polarity::Normal,
+                    },
+                    false,
+                ));
+            }
+            Ok(())
+        }
+
+        fn channel_count(&self) -> u32 {
+            self.channels
+        }
+    }
+
+    /// One big-endian u32 cell.
+    fn be32(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+
+    /// Minimal FDT (DTB v17) builder: header + struct block +
+    /// strings block, one reservation-map terminator. Same layout
+    /// as `narf-firmware-fdt`'s own test builder
+    /// (`firmware/fdt/src/tests.rs`); the blob is parsed by the
+    /// real FDT walker, so the decode under test reads real wire
+    /// bytes, not a hand-rolled node struct.
+    fn fdt_blob(nodes: &[(&str, &[(&str, &[u8])])]) -> Vec<u8> {
+        use narf_firmware_fdt as fdt;
+        let mut strings: Vec<u8> = Vec::new();
+        let intern = |strings: &mut Vec<u8>, name: &str| -> u32 {
+            // Search for an existing identical run.
+            let target = name.as_bytes();
+            let mut i = 0;
+            while i + target.len() < strings.len() {
+                if &strings[i..i + target.len()] == target && strings[i + target.len()] == 0 {
+                    return i as u32;
+                }
+                i += 1;
+            }
+            let off = strings.len() as u32;
+            strings.extend_from_slice(target);
+            strings.push(0);
+            off
+        };
+
+        let mut s: Vec<u8> = Vec::new();
+        // Root open: BEGIN_NODE + empty name + 4-byte alignment.
+        s.extend_from_slice(&fdt::FDT_BEGIN_NODE.to_be_bytes());
+        s.extend_from_slice(&[0, 0, 0, 0]);
+
+        for (node_path, props) in nodes {
+            let mut opened = 0;
+            for node_name in node_path.split('/') {
+                s.extend_from_slice(&fdt::FDT_BEGIN_NODE.to_be_bytes());
+                s.extend_from_slice(node_name.as_bytes());
+                s.push(0);
+                while s.len() % 4 != 0 {
+                    s.push(0);
+                }
+                opened += 1;
+            }
+            for (pname, pval) in *props {
+                let off = intern(&mut strings, pname);
+                s.extend_from_slice(&fdt::FDT_PROP.to_be_bytes());
+                s.extend_from_slice(&(pval.len() as u32).to_be_bytes());
+                s.extend_from_slice(&off.to_be_bytes());
+                s.extend_from_slice(pval);
+                while s.len() % 4 != 0 {
+                    s.push(0);
+                }
+            }
+            for _ in 0..opened {
+                s.extend_from_slice(&fdt::FDT_END_NODE.to_be_bytes());
+            }
+        }
+
+        s.extend_from_slice(&fdt::FDT_END_NODE.to_be_bytes()); // close root
+        s.extend_from_slice(&fdt::FDT_END.to_be_bytes());
+
+        let struct_size = s.len() as u32;
+        let strings_size = strings.len() as u32;
+
+        let mut rsv: Vec<u8> = Vec::new();
+        rsv.extend_from_slice(&0u64.to_be_bytes());
+        rsv.extend_from_slice(&0u64.to_be_bytes());
+
+        let off_rsvmap = 40u32;
+        let off_struct = off_rsvmap + rsv.len() as u32;
+        let off_strings = off_struct + struct_size;
+        let totalsize = off_strings + strings_size;
+
+        let mut out: Vec<u8> = Vec::with_capacity(totalsize as usize);
+        out.extend_from_slice(&fdt::FDT_MAGIC.to_be_bytes());
+        out.extend_from_slice(&totalsize.to_be_bytes());
+        out.extend_from_slice(&off_struct.to_be_bytes());
+        out.extend_from_slice(&off_strings.to_be_bytes());
+        out.extend_from_slice(&off_rsvmap.to_be_bytes());
+        out.extend_from_slice(&17u32.to_be_bytes()); // version
+        out.extend_from_slice(&16u32.to_be_bytes()); // last_comp_version
+        out.extend_from_slice(&0u32.to_be_bytes()); // boot_cpuid
+        out.extend_from_slice(&strings_size.to_be_bytes());
+        out.extend_from_slice(&struct_size.to_be_bytes());
+        out.extend_from_slice(&rsv);
+        out.extend_from_slice(&s);
+        out.extend_from_slice(&strings);
+        out
+    }
+
+    /// Two-node fixture blob: a PWM controller node (phandle
+    /// `0x2a`, `#pwm-cells` = `pwm_cells`) and a `pwm-fan` node
+    /// whose `pwms` carries `pwms_cells` (first cell the phandle)
+    /// and whose `cooling-levels` is `levels` when `Some`
+    /// (absent when `None`). The fan lives at `/fan`, the
+    /// controller at `/pwm@1000`.
+    fn pwm_fan_fixture(pwm_cells: u32, pwms_cells: &[u32], levels: Option<&[u32]>) -> Vec<u8> {
+        let phandle = be32(0x2a);
+        let cells = be32(pwm_cells);
+        let compatible = b"pwm-fan\0";
+        let mut pwms = Vec::new();
+        for c in pwms_cells {
+            pwms.extend_from_slice(&be32(*c));
+        }
+        let mut level_bytes = Vec::new();
+        for l in levels.unwrap_or(&[]) {
+            level_bytes.extend_from_slice(&be32(*l));
+        }
+        let mut fan_props: Vec<(&str, &[u8])> = alloc::vec![
+            ("compatible", compatible.as_slice()),
+            ("pwms", pwms.as_slice()),
+        ];
+        if levels.is_some() {
+            fan_props.push(("cooling-levels", level_bytes.as_slice()));
+        }
+        fdt_blob(&[
+            ("pwm@1000", &[("phandle", phandle.as_slice()), ("#pwm-cells", cells.as_slice())]),
+            ("fan", &fan_props),
+        ])
+    }
+
+    fn smoke_dt_pwm_fan_decode() -> TestResult {
+        // The binding's own example shape: `pwms = <&pwm 0
+        // 10000 0>` with `cooling-levels = <0 102 170 230>` —
+        // here channel 3 at the 25 kHz period (40_000 ns).
+        let blob = pwm_fan_fixture(2, &[0x2a, 3, 40_000], Some(&[0, 102, 170, 230]));
+        let desc = match decode_dt_pwm_fan(&blob, "/fan") {
+            Some(d) => d,
+            None => return TestResult::Fail("pwm-fan node must decode"),
+        };
+        if desc.controller != 0x2a || desc.channel != 3 || desc.period_ns != 40_000 {
+            return TestResult::Fail("pwms specifier decoded wrong");
+        }
+        if desc.polarity != Polarity::Normal {
+            return TestResult::Fail("2-cell pwms must decode as normal polarity");
+        }
+        if desc.cooling_levels != alloc::vec![0, 102, 170, 230] {
+            return TestResult::Fail("cooling-levels ladder decoded wrong");
+        }
+        // Unknown path / missing node must not decode.
+        if decode_dt_pwm_fan(&blob, "/nope").is_some() {
+            return TestResult::Fail("unknown path must not decode");
+        }
+        // No ladder declared: linear, not an error.
+        let blob = pwm_fan_fixture(2, &[0x2a, 0, 40_000], None);
+        match decode_dt_pwm_fan(&blob, "/fan") {
+            Some(d) if d.cooling_levels.is_empty() => {}
+            _ => return TestResult::Fail("absent cooling-levels must decode as linear"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers-platform-fan", smoke_dt_pwm_fan_decode);
+
+    fn smoke_dt_pwm_fan_decode_polarity_flag() -> TestResult {
+        // 3-cell specifier: flags bit 0 set inverts the output.
+        let blob = pwm_fan_fixture(3, &[0x2a, 1, 40_000, 1], None);
+        match decode_dt_pwm_fan(&blob, "/fan") {
+            Some(d) if d.polarity == Polarity::Inversed => {}
+            _ => return TestResult::Fail("flags bit 0 must decode as inverted polarity"),
+        }
+        let blob = pwm_fan_fixture(3, &[0x2a, 1, 40_000, 0], None);
+        match decode_dt_pwm_fan(&blob, "/fan") {
+            Some(d) if d.polarity == Polarity::Normal => {}
+            _ => return TestResult::Fail("flags 0 must decode as normal polarity"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers-platform-fan", smoke_dt_pwm_fan_decode_polarity_flag);
+
+    fn smoke_dt_pwm_fan_decode_rejects_malformed() -> TestResult {
+        // Missing `pwms` (required by the binding).
+        let blob = fdt_blob(&[("fan", &[("compatible", b"pwm-fan\0".as_slice())])]);
+        if decode_dt_pwm_fan(&blob, "/fan").is_some() {
+            return TestResult::Fail("node without pwms must not decode");
+        }
+        // Zero period: the worker divides by it.
+        let blob = pwm_fan_fixture(2, &[0x2a, 0, 0], None);
+        if decode_dt_pwm_fan(&blob, "/fan").is_some() {
+            return TestResult::Fail("zero period must not decode");
+        }
+        // Cooling level above the binding's 255 maximum.
+        let blob = pwm_fan_fixture(2, &[0x2a, 0, 40_000], Some(&[0, 256]));
+        if decode_dt_pwm_fan(&blob, "/fan").is_some() {
+            return TestResult::Fail("cooling level > 255 must not decode");
+        }
+        // `#pwm-cells` disagrees with the specifier length.
+        let blob = pwm_fan_fixture(3, &[0x2a, 0, 40_000], None);
+        if decode_dt_pwm_fan(&blob, "/fan").is_some() {
+            return TestResult::Fail("3-cell controller with 2-cell pwms must not decode");
+        }
+        let blob = pwm_fan_fixture(1, &[0x2a, 0, 40_000], None);
+        if decode_dt_pwm_fan(&blob, "/fan").is_some() {
+            return TestResult::Fail("#pwm-cells = 1 must not decode");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers-platform-fan",
+        smoke_dt_pwm_fan_decode_rejects_malformed
+    );
+
+    fn smoke_pwm_fan_linear_default_drives_25khz() -> TestResult {
+        // The first test that actually constructs a `PwmFan`: the
+        // pre-DT default keeps the old behaviour — 25 kHz, duty
+        // is the level itself.
+        narf_scheduler::__reset_queues_for_test();
+        let pwm = Arc::new(FakePwm::new(2));
+        let fan = PwmFan::new("pwm-fan", pwm.clone(), 1);
+        fan.set_level(200);
+        narf_scheduler::run_until_empty();
+        match pwm.last(1) {
+            Some((cfg, true)) => {
+                // 40_000 * 200 / 255 = 31_372 ns at 25 kHz.
+                if cfg.frequency_hz != 25_000 || cfg.duty_cycle_ns != 31_372 {
+                    return TestResult::Fail("linear PwmFan drove the wrong duty");
+                }
+            }
+            _ => return TestResult::Fail("PwmFan set_level(200) did not enable its channel"),
+        }
+        fan.set_level(0);
+        narf_scheduler::run_until_empty();
+        match pwm.last(1) {
+            Some((_, false)) => TestResult::Pass,
+            _ => TestResult::Fail("PwmFan set_level(0) did not disable its channel"),
+        }
+    }
+    kernel_test_in!(
+        "drivers-platform-fan",
+        smoke_pwm_fan_linear_default_drives_25khz
+    );
+
+    fn smoke_dt_pwm_fan_probe_registers_and_drives() -> TestResult {
+        narf_scheduler::__reset_queues_for_test();
+        narf_power::thermal::init();
+        let blob = pwm_fan_fixture(2, &[0x2a, 3, 40_000], Some(&[0, 102, 170, 230]));
+        let blob: &'static [u8] = alloc::boxed::Box::leak(blob.into_boxed_slice());
+        let pwm = Arc::new(FakePwm::new(4));
+        narf_pwm::unregister_controller(0x2a);
+        narf_pwm::register_controller(0x2a, pwm.clone());
+        // No controller registered yet for a different phandle:
+        // the probe defers instead of binding.
+        let blob_noctl = pwm_fan_fixture(2, &[0x2b, 3, 40_000], None);
+        let blob_noctl: &'static [u8] = alloc::boxed::Box::leak(blob_noctl.into_boxed_slice());
+        if dt_pwm_fan_probe(blob_noctl, "/fan").is_ok() {
+            narf_pwm::unregister_controller(0x2a);
+            return TestResult::Fail("probe with no controller must defer, not bind");
+        }
+        if dt_pwm_fan_probe(blob, "/fan").is_err() {
+            narf_pwm::unregister_controller(0x2a);
+            return TestResult::Fail("pwm-fan probe must succeed with a registered controller");
+        }
+        // Governor drive, end to end through the thermal
+        // registry: level 128 lands on cooling state 1
+        // (128 * 3 / 255 = 1) -> duty value 102 -> duty_ns
+        // 40_000 * 102 / 255 = 16_000 at 25 kHz, channel enabled.
+        if narf_power::thermal::set_cooling_level(128).is_err() {
+            narf_pwm::unregister_controller(0x2a);
+            return TestResult::Fail("set_cooling_level rejected");
+        }
+        narf_scheduler::run_until_empty();
+        match pwm.last(3) {
+            Some((cfg, true)) => {
+                if cfg.frequency_hz != 25_000
+                    || cfg.duty_cycle_ns != 16_000
+                    || cfg.polarity != Polarity::Normal
+                {
+                    narf_pwm::unregister_controller(0x2a);
+                    return TestResult::Fail("governor level 128 drove the wrong PWM config");
+                }
+            }
+            _ => {
+                narf_pwm::unregister_controller(0x2a);
+                return TestResult::Fail("fan channel 3 was not enabled by the governor drive");
+            }
+        }
+        // Level 0 disables the channel.
+        if narf_power::thermal::set_cooling_level(0).is_err() {
+            narf_pwm::unregister_controller(0x2a);
+            return TestResult::Fail("set_cooling_level(0) rejected");
+        }
+        narf_scheduler::run_until_empty();
+        match pwm.last(3) {
+            Some((_, false)) => {}
+            _ => {
+                narf_pwm::unregister_controller(0x2a);
+                return TestResult::Fail("level 0 must disable the fan channel");
+            }
+        }
+        narf_pwm::unregister_controller(0x2a);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers-platform-fan",
+        smoke_dt_pwm_fan_probe_registers_and_drives
+    );
+
+    fn smoke_pwm_fan_dt_driver_registers() -> TestResult {
+        // The Subsys initcall's claim: the `pwm-fan` compatible
+        // is registered with the bus DT-match table, so the
+        // Stage::Device walk binds it. Unregister afterwards so
+        // the global table is left as found.
+        narf_bus::unregister_dt_driver(PWM_FAN_DT_DRIVER);
+        register_dt_driver();
+        let found = narf_bus::registered_dt_drivers()
+            .iter()
+            .any(|d| d.name == PWM_FAN_DT_DRIVER && d.compatible.contains(&"pwm-fan"));
+        narf_bus::unregister_dt_driver(PWM_FAN_DT_DRIVER);
+        if !found {
+            return TestResult::Fail("pwm-fan DT driver was not registered");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers-platform-fan", smoke_pwm_fan_dt_driver_registers);
 }

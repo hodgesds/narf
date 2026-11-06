@@ -35,6 +35,7 @@ narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
 narf-kernel-test     = { path = "../../verification/kernel-test" }
 narf-firmware-smbios = { path = "../../firmware/smbios" }
+narf-firmware-fdt    = { path = "../../firmware/fdt" }
 # Used only by the TPM device model (tpm_fixture): the model's AK
 # derivation and Quote signing need real P-256 math, and a third
 # hand-copied ECC implementation in fixture code is exactly the
