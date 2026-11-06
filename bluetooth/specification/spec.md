@@ -369,6 +369,27 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   outbound channel-open client — #889), SCO (#817), fixed-CID
   sockets (ATT/SMP/signalling stay routed to the pump's own
   server/responder), and SDP-channel sockets (service-owned).
+- `pm` — per-controller power-management state (issue #820). Three
+  independent park causes — mgmt power-off, system suspend,
+  USB autosuspend — OR into `pm::is_parked`, which gates
+  `pump::pump_once` (a parked step never polls the transport but
+  still flushes queued outbound ACL, so a queued packet can wake
+  the port through the transport's TX-demand resume).
+  `pm::suspend_controller` / `pm::resume_controller` are the
+  device-PM suspend/resume pair (registered per USB controller by
+  the btusb bind as `btusb-hci<N>`); `pm::park_autosuspend` /
+  `pm::unpark_autosuspend` are the hub idle-suspend park and the
+  wake-watch / TX-demand unpark. `mgmt::is_powered` is truthful:
+  the `POWERED` setting bit AND NOT parked-for-power (mgmt off or
+  system suspend); a runtime (autosuspend) park leaves `HCI_UP`
+  alone, as on Linux. `pm::idle_timeout_ms` is the live idle
+  policy sysfs `idle_timeout` reports — default 30 000 ms (the USB
+  hub autosuspend window), 0 meaning "never autosuspend" — and the
+  btusb suspend hook vetoes gating for a 0-timeout controller.
+  Out of scope here: PCIe controllers (`btintel_pcie` never enters
+  the HCI controller registry, so it has no index to key this
+  state off) and a sysfs store path for `idle_timeout` — both
+  follow-up.
 
 ## Scope
 

@@ -69,6 +69,10 @@ pub mod l2cap_server;
 pub mod mesh;
 pub mod mgmt;
 pub mod opcode;
+/// Per-controller power-management state: park causes (mgmt
+/// power-off, system suspend, USB autosuspend) + idle timeout.
+/// Issue #820.
+pub mod pm;
 pub mod profiles;
 pub mod pump;
 pub mod rfcomm;

@@ -1215,9 +1215,18 @@ async fn dispatch_after_address(
         // USB Bluetooth HCI — class 0xE0 / subclass 0x01 / proto 0x01.
         // `find_bt_endpoints` walks the config blob; if no matching
         // interface is present it returns NotBluetooth and we fall
-        // through to the unknown-class log.
+        // through to the unknown-class log. The hub context rides
+        // in the same shape the registry probes receive (MSC
+        // precedent): parent hub slot + downstream port, None on a
+        // root port — the btusb bind records it for autosuspend
+        // activity accounting (#820).
         if crate::btusb::try_bind_btusb_already_addressed(
-            xhci_dev, slot_id, dev_vid, dev_pid, &cfg_blob,
+            xhci_dev,
+            slot_id,
+            dev_vid,
+            dev_pid,
+            &cfg_blob,
+            parent_hub_slot.map(|slot| (slot, port)),
         )
         .await
         .is_ok()

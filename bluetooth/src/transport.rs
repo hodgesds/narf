@@ -46,6 +46,11 @@ pub enum TransportError {
     EndpointStalled,
     /// Transport is registered but its host (USB hub) was unplugged.
     Detached,
+    /// Controller is parked for a power reason (mgmt power-off or
+    /// system suspend, issue #820) — transfers are refused, not
+    /// retried. A USB-autosuspend park does not surface here: the
+    /// transport resumes the port on TX demand instead.
+    Suspended,
     /// Generic catch-all for non-fatal transport errors that should
     /// trigger a retry.
     Transient,

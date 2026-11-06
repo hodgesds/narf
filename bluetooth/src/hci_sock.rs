@@ -48,10 +48,16 @@ pub fn send(dev: u16, packet: &[u8]) -> bool {
 /// Once the HCI pump is active for the controller it owns the
 /// transport's event stream, so events are read from the pump's
 /// fan-out queue; before that (and in pump-less fixtures) the
-/// transport is drained directly, as before.
+/// transport is drained directly, as before. A parked controller
+/// (#820: mgmt power-off, system suspend, USB autosuspend) has no
+/// events to deliver — polling its gated transport would fail —
+/// so the direct path returns `None` while parked.
 pub fn drain_event(dev: u16) -> Option<Vec<u8>> {
     if crate::pump::is_attached(dev as usize) {
         return crate::pump::take_socket_event(dev as usize);
+    }
+    if crate::pm::is_parked(dev as usize) {
+        return None;
     }
     let controller = controller::get_live(dev as usize)?;
     let event = controller.transport().recv_event().ok()??;

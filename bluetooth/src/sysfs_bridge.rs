@@ -155,9 +155,14 @@ pub fn register_hci_controller(
     let hr = info.hci_revision;
     kobject_add_attr(&hci_kobj, "hci_revision", move || format!("{}\n", hr));
 
-    // `idle_timeout` — ms; default 0 (no idle-power-down).
-    // Linux: `hdev->idle_timeout` (default 0).
-    kobject_add_attr(&hci_kobj, "idle_timeout", || "0\n".into());
+    // `idle_timeout` — ms; the controller's live idle policy
+    // (see `crate::pm`). Default is the USB hub autosuspend
+    // window (30 s); 0 means "never autosuspend" (Linux semantics).
+    // Linux: `hdev->idle_timeout`.
+    let index_for_idle = index;
+    kobject_add_attr(&hci_kobj, "idle_timeout", move || {
+        format!("{}\n", crate::pm::idle_timeout_ms(index_for_idle))
+    });
 
     // `sniff_max_interval` — ms, default 800 (0x0320 slots × 0.625 ms).
     // Linux: `hdev->sniff_max_interval` (default 800).
@@ -350,6 +355,34 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/sysfs", smoke_sysfs_hci_ver_attr);
+
+    // ── smoke: idle_timeout is the live pm policy, not "0" ───────
+
+    fn smoke_sysfs_hci_idle_timeout_live() -> TestResult {
+        __reset_for_test();
+        crate::pm::__reset_for_test();
+        let kobj = register_hci_controller(0, make_info(), &[]);
+        let val = match kobj.attr_show("idle_timeout") {
+            Some(v) => v,
+            None => return TestResult::Fail("idle_timeout attr missing"),
+        };
+        // Default is the hub autosuspend window (30 s), not 0.
+        if val.trim() != alloc::format!("{}", crate::pm::DEFAULT_IDLE_TIMEOUT_MS).as_str() {
+            return TestResult::Fail("idle_timeout default is not the hub window");
+        }
+        // The attribute follows the pm state live.
+        crate::pm::set_idle_timeout_ms(0, 0);
+        let val = match kobj.attr_show("idle_timeout") {
+            Some(v) => v,
+            None => return TestResult::Fail("idle_timeout attr missing after set"),
+        };
+        if val.trim() != "0" {
+            return TestResult::Fail("idle_timeout did not follow the pm state");
+        }
+        crate::pm::__reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/sysfs", smoke_sysfs_hci_idle_timeout_live);
 
     // ── smoke: connection child ──────────────────────────────────────
 
