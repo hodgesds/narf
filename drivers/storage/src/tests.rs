@@ -2045,6 +2045,146 @@ fn smoke_rtsx_probe_rejects_non_rtsx() -> TestResult {
 }
 kernel_test_in!("drivers/storage/rtsx", smoke_rtsx_probe_rejects_non_rtsx);
 
+// ── MPT3SAS interim probe (issue #935) ────────────────────────────
+//
+// The SAS3008 probe used to map BAR1, issue the doorbell reset and
+// the diagnostic-unlock write sequence, then drop the HBA while
+// reporting it bound. The interim fix deletes that path: probe
+// declines with `NotForThisDriver` before any BAR mapping, so no
+// reset can reach the hardware and the bus dispatcher offers the
+// device to the next claimant (bus spec §9.3). The device identity
+// below (LSI 0x1000:0x0097 SAS3008, PCI class 01:07:00 Serial
+// Attached SCSI) is the one #935 records for the match.
+
+/// Synthetic SAS3008 device for the mpt3sas probe smokes. The BARs
+/// are deliberately unprogrammed (`cfg_phys` 0): the decline must
+/// happen before any BAR mapping, so the fixture never hands probe a
+/// mappable window.
+fn mpt3sas_synth_sas3008() -> narf_bus::BusDevice {
+    use crate::mpt3sas;
+    use narf_bus::{BusAddr, BusDevice, BusKind, DeviceId, PcieAddr};
+    use narf_memory::PhysAddr;
+    // Bus 0x7f is synthetic (no such bus on QEMU q35), mirroring the
+    // bus crate's arbitration smoke.
+    let addr = PcieAddr::new(0, 0x7f, 0, 0);
+    BusDevice {
+        addr: BusAddr::Pcie(addr),
+        id: DeviceId {
+            vendor: mpt3sas::MPT3SAS_PCI_VENDOR,
+            device: mpt3sas::MPT3SAS_PCI_DEVICE_SAS3008,
+            class: 0x010700, // PCI class 01h/07h: Serial Attached SCSI
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Pcie {
+            addr,
+            cfg_phys: PhysAddr::new(0),
+        },
+    }
+}
+
+/// Verify the MPT3SAS probe declines a SAS3008 with
+/// `NotForThisDriver` instead of resetting the HBA, dropping it,
+/// and reporting it bound. Any other error would end the attempts
+/// for the device (bus spec §9.3); `Ok` would bind a device this
+/// driver cannot serve.
+fn smoke_mpt3sas_probe_declines_sas3008() -> TestResult {
+    use crate::mpt3sas;
+    use narf_bus::{BusDeviceCap, ProbeError};
+    use narf_capabilities::Cap;
+    let cap = Cap::<BusDeviceCap, narf_capabilities::Write>::bootstrap();
+    match mpt3sas::probe(mpt3sas_synth_sas3008(), cap) {
+        Err(ProbeError::NotForThisDriver) => TestResult::Pass,
+        Err(_) => TestResult::Fail("mpt3sas: SAS3008 declined with the wrong error"),
+        Ok(_) => TestResult::Fail("mpt3sas: probe must not claim the SAS3008 (#935)"),
+    }
+}
+kernel_test_in!(
+    "drivers/storage/mpt3sas",
+    smoke_mpt3sas_probe_declines_sas3008
+);
+
+/// Fallback claimant for the arbitration smoke: binds any
+/// storage-class device it is offered and records whether the
+/// SAS3008 reached it. Pure — no hardware access — so binding the
+/// QEMU storage devices it is also offered during the walk is
+/// harmless.
+static MPT3SAS_FALLBACK_BOUND_SAS3008: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn mpt3sas_fallback_probe(
+    device: narf_bus::BusDevice,
+    _cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    use crate::mpt3sas;
+    if device.id.vendor == mpt3sas::MPT3SAS_PCI_VENDOR
+        && device.id.device == mpt3sas::MPT3SAS_PCI_DEVICE_SAS3008
+    {
+        MPT3SAS_FALLBACK_BOUND_SAS3008.store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+/// Verify the declined SAS3008 is offered to the next claimant:
+/// with only the mpt3sas match (most specific, VendorDevice) and a
+/// storage-class fallback registered, `probe_all` must hand the
+/// synthetic SAS3008 to the fallback instead of counting it bound
+/// to mpt3sas.
+fn smoke_mpt3sas_probe_releases_match_to_next_claimant() -> TestResult {
+    use crate::mpt3sas;
+    use core::sync::atomic::Ordering;
+    use narf_bus::driver_match::{MatchKind, PciMatch, __reset_for_test};
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, registry};
+
+    // Hermetic match table + extended device registry; both are
+    // restored in cleanup (same pattern as the VMD domain fixture).
+    let saved = devices();
+    let mut extended = saved.clone();
+    extended.push(mpt3sas_synth_sas3008());
+    registry::install(extended);
+    __reset_for_test();
+    mpt3sas::register_pci_driver();
+    // The match must be present in the table: the decline is a
+    // refusal by a registered claimant, not an absent match.
+    let has_match = narf_bus::registered_pci_drivers().iter().any(|m| {
+        m.name == "mpt3sas"
+            && matches!(m.kind, MatchKind::VendorDevice { vendor, device }
+                if vendor == mpt3sas::MPT3SAS_PCI_VENDOR
+                    && device == mpt3sas::MPT3SAS_PCI_DEVICE_SAS3008)
+    });
+    if !has_match {
+        registry::install(saved);
+        __reset_for_test();
+        return TestResult::Fail("mpt3sas: VendorDevice match not registered");
+    }
+    narf_bus::register_pci_driver(PciMatch {
+        name: "mpt3sas-fallback",
+        kind: MatchKind::Class {
+            class: 0x01,
+            mask: 0xFF,
+        },
+        probe: mpt3sas_fallback_probe,
+    });
+    MPT3SAS_FALLBACK_BOUND_SAS3008.store(false, Ordering::SeqCst);
+    let authority = bootstrap_registry_authority();
+    let walked = probe_all_pci(&authority);
+    // Cleanup before asserting so later smokes see the restored
+    // registry and an empty match table.
+    registry::install(saved);
+    __reset_for_test();
+    if walked.is_err() {
+        return TestResult::Fail("mpt3sas: probe_all_pci lost the bootstrap authority");
+    }
+    if !MPT3SAS_FALLBACK_BOUND_SAS3008.load(Ordering::SeqCst) {
+        return TestResult::Fail("mpt3sas: declined SAS3008 never reached the next claimant");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/mpt3sas",
+    smoke_mpt3sas_probe_releases_match_to_next_claimant
+);
+
 /// Verify R7 (CMD8 response) decode: voltage nibble=1, pattern=0xAA.
 fn smoke_rtsx_r7_decode() -> TestResult {
     use crate::rtsx::card::decode_r7;
