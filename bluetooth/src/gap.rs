@@ -1264,6 +1264,13 @@ pub struct PeriodicSync {
     /// Sync handle from the Sync Established subevent, while Synced
     /// (or Terminating).
     pub sync_handle: Option<u16>,
+    /// ACL connection handle the sync arrived over, when the sync
+    /// was adopted from a Sync Transfer Received subevent
+    /// (§7.7.65.21); `None` for a locally created sync.
+    pub transfer_connection_handle: Option<u16>,
+    /// Service_Data carried by the transfer that established this
+    /// sync (peer-provided value); 0 unless adopted by transfer.
+    pub service_data: u16,
     pub advertising_sid: u8,
     pub advertiser_address_type: u8,
     pub advertiser_address: [u8; 6],
@@ -1325,6 +1332,42 @@ impl PeriodicSync {
         self.advertiser_phy = est.advertiser_phy;
         self.periodic_interval = est.periodic_advertising_interval;
         self.advertiser_clock_accuracy = est.advertiser_clock_accuracy;
+        // A locally created sync is not a transfer: clear any
+        // transfer provenance from an earlier adopted sync.
+        self.transfer_connection_handle = None;
+        self.service_data = 0;
+        self.fragment.clear();
+        self.phase = PeriodicSyncPhase::Synced;
+    }
+
+    /// Apply a Sync Transfer Received subevent (§7.7.65.21, issue
+    /// #1575). Unlike [`Self::note_sync_established`], a transfer
+    /// arrives with no pending Create Sync: only an Idle receiver
+    /// can adopt it. A transfer racing a pending Create Sync, or
+    /// one arriving while already Synced, is ignored — the local
+    /// attempt / existing sync wins and the transferred handle
+    /// must not hijack it. A failed transfer (status != 0)
+    /// establishes nothing; per the spec its Sync_Handle is
+    /// ignored and the receiver stays Idle.
+    pub fn note_sync_transfer_received(
+        &mut self,
+        xfer: &crate::event::LePeriodicAdvSyncTransferReceived,
+    ) {
+        if self.phase != PeriodicSyncPhase::Idle {
+            return;
+        }
+        if xfer.status != 0 {
+            return;
+        }
+        self.sync_handle = Some(xfer.sync_handle);
+        self.advertising_sid = xfer.advertising_sid;
+        self.advertiser_address_type = xfer.advertiser_address_type;
+        self.advertiser_address = xfer.advertiser_address;
+        self.advertiser_phy = xfer.advertiser_phy;
+        self.periodic_interval = xfer.periodic_advertising_interval;
+        self.advertiser_clock_accuracy = xfer.advertiser_clock_accuracy;
+        self.transfer_connection_handle = Some(xfer.connection_handle);
+        self.service_data = xfer.service_data;
         self.fragment.clear();
         self.phase = PeriodicSyncPhase::Synced;
     }
@@ -1402,6 +1445,7 @@ impl PeriodicSync {
     fn clear_sync(&mut self) {
         self.phase = PeriodicSyncPhase::Idle;
         self.sync_handle = None;
+        self.transfer_connection_handle = None;
         self.fragment.clear();
     }
 
@@ -1412,6 +1456,8 @@ impl PeriodicSync {
         PeriodicSyncSnapshot {
             phase: self.phase,
             sync_handle: self.sync_handle,
+            transfer_connection_handle: self.transfer_connection_handle,
+            service_data: self.service_data,
             advertising_sid: self.advertising_sid,
             advertiser_address_type: self.advertiser_address_type,
             advertiser_address: self.advertiser_address,
@@ -1430,6 +1476,8 @@ impl PeriodicSync {
 pub struct PeriodicSyncSnapshot {
     pub phase: PeriodicSyncPhase,
     pub sync_handle: Option<u16>,
+    pub transfer_connection_handle: Option<u16>,
+    pub service_data: u16,
     pub advertising_sid: u8,
     pub advertiser_address_type: u8,
     pub advertiser_address: [u8; 6],

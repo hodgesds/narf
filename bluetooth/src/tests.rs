@@ -7684,6 +7684,117 @@ fn smoke_event_periodic_adv_sync_lost_parse() -> TestResult {
 }
 kernel_test_in!("bluetooth/hci", smoke_event_periodic_adv_sync_lost_parse);
 
+fn smoke_event_periodic_adv_sync_transfer_received_parse() -> TestResult {
+    use crate::event::{LePeriodicAdvSyncTransferReceived, LeSubevent};
+    // §7.7.65.21 [v1]: status 0, connection handle 0x0001, service
+    // data 0xBEEF, sync handle 0x0007, SID 0x01, public advertiser
+    // C0:C1:C2:C3:C4:C5, PHY 1M, interval 0x0050 (100 ms), clock
+    // accuracy 0x00 (500 ppm). Bytes are laid out from the spec
+    // section, not from the implementation.
+    let payload: [u8; 19] = [
+        0x00, 0x01, 0x00, 0xEF, 0xBE, 0x07, 0x00, 0x01, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5,
+        0x01, 0x50, 0x00, 0x00,
+    ];
+    let ev = le_meta_event(
+        LeSubevent::PeriodicAdvertisingSyncTransferReceived as u8,
+        &payload,
+    );
+    let xfer = match LePeriodicAdvSyncTransferReceived::parse(&ev) {
+        Some(x) => x,
+        None => return TestResult::Fail("Sync Transfer Received parse returned None"),
+    };
+    if xfer.status != 0
+        || xfer.connection_handle != 0x0001
+        || xfer.service_data != 0xBEEF
+        || xfer.sync_handle != 0x0007
+    {
+        return TestResult::Fail("status / connection handle / service data / sync handle wrong");
+    }
+    if xfer.advertising_sid != 0x01 || xfer.advertiser_address_type != 0x00 {
+        return TestResult::Fail("SID / address type wrong");
+    }
+    if xfer.advertiser_address != [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5] {
+        return TestResult::Fail("advertiser address wrong");
+    }
+    if xfer.advertiser_phy != 0x01 || xfer.periodic_advertising_interval != 0x0050 {
+        return TestResult::Fail("PHY / interval wrong");
+    }
+    if xfer.advertiser_clock_accuracy != 0x00 {
+        return TestResult::Fail("clock accuracy wrong");
+    }
+    // A failed transfer still parses: the status is data for the
+    // state machine, only the layout is validated here.
+    let mut failed = payload;
+    failed[0] = 0x3E;
+    let ev = le_meta_event(
+        LeSubevent::PeriodicAdvertisingSyncTransferReceived as u8,
+        &failed,
+    );
+    match LePeriodicAdvSyncTransferReceived::parse(&ev) {
+        Some(x) if x.status == 0x3E => {}
+        _ => return TestResult::Fail("failed transfer did not parse with its status"),
+    }
+    // Truncated payload (18 of 19 bytes) is malformed.
+    let ev = le_meta_event(
+        LeSubevent::PeriodicAdvertisingSyncTransferReceived as u8,
+        &payload[..18],
+    );
+    if LePeriodicAdvSyncTransferReceived::parse(&ev).is_some() {
+        return TestResult::Fail("truncated Sync Transfer Received parsed");
+    }
+    // Wrong subevent code is not a Sync Transfer Received.
+    let ev = le_meta_event(
+        LeSubevent::PeriodicAdvertisingSyncEstablished as u8,
+        &payload,
+    );
+    if LePeriodicAdvSyncTransferReceived::parse(&ev).is_some() {
+        return TestResult::Fail("Sync Established subevent parsed as Sync Transfer Received");
+    }
+    // Non-LE-Meta event code is rejected.
+    let ev = crate::hci::Event {
+        code: crate::event::EventCode::CommandComplete as u8,
+        params: {
+            let mut p = vec![LeSubevent::PeriodicAdvertisingSyncTransferReceived as u8];
+            p.extend_from_slice(&payload);
+            p
+        },
+    };
+    if LePeriodicAdvSyncTransferReceived::parse(&ev).is_some() {
+        return TestResult::Fail("non-LE-Meta parsed as Sync Transfer Received");
+    }
+    // Each reserved / out-of-range field value is malformed:
+    // (offset, value, what it is).
+    let bad_fields: [(usize, u8, &str); 7] = [
+        (7, 0x10, "reserved SID"),
+        (8, 0x04, "reserved address type"),
+        (15, 0x04, "reserved PHY"),
+        (18, 0x08, "reserved clock accuracy"),
+        (1, 0x00, "connection handle above 0x0EFF"),
+        (5, 0x00, "sync handle above 0x0EFF"),
+        (16, 0x05, "interval below 0x0006"),
+    ];
+    for (off, val, what) in bad_fields {
+        let mut bad = payload;
+        bad[off] = val;
+        // The handle cases need the high byte set, not the low.
+        if off == 1 || off == 5 {
+            bad[off + 1] = 0x0F;
+        }
+        let ev = le_meta_event(
+            LeSubevent::PeriodicAdvertisingSyncTransferReceived as u8,
+            &bad,
+        );
+        if LePeriodicAdvSyncTransferReceived::parse(&ev).is_some() {
+            return TestResult::Fail(what);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/hci",
+    smoke_event_periodic_adv_sync_transfer_received_parse
+);
+
 // ── LE Periodic Advertising — sync state machine (#1560) ────────────
 
 fn smoke_gap_periodic_sync_state_machine() -> TestResult {
@@ -7833,6 +7944,148 @@ fn smoke_gap_periodic_sync_state_machine() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/gap", smoke_gap_periodic_sync_state_machine);
+
+fn smoke_gap_periodic_sync_transfer_received() -> TestResult {
+    use crate::event::{
+        LePeriodicAdvReport, LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost,
+        LePeriodicAdvSyncTransferReceived, LeSubevent, LE_PA_DATA_COMPLETE,
+    };
+    use crate::gap::{PeriodicSync, PeriodicSyncPhase};
+
+    fn transfer(
+        status: u8,
+        connection_handle: u16,
+        service_data: u16,
+        sync_handle: u16,
+    ) -> LePeriodicAdvSyncTransferReceived {
+        // §7.7.65.21 [v1] layout, built from the spec section.
+        let payload: [u8; 19] = [
+            status,
+            (connection_handle & 0xFF) as u8,
+            (connection_handle >> 8) as u8,
+            (service_data & 0xFF) as u8,
+            (service_data >> 8) as u8,
+            (sync_handle & 0xFF) as u8,
+            (sync_handle >> 8) as u8,
+            0x01,
+            0x00,
+            0xC0,
+            0xC1,
+            0xC2,
+            0xC3,
+            0xC4,
+            0xC5,
+            0x01,
+            0x50,
+            0x00,
+            0x00,
+        ];
+        let ev = le_meta_event(
+            LeSubevent::PeriodicAdvertisingSyncTransferReceived as u8,
+            &payload,
+        );
+        LePeriodicAdvSyncTransferReceived::parse(&ev).expect("fixture transfer")
+    }
+
+    fn established(status: u8, handle: u16) -> LePeriodicAdvSyncEstablished {
+        let payload: [u8; 15] = [
+            status,
+            (handle & 0xFF) as u8,
+            (handle >> 8) as u8,
+            0x01,
+            0x00,
+            0xC0,
+            0xC1,
+            0xC2,
+            0xC3,
+            0xC4,
+            0xC5,
+            0x01,
+            0x50,
+            0x00,
+            0x00,
+        ];
+        let ev = le_meta_event(
+            LeSubevent::PeriodicAdvertisingSyncEstablished as u8,
+            &payload,
+        );
+        LePeriodicAdvSyncEstablished::parse(&ev).expect("fixture established")
+    }
+
+    fn report(handle: u16, data: &[u8]) -> LePeriodicAdvReport {
+        let mut payload = vec![
+            (handle & 0xFF) as u8,
+            (handle >> 8) as u8,
+            0x04,
+            0xC4,
+            0xFF,
+            LE_PA_DATA_COMPLETE,
+            data.len() as u8,
+        ];
+        payload.extend_from_slice(data);
+        let ev = le_meta_event(LeSubevent::PeriodicAdvertisingReport as u8, &payload);
+        LePeriodicAdvReport::parse(&ev).expect("fixture report")
+    }
+
+    fn lost(handle: u16) -> LePeriodicAdvSyncLost {
+        let payload: [u8; 2] = [(handle & 0xFF) as u8, (handle >> 8) as u8];
+        let ev = le_meta_event(LeSubevent::PeriodicAdvertisingSyncLost as u8, &payload);
+        LePeriodicAdvSyncLost::parse(&ev).expect("fixture lost")
+    }
+
+    let mut sync = PeriodicSync::new();
+    // Failed transfer establishes nothing.
+    sync.note_sync_transfer_received(&transfer(0x3E, 0x0001, 0xBEEF, 0x0007));
+    if sync.phase != PeriodicSyncPhase::Idle || sync.sync_handle.is_some() {
+        return TestResult::Fail("failed transfer adopted a sync");
+    }
+    // Good transfer adopts with no pending Create Sync, and
+    // records the transfer provenance.
+    sync.note_sync_transfer_received(&transfer(0x00, 0x0001, 0xBEEF, 0x0007));
+    if sync.phase != PeriodicSyncPhase::Synced || sync.sync_handle != Some(0x0007) {
+        return TestResult::Fail("transfer did not reach Synced");
+    }
+    if sync.transfer_connection_handle != Some(0x0001) || sync.service_data != 0xBEEF {
+        return TestResult::Fail("transfer provenance wrong");
+    }
+    if sync.advertising_sid != 0x01 || sync.periodic_interval != 0x0050 {
+        return TestResult::Fail("transfer train fields wrong");
+    }
+    // Reports deliver on the transferred handle.
+    sync.note_report(&report(0x0007, &[0x02, 0x01, 0x06]));
+    if sync.reports_received != 1 || sync.last_report != [0x02, 0x01, 0x06] {
+        return TestResult::Fail("report on transferred sync not delivered");
+    }
+    // A second transfer while Synced is ignored, not a hijack.
+    sync.note_sync_transfer_received(&transfer(0x00, 0x0002, 0x1234, 0x0009));
+    if sync.sync_handle != Some(0x0007) || sync.transfer_connection_handle != Some(0x0001) {
+        return TestResult::Fail("transfer while Synced hijacked the sync");
+    }
+    // Sync Lost ends the transferred sync and clears provenance.
+    sync.note_sync_lost(&lost(0x0007));
+    if sync.phase != PeriodicSyncPhase::Idle
+        || sync.sync_handle.is_some()
+        || sync.transfer_connection_handle.is_some()
+    {
+        return TestResult::Fail("Sync Lost did not end the transferred sync");
+    }
+    // A transfer racing a pending Create Sync is ignored; the
+    // local attempt then lands with no transfer provenance.
+    sync.note_create_sync_sent();
+    sync.note_sync_transfer_received(&transfer(0x00, 0x0001, 0xBEEF, 0x0009));
+    if sync.phase != PeriodicSyncPhase::Creating {
+        return TestResult::Fail("transfer racing Create Sync moved phase out of Creating");
+    }
+    sync.note_sync_established(&established(0x00, 0x0007));
+    if sync.phase != PeriodicSyncPhase::Synced
+        || sync.sync_handle != Some(0x0007)
+        || sync.transfer_connection_handle.is_some()
+    {
+        return TestResult::Fail("local Create Sync did not land cleanly after racing transfer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_periodic_sync_transfer_received);
 
 fn smoke_gap_periodic_advertiser_state_machine() -> TestResult {
     use crate::gap::{PeriodicAdvertiser, PeriodicAdvertiserPhase};
