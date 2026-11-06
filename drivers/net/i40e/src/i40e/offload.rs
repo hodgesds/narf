@@ -347,7 +347,14 @@ fn sum_words(bytes: &[u8]) -> u32 {
 }
 
 impl TxPlan {
-    pub fn parse(packet: &[u8], meta: narf_net::TxMeta) -> Result<Self, super::I40eError> {
+    /// `mtu` is the programmed MTU: a TSO plan is valid only when
+    /// every emitted segment fits it (issue #802). At the 1500
+    /// default this is the old `> 1500` bound, unchanged.
+    pub fn parse(
+        packet: &[u8],
+        meta: narf_net::TxMeta,
+        mtu: u32,
+    ) -> Result<Self, super::I40eError> {
         use narf_net::L4CsumKind;
         let bad = super::I40eError::InvalidOffload;
         if meta.vlan_tag.is_some() {
@@ -378,7 +385,11 @@ impl TxPlan {
             ether = be16(packet, ip + 2);
             ip += 4;
         }
-        if meta.tso_mss.is_none() && packet.len() > ip + 1500 {
+        // A non-TSO frame's payload (everything after the Ethernet
+        // header + inline VLAN tags) must fit the programmed MTU
+        // (issue #802): `ip` is 14 + 4 per tag, so an untagged
+        // frame is capped at MTU + 14, a tagged one at MTU + 18.
+        if meta.tso_mss.is_none() && packet.len() > ip + mtu as usize {
             return Err(super::I40eError::FrameTooLong);
         }
         if meta.csum_l4.is_none() && meta.tso_mss.is_none() {
@@ -444,9 +455,15 @@ impl TxPlan {
             _ => return Err(bad),
         };
         if let Some(mss) = meta.tso_mss {
-            // i40e's minimum MSS is 64. Every emitted IP packet fits the MTU.
+            // i40e's minimum MSS is 64. Every emitted IP packet
+            // fits the programmed MTU (issue #802): the IP packet
+            // is `ip_len + header_len + mss`, and the MTU is the
+            // payload budget, so the bound is `> mtu`, not
+            // `> mtu + 18` — the 18 wire bytes (Eth header + FCS)
+            // sit outside the IP packet, so an IP packet of exactly
+            // MTU yields a wire frame of exactly MTU + 18.
             if mss < 64
-                || ip_len + header_len + mss as usize > 1500
+                || ip_len + header_len + mss as usize > mtu as usize
                 || l4_len <= header_len
                 || packet[transport + 13] & (0x02 | 0x04 | 0x20) != 0
             {

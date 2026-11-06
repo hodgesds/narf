@@ -35,9 +35,7 @@
 
 use super::queues::{rx_queue_regs, tx_queue_regs, QueueConfig, RegBank};
 use super::wol::WolConfig;
-use super::{
-    FCTRL_BAM, FCTRL_MPE, FCTRL_UPE, REG_FCTRL, SRRCTL_BSIZE_2K, SRRCTL_DESCTYPE_ADV_ONEBUF,
-};
+use super::{FCTRL_BAM, FCTRL_MPE, FCTRL_UPE, REG_FCTRL, SRRCTL_DESCTYPE_ADV_ONEBUF};
 
 /// RXCTRL register + RXEN bit (datasheet §8.2.3.8.10).
 pub const REG_RXCTRL: u64 = 0x03000;
@@ -90,15 +88,16 @@ pub fn suspend_plan(bank: &mut impl RegBank, wol: Option<WolConfig>) {
 /// The caller (`Ixgbe::resume`) zeroes the TX ring memory and
 /// re-arms the RX descriptors from the retained slot buffers
 /// before calling this; this plan only programs registers.
-///
-/// Fail-closed: configuration validation and base-count checks
-/// run before any register write. On `Err` the bank is untouched
-/// and the device must stay quiesced.
+/// `srrctl_bsize` is the SRRCTL.BSIZEPKT value (1 KiB units) for
+/// the programmed MTU (issue #802) — 2 at the 1500 default, 10 at
+/// 9710. The caller owns MAXFRS: `Ixgbe::resume` reprograms it
+/// from the stored MTU after this plan runs.
 pub fn resume_rebuild_plan(
     bank: &mut impl RegBank,
     cfg: &QueueConfig,
     tx_bases: &[u64],
     rx_bases: &[u64],
+    srrctl_bsize: u32,
 ) -> Result<(), &'static str> {
     cfg.validate().map_err(|_| "invalid queue config")?;
     if tx_bases.len() != cfg.num_tx {
@@ -129,7 +128,7 @@ pub fn resume_rebuild_plan(
         bank.write32(rx.rdlen, (cfg.ring_len * 16) as u32);
         bank.write32(rx.rdh, 0);
         bank.write32(rx.rdt, (cfg.ring_len - 1) as u32);
-        bank.write32(rx.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_ADV_ONEBUF);
+        bank.write32(rx.srrctl, srrctl_bsize | SRRCTL_DESCTYPE_ADV_ONEBUF);
         bank.set_bits(rx.rxdctl, XDCTL_ENABLE_PM);
     }
     // 3. Restore the bring-up receive filter + master enable,

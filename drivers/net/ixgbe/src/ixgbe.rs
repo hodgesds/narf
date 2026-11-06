@@ -27,6 +27,7 @@ pub mod ethtool;
 pub mod fcoe;
 pub mod fdir;
 pub mod hic;
+pub mod mtu;
 pub mod pm;
 pub mod queues;
 pub mod regs;
@@ -189,10 +190,6 @@ pub const ADVTXD_DCMD_VLE: u32 = 1 << 30;
 /// (Linux ixgbe_type.h: IXGBE_ADVTXD_VLAN_SHIFT 16).
 pub const ADVTXD_VLAN_SHIFT: u32 = 16;
 
-/// Non-TSO frame cap (existing behavior: MTU-sized frames only;
-/// jumbo is a separate issue).
-pub const TX_LEN_MAX: usize = 1518;
-
 /// TX watchdog timeout (Linux `dev->watchdog_timeo` is 5 s by
 /// default, and igc's supervisor uses the same 5 s): a TX
 /// descriptor posted longer ago than this with DD still clear is
@@ -200,9 +197,10 @@ pub const TX_LEN_MAX: usize = 1518;
 const TX_TIMEOUT_NS: u64 = 5_000_000_000;
 /// Watchdog supervisor cadence, matching igc's 10 ms maintenance tick.
 const TX_WATCHDOG_POLL_NS: u64 = 10_000_000;
-/// TSO frame cap for `tx()`: the per-slot copy buffer is 4096
-/// bytes (see bring_up), so a copied TSO superframe cannot run
-/// longer. Advertised as `max_tso_bytes` (see probe).
+/// TSO frame cap for `tx()`: the advertised bound (see probe's
+/// `max_tso_bytes`). The per-slot copy buffer is 10240 bytes (see
+/// bring_up), so the 4096 cap is conservative, not slot-bound;
+/// raising it is a separate change from the MTU lane (issue #802).
 pub const TX_TSO_MAX_TX: usize = 4096;
 /// TSO frame cap for `tx_frame()`: zero-copy, so the bound is the
 /// per-descriptor data length (Linux ixgbe.h:
@@ -233,8 +231,10 @@ pub struct AdvTxCtxtDesc {
 
 // Ring lengths come from `QueueConfig::ring_len` (32 for the
 // single-queue config, matching the old Stage-3/4 constants).
-// RX_BUF_LEN is a buffer size, not a ring length, and stays fixed.
-pub(crate) const RX_BUF_LEN: usize = 2048;
+// RX_BUF_LEN is a buffer size, not a ring length: fixed at the
+// family's max-frame size (issue #802), 10240 covers the 9732-byte
+// max RX frame, so an MTU change never reallocates.
+pub(crate) const RX_BUF_LEN: usize = mtu::RX_BUF_BYTES;
 
 // ── Descriptor types ───────────────────────────────────────────────
 
@@ -591,6 +591,10 @@ pub struct Ixgbe {
     pub link_up: IrqSafeSpinLock<bool>,
     /// Recorded device id (drives `name()`).
     pub did: u16,
+    /// Programmed MTU (payload bytes), issue #802. Probe default
+    /// 1500; changed only by [`Ixgbe::set_mtu`], which reprograms
+    /// MAXFRS + per-queue SRRCTL before storing it.
+    pub mtu: IrqSafeSpinLock<u32>,
     /// LAN id: the PCI function number (Linux
     /// `ixgbe_set_lan_id_multi_port_pcie` sets
     /// `bus->lan_id = bus->func` for these parts). The
@@ -698,16 +702,27 @@ fn program_tx_queue(bank: &mut impl RegBank, q: usize, phys: u64, ring_len: usiz
 }
 
 /// Program one RX queue's descriptor ring (base, length, head/tail,
-/// SRRCTL 2K advanced one-buffer descriptors, queue-enable) on any [`RegBank`].
+/// SRRCTL advanced one-buffer descriptors, queue-enable) on any [`RegBank`].
 /// Same sharing note as [`program_tx_queue`].
-fn program_rx_queue(bank: &mut impl RegBank, q: usize, phys: u64, ring_len: usize) {
+/// Program one RX queue's ring registers + SRRCTL. `srrctl_bsize`
+/// is the SRRCTL.BSIZEPKT value (1 KiB units) for the programmed
+/// MTU — 2 at the 1500 default, 10 at 9710 (issue #802). The value
+/// goes in unshifted (bits[6:0]); the full-word write matches the
+/// pre-existing shape (bring-up and resume both write SRRCTL whole).
+fn program_rx_queue(
+    bank: &mut impl RegBank,
+    q: usize,
+    phys: u64,
+    ring_len: usize,
+    srrctl_bsize: u32,
+) {
     let rxq = queues::rx_queue_regs(q).expect("validated queue count is in range");
     bank.write32(rxq.rdbal, phys as u32);
     bank.write32(rxq.rdbah, (phys >> 32) as u32);
     bank.write32(rxq.rdlen, (ring_len * 16) as u32);
     bank.write32(rxq.rdh, 0);
     bank.write32(rxq.rdt, ring_len.saturating_sub(1) as u32);
-    bank.write32(rxq.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_ADV_ONEBUF);
+    bank.write32(rxq.srrctl, srrctl_bsize | SRRCTL_DESCTYPE_ADV_ONEBUF);
     bank.set_bits(rxq.rxdctl, RXDCTL_ENABLE);
 }
 
@@ -861,7 +876,8 @@ impl Ixgbe {
             let mut tx_pool: Vec<DmaBuffer> = Vec::with_capacity(ring_len);
             for _ in 0..ring_len {
                 tx_pool.push(
-                    alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?,
+                    alloc_coherent(mtu::TX_BUF_BYTES, DomainId::DRIVER_0)
+                        .map_err(|_| IxgbeError::NoMemory)?,
                 );
             }
             // SAFETY: identity-mapped DMA.
@@ -893,7 +909,10 @@ impl Ixgbe {
         }
 
         // 7. RX rings + pools, one per RX queue (queue 0's sequence
-        //    verbatim, as for TX).
+        //    verbatim, as for TX). The MTU program for the 1500
+        //    default: SRRCTL 2 KiB per queue, MAXFRS 1518 (written
+        //    after the FCTRL/RXCTRL enable below).
+        let mtu_program = mtu::mtu_transition(mtu::STD_MTU).expect("1500 is in range");
         let mut rx_queues: Vec<RxQueueState> = Vec::with_capacity(queue_config.num_rx);
         for q in 0..queue_config.num_rx {
             let rx_ring =
@@ -901,8 +920,8 @@ impl Ixgbe {
             let rx_ring_phys = rx_ring.dma_addr().raw();
             let mut rx_pool = Vec::with_capacity(ring_len);
             for i in 0..ring_len {
-                let buf =
-                    alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
+                let buf = alloc_coherent(mtu::RX_BUF_BYTES, DomainId::DRIVER_0)
+                    .map_err(|_| IxgbeError::NoMemory)?;
                 let bp = buf.dma_addr().raw();
                 let desc = AdvRxDescRead::new(bp);
                 // SAFETY: identity-mapped DMA ring page.
@@ -917,7 +936,13 @@ impl Ixgbe {
             }
             {
                 let mut bank = queues::MmioBank::new(&mmio);
-                program_rx_queue(&mut bank, q, rx_ring_phys, ring_len);
+                program_rx_queue(
+                    &mut bank,
+                    q,
+                    rx_ring_phys,
+                    ring_len,
+                    mtu_program.srrctl_bsize,
+                );
             }
             rx_queues.push(RxQueueState {
                 rx_ring,
@@ -931,6 +956,12 @@ impl Ixgbe {
         unsafe {
             mmio.write32(REG_FCTRL, FCTRL_BAM | FCTRL_UPE | FCTRL_MPE);
             mmio.write32(REG_RXCTRL, RXCTRL_RXEN);
+            // MAXFRS — the device's RX length limit (issue #802):
+            // 1518 at the 1500 default, 9728 at 9710. The PF never
+            // programmed it before (the reset default accepted
+            // standard frames); programming it explicitly makes the
+            // acceptance limit follow the MTU.
+            mmio.write32(vmdq::REG_MAXFRS, mtu_program.maxfrs);
         }
 
         // 8. Read LINKS to seed link_up.
@@ -968,6 +999,7 @@ impl Ixgbe {
             mac,
             link_up: IrqSafeSpinLock::new(link_up),
             did: device.id.device,
+            mtu: IrqSafeSpinLock::new(mtu::STD_MTU),
             lan_id,
             queue_config,
             rss_cfg: IrqSafeSpinLock::new(None),
@@ -1006,9 +1038,10 @@ impl Ixgbe {
 
     /// Transmit a single frame on queue 0, polling the descriptor's
     /// DD bit. Honors `TxMeta`: TSO (IPv4/TCP, up to `TX_TSO_MAX_TX` bytes
-    /// — the per-slot copy-buffer size) and VLAN insertion (tag
+    /// — the advertised bound) and VLAN insertion (tag
     /// from the context descriptor + VLE on the data descriptor).
-    /// Non-TSO frames keep the 1518 cap. See [`Self::tx_on_queue`].
+    /// Non-TSO frames keep the programmed MTU's wire-size cap
+    /// (issue #802). See [`Self::tx_on_queue`].
     pub fn tx(&self, frame: &[u8], meta: &TxMeta) -> Result<(), IxgbeError> {
         self.tx_on_queue(0, frame, meta)
     }
@@ -1031,12 +1064,13 @@ impl Ixgbe {
         if frame.is_empty() {
             return Err(IxgbeError::FrameTooLong);
         }
-        // Bounds: non-TSO keeps the 1518 cap; TSO runs to the
-        // per-slot copy-buffer size. Larger TSO needs scatter.
+        // Bounds: non-TSO keeps the programmed MTU's wire-size cap
+        // (issue #802); TSO runs to the advertised bound. Larger
+        // TSO needs scatter.
         let limit = if meta.tso_mss.is_some() {
             TX_TSO_MAX_TX
         } else {
-            TX_LEN_MAX
+            mtu::frame_size(*self.mtu.lock()) as usize
         };
         if frame.len() > limit {
             return Err(IxgbeError::FrameTooLong);
@@ -1047,7 +1081,8 @@ impl Ixgbe {
         let slot = (*tail_g) as usize % ring_len;
         let phys = queue.tx_pool[slot].dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer; bounds-checked above
-        // (len <= 4096 = slot size for TSO, <= 1518 otherwise).
+        // (len <= 4096 = advertised TSO bound for TSO, <= MTU frame
+        // otherwise).
         unsafe {
             for (i, b) in frame.iter().enumerate() {
                 core::ptr::write_volatile(queue.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
@@ -1170,7 +1205,7 @@ impl Ixgbe {
         let limit = if meta.tso_mss.is_some() {
             TX_TSO_MAX_TX_FRAME
         } else {
-            TX_LEN_MAX
+            mtu::frame_size(*self.mtu.lock()) as usize
         };
         if len > limit {
             return Err(IxgbeError::FrameTooLong);
@@ -1376,7 +1411,7 @@ impl Ixgbe {
         // Refill before handing the filled buffer up, so the device never sees
         // an empty slot. On allocation failure, bail without advancing — the
         // frame stays in the ring for the next poll.
-        let replacement = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
+        let replacement = alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).ok()?;
         let repl_phys = replacement.dma_addr().raw();
         let filled = {
             let mut slots = queue.rx_slots.lock();
@@ -2069,8 +2104,13 @@ impl Ixgbe {
                 .map(|q| q.rx_ring.dma_addr().raw())
                 .collect();
             let mut bank = queues::MmioBank::new(&self.mmio);
-            pm::resume_rebuild_plan(&mut bank, cfg, &tx_bases, &rx_bases)
+            // Rebuild SRRCTL from the stored MTU (issue #802), then
+            // restore MAXFRS — the rebuild plan does not own it.
+            let program =
+                mtu::mtu_transition(*self.mtu.lock()).expect("stored MTU is always in range");
+            pm::resume_rebuild_plan(&mut bank, cfg, &tx_bases, &rx_bases, program.srrctl_bsize)
                 .map_err(IxgbeError::Other)?;
+            bank.write32(vmdq::REG_MAXFRS, program.maxfrs);
         }
         // 3b. Rebuild the Flow Director tables from the recorded
         // state (suspend / reset clears programmed filters). A
@@ -2423,7 +2463,7 @@ impl Ixgbe {
             driver: ethtool::ETHTOOL_DRIVER,
             version: ethtool::ETHTOOL_VERSION,
             mac: self.mac,
-            mtu: 1500,
+            mtu: *self.mtu.lock(),
             link_up: *self.link_up.lock(),
             num_tx_queues: self.queue_config.num_tx as u16,
             num_rx_queues: self.queue_config.num_rx as u16,
@@ -2478,6 +2518,39 @@ impl Ixgbe {
         Ok(())
     }
 
+    /// Program a validated MTU (issue #802): MAXFRS (the
+    /// device-wide RX length limit) first, then per-queue SRRCTL
+    /// (same full-word write bring-up/resume use). No queue
+    /// disable is needed: the pools are fixed at the max-frame
+    /// size, so a descriptor fetched with the old BSIZEPKT can
+    /// only under-fill its slot, never overrun it.
+    fn program_mtu(&self, program: mtu::MtuProgram) {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        bank.write32(vmdq::REG_MAXFRS, program.maxfrs);
+        for q in 0..self.queue_config.num_rx {
+            let rxq = queues::rx_queue_regs(q).expect("validated queue count is in range");
+            bank.write32(
+                rxq.srrctl,
+                program.srrctl_bsize | SRRCTL_DESCTYPE_ADV_ONEBUF,
+            );
+        }
+    }
+
+    /// Change the MTU (issue #802). Validates via the pure policy
+    /// module first (EINVAL 22 outside 68..=9710), no-ops when the
+    /// MTU is unchanged, otherwise programs the hardware and then
+    /// stores the new MTU. The RX/TX pools are fixed at the
+    /// max-frame size, so no reallocation is needed.
+    pub fn set_mtu(&self, mtu: u32) -> Result<(), i32> {
+        let program = mtu::mtu_transition(mtu).map_err(|e| e.0)?;
+        if program.mtu == *self.mtu.lock() {
+            return Ok(());
+        }
+        self.program_mtu(program);
+        *self.mtu.lock() = program.mtu;
+        Ok(())
+    }
+
     /// The stack-visible RSS config, if programmed.
     pub fn rss_config(&self) -> Option<narf_net::rss::RssConfig> {
         self.rss_cfg.lock().as_ref().map(|c| c.as_net_config())
@@ -2510,6 +2583,22 @@ impl narf_power::device_pm::DevicePmOps for Ixgbe {
     }
 }
 
+// ── MTU control hook ────────────────────────────────────────────────
+
+/// `DeviceControl` adapter for the stack's MTU switch (issue #802):
+/// the hook only acts on MTU — MAC, promiscuous and multicast pass
+/// through untouched. Installed by `probe` after `iface::register`.
+#[derive(Debug)]
+pub struct IxgbeMtuControl {
+    controller: Arc<Ixgbe>,
+}
+
+impl narf_net::iface::DeviceControl for IxgbeMtuControl {
+    fn configure(&self, config: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+        self.controller.set_mtu(config.mtu)
+    }
+}
+
 // ── HwNic impl (Stage 6) ───────────────────────────────────────────
 
 impl narf_net::Interface for Ixgbe {
@@ -2527,7 +2616,7 @@ impl narf_net::Interface for Ixgbe {
         self.mac
     }
     fn mtu(&self) -> u32 {
-        1500
+        *self.mtu.lock()
     }
     fn link_up(&self) -> bool {
         *self.link_up.lock()
@@ -2571,7 +2660,7 @@ impl crate::HwNic for Ixgbe {
         self.mac
     }
     fn mtu(&self) -> u32 {
-        1500
+        *self.mtu.lock()
     }
     fn link_up(&self) -> bool {
         *self.link_up.lock()
@@ -2644,6 +2733,11 @@ impl narf_net::Interface for IxgbeNic {
         <Ixgbe as narf_net::Interface>::mac(&self.nic)
     }
     fn mtu(&self) -> u32 {
+        // Delegates to `<Ixgbe as Interface>::mtu`, which the #802
+        // change makes read the programmed `mtu` lock — the branch's
+        // old singleton `with_controller` lookup is gone on main
+        // (#1633, indexed now) and this Nic already holds its own
+        // `Arc<Ixgbe>`, so per-port MTU comes from `self.nic`.
         <Ixgbe as narf_net::Interface>::mtu(&self.nic)
     }
     fn link_up(&self) -> bool {
@@ -2939,6 +3033,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
     };
     narf_net::iface::set_driver_info(&name, "ixgbe", Some("0.1.0"), bus_info);
+    narf_net::iface::set_device_control(
+        &name,
+        Arc::new(IxgbeMtuControl {
+            controller: dev.clone(),
+        }),
+    );
     narf_net::iface::set_offloads(
         &name,
         narf_net::OffloadCapabilities {
