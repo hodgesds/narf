@@ -532,9 +532,20 @@ pub const fn clock_divisor(base_hz: u32, target_hz: u32, spec_300: bool) -> u32 
     }
     let div = base_hz.div_ceil(target_hz);
     if spec_300 {
-        div.next_multiple_of(2).min(MAX_DIV_SPEC_300)
+        // `.min()` is not const on the pinned toolchain, so clamp by hand.
+        let d = div.next_multiple_of(2);
+        if d < MAX_DIV_SPEC_300 {
+            d
+        } else {
+            MAX_DIV_SPEC_300
+        }
     } else {
-        div.next_power_of_two().min(MAX_DIV_SPEC_200)
+        let d = div.next_power_of_two();
+        if d < MAX_DIV_SPEC_200 {
+            d
+        } else {
+            MAX_DIV_SPEC_200
+        }
     }
 }
 
@@ -665,11 +676,13 @@ impl DmaEngine {
     /// address / COMMAND register writes, so the descriptor stores
     /// are visible to the device.
     pub fn build_table(&mut self, len: usize) -> Result<(), SdhciError> {
+        // Take the bounce address first: holding `self.table` mutably
+        // while calling `self.bounce_addr()` is an E0502 borrow error.
+        let addr = self.bounce_addr();
         let Some(table) = self.table.as_mut() else {
             return Err(SdhciError::BadLength);
         };
         let desc_size = self.mode.desc_size();
-        let addr = self.bounce_addr();
         let slice = table.as_mut_slice();
         write_adma_desc(slice, 0, desc_size, addr, len, ADMA_ATTR_TRAN_VALID)?;
         write_adma_desc(slice, 1, desc_size, 0, 0, ADMA_ATTR_NOP_END_VALID)?;
@@ -1754,7 +1767,7 @@ impl Sdhci {
     /// DMA interrupt (512 KiB boundary) the SDMA address is
     /// reprogrammed to the next boundary and the wait continues
     /// (Linux `sdhci_data_irq` boundary restart).
-    fn wait_transfer_complete(&self, sdma_next: Option<&mut u64>) -> Result<(), SdhciError> {
+    fn wait_transfer_complete(&self, mut sdma_next: Option<&mut u64>) -> Result<(), SdhciError> {
         let done = narf_scheduler::responsive_spin_until(
             || {
                 self.io.read16(REG_NORMAL_INT_STS)
@@ -1779,7 +1792,10 @@ impl Sdhci {
             }
             if nis & NIS_DMA_INTERRUPT != 0 {
                 self.io.write16(REG_NORMAL_INT_STS, NIS_DMA_INTERRUPT);
-                if let Some(next) = sdma_next {
+                // Reborrow each iteration: moving `sdma_next` out
+                // here would make the next loop iteration an E0382
+                // use of a moved value.
+                if let Some(next) = sdma_next.as_deref_mut() {
                     *next = (*next & !(SDMA_BOUNDARY_SIZE - 1)) + SDMA_BOUNDARY_SIZE;
                     self.io.write32(REG_SDMA_ADDR, *next as u32);
                 }
@@ -1962,7 +1978,7 @@ impl Sdhci {
         &self,
         lba: u32,
         blocks: usize,
-        io: ChunkIo<'_>,
+        io: &mut ChunkIo<'_>,
         ccs: bool,
     ) -> Result<(), SdhciError> {
         let arg = if ccs { lba } else { lba.saturating_mul(512) };
@@ -2010,7 +2026,7 @@ impl Sdhci {
             Ok(()) => {
                 self.dma_complete_chunk(
                     len,
-                    match io {
+                    match &mut *io {
                         ChunkIo::Read(out) => Some(out),
                         ChunkIo::Write(_) => None,
                     },
@@ -2033,11 +2049,14 @@ impl Sdhci {
         &self,
         lba: u32,
         blocks: usize,
-        io: ChunkIo<'_>,
+        mut io: ChunkIo<'_>,
         ccs: bool,
     ) -> Result<(), SdhciError> {
         if self.dma.lock().is_some() {
-            match self.transfer_dma_chunk(lba, blocks, io, ccs) {
+            // Borrow `io` for the DMA attempt so the PIO fallback
+            // below can still take it by value (moving it into the
+            // DMA call was an E0382 use-after-move).
+            match self.transfer_dma_chunk(lba, blocks, &mut io, ccs) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     // DMA failed and latched PIO (or the command
