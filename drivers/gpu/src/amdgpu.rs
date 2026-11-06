@@ -2830,8 +2830,11 @@ fn clear_saved_display_audio(connector_idx: u8) {
 
 /// Test-only reset for the saved display-audio snapshot. The
 /// snapshot is kernel-global, so fixtures that share it reset it
-/// up front instead of depending on run order.
+/// up front instead of depending on run order. Only the
+/// x86_64-only `e2e_tests` fixtures call it, so it is gated to
+/// that arch.
 #[cfg(feature = "kernel-test")]
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn reset_saved_display_audio_for_test() {
     *SAVED_DISPLAY_AUDIO.lock() = None;
 }

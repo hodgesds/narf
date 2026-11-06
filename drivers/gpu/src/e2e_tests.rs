@@ -2172,6 +2172,8 @@ fn smoke_drm_laptop_display_audio_apply_executes_audio_after_video() -> TestResu
     }
     let mut regs = alloc::vec![0u32; 8];
     let mut gpu = renoir_gpu_for_display_audio(&mut regs);
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // `dp_plan` was built by `plan_modeset` against this `kms` for Renoir connector 1.
     if unsafe { gpu.apply_modeset_plan(&mut kms, &dp_plan, 1920, 0x8000_0000) }.is_err() {
         return TestResult::Fail("DP apply failed");
     }
@@ -2244,12 +2246,16 @@ fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
     }
     // Apply the DP plan (snapshots its audio), then re-run set_mode
     // for the same timing: audio replays after video (PM-resume shape).
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // `dp_plan` was built by `plan_modeset` against this `kms` for Renoir connector 1.
     if unsafe { gpu.apply_modeset_plan(&mut kms, &dp_plan, 1920, 0x8000_0000) }.is_err() {
         return TestResult::Fail("DP apply failed");
     }
     if regs[0] != last_audio.addr || regs[1] != last_audio.value {
         return TestResult::Fail("apply must end with the audio writes");
     }
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // 1920x1080 mode matches the applied plan's timing (the snapshot-replay path).
     if unsafe {
         gpu.set_mode(Mode {
             width: 1920,
@@ -2267,6 +2273,8 @@ fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
     // Stale timing: a different mode drops the snapshot instead of
     // programming a DTO built for another pixel clock — and the
     // drop sticks (a later same-timing modeset stays silent).
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // 1280x720 mode is a different timing from the applied plan (the stale-snapshot path).
     if unsafe {
         gpu.set_mode(Mode {
             width: 1280,
@@ -2281,6 +2289,8 @@ fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
     if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
         return TestResult::Fail("stale timing must drop saved audio");
     }
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // 1920x1080 mode re-runs the same timing after the snapshot was dropped.
     if unsafe {
         gpu.set_mode(Mode {
             width: 1920,
@@ -2337,6 +2347,8 @@ fn smoke_drm_laptop_display_audio_disable_before_teardown() -> TestResult {
         _ => return TestResult::Fail("DP teardown must have audio writes"),
     };
     let last_off = *off.last().unwrap();
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 1 is the live DP stream whose audio was applied from `dp_plan`.
     match unsafe { gpu.disable_display_audio(&kms, 1) } {
         Ok(true) => {}
         _ => return TestResult::Fail("disable must execute for a live DP stream"),
@@ -2351,6 +2363,8 @@ fn smoke_drm_laptop_display_audio_disable_before_teardown() -> TestResult {
     }
     // The caller's OTG clear follows the disable — the ordering
     // the fixture proves end to end.
+    // SAFETY: `gpu.regs` is the test-owned RAM register window; the write goes through the
+    // MM_INDEX/MM_DATA pair at its base, and the OTG address is latched, not dereferenced.
     unsafe {
         execute_modeset(
             &gpu.regs,
@@ -2364,6 +2378,8 @@ fn smoke_drm_laptop_display_audio_disable_before_teardown() -> TestResult {
         return TestResult::Fail("OTG clear must land after the disable writes");
     }
     // Snapshot cleared: a later set_mode stays video-only.
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // disable just cleared the snapshot, so this is the video-only `set_mode` path.
     if unsafe {
         gpu.set_mode(Mode {
             width: 1920,
@@ -2379,6 +2395,8 @@ fn smoke_drm_laptop_display_audio_disable_before_teardown() -> TestResult {
         return TestResult::Fail("disable must clear the saved audio");
     }
     // Control: the internal panel has no audio endpoint to disable.
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 0 is the internal panel with no audio endpoint (nothing to disable).
     match unsafe { gpu.disable_display_audio(&kms, 0) } {
         Ok(false) => {}
         _ => return TestResult::Fail("eDP disable must report nothing to do"),
@@ -2426,6 +2444,8 @@ fn smoke_drm_laptop_display_audio_hotplug_disconnect() -> TestResult {
         _ => return TestResult::Fail("DP teardown must have audio writes"),
     };
     let last_off = *off.last().unwrap();
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 1 is the live DP stream whose disable writes `plan_audio_disable` computed.
     match unsafe { gpu.apply_hotplug_disconnect(&mut kms, 1) } {
         Ok(HotplugAudioAction::DisableAudio { .. }) => {}
         _ => return TestResult::Fail("DP disconnect must apply the disable action"),
@@ -2442,6 +2462,8 @@ fn smoke_drm_laptop_display_audio_hotplug_disconnect() -> TestResult {
         return TestResult::Fail("disconnect must drop the CRTC binding");
     }
     // Snapshot cleared: a later set_mode stays video-only.
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // disconnect just cleared the snapshot, so this is the video-only `set_mode` path.
     if unsafe {
         gpu.set_mode(Mode {
             width: 1920,
@@ -2457,11 +2479,15 @@ fn smoke_drm_laptop_display_audio_hotplug_disconnect() -> TestResult {
         return TestResult::Fail("disconnect must clear the saved audio");
     }
     // Control: the internal panel disconnects with no audio action.
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 0 is the internal panel, so the disconnect applies no audio action.
     match unsafe { gpu.apply_hotplug_disconnect(&mut kms, 0) } {
         Ok(HotplugAudioAction::None) => {}
         _ => return TestResult::Fail("eDP disconnect must apply no audio action"),
     }
     // Control: unknown connector, no audio action.
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 99 is unknown, so the action degrades to `None` and no writes execute.
     match unsafe { gpu.apply_hotplug_disconnect(&mut kms, 99) } {
         Ok(HotplugAudioAction::None) => {}
         _ => return TestResult::Fail("unknown connector must apply no audio action"),
@@ -2519,6 +2545,8 @@ fn smoke_drm_laptop_display_audio_resume_rebuild() -> TestResult {
     kms.set_status(1, ConnectorStatus::Disconnected);
     regs[0] = 0;
     regs[1] = 0;
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 1 is now Disconnected, so the resume reports nothing and writes nothing.
     match unsafe { gpu.resume_display_audio(&kms) } {
         Ok(false) => {}
         _ => return TestResult::Fail("resume must report nothing after disconnect"),
@@ -2528,6 +2556,8 @@ fn smoke_drm_laptop_display_audio_resume_rebuild() -> TestResult {
     }
     // Control: undiscoverable DCN bases — nothing executes.
     gpu.ip_blocks.clear();
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // DCN bases are undiscoverable with `ip_blocks` cleared, so the resume writes nothing.
     match unsafe { gpu.resume_display_audio(&kms) } {
         Ok(false) => {}
         _ => return TestResult::Fail("resume without DCN discovery must report nothing"),
