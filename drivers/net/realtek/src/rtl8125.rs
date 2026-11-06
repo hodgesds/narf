@@ -1725,6 +1725,11 @@ fn rtl8125_link_sample(status: u8) -> crate::publish::LinkSample {
         } else {
             narf_net::iface::LinkDuplex::Half
         }),
+        // PHYStatus reports no media state (link/speed/duplex/
+        // flow-control only); no PHY-type code is read here
+        // (issue #791).
+        media_available: None,
+        phy_type: None,
     }
 }
 
