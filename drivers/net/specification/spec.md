@@ -49,7 +49,18 @@ frame-ring registration above is unchanged — stack-daemon and XDP consumers
 depend on it — and alongside it each family's probe registers with
 `narf_net::iface` through the shared helper in `narf_drivers_net_core::publish`
 (`publish_netdev`, or `publish_netdev_with_context` for multi-instance
-families such as i40e, whose send path resolves its PF by cookie). The iface
+families — i40e, and since issue #795 e1000, igb, ixgbe, r8169,
+forcedeth, and atheros, and since issue #1631 rtl8125, rtl8126,
+rtl8127, rtl8139, and tg3 — whose send path resolves its instance by
+cookie). Each multi-instance family retains its probed controllers in
+a `CONTROLLERS` vec (never shrunk, so cookies stay stable across
+detaches), exposes indexed `controller(index)` /
+`with_controller(index, f)` / `instance_count()` accessors, and
+refuses a second probe of the same live PCI address while binding a
+second function as a new instance. (mlx5, also #1631, keeps its
+controllers in the same `CONTROLLERS` vec but publishes no iface
+yet — its TX/RX datapath is still a stub — so it has no cookie send
+path.) The iface
 registration allocates a dynamic `eth%d` name from the central allocator;
 hardcoded frame-ring names (`eth3`, `eth4`, per-chip labels) survive only as
 pre-publication fallbacks. RX fan-out follows e1000's `dispatch_rx_frame`
