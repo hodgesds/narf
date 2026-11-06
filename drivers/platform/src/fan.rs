@@ -1695,7 +1695,12 @@ mod tests {
     /// (`firmware/fdt/src/tests.rs`); the blob is parsed by the
     /// real FDT walker, so the decode under test reads real wire
     /// bytes, not a hand-rolled node struct.
-    fn fdt_blob(nodes: &[(&str, &[(&str, &[u8])])]) -> Vec<u8> {
+    /// One FDT property in the test builder: name + raw payload.
+    type FdtProp<'a> = (&'a str, &'a [u8]);
+    /// One FDT node in the test builder: path + its properties.
+    type FdtNode<'a> = (&'a str, &'a [FdtProp<'a>]);
+
+    fn fdt_blob(nodes: &[FdtNode<'_>]) -> Vec<u8> {
         use narf_firmware_fdt as fdt;
         let mut strings: Vec<u8> = Vec::new();
         let intern = |strings: &mut Vec<u8>, name: &str| -> u32 {
