@@ -309,11 +309,11 @@ impl FixtureState {
     /// driver's live `narf_io` bounce buffer / ADMA table, owned
     /// by the controller under test.
     fn phys_slice(addr: u64, len: usize) -> Vec<u8> {
+        let ptr = narf_memory::PhysAddr::new(addr).kernel_mut_ptr::<u8>();
         // SAFETY: identity bus addresses of live narf_io buffers
         // owned by the controller under test; the model runs
         // synchronously inside its COMMAND write, as the device
         // would between doorbell and completion (sdio dma_tests).
-        let ptr = narf_memory::PhysAddr::new(addr).kernel_mut_ptr::<u8>();
         let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
         slice.to_vec()
     }
@@ -323,15 +323,16 @@ impl FixtureState {
     /// for a write. Missing image blocks read as zeros; written
     /// blocks are created.
     fn dma_move(&mut self, phys: u64, total: usize, read: bool, lba: u32) {
-        // SAFETY: same as `phys_slice`.
         let ptr = narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>();
         if read {
+            // SAFETY: same as `phys_slice`.
             let dst = unsafe { core::slice::from_raw_parts_mut(ptr, total) };
             for (i, b) in dst.iter_mut().enumerate() {
                 let blk = lba + (i / 512) as u32;
                 *b = self.image.get(&blk).map(|blk| blk[i % 512]).unwrap_or(0);
             }
         } else {
+            // SAFETY: same as `phys_slice`.
             let src = unsafe { core::slice::from_raw_parts(ptr, total) };
             for (i, b) in src.iter().enumerate() {
                 let blk = lba + (i / 512) as u32;
