@@ -23,7 +23,7 @@
 //! 128× too far into memory.
 //!
 //! **RX `dbuff` is in 128-byte units too**, via
-//! `I40E_RXQ_CTX_DBUFF_SHIFT`. A 2 KiB buffer is `dbuff = 16`.
+//! `I40E_RXQ_CTX_DBUFF_SHIFT`. A 9728-byte buffer is `dbuff = 76`.
 //!
 //! ## Head writeback
 //!
@@ -60,18 +60,26 @@ pub const DESC_BYTES: u64 = 16;
 /// Ring bytes, plus one descriptor's worth of slack for the TX
 /// head-writeback word.
 pub const RING_BYTES: u64 = RING_LEN as u64 * DESC_BYTES + DESC_BYTES;
-/// RX buffer size per descriptor.
-pub const RX_BUF_BYTES: usize = 2048;
+/// RX buffer size per descriptor. Fixed at the family's max frame
+/// (issue #802): 9728 covers the 9728-byte max RX frame, so an MTU
+/// change never reallocates — it only rewrites the RX context's
+/// `rxmax`.
+pub const RX_BUF_BYTES: usize = super::mtu::RX_BUF_BYTES;
 /// Normal MTU TX copy-buffer size. Frames larger than this use the bounded
-/// large/TSO cache below. Keeping the common case at one 2 KiB DMA mapping
-/// avoids wasting 64 KiB per outstanding packet.
-const TX_SMALL_BUF_BYTES: usize = 2048;
+/// large/TSO cache below. Fixed at the family's max frame (issue
+/// #802): 9728 covers the 9724-byte max TX frame, so a jumbo frame
+/// takes the 64-deep small cache instead of starving the 4-deep
+/// large cache.
+const TX_SMALL_BUF_BYTES: usize = super::mtu::TX_BUF_BYTES;
 /// Number of maximum-sized TSO packets that can be in flight on one 64-entry
 /// ring: a 64 KiB packet consumes sixteen data descriptors plus, at most, one
 /// context descriptor, so three fit before the mandatory one-slot gap. Four
 /// gives one spare without using unbounded memory.
 const TX_LARGE_POOL_LEN: usize = 4;
-/// Largest frame the RX queue accepts.
+/// Largest frame the RX queue accepts at the 1500 default (`rxmax`
+/// = MTU + 22). The live value is `QueuePair::rx_max_frame`,
+/// which `set_mtu` moves; this constant is the probe-time default
+/// (and the value the context-packing fixture pins).
 pub const RX_MAX_FRAME: u16 = 1522;
 /// `I40E_RXQ_CTX_DBUFF_SHIFT` — `dbuff` counts 128-byte units.
 pub const RXQ_CTX_DBUFF_SHIFT: u32 = 7;
@@ -338,6 +346,12 @@ pub struct QueuePair {
     tx_next: u16,
     rx_ring: DmaBuffer,
     rx_bufs: alloc::vec::Vec<DmaBuffer>,
+    /// Largest frame the RX queue accepts (`rxmax` in the queue
+    /// context), issue #802. Probe default `RX_MAX_FRAME` (1522);
+    /// `set_mtu` moves it via `reconfigure_rx_frame`, and
+    /// `configure` re-applies it — so a recovery rebuild preserves
+    /// the programmed MTU instead of shrinking back to 1500.
+    rx_max_frame: u16,
     /// Next RX descriptor to inspect.
     rx_next: u16,
     rx_discard: bool,
@@ -408,7 +422,8 @@ impl QueuePair {
         }
 
         // Allocate the queue-local copy caches before the queue is enabled.
-        // The normal path gets one 2 KiB buffer per TX descriptor; four 64 KiB
+        // The normal path gets one max-frame (9728-byte) buffer per TX
+        // descriptor (issue #802); four 64 KiB
         // buffers cover the maximum concurrent TSO packets that a 64-entry
         // ring can describe. `submit` only pops/pushes these vectors.
         let mut tx_small_free = alloc::vec::Vec::with_capacity(RING_LEN as usize);
@@ -437,6 +452,7 @@ impl QueuePair {
             tx_completed: 0,
             rx_ring,
             rx_bufs,
+            rx_max_frame: RX_MAX_FRAME,
             rx_next: 0,
             rx_discard: false,
         };
@@ -521,7 +537,7 @@ impl QueuePair {
             ring_phys: self.rx_ring_phys(),
             qlen: RING_LEN,
             buf_bytes: RX_BUF_BYTES as u16,
-            max_frame: RX_MAX_FRAME,
+            max_frame: self.rx_max_frame,
         });
         hmc.set_rx_context(queue_index, &rx_ctx)?;
 
@@ -537,6 +553,32 @@ impl QueuePair {
             csr.write32(reg_qrx_tail(self.pf_q), 0);
         }
         dma_barrier();
+        Ok(())
+    }
+
+    /// Rewrite only the RX queue context's `rxmax` (issue #802).
+    /// The caller disables the queue first (contexts may only be
+    /// rewritten while disabled) and re-enables after. `buf_bytes`
+    /// is unchanged — the pools are fixed at the max-frame size —
+    /// so only the acceptance limit moves. Stores the new limit in
+    /// `rx_max_frame` on success, so `configure` (bring-up and
+    /// recovery rebuild) and the RX drains keep following it. No
+    /// CSR access is needed: the context lives in the HMC backing
+    /// the device re-reads on enable.
+    pub fn reconfigure_rx_frame(
+        &mut self,
+        hmc: &LanHmc,
+        queue_index: u32,
+        max_frame: u16,
+    ) -> Result<(), I40eError> {
+        let rx_ctx = pack_rx_context(RxQueueContext {
+            ring_phys: self.rx_ring_phys(),
+            qlen: RING_LEN,
+            buf_bytes: RX_BUF_BYTES as u16,
+            max_frame,
+        });
+        hmc.set_rx_context(queue_index, &rx_ctx)?;
+        self.rx_max_frame = max_frame;
         Ok(())
     }
 
@@ -640,7 +682,10 @@ impl QueuePair {
 
     /// Publish a whole packet atomically, including a TSO context when needed.
     /// Success transfers a private DMA copy to the ring until EOP completes.
-    /// No waiting occurs under the queue lock.
+    /// No waiting occurs under the queue lock. `mtu` is the programmed
+    /// MTU, threaded into `TxPlan::parse` (issue #802): the parse
+    /// caps non-TSO frames at the MTU (VLAN-aware) and TSO segments
+    /// at the MTU, so there is no second cap here.
     ///
     /// # Safety
     /// `csr` must be this PF's mapped BAR0 with this queue enabled.
@@ -649,8 +694,9 @@ impl QueuePair {
         csr: &MmioRegion,
         frame: &[u8],
         meta: TxMeta,
+        mtu: u32,
     ) -> Result<(), I40eError> {
-        let plan = super::offload::TxPlan::parse(frame, meta)?;
+        let plan = super::offload::TxPlan::parse(frame, meta, mtu)?;
         self.reclaim()?;
         // 4-KiB chunks stay within i40e's 16-KiB buffer limit and DMA read
         // boundary restrictions. The entire header is in the first chunk.
@@ -717,7 +763,7 @@ impl QueuePair {
     /// the device completes EOP, exactly like `submit` retains its private
     /// copy. On a ring-full (or pre-DMA error) the buffer is handed back in the
     /// `Err` so the caller can retry without losing it; on success ownership
-    /// transfers to the ring.
+    /// transfers to the ring. `mtu` is the programmed MTU (see `submit`).
     ///
     /// # Safety
     /// `csr` must be this PF's mapped BAR0 with this queue enabled.
@@ -728,15 +774,19 @@ impl QueuePair {
         offset: usize,
         len: usize,
         meta: TxMeta,
+        mtu: u32,
     ) -> Result<(), (I40eError, DmaBuffer)> {
         if offset + len > buffer.len() {
             return Err((I40eError::FrameTooLong, buffer));
         }
-        let plan =
-            match super::offload::TxPlan::parse(&buffer.as_slice()[offset..offset + len], meta) {
-                Ok(p) => p,
-                Err(e) => return Err((e, buffer)),
-            };
+        let plan = match super::offload::TxPlan::parse(
+            &buffer.as_slice()[offset..offset + len],
+            meta,
+            mtu,
+        ) {
+            Ok(p) => p,
+            Err(e) => return Err((e, buffer)),
+        };
         if let Err(e) = self.reclaim() {
             return Err((e, buffer));
         }
@@ -799,9 +849,14 @@ impl QueuePair {
     /// Compatibility entry point; returns after submission, not wire completion.
     /// # Safety
     /// Same queue ownership requirements as `submit`.
-    pub unsafe fn transmit(&mut self, csr: &MmioRegion, frame: &[u8]) -> Result<(), I40eError> {
+    pub unsafe fn transmit(
+        &mut self,
+        csr: &MmioRegion,
+        frame: &[u8],
+        mtu: u32,
+    ) -> Result<(), I40eError> {
         // SAFETY: forwarded from caller.
-        unsafe { self.submit(csr, frame, TxMeta::plain()) }
+        unsafe { self.submit(csr, frame, TxMeta::plain(), mtu) }
     }
 
     /// Pop one received frame, if any.
@@ -828,18 +883,21 @@ impl QueuePair {
         // its final EOF descriptor. Checksum failures still go to software.
         let discard = self.rx_discard || !rx_desc_eof(status);
         self.rx_discard = !rx_desc_eof(status);
-        let payload = if !discard && errors & 0x07 == 0 && len > 0 && len <= RX_MAX_FRAME as usize {
-            let mut packet = alloc::vec![0u8; len];
-            for (i, byte) in packet.iter_mut().enumerate() {
-                // SAFETY: DD plus DMA barrier makes the completed RX buffer CPU-owned.
-                *byte = unsafe {
-                    core::ptr::read_volatile(self.rx_bufs[slot as usize].cpu_ptr_at::<u8>(i as u64))
-                };
-            }
-            Some((packet, super::offload::rx_metadata(status)))
-        } else {
-            None
-        };
+        let payload =
+            if !discard && errors & 0x07 == 0 && len > 0 && len <= self.rx_max_frame as usize {
+                let mut packet = alloc::vec![0u8; len];
+                for (i, byte) in packet.iter_mut().enumerate() {
+                    // SAFETY: DD plus DMA barrier makes the completed RX buffer CPU-owned.
+                    *byte = unsafe {
+                        core::ptr::read_volatile(
+                            self.rx_bufs[slot as usize].cpu_ptr_at::<u8>(i as u64),
+                        )
+                    };
+                }
+                Some((packet, super::offload::rx_metadata(status)))
+            } else {
+                None
+            };
 
         // Re-arm: back to the read format, pointing at the same
         // buffer.
@@ -893,7 +951,7 @@ impl QueuePair {
             && eof
             && errors & 0x07 == 0
             && len > 0
-            && len <= RX_MAX_FRAME as usize;
+            && len <= self.rx_max_frame as usize;
 
         // Hand out the filled buffer only when deliverable AND a replacement is
         // in hand, so the slot is never left empty. On a refill failure, bail
@@ -1089,7 +1147,7 @@ pub(super) mod runtime_tests {
         for index in 0..62 {
             // SAFETY: MMIO and DMA are backed by test-owned memory, no live device.
             unsafe {
-                queue.submit(&csr, &small, TxMeta::plain()).unwrap();
+                queue.submit(&csr, &small, TxMeta::plain(), 1500).unwrap();
             }
             complete(&queue, index + 1);
             queue.reclaim().unwrap();
@@ -1097,7 +1155,9 @@ pub(super) mod runtime_tests {
         let packet = super::super::tests::tcp_packet(false, 9000);
         // SAFETY: test-owned simulated queue.
         unsafe {
-            queue.submit(&csr, &packet, TxMeta::with_tso(1460)).unwrap();
+            queue
+                .submit(&csr, &packet, TxMeta::with_tso(1460), 1500)
+                .unwrap();
         }
         if queue.tx_next != 2
             || descriptor(&queue, 62).1 & 15 != 1
@@ -1136,12 +1196,13 @@ pub(super) mod runtime_tests {
         for _ in 0..RING_LEN - 1 {
             // SAFETY: test-owned simulated MMIO and descriptors.
             unsafe {
-                queue.submit(&csr, &packet, TxMeta::plain()).unwrap();
+                queue.submit(&csr, &packet, TxMeta::plain(), 1500).unwrap();
             }
         }
         let saved = descriptor(&queue, 63);
         // SAFETY: test-owned simulated queue.
-        if unsafe { queue.submit(&csr, &packet, TxMeta::plain()) } != Err(I40eError::TxRingFull)
+        if unsafe { queue.submit(&csr, &packet, TxMeta::plain(), 1500) }
+            != Err(I40eError::TxRingFull)
             || queue.tx_next != 63
             || descriptor(&queue, 63) != saved
         {
@@ -1170,7 +1231,7 @@ pub(super) mod runtime_tests {
         let free_before = queue.tx_small_free.len();
 
         // SAFETY: test-owned simulated queue.
-        unsafe { queue.submit(&csr, &packet, TxMeta::plain()).unwrap() };
+        unsafe { queue.submit(&csr, &packet, TxMeta::plain(), 1500).unwrap() };
         let first_phys = descriptor(&queue, 0).0;
         if queue.tx_small_free.len() + 1 != free_before {
             return TestResult::Fail("copy submit did not consume a prepared TX buffer");
@@ -1183,7 +1244,7 @@ pub(super) mod runtime_tests {
 
         // SAFETY: test-owned simulated queue. The LIFO cache must give the
         // just-completed DMA storage back rather than allocate a replacement.
-        unsafe { queue.submit(&csr, &packet, TxMeta::plain()).unwrap() };
+        unsafe { queue.submit(&csr, &packet, TxMeta::plain(), 1500).unwrap() };
         if descriptor(&queue, 1).0 != first_phys {
             return TestResult::Fail("copy submit did not reuse queue-local DMA storage");
         }
@@ -1204,7 +1265,7 @@ pub(super) mod runtime_tests {
         buf.as_mut_slice()[..len].copy_from_slice(&packet);
         let buf_phys = buf.dma_addr().raw();
         // SAFETY: test-owned simulated queue.
-        if unsafe { queue.submit_frame(&csr, buf, 0, len, TxMeta::plain()) }.is_err() {
+        if unsafe { queue.submit_frame(&csr, buf, 0, len, TxMeta::plain(), 1500) }.is_err() {
             return TestResult::Fail("submit_frame rejected a frame on an empty ring");
         }
         // Zero copy: the descriptor DMAs the frame's OWN buffer, not a fresh one.
@@ -1221,13 +1282,13 @@ pub(super) mod runtime_tests {
         let small = super::super::tests::tcp_packet(false, 10);
         while queue.tx_next != RING_LEN - 1 {
             // SAFETY: test-owned simulated queue.
-            unsafe { queue.submit(&csr, &small, TxMeta::plain()).unwrap() };
+            unsafe { queue.submit(&csr, &small, TxMeta::plain(), 1500).unwrap() };
         }
         let mut again = alloc_coherent(len, DomainId::DRIVER_0).unwrap();
         again.as_mut_slice()[..len].copy_from_slice(&packet);
         let again_phys = again.dma_addr().raw();
         // SAFETY: test-owned simulated queue, ring now full.
-        match unsafe { queue.submit_frame(&csr, again, 0, len, TxMeta::plain()) } {
+        match unsafe { queue.submit_frame(&csr, again, 0, len, TxMeta::plain(), 1500) } {
             Err((I40eError::TxRingFull, returned)) => {
                 if returned.dma_addr().raw() != again_phys {
                     return TestResult::Fail("ring-full did not hand back the same buffer");

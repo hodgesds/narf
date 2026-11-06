@@ -41,6 +41,11 @@ pub(crate) const BUILTIN_DOMAIN: narf_lib::id::DomainId = narf_lib::id::DomainId
 #[cfg(feature = "builtin")]
 pub mod e1000;
 
+/// Pure jumbo-frame MTU policy for the e1000/e1000e family (issue #802).
+/// No MMIO, no allocation; the live wiring is in [`e1000`].
+#[cfg(feature = "builtin")]
+pub(crate) mod mtu;
+
 /// The loadable-module registration + C-ABI datapath. Compiled only for the
 /// `.ko` build.
 #[cfg(feature = "module")]
