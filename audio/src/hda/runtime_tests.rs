@@ -2753,7 +2753,7 @@ fn native_hda_alc283_hp_tail_applied() -> TestResult {
     let sense = make_verb(0, 6, crate::hda_codec::verb::GET_PIN_SENSE);
     let mute = make_verb(0, 6, crate::hda_codec::verb::SET_AMP_GAIN_MUTE | 0xB080);
     let pin_out = make_verb(0, 6, crate::hda_codec::verb::SET_PIN_WIDGET_CONTROL | 0x40);
-    let expected: [u32; 12] = [
+    let expected: [u32; 11] = [
         sense,
         idx(0x43),
         set(0x9004),
@@ -2832,7 +2832,7 @@ fn native_hda_alc282_hp_tail_plugged() -> TestResult {
 kernel_test_in!("audio/hda", native_hda_alc282_hp_tail_plugged);
 
 /// #776 remainders: the ALC283 tail's sense-plugged branch
-/// issues the same 12 verbs as the unplugged branch — Linux
+/// issues the same 11 verbs as the unplugged branch — Linux
 /// only gates the 85 ms sleeps on sense, never the verbs.
 fn native_hda_alc283_hp_tail_plugged() -> TestResult {
     let fixture = match Fixture::alc283_plugged() {
@@ -2853,7 +2853,7 @@ fn native_hda_alc283_hp_tail_plugged() -> TestResult {
     let sense = make_verb(0, 6, crate::hda_codec::verb::GET_PIN_SENSE);
     let mute = make_verb(0, 6, crate::hda_codec::verb::SET_AMP_GAIN_MUTE | 0xB080);
     let pin_out = make_verb(0, 6, crate::hda_codec::verb::SET_PIN_WIDGET_CONTROL | 0x40);
-    let expected: [u32; 12] = [
+    let expected: [u32; 11] = [
         sense,
         idx(0x43),
         set(0x9004),
