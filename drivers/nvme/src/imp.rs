@@ -331,7 +331,7 @@ const ADMIN_Q_DEPTH: u16 = 8;
 const _: () = assert!(ADMIN_Q_DEPTH <= 4096);
 const _: () = assert!(ADMIN_Q_DEPTH as usize * 64 <= 4096);
 const _: () = assert!(ADMIN_Q_DEPTH as usize * 16 <= 4096);
-const _: () = assert!(ADMIN_Q_DEPTH - 1 >= 4);
+const _: () = assert!(ADMIN_Q_DEPTH > 4);
 
 /// I/O queue depth — same constraint (single 4 KiB DMA page each).
 /// Independent of the admin depth: only the admin queue needs the
