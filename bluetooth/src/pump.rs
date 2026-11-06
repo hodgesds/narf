@@ -2290,6 +2290,53 @@ impl PumpCore {
             .map_err(|_| SmpEncryptError::Transport)
     }
 
+/// Errors cancelling an in-flight pairing on a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmpCancelError {
+    /// No connection with this handle.
+    UnknownHandle,
+    /// No pairing session is in flight on this connection.
+    NotPairing,
+}
+
+impl PumpCore {
+    /// Abort an in-flight pairing on an LE connection (issue
+    /// #1528): clear the session — initiator or responder — and
+    /// send the peer a Pairing Failed PDU, Unspecified Reason
+    /// (Vol 3 Part H §3.5.5), so the peer also abandons the
+    /// exchange instead of waiting on a dead session. A
+    /// mgmt-started pairing completes as CANCELLED
+    /// ([`crate::mgmt::pairing_complete`], which no-ops for
+    /// responder pairings and direct `smp_initiate_pairing` calls
+    /// that never created a pending entry). No bond forms and no
+    /// LTK is recorded: cancellation happens before Done, so
+    /// there is nothing to forget. The link itself is untouched
+    /// — cancelling a pairing is not a disconnect.
+    pub fn smp_cancel_pairing(&mut self, handle: u16) -> Result<(), SmpCancelError> {
+        let (peer, le) = {
+            let conn = self
+                .connections
+                .iter()
+                .find(|c| c.handle == handle)
+                .ok_or(SmpCancelError::UnknownHandle)?;
+            if conn.smp.is_none() {
+                return Err(SmpCancelError::NotPairing);
+            }
+            (conn.peer_addr, conn.le)
+        };
+        let conn = self
+            .connection_mut(handle)
+            .ok_or(SmpCancelError::UnknownHandle)?;
+        conn.smp = None;
+        let failed = smp::Pdu {
+            code: smp::SMP_PAIRING_FAILED,
+            payload: alloc::vec![smp::SMP_FAILED_UNSPECIFIED],
+        };
+        self.queue_frame(handle, le, &BFrame::new(CID_SMP, failed.encode()));
+        crate::mgmt::pairing_complete(self.index, peer, crate::mgmt::STATUS_CANCELLED);
+        Ok(())
+    }
+
     /// Forget a peer's bond. Returns true when one was removed.
     pub fn forget_bond(&mut self, peer_addr: &[u8; 7]) -> bool {
         self.bonds.forget(peer_addr)
@@ -4508,6 +4555,12 @@ pub fn smp_initiate_pairing(index: usize, handle: u16) -> Option<Result<(), SmpI
 /// stored bond. See [`PumpCore::smp_start_encryption`].
 pub fn smp_start_encryption(index: usize, handle: u16) -> Option<Result<(), SmpEncryptError>> {
     with_core(index, |core| core.smp_start_encryption(handle))
+}
+
+/// Cancel an in-flight pairing on controller `index`'s connection
+/// `handle`. See [`PumpCore::smp_cancel_pairing`].
+pub fn smp_cancel_pairing(index: usize, handle: u16) -> Option<Result<(), SmpCancelError>> {
+    with_core(index, |core| core.smp_cancel_pairing(handle))
 }
 
 /// Forget controller `index`'s bond for `peer_addr`.
@@ -11560,6 +11613,93 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_mgmt_pair_device_full_exchange);
+
+    /// #1528: the pump cancel API. Cancelling an in-flight
+    /// initiator or responder session clears it (a fresh pairing
+    /// can start on the same connection) and sends the peer a
+    /// Pairing Failed PDU, Unspecified Reason (Vol 3 Part H
+    /// §3.5.5: code 0x05, reason 0x08 — the bytes are pinned
+    /// here from the spec, not from the encoder under test).
+    /// Cancelling with no session, or no connection, is a clean
+    /// error, not a silent no-op.
+    fn smoke_pump_smp_cancel_pairing() -> TestResult {
+        reset_all();
+        test_entropy::install_stream(0x0123_4567_89AB_CDEF);
+        let fail = |msg: &'static str| -> TestResult {
+            test_entropy::clear();
+            reset_all();
+            TestResult::Fail(msg)
+        };
+        // No pump at all → None, not an error.
+        if smp_cancel_pairing(0, SMP888_HANDLE).is_some() {
+            return fail("cancel with no pump was not None");
+        }
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(m) = smp888_bring_up_connect(&fake) {
+            return fail(m);
+        }
+        if smp_cancel_pairing(0, 0x1234) != Some(Err(SmpCancelError::UnknownHandle)) {
+            return fail("cancel on an unknown handle was not UnknownHandle");
+        }
+        if smp_cancel_pairing(0, SMP888_HANDLE) != Some(Err(SmpCancelError::NotPairing)) {
+            return fail("cancel with no session was not NotPairing");
+        }
+        let failed_sent = |fake: &ScriptedTransport| {
+            fake.sent_acl_frames().iter().any(|(h, f)| {
+                *h == SMP888_HANDLE
+                    && f.cid == CID_SMP
+                    && f.payload
+                        == alloc::vec![smp::SMP_PAIRING_FAILED, smp::SMP_FAILED_UNSPECIFIED]
+            })
+        };
+        // Initiator: start, cancel, Pairing Failed goes out, and
+        // the session is gone (a second cancel is NotPairing, a
+        // fresh start works).
+        if smp_initiate_pairing(0, SMP888_HANDLE) != Some(Ok(())) {
+            return fail("initiator start failed");
+        }
+        if smp_cancel_pairing(0, SMP888_HANDLE) != Some(Ok(())) {
+            return fail("initiator cancel failed");
+        }
+        let _ = pump_once(0);
+        if !failed_sent(&fake) {
+            return fail("initiator cancel sent no Pairing Failed (0x05, 0x08)");
+        }
+        if smp_cancel_pairing(0, SMP888_HANDLE) != Some(Err(SmpCancelError::NotPairing)) {
+            return fail("second initiator cancel was not NotPairing");
+        }
+        if smp_initiate_pairing(0, SMP888_HANDLE) != Some(Ok(())) {
+            return fail("pairing did not restart after cancel");
+        }
+        if smp_cancel_pairing(0, SMP888_HANDLE) != Some(Ok(())) {
+            return fail("second initiator cancel failed");
+        }
+        let _ = pump_once(0);
+        // Responder: a peer Pairing Request opens the session;
+        // cancelling it also sends Pairing Failed and clears it.
+        let rsp = smp888_step_acls(
+            &fake,
+            &[smp888_request_acl(SMP888_HANDLE, 0x06, 0x06)],
+            SMP888_HANDLE,
+        );
+        if rsp.len() != 1 || rsp[0][0] != smp::SMP_PAIRING_RESPONSE {
+            return fail("peer Pairing Request did not open a responder session");
+        }
+        if smp_cancel_pairing(0, SMP888_HANDLE) != Some(Ok(())) {
+            return fail("responder cancel failed");
+        }
+        let _ = pump_once(0);
+        if !failed_sent(&fake) {
+            return fail("responder cancel sent no Pairing Failed (0x05, 0x08)");
+        }
+        if smp_cancel_pairing(0, SMP888_HANDLE) != Some(Err(SmpCancelError::NotPairing)) {
+            return fail("second responder cancel was not NotPairing");
+        }
+        test_entropy::clear();
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_smp_cancel_pairing);
 
     /// #888: responder pairing with distribution. The LTK Request
     /// that arrives while the session is AuthComplete is answered

@@ -314,8 +314,14 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   bounds). PAIR_DEVICE (LE Just Works only, existing connection
   required) returns Command Status now and Command Complete when
   the initiator session ends (SUCCESS / AUTH_FAILED /
-  DISCONNECTED); UNPAIR_DEVICE forgets the bond (idempotent) and
-  refuses disconnect=1 on a live connection (NOT_SUPPORTED).
+  DISCONNECTED / CANCELLED); CANCEL_PAIR_DEVICE (issue #1528)
+  aborts an in-flight mgmt-started pairing via
+  `pump::smp_cancel_pairing` (Pairing Failed, Unspecified Reason,
+  Vol 3 Part H §3.5.5) and completes the pending PAIR_DEVICE
+  with CANCELLED — a cancel with no pending pairing for that
+  peer is INVALID_PARAMS, as in the kernel. UNPAIR_DEVICE
+  forgets the bond (idempotent) and refuses disconnect=1 on a
+  live connection (NOT_SUPPORTED).
   Known limits: mgmt issues its HCI synchronously, so while the
   pump task is draining the same transport a completion can be
   consumed by the pump instead (a single command path via the

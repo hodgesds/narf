@@ -14,6 +14,11 @@
 //! (#1312); pairing is the landed SMP initiator (#888), LE-only
 //! Just Works, with the async Linux completion model (Command
 //! Status now, Command Complete when the pairing finishes).
+//! CANCEL_PAIR_DEVICE (0x001a, #1528) aborts an in-flight
+//! mgmt-started pairing: the pump sends Pairing Failed and the
+//! pending PAIR_DEVICE completes with CANCELLED (0x10); a
+//! cancel with no pending pairing for that peer is
+//! INVALID_PARAMS, as in the kernel.
 //!
 //! Wire format and status codes follow `/usr/src/linux`
 //! `net/bluetooth/mgmt.c` + `include/net/bluetooth/mgmt.h`.
@@ -53,6 +58,7 @@ const OP_SET_DEV_CLASS: u16 = 0x000e;
 const OP_SET_LOCAL_NAME: u16 = 0x000f;
 const OP_GET_CONNECTIONS: u16 = 0x0015;
 const OP_PAIR_DEVICE: u16 = 0x0019;
+const OP_CANCEL_PAIR_DEVICE: u16 = 0x001a;
 const OP_UNPAIR_DEVICE: u16 = 0x001b;
 const OP_START_DISCOVERY: u16 = 0x0023;
 const OP_STOP_DISCOVERY: u16 = 0x0024;
@@ -85,6 +91,10 @@ const STATUS_NOT_SUPPORTED: u8 = 0x0c;
 const STATUS_INVALID_PARAMS: u8 = 0x0d;
 pub(crate) const STATUS_DISCONNECTED: u8 = 0x0e;
 const STATUS_NOT_POWERED: u8 = 0x0f;
+/// `MGMT_STATUS_CANCELLED` (mgmt.h): the status a pending
+/// PAIR_DEVICE completes with when userspace cancels it via
+/// CANCEL_PAIR_DEVICE (issue #1528).
+pub(crate) const STATUS_CANCELLED: u8 = 0x10;
 const STATUS_INVALID_INDEX: u8 = 0x11;
 const STATUS_ALREADY_PAIRED: u8 = 0x13;
 
@@ -731,6 +741,79 @@ fn pair_device(index: u16, params: &[u8]) -> Vec<u8> {
     }
 }
 
+/// CANCEL_PAIR_DEVICE (0x001a): `addr (6) + type (1)` (BlueZ
+/// `doc/mgmt-api.txt`; kernel `cancel_pair_device` in
+/// `net/bluetooth/mgmt.c`). Powered-only. The address must match
+/// a pending PAIR_DEVICE — no pending pairing, or a different
+/// peer, is INVALID_PARAMS (Command Status), exactly as the
+/// kernel answers when `pending_find(MGMT_OP_PAIR_DEVICE)`
+/// comes up empty or the address mismatches. BR/EDR can never
+/// match: pending pairings are LE-only (BR/EDR is rejected at
+/// PAIR_DEVICE), so it is INVALID_PARAMS too. On a match the
+/// pump aborts the SMP session (Pairing Failed, Unspecified
+/// Reason, Vol 3 Part H §3.5.5), the pending PAIR_DEVICE
+/// completes with CANCELLED (0x10) on the mgmt event sink, and
+/// this command completes with SUCCESS echoing the addr_info.
+fn cancel_pair_device(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_INDEX);
+    }
+    if params.len() < 7 {
+        return cmd_status(index, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_PARAMS);
+    }
+    let addr_type = params[6];
+    if addr_type != ADDR_LE_PUBLIC && addr_type != ADDR_LE_RANDOM {
+        return cmd_status(index, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_PARAMS);
+    }
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return cmd_status(index, OP_CANCEL_PAIR_DEVICE, STATUS_NOT_POWERED);
+    }
+    let mut peer = [0u8; 7];
+    peer[0] = match addr_type {
+        ADDR_LE_PUBLIC => 0,
+        _ => 1,
+    };
+    peer[1..7].copy_from_slice(&params[..6]);
+    // The kernel gate: cancel only matches a *pending
+    // PAIR_DEVICE*. A responder pairing or a direct
+    // `pump::smp_initiate_pairing` call never creates one, so
+    // cancelling those is INVALID_PARAMS — and the session is
+    // left alone, not aborted behind userspace's back.
+    if !PENDING_PAIR.lock().contains(&(index, peer)) {
+        return cmd_status(index, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_PARAMS);
+    }
+    // Resolve the live connection for the peer (mgmt pairs an
+    // existing connection). A disconnect already completed the
+    // pending pairing as DISCONNECTED and dropped the entry, so
+    // a missing connection here is unreachable in practice; the
+    // NOT_CONNECTED is defensive, mirroring PAIR_DEVICE.
+    let handle = match crate::pump::connections(index as usize) {
+        Some(conns) => conns.iter().find(|c| c.peer_addr == peer).map(|c| c.handle),
+        None => None,
+    };
+    let Some(handle) = handle else {
+        return cmd_status(index, OP_CANCEL_PAIR_DEVICE, STATUS_NOT_CONNECTED);
+    };
+    match crate::pump::smp_cancel_pairing(index as usize, handle) {
+        Some(Ok(())) => {
+            let mut data = Vec::with_capacity(7);
+            data.extend_from_slice(&params[..6]);
+            data.push(addr_type);
+            cmd_complete(index, OP_CANCEL_PAIR_DEVICE, STATUS_SUCCESS, &data)
+        }
+        // Raced: the session ended between the pending-entry
+        // check and the cancel, and its terminal path already
+        // completed the pairing — nothing left to cancel.
+        Some(Err(crate::pump::SmpCancelError::NotPairing)) => {
+            cmd_status(index, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_PARAMS)
+        }
+        Some(Err(crate::pump::SmpCancelError::UnknownHandle)) => {
+            cmd_status(index, OP_CANCEL_PAIR_DEVICE, STATUS_NOT_CONNECTED)
+        }
+        None => cmd_status(index, OP_CANCEL_PAIR_DEVICE, STATUS_FAILED),
+    }
+}
+
 /// UNPAIR_DEVICE (0x001b): `addr (6) + type (1) + disconnect (1)`.
 /// Powered-only. Removing a bond is idempotent — an unknown peer
 /// still replies success. `disconnect=1` with a live connection is
@@ -1028,7 +1111,9 @@ pub fn publish_device_found(
 /// entry in PENDING_PAIR) gets a Command Complete — responder
 /// pairings and direct `pump::smp_initiate_pairing` calls do not.
 /// `status` is SUCCESS on a completed pairing, AUTH_FAILED on an
-/// SMP failure, DISCONNECTED when the link died mid-pairing.
+/// SMP failure, DISCONNECTED when the link died mid-pairing, and
+/// CANCELLED when userspace cancelled it via CANCEL_PAIR_DEVICE
+/// (issue #1528).
 pub fn pairing_complete(index: usize, peer: [u8; 7], status: u8) {
     if !PENDING_PAIR.lock().remove(&(index as u16, peer)) {
         return;
@@ -1096,6 +1181,7 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
                 OP_SET_LOCAL_NAME,
                 OP_GET_CONNECTIONS,
                 OP_PAIR_DEVICE,
+                OP_CANCEL_PAIR_DEVICE,
                 OP_UNPAIR_DEVICE,
                 OP_START_DISCOVERY,
                 OP_STOP_DISCOVERY,
@@ -1200,6 +1286,7 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
         OP_STOP_DISCOVERY => alloc::vec![stop_discovery(index, params)],
         OP_GET_CONNECTIONS => alloc::vec![get_connections(index)],
         OP_PAIR_DEVICE => alloc::vec![pair_device(index, params)],
+        OP_CANCEL_PAIR_DEVICE => alloc::vec![cancel_pair_device(index, params)],
         OP_UNPAIR_DEVICE => alloc::vec![unpair_device(index, params)],
         _ => alloc::vec![cmd_status(index, opcode, STATUS_UNKNOWN_COMMAND)],
     }
@@ -2190,5 +2277,119 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_pair_unpair_and_get_connections);
+    /// #1528: CANCEL_PAIR_DEVICE aborts an in-flight mgmt
+    /// pairing — the pending PAIR_DEVICE completes with
+    /// CANCELLED on the event sink and the cancel itself
+    /// completes with SUCCESS echoing the addr_info — and a
+    /// cancel with no pending pairing for that peer is
+    /// INVALID_PARAMS (Command Status), as in the kernel.
+    /// Fixture layout is from BlueZ `doc/mgmt-api.txt` (opcode
+    /// 0x001a, params addr(6)+type(1), return addr(6)+type(1)),
+    /// not from the implementation's constants.
+    fn smoke_mgmt_cancel_pair_device() -> TestResult {
+        let (lt, index) = setup_controller(controller::ControllerInfo::default());
+        let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
+        crate::pump::test_entropy::install_stream(0x0123_4567_89AB_CDEF);
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        // Fixture opcodes from mgmt-api.txt, not from the impl:
+        // CANCEL_PAIR_DEVICE 0x001a, params addr(6) + type(1);
+        // error code 0x10 Cancelled.
+        const OP_CANCEL_PAIR_DEVICE: u16 = 0x001a;
+        const STATUS_CANCELLED: u8 = 0x10;
+        let mut cancel_params = [0u8; 7];
+        cancel_params[..6].copy_from_slice(&peer6);
+        cancel_params[6] = 0x01; // LE public
+        let np = handle(&mgmt_cmd(OP_CANCEL_PAIR_DEVICE, index, &cancel_params));
+        let np_ok = is_cmd_status(&np, OP_CANCEL_PAIR_DEVICE, STATUS_NOT_POWERED);
+        let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
+        // No pending pairing for this peer (or any peer) yet.
+        let none = handle(&mgmt_cmd(OP_CANCEL_PAIR_DEVICE, index, &cancel_params));
+        let none_ok = is_cmd_status(&none, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_PARAMS);
+        let short = handle(&mgmt_cmd(OP_CANCEL_PAIR_DEVICE, index, &cancel_params[..6]));
+        let short_ok = is_cmd_status(&short, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_PARAMS);
+        let mut bad_type = cancel_params;
+        bad_type[6] = 0x03;
+        let bt = handle(&mgmt_cmd(OP_CANCEL_PAIR_DEVICE, index, &bad_type));
+        let bt_ok = is_cmd_status(&bt, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_PARAMS);
+        let mut bredr = cancel_params;
+        bredr[6] = 0x00;
+        let br = handle(&mgmt_cmd(OP_CANCEL_PAIR_DEVICE, index, &bredr));
+        let br_ok = is_cmd_status(&br, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_PARAMS);
+        let bad_index = handle(&mgmt_cmd(OP_CANCEL_PAIR_DEVICE, 0x00ff, &cancel_params));
+        let bad_index_ok = is_cmd_status(&bad_index, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_INDEX);
+        // 0x001a is advertised by READ_COMMANDS now (22 opcodes).
+        let cmds = handle(&mgmt_cmd(OP_READ_COMMANDS, MGMT_INDEX_NONE, &[]));
+        let cmds_ok = cmds.len() == 1
+            && u16::from_le_bytes([cmds[0][9], cmds[0][10]]) == 22
+            && cmds[0].len() >= 13 + 22 * 2
+            && (0..22).any(|i| {
+                u16::from_le_bytes([cmds[0][13 + 2 * i], cmds[0][14 + 2 * i]])
+                    == OP_CANCEL_PAIR_DEVICE
+            });
+        // Bring the peer's connection up, then start a pairing.
+        lt.enqueue_event(le_conn_complete_event(0x0040, peer6));
+        let _ = crate::pump::pump_once(index as usize);
+        let connected = crate::pump::connection_count(index as usize) == Some(1);
+        let mut pair_params = [0u8; 8];
+        pair_params[..6].copy_from_slice(&peer6);
+        pair_params[6] = 0x01; // LE public
+        pair_params[7] = 0x03; // NoInputNoOutput
+        CAPTURED.lock().clear();
+        let pair = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &pair_params));
+        let pair_ok = is_cmd_status(&pair, OP_PAIR_DEVICE, STATUS_SUCCESS);
+        let pair2 = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &pair_params));
+        let pair_busy = is_cmd_status(&pair2, OP_PAIR_DEVICE, STATUS_BUSY);
+        // Cancel the in-flight pairing: Command Complete SUCCESS
+        // echoing addr(6) + type(1), and the pending PAIR_DEVICE
+        // completes with CANCELLED on the event sink.
+        let cancel = handle(&mgmt_cmd(OP_CANCEL_PAIR_DEVICE, index, &cancel_params));
+        let cancel_ok = is_cmd_complete(&cancel, OP_CANCEL_PAIR_DEVICE, STATUS_SUCCESS)
+            && cancel[0].len() >= 16
+            && cancel[0][9..15] == peer6[..]
+            && cancel[0][15] == 0x01;
+        let cancelled = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 16
+                && u16::from_le_bytes([e[0], e[1]]) == EV_CMD_COMPLETE
+                && u16::from_le_bytes([e[6], e[7]]) == OP_PAIR_DEVICE
+                && e[8] == STATUS_CANCELLED
+                && e[9..15] == peer6[..]
+                && e[15] == 0x01
+        });
+        // The pairing is gone: a second cancel has nothing to
+        // cancel, and a fresh PAIR_DEVICE starts again.
+        let cancel2 = handle(&mgmt_cmd(OP_CANCEL_PAIR_DEVICE, index, &cancel_params));
+        let cancel2_ok = is_cmd_status(&cancel2, OP_CANCEL_PAIR_DEVICE, STATUS_INVALID_PARAMS);
+        let pair3 = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &pair_params));
+        let pair3_ok = is_cmd_status(&pair3, OP_PAIR_DEVICE, STATUS_SUCCESS);
+        let cancel3 = handle(&mgmt_cmd(OP_CANCEL_PAIR_DEVICE, index, &cancel_params));
+        let cancel3_ok = is_cmd_complete(&cancel3, OP_CANCEL_PAIR_DEVICE, STATUS_SUCCESS);
+        crate::pump::test_entropy::clear();
+        if let Some(prev) = previous {
+            narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+        }
+        cleanup_mgmt();
+        if !np_ok || !powered {
+            return TestResult::Fail("CANCEL_PAIR_DEVICE power gating failed");
+        }
+        if !none_ok || !short_ok || !bt_ok || !br_ok || !bad_index_ok {
+            return TestResult::Fail("CANCEL_PAIR_DEVICE validation failed");
+        }
+        if !cmds_ok {
+            return TestResult::Fail("READ_COMMANDS does not advertise CANCEL_PAIR_DEVICE");
+        }
+        if !connected || !pair_ok || !pair_busy {
+            return TestResult::Fail("PAIR_DEVICE async start / BUSY failed");
+        }
+        if !cancel_ok || !cancelled {
+            return TestResult::Fail("CANCEL_PAIR_DEVICE did not cancel the pending pairing");
+        }
+        if !cancel2_ok {
+            return TestResult::Fail("second CANCEL_PAIR_DEVICE was not INVALID_PARAMS");
+        }
+        if !pair3_ok || !cancel3_ok {
+            return TestResult::Fail("pairing did not restart cleanly after cancel");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_cancel_pair_device);
 }
