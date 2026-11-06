@@ -356,7 +356,7 @@ kernel_test_in!(
 /// A native Xe backend that reports only its LNL GT profile.
 #[derive(Debug)]
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-struct ProfileBackend(bool);
+pub(crate) struct ProfileBackend(pub(crate) bool);
 impl crate::intel_gpu_user::UserBackend for ProfileBackend {
     fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
         None
@@ -380,7 +380,7 @@ impl crate::intel_gpu_user::UserBackend for ProfileBackend {
 /// `DRM_IOCTL_XE_GEM_CREATE` of an 8 KiB system object with `flags` and
 /// `cpu_caching` (1 WB, 2 WC); the new handle.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-fn xe_gem_create(
+pub(crate) fn xe_gem_create(
     info: &crate::intel_gpu_render::DeviceInfo,
     gem: &crate::intel_gpu_gem::GemState,
     flags: u32,
@@ -451,11 +451,13 @@ fn smoke_xe2lpd_gt_scanout_create_flag_follows_display_profile() -> TestResult {
         );
         assert!(xe_gem_create(&headless, &gem, 0, 2).is_ok());
     }
-    // Panther Lake keeps refusing it even with a display-reporting backend.
+    // Panther Lake follows the same display-preserving profile gate.
     let ptl = GtPlatform::from_pci(0x8086, 0xb080).unwrap();
     assert!(ptl.is_ptl());
+    let ptl_handle = xe_gem_create(&info(ptl, Some(true)), &gem, 2, 2).unwrap();
+    assert!(gem.object(ptl_handle).unwrap().scanout());
     assert_eq!(
-        xe_gem_create(&info(ptl, Some(true)), &gem, 2, 2),
+        xe_gem_create(&info(ptl, Some(false)), &gem, 2, 2),
         Err(FsError::InvalidData)
     );
     // Meteor Lake's display-14 iGPU admission is unchanged.

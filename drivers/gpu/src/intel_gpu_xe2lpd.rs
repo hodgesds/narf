@@ -896,4 +896,4 @@ pub(crate) mod tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_xe2lpd_gt_tests.rs"]
-mod gt_tests;
+pub(crate) mod gt_tests;

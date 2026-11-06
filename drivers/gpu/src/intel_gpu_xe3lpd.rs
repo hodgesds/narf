@@ -74,12 +74,12 @@
 //!   disabled by `xe_device_probe` before `xe_display_init` on a media GT
 //!   at or after B0 ([`wa_15015404425`]).
 //!
-//! Supported on display 30: opted-in eDP takeover, linear primary flips,
-//! the 64x64 cursor, CTM and double-buffered LUTs, and DSB transactions.
+//! Supported on display 30: opted-in eDP takeover, linear, X-tiled and
+//! Tile4 primary flips through DPT, the 64x64 cursor, CTM and double-buffered
+//! LUTs, DSB transactions, and the Xe `SCANOUT` create flag.
 //! Refused on display 30: eDP on Type-C, the C20 tables, every external
-//! output, PSR and panel replay, FBC (and its dirty rectangles), tiled and
-//! compressed primaries, the Xe `SCANOUT` create flag, DC states, system
-//! suspend and relight, and Wildcat Lake (30.02).
+//! output, PSR and panel replay, FBC (and its dirty rectangles), compressed
+//! primaries, DC states, system suspend and relight, and Wildcat Lake (30.02).
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 

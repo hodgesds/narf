@@ -634,7 +634,7 @@ impl Physical {
             card.intel_tile4 = false;
             if matches!(
                 self.generation,
-                Generation::MeteorLake | Generation::LunarLake
+                Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
             ) {
                 if let Some(mode) = card.crtcs.first().and_then(|c| c.mode) {
                     if (mode.width, mode.height) != (geometry.width, geometry.height) {
@@ -1224,9 +1224,9 @@ pub(crate) fn install(
     console: ActiveScanout,
 ) {
     // Panther Lake is owned only as display 30.00 behind the opted-in
-    // route, which holds Pipe A for its eDP panel: linear primary flips,
-    // the 64x64 cursor, CTM and double-buffered LUTs, and DSB transactions
-    // on the console's Pipe A. Tiled primaries, XR30, FBC and PSR are not offered.
+    // route, which holds Pipe A for its eDP panel: linear, X-tiled and Tile4
+    // primary flips through DPT, the 64x64 cursor, CTM and double-buffered LUTs,
+    // and DSB transactions on the console's Pipe A. XR30, FBC and PSR are not offered.
     let display30 = if generation == Generation::PantherLake {
         if !crate::intel_gpu_xe2lpd::route_owns_pipe_a() {
             return;

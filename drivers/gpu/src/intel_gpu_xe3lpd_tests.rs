@@ -1634,6 +1634,137 @@ fn smoke_xe3lpd_cursor_staging_and_dsb_arm() -> TestResult {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_xe3lpd_gt_scanout_create_flag_follows_display_profile() -> TestResult {
+    use crate::intel_gpu_gt::GtPlatform;
+    use narf_filesystem::FsError;
+    let info = |platform, display: Option<bool>| crate::intel_gpu_render::DeviceInfo {
+        device_id: 0xb080,
+        platform,
+        memory_bytes: 0x8000_0000,
+        hwconfig: None,
+        topology: None,
+        vram: None,
+        backend: display.map(|display| {
+            alloc::sync::Arc::new(crate::intel_gpu_xe2lpd::gt_tests::ProfileBackend(display))
+                as alloc::sync::Arc<dyn crate::intel_gpu_user::UserBackend>
+        }),
+    };
+    let ptl = GtPlatform::from_pci(0x8086, 0xb080).unwrap();
+    let gem = crate::intel_gpu_gem::GemState::new();
+    let display = info(ptl, Some(true));
+    let handle = crate::intel_gpu_xe2lpd::gt_tests::xe_gem_create(&display, &gem, 2, 2).unwrap();
+    let object = gem.object(handle).unwrap();
+    assert!(object.scanout() && object.is_wc());
+    assert_eq!(
+        crate::intel_gpu_xe2lpd::gt_tests::xe_gem_create(&display, &gem, 2, 1),
+        Err(FsError::InvalidData)
+    );
+    assert_eq!(
+        crate::intel_gpu_xe2lpd::gt_tests::xe_gem_create(&info(ptl, Some(false)), &gem, 2, 2),
+        Err(FsError::InvalidData)
+    );
+    TestResult::Pass
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_xe3lpd_kms_tile4_and_x_flips_through_owned_dpt() -> TestResult {
+    use crate::intel_gpu_gtt::{GEM_SCANOUT_GTT_END, GEM_SCANOUT_GTT_START, GGTT_ARRAY_BASE};
+    use crate::intel_gpu_kms::tests::MockPlatform;
+    use crate::intel_gpu_scanout::{Geometry, Layout, View};
+
+    let platform = MockPlatform::new().with_display_ip(DisplayIp::Xe3Lpd);
+    let timing = display30_resources(&platform);
+    let geometry = crate::intel_gpu_kms::tests::geometry();
+    crate::intel_gpu_kms::tile4_profile(&platform, geometry, timing).unwrap();
+    let device = platform.panther();
+    let fb = crate::intel_gpu_kms::tests::object(true).unwrap();
+    let frames: Vec<u64> = fb.pages().collect();
+    assert_eq!(frames.len(), 2);
+    let view = View {
+        layout: Layout::Tile4,
+        ..View::default()
+    };
+    {
+        let mut session = crate::intel_gpu_kms::tests::complete(device.session()).unwrap();
+        crate::intel_gpu_kms::tests::complete(session.present_color(
+            fb.clone(),
+            geometry,
+            view,
+            None,
+            Default::default(),
+            timing,
+        ))
+        .unwrap();
+    }
+    assert_eq!(platform.read32(0x70180), 0x8400_1400);
+    assert_eq!(platform.read32(0x70188), 2);
+    let surface = platform.read32(0x701ac);
+    assert_eq!(platform.read32(0x7019c), surface);
+    assert_eq!(surface % (2 << 20), 0);
+    assert!((GEM_SCANOUT_GTT_START..GEM_SCANOUT_GTT_END).contains(&u64::from(surface)));
+    let pte = GGTT_ARRAY_BASE + u64::from(surface) / 4096 * 8;
+    let (low, high) = (platform.read32(pte), platform.read32(pte + 4));
+    assert_eq!(low & 1, 1);
+    assert_eq!((high >> 20) & 3, 3);
+    assert_eq!(platform.read32(pte + 8), 0);
+    let table = (u64::from(low) | (u64::from(high) << 32)) & crate::intel_gpu_gtt::PTE_PHYS_MASK;
+    let entry = |index: u64| -> u64 {
+        // SAFETY: the presenter retains this DPT page, mapped by the PTE
+        // just read, for the surface's lifetime.
+        unsafe {
+            narf_memory::PhysAddr::new(table + index * 8)
+                .kernel_ptr::<u64>()
+                .read_volatile()
+        }
+    };
+    for (index, phys) in frames.iter().enumerate() {
+        assert_eq!(entry(index as u64), phys | 1 | (3 << 52), "entry {index}");
+    }
+    for index in 2..512 {
+        assert_eq!(entry(index), 0, "padding {index}");
+    }
+    assert!(platform.all_writes().iter().all(|&(r, _)| r != 0x7026c));
+
+    // X-tiled flip through DPT at 512 pitch.
+    let platform_x = MockPlatform::new().with_display_ip(DisplayIp::Xe3Lpd);
+    let timing_x = display30_resources(&platform_x);
+    let geom_x = Geometry {
+        width: 64,
+        height: 32,
+        pitch: 512,
+    };
+    let device_x = platform_x.panther_pitch(512);
+    let fb_x = crate::intel_gpu_kms::tests::object_sized(true, 16384).unwrap();
+    let view_x = View {
+        layout: Layout::X,
+        ..View::default()
+    };
+    {
+        let mut session = crate::intel_gpu_kms::tests::complete(device_x.session()).unwrap();
+        crate::intel_gpu_kms::tests::complete(session.present_color(
+            fb_x.clone(),
+            geom_x,
+            view_x,
+            None,
+            Default::default(),
+            timing_x,
+        ))
+        .unwrap();
+    }
+    assert_eq!(platform_x.read32(0x70180), 0x8400_0400);
+    assert_eq!(platform_x.read32(0x70188), 1);
+    let surface_x = platform_x.read32(0x701ac);
+    assert_eq!(platform_x.read32(0x7019c), surface_x);
+    assert_eq!(surface_x % (2 << 20), 0);
+    let pte_x = GGTT_ARRAY_BASE + u64::from(surface_x) / 4096 * 8;
+    let (low_x, high_x) = (platform_x.read32(pte_x), platform_x.read32(pte_x + 4));
+    assert_eq!(low_x & 1, 1);
+    assert_eq!((high_x >> 20) & 3, 3);
+
+    TestResult::Pass
+}
+
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xe3lpd",
     smoke_xe3lpd_cursor_and_dsb_pages_map_xe3_pat3
@@ -1647,4 +1778,14 @@ kernel_test_in!(
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xe3lpd",
     smoke_xe3lpd_cursor_staging_and_dsb_arm
+);
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3lpd",
+    smoke_xe3lpd_gt_scanout_create_flag_follows_display_profile
+);
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3lpd",
+    smoke_xe3lpd_kms_tile4_and_x_flips_through_owned_dpt
 );
