@@ -1611,7 +1611,7 @@ impl PumpCore {
         scan_response: Option<&[u8]>,
     ) -> Result<(), CentralError> {
         if data.len() > gap::EXT_ADV_DATA_MAX_LEN
-            || scan_response.map_or(false, |s| s.len() > gap::EXT_ADV_DATA_MAX_LEN)
+            || scan_response.is_some_and(|s| s.len() > gap::EXT_ADV_DATA_MAX_LEN)
         {
             return Err(CentralError::BadData);
         }
