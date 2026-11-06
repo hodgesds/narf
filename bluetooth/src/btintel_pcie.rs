@@ -1058,10 +1058,18 @@ pub(crate) fn maybe_reload_firmware_with(
             );
             return ReloadOutcome::Failed;
         }
-        Err(e) => {
+        Err(ReloadDeviceError::EnableFailed(e)) => {
             let _ = writeln!(
                 narf_console::Writer,
-                "  btintel-pcie: firmware reload failed: {:?}; staying parked",
+                "  btintel-pcie: firmware reload failed: enable_bt failed: {:?}; staying parked",
+                e,
+            );
+            return ReloadOutcome::Failed;
+        }
+        Err(ReloadDeviceError::DownloadFailed(e)) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: firmware reload failed: download failed: {:?}; staying parked",
                 e,
             );
             return ReloadOutcome::Failed;
