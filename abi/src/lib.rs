@@ -54,7 +54,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_capabilities::CapSlot;
+use narf_capabilities::{CapError, CapSlot};
 use narf_ipc::{Consumer, Producer};
 
 // Re-export the shared-ring primitive so callers that already depend
@@ -340,6 +340,16 @@ pub enum OpCode {
 
     /// Exit the current protection domain; inverse of `DomainEnter`.
     DomainExit = 0x0006,
+
+    /// Grant-gated cap transfer between tasks (capabilities/ §9.1,
+    /// #1363 wiring). `caps[0]` is the sender's Grant cap for the
+    /// object, `caps[1]` is the cap to transfer, `inline[0]` is the
+    /// target task id. Both presented slots resolve against the
+    /// submitting task's own table first (the §8 gate at dispatch
+    /// entry); on success `result[0]` is the receiver's fresh
+    /// task-local slot number (>= 16). The sender retains its slot
+    /// (sharing semantics).
+    CapTransfer = 0x0007,
 
     /// File ops mirror `narf_userspace::Syscall`'s file numbers.
     /// Inline operands match: `inline[0]=fd or path-ptr`,
@@ -802,6 +812,60 @@ fn cancel_outcome(tag: Tag, flags: SubmissionFlags) -> Completion {
 
 // ── Dispatcher ──────────────────────────────────────────────────────
 
+/// Map a capability error to the completion status dispatch reports.
+///
+/// - `Revoked` → `CapRevoked`: the authoritative "do NOT retry"
+///   status (spec §4) — the object was revoked between enqueue and
+///   dispatch, or the task has no table at all.
+/// - `TypeMismatch` / `RightsTooWeak` / `DomainMismatch` /
+///   `ObjectMismatch` → `Forbidden`: the presented cap does not
+///   permit the requested action.
+/// - `CapTableFull` → `Busy`: lookup never returns it; a transfer
+///   into a full receiver table is the only producer, and `Busy`
+///   ("caller may retry") is the least-wrong status — the receiver
+///   may make room by other means, and no narrower status exists.
+pub fn cap_error_status(e: CapError) -> NarfStatus {
+    match e {
+        CapError::Revoked => NarfStatus::CapRevoked,
+        CapError::CapTableFull => NarfStatus::Busy,
+        _ => NarfStatus::Forbidden,
+    }
+}
+
+/// Validate every non-empty cap in `caps` against the submitting
+/// task's own table (capabilities/ §8 steps 1–4 via
+/// `CapTable::lookup`, reached through the scheduler's per-task
+/// registry). The resolved object always comes from the table,
+/// never from the presented bytes, so a wire slot copied across
+/// tasks resolves at most to the submitter's own entry at that
+/// position — never to the victim's object.
+///
+/// `owner == None` (legacy unbound dispatcher) has no table to
+/// check against: any presented cap fails closed as `Forbidden`
+/// while cap-less submissions pass. There is no un-wired fallback
+/// that silently accepts a cap.
+///
+/// Shared by `Dispatcher::dispatch_one` and the synchronous
+/// `sys_ring_kick` path so both dispatch entries enforce the same
+/// gate. Step 5 of §8 (domain-tag match) is NOT done here: it
+/// needs the op's required domain, which no per-op table models
+/// yet — a remainder, not a silent skip.
+pub fn validate_submission_caps(
+    owner: Option<narf_scheduler::TaskId>,
+    caps: &[CapSlot; 4],
+) -> Result<(), NarfStatus> {
+    for presented in caps.iter() {
+        if presented.is_empty() {
+            continue;
+        }
+        let Some(owner) = owner else {
+            return Err(NarfStatus::Forbidden);
+        };
+        narf_scheduler::lookup_task_cap(owner, *presented).map_err(cap_error_status)?;
+    }
+    Ok(())
+}
+
 /// Pending-cancel registry — tags whose producers have issued an
 /// `OpCode::Cancel`. The dispatcher consults this before running each
 /// submission's op body: a hit short-circuits the op with `Cancelled`
@@ -978,6 +1042,13 @@ pub struct Dispatcher<const N: usize> {
     sq: SubmissionDrain<N>,
     cq: CompletionQueue<N>,
     pending: PendingCancels,
+    /// Submitting task whose `CapTable` validates `Submission::caps`
+    /// (capabilities/ §8 steps 1–4, #1363 wiring). `None` is the
+    /// legacy unbound dispatcher: it has no table to check against,
+    /// so any presented cap fails closed as `Forbidden` while
+    /// cap-less submissions still dispatch (see
+    /// `validate_submission_caps`).
+    owner: Option<narf_scheduler::TaskId>,
 }
 
 impl<const N: usize> Dispatcher<N> {
@@ -987,6 +1058,27 @@ impl<const N: usize> Dispatcher<N> {
             sq,
             cq,
             pending: PendingCancels::new(),
+            owner: None,
+        }
+    }
+
+    /// Create a dispatcher bound to the submitting task `owner`.
+    /// Every non-empty cap in a submission is resolved against
+    /// `owner`'s own table before the op body runs; a task can
+    /// therefore never spend another task's capabilities through
+    /// this dispatcher. This is the production constructor —
+    /// `spawn_dispatcher_for` binds the task Bootstrap minted the
+    /// rings for.
+    pub const fn for_task(
+        sq: SubmissionDrain<N>,
+        cq: CompletionQueue<N>,
+        owner: narf_scheduler::TaskId,
+    ) -> Self {
+        Self {
+            sq,
+            cq,
+            pending: PendingCancels::new(),
+            owner: Some(owner),
         }
     }
 
@@ -1020,6 +1112,14 @@ impl<const N: usize> Dispatcher<N> {
     async fn dispatch_one(&mut self, sub: Submission) -> Completion {
         let _g = narf_tracing::fntime::scope(&ABI_DISPATCH_LATENCY);
         let tag = sub.tag();
+        // Cap gate first (capabilities/ §8 steps 1–4, #1363 wiring):
+        // every presented cap resolves against the submitting task's
+        // own table before any op body — or cancel bookkeeping — can
+        // observe the submission. A failure short-circuits with the
+        // cap status; the op never runs.
+        if let Err(status) = validate_submission_caps(self.owner, &sub.caps) {
+            return Completion::with(tag, status, [0; 6]);
+        }
         // Enter the sub into the chain registry; assigns a chain id
         // (fresh or inherited from LINKED) and records tag→chain so a
         // later `OpCode::Cancel` can propagate across the chain.
@@ -1063,6 +1163,37 @@ impl<const N: usize> Dispatcher<N> {
                 self.pending.request(target);
                 self.pending.signal_inflight(target);
                 Completion::ok(tag)
+            }
+
+            OpCode::CapTransfer => {
+                // §9.1 Grant-gated transfer via the ABI. The §8 gate
+                // above already resolved caps[0] (Grant) and caps[1]
+                // against the sender's table; this re-resolves both
+                // and installs the resolved entry into the receiver's
+                // table. `inline[0]` is the target task id;
+                // `result[0]` is the receiver's fresh slot number.
+                // No `return` here: the bottom of `dispatch_one`
+                // deregisters the inflight token, and this arm must
+                // flow through it like every other arm.
+                match self.owner {
+                    None => Completion::with(tag, NarfStatus::Forbidden, [0; 6]),
+                    Some(owner) => {
+                        let target = narf_scheduler::TaskId(sub.inline[0]);
+                        match narf_scheduler::transfer_task_cap(
+                            owner,
+                            target,
+                            sub.caps[0],
+                            sub.caps[1],
+                        ) {
+                            Ok(slot) => {
+                                let mut result = [0u64; 6];
+                                result[0] = u64::from(slot);
+                                Completion::with(tag, NarfStatus::Ok, result)
+                            }
+                            Err(e) => Completion::with(tag, cap_error_status(e), [0; 6]),
+                        }
+                    }
+                }
             }
 
             OpCode::Yield => {

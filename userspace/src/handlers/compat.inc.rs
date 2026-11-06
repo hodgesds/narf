@@ -14496,10 +14496,19 @@ pub fn abi_file_op_bridge(
 /// Spawn an `abi::Dispatcher` task to drive the ring pair Bootstrap
 /// minted for `task_id`. Returns the scheduler TaskId of the new
 /// dispatcher task, or `None` if there's nothing to drive.
+///
+/// The dispatcher is bound to `task_id` (`Dispatcher::for_task`,
+/// #1363 wiring): every cap a submission presents resolves against
+/// that task's own table, so the task cannot spend another task's
+/// capabilities through its rings.
 pub fn spawn_dispatcher_for(task_id: u64) -> Option<narf_scheduler::TaskId> {
     let ends = take_kernel_ends(task_id)?;
     Some(narf_scheduler::spawn(async move {
-        let mut d = narf_abi::Dispatcher::new(ends.sq_drain, ends.cq_prod);
+        let mut d = narf_abi::Dispatcher::for_task(
+            ends.sq_drain,
+            ends.cq_prod,
+            narf_scheduler::TaskId(task_id),
+        );
         d.run().await;
     }))
 }

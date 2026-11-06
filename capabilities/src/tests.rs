@@ -737,3 +737,111 @@ fn smoke_cap_table_growth_and_cap() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("capabilities", smoke_cap_table_growth_and_cap);
+
+// ── raw ABI transfer install (#1363 wiring) ─────────────────────────
+
+fn smoke_cap_table_install_transfer() -> TestResult {
+    // `install_transfer` is the raw-slot twin of `Cap<T, Grant>::transfer`
+    // for ABI dispatch, which only ever sees wire `CapSlot`s. It takes
+    // RESOLVED entries (sender-table `lookup` results), never presented
+    // bytes. Pins the §9.1 reading this wiring confirms: the receiver's
+    // slot NUMBER is fresh (>= 16, general region) while the stored
+    // entry's index/generation are the shared global object identity.
+    use crate::{Cap, CapError, CapKind, CapSlot, CapTable, CapType, Grant, Read};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read: Cap<TestObj, Read> = grant.derive().unwrap();
+    let mut sender = CapTable::new();
+    let grant_at = sender.install_bootstrap(&grant).unwrap();
+    let read_at = sender.install_bootstrap(&read).unwrap();
+    if grant_at != 0 || read_at != 1 {
+        return TestResult::Fail("bootstrap installs did not land at slots 0, 1");
+    }
+    // Presented slots: task-local position in `index`, the cap's own
+    // generation/rights/type_tag otherwise (capabilities/ §8 step 2).
+    let g = grant.slot();
+    let r = read.slot();
+    let grant_presented = CapSlot::new(g.generation, grant_at, g.rights, g.type_tag);
+    let read_presented = CapSlot::new(r.generation, read_at, r.rights, r.type_tag);
+    let grant_entry = match sender.lookup(grant_presented) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("sender grant did not resolve"),
+    };
+    let read_entry = match sender.lookup(read_presented) {
+        Ok(e) => e,
+        Err(_) => return TestResult::Fail("sender cap did not resolve"),
+    };
+    let mut receiver = CapTable::new();
+    let at = match receiver.install_transfer(grant_entry, read_entry) {
+        Ok(at) => at,
+        Err(_) => return TestResult::Fail("install_transfer failed"),
+    };
+    if at < CapTable::RESERVED_SLOTS as u32 {
+        return TestResult::Fail("raw transfer landed in the bootstrap region");
+    }
+    // The stored entry still names the global object: same index and
+    // generation as the sender's cap — only the slot NUMBER is fresh.
+    let presented = CapSlot::new(r.generation, at, r.rights, r.type_tag);
+    match receiver.lookup(presented) {
+        Ok(entry) if entry.index == r.index && entry.generation == r.generation => {}
+        Ok(_) => return TestResult::Fail("transferred entry lost the global object identity"),
+        Err(_) => return TestResult::Fail("transferred slot did not resolve"),
+    }
+    // A non-Grant entry presented as the grant refuses: RightsTooWeak.
+    let mut receiver2 = CapTable::new();
+    if receiver2.install_transfer(read_entry, read_entry) != Err(CapError::RightsTooWeak) {
+        return TestResult::Fail("non-Grant install_transfer did not report RightsTooWeak");
+    }
+    // Different objects refuse: ObjectMismatch.
+    let other_grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let other_read: Cap<TestObj, Read> = other_grant.derive().unwrap();
+    let mut sender2 = CapTable::new();
+    sender2.install_bootstrap(&other_grant).unwrap();
+    sender2.install_bootstrap(&other_read).unwrap();
+    let og = other_grant.slot();
+    let other_grant_entry = sender2
+        .lookup(CapSlot::new(og.generation, 0, og.rights, og.type_tag))
+        .unwrap();
+    let mut receiver3 = CapTable::new();
+    if receiver3.install_transfer(other_grant_entry, read_entry) != Err(CapError::ObjectMismatch) {
+        return TestResult::Fail("cross-object install_transfer did not report ObjectMismatch");
+    }
+    // Type-tag mismatch between the two resolved entries refuses.
+    let mut forged = read_entry;
+    forged.type_tag = CapKind::Domain as u32;
+    let mut receiver4 = CapTable::new();
+    if receiver4.install_transfer(grant_entry, forged) != Err(CapError::TypeMismatch) {
+        return TestResult::Fail("type-mismatched install_transfer did not report TypeMismatch");
+    }
+    // Revoke between resolve and install: the install still lands (the
+    // §9.5 check-then-install race, shared with the typed transfer),
+    // but the installed entry is dead — a later lookup fails Revoked.
+    let grant2: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read2: Cap<TestObj, Read> = grant2.derive().unwrap();
+    let mut sender3 = CapTable::new();
+    sender3.install_bootstrap(&grant2).unwrap();
+    sender3.install_bootstrap(&read2).unwrap();
+    let g2 = grant2.slot();
+    let r2 = read2.slot();
+    let grant_entry2 = sender3
+        .lookup(CapSlot::new(g2.generation, 0, g2.rights, g2.type_tag))
+        .unwrap();
+    let read_entry2 = sender3
+        .lookup(CapSlot::new(r2.generation, 1, r2.rights, r2.type_tag))
+        .unwrap();
+    read2.revoke();
+    let mut receiver5 = CapTable::new();
+    let at2 = match receiver5.install_transfer(grant_entry2, read_entry2) {
+        Ok(at) => at,
+        Err(_) => return TestResult::Fail("post-revoke install_transfer refused the install"),
+    };
+    let dead_presented = CapSlot::new(r2.generation, at2, r2.rights, r2.type_tag);
+    if receiver5.lookup(dead_presented) != Err(CapError::Revoked) {
+        return TestResult::Fail("entry installed after revoke still resolved live");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_table_install_transfer);
