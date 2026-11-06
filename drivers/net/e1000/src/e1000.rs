@@ -4263,7 +4263,11 @@ impl E1000 {
         // inside the e1000 BAR0 register window on every PCH part.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let ipcnfg = unsafe { self.mmio.read32(REG_IPCNFG) };
+        // SAFETY: EEER (0x0E30) is a 32-bit EEE control/status register
+        // inside the mapped BAR0 window on every PCH part.
         let eeer = unsafe { self.mmio.read32(REG_EEER) };
+        // SAFETY: STATUS (0x0008) is a 32-bit read-only status register
+        // inside the mapped BAR0 window on every PCH part.
         let status = unsafe { self.mmio.read32(REG_STATUS) };
         let partner = mmd_read(&self.mmio, EEE_MMD_DEV, EEE_MMD_LP_ADV)?;
         let partner2 = mmd_read(&self.mmio, EEE_MMD_DEV, EEE_MMD_LP_ADV2)?;
@@ -4315,6 +4319,8 @@ impl E1000 {
         // e1000 BAR0 register window on every PCH part.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let ipcnfg = unsafe { self.mmio.read32(REG_IPCNFG) };
+        // SAFETY: EEER (0x0E30) is a 32-bit EEE control/status register
+        // inside the mapped BAR0 window on every PCH part.
         let eeer = unsafe { self.mmio.read32(REG_EEER) };
         let ipcnfg_next = eee_ipcnfg_next(ipcnfg, advertised);
         let eeer_next = eee_eeer_next(eeer, enable);
