@@ -534,6 +534,18 @@ pub struct PumpCore {
     /// Remote Name Request Complete, or on a refused Command
     /// Status (no Complete follows a refusal).
     pending_name: Option<[u8; 6]>,
+    /// Handles with a host-initiated HCI Disconnect in flight, in
+    /// issue order (issue #1527): [`PumpCore::disconnect`] sends
+    /// HCI_Disconnect and records the handle here; the
+    /// Disconnection Complete removes it, or a refused Command
+    /// Status does (no Complete follows a refusal — same
+    /// discipline as `pending_name`). Command Status events arrive
+    /// in issue order (Vol 4 Part E §7.7.15: one status per
+    /// command, in order), so a refused status belongs to the
+    /// oldest entry. A second disconnect for a handle already
+    /// queued here is refused as already-disconnecting instead of
+    /// sending the controller a duplicate Disconnect.
+    disconnecting: VecDeque<u16>,
     /// Write_Inquiry_Mode mode awaiting its Command Complete;
     /// applied to `classic.inquiry_mode` only on success.
     pending_inquiry_mode: Option<u8>,
@@ -620,6 +632,7 @@ impl PumpCore {
             pending_page: None,
             pending_scan_mode: None,
             pending_name: None,
+            disconnecting: VecDeque::new(),
             pending_inquiry_mode: None,
             bonds: BondStore::new(),
             claimed: Vec::new(),
@@ -2226,7 +2239,58 @@ fn smp_fail_reason(err: &PairingError) -> u8 {
     }
 }
 
+/// Errors starting a host-initiated disconnect (issue #1527).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisconnectError {
+    /// No connection with this handle.
+    UnknownHandle,
+    /// An HCI Disconnect is already in flight for this handle.
+    AlreadyDisconnecting,
+    /// The transport rejected the HCI Disconnect.
+    Transport,
+}
+
 impl PumpCore {
+    /// Disconnect a connection by handle: issue HCI_Disconnect
+    /// (§7.1.6, reason Remote User Terminated Connection 0x13)
+    /// and record the handle as disconnecting until the
+    /// Disconnection Complete (§7.7.5) — or a refused Command
+    /// Status — resolves it. The mgmt DISCONNECT completion is
+    /// reported from the event handlers, not here: this only
+    /// proves the command was issued.
+    pub fn disconnect(&mut self, handle: u16) -> Result<(), DisconnectError> {
+        if self.connection(handle).is_none() {
+            return Err(DisconnectError::UnknownHandle);
+        }
+        if self.disconnecting.contains(&handle) {
+            return Err(DisconnectError::AlreadyDisconnecting);
+        }
+        self.send_command(
+            op::HCI_DISCONNECT,
+            &gap::build_disconnect(handle, gap::DISCONNECT_REASON_REMOTE_USER),
+        )
+        .map_err(|_| DisconnectError::Transport)?;
+        self.disconnecting.push_back(handle);
+        Ok(())
+    }
+
+    /// Resolve a refused HCI Disconnect Command Status: no
+    /// Disconnection Complete follows a refusal, so the oldest
+    /// in-flight disconnect completes as FAILED here instead of
+    /// hanging until the link dies another way. A successful
+    /// status is a no-op — the Disconnection Complete is the
+    /// completion. Only a mgmt DISCONNECT that is pending gets a
+    /// Command Complete ([`crate::mgmt::disconnect_complete`]
+    /// ignores anything else, e.g. an UNPAIR-driven disconnect).
+    fn on_disconnect_command_done(&mut self, opcode: u16, status: u8) {
+        if opcode != op::HCI_DISCONNECT || status == 0 {
+            return;
+        }
+        if let Some(handle) = self.disconnecting.pop_front() {
+            crate::mgmt::disconnect_complete(self.index, handle, crate::mgmt::STATUS_FAILED);
+        }
+    }
+
     /// Start an initiator pairing on an LE connection: emit the
     /// Pairing Request and park the new session on the connection.
     /// This is the application trigger — the kernel side of pairing
@@ -2771,6 +2835,19 @@ impl PumpCore {
                                 None
                             }
                         });
+                    // A host-initiated disconnect resolves here
+                    // (issue #1527): drop the in-flight record
+                    // wherever it sits in issue order and complete
+                    // the mgmt DISCONNECT — SUCCESS when the
+                    // controller tore the link down, FAILED when
+                    // the event itself reports the disconnect
+                    // failed. An UNPAIR-driven disconnect has no
+                    // pending mgmt record and completes nothing.
+                    let disconnecting = self
+                        .disconnecting
+                        .iter()
+                        .position(|h| *h == dc.handle)
+                        .and_then(|i| self.disconnecting.remove(i));
                     self.connections.retain(|c| c.handle != dc.handle);
                     self.sysfs_track_disconnect(dc.handle);
                     if self.central.connected_handle == Some(dc.handle) {
@@ -2784,6 +2861,17 @@ impl PumpCore {
                             self.index,
                             peer,
                             crate::mgmt::STATUS_DISCONNECTED,
+                        );
+                    }
+                    if disconnecting.is_some() {
+                        crate::mgmt::disconnect_complete(
+                            self.index,
+                            dc.handle,
+                            if dc.status == 0 {
+                                crate::mgmt::STATUS_SUCCESS
+                            } else {
+                                crate::mgmt::STATUS_FAILED
+                            },
                         );
                     }
                 }
@@ -2835,6 +2923,7 @@ impl PumpCore {
                     self.on_periodic_command_done(cs.opcode, cs.status);
                     self.on_ext_central_command_done(cs.opcode, cs.status);
                     self.on_ext_adv_command_done(cs.opcode, cs.status, None);
+                    self.on_disconnect_command_done(cs.opcode, cs.status);
                 }
             }
             code if code == EventCode::EncryptionChange as u8 => {
@@ -4508,6 +4597,13 @@ pub fn smp_initiate_pairing(index: usize, handle: u16) -> Option<Result<(), SmpI
 /// stored bond. See [`PumpCore::smp_start_encryption`].
 pub fn smp_start_encryption(index: usize, handle: u16) -> Option<Result<(), SmpEncryptError>> {
     with_core(index, |core| core.smp_start_encryption(handle))
+}
+
+/// Disconnect controller `index`'s connection `handle` by
+/// issuing HCI Disconnect (issue #1527). See
+/// [`PumpCore::disconnect`].
+pub fn disconnect(index: usize, handle: u16) -> Option<Result<(), DisconnectError>> {
+    with_core(index, |core| core.disconnect(handle))
 }
 
 /// Forget controller `index`'s bond for `peer_addr`.

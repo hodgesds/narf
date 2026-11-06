@@ -284,9 +284,9 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   — follow-ups to #823 — and any mgmt/userspace trigger for these
   calls (future lane).
   Pairing initiation (issue #888) is `pump::smp_initiate_pairing` (LE
-  Just Works initiator + bond store); host-initiated disconnect
-  remains out of scope (no backend — the mgmt DISCONNECT
-  remainder).
+  Just Works initiator + bond store); host-initiated disconnect is
+  `pump::disconnect` (issue #1527: HCI_Disconnect by handle, reason
+  0x13, resolved by the Disconnection Complete event).
 - `mgmt` — the Linux Bluetooth Management API
   (`HCI_CHANNEL_CONTROL`, issue #815). Set-mode ops issue real
   HCI through the controller transport and record the setting
@@ -314,8 +314,12 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   bounds). PAIR_DEVICE (LE Just Works only, existing connection
   required) returns Command Status now and Command Complete when
   the initiator session ends (SUCCESS / AUTH_FAILED /
-  DISCONNECTED); UNPAIR_DEVICE forgets the bond (idempotent) and
-  refuses disconnect=1 on a live connection (NOT_SUPPORTED).
+  DISCONNECTED); DISCONNECT (issue #1527, powered-only) is async
+  like PAIR_DEVICE — no immediate reply, Command Complete echoing
+  the address when the Disconnection Complete lands (or FAILED
+  when the controller refuses the HCI command); UNPAIR_DEVICE
+  forgets the bond (idempotent) and disconnects a live connection
+  first when disconnect=1.
   Known limits: mgmt issues its HCI synchronously, so while the
   pump task is draining the same transport a completion can be
   consumed by the pump instead (a single command path via the
