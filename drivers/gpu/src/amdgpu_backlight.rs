@@ -467,10 +467,10 @@ mod smoke_tests {
             return TestResult::Fail("full duty not 100%");
         }
         // A dead period carries no duty to scale against.
-        if percent_for_active_count(0x8000, 0) != None {
+        if percent_for_active_count(0x8000, 0).is_some() {
             return TestResult::Fail("zero period must be unrecoverable");
         }
-        if percent_for_active_count(0x8000, 0x0001_0000) != None {
+        if percent_for_active_count(0x8000, 0x0001_0000).is_some() {
             return TestResult::Fail("BITCNT-only period must be unrecoverable");
         }
         // Round-trip through the forward arithmetic, both at the
