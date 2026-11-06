@@ -1298,13 +1298,11 @@ fn usb4_dock_composed_end_to_end() -> TestResult {
     {
         return TestResult::Fail("dock: retimer NVM read-back");
     }
-    if run(retimer::nvm_authenticate(&mut m, 0, &dock_port, &rt)).is_err() {
-        return TestResult::Fail("dock: retimer NVM authenticate");
-    }
-    // Authentication unassigns the index; re-enumeration (as the
-    // production flow prescribes) restores the chain and reads
-    // the outcome back as a clean auth status.
-    let chain = match run(retimer::scan_link(&mut m, 0, &dock_port)) {
+    // Authentication unassigns the index; the production
+    // post-authentication flow re-enumerates (as the production
+    // flow prescribes) and records the outcome as a clean auth
+    // status on the restored chain.
+    let chain = match run(retimer::authenticate_and_rescan(&mut m, 0, &dock_port, &rt)) {
         Ok(chain) => chain,
         Err(_) => return TestResult::Fail("dock: retimer re-enumeration after auth"),
     };

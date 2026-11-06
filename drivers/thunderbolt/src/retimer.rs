@@ -22,9 +22,14 @@
 //! Configuration Enabling Decisions — the Phase 3 record of lane
 //! bonding, §4.1.1.3 — must agree with the router port's own, or the
 //! link is rejected with a typed error rather than silently treated
-//! as single-lane), the retimer NVM firmware-update surface
+//! as single-lane), the link-down scan (router offline mode plus
+//! `SET_INBOUND_SBTX`/`UNSET_INBOUND_SBTX` session management
+//! around a scan before training, for retimers on a link with
+//! nothing connected), the retimer NVM firmware-update surface
 //! (sector size, offset, 64-byte block writes, read-back, and the
-//! authenticate handshake) restricted to on-board retimers, and the
+//! authenticate handshake) restricted to on-board retimers, with
+//! the post-authentication re-enumeration that records the new
+//! `auth_status` after an authenticated restart, and the
 //! lane-margining Port Operations (capabilities, hardware and
 //! software runs, software error counters; USB4 v2.0 §8.3.2.4).
 //!
@@ -450,6 +455,51 @@ pub async fn enumerate_retimers(
     .await
 }
 
+/// Put the router port into offline mode (`offline` true) or bring
+/// it back online (`offline` false) — Linux
+/// `usb4_port_set_router_offline`. Metadata 0 takes the port
+/// offline, 1 brings it back; the `ROUTER_OFFLINE_MODE` opcode is
+/// then a raw write to the router's own SB space with no
+/// completion poll, like [`enumerate_retimers`]. Offline the port
+/// stops responding to hotplug events and the on-board retimers
+/// stay powered, so the sideband can reach them with no link
+/// trained; online restores normal operation. This is the
+/// precondition for a link-down scan ([`scan_link_down`]) and must
+/// be paired: a scan that fails still brings the port back online.
+pub async fn set_router_offline_mode(
+    ctl: &mut impl Config,
+    route: u64,
+    port: &super::topology::Port,
+    offline: bool,
+) -> Result<(), Error> {
+    if port.usb4_cap == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    let ch = SbChannel::router(route, port);
+    sb_write(ctl, ch, SB_METADATA, &[if offline { 0 } else { 1 }]).await?;
+    sb_write(ctl, ch, SB_OPCODE, &[OP_ROUTER_OFFLINE]).await
+}
+
+/// Put the router port into offline mode (see
+/// [`set_router_offline_mode`]).
+pub async fn router_offline_mode(
+    ctl: &mut impl Config,
+    route: u64,
+    port: &super::topology::Port,
+) -> Result<(), Error> {
+    set_router_offline_mode(ctl, route, port, true).await
+}
+
+/// Bring the router port back online (see
+/// [`set_router_offline_mode`]).
+pub async fn router_online_mode(
+    ctl: &mut impl Config,
+    route: u64,
+    port: &super::topology::Port,
+) -> Result<(), Error> {
+    set_router_offline_mode(ctl, route, port, false).await
+}
+
 /// Enable sideband transactions on a retimer's connector-facing
 /// side (`SET_INBOUND_SBTX`). Per the Re-Timer Specification the
 /// retimer is not required to answer the first command with an RT
@@ -515,6 +565,21 @@ pub async fn auth_status(
     }
 }
 
+/// The termination half of the chain check: a non-empty chain
+/// must end in a retimer that reports itself last, or the chain's
+/// true extent is unknown. Shared by the trained-link agreement
+/// check ([`check_agreement`]) and the link-down scan
+/// ([`scan_link_down`]), which has no trained link to agree with
+/// but still must not publish an unterminated chain.
+pub fn check_terminated(chain: &[Retimer]) -> Result<(), Error> {
+    if let Some(last) = chain.last() {
+        if !last.last {
+            return Err(Error::ChainNotTerminated);
+        }
+    }
+    Ok(())
+}
+
 /// The pure link-agreement check behind [`scan_link`]: a non-empty
 /// chain must terminate in a retimer that reports itself last, and
 /// every retimer's Phase 3 decision nibble must equal the router
@@ -522,11 +587,7 @@ pub async fn auth_status(
 /// not take part in lane bonding must never let the link be treated
 /// as bonded (or silently as single-lane) by assumption.
 pub fn check_agreement(router_decisions: u8, chain: &[Retimer]) -> Result<(), Error> {
-    if let Some(last) = chain.last() {
-        if !last.last {
-            return Err(Error::ChainNotTerminated);
-        }
-    }
+    check_terminated(chain)?;
     for retimer in chain {
         if retimer.decisions() != router_decisions {
             return Err(Error::BondingDisagreement {
@@ -539,12 +600,106 @@ pub fn check_agreement(router_decisions: u8, chain: &[Retimer]) -> Result<(), Er
     Ok(())
 }
 
+/// Read every retimer's NVM authentication status, immediately
+/// after enumeration and before any Port Operation touches the
+/// retimers — Linux `tb_retimer_nvm_authenticate_status`, called
+/// from `tb_retimer_scan` right after `usb4_port_enumerate_retimers`
+/// with the note "before doing anything else". The order is
+/// load-bearing: the Opcode register carries the authentication
+/// outcome (`ERR ` with the status in Metadata), and the first
+/// Port Operation completion on that retimer overwrites it — a
+/// status read after the `QUERY_LAST_RETIMER`/`QUERY_CABLE_RETIMER`
+/// probes would always report a clean 0, even for a retimer whose
+/// image failed to authenticate. Stops at the first index that
+/// does not answer; indices past the stop read as `None`.
+async fn read_auth_statuses(
+    ctl: &mut impl Config,
+    route: u64,
+    port: &super::topology::Port,
+) -> [Option<u32>; MAX_RETIMERS as usize] {
+    let mut statuses = [None; MAX_RETIMERS as usize];
+    for index in 1..=MAX_RETIMERS {
+        match auth_status(ctl, route, port, index).await {
+            Ok(status) => statuses[(index - 1) as usize] = Some(status),
+            Err(_) => break,
+        }
+    }
+    statuses
+}
+
+/// Read one retimer's identity record at `index`, with the
+/// authentication status already read by [`read_auth_statuses`].
+/// Returns `Ok(None)` when no retimer answers at the index — the
+/// chain end. Any other failure is a typed [`Error`]: a retimer
+/// that answers Vendor ID but then refuses or garbles a reply is
+/// a fault, never an empty chain.
+async fn read_retimer(
+    ctl: &mut impl Config,
+    route: u64,
+    port: &super::topology::Port,
+    index: u8,
+    auth: Option<u32>,
+) -> Result<Option<Retimer>, Error> {
+    let ch = SbChannel::retimer(route, port, index);
+    let vendor_id = match sb_read(ctl, ch, SB_VENDOR_ID, 4).await {
+        Ok(value) => value[0],
+        Err(Error::NoResponse) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let product_id = sb_read(ctl, ch, SB_PRODUCT_ID, 4).await?[0];
+    let fw_version = sb_read(ctl, ch, SB_FW_VERSION, 4).await?[0];
+    let conf = sb_read(ctl, ch, SB_LINK_CONF, 4).await?[0].to_le_bytes();
+    let last = port_op(ctl, ch, OP_QUERY_LAST_RETIMER, OP_TIMEOUT_MS).await? & 1 != 0;
+    let cable = port_op(ctl, ch, OP_QUERY_CABLE_RETIMER, OP_TIMEOUT_MS).await? & 1 != 0;
+    Ok(Some(Retimer {
+        index,
+        vendor_id,
+        product_id,
+        fw_version,
+        last,
+        cable,
+        auth_status: auth,
+        link_conf: [conf[0], conf[1], conf[2]],
+    }))
+}
+
+/// Probe indices 1..=[`MAX_RETIMERS`] with the authentication
+/// statuses from [`read_auth_statuses`], stopping at the first
+/// index that does not answer or at the retimer that reports
+/// itself last. Shared by the trained-link scan ([`scan_link`])
+/// and the link-down scan ([`scan_link_down`]); the scans differ
+/// in what wraps the probe (trained-link agreement vs offline
+/// mode plus sideband sessions), not in the probe itself.
+async fn probe_chain(
+    ctl: &mut impl Config,
+    route: u64,
+    port: &super::topology::Port,
+    auth: &[Option<u32>; MAX_RETIMERS as usize],
+) -> Result<Vec<Retimer>, Error> {
+    let mut chain = Vec::new();
+    for index in 1..=MAX_RETIMERS {
+        let Some(record) =
+            read_retimer(ctl, route, port, index, auth[(index - 1) as usize]).await?
+        else {
+            break;
+        };
+        let last = record.last;
+        chain.push(record);
+        if last {
+            break;
+        }
+    }
+    Ok(chain)
+}
+
 /// Enumerate the retimers on one trained link and verify them
 /// against the link's trained configuration. Issues the Broadcast
-/// RT enumeration, then probes indices 1..=[`MAX_RETIMERS`]: the
-/// first index that does not answer ends the chain, and each
-/// answering retimer's Vendor/Product/Firmware identity, last and
-/// cable status, authentication status and Link Configuration are
+/// RT enumeration, reads each retimer's authentication status
+/// immediately after it ([`read_auth_statuses`]), then probes
+/// indices 1..=[`MAX_RETIMERS`] ([`probe_chain`]): the first
+/// index that does not answer ends the chain, and each answering
+/// retimer's Vendor/Product/Firmware identity, last and cable
+/// status, authentication status and Link Configuration are
 /// recorded. The router port's own Link Configuration decisions
 /// are read first and every retimer must agree with them
 /// ([`check_agreement`]).
@@ -563,35 +718,87 @@ pub async fn scan_link(
     }
     let router_conf = sb_read(ctl, SbChannel::router(route, port), SB_LINK_CONF, 4).await?[0];
     enumerate_retimers(ctl, route, port).await?;
-    let mut chain = Vec::new();
+    let auth = read_auth_statuses(ctl, route, port).await;
+    let chain = probe_chain(ctl, route, port, &auth).await?;
+    check_agreement((router_conf & 0x0f) as u8, &chain)?;
+    Ok(chain)
+}
+
+/// Enumerate the retimers on one link with no trained link — the
+/// link-down scan, Linux `tb_retimer_scan` as driven by the
+/// offline/rescan flow (`usb4_port_offline` +
+/// `tb_retimer_scan(port, false)` + `usb4_port_router_online`).
+/// The sequence is: take the port offline ([`router_offline_mode`],
+/// so it stops responding to hotplug and the on-board retimers
+/// stay powered), issue the Broadcast RT enumeration, read the
+/// authentication statuses immediately after it, open an inbound
+/// sideband session on every retimer index
+/// (`SET_INBOUND_SBTX`, best-effort per index — a missing
+/// retimer answers No Response and the probe below is the
+/// authority on presence), probe the chain ([`probe_chain`]),
+/// close the opened sessions in reverse index order
+/// (`UNSET_INBOUND_SBTX`, best-effort — a retimer whose session
+/// failed to open has none to close, and one failed close must
+/// not strand the sessions still open behind it), and bring the
+/// port back online — on failure as well as on success, so a
+/// failed scan never strands the port offline or a session open.
+///
+/// There is no trained link here, so there is no Phase 3
+/// agreement to check: each retimer's Link Configuration is
+/// recorded as read but not interpreted, and only termination
+/// ([`check_terminated`]) is enforced. Agreement is enforced by
+/// the later trained-link [`scan_link`] once the link trains.
+///
+/// This is an explicit maintenance operation, not part of the
+/// periodic topology scan: taking a port offline on every pass
+/// would suppress hotplug and fight link training. The caller
+/// that drives it is the retimer firmware-update orchestration
+/// (issue #1122 item 1 — image supply and its userspace ABI),
+/// which is what needs a down-link scan with nothing connected.
+/// The platform power step Linux performs first
+/// (`tb_acpi_power_on_retimers`) has no NARF equivalent yet:
+/// this function assumes the retimers are already powered, and a
+/// link whose retimers are unpowered enumerates as an empty chain.
+pub async fn scan_link_down(
+    ctl: &mut impl Config,
+    route: u64,
+    port: &super::topology::Port,
+) -> Result<Vec<Retimer>, Error> {
+    if port.usb4_cap == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    router_offline_mode(ctl, route, port).await?;
+    let scanned = scan_link_down_inner(ctl, route, port).await;
+    match router_online_mode(ctl, route, port).await {
+        Ok(()) => scanned,
+        Err(online) => scanned.and(Err(online)),
+    }
+}
+
+/// The offline-mode body of [`scan_link_down`]: enumerate, read
+/// the authentication statuses, open the inbound sideband
+/// sessions, probe the chain, and close the sessions that were
+/// opened — in that order, with the close running whether the
+/// probe succeeded or failed.
+async fn scan_link_down_inner(
+    ctl: &mut impl Config,
+    route: u64,
+    port: &super::topology::Port,
+) -> Result<Vec<Retimer>, Error> {
+    enumerate_retimers(ctl, route, port).await?;
+    let auth = read_auth_statuses(ctl, route, port).await;
+    let mut opened = Vec::new();
     for index in 1..=MAX_RETIMERS {
-        let ch = SbChannel::retimer(route, port, index);
-        let vendor_id = match sb_read(ctl, ch, SB_VENDOR_ID, 4).await {
-            Ok(value) => value[0],
-            Err(Error::NoResponse) => break,
-            Err(error) => return Err(error),
-        };
-        let product_id = sb_read(ctl, ch, SB_PRODUCT_ID, 4).await?[0];
-        let fw_version = sb_read(ctl, ch, SB_FW_VERSION, 4).await?[0];
-        let conf = sb_read(ctl, ch, SB_LINK_CONF, 4).await?[0].to_le_bytes();
-        let last = port_op(ctl, ch, OP_QUERY_LAST_RETIMER, OP_TIMEOUT_MS).await? & 1 != 0;
-        let cable = port_op(ctl, ch, OP_QUERY_CABLE_RETIMER, OP_TIMEOUT_MS).await? & 1 != 0;
-        let auth = auth_status(ctl, route, port, index).await.ok();
-        chain.push(Retimer {
-            index,
-            vendor_id,
-            product_id,
-            fw_version,
-            last,
-            cable,
-            auth_status: auth,
-            link_conf: [conf[0], conf[1], conf[2]],
-        });
-        if last {
-            break;
+        if set_inbound_sbtx(ctl, route, port, index).is_ok() {
+            opened.push(index);
         }
     }
-    check_agreement((router_conf & 0x0f) as u8, &chain)?;
+    let scanned = probe_chain(ctl, route, port, &auth).await;
+    for index in opened.iter().rev() {
+        let _ = unset_inbound_sbtx(ctl, route, port, *index).await;
+    }
+    let chain = scanned?;
+    check_terminated(&chain)?;
     Ok(chain)
 }
 
@@ -743,6 +950,42 @@ pub async fn nvm_authenticate(
         &[OP_NVM_AUTH_WRITE],
     )
     .await
+}
+
+/// The restart settle the Linux admin guide advises after
+/// `nvm_authenticate` before re-enumeration: five seconds or more
+/// ("Upgrading on-board retimer NVM when there is no cable
+/// connected", docs.kernel.org/admin-guide/thunderbolt.html). The
+/// retimer restarts on the new image and is not addressable until
+/// it comes back. This is a caller obligation, not a sleep inside
+/// [`authenticate_and_rescan`]: the re-enumeration returns a typed
+/// error when the retimer has not come back yet, and the update
+/// orchestration (issue #1122 item 1) waits this long and retries.
+pub const AUTH_RESTART_SETTLE_MS: u64 = 5000;
+
+/// Authenticate a retimer's NVM image and re-enumerate the link,
+/// returning the fresh chain with each retimer's new `auth_status`
+/// recorded — the post-authentication bookkeeping. This is
+/// [`nvm_authenticate`] followed by [`scan_link`]: the restart
+/// unassigns the index, the re-enumeration restores the chain,
+/// and the authentication outcome is read back as part of the
+/// scan (see [`read_auth_statuses`]), so the recorded status is
+/// the outcome of this authentication, not a stale pre-auth
+/// value. Cable retimers are refused before any traffic
+/// ([`Error::CableRetimer`]).
+///
+/// The returned chain is the record the caller publishes against
+/// the link — the next periodic topology scan republishes it the
+/// same way — and a nonzero `auth_status` on the authenticated
+/// retimer is a failed authentication, not a clean one.
+pub async fn authenticate_and_rescan(
+    ctl: &mut impl Config,
+    route: u64,
+    port: &super::topology::Port,
+    retimer: &Retimer,
+) -> Result<Vec<Retimer>, Error> {
+    nvm_authenticate(ctl, route, port, retimer).await?;
+    scan_link(ctl, route, port).await
 }
 
 /// Which receiver lanes a lane-margining run covers (USB4 §8.3.2.4;
@@ -1150,6 +1393,18 @@ mod tests {
         rc_reads: bool,
         garbage_ops: bool,
         drop_first_inbound: bool,
+        /// Whether `ROUTER_OFFLINE_MODE` last took this (router)
+        /// device offline: Metadata 0 takes it offline, 1 brings
+        /// it back (Linux `usb4_port_set_router_offline`).
+        offline: bool,
+        /// The sequence of offline states this device was put in,
+        /// in order — the test's view of the offline/online
+        /// bracketing around a scan.
+        offline_log: Vec<bool>,
+        /// Whether an inbound sideband session is open on this
+        /// (retimer) device: set by `SET_INBOUND_SBTX`, cleared
+        /// by `UNSET_INBOUND_SBTX`.
+        sbtx: bool,
         /// Lane-margining capabilities returned by `RDCP`.
         margin_caps: [u32; 3],
         /// Hardware margining results returned by `RHMG`.
@@ -1195,6 +1450,9 @@ mod tests {
                 rc_reads: false,
                 garbage_ops: false,
                 drop_first_inbound: false,
+                offline: false,
+                offline_log: Vec::new(),
+                sbtx: false,
                 margin_caps: [0; 3],
                 hw_results: [0; 3],
                 sw_result: 0,
@@ -1223,6 +1481,15 @@ mod tests {
             }
             let result = if self.garbage_ops {
                 (0xdead_beef, 0)
+            } else if opcode == OP_ROUTER_OFFLINE {
+                // The router goes offline when Metadata stages 0
+                // and back online when it stages 1 (Linux
+                // `usb4_port_set_router_offline`); the operation
+                // is a raw write with no completion to poll, so
+                // it completes clean and the transition is logged.
+                self.offline = self.metadata == 0;
+                self.offline_log.push(self.offline);
+                (0, 0)
             } else if self.margining_unsupported
                 && matches!(
                     opcode,
@@ -1302,7 +1569,10 @@ mod tests {
                         }
                         (0, self.metadata)
                     }
-                    OP_SET_INBOUND_SBTX | OP_UNSET_INBOUND_SBTX => (0, 0),
+                    OP_SET_INBOUND_SBTX | OP_UNSET_INBOUND_SBTX => {
+                        self.sbtx = opcode == OP_SET_INBOUND_SBTX;
+                        (0, 0)
+                    }
                     OP_ENUMERATE_RETIMERS => (0, 0),
                     _ => (OP_ONS, 0),
                 }
@@ -1344,6 +1614,13 @@ mod tests {
         stuck_pnd: bool,
         cs1_writes: Vec<u32>,
         inbound_attempts: u8,
+        /// Every opcode written to an SB Opcode register, in
+        /// order — the operation sequence a scan drove, by
+        /// FourCC value (the `PORT_CS_1` command dwords alone
+        /// cannot tell `ROUTER_OFFLINE_MODE` from
+        /// `ENUMERATE_RE-TIMERS`: both are router-channel opcode
+        /// writes).
+        op_log: Vec<u32>,
     }
 
     impl SbModel {
@@ -1366,6 +1643,7 @@ mod tests {
                 stuck_pnd: false,
                 cs1_writes: Vec::new(),
                 inbound_attempts: 0,
+                op_log: Vec::new(),
             }
         }
 
@@ -1425,6 +1703,7 @@ mod tests {
                 }
                 match reg {
                     SB_OPCODE => {
+                        self.op_log.push(staged[0]);
                         let opcode = staged[0];
                         if let Some(device) = self.device_mut(load) {
                             device.execute_op(opcode);
@@ -2044,4 +2323,201 @@ mod tests {
         "drivers/thunderbolt/retimer",
         usb4_retimer_lane_margining_failures
     );
+
+    /// Link-down enumeration (issue #1122 item 2): with no trained
+    /// link the scan takes the port offline, enumerates, reads the
+    /// authentication statuses, opens an inbound sideband session
+    /// on every retimer index, probes the chain, closes the opened
+    /// sessions in reverse order, and brings the port back online
+    /// — Linux `tb_retimer_scan` as driven by the offline/rescan
+    /// flow. The operation sequence is pinned by FourCC, and the
+    /// recorded chain equals the one the trained-link scan returns
+    /// for the same devices.
+    fn usb4_retimer_link_down_scan() -> TestResult {
+        let mut m = SbModel::new();
+        m.retimers = alloc::vec![
+            device(0x8087, 0x1111, 0x0001_0000, false, 0x03),
+            device(0x0451, 0x2222, 0x0002_0000, true, 0x03),
+        ];
+        let port = link_port();
+        let chain = match run(scan_link_down(&mut m, 0, &port)) {
+            Ok(chain) => chain,
+            Err(_) => return TestResult::Fail("link-down scan did not enumerate"),
+        };
+        if chain.len() != 2
+            || chain[0].index != 1
+            || chain[0].vendor_id != 0x8087
+            || chain[0].product_id != 0x1111
+            || chain[0].fw_version != 0x0001_0000
+            || chain[0].last
+            || chain[0].cable
+            || chain[0].auth_status != Some(0)
+            || !chain[0].lane1_enabled()
+            || chain[1].index != 2
+            || chain[1].vendor_id != 0x0451
+            || chain[1].product_id != 0x2222
+            || chain[1].fw_version != 0x0002_0000
+            || !chain[1].last
+        {
+            return TestResult::Fail("link-down chain records are not two distinct retimers");
+        }
+        // The same devices through the trained-link scan record
+        // the same chain: the down scan is the same probe, only
+        // the session around it differs.
+        let mut up = SbModel::new();
+        up.retimers = alloc::vec![
+            device(0x8087, 0x1111, 0x0001_0000, false, 0x03),
+            device(0x0451, 0x2222, 0x0002_0000, true, 0x03),
+        ];
+        if run(scan_link(&mut up, 0, &port)) != Ok(chain.clone()) {
+            return TestResult::Fail("link-down chain differs from the trained-link chain");
+        }
+        // The port is back online (offline then online, in that
+        // order) and every opened session is closed.
+        if m.router.offline || m.router.offline_log != alloc::vec![true, false] {
+            return TestResult::Fail("link-down scan did not bracket the port offline/online");
+        }
+        if m.retimers.iter().any(|device| device.sbtx) {
+            return TestResult::Fail("link-down scan left an inbound sideband session open");
+        }
+        // Offline, enumerate, one `SET_INBOUND_SBTX` per present
+        // retimer plus two attempts per absent index (the
+        // first-attempt No Response retry), the last/cable probes,
+        // the sessions closed in reverse index order, online.
+        let expected: Vec<u32> = alloc::vec![
+            OP_ROUTER_OFFLINE,
+            OP_ENUMERATE_RETIMERS,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_QUERY_LAST_RETIMER,
+            OP_QUERY_CABLE_RETIMER,
+            OP_QUERY_LAST_RETIMER,
+            OP_QUERY_CABLE_RETIMER,
+            OP_UNSET_INBOUND_SBTX,
+            OP_UNSET_INBOUND_SBTX,
+            OP_ROUTER_OFFLINE,
+        ];
+        if m.op_log != expected {
+            return TestResult::Fail("link-down operation sequence is not the offline/rescan flow");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/thunderbolt/retimer", usb4_retimer_link_down_scan);
+
+    /// A failed link-down scan still restores the port: an
+    /// unterminated chain errors, and the opened session is closed
+    /// and the port brought back online anyway.
+    fn usb4_retimer_link_down_scan_failure_restores_online() -> TestResult {
+        let mut m = SbModel::new();
+        m.retimers = alloc::vec![device(0x8087, 0x1111, 0x0001_0000, false, 0x03)];
+        let port = link_port();
+        if run(scan_link_down(&mut m, 0, &port)) != Err(Error::ChainNotTerminated) {
+            return TestResult::Fail("unterminated link-down chain was not a typed error");
+        }
+        if m.router.offline || m.router.offline_log != alloc::vec![true, false] {
+            return TestResult::Fail("failed link-down scan stranded the port offline");
+        }
+        if m.retimers.iter().any(|device| device.sbtx) {
+            return TestResult::Fail("failed link-down scan left an inbound session open");
+        }
+        // Offline, enumerate, one `SET_INBOUND_SBTX` for the
+        // present retimer plus two attempts per absent index, the
+        // probes, the one opened session closed, online.
+        let expected: Vec<u32> = alloc::vec![
+            OP_ROUTER_OFFLINE,
+            OP_ENUMERATE_RETIMERS,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_SET_INBOUND_SBTX,
+            OP_QUERY_LAST_RETIMER,
+            OP_QUERY_CABLE_RETIMER,
+            OP_UNSET_INBOUND_SBTX,
+            OP_ROUTER_OFFLINE,
+        ];
+        if m.op_log != expected {
+            return TestResult::Fail("failed link-down scan did not close its session");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/thunderbolt/retimer",
+        usb4_retimer_link_down_scan_failure_restores_online
+    );
+
+    /// Post-authentication bookkeeping (issue #1122 item 5): after
+    /// an authenticated restart the re-enumeration records the
+    /// retimer's NEW authentication status — including a nonzero
+    /// failure status. The status is read immediately after
+    /// enumeration, before any Port Operation completion can
+    /// overwrite the Opcode register with a clean 0: with the old
+    /// read order this test recorded `Some(0)` for a retimer
+    /// whose image failed to authenticate.
+    fn usb4_retimer_post_auth_rescan() -> TestResult {
+        if AUTH_RESTART_SETTLE_MS != 5000 {
+            return TestResult::Fail("post-auth restart settle is not the Linux 5 s guidance");
+        }
+        let mut m = SbModel::new();
+        let mut on_board = device(0x8087, 0x1111, 0x0001_0000, true, 0x03);
+        on_board.sector_size = 0x1000;
+        on_board.nvm = alloc::vec![0; 0x1000];
+        // The new image fails validation with status 0x2a.
+        on_board.auth_code = 0x2a;
+        m.retimers = alloc::vec![on_board];
+        let port = link_port();
+        let chain = match run(scan_link(&mut m, 0, &port)) {
+            Ok(chain) => chain,
+            Err(_) => return TestResult::Fail("post-auth fixture chain did not enumerate"),
+        };
+        let rt = &chain[0];
+        let image: Vec<u8> = (0..64u32).map(|i| (i as u8) ^ 0x5a).collect();
+        if run(nvm_write(&mut m, 0, &port, rt, 0, &image)).is_err() {
+            return TestResult::Fail("post-auth NVM block write");
+        }
+        let chain = match run(authenticate_and_rescan(&mut m, 0, &port, rt)) {
+            Ok(chain) => chain,
+            Err(_) => return TestResult::Fail("post-auth re-enumeration failed"),
+        };
+        if chain.len() != 1
+            || chain[0].vendor_id != 0x8087
+            || chain[0].product_id != 0x1111
+            || chain[0].fw_version != 0x0001_0000
+            || !chain[0].last
+            || chain[0].auth_status != Some(0x2a)
+        {
+            return TestResult::Fail("post-auth chain did not record the failed auth status");
+        }
+        // A cable retimer refuses the whole flow before any
+        // traffic — authentication is an on-board operation.
+        let cable = Retimer {
+            index: 2,
+            vendor_id: 0x0451,
+            product_id: 0x2222,
+            fw_version: 0,
+            last: true,
+            cable: true,
+            auth_status: None,
+            link_conf: [0x03, 0x10, 0x01],
+        };
+        if run(authenticate_and_rescan(&mut m, 0, &port, &cable)) != Err(Error::CableRetimer) {
+            return TestResult::Fail("cable retimer accepted post-auth re-enumeration");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/thunderbolt/retimer", usb4_retimer_post_auth_rescan);
 }
