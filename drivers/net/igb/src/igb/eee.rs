@@ -318,7 +318,7 @@ mod tests {
         }
 
         fn phy_value(&self, reg: u8) -> u16 {
-            if reg == PHY_MMDAAD && self.mmd_dev.borrow() & 0x4000 != 0 {
+            if reg == PHY_MMDAAD && *self.mmd_dev.borrow() & 0x4000 != 0 {
                 *self
                     .mmd
                     .borrow()
