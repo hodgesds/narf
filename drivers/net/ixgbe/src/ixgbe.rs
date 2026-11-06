@@ -110,7 +110,14 @@ pub(crate) const REG_FCTRL: u64 = 0x05080;
 pub(crate) const REG_RAL0: u64 = 0x0A200; // 82599 receive-address regs §8.2.3.7.9
 pub(crate) const REG_RAH0: u64 = 0x0A204;
 pub(crate) const REG_RXCTRL: u64 = 0x03000;
-pub(crate) const REG_LINKS: u64 = 0x04200;
+/// LINKS (82599 datasheet §8.2.3.22.20; the same offset Linux's
+/// `IXGBE_LINKS` uses for 82599/X540/X550). Was 0x04200 — that is
+/// PCS1GCFIG (§8.2.3.22.1), whose bit 30 is PCS_isolate, not
+/// link-up, so every LINKS consumer (probe seed, resume refresh,
+/// queue-0 pump observer) read a config bit that never moves with
+/// the cable and carrier could never come up on silicon
+/// (issue #791).
+pub(crate) const REG_LINKS: u64 = 0x042A4;
 
 // All queue registers come from queues::rx_queue_regs/tx_queue_regs
 // (datasheet §8.2, stride 0x40 per queue); the tx/rx paths index
@@ -131,8 +138,15 @@ pub(crate) const FCTRL_MPE: u32 = 1 << 8;
 // RXCTRL bits.
 pub(crate) const RXCTRL_RXEN: u32 = 1 << 0;
 
-// LINKS bits.
+// LINKS bits (82599 datasheet §8.2.3.22.20).
 pub(crate) const LINKS_UP: u32 = 1 << 30;
+/// LINK_SPEED field (bits 29:28): 00b Reserved, 01b 100 Mb/s,
+/// 10b 1 GbE, 11b 10 GbE. The field is MAC link speed, not a PHY
+/// rate — no PHY work (#790) is needed to report it.
+pub(crate) const LINKS_SPEED_MASK: u32 = 0b11 << 28;
+pub(crate) const LINKS_SPEED_100: u32 = 0b01 << 28;
+pub(crate) const LINKS_SPEED_1000: u32 = 0b10 << 28;
+pub(crate) const LINKS_SPEED_10000: u32 = 0b11 << 28;
 
 // RAH bits — Address-Valid; programmed when we plumb the MAC into RAH/RAL.
 #[allow(dead_code)]
@@ -2718,12 +2732,32 @@ fn ixgbe_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     ctrl.tx(frame, &meta).map_err(|_| ())
 }
 
-/// Decode a `LINKS` word into a publication sample. LINKS reports
-/// carrier in-band; its speed encoding is not decoded anywhere in the
-/// tree yet (PHY work, issue #790), so the sample is carrier-only
-/// rather than a guessed rate.
+/// Decode a `LINKS` word into a publication sample (82599
+/// datasheet §8.2.3.22.20: bit 30 Link Up, bits 29:28 LINK_SPEED
+/// 01b = 100 Mb/s, 10b = 1 GbE, 11b = 10 GbE, 00b Reserved).
+/// Speed is MAC link speed, so it needs no PHY decode (#790).
+/// Duplex stays `None`: LINKS reports no duplex bit, and the
+/// 82599's link modes (KX/KR/SFI/SGMII) carry no half-duplex
+/// state to publish — the sample says what the register proves
+/// and nothing more.
 fn ixgbe_link_sample(links: u32) -> crate::publish::LinkSample {
-    crate::publish::LinkSample::carrier_only(links & LINKS_UP != 0)
+    if links & LINKS_UP == 0 {
+        return crate::publish::LinkSample::DOWN;
+    }
+    let speed_mbps = match links & LINKS_SPEED_MASK {
+        LINKS_SPEED_100 => Some(100),
+        LINKS_SPEED_1000 => Some(1000),
+        LINKS_SPEED_10000 => Some(10000),
+        // 00b Reserved: carrier is real, the rate is not proven.
+        _ => None,
+    };
+    crate::publish::LinkSample {
+        carrier: true,
+        speed_mbps,
+        duplex: None,
+        media_available: None,
+        phy_type: None,
+    }
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {

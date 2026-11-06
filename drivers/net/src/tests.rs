@@ -2049,6 +2049,8 @@ fn smoke_netdev_carrier_transitions() -> TestResult {
             carrier: true,
             speed_mbps: Some(1000),
             duplex: Some(narf_net::iface::LinkDuplex::Full),
+            media_available: None,
+            phy_type: None,
         },
     ) {
         return TestResult::Fail("publish_link rejected the up transition");
@@ -2071,6 +2073,88 @@ fn smoke_netdev_carrier_transitions() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/core", smoke_netdev_carrier_transitions);
+
+fn smoke_netdev_media_publication() -> TestResult {
+    use crate::publish::{publish_link, publish_netdev, LinkSample};
+    // The media contract (issue #791 / #867): a sample carrying
+    // module state lands it in iface metadata, and a carrier-down
+    // sample keeps it — a seated SFP+ with no link is not an
+    // empty cage, and the stack must be able to tell.
+    let name = publish_netdev(
+        [0x02, 0x78, 0x40, 0x00, 0x00, 0x04],
+        fixture_send_a,
+        LinkSample::DOWN,
+    );
+    let Some(down0) = narf_net::iface::lookup(&name) else {
+        return TestResult::Fail("media fixture iface missing after publish");
+    };
+    if down0.media_available.is_some() || down0.phy_type.is_some() {
+        return TestResult::Fail("media fixture did not start unknown");
+    }
+    if !publish_link(
+        &name,
+        LinkSample {
+            carrier: true,
+            speed_mbps: Some(10000),
+            duplex: None,
+            media_available: Some(true),
+            phy_type: Some(0x07),
+        },
+    ) {
+        return TestResult::Fail("publish_link rejected the media up sample");
+    }
+    let Some(up) = narf_net::iface::lookup(&name) else {
+        return TestResult::Fail("media fixture iface missing after up");
+    };
+    if up.media_available != Some(true) || up.phy_type != Some(0x07) {
+        return TestResult::Fail("media state did not reach iface metadata");
+    }
+    // Link down, module still seated: carrier and speed clear,
+    // media and PHY type survive.
+    if !publish_link(
+        &name,
+        LinkSample {
+            carrier: false,
+            speed_mbps: None,
+            duplex: None,
+            media_available: Some(true),
+            phy_type: Some(0x07),
+        },
+    ) {
+        return TestResult::Fail("publish_link rejected the media down sample");
+    }
+    let Some(down1) = narf_net::iface::lookup(&name) else {
+        return TestResult::Fail("media fixture iface missing after down");
+    };
+    if down1.carrier || down1.speed_mbps.is_some() {
+        return TestResult::Fail("down sample did not clear carrier and speed");
+    }
+    if down1.media_available != Some(true) || down1.phy_type != Some(0x07) {
+        return TestResult::Fail("down sample dropped the seated-module state");
+    }
+    // Empty cage: media flips to absent, and the PHY type of the
+    // removed module clears with it — an empty cage has no type.
+    if !publish_link(
+        &name,
+        LinkSample {
+            carrier: false,
+            speed_mbps: None,
+            duplex: None,
+            media_available: Some(false),
+            phy_type: None,
+        },
+    ) {
+        return TestResult::Fail("publish_link rejected the empty-cage sample");
+    }
+    let Some(cage) = narf_net::iface::lookup(&name) else {
+        return TestResult::Fail("media fixture iface missing after cage sample");
+    };
+    if cage.media_available != Some(false) || cage.phy_type.is_some() {
+        return TestResult::Fail("empty-cage sample did not land media state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/core", smoke_netdev_media_publication);
 
 // ── RX dispatch mirror contract (issue #784) ──────────────────────
 //

@@ -1180,20 +1180,54 @@ static LSC_PENDING: AtomicBool = AtomicBool::new(false);
 /// mailbox pump step — same shape as `LSC_PENDING` (issue #1253).
 static MB_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// The family's publication sample. i210/82576/i350 negotiate up to
-/// 1 GbE copper; report full duplex when the link is up (QEMU's igb
-/// model reports LU immediately). Shared by probe (initial state) and
-/// the RX pump's LSC drain (every transition).
-fn igb_link_sample(dev: &Igb) -> crate::publish::LinkSample {
-    if dev.link_up() {
-        crate::publish::LinkSample {
-            carrier: true,
-            speed_mbps: Some(1000),
-            duplex: Some(narf_net::iface::LinkDuplex::Full),
-        }
-    } else {
-        crate::publish::LinkSample::DOWN
+/// STATUS bits (Intel 82576 datasheet §8.2.2; same register on
+/// 82575/i210/i350). FD/LU/SPEED are what the LSC drain and probe
+/// publish — the speed field is the negotiated link rate, not a
+/// headline maximum.
+const STATUS_FD: u32 = 1 << 0;
+const STATUS_LU: u32 = 1 << 1;
+/// SPEED field (bits 7:6): 00b = 10 Mb/s, 01b = 100 Mb/s,
+/// 10b = 1000 Mb/s, 11b = 1000 Mb/s.
+const STATUS_SPEED_MASK: u32 = 0b11 << 6;
+const STATUS_SPEED_100: u32 = 0b01 << 6;
+const STATUS_SPEED_1000: u32 = 0b10 << 6;
+const STATUS_SPEED_1000_ALT: u32 = 0b11 << 6;
+
+/// Decode a STATUS word into a publication sample (82576
+/// datasheet §8.2.2). Shared by probe (initial state) and the RX
+/// pump's LSC drain (every transition). Was a hardcoded
+/// 1000/Full whenever LU read — a 10/100M link was published as
+/// 1 GbE full duplex (issue #791).
+fn igb_link_sample_from_status(status: u32) -> crate::publish::LinkSample {
+    if status & STATUS_LU == 0 {
+        return crate::publish::LinkSample::DOWN;
     }
+    let speed_mbps = match status & STATUS_SPEED_MASK {
+        STATUS_SPEED_1000 | STATUS_SPEED_1000_ALT => 1000,
+        STATUS_SPEED_100 => 100,
+        _ => 10,
+    };
+    let duplex = if status & STATUS_FD != 0 {
+        narf_net::iface::LinkDuplex::Full
+    } else {
+        narf_net::iface::LinkDuplex::Half
+    };
+    crate::publish::LinkSample {
+        carrier: true,
+        speed_mbps: Some(speed_mbps),
+        duplex: Some(duplex),
+        // STATUS reports no media state; igb parts are fixed
+        // copper/fiber/SerDes, not caged modules (issue #791).
+        media_available: None,
+        phy_type: None,
+    }
+}
+
+/// The family's publication sample: one STATUS read, decoded.
+/// Shared by probe (initial state) and the RX pump's LSC drain
+/// (every transition).
+fn igb_link_sample(dev: &Igb) -> crate::publish::LinkSample {
+    igb_link_sample_from_status(dev.read_status())
 }
 
 fn igb_isr() {
@@ -2937,10 +2971,17 @@ impl Igb {
         Ok(())
     }
 
+    /// Read STATUS (0x0008) once. The LSC drain and probe publish
+    /// through [`igb_link_sample_from_status`]; [`Self::link_up`]
+    /// is the LU-only view of the same word.
+    pub fn read_status(&self) -> u32 {
+        // SAFETY: mapped MMIO; STATUS is inside the igb register window.
+        unsafe { self.mmio.read32(REG_STATUS) }
+    }
+
     pub fn link_up(&self) -> bool {
-        // SAFETY: mapped MMIO; STATUS bit 1 = LU (link up).
-        let s = unsafe { self.mmio.read32(REG_STATUS) };
-        s & (1 << 1) != 0
+        // STATUS bit 1 = LU (link up).
+        self.read_status() & STATUS_LU != 0
     }
 
     fn tx_desc_done(&self, slot: usize) -> bool {
@@ -5120,4 +5161,52 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_tx_timeout_recovery_fixture);
+
+    /// STATUS decode fixture (issue #791). The words are built
+    /// from the Intel 82576 datasheet §8.2.2 (STATUS 0x00008:
+    /// FD bit 0, LU bit 1, SPEED bits 7:6 — 00b = 10 Mb/s,
+    /// 01b = 100 Mb/s, 10b/11b = 1000 Mb/s) — never from the
+    /// driver's old hardcoded 1000/Full sample, so a 10/100M
+    /// link published as 1 GbE fails here instead of on silicon.
+    fn smoke_igb_status_link_sample() -> TestResult {
+        use super::{
+            igb_link_sample_from_status, STATUS_FD, STATUS_LU, STATUS_SPEED_100, STATUS_SPEED_1000,
+            STATUS_SPEED_1000_ALT,
+        };
+        let up_1g = igb_link_sample_from_status(STATUS_LU | STATUS_FD | STATUS_SPEED_1000);
+        if !up_1g.carrier
+            || up_1g.speed_mbps != Some(1000)
+            || up_1g.duplex != Some(narf_net::iface::LinkDuplex::Full)
+        {
+            return TestResult::Fail("1G full-duplex STATUS word decoded wrong");
+        }
+        // The 11b encoding is 1000 Mb/s too (datasheet §8.2.2),
+        // not the 10 Mb/s e1000's catch-all would give it.
+        let up_1g_alt = igb_link_sample_from_status(STATUS_LU | STATUS_FD | STATUS_SPEED_1000_ALT);
+        if !up_1g_alt.carrier || up_1g_alt.speed_mbps != Some(1000) {
+            return TestResult::Fail("11b STATUS speed must decode 1000 Mb/s");
+        }
+        let up_100m = igb_link_sample_from_status(STATUS_LU | STATUS_SPEED_100);
+        if !up_100m.carrier
+            || up_100m.speed_mbps != Some(100)
+            || up_100m.duplex != Some(narf_net::iface::LinkDuplex::Half)
+        {
+            return TestResult::Fail("100M half-duplex STATUS word decoded wrong");
+        }
+        // SPEED 00b, FD clear: 10 Mb/s half duplex.
+        let up_10m = igb_link_sample_from_status(STATUS_LU);
+        if !up_10m.carrier
+            || up_10m.speed_mbps != Some(10)
+            || up_10m.duplex != Some(narf_net::iface::LinkDuplex::Half)
+        {
+            return TestResult::Fail("10M STATUS word decoded wrong");
+        }
+        // LU clear, whatever the speed field says: DOWN, no speed.
+        let down = igb_link_sample_from_status(STATUS_FD | STATUS_SPEED_1000);
+        if down.carrier || down.speed_mbps.is_some() {
+            return TestResult::Fail("link-down STATUS word must decode DOWN");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_status_link_sample);
 }

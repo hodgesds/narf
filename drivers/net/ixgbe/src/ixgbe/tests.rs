@@ -5699,3 +5699,49 @@ fn smoke_ixgbe_tx_timeout_recovery_fixture() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_timeout_recovery_fixture);
+
+/// LINKS decode + register-offset fixture (issue #791). The words
+/// are built from the 82599 datasheet §8.2.3.22.20 (LINKS at
+/// 0x042A4: bit 30 Link Up, bits 29:28 LINK_SPEED 01b = 100 Mb/s,
+/// 10b = 1 GbE, 11b = 10 GbE, 00b Reserved) — never from the
+/// driver's own constants, so a wrong offset or a wrong speed
+/// table fails here instead of on silicon. The offset case is
+/// pinned by asserting the constant itself: 0x04200 is PCS1GCFIG
+/// (§8.2.3.22.1), whose bit 30 is PCS_isolate and never moves with
+/// the cable.
+fn smoke_ixgbe_links_decode() -> TestResult {
+    use super::{
+        ixgbe_link_sample, LINKS_SPEED_100, LINKS_SPEED_1000, LINKS_SPEED_10000, LINKS_UP,
+        REG_LINKS,
+    };
+    if REG_LINKS != 0x042A4 {
+        return TestResult::Fail("REG_LINKS is not the datasheet LINKS offset 0x042A4");
+    }
+    // 10G link up: carrier + 10000, no duplex claim (LINKS has
+    // no duplex bit).
+    let up_10g = ixgbe_link_sample(LINKS_UP | LINKS_SPEED_10000);
+    if !up_10g.carrier || up_10g.speed_mbps != Some(10000) || up_10g.duplex.is_some() {
+        return TestResult::Fail("10G LINKS word decoded wrong");
+    }
+    let up_1g = ixgbe_link_sample(LINKS_UP | LINKS_SPEED_1000);
+    if !up_1g.carrier || up_1g.speed_mbps != Some(1000) {
+        return TestResult::Fail("1G LINKS word decoded wrong");
+    }
+    let up_100m = ixgbe_link_sample(LINKS_UP | LINKS_SPEED_100);
+    if !up_100m.carrier || up_100m.speed_mbps != Some(100) {
+        return TestResult::Fail("100M LINKS word decoded wrong");
+    }
+    // Reserved speed encoding: carrier is real, the rate is not
+    // proven — never invent one.
+    let up_reserved = ixgbe_link_sample(LINKS_UP);
+    if !up_reserved.carrier || up_reserved.speed_mbps.is_some() {
+        return TestResult::Fail("reserved LINKS speed must not invent a rate");
+    }
+    // Link down, whatever the speed field says: DOWN, no speed.
+    let down = ixgbe_link_sample(LINKS_SPEED_10000);
+    if down.carrier || down.speed_mbps.is_some() {
+        return TestResult::Fail("link-down LINKS word must decode DOWN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_links_decode);

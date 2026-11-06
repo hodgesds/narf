@@ -250,13 +250,24 @@ async fn delay(ms: u64) {
 }
 
 /// Publication sample for a decoded AQ link status (issue #791):
-/// carrier + negotiated speed into `iface` metadata. The metadata
-/// schema has no media / phy_type fields, so those two stay
-/// unpublished — tracked by the follow-up issue referenced from the
-/// PR body.
+/// carrier + negotiated speed + module/media state into `iface`
+/// metadata. Media is carrier-independent on purpose: a seated
+/// SFP+ with no link still publishes `media_available = Some(true)`
+/// (and the down sample keeps it), while an empty cage publishes
+/// `Some(false)` — the distinction #791's endpoint requires.
+/// `phy_type` stays the raw AQ byte; decoding it to a name is
+/// #867's table work.
 pub(super) fn link_sample(status: LinkStatus) -> crate::publish::LinkSample {
+    let media_available = Some(status.media_available);
+    let phy_type = Some(status.phy_type);
     if !status.link_up {
-        return crate::publish::LinkSample::DOWN;
+        return crate::publish::LinkSample {
+            carrier: false,
+            speed_mbps: None,
+            duplex: None,
+            media_available,
+            phy_type,
+        };
     }
     let speed_mbps = match status.speed() {
         LinkSpeed::Speed100Mb => Some(100),
@@ -273,6 +284,8 @@ pub(super) fn link_sample(status: LinkStatus) -> crate::publish::LinkSample {
         carrier: true,
         speed_mbps,
         duplex: None,
+        media_available,
+        phy_type,
     }
 }
 
