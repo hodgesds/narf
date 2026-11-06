@@ -2315,9 +2315,9 @@ pub unsafe fn ahci_read_lba_xfer(
     // visible; fence so the bulk copy cannot be hoisted above it.
     compiler_fence(Ordering::Acquire);
     // SAFETY: `data_buf` is the base of the DMA area the HBA filled
-    // with the read payload (n_sectors*512 ≤ SCRATCH_DATA_MAX and
+    // with the read payload (n_sectors*512 ≤ stage.cap and
     // ≤ out.len(), both checked at entry); `out` is a kernel slice
-    // that cannot overlap the identity-mapped scratch page. Bulk copy
+    // that cannot overlap the staging region. Bulk copy
     // rather than a per-byte volatile loop: the payload is coherent
     // DMA memory, not MMIO, and per-byte volatility defeats
     // vectorisation on the hottest path in the system.
@@ -2334,14 +2334,46 @@ pub unsafe fn ahci_read_lba_xfer(
     Ok(())
 }
 
+/// Pick the staging region for one chunk of `chunk_sectors`
+/// sectors (#978): a chunk that fits the scratch page's data area
+/// keeps using it (no transfer-buffer allocation for small
+/// transfers); a larger chunk stages through the per-controller
+/// transfer buffer ([`AHCI_XFER_BYTES`], #930). Returns `None`
+/// when a bulk chunk has no transfer buffer (allocation failure).
+fn chunk_stage(ahci: &Ahci, chunk_sectors: u16) -> Option<DmaStage> {
+    if (chunk_sectors as usize) * 512 <= SCRATCH_DATA_MAX {
+        Some(DmaStage {
+            phys: ahci.scratch_phys() + SCRATCH_DATA_OFF as u64,
+            cap: SCRATCH_DATA_MAX,
+        })
+    } else {
+        let phys = ahci.xfer_phys();
+        if phys == 0 {
+            None
+        } else {
+            Some(DmaStage {
+                phys,
+                cap: AHCI_XFER_BYTES,
+            })
+        }
+    }
+}
+
 /// IRQ-driven sibling of [`ahci_read_lba`]. Identical wire-form +
-/// DMA-scratch shape; the only difference is that completion is
-/// signalled by an MSI-X / MSI / INTx interrupt walked by
-/// [`ahci_isr`] instead of by the host spin-polling PORT_CI.
+/// DMA shape; the only difference is that completion is signalled
+/// by an MSI-X / MSI / INTx interrupt walked by [`ahci_isr`]
+/// instead of by the host spin-polling PORT_CI.
 ///
 /// Falls back to spin-polling when no IRQ path is wired (i.e. when
 /// `AHCI_IRQ_VECTOR` is 0). This keeps the function safe to call
 /// even when MSI-X / MSI / INTx negotiation failed at probe.
+///
+/// Bulk transfers chunk at [`AHCI_XFER_BYTES`] (256 sectors) over
+/// the per-controller transfer buffer (#978 — the same treatment
+/// the sync block path got in #930); chunks that fit the scratch
+/// page's data area keep using it. Chunks complete sequentially,
+/// so the staging buffer is never shared between two in-flight
+/// commands.
 ///
 /// # Safety
 /// Same as [`ahci_read_lba`].
@@ -2352,7 +2384,54 @@ pub async unsafe fn ahci_read_lba_async(
     n_sectors: u16,
     out: &mut [u8],
 ) -> Result<(), AhciError> {
-    if n_sectors == 0 || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX {
+    if n_sectors == 0 || out.len() < (n_sectors as usize) * 512 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let mut done: u16 = 0;
+    while done < n_sectors {
+        let want = XFER_SECTORS.min(n_sectors - done);
+        let off = done as usize * 512;
+        let stage = match chunk_stage(ahci, want) {
+            Some(stage) => stage,
+            None => return Err(AhciError::BarMapFailed),
+        };
+        // SAFETY: forwarded caller contract; chunks complete
+        // sequentially, so the per-controller staging buffer is
+        // never shared between two in-flight commands.
+        unsafe {
+            ahci_read_lba_async_xfer(
+                ahci,
+                port_idx,
+                lba + done as u64,
+                want,
+                &mut out[off..off + want as usize * 512],
+                stage,
+            )
+            .await
+        }?;
+        done += want;
+    }
+    Ok(())
+}
+
+/// Shared READ DMA EXT body for [`ahci_read_lba_async`]: one chunk
+/// of at most `stage.cap` bytes, staged in `stage` — the scratch
+/// page's data area for small chunks, the per-controller transfer
+/// buffer for bulk ones (#978). Single PRDT entry, so
+/// `n_sectors * 512 <= stage.cap`.
+///
+/// # Safety
+/// Same as [`ahci_read_lba`]; `stage` must name a coherent DMA
+/// region of at least `stage.cap` bytes owned by `ahci`.
+pub async unsafe fn ahci_read_lba_async_xfer(
+    ahci: &Ahci,
+    port_idx: u8,
+    lba: u64,
+    n_sectors: u16,
+    out: &mut [u8],
+    stage: DmaStage,
+) -> Result<(), AhciError> {
+    if n_sectors == 0 || (n_sectors as usize) * 512 > stage.cap {
         return Err(AhciError::BarMapFailed);
     }
     if out.len() < (n_sectors as usize) * 512 {
@@ -2373,15 +2452,17 @@ pub async unsafe fn ahci_read_lba_async(
     let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
-    let data_buf = base + 0x600;
-    // Bulk zero — see `ahci_read_lba` for why this is not a per-byte
-    // volatile loop.
-    // SAFETY: identity-mapped DMA; extent ≤ 4096 (checked at entry).
+    let data_buf = stage.phys;
+    // Bulk zero of the command structures only — the payload area
+    // is the stage itself, filled by the device; see
+    // `ahci_read_lba` for why this is not a per-byte volatile loop.
+    // SAFETY: identity-mapped DMA; extent 0x600 is inside the
+    // scratch page.
     unsafe {
         core::ptr::write_bytes(
             narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
             0,
-            0x600 + (n_sectors as usize) * 512,
+            0x600,
         );
     }
     // SAFETY: identity-mapped DMA.
@@ -2501,10 +2582,10 @@ pub async unsafe fn ahci_read_lba_async(
     // it.
     compiler_fence(Ordering::Acquire);
     // SAFETY: `data_buf` is the base of the DMA area the HBA filled
-    // with the read payload (n_sectors*512 ≤ SCRATCH_DATA_MAX bytes,
+    // with the read payload (n_sectors*512 ≤ stage.cap bytes,
     // checked at entry); `out` is a kernel slice that cannot overlap
-    // the identity-mapped scratch page. Bulk copy rather than a
-    // per-byte volatile loop — see `ahci_read_lba`.
+    // the staging region. Bulk copy rather than a per-byte volatile
+    // loop — see `ahci_read_lba`.
     unsafe {
         core::ptr::copy_nonoverlapping(
             narf_memory::PhysAddr::new(data_buf).kernel_ptr::<u8>(),
@@ -2519,7 +2600,9 @@ pub async unsafe fn ahci_read_lba_async(
 }
 
 /// IRQ-driven sibling of [`ahci_write_lba`]. Same shape as
-/// [`ahci_read_lba_async`].
+/// [`ahci_read_lba_async`]: bulk transfers chunk at
+/// [`AHCI_XFER_BYTES`] over the per-controller transfer buffer
+/// (#978); small chunks keep the scratch page's data area.
 ///
 /// # Safety
 /// Same as [`ahci_write_lba`].
@@ -2530,7 +2613,52 @@ pub async unsafe fn ahci_write_lba_async(
     n_sectors: u16,
     data: &[u8],
 ) -> Result<(), AhciError> {
-    if n_sectors == 0 || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX {
+    if n_sectors == 0 || data.len() < (n_sectors as usize) * 512 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let mut done: u16 = 0;
+    while done < n_sectors {
+        let want = XFER_SECTORS.min(n_sectors - done);
+        let off = done as usize * 512;
+        let stage = match chunk_stage(ahci, want) {
+            Some(stage) => stage,
+            None => return Err(AhciError::BarMapFailed),
+        };
+        // SAFETY: forwarded caller contract; chunks complete
+        // sequentially, so the per-controller staging buffer is
+        // never shared between two in-flight commands.
+        unsafe {
+            ahci_write_lba_async_xfer(
+                ahci,
+                port_idx,
+                lba + done as u64,
+                want,
+                &data[off..off + want as usize * 512],
+                stage,
+            )
+            .await
+        }?;
+        done += want;
+    }
+    Ok(())
+}
+
+/// Shared WRITE DMA EXT body for [`ahci_write_lba_async`]: one
+/// chunk of at most `stage.cap` bytes, staged in `stage` (see
+/// [`ahci_read_lba_async_xfer`]).
+///
+/// # Safety
+/// Same as [`ahci_write_lba`]; `stage` must name a coherent DMA
+/// region of at least `stage.cap` bytes owned by `ahci`.
+pub async unsafe fn ahci_write_lba_async_xfer(
+    ahci: &Ahci,
+    port_idx: u8,
+    lba: u64,
+    n_sectors: u16,
+    data: &[u8],
+    stage: DmaStage,
+) -> Result<(), AhciError> {
+    if n_sectors == 0 || (n_sectors as usize) * 512 > stage.cap {
         return Err(AhciError::BarMapFailed);
     }
     if data.len() < (n_sectors as usize) * 512 {
@@ -2551,12 +2679,12 @@ pub async unsafe fn ahci_write_lba_async(
     let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
-    let data_buf = base + 0x600;
+    let data_buf = stage.phys;
     // Bulk zero + payload copy — see `ahci_write_lba` for why these
     // are not per-byte volatile loops.
-    // SAFETY: identity-mapped DMA; n_sectors*512 ≤ SCRATCH_DATA_MAX
-    // (checked at entry) keeps the copy inside the scratch page, and
-    // `data` is a kernel slice that cannot overlap it.
+    // SAFETY: identity-mapped DMA; n_sectors*512 ≤ stage.cap
+    // (checked at entry) keeps the copy inside the staging region,
+    // and `data` is a kernel slice that cannot overlap it.
     unsafe {
         core::ptr::write_bytes(
             narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
@@ -2685,8 +2813,14 @@ pub async unsafe fn ahci_write_lba_async(
 /// Issue ATA `READ FPDMA QUEUED` (NCQ, opcode 0x60) for a single
 /// outstanding command on slot `tag` (0..31), reading `n_sectors`
 /// 512-byte sectors at `lba`. Polled completion on PORT_CI bit
-/// `tag` clearing. Same single-page scratch shape as the non-NCQ
-/// variants.
+/// `tag` clearing.
+///
+/// Bulk transfers chunk at [`AHCI_XFER_BYTES`] (256 sectors) over
+/// the per-controller transfer buffer (#978); each chunk is a
+/// separate NCQ command on the same `tag` that completes (polled)
+/// before the next is issued, so the 32-tag queue depth is
+/// unchanged — chunking never holds more than one tag at a time.
+/// Small transfers keep the scratch page's data area.
 ///
 /// NCQ wire-form differs from READ DMA EXT (§7.21 of ATA8-ACS): the
 /// "sector count" register holds the tag (bits[7:3]) instead of the
@@ -2706,31 +2840,42 @@ pub unsafe fn ahci_read_lba_ncq(
     n_sectors: u16,
     out: &mut [u8],
 ) -> Result<(), AhciError> {
-    if tag >= 32
-        || n_sectors == 0
-        || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX
-        || out.len() < (n_sectors as usize) * 512
-    {
+    if tag >= 32 || n_sectors == 0 || out.len() < (n_sectors as usize) * 512 {
         return Err(AhciError::BarMapFailed);
     }
-    // SAFETY: caller-asserted.
-    unsafe {
-        ahci_lba_ncq(
-            ahci,
-            port_idx,
-            pmp,
-            tag,
-            /*write=*/ false,
-            lba,
-            n_sectors,
-            out,
-            &[],
-        )
+    let mut done: u16 = 0;
+    while done < n_sectors {
+        let want = XFER_SECTORS.min(n_sectors - done);
+        let off = done as usize * 512;
+        let stage = match chunk_stage(ahci, want) {
+            Some(stage) => stage,
+            None => return Err(AhciError::BarMapFailed),
+        };
+        // SAFETY: caller-asserted; each chunk completes (polled)
+        // before the next is issued on the same tag.
+        unsafe {
+            ahci_lba_ncq(
+                ahci,
+                port_idx,
+                pmp,
+                tag,
+                /*write=*/ false,
+                lba + done as u64,
+                want,
+                &mut out[off..off + want as usize * 512],
+                &[],
+                stage,
+            )
+        }?;
+        done += want;
     }
+    Ok(())
 }
 
 /// Issue ATA `WRITE FPDMA QUEUED` (NCQ, opcode 0x61). Mirror of
-/// `ahci_read_lba_ncq` for outbound transfers.
+/// `ahci_read_lba_ncq` for outbound transfers: bulk transfers
+/// chunk at [`AHCI_XFER_BYTES`] over the per-controller transfer
+/// buffer (#978), one polled command per chunk on the same `tag`.
 ///
 /// # Safety
 /// Same as `ahci_write_lba`.
@@ -2743,20 +2888,37 @@ pub unsafe fn ahci_write_lba_ncq(
     n_sectors: u16,
     data: &[u8],
 ) -> Result<(), AhciError> {
-    if tag >= 32
-        || n_sectors == 0
-        || (n_sectors as usize) * 512 > SCRATCH_DATA_MAX
-        || data.len() < (n_sectors as usize) * 512
-    {
+    if tag >= 32 || n_sectors == 0 || data.len() < (n_sectors as usize) * 512 {
         return Err(AhciError::BarMapFailed);
     }
     let mut sink = [0u8; 0];
-    // SAFETY: caller-asserted.
-    unsafe {
-        ahci_lba_ncq(
-            ahci, port_idx, pmp, tag, /*write=*/ true, lba, n_sectors, &mut sink, data,
-        )
+    let mut done: u16 = 0;
+    while done < n_sectors {
+        let want = XFER_SECTORS.min(n_sectors - done);
+        let off = done as usize * 512;
+        let stage = match chunk_stage(ahci, want) {
+            Some(stage) => stage,
+            None => return Err(AhciError::BarMapFailed),
+        };
+        // SAFETY: caller-asserted; each chunk completes (polled)
+        // before the next is issued on the same tag.
+        unsafe {
+            ahci_lba_ncq(
+                ahci,
+                port_idx,
+                pmp,
+                tag,
+                /*write=*/ true,
+                lba + done as u64,
+                want,
+                &mut sink,
+                &data[off..off + want as usize * 512],
+                stage,
+            )
+        }?;
+        done += want;
     }
+    Ok(())
 }
 
 // All parameters map directly to AHCI NCQ FIS and PRD fields; no grouping is natural.
@@ -2771,6 +2933,7 @@ unsafe fn ahci_lba_ncq(
     n_sectors: u16,
     out: &mut [u8],
     data_in: &[u8],
+    stage: DmaStage,
 ) -> Result<(), AhciError> {
     let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
     // SAFETY: caller-asserted.
@@ -2787,13 +2950,13 @@ unsafe fn ahci_lba_ncq(
     let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
-    let data_buf = base + 0x600;
+    let data_buf = stage.phys;
     // Zero scratch + (for writes) copy caller payload in. Bulk ops —
     // see `ahci_read_lba` for why these are not per-byte volatile
     // loops.
     // SAFETY: identity-mapped DMA; the public NCQ wrappers check
-    // n_sectors*512 ≤ SCRATCH_DATA_MAX, keeping the copy inside the
-    // scratch page, and `data_in` is a kernel slice that cannot
+    // n_sectors*512 ≤ stage.cap, keeping the copy inside the
+    // staging region, and `data_in` is a kernel slice that cannot
     // overlap it.
     unsafe {
         core::ptr::write_bytes(
@@ -2973,10 +3136,10 @@ unsafe fn ahci_lba_ncq(
     if !write {
         compiler_fence(Ordering::Acquire);
         // SAFETY: `data_buf` is the base of the DMA area the HBA
-        // filled for this read (n_sectors*512 ≤ SCRATCH_DATA_MAX and
+        // filled for this read (n_sectors*512 ≤ stage.cap and
         // ≤ out.len(), both checked by the public wrapper); `out` is a
-        // kernel slice that cannot overlap the identity-mapped scratch
-        // page. Bulk copy rather than a per-byte volatile loop — see
+        // kernel slice that cannot overlap the staging region.
+        // Bulk copy rather than a per-byte volatile loop — see
         // `ahci_read_lba`.
         unsafe {
             core::ptr::copy_nonoverlapping(
