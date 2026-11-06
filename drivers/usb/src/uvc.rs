@@ -677,6 +677,19 @@ pub struct UvcStreamingEndpoint {
     pub interval: u8,
 }
 
+/// One bound UVC control: the V4L2-facing id plus the wire length
+/// the device reported for it via GET_LEN. The (unit, selector)
+/// pair is not stored here — it is derived on every access through
+/// [`narf_drivers_video::uvc::route_control`] from the device's
+/// retained PU/CT unit ids, so there is exactly one routing
+/// authority.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UvcControl {
+    pub id: narf_drivers_video::uvc::ControlId,
+    /// Payload length in bytes (1, 2, or 4) from GET_LEN.
+    pub len: u8,
+}
+
 /// One bound UVC device — control interface plus its streaming alternates.
 #[derive(Clone, Debug)]
 pub struct UvcDevice {
@@ -728,6 +741,19 @@ pub struct UvcDevice {
     /// Index of the xHCI controller the camera is on
     /// ([`UvcTransport::controller_id`]); `slot_id` is only unique within it.
     pub controller: u8,
+    /// Unit id of the first Processing Unit found in the VC
+    /// descriptors (0 when the device has none). PU controls route
+    /// here via `route_control`.
+    pub pu_unit_id: u8,
+    /// Unit id of the first Camera Terminal found in the VC
+    /// descriptors (0 when the device has none). CT controls route
+    /// here via `route_control`.
+    pub ct_unit_id: u8,
+    /// Controls the device's PU/CT descriptors advertise, with the
+    /// wire length each reported via GET_LEN. The V4L2 control list
+    /// installed on the `/dev/video<N>` node mirrors this table;
+    /// controls absent from it are never advertised.
+    pub controls: Vec<UvcControl>,
 }
 
 /// System-wide registry of bound UVC devices (records carry their
@@ -979,6 +1005,292 @@ pub fn find_video_streaming_interface(cfg: &[u8]) -> Option<u8> {
     None
 }
 
+// ── VC control-unit discovery + GET/SET_CUR query (#809) ─────────────
+//
+// The VideoControl class-specific blob carries the entities that own
+// the camera's controls: the Camera Terminal (bmControls per UVC 1.5
+// §3.7.2.3 Table 3-6) and the Processing Unit (bmControls per §3.7.2.5
+// Table 3-8). Bind walks the blob, builds the V4L2 control list from
+// the bitmaps (`supported_controls`: bit N ↔ selector N+1), and reads
+// each advertised control's range from the hardware (GET_LEN →
+// GET_MIN/GET_MAX/GET_RES/GET_DEF/GET_CUR) so the V4L2 surface
+// reports device values, never an invented table. A control whose
+// query fails, whose length has no V4L2 integer mapping, or whose
+// device-reported range is inverted is skipped, not advertised.
+
+/// First Camera Terminal / Processing Unit found in a VC
+/// class-specific blob: `(unit_id, bmControls bitmap)` each, or
+/// `None` when the blob carries no such entity. Only the first of
+/// each kind is retained — multi-PU/multi-CT topologies are not
+/// modelled (see the #809 remainder note in
+/// [`try_bind_video_with_transport`]).
+pub fn parse_vc_control_units(vc_cs_blob: &[u8]) -> (Option<(u8, u32)>, Option<(u8, u32)>) {
+    let mut ct: Option<(u8, u32)> = None;
+    let mut pu: Option<(u8, u32)> = None;
+    let mut i = 0usize;
+    while i + 3 <= vc_cs_blob.len() {
+        let len = vc_cs_blob[i] as usize;
+        if len < 3 || i + len > vc_cs_blob.len() {
+            break;
+        }
+        if vc_cs_blob[i + 1] == CS_INTERFACE {
+            match vc_cs_blob[i + 2] {
+                VC_INPUT_TERMINAL if ct.is_none() => {
+                    if let Ok(it) = InputTerminal::parse(&vc_cs_blob[i..i + len]) {
+                        if let Some(camera) = it.camera {
+                            ct = Some((it.terminal_id, camera.controls));
+                        }
+                    }
+                }
+                VC_PROCESSING_UNIT if pu.is_none() => {
+                    if let Ok(unit) = ProcessingUnit::parse(&vc_cs_blob[i..i + len]) {
+                        pu = Some((unit.unit_id, unit.controls));
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += len;
+    }
+    (ct, pu)
+}
+
+/// One descriptor-advertised control with its hardware-reported
+/// range, ready to install as a V4L2 [`ControlState`].
+pub struct BoundUvcControl {
+    pub id: narf_drivers_video::uvc::ControlId,
+    /// Payload length in bytes (1, 2, or 4) from GET_LEN.
+    pub len: u8,
+    pub state: narf_drivers_video::v4l2_ioctl::ControlState,
+}
+
+/// Issue one UVC GET_* control query and return the payload bytes.
+/// `None` on transfer failure or a short read — the caller skips
+/// that control rather than advertising a range it never read.
+async fn query_control<T: UvcTransport>(
+    transport: &T,
+    slot_id: u8,
+    vc_iface: u8,
+    request: u8,
+    selector: u8,
+    unit_id: u8,
+    len: usize,
+) -> Option<Vec<u8>> {
+    use narf_drivers_video::uvc::control::{bm_request_type, w_index, w_value};
+    let mut buf = alloc::vec![0u8; len];
+    let n = transport
+        .control_in(
+            slot_id,
+            bm_request_type(request),
+            request,
+            w_value(selector),
+            w_index(unit_id, vc_iface),
+            &mut buf,
+        )
+        .await
+        .ok()?;
+    if n < len {
+        return None;
+    }
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// Query the hardware ranges for every control the PU/CT bitmaps
+/// advertise and build the V4L2 control list from them.
+///
+/// Per control, in order: GET_LEN (the 2-byte length answer, UVC 1.5
+/// §A.8 — the device itself reports the payload size, so no size is
+/// ever assumed), then GET_MIN / GET_MAX / GET_DEF / GET_CUR at that
+/// length, and GET_RES for the step (a failed GET_RES falls back to
+/// step 1, the V4L2 default step). Any failure, an unsupported
+/// length, or an inverted `[min, max]` range skips that control.
+/// Returns `(bound_controls, pu_unit_id, ct_unit_id)`.
+pub async fn query_uvc_controls<T: UvcTransport>(
+    transport: &T,
+    slot_id: u8,
+    vc_iface: u8,
+    vc_cs_blob: &[u8],
+) -> (Vec<BoundUvcControl>, u8, u8) {
+    use narf_drivers_video::uvc::control::{
+        decode_control_value, supported_controls, GET_CUR, GET_DEF, GET_LEN, GET_MAX, GET_MIN,
+        GET_RES,
+    };
+    let (ct, pu) = parse_vc_control_units(vc_cs_blob);
+    let (ct_unit_id, ct_bitmap) = ct.unwrap_or((0, 0));
+    let (pu_unit_id, pu_bitmap) = pu.unwrap_or((0, 0));
+    let mut out = Vec::new();
+    for id in supported_controls(pu_bitmap, ct_bitmap) {
+        let Some((unit_id, selector)) =
+            narf_drivers_video::uvc::route_control(id, pu_unit_id, ct_unit_id)
+        else {
+            continue;
+        };
+        // GET_LEN answers a 2-byte little-endian length.
+        let len_bytes = match query_control(
+            transport, slot_id, vc_iface, GET_LEN, selector, unit_id, 2,
+        )
+        .await
+        {
+            Some(b) => b,
+            None => continue,
+        };
+        let len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
+        if !matches!(len, 1 | 2 | 4) {
+            continue;
+        }
+        let (Some(min_b), Some(max_b), Some(def_b), Some(cur_b)) = (
+            query_control(
+                transport, slot_id, vc_iface, GET_MIN, selector, unit_id, len,
+            )
+            .await,
+            query_control(
+                transport, slot_id, vc_iface, GET_MAX, selector, unit_id, len,
+            )
+            .await,
+            query_control(
+                transport, slot_id, vc_iface, GET_DEF, selector, unit_id, len,
+            )
+            .await,
+            query_control(
+                transport, slot_id, vc_iface, GET_CUR, selector, unit_id, len,
+            )
+            .await,
+        ) else {
+            continue;
+        };
+        let (Some(min), Some(max), Some(def), Some(cur)) = (
+            decode_control_value(&min_b),
+            decode_control_value(&max_b),
+            decode_control_value(&def_b),
+            decode_control_value(&cur_b),
+        ) else {
+            continue;
+        };
+        if min > max {
+            continue;
+        }
+        // GET_RES (step); a device that cannot answer it gets step 1.
+        let step = query_control(
+            transport, slot_id, vc_iface, GET_RES, selector, unit_id, len,
+        )
+        .await
+        .and_then(|b| decode_control_value(&b))
+        .filter(|&s| s > 0)
+        .unwrap_or(1);
+        let value = cur.clamp(min, max);
+        out.push(BoundUvcControl {
+            id,
+            len: len as u8,
+            state: narf_drivers_video::v4l2_ioctl::ControlState {
+                id: id.v4l2_id(),
+                name: id.name(),
+                min,
+                max,
+                step,
+                default: def,
+                value,
+            },
+        });
+    }
+    (out, pu_unit_id, ct_unit_id)
+}
+
+/// Transport-generic GET_CUR for one V4L2 control id on `/dev/video<node>`.
+/// Resolves the node to its bound device, routes the id through
+/// `route_control` to the owning unit/selector, and issues the
+/// hardware GET_CUR. Returns the device-reported value, or the
+/// positive Linux errno on failure.
+pub async fn control_get_with<T: UvcTransport>(
+    transport: &T,
+    node: usize,
+    id: u32,
+) -> Result<i32, i64> {
+    use narf_drivers_video::uvc::control::{decode_control_value, route_control, GET_CUR};
+    let control_id = narf_drivers_video::uvc::ControlId::from_v4l2_id(id).ok_or(ERRNO_ENODEV)?;
+    let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
+    let (slot_id, vc_iface, pu_unit_id, ct_unit_id, len) = {
+        let devices = UVC_DEVICES.lock();
+        let device = devices.get(idx).ok_or(ERRNO_ENODEV)?;
+        let entry = device
+            .controls
+            .iter()
+            .find(|c| c.id == control_id)
+            .ok_or(ERRNO_ENODEV)?;
+        (
+            device.slot_id,
+            device.vc_iface,
+            device.pu_unit_id,
+            device.ct_unit_id,
+            entry.len,
+        )
+    };
+    let (unit_id, selector) =
+        route_control(control_id, pu_unit_id, ct_unit_id).ok_or(ERRNO_ENODEV)?;
+    let buf = query_control(
+        transport,
+        slot_id,
+        vc_iface,
+        GET_CUR,
+        selector,
+        unit_id,
+        len as usize,
+    )
+    .await
+    .ok_or(ERRNO_EIO)?;
+    decode_control_value(&buf).ok_or(ERRNO_EIO)
+}
+
+/// Transport-generic SET_CUR for one V4L2 control id on `/dev/video<node>`.
+/// Same resolution as [`control_get_with`]; encodes the clamped
+/// value at the GET_LEN-reported length and returns the value the
+/// transfer carried (the device echoes nothing on SET_CUR, so the
+/// clamped value is the confirmed one).
+pub async fn control_set_with<T: UvcTransport>(
+    transport: &T,
+    node: usize,
+    id: u32,
+    value: i32,
+) -> Result<i32, i64> {
+    use narf_drivers_video::uvc::control::{encode_control_value, route_control, SET_CUR};
+    let control_id = narf_drivers_video::uvc::ControlId::from_v4l2_id(id).ok_or(ERRNO_ENODEV)?;
+    let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
+    let (slot_id, vc_iface, pu_unit_id, ct_unit_id, len) = {
+        let devices = UVC_DEVICES.lock();
+        let device = devices.get(idx).ok_or(ERRNO_ENODEV)?;
+        let entry = device
+            .controls
+            .iter()
+            .find(|c| c.id == control_id)
+            .ok_or(ERRNO_ENODEV)?;
+        (
+            device.slot_id,
+            device.vc_iface,
+            device.pu_unit_id,
+            device.ct_unit_id,
+            entry.len,
+        )
+    };
+    let (unit_id, selector) =
+        route_control(control_id, pu_unit_id, ct_unit_id).ok_or(ERRNO_ENODEV)?;
+    let mut payload = [0u8; 4];
+    if !encode_control_value(value, len, &mut payload) {
+        return Err(ERRNO_EIO);
+    }
+    transport
+        .control_out(
+            slot_id,
+            narf_drivers_video::uvc::control::bm_request_type(SET_CUR),
+            SET_CUR,
+            narf_drivers_video::uvc::control::w_value(selector),
+            narf_drivers_video::uvc::control::w_index(unit_id, vc_iface),
+            &payload[..len as usize],
+        )
+        .await
+        .map_err(|_| ERRNO_EIO)?;
+    Ok(value)
+}
+
 /// Transport-generic core of [`try_bind_video_already_addressed`]:
 /// SET_CONFIGURATION, then record the slot/interface pair, the parsed
 /// streaming format table, and register the `/dev/video<N>` node.
@@ -1027,8 +1339,24 @@ pub async fn try_bind_video_with_transport<T: UvcTransport>(
         .map(|h| (h.bcd_uvc, h.clock_frequency))
         .unwrap_or((0x0100, 0));
     let formats = narf_drivers_video::v4l2_ioctl::uvc_to_v4l2_formats(&stream_formats);
+    // Build the V4L2 control list from the device's real PU/CT
+    // descriptors, with ranges read from the hardware (#809). The
+    // query runs against the live transport before the node is
+    // registered, so the node never advertises the synthetic
+    // default table: a camera whose descriptors advertise no
+    // controls gets an empty list. Only the first Camera Terminal
+    // and first Processing Unit are retained — multi-PU/multi-CT
+    // topologies are a known remainder, not modelled here.
+    let (bound_controls, pu_unit_id, ct_unit_id) = match &probe {
+        Some(p) => query_uvc_controls(transport, slot_id, vc_iface, &p.vc_cs_blob).await,
+        None => (Vec::new(), 0, 0),
+    };
     let video_node =
         narf_drivers_video::devfs_bridge::register_video_with_formats("USB Video Device", formats);
+    narf_drivers_video::devfs_bridge::set_controls(
+        video_node,
+        bound_controls.iter().map(|b| b.state).collect(),
+    );
     let mut g = UVC_DEVICES.lock();
     let idx = g.len();
     g.push(UvcDevice {
@@ -1045,6 +1373,15 @@ pub async fn try_bind_video_with_transport<T: UvcTransport>(
         uvc_version,
         clock_frequency,
         controller: transport.controller_id(),
+        pu_unit_id,
+        ct_unit_id,
+        controls: bound_controls
+            .iter()
+            .map(|b| UvcControl {
+                id: b.id,
+                len: b.len,
+            })
+            .collect(),
     });
     Ok(idx)
 }
@@ -1065,6 +1402,7 @@ pub async fn try_bind_video_already_addressed(
     };
     if let Some(video_node) = video_node {
         narf_drivers_video::devfs_bridge::set_stream_ops(video_node, video_stream_ops());
+        narf_drivers_video::devfs_bridge::set_control_ops(video_node, video_control_ops());
     }
     Ok(idx)
 }
@@ -2151,6 +2489,43 @@ pub fn video_stream_ops() -> narf_drivers_video::v4l2_ioctl::StreamOps {
     narf_drivers_video::v4l2_ioctl::StreamOps {
         start: video_stream_start,
         stop: video_stream_stop,
+    }
+}
+
+// ── V4L2 control hooks (VIDIOC_G/S_CTRL composition, #809) ────────────
+//
+// Installed on the bound device's /dev/video<N> node at bind time
+// (see `try_bind_video_already_addressed`). The V4L2 layer awaits
+// `get`/`set` before reporting a value, so a failed transfer fails
+// the ioctl instead of echoing a cached value the hardware never
+// took.
+
+fn video_control_get(node: usize, id: u32) -> narf_drivers_video::v4l2_ioctl::ControlHookFuture {
+    Box::pin(async move {
+        let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
+        let controller = controller_of(idx).ok_or(ERRNO_ENODEV)?;
+        control_get_with(&*controller, node, id).await
+    })
+}
+
+fn video_control_set(
+    node: usize,
+    id: u32,
+    value: i32,
+) -> narf_drivers_video::v4l2_ioctl::ControlHookFuture {
+    Box::pin(async move {
+        let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
+        let controller = controller_of(idx).ok_or(ERRNO_ENODEV)?;
+        control_set_with(&*controller, node, id, value).await
+    })
+}
+
+/// The [`narf_drivers_video::v4l2_ioctl::ControlOps`] installed on every
+/// UVC-bound `/dev/video<N>` node.
+pub fn video_control_ops() -> narf_drivers_video::v4l2_ioctl::ControlOps {
+    narf_drivers_video::v4l2_ioctl::ControlOps {
+        get: video_control_get,
+        set: video_control_set,
     }
 }
 

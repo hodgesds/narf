@@ -9402,7 +9402,12 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 /// One recorded transfer in the modelled device conversation.
 /// Probe/commit payloads are variable-length: 26 bytes for a 1.0
-/// device, 34 for a 1.1+ device.
+/// device, 34 for a 1.1+ device. The unit-control variants are
+/// `GetControl { request, unit, selector }` (a UVC GET_* query;
+/// unit/selector decode from wIndex/wValue, unit << 8 | iface /
+/// selector << 8) and `SetControl(unit, selector, payload)` (a
+/// SET_CUR; the tuple form keeps the enum's struct variants
+/// single-line under rustfmt).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FixtureXfer {
     SetConfiguration,
@@ -9413,8 +9418,53 @@ enum FixtureXfer {
     SetInterface { interface: u16, alt: u16 },
     IsochIn,
     BulkIn,
+    GetControl { request: u8, unit: u8, selector: u8 },
+    SetControl(u8, u8, Vec<u8>),
     OtherControlOut { request: u8, value: u16 },
     OtherControlIn { request: u8, value: u16 },
+}
+
+/// One modelled UVC unit control: the (unit, selector) it answers
+/// plus the hardware range the bind-time GET_* queries report and
+/// the current value GET_CUR answers / SET_CUR updates.
+#[derive(Clone, Copy, Debug)]
+struct FixtureControl {
+    unit: u8,
+    selector: u8,
+    len: u8,
+    min: i32,
+    max: i32,
+    res: i32,
+    def: i32,
+    cur: i32,
+}
+
+impl FixtureControl {
+    /// Encode `value` at this control's wire length (1 byte, LE i16,
+    /// or LE u32 — the same codec the production
+    /// `decode_control_value` / `encode_control_value` use).
+    fn encode(&self, value: i32) -> Vec<u8> {
+        match self.len {
+            1 => alloc::vec![value.clamp(0, u8::MAX as i32) as u8],
+            2 => (value as i16).to_le_bytes().to_vec(),
+            4 => (value.max(0) as u32).to_le_bytes().to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Decode a SET_CUR payload at this control's wire length.
+    fn decode(&self, data: &[u8]) -> Option<i32> {
+        match self.len {
+            1 => data.first().map(|&b| b as i32),
+            2 => data
+                .get(..2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32),
+            4 => data
+                .get(..4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]).min(i32::MAX as u32) as i32),
+            _ => None,
+        }
+    }
 }
 
 struct FixtureState {
@@ -9437,6 +9487,8 @@ struct FixtureState {
     /// High-water mark of `isoch_in_flight` — the #808 pipeline
     /// proof: the maximum the transport ever observed at once.
     isoch_max_in_flight: usize,
+    /// Modelled UVC unit controls, keyed by (unit, selector).
+    controls: Vec<FixtureControl>,
 }
 
 /// Modelled UVC device behind the [`crate::uvc::UvcTransport`] seam.
@@ -9463,6 +9515,7 @@ impl FixtureTransport {
                 packets: packets.into(),
                 isoch_in_flight: 0,
                 isoch_max_in_flight: 0,
+                controls: Vec::new(),
             }),
         }
     }
@@ -9490,6 +9543,15 @@ impl FixtureTransport {
     /// the #1244 GET_CUR version-validation tests.
     fn set_versions(&self, preferred: u8, min: u8, max: u8) {
         self.state.lock().versions = Some((preferred, min, max));
+    }
+
+    /// Install the modelled UVC unit-control table answered by
+    /// GET_LEN/GET_MIN/GET_MAX/GET_RES/GET_DEF/GET_CUR and updated
+    /// by SET_CUR. The bind-time control query reads its ranges
+    /// from here, so the table — not the implementation — decides
+    /// which controls the node advertises.
+    fn set_control_table(&self, table: Vec<FixtureControl>) {
+        self.state.lock().controls = table;
     }
 
     /// Stage a packet for the modelled device to source, as if it
@@ -9597,6 +9659,26 @@ impl crate::uvc::UvcTransport for FixtureTransport {
             });
             return Ok(data.len());
         }
+        // UVC unit-control SET_CUR (wValue = selector << 8, wIndex =
+        // unit << 8 | iface): apply the payload to the modelled
+        // control, clamped to its [min, max] range like real hardware.
+        if b_request == 0x01 && (w_value >> 8) != 0 {
+            let unit = (w_index >> 8) as u8;
+            let selector = (w_value >> 8) as u8;
+            state
+                .log
+                .push(FixtureXfer::SetControl(unit, selector, data.to_vec()));
+            if let Some(c) = state
+                .controls
+                .iter_mut()
+                .find(|c| c.unit == unit && c.selector == selector)
+            {
+                if let Some(v) = c.decode(data) {
+                    c.cur = v.clamp(c.min, c.max);
+                }
+            }
+            return Ok(data.len());
+        }
         state.log.push(FixtureXfer::OtherControlOut {
             request: b_request,
             value: w_value,
@@ -9610,7 +9692,7 @@ impl crate::uvc::UvcTransport for FixtureTransport {
         _bm_request_type: u8,
         b_request: u8,
         w_value: u16,
-        _w_index: u16,
+        w_index: u16,
         out: &mut [u8],
     ) -> Result<usize, crate::xhci::XhciError> {
         let mut state = self.state.lock();
@@ -9635,6 +9717,45 @@ impl crate::uvc::UvcTransport for FixtureTransport {
             }
             let n = out.len().min(accepted.len());
             out[..n].copy_from_slice(&accepted[..n]);
+            return Ok(n);
+        }
+        // UVC unit-control GET_* (wValue = selector << 8, wIndex =
+        // unit << 8 | iface). The probe branch above already claimed
+        // GET_CUR with wValue == 0x01, so anything reaching here is
+        // a unit control. An unmodelled (unit, selector) answers
+        // zero bytes — a short read the production query treats as
+        // "skip this control".
+        if matches!(b_request, 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x87) && (w_value >> 8) != 0 {
+            let unit = (w_index >> 8) as u8;
+            let selector = (w_value >> 8) as u8;
+            state.log.push(FixtureXfer::GetControl {
+                request: b_request,
+                unit,
+                selector,
+            });
+            let Some(c) = state
+                .controls
+                .iter()
+                .find(|c| c.unit == unit && c.selector == selector)
+                .copied()
+            else {
+                return Ok(0);
+            };
+            let answer: Vec<u8> = if b_request == 0x85 {
+                // GET_LEN answers the 2-byte little-endian length.
+                (c.len as u16).to_le_bytes().to_vec()
+            } else {
+                let value = match b_request {
+                    0x82 => c.min,
+                    0x83 => c.max,
+                    0x84 => c.res,
+                    0x87 => c.def,
+                    _ => c.cur,
+                };
+                c.encode(value)
+            };
+            let n = out.len().min(answer.len());
+            out[..n].copy_from_slice(&answer[..n]);
             return Ok(n);
         }
         state.log.push(FixtureXfer::OtherControlIn {
@@ -9739,6 +9860,139 @@ fn uvc_fixture_stream_ops() -> narf_drivers_video::v4l2_ioctl::StreamOps {
     }
 }
 
+/// Fixture control hooks: the same production `control_get_with` /
+/// `control_set_with` composition the live driver installs, driven
+/// against the modelled transport.
+fn uvc_fixture_control_get(
+    node: usize,
+    id: u32,
+) -> narf_drivers_video::v4l2_ioctl::ControlHookFuture {
+    Box::pin(async move {
+        let transport = UVC_FIXTURE_TRANSPORT.lock().clone().ok_or(19)?;
+        crate::uvc::control_get_with(&*transport, node, id).await
+    })
+}
+
+fn uvc_fixture_control_set(
+    node: usize,
+    id: u32,
+    value: i32,
+) -> narf_drivers_video::v4l2_ioctl::ControlHookFuture {
+    Box::pin(async move {
+        let transport = UVC_FIXTURE_TRANSPORT.lock().clone().ok_or(19)?;
+        crate::uvc::control_set_with(&*transport, node, id, value).await
+    })
+}
+
+fn uvc_fixture_control_ops() -> narf_drivers_video::v4l2_ioctl::ControlOps {
+    narf_drivers_video::v4l2_ioctl::ControlOps {
+        get: uvc_fixture_control_get,
+        set: uvc_fixture_control_set,
+    }
+}
+
+/// The modelled controls camera's unit-control table: the hardware
+/// ranges the bind-time GET_* queries report. One entry per
+/// descriptor-advertised control in
+/// `uvc_fixture_config_blob_with_controls` — the two bitmaps
+/// advertise 12 bits, these 9 have a V4L2 integer mapping.
+fn uvc_fixture_control_table() -> Vec<FixtureControl> {
+    alloc::vec![
+        // Processing Unit (id 2).
+        FixtureControl {
+            unit: 2,
+            selector: 0x02,
+            len: 2,
+            min: -64,
+            max: 64,
+            res: 1,
+            def: 0,
+            cur: 0
+        },,
+        FixtureControl {
+            unit: 2,
+            selector: 0x03,
+            len: 2,
+            min: 0,
+            max: 64,
+            res: 1,
+            def: 32,
+            cur: 32
+        },,
+        FixtureControl {
+            unit: 2,
+            selector: 0x04,
+            len: 2,
+            min: 0,
+            max: 100,
+            res: 1,
+            def: 0,
+            cur: 0
+        },,
+        FixtureControl {
+            unit: 2,
+            selector: 0x06,
+            len: 2,
+            min: -180,
+            max: 180,
+            res: 1,
+            def: 0,
+            cur: 0
+        },,
+        FixtureControl {
+            unit: 2,
+            selector: 0x07,
+            len: 2,
+            min: 0,
+            max: 128,
+            res: 1,
+            def: 64,
+            cur: 64
+        },
+        // Camera Terminal (id 1).
+        FixtureControl {
+            unit: 1,
+            selector: 0x04,
+            len: 4,
+            min: 1,
+            max: 10000,
+            res: 1,
+            def: 156,
+            cur: 156
+        },,
+        FixtureControl {
+            unit: 1,
+            selector: 0x06,
+            len: 2,
+            min: 0,
+            max: 255,
+            res: 1,
+            def: 0,
+            cur: 0
+        },,
+        FixtureControl {
+            unit: 1,
+            selector: 0x08,
+            len: 1,
+            min: 0,
+            max: 1,
+            res: 1,
+            def: 1,
+            cur: 1
+        },,
+        FixtureControl {
+            unit: 1,
+            selector: 0x0B,
+            len: 2,
+            min: 0,
+            max: 400,
+            res: 1,
+            def: 100,
+            cur: 100
+        },
+    ]
+}
+
 /// Configuration descriptor set for the modelled camera: VC interface
 /// 0, VS interface 1 with one uncompressed YUYV 640×480 @30 fps format
 /// and an isochronous alt-1 endpoint (0x81, 1024-byte packets).
@@ -9751,7 +10005,21 @@ fn uvc_fixture_config_blob() -> Vec<u8> {
 fn uvc_fixture_config_blob_versioned(bcd_uvc: u16, clock_hz: u32) -> Vec<u8> {
     // Alt 1 isochronous IN endpoint: attrs 0x01, wMaxPacketSize
     // 1024, interval 1.
-    uvc_fixture_config_blob_inner(bcd_uvc, clock_hz, 0x01, 0x0400, 1)
+    uvc_fixture_config_blob_inner(bcd_uvc, clock_hz, 0x01, 0x0400, 1, false)
+}
+
+/// Modelled 1.5 camera with a Camera Terminal (id 1) and a
+/// Processing Unit (id 2) in its VC descriptors, for the #809
+/// control tests. The bitmaps are built from the UVC spec's own
+/// tables, not from the implementation: CT bmControls
+/// 0x14A9 = scanning(D0) + exposure-absolute(D3) + focus-absolute
+/// (D5) + focus-auto(D7) + zoom-absolute(D10) + pan/tilt-absolute
+/// (D12); PU bmControls 0x086E = brightness(D1) + contrast(D2) +
+/// gain(D3) + hue(D5) + saturation(D6) + white-balance-component
+/// (D11). The D0/D12/D11 bits have no V4L2 integer mapping and
+/// must not be advertised.
+fn uvc_fixture_config_blob_with_controls() -> Vec<u8> {
+    uvc_fixture_config_blob_inner(0x0150, 48_000_000, 0x01, 0x0400, 1, true)
 }
 
 /// Bulk-only modelled camera: same descriptors as the isochronous
@@ -9762,7 +10030,7 @@ fn uvc_fixture_config_blob_versioned(bcd_uvc: u16, clock_hz: u32) -> Vec<u8> {
 /// 512-byte packet size: STREAMON on this camera succeeds only
 /// through the bulk fallback, never through the isochronous gate.
 fn uvc_fixture_config_blob_bulk_only() -> Vec<u8> {
-    uvc_fixture_config_blob_inner(0x0100, 0x0047_9C40, 0x02, 0x0200, 0)
+    uvc_fixture_config_blob_inner(0x0100, 0x0047_9C40, 0x02, 0x0200, 0, false)
 }
 
 fn uvc_fixture_config_blob_inner(
@@ -9771,6 +10039,7 @@ fn uvc_fixture_config_blob_inner(
     ep_attrs: u8,
     ep_max_packet: u16,
     ep_interval: u8,
+    with_controls: bool,
 ) -> Vec<u8> {
     let mut cfg = alloc::vec::Vec::new();
     // Configuration header (wTotalLength patched at the end).
@@ -9783,6 +10052,17 @@ fn uvc_fixture_config_blob_inner(
     vc_header[3..5].copy_from_slice(&bcd_uvc.to_le_bytes());
     vc_header[7..11].copy_from_slice(&clock_hz.to_le_bytes());
     cfg.extend_from_slice(&vc_header);
+    if with_controls {
+        // Camera Terminal (id 1, ITT_CAMERA 0x0201): focal lengths
+        // 0, bControlSize 3, bmControls 0x14A9, iTerminal 0.
+        cfg.extend_from_slice(&[
+            19, 0x24, 0x02, 1, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0xA9, 0x14, 0x00, 0,
+        ]);
+        // Processing Unit (id 2, source = terminal 1): max
+        // multiplier 0, bControlSize 2, bmControls 0x086E,
+        // iProcessing 0.
+        cfg.extend_from_slice(&[11, 0x24, 0x05, 2, 1, 0, 0, 2, 0x6E, 0x08, 0]);
+    }
     // Interface 1 alt 0: VideoStreaming, zero bandwidth.
     cfg.extend_from_slice(&[9, 4, 1, 0, 0, 0x0E, 0x02, 0x00, 0]);
     // VS_INPUT_HEADER: 1 format, CS total 71, endpoint 0x81, terminal 1.
@@ -9855,10 +10135,16 @@ impl FixtureCtx {
         self.mem.lock()[FIXTURE_ARG as usize + off..FIXTURE_ARG as usize + off + 4]
             .copy_from_slice(&v.to_ne_bytes());
     }
+    fn put_i32(&self, off: usize, v: i32) {
+        self.put_u32(off, v as u32);
+    }
     fn get_u32(&self, off: usize) -> u32 {
         let m = self.mem.lock();
         let a = FIXTURE_ARG as usize + off;
         u32::from_ne_bytes([m[a], m[a + 1], m[a + 2], m[a + 3]])
+    }
+    fn get_i32(&self, off: usize) -> i32 {
+        self.get_u32(off) as i32
     }
 }
 
@@ -10341,6 +10627,153 @@ fn smoke_uvc_isoc_pipeline_high_bandwidth() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_isoc_pipeline_high_bandwidth);
+
+/// V4L2 controls from real descriptors, end to end (#809): bind the
+/// modelled controls camera, assert the node advertises exactly the
+/// 9 descriptor-advertised controls with the hardware-reported
+/// ranges (not the invented default table), then drive the real
+/// V4L2 dispatch — S_CTRL must reach hardware SET_CUR through
+/// `route_control`, G_CTRL must read hardware GET_CUR back, and a
+/// control the descriptors lack must be rejected without touching
+/// the device.
+fn smoke_uvc_v4l2_controls_from_descriptors_e2e() -> TestResult {
+    narf_drivers_video::devfs_bridge::__reset_for_test();
+    crate::uvc::__reset_uvc_for_test();
+    let transport = Arc::new(FixtureTransport::new(false, false, Vec::new()));
+    transport.set_control_table(uvc_fixture_control_table());
+    *UVC_FIXTURE_TRANSPORT.lock() = Some(transport.clone());
+    let blob = uvc_fixture_config_blob_with_controls();
+    let idx = match narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        7,
+        &blob,
+    )) {
+        Ok(idx) => idx,
+        Err(_) => return TestResult::Fail("bind against the modelled controls camera failed"),
+    };
+    let node = {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = match devices.get(idx) {
+            Some(d) => d,
+            None => return TestResult::Fail("bound device missing"),
+        };
+        if device.pu_unit_id != 2 || device.ct_unit_id != 1 {
+            return TestResult::Fail("bind should record PU unit 2 + CT unit 1");
+        }
+        device.video_node
+    };
+    if !narf_drivers_video::devfs_bridge::set_control_ops(node, uvc_fixture_control_ops()) {
+        return TestResult::Fail("installing fixture control hooks failed");
+    }
+    let dev = narf_drivers_video::devfs_bridge::get_device(node)
+        .ok_or("registered video device missing")?;
+    // The node advertises exactly the 9 mapped controls, in PU-then-
+    // CT selector order — the 12 advertised bitmap bits minus the 3
+    // with no V4L2 integer mapping (scanning, pan/tilt-absolute,
+    // white-balance-component). The invented default table's 4
+    // controls are gone as a set: hue is here only because the PU
+    // bitmap sets it, with the device's own range.
+    let listed: Vec<(u32, i32, i32, i32, i32)> = dev
+        .lock()
+        .controls
+        .iter()
+        .map(|c| (c.id, c.min, c.max, c.default, c.value))
+        .collect();
+    let expect: Vec<(u32, i32, i32, i32, i32)> = alloc::vec![
+        (0x0098_0900, -64, 64, 0, 0),       // brightness
+        (0x0098_0901, 0, 64, 32, 32),       // contrast
+        (0x0098_0913, 0, 100, 0, 0),        // gain
+        (0x0098_0903, -180, 180, 0, 0),     // hue
+        (0x0098_0902, 0, 128, 64, 64),      // saturation
+        (0x009a_0902, 1, 10_000, 156, 156), // exposure absolute
+        (0x009a_090a, 0, 255, 0, 0),        // focus absolute
+        (0x009a_090c, 0, 1, 1, 1),          // focus auto
+        (0x009a_090d, 0, 400, 100, 100),    // zoom absolute
+    ];
+    if listed != expect {
+        return TestResult::Fail("node must advertise exactly the descriptor controls + ranges");
+    }
+    // The bind-time query must have asked the device for every
+    // advertised control's length and range — 6 queries per control
+    // (GET_LEN + GET_MIN + GET_MAX + GET_RES + GET_DEF + GET_CUR).
+    let log = transport.log();
+    let get_ctls = log
+        .iter()
+        .filter(|x| matches!(x, FixtureXfer::GetControl { .. }))
+        .count();
+    if get_ctls != 9 * 6 {
+        return TestResult::Fail("bind must query LEN+MIN+MAX+RES+DEF+CUR per control (54)");
+    }
+    // Drive the real dispatch.
+    let events: FixtureEvents = Arc::new(IrqSafeSpinLock::new(
+        narf_drivers_video::v4l2_ioctl::FdEvents::new(),
+    ));
+    let ctx = FixtureCtx::new();
+    const BRIGHTNESS: u32 = 0x0098_0900;
+    const HUE: u32 = 0x0098_0903;
+    const WB_TEMP: u32 = 0x0098_091a;
+    // S_CTRL brightness = 10 → SET_CUR to PU unit 2, selector 0x02,
+    // payload LE i16 [10, 0]; the ioctl reports 10.
+    ctx.put_u32(0, BRIGHTNESS);
+    ctx.put_i32(4, 10);
+    if fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 28, 8)) != Ok(0) || ctx.get_i32(4) != 10 {
+        return TestResult::Fail("S_CTRL brightness=10 should succeed and report 10");
+    }
+    if !transport.log().iter().any(|x| {
+        matches!(
+            x,
+            FixtureXfer::SetControl(2, 0x02, payload) if payload.as_slice() == [10, 0]
+        )
+    }) {
+        return TestResult::Fail("S_CTRL must reach hardware SET_CUR (unit 2, sel 0x02, [10,0])");
+    }
+    // G_CTRL brightness reads the device value back.
+    ctx.put_u32(0, BRIGHTNESS);
+    ctx.put_i32(4, 0);
+    if fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 27, 8)) != Ok(0) || ctx.get_i32(4) != 10 {
+        return TestResult::Fail("G_CTRL should return the hardware value 10");
+    }
+    // S_CTRL hue = 200 clamps to the device max 180 before SET_CUR.
+    ctx.put_u32(0, HUE);
+    ctx.put_i32(4, 200);
+    if fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 28, 8)) != Ok(0) || ctx.get_i32(4) != 180 {
+        return TestResult::Fail("S_CTRL hue=200 should clamp to the device max 180");
+    }
+    if !transport.log().iter().any(|x| {
+        matches!(
+            x,
+            FixtureXfer::SetControl(2, 0x06, payload) if payload.as_slice() == [0xB4, 0x00]
+        )
+    }) {
+        return TestResult::Fail("clamped hue SET_CUR must carry LE i16 180");
+    }
+    // S_CTRL white-balance temperature — a real UVC control whose
+    // bit this device's PU bitmap does NOT set — is EINVAL and
+    // never reaches the device.
+    let sets_before = transport
+        .log()
+        .iter()
+        .filter(|x| matches!(x, FixtureXfer::SetControl(..)))
+        .count();
+    ctx.put_u32(0, WB_TEMP);
+    ctx.put_i32(4, 5000);
+    if fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 28, 8)) != Ok(fixture_eno(22)) {
+        return TestResult::Fail("undescribed S_CTRL id should be EINVAL");
+    }
+    let sets_after = transport
+        .log()
+        .iter()
+        .filter(|x| matches!(x, FixtureXfer::SetControl(..)))
+        .count();
+    if sets_after != sets_before {
+        return TestResult::Fail("undescribed S_CTRL must not reach the hardware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_v4l2_controls_from_descriptors_e2e
+);
 
 /// The bulk fallback's selection rules, pinned without hardware:
 /// the isochronous gate rejects a PROBE figure above its interval
