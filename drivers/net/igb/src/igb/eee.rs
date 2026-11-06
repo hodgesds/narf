@@ -131,6 +131,7 @@ pub trait EeeRegs {
 }
 
 /// [`EeeRegs`] over a live BAR0 mapping.
+#[derive(Debug)]
 pub struct MmioEeeRegs<'a>(pub &'a narf_bus::MmioRegion);
 
 impl EeeRegs for MmioEeeRegs<'_> {
