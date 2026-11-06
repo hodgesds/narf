@@ -188,7 +188,7 @@ pub enum JdSrc {
     /// JD2, 100 kΩ decode.
     Jd2_100k,
     /// JD2, 1.8 V single-port mode.
-    Jd2_1p8v_1port,
+    Jd2_1p8v1port,
 }
 
 /// What the jack-detect poll found.
@@ -352,7 +352,7 @@ pub fn io_init<T: Transport>(bus: &Bus<T>, dev: u8) -> Result<(), SdwError> {
     verb_write(bus, dev, SET_GAIN_ADC1_H, 0x5080)?;
     // Set configuration defaults.
     for &(reg, value) in CONFIG_DEFAULTS {
-        verb_write(bus, dev, reg, value)?;
+        verb_write(bus, dev, reg, value.into())?;
     }
     // Data-port arrangement.
     index_write(bus, dev, VENDOR_REG, TX_RX_MUX_CTL, 0x0154)?;
@@ -395,7 +395,7 @@ pub fn jack_init<T: Transport>(bus: &Bus<T>, dev: u8, jd_src: JdSrc) -> Result<(
             index_update_bits(bus, dev, VENDOR_REG, JD_CTL2, 0x1c03, 0x0402)?;
             index_update_bits(bus, dev, VENDOR_REG, CC_DET1, 0x0400, 0x0400)?;
         }
-        JdSrc::Jd2_1p8v_1port => {
+        JdSrc::Jd2_1p8v1port => {
             index_update_bits(bus, dev, VENDOR_REG, JD_CTL1, 0x0002, 0x0000)?;
             index_update_bits(bus, dev, VENDOR_REG, JD_CTL2, 0x0c02, 0x0402)?;
             index_update_bits(bus, dev, VENDOR_REG, JD_CTL4, 0x000b, 0x000a)?;
@@ -944,7 +944,7 @@ mod tests {
             return TestResult::Fail("JD2_100k index writes mismatch");
         }
         let bus = Bus::new(FakeTransport::new());
-        if jack_init(&bus, 1, JdSrc::Jd2_1p8v_1port) != Ok(()) {
+        if jack_init(&bus, 1, JdSrc::Jd2_1p8v1port) != Ok(()) {
             return TestResult::Fail("jack_init JD2_1p8v failed");
         }
         if bus.transport().index_writes()

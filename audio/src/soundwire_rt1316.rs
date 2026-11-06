@@ -113,7 +113,7 @@ pub fn paged_write<T: Transport>(
     if dev == BROADCAST_DEV_NUM || !(1..=MAX_DEV_NUM).contains(&dev) {
         return Err(SdwError::InvalidDevice);
     }
-    if addr < REG_NO_PAGE || addr >= REG_MAX {
+    if !(REG_NO_PAGE..REG_MAX).contains(&addr) {
         return Err(SdwError::InvalidAddress);
     }
     let page1 = ((addr >> 23) & 0xFF) as u8;
