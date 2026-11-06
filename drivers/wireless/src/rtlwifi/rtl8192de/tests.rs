@@ -737,6 +737,99 @@ fn de_us_domain() -> narf_wireless::reg::RegulatoryDomain {
     }
 }
 
+/// US 5 GHz domain: UNII-1/2/3 blocks, 80 MHz, 30 dBm (no flags, so
+/// no DFS rule overlaps the test spans).
+fn de_us_5g_domain() -> narf_wireless::reg::RegulatoryDomain {
+    use narf_wireless::reg::*;
+    RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![
+            RegRule {
+                freq_start_mhz: 5140,
+                freq_end_mhz: 5360,
+                max_bandwidth_mhz: 80,
+                max_power_dbm: 30,
+                flags: RegFlags::empty(),
+            },
+            RegRule {
+                freq_start_mhz: 5460,
+                freq_end_mhz: 5860,
+                max_bandwidth_mhz: 80,
+                max_power_dbm: 30,
+                flags: RegFlags::empty(),
+            },
+        ],
+    }
+}
+
+/// Build a v3 NAPC envelope from the documented layout (header 96,
+/// rows of 516 bytes: channel/band/bandwidth/offset + four 64-entry
+/// curves). `rows` are (channel, band, bandwidth, offset, curve fn)
+/// with the curve fn taking (band, curve, index).
+fn de_napc_v3_fixture(
+    antenna: i16,
+    qualified: i16,
+    rows: &[(u8, u8, u8, u8, fn(u8, u8, u8) -> i16)],
+) -> Vec<u8> {
+    let factory = de_factory();
+    let identity = crate::rtlwifi::radio::factory_identity(&factory);
+    let total = 96 + rows.len() * 516;
+    let mut bytes = vec![0u8; total];
+    bytes[0..4].copy_from_slice(b"NAPC");
+    bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
+    bytes[6..8].copy_from_slice(&96u16.to_le_bytes());
+    bytes[8..12].copy_from_slice(&(total as u32).to_le_bytes());
+    bytes[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    bytes[14..16].copy_from_slice(&0x8193u16.to_le_bytes());
+    bytes[16..48].copy_from_slice(&identity);
+    bytes[48..54].copy_from_slice(&factory.mac);
+    bytes[56..58].copy_from_slice(&antenna.to_le_bytes());
+    bytes[58..60].copy_from_slice(&qualified.to_le_bytes());
+    bytes[60..62].copy_from_slice(&(rows.len() as u16).to_le_bytes());
+    for (i, (channel, band, bandwidth, offset, curve)) in rows.iter().enumerate() {
+        let row = &mut bytes[96 + i * 516..96 + (i + 1) * 516];
+        row[0] = *channel;
+        row[1] = *band;
+        row[2] = *bandwidth;
+        row[3] = *offset;
+        for curve_idx in 0..4u8 {
+            for idx in 0..64u8 {
+                let at = 4 + (usize::from(curve_idx) * 64 + usize::from(idx)) * 2;
+                row[at..at + 2]
+                    .copy_from_slice(&curve(*band, curve_idx, idx).to_le_bytes());
+            }
+        }
+    }
+    bytes
+}
+
+/// Flat rising curves on every family: output `2 * index` quarter
+/// dBm, so an 80 qdBm ceiling with antenna 0 admits index 40 on
+/// every rate. On 5 GHz rows the CCK curve (family 0) is unmeasured,
+/// as the format requires.
+fn de_v3_rising(band: u8, curve: u8, idx: u8) -> i16 {
+    if band == 1 && curve == 0 {
+        i16::MAX
+    } else {
+        i16::from(idx) * 2
+    }
+}
+
+/// 2SS curve unmeasured: MCS8-15 can never be admitted, while every
+/// other rate stays measured (5 GHz CCK still unmeasured).
+fn de_v3_no_2ss(band: u8, curve: u8, idx: u8) -> i16 {
+    if curve == 3 || (band == 1 && curve == 0) {
+        i16::MAX
+    } else {
+        i16::from(idx) * 2
+    }
+}
+
+/// 5 GHz CCK curve measured: a format violation on 5 GHz rows.
+fn de_v3_cck_5g(_band: u8, _curve: u8, idx: u8) -> i16 {
+    i16::from(idx) * 2
+}
+
 /// v1 parse + permission (all 20 rates admitted, index 40), tampered
 /// variants, the 5 GHz row refusal, unordered rows, unmeasured HT,
 /// and the v2 40 MHz point.
@@ -784,7 +877,8 @@ fn smoke_rtl8192de_envelope_parse_permission() -> TestResult {
     if Calibration::from_verified(&bytes, Some([0xabu8; 32]), &other).is_ok() {
         return TestResult::Fail("8192DE envelope identity mismatch admitted");
     }
-    // A 5 GHz row (band byte 1) is a format failure in step 2.
+    // A 5 GHz row (band byte 1) is a format failure in v2 (v2 is
+    // 2.4 GHz-only; v3 admits band-1 rows — see the v3 test below).
     let mut banded = de_napc_fixture(2, 0, 80, &[(6, 20, 0, de_rising)]);
     banded[96 + 1] = 1;
     if Calibration::from_verified(&banded, Some([0xabu8; 32]), &factory).is_ok() {
@@ -826,6 +920,181 @@ fn smoke_rtl8192de_envelope_parse_permission() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_envelope_parse_permission
+);
+
+/// NAPC v3: 5 GHz rows + 2SS HT rates end to end — v3 parse, band
+/// ordering, CCK-on-5GHz refusal, v2 5 GHz refusal, 5 GHz 20/40 MHz
+/// permissions (CCK refused, MCS8-15 admitted), DFS refusal, the
+/// two-stream gate on both RF types, and the ARFR MCS8-15 bits.
+fn smoke_rtl8192de_envelope_v3_5ghz_two_stream() -> TestResult {
+    use envelope::*;
+    let factory = de_factory();
+    let domain5 = de_us_5g_domain();
+    let rows: &[(u8, u8, u8, u8, fn(u8, u8, u8) -> i16)] = &[
+        (6, 0, 20, 0, de_v3_rising),
+        (36, 1, 20, 0, de_v3_rising),
+        (40, 1, 20, 0, de_v3_rising),
+        (165, 1, 20, 0, de_v3_rising),
+        (36, 1, 40, 1, de_v3_rising),
+        (40, 1, 40, 2, de_v3_rising),
+    ];
+    let bytes = de_napc_v3_fixture(0, 80, rows);
+    let cal = match Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8192DE envelope v3 parse"),
+    };
+    if cal.operating_points().count() != 6
+        || !cal.measures(Operating::twenty(36))
+        || !cal.measures(Operating {
+            width: Width::W40Above,
+            channel: 36,
+        })
+    {
+        return TestResult::Fail("8192DE envelope v3 rows");
+    }
+    if Operating::twenty(36).center_mhz() != Some(5180)
+        || Operating {
+            width: Width::W40Above,
+            channel: 36,
+        }
+        .center_mhz()
+            != Some(5190)
+        || Operating {
+            width: Width::W40Below,
+            channel: 40,
+        }
+        .center_mhz()
+            != Some(5190)
+        || Operating::twenty(165).center_mhz() != Some(5825)
+        || Operating {
+            width: Width::W40Above,
+            channel: 165,
+        }
+        .center_mhz()
+            .is_some()
+        || Operating {
+            width: Width::W40Below,
+            channel: 36,
+        }
+        .center_mhz()
+            .is_some()
+        || !station_channel(36)
+        || !station_channel(38)
+        || !station_channel(165)
+        || station_channel(34)
+        || station_frequency_mhz(36) != Some(5180)
+        || station_channel_at(5180) != Some(36)
+        || station_channel_at(5825) != Some(165)
+    {
+        return TestResult::Fail("8192DE envelope 5 GHz plan shape");
+    }
+    // 5 GHz 20 MHz: OFDM + MCS0-7 + MCS8-15 admitted (bits 4..27),
+    // CCK refused, index 40, EIRP 80 (30 dBm rules, qualified 80).
+    let p5 = match cal.permission_for(&domain5, Operating::twenty(36)) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("8192DE envelope 5 GHz permission"),
+    };
+    if p5.admitted_rates() != 0x0fff_fff0
+        || p5.eirp_limit_qdbm() != 80
+        || (0..4u8).any(|r| p5.admits(r))
+        || (4..28u8).any(|r| !p5.admits(r) || p5.index(r) != 40)
+    {
+        return TestResult::Fail("8192DE envelope 5 GHz permission values");
+    }
+    // 5 GHz 40 MHz above (36) and below (40): same admission.
+    for op in [
+        Operating {
+            width: Width::W40Above,
+            channel: 36,
+        },
+        Operating {
+            width: Width::W40Below,
+            channel: 40,
+        },
+    ] {
+        match cal.permission_for(&domain5, op) {
+            Ok(p) if p.admitted_rates() == 0x0fff_fff0 && p.eirp_limit_qdbm() == 80 => {}
+            _ => return TestResult::Fail("8192DE envelope 5 GHz 40 MHz permission"),
+        }
+    }
+    // 2.4 GHz from the same v3 file: all 28 rates admitted.
+    match cal.permission_for(&de_us_domain(), Operating::twenty(6)) {
+        Ok(p) if p.admitted_rates() == 0x0fff_ffff && p.eirp_limit_qdbm() == 80 => {}
+        _ => return TestResult::Fail("8192DE envelope v3 2.4 GHz permission"),
+    }
+    // Two-stream gate: 2T2R only, even with every 2SS rate measured.
+    if !ht::admitted(&p5)
+        || !ht::two_stream(&p5, RfType::TwoT2R)
+        || ht::two_stream(&p5, RfType::OneT1R)
+    {
+        return TestResult::Fail("8192DE two-stream gate");
+    }
+    // Unmeasured 2SS curve: permission still mints (2SS never
+    // required), MCS8-15 unadmitted, two-stream refused.
+    let no_2ss = de_napc_v3_fixture(0, 80, &[(36, 1, 20, 0, de_v3_no_2ss)]);
+    let cal_no_2ss = match Calibration::from_verified(&no_2ss, Some([0xabu8; 32]), &factory) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("8192DE envelope v3 no-2SS parse"),
+    };
+    match cal_no_2ss.permission_for(&domain5, Operating::twenty(36)) {
+        Ok(p)
+            if p.admitted_rates() == 0xfff0
+                && ht::admitted(&p)
+                && !ht::two_stream(&p, RfType::TwoT2R) => {}
+        _ => return TestResult::Fail("8192DE envelope unmeasured 2SS admitted"),
+    }
+    // A measured CCK curve on a 5 GHz row is a format failure.
+    let cck_5g = de_napc_v3_fixture(0, 80, &[(36, 1, 20, 0, de_v3_cck_5g)]);
+    if Calibration::from_verified(&cck_5g, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8192DE envelope measured 5 GHz CCK admitted");
+    }
+    // A 5 GHz primary in a v2 file is a format failure even with the
+    // band byte clear (v2 is 2.4 GHz-only).
+    let v2_5g = de_napc_fixture(2, 0, 80, &[(36, 20, 0, de_rising)]);
+    if Calibration::from_verified(&v2_5g, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8192DE envelope v2 5 GHz primary admitted");
+    }
+    // Band-1 rows before band-0 rows violate strict ordering.
+    let unordered = de_napc_v3_fixture(
+        0,
+        80,
+        &[(36, 1, 20, 0, de_v3_rising), (6, 0, 20, 0, de_v3_rising)],
+    );
+    if Calibration::from_verified(&unordered, Some([0xabu8; 32]), &factory).is_ok() {
+        return TestResult::Fail("8192DE envelope v3 unordered bands admitted");
+    }
+    // A flagged (DFS) rule overlapping the span refuses the point.
+    {
+        use narf_wireless::reg::*;
+        let mut dfs = de_us_5g_domain();
+        dfs.rules[0].flags = RegFlags::DFS;
+        if cal
+            .permission_for(&dfs, Operating::twenty(36))
+            .is_ok()
+        {
+            return TestResult::Fail("8192DE envelope DFS rule admitted");
+        }
+    }
+    // ARFR: MCS8-15 bits present on 2T2R, absent on 1T1R.
+    let sta = rate::StaRates {
+        supp_rates: [0, 0xfff],
+        mcs_rx_mask: [0xff, 0xff],
+        mode: rate::WirelessMode::N5g,
+        ht_enable: true,
+        bw40: false,
+        sgi20: false,
+        sgi40: false,
+    };
+    let v2t = rate::rate_table_value(&sta, Band::On5Ghz, RfType::TwoT2R);
+    let v1t = rate::rate_table_value(&sta, Band::On5Ghz, RfType::OneT1R);
+    if v2t & (0xff << 20) != 0x0f00_0000 || v1t & (0xff << 20) != 0 {
+        return TestResult::Fail("8192DE ARFR MCS8-15 bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_envelope_v3_5ghz_two_stream
 );
 
 /// Packet owner: firmware `Info` + envelope `Permission` admission,
