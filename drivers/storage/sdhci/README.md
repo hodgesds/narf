@@ -16,4 +16,15 @@ with `SdhciBlockDevice` implementing `BlockDeviceSync` for the block
 layer and `src/sdhci/fixture_tests.rs` holding the fixtures. The crate
 is dual-build (built-in or loadable `.ko`, `src/module_probe.rs`).
 
+## Power management (#839)
+
+`src/sdhci/pm.rs` joins the `power` device_pm fan-out at probe:
+suspend refuses new I/O, drains the controller and cuts the SD clock
++ card power; resume re-runs the bring-up hardware sequence and
+re-identifies the card, revalidating CID + capacity + CCS before
+serving I/O again (a mismatch keeps the controller suspended; a card
+removed while suspended unpublishes `sdhci0`). After 5 s idle the
+Stage::Late monitor task gates the card clock + power; the next block
+I/O ungates synchronously. Fixture-validated end to end in `pm.rs`.
+
 - Spec: [`../specification/spec.md`](../specification/spec.md)

@@ -115,6 +115,19 @@ pub fn register_initcalls() {
         rtsx::spawn_card_poll_task();
         InitResult::Ok
     });
+    // SDHCI idle monitor (#839): after RUNTIME_IDLE_TIMEOUT_MS with
+    // no block I/O the monitor gates the card clock + power; the
+    // next block I/O ungates synchronously (re-init + re-identify).
+    // NotPresent when no SDHCI controller probed (the USB
+    // supervisor rule).
+    #[cfg(feature = "sdhci")]
+    narf_init::register(Stage::Late, "sdhci-idle-monitor", || {
+        if !sdhci::is_probed() {
+            return InitResult::NotPresent;
+        }
+        sdhci::pm::spawn_idle_monitor_task();
+        InitResult::Ok
+    });
     // Intel VMD must register at Stage::Device because its probe appends
     // children into the bus registry that the *same* PCI walk's later probes
     // would not otherwise see. Keeping VMD at Stage::Device leaves the

@@ -478,6 +478,21 @@ impl FixtureTransport {
         self.state.lock().card = None;
     }
 
+    /// Insert (or replace) the card in the modelled slot — the
+    /// suspend/resume tests model a card swapped while the system
+    /// was suspended, or a card inserted after a resume-absent.
+    pub fn insert_card(&self, card: FixtureCard) {
+        self.state.lock().card = Some(card);
+    }
+
+    /// One byte of the modelled internal-register file (HAIMR /
+    /// command-entry address space) — lets PM tests assert the
+    /// power/clock registers the driver programs (CARD_PWR_CTL,
+    /// CARD_CLK_EN, FPDCTL) without going through the driver.
+    pub fn internal_reg(&self, addr: u16) -> u8 {
+        self.state.lock().regs[masked(addr)]
+    }
+
     /// Every SD command index the engine ran, in order.
     pub fn cmd_indices(&self) -> Vec<u8> {
         self.state.lock().cmd_log.iter().map(|(i, _)| *i).collect()

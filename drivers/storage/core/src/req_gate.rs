@@ -50,6 +50,16 @@ impl<'a> ReqGate<'a> {
         }
         ReqGate(flag)
     }
+
+    /// Take the gate only if it is free right now, without spinning.
+    /// The idle-power monitor (#839) uses this so a gate attempt never
+    /// waits out an in-flight transfer — a busy controller is simply
+    /// retried on the next tick.
+    pub fn try_acquire(flag: &'a AtomicBool) -> Option<ReqGate<'a>> {
+        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| ReqGate(flag))
+    }
 }
 
 impl Drop for ReqGate<'_> {
