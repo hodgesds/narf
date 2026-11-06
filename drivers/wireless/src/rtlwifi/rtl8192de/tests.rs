@@ -795,8 +795,7 @@ fn de_napc_v3_fixture(
         for curve_idx in 0..4u8 {
             for idx in 0..64u8 {
                 let at = 4 + (usize::from(curve_idx) * 64 + usize::from(idx)) * 2;
-                row[at..at + 2]
-                    .copy_from_slice(&curve(*band, curve_idx, idx).to_le_bytes());
+                row[at..at + 2].copy_from_slice(&curve(*band, curve_idx, idx).to_le_bytes());
             }
         }
     }
@@ -953,31 +952,31 @@ fn smoke_rtl8192de_envelope_v3_5ghz_two_stream() -> TestResult {
         return TestResult::Fail("8192DE envelope v3 rows");
     }
     if Operating::twenty(36).center_mhz() != Some(5180)
-        || Operating {
+        || (Operating {
             width: Width::W40Above,
             channel: 36,
-        }
+        })
         .center_mhz()
             != Some(5190)
-        || Operating {
+        || (Operating {
             width: Width::W40Below,
             channel: 40,
-        }
+        })
         .center_mhz()
             != Some(5190)
         || Operating::twenty(165).center_mhz() != Some(5825)
-        || Operating {
+        || (Operating {
             width: Width::W40Above,
             channel: 165,
-        }
+        })
         .center_mhz()
-            .is_some()
-        || Operating {
+        .is_some()
+        || (Operating {
             width: Width::W40Below,
             channel: 36,
-        }
+        })
         .center_mhz()
-            .is_some()
+        .is_some()
         || !station_channel(36)
         || !station_channel(38)
         || !station_channel(165)
@@ -1068,10 +1067,7 @@ fn smoke_rtl8192de_envelope_v3_5ghz_two_stream() -> TestResult {
         use narf_wireless::reg::*;
         let mut dfs = de_us_5g_domain();
         dfs.rules[0].flags = RegFlags::DFS;
-        if cal
-            .permission_for(&dfs, Operating::twenty(36))
-            .is_ok()
-        {
+        if cal.permission_for(&dfs, Operating::twenty(36)).is_ok() {
             return TestResult::Fail("8192DE envelope DFS rule admitted");
         }
     }
