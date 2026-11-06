@@ -341,8 +341,10 @@ pub struct RtlNic {
     mtu: IrqSafeSpinLock<u32>,
     /// Last WoL option set programmed via [`RtlNic::set_wol_opts`].
     wol_opts: IrqSafeSpinLock<crate::features::WolOpts>,
-    /// True when PHYStatus.LinkSts read 1 at bring-up. We don't yet
-    /// re-poll on LinkChg interrupts.
+    /// True when PHYStatus.LinkSts read 1 at bring-up. Probe-time
+    /// snapshot only — the RX pump re-samples PHYStatus every pass
+    /// and republishes transitions into iface metadata (issue #791),
+    /// which is where live carrier lives; see `r8169_rx_pump`.
     pub link_up: bool,
     /// IDT vector wired to MSI-X entry 0, when MSI-X is enabled.
     pub irq_vector: Option<u8>,
@@ -584,8 +586,11 @@ impl RtlNic {
         // 7. PHYStatus snapshot. The PHY sub-block runs auto-neg in
         //    the background; on a live cabled link the LinkSts bit
         //    reads 1 within ~3 seconds of reset. We capture the
-        //    current state — a follow-up wires LinkChg-driven
-        //    re-evaluation.
+        //    current state for the probe-time sample and the
+        //    `Interface::link_up` snapshot; the RX pump re-samples
+        //    PHYStatus every pass and republishes transitions
+        //    (issue #791) — LinkChg re-evaluation lives there, not
+        //    in a follow-up.
         // SAFETY: same.
         let phystat = unsafe { mmio.read8(REG_PHYSTAT) };
         let link_up = phystat & PHYSTAT_LINKSTS != 0;
@@ -1570,4 +1575,31 @@ pub fn with_controller_mut<R>(f: impl FnOnce(&mut RtlNic) -> R) -> Option<R> {
         .lock()
         .as_mut()
         .map(|a| f(Arc::get_mut(a).expect("RtlNic static has multiple owners")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{r8169_link_sample, PHYSTAT_LINKSTS};
+
+    /// PHYStatus decode fixture (issue #791). The bytes are built
+    /// from the register map in this file's header (PHYStatus
+    /// 0x6C, LinkSts at bit 1): only that bit proves carrier.
+    /// Speed/duplex stay unreported — they are PHY work (#790),
+    /// so the sample is carrier-only rather than a guessed rate.
+    #[test]
+    fn phystat_link_sample() {
+        let up = r8169_link_sample(PHYSTAT_LINKSTS);
+        assert!(up.carrier);
+        assert_eq!(up.speed_mbps, None);
+        assert_eq!(up.duplex, None);
+        // Other PHYStatus bits without LinkSts must not read as up.
+        let no_link = r8169_link_sample(0xFC & !PHYSTAT_LINKSTS);
+        assert!(!no_link.carrier);
+        assert_eq!(no_link.speed_mbps, None);
+        let down = r8169_link_sample(0);
+        assert!(!down.carrier);
+        // The pump's transition detector is sample inequality: a
+        // flip of exactly the LinkSts bit changes the sample.
+        assert_ne!(r8169_link_sample(PHYSTAT_LINKSTS), r8169_link_sample(0));
+    }
 }
