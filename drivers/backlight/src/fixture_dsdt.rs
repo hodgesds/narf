@@ -195,5 +195,5 @@ pub(crate) fn dsdt_bytes() -> Vec<u8> {
     let gfx0 = device("GFX0", &dd0);
 
     // Scope (\_SB) { GFX0 } — NameString is root char + "_SB_".
-    pkg_wrap(&[0x10], &[b'\\', b'_', b'S', b'B', b'_'], &[], &gfx0)
+    pkg_wrap(&[0x10], b"\\_SB_", &[], &gfx0)
 }
