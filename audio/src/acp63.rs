@@ -32,9 +32,10 @@ const INTR_ENABLE: u64 = 0x1a00;
 const INTR_CONTROL: u64 = 0x1a04;
 const INTR_STATUS: u64 = 0x1a0c;
 const PDM_ENABLE: u64 = 0x2c04;
-/// ACP DMA channel block, shared with the SDW DMA engine in
-/// `crate::acp63_sdw_dma` (the SDW binding owns the function
-/// exclusively when it binds, so the channel is free for its stream).
+/// ACP PDM/WOV DMA channel block (the PDM capture path's own
+/// registers). The SDW DMA engine (`crate::acp63_sdw_dma`) does NOT
+/// use this block: Linux programs per-stream SDW registers instead
+/// (#1337), so this block belongs to the PDM path alone.
 /// Offsets as in Linux `include/sound/acp63_chip_offset_byte.h`, the
 /// same header the PDM path's constants come from.
 pub(crate) const DMA_ENABLE: u64 = 0x2c08;
