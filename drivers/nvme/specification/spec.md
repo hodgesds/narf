@@ -294,4 +294,55 @@ NVMe-specific public API beyond that.
 
 ## 10. Open questions
 
-(none — all v0.1 questions resolved in §8)
+### 10.1 CID-matched completion tracking (delivered, #1619)
+
+**Delivered:** every completion consumer matches by CID (NVMe
+base spec §4.6: the CQE's `cid` echoes the submission's CDW0
+bits 16..31), never merely by taking the next entry at the CQ
+head:
+
+- `Queue::submit_raw_ms` (polled admin + I/O submit) loops on
+  the CQ head until the CQE carrying its own CID arrives, within
+  the caller's timeout budget. A stray whose CID is an
+  outstanding AER is stashed (`stray_aer`, bounded by
+  `ADMIN_Q_DEPTH - 1`) for `drain_aer`; any other stray is
+  consumed and dropped.
+- `Controller::drain_aer` consumes only CQEs whose CID is an
+  outstanding AER (tracked per admin queue in `aer_cids`),
+  drains the `stray_aer` stash first, and reposts one AER per
+  drained completion. A head entry carrying another CID is a
+  normal admin command's completion and is left for its waiter.
+- `Controller::submit_io_irq` / `submit_io_irq_async` drain
+  through `try_take_io_cqe`: only the CQE carrying the
+  submitted CID is accepted; strays are consumed and dropped
+  and the wait repeats within the command deadline. The async
+  loop re-checks the head after constructing each
+  `wait_for_irq_until` future, closing the lost-wakeup window
+  the old single-shot form's pre-doorbell construction handled.
+- Diagnostics: `Controller::aer_outstanding()` (posted, not yet
+  completed AERs) and `Controller::stray_aer_len()`.
+
+**Fixture:** `imp/tests_cid.rs` drives the real
+`submit_raw_ms` loop against a RAM-backed fake controller
+with spec-laid-out pre-posted CQEs (§4.6): a stray AER error
+completion at the admin head is skipped (event word stashed,
+then drained + reposted) and the submit returns its own CQE;
+an I/O-queue stray is dropped, never stashed. A live AER
+event cannot be synthesised on QEMU from the harness (no QMP
+hot-attach), so the live event half is silicon-only — the
+same carve-out as the AER supervisor.
+
+**Remainders (not this change):**
+
+- True concurrent async I/O still needs a per-queue CID waiter
+  table + `submit_io_begin` returning a per-CID wait (that split
+  is authored in unmerged PR #1617, which must rebase onto this
+  PR and drop its duplicate `submit_raw_ms` CID loop +
+  `stray_aer`/`aer_outstanding` hunks) + routing
+  `BlockDevice::submit` through `submit_io_irq_async` — all
+  gated on the `InstalledController` request-gate → async-Mutex
+  migration, since the gate serialises the whole controller
+  today and no second submitter can exist to wait.
+- A multi-submitter smoke belongs with that migration, not
+  here: through the gate it would only prove sequential
+  submits, not concurrency.
