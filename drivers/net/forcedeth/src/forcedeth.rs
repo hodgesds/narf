@@ -93,7 +93,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 use narf_driver_runtime::{
@@ -344,13 +344,43 @@ pub const RING_LEN: usize = 64;
 /// trailer.
 pub const RX_BUF_LEN: usize = 2048;
 
+/// TX watchdog timeout (Linux `dev->watchdog_timeo` is 5 s by
+/// default, and igc's supervisor uses the same 5 s): a TX
+/// descriptor posted longer ago than this with VALID still set is
+/// a wedged ring, not congestion.
+const TX_TIMEOUT_NS: u64 = 5_000_000_000;
+/// Watchdog supervisor cadence, matching igc's 10 ms maintenance tick.
+const TX_WATCHDOG_POLL_NS: u64 = 10_000_000;
+
+/// True when any posted TX descriptor has waited longer than
+/// `timeout` cycles with VALID still set — the ring is wedged (igc
+/// `Queue::stalled` shape, per-slot so a later post cannot mask
+/// an older stuck one). Factored pure so the fixture pins the
+/// decision the watchdog uses.
+fn tx_stalled(posted_at: &[u64; RING_LEN], now: u64, timeout: u64) -> bool {
+    posted_at
+        .iter()
+        .any(|&posted| posted != 0 && now.wrapping_sub(posted) > timeout)
+}
+
+/// Clear a slot's post time only if it still holds the stamp this
+/// post recorded: a later post to the same slot (after wraparound)
+/// must not have its stamp wiped by the earlier post's completion.
+fn tx_note_completed(posted_at: &mut [u64; RING_LEN], slot: usize, stamped: u64) {
+    if posted_at[slot] == stamped {
+        posted_at[slot] = 0;
+    }
+}
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NicError {
     BarMapFailed,
     NoMemory,
-    /// The `TxRxControl.IDLE` bit didn't go high inside the deadline.
+    /// A reset did not complete inside its deadline: either the
+    /// `TxRxControl.IDLE` bit never went high, or the `MacReset`
+    /// self-clear never landed.
     ResetTimeout,
     /// MII transaction never cleared the INUSE bit.
     MiiTimeout,
@@ -426,6 +456,29 @@ pub struct ForcedethNic {
     /// frame stays alive for the descriptor's lifetime.
     tx_pool: alloc::vec::Vec<DmaBuffer>,
     tx_head: IrqSafeSpinLock<u32>,
+    /// Cycle counter at which each TX slot was posted (`0` = no
+    /// descriptor outstanding). The watchdog treats an aged entry
+    /// as a wedged ring. Stamped by `transmit` after the kick,
+    /// cleared when the slot's VALID bit clears.
+    tx_posted_at: IrqSafeSpinLock<[u64; RING_LEN]>,
+    /// TX stall recoveries (Linux `tx_timeout_count`): incremented
+    /// by the watchdog supervisor when it fires `recover()` on a
+    /// ring stalled 5 s, mirroring igc's `tx_timeouts`.
+    tx_timeouts: AtomicU64,
+    /// Controller resets performed by [`ForcedethNic::recover`].
+    tx_resets: AtomicU64,
+    /// Set while [`ForcedethNic::recover`] owns the reset sequence:
+    /// TX posts fail fast instead of racing the ring reprogram (a
+    /// post landing mid-reset could be zeroed with the stale ring
+    /// or never rung).
+    recovering: AtomicBool,
+    /// TX ring epoch, advanced by [`ForcedethNic::recover`] on
+    /// every recovery. A `transmit` whose VALID poll straddles a
+    /// reset sees VALID clear because the reset zeroed the ring —
+    /// not because its frame went out. The epoch distinguishes a
+    /// real completion from a reset, so that caller reports
+    /// `TxTimeout` instead of a success it did not earn.
+    tx_epoch: AtomicU64,
     rx_ring: DmaBuffer,
     rx_pool: alloc::vec::Vec<DmaBuffer>,
     rx_head: IrqSafeSpinLock<u32>,
@@ -720,6 +773,11 @@ impl ForcedethNic {
             tx_ring,
             tx_pool,
             tx_head: IrqSafeSpinLock::new(0),
+            tx_posted_at: IrqSafeSpinLock::new([0; RING_LEN]),
+            tx_timeouts: AtomicU64::new(0),
+            tx_resets: AtomicU64::new(0),
+            recovering: AtomicBool::new(false),
+            tx_epoch: AtomicU64::new(0),
             rx_ring,
             rx_pool,
             rx_head: IrqSafeSpinLock::new(0),
@@ -748,6 +806,13 @@ impl ForcedethNic {
         }
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
+        }
+        // Fail fast while recovery owns the reset sequence: a post
+        // landing mid-reset could be zeroed with the stale ring.
+        // TxRingFull is the honest signal — the ring is not
+        // accepting posts right now, and the caller retries.
+        if self.recovering.load(Ordering::Acquire) {
+            return Err(NicError::TxRingFull);
         }
 
         let mut head_g = self.tx_head.lock();
@@ -814,6 +879,17 @@ impl ForcedethNic {
         *head_g = (*head_g + 1) % (RING_LEN as u32);
         drop(head_g);
 
+        // Post time for the watchdog (see `tx_stalled`): stamped
+        // once the kick has rung, so a descriptor the chip never
+        // completes ages from its post, not from entry.
+        let stamped = narf_time::now_cycles();
+        self.tx_posted_at.lock()[slot] = stamped;
+        // TX epoch at post time: if a watchdog recovery resets the
+        // ring while this poll runs, VALID reads clear because the
+        // reset zeroed the descriptor — the epoch check below keeps
+        // that from reporting as a completion.
+        let epoch = self.tx_epoch.load(Ordering::Acquire);
+
         // Poll for VALID → 0. The chip clears VALID once the frame
         // has been DMA'd to its TX FIFO. 250 ms wall-clock budget.
         let owned = narf_scheduler::responsive_spin_until(
@@ -824,6 +900,20 @@ impl ForcedethNic {
         if !owned {
             return Err(NicError::TxTimeout);
         }
+        // A reset during the poll zeroes the ring, so VALID reads
+        // clear even though this frame never went out: the epoch
+        // distinguishes a real completion from a reset.
+        if epoch != self.tx_epoch.load(Ordering::Acquire) {
+            return Err(NicError::TxTimeout);
+        }
+        // VALID cleared: the descriptor completed, so its post time
+        // is void (conditional clear — a later post to this slot
+        // must keep its own stamp).
+        {
+            let mut posted = self.tx_posted_at.lock();
+            tx_note_completed(&mut posted, slot, stamped);
+        }
+        // (no scratch drop — buffer is persistent in tx_pool)
         Ok(())
     }
 
@@ -1035,6 +1125,209 @@ impl ForcedethNic {
             crate::publish::LinkSample::carrier_only(self.live_link_up()),
         );
     }
+
+    /// TX stall recoveries (Linux `tx_timeout_count`).
+    pub fn tx_timeouts(&self) -> u64 {
+        self.tx_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Controller resets performed by [`ForcedethNic::recover`].
+    pub fn tx_resets(&self) -> u64 {
+        self.tx_resets.load(Ordering::Relaxed)
+    }
+
+    /// One watchdog pass (shared by the supervisor task and the
+    /// fixture): if the link is up and a TX descriptor has waited
+    /// past the timeout, count the timeout and recover. Returns
+    /// true when recovery fired.
+    fn check_tx_watchdog_at(&self, now: u64) -> bool {
+        if self.recovering.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.live_link_up() {
+            return false;
+        }
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        if !tx_stalled(&self.tx_posted_at.lock(), now, timeout) {
+            return false;
+        }
+        self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+        self.recover().is_ok()
+    }
+
+    /// TX-timeout recovery (Linux `nv_tx_timeout` + `nv_reset`
+    /// shape): stop the TX/RX paths, chip-wide MAC reset, reset the
+    /// TX/RX state machines, and reprogram the rings and filters
+    /// from the bring-up values. The TX cursor is reset —
+    /// descriptors posted before the reset will never complete —
+    /// and the RX descriptors are re-primed from the pool. A reset
+    /// that never self-clears reports `ResetTimeout` and leaves the
+    /// device stopped; a concurrent recovery reports `TxRingFull`
+    /// without touching the device. The PHY is not re-initialised:
+    /// the reset is a MAC-block reset and does not touch the MII
+    /// glue or the PHY.
+    pub fn recover(&self) -> Result<(), NicError> {
+        if self.recovering.swap(true, Ordering::AcqRel) {
+            return Err(NicError::TxRingFull);
+        }
+        // Advance the TX epoch before the reset: any `transmit`
+        // whose VALID poll straddles the reset sees VALID clear
+        // because the reset zeroed the ring, not because its frame
+        // went out — the epoch lets it report `TxTimeout` instead
+        // of a success it did not earn.
+        self.tx_epoch.fetch_add(1, Ordering::Release);
+        let result = self.recover_inner();
+        self.recovering.store(false, Ordering::Release);
+        if result.is_ok() {
+            self.tx_resets.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn recover_inner(&self) -> Result<(), NicError> {
+        // 1. Mask interrupts, clear any latched causes, and stop
+        // the TX/RX paths.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_IRQ_MASK, 0);
+            self.mmio.write32(REG_IRQ_STATUS, 0xFFFFFFFF);
+            self.mmio.write32(REG_XMIT_CTL, 0);
+            self.mmio.write32(REG_RCV_CTL, 0);
+        }
+        // Poll the TX/RX BUSY bits to 0 ("polled at stop" per the
+        // register table). A path that never idles is itself the
+        // wedge; the MAC reset below is what un-wedges it, so the
+        // result is observed but does not fail the recovery.
+        let _ = narf_scheduler::responsive_spin_until(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { self.mmio.read32(REG_XMIT_STATUS) } & XMIT_STATUS_BUSY == 0
+                && unsafe { self.mmio.read32(REG_RCV_STATUS) } & RCV_STATUS_BUSY == 0,
+            narf_time::Deadline::after_ms(100),
+        );
+        // 2. Chip-wide MAC reset. `MacReset` self-clears once the
+        // MAC block has re-initialised; 100 ms is the wedge
+        // threshold (same bound as the other families' resets).
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_MAC_RESET, MAC_RESET_ASSERT);
+        }
+        let cleared = narf_scheduler::responsive_spin_until(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { self.mmio.read32(REG_MAC_RESET) } & MAC_RESET_ASSERT == 0,
+            narf_time::Deadline::after_ms(100),
+        );
+        if !cleared {
+            return Err(NicError::ResetTimeout);
+        }
+        // Re-mask after the reset: the reset may have restored the
+        // power-on mask, and Stage-2 stays polled.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_IRQ_MASK, 0);
+            self.mmio.write32(REG_IRQ_STATUS, 0xFFFFFFFF);
+        }
+        // 3. Reset the TX/RX state machines (bring-up step 1):
+        // raise RESET | BIT2 | txrxctl_bits, push the write, wait
+        // 2 ms, then lower RESET.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(
+                REG_TX_RX_CONTROL,
+                TXRXCTL_BIT2 | TXRXCTL_RESET | self.txrxctl_bits,
+            );
+            let _ = self.mmio.read32(REG_TX_RX_CONTROL);
+        }
+        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(2));
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio
+                .write32(REG_TX_RX_CONTROL, TXRXCTL_BIT2 | self.txrxctl_bits);
+            let _ = self.mmio.read32(REG_TX_RX_CONTROL);
+        }
+        // 4. Reprogram the MII clock divider (bring-up step 4) and
+        // the station address. The MAC reset may have cleared the
+        // address registers, so rewrite the decoded MAC in natural
+        // order with MAC_ADDR_REV latched — the post-bring-up
+        // layout in both the correct-order and the reversed-order
+        // cases, so the write is idempotent.
+        let mac_a = (self.mac[0] as u32)
+            | ((self.mac[1] as u32) << 8)
+            | ((self.mac[2] as u32) << 16)
+            | ((self.mac[3] as u32) << 24);
+        let mac_b = (self.mac[4] as u32) | ((self.mac[5] as u32) << 8);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_MII_SPEED, MIISPEED_DEFAULT);
+            self.mmio.write32(REG_MAC_ADDR_A, mac_a);
+            self.mmio.write32(REG_MAC_ADDR_B, mac_b);
+            let txpoll = self.mmio.read32(REG_TRANSMIT_POLL);
+            self.mmio
+                .write32(REG_TRANSMIT_POLL, txpoll | TRANSMIT_POLL_MAC_ADDR_REV);
+        }
+        // 5. Zero the TX ring (a stale VALID bit would make a fresh
+        // post look ring-full) and reprogram the ring bases +
+        // sizes (bring-up step 7).
+        // SAFETY: the TX ring is a coherent DMA buffer of exactly
+        // `RING_LEN * 8` bytes.
+        unsafe {
+            core::ptr::write_bytes(self.tx_ring.cpu_mut_ptr_at::<u8>(0), 0, RING_LEN * 8);
+        }
+        let tx_phys = self.tx_ring.dma_addr().raw();
+        let rx_phys = self.rx_ring.dma_addr().raw();
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_TX_RING_PHYS, tx_phys as u32);
+            self.mmio.write32(REG_RX_RING_PHYS, rx_phys as u32);
+            self.mmio
+                .write32(REG_TX_RING_PHYS_HIGH, (tx_phys >> 32) as u32);
+            self.mmio
+                .write32(REG_RX_RING_PHYS_HIGH, (rx_phys >> 32) as u32);
+            self.mmio.write32(
+                REG_RING_SIZES,
+                ((RING_LEN as u32 - 1) << RINGSZ_TXSHIFT)
+                    | ((RING_LEN as u32 - 1) << RINGSZ_RXSHIFT),
+            );
+        }
+        // 6. Re-prime the RX descriptors from the pool (bring-up
+        // step 8).
+        let rx_ring_phys = self.rx_ring.dma_addr().raw();
+        for (i, slot) in self.rx_pool.iter().enumerate().take(RING_LEN) {
+            let buf_phys = slot.dma_addr().raw();
+            let d = Desc {
+                buf: buf_phys as u32,
+                flaglen: RXD_AVAIL | (RX_BUF_LEN as u32 & DESC_LEN_MASK_V2),
+            };
+            // SAFETY: identity-mapped DMA ring page; i < RING_LEN.
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(rx_ring_phys + (i * 8) as u64)
+                        .kernel_mut_ptr::<Desc>(),
+                    d,
+                );
+            }
+        }
+        // 7. Restore the packet filter and re-enable the receive +
+        // transmit paths (bring-up step 10).
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio
+                .write32(REG_PACKET_FILTER, PFF_ALWAYS | PFF_MYADDR);
+            self.mmio
+                .write32(REG_RCV_CTL, RCV_CTL_RX_PATH_EN | RCV_CTL_START);
+            self.mmio
+                .write32(REG_XMIT_CTL, XMIT_CTL_TX_PATH_EN | XMIT_CTL_START);
+        }
+        // 8. Reset the software cursors now that the rings are
+        // fresh, and republish link from the live PHY state.
+        *self.tx_head.lock() = 0;
+        *self.rx_head.lock() = 0;
+        self.tx_posted_at.lock().fill(0);
+        crate::publish::publish_link(
+            forcedeth_ifname(),
+            crate::publish::LinkSample::carrier_only(self.live_link_up()),
+        );
+        Ok(())
+    }
 }
 
 // ── MII transaction helper ──────────────────────────────────────────
@@ -1210,9 +1503,14 @@ fn spawn_pumps(
         forcedeth_rx_pump(d1, rx_prod).await;
     });
 
-    let d2 = device;
+    let d2 = device.clone();
     narf_scheduler::spawn(async move {
         forcedeth_tx_pump(d2, tx_cons).await;
+    });
+
+    let d3 = device;
+    narf_scheduler::spawn(async move {
+        forcedeth_watchdog_pump(d3).await;
     });
 }
 
@@ -1258,6 +1556,18 @@ async fn forcedeth_rx_pump(device: Arc<ForcedethNic>, mut rx_prod: Producer<Fram
 async fn forcedeth_tx_pump(device: Arc<ForcedethNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
         let _ = device.transmit(frame.payload(), &TxMeta::plain());
+    }
+}
+
+/// TX-timeout supervisor (igc maintenance-task shape): every 10 ms
+/// run one watchdog pass; a ring stalled 5 s with carrier up is
+/// recovered and counted. The pass itself gates on an in-flight
+/// recovery, so this loop is only a timer.
+async fn forcedeth_watchdog_pump(device: Arc<ForcedethNic>) {
+    let tick = narf_time::ns_to_cycles(TX_WATCHDOG_POLL_NS);
+    loop {
+        narf_time::sleep_cycles(tick).await;
+        device.check_tx_watchdog_at(narf_time::now_cycles());
     }
 }
 
@@ -1441,6 +1751,8 @@ pub fn with_controller_mut<R>(f: impl FnOnce(&mut ForcedethNic) -> R) -> Option<
 
 #[cfg(target_arch = "x86_64")]
 mod tests {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -1707,4 +2019,294 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/forcedeth", smoke_forcedeth_ring_sizes_encoding);
+
+    fn smoke_forcedeth_tx_stall_detection() -> TestResult {
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        let mut posted = [0u64; RING_LEN];
+        if tx_stalled(&posted, 1_000_000, timeout) {
+            return TestResult::Fail("forcedeth idle TX ring reported stalled");
+        }
+        let now = 10_000_000u64;
+        posted[5] = now;
+        if tx_stalled(&posted, now + timeout, timeout) {
+            return TestResult::Fail("forcedeth TX stall fired at exactly the timeout");
+        }
+        if !tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("forcedeth TX stall did not fire past the timeout");
+        }
+        // A second, later post does not mask the older stuck one...
+        posted[6] = now + 100;
+        if !tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("forcedeth later TX post masked the stuck descriptor");
+        }
+        // ...and completing the oldest clears the stall once nothing
+        // aged remains.
+        tx_note_completed(&mut posted, 5, now);
+        if tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("forcedeth TX stall survived completing the stuck slot");
+        }
+        // A completion stamped for a different post leaves the
+        // current post's stamp alone.
+        tx_note_completed(&mut posted, 6, now);
+        if posted[6] == 0 {
+            return TestResult::Fail("forcedeth completion cleared a different post's stamp");
+        }
+        tx_note_completed(&mut posted, 6, now + 100);
+        if tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("forcedeth empty TX ring reported stalled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/forcedeth", smoke_forcedeth_tx_stall_detection);
+
+    /// Fake nForce MAC for the TX-timeout fixture: a 4 KiB MMIO
+    /// backing page plus a sleep-pump that emulates the two
+    /// hardware behaviours recovery depends on — `MacReset`
+    /// self-clear and TX descriptor completion (VALID clear) once
+    /// the test arms it. Built from the spec (register offsets,
+    /// reset semantics), never from the implementation's constants.
+    static FIXTURE_MMIO: AtomicU64 = AtomicU64::new(0);
+    static FIXTURE_COMPLETE_TX: AtomicBool = AtomicBool::new(false);
+    static FIXTURE_PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+    fn fixture_pump() {
+        let base = FIXTURE_MMIO.load(Ordering::Acquire);
+        if base == 0 {
+            return;
+        }
+        // SAFETY: fixture-owned fake MMIO; base is published by the
+        // fixture and cleared on drop. The backing page is 4 KiB, so
+        // every register offset below is in bounds.
+        unsafe {
+            let rst = core::ptr::read_volatile((base + REG_MAC_RESET) as *const u32);
+            if rst & MAC_RESET_ASSERT != 0 {
+                core::ptr::write_volatile(
+                    (base + REG_MAC_RESET) as *mut u32,
+                    rst & !MAC_RESET_ASSERT,
+                );
+            }
+            if FIXTURE_COMPLETE_TX.load(Ordering::Acquire) {
+                let ring_lo =
+                    core::ptr::read_volatile((base + REG_TX_RING_PHYS) as *const u32) as u64;
+                let ring_hi =
+                    core::ptr::read_volatile((base + REG_TX_RING_PHYS_HIGH) as *const u32) as u64;
+                let ring = (ring_hi << 32) | ring_lo;
+                if ring != 0 {
+                    for slot in 0..RING_LEN {
+                        let flaglen = narf_memory::PhysAddr::new(ring + (slot * 8) as u64 + 4)
+                            .kernel_mut_ptr::<u32>();
+                        // SAFETY: fixture-owned DMA ring; slot bounded.
+                        if core::ptr::read_volatile(flaglen) & TXD_VALID != 0 {
+                            let v = core::ptr::read_volatile(flaglen);
+                            core::ptr::write_volatile(flaglen, v & !TXD_VALID);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct TxTimeoutFixture {
+        device: ForcedethNic,
+        _mmio_mem: DmaBuffer,
+    }
+
+    impl TxTimeoutFixture {
+        fn new() -> Self {
+            // 4 KiB fake BAR0 (register window is 0x000..0x194).
+            let mut mem = alloc_coherent(4096, DomainId::DRIVER_0).unwrap();
+            mem.as_mut_slice().fill(0);
+            let csr = MmioRegion {
+                phys: mem.phys_addr(),
+                virt: mem.as_mut_ptr() as u64,
+                len: mem.len() as u64,
+                kind: narf_bus::BarKind::Mmio32 {
+                    prefetchable: false,
+                },
+            };
+            // Seed the fake PHY's BMSR with link up (IEEE 802.3
+            // Clause 22 bit 2): the watchdog gates on the live link
+            // sample, and the fake MII glue returns MIIData verbatim.
+            // SAFETY: fixture-owned MMIO backing.
+            unsafe {
+                csr.write32(REG_MII_DATA, BMSR_LINK_UP as u32);
+            }
+            FIXTURE_MMIO.store(csr.virt, Ordering::Release);
+            if !FIXTURE_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
+                narf_scheduler::sleep_pumps::register_nested_only(fixture_pump);
+            }
+            let tx_ring = alloc_coherent(RING_LEN * 8, DomainId::DRIVER_0).unwrap();
+            let rx_ring = alloc_coherent(RING_LEN * 8, DomainId::DRIVER_0).unwrap();
+            let mut rx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
+            for _ in 0..RING_LEN {
+                rx_pool.push(alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).unwrap());
+            }
+            let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
+            for _ in 0..RING_LEN {
+                tx_pool.push(alloc_coherent(2048, DomainId::DRIVER_0).unwrap());
+            }
+            let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+            let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+            let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+            let device = ForcedethNic {
+                mmio: csr,
+                tx_ring,
+                tx_pool,
+                tx_head: IrqSafeSpinLock::new(0),
+                tx_posted_at: IrqSafeSpinLock::new([0; RING_LEN]),
+                tx_timeouts: AtomicU64::new(0),
+                tx_resets: AtomicU64::new(0),
+                recovering: AtomicBool::new(false),
+                tx_epoch: AtomicU64::new(0),
+                rx_ring,
+                rx_pool,
+                rx_head: IrqSafeSpinLock::new(0),
+                mac,
+                link_up: true,
+                phy_addr: 0,
+                txrxctl_bits: TXRXCTL_DESC_2,
+                rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+                tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+            };
+            // Bring-up register program (steps 7–10), minus the IRQ
+            // install and the PHY scan: ring bases + sizes, RX
+            // prime, mask, filter, path enable.
+            let tx_phys = device.tx_ring.dma_addr().raw();
+            let rx_phys = device.rx_ring.dma_addr().raw();
+            // SAFETY: fixture-owned fake MMIO.
+            unsafe {
+                device.mmio.write32(REG_TX_RING_PHYS, tx_phys as u32);
+                device.mmio.write32(REG_RX_RING_PHYS, rx_phys as u32);
+                device
+                    .mmio
+                    .write32(REG_TX_RING_PHYS_HIGH, (tx_phys >> 32) as u32);
+                device
+                    .mmio
+                    .write32(REG_RX_RING_PHYS_HIGH, (rx_phys >> 32) as u32);
+                device.mmio.write32(
+                    REG_RING_SIZES,
+                    ((RING_LEN as u32 - 1) << RINGSZ_TXSHIFT)
+                        | ((RING_LEN as u32 - 1) << RINGSZ_RXSHIFT),
+                );
+            }
+            // Prime the RX descriptors from the pool (bring-up step 8).
+            let rx_ring_phys = device.rx_ring.dma_addr().raw();
+            for (i, slot) in device.rx_pool.iter().enumerate().take(RING_LEN) {
+                let buf_phys = slot.dma_addr().raw();
+                let d = Desc {
+                    buf: buf_phys as u32,
+                    flaglen: RXD_AVAIL | (RX_BUF_LEN as u32 & DESC_LEN_MASK_V2),
+                };
+                // SAFETY: identity-mapped DMA ring page; i < RING_LEN.
+                unsafe {
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(rx_ring_phys + (i * 8) as u64)
+                            .kernel_mut_ptr::<Desc>(),
+                        d,
+                    );
+                }
+            }
+            // SAFETY: fixture-owned fake MMIO.
+            unsafe {
+                device.mmio.write32(REG_IRQ_MASK, 0);
+                device.mmio.write32(REG_IRQ_STATUS, 0xFFFFFFFF);
+                device
+                    .mmio
+                    .write32(REG_PACKET_FILTER, PFF_ALWAYS | PFF_MYADDR);
+                device
+                    .mmio
+                    .write32(REG_RCV_CTL, RCV_CTL_RX_PATH_EN | RCV_CTL_START);
+                device
+                    .mmio
+                    .write32(REG_XMIT_CTL, XMIT_CTL_TX_PATH_EN | XMIT_CTL_START);
+            }
+            core::mem::drop(rx_prod);
+            core::mem::drop(tx_cons);
+            Self {
+                device,
+                _mmio_mem: mem,
+            }
+        }
+    }
+
+    impl Drop for TxTimeoutFixture {
+        fn drop(&mut self) {
+            FIXTURE_COMPLETE_TX.store(false, Ordering::Release);
+            FIXTURE_MMIO.store(0, Ordering::Release);
+        }
+    }
+
+    fn smoke_forcedeth_tx_timeout_recovery_fixture() -> TestResult {
+        let fixture = TxTimeoutFixture::new();
+        let device = &fixture.device;
+        let frame = [0xAAu8; 64];
+        // 1. Stall: the fake device never completes the descriptor,
+        // so the synchronous post times out — the wedged ring, as
+        // the field sees it.
+        if device.transmit(&frame, &TxMeta::plain()).is_ok() {
+            return TestResult::Fail("forcedeth TX completed against a wedged fake device");
+        }
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        let posted = device.tx_posted_at.lock()[0];
+        if posted == 0 {
+            return TestResult::Fail("forcedeth TX post did not stamp a post time");
+        }
+        // 2. The watchdog does not fire inside the grace period...
+        if device.check_tx_watchdog_at(posted + timeout) {
+            return TestResult::Fail("forcedeth watchdog fired at exactly the timeout");
+        }
+        if device.tx_resets() != 0 || device.tx_timeouts() != 0 {
+            return TestResult::Fail("forcedeth watchdog counted a recovery it did not fire");
+        }
+        // ...but fires past it, resets the controller, and the ring
+        // comes back.
+        if !device.check_tx_watchdog_at(posted + timeout + 1) {
+            return TestResult::Fail("forcedeth watchdog did not fire past the timeout");
+        }
+        if device.tx_timeouts() != 1 || device.tx_resets() != 1 {
+            return TestResult::Fail("forcedeth watchdog recovery was not counted");
+        }
+        // The recovery advanced the TX epoch exactly once, so a
+        // `transmit` whose VALID poll straddled the reset cannot
+        // mistake the zeroed ring for a completion.
+        if device.tx_epoch.load(Ordering::Relaxed) != 1 {
+            return TestResult::Fail("forcedeth recovery did not advance the TX epoch");
+        }
+        // SAFETY: fixture-owned fake MMIO.
+        unsafe {
+            let tx_lo = device.mmio.read32(REG_TX_RING_PHYS) as u64;
+            let tx_hi = device.mmio.read32(REG_TX_RING_PHYS_HIGH) as u64;
+            if (tx_hi << 32) | tx_lo != device.tx_ring.dma_addr().raw() {
+                return TestResult::Fail("forcedeth recovery left a stale TX ring base");
+            }
+            if device.mmio.read32(REG_XMIT_CTL) & XMIT_CTL_TX_PATH_EN == 0 {
+                return TestResult::Fail("forcedeth recovery left TX disabled");
+            }
+            if device.mmio.read32(REG_RCV_CTL) & RCV_CTL_RX_PATH_EN == 0 {
+                return TestResult::Fail("forcedeth recovery left RX disabled");
+            }
+            if device.mmio.read32(REG_PACKET_FILTER) & PFF_MYADDR == 0 {
+                return TestResult::Fail("forcedeth recovery left the packet filter unprogrammed");
+            }
+        }
+        if tx_stalled(&device.tx_posted_at.lock(), posted + timeout + 1, timeout) {
+            return TestResult::Fail("forcedeth TX stall survived the recovery");
+        }
+        // 3. Traffic resumes: with the fake device completing
+        // descriptors again, a fresh post completes.
+        FIXTURE_COMPLETE_TX.store(true, Ordering::Release);
+        if device.transmit(&frame, &TxMeta::plain()).is_err() {
+            return TestResult::Fail("forcedeth TX did not resume after recovery");
+        }
+        // The completed frame cleared its post time, so nothing
+        // aged remains for the watchdog to fire on.
+        if device.check_tx_watchdog_at(narf_time::now_cycles()) {
+            return TestResult::Fail("forcedeth watchdog fired on an empty ring");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/forcedeth",
+        smoke_forcedeth_tx_timeout_recovery_fixture
+    );
 }
