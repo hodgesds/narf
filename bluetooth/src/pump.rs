@@ -3301,6 +3301,7 @@ impl PumpCore {
         self.send_command(op::HCI_LE_START_ENCRYPTION, &params)
             .map_err(|_| SmpEncryptError::Transport)
     }
+}
 
 /// Errors cancelling an in-flight pairing on a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
