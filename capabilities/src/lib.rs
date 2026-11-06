@@ -259,12 +259,19 @@ pub struct Cap<T, R: Rights> {
 }
 
 impl<T, R: Rights> Cap<T, R> {
-    /// Internal: construct a cap from a raw slot.
+    /// In-crate constructor from a raw slot. Deliberately NOT public
+    /// (SEC-B5, #1293): `Cap<T, R>` cannot be constructed outside
+    /// `capabilities/` — the only public entry points are
+    /// `Cap::bootstrap` (fresh object-table entry),
+    /// `Cap::derive` (weaken a live cap), and `Cap::transfer`
+    /// (Grant-gated cross-table install). A `CapSlot` on its own
+    /// carries no authority: it is ABI data, and without this
+    /// constructor it cannot be re-typed into a `Cap`.
     ///
     /// # Safety
-    /// The slot must have been minting by a TCB-authorised path and
+    /// The slot must have been minted by a TCB-authorised path and
     /// its `type_tag` and `rights` must match `T` and `R`.
-    pub const unsafe fn mint(slot: CapSlot) -> Self {
+    const unsafe fn mint(slot: CapSlot) -> Self {
         Self {
             slot,
             _tag: PhantomData,

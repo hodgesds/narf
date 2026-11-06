@@ -499,18 +499,11 @@ kernel_test_in!(
 
 fn smoke_rtw89_rx_current_native_authority_precedes_allocation_and_dma_reads() -> TestResult {
     use narf_bus::{BusAddr, BusDevice, BusDeviceCap, BusKind, DeviceId, MmioRegion, PcieAddr};
-    use narf_capabilities::{object_table, Cap, CapKind, CapSlot, Rights, Write};
-    let (index, generation) = object_table::register(CapKind::BusDevice);
-    // SAFETY: fresh private object with exact BusDevice/Write generation and
-    // rights; the model owns all mapped register RAM for this capability.
-    let authority = unsafe {
-        Cap::<BusDeviceCap, Write>::mint(CapSlot::new(
-            generation,
-            index,
-            Write::BITS,
-            CapKind::BusDevice as u32,
-        ))
-    };
+    use narf_capabilities::{Cap, Write};
+    // Fresh live BusDevice/Write fixture authority, minted via the
+    // safe `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    let authority = Cap::<BusDeviceCap, Write>::bootstrap();
     let mut words = vec![0u32; 0x10000 / 4];
     let region = MmioRegion {
         phys: narf_memory::PhysAddr::new(0),

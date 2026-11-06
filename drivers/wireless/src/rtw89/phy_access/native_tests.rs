@@ -6,19 +6,12 @@ use core::{
     pin::pin,
     task::{Context, Poll, Waker},
 };
-use narf_capabilities::{object_table, CapKind, CapSlot, Rights};
 use narf_kernel_test::{kernel_test_in, TestResult};
 fn cap() -> Cap<BusDeviceCap, Write> {
-    let (index, generation) = object_table::register(CapKind::BusDevice);
-    // SAFETY: fresh private model object and matching kind/generation/rights.
-    unsafe {
-        Cap::mint(CapSlot::new(
-            generation,
-            index,
-            Write::BITS,
-            CapKind::BusDevice as u32,
-        ))
-    }
+    // Fresh live BusDevice/Write fixture cap, minted via the safe
+    // `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    Cap::bootstrap()
 }
 fn region(words: &mut Vec<u32>) -> MmioRegion {
     MmioRegion {

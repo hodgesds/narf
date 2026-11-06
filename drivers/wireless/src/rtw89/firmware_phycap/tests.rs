@@ -10,7 +10,7 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use narf_bus::BusDeviceCap;
-use narf_capabilities::{object_table, Cap, CapKind, CapSlot, Rights, Write};
+use narf_capabilities::{Cap, Write};
 use narf_kernel_test::{kernel_test_in, TestResult};
 include!("golden.rs");
 struct Model {
@@ -44,16 +44,10 @@ impl Model {
         model
     }
     fn new(seed: u8, response: [u32; 4]) -> Self {
-        let (index, generation) = object_table::register(CapKind::BusDevice);
-        // SAFETY: fresh exact inert BusDevice fixture object with Write rights.
-        let authority = unsafe {
-            Cap::mint(CapSlot::new(
-                generation,
-                index,
-                Write::BITS,
-                CapKind::BusDevice as u32,
-            ))
-        };
+        // Fresh live BusDevice/Write fixture authority, minted via the
+        // safe `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+        // crate-private to `capabilities/`).
+        let authority = Cap::bootstrap();
         let mut bytes = vec![seed; 65536];
         bytes[0x8160] = 0;
         bytes[0x8164] = 0;

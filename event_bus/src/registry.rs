@@ -238,9 +238,13 @@ fn create_topic_inner<T: Event>(
     let ring: Arc<Ring<T>> = Arc::new(Ring::new(capacity));
     let arena = arena_slot_bytes.map(|sb| Arc::new(Arena::new(capacity, sb)));
 
-    // Mint publisher + subscriber object-table entries up front so
-    // we record the indices for revocation tracking.
-    let (pub_index, pub_gen) = object_table::register(CapKind::EventPublisher);
+    // Mint the publisher cap up front (and reserve the subscriber
+    // object-table entry) so we record the indices for revocation
+    // tracking. `Cap::bootstrap` registers the fresh
+    // EventPublisher entry and mints the cap for it (SEC-B5,
+    // #1293: `Cap::mint` is crate-private to `capabilities/`).
+    let publisher_cap: Cap<PublisherCap, Invoke> = Cap::bootstrap();
+    let pub_index = publisher_cap.slot().index;
     let (sub_index, _sub_gen) = object_table::register(CapKind::EventSubscriber);
 
     let entry = Arc::new(TopicEntry {
@@ -266,16 +270,6 @@ fn create_topic_inner<T: Event>(
     let topic_id = TopicId((g.topics.len() - 1) as u32);
     drop(g);
 
-    let publisher_cap_slot = CapSlot::new(
-        pub_gen,
-        pub_index,
-        Invoke::BITS,
-        CapKind::EventPublisher as u32,
-    );
-    // SAFETY: We just registered this slot in the object table;
-    // type_tag matches CapKind::EventPublisher.
-    // SAFETY: Valid memory or trusted environment
-    let publisher_cap: Cap<PublisherCap, Invoke> = unsafe { Cap::mint(publisher_cap_slot) };
     let publisher = Publisher::new(publisher_cap, ring, arena, topic_id);
 
     // Audit topic creation. Suppress the audit emit when we're
@@ -316,15 +310,10 @@ pub fn lookup_topic<T: Event>(
         .downcast::<Ring<T>>()
         .map_err(|_| LookupError::PayloadMismatch)?;
     let cursor = ring.attach_cursor();
-    let (sub_idx, sub_gen) = object_table::register(CapKind::EventSubscriber);
-    let sub_cap_slot = CapSlot::new(
-        sub_gen,
-        sub_idx,
-        Invoke::BITS,
-        CapKind::EventSubscriber as u32,
-    );
-    // SAFETY: just minted the slot.
-    let sub_cap: Cap<SubscriberCap, Invoke> = unsafe { Cap::mint(sub_cap_slot) };
+    // `Cap::bootstrap` registers a fresh EventSubscriber entry and
+    // mints the cap for it (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    let sub_cap: Cap<SubscriberCap, Invoke> = Cap::bootstrap();
     Ok(Subscriber::new(sub_cap, ring, entry.arena.clone(), cursor))
 }
 
@@ -354,15 +343,10 @@ pub fn audit_subscribe_kernel(
         .downcast::<Ring<crate::audit::AuditEvent>>()
         .map_err(|_| LookupError::PayloadMismatch)?;
     let cursor = ring.attach_cursor();
-    let (sub_idx, sub_gen) = object_table::register(CapKind::EventSubscriber);
-    let sub_cap_slot = CapSlot::new(
-        sub_gen,
-        sub_idx,
-        Invoke::BITS,
-        CapKind::EventSubscriber as u32,
-    );
-    // SAFETY: just minted the slot.
-    let sub_cap: Cap<SubscriberCap, Invoke> = unsafe { Cap::mint(sub_cap_slot) };
+    // `Cap::bootstrap` registers a fresh EventSubscriber entry and
+    // mints the cap for it (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    let sub_cap: Cap<SubscriberCap, Invoke> = Cap::bootstrap();
     Ok(Subscriber::new(sub_cap, ring, entry.arena.clone(), cursor))
 }
 

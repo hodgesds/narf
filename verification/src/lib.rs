@@ -1595,16 +1595,10 @@ kernel_test!(smoke_rcu_sleepable_timeout);
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn make_block_request(op: narf_block::BlockOp, user_tag: u64) -> narf_block::BlockRequest {
     use narf_block::{BlockRequest, QosHint};
-    use narf_capabilities::{Cap, CapSlot, Read, Rights};
-    // SAFETY: Valid memory or trusted environment
-    let cap = unsafe {
-        Cap::<narf_io::DmaBuffer, Read>::mint(CapSlot::new(
-            1,
-            0,
-            Read::BITS,
-            narf_capabilities::CapKind::DmaBuffer as u32,
-        ))
-    };
+    use narf_capabilities::{Cap, Read};
+    // Minted via the safe `Cap::bootstrap` path (SEC-B5, #1293:
+    // `Cap::mint` is crate-private to `capabilities/`).
+    let cap = Cap::<narf_io::DmaBuffer, Read>::bootstrap();
     BlockRequest {
         op,
         lba: 0,

@@ -10,21 +10,14 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use narf_bus::{BusAddr, BusKind, DeviceId, PcieAddr};
-use narf_capabilities::{object_table, CapKind, CapSlot, Rights};
 use narf_kernel_test::{kernel_test_in, TestResult};
 include!("radio_init/header_golden.rs");
 
 fn cap() -> Cap<BusDeviceCap, Write> {
-    let (index, generation) = object_table::register(CapKind::BusDevice);
-    // SAFETY: fresh model object, exact BusDevice/Write rights and generation.
-    unsafe {
-        Cap::mint(CapSlot::new(
-            generation,
-            index,
-            Write::BITS,
-            CapKind::BusDevice as u32,
-        ))
-    }
+    // Fresh live BusDevice/Write fixture cap, minted via the safe
+    // `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    Cap::bootstrap()
 }
 fn device(chip: ChipId) -> BusDevice {
     let address = PcieAddr::new(0, 0, 7, 0);

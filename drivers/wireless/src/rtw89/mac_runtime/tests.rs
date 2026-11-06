@@ -407,20 +407,14 @@ kernel_test_in!(
 );
 
 fn smoke_rtw89_b_mac_uses_current_native_authority_before_register_access() -> TestResult {
-    use narf_capabilities::{object_table, Cap, CapKind, CapSlot, Rights, Write};
+    use narf_capabilities::{Cap, Write};
     let (_, factory) = Model::setup(0, 1);
     let mut words = vec![0u32; 16384];
     let before = words.clone();
-    let (index, generation) = object_table::register(CapKind::BusDevice);
-    // SAFETY: new fixture object has exact BusDevice/Write type and rights.
-    let authority: Cap<narf_bus::BusDeviceCap, Write> = unsafe {
-        Cap::mint(CapSlot::new(
-            generation,
-            index,
-            Write::BITS,
-            CapKind::BusDevice as u32,
-        ))
-    };
+    // Fresh live BusDevice/Write fixture authority, minted via the
+    // safe `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    let authority: Cap<narf_bus::BusDeviceCap, Write> = Cap::bootstrap();
     let region = narf_bus::MmioRegion {
         phys: narf_memory::PhysAddr::new(0),
         virt: words.as_mut_ptr() as u64,

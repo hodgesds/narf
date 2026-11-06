@@ -242,18 +242,11 @@ kernel_test_in!(
 
 fn smoke_realtek_revocation_prevents_bar_sizing_and_decode_changes() -> TestResult {
     use narf_bus::BusDeviceCap;
-    use narf_capabilities::{object_table, Cap, CapError, CapKind, CapSlot, Rights, Write};
-    let (index, generation) = object_table::register(CapKind::BusDevice);
-    // SAFETY: the fixture owns the newly registered BusDevice object and
-    // mints only its declared type, current generation and Write rights.
-    let cap: Cap<BusDeviceCap, Write> = unsafe {
-        Cap::mint(CapSlot::new(
-            generation,
-            index,
-            Write::BITS,
-            CapKind::BusDevice as u32,
-        ))
-    };
+    use narf_capabilities::{Cap, CapError, Write};
+    // Fresh live BusDevice/Write fixture cap, minted via the safe
+    // `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    let cap: Cap<BusDeviceCap, Write> = Cap::bootstrap();
     let state = RefCell::new(MappingModel::new(BUS_MASTER | MEM_SPACE));
     if super::pci_park::invoke(&cap, || mapping(&state, false)) != Ok(Ok(7)) {
         return TestResult::Fail("current Realtek mapping invocation rejected");

@@ -1,21 +1,13 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
-use narf_capabilities::{object_table, CapSlot, CapType, Rights};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wireless::reg::{RegFlags, RegRule};
 fn authority() -> Cap<FirmwareBlob, Read> {
-    let (index, generation) = object_table::register(FirmwareBlob::KIND);
-    // SAFETY: private freshly registered firmware object, exact Read type/rights;
-    // no unsigned device/firmware lookup or production policy is bypassed.
-    unsafe {
-        Cap::mint(CapSlot::new(
-            generation,
-            index,
-            Read::BITS,
-            FirmwareBlob::KIND as u32,
-        ))
-    }
+    // Fresh live FirmwareBlob/Read fixture authority, minted via the
+    // safe `Cap::bootstrap` path (SEC-B5, #1293: `Cap::mint` is
+    // crate-private to `capabilities/`).
+    Cap::bootstrap()
 }
 const MAC: [u8; 6] = [2, 4, 6, 8, 10, 12];
 fn board(profile: Profile, seed: u8) -> Board {

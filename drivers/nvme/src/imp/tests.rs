@@ -448,20 +448,13 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
     }
     let write_cap = register_with_cap(buf);
     // Downgrade Write→Read so the cap matches BlockRequest::buffer's type.
-    // SAFETY: `mint` reconstructs a cap from a slot we own — `write_cap`'s
-    // live `generation`/`index` — narrowed to `Read::BITS` (a subset of the
-    // original rights) and the same `DmaBuffer` kind, so it aliases the same
-    // valid DMA-buffer slot with strictly fewer rights.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let read_cap = unsafe {
-        use narf_capabilities::{Cap, CapSlot, Read, Rights};
-        let s = write_cap.slot();
-        Cap::<narf_io::DmaBuffer, Read>::mint(CapSlot::new(
-            s.generation,
-            s.index,
-            Read::BITS,
-            narf_capabilities::CapKind::DmaBuffer as u32,
-        ))
+    // `derive` narrows the live write cap to the `Read` subset (SEC-B5,
+    // #1293: `Cap::mint` is crate-private to `capabilities/`), so the
+    // read cap aliases the same valid DMA-buffer slot with strictly
+    // fewer rights.
+    let read_cap = match write_cap.derive::<narf_capabilities::Read>() {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("derive Read from live write cap failed"),
     };
 
     let dev = NvmeBlockDevice;

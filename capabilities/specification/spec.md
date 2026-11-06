@@ -65,6 +65,14 @@ impl<T, R: Rights> Cap<T, R> {
     pub fn revoke(self);
 }
 
+impl<T: CapType, R: Rights> Cap<T, R> {
+    /// The only public mint: allocates a fresh object-table entry
+    /// with `T::KIND` and `R::BITS`. `Cap::mint` itself is
+    /// crate-private (SEC-B5, #1293) — no external crate can
+    /// construct a `Cap` from a hand-built `CapSlot`.
+    pub fn bootstrap() -> Self;
+}
+
 impl<T: CapType> Cap<T, Grant> {
     /// Grant-gated cross-task transfer (§9.1). Installs `cap`'s slot
     /// into `target`'s table; returns the receiver's task-local slot
@@ -250,11 +258,16 @@ and, where relevant, the badge value separately.
 
 ## 4. Invariants & safety properties
 
-- `Cap<T, R>` cannot be constructed outside `capabilities/` — the only
-  ways in are derivation from an existing cap, the creator-gated mint
-  (`bootstrap_with`, §9.8), or the legacy ungated `bootstrap()` at
-  task creation (removal tracked in #1538; until it lands, "bootstrap
-  at task creation" is a convention, not an enforced gate — SEC-B1).
+- `Cap<T, R>` cannot be constructed outside `capabilities/` — enforced
+  by the compiler, not by convention: `Cap::mint` is crate-private
+  (SEC-B5, #1293), so the only ways in are derivation from an existing
+  cap, the creator-gated mint (`bootstrap_with`, §9.8), the legacy
+  ungated `bootstrap()` at task creation (removal tracked in #1538;
+  until it lands, "bootstrap at task creation" is a convention, not an
+  enforced gate — SEC-B1), or Grant-gated `Cap::transfer`. A `CapSlot`
+  is ABI data, not authority — its fields and constructor stay public
+  so syscall arguments can carry it, but no public constructor consumes
+  a slot, so a hand-built slot cannot be re-typed into a `Cap`.
 - Derivation never *increases* rights (`SubsetOf` is type-checked).
 - **Type-level rights prove *prior grant*; epoch check proves *current
   validity*.** These are distinct soundness properties. The Rust type
