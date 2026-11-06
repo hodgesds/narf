@@ -412,9 +412,16 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   policy sysfs `idle_timeout` reports — default 30 000 ms (the USB
   hub autosuspend window), 0 meaning "never autosuspend" — and the
   btusb suspend hook vetoes gating for a 0-timeout controller.
-  Out of scope here: a sysfs store path for `idle_timeout`, and
-  reloading PCIe firmware after a power cut across suspend (resume
-  detects the loss and stays parked) — both follow-up.
+  Reloading PCIe firmware after a power cut across suspend is
+  covered since #1660: resume detects the loss (`BOOT_STAGE`
+  without `OPFW`), records `firmware_lost`, and stays parked, and
+  a supervisor task spawned at firmware-load time observes the
+  flag from task context, re-runs `enable_bt` (re-publish CI,
+  `MAC_INIT`, wait for ROM) + `fw::setup`, and unparks the pump —
+  the transport survives, so the HCI index is kept and
+  `register_ready_transport` is not re-run.
+  Out of scope here: a sysfs store path for `idle_timeout` —
+  follow-up.
 
 ## Scope
 

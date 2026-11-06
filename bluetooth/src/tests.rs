@@ -6018,6 +6018,333 @@ kernel_test_in!(
     smoke_btintel_pcie_index_of_transport
 );
 
+// ── Intel PCIe Bluetooth: post-resume firmware reload (#1660) ────────
+
+/// Recording stand-in for the device-side half of a reload.
+///
+/// Built from the reload semantics themselves, never from the
+/// implementation: a reload re-enables BT and re-downloads, and
+/// lands either an operational image or a failure. The flags let
+/// one smoke walk every failure branch the orchestration must
+/// survive: a failed re-enable, a failed download, a non-OP
+/// landing — each must leave the loss recorded and the pump parked
+/// for the supervisor's next attempt.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug)]
+struct FakeFwReloader {
+    calls: core::sync::atomic::AtomicU32,
+    fail_re_enable: core::sync::atomic::AtomicBool,
+    fail_download: core::sync::atomic::AtomicBool,
+    land_iml: core::sync::atomic::AtomicBool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl FakeFwReloader {
+    fn new() -> Self {
+        use core::sync::atomic::{AtomicBool, AtomicU32};
+        Self {
+            calls: AtomicU32::new(0),
+            fail_re_enable: AtomicBool::new(false),
+            fail_download: AtomicBool::new(false),
+            land_iml: AtomicBool::new(false),
+        }
+    }
+
+    fn calls(&self) -> u32 {
+        self.calls.load(core::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl crate::btintel_pcie::PcieFwReload for FakeFwReloader {
+    fn reload_device(
+        &self,
+    ) -> Result<crate::btintel_pcie::fw::IntelVersionTlv, crate::btintel_pcie::ReloadDeviceError>
+    {
+        use crate::btintel_pcie as bt;
+        use core::sync::atomic::Ordering;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_re_enable.load(Ordering::SeqCst) {
+            return Err(bt::ReloadDeviceError::EnableFailed(
+                bt::BtPcieError::AliveTimeout,
+            ));
+        }
+        if self.fail_download.load(Ordering::SeqCst) {
+            return Err(bt::ReloadDeviceError::DownloadFailed(
+                bt::FirmwareLoadError::Fw(bt::fw::FwError::Timeout),
+            ));
+        }
+        Ok(bt::fw::IntelVersionTlv {
+            img_type: if self.land_iml.load(Ordering::SeqCst) {
+                bt::fw::IMG_IML
+            } else {
+                bt::fw::IMG_OP
+            },
+            ..Default::default()
+        })
+    }
+}
+
+/// A controller driven through a scripted power-cut resume, with
+/// everything the reload step needs held alive: the isolated PM
+/// registry guard, the transport, its HCI index (when bring-up
+/// ran), and the scripted regs.
+#[cfg(target_arch = "x86_64")]
+struct PowerCutFixture {
+    _pm_registry: narf_power::device_pm::TestRegistryGuard,
+    transport: Arc<dyn crate::transport::HciTransport>,
+    index: Option<usize>,
+    regs: Arc<FakePcieRegs>,
+}
+
+/// Drive a scripted power-cut resume: suspend parks the pump and
+/// writes D3, resume finds the controller back in ROM, records the
+/// loss, and stays parked. `register_controller` selects whether
+/// the HCI bring-up ran — without it there is no index for the
+/// reload step to unpark through.
+#[cfg(target_arch = "x86_64")]
+fn drive_power_cut(register_controller: bool) -> Result<PowerCutFixture, &'static str> {
+    use crate::btintel_pcie as bt;
+    use narf_power::device_pm;
+
+    btintel_pcie_pm_reset();
+    let _pm_registry = device_pm::__test_isolate_registry();
+
+    let transport: Arc<dyn crate::transport::HciTransport> =
+        Arc::new(LoopbackTransport::new("btintel-pcie-pm-reload"));
+    crate::transport::register(transport.clone());
+    let index = if register_controller {
+        Some(crate::controller::register_ready_transport(
+            transport.clone(),
+            crate::controller::ControllerInfo::default(),
+        ))
+    } else {
+        None
+    };
+    let regs = Arc::new(FakePcieRegs::new(FakePcieMode::PowerCut));
+    device_pm::register_device_pm_ops(
+        "btintel-pcie",
+        Arc::new(bt::BtIntelPciePm::new(regs.clone(), transport.clone())),
+    );
+
+    if !device_pm::suspend_all_devices().ok() {
+        return Err("suspend fan-out failed before the power cut");
+    }
+    if device_pm::resume_all_devices().ok() {
+        return Err("resume fan-out hid the firmware loss");
+    }
+    if !bt::firmware_lost() {
+        return Err("resume did not record the firmware loss");
+    }
+    if let Some(i) = index {
+        if !crate::pm::is_parked(i) {
+            return Err("resume did not stay parked after the power cut");
+        }
+    }
+    Ok(PowerCutFixture {
+        _pm_registry,
+        transport,
+        index,
+        regs,
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_pm_power_cut_reload_restores_hci() -> TestResult {
+    use crate::btintel_pcie as bt;
+
+    let fixture = match drive_power_cut(true) {
+        Ok(f) => f,
+        Err(msg) => {
+            btintel_pcie_pm_reset();
+            return TestResult::Fail(msg);
+        }
+    };
+    let Some(index) = fixture.index else {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("power-cut fixture has no HCI index");
+    };
+    let reloader = FakeFwReloader::new();
+    // The reload step: re-enable + re-download, clear the loss,
+    // unpark the pump. The transport survived — same Arc, same HCI
+    // index — so no re-registration happens, and the orchestration
+    // itself never touches the rings (the re-arm lives in the
+    // device-side step the fake stands in for).
+    if bt::maybe_reload_firmware_with(&fixture.transport, &reloader) != bt::ReloadOutcome::Reloaded
+    {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("reload step did not report Reloaded after the power cut");
+    }
+    if reloader.calls() != 1
+        || bt::firmware_lost()
+        || crate::pm::is_parked(index)
+        || fixture.regs.rearms() != 0
+        || fixture.regs.writes() != vec![bt::POWER_STATE_D3_HOT, bt::POWER_STATE_D0]
+    {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("reload did not run once, clear the loss, and unpark the pump");
+    }
+    if crate::controller::index_of_transport(&fixture.transport) != Some(index) {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("reload changed the HCI index");
+    }
+    // A second step is a no-op: the loss is cleared, so the
+    // supervisor must not download again.
+    if bt::maybe_reload_firmware_with(&fixture.transport, &reloader) != bt::ReloadOutcome::NotNeeded
+        || reloader.calls() != 1
+    {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("reload step re-ran after the loss was cleared");
+    }
+    btintel_pcie_pm_reset();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_pcie_pm_power_cut_reload_restores_hci
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_pm_reload_failure_stays_parked_and_retries() -> TestResult {
+    use crate::btintel_pcie as bt;
+    use core::sync::atomic::Ordering;
+
+    let fixture = match drive_power_cut(true) {
+        Ok(f) => f,
+        Err(msg) => {
+            btintel_pcie_pm_reset();
+            return TestResult::Fail(msg);
+        }
+    };
+    let Some(index) = fixture.index else {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("power-cut fixture has no HCI index");
+    };
+    let reloader = FakeFwReloader::new();
+
+    // A non-operational landing is not a recovery: the loss stays
+    // recorded and the pump stays parked.
+    reloader.land_iml.store(true, Ordering::SeqCst);
+    if bt::maybe_reload_firmware_with(&fixture.transport, &reloader) != bt::ReloadOutcome::Failed
+        || !bt::firmware_lost()
+        || !crate::pm::is_parked(index)
+    {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("IML landing cleared the loss or unparked the pump");
+    }
+    reloader.land_iml.store(false, Ordering::SeqCst);
+
+    // A failed download: same — parked, loss recorded, retryable.
+    reloader.fail_download.store(true, Ordering::SeqCst);
+    if bt::maybe_reload_firmware_with(&fixture.transport, &reloader) != bt::ReloadOutcome::Failed
+        || !bt::firmware_lost()
+        || !crate::pm::is_parked(index)
+    {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("failed download cleared the loss or unparked the pump");
+    }
+    reloader.fail_download.store(false, Ordering::SeqCst);
+
+    // A failed re-enable: same.
+    reloader.fail_re_enable.store(true, Ordering::SeqCst);
+    if bt::maybe_reload_firmware_with(&fixture.transport, &reloader) != bt::ReloadOutcome::Failed
+        || !bt::firmware_lost()
+        || !crate::pm::is_parked(index)
+    {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("failed re-enable cleared the loss or unparked the pump");
+    }
+    reloader.fail_re_enable.store(false, Ordering::SeqCst);
+
+    // All three branches retried cleanly: the next attempt reloads
+    // and unparks.
+    if bt::maybe_reload_firmware_with(&fixture.transport, &reloader) != bt::ReloadOutcome::Reloaded
+        || bt::firmware_lost()
+        || crate::pm::is_parked(index)
+    {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("reload did not recover after the failures cleared");
+    }
+    if reloader.calls() != 4 {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("reload step did not run once per attempt");
+    }
+    btintel_pcie_pm_reset();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_pcie_pm_reload_failure_stays_parked_and_retries
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_pm_reload_not_needed_without_loss() -> TestResult {
+    use crate::btintel_pcie as bt;
+
+    btintel_pcie_pm_reset();
+    let transport: Arc<dyn crate::transport::HciTransport> =
+        Arc::new(LoopbackTransport::new("btintel-pcie-pm-reload-idle"));
+    crate::transport::register(transport.clone());
+    let index = crate::controller::register_ready_transport(
+        transport.clone(),
+        crate::controller::ControllerInfo::default(),
+    );
+    let reloader = FakeFwReloader::new();
+    // No suspend, no loss: the step must not touch the device.
+    if bt::maybe_reload_firmware_with(&transport, &reloader) != bt::ReloadOutcome::NotNeeded
+        || reloader.calls() != 0
+    {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("reload step ran without a recorded loss");
+    }
+    if crate::pm::is_parked(index) {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail("reload step parked a healthy controller");
+    }
+    btintel_pcie_pm_reset();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_pcie_pm_reload_not_needed_without_loss
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_btintel_pcie_pm_reload_without_index_stays_lost() -> TestResult {
+    use crate::btintel_pcie as bt;
+
+    let fixture = match drive_power_cut(false) {
+        Ok(f) => f,
+        Err(msg) => {
+            btintel_pcie_pm_reset();
+            return TestResult::Fail(msg);
+        }
+    };
+    let reloader = FakeFwReloader::new();
+    // No HCI index (bring-up never ran): the step must fail before
+    // touching the device and leave the loss recorded for the
+    // supervisor's next attempt.
+    if bt::maybe_reload_firmware_with(&fixture.transport, &reloader) != bt::ReloadOutcome::Failed
+        || reloader.calls() != 0
+        || !bt::firmware_lost()
+    {
+        btintel_pcie_pm_reset();
+        return TestResult::Fail(
+            "reload without an HCI index touched the device or cleared the loss",
+        );
+    }
+    btintel_pcie_pm_reset();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "bluetooth/btintel_pcie",
+    smoke_btintel_pcie_pm_reload_without_index_stays_lost
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_btintel_pcie_hci_packet_types() -> TestResult {
     use crate::btintel_pcie::rings::{

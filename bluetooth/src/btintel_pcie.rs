@@ -79,9 +79,11 @@
 //! only re-arms RX, the operational image stays resident across the
 //! firmware's own D3 sleep state. A power cut is different — the
 //! controller comes back in its ROM bootloader — and resume detects
-//! that (`BOOT_STAGE` without `OPFW`), records it, and stays
-//! parked; reloading firmware from a post-resume task is a
-//! follow-up (see the #1576 PR body).
+//! that (`BOOT_STAGE` without `OPFW`), records `firmware_lost`,
+//! and stays parked; a supervisor task spawned at firmware-load
+//! time (`firmware_reload_supervisor`, #1660) observes the flag
+//! from task context, re-runs `enable_bt` + `fw::setup`, and
+//! unparks the pump.
 //!
 //! No [`crate::transport::HciTransport`] is registered yet. The HCI
 //! core's bring-up sequence assumes a controller running operational
@@ -554,6 +556,26 @@ impl BtIntelPcie {
     /// # Safety
     /// `self.mmio` must be this device's mapped CSR window.
     unsafe fn enable_bt(&mut self) -> Result<(), BtPcieError> {
+        // SAFETY: forwarded — caller-asserted mapped CSR window.
+        unsafe { self.enable_bt_regs() }?;
+        // Cache the stage the device reached; the reload path
+        // re-reads the live register instead, so it does not need
+        // this store.
+        self.boot_stage = self.current_boot_stage();
+        Ok(())
+    }
+
+    /// Register sequence of [`Self::enable_bt`], without the
+    /// cached-stage store, so the post-resume reload (#1660) can
+    /// re-run it through the shared `Arc<BtIntelPcie>` — the
+    /// controller is behind `Arc`s in `CONTROLLER`, the transport,
+    /// and the device-PM ops, so no `&mut` handle exists after
+    /// bring-up. Every step here is `&self`-compatible; only the
+    /// cache store needed `&mut`.
+    ///
+    /// # Safety
+    /// `self.mmio` must be this device's mapped CSR window.
+    unsafe fn enable_bt_regs(&self) -> Result<(), BtPcieError> {
         let ci = self.rings.ctx_info_phys();
         {
             let _g = self.ctrl.lock();
@@ -600,12 +622,40 @@ impl BtIntelPcie {
         if stage & BOOT_STAGE_DEVICE_HALTED != 0 {
             return Err(BtPcieError::NotInBootloader(stage));
         }
-        self.boot_stage = stage;
 
         // Hand the device the RX ring now that it is running.
         // SAFETY: `self.mmio` is the mapped CSR window.
         unsafe { self.rings.start_rx(&self.mmio) };
         Ok(())
+    }
+
+    /// Re-establish the MAC and ring state after a power cut (#1660),
+    /// so `fw::setup` can download again.
+    ///
+    /// A power cut loses the context-information block and every
+    /// ring position on the device side, so the rings are re-armed
+    /// first: the index arrays go back to zero before the CI block
+    /// is re-published and the MAC is re-started, exactly as
+    /// bring-up does with fresh rings. The doorbell `rearm_rx`
+    /// rings while the MAC is still down is harmless — the
+    /// `enable_bt` sequence ends by ringing it again once the MAC
+    /// is up. `reset` is deliberately NOT re-run: the device is
+    /// already in its ROM bootloader (that is what the resume path
+    /// detected), and the `enable_bt` sequence is the cold-start
+    /// path from there; if silicon ever needs a reset first, the
+    /// reload fails closed (`AliveTimeout` / `NotInBootloader`,
+    /// flag stays set, supervisor retries) instead of
+    /// half-bringing the controller up.
+    ///
+    /// # Safety
+    /// `self.mmio` must be this device's mapped CSR window.
+    pub(crate) unsafe fn re_enable_bt(&self) -> Result<(), BtPcieError> {
+        // SAFETY: caller-asserted mapped CSR window; the device
+        // lost all ring positions with power, so the index arrays
+        // go back to zero before the CI block is re-published.
+        unsafe { self.rings.rearm_rx(&self.mmio) };
+        // SAFETY: same; the `enable_bt` register sequence.
+        unsafe { self.enable_bt_regs() }
     }
 
     /// Send one HCI packet.
@@ -764,8 +814,8 @@ pub(crate) fn firmware_lost() -> bool {
 /// resume below detects it (`BOOT_STAGE` without `OPFW`), records
 /// [`firmware_lost`], and leaves the pump parked. Re-downloading
 /// firmware needs the firmware registry and long spin waits, which
-/// cannot run inside a device-PM handler — that reload path is a
-/// follow-up; see the #1576 PR body.
+/// cannot run inside a device-PM handler — the reload runs in
+/// [`maybe_reload_firmware`] from the supervisor task (#1660).
 #[derive(Debug)]
 pub(crate) struct BtIntelPciePm {
     regs: alloc::sync::Arc<dyn PciePowerRegs>,
@@ -842,7 +892,7 @@ impl narf_power::device_pm::DevicePmOps for BtIntelPciePm {
         // resident; a power cut does not. A controller back in its
         // ROM bootloader needs a full firmware download, which
         // cannot run here — record the loss, stay parked, and let
-        // the follow-up reload path (or a reboot) recover it.
+        // the reload supervisor (#1660) recover it.
         let stage = self.regs.boot_stage();
         if !is_opfw(stage) {
             FIRMWARE_LOST.store(true, Ordering::Release);
@@ -863,9 +913,211 @@ impl narf_power::device_pm::DevicePmOps for BtIntelPciePm {
     }
 }
 
+// ── Post-resume firmware reload (#1660) ─────────────────────────────
+
+/// Poll interval (ms) for the firmware-reload supervisor.
+///
+/// Not a spec value: a power-cut loss is rare and a reload takes
+/// milliseconds of device time once started, so a one-second
+/// observation cadence bounds the post-resume outage at ~1 s
+/// without a permanently spinning watcher.
+pub const FIRMWARE_RELOAD_POLL_MS: u64 = 1_000;
+
+/// One reload attempt's outcome, for the supervisor and the smokes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    /// No firmware loss is recorded; nothing to do.
+    NotNeeded,
+    /// The firmware was re-downloaded and the pump unparked.
+    Reloaded,
+    /// The reload failed; `firmware_lost` stays set and the
+    /// supervisor retries on its next tick.
+    Failed,
+}
+
+/// Why one `fw::setup` run failed.
+#[derive(Debug)]
+pub(crate) enum FirmwareLoadError {
+    /// No trusted loader authority (or its derivation failed), so
+    /// the firmware registry cannot be read.
+    NoAuthority,
+    /// `fw::setup` itself failed.
+    Fw(fw::FwError),
+}
+
+/// Run the firmware download once: derive the registry authority
+/// and run [`fw::setup`]. Shared by the boot-time `load_firmware`
+/// and the post-resume reload, so both paths download the same
+/// image the same way.
+fn download_firmware(
+    controller: &alloc::sync::Arc<BtIntelPcie>,
+) -> Result<fw::IntelVersionTlv, FirmwareLoadError> {
+    let Some(write_auth) = narf_firmware::trusted_loader_authority() else {
+        return Err(FirmwareLoadError::NoAuthority);
+    };
+    let auth = write_auth
+        .derive()
+        .map_err(|_| FirmwareLoadError::NoAuthority)?;
+    fw::setup(controller, &auth).map_err(FirmwareLoadError::Fw)
+}
+
+/// The device-side half of a firmware reload, split out so the
+/// orchestration in [`maybe_reload_firmware_with`] can be exercised
+/// without a controller: the production implementation re-runs the
+/// `enable_bt` register sequence and `fw::setup`; fixtures record
+/// the calls and return a canned version. Same seam shape as
+/// [`PciePowerRegs`].
+pub(crate) trait PcieFwReload: Send + Sync + core::fmt::Debug {
+    /// Re-establish the MAC/ring state and re-download operational
+    /// firmware. Returns the version `fw::setup` left running.
+    fn reload_device(&self) -> Result<fw::IntelVersionTlv, ReloadDeviceError>;
+}
+
+/// Why the device-side half of a reload failed.
+#[derive(Debug)]
+pub(crate) enum ReloadDeviceError {
+    /// The `enable_bt` re-run failed (device never reached ROM,
+    /// MAC access lost, ...).
+    EnableFailed(BtPcieError),
+    /// The firmware download failed.
+    DownloadFailed(FirmwareLoadError),
+}
+
+/// Production [`PcieFwReload`]: the probed controller.
+#[derive(Debug)]
+struct RealReloader {
+    controller: alloc::sync::Arc<BtIntelPcie>,
+}
+
+impl PcieFwReload for RealReloader {
+    fn reload_device(&self) -> Result<fw::IntelVersionTlv, ReloadDeviceError> {
+        // SAFETY: `controller.mmio` is this device's mapped CSR window.
+        unsafe { self.controller.re_enable_bt() }.map_err(ReloadDeviceError::EnableFailed)?;
+        let ver = download_firmware(&self.controller).map_err(ReloadDeviceError::DownloadFailed)?;
+        // Operational firmware is running again — the transport is
+        // already registered from the first load (a no-op on reload
+        // through the `REGISTERED` guard), but the invariant
+        // "OP ⟹ transport registered" belongs in one place.
+        if ver.img_type == fw::IMG_OP {
+            register_transport(&self.controller);
+        }
+        Ok(ver)
+    }
+}
+
+/// Run one firmware-reload attempt if a power cut was recorded.
+///
+/// The production entry: resolves the controller and transport
+/// recorded at firmware-load time and delegates to
+/// [`maybe_reload_firmware_with`]. Returns [`ReloadOutcome::NotNeeded`]
+/// when no controller or transport exists — a loss cannot be
+/// recorded without them, so there is nothing to repair.
+pub(crate) fn maybe_reload_firmware() -> ReloadOutcome {
+    let Some(controller) = CONTROLLER.lock().clone() else {
+        return ReloadOutcome::NotNeeded;
+    };
+    let Some(transport) = TRANSPORT.lock().clone() else {
+        return ReloadOutcome::NotNeeded;
+    };
+    maybe_reload_firmware_with(&transport, &RealReloader { controller })
+}
+
+/// One reload attempt, given the transport whose pump must come back
+/// and the device-side reload step.
+///
+/// The order is load-bearing: the HCI index is resolved before the
+/// device is touched, so a controller with no pump to unpark fails
+/// without a wasted download and the supervisor retries; the loss
+/// flag is cleared only once operational firmware is confirmed
+/// running, so any failure leaves the controller parked and the
+/// flag set for the next attempt. The transport itself survives the
+/// power cut (same `Arc`, already registered) and keeps its HCI
+/// index — `register_ready_transport` must NOT be re-run.
+pub(crate) fn maybe_reload_firmware_with(
+    transport: &alloc::sync::Arc<dyn crate::transport::HciTransport>,
+    reloader: &dyn PcieFwReload,
+) -> ReloadOutcome {
+    use core::fmt::Write as _;
+    if !firmware_lost() {
+        return ReloadOutcome::NotNeeded;
+    }
+    let Some(index) = crate::controller::index_of_transport(transport) else {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  btintel-pcie: firmware lost but no HCI index; reload deferred",
+        );
+        return ReloadOutcome::Failed;
+    };
+    match reloader.reload_device() {
+        Ok(ver) if ver.img_type == fw::IMG_OP => {}
+        Ok(ver) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: reload landed img-type {:#04x}, not operational; staying parked",
+                ver.img_type,
+            );
+            return ReloadOutcome::Failed;
+        }
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: firmware reload failed: {:?}; staying parked",
+                e,
+            );
+            return ReloadOutcome::Failed;
+        }
+    }
+    FIRMWARE_LOST.store(false, Ordering::Release);
+    crate::pm::resume_controller(index);
+    let _ = writeln!(
+        narf_console::Writer,
+        "  btintel-pcie: firmware reloaded after power cut; controller serving again",
+    );
+    ReloadOutcome::Reloaded
+}
+
+/// The firmware-reload supervisor (#1660).
+///
+/// A power cut across suspend can only be repaired from task
+/// context — the device-PM resume handler runs on the boot CPU
+/// with interrupts gated, so it records `firmware_lost` and stays
+/// parked. This task observes the flag once a second and runs
+/// [`maybe_reload_firmware`]. It covers every resume path (S3,
+/// s2idle, rollback) because they all funnel through the same
+/// resume handler that sets the flag — no per-path hook is needed,
+/// and no power-crate resume-completion callback either.
+async fn firmware_reload_supervisor() {
+    loop {
+        narf_time::sleep_ms(FIRMWARE_RELOAD_POLL_MS).await;
+        let _ = maybe_reload_firmware();
+    }
+}
+
+static RELOAD_SUPERVISOR_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Spawn the reload supervisor once. Called from
+/// `register_transport`, where the transport and the device-PM ops
+/// become live — exactly the point from which a resume can record
+/// a loss for the supervisor to repair. Spawned from the
+/// `Stage::Late` firmware initcall, where driver spawns are
+/// allowed.
+fn spawn_firmware_reload_supervisor() {
+    if RELOAD_SUPERVISOR_SPAWNED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    narf_scheduler::spawn(firmware_reload_supervisor());
+}
+
 // ── Driver-match registration ───────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<alloc::sync::Arc<BtIntelPcie>>> =
+    IrqSafeSpinLock::new(None);
+
+/// The registered HCI transport, for the reload path's index lookup.
+/// Set in `register_transport` next to the device-PM ops; the
+/// transport survives a power cut (same `Arc`), so the reload
+/// unparks the pump through it instead of re-registering.
+static TRANSPORT: IrqSafeSpinLock<Option<alloc::sync::Arc<dyn crate::transport::HciTransport>>> =
     IrqSafeSpinLock::new(None);
 
 /// Probe entry — installed via `bus::register_pci_driver`.
@@ -950,19 +1202,7 @@ pub fn load_firmware() {
         return;
     };
 
-    let Some(write_auth) = narf_firmware::trusted_loader_authority() else {
-        let _ = writeln!(
-            narf_console::Writer,
-            "  btintel-pcie: no firmware authority; controller left in its ROM bootloader",
-        );
-        return;
-    };
-    let auth = match write_auth.derive() {
-        Ok(a) => a,
-        Err(_) => return,
-    };
-
-    match fw::setup(&controller, &auth) {
+    match download_firmware(&controller) {
         Ok(ver) => {
             let _ = writeln!(
                 narf_console::Writer,
@@ -998,7 +1238,13 @@ pub fn load_firmware() {
                 );
             }
         }
-        Err(e) => {
+        Err(FirmwareLoadError::NoAuthority) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btintel-pcie: no firmware authority; controller left in its ROM bootloader",
+            );
+        }
+        Err(FirmwareLoadError::Fw(e)) => {
             let _ = writeln!(
                 narf_console::Writer,
                 "  btintel-pcie: firmware download failed: {:?}",
@@ -1031,10 +1277,14 @@ fn register_transport(controller: &alloc::sync::Arc<BtIntelPcie>) {
     let t: alloc::sync::Arc<dyn crate::transport::HciTransport> =
         alloc::sync::Arc::new(transport::BtIntelPcieTransport::new(controller.clone()));
     crate::transport::register(t.clone());
+    // Keep the transport for the post-resume reload (#1660): the
+    // reload resolves the HCI index through it to unpark the pump.
+    *TRANSPORT.lock() = Some(t.clone());
     narf_power::device_pm::register_device_pm_ops(
         "btintel-pcie",
         alloc::sync::Arc::new(BtIntelPciePm::new(controller.clone(), t)),
     );
+    spawn_firmware_reload_supervisor();
     let _ = writeln!(
         narf_console::Writer,
         "  btintel-pcie: HCI transport registered ({} total)",
@@ -1071,5 +1321,7 @@ pub fn with_controller<R>(f: impl FnOnce(&BtIntelPcie) -> R) -> Option<R> {
 /// end-state.
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
+    *TRANSPORT.lock() = None;
     FIRMWARE_LOST.store(false, Ordering::Release);
+    RELOAD_SUPERVISOR_SPAWNED.store(false, Ordering::Release);
 }

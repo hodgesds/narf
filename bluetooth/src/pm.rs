@@ -49,11 +49,12 @@
 //! (which runs after the firmware download), and
 //! `btintel_pcie::BtIntelPciePm` drives `suspend_controller` /
 //! `resume_controller` from the device-PM fan-out, resolving the
-//! HCI index lazily by transport identity. The one gap left is a
-//! power cut across suspend: the controller comes back in its ROM
-//! bootloader, resume records `firmware_lost` and stays parked,
-//! and reloading the firmware from a post-resume task is a
-//! follow-up (see the #1576 PR body).
+//! HCI index lazily by transport identity. A power cut across
+//! suspend is covered since #1660: the controller comes back in its
+//! ROM bootloader, resume records `firmware_lost` and stays parked,
+//! and the reload supervisor (`btintel_pcie::maybe_reload_firmware`)
+//! re-runs `enable_bt` + `fw::setup` from task context and unparks
+//! the pump.
 
 extern crate alloc;
 
