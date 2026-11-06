@@ -19,7 +19,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::task::{Context, Poll, Waker};
 
-use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
+use narf_block::{BlockDevice, BlockFeature, BlockOp, BlockRequest, LbaRange, QosHint};
 use narf_capabilities::{Cap, Read, Write};
 use narf_driver_runtime::DomainId;
 use narf_filesystem::{
@@ -1795,6 +1795,119 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let bm_block = self.group_descs[group].block_bitmap;
         self.free_in_bitmap_block(group, BitmapKind::Block, bm_block, bit)
             .await
+    }
+
+    /// FITRIM (`fstrim`) — the first discard caller (#1166).
+    ///
+    /// Scans the block bitmaps for free blocks inside the byte
+    /// range `[start, start + len)`, coalesces each maximal
+    /// contiguous free run, and issues one
+    /// [`BlockDevice::discard`] per run that is at least `minlen`
+    /// bytes long. Returns the bytes actually trimmed. Only whole
+    /// filesystem blocks fully inside the range are candidates, so
+    /// a partially-covered edge block is never trimmed.
+    ///
+    /// Linux refs: `include/uapi/linux/fs.h::FITRIM` /
+    /// `struct fstrim_range` for the wire format (see
+    /// [`super::fitrim`]); `ext4_trim_fs` for the scan-and-discard
+    /// shape. Two deliberate divergences, both documented:
+    /// - A device without [`BlockFeature::Discard`] fails with
+    ///   [`FsError::Unsupported`] (Linux `EOPNOTSUPP` from
+    ///   `blkdev_issue_discard`) instead of silently reporting
+    ///   success — a no-op "trim" would tell callers blocks were
+    ///   freed when they were not (#841).
+    /// - The whole scan+discard holds `allocation_lock`, the same
+    ///   lock that serializes `alloc_block`/`free_block` bitmap
+    ///   updates. Without it a block freed by the scan could be
+    ///   reallocated before its discard lands, and a live block
+    ///   would be trimmed. A bitmap whose checksum does not verify
+    ///   aborts the ioctl rather than trimming on untrusted bits.
+    ///
+    /// FITRIM writes no filesystem metadata, so it is allowed on a
+    /// read-only volume. No `CAP_SYS_ADMIN` gate is enforced here:
+    /// the ioctl seam carries no credential (see the PR body).
+    pub async fn fitrim(&self, start: u64, len: u64, minlen: u64) -> Result<u64, FsError> {
+        if !self.device.supports(BlockFeature::Discard) {
+            return Err(FsError::Unsupported);
+        }
+        if len == 0 {
+            return Err(FsError::InvalidData);
+        }
+        let bs = self.block_size() as u64;
+        let fs_bytes = self.superblock.total_blocks() * bs;
+        if start >= fs_bytes {
+            return Err(FsError::InvalidData);
+        }
+        let end = start.saturating_add(len).min(fs_bytes);
+        // Whole blocks fully inside [start, end) only.
+        let first = start.div_ceil(bs);
+        let last_excl = end / bs;
+        if last_excl <= first {
+            return Ok(0);
+        }
+        let min_run = minlen.div_ceil(bs).max(1);
+        let lbs = u64::from(self.device.logical_block_size());
+        let mut trimmed: u64 = 0;
+        let _allocation = self.allocation_lock.lock().await;
+        let bpg = self.superblock.blocks_per_group as u64;
+        let first_block = self.superblock.first_data_block as u64;
+        for (gi, gd) in self.group_descs.iter().enumerate() {
+            let group_first = first_block + gi as u64 * bpg;
+            let group_last = (group_first + bpg).min(self.superblock.total_blocks());
+            let bits_in_group = group_last.saturating_sub(group_first);
+            let scan_first = first.max(group_first);
+            let scan_last = last_excl.min(group_last);
+            if scan_last <= scan_first {
+                continue;
+            }
+            let mut bitmap = vec![0u8; bs as usize];
+            self.read_block(gd.block_bitmap, &mut bitmap).await?;
+            self.verify_bitmap(gi, BitmapKind::Block, &bitmap).await?;
+            let bit_is_free = |block: u64| -> bool {
+                let bit = (block - group_first) as usize;
+                bit < bits_in_group as usize
+                    && bit / 8 < bitmap.len()
+                    && (bitmap[bit / 8] >> (bit % 8)) & 1 == 0
+            };
+            let mut run_start: Option<u64> = None;
+            // One past the scan end acts as a sentinel that flushes
+            // a run ending exactly at the range edge.
+            for block in scan_first..=scan_last {
+                let free = block < scan_last && bit_is_free(block);
+                match (run_start, free) {
+                    (None, true) => run_start = Some(block),
+                    (Some(run), false) => {
+                        let run_len = block - run;
+                        run_start = None;
+                        if run_len >= min_run {
+                            trimmed += self.discard_run(run, run_len, bs, lbs).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(trimmed)
+    }
+
+    /// Discard one free run of `run_len` filesystem blocks starting
+    /// at `run_start`. Returns the trimmed bytes (0 when the run
+    /// cannot be expressed in whole device blocks — a filesystem
+    /// block smaller than one device block — which is skipped
+    /// rather than trimmed partially).
+    async fn discard_run(&self, run_start: u64, run_len: u64, bs: u64, lbs: u64) -> u64 {
+        if bs < lbs {
+            return 0;
+        }
+        let lba_start = run_start * (bs / lbs);
+        let lba_blocks = run_len * (bs / lbs);
+        self.device
+            .discard(LbaRange {
+                start: lba_start,
+                blocks: lba_blocks,
+            })
+            .await;
+        run_len * bs
     }
 
     /// Allocate a free inode. Returns the 1-based inode number.

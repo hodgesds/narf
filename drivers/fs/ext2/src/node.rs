@@ -37,7 +37,7 @@ use alloc::vec::Vec;
 use narf_block::BlockDevice;
 use narf_filesystem::{
     DirEntry as VfsDirEntry, DirOps, FileFolio, FileMapping, FileOps, FileType, FsError, FsFuture,
-    Mode, Stat, PAGE_SIZE,
+    FsIoctlReply, Mode, Stat, PAGE_SIZE,
 };
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -812,6 +812,40 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         })
     }
 
+    /// FITRIM (`fstrim`) on this file — the first discard caller
+    /// (#1166). Reads the `struct fstrim_range` through the
+    /// fault-contained [`narf_filesystem::IoctlContext`], runs
+    /// [`Ext2Volume::fitrim`](super::volume::Ext2Volume::fitrim),
+    /// and writes the range back with `len` holding the bytes
+    /// actually trimmed. Any other command keeps the default
+    /// `ENOTTY` behaviour.
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        context: &'a dyn narf_filesystem::IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            if cmd != super::fitrim::FITRIM {
+                return self.ioctl(cmd, arg as usize);
+            }
+            let mut image = [0u8; super::fitrim::FSTRIM_RANGE_LEN];
+            context.read(arg, &mut image)?;
+            let range = super::fitrim::FstrimRange::decode(&image)?;
+            let trimmed = self
+                .volume
+                .fitrim(range.start, range.len, range.minlen)
+                .await?;
+            let out = super::fitrim::FstrimRange {
+                start: range.start,
+                len: trimmed,
+                minlen: range.minlen,
+            };
+            context.write(arg, &out.encode())?;
+            Ok(0)
+        })
+    }
+
     fn stat(&self) -> Stat {
         self.state.lock().stat
     }
@@ -1124,6 +1158,43 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
 
     fn rcu_walkable(&self) -> bool {
         true
+    }
+
+    /// FITRIM on this directory fd — the path `fstrim(8)` uses (it
+    /// opens the mount point and issues FITRIM on the directory
+    /// fd). `input` is the already-copied `struct fstrim_range`
+    /// image; the reply carries it back with `len` holding the
+    /// bytes actually trimmed.
+    fn ioctl_async<'a>(
+        &'a self,
+        cmd: u32,
+        _arg: u64,
+        input: &'a [u8],
+        out_size: usize,
+    ) -> FsFuture<'a, FsIoctlReply> {
+        Box::pin(async move {
+            if cmd != super::fitrim::FITRIM {
+                return Err(FsError::Unsupported);
+            }
+            if out_size < super::fitrim::FSTRIM_RANGE_LEN {
+                return Err(FsError::InvalidData);
+            }
+            let range = super::fitrim::FstrimRange::decode(input)?;
+            let trimmed = self
+                .volume
+                .fitrim(range.start, range.len, range.minlen)
+                .await?;
+            Ok(FsIoctlReply {
+                result: 0,
+                output: super::fitrim::FstrimRange {
+                    start: range.start,
+                    len: trimmed,
+                    minlen: range.minlen,
+                }
+                .encode()
+                .to_vec(),
+            })
+        })
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
