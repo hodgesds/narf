@@ -41,8 +41,8 @@ use narf_hid::pen::{DecodedPen, PenProfile};
 use narf_hid::ptp::{DecodedReport as DecodedPtpReport, PtpProfile};
 use narf_hid::touchscreen::{DecodedTouchContact, DecodedTouchReport, TouchscreenProfile};
 use narf_input::evdev::{
-    key as evkey, prop, DeviceCaps, DeviceNode, EvdevEvent, EventType, MtContactUpdate,
-    MtEvdevState,
+    key as evkey, led as evled, prop, DeviceCaps, DeviceNode, EvdevEvent, EventType,
+    MtContactUpdate, MtEvdevState,
 };
 use narf_input::{
     abs, btn, push_global, AbsoluteEvent, AxisInfo, ButtonEvent, InputEvent, TouchEvent, TouchState,
@@ -181,7 +181,17 @@ pub fn build_pen_caps(profile: &PenProfile, identity: &DeviceCaps) -> DeviceCaps
 /// `INPUT_PROP_POINTER | INPUT_PROP_BUTTONPAD` (same libinput
 /// classification as the PTP path — without them the pad falls
 /// into the touchscreen heuristic).
-pub fn build_elan_caps(params: &ElanDeviceParams, identity: &DeviceCaps) -> DeviceCaps {
+///
+/// `has_led` declares the `EV_LED` / `LED_MUTE` capability on
+/// HAS_LED devices (issue #1684): the input core then owns the
+/// mute state for this node and the pump drives the 0xBC feature
+/// report from it. Non-LED devices declare no LED bit, so no
+/// mute state can be addressed to them.
+pub fn build_elan_caps(
+    params: &ElanDeviceParams,
+    identity: &DeviceCaps,
+    has_led: bool,
+) -> DeviceCaps {
     let mut caps = identity.clone();
     let x = axis(0, params.max_x as i32);
     let y = axis(0, params.max_y as i32);
@@ -192,6 +202,9 @@ pub fn build_elan_caps(params: &ElanDeviceParams, identity: &DeviceCaps) -> Devi
     caps.add_key(evkey::BTN_LEFT);
     caps.add_prop(prop::POINTER);
     caps.add_prop(prop::BUTTONPAD);
+    if has_led {
+        caps.add_led(evled::LED_MUTE);
+    }
     caps
 }
 
