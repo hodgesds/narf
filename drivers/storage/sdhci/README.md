@@ -6,8 +6,11 @@ the SD Physical Layer Simplified Specification (both free from
 sdcard.org; section numbers in the source refer to them). It performs
 the full controller bring-up over the BAR0 MMIO window — software
 reset, power-on, init clock, and the CMD0/CMD8/ACMD41/CMD2/CMD3/CMD7
-identification handshake — plus single-block PIO transfers (CMD17/
-CMD24), with response and register decoding borrowed from
+identification handshake — then negotiates the data path (#837):
+25 MHz clock raise from the Capabilities base clock, 4-bit bus
+(ACMD51 SCR probe + ACMD6), and multi-block CMD18/CMD25 with
+Auto-CMD12 over SDMA/ADMA2 (coherent bounce buffer, PIO fallback),
+with response and register decoding borrowed from
 `narf-drivers-storage-core` (`sd_proto`).
 
 The implementation lives in `src/sdhci.rs` (`Sdhci`, `SdCard`,

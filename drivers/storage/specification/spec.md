@@ -39,7 +39,10 @@ All driver code is derived strictly from the references below.
   §5.1 OCR layout. §5.2 CID layout (manufacturer ID, OEM, product
   name, revision, serial, MDT). §5.3.2 CSD v1.0 capacity formula
   (C_SIZE × 2^(C_SIZE_MULT+2) × 2^READ_BL_LEN). §5.3.3 CSD v2.0
-  capacity formula ((C_SIZE+1) × 512 KiB).
+  capacity formula ((C_SIZE+1) × 512 KiB). SCR register fields
+  (SD_SPEC, SD_BUS_WIDTHS — v4.10 Tables 5-17 / 5-21) + ACMD51
+  SEND_SCR and ACMD6 SET_BUS_WIDTH (argument 2 = 4-bit, valid
+  only in transfer state after CMD7).
 
 ### UFS / UFSHCI 3.0
 
@@ -93,12 +96,22 @@ All driver code is derived strictly from the references below.
 - **SDHCI** (`sdhci`): full controller bring-up — software reset,
   power on at 3.3 V, supply 400 kHz init clock, run the SD
   identification sequence (CMD0 / CMD8 / ACMD41 / CMD2 / CMD3 / CMD7
-  / CMD16), single-block PIO `read_block` / `write_block` on top of
-  CMD17 / CMD24, error reporting via NIS_ERROR + EIS. Identified
-  cards are published as `sdhci0` with a partition scan
+  / CMD16), then negotiate the data path (#837): raise the SD clock
+  to the 25 MHz default-speed maximum from the Capabilities base
+  clock, widen the bus to 4-bit (ACMD51 SCR probe + ACMD6
+  SET_BUS_WIDTH + Host Control), and serve multi-block CMD18 / CMD25
+  transfers with Auto-CMD12 — SDMA / ADMA2 through a host-owned
+  coherent bounce buffer when the Capabilities admit it (ADMA
+  preferred, SDMA boundary restart at 512 KiB, PIO fallback on DMA
+  error), PIO multi-block otherwise. Single-block PIO `read_block` /
+  `write_block` on top of CMD17 / CMD24 remains for 1-block callers;
+  error reporting via NIS_ERROR + EIS (+ ADMA Error Status).
+  Identified cards are published as `sdhci0` with a partition scan
   (`sdhci0p<m>`) (#834). Register access runs through an
   `SdhciTransport` seam (BAR0 MMIO in production), so the
-  identify → publish conversation is fixture-modelled end to end.
+  identify → negotiate → publish conversation is fixture-modelled
+  end to end, including a modelled DMA engine that walks the
+  driver's real ADMA table / SDMA address.
 - **RTSX** (`rtsx`): Realtek PCIe SD card reader — probe, card
   identify (real CID/CSD decoded via `sd_proto`), single-block
   CMD17 / CMD24 block I/O over the ping-pong buffer. Cards are
@@ -116,13 +129,13 @@ All driver code is derived strictly from the references below.
 - **SD protocol decoders** (`sd_proto`): pure parsers for R1, R6, R7
   responses; CID register (manufacturer + OEM + product name + serial
   + MDT); CSD register (both v1.0 and v2.0 capacity formulas + read /
-  write block lengths). Driver-agnostic; covered by deterministic
+  write block lengths); SCR register (SD_SPEC + SD_BUS_WIDTHS, the
+  4-bit precondition for ACMD6). Driver-agnostic; covered by deterministic
   smoke tests independent of MMIO.
 
 ### Out of scope (deferred)
-- ADMA2 scatter-gather descriptor table — bring-up uses PIO only.
-- Multi-block CMD18 / CMD25 transfers with Auto-CMD12.
-- High-Speed / DDR / SDR50 / SDR104 timing modes (need eMMC TUNING /
-  card-status interrogation).
+- High-Speed / DDR / SDR50 / SDR104 timing modes (need CMD6 switch
+  + tuning, #838; the 50 MHz high-speed switch is the follow-on to
+  the 25 MHz data-path raise in #837).
 - eMMC EXT_CSD (JEDEC JESD84-B51) — landed when an eMMC fabric is
   exercised end-to-end.
