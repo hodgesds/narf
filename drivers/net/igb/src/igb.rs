@@ -1130,25 +1130,40 @@ impl MailboxPumpOutcome {
     }
 }
 
-/// MMIO base of the IRQ-attached igb, shared with the static ISR so it
-/// can read ICR (read-to-clear) and acknowledge the device. 0 = no
-/// controller bound (handler short-circuits).
-static ISR_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-
-/// Sync ISR: read ICR to acknowledge the device, then return. The
-/// dispatch layer bumps the per-vector fire-count and wakes any waiter.
-/// Link Status Change pending, set by the ISR when ICR reports LSC.
-/// The ISR does no lock or allocation work; the RX pump (task
-/// context) consumes the flag, re-samples STATUS via `Igb::link_up`,
-/// and republishes the iface link metadata — before this, carrier
-/// was a probe-time photograph because the ISR read ICR only to
-/// acknowledge it (issue #791).
-static LSC_PENDING: AtomicBool = AtomicBool::new(false);
-
-/// Mailbox event pending, set by the ISR when ICR reports VMMB.
-/// The RX pump (task context) consumes the flag and runs the
-/// mailbox pump step — same shape as `LSC_PENDING` (issue #1253).
-static MB_PENDING: AtomicBool = AtomicBool::new(false);
+/// Sync ISR, demultiplexed by vector: `install_handler_named`
+/// passes the vector back as the cookie, and the handler acks only
+/// the controllers bound to that vector — the igc `ISR_HW` pattern,
+/// without the table, since the vector already lives on the
+/// controller. The old static `ISR_MMIO_BASE` could only ack one
+/// NIC: a second igb overwrote it, leaving the first device's
+/// level-triggered INTx unacknowledged (issue #795). Detached
+/// controllers are skipped: detach masks the device, so a stale
+/// in-flight interrupt must not revive it. The dispatch layer bumps
+/// the per-vector fire-count and wakes any waiter.
+fn igb_isr(cookie: u64) -> narf_interrupts::dispatch::IrqStatus {
+    let vector = cookie as u8;
+    for dev in CONTROLLERS.lock().iter() {
+        if dev.detached.load(Ordering::Acquire) || dev.irq_vector != Some(vector) {
+            continue;
+        }
+        // SAFETY: `dev.mmio` is the device's BAR0 mapping, valid for
+        // the controller lifetime; ICR (0x00c0) is inside the igb
+        // register window. The read auto-clears pending cause bits.
+        let icr = unsafe { narf_arch::mmio::read32(dev.mmio.virt + REG_ICR) };
+        // LSC is in the default IMS mask, so a link transition reaches
+        // this read; record it for the pump instead of discarding the
+        // cause word (issue #791).
+        if icr & IMS_LSC != 0 {
+            dev.lsc_pending.store(true, Ordering::Release);
+        }
+        // VMMB reaches this read once `vt_allocate` adds it to IMS;
+        // record it for the mailbox pump the same way.
+        if icr & IMS_VMMB != 0 {
+            dev.mb_pending.store(true, Ordering::Release);
+        }
+    }
+    narf_interrupts::dispatch::IrqStatus::Handled
+}
 
 /// The family's publication sample. i210/82576/i350 negotiate up to
 /// 1 GbE copper; report full duplex when the link is up (QEMU's igb
@@ -1163,27 +1178,6 @@ fn igb_link_sample(dev: &Igb) -> crate::publish::LinkSample {
         }
     } else {
         crate::publish::LinkSample::DOWN
-    }
-}
-
-fn igb_isr() {
-    let base = ISR_MMIO_BASE.load(Ordering::Acquire);
-    if base == 0 {
-        return;
-    }
-    // SAFETY: `base` is the device's BAR0 virt, mapped at bring-up;
-    // ICR (0x00c0) is inside the igb register window.
-    let icr = unsafe { narf_arch::mmio::read32(base + REG_ICR) };
-    // LSC is in the default IMS mask, so a link transition reaches
-    // this read; record it for the pump instead of discarding the
-    // cause word (issue #791).
-    if icr & IMS_LSC != 0 {
-        LSC_PENDING.store(true, Ordering::Release);
-    }
-    // VMMB reaches this read once `vt_allocate` adds it to IMS;
-    // record it for the mailbox pump the same way.
-    if icr & IMS_VMMB != 0 {
-        MB_PENDING.store(true, Ordering::Release);
     }
 }
 
@@ -1567,6 +1561,21 @@ pub struct Igb {
     /// IDT vector bound to the device's MSI-X table[0]. `None` means
     /// polled-only completion.
     pub irq_vector: Option<u8>,
+    /// PCI address of the function this instance drives. Probe
+    /// refuses a second bind of the same live address (issue #795):
+    /// two `Igb`s for one chip would drive one set of rings.
+    pub addr: narf_bus::BusAddr,
+    /// Interface name `publish_netdev_with_context` assigned this
+    /// instance (`eth%d`). Per-instance (i40e/igc pattern): the old
+    /// module-level `IGB_IFNAME` static could only name one NIC.
+    ifname: crate::publish::IfName,
+    /// Link Status Change pending, set by the ISR when ICR reports
+    /// LSC. Per-instance: the old module-level `LSC_PENDING` could
+    /// only flag one NIC's transition (issue #791).
+    lsc_pending: AtomicBool,
+    /// Mailbox event pending, set by the ISR when ICR reports VMMB.
+    /// Per-instance, same shape as `lsc_pending` (issue #1253).
+    mb_pending: AtomicBool,
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
@@ -1789,11 +1798,18 @@ impl Igb {
             Err(_) => (None, None),
         };
 
-        if irq_vector.is_some() {
-            ISR_MMIO_BASE.store(mmio.virt, Ordering::Release);
-        }
+        // Install the ISR with the vector as its cookie, so the
+        // handler can demultiplex by vector (see `igb_isr`). An early
+        // interrupt racing bring-up finds no controller bound to the
+        // vector yet and is ignored; IMS is programmed below, so no
+        // cause can fire before the device is up.
         if let Some(v) = irq_vector {
-            narf_interrupts::install_handler(v, igb_isr);
+            narf_interrupts::dispatch::install_handler_named(
+                v,
+                "igb",
+                u64::from(v),
+                igb_isr,
+            );
         }
 
         // 9. Program the extended interrupt block. Queue 0 RX and TX
@@ -1845,6 +1861,10 @@ impl Igb {
             ready: true,
             _msix: msix,
             irq_vector,
+            addr: device.addr,
+            ifname: crate::publish::IfName::new(),
+            lsc_pending: AtomicBool::new(false),
+            mb_pending: AtomicBool::new(false),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
@@ -2397,7 +2417,7 @@ impl Igb {
     /// the `igb_write_mbx` lock dance. Also processes VF reset
     /// events (`igb_vf_reset_event`) and VF acks
     /// (`igb_rcv_ack_from_vf`). Callable from task context (the RX
-    /// pump drains `MB_PENDING` into this) and from fixtures; the
+    /// pump drains `mb_pending` into this) and from fixtures; the
     /// ISR itself only sets the flag.
     ///
     /// Fails fast with an empty outcome when the datapath gate is
@@ -2509,7 +2529,7 @@ impl Igb {
                 Self::phy_write(&self.mmio, PHY_BMCR, PHY_BMCR_PWRDOWN);
             }
         }
-        crate::publish::publish_link(igb_ifname(), crate::publish::LinkSample::DOWN);
+        crate::publish::publish_link(self.ifname(), crate::publish::LinkSample::DOWN);
         Ok(())
     }
 
@@ -2584,7 +2604,7 @@ impl Igb {
             }
         }
         self.suspended.store(false, Ordering::Release);
-        crate::publish::publish_link(igb_ifname(), igb_link_sample(self));
+        crate::publish::publish_link(self.ifname(), igb_link_sample(self));
         Ok(())
     }
 
@@ -2595,7 +2615,6 @@ impl Igb {
     /// any WoL arming. The registry half lives in [`igb_detach`].
     fn detach_device(&self) {
         self.detached.store(true, Ordering::Release);
-        ISR_MMIO_BASE.store(0, Ordering::Release);
         let q0 = queue_regs(0);
         // SAFETY: mapped MMIO.
         unsafe {
@@ -3070,58 +3089,75 @@ impl Igb {
 
 // ── HwNic adapter ───────────────────────────────────────────────────
 
+/// One probed port, as the net stack sees it.
+///
+/// This owns its `Arc<Igb>` rather than looking the controller up
+/// in a module-level static. That is what makes multiple ports work:
+/// `Interface::rx_ring` / `tx_ring` return references borrowed from
+/// `&self`, so an interface with no storage of its own has to hand
+/// back a `static` — and every instance would then share one pair of
+/// rings, with the second port's frames landing in the first port's
+/// queue (i40e's `I40eNicIface` pattern).
 #[derive(Debug)]
-pub struct IgbNic;
+pub struct IgbNic {
+    /// This port's controller; the rings are borrowed out of it.
+    nic: Arc<Igb>,
+    /// Pre-publish fallback name, used by [`narf_net::Interface::name`]
+    /// before probe publishes the dynamic `eth%d` name.
+    name: &'static str,
+}
 
 impl narf_net::Interface for IgbNic {
     fn name(&self) -> &str {
-        "igb"
+        // The dynamic `eth%d` name once published (issue #784); the
+        // frame-ring name before probe gets that far.
+        let n = self.nic.ifname();
+        if n.is_empty() {
+            self.name
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac()).unwrap_or([0; 6])
+        self.nic.mac()
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up()).unwrap_or(false)
+        self.nic.link_up()
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        // Ring consumer attached: record it under this port's own
+        // name, so detach can clear it (net spec §3: `eth%d` names
+        // are lowest-free-allocated and reused). igb has no RX
+        // mirror copy of its own — frames go straight to the stack
+        // — so this is bookkeeping only.
+        crate::publish::note_rx_mirror_attached(self.nic.ifname());
+        &self.nic.rx_ipc_ring
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.nic.tx_ipc_ring
     }
 }
 
 impl crate::HwNic for IgbNic {
     fn name(&self) -> &'static str {
-        "igb"
+        let n = self.nic.ifname();
+        if n.is_empty() {
+            self.name
+        } else {
+            n
+        }
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac()).unwrap_or([0; 6])
+        self.nic.mac()
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up()).unwrap_or(false)
+        self.nic.link_up()
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::IntelIgb
@@ -3144,12 +3180,53 @@ impl crate::HwNic for IgbNic {
     }
 }
 
+impl Igb {
+    /// This instance's published interface name (`eth%d`), or `""`
+    /// before probe publishes it. Per-instance state (i40e/igc
+    /// pattern); the pumps and the registry adapter read the name
+    /// off the device they serve, never a module-level static.
+    pub fn ifname(&self) -> &'static str {
+        self.ifname.get()
+    }
+}
+
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<Igb>>> = IrqSafeSpinLock::new(None);
+/// Every probed controller, by probe order. The index is the cookie
+/// the kernel-side stack's send path resolves through
+/// [`igb_send_frame`] — the i40e `CONTROLLERS` pattern, so a second
+/// I210/I350 on the same machine probes, binds, and carries traffic
+/// instead of being dropped by a singleton slot (issue #795). The
+/// vec never shrinks: detaches mark the device in place instead of
+/// removing its slot, so a live controller's cookie stays valid for
+/// the kernel lifetime.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<Igb>>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// The probed controller at `index`, if it is live (probed and not
+/// detached). The index is the cookie probe assigned (see
+/// `CONTROLLERS`); it is stable because the vec never shrinks.
+fn live_controller(index: usize) -> Option<Arc<Igb>> {
+    CONTROLLERS
+        .lock()
+        .get(index)
+        .filter(|c| !c.detached.load(Ordering::Acquire))
+        .cloned()
+}
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    // A second probe of the SAME live function is a no-op success
+    // (the old idempotent behaviour): the bus re-walks devices, and
+    // rebuilding a second `Igb` for the same silicon would let two
+    // instances drive one chip's rings. A second FUNCTION binds as a
+    // new instance instead of being dropped (issue #795). A detached
+    // entry does not block a re-probe of its address, so a hot
+    // re-bind after detach can reclaim the function.
+    if CONTROLLERS
+        .lock()
+        .iter()
+        .any(|c| c.addr == device.addr && !c.detached.load(Ordering::Acquire))
+    {
         return Ok(());
     }
     narf_bus::pci::set_command(
@@ -3167,7 +3244,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     let mac = dev.mac;
     let link_sample = igb_link_sample(&dev);
-    *CONTROLLER.lock() = Some(dev);
+    // Retain before any ring DMA address reaches the device; the
+    // index is this instance's send-path cookie (see `CONTROLLERS`).
+    let index = {
+        let mut g = CONTROLLERS.lock();
+        g.push(dev.clone());
+        g.len() - 1
+    };
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -3179,21 +3262,27 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Register with the kernel-side TCP stack: hand it a `(mac, send_fn)`
     // pair + a name, and install the synchronous RX drain so busy-wait
     // paths (ARP / TCP handshake) can pull frames off the ring directly
-    // while the parked syscall spins. Mirrors e1000's probe.
-    let name = narf_net::iface::register("eth%d", mac, igb_send_frame);
+    // while the parked syscall spins. Mirrors e1000's probe. The send
+    // hook carries this instance's `CONTROLLERS` index as its cookie,
+    // so each port's outbound frames resolve to its own NIC.
+    let name = crate::publish::publish_netdev_with_context(
+        mac,
+        index as u64,
+        igb_send_frame,
+        link_sample,
+    );
     let bus_info = match device.addr {
         narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
         narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
     };
     narf_net::iface::set_driver_info(&name, "igb", None, bus_info);
-    crate::publish::publish_link(&name, link_sample);
     narf_net::iface::set_offloads(
         &name,
         narf_net::OffloadCapabilities {
             ..Default::default()
         },
     );
-    *IGB_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
+    dev.ifname.set(name);
     narf_net::iface::install_rx_drain(igb_rx_pump_step);
 
     // Stage-4 registry (cap-gated) — the newer `Interface` consumer path.
@@ -3202,67 +3291,80 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(&auth, IgbNic);
+        let _ = narf_net::registry().register(
+            &auth,
+            IgbNic {
+                nic: dev.clone(),
+                name: "igb",
+            },
+        );
     }
 
     Ok(())
 }
 
-/// The interface name `iface::register` gave this NIC (`eth%d`). Set
-/// once at probe; leaked into a `&'static str` since the device lives
-/// as long as the kernel.
-static IGB_IFNAME: IrqSafeSpinLock<Option<&'static str>> = IrqSafeSpinLock::new(None);
-
-fn igb_ifname() -> &'static str {
-    IGB_IFNAME.lock().unwrap_or("")
-}
-
-/// SendFn registered with `narf_net::iface` at probe. Routes the
-/// kernel-side TCP stack's outbound frames through `Igb::tx`. We clone
-/// the `Arc` out rather than hold the IRQ-masking CONTROLLER lock across
-/// `tx`, which busy-polls the DD bit for up to 250 ms.
-fn igb_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let ctrl = CONTROLLER.lock().as_ref().cloned().ok_or(())?;
+/// `SendCtxFn` registered with `narf_net::iface` at probe. Routes the
+/// kernel-side TCP stack's outbound frames through `Igb::tx`; the
+/// cookie is the controller's index in `CONTROLLERS`. We clone the
+/// `Arc` out rather than hold the IRQ-masking `CONTROLLERS` lock
+/// across `tx`, which busy-polls the DD bit for up to 250 ms.
+fn igb_send_frame(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = live_controller(cookie as usize).ok_or(())?;
     ctrl.tx(frame, &meta).map_err(|_| ())
 }
 
-/// Detach the bound igb device, if any: device half (mask, disable
-/// queues, clear WoL, drop the ISR base, set the datapath gate), then
-/// the registry half the net spec §3 obliges — publish link down,
-/// clear the RX-mirror attach note for the interface name (names are
+/// Detach the bound igb device at `index`, if any: device half (mask,
+/// disable queues, clear WoL, set the datapath gate), then the
+/// registry half the net spec §3 obliges — publish link down, clear
+/// the RX-mirror attach note for the interface name (names are
 /// lowest-free-allocated and reused), and unregister the interface.
-/// Idempotent: a second call finds no controller and does nothing.
-/// The async pumps are not joined (they hold `Arc<Igb>` clones), but
-/// every datapath entry point fails fast once detached, so a parked
-/// pump can no longer touch the device.
-pub fn igb_detach() {
-    let controller = CONTROLLER.lock().take();
-    let Some(device) = controller else {
+/// Idempotent: an out-of-range index or an already-detached device
+/// does nothing. The async pumps are not joined (they hold `Arc<Igb>`
+/// clones), but every datapath entry point fails fast once detached,
+/// so a parked pump can no longer touch the device. The
+/// `CONTROLLERS` slot is kept so other controllers' cookies stay
+/// valid.
+pub fn igb_detach(index: usize) {
+    let Some(device) = CONTROLLERS.lock().get(index).cloned() else {
         return;
     };
+    if device.detached.load(Ordering::Acquire) {
+        return;
+    }
     device.detach_device();
-    let name = igb_ifname();
+    let name = device.ifname();
     crate::publish::publish_link(name, crate::publish::LinkSample::DOWN);
     crate::publish::clear_rx_mirror_attached(name);
     let _ = narf_net::iface::unregister(name);
-    *IGB_IFNAME.lock() = None;
 }
 
-/// Drain one frame from the RX ring and dispatch it through the network
-/// stack's RX handler. Returns true iff a frame was processed. Called
-/// from the kernel-side polling task + busy-wait drains.
+/// Drain one frame from each live controller's RX ring and dispatch
+/// it through the network stack's RX handler. Returns true iff a
+/// frame was processed. Called from the kernel-side polling task +
+/// busy-wait drains. Every live port is drained (not just the
+/// first): with one global drain step, a second NIC's replies would
+/// otherwise stall until its async pump gets CPU — which never
+/// happens while the syscall is parked (issue #795).
 pub fn igb_rx_pump_step() -> bool {
-    // Bind the clone before the match so the lock guard is dropped at this
-    // semicolon. A match directly on `CONTROLLER.lock()` extends the scrutinee
-    // temporary through the selected arm; ARP dispatch can synchronously send
-    // a queued packet and would then deadlock reacquiring CONTROLLER.
-    let controller = CONTROLLER.lock().as_ref().cloned();
-    match controller {
-        Some(c) => c.rx_recv_in_place(|frame| {
-            narf_net::iface::on_rx_frame_from(igb_ifname(), frame);
-        }),
-        None => false,
+    // Clone the handles out first so no `CONTROLLERS` lock is held
+    // across the synchronous stack dispatch: ARP dispatch can
+    // synchronously send a queued packet, and a drain step that held
+    // the vec lock across it would deadlock reacquiring it.
+    let controllers: alloc::vec::Vec<Arc<Igb>> = CONTROLLERS
+        .lock()
+        .iter()
+        .filter(|c| !c.detached.load(Ordering::Acquire))
+        .cloned()
+        .collect();
+    let mut any = false;
+    for c in controllers {
+        if c.rx_recv_in_place(|frame| {
+            narf_net::iface::on_rx_frame_from(c.ifname(), frame);
+        }) {
+            any = true;
+        }
     }
+    any
 }
 
 /// Every Intel device id this driver claims.
@@ -3308,12 +3410,31 @@ fn name_for(did: u16) -> &'static str {
     }
 }
 
-pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+/// Number of live probed controllers (issue #795).
+pub fn instance_count() -> usize {
+    CONTROLLERS
+        .lock()
+        .iter()
+        .filter(|c| !c.detached.load(Ordering::Acquire))
+        .count()
 }
 
-pub fn with_controller<R>(f: impl FnOnce(&Igb) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(|a| f(a))
+/// `true` once at least one controller has been probed and not
+/// detached.
+pub fn is_probed() -> bool {
+    instance_count() > 0
+}
+
+/// The live probed controller at `index`, if it exists (see
+/// `live_controller`).
+pub fn controller(index: usize) -> Option<Arc<Igb>> {
+    live_controller(index)
+}
+
+/// Test-side accessor: run `f` against the live probed controller
+/// at `index` (i40e shape).
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&Igb) -> R) -> Option<R> {
+    live_controller(index).map(|a| f(&a))
 }
 
 fn spawn_tx_pump(device: Arc<Igb>, tx_cons: Consumer<Frame, TX_RING_N>) {
@@ -3341,14 +3462,14 @@ async fn igb_rx_pump(device: Arc<Igb>) {
         // transition; re-sample STATUS in task context and republish.
         // The pump wakes on the same interrupt (LSC is in IMS_DEFAULT)
         // or on the 10 ms fallback, so this adds no polling loop.
-        if LSC_PENDING.swap(false, Ordering::AcqRel) {
-            crate::publish::publish_link(igb_ifname(), igb_link_sample(&device));
+        if device.lsc_pending.swap(false, Ordering::AcqRel) {
+            crate::publish::publish_link(device.ifname(), igb_link_sample(&device));
         }
         // Mailbox drain (issue #1253): the ISR flagged a VF
         // mailbox event; run the pump step in task context. The
         // pump fails fast when no VT is allocated, so this costs
         // one flag check per loop when SR-IOV is off.
-        if MB_PENDING.swap(false, Ordering::AcqRel) {
+        if device.mb_pending.swap(false, Ordering::AcqRel) {
             let _ = device.vt_mailbox_pump_step();
         }
         let irq_waiter = device.irq_vector.map(|vector| {
@@ -3362,7 +3483,7 @@ async fn igb_rx_pump(device: Arc<Igb>) {
         // synchronous `igb_rx_pump_step` uses, so the async pump and the
         // busy-wait drain never race for a descriptor.
         let drained = device.rx_drain_in_place(RX_DRAIN_BUDGET, |frame| {
-            narf_net::iface::on_rx_frame_from(igb_ifname(), frame);
+            narf_net::iface::on_rx_frame_from(device.ifname(), frame);
         });
         if drained == RX_DRAIN_BUDGET {
             narf_scheduler::yield_now().await;

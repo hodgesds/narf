@@ -590,6 +590,14 @@ pub struct Ixgbe {
     /// True while the datapath is quiesced (suspend/detach): tx/rx
     /// paths refuse work instead of feeding a stopped device.
     pub quiesced: IrqSafeSpinLock<bool>,
+    /// PCI address of the function this instance drives. Probe
+    /// refuses a second bind of the same live address (issue #795):
+    /// two `Ixgbe`s for one chip would drive one set of rings.
+    pub addr: narf_bus::BusAddr,
+    /// Interface name `publish_netdev_with_context` assigned this
+    /// instance (`eth%d`). Per-instance (i40e/igc pattern): the old
+    /// module-level `IXGBE_IFNAME` static could only name one NIC.
+    ifname: crate::publish::IfName,
     /// Stage 5: MSI-X table once enabled.
     pub(crate) msix: Option<MsixTable>,
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -907,6 +915,8 @@ impl Ixgbe {
             eee_state: IrqSafeSpinLock::new(None),
             wol_board_cap: IrqSafeSpinLock::new(wol::WolBoardCap::default()),
             quiesced: IrqSafeSpinLock::new(false),
+            addr: device.addr,
+            ifname: crate::publish::IfName::new(),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -2019,7 +2029,7 @@ impl narf_net::Interface for Ixgbe {
     fn name(&self) -> &str {
         // The dynamic `eth%d` name once published (issue #784); the
         // per-chip name before probe gets that far.
-        let n = ixgbe_ifname();
+        let n = self.ifname();
         if n.is_empty() {
             name_for(self.did)
         } else {
@@ -2063,7 +2073,7 @@ impl narf_net::Interface for Ixgbe {
 
 impl crate::HwNic for Ixgbe {
     fn name(&self) -> &'static str {
-        let n = ixgbe_ifname();
+        let n = self.ifname();
         if n.is_empty() {
             name_for(self.did)
         } else {
@@ -2122,75 +2132,100 @@ impl crate::HwNic for Ixgbe {
     }
 }
 
-// ── IxgbeNic: lightweight ZST for narf-net registry ───────────────
+// ── IxgbeNic: one probed port for the narf-net registry ────────────
 //
-// The full `Ixgbe` struct owns MMIO + DMA rings and can't be cloned.
-// `IxgbeNic` is a zero-sized sentinel that delegates to the module-level
-// `CONTROLLER` static, following the same pattern as `Rtl8139Nic`.
+// The full `Ixgbe` struct owns MMIO + DMA rings and can't be cloned,
+// so the registry holds this thin adapter instead. It owns its
+// `Arc<Ixgbe>` and delegates every method to the struct's own
+// per-device `Interface` / `HwNic` impls — the rings are borrowed
+// out of the controller, so each port's frame rings are its own
+// (i40e's `I40eNicIface` pattern). The old zero-sized sentinel
+// delegated to the module-level `CONTROLLER` static instead, which
+// could only ever serve the first port (issue #795).
 
 #[derive(Debug)]
-pub struct IxgbeNic;
+pub struct IxgbeNic {
+    /// This port's controller; the rings are borrowed out of it.
+    nic: Arc<Ixgbe>,
+}
 
 impl narf_net::Interface for IxgbeNic {
     fn name(&self) -> &str {
-        let n = ixgbe_ifname();
-        if n.is_empty() {
-            with_controller(|c| name_for(c.did)).unwrap_or("ixgbe")
-        } else {
-            n
-        }
+        <Ixgbe as narf_net::Interface>::name(&self.nic)
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        <Ixgbe as narf_net::Interface>::mac(&self.nic)
     }
     fn mtu(&self) -> u32 {
-        1500
+        <Ixgbe as narf_net::Interface>::mtu(&self.nic)
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| *c.link_up.lock()).unwrap_or(false)
+        <Ixgbe as narf_net::Interface>::link_up(&self.nic)
     }
     fn num_rx_queues(&self) -> u16 {
-        with_controller(|c| c.queue_config.num_rx as u16).unwrap_or(1)
+        <Ixgbe as narf_net::Interface>::num_rx_queues(&self.nic)
     }
     fn num_tx_queues(&self) -> u16 {
-        with_controller(|c| c.queue_config.num_tx as u16).unwrap_or(1)
+        <Ixgbe as narf_net::Interface>::num_tx_queues(&self.nic)
     }
     fn queue_affinity(&self, q: u16) -> narf_net::rss::QueueAffinity {
-        with_controller(|c| narf_net::rss::QueueAffinity {
-            core: 0,
-            irq: queue_vector_for(&c.queue_config, q as usize),
-        })
-        .unwrap_or_default()
+        <Ixgbe as narf_net::Interface>::queue_affinity(&self.nic, q)
     }
     fn rss(&self) -> Option<narf_net::rss::RssConfig> {
-        with_controller(|c| c.rss_config()).flatten()
+        <Ixgbe as narf_net::Interface>::rss(&self.nic)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-                if r.is_some() {
-                    // Ring consumer attached: enable the RX mirror
-                    // (e1000's `rx_mirror_enabled` moment).
-                    crate::publish::note_rx_mirror_attached(ixgbe_ifname());
-                }
-            }
-        });
-        &RING
+        // Ring consumer attached: enable the RX mirror (e1000's
+        // `rx_mirror_enabled` moment), keyed by this port's own
+        // published name. The struct impl returns the controller's
+        // own slot directly, so no take-into-static happens here.
+        crate::publish::note_rx_mirror_attached(self.nic.ifname());
+        <Ixgbe as narf_net::Interface>::rx_ring(&self.nic)
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        <Ixgbe as narf_net::Interface>::tx_ring(&self.nic)
+    }
+}
+
+impl crate::HwNic for IxgbeNic {
+    fn name(&self) -> &'static str {
+        <Ixgbe as crate::HwNic>::name(&self.nic)
+    }
+    fn mac(&self) -> [u8; 6] {
+        <Ixgbe as crate::HwNic>::mac(&self.nic)
+    }
+    fn mtu(&self) -> u32 {
+        <Ixgbe as crate::HwNic>::mtu(&self.nic)
+    }
+    fn link_up(&self) -> bool {
+        <Ixgbe as crate::HwNic>::link_up(&self.nic)
+    }
+    fn model(&self) -> crate::NicModel {
+        <Ixgbe as crate::HwNic>::model(&self.nic)
+    }
+    fn caps(&self) -> crate::NicCaps {
+        <Ixgbe as crate::HwNic>::caps(&self.nic)
+    }
+    fn num_rx_queues(&self) -> u16 {
+        <Ixgbe as crate::HwNic>::num_rx_queues(&self.nic)
+    }
+    fn num_tx_queues(&self) -> u16 {
+        <Ixgbe as crate::HwNic>::num_tx_queues(&self.nic)
+    }
+    fn queue_affinity(&self, q: u16) -> narf_net::rss::QueueAffinity {
+        <Ixgbe as crate::HwNic>::queue_affinity(&self.nic, q)
+    }
+    fn rss(&self) -> Option<narf_net::rss::RssConfig> {
+        <Ixgbe as crate::HwNic>::rss(&self.nic)
+    }
+    fn ring_capacity(&self) -> usize {
+        <Ixgbe as crate::HwNic>::ring_capacity(&self.nic)
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        <Self as narf_net::Interface>::rx_ring(self)
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        <Self as narf_net::Interface>::tx_ring(self)
     }
 }
 
@@ -2250,42 +2285,70 @@ fn read_mac_from_rar(mmio: &MmioRegion) -> [u8; 6] {
     ]
 }
 
+impl Ixgbe {
+    /// This instance's published interface name (`eth%d`), or `""`
+    /// before probe publishes it. Per-instance state (i40e/igc
+    /// pattern); the pumps and the registry adapter read the name
+    /// off the device they serve, never a module-level static.
+    pub fn ifname(&self) -> &'static str {
+        self.ifname.get()
+    }
+}
+
 // ── PCI registration ───────────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<Ixgbe>>> = IrqSafeSpinLock::new(None);
+/// Every probed controller, by probe order. The index is the cookie
+/// the kernel-side stack's send path resolves through
+/// [`ixgbe_send_frame`] — the i40e `CONTROLLERS` pattern, so a
+/// second 82599/X540 on the same machine probes, binds, and carries
+/// traffic instead of being dropped by a singleton slot (issue
+/// #795). The vec never shrinks: detaches quiesce the device in
+/// place instead of removing its slot, so a live controller's
+/// cookie stays valid for the kernel lifetime.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<Ixgbe>>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-/// Detach the controller: quiesce + clear DRV_LOAD on the device,
-/// drop the CONTROLLER slot, clear the RX mirror note, and
-/// unregister the iface so its eth%d name can be reused. Pumps
-/// hold Arc clones and cannot be cancelled; the quiesced flag
-/// makes their tx/rx paths refuse work instead.
-pub fn detach_controller() {
-    if let Some(dev) = CONTROLLER.lock().take() {
-        dev.prepare_detach();
+/// The probed controller at `index`, if it is live (probed and not
+/// quiesced by detach/suspend). The index is the cookie probe
+/// assigned (see `CONTROLLERS`); it is stable because the vec never
+/// shrinks.
+fn live_controller(index: usize) -> Option<Arc<Ixgbe>> {
+    CONTROLLERS
+        .lock()
+        .get(index)
+        .filter(|c| !*c.quiesced.lock())
+        .cloned()
+}
+
+/// Detach the controller at `index`: quiesce + clear DRV_LOAD on the
+/// device, drop the RX mirror note, and unregister the iface so its
+/// `eth%d` name can be reused. Idempotent: an out-of-range index or
+/// an already-quiesced controller does nothing. Pumps hold `Arc`
+/// clones and cannot be cancelled; the quiesced flag makes their
+/// tx/rx paths refuse work instead. The `CONTROLLERS` slot is kept
+/// so other controllers' cookies stay valid.
+pub fn detach_controller(index: usize) {
+    let Some(dev) = CONTROLLERS.lock().get(index).cloned() else {
+        return;
+    };
+    if *dev.quiesced.lock() {
+        return;
     }
-    let name = ixgbe_ifname();
+    dev.prepare_detach();
+    let name = dev.ifname();
     if !name.is_empty() {
         crate::publish::clear_rx_mirror_attached(name);
         let _ = narf_net::iface::unregister(name);
     }
 }
 
-/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
-/// `dev_alloc_name`). Set once at probe; the device lives as long as
-/// the kernel, so the name is leaked into a `&'static str`.
-static IXGBE_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
-
-/// This NIC's interface name; empty until it has registered.
-pub fn ixgbe_ifname() -> &'static str {
-    IXGBE_IFNAME.get()
-}
-
-/// SendFn registered with `narf_net::iface` at probe time. Routes the
-/// kernel-side TCP stack's outbound frames through `Ixgbe::tx`. The
-/// Arc is cloned out rather than holding the IRQ-masking CONTROLLER
+/// `SendCtxFn` registered with `narf_net::iface` at probe time. Routes
+/// the kernel-side TCP stack's outbound frames through `Ixgbe::tx`;
+/// the cookie is the controller's index in `CONTROLLERS`. The `Arc`
+/// is cloned out rather than holding the IRQ-masking `CONTROLLERS`
 /// lock across `tx` (same reasoning as e1000's send path).
-fn ixgbe_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+fn ixgbe_send_frame(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = live_controller(cookie as usize).ok_or(())?;
     ctrl.tx(frame, &meta).map_err(|_| ())
 }
 
@@ -2298,7 +2361,18 @@ fn ixgbe_link_sample(links: u32) -> crate::publish::LinkSample {
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    // A second probe of the SAME live function is a no-op success
+    // (the old idempotent behaviour): the bus re-walks devices, and
+    // rebuilding a second `Ixgbe` for the same silicon would let two
+    // instances drive one chip's rings. A second FUNCTION binds as a
+    // new instance instead of being dropped (issue #795). A quiesced
+    // (detached) entry does not block a re-probe of its address, so
+    // a hot re-bind after detach can reclaim the function.
+    if CONTROLLERS
+        .lock()
+        .iter()
+        .any(|c| c.addr == device.addr && !*c.quiesced.lock())
+    {
         return Ok(());
     }
     narf_bus::pci::set_command(
@@ -2312,7 +2386,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: `bring_up` requires exclusive ownership of the device's
     // BAR0 for init; we hold the bus `Cap<BusDeviceCap, Write>` and the
-    // `CONTROLLER` guard above guarantees no other probe is racing this
+    // same-address guard above guarantees no other probe is racing this
     // device, so BAR0 is owned exclusively here.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = match unsafe { Ixgbe::bring_up(&device, &cap) } {
@@ -2320,7 +2394,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
-    *CONTROLLER.lock() = Some(dev.clone());
+    // Retain before any ring DMA address reaches the device; the
+    // index is this instance's send-path cookie (see `CONTROLLERS`).
+    let index = {
+        let mut g = CONTROLLERS.lock();
+        g.push(dev.clone());
+        g.len() - 1
+    };
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
@@ -2331,10 +2411,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
 
     // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
-    // name + carrier metadata via the shared helper that generalises
-    // the e1000/igb pattern. The frame-ring registration below stays.
-    let name = crate::publish::publish_netdev(
+    // name + carrier metadata via the shared helper, keyed by the
+    // `CONTROLLERS` index so each port's send path resolves to its
+    // own NIC (i40e pattern). The frame-ring registration below stays.
+    let name = crate::publish::publish_netdev_with_context(
         dev.mac,
+        index as u64,
         ixgbe_send_frame,
         ixgbe_link_sample(dev.read_links()),
     );
@@ -2343,7 +2425,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // version, bus address, and the offloads the paths actually
     // honor (TX checksum + RX checksum reporting, TSO to the tx()
     // copy-buffer bound, VLAN insertion — see ethtool.rs).
-    // Runs before IXGBE_IFNAME.set moves `name`.
+    // Runs before `dev.ifname.set` moves `name`.
     let bus_info = match device.addr {
         narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
         narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
@@ -2358,7 +2440,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             vlan_insert: true,
         },
     );
-    IXGBE_IFNAME.set(name);
+    dev.ifname.set(name);
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -2366,7 +2448,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(&auth, IxgbeNic);
+        let _ = narf_net::registry().register(
+            &auth,
+            IxgbeNic {
+                nic: dev.clone(),
+            },
+        );
     }
 
     // No pump spawn here: `bring_up` spawned the device's per-queue
@@ -2435,7 +2522,7 @@ async fn ixgbe_rx_pump(device: Arc<Ixgbe>, q: usize, observe_link: bool) {
             let sample = ixgbe_link_sample(device.read_links());
             if sample != last_sample {
                 last_sample = sample;
-                crate::publish::publish_link(ixgbe_ifname(), sample);
+                crate::publish::publish_link(device.ifname(), sample);
             }
         }
         match device.rx_recv_frame_on_queue(q) {
@@ -2447,7 +2534,7 @@ async fn ixgbe_rx_pump(device: Arc<Ixgbe>, q: usize, observe_link: bool) {
                 // mirror is non-blocking — a full/closed ring drops
                 // its copy, never the stack's packet. All RX pumps
                 // fan into the one mirror producer on the device.
-                let name = ixgbe_ifname();
+                let name = device.ifname();
                 crate::publish::dispatch_rx(
                     name,
                     &mut frame,
@@ -2538,17 +2625,38 @@ pub fn name_for(did: u16) -> &'static str {
     }
 }
 
-pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
-}
-
-pub fn with_controller<R>(f: impl FnOnce(&Ixgbe) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(|a| f(a))
-}
-
-pub fn with_controller_mut<R>(f: impl FnOnce(&mut Ixgbe) -> R) -> Option<R> {
-    CONTROLLER
+/// Number of live probed controllers (issue #795).
+pub fn instance_count() -> usize {
+    CONTROLLERS
         .lock()
-        .as_mut()
+        .iter()
+        .filter(|c| !*c.quiesced.lock())
+        .count()
+}
+
+/// `true` once at least one controller has been probed and not
+/// quiesced by detach/suspend.
+pub fn is_probed() -> bool {
+    instance_count() > 0
+}
+
+/// The live probed controller at `index`, if it exists (see
+/// `live_controller`).
+pub fn controller(index: usize) -> Option<Arc<Ixgbe>> {
+    live_controller(index)
+}
+
+/// Test-side accessor: run `f` against the live probed controller
+/// at `index` (i40e shape).
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&Ixgbe) -> R) -> Option<R> {
+    live_controller(index).map(|a| f(&a))
+}
+
+/// Mutable accessor.
+pub fn with_controller_mut<R>(index: usize, f: impl FnOnce(&mut Ixgbe) -> R) -> Option<R> {
+    CONTROLLERS
+        .lock()
+        .get_mut(index)
+        .filter(|c| !*c.quiesced.lock())
         .map(|a| f(Arc::get_mut(a).expect("Ixgbe static has multiple owners")))
 }
