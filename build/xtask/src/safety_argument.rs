@@ -891,7 +891,7 @@ enforces = ["memory/src/wx.rs::jit_cap_default_policy"]
         let spec = fs::read_to_string(root.join(SPEC_REL)).unwrap();
         let report = check_document(&doc, &spec, &root);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert_eq!(report.total_entries, 526);
+        assert_eq!(report.total_entries, 528);
         assert_eq!(report.retired_entries, 98);
     }
 }
