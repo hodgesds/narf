@@ -136,8 +136,10 @@ fn register_i8042_initcalls() {
         narf_input::I8042_MOUSE_IRQ_ROUTED.store(irq_ok, core::sync::atomic::Ordering::Release);
         let _ = writeln!(
             narf_console::Writer,
-            "  i8042-mouse: init=ok irq12={}",
+            "  i8042-mouse: init=ok irq12={} hw={} proto={}",
             if irq_ok { "routed" } else { "ROUTING_FAILED" },
+            crate::psmouse::hardware().as_str(),
+            crate::psmouse::protocol().as_str(),
         );
         InitResult::Ok
     });
