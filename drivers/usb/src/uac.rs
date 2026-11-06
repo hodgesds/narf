@@ -1998,7 +1998,7 @@ impl BindOutcome {
 /// the recorded pin already equals the desired pin.
 pub fn selector_pin_switch_needed(outcome: &BindOutcome, capture: bool, desired_pin: u8) -> bool {
     let i = BindOutcome::dir_idx(capture);
-    outcome.selector_pin_cur[i].map_or(true, |cur| cur != desired_pin)
+    outcome.selector_pin_cur[i].is_none_or(|cur| cur != desired_pin)
 }
 
 /// Build the full ordered bind conversation for a device:

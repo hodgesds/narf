@@ -7914,7 +7914,7 @@ fn smoke_uac_mixer_unit_decodes_gain_matrix() -> TestResult {
     if m.gain(1, 1) != Some(true) || m.gain(2, 2) != Some(true) {
         return TestResult::Fail("UAC2 mixer gains present");
     }
-    if m.gain(1, 3) != None || m.gain(0, 1) != None {
+    if m.gain(1, 3).is_some() || m.gain(0, 1).is_some() {
         return TestResult::Fail("UAC2 mixer gain out of range = None");
     }
     // UAC1 mixer (Table 4-5): unit 7, p = 2, m = 2, bitmap 0xFC
@@ -7962,7 +7962,7 @@ fn smoke_uac_topology_walk_uac2_mixer_clock_selector() -> TestResult {
         Ok(t) => t,
         Err(_) => return TestResult::Fail("UAC2 mixer topology parse"),
     };
-    if topo.mixers.len() != 1 || topo.selectors.len() != 0 {
+    if topo.mixers.len() != 1 || !topo.selectors.is_empty() {
         return TestResult::Fail("UAC2 mixer / selector counts");
     }
     let mx = &topo.mixers[0];
