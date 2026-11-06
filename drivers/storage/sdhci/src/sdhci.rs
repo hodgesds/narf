@@ -1395,10 +1395,10 @@ impl Sdhci {
             // multi-block off — the block-size register carries
             // the boundary field as for CMD6.
             let blksz = ((SDMA_BOUNDARY_ARG & 0x7) << 12) | 64;
-            let ok = match self.cmd(19, 0, RESP_48, true, TM_DATA_DIR_READ, blksz, 1) {
-                Ok(r) if !(R1Status { raw: r }).has_error() => true,
-                _ => false,
-            };
+            let ok = matches!(
+                self.cmd(19, 0, RESP_48, true, TM_DATA_DIR_READ, blksz, 1),
+                Ok(r) if !(R1Status { raw: r }).has_error()
+            );
             if ok {
                 let mut block = [0u8; TUNING_BLOCK_LEN];
                 if self.read_data_pio(&mut block).is_ok() {
