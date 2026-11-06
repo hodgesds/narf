@@ -289,8 +289,7 @@ pub(crate) const MIF_BOOT_FW_INIT_FAILED: u32 = 1 << 29;
 pub(crate) const MIF_BOOT_FW_INIT_COMP_SUCCESS: u32 = 1 << 31;
 pub(crate) const MIF_BOOT_FAILED_MASK: u32 =
     MIF_BOOT_CRASH_INIT | MIF_BOOT_CODE_FAILED | MIF_BOOT_FW_INIT_FAILED;
-pub(crate) const MIF_BOOT_COMPLETE_MASK: u32 =
-    MIF_BOOT_FAILED_MASK | MIF_BOOT_FW_INIT_COMP_SUCCESS;
+pub(crate) const MIF_BOOT_COMPLETE_MASK: u32 = MIF_BOOT_FAILED_MASK | MIF_BOOT_FW_INIT_COMP_SUCCESS;
 /// Host-request-interrupt READY bit (`HW_ATL2_MCP_HOST_REQ_INT_READY`).
 pub(crate) const MIF_HOST_REQ_READY: u32 = 1 << 0;
 
@@ -606,10 +605,8 @@ pub const fn build_link_options(speed_msk: u32) -> u32 {
 /// `l = mac[2] << 24 | mac[3] << 16 | mac[4] << 8 | mac[5]`.
 pub const fn mac_filter_words(mac: [u8; 6]) -> (u32, u32) {
     let h = ((mac[0] as u32) << 8) | mac[1] as u32;
-    let l = ((mac[2] as u32) << 24)
-        | ((mac[3] as u32) << 16)
-        | ((mac[4] as u32) << 8)
-        | mac[5] as u32;
+    let l =
+        ((mac[2] as u32) << 24) | ((mac[3] as u32) << 16) | ((mac[4] as u32) << 8) | mac[5] as u32;
     (l, h)
 }
 
@@ -1488,9 +1485,7 @@ impl AqcNic {
         let desc_addr = ring_phys + (slot * 16) as u64;
         // SAFETY: identity-mapped DMA ring; slot < RING_LEN.
         let wb = unsafe {
-            core::ptr::read_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxdWb>(),
-            )
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxdWb>())
         };
         if wb.status & RXD_WB_DD == 0 {
             return None;

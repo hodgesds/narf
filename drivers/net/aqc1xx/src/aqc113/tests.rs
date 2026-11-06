@@ -19,9 +19,9 @@ use super::{
     build_link_options, build_rx_desc, build_tx_desc, decode_fw_version, decode_mac_from_shared,
     decode_rx_wb, fw_version_word, link_rate_to_mbps, link_sample, mac_filter_words,
     mac_is_invalid, name_for, read_filter_caps, read_fw_version, read_link_status,
-    read_permanent_mac, speed_mask_for, FilterCaps, LinkStatus, RegIo, RxCsumResult, RxdWb,
-    TxDesc, AQC_DEV_113, AQC_DEV_113C, AQC_DEV_113CA, AQC_DEV_113CS, AQC_DEV_113DEV,
-    AQC_DEV_114CS, AQC_DEV_115C, AQC_DEV_116C, AQC_VENDOR, RING_LEN, RX_BUF_LEN,
+    read_permanent_mac, speed_mask_for, FilterCaps, LinkStatus, RegIo, RxCsumResult, RxdWb, TxDesc,
+    AQC_DEV_113, AQC_DEV_113C, AQC_DEV_113CA, AQC_DEV_113CS, AQC_DEV_113DEV, AQC_DEV_114CS,
+    AQC_DEV_115C, AQC_DEV_116C, AQC_VENDOR, RING_LEN, RX_BUF_LEN,
 };
 
 // ── Spec literals (transcribed from Linux atlantic; independent ────
@@ -279,11 +279,7 @@ fn smoke_aqc113_tx_desc_layout() -> TestResult {
     let mut bytes = [0u8; 16];
     // SAFETY: TxDesc is 16 bytes; copying it out is a plain read.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            &d as *const TxDesc as *const u8,
-            bytes.as_mut_ptr(),
-            16,
-        );
+        core::ptr::copy_nonoverlapping(&d as *const TxDesc as *const u8, bytes.as_mut_ptr(), 16);
     }
     let expected: [u8; 16] = [
         0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, // buf_addr LE
@@ -540,7 +536,10 @@ impl FakeRegs {
 
     /// True when the write log contains exactly this write.
     fn logged(&self, off: u64, value: u32) -> bool {
-        self.log.lock().iter().any(|(a, v)| *a == off && *v == value)
+        self.log
+            .lock()
+            .iter()
+            .any(|(a, v)| *a == off && *v == value)
     }
 }
 
@@ -724,11 +723,13 @@ fn smoke_aqc113_fake_bringup_conversation() -> TestResult {
         return TestResult::Fail("link_options != 0x0300FF01");
     }
     // Link status reads back as 2.5G full duplex.
-    if read_link_status(&fake) != (LinkStatus {
-        carrier: true,
-        mbps: 2500,
-        full_duplex: true,
-    }) {
+    if read_link_status(&fake)
+        != (LinkStatus {
+            carrier: true,
+            mbps: 2500,
+            full_duplex: true,
+        })
+    {
         return TestResult::Fail("link status misread from the fake");
     }
     // The TX writeback-threshold write landed (value 0).
@@ -737,10 +738,7 @@ fn smoke_aqc113_fake_bringup_conversation() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/net/aqc113",
-    smoke_aqc113_fake_bringup_conversation
-);
+kernel_test_in!("drivers/net/aqc113", smoke_aqc113_fake_bringup_conversation);
 
 fn smoke_aqc113_fake_boot_failure() -> TestResult {
     // Tampered firmware: boot reports a code failure → FwFailed.
