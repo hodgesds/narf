@@ -13,6 +13,8 @@
 //!   `USB_TYPE_CLASS | USB_RECIP_INTERFACE | (query & 0x80 ? USB_DIR_IN : USB_DIR_OUT)`
 //! and `uvc_video.c` `uvc_probe_video()` lines 440-480 — probe/commit loop.
 
+use alloc::vec::Vec;
+
 // ── Request codes (UVC 1.5 §A.8) ────────────────────────────────────
 
 /// SET_CUR — set current value of a control.

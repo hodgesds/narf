@@ -1712,7 +1712,7 @@ async fn g_ctrl(dev: &Arc<IrqSafeSpinLock<VideoDevice>>, b: &mut [u8]) -> u64 {
     let id = rd_u32(b, 0);
     let (index, ops) = {
         let g = dev.lock();
-        if g.controls.iter().find(|c| c.id == id).is_none() {
+        if !g.controls.iter().any(|c| c.id == id) {
             return errno(EINVAL);
         }
         (g.index, g.control_ops)
