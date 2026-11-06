@@ -42,6 +42,15 @@
 //! EXTEND_OBSERVED to prevent. The hooks fail closed when
 //! uninstalled, so a boot whose measured-boot pass never ran
 //! cannot quote either.
+//!
+//! It also refuses when the firmware replay has been proven to
+//! disagree with the hardware PCRs 0–7 (#1071) and the quote
+//! selects any of those PCRs: a quote over a shadow the hardware
+//! contradicts would attest a chain that never ran. The refusal
+//! is scoped to PCRs 0–7 (the selection mask's first byte —
+//! `TPMS_PCR_SELECTION.pcrSelect[0]`, one bit per PCR, low bit
+//! first); quotes over PCR 8+ are unaffected, since the mismatch
+//! says nothing about them.
 
 extern crate alloc;
 
@@ -133,13 +142,27 @@ pub async fn ensure_ak(dev: &dyn TpmDevice) -> Result<u32, TpmError> {
 /// (the verifier's nonce), signed by the provisioned AK.
 ///
 /// Refuses (`TpmError::Denied`) when no PCR extend has been
-/// observed this boot — see the module doc's guard section.
+/// observed this boot, or when the firmware replay has been
+/// proven to disagree with the hardware PCRs 0–7 and the quote
+/// selects any of those PCRs — see the module doc's guard section.
 pub async fn attestation_quote(
     dev: &dyn TpmDevice,
     qualifying_data: &[u8],
     selections: &[(u16, &[u8])],
 ) -> Result<QuoteBundle, TpmError> {
     if !narf_tpm::attest::extends_observed() {
+        return Err(TpmError::Denied);
+    }
+    // A proven firmware-replay mismatch (#1071) refuses quotes
+    // over PCRs 0–7: the shadow the quote would attest contradicts
+    // the hardware. The selection mask's first byte covers PCRs
+    // 0–7 (`TPMS_PCR_SELECTION.pcrSelect[0]`); a quote naming only
+    // PCR 8+ is unaffected.
+    if narf_tpm::attest::firmware_replay_mismatch()
+        && selections
+            .iter()
+            .any(|(_, mask)| mask.first().is_some_and(|&b| b != 0))
+    {
         return Err(TpmError::Denied);
     }
     let handle = ensure_ak(dev).await?;

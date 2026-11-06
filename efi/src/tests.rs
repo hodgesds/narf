@@ -317,3 +317,307 @@ fn smoke_efi_reset_type_variants_distinct() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("efi/reset", smoke_efi_reset_type_variants_distinct);
+
+// ── TCG2 event log ──────────────────────────────────────────────
+//
+// Fixtures are built byte-by-byte from the spec layouts (TCG EFI
+// Protocol Spec + PC Client §9–§10), never by calling the decoder
+// under test — a fixture and its decoder must not be able to agree
+// on a wrong constant.
+
+fn tcg2_push_u16(v: &mut alloc::vec::Vec<u8>, x: u16) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+fn tcg2_push_u32(v: &mut alloc::vec::Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+fn tcg2_push_u64(v: &mut alloc::vec::Vec<u8>, x: u64) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+
+/// `TCG_EfiSpecIdEventStruct` body, per the spec layout:
+/// signature[16], platformClass u32, minor/major/errata/uintnSize
+/// u8s, numberOfAlgorithms u32, {algId u16, digestSize u16} pairs,
+/// vendorInfoSize u8 (0 here, no vendor info).
+fn tcg2_spec_id_body(algs: &[(u16, u16)]) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::new();
+    v.extend_from_slice(b"Spec ID Event03");
+    tcg2_push_u32(&mut v, 0); // platformClass: CLIENT
+    v.push(0); // specVersionMinor
+    v.push(2); // specVersionMajor
+    v.push(2); // specErrata
+    v.push(2); // uintnSize
+    tcg2_push_u32(&mut v, algs.len() as u32);
+    for &(alg, size) in algs {
+        tcg2_push_u16(&mut v, alg);
+        tcg2_push_u16(&mut v, size);
+    }
+    v.push(0); // vendorInfoSize
+    v
+}
+
+/// The Spec ID event as the log's first record: a legacy
+/// `TCG_PCR_EVENT` (pcrIndex, eventType `EV_NO_ACTION`, 20 zero
+/// digest bytes, eventSize, event).
+fn tcg2_spec_id_record(algs: &[(u16, u16)]) -> alloc::vec::Vec<u8> {
+    let body = tcg2_spec_id_body(algs);
+    let mut v = alloc::vec::Vec::new();
+    tcg2_push_u32(&mut v, 0); // pcrIndex
+    tcg2_push_u32(&mut v, 0x0000_0003); // EV_NO_ACTION
+    v.extend_from_slice(&[0u8; 20]); // digest (zero)
+    tcg2_push_u32(&mut v, body.len() as u32);
+    v.extend_from_slice(&body);
+    v
+}
+
+/// One `TCG_PCR_EVENT2` record: pcrIndex, eventType, digestCount,
+/// (algId, digest) pairs, eventSize, event.
+fn tcg2_event2_record(
+    pcr: u32,
+    event_type: u32,
+    digests: &[(u16, &[u8])],
+    event: &[u8],
+) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::new();
+    tcg2_push_u32(&mut v, pcr);
+    tcg2_push_u32(&mut v, event_type);
+    tcg2_push_u32(&mut v, digests.len() as u32);
+    for &(alg, digest) in digests {
+        tcg2_push_u16(&mut v, alg);
+        v.extend_from_slice(digest);
+    }
+    tcg2_push_u32(&mut v, event.len() as u32);
+    v.extend_from_slice(event);
+    v
+}
+
+fn smoke_tcg2_guid_byte_order() -> TestResult {
+    use crate::tcg2::{EFI_TCG2_FINAL_EVENTS_TABLE_GUID, LINUX_EFI_TPM_EVENT_LOG_GUID};
+    // EFI_GUID wire order: data1/data2/data3 little-endian, then
+    // the 8 tail bytes verbatim. This pins the order the
+    // configuration-table walk compares against — a swapped field
+    // silently finds no table.
+    if EFI_TCG2_FINAL_EVENTS_TABLE_GUID.0
+        != [
+            0x96, 0xd0, 0x2e, 0x1e, 0xe2, 0x30, 0x54, 0x42, 0xbd, 0x89, 0x86, 0x3b, 0xbe, 0xf8,
+            0x23, 0x25,
+        ]
+    {
+        return TestResult::Fail("final-events GUID bytes wrong");
+    }
+    if LINUX_EFI_TPM_EVENT_LOG_GUID.0
+        != [
+            0xb0, 0x9c, 0x79, 0xb7, 0xa2, 0xec, 0x43, 0x49, 0x96, 0x67, 0x1f, 0xae, 0x07, 0xb7,
+            0x47, 0xfa,
+        ]
+    {
+        return TestResult::Fail("Linux event-log GUID bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("efi/tcg2", smoke_tcg2_guid_byte_order);
+
+fn smoke_tcg2_table_headers_decode() -> TestResult {
+    use crate::tcg2::{decode_final_events_table_header, decode_linux_tpm_event_log_header};
+    let mut fin = alloc::vec::Vec::new();
+    tcg2_push_u64(&mut fin, 1); // Version
+    tcg2_push_u64(&mut fin, 3); // NumberOfEvents
+    match decode_final_events_table_header(&fin) {
+        Some(h) if h.version == 1 && h.number_of_events == 3 => {}
+        _ => return TestResult::Fail("final-events header decode wrong"),
+    }
+    let mut bad = fin.clone();
+    bad[0] = 2; // Version 2: not understood
+    if decode_final_events_table_header(&bad).is_some() {
+        return TestResult::Fail("final-events version 2 accepted");
+    }
+    if decode_final_events_table_header(&fin[..15]).is_some() {
+        return TestResult::Fail("short final-events header accepted");
+    }
+    let mut log = alloc::vec::Vec::new();
+    tcg2_push_u32(&mut log, 0x1234); // size
+    tcg2_push_u32(&mut log, 0x40); // final_events_preboot_size
+    log.push(2); // version = TCG2
+    match decode_linux_tpm_event_log_header(&log) {
+        Some(h) if h.size == 0x1234 && h.final_events_preboot_size == 0x40 && h.version == 2 => {}
+        _ => return TestResult::Fail("Linux event-log header decode wrong"),
+    }
+    let mut sha1_only = log.clone();
+    sha1_only[8] = 1; // version = TCG_1_2: no SHA-256 bank
+    if decode_linux_tpm_event_log_header(&sha1_only).is_some() {
+        return TestResult::Fail("SHA-1-only event-log header accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("efi/tcg2", smoke_tcg2_table_headers_decode);
+
+fn smoke_tcg2_log_parses_spec_stream() -> TestResult {
+    use crate::tcg2::parse_tcg2_log;
+    let algs = [(0x0004u16, 20u16), (0x000Bu16, 32u16)];
+    let mut log = tcg2_spec_id_record(&algs);
+    // EV_S_CRTM_VERSION (0x8) into PCR 0, SHA-1 + SHA-256 digests.
+    log.extend_from_slice(&tcg2_event2_record(
+        0,
+        0x0000_0008,
+        &[(0x0004, &[0x11u8; 20]), (0x000B, &[0x22u8; 32])],
+        b"v1.0",
+    ));
+    // EV_SEPARATOR (0x4) into PCR 0.
+    log.extend_from_slice(&tcg2_event2_record(
+        0,
+        0x0000_0004,
+        &[(0x0004, &[0x33u8; 20]), (0x000B, &[0x44u8; 32])],
+        &[4, 0, 0, 0],
+    ));
+    // EV_NO_ACTION into PCR 7, zero digests.
+    log.extend_from_slice(&tcg2_event2_record(
+        7,
+        0x0000_0003,
+        &[(0x0004, &[0u8; 20]), (0x000B, &[0u8; 32])],
+        b"note",
+    ));
+    let (info, events) = match parse_tcg2_log(&log) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("valid TCG2 log rejected"),
+    };
+    if info.number_of_algorithms != 2 || !info.has_sha256 {
+        return TestResult::Fail("Spec ID info wrong");
+    }
+    if events.len() != 4 {
+        return TestResult::Fail("expected Spec ID + 3 records");
+    }
+    // Record 0 is the Spec ID event itself: never extended.
+    if events[0].event_type != 0x0000_0003 || events[0].sha256_digest.is_some() {
+        return TestResult::Fail("Spec ID record misparsed");
+    }
+    if &events[0].event[0..16] != b"Spec ID Event03" {
+        return TestResult::Fail("Spec ID signature not carried");
+    }
+    if events[1].sha256_digest != Some([0x22u8; 32]) || events[1].event != b"v1.0" {
+        return TestResult::Fail("first EVENT2 record misparsed");
+    }
+    if events[2].event_type != 0x0000_0004 || events[2].sha256_digest != Some([0x44u8; 32]) {
+        return TestResult::Fail("separator record misparsed");
+    }
+    if events[3].pcr != 7 || events[3].sha256_digest != Some([0u8; 32]) {
+        return TestResult::Fail("NO_ACTION record misparsed");
+    }
+    // A zero-padded tail ends the log cleanly (Linux rule).
+    let mut padded = log.clone();
+    padded.extend_from_slice(&[0u8; 24]);
+    match parse_tcg2_log(&padded) {
+        Ok((_, evs)) if evs.len() == 4 => TestResult::Pass,
+        _ => TestResult::Fail("zero-padded tail rejected"),
+    }
+}
+kernel_test_in!("efi/tcg2", smoke_tcg2_log_parses_spec_stream);
+
+fn smoke_tcg2_log_rejects_malformed() -> TestResult {
+    use crate::tcg2::{parse_tcg2_log, Tcg2LogError};
+    let algs = [(0x0004u16, 20u16), (0x000Bu16, 32u16)];
+    let good = tcg2_spec_id_record(&algs);
+    let mut rec = tcg2_event2_record(
+        0,
+        0x0000_0008,
+        &[(0x0004, &[0x11u8; 20]), (0x000B, &[0x22u8; 32])],
+        b"v1.0",
+    );
+    // Bad Spec ID signature.
+    let mut bad_sig = good.clone();
+    bad_sig[32] = b'X';
+    if parse_tcg2_log(&bad_sig) != Err(Tcg2LogError::BadSpecIdSignature) {
+        return TestResult::Fail("bad Spec ID signature accepted");
+    }
+    // SHA-1-only algorithm list: no SHA-256 bank to replay.
+    let sha1_only = tcg2_spec_id_record(&[(0x0004u16, 20u16)]);
+    if parse_tcg2_log(&sha1_only) != Err(Tcg2LogError::NoSha256Bank) {
+        return TestResult::Fail("SHA-1-only log accepted");
+    }
+    // Digest count (1) != numberOfAlgorithms (2).
+    let mut log = good.clone();
+    rec[8..12].copy_from_slice(&1u32.to_le_bytes());
+    log.extend_from_slice(&rec);
+    if parse_tcg2_log(&log) != Err(Tcg2LogError::BadDigestCount) {
+        return TestResult::Fail("digest-count mismatch accepted");
+    }
+    // Truncated tail.
+    let mut truncated = good.clone();
+    truncated.extend_from_slice(&rec[..rec.len() - 3]);
+    if parse_tcg2_log(&truncated) != Err(Tcg2LogError::Short) {
+        return TestResult::Fail("truncated record accepted");
+    }
+    // PCR out of range.
+    let mut bad_pcr = good.clone();
+    bad_pcr.extend_from_slice(&tcg2_event2_record(
+        24,
+        0x0000_0008,
+        &[(0x0004, &[0x11u8; 20]), (0x000B, &[0x22u8; 32])],
+        b"x",
+    ));
+    if parse_tcg2_log(&bad_pcr) != Err(Tcg2LogError::BadPcrIndex) {
+        return TestResult::Fail("PCR 24 accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("efi/tcg2", smoke_tcg2_log_rejects_malformed);
+
+fn smoke_tcg2_final_events_parse() -> TestResult {
+    use crate::tcg2::{parse_final_events, Tcg2LogError};
+    let first = tcg2_event2_record(
+        5,
+        0x8000_0007, // EV_EFI_ACTION
+        &[(0x0004, &[0x55u8; 20]), (0x000B, &[0x66u8; 32])],
+        b"Exit Boot Services Invocation",
+    );
+    let second = tcg2_event2_record(
+        5,
+        0x8000_0007,
+        &[(0x0004, &[0x77u8; 20]), (0x000B, &[0x88u8; 32])],
+        b"Exit Boot Services Returned with Success",
+    );
+    let mut body = alloc::vec::Vec::new();
+    body.extend_from_slice(&first);
+    body.extend_from_slice(&second);
+    // Exact count, Spec ID count known from the main log.
+    match parse_final_events(&body, 2, Some(2), 0) {
+        Ok(evs) if evs.len() == 2 && evs[0].sha256_digest == Some([0x66u8; 32]) => {}
+        _ => return TestResult::Fail("final-events parse wrong"),
+    }
+    // Without the main log's Spec ID anchor, single-bank records
+    // still parse.
+    let single = tcg2_event2_record(5, 0x8000_0007, &[(0x000B, &[0x99u8; 32])], b"x");
+    match parse_final_events(&single, 1, None, 0) {
+        Ok(evs) if evs.len() == 1 => {}
+        _ => return TestResult::Fail("anchorless final-events parse wrong"),
+    }
+    // `final_events_preboot_size`: the first record is already in
+    // the main log and must be skipped, never replayed twice.
+    match parse_final_events(&body, 2, Some(2), first.len()) {
+        Ok(evs) if evs.len() == 1 && evs[0].sha256_digest == Some([0x88u8; 32]) => {}
+        _ => return TestResult::Fail("preboot dedup skip wrong"),
+    }
+    // A prefix that lands mid-record is corrupt, not a skip.
+    if parse_final_events(&body, 2, Some(2), 5) != Err(Tcg2LogError::BadPrebootSize) {
+        return TestResult::Fail("mid-record preboot skip accepted");
+    }
+    // A prefix longer than the table overruns it.
+    if parse_final_events(&body, 2, Some(2), body.len() + 1) != Err(Tcg2LogError::BadPrebootSize)
+    {
+        return TestResult::Fail("overrunning preboot skip accepted");
+    }
+    // Fewer records than NumberOfEvents.
+    if parse_final_events(&body, 3, Some(2), 0) != Err(Tcg2LogError::Short) {
+        return TestResult::Fail("short final table accepted");
+    }
+    // Digest count disagrees with the anchor.
+    if parse_final_events(&body, 2, Some(1), 0) != Err(Tcg2LogError::BadDigestCount) {
+        return TestResult::Fail("final-events digest-count mismatch accepted");
+    }
+    // A non-NO_ACTION record without a SHA-256 digest cannot replay.
+    let no_sha256 = tcg2_event2_record(5, 0x8000_0007, &[(0x0004, &[0x11u8; 20])], b"x");
+    if parse_final_events(&no_sha256, 1, None, 0) != Err(Tcg2LogError::NoSha256Bank) {
+        return TestResult::Fail("SHA-256-less final event accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("efi/tcg2", smoke_tcg2_final_events_parse);

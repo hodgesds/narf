@@ -26,7 +26,10 @@ pub mod x86_64;
 pub mod aarch64;
 
 pub use args::KernelCmdline;
-pub use firmware::{firmware_handoff, FirmwareHandoff, SmbiosEntryCopy};
+pub use firmware::{
+    find_efi_config_table, firmware_handoff, tcg2_log_tables, FirmwareHandoff, SmbiosEntryCopy,
+    Tcg2LogTables,
+};
 pub use info::{validate_memory_map, BootError, BootInfo, MemRegion, MemRegionKind, RawBootInfo};
 
 /// Bootloader-supplied kernel command-line as a `&'static str`.

@@ -247,26 +247,38 @@ contract:
   securityfs mounts an empty directory with no content registry,
   so the class device — where this tree publishes TPM state —
   carries the node under the same name.
-- **Firmware event-log ingestion (design answer, #945).** A quote
-  is only as strong as the measurement chain behind the PCRs,
-  and on UEFI laptops the chain's first links are firmware's:
-  the SRTM extends PCRs 0–7 before NARF runs. NARF today neither
-  ingests the firmware TCG log nor reads the hardware PCRs back,
-  so its shadow starts at zero and a quote over PCRs 0–7 cannot
-  account for the firmware extends. The designed path: the boot
-  handoff surfaces the EFI TCG2 log (the `TCG_PCR_EVENT2` stream
-  plus the final-events table) to `frame::measure` before its
-  first extend; measure replays the firmware events into the
-  shadow with the hardware extend formula, records them at the
-  head of its own log (so the published log is the full chain),
-  and cross-checks the replayed shadow against a hardware
-  `TPM2_PCR_Read` of PCRs 0–7 on first quote — a mismatch means
-  the firmware's log and its extends disagree, and quotes over
-  those PCRs must say so rather than paper over it. That
-  implementation touches `boot/` and `frame/` (TCB) and lands as
-  its own lane (tracked as #1071); until it does, quotes over the
-  boot PCRs attest NARF's extends only, and this paragraph is the
-  standing caveat every verifier of a NARF quote must apply.
+- **Firmware event-log ingestion (landed, #1071).** A quote is
+  only as strong as the measurement chain behind the PCRs, and
+  on UEFI laptops the chain's first links are firmware's: the
+  SRTM extends PCRs 0–7 before NARF runs. The measured-boot
+  initcall now ingests the firmware TCG2 log before its first
+  extend: the boot handoff locates it through the EFI
+  configuration table (`narf_boot::firmware::tcg2_log_tables` —
+  the `LINUX_EFI_TPM_EVENT_LOG_GUID` main log plus the
+  `EFI_TCG2_FINAL_EVENTS_TABLE_GUID` final-events table,
+  de-duplicated by `final_events_preboot_size`), `frame::measure`
+  parses it with the pure `narf_efi::tcg2` codecs and replays
+  the firmware events into the shadow with the hardware extend
+  formula, recording them at the head of its own log — so the
+  published `binary_bios_measurements` is the full chain
+  (firmware prefix + NARF events), byte-compatible with what a
+  verifier replays. `EV_NO_ACTION` records are recorded, never
+  extended. Before the completion summary the initcall reads
+  the hardware PCRs 0–7 back (`TPM2_PCR_Read` through the
+  registry device) and compares them against the replayed
+  shadow; a proven mismatch is sticky, reported on the boot
+  console, and refuses quotes over PCRs 0–7 (the quote guard
+  in `drivers/platform/src/tpm_attestation.rs`) — a mismatch
+  means the firmware's log and its extends disagree, and quotes
+  over those PCRs say so rather than paper over it. Ingest is
+  two-phase (parse all, then apply) and exactly-once; a
+  malformed log replays nothing. Remaining caveat: on boots
+  where firmware publishes no TCG2 log (non-EFI, or a stub
+  that does not install the tables) there is no firmware prefix
+  to replay, and the cross-check correctly reports mismatch
+  against hardware that firmware did extend — the verifier must
+  still apply that standing caveat to quotes from such boots.
+  DRTM / PCRs 17–22 locality remain out of scope.
 
 ## 4. Operation: PCR Extension
 

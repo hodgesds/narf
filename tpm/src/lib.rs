@@ -1112,6 +1112,9 @@ mod tests {
     fn stub_extends_observed() -> bool {
         true
     }
+    fn stub_firmware_replay_mismatch() -> bool {
+        true
+    }
 
     fn smoke_tpm_measurement_hooks_fail_closed() -> TestResult {
         use crate::attest;
@@ -1119,15 +1122,22 @@ mod tests {
         if attest::extends_observed() {
             return TestResult::Fail("uninstalled hooks must report no extends (fail closed)");
         }
+        if attest::firmware_replay_mismatch() {
+            return TestResult::Fail("uninstalled hooks must report no mismatch (fail closed)");
+        }
         if !attest::event_log_bytes().is_empty() {
             return TestResult::Fail("uninstalled hooks must serve an empty log");
         }
         attest::install_measurement_hooks(attest::MeasurementHooks {
             event_log: stub_event_log,
             extends_observed: stub_extends_observed,
+            firmware_replay_mismatch: stub_firmware_replay_mismatch,
         });
         if !attest::extends_observed() {
             return TestResult::Fail("installed hook's extend flag not consulted");
+        }
+        if !attest::firmware_replay_mismatch() {
+            return TestResult::Fail("installed hook's mismatch flag not consulted");
         }
         if attest::event_log_bytes() != alloc::vec![0xDE, 0xAD, 0xBE, 0xEF] {
             return TestResult::Fail("installed hook's log bytes not served");
