@@ -343,9 +343,13 @@ impl<R: DmaRegs> PayloadEngine for SdwDma<R> {
         // Stop first (idempotent when already stopped); a failed stop
         // retains the old stream and fails the prepare (acp63).
         self.stop()?;
+        // Hoisted above the ring borrow: `stream_regs()` takes `&self`,
+        // which would overlap the live `&mut` ring borrow below (E0502).
+        // The register block depends only on the stream id, so reading
+        // it here changes no behaviour.
+        let regs = self.stream_regs();
         let ring = self.ring.as_mut().ok_or(SoundError::BadState)?;
         ring.reset();
-        let regs = self.stream_regs();
         // ATU group 2 (SDW), Linux `acp63_config_dma`: base and
         // page size, then this stream's PTE slice in scratch SRAM
         // (PTE pairs per 4 KiB page: low word = address low, high
