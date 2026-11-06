@@ -109,7 +109,7 @@ Each links to its owning spec for the full text.
 | 10 | `DomainId` namespace is **owned by `security-model/` §4.1** (FRAME=0, CAPS=1, MEMORY_MGR=2, SCHED=3, IPC=4, TRACER=5, KEYS=6, OBSERVE=7, USERSPACE_K=8, DRIVER(0..5)=9..14, SCRATCH=15). `memory/` §3 mirrors as `DomainId::*` constants. |
 | 11 | QSBR readers may **not `await`** inside a critical section — only sleepable-RCU may. `ReadGuard` is `!Send` to enforce. Sleepable-RCU is **cap-gated** with budget + timeout-bounded sync. | `rcu/` §3.3, §3.5 |
 | 12 | `SeqLock<T: Copy>` bound is load-bearing (torn-state sampling is UB without `Copy`). `SpinLockGuard<'_, T, IrqState>` typestate makes mixed-IRQ-context use a compile error. | `lib/` §3 |
-| 13 | AI-originated TCB PRs include `safety-argument.toml` referencing `security-model/` invariants by `section#Lline`; CI rejects unresolvable refs. Audit trail is SLSA in-toto + `narf-agent` predicate. | `process/` §6.3, §6.5 |
+| 13 | AI-originated TCB PRs include an explicit safety argument in the PR body referencing `security-model/` invariants by `section#Lline`, and file safety items as repo issues (one per finding / subsystem) instead of a committed file. Audit trail is SLSA in-toto + `narf-agent` predicate. | `process/` §6.3, §6.5 |
 
 ## Sync → async bridge primitives (`narf_scheduler`)
 

@@ -399,7 +399,7 @@ pub unsafe extern "C" fn s3_wake_entry() -> ! {
         //
         // ── EFER FIRST, before CR3 ──────────────────────────────
         // Firmware may clear IA32_EFER across S3. Every kernel window
-        // is NX (see safety-argument.toml / bpf spec §4.2), so with
+        // is NX (see bpf spec §4.2), so with
         // EFER.NXE clear, PTE bit 63 is a *reserved* bit: the instant
         // CR3 points at the kernel tables, the very next access
         // through any kernel mapping — the `mov rsp` load, the stack

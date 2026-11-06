@@ -120,36 +120,23 @@ never applies; default to TCB), but the review bar of §4 applies:
 - Two maintainers review, one must be a security reviewer.
 - A `security-review` pass is mandatory.
 - The agent must include, in the PR description, an explicit safety
-  argument **in the schema below** — prose alone is not accepted.
+  argument referencing the `security-model/` invariants it claims
+  preserved, by `section#line` — and file any safety items as repo
+  issues (one per finding / subsystem). An argument that does not name
+  its invariants is not accepted.
 - If any reviewer believes the agent's safety argument is wrong, the
   PR is closed, not iterated. A new PR must start from a fresh prompt.
 
-**Machine-checkable safety-argument schema (binding from Stage 2).**
-Every AI-originated TCB PR includes a `safety-argument.toml` block
-with:
-
-```toml
-[safety_argument]
-schema_version = 1
-agent          = "<agent-name@version>"
-prompt_hash    = "<sha256 of the originating prompt>"
-
-# One entry per security-model invariant claimed preserved.
-# Each entry references the section.line in security-model/specification/spec.md
-# at the commit being reviewed. CI verifies the references exist.
-[[invariants_preserved]]
-ref       = "security-model/specification/spec.md#L34"  # TCB-set definition
-argument  = "Change is in capabilities/ which is already in the TCB set; no boundary moved."
-
-[[invariants_preserved]]
-ref       = "security-model/specification/spec.md#L37"  # cap-AND-domain rule
-argument  = "Edit only adds a new cap operation; both checks remain in place."
-```
-
-A linter run by CI parses the file, verifies each `ref` resolves to
-a present line, and counts unique invariants covered. The schema is
-not the safety argument — it is its skeleton; reviewers still read
-the prose. But missing or unresolvable refs are a hard merge-block.
+**Safety argument (PR body + repo issues).** The agent includes the
+safety argument in the PR description: an explicit, structured
+argument naming each `security-model/` invariant claimed preserved,
+referenced by `section#line` at the commit being reviewed. Safety
+items are filed and tracked as repo issues (one per finding /
+subsystem), not appended to a committed file — the former
+`safety-argument.toml` was removed in #1594 and its content survives
+only in git history. Reviewers still read the prose; an argument that
+does not name its invariants, or names ones the change does not
+preserve, is a hard merge-block.
 
 ### 6.5 Audit trail (concrete format from Stage 2)
 

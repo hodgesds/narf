@@ -125,13 +125,6 @@ fn is_ignorable_path(rel: &str) -> bool {
         base,
         "LICENSE" | "README.md" | "ROADMAP.md" | "STATUS.md" | "AGENTS.md"
     ) || base.ends_with(".md")
-        // Root safety-argument.toml changes no build output and CI has
-        // no checker for it today, so it seeds nothing on its own. A
-        // code + safety-entry diff is scoped by the code; the
-        // safety-only case is forced full explicitly in `plan` (an
-        // all-ignored diff is not the empty diff, so it needs its own
-        // rule — see there).
-        || rel == "safety-argument.toml"
 }
 
 /// One workspace crate: its cargo package name, its directory relative to
@@ -427,24 +420,6 @@ pub fn plan(
                 lint_all = true;
             }
         }
-    }
-
-    // safety-argument.toml is ignorable (it seeds nothing), but a diff
-    // touching ONLY it must not come out as a minimal doc-only run:
-    // the empty-set rule above keys on the raw diff, and an
-    // all-ignored diff is not empty, so this case needs its own rule.
-    // A safety-entry change riding along with code is unaffected — the
-    // code still scopes the run. lint_all keeps the full run honest:
-    // every other full path lints all crates, and a "full" run that
-    // skipped clippy would not be full.
-    if !changed_files.is_empty()
-        && seeds.is_empty()
-        && changed_files.iter().any(|f| f == "safety-argument.toml")
-    {
-        p.full = true;
-        lint_all = true;
-        p.reasons
-            .push("safety-argument-only change — running full as a safe default".into());
     }
 
     // Hub crate directly touched ⇒ full.
@@ -1757,43 +1732,5 @@ mod tests {
             !p.subsystems.contains("drivers/gpu/amdgpu"),
             "non-allowlisted crate must not narrow"
         );
-    }
-
-    #[test]
-    fn safety_argument_toml_is_ignorable_except_when_alone() {
-        let cr = fixture();
-        // Code + safety entry: scoped by the code.
-        let p = plan(
-            &[
-                "filesystem/src/page_cache.rs".into(),
-                "safety-argument.toml".into(),
-            ],
-            &cr,
-            &tags(),
-            &BTreeMap::new(),
-            "pull_request",
-            false,
-        );
-        assert!(!p.full, "safety entry must not force full alongside code");
-        assert!(p.subsystems.contains("filesystem"));
-        // Safety entry alone: full, via its own rule (not the empty-diff rule).
-        let p = plan(
-            &["safety-argument.toml".into()],
-            &cr,
-            &tags(),
-            &BTreeMap::new(),
-            "pull_request",
-            false,
-        );
-        assert!(p.full, "safety-only diff must stay full");
-        assert!(
-            p.reasons.iter().any(|r| r.contains("safety-argument")),
-            "reasons: {:?}",
-            p.reasons
-        );
-        // A "full" run that skipped clippy would not be full: like every
-        // other full path, the safety-only run lints all crates.
-        assert!(p.run_clippy);
-        assert_eq!(p.clippy_crates.len(), cr.len());
     }
 }

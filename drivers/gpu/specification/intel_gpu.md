@@ -7077,8 +7077,7 @@ Sources are Linux b90c984d: `mm/mmu_notifier.c` (the interval API),
 `xe_vm_userptr_pin`, `__xe_vm_userptr_needs_repin`), `xe_exec.c`
 (`xe_exec_ioctl`'s pin and `-EAGAIN` retry), `xe_vm.c::new_vma` and
 `drm_gpusvm.c::drm_gpusvm_get_pages`. This is TCB-class work: the
-notifier is new memory/ code (`memory/specification/spec.md` §3 and §4,
-`safety-argument.toml`).
+notifier is new memory/ code (`memory/specification/spec.md` §3 and §4).
 
 **Memory layer.** `narf_memory::mmu_notifier::MmuIntervalNotifier::insert`
 registers `[start, start + length)` of one address space. Each operation
@@ -7152,8 +7151,7 @@ Sources are Linux b90c984d: `mm/vmscan.c::shrink_folio_list` (the two
 reference test and the anon-exclusive `folio_try_share_anon_rmap_pte`
 back-off), `mm/rmap.c::try_to_migrate_one`, `mm/migrate.c` and
 `mm/gup.c::follow_page_pte` (`FOLL_TOUCH` dirtying at a `FOLL_WRITE` pin).
-This is TCB-class memory/ work (`memory/specification/spec.md` §3 and §4,
-`safety-argument.toml`).
+This is TCB-class memory/ work (`memory/specification/spec.md` §3 and §4).
 
 The frames behind an Xe MAP_USERPTR (or any other `UserPagePin`) were never
 freed under the GPU, because the pin holds a reference. Their contents could
@@ -7187,8 +7185,7 @@ Sources are Linux b90c984d: `ttm_bo_vm.c` (`ttm_bo_unmap_virtual`,
 `ttm_bo_vm_fault_reserved`), `mm/memory.c::unmap_mapping_range`, `xe_bo.c`
 (`xe_bo_cpu_fault`, `__xe_bo_cpu_fault`, `xe_bo_runtime_pm_release_mmap_offset`,
 the `vram_userfault` list) and `xe_pm.c::xe_pm_runtime_suspend`. The memory/
-half is TCB-class (`memory/specification/spec.md` §3 and §4,
-`safety-argument.toml`).
+half is TCB-class (`memory/specification/spec.md` §3 and §4).
 
 A discrete GT used to refuse runtime suspend while any VRAM was allocated,
 because user CPU mappings of the LMEM BAR could not be revoked and the BAR

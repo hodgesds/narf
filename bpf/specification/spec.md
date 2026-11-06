@@ -615,10 +615,10 @@ return-address stack is forbidden.
 
 ## 4. Invariants
 
-Numbered for `safety-argument.toml` references. **This subsystem touches
+Numbered for cross-reference from PR safety arguments. **This subsystem touches
 `frame/`, `memory/`, and `capabilities/`, so it is a TCB change** under
 AGENTS.md: two maintainers (one security), signed commit, `security-review`,
-and a `safety-argument.toml` entry.
+and a safety argument in the PR description.
 
 **4.1 — BPF kernel-VA top-level tables are allocated at boot, before the first
 user address space.** `new_user_pml4_on` snapshot-copies PML4[256..511] by
