@@ -98,6 +98,14 @@ pub const FID_HOST_BEHAVIOR_SUPPORT: u8 = 0x16;
 pub const FID_SANITIZE_CONFIG: u8 = 0x17;
 pub const FID_BOOT_PARTITION_WRITE_PROTECTION: u8 = 0x1A;
 
+/// Async Event Configuration bitmap bits (NVMe Base Spec 2.0c
+/// §5.31, table 295) — the event classes the host asks the
+/// controller to report via AER completions. The driver enables
+/// SMART/health + namespace-attribute-changed at bring-up (#928);
+/// the AER supervisor rescans namespaces on the latter.
+pub const AEC_SMART_HEALTH: u32 = 1 << 0;
+pub const AEC_NS_ATTR_CHANGED: u32 = 1 << 1;
+
 /// One NVMe Submission Queue Entry — the public-API mirror of the
 /// internal `Sqe` struct used by the driver. We keep this in its own
 /// type so admin builders compose without touching the driver's
@@ -385,6 +393,26 @@ pub fn set_features_async_event_config(cid: u16, aec: u32) -> AdminSqe {
 /// Linux ref: drivers/nvme/host/core.c:nvme_async_event
 pub fn async_event_request(cid: u16) -> AdminSqe {
     AdminSqe::new(OPC_ASYNC_EVENT_REQUEST).with_cid(cid)
+}
+
+/// Async Event Type "Notice" (CQE CDW0 bits[2:0] == 0x02, §5.2).
+pub const AER_TYPE_NOTICE: u32 = 0x02;
+
+/// Notice event information "Namespace Attribute Changed" (CQE
+/// CDW0 bits[15:8] == 0x00 with type Notice, §5.2). The namespace
+/// set may have grown, shrunk or changed geometry: the host must
+/// re-enumerate. Linux `include/linux/nvme.h`:
+/// `NVME_AER_NOTICE_NS_CHANGED`.
+pub const AER_NOTICE_NS_ATTR_CHANGED: u32 = 0x00;
+
+/// Decode one AER completion word (CQE `cmd_specific`, §5.2 CDW0
+/// layout) as "a namespace-change event": type Notice (0x02) with
+/// information Namespace Attribute Changed (0x00). Every other
+/// combination (error, SMART, firmware activation, telemetry, ...)
+/// is a real event for the log, but needs no namespace rescan.
+pub fn async_event_is_ns_change(cmd_specific: u32) -> bool {
+    (cmd_specific & 0x07) == AER_TYPE_NOTICE
+        && ((cmd_specific >> 8) & 0xFF) == AER_NOTICE_NS_ATTR_CHANGED
 }
 
 // ── Identify Controller typed decoder ──────────────────────────────
