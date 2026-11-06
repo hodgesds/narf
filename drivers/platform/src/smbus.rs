@@ -265,6 +265,41 @@ impl Smbus {
         }
         Ok(count)
     }
+
+    /// Write a block at `cmd` on device `addr`.
+    ///
+    /// SMBus protocol "Block Write" (§16.x): the host sends the
+    /// command byte, then the byte count, then the data bytes.
+    /// Register model is the mirror of [`Smbus::read_block_data`]
+    /// (count in HST_D0, payload through HOST_BLOCK_DB): the ICH
+    /// block buffer holds the whole block, so the count and all
+    /// data bytes are staged before START — the same preload the
+    /// Linux i801 driver performs for block-buffer adapters.
+    /// A zero-length or over-32-byte block is a framing error
+    /// ([`SmbusError::Failed`]).
+    ///
+    /// Needs silicon validation like the rest of this host driver
+    /// (no SMBus block write has run against real hardware in
+    /// this tree yet); the RMI4-over-SMBus v2 transport is the
+    /// first consumer.
+    pub fn write_block_data(&self, addr: u8, cmd: u8, data: &[u8]) -> Result<(), SmbusError> {
+        if data.is_empty() || data.len() > 32 {
+            return Err(SmbusError::Failed);
+        }
+        self.wait_idle()?;
+        // SAFETY: x86_64 PIO.
+        unsafe {
+            pio_out8(self.io_base + SMB_XMIT_SLVA, addr << 1);
+            pio_out8(self.io_base + SMB_HST_CMD, cmd);
+            pio_out8(self.io_base + SMB_HST_D0, data.len() as u8);
+            for b in data {
+                pio_out8(self.io_base + SMB_HOST_BLOCK_DB, *b);
+            }
+            pio_out8(self.io_base + SMB_HST_CNT, CNT_START | CNT_PROTO_BLOCK);
+        }
+        self.wait_complete()?;
+        Ok(())
+    }
 }
 
 // ── Driver-match registration ────────────────────────────────────────

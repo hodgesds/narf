@@ -48,6 +48,9 @@ use narf_input::{
     abs, btn, push_global, AbsoluteEvent, AxisInfo, ButtonEvent, InputEvent, TouchEvent, TouchState,
 };
 
+use crate::hid_elan::{ElanDeviceParams, ELAN_MAX_FINGERS, ELAN_MAX_PRESSURE};
+use crate::rmi4_core::Rmi4DeviceProbe;
+
 // ── evdev capability constructors ─────────────────────────────────────────────
 //
 // Each constructor starts from the transport identity the bind layer
@@ -170,6 +173,50 @@ pub fn build_pen_caps(profile: &PenProfile, identity: &DeviceCaps) -> DeviceCaps
         caps.add_key(evkey::BTN_STYLUS2);
     }
     caps.add_prop(prop::DIRECT);
+    caps
+}
+
+/// Caps for an Elan vendor-format touchpad: slot-protocol-B
+/// axes over the probe-time `max_x` / `max_y`, clickpad button,
+/// `INPUT_PROP_POINTER | INPUT_PROP_BUTTONPAD` (same libinput
+/// classification as the PTP path — without them the pad falls
+/// into the touchscreen heuristic).
+pub fn build_elan_caps(params: &ElanDeviceParams, identity: &DeviceCaps) -> DeviceCaps {
+    let mut caps = identity.clone();
+    let x = axis(0, params.max_x as i32);
+    let y = axis(0, params.max_y as i32);
+    add_mt_axes(&mut caps, ELAN_MAX_FINGERS, x, y);
+    caps.add_abs_info(abs::ABS_PRESSURE, axis(0, ELAN_MAX_PRESSURE as i32));
+    caps.add_abs_info(abs::ABS_MT_PRESSURE, axis(0, ELAN_MAX_PRESSURE as i32));
+    caps.add_key(evkey::BTN_TOUCH);
+    caps.add_key(evkey::BTN_LEFT);
+    caps.add_prop(prop::POINTER);
+    caps.add_prop(prop::BUTTONPAD);
+    caps
+}
+
+/// Caps for a Synaptics RMI4 touchpad bound through a vendor
+/// transport (HID or SMBus): slot-protocol-B axes, clickpad
+/// button, `INPUT_PROP_POINTER | INPUT_PROP_BUTTONPAD`.
+///
+/// Axis ranges are the decoder field widths — F$12 carries u16
+/// coordinates, F$11 12-bit ones — until the F$11/F$12
+/// sensor-maximum queries are decoded at probe time (remainder:
+/// the true maxima narrow the range libinput scales through).
+pub fn build_rmi_caps(probe: &Rmi4DeviceProbe, identity: &DeviceCaps) -> DeviceCaps {
+    let mut caps = identity.clone();
+    let (max, slots) = if probe.f12.is_some() {
+        (0xFFFF, 10)
+    } else {
+        (0x0FFF, 5)
+    };
+    add_mt_axes(&mut caps, slots, axis(0, max), axis(0, max));
+    caps.add_abs_info(abs::ABS_PRESSURE, axis(0, 255));
+    caps.add_abs_info(abs::ABS_MT_PRESSURE, axis(0, 255));
+    caps.add_key(evkey::BTN_TOUCH);
+    caps.add_key(evkey::BTN_LEFT);
+    caps.add_prop(prop::POINTER);
+    caps.add_prop(prop::BUTTONPAD);
     caps
 }
 
