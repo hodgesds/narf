@@ -310,6 +310,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         irq: None,
         name: "pci-serial",
         baud: DEFAULT_BAUD,
+        kind: registry::UartFamily::Uart8250,
+        virt: None,
     });
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {

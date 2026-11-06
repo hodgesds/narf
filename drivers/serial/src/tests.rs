@@ -180,6 +180,8 @@ fn smoke_serial_registry() -> TestResult {
         irq: Some(4),
         name: "test-COM1",
         baud: 115_200,
+        kind: crate::registry::UartFamily::Uart8250,
+        virt: None,
     });
     let after = crate::registry::count();
     if after <= before {
@@ -202,6 +204,8 @@ fn smoke_serial_registry_mmio_entry_is_truthful() -> TestResult {
         irq: Some(12),
         name: "test-LPSS",
         baud: 115_200,
+        kind: crate::registry::UartFamily::Uart8250,
+        virt: None,
     });
     let found = crate::registry::uarts()
         .into_iter()
