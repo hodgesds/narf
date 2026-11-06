@@ -163,6 +163,13 @@ pub struct EthtoolInfo {
     /// `QueueStats`). Read by the same snapshot as `stats`, so
     /// one `ethtool_info` call consumes every interval counter.
     pub queue_stats: QueueStats,
+    /// TX stall recoveries (Linux `tx_timeout_count`): incremented
+    /// by the watchdog supervisor when it fires `recover()`. A
+    /// lifetime total, unlike the RC interval counters above.
+    pub tx_timeouts: u64,
+    /// Controller resets performed by `recover()`. A lifetime
+    /// total, unlike the RC interval counters above.
+    pub tx_resets: u64,
 }
 
 impl EthtoolInfo {
@@ -170,7 +177,7 @@ impl EthtoolInfo {
     /// plane logs (stable field order for tests).
     pub fn summary(&self) -> alloc::string::String {
         alloc::format!(
-            "{} {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={} link={} txq={} rxq={} caps=0x{:x} rss={} vlan={} wol={}/{} rx_pkts={} tx_pkts={}",
+            "{} {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={} link={} txq={} rxq={} caps=0x{:x} rss={} vlan={} wol={}/{} rx_pkts={} tx_pkts={} tx_timeouts={} tx_resets={}",
             self.driver,
             self.version,
             self.mac[0],
@@ -190,6 +197,8 @@ impl EthtoolInfo {
             self.wol_armed,
             self.stats.rx_good_packets,
             self.stats.tx_good_packets,
+            self.tx_timeouts,
+            self.tx_resets,
         )
     }
 }

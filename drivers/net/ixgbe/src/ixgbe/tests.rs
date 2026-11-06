@@ -1224,6 +1224,8 @@ fn smoke_ixgbe_ethtool_snapshot() -> TestResult {
         wol_armed: false,
         stats,
         queue_stats: QueueStats::default(),
+        tx_timeouts: 0,
+        tx_resets: 0,
     };
     let summary = info.summary();
     if !summary.contains("ixgbe 0.1.0")
@@ -5372,3 +5374,328 @@ fn smoke_ixgbe_fcoe_rx_classify() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fcoe_rx_classify);
+
+// ── TX-timeout watchdog + reset recovery (#796) ──────────────────
+
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use super::{
+    program_rx_queue, program_tx_queue, tx_note_completed, tx_stalled, Ixgbe, RxQueueState,
+    TxQueueState, ADVTXD_STAT_DD, CTRL_RST_MASK, FCTRL_BAM, FCTRL_MPE, FCTRL_UPE, LINKS_UP, RAH_AV,
+    REG_CTRL, REG_FCTRL, REG_LINKS, REG_RAH0, REG_RAL0, REG_RXCTRL, RXCTRL_RXEN, TX_TIMEOUT_NS,
+};
+use narf_bus::MmioRegion;
+use narf_io::{alloc_coherent, DmaBuffer};
+use narf_ipc::channel;
+use narf_lib::id::DomainId;
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
+
+fn smoke_ixgbe_tx_stall_detection() -> TestResult {
+    let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+    let mut posted = alloc::vec![0u64; 32];
+    if tx_stalled(&posted, 1_000_000, timeout) {
+        return TestResult::Fail("ixgbe idle TX ring reported stalled");
+    }
+    let now = 10_000_000u64;
+    posted[5] = now;
+    if tx_stalled(&posted, now + timeout, timeout) {
+        return TestResult::Fail("ixgbe TX stall fired at exactly the timeout");
+    }
+    if !tx_stalled(&posted, now + timeout + 1, timeout) {
+        return TestResult::Fail("ixgbe TX stall did not fire past the timeout");
+    }
+    // A second, later post does not mask the older stuck one...
+    posted[6] = now + 100;
+    if !tx_stalled(&posted, now + timeout + 1, timeout) {
+        return TestResult::Fail("ixgbe later TX post masked the stuck descriptor");
+    }
+    // ...and completing the oldest clears the stall once nothing
+    // aged remains.
+    tx_note_completed(&mut posted, 5, now);
+    if tx_stalled(&posted, now + timeout + 1, timeout) {
+        return TestResult::Fail("ixgbe TX stall survived completing the stuck slot");
+    }
+    // A completion stamped for a different post leaves the
+    // current post's stamp alone.
+    tx_note_completed(&mut posted, 6, now);
+    if posted[6] == 0 {
+        return TestResult::Fail("ixgbe completion cleared a different post's stamp");
+    }
+    tx_note_completed(&mut posted, 6, now + 100);
+    if tx_stalled(&posted, now + timeout + 1, timeout) {
+        return TestResult::Fail("ixgbe empty TX ring reported stalled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_stall_detection);
+
+/// Fake 82599 for the TX-timeout fixture: a 128 KiB MMIO backing
+/// page plus a sleep-pump that emulates the two hardware behaviours
+/// recovery depends on — CTRL.RST self-clear (datasheet §4.6.3.1)
+/// and TX descriptor completion (DD) once the test arms it. Built
+/// from the spec (register offsets, reset semantics), never from
+/// the implementation's constants.
+static FIXTURE_MMIO: AtomicU64 = AtomicU64::new(0);
+static FIXTURE_COMPLETE_TX: AtomicBool = AtomicBool::new(false);
+static FIXTURE_PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+fn fixture_pump() {
+    let base = FIXTURE_MMIO.load(Ordering::Acquire);
+    if base == 0 {
+        return;
+    }
+    // SAFETY: fixture-owned fake MMIO; base is published by the
+    // fixture and cleared on drop. The backing page is 128 KiB, so
+    // every register offset below is in bounds.
+    unsafe {
+        let ctrl = core::ptr::read_volatile((base + REG_CTRL) as *const u32);
+        if ctrl & CTRL_RST_MASK != 0 {
+            core::ptr::write_volatile((base + REG_CTRL) as *mut u32, ctrl & !CTRL_RST_MASK);
+        }
+        if FIXTURE_COMPLETE_TX.load(Ordering::Acquire) {
+            let txq = super::queues::tx_queue_regs(0).expect("queue 0 registers resolve");
+            let tdbal = core::ptr::read_volatile((base + txq.tdbal) as *const u32) as u64;
+            let tdbah = core::ptr::read_volatile((base + txq.tdbah) as *const u32) as u64;
+            let ring = (tdbah << 32) | tdbal;
+            let tdlen = core::ptr::read_volatile((base + txq.tdlen) as *const u32) as usize;
+            if ring != 0 && tdlen >= 16 {
+                for slot in 0..(tdlen / 16) {
+                    let status = narf_memory::PhysAddr::new(ring + (slot * 16) as u64 + 12)
+                        .kernel_mut_ptr::<u32>();
+                    // SAFETY: fixture-owned DMA ring; slot bounded
+                    // by the programmed TDLEN.
+                    let v = core::ptr::read_volatile(status);
+                    if v & ADVTXD_STAT_DD == 0 {
+                        core::ptr::write_volatile(status, v | ADVTXD_STAT_DD);
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct TxTimeoutFixture {
+    device: Ixgbe,
+    _mmio_mem: DmaBuffer,
+}
+
+impl TxTimeoutFixture {
+    fn new() -> Self {
+        // 128 KiB fake BAR0 (82599 BAR0 window).
+        let mut mem = alloc_coherent(128 * 1024, DomainId::DRIVER_0).unwrap();
+        mem.as_mut_slice().fill(0);
+        let csr = MmioRegion {
+            phys: mem.phys_addr(),
+            virt: mem.as_mut_ptr() as u64,
+            len: mem.len() as u64,
+            kind: narf_bus::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        // Seed LINKS up: the watchdog gates on the live link
+        // sample (datasheet §8.2.3.8.11, LINKS_UP bit 30).
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            csr.write32(REG_LINKS, LINKS_UP);
+        }
+        FIXTURE_MMIO.store(csr.virt, Ordering::Release);
+        if !FIXTURE_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
+            narf_scheduler::sleep_pumps::register_nested_only(fixture_pump);
+        }
+        let queue_config = super::queues::QueueConfig::single();
+        let ring_len = queue_config.ring_len;
+        let ring_bytes = ring_len * 16;
+        let tx_ring = alloc_coherent(ring_bytes, DomainId::DRIVER_0).unwrap();
+        let mut tx_pool = alloc::vec::Vec::with_capacity(ring_len);
+        for _ in 0..ring_len {
+            tx_pool.push(alloc_coherent(4096, DomainId::DRIVER_0).unwrap());
+        }
+        let rx_ring = alloc_coherent(ring_bytes, DomainId::DRIVER_0).unwrap();
+        let mut rx_pool = alloc::vec::Vec::with_capacity(ring_len);
+        for _ in 0..ring_len {
+            rx_pool.push(alloc_coherent(4096, DomainId::DRIVER_0).unwrap());
+        }
+        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let device = Ixgbe {
+            mmio: csr,
+            tx_queues: alloc::vec![TxQueueState {
+                tx_ring,
+                tx_pool,
+                tx_tail: IrqSafeSpinLock::new(0),
+                tx_posted_at: IrqSafeSpinLock::new(alloc::vec![0u64; ring_len]),
+            }],
+            rx_queues: alloc::vec![RxQueueState {
+                rx_ring,
+                rx_slots: IrqSafeSpinLock::new(rx_pool),
+                rx_head: IrqSafeSpinLock::new(0),
+            }],
+            rx_mirror: IrqSafeSpinLock::new(rx_prod),
+            mac,
+            link_up: IrqSafeSpinLock::new(true),
+            did: IXGBE_DEV_82599EB,
+            lan_id: 0,
+            queue_config,
+            rss_cfg: IrqSafeSpinLock::new(None),
+            dcb_cfg: IrqSafeSpinLock::new(None),
+            vlan_filter: IrqSafeSpinLock::new(None),
+            vmdq_cfg: IrqSafeSpinLock::new(None),
+            fcoe_queues: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            fdir_state: IrqSafeSpinLock::new(super::fdir::FdirState::default()),
+            wol_armed: IrqSafeSpinLock::new(None),
+            eee_state: IrqSafeSpinLock::new(None),
+            wol_board_cap: IrqSafeSpinLock::new(super::wol::WolBoardCap::default()),
+            quiesced: IrqSafeSpinLock::new(false),
+            tx_timeouts: AtomicU64::new(0),
+            tx_resets: AtomicU64::new(0),
+            recovering: AtomicBool::new(false),
+            tx_epoch: AtomicU64::new(0),
+            msix: None,
+            rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+        };
+        // Bring-up register program (steps 6–7), minus the IRQ
+        // install: queue rings, receive filter, master RX enable.
+        let tx_phys = device.tx_queues[0].tx_ring.dma_addr().raw();
+        let rx_phys = device.rx_queues[0].rx_ring.dma_addr().raw();
+        {
+            let mut bank = super::queues::MmioBank::new(&device.mmio);
+            program_tx_queue(&mut bank, 0, tx_phys, ring_len);
+            program_rx_queue(&mut bank, 0, rx_phys, ring_len);
+        }
+        // Prime the RX descriptors from the pool (bring-up step 7).
+        let rx_ring_phys = device.rx_queues[0].rx_ring.dma_addr().raw();
+        {
+            let slots = device.rx_queues[0].rx_slots.lock();
+            for (i, buf) in slots.iter().enumerate() {
+                let desc = super::rxdesc::AdvRxDescRead::new(buf.dma_addr().raw());
+                // SAFETY: identity-mapped DMA ring page.
+                unsafe {
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(rx_ring_phys + (i * 16) as u64)
+                            .kernel_mut_ptr::<super::rxdesc::AdvRxDescRead>(),
+                        desc,
+                    );
+                }
+            }
+        }
+        // SAFETY: fixture-owned fake MMIO.
+        unsafe {
+            device
+                .mmio
+                .write32(REG_FCTRL, FCTRL_BAM | FCTRL_UPE | FCTRL_MPE);
+            device.mmio.write32(REG_RXCTRL, RXCTRL_RXEN);
+        }
+        core::mem::drop(tx_cons);
+        Self {
+            device,
+            _mmio_mem: mem,
+        }
+    }
+}
+
+impl Drop for TxTimeoutFixture {
+    fn drop(&mut self) {
+        FIXTURE_COMPLETE_TX.store(false, Ordering::Release);
+        FIXTURE_MMIO.store(0, Ordering::Release);
+    }
+}
+
+fn smoke_ixgbe_tx_timeout_recovery_fixture() -> TestResult {
+    let fixture = TxTimeoutFixture::new();
+    let device = &fixture.device;
+    let frame = [0xAAu8; 64];
+    // 1. Stall: the fake device never completes the descriptor,
+    // so the synchronous post times out — the wedged ring, as
+    // the field sees it.
+    if device.tx(&frame, &TxMeta::plain()).is_ok() {
+        return TestResult::Fail("ixgbe TX completed against a wedged fake device");
+    }
+    let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+    let posted = device.tx_queues[0].tx_posted_at.lock()[0];
+    if posted == 0 {
+        return TestResult::Fail("ixgbe TX post did not stamp a post time");
+    }
+    // 2. The watchdog does not fire inside the grace period...
+    if device.check_tx_watchdog_at(posted + timeout) {
+        return TestResult::Fail("ixgbe watchdog fired at exactly the timeout");
+    }
+    if device.tx_resets() != 0 || device.tx_timeouts() != 0 {
+        return TestResult::Fail("ixgbe watchdog counted a recovery it did not fire");
+    }
+    // ...but fires past it, resets the controller, and the ring
+    // comes back.
+    if !device.check_tx_watchdog_at(posted + timeout + 1) {
+        return TestResult::Fail("ixgbe watchdog did not fire past the timeout");
+    }
+    if device.tx_timeouts() != 1 || device.tx_resets() != 1 {
+        return TestResult::Fail("ixgbe watchdog recovery was not counted");
+    }
+    // The recovery advanced the TX epoch exactly once, so a TX
+    // whose DD poll straddled the reset cannot mistake a later
+    // frame's DD on the reused slot for its own completion.
+    if device.tx_epoch.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("ixgbe recovery did not advance the TX epoch");
+    }
+    // SAFETY: fixture-owned fake MMIO.
+    unsafe {
+        let txq = super::queues::tx_queue_regs(0).expect("queue 0 registers resolve");
+        let rxq = super::queues::rx_queue_regs(0).expect("queue 0 registers resolve");
+        let tdbal = device.mmio.read32(txq.tdbal) as u64;
+        let tdbah = device.mmio.read32(txq.tdbah) as u64;
+        if (tdbah << 32) | tdbal != device.tx_queues[0].tx_ring.dma_addr().raw() {
+            return TestResult::Fail("ixgbe recovery left a stale TX ring base");
+        }
+        if device.mmio.read32(txq.txdctl) & super::TXDCTL_ENABLE == 0 {
+            return TestResult::Fail("ixgbe recovery left the TX queue disabled");
+        }
+        if device.mmio.read32(rxq.rxdctl) & super::RXDCTL_ENABLE == 0 {
+            return TestResult::Fail("ixgbe recovery left the RX queue disabled");
+        }
+        if device.mmio.read32(REG_RXCTRL) & RXCTRL_RXEN == 0 {
+            return TestResult::Fail("ixgbe recovery left RX disabled");
+        }
+        if device.mmio.read32(REG_FCTRL) & (FCTRL_BAM | FCTRL_UPE | FCTRL_MPE)
+            != (FCTRL_BAM | FCTRL_UPE | FCTRL_MPE)
+        {
+            return TestResult::Fail("ixgbe recovery left the receive filter unprogrammed");
+        }
+        if device.mmio.read32(rxq.rdt) != (device.queue_config.ring_len - 1) as u32 {
+            return TestResult::Fail("ixgbe recovery left the RX tail unprimed");
+        }
+        let ral = device.mmio.read32(REG_RAL0);
+        let rah = device.mmio.read32(REG_RAH0);
+        let mac = device.mac;
+        if ral
+            != (mac[0] as u32)
+                | ((mac[1] as u32) << 8)
+                | ((mac[2] as u32) << 16)
+                | ((mac[3] as u32) << 24)
+            || rah != (mac[4] as u32) | ((mac[5] as u32) << 8) | RAH_AV
+        {
+            return TestResult::Fail("ixgbe recovery left the station address unprogrammed");
+        }
+    }
+    if tx_stalled(
+        &device.tx_queues[0].tx_posted_at.lock(),
+        posted + timeout + 1,
+        timeout,
+    ) {
+        return TestResult::Fail("ixgbe TX stall survived the recovery");
+    }
+    // 3. Traffic resumes: with the fake device completing
+    // descriptors again, a fresh post completes.
+    FIXTURE_COMPLETE_TX.store(true, Ordering::Release);
+    if device.tx(&frame, &TxMeta::plain()).is_err() {
+        return TestResult::Fail("ixgbe TX did not resume after recovery");
+    }
+    // The completed frame cleared its post time, so nothing
+    // aged remains for the watchdog to fire on.
+    if device.check_tx_watchdog_at(narf_time::now_cycles()) {
+        return TestResult::Fail("ixgbe watchdog fired on an empty ring");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_tx_timeout_recovery_fixture);
