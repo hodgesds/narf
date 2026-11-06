@@ -416,12 +416,12 @@ kernel_test_in!(
     smoke_iwl_device_current_policy_closes_queued_tx_copied_rx_and_retains_stop
 );
 
-fn smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_only() -> TestResult {
+fn smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_and_link_reconf() -> TestResult {
     // The station MLD Capabilities and Operations field advertises
-    // negotiated TTLM (SAME, #1553 verified) and nothing else: link
-    // reconfiguration stays unadvertised until its wire layout is
-    // reworked. `supports_mlo` keys off `phy.eht`, which the model
-    // fixture leaves clear, so enable it on this device.
+    // negotiated TTLM (SAME, #1553 verified) and link reconfiguration
+    // (0x2000, wire layout verified #1553) and nothing else.
+    // `supports_mlo` keys off `phy.eht`, which the model fixture
+    // leaves clear, so enable it on this device.
     let mut fixture = Fixture::new(false);
     let caps = {
         let device = Arc::get_mut(fixture.device.as_mut().unwrap())
@@ -436,14 +436,18 @@ fn smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_only() -> TestResult {
     }
     let cap = &caps[0];
     if cap.iftype != 2
-        || cap.mld_capa_and_ops != super::super::sc_ttlm_neg::MLD_CAP_OP_TTLM_NEG_SAME
+        || cap.mld_capa_and_ops
+            != super::super::sc_ttlm_neg::MLD_CAP_OP_TTLM_NEG_SAME
+                | super::super::sc_ttlm_neg::MLD_CAP_OP_LINK_RECONF_SUPPORT
         || cap.ext_mld_capa_and_ops != 0
     {
-        return TestResult::Fail("station MLD capabilities do not advertise TTLM negotiation only");
+        return TestResult::Fail(
+            "station MLD capabilities do not advertise TTLM negotiation and link reconfiguration",
+        );
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/iwlwifi/mlo",
-    smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_only
+    smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_and_link_reconf
 );
