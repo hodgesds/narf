@@ -48,6 +48,8 @@ use alloc::vec::Vec;
 
 use narf_bus::MmioRegion;
 
+use crate::phy::{Phy, PhyLink};
+
 // ── PHY paged-register access types ─────────────────────────────────
 // Shared by the whole family (RTL8125 / RTL8126 / RTL8127 /
 // RTL8168G): "page" is the value written to MII register 0x1F.
@@ -827,6 +829,115 @@ impl PhyAccess<'_> {
     }
 }
 
+// ── Shared PHY trait (`narf_drivers_net_core::phy::Phy`) ─────────────
+// The family adopts the shared trait (issue #790) over this
+// accessor. The OCP window encodes the page in the *address*
+// (see the module docs), so the paged accessors are stateless
+// address arithmetic — they never touch the latched `ocp_base`
+// the firmware interpreter / config-table paths use, and never
+// touch the PHY's own page register. `read_reg` / `write_reg`
+// are page-0 by construction for the same reason. The MMD
+// accessors use the trait's Clause-22 indirection default:
+// the PHY's 0x0D/0x0E registers are the standard MMD control /
+// data pair, and Linux's `r8169_mdio_read_reg_c45` /
+// `_write_c45` prove the silicon implements the sequence.
+// The emulated-AN MMD mapping (7.60 → page 0xa5d reg 0x10,
+// 7.62 → page 0xa6d reg 0x12, …) is NOT overridden here: the
+// EEE advertisement path (`advertise_eee`) already programs
+// those paged registers directly, and the #794 EEE surface
+// decides the override. This lane only proves the transport.
+
+/// Page of the `rtlgen` negotiated-speed register (Linux
+/// `drivers/net/phy/realtek.c`, `rtlgen_read_status`, v6.12:
+/// `phy_read_paged(phydev, 0xa43, 0x12)`).
+pub const RTLGEN_SPEED_PAGE: u16 = 0x0A43;
+/// Register of the `rtlgen` negotiated-speed word.
+pub const RTLGEN_SPEED_REG: u16 = 0x12;
+/// Mask selecting the speed field (Linux `RTLGEN_SPEED_MASK`
+/// 0x0630).
+pub const RTLGEN_SPEED_MASK: u16 = 0x0630;
+
+/// Decode a `rtlgen` speed word (page 0xa43, register 0x12)
+/// into a negotiated rate. Table is Linux `rtlgen_decode_speed`
+/// verbatim: 0x0000 → 10, 0x0010 → 100, 0x0020 → 1000,
+/// 0x0200 → 10000, 0x0210 → 2500, 0x0220 → 5000. Bits outside
+/// the mask are ignored; a masked value with no table entry
+/// (e.g. 0x0400) decodes to `None` — the caller keeps its
+/// in-band rate rather than inventing one.
+pub const fn rtlgen_decode_speed(val: u16) -> Option<u32> {
+    match val & RTLGEN_SPEED_MASK {
+        0x0000 => Some(10),
+        0x0010 => Some(100),
+        0x0020 => Some(1000),
+        0x0200 => Some(10000),
+        0x0210 => Some(2500),
+        0x0220 => Some(5000),
+        _ => None,
+    }
+}
+
+/// Apply a raw `rtlgen` speed word to a Clause-22 [`PhyLink`]
+/// (pure, fixture-tested): a decodable word replaces the
+/// Clause-22 speed — the PHY's own negotiated-rate register
+/// outranks the LPA/GBSR resolution, exactly as Linux's
+/// `rtlgen_read_status` lets `rtlgen_decode_speed` overwrite
+/// `genphy_read_status`'s result. An undecodable word leaves
+/// the Clause-22 result untouched. Duplex always stays with
+/// the Clause-22 resolution: the speed word carries none.
+pub fn rtlgen_apply_speed(c22: PhyLink, speed_val: u16) -> PhyLink {
+    match rtlgen_decode_speed(speed_val) {
+        Some(speed) => PhyLink {
+            speed_mbps: Some(speed),
+            ..c22
+        },
+        None => c22,
+    }
+}
+
+impl Phy for PhyAccess<'_> {
+    type Error = PhyError;
+
+    /// Stateless page-0 read: `OCP_STD_PHY_BASE + reg * 2`.
+    /// Never consults the latched `ocp_base`, so a config-table
+    /// or firmware pass mid-program cannot divert this read.
+    fn read_reg(&self, reg: u8) -> Result<u16, PhyError> {
+        self.phy_ocp_read(OCP_STD_PHY_BASE as u32 + u32::from(reg) * 2)
+    }
+
+    /// Stateless page-0 write.
+    fn write_reg(&self, reg: u8, val: u16) -> Result<(), PhyError> {
+        self.phy_ocp_write(OCP_STD_PHY_BASE as u32 + u32::from(reg) * 2, val)
+    }
+
+    /// Stateless paged read: `paged_addr(page, reg)` is the
+    /// whole operation — no page-register write, no restore.
+    fn read_paged(&self, page: u16, reg: u8) -> Result<u16, PhyError> {
+        let addr = Self::paged_addr(page, u16::from(reg))?;
+        self.phy_ocp_read(addr)
+    }
+
+    /// Stateless paged write.
+    fn write_paged(&self, page: u16, reg: u8, val: u16) -> Result<(), PhyError> {
+        let addr = Self::paged_addr(page, u16::from(reg))?;
+        self.phy_ocp_write(addr, val)
+    }
+
+    /// Linux `rtlgen_read_status`: the standard Clause-22
+    /// decode, then — link up only — the 0xa43/0x12 speed word
+    /// overrides the rate. The `rtl822x_read_status` extra (LP
+    /// 10GBT advertisement at page 0xa5d reg 0x13) is not
+    /// needed here: it feeds the partner advertisement, not
+    /// the local negotiated rate.
+    fn read_status(&self) -> Result<PhyLink, PhyError> {
+        let c22 = crate::phy::read_status_c22(self)?;
+        if !c22.link_up {
+            return Ok(c22);
+        }
+        let val = self.read_paged(RTLGEN_SPEED_PAGE, RTLGEN_SPEED_REG as u8)?;
+        Ok(rtlgen_apply_speed(c22, val))
+    }
+}
+
 // ── Fixtures ────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -895,4 +1006,325 @@ mod tests {
         "drivers/net/realtek-phy-access",
         smoke_phy_bmcr_restart_value
     );
+
+    // ── Shared PHY trait fixtures (issue #790) ──────────────────
+    // The fake below is built from the spec itself (IEEE 802.3
+    // Clause 22 register map + Clause-45-over-22 indirection
+    // sequence + Linux `rtlgen_decode_speed` table), never from
+    // this crate's constants: every expected value is a literal
+    // taken from the standard / Linux source, so the trait and
+    // the fake cannot agree on a wrong constant and pass.
+
+    /// A Clause-22 PHY register file in memory, implementing the
+    /// shared [`Phy`] trait. Models page 0 (the standard
+    /// registers) and page 0xa43 (the `rtlgen` speed word), the
+    /// page register at 0x1F, and the Clause-45 MMD indirection
+    /// state machine on 0x0D/0x0E for MMD 7. It does NOT model
+    /// the BMSR latch-low quirk (both reads return the stored
+    /// word): the double-read discipline lives in the trait's
+    /// code, and the fake's job is the decode, not the silicon
+    /// timing.
+    struct FakeMdio {
+        /// Page-0 registers, indexed by register number.
+        page0: [u16; 32],
+        /// Page 0xa43 register 0x12 (`rtlgen` speed word).
+        speed_word: u16,
+        /// Currently-selected page (register 0x1F).
+        page: core::cell::Cell<u16>,
+        /// MMD 7 register file (regs 0..=63).
+        mmd7: [u16; 64],
+        /// MMD device selected by the last 0x0D write.
+        mmd_dev: core::cell::Cell<u16>,
+        /// MMD register selected by the last 0x0E write in the
+        /// address phase.
+        mmd_reg: core::cell::Cell<u16>,
+        /// `true` once a 0x0D write carried the 0x4000 data-phase bit.
+        mmd_data_phase: core::cell::Cell<bool>,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum FakeError {
+        UnmodeledPage(u16),
+    }
+
+    impl FakeMdio {
+        /// Page-0 words: BMSR, ANAR, GBCR, LPA, GBSR, BMCR as the
+        /// test needs them; everything else zero.
+        fn new(bmsr: u16, anar: u16, gbcr: u16, lpa: u16, gbsr: u16, bmcr: u16) -> Self {
+            let mut page0 = [0u16; 32];
+            page0[0x00] = bmcr;
+            page0[0x01] = bmsr;
+            page0[0x02] = 0x001c;
+            page0[0x03] = 0xc914;
+            page0[0x04] = anar;
+            page0[0x05] = lpa;
+            page0[0x09] = gbcr;
+            page0[0x0a] = gbsr;
+            FakeMdio {
+                page0,
+                speed_word: 0,
+                page: core::cell::Cell::new(0),
+                mmd7: [0u16; 64],
+                mmd_dev: core::cell::Cell::new(0),
+                mmd_reg: core::cell::Cell::new(0),
+                mmd_data_phase: core::cell::Cell::new(false),
+            }
+        }
+    }
+
+    impl crate::phy::Phy for FakeMdio {
+        type Error = FakeError;
+
+        fn read_reg(&self, reg: u8) -> Result<u16, FakeError> {
+            let page = self.page.get();
+            if page == 0 {
+                if reg == 0x0e && self.mmd_data_phase.get() {
+                    // Data-phase read: the selected MMD register.
+                    if self.mmd_dev.get() == 7 {
+                        return Ok(self.mmd7[usize::from(self.mmd_reg.get()) & 63]);
+                    }
+                    return Ok(0);
+                }
+                if reg == 0x0e {
+                    return Ok(self.mmd_reg.get());
+                }
+                return Ok(self.page0[usize::from(reg) & 31]);
+            }
+            if page == 0x0a43 {
+                if reg == 0x12 {
+                    return Ok(self.speed_word);
+                }
+                return Ok(0);
+            }
+            Err(FakeError::UnmodeledPage(page))
+        }
+
+        fn write_reg(&self, reg: u8, val: u16) -> Result<(), FakeError> {
+            let page = self.page.get();
+            if reg == 0x1f {
+                self.page.set(val);
+                return Ok(());
+            }
+            if page == 0 {
+                if reg == 0x0d {
+                    self.mmd_dev.set(val & 0x1f);
+                    self.mmd_data_phase.set(val & 0x4000 != 0);
+                    return Ok(());
+                }
+                if reg == 0x0e {
+                    if self.mmd_data_phase.get() {
+                        if self.mmd_dev.get() == 7 {
+                            self.mmd7[usize::from(self.mmd_reg.get()) & 63] = val;
+                        }
+                    } else {
+                        self.mmd_reg.set(val);
+                    }
+                    return Ok(());
+                }
+                self.page0[usize::from(reg) & 31] = val;
+                return Ok(());
+            }
+            if page == 0x0a43 {
+                if reg == 0x12 {
+                    self.speed_word = val;
+                    return Ok(());
+                }
+                return Ok(());
+            }
+            Err(FakeError::UnmodeledPage(page))
+        }
+    }
+
+    fn smoke_phy_rtlgen_decode_speed() -> TestResult {
+        // Linux `rtlgen_decode_speed` table, pinned as literals
+        // (mask 0x0630 applied first — bits outside the mask
+        // must not change the verdict).
+        if RTLGEN_SPEED_MASK != 0x0630 {
+            return TestResult::Fail("RTLGEN_SPEED_MASK is not 0x0630");
+        }
+        if RTLGEN_SPEED_PAGE != 0x0a43 || RTLGEN_SPEED_REG != 0x12 {
+            return TestResult::Fail("rtlgen speed word is not page 0xa43 reg 0x12");
+        }
+        for (word, want) in [
+            (0x0000u16, Some(10u32)),
+            (0x0010, Some(100)),
+            (0x0020, Some(1000)),
+            (0x0200, Some(10000)),
+            (0x0210, Some(2500)),
+            (0x0220, Some(5000)),
+            (0x0400, None),
+            (0x0230, None),
+            (0x0630, None),
+        ] {
+            if rtlgen_decode_speed(word) != want {
+                return TestResult::Fail("rtlgen_decode_speed disagrees with the Linux table");
+            }
+        }
+        // Bits outside the mask are ignored: 0x0210 | 0x09c0 is
+        // still 2500.
+        if rtlgen_decode_speed(0x0210 | 0x09c0) != Some(2500) {
+            return TestResult::Fail("rtlgen_decode_speed let out-of-mask bits change the rate");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-phy-access",
+        smoke_phy_rtlgen_decode_speed
+    );
+
+    fn smoke_phy_rtlgen_apply_speed() -> TestResult {
+        use crate::phy::PhyLink;
+        use narf_net::iface::LinkDuplex;
+        // A decodable word replaces the Clause-22 speed and
+        // keeps its duplex; an undecodable word keeps the
+        // Clause-22 result whole.
+        let c22 = PhyLink::up(Some(1000), Some(LinkDuplex::Full));
+        let over = rtlgen_apply_speed(c22, 0x0210);
+        if over.speed_mbps != Some(2500) || over.duplex != Some(LinkDuplex::Full) {
+            return TestResult::Fail(
+                "rtlgen 0x0210 must override the rate to 2500, keeping duplex",
+            );
+        }
+        let kept = rtlgen_apply_speed(c22, 0x0400);
+        if kept != c22 {
+            return TestResult::Fail("undecodable rtlgen word must keep the Clause-22 result");
+        }
+        // A down link stays down whatever the word says.
+        if rtlgen_apply_speed(PhyLink::DOWN, 0x0210) != PhyLink::DOWN {
+            return TestResult::Fail("rtlgen apply must not resurrect a down link");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-phy-access",
+        smoke_phy_rtlgen_apply_speed
+    );
+
+    fn smoke_phy_trait_c22_read_status() -> TestResult {
+        use crate::phy::{phy_id_valid, Phy, PhyLink};
+        use narf_net::iface::LinkDuplex;
+        // BMSR 0x0024 = link up + autoneg complete; our ANAR
+        // advertises all 10/100, GBCR 1000 full; the partner
+        // offers 100 full + 1000 full → 1000 full wins.
+        let phy = FakeMdio::new(0x0024, 0x01e1, 0x0200, 0x01c1, 0x0800, 0x1000);
+        let link = match phy.read_status() {
+            Ok(l) => l,
+            Err(_) => return TestResult::Fail("trait read_status failed on a healthy fake"),
+        };
+        if !link.link_up || link.speed_mbps != Some(1000) || link.duplex != Some(LinkDuplex::Full) {
+            return TestResult::Fail("trait read_status did not resolve 1000/Full");
+        }
+        // Partner offers 10 half only → 10 half, even though we
+        // advertise faster modes.
+        let phy = FakeMdio::new(0x0024, 0x01e1, 0x0200, 0x0020, 0x0000, 0x1000);
+        let link = match phy.read_status() {
+            Ok(l) => l,
+            Err(_) => return TestResult::Fail("trait read_status failed on the 10HD fake"),
+        };
+        if link.speed_mbps != Some(10) || link.duplex != Some(LinkDuplex::Half) {
+            return TestResult::Fail("trait read_status did not resolve 10/Half");
+        }
+        // Link down: BMSR 0x0000 → DOWN, speed/duplex unknown.
+        let phy = FakeMdio::new(0x0000, 0x01e1, 0x0200, 0x01c1, 0x0800, 0x1000);
+        let link = match phy.read_status() {
+            Ok(l) => l,
+            Err(_) => return TestResult::Fail("trait read_status failed on the down fake"),
+        };
+        if link != PhyLink::DOWN {
+            return TestResult::Fail("trait read_status must report DOWN on a down link");
+        }
+        // Autoneg incomplete (BMSR 0x0004): forced BMCR
+        // 0x1140 = AN enable + 1000 + full → 1000/Full.
+        let phy = FakeMdio::new(0x0004, 0x01e1, 0x0200, 0x0000, 0x0000, 0x1140);
+        let link = match phy.read_status() {
+            Ok(l) => l,
+            Err(_) => return TestResult::Fail("trait read_status failed on the forced fake"),
+        };
+        if link.speed_mbps != Some(1000) || link.duplex != Some(LinkDuplex::Full) {
+            return TestResult::Fail("trait read_status did not fall back to forced BMCR");
+        }
+        // PHY identification: the fake carries 0x001cc914
+        // (RTL8211DN); an all-ones ID is the no-device signature.
+        let phy = FakeMdio::new(0x0024, 0x01e1, 0x0200, 0x01c1, 0x0800, 0x1000);
+        match phy.read_phy_id() {
+            Ok(id) if id == 0x001c_c914 => {}
+            _ => return TestResult::Fail("trait read_phy_id did not compose 0x001cc914"),
+        }
+        if !phy_id_valid(0x001c_c914) || phy_id_valid(0) || phy_id_valid(0xffff_ffff) {
+            return TestResult::Fail("trait phy_id_valid misjudged an ID");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-phy-access",
+        smoke_phy_trait_c22_read_status
+    );
+
+    fn smoke_phy_trait_paged_and_mmd() -> TestResult {
+        use crate::phy::Phy;
+        // Paged access: the rtlgen speed word lives at page
+        // 0xa43 reg 0x12; the access must restore page 0, so a
+        // BMSR read afterwards still sees the page-0 word.
+        let mut phy = FakeMdio::new(0x0024, 0x01e1, 0x0200, 0x01c1, 0x0800, 0x1000);
+        phy.speed_word = 0x0210;
+        match phy.read_paged(0x0a43, 0x12) {
+            Ok(v) if v == 0x0210 => {}
+            _ => return TestResult::Fail("trait read_paged did not return the speed word"),
+        }
+        match phy.read_reg(0x01) {
+            Ok(v) if v == 0x0024 => {}
+            _ => return TestResult::Fail("trait read_paged did not restore page 0"),
+        }
+        // A paged write lands in the same register.
+        if phy.write_paged(0x0a43, 0x12, 0x0220).is_err() {
+            return TestResult::Fail("trait write_paged failed");
+        }
+        match phy.read_paged(0x0a43, 0x12) {
+            Ok(v) if v == 0x0220 => {}
+            _ => return TestResult::Fail("trait write_paged did not stick"),
+        }
+        // MMD via Clause-22 indirection: write 7.62 = 0x0003,
+        // read it back; the fake's 0x0D/0x0E state machine is
+        // the IEEE sequence, not this crate's constants.
+        if phy.write_mmd(7, 62, 0x0003).is_err() {
+            return TestResult::Fail("trait write_mmd failed");
+        }
+        match phy.read_mmd(7, 62) {
+            Ok(v) if v == 0x0003 => {}
+            _ => return TestResult::Fail("trait read_mmd did not return the written word"),
+        }
+        // An unmodeled page is an error, not a silent wrap.
+        if phy.read_paged(0x0a44, 0x12).is_ok() {
+            return TestResult::Fail("trait read_paged admitted an unmodeled page");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-phy-access",
+        smoke_phy_trait_paged_and_mmd
+    );
+
+    fn smoke_phy_merge_sample() -> TestResult {
+        use crate::phy::{merge_phy_sample, PhyLink};
+        use crate::publish::LinkSample;
+        use narf_net::iface::LinkDuplex;
+        // In-band lower bound 1000 + PHY 2500/Full → 2500/Full.
+        let base = LinkSample::up(Some(1000), Some(LinkDuplex::Full));
+        let merged = merge_phy_sample(base, PhyLink::up(Some(2500), Some(LinkDuplex::Full)));
+        if merged.speed_mbps != Some(2500) || merged.duplex != Some(LinkDuplex::Full) {
+            return TestResult::Fail("merge must let a proven PHY rate win");
+        }
+        // PHY proves carrier but not the rate → the in-band
+        // bound survives.
+        let merged = merge_phy_sample(base, PhyLink::up(None, Some(LinkDuplex::Full)));
+        if merged.speed_mbps != Some(1000) {
+            return TestResult::Fail("merge must keep the in-band bound on an unproven PHY rate");
+        }
+        // PHY down always wins.
+        if merge_phy_sample(base, PhyLink::DOWN) != LinkSample::DOWN {
+            return TestResult::Fail("merge must report DOWN on a down PHY link");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/realtek-phy-access", smoke_phy_merge_sample);
 }

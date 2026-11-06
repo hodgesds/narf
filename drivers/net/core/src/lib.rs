@@ -2,7 +2,8 @@
 //!
 //! The driver-agnostic half of `narf-drivers-net`: the [`HwNic`] trait and the
 //! types it is defined over ([`NicModel`], [`NicCaps`], [`NicDescriptor`],
-//! [`NicError`]), plus the Realtek PHY helpers in [`rtl_phy`]. Per-driver
+//! [`NicError`]), plus the Realtek PHY helpers in [`rtl_phy`] and the
+//! shared PHY/MDIO trait in [`phy`]. Per-driver
 //! crates depend on this crate for the trait surface rather than on the
 //! `narf-drivers-net` facade, which depends on *them* — so there is no cycle.
 //!
@@ -15,6 +16,7 @@
 
 extern crate alloc;
 
+pub mod phy;
 pub mod publish;
 pub mod rtl_phy;
 
