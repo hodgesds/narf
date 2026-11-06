@@ -5775,7 +5775,9 @@ impl SocketFile {
             {
                 self.bt_connect(&addr)
             }
-            SocketOp::Connect { addr } if self.protocol == BTPROTO_SCO => self.bt_connect_sco(addr),
+            SocketOp::Connect { addr } if self.protocol == BTPROTO_SCO => {
+                self.bt_connect_sco(&addr)
+            }
             SocketOp::Send { buf, addr, flags } if self.protocol == BTPROTO_SCO => {
                 self.bt_send_sco(buf, addr, flags)
             }
@@ -6424,7 +6426,7 @@ impl SocketFile {
                 let mut listeners = RFCOMM_LISTENERS.lock();
                 listeners.retain(|(_, _, w)| {
                     w.upgrade()
-                        .is_some_and(|s| Arc::as_ptr(&s) != self as *const SocketFile)
+                        .is_some_and(|s| !core::ptr::eq(Arc::as_ptr(&s), self))
                 });
             } else {
                 narf_filesystem::bluetooth::bt_unregister_psm(l.dev, l.psm, l.le);
@@ -6440,7 +6442,7 @@ impl SocketFile {
             let mut listeners = SCO_LISTENERS.lock();
             listeners.retain(|(_, w)| {
                 w.upgrade()
-                    .is_some_and(|s| Arc::as_ptr(&s) != self as *const SocketFile)
+                    .is_some_and(|s| !core::ptr::eq(Arc::as_ptr(&s), self))
             });
         }
     }
