@@ -1026,13 +1026,13 @@ mod tests {
     /// timing.
     struct FakeMdio {
         /// Page-0 registers, indexed by register number.
-        page0: [u16; 32],
+        page0: core::cell::Cell<[u16; 32]>,
         /// Page 0xa43 register 0x12 (`rtlgen` speed word).
-        speed_word: u16,
+        speed_word: core::cell::Cell<u16>,
         /// Currently-selected page (register 0x1F).
         page: core::cell::Cell<u16>,
         /// MMD 7 register file (regs 0..=63).
-        mmd7: [u16; 64],
+        mmd7: core::cell::Cell<[u16; 64]>,
         /// MMD device selected by the last 0x0D write.
         mmd_dev: core::cell::Cell<u16>,
         /// MMD register selected by the last 0x0E write in the
@@ -1061,10 +1061,10 @@ mod tests {
             page0[0x09] = gbcr;
             page0[0x0a] = gbsr;
             FakeMdio {
-                page0,
-                speed_word: 0,
+                page0: core::cell::Cell::new(page0),
+                speed_word: core::cell::Cell::new(0),
                 page: core::cell::Cell::new(0),
-                mmd7: [0u16; 64],
+                mmd7: core::cell::Cell::new([0u16; 64]),
                 mmd_dev: core::cell::Cell::new(0),
                 mmd_reg: core::cell::Cell::new(0),
                 mmd_data_phase: core::cell::Cell::new(false),
@@ -1081,18 +1081,18 @@ mod tests {
                 if reg == 0x0e && self.mmd_data_phase.get() {
                     // Data-phase read: the selected MMD register.
                     if self.mmd_dev.get() == 7 {
-                        return Ok(self.mmd7[usize::from(self.mmd_reg.get()) & 63]);
+                        return Ok(self.mmd7.get()[usize::from(self.mmd_reg.get()) & 63]);
                     }
                     return Ok(0);
                 }
                 if reg == 0x0e {
                     return Ok(self.mmd_reg.get());
                 }
-                return Ok(self.page0[usize::from(reg) & 31]);
+                return Ok(self.page0.get()[usize::from(reg) & 31]);
             }
             if page == 0x0a43 {
                 if reg == 0x12 {
-                    return Ok(self.speed_word);
+                    return Ok(self.speed_word.get());
                 }
                 return Ok(0);
             }
@@ -1114,19 +1114,23 @@ mod tests {
                 if reg == 0x0e {
                     if self.mmd_data_phase.get() {
                         if self.mmd_dev.get() == 7 {
-                            self.mmd7[usize::from(self.mmd_reg.get()) & 63] = val;
+                            let mut mmd7 = self.mmd7.get();
+                            mmd7[usize::from(self.mmd_reg.get()) & 63] = val;
+                            self.mmd7.set(mmd7);
                         }
                     } else {
                         self.mmd_reg.set(val);
                     }
                     return Ok(());
                 }
-                self.page0[usize::from(reg) & 31] = val;
+                let mut page0 = self.page0.get();
+                page0[usize::from(reg) & 31] = val;
+                self.page0.set(page0);
                 return Ok(());
             }
             if page == 0x0a43 {
                 if reg == 0x12 {
-                    self.speed_word = val;
+                    self.speed_word.set(val);
                     return Ok(());
                 }
                 return Ok(());
@@ -1247,7 +1251,7 @@ mod tests {
         // (RTL8211DN); an all-ones ID is the no-device signature.
         let phy = FakeMdio::new(0x0024, 0x01e1, 0x0200, 0x01c1, 0x0800, 0x1000);
         match phy.read_phy_id() {
-            Ok(id) if id == 0x001c_c914 => {}
+            Ok(0x001c_c914) => {}
             _ => return TestResult::Fail("trait read_phy_id did not compose 0x001cc914"),
         }
         if !phy_id_valid(0x001c_c914) || phy_id_valid(0) || phy_id_valid(0xffff_ffff) {
@@ -1265,14 +1269,14 @@ mod tests {
         // Paged access: the rtlgen speed word lives at page
         // 0xa43 reg 0x12; the access must restore page 0, so a
         // BMSR read afterwards still sees the page-0 word.
-        let mut phy = FakeMdio::new(0x0024, 0x01e1, 0x0200, 0x01c1, 0x0800, 0x1000);
-        phy.speed_word = 0x0210;
+        let phy = FakeMdio::new(0x0024, 0x01e1, 0x0200, 0x01c1, 0x0800, 0x1000);
+        phy.speed_word.set(0x0210);
         match phy.read_paged(0x0a43, 0x12) {
-            Ok(v) if v == 0x0210 => {}
+            Ok(0x0210) => {}
             _ => return TestResult::Fail("trait read_paged did not return the speed word"),
         }
         match phy.read_reg(0x01) {
-            Ok(v) if v == 0x0024 => {}
+            Ok(0x0024) => {}
             _ => return TestResult::Fail("trait read_paged did not restore page 0"),
         }
         // A paged write lands in the same register.
@@ -1280,7 +1284,7 @@ mod tests {
             return TestResult::Fail("trait write_paged failed");
         }
         match phy.read_paged(0x0a43, 0x12) {
-            Ok(v) if v == 0x0220 => {}
+            Ok(0x0220) => {}
             _ => return TestResult::Fail("trait write_paged did not stick"),
         }
         // MMD via Clause-22 indirection: write 7.62 = 0x0003,
@@ -1290,7 +1294,7 @@ mod tests {
             return TestResult::Fail("trait write_mmd failed");
         }
         match phy.read_mmd(7, 62) {
-            Ok(v) if v == 0x0003 => {}
+            Ok(0x0003) => {}
             _ => return TestResult::Fail("trait read_mmd did not return the written word"),
         }
         // An unmodeled page is an error, not a silent wrap.
