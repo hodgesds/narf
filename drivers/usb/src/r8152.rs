@@ -24,8 +24,11 @@
 //! Datapath formats:
 //! - **RX**: bulk-IN transfers carry an aggregation buffer of
 //!   back-to-back segments; each segment is a 24-byte `rx_desc`
-//!   (`opts1..opts6`, `opts1 & 0x7FFF` = frame length, frame bytes
-//!   only) followed immediately by the frame. `opts2` carries the
+//!   (`opts1..opts6`, `opts1 & 0x7FFF` = frame length INCLUDING
+//!   the trailing 4-byte FCS, which the walk strips) followed by
+//!   the frame + FCS, zero-padded so the next descriptor starts
+//!   at the next 8-byte boundary (Linux `rx_bottom` /
+//!   `rx_agg_align`, `RX_ALIGN` = 8). `opts2` carries the
 //!   checksum report bits (`RD_IPV4_CS` / `RD_IPV6_CS` /
 //!   `RD_TCP_CS` / `RD_UDP_CS`) and `opts3` the fail bits
 //!   (`RX_IPF` / `RX_UDPF` / `RX_TCPF`); the pump decodes them
@@ -393,6 +396,14 @@ pub const RX_TCPF: u32 = 1 << 21;
 
 /// RX aggregation segment header length (`rx_desc`, 6 × u32).
 pub const RX_DESC_LEN: usize = 24;
+/// RX aggregation segment alignment (Linux `RX_ALIGN`:
+/// `rx_agg_align` rounds the end of frame + FCS up to the
+/// next 8-byte boundary, where the next `rx_desc` starts).
+pub const RX_DESC_ALIGN: usize = 8;
+/// FCS bytes trailing each RX frame inside the descriptor's
+/// length field (Linux `ETH_FCS_LEN`); the walk strips them,
+/// so `RxSegment.len` stays "delivered frame bytes".
+pub const RX_FCS_LEN: usize = 4;
 /// `rx_desc.opts1` frame-length mask.
 pub const RX_LEN_MASK: u32 = 0x7FFF;
 /// Minimum Ethernet frame the chip hands up (`ETH_ZLEN`); a
@@ -1260,7 +1271,9 @@ pub fn decode_link_status(byte: u8) -> (bool, Option<u32>, Option<narf_net::ifac
 pub struct RxSegment {
     /// Byte offset of the frame within the aggregation buffer.
     pub offset: usize,
-    /// Frame length in bytes (descriptor excluded).
+    /// Delivered frame length in bytes (descriptor excluded,
+    /// and the trailing FCS stripped — see
+    /// [`parse_rx_aggregate`]).
     pub len: usize,
     /// 802.1Q tag the chip stripped and reported in `rx_desc`
     /// `opts2` (`RX_VLAN_TAG_BIT`), or `None` when the segment
@@ -1404,10 +1417,16 @@ pub fn rx_segment_deliverable(csum: RxCsumResult, frame: &[u8]) -> bool {
     }
 }
 
-/// Walk an RX aggregation buffer into its frames. Stops at the
-/// first segment whose length field is implausible (< ETH_ZLEN,
-/// or running past the buffer) — the stream cannot be resynced
-/// past a bad descriptor.
+/// Walk an RX aggregation buffer into its frames, mirroring
+/// Linux's `rx_bottom` walk: the `opts1` length field counts
+/// frame + FCS, so the walk bounds-checks the raw length
+/// (`< ETH_ZLEN`, i.e. `RX_MIN_FRAME`, or running past the
+/// buffer, stops the walk — the stream cannot be resynced past
+/// a bad descriptor), delivers `pkt_len - ETH_FCS_LEN` bytes,
+/// and places the next descriptor at the next 8-byte boundary
+/// (`rx_agg_align`). The raw-length check runs BEFORE the
+/// strip, exactly as in Linux: a raw length of 60 delivers a
+/// 56-byte frame.
 pub fn parse_rx_aggregate(buf: &[u8]) -> Vec<RxSegment> {
     let mut out = Vec::new();
     let mut off = 0usize;
@@ -1415,17 +1434,17 @@ pub fn parse_rx_aggregate(buf: &[u8]) -> Vec<RxSegment> {
         let opts1 = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         let opts2 = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
         let opts3 = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
-        let len = (opts1 & RX_LEN_MASK) as usize;
-        if (len as u32) < RX_MIN_FRAME || off + RX_DESC_LEN + len > buf.len() {
+        let pkt_len = (opts1 & RX_LEN_MASK) as usize;
+        if pkt_len < RX_MIN_FRAME as usize || off + RX_DESC_LEN + pkt_len > buf.len() {
             break;
         }
         out.push(RxSegment {
             offset: off + RX_DESC_LEN,
-            len,
+            len: pkt_len - RX_FCS_LEN,
             vlan_tag: rx_vlan_tag_from_opts2(opts2),
             csum: rx_csum_result(opts2, opts3),
         });
-        off += RX_DESC_LEN + len;
+        off = (off + RX_DESC_LEN + pkt_len + RX_DESC_ALIGN - 1) & !(RX_DESC_ALIGN - 1);
     }
     out
 }
@@ -2935,25 +2954,44 @@ pub mod tests {
     }
 
     fn smoke_r8152_rx_aggregate_walk() -> TestResult {
-        // Two valid frames then a runt descriptor: the walk must
-        // yield exactly the two frames and stop at the runt.
+        // Three valid frames then a runt descriptor: the walk
+        // must yield exactly the three frames and stop at the
+        // runt. Segments are built from the Linux `rx_desc`
+        // layout (never from the parser under test): `opts1`
+        // counts frame + FCS, the 4 FCS bytes follow the frame,
+        // and the next descriptor starts at the next 8-byte
+        // boundary. The 61-byte frame forces the alignment
+        // step (its segment ends at offset 177, the next
+        // descriptor sits at 184); a walk without the alignment
+        // would read the pad as a descriptor and stop after
+        // two frames.
         let f1 = datagram_frame(60, 0xA5);
-        let f2 = datagram_frame(100, 0x3C);
+        let f2 = datagram_frame(61, 0x3C);
+        let f3 = datagram_frame(100, 0x77);
         let mut buf = alloc::vec::Vec::new();
         let push_seg = |buf: &mut Vec<u8>, frame: &[u8]| {
-            buf.extend_from_slice(&(frame.len() as u32).to_le_bytes()); // opts1
+            buf.extend_from_slice(&((frame.len() + RX_FCS_LEN) as u32).to_le_bytes()); // opts1
             buf.extend_from_slice(&[0u8; 20]); // opts2..opts6
             buf.extend_from_slice(frame);
+            buf.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // FCS marker
+            while buf.len() % RX_DESC_ALIGN != 0 {
+                buf.push(0);
+            }
         };
         push_seg(&mut buf, &f1);
         push_seg(&mut buf, &f2);
+        push_seg(&mut buf, &f3);
         buf.extend_from_slice(&10u32.to_le_bytes()); // runt opts1
         buf.extend_from_slice(&[0u8; 20]);
         buf.extend_from_slice(&[0u8; 10]);
         let segs = parse_rx_aggregate(&buf);
-        if segs.len() != 2 {
+        if segs.len() != 3 {
             return TestResult::Fail("aggregate walk yielded wrong frame count");
         }
+        // seg0: desc [0..24), frame [24..84), FCS [84..88).
+        // seg1: desc [88..112), frame [112..173), FCS
+        // [173..177), pad [177..184). seg2: desc [184..208),
+        // frame [208..308), FCS [308..312).
         if segs[0]
             != (RxSegment {
                 offset: RX_DESC_LEN,
@@ -2966,18 +3004,38 @@ pub mod tests {
         }
         if segs[1]
             != (RxSegment {
-                offset: RX_DESC_LEN + 60 + RX_DESC_LEN,
-                len: 100,
+                offset: 112,
+                len: 61,
                 vlan_tag: None,
                 csum: RxCsumResult::NotChecked,
             })
         {
             return TestResult::Fail("second segment location wrong");
         }
+        if segs[2]
+            != (RxSegment {
+                offset: 208,
+                len: 100,
+                vlan_tag: None,
+                csum: RxCsumResult::NotChecked,
+            })
+        {
+            return TestResult::Fail("third segment location wrong");
+        }
+        // Delivered bytes are the frames only — the FCS marker
+        // is stripped, never handed to the stack.
         if &buf[segs[0].offset..segs[0].offset + segs[0].len] != f1.as_slice()
             || &buf[segs[1].offset..segs[1].offset + segs[1].len] != f2.as_slice()
+            || &buf[segs[2].offset..segs[2].offset + segs[2].len] != f3.as_slice()
         {
             return TestResult::Fail("segment payload bytes wrong");
+        }
+        for seg in &segs {
+            if buf[seg.offset + seg.len..seg.offset + seg.len + RX_FCS_LEN]
+                != [0xDE, 0xAD, 0xBE, 0xEF]
+            {
+                return TestResult::Fail("FCS marker not where the length says");
+            }
         }
         // Truncated tail: length field runs past the buffer → stop.
         let mut bad = datagram_frame(60, 0x11);
@@ -3163,11 +3221,18 @@ pub mod tests {
         f_bad.resize(60, 0);
         let mut buf = Vec::new();
         let push_seg = |buf: &mut Vec<u8>, frame: &[u8], opts2: u32, opts3: u32| {
-            buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            // Linux layout: opts1 counts frame + FCS, FCS
+            // bytes follow the frame, next descriptor at the
+            // next 8-byte boundary (88 is already aligned).
+            buf.extend_from_slice(&((frame.len() + RX_FCS_LEN) as u32).to_le_bytes());
             buf.extend_from_slice(&opts2.to_le_bytes());
             buf.extend_from_slice(&opts3.to_le_bytes());
             buf.extend_from_slice(&[0u8; 12]);
             buf.extend_from_slice(frame);
+            buf.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // FCS marker
+            while buf.len() % RX_DESC_ALIGN != 0 {
+                buf.push(0);
+            }
         };
         push_seg(&mut buf, &f_good, RD_IPV4_CS | RD_TCP_CS, 0);
         push_seg(&mut buf, &f_bad, RD_IPV4_CS | RD_TCP_CS, RX_TCPF);
@@ -4327,13 +4392,16 @@ pub mod tests {
             return TestResult::Fail("short frame must not splice");
         }
         // Aggregate walk reports the tag on the segment.
+        // Linux layout: opts1 counts frame + FCS (60 + 4),
+        // FCS bytes follow the frame.
         let mut agg = alloc::vec::Vec::new();
-        agg.extend_from_slice(&60u32.to_le_bytes()); // opts1: len
+        agg.extend_from_slice(&((frame.len() + RX_FCS_LEN) as u32).to_le_bytes()); // opts1: len
         agg.extend_from_slice(&(RX_VLAN_TAG_BIT | 0x6400).to_le_bytes()); // opts2
         agg.extend_from_slice(&[0u8; 16]); // opts3..opts6
         agg.extend_from_slice(&frame);
+        agg.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // FCS marker
         let segs = parse_rx_aggregate(&agg);
-        if segs.len() != 1 || segs[0].vlan_tag != Some(0x0064) {
+        if segs.len() != 1 || segs[0].vlan_tag != Some(0x0064) || segs[0].len != 60 {
             return TestResult::Fail("aggregate walk must report the VLAN tag");
         }
         TestResult::Pass
