@@ -4472,7 +4472,7 @@ pub fn periodic_sync_transfer_last_outcome(index: usize) -> Option<gap::SyncTran
         .find(|s| s.index == index)?
         .core
         .as_ref()
-        .map(|c| c.last_sync_transfer)
+        .and_then(|c| c.last_sync_transfer)
 }
 
 /// Current periodic advertiser phase for controller `index`, if its
