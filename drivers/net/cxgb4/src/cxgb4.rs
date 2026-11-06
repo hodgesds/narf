@@ -38,10 +38,7 @@ pub const CHELSIO_VENDOR: u16 = 0x1425;
 /// stays unbound and available to other claimants. Never returns
 /// any other error: any other variant would end the walk for this
 /// device instead of falling through.
-pub fn probe(
-    device: BusDevice,
-    _cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), ProbeError> {
+pub fn probe(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) -> Result<(), ProbeError> {
     let _ = writeln!(
         Writer,
         "  net: cxgb4: Chelsio [{:04x}:{:04x}] explicitly not implemented (#799), declining probe",
