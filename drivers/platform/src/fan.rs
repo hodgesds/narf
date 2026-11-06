@@ -625,16 +625,16 @@ impl PwmFan {
     /// Construct from a board description: the DT probe's path.
     /// A zero period is normalised to the 25 kHz default — a
     /// `PwmFan` must never divide by its own period.
-    pub fn from_description(
-        name: &'static str,
-        pwm: Arc<dyn PwmDevice>,
-        desc: PwmFanDesc,
-    ) -> Self {
+    pub fn from_description(name: &'static str, pwm: Arc<dyn PwmDevice>, desc: PwmFanDesc) -> Self {
         Self {
             name,
             pwm,
             channel: desc.channel,
-            period_ns: if desc.period_ns == 0 { 40_000 } else { desc.period_ns },
+            period_ns: if desc.period_ns == 0 {
+                40_000
+            } else {
+                desc.period_ns
+            },
             polarity: desc.polarity,
             cooling_levels: Arc::from(desc.cooling_levels),
             target_level: core::sync::atomic::AtomicU8::new(0),
@@ -752,10 +752,7 @@ impl CoolingDevice for PwmFan {
 /// registration outcome so the probe can leave the node unbound
 /// (deferred probe) when registration fails. Registration failure
 /// is logged, never swallowed silently.
-pub fn register_pwm_fan(
-    pwm: Arc<dyn PwmDevice>,
-    desc: PwmFanDesc,
-) -> Result<(), ThermalError> {
+pub fn register_pwm_fan(pwm: Arc<dyn PwmDevice>, desc: PwmFanDesc) -> Result<(), ThermalError> {
     let cap = bootstrap_thermal_authority();
     let channel = desc.channel;
     let period_ns = desc.period_ns;
@@ -768,7 +765,9 @@ pub fn register_pwm_fan(
             let _ = writeln!(
                 narf_console::Writer,
                 "  pwm-fan: registered (channel={}, period_ns={}, cooling-levels={})",
-                channel, period_ns, n_levels
+                channel,
+                period_ns,
+                n_levels
             );
             Ok(())
         }
@@ -836,8 +835,11 @@ fn node_path_string(path: &narf_firmware_fdt::Path<'_>) -> String {
 ///   so it is neither read nor required here.
 pub fn decode_dt_pwm_fan(blob: &[u8], path: &str) -> Option<PwmFanDesc> {
     // 1) Find the node at `path` and collect its properties.
-    let mut pwms: Option<&[u8]> = None;
-    let mut cooling_levels: Option<&[u8]> = None;
+    // Property payloads borrow from the walker's per-call iterator,
+    // so they are copied into owned buffers here — the decoded
+    // description must outlive the walk.
+    let mut pwms: Option<Vec<u8>> = None;
+    let mut cooling_levels: Option<Vec<u8>> = None;
     let mut compatible_ok = false;
     let mut found = false;
     narf_firmware_fdt::walk_nodes(blob, |node_path, props| {
@@ -851,11 +853,10 @@ pub fn decode_dt_pwm_fan(blob: &[u8], path: &str) -> Option<PwmFanDesc> {
         for (name, value) in props {
             match name {
                 "compatible" => {
-                    compatible_ok =
-                        narf_firmware_fdt::compatible_matches(value, "pwm-fan");
+                    compatible_ok = narf_firmware_fdt::compatible_matches(value, "pwm-fan");
                 }
-                "pwms" => pwms = Some(value),
-                "cooling-levels" => cooling_levels = Some(value),
+                "pwms" => pwms = Some(value.to_vec()),
+                "cooling-levels" => cooling_levels = Some(value.to_vec()),
                 _ => {}
             }
         }
@@ -868,7 +869,12 @@ pub fn decode_dt_pwm_fan(blob: &[u8], path: &str) -> Option<PwmFanDesc> {
         return None;
     }
     let be = |i: usize| {
-        u32::from_be_bytes([pwms[4 * i], pwms[4 * i + 1], pwms[4 * i + 2], pwms[4 * i + 3]])
+        u32::from_be_bytes([
+            pwms[4 * i],
+            pwms[4 * i + 1],
+            pwms[4 * i + 2],
+            pwms[4 * i + 3],
+        ])
     };
     let controller = be(0);
     // 2) The controller node's `#pwm-cells` says how many cells
@@ -940,6 +946,7 @@ pub fn dt_pwm_fan_probe(blob: &'static [u8], path: &str) -> Result<(), ProbeErro
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
     use async_trait::async_trait;
     use core::sync::atomic::{AtomicU8, Ordering};
     use narf_kernel_test::{kernel_test_in, TestResult};
@@ -1796,7 +1803,13 @@ mod tests {
             fan_props.push(("cooling-levels", level_bytes.as_slice()));
         }
         fdt_blob(&[
-            ("pwm@1000", &[("phandle", phandle.as_slice()), ("#pwm-cells", cells.as_slice())]),
+            (
+                "pwm@1000",
+                &[
+                    ("phandle", phandle.as_slice()),
+                    ("#pwm-cells", cells.as_slice()),
+                ],
+            ),
             ("fan", &fan_props),
         ])
     }
@@ -1847,7 +1860,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers-platform-fan", smoke_dt_pwm_fan_decode_polarity_flag);
+    kernel_test_in!(
+        "drivers-platform-fan",
+        smoke_dt_pwm_fan_decode_polarity_flag
+    );
 
     fn smoke_dt_pwm_fan_decode_rejects_malformed() -> TestResult {
         // Missing `pwms` (required by the binding).
