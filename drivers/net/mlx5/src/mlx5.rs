@@ -345,8 +345,10 @@ pub struct Mlx5Hca {
     /// Stage 4: result of the bring-up self-test NOP. `Some(Ok(()))`
     /// means the cmdq transport works end-to-end with this device;
     /// `Some(Err(_))` means probe ran but the NOP self-test failed
-    /// (driver still bound — operator can investigate).
-    nop_selftest: Option<Result<(), Mlx5Error>>,
+    /// (driver still bound — operator can investigate). Behind a
+    /// lock so probe can run the self-test through the shared `Arc`
+    /// (the pump tasks spawned by `bring_up` hold clones).
+    nop_selftest: IrqSafeSpinLock<Option<Result<(), Mlx5Error>>>,
     /// Stage 7: registry of live EQs (eq_number + backing DMA).
     eqs: IrqSafeSpinLock<Vec<LiveEq>>,
     /// Stage 8: registry of live CQs.
@@ -362,12 +364,16 @@ pub struct Mlx5Hca {
     /// override is kept on the struct so a future stage can refine
     /// after a proper QUERY_HCA_CAP read.
     uar_base: u64,
+    /// PCI address of the function this instance drives. Probe
+    /// refuses a second bind of the same address (issue #1631): two
+    /// `Mlx5Hca`s for one chip would drive one set of queues.
+    pub addr: narf_bus::BusAddr,
     /// Stage 12: cached MAC + MTU from the last `QUERY_NIC_VPORT_CONTEXT`.
     nic_state: IrqSafeSpinLock<NicCachedState>,
 
     // IPC integration
-    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
-    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
 // SAFETY: the only non-`Send` members are the `MmioRegion`/`DmaBuffer` raw
@@ -428,7 +434,7 @@ impl Mlx5Hca {
     pub unsafe fn bring_up(
         device: &BusDevice,
         _cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<Self, Mlx5Error> {
+    ) -> Result<Arc<Self>, Mlx5Error> {
         // SAFETY: caller-authority over the device.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| Mlx5Error::BarMapFailed)?;
 
@@ -476,13 +482,14 @@ impl Mlx5Hca {
             segment,
             cmdq,
             next_token: IrqSafeSpinLock::new(1),
-            nop_selftest: None,
+            nop_selftest: IrqSafeSpinLock::new(None),
             eqs: IrqSafeSpinLock::new(Vec::new()),
             cqs: IrqSafeSpinLock::new(Vec::new()),
             uars: IrqSafeSpinLock::new(Vec::new()),
             pds: IrqSafeSpinLock::new(Vec::new()),
             qps: IrqSafeSpinLock::new(Vec::new()),
             uar_base: UAR_BASE_DEFAULT,
+            addr: device.addr,
             nic_state: IrqSafeSpinLock::new(NicCachedState::default()),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -491,7 +498,13 @@ impl Mlx5Hca {
         // Spawn pumps
         spawn_pumps(hca.clone(), rx_prod, tx_cons);
 
-        Arc::try_unwrap(hca).map_err(|_| Mlx5Error::NoMemory)
+        // Return the `Arc` directly: unwrapping it back to `Self`
+        // (the old `Arc::try_unwrap` tail) always failed — the pump
+        // tasks above hold clones, so the refcount is above 1 and
+        // probe could never bind even the first HCA. e1000's
+        // bring_up documents the same trap (e1000.rs, bring_up
+        // step 9 comment).
+        Ok(hca)
     }
 
     /// Stage 12: refresh the cached MAC + MTU off the live HCA.
@@ -514,17 +527,19 @@ impl Mlx5Hca {
     /// Stage 4 self-check: post a single NOP through the live cmdq
     /// transport. Records the result on the driver so callers can
     /// query it later via `nop_selftest()`. Idempotent — each call
-    /// re-runs the NOP and overwrites the stored result.
-    pub fn run_nop_selftest(&mut self) -> Result<(), Mlx5Error> {
+    /// re-runs the NOP and overwrites the stored result. Takes
+    /// `&self` (the result lives behind a lock) so probe can run it
+    /// through the shared `Arc` after `bring_up` spawns the pumps.
+    pub fn run_nop_selftest(&self) -> Result<(), Mlx5Error> {
         let r = self.issue_command_inline(CmdOp::Nop, 0, &[]).map(|_| ());
-        self.nop_selftest = Some(r.clone());
+        *self.nop_selftest.lock() = Some(r.clone());
         r
     }
 
     /// Latest stored NOP self-test outcome, or `None` if it was
     /// never run.
     pub fn nop_selftest(&self) -> Option<Result<(), Mlx5Error>> {
-        self.nop_selftest.clone()
+        self.nop_selftest.lock().clone()
     }
 
     /// Issue an inline-mode command (≤8 B input, ≤8 B output) to slot
@@ -1520,10 +1535,25 @@ pub(crate) fn program_cmdq_registers(mmio: &MmioRegion, cmdq_phys: u64, log_size
 
 // ── Driver-match registration ──────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Mlx5Hca>> = IrqSafeSpinLock::new(None);
+/// Every probed controller, by probe order. The i40e `CONTROLLERS`
+/// pattern, so a second ConnectX on the same machine probes and
+/// binds instead of being dropped by a singleton slot (issue
+/// #1631). The vec never shrinks, so a live controller's index
+/// stays valid for the kernel lifetime. (Unlike the other families
+/// converted here, mlx5 publishes no iface yet — its TX/RX
+/// datapath is still a stub — so there is no cookie send path to
+/// key by the index.)
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<Mlx5Hca>>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
+/// Probe entry — installed via `bus::register_pci_driver`. A second
+/// probe of the SAME function is a no-op success (the old idempotent
+/// behaviour): the bus re-walks devices, and rebuilding a second
+/// `Mlx5Hca` for the same silicon would let two instances drive one
+/// chip's queues. A second FUNCTION binds as a new instance instead
+/// of being dropped (issue #1631).
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    if CONTROLLERS.lock().iter().any(|c| c.addr == device.addr) {
         return Ok(());
     }
     narf_bus::pci::set_command(
@@ -1535,7 +1565,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over device.
-    let mut dev = match unsafe { Mlx5Hca::bring_up(&device, &cap) } {
+    let dev = match unsafe { Mlx5Hca::bring_up(&device, &cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
@@ -1545,7 +1575,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // failing probe — a NOP timeout might be a slow host, not a
     // broken device.
     let _ = dev.run_nop_selftest();
-    *CONTROLLER.lock() = Some(dev);
+    // Retain before any queue DMA address reaches the device.
+    CONTROLLERS.lock().push(dev.clone());
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -1560,7 +1591,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(&auth, Mlx5NetIface);
+        let _ = narf_net::registry().register(
+            &auth,
+            Mlx5NetIface {
+                nic: dev.clone(),
+                name: "mlx5",
+            },
+        );
     }
 
     Ok(())
@@ -1625,65 +1662,67 @@ fn name_for(did: u16) -> &'static str {
     }
 }
 
+/// Number of probed controllers (issue #1631).
+pub fn instance_count() -> usize {
+    CONTROLLERS.lock().len()
+}
+
+/// `true` once at least one controller has been probed.
 pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+    !CONTROLLERS.lock().is_empty()
 }
 
-pub fn with_controller<R>(f: impl FnOnce(&Mlx5Hca) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+/// The probed controller at `index`, if it exists. The index is
+/// stable for the kernel lifetime because the vec never shrinks.
+pub fn controller(index: usize) -> Option<Arc<Mlx5Hca>> {
+    CONTROLLERS.lock().get(index).cloned()
 }
 
-// ── Mlx5NetIface: lightweight ZST for narf-net registry ───────────
+/// Test-side accessor: run `f` against the probed controller at
+/// `index` (i40e shape).
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&Mlx5Hca) -> R) -> Option<R> {
+    CONTROLLERS.lock().get(index).map(|a| f(a))
+}
+
+// ── Mlx5NetIface: lightweight adapter for the narf-net registry ────
 //
-// `Mlx5Hca` owns firmware objects and can't be cloned cheaply.
-// `Mlx5NetIface` is a zero-sized sentinel that delegates to the
-// module-level `CONTROLLER` static, following the `Rtl8139Nic` pattern.
+// `Mlx5Hca` owns firmware objects and can't be cloned cheaply, so
+// the registry holds this adapter instead — but the adapter owns
+// its instance's `Arc`, following the `Rtl8139Nic` pattern, so a
+// second HCA gets its own adapter and its own rings rather than
+// every port sharing one module-level static.
 
 #[derive(Debug)]
-pub struct Mlx5NetIface;
+pub struct Mlx5NetIface {
+    /// This port's controller; the rings are borrowed out of it.
+    nic: Arc<Mlx5Hca>,
+    /// Pre-publish fallback name, used by [`narf_net::Interface::name`].
+    name: &'static str,
+}
 
 impl narf_net::Interface for Mlx5NetIface {
     fn name(&self) -> &str {
-        "mlx5"
+        self.name
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.nic_state().mac).unwrap_or([0; 6])
+        self.nic.nic_state().mac
     }
     fn mtu(&self) -> u32 {
-        with_controller(|c| {
-            let m = c.nic_state().mtu;
-            if m == 0 {
-                1500
-            } else {
-                m
-            }
-        })
-        .unwrap_or(1500)
+        let m = self.nic.nic_state().mtu;
+        if m == 0 {
+            1500
+        } else {
+            m
+        }
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.nic_state().link_up).unwrap_or(false)
+        self.nic.nic_state().link_up
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.nic.rx_ipc_ring
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.nic.tx_ipc_ring
     }
 }
 

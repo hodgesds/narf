@@ -108,10 +108,18 @@ pub struct Rtl8139 {
     /// Round-robin index for the next TX descriptor.
     tx_index: IrqSafeSpinLock<usize>,
     pub ready: bool,
+    /// PCI address of the function this instance drives. Probe
+    /// refuses a second bind of the same address (issue #1631): two
+    /// `Rtl8139`s for one chip would drive one set of rings.
+    pub addr: narf_bus::BusAddr,
+    /// Interface name `publish_netdev_with_context` assigned this
+    /// instance (`eth%d`). Per-instance (i40e/igc pattern): the old
+    /// module-level `RTL8139_IFNAME` static could only name one NIC.
+    ifname: crate::publish::IfName,
 
     // IPC integration
-    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
-    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
 // SAFETY: `Rtl8139` is only `!Send` because of the raw MMIO/DMA pointers in
@@ -143,7 +151,7 @@ impl Rtl8139 {
         _cap: &Cap<BusDeviceCap, Write>,
         _rx_cons: Consumer<Frame, RX_RING_N>,
         _tx_prod: Producer<Frame, TX_RING_N>,
-    ) -> Result<Self, Rtl8139Error> {
+    ) -> Result<Arc<Self>, Rtl8139Error> {
         // SAFETY: caller-asserted. RTL8139 advertises both BAR0
         // (IO) and BAR1 (MMIO); MMIO is more portable + cross-arch
         // friendly.
@@ -248,11 +256,20 @@ impl Rtl8139 {
             rx_offset: IrqSafeSpinLock::new(0),
             tx_index: IrqSafeSpinLock::new(0),
             ready: true,
+            addr: device.addr,
+            ifname: crate::publish::IfName::new(),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
 
-        Arc::try_unwrap(rtl).map_err(|_| Rtl8139Error::Other("Arc unwrap failed"))
+        // Return the `Arc` directly, matching the other families:
+        // the old `Arc::try_unwrap` tail happened to succeed here
+        // only because this driver spawns its pumps in `probe`,
+        // so no clone existed at unwrap time — but the trap is
+        // the same, and any future move of the pump spawn into
+        // `bring_up` would have made probe always fail (see
+        // rtl8125/rtl8126, issue #1631).
+        Ok(rtl)
     }
 
     pub fn mac(&self) -> [u8; 6] {
@@ -382,74 +399,73 @@ impl Rtl8139 {
 // ── HwNic adapter ───────────────────────────────────────────────────
 
 #[derive(Debug)]
-pub struct Rtl8139Nic;
+/// One probed port, as the net stack sees it.
+///
+/// This owns its `Arc<Rtl8139>` rather than looking the controller up
+/// in a module-level static. That is what makes multiple ports work:
+/// `Interface::rx_ring` / `tx_ring` return references borrowed from
+/// `&self`, so an interface with no storage of its own has to hand
+/// back a `static` — and every instance would then share one pair of
+/// rings, with the second port's frames landing in the first port's
+/// queue (i40e's `I40eNicIface` pattern).
+#[derive(Debug)]
+pub struct Rtl8139Nic {
+    /// This port's controller; the rings are borrowed out of it.
+    nic: Arc<Rtl8139>,
+    /// Pre-publish fallback name, used by [`narf_net::Interface::name`]
+    /// before probe publishes the dynamic `eth%d` name.
+    name: &'static str,
+}
 
 impl narf_net::Interface for Rtl8139Nic {
     fn name(&self) -> &str {
         // The dynamic `eth%d` name once published (issue #784); the
         // family name before probe gets that far.
-        let n = rtl8139_ifname();
+        let n = self.nic.ifname();
         if n.is_empty() {
-            "rtl8139"
+            self.name
         } else {
             n
         }
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up()).unwrap_or(false)
+        self.nic.link_up()
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-                if r.is_some() {
-                    // Ring consumer attached: enable the RX mirror
-                    // (e1000's `rx_mirror_enabled` moment).
-                    crate::publish::note_rx_mirror_attached(rtl8139_ifname());
-                }
-            }
-        });
-        &RING
+        // Ring consumer attached: enable the RX mirror (e1000's
+        // `rx_mirror_enabled` moment), keyed by this port's own
+        // published name.
+        crate::publish::note_rx_mirror_attached(self.nic.ifname());
+        &self.nic.rx_ipc_ring
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.nic.tx_ipc_ring
     }
 }
 
 impl crate::HwNic for Rtl8139Nic {
     fn name(&self) -> &'static str {
-        let n = rtl8139_ifname();
+        let n = self.nic.ifname();
         if n.is_empty() {
-            "rtl8139"
+            self.name
         } else {
             n
         }
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up()).unwrap_or(false)
+        self.nic.link_up()
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::RealtekRtl8139
@@ -468,31 +484,63 @@ impl crate::HwNic for Rtl8139Nic {
     }
 }
 
-// ── Driver-match registration ────────────────────────────────────────
-
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<Rtl8139>>> = IrqSafeSpinLock::new(None);
-
-/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
-/// `dev_alloc_name`). Set once at probe; the device lives as long as
-/// the kernel, so the name is leaked into a `&'static str`.
-static RTL8139_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
-
-/// This NIC's interface name; empty until it has registered.
-pub fn rtl8139_ifname() -> &'static str {
-    RTL8139_IFNAME.get()
+/// Number of probed controllers (issue #1631).
+pub fn instance_count() -> usize {
+    CONTROLLERS.lock().len()
 }
 
-/// SendFn registered with `narf_net::iface` at probe time. Routes the
-/// kernel-side TCP stack's outbound frames through `Rtl8139::tx`. The
-/// Arc is cloned out rather than holding the IRQ-masking CONTROLLER
+/// `true` once at least one controller has been probed.
+pub fn is_probed() -> bool {
+    !CONTROLLERS.lock().is_empty()
+}
+
+/// The probed controller at `index`, if it exists. The index is the
+/// cookie probe assigned (see `CONTROLLERS`); it is stable for the
+/// kernel lifetime because the vec never shrinks.
+pub fn controller(index: usize) -> Option<Arc<Rtl8139>> {
+    CONTROLLERS.lock().get(index).cloned()
+}
+
+/// Test-side accessor: run `f` against the probed controller at
+/// `index` (i40e shape).
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&Rtl8139) -> R) -> Option<R> {
+    CONTROLLERS.lock().get(index).map(|a| f(a))
+}
+
+impl Rtl8139 {
+    /// This instance's published interface name (`eth%d`), or `""`
+    /// before probe publishes it. Per-instance state (i40e/igc
+    /// pattern); the pumps and the registry adapter read the name
+    /// off the device they serve, never a module-level static.
+    pub fn ifname(&self) -> &'static str {
+        self.ifname.get()
+    }
+}
+
+// ── Driver-match registration ────────────────────────────────────────
+
+/// Every probed controller, by probe order. The index is the cookie
+/// the kernel-side stack's send path resolves through
+/// [`rtl8139_send_frame`] — the i40e `CONTROLLERS` pattern, so a
+/// second RTL8139 on the same machine probes, binds, and carries
+/// traffic instead of being dropped by a singleton slot (issue
+/// #1631). The vec never shrinks, so a live controller's cookie
+/// stays valid for the kernel lifetime.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<Rtl8139>>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// `SendCtxFn` registered with `narf_net::iface` at probe time. Routes
+/// the kernel-side TCP stack's outbound frames through `Rtl8139::tx`;
+/// the cookie is the controller's index in `CONTROLLERS`. The `Arc`
+/// is cloned out rather than holding the IRQ-masking `CONTROLLERS`
 /// lock across `tx` (same reasoning as e1000's send path).
-fn rtl8139_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
-    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+fn rtl8139_send_frame(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = controller(cookie as usize).ok_or(())?;
     ctrl.tx(frame).map_err(|_| ())
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    if CONTROLLERS.lock().iter().any(|c| c.addr == device.addr) {
         return Ok(());
     }
     narf_bus::pci::set_command(
@@ -509,10 +557,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: caller-authority.
     let dev = match unsafe { Rtl8139::bring_up(&device, &cap, rx_cons, tx_prod) } {
-        Ok(d) => Arc::new(d),
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    *CONTROLLER.lock() = Some(dev.clone());
+
+    // Retain before any ring DMA address reaches the device; the
+    // index is this instance's send-path cookie (see `CONTROLLERS`).
+    let index = {
+        let mut g = CONTROLLERS.lock();
+        g.push(dev.clone());
+        g.len() - 1
+    };
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("rtl8139"),
@@ -523,16 +578,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
 
     // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
-    // name + carrier metadata via the shared helper. `link_up()` is a
-    // live MSR read on this family, so the initial sample is current,
-    // and the polled RX pump keeps it current (issue #791). The
-    // frame-ring registration below stays.
-    let name = crate::publish::publish_netdev(
+    // name + carrier metadata via the shared helper, keyed by the
+    // `CONTROLLERS` index so each port's send path resolves to its
+    // own NIC (i40e pattern). `link_up()` is a live MSR read on this
+    // family, so the initial sample is current, and the polled RX
+    // pump keeps it current (issue #791). The frame-ring
+    // registration below stays.
+    let name = crate::publish::publish_netdev_with_context(
         dev.mac,
+        index as u64,
         rtl8139_send_frame,
         crate::publish::LinkSample::carrier_only(dev.link_up()),
     );
-    RTL8139_IFNAME.set(name);
+    dev.ifname.set(name);
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -540,7 +598,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(&auth, Rtl8139Nic);
+        let _ = narf_net::registry().register(
+            &auth,
+            Rtl8139Nic {
+                nic: dev.clone(),
+                name: "rtl8139",
+            },
+        );
     }
 
     // Spawn pumps
@@ -576,7 +640,7 @@ async fn rtl8139_rx_pump(device: Arc<Rtl8139>, mut rx_prod: Producer<Frame, RX_R
         if up != last_up {
             last_up = up;
             crate::publish::publish_link(
-                rtl8139_ifname(),
+                device.ifname(),
                 crate::publish::LinkSample::carrier_only(up),
             );
         }
@@ -591,7 +655,7 @@ async fn rtl8139_rx_pump(device: Arc<Rtl8139>, mut rx_prod: Producer<Frame, RX_R
             // the kernel stack in place. The mirror is non-blocking —
             // a full/closed ring drops its copy, never the stack's
             // packet.
-            let name = rtl8139_ifname();
+            let name = device.ifname();
             crate::publish::dispatch_rx(
                 name,
                 &mut frame,
@@ -620,12 +684,4 @@ pub fn register_pci_driver() {
         },
         probe,
     });
-}
-
-pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
-}
-
-pub fn with_controller<R>(f: impl FnOnce(&Rtl8139) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(|a| f(a))
 }
