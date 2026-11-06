@@ -15,9 +15,32 @@
 //!
 //! ## Pairing flow (LE Secure Connections, §2.3.5.6)
 //!
-//! Today's surface implements LE Secure Connections **Just Works**
-//! (the §2.3.5.6.2 commitment sequence is shared with Numeric
-//! Comparison; only the user-confirmation step differs):
+//! The feature exchange picks a method with
+//! [`pick_pairing_method`] (§2.3.5.1 table 2.8 — OOB when one or
+//! both sides hold OOB data, table 2.7; Just Works when neither
+//! side asks for MITM) and the state machines run it:
+//!
+//! - **Just Works / Numeric Comparison** (§2.3.5.6.2): the
+//!   commitment sequence below, shared by both methods. Just
+//!   Works proceeds straight to the DHKey Check; Numeric
+//!   Comparison parks after the f5 derivation with the g2 value
+//!   displayed, and the DHKey Check leaves only after the user
+//!   confirms the values match
+//!   ([`Initiator::confirm_numeric_comparison`] /
+//!   [`Responder::confirm_numeric_comparison`]).
+//! - **Passkey Entry** (§2.3.5.6.3): 20 rounds of
+//!   Confirm/Random, one per passkey bit (`Cai = f4(PKax, PKbx,
+//!   Nai, rai)` with Z = 0x80 | bit, §2.2.6 table 2.1), ending
+//!   with Na = Na20 / Nb = Nb20 for stage 2. The passkey is
+//!   generated for display or supplied via
+//!   [`Initiator::provide_passkey`] / [`Responder::provide_passkey`].
+//! - **Out of Band** (§2.3.5.6.4): the confirm commits each
+//!   side's own key to its own OOB random (`Ca = f4(PKax, PKax,
+//!   ra, 0)`), the OOB hash binds the peer's public key, and
+//!   stage 2 uses the OOB randoms as the f6 `R` values
+//!   (§2.2.8 table 2.2).
+//!
+//! The Just Works / Numeric Comparison commitment sequence:
 //!
 //!   Initiator                       Responder
 //!   ─────────                       ─────────
@@ -41,9 +64,11 @@
 //! (Confirm Value Failed); a DHKey Check mismatch with 0x0B
 //! (DHKey Check Failed) — §3.5.5 table 3.7.
 //!
-//! Passkey + OOB extensions land alongside an authentication-policy
-//! hook; the state machine here is parameterised on a Pairing
-//! Method enum.
+//! Passkey Entry (§2.3.5.6.3) and Out of Band (§2.3.5.6.4) are
+//! implemented in the same machines, selected by
+//! [`pick_pairing_method`]; the IO capability (and its MITM bit)
+//! is configurable per session via `with_io_capability` instead
+//! of hardcoded.
 
 use alloc::vec::Vec;
 
@@ -134,8 +159,58 @@ pub enum PairingMethod {
     OutOfBand,
 }
 
+/// Peer Out-of-Band data for LE Secure Connections (§2.3.5.6.4):
+/// the peer's OOB confirm hash and randomizer (the P-256 pair from
+/// mgmt ADD_REMOTE_OOB_DATA). `hash` is `f4(PKbx, PKbx, rb, 0)` —
+/// the peer's public-key confirm over its own random `randomizer`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OobData {
+    pub hash: [u8; 16],
+    pub randomizer: [u8; 16],
+}
+
+/// A 6-digit passkey as the 128-bit integer `f6` takes it (§2.2.8
+/// table 2.2: "ra and rb are 6-digit passkey values expressed as a
+/// 128-bit integer", e.g. 131313 is 0x00…0200f1 — big-endian).
+pub fn passkey_as_128(passkey: u32) -> [u8; 16] {
+    let mut r = [0u8; 16];
+    r[12..16].copy_from_slice(&passkey.to_be_bytes());
+    r
+}
+
+/// One bit of a passkey as the `f4` Z byte (§2.2.6: the most
+/// significant bit of Z is set and the least significant bit is
+/// one bit of the passkey — Z = 0x81 for a 1 bit, 0x80 for a 0).
+pub fn passkey_bit_z(passkey: u32, round: u8) -> u8 {
+    0x80 | (((passkey >> round) & 1) as u8)
+}
+
+/// Something a parked pairing needs from the application, raised
+/// exactly once per park. The pump drains it after each `feed()`
+/// and publishes the matching mgmt event; the mgmt reply resumes
+/// the session.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SmpAttention {
+    /// Numeric Comparison value to display (§2.3.5.6.2 steps 7–8):
+    /// the user confirms the two sides match, via mgmt
+    /// USER_CONFIRM_REPLY / NEG_REPLY.
+    UserConfirm(u32),
+    /// Passkey entry needs the passkey typed in on this side
+    /// (§2.3.5.3): answered via mgmt USER_PASSKEY_REPLY /
+    /// NEG_REPLY.
+    PasskeyRequest,
+    /// This side displays the passkey (§2.3.5.3): the peer types
+    /// it in. Informational — the rounds already started; no
+    /// reply is awaited.
+    PasskeyNotify(u32),
+}
+
 /// Pick a pairing method from initiator + responder IO caps and
-/// whether either side asked for MITM. §2.3.5.1 table 2.8.
+/// whether either side asked for MITM. §2.3.5.1 table 2.8. The
+/// caller passes `oob` true when ONE OR BOTH sides have OOB data
+/// (§2.3.5.1 table 2.7: LE Secure Connections uses OOB "if one or
+/// both devices have out of band authentication data") — it is NOT
+/// an AND of the two flags.
 pub fn pick_pairing_method(
     initiator_io: IoCapability,
     responder_io: IoCapability,
@@ -150,26 +225,35 @@ pub fn pick_pairing_method(
         return PairingMethod::JustWorks;
     }
     use IoCapability::*;
-    // §2.3.5.1 table 2.8 — Secure Connections variant.
+    // §2.3.5.1 table 2.8 — Secure Connections variant. The table
+    // reads rows = responder, columns = initiator, and the cell
+    // names the side that DISPLAYS the passkey: the side with the
+    // display shows it, the side with the keyboard types it in.
+    // (E.g. initiator DisplayOnly + responder KeyboardOnly is
+    // "initiator displays, responder inputs" — the initiator is
+    // the only side with a display. An earlier revision had these
+    // two roles transposed; the Silicon Labs worked example —
+    // initiator DISPLAYONLY + responder KEYBOARDDISPLAY →
+    // "initiator displays, responder inputs" — pins the reading.)
     let _ = sc;
     match (initiator_io, responder_io) {
         (NoInputNoOutput, _) | (_, NoInputNoOutput) => PairingMethod::JustWorks,
         (DisplayOnly, KeyboardOnly) | (DisplayOnly, KeyboardDisplay) => {
-            PairingMethod::PasskeyEntryResponderDisplays
+            PairingMethod::PasskeyEntryInitiatorDisplays
         }
         (DisplayOnly, DisplayOnly) | (DisplayOnly, DisplayYesNo) => PairingMethod::JustWorks,
-        (DisplayYesNo, KeyboardOnly) => PairingMethod::PasskeyEntryResponderDisplays,
+        (DisplayYesNo, KeyboardOnly) => PairingMethod::PasskeyEntryInitiatorDisplays,
         (DisplayYesNo, DisplayYesNo) | (DisplayYesNo, KeyboardDisplay) => {
             PairingMethod::NumericComparison
         }
         (KeyboardOnly, DisplayOnly) | (KeyboardOnly, DisplayYesNo) => {
-            PairingMethod::PasskeyEntryInitiatorDisplays
+            PairingMethod::PasskeyEntryResponderDisplays
         }
         (KeyboardOnly, KeyboardOnly) => PairingMethod::PasskeyEntryBothInput,
-        (KeyboardOnly, KeyboardDisplay) => PairingMethod::PasskeyEntryInitiatorDisplays,
-        (KeyboardDisplay, DisplayOnly) => PairingMethod::PasskeyEntryInitiatorDisplays,
+        (KeyboardOnly, KeyboardDisplay) => PairingMethod::PasskeyEntryResponderDisplays,
+        (KeyboardDisplay, DisplayOnly) => PairingMethod::PasskeyEntryResponderDisplays,
         (KeyboardDisplay, DisplayYesNo) => PairingMethod::NumericComparison,
-        (KeyboardDisplay, KeyboardOnly) => PairingMethod::PasskeyEntryResponderDisplays,
+        (KeyboardDisplay, KeyboardOnly) => PairingMethod::PasskeyEntryInitiatorDisplays,
         (KeyboardDisplay, KeyboardDisplay) => PairingMethod::NumericComparison,
         (DisplayYesNo, DisplayOnly) => PairingMethod::JustWorks,
     }
@@ -397,6 +481,21 @@ pub enum PairingState {
     WaitConfirm,
     WaitRandom,
     SentDhKeyCheck,
+    /// Numeric Comparison value computed and displayed; the DHKey
+    /// Check must not leave until the user confirms the values
+    /// match (§2.3.5.6.2 steps 7–8). [`Initiator::confirm_numeric_comparison`]
+    /// resumes or aborts.
+    WaitUserConfirm,
+    /// Passkey entry needs the passkey typed in on this side
+    /// (§2.3.5.3). [`Initiator::provide_passkey`] resumes.
+    WaitPasskey,
+    /// Passkey round in flight (§2.3.5.6.3 steps 3–8): our
+    /// round confirm left, waiting for the peer's round confirm.
+    PasskeyWaitConfirm,
+    /// Passkey round in flight: the peer's round confirm arrived
+    /// and our round random left, waiting for the peer's round
+    /// random.
+    PasskeyWaitRandom,
     /// Authentication (Phase 2) completed and keys are negotiated
     /// for distribution, but the link is not yet encrypted. Phase 3
     /// distribution PDUs are only legal on an encrypted link (Part H
@@ -422,6 +521,20 @@ pub enum PairingError {
     BadDhKeyCheck,
     /// Peer sent a PDU we don't know how to consume in this state.
     Protocol,
+    /// The user rejected the Numeric Comparison values (mgmt
+    /// USER_CONFIRM_NEG_REPLY). The pump maps this to Pairing
+    /// Failed 0x0C (Numeric Comparison Failed, §3.5.5 table 3.7).
+    NumericComparisonRejected,
+    /// Passkey entry was cancelled on this side (mgmt
+    /// USER_PASSKEY_NEG_REPLY). The pump maps this to Pairing
+    /// Failed 0x01 (Passkey Entry Failed, §3.5.5 table 3.7).
+    PasskeyEntryFailed,
+    /// The peer claims OOB data for us (its OOB flag is set) but
+    /// this side never generated local OOB data to give it, so the
+    /// OOB authentication cannot run (§2.3.5.6.4 rule 3 needs our
+    /// own `r`, which only READ_LOCAL_OOB_DATA can mint). The
+    /// pump maps this to Pairing Failed 0x02 (OOB Not Available).
+    OobNotAvailable,
 }
 
 /// Phase 3 key-distribution helpers (Part H §3.6.1, §3.6.4–§3.6.6).
@@ -543,6 +656,35 @@ pub struct Initiator<C: SmpCrypto> {
     features: PairingFeatureExchange,
     /// Peer features captured from Pairing_Response.
     peer_features: PairingFeatureExchange,
+    /// Numeric Comparison value (only meaningful when method ==
+    /// NumericComparison). Application surfaces this to the user
+    /// for confirmation before [`Self::confirm_numeric_comparison`]
+    /// is called.
+    pub numeric_comparison: Option<u32>,
+    /// Passkey for Passkey Entry (typed in, or generated for
+    /// display). `None` until supplied or generated.
+    passkey: Option<u32>,
+    /// Peer's OOB data (mgmt ADD_REMOTE_OOB_DATA), if any.
+    /// Set before [`Self::start`] so the Pairing Request carries
+    /// the OOB flag.
+    peer_oob: Option<OobData>,
+    /// Our `r` for the f6 check values (§2.2.8 table 2.2): the
+    /// passkey as a 128-bit integer for Passkey Entry, our OOB
+    /// random for OOB, zero for Just Works / Numeric Comparison.
+    /// The DHKey Check we SEND uses the peer's `r`
+    /// ([`Self::r_peer`]); the peer's check we VERIFY uses this.
+    r_own: [u8; 16],
+    /// Peer's `r` for the f6 check values: the passkey as a
+    /// 128-bit integer for Passkey Entry, the peer's OOB
+    /// randomizer for OOB, zero for Just Works / Numeric
+    /// Comparison.
+    r_peer: [u8; 16],
+    /// Current passkey round (0..20, §2.3.5.6.3).
+    passkey_round: u8,
+    /// Attention raised exactly once when the session parks for
+    /// the user or generates a display passkey; the pump drains
+    /// it with [`Self::take_attention`].
+    attention_pending: Option<SmpAttention>,
     /// True when both sides negotiated bonding (both Bonding_Flags
     /// == 01). The pump stores a bond only when this is set; a
     /// non-bonded pairing's LTK lives for the connection only.
@@ -563,9 +705,27 @@ pub struct Initiator<C: SmpCrypto> {
 }
 
 impl<C: SmpCrypto> Initiator<C> {
+    /// Default initiator: NoInputNoOutput, no MITM — Just Works.
+    /// Use [`Self::with_io_capability`] to negotiate MITM methods.
     pub fn new(crypto: C, iat_addr: [u8; 7], rat_addr: [u8; 7]) -> Self {
+        Self::with_io_capability(crypto, iat_addr, rat_addr, IoCapability::NoInputNoOutput)
+    }
+
+    /// Initiator advertising `io`: the MITM bit is set exactly
+    /// when the capability can authenticate (anything but
+    /// NoInputNoOutput) — with no MITM bit, §2.3.5.1 says the IO
+    /// capabilities are ignored and Just Works is used, so
+    /// advertising a display/keyboard capability without MITM
+    /// could never negotiate a MITM method.
+    pub fn with_io_capability(
+        crypto: C,
+        iat_addr: [u8; 7],
+        rat_addr: [u8; 7],
+        io: IoCapability,
+    ) -> Self {
         let na = crypto.rand128();
         let (priv_key, pub_x, pub_y) = crypto.p256_keygen();
+        let mitm = io != IoCapability::NoInputNoOutput;
         Self {
             state: PairingState::Idle,
             method: PairingMethod::JustWorks,
@@ -584,9 +744,9 @@ impl<C: SmpCrypto> Initiator<C> {
             iat_addr,
             rat_addr,
             features: PairingFeatureExchange {
-                io_capability: IoCapability::NoInputNoOutput as u8,
+                io_capability: io as u8,
                 oob_data_flag: 0,
-                auth_req: AUTH_BONDING | AUTH_SC,
+                auth_req: AUTH_BONDING | AUTH_SC | if mitm { AUTH_MITM } else { 0 },
                 max_encryption_key_size: 16,
                 // Offer IdKey + Sign and request the same. The
                 // negotiated set is the intersection (§3.6.1: "The
@@ -604,6 +764,13 @@ impl<C: SmpCrypto> Initiator<C> {
                 initiator_key_distribution: 0,
                 responder_key_distribution: 0,
             },
+            numeric_comparison: None,
+            passkey: None,
+            peer_oob: None,
+            r_own: [0; 16],
+            r_peer: [0; 16],
+            passkey_round: 0,
+            attention_pending: None,
             bonded: false,
             dist_send: 0,
             dist_expect: 0,
@@ -611,6 +778,144 @@ impl<C: SmpCrypto> Initiator<C> {
             peer_irk: None,
             peer_identity_addr: None,
             peer_csrk: None,
+        }
+    }
+
+    /// Record the peer's OOB data (from mgmt ADD_REMOTE_OOB_DATA)
+    /// before [`Self::start`]: the Pairing Request advertises the
+    /// OOB flag, and the data authenticates the peer's public key
+    /// after the key exchange (§2.3.5.6.4).
+    pub fn set_peer_oob(&mut self, data: OobData) {
+        self.peer_oob = Some(data);
+        self.features.oob_data_flag = 1;
+    }
+
+    /// Drain the attention raised when this session parked for the
+    /// user or generated a display passkey. Returns `None` when
+    /// nothing is pending (including on repeat calls).
+    pub fn take_attention(&mut self) -> Option<SmpAttention> {
+        self.attention_pending.take()
+    }
+
+    /// Supply the passkey (mgmt USER_PASSKEY_REPLY) and, when the
+    /// session is parked in [`PairingState::WaitPasskey`], start
+    /// the §2.3.5.6.3 rounds. Returns the PDUs to send (round 0's
+    /// confirm when resuming). A passkey supplied while the
+    /// session is not parked is recorded for the rounds when they
+    /// start. Values above 999999 are rejected — a passkey is six
+    /// decimal digits (§2.3.5.3).
+    pub fn provide_passkey(&mut self, passkey: u32) -> Result<Vec<Pdu>, PairingError> {
+        if passkey > 999_999 {
+            return Err(PairingError::Protocol);
+        }
+        self.set_passkey(passkey);
+        if self.state != PairingState::WaitPasskey {
+            return Ok(Vec::new());
+        }
+        Ok(self.start_passkey_round())
+    }
+
+    /// Record a passkey and the f6 `r` values it implies (§2.2.8
+    /// table 2.2: both sides use the same passkey, so `r_own` and
+    /// `r_peer` are the same 128-bit integer).
+    fn set_passkey(&mut self, passkey: u32) {
+        self.passkey = Some(passkey);
+        let r = passkey_as_128(passkey);
+        self.r_own = r;
+        self.r_peer = r;
+    }
+
+    /// Generate the passkey this side displays (§2.3.5.3: randomly
+    /// generated per pairing, never reused) and record it.
+    fn generate_display_passkey(&mut self) -> u32 {
+        let rand = self.crypto.rand128();
+        let passkey = u32::from_le_bytes([rand[0], rand[1], rand[2], rand[3]]) % 1_000_000;
+        self.set_passkey(passkey);
+        passkey
+    }
+
+    /// Begin (or resume) the §2.3.5.6.3 rounds: pick a fresh
+    /// round nonce, commit to this round's passkey bit with
+    /// `Cai = f4(PKax, PKbx, Nai, rai)` (§2.2.6 table 2.1, Z =
+    /// 0x80 | bit), and park in PasskeyWaitConfirm.
+    fn start_passkey_round(&mut self) -> Vec<Pdu> {
+        let z = passkey_bit_z(self.passkey.unwrap_or(0), self.passkey_round);
+        self.na = self.crypto.rand128();
+        let ca = confirm_value(&self.crypto, &self.pub_x, &self.peer_pub_x, &self.na, z);
+        self.state = PairingState::PasskeyWaitConfirm;
+        alloc::vec![Pdu {
+            code: SMP_PAIRING_CONFIRM,
+            payload: ca.to_vec(),
+        }]
+    }
+
+    /// Answer the parked Numeric Comparison (§2.3.5.6.2 steps 7–8).
+    /// `accepted == true` releases the Pairing Random + DHKey
+    /// Check; `false` aborts the pairing with
+    /// [`PairingError::NumericComparisonRejected`] (the pump maps
+    /// it to Pairing Failed 0x0C). Only valid from
+    /// [`PairingState::WaitUserConfirm`].
+    pub fn confirm_numeric_comparison(&mut self, accepted: bool) -> Result<Vec<Pdu>, PairingError> {
+        if self.state != PairingState::WaitUserConfirm {
+            return Err(PairingError::Protocol);
+        }
+        if !accepted {
+            self.state = PairingState::Failed;
+            return Err(PairingError::NumericComparisonRejected);
+        }
+        self.state = PairingState::SentDhKeyCheck;
+        Ok(self.emit_random_and_dhkey_check())
+    }
+
+    /// Emit Pairing Random (Na) + the DHKey Check Ea (§2.3.5.6.5):
+    /// `Ea = f6(MacKey, Na, Nb, R, IOcapA, A, B)` with R the
+    /// peer's `r` (§2.2.8 table 2.2) — zero for Just Works /
+    /// Numeric Comparison, the peer's OOB randomizer for OOB, the
+    /// passkey for Passkey Entry.
+    fn emit_random_and_dhkey_check(&mut self) -> Vec<Pdu> {
+        let ea = dhkey_check_value(
+            &self.crypto,
+            &self.mac_key,
+            &DhKeyCheckInputs {
+                n1: &self.na,
+                n2: &self.nb,
+                r: &self.r_peer,
+                iocap: &iocap_bytes(&self.features),
+                a1: &self.iat_addr,
+                a2: &self.rat_addr,
+            },
+        );
+        alloc::vec![
+            Pdu {
+                code: SMP_PAIRING_RANDOM,
+                payload: self.na.to_vec(),
+            },
+            Pdu {
+                code: SMP_PAIRING_DHKEY_CHECK,
+                payload: ea.to_vec(),
+            },
+        ]
+    }
+
+    /// Our confirm value for the Just Works / Numeric Comparison /
+    /// OOB commitment step: `f4(own_pk, peer_pk, nonce, 0)` except
+    /// for OOB, where the confirm commits our own key to our own
+    /// random (`Ca = f4(PKax, PKax, ra, 0)`, §2.2.6 table 2.1).
+    fn own_confirm(&self, nonce: &[u8; 16], z: u8) -> [u8; 16] {
+        if self.method == PairingMethod::OutOfBand {
+            confirm_value(&self.crypto, &self.pub_x, &self.pub_x, nonce, z)
+        } else {
+            confirm_value(&self.crypto, &self.pub_x, &self.peer_pub_x, nonce, z)
+        }
+    }
+
+    /// The peer's confirm value we expect: `f4(peer_pk, own_pk,
+    /// nonce, 0)` except for OOB (`Cb = f4(PKbx, PKbx, rb, 0)`).
+    fn peer_confirm_want(&self, nonce: &[u8; 16], z: u8) -> [u8; 16] {
+        if self.method == PairingMethod::OutOfBand {
+            confirm_value(&self.crypto, &self.peer_pub_x, &self.peer_pub_x, nonce, z)
+        } else {
+            confirm_value(&self.crypto, &self.peer_pub_x, &self.pub_x, nonce, z)
         }
     }
 
@@ -639,11 +944,16 @@ impl<C: SmpCrypto> Initiator<C> {
             PairingState::WaitConfirm => self.on_pairing_confirm(rx),
             PairingState::WaitRandom => self.on_pairing_random(rx),
             PairingState::SentDhKeyCheck => self.on_dhkey_check(rx),
+            PairingState::PasskeyWaitConfirm => self.on_passkey_confirm(rx),
+            PairingState::PasskeyWaitRandom => self.on_passkey_random(rx),
             PairingState::WaitDistribution => self.on_distribution(rx),
             // AuthComplete parks the session until the pump
             // reports encryption. A distribution PDU here is
             // nonconformant (Phase 3 needs an encrypted link) —
-            // fail, do not buffer it.
+            // fail, do not buffer it. WaitUserConfirm /
+            // WaitPasskey park for the user; a peer PDU here is
+            // equally nonconformant — the peer must wait for our
+            // next move, not speak out of turn.
             _ => Err(PairingError::Protocol),
         }
     }
@@ -694,11 +1004,34 @@ impl<C: SmpCrypto> Initiator<C> {
 
         let mitm = (self.features.auth_req & AUTH_MITM) != 0 || (peer.auth_req & AUTH_MITM) != 0;
         let sc = (self.features.auth_req & AUTH_SC) != 0 && (peer.auth_req & AUTH_SC) != 0;
-        let oob = self.features.oob_data_flag != 0 && peer.oob_data_flag != 0;
+        // OOB is selected when ONE OR BOTH sides have OOB data
+        // (§2.3.5.1 table 2.7) — an AND here would silently
+        // downgrade one-direction OOB to the IO-capability table.
+        let oob = self.features.oob_data_flag != 0 || peer.oob_data_flag != 0;
         let local_io =
             IoCapability::from_u8(self.features.io_capability).ok_or(PairingError::Protocol)?;
         let peer_io = IoCapability::from_u8(peer.io_capability).ok_or(PairingError::Protocol)?;
         self.method = pick_pairing_method(local_io, peer_io, mitm, sc, oob);
+
+        if self.method == PairingMethod::OutOfBand {
+            // §2.3.5.6.4 rule 3: when the peer has no OOB data
+            // for us its flag is clear and our own `r` is zero.
+            // When its flag is set it holds OOB data we never
+            // minted (no READ_LOCAL_OOB_DATA yet) — the OOB
+            // authentication cannot run; fail instead of
+            // authenticating against a zero `r` we invented.
+            if peer.oob_data_flag == 0 {
+                self.r_own = [0; 16];
+            } else {
+                return Err(PairingError::OobNotAvailable);
+            }
+            // The peer's `r` is its OOB randomizer when we hold
+            // its OOB data, else zero (rule 1/2).
+            self.r_peer = self.peer_oob.map(|o| o.randomizer).unwrap_or([0; 16]);
+            // The random this side reveals in-band IS our `r`
+            // (Na = ra for the f5/f6 inputs, table 2.2).
+            self.na = self.r_own;
+        }
 
         // Negotiate bonding and Phase 3 distribution (§3.6.1).
         // Bonding requires both sides' Bonding_Flags == 01 (the
@@ -745,14 +1078,144 @@ impl<C: SmpCrypto> Initiator<C> {
             .crypto
             .p256_dh(&self.priv_key, &self.peer_pub_x, &self.peer_pub_y);
 
-        // Authentication stage 1 (§2.3.5.6.2): commit to both
-        // public keys and our nonce with Ca (§2.2.6 table 2.1)
-        // before Na is revealed to the responder.
-        let ca = confirm_value(&self.crypto, &self.pub_x, &self.peer_pub_x, &self.na, 0);
-        self.state = PairingState::WaitConfirm;
+        match self.method {
+            PairingMethod::PasskeyEntryInitiatorDisplays
+            | PairingMethod::PasskeyEntryResponderDisplays
+            | PairingMethod::PasskeyEntryBothInput => {
+                self.passkey_round = 0;
+                match self.method {
+                    // This side displays: generate the passkey,
+                    // notify the user, and start the rounds.
+                    PairingMethod::PasskeyEntryInitiatorDisplays => {
+                        let passkey = self.generate_display_passkey();
+                        self.attention_pending = Some(SmpAttention::PasskeyNotify(passkey));
+                        Ok(self.start_passkey_round())
+                    }
+                    // The passkey is typed in here: park until
+                    // provide_passkey resumes the rounds.
+                    _ => {
+                        if self.passkey.is_some() {
+                            Ok(self.start_passkey_round())
+                        } else {
+                            self.state = PairingState::WaitPasskey;
+                            self.attention_pending = Some(SmpAttention::PasskeyRequest);
+                            Ok(Vec::new())
+                        }
+                    }
+                }
+            }
+            PairingMethod::OutOfBand => {
+                // The peer's OOB hash binds its public key to
+                // the randomizer we received out of band
+                // (§2.3.5.6.4): `Cb_hash = f4(PKbx, PKbx, rb, 0)`.
+                // A mismatch means the OOB data is not this
+                // peer's — abort, do not authenticate.
+                if let Some(oob) = self.peer_oob {
+                    let want = confirm_value(
+                        &self.crypto,
+                        &self.peer_pub_x,
+                        &self.peer_pub_x,
+                        &oob.randomizer,
+                        0,
+                    );
+                    if want != oob.hash {
+                        self.state = PairingState::Failed;
+                        return Err(PairingError::BadConfirm);
+                    }
+                }
+                self.state = PairingState::WaitConfirm;
+                Ok(alloc::vec![Pdu {
+                    code: SMP_PAIRING_CONFIRM,
+                    payload: self.own_confirm(&self.r_own, 0).to_vec(),
+                }])
+            }
+            // Authentication stage 1 (§2.3.5.6.2): commit to both
+            // public keys and our nonce with Ca (§2.2.6 table 2.1)
+            // before Na is revealed to the responder.
+            _ => {
+                let ca = self.own_confirm(&self.na, 0);
+                self.state = PairingState::WaitConfirm;
+                Ok(alloc::vec![Pdu {
+                    code: SMP_PAIRING_CONFIRM,
+                    payload: ca.to_vec(),
+                }])
+            }
+        }
+    }
+
+    /// One passkey round's confirm step (§2.3.5.6.3): the peer's
+    /// round confirm arrived; commit our round random and send
+    /// it, then wait for the peer's round random.
+    fn on_passkey_confirm(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
+        if rx.code != SMP_PAIRING_CONFIRM {
+            return Err(PairingError::Protocol);
+        }
+        if rx.payload.len() < 16 {
+            return Err(PairingError::Protocol);
+        }
+        // Cbi cannot be checked yet — it commits the responder
+        // to Nbi, revealed by the next PDU.
+        self.peer_confirm.copy_from_slice(&rx.payload[..16]);
+        self.state = PairingState::PasskeyWaitRandom;
         Ok(alloc::vec![Pdu {
-            code: SMP_PAIRING_CONFIRM,
-            payload: ca.to_vec(),
+            code: SMP_PAIRING_RANDOM,
+            payload: self.na.to_vec(),
+        }])
+    }
+
+    /// One passkey round's random step (§2.3.5.6.3): the peer's
+    /// round random arrived; verify its round confirm against
+    /// this round's passkey bit, then either start the next
+    /// round or finish authentication stage 1 (Na = Na20,
+    /// Nb = Nb20 for stage 2).
+    fn on_passkey_random(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
+        if rx.code != SMP_PAIRING_RANDOM {
+            return Err(PairingError::Protocol);
+        }
+        if rx.payload.len() < 16 {
+            return Err(PairingError::Protocol);
+        }
+        self.nb.copy_from_slice(&rx.payload[..16]);
+        let z = passkey_bit_z(self.passkey.unwrap_or(0), self.passkey_round);
+        let want_cb = confirm_value(&self.crypto, &self.peer_pub_x, &self.pub_x, &self.nb, z);
+        if self.peer_confirm != want_cb {
+            self.state = PairingState::Failed;
+            return Err(PairingError::BadConfirm);
+        }
+        if self.passkey_round < 19 {
+            self.passkey_round += 1;
+            return Ok(self.start_passkey_round());
+        }
+        // Round 19 done: Na20/Nb20 are already in na/nb. Derive
+        // MacKey + LTK via f5 (§2.2.7), then the DHKey Check —
+        // stage 2 sends only the check (both round-20 randoms
+        // were already exchanged).
+        let (mac_key, ltk) = derive_mac_key_and_ltk(
+            &self.crypto,
+            &self.dh_key,
+            &self.na,
+            &self.nb,
+            &self.iat_addr,
+            &self.rat_addr,
+        );
+        self.mac_key = mac_key;
+        self.ltk = ltk;
+        let ea = dhkey_check_value(
+            &self.crypto,
+            &self.mac_key,
+            &DhKeyCheckInputs {
+                n1: &self.na,
+                n2: &self.nb,
+                r: &self.r_peer,
+                iocap: &iocap_bytes(&self.features),
+                a1: &self.iat_addr,
+                a2: &self.rat_addr,
+            },
+        );
+        self.state = PairingState::SentDhKeyCheck;
+        Ok(alloc::vec![Pdu {
+            code: SMP_PAIRING_DHKEY_CHECK,
+            payload: ea.to_vec(),
         }])
     }
 
@@ -781,9 +1244,10 @@ impl<C: SmpCrypto> Initiator<C> {
 
         // Verify Cb now that Nb is revealed (§2.2.6 table 2.1:
         // the responder's confirm takes the responder's key
-        // first). A mismatch aborts the pairing — the caller
-        // maps BadConfirm to Pairing Failed 0x04.
-        let want_cb = confirm_value(&self.crypto, &self.peer_pub_x, &self.pub_x, &self.nb, 0);
+        // first; for OOB it takes the responder's key twice).
+        // A mismatch aborts the pairing — the caller maps
+        // BadConfirm to Pairing Failed 0x04.
+        let want_cb = self.peer_confirm_want(&self.nb, 0);
         if self.peer_confirm != want_cb {
             self.state = PairingState::Failed;
             return Err(PairingError::BadConfirm);
@@ -801,32 +1265,29 @@ impl<C: SmpCrypto> Initiator<C> {
         self.mac_key = mac_key;
         self.ltk = ltk;
 
+        // Numeric Comparison (§2.3.5.6.2 steps 7–8): both sides
+        // display the g2 value and the user confirms they match
+        // BEFORE the DHKey Check leaves. Park here — the Random
+        // and DHKey Check wait for confirm_numeric_comparison.
+        if self.method == PairingMethod::NumericComparison {
+            let value = numeric_comparison_value(
+                &self.crypto,
+                &self.pub_x,
+                &self.peer_pub_x,
+                &self.na,
+                &self.nb,
+            );
+            self.numeric_comparison = Some(value);
+            self.state = PairingState::WaitUserConfirm;
+            self.attention_pending = Some(SmpAttention::UserConfirm(value));
+            return Ok(Vec::new());
+        }
+
         // Authentication stage 2 (§2.3.5.6.5): our DHKey Check
-        // Ea leaves with Na. Ea = f6(MacKey, Na, Nb, 0, IOcapA,
-        // A, B) per §2.2.8 table 2.2.
-        let ea = dhkey_check_value(
-            &self.crypto,
-            &self.mac_key,
-            &DhKeyCheckInputs {
-                n1: &self.na,
-                n2: &self.nb,
-                r: &[0u8; 16],
-                iocap: &iocap_bytes(&self.features),
-                a1: &self.iat_addr,
-                a2: &self.rat_addr,
-            },
-        );
+        // Ea leaves with Na. Ea = f6(MacKey, Na, Nb, R, IOcapA,
+        // A, B) per §2.2.8 table 2.2, with R the peer's `r`.
         self.state = PairingState::SentDhKeyCheck;
-        Ok(alloc::vec![
-            Pdu {
-                code: SMP_PAIRING_RANDOM,
-                payload: self.na.to_vec(),
-            },
-            Pdu {
-                code: SMP_PAIRING_DHKEY_CHECK,
-                payload: ea.to_vec(),
-            },
-        ])
+        Ok(self.emit_random_and_dhkey_check())
     }
 
     fn on_dhkey_check(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
@@ -836,17 +1297,20 @@ impl<C: SmpCrypto> Initiator<C> {
         if rx.payload.len() < 16 {
             return Err(PairingError::Protocol);
         }
-        // Verify Eb = f6(MacKey, Nb, Na, 0, IOcapB, B, A)
+        // Verify Eb = f6(MacKey, Nb, Na, R, IOcapB, B, A)
         // (§2.2.8 table 2.2) — the responder's form swaps both
-        // the nonce order and the address order. A mismatch
-        // aborts the pairing (Pairing Failed 0x0B at the caller).
+        // the nonce order and the address order, and R is our
+        // own `r` (zero for Just Works / Numeric Comparison, our
+        // OOB random for OOB, the passkey for Passkey Entry). A
+        // mismatch aborts the pairing (Pairing Failed 0x0B at the
+        // caller).
         let want_eb = dhkey_check_value(
             &self.crypto,
             &self.mac_key,
             &DhKeyCheckInputs {
                 n1: &self.nb,
                 n2: &self.na,
-                r: &[0u8; 16],
+                r: &self.r_own,
                 iocap: &iocap_bytes(&self.peer_features),
                 a1: &self.rat_addr,
                 a2: &self.iat_addr,
@@ -909,6 +1373,23 @@ pub enum ResponderState {
     SentPublicKey,
     SentRandom,
     WaitDhKeyCheck,
+    /// Numeric Comparison value computed and displayed; the
+    /// peer's DHKey Check must not be answered until the user
+    /// confirms the values match (§2.3.5.6.2 steps 7–8).
+    /// [`Responder::confirm_numeric_comparison`] resumes or
+    /// aborts.
+    WaitUserConfirm,
+    /// Passkey entry needs the passkey typed in on this side
+    /// (§2.3.5.3). [`Responder::provide_passkey`] resumes.
+    WaitPasskey,
+    /// Passkey round in flight (§2.3.5.6.3 steps 3–8): our
+    /// round confirm left, waiting for the initiator's round
+    /// random.
+    PasskeyWaitRandom,
+    /// Passkey round in flight: the initiator's round random
+    /// arrived and our round random left, waiting for the
+    /// initiator's next round confirm.
+    PasskeyWaitConfirm,
     /// Authentication (Phase 2) completed and keys are negotiated
     /// for distribution, but the link is not yet encrypted. Same
     /// parking state as [`PairingState::AuthComplete`]: the pump
@@ -951,6 +1432,29 @@ pub struct Responder<C: SmpCrypto> {
     /// NumericComparison). Application surfaces this to the user
     /// for confirmation.
     pub numeric_comparison: Option<u32>,
+    /// Passkey for Passkey Entry (typed in, or generated for
+    /// display). `None` until supplied or generated.
+    passkey: Option<u32>,
+    /// Peer's OOB data (mgmt ADD_REMOTE_OOB_DATA), if any.
+    peer_oob: Option<OobData>,
+    /// Our `r` for the f6 check values (§2.2.8 table 2.2): the
+    /// passkey as a 128-bit integer for Passkey Entry, our OOB
+    /// random for OOB, zero for Just Works / Numeric Comparison.
+    /// The check we SEND (Eb) uses the peer's `r`
+    /// ([`Self::r_peer`]); the peer's check we VERIFY (Ea) uses
+    /// this.
+    r_own: [u8; 16],
+    /// Peer's `r` for the f6 check values: the passkey as a
+    /// 128-bit integer for Passkey Entry, the peer's OOB
+    /// randomizer for OOB, zero for Just Works / Numeric
+    /// Comparison.
+    r_peer: [u8; 16],
+    /// Current passkey round (0..20, §2.3.5.6.3).
+    passkey_round: u8,
+    /// Attention raised exactly once when the session parks for
+    /// the user or generates a display passkey; the pump drains
+    /// it with [`Self::take_attention`].
+    attention_pending: Option<SmpAttention>,
     /// True when both sides negotiated bonding (both Bonding_Flags
     /// == 01). Same rule as [`Initiator::bonded`].
     pub bonded: bool,
@@ -969,9 +1473,25 @@ pub struct Responder<C: SmpCrypto> {
 }
 
 impl<C: SmpCrypto> Responder<C> {
+    /// Default responder: DisplayYesNo + MITM. Use
+    /// [`Self::with_io_capability`] to advertise another
+    /// capability.
     pub fn new(crypto: C, iat_addr: [u8; 7], rat_addr: [u8; 7]) -> Self {
+        Self::with_io_capability(crypto, iat_addr, rat_addr, IoCapability::DisplayYesNo)
+    }
+
+    /// Responder advertising `io`: the MITM bit is set exactly
+    /// when the capability can authenticate (anything but
+    /// NoInputNoOutput); see [`Initiator::with_io_capability`].
+    pub fn with_io_capability(
+        crypto: C,
+        iat_addr: [u8; 7],
+        rat_addr: [u8; 7],
+        io: IoCapability,
+    ) -> Self {
         let nb = crypto.rand128();
         let (priv_key, pub_x, pub_y) = crypto.p256_keygen();
+        let mitm = io != IoCapability::NoInputNoOutput;
         Self {
             state: ResponderState::Idle,
             method: PairingMethod::JustWorks,
@@ -990,9 +1510,9 @@ impl<C: SmpCrypto> Responder<C> {
             iat_addr,
             rat_addr,
             features_local: PairingFeatureExchange {
-                io_capability: IoCapability::DisplayYesNo as u8,
+                io_capability: io as u8,
                 oob_data_flag: 0,
-                auth_req: AUTH_BONDING | AUTH_SC | AUTH_MITM,
+                auth_req: AUTH_BONDING | AUTH_SC | if mitm { AUTH_MITM } else { 0 },
                 max_encryption_key_size: 16,
                 // Same offer as the initiator: IdKey + Sign, both
                 // directions. The negotiated set is the
@@ -1009,6 +1529,12 @@ impl<C: SmpCrypto> Responder<C> {
                 responder_key_distribution: 0,
             },
             numeric_comparison: None,
+            passkey: None,
+            peer_oob: None,
+            r_own: [0; 16],
+            r_peer: [0; 16],
+            passkey_round: 0,
+            attention_pending: None,
             bonded: false,
             dist_send: 0,
             dist_expect: 0,
@@ -1016,6 +1542,95 @@ impl<C: SmpCrypto> Responder<C> {
             peer_irk: None,
             peer_identity_addr: None,
             peer_csrk: None,
+        }
+    }
+
+    /// Record the peer's OOB data (from mgmt ADD_REMOTE_OOB_DATA)
+    /// before the Pairing Request arrives: the Pairing Response
+    /// advertises the OOB flag (§2.3.5.6.4).
+    pub fn set_peer_oob(&mut self, data: OobData) {
+        self.peer_oob = Some(data);
+        self.features_local.oob_data_flag = 1;
+    }
+
+    /// Drain the attention raised when this session parked for the
+    /// user or generated a display passkey. See
+    /// [`Initiator::take_attention`].
+    pub fn take_attention(&mut self) -> Option<SmpAttention> {
+        self.attention_pending.take()
+    }
+
+    /// Supply the passkey (mgmt USER_PASSKEY_REPLY) and, when the
+    /// session is parked in [`ResponderState::WaitPasskey`],
+    /// resume it (the responder waits for the initiator's round
+    /// confirm — no PDU leaves here). Values above 999999 are
+    /// rejected (§2.3.5.3: six decimal digits).
+    pub fn provide_passkey(&mut self, passkey: u32) -> Result<Vec<Pdu>, PairingError> {
+        if passkey > 999_999 {
+            return Err(PairingError::Protocol);
+        }
+        self.set_passkey(passkey);
+        if self.state != ResponderState::WaitPasskey {
+            return Ok(Vec::new());
+        }
+        self.state = ResponderState::PasskeyWaitConfirm;
+        Ok(Vec::new())
+    }
+
+    /// Record a passkey and the f6 `r` values it implies (§2.2.8
+    /// table 2.2 — both sides use the same passkey).
+    fn set_passkey(&mut self, passkey: u32) {
+        self.passkey = Some(passkey);
+        let r = passkey_as_128(passkey);
+        self.r_own = r;
+        self.r_peer = r;
+    }
+
+    /// Generate the passkey this side displays (§2.3.5.3) and
+    /// record it.
+    fn generate_display_passkey(&mut self) -> u32 {
+        let rand = self.crypto.rand128();
+        let passkey = u32::from_le_bytes([rand[0], rand[1], rand[2], rand[3]]) % 1_000_000;
+        self.set_passkey(passkey);
+        passkey
+    }
+
+    /// Answer the parked Numeric Comparison (§2.3.5.6.2 steps 7–8).
+    /// `accepted == true` moves the session to WaitDhKeyCheck so
+    /// the peer's DHKey Check is accepted; `false` aborts with
+    /// [`PairingError::NumericComparisonRejected`] (Pairing Failed
+    /// 0x0C at the pump). Only valid from
+    /// [`ResponderState::WaitUserConfirm`].
+    pub fn confirm_numeric_comparison(&mut self, accepted: bool) -> Result<Vec<Pdu>, PairingError> {
+        if self.state != ResponderState::WaitUserConfirm {
+            return Err(PairingError::Protocol);
+        }
+        if !accepted {
+            self.state = ResponderState::Failed;
+            return Err(PairingError::NumericComparisonRejected);
+        }
+        self.state = ResponderState::WaitDhKeyCheck;
+        Ok(Vec::new())
+    }
+
+    /// Our confirm value for the Just Works / Numeric Comparison /
+    /// OOB commitment step: `f4(own_pk, peer_pk, nonce, 0)` except
+    /// for OOB (`Cb = f4(PKbx, PKbx, rb, 0)`, §2.2.6 table 2.1).
+    fn own_confirm(&self, nonce: &[u8; 16], z: u8) -> [u8; 16] {
+        if self.method == PairingMethod::OutOfBand {
+            confirm_value(&self.crypto, &self.pub_x, &self.pub_x, nonce, z)
+        } else {
+            confirm_value(&self.crypto, &self.pub_x, &self.peer_pub_x, nonce, z)
+        }
+    }
+
+    /// The peer's confirm value we expect: `f4(peer_pk, own_pk,
+    /// nonce, 0)` except for OOB (`Ca = f4(PKax, PKax, ra, 0)`).
+    fn peer_confirm_want(&self, nonce: &[u8; 16], z: u8) -> [u8; 16] {
+        if self.method == PairingMethod::OutOfBand {
+            confirm_value(&self.crypto, &self.peer_pub_x, &self.peer_pub_x, nonce, z)
+        } else {
+            confirm_value(&self.crypto, &self.peer_pub_x, &self.pub_x, nonce, z)
         }
     }
 
@@ -1033,12 +1648,16 @@ impl<C: SmpCrypto> Responder<C> {
             ResponderState::Idle => self.on_request(rx),
             ResponderState::GotRequest => self.on_initiator_public_key(rx),
             ResponderState::SentPublicKey => self.on_pairing_confirm(rx),
+            ResponderState::PasskeyWaitConfirm => self.on_passkey_confirm(rx),
             ResponderState::SentRandom => self.on_pairing_random(rx),
+            ResponderState::PasskeyWaitRandom => self.on_passkey_random(rx),
             ResponderState::WaitDhKeyCheck => self.on_dhkey_check(rx),
             ResponderState::WaitDistribution => self.on_distribution(rx),
             // AuthComplete parks the session until the pump
             // reports encryption; a distribution PDU here is
             // nonconformant — fail, do not buffer it.
+            // WaitUserConfirm / WaitPasskey park for the user; a
+            // peer PDU here is equally nonconformant.
             _ => Err(PairingError::Protocol),
         }
     }
@@ -1088,7 +1707,9 @@ impl<C: SmpCrypto> Responder<C> {
         let mitm =
             (peer.auth_req & AUTH_MITM) != 0 || (self.features_local.auth_req & AUTH_MITM) != 0;
         let sc = (peer.auth_req & AUTH_SC) != 0 && (self.features_local.auth_req & AUTH_SC) != 0;
-        let oob = peer.oob_data_flag != 0 && self.features_local.oob_data_flag != 0;
+        // OOB is selected when ONE OR BOTH sides have OOB data
+        // (§2.3.5.1 table 2.7).
+        let oob = peer.oob_data_flag != 0 || self.features_local.oob_data_flag != 0;
         let local_io = IoCapability::from_u8(self.features_local.io_capability)
             .ok_or(PairingError::Protocol)?;
         let peer_io = IoCapability::from_u8(peer.io_capability).ok_or(PairingError::Protocol)?;
@@ -1097,6 +1718,23 @@ impl<C: SmpCrypto> Responder<C> {
         // signature is (initiator, responder, ...) so we pass peer
         // first since the peer started this exchange.
         self.method = pick_pairing_method(peer_io, local_io, mitm, sc, oob);
+
+        if self.method == PairingMethod::OutOfBand {
+            // §2.3.5.6.4 rule 3: when the peer has no OOB data
+            // for us its flag is clear and our own `r` is zero.
+            // When its flag is set it holds OOB data we never
+            // minted — fail instead of authenticating against an
+            // invented `r`.
+            if peer.oob_data_flag == 0 {
+                self.r_own = [0; 16];
+            } else {
+                return Err(PairingError::OobNotAvailable);
+            }
+            self.r_peer = self.peer_oob.map(|o| o.randomizer).unwrap_or([0; 16]);
+            // The random this side reveals in-band IS our `r`
+            // (Nb = rb for the f5/f6 inputs, table 2.2).
+            self.nb = self.r_own;
+        }
 
         // Negotiate bonding and Phase 3 distribution (§3.6.1),
         // mirrored from the initiator side: the responder's send
@@ -1133,6 +1771,24 @@ impl<C: SmpCrypto> Responder<C> {
             .crypto
             .p256_dh(&self.priv_key, &self.peer_pub_x, &self.peer_pub_y);
 
+        if self.method == PairingMethod::OutOfBand {
+            // The peer's OOB hash binds its public key to the
+            // randomizer we received out of band (§2.3.5.6.4).
+            if let Some(oob) = self.peer_oob {
+                let want = confirm_value(
+                    &self.crypto,
+                    &self.peer_pub_x,
+                    &self.peer_pub_x,
+                    &oob.randomizer,
+                    0,
+                );
+                if want != oob.hash {
+                    self.state = ResponderState::Failed;
+                    return Err(PairingError::BadConfirm);
+                }
+            }
+        }
+
         let mut pk = alloc::vec::Vec::with_capacity(64);
         pk.extend_from_slice(&self.pub_x);
         pk.extend_from_slice(&self.pub_y);
@@ -1140,8 +1796,105 @@ impl<C: SmpCrypto> Responder<C> {
             code: SMP_PAIRING_PUBLIC_KEY,
             payload: pk,
         };
-        self.state = ResponderState::SentPublicKey;
-        Ok(alloc::vec![out])
+        match self.method {
+            PairingMethod::PasskeyEntryInitiatorDisplays
+            | PairingMethod::PasskeyEntryResponderDisplays
+            | PairingMethod::PasskeyEntryBothInput => {
+                self.passkey_round = 0;
+                self.state = ResponderState::PasskeyWaitConfirm;
+                match self.method {
+                    // This side displays: generate the passkey
+                    // and notify the user; the rounds start when
+                    // the initiator's round confirm arrives.
+                    PairingMethod::PasskeyEntryResponderDisplays => {
+                        let passkey = self.generate_display_passkey();
+                        self.attention_pending = Some(SmpAttention::PasskeyNotify(passkey));
+                    }
+                    // The passkey is typed in here: park until
+                    // provide_passkey resumes the rounds.
+                    _ => {
+                        if self.passkey.is_none() {
+                            self.state = ResponderState::WaitPasskey;
+                            self.attention_pending = Some(SmpAttention::PasskeyRequest);
+                        }
+                    }
+                }
+                Ok(alloc::vec![out])
+            }
+            _ => {
+                self.state = ResponderState::SentPublicKey;
+                Ok(alloc::vec![out])
+            }
+        }
+    }
+
+    /// One passkey round's confirm step (§2.3.5.6.3): the
+    /// initiator's round confirm arrived; commit our round
+    /// confirm and park until its round random arrives.
+    fn on_passkey_confirm(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
+        if rx.code != SMP_PAIRING_CONFIRM {
+            return Err(PairingError::Protocol);
+        }
+        if rx.payload.len() < 16 {
+            return Err(PairingError::Protocol);
+        }
+        self.peer_confirm.copy_from_slice(&rx.payload[..16]);
+        let z = passkey_bit_z(self.passkey.unwrap_or(0), self.passkey_round);
+        self.nb = self.crypto.rand128();
+        let cb = confirm_value(&self.crypto, &self.pub_x, &self.peer_pub_x, &self.nb, z);
+        self.state = ResponderState::PasskeyWaitRandom;
+        Ok(alloc::vec![Pdu {
+            code: SMP_PAIRING_CONFIRM,
+            payload: cb.to_vec(),
+        }])
+    }
+
+    /// One passkey round's random step (§2.3.5.6.3): the
+    /// initiator's round random arrived; verify its round
+    /// confirm against this round's passkey bit, reveal our
+    /// round random, then either wait for the next round confirm
+    /// or finish authentication stage 1 (Na = Na20, Nb = Nb20
+    /// for stage 2).
+    fn on_passkey_random(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
+        if rx.code != SMP_PAIRING_RANDOM {
+            return Err(PairingError::Protocol);
+        }
+        if rx.payload.len() < 16 {
+            return Err(PairingError::Protocol);
+        }
+        self.na.copy_from_slice(&rx.payload[..16]);
+        let z = passkey_bit_z(self.passkey.unwrap_or(0), self.passkey_round);
+        let want_ca = confirm_value(&self.crypto, &self.peer_pub_x, &self.pub_x, &self.na, z);
+        if self.peer_confirm != want_ca {
+            self.state = ResponderState::Failed;
+            return Err(PairingError::BadConfirm);
+        }
+        if self.passkey_round < 19 {
+            self.passkey_round += 1;
+            self.state = ResponderState::PasskeyWaitConfirm;
+            return Ok(alloc::vec![Pdu {
+                code: SMP_PAIRING_RANDOM,
+                payload: self.nb.to_vec(),
+            }]);
+        }
+        // Round 19 done: Na20/Nb20 are already in na/nb. Derive
+        // MacKey + LTK via f5 (§2.2.7) and wait for the
+        // initiator's DHKey Check.
+        let (mac_key, ltk) = derive_mac_key_and_ltk(
+            &self.crypto,
+            &self.dh_key,
+            &self.na,
+            &self.nb,
+            &self.iat_addr,
+            &self.rat_addr,
+        );
+        self.mac_key = mac_key;
+        self.ltk = ltk;
+        self.state = ResponderState::WaitDhKeyCheck;
+        Ok(alloc::vec![Pdu {
+            code: SMP_PAIRING_RANDOM,
+            payload: self.nb.to_vec(),
+        }])
     }
 
     fn on_pairing_confirm(&mut self, rx: &Pdu) -> Result<Vec<Pdu>, PairingError> {
@@ -1154,10 +1907,12 @@ impl<C: SmpCrypto> Responder<C> {
         self.peer_confirm.copy_from_slice(&rx.payload[..16]);
 
         // Commit Cb and reveal Nb together (§2.3.5.6.2). Our
-        // confirm takes our own key first (§2.2.6 table 2.1).
-        // Ca itself is verified when Na arrives — a commitment
-        // cannot be checked before its nonce is revealed.
-        let cb = confirm_value(&self.crypto, &self.pub_x, &self.peer_pub_x, &self.nb, 0);
+        // confirm takes our own key first (§2.2.6 table 2.1);
+        // for OOB it takes our own key twice and the nonce is
+        // our `r`. Ca itself is verified when Na arrives — a
+        // commitment cannot be checked before its nonce is
+        // revealed.
+        let cb = self.own_confirm(&self.nb, 0);
         self.state = ResponderState::SentRandom;
         Ok(alloc::vec![
             Pdu {
@@ -1182,27 +1937,18 @@ impl<C: SmpCrypto> Responder<C> {
 
         // Verify the initiator's commitment Ca now that Na is
         // revealed (§2.2.6 table 2.1: Ca takes the initiator's
-        // key first). A mismatch aborts the pairing — the caller
-        // maps BadConfirm to Pairing Failed 0x04.
-        let want_ca = confirm_value(&self.crypto, &self.peer_pub_x, &self.pub_x, &self.na, 0);
+        // key first; for OOB it takes the initiator's key twice).
+        // A mismatch aborts the pairing — the caller maps
+        // BadConfirm to Pairing Failed 0x04.
+        let want_ca = self.peer_confirm_want(&self.na, 0);
         if self.peer_confirm != want_ca {
             self.state = ResponderState::Failed;
             return Err(PairingError::BadConfirm);
         }
 
-        // Compute Numeric Comparison value if that's the negotiated
-        // method — application confirms before we mark Done.
-        if self.method == PairingMethod::NumericComparison {
-            self.numeric_comparison = Some(numeric_comparison_value(
-                &self.crypto,
-                &self.peer_pub_x,
-                &self.pub_x,
-                &self.na,
-                &self.nb,
-            ));
-        }
-
-        // Derive MacKey + LTK via f5 (§2.2.7).
+        // Derive MacKey + LTK via f5 (§2.2.7) before any park:
+        // the MacKey must be live when the peer's DHKey Check
+        // arrives after the user confirms.
         let (mac_key, ltk) = derive_mac_key_and_ltk(
             &self.crypto,
             &self.dh_key,
@@ -1213,6 +1959,26 @@ impl<C: SmpCrypto> Responder<C> {
         );
         self.mac_key = mac_key;
         self.ltk = ltk;
+
+        // Compute Numeric Comparison value if that's the negotiated
+        // method — application confirms before we answer the
+        // peer's DHKey Check.
+        if self.method == PairingMethod::NumericComparison {
+            self.numeric_comparison = Some(numeric_comparison_value(
+                &self.crypto,
+                &self.peer_pub_x,
+                &self.pub_x,
+                &self.na,
+                &self.nb,
+            ));
+            // Park for the user's confirmation (§2.3.5.6.2 steps
+            // 7–8): the peer's DHKey Check must not be answered
+            // until confirm_numeric_comparison runs.
+            self.state = ResponderState::WaitUserConfirm;
+            self.attention_pending =
+                Some(SmpAttention::UserConfirm(self.numeric_comparison.unwrap()));
+            return Ok(Vec::new());
+        }
 
         self.state = ResponderState::WaitDhKeyCheck;
         Ok(Vec::new())
@@ -1225,16 +1991,18 @@ impl<C: SmpCrypto> Responder<C> {
         if rx.payload.len() < 16 {
             return Err(PairingError::Protocol);
         }
-        // Verify Ea = f6(MacKey, Na, Nb, 0, IOcapA, A, B)
-        // (§2.2.8 table 2.2). A mismatch aborts the pairing
-        // (Pairing Failed 0x0B at the caller).
+        // Verify Ea = f6(MacKey, Na, Nb, R, IOcapA, A, B)
+        // (§2.2.8 table 2.2), with R our own `r` (zero for Just
+        // Works / Numeric Comparison, our OOB random for OOB, the
+        // passkey for Passkey Entry). A mismatch aborts the
+        // pairing (Pairing Failed 0x0B at the caller).
         let want_ea = dhkey_check_value(
             &self.crypto,
             &self.mac_key,
             &DhKeyCheckInputs {
                 n1: &self.na,
                 n2: &self.nb,
-                r: &[0u8; 16],
+                r: &self.r_own,
                 iocap: &iocap_bytes(&self.features_peer),
                 a1: &self.iat_addr,
                 a2: &self.rat_addr,
@@ -1244,14 +2012,15 @@ impl<C: SmpCrypto> Responder<C> {
             self.state = ResponderState::Failed;
             return Err(PairingError::BadDhKeyCheck);
         }
-        // Answer with Eb — the swapped form (§2.2.8 table 2.2).
+        // Answer with Eb — the swapped form (§2.2.8 table 2.2),
+        // with R the peer's `r`.
         let eb = dhkey_check_value(
             &self.crypto,
             &self.mac_key,
             &DhKeyCheckInputs {
                 n1: &self.nb,
                 n2: &self.na,
-                r: &[0u8; 16],
+                r: &self.r_peer,
                 iocap: &iocap_bytes(&self.features_local),
                 a1: &self.rat_addr,
                 a2: &self.iat_addr,
