@@ -101,6 +101,8 @@ fn fake_controller(oncs: u16, nsze: u64, cqe0_status: u16) -> Option<FakeCtrl> {
         cq_phase: 1,
         db_stride: 4,
         next_cid: 0,
+        stray_aer: [0; 4],
+        stray_aer_len: 0,
     });
     ctrl.io_queue_locks.push(IrqSafeSpinLock::new(()));
     Some(FakeCtrl {

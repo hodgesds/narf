@@ -826,6 +826,17 @@ fn recovery_verdict(
     RecoveryVerdict::Unchanged
 }
 
+/// What one [`Controller::drain_aer_events`] pass found.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AerDrain {
+    /// AER completions processed (stashed + live-CQ).
+    pub drained: u8,
+    /// At least one drained event was a namespace-attribute-changed
+    /// Notice: the namespace set may have changed and the caller
+    /// should rescan (see [`Controller::rescan_namespaces`]).
+    pub ns_changed: bool,
+}
+
 impl Controller {
     /// Skeleton constructor — used by the original
     /// `smoke_nvme_probe_stub_surfaces_not_implemented` test which
@@ -2219,7 +2230,7 @@ impl Controller {
     }
 
     /// Probe-time I/O queue setup (#928): negotiate the queue count
-    /// + create the per-queue MSI-X pairs, falling back to the
+    /// and create the per-queue MSI-X pairs, falling back to the
     /// single polled pair when MSI-X is unavailable or the
     /// controller refuses the negotiation. The fallback runs only
     /// on [`NvmeError::Msix`], which
@@ -2657,17 +2668,6 @@ impl Controller {
     }
 
     // ── Admin: AER drain ──────────────────────────────────────────────
-
-/// What one [`Controller::drain_aer_events`] pass found.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct AerDrain {
-    /// AER completions processed (stashed + live-CQ).
-    pub drained: u8,
-    /// At least one drained event was a namespace-attribute-changed
-    /// Notice: the namespace set may have changed and the caller
-    /// should rescan (see [`Controller::rescan_namespaces`]).
-    pub ns_changed: bool,
-}
 
     /// Drain all currently-completed Async Event Request completions
     /// from the admin CQ and repost a fresh AER for each one drained,
