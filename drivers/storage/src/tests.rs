@@ -1190,6 +1190,31 @@ fn smoke_sd_r7_check_pattern() -> TestResult {
 }
 kernel_test_in!("drivers/storage/sd-proto", smoke_sd_r7_check_pattern);
 
+fn smoke_sd_scr_bus_widths() -> TestResult {
+    use crate::sd_proto::Scr;
+    // SCR bytes in wire order: SD_SPEC 2 (v2.00) in byte 0,
+    // SD_BUS_WIDTHS 0x5 (1-bit + 4-bit) in byte 1.
+    let scr = Scr::parse(&[0x02, 0x05, 0, 0, 0, 0, 0, 0]);
+    if scr.sd_spec != 2 {
+        return TestResult::Fail("SD_SPEC must be the high nibble of byte 0");
+    }
+    if scr.bus_widths != 0x05 || !scr.supports_4bit() {
+        return TestResult::Fail("bus widths 0x5 must report 4-bit support");
+    }
+    // 1-bit-only card: widths 0x1, no 4-bit.
+    let narrow = Scr::parse(&[0x02, 0x01, 0, 0, 0, 0, 0, 0]);
+    if narrow.bus_widths != 0x01 || narrow.supports_4bit() {
+        return TestResult::Fail("bus widths 0x1 must not report 4-bit support");
+    }
+    // Blank SCR: no widths at all.
+    let blank = Scr::parse(&[0; 8]);
+    if blank.sd_spec != 0 || blank.bus_widths != 0 || blank.supports_4bit() {
+        return TestResult::Fail("blank SCR must parse as no capabilities");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/sd-proto", smoke_sd_scr_bus_widths);
+
 fn smoke_sd_csd_v2_extracts_capacity() -> TestResult {
     use crate::sd_proto::Csd;
     // Build a CSD v2.0 image where C_SIZE = 0x1DFFF (122879) →

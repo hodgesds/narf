@@ -110,6 +110,45 @@ impl R7 {
     }
 }
 
+/// Decoded SCR register (SD Physical Layer Simplified Specification
+/// v4.10, Table 5-17 SCR fields / Table 5-21 supported bus widths).
+/// The 64-bit register arrives MSB-first over the data lines
+/// (ACMD51 SEND_SCR, 8-byte data block); `bytes[0]` is the most
+/// significant byte: SCR_STRUCTURE [63:60] | SD_SPEC [59:56] in
+/// `bytes[0]`, DATA_STAT_AFTER_ERASE [55] | SD_SECURITY [54:52] |
+/// SD_BUS_WIDTHS [51:48] in `bytes[1]`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Scr {
+    /// SD physical-layer spec version the card claims (SD_SPEC
+    /// field, bits [59:56]): 0 = v1.0–1.01, 1 = v1.10, 2 = v2.00,
+    /// 3 = v3.0x, 4 = v4.0x.
+    pub sd_spec: u8,
+    /// SD_BUS_WIDTHS field, bits [51:48]: bit 0 = 1-bit bus,
+    /// bit 2 = 4-bit bus.
+    pub bus_widths: u8,
+}
+
+impl Scr {
+    /// 1-bit bus supported (SD_BUS_WIDTHS bit 0).
+    pub const BUS_WIDTH_1: u8 = 1 << 0;
+    /// 4-bit bus supported (SD_BUS_WIDTHS bit 2).
+    pub const BUS_WIDTH_4: u8 = 1 << 2;
+
+    /// Parse the 8-byte SCR in wire order (byte 0 first).
+    pub fn parse(bytes: &[u8; 8]) -> Self {
+        Self {
+            sd_spec: (bytes[0] >> 4) & 0x0F,
+            bus_widths: bytes[1] & 0x0F,
+        }
+    }
+
+    /// True when the card reports a 4-bit data bus (SD_BUS_WIDTHS
+    /// bit 2) — the precondition for ACMD6 SET_BUS_WIDTH to 4-bit.
+    pub const fn supports_4bit(self) -> bool {
+        self.bus_widths & Self::BUS_WIDTH_4 != 0
+    }
+}
+
 /// Decoded CID register (§5.2). 16 bytes, but most controllers
 /// hand back 4 × u32 with the CRC7 + end bit dropped, so we treat
 /// the 128 logical bits as `[u32;4]` in big-endian word order:
