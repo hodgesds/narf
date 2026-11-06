@@ -10665,8 +10665,10 @@ fn smoke_uvc_v4l2_controls_from_descriptors_e2e() -> TestResult {
     if !narf_drivers_video::devfs_bridge::set_control_ops(node, uvc_fixture_control_ops()) {
         return TestResult::Fail("installing fixture control hooks failed");
     }
-    let dev = narf_drivers_video::devfs_bridge::get_device(node)
-        .ok_or("registered video device missing")?;
+    let dev = match narf_drivers_video::devfs_bridge::get_device(node) {
+        Some(dev) => dev,
+        None => return TestResult::Fail("registered video device missing"),
+    };
     // The node advertises exactly the 9 mapped controls, in PU-then-
     // CT selector order — the 12 advertised bitmap bits minus the 3
     // with no V4L2 integer mapping (scanning, pan/tilt-absolute,
