@@ -90,8 +90,10 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt;
 
 use narf_hid::descriptor::{FieldKind, ReportDescriptor};
 use narf_input::rmi4::{PdtEntry, TouchpadReport};
@@ -1005,6 +1007,28 @@ pub enum RmiElanKind {
     },
 }
 
+// Manual `Debug`: the boxed trait objects (`dyn Rmi4Transport` /
+// `dyn ElanHidIo`) are not `Debug`, and `Debug` is not an auto
+// trait so it cannot be added to the `dyn` bounds (E0225) — a
+// derived impl would fail. The transport / io fields are omitted.
+impl fmt::Debug for RmiElanKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rmi { probe, .. } => f
+                .debug_struct("Rmi")
+                .field("probe", probe)
+                .finish_non_exhaustive(),
+            Self::Elan {
+                params, quirks, ..
+            } => f
+                .debug_struct("Elan")
+                .field("params", params)
+                .field("quirks", quirks)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 /// One bound USB-HID RMI4 / Elan touchpad. Held in the global
 /// [`RMI_ELAN_DEVICES`] registry; the supervisor's pump cycle
 /// drains reports off each.
@@ -1029,6 +1053,23 @@ pub struct RmiElanBinding {
     pub(crate) evdev_id: DeviceId,
     /// evdev DeviceNode — MT frames dispatched here.
     pub(crate) evdev_node: Arc<DeviceNode>,
+}
+
+impl fmt::Debug for RmiElanBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RmiElanBinding")
+            .field("slot_id", &self.slot_id)
+            .field("in_dci", &self.in_dci)
+            .field("interface_num", &self.interface_num)
+            .field("hub_port", &self.hub_port)
+            .field("kind", &self.kind)
+            .field("pump", &self.pump)
+            .field("x_range", &self.x_range)
+            .field("y_range", &self.y_range)
+            .field("evdev_id", &self.evdev_id)
+            .field("evdev_node", &self.evdev_node)
+            .finish()
+    }
 }
 
 /// Bound RMI/Elan touchpads, one registry per xHCI controller.
@@ -1520,7 +1561,10 @@ pub fn set_mute_led_for_slot(controller: u8, slot_id: u8, on: bool) -> bool {
         return false;
     }
     let mut g = io.lock();
-    elan::set_mute_led(&mut **g, on).is_ok()
+    // `elan::set_mute_led` is generic over `T: ElanHidIo` (implicitly
+    // `Sized`), so it cannot take `&mut dyn ElanHidIo` here; call the
+    // trait method directly — identical body (encode + `set_feature`).
+    g.set_feature(&elan::encode_mute_led(on)).is_ok()
 }
 
 #[doc(hidden)]
