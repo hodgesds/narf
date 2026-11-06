@@ -121,9 +121,12 @@
 //! [`classic_inquiry_mode`] expose the state for a future
 //! mgmt/userspace trigger lane. What this deliberately does
 //! NOT do: SSP pairing initiation on the paged link (#888 covers
-//! pairing), or SCO setup after connect (#817) — the connection is
-//! tracked like any other pump connection and torn down on
-//! Disconnection Complete.
+//! pairing). SCO setup after connect is the AF_BLUETOOTH SCO socket
+//! path (issue #814): [`sco_connect`] pages when needed and issues
+//! `HCI_Setup_Synchronous_Connection` (§7.1.26) on the ACL handle,
+//! completing on Synchronous Connection Complete (§7.7.35); SCO
+//! frames ride the transport's `send_sco` / `recv_sco` (#817) and
+//! are staged per link for [`drain_sco_rx`].
 //!
 //! ## Lifecycle
 //!
@@ -145,7 +148,9 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_filesystem::bluetooth::{BtConnectStatus, BtRegisterStatus, BtSendError};
+use narf_filesystem::bluetooth::{
+    BtConnectStatus, BtRegisterStatus, BtScoConnectResult, BtSendError,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::att;
@@ -160,7 +165,7 @@ use crate::event::{
     LeChannelSelectionAlgorithm, LeConnectionComplete, LeEnhancedConnectionComplete,
     LeLongTermKeyRequest, LePeriodicAdvReport, LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost,
     LePeriodicAdvSyncTransferReceived, LeScanRequestReceived, LeScanTimeout,
-    NumberOfCompletedPackets, RemoteNameRequestComplete,
+    NumberOfCompletedPackets, RemoteNameRequestComplete, SyncConnectionComplete,
 };
 use crate::gap::{
     self, AdvertisingSetPhase, CentralPhase, ExtendedScannerPhase, PeriodicAdvertiserPhase,
@@ -168,7 +173,7 @@ use crate::gap::{
 };
 use crate::gatt_client::{self, GattClientError};
 use crate::gatt_server::GattServer;
-use crate::hci::{AclData, Command, Event};
+use crate::hci::{AclData, Command, Event, ScoData};
 use crate::hogp::HidInformation;
 use crate::hogp_client::{HogpClient, HogpHandles};
 use crate::l2cap::{
@@ -370,6 +375,8 @@ pub struct PumpStats {
     pub frames_dropped_no_credit: u64,
     pub socket_events_dropped: u64,
     pub transport_errors: u64,
+    /// SCO frames received from the transport and staged on a link.
+    pub sco_received: u64,
 }
 
 /// Work performed by one [`pump_once`] step.
@@ -379,11 +386,17 @@ pub struct PumpStep {
     pub acl_received: u32,
     pub acl_sent: u32,
     pub commands_sent: u32,
+    /// SCO frames received from the transport and staged on a link.
+    pub sco_received: u32,
 }
 
 impl PumpStep {
     pub fn is_idle(&self) -> bool {
-        self.events == 0 && self.acl_received == 0 && self.acl_sent == 0 && self.commands_sent == 0
+        self.events == 0
+            && self.acl_received == 0
+            && self.acl_sent == 0
+            && self.commands_sent == 0
+            && self.sco_received == 0
     }
 }
 
@@ -550,6 +563,57 @@ impl Connection {
     }
 }
 
+// ── SCO link state (issue #814) ─────────────────────────────────────
+
+/// One established SCO/eSCO link: the Synchronous Connection
+/// Complete's handle + negotiated lengths, the ACL handle it rides
+/// on, and staged inbound frames.
+#[derive(Debug)]
+struct ScoLink {
+    /// SCO connection handle (from Synchronous Connection Complete).
+    handle: u16,
+    /// ACL connection handle this SCO link rides on.
+    acl_handle: u16,
+    /// Peer bdaddr (wire order).
+    peer: [u8; 6],
+    /// Voice setting the link was opened with (socket BT_VOICE).
+    voice_setting: u16,
+    /// Negotiated packet lengths from Synchronous Connection Complete.
+    tx_packet_length: u16,
+    rx_packet_length: u16,
+    /// SCO MTU for send (controller Read Buffer Size SCO MTU, 60
+    /// when unset — Linux `sco_conn_add`).
+    mtu: u16,
+    /// Peer class of device (SCO_CONNINFO; zeros when unknown).
+    dev_class: [u8; 3],
+    /// Staged inbound SCO payloads awaiting `drain_sco_rx`.
+    rx: VecDeque<Vec<u8>>,
+    /// Claimed by a socket's `sco_connect_status` poll. A link is
+    /// claimed at most once: a second socket connecting to the same
+    /// peer gets AlreadyConnected until the link goes away.
+    claimed: bool,
+}
+
+/// Outbound SCO setup in flight (at most one per controller — the
+/// classic phase machine pages one peer at a time).
+#[derive(Debug)]
+struct PendingSco {
+    /// Peer bdaddr (wire order).
+    peer: [u8; 6],
+    /// Voice setting the socket asked for.
+    voice_setting: u16,
+    /// ACL handle once the peer's ACL connection is up; None while paging.
+    acl_handle: Option<u16>,
+    /// Setup Synchronous Connection already issued; awaiting
+    /// Synchronous Connection Complete.
+    setup_sent: bool,
+    /// Terminal outcome recorded once the setup can no longer
+    /// complete (refused Setup Sync, failed page, dead ACL, dead
+    /// transport). Consumed by `sco_connect_status` / a re-entered
+    /// `sco_connect`, which report it verbatim.
+    failed: Option<BtScoConnectResult>,
+}
+
 // ── Pump core ───────────────────────────────────────────────────────
 
 /// The dispatch state for one controller. Owned by the registry slot
@@ -676,6 +740,13 @@ pub struct PumpCore {
     pending_acl: VecDeque<Vec<u8>>,
     /// Controller-wide ACL packets currently with the controller.
     acl_in_flight: u32,
+    /// Established SCO links (issue #814): one per peer, owned by
+    /// the AF_BLUETOOTH SCO socket that connected it. A link's SCO
+    /// handle dies with its ACL connection (Disconnection Complete
+    /// removes both).
+    sco_links: Vec<ScoLink>,
+    /// Outbound SCO setup in flight.
+    pending_sco: Option<PendingSco>,
     stats: PumpStats,
 }
 
@@ -697,6 +768,8 @@ impl fmt::Debug for PumpCore {
             .field("outbound", &self.outbound.len())
             .field("pending_acl", &self.pending_acl.len())
             .field("acl_in_flight", &self.acl_in_flight)
+            .field("sco_links", &self.sco_links.len())
+            .field("pending_sco", &self.pending_sco.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -751,6 +824,8 @@ impl PumpCore {
             next_signal_ident: 0,
             pending_acl: VecDeque::new(),
             acl_in_flight: 0,
+            sco_links: Vec::new(),
+            pending_sco: None,
             stats: PumpStats::default(),
         }
     }
@@ -1868,6 +1943,337 @@ impl PumpCore {
                 self.outbound[pos].state = OutboundState::Failed;
             }
             _ => {}
+        }
+    }
+
+    // ── SCO socket backend (issue #814) ─────────────────────────────
+
+    /// SCO MTU for send: the controller's Read Buffer Size SCO MTU,
+    /// 60 when bring-up left it unset (Linux `sco_conn_add`).
+    fn sco_mtu(&self) -> u16 {
+        if self.info.sco_data_mtu > 0 {
+            u16::from(self.info.sco_data_mtu)
+        } else {
+            60
+        }
+    }
+
+    /// Peer class of device from the classic peer table (inquiry
+    /// result); zeros when the peer was never discovered.
+    fn sco_peer_class(&self, peer: &[u8; 6]) -> [u8; 3] {
+        self.classic
+            .peer(peer)
+            .map(|p| p.class_of_device)
+            .unwrap_or([0; 3])
+    }
+
+    /// ACL handle of the live BR/EDR connection to `peer`, if any.
+    fn acl_handle_for_peer(&self, peer: &[u8; 6]) -> Option<u16> {
+        self.connections
+            .iter()
+            .find(|c| !c.le && c.peer_addr[1..7] == *peer)
+            .map(|c| c.handle)
+    }
+
+    /// Issue HCI_Setup_Synchronous_Connection (§7.1.26) on `handle`
+    /// with the socket's voice setting. Bandwidth 8 kHz both ways,
+    /// latency don't-care, retransmission effort 0x02 (HFP CVSD
+    /// preferred), all SCO+eSCO packet types
+    /// (`ESCO_PACKET_TYPES_ALL` — the in-tree generic default).
+    fn issue_setup_sync(&mut self, handle: u16, voice_setting: u16) -> Result<(), TransportError> {
+        let cmd = classic::build_setup_synchronous_connection(
+            handle,
+            classic::SCO_BANDWIDTH_8KHZ,
+            classic::SCO_BANDWIDTH_8KHZ,
+            0xFFFF,
+            voice_setting,
+            0x02,
+            classic::ESCO_PACKET_TYPES_ALL,
+        );
+        self.send_command_obj(&cmd)
+    }
+
+    /// Consume a recorded terminal failure for `peer`'s pending
+    /// setup, clearing the pending slot. `None` when no failed
+    /// setup for this peer exists.
+    fn take_pending_sco_failure(&mut self, peer: [u8; 6]) -> Option<BtScoConnectResult> {
+        if self
+            .pending_sco
+            .as_ref()
+            .is_some_and(|p| p.peer == peer && p.failed.is_some())
+        {
+            let pending = self.pending_sco.take().unwrap();
+            return pending.failed;
+        }
+        None
+    }
+
+    /// Record a terminal failure on the in-flight SCO setup (at most
+    /// one setup runs per controller) and publish a channel event so
+    /// a parked connect(2) wakes and re-polls. No-op when no setup
+    /// is in flight or one already failed.
+    fn fail_pending_sco(&mut self, result: BtScoConnectResult) {
+        if let Some(pending) = self.pending_sco.as_mut() {
+            if pending.failed.is_none() {
+                pending.failed = Some(result);
+                narf_filesystem::bluetooth::publish_bt_channel_event();
+            }
+        }
+    }
+
+    /// Record a terminal HCI-status failure on the in-flight setup.
+    fn fail_pending_sco_status(&mut self, status: u8) {
+        self.fail_pending_sco(BtScoConnectResult::Refused(status));
+    }
+
+    /// The ACL to `peer` just came up: if an outbound SCO setup is
+    /// waiting on its page, issue Setup Synchronous Connection on
+    /// the new handle. A refused command fails the setup.
+    fn maybe_issue_pending_sco_setup(&mut self, peer: &[u8; 6], handle: u16) {
+        let Some(pending) = &self.pending_sco else {
+            return;
+        };
+        if pending.peer != *peer || pending.setup_sent || pending.failed.is_some() {
+            return;
+        }
+        let voice_setting = pending.voice_setting;
+        match self.issue_setup_sync(handle, voice_setting) {
+            Ok(()) => {
+                if let Some(pending) = self.pending_sco.as_mut() {
+                    pending.acl_handle = Some(handle);
+                    pending.setup_sent = true;
+                }
+            }
+            Err(_) => self.fail_pending_sco(BtScoConnectResult::Transport),
+        }
+    }
+
+    /// Complete an outbound SCO setup on Synchronous Connection
+    /// Complete (§7.7.35). Status 0 with a matching pending setup
+    /// records the link (claimed by the socket's status poll); a
+    /// refusal fails the pending setup. A completion with no
+    /// matching pending setup (the socket cancelled mid-flight, or
+    /// a peer-initiated link) still records an unclaimed link — a
+    /// later `sco_connect` to that peer claims it.
+    fn on_sync_connection_complete(&mut self, sc: SyncConnectionComplete) {
+        let pending_matches = self
+            .pending_sco
+            .as_ref()
+            .is_some_and(|p| p.peer == sc.bd_addr && p.setup_sent && p.failed.is_none());
+        if sc.status != 0 {
+            if self
+                .pending_sco
+                .as_ref()
+                .is_some_and(|p| p.peer == sc.bd_addr && p.setup_sent)
+            {
+                self.fail_pending_sco_status(sc.status);
+            }
+            return;
+        }
+        let Some(acl_handle) = self.acl_handle_for_peer(&sc.bd_addr) else {
+            // No ACL to attribute it to (it died between the setup
+            // and the completion) — nothing to stage it on.
+            return;
+        };
+        if pending_matches {
+            self.pending_sco = None;
+        }
+        if self.sco_links.iter().any(|l| l.handle == sc.handle) {
+            return;
+        }
+        self.sco_links.push(ScoLink {
+            handle: sc.handle,
+            acl_handle,
+            peer: sc.bd_addr,
+            tx_packet_length: sc.tx_packet_length,
+            rx_packet_length: sc.rx_packet_length,
+            mtu: self.sco_mtu(),
+            dev_class: self.sco_peer_class(&sc.bd_addr),
+            rx: VecDeque::new(),
+            claimed: false,
+        });
+        narf_filesystem::bluetooth::publish_bt_channel_event();
+    }
+
+    /// Drop every SCO link riding ACL `handle`, and the link whose
+    /// own SCO handle is `handle` (a peer-torn-down synchronous
+    /// link). The socket layer learns on its next send/recv
+    /// (NotConnected) — the same staleness the L2CAP channel path
+    /// has for a dead channel.
+    fn drop_sco_links_for_handle(&mut self, handle: u16) {
+        self.sco_links
+            .retain(|l| l.handle != handle && l.acl_handle != handle);
+    }
+
+    /// Route one decoded SCO frame to its link's staging, dropping
+    /// frames for unknown handles (stale controller frames after a
+    /// link went away). The packet-status flag (§5.4.3) is not
+    /// staged: Linux delivers it as ancillary data
+    /// (`BT_SCM_PKT_STATUS`), never as payload, and NARF has no BT
+    /// ancillary-data path yet — a frame with a nonzero status
+    /// still delivers its payload.
+    fn route_sco(&mut self, frame: ScoData) -> bool {
+        let Some(link) = self.sco_links.iter_mut().find(|l| l.handle == frame.handle) else {
+            return false;
+        };
+        link.rx.push_back(frame.data);
+        true
+    }
+
+    /// Start an outbound SCO setup to `peer` (issue #814). When an
+    /// ACL connection to the peer already exists the Setup Sync
+    /// command goes out immediately; otherwise the peer is paged
+    /// first (it must have been discovered — `classic_connect`
+    /// refuses an unknown peer rather than paging blind) and the
+    /// setup follows on Connection Complete. `Connected` only when
+    /// a link to this peer already exists and is unclaimed.
+    pub fn sco_connect(&mut self, peer: [u8; 6], voice_setting: u16) -> BtScoConnectResult {
+        if let Some(failed) = self.take_pending_sco_failure(peer) {
+            return failed;
+        }
+        if let Some(link) = self.sco_links.iter_mut().find(|l| l.peer == peer) {
+            if link.claimed {
+                return BtScoConnectResult::AlreadyConnected;
+            }
+            link.claimed = true;
+            return BtScoConnectResult::Connected {
+                handle: link.handle,
+                mtu: link.mtu,
+                dev_class: link.dev_class,
+            };
+        }
+        if let Some(pending) = &self.pending_sco {
+            if pending.peer == peer {
+                return BtScoConnectResult::Pending;
+            }
+            return BtScoConnectResult::Busy;
+        }
+        if let Some(handle) = self.acl_handle_for_peer(&peer) {
+            if self.issue_setup_sync(handle, voice_setting).is_err() {
+                return BtScoConnectResult::Busy;
+            }
+            self.pending_sco = Some(PendingSco {
+                peer,
+                voice_setting,
+                acl_handle: Some(handle),
+                setup_sent: true,
+                failed: None,
+            });
+            return BtScoConnectResult::Pending;
+        }
+        match self.classic_connect(peer) {
+            Ok(()) => {
+                self.pending_sco = Some(PendingSco {
+                    peer,
+                    voice_setting,
+                    acl_handle: None,
+                    setup_sent: false,
+                    failed: None,
+                });
+                BtScoConnectResult::Pending
+            }
+            Err(ClassicError::UnknownPeer) => BtScoConnectResult::UnknownPeer,
+            Err(_) => BtScoConnectResult::Busy,
+        }
+    }
+
+    /// Poll the outcome of an outbound SCO setup to `peer`:
+    /// `Connected` claims the established link, `Pending` means
+    /// still in flight, `Refused`/`Transport`/`Aborted` are
+    /// terminal.
+    pub fn sco_connect_status(&mut self, peer: [u8; 6]) -> BtScoConnectResult {
+        if let Some(failed) = self.take_pending_sco_failure(peer) {
+            return failed;
+        }
+        if let Some(link) = self
+            .sco_links
+            .iter_mut()
+            .find(|l| l.peer == peer && !l.claimed)
+        {
+            link.claimed = true;
+            return BtScoConnectResult::Connected {
+                handle: link.handle,
+                mtu: link.mtu,
+                dev_class: link.dev_class,
+            };
+        }
+        if self.sco_links.iter().any(|l| l.peer == peer) {
+            return BtScoConnectResult::AlreadyConnected;
+        }
+        if self.pending_sco.as_ref().is_some_and(|p| p.peer == peer) {
+            return BtScoConnectResult::Pending;
+        }
+        BtScoConnectResult::Aborted
+    }
+
+    /// Send one SCO frame on the open link (`handle`). A payload
+    /// larger than the link MTU is TooBig (the socket layer reports
+    /// EINVAL, per Linux `sco_send_frame`); a transport that cannot
+    /// carry SCO data is Unsupported (EOPNOTSUPP, fail-closed).
+    /// Frames go straight to the transport — SCO has no ACL-style
+    /// flow control or queueing.
+    pub fn send_sco(&mut self, handle: u16, payload: &[u8]) -> Result<usize, BtSendError> {
+        if payload.is_empty() {
+            return Ok(0);
+        }
+        let Some(link) = self.sco_links.iter().find(|l| l.handle == handle) else {
+            return Err(BtSendError::NoChannel);
+        };
+        if payload.len() > link.mtu as usize {
+            return Err(BtSendError::TooBig);
+        }
+        let frame = ScoData {
+            handle,
+            packet_status: 0,
+            data: payload.to_vec(),
+        };
+        match self.transport.send_sco(&frame.encode()) {
+            Ok(()) => Ok(payload.len()),
+            Err(TransportError::Unsupported) => Err(BtSendError::Unsupported),
+            Err(_) => Err(BtSendError::Busy),
+        }
+    }
+
+    /// Drain staged inbound SCO payloads for the open link
+    /// (`handle`). `None` when no such link exists.
+    pub fn drain_sco_rx(&mut self, handle: u16) -> Option<Vec<Vec<u8>>> {
+        let link = self.sco_links.iter_mut().find(|l| l.handle == handle)?;
+        Some(link.rx.drain(..).collect())
+    }
+
+    /// Whether staged inbound SCO frames await on the open link
+    /// (`handle`) — non-consuming peek for poll.
+    pub fn sco_rx_pending(&self, handle: u16) -> bool {
+        self.sco_links
+            .iter()
+            .find(|l| l.handle == handle)
+            .is_some_and(|l| !l.rx.is_empty())
+    }
+
+    /// Tear down the open SCO link (`handle`): remove it and send
+    /// the controller HCI_Disconnect on the SCO handle (reason 0x13
+    /// Remote User Terminated Connection). `false` when no such
+    /// link exists. The ACL connection itself survives — only the
+    /// synchronous link goes away. (A shared host-initiated
+    /// disconnect backend, #1527, may subsume this direct command
+    /// later.)
+    pub fn disconnect_sco(&mut self, handle: u16) -> bool {
+        let Some(pos) = self.sco_links.iter().position(|l| l.handle == handle) else {
+            return false;
+        };
+        self.sco_links.remove(pos);
+        let params = gap::build_disconnect(handle, gap::DISCONNECT_REASON_REMOTE_USER);
+        let _ = self.send_command(op::HCI_DISCONNECT, &params);
+        true
+    }
+
+    /// Cancel an in-flight outbound SCO setup to `peer` (shutdown /
+    /// Drop of a socket whose connect never completed). A page
+    /// already in flight is left running; its Connection Complete
+    /// lands a plain ACL connection and issues no SCO setup.
+    pub fn cancel_sco_connect(&mut self, peer: [u8; 6]) {
+        if self.pending_sco.as_ref().is_some_and(|p| p.peer == peer) {
+            self.pending_sco = None;
         }
     }
 
@@ -3091,8 +3497,13 @@ impl PumpCore {
                         // running; drop the deferred page rather
                         // than page against a controller that may
                         // still be inquiring.
-                        self.pending_page = None;
+                        let dropped_peer = self.pending_page.take().map(|p| p.bd_addr);
                         self.classic.note_inquiry_started();
+                        if dropped_peer.is_some_and(|peer| {
+                            self.pending_sco.as_ref().is_some_and(|p| p.peer == peer)
+                        }) {
+                            self.fail_pending_sco_status(status);
+                        }
                     }
                 }
             }
@@ -3102,6 +3513,23 @@ impl PumpCore {
                     // The controller refused the page: the link —
                     // and any outbound open waiting on it — is dead.
                     self.fail_outbound_acl_pending(false);
+                    // A refused page kills the SCO setup waiting on it.
+                    if self
+                        .pending_sco
+                        .as_ref()
+                        .is_some_and(|p| p.acl_handle.is_none())
+                    {
+                        self.fail_pending_sco_status(status);
+                    }
+                }
+            }
+            op::HCI_SETUP_SYNCHRONOUS_CONNECTION => {
+                // Refused Setup Sync: no Synchronous Connection
+                // Complete follows, so the pending setup fails here.
+                // An accepted command keeps it until the Complete
+                // event arrives (see dispatch_event).
+                if status != 0 {
+                    self.fail_pending_sco_status(status);
                 }
             }
             op::HCI_WRITE_SCAN_ENABLE => {
@@ -3970,6 +4398,14 @@ impl PumpCore {
                     _ => {}
                 }
             }
+            code if code == EventCode::SyncConnectionComplete as u8 => {
+                // §7.7.35: Status(1) Handle(2) BD_ADDR(6)
+                // Link_Type(1) TX_Interval(1) ReTx_Window(1)
+                // Rx_Len(2) Tx_Len(2) Air_Mode(1).
+                if let Some(sc) = SyncConnectionComplete::parse(event) {
+                    self.on_sync_connection_complete(sc);
+                }
+            }
             code if code == EventCode::ConnectionComplete as u8 => {
                 // §7.7.3: Status(1) Handle(2) BD_ADDR(6) Link_Type(1)
                 // Encryption_Enabled(1).
@@ -3997,6 +4433,9 @@ impl PumpCore {
                         // An outbound open waiting on this link
                         // sends its channel-open request now (#1532).
                         self.advance_outbound_on_acl(cc.handle, peer, false);
+                        // SCO setup waiting on this page: the ACL is
+                        // up — issue Setup Synchronous Connection now.
+                        self.maybe_issue_pending_sco_setup(&cc.bd_addr, cc.handle);
                     } else if classic_completed {
                         // The page failed: no link, no channel open.
                         self.fail_outbound_acl_pending(false);
@@ -4027,6 +4466,17 @@ impl PumpCore {
                             }
                         });
                     self.connections.retain(|c| c.handle != dc.handle);
+                    // SCO links ride the ACL: a dead ACL takes its
+                    // SCO links with it, and a setup waiting on
+                    // this ACL fails with the disconnect reason.
+                    self.drop_sco_links_for_handle(dc.handle);
+                    if self
+                        .pending_sco
+                        .as_ref()
+                        .is_some_and(|p| p.acl_handle == Some(dc.handle))
+                    {
+                        self.fail_pending_sco_status(dc.reason);
+                    }
                     self.sysfs_track_disconnect(dc.handle);
                     if self.central.connected_handle == Some(dc.handle) {
                         self.central.note_disconnected();
@@ -5394,6 +5844,71 @@ pub fn disconnect_channel(dev: u16, handle: u16, cid: u16) -> bool {
     with_core(dev as usize, |core| core.disconnect_channel(handle, cid)).unwrap_or(false)
 }
 
+// ── SCO socket backend (issue #814) ──────────────────────────────────
+
+/// Start an outbound SCO setup to `peer` on controller `dev`
+/// (see `PumpCore::sco_connect`). `NoPump` when no pump exists
+/// for this controller index, `Busy` when a pump step currently
+/// owns the core.
+pub fn sco_connect(dev: u16, peer: [u8; 6], voice_setting: u16) -> BtScoConnectResult {
+    match with_pump_core(dev as usize, |core| core.sco_connect(peer, voice_setting)) {
+        Ok(r) => r,
+        Err(CentralError::NoPump) => BtScoConnectResult::NoPump,
+        Err(_) => BtScoConnectResult::Busy,
+    }
+}
+
+/// Poll the outcome of an outbound SCO setup to `peer` started by
+/// [`sco_connect`] (see `PumpCore::sco_connect_status`).
+pub fn sco_connect_status(dev: u16, peer: [u8; 6]) -> BtScoConnectResult {
+    match with_pump_core(dev as usize, |core| core.sco_connect_status(peer)) {
+        Ok(r) => r,
+        Err(CentralError::NoPump) => BtScoConnectResult::NoPump,
+        Err(_) => BtScoConnectResult::Busy,
+    }
+}
+
+/// Send one SCO frame on the open link (`handle`) of controller
+/// `dev` (see `PumpCore::send_sco`).
+pub fn send_sco(dev: u16, handle: u16, payload: &[u8]) -> Result<usize, BtSendError> {
+    with_core(dev as usize, |core| core.send_sco(handle, payload)).unwrap_or(Err(BtSendError::Busy))
+}
+
+/// Drain staged inbound SCO payloads for the open link (`handle`)
+/// (see `PumpCore::drain_sco_rx`).
+pub fn drain_sco_rx(dev: u16, handle: u16) -> Option<Vec<Vec<u8>>> {
+    let mut pumps = PUMPS.lock();
+    let slot = find_slot_mut(&mut pumps, dev as usize)?;
+    slot.core.as_mut()?.drain_sco_rx(handle)
+}
+
+/// Whether staged inbound SCO frames await on the open link
+/// (`handle`) — non-consuming peek for poll.
+pub fn sco_rx_pending(dev: u16, handle: u16) -> bool {
+    let pumps = PUMPS.lock();
+    let Some(slot) = pumps.iter().find(|s| s.index == dev as usize) else {
+        return false;
+    };
+    slot.core
+        .as_ref()
+        .map(|c| c.sco_rx_pending(handle))
+        .unwrap_or(false)
+}
+
+/// Tear down the open SCO link (`handle`) on controller `dev`
+/// (see `PumpCore::disconnect_sco`). `false` when no such link
+/// exists, or the core is busy with a pump step.
+pub fn disconnect_sco(dev: u16, handle: u16) -> bool {
+    with_core(dev as usize, |core| core.disconnect_sco(handle)).unwrap_or(false)
+}
+
+/// Cancel an in-flight outbound SCO setup to `peer` (see
+/// `PumpCore::cancel_sco_connect`). No-op when no pump exists or
+/// no setup is in flight for this peer.
+pub fn cancel_sco_connect(dev: u16, peer: [u8; 6]) {
+    let _ = with_core(dev as usize, |core| core.cancel_sco_connect(peer));
+}
+
 /// Claim the oldest unclaimed RFCOMM DLC opened by a peer to server
 /// `channel` on controller `dev`. `None` when nothing is pending or
 /// no pump exists. See `PumpCore::take_pending_rfcomm`.
@@ -6540,6 +7055,34 @@ pub fn pump_once(index: usize) -> PumpStep {
         }
     }
     step.acl_sent += core.flush_acl();
+
+    // SCO: drain Synchronous Data frames into their links' staging.
+    // A transport without SCO (no isoch endpoints) reports
+    // Unsupported on every poll — that is an expected "no data",
+    // not a transport error.
+    for _ in 0..MAX_PACKETS_PER_STEP {
+        if parked {
+            break;
+        }
+        match core.transport.recv_sco() {
+            Ok(Some(bytes)) => {
+                if let Some(frame) = ScoData::decode(&bytes) {
+                    if core.route_sco(frame) {
+                        step.sco_received += 1;
+                        core.stats.sco_received += 1;
+                        narf_filesystem::bluetooth::publish_bt_channel_event();
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(TransportError::Unsupported) => break,
+            Err(_) => {
+                core.stats.transport_errors += 1;
+                break;
+            }
+        }
+    }
+
     step.commands_sent = (core.stats.commands_sent - commands_before) as u32;
 
     let final_stats = core.stats;
@@ -6591,6 +7134,13 @@ mod tests {
         acl_inbox: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
         sent_commands: IrqSafeSpinLock<Vec<Command>>,
         sent_acl: IrqSafeSpinLock<Vec<Vec<u8>>>,
+        /// Raw SCO packets the scripted peer delivers.
+        sco_inbox: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
+        /// Raw SCO packets the host sent.
+        sent_sco: IrqSafeSpinLock<Vec<Vec<u8>>>,
+        /// When set, `send_sco` / `recv_sco` fail closed with
+        /// `Unsupported` (a controller with no isoch endpoints).
+        sco_unsupported: IrqSafeSpinLock<bool>,
     }
 
     impl ScriptedTransport {
@@ -6600,6 +7150,9 @@ mod tests {
                 acl_inbox: IrqSafeSpinLock::new(VecDeque::new()),
                 sent_commands: IrqSafeSpinLock::new(Vec::new()),
                 sent_acl: IrqSafeSpinLock::new(Vec::new()),
+                sco_inbox: IrqSafeSpinLock::new(VecDeque::new()),
+                sent_sco: IrqSafeSpinLock::new(Vec::new()),
+                sco_unsupported: IrqSafeSpinLock::new(false),
             }
         }
     }
@@ -6610,6 +7163,14 @@ mod tests {
         }
         fn enqueue_acl(&self, bytes: Vec<u8>) {
             self.acl_inbox.lock().push_back(bytes);
+        }
+        fn enqueue_sco(&self, bytes: Vec<u8>) {
+            self.sco_inbox.lock().push_back(bytes);
+        }
+        /// Fail closed on SCO I/O, like a controller with no isoch
+        /// endpoints (#817).
+        fn set_sco_unsupported(&self, unsupported: bool) {
+            *self.sco_unsupported.lock() = unsupported;
         }
         fn sent_opcodes(&self) -> Vec<u16> {
             self.sent_commands.lock().iter().map(|c| c.opcode).collect()
@@ -6632,6 +7193,13 @@ mod tests {
                 .filter_map(|acl| BFrame::decode(&acl.data).map(|f| (acl.handle, f)))
                 .collect()
         }
+        fn sent_sco_frames(&self) -> Vec<ScoData> {
+            self.sent_sco
+                .lock()
+                .iter()
+                .filter_map(|bytes| ScoData::decode(bytes))
+                .collect()
+        }
     }
 
     impl HciTransport for ScriptedTransport {
@@ -6648,6 +7216,19 @@ mod tests {
         }
         fn recv_acl(&self) -> Result<Option<Vec<u8>>, TransportError> {
             Ok(self.acl_inbox.lock().pop_front())
+        }
+        fn send_sco(&self, data: &[u8]) -> Result<(), TransportError> {
+            if *self.sco_unsupported.lock() {
+                return Err(TransportError::Unsupported);
+            }
+            self.sent_sco.lock().push(data.to_vec());
+            Ok(())
+        }
+        fn recv_sco(&self) -> Result<Option<Vec<u8>>, TransportError> {
+            if *self.sco_unsupported.lock() {
+                return Err(TransportError::Unsupported);
+            }
+            Ok(self.sco_inbox.lock().pop_front())
         }
         fn name(&self) -> &'static str {
             "fake-hci"
@@ -12484,6 +13065,452 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_classic_remote_name_guards);
+
+    // ── #814: SCO socket backend fixtures ────────────────────────
+
+    /// HCI_Synchronous_Connection_Complete event (§7.7.35): Status,
+    /// Handle, BD_ADDR, Link_Type, TX_Interval, ReTx_Window,
+    /// Rx_Len, Tx_Len, Air_Mode. Bytes pinned against the spec
+    /// layout, not against `SyncConnectionComplete::parse`.
+    fn sync_connection_complete_event(
+        status: u8,
+        handle: u16,
+        bd_addr: [u8; 6],
+        rx_len: u16,
+        tx_len: u16,
+    ) -> Event {
+        let mut params = alloc::vec![status];
+        params.extend_from_slice(&handle.to_le_bytes());
+        params.extend_from_slice(&bd_addr);
+        params.extend_from_slice(&[0x00, 0x07, 0x00]); // SCO link, TX interval 7, retx window 0
+        params.extend_from_slice(&rx_len.to_le_bytes());
+        params.extend_from_slice(&tx_len.to_le_bytes());
+        params.push(0x02); // air mode CVSD
+        Event {
+            code: EventCode::SyncConnectionComplete as u8,
+            params,
+        }
+    }
+
+    /// Expected Setup Synchronous Connection params for `handle`
+    /// with the socket's CVSD defaults (§7.1.26): 8 kHz TX/RX,
+    /// 0xFFFF max latency, voice 0x0060, retransmission effort
+    /// 0x02, all eSCO packet types 0x003F.
+    fn expected_setup_sync_params(handle: u16) -> Vec<u8> {
+        alloc::vec![
+            (handle & 0xFF) as u8,
+            (handle >> 8) as u8,
+            0x40,
+            0x1F,
+            0x00,
+            0x00, // TX 8000
+            0x40,
+            0x1F,
+            0x00,
+            0x00, // RX 8000
+            0xFF,
+            0xFF, // max latency
+            0x60,
+            0x00, // voice CVSD
+            0x02, // retransmission effort
+            0x3F,
+            0x00, // packet types
+        ]
+    }
+
+    /// #814: SCO connect over a live ACL — Setup Sync with the
+    /// pinned CVSD params, Synchronous Connection Complete lands
+    /// the link, then send/recv move SCO frames through the
+    /// scripted peer and disconnect tears the link down.
+    fn smoke_pump_sco_connect_send_recv() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        let acl_handle = 0x0042;
+        let sco_handle = 0x0043;
+        // 1. Seed the ACL link directly (the paging half is covered
+        // by the classic fixtures).
+        fake.enqueue_event(classic_connection_complete(acl_handle, peer));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("ACL seed did not land a connection");
+        }
+        // 2. SCO connect over the live ACL issues Setup Synchronous
+        // Connection with the pinned CVSD params.
+        if sco_connect(0, peer, crate::classic::SCO_VOICE_SETTING_CVSD)
+            != BtScoConnectResult::Pending
+        {
+            reset_all();
+            return TestResult::Fail("sco_connect over live ACL did not go Pending");
+        }
+        let sent = fake.sent_command_params();
+        if sent.last()
+            != Some(&(
+                op::HCI_SETUP_SYNCHRONOUS_CONNECTION,
+                expected_setup_sync_params(acl_handle),
+            ))
+        {
+            reset_all();
+            return TestResult::Fail("sco_connect did not issue the pinned Setup Sync command");
+        }
+        if sco_connect_status(0, peer) != BtScoConnectResult::Pending {
+            reset_all();
+            return TestResult::Fail("sco_connect_status did not stay Pending before completion");
+        }
+        // 3. Synchronous Connection Complete lands the link with
+        // the controller's SCO MTU (64 from the scripted bring-up).
+        fake.enqueue_event(sync_connection_complete_event(0, sco_handle, peer, 60, 60));
+        let _ = pump_once(0);
+        match sco_connect_status(0, peer) {
+            BtScoConnectResult::Connected {
+                handle,
+                mtu,
+                dev_class,
+            } if handle == sco_handle && mtu == 64 && dev_class == [0, 0, 0] => {}
+            _ => {
+                reset_all();
+                return TestResult::Fail("sync complete did not land the link");
+            }
+        }
+        // 4. Send one SCO frame; the scripted peer sees the exact
+        // §5.4.3 packet.
+        if send_sco(0, sco_handle, b"hello") != Ok(5) {
+            reset_all();
+            return TestResult::Fail("send_sco rejected a frame on the live link");
+        }
+        let frames = fake.sent_sco_frames();
+        if frames.len() != 1
+            || frames[0].handle != sco_handle
+            || frames[0].packet_status != 0
+            || frames[0].data != b"hello"
+        {
+            reset_all();
+            return TestResult::Fail("sent SCO frame bytes mismatch");
+        }
+        // 5. An inbound SCO frame is staged by the pump drain and
+        // comes back out of drain_sco_rx.
+        fake.enqueue_sco(
+            ScoData {
+                handle: sco_handle,
+                packet_status: 0,
+                data: b"world".to_vec(),
+            }
+            .encode(),
+        );
+        let _ = pump_once(0);
+        if !sco_rx_pending(0, sco_handle) {
+            reset_all();
+            return TestResult::Fail("inbound SCO frame did not stage");
+        }
+        if drain_sco_rx(0, sco_handle) != Some(alloc::vec![b"world".to_vec()]) {
+            reset_all();
+            return TestResult::Fail("drain_sco_rx did not return the staged frame");
+        }
+        if sco_rx_pending(0, sco_handle) {
+            reset_all();
+            return TestResult::Fail("drain_sco_rx left the link pending");
+        }
+        // 6. Disconnect issues HCI_Disconnect (reason 0x13) and the
+        // link is gone: send and drain both refuse.
+        if !disconnect_sco(0, sco_handle) {
+            reset_all();
+            return TestResult::Fail("disconnect_sco rejected the live link");
+        }
+        let sent = fake.sent_command_params();
+        if sent.last() != Some(&(op::HCI_DISCONNECT, alloc::vec![0x43, 0x00, 0x13])) {
+            reset_all();
+            return TestResult::Fail("disconnect_sco did not issue HCI_Disconnect(0x13)");
+        }
+        if send_sco(0, sco_handle, b"x") != Err(BtSendError::NoChannel) {
+            reset_all();
+            return TestResult::Fail("send_sco accepted a frame after disconnect");
+        }
+        if drain_sco_rx(0, sco_handle).is_some() {
+            reset_all();
+            return TestResult::Fail("drain_sco_rx returned frames after disconnect");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_sco_connect_send_recv);
+
+    /// #814: SCO connect with no live ACL pages first — inquiry,
+    /// Create Connection, Connection Complete, then Setup Sync —
+    /// and a second connect to the live link is AlreadyConnected.
+    fn smoke_pump_sco_connect_pages_first() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let peer = [0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5];
+        if classic_start_inquiry(0, crate::classic::GIAC, 8, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_start_inquiry rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_INQUIRY, 0));
+        let _ = pump_once(0);
+        fake.enqueue_event(inquiry_result_event(peer, 0x01, [0x10, 0x01, 0x00], 0x0ABC));
+        let _ = pump_once(0);
+        fake.enqueue_event(inquiry_complete_event(0));
+        let _ = pump_once(0);
+        // 1. No ACL yet: the page goes out first.
+        if sco_connect(0, peer, crate::classic::SCO_VOICE_SETTING_CVSD)
+            != BtScoConnectResult::Pending
+        {
+            reset_all();
+            return TestResult::Fail("sco_connect without an ACL did not go Pending");
+        }
+        let sent = fake.sent_command_params();
+        if sent.last().map(|(o, _)| *o) != Some(op::HCI_CREATE_CONNECTION) {
+            reset_all();
+            return TestResult::Fail("sco_connect without an ACL did not page first");
+        }
+        fake.enqueue_event(cs(op::HCI_CREATE_CONNECTION, 0));
+        let _ = pump_once(0);
+        if sco_connect_status(0, peer) != BtScoConnectResult::Pending {
+            reset_all();
+            return TestResult::Fail("sco_connect_status did not stay Pending while paging");
+        }
+        // 2. The page lands the ACL; Setup Sync follows at once.
+        fake.enqueue_event(classic_connection_complete(0x0042, peer));
+        let _ = pump_once(0);
+        let sent = fake.sent_command_params();
+        if sent.last()
+            != Some(&(
+                op::HCI_SETUP_SYNCHRONOUS_CONNECTION,
+                expected_setup_sync_params(0x0042),
+            ))
+        {
+            reset_all();
+            return TestResult::Fail("page complete did not issue the pinned Setup Sync command");
+        }
+        // 3. Synchronous Connection Complete lands the link with
+        // the peer's class from the inquiry record.
+        fake.enqueue_event(sync_connection_complete_event(0, 0x0043, peer, 60, 60));
+        let _ = pump_once(0);
+        match sco_connect_status(0, peer) {
+            BtScoConnectResult::Connected {
+                handle,
+                mtu,
+                dev_class,
+            } if handle == 0x0043 && mtu == 64 && dev_class == [0x10, 0x01, 0x00] => {}
+            _ => {
+                reset_all();
+                return TestResult::Fail("paged SCO setup did not land the link");
+            }
+        }
+        // 4. A second connect to the live link is refused outright.
+        if sco_connect(0, peer, crate::classic::SCO_VOICE_SETTING_CVSD)
+            != BtScoConnectResult::AlreadyConnected
+        {
+            reset_all();
+            return TestResult::Fail("second sco_connect did not report AlreadyConnected");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_sco_connect_pages_first);
+
+    /// #814: SCO connect refusals — no pump, undiscovered peer,
+    /// controller-refused setup (Page Timeout surfaces as
+    /// Refused(0x04) and a retry re-issues the setup) — and a
+    /// transport with no isoch endpoints fails SCO send closed.
+    fn smoke_pump_sco_connect_refusals() -> TestResult {
+        reset_all();
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        // 1. No pump for this controller index.
+        if sco_connect(7, peer, crate::classic::SCO_VOICE_SETTING_CVSD)
+            != BtScoConnectResult::NoPump
+        {
+            reset_all();
+            return TestResult::Fail("sco_connect without a pump did not report NoPump");
+        }
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        // 2. Undiscovered peer: refused without issuing a command.
+        let before = fake.sent_command_params().len();
+        if sco_connect(0, peer, crate::classic::SCO_VOICE_SETTING_CVSD)
+            != BtScoConnectResult::UnknownPeer
+        {
+            reset_all();
+            return TestResult::Fail(
+                "sco_connect to an undiscovered peer did not report UnknownPeer",
+            );
+        }
+        if fake.sent_command_params().len() != before {
+            reset_all();
+            return TestResult::Fail("sco_connect to an undiscovered peer issued a command");
+        }
+        // 3. Controller refuses the setup: Page Timeout surfaces.
+        fake.enqueue_event(classic_connection_complete(0x0042, peer));
+        let _ = pump_once(0);
+        if sco_connect(0, peer, crate::classic::SCO_VOICE_SETTING_CVSD)
+            != BtScoConnectResult::Pending
+        {
+            reset_all();
+            return TestResult::Fail("sco_connect over live ACL did not go Pending");
+        }
+        fake.enqueue_event(sync_connection_complete_event(0x04, 0x0043, peer, 60, 60));
+        let _ = pump_once(0);
+        if sco_connect_status(0, peer) != BtScoConnectResult::Refused(0x04) {
+            reset_all();
+            return TestResult::Fail("refused setup did not surface Refused(0x04)");
+        }
+        // 4. A retry after the refusal re-issues the setup and lands.
+        if sco_connect(0, peer, crate::classic::SCO_VOICE_SETTING_CVSD)
+            != BtScoConnectResult::Pending
+        {
+            reset_all();
+            return TestResult::Fail("sco_connect retry after refusal did not go Pending");
+        }
+        fake.enqueue_event(sync_connection_complete_event(0, 0x0043, peer, 60, 60));
+        let _ = pump_once(0);
+        if !matches!(
+            sco_connect_status(0, peer),
+            BtScoConnectResult::Connected { handle: 0x0043, .. }
+        ) {
+            reset_all();
+            return TestResult::Fail("sco_connect retry did not land the link");
+        }
+        // 5. A transport with no isoch endpoints fails SCO send
+        // closed and stages nothing on receive.
+        fake.set_sco_unsupported(true);
+        if send_sco(0, 0x0043, b"x") != Err(BtSendError::Unsupported) {
+            reset_all();
+            return TestResult::Fail("send_sco did not fail closed on an isoch-less transport");
+        }
+        fake.enqueue_sco(
+            ScoData {
+                handle: 0x0043,
+                packet_status: 0,
+                data: b"y".to_vec(),
+            }
+            .encode(),
+        );
+        let _ = pump_once(0);
+        if sco_rx_pending(0, 0x0043) || drain_sco_rx(0, 0x0043).is_some() {
+            reset_all();
+            return TestResult::Fail("isoch-less transport staged an inbound SCO frame");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_sco_connect_refusals);
+
+    /// #814: death of the ACL drops the SCO link riding on it —
+    /// send and drain refuse, and no link survives for a later
+    /// connect poll.
+    fn smoke_pump_sco_acl_disconnect_drops_link() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        fake.enqueue_event(classic_connection_complete(0x0042, peer));
+        let _ = pump_once(0);
+        if sco_connect(0, peer, crate::classic::SCO_VOICE_SETTING_CVSD)
+            != BtScoConnectResult::Pending
+        {
+            reset_all();
+            return TestResult::Fail("sco_connect over live ACL did not go Pending");
+        }
+        fake.enqueue_event(sync_connection_complete_event(0, 0x0043, peer, 60, 60));
+        let _ = pump_once(0);
+        if !matches!(
+            sco_connect_status(0, peer),
+            BtScoConnectResult::Connected { handle: 0x0043, .. }
+        ) {
+            reset_all();
+            return TestResult::Fail("SCO setup did not land the link");
+        }
+        fake.enqueue_event(Event {
+            code: EventCode::DisconnectionComplete as u8,
+            params: alloc::vec![0x00, 0x42, 0x00, 0x13],
+        });
+        let _ = pump_once(0);
+        if connection_count(0) != Some(0) {
+            reset_all();
+            return TestResult::Fail("ACL disconnect did not drop the connection");
+        }
+        if send_sco(0, 0x0043, b"x") != Err(BtSendError::NoChannel) {
+            reset_all();
+            return TestResult::Fail("send_sco accepted a frame after its ACL died");
+        }
+        if drain_sco_rx(0, 0x0043).is_some() {
+            reset_all();
+            return TestResult::Fail("drain_sco_rx returned frames after its ACL died");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_sco_acl_disconnect_drops_link);
+
+    /// #814: cancelling a SCO setup while it pages leaves the page
+    /// running but issues no SCO setup when the ACL lands; the
+    /// poll reports Aborted.
+    fn smoke_pump_sco_cancel_connect() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let peer = [0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5];
+        if classic_start_inquiry(0, crate::classic::GIAC, 8, 0).is_err() {
+            reset_all();
+            return TestResult::Fail("classic_start_inquiry rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_INQUIRY, 0));
+        let _ = pump_once(0);
+        fake.enqueue_event(inquiry_result_event(peer, 0x01, [0x10, 0x01, 0x00], 0x0ABC));
+        let _ = pump_once(0);
+        fake.enqueue_event(inquiry_complete_event(0));
+        let _ = pump_once(0);
+        if sco_connect(0, peer, crate::classic::SCO_VOICE_SETTING_CVSD)
+            != BtScoConnectResult::Pending
+        {
+            reset_all();
+            return TestResult::Fail("sco_connect without an ACL did not go Pending");
+        }
+        cancel_sco_connect(0, peer);
+        if sco_connect_status(0, peer) != BtScoConnectResult::Aborted {
+            reset_all();
+            return TestResult::Fail("cancelled SCO setup did not report Aborted");
+        }
+        // The page still lands a plain ACL connection — and no SCO
+        // setup follows it.
+        fake.enqueue_event(cs(op::HCI_CREATE_CONNECTION, 0));
+        let _ = pump_once(0);
+        fake.enqueue_event(classic_connection_complete(0x0042, peer));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("cancelled page did not land the ACL");
+        }
+        if fake
+            .sent_command_params()
+            .iter()
+            .any(|(o, _)| *o == op::HCI_SETUP_SYNCHRONOUS_CONNECTION)
+        {
+            reset_all();
+            return TestResult::Fail("cancelled SCO setup issued Setup Sync after the page landed");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_sco_cancel_connect);
 
     /// #1313: bring up the fake controller and land a central-role
     /// connection from Idle (Create issued directly, no scan
