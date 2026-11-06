@@ -128,16 +128,14 @@ fn smoke_r8169_multi_instance_cookie_dispatch() -> TestResult {
     if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrl) {
         return TestResult::Fail("re-probe replaced controller(0)");
     }
-    let ring_ptr =
-        narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+    let ring_ptr = narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
     if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
         return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
     }
     if ctrl.rx_ipc_ring.lock().is_none() {
         return TestResult::Fail("attach took the NIC's RX ring");
     }
-    let tx_ptr =
-        narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+    let tx_ptr = narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
     if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
         return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
     }
@@ -605,16 +603,14 @@ fn smoke_igb_multi_instance_cookie_dispatch() -> TestResult {
     if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrl) {
         return TestResult::Fail("re-probe replaced controller(0)");
     }
-    let ring_ptr =
-        narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+    let ring_ptr = narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
     if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
         return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
     }
     if ctrl.rx_ipc_ring.lock().is_none() {
         return TestResult::Fail("attach took the NIC's RX ring");
     }
-    let tx_ptr =
-        narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+    let tx_ptr = narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
     if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
         return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
     }
@@ -623,10 +619,7 @@ fn smoke_igb_multi_instance_cookie_dispatch() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/net/igb",
-    smoke_igb_multi_instance_cookie_dispatch
-);
+kernel_test_in!("drivers/net/igb", smoke_igb_multi_instance_cookie_dispatch);
 
 fn smoke_e1000_pci_match_table_covers_modern_pch() -> TestResult {
     // Structural smoke: register the e1000 driver and assert every
@@ -819,7 +812,8 @@ fn smoke_e1000_qemu_fwsm_dance_is_noop() -> TestResult {
     }
     // QEMU's 82540EM / 82574L must come up as a legacy part with no
     // active ME — the FWSM dance was skipped entirely.
-    let (pch, me) = e1000::with_controller(0, |c| (c.pch_part, c.me_active)).unwrap_or((true, true));
+    let (pch, me) =
+        e1000::with_controller(0, |c| (c.pch_part, c.me_active)).unwrap_or((true, true));
     if pch {
         return TestResult::Fail("QEMU NIC mis-classified as PCH");
     }
@@ -934,16 +928,14 @@ fn smoke_e1000_multi_instance_cookie_dispatch() -> TestResult {
     }
     // Ring identity: the registry adapter borrows the NIC's own
     // ring — no static take happened at attach.
-    let ring_ptr =
-        narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+    let ring_ptr = narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
     if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
         return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
     }
     if ctrl.rx_ipc_ring.lock().is_none() {
         return TestResult::Fail("attach took the NIC's RX ring");
     }
-    let tx_ptr =
-        narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+    let tx_ptr = narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
     if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
         return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
     }
@@ -1262,16 +1254,14 @@ fn smoke_atheros_multi_instance_cookie_dispatch() -> TestResult {
     if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrl) {
         return TestResult::Fail("re-probe replaced controller(0)");
     }
-    let ring_ptr =
-        narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+    let ring_ptr = narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
     if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
         return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
     }
     if ctrl.rx_ipc_ring.lock().is_none() {
         return TestResult::Fail("attach took the NIC's RX ring");
     }
-    let tx_ptr =
-        narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+    let tx_ptr = narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
     if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
         return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
     }
