@@ -8,9 +8,10 @@ use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_modeset::Mode,
     intel_gpu_vrr::{
-        cmrr_disable, cmrr_enable, is_cmrr_active, is_vrr_active, mode_vrefresh, on_plane_flip,
-        program_cmrr_timings, program_fixed_rr_timings, program_vrr_timings, vrr_disable,
-        vrr_enable, vrr_send_push, CmrrRate, CmrrTimings, DisplayVrrIp, VrrRange, VrrTimings,
+        capture_mode_from_hw, cmrr_disable, cmrr_enable, is_cmrr_active, is_vrr_active,
+        mode_vrefresh, on_plane_flip, populate_card, program_cmrr_timings,
+        program_fixed_rr_timings, program_vrr_timings, vrr_disable, vrr_enable, vrr_send_push,
+        vrr_status_string, CmrrRate, CmrrTimings, DisplayVrrIp, VrrRange, VrrTimings,
         VrrTranscoder, EMP_AS_SDP_TL_OFFSET, TRANSCODER_A_BASE, TRANS_CMRR_M_HI_OFFSET,
         TRANS_CMRR_M_LO_OFFSET, TRANS_CMRR_N_HI_OFFSET, TRANS_CMRR_N_LO_OFFSET, TRANS_PUSH_EN,
         TRANS_PUSH_OFFSET, TRANS_VRR_CTL_OFFSET, TRANS_VRR_FLIPLINE_OFFSET, TRANS_VRR_VMAX_OFFSET,
@@ -44,6 +45,10 @@ impl MockMmio {
             .filter(|(r, _)| *r == reg)
             .map(|(_, v)| *v)
             .collect()
+    }
+
+    fn set(&self, reg: u64, val: u32) {
+        self.values.borrow_mut().insert(reg, val);
     }
 }
 
@@ -546,4 +551,193 @@ fn smoke_intel_vrr_cmrr_state_and_flip_push() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_vrr",
     smoke_intel_vrr_cmrr_state_and_flip_push
+);
+
+// ── Test 11: CMRR Rate Strings & Parsing ─────────────────────────────────────
+
+fn smoke_intel_cmrr_rate_strings() -> TestResult {
+    let rates = [
+        (CmrrRate::Fps23_976, "23.976"),
+        (CmrrRate::Fps24, "24"),
+        (CmrrRate::Fps25, "25"),
+        (CmrrRate::Fps29_970, "29.970"),
+        (CmrrRate::Fps30, "30"),
+        (CmrrRate::Fps48, "48"),
+        (CmrrRate::Fps50, "50"),
+        (CmrrRate::Fps59_940, "59.940"),
+        (CmrrRate::Fps60, "60"),
+    ];
+
+    for (rate, expected_str) in rates {
+        assert_eq!(rate.as_str(), expected_str);
+        assert_eq!(CmrrRate::from_str(expected_str), Some(rate));
+        assert_eq!(
+            CmrrRate::from_str(&alloc::format!("{}Hz", expected_str)),
+            Some(rate)
+        );
+        assert_eq!(
+            CmrrRate::from_str(&alloc::format!("{} fps", expected_str)),
+            Some(rate)
+        );
+    }
+
+    assert_eq!(CmrrRate::from_str("59.94"), Some(CmrrRate::Fps59_940));
+    assert_eq!(CmrrRate::from_str("23.98"), Some(CmrrRate::Fps23_976));
+    assert_eq!(CmrrRate::from_str("invalid"), None);
+    assert_eq!(CmrrRate::from_str("144"), None);
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_gpu_vrr", smoke_intel_cmrr_rate_strings);
+
+// ── Test 12: Hardware Transcoder Mode Capture ────────────────────────────────
+
+fn smoke_intel_vrr_capture_mode_from_hw() -> TestResult {
+    let io = MockMmio::new();
+    let base = TRANSCODER_A_BASE;
+
+    // Unprogrammed MMIO returns None
+    assert_eq!(capture_mode_from_hw(&io, VrrTranscoder::A), None);
+
+    // Mock 1920x1080@60 timings
+    // htotal: active 1920 -> (1920 - 1) = 1919; total 2200 -> (2200 - 1) = 2199
+    let htotal_val = 1919u32 | (2199u32 << 16);
+    // hsync: start 2008 -> 2007; end 2052 -> 2051
+    let hsync_val = 2007u32 | (2051u32 << 16);
+    // vtotal: active 1080 -> 1079; total 1125 -> 1124
+    let vtotal_val = 1079u32 | (1124u32 << 16);
+    // vsync: start 1084 -> 1083; end 1089 -> 1088
+    let vsync_val = 1083u32 | (1088u32 << 16);
+
+    io.set(base, htotal_val);
+    io.set(base + 0x008, hsync_val);
+    io.set(base + 0x00c, vtotal_val);
+    io.set(base + 0x014, vsync_val);
+
+    let mode = capture_mode_from_hw(&io, VrrTranscoder::A).expect("captured mode");
+    assert_eq!(mode.h_active, 1920);
+    assert_eq!(mode.h_total, 2200);
+    assert_eq!(mode.h_sync_start, 2008);
+    assert_eq!(mode.h_sync_end, 2052);
+    assert_eq!(mode.v_active, 1080);
+    assert_eq!(mode.v_total, 1125);
+    assert_eq!(mode.v_sync_start, 1084);
+    assert_eq!(mode.v_sync_end, 1089);
+    assert_eq!(mode.pixel_clock_khz, (2200 * 1125 * 60) / 1000);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_capture_mode_from_hw
+);
+
+// ── Test 13: VRR & CMRR Sysfs Telemetry and Controls ─────────────────────────
+
+fn smoke_intel_vrr_sysfs_telemetry_and_controls() -> TestResult {
+    use narf_filesystem::{sysfs::Kobject, FsError};
+
+    let root = Kobject::new_root("test-card0");
+    populate_card(0, &root);
+
+    // Direct status formatting verification
+    let direct_status = vrr_status_string();
+    assert!(direct_status.contains("Pipe A:"));
+
+    let vrr_dir = root.get_child("vrr").expect("vrr sysfs directory");
+
+    // Status report formatting via sysfs attribute
+    let status = vrr_dir.attr_show("vrr_status").expect("vrr_status");
+    assert!(status.contains("Pipe A:"));
+    assert!(status.contains("vrr_enabled:"));
+    assert!(status.contains("cmrr_enabled:"));
+    assert!(status.contains("cmrr_rate:"));
+
+    // Pipe A enable control
+    assert_eq!(vrr_dir.attr_show("pipeA_enabled"), Some("0\n".into()));
+    assert_eq!(vrr_dir.attr_store("pipeA_enabled", b"1\n"), Some(Ok(())));
+    assert!(VRR_STATE.is_enabled(1));
+    assert_eq!(vrr_dir.attr_show("pipeA_enabled"), Some("1\n".into()));
+    assert_eq!(vrr_dir.attr_store("pipeA_enabled", b"0"), Some(Ok(())));
+    assert!(!VRR_STATE.is_enabled(1));
+    assert_eq!(vrr_dir.attr_show("pipeA_enabled"), Some("0\n".into()));
+
+    // Pipe A CMRR enable control
+    assert_eq!(vrr_dir.attr_show("pipeA_cmrr_enabled"), Some("0\n".into()));
+    assert_eq!(vrr_dir.attr_store("pipeA_cmrr_enabled", b"1"), Some(Ok(())));
+    assert!(VRR_STATE.is_cmrr_enabled(1));
+    assert_eq!(vrr_dir.attr_show("pipeA_cmrr_enabled"), Some("1\n".into()));
+    assert_eq!(vrr_dir.attr_store("pipeA_cmrr_enabled", b"0"), Some(Ok(())));
+    assert!(!VRR_STATE.is_cmrr_enabled(1));
+    assert_eq!(vrr_dir.attr_show("pipeA_cmrr_enabled"), Some("0\n".into()));
+
+    // Pipe A CMRR rate control
+    assert_eq!(
+        vrr_dir.attr_store("pipeA_cmrr_rate", b"59.940Hz\n"),
+        Some(Ok(()))
+    );
+    assert_eq!(VRR_STATE.cmrr_rate(1), Some(CmrrRate::Fps59_940));
+    assert_eq!(
+        vrr_dir.attr_show("pipeA_cmrr_rate"),
+        Some("59.940\n".into())
+    );
+
+    assert_eq!(
+        vrr_dir.attr_store("pipeA_cmrr_rate", b"bad_rate"),
+        Some(Err(FsError::InvalidData))
+    );
+
+    // Push trigger store
+    assert_eq!(vrr_dir.attr_store("pipeA_push", b"1"), Some(Ok(())));
+    assert_eq!(vrr_dir.attr_show("pipeA_push"), Some("0\n".into()));
+
+    // Telemetry read attributes
+    assert!(vrr_dir.attr_show("pipeA_vrr_live").is_some());
+    assert!(vrr_dir.attr_show("pipeA_cmrr_live").is_some());
+    assert!(vrr_dir.attr_show("pipeA_vmin").is_some());
+    assert!(vrr_dir.attr_show("pipeA_vmax").is_some());
+    assert!(vrr_dir.attr_show("pipeA_flipline").is_some());
+    assert!(vrr_dir.attr_show("pipeA_guardband").is_some());
+    assert!(vrr_dir.attr_show("pipeA_cmrr_m").is_some());
+    assert!(vrr_dir.attr_show("pipeA_cmrr_n").is_some());
+
+    // Clean up
+    VRR_STATE.set_cmrr_rate(1, None);
+    VRR_STATE.set_cmrr_timings(1, None);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_sysfs_telemetry_and_controls
+);
+
+// ── Test 14: Global VRR State Mode and Rate Accessors ────────────────────────
+
+fn smoke_intel_vrr_state_mode_and_rate_accessors() -> TestResult {
+    let crtc_id = 1;
+    let m = mode_1080p60();
+
+    assert_eq!(VRR_STATE.mode(crtc_id), None);
+    assert_eq!(VRR_STATE.cmrr_rate(crtc_id), None);
+
+    VRR_STATE.set_mode(crtc_id, Some(m));
+    assert_eq!(VRR_STATE.mode(crtc_id), Some(m));
+
+    VRR_STATE.set_cmrr_rate(crtc_id, Some(CmrrRate::Fps24));
+    assert_eq!(VRR_STATE.cmrr_rate(crtc_id), Some(CmrrRate::Fps24));
+
+    // Test out of bounds CRTC index
+    assert_eq!(VRR_STATE.mode(99), None);
+    assert_eq!(VRR_STATE.cmrr_rate(99), None);
+
+    // Clean up
+    VRR_STATE.set_mode(crtc_id, None);
+    VRR_STATE.set_cmrr_rate(crtc_id, None);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_state_mode_and_rate_accessors
 );

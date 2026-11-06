@@ -1302,6 +1302,40 @@ pub(crate) fn install(
             }
         }
     }
+    // Seed default VRR & CMRR timings for Pipe A on CRTC 1
+    let (width, height) = (console.width as u16, console.height as u16);
+    let default_mode = crate::intel_gpu_modeset::Mode {
+        pixel_clock_khz: (u32::from(width) * u32::from(height) * 60) / 1000,
+        h_active: width,
+        h_total: width + 160,
+        h_sync_start: width + 48,
+        h_sync_end: width + 80,
+        v_active: height,
+        v_total: height + 40,
+        v_sync_start: height + 3,
+        v_sync_end: height + 9,
+        h_sync_positive: false,
+        v_sync_positive: false,
+    };
+    let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_generation(generation);
+    let vrr_range = crate::intel_gpu_vrr::VrrRange {
+        min_hz: 48,
+        max_hz: 60,
+    };
+    crate::intel_gpu_vrr::VRR_STATE.set_mode(1, Some(default_mode));
+    crate::intel_gpu_vrr::VRR_STATE.set_range(1, Some(vrr_range));
+    if let Some(timings) = crate::intel_gpu_vrr::VrrTimings::compute(&default_mode, vrr_range, ip) {
+        crate::intel_gpu_vrr::VRR_STATE.set_timings(1, Some(timings));
+    }
+    if let Some(cmrr_timings) = crate::intel_gpu_vrr::CmrrTimings::compute(
+        &default_mode,
+        crate::intel_gpu_vrr::CmrrRate::Fps59_940,
+        ip,
+    ) {
+        crate::intel_gpu_vrr::VRR_STATE
+            .set_cmrr_rate(1, Some(crate::intel_gpu_vrr::CmrrRate::Fps59_940));
+        crate::intel_gpu_vrr::VRR_STATE.set_cmrr_timings(1, Some(cmrr_timings));
+    }
     display.platform.console_published(&console);
 }
 pub(crate) fn display(index: u32) -> Option<Arc<Display>> {

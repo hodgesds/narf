@@ -307,6 +307,53 @@ impl CmrrRate {
             Self::Custom { num, den } => (num as u64, den as u64),
         }
     }
+
+    /// String representation of the standard rate in Hz (e.g. "59.940").
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fps23_976 => "23.976",
+            Self::Fps24 => "24",
+            Self::Fps25 => "25",
+            Self::Fps29_970 => "29.970",
+            Self::Fps30 => "30",
+            Self::Fps48 => "48",
+            Self::Fps50 => "50",
+            Self::Fps59_940 => "59.940",
+            Self::Fps60 => "60",
+            Self::Custom { .. } => "custom",
+        }
+    }
+
+    /// Parse a refresh rate string into a `CmrrRate`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        s.parse().ok()
+    }
+}
+
+impl core::str::FromStr for CmrrRate {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s
+            .trim()
+            .trim_end_matches("Hz")
+            .trim_end_matches("hz")
+            .trim_end_matches("fps")
+            .trim();
+        match s {
+            "23.976" | "23.98" => Ok(Self::Fps23_976),
+            "24" | "24.0" => Ok(Self::Fps24),
+            "25" | "25.0" => Ok(Self::Fps25),
+            "29.970" | "29.97" => Ok(Self::Fps29_970),
+            "30" | "30.0" => Ok(Self::Fps30),
+            "48" | "48.0" => Ok(Self::Fps48),
+            "50" | "50.0" => Ok(Self::Fps50),
+            "59.940" | "59.94" => Ok(Self::Fps59_940),
+            "60" | "60.0" => Ok(Self::Fps60),
+            _ => Err(()),
+        }
+    }
 }
 
 /// Content-Matched Refresh Rate timing parameters programmed into the transcoder.
@@ -649,6 +696,8 @@ pub struct VrrState {
     timings: [IrqSafeSpinLock<Option<VrrTimings>>; 4],
     cmrr_timings: [IrqSafeSpinLock<Option<CmrrTimings>>; 4],
     range: [IrqSafeSpinLock<Option<VrrRange>>; 4],
+    cmrr_rate: [IrqSafeSpinLock<Option<CmrrRate>>; 4],
+    mode: [IrqSafeSpinLock<Option<Mode>>; 4],
 }
 
 impl Default for VrrState {
@@ -685,6 +734,18 @@ impl VrrState {
                 IrqSafeSpinLock::new(None),
             ],
             range: [
+                IrqSafeSpinLock::new(None),
+                IrqSafeSpinLock::new(None),
+                IrqSafeSpinLock::new(None),
+                IrqSafeSpinLock::new(None),
+            ],
+            cmrr_rate: [
+                IrqSafeSpinLock::new(None),
+                IrqSafeSpinLock::new(None),
+                IrqSafeSpinLock::new(None),
+                IrqSafeSpinLock::new(None),
+            ],
+            mode: [
                 IrqSafeSpinLock::new(None),
                 IrqSafeSpinLock::new(None),
                 IrqSafeSpinLock::new(None),
@@ -753,6 +814,26 @@ impl VrrState {
     pub fn range(&self, crtc_id: u32) -> Option<VrrRange> {
         Self::crtc_index(crtc_id).and_then(|idx| *self.range[idx].lock())
     }
+
+    pub fn set_cmrr_rate(&self, crtc_id: u32, rate: Option<CmrrRate>) {
+        if let Some(idx) = Self::crtc_index(crtc_id) {
+            *self.cmrr_rate[idx].lock() = rate;
+        }
+    }
+
+    pub fn cmrr_rate(&self, crtc_id: u32) -> Option<CmrrRate> {
+        Self::crtc_index(crtc_id).and_then(|idx| *self.cmrr_rate[idx].lock())
+    }
+
+    pub fn set_mode(&self, crtc_id: u32, mode: Option<Mode>) {
+        if let Some(idx) = Self::crtc_index(crtc_id) {
+            *self.mode[idx].lock() = mode;
+        }
+    }
+
+    pub fn mode(&self, crtc_id: u32) -> Option<Mode> {
+        Self::crtc_index(crtc_id).and_then(|idx| *self.mode[idx].lock())
+    }
 }
 
 pub static VRR_STATE: VrrState = VrrState::new();
@@ -802,6 +883,273 @@ pub fn on_plane_flip(crtc_id: u32, io: &(impl MmioWindow + ?Sized)) {
         let trans = VrrTranscoder::for_crtc(crtc_id);
         let _ = vrr_send_push(io, trans);
     }
+}
+
+/// Attempt to reconstruct active display `Mode` timings from hardware transcoder registers.
+pub fn capture_mode_from_hw(io: &(impl MmioWindow + ?Sized), trans: VrrTranscoder) -> Option<Mode> {
+    let base = trans.base();
+    let htotal = io.read32(base);
+    let hsync = io.read32(base + 0x008);
+    let vtotal = io.read32(base + 0x00c);
+    let vsync = io.read32(base + 0x014);
+
+    if htotal == 0
+        || htotal == u32::MAX
+        || vtotal == 0
+        || vtotal == u32::MAX
+        || !io.display_access_ok()
+    {
+        return None;
+    }
+
+    let h_active = ((htotal & 0xffff) + 1) as u16;
+    let h_tot = (((htotal >> 16) & 0xffff) + 1) as u16;
+    let v_active = ((vtotal & 0xffff) + 1) as u16;
+    let v_tot = (((vtotal >> 16) & 0xffff) + 1) as u16;
+
+    let (h_sync_start, h_sync_end) = if hsync != 0 && hsync != u32::MAX {
+        let start = ((hsync & 0xffff) + 1) as u16;
+        let end = (((hsync >> 16) & 0xffff) + 1) as u16;
+        if start <= h_tot && end <= h_tot && start >= h_active {
+            (start, end)
+        } else {
+            (h_active + 16, h_active + 32)
+        }
+    } else {
+        (h_active + 16, h_active + 32)
+    };
+
+    let (v_sync_start, v_sync_end) = if vsync != 0 && vsync != u32::MAX {
+        let start = ((vsync & 0xffff) + 1) as u16;
+        let end = (((vsync >> 16) & 0xffff) + 1) as u16;
+        if start <= v_tot && end <= v_tot && start >= v_active {
+            (start, end)
+        } else {
+            (v_active + 3, v_active + 6)
+        }
+    } else {
+        (v_active + 3, v_active + 6)
+    };
+
+    let pixel_clock_khz = (u32::from(h_tot) * u32::from(v_tot) * 60) / 1000;
+
+    Some(Mode {
+        pixel_clock_khz,
+        h_active,
+        h_total: h_tot,
+        h_sync_start,
+        h_sync_end,
+        v_active,
+        v_total: v_tot,
+        v_sync_start,
+        v_sync_end,
+        h_sync_positive: false,
+        v_sync_positive: false,
+    })
+}
+
+/// Generate a multi-line formatted summary of the VRR and CMRR engine state across all pipes.
+pub fn vrr_status_string() -> alloc::string::String {
+    use alloc::format;
+    let mut out = alloc::string::String::new();
+    for crtc_id in 1..=4 {
+        let name = match crtc_id {
+            1 => "Pipe A",
+            2 => "Pipe B",
+            3 => "Pipe C",
+            4 => "Pipe D",
+            _ => "Unknown",
+        };
+        let enabled = VRR_STATE.is_enabled(crtc_id);
+        let cmrr_en = VRR_STATE.is_cmrr_enabled(crtc_id);
+        let rate_str = VRR_STATE
+            .cmrr_rate(crtc_id)
+            .map(|r| r.as_str())
+            .unwrap_or("none");
+        let timings = VRR_STATE.timings(crtc_id);
+        let cmrr_t = VRR_STATE.cmrr_timings(crtc_id);
+        out.push_str(&format!("{}:\n", name));
+        out.push_str(&format!("  vrr_enabled: {}\n", if enabled { 1 } else { 0 }));
+        out.push_str(&format!(
+            "  cmrr_enabled: {}\n",
+            if cmrr_en { 1 } else { 0 }
+        ));
+        out.push_str(&format!("  cmrr_rate: {}\n", rate_str));
+        if let Some(t) = timings {
+            out.push_str(&format!("  vmin: {}\n", t.vmin));
+            out.push_str(&format!("  vmax: {}\n", t.vmax));
+            out.push_str(&format!("  flipline: {}\n", t.flipline));
+            out.push_str(&format!("  guardband: {}\n", t.guardband));
+        } else {
+            out.push_str("  timings: none\n");
+        }
+        if let Some(c) = cmrr_t {
+            out.push_str(&format!("  cmrr_m: {}\n", c.cmrr_m));
+            out.push_str(&format!("  cmrr_n: {}\n", c.cmrr_n));
+            out.push_str(&format!("  cmrr_guardband: {}\n", c.guardband));
+        } else {
+            out.push_str("  cmrr_timings: none\n");
+        }
+    }
+    out
+}
+
+/// Populate sysfs nodes for Intel VRR & CMRR under `/sys/class/drm/card<N>/vrr/`.
+pub fn populate_card(_index: u32, node: &alloc::sync::Arc<narf_filesystem::sysfs::Kobject>) {
+    use alloc::format;
+    use narf_filesystem::sysfs::{
+        get_or_create_child, kobject_add_attr, kobject_add_writable_attr,
+    };
+
+    let vrr_dir = get_or_create_child(node, "vrr");
+
+    kobject_add_attr(&vrr_dir, "vrr_status", vrr_status_string);
+
+    kobject_add_writable_attr(
+        &vrr_dir,
+        "pipeA_enabled",
+        || format!("{}\n", if VRR_STATE.is_enabled(1) { 1 } else { 0 }),
+        |data| {
+            let s = core::str::from_utf8(data)
+                .map_err(|_| FsError::InvalidData)?
+                .trim();
+            match s {
+                "1" | "true" | "on" => {
+                    request_vrr_enabled(1, true);
+                    Ok(())
+                }
+                "0" | "false" | "off" => {
+                    request_vrr_enabled(1, false);
+                    Ok(())
+                }
+                _ => Err(FsError::InvalidData),
+            }
+        },
+    );
+
+    kobject_add_writable_attr(
+        &vrr_dir,
+        "pipeA_cmrr_enabled",
+        || format!("{}\n", if VRR_STATE.is_cmrr_enabled(1) { 1 } else { 0 }),
+        |data| {
+            let s = core::str::from_utf8(data)
+                .map_err(|_| FsError::InvalidData)?
+                .trim();
+            match s {
+                "1" | "true" | "on" => {
+                    request_cmrr_enabled(1, true);
+                    Ok(())
+                }
+                "0" | "false" | "off" => {
+                    request_cmrr_enabled(1, false);
+                    Ok(())
+                }
+                _ => Err(FsError::InvalidData),
+            }
+        },
+    );
+
+    kobject_add_writable_attr(
+        &vrr_dir,
+        "pipeA_cmrr_rate",
+        || {
+            let r = VRR_STATE
+                .cmrr_rate(1)
+                .map(|rate| rate.as_str())
+                .unwrap_or("none");
+            format!("{}\n", r)
+        },
+        |data| {
+            let s = core::str::from_utf8(data)
+                .map_err(|_| FsError::InvalidData)?
+                .trim();
+            if s == "none" || s == "off" {
+                VRR_STATE.set_cmrr_rate(1, None);
+                VRR_STATE.set_cmrr_timings(1, None);
+                return Ok(());
+            }
+            let rate = CmrrRate::from_str(s).ok_or(FsError::InvalidData)?;
+            VRR_STATE.set_cmrr_rate(1, Some(rate));
+            let mode = VRR_STATE.mode(1).unwrap_or(Mode::VESA_1024X768_60);
+            let ip = crate::intel_gpu::with_controller(|dev| {
+                DisplayVrrIp::from_generation(dev.chip.generation)
+            })
+            .unwrap_or(DisplayVrrIp::Display30);
+            if let Some(cmrr_t) = CmrrTimings::compute(&mode, rate, ip) {
+                VRR_STATE.set_cmrr_timings(1, Some(cmrr_t));
+                if VRR_STATE.is_cmrr_enabled(1) {
+                    request_cmrr_enabled(1, true);
+                }
+            }
+            Ok(())
+        },
+    );
+
+    kobject_add_attr(&vrr_dir, "pipeA_vrr_live", || {
+        let live = crate::intel_gpu::with_controller(|dev| {
+            let io = dev.mode_window();
+            is_vrr_active(&io, VrrTranscoder::A)
+        })
+        .unwrap_or(false);
+        format!("{}\n", if live { 1 } else { 0 })
+    });
+
+    kobject_add_attr(&vrr_dir, "pipeA_cmrr_live", || {
+        let live = crate::intel_gpu::with_controller(|dev| {
+            let io = dev.mode_window();
+            is_cmrr_active(&io, VrrTranscoder::A)
+        })
+        .unwrap_or(false);
+        format!("{}\n", if live { 1 } else { 0 })
+    });
+
+    kobject_add_attr(&vrr_dir, "pipeA_vmin", || {
+        let v = VRR_STATE.timings(1).map(|t| t.vmin).unwrap_or(0);
+        format!("{}\n", v)
+    });
+
+    kobject_add_attr(&vrr_dir, "pipeA_vmax", || {
+        let v = VRR_STATE.timings(1).map(|t| t.vmax).unwrap_or(0);
+        format!("{}\n", v)
+    });
+
+    kobject_add_attr(&vrr_dir, "pipeA_flipline", || {
+        let v = VRR_STATE.timings(1).map(|t| t.flipline).unwrap_or(0);
+        format!("{}\n", v)
+    });
+
+    kobject_add_attr(&vrr_dir, "pipeA_guardband", || {
+        let v = VRR_STATE.timings(1).map(|t| t.guardband).unwrap_or(0);
+        format!("{}\n", v)
+    });
+
+    kobject_add_attr(&vrr_dir, "pipeA_cmrr_m", || {
+        let v = VRR_STATE.cmrr_timings(1).map(|t| t.cmrr_m).unwrap_or(0);
+        format!("{}\n", v)
+    });
+
+    kobject_add_attr(&vrr_dir, "pipeA_cmrr_n", || {
+        let v = VRR_STATE.cmrr_timings(1).map(|t| t.cmrr_n).unwrap_or(0);
+        format!("{}\n", v)
+    });
+
+    kobject_add_writable_attr(
+        &vrr_dir,
+        "pipeA_push",
+        || "0\n".into(),
+        |data| {
+            let s = core::str::from_utf8(data)
+                .map_err(|_| FsError::InvalidData)?
+                .trim();
+            if s == "1" || s == "push" {
+                crate::intel_gpu::with_controller(|dev| {
+                    let io = dev.mode_window();
+                    on_plane_flip(1, &io);
+                });
+            }
+            Ok(())
+        },
+    );
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
