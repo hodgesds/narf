@@ -1334,21 +1334,39 @@ fn smoke_igc_flow_filters_and_validation() -> TestResult {
             queue: 2,
             ethertype: Some(0x88f7),
             destination_mac: None,
+            source_mac: None,
             vlan_priority: None,
+            vlan_etype: None,
+            vlan_tci: None,
+            user_data: None,
+            user_mask: None,
+            default_queue: false,
         },
         FlowRule {
             location: 1,
             queue: 1,
             ethertype: None,
             destination_mac: Some([2, 1, 2, 3, 4, 5]),
+            source_mac: None,
             vlan_priority: None,
+            vlan_etype: None,
+            vlan_tci: None,
+            user_data: None,
+            user_mask: None,
+            default_queue: false,
         },
         FlowRule {
             location: 2,
             queue: 3,
             ethertype: None,
             destination_mac: None,
+            source_mac: None,
             vlan_priority: Some(7),
+            vlan_etype: None,
+            vlan_tci: None,
+            user_data: None,
+            user_mask: None,
+            default_queue: false,
         },
     ];
     crate::traffic::validate_flows(&rules, 4, 0).unwrap();
@@ -1372,6 +1390,154 @@ fn smoke_igc_flow_filters_and_validation() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_flow_filters_and_validation);
+
+fn smoke_igc_flow_filters_gap14() -> TestResult {
+    use narf_net::nic::FlowRule;
+    fn flow(location: u16, queue: u16) -> FlowRule {
+        FlowRule {
+            location,
+            queue,
+            ethertype: None,
+            destination_mac: None,
+            source_mac: None,
+            vlan_priority: None,
+            vlan_etype: None,
+            vlan_tci: None,
+            user_data: None,
+            user_mask: None,
+            default_queue: false,
+        }
+    }
+    let m = Model::new();
+    let mut src = flow(0, 1);
+    src.source_mac = Some([6, 5, 4, 3, 2, 1]);
+    let mut def = flow(1, 3);
+    def.default_queue = true;
+    // Destination MAC + user data: a flex rule (Linux
+    // `igc_ethtool_init_nfc_rule`: multiple criteria). No VLAN field,
+    // so the EtherType/user-data offsets are 12/14.
+    let mut flex = flow(2, 2);
+    flex.destination_mac = Some([2, 1, 2, 3, 4, 5]);
+    flex.user_data = Some([0xaa; 8]);
+    flex.user_mask = Some([0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0]);
+    // Full-TCI match: a flex rule. The TCI bytes are the stored
+    // host-order value, as Linux copies them (igc_add_flex_filter).
+    let mut tci = flow(3, 0);
+    tci.vlan_tci = Some(0x1234);
+    // EtherType + VLAN priority: multiple criteria, so flex; the
+    // priority-only TCI is still the PCP field at offset 14.
+    let mut multi = flow(4, 1);
+    multi.ethertype = Some(0x88cc);
+    multi.vlan_priority = Some(5);
+    let rules = alloc::vec![src, def.clone(), flex.clone(), tci, multi];
+    crate::traffic::validate_flows(&rules, 4, 0).unwrap();
+    crate::traffic::flows(&m, &rules, 1);
+    // Source MAC lands in RAL slot 1 with the ASEL bit (0x90010000).
+    // Default queue 3 lands in MRQC bits 5:3.
+    check!(
+        m.value(0x5408) == 0x03040506 && m.value(0x540c) == 0x90050102 && m.value(0x5818) == 0x18,
+        "source-MAC / default-queue register encoding wrong"
+    );
+    // Flex slot 0 (FHFT 0x9000, bank 0): dst MAC rows + user data at
+    // offset 14 with the partial mask (byte 14 full; 16, 18, 20 full;
+    // 15, 17, 19, 21 masked out).
+    check!(
+        m.value(0x5804) == 0
+            && m.value(0x90fc) == 0x220
+            && m.value(0x9000) == 0x03020102
+            && m.value(0x9004) == 0x00000504
+            && m.value(0x9008) == 0x3f
+            && m.value(0x9010) == 0
+            && m.value(0x9014) == 0xaaaa0000
+            && m.value(0x9018) == 0x40
+            && m.value(0x9020) == 0xaaaaaaaa
+            && m.value(0x9024) == 0x0000aaaa
+            && m.value(0x9028) == 0x15,
+        "flex filter slot 0 encoding wrong"
+    );
+    // Flex slot 1 (FHFT 0x9100): full-TCI bytes at offset 14.
+    check!(
+        m.value(0x91fc) == 0x20
+            && m.value(0x9110) == 0
+            && m.value(0x9114) == 0x12340000
+            && m.value(0x9118) == 0xc0,
+        "flex filter full-TCI encoding wrong"
+    );
+    // Flex slot 2 (FHFT 0x9200): EtherType BE at 12, PCP TCI at 14.
+    check!(
+        m.value(0x92fc) == 0x120 && m.value(0x9214) == 0xa000cc88 && m.value(0x9218) == 0xf0,
+        "flex filter multi-criterion encoding wrong"
+    );
+    check!(
+        m.value(0x5808) == 0x74000,
+        "flex enables wrong (FLEX_HQ + FLX0-2)"
+    );
+    // Location space is 65; the 65th slot (64) is valid, 65 is not.
+    let mut edge = flow(64, 0);
+    edge.ethertype = Some(0x88f8);
+    let mut over = flow(65, 0);
+    over.ethertype = Some(0x88f9);
+    check!(
+        crate::traffic::validate_flows(&alloc::vec![edge], 4, 0).is_ok()
+            && crate::traffic::validate_flows(&alloc::vec![over], 4, 0).is_err(),
+        "location 64/65 boundary wrong"
+    );
+    // An exact-duplicate flex filter at another location is -EEXIST,
+    // and a second default-queue rule is too (Linux check_nfc_rule).
+    let mut dup = flow(10, 2);
+    dup.destination_mac = Some([2, 1, 2, 3, 4, 5]);
+    dup.user_data = Some([0xaa; 8]);
+    dup.user_mask = Some([0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0]);
+    let mut def2 = flow(11, 0);
+    def2.default_queue = true;
+    check!(
+        crate::traffic::validate_flows(&alloc::vec![flex.clone(), dup], 4, 0) == Err(17)
+            && crate::traffic::validate_flows(&alloc::vec![def.clone(), def2], 4, 0) == Err(17),
+        "duplicate flex / default-queue rule accepted"
+    );
+    // A rule with no match field (and not the wildcard) is -EINVAL,
+    // and the 33rd flex rule is -ENOSPC.
+    let empty = flow(12, 0);
+    let mut many = alloc::vec::Vec::new();
+    for i in 0..33u16 {
+        let mut r = flow(i, 0);
+        r.user_data = Some([i as u8; 8]);
+        many.push(r);
+    }
+    check!(
+        crate::traffic::validate_flows(&alloc::vec![empty], 4, 0) == Err(22)
+            && crate::traffic::validate_flows(&many, 4, 0) == Err(28),
+        "empty / over-capacity flex rules accepted"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_flow_filters_gap14);
+
+fn smoke_igc_min_fragment_rounding() -> TestResult {
+    // Linux `igc_fpe_get_supported_frag_size` (igc_tsn.c:441-453):
+    // smallest of {64, 128, 192, 256} at or above the request, 256
+    // above the largest.
+    for (v, want) in [
+        (0, 64),
+        (60, 64),
+        (64, 64),
+        (65, 128),
+        (128, 128),
+        (129, 192),
+        (192, 192),
+        (193, 256),
+        (252, 256),
+        (256, 256),
+        (300, 256),
+        (65535, 256),
+    ] {
+        if crate::igc::control::round_min_fragment(v) != want {
+            return TestResult::Fail("min-fragment rounding wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_min_fragment_rounding);
 
 fn smoke_igc_sctp_crc_descriptor() -> TestResult {
     let mut bytes = tcp4(0);

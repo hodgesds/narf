@@ -495,14 +495,22 @@ impl NicControl for Igc {
         let m = self.merge.lock();
         Ok((m.config, m.status))
     }
+    fn permanent_mac(&self) -> Result<[u8; 6], i32> {
+        Ok(self.config.lock().permanent_mac)
+    }
     fn set_preemption(&self, c: narf_net::nic::Preemption) -> Result<(), i32> {
-        if c.verify_ms == 0
-            || c.verify_ms > 128
-            || !(64..=256).contains(&c.minimum_fragment)
-            || c.minimum_fragment % 64 != 0
-        {
+        if c.verify_ms == 0 || c.verify_ms > 128 {
             return Err(22);
         }
+        // Linux `igc_ethtool_set_mm` (igc_ethtool.c:1860-1882) rounds
+        // tx_min_frag_size up to a supported size instead of rejecting
+        // it; the stored (rounded) value is what MM_GET reports back.
+        // The genl layer already enforces the 60..=252 netlink policy
+        // range, so anything reaching here rounds into 64..=256.
+        let c = narf_net::nic::Preemption {
+            minimum_fragment: round_min_fragment(c.minimum_fragment),
+            ..c
+        };
         let _control = self.control().map_err(|_| 16)?;
         if self.mtu() > 1500
             || self.queues().iter().any(|q| q.xsk().is_some())
@@ -511,7 +519,10 @@ impl NicControl for Igc {
                     .flows
                     .lock()
                     .iter()
-                    .filter(|f| f.destination_mac.is_some())
+                    .filter(|f| {
+                        !crate::traffic::is_flex(f)
+                            && (f.destination_mac.is_some() || f.source_mac.is_some())
+                    })
                     .count()
                 > 14
         {
@@ -583,6 +594,20 @@ impl NicControl for Igc {
     fn runtime_resume(&self) -> Result<(), i32> {
         narf_power::device_pm::DevicePmOps::resume(self).map_err(|_| 5)
     }
+}
+
+/// Linux `igc_fpe_get_supported_frag_size` (igc_tsn.c:441-453): the
+/// smallest supported size in {64, 128, 192, 256} at or above the
+/// request; anything above the largest rounds to `TX_MAX_FRAG_SIZE`
+/// (256). `merge.rs` programs `minimum_fragment / 64 - 1`, so the
+/// rounded value always lands on a legal fragment field.
+pub(crate) fn round_min_fragment(v: u16) -> u16 {
+    for size in [64u16, 128, 192, 256] {
+        if v <= size {
+            return size;
+        }
+    }
+    256
 }
 
 /// Linux `igc_ethtool_set_coalesce` validation for one usecs value:
