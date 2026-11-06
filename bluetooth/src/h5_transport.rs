@@ -44,25 +44,25 @@
 //!
 //! ## Byte port
 //!
-//! The serial registry publishes descriptors only, so the 8250 byte
-//! port ([`Uart8250BytePort`]) rebuilds its handle from the registry
-//! entry — the same shape `filesystem::console_tty` uses for
-//! probed-UART ttys. [`H5Transport::from_uart_info`] builds a
-//! transport from a [`UartInfo`]; [`H5Transport::bind_named`] finds
-//! one by name, establishes the link, and registers the transport.
-//! There is intentionally no boot initcall here yet: claiming a UART
-//! at boot would steal it from the `/dev/ttyS<N>` data ttys, so the
-//! boot bind (opt-in `bt-h5=<name>` selection) is a follow-up.
+//! The serial registry publishes descriptors only, so the byte ports
+//! ([`Uart8250BytePort`], [`Pl011BytePort`]) rebuild their handles
+//! from the registry entry — the same shape `filesystem::console_tty`
+//! uses for probed-UART ttys. [`H5Transport::from_uart_info`] builds
+//! a transport from a [`UartInfo`], dispatching on the entry's
+//! [`UartFamily`]; [`H5Transport::bind_named`] finds one by name,
+//! establishes the link, and registers the transport. Boot bind is
+//! opt-in only (`bt-h5=<name>`, Stage::Late `bluetooth-h5-boot`
+//! initcall in `crate::register_initcalls`): claiming a UART at boot
+//! without opt-in would steal it from the `/dev/ttyS<N>` data ttys.
 //!
 //! ## H4 convergence
 //!
-//! `H4BytePort` does not exist on main (verified: zero matches at
-//! 1307de44); the H4 lane (#821, PR #1557, unmerged) has not landed
-//! its byte-port pattern. This transport therefore defines its own
-//! [`Uart8250BytePort`] over the serial registry directly instead
-//! of copying unmerged code. When #1557 lands, H4 should adopt the
-//! shared [`BytePort`] trait in [`crate::transport`] and the two
-//! transports should share one 8250 adapter.
+//! H4 landed with its own byte-port trait (`H4BytePort`, #821, PR
+//! #1557, merged 2026-11-05) instead of the shared [`BytePort`]
+//! trait in [`crate::transport`]. This transport therefore keeps its
+//! own [`Uart8250BytePort`] over the serial registry. H4 should
+//! still adopt the shared trait and the two transports should share
+//! one 8250 adapter — that convergence is open, not done here.
 //!
 //! ## Timing
 //!
@@ -77,7 +77,8 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_drivers_serial::registry::UartInfo;
+use narf_drivers_serial::pl011::Pl011;
+use narf_drivers_serial::registry::{UartFamily, UartInfo};
 use narf_drivers_serial::uart_8250::{Uart8250, UartBase};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_time::Deadline;
@@ -218,6 +219,77 @@ impl BytePort for Uart8250BytePort {
     }
 }
 
+/// [`BytePort`] over a PL011 UART, rebuilt from a serial registry
+/// entry (the `console_tty` shape: the probe already programmed
+/// baud/FIFO, the handle itself is stateless apart from base, so it
+/// may be rebuilt freely).
+///
+/// Writes spin on FR.TXFF and reads poll FR.RXFE + DR, exactly like
+/// the console PL011 backend (`console::aarch64`). On aarch64 this
+/// is the usable byte port for H5; the 8250 port is inert there.
+#[derive(Debug)]
+pub struct Pl011BytePort {
+    uart: Pl011,
+    name: &'static str,
+}
+
+impl Pl011BytePort {
+    /// Build a byte port over an already-constructed PL011 handle.
+    pub fn new(uart: Pl011, name: &'static str) -> Self {
+        Self { uart, name }
+    }
+
+    /// Rebuild the handle from a registry entry. Returns `None`
+    /// when the entry carries no mapped VA, or when a PL011 entry
+    /// carries an I/O base (PL011 is MMIO-only) — a corrupt entry
+    /// binds nothing rather than poking the wrong address.
+    pub fn from_info(info: &UartInfo) -> Option<Self> {
+        let UartBase::Mmio(_) = info.base else {
+            return None;
+        };
+        let Some(va) = info.virt else {
+            return None;
+        };
+        // SAFETY: `va` is the probe-installed mapping for this
+        // entry (see `UartInfo::virt`); the handle lives only as
+        // long as the mapping does (ioremap mappings persist until
+        // explicit iounmap, which no probe performs).
+        let uart = unsafe { Pl011::from_va(va, info.irq) };
+        Some(Self::new(uart, info.name))
+    }
+}
+
+impl BytePort for Pl011BytePort {
+    fn write_bytes(&self, bytes: &[u8]) {
+        for &b in bytes {
+            self.uart.write_byte(b);
+        }
+    }
+
+    fn read_byte(&self) -> Option<u8> {
+        self.uart.read_byte()
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+/// The `bt-h5=<name>` cmdline opt-in: the UART name to bind at boot,
+/// or `None` when the key is absent, bare (`bt-h5` with no value),
+/// or empty (`bt-h5=`). Only the first `bt-h5=` token counts
+/// (`KernelCmdline::value`). A missing or malformed value binds
+/// nothing — the Stage::Late `bluetooth-h5-boot` initcall skips the
+/// bind instead of stealing a UART.
+pub fn boot_bind_name<'a>(args: narf_boot::args::KernelCmdline<'a>) -> Option<&'a str> {
+    let name = args.value("bt-h5")?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 // ── Transport ───────────────────────────────────────────────────────
 
 /// One unacknowledged reliable frame, kept for retransmission
@@ -320,28 +392,46 @@ impl H5Transport {
         }
     }
 
+    /// Build the [`BytePort`] for a serial registry entry,
+    /// dispatching on the entry's [`UartFamily`]: PL011 entries get
+    /// a [`Pl011BytePort`], 8250-family entries a
+    /// [`Uart8250BytePort`]. Returns `None` when a PL011 entry
+    /// cannot be built (see [`Pl011BytePort::from_info`]).
+    pub fn byte_port_for(info: &UartInfo) -> Option<Arc<dyn BytePort>> {
+        match info.kind {
+            UartFamily::Pl011 => {
+                Pl011BytePort::from_info(info).map(|p| Arc::new(p) as Arc<dyn BytePort>)
+            }
+            UartFamily::Uart8250 => Some(Arc::new(Uart8250BytePort::from_info(info))),
+        }
+    }
+
     /// Build a transport from a serial registry entry, rebuilding
-    /// the 8250 handle from the descriptor (the `console_tty`
-    /// shape). The port's programmed baud is used for Tmax timing.
-    pub fn from_uart_info(info: &UartInfo) -> Arc<Self> {
-        let port = Arc::new(Uart8250BytePort::from_info(info));
+    /// the byte-port handle from the descriptor (the `console_tty`
+    /// shape). The port kind follows the entry's [`UartFamily`]
+    /// (see [`Self::byte_port_for`]). Returns `None` when a PL011
+    /// entry cannot be built. The port's programmed baud is used
+    /// for Tmax timing.
+    pub fn from_uart_info(info: &UartInfo) -> Option<Arc<Self>> {
+        let port = Self::byte_port_for(info)?;
         let mut config = H5TransportConfig::default();
         if info.baud != 0 {
             config.baud = info.baud;
         }
-        Arc::new(Self::new(port, config))
+        Some(Arc::new(Self::new(port, config)))
     }
 
     /// Find a registry UART by name, establish the link, and
     /// register the transport so [`crate::controller::bring_up_all`]
-    /// picks it up. Returns `None` when no such UART is registered
-    /// or the peer does not answer link establishment within the
-    /// budget — in both cases nothing is registered.
+    /// picks it up. Returns `None` when no such UART is registered,
+    /// when its byte port cannot be built, or when the peer does
+    /// not answer link establishment within the budget — in all
+    /// cases nothing is registered.
     pub fn bind_named(name: &str) -> Option<Arc<Self>> {
         let info = narf_drivers_serial::registry::uarts()
             .into_iter()
             .find(|u| u.name == name)?;
-        let transport = Self::from_uart_info(&info);
+        let transport = Self::from_uart_info(&info)?;
         if transport
             .establish(Deadline::after_ms(ESTABLISH_BUDGET_MS))
             .is_err()
@@ -1424,6 +1514,7 @@ pub mod tests {
         // Pure construction: rebuilds the 8250 handle from the
         // registry entry (the console_tty shape) without touching
         // hardware — no bytes are ever written or read here.
+        use narf_drivers_serial::registry::UartFamily;
         use narf_drivers_serial::uart_8250::{COM2_BASE, UART_CLOCK_HZ};
         let info = UartInfo {
             base: UartBase::Io(COM2_BASE),
@@ -1432,8 +1523,12 @@ pub mod tests {
             irq: Some(3),
             name: "COM2",
             baud: 115_200,
+            kind: UartFamily::Uart8250,
+            virt: None,
         };
-        let transport = H5Transport::from_uart_info(&info);
+        let Some(transport) = H5Transport::from_uart_info(&info) else {
+            return TestResult::Fail("from_uart_info must build a transport for an 8250 entry");
+        };
         if transport.port_name() != "COM2" {
             return TestResult::Fail("port name must come from the registry entry");
         }
@@ -1445,5 +1540,162 @@ pub mod tests {
     kernel_test_in!(
         "bluetooth/h5-transport",
         smoke_h5_from_uart_info_rebuilds_handle
+    );
+
+    /// `bt-h5=<name>` parsing is the `KernelCmdline::value` rule, no
+    /// more: the first token wins, a bare flag has no value, and an
+    /// empty value binds nothing.
+    fn smoke_h5_boot_bind_name_parses() -> TestResult {
+        use narf_boot::args::KernelCmdline;
+        if boot_bind_name(KernelCmdline::new("bt-h5=COM2")) != Some("COM2") {
+            return TestResult::Fail("bt-h5=COM2 must parse to COM2");
+        }
+        if boot_bind_name(KernelCmdline::new("quiet bt-h5=PL011-0 debug")) != Some("PL011-0") {
+            return TestResult::Fail("bt-h5=PL011-0 must parse among other tokens");
+        }
+        if boot_bind_name(KernelCmdline::new("bt-h5=COM2 bt-h5=COM1")) != Some("COM2") {
+            return TestResult::Fail("first bt-h5= token must win");
+        }
+        if boot_bind_name(KernelCmdline::new("")).is_some() {
+            return TestResult::Fail("absent bt-h5= must bind nothing");
+        }
+        if boot_bind_name(KernelCmdline::new("bt-h5")).is_some() {
+            return TestResult::Fail("bare bt-h5 flag must bind nothing");
+        }
+        if boot_bind_name(KernelCmdline::new("bt-h5=")).is_some() {
+            return TestResult::Fail("empty bt-h5= value must bind nothing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/h5-transport", smoke_h5_boot_bind_name_parses);
+
+    /// `bind_named` for a name no registry entry carries binds
+    /// nothing and touches no hardware (the lookup fails before any
+    /// port is built).
+    fn smoke_h5_bind_named_missing_name_binds_nothing() -> TestResult {
+        if H5Transport::bind_named("no-such-uart-h5-test").is_some() {
+            return TestResult::Fail("bind_named must return None for an unregistered name");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/h5-transport",
+        smoke_h5_bind_named_missing_name_binds_nothing
+    );
+
+    /// Fake PL011 register block, leaked-box shape as
+    /// `drivers/serial::pl011`'s fixture: 16 u32 cells covering DR
+    /// (cell 0) and FR (cell 6, offset 0x18).
+    fn make_fake_pl011_regs() -> &'static mut [u32; 16] {
+        let buf: alloc::boxed::Box<[u32; 16]> = alloc::boxed::Box::new([0u32; 16]);
+        alloc::boxed::Box::leak(buf)
+    }
+
+    /// `Pl011BytePort` read/write against the fake UART: FR.RXFE
+    /// gates reads, DR carries the byte, and writes are 32-bit
+    /// stores into DR — the PL011 semantics, not the 8250's.
+    fn smoke_h5_pl011_byte_port_read_write() -> TestResult {
+        use narf_drivers_serial::pl011::{Pl011, FR_RXFE, REG_DR, REG_FR};
+        let regs = make_fake_pl011_regs();
+        let base = regs.as_mut_ptr();
+        // SAFETY: `regs` is a live RAM-backed register block for the
+        // duration of this test; every index below is in-bounds
+        // (< 16). Manipulation uses volatile ops so the port's
+        // volatile accesses observe them in order.
+        unsafe {
+            core::ptr::write_volatile(base.add(REG_FR / 4), FR_RXFE);
+            let uart = Pl011::from_va(base as u64, None);
+            let port = Pl011BytePort::new(uart, "test-PL011-0");
+            if port.read_byte().is_some() {
+                return TestResult::Fail("read_byte must be None when FR.RXFE is set");
+            }
+            core::ptr::write_volatile(base.add(REG_DR / 4), 0x42);
+            core::ptr::write_volatile(base.add(REG_FR / 4), 0);
+            match port.read_byte() {
+                Some(0x42) => {}
+                _ => {
+                    return TestResult::Fail(
+                        "read_byte must return the DR byte when RXFE is clear",
+                    );
+                }
+            }
+            core::ptr::write_volatile(base.add(REG_DR / 4), 0xDEAD_BEEF);
+            core::ptr::write_volatile(base.add(REG_FR / 4), 0);
+            port.write_bytes(&[0x41]);
+            if core::ptr::read_volatile(base.add(REG_DR / 4)) != 0x41 {
+                return TestResult::Fail("write_bytes must store the byte in DR (32-bit write)");
+            }
+            if port.name() != "test-PL011-0" {
+                return TestResult::Fail("port name must come from the constructor");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/h5-transport",
+        smoke_h5_pl011_byte_port_read_write
+    );
+
+    /// `byte_port_for` dispatches on the registry entry's kind: a
+    /// PL011 entry yields a port that talks PL011 registers. The
+    /// proof is behavioral, not a type assertion — if the dispatch
+    /// had built an 8250 port instead, the write would be an 8-bit
+    /// store (DR keeps its high bytes) on x86_64, or dropped
+    /// entirely on aarch64 (inert 8250 accessors), and reads would
+    /// follow LSR instead of FR.
+    fn smoke_h5_byte_port_for_dispatches_on_family() -> TestResult {
+        use narf_drivers_serial::pl011::{FR_RXFE, REG_DR, REG_FR};
+        use narf_drivers_serial::registry::UartFamily;
+        use narf_memory::PhysAddr;
+        let regs = make_fake_pl011_regs();
+        let base = regs.as_mut_ptr();
+        let info = UartInfo {
+            base: UartBase::Mmio(PhysAddr::new(0x0900_0000)),
+            reg_shift: 0,
+            clock_hz: 24_000_000,
+            irq: None,
+            name: "test-PL011-0",
+            baud: 115_200,
+            kind: UartFamily::Pl011,
+            virt: Some(base as u64),
+        };
+        let Some(port) = H5Transport::byte_port_for(&info) else {
+            return TestResult::Fail("byte_port_for must build a port for a PL011 entry");
+        };
+        if port.name() != "test-PL011-0" {
+            return TestResult::Fail("port name must come from the registry entry");
+        }
+        // SAFETY: `regs` is a live RAM-backed register block for the
+        // duration of this test; every index below is in-bounds.
+        unsafe {
+            core::ptr::write_volatile(base.add(REG_DR / 4), 0xDEAD_BEEF);
+            core::ptr::write_volatile(base.add(REG_FR / 4), 0);
+            port.write_bytes(&[0x41]);
+            if core::ptr::read_volatile(base.add(REG_DR / 4)) != 0x41 {
+                return TestResult::Fail(
+                    "PL011 port write must be a 32-bit DR store (wrong port kind?)",
+                );
+            }
+            core::ptr::write_volatile(base.add(REG_DR / 4), 0x55);
+            core::ptr::write_volatile(base.add(REG_FR / 4), 0);
+            if port.read_byte() != Some(0x55) {
+                return TestResult::Fail("PL011 port read must return the DR byte");
+            }
+            core::ptr::write_volatile(base.add(REG_FR / 4), FR_RXFE);
+            if port.read_byte().is_some() {
+                return TestResult::Fail("PL011 port read must be None when FR.RXFE is set");
+            }
+        }
+        // A PL011 entry with no mapped VA builds nothing rather
+        // than poking the physical base.
+        let unmapped = UartInfo { virt: None, ..info };
+        if H5Transport::byte_port_for(&unmapped).is_some() {
+            return TestResult::Fail("byte_port_for must return None for an unmapped PL011 entry");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/h5-transport",
+        smoke_h5_byte_port_for_dispatches_on_family
     );
 }

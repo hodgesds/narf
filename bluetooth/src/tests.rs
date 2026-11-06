@@ -6993,6 +6993,29 @@ kernel_test_in!(
     smoke_btintel_firmware_runs_after_firmware_scans
 );
 
+/// The opt-in H5 boot bind must run before the bring-up pass, or it
+/// would register its transport after `bring_up_all` already ran and
+/// the controller would sit unbrought-up until a later pass (there
+/// is none). Mirrors the btintel firmware ordering test above.
+fn smoke_bt_h5_boot_bind_runs_before_bringup() -> TestResult {
+    let late = narf_init::registered_names(narf_init::Stage::Late);
+    let pos = |needle: &str| late.iter().position(|n| *n == needle);
+
+    let (Some(h5), Some(bringup)) = (pos("bluetooth-h5-boot"), pos("bluetooth-bringup")) else {
+        return TestResult::Skip("bluetooth initcalls not registered in this build");
+    };
+    if bringup < h5 {
+        return TestResult::Fail(
+            "bluetooth-h5-boot runs after bluetooth-bringup; the bound transport would miss bring-up",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/h5-transport",
+    smoke_bt_h5_boot_bind_runs_before_bringup
+);
+
 /// The RX ring carries events, ACL and synchronous data interleaved
 /// in one stream, while `HciTransport` asks for them through separate
 /// calls. Without per-class queues, whichever call ran first would

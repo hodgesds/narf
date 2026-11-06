@@ -66,6 +66,8 @@ pub fn enumerate_acpi_uarts() {
             irq: dev.irq,
             name: ACPI_UART_NAME,
             baud: 115_200,
+            kind: registry::UartFamily::Uart8250,
+            virt: None,
         });
         found += 1;
     }

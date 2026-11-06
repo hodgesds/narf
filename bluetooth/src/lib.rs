@@ -143,6 +143,46 @@ pub fn register_initcalls() {
         btintel_pcie::register_pci_driver();
         InitResult::Ok
     });
+    // Stage: opt-in H5 boot bind (`bt-h5=<uart-name>`, issue #1580
+    // items 1–2). Runs before `bluetooth-bringup` (registered later
+    // by bare_main) so the bound transport is in the registry when
+    // the bring-up pass runs; the pump adopts it from
+    // `pump::notify_controller_ready` at bring-up time. No cmdline
+    // key, or an empty value, means no bind — a UART is never stolen
+    // from the `/dev/ttyS<N>` data ttys without opt-in. Link
+    // establishment may take the full 5 s budget, hence the
+    // explicit 6 s budget (the default 500 ms would only log an
+    // over-budget warning, not kill the call).
+    narf_init::register_with_budget(
+        Stage::Late,
+        "bluetooth-h5-boot",
+        || {
+            use core::fmt::Write as _;
+            let Some(name) = h5_transport::boot_bind_name(narf_boot::args()) else {
+                return InitResult::NotPresent;
+            };
+            match h5_transport::H5Transport::bind_named(name) {
+                Some(t) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  bluetooth: H5 on {} (bt-h5={})",
+                        t.port_name(),
+                        name
+                    );
+                    InitResult::Ok
+                }
+                None => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  bluetooth: bt-h5={} did not bind (unknown UART, unmapped port, or no link)",
+                        name
+                    );
+                    InitResult::NotPresent
+                }
+            }
+        },
+        6000,
+    );
     narf_init::register(Stage::Late, "bluetooth-stage0", || {
         // Stage 0: no work beyond registering the subsystem. A real
         // controller probed by the USB supervisor will print its own
