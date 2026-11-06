@@ -47,6 +47,8 @@ pub enum NicModel {
     NvidiaForcedeth,
     /// Broadcom Tigon3 — "tg3".
     BroadcomTg3,
+    /// VMware vmxnet3 paravirtual NIC — "vmxnet3".
+    VmwareVmxnet3,
 }
 
 impl NicModel {
@@ -66,6 +68,7 @@ impl NicModel {
             NicModel::AtherosAtl1c => (0x1969, 0x1063),
             NicModel::NvidiaForcedeth => (0x10DE, 0x0372),
             NicModel::BroadcomTg3 => (0x14E4, 0x1644),
+            NicModel::VmwareVmxnet3 => (0x15AD, 0x07B0),
         }
     }
 }
