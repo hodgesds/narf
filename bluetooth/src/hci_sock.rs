@@ -17,6 +17,7 @@ use crate::hci::Command;
 /// HCI packet-type indicators (first byte on the HCI socket wire).
 const HCI_COMMAND_PKT: u8 = 0x01;
 const HCI_ACLDATA_PKT: u8 = 0x02;
+const HCI_SCODATA_PKT: u8 = 0x03;
 const HCI_EVENT_PKT: u8 = 0x04;
 
 /// Send a type-prefixed HCI packet to controller `dev`'s transport. Returns
@@ -37,6 +38,10 @@ pub fn send(dev: u16, packet: &[u8]) -> bool {
                 .is_ok()
         }
         Some(HCI_ACLDATA_PKT) => transport.send_acl(&packet[1..]).is_ok(),
+        // SCO data (issue #814): forwarded to the transport's
+        // `send_sco` (#817 isoch path); a transport without SCO
+        // refuses, never misroutes to bulk-OUT.
+        Some(HCI_SCODATA_PKT) => transport.send_sco(&packet[1..]).is_ok(),
         _ => false,
     }
 }
@@ -199,6 +204,38 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/hci_sock", smoke_hci_sock_send_and_drain);
+
+    /// #814: a raw-HCI SCO data packet (0x03) reaches the
+    /// transport's `send_sco` instead of being rejected — the
+    /// LoopbackTransport's default no-op accepts it — while an
+    /// unknown packet type is still refused.
+    fn smoke_hci_sock_send_sco() -> TestResult {
+        crate::transport::__test_reset();
+        controller::__test_reset_controllers();
+        let loopback = Arc::new(LoopbackTransport::new("hci-sock-sco"));
+        let transport: Arc<dyn crate::transport::HciTransport> = loopback.clone();
+        crate::transport::register(transport.clone());
+        let dev =
+            controller::register_ready_transport(transport, controller::ControllerInfo::default())
+                as u16;
+
+        // SCO data: 0x03 || handle(2) || payload — §5.4.3 framing.
+        let sco = [HCI_SCODATA_PKT, 0x43, 0x00, b'v', b'o', b'i', b'c', b'e'];
+        let sent = send(dev, &sco);
+        let unknown = send(dev, &[0x07, 0x00]);
+
+        crate::transport::__test_reset();
+        controller::__test_reset_controllers();
+
+        if !sent {
+            return TestResult::Fail("HCI SCO data packet was not forwarded to send_sco");
+        }
+        if unknown {
+            return TestResult::Fail("unknown HCI packet type was not rejected");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/hci_sock", smoke_hci_sock_send_sco);
 
     fn smoke_hci_sock_monitor_replay() -> TestResult {
         crate::transport::__test_reset();
