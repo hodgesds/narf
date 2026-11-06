@@ -802,10 +802,7 @@ fn smoke_nvme_probe_wires_msix_irq_datapath() -> TestResult {
                 );
             }
         }
-        if ctrl
-            .write_lba(1, 1, &buf)
-            .is_err()
-        {
+        if ctrl.write_lba(1, 1, &buf).is_err() {
             return TestResult::Fail("write_lba via IRQ path failed");
         }
         // SAFETY: same.
