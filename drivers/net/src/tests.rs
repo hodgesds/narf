@@ -38,6 +38,119 @@ fn smoke_r8169_pci_probe() -> TestResult {
 }
 kernel_test_in!("drivers/net/r8169", smoke_r8169_pci_probe);
 
+// ── r8169 multi-instance (issue #795) ─────────────────────────────
+
+/// Same shape as `smoke_e1000_multi_instance_cookie_dispatch` (see
+/// its doc comment): one live instance at cookie 0, no instance at
+/// cookie 1, published iface resolves by name, `send_on` dispatches
+/// through cookie 0, re-probe keeps the same `Arc`, and the registry
+/// adapter borrows the NIC's own rings. The QEMU test VM has no
+/// Realtek NIC, so only the no-silicon branch runs in CI; the live
+/// branch runs on real hardware. This also pins the `bring_up`
+/// fix: before #795 the probe always failed here because
+/// `Arc::try_unwrap` could never succeed once the pump tasks held
+/// clones — `is_probed()` after probe would have been false.
+fn smoke_r8169_multi_instance_cookie_dispatch() -> TestResult {
+    use crate::r8169;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window the test harness
+    // maps before running; `init` only walks that ECAM region and is safe to
+    // call repeatedly (idempotent on re-entry).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_r8169 = devs.iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == r8169::RTL_VENDOR
+            && d.id.device == r8169::RTL_DEV_8168
+    });
+    if !has_r8169 {
+        if r8169::instance_count() != 0 {
+            return TestResult::Fail("instance_count != 0 with no r8169 silicon");
+        }
+        if r8169::controller(0).is_some() {
+            return TestResult::Fail("controller(0) Some with no r8169 silicon");
+        }
+        if r8169::is_probed() {
+            return TestResult::Fail("is_probed with no r8169 silicon");
+        }
+        let frame = [0u8; 64];
+        if narf_net::iface::send_on("eth999", &frame).is_ok() {
+            return TestResult::Fail("send_on resolved a nonexistent iface");
+        }
+        return TestResult::Pass;
+    }
+    __reset_for_test();
+    r8169::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !r8169::is_probed() {
+        return TestResult::Fail("r8169 not probed");
+    }
+    if r8169::instance_count() != 1 {
+        return TestResult::Fail("instance_count != 1 after single-NIC probe");
+    }
+    let ctrl = match r8169::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) None after probe"),
+    };
+    if r8169::controller(1).is_some() {
+        return TestResult::Fail("controller(1) Some with one NIC");
+    }
+    if r8169::controller(usize::MAX).is_some() {
+        return TestResult::Fail("controller(MAX) Some");
+    }
+    let name = ctrl.ifname();
+    if name.is_empty() {
+        return TestResult::Fail("published name empty after probe");
+    }
+    if narf_net::iface::lookup(name).is_none() {
+        return TestResult::Fail("iface not published under its name");
+    }
+    let mut frame = [0u8; 64];
+    frame[..6].fill(0xFF);
+    frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+    frame[12] = 0xFF;
+    frame[13] = 0xFF;
+    if narf_net::iface::send_on(name, &frame).is_err() {
+        return TestResult::Fail("send_on cookie-0 TX failed");
+    }
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    let after = match r8169::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) vanished across re-probe"),
+    };
+    if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrl) {
+        return TestResult::Fail("re-probe replaced controller(0)");
+    }
+    let ring_ptr =
+        narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+    if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
+    }
+    if ctrl.rx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("attach took the NIC's RX ring");
+    }
+    let tx_ptr =
+        narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+    if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
+    }
+    if ctrl.tx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("attach took the NIC's TX ring");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/r8169",
+    smoke_r8169_multi_instance_cookie_dispatch
+);
+
 // ── qcnfa765 ───────────────────────────────────────────────────────
 //
 // (moved to drivers/wireless/ as part of the wireless consolidation
@@ -79,7 +192,7 @@ fn smoke_e1000_bring_up_and_tx() -> TestResult {
     if !e1000::is_probed() {
         return TestResult::Fail("e1000 not probed");
     }
-    let mac = e1000::with_controller(|c| c.mac).unwrap_or([0; 6]);
+    let mac = e1000::with_controller(0, |c| c.mac).unwrap_or([0; 6]);
     if mac == [0; 6] || mac == [0xFF; 6] {
         return TestResult::Fail("MAC reads as all-zero or all-FF");
     }
@@ -91,7 +204,7 @@ fn smoke_e1000_bring_up_and_tx() -> TestResult {
     for (i, b) in frame.iter_mut().enumerate().skip(14) {
         *b = (i as u8).wrapping_mul(0x4D);
     }
-    let tx_ok = e1000::with_controller(|c| c.tx(&frame))
+    let tx_ok = e1000::with_controller(0, |c| c.tx(&frame))
         .map(|r| r.is_ok())
         .unwrap_or(false);
     if !tx_ok {
@@ -103,14 +216,15 @@ kernel_test_in!("drivers/net/e1000", smoke_e1000_bring_up_and_tx);
 
 /// The installed controller must never be replaced by a repeat probe.
 ///
-/// `e1000::probed_controller` clones the `Arc` out of `CONTROLLER` and
+/// `e1000::controller(0)` clones the `Arc` out of `CONTROLLERS` and
 /// releases the lock, so callers run whole device round-trips (the
 /// 250 ms TX DD poll) against that handle with no lock held and
 /// interrupts enabled. The `Arc` makes that memory-safe regardless, but
-/// the driver's correctness still rests on `probe`'s install-once early
-/// return: if a re-probe ever built a SECOND `E1000` for the same
+/// the driver's correctness still rests on `probe`'s same-address
+/// early return: if a re-probe ever built a SECOND `E1000` for the same
 /// silicon, old handles would keep driving the rings while the new
-/// instance reprogrammed them underneath. Pin the invariant: probing
+/// instance reprogrammed them underneath. (A second FUNCTION binds a
+/// new instance instead — issue #795.) Pin the invariant: probing
 /// again must hand back the same controller, before and after traffic.
 fn smoke_e1000_controller_handle_is_stable() -> TestResult {
     use crate::e1000;
@@ -119,7 +233,7 @@ fn smoke_e1000_controller_handle_is_stable() -> TestResult {
     if !e1000::is_probed() {
         return TestResult::Skip("e1000 not probed");
     }
-    let before = match e1000::probed_controller() {
+    let before = match e1000::controller(0) {
         Some(c) => alloc::sync::Arc::as_ptr(&c) as usize,
         None => return TestResult::Fail("probed controller has no handle"),
     };
@@ -127,7 +241,7 @@ fn smoke_e1000_controller_handle_is_stable() -> TestResult {
     // A repeat probe must be refused, not install a fresh controller.
     let authority = bootstrap_registry_authority();
     let _ = probe_all_pci(&authority);
-    match e1000::probed_controller().map(|c| alloc::sync::Arc::as_ptr(&c) as usize) {
+    match e1000::controller(0).map(|c| alloc::sync::Arc::as_ptr(&c) as usize) {
         Some(a) if a == before => {}
         Some(_) => return TestResult::Fail("re-probe REPLACED the installed controller"),
         None => return TestResult::Fail("re-probe removed the installed controller"),
@@ -135,8 +249,8 @@ fn smoke_e1000_controller_handle_is_stable() -> TestResult {
 
     // And it must survive ordinary traffic through the unlocked path.
     let mut buf = [0u8; 64];
-    let _ = e1000::with_controller(|c| c.rx_recv(&mut buf));
-    match e1000::probed_controller().map(|c| alloc::sync::Arc::as_ptr(&c) as usize) {
+    let _ = e1000::with_controller(0, |c| c.rx_recv(&mut buf));
+    match e1000::controller(0).map(|c| alloc::sync::Arc::as_ptr(&c) as usize) {
         Some(a) if a == before => TestResult::Pass,
         Some(_) => TestResult::Fail("controller handle changed across I/O"),
         None => TestResult::Fail("controller vanished across I/O"),
@@ -171,7 +285,7 @@ fn smoke_e1000_rx_arp_request() -> TestResult {
     if probe_all_pci(&authority).is_err() {
         return TestResult::Fail("probe_all_pci");
     }
-    let mac = e1000::with_controller(|c| c.mac).unwrap_or([0; 6]);
+    let mac = e1000::with_controller(0, |c| c.mac).unwrap_or([0; 6]);
     let mut frame = [0u8; 42];
     frame[..6].fill(0xFF);
     frame[6..(6 + 6)].copy_from_slice(&mac);
@@ -194,7 +308,7 @@ fn smoke_e1000_rx_arp_request() -> TestResult {
     frame[39] = 0;
     frame[40] = 2;
     frame[41] = 2;
-    if !e1000::with_controller(|c| c.tx(&frame))
+    if !e1000::with_controller(0, |c| c.tx(&frame))
         .map(|r| r.is_ok())
         .unwrap_or(false)
     {
@@ -203,7 +317,7 @@ fn smoke_e1000_rx_arp_request() -> TestResult {
     let mut rx_buf = [0u8; 1518];
     let mut any_len = 0usize;
     for _ in 0..1_000_000u32 {
-        let len = e1000::with_controller(|c| c.rx_recv(&mut rx_buf)).unwrap_or(0);
+        let len = e1000::with_controller(0, |c| c.rx_recv(&mut rx_buf)).unwrap_or(0);
         if len > 0 {
             any_len = len;
             break;
@@ -211,7 +325,7 @@ fn smoke_e1000_rx_arp_request() -> TestResult {
         core::hint::spin_loop();
     }
     let _ = any_len;
-    let _ = e1000::with_controller(|c| c.rx_has_pending());
+    let _ = e1000::with_controller(0, |c| c.rx_has_pending());
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/e1000", smoke_e1000_rx_arp_request);
@@ -405,6 +519,115 @@ fn smoke_igb_pci_match_ownership() -> TestResult {
 }
 kernel_test_in!("drivers/net/igb", smoke_igb_pci_match_ownership);
 
+// ── igb multi-instance (issue #795) ───────────────────────────────
+
+/// Same shape as `smoke_e1000_multi_instance_cookie_dispatch` (see
+/// its doc comment): one live instance at cookie 0, no instance at
+/// cookie 1, published iface resolves by name, `send_on` dispatches
+/// through cookie 0, re-probe keeps the same `Arc`, and the registry
+/// adapter borrows the NIC's own rings. Live branch runs under
+/// `XTASK_QEMU_IGB=1`; the no-silicon branch runs in CI everywhere.
+fn smoke_igb_multi_instance_cookie_dispatch() -> TestResult {
+    use crate::igb;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window the test harness
+    // maps before running; `init` only walks that ECAM region and is safe to
+    // call repeatedly (idempotent on re-entry).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_igb = devs.iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == igb::IGB_VENDOR
+            && igb::SUPPORTED_DEVICE_IDS.contains(&d.id.device)
+    });
+    if !has_igb {
+        if igb::instance_count() != 0 {
+            return TestResult::Fail("instance_count != 0 with no igb silicon");
+        }
+        if igb::controller(0).is_some() {
+            return TestResult::Fail("controller(0) Some with no igb silicon");
+        }
+        if igb::is_probed() {
+            return TestResult::Fail("is_probed with no igb silicon");
+        }
+        let frame = [0u8; 64];
+        if narf_net::iface::send_on("eth999", &frame).is_ok() {
+            return TestResult::Fail("send_on resolved a nonexistent iface");
+        }
+        return TestResult::Pass;
+    }
+    __reset_for_test();
+    igb::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !igb::is_probed() {
+        return TestResult::Fail("igb not probed");
+    }
+    if igb::instance_count() != 1 {
+        return TestResult::Fail("instance_count != 1 after single-NIC probe");
+    }
+    let ctrl = match igb::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) None after probe"),
+    };
+    if igb::controller(1).is_some() {
+        return TestResult::Fail("controller(1) Some with one NIC");
+    }
+    if igb::controller(usize::MAX).is_some() {
+        return TestResult::Fail("controller(MAX) Some");
+    }
+    let name = ctrl.ifname();
+    if name.is_empty() {
+        return TestResult::Fail("published name empty after probe");
+    }
+    if narf_net::iface::lookup(name).is_none() {
+        return TestResult::Fail("iface not published under its name");
+    }
+    let mut frame = [0u8; 64];
+    frame[..6].fill(0xFF);
+    frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+    frame[12] = 0xFF;
+    frame[13] = 0xFF;
+    if narf_net::iface::send_on(name, &frame).is_err() {
+        return TestResult::Fail("send_on cookie-0 TX failed");
+    }
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    let after = match igb::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) vanished across re-probe"),
+    };
+    if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrl) {
+        return TestResult::Fail("re-probe replaced controller(0)");
+    }
+    let ring_ptr =
+        narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+    if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
+    }
+    if ctrl.rx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("attach took the NIC's RX ring");
+    }
+    let tx_ptr =
+        narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+    if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
+    }
+    if ctrl.tx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("attach took the NIC's TX ring");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igb",
+    smoke_igb_multi_instance_cookie_dispatch
+);
+
 fn smoke_e1000_pci_match_table_covers_modern_pch() -> TestResult {
     // Structural smoke: register the e1000 driver and assert every
     // ID in `SUPPORTED_DEVICE_IDS` is present in the bus's match
@@ -596,7 +819,7 @@ fn smoke_e1000_qemu_fwsm_dance_is_noop() -> TestResult {
     }
     // QEMU's 82540EM / 82574L must come up as a legacy part with no
     // active ME — the FWSM dance was skipped entirely.
-    let (pch, me) = e1000::with_controller(|c| (c.pch_part, c.me_active)).unwrap_or((true, true));
+    let (pch, me) = e1000::with_controller(0, |c| (c.pch_part, c.me_active)).unwrap_or((true, true));
     if pch {
         return TestResult::Fail("QEMU NIC mis-classified as PCH");
     }
@@ -606,6 +829,133 @@ fn smoke_e1000_qemu_fwsm_dance_is_noop() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/e1000", smoke_e1000_qemu_fwsm_dance_is_noop);
+
+// ── e1000 multi-instance (issue #795) ─────────────────────────────
+
+/// Multi-instance cookie dispatch: after probe exactly one live
+/// instance exists at cookie 0, no instance at cookie 1, the
+/// published iface resolves by name, and the registry send path
+/// (`send_on`) dispatches through cookie 0 to the live controller.
+/// The per-instance ring adapter borrows the NIC's own ring (no
+/// static take): the adapter's `rx_ring` pointer IS the
+/// controller's `rx_ipc_ring`, and the controller still owns its
+/// ring after attach. A re-probe hands back the same `Arc`.
+///
+/// No-silicon branch runs in CI on every config: with no device
+/// present the vec must be empty and the registry send must fail.
+/// A second NIC of the same family is only provable with two
+/// devices attached; the cookie plumbing pinned here is the same
+/// path a second port's traffic takes (cookie 1 instead of 0).
+fn smoke_e1000_multi_instance_cookie_dispatch() -> TestResult {
+    use crate::e1000;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window the test harness
+    // maps before running; `init` only walks that ECAM region and is safe to
+    // call repeatedly (idempotent on re-entry).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_e1000 = devs.iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == e1000::E1000_VENDOR
+            && (d.id.device == e1000::E1000_DEV_82540EM
+                || d.id.device == e1000::E1000_DEV_82545EM
+                || d.id.device == e1000::E1000_DEV_82544GC
+                || d.id.device == e1000::E1000E_DEV_82574L)
+    });
+    // No silicon: the vec must be empty and cookie-0 send must fail
+    // at the registry (no iface registered for this family).
+    if !has_e1000 {
+        if e1000::instance_count() != 0 {
+            return TestResult::Fail("instance_count != 0 with no e1000 silicon");
+        }
+        if e1000::controller(0).is_some() {
+            return TestResult::Fail("controller(0) Some with no e1000 silicon");
+        }
+        if e1000::is_probed() {
+            return TestResult::Fail("is_probed with no e1000 silicon");
+        }
+        let frame = [0u8; 64];
+        if narf_net::iface::send_on("eth999", &frame).is_ok() {
+            return TestResult::Fail("send_on resolved a nonexistent iface");
+        }
+        return TestResult::Pass;
+    }
+    __reset_for_test();
+    e1000::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !e1000::is_probed() {
+        return TestResult::Fail("e1000 not probed");
+    }
+    if e1000::instance_count() != 1 {
+        return TestResult::Fail("instance_count != 1 after single-NIC probe");
+    }
+    let ctrl = match e1000::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) None after probe"),
+    };
+    if e1000::controller(1).is_some() {
+        return TestResult::Fail("controller(1) Some with one NIC");
+    }
+    if e1000::controller(usize::MAX).is_some() {
+        return TestResult::Fail("controller(MAX) Some");
+    }
+    let name = ctrl.ifname();
+    if name.is_empty() {
+        return TestResult::Fail("published name empty after probe");
+    }
+    if narf_net::iface::lookup(name).is_none() {
+        return TestResult::Fail("iface not published under its name");
+    }
+    // Cookie-0 send through the real registry path: the stored
+    // (cookie, send) pair must resolve to this controller.
+    let mut frame = [0u8; 64];
+    frame[..6].fill(0xFF);
+    frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+    frame[12] = 0xFF;
+    frame[13] = 0xFF;
+    if narf_net::iface::send_on(name, &frame).is_err() {
+        return TestResult::Fail("send_on cookie-0 TX failed");
+    }
+    // A repeat probe must hand back the same Arc (same-address guard).
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    let after = match e1000::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) vanished across re-probe"),
+    };
+    if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrl) {
+        return TestResult::Fail("re-probe replaced controller(0)");
+    }
+    // Ring identity: the registry adapter borrows the NIC's own
+    // ring — no static take happened at attach.
+    let ring_ptr =
+        narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+    if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
+    }
+    if ctrl.rx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("attach took the NIC's RX ring");
+    }
+    let tx_ptr =
+        narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+    if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
+    }
+    if ctrl.tx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("attach took the NIC's TX ring");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/e1000",
+    smoke_e1000_multi_instance_cookie_dispatch
+);
 
 // ── atheros (atl1c — AR81xx Gigabit Ethernet) ─────────────────────
 //
@@ -820,6 +1170,119 @@ fn smoke_atl1c_default_intr_mask_includes_rx_tx() -> TestResult {
 kernel_test_in!(
     "drivers/net/atheros",
     smoke_atl1c_default_intr_mask_includes_rx_tx
+);
+
+// ── atheros multi-instance (issue #795) ────────────────────────────
+
+/// Same shape as `smoke_e1000_multi_instance_cookie_dispatch` (see
+/// its doc comment): one live instance at cookie 0, no instance at
+/// cookie 1, published iface resolves by name, `send_on` dispatches
+/// through cookie 0, re-probe keeps the same `Arc`, and the registry
+/// adapter borrows the NIC's own rings. The QEMU test VM has no
+/// Atheros NIC, so only the no-silicon branch runs in CI; the live
+/// branch runs on real hardware. This also pins the `bring_up`
+/// fix: before #795 the probe always failed here because
+/// `Arc::try_unwrap` could never succeed once the pump tasks held
+/// clones — `is_probed()` after probe would have been false.
+fn smoke_atheros_multi_instance_cookie_dispatch() -> TestResult {
+    use crate::atheros;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window the test harness
+    // maps before running; `init` only walks that ECAM region and is safe to
+    // call repeatedly (idempotent on re-entry).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_atl = devs.iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == atheros::ATL_VENDOR
+            && atheros::SUPPORTED_DEVICE_IDS.contains(&d.id.device)
+    });
+    if !has_atl {
+        if atheros::instance_count() != 0 {
+            return TestResult::Fail("instance_count != 0 with no atheros silicon");
+        }
+        if atheros::controller(0).is_some() {
+            return TestResult::Fail("controller(0) Some with no atheros silicon");
+        }
+        if atheros::is_probed() {
+            return TestResult::Fail("is_probed with no atheros silicon");
+        }
+        let frame = [0u8; 64];
+        if narf_net::iface::send_on("eth999", &frame).is_ok() {
+            return TestResult::Fail("send_on resolved a nonexistent iface");
+        }
+        return TestResult::Pass;
+    }
+    __reset_for_test();
+    atheros::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !atheros::is_probed() {
+        return TestResult::Fail("atheros not probed");
+    }
+    if atheros::instance_count() != 1 {
+        return TestResult::Fail("instance_count != 1 after single-NIC probe");
+    }
+    let ctrl = match atheros::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) None after probe"),
+    };
+    if atheros::controller(1).is_some() {
+        return TestResult::Fail("controller(1) Some with one NIC");
+    }
+    if atheros::controller(usize::MAX).is_some() {
+        return TestResult::Fail("controller(MAX) Some");
+    }
+    let name = ctrl.ifname();
+    if name.is_empty() {
+        return TestResult::Fail("published name empty after probe");
+    }
+    if narf_net::iface::lookup(name).is_none() {
+        return TestResult::Fail("iface not published under its name");
+    }
+    let mut frame = [0u8; 64];
+    frame[..6].fill(0xFF);
+    frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+    frame[12] = 0xFF;
+    frame[13] = 0xFF;
+    if narf_net::iface::send_on(name, &frame).is_err() {
+        return TestResult::Fail("send_on cookie-0 TX failed");
+    }
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    let after = match atheros::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) vanished across re-probe"),
+    };
+    if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrl) {
+        return TestResult::Fail("re-probe replaced controller(0)");
+    }
+    let ring_ptr =
+        narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+    if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
+    }
+    if ctrl.rx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("attach took the NIC's RX ring");
+    }
+    let tx_ptr =
+        narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+    if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
+    }
+    if ctrl.tx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("attach took the NIC's TX ring");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/atheros",
+    smoke_atheros_multi_instance_cookie_dispatch
 );
 
 // ── Realtek PHY / RX descriptor smokes ─────────────────────────────
