@@ -29,7 +29,13 @@ All driver code is derived strictly from the references below.
   §6.6.4 (SWITCH command argument layout — Access:2 / Index:8 /
   Value:8 / CmdSet:8). §6.6.5 (HS200 / HS400 timing flags).
   §6.13 (device status: CURRENT_STATE bits [12:9], SWITCH_ERROR
-  bit 7, READY_FOR_DATA bit 8). §6.15 (RPMB authenticated frames).
+  bit 7, READY_FOR_DATA bit 8). §6.6.22 (RPMB authenticated
+  frames: Table 17 frame layout, Table 18 request/response
+  types, Tables 19/20 operation results, §6.6.22.3 HMAC-SHA-256
+  over frame bytes [283:0], §6.6.22.4 CMD23 + CMD18/CMD25
+  accesses with CMD23 bit 31 = reliable write). §6.6.7.1 /
+  §6.6.8.1 (CMD23 pre-defined block count terminates the
+  transfer; no CMD12).
   §7.4 (EXT_CSD register, 512 bytes; field offsets in Table 93:
   REV=192, CARD_TYPE=196, BUS_WIDTH=183, HS_TIMING=185,
   PARTITION_CONFIG=179, BOOT_SIZE_MULT=226, RPMB_SIZE_MULT=168,
@@ -183,7 +189,12 @@ All driver code is derived strictly from the references below.
   `emmc0gp<m>`; every I/O through a hardware partition switches the
   card to that partition first (cached, verified by CMD13). RPMB is
   decoded and sized but not published as a plain block device: it
-  admits only authenticated frames (§6.15). (#827)
+  admits only authenticated frames (§6.6.22), implemented in
+  `sdhci::rpmb` as single-frame (256 B) operations — key program,
+  authenticated counter read, authenticated data read/write with
+  HMAC-SHA-256 and a fresh nonce per read, result readback with
+  the counter+1 check — over CMD23 + CMD18/CMD25; the key is
+  supplied per operation and never stored. (#827, #1622)
 - **SD protocol decoders** (`sd_proto`): pure parsers for R1, R6, R7
   responses; CID register (manufacturer + OEM + product name + serial
   + MDT); CSD register (both v1.0 and v2.0 capacity formulas + read /
@@ -199,6 +210,7 @@ All driver code is derived strictly from the references below.
   for eMMC (needs the eMMC driver, #827).
 - eMMC EXT_CSD (JEDEC JESD84-B51) — landed when an eMMC fabric is
   exercised end-to-end.
-- RPMB authenticated-frame protocol (CMD23 + CMD17/CMD24 frames
-  carrying a MAC and a nonce / write counter) — the RPMB partition
-  is decoded and sized but not published as a plain block device.
+- RPMB multi-frame transfers (512 B / 8 KB, §6.6.22.4.3) and the
+  authenticated device-configuration accesses (0x0006/0x0007,
+  §6.6.22.4.5/§6.6.22.4.6) — the single-frame protocol is landed;
+  these are extensions, not the protocol itself.

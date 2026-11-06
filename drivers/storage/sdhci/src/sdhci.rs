@@ -303,7 +303,12 @@ const CMD_CRC_EN: u16 = 1 << 3;
 const CMD_INDEX_EN: u16 = 1 << 4;
 const CMD_DATA_PRES: u16 = 1 << 5;
 
-// Transfer mode bits (§2.2.5).
+// Transfer mode bits (§2.2.5). BLOCK_COUNT_EN + MULTI_BLOCK are
+// wired by the RPMB path (CMD18/CMD25 with a CMD23 pre-defined
+// count); AUTO_CMD12 stays off there — the CMD23 count terminates
+// the transfer, so no CMD12 is issued (JESD84-B51 §6.6.7.1/§6.6.8.1).
+// (TM_DMA is live again: main's #837 datapath sets it for DMA
+// transfers; the RPMB base had it unused.)
 const TM_DMA: u16 = 1 << 0;
 const TM_BLOCK_COUNT_EN: u16 = 1 << 1;
 const TM_AUTO_CMD12: u16 = 1 << 2;
@@ -325,6 +330,19 @@ fn make_cmd(idx: u8, resp_kind: u16, has_data: bool) -> u16 {
         v |= CMD_DATA_PRES;
     }
     v
+}
+
+/// Transfer Mode bits for a multi-block command with a CMD23
+/// pre-defined block count: multi-block select + block-count
+/// enable, Auto-CMD12 off — the CMD23 count terminates the
+/// transfer, so no CMD12 is issued (JESD84-B51 §6.6.7.1/§6.6.8.1).
+/// Single-block commands pass `false` and get no extra bits.
+const fn multi_block_tm(multi: bool) -> u16 {
+    if multi {
+        TM_BLOCK_COUNT_EN | TM_MULTI_BLOCK
+    } else {
+        0
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -2282,7 +2300,7 @@ impl Sdhci {
     pub fn read_block(&self, lba: u32, out: &mut [u8; 512]) -> Result<(), SdhciError> {
         let card = self.card.lock().ok_or(SdhciError::NoCard)?;
         let arg = if card.ccs { lba } else { lba * 512 };
-        self.read_pio_block(17, arg, out)
+        self.read_pio_block(17, arg, false, out)
     }
 
     /// Issue a single-block read command (`idx` — CMD17 for a card
@@ -2290,9 +2308,23 @@ impl Sdhci {
     /// block from the Buffer Data Port. `arg` is the command
     /// argument as the card expects it: a block address for
     /// sector-addressed cards, a byte address otherwise.
-    fn read_pio_block(&self, idx: u8, arg: u32, out: &mut [u8; 512]) -> Result<(), SdhciError> {
+    ///
+    /// With `multi`, the command is a multi-block command with a
+    /// CMD23 pre-defined block count (`idx` — CMD18): the Transfer
+    /// Mode selects multi-block + block-count-enable and leaves
+    /// Auto-CMD12 off, so the CMD23 count terminates the transfer
+    /// and no CMD12 is issued (JESD84-B51 §6.6.7.1). The transfer
+    /// itself is still one 512-byte block — this lane only ever
+    /// pre-defines a count of 1.
+    fn read_pio_block(
+        &self,
+        idx: u8,
+        arg: u32,
+        multi: bool,
+        out: &mut [u8; 512],
+    ) -> Result<(), SdhciError> {
         // Data-direction read.
-        let tm = TM_DATA_DIR_READ;
+        let tm = TM_DATA_DIR_READ | multi_block_tm(multi);
         let _ = self.cmd(idx, arg, RESP_48, true, tm, 512, 1)?;
 
         // Wait for buffer-read-ready, then drain 512 / 4 = 128
@@ -2333,14 +2365,24 @@ impl Sdhci {
     pub fn write_block(&self, lba: u32, data: &[u8; 512]) -> Result<(), SdhciError> {
         let card = self.card.lock().ok_or(SdhciError::NoCard)?;
         let arg = if card.ccs { lba } else { lba * 512 };
-        self.write_pio_block(24, arg, data)
+        self.write_pio_block(24, arg, false, data)
     }
 
     /// Issue a single-block write command (`idx`, CMD24) and push
     /// its 512-byte data block through the Buffer Data Port. `arg`
     /// follows the same addressing rule as `read_pio_block`.
-    fn write_pio_block(&self, idx: u8, arg: u32, data: &[u8; 512]) -> Result<(), SdhciError> {
-        let _ = self.cmd(idx, arg, RESP_48, true, /*tm*/ 0, 512, 1)?;
+    ///
+    /// With `multi`, the command is a multi-block command with a
+    /// CMD23 pre-defined block count (`idx` — CMD25); see
+    /// `read_pio_block` for the Transfer Mode rule.
+    fn write_pio_block(
+        &self,
+        idx: u8,
+        arg: u32,
+        multi: bool,
+        data: &[u8; 512],
+    ) -> Result<(), SdhciError> {
+        let _ = self.cmd(idx, arg, RESP_48, true, multi_block_tm(multi), 512, 1)?;
 
         // Wait for buffer-write-ready, push 128 u32 words.
         // responsive_spin_until ticks sleep_pumps so cursor/FB stay
@@ -2814,6 +2856,11 @@ pub fn __reset_for_test() {
 }
 
 mod emmc;
+
+/// RPMB authenticated-frame protocol on the eMMC driver.
+mod rpmb;
+
+pub use self::rpmb::RpmbError;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod fixture_tests;
