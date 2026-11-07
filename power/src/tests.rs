@@ -304,6 +304,131 @@ fn smoke_thermal_active_cooling_governor() -> TestResult {
 }
 kernel_test_in!("power/thermal", smoke_thermal_active_cooling_governor);
 
+/// #914 (narrow remainder): the production thermal path needs no
+/// `subscribe()` consumer to drive cooling. `thermal::init()` —
+/// the Stage::PostCore `thermal-registry` initcall — installs the
+/// default `StepPolicy`, and the ACPI poll task feeds it through
+/// `record_temp`; the governor drives every registered cooling
+/// device inline on each band crossing. This pins that exact
+/// production path: `init()` only (no `install_active_cooling`
+/// anywhere), a zone whose trips come from the firmware's
+/// deciKelvin values through the production conversion, and the
+/// full Normal → Warm → Critical → Normal sequence asserting the
+/// driven level, the tracked level, and the event reaching a
+/// subscriber — the bus path stays live for future async
+/// observers while actuation stays with the governor.
+fn smoke_thermal_default_policy_drives_cooling_914() -> TestResult {
+    use crate::acpi_thermal::decik_to_milli_c;
+    use crate::bootstrap_thermal_authority;
+    use crate::thermal::{
+        __test_reset, current_cooling_level, init, record_temp, register_cooling_device,
+        register_zone, subscribe, CoolingDevice, ThermalEvent, ThermalState,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_capabilities::{Cap, Read};
+    use narf_event_bus::TopicRegistry;
+
+    // Fixture trips from the spec itself (ACPI 6.5 §11.4): the
+    // firmware trip points are deciKelvin, converted by the
+    // production path into the registry's milli-C bands, so the
+    // test cannot agree with the code on a hand-copied literal.
+    // _CRT 3632 deciK → 90_050 mC; _PSV 3432 deciK → 70_050 mC.
+    __test_reset();
+    init();
+    let crit_milli = decik_to_milli_c(3632);
+    let warn_milli = decik_to_milli_c(3432);
+    if crit_milli != 90_050 || warn_milli != 70_050 {
+        __test_reset();
+        return TestResult::Fail("deciKelvin trip conversion drifted from spec");
+    }
+
+    #[derive(Debug)]
+    struct RecordingFan(AtomicU8);
+    impl CoolingDevice for RecordingFan {
+        fn name(&self) -> &'static str {
+            "rec"
+        }
+        fn set_level(&self, level: u8) {
+            self.0.store(level, Ordering::SeqCst);
+        }
+    }
+
+    let cap = bootstrap_thermal_authority();
+    let fan = Arc::new(RecordingFan(AtomicU8::new(0)));
+    if register_cooling_device(&cap, fan.clone()).is_err() {
+        __test_reset();
+        return TestResult::Fail("register_cooling_device rejected a live cap");
+    }
+    let zone = match register_zone(&cap, "TZ0", warn_milli, crit_milli) {
+        Ok(id) => id,
+        Err(_) => {
+            __test_reset();
+            return TestResult::Fail("register_zone rejected a live cap");
+        }
+    };
+
+    let reg_r: Cap<TopicRegistry, Read> = Cap::bootstrap();
+    let mut sub = match subscribe(&reg_r) {
+        Ok(s) => s,
+        Err(_) => {
+            __test_reset();
+            return TestResult::Fail("subscribe failed");
+        }
+    };
+    let drain = |sub: &mut narf_event_bus::Subscriber<ThermalEvent>| -> u8 {
+        match sub.try_next() {
+            Ok(Some((_seq, ThermalEvent::Normal { .. }))) => 1,
+            Ok(Some((_seq, ThermalEvent::Warm { .. }))) => 2,
+            Ok(Some((_seq, ThermalEvent::Critical { .. }))) => 3,
+            _ => 0,
+        }
+    };
+
+    // Readings in deciKelvin, converted through the production
+    // path: 3132 → 40_050 (Normal), 3482 → 75_050 (Warm),
+    // 3682 → 95_050 (Critical), 3232 → 50_050 (Normal). Expected
+    // levels are spec §3.4's StepPolicy mapping (0 / 128 / 255);
+    // the tracked level is `None` until the first crossing drives
+    // one. Event codes mirror the 1/2/3 = Normal/Warm/Critical
+    // mapping (0 = no event: Normal → Normal crosses nothing).
+    let steps: [(u64, ThermalState, u8, Option<u8>, u8); 4] = [
+        (3132, ThermalState::Normal, 0, None, 0),
+        (3482, ThermalState::Warm, 128, Some(128), 2),
+        (3682, ThermalState::Critical, 255, Some(255), 3),
+        (3232, ThermalState::Normal, 0, Some(0), 1),
+    ];
+    for (deci_k, want_state, want_level, want_tracked, want_event) in steps {
+        let milli_c = decik_to_milli_c(deci_k);
+        match record_temp(zone, milli_c) {
+            Ok(state) if state == want_state => {}
+            _ => {
+                __test_reset();
+                return TestResult::Fail("record_temp misclassified a spec reading");
+            }
+        }
+        if fan.0.load(Ordering::SeqCst) != want_level {
+            __test_reset();
+            return TestResult::Fail("default policy did not drive the spec level");
+        }
+        if current_cooling_level() != want_tracked {
+            __test_reset();
+            return TestResult::Fail("governor crossing did not track the driven level");
+        }
+        if drain(&mut sub) != want_event {
+            __test_reset();
+            return TestResult::Fail("ThermalEvent did not reach the subscriber");
+        }
+    }
+
+    __test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/thermal",
+    smoke_thermal_default_policy_drives_cooling_914
+);
+
 /// #916: the last-driven-level tracker behind resume re-assert.
 /// `None` on a fresh registry, `Some` after an explicit set, and
 /// updated by a governor crossing — so a resume handler reading it
