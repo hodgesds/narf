@@ -842,22 +842,50 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
             // suspended; an idle USB stick / hub does.
             attach::idle_suspend_pass(c).await;
             SUPERVISOR_PHASE.store(9, core::sync::atomic::Ordering::Relaxed);
-            // Inter-cycle delay: PARK on the timer wheel for ~100 ms
-            // instead of busy-yielding. The old `while !pause.expired()
-            // { yield_now().await }` form self-woke every executor round
-            // for the full 100 ms — a perpetual runnable task that kept
-            // the executor from ever halting (nr_running never hit 0),
-            // pinned the CPU at 100%, and paced every scheduler round at
-            // the cost of that spin. On an otherwise-idle single-flight
-            // workload (off-box redis) that turned a sub-round wake into
-            // a ~one-round (~230 µs) latency hit on EVERY request, since a
-            // freshly-woken peer (the epoll-parked server) waited out a
-            // full spinning round to be re-polled. The timer wheel now
-            // fires reliably (one-shot TSC-deadline), so a real parked
-            // sleep wakes this task on time AND lets the executor halt
-            // between USB pump cycles.
+            // Inter-cycle event-driven pump (matching Linux's `usbhid`
+            // `hid_irq_in` -> `input_event` + `usb_submit_urb` flow in
+            // `drivers/hid/usbhid/hid-core.c:273-325`):
+            //
+            // When a bound USB HID device (mouse/keyboard/touchpad) has an
+            // armed Interrupt-IN TRB and sends a report, the xHCI MSI-X ISR
+            // (`xhci_isr` -> `demux_one_event`) moves the Transfer Event TRB
+            // into `c.transfer_events` and pokes `supervisor_waker`. Waiting
+            // on `register_supervisor_waker` wakes this task immediately on
+            // the hardware interrupt so `pump_bound_devices(c)` drains the
+            // report, pushes `EV_REL`/`EV_KEY`/`EV_SYN` into `evdev` (waking
+            // `kwin_wayland` out of `epoll_wait`), and immediately re-arms
+            // the next Interrupt-IN TRB (`arm_interrupt_in`) within
+            // microseconds — supporting 125 Hz..1000 Hz mice with zero
+            // busy-polling while the mouse is stationary. An 8 ms timer-wheel
+            // fallback slice covers controllers without MSI-X/INTx and bounds
+            // the outer ~96 ms window between full port/hub enumeration and
+            // idle-suspend passes.
             let _ = irq_vector;
-            narf_time::sleep_ms(100).await;
+            let cycle_deadline = narf_time::Deadline::after_ms(96);
+            let seen_psce = xhci::USB_PSCE_EVENTS.load(core::sync::atomic::Ordering::Acquire);
+            while !cycle_deadline.expired() {
+                let mut fallback_sleep = narf_time::sleep_ms(8);
+                core::future::poll_fn(|cx| {
+                    use core::future::Future as _;
+                    use core::pin::Pin;
+                    use core::task::Poll;
+
+                    c.register_supervisor_waker(cx.waker().clone());
+                    if c.has_pending_transfer_events()
+                        || xhci::USB_PSCE_EVENTS.load(core::sync::atomic::Ordering::Acquire)
+                            != seen_psce
+                        || cycle_deadline.expired()
+                    {
+                        return Poll::Ready(());
+                    }
+                    Pin::new(&mut fallback_sleep).poll(cx)
+                })
+                .await;
+                pump_bound_devices(c);
+                if xhci::USB_PSCE_EVENTS.load(core::sync::atomic::Ordering::Acquire) != seen_psce {
+                    break;
+                }
+            }
         }
     })
 }

@@ -1065,15 +1065,27 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     }
 
     /// `fsync` must leave every write that has already returned durable on
-    /// disk. It delegates that to [`BtrfsVolume::sync_to_disk`], which is the
-    /// single place the requirement is implemented — it commits the open
-    /// batch and then writes the staged superblock, which together are what
-    /// "already returned" means once writes are batched.
+    /// disk. When `data_only` is true (`fdatasync`), data blocks and their
+    /// modified tree nodes were already submitted to the block device during
+    /// `write` and `batch_stage`; a device flush barrier is sufficient to make
+    /// the non-volatile media durable without forcing a synchronous multi-round
+    /// transaction commit that freezes concurrent operations.
+    ///
+    /// For full `fsync` (`data_only == false`), it delegates to
+    /// [`BtrfsVolume::sync_to_disk_exclusive`], which commits the open batch
+    /// and writes the staged superblock.
     ///
     /// (The tree-log is only used to *replay* a crashed volume's log on mount,
     /// not to defer writes, so it plays no part here.)
-    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
+    fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let vol = self.volume()?;
+            if data_only {
+                vol.flush().await
+            } else {
+                vol.sync_to_disk_exclusive().await
+            }
+        })
     }
 
     fn stat(&self) -> Stat {
@@ -1311,8 +1323,15 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     /// A directory's `fsync`/`syncfs` makes every returned write durable, as
     /// a file's does (see [`FileOps::fsync`] above): `sync(2)`, `syncfs` on a
     /// directory fd and `fsync` of a directory after a rename all land here.
-    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
+    fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let vol = self.volume()?;
+            if data_only {
+                vol.flush().await
+            } else {
+                vol.sync_to_disk_exclusive().await
+            }
+        })
     }
 
     /// `syncfs(2)`, and the generic `sync(2)` / pre-shutdown sync of every
