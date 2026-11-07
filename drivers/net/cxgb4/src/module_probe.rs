@@ -1,9 +1,11 @@
 //! Loadable-module registration path for cxgb4.
 //!
-//! Registration-only: the probe thunk returns `-ENOSYS` because the device
-//! datapath ABI is not yet exported. The built-in build registers the full id
-//! table; this registers the primary id as the module-build proof. See
-//! `narf-drivers-net-e1000` for the rationale.
+//! Refusal-only (issue #799): cxgb4 is explicitly not implemented —
+//! the Chelsio T4/T5/T6 datapath is out of this program's desktop
+//! scope — so the probe thunk returns `-ENOSYS` for every device.
+//! This registers the primary id (`0x4401`) as the module-build
+//! proof; the built-in build registers a vendor-wide refusal match.
+//! See `narf-drivers-net-e1000` for the rationale.
 
 const VENDOR: u16 = 0x1425;
 const DEVICE: u16 = 0x4401;
