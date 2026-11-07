@@ -296,7 +296,8 @@ program (runtime suspend arms link-change only, system suspend arms the
 caller's filters minus link-change when the link is up, an empty armed set
 powers the link down). The ethtool surface is a driver-local read struct
 (drvinfo, forced-link settings, ring parameters, EITR coalesce, pause
-parameters, WoL, RSS sizes, live RX/TX counters); set-side ops are absent.
+parameters, WoL, RSS sizes, live RX/TX counters); set-side ops are absent
+except WoL (`set_wol_filters` stores the filters the suspend program arms).
 Suspend masks interrupts, disables queue 0, and arms WoL or stops DMA and
 powers the PHY down; resume clears WUS, re-kicks the PHY, restores RCTL/TCTL,
 re-runs the ENABLE handshake, and unmasks MSI-X. Detach masks and disables,
@@ -448,7 +449,19 @@ frame itself and builds its descriptors from the shared builders.
   is left pending there. On 8168evl (VER_34) the magic bit lives
   in ERI space and is programmed through the shared ERI accessor
   (ERIDR 0x70 / ERIAR 0x74, `MagicPacket_v2` bit 16 at ERI 0x0dc),
-  so nothing is left pending there either.
+  so nothing is left pending there either. The other wired families
+  arm magic-packet WoL with their own driver-local surfaces
+  (issue #792): igb programs WUC/WUFC/WUS (`set_wol_filters` +
+  `suspend`); ixgbe arms WUC/WUFC/WUS plus IPv4/IPv6 wake
+  addresses, gated by the board-cap word; i40e programs
+  `PFPM_APM`/`PFPM_WUFC` plus the two `mac_address_write`
+  magic-wake steps, gated by the board record (controlling PF +
+  NVM WoL word + MC-magic-wake capability); forcedeth programs
+  `WakeUpFlags` (`0x1111`) with the `PFF_ALWAYS|MYADDR` + RX-start
+  suspend program; atl1c programs `WOL_CTRL` via
+  `atl1c_power_saving` (magic + link-change, with the AR8161 rev
+  0xc1 pattern quirk). e1000 WoL stays unimplemented — blocked on
+  the gap-4 PM/suspend contract + P5 scope call.
 - **EEE.** Each driver exposes its LPI capabilities
   (`eee_caps`, Linux's `rtl8169_get_lpi_caps` shape: 100/1000FD
   everywhere EEE is supported, +2500FD from VER_63, +5000FD

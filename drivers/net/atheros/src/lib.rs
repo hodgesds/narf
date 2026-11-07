@@ -20,6 +20,10 @@ pub use narf_drivers_net_core::*;
 #[cfg(feature = "builtin")]
 pub mod atheros;
 
+/// Wake-on-LAN (issue #792): pure program + fixture tests.
+#[cfg(feature = "builtin")]
+pub mod wol;
+
 #[cfg(feature = "module")]
 mod module_probe;
 
