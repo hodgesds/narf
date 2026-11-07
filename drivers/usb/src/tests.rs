@@ -5731,8 +5731,12 @@ struct FakeFpTransport {
     /// `SetConfiguration`; `bulk_in` / `bulk_out` return
     /// `EndpointConfig` (models the controller being gone, the
     /// way `XhciFpTransport` fails its per-call resolution).
-    /// A failed call records no step: it never reaches the
-    /// modelled device.
+    /// A failed `control_out` / bulk call records no step: it
+    /// never reaches the modelled device. A failed
+    /// `configure_endpoints` call DOES record its attempt: the
+    /// failure is the controller's answer to an attempt that
+    /// reached it, and the bind smoke pins exactly one such
+    /// attempt before the bind fails.
     fail_configure: core::sync::atomic::AtomicBool,
     fail_control_out: core::sync::atomic::AtomicBool,
     fail_bulk: core::sync::atomic::AtomicBool,
@@ -5774,16 +5778,19 @@ impl crate::fingerprint::FpTransport for FakeFpTransport {
         endpoints: &'a [crate::xhci::EndpointConfig],
     ) -> crate::fingerprint::FpFuture<'a, Result<(), crate::fingerprint::FpError>> {
         use crate::fingerprint::FpError;
+        // Record the attempt even when it fails: the bind smoke
+        // pins exactly one configure attempt (slot 4, no
+        // SET_CONFIGURATION after) for the EndpointConfig defeat.
+        self.steps.lock().push(FakeFpStep::ConfigureEndpoints {
+            slot: slot_id,
+            eps: endpoints.to_vec(),
+        });
         if self
             .fail_configure
             .load(core::sync::atomic::Ordering::Acquire)
         {
             return alloc::boxed::Box::pin(async move { Err(FpError::EndpointConfig) });
         }
-        self.steps.lock().push(FakeFpStep::ConfigureEndpoints {
-            slot: slot_id,
-            eps: endpoints.to_vec(),
-        });
         alloc::boxed::Box::pin(async move { Ok(()) })
     }
 
