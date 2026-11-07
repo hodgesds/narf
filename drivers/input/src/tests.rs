@@ -701,7 +701,7 @@ kernel_test_in!(
 fn smoke_i8042_mouse_elantech_bad_packet_drops_and_resyncs() -> TestResult {
     use crate::i8042_mouse;
     use crate::psmouse::PsmouseProtocol;
-    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global};
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, InputEvent};
     init_global_ring(8);
     __reset_global_ring_for_test();
     i8042_mouse::__reset_for_test();
@@ -4971,6 +4971,7 @@ kernel_test_in!(
 
 mod psmouse_smokes {
     use alloc::collections::VecDeque;
+    use alloc::vec;
     use alloc::vec::Vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
