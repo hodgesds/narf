@@ -4205,11 +4205,21 @@ fn smoke_i8042_pm_resume_parks_inflight_led_exchange() -> TestResult {
     if i8042::__led_tx_idle_for_test() {
         return TestResult::Fail("exchange must be in flight before resume");
     }
+    // Clear the desired bitmap before resume: on an initialised
+    // controller `pm_resume` re-drives a non-zero desired bitmap
+    // (the keyboard reset cleared its LEDs), which starts a fresh
+    // exchange and would mask the park. With nothing to re-drive,
+    // the park at Idle is observable on either path; the re-drive
+    // itself is pinned by
+    // `smoke_i8042_pm_resume_redrives_desired_leds` below.
+    // Turning the LED off mid-exchange only records intent — no
+    // second byte is written while the exchange is in flight.
+    i8042::on_led_state(0);
     // Resume parks it: the keyboard was reset, so the ACK will
     // never arrive — the machine must return to Idle instead of
     // blocking every later LED update.
     if i8042::pm_resume().is_err() {
-        return TestResult::Fail("resume must be Ok when uninitialised");
+        return TestResult::Fail("resume must be Ok");
     }
     if !i8042::__led_tx_idle_for_test() {
         return TestResult::Fail("resume must park the LED exchange at Idle");
@@ -4221,8 +4231,8 @@ fn smoke_i8042_pm_resume_parks_inflight_led_exchange() -> TestResult {
     if i8042::__led_tx_log_for_test() != alloc::vec![0xED] {
         return TestResult::Fail("late ACK must not resume the parked exchange");
     }
-    // The desired bitmap survived the park: a fresh sink call
-    // starts a clean exchange for it.
+    // The machine is ready for a fresh exchange: a new sink call
+    // starts a clean one for the requested bitmap.
     i8042::on_led_state(1 << led::LED_CAPSL);
     if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED] {
         return TestResult::Fail("fresh exchange must start after the park");
@@ -4234,6 +4244,47 @@ kernel_test_in!(
     "drivers/input",
     smoke_i8042_pm_resume_parks_inflight_led_exchange
 );
+
+fn smoke_i8042_pm_resume_redrives_desired_leds() -> TestResult {
+    use crate::i8042;
+    use narf_input::evdev::led;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring};
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    // Start an exchange (Caps Lock on) and leave the LED lit: on
+    // an initialised controller resume re-drives the desired
+    // bitmap, because the keyboard reset cleared its LEDs.
+    i8042::on_led_state(1 << led::LED_CAPSL);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED] {
+        return TestResult::Fail("exchange must start with exactly [0xED]");
+    }
+    if i8042::pm_resume().is_err() {
+        return TestResult::Fail("resume must be Ok");
+    }
+    // The stale exchange was parked and a fresh one started for
+    // the preserved desired bitmap: a second 0xED, still in flight.
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED] {
+        return TestResult::Fail("resume must re-drive the desired LEDs with a fresh 0xED");
+    }
+    if i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("re-driven exchange must be in flight after resume");
+    }
+    // The fresh exchange completes normally: its ACK writes the
+    // Caps data byte, and the data ACK returns it to Idle.
+    i8042::feed_bytes_for_test(&[0xFA]);
+    if i8042::__led_tx_log_for_test() != alloc::vec![0xED, 0xED, 0x04] {
+        return TestResult::Fail("ACK of the re-driven exchange must write the LED data byte");
+    }
+    i8042::feed_bytes_for_test(&[0xFA]);
+    if !i8042::__led_tx_idle_for_test() {
+        return TestResult::Fail("re-driven exchange must complete at Idle");
+    }
+    i8042::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_pm_resume_redrives_desired_leds);
 
 fn smoke_i8042_pm_resume_drops_partial_mouse_packet() -> TestResult {
     use crate::i8042;
