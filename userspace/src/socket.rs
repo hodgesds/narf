@@ -6377,8 +6377,6 @@ impl SocketFile {
             let SocketState::BluetoothConn {
                 listen,
                 channel,
-                listen,
-                channel,
                 connect,
                 sco,
                 sco_link,
