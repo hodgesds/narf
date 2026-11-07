@@ -3130,10 +3130,10 @@ fn smoke_acpi_xsdt_out_of_window_child_skipped() -> TestResult {
 
     // XSDT with two entries: the valid child, then a pointer at the
     // window end (out of window — must be skipped, never dereferenced).
-    let ceiling = narf_memory::phys_alloc_ceiling();
-    if ceiling == 0 {
+    let window_end = narf_memory::mapped_window_end();
+    if window_end == 0 {
         narf_memory::frame::free_frame(child_frame);
-        return TestResult::Fail("phys_alloc_ceiling is 0");
+        return TestResult::Fail("mapped_window_end is 0");
     }
     let mut xsdt: Vec<u8> = Vec::new();
     xsdt.extend_from_slice(b"XSDT");
@@ -3146,7 +3146,7 @@ fn smoke_acpi_xsdt_out_of_window_child_skipped() -> TestResult {
     xsdt.extend_from_slice(&0u32.to_le_bytes());
     xsdt.extend_from_slice(&0u32.to_le_bytes());
     xsdt.extend_from_slice(&child_phys.to_le_bytes());
-    xsdt.extend_from_slice(&ceiling.to_le_bytes());
+    xsdt.extend_from_slice(&window_end.to_le_bytes());
     let total = xsdt.len() as u32;
     xsdt[4..8].copy_from_slice(&total.to_le_bytes());
     let xsum: u8 = xsdt.iter().fold(0u8, |a, b| a.wrapping_add(*b));
@@ -3188,11 +3188,11 @@ kernel_test_in!("acpi", smoke_acpi_xsdt_out_of_window_child_skipped);
 /// at the window end (or at a pointer whose length addition
 /// overflows) fails before any byte is read.
 fn smoke_acpi_xsdt_itself_out_of_window_rejected() -> TestResult {
-    let ceiling = narf_memory::phys_alloc_ceiling();
-    if ceiling == 0 {
-        return TestResult::Fail("phys_alloc_ceiling is 0");
+    let window_end = narf_memory::mapped_window_end();
+    if window_end == 0 {
+        return TestResult::Fail("mapped_window_end is 0");
     }
-    for phys in [ceiling, u64::MAX] {
+    for phys in [window_end, u64::MAX] {
         // SAFETY: no byte is read — the window check rejects first.
         match unsafe { crate::walk_xsdt(phys, |_, _| {}) } {
             Err(crate::AcpiError::OutOfMappedWindow) => {}

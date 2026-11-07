@@ -108,8 +108,8 @@ pub use aarch64::{ioremap, mmu, paging};
 
 #[cfg(target_arch = "x86_64")]
 pub use addr::{
-    direct_map_activate_at, direct_map_base, direct_map_live, KERNEL_DIRECT_MAP_BASE,
-    KERNEL_DIRECT_MAP_PML4_BASE, KERNEL_DIRECT_MAP_PML4_SLOTS,
+    direct_map_activate_at, direct_map_base, direct_map_live, direct_map_phys_end,
+    KERNEL_DIRECT_MAP_BASE, KERNEL_DIRECT_MAP_PML4_BASE, KERNEL_DIRECT_MAP_PML4_SLOTS,
 };
 pub use addr::{PhysAddr, VirtAddr};
 pub use domain_state::{restore_domain_state, save_domain_state, DomainSavedState};
@@ -142,8 +142,8 @@ pub use frame::{
     alloc_frame, alloc_frame_anywhere, alloc_frame_on, alloc_pages_below, alloc_pages_on,
     current_cpu_node, current_frame_alloc_name, firmware_node_count, free_frame, free_pages,
     hotplug_node_for_phys, init_from_map, install_frame_alloc, install_memory_hotplug_hook,
-    is_numa_aware, memory_blocks, node_for_phys, node_free, node_free_blocks, node_total,
-    numa_node_stats, offline_memory_range, online_memory_range, online_node_count,
+    is_numa_aware, mapped_window_end, memory_blocks, node_for_phys, node_free, node_free_blocks,
+    node_total, numa_node_stats, offline_memory_range, online_memory_range, online_node_count,
     online_node_mask, phys_alloc_ceiling, rebalance_to_topology, release_early_ceiling,
     reserve_for_slab_promotion, stats as frame_stats,
     validate_no_overlap as frame_validate_no_overlap, BuddyFrameAlloc, BumpFrameAlloc, FrameAlloc,

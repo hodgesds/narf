@@ -245,13 +245,38 @@ pub const KERNEL_DIRECT_MAP_PML4_SLOTS: usize = 127;
 #[cfg(target_arch = "x86_64")]
 static DIRECT_MAP_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Publish the direct map's base. Called once by `init_mmu` immediately
-/// after the CR3 swap, with the (possibly randomized) base the map was
-/// actually built at.
+/// Physical extent of the direct map `[0, DIRECT_MAP_PHYS_END)`, published
+/// by `init_mmu` alongside the base. 0 while the map is not live.
+///
+/// This is the bound [`crate::mapped_window_end`] (memory/src/frame.rs)
+/// uses for the SEC-F2 ACPI table-window check: the direct map covers the
+/// whole `[0, 512 GiB)` chunk 0 range regardless of how much RAM is installed,
+/// so firmware tables in ACPI-reclaimable RAM above the top of boot-donated
+/// *Usable* RAM are reachable through it even though they sit above
+/// [`phys_alloc_ceiling`]. 0 is fail-closed: no bound published yet means
+/// every table is rejected, never read past the mapped window.
+#[cfg(target_arch = "x86_64")]
+static DIRECT_MAP_PHYS_END: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Publish the direct map's base and physical extent. Called once by
+/// `init_mmu` immediately after the CR3 swap, with the (possibly randomized)
+/// base the map was actually built at and the extent `dmap_chunks * 512 GiB`.
+///
+/// The extent is stored BEFORE the base: `direct_map_base() != 0` is the
+/// "live" signal, so any reader that observes a live base must also observe
+/// the extent that goes with it.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-pub fn direct_map_activate_at(base: u64) {
+pub fn direct_map_activate_at(base: u64, phys_end: u64) {
+    DIRECT_MAP_PHYS_END.store(phys_end, core::sync::atomic::Ordering::Release);
     DIRECT_MAP_BASE.store(base, core::sync::atomic::Ordering::Release);
+}
+
+/// Physical extent of the direct map `[0, end)`, or 0 while it is not live.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn direct_map_phys_end() -> u64 {
+    DIRECT_MAP_PHYS_END.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Base the direct map is live at, or 0 while it is not.

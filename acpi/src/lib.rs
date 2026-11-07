@@ -166,12 +166,16 @@ fn checksum(bytes: &[u8]) -> u8 {
 
 /// Validate that `[phys, phys + len)` lies inside the physical window
 /// the kernel can actually reach through [`PhysAddr::kernel_ptr`]
-/// (SEC-F2). The window end is [`narf_memory::phys_alloc_ceiling`]:
-/// the top of boot-donated RAM, which is also the extent of the
-/// high-half direct map `init_mmu` installs — and, before the direct
-/// map comes up, the early 4 GiB ceiling. Both answer the same
-/// question, "is this address one the kernel can actually reach?",
-/// and the ceiling is fail-closed (0 / uninitialized → everything
+/// (SEC-F2). The window end is [`narf_memory::mapped_window_end`]: on
+/// x86_64 the extent of the high-half direct map `init_mmu` installs
+/// (`dmap_chunks * 512 GiB`, covering firmware tables in ACPI-reclaimable
+/// RAM above the top of boot-donated RAM) — and, before the direct map
+/// comes up, the early 4 GiB ceiling. This is deliberately NOT
+/// `phys_alloc_ceiling`: that is the top of boot-donated *Usable* RAM, and
+/// bounding by it rejects every ACPI table deterministically (the XSDT
+/// chain lives in ACPI-reclaimable RAM the boot map did not donate). Both
+/// answer the same question, "is this address one the kernel can actually
+/// reach?", and the window is fail-closed (0 / unpublished → everything
 /// is rejected) so a table pointer can never drive a read past the
 /// mapped window.
 ///
@@ -184,7 +188,7 @@ pub fn check_table_window(phys: u64, len: usize) -> Result<(), AcpiError> {
     let end = phys
         .checked_add(len as u64)
         .ok_or(AcpiError::OutOfMappedWindow)?;
-    if end > narf_memory::phys_alloc_ceiling() {
+    if end > narf_memory::mapped_window_end() {
         return Err(AcpiError::OutOfMappedWindow);
     }
     Ok(())
