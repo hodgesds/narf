@@ -44,6 +44,26 @@ bring-up and passes carrier, negotiated Mbps, and duplex to the central net
 registry; sysfs and rtnetlink do not infer those values from the fact that an
 administrator opened the interface.
 
+Shared PHY/MDIO abstraction (issue #790, `narf_drivers_net_core::phy`):
+one `Phy` trait over Clause-22 register access (`read_reg` /
+`write_reg`, with provided paged access, Clause-45 MMD access via
+the Clause-22 indirection registers, PHY identification, link
+sampling, and the negotiated-status decode `read_status_c22`).
+Realtek adopts it over the OCP window (`PhyAccess`: stateless
+page-0/paged address arithmetic, never the latched `ocp_base`)
+with the `rtlgen` override — Clause-22 resolution plus the page
+0xa43 register 0x12 speed word (Linux `rtlgen_read_status` /
+`rtlgen_decode_speed`) — so RTL8125/8126/8127 publish their exact
+negotiated multigig rate (2500/5000/10000) instead of the in-band
+1000 lower bound, and RTL8168 publishes 10/100/1000 + duplex from
+its PHYStatus byte (exact at the 1G ceiling, no PHY read needed).
+Intel adopts it over MDIC (e1000: `phy_id` / `phy_link_up` /
+`autoneg_complete` delegate to the trait; igb/igc MDIC adoption
+and ixgbe, which has no in-tree MDIO transport, are follow-ups —
+ixgbe's LINKS speed decode rides with the #791 carrier lane).
+The trait's MMD accessors are the transport the #794 EEE surface
+will ride; no EEE policy lives here.
+
 Every wired PCIe family dual-publishes (issue #784). The capability-gated
 frame-ring registration above is unchanged — stack-daemon and XDP consumers
 depend on it — and alongside it each family's probe registers with

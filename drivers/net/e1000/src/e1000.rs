@@ -394,12 +394,8 @@ const MDIC_ERROR: u32 = 1 << 30;
 // these — see the lane disclosure in the PR body.
 /// PHY basic-mode control register.
 const PHY_BMCR: u32 = 0;
-/// PHY basic-mode status register.
-const PHY_BMSR: u32 = 1;
 /// PHY identifier register 1 (OUI bits 3–18).
 const PHY_ID1: u32 = 2;
-/// PHY identifier register 2 (OUI bits 19–24, model, revision).
-const PHY_ID2: u32 = 3;
 /// PHY auto-negotiation advertisement register.
 const PHY_ANAR: u32 = 4;
 /// PHY link-partner ability register.
@@ -4105,16 +4101,34 @@ impl E1000 {
         }
         r
     }
+}
 
+impl crate::phy::Phy for E1000 {
+    type Error = E1000Error;
+
+    /// MDIC Clause-22 read. Same do-not-call-during-bring_up
+    /// constraint as [`E1000::phy_read`]: bring-up holds SWFLAG
+    /// across init, and this method's per-access release would
+    /// drop that hold early.
+    fn read_reg(&self, reg: u8) -> Result<u16, E1000Error> {
+        self.phy_read(u32::from(reg))
+    }
+
+    /// MDIC Clause-22 write, same constraint as `read_reg`.
+    fn write_reg(&self, reg: u8, val: u16) -> Result<(), E1000Error> {
+        self.phy_write(u32::from(reg), val)
+    }
+}
+
+impl E1000 {
     /// Read the PHY identifier (PHYSID1/PHYSID2 composed per
     /// `phy_id_from`). Fails closed with `PhyNotPresent` when the
     /// read returns the no-device signature rather than inventing
-    /// an identity for an absent PHY.
+    /// an identity for an absent PHY. Implemented in terms of
+    /// the shared [`crate::phy::Phy`] trait (issue #790).
     pub fn phy_id(&self) -> Result<u32, E1000Error> {
-        let id1 = self.phy_read(PHY_ID1)?;
-        let id2 = self.phy_read(PHY_ID2)?;
-        let id = phy_id_from(id1, id2);
-        if !phy_id_valid(id) {
+        let id = <Self as crate::phy::Phy>::read_phy_id(self)?;
+        if !crate::phy::phy_id_valid(id) {
             return Err(E1000Error::PhyNotPresent);
         }
         Ok(id)
@@ -4124,11 +4138,10 @@ impl E1000 {
     /// first re-arms the latch-low link bit (IEEE 802.3 §22.2.4.2),
     /// the second reports live state. This is the PHY-side signal;
     /// the MAC-side `STATUS.LU` sample that `link_up` reports is a
-    /// separate, already-existing path.
+    /// separate, already-existing path. Implemented in terms of
+    /// the shared [`crate::phy::Phy`] trait (issue #790).
     pub fn phy_link_up(&self) -> Result<bool, E1000Error> {
-        let _ = self.phy_read(PHY_BMSR)?;
-        let bmsr = self.phy_read(PHY_BMSR)?;
-        Ok(bmsr_link(bmsr))
+        <Self as crate::phy::Phy>::link_up(self)
     }
 
     /// Program auto-negotiation advertisement and restart
@@ -4158,11 +4171,10 @@ impl E1000 {
     /// Auto-negotiation complete sample: two consecutive BMSR
     /// reads (latch-low), trust the second — same discipline as
     /// `phy_link_up`. Same do-not-call-during-bring_up constraint
-    /// as `phy_read`.
+    /// as `phy_read`. Implemented in terms of the shared
+    /// [`crate::phy::Phy`] trait (issue #790).
     pub fn autoneg_complete(&self) -> Result<bool, E1000Error> {
-        let _ = self.phy_read(PHY_BMSR)?;
-        let bmsr = self.phy_read(PHY_BMSR)?;
-        Ok(bmsr_ancomplete(bmsr))
+        <Self as crate::phy::Phy>::autoneg_complete(self)
     }
 
     /// Link-partner ability: LPA + 1000BASE-T status. Same
@@ -4881,4 +4893,88 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_flow_control_ctrl_bits);
+
+    fn smoke_shared_phy_resolve_matches_e1000() -> TestResult {
+        // The shared trait's Clause-22 resolution
+        // (`crate::phy::resolve_aneg`, issue #790) must agree with
+        // this driver's own `resolve_negotiated_mode` on every
+        // advertisement combination: same priority
+        // (1000FD > 1000HD > 100FD > 100HD > 10FD > 10HD), same
+        // intersection rule. The words are literals from the
+        // register map in this file (ANAR 10HD 0x0020 / 10FD
+        // 0x0040 / 100HD 0x0080 / 100FD 0x0100; GBCR 1000HD
+        // 0x0100 / 1000FD 0x0200; STAT1000 1000HD 0x0400 /
+        // 1000FD 0x0800), not the constants under test.
+        use narf_net::iface::LinkDuplex;
+        for (our_anar, our_gbcr, lp_anar, lp_stat1000, want) in [
+            (
+                0x01e0u16,
+                0x0200u16,
+                0x01e1u16,
+                0x0800u16,
+                Some((1000u32, LinkDuplex::Full)),
+            ),
+            (
+                0x01e0,
+                0x0300,
+                0x01e1,
+                0x0400,
+                Some((1000, LinkDuplex::Half)),
+            ),
+            (
+                0x01e0,
+                0x0200,
+                0x0100,
+                0x0000,
+                Some((100, LinkDuplex::Full)),
+            ),
+            (
+                0x01e0,
+                0x0200,
+                0x0080,
+                0x0000,
+                Some((100, LinkDuplex::Half)),
+            ),
+            (0x01e0, 0x0200, 0x0040, 0x0000, Some((10, LinkDuplex::Full))),
+            (0x01e0, 0x0200, 0x0020, 0x0000, Some((10, LinkDuplex::Half))),
+            (0x01e0, 0x0200, 0x0000, 0x0000, None),
+            // Disjoint advertisements: no common mode.
+            (0x0100, 0x0000, 0x0020, 0x0000, None),
+            // Priority: partner offers 100FD + 1000FD, we offer
+            // 1000HD only (not FULL) → falls through to 100FD.
+            (
+                0x01e0,
+                0x0100,
+                0x0100,
+                0x0800,
+                Some((100, LinkDuplex::Full)),
+            ),
+        ] {
+            let ours = super::resolve_negotiated_mode(our_anar, our_gbcr, lp_anar, lp_stat1000);
+            let shared = crate::phy::resolve_aneg(our_anar, our_gbcr, lp_anar, lp_stat1000);
+            let ours_mapped = ours.map(|m| {
+                let (speed, duplex) = match m {
+                    super::LinkMode::Speed10Half => (10u32, LinkDuplex::Half),
+                    super::LinkMode::Speed10Full => (10, LinkDuplex::Full),
+                    super::LinkMode::Speed100Half => (100, LinkDuplex::Half),
+                    super::LinkMode::Speed100Full => (100, LinkDuplex::Full),
+                    super::LinkMode::Speed1000Half => (1000, LinkDuplex::Half),
+                    super::LinkMode::Speed1000Full => (1000, LinkDuplex::Full),
+                };
+                (speed, duplex)
+            });
+            let shared_mapped = match shared {
+                (Some(speed), Some(duplex)) => Some((speed, duplex)),
+                (None, None) => None,
+                _ => Some((u32::MAX, LinkDuplex::Half)),
+            };
+            if ours_mapped != want || shared_mapped != want {
+                return TestResult::Fail(
+                    "shared PHY resolve disagrees with e1000 resolve_negotiated_mode",
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_shared_phy_resolve_matches_e1000);
 }
