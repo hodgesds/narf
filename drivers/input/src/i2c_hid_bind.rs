@@ -67,7 +67,7 @@ use narf_drivers_i2c::{registry as i2c_registry, I2cBus};
 use narf_input::evdev::{DeviceId, DeviceNode};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::i2c_hid::{I2cHidDriver, I2cHidError, RetryPolicy};
+use crate::i2c_hid::{I2cHidDriver, I2cHidError, RetryPolicy, POWER_ON};
 
 /// Default HID descriptor register used when `_DSM` evaluation is
 /// unavailable. The Microsoft spec leaves this device-defined; AMD
@@ -1028,8 +1028,31 @@ async fn pump_task_inner(
                         continue;
                     }
                     RecoveryAction::Reset => {
-                        match driver.bring_up(&RetryPolicy::default()).await {
+                        // NOTE: this is `bring_up` minus the descriptor
+                        // re-read. `bring_up` takes `&mut self` only
+                        // for `read_descriptor` (it writes
+                        // `self.descriptor`); the vendor sessions
+                        // (`rmi_session`, `elan_*`) borrow `driver`
+                        // for the whole pump loop, so a `&mut` borrow
+                        // cannot coexist here. The descriptor is
+                        // static firmware data already read at bind
+                        // time, so the Reset path performs bring_up's
+                        // remaining steps — RESET with bounded retry
+                        // + best-effort POWER_ON — through the `&self`
+                        // methods.
+                        match driver.reset_with_retry(&RetryPolicy::default()).await {
                             Ok(_) => {
+                                // SET_POWER is best-effort (same as
+                                // `bring_up`): some devices ignore it
+                                // and still report.
+                                if let Err(e) = driver.set_power(POWER_ON).await {
+                                    let _ = writeln!(
+                                        narf_console::Writer,
+                                        "  i2c-hid-pump: {}: RESET/re-bind SET_POWER(ON) failed ({:?}); continuing",
+                                        path,
+                                        e
+                                    );
+                                }
                                 let _ = writeln!(
                                     narf_console::Writer,
                                     "  i2c-hid-pump: {}: RESET/re-bind recovered the device",

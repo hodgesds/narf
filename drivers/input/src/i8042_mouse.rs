@@ -805,6 +805,9 @@ pub unsafe fn init() -> Result<(), InitError> {
             // Elantech absolute caps are declared in the `is_elantech`
             // block just below (ABS_X/Y + MT slots, no REL axes).
             psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech => {}
+            // Synaptics absolute caps are declared in the `absolute`
+            // block above (ABS_X/Y + pressure, no REL axes).
+            psmouse::PsmouseProtocol::SynapticsAbsolute => {}
         }
         if is_elantech {
             // Absolute axes + protocol-B MT slots, same shape as the
@@ -1461,6 +1464,9 @@ fn feed_relative_byte(byte: u8) {
         // Elantech never reaches this function (`feed_byte`
         // routes it to `feed_elantech_byte`).
         psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech => (0, 0),
+        // Synaptics never reaches this function (`feed_byte`
+        // routes it to `feed_synaptics_byte`).
+        psmouse::PsmouseProtocol::SynapticsAbsolute => (0, 0),
     };
 
     STATE.rel_dx_acc.fetch_add(dx, Ordering::Relaxed);
