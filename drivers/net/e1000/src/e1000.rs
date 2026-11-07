@@ -6156,6 +6156,10 @@ mod tests {
                 rx_head: IrqSafeSpinLock::new(0),
                 vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
                 multicast_filter: IrqSafeSpinLock::new(MulticastFilter::new()),
+                // Fixture device: the fake BAR0 is an 8254x window,
+                // so the classic 82540EM id (jumbo ceiling 16110).
+                did: super::E1000_DEV_82540EM,
+                mtu: IrqSafeSpinLock::new(crate::mtu::STD_MTU),
                 mac,
                 link_up: true,
                 _msix: None,
