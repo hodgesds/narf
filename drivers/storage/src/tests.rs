@@ -2818,6 +2818,203 @@ fn smoke_ahci_large_transfer_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/storage/ahci", smoke_ahci_large_transfer_round_trip);
 
+/// #978: the async paths get the #930 treatment — a single async
+/// call far past the historical 5-sector scratch cap must
+/// round-trip byte-exact. 300 sectors exercises multi-chunk
+/// submission (256-sector xfer chunk + 44-sector xfer chunk);
+/// 261 sectors exercises a chunk-boundary stage switch (256-sector
+/// xfer chunk + 5-sector scratch chunk); 3 sectors exercises the
+/// scratch stage alone. Uses the middle of the disk, away from the
+/// low LBAs other smokes scribble on and from the #930 fixture's
+/// area.
+fn smoke_ahci_async_large_transfer_round_trip() -> TestResult {
+    use crate::ahci;
+    use narf_block::BlockDeviceSync;
+    let Some(sync) = ahci::AhciBlockSync::from_probed() else {
+        return TestResult::Skip("AHCI not probed / no disk");
+    };
+    let cap = sync.capacity();
+    if cap < 4096 {
+        return TestResult::Skip("disk too small for the async large-transfer fixture");
+    }
+    let port = ahci::with_controller(|c| {
+        c.ports
+            .iter()
+            .find(|p| p.kind == ahci::PortKind::Sata)
+            .map(|p| p.index)
+    })
+    .flatten()
+    .unwrap_or(0);
+    let base = cap / 2 + 1024;
+    // 300 sectors: two xfer-buffer chunks.
+    let mut wbuf = alloc::vec![0u8; 300 * 512];
+    for (i, b) in wbuf.iter_mut().enumerate() {
+        *b = audit_ahci_pattern(i + 11);
+    }
+    let w = ahci::with_controller(|c| {
+        // SAFETY: kernel-test holds the HBA exclusively via the
+        // request gate; the async future is IRQ-driven (or falls
+        // back to sync-poll when no IRQ is wired), so `block_on`
+        // makes progress.
+        let fut = unsafe { ahci::ahci_write_lba_async(c, port, base, 300, &wbuf) };
+        narf_scheduler::block_on(fut)
+    });
+    if !matches!(w, Some(Ok(()))) {
+        return TestResult::Fail("a single 300-sector async write must succeed (#978)");
+    }
+    let mut rbuf = alloc::vec![0u8; 300 * 512];
+    let r = ahci::with_controller(|c| {
+        // SAFETY: same.
+        let fut = unsafe { ahci::ahci_read_lba_async(c, port, base, 300, &mut rbuf) };
+        narf_scheduler::block_on(fut)
+    });
+    if !matches!(r, Some(Ok(()))) {
+        return TestResult::Fail("a single 300-sector async read must succeed (#978)");
+    }
+    if rbuf != wbuf {
+        return TestResult::Fail("300-sector async round-trip data mismatch");
+    }
+    // 261 sectors: xfer chunk + 5-sector scratch chunk.
+    let mut w261 = alloc::vec![0u8; 261 * 512];
+    for (i, b) in w261.iter_mut().enumerate() {
+        *b = audit_ahci_pattern(i + 101);
+    }
+    let w = ahci::with_controller(|c| {
+        // SAFETY: same.
+        let fut = unsafe { ahci::ahci_write_lba_async(c, port, base + 400, 261, &w261) };
+        narf_scheduler::block_on(fut)
+    });
+    if !matches!(w, Some(Ok(()))) {
+        return TestResult::Fail("a single 261-sector async write must succeed (#978)");
+    }
+    let mut r261 = alloc::vec![0u8; 261 * 512];
+    let r = ahci::with_controller(|c| {
+        // SAFETY: same.
+        let fut = unsafe { ahci::ahci_read_lba_async(c, port, base + 400, 261, &mut r261) };
+        narf_scheduler::block_on(fut)
+    });
+    if !matches!(r, Some(Ok(()))) || r261 != w261 {
+        return TestResult::Fail("261-sector async round-trip data mismatch");
+    }
+    // 3 sectors: scratch stage alone.
+    let mut w3 = alloc::vec![0u8; 3 * 512];
+    for (i, b) in w3.iter_mut().enumerate() {
+        *b = audit_ahci_pattern(i + 201);
+    }
+    let w = ahci::with_controller(|c| {
+        // SAFETY: same.
+        let fut = unsafe { ahci::ahci_write_lba_async(c, port, base + 700, 3, &w3) };
+        narf_scheduler::block_on(fut)
+    });
+    if !matches!(w, Some(Ok(()))) {
+        return TestResult::Fail("a 3-sector async write must succeed (#978)");
+    }
+    let mut r3 = alloc::vec![0u8; 3 * 512];
+    let r = ahci::with_controller(|c| {
+        // SAFETY: same.
+        let fut = unsafe { ahci::ahci_read_lba_async(c, port, base + 700, 3, &mut r3) };
+        narf_scheduler::block_on(fut)
+    });
+    if !matches!(r, Some(Ok(()))) || r3 != w3 {
+        return TestResult::Fail("3-sector async round-trip data mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/storage/ahci",
+    smoke_ahci_async_large_transfer_round_trip
+);
+
+/// #978: the NCQ paths get the #930 treatment — a bulk NCQ
+/// transfer far past the 5-sector cap must complete, and the
+/// 32-tag queue depth must not regress under chunking (each chunk
+/// is one command on one tag, completed before the next is issued).
+/// Like the existing NCQ smoke, this asserts command pass, not
+/// data round-trip: QEMU's emulated AHCI NCQ has writeback timing
+/// quirks that make the write→read data comparison flake.
+fn smoke_ahci_ncq_bulk_and_depth() -> TestResult {
+    use crate::ahci;
+    use narf_block::BlockDeviceSync;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: same bus-init rationale as smoke_ahci_ncq_write_then_read_lba.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    if !devs.iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == ahci::AHCI_VENDOR
+            && d.id.device == ahci::AHCI_ICH9_DEV
+    }) {
+        return TestResult::Skip("no AHCI device");
+    }
+    if !ahci::is_probed() {
+        __reset_for_test();
+        ahci::register_pci_driver();
+        let _ = probe_all_pci(&bootstrap_registry_authority());
+    }
+    if !ahci::is_probed() {
+        return TestResult::Fail("ahci probe failed");
+    }
+    let Some(sync) = ahci::AhciBlockSync::from_probed() else {
+        return TestResult::Skip("AHCI not probed / no disk");
+    };
+    let cap = sync.capacity();
+    if cap < 4096 {
+        return TestResult::Skip("disk too small for the NCQ bulk fixture");
+    }
+    let port = ahci::with_controller(|c| {
+        c.ports
+            .iter()
+            .find(|p| p.kind == ahci::PortKind::Sata)
+            .map(|p| p.index)
+    })
+    .flatten()
+    .unwrap_or(0);
+    let base = cap / 2 + 2048;
+    // Bulk: 300 sectors = two chunks on one tag each way.
+    let mut payload = alloc::vec![0u8; 300 * 512];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = audit_ahci_pattern(i + 301);
+    }
+    let w = ahci::with_controller(|c|
+        // SAFETY: kernel-test holds the HBA exclusively.
+        unsafe { ahci::ahci_write_lba_ncq(c, port, 0, 0, base, 300, &payload) });
+    if !matches!(w, Some(Ok(()))) {
+        return TestResult::Fail("a single 300-sector NCQ write must succeed (#978)");
+    }
+    let mut readback = alloc::vec![0u8; 300 * 512];
+    let r = ahci::with_controller(|c|
+        // SAFETY: same.
+        unsafe { ahci::ahci_read_lba_ncq(c, port, 0, 1, base, 300, &mut readback) });
+    if !matches!(r, Some(Ok(()))) {
+        return TestResult::Fail("a single 300-sector NCQ read must succeed (#978)");
+    }
+    // Depth: every tag 0..31 still accepts and completes a command.
+    let mut one = [0u8; 512];
+    for (i, b) in one.iter_mut().enumerate() {
+        *b = audit_ahci_pattern(i + 401);
+    }
+    for tag in 0..32u8 {
+        let w = ahci::with_controller(|c|
+            // SAFETY: same.
+            unsafe { ahci::ahci_write_lba_ncq(c, port, 0, tag, base + 400, 1, &one) });
+        if !matches!(w, Some(Ok(()))) {
+            return TestResult::Fail("NCQ write must succeed on every tag 0..31 (#978)");
+        }
+        let mut back = [0u8; 512];
+        let r = ahci::with_controller(|c|
+            // SAFETY: same.
+            unsafe { ahci::ahci_read_lba_ncq(c, port, 0, tag, base + 400, 1, &mut back) });
+        if !matches!(r, Some(Ok(()))) {
+            return TestResult::Fail("NCQ read must succeed on every tag 0..31 (#978)");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_ncq_bulk_and_depth);
+
 /// #841: the block surface's durability contract on the real
 /// disk — flush succeeds, FUA writes round-trip (natively or via
 /// the write + flush emulation), the advertised capabilities
