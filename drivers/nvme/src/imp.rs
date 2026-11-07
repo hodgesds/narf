@@ -316,14 +316,26 @@ const _: () = assert!(core::mem::size_of::<Cqe>() == 16);
 
 // ── Controller ──────────────────────────────────────────────────────
 
-/// Admin queue depth — small enough to fit alongside the CQ in a
-/// single 4 KiB DMA page, large enough to keep IDENTIFY + a couple of
-/// in-flight admin commands. The doorbell-write protocol enforces a
-/// "queue not full" invariant when (head + 1) mod N == tail.
-const ADMIN_Q_DEPTH: u16 = 4;
+/// Admin queue depth — 8 entries: the SQ is 8 × 64 = 512 B and the CQ
+/// 8 × 16 = 128 B, so each still fits in a single 4 KiB DMA page, and
+/// the AER cap (`depth - 1` = 7) covers the NVMe Base Spec 2.0c §5.2
+/// floor of AERL+1 ≥ 4 outstanding AERs while leaving one SQ slot
+/// free for a non-AER admin command. The doorbell-write protocol
+/// enforces a "queue not full" invariant when (head + 1) mod N == tail.
+const ADMIN_Q_DEPTH: u16 = 8;
 
-/// I/O queue depth — same constraint (single 4 KiB DMA page each), in
-/// practice we keep it equal to the admin depth.
+// Admin-queue arithmetic, pinned at compile time (#1618):
+// - AQA encodes (depth - 1) in 12-bit fields (ASQS/ACQS), so depth ≤ 4096.
+// - SQ (64 B/SQE) and CQ (16 B/CQE) each fit one 4 KiB DMA page.
+// - The AER cap (depth - 1) covers the spec §5.2 floor of 4 AERs.
+const _: () = assert!(ADMIN_Q_DEPTH <= 4096);
+const _: () = assert!(ADMIN_Q_DEPTH as usize * 64 <= 4096);
+const _: () = assert!(ADMIN_Q_DEPTH as usize * 16 <= 4096);
+const _: () = assert!(ADMIN_Q_DEPTH > 4);
+
+/// I/O queue depth — same constraint (single 4 KiB DMA page each).
+/// Independent of the admin depth: only the admin queue needs the
+/// AER headroom (§5.2), so the I/O depth stays at 4.
 const IO_Q_DEPTH: u16 = 4;
 
 /// Default I/O queue id (NVMe reserves qid=0 for the admin queue;
@@ -2303,7 +2315,7 @@ impl Controller {
         let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
 
-        // ADMIN_Q_DEPTH is 4; posting more AERs than free slots would
+        // ADMIN_Q_DEPTH is 8; posting more AERs than free slots would
         // deadlock the polled path. Cap at depth - 1 so there's always
         // room for a non-AER admin command to slip through.
         let cap = (ADMIN_Q_DEPTH - 1).min(count as u16) as u8;
@@ -2400,7 +2412,7 @@ impl Controller {
             drained += 1;
 
             // Repost one AER to keep the in-flight count stable.
-            // ADMIN_Q_DEPTH is 4; we cap posting at depth-1 to leave
+            // ADMIN_Q_DEPTH is 8; we cap posting at depth-1 to leave
             // room for non-AER admin commands.
             let cid = admin.next_cid;
             admin.next_cid = admin.next_cid.wrapping_add(1);
@@ -2423,6 +2435,19 @@ impl Controller {
             }
         }
         drained
+    }
+
+    /// Admin SQ occupancy: posted SQEs whose CQEs have not yet been
+    /// consumed — `(sq_tail - cq_head) mod depth`. AERs posted via
+    /// [`Self::post_aer_commands`] count here until [`Self::drain_aer`]
+    /// consumes their completions. Exposed for tests: the AER smoke
+    /// asserts the occupancy rises by exactly the spec §5.2 floor (4)
+    /// after posting 4 AERs, proving the admin queue holds them.
+    pub fn admin_sq_occupancy(&self) -> u16 {
+        match &self.admin {
+            Some(a) => (a.sq_tail + a.depth - a.cq_head) % a.depth,
+            None => 0,
+        }
     }
 
     /// Per-queue lock count — always equal to `io_queue_count()`.

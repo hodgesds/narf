@@ -282,6 +282,22 @@ For v1.0, NVMe relies on the device's internal ECC for
 end-to-end data integrity; software adds no further
 protection.
 
+### 8.4 Admin queue depth vs AER headroom (resolved, #1618)
+
+**Decision:** **admin queue depth 8** (`ADMIN_Q_DEPTH = 8`).
+
+NVMe Base Spec 2.0c §5.2 recommends hosts keep at least AERL+1 AER
+requests outstanding, with a floor of ≥4. The old depth-4 admin queue
+capped AER posting at `depth - 1 = 3`, below the floor. At depth 8
+the SQ is 8 × 64 = 512 B and the CQ 8 × 16 = 128 B, so each queue
+still fits in a single 4 KiB DMA page; the AER cap (`depth - 1` = 7)
+covers the ≥4 floor while leaving one SQ slot free for a non-AER
+admin command. AQA, the doorbell stride (CAP.DSTRD, depth-independent),
+and the depth-1 drain bound all derive from the constant, so no other
+arithmetic changes; the AER smoke asserts the queue holds 4 AERs at
+once. The I/O queue depth stays 4 — only the admin queue needs the
+AER headroom.
+
 ## 9. ABI versioning
 
 `narf-drivers-nvme` exports its `Controller` type opaquely
