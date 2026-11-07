@@ -976,6 +976,40 @@ impl RenderFile {
         if matches!(cmd, abi::GEM_SET_DOMAIN | abi::GEM_SW_FINISH) {
             return Some(self.domain_ioctl(cmd, arg, user).await.map(|()| 0));
         }
+        if cmd == abi::PERF_OPEN {
+            let backend = info.backend.clone();
+            return Some(crate::intel_gpu_oa::errno(
+                crate::intel_gpu_oa::i915_open(
+                    backend,
+                    arg,
+                    user,
+                    crate::intel_gpu_oa::Gate::PHYSICAL,
+                )
+                .await,
+            ));
+        }
+        if cmd == abi::PERF_ADD_CONFIG {
+            let backend = info.backend.as_deref();
+            return Some(crate::intel_gpu_oa::errno(
+                crate::intel_gpu_oa::i915_add_config(
+                    backend,
+                    arg,
+                    user,
+                    crate::intel_gpu_oa::Gate::PHYSICAL,
+                ),
+            ));
+        }
+        if cmd == abi::PERF_REMOVE_CONFIG {
+            let backend = info.backend.as_deref();
+            return Some(crate::intel_gpu_oa::errno(
+                crate::intel_gpu_oa::remove_config(
+                    backend,
+                    arg,
+                    user,
+                    crate::intel_gpu_oa::Gate::PHYSICAL,
+                ),
+            ));
+        }
         self.dispatch(info, cmd, arg, user)
     }
 
@@ -1239,6 +1273,28 @@ impl RenderFile {
         }
         if nr != 9 && !(0x40..0x80).contains(&nr) {
             return None;
+        }
+        if cmd == abi::PERF_ADD_CONFIG {
+            let backend = info.backend.as_deref();
+            return Some(crate::intel_gpu_oa::errno(
+                crate::intel_gpu_oa::i915_add_config(
+                    backend,
+                    arg,
+                    user,
+                    crate::intel_gpu_oa::Gate::PHYSICAL,
+                ),
+            ));
+        }
+        if cmd == abi::PERF_REMOVE_CONFIG {
+            let backend = info.backend.as_deref();
+            return Some(crate::intel_gpu_oa::errno(
+                crate::intel_gpu_oa::remove_config(
+                    backend,
+                    arg,
+                    user,
+                    crate::intel_gpu_oa::Gate::PHYSICAL,
+                ),
+            ));
         }
         Some(self.ioctl(info, cmd, arg, user).map(|()| 0))
     }
@@ -2052,21 +2108,15 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
             i32::try_from(frequency).map_err(|_| FsError::NoDevice)?
         }
         23 => 1, // I915_PARAM_HAS_GEM_USERPTR
-        // Explicitly absent features; do not advertise perf,
-        // secure dispatch, CPU coherency or unimplemented scheduler controls.
-        6..=8
-        | 12..=13
-        | 15..=17
-        | 20..=21
-        | 24
-        | 27..=29
-        | 36
-        | 38..=39
-        | 42
-        | 52
-        | 54
-        | 56
-        | 58 => 0,
+        abi::PARAM_PERF_REVISION => i32::from(
+            info.backend
+                .as_ref()
+                .and_then(|backend| backend.oa_device())
+                .is_some(),
+        ),
+        // Explicitly absent features; do not advertise secure dispatch,
+        // CPU coherency or unimplemented scheduler controls.
+        6..=8 | 12..=13 | 15..=17 | 20..=21 | 24 | 27..=29 | 36 | 38..=39 | 42 | 52 | 56 | 58 => 0,
         _ => return Err(FsError::InvalidData),
     })
 }
@@ -2093,6 +2143,137 @@ fn version(arg: u64, user: &dyn IoctlContext, name: &[u8]) -> Result<(), FsError
     user.write(arg, &request)
 }
 
+fn query_perf_config(
+    info: &DeviceInfo,
+    subcmd: u32,
+    capacity: i32,
+    data_ptr: u64,
+    user: &dyn IoctlContext,
+) -> Result<i32, FsError> {
+    let device = info
+        .backend
+        .as_ref()
+        .and_then(|b| b.oa_device())
+        .ok_or(FsError::NoDevice)?;
+
+    match subcmd {
+        abi::QUERY_PERF_CONFIG_LIST => {
+            let ids = crate::intel_gpu_oa::query_config_ids(device.card);
+            let n_configs = ids.len();
+            let total_size = 48 + 8 * n_configs;
+            if capacity == 0 {
+                return Ok(total_size as i32);
+            }
+            if (capacity as usize) < total_size {
+                return Err(FsError::InvalidData);
+            }
+            if data_ptr == 0 {
+                return Err(FsError::BadAddress);
+            }
+            let mut flags_bytes = [0u8; 4];
+            user.read(data_ptr + 40, &mut flags_bytes)?;
+            if u32::from_le_bytes(flags_bytes) != 0 {
+                return Err(FsError::InvalidData);
+            }
+            user.write(data_ptr, &(n_configs as u64).to_le_bytes())?;
+            for (idx, &cid) in ids.iter().enumerate() {
+                let at = data_ptr + 48 + (idx as u64) * 8;
+                user.write(at, &cid.to_le_bytes())?;
+            }
+            Ok(total_size as i32)
+        }
+        abi::QUERY_PERF_CONFIG_DATA_FOR_UUID | abi::QUERY_PERF_CONFIG_DATA_FOR_ID => {
+            let total_size = 48 + 72;
+            if capacity == 0 {
+                return Ok(total_size as i32);
+            }
+            if (capacity as usize) < total_size {
+                return Err(FsError::InvalidData);
+            }
+            if data_ptr == 0 {
+                return Err(FsError::BadAddress);
+            }
+            let mut flags_bytes = [0u8; 4];
+            user.read(data_ptr + 40, &mut flags_bytes)?;
+            if u32::from_le_bytes(flags_bytes) != 0 {
+                return Err(FsError::InvalidData);
+            }
+            let config = if subcmd == abi::QUERY_PERF_CONFIG_DATA_FOR_UUID {
+                let mut uuid = [0u8; 36];
+                user.read(data_ptr, &mut uuid)?;
+                crate::intel_gpu_oa::query_config_by_uuid(device.card, &uuid)
+                    .ok_or(FsError::NotFound)?
+            } else {
+                let mut cid_bytes = [0u8; 8];
+                user.read(data_ptr, &mut cid_bytes)?;
+                let cid = u64::from_le_bytes(cid_bytes);
+                crate::intel_gpu_oa::query_config_by_id(device.card, cid)
+                    .ok_or(FsError::NotFound)?
+            };
+
+            let mut user_config = [0u8; 72];
+            user.read(data_ptr + 48, &mut user_config)?;
+            let mut n_mux = u32_at(&user_config, 36);
+            let mut n_bool = u32_at(&user_config, 40);
+            let mut n_flex = u32_at(&user_config, 44);
+            let mux_ptr = u64_at(&user_config, 48);
+            let bool_ptr = u64_at(&user_config, 56);
+            let flex_ptr = u64_at(&user_config, 64);
+
+            if (n_bool > 0 && n_bool < config.n_bool)
+                || (n_flex > 0 && n_flex < config.n_flex)
+                || (n_mux > 0 && n_mux < config.n_mux)
+            {
+                return Err(FsError::InvalidData);
+            }
+
+            let copy_reg_group = |user: &dyn IoctlContext,
+                                  regs: &[(u32, u32)],
+                                  user_n_regs: &mut u32,
+                                  user_regs_ptr: u64|
+             -> Result<(), FsError> {
+                let kernel_n_regs = regs.len() as u32;
+                if *user_n_regs == 0 {
+                    *user_n_regs = kernel_n_regs;
+                    return Ok(());
+                }
+                if user_regs_ptr == 0 {
+                    return Err(FsError::BadAddress);
+                }
+                for (i, (addr, val)) in regs.iter().enumerate() {
+                    let at = user_regs_ptr
+                        .checked_add((i as u64) * 8)
+                        .ok_or(FsError::BadAddress)?;
+                    user.write(at, &addr.to_le_bytes())?;
+                    user.write(at + 4, &val.to_le_bytes())?;
+                }
+                *user_n_regs = kernel_n_regs;
+                Ok(())
+            };
+
+            let bool_regs = &config.regs[0..config.n_bool as usize];
+            copy_reg_group(user, bool_regs, &mut n_bool, bool_ptr)?;
+            put32(&mut user_config, 40, n_bool);
+
+            let flex_start = config.n_bool as usize;
+            let flex_end = flex_start + config.n_flex as usize;
+            let flex_regs = &config.regs[flex_start..flex_end];
+            copy_reg_group(user, flex_regs, &mut n_flex, flex_ptr)?;
+            put32(&mut user_config, 44, n_flex);
+
+            let mux_regs = &config.regs[flex_end..];
+            copy_reg_group(user, mux_regs, &mut n_mux, mux_ptr)?;
+            put32(&mut user_config, 36, n_mux);
+
+            user_config[..36].copy_from_slice(&config.uuid);
+            user.write(data_ptr + 48, &user_config)?;
+
+            Ok(total_size as i32)
+        }
+        _ => Err(FsError::InvalidData),
+    }
+}
+
 fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsError> {
     let request = read(user, arg, 16)?;
     let count = u32_at(&request, 0) as usize;
@@ -2108,8 +2289,15 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
         let id = u64_at(item, 0);
         let capacity = u32_at(item, 8) as i32;
         let flags = u32_at(item, 12);
+        let data_ptr = u64_at(item, 16);
         let result = (|| {
-            if flags != 0 || capacity < 0 {
+            if capacity < 0 {
+                return Err(FsError::InvalidData);
+            }
+            if id == abi::QUERY_PERF_CONFIG {
+                return query_perf_config(info, flags, capacity, data_ptr, user);
+            }
+            if flags != 0 {
                 return Err(FsError::InvalidData);
             }
             let reply: Cow<'_, [u8]> = match id {
@@ -2184,6 +2372,7 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
         let length = match result {
             Ok(size) => size,
             Err(FsError::BadAddress) => -14,
+            Err(FsError::NotFound) => -2,
             Err(FsError::NoDevice) => -19,
             Err(_) => -22,
         };
@@ -3865,6 +4054,333 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_render",
         smoke_i915_exec_context_order_and_dr4_fixup
+    );
+
+    fn smoke_i915_perf_getparam_and_query_config() -> TestResult {
+        check(|| {
+            let file = RenderFile::new();
+            let user = User::new();
+
+            // 1. GETPARAM 54 (PARAM_PERF_REVISION) when no OA device is published -> returns 0
+            let mut info_no_oa = info(Generation::MeteorLake);
+            info_no_oa.backend = None;
+            let mut wire = [0u8; 16];
+            put32(&mut wire, 0, abi::PARAM_PERF_REVISION);
+            put64(&mut wire, 8, 1024);
+            user.store(64, &wire);
+            file.dispatch(&info_no_oa, abi::GETPARAM, 64, &user)
+                .unwrap()
+                .map_err(|_| "getparam without OA")?;
+            let val = i32::from_le_bytes(user.load(1024, 4).try_into().unwrap());
+            if val != 0 {
+                return Err("PARAM_PERF_REVISION must be 0 when no OA unit is published");
+            }
+
+            // Backend with an OA device
+            struct OaBackend {
+                device: crate::intel_gpu_oa::Device,
+            }
+            impl core::fmt::Debug for OaBackend {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str("OaBackend")
+                }
+            }
+            impl crate::intel_gpu_user::UserBackend for OaBackend {
+                fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
+                    None
+                }
+                fn oa_device(&self) -> Option<crate::intel_gpu_oa::Device> {
+                    Some(self.device)
+                }
+                fn submit<'a>(
+                    &'a self,
+                    _: Arc<crate::intel_gpu_user::UserContext>,
+                    _: crate::intel_gpu_user::UserBatch,
+                ) -> narf_filesystem::FsFuture<'a, Arc<crate::intel_gpu_fence::CompletionFence>>
+                {
+                    alloc::boxed::Box::pin(async { Err(FsError::Unsupported) })
+                }
+            }
+
+            let oa_dev = crate::intel_gpu_oa::Device {
+                card: 60,
+                platform: GtPlatform::Integrated(Generation::MeteorLake),
+                graphics: 1270,
+                timestamp: 19_200_000,
+                engines: crate::intel_gpu_engine::EngineSet::of(&[
+                    crate::intel_gpu_engine::Engine::Rcs0,
+                ]),
+                reserve: 16 * 1024 * 1024,
+                media_engines: None,
+                media_timestamp: None,
+            };
+            let mut info_oa = info(Generation::MeteorLake);
+            info_oa.backend = Some(Arc::new(OaBackend { device: oa_dev }));
+
+            // GETPARAM 54 with OA published -> returns 1
+            file.dispatch(&info_oa, abi::GETPARAM, 64, &user)
+                .unwrap()
+                .map_err(|_| "getparam with OA")?;
+            let val = i32::from_le_bytes(user.load(1024, 4).try_into().unwrap());
+            if val != 1 {
+                return Err("PARAM_PERF_REVISION must be 1 when OA unit is published");
+            }
+
+            // 2. QUERY item 3 (DRM_I915_QUERY_PERF_CONFIG)
+            let run_query = |file: &RenderFile,
+                             info: &DeviceInfo,
+                             user: &User,
+                             subcmd: u32,
+                             capacity: i32,
+                             data_ptr: u64|
+             -> Result<i32, FsError> {
+                let mut req = [0u8; 16];
+                put32(&mut req, 0, 1);
+                put32(&mut req, 4, 0);
+                put64(&mut req, 8, 256);
+                user.store(64, &req);
+
+                let mut item = [0u8; 24];
+                put64(&mut item, 0, abi::QUERY_PERF_CONFIG);
+                put32(&mut item, 8, capacity as u32);
+                put32(&mut item, 12, subcmd);
+                put64(&mut item, 16, data_ptr);
+                user.store(256, &item);
+
+                file.dispatch(info, abi::QUERY, 64, user).unwrap()?;
+                let out_item = user.load(256, 24);
+                let out_length = u32_at(&out_item, 8) as i32;
+                Ok(out_length)
+            };
+
+            // 2a. QUERY_PERF_CONFIG_LIST (subcmd 1) with 0 configs
+            let len = run_query(&file, &info_oa, &user, abi::QUERY_PERF_CONFIG_LIST, 0, 0)
+                .map_err(|_| "probe list 0")?;
+            if len != 48 {
+                return Err("expected list length 48 with 0 configs");
+            }
+
+            let mut query_buf = [0u8; 48];
+            user.store(1024, &query_buf);
+            let len = run_query(
+                &file,
+                &info_oa,
+                &user,
+                abi::QUERY_PERF_CONFIG_LIST,
+                48,
+                1024,
+            )
+            .map_err(|_| "query list 0")?;
+            if len != 48 {
+                return Err("expected returned length 48");
+            }
+            let n_configs = u64_at(&user.load(1024, 8), 0);
+            if n_configs != 0 {
+                return Err("expected 0 configs initially");
+            }
+
+            // Flags validation: flags at offset 40 MBZ
+            put32(&mut query_buf, 40, 1);
+            user.store(1024, &query_buf);
+            let err_len = run_query(
+                &file,
+                &info_oa,
+                &user,
+                abi::QUERY_PERF_CONFIG_LIST,
+                48,
+                1024,
+            )
+            .map_err(|_| "query list bad flags")?;
+            if err_len != -22 {
+                return Err("expected -22 (EINVAL) for invalid query flags");
+            }
+            put32(&mut query_buf, 40, 0);
+
+            // 2b. Add config via PERF_ADD_CONFIG
+            let mut cfg_raw = [0u8; 72];
+            let u1 = *b"12345678-1234-1234-1234-123456789abc";
+            cfg_raw[..36].copy_from_slice(&u1);
+            put32(&mut cfg_raw, 36, 1); // 1 mux reg
+            put32(&mut cfg_raw, 40, 1); // 1 bool reg
+            put32(&mut cfg_raw, 44, 0); // 0 flex regs
+            put64(&mut cfg_raw, 48, 2048); // mux reg ptr
+            put64(&mut cfg_raw, 56, 2080); // bool reg ptr
+            put64(&mut cfg_raw, 64, 0); // flex reg ptr
+            user.store(1500, &cfg_raw);
+
+            // Mux reg: addr = 0x9888, val = 0x1111
+            user.store(2048, &0x9888u32.to_le_bytes());
+            user.store(2052, &0x1111u32.to_le_bytes());
+            // Bool reg: addr = 0x9888, val = 0x2222
+            user.store(2080, &0x9888u32.to_le_bytes());
+            user.store(2084, &0x2222u32.to_le_bytes());
+
+            let cfg_id = file
+                .dispatch(&info_oa, abi::PERF_ADD_CONFIG, 1500, &user)
+                .unwrap()
+                .map_err(|_| "PERF_ADD_CONFIG")?;
+            if cfg_id < 1 {
+                return Err("expected positive config id");
+            }
+
+            // 2c. QUERY_PERF_CONFIG_LIST after adding config
+            let len = run_query(&file, &info_oa, &user, abi::QUERY_PERF_CONFIG_LIST, 0, 0)
+                .map_err(|_| "probe list 1")?;
+            if len != 56 {
+                return Err("expected list length 56 with 1 config");
+            }
+            let list_buf = [0u8; 56];
+            user.store(1024, &list_buf);
+            let len = run_query(
+                &file,
+                &info_oa,
+                &user,
+                abi::QUERY_PERF_CONFIG_LIST,
+                56,
+                1024,
+            )
+            .map_err(|_| "query list 1")?;
+            if len != 56 {
+                return Err("expected returned length 56");
+            }
+            let out_data = user.load(1024, 56);
+            let n_configs = u64_at(&out_data, 0);
+            let returned_id = u64_at(&out_data, 48);
+            if n_configs != 1 || returned_id != cfg_id {
+                return Err("expected 1 config matching cfg_id");
+            }
+
+            // 2d. QUERY_PERF_CONFIG_DATA_FOR_ID (subcmd 3)
+            let len = run_query(
+                &file,
+                &info_oa,
+                &user,
+                abi::QUERY_PERF_CONFIG_DATA_FOR_ID,
+                0,
+                0,
+            )
+            .map_err(|_| "probe data for id")?;
+            if len != 120 {
+                return Err("expected data length 120 (48 + 72)");
+            }
+
+            let mut data_buf = [0u8; 120];
+            put64(&mut data_buf, 0, cfg_id);
+            put32(&mut data_buf, 48 + 36, 1);
+            put32(&mut data_buf, 48 + 40, 1);
+            put32(&mut data_buf, 48 + 44, 0);
+            put64(&mut data_buf, 48 + 48, 3000);
+            put64(&mut data_buf, 48 + 56, 3016);
+            user.store(1024, &data_buf);
+
+            let len = run_query(
+                &file,
+                &info_oa,
+                &user,
+                abi::QUERY_PERF_CONFIG_DATA_FOR_ID,
+                120,
+                1024,
+            )
+            .map_err(|_| "query data for id")?;
+            if len != 120 {
+                return Err("expected returned length 120");
+            }
+            let out_data = user.load(1024, 120);
+            if out_data[48..48 + 36] != u1 {
+                return Err("config uuid mismatch in query output");
+            }
+            let mux_out_addr = u32_at(&user.load(3000, 8), 0);
+            let mux_out_val = u32_at(&user.load(3000, 8), 4);
+            if mux_out_addr != 0x9888 || mux_out_val != 0x1111 {
+                return Err("mux register mismatch in query output");
+            }
+
+            // Bad ID: returns -2 (ENOENT)
+            put64(&mut data_buf, 0, 999999);
+            user.store(1024, &data_buf);
+            let err_len = run_query(
+                &file,
+                &info_oa,
+                &user,
+                abi::QUERY_PERF_CONFIG_DATA_FOR_ID,
+                120,
+                1024,
+            )
+            .map_err(|_| "query bad id")?;
+            if err_len != -2 {
+                return Err("expected -2 (ENOENT) for invalid config id");
+            }
+
+            // 2e. QUERY_PERF_CONFIG_DATA_FOR_UUID (subcmd 2)
+            let mut uuid_buf = [0u8; 120];
+            uuid_buf[..36].copy_from_slice(&u1);
+            put32(&mut uuid_buf, 48 + 36, 1);
+            put32(&mut uuid_buf, 48 + 40, 1);
+            put64(&mut uuid_buf, 48 + 48, 3000);
+            put64(&mut uuid_buf, 48 + 56, 3016);
+            user.store(1024, &uuid_buf);
+
+            let len = run_query(
+                &file,
+                &info_oa,
+                &user,
+                abi::QUERY_PERF_CONFIG_DATA_FOR_UUID,
+                120,
+                1024,
+            )
+            .map_err(|_| "query data for uuid")?;
+            if len != 120 {
+                return Err("expected returned length 120 for uuid query");
+            }
+
+            // Bad UUID: returns -2 (ENOENT)
+            uuid_buf[..36].copy_from_slice(b"00000000-0000-0000-0000-000000000000");
+            user.store(1024, &uuid_buf);
+            let err_len = run_query(
+                &file,
+                &info_oa,
+                &user,
+                abi::QUERY_PERF_CONFIG_DATA_FOR_UUID,
+                120,
+                1024,
+            )
+            .map_err(|_| "query bad uuid")?;
+            if err_len != -2 {
+                return Err("expected -2 (ENOENT) for invalid config uuid");
+            }
+
+            // 2f. PERF_REMOVE_CONFIG
+            user.store(1600, &cfg_id.to_le_bytes());
+            file.dispatch(&info_oa, abi::PERF_REMOVE_CONFIG, 1600, &user)
+                .unwrap()
+                .map_err(|_| "PERF_REMOVE_CONFIG")?;
+
+            let len = run_query(&file, &info_oa, &user, abi::QUERY_PERF_CONFIG_LIST, 0, 0)
+                .map_err(|_| "probe list after remove")?;
+            if len != 48 {
+                return Err("expected list length 48 after remove");
+            }
+            put64(&mut data_buf, 0, cfg_id);
+            user.store(1024, &data_buf);
+            let err_len = run_query(
+                &file,
+                &info_oa,
+                &user,
+                abi::QUERY_PERF_CONFIG_DATA_FOR_ID,
+                120,
+                1024,
+            )
+            .map_err(|_| "query removed id")?;
+            if err_len != -2 {
+                return Err("expected -2 (ENOENT) for removed config id");
+            }
+
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_i915_perf_getparam_and_query_config
     );
 
     include!("intel_gpu_sync_tests.rs");

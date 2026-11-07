@@ -35,6 +35,9 @@ pub const I915_USERPTR_PROBE: u32 = 1 << 1;
 pub const I915_USERPTR_UNSYNCHRONIZED: u32 = 1 << 31;
 pub const GEM_CONTEXT_GETPARAM: u32 = iowr(D, 0x74, 24);
 pub const GEM_CONTEXT_SETPARAM: u32 = iowr(D, 0x75, 24);
+pub const PERF_OPEN: u32 = iow(D, 0x76, 16);
+pub const PERF_ADD_CONFIG: u32 = iow(D, 0x77, 72);
+pub const PERF_REMOVE_CONFIG: u32 = iow(D, 0x78, 8);
 pub const QUERY: u32 = iowr(D, 0x79, 16);
 pub const GEM_VM_CREATE: u32 = iowr(D, 0x7a, 16);
 pub const GEM_VM_DESTROY: u32 = iow(D, 0x7b, 16);
@@ -48,10 +51,27 @@ pub const ENGINE_VIDEO_ENHANCE: u16 = 3;
 pub const ENGINE_COMPUTE: u16 = 4;
 pub const QUERY_TOPOLOGY: u64 = 1;
 pub const QUERY_ENGINES: u64 = 2;
+pub const QUERY_PERF_CONFIG: u64 = 3;
+pub const QUERY_PERF_CONFIG_LIST: u32 = 1;
+pub const QUERY_PERF_CONFIG_DATA_FOR_UUID: u32 = 2;
+pub const QUERY_PERF_CONFIG_DATA_FOR_ID: u32 = 3;
 pub const QUERY_MEMORY_REGIONS: u64 = 4;
 pub const QUERY_HWCONFIG: u64 = 5;
 pub const QUERY_GEOMETRY_SUBSLICES: u64 = 6;
 pub const QUERY_GUC_SUBMISSION_VERSION: u64 = 7;
+
+pub const PARAM_PERF_REVISION: u32 = 54;
+
+pub const PERF_PROP_CTX_HANDLE: u64 = 1;
+pub const PERF_PROP_SAMPLE_OA: u64 = 2;
+pub const PERF_PROP_OA_METRICS_SET: u64 = 3;
+pub const PERF_PROP_OA_FORMAT: u64 = 4;
+pub const PERF_PROP_OA_EXPONENT: u64 = 5;
+pub const PERF_PROP_HOLD_PREEMPTION: u64 = 6;
+pub const PERF_PROP_GLOBAL_SSEU: u64 = 7;
+pub const PERF_PROP_POLL_OA_PERIOD: u64 = 8;
+pub const PERF_PROP_OA_ENGINE_CLASS: u64 = 9;
+pub const PERF_PROP_OA_ENGINE_INSTANCE: u64 = 10;
 
 pub const EXEC_RENDER: u64 = 1;
 pub const EXEC_BLT: u64 = 3;
@@ -128,6 +148,9 @@ pub(crate) fn compatibility_ioctl(cmd: u32) -> bool {
             | GEM_VM_CREATE
             | GEM_VM_DESTROY
             | GEM_CLOSE
+            | PERF_OPEN
+            | PERF_ADD_CONFIG
+            | PERF_REMOVE_CONFIG
     )
 }
 
