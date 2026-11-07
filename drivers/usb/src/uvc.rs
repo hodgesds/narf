@@ -955,13 +955,22 @@ pub fn find_video_streaming_interface(cfg: &[u8]) -> Option<u8> {
 // query fails, whose length has no V4L2 integer mapping, or whose
 // device-reported range is inverted is skipped, not advertised.
 
+/// One VC control unit found in a class-specific blob:
+/// `(unit_id, bmControls bitmap)`.
+pub type VcControlUnit = (u8, u32);
+
+/// First Camera Terminal / Processing Unit found in a VC
+/// class-specific blob: one [`VcControlUnit`] each, or
+/// `None` when the blob carries no such entity.
+pub type VcControlUnits = (Option<VcControlUnit>, Option<VcControlUnit>);
+
 /// First Camera Terminal / Processing Unit found in a VC
 /// class-specific blob: `(unit_id, bmControls bitmap)` each, or
 /// `None` when the blob carries no such entity. Only the first of
 /// each kind is retained — multi-PU/multi-CT topologies are not
 /// modelled (see the #809 remainder note in
 /// [`try_bind_video_with_transport`]).
-pub fn parse_vc_control_units(vc_cs_blob: &[u8]) -> (Option<(u8, u32)>, Option<(u8, u32)>) {
+pub fn parse_vc_control_units(vc_cs_blob: &[u8]) -> VcControlUnits {
     let mut ct: Option<(u8, u32)> = None;
     let mut pu: Option<(u8, u32)> = None;
     let mut i = 0usize;
@@ -994,6 +1003,7 @@ pub fn parse_vc_control_units(vc_cs_blob: &[u8]) -> (Option<(u8, u32)>, Option<(
 
 /// One descriptor-advertised control with its hardware-reported
 /// range, ready to install as a V4L2 [`ControlState`].
+#[derive(Debug)]
 pub struct BoundUvcControl {
     pub id: narf_drivers_video::uvc::ControlId,
     /// Payload length in bytes (1, 2, or 4) from GET_LEN.
