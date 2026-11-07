@@ -66,7 +66,7 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_engine::{Engine, EngineSet};
 use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_gt_hw::{MTL_GLOBAL_MOCS, MTL_L3CC};
-use crate::intel_gpu_topology::{xelpg_l3_bank_mask, MIRROR_FUSE3, XEHP_FUSE4};
+use crate::intel_gpu_topology::{MIRROR_FUSE3, XEHP_FUSE4, xelpg_l3_bank_mask};
 use core::task::Poll;
 
 /// Default-off opt-in for the whole MTL/Arrow media GT path (lifecycle owner,
@@ -285,6 +285,12 @@ pub struct MediaTopology {
 const GEOMETRY_DSS_ENABLE: u64 = 0x913c;
 const COMPUTE_DSS_ENABLE: u64 = 0x9144;
 const EU_ENABLE: u64 = 0x9134;
+/// regs/xe_gt_regs.h `MTL_MIRROR_TARGET_WP1` (`0x0c60`, GSI-translated to
+/// `0x380c60` on GT1); bits [8:0] (`MTL_CAGF_MASK`) carry CAGF in 16.67 MHz units.
+pub(crate) const MTL_MIRROR_TARGET_WP1: u64 = 0x0c60;
+/// regs/xe_gt_regs.h `MTL_MEDIA_MC6` (`0x138048`, above `MEDIA_GT_GSI_LENGTH`
+/// in the PCU mirror range); 32-bit residency counter in 1.28 us (1280 ns) units.
+pub(crate) const MTL_MEDIA_MC6: u64 = 0x138048;
 
 impl MediaTopology {
     /// Two identical samples of GT1's fuse mirrors under GT1 wake. As for
@@ -1297,6 +1303,23 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
     pub(crate) fn slpc_status(&self) -> Option<crate::intel_gpu_slpc::Status> {
         self.publication()?;
         self.gt.slpc_status()
+    }
+
+    /// GT1's accumulated MC6 residency in milliseconds (`MTL_MEDIA_MC6`,
+    /// `0x138048`, 1.28 us units) while GT1 is published.
+    pub(crate) fn mc6_residency_ms(&self) -> Option<u64> {
+        self.publication()?;
+        let raw = self.media.read32(MTL_MEDIA_MC6);
+        (raw != u32::MAX).then_some((u64::from(raw) * 1280) / 1_000_000)
+    }
+
+    /// GT1's actual CAGF operating frequency in MHz (`MTL_MIRROR_TARGET_WP1`,
+    /// `0x0c60` + GSI = `0x380c60`, bits [8:0] in 16.67 MHz units) while GT1
+    /// is published.
+    pub(crate) fn act_freq_mhz(&self) -> Option<u32> {
+        self.publication()?;
+        let raw = self.media.read32(MTL_MIRROR_TARGET_WP1);
+        (raw != u32::MAX).then_some(crate::intel_gpu_slpc::decode(raw & 0x1ff))
     }
 
     /// Advance start, scheduling or stop by one bounded step.

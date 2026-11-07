@@ -4,12 +4,12 @@
 //! production constants. The register model supplies only hardware ACKs.
 use super::*;
 use crate::intel_gpu_pmdemand::{Demand, Params};
-use crate::intel_gpu_xelpg_cdclk::{plan, Current, Rung, Step};
-use crate::intel_gpu_xelpg_dbuf::{dbuf_slices, mbus_joined, Entry};
+use crate::intel_gpu_xelpg_cdclk::{Current, Rung, Step, plan};
+use crate::intel_gpu_xelpg_dbuf::{Entry, dbuf_slices, mbus_joined};
 use crate::intel_gpu_xelpg_wm::Level;
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::cell::{Cell, RefCell};
-use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_kernel_test::{TestResult, kernel_test_in};
 
 /// Register file with source ACK behavior: PM demand REQ_ENABLE self-clears,
 /// DBUF POWER_STATE follows POWER_REQUEST, the CDCLK PLL reports LOCK while
@@ -1214,7 +1214,7 @@ fn smoke_xelpg_resources_dsc_pipe_adds_vdsc_cdclk_and_prefill() -> TestResult {
     // slice bubbles (vdsc_min_cdclk(650016, 2960, 1, 1) = 653091 kHz,
     // past the 652.8 MHz maximum), on two engines with four slices
     // 331157 kHz, above the 325008 kHz pixel minimum: the 480 MHz rung.
-    use crate::intel_gpu_xelpg_dsc::{vdsc_min_cdclk, DscTerm};
+    use crate::intel_gpu_xelpg_dsc::{DscTerm, vdsc_min_cdclk};
     if vdsc_min_cdclk(650_016, 2960, 1, 1) != 653_091
         || vdsc_min_cdclk(650_016, 2960, 4, 2) != 331_157
     {
@@ -1319,6 +1319,45 @@ fn smoke_xelpg_resources_bigjoiner_and_panel_fitter_allocation() -> TestResult {
     }
     if compute(&request, &latency()) != Err(ResourceError::Unsupported) {
         return TestResult::Fail("self-joining must be rejected");
+    }
+
+    // 3. Pipe scaler window bounds check
+    request.pipes[0] = pipe(148_500, (1920, 2200), (1080, 1125), 540_000, 0);
+    if let Some(p) = request.pipes[0].as_mut() {
+        p.scaler = Some(crate::intel_gpu_xelpg_scaler::PipeScaler {
+            id: 0,
+            window: crate::intel_gpu_xelpg_scaler::Window {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            hscale: 0x10000,
+            vscale: 0x10000,
+            filter: crate::intel_gpu_xelpg_scaler::Filter::Default,
+        });
+    }
+    if compute(&request, &latency()).is_err() {
+        return TestResult::Fail("valid pipe scaler window must compute");
+    }
+
+    // Scaler window exceeding hdisplay/vdisplay must be rejected
+    if let Some(p) = request.pipes[0].as_mut() {
+        p.scaler = Some(crate::intel_gpu_xelpg_scaler::PipeScaler {
+            id: 0,
+            window: crate::intel_gpu_xelpg_scaler::Window {
+                x: 100,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            hscale: 0x10000,
+            vscale: 0x10000,
+            filter: crate::intel_gpu_xelpg_scaler::Filter::Default,
+        });
+    }
+    if compute(&request, &latency()) != Err(ResourceError::Unsupported) {
+        return TestResult::Fail("scaler window exceeding hdisplay must be rejected");
     }
 
     TestResult::Pass

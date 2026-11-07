@@ -581,7 +581,7 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 match pool.smallbar_access(&owner.pending.window) {
                     Ok(()) => {}
                     Err(crate::intel_gpu_gt::lnl::Error::Busy) => {
-                        return Err(narf_filesystem::FsError::WouldBlock)
+                        return Err(narf_filesystem::FsError::WouldBlock);
                     }
                     Err(_) => {
                         owner.close_controls();
@@ -954,7 +954,7 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 match pool.smallbar_access(&owner.pending.window) {
                     Ok(()) => {}
                     Err(crate::intel_gpu_gt::lnl::Error::Busy) => {
-                        return Err(narf_filesystem::FsError::WouldBlock)
+                        return Err(narf_filesystem::FsError::WouldBlock);
                     }
                     Err(_) => {
                         owner.close_controls();
@@ -1106,8 +1106,31 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             return None;
         }
         let owner = self.owner.upgrade()?;
+        if owner.suspended.load(Ordering::Acquire) {
+            return None;
+        }
         let state = owner.state.try_lock()?;
-        state.media_guc.as_ref().map(|_| 0)
+        if state.phase != Phase::Running {
+            return None;
+        }
+        state
+            .media_guc
+            .as_ref()
+            .and_then(|guc| guc.mc6_residency_ms())
+    }
+    fn media_gt_act_freq_mhz(&self) -> Option<u32> {
+        if self.epoch.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let owner = self.owner.upgrade()?;
+        if owner.suspended.load(Ordering::Acquire) {
+            return None;
+        }
+        let state = owner.state.try_lock()?;
+        if state.phase != Phase::Running {
+            return None;
+        }
+        state.media_guc.as_ref().and_then(|guc| guc.act_freq_mhz())
     }
     fn main_gt_slpc_status(&self) -> Option<crate::intel_gpu_slpc::Status> {
         if self.epoch.load(Ordering::Acquire) == 0 {
@@ -1122,8 +1145,50 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             return None;
         }
         let owner = self.owner.upgrade()?;
+        if owner.suspended.load(Ordering::Acquire) {
+            return None;
+        }
         let state = owner.state.try_lock()?;
-        state.gt.as_ref().map(|_| 0)
+        if state.phase != Phase::Running {
+            return None;
+        }
+        state.gt.as_ref()?;
+        let raw = owner
+            .pending
+            .window
+            .read32(crate::intel_gpu_rc6::GEN6_GT_GFX_RC6);
+        (raw != u32::MAX).then_some((u64::from(raw) * 1280) / 1_000_000)
+    }
+    fn main_gt_act_freq_mhz(&self) -> Option<u32> {
+        if self.epoch.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let owner = self.owner.upgrade()?;
+        if owner.suspended.load(Ordering::Acquire) {
+            return None;
+        }
+        let state = owner.state.try_lock()?;
+        if state.phase != Phase::Running {
+            return None;
+        }
+        state.gt.as_ref()?;
+        let raw = if self.platform == GtPlatform::Alchemist || self.platform.is_gen12() {
+            let rpstat = owner.pending.window.read32(0x1381b4);
+            if rpstat == u32::MAX {
+                return None;
+            }
+            (rpstat >> 11) & 0x1ff
+        } else {
+            let wp1 = owner
+                .pending
+                .window
+                .read32(crate::intel_gpu_gt::media::MTL_MIRROR_TARGET_WP1);
+            if wp1 == u32::MAX {
+                return None;
+            }
+            wp1 & 0x1ff
+        };
+        Some(crate::intel_gpu_slpc::decode(raw))
     }
     fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
         let epoch = self.epoch.load(Ordering::Acquire);
@@ -1188,7 +1253,7 @@ impl Backend {
             match access {
                 Ok(()) => {}
                 Err(crate::intel_gpu_gt::lnl::Error::Busy) => {
-                    return Err(narf_filesystem::FsError::WouldBlock.into())
+                    return Err(narf_filesystem::FsError::WouldBlock.into());
                 }
                 Err(_) => {
                     owner.close_controls();
@@ -3725,7 +3790,7 @@ pub(crate) fn probe_discrete(
 mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
-    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_kernel_test::{TestResult, kernel_test_in};
 
     fn smoke_gt_compute_boot_selection_is_unambiguous_and_immutable() -> TestResult {
         use narf_boot::args::KernelCmdline;
@@ -3937,8 +4002,8 @@ mod tests {
         "drivers/gpu/intel_gpu_gt",
         smoke_gt_pci_identity_and_virtualization_admission
     );
-    fn smoke_gt_discrete_display_inventory_denies_absent_planes_and_refuses_each_live_fetcher(
-    ) -> TestResult {
+    fn smoke_gt_discrete_display_inventory_denies_absent_planes_and_refuses_each_live_fetcher()
+    -> TestResult {
         use core::cell::Cell;
         struct Io {
             live: Option<u64>,
@@ -3954,11 +4019,7 @@ mod tests {
                 if self.unavailable == Some(r) {
                     return u32::MAX;
                 }
-                if self.live == Some(r) {
-                    1 << 31
-                } else {
-                    0
-                }
+                if self.live == Some(r) { 1 << 31 } else { 0 }
             }
             fn write32(&self, _: u64, _: u32) {
                 panic!("read-only discrete display admission wrote MMIO")

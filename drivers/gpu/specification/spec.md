@@ -329,11 +329,16 @@ The Gen12 orchestrator writes `vblank_display13` on ADL-P/ADL-N, and
 `vblank_start`). The display-14 resource request
 (`intel_gpu_display_resources::request_dsc`, `initialize_dsc`) carries the
 pipe's `DscTerm`; `pipe_a_dsc` reads it back from Pipe A's engines.
-`intel_gpu_xelpg_scaler` models the panel fitter (`panel_fit`, `plan`,
+`intel_gpu_xelpg_scaler` models and programs the panel fitter (`panel_fit`, `plan`,
 `PipeScaler::enable_writes`, `disable_writes`, `nearest_filter_writes`,
-`calc_phase`, `prefill_lines`; `ScalerRefusal`) without a production
-caller. `intel_gpu_pipes::TranscoderProgram::vblank_display13` is the
-display 13+ `TRANS_VBLANK` value both display-14 writers and the display-13
+`calc_phase`, `prefill_lines`; `ScalerRefusal`). `XeLpgModeset` wires panel fitting
+(`with_panel_fit`, aspect/center/fullscreen scaling, nearest/default filters, sized
+framebuffer validation via `validate_framebuffer_sized`, `program_pipe_source`,
+`program_scaler`, `disable_scaler`) and bigjoiner master/slave programming
+(`with_bigjoiner`, `program_bigjoiner`, master `JOINER_ENABLE` and secondary
+`SECONDARY_BIG_JOINER_ENABLE` in `ICL_PIPE_DSS_CTL1`, watermark scaler prefill lines
+in `intel_gpu_xelpg_wm::check_vblank_dsc_scaler_ip`). `intel_gpu_pipes::TranscoderProgram::vblank_display13`
+is the display 13+ `TRANS_VBLANK` value both display-14 writers and the display-13
 Gen12 orchestrator use.
 
 ### Lunar Lake display 20 (Xe2_LPD)
@@ -721,7 +726,7 @@ while any allowed engine is making real progress. Diagnostics report an exact
 observed engine or unavailable, plus the placement set; the template engine
 is never substituted for physical evidence. Disable/deregister/final-TLB and
 full-reset ownership rules retain the whole virtual context and residency.
-Single-row width-two through width-four parallel COPY/COMPUTE queues retain
+Single-row width-two through width-four parallel COPY/COMPUTE/VIDEO (VCS/VECS) queues retain
 one persistent image/ring per lane, a common context serial/epoch, an immutable
 shared VM graph and a copied batch address per lane. Published dense logical
 instances must be adjacent and same-class; actual engine availability bounds
@@ -753,11 +758,10 @@ completed lanes cannot mask a remaining stall. All placements survive close,
 cancel and reset until existing retirement proofs complete. Qualified physical
 sets permit compute 2×2, 2×3 and 3×2; one RCS0 cannot form a parallel render group,
 and COPY0/1 permits only one distinct two-lane row. Unsupported physical widths
-remain refused. Pinned Linux's platform descriptors give every current
+remain refused. Parallel queue creation (width > 1) accepts COPY (class 1), VCS (class 2), VECS (class 3), and COMPUTE (class 4) with contiguous placement rows on the matching GT; class 0 (Render) or class 5 (Bind) with width > 1, or COMPUTE/VIDEO on a GT without published instances, return EINVAL. Pinned Linux's platform descriptors give every current
 profile a zero multi-queue class mask; CGP groups and dynamic multi-queue
 properties remain unadvertised pending independent platform qualification.
-VIDEO classes, and COMPUTE on a GT
-without a published compute instance, return EINVAL. `UserStatus::engines` carries the GT's
+`UserStatus::engines` carries the GT's
 published `EngineSet`; ENGINES lists exactly that set in xe_hw_engine order
 and engine-cycle queries for an unpublished class return EINVAL after the
 syntax and readiness checks. EXEC_QUEUE_CREATE extensions follow
@@ -1017,10 +1021,10 @@ facts only with the live epoch. These are the card, platform, graphics
 version, OA timestamp frequency, published engines and reservation.
 Query 8 (`drm_xe_query_oa_units`) has zero units until then. After that it
 has one OAG unit (id 0, gt 0) with the published render and compute
-engines. Its capabilities are BASE, OA_BUFFER_SIZE, WAIT_NUM_REPORTS and
-OA_UNIT_GT_ID. When the standalone media GT is published, Query 8 also
+engines. Its capabilities are BASE, SYNCS (`DRM_XE_OA_CAPS_SYNCS`), OA_BUFFER_SIZE, WAIT_NUM_REPORTS and
+OA_UNIT_GT_ID (value 47). When the standalone media GT is published, Query 8 also
 enumerates unit 1 (OAM, gt 1) with published VCS/VECS engines and CAPS_OAM
-(including DRM_XE_OA_CAPS_OAM). Sysfs `/sys/class/drm/card<N>/oa/` exposes
+(including `DRM_XE_OA_CAPS_SYNCS` and `DRM_XE_OA_CAPS_OAM`, value 63). Sysfs `/sys/class/drm/card<N>/oa/` exposes
 live `oa_status`, `oa_buffer_size`, `oa_active`, `oa_configs_count`, and
 `oa_overflow_count`.
 
@@ -1039,7 +1043,9 @@ or op is EINVAL. The OA ops follow `xe_oa.c`'s errno order and C widths:
 - Extensions are E2BIG past sixteen, then EFAULT/EINVAL.
 - An exec queue is ENOENT or EOPNOTSUPP (width > 1).
 - Privilege is EACCES. Unprivileged open is permitted for an exec queue stream without sampling (`sample: false`); periodic timer sampling (`sample: true`), preemption holding (`no_preempt: true`), or queue-less global streams require current CAP_PERFMON/CAP_SYS_ADMIN.
-- A second stream per card is EBUSY.
+- Stream open and `DRM_XE_OA_IOCTL_CONFIG` accept `DRM_XE_OA_PROPERTY_NUM_SYNCS` (10) and `DRM_XE_OA_PROPERTY_SYNCS` (11) for up to two syncs: in-fences are awaited, and out-fences and user-fences are signaled on completion.
+- Unit 1 (OAM) streams require `device.has_oam()`, an exec queue mapped to a media engine (VCS/VECS), and an MPEC format (8 or 9), rejecting timer sampling; non-MPEC formats on OAM and MPEC formats on OAG (Unit 0) are rejected.
+- Concurrency permits are maintained independently per unit (`ACTIVE: [[AtomicBool; 2]; 64]`), so Unit 0 and Unit 1 can be open simultaneously on the same card; a second stream on the same unit is EBUSY.
 - Add returns EADDRINUSE for a duplicate uuid and otherwise the lowest
   free id from 1. Remove returns ENOENT for an unknown id.
 
@@ -2106,11 +2112,16 @@ bounds by readback, then sends GUCRC_FIRMWARE_CONTROL, the compute strategy (a
 refusal is ignored) and the Base profile. `MediaGuc` publishes GT1 only after
 SLPC is Running, and any start failure stops GT1 (`MediaGucError::Slpc`), as
 xe_uc_load_hw fails. `MediaGuc::slpc_status` reports the confirmed status
-while GT1 is published. Before any reset of a GuC that started media power,
+while GT1 is published, `MediaGuc::mc6_residency_ms` reads `MTL_MEDIA_MC6`
+(`0x138048`, 1.28 us units) and `MediaGuc::act_freq_mhz` reads
+`MTL_MIRROR_TARGET_WP1` (`0x380c60`, bits [8:0] in 16.67 MHz units). Before any reset of a GuC that started media power,
 with wake held, the owner sends GUCRC_HOST_CONTROL if firmware control was
 handed over, then writes RC_CONTROL, RC_STATE and POWERGATE_ENABLE to zero at
-GT1's GSI copies. The main GT's sequence and stop are unchanged. GT1 has no
-sysfs or UAPI power interface: the per-card controls below remain GT0's.
+GT1's GSI copies. The main GT's sequence and stop are unchanged. Read-only
+per-GT frequency and idle telemetry is exposed through `intel_gpu_gt_sysfs`
+(`gt/`, `gt0/`, `device/tile0/gt0/{freq0,gtidle}/`) and
+`intel_gpu_media_gt_sysfs` (`gt1/`, `device/tile0/gt1/{freq0,gtidle}/`);
+writable per-card SLPC controls below remain GT0's.
 
 `intel_gpu_power_controls::PowerControls` supplies a bounded per-card mailbox
 through `UserBackend::power_controls`. The GT owner explicitly activates a
@@ -2127,10 +2138,13 @@ Intel card sysfs nodes expose writable `gt_min_freq_mhz`, `gt_max_freq_mhz`,
 (`base` or `power-saving`). Read-only `gt_RPn_freq_mhz`, `gt_RP1_freq_mhz`,
 `gt_RP0_freq_mhz` and `slpc_status` report confirmed limits and mailbox state.
 The gt_* names follow i915; slpc_* files and asynchronous store acceptance
-are NARF extensions, not the Xe freq0 sysfs ABI. They control GT0 only; the
-Xe per-GT `tile0/gt1/freq0` and `gtidle` trees are absent, so the media GT has
-no frequency or idle attributes. Callbacks resolve the current
-per-card backend and perform no MMIO. Every writable SLPC callback requires
+are NARF extensions, not the Xe freq0 sysfs ABI. Writable controls apply to
+GT0 only, while read-only `tile0/gt0/{freq0,gtidle}` and
+`tile0/gt1/{freq0,gtidle}` trees (`cur_freq`, `act_freq`, `min_freq`,
+`max_freq`, `rp0_freq`, `rpe_freq`, `rpn_freq`, `power_profile`, `name`,
+`idle_residency_ms`, `idle_status`, `gt1-mc`) plus `gt0/` and `gt1/`
+telemetry attributes (`rps_*_freq_mhz`, `rc6*_residency_ms`, `slpc_status`,
+`slpc_power_profile`) report GT0 and GT1 telemetry through `UserBackend`. Every writable SLPC callback requires
 current initial-namespace CAP_SYS_ADMIN; reads remain cached. Only confirmed user policy survives
 close; a newly activated GT revalidates it against fresh limits and replays
 range then profile with acknowledgments. Queued/unacknowledged old-epoch

@@ -120,12 +120,20 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn media_gt_rc6_residency_ms(&self) -> Option<u64> {
         None
     }
+    /// Actual measured CAGF operating frequency in MHz for the standalone media GT (GT1).
+    fn media_gt_act_freq_mhz(&self) -> Option<u32> {
+        None
+    }
     /// Confirmed SLPC status (limits, range, profile) for the main graphics GT (GT0).
     fn main_gt_slpc_status(&self) -> Option<crate::intel_gpu_slpc::Status> {
         None
     }
     /// Accumulated RC6 residency in milliseconds for the main graphics GT (GT0).
     fn main_gt_rc6_residency_ms(&self) -> Option<u64> {
+        None
+    }
+    /// Actual measured CAGF operating frequency in MHz for the main graphics GT (GT0).
+    fn main_gt_act_freq_mhz(&self) -> Option<u32> {
         None
     }
     /// Cached physical automatic global-reset availability for this live user
@@ -470,7 +478,7 @@ impl UserContext {
             .and_then(|set| set.iter().next())
             .ok_or(FsError::InvalidData)?;
         if !(2..=MAX_PARALLEL_WIDTH).contains(&lanes.len())
-            || !(first.is_copy() || first.is_compute())
+            || !(first.is_copy() || first.is_compute() || first.is_media())
             || lanes.iter().any(|set| {
                 set.iter().next().is_none()
                     || set

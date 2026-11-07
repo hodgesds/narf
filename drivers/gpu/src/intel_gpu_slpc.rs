@@ -23,7 +23,7 @@ use crate::{
     intel_gpu_rcs::GpuBacking,
 };
 use alloc::{vec, vec::Vec};
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 pub(crate) const RESET_FENCE: u16 = 0xfffe;
 const FIRST_FENCE: u16 = 0x8000;
@@ -69,7 +69,7 @@ pub struct Limits {
     pub max_mhz: u32,
 }
 
-fn decode(raw: u32) -> u32 {
+pub(crate) fn decode(raw: u32) -> u32 {
     (raw * 50 + 1) / 3
 }
 fn rounded(mhz: u32) -> u32 {

@@ -98,15 +98,15 @@
 //!   PM demand instead, the inherited path still sends none.
 
 use core::cell::Cell;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
 use crate::dp_link_training::RateSelect;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError, PixelFormat};
 use crate::intel_gpu_pll::LinkRate;
 use crate::intel_gpu_xelpg::{
-    disable_port_pll, enable_d2d, enable_port_pll_khz, program_port_buf_ctl, reprogram_pll_khz,
-    set_signal_levels_khz, Cx0Error, Cx0Phy, XeLpgPort,
+    Cx0Error, Cx0Phy, XeLpgPort, disable_port_pll, enable_d2d, enable_port_pll_khz,
+    program_port_buf_ctl, reprogram_pll_khz, set_signal_levels_khz,
 };
 use crate::intel_gpu_xelpg_dsc::{DscPlan, DscRefusal};
 
@@ -518,12 +518,23 @@ pub struct XeLpgModeset<'a, M: MmioWindow + ?Sized> {
     /// The display IP the sequence is dispatched on (14.00 unless a
     /// per-device display-20 admission selected Xe2_LPD).
     ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    /// Panel fitting configuration: (source width, source height, scaling mode, filter)
+    panel_fit: Option<(
+        u16,
+        u16,
+        crate::intel_gpu_xelpg_scaler::ScalingMode,
+        crate::intel_gpu_xelpg_scaler::Filter,
+    )>,
+    /// Bigjoiner slave pipe when two pipes are joined to drive one output.
+    bigjoiner_slave: Option<crate::intel_gpu_pipes::Pipe>,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for XeLpgModeset<'a, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("XeLpgModeset")
             .field("port", &self.port)
+            .field("panel_fit", &self.panel_fit)
+            .field("bigjoiner_slave", &self.bigjoiner_slave)
             .finish()
     }
 }
@@ -553,6 +564,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             port,
             pipe_dmc: &crate::intel_gpu_dc_states::ServicePipeDmc,
             ip: crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
+            panel_fit: None,
+            bigjoiner_slave: None,
         }
     }
 
@@ -567,6 +580,24 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// [`crate::intel_gpu_xe3lpd`]'s, over its PICA register view).
     pub(crate) fn with_display_ip(mut self, ip: crate::intel_gpu_xe2lpd::DisplayIp) -> Self {
         self.ip = ip;
+        self
+    }
+
+    /// Configure panel fitting with a custom source size, scaling mode, and filter.
+    pub fn with_panel_fit(
+        mut self,
+        src_w: u16,
+        src_h: u16,
+        mode: crate::intel_gpu_xelpg_scaler::ScalingMode,
+        filter: crate::intel_gpu_xelpg_scaler::Filter,
+    ) -> Self {
+        self.panel_fit = Some((src_w, src_h, mode, filter));
+        self
+    }
+
+    /// Configure bigjoiner with a slave pipe.
+    pub fn with_bigjoiner(mut self, slave: crate::intel_gpu_pipes::Pipe) -> Self {
+        self.bigjoiner_slave = Some(slave);
         self
     }
 
@@ -612,7 +643,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         primary_fb: &Framebuffer,
         mode: &Mode,
     ) -> Result<Mode, ModesetError> {
-        crate::intel_gpu_modeset::validate_framebuffer_mode(primary_fb, mode)?;
+        let (src_w, src_h) = self
+            .panel_fit
+            .map_or((mode.h_active, mode.v_active), |(w, h, _, _)| (w, h));
+        crate::intel_gpu_modeset::validate_framebuffer_sized(primary_fb, src_w, src_h)?;
         inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?;
         // Nested under `modeset`'s reference when reached from there.
         let _power =
@@ -622,10 +656,16 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             raw: self.mmio,
             failed: Cell::new(false),
         };
-        let result = XeLpgModeset::new(&checked, self.port)
+        let mut child = XeLpgModeset::new(&checked, self.port)
             .with_pipe_dmc(self.pipe_dmc)
-            .with_display_ip(self.ip)
-            .modeset_checked(primary_fb, mode);
+            .with_display_ip(self.ip);
+        if let Some((w, h, smode, sfilter)) = self.panel_fit {
+            child = child.with_panel_fit(w, h, smode, sfilter);
+        }
+        if let Some(slave) = self.bigjoiner_slave {
+            child = child.with_bigjoiner(slave);
+        }
+        let result = child.modeset_checked(primary_fb, mode);
         if !checked.display_access_ok() {
             return Err(result
                 .err()
@@ -644,6 +684,19 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         mode: &Mode,
     ) -> Result<Mode, ModesetError> {
         let mode = *mode;
+        let scaler_plan = if let Some((src_w, src_h, smode, sfilter)) = self.panel_fit {
+            crate::intel_gpu_xelpg_scaler::plan(
+                &mode,
+                u32::from(src_w),
+                u32::from(src_h),
+                smode,
+                sfilter,
+            )
+            .map_err(|_| ModesetError::DisplayResourceUnavailable)?
+            .map(|scaler| (src_w, src_h, scaler))
+        } else {
+            None
+        };
 
         // Step 2: power wells — PW_1 (transcoder A / DDI A-B),
         // PW_A (pipe A), and this port's Xe-LPDP AUX power request
@@ -826,7 +879,13 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             crate::intel_gpu_xe3lpd::program_vrr_timings(self.mmio, &mode)
                 .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
         }
-        self.program_pipe(&mode);
+        if let Some((src_w, src_h, ref scaler)) = scaler_plan {
+            self.program_pipe_source(src_w, src_h);
+            self.program_scaler(scaler);
+        } else {
+            self.disable_scaler();
+            self.program_pipe(&mode);
+        }
         let program_msa = self.program_pipe_misc(pipe_bpp, matches!(plan, EdpPlan::Link { .. }))?;
 
         // Step 8: bind transcoder A to this port (DP-SST at the pipe bpp).
@@ -837,9 +896,16 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         } else {
             self.program_trans_ddi_func_ctl(lanes, pipe_bpp);
         }
+        if let Some(slave) = self.bigjoiner_slave {
+            self.program_bigjoiner(crate::intel_gpu_pipes::Pipe::A, slave, true);
+        }
 
         // Step 9: program the primary plane.
-        self.program_plane(primary_fb, &mode);
+        if let Some((src_w, src_h, _)) = scaler_plan {
+            self.program_plane_sized(primary_fb, src_w, src_h);
+        } else {
+            self.program_plane(primary_fb, &mode);
+        }
 
         // Step 10: link-retrain preamble — D2D link up, port
         // buffer width, initial (zero) signal levels.
@@ -978,7 +1044,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             self.program_trans_ddi_func_ctl(trained_lanes, pipe_bpp);
         }
         self.enable_transcoder()?;
-        self.observe_plane(primary_fb, &mode, trained_lanes, pipe_bpp, frame)?;
+        let (plane_w, plane_h) = scaler_plan
+            .as_ref()
+            .map_or((mode.h_active, mode.v_active), |(w, h, _)| (*w, *h));
+        self.observe_plane(primary_fb, plane_w, plane_h, trained_lanes, pipe_bpp, frame)?;
         let panel_active = owned.is_some() || cold.is_some_and(|off| off.mode == Some(mode));
         if xe2 && panel_active {
             // intel_program_dpkgc_latency after commit_modeset_enables:
@@ -1032,8 +1101,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// enabled and selects this port (the lit eDP readout).
     fn lit_pipe_bpp(&self) -> Option<u32> {
         use crate::intel_gpu_pipes::{
-            Transcoder, TRANS_DDI_FUNC_CTL_DDI_SHIFT, TRANS_DDI_FUNC_CTL_ENABLE,
-            TRANS_DDI_FUNC_CTL_OFFSET,
+            TRANS_DDI_FUNC_CTL_DDI_SHIFT, TRANS_DDI_FUNC_CTL_ENABLE, TRANS_DDI_FUNC_CTL_OFFSET,
+            Transcoder,
         };
         let func = self
             .mmio
@@ -1057,7 +1126,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// One training attempt at exactly `select` x `lanes` (no fallback
     /// ladder), with this port's AUX: the converged levels.
     fn train_select(&mut self, select: RateSelect, lanes: u8) -> Result<LaneLevels, ModesetError> {
-        use crate::dp_link_training::{train_link_select, LinkError};
+        use crate::dp_link_training::{LinkError, train_link_select};
         let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
         match train_link_select(&mut aux, select, lanes, |_us| core::hint::spin_loop()) {
             Ok(trained) => {
@@ -1095,7 +1164,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         pll_khz: &mut u32,
         pll_lanes: &mut u8,
     ) -> Result<(u32, u8, LaneLevels), ModesetError> {
-        use crate::intel_gpu_xelpg_dsc::{installed_edp_vbt, EdpFallback, Fallback};
+        use crate::intel_gpu_xelpg_dsc::{EdpFallback, Fallback, installed_edp_vbt};
         let common = caps.limits(installed_edp_vbt().max_link_rate());
         let mut use_max_params = false;
         let mut cap = None;
@@ -1125,7 +1194,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 } => cap = Some((max_rate, max_lanes)),
                 Fallback::Same if !same_retried => same_retried = true,
                 Fallback::Same | Fallback::Exhausted => {
-                    return Err(ModesetError::LinkTrainingExhausted)
+                    return Err(ModesetError::LinkTrainingExhausted);
                 }
             }
             let EdpPlan::Link {
@@ -1172,7 +1241,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// be written after training.
     fn program_pipe_misc(&mut self, pipe_bpp: u32, always: bool) -> Result<bool, ModesetError> {
         use crate::intel_gpu_pipes::Pipe as PipeIdx;
-        use crate::intel_gpu_xelpg_dsc::{pipe_misc, PIPE_MISC_OFFSET};
+        use crate::intel_gpu_xelpg_dsc::{PIPE_MISC_OFFSET, pipe_misc};
         let off = PipeIdx::A.base() + PIPE_MISC_OFFSET;
         if !always {
             let v = self.mmio.read32(off);
@@ -1191,7 +1260,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// `intel_ddi_set_dp_msa` for transcoder A at `pipe_bpp`.
     fn program_msa(&mut self, pipe_bpp: u32) {
         use crate::intel_gpu_pipes::Transcoder;
-        use crate::intel_gpu_xelpg_dsc::{msa_misc, TRANS_MSA_MISC_OFFSET};
+        use crate::intel_gpu_xelpg_dsc::{TRANS_MSA_MISC_OFFSET, msa_misc};
         self.mmio.write32(
             Transcoder::A.base() + TRANS_MSA_MISC_OFFSET,
             msa_misc(pipe_bpp),
@@ -1202,7 +1271,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// `intel_dp_set_power(D0)` then `intel_dp_sink_enable_decompression`.
     fn sink_enable_decompression(&mut self) -> Result<(), ModesetError> {
         use crate::dp_aux::AuxChannel as _;
-        use crate::intel_gpu_xelpg_dsc::{set_sink_decompression, DP_SET_POWER, DP_SET_POWER_D0};
+        use crate::intel_gpu_xelpg_dsc::{DP_SET_POWER, DP_SET_POWER_D0, set_sink_decompression};
         let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
         aux.dpcd_write(DP_SET_POWER, &[DP_SET_POWER_D0])
             .map_err(ModesetError::AuxFailure)?;
@@ -1320,7 +1389,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// any write; without a record the existing enabled-DDI path runs.
     fn cold_panel(&self) -> Result<Option<PanelOff>, ModesetError> {
         use crate::intel_gpu_pipes::{
-            Pipe as PipeIdx, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
+            PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE, Pipe as PipeIdx,
         };
         let Some(off) = *PANEL_OFF.lock() else {
             return Ok(None);
@@ -1359,7 +1428,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// port and mode but without `TRANS_DDI_FUNC_ENABLE`.
     fn configure_trans_ddi_func(&mut self, lanes: u8, pipe_bpp: u32) {
         use crate::intel_gpu_pipes::{
-            Transcoder, TRANS_DDI_FUNC_CTL_ENABLE, TRANS_DDI_FUNC_CTL_OFFSET,
+            TRANS_DDI_FUNC_CTL_ENABLE, TRANS_DDI_FUNC_CTL_OFFSET, Transcoder,
         };
         let val = dp_sst_func_ctl(self.port, lanes, pipe_bpp) & !TRANS_DDI_FUNC_CTL_ENABLE;
         self.mmio
@@ -1373,8 +1442,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// register (`PLANE_SURF`, `CURBASE`).
     pub fn disable_planes(&mut self) -> Result<(), ModesetError> {
         use crate::intel_gpu_pipes::{
-            Pipe as PipeIdx, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET,
-            PLANE_SURF_OFFSET,
+            PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
+            Pipe as PipeIdx,
         };
         let _power =
             crate::intel_gpu_dc_states::acquire(crate::intel_gpu_dc_states::DcUser::Modeset)
@@ -1400,6 +1469,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             || self.mmio.read32(CUR_CTL_A) & CUR_MODE_MASK != 0
         {
             return Err(ModesetError::PipelineStopUnavailable);
+        }
+        self.disable_scaler();
+        if let Some(slave) = self.bigjoiner_slave {
+            self.program_bigjoiner(PipeIdx::A, slave, false);
         }
         Ok(())
     }
@@ -1441,9 +1514,16 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             raw: self.mmio,
             failed: Cell::new(false),
         };
-        let result = XeLpgModeset::new(&checked, self.port)
+        let mut child = XeLpgModeset::new(&checked, self.port)
             .with_pipe_dmc(self.pipe_dmc)
-            .panel_off_checked(ddi_reg);
+            .with_display_ip(self.ip);
+        if let Some((w, h, smode, sfilter)) = self.panel_fit {
+            child = child.with_panel_fit(w, h, smode, sfilter);
+        }
+        if let Some(slave) = self.bigjoiner_slave {
+            child = child.with_bigjoiner(slave);
+        }
+        let result = child.panel_off_checked(ddi_reg);
         if !checked.display_access_ok() {
             return Err(result
                 .err()
@@ -1455,9 +1535,9 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     fn panel_off_checked(&mut self, ddi_reg: u64) -> Result<PanelOff, ModesetError> {
         use crate::dp_aux::AuxChannel as _;
         use crate::intel_gpu_pipes::{
-            Pipe as PipeIdx, Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
-            PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, TRANS_DDI_FUNC_CTL_DDI_SHIFT,
-            TRANS_DDI_FUNC_CTL_ENABLE, TRANS_DDI_FUNC_CTL_OFFSET,
+            PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET,
+            PLANE_PRIMARY_OFFSET, Pipe as PipeIdx, TRANS_DDI_FUNC_CTL_DDI_SHIFT,
+            TRANS_DDI_FUNC_CTL_ENABLE, TRANS_DDI_FUNC_CTL_OFFSET, Transcoder,
         };
         let stop = ModesetError::PipelineStopUnavailable;
         let conf_reg = PipeIdx::A.base() + PIPECONF_OFFSET;
@@ -1516,6 +1596,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             func & !(TRANS_DDI_FUNC_CTL_ENABLE | TRANS_DDI_PORT_AND_MODE),
         );
         compiler_fence(Ordering::SeqCst);
+        self.disable_scaler();
+        if let Some(slave) = self.bigjoiner_slave {
+            self.program_bigjoiner(PipeIdx::A, slave, false);
+        }
         crate::intel_gpu_xelpg_dsc::disable_engines(self.mmio, PipeIdx::A).map_err(|_| stop)?;
         // intel_ddi_post_disable_dp: intel_dp_set_infoframes(false) clears
         // the PPS SDP; intel_dp_set_power(D3) for a DPCD 1.1+ sink.
@@ -1590,8 +1674,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// re-enable, producer exclusion and DMA retirement remain follow-on work.
     fn disable_pipeline(&mut self) -> Result<(), ModesetError> {
         use crate::intel_gpu_pipes::{
-            Pipe as PipeIdx, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE, PLANE_CTL_ENABLE,
-            PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
+            PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET,
+            PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET, Pipe as PipeIdx,
         };
         let plane_base = PipeIdx::A.base() + PLANE_PRIMARY_OFFSET;
         let ctl = self.mmio.read32(plane_base + PLANE_CTL_OFFSET);
@@ -1642,6 +1726,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             crate::intel_gpu_pipes::Transcoder::A,
         )
         .map_err(|_| ModesetError::PipelineStopUnavailable)?;
+        self.disable_scaler();
+        if let Some(slave) = self.bigjoiner_slave {
+            self.program_bigjoiner(PipeIdx::A, slave, false);
+        }
         disable_port_pll(self.mmio, self.port).map_err(map_cx0_err)?;
         // The old helper polls ACK0 only. A refused write must not leave a
         // lane1 request/ACK unnoticed. Keep its existing conservative 3.2ms
@@ -1666,8 +1754,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
 
     pub(crate) fn program_transcoder(&mut self, mode: &Mode) {
         use crate::intel_gpu_pipes::{
-            build_transcoder, Transcoder, TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET,
-            TRANS_HTOTAL_OFFSET, TRANS_VBLANK_OFFSET, TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET,
+            TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET, TRANS_HTOTAL_OFFSET, TRANS_VBLANK_OFFSET,
+            TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET, Transcoder, build_transcoder,
         };
         let timing = mode_to_display_timing(mode);
         let prog = match build_transcoder(&timing) {
@@ -1706,7 +1794,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 
     pub(crate) fn program_pipe(&mut self, mode: &Mode) {
-        use crate::intel_gpu_pipes::{build_pipe, Pipe as PipeIdx, PIPE_SRCSZ_OFFSET};
+        use crate::intel_gpu_pipes::{PIPE_SRCSZ_OFFSET, Pipe as PipeIdx, build_pipe};
         let timing = mode_to_display_timing(mode);
         let prog = match build_pipe(&timing) {
             Ok(p) => p,
@@ -1718,9 +1806,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 
     /// Program custom pipe source dimensions (e.g. for panel fitting) into `PIPE_SRCSZ`.
-    #[allow(dead_code)]
     pub(crate) fn program_pipe_source(&mut self, src_w: u16, src_h: u16) {
-        use crate::intel_gpu_pipes::{Pipe as PipeIdx, PIPE_SRCSZ_OFFSET};
+        use crate::intel_gpu_pipes::{PIPE_SRCSZ_OFFSET, Pipe as PipeIdx};
         let srcsz = (((src_w.saturating_sub(1)) as u32) << 16) | ((src_h.saturating_sub(1)) as u32);
         self.mmio
             .write32(PipeIdx::A.trans_base() + PIPE_SRCSZ_OFFSET, srcsz);
@@ -1728,7 +1815,6 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 
     /// Program panel-fitting scaler registers for Pipe A.
-    #[allow(dead_code)]
     pub(crate) fn program_scaler(&mut self, scaler: &crate::intel_gpu_xelpg_scaler::PipeScaler) {
         use crate::intel_gpu_pipes::Pipe as PipeIdx;
         for (reg, val) in scaler.enable_writes(PipeIdx::A) {
@@ -1738,7 +1824,6 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 
     /// Disable and detach scalers on Pipe A.
-    #[allow(dead_code)]
     pub(crate) fn disable_scaler(&mut self) {
         use crate::intel_gpu_pipes::Pipe as PipeIdx;
         for (reg, val) in crate::intel_gpu_xelpg_scaler::disable_writes(PipeIdx::A) {
@@ -1748,14 +1833,13 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 
     /// Program DSS_CTL joiner registers when joining master and slave pipes.
-    #[allow(dead_code)]
     pub(crate) fn program_bigjoiner(
         &mut self,
         master: crate::intel_gpu_pipes::Pipe,
         slave: crate::intel_gpu_pipes::Pipe,
         enable: bool,
     ) {
-        use crate::intel_gpu_xelpg_dsc::{dss_ctl1, JOINER_ENABLE};
+        use crate::intel_gpu_xelpg_dsc::{JOINER_ENABLE, dss_ctl1};
         const SECONDARY_BIG_JOINER_ENABLE: u32 = 1 << 29;
         if enable {
             self.mmio.write32(dss_ctl1(master), JOINER_ENABLE);
@@ -1771,7 +1855,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// `TRANS_DDI_FUNC_CTL` for DP SST on this port at `lanes`, with the
     /// pipe's BPC field (`TRANS_DDI_BPC_8` is 0).
     fn program_trans_ddi_func_ctl(&mut self, lanes: u8, pipe_bpp: u32) {
-        use crate::intel_gpu_pipes::{Transcoder, TRANS_DDI_FUNC_CTL_OFFSET};
+        use crate::intel_gpu_pipes::{TRANS_DDI_FUNC_CTL_OFFSET, Transcoder};
         let val = dp_sst_func_ctl(self.port, lanes, pipe_bpp);
         self.mmio
             .write32(Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
@@ -1782,8 +1866,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     /// link symbol clock of `link_khz`.
     pub(crate) fn program_mn_khz(&mut self, mode: &Mode, link_khz: u32, lanes: u8) {
         use crate::intel_gpu_pipes::{
-            dp_mn, Transcoder, PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET,
-            PIPE_LINK_N1_OFFSET,
+            PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET, PIPE_LINK_N1_OFFSET,
+            Transcoder, dp_mn,
         };
         let (dm, dn, lm, ln) = dp_mn(mode.pixel_clock_khz, link_khz, lanes as u32, 3);
         let base = Transcoder::A.base();
@@ -1795,22 +1879,16 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
-    pub(crate) fn program_plane(&mut self, fb: &Framebuffer, mode: &Mode) {
+    pub(crate) fn program_plane_sized(&mut self, fb: &Framebuffer, w: u16, h: u16) {
         use crate::intel_gpu_pipes::{
-            build_primary_plane, Pipe as PipeIdx, PixelFormat as PipeFmt, PLANE_CTL_OFFSET,
-            PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET, PLANE_STRIDE_OFFSET,
-            PLANE_SURF_OFFSET,
+            PLANE_CTL_OFFSET, PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET,
+            PLANE_STRIDE_OFFSET, PLANE_SURF_OFFSET, Pipe as PipeIdx, PixelFormat as PipeFmt,
+            build_primary_plane,
         };
         let pipe_fmt = match fb.format {
             PixelFormat::Xrgb8888 => PipeFmt::Argb8888,
         };
-        let prog = match build_primary_plane(
-            mode.h_active,
-            mode.v_active,
-            fb.stride_bytes,
-            fb.phys_addr as u32,
-            pipe_fmt,
-        ) {
+        let prog = match build_primary_plane(w, h, fb.stride_bytes, fb.phys_addr as u32, pipe_fmt) {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -1823,6 +1901,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         self.mmio.write32(base + PLANE_CTL_OFFSET, prog.plane_ctl);
         self.mmio.write32(base + PLANE_SURF_OFFSET, prog.plane_surf);
         compiler_fence(Ordering::SeqCst);
+    }
+
+    pub(crate) fn program_plane(&mut self, fb: &Framebuffer, mode: &Mode) {
+        self.program_plane_sized(fb, mode.h_active, mode.v_active);
     }
 
     // ── DP transport + training ──────────────────────────────
@@ -1856,7 +1938,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         rate: crate::dp_link_training::LinkRate,
         lanes: u8,
     ) -> Result<(LinkRate, u8, LaneLevels), ModesetError> {
-        use crate::dp_link_training::{train_link, LinkError, LinkRate as TrainRate};
+        use crate::dp_link_training::{LinkError, LinkRate as TrainRate, train_link};
         let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
         match train_link(&mut aux, rate, lanes, |_us| core::hint::spin_loop()) {
             Ok(trained) => {
@@ -1883,7 +1965,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
 
     fn enable_transcoder(&mut self) -> Result<(), ModesetError> {
         use crate::intel_gpu_pipes::{
-            Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
+            PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE, Transcoder,
         };
         let off = Transcoder::A.conf_base() + PIPECONF_OFFSET;
         let cur = self.mmio.read32(off);
@@ -1908,15 +1990,16 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     fn observe_plane(
         &self,
         fb: &Framebuffer,
-        mode: &Mode,
+        w: u16,
+        h: u16,
         lanes: u8,
         pipe_bpp: u32,
         start: u32,
     ) -> Result<(), ModesetError> {
-        use crate::intel_gpu_pipes::{build_primary_plane, PixelFormat as PipeFmt};
+        use crate::intel_gpu_pipes::{PixelFormat as PipeFmt, build_primary_plane};
         let plane = build_primary_plane(
-            mode.h_active,
-            mode.v_active,
+            w,
+            h,
             fb.stride_bytes,
             fb.phys_addr as u32,
             PipeFmt::Argb8888,
@@ -2032,7 +2115,7 @@ fn rate_select(link_rate: u32, select: Option<u8>) -> Result<RateSelect, Modeset
 
 /// `TRANS_DDI_FUNC_CTL` for DP SST on `port` at `lanes` and `pipe_bpp`.
 fn dp_sst_func_ctl(port: XeLpgPort, lanes: u8, pipe_bpp: u32) -> u32 {
-    use crate::intel_gpu_pipes::{build_trans_ddi_func_ctl, TRANS_DDI_MODE_DP_SST};
+    use crate::intel_gpu_pipes::{TRANS_DDI_MODE_DP_SST, build_trans_ddi_func_ctl};
     build_trans_ddi_func_ctl(port.func_ctl_index(), TRANS_DDI_MODE_DP_SST, lanes)
         | crate::intel_gpu_xelpg_dsc::trans_ddi_bpc(pipe_bpp)
 }
@@ -2084,7 +2167,7 @@ fn decide_plan_capped(
     cap: Option<(u32, u8)>,
 ) -> Result<EdpPlan, ModesetError> {
     use crate::intel_gpu_xelpg_dsc::{
-        decide_edp_capped, installed_edp_vbt, LinkDecision, PIPE_BPP,
+        LinkDecision, PIPE_BPP, decide_edp_capped, installed_edp_vbt,
     };
     let decision = decide_edp_capped(
         caps,
@@ -2210,7 +2293,7 @@ pub mod tests {
     use crate::intel_gpu_xelpg::tests::{Fail, FakePhy};
     use alloc::vec::Vec;
     use core::cell::{Cell, RefCell};
-    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_kernel_test::{TestResult, kernel_test_in};
 
     extern crate alloc;
 
@@ -2717,7 +2800,7 @@ pub mod tests {
     }
 
     fn oled_plan() -> crate::intel_gpu_xelpg_dsc::DscPlan {
-        use crate::intel_gpu_xelpg_dsc::{decide_edp, DscDpcd, EdpCaps, EdpVbt, LinkDecision};
+        use crate::intel_gpu_xelpg_dsc::{DscDpcd, EdpCaps, EdpVbt, LinkDecision, decide_edp};
         let mut receiver = [0u8; 16];
         receiver[..3].copy_from_slice(&[0x14, 0x14, 0x82]);
         let caps = EdpCaps {
@@ -2734,7 +2817,7 @@ pub mod tests {
 
     fn smoke_mtl_edp_dsc_modeset_programs_vdsc_pps_and_sink() -> TestResult {
         use crate::intel_gpu_pipes::Pipe as PipeIdx;
-        use crate::intel_gpu_xelpg_dsc::{install_edp_vbt, installed_edp_vbt, EdpVbt};
+        use crate::intel_gpu_xelpg_dsc::{EdpVbt, install_edp_vbt, installed_edp_vbt};
         let previous = installed_edp_vbt();
         install_edp_vbt(EdpVbt::Missing);
         let fake = MtlFake::new(XeLpgPort::A);
@@ -2818,7 +2901,7 @@ pub mod tests {
     );
 
     fn smoke_mtl_edp_dsc_refusals_precede_every_write() -> TestResult {
-        use crate::intel_gpu_xelpg_dsc::{install_edp_vbt, installed_edp_vbt, DscRefusal, EdpVbt};
+        use crate::intel_gpu_xelpg_dsc::{DscRefusal, EdpVbt, install_edp_vbt, installed_edp_vbt};
         let previous = installed_edp_vbt();
         let mode = oled_mode();
         let run = |rate: u8, lanes: u8, vbt: EdpVbt| {
@@ -2914,7 +2997,7 @@ pub mod tests {
     }
 
     fn smoke_mtl_edp_six_bpc_programs_pipe_misc_ddi_msa_and_mn() -> TestResult {
-        use crate::intel_gpu_xelpg_dsc::{link_m_n, EdpVbt};
+        use crate::intel_gpu_xelpg_dsc::{EdpVbt, link_m_n};
         // An eDP 1.4 panel without a rate table on one RBR lane: 1024x768@60
         // needs 195000 kBps at 24 bpp and 146250 at 18; the lane carries
         // 162000. Linux drives 6 bpc (intel_dp_compute_link_config_wide).
@@ -2978,7 +3061,7 @@ pub mod tests {
     );
 
     fn smoke_mtl_edp_rate_table_trains_with_link_rate_set() -> TestResult {
-        use crate::intel_gpu_xelpg_dsc::{link_m_n, EdpVbt};
+        use crate::intel_gpu_xelpg_dsc::{EdpVbt, link_m_n};
         // An eDP 1.4 panel with DP_MAX_LINK_RATE 0 and the table 1.62, 2.16,
         // 2.43, 2.7 Gbps on two lanes. A 140 MHz 1024x768 needs 420000 kBps
         // at 24 bpp: 2.16 Gbps x2 (432000), the table's index 1.
@@ -3026,7 +3109,7 @@ pub mod tests {
     );
 
     fn smoke_mtl_edp_planned_link_retries_at_max_params() -> TestResult {
-        use crate::intel_gpu_xelpg_dsc::{link_m_n, EdpVbt};
+        use crate::intel_gpu_xelpg_dsc::{EdpVbt, link_m_n};
         // An EDID 6 bpc panel (eDP 1.4, HBR2 x4): Linux's first link is
         // 18 bpp on RBR x1. The sink refuses clock recovery at RBR, so the
         // retry takes use_max_params: 18 bpp on HBR2 x4.
@@ -3197,7 +3280,7 @@ pub mod tests {
     );
 
     fn smoke_mtl_edp_vbt_bpp_clamp_and_lit_pipe_fixup() -> TestResult {
-        use crate::intel_gpu_xelpg_dsc::{install_edp_vbt, installed_edp_vbt, EdpVbt};
+        use crate::intel_gpu_xelpg_dsc::{EdpVbt, install_edp_vbt, installed_edp_vbt};
         let vbt18 = EdpVbt::Panel {
             dsc_disable: false,
             max_link_rate: 0,
@@ -3333,8 +3416,8 @@ pub mod tests {
         // recipe); the MTL run completes. Write logs must be
         // disjoint on the generation-defining registers.
         use crate::intel_gpu_ddi::Ddi;
-        use crate::intel_gpu_modeset::tests::FakeMmio as Gen12Fake;
         use crate::intel_gpu_modeset::Modeset;
+        use crate::intel_gpu_modeset::tests::FakeMmio as Gen12Fake;
         let mut g12 = Gen12Fake::new();
         g12.set_read(0x4_5404, 0x1 | 0x4);
         g12.state_offset = 0x4_6010;
@@ -3465,7 +3548,7 @@ pub mod tests {
     // Full native production modeset conversations establish the prerequisite
     // consumed by CTM capture. No firmware color defaults are supplied.
     use crate::intel_gpu::Generation;
-    use crate::intel_gpu_color::{initialize_rgb_bypass, Owner, GAMMA, MODE};
+    use crate::intel_gpu_color::{GAMMA, MODE, Owner, initialize_rgb_bypass};
     use narf_filesystem::FsError;
 
     const CONTROLS: [(u64, u32); 5] = [
@@ -3874,5 +3957,124 @@ pub mod tests {
         "drivers/gpu/intel_gpu_modeset_xelpg",
         smoke_mtl_color_readback_failure_aborts_owned_modeset_before_reenable
     );
+
+    fn smoke_mtl_modeset_panel_fitting_scaler_and_pipe_source() -> TestResult {
+        use crate::intel_gpu_xelpg_scaler::{Filter, PS_SCALER_EN, ScalingMode};
+
+        let fake = MtlFake::new(XeLpgPort::A);
+        // Native panel mode: 2880x1800 OLED
+        let mode = oled_mode();
+        oled_panel(&fake, 0x14, 2);
+
+        // Framebuffer: 1920x1200 (aspect 16:10 matches panel 2880:1800)
+        let fb = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 1920 * 4,
+            format: PixelFormat::Xrgb8888,
+        };
+
+        let mut ms = XeLpgModeset::new(&fake, XeLpgPort::A).with_panel_fit(
+            1920,
+            1200,
+            ScalingMode::Aspect,
+            Filter::Default,
+        );
+        let res = ms.modeset_fixed(&fb, &mode);
+        if res != Ok(mode) {
+            return TestResult::Fail("panel-fitting modeset must succeed");
+        }
+
+        // 1. PIPE_SRCSZ (0x6001c) must have source size (1919 << 16) | 1199
+        let srcsz = fake.writes_to(0x6001c);
+        if srcsz.last() != Some(&((1919 << 16) | 1199)) {
+            return TestResult::Fail("PIPE_SRCSZ must receive custom source size (1919, 1199)");
+        }
+
+        // 2. SKL_PS_CTRL (0x68180) must have PS_SCALER_EN set
+        let ps_ctrl = fake.writes_to(0x68180);
+        if !ps_ctrl.iter().any(|&v| v & PS_SCALER_EN != 0) {
+            return TestResult::Fail("SKL_PS_CTRL must have PS_SCALER_EN enabled");
+        }
+
+        // 3. SKL_PS_WIN_POS (0x68170) must be (0, 0)
+        let ps_win_pos = fake.writes_to(0x68170);
+        if ps_win_pos.last() != Some(&0) {
+            return TestResult::Fail("SKL_PS_WIN_POS must be (0, 0) for 16:10 aspect match");
+        }
+
+        // 4. SKL_PS_WIN_SZ (0x68174) must be (2880 << 16) | 1800
+        let ps_win_sz = fake.writes_to(0x68174);
+        if ps_win_sz.last() != Some(&((2880 << 16) | 1800)) {
+            return TestResult::Fail("SKL_PS_WIN_SZ must match panel window dimensions");
+        }
+
+        // 5. PLANE_SIZE_1_A (0x70190) must receive (1919 << 16) | 1199
+        let plane_size = fake.writes_to(0x70190);
+        if plane_size.last() != Some(&((1919 << 16) | 1199)) {
+            return TestResult::Fail("PLANE_SIZE_1_A must receive source dimensions");
+        }
+
+        // 6. Disable/panel_off disables scaler registers
+        if ms.disable_planes().is_err() || ms.panel_off().is_err() {
+            return TestResult::Fail("panel_off must succeed");
+        }
+        if fake.writes_to(0x68180).last() != Some(&0) {
+            return TestResult::Fail("SKL_PS_CTRL must be cleared on disable");
+        }
+        if fake.writes_to(0x68170).last() != Some(&0) {
+            return TestResult::Fail("SKL_PS_WIN_POS must be cleared on disable");
+        }
+        if fake.writes_to(0x68174).last() != Some(&0) {
+            return TestResult::Fail("SKL_PS_WIN_SZ must be cleared on disable");
+        }
+
+        forget_panel_off();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_modeset_panel_fitting_scaler_and_pipe_source
+    );
+
+    fn smoke_mtl_modeset_bigjoiner_join_and_disable() -> TestResult {
+        use crate::intel_gpu_pipes::Pipe as PipeIdx;
+        use crate::intel_gpu_xelpg_dsc::{JOINER_ENABLE, dss_ctl1};
+        const SECONDARY_BIG_JOINER_ENABLE: u32 = 1 << 29;
+
+        let fake = MtlFake::new(XeLpgPort::A);
+        let mode = Mode::VESA_1024X768_60;
+        let mut ms = XeLpgModeset::new(&fake, XeLpgPort::A).with_bigjoiner(PipeIdx::B);
+        let res = ms.modeset_fixed(&test_fb(), &mode);
+        if res != Ok(mode) {
+            return TestResult::Fail("modeset_fixed with bigjoiner must succeed");
+        }
+        let master_dss = dss_ctl1(PipeIdx::A);
+        let slave_dss = dss_ctl1(PipeIdx::B);
+        if !fake.writes_to(master_dss).contains(&JOINER_ENABLE) {
+            return TestResult::Fail("master pipe DSS_CTL1 must have JOINER_ENABLE");
+        }
+        if !fake
+            .writes_to(slave_dss)
+            .contains(&SECONDARY_BIG_JOINER_ENABLE)
+        {
+            return TestResult::Fail("slave pipe DSS_CTL1 must have SECONDARY_BIG_JOINER_ENABLE");
+        }
+        if ms.disable_planes().is_err() || ms.panel_off().is_err() {
+            return TestResult::Fail("panel_off with bigjoiner must succeed");
+        }
+        if fake.writes_to(master_dss).last() != Some(&0) {
+            return TestResult::Fail("master pipe DSS_CTL1 must be cleared on panel off");
+        }
+        if fake.writes_to(slave_dss).last() != Some(&0) {
+            return TestResult::Fail("slave pipe DSS_CTL1 must be cleared on panel off");
+        }
+        forget_panel_off();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_modeset_bigjoiner_join_and_disable
+    );
+
     include!("intel_gpu_modeset_xelpg_failclosed_tests.rs");
 }

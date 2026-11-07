@@ -25,7 +25,7 @@
 //! queries return empty strings or "unavailable\n", matching Linux behavior.
 
 use alloc::{format, string::String, sync::Arc};
-use narf_filesystem::sysfs::{get_or_create_child, kobject_add_attr, Kobject};
+use narf_filesystem::sysfs::{Kobject, get_or_create_child, kobject_add_attr};
 
 use crate::intel_gpu_user::UserBackend;
 
@@ -41,6 +41,8 @@ pub struct MainGtTelemetry {
     pub rpe_freq_mhz: u32,
     pub rpn_freq_mhz: u32,
     pub is_running: bool,
+    pub power_profile: &'static str,
+    pub idle_status: &'static str,
 }
 
 impl MainGtTelemetry {
@@ -52,11 +54,21 @@ impl MainGtTelemetry {
         }
         let slpc = backend.main_gt_slpc_status();
         let rc6_ms = backend.main_gt_rc6_residency_ms().unwrap_or(0);
+        let hw_act = backend.main_gt_act_freq_mhz();
+        let idle_status = if hw_act == Some(0) && rc6_ms > 0 {
+            "gt-c6"
+        } else {
+            "gt-c0"
+        };
 
         if let Some(status) = slpc {
+            let power_profile = match status.profile {
+                crate::intel_gpu_slpc::PowerProfile::Base => "base",
+                crate::intel_gpu_slpc::PowerProfile::PowerSaving => "power_saving",
+            };
             Some(Self {
                 cur_freq_mhz: status.range.min_mhz,
-                act_freq_mhz: status.range.min_mhz,
+                act_freq_mhz: hw_act.filter(|&f| f > 0).unwrap_or(status.range.min_mhz),
                 rc6_residency_ms: rc6_ms,
                 min_freq_mhz: status.range.min_mhz,
                 max_freq_mhz: status.range.max_mhz,
@@ -64,6 +76,8 @@ impl MainGtTelemetry {
                 rpe_freq_mhz: status.limits.rpe_mhz,
                 rpn_freq_mhz: status.limits.rpn_mhz,
                 is_running: true,
+                power_profile,
+                idle_status,
             })
         } else {
             // Main GT is active but SLPC not active or using fixed clock
@@ -72,7 +86,7 @@ impl MainGtTelemetry {
                 .map_or(100, |f| (f.reference_clock / 1_000_000).max(100));
             Some(Self {
                 cur_freq_mhz: ref_mhz,
-                act_freq_mhz: ref_mhz,
+                act_freq_mhz: hw_act.filter(|&f| f > 0).unwrap_or(ref_mhz),
                 rc6_residency_ms: rc6_ms,
                 min_freq_mhz: 100,
                 max_freq_mhz: 1300,
@@ -80,6 +94,8 @@ impl MainGtTelemetry {
                 rpe_freq_mhz: 600,
                 rpn_freq_mhz: 100,
                 is_running: false,
+                power_profile: "base",
+                idle_status,
             })
         }
     }
@@ -188,10 +204,18 @@ pub(crate) fn populate_card(
         kobject_add_attr(&freq0, "rpn_freq", move || {
             r().map_or_else(String::new, |t| format!("{}\n", t.rpn_freq_mhz))
         });
+        let r = resolve;
+        kobject_add_attr(&freq0, "power_profile", move || {
+            r().map_or_else(String::new, |t| format!("{}\n", t.power_profile))
+        });
 
         let r = resolve;
         kobject_add_attr(&gtidle, "idle_residency_ms", move || {
             r().map_or_else(String::new, |t| format!("{}\n", t.rc6_residency_ms))
+        });
+        let r = resolve;
+        kobject_add_attr(&gtidle, "idle_status", move || {
+            r().map_or_else(String::new, |t| format!("{}\n", t.idle_status))
         });
         kobject_add_attr(&gtidle, "name", move || "gt0-rc6\n".into());
     }

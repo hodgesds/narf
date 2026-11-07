@@ -584,19 +584,37 @@ impl Prefill {
         wm0_lines: u16,
         dsc: bool,
     ) -> Result<Self, WmError> {
+        Self::new_ip_scaler(ip, timing, wm0_lines, dsc, false)
+    }
+
+    /// [`Prefill::new_ip`] with crtc scaler prefill lines factored in.
+    fn new_ip_scaler(
+        ip: crate::intel_gpu_xe2lpd::DisplayIp,
+        timing: Timing,
+        wm0_lines: u16,
+        dsc: bool,
+        scaler: bool,
+    ) -> Result<Self, WmError> {
         if timing.vtotal <= timing.vblank_start || timing.htotal == 0 {
             return Err(WmError::Unsupported);
         }
         // prefill_init: framestart_delay 1 + 20 us of translation walks.
         let fixed = (1u64 << 16) + usecs_to_lines(timing, 20);
-        // prefill_lines_nocdclk without scalers: DSC (1.5 lines when
-        // compressing), then the worst wm0 lines.
+        // prefill_lines_nocdclk: DSC (1.5 lines when compressing),
+        // scaler (4.0 lines on display 14 when crtc scaler is enabled),
+        // then the worst wm0 lines.
         let dsc = if dsc {
             crate::intel_gpu_xelpg_dsc::PREFILL_LINES
         } else {
             0
         };
-        let wm0 = dsc + (u64::from(wm0_lines) << 16);
+        let scaler = if scaler {
+            let (first, _) = crate::intel_gpu_xelpg_scaler::prefill_lines(1, true);
+            first
+        } else {
+            0
+        };
+        let wm0 = dsc + scaler + (u64::from(wm0_lines) << 16);
         // intel_cdclk_prefill_adjustment(_worst): calc_cdclk at the
         // pixel-rate minimum, ppc 2.
         let cdclk = crate::intel_gpu_xelpg_cdclk::calc_cdclk_ip(
@@ -703,16 +721,17 @@ pub(crate) fn check_vblank_dsc(
     )
 }
 
-/// [`check_vblank_dsc`] on `ip`.
-pub(crate) fn check_vblank_dsc_ip(
+/// [`check_vblank_dsc`] on `ip` with `scaler`.
+pub(crate) fn check_vblank_dsc_scaler_ip(
     ip: crate::intel_gpu_xe2lpd::DisplayIp,
     timing: Timing,
     latency: &Latency,
     planes: &mut [&mut PlaneWm],
     dsc: bool,
+    scaler: bool,
 ) -> Result<bool, WmError> {
     let wm0 = planes.iter().map(|p| p.levels[0].lines).max().unwrap_or(0);
-    let prefill = Prefill::new_ip(ip, timing, wm0, dsc)?;
+    let prefill = Prefill::new_ip_scaler(ip, timing, wm0, dsc, scaler)?;
     let max_level = prefill.max_level(latency)?;
     for plane in planes.iter_mut() {
         for level in plane.levels.iter_mut().skip(max_level + 1) {
@@ -726,6 +745,17 @@ pub(crate) fn check_vblank_dsc_ip(
         }
     }
     Ok(max_level < LEVELS - 1)
+}
+
+/// [`check_vblank_dsc`] on `ip`.
+pub(crate) fn check_vblank_dsc_ip(
+    ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    timing: Timing,
+    latency: &Latency,
+    planes: &mut [&mut PlaneWm],
+    dsc: bool,
+) -> Result<bool, WmError> {
+    check_vblank_dsc_scaler_ip(ip, timing, latency, planes, dsc, false)
 }
 
 // ── Wa_14015648006's Pipe-A input ─────────────────────────────────
