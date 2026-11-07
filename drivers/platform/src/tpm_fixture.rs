@@ -3094,6 +3094,12 @@ fn attest_hook_extends() -> bool {
 fn attest_hook_no_extends() -> bool {
     false
 }
+fn attest_hook_no_mismatch() -> bool {
+    false
+}
+fn attest_hook_mismatch() -> bool {
+    true
+}
 
 fn smoke_tpm_attestation_conversation() -> TestResult {
     use narf_tpm::attest::AttestError;
@@ -3205,6 +3211,7 @@ fn smoke_tpm_attestation_conversation() -> TestResult {
     narf_tpm::attest::install_measurement_hooks(narf_tpm::attest::MeasurementHooks {
         event_log: attest_hook_log,
         extends_observed: attest_hook_no_extends,
+        firmware_replay_mismatch: attest_hook_no_mismatch,
     });
     match narf_scheduler::block_on_spin(crate::tpm_attestation::attestation_quote(
         adapter.as_ref(),
@@ -3217,6 +3224,30 @@ fn smoke_tpm_attestation_conversation() -> TestResult {
     narf_tpm::attest::install_measurement_hooks(narf_tpm::attest::MeasurementHooks {
         event_log: attest_hook_log,
         extends_observed: attest_hook_extends,
+        firmware_replay_mismatch: attest_hook_no_mismatch,
+    });
+
+    // (3b) A proven firmware-replay mismatch refuses quotes over
+    // PCRs 0–7 (#1071), even with extends observed — the shadow
+    // the quote would attest contradicts the hardware. The
+    // selection above names PCR 4, so the refusal applies.
+    narf_tpm::attest::install_measurement_hooks(narf_tpm::attest::MeasurementHooks {
+        event_log: attest_hook_log,
+        extends_observed: attest_hook_extends,
+        firmware_replay_mismatch: attest_hook_mismatch,
+    });
+    match narf_scheduler::block_on_spin(crate::tpm_attestation::attestation_quote(
+        adapter.as_ref(),
+        nonce,
+        &selections,
+    )) {
+        Err(HighLevelTpmError::Denied) => {}
+        _ => return TestResult::Fail("quote not refused on firmware-replay mismatch"),
+    }
+    narf_tpm::attest::install_measurement_hooks(narf_tpm::attest::MeasurementHooks {
+        event_log: attest_hook_log,
+        extends_observed: attest_hook_extends,
+        firmware_replay_mismatch: attest_hook_no_mismatch,
     });
 
     // (4) Provisioning: creates exactly one object; re-entry is a
@@ -3508,6 +3539,7 @@ fn smoke_tpm_attestation_event_log_publication() -> TestResult {
     narf_tpm::attest::install_measurement_hooks(narf_tpm::attest::MeasurementHooks {
         event_log: attest_hook_log,
         extends_observed: attest_hook_extends,
+        firmware_replay_mismatch: attest_hook_no_mismatch,
     });
 
     let mut dev = FakeTpmDevice::crb();

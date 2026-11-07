@@ -128,6 +128,14 @@ pub struct Measurement {
     /// Human-readable label (kept owned so the log can carry per-path
     /// strings from firmware-measurement events).
     pub label: String,
+    /// The raw event bytes as logged by firmware, when this entry
+    /// came from a firmware event log (#1071). `None` for NARF's own
+    /// measurements, whose event bytes are the `label` (the encoder's
+    /// historical layout). `Some` — even when empty — for replayed
+    /// firmware events, whose event bytes are arbitrary binary and
+    /// must round-trip byte-for-byte so a verifier replaying the
+    /// published log reproduces the firmware prefix.
+    pub event_data: Option<Vec<u8>>,
 }
 
 /// Software shadow of the hardware event log. Each successful
@@ -211,20 +219,25 @@ pub fn any_extend_observed() -> bool {
 /// Install the measurement hooks the TPM attestation surface
 /// (`narf_tpm::attest`) consults: this module's TCG event-log
 /// encoder (served to userspace as the sysfs
-/// `binary_bios_measurements` node) and [`any_extend_observed`]
+/// `binary_bios_measurements` node), [`any_extend_observed`]
 /// (the flag the quote composition refuses on when no extend has
-/// been recorded this boot).
+/// been recorded this boot), and [`firmware_replay_mismatch`]
+/// (the flag the quote composition refuses on when the firmware
+/// replay disagrees with the hardware PCRs 0–7).
 ///
 /// Called once from the measured-boot initcall in `bare_main`,
-/// before that pass's own extends run. The hooks are plain
-/// function pointers to the two pure readers above — installing
-/// them changes no measurement semantics; it only publishes, to
-/// the crates that cannot name `frame` (the dependency runs the
-/// other way), state this module already maintains.
+/// after the firmware event-log ingest and before that pass's own
+/// extends run, so the first published log already carries the
+/// firmware prefix. The hooks are plain function pointers to the
+/// pure readers above — installing them changes no measurement
+/// semantics; it only publishes, to the crates that cannot name
+/// `frame` (the dependency runs the other way), state this module
+/// already maintains.
 pub fn install_attestation_hooks() {
     narf_tpm::attest::install_measurement_hooks(narf_tpm::attest::MeasurementHooks {
         event_log: tcg_event_log_encode,
         extends_observed: any_extend_observed,
+        firmware_replay_mismatch,
     });
 }
 
@@ -240,6 +253,395 @@ pub fn install_attestation_hooks() {
 /// not happen.
 pub fn hardware_dispatch_active() -> bool {
     !narf_tpm::registry::list().is_empty()
+}
+
+// ── Firmware TCG event-log ingest (#1071) ──────────────────────────
+//
+// The firmware's own measurements (SRTM, UEFI drivers, boot
+// attempts, Secure Boot policy — PCRs 0–7) happened before NARF
+// ran, so the shadow starts at zero while the hardware PCRs do
+// not. Ingesting the firmware TCG2 event log replays those events
+// into the shadow with the same extend formula, and records them
+// at the head of the published log, so the full chain — firmware
+// prefix + NARF events — is what a verifier replays. Without this,
+// quotes over the boot PCRs attest NARF's extends only.
+//
+// The handoff is the EFI configuration table
+// (`narf_boot::firmware::tcg2_log_tables`, multiboot2 tag 12's
+// system-table pointer); the wire decoding is pure
+// (`narf_efi::tcg2`), so both are tested against synthetic,
+// spec-built bytes. Ingest runs once, first, in the measured-boot
+// initcall — before `install_attestation_hooks` publishes the log
+// and before any NARF extend. The read-back cross-check
+// (`cross_check_pcrs_0_7`) arbitrates afterwards: it compares the
+// replayed shadow against the hardware PCRs 0–7 and refuses quotes
+// over them on a proven mismatch.
+//
+// Design invariants (security-model §4, §9 — the TCB is
+// `frame/`; this module is inside it):
+// - Ingest is two-phase: parse everything first, then apply. A
+//   malformed tail leaves no half-replayed shadow or log.
+// - `EV_NO_ACTION` records are recorded, never extended
+//   (PC Client Table 13: "MUST NOT extend any PCR").
+// - The replay never touches the hardware TPM: firmware already
+//   extended those digests; re-extending would double-extend.
+// - A mismatch is sticky and surfaces (quote refusal), never
+//   papered over by re-seeding the shadow from hardware.
+
+/// Whether the firmware event log has been ingested this boot.
+/// Exactly-once: a second ingest is refused, and ingest after any
+/// NARF extend is refused (the firmware prefix must be the head
+/// of the log, and the shadow must start from it).
+static FIRMWARE_INGESTED: AtomicBool = AtomicBool::new(false);
+
+/// The outcome of the firmware ingest, once it has run.
+static FIRMWARE_INGEST: IrqSafeSpinLock<Option<FirmwareIngest>> = IrqSafeSpinLock::new(None);
+
+/// Sticky: the last PCR 0–7 read-back cross-check proved the
+/// replayed shadow disagrees with hardware. Set only by
+/// [`cross_check_pcrs_0_7`] on a proven mismatch; never cleared
+/// except by [`__reset_for_test`]. The quote composition consults
+/// this through the attestation hooks and refuses quotes over
+/// PCRs 0–7 while it is set.
+static FIRMWARE_REPLAY_MISMATCH: AtomicBool = AtomicBool::new(false);
+
+/// The last PCR 0–7 cross-check outcome, if one ran.
+static LAST_CROSS_CHECK: IrqSafeSpinLock<Option<PcrCrossCheck>> = IrqSafeSpinLock::new(None);
+
+/// The outcome of a firmware event-log ingest.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FirmwareIngest {
+    /// Records replayed from the main log (Spec ID event included).
+    pub main_events: usize,
+    /// Records replayed from the final-events table (after the
+    /// preboot dedup skip — records already in the main log are
+    /// not counted twice).
+    pub final_events: usize,
+    /// True when a main log was present and parsed cleanly end to
+    /// end. The final-events table's absence does not clear this:
+    /// the read-back cross-check arbitrates whether the chain is
+    /// actually complete.
+    pub full_chain: bool,
+}
+
+/// Why a firmware event-log ingest failed. Every variant fails
+/// closed: a failed ingest replays nothing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FirmwareIngestError {
+    /// Ingest already ran this boot.
+    AlreadyIngested,
+    /// The log already holds NARF events, or an extend was already
+    /// recorded — the firmware prefix can no longer be its head.
+    TooLate,
+    /// No EFI system table, or neither TCG2 log table published.
+    NoFirmwareLog,
+    /// A firmware table's bytes could not be read (out of range,
+    /// above the identity-map limit, or aarch64 where no identity
+    /// map read exists yet).
+    UnreadableFirmwareMemory,
+    /// The main log's declared size exceeds
+    /// [`narf_efi::tcg2::MAX_TCG2_LOG_BYTES`].
+    MainLogTooLarge,
+    /// The final-events table declares more than
+    /// [`narf_efi::tcg2::MAX_TCG2_LOG_EVENTS`] events.
+    FinalTableTooLarge,
+    /// The main log failed to parse.
+    BadMainLog(narf_efi::tcg2::Tcg2LogError),
+    /// The final-events table failed to parse.
+    BadFinalTable(narf_efi::tcg2::Tcg2LogError),
+}
+
+/// The outcome of one PCR 0–7 read-back cross-check.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PcrCrossCheck {
+    /// True when every PCR 0–7 was read back and compared. False
+    /// when no registry TPM exists (nothing to compare against)
+    /// or a read failed (inconclusive, not a mismatch).
+    pub checked: bool,
+    /// Per-PCR (index = PCR number) mismatch against the replayed
+    /// shadow. Meaningful only when `checked` is true.
+    pub mismatched: [bool; 8],
+    /// True when at least one `read_pcr` failed. A transport
+    /// failure proves nothing about the replay, so it neither
+    /// sets the sticky mismatch nor counts as a check.
+    pub read_failed: bool,
+}
+
+/// The firmware ingest outcome, once ingest has run.
+pub fn firmware_ingest() -> Option<FirmwareIngest> {
+    *FIRMWARE_INGEST.lock()
+}
+
+/// Whether the firmware replay has been proven to disagree with
+/// the hardware PCRs 0–7. Consulted by the quote composition
+/// through the attestation hooks.
+pub fn firmware_replay_mismatch() -> bool {
+    FIRMWARE_REPLAY_MISMATCH.load(Ordering::Acquire)
+}
+
+/// The last PCR 0–7 cross-check outcome, if one ran.
+pub fn last_cross_check() -> Option<PcrCrossCheck> {
+    *LAST_CROSS_CHECK.lock()
+}
+
+/// Read firmware-table bytes out of physical memory through the
+/// boot identity map. Mirrors the guards in
+/// `firmware/smbios`'s `KernelPhys`: the address must be non-zero
+/// and the range must end at or below the direct map's first slot
+/// (`LOW_IDENTITY_LIMIT`, 512 GiB); on aarch64 there is no such
+/// read yet and every read fails closed.
+fn read_firmware_phys(phys: u64, out: &mut [u8]) -> bool {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (phys, out);
+        false
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let Some(end) = phys.checked_add(out.len() as u64) else {
+            return false;
+        };
+        if phys == 0 || end > narf_memory::addr::LOW_IDENTITY_LIMIT {
+            return false;
+        }
+        let src = narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>();
+        // SAFETY: same argument as `KernelPhys` in
+        // `firmware/smbios`'s discover.rs: `[phys, end)` is below
+        // 512 GiB, all of which the direct map's first slot maps;
+        // before the map is live `kernel_ptr` is the boot identity
+        // map. Firmware tables are plain RAM / ROM.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+}
+
+/// One firmware event, parsed and ready to apply to the shadow and
+/// the log. The digest is the SHA-256 bank's (the parser
+/// guarantees it for every non-`EV_NO_ACTION` record); `extend`
+/// is false exactly for `EV_NO_ACTION` records.
+struct ParsedFirmwareEvent {
+    pcr: u32,
+    event_type: u32,
+    digest: [u8; SHA256_DIGEST_SIZE],
+    event: Vec<u8>,
+    extend: bool,
+}
+
+impl ParsedFirmwareEvent {
+    fn from_tcg2(ev: narf_efi::tcg2::Tcg2Event<'_>) -> Self {
+        ParsedFirmwareEvent {
+            pcr: ev.pcr,
+            event_type: ev.event_type,
+            digest: ev.sha256_digest.unwrap_or([0u8; SHA256_DIGEST_SIZE]),
+            event: ev.event.to_vec(),
+            extend: ev.event_type != EV_NO_ACTION,
+        }
+    }
+}
+
+/// Ingest the firmware TCG2 event log: locate it through the EFI
+/// configuration table, parse it, and replay it into the shadow
+/// and the head of the log. Runs once, first, in the measured-boot
+/// initcall; a retry after a failure is allowed (the
+/// exactly-once flag is set only on success), but a retry after
+/// success — or after any NARF extend — is refused.
+pub fn ingest_firmware_event_log() -> Result<FirmwareIngest, FirmwareIngestError> {
+    if FIRMWARE_INGESTED.load(Ordering::Acquire) {
+        return Err(FirmwareIngestError::AlreadyIngested);
+    }
+    if !LOG.lock().is_empty() || EXTEND_OBSERVED.load(Ordering::Acquire) {
+        return Err(FirmwareIngestError::TooLate);
+    }
+    let outcome = ingest_firmware_event_log_inner()?;
+    FIRMWARE_INGESTED.store(true, Ordering::Release);
+    *FIRMWARE_INGEST.lock() = Some(outcome);
+    Ok(outcome)
+}
+
+fn ingest_firmware_event_log_inner() -> Result<FirmwareIngest, FirmwareIngestError> {
+    use narf_efi::tcg2;
+    let handoff = narf_boot::firmware::firmware_handoff();
+    let systab = handoff
+        .efi_system_table
+        .ok_or(FirmwareIngestError::NoFirmwareLog)?;
+    let tables = narf_boot::firmware::tcg2_log_tables(systab, &read_firmware_phys);
+    if tables.main_log.is_none() && tables.final_events.is_none() {
+        return Err(FirmwareIngestError::NoFirmwareLog);
+    }
+
+    // Phase 1 — parse everything before touching the shadow or the
+    // log, so a malformed tail cannot leave a half-replayed prefix.
+    let mut events: Vec<ParsedFirmwareEvent> = Vec::new();
+    let mut main_events = 0usize;
+    let mut final_events = 0usize;
+    let mut full_chain = false;
+    let mut expected_digest_count: Option<u32> = None;
+    let mut preboot_size = 0usize;
+    if let Some(addr) = tables.main_log {
+        let mut header = [0u8; 9];
+        if !read_firmware_phys(addr, &mut header) {
+            return Err(FirmwareIngestError::UnreadableFirmwareMemory);
+        }
+        let log_header = tcg2::decode_linux_tpm_event_log_header(&header).ok_or(
+            FirmwareIngestError::BadMainLog(tcg2::Tcg2LogError::UnsupportedLogVersion),
+        )?;
+        if log_header.size as usize > tcg2::MAX_TCG2_LOG_BYTES {
+            return Err(FirmwareIngestError::MainLogTooLarge);
+        }
+        let size = log_header.size as usize;
+        let mut log_bytes = alloc::vec![0u8; size];
+        if size > 0 {
+            let Some(log_addr) = addr.checked_add(9) else {
+                return Err(FirmwareIngestError::UnreadableFirmwareMemory);
+            };
+            if !read_firmware_phys(log_addr, &mut log_bytes) {
+                return Err(FirmwareIngestError::UnreadableFirmwareMemory);
+            }
+        }
+        let (spec, parsed) =
+            tcg2::parse_tcg2_log(&log_bytes).map_err(FirmwareIngestError::BadMainLog)?;
+        expected_digest_count = Some(spec.number_of_algorithms);
+        preboot_size = log_header.final_events_preboot_size as usize;
+        main_events = parsed.len();
+        full_chain = true;
+        events.extend(parsed.into_iter().map(ParsedFirmwareEvent::from_tcg2));
+    }
+    if let Some(addr) = tables.final_events {
+        let mut header = [0u8; 16];
+        if !read_firmware_phys(addr, &mut header) {
+            return Err(FirmwareIngestError::UnreadableFirmwareMemory);
+        }
+        let table_header = tcg2::decode_final_events_table_header(&header).ok_or(
+            FirmwareIngestError::BadFinalTable(tcg2::Tcg2LogError::UnsupportedLogVersion),
+        )?;
+        if table_header.number_of_events > tcg2::MAX_TCG2_LOG_EVENTS as u64 {
+            return Err(FirmwareIngestError::FinalTableTooLarge);
+        }
+        // The table has no total length: copy a bounded window
+        // sized by the event count (4 KiB per event is far above
+        // any real firmware record) and walk exactly
+        // `number_of_events` records out of it.
+        let window_len =
+            ((table_header.number_of_events as usize) * 4096).min(tcg2::MAX_TCG2_LOG_BYTES);
+        let mut window = alloc::vec![0u8; window_len];
+        if window_len > 0 {
+            let Some(events_addr) = addr.checked_add(16) else {
+                return Err(FirmwareIngestError::UnreadableFirmwareMemory);
+            };
+            if !read_firmware_phys(events_addr, &mut window) {
+                return Err(FirmwareIngestError::UnreadableFirmwareMemory);
+            }
+        }
+        let parsed = tcg2::parse_final_events(
+            &window,
+            table_header.number_of_events,
+            expected_digest_count,
+            preboot_size,
+        )
+        .map_err(FirmwareIngestError::BadFinalTable)?;
+        final_events = parsed.len();
+        events.extend(parsed.into_iter().map(ParsedFirmwareEvent::from_tcg2));
+    }
+
+    // Phase 2 — apply in stream order. The guards in
+    // `ingest_firmware_event_log` guarantee the log is empty and
+    // nothing was extended yet, so these land at the head of the
+    // log and the shadow starts from them.
+    apply_firmware_replay(&events, main_events, final_events, full_chain)
+}
+
+/// Apply already-parsed firmware events to the shadow and the head
+/// of the log, in stream order. The caller guarantees the guards
+/// (`ingest_firmware_event_log` checks them); the smokes call this
+/// directly with spec-built logs, since the full ingest path reads
+/// physical firmware memory.
+fn apply_firmware_replay(
+    events: &[ParsedFirmwareEvent],
+    main_events: usize,
+    final_events: usize,
+    full_chain: bool,
+) -> Result<FirmwareIngest, FirmwareIngestError> {
+    if FIRMWARE_INGESTED.load(Ordering::Acquire) {
+        return Err(FirmwareIngestError::AlreadyIngested);
+    }
+    if !LOG.lock().is_empty() || EXTEND_OBSERVED.load(Ordering::Acquire) {
+        return Err(FirmwareIngestError::TooLate);
+    }
+    for ev in events {
+        if ev.extend {
+            // The parser guarantees `ev.pcr < 24`; the shadow
+            // extend cannot fail here. The hardware TPM is never
+            // touched: firmware already extended these digests.
+            let _ = extend_shadow(ev.pcr, &ev.digest);
+        }
+        record_firmware(
+            ev.pcr,
+            ev.event_type,
+            alloc::format!("firmware:{:#010x}", ev.event_type),
+            &ev.digest,
+            ev.event.clone(),
+        );
+    }
+    let outcome = FirmwareIngest {
+        main_events,
+        final_events,
+        full_chain,
+    };
+    FIRMWARE_INGESTED.store(true, Ordering::Release);
+    *FIRMWARE_INGEST.lock() = Some(outcome);
+    Ok(outcome)
+}
+
+/// Read hardware PCRs 0–7 back and compare them against the
+/// replayed shadow (#1071 cross-check).
+///
+/// Runs whenever a registry TPM exists, regardless of whether a
+/// firmware log was ingested: the comparison is meaningful either
+/// way (on QEMU/swtpm with no firmware extends, both sides are
+/// zero plus NARF's extends; on real UEFI without a published log
+/// it correctly reports mismatch). Per-PCR 0–7 `read_pcr` must
+/// return 32 bytes equal to the shadow. Any read failure makes
+/// the outcome inconclusive (`checked = false`, `read_failed =
+/// true`) — it proves nothing about the replay, so it neither
+/// sets the sticky mismatch nor refuses quotes. Any proven
+/// mismatch sets the sticky [`FIRMWARE_REPLAY_MISMATCH`] flag,
+/// which the quote composition refuses on.
+///
+/// Callers run this before the measured-boot completion summary,
+/// so the boot console reports the outcome.
+pub async fn cross_check_pcrs_0_7() -> PcrCrossCheck {
+    let mut out = PcrCrossCheck {
+        checked: false,
+        mismatched: [false; 8],
+        read_failed: false,
+    };
+    let Some(tpm) = narf_tpm::registry::list().first().cloned() else {
+        return out;
+    };
+    for pcr in 0..8u32 {
+        let want = pcr_shadow(pcr).unwrap_or([0u8; SHA256_DIGEST_SIZE]);
+        match tpm.read_pcr(pcr).await {
+            Ok(v) if v.len() == SHA256_DIGEST_SIZE && v.as_slice() == want.as_slice() => {}
+            Ok(_) => {
+                out.mismatched[pcr as usize] = true;
+            }
+            Err(_) => {
+                out.read_failed = true;
+            }
+        }
+    }
+    if out.read_failed {
+        *LAST_CROSS_CHECK.lock() = Some(out);
+        return out;
+    }
+    out.checked = true;
+    if out.mismatched.iter().any(|&m| m) {
+        FIRMWARE_REPLAY_MISMATCH.store(true, Ordering::Release);
+    }
+    *LAST_CROSS_CHECK.lock() = Some(out);
+    out
 }
 
 /// Record a measurement in the software log and extend it into both
@@ -411,9 +813,14 @@ pub fn event_count() -> usize {
 ///     UINT32 digestCount  = 1
 ///     UINT16 algId        = TPM_ALG_SHA256
 ///     BYTE   digest[32]
-///     UINT32 eventSize    = label.len()
+///     UINT32 eventSize    = event bytes length
 ///     BYTE   event[eventSize]
 /// ```
+///
+/// The event bytes are the `label` for NARF's own measurements and
+/// the verbatim firmware event bytes (`event_data`) for replayed
+/// firmware events (#1071) — so a verifier replaying the published
+/// log reproduces the firmware prefix exactly.
 pub fn tcg_event_log_encode() -> Vec<u8> {
     let log = LOG.lock();
     let mut out = Vec::with_capacity(log.len() * (4 + 4 + 4 + 2 + 32 + 4 + 16));
@@ -425,9 +832,12 @@ pub fn tcg_event_log_encode() -> Vec<u8> {
         // algId = SHA256
         out.extend_from_slice(&TPM_ALG_SHA256.to_le_bytes());
         out.extend_from_slice(&e.digest);
-        let label_bytes = e.label.as_bytes();
-        out.extend_from_slice(&(label_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(label_bytes);
+        let event_bytes = match &e.event_data {
+            Some(data) => data.as_slice(),
+            None => e.label.as_bytes(),
+        };
+        out.extend_from_slice(&(event_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(event_bytes);
     }
     out
 }
@@ -460,10 +870,13 @@ pub fn tcg_event_log_decode_one(buf: &[u8]) -> Option<(Measurement, usize)> {
     if off + event_size > buf.len() {
         return None;
     }
-    let label = match core::str::from_utf8(&buf[off..off + event_size]) {
-        Ok(s) => alloc::string::ToString::to_string(s),
-        Err(_) => return None,
-    };
+    // Firmware event bytes are arbitrary binary, not necessarily
+    // text: keep them verbatim in `event_data` and recover a label
+    // lossily. A decode that refused non-UTF-8 bytes would make the
+    // published log unloadable on logs whose firmware events carry
+    // binary payloads.
+    let event_data = buf[off..off + event_size].to_vec();
+    let label = String::from_utf8_lossy(&event_data).into_owned();
     Some((
         Measurement {
             pcr,
@@ -471,17 +884,22 @@ pub fn tcg_event_log_decode_one(buf: &[u8]) -> Option<(Measurement, usize)> {
             digest,
             data_len: 0,
             label,
+            event_data: Some(event_data),
         },
         off + event_size,
     ))
 }
 
-/// Reset the log + shadow. Test-only.
+/// Reset the log + shadow + firmware-ingest state. Test-only.
 #[doc(hidden)]
 pub fn __reset_for_test() {
     LOG.lock().clear();
     *PCR_SHADOW.lock() = [[0u8; SHA256_DIGEST_SIZE]; PCR_COUNT];
     EXTEND_OBSERVED.store(false, Ordering::Release);
+    FIRMWARE_INGESTED.store(false, Ordering::Release);
+    *FIRMWARE_INGEST.lock() = None;
+    FIRMWARE_REPLAY_MISMATCH.store(false, Ordering::Release);
+    *LAST_CROSS_CHECK.lock() = None;
 }
 
 fn record(
@@ -497,6 +915,7 @@ fn record(
         digest: *digest,
         data_len,
         label: alloc::string::ToString::to_string(label),
+        event_data: None,
     });
 }
 
@@ -513,6 +932,29 @@ fn record_owned(
         digest: *digest,
         data_len,
         label,
+        event_data: None,
+    });
+}
+
+/// Record a replayed firmware event (#1071): same log entry as
+/// [`record_owned`], but the event bytes are kept verbatim in
+/// `event_data` (the measured-data length is unknowable for
+/// firmware events — the digest is authoritative — so `data_len`
+/// is 0).
+fn record_firmware(
+    pcr: u32,
+    event_type: u32,
+    label: String,
+    digest: &[u8; SHA256_DIGEST_SIZE],
+    event: Vec<u8>,
+) {
+    LOG.lock().push(Measurement {
+        pcr,
+        event_type,
+        digest: *digest,
+        data_len: 0,
+        label,
+        event_data: Some(event),
     });
 }
 
@@ -834,6 +1276,14 @@ impl StatefulTpm {
     fn bank_snapshot(&self, pcr: u32) -> [u8; SHA256_DIGEST_SIZE] {
         self.bank.lock()[pcr as usize]
     }
+
+    /// Test-only: set one bank PCR outright (what real firmware
+    /// left in silicon), without extending — the firmware replay
+    /// never extends hardware, so the cross-check smoke seeds the
+    /// device bank to the replayed shadow this way.
+    fn seed_pcr(&self, pcr: u32, value: [u8; SHA256_DIGEST_SIZE]) {
+        self.bank.lock()[pcr as usize] = value;
+    }
 }
 
 #[async_trait]
@@ -975,3 +1425,281 @@ fn smoke_measure_hardware_failure_propagates() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("frame/measure", smoke_measure_hardware_failure_propagates);
+
+/// Synthetic TCG2 log builders for the firmware-ingest smokes
+/// (#1071). Hand-built from the TCG PC Client spec layouts (same
+/// shapes as `efi/src/tests.rs`'s builders, duplicated here
+/// because a kernel-test crate cannot import another crate's test
+/// helpers): a Spec ID event, then EVENT2 records.
+fn fw_push_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn fw_push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn fw_spec_id_record() -> Vec<u8> {
+    // TCG_PCR_EVENT: PCR 0, EV_NO_ACTION, 20 zero digest bytes,
+    // event = TCG_EfiSpecIdEventStruct ("Spec ID Event03",
+    // platformClass 0, specVersion 2.0, errata 0, uintnSize 2,
+    // numberOfAlgorithms 2: SHA-1/20 + SHA-256/32, vendorInfo "").
+    let mut body = Vec::new();
+    body.extend_from_slice(b"Spec ID Event03");
+    fw_push_u32(&mut body, 0);
+    body.push(0);
+    body.push(2);
+    body.push(0);
+    body.push(2);
+    fw_push_u32(&mut body, 2);
+    fw_push_u16(&mut body, 0x0004);
+    fw_push_u16(&mut body, 20);
+    fw_push_u16(&mut body, 0x000B);
+    fw_push_u16(&mut body, 32);
+    body.push(0);
+    let mut rec = Vec::new();
+    fw_push_u32(&mut rec, 0);
+    fw_push_u32(&mut rec, EV_NO_ACTION);
+    rec.extend_from_slice(&[0u8; 20]);
+    fw_push_u32(&mut rec, body.len() as u32);
+    rec.extend_from_slice(&body);
+    rec
+}
+
+fn fw_event2_record(pcr: u32, event_type: u32, sha256: [u8; 32], event: &[u8]) -> Vec<u8> {
+    // EVENT2 with two digests (SHA-1 + SHA-256), matching the Spec
+    // ID anchor above — every record's digest count SHALL equal
+    // numberOfAlgorithms (PC Client §9.1).
+    let mut rec = Vec::new();
+    fw_push_u32(&mut rec, pcr);
+    fw_push_u32(&mut rec, event_type);
+    fw_push_u32(&mut rec, 2);
+    fw_push_u16(&mut rec, 0x0004);
+    rec.extend_from_slice(&[0x11u8; 20]);
+    fw_push_u16(&mut rec, 0x000B);
+    rec.extend_from_slice(&sha256);
+    fw_push_u32(&mut rec, event.len() as u32);
+    rec.extend_from_slice(event);
+    rec
+}
+
+fn fw_synthetic_log() -> Vec<u8> {
+    let mut log = fw_spec_id_record();
+    // CRTM measurement into PCR 0.
+    log.extend_from_slice(&fw_event2_record(
+        0,
+        0x0000_0008,
+        [0x21u8; 32],
+        b"CRTM version",
+    ));
+    // Separator into PCR 0.
+    log.extend_from_slice(&fw_event2_record(
+        0,
+        EV_SEPARATOR,
+        [0x22u8; 32],
+        b"separator",
+    ));
+    // Informational NO_ACTION event on PCR 7 — recorded, never extended.
+    log.extend_from_slice(&fw_event2_record(
+        7,
+        EV_NO_ACTION,
+        [0x23u8; 32],
+        b"informational",
+    ));
+    log
+}
+
+fn smoke_measure_firmware_ingest_replays_spec_log() -> TestResult {
+    __reset_for_test();
+    let log = fw_synthetic_log();
+    let (info, parsed) = match narf_efi::tcg2::parse_tcg2_log(&log) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("synthetic TCG2 log rejected"),
+    };
+    if info.number_of_algorithms != 2 || parsed.len() != 4 {
+        return TestResult::Fail("synthetic log parsed wrong");
+    }
+    let events: Vec<ParsedFirmwareEvent> = parsed
+        .into_iter()
+        .map(ParsedFirmwareEvent::from_tcg2)
+        .collect();
+    let outcome = match apply_firmware_replay(&events, 4, 0, true) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("firmware replay refused"),
+    };
+    if outcome.main_events != 4 || outcome.final_events != 0 || !outcome.full_chain {
+        return TestResult::Fail("ingest outcome wrong");
+    }
+    // The firmware prefix is the head of the log, in stream order.
+    let entries = get_log();
+    if entries.len() != 4 {
+        return TestResult::Fail("log length after replay wrong");
+    }
+    if entries[0].event_type != EV_NO_ACTION || entries[1].event_type != 0x0000_0008 {
+        return TestResult::Fail("replayed log order wrong");
+    }
+    // The Spec ID record's digest is the all-zero legacy digest.
+    if entries[0].digest != [0u8; SHA256_DIGEST_SIZE] {
+        return TestResult::Fail("Spec ID digest not zero");
+    }
+    // Shadow math: PCR 0 = H(H(0 || 0x21..) || 0x22..); the
+    // NO_ACTION event on PCR 7 extended nothing.
+    let want_pcr0 = pcr_extend_value(
+        &pcr_extend_value(&[0u8; SHA256_DIGEST_SIZE], &[0x21u8; 32]),
+        &[0x22u8; 32],
+    );
+    if pcr_shadow(0) != Some(want_pcr0) {
+        return TestResult::Fail("PCR 0 shadow after replay wrong");
+    }
+    if pcr_shadow(7) != Some([0u8; SHA256_DIGEST_SIZE]) {
+        return TestResult::Fail("NO_ACTION event extended PCR 7");
+    }
+    // Firmware event bytes round-trip through the encoder: a
+    // verifier replaying the published log sees the firmware
+    // prefix verbatim.
+    let encoded = tcg_event_log_encode();
+    let mut off = 0usize;
+    let mut decoded: Vec<Measurement> = Vec::new();
+    while off < encoded.len() {
+        let Some((m, n)) = tcg_event_log_decode_one(&encoded[off..]) else {
+            return TestResult::Fail("published log undecodable");
+        };
+        off += n;
+        decoded.push(m);
+    }
+    if decoded.len() != 4 || decoded[1].digest != [0x21u8; 32] {
+        return TestResult::Fail("published log round-trip wrong");
+    }
+    if decoded[1].event_data.as_deref() != Some(b"CRTM version".as_slice()) {
+        return TestResult::Fail("firmware event bytes not preserved");
+    }
+    // Guards: a second replay is refused, and the state is untouched.
+    match apply_firmware_replay(&events, 4, 0, true) {
+        Err(FirmwareIngestError::AlreadyIngested) => {}
+        _ => return TestResult::Fail("second replay not refused"),
+    }
+    if get_log().len() != 4 || pcr_shadow(0) != Some(want_pcr0) {
+        return TestResult::Fail("refused replay mutated state");
+    }
+    // TooLate: after any NARF extend, a replay is refused.
+    __reset_for_test();
+    let _ = extend_shadow(4, &[0xCDu8; 32]);
+    match apply_firmware_replay(&events, 4, 0, true) {
+        Err(FirmwareIngestError::TooLate) => {}
+        _ => return TestResult::Fail("replay after extend not refused"),
+    }
+    if !get_log().is_empty() {
+        return TestResult::Fail("refused replay recorded events");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/measure",
+    smoke_measure_firmware_ingest_replays_spec_log
+);
+
+fn smoke_measure_firmware_ingest_absent_without_efi() -> TestResult {
+    // The kernel-test environment has no EFI system table
+    // (`firmware_handoff` is EMPTY: parse_raw never ran), so the
+    // full ingest path must report the absence, not a log.
+    __reset_for_test();
+    match ingest_firmware_event_log() {
+        Err(FirmwareIngestError::NoFirmwareLog) => {}
+        _ => return TestResult::Fail("ingest without EFI did not report NoFirmwareLog"),
+    }
+    if firmware_ingest().is_some() || !get_log().is_empty() {
+        return TestResult::Fail("failed ingest left state behind");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/measure",
+    smoke_measure_firmware_ingest_absent_without_efi
+);
+
+fn smoke_measure_firmware_cross_check_matches_and_mismatches() -> TestResult {
+    narf_tpm::registry::__reset_for_test();
+    __reset_for_test();
+    narf_scheduler::__reset_queues_for_test();
+
+    let tpm = Arc::new(StatefulTpm::new());
+    narf_tpm::registry::register(tpm.clone());
+
+    // Replay the synthetic firmware log: the shadow PCR 0
+    // advances; the device bank does not (replay never touches
+    // hardware).
+    let log = fw_synthetic_log();
+    let Ok((_, parsed)) = narf_efi::tcg2::parse_tcg2_log(&log) else {
+        narf_tpm::registry::__reset_for_test();
+        __reset_for_test();
+        return TestResult::Fail("synthetic TCG2 log rejected");
+    };
+    let events: Vec<ParsedFirmwareEvent> = parsed
+        .into_iter()
+        .map(ParsedFirmwareEvent::from_tcg2)
+        .collect();
+    if apply_firmware_replay(&events, 4, 0, true).is_err() {
+        narf_tpm::registry::__reset_for_test();
+        __reset_for_test();
+        return TestResult::Fail("firmware replay refused");
+    }
+    // Seed the device bank with the replayed shadow for PCRs 0–7
+    // (what real firmware left in silicon): the check matches.
+    for pcr in 0..8u32 {
+        tpm.seed_pcr(pcr, pcr_shadow(pcr).unwrap_or([0u8; SHA256_DIGEST_SIZE]));
+    }
+    let outcome = Arc::new(IrqSafeSpinLock::new(None));
+    let outcome2 = outcome.clone();
+    narf_scheduler::spawn(async move {
+        *outcome2.lock() = Some(cross_check_pcrs_0_7().await);
+    });
+    narf_scheduler::run_until_empty();
+    let check = match *outcome.lock() {
+        Some(c) => c,
+        None => {
+            narf_tpm::registry::__reset_for_test();
+            __reset_for_test();
+            return TestResult::Fail("cross-check task never ran");
+        }
+    };
+    if !check.checked || check.mismatched.iter().any(|&m| m) || firmware_replay_mismatch() {
+        narf_tpm::registry::__reset_for_test();
+        __reset_for_test();
+        return TestResult::Fail("matching replay reported mismatch");
+    }
+    // Now corrupt one hardware PCR: the check must prove the
+    // mismatch and set the sticky flag.
+    tpm.seed_pcr(1, [0xFFu8; 32]);
+    let outcome = Arc::new(IrqSafeSpinLock::new(None));
+    let outcome2 = outcome.clone();
+    narf_scheduler::spawn(async move {
+        *outcome2.lock() = Some(cross_check_pcrs_0_7().await);
+    });
+    narf_scheduler::run_until_empty();
+    let check = match *outcome.lock() {
+        Some(c) => c,
+        None => {
+            narf_tpm::registry::__reset_for_test();
+            __reset_for_test();
+            return TestResult::Fail("mismatch cross-check task never ran");
+        }
+    };
+    let checked = check.checked;
+    let m0 = check.mismatched[0];
+    let m1 = check.mismatched[1];
+    let sticky = firmware_replay_mismatch();
+    narf_tpm::registry::__reset_for_test();
+    __reset_for_test();
+    if !checked || !m1 || m0 {
+        return TestResult::Fail("mismatch not proven on PCR 1");
+    }
+    if !sticky {
+        return TestResult::Fail("sticky mismatch flag not set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/measure",
+    smoke_measure_firmware_cross_check_matches_and_mismatches
+);

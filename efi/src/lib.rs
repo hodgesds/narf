@@ -33,6 +33,9 @@
 //! - [`reset`] — `EfiResetType` enum + status codes.
 //! - [`system_table`] — `EFI_SYSTEM_TABLE` / `EFI_TABLE_HEADER`
 //!   decoders, signature constants, CRC32 verification helper.
+//! - [`tcg2`] — TCG2 event-log codecs (final-events table, the
+//!   Linux stub's event-log wrapper, `TCG_PCR_EVENT` /
+//!   `TCG_PCR_EVENT2` stream parsing) for firmware measured boot.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -43,6 +46,7 @@ extern crate alloc;
 pub mod reset;
 pub mod runtime;
 pub mod system_table;
+pub mod tcg2;
 pub mod time;
 pub mod variable;
 
