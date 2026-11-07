@@ -336,9 +336,9 @@ pub const DSS_LINK_ACTIVATE: u32 = 1;
 
 /// Size of MBIM_DSS_CONNECT (MBIM 1.0 §10.5.38): DeviceServiceId (16)
 /// + DssSessionId (4) + DssLinkState (4). The DeviceServiceId is the
-/// per-link GUID identifying which device service owns the stream
-/// (e.g. the modem-logging GUID below); the session id is the DSS
-/// session on the shared bulk pair.
+///   per-link GUID identifying which device service owns the stream
+///   (e.g. the modem-logging GUID below); the session id is the DSS
+///   session on the shared bulk pair.
 pub const DSS_CONNECT_INFO_LEN: usize = 24;
 
 /// ModemFileTransfer link GUID — 0EBB1CEB-AF2D-484D-8DF3-53BC51FD162C.
