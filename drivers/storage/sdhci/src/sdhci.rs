@@ -59,12 +59,17 @@
 //! failure power-cycles the card and re-runs identification +
 //! negotiation without UHS, so the card stays usable at 3.3 V.
 //!
-//! What stays out: eMMC-specific paths (#827, incl. HS200/HS400);
-//! 3.3 V High-Speed 50 MHz (CMD6 switch-function at 3.3 V) is a
-//! follow-on, not part of this data path; CMD6 driver-strength /
-//! current-limit selection is not programmed (cards stay at their
-//! default); re-tuning (SDHCI Capabilities re-tuning modes/timer)
-//! is not wired — tuning runs once at bring-up.
+//! eMMC (#827): a card that does not answer APP_CMD is identified
+//! as eMMC instead (CMD1 / CMD2 / CMD3 / CMD7 / CMD8 SEND_EXT_CSD;
+//! see `emmc`), and published as `emmc0` with its boot and
+//! general-purpose partitions.
+//!
+//! What stays out: eMMC HS200/HS400; 3.3 V High-Speed 50 MHz (CMD6
+//! switch-function at 3.3 V) is a follow-on, not part of this data
+//! path; CMD6 driver-strength / current-limit selection is not
+//! programmed (cards stay at their default); re-tuning (SDHCI
+//! Capabilities re-tuning modes/timer) is not wired — tuning runs
+//! once at bring-up.
 //!
 //! Card detect (#836): an empty slot at probe is not a failure —
 //! the controller installs with no card known, and a Stage::Late
@@ -298,7 +303,12 @@ const CMD_CRC_EN: u16 = 1 << 3;
 const CMD_INDEX_EN: u16 = 1 << 4;
 const CMD_DATA_PRES: u16 = 1 << 5;
 
-// Transfer mode bits (§2.2.5).
+// Transfer mode bits (§2.2.5). BLOCK_COUNT_EN + MULTI_BLOCK are
+// wired by the RPMB path (CMD18/CMD25 with a CMD23 pre-defined
+// count); AUTO_CMD12 stays off there — the CMD23 count terminates
+// the transfer, so no CMD12 is issued (JESD84-B51 §6.6.7.1/§6.6.8.1).
+// (TM_DMA is live again: main's #837 datapath sets it for DMA
+// transfers; the RPMB base had it unused.)
 const TM_DMA: u16 = 1 << 0;
 const TM_BLOCK_COUNT_EN: u16 = 1 << 1;
 const TM_AUTO_CMD12: u16 = 1 << 2;
@@ -320,6 +330,19 @@ fn make_cmd(idx: u8, resp_kind: u16, has_data: bool) -> u16 {
         v |= CMD_DATA_PRES;
     }
     v
+}
+
+/// Transfer Mode bits for a multi-block command with a CMD23
+/// pre-defined block count: multi-block select + block-count
+/// enable, Auto-CMD12 off — the CMD23 count terminates the
+/// transfer, so no CMD12 is issued (JESD84-B51 §6.6.7.1/§6.6.8.1).
+/// Single-block commands pass `false` and get no extra bits.
+const fn multi_block_tm(multi: bool) -> u16 {
+    if multi {
+        TM_BLOCK_COUNT_EN | TM_MULTI_BLOCK
+    } else {
+        0
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -362,6 +385,15 @@ pub enum SdhciError {
     /// CMD19 tuning never completed (Execute Tuning stayed set past
     /// the loop/budget limit, or the tuned-clock bit never set).
     TuningFailed,
+    /// The card did not answer APP_CMD (CMD55): it is not an SD
+    /// card. The caller falls through to the eMMC sequence.
+    NotSdCard,
+    /// CMD13 reported SWITCH_ERROR after a SWITCH (CMD6): the
+    /// device refused the requested EXT_CSD change.
+    SwitchError,
+    /// EXT_CSD could not be parsed, or no capacity could be
+    /// determined from EXT_CSD + CSD together.
+    BadExtCsd,
 }
 
 /// Host data-path DMA mode, selected from Capabilities at bring-up
@@ -861,6 +893,13 @@ pub struct Sdhci {
     /// table). Locked only for the short prepare/complete phases
     /// of a transfer — never across the completion poll.
     dma: IrqSafeSpinLock<Option<DmaEngine>>,
+    /// Identified eMMC card, if the slot holds eMMC rather than SD.
+    /// Exactly one of `card` / `emmc` is filled by `bring_up`.
+    pub emmc: IrqSafeSpinLock<Option<emmc::EmmcCard>>,
+    /// PARTITION_CONFIG access value the card is currently switched
+    /// to (0 = user area). Only meaningful when `emmc` is filled;
+    /// updated only after a SWITCH verifies via CMD13.
+    pub emmc_access: IrqSafeSpinLock<u8>,
     /// Serialises polled SD transfers across callers. Spun on WITHOUT
     /// masking interrupts — see [`crate::req_gate::ReqGate`] for why
     /// this replaces holding `CONTROLLER` across a multi-block PIO
@@ -874,14 +913,16 @@ impl core::fmt::Debug for Sdhci {
         f.debug_struct("Sdhci")
             .field("probed_card", &self.card.lock().is_some())
             .field("data_path", &*self.path.lock())
+            .field("probed_emmc", &self.emmc.lock().is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl Sdhci {
     /// Bring up the host controller: software reset, supply 400 kHz
-    /// init clock, set 3.3V, and — if a card is present and
-    /// identifies — run the SD identification sequence.
+    /// init clock, set 3.3V, and — if a card is present — run the
+    /// identification sequence: SD first, eMMC when the card does
+    /// not answer APP_CMD (`identify_any`).
     ///
     /// An empty slot is NOT a failure (#836): the controller
     /// installs with no card known, and the card-detect poll task
@@ -890,7 +931,8 @@ impl Sdhci {
     /// the poll to retry, instead of bricking the slot. Only
     /// controller failures (BAR map, reset timeout) fail bring-up.
     /// Returns the controller; the identified card, if any, is in
-    /// `me.card`.
+    /// `me.card` (SD) or `me.emmc` (eMMC) — exactly one of the
+    /// two slots is filled on success.
     ///
     /// # Safety
     /// Caller owns BAR0 exclusively for the duration of init.
@@ -905,6 +947,8 @@ impl Sdhci {
             card: IrqSafeSpinLock::new(None),
             path: IrqSafeSpinLock::new(DataPath::identification()),
             dma: IrqSafeSpinLock::new(None),
+            emmc: IrqSafeSpinLock::new(None),
+            emmc_access: IrqSafeSpinLock::new(0),
             req_gate: AtomicBool::new(false),
         };
 
@@ -977,26 +1021,34 @@ impl Sdhci {
         //    (powering the slot down is #839 PM policy, not detect).
         let pstate = me.io.read32(REG_PRESENT_STATE);
         if pstate & PSTATE_CARD_INSERTED != 0 {
-            // 7. Run the SD identification sequence. A failure here
-            //    leaves the slot empty for the card-detect poll to
-            //    retry — a reseat is an insertion, and the poll owns
-            //    retries from here on.
+            // 7. Run the identification sequence: SD first, eMMC when
+            // the card does not answer APP_CMD. A failure here
+            // leaves the slot empty for the card-detect poll to
+            // retry — a reseat is an insertion, and the poll owns
+            // retries from here on.
             //
             // SAFETY: `me.io` is the SDHCI register window set up
-            // above and `identify_sequence` runs here at bring-up
-            // under exclusive ownership, satisfying its
-            // single-caller precondition (its other call sites are
+            // above and `identify_any` runs here at bring-up under
+            // exclusive ownership, satisfying its single-call
+            // ownership precondition (it delegates to
+            // `identify_sequence`, whose other call sites are
             // resume re-identification, #839, and the voltage-switch
             // recovery path after a power cycle; re-probes go through
-            // the request gate instead — see `service_card_slot`).
-            match unsafe { me.identify_sequence() } {
-                Ok(card) => {
-                    *me.card.lock() = Some(card);
+            // the request gate instead — see `service_card_slot`),
+            // with no transfer in flight.
+            match unsafe { me.identify_any() } {
+                Ok(()) => {
                     // Negotiate the data path (clock raise, bus
-                    // width, DMA). Best-effort by design: any step
-                    // that fails leaves the identification profile in
-                    // place and the card stays usable.
-                    me.negotiate_data_path();
+                    // width, DMA) — SD only: the SD ACMD6 / CMD6
+                    // switch-function sequence must never run
+                    // against an eMMC card (eMMC CMD6 is SWITCH,
+                    // a different command with EXT_CSD side
+                    // effects). Best-effort by design: any step
+                    // that fails leaves the identification profile
+                    // in place and the card stays usable.
+                    if me.card.lock().is_some() {
+                        me.negotiate_data_path();
+                    }
                 }
                 Err(e) => {
                     use core::fmt::Write as _;
@@ -1151,6 +1203,14 @@ impl Sdhci {
             Err(_) => false,
         };
 
+        // APP_CMD probe: an eMMC card does not implement APP_CMD, so
+        // a timeout here means "not SD" — the caller falls through
+        // to the eMMC sequence instead of failing the probe. (This is
+        // the SD/MMC discriminator: SD cards answer CMD55, eMMC
+        // cards ignore it.)
+        if self.cmd(55, 0, RESP_48, false, 0, 0, 0).is_err() {
+            return Err(SdhciError::NotSdCard);
+        }
         // ACMD41 (SD_SEND_OP_COND): repeat CMD55 + CMD41 until
         // the response's busy bit (bit 31) is set.
         let mut acmd41_arg = 0x4000_0000u32; // HCS=1 (host supports SDHC).
@@ -2199,16 +2259,73 @@ impl Sdhci {
         Ok(())
     }
 
+    /// Run card identification, storing the result in the matching
+    /// slot: the SD sequence first; when the card does not answer
+    /// APP_CMD (CMD55) it is not an SD card, so reset and run the
+    /// eMMC sequence instead (`emmc::identify_emmc_sequence`).
+    /// Exactly one of `card` / `emmc` is filled on success.
+    ///
+    /// # Safety
+    /// MMIO ownership; called only once at bring-up (or once per
+    /// fixture install in tests).
+    pub(crate) unsafe fn identify_any(&self) -> Result<(), SdhciError> {
+        // SAFETY: `identify_sequence` requires exclusive MMIO ownership
+        // and a single call at bring-up. Both are part of `identify_any`'s
+        // own safety contract, upheld by its callers: `bring_up` owns
+        // BAR0 exclusively and runs this once, and fixture installs run
+        // it once per installed controller.
+        match unsafe { self.identify_sequence() } {
+            Ok(card) => {
+                *self.card.lock() = Some(card);
+                Ok(())
+            }
+            Err(SdhciError::NotSdCard) => {
+                // SAFETY: `identify_emmc_sequence` requires the same
+                // exclusive-MMIO, single-call contract as the SD
+                // sequence above, discharged by `identify_any`'s
+                // callers; reaching this arm means the SD probe failed
+                // with `NotSdCard`, so the card is not SD and the eMMC
+                // sequence is the correct fallback.
+                let emmc = unsafe { self.identify_emmc_sequence() }?;
+                *self.emmc.lock() = Some(emmc);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Read a single 512-byte block via PIO. `lba` is the block
     /// number for SDHC cards; for SDSC cards (`ccs=0`) it's
     /// pre-multiplied by 512 to produce a byte address.
     pub fn read_block(&self, lba: u32, out: &mut [u8; 512]) -> Result<(), SdhciError> {
         let card = self.card.lock().ok_or(SdhciError::NoCard)?;
         let arg = if card.ccs { lba } else { lba * 512 };
+        self.read_pio_block(17, arg, false, out)
+    }
 
-        // CMD17 (READ_SINGLE_BLOCK) with data-direction read.
-        let tm = TM_DATA_DIR_READ;
-        let _ = self.cmd(17, arg, RESP_48, true, tm, 512, 1)?;
+    /// Issue a single-block read command (`idx` — CMD17 for a card
+    /// block, CMD8 for SEND_EXT_CSD) and drain its 512-byte data
+    /// block from the Buffer Data Port. `arg` is the command
+    /// argument as the card expects it: a block address for
+    /// sector-addressed cards, a byte address otherwise.
+    ///
+    /// With `multi`, the command is a multi-block command with a
+    /// CMD23 pre-defined block count (`idx` — CMD18): the Transfer
+    /// Mode selects multi-block + block-count-enable and leaves
+    /// Auto-CMD12 off, so the CMD23 count terminates the transfer
+    /// and no CMD12 is issued (JESD84-B51 §6.6.7.1). The transfer
+    /// itself is still one 512-byte block — this lane only ever
+    /// pre-defines a count of 1.
+    fn read_pio_block(
+        &self,
+        idx: u8,
+        arg: u32,
+        multi: bool,
+        out: &mut [u8; 512],
+    ) -> Result<(), SdhciError> {
+        // Data-direction read.
+        let tm = TM_DATA_DIR_READ | multi_block_tm(multi);
+        let _ = self.cmd(idx, arg, RESP_48, true, tm, 512, 1)?;
 
         // Wait for buffer-read-ready, then drain 512 / 4 = 128
         // u32 words from the buffer port. responsive_spin_until keeps
@@ -2248,7 +2365,24 @@ impl Sdhci {
     pub fn write_block(&self, lba: u32, data: &[u8; 512]) -> Result<(), SdhciError> {
         let card = self.card.lock().ok_or(SdhciError::NoCard)?;
         let arg = if card.ccs { lba } else { lba * 512 };
-        let _ = self.cmd(24, arg, RESP_48, true, /*tm*/ 0, 512, 1)?;
+        self.write_pio_block(24, arg, false, data)
+    }
+
+    /// Issue a single-block write command (`idx`, CMD24) and push
+    /// its 512-byte data block through the Buffer Data Port. `arg`
+    /// follows the same addressing rule as `read_pio_block`.
+    ///
+    /// With `multi`, the command is a multi-block command with a
+    /// CMD23 pre-defined block count (`idx` — CMD25); see
+    /// `read_pio_block` for the Transfer Mode rule.
+    fn write_pio_block(
+        &self,
+        idx: u8,
+        arg: u32,
+        multi: bool,
+        data: &[u8; 512],
+    ) -> Result<(), SdhciError> {
+        let _ = self.cmd(idx, arg, RESP_48, true, multi_block_tm(multi), 512, 1)?;
 
         // Wait for buffer-write-ready, push 128 u32 words.
         // responsive_spin_until ticks sleep_pumps so cursor/FB stay
@@ -2463,12 +2597,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     *CONTROLLER.lock() = Some(dev);
 
-    if let Some(card) = CONTROLLER.lock().as_ref().unwrap().card.lock().as_ref() {
-        publish_card(card.capacity_blocks);
-    }
+    let is_emmc = publish_installed();
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("sd0"),
+        name: alloc::string::String::from(if is_emmc { "emmc0" } else { "sd0" }),
         kind: narf_drivers::BoundKind::Block,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
@@ -2478,6 +2610,33 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // on the name, so a re-probe re-registers the same handlers).
     pm::register();
     Ok(())
+}
+
+/// Publish whatever `bring_up` identified — an SD card as `sdhci0`
+/// or an eMMC as `emmc0` — after the controller is installed.
+/// Returns true when an eMMC was published.
+///
+/// The card identity is copied out of its slot before publishing:
+/// publishing runs a partition scan, and the scan performs block
+/// I/O through `with_controller`, which re-locks `CONTROLLER` —
+/// holding any controller lock across the scan would deadlock on
+/// this non-reentrant spinlock. (The old probe code held
+/// `CONTROLLER` across `publish_card`; that could only have
+/// survived because no card was present at probe time on the
+/// machines exercised so far.)
+fn publish_installed() -> bool {
+    let Some(ctrl) = probed_sdhci() else {
+        return false;
+    };
+    if let Some(emmc) = ctrl.emmc.lock().as_ref().copied() {
+        emmc::publish_emmc(&emmc);
+        true
+    } else if let Some(card) = ctrl.card.lock().as_ref().copied() {
+        publish_card(card.capacity_blocks);
+        false
+    } else {
+        false
+    }
 }
 
 /// Publish an identified card as the `sdhci0` block device and scan
@@ -2683,6 +2842,8 @@ pub fn __install_for_test(transport: alloc::sync::Arc<dyn SdhciTransport>) {
         card: IrqSafeSpinLock::new(None),
         path: IrqSafeSpinLock::new(DataPath::identification()),
         dma: IrqSafeSpinLock::new(None),
+        emmc: IrqSafeSpinLock::new(None),
+        emmc_access: IrqSafeSpinLock::new(0),
         req_gate: AtomicBool::new(false),
     });
 }
@@ -2693,6 +2854,13 @@ pub fn __install_for_test(transport: alloc::sync::Arc<dyn SdhciTransport>) {
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
 }
+
+mod emmc;
+
+/// RPMB authenticated-frame protocol on the eMMC driver.
+mod rpmb;
+
+pub use self::rpmb::RpmbError;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod fixture_tests;

@@ -15,7 +15,7 @@ default = ["builtin"]
 builtin = [
     "dep:narf-drivers-storage-core", "dep:narf-acpi", "dep:narf-aml",
     "dep:narf-block", "dep:narf-bus", "dep:narf-capabilities",
-    "dep:narf-console", "dep:narf-drivers", "dep:narf-filesystem",
+    "dep:narf-console", "dep:narf-crypto", "dep:narf-drivers", "dep:narf-filesystem",
     "dep:narf-interrupts", "dep:narf-io", "dep:narf-kernel-test",
     "dep:narf-lib", "dep:narf-memory", "dep:narf-power", "dep:narf-scheduler", "dep:narf-time",
 ]
@@ -31,6 +31,7 @@ narf-block        = { path = "../../../block", optional = true }
 narf-bus          = { path = "../../../bus", optional = true }
 narf-capabilities = { path = "../../../capabilities", optional = true }
 narf-console      = { path = "../../../console", optional = true }
+narf-crypto       = { path = "../../../crypto", optional = true }
 narf-drivers      = { path = "../..", optional = true }
 narf-filesystem   = { path = "../../../filesystem", optional = true }
 narf-interrupts   = { path = "../../../interrupts", optional = true }

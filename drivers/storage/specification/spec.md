@@ -19,17 +19,32 @@ All driver code is derived strictly from the references below.
   §2.2.14 Clock Control, §2.2.16 Software Reset, §2.2.18 Normal
   Interrupt Status, §3.6 reset sequence, §3.7 SD bus power on.
 
-### eMMC EXT_CSD
+### eMMC
 
 - **JEDEC Standard JESD84-B51 — "Embedded Multi-Media Card (e•MMC)
   Electrical Standard (5.1)"** — JEDEC. Public.
+  §6.4.2 (CMD1 SEND_OP_COND OCR: busy bit 31, sector-mode bit 30,
+  2.7–3.6 V window). §6.6.1 (SWITCH / CMD6) and §6.6.2.2
+  (CMD13 verification: Tran state + ready-for-data, SWITCH_ERROR).
   §6.6.4 (SWITCH command argument layout — Access:2 / Index:8 /
   Value:8 / CmdSet:8). §6.6.5 (HS200 / HS400 timing flags).
-  §7.4 (EXT_CSD register, 512 bytes; field offsets in Table 39:
+  §6.13 (device status: CURRENT_STATE bits [12:9], SWITCH_ERROR
+  bit 7, READY_FOR_DATA bit 8). §6.6.22 (RPMB authenticated
+  frames: Table 17 frame layout, Table 18 request/response
+  types, Tables 19/20 operation results, §6.6.22.3 HMAC-SHA-256
+  over frame bytes [283:0], §6.6.22.4 CMD23 + CMD18/CMD25
+  accesses with CMD23 bit 31 = reliable write). §6.6.7.1 /
+  §6.6.8.1 (CMD23 pre-defined block count terminates the
+  transfer; no CMD12).
+  §7.4 (EXT_CSD register, 512 bytes; field offsets in Table 93:
   REV=192, CARD_TYPE=196, BUS_WIDTH=183, HS_TIMING=185,
   PARTITION_CONFIG=179, BOOT_SIZE_MULT=226, RPMB_SIZE_MULT=168,
   SEC_COUNT=212, PRE_EOL_INFO=267, DEVICE_LIFE_TIME_EST_TYP_A=268,
-  DEVICE_LIFE_TIME_EST_TYP_B=269).
+  DEVICE_LIFE_TIME_EST_TYP_B=269, GP_SIZE_MULT_1..4=143/146/149/152,
+  HC_WP_GRP_SIZE=221, HC_ERASE_GRP_SIZE=224, ERASE_GROUP_DEF=175,
+  PARTITIONING_SUPPORT=160, RST_n_FUNCTION=162).
+  §7.4.89 (GP partition size = GP_SIZE_MULT × HC_WP_GRP_SIZE ×
+  HC_ERASE_GRP_SIZE × 512 KiB).
 
 ### SD protocol (CSD / CID / responses)
 
@@ -116,8 +131,10 @@ All driver code is derived strictly from the references below.
   non-fatal; a failed switch power-cycles the card and re-identifies
   at 3.3 V without UHS. Fixture-validated end to end (S18A, switch
   status, tuning engine, DAT levels, power-cycle recovery).
-  Identified cards are published as `sdhci0` with a partition scan
-  (`sdhci0p<m>`) (#834). An empty slot at probe installs the
+  An SD probe that times out on CMD55 falls through to the eMMC
+  sequence instead of failing the probe (an eMMC card ignores
+  APP_CMD) — see the eMMC bullet. Identified cards are published as
+  `sdhci0` with a partition scan (`sdhci0p<m>`) (#834). An empty slot at probe installs the
   controller with no card known instead of failing probe, and a
   Stage::Late poll task reconciles the Present State card level
   with the known card: identify-on-insert, teardown-on-remove
@@ -153,14 +170,31 @@ All driver code is derived strictly from the references below.
   task gates a `Ready` slot; the next block I/O ungates
   synchronously. An empty slot is never gated, so insertions keep
   being detected (#839).
-- **eMMC EXT_CSD** (`emmc`): clean-room JEDEC JESD84-B51 EXT_CSD
-  register decoder. Parses revision, CARD_TYPE flags (HS_26 /
-  HS_52 / HS200 / HS400 with 1V8 + 1V2 variants), bus width,
-  HS_TIMING, PARTITION_CONFIG (active boot partition + currently
-  accessed partition), BOOT/RPMB partition sizes (mult × 128 KiB),
+- **eMMC** (`emmc` decoder + `sdhci::emmc` driver): clean-room
+  JEDEC JESD84-B51 EXT_CSD register decoder. Parses revision,
+  CARD_TYPE flags (HS_26 / HS_52 / HS200 / HS400 with 1V8 + 1V2
+  variants), bus width, HS_TIMING, PARTITION_CONFIG (active boot
+  partition + currently accessed partition), BOOT/RPMB partition
+  sizes (mult × 128 KiB), GP partition sizes (§7.4.89 formula),
   user-area capacity from SEC_COUNT, PRE_EOL_INFO + per-area life-
   time estimation. Builder for the SWITCH (CMD6) argument used to
-  rewrite individual EXT_CSD bytes (Access=Write Byte).
+  rewrite individual EXT_CSD bytes (Access=Write Byte). The driver
+  identifies an eMMC card on the SDHCI host (CMD0 / CMD1 polled to
+  OCR-ready / CMD2 / CMD3 / CMD9 / CMD7 / CMD8 SEND_EXT_CSD, with
+  the CSD capacity fallback when SEC_COUNT is 0), pins
+  PARTITION_CONFIG to the user area with a CMD6 + CMD13-verified
+  SWITCH, and publishes the user area as `emmc0` with a partition
+  scan (`emmc0p<m>`), the boot partitions as `emmc0boot0` /
+  `emmc0boot1`, and each configured general-purpose partition as
+  `emmc0gp<m>`; every I/O through a hardware partition switches the
+  card to that partition first (cached, verified by CMD13). RPMB is
+  decoded and sized but not published as a plain block device: it
+  admits only authenticated frames (§6.6.22), implemented in
+  `sdhci::rpmb` as single-frame (256 B) operations — key program,
+  authenticated counter read, authenticated data read/write with
+  HMAC-SHA-256 and a fresh nonce per read, result readback with
+  the counter+1 check — over CMD23 + CMD18/CMD25; the key is
+  supplied per operation and never stored. (#827, #1622)
 - **SD protocol decoders** (`sd_proto`): pure parsers for R1, R6, R7
   responses; CID register (manufacturer + OEM + product name + serial
   + MDT); CSD register (both v1.0 and v2.0 capacity formulas + read /
@@ -176,3 +210,7 @@ All driver code is derived strictly from the references below.
   for eMMC (needs the eMMC driver, #827).
 - eMMC EXT_CSD (JEDEC JESD84-B51) — landed when an eMMC fabric is
   exercised end-to-end.
+- RPMB multi-frame transfers (512 B / 8 KB, §6.6.22.4.3) and the
+  authenticated device-configuration accesses (0x0006/0x0007,
+  §6.6.22.4.5/§6.6.22.4.6) — the single-frame protocol is landed;
+  these are extensions, not the protocol itself.
