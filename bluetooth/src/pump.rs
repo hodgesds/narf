@@ -159,7 +159,8 @@ use crate::event::{
     CommandStatus, DisconnectionComplete, EventCode, LeAdvertisingSetTerminated,
     LeChannelSelectionAlgorithm, LeConnectionComplete, LeEnhancedConnectionComplete,
     LeLongTermKeyRequest, LePeriodicAdvReport, LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost,
-    LeScanRequestReceived, LeScanTimeout, NumberOfCompletedPackets, RemoteNameRequestComplete,
+    LePeriodicAdvSyncTransferReceived, LeScanRequestReceived, LeScanTimeout,
+    NumberOfCompletedPackets, RemoteNameRequestComplete,
 };
 use crate::gap::{
     self, AdvertisingSetPhase, CentralPhase, ExtendedScannerPhase, PeriodicAdvertiserPhase,
@@ -3823,7 +3824,7 @@ impl PumpCore {
                     }
                 }
                 // Periodic advertising sync subevents (§7.7.65.14..16,
-                // issue #1560). Malformed subevents parse to None
+                // .21, issues #1560 / #1575). Malformed subevents parse to None
                 // and are dropped; the state machine itself ignores
                 // reports for other handles and stale subevents, so
                 // a residual report racing a Sync Lost / Terminate
@@ -3836,6 +3837,16 @@ impl PumpCore {
                 }
                 if let Some(lost) = LePeriodicAdvSyncLost::parse(event) {
                     self.periodic_sync.note_sync_lost(&lost);
+                }
+                // Periodic Advertising Sync Transfer Received
+                // (§7.7.65.21, issue #1575): a sync that arrives
+                // by transfer adopts into PeriodicSync with no
+                // pending Create Sync; malformed transfers parse
+                // to None and are dropped, and the state machine
+                // ignores failed transfers and transfers racing a
+                // pending Create Sync or an existing sync.
+                if let Some(xfer) = LePeriodicAdvSyncTransferReceived::parse(event) {
+                    self.periodic_sync.note_sync_transfer_received(&xfer);
                 }
                 // Extended discovery reports feed the extended scanner
                 // peer table while extended scanning (§7.7.65.13),
@@ -15946,6 +15957,34 @@ mod tests {
         }
     }
 
+    /// LE Periodic Advertising Sync Transfer Received subevent [v1]
+    /// (§7.7.65.21): subevent, status, connection handle, service
+    /// data, sync handle, SID, address type, address, PHY,
+    /// interval, clock accuracy.
+    fn le_periodic_adv_sync_transfer_received(
+        status: u8,
+        connection_handle: u16,
+        service_data: u16,
+        sync_handle: u16,
+        sid: u8,
+        peer: [u8; 6],
+    ) -> Event {
+        let mut params = alloc::vec![0x18, status];
+        params.extend_from_slice(&connection_handle.to_le_bytes());
+        params.extend_from_slice(&service_data.to_le_bytes());
+        params.extend_from_slice(&sync_handle.to_le_bytes());
+        params.push(sid);
+        params.push(0x00); // advertiser address type: public
+        params.extend_from_slice(&peer);
+        params.push(0x01); // advertiser PHY: 1M
+        params.extend_from_slice(&0x0050u16.to_le_bytes()); // interval 100 ms
+        params.push(0x00); // advertiser clock accuracy
+        Event {
+            code: EventCode::LeMeta as u8,
+            params,
+        }
+    }
+
     /// #1560: the full periodic advertising conversation against the
     /// scripted controller — broadcaster parameters / data / enable,
     /// then receiver Create Sync → Sync Established → complete +
@@ -16760,6 +16799,130 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_periodic_adv_sync_transfer_flow);
+
+    /// #1575: a transferred sync adopts into PeriodicSync with no
+    /// (named `..._received_flow` on rebase: #1654's sender-side test
+    /// on main already owns `smoke_pump_periodic_adv_sync_transfer_flow`.)
+    /// pending Create Sync — the scripted controller sends the
+    /// 0x18 subevent, reports then deliver on the transferred
+    /// handle, and Sync Lost ends it. Failed, truncated, and
+    /// racing transfers are ignored.
+    fn smoke_pump_periodic_adv_sync_transfer_received_flow() -> TestResult {
+        use crate::event::LE_PA_DATA_COMPLETE;
+        use crate::gap::{PeerAddressType, PeriodicAdvertisingCreateSync};
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        // 1. Failed transfer (status 0x3E): nothing is adopted.
+        fake.enqueue_event(le_periodic_adv_sync_transfer_received(
+            0x3E, 0x0001, 0xBEEF, 0x0007, 0x01, peer,
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("failed transfer adopted a sync");
+        }
+        // 2. Truncated transfer (19 of 20 params bytes): ignored.
+        let mut truncated =
+            le_periodic_adv_sync_transfer_received(0x00, 0x0001, 0xBEEF, 0x0007, 0x01, peer);
+        truncated.params.truncate(19);
+        fake.enqueue_event(truncated);
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("truncated transfer adopted a sync");
+        }
+        // 3. Good transfer, no pending Create Sync: adopts.
+        fake.enqueue_event(le_periodic_adv_sync_transfer_received(
+            0x00, 0x0001, 0xBEEF, 0x0007, 0x01, peer,
+        ));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0);
+        if snap.as_ref().map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Synced)
+            || snap.as_ref().and_then(|s| s.sync_handle) != Some(0x0007)
+            || snap.as_ref().map(|s| s.periodic_interval) != Some(0x0050)
+            || snap.as_ref().and_then(|s| s.transfer_connection_handle) != Some(0x0001)
+            || snap.as_ref().map(|s| s.service_data) != Some(0xBEEF)
+        {
+            reset_all();
+            return TestResult::Fail("transfer did not adopt the sync");
+        }
+        // 4. A report on the transferred handle delivers.
+        fake.enqueue_event(le_periodic_adv_report(
+            0x0007,
+            4,
+            -60,
+            LE_PA_DATA_COMPLETE,
+            &[0x02, 0x01, 0x06],
+        ));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0).unwrap();
+        if snap.reports_received != 1 || snap.last_report != [0x02, 0x01, 0x06] {
+            reset_all();
+            return TestResult::Fail("report on transferred sync not delivered");
+        }
+        // 5. A second transfer while Synced is ignored (existing
+        // sync wins; no hijack to handle 0x0009).
+        fake.enqueue_event(le_periodic_adv_sync_transfer_received(
+            0x00, 0x0002, 0x1234, 0x0009, 0x02, peer,
+        ));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0).unwrap();
+        if snap.sync_handle != Some(0x0007) || snap.transfer_connection_handle != Some(0x0001) {
+            reset_all();
+            return TestResult::Fail("transfer while Synced hijacked the sync");
+        }
+        // 6. Sync Lost ends the transferred sync.
+        fake.enqueue_event(le_periodic_adv_sync_lost(0x0007));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0).unwrap();
+        if snap.phase != crate::gap::PeriodicSyncPhase::Idle
+            || snap.sync_handle.is_some()
+            || snap.transfer_connection_handle.is_some()
+        {
+            reset_all();
+            return TestResult::Fail("Sync Lost did not end the transferred sync");
+        }
+        // 7. A transfer racing a pending Create Sync is ignored;
+        // the local attempt then lands normally, with no transfer
+        // provenance.
+        let req = PeriodicAdvertisingCreateSync::to_advertiser(0x01, PeerAddressType::Public, peer);
+        if periodic_adv_create_sync(0, req).is_err() {
+            reset_all();
+            return TestResult::Fail("periodic_adv_create_sync rejected from Idle");
+        }
+        fake.enqueue_event(le_periodic_adv_sync_transfer_received(
+            0x00, 0x0001, 0xBEEF, 0x0009, 0x01, peer,
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase)
+            != Some(crate::gap::PeriodicSyncPhase::Creating)
+        {
+            reset_all();
+            return TestResult::Fail("transfer racing Create Sync moved phase out of Creating");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC, 0));
+        let _ = pump_once(0);
+        fake.enqueue_event(le_periodic_adv_sync_established(0x00, 0x0007, 0x01, peer));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0).unwrap();
+        let ok = snap.phase == crate::gap::PeriodicSyncPhase::Synced
+            && snap.sync_handle == Some(0x0007)
+            && snap.transfer_connection_handle.is_none();
+        reset_all();
+        if !ok {
+            return TestResult::Fail("local Create Sync did not land after racing transfer");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_periodic_adv_sync_transfer_received_flow
+    );
 
     /// #1560: failure paths fail closed — out-of-order API calls are
     /// rejected, out-of-range parameters never reach the controller,
