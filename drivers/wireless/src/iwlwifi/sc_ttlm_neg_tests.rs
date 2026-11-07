@@ -373,8 +373,8 @@ fn smoke_iwl_mld_ml_reconfiguration_request_layout() -> TestResult {
     // control 0x01a1 (link 1 + STA MAC present + DEL_LINK), STA info
     // length 7, STA MAC. No EML or MLD capa ops: nothing is added.
     let golden_del: Vec<u8> = alloc::vec![
-        37, 11, 0x5a, 255, 21, 107, 0x12, 0x00, 7, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0, 9,
-        0xa1, 0x01, 7, 0x02, 0x00, 0x00, 0x00, 0x00, 0x11,
+        37, 11, 0x5a, 255, 21, 107, 0x12, 0x00, 7, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0, 9, 0xa1,
+        0x01, 7, 0x02, 0x00, 0x00, 0x00, 0x00, 0x11,
     ];
     let Some(req) = build_ml_reconf_request(
         0x5a,
@@ -402,9 +402,9 @@ fn smoke_iwl_mld_ml_reconfiguration_request_layout() -> TestResult {
     // elements copied verbatim, and the WMM info IE
     // ([221, 7, 00:50:f2, 2, 0, 1, qos_info], util.c:4493).
     let golden_add: Vec<u8> = alloc::vec![
-        37, 11, 0x5a, 255, 42, 107, 0x72, 0x00, 11, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x33,
-        0x00, 0x20, 0x20, 0, 26, 0x32, 0x01, 24, 0x02, 0x00, 0x00, 0x00, 0x00, 0x22, 0x11, 0x00,
-        45, 4, 0x01, 0x02, 0x03, 0x04, 221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0x00,
+        37, 11, 0x5a, 255, 42, 107, 0x72, 0x00, 11, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x33, 0x00,
+        0x20, 0x20, 0, 26, 0x32, 0x01, 24, 0x02, 0x00, 0x00, 0x00, 0x00, 0x22, 0x11, 0x00, 45, 4,
+        0x01, 0x02, 0x03, 0x04, 221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0x00,
     ];
     let Some(req) = build_ml_reconf_request(
         0x5a,
@@ -571,8 +571,13 @@ fn smoke_iwl_mld_ml_reconfiguration_response() -> TestResult {
     // Baseline negotiated mapping m1 (TID 6 on link 0, the rest on
     // links {0, 1}), so the reconf tests can check map clipping.
     engine.begin_request(0x11, m1(), 0, 0);
-    if engine.handle_response(&ttlm_response(0x11, 0, &m1(), 0, 0), valid, &mut ttlm, 0, 1000)
-        != Ok(NegOutcome::Immediate)
+    if engine.handle_response(
+        &ttlm_response(0x11, 0, &m1(), 0, 0),
+        valid,
+        &mut ttlm,
+        0,
+        1000,
+    ) != Ok(NegOutcome::Immediate)
     {
         return TestResult::Fail("reconfiguration baseline negotiation failed");
     }
@@ -622,11 +627,8 @@ fn smoke_iwl_mld_ml_reconfiguration_response() -> TestResult {
 
     // A failed removal is a protocol error, and leaves state untouched.
     engine.begin_reconf(0x44, 0, 0b0001);
-    if engine.handle_reconf_response(
-        &reconf_response(0x44, &[(0, 7)], None),
-        valid,
-        &mut ttlm,
-    ) != Err(NegError::Malformed)
+    if engine.handle_reconf_response(&reconf_response(0x44, &[(0, 7)], None), valid, &mut ttlm)
+        != Err(NegError::Malformed)
     {
         return TestResult::Fail("failed ML reconfiguration removal was allowed");
     }
@@ -634,11 +636,8 @@ fn smoke_iwl_mld_ml_reconfiguration_response() -> TestResult {
     // A response for an unrequested link, a duplicate duple, a missing
     // duple, or a reserved link id is malformed.
     engine.begin_reconf(0x55, 0b1000, 0);
-    if engine.handle_reconf_response(
-        &reconf_response(0x55, &[(2, 0)], None),
-        valid,
-        &mut ttlm,
-    ) != Err(NegError::Malformed)
+    if engine.handle_reconf_response(&reconf_response(0x55, &[(2, 0)], None), valid, &mut ttlm)
+        != Err(NegError::Malformed)
     {
         return TestResult::Fail("reconfiguration accepting an unrequested link was allowed");
     }
@@ -661,11 +660,8 @@ fn smoke_iwl_mld_ml_reconfiguration_response() -> TestResult {
         return TestResult::Fail("reconfiguration missing a status duple was allowed");
     }
     engine.begin_reconf(0x55, 0b1000, 0);
-    if engine.handle_reconf_response(
-        &reconf_response(0x55, &[(15, 0)], None),
-        valid,
-        &mut ttlm,
-    ) != Err(NegError::Malformed)
+    if engine.handle_reconf_response(&reconf_response(0x55, &[(15, 0)], None), valid, &mut ttlm)
+        != Err(NegError::Malformed)
     {
         return TestResult::Fail("reconfiguration with reserved link id 15 was allowed");
     }
@@ -673,7 +669,15 @@ fn smoke_iwl_mld_ml_reconfiguration_response() -> TestResult {
     // Truncated frames: fewer bytes than the count's duples need, and
     // a group key length byte promising more bytes than follow.
     engine.begin_reconf(0x66, 0b1000, 0b0001);
-    let short = alloc::vec![PROT_EHT_CATEGORY, PROT_EHT_ML_RECONF_RESPONSE, 0x66, 2, 3, 0, 0];
+    let short = alloc::vec![
+        PROT_EHT_CATEGORY,
+        PROT_EHT_ML_RECONF_RESPONSE,
+        0x66,
+        2,
+        3,
+        0,
+        0
+    ];
     if engine.handle_reconf_response(&short, valid, &mut ttlm) != Err(NegError::Malformed) {
         return TestResult::Fail("truncated reconfiguration status duples were accepted");
     }
@@ -695,13 +699,12 @@ fn smoke_iwl_mld_ml_reconfiguration_response() -> TestResult {
 
     // Group key data absent when links were added is malformed.
     engine.begin_reconf(0x77, 0b1000, 0);
-    if engine.handle_reconf_response(
-        &reconf_response(0x77, &[(3, 0)], None),
-        valid,
-        &mut ttlm,
-    ) != Err(NegError::Malformed)
+    if engine.handle_reconf_response(&reconf_response(0x77, &[(3, 0)], None), valid, &mut ttlm)
+        != Err(NegError::Malformed)
     {
-        return TestResult::Fail("reconfiguration without group key data for added links was allowed");
+        return TestResult::Fail(
+            "reconfiguration without group key data for added links was allowed",
+        );
     }
 
     // A wrong token leaves the pending exchange untouched; the right
@@ -722,7 +725,8 @@ fn smoke_iwl_mld_ml_reconfiguration_response() -> TestResult {
     }
     let mut bad_category = reconf_response(0x88, &[(3, 0)], Some(&[]));
     bad_category[0] = 36;
-    if engine.handle_reconf_response(&bad_category, valid, &mut ttlm) != Err(NegError::WrongCategory)
+    if engine.handle_reconf_response(&bad_category, valid, &mut ttlm)
+        != Err(NegError::WrongCategory)
     {
         return TestResult::Fail("wrong-category reconfiguration response was not rejected");
     }
@@ -773,22 +777,25 @@ fn smoke_iwl_mld_ml_reconfiguration_response() -> TestResult {
     let mut engine = NegotiatedTtlm::default();
     let mut ttlm = super::super::sc_emlsr::TtlmState::default();
     engine.begin_request(0x11, m1(), 0, 0);
-    if engine.handle_response(&ttlm_response(0x11, 0, &m1(), 0, 0), valid, &mut ttlm, 0, 1000)
-        != Ok(NegOutcome::Immediate)
+    if engine.handle_response(
+        &ttlm_response(0x11, 0, &m1(), 0, 0),
+        valid,
+        &mut ttlm,
+        0,
+        1000,
+    ) != Ok(NegOutcome::Immediate)
     {
         return TestResult::Fail("map-clipping baseline negotiation failed");
     }
     engine.begin_reconf(0x22, 0, 0b0010);
-    if engine.handle_reconf_response(
-        &reconf_response(0x22, &[(1, 0)], None),
-        valid,
-        &mut ttlm,
-    ) != Ok(ReconfOutcome {
-        new_valid: 0b0101,
-        added: 0,
-        removed: 0b0010,
-        group_key_data: Vec::new(),
-    }) {
+    if engine.handle_reconf_response(&reconf_response(0x22, &[(1, 0)], None), valid, &mut ttlm)
+        != Ok(ReconfOutcome {
+            new_valid: 0b0101,
+            added: 0,
+            removed: 0b0010,
+            group_key_data: Vec::new(),
+        })
+    {
         return TestResult::Fail("map-clipping reconfiguration failed");
     }
     if engine.map() != Some([0b001; 8]) || !ttlm.negotiated || ttlm.dormant != 0b0100 {
@@ -800,22 +807,25 @@ fn smoke_iwl_mld_ml_reconfiguration_response() -> TestResult {
     let mut engine = NegotiatedTtlm::default();
     let mut ttlm = super::super::sc_emlsr::TtlmState::default();
     engine.begin_request(0x11, m2(), 100, 0);
-    if engine.handle_response(&ttlm_response(0x11, 0, &m2(), 100, 0), valid, &mut ttlm, 0, 5000)
-        != Ok(NegOutcome::Staged)
+    if engine.handle_response(
+        &ttlm_response(0x11, 0, &m2(), 100, 0),
+        valid,
+        &mut ttlm,
+        0,
+        5000,
+    ) != Ok(NegOutcome::Staged)
     {
         return TestResult::Fail("staged-map baseline negotiation failed");
     }
     engine.begin_reconf(0x22, 0, 0b0010);
-    if engine.handle_reconf_response(
-        &reconf_response(0x22, &[(1, 0)], None),
-        valid,
-        &mut ttlm,
-    ) != Ok(ReconfOutcome {
-        new_valid: 0b0101,
-        added: 0,
-        removed: 0b0010,
-        group_key_data: Vec::new(),
-    }) {
+    if engine.handle_reconf_response(&reconf_response(0x22, &[(1, 0)], None), valid, &mut ttlm)
+        != Ok(ReconfOutcome {
+            new_valid: 0b0101,
+            added: 0,
+            removed: 0b0010,
+            group_key_data: Vec::new(),
+        })
+    {
         return TestResult::Fail("staged-map reconfiguration failed");
     }
     if engine.due(5002, 0b0101).is_some() {
@@ -827,8 +837,13 @@ fn smoke_iwl_mld_ml_reconfiguration_response() -> TestResult {
     let mut engine = NegotiatedTtlm::default();
     let mut ttlm = super::super::sc_emlsr::TtlmState::default();
     engine.begin_request(0x11, m1(), 100, 0);
-    if engine.handle_response(&ttlm_response(0x11, 0, &m1(), 100, 0), valid, &mut ttlm, 0, 5000)
-        != Ok(NegOutcome::Staged)
+    if engine.handle_response(
+        &ttlm_response(0x11, 0, &m1(), 100, 0),
+        valid,
+        &mut ttlm,
+        0,
+        5000,
+    ) != Ok(NegOutcome::Staged)
     {
         return TestResult::Fail("surviving staged-map baseline negotiation failed");
     }

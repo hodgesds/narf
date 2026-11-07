@@ -659,6 +659,10 @@ impl NegotiatedTtlm {
         if frame[2] != pending.token {
             return Err(NegError::WrongToken);
         }
+        // Copy the requested masks out of the pending entry before
+        // clearing it: `requested` borrows `self.pending`, so the
+        // borrow must end before the assignment below (E0506).
+        let requested = *requested;
         // From here the exchange is terminal: a malformed acceptance
         // must not leave a stale pending entry for a retransmitted
         // response to revive.
@@ -669,7 +673,7 @@ impl NegotiatedTtlm {
         }
         let mut remaining = requested.add | requested.remove;
         let mut accepted_add = requested.add;
-        let mut accepted_remove = requested.remove;
+        let accepted_remove = requested.remove;
         let mut pos = 4;
         for _ in 0..count {
             let link_id = frame[pos] & ML_RECONF_LINK_ID_MASK;
