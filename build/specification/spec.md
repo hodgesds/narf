@@ -179,6 +179,13 @@ and CI compiler-cache integration.
   `XTASK_QEMU_LEGACY_TAP=<ifname>` explicitly selects the e1000 TAP in any
   hardware profile. TAP selection takes precedence over the corresponding
   `XTASK_QEMU_HOSTFWD` / `XTASK_QEMU_LEGACY_HOSTFWD` SLIRP configuration.
+- `XTASK_QEMU_SECOND_NIC=1` attaches a second legacy NIC of the same model as
+  the first (e1000 by default, igb under `XTASK_QEMU_IGB=1`) on its own
+  user-mode netdev `n2`, so the #795 multi-instance fixtures can probe two
+  same-family NICs at once (issue #1632). QEMU auto-assigns the second NIC a
+  distinct MAC (52:54:00:12:34:56, then counting the last octet upward).
+  Kernel-test config:
+  `XTASK_QEMU_SECOND_NIC=1 cargo xtask test --arch=x86_64 --subsystem drivers/net/e1000`.
 - `cargo xtask affected --base REF --head REF --event EVENT` computes CI jobs,
   directly changed packages, reverse-dependent packages, and kernel subsystem
   filters from Cargo metadata and Rust registration tokens. PRs use their head

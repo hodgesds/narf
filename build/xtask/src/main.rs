@@ -1904,24 +1904,23 @@ impl Arch {
                     ]);
                     args.extend(second_nvme_qemu_args());
                     let n1 = legacy_qemu_netdev(profile);
-                    // `XTASK_QEMU_IGB=1` swaps the legacy NIC model for QEMU's
-                    // `igb` (82576, 0x10C9) so the advanced-descriptor igb
-                    // driver can be exercised on the same `n1` backend. The
-                    // emulated 82576 drives the identical datapath as the i210.
-                    let legacy_nic_dev = if std::env::var("XTASK_QEMU_IGB")
-                        .map(|v| v == "1")
-                        .unwrap_or(false)
-                    {
-                        "igb,netdev=n1"
-                    } else {
-                        "e1000,netdev=n1"
-                    };
+                    // The legacy NIC model (`e1000` by default, `igb`
+                    // under `XTASK_QEMU_IGB=1` — QEMU's 82576, 0x10C9 —
+                    // so the advanced-descriptor igb driver can be
+                    // exercised on the same `n1` backend; the emulated
+                    // 82576 drives the identical datapath as the i210).
+                    // [`legacy_nic_model`] is the single source of truth:
+                    // the second NIC below always matches it.
+                    let legacy_nic_dev = format!("{},netdev=n1", legacy_nic_model());
                     args.extend_from_slice(&[
                         "-netdev".into(),
                         n1,
                         "-device".into(),
-                        legacy_nic_dev.into(),
+                        legacy_nic_dev,
                     ]);
+                    // A second NIC of the same model on its own netdev
+                    // `n2` (issue #1632); see [`second_legacy_nic_qemu_args`].
+                    args.extend(second_legacy_nic_qemu_args());
                     args.extend_from_slice(&[
                         "-drive".into(),
                         format!(
@@ -2154,24 +2153,23 @@ impl Arch {
                     ]);
                     args.extend(second_nvme_qemu_args());
                     let n1 = legacy_qemu_netdev(profile);
-                    // `XTASK_QEMU_IGB=1` swaps the legacy NIC model for QEMU's
-                    // `igb` (82576, 0x10C9) so the advanced-descriptor igb
-                    // driver can be exercised on the same `n1` backend. The
-                    // emulated 82576 drives the identical datapath as the i210.
-                    let legacy_nic_dev = if std::env::var("XTASK_QEMU_IGB")
-                        .map(|v| v == "1")
-                        .unwrap_or(false)
-                    {
-                        "igb,netdev=n1"
-                    } else {
-                        "e1000,netdev=n1"
-                    };
+                    // The legacy NIC model (`e1000` by default, `igb`
+                    // under `XTASK_QEMU_IGB=1` — QEMU's 82576, 0x10C9 —
+                    // so the advanced-descriptor igb driver can be
+                    // exercised on the same `n1` backend; the emulated
+                    // 82576 drives the identical datapath as the i210).
+                    // [`legacy_nic_model`] is the single source of truth:
+                    // the second NIC below always matches it.
+                    let legacy_nic_dev = format!("{},netdev=n1", legacy_nic_model());
                     args.extend_from_slice(&[
                         "-netdev".into(),
                         n1,
                         "-device".into(),
-                        legacy_nic_dev.into(),
+                        legacy_nic_dev,
                     ]);
+                    // A second NIC of the same model on its own netdev
+                    // `n2` (issue #1632); see [`second_legacy_nic_qemu_args`].
+                    args.extend(second_legacy_nic_qemu_args());
                 }
 
                 if virtio {
@@ -3496,6 +3494,89 @@ fn legacy_qemu_netdev_from(tap: Option<&str>, hostfwd: Option<&str>) -> String {
             Some(fwd) => format!("user,id=n1,hostfwd={fwd}"),
             None => "user,id=n1".into(),
         },
+    }
+}
+
+/// The legacy NIC model for this boot: QEMU's `igb` (82576, 0x10C9)
+/// under `XTASK_QEMU_IGB=1`, otherwise QEMU's default `e1000`
+/// (82540EM). Single source of truth for the first (`n1`) and second
+/// (`n2`) legacy NICs, so the pair is always same-family (issue
+/// #1632): a later model switch composes with the second NIC by
+/// extending this function, not by re-checking env at each call site.
+fn legacy_nic_model() -> &'static str {
+    legacy_nic_model_from(
+        std::env::var("XTASK_QEMU_IGB")
+            .map(|v| v == "1")
+            .unwrap_or(false),
+    )
+}
+
+fn legacy_nic_model_from(igb: bool) -> &'static str {
+    if igb {
+        "igb"
+    } else {
+        "e1000"
+    }
+}
+
+/// `-netdev`/`-device` args attaching a second legacy NIC of the
+/// same model as the first, on its own user-mode netdev `n2` (issue
+/// #1632). `XTASK_QEMU_SECOND_NIC=1` is the switch; empty unless
+/// set, so the default single-NIC layout is unchanged. QEMU
+/// auto-assigns each NIC a distinct MAC when none is given (first
+/// 52:54:00:12:34:56, counting the last octet upward — verified
+/// against local QEMU 8.2.2 `info network`), so the two instances
+/// probe as distinct devices with distinct MACs and the #795
+/// multi-instance fixtures can bind both. The second NIC is
+/// user-mode only: no TAP/hostfwd selection (a second tap would
+/// need a second host interface).
+fn second_legacy_nic_qemu_args() -> Vec<String> {
+    second_legacy_nic_qemu_args_from(
+        std::env::var("XTASK_QEMU_SECOND_NIC")
+            .map(|v| v == "1")
+            .unwrap_or(false),
+        legacy_nic_model(),
+    )
+}
+
+fn second_legacy_nic_qemu_args_from(enabled: bool, model: &str) -> Vec<String> {
+    if !enabled {
+        return Vec::new();
+    }
+    vec![
+        "-netdev".into(),
+        "user,id=n2".into(),
+        "-device".into(),
+        format!("{model},netdev=n2"),
+    ]
+}
+
+#[cfg(test)]
+mod second_nic_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_nic_model_defaults_to_e1000_and_igb_switch_selects_igb() {
+        assert_eq!(legacy_nic_model_from(false), "e1000");
+        assert_eq!(legacy_nic_model_from(true), "igb");
+    }
+
+    #[test]
+    fn second_nic_args_are_empty_unless_enabled() {
+        assert!(second_legacy_nic_qemu_args_from(false, "e1000").is_empty());
+        assert!(second_legacy_nic_qemu_args_from(false, "igb").is_empty());
+    }
+
+    #[test]
+    fn second_nic_args_attach_the_same_model_on_netdev_n2() {
+        assert_eq!(
+            second_legacy_nic_qemu_args_from(true, "e1000"),
+            ["-netdev", "user,id=n2", "-device", "e1000,netdev=n2"]
+        );
+        assert_eq!(
+            second_legacy_nic_qemu_args_from(true, "igb"),
+            ["-netdev", "user,id=n2", "-device", "igb,netdev=n2"]
+        );
     }
 }
 
