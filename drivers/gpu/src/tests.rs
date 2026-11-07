@@ -2561,6 +2561,216 @@ kernel_test_in!(
     smoke_dcn20_set_mode_rejects_without_fw
 );
 
+/// Words-backed AMD GPU fixture for the #948 modeset-init tests.
+/// `regs` points at `words`, so the indexed MM_INDEX/MM_DATA port
+/// reads and writes the first two words (the DATA latch). With
+/// `apu`, the GPU is a Phoenix APU (a panel exists, GC 11.0.1 from
+/// the tree's own `APU_GC_VERSIONS`); otherwise a Navi22 discrete
+/// GPU (no panel).
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+fn amd_modeset_fixture(words: &mut [u32; 16], apu: bool) -> crate::amdgpu::AmdGpu {
+    let mut gpu = crate::amdgpu_gfx_navi22::tests::gpu();
+    gpu.regs.virt = words.as_mut_ptr() as u64;
+    gpu.regs.len = (words.len() * 4) as u64;
+    gpu.fw_loaded = true;
+    if apu {
+        gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(
+            crate::amdgpu::AMD_VENDOR,
+            crate::amdgpu::PHOENIX_HAWKPOINT1,
+        )
+        .unwrap();
+        for block in gpu.ip_blocks.iter_mut() {
+            if block.hw_id == crate::amdgpu_discovery::HW_ID_GC {
+                (block.major, block.minor, block.revision) = (11, 0, 1);
+            }
+        }
+    }
+    gpu
+}
+
+/// First modeset on an APU initialises the stored backlight level
+/// and the commit path applies it via `set_backlight` (#948).
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+fn smoke_amd_modeset_first_init_applies_backlight() -> TestResult {
+    use crate::amdgpu::Mode;
+    use crate::amdgpu_backlight::{
+        for_pwrseq, BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN, BL_PWM_GRP1_REG_LOCK,
+    };
+    use crate::amdgpu_dcn::{dcn20_modeset_sequence, timing_for_mode};
+    let mut words = [0u32; 16];
+    let mut gpu = amd_modeset_fixture(&mut words, true);
+    // The modeset sequence must never touch the PWRSEQ lock
+    // register: only `set_backlight` writes it, so the final latch
+    // state below proves the commit path applied the level.
+    let timing = match timing_for_mode(1920, 1080, 60) {
+        Some(t) => t,
+        None => return TestResult::Fail("FHD@60 missing"),
+    };
+    let seq = dcn20_modeset_sequence(&timing, gpu.vram.base, 1920, 0);
+    if seq
+        .iter()
+        .any(|w| w.addr == for_pwrseq(BL_PWM_GRP1_REG_LOCK, 0))
+    {
+        return TestResult::Fail("modeset sequence writes the PWM lock register");
+    }
+    // SAFETY: fixture-owned RAM model; `set_mode` drives only the
+    // INDEX/DATA latch words.
+    let outcome = unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    };
+    if outcome.is_err() {
+        return TestResult::Fail("APU set_mode failed on the fixture");
+    }
+    if gpu.mode.is_none() {
+        return TestResult::Fail("mode not recorded");
+    }
+    // The fixture has no register file: every indexed read returns
+    // the DATA latch, which the modeset sequence leaves holding
+    // OTG_MASTER_EN (bit 31 clear), so the readback reports no
+    // live level and the first modeset falls back to full
+    // brightness. The level itself, and the apply, are what this
+    // test pins; the readback arithmetic is pinned by
+    // `smoke_percent_for_active_count_round_trip`.
+    if gpu.backlight_percent != Some(100) {
+        return TestResult::Fail("first modeset did not initialise the level");
+    }
+    // `set_backlight`'s last write is the group-lock release:
+    // INDEX holds the lock register's byte address, DATA holds the
+    // release value. Only `set_backlight` produces this pair.
+    let lock_addr = for_pwrseq(BL_PWM_GRP1_REG_LOCK, 0) * 4;
+    if words[0] != lock_addr || words[1] != BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN {
+        return TestResult::Fail("commit path did not apply via set_backlight");
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+kernel_test_in!(
+    "drivers/gpu/amdgpu/dcn",
+    smoke_amd_modeset_first_init_applies_backlight
+);
+
+/// A stored level survives a later modeset (no re-init from
+/// readback), and `set_backlight` refreshes the stored level on
+/// success, so the next modeset re-applies the level the user
+/// last set instead of the first-modeset readback (#948).
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+fn smoke_amd_modeset_preserves_stored_level() -> TestResult {
+    use crate::amdgpu::Mode;
+    use crate::amdgpu_backlight::{
+        for_pwrseq, BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN, BL_PWM_GRP1_REG_LOCK,
+    };
+    let mut words = [0u32; 16];
+    let mut gpu = amd_modeset_fixture(&mut words, true);
+    gpu.backlight_percent = Some(42);
+    // SAFETY: fixture-owned RAM model; see the test above.
+    let outcome = unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    };
+    if outcome.is_err() {
+        return TestResult::Fail("APU set_mode failed on the fixture");
+    }
+    if gpu.backlight_percent != Some(42) {
+        return TestResult::Fail("modeset re-initialised a stored level");
+    }
+    let lock_addr = for_pwrseq(BL_PWM_GRP1_REG_LOCK, 0) * 4;
+    if words[0] != lock_addr || words[1] != BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN {
+        return TestResult::Fail("commit path did not re-apply the stored level");
+    }
+    // SAFETY: a mode is programmed, so `set_backlight` may run.
+    if unsafe { gpu.set_backlight(30) }.is_err() {
+        return TestResult::Fail("set_backlight failed after a programmed mode");
+    }
+    if gpu.backlight_percent != Some(30) {
+        return TestResult::Fail("set_backlight did not refresh the stored level");
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+kernel_test_in!(
+    "drivers/gpu/amdgpu/dcn",
+    smoke_amd_modeset_preserves_stored_level
+);
+
+/// A modeset with no panel leaves the level untouched (#948):
+/// a discrete GPU programs its mode but stores nothing and never
+/// touches the PWM registers, and a modeset that fails before
+/// programming (no firmware, Navi4 refusal) stores nothing.
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+fn smoke_amd_modeset_without_panel_leaves_level_untouched() -> TestResult {
+    use crate::amdgpu::{AmdgpuError, Mode};
+    use crate::amdgpu_dcn::{OTG0_OTG_CONTROL, OTG_MASTER_EN};
+    // Discrete: mode programs, level stays unset, and the latch
+    // still holds the modeset sequence's last write
+    // (OTG_CONTROL = OTG_MASTER_EN) — `set_backlight` never ran.
+    let mut words = [0u32; 16];
+    let mut gpu = amd_modeset_fixture(&mut words, false);
+    // SAFETY: fixture-owned RAM model; see the tests above.
+    let outcome = unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    };
+    if outcome.is_err() {
+        return TestResult::Fail("discrete set_mode failed on the fixture");
+    }
+    if gpu.backlight_percent.is_some() {
+        return TestResult::Fail("discrete modeset stored a panel level");
+    }
+    if words[0] != OTG0_OTG_CONTROL || words[1] != OTG_MASTER_EN {
+        return TestResult::Fail("discrete modeset touched the PWM registers");
+    }
+    // No firmware: the modeset fails before any programming.
+    let mut words = [0u32; 16];
+    let mut gpu = amd_modeset_fixture(&mut words, true);
+    gpu.fw_loaded = false;
+    // SAFETY: `set_mode` bails before any MMIO when fw is not loaded.
+    let outcome = unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    };
+    if outcome != Err(AmdgpuError::FirmwareLoadFailed) {
+        return TestResult::Fail("pre-firmware modeset did not refuse");
+    }
+    if gpu.backlight_percent.is_some() || words != [0u32; 16] {
+        return TestResult::Fail("failed modeset stored a level or touched MMIO");
+    }
+    // Navi4: the modeset refuses before any programming.
+    let mut gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+    // SAFETY: Navi4 refuses before dereferencing the register mapping.
+    let outcome = unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    };
+    if outcome != Err(AmdgpuError::UnknownAsic) {
+        return TestResult::Fail("Navi4 modeset did not refuse");
+    }
+    if gpu.backlight_percent.is_some() {
+        return TestResult::Fail("refused modeset stored a level");
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+kernel_test_in!(
+    "drivers/gpu/amdgpu/dcn",
+    smoke_amd_modeset_without_panel_leaves_level_untouched
+);
+
 #[cfg(feature = "amdgpu")]
 fn smoke_dcn20_modeset_seq_contains_expected_offsets() -> TestResult {
     use crate::amdgpu_dcn::{

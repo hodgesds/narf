@@ -262,6 +262,7 @@ fn pcie_probe_reports_memory_and_identity() -> TestResult {
             vram,
             chip: amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, NAVI22).unwrap(),
             mode: None,
+            backlight_percent: None,
             fw_loaded: false,
             vbios: None,
             gc_info: Some(GcInfo {

@@ -811,6 +811,7 @@ impl ColdBoot {
                 .transpose()
                 .map_err(|_| Error::Allocation)?,
             mode: None,
+            backlight_percent: None,
             fw_loaded: false,
         };
         let trainer = if let Some(exchange) = exchange {
