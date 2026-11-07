@@ -18,6 +18,7 @@ pub fn header_size(cmd: u32) -> Option<usize> {
         0x05 | 0x06 => 20,
         0x04 => 12,
         0x07 | 0x08 | 0x27 | 0x28 => 8,
+        0x20 => 8,
         0x0b | 0x0c => 16,
         0x09 => 4,
         0x0e | 0x0f => 92,
@@ -49,6 +50,16 @@ pub fn request_size(header: &[u8]) -> nic::Result<usize> {
     }
     let extra = match cmd {
         0x04 => get(header, 8) as usize,
+        // GPERMADDR: the user buffer follows the 8-byte header; Linux
+        // `ethtool_get_perm_addr` fails a buffer smaller than the
+        // address with -ETOOSMALL (133).
+        0x20 => {
+            let size = get(header, 4) as usize;
+            if size < 6 {
+                return Err(133);
+            }
+            size
+        }
         0x0b | 0x0c => get(header, 12) as usize,
         0x1b => (get(header, 8) as usize).checked_mul(32).ok_or(22)?,
         0x1d => (get(header, 4) as usize).checked_mul(8).ok_or(22)?,
@@ -135,20 +146,30 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                 driver.set_nvm(magic, offset, &b[16..16 + len])?;
                 return Ok(());
             }
+            0x20 => {
+                // Linux `ethtool_get_perm_addr`: the size word is the
+                // user buffer size on entry and the address size (6)
+                // on return; `request_size` already rejected a buffer
+                // smaller than the address with -ETOOSMALL.
+                let mac = driver.permanent_mac()?;
+                put(b, 4, 6);
+                b[8..14].copy_from_slice(&mac);
+                return Ok(());
+            }
             0x2e..=0x32 => {
                 let mut rules = driver.flow_rules()?;
                 let location = get(b, 176);
                 match cmd {
                     0x2e => {
                         put(b, 184, rules.len() as u32);
-                        put64(b, 8, 32);
+                        put64(b, 8, u64::from(nic::MAX_RXNFC_RULES));
                     }
                     0x30 => {
                         let capacity = get(b, 184) as usize;
                         if capacity < rules.len() {
                             return Err(90);
                         }
-                        put64(b, 8, 32);
+                        put64(b, 8, u64::from(nic::MAX_RXNFC_RULES));
                         put(b, 184, rules.len() as u32);
                         for (i, r) in rules.iter().enumerate() {
                             put(b, 188 + i * 4, u32::from(r.location));
@@ -159,11 +180,14 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                             .iter()
                             .find(|r| u32::from(r.location) == location)
                             .ok_or(2)?;
+                        // Linux `igc_ethtool_get_nfc_rule` reports the
+                        // table size here too.
+                        put64(b, 8, u64::from(nic::MAX_RXNFC_RULES));
                         encode_rule(b, r);
                     }
                     0x32 => {
                         if get(b, 176) == u32::MAX {
-                            let location = (0..32)
+                            let location = (0..u32::from(nic::MAX_RXNFC_RULES))
                                 .find(|i| !rules.iter().any(|r| u32::from(r.location) == *i))
                                 .ok_or(28)?;
                             put(b, 176, location);
@@ -588,6 +612,20 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
     })
 }
 
+/// Linux `igc_ethtool_init_nfc_rule` + `igc_ethtool_add_nfc_rule`
+/// (igc_ethtool.c:1225-1420), against the uapi layout
+/// (`struct ethtool_rx_flow_spec`: h_u @20, h_ext @72, m_u @92,
+/// m_ext @144, ring_cookie @168, location @176).
+///
+/// Accepted masks are full-only, as in Linux: a partial MAC/ethertype
+/// mask is -EOPNOTSUPP, a VLAN TCI mask other than the priority mask
+/// (0xe000) or the full mask (0xffff) is -EOPNOTSUPP, and a VLAN
+/// EtherType mask other than full is -EOPNOTSUPP. `FLOW_MAC_EXT` is
+/// not accepted: Linux igc requires `flow_type & ~FLOW_EXT` to be
+/// exactly `ETHER_FLOW`. A rule with no match field at all and a plain
+/// `ETHER_FLOW` type is the wildcard/default-queue rule; the same
+/// empty rule with `FLOW_EXT` set is -EINVAL (Linux
+/// `igc_ethtool_check_nfc_rule`: a rule with no match).
 fn decode_rule(b: &[u8]) -> nic::Result<nic::FlowRule> {
     let flow = get(b, 16);
     if flow & !0x80000000 != 0x12 {
@@ -600,14 +638,20 @@ fn decode_rule(b: &[u8]) -> nic::Result<nic::FlowRule> {
         queue,
         ethertype: None,
         destination_mac: None,
+        source_mac: None,
         vlan_priority: None,
+        vlan_etype: None,
+        vlan_tci: None,
+        user_data: None,
+        user_mask: None,
+        default_queue: false,
     };
-    // Ethernet union starts at 20/92. Source matching, partial masks and
-    // user-defined extension data have no equivalent in IGC's hardware filters.
-    if b[98..104].iter().any(|v| *v != 0)
-        || b[106..144].iter().any(|v| *v != 0)
-        || b[144..154].iter().any(|v| *v != 0)
-        || b[156..164].iter().any(|v| *v != 0)
+    // Masks with no Linux-igc meaning: the ether_spec union tail, the
+    // flow-ext padding, and the flow-ext destination MAC (FLOW_MAC_EXT
+    // is not a Linux-igc match).
+    if b[106..144].iter().any(|v| *v != 0)
+        || b[144..146].iter().any(|v| *v != 0)
+        || b[146..152].iter().any(|v| *v != 0)
     {
         return Err(95);
     }
@@ -617,26 +661,80 @@ fn decode_rule(b: &[u8]) -> nic::Result<nic::FlowRule> {
         }
         r.destination_mac = Some(b[20..26].try_into().unwrap());
     }
+    if b[98..104].iter().any(|v| *v != 0) {
+        if b[98..104] != [255; 6] {
+            return Err(95);
+        }
+        r.source_mac = Some(b[26..32].try_into().unwrap());
+    }
     if b[104..106] != [0; 2] {
         if b[104..106] != [255; 2] {
             return Err(95);
         }
         r.ethertype = Some(u16::from_be_bytes(b[32..34].try_into().unwrap()));
     }
-    if flow & 0x80000000 != 0 && b[154..156] != [0; 2] {
-        if b[154..156] != [0xe0, 0] {
+    if flow & 0x80000000 != 0 {
+        // VLAN EtherType: Linux keys the match on a nonzero value and
+        // requires a full mask when one is given.
+        if b[152..154] != [0; 2] && b[152..154] != [255; 2] {
             return Err(95);
         }
-        r.vlan_priority = Some((u16::from_be_bytes(b[82..84].try_into().unwrap()) >> 13) as u8);
+        if b[80..82] != [0; 2] {
+            r.vlan_etype = Some(u16::from_be_bytes(b[80..82].try_into().unwrap()));
+        }
+        // VLAN TCI: Linux accepts only the priority mask (0xe000) and
+        // the full mask (0xffff). A nonzero value with a zero mask
+        // behaves as a priority match, as in Linux (the stored TCI
+        // feeds the VLAN-priority filter).
+        let tci = u16::from_be_bytes(b[82..84].try_into().unwrap());
+        match b[154..156] {
+            [0, 0] => {
+                if tci != 0 {
+                    r.vlan_priority = Some((tci >> 13) as u8);
+                }
+            }
+            [0xe0, 0] => r.vlan_priority = Some((tci >> 13) as u8),
+            [0xff, 0xff] => r.vlan_tci = Some(tci),
+            _ => return Err(95),
+        }
+        // User data: Linux sets the flag only when either data word is
+        // nonzero; the mask rides along verbatim.
+        let data: [u8; 8] = b[84..92].try_into().unwrap();
+        if data.iter().any(|v| *v != 0) {
+            r.user_data = Some(data);
+            r.user_mask = Some(b[156..164].try_into().unwrap());
+        }
+    }
+    if r.ethertype.is_none()
+        && r.destination_mac.is_none()
+        && r.source_mac.is_none()
+        && r.vlan_priority.is_none()
+        && r.vlan_etype.is_none()
+        && r.vlan_tci.is_none()
+        && r.user_data.is_none()
+    {
+        if flow == 0x12 {
+            r.default_queue = true;
+        } else {
+            return Err(22);
+        }
     }
     Ok(r)
 }
+/// Linux `igc_ethtool_get_nfc_rule` (igc_ethtool.c:963-1021): FLOW_EXT
+/// is set for VLAN EtherType, VLAN TCI (including the priority-only
+/// form) and user data; masks are written full. A default-queue rule
+/// encodes as a plain `ETHER_FLOW` with zero masks.
 fn encode_rule(b: &mut [u8], r: &nic::FlowRule) {
     b[16..184].fill(0);
     put(
         b,
         16,
-        0x12 | if r.vlan_priority.is_some() {
+        0x12 | if r.vlan_priority.is_some()
+            || r.vlan_tci.is_some()
+            || r.vlan_etype.is_some()
+            || r.user_data.is_some()
+        {
             0x80000000
         } else {
             0
@@ -648,13 +746,30 @@ fn encode_rule(b: &mut [u8], r: &nic::FlowRule) {
         b[20..26].copy_from_slice(&mac);
         b[92..98].fill(255);
     }
+    if let Some(mac) = r.source_mac {
+        b[26..32].copy_from_slice(&mac);
+        b[98..104].fill(255);
+    }
     if let Some(t) = r.ethertype {
         b[32..34].copy_from_slice(&t.to_be_bytes());
         b[104..106].fill(255);
     }
+    if let Some(t) = r.vlan_etype {
+        b[80..82].copy_from_slice(&t.to_be_bytes());
+        b[152..154].fill(255);
+    }
     if let Some(p) = r.vlan_priority {
         b[82..84].copy_from_slice(&(u16::from(p) << 13).to_be_bytes());
         b[154..156].copy_from_slice(&[0xe0, 0]);
+    }
+    if let Some(t) = r.vlan_tci {
+        b[82..84].copy_from_slice(&t.to_be_bytes());
+        b[154..156].fill(255);
+    }
+    if let Some(data) = r.user_data {
+        b[84..92].copy_from_slice(&data);
+        // No mask stored means "match all eight bytes".
+        b[156..164].copy_from_slice(&r.user_mask.unwrap_or([0xff; 8]));
     }
 }
 
@@ -1029,6 +1144,13 @@ fn handle_genl(
                             return Err(22);
                         }
                         let v = u32::from_ne_bytes(payload.try_into().map_err(|_| 22)?);
+                        // Linux `ethnl_mm_set_policy` (net/ethtool/mm.c):
+                        // NLA_POLICY_RANGE(NLA_U32, 60, 252). The driver
+                        // then rounds the surviving value up to a
+                        // supported size (see `set_preemption`).
+                        if !(60..=252).contains(&v) {
+                            return Err(22);
+                        }
                         min_frag = Some(u16::try_from(v).map_err(|_| 22)?);
                     }
                     _ => return Err(22),
