@@ -2253,8 +2253,14 @@ mod tests {
                 mtu: IrqSafeSpinLock::new(1500),
                 wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
                 link_up: true,
+                suspended: AtomicBool::new(false),
                 irq_vector: None,
                 msix: None,
+                // Fixture-owned MMIO backing is this instance's address;
+                // no second fixture shares it, so the probe-time
+                // duplicate-bind refusal can never fire here.
+                addr: narf_bus::BusAddr::Mmio(mem.phys_addr()),
+                ifname: crate::publish::IfName::new(),
                 rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
                 tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
             };
