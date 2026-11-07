@@ -5643,31 +5643,262 @@ fn smoke_fp_open_requires_rawio_cap() -> TestResult {
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_open_requires_rawio_cap);
 
-/// Modelled control-transfer device for the ioctl smoke: records
-/// the SETUP fields of every OUT transfer and answers IN transfers
-/// from a fixed byte string.
+/// Modelled fingerprint device for the ioctl, bind, data-plane,
+/// and WBDI smokes: records the SETUP fields of every OUT transfer
+/// and answers IN transfers from a fixed byte string, and — for the
+/// bind/data-plane smokes — models endpoint configuration, bulk
+/// transfers, and interrupt-IN arming/polling, logging every step
+/// of the conversation in issue order so smokes can pin that
+/// configure-endpoints precedes SET_CONFIGURATION and that the
+/// WBDI BOS fetch precedes the vendor request.
 ///
 /// `FpOutRecord` names the OUT-transfer record tuple so the
 /// `FakeFpTransport::last_out` field type stays under clippy's
 /// `type_complexity` threshold.
 type FpOutRecord = (u8, u8, u16, u16, alloc::vec::Vec<u8>);
 
+/// Scripted control-IN answer key: (bm_request_type, b_request,
+/// w_value, w_index, out_len). The out length is part of the key
+/// because the WBDI BOS fetch issues the same GET_DESCRIPTOR
+/// twice — once for the 5-byte header, once for the full blob —
+/// and the two answers differ.
+type FpCtrlKey = (u8, u8, u16, u16, usize);
+
+/// One recorded step of the modelled controller conversation,
+/// in issue order.
+#[derive(Clone, Debug)]
+enum FakeFpStep {
+    ControlIn {
+        bm: u8,
+        req: u8,
+        val: u16,
+        idx: u16,
+        len: usize,
+    },
+    ControlOut {
+        bm: u8,
+        req: u8,
+        val: u16,
+        idx: u16,
+        data: alloc::vec::Vec<u8>,
+    },
+    ConfigureEndpoints {
+        slot: u8,
+        eps: alloc::vec::Vec<crate::xhci::EndpointConfig>,
+    },
+    BulkOut {
+        slot: u8,
+        dci: u8,
+        data: alloc::vec::Vec<u8>,
+    },
+    BulkIn {
+        slot: u8,
+        dci: u8,
+        len: usize,
+    },
+    ArmInterrupt {
+        slot: u8,
+        dci: u8,
+        len: u32,
+    },
+}
+
 struct FakeFpTransport {
     in_bytes: alloc::vec::Vec<u8>,
     last_out: narf_lib::sync::IrqSafeSpinLock<Option<FpOutRecord>>,
+    /// Controller id reported by `controller_id`; the bind path
+    /// records it on the device.
+    controller: u8,
+    /// Scripted control-IN answers by [`FpCtrlKey`]. A request
+    /// with no scripted entry falls back to `in_bytes`.
+    in_script: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(FpCtrlKey, alloc::vec::Vec<u8>)>>,
+    /// Ordered conversation log.
+    steps: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<FakeFpStep>>,
+    /// Next bulk-IN response bytes (returned verbatim, truncated
+    /// to the caller's buffer; not consumed).
+    bulk_in_script: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>,
+    /// Bulk-OUT short-transfer injection: when `Some(n)`,
+    /// `bulk_out` reports `n` bytes (clamped to the data length)
+    /// instead of the full length, so `send_command`'s
+    /// full-transfer rule is exercised end to end.
+    bulk_out_short: narf_lib::sync::IrqSafeSpinLock<Option<usize>>,
+    /// Interrupt-IN scripted packet + armed flag.
+    intr_script: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>,
+    intr_armed: core::sync::atomic::AtomicBool,
+    /// Fail injection: `configure_endpoints` returns
+    /// `EndpointConfig` (models endpoint-context configuration
+    /// failing on the controller); `control_out` returns
+    /// `SetConfiguration`; `bulk_in` / `bulk_out` return
+    /// `EndpointConfig` (models the controller being gone, the
+    /// way `XhciFpTransport` fails its per-call resolution).
+    /// A failed `control_out` / bulk call records no step: it
+    /// never reaches the modelled device. A failed
+    /// `configure_endpoints` call DOES record its attempt: the
+    /// failure is the controller's answer to an attempt that
+    /// reached it, and the bind smoke pins exactly one such
+    /// attempt before the bind fails.
+    fail_configure: core::sync::atomic::AtomicBool,
+    fail_control_out: core::sync::atomic::AtomicBool,
+    fail_bulk: core::sync::atomic::AtomicBool,
+}
+
+impl FakeFpTransport {
+    fn new(controller: u8, in_bytes: alloc::vec::Vec<u8>) -> Self {
+        Self {
+            in_bytes,
+            last_out: narf_lib::sync::IrqSafeSpinLock::new(None),
+            controller,
+            in_script: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            steps: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            bulk_in_script: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            bulk_out_short: narf_lib::sync::IrqSafeSpinLock::new(None),
+            intr_script: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            intr_armed: core::sync::atomic::AtomicBool::new(false),
+            fail_configure: core::sync::atomic::AtomicBool::new(false),
+            fail_control_out: core::sync::atomic::AtomicBool::new(false),
+            fail_bulk: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Script one control-IN answer, keyed by
+    /// (bm_request_type, b_request, w_value, w_index, out_len).
+    fn script_control_in(&self, key: FpCtrlKey, bytes: alloc::vec::Vec<u8>) {
+        self.in_script.lock().push((key, bytes));
+    }
 }
 
 impl crate::fingerprint::FpTransport for FakeFpTransport {
+    fn controller_id(&self) -> u8 {
+        self.controller
+    }
+
+    fn configure_endpoints<'a>(
+        &'a self,
+        slot_id: u8,
+        endpoints: &'a [crate::xhci::EndpointConfig],
+    ) -> crate::fingerprint::FpFuture<'a, Result<(), crate::fingerprint::FpError>> {
+        use crate::fingerprint::FpError;
+        // Record the attempt even when it fails: the bind smoke
+        // pins exactly one configure attempt (slot 4, no
+        // SET_CONFIGURATION after) for the EndpointConfig defeat.
+        self.steps.lock().push(FakeFpStep::ConfigureEndpoints {
+            slot: slot_id,
+            eps: endpoints.to_vec(),
+        });
+        if self
+            .fail_configure
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return alloc::boxed::Box::pin(async move { Err(FpError::EndpointConfig) });
+        }
+        alloc::boxed::Box::pin(async move { Ok(()) })
+    }
+
+    fn bulk_in<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        buf: &'a mut [u8],
+    ) -> crate::fingerprint::FpFuture<'a, Result<usize, crate::fingerprint::FpError>> {
+        use crate::fingerprint::FpError;
+        if self.fail_bulk.load(core::sync::atomic::Ordering::Acquire) {
+            return alloc::boxed::Box::pin(async move { Err(FpError::EndpointConfig) });
+        }
+        let script = self.bulk_in_script.lock().clone();
+        let n = script.len().min(buf.len());
+        buf[..n].copy_from_slice(&script[..n]);
+        self.steps.lock().push(FakeFpStep::BulkIn {
+            slot: slot_id,
+            dci,
+            len: n,
+        });
+        alloc::boxed::Box::pin(async move { Ok(n) })
+    }
+
+    fn bulk_out<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        data: &'a [u8],
+    ) -> crate::fingerprint::FpFuture<'a, Result<usize, crate::fingerprint::FpError>> {
+        use crate::fingerprint::FpError;
+        if self.fail_bulk.load(core::sync::atomic::Ordering::Acquire) {
+            return alloc::boxed::Box::pin(async move { Err(FpError::EndpointConfig) });
+        }
+        let data_vec = data.to_vec();
+        self.steps.lock().push(FakeFpStep::BulkOut {
+            slot: slot_id,
+            dci,
+            data: data_vec.clone(),
+        });
+        let n = match *self.bulk_out_short.lock() {
+            Some(short) => short.min(data_vec.len()),
+            None => data_vec.len(),
+        };
+        alloc::boxed::Box::pin(async move { Ok(n) })
+    }
+
+    fn arm_interrupt_in(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        len: u32,
+    ) -> Result<(), crate::fingerprint::FpError> {
+        self.intr_armed
+            .store(true, core::sync::atomic::Ordering::Release);
+        self.steps.lock().push(FakeFpStep::ArmInterrupt {
+            slot: slot_id,
+            dci,
+            len,
+        });
+        Ok(())
+    }
+
+    fn poll_interrupt_in(
+        &self,
+        _slot_id: u8,
+        _dci: u8,
+        buf: &mut [u8],
+    ) -> Result<Option<usize>, crate::fingerprint::FpError> {
+        if !self.intr_armed.load(core::sync::atomic::Ordering::Acquire) {
+            return Ok(None);
+        }
+        let script = self.intr_script.lock().clone();
+        if script.is_empty() {
+            return Ok(None);
+        }
+        let n = script.len().min(buf.len());
+        buf[..n].copy_from_slice(&script[..n]);
+        Ok(Some(n))
+    }
+
     fn control_in<'a>(
         &'a self,
         _slot_id: u8,
-        _bm_request_type: u8,
-        _b_request: u8,
-        _w_value: u16,
-        _w_index: u16,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
         out: &'a mut [u8],
     ) -> crate::fingerprint::FpFuture<'a, Result<usize, crate::fingerprint::FpError>> {
-        let bytes = self.in_bytes.clone();
+        // A scripted answer for this exact SETUP + length wins;
+        // otherwise the fallback `in_bytes` answer (the ioctl
+        // smoke's shape).
+        let key = (bm_request_type, b_request, w_value, w_index, out.len());
+        let scripted = self
+            .in_script
+            .lock()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone());
+        let bytes = scripted.unwrap_or_else(|| self.in_bytes.clone());
+        self.steps.lock().push(FakeFpStep::ControlIn {
+            bm: bm_request_type,
+            req: b_request,
+            val: w_value,
+            idx: w_index,
+            len: out.len(),
+        });
         alloc::boxed::Box::pin(async move {
             let n = bytes.len().min(out.len());
             out[..n].copy_from_slice(&bytes[..n]);
@@ -5684,10 +5915,26 @@ impl crate::fingerprint::FpTransport for FakeFpTransport {
         w_index: u16,
         data: &'a [u8],
     ) -> crate::fingerprint::FpFuture<'a, Result<usize, crate::fingerprint::FpError>> {
+        use crate::fingerprint::FpError;
+        if self
+            .fail_control_out
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return alloc::boxed::Box::pin(async move { Err(FpError::SetConfiguration) });
+        }
         let data = data.to_vec();
+        let n = data.len();
         let mut g = self.last_out.lock();
         *g = Some((bm_request_type, b_request, w_value, w_index, data.clone()));
-        alloc::boxed::Box::pin(async move { Ok(data.len()) })
+        drop(g);
+        self.steps.lock().push(FakeFpStep::ControlOut {
+            bm: bm_request_type,
+            req: b_request,
+            val: w_value,
+            idx: w_index,
+            data,
+        });
+        alloc::boxed::Box::pin(async move { Ok(n) })
     }
 }
 
@@ -5752,9 +5999,9 @@ fn fp_ctrl_arg(bm: u8, req: u8, val: u16, idx: u16, len: u32, ptr: u64) -> [u8; 
 /// the transport with its SETUP fields intact, an IN vendor
 /// request copies the response back and writes back the actual
 /// length, and malformed requests never reach the transport.
-/// The data plane is untouched by this change (diff proof); the
-/// read step below only pins that the read path still resolves
-/// through the controller and fails without a device.
+/// The read step below pins that the data plane — which now runs
+/// over the same transport — still fails when the transport
+/// reports the controller gone.
 fn smoke_fp_ctrl_transfer_ioctl() -> TestResult {
     use crate::fingerprint::{
         FpVendor, __reset_fp_for_test, __test_fp_node, __test_register_device, FP_DEVICES,
@@ -5770,10 +6017,7 @@ fn smoke_fp_ctrl_transfer_ioctl() -> TestResult {
             return TestResult::Fail("test device should be in the registry");
         }
     };
-    let transport = alloc::sync::Arc::new(FakeFpTransport {
-        in_bytes: alloc::vec![0xAA, 0xBB],
-        last_out: narf_lib::sync::IrqSafeSpinLock::new(None),
-    });
+    let transport = alloc::sync::Arc::new(FakeFpTransport::new(0, alloc::vec![0xAA, 0xBB]));
     let node = __test_fp_node(dev, transport.clone());
     let ctx = MemCtx::new();
     let mut fail: Option<&str> = None;
@@ -5865,9 +6109,15 @@ fn smoke_fp_ctrl_transfer_ioctl() -> TestResult {
             fail = Some("GET_INFO packing mismatch");
         }
     }
-    // Data plane intact: a read still resolves through the
-    // controller and fails without a bound device on this slot.
+    // Data plane intact: a read fails when the transport reports
+    // the controller gone — the `fail_bulk` injection stands in
+    // for `XhciFpTransport`'s per-call controller resolution
+    // failing on an unbound controller, as the host unit test
+    // pins for the production transport.
     if fail.is_none() {
+        transport
+            .fail_bulk
+            .store(true, core::sync::atomic::Ordering::Release);
         let mut buf = [0u8; 64];
         let r = narf_scheduler::block_on(node.read(0, &mut buf));
         if r.is_ok() {
@@ -5881,6 +6131,611 @@ fn smoke_fp_ctrl_transfer_ioctl() -> TestResult {
     }
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_ctrl_transfer_ioctl);
+
+/// Vendor-class config blob with a bulk-IN 0x81 / bulk-OUT 0x01
+/// pair (the Goodix/Synaptics/Validity bind shape), shared by
+/// the fake-controller bind, data-plane, and WBDI smokes so the
+/// blob is built once, not re-typed per smoke.
+fn fp_cfg_bulk_pair() -> alloc::vec::Vec<u8> {
+    // Config (9) + Interface (9) + bulk-IN (7) + bulk-OUT (7) = 32.
+    let mut v = alloc::vec![0u8; 32];
+    v[0] = 9;
+    v[1] = 0x02;
+    v[2] = 32;
+    v[4] = 1;
+    v[5] = 1;
+    v[9] = 9;
+    v[10] = 0x04;
+    v[11] = 0;
+    v[13] = 2;
+    v[14] = 0xFF;
+    // bulk-IN @ ep 0x81, wMaxPacketSize 512.
+    v[18] = 7;
+    v[19] = 0x05;
+    v[20] = 0x81;
+    v[21] = 0x02;
+    v[22] = 0x00;
+    v[23] = 0x02;
+    // bulk-OUT @ ep 0x01, wMaxPacketSize 512.
+    v[25] = 7;
+    v[26] = 0x05;
+    v[27] = 0x01;
+    v[28] = 0x02;
+    v[29] = 0x00;
+    v[30] = 0x02;
+    v
+}
+
+/// Vendor-class config blob with only an interrupt-IN 0x81
+/// endpoint (the ELAN bind shape).
+fn fp_cfg_intr_only() -> alloc::vec::Vec<u8> {
+    // Config (9) + Interface (9) + interrupt-IN (7) = 25.
+    let mut v = alloc::vec![0u8; 25];
+    v[0] = 9;
+    v[1] = 0x02;
+    v[2] = 25;
+    v[4] = 1;
+    v[5] = 1;
+    v[9] = 9;
+    v[10] = 0x04;
+    v[11] = 0;
+    v[13] = 1;
+    v[14] = 0xFF;
+    // interrupt-IN @ ep 0x81, wMaxPacketSize 64.
+    v[18] = 7;
+    v[19] = 0x05;
+    v[20] = 0x81;
+    v[21] = 0x03;
+    v[22] = 0x40;
+    v[23] = 0x00;
+    v
+}
+
+/// Fake-controller bind (#923): the production
+/// `try_bind_fingerprint_already_addressed` runs end to end
+/// against a modelled device — configure-endpoints, then
+/// SET_CONFIGURATION, then registry publication — for a bulk
+/// reader (Goodix) and an interrupt-only reader (ELAN), with
+/// the failure classes pinned: unknown VID/PID, missing
+/// endpoints, endpoint-configuration failure, and
+/// SET_CONFIGURATION failure all register nothing.
+fn smoke_fp_bind_fake_controller() -> TestResult {
+    use crate::fingerprint::{
+        __reset_fp_for_test, attached_fp_count, enumerate_fp, lookup_fp,
+        try_bind_fingerprint_already_addressed, with_device, FpError, FpVendor,
+    };
+    use crate::xhci::EndpointKind;
+    __reset_fp_for_test();
+    let fake = alloc::sync::Arc::new(FakeFpTransport::new(5, alloc::vec![]));
+    let cfg = fp_cfg_bulk_pair();
+    let cfg_intr = fp_cfg_intr_only();
+    let mut fail: Option<&str> = None;
+    // Goodix bulk bind: configure-endpoints (bulk pair) then
+    // SET_CONFIGURATION, in that order.
+    if fail.is_none() {
+        let r = narf_scheduler::block_on(try_bind_fingerprint_already_addressed(
+            &*fake, 2, 0x27C6, 0x5110, &cfg,
+        ));
+        if r != Ok(()) {
+            fail = Some("Goodix bind against the fake controller must succeed");
+        }
+    }
+    if fail.is_none() && attached_fp_count() != 1 {
+        fail = Some("Goodix bind must register exactly one reader");
+    }
+    if fail.is_none() {
+        let seen = with_device(0, |d| {
+            (
+                d.vendor,
+                d.slot_id,
+                d.bulk_in_ep,
+                d.bulk_out_ep,
+                d.controller,
+            )
+        });
+        if seen != Some((FpVendor::Goodix, 2, 3, 2, 5)) {
+            fail = Some("bound Goodix record must carry slot 2, DCIs 3/2, controller 5");
+        }
+    }
+    if fail.is_none() {
+        let steps = fake.steps.lock().clone();
+        match &steps[..] {
+            [FakeFpStep::ConfigureEndpoints { slot, eps }, FakeFpStep::ControlOut {
+                bm,
+                req,
+                val,
+                idx,
+                data,
+            }] if *slot == 2
+                && eps.len() == 2
+                && eps[0].ep_addr == 0x81
+                && eps[0].kind == EndpointKind::BulkIn
+                && eps[1].ep_addr == 0x01
+                && eps[1].kind == EndpointKind::BulkOut
+                && *bm == 0x00
+                && *req == 0x09
+                && *val == 1
+                && *idx == 0
+                && data.is_empty() => {}
+            _ => {
+                fail = Some("Goodix bind must issue configure-endpoints then SET_CONFIGURATION(1)");
+            }
+        }
+    }
+    // The bound reader publishes as /dev/fp0.
+    if fail.is_none() && lookup_fp("fp0").is_none() {
+        fail = Some("fp0 must resolve after the Goodix bind");
+    }
+    if fail.is_none() && enumerate_fp().len() != 1 {
+        fail = Some("enumerate must list exactly fp0 after the Goodix bind");
+    }
+    // ELAN interrupt-only bind lands as fp1 with no bulk-OUT.
+    if fail.is_none() {
+        let r = narf_scheduler::block_on(try_bind_fingerprint_already_addressed(
+            &*fake, 3, 0x04F3, 0x0903, &cfg_intr,
+        ));
+        if r != Ok(()) {
+            fail = Some("ELAN bind against the fake controller must succeed");
+        }
+    }
+    if fail.is_none() && attached_fp_count() != 2 {
+        fail = Some("ELAN bind must register a second reader");
+    }
+    if fail.is_none() {
+        let seen = with_device(1, |d| (d.vendor, d.slot_id, d.bulk_in_ep, d.bulk_out_ep));
+        if seen != Some((FpVendor::Elan, 3, 3, 0)) {
+            fail = Some("bound ELAN record must carry slot 3, IN DCI 3, no bulk-OUT");
+        }
+    }
+    if fail.is_none() && lookup_fp("fp1").is_none() {
+        fail = Some("fp1 must resolve after the ELAN bind");
+    }
+    if fail.is_none() {
+        let steps = fake.steps.lock().clone();
+        match &steps[2..] {
+            [FakeFpStep::ConfigureEndpoints { slot, eps }, FakeFpStep::ControlOut {
+                bm,
+                req,
+                val,
+                idx,
+                data,
+            }] if *slot == 3
+                && eps.len() == 1
+                && eps[0].ep_addr == 0x81
+                && eps[0].kind == EndpointKind::InterruptIn
+                && *bm == 0x00
+                && *req == 0x09
+                && *val == 1
+                && *idx == 0
+                && data.is_empty() => {}
+            _ => {
+                fail = Some(
+                    "ELAN bind must issue configure-endpoints (interrupt-IN) then SET_CONFIGURATION(1)",
+                );
+            }
+        }
+    }
+    // Defeats: unknown VID/PID and missing endpoints fail with
+    // their class and touch neither the controller nor the registry.
+    if fail.is_none() {
+        let steps_before = fake.steps.lock().len();
+        let r = narf_scheduler::block_on(try_bind_fingerprint_already_addressed(
+            &*fake, 4, 0x1234, 0x5678, &cfg,
+        ));
+        if r != Err(FpError::NotFingerprint) {
+            fail = Some("unknown VID/PID must fail NotFingerprint");
+        } else if attached_fp_count() != 2 || fake.steps.lock().len() != steps_before {
+            fail = Some("unknown VID/PID must not touch the controller or registry");
+        }
+    }
+    if fail.is_none() {
+        let steps_before = fake.steps.lock().len();
+        let r = narf_scheduler::block_on(try_bind_fingerprint_already_addressed(
+            &*fake, 4, 0x27C6, 0x5110, &cfg_intr,
+        ));
+        if r != Err(FpError::EndpointsMissing) {
+            fail = Some("Goodix without a bulk pair must fail EndpointsMissing");
+        } else if attached_fp_count() != 2 || fake.steps.lock().len() != steps_before {
+            fail = Some("missing endpoints must not touch the controller or registry");
+        }
+    }
+    // Endpoint-configuration failure: configure is attempted
+    // (one step) and the bind fails before SET_CONFIGURATION.
+    if fail.is_none() {
+        fake.fail_configure
+            .store(true, core::sync::atomic::Ordering::Release);
+        let steps_before = fake.steps.lock().len();
+        let r = narf_scheduler::block_on(try_bind_fingerprint_already_addressed(
+            &*fake, 4, 0x27C6, 0x5110, &cfg,
+        ));
+        fake.fail_configure
+            .store(false, core::sync::atomic::Ordering::Release);
+        if r != Err(FpError::EndpointConfig) {
+            fail = Some("configure failure must fail EndpointConfig");
+        } else if attached_fp_count() != 2 {
+            fail = Some("configure failure must register nothing");
+        } else if fake.steps.lock().len() != steps_before + 1 {
+            fail = Some("configure failure must follow exactly one configure attempt");
+        } else {
+            match &fake.steps.lock()[steps_before] {
+                FakeFpStep::ConfigureEndpoints { slot, .. } if *slot == 4 => {}
+                _ => {
+                    fail = Some("the configure attempt must target slot 4");
+                }
+            }
+        }
+    }
+    // SET_CONFIGURATION failure: configure succeeds (one step)
+    // and the bind fails without registering.
+    if fail.is_none() {
+        fake.fail_control_out
+            .store(true, core::sync::atomic::Ordering::Release);
+        let steps_before = fake.steps.lock().len();
+        let r = narf_scheduler::block_on(try_bind_fingerprint_already_addressed(
+            &*fake, 4, 0x27C6, 0x5110, &cfg,
+        ));
+        fake.fail_control_out
+            .store(false, core::sync::atomic::Ordering::Release);
+        if r != Err(FpError::SetConfiguration) {
+            fail = Some("SET_CONFIGURATION failure must fail SetConfiguration");
+        } else if attached_fp_count() != 2 {
+            fail = Some("SET_CONFIGURATION failure must register nothing");
+        } else if fake.steps.lock().len() != steps_before + 1 {
+            fail = Some("SET_CONFIGURATION failure must follow exactly one configure");
+        } else {
+            match &fake.steps.lock()[steps_before] {
+                FakeFpStep::ConfigureEndpoints { slot, .. } if *slot == 4 => {}
+                _ => {
+                    fail = Some("the configure attempt must target slot 4");
+                }
+            }
+        }
+    }
+    __reset_fp_for_test();
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_bind_fake_controller);
+
+/// `FpFileNode` read/write through devfs (#923): a Goodix reader
+/// bound against the fake controller publishes as `/dev/fp0`;
+/// the devfs-returned node writes a vendor command to bulk-OUT
+/// (recorded by the model) and reads a scripted bulk-IN response,
+/// and a short bulk-OUT fails the write. An ELAN reader's first
+/// read arms its interrupt-IN endpoint and returns the scripted
+/// packet.
+fn smoke_fp_node_read_write_via_devfs() -> TestResult {
+    use crate::fingerprint::{
+        __reset_fp_for_test, __test_set_fp_transport, lookup_fp,
+        try_bind_fingerprint_already_addressed, with_device,
+    };
+    __reset_fp_for_test();
+    let fake = alloc::sync::Arc::new(FakeFpTransport::new(5, alloc::vec![]));
+    let cfg = fp_cfg_bulk_pair();
+    let cfg_intr = fp_cfg_intr_only();
+    let mut fail: Option<&str> = None;
+    // Bind the Goodix reader against the fake controller.
+    if fail.is_none() {
+        let r = narf_scheduler::block_on(try_bind_fingerprint_already_addressed(
+            &*fake, 2, 0x27C6, 0x5110, &cfg,
+        ));
+        if r != Ok(()) {
+            fail = Some("Goodix bind must succeed for the node smoke");
+        }
+    }
+    // The devfs-returned node talks through the fake transport.
+    if fail.is_none() {
+        __test_set_fp_transport(Some(fake.clone()));
+        if let Some(node) = lookup_fp("fp0") {
+            // Write: the command bytes reach bulk-OUT DCI 2.
+            let r = narf_scheduler::block_on(node.write(0, b"\xA5\x5A\x01"));
+            if r != Ok(3) {
+                fail = Some("node write must report 3 bytes");
+            }
+            if fail.is_none() {
+                let steps = fake.steps.lock().clone();
+                match steps.last() {
+                    Some(FakeFpStep::BulkOut { slot, dci, data })
+                        if *slot == 2 && *dci == 2 && data.as_slice() == [0xA5, 0x5A, 0x01] => {}
+                    _ => {
+                        fail = Some("node write must reach bulk-OUT DCI 2 with the command bytes");
+                    }
+                }
+            }
+            // Read: the scripted bulk-IN response comes back.
+            if fail.is_none() {
+                *fake.bulk_in_script.lock() = alloc::vec![0x10, 0x20, 0x30, 0x40];
+                let mut buf = [0u8; 64];
+                let r = narf_scheduler::block_on(node.read(0, &mut buf));
+                if r != Ok(4) {
+                    fail = Some("node read must report 4 bytes");
+                } else if buf[..4] != [0x10, 0x20, 0x30, 0x40] {
+                    fail = Some("node read must return the scripted response bytes");
+                }
+                if fail.is_none() {
+                    // The read must have reached bulk-IN on slot 2,
+                    // DCI 3 (ep 0x81), returning all 4 scripted bytes.
+                    match fake.steps.lock().last() {
+                        Some(FakeFpStep::BulkIn { slot, dci, len })
+                            if *slot == 2 && *dci == 3 && *len == 4 => {}
+                        _ => {
+                            fail = Some("node read must reach bulk-IN slot 2 DCI 3 with 4 bytes");
+                        }
+                    }
+                }
+            }
+            // Short bulk-OUT fails the write (full-transfer rule).
+            if fail.is_none() {
+                *fake.bulk_out_short.lock() = Some(1);
+                let r = narf_scheduler::block_on(node.write(0, b"\xA5\x5A\x01"));
+                *fake.bulk_out_short.lock() = None;
+                if r.is_ok() {
+                    fail = Some("short bulk-OUT must fail the write");
+                }
+            }
+        } else {
+            fail = Some("fp0 must resolve after the bind");
+        }
+    }
+    // ELAN: the first read arms interrupt-IN and returns the packet.
+    if fail.is_none() {
+        let r = narf_scheduler::block_on(try_bind_fingerprint_already_addressed(
+            &*fake, 3, 0x04F3, 0x0903, &cfg_intr,
+        ));
+        if r != Ok(()) {
+            fail = Some("ELAN bind must succeed for the node smoke");
+        }
+    }
+    if fail.is_none() {
+        *fake.intr_script.lock() = alloc::vec![0x77, 0x88];
+        if let Some(node) = lookup_fp("fp1") {
+            let mut buf = [0u8; 64];
+            let r = narf_scheduler::block_on(node.read(0, &mut buf));
+            if r != Ok(2) {
+                fail = Some("ELAN node read must report 2 bytes");
+            } else if buf[..2] != [0x77, 0x88] {
+                fail = Some("ELAN node read must return the scripted packet");
+            }
+            if fail.is_none() {
+                let armed = with_device(1, |d| d.is_armed());
+                if armed != Some(true) {
+                    fail = Some("ELAN read must arm the interrupt-IN endpoint");
+                }
+            }
+            if fail.is_none() {
+                // The first ELAN read must arm interrupt-IN on slot 3,
+                // DCI 3 (ep 0x81), for the 64-byte max packet.
+                match fake.steps.lock().last() {
+                    Some(FakeFpStep::ArmInterrupt { slot, dci, len })
+                        if *slot == 3 && *dci == 3 && *len == 64 => {}
+                    _ => {
+                        fail = Some("ELAN read must arm interrupt-IN slot 3 DCI 3 for 64 bytes");
+                    }
+                }
+            }
+        } else {
+            fail = Some("fp1 must resolve after the ELAN bind");
+        }
+    }
+    // Cleanup: restore production transport resolution and empty
+    // the registry (a leftover entry breaks the no-reader-on-QEMU
+    // smoke).
+    __test_set_fp_transport(None);
+    __reset_fp_for_test();
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!(
+    "drivers/usb/fingerprint",
+    smoke_fp_node_read_write_via_devfs
+);
+
+/// End-to-end WBDI (#923): BOS fetch → vendor request → registry
+/// entry, all against the modelled device. The fake answers
+/// GET_DESCRIPTOR(BOS) (header, then the full blob carrying the
+/// MS OS 2.0 platform cap) and the MS OS 2.0 vendor request with
+/// a WINUSB/WBDI descriptor set; the recogniser + bridge then
+/// bind the reader, it publishes as `/dev/fp0`, and the
+/// devfs-returned node drives bulk transfers. A plain-WinUSB set
+/// is recognised as not-WBDI and registers nothing.
+fn smoke_fp_wbdi_e2e_fake_controller() -> TestResult {
+    use crate::fingerprint::{
+        __reset_fp_for_test, __test_set_fp_transport, attached_fp_count, lookup_fp,
+        try_bridge_wbdi_already_addressed, with_device, FpVendor,
+    };
+    use crate::wbdi::try_bind_wbdi_already_addressed;
+    use crate::xhci::EndpointKind;
+    __reset_fp_for_test();
+    let mut fail: Option<&str> = None;
+    // MS OS 2.0 §3.4 Table 4 layout, same bytes the BOS smoke
+    // pins: 28-byte Platform Capability with the MS UUID,
+    // dwWindowsVersion 0x06030000, total-set length 30,
+    // vendor code 0x42.
+    const MS_UUID: [u8; 16] = [
+        0xDF, 0x60, 0xDD, 0xD8, 0x89, 0x45, 0xC7, 0x4C, 0x9C, 0xD2, 0x65, 0x9D, 0x9E, 0x64, 0x8A,
+        0x9F,
+    ];
+    let bos_total: u16 = 33;
+    let mut bos_header = [0u8; 5];
+    bos_header[0] = 5;
+    bos_header[1] = 0x0F;
+    bos_header[2..4].copy_from_slice(&bos_total.to_le_bytes());
+    bos_header[4] = 1;
+    let mut bos_blob = alloc::vec![0u8; 33];
+    bos_blob[0..5].copy_from_slice(&bos_header);
+    bos_blob[5] = 28;
+    bos_blob[6] = 0x10;
+    bos_blob[7] = 0x05;
+    bos_blob[9..25].copy_from_slice(&MS_UUID);
+    bos_blob[25..29].copy_from_slice(&0x06030000u32.to_le_bytes());
+    bos_blob[29..31].copy_from_slice(&30u16.to_le_bytes());
+    bos_blob[31] = 0x42;
+    // MS OS 2.0 descriptor set: 10-byte header + 20-byte
+    // Compatible-ID feature, WINUSB / WBDI.
+    let mut set = alloc::vec![0u8; 30];
+    set[0..2].copy_from_slice(&10u16.to_le_bytes());
+    set[2..4].copy_from_slice(&0u16.to_le_bytes());
+    set[4..8].copy_from_slice(&0x06030000u32.to_le_bytes());
+    set[8..10].copy_from_slice(&30u16.to_le_bytes());
+    set[10..12].copy_from_slice(&20u16.to_le_bytes());
+    set[12..14].copy_from_slice(&3u16.to_le_bytes());
+    set[14..22].copy_from_slice(b"WINUSB\0\0");
+    set[22..30].copy_from_slice(b"WBDI\0\0\0\0");
+
+    let fake = alloc::sync::Arc::new(FakeFpTransport::new(5, alloc::vec![]));
+    fake.script_control_in((0x80, 6, 0x0F00, 0, 5), bos_header.to_vec());
+    fake.script_control_in((0x80, 6, 0x0F00, 0, 33), bos_blob.clone());
+    fake.script_control_in((0xC0, 0x42, 0, 0x07, 30), set);
+    *fake.bulk_in_script.lock() = alloc::vec![0xDE, 0xAD];
+    let cfg = fp_cfg_bulk_pair();
+    // Recognition: BOS fetch (header + blob) then the vendor
+    // request, returning the vendor interface.
+    if fail.is_none() {
+        let entry = narf_scheduler::block_on(try_bind_wbdi_already_addressed(&*fake, 4, &cfg));
+        match entry {
+            Ok(e) if e.vendor_iface == 0 => {}
+            Ok(_) => fail = Some("WBDI recognition must report vendor interface 0"),
+            Err(_) => {
+                fail = Some("WBDI recognition must succeed against the modelled device");
+            }
+        }
+    }
+    // Bridge: configure-endpoints + SET_CONFIGURATION, then a
+    // registry entry.
+    if fail.is_none() {
+        let idx = narf_scheduler::block_on(try_bridge_wbdi_already_addressed(&*fake, 4, &cfg));
+        if idx != Ok(0) {
+            fail = Some("WBDI bridge must register the reader at index 0");
+        }
+    }
+    if fail.is_none() && attached_fp_count() != 1 {
+        fail = Some("WBDI bridge must register exactly one reader");
+    }
+    if fail.is_none() {
+        let seen = with_device(0, |d| (d.vendor, d.slot_id, d.bulk_in_ep, d.bulk_out_ep));
+        if seen != Some((FpVendor::Wbdi, 4, 3, 2)) {
+            fail = Some("bridged WBDI record must carry slot 4, DCIs 3/2");
+        }
+    }
+    // The whole conversation, in order: BOS header, BOS blob,
+    // vendor request, configure-endpoints, SET_CONFIGURATION.
+    if fail.is_none() {
+        let steps = fake.steps.lock().clone();
+        match &steps[..] {
+            [FakeFpStep::ControlIn {
+                bm: bm0,
+                req: req0,
+                val: val0,
+                idx: idx0,
+                len: len0,
+            }, FakeFpStep::ControlIn {
+                bm: bm1,
+                req: req1,
+                val: val1,
+                idx: idx1,
+                len: len1,
+            }, FakeFpStep::ControlIn {
+                bm: bm2,
+                req: req2,
+                val: val2,
+                idx: idx2,
+                len: len2,
+            }, FakeFpStep::ConfigureEndpoints { slot, eps }, FakeFpStep::ControlOut {
+                bm,
+                req,
+                val,
+                idx,
+                data,
+            }] if *bm0 == 0x80
+                && *req0 == 6
+                && *val0 == 0x0F00
+                && *idx0 == 0
+                && *len0 == 5
+                && *bm1 == 0x80
+                && *req1 == 6
+                && *val1 == 0x0F00
+                && *idx1 == 0
+                && *len1 == 33
+                && *bm2 == 0xC0
+                && *req2 == 0x42
+                && *val2 == 0
+                && *idx2 == 0x07
+                && *len2 == 30
+                && *slot == 4
+                && eps.len() == 2
+                && eps[0].ep_addr == 0x81
+                && eps[0].kind == EndpointKind::BulkIn
+                && eps[1].ep_addr == 0x01
+                && eps[1].kind == EndpointKind::BulkOut
+                && *bm == 0x00
+                && *req == 0x09
+                && *val == 1
+                && *idx == 0
+                && data.is_empty() => {}
+            _ => {
+                fail = Some(
+                    "WBDI conversation must be BOS fetch, vendor request, configure, SET_CONFIGURATION",
+                );
+            }
+        }
+    }
+    // The bridged reader publishes as /dev/fp0 and its node
+    // drives bulk transfers through the fake.
+    if fail.is_none() {
+        __test_set_fp_transport(Some(fake.clone()));
+        if let Some(node) = lookup_fp("fp0") {
+            let r = narf_scheduler::block_on(node.write(0, &[0x01, 0x02]));
+            if r != Ok(2) {
+                fail = Some("bridged fp0 write must report 2 bytes");
+            }
+            if fail.is_none() {
+                let mut buf = [0u8; 64];
+                let r = narf_scheduler::block_on(node.read(0, &mut buf));
+                if r != Ok(2) {
+                    fail = Some("bridged fp0 read must report 2 bytes");
+                } else if buf[..2] != [0xDE, 0xAD] {
+                    fail = Some("bridged fp0 read must return the scripted bytes");
+                }
+            }
+        } else {
+            fail = Some("fp0 must resolve after the WBDI bridge");
+        }
+    }
+    // Defeat: a plain-WinUSB set (no WBDI sub-ID) is recognised
+    // as not-WBDI and registers nothing.
+    if fail.is_none() {
+        let mut plain_set = alloc::vec![0u8; 30];
+        plain_set[0..2].copy_from_slice(&10u16.to_le_bytes());
+        plain_set[2..4].copy_from_slice(&0u16.to_le_bytes());
+        plain_set[4..8].copy_from_slice(&0x06030000u32.to_le_bytes());
+        plain_set[8..10].copy_from_slice(&30u16.to_le_bytes());
+        plain_set[10..12].copy_from_slice(&20u16.to_le_bytes());
+        plain_set[12..14].copy_from_slice(&3u16.to_le_bytes());
+        plain_set[14..22].copy_from_slice(b"WINUSB\0\0");
+        plain_set[22..30].copy_from_slice(b"OTHER\0\0\0");
+        let fake2 = alloc::sync::Arc::new(FakeFpTransport::new(5, alloc::vec![]));
+        fake2.script_control_in((0x80, 6, 0x0F00, 0, 5), bos_header.to_vec());
+        fake2.script_control_in((0x80, 6, 0x0F00, 0, 33), bos_blob);
+        fake2.script_control_in((0xC0, 0x42, 0, 0x07, 30), plain_set);
+        let r = narf_scheduler::block_on(try_bind_wbdi_already_addressed(&*fake2, 6, &cfg));
+        if r.is_ok() {
+            fail = Some("plain-WinUSB set must not be recognised as WBDI");
+        } else if attached_fp_count() != 1 {
+            fail = Some("failed WBDI recognition must register nothing");
+        }
+    }
+    __test_set_fp_transport(None);
+    __reset_fp_for_test();
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_wbdi_e2e_fake_controller);
 #[cfg(feature = "kernel-test")]
 kernel_test_in!(
     "drivers/usb/fingerprint",
