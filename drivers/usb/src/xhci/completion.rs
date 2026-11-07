@@ -64,15 +64,28 @@ struct Command {
     slot: u8,
     completion: Latch,
 }
-/// At most one retained receipt per physical command-ring entry. A dropped
-/// waiter leaves its receipt reserved; new commands cannot overwrite it.
+/// At most one retained receipt per physical command-ring entry.
+/// A waiter that times out retires its own receipt (#884):
+/// `retire_pointer` drops the reservation and records the TRB
+/// pointer as retired, so a Command Completion Event that arrives
+/// late for it is swallowed by `record` instead of landing in the
+/// lossy command-event queue, where it could be misattributed to
+/// the next command recycled onto the same ring entry.
+/// Re-reserving the entry clears the tombstone — a later CCE
+/// naming the pointer then belongs to the new command. Residual
+/// race, inherent to the xHCI event format: a CCE carries no
+/// sequence number, so one that arrives after re-reserve but
+/// before the new command completes is indistinguishable from the
+/// new command's own CCE.
 pub(super) struct Commands {
     pending: Vec<Option<Command>>,
+    retired: Vec<u64>,
 }
 impl Commands {
     pub fn new(entries: usize) -> Self {
         Self {
             pending: core::iter::repeat_with(|| None).take(entries).collect(),
+            retired: Vec::new(),
         }
     }
     pub fn active(&self) -> bool {
@@ -88,6 +101,10 @@ impl Commands {
         for value in self.pending.iter_mut() {
             *value = None;
         }
+        // Ring pointers repeat after the reset cursors restart at
+        // zero: a stale tombstone would swallow the recycled
+        // entry's own completion, so recovery drops them too.
+        self.retired.clear();
     }
     pub fn reserve(&mut self, entry: usize, pointer: u64, slot: u8) -> Result<(), Conflict> {
         let value = self.pending.get_mut(entry).ok_or(Conflict)?;
@@ -99,9 +116,41 @@ impl Commands {
             slot,
             completion: Latch::new(),
         });
+        // The entry is live again: a later CCE naming this pointer
+        // belongs to the new command, not the retired one.
+        self.retired.retain(|retired| *retired != pointer);
         Ok(())
     }
+    /// Retire the receipt for a command whose waiter timed out
+    /// (#884) and remember its TRB pointer so a late CCE for it
+    /// is swallowed by `record`. Returns whether a receipt was
+    /// dropped; false when the pointer was already consumed or
+    /// never reserved. Pointers are unique per ring entry, so at
+    /// most one receipt matches.
+    pub fn retire_pointer(&mut self, pointer: u64) -> bool {
+        for value in self.pending.iter_mut() {
+            if value
+                .as_ref()
+                .is_some_and(|command| command.pointer == pointer)
+            {
+                *value = None;
+                if !self.retired.contains(&pointer) {
+                    self.retired.push(pointer);
+                }
+                return true;
+            }
+        }
+        false
+    }
     pub fn record(&mut self, event: Event) -> bool {
+        // A CCE for a retired pointer arrived after its waiter
+        // gave up: swallow it here so the demux does not queue it,
+        // where it could be misattributed to the next command
+        // recycled onto the same ring entry.
+        let origin = u64::from(event[0]) | u64::from(event[1]) << 32;
+        if self.retired.contains(&(origin & !15)) {
+            return true;
+        }
         for command in self.pending.iter_mut().flatten() {
             if super::event_wait::command_pointer_matches(&event, command.pointer)
                 && (command.slot == 0 || event[3] >> 24 == u32::from(command.slot))
