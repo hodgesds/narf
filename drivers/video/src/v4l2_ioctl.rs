@@ -19,7 +19,14 @@
 //!   capture-pump start — and fails the ioctl if that fails; STREAMOFF
 //!   awaits the reverse teardown before resetting local buffer state.
 //! - `VIDIOC_G_PARM` / `S_PARM` (capture frame interval).
-//! - `VIDIOC_G_CTRL` / `S_CTRL` / `QUERYCTRL`.
+//! - `VIDIOC_G_CTRL` / `S_CTRL` / `QUERYCTRL`. The control list is
+//!   built from the device's real PU/CT descriptors at bind (see
+//!   [`crate::uvc::control::supported_controls`]) with ranges read
+//!   from the hardware via GET_MIN/GET_MAX/GET_RES/GET_DEF; when the
+//!   device carries [`ControlOps`] (installed by its class driver),
+//!   G_CTRL/S_CTRL route through them to hardware GET_CUR/SET_CUR
+//!   and a failed transfer fails the ioctl instead of echoing a
+//!   cached value. Devices with no hooks keep cache-only behaviour.
 //! - `VIDIOC_ENUMINPUT` / `G_INPUT` / `S_INPUT`.
 //!
 //! ## Linux reference (validated against `/usr/src/linux` v7.0.0-rc3)
@@ -202,6 +209,9 @@ const V4L2_EVENT_CTRL_CH_VALUE: u32 = 1 << 0;
 const V4L2_EVENT_SUB_FL_SEND_INITIAL: u32 = 1 << 0;
 
 // Control IDs (v4l2-controls.h): V4L2_CTRL_CLASS_USER | 0x900.
+// The full V4L2-ID mapping for every UVC control lives in
+// `crate::uvc::control::ControlId::v4l2_id` (the single authority);
+// only the IDs the synthetic default table needs are repeated here.
 const V4L2_CID_BASE: u32 = 0x0098_0900;
 const V4L2_CID_BRIGHTNESS: u32 = V4L2_CID_BASE;
 const V4L2_CID_CONTRAST: u32 = V4L2_CID_BASE + 1;
@@ -452,6 +462,44 @@ pub type StreamHookFuture = Pin<Box<dyn Future<Output = Result<(), i64>> + Send>
 pub struct StreamOps {
     pub start: fn(node: usize, format: PixFormat) -> StreamHookFuture,
     pub stop: fn(node: usize) -> StreamHookFuture,
+}
+
+/// Future returned by a [`ControlOps`] hook. `Ok` carries the
+/// device-confirmed value; `Err` carries the positive Linux errno
+/// the ioctl fails with (e.g. `EIO` when the device rejects or
+/// cannot complete the control transfer).
+pub type ControlHookFuture = Pin<Box<dyn Future<Output = Result<i32, i64>> + Send>>;
+
+/// Hardware control hooks for a video device, installed by the class
+/// driver that owns the hardware (e.g. the USB Video Class driver in
+/// `narf-drivers-usb`) via
+/// [`crate::devfs_bridge::set_control_ops`], alongside the
+/// descriptor-built control list installed via
+/// [`crate::devfs_bridge::set_controls`].
+///
+/// The contract:
+///
+/// - `get` issues a UVC GET_CUR for the control with V4L2 id `id`
+///   (routed through `uvc::control::route_control` to the owning
+///   Processing Unit / Camera Terminal) and returns the
+///   device-reported value. It is awaited by `VIDIOC_G_CTRL` and
+///   `VIDIOC_G_EXT_CTRLS` *before* the cached value is reported;
+///   an `Err` fails the ioctl with that errno and the cache is left
+///   untouched.
+/// - `set` clamps `value` into the descriptor-reported range first
+///   (the V4L2 layer does that before calling), issues a UVC
+///   SET_CUR, and returns the device-confirmed value. It is awaited
+///   by `VIDIOC_S_CTRL` / `VIDIOC_S_EXT_CTRLS`; an `Err` fails the
+///   ioctl and the cache is left untouched — a failed SET_CUR must
+///   never echo a value the hardware never took (that silent lie is
+///   what #809 removes).
+///
+/// Devices with no hooks keep the historical cache-only behaviour
+/// (synthetic/fixture nodes with no hardware behind them).
+#[derive(Copy, Clone, Debug)]
+pub struct ControlOps {
+    pub get: fn(node: usize, id: u32) -> ControlHookFuture,
+    pub set: fn(node: usize, id: u32, value: i32) -> ControlHookFuture,
 }
 
 /// One queued V4L2 event: its type, matching id, running sequence, and the
@@ -989,12 +1037,12 @@ async fn handle(
         VIDIOC_STREAMON => streamon(dev, b, true, events).await,
         VIDIOC_STREAMOFF => streamon(dev, b, false, events).await,
         VIDIOC_G_PARM | VIDIOC_S_PARM => g_parm(dev, b),
-        VIDIOC_G_CTRL => g_ctrl(dev, b),
-        VIDIOC_S_CTRL => s_ctrl(dev, b, events),
+        VIDIOC_G_CTRL => g_ctrl(dev, b).await,
+        VIDIOC_S_CTRL => s_ctrl(dev, b, events).await,
         VIDIOC_QUERYCTRL => queryctrl(dev, b),
-        VIDIOC_G_EXT_CTRLS => ext_ctrls(dev, b, arg, ctx, ExtCtrlOp::Get, events)?,
-        VIDIOC_S_EXT_CTRLS => ext_ctrls(dev, b, arg, ctx, ExtCtrlOp::Set, events)?,
-        VIDIOC_TRY_EXT_CTRLS => ext_ctrls(dev, b, arg, ctx, ExtCtrlOp::Try, events)?,
+        VIDIOC_G_EXT_CTRLS => ext_ctrls(dev, b, arg, ctx, ExtCtrlOp::Get, events).await?,
+        VIDIOC_S_EXT_CTRLS => ext_ctrls(dev, b, arg, ctx, ExtCtrlOp::Set, events).await?,
+        VIDIOC_TRY_EXT_CTRLS => ext_ctrls(dev, b, arg, ctx, ExtCtrlOp::Try, events).await?,
         VIDIOC_SUBSCRIBE_EVENT => subscribe_event(dev, b, events),
         VIDIOC_UNSUBSCRIBE_EVENT => unsubscribe_event(b, events),
         VIDIOC_DQEVENT => dqevent(b, events),
@@ -1652,38 +1700,98 @@ fn g_parm(dev: &Arc<IrqSafeSpinLock<VideoDevice>>, b: &mut [u8]) -> u64 {
     0
 }
 
-fn g_ctrl(dev: &Arc<IrqSafeSpinLock<VideoDevice>>, b: &mut [u8]) -> u64 {
+/// `VIDIOC_G_CTRL`: read the control's current value.
+///
+/// With [`ControlOps`] installed the value comes from hardware
+/// GET_CUR (routed by the class driver through
+/// `uvc::control::route_control`); the cache is refreshed from the
+/// device-reported value. A failed transfer fails the ioctl with
+/// that errno and leaves the cache untouched. Without hooks the
+/// cached value is reported, as before.
+async fn g_ctrl(dev: &Arc<IrqSafeSpinLock<VideoDevice>>, b: &mut [u8]) -> u64 {
     let id = rd_u32(b, 0);
-    let g = dev.lock();
-    let Some(c) = g.controls.iter().find(|c| c.id == id) else {
-        return errno(EINVAL);
+    let (index, ops) = {
+        let g = dev.lock();
+        if !g.controls.iter().any(|c| c.id == id) {
+            return errno(EINVAL);
+        }
+        (g.index, g.control_ops)
     };
-    wr_i32(b, 4, c.value);
-    0
+    let Some(ops) = ops else {
+        let g = dev.lock();
+        let c = g.controls.iter().find(|c| c.id == id).unwrap();
+        wr_i32(b, 4, c.value);
+        return 0;
+    };
+    match (ops.get)(index, id).await {
+        Ok(value) => {
+            let mut g = dev.lock();
+            if let Some(c) = g.controls.iter_mut().find(|c| c.id == id) {
+                c.value = value;
+            }
+            wr_i32(b, 4, value);
+            0
+        }
+        Err(e) => errno(e),
+    }
 }
 
-fn s_ctrl(
+/// `VIDIOC_S_CTRL`: set the control's current value.
+///
+/// The value is clamped to the descriptor-reported `[min, max]`
+/// and snapped to `step` first. With [`ControlOps`] installed the
+/// clamped value goes to hardware SET_CUR; only the
+/// device-confirmed value is cached and reported back, and a
+/// control-change event is emitted for it. A failed transfer fails
+/// the ioctl with that errno and the cache keeps the previous
+/// value — never the value the hardware never took. Without hooks
+/// the cache-only behaviour is preserved.
+async fn s_ctrl(
     dev: &Arc<IrqSafeSpinLock<VideoDevice>>,
     b: &mut [u8],
     events: &IrqSafeSpinLock<FdEvents>,
 ) -> u64 {
     let id = rd_u32(b, 0);
     let val_in = rd_i32(b, 4);
-    let mut g = dev.lock();
-    let Some(c) = g.controls.iter_mut().find(|c| c.id == id) else {
-        return errno(EINVAL);
+    let (index, clamped, ops) = {
+        let g = dev.lock();
+        let Some(c) = g.controls.iter().find(|c| c.id == id) else {
+            return errno(EINVAL);
+        };
+        // Clamp to [min, max] and snap to step, like v4l2 does.
+        let mut val = val_in.clamp(c.min, c.max);
+        if c.step > 1 {
+            val -= (val - c.min) % c.step;
+        }
+        (g.index, val, g.control_ops)
     };
-    // Clamp to [min, max] and snap to step, like v4l2 does.
-    let mut val = val_in.clamp(c.min, c.max);
-    if c.step > 1 {
-        val -= (val - c.min) % c.step;
+    let Some(ops) = ops else {
+        let mut g = dev.lock();
+        let Some(c) = g.controls.iter_mut().find(|c| c.id == id) else {
+            return errno(EINVAL);
+        };
+        c.value = clamped;
+        let snapshot = *c;
+        drop(g);
+        wr_i32(b, 4, clamped); // report the clamped value back
+        emit_ctrl_event(events, &snapshot);
+        return 0;
+    };
+    match (ops.set)(index, id, clamped).await {
+        Ok(confirmed) => {
+            let mut g = dev.lock();
+            let Some(c) = g.controls.iter_mut().find(|c| c.id == id) else {
+                return errno(EINVAL);
+            };
+            c.value = confirmed;
+            let snapshot = *c;
+            drop(g);
+            wr_i32(b, 4, confirmed);
+            emit_ctrl_event(events, &snapshot);
+            0
+        }
+        Err(e) => errno(e),
     }
-    c.value = val;
-    let snapshot = *c;
-    drop(g);
-    wr_i32(b, 4, val); // report the clamped value back
-    emit_ctrl_event(events, &snapshot);
-    0
 }
 
 /// Queue a `V4L2_EVENT_CTRL` value-change event for a control. No-op unless the
@@ -1749,7 +1857,7 @@ enum ExtCtrlOp {
 /// unknown id (or an attempt to set the read-only default-value set) the
 /// 1-based failing index is written to `error_idx` and `EINVAL` is returned, as
 /// `v4l2-ioctl.c::v4l2_g/s_ext_ctrls` do.
-fn ext_ctrls(
+async fn ext_ctrls(
     dev: &Arc<IrqSafeSpinLock<VideoDevice>>,
     b: &mut [u8],
     arg: u64,
@@ -1775,6 +1883,11 @@ fn ext_ctrls(
         ctx.write(arg.wrapping_add(8), &i.to_ne_bytes())?;
         Ok(errno(EINVAL))
     };
+    // Same, but with the hardware hook's errno (e.g. EIO) instead of EINVAL.
+    let fail_at_errno = |i: u32, e: i64| -> Result<u64, FsError> {
+        ctx.write(arg.wrapping_add(8), &i.to_ne_bytes())?;
+        Ok(errno(e))
+    };
 
     for i in 0..count {
         let entry = ptr
@@ -1784,39 +1897,89 @@ fn ext_ctrls(
         ctx.read(entry, &mut e)?;
         let id = rd_u32(&e, 0);
 
-        let mut g = dev.lock();
-        let Some(idx) = g.controls.iter().position(|c| c.id == id) else {
-            drop(g);
-            return fail_at(i);
+        // Resolve the control and (for Set/Try) the clamped value
+        // under the lock, then drop it: the hardware hook awaits and
+        // must never run under the device lock.
+        let (index, value, ops) = {
+            let g = dev.lock();
+            let Some(idx) = g.controls.iter().position(|c| c.id == id) else {
+                drop(g);
+                return fail_at(i);
+            };
+            let c = g.controls[idx];
+            if op != ExtCtrlOp::Get && defaults {
+                // The default-value set is read-only.
+                drop(g);
+                return fail_at(i);
+            }
+            let value = match op {
+                ExtCtrlOp::Get => {
+                    if defaults {
+                        c.default
+                    } else {
+                        c.value
+                    }
+                }
+                ExtCtrlOp::Set | ExtCtrlOp::Try => {
+                    let mut v = rd_i32(&e, 12).clamp(c.min, c.max);
+                    if c.step > 1 {
+                        v -= (v - c.min) % c.step;
+                    }
+                    v
+                }
+            };
+            (g.index, value, g.control_ops)
         };
         match op {
             ExtCtrlOp::Get => {
+                // The default-value set never touches hardware.
                 let v = if defaults {
-                    g.controls[idx].default
+                    value
+                } else if let Some(ops) = ops {
+                    match (ops.get)(index, id).await {
+                        Ok(v) => {
+                            let mut g = dev.lock();
+                            if let Some(c) = g.controls.iter_mut().find(|c| c.id == id) {
+                                c.value = v;
+                            }
+                            v
+                        }
+                        Err(e) => return fail_at_errno(i, e),
+                    }
                 } else {
-                    g.controls[idx].value
+                    value
                 };
                 wr_i32(&mut e, 12, v);
             }
             ExtCtrlOp::Set | ExtCtrlOp::Try => {
-                if defaults {
-                    // The default-value set is read-only.
-                    drop(g);
-                    return fail_at(i);
-                }
-                let c = &mut g.controls[idx];
-                let mut val = rd_i32(&e, 12).clamp(c.min, c.max);
-                if c.step > 1 {
-                    val -= (val - c.min) % c.step;
-                }
                 let snapshot = if op == ExtCtrlOp::Set {
-                    c.value = val;
-                    Some(*c)
+                    if let Some(ops) = ops {
+                        match (ops.set)(index, id, value).await {
+                            Ok(confirmed) => {
+                                let mut g = dev.lock();
+                                let Some(c) = g.controls.iter_mut().find(|c| c.id == id) else {
+                                    return fail_at(i);
+                                };
+                                c.value = confirmed;
+                                wr_i32(&mut e, 12, confirmed);
+                                Some(*c)
+                            }
+                            Err(e) => return fail_at_errno(i, e),
+                        }
+                    } else {
+                        let mut g = dev.lock();
+                        let Some(c) = g.controls.iter_mut().find(|c| c.id == id) else {
+                            return fail_at(i);
+                        };
+                        c.value = value;
+                        wr_i32(&mut e, 12, value);
+                        Some(*c)
+                    }
                 } else {
+                    // TRY_CTRLS: clamp only, no hardware, no cache change.
+                    wr_i32(&mut e, 12, value);
                     None
                 };
-                wr_i32(&mut e, 12, val);
-                drop(g);
                 if let Some(s) = snapshot {
                     emit_ctrl_event(events, &s);
                 }
@@ -1824,7 +1987,6 @@ fn ext_ctrls(
                 continue;
             }
         }
-        drop(g);
         ctx.write(entry, &e)?;
     }
     Ok(0)
