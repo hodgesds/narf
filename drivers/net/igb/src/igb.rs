@@ -680,7 +680,8 @@ pub fn strip_vlan_tag_in_place(frame: &mut [u8], len: usize) -> Option<usize> {
 // WUC arms PME, WUFC selects the wake filters, WUS reports which
 // filter fired (write-1-to-clear; Linux clears it with ~0 on resume).
 // The live device does not arm WoL at bring-up: arming belongs to
-// the suspend sequence (next commit), and the EEPROM support probe
+// the suspend sequence (`Igb::suspend` programs WUC/WUFC via
+// `wol_suspend_program`), and the EEPROM support probe
 // below still needs NVM access NARF's igb does not have yet — the
 // support decode is provided so the suspend path can use it the
 // moment NVM reads land, not as a claim that probe knows it today.

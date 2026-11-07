@@ -39,6 +39,7 @@
 //! | 0x194   | MIIData           | MII data window (write before / read |
 //! |         |                   |  after MIIControl)                   |
 //! | 0x144   | TxRxControl       | DESC_VERx | RESET | KICK             |
+//! | 0x200   | WakeUpFlags       | WoL magic-pattern accept (issue #792)|
 //!
 //! ## MAC address byte-ordering quirk
 //!
@@ -92,7 +93,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 use narf_driver_runtime::{
@@ -357,6 +358,8 @@ pub enum NicError {
     MiiError,
     /// Frame outside [1, 1518].
     FrameTooLong,
+    /// The datapath was used while the device is suspended.
+    Suspended,
     /// `transmit` couldn't find a free TX descriptor.
     TxRingFull,
     /// `transmit` polled too long for VALID to clear.
@@ -440,6 +443,11 @@ pub struct ForcedethNic {
     /// Linux carries this in `np->txrxctl_bits` so every write to
     /// REG_TX_RX_CONTROL can OR in the persistent state.
     txrxctl_bits: u32,
+    /// WoL enable (issue #792): the stored `wolenabled` flag from
+    /// Linux `nv_set_wol`.
+    wol_enabled: AtomicBool,
+    /// True while the device is suspended (datapath gate).
+    suspended: AtomicBool,
 
     // IPC integration
     rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -696,6 +704,14 @@ impl ForcedethNic {
             mmio.write32(REG_XMIT_CTL, XMIT_CTL_TX_PATH_EN | XMIT_CTL_START);
         }
 
+        // 11. Wake-on-LAN starts disabled (issue #792): Linux's
+        //     probe writes `WakeUpFlags = 0` with `wolenabled = 0`
+        //     (`nv_init_nic` only arms it once the flag is set).
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            mmio.write32(crate::wol::REG_WAKEUP_FLAGS, 0);
+        }
+
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
         let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
 
@@ -711,6 +727,8 @@ impl ForcedethNic {
             link_up,
             phy_addr,
             txrxctl_bits,
+            wol_enabled: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
@@ -725,6 +743,9 @@ impl ForcedethNic {
     /// Transmit a single Ethernet frame, polled. Frame must be in
     /// `[1, 1518]` bytes; padding for runt frames is the chip's job.
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(NicError::Suspended);
+        }
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
         }
@@ -808,8 +829,12 @@ impl ForcedethNic {
 
     /// Pop one received frame off the RX ring. Returns `Some(buf)`
     /// when a descriptor's AVAIL bit reads 0 (chip handed it back)
-    /// and `None` when the head is still chip-owned.
+    /// and `None` when the head is still chip-owned — or while the
+    /// device is suspended.
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        if self.suspended.load(Ordering::Acquire) {
+            return None;
+        }
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -898,6 +923,117 @@ impl ForcedethNic {
             self.mmio.write32(REG_IRQ_STATUS, s);
         }
         s
+    }
+
+    // ── Wake-on-LAN (issue #792) ────────────────────────────────────
+
+    /// Set the WoL enable (Linux `nv_set_wol` semantics, infallible
+    /// like Linux: it returns 0 always). Only `WAKE_MAGIC` is
+    /// honoured; any other non-zero word leaves the stored enable
+    /// unchanged. The `WakeUpFlags` register is programmed live from
+    /// the stored enable — see `wol.rs` for the one deliberate
+    /// deviation from Linux's write here.
+    pub fn set_wol(&self, wolopts: u32) {
+        let enabled = crate::wol::set_wol(wolopts, self.wol_enabled.load(Ordering::Acquire));
+        self.wol_enabled.store(enabled, Ordering::Release);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(
+                crate::wol::REG_WAKEUP_FLAGS,
+                crate::wol::wakeup_flags(enabled),
+            );
+        }
+    }
+
+    /// Read the WoL surface (Linux `nv_get_wol`):
+    /// `(supported, wolopts)`.
+    pub fn get_wol(&self) -> (u32, u32) {
+        (
+            crate::wol::wol_supported_opts(),
+            crate::wol::wol_opts(self.wol_enabled.load(Ordering::Acquire)),
+        )
+    }
+
+    /// Suspend the device for system sleep (Linux `nv_close` WoL
+    /// block): mask IRQs, stop the datapath gate, arm the receiver
+    /// for wake filtering when WoL is enabled (or, by the Linux
+    /// default, whenever the PHY is left powered), and publish link
+    /// down. Idempotent: a second suspend is a no-op. The PCI PME
+    /// enable is the platform power layer's job
+    /// (`narf_bus::pci_pme`); this programs only the device-side
+    /// wake filtering.
+    pub fn suspend(&self) {
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_IRQ_MASK, 0);
+        }
+        // NARF has no `phy_power_down` module parameter, so the live
+        // path always takes Linux's default (`phy_power_down = 0`):
+        // the receiver stays armed and the PHY stays up.
+        let program = crate::wol::suspend_program(self.wol_enabled.load(Ordering::Acquire), false);
+        let mut bank = crate::wol::MmioRegBank(&self.mmio);
+        crate::wol::apply_suspend(&mut bank, &program);
+        if program.power_down_phy && self.phy_addr < 32 {
+            // Linux read-modify-writes BMCR with PDOWN. Unreachable
+            // on the live path (the default program never sets the
+            // flag); kept so the `phy_power_down = 1` program stays
+            // executable, not just fixture-tested.
+            if let Ok(bmcr) = mii_rw(&self.mmio, self.phy_addr, MII_BMCR, None) {
+                let _ = mii_rw(
+                    &self.mmio,
+                    self.phy_addr,
+                    MII_BMCR,
+                    Some(bmcr | crate::wol::BMCR_PDOWN as u32),
+                );
+            }
+        }
+        crate::publish::publish_link(forcedeth_ifname(), crate::publish::LinkSample::DOWN);
+    }
+
+    /// Resume a suspended device (Linux `nv_resume` → `nv_init_nic`
+    /// order, adapted): re-assert `WakeUpFlags` from the stored
+    /// enable, restore the bring-up datapath words, restart PHY
+    /// autoneg out of any power-down, and republish link. Resuming
+    /// a running device is a no-op. The rings are retained across
+    /// the sleep (no ring rebuild, unlike Linux's full `nv_open`
+    /// on resume — the `PowerState2` clock gate is likewise not
+    /// modeled; see `wol.rs`).
+    pub fn resume(&self) {
+        if !self.suspended.load(Ordering::Acquire) {
+            return;
+        }
+        let words = crate::wol::resume_words();
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(
+                crate::wol::REG_WAKEUP_FLAGS,
+                crate::wol::wakeup_flags(self.wol_enabled.load(Ordering::Acquire)),
+            );
+            self.mmio
+                .write32(crate::wol::REG_PACKET_FILTER, words.packet_filter);
+            self.mmio.write32(crate::wol::REG_RCV_CTL, words.rcv_ctl);
+            self.mmio.write32(crate::wol::REG_XMIT_CTL, words.xmit_ctl);
+        }
+        // Restart autoneg out of a power-down (the igb-resume
+        // shape); a PHY that was never powered down just restarts
+        // autoneg, which is what Linux's resume-time `phy_reset`
+        // does anyway.
+        if self.phy_addr < 32 {
+            let _ = mii_rw(
+                &self.mmio,
+                self.phy_addr,
+                MII_BMCR,
+                Some((BMCR_AUTONEG_EN | BMCR_AUTONEG_RESTART) as u32),
+            );
+        }
+        self.suspended.store(false, Ordering::Release);
+        crate::publish::publish_link(
+            forcedeth_ifname(),
+            crate::publish::LinkSample::carrier_only(self.live_link_up()),
+        );
     }
 }
 

@@ -103,6 +103,8 @@ mod rss;
 mod runtime;
 pub use runtime::{I40eNic, RecoveryStatus};
 pub mod vsi;
+/// Wake-on-LAN (issue #792): pure gates + wire formats.
+pub mod wol;
 
 mod tests;
 
@@ -326,6 +328,12 @@ pub const REG_GLGEN_RSTAT: u64 = 0x000B_8188;
 /// `I40E_GLGEN_RSTAT_DEVSTATE_MASK`.
 pub const GLGEN_RSTAT_DEVSTATE_MASK: u32 = 0x3;
 
+/// `I40E_PFPM_APM` — PF power-management APM register (WoL,
+/// issue #792). Re-exported from `wol` for the live path.
+pub const REG_PFPM_APM: u64 = wol::REG_PFPM_APM;
+/// `I40E_PFPM_WUFC` — PF wake-up filter control (WoL, issue #792).
+pub const REG_PFPM_WUFC: u64 = wol::REG_PFPM_WUFC;
+
 /// `I40E_GLNVM_ULD` — NVM upload-done status.
 pub const REG_GLNVM_ULD: u64 = 0x000B_6008;
 /// `I40E_GLNVM_ULD_CONF_CORE_DONE_MASK` (bit 3).
@@ -441,6 +449,9 @@ pub enum AqOpcode {
     QueueShutdown = 0x0003,
     /// Read the port's MAC addresses (indirect).
     MacAddressRead = 0x0107,
+    /// Change the MAC addresses (direct). Used by WoL
+    /// (`i40e_aq_mac_address_write`).
+    MacAddressWrite = 0x0108,
     /// Release the port from the option ROM's PXE mode (direct).
     ClearPxeMode = 0x0110,
     /// Current link speed / state (direct).
@@ -847,6 +858,11 @@ pub enum I40eError {
     DeviceFailed,
     /// Malformed or unsupported firmware RSS resource description.
     BadRssCapabilities,
+    /// WoL is not offered on this PF, or the request asked for a
+    /// filter this family cannot arm (issue #792).
+    WolUnsupported,
+    /// The datapath was used while the device is suspended.
+    Suspended,
 }
 
 // ── Live driver state ───────────────────────────────────────────────
@@ -1609,6 +1625,40 @@ impl Hardware {
         MacAddresses::parse(&buf)
             .map(|m| m.pf_lan)
             .ok_or(I40eError::BadMacAddress)
+    }
+
+    /// `mac_address_write` (0x0108) — direct. Writes the command
+    /// flags + MAC in the `i40e_aqc_mac_address_write` layout
+    /// (see `wol::mac_address_write_params`).
+    pub fn aq_mac_address_write(&self, flags: u16, mac: [u8; 6]) -> Result<(), I40eError> {
+        let params = wol::mac_address_write_params(flags, mac);
+        self.aq_send(AqOpcode::MacAddressWrite, params, None, 0)?;
+        Ok(())
+    }
+
+    /// `i40e_enable_mc_magic_wake`: program the firmware's
+    /// magic-packet wake filters with the two `mac_address_write`
+    /// steps (first `LAA_WOL`, then `MC_MAG_EN |
+    /// WOL_PRESERVE_ON_PFR | UPDATE_MC_MAG`) against this PF's LAN
+    /// MAC. The caller gates this on the `WOL_MC_MAGIC_PKT_WAKE`
+    /// capability.
+    pub fn enable_mc_magic_wake(&self) -> Result<(), I40eError> {
+        for (flags, mac) in wol::mc_magic_wake_steps(self.mac) {
+            self.aq_mac_address_write(flags, mac)?;
+        }
+        Ok(())
+    }
+
+    /// Program the PFPM WoL arming words (`i40e_io_suspend`):
+    /// `PFPM_APM = APME` and `PFPM_WUFC = MAG` when WoL is
+    /// enabled, both 0 otherwise.
+    pub fn set_wol_pfpm(&self, wol_en: bool) {
+        let (apm, wufc) = wol::suspend_pfpm(wol_en);
+        // SAFETY: `self.csr` is this PF's mapped CSR window.
+        unsafe {
+            self.csr.write32(REG_PFPM_APM, apm);
+            self.csr.write32(REG_PFPM_WUFC, wufc);
+        }
     }
 
     /// `get_link_status` (0x0607) — direct.
