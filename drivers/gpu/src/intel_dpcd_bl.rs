@@ -40,9 +40,11 @@
 //!
 //! The retained `owner` module is installed by the MTL/Arrow internal-panel
 //! probe after the fixed Pipe-A/DDI-A route and owned console are live. It
-//! source-probes the VESA caps, exact PWM bit count and existing DPCD-only SDR
-//! mode; mixed PWM/product, passthrough/dynamic/luminance/HDR and other routes
-//! remain refused. Its maximum is `(1 << PWMGENbitcount) - 1`, including
+//! source-probes the VESA caps, exact PWM bit count and switches a
+//! full-AUX panel left in PWM/preset/product control mode into DPCD SDR
+//! mode (issue #1219); mixed PWM/product caps, passthrough, dynamic,
+//! luminance/HDR and other routes remain refused. Its maximum is
+//! `(1 << PWMGENbitcount) - 1`, including
 //! sub-16-bit panels carried in a two-byte field. The generic device below
 //! remains the small protocol seam for callers supplying their own profile.
 //!
