@@ -1886,7 +1886,7 @@ impl AlpsDecoder {
         f.first_mp = p[4] & 0x40 != 0;
         f.is_mp = p[0] & 0x40 != 0;
         if f.is_mp {
-            f.fingers = (p[5] & 0x3) + 1;
+            f.fingers = ((p[5] & 0x3) as u32) + 1;
             f.x_map = (((p[4] & 0x7e) as u32) << 8)
                 | (((p[1] & 0x7f) as u32) << 2)
                 | (((p[0] & 0x30) as u32) >> 4);
@@ -1912,7 +1912,7 @@ impl AlpsDecoder {
         f.first_mp = p[4] & 0x40 != 0;
         f.is_mp = p[5] & 0x40 != 0;
         if f.is_mp {
-            f.fingers = core::cmp::max(p[5] & 0x3, (p[5] >> 2) & 0x3) + 1;
+            f.fingers = (core::cmp::max(p[5] & 0x3, (p[5] >> 2) & 0x3) as u32) + 1;
             f.x_map = (((p[5] & 0x10) as u32) << 11)
                 | (((p[4] & 0x7e) as u32) << 8)
                 | (((p[1] & 0x7f) as u32) << 2)
@@ -2341,7 +2341,7 @@ impl AlpsDecoder {
             V7PacketId::Multi => {
                 mt[1].x &= !0x003F;
                 mt[1].y &= !0x0020;
-                mt[1].y |= (((p[4] & 0x02) as i32) << 4);
+                mt[1].y |= ((p[4] & 0x02) as i32) << 4;
                 mt[1].y |= 0x001F;
             }
             V7PacketId::New => {
