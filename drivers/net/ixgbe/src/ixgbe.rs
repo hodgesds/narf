@@ -2350,7 +2350,10 @@ impl Ixgbe {
                 .map(|q| q.rx_ring.dma_addr().raw())
                 .collect();
             let mut bank = queues::MmioBank::new(&self.mmio);
-            pm::resume_rebuild_plan(&mut bank, cfg, &tx_bases, &rx_bases)
+            // Rebuild SRRCTL from the stored MTU (issue #802).
+            let program =
+                mtu::mtu_transition(*self.mtu.lock()).expect("stored MTU is always in range");
+            pm::resume_rebuild_plan(&mut bank, cfg, &tx_bases, &rx_bases, program.srrctl_bsize)
                 .map_err(IxgbeError::Other)?;
         }
         // 8. Replay the recorded filter/feature state the reset
