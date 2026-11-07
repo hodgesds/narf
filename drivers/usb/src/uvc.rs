@@ -48,6 +48,7 @@
 //!   0x12 VS_FORMAT_STREAM_BASED   — MPEG-2 TS etc. (Table A-6)
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // ── Class triple ───────────────────────────────────────────────────
 
@@ -764,6 +765,24 @@ pub struct UvcDevice {
     /// installed on the `/dev/video<N>` node mirrors this table;
     /// controls absent from it are never advertised.
     pub controls: Vec<UvcControl>,
+    /// Hub context for hub idle-suspend accounting: `Some((parent hub
+    /// slot id, downstream port))` when the camera sits behind a hub,
+    /// `None` on a root port. Recorded at bind (MSC/NCM/CDC-ACM
+    /// precedent); the capture pump feeds it to
+    /// [`crate::attach::mark_port_activity`] on every completed
+    /// transfer, and the class suspend hook + TX-demand resume filter
+    /// on it (#807).
+    pub hub_port: Option<(u8, u8)>,
+    /// Device-accepted VS PROBE/COMMIT values from the last successful
+    /// negotiation — the parameters a suspend/resume cycle
+    /// re-negotiates from. Written by negotiation success only, so a
+    /// stream activated without negotiation has none.
+    pub last_stream: Option<VsProbeCommit>,
+    /// Stream that was active when the system-PM prepare hook quiesced
+    /// the device: the resume replay's work-list. Set by prepare (from
+    /// `last_stream`, only for a device whose stream was live) and
+    /// taken by the resume replay; `None` means "nothing to restore".
+    pub suspended_stream: Option<VsProbeCommit>,
 }
 
 /// System-wide registry of bound UVC devices (records carry their
@@ -1341,10 +1360,14 @@ pub async fn control_set_with<T: UvcTransport>(
 /// Transport-generic core of [`try_bind_video_already_addressed`]:
 /// SET_CONFIGURATION, then record the slot/interface pair, the parsed
 /// streaming format table, and register the `/dev/video<N>` node.
+/// `hub_port` is the attach cascade's hub context (parent hub slot +
+/// downstream port, `None` on a root port); it is recorded for the
+/// hub idle-suspend accounting in #807.
 pub async fn try_bind_video_with_transport<T: UvcTransport>(
     transport: &T,
     slot_id: u8,
     cfg: &[u8],
+    hub_port: Option<(u8, u8)>,
 ) -> Result<usize, UvcError> {
     let vc_iface = find_video_control_interface(cfg).ok_or(UvcError::NotVideo)?;
     let cfg_value = if cfg.len() >= 9 { cfg[5] } else { 1 };
@@ -1430,6 +1453,9 @@ pub async fn try_bind_video_with_transport<T: UvcTransport>(
                 len: b.len,
             })
             .collect(),
+        hub_port,
+        last_stream: None,
+        suspended_stream: None,
     });
     Ok(idx)
 }
@@ -1442,8 +1468,9 @@ pub async fn try_bind_video_already_addressed(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
     cfg: &[u8],
+    hub_port: Option<(u8, u8)>,
 ) -> Result<usize, UvcError> {
-    let idx = try_bind_video_with_transport(xhci_dev, slot_id, cfg).await?;
+    let idx = try_bind_video_with_transport(xhci_dev, slot_id, cfg, hub_port).await?;
     let video_node = {
         let devices = UVC_DEVICES.lock();
         devices.get(idx).map(|device| device.video_node)
@@ -1468,7 +1495,7 @@ pub async fn try_bind_uvc_already_addressed(
     slot_id: u8,
     cfg: &[u8],
 ) -> Result<usize, UvcError> {
-    try_bind_video_already_addressed(xhci_dev, slot_id, cfg).await
+    try_bind_video_already_addressed(xhci_dev, slot_id, cfg, None).await
 }
 
 /// Retain every bulk/isochronous IN endpoint together with the
@@ -1802,6 +1829,9 @@ pub async fn negotiate_and_activate_video_stream(
     idx: usize,
     desired: VsProbeCommit,
 ) -> Result<UvcNegotiatedStream, UvcError> {
+    // A port the hub idle-suspend pass gated while the camera was
+    // idle must come back before the negotiation transfers (#807).
+    ensure_uvc_port_awake(xhci_dev, idx).await;
     let negotiated = negotiate_and_activate_video_stream_with(xhci_dev, idx, desired).await?;
     start_video_capture_pump(idx);
     Ok(negotiated)
@@ -1919,6 +1949,15 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
     // `VsProbeCommit` is `Copy`, so `accepted` is still available
     // for the return value below.
     retain_negotiated_stream(idx, accepted);
+    // Record the device-accepted parameters: a later suspend/resume
+    // cycle re-negotiates from exactly these values (#807). Only a
+    // successful negotiation writes the record.
+    {
+        let mut devices = UVC_DEVICES.lock();
+        if let Some(device) = devices.get_mut(idx) {
+            device.last_stream = Some(accepted);
+        }
+    }
     Ok(UvcNegotiatedStream {
         control: accepted,
         endpoint,
@@ -2041,7 +2080,7 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
     transport: &T,
     generation: u64,
 ) -> Result<(), UvcError> {
-    let (slot_id, endpoint, video_node, reassembly) = {
+    let (slot_id, endpoint, video_node, reassembly, controller, hub_port) = {
         let devices = UVC_DEVICES.lock();
         let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
         (
@@ -2056,6 +2095,8 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
             // with no negotiation on record) yields the legacy
             // config, so the pump behaves exactly as before.
             device.reassembly_config(),
+            device.controller,
+            device.hub_port,
         )
     };
     let packet_size = usize::try_from(endpoint.max_payload_size)
@@ -2101,6 +2142,14 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
         match transfer {
             Ok(received) if received != 0 => {
                 consecutive_errors = 0;
+                // Hub idle-suspend accounting (#807): every completed
+                // transfer resets the port's idle timer, so a
+                // streaming camera never idles into a port suspend.
+                // No-op for root-port cameras (`hub_port` is `None`)
+                // and when the hub is gone.
+                if let Some((hub_slot, port)) = hub_port {
+                    crate::attach::mark_port_activity(controller, hub_slot, port);
+                }
                 if reassembler.push(&packet[..received]) == ReassemblerOutcome::FrameComplete {
                     let frame = reassembler.take_frame();
                     // The transfer that completed this frame may
@@ -2333,6 +2382,9 @@ pub fn attached_uvc_count() -> usize {
 #[doc(hidden)]
 pub fn __reset_uvc_for_test() {
     UVC_DEVICES.lock().clear();
+    // A previous smoke that quiesced for suspend without resuming
+    // must not wedge the next smoke's STREAMON.
+    UVC_PM_SUSPENDED.store(false, Ordering::SeqCst);
 }
 
 /// Detach half of UVC bind for one slot: drop every `UVC_DEVICES`
@@ -2500,6 +2552,14 @@ pub async fn stream_start_with<T: UvcTransport>(
     node: usize,
     format: narf_drivers_video::v4l2_ioctl::PixFormat,
 ) -> Result<(), i64> {
+    // Quiesced for system suspend (#807): the PM prepare hook latched
+    // this before the controller fan-out, and the resume replay clears
+    // it when the camera is streaming again. A STREAMON racing the
+    // transition fails busy instead of negotiating against a device
+    // whose power is about to be cut; the caller retries after resume.
+    if pm_quiesced() {
+        return Err(ERRNO_EBUSY);
+    }
     let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
     let desired = {
         let devices = UVC_DEVICES.lock();
@@ -2529,6 +2589,9 @@ fn video_stream_start(
     Box::pin(async move {
         let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
         let controller = controller_of(idx).ok_or(ERRNO_ENODEV)?;
+        // A port the hub idle-suspend pass gated while the camera was
+        // idle must come back before the negotiation transfers (#807).
+        ensure_uvc_port_awake(&controller, idx).await;
         stream_start_with(&*controller, node, format).await?;
         if let Some(idx) = uvc_index_for_video_node(node) {
             start_video_capture_pump(idx);
@@ -2602,6 +2665,296 @@ pub fn video_control_ops() -> narf_drivers_video::v4l2_ioctl::ControlOps {
         get: video_control_get,
         set: video_control_set,
     }
+}
+
+// ── Suspend / resume (#807) ──────────────────────────────────────────
+//
+// Two registrations, mirroring the USB classes that already suspend:
+//
+// - The async system-PM hook (`narf_power::system_pm`, #763 pattern):
+//   prepare runs while the scheduler and device interrupts still
+//   service futures, so it can do the real quiesce — stop the pump +
+//   select alternate setting 0, the STREAMOFF teardown — and record
+//   the stream for the resume replay. Resume runs only after the
+//   synchronous device fan-out restored xHCI, and re-negotiates +
+//   re-activates each quiesced camera from its recorded parameters.
+// - The synchronous device-PM hook (`narf_power::device_pm`, #820
+//   pattern): a flag-only backstop for the interrupt-gated fan-out.
+//   It latches the quiesce flag and stop-requests every streaming
+//   pump — it can do no I/O, so alternate-setting selection stays
+//   the async prepare's job.
+//
+// Hub idle-suspend participation rides on the same hub context:
+// the pump feeds [`crate::attach::mark_port_activity`] on every
+// completed transfer (a streaming camera never idles), the class
+// suspend hook vetoes gating a live stream, and STREAMON resumes a
+// gated port before negotiating.
+
+/// Pump quiesce latch: set by the PM prepare hook (and by the
+/// synchronous device-PM backstop), cleared when the resume replay
+/// settles. While set, STREAMON refuses busy and no pump delivers.
+static UVC_PM_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+/// True while the class is quiesced for system suspend.
+pub fn pm_quiesced() -> bool {
+    UVC_PM_SUSPENDED.load(Ordering::SeqCst)
+}
+
+fn pm_prepare() {
+    UVC_PM_SUSPENDED.store(true, Ordering::SeqCst);
+}
+
+fn pm_finish_resume() {
+    UVC_PM_SUSPENDED.store(false, Ordering::SeqCst);
+}
+
+/// TX-demand resume for UVC (#807): if the camera's hub port is
+/// gated, resume it before the transfer that would otherwise NAK on
+/// it (Linux `usb_autopm_get_interface` shape; the btusb
+/// `ensure_port_awake` precedent). No-op for root-port cameras
+/// (`hub_port` is `None`) and when the port is already awake.
+async fn ensure_uvc_port_awake(xhci_dev: &crate::xhci::Xhci, idx: usize) {
+    let Some((hub_slot, port)) = UVC_DEVICES.lock().get(idx).and_then(|d| d.hub_port) else {
+        return;
+    };
+    if !crate::attach::hub_port_is_suspended(xhci_dev.id(), hub_slot, port) {
+        return;
+    }
+    crate::attach::resume_port(xhci_dev, hub_slot, port).await;
+    if !crate::attach::hub_port_is_suspended(xhci_dev.id(), hub_slot, port) {
+        crate::attach::mark_port_activity(xhci_dev.id(), hub_slot, port);
+    }
+}
+
+/// Register the UVC class suspend hook (#807). Called from the USB
+/// crate's Stage::Subsys initcalls; registration tolerates
+/// duplicates (see [`crate::class_registry::register_suspend_hook`]).
+pub fn register() {
+    let _ = crate::class_registry::register_suspend_hook("uvcvideo", |slot, port| {
+        alloc::boxed::Box::pin(suspend_uvc_port(slot, port))
+    });
+}
+
+/// Class suspend hook for one hub port (see
+/// [`crate::class_registry::dispatch_suspend`]). Runs inside the
+/// supervisor's idle-suspend pass, before the pass gates the port.
+///
+/// A streaming camera vetoes gating (`ParkFailed`): the pump's
+/// activity marks keep a streaming camera from ever going
+/// idle-expired, so a veto only fires for a stalled stream — and
+/// gating mid-stream would break the pump's in-flight transfer with
+/// no resume path (it exits after 8 consecutive errors, leaving the
+/// V4L2 node streaming into a dead pump). An idle bound camera parks
+/// (`Parked`: nothing to do; the next STREAMON resumes the port
+/// first). Idempotent and panic-free.
+pub(crate) async fn suspend_uvc_port(
+    hub_slot: u8,
+    port: u8,
+) -> crate::class_registry::SuspendOutcome {
+    use crate::class_registry::SuspendOutcome;
+    let devices = UVC_DEVICES.lock();
+    let Some(device) = devices
+        .iter()
+        .find(|d| d.hub_port == Some((hub_slot, port)))
+    else {
+        return SuspendOutcome::NotMine;
+    };
+    if device.active_stream.is_some() {
+        SuspendOutcome::ParkFailed
+    } else {
+        SuspendOutcome::Parked
+    }
+}
+
+/// Quiesce every streaming UVC camera on `controller` for system
+/// suspend (#807): latch the class quiesce flag, then for each live
+/// stream record the device-accepted parameters for the resume
+/// replay and run the STREAMOFF teardown (stop pump + select
+/// alternate setting 0) over `transport`.
+///
+/// Best-effort per device: a failed alt-0 selection still leaves the
+/// software state quiesced (pump stopping, `active_stream` cleared),
+/// and STREAMON can restart the camera afterwards — so a single sick
+/// camera never aborts the whole system suspend (a failing prepare
+/// makes the coordinator unwind every earlier hook). A streaming
+/// device whose negotiation record is missing (`last_stream` is
+/// `None` — activated without negotiation) is still quiesced, but
+/// has nothing for resume to replay.
+pub async fn prepare_suspend_with<T: UvcTransport>(transport: &T, controller: u8) {
+    pm_prepare();
+    let streaming: Vec<(usize, Option<VsProbeCommit>)> = {
+        let devices = UVC_DEVICES.lock();
+        devices
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.controller == controller && d.active_stream.is_some())
+            .map(|(idx, d)| (idx, d.last_stream))
+            .collect()
+    };
+    for (idx, last) in streaming {
+        {
+            let mut devices = UVC_DEVICES.lock();
+            if let Some(device) = devices.get_mut(idx) {
+                device.suspended_stream = last;
+            }
+        }
+        let _ = deactivate_video_stream_with(transport, idx).await;
+    }
+}
+
+/// Re-negotiate + re-activate every camera
+/// [`prepare_suspend_with`] quiesced on `controller` (#807):
+/// PROBE/COMMIT with the device-accepted parameters the prepare
+/// recorded, then activation (alternate setting + endpoint
+/// configuration). Returns the registry indices re-activated — the
+/// caller spawns each one's capture pump — and `DriverError` when
+/// any replay failed (best-effort: one sick camera never blocks the
+/// rest). A device whose stream restarted already (a STREAMON raced
+/// the resume through the window between the synchronous resume
+/// clearing the latch and this replay reaching the device) is
+/// skipped, not re-negotiated. Clears the class quiesce latch when
+/// the replay settles, even on failure, so STREAMON is usable again.
+pub async fn resume_replay_with<T: UvcTransport>(
+    transport: &T,
+    controller: u8,
+) -> (
+    Vec<usize>,
+    Result<(), narf_power::device_pm::DeviceSuspendError>,
+) {
+    let pending: Vec<(usize, VsProbeCommit)> = {
+        let mut devices = UVC_DEVICES.lock();
+        let mut out = Vec::new();
+        for (idx, device) in devices.iter_mut().enumerate() {
+            if device.controller != controller {
+                continue;
+            }
+            if let Some(desired) = device.suspended_stream.take() {
+                out.push((idx, desired));
+            }
+        }
+        out
+    };
+    let mut reactivated = Vec::new();
+    let mut failed = false;
+    for (idx, desired) in pending {
+        if UVC_DEVICES
+            .lock()
+            .get(idx)
+            .is_some_and(|d| d.active_stream.is_some())
+        {
+            continue;
+        }
+        match negotiate_and_activate_video_stream_with(transport, idx, desired).await {
+            Ok(_) => reactivated.push(idx),
+            Err(_) => failed = true,
+        }
+    }
+    pm_finish_resume();
+    let result = if failed {
+        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
+    } else {
+        Ok(())
+    };
+    (reactivated, result)
+}
+
+/// Flag-only system-suspend backstop for UVC (#807).
+///
+/// Runs on the boot CPU with interrupts gated (the synchronous
+/// device-PM fan-out), so it must not schedule, sleep, or do I/O:
+/// it latches the quiesce flag and stop-requests every streaming
+/// pump so no frame is delivered across suspend. Alternate-setting-0
+/// selection stays the async prepare hook's job — this hook never
+/// selects alt 0, because it cannot issue a control transfer.
+///
+/// A suspend that bypassed the async prepare (no caller in-tree
+/// does; the coordinator always prepares first) leaves the stream
+/// record standing with a dead pump: STREAMON then fails busy until
+/// STREAMOFF tears the record down. That degraded path is accepted
+/// rather than wedging the machine: the backstop's job is only to
+/// stop delivery, never to own the hardware state.
+pub(crate) struct UvcPm;
+
+impl narf_power::device_pm::DevicePmOps for UvcPm {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        pm_prepare();
+        let mut devices = UVC_DEVICES.lock();
+        for device in devices.iter_mut() {
+            if device.active_stream.is_some() {
+                device.capture_stop_requested = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        pm_finish_resume();
+        Ok(())
+    }
+}
+
+struct UvcSystemPm;
+
+impl narf_power::system_pm::AsyncSystemPm for UvcSystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async {
+            for xhci in crate::xhci::controllers() {
+                prepare_suspend_with(xhci.as_ref(), xhci.id()).await;
+            }
+            Ok(())
+        })
+    }
+
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async {
+            // Every controller replays its own bindings; a binding whose
+            // controller is gone cannot be replayed.
+            let mut result = Ok(());
+            let controllers = crate::xhci::controllers();
+            for xhci in &controllers {
+                // The port may have idled into a gate while the machine
+                // slept; wake each pending camera's port before its
+                // replay transfers.
+                let pending: Vec<usize> = {
+                    let devices = UVC_DEVICES.lock();
+                    devices
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.controller == xhci.id() && d.suspended_stream.is_some())
+                        .map(|(idx, _)| idx)
+                        .collect()
+                };
+                for idx in pending {
+                    ensure_uvc_port_awake(xhci.as_ref(), idx).await;
+                }
+                let (reactivated, replay) = resume_replay_with(xhci.as_ref(), xhci.id()).await;
+                if replay.is_err() {
+                    result = Err(narf_power::device_pm::DeviceSuspendError::DriverError);
+                }
+                for idx in reactivated {
+                    start_video_capture_pump(idx);
+                }
+            }
+            let orphaned = UVC_DEVICES.lock().iter().any(|d| {
+                d.suspended_stream.is_some() && !controllers.iter().any(|c| c.id() == d.controller)
+            });
+            if orphaned {
+                result = Err(narf_power::device_pm::DeviceSuspendError::DriverError);
+            }
+            pm_finish_resume();
+            result
+        })
+    }
+}
+
+/// Register the UVC power-management hooks (#807): the async
+/// system-PM hook (prepare quiesces, resume re-negotiates) and the
+/// synchronous device-PM backstop. Called once from the USB crate's
+/// Stage::Subsys initcalls; both registrations are idempotent on
+/// the hook name.
+pub fn register_pm() {
+    narf_power::system_pm::register_async_system_pm("uvcvideo", alloc::sync::Arc::new(UvcSystemPm));
+    narf_power::device_pm::register_device_pm_ops("uvcvideo", alloc::sync::Arc::new(UvcPm));
 }
 
 // ── UVC payload header (§2.4.3.3) ──────────────────────────────────

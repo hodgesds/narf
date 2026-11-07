@@ -1215,9 +1215,18 @@ async fn dispatch_after_address(
         {
             return AttachOutcome::AudioClass;
         }
-        // USB Video Class — class 0x0E, subclass 0x01 (VC).
-        if let Ok(_idx) =
-            crate::uvc::try_bind_video_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        // USB Video Class — class 0x0E, subclass 0x01 (VC). The hub
+        // context rides in the same shape the registry probes receive
+        // (MSC/NCM precedent): parent hub slot + downstream port,
+        // None on a root port — the #807 hub idle-suspend accounting
+        // and TX-demand resume filter on it.
+        if let Ok(_idx) = crate::uvc::try_bind_video_already_addressed(
+            xhci_dev,
+            slot_id,
+            &cfg_blob,
+            parent_hub_slot.map(|slot| (slot, port)),
+        )
+        .await
         {
             return AttachOutcome::VideoClass;
         }

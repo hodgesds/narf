@@ -113,6 +113,18 @@ pub fn register_initcalls() {
         uvc::register_initcalls();
         InitResult::Ok
     });
+    // UVC suspend/resume (#807): the class suspend hook for the
+    // supervisor's hub idle-suspend pass (vetoes gating a live
+    // stream) and the system-PM hooks (prepare quiesces, resume
+    // re-negotiates) plus the synchronous device-PM backstop.
+    narf_init::register(Stage::Subsys, "usb-uvc-suspend", || {
+        uvc::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-uvc-pm", || {
+        uvc::register_pm();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "usb-r8152", || {
         r8152::register();
         InitResult::Ok

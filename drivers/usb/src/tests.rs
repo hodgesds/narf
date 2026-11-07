@@ -3335,6 +3335,7 @@ fn smoke_uvc_streamon_v15_negotiation() -> TestResult {
         &*transport,
         7,
         &blob,
+        None,
     )) {
         Ok(idx) => idx,
         Err(_) => return TestResult::Fail("bind against the modelled 1.5 camera failed"),
@@ -3429,6 +3430,7 @@ fn uvc_negotiate_setup(
         &**transport,
         7,
         &blob,
+        None,
     ))
     .map_err(|_| "bind against the modelled 1.5 camera failed")?;
     let desired = {
@@ -10550,6 +10552,7 @@ fn uvc_fixture_bound_with_blob(
         &*transport,
         7,
         blob,
+        None,
     ))
     .map_err(|_| "bind against the modelled camera failed")?;
     let (node, format_count) = {
@@ -11391,6 +11394,398 @@ fn smoke_uvc_bulk_only_streamon_pump_e2e() -> TestResult {
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_bulk_only_streamon_pump_e2e);
 
+// ── drivers/usb/uvc suspend/resume (#807) ────────────────────────────
+//
+// Fixtures built from the UVC PM semantics themselves: the modelled
+// 1.5 camera (same bind + negotiation path as the #1244 smokes),
+// a real capture pump driven by hand, and the real hub registry —
+// never from implementation constants.
+
+/// Bind the modelled 1.5 camera behind hub slot 0xC0 port 1 and
+/// negotiate + activate its stream, shared by the #807 PM smokes so
+/// they exercise the real bind + negotiation path, not hand-built
+/// state. Returns (transport, device index). The pump is NOT
+/// spawned: smokes drive `pump_video_frames_with` themselves (a
+/// smoke cannot rely on executor scheduling).
+fn uvc_pm_streaming_setup() -> Result<(Arc<FixtureTransport>, usize), &'static str> {
+    narf_drivers_video::devfs_bridge::__reset_for_test();
+    crate::uvc::__reset_uvc_for_test();
+    let transport = Arc::new(FixtureTransport::new(
+        false,
+        false,
+        uvc_fixture_frame_packets(),
+    ));
+    transport.set_clock(48_000_000);
+    let blob = uvc_fixture_config_blob_versioned(0x0150, 48_000_000);
+    let idx = narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        7,
+        &blob,
+        Some((0xC0, 1)),
+    ))
+    .map_err(|_| "bind against the modelled 1.5 camera failed")?;
+    let desired = {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = devices.get(idx).ok_or("bound device missing")?;
+        if device.hub_port != Some((0xC0, 1)) {
+            return Err("bind should record the hub context");
+        }
+        let format = narf_drivers_video::v4l2_ioctl::PixFormat {
+            width: 640,
+            height: 480,
+            fourcc: u32::from_le_bytes(*b"YUYV"),
+        };
+        crate::uvc::desired_probe_commit(device, format).ok_or("desired_probe_commit failed")?
+    };
+    narf_scheduler::block_on(crate::uvc::negotiate_and_activate_video_stream_with(
+        &*transport,
+        idx,
+        desired,
+    ))
+    .map_err(|_| "negotiation failed")?;
+    Ok((transport, idx))
+}
+
+/// Prepare must quiesce a streaming camera: the capture pump exits,
+/// the streaming alternate is released (SET_INTERFACE alt 0, after
+/// the alt-1 activation), the stream is recorded for resume, and
+/// the quiesce latch is set.
+fn smoke_uvc_pm_prepare_quiesces_streaming_device() -> TestResult {
+    let (transport, idx) = match uvc_pm_streaming_setup() {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Drive the capture pump until it consumes a packet: the pump is
+    // alive on the streaming alternate.
+    let generation = crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    let mut pump = Box::pin(crate::uvc::pump_video_frames_with(
+        idx,
+        &*transport,
+        generation,
+    ));
+    let mut consumed = false;
+    for _ in 0..100 {
+        let _ = fixture_poll(pump.as_mut());
+        if transport
+            .log()
+            .iter()
+            .any(|x| matches!(x, FixtureXfer::IsochIn))
+        {
+            consumed = true;
+            break;
+        }
+    }
+    if !consumed {
+        return TestResult::Fail("pump should consume a packet before suspend");
+    }
+    // System suspend: prepare must stop the pump and release alt 0.
+    narf_scheduler::block_on(crate::uvc::prepare_suspend_with(&*transport, 0));
+    if !crate::uvc::pm_quiesced() {
+        return TestResult::Fail("prepare should latch the quiesce flag");
+    }
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = &devices[idx];
+        if device.active_stream.is_some() {
+            return TestResult::Fail("prepare should clear the active stream");
+        }
+        if device.suspended_stream.is_none() {
+            return TestResult::Fail("prepare should record the stream for resume");
+        }
+    }
+    let log = transport.log();
+    let alt0 = log
+        .iter()
+        .rposition(|x| matches!(x, FixtureXfer::SetInterface { alt: 0, .. }));
+    let alt1 = log
+        .iter()
+        .rposition(|x| matches!(x, FixtureXfer::SetInterface { alt: 1, .. }));
+    match (alt1, alt0) {
+        (Some(a1), Some(a0)) if a0 > a1 => {}
+        _ => {
+            return TestResult::Fail("prepare should end with SET_INTERFACE alt 0 after alt 1");
+        }
+    }
+    // The parked pump wakes on the next staged packet and must exit
+    // cleanly instead of delivering into the stopped stream.
+    transport.stage_packet(alloc::vec![2u8, 0x83, b'W', b'A', b'K', b'E', b'!']);
+    if fixture_poll_until_ready(pump.as_mut()) != Some(Ok(())) {
+        return TestResult::Fail("pump should exit Ok after prepare");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_pm_prepare_quiesces_streaming_device
+);
+
+/// Resume must re-negotiate from the recorded parameters and
+/// re-activate the stream: PROBE + COMMIT + alt 1 after the
+/// prepare, a bumped stream generation, and a pump that runs again
+/// on the re-activated stream.
+fn smoke_uvc_pm_resume_renegotiates_and_reactivates() -> TestResult {
+    let (transport, idx) = match uvc_pm_streaming_setup() {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let generation_before = crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    narf_scheduler::block_on(crate::uvc::prepare_suspend_with(&*transport, 0));
+    let log_len_after_prepare = transport.log().len();
+    let (reactivated, result) =
+        narf_scheduler::block_on(crate::uvc::resume_replay_with(&*transport, 0));
+    if result.is_err() {
+        return TestResult::Fail("resume replay should succeed");
+    }
+    if reactivated != alloc::vec![idx] {
+        return TestResult::Fail("resume should re-activate exactly the quiesced camera");
+    }
+    if crate::uvc::pm_quiesced() {
+        return TestResult::Fail("resume should clear the quiesce flag");
+    }
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = &devices[idx];
+        if device.active_stream.is_none() {
+            return TestResult::Fail("resume should restore the active stream");
+        }
+        if device.suspended_stream.is_some() {
+            return TestResult::Fail("resume should consume the recorded stream");
+        }
+        if device.stream_generation != generation_before + 1 {
+            return TestResult::Fail("resume should bump the stream generation");
+        }
+    }
+    // The replay must re-run the whole negotiation, not just reselect
+    // the alternate: a camera that lost power in S3 comes back
+    // uncommitted.
+    let log = transport.log();
+    let rest = &log[log_len_after_prepare..];
+    let has_probe = rest
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetCurProbe { .. }));
+    let has_commit = rest
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetCurCommit { .. }));
+    let has_alt1 = rest
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetInterface { alt: 1, .. }));
+    if !has_probe || !has_commit || !has_alt1 {
+        return TestResult::Fail("resume should re-issue PROBE, COMMIT and alt 1");
+    }
+    // The re-activated stream must actually run: drive its pump and
+    // watch it consume a packet.
+    let generation = crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    let mut pump = Box::pin(crate::uvc::pump_video_frames_with(
+        idx,
+        &*transport,
+        generation,
+    ));
+    let mut consumed = false;
+    for _ in 0..100 {
+        let _ = fixture_poll(pump.as_mut());
+        if transport.log()[log_len_after_prepare..]
+            .iter()
+            .any(|x| matches!(x, FixtureXfer::IsochIn))
+        {
+            consumed = true;
+            break;
+        }
+    }
+    if !consumed {
+        return TestResult::Fail("resumed pump should consume a packet");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_pm_resume_renegotiates_and_reactivates
+);
+
+/// A completed pump transfer refreshes the hub port's idle tick, so
+/// a streaming camera never becomes an idle-suspend candidate: age
+/// the tick past the window, drive the pump once, and the deadline
+/// must move out with the feed.
+fn smoke_uvc_pm_pump_marks_hub_activity() -> TestResult {
+    use crate::attach::{idle_suspend_candidates, mark_ports_bound, HUBS, IDLE_SUSPEND_NS};
+    let base = HUBS.of(0).lock().len();
+    HUBS.of(0).lock().push(fake_hub_binding(0xC0, 2));
+    let result = (|| {
+        let (transport, idx) = match uvc_pm_streaming_setup() {
+            Ok(v) => v,
+            Err(e) => return TestResult::Fail(e),
+        };
+        mark_ports_bound(0, 0xC0, 1 << 1);
+        // Age the port's tick past the idle window: without a pump
+        // feed it is a suspend candidate.
+        let aged = {
+            let mut g = HUBS.of(0).lock();
+            let h = match g.iter_mut().find(|h| h.hub.slot_id == 0xC0) {
+                Some(h) => h,
+                None => return TestResult::Fail("pushed hub missing"),
+            };
+            let tick = h.last_activity_tick[1];
+            h.last_activity_tick[1] = tick.saturating_sub(IDLE_SUSPEND_NS + 1_000_000_000);
+            tick.saturating_sub(IDLE_SUSPEND_NS + 1_000_000_000)
+        };
+        {
+            let g = HUBS.of(0).lock();
+            if !idle_suspend_candidates(&g[..], aged + IDLE_SUSPEND_NS + 1_000_000_000)
+                .contains(&(0xC0, 1u8))
+            {
+                return TestResult::Fail("aged port should be a suspend candidate first");
+            }
+        }
+        // Drive the pump: one completed transfer must refresh the tick.
+        let generation = crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+        let mut pump = Box::pin(crate::uvc::pump_video_frames_with(
+            idx,
+            &*transport,
+            generation,
+        ));
+        let mut fed_tick = None;
+        for _ in 0..100 {
+            let _ = fixture_poll(pump.as_mut());
+            let tick = HUBS
+                .of(0)
+                .lock()
+                .iter()
+                .find(|h| h.hub.slot_id == 0xC0)
+                .map(|h| h.last_activity_tick[1])
+                .unwrap_or(0);
+            if tick > aged {
+                fed_tick = Some(tick);
+                break;
+            }
+        }
+        let tick = match fed_tick {
+            Some(t) => t,
+            None => return TestResult::Fail("pump transfer should refresh the activity tick"),
+        };
+        {
+            let g = HUBS.of(0).lock();
+            if idle_suspend_candidates(&g[..], tick + IDLE_SUSPEND_NS - 1_000_000_000)
+                .contains(&(0xC0, 1u8))
+            {
+                return TestResult::Fail("activity feed should push the deadline out");
+            }
+        }
+        TestResult::Pass
+    })();
+    HUBS.of(0).lock().truncate(base);
+    result
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_pm_pump_marks_hub_activity);
+
+/// The class suspend hook vetoes gating a live stream (the pump's
+/// activity marks keep it from idling anyway; the veto is the safety
+/// net for a stalled stream), parks an idle bound camera, and
+/// ignores ports it owns nothing on.
+fn smoke_uvc_pm_suspend_hook_vetoes_streaming_parks_idle() -> TestResult {
+    use crate::class_registry::SuspendOutcome;
+    let (transport, idx) = match uvc_pm_streaming_setup() {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0xC0, 1)) != SuspendOutcome::ParkFailed
+    {
+        return TestResult::Fail("hook should veto gating a streaming camera");
+    }
+    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0xC0, 2)) != SuspendOutcome::NotMine {
+        return TestResult::Fail("hook should ignore a port with no UVC device");
+    }
+    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0xEE, 7)) != SuspendOutcome::NotMine {
+        return TestResult::Fail("hook should ignore an unrelated hub/port");
+    }
+    // Idle the camera through the STREAMOFF teardown: the hook may
+    // park it now, and the port may gate.
+    if narf_scheduler::block_on(crate::uvc::deactivate_video_stream_with(&*transport, idx)).is_err()
+    {
+        return TestResult::Fail("STREAMOFF teardown should succeed");
+    }
+    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0xC0, 1)) != SuspendOutcome::Parked {
+        return TestResult::Fail("hook should park an idle bound camera");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_pm_suspend_hook_vetoes_streaming_parks_idle
+);
+
+/// The synchronous device-PM backstop is flag-only: suspend latches
+/// the quiesce flag and stop-requests the streaming pump (no I/O —
+/// alt 0 stays the async prepare's job), resume unlatches.
+fn smoke_uvc_pm_device_pm_flag_backstop() -> TestResult {
+    use narf_power::device_pm::DevicePmOps;
+    let (_transport, idx) = match uvc_pm_streaming_setup() {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let pm = crate::uvc::UvcPm;
+    if pm.suspend().is_err() {
+        return TestResult::Fail("device-PM suspend should succeed");
+    }
+    if !crate::uvc::pm_quiesced() {
+        return TestResult::Fail("device-PM suspend should latch the quiesce flag");
+    }
+    if !crate::uvc::UVC_DEVICES.lock()[idx].capture_stop_requested {
+        return TestResult::Fail("device-PM suspend should stop-request the pump");
+    }
+    if pm.resume().is_err() {
+        return TestResult::Fail("device-PM resume should succeed");
+    }
+    if crate::uvc::pm_quiesced() {
+        return TestResult::Fail("device-PM resume should clear the quiesce flag");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_pm_device_pm_flag_backstop);
+
+/// STREAMON refuses busy while the class is quiesced for suspend,
+/// and works again once the resume replay settles.
+fn smoke_uvc_pm_streamon_refused_while_quiesced() -> TestResult {
+    let (transport, idx) = match uvc_pm_streaming_setup() {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Idle the camera first: the refusal is about the suspend
+    // quiesce, not about an already-running stream.
+    if narf_scheduler::block_on(crate::uvc::deactivate_video_stream_with(&*transport, idx)).is_err()
+    {
+        return TestResult::Fail("STREAMOFF teardown should succeed");
+    }
+    // Quiesce with no live stream: only the latch is set.
+    narf_scheduler::block_on(crate::uvc::prepare_suspend_with(&*transport, 0));
+    let node = crate::uvc::UVC_DEVICES.lock()[idx].video_node;
+    let format = narf_drivers_video::v4l2_ioctl::PixFormat {
+        width: 640,
+        height: 480,
+        fourcc: u32::from_le_bytes(*b"YUYV"),
+    };
+    match narf_scheduler::block_on(crate::uvc::stream_start_with(&*transport, node, format)) {
+        Err(16) => {}
+        Err(_) => return TestResult::Fail("STREAMON while quiesced should fail busy (16)"),
+        Ok(()) => return TestResult::Fail("STREAMON while quiesced should fail"),
+    }
+    // Resume with nothing to replay still clears the latch.
+    let (reactivated, result) =
+        narf_scheduler::block_on(crate::uvc::resume_replay_with(&*transport, 0));
+    if result.is_err() || !reactivated.is_empty() {
+        return TestResult::Fail("empty resume replay should succeed with nothing to do");
+    }
+    if crate::uvc::pm_quiesced() {
+        return TestResult::Fail("resume should clear the quiesce flag");
+    }
+    if narf_scheduler::block_on(crate::uvc::stream_start_with(&*transport, node, format)).is_err() {
+        return TestResult::Fail("STREAMON after resume should succeed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_uvc_pm_streamon_refused_while_quiesced
+);
+
 /// Two modelled cameras bind, the first detaches cleanly (binding
 /// and node both gone, survivor untouched), detach is idempotent
 /// and a no-op for unknown slots, wholesale detach clears the rest,
@@ -11407,6 +11802,7 @@ fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
         &*transport,
         8,
         &uvc_fixture_config_blob(),
+        None,
     ))
     .is_err()
     {
@@ -11471,6 +11867,7 @@ fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
         &*transport,
         7,
         &uvc_fixture_config_blob(),
+        None,
     ))
     .is_err()
     {
