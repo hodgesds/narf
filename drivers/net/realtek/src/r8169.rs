@@ -1220,7 +1220,8 @@ impl RtlNic {
         unsafe {
             self.mmio.write32(REG_TNPDS, tx_phys as u32);
             self.mmio.write32(REG_TNPDS + 4, (tx_phys >> 32) as u32);
-            self.mmio.write32(REG_TCR, TCR_MXDMA_UNLIMITED | TCR_IFG_STD);
+            self.mmio
+                .write32(REG_TCR, TCR_MXDMA_UNLIMITED | TCR_IFG_STD);
             self.mmio.write8(REG_9346CR, EEM_CONFIG_WRITE);
             let mut regs = crate::features::MmioRegs(&self.mmio);
             let ver = self.mac_version.unwrap_or(0);
@@ -1260,7 +1261,8 @@ impl RtlNic {
         // SAFETY: identity-mapped MMIO.
         unsafe {
             self.mmio.write32(REG_RDSAR, rx_ring_phys as u32);
-            self.mmio.write32(REG_RDSAR + 4, (rx_ring_phys >> 32) as u32);
+            self.mmio
+                .write32(REG_RDSAR + 4, (rx_ring_phys >> 32) as u32);
             self.mmio.write16(REG_RMS, RX_BUF_LEN as u16);
             self.mmio.write32(
                 REG_RCR,
@@ -1918,12 +1920,11 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use super::{
-        alloc_coherent, channel, tx_note_completed, tx_stalled, Desc, DmaBuffer, DomainId,
-        Frame, IrqSafeSpinLock, MmioRegion, RtlNic, TxMeta, CR_RE, CR_RST, CR_TE, PHYSTAT_LINKSTS,
-        RCR_AB, RCR_AM, RCR_APM, RCR_MXDMA_UNLIMITED, RCR_RXFTH_NONE, REG_CR, REG_IMR,
-        REG_PHYSTAT, REG_RCR, REG_RDSAR, REG_RMS, REG_TCR, REG_TNPDS, RING_BYTES, RING_LEN,
-        RXD_EOR, RXD_OWN, RX_BUF_LEN, RX_RING_N, TCR_IFG_STD, TCR_MXDMA_UNLIMITED, TXD_OWN,
-        TX_BUF_LEN, TX_RING_N, TX_TIMEOUT_NS,
+        alloc_coherent, channel, tx_note_completed, tx_stalled, Desc, DmaBuffer, DomainId, Frame,
+        IrqSafeSpinLock, MmioRegion, RtlNic, TxMeta, CR_RE, CR_TE, RCR_AB, RCR_AM, RCR_APM,
+        RCR_MXDMA_UNLIMITED, RCR_RXFTH_NONE, REG_CR, REG_IMR, REG_RCR, REG_RDSAR, REG_RMS, REG_TCR,
+        REG_TNPDS, RING_BYTES, RING_LEN, RXD_EOR, RXD_OWN, RX_BUF_LEN, RX_RING_N, TCR_IFG_STD,
+        TCR_MXDMA_UNLIMITED, TX_BUF_LEN, TX_RING_N, TX_TIMEOUT_NS,
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -2138,7 +2139,9 @@ mod tests {
                 device
                     .mmio
                     .write32(REG_TCR, TCR_MXDMA_UNLIMITED | TCR_IFG_STD);
-                device.mmio.write8(super::REG_9346CR, super::EEM_CONFIG_WRITE);
+                device
+                    .mmio
+                    .write8(super::REG_9346CR, super::EEM_CONFIG_WRITE);
                 let mut regs = crate::features::MmioRegs(&device.mmio);
                 let ver = device.mac_version.unwrap_or(0);
                 let jumbo = crate::features::jumbo_config(ver, true);
@@ -2175,7 +2178,9 @@ mod tests {
             // SAFETY: fixture-owned fake MMIO.
             unsafe {
                 device.mmio.write32(REG_RDSAR, rx_ring_phys as u32);
-                device.mmio.write32(REG_RDSAR + 4, (rx_ring_phys >> 32) as u32);
+                device
+                    .mmio
+                    .write32(REG_RDSAR + 4, (rx_ring_phys >> 32) as u32);
                 device.mmio.write16(REG_RMS, RX_BUF_LEN as u16);
                 device.mmio.write32(
                     REG_RCR,
