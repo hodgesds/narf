@@ -1623,6 +1623,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -1704,6 +1705,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -1752,6 +1754,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -1776,6 +1779,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -1800,6 +1804,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -1850,6 +1855,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -1898,6 +1904,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -1946,6 +1953,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]

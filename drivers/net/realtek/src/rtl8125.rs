@@ -576,7 +576,7 @@ impl TxDesc {
 // ── Live driver state ───────────────────────────────────────────────
 // Stage 2b: descriptor rings, MMIO-backed bring_up, polled TX/RX path.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 use narf_driver_runtime::{
@@ -598,6 +598,9 @@ pub enum NicError {
     TxTimeout,
     /// MSI-X table couldn't be brought up.
     MsixSetup,
+    /// The device is suspended for system suspend (issue #793):
+    /// the datapath gates refuse TX and RX while suspended.
+    Suspended,
     /// The requested TX offload cannot be programmed for this
     /// frame (unparseable transport header, SCTP, MSS/offset
     /// overflow).
@@ -641,6 +644,9 @@ pub struct RtlNic {
     /// True when PHYStatus.LinkSts read 1 at bring-up. We don't yet
     /// re-poll on LinkChg interrupts.
     pub link_up: bool,
+    /// Set by `suspend`, cleared by `resume`: the datapath gates
+    /// refuse TX and RX while this is set (issue #793).
+    suspended: AtomicBool,
     /// IDT vector wired to MSI-X entry 0, when MSI-X is enabled.
     pub irq_vector: Option<u8>,
     /// Live MSI-X table — kept alive so the device's MSI-X enable
@@ -893,6 +899,7 @@ impl RtlNic {
             chip_kind,
             wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
             link_up,
+            suspended: AtomicBool::new(false),
             irq_vector: None,
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
@@ -950,6 +957,9 @@ impl RtlNic {
     /// family jumbo tagged frame (16384 bytes) are accepted; the
     /// chip pads frames < 64 bytes itself.
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(NicError::Suspended);
+        }
         if frame.is_empty() || frame.len() > TX_BUF_LEN {
             return Err(NicError::FrameTooLong);
         }
@@ -1071,6 +1081,9 @@ impl RtlNic {
     /// Like [`RtlNic::receive`], plus the chip's RX checksum
     /// verification result decoded from the returned descriptor.
     pub fn receive_with_meta(&self) -> Option<(alloc::vec::Vec<u8>, RxCsumResult)> {
+        if self.suspended.load(Ordering::Acquire) {
+            return None;
+        }
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -1259,6 +1272,49 @@ impl RtlNic {
         let up = phystat & PHYSTAT_LINKSTS != 0;
         self.link_up = up;
         up
+    }
+
+    /// Suspend the device for system suspend (issue #793): mask
+    /// interrupts, acknowledge pending causes, stop the TX/RX DMA
+    /// engines via the shared `pm` plan, and publish link down. A
+    /// second suspend is a no-op success. The PHY stays powered
+    /// (its autoneg advertisement persists), and the descriptor
+    /// rings persist — only the CR EN bits gate DMA.
+    pub fn suspend(&self) -> Result<(), NicError> {
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        crate::pm::suspend_plan(&crate::pm::MmioBank::new(&self.mmio), crate::pm::IMR_WIDE);
+        crate::publish::publish_link(rtl8125_ifname(), crate::publish::LinkSample::DOWN);
+        Ok(())
+    }
+
+    /// Resume a suspended device (issue #793): re-kick the PHY so
+    /// the link re-negotiates after the DMA stop, restore the DMA
+    /// engines + interrupt mask via the shared `pm` plan, and
+    /// republish link from live PHYStatus. Resuming a running
+    /// device is a no-op success. The PHY re-kick is best-effort:
+    /// a failed MDIO read leaves the advertisement as it was, and
+    /// the link still comes back on its own.
+    pub fn resume(&self) -> Result<(), NicError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let phy = crate::phy_access::PhyAccess::new(&self.mmio);
+        if let Ok(bmcr) = phy.phyar_read(crate::phy_access::MII_BMCR_REG) {
+            if let Some(word) = crate::phy_access::bmcr_restart_value(bmcr) {
+                let _ = phy.phyar_write(crate::phy_access::MII_BMCR_REG, word);
+            }
+        }
+        crate::pm::resume_plan(
+            &crate::pm::MmioBank::new(&self.mmio),
+            crate::pm::IMR_WIDE,
+            INT32_ROK | INT32_TOK | INT32_LINKCHG | INT32_RDU | INT32_TDU,
+            self.irq_vector.is_some(),
+        );
+        self.suspended.store(false, Ordering::Release);
+        crate::publish::publish_link(rtl8125_ifname(), rtl8125_link_sample(self.phy_status()));
+        Ok(())
     }
 }
 
@@ -1730,6 +1786,17 @@ fn rtl8125_link_sample(status: u8) -> crate::publish::LinkSample {
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
+impl narf_power::device_pm::DevicePmOps for RtlNic {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.suspend()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+}
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
@@ -1772,6 +1839,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let status = with_controller(|c| c.phy_status()).unwrap_or(0);
     let name = crate::publish::publish_netdev(mac, rtl8125_send_frame, rtl8125_link_sample(status));
     RTL8125_IFNAME.set(name);
+
+    // Device-PM registration (#793): system suspend fans out
+    // through `suspend` / `resume` via the `DevicePmOps` impl
+    // above. The registry is idempotent on the interface name.
+    // There is no detach path to withdraw the entry from yet —
+    // the CONTROLLER slot is never drained either, so the entry
+    // lives as long as the device does.
+    narf_power::device_pm::register_device_pm_ops(rtl8125_ifname(), dev.clone());
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {

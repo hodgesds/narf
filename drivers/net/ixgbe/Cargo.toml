@@ -21,7 +21,7 @@ builtin = [
     "dep:narf-capabilities", "dep:narf-console", "dep:narf-driver-runtime",
     "dep:narf-drivers", "dep:narf-firmware", "dep:narf-interrupts",
     "dep:narf-io", "dep:narf-ipc", "dep:narf-kernel-test", "dep:narf-lib",
-    "dep:narf-memory", "dep:narf-net", "dep:narf-scheduler", "dep:narf-time",
+    "dep:narf-memory", "dep:narf-net", "dep:narf-power", "dep:narf-scheduler", "dep:narf-time",
 ]
 module = []
 
@@ -42,6 +42,7 @@ narf-kernel-test  = { path = "../../../verification/kernel-test", optional = tru
 narf-lib          = { path = "../../../lib", optional = true }
 narf-memory       = { path = "../../../memory", optional = true }
 narf-net          = { path = "../../../net", optional = true }
+narf-power        = { path = "../../../power", optional = true }
 narf-scheduler    = { path = "../../../scheduler", optional = true }
 narf-time         = { path = "../../../time", optional = true }
 

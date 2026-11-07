@@ -98,6 +98,7 @@ pub mod irq;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::AtomicBool;
 pub mod offload;
+pub mod pm;
 pub mod ring;
 mod rss;
 mod runtime;
@@ -899,6 +900,9 @@ pub(super) struct Hardware {
     rss: rss::RssConfig,
     reset_discarded: u64,
     interrupts: Option<interrupts::Interrupts>,
+    /// Set by `suspend`, cleared by `resume`: the datapath gates
+    /// refuse TX and RX while this is set (issue #793).
+    suspended: AtomicBool,
 }
 
 // SAFETY: AQ transactions and per-queue locks serialize descriptor/buffer
@@ -1089,6 +1093,7 @@ impl Hardware {
             rss: rss::RssConfig::default(),
             reset_discarded: 0,
             interrupts: Some(interrupts),
+            suspended: AtomicBool::new(false),
         };
 
         nic.initialize(false)?;
@@ -1201,6 +1206,52 @@ impl Hardware {
         self.interrupts.as_ref().unwrap()
     }
 
+    /// Whether the datapath is gated for system suspend.
+    pub fn suspended(&self) -> bool {
+        self.suspended.load(Ordering::Acquire)
+    }
+
+    /// Suspend the PF for system suspend (issue #793): mask
+    /// interrupts and disable every LAN queue via the `pm` plan,
+    /// then gate the datapath. A second suspend is a no-op success.
+    /// The Admin Queue rings, HMC contexts and VSI state persist —
+    /// only the LAN queue enables gate DMA — so resume is a
+    /// re-enable, not a bring-up replay.
+    pub fn suspend(&self) -> Result<(), I40eError> {
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let bank = pm::MmioBank::new(&self.csr);
+        let queues: alloc::vec::Vec<u16> = (0..self.queues.len() as u16).collect();
+        pm::suspend_plan(&bank, self.base_queue, &queues);
+        Ok(())
+    }
+
+    /// Resume a suspended PF (issue #793): re-enable every LAN
+    /// queue and re-arm interrupts via the `pm` plan, then open the
+    /// datapath gate. Resuming a running PF is a no-op success. A
+    /// queue whose `QENA_STAT` never follows the request, or a PF
+    /// whose cause register reports a fatal condition, leaves the
+    /// device suspended and reports the failure — the caller may
+    /// fail the PF into the recovery pump instead.
+    pub fn resume(&self) -> Result<(), I40eError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.irq().failed() {
+            return Err(I40eError::DeviceFailed);
+        }
+        let bank = pm::MmioBank::new(&self.csr);
+        let queues: alloc::vec::Vec<u16> = (0..self.queues.len() as u16).collect();
+        pm::resume_plan(&bank, self.base_queue, &queues).map_err(|e| match e {
+            "tx queue enable timeout" => I40eError::TxQueueEnableTimeout,
+            "rx queue enable timeout" => I40eError::RxQueueEnableTimeout,
+            _ => I40eError::DeviceFailed,
+        })?;
+        self.suspended.store(false, Ordering::Release);
+        Ok(())
+    }
+
     /// Submit with negotiated metadata. Success means the ring owns a DMA copy;
     /// completion is asynchronous. A full ring leaves the caller's bytes intact.
     pub fn transmit_with_meta(
@@ -1209,7 +1260,7 @@ impl Hardware {
         meta: narf_net::TxMeta,
         index: usize,
     ) -> Result<(), I40eError> {
-        if self.irq().failed() {
+        if self.irq().failed() || self.suspended.load(Ordering::Acquire) {
             return Err(I40eError::DeviceFailed);
         }
         let result = {
@@ -1235,7 +1286,7 @@ impl Hardware {
         meta: narf_net::TxMeta,
         index: usize,
     ) -> Result<(), (I40eError, DmaBuffer)> {
-        if self.irq().failed() {
+        if self.irq().failed() || self.suspended.load(Ordering::Acquire) {
             return Err((I40eError::DeviceFailed, buffer));
         }
         let result = {
@@ -1260,7 +1311,7 @@ impl Hardware {
 
     /// Pop one received frame from queue 0, if any.
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
-        if self.irq().failed() {
+        if self.irq().failed() || self.suspended.load(Ordering::Acquire) {
             return None;
         }
         let mut q = self.queues[0].lock();
@@ -1889,6 +1940,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         runtime::link_sample(nic.link_status()),
     );
     nic.set_ifname(eth_name);
+
+    // Device-PM registration (#793): system suspend fans out
+    // through `I40eNic::suspend` / `I40eNic::resume` via the
+    // `DevicePmOps` impl in `runtime.rs`, one entry per PF under
+    // its `eth%d` name. The registry is idempotent on name. There
+    // is no i40e detach path to withdraw the entry from yet — the
+    // CONTROLLERS table is never drained either, so the entry lives
+    // as long as the PF does.
+    narf_power::device_pm::register_device_pm_ops(nic.ifname(), nic.clone());
 
     // Every PF is published under its own name. The X710 presents one
     // PF per port and the MS-03 has two, so this is the difference
