@@ -46,13 +46,13 @@
 //!   color management, plane composition, etc. We compress to
 //!   the per-CRTC core sequence here.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
 use crate::dp_aux::AuxError;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_pipes::Pipe;
-use crate::intel_gpu_pll::{combo_coeffs, decode_refclk_family, encode_cfgcr0, LinkRate, DSSM};
+use crate::intel_gpu_pll::{DSSM, LinkRate, combo_coeffs, decode_refclk_family, encode_cfgcr0};
 
 // ── Power Well control register block (Tiger Lake PRM Vol. 11
 // §"Power Wells"; Linux i915 `intel_display_regs.h`) ─────────────
@@ -635,7 +635,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// Bind this run's transcoder to the DDI in HDMI mode (8 bpc,
     /// the fixed 4-lane width, scrambling bits per the plan).
     fn program_trans_ddi_func_ctl_hdmi(&mut self, scrambling: bool, high_tmds_char_rate: bool) {
-        use crate::intel_gpu_pipes::{build_trans_ddi_func_ctl_hdmi, TRANS_DDI_FUNC_CTL_OFFSET};
+        use crate::intel_gpu_pipes::{TRANS_DDI_FUNC_CTL_OFFSET, build_trans_ddi_func_ctl_hdmi};
         let val = build_trans_ddi_func_ctl_hdmi(self.ddi as u8, scrambling, high_tmds_char_rate);
         self.mmio
             .write32(self.transcoder().base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
@@ -1176,8 +1176,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// (`intel_set_transcoder_timings`).
     fn program_transcoder(&mut self, mode: &Mode) {
         use crate::intel_gpu_pipes::{
-            build_transcoder, TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET, TRANS_HTOTAL_OFFSET,
-            TRANS_VBLANK_OFFSET, TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET,
+            TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET, TRANS_HTOTAL_OFFSET, TRANS_VBLANK_OFFSET,
+            TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET, build_transcoder,
         };
         let timing = mode_to_display_timing(mode);
         let prog = match build_transcoder(&timing) {
@@ -1210,7 +1210,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
     /// (`intel_set_pipe_src_size`).
     fn program_pipe(&mut self, mode: &Mode) {
-        use crate::intel_gpu_pipes::{build_pipe, PIPE_SRCSZ_OFFSET};
+        use crate::intel_gpu_pipes::{PIPE_SRCSZ_OFFSET, build_pipe};
         let timing = mode_to_display_timing(mode);
         let prog = match build_pipe(&timing) {
             Ok(p) => p,
@@ -1246,8 +1246,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// the per-plane register writes in `skl_plane_update_*`).
     fn program_plane(&mut self, fb: &Framebuffer, mode: &Mode) {
         use crate::intel_gpu_pipes::{
-            build_primary_plane, PixelFormat as PipeFmt, PLANE_CTL_OFFSET, PLANE_OFFSET_OFFSET,
-            PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET, PLANE_STRIDE_OFFSET, PLANE_SURF_OFFSET,
+            PLANE_CTL_OFFSET, PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET,
+            PLANE_STRIDE_OFFSET, PLANE_SURF_OFFSET, PixelFormat as PipeFmt, build_primary_plane,
         };
         let pipe_fmt = match fb.format {
             // XRGB8888 → 8:8:8:8 ARGB encoding (alpha treated as
@@ -1298,7 +1298,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         &mut self,
         plan: Option<LinkPlan>,
     ) -> Result<(LinkRate, Option<crate::dp_link_training::TrainedLink>), ModesetError> {
-        use crate::dp_link_training::{train_link, LinkError, LinkRate as TrainRate};
+        use crate::dp_link_training::{LinkError, LinkRate as TrainRate, train_link};
         let mut aux = IntelAux::new(self.mmio, self.ddi);
         // The legacy path starts at HBR2/4-lane and falls back
         // via `train_link`'s policy — the broadest envelope a
@@ -1331,7 +1331,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// entry at DDI base + 0x10 + n*8). Before lane 1 the tables
     /// in `intel_gpu_ddi` had zero writers tree-wide.
     fn load_buf_trans(&mut self, rate: LinkRate) {
-        use crate::intel_gpu_ddi::{dp_buf_trans_table, DDI_BUF_TRANS_BASE_OFFSET};
+        use crate::intel_gpu_ddi::{DDI_BUF_TRANS_BASE_OFFSET, dp_buf_trans_table};
         let bw = match rate.dpcd_link_bw_set() {
             Some(b) => b,
             None => return,
@@ -1355,7 +1355,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// pre-multi-pipe programming.
     fn program_dpclka_routing(&mut self) {
         use crate::intel_gpu_pll::{
-            dpclka_clk_off, dpclka_clk_sel, dpclka_clk_sel_mask, DPCLKA_CFGCR0,
+            DPCLKA_CFGCR0, dpclka_clk_off, dpclka_clk_sel, dpclka_clk_sel_mask,
         };
         let phy = self.ddi as u32;
         let cur = self.mmio.read32(DPCLKA_CFGCR0);
@@ -1406,8 +1406,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
     fn program_mn_values(&mut self, mode: &Mode, ls_khz: u32, lanes: u8) {
         use crate::intel_gpu_pipes::{
-            dp_mn, PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET,
-            PIPE_LINK_N1_OFFSET,
+            PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET, PIPE_LINK_N1_OFFSET,
+            dp_mn,
         };
         let (dm, dn, lm, ln) = dp_mn(mode.pixel_clock_khz, ls_khz, lanes as u32, 3);
         let base = self.transcoder().base();
@@ -1425,7 +1425,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// negotiated count on the plan path), DP-MST for MST
     /// stream runs (#1017).
     fn program_trans_ddi_func_ctl_mode(&mut self, lanes: u8, mode: u32) {
-        use crate::intel_gpu_pipes::{build_trans_ddi_func_ctl, TRANS_DDI_FUNC_CTL_OFFSET};
+        use crate::intel_gpu_pipes::{TRANS_DDI_FUNC_CTL_OFFSET, build_trans_ddi_func_ctl};
         let val = build_trans_ddi_func_ctl(self.ddi as u8, mode, lanes);
         self.mmio
             .write32(self.transcoder().base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
@@ -1465,8 +1465,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// unknown provenance in place.
     fn program_watermarks(&mut self, mode: &Mode, fb: &Framebuffer) {
         use crate::intel_gpu_wm::{
-            adjust_latencies, compute_plane_watermarks, encode_plane_buf_cfg, encode_wm_level,
-            validate_watermarks, WmParams, PRIMARY_DDB_END, PRIMARY_DDB_START,
+            PRIMARY_DDB_END, PRIMARY_DDB_START, WmParams, adjust_latencies,
+            compute_plane_watermarks, encode_plane_buf_cfg, encode_wm_level, validate_watermarks,
         };
         if let Some((start, end)) = self.dbuf_share {
             write_wm_block(
@@ -1558,7 +1558,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// (`intel_ddi_pre_enable_dp` + `intel_ddi_buf_enable`).
     fn enable_ddi_buffer(&mut self, lanes: u8) {
         use crate::intel_gpu_ddi::{
-            build_ddi_buf_ctl, LaneCount, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET,
+            DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET, LaneCount, build_ddi_buf_ctl,
         };
         let lane_count = match lanes {
             1 => LaneCount::X1,
@@ -1803,24 +1803,32 @@ fn validate_framebuffer(fb: &Framebuffer) -> Result<(), ModesetError> {
 }
 
 /// Validate the plane before either orchestrator disables a live pipeline.
-pub(crate) fn validate_framebuffer_mode(fb: &Framebuffer, mode: &Mode) -> Result<(), ModesetError> {
+pub(crate) fn validate_framebuffer_sized(
+    fb: &Framebuffer,
+    w: u16,
+    h: u16,
+) -> Result<(), ModesetError> {
     validate_framebuffer(fb)?;
-    if fb.stride_bytes < u32::from(mode.h_active) * 4 {
+    if fb.stride_bytes < u32::from(w) * 4 {
         return Err(ModesetError::InvalidFramebuffer);
     }
-    let end = fb.phys_addr + u64::from(fb.stride_bytes) * u64::from(mode.v_active);
+    let end = fb.phys_addr + u64::from(fb.stride_bytes) * u64::from(h);
     if end > 1u64 << 32 {
         return Err(ModesetError::InvalidFramebuffer);
     }
     crate::intel_gpu_pipes::build_primary_plane(
-        mode.h_active,
-        mode.v_active,
+        w,
+        h,
         fb.stride_bytes,
         fb.phys_addr as u32,
         crate::intel_gpu_pipes::PixelFormat::Argb8888,
     )
     .map_err(|_| ModesetError::InvalidFramebuffer)?;
     Ok(())
+}
+
+pub(crate) fn validate_framebuffer_mode(fb: &Framebuffer, mode: &Mode) -> Result<(), ModesetError> {
+    validate_framebuffer_sized(fb, mode.h_active, mode.v_active)
 }
 
 /// Internal-panel modeset dispatch shared by takeover and resume.
@@ -1913,7 +1921,7 @@ pub mod tests {
     use super::*;
     use alloc::vec::Vec;
     use core::cell::RefCell;
-    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_kernel_test::{TestResult, kernel_test_in};
 
     /// Mock MMIO window. Records every write and returns canned
     /// reads keyed by offset (default 0).
@@ -2375,8 +2383,8 @@ pub mod tests {
 
     fn smoke_program_transcoder_writes_six_regs() -> TestResult {
         use crate::intel_gpu_pipes::{
-            Transcoder, TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET, TRANS_HTOTAL_OFFSET,
-            TRANS_VBLANK_OFFSET, TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET,
+            TRANS_HBLANK_OFFSET, TRANS_HSYNC_OFFSET, TRANS_HTOTAL_OFFSET, TRANS_VBLANK_OFFSET,
+            TRANS_VSYNC_OFFSET, TRANS_VTOTAL_OFFSET, Transcoder,
         };
         let mmio = FakeMmio::new();
         let mut ms = Modeset::new(&mmio, Ddi::A);
@@ -2404,7 +2412,7 @@ pub mod tests {
 
     fn smoke_program_transcoder_vblank_start_follows_display_version() -> TestResult {
         use crate::intel_gpu_gt::Gen12Platform;
-        use crate::intel_gpu_pipes::{Transcoder, TRANS_VBLANK_OFFSET, TRANS_VTOTAL_OFFSET};
+        use crate::intel_gpu_pipes::{TRANS_VBLANK_OFFSET, TRANS_VTOTAL_OFFSET, Transcoder};
         // intel_set_transcoder_timings for 1024x768 (vtotal 806): display 12
         // (TGL, ADL-S) writes VBLANK_START vactive - 1 = 767 with
         // VBLANK_END 805; display 13 (ADL-P, ADL-N) writes VBLANK_END only.
@@ -2439,7 +2447,7 @@ pub mod tests {
     );
 
     fn smoke_program_pipe_writes_srcsz() -> TestResult {
-        use crate::intel_gpu_pipes::{Pipe as PipeIdx, PIPE_SRCSZ_OFFSET};
+        use crate::intel_gpu_pipes::{PIPE_SRCSZ_OFFSET, Pipe as PipeIdx};
         let mmio = FakeMmio::new();
         let mut ms = Modeset::new(&mmio, Ddi::A);
         ms.program_pipe(&Mode::VESA_1024X768_60);
@@ -2508,7 +2516,7 @@ pub mod tests {
 
     fn smoke_program_plane_arms_surf_last() -> TestResult {
         use crate::intel_gpu_pipes::{
-            Pipe as PipeIdx, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
+            PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET, Pipe as PipeIdx,
         };
         let mmio = FakeMmio::new();
         let mut ms = Modeset::new(&mmio, Ddi::A);
@@ -2552,7 +2560,7 @@ pub mod tests {
     );
 
     fn smoke_enable_transcoder_writes_enable_bit() -> TestResult {
-        use crate::intel_gpu_pipes::{Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET};
+        use crate::intel_gpu_pipes::{PIPECONF_ENABLE, PIPECONF_OFFSET, Transcoder};
         let mut mmio = FakeMmio::new();
         // Pre-set the state bit so the poll returns immediately.
         mmio.state_offset = Transcoder::A.conf_base() + PIPECONF_OFFSET;
@@ -2652,7 +2660,7 @@ pub mod tests {
     );
 
     fn smoke_program_routing_and_watermarks() -> TestResult {
-        use crate::intel_gpu_pipes::{Pipe as PipeIdx, Transcoder, TRANS_DDI_FUNC_CTL_OFFSET};
+        use crate::intel_gpu_pipes::{Pipe as PipeIdx, TRANS_DDI_FUNC_CTL_OFFSET, Transcoder};
         let mmio = FakeMmio::new();
         let mut ms = Modeset::new(&mmio, Ddi::A);
         ms.program_trans_ddi_func_ctl_mode(4, crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST);
@@ -2773,8 +2781,8 @@ pub mod tests {
     fn smoke_disable_pipeline_writes_disables_in_order() -> TestResult {
         use crate::intel_gpu_ddi::DDI_BUF_CTL_OFFSET;
         use crate::intel_gpu_pipes::{
-            Pipe as PipeIdx, Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_CTL_ENABLE,
-            PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET,
+            PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET,
+            PLANE_PRIMARY_OFFSET, Pipe as PipeIdx, Transcoder,
         };
         let mut mmio = FakeMmio::new();
         // Use a wildcard state read that returns 0 for STATE bits
@@ -3426,8 +3434,8 @@ pub mod tests {
         "drivers/gpu/intel_gpu_modeset",
         smoke_modeset_gen12_xrgb_arb_slots_are_exact_source_family_literals
     );
-    fn smoke_external_display_family_uses_exact_pci_ids_and_rejects_generation_aliases(
-    ) -> TestResult {
+    fn smoke_external_display_family_uses_exact_pci_ids_and_rejects_generation_aliases()
+    -> TestResult {
         use crate::intel_gpu::{ChipInfo, Generation};
         use crate::intel_gpu_gt::Gen12Platform;
         for (did, generation, family) in [
@@ -3523,8 +3531,8 @@ fn takeover_display_with_chip<M: MmioWindow + ?Sized>(
     chip: Option<crate::intel_gpu::ChipInfo>,
 ) -> Option<Mode> {
     use crate::intel_gpu_pipes::{
-        Pipe, PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_STRIDE_OFFSET,
-        PLANE_SURF_OFFSET,
+        PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_STRIDE_OFFSET,
+        PLANE_SURF_OFFSET, Pipe,
     };
     if !generation.display_supported() {
         return None;

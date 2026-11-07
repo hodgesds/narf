@@ -286,6 +286,14 @@ pub(crate) fn compute_ip_vblank(
         if max_w == 0 || max_h == 0 || max_w > p.hdisplay || max_h > p.vdisplay {
             return Err(ResourceError::Unsupported);
         }
+        if let Some(scaler) = p.scaler {
+            if u64::from(scaler.window.x) + u64::from(scaler.window.width) > u64::from(p.hdisplay)
+                || u64::from(scaler.window.y) + u64::from(scaler.window.height)
+                    > u64::from(p.vdisplay)
+            {
+                return Err(ResourceError::Unsupported);
+            }
+        }
         for (i, plane) in p.planes.iter().enumerate() {
             let Some(plane) = plane else { continue };
             if plane.width == 0 || plane.height == 0 || plane.width > max_w || plane.height > max_h
@@ -307,7 +315,14 @@ pub(crate) fn compute_ip_vblank(
         {
             let mut all: Vec<&mut PlaneWm> = plane_wm.iter_mut().collect();
             all.push(&mut cursor_wm);
-            wm::check_vblank_dsc_ip(prefill_ip(ip), t, latency, &mut all, p.dsc.is_some())?;
+            wm::check_vblank_dsc_scaler_ip(
+                prefill_ip(ip),
+                t,
+                latency,
+                &mut all,
+                p.dsc.is_some(),
+                p.scaler.is_some(),
+            )?;
         }
         let mut crtc_data_rate = 0u64;
         for (i, plane) in p.planes.iter().enumerate() {
@@ -990,11 +1005,7 @@ fn restore(
         })
     };
     let ratio_mask = |mask: u32| {
-        if state.ip.xe2_plus() {
-            mask
-        } else {
-            0
-        }
+        if state.ip.xe2_plus() { mask } else { 0 }
     };
     if stage >= Stage::Mbus {
         let mask = ratio_mask(crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK);

@@ -3,7 +3,7 @@
 //! b90c984d skl_watermark.c / skl_prefill.c, independently of this
 //! module's arithmetic.
 use super::*;
-use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_kernel_test::{TestResult, kernel_test_in};
 
 /// 100 MHz pixel rate, htotal 1000: one line is exactly 10 µs, so
 /// `prefill_usecs_to_lines` is `us / 10` lines with no rounding for
@@ -249,4 +249,36 @@ fn smoke_xelpg_wm_dsc_prefill_adds_one_and_a_half_lines() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_wm",
     smoke_xelpg_wm_dsc_prefill_adds_one_and_a_half_lines
+);
+
+fn smoke_xelpg_wm_scaler_prefill_adds_four_lines() -> TestResult {
+    let t = ten_us_lines();
+    let lat = latency([6, 10, 100, 500, 900, 960]);
+    // Without scaler: latency 960 us fits into 100-line guardband (3 fixed lines + 96 lines = 99 lines <= 100).
+    // With scaler: adds 4 lines * 18963 / 65536 = 1.157 lines: 3 + 1.157 + 96 = 100.157 lines > 100, so level 5 fails to fit.
+    if wm_level_disabled_dsc(t, &lat, 0, false) != Ok(false) {
+        return TestResult::Fail("without scaler, latency 960 us must fit");
+    }
+    let mut primary = PlaneWm::default();
+    for l in primary.levels.iter_mut() {
+        *l = level(4);
+    }
+    if check_vblank_dsc_scaler_ip(
+        crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
+        t,
+        &lat,
+        &mut [&mut primary],
+        false,
+        true,
+    ) != Ok(true)
+        || primary.levels[5].enable
+        || !primary.levels[4].enable
+    {
+        return TestResult::Fail("a scaled pipe must lose level 5 due to 4-line scaler prefill");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_wm",
+    smoke_xelpg_wm_scaler_prefill_adds_four_lines
 );

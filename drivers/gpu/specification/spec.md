@@ -329,11 +329,16 @@ The Gen12 orchestrator writes `vblank_display13` on ADL-P/ADL-N, and
 `vblank_start`). The display-14 resource request
 (`intel_gpu_display_resources::request_dsc`, `initialize_dsc`) carries the
 pipe's `DscTerm`; `pipe_a_dsc` reads it back from Pipe A's engines.
-`intel_gpu_xelpg_scaler` models the panel fitter (`panel_fit`, `plan`,
+`intel_gpu_xelpg_scaler` models and programs the panel fitter (`panel_fit`, `plan`,
 `PipeScaler::enable_writes`, `disable_writes`, `nearest_filter_writes`,
-`calc_phase`, `prefill_lines`; `ScalerRefusal`) without a production
-caller. `intel_gpu_pipes::TranscoderProgram::vblank_display13` is the
-display 13+ `TRANS_VBLANK` value both display-14 writers and the display-13
+`calc_phase`, `prefill_lines`; `ScalerRefusal`). `XeLpgModeset` wires panel fitting
+(`with_panel_fit`, aspect/center/fullscreen scaling, nearest/default filters, sized
+framebuffer validation via `validate_framebuffer_sized`, `program_pipe_source`,
+`program_scaler`, `disable_scaler`) and bigjoiner master/slave programming
+(`with_bigjoiner`, `program_bigjoiner`, master `JOINER_ENABLE` and secondary
+`SECONDARY_BIG_JOINER_ENABLE` in `ICL_PIPE_DSS_CTL1`, watermark scaler prefill lines
+in `intel_gpu_xelpg_wm::check_vblank_dsc_scaler_ip`). `intel_gpu_pipes::TranscoderProgram::vblank_display13`
+is the display 13+ `TRANS_VBLANK` value both display-14 writers and the display-13
 Gen12 orchestrator use.
 
 ### Lunar Lake display 20 (Xe2_LPD)
