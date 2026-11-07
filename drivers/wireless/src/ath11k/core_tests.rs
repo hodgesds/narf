@@ -1512,7 +1512,7 @@ fn smoke_ath11k_wmi_per_pdev_routing() -> TestResult {
         "unconnected pdev sends"
     );
     let pipes: Vec<u8> = trace
-        .borrow()
+        .lock()
         .iter()
         .filter_map(|e| match e {
             Ev::Tx { pipe, .. } => Some(*pipe),

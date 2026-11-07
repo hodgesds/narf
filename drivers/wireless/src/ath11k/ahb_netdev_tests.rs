@@ -260,8 +260,8 @@ fn smoke_ath11k_ahb_netdev_dispatch() -> TestResult {
     };
     let shared = Shared::new(rt, test_rng);
     let mac = Mac::new(
-        Port(shared.clone(), 0),
-        Port(shared.clone(), 0),
+        Port(shared.clone(), 0, 0),
+        Port(shared.clone(), 0, 0),
         caps.clone(),
         MacConfig::wcn6855(),
         None,

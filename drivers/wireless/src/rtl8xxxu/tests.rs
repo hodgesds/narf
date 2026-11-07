@@ -1032,7 +1032,7 @@ fn smoke_rtl8xxxu_probe_stores_device_handle() -> TestResult {
     dev.set_ids(RTL8XXXU_VENDOR, RTL8188EU_ID);
     let dev = alloc::sync::Arc::new(dev);
 
-    let result = super::rtl8xxxu_probe(dev);
+    let result = super::rtl8xxxu_probe(dev, None);
     if result.is_err() {
         return TestResult::Fail("rtl8xxxu_probe returned Err for RTL8188EU");
     }
@@ -1268,7 +1268,7 @@ fn smoke_rtl8xxxu_disconnect_re_register() -> TestResult {
     dev1.set_ids(RTL8XXXU_VENDOR, RTL8192EU_ID);
     let dev1 = alloc::sync::Arc::new(dev1);
 
-    if super::rtl8xxxu_probe(dev1).is_err() {
+    if super::rtl8xxxu_probe(dev1, None).is_err() {
         return TestResult::Fail("first probe failed");
     }
     let count_after_first = super::DEVICES
@@ -1301,7 +1301,7 @@ fn smoke_rtl8xxxu_disconnect_re_register() -> TestResult {
     dev2.set_ids(RTL8XXXU_VENDOR, RTL8192EU_ID);
     let dev2 = alloc::sync::Arc::new(dev2);
 
-    if super::rtl8xxxu_probe(dev2).is_err() {
+    if super::rtl8xxxu_probe(dev2, None).is_err() {
         return TestResult::Fail("second probe after disconnect failed");
     }
     let count_after_second = super::DEVICES
