@@ -1329,10 +1329,28 @@ fn smoke_mbim_dss_connect_session() -> TestResult {
         if msg.len() != 72 {
             return Err("sent DSS_CONNECT is not 72 bytes");
         }
-        let (_, _, head) =
-            parse_command_head(msg).map_err(|_| "sent DSS_CONNECT head did not parse")?;
-        if head.service != MBIM_UUID_DSS || head.cid != CID_DSS_CONNECT {
+        // The sent frame is a COMMAND_MSG (a host request), not a
+        // COMMAND_DONE / INDICATE_STATUS response — `parse_command_head`
+        // only parses responses, so it rejects a request head by design
+        // (InvalidLength for any other message type). Read the request
+        // head fields directly, as the fake modem does for sent frames.
+        if frd32(msg, 0) != MBIM_COMMAND_MSG {
+            return Err("sent DSS_CONNECT message type is not COMMAND_MSG");
+        }
+        if frd32(msg, 4) != 72 {
+            return Err("sent DSS_CONNECT message length is not 72");
+        }
+        if frd32(msg, 12) != 1 || frd32(msg, 16) != 0 {
+            return Err("sent DSS_CONNECT fragment header wrong");
+        }
+        if msg[20..36] != MBIM_UUID_DSS[..] || frd32(msg, 36) != CID_DSS_CONNECT {
             return Err("sent DSS_CONNECT service/CID wrong");
+        }
+        if frd32(msg, 40) != COMMAND_TYPE_SET {
+            return Err("sent DSS_CONNECT command type is not SET");
+        }
+        if frd32(msg, 44) != 24 {
+            return Err("sent DSS_CONNECT information buffer length is not 24");
         }
         if msg[8..12] != [0x02, 0x00, 0x00, 0x00] {
             return Err("sent DSS_CONNECT transaction id wrong");
