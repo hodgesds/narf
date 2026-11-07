@@ -293,6 +293,16 @@ pub enum PanelPowerError {
 /// Trait for the host driver's view of: program GPIOs (VDD_EN /
 /// BL_EN) + program PWM (USER_LEVEL). Decoupling from MMIO lets
 /// the state machine be tested without a real panel.
+///
+/// Rail ownership: on AMD parts the VDD/BL_EN rails are sequenced
+/// by platform firmware (DMUB/EC panel power sequencing — the
+/// driver preserves it via `BootOptions::skip_panel_power_sequence`
+/// and the ATOM GPIO LUT is decode-only, with no pin-drive path),
+/// so the AMD production impl leaves `set_vdd` /
+/// `set_backlight_enable` as documented no-ops and the sequencer
+/// models those transitions plus their settle delays, while the
+/// host performs the PWM transitions itself. A platform where the
+/// host genuinely drives the rails implements all four methods.
 pub trait EdpPanelHw {
     /// Drive the VDD_EN GPIO. `true` = VDD on.
     fn set_vdd(&mut self, on: bool);
@@ -342,14 +352,27 @@ impl EdpPanelSequencer {
         Ok(())
     }
 
-    /// Drive VideoValid → BacklightOn. Programs:
+    /// Drive VideoValid → BacklightOn, or BacklightOff → BacklightOn
+    /// (the DPMS / platform-VDD relight: VDD stayed up under platform
+    /// firmware, video stayed valid, so only the backlight-enable
+    /// sequence re-runs). Programs:
     ///   wait T4 → BL_EN on → wait T5 → PWM USER_LEVEL.
+    ///
+    /// The BacklightOff predecessor is what makes DPMS off/on and
+    /// suspend/resume relight possible without cycling VDD: the
+    /// host owns the PWM half of the panel power sequence, the
+    /// platform firmware owns the VDD/BL_EN rails (see
+    /// [`EdpPanelHw`]), so a relight must not have to re-run the
+    /// VDD half to reach a lit panel again.
     pub fn power_on_backlight<H: EdpPanelHw>(
         &mut self,
         hw: &mut H,
         user_level: u16,
     ) -> Result<(), PanelPowerError> {
-        if !matches!(self.state, EdpPanelState::VideoValid) {
+        if !matches!(
+            self.state,
+            EdpPanelState::VideoValid | EdpPanelState::BacklightOff
+        ) {
             return Err(PanelPowerError::IllegalTransition);
         }
         hw.delay_ms(self.seq.t4_video_to_bl_ms);
@@ -507,4 +530,39 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_edp_rejects_illegal_transitions);
+
+    fn smoke_edp_relight_from_backlight_off() -> TestResult {
+        // DPMS off/on + suspend/resume relight: BacklightOff →
+        // BacklightOn must be legal without cycling VDD, and the
+        // restored level is the one the caller passes — the
+        // sequencer caches it as the new last_pwm_level.
+        let mut s = EdpPanelSequencer::new(EdpPowerSeq::default());
+        let mut hw = MockEdpHw { log: Vec::new() };
+        s.power_on_video(&mut hw).expect("on video");
+        s.power_on_backlight(&mut hw, 0xC000).expect("on bl");
+        s.power_off_backlight(&mut hw).expect("off bl");
+        if s.state != EdpPanelState::BacklightOff {
+            return TestResult::Fail("not BacklightOff after fade");
+        }
+        // No VDD event in the relight: VDD stays up throughout.
+        let vdd_before = hw.log.iter().filter(|e| e.0 == "vdd").count();
+        s.power_on_backlight(&mut hw, 0x8000)
+            .expect("relight from BacklightOff");
+        if s.state != EdpPanelState::BacklightOn {
+            return TestResult::Fail("relight did not reach BacklightOn");
+        }
+        if s.last_pwm_level != 0x8000 {
+            return TestResult::Fail("relight did not cache the new level");
+        }
+        if hw.log.iter().filter(|e| e.0 == "vdd").count() != vdd_before {
+            return TestResult::Fail("relight must not touch VDD");
+        }
+        // The last PWM write is the restored level.
+        let last_pwm = hw.log.iter().rev().find(|e| e.0 == "pwm");
+        if last_pwm != Some(&("pwm", 0x8000)) {
+            return TestResult::Fail("relight did not program the new level");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_edp_relight_from_backlight_off);
 }

@@ -1887,6 +1887,54 @@ impl AmdGpu {
         Ok(())
     }
 
+    /// Program the panel backlight PWM to a raw `USER_LEVEL`
+    /// (0 = full off, 0xFFFF = full on) — the sequencer-facing
+    /// form of [`AmdGpu::set_backlight`], without the percent
+    /// conversion. The eDP panel-power sequencer's production
+    /// `EdpPanelHw` drives this so suspend/resume relight goes
+    /// through the sequencer's T4/T5 ordering and `last_pwm_level`
+    /// cache instead of bypassing it.
+    ///
+    /// Same guards as `set_backlight`: requires a programmed mode
+    /// (DCN up) and a discovery-resolvable DCN base; Navi4 has
+    /// neither and refuses.
+    ///
+    /// Deliberately a small duplication of `set_backlight`'s
+    /// read-period → build → write body rather than a refactor of
+    /// it: #948 (AMD DC `set_backlight`) is a separate running
+    /// lane — consolidate the two once it lands.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively.
+    pub(crate) unsafe fn set_pwm_user_level(&mut self, level: u16) -> Result<(), AmdgpuError> {
+        if self.chip.family == Family::Navi4 {
+            return Err(AmdgpuError::UnknownAsic);
+        }
+        if self.mode.is_none() {
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+        let dcn_base = self
+            .ip_block_base(amdgpu_discovery::HW_ID_DCN, 0)
+            .ok_or(AmdgpuError::UnknownAsic)?;
+        // SAFETY: caller-asserted BAR5 ownership; the register is inside the
+        // DCN window `ip_block_base` resolved.
+        let period_cntl = unsafe {
+            mm_read(
+                &self.regs,
+                dcn_base + crate::amdgpu_backlight::BL_PWM_PERIOD_CNTL,
+            )
+        };
+        let writes = crate::amdgpu_backlight::build_set_user_level(0, level, period_cntl)
+            .map_err(|_| AmdgpuError::UnknownAsic)?;
+        // SAFETY: caller-asserted BAR5 ownership.
+        unsafe {
+            for w in &writes {
+                mm_write(&self.regs, dcn_base + w.addr, w.value);
+            }
+        }
+        Ok(())
+    }
+
     /// MP1 (SMU) register-window base. Reads IP discovery first;
     /// pre-discovery silicon doesn't expose SMU bring-up here.
     pub fn mp1_base(&self) -> Option<u32> {
@@ -2146,7 +2194,7 @@ pub(crate) fn boot_clock_ready() -> bool {
 /// reset handshake uses, and it is a fallback rather than the primary path
 /// because a spin count's duration is whatever the CPU clock makes it, while
 /// the hardware waits this stands in for are specified in time.
-fn delay_us(us: u32) {
+pub(crate) fn delay_us(us: u32) {
     let hz = narf_time::calibrate_clocks();
     if hz > 0 {
         narf_time::busy_wait_cycles((hz / 1_000_000).max(1) * u64::from(us));
