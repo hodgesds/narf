@@ -2772,14 +2772,10 @@ impl Igb {
         unsafe {
             self.mmio.write32(REG_IMC, !0u32);
             self.mmio.write32(REG_EIMC, !0u32);
-            self.mmio.write32(
-                q0.txdctl,
-                queue_disable_word(self.mmio.read32(q0.txdctl)),
-            );
-            self.mmio.write32(
-                q0.rxdctl,
-                queue_disable_word(self.mmio.read32(q0.rxdctl)),
-            );
+            self.mmio
+                .write32(q0.txdctl, queue_disable_word(self.mmio.read32(q0.txdctl)));
+            self.mmio
+                .write32(q0.rxdctl, queue_disable_word(self.mmio.read32(q0.rxdctl)));
             self.mmio.write32(REG_TCTL, TCTL_SUSPEND_OFF);
             self.mmio.write32(REG_RCTL, RCTL_SUSPEND_OFF);
         }
@@ -2818,11 +2814,7 @@ impl Igb {
                 REG_CTRL,
                 ctrl | CTRL_SLU | CTRL_FD | CTRL_SPEED_1000 | CTRL_FRCSPD | CTRL_FRCDPLX,
             );
-            Self::phy_write(
-                &self.mmio,
-                PHY_BMCR,
-                PHY_BMCR_ANENABLE | PHY_BMCR_ANRESTART,
-            );
+            Self::phy_write(&self.mmio, PHY_BMCR, PHY_BMCR_ANENABLE | PHY_BMCR_ANRESTART);
         }
         // Bounded wait for link (bring-up step 3); the result is
         // ignored — a wedged cable must not fail the recovery.
@@ -3766,25 +3758,24 @@ mod tests {
         rxcsum_rss_word, rxdctl_word, strip_vlan_tag_in_place, txdctl_word, usecs_to_eitr,
         vfta_bit, vfta_word, wol_supported, wol_suspend_program, wus_clear_word,
         wus_delivered_wake_packet, AdvRxDescRead, AdvRxDescWb, AdvTxCtxtDesc, AdvTxDataDesc,
-        DmaBuffer, DomainId, Frame, Igb, IgbStats, IrqSafeSpinLock, IvarScheme, MmioRegion,
-        TxMeta, TxRingCursor, VlanFilter, WolFilters, ADVTXD_DCMD_DEXT, ADVTXD_DTYP_CTXT,
-        ADV_RXD_STAT_VP, CTRL_ADVD3WUC, CTRL_RST, EEPROM_APME, EITR_CNT_IGNR, EITR_START,
-        IGB_82576, IGB_82576_NS, IGB_DRIVER_VERSION, IGB_I210_COPPER, IGB_I211_COPPER,
-        IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575, IGB_MAX_QUEUES_I211,
-        IGB_STAT_NAMES, IVAR_VALID, MRQC_ENABLE_RSS_MQ, MRQC_ENABLE_VMDQ,
-        MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4, MRQC_FIELD_IPV4_TCP, MRQC_FIELD_IPV4_UDP,
-        MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP, MRQC_FIELD_IPV6_TCP_EX, MRQC_FIELD_IPV6_UDP,
-        PHY_BMCR_PWRDOWN, QUEUE_ENABLE, RAH_AV, RCTL_BAM, RCTL_EN, RCTL_MPE, RCTL_SECRC,
-        RCTL_SUSPEND_ARMED, RCTL_SUSPEND_OFF, RCTL_UPE, REG_CTRL, REG_EIAC, REG_EIAM, REG_EIMC,
-        REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_MRQC,
-        REG_RAL0, REG_RAH0, REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT, REG_RETA_BASE,
-        REG_RSSRK_BASE, REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0, REG_STATUS, REG_TDBAH, REG_TDBAL,
-        REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0, REG_VET, REG_VFTA_BASE, REG_WUC, REG_WUFC,
-        REG_WUS, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE, RXCSUM_CRCOFL, RXCSUM_PCSD, RX_RING_LEN,
-        RX_RING_N, SRRCTL_DESCTYPE_ADV_ONEBUF, TCTL_EN, TCTL_PSP, TCTL_SUSPEND_OFF,
-        TXD_STAT_DD, TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_N,
-        TX_RING_USABLE, TX_TIMEOUT_NS, VET_8021Q, VFTA_WORDS, WUC_PME_EN, WUFC_LNKC, WUFC_MAG,
-        WUFC_MC, WUS_ARPD, WUS_IPV6,
+        DmaBuffer, DomainId, Frame, Igb, IgbStats, IrqSafeSpinLock, IvarScheme, MmioRegion, TxMeta,
+        TxRingCursor, VlanFilter, WolFilters, ADVTXD_DCMD_DEXT, ADVTXD_DTYP_CTXT, ADV_RXD_STAT_VP,
+        CTRL_ADVD3WUC, CTRL_RST, EEPROM_APME, EITR_CNT_IGNR, EITR_START, IGB_82576, IGB_82576_NS,
+        IGB_DRIVER_VERSION, IGB_I210_COPPER, IGB_I211_COPPER, IGB_I350_COPPER, IGB_MAX_QUEUES,
+        IGB_MAX_QUEUES_82575, IGB_MAX_QUEUES_I211, IGB_STAT_NAMES, IVAR_VALID, MRQC_ENABLE_RSS_MQ,
+        MRQC_ENABLE_VMDQ, MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4, MRQC_FIELD_IPV4_TCP,
+        MRQC_FIELD_IPV4_UDP, MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP, MRQC_FIELD_IPV6_TCP_EX,
+        MRQC_FIELD_IPV6_UDP, PHY_BMCR_PWRDOWN, QUEUE_ENABLE, RAH_AV, RCTL_BAM, RCTL_EN, RCTL_MPE,
+        RCTL_SECRC, RCTL_SUSPEND_ARMED, RCTL_SUSPEND_OFF, RCTL_UPE, REG_CTRL, REG_EIAC, REG_EIAM,
+        REG_EIMC, REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC,
+        REG_MRQC, REG_RAH0, REG_RAL0, REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT,
+        REG_RETA_BASE, REG_RSSRK_BASE, REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0, REG_STATUS,
+        REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0, REG_VET, REG_VFTA_BASE,
+        REG_WUC, REG_WUFC, REG_WUS, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE, RXCSUM_CRCOFL, RXCSUM_PCSD,
+        RX_RING_LEN, RX_RING_N, SRRCTL_DESCTYPE_ADV_ONEBUF, TCTL_EN, TCTL_PSP, TCTL_SUSPEND_OFF,
+        TXD_STAT_DD, TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_N, TX_RING_USABLE,
+        TX_TIMEOUT_NS, VET_8021Q, VFTA_WORDS, WUC_PME_EN, WUFC_LNKC, WUFC_MAG, WUFC_MC, WUS_ARPD,
+        WUS_IPV6,
     };
 
     fn smoke_igb_extended_interrupt_layout() -> TestResult {
@@ -3811,10 +3802,7 @@ mod tests {
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_extended_interrupt_layout);
 
-    use super::{
-        alloc_coherent, vmdq, AtomicBool, DmaBuffer, DomainId, Igb, IrqSafeSpinLock, MmioRegion,
-        Ordering, Vec, IMS_VMMB,
-    };
+    use super::{vmdq, Vec, IMS_VMMB};
     use narf_bus::{msix::__synth_msix_table, BarKind};
 
     /// Fake-MMIO igb for the mailbox-pump fixtures: a 64 KiB
@@ -4878,10 +4866,7 @@ mod tests {
         unsafe {
             let ctrl = core::ptr::read_volatile((base + REG_CTRL) as *const u32);
             if ctrl & CTRL_RST != 0 {
-                core::ptr::write_volatile(
-                    (base + REG_CTRL) as *mut u32,
-                    ctrl & !CTRL_RST,
-                );
+                core::ptr::write_volatile((base + REG_CTRL) as *mut u32, ctrl & !CTRL_RST);
             }
             if FIXTURE_COMPLETE_TX.load(Ordering::Acquire) {
                 let tdbal = core::ptr::read_volatile((base + REG_TDBAL) as *const u32) as u64;
@@ -4935,15 +4920,11 @@ mod tests {
             let rx_ring_buf = alloc_coherent(4096, DomainId::DRIVER_0).unwrap();
             let mut tx_buf_pool = alloc::vec::Vec::with_capacity(TX_RING_LEN);
             for _ in 0..TX_RING_LEN {
-                tx_buf_pool.push(
-                    alloc_coherent(super::FRAME_SIZE, DomainId::DRIVER_0).unwrap(),
-                );
+                tx_buf_pool.push(alloc_coherent(super::FRAME_SIZE, DomainId::DRIVER_0).unwrap());
             }
             let mut rx_buf_pool = alloc::vec::Vec::with_capacity(RX_RING_LEN);
             for _ in 0..RX_RING_LEN {
-                rx_buf_pool.push(
-                    alloc_coherent(super::FRAME_SIZE, DomainId::DRIVER_0).unwrap(),
-                );
+                rx_buf_pool.push(alloc_coherent(super::FRAME_SIZE, DomainId::DRIVER_0).unwrap());
             }
             let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
             let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
@@ -4995,25 +4976,23 @@ mod tests {
                         | super::CTRL_FRCSPD
                         | super::CTRL_FRCDPLX,
                 );
-                device.mmio.write32(q0.tdbal, (tx_phys & 0xFFFF_FFFF) as u32);
-                device.mmio.write32(q0.tdbah, (tx_phys >> 32) as u32);
                 device
                     .mmio
-                    .write32(q0.tdlen, (TX_RING_LEN * 16) as u32);
+                    .write32(q0.tdbal, (tx_phys & 0xFFFF_FFFF) as u32);
+                device.mmio.write32(q0.tdbah, (tx_phys >> 32) as u32);
+                device.mmio.write32(q0.tdlen, (TX_RING_LEN * 16) as u32);
                 device.mmio.write32(q0.tdh, 0);
                 device.mmio.write32(q0.tdt, 0);
                 device.mmio.write32(super::REG_TCTL, TCTL_EN | TCTL_PSP);
                 let txdctl = queue_enable_word(device.mmio.read32(q0.txdctl));
                 device.mmio.write32(q0.txdctl, txdctl);
-                device.mmio.write32(q0.rdbal, (rx_phys & 0xFFFF_FFFF) as u32);
+                device
+                    .mmio
+                    .write32(q0.rdbal, (rx_phys & 0xFFFF_FFFF) as u32);
                 device.mmio.write32(q0.rdbah, (rx_phys >> 32) as u32);
-                device
-                    .mmio
-                    .write32(q0.rdlen, (RX_RING_LEN * 16) as u32);
+                device.mmio.write32(q0.rdlen, (RX_RING_LEN * 16) as u32);
                 device.mmio.write32(q0.rdh, 0);
-                device
-                    .mmio
-                    .write32(q0.rdt, (RX_RING_LEN - 1) as u32);
+                device.mmio.write32(q0.rdt, (RX_RING_LEN - 1) as u32);
                 let mut srrctl = device.mmio.read32(q0.srrctl);
                 srrctl &= !(super::SRRCTL_BSIZEPKT_MASK | super::SRRCTL_DESCTYPE_MASK);
                 srrctl |= ((super::FRAME_SIZE as u32) >> super::SRRCTL_BSIZEPKT_SHIFT)
@@ -5029,9 +5008,7 @@ mod tests {
                         | super::RCTL_SECRC
                         | super::RCTL_BSIZE_2K,
                 );
-                device
-                    .mmio
-                    .write32(super::REG_VET, super::VET_8021Q);
+                device.mmio.write32(super::REG_VET, super::VET_8021Q);
             }
             // Prime the RX descriptors from the pool (bring-up step 7).
             {
@@ -5113,7 +5090,11 @@ mod tests {
                 return TestResult::Fail("igb recovery left the RX tail unprimed");
             }
         }
-        if device.tx_state.lock().stalled(posted + timeout + 1, timeout) {
+        if device
+            .tx_state
+            .lock()
+            .stalled(posted + timeout + 1, timeout)
+        {
             return TestResult::Fail("igb TX stall survived the recovery");
         }
         // 3. Traffic resumes: with the fake device completing

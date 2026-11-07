@@ -884,10 +884,7 @@ impl TxQueueState {
         self.cursor.reset();
         self.completion_slot = (0..TX_RING_LEN).collect();
         self.doorbell_tail = 0;
-        core::mem::replace(
-            &mut self.owned,
-            (0..TX_RING_LEN).map(|_| None).collect(),
-        )
+        core::mem::replace(&mut self.owned, (0..TX_RING_LEN).map(|_| None).collect())
     }
 }
 
@@ -3545,9 +3542,7 @@ impl E1000 {
             return Err(E1000Error::Other("e1000 device detached or suspended"));
         }
         if self.recovering.swap(true, Ordering::AcqRel) {
-            return Err(E1000Error::Other(
-                "e1000 TX recovery already in progress",
-            ));
+            return Err(E1000Error::Other("e1000 TX recovery already in progress"));
         }
         let result = self.recover_inner();
         self.recovering.store(false, Ordering::Release);
@@ -4580,10 +4575,10 @@ mod tests {
 
     use super::{
         alloc_coherent, channel, mta_bit, mta_word, multicast_hash12, rar_encode, rar_slot_ok,
-        vfta_bit, vfta_word, vlan_reinsert_tag, vlan_tci_parts, DmaBuffer, DmaPool, E1000, Frame,
+        vfta_bit, vfta_word, vlan_reinsert_tag, vlan_tci_parts, DmaBuffer, DmaPool, Frame,
         IrqSafeSpinLock, MmioRegion, MulticastFilter, RxDesc, TxDesc, TxQueueState, VlanFilter,
-        RX_RING_LEN, RX_RING_N, TXD_CMD_EOP, TXD_CMD_IFCS, TXD_CMD_RS, TXD_CMD_VLE,
-        TXD_STAT_DD, TX_RING_LEN, TX_RING_USABLE, TX_TIMEOUT_NS,
+        E1000, RX_RING_LEN, RX_RING_N, TXD_CMD_EOP, TXD_CMD_IFCS, TXD_CMD_RS, TXD_CMD_VLE,
+        TXD_STAT_DD, TX_RING_LEN, TX_RING_N, TX_RING_USABLE, TX_TIMEOUT_NS,
     };
 
     fn smoke_partial_tso_ring_requires_deferred_batch_flush() -> TestResult {
@@ -5418,7 +5413,9 @@ mod tests {
                 device.mmio.write32(super::REG_RAL0, ral);
                 device.mmio.write32(super::REG_RAH0, rah);
                 device.mmio.write32(super::REG_TDBAL, tx_phys as u32);
-                device.mmio.write32(super::REG_TDBAH, (tx_phys >> 32) as u32);
+                device
+                    .mmio
+                    .write32(super::REG_TDBAH, (tx_phys >> 32) as u32);
                 device
                     .mmio
                     .write32(super::REG_TDLEN, (TX_RING_LEN * 16) as u32);
@@ -5436,7 +5433,9 @@ mod tests {
                         | super::TCTL_RTLC,
                 );
                 device.mmio.write32(super::REG_RDBAL, rx_phys as u32);
-                device.mmio.write32(super::REG_RDBAH, (rx_phys >> 32) as u32);
+                device
+                    .mmio
+                    .write32(super::REG_RDBAH, (rx_phys >> 32) as u32);
                 device
                     .mmio
                     .write32(super::REG_RDLEN, (RX_RING_LEN * 16) as u32);
@@ -5446,10 +5445,7 @@ mod tests {
                     .write32(super::REG_RDT, (RX_RING_LEN - 1) as u32);
                 device.mmio.write32(
                     super::REG_RCTL,
-                    super::RCTL_EN
-                        | super::RCTL_BAM
-                        | super::RCTL_SECRC
-                        | super::RCTL_BSIZE_2K,
+                    super::RCTL_EN | super::RCTL_BAM | super::RCTL_SECRC | super::RCTL_BSIZE_2K,
                 );
                 let ctrl = device.mmio.read32(super::REG_CTRL);
                 device.mmio.write32(super::REG_CTRL, ctrl | super::CTRL_SLU);
