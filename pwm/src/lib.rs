@@ -3,8 +3,11 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use async_trait::async_trait;
 use narf_capabilities::{CapKind, CapType};
+use narf_lib::sync::IrqSafeSpinLock;
 
 /// PWM Polarity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +58,55 @@ pub trait PwmDevice: Send + Sync {
 
 /// Force-link hook.
 pub fn register_initcalls() {}
+
+// ── Controller registry ─────────────────────────────────────────────
+//
+// PWM controller drivers register the `PwmDevice` they drive under
+// the controller node's Devicetree phandle, so DT-described
+// consumers — a `pwm-fan` node whose `pwms` specifier carries that
+// phandle, an LED, a backlight — can resolve the controller the
+// board description points at without knowing which driver owns
+// the silicon. The registry is deliberately dumb: one phandle,
+// one controller, last registration wins. It holds no capability
+// and performs no arbitration; the consumer owns the channel it
+// was described with, and two consumers claiming the same channel
+// is a board-description bug, not something this table can fix.
+//
+// Registration timing matters: a consumer probe that runs before
+// its controller registers (e.g. the Stage::Device DT walk) gets
+// `None` and defers — the consumer's probe must treat that as a
+// retryable miss, not a hard failure. Controller drivers register
+// no later than Stage::Device for their consumers to bind at boot.
+
+/// Controllers registered by Devicetree phandle.
+static CONTROLLERS: IrqSafeSpinLock<Vec<(u32, Arc<dyn PwmDevice>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Register `dev` as the controller at DT phandle `phandle`.
+/// Re-registering under the same phandle replaces the previous
+/// controller (a later driver claiming the node wins).
+pub fn register_controller(phandle: u32, dev: Arc<dyn PwmDevice>) {
+    let mut g = CONTROLLERS.lock();
+    if let Some(slot) = g.iter_mut().find(|(ph, _)| *ph == phandle) {
+        slot.1 = dev;
+    } else {
+        g.push((phandle, dev));
+    }
+}
+
+/// The controller registered under DT phandle `phandle`, if any.
+pub fn lookup_controller(phandle: u32) -> Option<Arc<dyn PwmDevice>> {
+    CONTROLLERS
+        .lock()
+        .iter()
+        .find(|(ph, _)| *ph == phandle)
+        .map(|(_, dev)| dev.clone())
+}
+
+/// Drop the controller registered under `phandle`, if any.
+pub fn unregister_controller(phandle: u32) {
+    CONTROLLERS.lock().retain(|(ph, _)| *ph != phandle);
+}
 
 // ── Smoke Tests ───────────────────────────────────────────────────
 
@@ -256,4 +308,43 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("pwm", smoke_pwm_channel_count_reflects_construction);
+
+    fn smoke_pwm_controller_registry_round_trip() -> TestResult {
+        // A phandle no controller test has touched; unregister
+        // first so a stale entry from an aborted earlier run
+        // cannot make the miss check pass vacuously.
+        let phandle = 0x9_911u32;
+        unregister_controller(phandle);
+        if lookup_controller(phandle).is_some() {
+            return TestResult::Fail("unregistered phandle must miss");
+        }
+        let pwm = Arc::new(MockPwm {
+            state: IrqSafeSpinLock::new(Vec::new()),
+            channels: 2,
+        });
+        register_controller(phandle, pwm);
+        match lookup_controller(phandle) {
+            Some(found) => {
+                if found.channel_count() != 2 {
+                    return TestResult::Fail("registry returned the wrong controller");
+                }
+            }
+            None => return TestResult::Fail("registered controller must be found"),
+        }
+        // Re-registering under the same phandle replaces.
+        let pwm2 = Arc::new(MockPwm {
+            state: IrqSafeSpinLock::new(Vec::new()),
+            channels: 5,
+        });
+        register_controller(phandle, pwm2);
+        if lookup_controller(phandle).map(|c| c.channel_count()) != Some(5) {
+            return TestResult::Fail("re-register must replace the controller");
+        }
+        unregister_controller(phandle);
+        if lookup_controller(phandle).is_some() {
+            return TestResult::Fail("unregistered controller must be gone");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("pwm", smoke_pwm_controller_registry_round_trip);
 }
