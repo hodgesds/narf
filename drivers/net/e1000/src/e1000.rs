@@ -1931,6 +1931,10 @@ fn link_sample_from_status(status: u32) -> crate::publish::LinkSample {
         carrier: true,
         speed_mbps: Some(speed_mbps),
         duplex: Some(duplex),
+        // STATUS reports no media state; e1000-family parts are
+        // fixed copper/fiber, not caged modules (issue #791).
+        media_available: None,
+        phy_type: None,
     }
 }
 

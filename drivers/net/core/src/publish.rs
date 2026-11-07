@@ -36,7 +36,11 @@
 //!    paths that observe a link transition call [`publish_link`] with a
 //!    fresh [`LinkSample`], which forwards to
 //!    `narf_net::iface::set_link_metadata` (the one place carrier,
-//!    speed and duplex live for rtnetlink / ethtool consumers).
+//!    speed and duplex live for rtnetlink / ethtool consumers) and,
+//!    when the sample carries media state, to
+//!    `narf_net::iface::set_link_media` (module presence / raw PHY
+//!    type, issue #791 / #867 — carrier-independent, so a down
+//!    sample still lands the cage state).
 
 use alloc::vec::Vec;
 
@@ -61,6 +65,18 @@ pub struct LinkSample {
     pub speed_mbps: Option<u32>,
     /// Negotiated duplex, when the status source reports it.
     pub duplex: Option<LinkDuplex>,
+    /// Transceiver/module presence, when the status source reports
+    /// it (issue #791 / #867). `Some(true)` = a module is seated,
+    /// even when the link is down; `Some(false)` = an empty cage.
+    /// `None` = the family reports no media state. Unlike speed /
+    /// duplex it survives a carrier-down sample — see
+    /// `narf_net::iface::set_link_media`.
+    pub media_available: Option<bool>,
+    /// Raw firmware PHY-type code, when the status source reports
+    /// one (issue #791 / #867). Family-defined; for i40e it is the
+    /// AQ `get_link_status` phy_type byte. Decoding it to a name
+    /// is #867's table work.
+    pub phy_type: Option<u8>,
 }
 
 impl LinkSample {
@@ -69,6 +85,8 @@ impl LinkSample {
         carrier: false,
         speed_mbps: None,
         duplex: None,
+        media_available: None,
+        phy_type: None,
     };
 
     /// A carrier-up sample with the negotiated speed/duplex, either of
@@ -78,6 +96,8 @@ impl LinkSample {
             carrier: true,
             speed_mbps,
             duplex,
+            media_available: None,
+            phy_type: None,
         }
     }
 
@@ -88,6 +108,8 @@ impl LinkSample {
             carrier,
             speed_mbps: None,
             duplex: None,
+            media_available: None,
+            phy_type: None,
         }
     }
 }
@@ -155,9 +177,18 @@ pub fn publish_netdev_with_context(
 /// Push a fresh link sample into the registry's per-interface
 /// metadata. Returns false when no interface of that name is
 /// registered (a carrier event racing ahead of publication), which
-/// callers treat as benign: the next sample lands.
+/// callers treat as benign: the next sample lands. A sample that
+/// carries media state forwards it through
+/// [`narf_net::iface::set_link_media`] as well — media is
+/// carrier-independent, so a down sample that knows the cage is
+/// empty still lands that fact.
 pub fn publish_link(name: &str, sample: LinkSample) -> bool {
-    narf_net::iface::set_link_metadata(name, sample.carrier, sample.speed_mbps, sample.duplex)
+    let published =
+        narf_net::iface::set_link_metadata(name, sample.carrier, sample.speed_mbps, sample.duplex);
+    if sample.media_available.is_some() || sample.phy_type.is_some() {
+        narf_net::iface::set_link_media(name, sample.media_available, sample.phy_type);
+    }
+    published
 }
 
 /// Hand a received frame to the kernel-side stack. A no-op before
