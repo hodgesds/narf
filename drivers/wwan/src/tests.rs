@@ -351,9 +351,14 @@ fn fake_command_done(txn: u32, cid: u32, status: u32, info: &[u8]) -> Vec<u8> {
     fw32(&mut v, txn);
     fw32(&mut v, 1);
     fw32(&mut v, 0); // fragment header: single fragment
+
+    // UUID_BASIC_CONNECT, wire order — a literal on purpose: the fake
+    // never copies the production constant, so a shared wrong value
+    // cannot pass silently (the pinning test below anchors the value
+    // to the libmbim-derived bytes instead).
     v.extend_from_slice(&[
-        0x33, 0xCC, 0x89, 0xA2, 0xBC, 0xBB, 0x45, 0x18, 0xBB, 0xDB, 0x34, 0xEC, 0x7E, 0xDF, 0xB8,
-        0x73,
+        0xA2, 0x89, 0xCC, 0x33, 0xBC, 0xBB, 0x8B, 0x4F, 0xB6, 0xB0, 0x13, 0x3E, 0xC2, 0xAA, 0xE6,
+        0xDF,
     ]); // UUID_BASIC_CONNECT, wire order
     fw32(&mut v, cid);
     fw32(&mut v, status);
@@ -385,8 +390,8 @@ fn fake_indicate_connect(session: u32, state: u32) -> Vec<u8> {
     fw32(&mut v, 1);
     fw32(&mut v, 0);
     v.extend_from_slice(&[
-        0x33, 0xCC, 0x89, 0xA2, 0xBC, 0xBB, 0x45, 0x18, 0xBB, 0xDB, 0x34, 0xEC, 0x7E, 0xDF, 0xB8,
-        0x73,
+        0xA2, 0x89, 0xCC, 0x33, 0xBC, 0xBB, 0x8B, 0x4F, 0xB6, 0xB0, 0x13, 0x3E, 0xC2, 0xAA, 0xE6,
+        0xDF,
     ]);
     fw32(&mut v, mbim::CID_CONNECT);
     fw32(&mut v, info.len() as u32);
@@ -594,8 +599,8 @@ impl FakeModem {
                             fw32(&mut f0, 2);
                             fw32(&mut f0, 0);
                             f0.extend_from_slice(&[
-                                0x33, 0xCC, 0x89, 0xA2, 0xBC, 0xBB, 0x45, 0x18, 0xBB, 0xDB, 0x34,
-                                0xEC, 0x7E, 0xDF, 0xB8, 0x73,
+                                0xA2, 0x89, 0xCC, 0x33, 0xBC, 0xBB, 0x8B, 0x4F, 0xB6, 0xB0, 0x13,
+                                0x3E, 0xC2, 0xAA, 0xE6, 0xDF,
                             ]);
                             fw32(&mut f0, cid);
                             fw32(&mut f0, 0);
@@ -777,6 +782,63 @@ fn fake_ntb(session: u8, payload: &[u8]) -> Vec<u8> {
     v
 }
 
+// ─── Fixture: Basic Connect UUID pinned against the independent value ───────
+//
+// The production constant must equal the wire bytes libmbim 1.31.2
+// derives for `MBIM_UUID_BASIC_CONNECT`, independently of this crate:
+// printable `a289cc33-bcbb-8b4f-b6b0-133ec2aae6df`, wire bytes in
+// string order (no little-endian swap of any field — the Windows GUID
+// encoding does NOT apply on the MBIM wire). Issue #1710: the old
+// constant carried a different UUID value AND LE-swapped its first
+// four bytes, and every fixture echoed it, so nothing caught it.
+// This test is the anchor: the literal below comes from the libmbim
+// probe, not from the constant, and the fake-modem literals above
+// must agree with it as well (checked indirectly — the session tests
+// fail if a fake answers with a different service UUID than
+// `MBIM_UUID_BASIC_CONNECT`).
+
+fn smoke_mbim_uuid_basic_connect_pinned() -> TestResult {
+    // Independently-derived wire bytes (libmbim 1.31.2 probe, #1710).
+    const EXPECTED: [u8; 16] = [
+        0xA2, 0x89, 0xCC, 0x33, 0xBC, 0xBB, 0x8B, 0x4F, 0xB6, 0xB0, 0x13, 0x3E, 0xC2, 0xAA, 0xE6,
+        0xDF,
+    ];
+    if MBIM_UUID_BASIC_CONNECT != EXPECTED {
+        return TestResult::Fail("MBIM_UUID_BASIC_CONNECT differs from the libmbim-derived bytes");
+    }
+    // The first four wire bytes are the first UUID field in string
+    // order (a2 89 cc 33), NOT little-endian-swapped (33 cc 89 a2).
+    if MBIM_UUID_BASIC_CONNECT[0..4] != [0xA2, 0x89, 0xCC, 0x33] {
+        return TestResult::Fail("Basic Connect UUID first field is LE-swapped on the wire");
+    }
+    // Printable form of the same bytes, string order throughout.
+    let printable = alloc::format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-\
+         {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        EXPECTED[0],
+        EXPECTED[1],
+        EXPECTED[2],
+        EXPECTED[3],
+        EXPECTED[4],
+        EXPECTED[5],
+        EXPECTED[6],
+        EXPECTED[7],
+        EXPECTED[8],
+        EXPECTED[9],
+        EXPECTED[10],
+        EXPECTED[11],
+        EXPECTED[12],
+        EXPECTED[13],
+        EXPECTED[14],
+        EXPECTED[15],
+    );
+    if printable != "a289cc33-bcbb-8b4f-b6b0-133ec2aae6df" {
+        return TestResult::Fail("Basic Connect UUID printable form is wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wwan", smoke_mbim_uuid_basic_connect_pinned);
+
 // ─── Fixture: CONNECT set pinned byte-for-byte ───────────────────────────────
 //
 // The full COMMAND_MSG for a session-0 activation with APN "web",
@@ -799,8 +861,8 @@ fn smoke_mbim_connect_set_pinned() -> TestResult {
         0x07, 0x00, 0x00, 0x00, // TransactionId = 7
         0x01, 0x00, 0x00, 0x00, // Fragment: total = 1
         0x00, 0x00, 0x00, 0x00, // Fragment: current = 0
-        0x33, 0xCC, 0x89, 0xA2, 0xBC, 0xBB, 0x45, 0x18, // UUID_BASIC_CONNECT (wire order)
-        0xBB, 0xDB, 0x34, 0xEC, 0x7E, 0xDF, 0xB8, 0x73, //
+        0xA2, 0x89, 0xCC, 0x33, 0xBC, 0xBB, 0x8B, 0x4F, // UUID_BASIC_CONNECT (wire order)
+        0xB6, 0xB0, 0x13, 0x3E, 0xC2, 0xAA, 0xE6, 0xDF, //
         0x0C, 0x00, 0x00, 0x00, // CID = MBIM_CID_CONNECT (12)
         0x01, 0x00, 0x00, 0x00, // CommandType = SET
         0x42, 0x00, 0x00, 0x00, // InformationBufferLength = 66
@@ -841,8 +903,8 @@ fn smoke_mbim_caps_response_pinned() -> TestResult {
         0x02, 0x00, 0x00, 0x00, // TransactionId = 2
         0x01, 0x00, 0x00, 0x00, // Fragment: total = 1
         0x00, 0x00, 0x00, 0x00, // Fragment: current = 0
-        0x33, 0xCC, 0x89, 0xA2, 0xBC, 0xBB, 0x45, 0x18, // UUID_BASIC_CONNECT
-        0xBB, 0xDB, 0x34, 0xEC, 0x7E, 0xDF, 0xB8, 0x73, //
+        0xA2, 0x89, 0xCC, 0x33, 0xBC, 0xBB, 0x8B, 0x4F, // UUID_BASIC_CONNECT
+        0xB6, 0xB0, 0x13, 0x3E, 0xC2, 0xAA, 0xE6, 0xDF, //
         0x01, 0x00, 0x00, 0x00, // CID = MBIM_CID_DEVICE_CAPS (1)
         0x00, 0x00, 0x00, 0x00, // Status = SUCCESS
         0x92, 0x00, 0x00, 0x00, // InformationBufferLength = 146
