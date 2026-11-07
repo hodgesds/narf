@@ -1619,7 +1619,9 @@ mod tests {
         /// FourCC value (the `PORT_CS_1` command dwords alone
         /// cannot tell `ROUTER_OFFLINE_MODE` from
         /// `ENUMERATE_RE-TIMERS`: both are router-channel opcode
-        /// writes).
+        /// writes). An opcode is recorded when the driver issues
+        /// it, even if no retimer answers: an absent index's No
+        /// Response retries are part of the driven sequence.
         op_log: Vec<u32>,
     }
 
@@ -1679,6 +1681,14 @@ mod tests {
                 Some(Load::Retimer(i)) => self.retimers.get(i).is_some_and(|device| device.present),
                 _ => false,
             };
+            if write && reg == SB_OPCODE {
+                // Record the opcode the driver issued even when
+                // no retimer answers it: op_log is the operation
+                // sequence the scan drove, and a No Response
+                // attempt — an absent index's retry, or a dropped
+                // first SET_INBOUND_SBTX — is part of it.
+                self.op_log.push(self.window[0]);
+            }
             if !present {
                 self.outcome_nr = true;
                 return;
@@ -1703,7 +1713,6 @@ mod tests {
                 }
                 match reg {
                     SB_OPCODE => {
-                        self.op_log.push(staged[0]);
                         let opcode = staged[0];
                         if let Some(device) = self.device_mut(load) {
                             device.execute_op(opcode);
