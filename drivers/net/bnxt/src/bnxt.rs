@@ -1,78 +1,30 @@
-//! Broadcom NetXtreme-C/E (bnxt) Ethernet driver.
+//! Broadcom NetXtreme-C/E (bnxt) Ethernet driver — explicit refusal marker.
 //!
-//! Provides support for the Broadcom BCM573xx, BCM574xx, and BCM575xx
-//! series Ethernet controllers.
+//! The real datapath is NOT implemented and is deferred out of the
+//! desktop scope (issue #798): there is no TX/RX path and no `HwNic`
+//! implementation. Probe declines every device with
+//! `ProbeError::NotForThisDriver` *before touching the hardware*, so
+//! the device is never presented as bound and stays available to the
+//! next claimant in the bus arbitration walk (bus spec §9.3).
 //!
 //! References: `linux/drivers/net/ethernet/broadcom/bnxt/`
 
-extern crate alloc;
-
-use alloc::sync::Arc;
-use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BusDevice, BusDeviceCap, ProbeError};
 use narf_capabilities::{Cap, Write};
 
 const BNXT_PCI_VENDOR: u16 = 0x14E4;
 const BNXT_PCI_DEVICE_BCM57414: u16 = 0x16D7;
 
-// Basic BNXT registers
-const BNXT_VER: u64 = 0x00;
-const BNXT_MAC_CTRL: u64 = 0x04;
-const BNXT_MAC_RESET: u32 = 1 << 0;
-
-#[derive(Debug)]
-pub struct BnxtNic {
-    mmio: MmioRegion,
-}
-
-impl BnxtNic {
-    pub fn new(mmio: MmioRegion) -> Self {
-        let nic = Self { mmio };
-        nic.init();
-        nic
-    }
-
-    fn read_u32(&self, offset: u64) -> u32 {
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { self.mmio.read32(offset) }
-    }
-
-    fn write_u32(&self, offset: u64, val: u32) {
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { self.mmio.write32(offset, val) }
-    }
-
-    fn init(&self) {
-        // Read version/ID
-        let _ver = self.read_u32(BNXT_VER);
-
-        // Assert MAC reset
-        let ctrl = self.read_u32(BNXT_MAC_CTRL);
-        self.write_u32(BNXT_MAC_CTRL, ctrl | BNXT_MAC_RESET);
-
-        let mut timeout = 100_000;
-        while (self.read_u32(BNXT_MAC_CTRL) & BNXT_MAC_RESET) != 0 {
-            timeout -= 1;
-            if timeout == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-    }
-}
-
-pub fn probe(
-    device: BusDevice,
-    _cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let mmio = match unsafe { narf_bus::map_bar(&device, 0) } {
-        Ok(m) => m,
-        Err(_) => return Err(narf_bus::ProbeError::BadDevice),
-    };
-
-    let _nic = Arc::new(BnxtNic::new(mmio));
-    // Would normally register to net registry here
-    Ok(())
+/// Probe entry — installed via `bus::register_pci_driver`.
+///
+/// Explicit refusal, not a driver: the bnxt datapath is deferred out
+/// of desktop scope (#798), so this always declines with
+/// `NotForThisDriver`. The dispatcher returns the device to the
+/// candidate list and attempts the next-most-specific match. No BAR
+/// is mapped and no reset is pulsed — declining must not disturb
+/// hardware another driver may later claim.
+pub fn probe(_device: BusDevice, _cap: Cap<BusDeviceCap, Write>) -> Result<(), ProbeError> {
+    Err(ProbeError::NotForThisDriver)
 }
 
 pub fn register_pci_driver() {
