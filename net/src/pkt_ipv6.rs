@@ -190,6 +190,79 @@ impl Icmpv6Header {
     }
 }
 
+// ── ICMPv6 error messages (RFC 4443 §3) ────────────────────────────
+
+/// Minimum IPv6 MTU (RFC 8200 §5). Every ICMPv6 error message must fit
+/// within it, IPv6 header included (RFC 4443 §2.4(c)).
+pub const ICMPV6_MIN_MTU: usize = 1280;
+
+/// Maximum invoking-packet bytes an ICMPv6 error message may quote:
+/// minimum MTU minus the IPv6 header (40) minus the ICMPv6 error
+/// header (type/code/checksum + 32-bit field = 8).
+pub const ICMPV6_MAX_INVOKING_LEN: usize = ICMPV6_MIN_MTU - IPV6_HDR_LEN - 8; // 1232
+
+// Destination Unreachable codes (RFC 4443 §3.1). Code 7 ("error in
+// source routing header") existed in RFC 2463 and was removed in
+// RFC 4443 — do not re-add it.
+pub const ICMPV6_DU_NO_ROUTE: u8 = 0;
+pub const ICMPV6_DU_ADMIN_PROHIBITED: u8 = 1;
+pub const ICMPV6_DU_BEYOND_SCOPE: u8 = 2;
+pub const ICMPV6_DU_ADDR_UNREACHABLE: u8 = 3;
+pub const ICMPV6_DU_PORT_UNREACHABLE: u8 = 4;
+pub const ICMPV6_DU_SRC_FAILED_POLICY: u8 = 5;
+pub const ICMPV6_DU_REJECT_ROUTE: u8 = 6;
+
+// Time Exceeded codes (RFC 4443 §3.3).
+pub const ICMPV6_TE_HOP_LIMIT: u8 = 0;
+pub const ICMPV6_TE_REASSEMBLY: u8 = 1;
+
+// Parameter Problem codes (RFC 4443 §3.4).
+pub const ICMPV6_PP_ERRONEOUS_FIELD: u8 = 0;
+pub const ICMPV6_PP_UNKNOWN_NEXT_HEADER: u8 = 1;
+pub const ICMPV6_PP_UNKNOWN_OPTION: u8 = 2;
+
+/// Build an ICMPv6 error message body (RFC 4443 §2.1, §3): type/code,
+/// checksum placeholder (zero — the transmit path stamps the
+/// pseudo-header checksum), a 32-bit message field, then as much of
+/// `invoking` as fits without the ICMPv6 packet exceeding the minimum
+/// IPv6 MTU (RFC 4443 §2.4(c)). `invoking` is the offending packet
+/// starting at its IPv6 header.
+pub fn icmp6_error_body(typ: u8, code: u8, field: u32, invoking: &[u8]) -> Vec<u8> {
+    let quoted = invoking.len().min(ICMPV6_MAX_INVOKING_LEN);
+    let mut out = Vec::with_capacity(8 + quoted);
+    out.push(typ);
+    out.push(code);
+    out.extend_from_slice(&[0u8; 2]); // checksum placeholder
+    out.extend_from_slice(&field.to_be_bytes());
+    out.extend_from_slice(&invoking[..quoted]);
+    out
+}
+
+/// Destination Unreachable (type 1, RFC 4443 §3.1). The 32-bit field
+/// is unused and zero for every code.
+pub fn destination_unreachable(code: u8, invoking: &[u8]) -> Vec<u8> {
+    icmp6_error_body(ICMPV6_DESTINATION_UNREACHABLE, code, 0, invoking)
+}
+
+/// Packet Too Big (type 2, code 0, RFC 4443 §3.2). The 32-bit field
+/// carries the MTU of the next-hop link.
+pub fn packet_too_big(mtu: u32, invoking: &[u8]) -> Vec<u8> {
+    icmp6_error_body(ICMPV6_PACKET_TOO_BIG, 0, mtu, invoking)
+}
+
+/// Time Exceeded (type 3, RFC 4443 §3.3). The 32-bit field is unused
+/// and zero for every code.
+pub fn time_exceeded(code: u8, invoking: &[u8]) -> Vec<u8> {
+    icmp6_error_body(ICMPV6_TIME_EXCEEDED, code, 0, invoking)
+}
+
+/// Parameter Problem (type 4, RFC 4443 §3.4). The 32-bit field is the
+/// Pointer: the octet offset within the invoking packet where the
+/// error was detected.
+pub fn parameter_problem(code: u8, pointer: u32, invoking: &[u8]) -> Vec<u8> {
+    icmp6_error_body(ICMPV6_PARAMETER_PROBLEM, code, pointer, invoking)
+}
+
 // ── Neighbor Discovery options (RFC 4861 §4.6) ─────────────────────
 
 pub const ND_OPT_SOURCE_LINK_LAYER_ADDR: u8 = 1;
