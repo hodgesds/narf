@@ -8577,6 +8577,11 @@ struct FixtureState {
     fail_probe: bool,
     fail_set_interface: bool,
     packets: VecDeque<Vec<u8>>,
+    /// Concurrent `isoch_in` calls in flight right now.
+    isoch_in_flight: usize,
+    /// High-water mark of `isoch_in_flight` — the #808 pipeline
+    /// proof: the maximum the transport ever observed at once.
+    isoch_max_in_flight: usize,
 }
 
 /// Modelled UVC device behind the [`crate::uvc::UvcTransport`] seam.
@@ -8601,12 +8606,20 @@ impl FixtureTransport {
                 fail_probe,
                 fail_set_interface,
                 packets: packets.into(),
+                isoch_in_flight: 0,
+                isoch_max_in_flight: 0,
             }),
         }
     }
 
     fn log(&self) -> Vec<FixtureXfer> {
         self.state.lock().log.clone()
+    }
+
+    /// High-water mark of concurrent `isoch_in` calls observed by
+    /// the modelled device — the #808 pipeline depth proof.
+    fn max_isoch_in_flight(&self) -> usize {
+        self.state.lock().isoch_max_in_flight
     }
 
     /// Set the modelled device's VC HEADER clock, answered in the
@@ -8660,6 +8673,29 @@ impl Future for PacketStaged<'_> {
         } else {
             Poll::Ready(())
         }
+    }
+}
+
+/// RAII counter for concurrent `isoch_in` calls: increments on
+/// entry, decrements on drop — including when the pump drops a
+/// parked transfer at STREAMOFF — and records the high-water mark
+/// the #808 pipeline fixture asserts on.
+struct IsochInFlightGuard<'a> {
+    state: &'a IrqSafeSpinLock<FixtureState>,
+}
+
+impl<'a> IsochInFlightGuard<'a> {
+    fn new(state: &'a IrqSafeSpinLock<FixtureState>) -> Self {
+        let mut s = state.lock();
+        s.isoch_in_flight += 1;
+        s.isoch_max_in_flight = s.isoch_max_in_flight.max(s.isoch_in_flight);
+        Self { state }
+    }
+}
+
+impl Drop for IsochInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.state.lock().isoch_in_flight -= 1;
     }
 }
 
@@ -8767,12 +8803,24 @@ impl crate::uvc::UvcTransport for FixtureTransport {
         Ok(())
     }
 
+    fn isoch_pipeline_depth(&self) -> usize {
+        // The modelled device serves concurrent `isoch_in` calls
+        // from independent staged packets, so it advertises the
+        // full scheduler depth — the transport the #808 pipeline
+        // fixture proves against. (The real xHCI transport keeps
+        // depth 1: one shared DMA page per endpoint, see #885.)
+        narf_drivers_video::uvc::ISOC_DEPTH
+    }
+
     async fn isoch_in(
         &self,
         _slot_id: u8,
         _dci: u8,
         out: &mut [u8],
     ) -> Result<usize, crate::xhci::XhciError> {
+        // Track concurrent in-flight transfers: the #808 pipeline
+        // proof is the maximum observed here, not a count of calls.
+        let _guard = IsochInFlightGuard::new(&self.state);
         // Park until the device sources a packet, like the real
         // transfer: never an empty read.
         PacketStaged { state: &self.state }.await;
@@ -9323,6 +9371,121 @@ fn smoke_uvc_streamon_composition_e2e() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_composition_e2e);
+
+/// High-bandwidth isochronous pipelining (#808): the capture pump
+/// keeps `ISOC_DEPTH` transfers in flight against a transport that
+/// advertises it, and frames complete in order.
+///
+/// The modelled camera is the same 640×480 YUYV @30 device as the
+/// composition e2e (1024-byte payloads), but the stream is six
+/// four-packet frames back to back — 24 packets, 4088 payload bytes
+/// per frame — instead of one two-packet frame. Packet counts and
+/// frame sizes come from the UVC payload framing itself (2-byte
+/// header + payload, FID toggle per frame, EOF on the last packet),
+/// never from the pump's implementation constants. The test asserts
+/// three things the single-shot pump cannot show: the transport
+/// observed all four transfers in flight at once, all 24 packets
+/// arrived through `isoch_in`, and all six frames dequeued
+/// byte-exact and in order.
+fn smoke_uvc_isoc_pipeline_high_bandwidth() -> TestResult {
+    let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(false, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if fixture_streamon(&dev, &events, &ctx) != Ok(0) {
+        return TestResult::Fail("STREAMON should succeed");
+    }
+    let generation = crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    let mut pump = Box::pin(crate::uvc::pump_video_frames_with(
+        idx,
+        &*transport,
+        generation,
+    ));
+    // Warm-up: the bind staged one two-packet frame
+    // (`UVC-E2E-FRAME!`); the pipelined pump must deliver it first.
+    let mut warm = None;
+    for _ in 0..10_000 {
+        let _ = fixture_poll(pump.as_mut());
+        match fixture_dqbuf(&dev, &events, &ctx) {
+            FixtureDqbuf::Frame(bytes) => {
+                warm = Some(bytes);
+                break;
+            }
+            FixtureDqbuf::Again => continue,
+            FixtureDqbuf::Failed(e) => return TestResult::Fail(e),
+        }
+    }
+    if warm.as_deref() != Some(b"UVC-E2E-FRAME!".as_slice()) {
+        return TestResult::Fail("pipelined pump should deliver the staged frame first");
+    }
+    // Six four-packet frames. Frame `f` alternates FID from the
+    // warm-up frame's FID 1 (so `f` even → FID 0, odd → FID 1);
+    // every packet carries 1022 payload bytes (a 1024-byte transfer
+    // minus the 2-byte UVC header), each filled with one marker
+    // byte per (frame, packet), so any reordering or drop changes
+    // the dequeued bytes.
+    let mut expected: Vec<Vec<u8>> = Vec::new();
+    for f in 0..6u8 {
+        let fid = if f % 2 == 0 { 0x00 } else { 0x01 };
+        let mut frame: Vec<u8> = Vec::new();
+        for p in 0..4u8 {
+            let flags = 0x80 | fid | if p == 3 { 0x02 } else { 0x00 };
+            let marker = f.wrapping_mul(16).wrapping_add(p);
+            let payload = alloc::vec![marker; 1022];
+            transport.stage_packet(uvc_fixture_packet(flags, &payload));
+            frame.extend_from_slice(&payload);
+        }
+        expected.push(frame);
+    }
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..100_000 {
+        let _ = fixture_poll(pump.as_mut());
+        match fixture_dqbuf(&dev, &events, &ctx) {
+            FixtureDqbuf::Frame(bytes) => {
+                got.push(bytes);
+                if got.len() == expected.len() {
+                    break;
+                }
+            }
+            FixtureDqbuf::Again => continue,
+            FixtureDqbuf::Failed(e) => return TestResult::Fail(e),
+        }
+    }
+    if got != expected {
+        return TestResult::Fail("high-bandwidth frames must dequeue byte-exact and in order");
+    }
+    if transport.max_isoch_in_flight() != narf_drivers_video::uvc::ISOC_DEPTH {
+        return TestResult::Fail("pipelined pump should keep ISOC_DEPTH transfers in flight");
+    }
+    let isoch_count = transport
+        .log()
+        .iter()
+        .filter(|x| matches!(x, FixtureXfer::IsochIn))
+        .count();
+    if isoch_count != 2 + 24 {
+        return TestResult::Fail("all staged packets should arrive through isoch_in");
+    }
+    // STREAMOFF reverses the composition; the parked pump exits
+    // cleanly on the wake packet, as in the composition e2e.
+    match fixture_streamoff(&dev, &events, &ctx) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("STREAMOFF should succeed"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    transport.stage_packet(alloc::vec![2u8, 0x83, b'W', b'A', b'K', b'E', b'!']);
+    let mut pump_done = None;
+    for _ in 0..10_000 {
+        if let Poll::Ready(r) = fixture_poll(pump.as_mut()) {
+            pump_done = Some(r);
+            break;
+        }
+    }
+    if !matches!(pump_done, Some(Ok(()))) {
+        return TestResult::Fail("pump should exit Ok after STREAMOFF");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_isoc_pipeline_high_bandwidth);
 
 /// The bulk fallback's selection rules, pinned without hardware:
 /// the isochronous gate rejects a PROBE figure above its interval
