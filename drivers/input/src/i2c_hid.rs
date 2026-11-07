@@ -384,6 +384,46 @@ impl I2cHidDriver {
     pub fn descriptor(&self) -> Option<HidDescriptor> {
         self.descriptor
     }
+
+    /// The bus this driver talks on. System-PM snapshots the bus +
+    /// address + descriptor so the suspend/resume hooks can drive
+    /// the device without owning the pump's driver instance.
+    pub fn bus(&self) -> &Arc<dyn I2cBus> {
+        &self.bus
+    }
+
+    /// 7-bit slave address of this device.
+    pub fn addr(&self) -> u8 {
+        self.addr
+    }
+
+    /// HID descriptor register address (from `_DSM` or the 0x0001
+    /// fallback) — needed to rebuild a driver from a snapshot.
+    pub fn hid_desc_register(&self) -> u16 {
+        self.hid_desc_register
+    }
+
+    /// Build a driver around an already-known descriptor. The
+    /// system-PM resume path uses this: after RESET the pump's
+    /// descriptor snapshot is still the register map (the pump
+    /// itself assumes the same), so the hook can issue RESET +
+    /// SET_POWER(ON) + PTP mode restore without a bus read first —
+    /// a sleeping device may not answer a descriptor read until
+    /// it has been woken with SET_POWER(ON), which itself needs
+    /// the command register from the descriptor.
+    pub fn from_descriptor(
+        bus: Arc<dyn I2cBus>,
+        addr: u8,
+        hid_desc_register: u16,
+        descriptor: HidDescriptor,
+    ) -> Self {
+        Self {
+            bus,
+            addr,
+            hid_desc_register,
+            descriptor: Some(descriptor),
+        }
+    }
 }
 
 /// Single helper for the no-data commands (RESET, SET_POWER). The
@@ -489,6 +529,12 @@ pub fn register_initcalls() {
         },
         3000,
     );
+    // System-PM hook for the devices the bind pass records
+    // (SET_POWER SLEEP on prepare, RESET + POWER_ON + PTP mode
+    // restore on resume). The hook is a no-op over an empty
+    // device list until a pump records its device; see
+    // `i2c_hid_pm`.
+    crate::i2c_hid_pm::register_pm();
 }
 
 /// Evaluate `<path>._CRS` and print each resource item we recognize.
