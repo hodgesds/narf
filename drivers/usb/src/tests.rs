@@ -6447,6 +6447,17 @@ fn smoke_fp_node_read_write_via_devfs() -> TestResult {
                 } else if buf[..4] != [0x10, 0x20, 0x30, 0x40] {
                     fail = Some("node read must return the scripted response bytes");
                 }
+                if fail.is_none() {
+                    // The read must have reached bulk-IN on slot 2,
+                    // DCI 3 (ep 0x81), returning all 4 scripted bytes.
+                    match fake.steps.lock().last() {
+                        Some(FakeFpStep::BulkIn { slot, dci, len })
+                            if *slot == 2 && *dci == 3 && *len == 4 => {}
+                        _ => {
+                            fail = Some("node read must reach bulk-IN slot 2 DCI 3 with 4 bytes");
+                        }
+                    }
+                }
             }
             // Short bulk-OUT fails the write (full-transfer rule).
             if fail.is_none() {
@@ -6484,6 +6495,17 @@ fn smoke_fp_node_read_write_via_devfs() -> TestResult {
                 let armed = with_device(1, |d| d.is_armed());
                 if armed != Some(true) {
                     fail = Some("ELAN read must arm the interrupt-IN endpoint");
+                }
+            }
+            if fail.is_none() {
+                // The first ELAN read must arm interrupt-IN on slot 3,
+                // DCI 3 (ep 0x81), for the 64-byte max packet.
+                match fake.steps.lock().last() {
+                    Some(FakeFpStep::ArmInterrupt { slot, dci, len })
+                        if *slot == 3 && *dci == 3 && *len == 64 => {}
+                    _ => {
+                        fail = Some("ELAN read must arm interrupt-IN slot 3 DCI 3 for 64 bytes");
+                    }
                 }
             }
         } else {
