@@ -485,8 +485,11 @@ pub fn profile_for(id: &SlaveId) -> CodecProfile {
     }
 }
 
+/// Stream direction, shared by the card and its payload-engine
+/// factory: a playback lease programs a TX DMA channel, a capture
+/// lease an RX DMA channel.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Direction {
+pub enum Direction {
     Playback,
     Capture,
 }
@@ -505,8 +508,10 @@ pub trait PayloadEngine: Send + Sync + core::fmt::Debug {
     /// Stop a running stream if needed, reset the ring, and program
     /// the DMA channel (ATU/window, ring address/size, watermark).
     fn prepare(&mut self) -> Result<(), SoundError>;
-    /// Claim the DMA channel and enable DMA. Fails `DeviceBusy` when
-    /// another stream on the same card already owns the channel.
+    /// Claim this stream's DMA channel and enable DMA. Fails
+    /// `DeviceBusy` when the same stream's channel is already
+    /// claimed (the card already arbitrates one lease per
+    /// direction; the engine claim is defense-in-depth).
     fn start(&mut self) -> Result<(), SoundError>;
     /// Stop DMA. On failure the ring, position, and channel claim are
     /// retained (failed-stop retention) and the caller must retry.
@@ -523,7 +528,7 @@ pub trait PayloadEngine: Send + Sync + core::fmt::Debug {
     /// Drop-path shutdown: stop DMA and report whether the ring may
     /// be freed. The default reports success only on a clean stop; an
     /// engine with channel arbitration overrides this to release its
-    /// guard even when the stop itself fails, so the card is not
+    /// per-stream channel claim even when the stop itself fails, so the card is not
     /// wedged by a lease that is going away anyway.
     fn shutdown_for_drop(&mut self) -> bool {
         self.stop().is_ok()
@@ -532,9 +537,10 @@ pub trait PayloadEngine: Send + Sync + core::fmt::Debug {
 
 /// Builds one fresh [`PayloadEngine`] per stream lease. The factory is
 /// per-card, so every engine it builds shares the card's DMA channel
-/// arbitration.
+/// arbitration; `direction` selects which of the card's channels the
+/// engine programs (playback TX, capture RX).
 pub trait PayloadEngineFactory: Send + Sync + core::fmt::Debug {
-    fn create(&self) -> Box<dyn PayloadEngine>;
+    fn create(&self, direction: Direction) -> Box<dyn PayloadEngine>;
 }
 
 /// A sound card backed by one enumerated SDW peripheral, published
@@ -671,7 +677,7 @@ impl<T: Transport + 'static> PcmDevice for CodecCard<T> {
             engine: self
                 .payload_factory
                 .as_ref()
-                .map(|factory| Arc::new(IrqSafeSpinLock::new(factory.create()))),
+                .map(|factory| Arc::new(IrqSafeSpinLock::new(factory.create(direction)))),
         }))
     }
 }
@@ -857,7 +863,7 @@ impl<T: Transport> Drop for SdwPcm<T> {
     fn drop(&mut self) {
         // Quiesce DMA before dropping the wire. A failed stop must
         // not free the ring under a live engine, so leak the engine
-        // instead (its channel guard is force-released by
+        // instead (its per-stream channel claim is force-released by
         // `shutdown_for_drop`, so the card is not wedged; the next
         // lease reprograms the channel for its own ring).
         if self.enabled {
@@ -1270,9 +1276,11 @@ mod tests {
             GENERIC_CODEC_PROFILE,
             stream,
         );
-        card.set_payload_engine(Arc::new(FakeDmaFactory::new(regs.clone())));
+        card.set_payload_engine(Arc::new(FakeDmaFactory::new(regs.clone(), 0)));
         // Playback lease: configure → prepare → start → write →
-        // pointer → pause → resume → stop.
+        // pointer → pause → resume → stop. The TX0 stream (stream
+        // id 0) carries the playback counter; the RX0 stream
+        // (stream id 3) has an independent counter.
         let mut pcm = match card.open(false, 0) {
             Ok(pcm) => pcm,
             Err(_) => return TestResult::Fail("playback open failed"),
@@ -1292,7 +1300,7 @@ mod tests {
         if pcm.write(&[0x11u8; 4096]) != Ok(4096) {
             return TestResult::Fail("playback write failed");
         }
-        regs.set_counter(4096);
+        regs.set_counter(0, 4096);
         if pcm.pointer() != 1024 {
             return TestResult::Fail("playback pointer mismatch");
         }
@@ -1307,10 +1315,40 @@ mod tests {
         if pcm.pause(false) != Ok(()) {
             return TestResult::Fail("resume failed");
         }
-        regs.set_counter(8192);
+        regs.set_counter(0, 8192);
         if pcm.pointer() != 2048 {
             return TestResult::Fail("resumed pointer mismatch");
         }
+        // Capture lease on the same card WHILE playback runs: the
+        // per-stream model gives capture its own RX0 channel, so
+        // the second lease starts instead of failing DeviceBusy.
+        // Its counter is independent of the playback counter.
+        let mut cap = match card.open(true, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("capture open during playback failed"),
+        };
+        if cap.configure(card.default_params(true)) != Ok(())
+            || cap.prepare() != Ok(())
+            || cap.start() != Ok(())
+        {
+            return TestResult::Fail("capture lifecycle during playback failed");
+        }
+        regs.set_counter(3, 4096);
+        let mut out = [0u8; 4096];
+        if cap.read(&mut out) != Ok(4096) || out != [0u8; 4096] {
+            return TestResult::Fail("capture read mismatch");
+        }
+        if cap.read(&mut out) != Ok(0) {
+            return TestResult::Fail("capture read with no new data must return 0");
+        }
+        // Playback is unaffected by the capture stream's counter.
+        if pcm.pointer() != 2048 {
+            return TestResult::Fail("playback pointer must be unaffected by capture");
+        }
+        if cap.stop() != Ok(()) {
+            return TestResult::Fail("capture stop failed");
+        }
+        drop(cap);
         if pcm.stop() != Ok(()) {
             return TestResult::Fail("playback stop failed");
         }
@@ -1319,39 +1357,6 @@ mod tests {
             return TestResult::Fail("start after stop must fail without prepare");
         }
         drop(pcm);
-        // Capture lease on the same card (the guard hands off across
-        // leases). The fake counter drives completion; the ring was
-        // reset to zeros, so the read returns zero bytes — the
-        // accounting path, not the data path (data across the ring is
-        // pinned in the engine fixtures).
-        let mut cap = match card.open(true, 0) {
-            Ok(pcm) => pcm,
-            Err(_) => return TestResult::Fail("capture open failed"),
-        };
-        if cap.configure(card.default_params(true)) != Ok(())
-            || cap.prepare() != Ok(())
-            || cap.start() != Ok(())
-        {
-            return TestResult::Fail("capture lifecycle failed");
-        }
-        regs.set_counter(12288);
-        // NOTE: the fake counter block is shared across leases, and
-        // capture `start` latched baseline 8192 (the playback lease's
-        // final value). The counter must move monotonically under a
-        // running engine — a backward jump reads as an overrun and
-        // trips xrun — so the capture completion is 8192 + 4096, not
-        // a reset to 4096.
-        let mut out = [0u8; 4096];
-        if cap.read(&mut out) != Ok(4096) || out != [0u8; 4096] {
-            return TestResult::Fail("capture read mismatch");
-        }
-        if cap.read(&mut out) != Ok(0) {
-            return TestResult::Fail("capture read with no new data must return 0");
-        }
-        if cap.stop() != Ok(()) {
-            return TestResult::Fail("capture stop failed");
-        }
-        drop(cap);
         TestResult::Pass
     }
     kernel_test_in!("audio/soundwire", sdw_pcm_moves_samples_through_dma_engine);

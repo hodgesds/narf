@@ -356,11 +356,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     .map_err(|_| ProbeError::BadDevice)?;
     // SAFETY: Bus probing has exclusively claimed this function and its BAR.
     let mmio = unsafe { narf_bus::bar::map_bar(&device, 0) }.map_err(|_| ProbeError::BadDevice)?;
-    // The DMA engine programs the ATU scratch window as well as the
-    // manager block; a BAR covering one but not the other binds a
-    // card whose streams could never move samples, so fail closed.
+    // The DMA engine programs the per-stream ATU scratch PTE table
+    // as well as the manager block; a BAR covering one but not the
+    // other binds a card whose streams could never move samples, so
+    // fail closed.
     if mmio.len < regs::MANAGER_OFFSET + regs::SW_ERROR_INTR_MASK + 4
-        || mmio.len < crate::acp63::SCRATCH + 64
+        || mmio.len < crate::acp63_sdw_dma::SDW_PTE_TABLE_END
     {
         return Err(ProbeError::BadDevice);
     }
@@ -398,7 +399,9 @@ fn compose_cards(
     mmio: MmioRegion,
 ) -> Result<Vec<Arc<CodecCard<AcpSdwTransport>>>, narf_bus::ProbeError> {
     use narf_bus::ProbeError;
-    if mmio.len < regs::MANAGER_OFFSET + regs::SW_ERROR_INTR_MASK + 4 {
+    if mmio.len < regs::MANAGER_OFFSET + regs::SW_ERROR_INTR_MASK + 4
+        || mmio.len < crate::acp63_sdw_dma::SDW_PTE_TABLE_END
+    {
         return Err(ProbeError::BadDevice);
     }
     let transport = AcpSdwTransport::new(mmio);
@@ -440,10 +443,17 @@ fn compose_cards(
     };
     let shared = Arc::new(IrqSafeSpinLock::new(bus));
     let mut cards = Vec::new();
-    for peripheral in enumerated {
+    for (pair, peripheral) in enumerated.into_iter().enumerate() {
         let profile = profile_for(&peripheral.id);
         let mut card = CodecCard::new(shared.clone(), peripheral.dev_num, profile, stream);
-        card.set_payload_engine(Arc::new(AcpSdwDmaFactory::new(mmio)));
+        // SDW0 exposes three TX + three RX DMA channels (Linux
+        // stream ids 0..=2 / 3..=5); card `pair` owns TX`pair` /
+        // RX`pair` (#1337). A fourth codec has no DMA channel left:
+        // bind it engine-less (payload reports BadState, as generic
+        // transports do) rather than failing the whole manager.
+        if pair < 3 {
+            card.set_payload_engine(Arc::new(AcpSdwDmaFactory::new(mmio, pair as u8)));
+        }
         cards.push(Arc::new(card));
     }
     Ok(cards)
