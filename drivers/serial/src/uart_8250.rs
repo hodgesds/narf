@@ -455,6 +455,8 @@ pub fn register_legacy_uarts() {
             irq: Some(irq),
             name,
             baud: 115_200,
+            kind: registry::UartFamily::Uart8250,
+            virt: None,
         });
     }
 }

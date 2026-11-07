@@ -168,6 +168,8 @@ fn probe_one(path: &str) -> Option<()> {
         irq: irq_vec,
         name: static_name,
         baud: 115_200,
+        kind: crate::registry::UartFamily::Uart8250,
+        virt: None,
     });
 
     Some(())

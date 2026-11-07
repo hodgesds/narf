@@ -562,8 +562,9 @@ pub fn serial_numbers_for(entries: &[narf_drivers_serial::registry::UartInfo]) -
 /// as `0xFF`, so DR looks set). No `0xFF` filter is added: `0xFF` is
 /// a valid data byte, and filtering would invent tty semantics.
 /// (2) On aarch64 the 8250 accessors are stubs (writes dropped, reads
-/// `None`); the registry is effectively empty there today because
-/// PL011 registers nothing, so the table is empty in practice.
+/// `None`); the registry holds the QEMU virt PL011 there, but PL011
+/// entries are skipped above (no 8250 backend exists for them), so
+/// the table is empty in practice.
 pub fn serial_port_by_index(n: u32) -> Option<&'static TtyPort> {
     if n == 0 || n > crate::MAX_EXTRA_SERIAL_TTYS {
         return None;
@@ -576,7 +577,7 @@ static SERIAL_PORTS: IrqSafeSpinLock<Option<&'static [&'static TtyPort]>> =
     IrqSafeSpinLock::new(None);
 
 fn build_serial_ports() -> &'static [&'static TtyPort] {
-    use narf_drivers_serial::registry;
+    use narf_drivers_serial::registry::{self, UartFamily};
     use narf_drivers_serial::uart_8250::UartBase;
     let entries = registry::uarts();
     let numbers = serial_numbers_for(&entries);
@@ -585,6 +586,14 @@ fn build_serial_ports() -> &'static [&'static TtyPort] {
         let Some(index) = number else {
             continue;
         };
+        // PL011 entries have no 8250 backend: rebuilding an 8250
+        // handle over PL011 registers would poll LSR at +5 instead
+        // of FR at +0x18. A PL011 data tty is a follow-up; until
+        // then the entry is invisible here (it stays bindable by H5
+        // through `H5Transport::byte_port_for`).
+        if entry.kind != UartFamily::Uart8250 {
+            continue;
+        }
         let handle: &'static Uart8250 = Box::leak(Box::new(match entry.base {
             UartBase::Io(port) => Uart8250::new(port, entry.irq),
             UartBase::Mmio(addr) => {
@@ -1205,7 +1214,7 @@ pub fn clear_redirect_to_tty(tty_id: u32) -> Option<alloc::sync::Arc<dyn crate::
 /// like a legacy COM entry — the registry's base kind is irrelevant
 /// to numbering, only to the backend the port later rebuilds.
 fn smoke_serial_numbers_skip_console_and_cap() -> narf_kernel_test::TestResult {
-    use narf_drivers_serial::registry::UartInfo;
+    use narf_drivers_serial::registry::{UartFamily, UartInfo};
     use narf_drivers_serial::uart_8250::{UartBase, COM1_BASE, COM2_BASE, UART_CLOCK_HZ};
     use narf_memory::PhysAddr;
     let entry = |base: UartBase, shift: u8, clock: u32| UartInfo {
@@ -1215,6 +1224,8 @@ fn smoke_serial_numbers_skip_console_and_cap() -> narf_kernel_test::TestResult {
         irq: None,
         name: "test",
         baud: 115_200,
+        kind: UartFamily::Uart8250,
+        virt: None,
     };
     let entries = alloc::vec![
         entry(UartBase::Io(COM1_BASE), 0, UART_CLOCK_HZ),

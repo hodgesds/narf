@@ -184,12 +184,16 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   `transport::BytePort`: SYNC / CONFIG link establishment (Vol 4
   Part D §5), sequence numbers + sliding window + retransmission
   (§6, §12 timing). `H5Transport::from_uart_info` rebuilds the
-  8250 handle from a serial registry entry; `bind_named(name)`
-  establishes the link and registers the transport for
-  `bring_up_all`. No boot initcall yet: claiming a UART at boot
-  would steal it from the `/dev/ttyS<N>` data ttys, so the boot
-  bind is a follow-up. The H4 lane's `H4BytePort` is a separate
-  trait from `BytePort`; H4 should adopt the shared `BytePort`
+  byte-port handle from a serial registry entry, dispatching on the
+  entry's `UartFamily` (PL011 entries get a `Pl011BytePort`, 8250
+  entries a `Uart8250BytePort`); `bind_named(name)` establishes the
+  link and registers the transport for `bring_up_all`. Boot bind is
+  opt-in only: the Stage::Late `bluetooth-h5-boot` initcall binds
+  `bt-h5=<uart-name>` (absent, bare, or empty binds nothing) and
+  runs before `bluetooth-bringup`. The QEMU virt PL011 is published
+  in the serial registry as `PL011-0` so H5 works on ARM boards; a
+  PL011 data tty is still a follow-up. H4 landed with its own
+  `H4BytePort` trait (#1557); H4 should adopt the shared `BytePort`
   trait and the two transports should share one 8250 adapter.
 - `h4_transport::H4Transport` — `HciTransport` over a UART byte port
   (`H4BytePort`: `write_byte` / `read_byte`, implemented for the

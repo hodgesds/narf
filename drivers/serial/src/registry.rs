@@ -12,6 +12,12 @@
 //! low-16-bits shim of their MMIO address. A consumer that built a tty
 //! backend from the shim would poke the wrong ports, so the registry
 //! now carries the real base and the MMIO exclusion is gone.
+//!
+//! Entries whose registers need a non-identity mapping also carry
+//! the kernel VA (`virt`): the kernel does not identity-map MMIO, so
+//! a consumer that rebuilds a handle from such an entry must use
+//! `virt`, never the physical base. `None` means the physical base
+//! is directly reachable (the identity map, x86_64).
 
 extern crate alloc;
 
@@ -19,6 +25,24 @@ use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::uart_8250::UartBase;
+
+/// Which UART hardware family a registry entry describes.
+///
+/// The registry publishes descriptors only; consumers rebuild a
+/// handle from the entry. A PL011 and an 8250 share the data
+/// register at offset 0 but nothing else, so a consumer that
+/// rebuilt a PL011 entry as an 8250 would poll the wrong status
+/// register (LSR at +5 instead of FR at +0x18) — the kind tells it
+/// which handle to build.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UartFamily {
+    /// 8250/16550-family UART: ISA COM, PCI serial, Intel LPSS,
+    /// ACPI PNP0501. Byte I/O, LSR at offset +5.
+    Uart8250,
+    /// ARM PrimeCell PL011 UART: MMIO, 32-bit registers, FR at
+    /// offset 0x18. See `crate::pl011`.
+    Pl011,
+}
 
 /// Registered UART descriptor.
 #[derive(Clone, Debug)]
@@ -36,6 +60,14 @@ pub struct UartInfo {
     pub name: &'static str,
     /// Baud rate currently programmed.
     pub baud: u32,
+    /// Which UART hardware family this entry describes — the
+    /// handle a consumer rebuilds from it.
+    pub kind: UartFamily,
+    /// Kernel VA of the register block, when the port needs a
+    /// non-identity mapping (PL011 on aarch64: the probe's `ioremap`
+    /// Device mapping). `None` means the physical base is directly
+    /// reachable.
+    pub virt: Option<u64>,
 }
 
 static REGISTRY: IrqSafeSpinLock<Vec<UartInfo>> = IrqSafeSpinLock::new(Vec::new());
