@@ -3,7 +3,7 @@
 //! b90c984d skl_watermark.c / skl_prefill.c, independently of this
 //! module's arithmetic.
 use super::*;
-use narf_kernel_test::{TestResult, kernel_test_in};
+use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// 100 MHz pixel rate, htotal 1000: one line is exactly 10 µs, so
 /// `prefill_usecs_to_lines` is `us / 10` lines with no rounding for

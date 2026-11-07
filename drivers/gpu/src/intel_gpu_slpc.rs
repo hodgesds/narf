@@ -23,7 +23,7 @@ use crate::{
     intel_gpu_rcs::GpuBacking,
 };
 use alloc::{vec, vec::Vec};
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 
 pub(crate) const RESET_FENCE: u16 = 0xfffe;
 const FIRST_FENCE: u16 = 0x8000;

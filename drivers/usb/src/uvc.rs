@@ -2232,14 +2232,12 @@ async fn pump_video_frames_pipelined<T: UvcTransport>(
     // owned-buffer receive on launch and returned with the result.
     let mut bufs: [Option<Vec<u8>>; ISOC_DEPTH] =
         core::array::from_fn(|_| Some(alloc::vec![0u8; packet_size]));
-    type IsochFut<'a> = core::pin::Pin<
-        alloc::boxed::Box<
-            dyn Future<Output = (Vec<u8>, Result<usize, crate::xhci::XhciError>)> + Send + 'a,
-        >,
-    >;
+    /// One isochronous completion: the buffer back with its transfer result.
+    type IsochResult = (Vec<u8>, Result<usize, crate::xhci::XhciError>);
+    type IsochFut<'a> =
+        core::pin::Pin<alloc::boxed::Box<dyn Future<Output = IsochResult> + Send + 'a>>;
     let mut in_flight: [Option<IsochFut<'_>>; ISOC_DEPTH] = [None, None, None, None];
-    let mut completed: [Option<(Vec<u8>, Result<usize, crate::xhci::XhciError>)>; ISOC_DEPTH] =
-        [None, None, None, None];
+    let mut completed: [Option<IsochResult>; ISOC_DEPTH] = [None, None, None, None];
     let mut head = 0usize;
     let mut reassembler = UvcFrameReassembler::new();
     let mut consecutive_errors = 0u8;

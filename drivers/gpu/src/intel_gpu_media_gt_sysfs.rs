@@ -28,7 +28,7 @@
 //! queries return empty strings or "unavailable\n", matching Linux behavior.
 
 use alloc::{format, string::String, sync::Arc};
-use narf_filesystem::sysfs::{Kobject, get_or_create_child, kobject_add_attr};
+use narf_filesystem::sysfs::{get_or_create_child, kobject_add_attr, Kobject};
 
 use crate::intel_gpu_user::UserBackend;
 

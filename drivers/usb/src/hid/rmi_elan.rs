@@ -216,11 +216,11 @@ pub fn find_rmi_elan_interface(cfg: &[u8], prefer_interface: Option<u8>) -> Opti
     let mut out_ep: Option<EndpointConfig> = None;
     // Flush the interface currently being walked into the
     // candidate list (only when it has an interrupt-IN endpoint).
-    let mut flush = |iface_num: &mut Option<u8>,
-                     hid_off: &mut Option<usize>,
-                     in_ep: &mut Option<EndpointConfig>,
-                     out_ep: &mut Option<EndpointConfig>,
-                     candidates: &mut Vec<HidEndpoints>| {
+    let flush = |iface_num: &mut Option<u8>,
+                 hid_off: &mut Option<usize>,
+                 in_ep: &mut Option<EndpointConfig>,
+                 out_ep: &mut Option<EndpointConfig>,
+                 candidates: &mut Vec<HidEndpoints>| {
         if let (Some(num), Some(off), Some(in_)) = (*iface_num, *hid_off, *in_ep) {
             candidates.push(HidEndpoints {
                 interface_num: num,
@@ -1290,10 +1290,12 @@ pub async fn try_bind_rmi_elan_already_addressed(
         xhci_dev,
         slot_id,
         kind,
-        eps.interface_num,
-        in_dci,
-        out_dci,
-        out_size,
+        VendorProbeParams {
+            interface_num: eps.interface_num,
+            in_dci,
+            out_dci,
+            out_size,
+        },
         topo,
     )
     .await
@@ -1322,6 +1324,17 @@ pub async fn try_bind_rmi_elan_already_addressed(
     }
 }
 
+/// Endpoint parameters for the vendor probe: the interface and
+/// interrupt endpoints the probe binds to, plus the output report
+/// size the transport needs.
+#[derive(Copy, Clone, Debug)]
+struct VendorProbeParams {
+    interface_num: u8,
+    in_dci: u8,
+    out_dci: Option<u8>,
+    out_size: usize,
+}
+
 /// Run the vendor probe and register the binding. Every error is
 /// mapped to `HidError::NotBootKeyboard` — the value is only a
 /// "not bound" signal for the generic-HID fallback in the caller.
@@ -1329,13 +1342,16 @@ async fn probe_and_register(
     xhci_dev: &Xhci,
     slot_id: u8,
     kind: VendorKind,
-    interface_num: u8,
-    in_dci: u8,
-    out_dci: Option<u8>,
-    out_size: usize,
+    params: VendorProbeParams,
     topo: BindTopology,
 ) -> Result<AttachOutcome, HidError> {
     const NOT_BOUND: HidError = HidError::NotBootKeyboard;
+    let VendorProbeParams {
+        interface_num,
+        in_dci,
+        out_dci,
+        out_size,
+    } = params;
     match kind {
         VendorKind::Rmi { quirks } => {
             let io = UsbHidIo::new(

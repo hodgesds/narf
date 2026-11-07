@@ -1,17 +1,17 @@
 //! Tests for Standalone Media GT (GT1) telemetry and sysfs attributes.
 
 use alloc::sync::Arc;
-use narf_filesystem::sysfs::{__reset_for_test, Kobject};
-use narf_kernel_test::{TestResult, kernel_test_in};
+use narf_filesystem::sysfs::{Kobject, __reset_for_test};
+use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::drm_registry::{DrmCard, register_drm_card};
+use crate::drm_registry::{register_drm_card, DrmCard};
 use crate::intel_gpu_engine::EngineSet;
-use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_gt::media::MediaTopology;
+use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_slpc::{FrequencyRange, Limits, PowerProfile, Status as SlpcStatus};
 use crate::intel_gpu_user::{MediaGtStatus, UserBackend, UserStatus};
 
-use super::{MediaGtTelemetry, populate_card};
+use super::{populate_card, MediaGtTelemetry};
 
 #[derive(Debug)]
 struct MockBackend {

@@ -1005,7 +1005,11 @@ fn restore(
         })
     };
     let ratio_mask = |mask: u32| {
-        if state.ip.xe2_plus() { mask } else { 0 }
+        if state.ip.xe2_plus() {
+            mask
+        } else {
+            0
+        }
     };
     if stage >= Stage::Mbus {
         let mask = ratio_mask(crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK);

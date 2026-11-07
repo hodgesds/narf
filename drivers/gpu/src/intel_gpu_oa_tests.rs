@@ -9,7 +9,7 @@ use core::{
     sync::atomic::{AtomicU64, AtomicUsize},
     task::{Context, Poll, Waker},
 };
-use narf_kernel_test::{TestResult, kernel_test_in};
+use narf_kernel_test::{kernel_test_in, TestResult};
 
 const MTL: GtPlatform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
 const LNL: GtPlatform = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
