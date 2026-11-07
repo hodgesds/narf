@@ -357,6 +357,12 @@ pub fn set_clock_range<M: SmuMmio>(
 // The DMA buffer and the transfer handshake are not wired up yet. The decoder
 // below is, so that when they are, the field offsets are not guessed: they
 // come from `offsetof` on `SmuMetrics_t` in `smu13_driver_if_v13_0_4.h`.
+//
+// The owner that wires them up is `amdgpu_smu_apu_telemetry`
+// (`ApuTelemetryOwner`): a DMA-coherent buffer published with
+// `SetDriverDramAddr{High,Low}`, `TransferTableSmu2Dram` with
+// `TABLE_SMU_METRICS`, and a 1 s cadence monitor publishing the last
+// decoded sample.
 
 /// `sizeof(SmuMetrics_t)` for SMU 13.0.4. The transfer buffer must be at
 /// least this large, and a shorter slice is rejected rather than decoded.
@@ -442,6 +448,127 @@ impl SmuMetrics {
     /// SMU_TEMPERATURE_UNITS_PER_CENTIGRADES`, so centi-Celsius times ten —
     /// the conversion a tenths-of-a-degree reading would have got wrong by a
     /// factor of ten.
+    pub fn edge_temperature_milli_c(&self) -> i32 {
+        self.gfx_temperature_centi_c as i32 * 10
+    }
+    /// Hotspot temperature in milli-Celsius (`METRICS_TEMPERATURE_HOTSPOT`
+    /// reads `SocTemperature`).
+    pub fn hotspot_temperature_milli_c(&self) -> i32 {
+        self.soc_temperature_centi_c as i32 * 10
+    }
+    /// Activity as a whole percentage.
+    pub fn gfx_activity_percent(&self) -> u16 {
+        self.gfx_activity_centi_percent / 100
+    }
+}
+
+// ── Metrics table, SMU 12 (Renoir) ──────────────────────────────────
+//
+// The Renoir `SmuMetrics_t` is a different struct from the Phoenix one
+// above: `ClockFrequency[CLOCK_COUNT]` first, `L3Frequency[2]` /
+// `L3Temperature[2]` arrays, and — the trap for anyone porting the v13
+// decode — `CurrentSocketPower`, `ApuPower` and `dGpuPower` are in
+// **watts** here (`//[W]`), not milliwatts. Every offset below is the
+// field order of `SmuMetrics_t` in `smu12_driver_if.h`, all `uint16_t`,
+// counted out in the same way as the v13 table above; `sizeof` is
+// 148 bytes. `TABLE_SMU_METRICS` is 7 on SMU 12 as well
+// (`smu12_driver_if.h`, "Table types").
+
+/// `sizeof(SmuMetrics_t)` for SMU 12.0 (Renoir). The transfer buffer must
+/// be at least this large, and a shorter slice is rejected rather than
+/// decoded.
+pub const SMU_METRICS_V12_BYTES: usize = 148;
+
+/// Byte offsets within the SMU 12 `SmuMetrics_t`. Every field is
+/// `uint16_t`; `CLOCK_COUNT` is 18 (see `CLOCK_IDs_e` in
+/// `smu12_driver_if.h`), so the averages start at 0x24.
+mod metrics_v12_off {
+    /// `ClockFrequency[CLOCK_GFXCLK]`, `CLOCK_GFXCLK` = 17.
+    pub const GFXCLK_FREQUENCY: usize = 0x22;
+    pub const AVG_GFXCLK_FREQUENCY: usize = 0x24;
+    pub const AVG_SOCCLK_FREQUENCY: usize = 0x26;
+    pub const AVG_VCLK_FREQUENCY: usize = 0x28;
+    pub const AVG_FCLK_FREQUENCY: usize = 0x2a;
+    pub const GFX_ACTIVITY: usize = 0x2c;
+    pub const UVD_ACTIVITY: usize = 0x2e;
+    /// `Voltage[2]`, indexed VDDCR_VDD then VDDCR_SOC.
+    pub const VOLTAGE: usize = 0x30;
+    pub const FAN_PWM: usize = 0x3c;
+    /// Watts on SMU 12, not milliwatts — see the module note above.
+    pub const CURRENT_SOCKET_POWER_W: usize = 0x3e;
+    pub const GFX_TEMPERATURE: usize = 0x78;
+    pub const SOC_TEMPERATURE: usize = 0x7a;
+    pub const THROTTLER_STATUS: usize = 0x7c;
+    /// Watts on SMU 12, not milliwatts.
+    pub const APU_POWER_W: usize = 0x84;
+    /// Watts on SMU 12, not milliwatts.
+    pub const DGPU_POWER_W: usize = 0x86;
+}
+
+/// The subset of the SMU 12 `SmuMetrics_t` this driver reads. Units are
+/// the firmware's own, converted at the edge — except the power fields,
+/// which the header reports in watts on this generation (the v13
+/// struct reports milliwatts); the `_w` suffix says so at every use.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SmuMetricsV12 {
+    pub gfxclk_mhz: u16,
+    pub avg_gfxclk_mhz: u16,
+    pub avg_socclk_mhz: u16,
+    pub avg_vclk_mhz: u16,
+    pub avg_fclk_mhz: u16,
+    /// Activity in centi-percent, as on v13.
+    pub gfx_activity_centi_percent: u16,
+    pub vcn_activity_centi_percent: u16,
+    /// `Voltage[0]` / `Voltage[1]`: VDDCR_VDD and VDDCR_SOC, in millivolts.
+    pub vddgfx_mv: u16,
+    pub vddsoc_mv: u16,
+    /// Fan PWM in milli-percent (`FanPwm`, `//[milli]`).
+    pub fan_pwm_milli: u16,
+    /// Temperatures in **centi**-Celsius, as on v13.
+    pub gfx_temperature_centi_c: u16,
+    pub soc_temperature_centi_c: u16,
+    pub throttler_status: u16,
+    /// Watts, not milliwatts.
+    pub current_socket_power_w: u16,
+    /// Watts, not milliwatts.
+    pub apu_power_w: u16,
+    /// Watts, not milliwatts.
+    pub dgpu_power_w: u16,
+}
+
+/// Decode a transferred SMU 12 `SmuMetrics_t`. Returns `None` for a
+/// buffer shorter than the structure.
+pub fn parse_metrics_v12(table: &[u8]) -> Option<SmuMetricsV12> {
+    use metrics_v12_off as f;
+    if table.len() < SMU_METRICS_V12_BYTES {
+        return None;
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([table[o], table[o + 1]]);
+    Some(SmuMetricsV12 {
+        gfxclk_mhz: u16_at(f::GFXCLK_FREQUENCY),
+        avg_gfxclk_mhz: u16_at(f::AVG_GFXCLK_FREQUENCY),
+        avg_socclk_mhz: u16_at(f::AVG_SOCCLK_FREQUENCY),
+        avg_vclk_mhz: u16_at(f::AVG_VCLK_FREQUENCY),
+        avg_fclk_mhz: u16_at(f::AVG_FCLK_FREQUENCY),
+        gfx_activity_centi_percent: u16_at(f::GFX_ACTIVITY),
+        vcn_activity_centi_percent: u16_at(f::UVD_ACTIVITY),
+        vddgfx_mv: u16_at(f::VOLTAGE),
+        vddsoc_mv: u16_at(f::VOLTAGE + 2),
+        fan_pwm_milli: u16_at(f::FAN_PWM),
+        gfx_temperature_centi_c: u16_at(f::GFX_TEMPERATURE),
+        soc_temperature_centi_c: u16_at(f::SOC_TEMPERATURE),
+        throttler_status: u16_at(f::THROTTLER_STATUS),
+        current_socket_power_w: u16_at(f::CURRENT_SOCKET_POWER_W),
+        apu_power_w: u16_at(f::APU_POWER_W),
+        dgpu_power_w: u16_at(f::DGPU_POWER_W),
+    })
+}
+
+impl SmuMetricsV12 {
+    /// Edge temperature in milli-Celsius, the unit the OS thermal surface
+    /// wants. `GfxTemperature` is centi-Celsius on SMU 12 exactly as on
+    /// SMU 13 (`renoir_get_smu_metrics_data`, `METRICS_TEMPERATURE_EDGE`),
+    /// so centi-Celsius times ten.
     pub fn edge_temperature_milli_c(&self) -> i32 {
         self.gfx_temperature_centi_c as i32 * 10
     }
