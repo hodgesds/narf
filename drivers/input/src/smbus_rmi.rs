@@ -82,7 +82,6 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use narf_drivers_platform::smbus::{Smbus, SmbusError};
@@ -281,9 +280,9 @@ impl<H: SmbusIo> SmbusRmiTransport<H> {
     /// Negotiate the protocol version: read a byte at
     /// `SMB_PROTOCOL_VERSION_ADDRESS`; the version is the value
     /// + 1 (`rmi_smb_probe`). v1 additionally sets the page to 0
-    /// — which both puts the page-select register in a known
-    /// state and proves the device answers. Any other version
-    /// (or a failed read) declines the device.
+    ///   — which both puts the page-select register in a known
+    ///   state and proves the device answers. Any other version
+    ///   (or a failed read) declines the device.
     pub fn probe_version(&mut self) -> Result<SmbusRmiVersion, TransportError> {
         let v = self
             .io

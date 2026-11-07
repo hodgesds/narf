@@ -1139,10 +1139,12 @@ async fn pump_task_inner(
                         Some(node.as_ref()),
                         &contacts,
                         Some(report.btn_left),
-                        0,
-                        params.max_x as i32,
-                        0,
-                        params.max_y as i32,
+                        crate::rmi4_core::Rmi4PumpBounds {
+                            x_min: 0,
+                            x_max: params.max_x as i32,
+                            y_min: 0,
+                            y_max: params.max_y as i32,
+                        },
                     );
                     // Mute LED follows the node's LED_MUTE bit
                     // (issue #1684); a change since the last send
@@ -1447,7 +1449,17 @@ pub(crate) async fn pump_rmi_attn(
                         pressure: o.z as i32,
                     })
                     .collect();
-                state.pump_contacts(Some(node), &contacts, btn_left, 0, 0xFFFF, 0, 0xFFFF);
+                state.pump_contacts(
+                    Some(node),
+                    &contacts,
+                    btn_left,
+                    crate::rmi4_core::Rmi4PumpBounds {
+                        x_min: 0,
+                        x_max: 0xFFFF,
+                        y_min: 0,
+                        y_max: 0xFFFF,
+                    },
+                );
             }
         }
         return;
@@ -1477,7 +1489,17 @@ pub(crate) async fn pump_rmi_attn(
                         pressure: 0,
                     })
                     .collect();
-                state.pump_contacts(Some(node), &contacts, btn_left, 0, 0x0FFF, 0, 0x0FFF);
+                state.pump_contacts(
+                    Some(node),
+                    &contacts,
+                    btn_left,
+                    crate::rmi4_core::Rmi4PumpBounds {
+                        x_min: 0,
+                        x_max: 0x0FFF,
+                        y_min: 0,
+                        y_max: 0x0FFF,
+                    },
+                );
             }
         }
     }

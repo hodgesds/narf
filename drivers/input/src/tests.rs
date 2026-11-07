@@ -3371,10 +3371,12 @@ mod i2c_hid_touch_smokes {
                 None,
                 &contacts,
                 Some(decoded.btn_left),
-                0,
-                params.max_x as i32,
-                0,
-                params.max_y as i32,
+                crate::rmi4_core::Rmi4PumpBounds {
+                    x_min: 0,
+                    x_max: params.max_x as i32,
+                    y_min: 0,
+                    y_max: params.max_y as i32,
+                },
             );
             if pushed < 1 {
                 return TestResult::Fail("pump pushed 0 events");
@@ -3431,7 +3433,7 @@ mod i2c_hid_touch_smokes {
         }
 
         let bus_dyn: Arc<dyn I2cBus> = bus.clone();
-        let drv = I2cHidDriver::new(bus_dyn, 0x10, 0x0001);
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x10, 0x0001);
         let bus_for_check = bus.clone();
         run_async(async move {
             if drv.read_descriptor().await.is_err() {
@@ -5040,6 +5042,7 @@ kernel_test_in!(
 fn smoke_hid_elan_mute_led_class_device() -> TestResult {
     use crate::hid_elan::{ElanDeviceParams, ELAN_MUTE_LED_MAX_BRIGHTNESS, ELAN_MUTE_LED_NAME};
     use crate::i2c_hid_touch::build_elan_caps;
+    use narf_drivers_leds::LedDevice;
     use narf_input::evdev::{led, DeviceCaps, ROUTER};
     narf_drivers_leds::__reset_all_for_test();
     let params = ElanDeviceParams {
