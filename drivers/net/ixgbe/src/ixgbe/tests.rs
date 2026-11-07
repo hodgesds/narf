@@ -5600,7 +5600,7 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_fcoe_rx_classify);
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::{
-    program_rx_queue, program_tx_queue, tx_note_completed, tx_stalled, Ixgbe, RxQueueState,
+    mtu, program_rx_queue, program_tx_queue, tx_note_completed, tx_stalled, Ixgbe, RxQueueState,
     TxQueueState, ADVTXD_STAT_DD, CTRL_RST_MASK, FCTRL_BAM, FCTRL_MPE, FCTRL_UPE, LINKS_UP, RAH_AV,
     REG_CTRL, REG_FCTRL, REG_LINKS, REG_RAH0, REG_RAL0, REG_RXCTRL, RXCTRL_RXEN, TX_TIMEOUT_NS,
 };
@@ -5756,6 +5756,7 @@ impl TxTimeoutFixture {
             mac,
             link_up: IrqSafeSpinLock::new(true),
             did: IXGBE_DEV_82599EB,
+            mtu: IrqSafeSpinLock::new(mtu::STD_MTU),
             lan_id: 0,
             queue_config,
             rss_cfg: IrqSafeSpinLock::new(None),
@@ -5772,6 +5773,8 @@ impl TxTimeoutFixture {
             tx_resets: AtomicU64::new(0),
             recovering: AtomicBool::new(false),
             tx_epoch: AtomicU64::new(0),
+            addr: narf_bus::BusAddr::Mmio(mem.phys_addr()),
+            ifname: crate::publish::IfName::new(),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -5783,7 +5786,7 @@ impl TxTimeoutFixture {
         {
             let mut bank = super::queues::MmioBank::new(&device.mmio);
             program_tx_queue(&mut bank, 0, tx_phys, ring_len);
-            program_rx_queue(&mut bank, 0, rx_phys, ring_len);
+            program_rx_queue(&mut bank, 0, rx_phys, ring_len, SRRCTL_BSIZE_2K);
         }
         // Prime the RX descriptors from the pool (bring-up step 7).
         let rx_ring_phys = device.rx_queues[0].rx_ring.dma_addr().raw();
