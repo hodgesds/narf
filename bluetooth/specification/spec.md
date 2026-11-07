@@ -399,7 +399,11 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   the port through the transport's TX-demand resume).
   `pm::suspend_controller` / `pm::resume_controller` are the
   device-PM suspend/resume pair (registered per USB controller by
-  the btusb bind as `btusb-hci<N>`); `pm::park_autosuspend` /
+  the btusb bind as `btusb-hci<N>`, and per PCIe controller by the
+  btintel-pcie firmware load as `btintel-pcie`, which resolves the
+  HCI index lazily by transport identity — the index only exists
+  once `bring_up_all` has run the mandatory HCI bring-up over the
+  transport); `pm::park_autosuspend` /
   `pm::unpark_autosuspend` are the hub idle-suspend park and the
   wake-watch / TX-demand unpark. `mgmt::is_powered` is truthful:
   the `POWERED` setting bit AND NOT parked-for-power (mgmt off or
@@ -408,9 +412,15 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   policy sysfs `idle_timeout` reports — default 30 000 ms (the USB
   hub autosuspend window), 0 meaning "never autosuspend" — and the
   btusb suspend hook vetoes gating for a 0-timeout controller.
-  Out of scope here: PCIe controllers (`btintel_pcie` never enters
-  the HCI controller registry, so it has no index to key this
-  state off) and a sysfs store path for `idle_timeout` — both
+  Reloading PCIe firmware after a power cut across suspend is
+  covered since #1660: resume detects the loss (`BOOT_STAGE`
+  without `OPFW`), records `firmware_lost`, and stays parked, and
+  a supervisor task spawned at firmware-load time observes the
+  flag from task context, re-runs `enable_bt` (re-publish CI,
+  `MAC_INIT`, wait for ROM) + `fw::setup`, and unparks the pump —
+  the transport survives, so the HCI index is kept and
+  `register_ready_transport` is not re-run.
+  Out of scope here: a sysfs store path for `idle_timeout` —
   follow-up.
 
 ## Scope
