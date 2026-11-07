@@ -25,6 +25,8 @@ narf-drivers-leds = { path = "../leds" }
 narf-filesystem   = { path = "../../filesystem" }
 narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
 narf-memory       = { path = "../../memory" }
+narf-pwm          = { path = "../../pwm" }
+async-trait       = "0.1"
 
 [features]
 kernel-test = ["narf-drivers-leds/kernel-test"]
