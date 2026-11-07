@@ -429,7 +429,7 @@ fn smoke_i8042_mouse_intellimouse_wheel_reports_scroll() -> TestResult {
             if p.dx != 0 || p.dy != 0 {
                 return TestResult::Fail("wheel packet motion should be zero");
             }
-            if !p.buttons.is_empty() {
+            if p.buttons != PointerButtons::EMPTY {
                 return TestResult::Fail("wheel packet should carry no buttons");
             }
         }
