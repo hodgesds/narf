@@ -444,3 +444,170 @@ fn smoke_ov05c10_mipi_lane_count_and_link_freq() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/video", smoke_ov05c10_mipi_lane_count_and_link_freq);
+
+// ── ISP probe refusal fixtures (#811) ────────────────────────────────
+//
+// Fixtures are built from each driver's own PCI ID table — the
+// device under test for a platform comes from that platform's
+// `PCI_IDS`, never from a literal copied out of the impl — and each
+// probe is handed a freshly bootstrapped cap, exactly as the bus
+// dispatcher mints one per attempt. A refused probe must never
+// touch the hardware, so the zeroed config-space address in the
+// fixture is safe: probe returns before any BAR or config access.
+
+fn isp_fixture_device(vendor: u16, device: u16) -> narf_bus::BusDevice {
+    use narf_bus::{BusAddr, BusDevice, BusKind, DeviceId, PcieAddr};
+    let pcie = PcieAddr::new(0, 0, 0, 0);
+    BusDevice {
+        addr: BusAddr::Pcie(pcie),
+        id: DeviceId {
+            vendor,
+            device,
+            class: 0,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: BusKind::Pcie {
+            addr: pcie,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    }
+}
+
+fn fresh_probe_cap() -> narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write> {
+    narf_capabilities::Cap::bootstrap()
+}
+
+// ── Smoke 10: every ISP platform probe refuses honestly ──────────────
+
+fn smoke_isp_probe_refuses_all_platforms() -> TestResult {
+    use crate::amd_mp2_isp::{is_probed as mp2_probed, PCI_IDS as MP2_IDS};
+    use crate::intel_ipu3::{is_probed as ipu3_probed, PCI_IDS as IPU3_IDS};
+    use crate::intel_ipu6::{is_probed as ipu6_probed, IPU6_DID, PCI_IDS as IPU6_IDS};
+    use narf_bus::ProbeError;
+
+    // IPU3: the single Skylake DID.
+    for &(vendor, device) in IPU3_IDS {
+        match crate::intel_ipu3::probe(isp_fixture_device(vendor, device), fresh_probe_cap()) {
+            Err(ProbeError::NotForThisDriver) => {}
+            Err(_) => return TestResult::Fail("IPU3 probe refused with the wrong error"),
+            Ok(()) => return TestResult::Fail("IPU3 probe CLAIMED a device it cannot drive"),
+        }
+    }
+
+    // IPU6: all six variant DIDs.
+    for &(vendor, device) in IPU6_IDS {
+        match crate::intel_ipu6::probe(isp_fixture_device(vendor, device), fresh_probe_cap()) {
+            Err(ProbeError::NotForThisDriver) => {}
+            Err(_) => return TestResult::Fail("IPU6 probe refused with the wrong error"),
+            Ok(()) => return TestResult::Fail("IPU6 probe CLAIMED a device it cannot drive"),
+        }
+    }
+
+    // MP2: both generations.
+    for &(vendor, device) in MP2_IDS {
+        match crate::amd_mp2_isp::probe(isp_fixture_device(vendor, device), fresh_probe_cap()) {
+            Err(ProbeError::NotForThisDriver) => {}
+            Err(_) => return TestResult::Fail("MP2 probe refused with the wrong error"),
+            Ok(()) => return TestResult::Fail("MP2 probe CLAIMED a device it cannot drive"),
+        }
+    }
+
+    // Wrong-vendor and unknown-DID devices decline too.
+    match crate::intel_ipu6::probe(isp_fixture_device(0x1022, IPU6_DID), fresh_probe_cap()) {
+        Err(ProbeError::NotForThisDriver) => {}
+        _ => return TestResult::Fail("IPU6 probe accepted a wrong-vendor device"),
+    }
+    match crate::intel_ipu3::probe(isp_fixture_device(0x8086, 0xFFFF), fresh_probe_cap()) {
+        Err(ProbeError::NotForThisDriver) => {}
+        _ => return TestResult::Fail("IPU3 probe accepted an unknown DID"),
+    }
+    match crate::amd_mp2_isp::probe(isp_fixture_device(0x1022, 0xFFFF), fresh_probe_cap()) {
+        Err(ProbeError::NotForThisDriver) => {}
+        _ => return TestResult::Fail("MP2 probe accepted an unknown DID"),
+    }
+
+    // No refusal installed a controller: nothing is ever "probed".
+    if ipu3_probed() {
+        return TestResult::Fail("IPU3 is_probed() true after a refused probe");
+    }
+    if ipu6_probed() {
+        return TestResult::Fail("IPU6 is_probed() true after a refused probe");
+    }
+    if mp2_probed() {
+        return TestResult::Fail("MP2 is_probed() true after a refused probe");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video", smoke_isp_probe_refuses_all_platforms);
+
+// ── Smoke 11: refusal reasons are per-platform ───────────────────────
+
+fn smoke_isp_refusal_reason_is_per_platform() -> TestResult {
+    use crate::amd_mp2_isp::{
+        refusal_reason as mp2_reason, FIRMWARE_NAME, MP2_DID_15E4, MP2_DID_164A,
+    };
+    use crate::intel_ipu3::{refusal_reason as ipu3_reason, IPU3_DID};
+    use crate::intel_ipu6::{
+        firmware_for, refusal_reason as ipu6_reason, IPU6EP_MTL_DID, IPU6_DID, PCI_IDS as IPU6_IDS,
+    };
+
+    // IPU6: every known DID gets a reason naming its OWN firmware
+    // blob — a Tiger Lake refusal must not name the SE blob.
+    for &(_, did) in IPU6_IDS {
+        let reason = match ipu6_reason(did) {
+            Some(r) => r,
+            None => return TestResult::Fail("IPU6 DID with no refusal reason"),
+        };
+        let fw = match firmware_for(did) {
+            Some(f) => f,
+            None => return TestResult::Fail("IPU6 DID with no firmware name"),
+        };
+        if !reason.contains(fw) {
+            return TestResult::Fail("IPU6 refusal reason names the wrong firmware blob");
+        }
+    }
+    // Tiger Lake and Meteor Lake must not share one reason.
+    if ipu6_reason(IPU6_DID) == ipu6_reason(IPU6EP_MTL_DID) {
+        return TestResult::Fail("IPU6 variants share one refusal reason");
+    }
+
+    // IPU3: the reason names the missing CSS pipeline — and IPU3
+    // has no firmware blob to name, unlike IPU6/MP2.
+    let ipu3 = match ipu3_reason(IPU3_DID) {
+        Some(r) => r,
+        None => return TestResult::Fail("IPU3 DID with no refusal reason"),
+    };
+    if !ipu3.contains("CSS") {
+        return TestResult::Fail("IPU3 refusal reason does not name the CSS pipeline");
+    }
+
+    // MP2: both generations name the blob, and the generations get
+    // distinct reasons.
+    let mp2_v1 = match mp2_reason(MP2_DID_15E4) {
+        Some(r) => r,
+        None => return TestResult::Fail("MP2 1.0 DID with no refusal reason"),
+    };
+    let mp2_v1_1 = match mp2_reason(MP2_DID_164A) {
+        Some(r) => r,
+        None => return TestResult::Fail("MP2 1.1 DID with no refusal reason"),
+    };
+    if !mp2_v1.contains(FIRMWARE_NAME) || !mp2_v1_1.contains(FIRMWARE_NAME) {
+        return TestResult::Fail("MP2 refusal reason does not name the firmware blob");
+    }
+    if mp2_v1 == mp2_v1_1 {
+        return TestResult::Fail("MP2 generations share one refusal reason");
+    }
+
+    // Unknown DIDs get no reason from any platform.
+    if ipu6_reason(0xFFFF).is_some()
+        || ipu3_reason(0xFFFF).is_some()
+        || mp2_reason(0xFFFF).is_some()
+    {
+        return TestResult::Fail("unknown DID got a refusal reason");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video", smoke_isp_refusal_reason_is_per_platform);

@@ -1,6 +1,6 @@
 [package]
 name         = "narf-drivers-video"
-description  = "Camera ISP driver scaffold — Intel IPU3/IPU6 + AMD MP2 ISP (Stage-0/1)."
+description  = "Camera ISP refusal markers — Intel IPU3/IPU6 + AMD MP2 ISP probes decline until firmware/CSI bring-up lands (#811)."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
