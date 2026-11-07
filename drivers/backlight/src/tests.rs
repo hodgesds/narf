@@ -1,8 +1,11 @@
 //! Smoke tests for the backlight subsystem (≥10 required).
 //!
 #![allow(clippy::undocumented_unsafe_blocks)]
-//! All tests are pure (no hardware, no AML live evaluation) — they
-//! use synthetic devices registered via the `__test_install*` helpers.
+//! Most tests are pure (no hardware, no AML live evaluation) —
+//! they use synthetic devices registered via the
+//! `__test_install*` helpers. Smokes 27–30 instead parse the
+//! fixture DSDT (`fixture_dsdt::dsdt_bytes`) into the real AML
+//! namespace and drive the production discovery + dispatch paths.
 //! The global registries are cleared before each test via
 //! `__reset_all_for_test()` / module-local `__reset_for_test()`.
 
@@ -25,6 +28,7 @@ mod smokes {
         __reset_for_test as bk_reset, handle_notify, register_video_notify, NOTIFY_BRIGHTNESS_DOWN,
         NOTIFY_BRIGHTNESS_UP,
     };
+    use crate::fixture_dsdt::{dsdt_bytes, BCL_LADDER, DD0_PATH};
     use crate::kbd_backlight::{dell_encode_kbd_level, install, KbdBacklightDevice, KbdBlVendor};
     use crate::leds::{led_device, register_led, unregister_led, LedDevice, SimpleLed, Trigger};
     use crate::sysfs_bridge::populate_backlight_class;
@@ -32,6 +36,7 @@ mod smokes {
         __reset_all_for_test, backlight_device, backlight_devices, panel_owner, register_backlight,
         unregister_backlight, BacklightDevice, BacklightKind, Ownership,
     };
+    use narf_aml::eval::evaluate_method;
 
     // ── 1. BacklightDevice registry add / remove ───────────────────
 
@@ -966,5 +971,325 @@ mod smokes {
     kernel_test_in!(
         "drivers/backlight",
         smoke_kbd_backlight_install_publishes_led
+    );
+
+    // ── 27–30. Fixture DSDT (#958) ─────────────────────────────────
+    //
+    // The smokes above install pre-parsed ladders via
+    // `__test_install` and never touch AML. These four parse the
+    // fixture DSDT (`fixture_dsdt::dsdt_bytes`) into the real AML
+    // namespace and drive the production discovery + dispatch
+    // paths: `_BCL` evaluation → registry → sysfs → `_BCM`.
+
+    /// Reset every registry the fixture smokes touch: the backlight
+    /// registries, sysfs, the AML namespace + notify table, and the
+    /// brightness-key handler.
+    fn reset_fixture_state() {
+        __reset_all_for_test();
+        sysfs_reset();
+        av_reset();
+        bk_reset();
+        narf_aml::sync::__reset_for_test();
+        narf_aml::__reset_for_test();
+    }
+
+    /// Parse the fixture DSDT into the AML namespace. Expects
+    /// exactly the 7 nodes the fixture declares (Scope `\_SB`,
+    /// Devices `GFX0` + `DD0`, Name `LEVL`, Methods `_BCL` / `_BCM`
+    /// / `_BQC`).
+    fn install_fixture_dsdt() -> Result<(), &'static str> {
+        let parsed = narf_aml::__parse_body_for_test(&dsdt_bytes(), "\\")
+            .map_err(|_| "fixture DSDT parse failed")?;
+        if parsed != 7 {
+            return Err("fixture DSDT parsed an unexpected node count");
+        }
+        if narf_aml::find_node(DD0_PATH).is_none() {
+            return Err("fixture DD0 device missing from the namespace");
+        }
+        Ok(())
+    }
+
+    /// Read the fixture's firmware-side current level straight out
+    /// of AML (`_BQC`), bypassing the driver's `last` cache — the
+    /// proof that a dispatched `_BCM` argument actually landed in
+    /// firmware state.
+    fn fixture_level() -> Option<u32> {
+        match evaluate_method(&alloc::format!("{}._BQC", DD0_PATH), &[]) {
+            Ok(narf_aml::Value::Integer(v)) => Some(v as u32),
+            _ => None,
+        }
+    }
+
+    // ── 27. Fixture DSDT _BCL parse end to end (AML→registry) ──────
+
+    fn smoke_fixture_dsdt_bcl_parse_end_to_end() -> TestResult {
+        reset_fixture_state();
+        if let Err(e) = install_fixture_dsdt() {
+            reset_fixture_state();
+            return TestResult::Fail(e);
+        }
+
+        // Production discovery: walk the AML namespace, evaluate
+        // _BCL per device, register what answers.
+        crate::acpi_video::init();
+
+        let devs = crate::acpi_video::acpi_video_devices();
+        if devs.len() != 1 {
+            reset_fixture_state();
+            return TestResult::Fail("discovery found != 1 ACPI video device");
+        }
+        let dev = &devs[0];
+        if dev.name != "acpi_video0" {
+            reset_fixture_state();
+            return TestResult::Fail("discovered device is not acpi_video0");
+        }
+        if dev.acpi_path != DD0_PATH {
+            reset_fixture_state();
+            return TestResult::Fail("discovered device has the wrong AML path");
+        }
+        // _BCL [80, 100, 0, 10, …, 100] → first two stripped, the
+        // ladder is 0..=100 in steps of 10.
+        if dev.levels.len() != 11 {
+            reset_fixture_state();
+            return TestResult::Fail("ladder len != 11");
+        }
+        if dev.levels.as_slice() != BCL_LADDER {
+            reset_fixture_state();
+            return TestResult::Fail("ladder != fixture ladder");
+        }
+        if dev.levels[0] != 0 || dev.levels[5] != 50 || dev.levels[10] != 100 {
+            reset_fixture_state();
+            return TestResult::Fail("ladder values wrong");
+        }
+        if dev.max_brightness() != 100 {
+            reset_fixture_state();
+            return TestResult::Fail("max != 100");
+        }
+        // _BQC read-back through the driver: firmware starts at 50.
+        if dev.current_brightness() != 50 {
+            reset_fixture_state();
+            return TestResult::Fail("initial _BQC read-back != 50");
+        }
+        // The discovered device is the elected panel owner.
+        match panel_owner() {
+            Some(o) if o.name() == "acpi_video0" => {}
+            _ => {
+                reset_fixture_state();
+                return TestResult::Fail("fixture device is not the panel owner");
+            }
+        }
+
+        reset_fixture_state();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/backlight", smoke_fixture_dsdt_bcl_parse_end_to_end);
+
+    // ── 28. Fixture DSDT _BCM captures the dispatched argument ─────
+
+    fn smoke_fixture_dsdt_bcm_captures_argument() -> TestResult {
+        reset_fixture_state();
+        if let Err(e) = install_fixture_dsdt() {
+            reset_fixture_state();
+            return TestResult::Fail(e);
+        }
+        crate::acpi_video::init();
+
+        let devs = crate::acpi_video::acpi_video_devices();
+        if devs.len() != 1 {
+            reset_fixture_state();
+            return TestResult::Fail("discovery found != 1 ACPI video device");
+        }
+        let dev = &devs[0];
+
+        // Firmware starts at 50.
+        if fixture_level() != Some(50) {
+            reset_fixture_state();
+            return TestResult::Fail("initial firmware level != 50");
+        }
+        // 63 is not a ladder rung: the driver snaps to 60 and _BCM
+        // must receive exactly 60 — read it back out of AML, not
+        // out of the driver's cache.
+        dev.set_brightness(63);
+        if fixture_level() != Some(60) {
+            reset_fixture_state();
+            return TestResult::Fail("_BCM did not capture the snapped level 60");
+        }
+        // Prove the live query path too: drop the driver's cache and
+        // re-read through _BQC.
+        dev.last.store(-1, Ordering::Release);
+        if dev.current_brightness() != 60 {
+            reset_fixture_state();
+            return TestResult::Fail("_BQC re-query did not return 60");
+        }
+        dev.set_brightness(100);
+        if fixture_level() != Some(100) {
+            reset_fixture_state();
+            return TestResult::Fail("_BCM did not capture 100");
+        }
+        dev.set_brightness(0);
+        if fixture_level() != Some(0) {
+            reset_fixture_state();
+            return TestResult::Fail("_BCM did not capture 0");
+        }
+        // Out-of-range clamps through the ladder: 1000 snaps to 100.
+        dev.set_brightness(1000);
+        if fixture_level() != Some(100) {
+            reset_fixture_state();
+            return TestResult::Fail("_BCM did not capture the clamped level 100");
+        }
+
+        reset_fixture_state();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_fixture_dsdt_bcm_captures_argument
+    );
+
+    // ── 29. Fixture DSDT sysfs end to end ──────────────────────────
+
+    fn smoke_fixture_dsdt_sysfs_end_to_end() -> TestResult {
+        reset_fixture_state();
+        sysfs_reset();
+        if let Err(e) = install_fixture_dsdt() {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail(e);
+        }
+        crate::acpi_video::init();
+        populate_backlight_class();
+
+        let class = narf_filesystem::sysfs::class_register("backlight");
+        let kobj = match class.get_child("acpi_video0") {
+            Some(k) => k,
+            None => {
+                reset_fixture_state();
+                sysfs_reset();
+                return TestResult::Fail("acpi_video0 not published to /sys/class/backlight");
+            }
+        };
+        if kobj.attr_show("max_brightness").unwrap_or_default().trim() != "100" {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail("max_brightness did not read 100 through sysfs");
+        }
+        if kobj.attr_show("brightness").unwrap_or_default().trim() != "50" {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail("brightness did not read the initial 50 through sysfs");
+        }
+        // A sysfs store travels brightness → snap → _BCM(70).
+        if !matches!(kobj.attr_store("brightness", b"70\n"), Some(Ok(()))) {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail("brightness store(70) failed");
+        }
+        if fixture_level() != Some(70) {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail("sysfs store(70) did not reach _BCM");
+        }
+        if kobj.attr_show("brightness").unwrap_or_default().trim() != "70" {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail("brightness read-back wrong after store(70)");
+        }
+        // Off-ladder store snaps: 63 → _BCM(60).
+        if !matches!(kobj.attr_store("brightness", b"63\n"), Some(Ok(()))) {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail("brightness store(63) failed");
+        }
+        if fixture_level() != Some(60) {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail("sysfs store(63) did not snap to _BCM(60)");
+        }
+
+        reset_fixture_state();
+        sysfs_reset();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/backlight", smoke_fixture_dsdt_sysfs_end_to_end);
+
+    // ── 30. Composition: fixture panel is populated by the composed boot path ──
+
+    fn smoke_fixture_dsdt_composition_populates_panel() -> TestResult {
+        reset_fixture_state();
+        sysfs_reset();
+        if let Err(e) = install_fixture_dsdt() {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail(e);
+        }
+
+        // The composed boot path (#947): the Stage::Device initcalls
+        // run acpi-video discovery, then the sysfs initcall
+        // populates the class. (Dynamic publication would publish
+        // on registration anyway; this smoke pins the composed
+        // sequence itself.)
+        crate::acpi_video::init();
+        populate_backlight_class();
+
+        // /sys/class/backlight/<panel> is populated — looked up
+        // through the non-creating child accessors so the assertion
+        // cannot create the entries it checks.
+        let root = narf_filesystem::sysfs::sysfs_root();
+        let class_dir = match root.get_child("class") {
+            Some(c) => c,
+            None => {
+                reset_fixture_state();
+                sysfs_reset();
+                return TestResult::Fail("/sys/class missing");
+            }
+        };
+        let backlight_dir = match class_dir.get_child("backlight") {
+            Some(c) => c,
+            None => {
+                reset_fixture_state();
+                sysfs_reset();
+                return TestResult::Fail("/sys/class/backlight missing after populate");
+            }
+        };
+        let panel = match backlight_dir.get_child("acpi_video0") {
+            Some(k) => k,
+            None => {
+                reset_fixture_state();
+                sysfs_reset();
+                return TestResult::Fail("/sys/class/backlight/acpi_video0 missing");
+            }
+        };
+        if panel.attr_show("type").unwrap_or_default().trim() != "firmware" {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail("panel type is not firmware");
+        }
+        if panel.attr_show("max_brightness").unwrap_or_default().trim() != "100" {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail("panel max_brightness is not 100");
+        }
+        if panel.attr_show("brightness").unwrap_or_default().trim() != "50" {
+            reset_fixture_state();
+            sysfs_reset();
+            return TestResult::Fail("panel brightness is not the initial 50");
+        }
+        // And the published panel is the elected owner.
+        match panel_owner() {
+            Some(o) if o.name() == "acpi_video0" => {}
+            _ => {
+                reset_fixture_state();
+                sysfs_reset();
+                return TestResult::Fail("published panel is not the panel owner");
+            }
+        }
+
+        reset_fixture_state();
+        sysfs_reset();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/backlight",
+        smoke_fixture_dsdt_composition_populates_panel
     );
 }
