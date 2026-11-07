@@ -8,6 +8,8 @@
 //!   caps-lock LED, etc.).
 //! - ACPI `_BCL` / `_BCM` / `_BQC` video backlight.
 //! - Intel BXT PWM backlight (registered from the Intel GPU probe).
+//! - Generic PWM panel backlight (`pwm_bl`, issue #957) — a panel
+//!   bound to a `narf-pwm` channel, registered from a panel probe.
 //! - Keyboard backlight via vendor WMI.
 //! - Brightness key handling (ACPI Notify 0x86/0x87).
 //!
@@ -72,6 +74,7 @@ pub mod brightness_keys;
 pub mod intel_bl;
 pub mod kbd_backlight;
 pub mod leds;
+pub mod pwm_bl;
 pub mod sysfs_bridge;
 
 mod tests;
