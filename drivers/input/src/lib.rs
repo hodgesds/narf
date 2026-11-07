@@ -31,6 +31,7 @@ pub mod intel_ish;
 #[cfg(target_arch = "x86_64")]
 pub mod psmouse;
 pub mod rmi4_core;
+pub mod smbus_rmi;
 pub mod wacom;
 pub mod wbdi;
 
@@ -63,16 +64,23 @@ pub fn register_initcalls() {
     hid_multitouch::register_initcalls();
 
     // hid-rmi (Synaptics RMI4 over HID) — banner + device-id
-    // table load. The USB-HID transport reads
-    // `hid_rmi::RMI_DEVICE_TABLE` and `match_device()` when it
-    // sees a Synaptics VID at enumeration time.
+    // table load. The i2c-HID bind pump composes the async
+    // `HidRmiSession` (mode-set + PDT walk + F$11/F$12 ATTN
+    // decode) when it classifies a device as RMI4; the USB-HID
+    // side still needs a `HidIo` backend over xHCI before
+    // `RMI_DEVICE_TABLE` / `match_device()` have a caller there.
     hid_rmi::register_initcalls();
 
-    // hid-elan — banner + device-id table load. Used by the i2c-HID
-    // and USB-HID transports to recognise Elan touchpads with
-    // vendor-specific report formats (HP Pavilion X2, Toshiba Click,
-    // and a slice of Lenovo/Acer/MSI laptops).
+    // hid-elan — banner + device-id table load. The i2c-HID bind
+    // pump composes the Elan vendor decode (absolute-mode probe
+    // + 0x5D report decode) when it classifies a device as Elan;
+    // the USB-HID side is the same `HidIo`-backend remainder as
+    // hid-rmi.
     hid_elan::register_initcalls();
+
+    // RMI4-over-SMBus transport probe (issue #765) — runs once
+    // the platform SMBus controller is up (Stage::Subsys).
+    smbus_rmi::register_initcalls();
 
     wacom::register_usb_driver();
     goodix::register_initcalls();

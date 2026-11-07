@@ -384,6 +384,16 @@ impl I2cHidDriver {
     pub fn descriptor(&self) -> Option<HidDescriptor> {
         self.descriptor
     }
+
+    /// Largest input report the device may send, from the HID
+    /// descriptor's `wMaxInputLength`. Falls back to 64 before
+    /// the descriptor is read — the RMI4-over-HID session sizes
+    /// its read-drain buffer off this.
+    pub fn max_input_length(&self) -> usize {
+        self.descriptor
+            .map(|d| d.w_max_input_length as usize)
+            .unwrap_or(64)
+    }
 }
 
 /// Single helper for the no-data commands (RESET, SET_POWER). The
