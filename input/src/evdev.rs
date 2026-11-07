@@ -1393,6 +1393,74 @@ pub fn dispatch_pointer_to_node(node: &DeviceNode, dx: i32, dy: i32, btn_changes
     node.dispatch(EvdevEvent::syn_report(now));
 }
 
+/// Dispatch a full pointer frame — relative motion, wheel deltas,
+/// **plus** button transitions — to `node` as a single evdev frame
+/// (one `SYN_REPORT`), matching how a real 4-byte PS/2 packet is
+/// reported. `wheel` is the `EV_REL REL_WHEEL` delta (vertical
+/// scroll), `hwheel` the `EV_REL REL_HWHEEL` delta (horizontal
+/// scroll, Explorer 4.0 tilt). A fully-empty frame (no motion, no
+/// wheel, no button change) is skipped so idle packets don't spam
+/// consumers.
+///
+/// Used by `drivers/input/src/i8042_mouse.rs` so the compositor
+/// sees wheel scrolls, not just motion and clicks.
+pub fn dispatch_pointer_wheel_to_node(
+    node: &DeviceNode,
+    dx: i32,
+    dy: i32,
+    wheel: i32,
+    hwheel: i32,
+    btn_changes: &[(u16, bool)],
+) {
+    if dx == 0 && dy == 0 && wheel == 0 && hwheel == 0 && btn_changes.is_empty() {
+        return;
+    }
+    // Monotonic NANOSECONDS — see the note in
+    // `dispatch_pointer_to_node`.
+    let now = narf_time::monotonic_ns();
+    if dx != 0 {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Rel,
+            code: rel::REL_X,
+            value: dx,
+        });
+    }
+    if dy != 0 {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Rel,
+            code: rel::REL_Y,
+            value: dy,
+        });
+    }
+    if wheel != 0 {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Rel,
+            code: rel::REL_WHEEL,
+            value: wheel,
+        });
+    }
+    if hwheel != 0 {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Rel,
+            code: rel::REL_HWHEEL,
+            value: hwheel,
+        });
+    }
+    for &(code, pressed) in btn_changes {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Key,
+            code,
+            value: if pressed { 1 } else { 0 },
+        });
+    }
+    node.dispatch(EvdevEvent::syn_report(now));
+}
+
 // ── Multi-touch (slot protocol B) frame dispatch ────────────────────────────
 
 /// One contact's state in a multi-touch frame, already resolved to an

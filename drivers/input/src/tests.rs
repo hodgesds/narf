@@ -405,6 +405,505 @@ fn smoke_i8042_mouse_drops_unsynced_byte() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_i8042_mouse_drops_unsynced_byte);
 
+fn smoke_i8042_mouse_intellimouse_wheel_reports_scroll() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::PsmouseProtocol;
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, PointerButtons,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    i8042_mouse::set_protocol_for_test(PsmouseProtocol::IntelliMouse);
+
+    // 4-byte packet, no motion, wheel byte 0x01. Linux reports
+    // REL_WHEEL = -(signed char)packet[3] = -1 (one click up).
+    i8042_mouse::feed_byte_for_test(0x08);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x01);
+
+    // The motion half still rides the Pointer channel (dx=dy=0).
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != 0 || p.dy != 0 {
+                return TestResult::Fail("wheel packet motion should be zero");
+            }
+            if p.buttons != PointerButtons::EMPTY {
+                return TestResult::Fail("wheel packet should carry no buttons");
+            }
+        }
+        _ => return TestResult::Fail("no PointerEvent for wheel packet"),
+    }
+    match pop_global() {
+        Some(InputEvent::Scroll(s)) => {
+            if s.dx != 0 || s.dy != -1 {
+                return TestResult::Fail("wheel 0x01 should scroll dy=-1");
+            }
+        }
+        _ => return TestResult::Fail("no ScrollEvent for wheel packet"),
+    }
+    // Wheel byte 0xFF = -1 signed -> REL_WHEEL = +1 (one click down).
+    i8042_mouse::feed_byte_for_test(0x08);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0xFF);
+    let _ = pop_global(); // Pointer half
+    match pop_global() {
+        Some(InputEvent::Scroll(s)) => {
+            if s.dx != 0 || s.dy != 1 {
+                return TestResult::Fail("wheel 0xFF should scroll dy=+1");
+            }
+        }
+        _ => return TestResult::Fail("no ScrollEvent for wheel 0xFF"),
+    }
+    let (wheel, hwheel) = i8042_mouse::take_wheel_delta();
+    if wheel != 0 || hwheel != 0 {
+        return TestResult::Fail("wheel accumulator should read (-1+1, 0) = (0, 0)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_intellimouse_wheel_reports_scroll
+);
+
+fn smoke_i8042_mouse_explorer_side_extra_buttons() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::PsmouseProtocol;
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, PointerButtons,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    i8042_mouse::set_protocol_for_test(PsmouseProtocol::Explorer);
+
+    // 4th byte 0x10: 4th button (bit 4) pressed, wheel nibble 0.
+    // 0x30: 4th + 5th. 0x00: both released. No wheel motion anywhere.
+    for b3 in [0x10u8, 0x30, 0x00] {
+        i8042_mouse::feed_byte_for_test(0x08);
+        i8042_mouse::feed_byte_for_test(0x00);
+        i8042_mouse::feed_byte_for_test(0x00);
+        i8042_mouse::feed_byte_for_test(b3);
+    }
+    let want: [PointerButtons; 3] = [
+        PointerButtons::SIDE,
+        PointerButtons::SIDE | PointerButtons::EXTRA,
+        PointerButtons::EMPTY,
+    ];
+    for (i, w) in want.iter().enumerate() {
+        match pop_global() {
+            Some(InputEvent::Pointer(p)) => {
+                if p.buttons != *w {
+                    return TestResult::Fail("Explorer side/extra button state wrong");
+                }
+            }
+            _ => return TestResult::Fail("missing PointerEvent in Explorer button sequence"),
+        }
+        // Wheel is zero in all three packets: no ScrollEvent follows.
+        if pop_global().is_some() {
+            return TestResult::Fail("wheel-zero Explorer packet leaked a ScrollEvent");
+        }
+        let _ = i;
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_explorer_side_extra_buttons
+);
+
+fn smoke_i8042_mouse_explorer_tilt_hwheel() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::PsmouseProtocol;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, InputEvent};
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    i8042_mouse::set_protocol_for_test(PsmouseProtocol::ExplorerTilt);
+
+    // 4th byte 0x41: top bits 0x40 = Explorer 4.0 horizontal scroll,
+    // value (0x41 & 32) - (0x41 & 31) = 31 on REL_HWHEEL.
+    i8042_mouse::feed_byte_for_test(0x08);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x41);
+    let _ = pop_global(); // Pointer half
+    match pop_global() {
+        Some(InputEvent::Scroll(s)) => {
+            if s.dx != 31 || s.dy != 0 {
+                return TestResult::Fail("tilt 0x41 should scroll dx=+31");
+            }
+        }
+        _ => return TestResult::Fail("no ScrollEvent for tilt packet"),
+    }
+    // 0x81: top bits 0x80 = vertical tilt scroll, value -1 on REL_WHEEL.
+    i8042_mouse::feed_byte_for_test(0x08);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x00);
+    i8042_mouse::feed_byte_for_test(0x81);
+    let _ = pop_global(); // Pointer half
+    match pop_global() {
+        Some(InputEvent::Scroll(s)) => {
+            if s.dx != 0 || s.dy != -1 {
+                return TestResult::Fail("tilt 0x81 should scroll dy=-1");
+            }
+        }
+        _ => return TestResult::Fail("no ScrollEvent for vertical tilt packet"),
+    }
+    let (wheel, hwheel) = i8042_mouse::take_wheel_delta();
+    if wheel != -1 || hwheel != 31 {
+        return TestResult::Fail("wheel accumulator should read (-1, 31)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_mouse_explorer_tilt_hwheel);
+
+/// Elantech v2 info for the IRQ-path fixtures: firmware 02.08.00
+/// (known-fw ranges 1152x768, pressure reporting on).
+fn elantech_v2_info_for_test() -> crate::psmouse::ElantechInfo {
+    crate::psmouse::ElantechInfo {
+        hw_version: 2,
+        fw_version: 0x020800,
+        ic_version: 2,
+        x_max: 1152,
+        y_max: 768,
+        width: 0,
+        reports_pressure: true,
+        crc_enabled: false,
+        buttonpad: false,
+        has_trackpoint: false,
+        samples_1: 0,
+        jumpy_cursor: false,
+    }
+}
+
+fn smoke_i8042_mouse_elantech_v2_absolute_reports_touch() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::PsmouseProtocol;
+    use narf_input::{
+        __reset_global_ring_for_test, abs, init_global_ring, pop_global, InputEvent, TouchState,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    i8042_mouse::set_elantech_for_test(PsmouseProtocol::Elantech, &elantech_v2_info_for_test());
+
+    // v2 1-finger packet (verified vector): x=1000, y=500,
+    // pressure 0xAB, width 5, left pressed.
+    for b in [0x55u8, 0xA3, 0xE8, 0x12, 0xB1, 0x0C] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_X && a.value == 1000 => {}
+        _ => return TestResult::Fail("no ABS_X=1000 for Elantech v2 packet"),
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_Y && a.value == 500 => {}
+        _ => return TestResult::Fail("no ABS_Y=500 for Elantech v2 packet"),
+    }
+    match pop_global() {
+        Some(InputEvent::Touch(t))
+            if t.slot == 0
+                && t.state == TouchState::Down
+                && t.x == 1000
+                && t.y == 500
+                && t.pressure == 0xAB => {}
+        _ => return TestResult::Fail("no Touch Down slot 0 (1000, 500, pres 0xAB)"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_elantech_v2_absolute_reports_touch
+);
+
+fn smoke_i8042_mouse_elantech_bad_packet_drops_and_resyncs() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::PsmouseProtocol;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, InputEvent};
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    i8042_mouse::set_elantech_for_test(PsmouseProtocol::Elantech, &elantech_v2_info_for_test());
+
+    // A packet failing the v2 constant-bit check (byte 0 0x00),
+    // then the exact v2 debounce packet — neither may report
+    // anything, and neither may desync the stream.
+    for b in [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x00] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    for b in [0x84u8, 0xFF, 0xFF, 0x02, 0xFF, 0xFF] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    if pop_global().is_some() {
+        return TestResult::Fail("bad / debounce Elantech packets must not report");
+    }
+    // The good packet after them still decodes: the stream is
+    // back in sync.
+    for b in [0x55u8, 0xA3, 0xE8, 0x12, 0xB1, 0x0C] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.value == 1000 => {}
+        _ => return TestResult::Fail("good packet after bad ones must still report ABS_X=1000"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_elantech_bad_packet_drops_and_resyncs
+);
+
+fn smoke_i8042_mouse_elantech_v1_jumpy_discards_first_two() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::{ElantechInfo, PsmouseProtocol};
+    use narf_input::{
+        __reset_global_ring_for_test, abs, init_global_ring, pop_global, InputEvent, TouchState,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    // Firmware 02.00.22: jumpy-cursor workaround is on.
+    let info = ElantechInfo {
+        hw_version: 1,
+        fw_version: 0x020022,
+        ic_version: 2,
+        x_max: 544,
+        y_max: 352,
+        width: 0,
+        reports_pressure: false,
+        crc_enabled: false,
+        buttonpad: false,
+        has_trackpoint: false,
+        samples_1: 0,
+        jumpy_cursor: true,
+    };
+    i8042_mouse::set_elantech_for_test(PsmouseProtocol::ElantechV1, &info);
+
+    // v1 1-finger packet (verified vector): x=300, y=200, left.
+    // The first two single-finger reports are discarded as bogus.
+    for _ in 0..2 {
+        for b in [0x49u8, 0x04, 0x2C, 0x98] {
+            i8042_mouse::feed_byte_for_test(b);
+        }
+        if pop_global().is_some() {
+            return TestResult::Fail("jumpy v1 pad must discard its first two reports");
+        }
+    }
+    for b in [0x49u8, 0x04, 0x2C, 0x98] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_X && a.value == 300 => {}
+        _ => return TestResult::Fail("third v1 report must deliver ABS_X=300"),
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_Y && a.value == 200 => {}
+        _ => return TestResult::Fail("third v1 report must deliver ABS_Y=200"),
+    }
+    match pop_global() {
+        Some(InputEvent::Touch(t))
+            if t.slot == 0 && t.state == TouchState::Down && t.x == 300 && t.y == 200 => {}
+        _ => return TestResult::Fail("third v1 report must deliver Touch Down (300, 200)"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_elantech_v1_jumpy_discards_first_two
+);
+
+fn smoke_i8042_mouse_elantech_v4_head_motion_status() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::{ElantechInfo, PsmouseProtocol};
+    use narf_input::{
+        __reset_global_ring_for_test, abs, init_global_ring, pop_global, InputEvent, TouchState,
+    };
+    init_global_ring(16);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    // Firmware 46.0F.02 (v4, ranges 1200x800, width scale 52).
+    let info = ElantechInfo {
+        hw_version: 4,
+        fw_version: 0x460f02,
+        ic_version: 6,
+        x_max: 1200,
+        y_max: 800,
+        width: 52,
+        reports_pressure: true,
+        crc_enabled: false,
+        buttonpad: false,
+        has_trackpoint: false,
+        samples_1: 0,
+        jumpy_cursor: false,
+    };
+    i8042_mouse::set_elantech_for_test(PsmouseProtocol::Elantech, &info);
+
+    // Head packet: slot 0 at (1000, 200), pressure 0x9A.
+    for b in [0x30u8, 0x93, 0xE8, 0x31, 0xA2, 0x58] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_X && a.value == 1000 => {}
+        _ => return TestResult::Fail("v4 head must deliver ABS_X=1000"),
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_Y && a.value == 200 => {}
+        _ => return TestResult::Fail("v4 head must deliver ABS_Y=200"),
+    }
+    match pop_global() {
+        Some(InputEvent::Touch(t))
+            if t.slot == 0
+                && t.state == TouchState::Down
+                && t.x == 1000
+                && t.y == 200
+                && t.pressure == 0x9A => {}
+        _ => return TestResult::Fail("v4 head must deliver Touch Down slot 0 (1000, 200)"),
+    }
+    // Motion packet: slot 0 dx=+10, dy=-5 -> (1010, 205).
+    for b in [0x20u8, 0x0A, 0xFB, 0x32, 0x00, 0x00] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_X && a.value == 1010 => {}
+        _ => return TestResult::Fail("v4 motion must deliver ABS_X=1010"),
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_Y && a.value == 205 => {}
+        _ => return TestResult::Fail("v4 motion must deliver ABS_Y=205"),
+    }
+    match pop_global() {
+        Some(InputEvent::Touch(t))
+            if t.slot == 0 && t.state == TouchState::Move && t.x == 1010 && t.y == 205 => {}
+        _ => return TestResult::Fail("v4 motion must deliver Touch Move slot 0 (1010, 205)"),
+    }
+    // Status packet: no fingers down — release at the last position.
+    for b in [0x00u8, 0x00, 0x00, 0x10, 0x00, 0x00] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    match pop_global() {
+        Some(InputEvent::Touch(t))
+            if t.slot == 0
+                && t.state == TouchState::Up
+                && t.tracking_id.is_none()
+                && t.x == 1010
+                && t.y == 205 => {}
+        _ => return TestResult::Fail("v4 status must deliver Touch Up slot 0 at (1010, 205)"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_elantech_v4_head_motion_status
+);
+
+fn smoke_i8042_mouse_elantech_v3_head_tail_pair() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::{ElantechInfo, PsmouseProtocol};
+    use narf_input::{
+        __reset_global_ring_for_test, abs, init_global_ring, pop_global, InputEvent, TouchState,
+    };
+    init_global_ring(16);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    let info = ElantechInfo {
+        hw_version: 3,
+        fw_version: 0x050000,
+        ic_version: 5,
+        x_max: 1200,
+        y_max: 800,
+        width: 0,
+        reports_pressure: true,
+        crc_enabled: false,
+        buttonpad: false,
+        has_trackpoint: false,
+        samples_1: 0,
+        jumpy_cursor: false,
+    };
+    i8042_mouse::set_elantech_for_test(PsmouseProtocol::Elantech, &info);
+
+    // Two-finger head packet only stashes finger A: no events.
+    for b in [0x85u8, 0x52, 0x58, 0x02, 0x60, 0x64] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    if pop_global().is_some() {
+        return TestResult::Fail("v3 head packet must not report on its own");
+    }
+    // Tail packet completes the pair: (600, 700) + (900, 400).
+    for b in [0x8Du8, 0x73, 0x84, 0x0C, 0x81, 0x90] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_X && a.value == 600 => {}
+        _ => return TestResult::Fail("v3 tail must deliver ABS_X=600"),
+    }
+    match pop_global() {
+        Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_Y && a.value == 700 => {}
+        _ => return TestResult::Fail("v3 tail must deliver ABS_Y=700"),
+    }
+    match pop_global() {
+        Some(InputEvent::Touch(t))
+            if t.slot == 0 && t.state == TouchState::Down && t.x == 600 && t.y == 700 => {}
+        _ => return TestResult::Fail("v3 tail must deliver Touch Down slot 0 (600, 700)"),
+    }
+    match pop_global() {
+        Some(InputEvent::Touch(t))
+            if t.slot == 1 && t.state == TouchState::Down && t.x == 900 && t.y == 400 => {}
+        _ => return TestResult::Fail("v3 tail must deliver Touch Down slot 1 (900, 400)"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_elantech_v3_head_tail_pair
+);
+
+fn smoke_i8042_mouse_3byte_fallback_stream_stays_in_sync() -> TestResult {
+    use crate::i8042_mouse;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, InputEvent};
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    // Protocol stays Standard (failed knock): 3-byte packets.
+
+    // Packet 1, then a stray 0x01 (a wheel byte from a 4-byte
+    // stream) — no sync bit, so it must drop, not shift the
+    // stream — then packet 2.
+    for b in [0x08u8, 5, 3, 0x01, 0x08, 1, 1] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != 5 || p.dy != -3 {
+                return TestResult::Fail("first 3-byte packet decoded wrong");
+            }
+        }
+        _ => return TestResult::Fail("first packet missing"),
+    }
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != 1 || p.dy != -1 {
+                return TestResult::Fail("stray wheel byte desynced the 3-byte stream");
+            }
+        }
+        _ => return TestResult::Fail("second packet missing after stray byte"),
+    }
+    if pop_global().is_some() {
+        return TestResult::Fail("no ScrollEvent may appear in 3-byte mode");
+    }
+    let (dx, dy) = i8042_mouse::take_rel_delta();
+    if dx != 6 || dy != -4 {
+        return TestResult::Fail("rel accumulator wrong after fallback stream");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_3byte_fallback_stream_stays_in_sync
+);
+
 fn smoke_virtio_input_decode_synthetic() -> TestResult {
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
     use narf_input::{
@@ -3959,3 +4458,945 @@ kernel_test_in!(
     "drivers/input",
     smoke_i8042_led_sink_wired_from_core_dispatch
 );
+
+// ── psmouse protocol negotiation + Synaptics decoders ──────────────────────
+//
+// Fixtures are built from the cited specs, never from the impl:
+// knock byte sequences from Linux `psmouse-base.c` / Chapweske,
+// Synaptics packet layouts from Linux `synaptics_parse_hw_state`.
+// The fake transport records every byte the driver sends and replays
+// canned replies, so the negotiation fixtures pin the exact wire
+// order of the whole probe sequence.
+
+mod psmouse_smokes {
+    use alloc::collections::VecDeque;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use crate::psmouse::{
+        decode_elantech_v1, decode_elantech_v2, decode_elantech_v3, decode_elantech_v4,
+        decode_synaptics_newabs, decode_synaptics_oldabs, elantech_hw_version, elantech_info,
+        elantech_is_debounce_v2, elantech_is_signature_valid, elantech_packet_check_v1,
+        elantech_packet_check_v2, elantech_packet_check_v3, elantech_packet_check_v4,
+        negotiate_protocol, synaptics_invert_y, synaptics_validate_byte, ElantechPacket,
+        ElantechState, Ps2Transport, PsmouseHardware, PsmouseProtocol, SynapticsPktType,
+    };
+
+    /// Fake PS/2 device: records every byte sent, replays canned
+    /// reply bytes in order. `send` always ACKs (the real ACK wait
+    /// is a transport detail); `recv` pops the next canned byte.
+    struct FakePs2 {
+        sent: Vec<u8>,
+        replies: VecDeque<u8>,
+    }
+
+    impl FakePs2 {
+        fn new(replies: &[u8]) -> Self {
+            Self {
+                sent: Vec::new(),
+                replies: replies.iter().copied().collect(),
+            }
+        }
+    }
+
+    impl Ps2Transport for FakePs2 {
+        fn send(&mut self, byte: u8) -> bool {
+            self.sent.push(byte);
+            true
+        }
+
+        fn recv(&mut self) -> Option<u8> {
+            self.replies.pop_front()
+        }
+    }
+
+    /// SETRATE(rate) wire bytes: [0xF3, rate].
+    fn set_rate(rate: u8) -> [u8; 2] {
+        [0xF3, rate]
+    }
+
+    /// The shared probe prefix every negotiation runs: Synaptics
+    /// detect (4x SETRES(0) + GETINFO, answered "not Synaptics"),
+    /// ALPS E6 report (answered "not ALPS"), Elantech magic knock
+    /// (answered "not Elantech"), then reset (BAT + ID).
+    /// Returns the bytes the driver must have sent, and consumes
+    /// the matching replies from the fake.
+    fn probe_prefix_sent() -> Vec<u8> {
+        let mut sent = Vec::new();
+        // Synaptics: SETRES(0) x4, GETINFO.
+        for _ in 0..4 {
+            sent.extend_from_slice(&[0xE8, 0x00]);
+        }
+        sent.push(0xE9);
+        // ALPS E6: SETRES(0xE6), SETSCALE11, SETSCALE11, GETINFO.
+        sent.extend_from_slice(&[0xE8, 0xE6, 0xE6, 0xE6, 0xE9]);
+        // Elantech magic knock: SETDEFAULTS, DISABLE, 3x
+        // SETSCALE11, GETINFO.
+        sent.extend_from_slice(&[0xF6, 0xF5, 0xE6, 0xE6, 0xE6, 0xE9]);
+        // Reset.
+        sent.push(0xFF);
+        sent
+    }
+
+    /// Sliced command wire bytes (Linux `ps2_sliced_command`):
+    /// `0xE6`, then `0xE8` + each 2-bit slice of `command`, most
+    /// significant first. Built from the wire format, not from
+    /// the implementation.
+    fn sliced_cmd(cmd: u8) -> Vec<u8> {
+        let mut sent = vec![0xE6];
+        for shift in [6, 4, 2, 0] {
+            sent.extend_from_slice(&[0xE8, (cmd >> shift) & 0x03]);
+        }
+        sent
+    }
+
+    fn smoke_psmouse_intellimouse_knock_sequence() -> TestResult {
+        // Replies, in order: Synaptics GETINFO [0,0,0] (not Synaptics),
+        // ALPS E6 GETINFO [0,0,0] (not ALPS), Elantech magic-knock
+        // GETINFO [0,0,0] (not Elantech), reset BAT+ID, Intelli
+        // prefix GETID=0x03, Explorer GETID=0x00 (not Explorer),
+        // standalone Intelli GETID=0x03.
+        let replies = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0x00, 0x03, 0x00, 0x03,
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Generic {
+            return TestResult::Fail("plain mouse must not detect vendor hardware");
+        }
+        if proto != PsmouseProtocol::IntelliMouse {
+            return TestResult::Fail("ID 0x03 after 200/100/80 must negotiate IntelliMouse");
+        }
+        // Exact wire order: probe prefix, Intelli knock + GETID,
+        // Explorer knock + GETID, Intelli knock + GETID again
+        // (Linux tries Explorer first, then IntelliMouse standalone).
+        let mut want = probe_prefix_sent();
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        if fake.sent != want {
+            return TestResult::Fail("IntelliMouse knock wire sequence wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_intellimouse_knock_sequence
+    );
+
+    fn smoke_psmouse_explorer_knock_sequence() -> TestResult {
+        // Replies: Synaptics no, ALPS no, Elantech magic knock no,
+        // reset BAT+ID, Intelli prefix GETID=0x03, Explorer GETID=0x04,
+        // then the 4.0 tilt knock (200/80/40) with no further replies.
+        let replies = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0x00, 0x03, 0x04,
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Generic || proto != PsmouseProtocol::ExplorerTilt {
+            return TestResult::Fail("ID 0x04 after 200/200/80 must negotiate ExplorerTilt");
+        }
+        let mut want = probe_prefix_sent();
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        // Tilt enable: 200, 80, 40 — and no standalone Intelli knock
+        // afterwards (Explorer already won).
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(80));
+        want.extend_from_slice(&set_rate(40));
+        if fake.sent != want {
+            return TestResult::Fail("Explorer knock wire sequence wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_explorer_knock_sequence
+    );
+
+    fn smoke_psmouse_standard_fallback_knock() -> TestResult {
+        // Plain mouse: every GETID answers 0x00.
+        let replies = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Generic || proto != PsmouseProtocol::Standard {
+            return TestResult::Fail("ID 0x00 everywhere must fall back to Standard");
+        }
+        // No tilt knock may appear after a failed Explorer attempt.
+        if fake.sent.windows(2).any(|w| w[0] == 0xF3 && w[1] == 40) {
+            return TestResult::Fail("tilt knock must not run without ID 0x04");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_standard_fallback_knock
+    );
+
+    fn smoke_psmouse_synaptics_detect_knock() -> TestResult {
+        // Synaptics pad in relative mode: GETINFO answers [?, 0x47, ?],
+        // then it also answers the IntelliMouse knock (pads emulate
+        // IMPS in relative mode — Linux records Synaptics hardware
+        // AND negotiates the wheel protocol).
+        let replies = [
+            0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0xAA, 0x00, 0x03, 0x00, 0x03,
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Synaptics {
+            return TestResult::Fail("GETINFO byte 0x47 must detect Synaptics");
+        }
+        if proto != PsmouseProtocol::IntelliMouse {
+            return TestResult::Fail("Synaptics pad must still negotiate IntelliMouse wheel");
+        }
+        // ALPS must NOT be probed once Synaptics matched (the ALPS
+        // E6 knock would confuse the pad — Linux skips it too).
+        // Elantech IS still probed after a Synaptics match (Linux
+        // keeps probing vendor protocols until one claims the
+        // device); the pad fails its magic knock.
+        let mut want: Vec<u8> = Vec::new();
+        for _ in 0..4 {
+            want.extend_from_slice(&[0xE8, 0x00]);
+        }
+        want.push(0xE9);
+        want.extend_from_slice(&[0xF6, 0xF5, 0xE6, 0xE6, 0xE6, 0xE9]);
+        want.push(0xFF);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        if fake.sent != want {
+            return TestResult::Fail("Synaptics wire sequence wrong (ALPS must be skipped)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_synaptics_detect_knock
+    );
+
+    fn smoke_psmouse_alps_detect_knock() -> TestResult {
+        // ALPS pad: Synaptics GETINFO no, E6 report 00-00-0A, E7
+        // report 73-02-64 (v3 signature), Elantech magic knock no,
+        // then plain-mouse IDs.
+        let replies = [
+            0x00, 0x00, 0x00, // Synaptics GETINFO
+            0x00, 0x00, 0x0A, // ALPS E6 report
+            0x73, 0x02, 0x64, // ALPS E7 report
+            0x00, 0x00, 0x00, // Elantech magic knock (fails)
+            0xAA, 0x00, // reset BAT+ID
+            0x00, 0x00, 0x00, // GETIDs
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Alps {
+            return TestResult::Fail("E6/E7 reports must detect ALPS");
+        }
+        if proto != PsmouseProtocol::Standard {
+            return TestResult::Fail("ALPS pad answering ID 0x00 must stay Standard");
+        }
+        // Wire order: Synaptics knock, ALPS E6 (E8-E6-E6-E6-E9),
+        // ALPS E7 (E8-E7-E7-E7-E9), Elantech magic knock
+        // (F6-F5-E6-E6-E6-E9), reset, then the wheel knocks.
+        let mut want: Vec<u8> = Vec::new();
+        for _ in 0..4 {
+            want.extend_from_slice(&[0xE8, 0x00]);
+        }
+        want.push(0xE9);
+        want.extend_from_slice(&[0xE8, 0xE6, 0xE6, 0xE6, 0xE9]);
+        want.extend_from_slice(&[0xE8, 0xE7, 0xE7, 0xE7, 0xE9]);
+        want.extend_from_slice(&[0xF6, 0xF5, 0xE6, 0xE6, 0xE6, 0xE9]);
+        want.push(0xFF);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        want.extend_from_slice(&set_rate(200));
+        want.extend_from_slice(&set_rate(100));
+        want.extend_from_slice(&set_rate(80));
+        want.push(0xF2);
+        if fake.sent != want {
+            return TestResult::Fail("ALPS wire sequence wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/psmouse", smoke_psmouse_alps_detect_knock);
+
+    fn smoke_synaptics_newabs_decode() -> TestResult {
+        // NEWABS packet built from the Linux layout for x=1000,
+        // y=2000, z=50, w=1, left pressed:
+        //   b0 = 0x81 (sync + left), b1 = 0x73 (x hi 0x3, y hi 0x7),
+        //   b2 = 50 (z), b3 = 0xC4 (sync + w bit), b4 = 0xE8 (x lo),
+        //   b5 = 0xD0 (y lo).
+        let buf: [u8; 6] = [0x81, 0x73, 50, 0xC4, 0xE8, 0xD0];
+        for idx in 0..5 {
+            if !synaptics_validate_byte(&buf, idx, SynapticsPktType::NewAbsStrict) {
+                return TestResult::Fail("NEWABS strict validation must pass this packet");
+            }
+        }
+        let hw = decode_synaptics_newabs(&buf);
+        if hw.x != 1000 || hw.y != 2000 || hw.z != 50 || hw.w != 1 {
+            return TestResult::Fail("NEWABS x/y/z/w decode wrong");
+        }
+        if !hw.left || hw.right {
+            return TestResult::Fail("NEWABS button bits wrong");
+        }
+        if synaptics_invert_y(hw.y) != 5856 - 2000 {
+            return TestResult::Fail("Y inversion must be 5856 - y");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/psmouse", smoke_synaptics_newabs_decode);
+
+    fn smoke_synaptics_oldabs_decode() -> TestResult {
+        // OLDABS packet for x=1000, y=2000, z=50, w=2, left pressed:
+        //   b0 = 0xC5 (sync + w bit + left), b1 = 0x03 (x hi),
+        //   b2 = 0xE8 (x lo), b3 = 0xB2 (sync + z lo 0x32),
+        //   b4 = 0x07 (y hi), b5 = 0xD0 (y lo).
+        let buf: [u8; 6] = [0xC5, 0x03, 0xE8, 0xB2, 0x07, 0xD0];
+        for idx in 0..5 {
+            if !synaptics_validate_byte(&buf, idx, SynapticsPktType::OldAbs) {
+                return TestResult::Fail("OLDABS validation must pass this packet");
+            }
+        }
+        let hw = decode_synaptics_oldabs(&buf);
+        if hw.x != 1000 || hw.y != 2000 || hw.z != 50 || hw.w != 2 {
+            return TestResult::Fail("OLDABS x/y/z/w decode wrong");
+        }
+        if !hw.left || hw.right {
+            return TestResult::Fail("OLDABS button bits wrong");
+        }
+        // A NEWABS-strict check must reject an OLDABS packet
+        // (byte 0 fails the NEWABS mask), so the two flavours can
+        // never be confused by the packet-type probe.
+        if synaptics_validate_byte(&buf, 0, SynapticsPktType::NewAbsStrict) {
+            return TestResult::Fail("NEWABS validation must reject OLDABS byte 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/psmouse", smoke_synaptics_oldabs_decode);
+
+    fn smoke_elantech_signature_and_hw_version() -> TestResult {
+        // Signature: a zero major is never Elantech (this is the
+        // standard mouse 00.02.64 false positive); a zero minor is
+        // a real firmware; a sample rate in param[2] is a mouse
+        // echoing rates, not a version; the hw>=4 carve-out accepts
+        // revisions above 20 that are not rates.
+        if elantech_is_signature_valid(&[0x00, 0x02, 0x64]) {
+            return TestResult::Fail("00.02.64 must fail the signature (zero major)");
+        }
+        if !elantech_is_signature_valid(&[0x02, 0x00, 0x22]) {
+            return TestResult::Fail("02.00.22 must pass the signature");
+        }
+        if elantech_is_signature_valid(&[0x02, 0x08, 0x64]) {
+            return TestResult::Fail("02.08.64 must fail the signature (100 is a rate)");
+        }
+        if !elantech_is_signature_valid(&[0x02, 0x08, 0x00]) {
+            return TestResult::Fail("02.08.00 must pass the signature");
+        }
+        if !elantech_is_signature_valid(&[0x46, 0x0F, 0x02]) {
+            return TestResult::Fail("46.0F.02 must pass the signature (hw>=4 carve-out)");
+        }
+        if elantech_is_signature_valid(&[0x16, 0x0F, 0x28]) {
+            return TestResult::Fail("16.0F.28 must fail (revision 40, and 40 is a rate)");
+        }
+        // Hardware version table (elantech_set_properties).
+        if elantech_hw_version(0x020022) != Some(1) {
+            return TestResult::Fail("fw 0x020022 must be hw v1");
+        }
+        if elantech_hw_version(0x020600) != Some(1) {
+            return TestResult::Fail("fw 0x020600 must be hw v1");
+        }
+        if elantech_hw_version(0x020030) != Some(2) {
+            return TestResult::Fail("fw 0x020030 must be hw v2");
+        }
+        if elantech_hw_version(0x020800) != Some(2) {
+            return TestResult::Fail("fw 0x020800 must be hw v2");
+        }
+        if elantech_hw_version(0x040216) != Some(2) {
+            return TestResult::Fail("fw 0x040216 must be hw v2");
+        }
+        if elantech_hw_version(0x050000) != Some(3) {
+            return TestResult::Fail("fw 0x050000 must be hw v3");
+        }
+        if elantech_hw_version(0x460f02) != Some(4) {
+            return TestResult::Fail("fw 0x460f02 must be hw v4");
+        }
+        if elantech_hw_version(0x030000).is_some() {
+            return TestResult::Fail("fw 0x030000 (IC 3) must be unknown hardware");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_elantech_signature_and_hw_version
+    );
+
+    fn smoke_psmouse_elantech_detect_v2_knock() -> TestResult {
+        // Elantech v2 pad, firmware 02.08.00 (elantech.rst EF023):
+        // Synaptics no, ALPS E6 no, magic knock 3C-03-C8, firmware
+        // version 02.08.00, capabilities 00-16-0C, samples 00-00-00,
+        // then the v2 absolute-mode register writes + reg 0x10
+        // read-back. No reset and no wheel knock may follow.
+        let replies = [
+            0x00, 0x00, 0x00, // Synaptics GETINFO
+            0x00, 0x00, 0x00, // ALPS E6 GETINFO
+            0x3C, 0x03, 0xC8, // Elantech magic knock
+            0x02, 0x08, 0x00, // FW version query
+            0x00, 0x16, 0x0C, // Capabilities query
+            0x00, 0x00, 0x00, // Sample query
+            0x54, 0x00, 0x00, // Reg 0x10 read-back
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Elantech || proto != PsmouseProtocol::Elantech {
+            return TestResult::Fail("Elantech v2 pad must negotiate Elantech");
+        }
+        let Some(info) = elantech_info() else {
+            return TestResult::Fail("Elantech info must be recorded after detection");
+        };
+        if info.hw_version != 2
+            || info.fw_version != 0x020800
+            || info.x_max != 1152
+            || info.y_max != 768
+            || !info.reports_pressure
+            || info.crc_enabled
+            || info.buttonpad
+            || info.has_trackpoint
+        {
+            return TestResult::Fail("Elantech v2 info (ranges/flags) wrong");
+        }
+        let mut want = probe_prefix_sent();
+        // The probe prefix ends with the magic knock + reset; the
+        // Elantech path returns before the reset, so drop it.
+        want.pop();
+        // FW version / capabilities / samples: sliced queries.
+        want.extend_from_slice(&sliced_cmd(0x01));
+        want.push(0xE9);
+        want.extend_from_slice(&sliced_cmd(0x02));
+        want.push(0xE9);
+        want.extend_from_slice(&sliced_cmd(0x03));
+        want.push(0xE9);
+        // Absolute mode, v2: write reg 0x10=0x54, 0x11=0x88,
+        // 0x21=0x60 (F8 11 F8 reg F8 val E6 each), then read back
+        // reg 0x10 (F8 10 F8 10 E9).
+        want.extend_from_slice(&[0xF8, 0x11, 0xF8, 0x10, 0xF8, 0x54, 0xE6]);
+        want.extend_from_slice(&[0xF8, 0x11, 0xF8, 0x11, 0xF8, 0x88, 0xE6]);
+        want.extend_from_slice(&[0xF8, 0x11, 0xF8, 0x21, 0xF8, 0x60, 0xE6]);
+        want.extend_from_slice(&[0xF8, 0x10, 0xF8, 0x10, 0xE9]);
+        if fake.sent != want {
+            return TestResult::Fail("Elantech v2 detect wire sequence wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_elantech_detect_v2_knock
+    );
+
+    fn smoke_psmouse_elantech_rejects_standard_mouse() -> TestResult {
+        // The #1676 false positive, nailed shut: a standard mouse
+        // answers the Elantech magic knock's GETINFO with
+        // 00-02-64, which parses as version triple 00.02.64 — but
+        // the magic bytes are 3C-03-C8, so detection fails before
+        // the firmware query ever runs.
+        let replies = [
+            0x00, 0x00, 0x00, // Synaptics GETINFO
+            0x00, 0x00, 0x00, // ALPS E6 GETINFO
+            0x00, 0x02, 0x64, // Elantech magic knock (fails)
+            0xAA, 0x00, // reset BAT+ID
+            0x00, 0x00, 0x00, // GETIDs
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Generic || proto != PsmouseProtocol::Standard {
+            return TestResult::Fail("standard mouse must fall back to Standard, not Elantech");
+        }
+        if elantech_info().is_some() {
+            return TestResult::Fail("no Elantech info may be recorded for a standard mouse");
+        }
+        // The firmware query is a sliced command; it must never
+        // appear — the knock alone decides.
+        if fake.sent.windows(2).any(|w| w[0] == 0xE8 && w[1] == 0x01) {
+            return TestResult::Fail("firmware query must not run after a failed magic knock");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_elantech_rejects_standard_mouse
+    );
+
+    fn smoke_psmouse_elantech_rejects_zero_major_signature() -> TestResult {
+        // Magic knock passes, but the firmware version is
+        // 00.02.64: param[0] == 0 fails the signature (Linux:
+        // "Probably not a real Elantech touchpad").
+        let replies = [
+            0x00, 0x00, 0x00, // Synaptics GETINFO
+            0x00, 0x00, 0x00, // ALPS E6 GETINFO
+            0x3C, 0x03, 0xC8, // Elantech magic knock
+            0x00, 0x02, 0x64, // FW version query (invalid)
+            0xAA, 0x00, // reset BAT+ID
+            0x00, 0x00, 0x00, // GETIDs
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Generic || proto != PsmouseProtocol::Standard {
+            return TestResult::Fail("zero-major firmware must fall back to Standard");
+        }
+        if elantech_info().is_some() {
+            return TestResult::Fail("no Elantech info may be recorded on signature failure");
+        }
+        // No register writes (0xF8) may appear: absolute mode
+        // must never be attempted for a rejected pad.
+        if fake.sent.contains(&0xF8) {
+            return TestResult::Fail("register writes must not run after a signature failure");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_elantech_rejects_zero_major_signature
+    );
+
+    fn smoke_psmouse_elantech_rejects_rate_version_signature() -> TestResult {
+        // Magic knock passes, but the firmware version is
+        // 02.08.64: param[2] == 100 is a sample rate, so the
+        // signature fails (Logitech mice answer the knock this way).
+        let replies = [
+            0x00, 0x00, 0x00, // Synaptics GETINFO
+            0x00, 0x00, 0x00, // ALPS E6 GETINFO
+            0x3C, 0x03, 0xC8, // Elantech magic knock
+            0x02, 0x08, 0x64, // FW version query (invalid)
+            0xAA, 0x00, // reset BAT+ID
+            0x00, 0x00, 0x00, // GETIDs
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Generic || proto != PsmouseProtocol::Standard {
+            return TestResult::Fail("rate-valued firmware must fall back to Standard");
+        }
+        if elantech_info().is_some() {
+            return TestResult::Fail("no Elantech info may be recorded on signature failure");
+        }
+        if fake.sent.contains(&0xF8) {
+            return TestResult::Fail("register writes must not run after a signature failure");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_elantech_rejects_rate_version_signature
+    );
+
+    fn smoke_psmouse_elantech_detect_v4_knock() -> TestResult {
+        // Elantech v4 pad, firmware 46.0F.02: the hw>=4 carve-out
+        // accepts the signature, and hw v3+ uses the fast (0xF8)
+        // query commands. FW_ID 34-B0-20 gives ranges 1200x800
+        // with 24 traces, so width is 1200/23 = 52. No reg 0x10
+        // read-back exists on v4.
+        let replies = [
+            0x00, 0x00, 0x00, // Synaptics GETINFO
+            0x00, 0x00, 0x00, // ALPS E6 GETINFO
+            0x3C, 0x03, 0xC8, // Elantech magic knock
+            0x46, 0x0F, 0x02, // FW version query
+            0x00, 0x18, 0x0C, // Capabilities query (24 traces)
+            0x00, 0x00, 0x00, // Sample query
+            0x34, 0xB0, 0x20, // FW ID query (1200x800)
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Elantech || proto != PsmouseProtocol::Elantech {
+            return TestResult::Fail("Elantech v4 pad must negotiate Elantech");
+        }
+        let Some(info) = elantech_info() else {
+            return TestResult::Fail("Elantech info must be recorded after detection");
+        };
+        if info.hw_version != 4
+            || info.fw_version != 0x460f02
+            || info.x_max != 1200
+            || info.y_max != 800
+            || info.width != 52
+            || !info.reports_pressure
+            || info.crc_enabled
+        {
+            return TestResult::Fail("Elantech v4 info (ranges/width/flags) wrong");
+        }
+        let mut want = probe_prefix_sent();
+        want.pop(); // Elantech returns before the reset.
+        want.extend_from_slice(&sliced_cmd(0x01));
+        want.push(0xE9);
+        // Fast queries (hw v3+): F8, cmd, GETINFO.
+        want.extend_from_slice(&[0xF8, 0x02, 0xE9]);
+        want.extend_from_slice(&[0xF8, 0x03, 0xE9]);
+        want.extend_from_slice(&[0xF8, 0x00, 0xE9]);
+        // Absolute mode, v4: write reg 0x07=0x01
+        // (F8 00 F8 07 F8 00 F8 01 E6), no read-back.
+        want.extend_from_slice(&[0xF8, 0x00, 0xF8, 0x07, 0xF8, 0x00, 0xF8, 0x01, 0xE6]);
+        if fake.sent != want {
+            return TestResult::Fail("Elantech v4 detect wire sequence wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_elantech_detect_v4_knock
+    );
+
+    fn smoke_psmouse_elantech_detect_v1_knock() -> TestResult {
+        // Elantech v1 pad, firmware 02.00.22 (elantech.rst EF013):
+        // sliced register writes (0x10=0x16, 0x11=0x8F) plus a
+        // sliced read-back of reg 0x10 showing the absolute-mode
+        // bit. Ranges are the v1 constants (544x352).
+        let replies = [
+            0x00, 0x00, 0x00, // Synaptics GETINFO
+            0x00, 0x00, 0x00, // ALPS E6 GETINFO
+            0x3C, 0x03, 0xC8, // Elantech magic knock
+            0x02, 0x00, 0x22, // FW version query
+            0x00, 0x00, 0x00, // Capabilities query
+            0x16, 0x00, 0x00, // Reg 0x10 read-back (absolute bit set)
+        ];
+        let mut fake = FakePs2::new(&replies);
+        let (hw, proto) = negotiate_protocol(&mut fake);
+        if hw != PsmouseHardware::Elantech || proto != PsmouseProtocol::ElantechV1 {
+            return TestResult::Fail("Elantech v1 pad must negotiate ElantechV1");
+        }
+        let Some(info) = elantech_info() else {
+            return TestResult::Fail("Elantech info must be recorded after detection");
+        };
+        if info.hw_version != 1
+            || info.fw_version != 0x020022
+            || info.x_max != 544
+            || info.y_max != 352
+            || info.reports_pressure
+            || !info.jumpy_cursor
+        {
+            return TestResult::Fail("Elantech v1 info (ranges/jumpy) wrong");
+        }
+        let mut want = probe_prefix_sent();
+        want.pop(); // Elantech returns before the reset.
+        want.extend_from_slice(&sliced_cmd(0x01));
+        want.push(0xE9);
+        want.extend_from_slice(&sliced_cmd(0x02));
+        want.push(0xE9);
+        // Absolute mode, v1: write reg 0x10=0x16 then 0x11=0x8F
+        // (sliced WRITE, sliced reg, sliced val, SETSCALE11 each),
+        // then read back reg 0x10 (sliced READ, sliced reg, GETINFO).
+        for (reg, val) in [(0x10u8, 0x16u8), (0x11u8, 0x8fu8)] {
+            want.extend_from_slice(&sliced_cmd(0x11));
+            want.extend_from_slice(&sliced_cmd(reg));
+            want.extend_from_slice(&sliced_cmd(val));
+            want.push(0xE6);
+        }
+        want.extend_from_slice(&sliced_cmd(0x10));
+        want.extend_from_slice(&sliced_cmd(0x10));
+        want.push(0xE9);
+        if fake.sent != want {
+            return TestResult::Fail("Elantech v1 detect wire sequence wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/psmouse",
+        smoke_psmouse_elantech_detect_v1_knock
+    );
+
+    fn smoke_elantech_v1_decode() -> TestResult {
+        // v1 packets, both firmware layouts (verified vectors):
+        // new-fw (02.00.22): 1 finger at (300, 200), left pressed.
+        let pkt: [u8; 4] = [0x49, 0x04, 0x2C, 0x98];
+        if !elantech_packet_check_v1(&pkt, 0x020022) {
+            return TestResult::Fail("v1 parity check must pass this packet");
+        }
+        let mut state = ElantechState::default();
+        let Some(frame) = decode_elantech_v1(&mut state, &pkt, 0x020022, 352, false) else {
+            return TestResult::Fail("v1 decode must produce a frame");
+        };
+        if frame.fingers != 1
+            || !frame.slots[0].active
+            || frame.slots[0].x != 300
+            || frame.slots[0].y != 200
+            || !frame.left
+            || frame.right
+        {
+            return TestResult::Fail("v1 new-fw decode (fingers/x/y/buttons) wrong");
+        }
+        // Old-fw (01.00.00): 2 fingers at (100, 50), left pressed.
+        let pkt: [u8; 4] = [0x0D, 0x91, 0x64, 0x2E];
+        if !elantech_packet_check_v1(&pkt, 0x010000) {
+            return TestResult::Fail("v1 old-fw parity check must pass this packet");
+        }
+        let mut state = ElantechState::default();
+        let Some(frame) = decode_elantech_v1(&mut state, &pkt, 0x010000, 352, false) else {
+            return TestResult::Fail("v1 old-fw decode must produce a frame");
+        };
+        if frame.fingers != 2 || frame.slots[0].x != 100 || frame.slots[0].y != 50 {
+            return TestResult::Fail("v1 old-fw decode (fingers/x/y) wrong");
+        }
+        // One flipped parity bit fails the check.
+        if elantech_packet_check_v1(&[0x49, 0x04, 0x2C, 0x99], 0x020022) {
+            return TestResult::Fail("v1 parity check must fail a corrupted packet");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/psmouse", smoke_elantech_v1_decode);
+
+    fn smoke_elantech_v2_decode() -> TestResult {
+        // 1 finger at (1000, 500), pressure 0xAB, width 5, left.
+        let pkt: [u8; 6] = [0x55, 0xA3, 0xE8, 0x12, 0xB1, 0x0C];
+        if !elantech_packet_check_v2(&pkt, true) {
+            return TestResult::Fail("v2 pressure check must pass this packet");
+        }
+        let mut state = ElantechState::default();
+        let frame = decode_elantech_v2(&mut state, &pkt, 768);
+        if frame.fingers != 1
+            || frame.slots[0].x != 1000
+            || frame.slots[0].y != 500
+            || frame.pressure != 0xAB
+            || frame.width != 5
+            || !frame.left
+        {
+            return TestResult::Fail("v2 1-finger decode (x/y/pres/width/buttons) wrong");
+        }
+        // 2 fingers at (400, 600) and (800, 300); fixed pres/width.
+        let pkt: [u8; 6] = [0x85, 0x64, 0x2A, 0x02, 0xC8, 0x75];
+        if !elantech_packet_check_v2(&pkt, true) {
+            return TestResult::Fail("v2 2-finger check must pass this packet");
+        }
+        let mut state = ElantechState::default();
+        let frame = decode_elantech_v2(&mut state, &pkt, 768);
+        if frame.fingers != 2
+            || frame.slots[0].x != 400
+            || frame.slots[0].y != 600
+            || frame.slots[1].x != 800
+            || frame.slots[1].y != 300
+            || frame.pressure != 127
+            || frame.width != 7
+        {
+            return TestResult::Fail("v2 2-finger decode wrong");
+        }
+        // 4 fingers: fingers field 3 with byte 3 bit 7 set.
+        let pkt: [u8; 6] = [0xD5, 0xA3, 0xE8, 0x92, 0xB1, 0x0C];
+        if !elantech_packet_check_v2(&pkt, true) {
+            return TestResult::Fail("v2 4-finger check must pass this packet");
+        }
+        let mut state = ElantechState::default();
+        let frame = decode_elantech_v2(&mut state, &pkt, 768);
+        if frame.fingers != 4 || frame.slots[0].x != 1000 || frame.slots[0].y != 500 {
+            return TestResult::Fail("v2 4-finger decode wrong");
+        }
+        // Old non-pressure firmware layout (fw 02.00.30, EF113).
+        let pkt: [u8; 6] = [0x7D, 0x03, 0xE8, 0x38, 0x01, 0x0C];
+        if !elantech_packet_check_v2(&pkt, false) {
+            return TestResult::Fail("v2 old-fw check must pass this packet");
+        }
+        let mut state = ElantechState::default();
+        let frame = decode_elantech_v2(&mut state, &pkt, 768);
+        if frame.fingers != 1 || frame.slots[0].x != 1000 || frame.slots[0].y != 500 {
+            return TestResult::Fail("v2 old-fw decode wrong");
+        }
+        // The exact debounce packet is recognised as such.
+        if !elantech_is_debounce_v2(&[0x84, 0xFF, 0xFF, 0x02, 0xFF, 0xFF]) {
+            return TestResult::Fail("v2 debounce packet must be recognised");
+        }
+        if elantech_is_debounce_v2(&[0x55, 0xA3, 0xE8, 0x12, 0xB1, 0x0C]) {
+            return TestResult::Fail("a live v2 packet must not be debounce");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/psmouse", smoke_elantech_v2_decode);
+
+    fn smoke_elantech_v3_decode() -> TestResult {
+        // Two-finger head packet only stashes finger A (600, 700).
+        let head: [u8; 6] = [0x85, 0x52, 0x58, 0x02, 0x60, 0x64];
+        if elantech_packet_check_v3(&head, false) != ElantechPacket::V3Head {
+            return TestResult::Fail("v3 head packet must classify as V3Head");
+        }
+        let mut state = ElantechState::default();
+        if decode_elantech_v3(&mut state, &head, ElantechPacket::V3Head, 800, false).is_some() {
+            return TestResult::Fail("v3 head packet must not produce a frame");
+        }
+        if !state.v3_head_pending {
+            return TestResult::Fail("v3 head packet must stash its finger");
+        }
+        // Tail packet completes the pair: (600, 700) + (900, 400).
+        let tail: [u8; 6] = [0x8D, 0x73, 0x84, 0x0C, 0x81, 0x90];
+        if elantech_packet_check_v3(&tail, false) != ElantechPacket::V3Tail {
+            return TestResult::Fail("v3 tail packet must classify as V3Tail");
+        }
+        let Some(frame) = decode_elantech_v3(&mut state, &tail, ElantechPacket::V3Tail, 800, false)
+        else {
+            return TestResult::Fail("v3 tail packet must produce a frame");
+        };
+        if frame.fingers != 2
+            || frame.slots[0].x != 600
+            || frame.slots[0].y != 700
+            || frame.slots[1].x != 900
+            || frame.slots[1].y != 400
+        {
+            return TestResult::Fail("v3 head/tail decode wrong");
+        }
+        // One finger rides a single head-type packet.
+        let pkt: [u8; 6] = [0x45, 0x53, 0xE8, 0x02, 0x02, 0x58];
+        if elantech_packet_check_v3(&pkt, false) != ElantechPacket::V3Head {
+            return TestResult::Fail("v3 1-finger packet must classify as V3Head");
+        }
+        let mut state = ElantechState::default();
+        let Some(frame) = decode_elantech_v3(&mut state, &pkt, ElantechPacket::V3Head, 800, false)
+        else {
+            return TestResult::Fail("v3 1-finger packet must produce a frame");
+        };
+        if frame.fingers != 1 || frame.slots[0].x != 1000 || frame.slots[0].y != 200 {
+            return TestResult::Fail("v3 1-finger decode wrong");
+        }
+        // Debounce, CRC signatures, and the trackpoint signature.
+        if elantech_packet_check_v3(&[0xC4, 0xFF, 0xFF, 0x02, 0xFF, 0xFF], false)
+            != ElantechPacket::Debounce
+        {
+            return TestResult::Fail("v3 debounce packet must classify as Debounce");
+        }
+        if elantech_packet_check_v3(&[0x45, 0x53, 0xE8, 0x08, 0x02, 0x58], true)
+            != ElantechPacket::V3Head
+        {
+            return TestResult::Fail("v3 CRC head signature must classify as V3Head");
+        }
+        if elantech_packet_check_v3(&[0x45, 0x53, 0xE8, 0x09, 0x02, 0x58], true)
+            != ElantechPacket::V3Tail
+        {
+            return TestResult::Fail("v3 CRC tail signature must classify as V3Tail");
+        }
+        if elantech_packet_check_v3(&[0x45, 0x53, 0xE8, 0x06, 0x02, 0x58], false)
+            != ElantechPacket::Trackpoint
+        {
+            return TestResult::Fail("v3 trackpoint signature must classify as Trackpoint");
+        }
+        if elantech_packet_check_v3(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00], false)
+            != ElantechPacket::Unknown
+        {
+            return TestResult::Fail("garbage must classify as Unknown");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/psmouse", smoke_elantech_v3_decode);
+
+    fn smoke_elantech_v4_decode() -> TestResult {
+        // Head: slot 0 at (1000, 200), pressure 0x9A, 3 traces.
+        let head: [u8; 6] = [0x30, 0x93, 0xE8, 0x31, 0xA2, 0x58];
+        if elantech_packet_check_v4(&head, false, 0x460f02, 0, false) != ElantechPacket::V4Head {
+            return TestResult::Fail("v4 head packet must classify as V4Head");
+        }
+        let mut state = ElantechState::default();
+        let Some(frame) =
+            decode_elantech_v4(&mut state, &head, ElantechPacket::V4Head, 800, 52, false)
+        else {
+            return TestResult::Fail("v4 head packet must produce a frame");
+        };
+        if frame.fingers != 1
+            || frame.slots[0].x != 1000
+            || frame.slots[0].y != 200
+            || frame.slots[0].pressure != 0x9A
+            || frame.slots[0].width != 156
+        {
+            return TestResult::Fail("v4 head decode (x/y/pres/width) wrong");
+        }
+        // Motion: slot 0 dx=+10, dy=-5 -> (1010, 205).
+        let motion: [u8; 6] = [0x20, 0x0A, 0xFB, 0x32, 0x00, 0x00];
+        if elantech_packet_check_v4(&motion, false, 0x460f02, 0, false) != ElantechPacket::V4Motion
+        {
+            return TestResult::Fail("v4 motion packet must classify as V4Motion");
+        }
+        let Some(frame) = decode_elantech_v4(
+            &mut state,
+            &motion,
+            ElantechPacket::V4Motion,
+            800,
+            52,
+            false,
+        ) else {
+            return TestResult::Fail("v4 motion packet must produce a frame");
+        };
+        if frame.slots[0].x != 1010 || frame.slots[0].y != 205 {
+            return TestResult::Fail("v4 motion decode wrong");
+        }
+        // Status: no fingers down — slot 0 releases.
+        let status: [u8; 6] = [0x00, 0x00, 0x00, 0x10, 0x00, 0x00];
+        if elantech_packet_check_v4(&status, false, 0x460f02, 0, false) != ElantechPacket::V4Status
+        {
+            return TestResult::Fail("v4 status packet must classify as V4Status");
+        }
+        let Some(frame) = decode_elantech_v4(
+            &mut state,
+            &status,
+            ElantechPacket::V4Status,
+            800,
+            52,
+            false,
+        ) else {
+            return TestResult::Fail("v4 status packet must produce a frame");
+        };
+        if frame.fingers != 0 || frame.slots[0].active {
+            return TestResult::Fail("v4 status decode must release slot 0");
+        }
+        // A packet type of 3 is unknown, and a head packet naming
+        // slot 5 (id bits 110) decodes to nothing.
+        if elantech_packet_check_v4(
+            &[0x30, 0x93, 0xE8, 0x33, 0xA2, 0x58],
+            false,
+            0x460f02,
+            0,
+            false,
+        ) != ElantechPacket::Unknown
+        {
+            return TestResult::Fail("v4 type 3 must classify as Unknown");
+        }
+        let bad_head: [u8; 6] = [0x30, 0x93, 0xE8, 0xD1, 0xA2, 0x58];
+        if elantech_packet_check_v4(&bad_head, false, 0x460f02, 0, false) != ElantechPacket::V4Head
+        {
+            return TestResult::Fail("v4 slot-5 head must still classify as V4Head");
+        }
+        if decode_elantech_v4(
+            &mut state,
+            &bad_head,
+            ElantechPacket::V4Head,
+            800,
+            52,
+            false,
+        )
+        .is_some()
+        {
+            return TestResult::Fail("v4 head naming slot 5 must decode to nothing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/psmouse", smoke_elantech_v4_decode);
+}
