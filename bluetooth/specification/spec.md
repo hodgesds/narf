@@ -419,9 +419,42 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   starts the open and reports Pending, a later call completes it
   (Open / OpenRfcomm) or reports the terminal Refused / Failed
   outcome; cancelling drops the record and tears down any
-  half-opened channel. Out of scope here: SCO (#817), fixed-CID
+  half-opened channel. Out of scope here: fixed-CID
   sockets (ATT/SMP/signalling stay routed to the pump's own
   server/responder), and SDP-channel sockets (service-owned).
+  SCO sockets (issue #814) ride the #817 SCO transport
+  (`HciTransport::send_sco` / `recv_sco`, isoch endpoints on USB).
+  `pump::sco_connect` starts an outbound setup — over a live ACL
+  it issues Setup Synchronous Connection at once (8 kHz TX/RX,
+  0xFFFF max latency, the socket's BT_VOICE setting, retransmission
+  effort 0x02, all eSCO packet types), otherwise it pages first
+  (the peer must be discovered; NARF never pages blind) — and
+  `pump::sco_connect_status` polls the outcome: Pending while in
+  flight, Connected once the Synchronous Connection Complete
+  lands the link (MTU = the controller's SCO MTU, else 60),
+  Refused(status) for a controller refusal (0x04 Page Timeout
+  surfaces as ETIMEDOUT at the socket layer), Aborted when no
+  setup is in flight. At most one pending setup per controller;
+  a second connect to a live link is AlreadyConnected, and an
+  unmatched Synchronous Connection Complete records an unclaimed
+  link a later connect claims. `pump::send_sco` sends one frame
+  (oversize → TooBig; an isoch-less transport → Unsupported,
+  fail-closed), `pump::drain_sco_rx` / `sco_rx_pending` drain/peek
+  staged inbound frames (the packet-status flag is dropped at the
+  pump — Linux delivers it as `BT_SCM_PKT_STATUS` ancillary data,
+  which NARF has no BT cmsg path for yet), `pump::disconnect_sco`
+  issues HCI_Disconnect (reason 0x13), and
+  `pump::cancel_sco_connect` drops a pending setup (a page already
+  in flight still lands a plain ACL). `pump_once` drains
+  `recv_sco` each step; Disconnection Complete drops SCO links
+  riding the dead ACL (and the SCO handle itself). Raw HCI
+  sockets forward 0x03 SCO data packets to `send_sco`. The socket
+  layer (`userspace/src/socket.rs`) is two-phase: the first
+  `connect()` returns EINPROGRESS and the syscall parks on
+  POLLOUT|ERR|HUP, re-executing into a status poll; SOL_SCO
+  SCO_OPTIONS reports the link MTU and SCO_CONNINFO the handle +
+  peer class once connected (ENOTCONN before). Inbound SCO accept
+  is out of scope — accept still returns WouldBlock.
 - `pm` — per-controller power-management state (issue #820). Three
   independent park causes — mgmt power-off, system suspend,
   USB autosuspend — OR into `pm::is_parked`, which gates

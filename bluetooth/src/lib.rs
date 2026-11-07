@@ -263,6 +263,18 @@ pub fn register_initcalls() {
             crate::pump::connect_ready,
             crate::pump::cancel_connect,
         );
+        // Stage: install the SCO socket handlers (issue #814) so
+        // AF_BLUETOOTH SCO connect/send/recv reach the pump's SCO
+        // links over the #817 isoch transport.
+        narf_filesystem::bluetooth::install_bt_sco_handlers(
+            crate::pump::sco_connect,
+            crate::pump::sco_connect_status,
+            crate::pump::send_sco,
+            crate::pump::drain_sco_rx,
+            crate::pump::sco_rx_pending,
+            crate::pump::disconnect_sco,
+            crate::pump::cancel_sco_connect,
+        );
         InitResult::Ok
     });
 }

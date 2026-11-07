@@ -39,8 +39,16 @@ pub(crate) fn sys_socket_connect(ctx: &mut dyn TrapContext) {
         crate::socket::SocketOpResult::Err(e) => {
             let errno = e.errno() as i64;
             let waitable = errno == EINPROGRESS || errno == EALREADY;
-            if waitable && sock.inet_connect_pending() && !socket_listener_nonblock(task, fd, &sock) {
+            if waitable && sock.inet_connect_pending() && !socket_listener_nonblock(task, fd, &sock)
+            {
                 inet_wait_for_connect(ctx, &sock, errno, resumed);
+                return;
+            }
+            if waitable
+                && sock.bt_sco_connect_pending()
+                && !socket_listener_nonblock(task, fd, &sock)
+            {
+                sco_wait_for_connect(ctx, &sock, errno, resumed);
                 return;
             }
             ctx.set_return(SyscallReturn::ok((-errno) as u64));
@@ -65,7 +73,8 @@ fn inet_wait_for_connect(
 ) {
     use core::sync::atomic::Ordering;
     if resumed.is_none() {
-        sock.connect_timeo_errno().store(errno as i32, Ordering::Release);
+        sock.connect_timeo_errno()
+            .store(errno as i32, Ordering::Release);
     }
     let timeout_errno = match sock.connect_timeo_errno().load(Ordering::Acquire) {
         0 => errno,
@@ -85,6 +94,48 @@ fn inet_wait_for_connect(
                 }
             }
             None => errno_ret(timeout_errno),
+        };
+        ctx.set_return(ret);
+        return;
+    }
+    super::handler_sys_socket_recv::socket_block_with(
+        ctx,
+        sock,
+        narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR | narf_filesystem::POLL_HUP,
+        sock.sndtimeo(),
+        resumed,
+        timeout_errno,
+    );
+}
+
+/// `sco_wait_for_connect`: a blocking SCO connect(2) sleeps until the
+/// setup ends — readiness (POLLOUT once established, ERR/HUP once it
+/// fails) wakes it and the syscall re-executes, finding the outcome in
+/// `bt_sco_connect_progress`. Bounded by SO_SNDTIMEO: on timeout it
+/// returns EINPROGRESS; a signal ends a finite wait with EINTR.
+/// Nothing spins: the CPU idles while the HCI setup runs.
+fn sco_wait_for_connect(
+    ctx: &mut dyn TrapContext,
+    sock: &alloc::sync::Arc<crate::socket::SocketFile>,
+    errno: i64,
+    resumed: Option<u64>,
+) {
+    use core::sync::atomic::Ordering;
+    if resumed.is_none() {
+        sock.connect_timeo_errno()
+            .store(errno as i32, Ordering::Release);
+    }
+    let timeout_errno = match sock.connect_timeo_errno().load(Ordering::Acquire) {
+        0 => errno,
+        e => e as i64,
+    };
+    if !can_park_reexecute() {
+        // Kernel-test / nested context: no task to park. Poll the
+        // setup once; still-pending reports EINPROGRESS again.
+        let ret = match sock.bt_sco_connect_progress() {
+            crate::socket::SocketOpResult::Ok(_) => SyscallReturn::ok(0),
+            crate::socket::SocketOpResult::Err(e) => errno_ret(e.errno() as i64),
+            _ => errno_ret(EINVAL),
         };
         ctx.set_return(ret);
         return;

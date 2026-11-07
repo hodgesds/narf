@@ -104,7 +104,8 @@ pub const AF_BLUETOOTH: u16 = 31;
 pub const BT_MAX_PROTO: i32 = 9;
 /// Bluetooth protocols (include/net/bluetooth/bluetooth.h). BTPROTO_HCI is the
 /// raw HCI + mgmt surface; L2CAP/RFCOMM/SCO are the connection-oriented
-/// protocol families (bind/getsockname implemented; connect is hardware-gated).
+/// protocol families (bind/getsockname implemented; L2CAP/RFCOMM connect is
+/// #889/#1532; SCO connect/send/recv is issue #814).
 pub const BTPROTO_L2CAP: u32 = 0;
 pub const BTPROTO_HCI: u32 = 1;
 pub const BTPROTO_SCO: u32 = 2;
@@ -205,6 +206,35 @@ pub struct BtChannelState {
 /// the next lookup.
 static SCO_LISTENERS: IrqSafeSpinLock<Vec<([u8; 6], alloc::sync::Weak<SocketFile>)>> =
     IrqSafeSpinLock::new(Vec::new());
+
+/// A live SCO link owned by one socket (`struct sco_conn` +
+/// `sco_pi(sk)->conn`, issue #814). One socket holds at most one:
+/// `connect` fills it, `shutdown`/drop clears it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BtScoState {
+    /// Controller index the link lives on.
+    pub dev: u16,
+    /// SCO connection handle.
+    pub handle: u16,
+    /// Peer bdaddr.
+    pub peer: [u8; 6],
+    /// SCO MTU (controller `sco_data_mtu`, else 60).
+    pub mtu: u16,
+    /// Peer class of device (from the inquiry record, else zero).
+    pub dev_class: [u8; 3],
+}
+
+/// Map an HCI setup-refusal status onto an errno (issue #814):
+/// 0x04 Page Timeout → ETIMEDOUT; every other nonzero status →
+/// ECONNREFUSED. Only a partial `bt_to_errno` — the full
+/// HCI-status→errno table is a remainder.
+fn bt_sco_refused_errno(status: u8) -> SockError {
+    if status == 0x04 {
+        SockError::Stack(errno::ETIMEDOUT as i32)
+    } else {
+        SockError::ConnectionRefused
+    }
+}
 
 /// Listening RFCOMM sockets by (controller, server channel);
 /// a dropped socket's entry is pruned on the next lookup. L2CAP
@@ -817,6 +847,14 @@ pub enum SockError {
     AfNoSupport,
     /// `ENETUNREACH` — no route to the destination.
     NetUnreach,
+    /// `EHOSTUNREACH` — SCO connect to an undiscovered peer
+    /// (Linux `sco_connect`: `hci_get_route` failure). NARF
+    /// never pages blind, so an unknown peer is a routing
+    /// failure, not a page attempt.
+    HostUnreach,
+    /// `EBUSY` — a SCO link (or its setup) is already owned by
+    /// another socket (Linux `sco_chan_add` on an owned conn).
+    Busy,
     /// `ENOPROTOOPT` — `setsockopt` of a read-only `SOL_SOCKET` option
     /// (Linux `sk_setsockopt`, net/core/sock.c: SO_TYPE / SO_PROTOCOL /
     /// SO_DOMAIN / SO_ERROR).
@@ -869,6 +907,8 @@ impl SockError {
             Self::Access => errno::EACCES as i32,
             Self::AfNoSupport => errno::EAFNOSUPPORT as i32,
             Self::NetUnreach => errno::ENETUNREACH as i32,
+            Self::HostUnreach => errno::EHOSTUNREACH as i32,
+            Self::Busy => errno::EBUSY as i32,
             Self::NoProtoOpt => errno::ENOPROTOOPT as i32,
             Self::Stack(e) => e,
         }
@@ -1653,12 +1693,18 @@ enum SocketState {
     /// listen registration (issue #814); `channel` is an accepted channel.
     /// `connect` is an in-flight outbound open (issue #1532); a socket is
     /// CONNECTED once `channel` is filled by connect or accept.
+    /// `sco_link` is a live SCO link (issue #814) and `sco_pending` an
+    /// outbound SCO setup in flight (`(dev, peer)`).
     BluetoothConn {
         bound: Option<Vec<u8>>,
         sco: ScoSockState,
         listen: Option<BtListenState>,
         channel: Option<BtChannelState>,
         connect: Option<BtConnectState>,
+        /// Live SCO link (BTPROTO_SCO only).
+        sco_link: Option<BtScoState>,
+        /// Outbound SCO setup in flight (BTPROTO_SCO only).
+        sco_pending: Option<(u16, [u8; 6])>,
         /// Staged inbound SDUs / RFCOMM payloads awaiting recv.
         rx: VecDeque<Vec<u8>>,
     },
@@ -2053,6 +2099,8 @@ impl SocketFile {
                 listen: None,
                 channel: None,
                 connect: None,
+                sco_link: None,
+                sco_pending: None,
                 rx: VecDeque::new(),
             }
         } else {
@@ -5008,10 +5056,29 @@ impl SocketFile {
                 connect,
                 rx,
                 sco,
+                sco_link,
+                sco_pending,
                 ..
             } => {
                 if sco.listening {
                     0
+                } else if sco_pending.is_some() {
+                    // A SCO connect in flight suppresses POLLOUT
+                    // (`bt_sock_poll`: BT_CONNECT/CONNECT2/CONFIG →
+                    // mask without POLLOUT); the syscall parks on
+                    // ERR|HUP and re-runs connect on wake.
+                    0
+                } else if let Some(link) = sco_link {
+                    // An established SCO link is writable, and
+                    // readable when a frame is staged (locally or
+                    // in the pump).
+                    let mut bits = narf_filesystem::POLL_OUT;
+                    let staged = !rx.is_empty()
+                        || narf_filesystem::bluetooth::bt_sco_rx_pending(link.dev, link.handle);
+                    if staged {
+                        bits |= narf_filesystem::POLL_IN;
+                    }
+                    bits
                 } else if let Some(l) = listen {
                     let ready = if self.protocol == BTPROTO_RFCOMM {
                         narf_filesystem::bluetooth::bt_pending_rfcomm(l.dev, l.psm as u8)
@@ -5609,13 +5676,34 @@ impl SocketFile {
             SocketOpResult::OptValue { n }
         };
         let state = self.state.lock();
-        let SocketState::BluetoothConn { bound, sco, .. } = &*state else {
+        let SocketState::BluetoothConn {
+            bound,
+            sco,
+            sco_link,
+            ..
+        } = &*state
+        else {
             return SocketOpResult::Err(SockError::InvalidArg);
         };
         if level == SOL_SCO {
             return match name {
-                // Both need a CONNECTED (or deferred CONNECT2) link.
-                SCO_OPTIONS | SCO_CONNINFO => SocketOpResult::Err(SockError::NotConnected),
+                // `sco_sock_getsockopt_old`: both need a CONNECTED
+                // link (or a deferred CONNECT2 one — out of scope).
+                SCO_OPTIONS => {
+                    let Some(link) = *sco_link else {
+                        return SocketOpResult::Err(SockError::NotConnected);
+                    };
+                    write(buf, &link.mtu.to_ne_bytes())
+                }
+                SCO_CONNINFO => {
+                    let Some(link) = *sco_link else {
+                        return SocketOpResult::Err(SockError::NotConnected);
+                    };
+                    let mut bytes = alloc::vec![];
+                    bytes.extend_from_slice(&link.handle.to_ne_bytes());
+                    bytes.extend_from_slice(&link.dev_class);
+                    write(buf, &bytes)
+                }
                 _ => SocketOpResult::Err(SockError::NoProtoOpt),
             };
         }
@@ -5687,6 +5775,17 @@ impl SocketFile {
             {
                 self.bt_connect(&addr)
             }
+            SocketOp::Connect { addr } if self.protocol == BTPROTO_SCO => {
+                self.bt_connect_sco(&addr)
+            }
+            SocketOp::Send { buf, addr, flags } if self.protocol == BTPROTO_SCO => {
+                self.bt_send_sco(buf, addr, flags)
+            }
+            SocketOp::Recv { buf, flags } if self.protocol == BTPROTO_SCO => {
+                self.bt_recv_sco(buf, flags)
+            }
+            SocketOp::GetPeerName if self.protocol == BTPROTO_SCO => self.bt_sco_getpeername(),
+            SocketOp::Shutdown { .. } if self.protocol == BTPROTO_SCO => self.bt_shutdown(),
             SocketOp::Send { buf, addr, .. }
                 if self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM =>
             {
@@ -5734,9 +5833,9 @@ impl SocketFile {
             }
             SocketOp::GetSockOpt { level, name, buf } => self.handle_getsockopt(level, name, buf),
             SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
-            // connect() for SCO needs the SCO transport (#817);
-            // that backend does not exist, so the honest error
-            // stays. Anything else this dispatcher does not know
+            // connect() for SCO and L2CAP/RFCOMM both have backends
+            // now (#814 SCO, #1532 outbound open) and are dispatched
+            // above. Anything else this dispatcher does not know
             // is NotSupported.
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
@@ -6191,6 +6290,9 @@ impl SocketFile {
             Err(narf_filesystem::bluetooth::BtSendError::TooBig) => {
                 SocketOpResult::Err(SockError::MsgSize)
             }
+            Err(narf_filesystem::bluetooth::BtSendError::Unsupported) => {
+                SocketOpResult::Err(SockError::NotSupported)
+            }
             Err(narf_filesystem::bluetooth::BtSendError::WrongService) => {
                 SocketOpResult::Err(SockError::InvalidArg)
             }
@@ -6263,23 +6365,38 @@ impl SocketFile {
     }
 
     /// Release the L2CAP/RFCOMM channel and/or listen registration
-    /// (issue #814). Idempotent: bridge calls are no-ops when the
-    /// pump no longer knows the channel, and the RFCOMM registry
-    /// entry is pruned (dead entries included — during Drop our own
-    /// Weak no longer upgrades). Called from shutdown and Drop.
+    /// (issue #814), plus the SCO link, pending SCO setup and/or
+    /// SCO listener registration (issue #814). Idempotent: bridge
+    /// calls are no-ops when the pump no longer knows the channel
+    /// or link, and the RFCOMM/SCO registry entries are pruned
+    /// (dead entries included — during Drop our own Weak no longer
+    /// upgrades). Called from shutdown and Drop.
     fn bt_teardown(&self) {
-        let (listen, channel, connect) = {
+        let (listen, channel, connect, sco_link, sco_pending, sco_listening) = {
             let mut state = self.state.lock();
             let SocketState::BluetoothConn {
                 listen,
                 channel,
+                listen,
+                channel,
                 connect,
+                sco,
+                sco_link,
+                sco_pending,
                 ..
             } = &mut *state
             else {
                 return;
             };
-            (listen.take(), channel.take(), connect.take())
+            let sco_listening = core::mem::replace(&mut sco.listening, false);
+            (
+                listen.take(),
+                channel.take(),
+                connect.take(),
+                sco_link.take(),
+                sco_pending.take(),
+                sco_listening,
+            )
         };
         // An in-flight outbound open dies with the socket (#1532):
         // cancel it so no half-open channel survives.
@@ -6309,12 +6426,349 @@ impl SocketFile {
                 let mut listeners = RFCOMM_LISTENERS.lock();
                 listeners.retain(|(_, _, w)| {
                     w.upgrade()
-                        .is_some_and(|s| Arc::as_ptr(&s) != self as *const SocketFile)
+                        .is_some_and(|s| !core::ptr::eq(Arc::as_ptr(&s), self))
                 });
             } else {
                 narf_filesystem::bluetooth::bt_unregister_psm(l.dev, l.psm, l.le);
             }
         }
+        if let Some((dev, peer)) = sco_pending {
+            narf_filesystem::bluetooth::bt_sco_cancel_connect(dev, peer);
+        }
+        if let Some(link) = sco_link {
+            narf_filesystem::bluetooth::bt_disconnect_sco(link.dev, link.handle);
+        }
+        if sco_listening {
+            let mut listeners = SCO_LISTENERS.lock();
+            listeners.retain(|(_, w)| {
+                w.upgrade()
+                    .is_some_and(|s| !core::ptr::eq(Arc::as_ptr(&s), self))
+            });
+        }
+    }
+
+    // ── SCO socket backend (issue #814) ──────────────────────────
+
+    /// `sco_sock_connect`: two-phase outbound SCO setup onto the
+    /// #817 transport. The first dispatch initiates via the broker
+    /// and returns EINPROGRESS; the syscall layer parks on
+    /// POLLOUT|ERR|HUP and re-executes this dispatch, which polls
+    /// the broker status. A non-park (kernel-test) re-run polls
+    /// once and reports EINPROGRESS again while pending.
+    ///
+    /// NARF divergences from Linux (sco.c), documented not hidden:
+    /// the peer must be discovered (no blind paging — NARF never
+    /// guesses PSRM/clock offset); re-entering connect() while a
+    /// setup is in flight polls it (Linux: EBADFD).
+    fn bt_connect_sco(self: &Arc<Self>, addr: &SockAddr) -> SocketOpResult {
+        if self.kind != SOCK_SEQPACKET {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        if addr.family != AF_BLUETOOTH || addr.body.len() < 6 {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let mut peer = [0u8; 6];
+        peer.copy_from_slice(&addr.body[..6]);
+        let (bound_local, voice_setting) = {
+            let state = self.state.lock();
+            let SocketState::BluetoothConn {
+                bound,
+                sco,
+                sco_link,
+                sco_pending,
+                ..
+            } = &*state
+            else {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            };
+            if sco_link.is_some() || sco.listening {
+                return SocketOpResult::Err(SockError::BadFdState);
+            }
+            if let Some((dev, pending_peer)) = *sco_pending {
+                if pending_peer != peer {
+                    return SocketOpResult::Err(SockError::BadFdState);
+                }
+                // Re-entering connect() while a setup is in flight
+                // polls it — the park/re-execute loop needs the
+                // outcome, not a fresh refusal.
+                return self.bt_sco_poll_pending(dev, peer);
+            }
+            (bound.clone(), sco.voice_setting)
+        };
+        // Route: the bound local bdaddr, else BDADDR_ANY → the
+        // first registered controller (`hci_get_route`).
+        let local: [u8; 6] = match bound_local {
+            Some(body) => match body.get(..6).and_then(|b| b.try_into().ok()) {
+                Some(b) => b,
+                None => return SocketOpResult::Err(SockError::InvalidArg),
+            },
+            None => [0u8; 6],
+        };
+        let Some(dev) = Self::bt_route_controller(&local) else {
+            return SocketOpResult::Err(SockError::NoDevice);
+        };
+        match narf_filesystem::bluetooth::bt_sco_connect(dev, peer, voice_setting) {
+            narf_filesystem::bluetooth::BtScoConnectResult::Pending => {
+                let mut state = self.state.lock();
+                if let SocketState::BluetoothConn {
+                    bound, sco_pending, ..
+                } = &mut *state
+                {
+                    // Record the routed local bdaddr when the
+                    // socket was unbound (Linux binds the routed
+                    // device on connect).
+                    if bound.is_none() {
+                        *bound = Some(local.to_vec());
+                    }
+                    *sco_pending = Some((dev, peer));
+                }
+                SocketOpResult::Err(SockError::InProgress)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::Connected {
+                handle,
+                mtu,
+                dev_class,
+            } => {
+                // An unclaimed link for this peer already existed
+                // (cancel race) — no setup was needed.
+                let mut state = self.state.lock();
+                if let SocketState::BluetoothConn {
+                    bound, sco_link, ..
+                } = &mut *state
+                {
+                    if bound.is_none() {
+                        *bound = Some(local.to_vec());
+                    }
+                    *sco_link = Some(BtScoState {
+                        dev,
+                        handle,
+                        peer,
+                        mtu,
+                        dev_class,
+                    });
+                }
+                SocketOpResult::Ok(0)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::NoPump
+            | narf_filesystem::bluetooth::BtScoConnectResult::Transport => {
+                SocketOpResult::Err(SockError::NoDevice)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::Busy => {
+                SocketOpResult::Err(SockError::WouldBlock)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::UnknownPeer => {
+                SocketOpResult::Err(SockError::HostUnreach)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::AlreadyConnected => {
+                SocketOpResult::Err(SockError::BadFdState)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::Refused(status) => {
+                SocketOpResult::Err(bt_sco_refused_errno(status))
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::Aborted => {
+                SocketOpResult::Err(SockError::ConnectionRefused)
+            }
+        }
+    }
+
+    /// Poll an in-flight SCO setup started by [`Self::bt_connect_sco`].
+    /// Connected → store the link, clear pending, Ok(0). A terminal
+    /// refusal clears pending and reports the mapped errno. Still
+    /// pending (or pump-busy) → EINPROGRESS again, so the syscall
+    /// layer re-parks.
+    fn bt_sco_poll_pending(self: &Arc<Self>, dev: u16, peer: [u8; 6]) -> SocketOpResult {
+        match narf_filesystem::bluetooth::bt_sco_connect_status(dev, peer) {
+            narf_filesystem::bluetooth::BtScoConnectResult::Connected {
+                handle,
+                mtu,
+                dev_class,
+            } => {
+                let mut state = self.state.lock();
+                if let SocketState::BluetoothConn {
+                    sco_link,
+                    sco_pending,
+                    ..
+                } = &mut *state
+                {
+                    *sco_pending = None;
+                    *sco_link = Some(BtScoState {
+                        dev,
+                        handle,
+                        peer,
+                        mtu,
+                        dev_class,
+                    });
+                }
+                SocketOpResult::Ok(0)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::Pending
+            | narf_filesystem::bluetooth::BtScoConnectResult::Busy => {
+                SocketOpResult::Err(SockError::InProgress)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::NoPump
+            | narf_filesystem::bluetooth::BtScoConnectResult::Transport => {
+                self.bt_sco_clear_pending();
+                SocketOpResult::Err(SockError::NoDevice)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::UnknownPeer => {
+                self.bt_sco_clear_pending();
+                SocketOpResult::Err(SockError::HostUnreach)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::AlreadyConnected => {
+                self.bt_sco_clear_pending();
+                SocketOpResult::Err(SockError::BadFdState)
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::Refused(status) => {
+                self.bt_sco_clear_pending();
+                SocketOpResult::Err(bt_sco_refused_errno(status))
+            }
+            narf_filesystem::bluetooth::BtScoConnectResult::Aborted => {
+                self.bt_sco_clear_pending();
+                SocketOpResult::Err(SockError::ConnectionRefused)
+            }
+        }
+    }
+
+    /// Clear the in-flight SCO setup marker (terminal outcome).
+    fn bt_sco_clear_pending(&self) {
+        let mut state = self.state.lock();
+        if let SocketState::BluetoothConn { sco_pending, .. } = &mut *state {
+            *sco_pending = None;
+        }
+    }
+
+    /// Whether this SCO socket has an outbound setup in flight —
+    /// the `sys_socket_connect` park condition.
+    pub(crate) fn bt_sco_connect_pending(&self) -> bool {
+        matches!(
+            &*self.state.lock(),
+            SocketState::BluetoothConn {
+                sco_pending: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Poll an in-flight SCO setup once, without parking — the
+    /// non-park branch of `sys_socket_connect` re-execution.
+    pub(crate) fn bt_sco_connect_progress(self: &Arc<Self>) -> SocketOpResult {
+        let pending = match &*self.state.lock() {
+            SocketState::BluetoothConn {
+                sco_pending: Some(p),
+                ..
+            } => *p,
+            _ => return SocketOpResult::Err(SockError::InvalidArg),
+        };
+        self.bt_sco_poll_pending(pending.0, pending.1)
+    }
+
+    /// Send one SCO frame (issue #814). MSG_OOB → EOPNOTSUPP;
+    /// oversize → EINVAL (the link MTU, not EMSGSIZE — Linux
+    /// `sco_send_frame`); no isoch transport → EOPNOTSUPP; pump
+    /// busy → EAGAIN; no link / no pump → ENOTCONN.
+    fn bt_send_sco(
+        self: &Arc<Self>,
+        buf: &[u8],
+        addr: Option<SockAddr>,
+        flags: u32,
+    ) -> SocketOpResult {
+        if flags & MSG_OOB != 0 {
+            return SocketOpResult::Err(SockError::NotSupported);
+        }
+        if addr.is_some() {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let link = {
+            let state = self.state.lock();
+            let SocketState::BluetoothConn { sco_link, .. } = &*state else {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            };
+            let Some(link) = *sco_link else {
+                return SocketOpResult::Err(SockError::NotConnected);
+            };
+            link
+        };
+        match narf_filesystem::bluetooth::bt_send_sco(link.dev, link.handle, buf) {
+            Ok(n) => SocketOpResult::Ok(n as u64),
+            Err(narf_filesystem::bluetooth::BtSendError::TooBig) => {
+                SocketOpResult::Err(SockError::InvalidArg)
+            }
+            Err(narf_filesystem::bluetooth::BtSendError::Unsupported) => {
+                SocketOpResult::Err(SockError::NotSupported)
+            }
+            Err(narf_filesystem::bluetooth::BtSendError::Busy)
+            | Err(narf_filesystem::bluetooth::BtSendError::NoCredits) => {
+                SocketOpResult::Err(SockError::WouldBlock)
+            }
+            Err(narf_filesystem::bluetooth::BtSendError::NoPump)
+            | Err(narf_filesystem::bluetooth::BtSendError::NoChannel) => {
+                SocketOpResult::Err(SockError::NotConnected)
+            }
+            Err(narf_filesystem::bluetooth::BtSendError::WrongService) => {
+                SocketOpResult::Err(SockError::InvalidArg)
+            }
+        }
+    }
+
+    /// Recv one SCO frame (issue #814). SEQPACKET: one frame per
+    /// recv; a short buffer truncates with ReceivedTruncated.
+    /// MSG_PEEK does not consume. Empty → EAGAIN; no link →
+    /// ENOTCONN. The peer is the connected peer (Linux reports no
+    /// peer on SCO recv — NARF divergence, documented).
+    fn bt_recv_sco(self: &Arc<Self>, buf: &mut [u8], flags: u32) -> SocketOpResult {
+        let mut state = self.state.lock();
+        let SocketState::BluetoothConn { sco_link, rx, .. } = &mut *state else {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        };
+        let Some(link) = *sco_link else {
+            return SocketOpResult::Err(SockError::NotConnected);
+        };
+        // Drain first (the drain does no transport I/O, so holding
+        // the state lock across it mirrors `bt_recv`).
+        let Some(frames) = narf_filesystem::bluetooth::bt_drain_sco(link.dev, link.handle) else {
+            // The pump dropped the link (its ACL died) without the
+            // socket knowing — the socket-side link is stale.
+            *sco_link = None;
+            return SocketOpResult::Err(SockError::NotConnected);
+        };
+        rx.extend(frames);
+        let Some(frame) = rx.front().cloned() else {
+            return SocketOpResult::Err(SockError::WouldBlock);
+        };
+        let take = buf.len().min(frame.len());
+        buf[..take].copy_from_slice(&frame[..take]);
+        if flags & MSG_PEEK == 0 {
+            rx.pop_front();
+        }
+        let peer = Some(SockAddr {
+            family: AF_BLUETOOTH,
+            body: link.peer.to_vec(),
+        });
+        if take < frame.len() {
+            SocketOpResult::ReceivedTruncated {
+                copied: take,
+                full_len: frame.len(),
+                peer,
+            }
+        } else {
+            SocketOpResult::Received { n: take, peer }
+        }
+    }
+
+    /// `getpeername` on a connected SCO socket (issue #814). No
+    /// link → ENOTCONN.
+    fn bt_sco_getpeername(self: &Arc<Self>) -> SocketOpResult {
+        let state = self.state.lock();
+        let SocketState::BluetoothConn { sco_link, .. } = &*state else {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        };
+        let Some(link) = *sco_link else {
+            return SocketOpResult::Err(SockError::NotConnected);
+        };
+        SocketOpResult::Addr(SockAddr {
+            family: AF_BLUETOOTH,
+            body: link.peer.to_vec(),
+        })
     }
 
     /// Channel-event wake sink (issue #814). The pump publishes
@@ -10781,12 +11235,14 @@ impl Drop for SocketFile {
         if let SocketState::Packet { sock } = &*self.state.lock() {
             sock.release();
         }
-        // L2CAP/RFCOMM: dropping a listener unregisters its PSM /
-        // server channel and dropping an accepted socket disconnects
-        // its channel (issue #814). Idempotent — a socket that was
-        // already shut down has nothing left to release.
+        // L2CAP/RFCOMM/SCO: dropping a listener unregisters its PSM /
+        // server channel and dropping a connected socket disconnects
+        // its channel or SCO link (issue #814). Idempotent — a socket
+        // that was already shut down has nothing left to release.
         if self.domain == AF_BLUETOOTH
-            && (self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM)
+            && (self.protocol == BTPROTO_L2CAP
+                || self.protocol == BTPROTO_RFCOMM
+                || self.protocol == BTPROTO_SCO)
         {
             self.bt_teardown();
         }
