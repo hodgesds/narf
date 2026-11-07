@@ -341,11 +341,7 @@ impl BeAssembler {
             if rxd.pkt_len == 0 {
                 return Err(Error::Descriptor);
             }
-            let dw0 = u32::from_le_bytes(
-                bytes[4..8]
-                    .try_into()
-                    .map_err(|_| Error::Extent)?,
-            );
+            let dw0 = u32::from_le_bytes(bytes[4..8].try_into().map_err(|_| Error::Extent)?);
             let rxd_len = if dw0 & RXD_D0_LONG != 0 {
                 RXD_LEN_LONG
             } else {
@@ -493,7 +489,7 @@ pub(super) struct RxqOutcome {
 
 /// One `complete()` run: everything the NAPI-order drain
 /// produced, in drain order.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Outcome {
     pub(super) tx: Vec<TxReceipt>,
     pub(super) frames: Vec<(WifiMeta, Vec<u8>)>,
@@ -529,8 +525,7 @@ fn drain_rpq_buffer(
     }
     let bytes = &bytes[..info.size];
     let rxd = decode_rxd_be(bytes.get(4..).ok_or(Error::Extent)?).ok_or(Error::Descriptor)?;
-    let dw0 =
-        u32::from_le_bytes(bytes[4..8].try_into().map_err(|_| Error::Extent)?);
+    let dw0 = u32::from_le_bytes(bytes[4..8].try_into().map_err(|_| Error::Extent)?);
     let rxd_len = if dw0 & RXD_D0_LONG != 0 {
         RXD_LEN_LONG
     } else {
@@ -618,7 +613,7 @@ impl Worker {
             // Eq-is-full: the next slot to consume is past the
             // host WP (`rtw89_pci_get_rx_skb_idx`).
             let slot = ((self.rpq_wp + 1) % self.rpq_len) as usize;
-            let buffer: &mut [u8] = &mut buffers[slot];
+            let buffer: &mut [u8] = buffers[slot];
             barrier();
             match drain_rpq_buffer(buffer, data) {
                 Ok((completions, dropped)) => {
@@ -665,7 +660,7 @@ impl Worker {
         let mut outcome = RxqOutcome::default();
         for _ in 0..count {
             let slot = ((self.rx_wp + 1) % self.rx_len) as usize;
-            let buffer: &mut [u8] = &mut buffers[slot];
+            let buffer: &mut [u8] = buffers[slot];
             barrier();
             match self.assembler.segment(buffer) {
                 Ok(Some(event)) => match event {

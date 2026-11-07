@@ -883,18 +883,16 @@ impl Rtw89Device {
             // buffer; `as_mut_ptr` + length covers exactly its
             // bytes, and the slice is dropped below before any
             // other access to the buffer.
-            let slice = unsafe {
-                core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.as_slice().len())
-            };
+            let slice =
+                unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.as_slice().len()) };
             rxq.push(slice);
         }
         let mut rpq: Vec<&mut [u8]> = Vec::new();
         for buf in &self.rx_buffers[RXCH_RPQ as usize] {
             buf.sync(0, buf.as_slice().len());
             // SAFETY: same probe-allocation contract as above.
-            let slice = unsafe {
-                core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.as_slice().len())
-            };
+            let slice =
+                unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.as_slice().len()) };
             rpq.push(slice);
         }
         let outcome = owner.complete(regs, events, &mut rxq, &mut rpq, budget)?;

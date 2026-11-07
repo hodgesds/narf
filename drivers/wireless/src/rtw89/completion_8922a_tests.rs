@@ -7,12 +7,15 @@
 //! standing in for the probe-allocated DMA buffers.
 
 use super::chip_8922a;
+use super::completion_8922a::Error as CompletionError;
 use super::completion_8922a::*;
 use super::dma::{TxBd, TXBD_OPT_LS, TXCH_NUM};
 use super::dma_be::Regs;
 use super::efuse_be::BeFactory;
 use super::irq::Events;
+use super::prepared_8922a::Error as PreparedError;
 use super::prepared_8922a::*;
+use super::rx_packet::C2h;
 use super::station_8922a::{Band, Request};
 use super::tx_8922a::{PrepareArgs, BUFFER_DMA_MASK, DATA_RING_DEPTH, FRAME_DMA_MASK};
 use super::txrx_be::{encode_txwd_be, TxwdBeInfo};
@@ -42,8 +45,7 @@ impl Model {
     }
 
     fn set_idx(&mut self, addr: u32, rp: u16, wp: u16) {
-        self.regs32
-            .insert(addr, ((rp as u32) << 16) | wp as u32);
+        self.regs32.insert(addr, ((rp as u32) << 16) | wp as u32);
     }
 }
 
@@ -149,7 +151,20 @@ fn segment(fs: bool, ls: bool, content: &[u8]) -> Vec<u8> {
 /// One RPQ buffer: [RXBD-info][short RXD][records...]. The RPQ
 /// RXD type is not dispatched on in Linux, so it stays 0.
 fn rpq_buffer(records: &[[u8; 4]]) -> Vec<u8> {
-    let mut content = rxd(0, (records.len() * 4) as u16, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
+    let mut content = rxd(
+        0,
+        (records.len() * 4) as u16,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        false,
+    );
     for record in records {
         content.extend_from_slice(record);
     }
@@ -160,7 +175,10 @@ fn rpq_buffer(records: &[[u8; 4]]) -> Vec<u8> {
 /// POLLUTED bit 31 clear, SEQ bits 30:16, TX_STATUS bits 15:13,
 /// QSEL bits 12:8, MACID bits 7:0.
 fn record(seq: u16, status: u8, qsel: u8, mac: u8) -> [u8; 4] {
-    (((seq as u32 & 0x7fff) << 16) | ((status as u32 & 0x7) << 13) | ((qsel as u32) << 8) | mac as u32)
+    (((seq as u32 & 0x7fff) << 16)
+        | ((status as u32 & 0x7) << 13)
+        | ((qsel as u32) << 8)
+        | mac as u32)
         .to_le_bytes()
 }
 
@@ -227,7 +245,7 @@ kernel_test_in!(
 );
 
 fn smoke_rtw89_completion_8922a_routes() -> TestResult {
-    let mut c2h = |category: u8, class: u8, function: u8| C2h {
+    let c2h = |category: u8, class: u8, function: u8| C2h {
         category,
         class,
         function,
@@ -236,11 +254,31 @@ fn smoke_rtw89_completion_8922a_routes() -> TestResult {
     if route_c2h(&c2h(0, 0, 0)) != Route::Test
         || route_c2h(&c2h(1, 0, 0)) != (Route::Mac { class: 0, func: 0 })
         || route_c2h(&c2h(1, 0, 1)) != (Route::Mac { class: 0, func: 1 })
-        || route_c2h(&c2h(1, 0x18, 2)) != (Route::Mac { class: 0x18, func: 2 })
-        || route_c2h(&c2h(2, 0x10, 0)) != (Route::OutsrcBtc { class: 0x10, func: 0 })
-        || route_c2h(&c2h(2, 0x17, 3)) != (Route::OutsrcBtc { class: 0x17, func: 3 })
-        || route_c2h(&c2h(2, 0x18, 0)) != (Route::OutsrcPhy { class: 0x18, func: 0 })
-        || route_c2h(&c2h(2, 0x00, 0)) != (Route::OutsrcPhy { class: 0x00, func: 0 })
+        || route_c2h(&c2h(1, 0x18, 2))
+            != (Route::Mac {
+                class: 0x18,
+                func: 2,
+            })
+        || route_c2h(&c2h(2, 0x10, 0))
+            != (Route::OutsrcBtc {
+                class: 0x10,
+                func: 0,
+            })
+        || route_c2h(&c2h(2, 0x17, 3))
+            != (Route::OutsrcBtc {
+                class: 0x17,
+                func: 3,
+            })
+        || route_c2h(&c2h(2, 0x18, 0))
+            != (Route::OutsrcPhy {
+                class: 0x18,
+                func: 0,
+            })
+        || route_c2h(&c2h(2, 0x00, 0))
+            != (Route::OutsrcPhy {
+                class: 0x00,
+                func: 0,
+            })
         || route_c2h(&c2h(3, 0, 0)) != (Route::UnknownCategory { category: 3 })
         || route_c2h(&c2h(255, 0, 0)) != (Route::UnknownCategory { category: 255 })
     {
@@ -273,8 +311,8 @@ fn submit_frame(owner: &mut Prepared8922a, regs: &mut Model) -> Result<u16, &'st
     }
     let header_buf = alloc_coherent_masked(MAX_HEADER_BYTES, DomainId::DRIVER_0, BUFFER_DMA_MASK)
         .map_err(|_| "header alloc failed")?;
-    let frame_buf =
-        alloc_coherent_masked(100, DomainId::DRIVER_0, FRAME_DMA_MASK).map_err(|_| "frame alloc failed")?;
+    let frame_buf = alloc_coherent_masked(100, DomainId::DRIVER_0, FRAME_DMA_MASK)
+        .map_err(|_| "frame alloc failed")?;
     let header_dma = header_buf.dma_addr().raw();
     let frame_dma = frame_buf.dma_addr().raw();
     let mut bd = vec![TxBd::default(); DATA_RING_DEPTH as usize];
@@ -318,7 +356,16 @@ fn smoke_rtw89_completion_8922a_rpq_end_to_end() -> TestResult {
     let mut rxq = empty_buffers(256);
     regs.set_idx(0xB164, 1, 255);
     regs.set_idx(0xB100, 1, 1);
-    let header_dma = match owner.complete(&mut regs, Events { rpq: true, ..Default::default() }, &mut refs(&mut rxq), &mut refs(&mut rpq), 64) {
+    let header_dma = match owner.complete(
+        &mut regs,
+        Events {
+            rpq: true,
+            ..Default::default()
+        },
+        &mut refs(&mut rxq),
+        &mut refs(&mut rpq),
+        64,
+    ) {
         Ok(outcome) => {
             if outcome.tx.len() != 1
                 || outcome.tx[0].status != 1
@@ -373,7 +420,10 @@ fn smoke_rtw89_completion_8922a_rxq_wifi() -> TestResult {
     regs.set_idx(0xB160, 2, 255);
     let outcome = match owner.complete(
         &mut regs,
-        Events { rx: true, ..Default::default() },
+        Events {
+            rx: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         64,
@@ -435,7 +485,10 @@ fn smoke_rtw89_completion_8922a_rxq_c2h() -> TestResult {
     regs.set_idx(0xB160, 2, 255);
     let outcome = match owner.complete(
         &mut regs,
-        Events { rx: true, ..Default::default() },
+        Events {
+            rx: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         64,
@@ -475,21 +528,29 @@ fn smoke_rtw89_completion_8922a_halt() -> TestResult {
     let writes_before = regs.regs16.len();
     if owner.complete(
         &mut regs,
-        Events { halt_c2h: true, rx: true, rpq: true, ..Default::default() },
+        Events {
+            halt_c2h: true,
+            rx: true,
+            rpq: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         64,
-    ) != Err(Error::Completion(Error::Halted))
+    ) != Err(PreparedError::Completion(CompletionError::Halted))
     {
         return TestResult::Fail("halt_c2h must fail with Halted");
     }
     if owner.complete(
         &mut regs,
-        Events { watchdog: true, ..Default::default() },
+        Events {
+            watchdog: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         64,
-    ) != Err(Error::Completion(Error::Halted))
+    ) != Err(PreparedError::Completion(CompletionError::Halted))
     {
         return TestResult::Fail("watchdog must fail with Halted");
     }
@@ -499,10 +560,7 @@ fn smoke_rtw89_completion_8922a_halt() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/wireless/rtw89",
-    smoke_rtw89_completion_8922a_halt
-);
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_completion_8922a_halt);
 
 fn smoke_rtw89_completion_8922a_refusals() -> TestResult {
     let mut owner = match Prepared8922a::new(factory(), 0) {
@@ -515,11 +573,14 @@ fn smoke_rtw89_completion_8922a_refusals() -> TestResult {
     // Rings not programmed yet.
     if owner.complete(
         &mut regs,
-        Events { rx: true, ..Default::default() },
+        Events {
+            rx: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         64,
-    ) != Err(Error::NotProgrammed)
+    ) != Err(PreparedError::NotProgrammed)
     {
         return TestResult::Fail("complete before program_rings must be NotProgrammed");
     }
@@ -529,18 +590,24 @@ fn smoke_rtw89_completion_8922a_refusals() -> TestResult {
     };
     if owner.complete(
         &mut regs,
-        Events { rx: true, ..Default::default() },
+        Events {
+            rx: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         0,
-    ) != Err(Error::Completion(Error::Budget))
+    ) != Err(PreparedError::Completion(CompletionError::Budget))
         || owner.complete(
             &mut regs,
-            Events { rx: true, ..Default::default() },
+            Events {
+                rx: true,
+                ..Default::default()
+            },
             &mut refs(&mut rxq),
             &mut refs(&mut rpq),
             257,
-        ) != Err(Error::Completion(Error::Budget))
+        ) != Err(PreparedError::Completion(CompletionError::Budget))
     {
         return TestResult::Fail("budget 0 / 257 must be refused");
     }
@@ -548,7 +615,11 @@ fn smoke_rtw89_completion_8922a_refusals() -> TestResult {
     // empty drain still rearms.
     match owner.complete(
         &mut regs,
-        Events { rx_unavailable: true, rx: true, ..Default::default() },
+        Events {
+            rx_unavailable: true,
+            rx: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         64,
@@ -589,7 +660,10 @@ fn smoke_rtw89_completion_8922a_rxq_drops_and_continues() -> TestResult {
     regs.set_idx(0xB160, 3, 255);
     let outcome = match owner.complete(
         &mut regs,
-        Events { rx: true, ..Default::default() },
+        Events {
+            rx: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         64,
@@ -632,7 +706,10 @@ fn smoke_rtw89_completion_8922a_rxq_multisegment() -> TestResult {
     regs.set_idx(0xB160, 2, 255);
     let outcome = match owner.complete(
         &mut regs,
-        Events { rx: true, ..Default::default() },
+        Events {
+            rx: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         64,
@@ -670,7 +747,10 @@ fn smoke_rtw89_completion_8922a_rxq_ppdu() -> TestResult {
     regs.set_idx(0xB160, 1, 255);
     let outcome = match owner.complete(
         &mut regs,
-        Events { rx: true, ..Default::default() },
+        Events {
+            rx: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         64,
@@ -714,7 +794,10 @@ fn smoke_rtw89_completion_8922a_rpq_stale_record() -> TestResult {
     regs.set_idx(0xB100, 1, 1);
     let outcome = match owner.complete(
         &mut regs,
-        Events { rpq: true, ..Default::default() },
+        Events {
+            rpq: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         64,
@@ -758,7 +841,10 @@ fn smoke_rtw89_completion_8922a_budget_and_wrap() -> TestResult {
     // frame is still queued.
     let outcome = match owner.complete(
         &mut regs,
-        Events { rx: true, ..Default::default() },
+        Events {
+            rx: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         2,
@@ -777,7 +863,10 @@ fn smoke_rtw89_completion_8922a_budget_and_wrap() -> TestResult {
     // would be slot 3, then 0).
     let outcome = match owner.complete(
         &mut regs,
-        Events { rx: true, ..Default::default() },
+        Events {
+            rx: true,
+            ..Default::default()
+        },
         &mut refs(&mut rxq),
         &mut refs(&mut rpq),
         2,

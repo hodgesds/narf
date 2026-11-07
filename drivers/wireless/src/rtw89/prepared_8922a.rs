@@ -212,7 +212,7 @@ pub(super) struct Prepared8922a {
     h2c_retained: Vec<DmaBuffer>,
     /// C2H completion worker state (RPQ/RXQ host write pointers
     /// + RXQ assembly). Rebuilt by `program_rings` at the
-    /// programmed depths, reset by `stop_dma`.
+    ///   programmed depths, reset by `stop_dma`.
     completion: completion_8922a::Worker,
 }
 
@@ -363,8 +363,10 @@ impl Prepared8922a {
         if budget == 0 || budget > 256 {
             return Err(Error::Completion(completion_8922a::Error::Budget));
         }
-        let mut outcome = completion_8922a::Outcome::default();
-        outcome.rx_unavailable = events.rx_unavailable;
+        let mut outcome = completion_8922a::Outcome {
+            rx_unavailable: events.rx_unavailable,
+            ..Default::default()
+        };
         let mut remaining = budget;
         if events.rpq {
             let rpq_out = self
@@ -385,8 +387,7 @@ impl Prepared8922a {
             outcome.work_done += rpq_out.work;
         }
         if events.rx {
-            let admitted: Vec<u8> =
-                self.stations.iter().map(|station| station.macid).collect();
+            let admitted: Vec<u8> = self.stations.iter().map(|station| station.macid).collect();
             let rxq_out = self
                 .completion
                 .drain_rxq(regs, rxq, remaining, &admitted)
@@ -456,8 +457,7 @@ impl Prepared8922a {
         tx_len: u16,
         rx_len: u16,
     ) -> Result<(), Error> {
-        let worker =
-            completion_8922a::Worker::new(rx_len, rx_len).map_err(Error::Completion)?;
+        let worker = completion_8922a::Worker::new(rx_len, rx_len).map_err(Error::Completion)?;
         dma_8922a::reset_trx_rings(regs, tx_phys, rx_phys, tx_len, rx_len)?;
         self.completion = worker;
         self.rings_programmed = true;
