@@ -454,27 +454,21 @@ impl AcHeader2 {
     }
 }
 
-/// UAC2 INPUT_TERMINAL descriptor (§4.7.2.4). The fields this
-/// driver consumes (id, type, association, source, channel count)
-/// sit at the same leading offsets the v2 layout shares with the
-/// walker's expectations; trailing clock-control fields are
-/// informational here.
-///
-/// NOTE (spec deviation, not fixed here): Table 4-9 lays the
-/// descriptor out as `bCSourceID` at offset 7 and `bNrChannels`
-/// at offset 8 (17 bytes total), while this parser reads
-/// `nr_channels` at offset 7 — i.e. it reads the clock-source
-/// ID as the channel count — and the #777 fixture encodes its
-/// IT the same way. The clock model therefore resolves a
-/// stream's clock from the clock source's `assoc_terminal`,
-/// not from the terminal's `bCSourceID`. Fixing the parse means
-/// re-wiring clock resolution onto `bCSourceID` and re-basing
-/// the #777 fixture; that is a separate lane (#1520), not this one.
+/// UAC2 INPUT_TERMINAL descriptor (§4.7.2.4, Table 4-9, 17 bytes):
+/// `bTerminalID` at 3, `wTerminalType` at 4..6, `bAssocTerminal`
+/// at 6, `bCSourceID` at 7, `bNrChannels` at 8, `bmChannelConfig`
+/// at 9..13, `iChannelNames` at 13, `bmControls` at 14..16,
+/// `iTerminal` at 16. `bCSourceID` names the clock entity
+/// (source, selector, or multiplier) driving this terminal — it
+/// is the spec mechanism for terminal→clock association, and
+/// `clock_for_terminal` resolves through it first.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct InputTerminal2 {
     pub terminal_id: u8,
     pub terminal_type: u16,
     pub assoc_terminal: u8,
+    /// `bCSourceID` — ID of the clock entity driving this terminal.
+    pub clock_source_id: u8,
     pub nr_channels: u8,
     pub channel_config: u32,
     /// `bmControls` — copy-protect / connector / overload bits.
@@ -483,7 +477,7 @@ pub struct InputTerminal2 {
 
 impl InputTerminal2 {
     pub fn parse(buf: &[u8]) -> Result<Self, UacError> {
-        if buf.len() < 16 {
+        if buf.len() < 17 {
             return Err(UacError::Short);
         }
         check_class_specific(buf, AC_SUBTYPE_INPUT_TERMINAL)?;
@@ -491,9 +485,10 @@ impl InputTerminal2 {
             terminal_id: buf[3],
             terminal_type: u16::from_le_bytes([buf[4], buf[5]]),
             assoc_terminal: buf[6],
-            nr_channels: buf[7],
-            channel_config: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            controls: u16::from_le_bytes([buf[13], buf[14]]),
+            clock_source_id: buf[7],
+            nr_channels: buf[8],
+            channel_config: u32::from_le_bytes([buf[9], buf[10], buf[11], buf[12]]),
+            controls: u16::from_le_bytes([buf[14], buf[15]]),
         })
     }
 }
@@ -953,6 +948,13 @@ pub struct UacTerminal {
     /// For output terminals: the unit/terminal feeding this one.
     /// Zero for input terminals.
     pub source_id: u8,
+    /// UAC2 input terminals: the clock entity (source, selector,
+    /// or multiplier) named by the descriptor's `bCSourceID`
+    /// (Table 4-9); 0 for V1 terminals and output terminals.
+    /// Deliberately separate from `source_id`: the topology walk
+    /// follows `source_id` as an entity-graph edge, and a clock
+    /// entity ID is not a topology node.
+    pub clock_source_id: u8,
     pub is_input: bool,
     pub nr_channels: u8,
 }
@@ -1379,6 +1381,7 @@ impl UacTopology {
                         id: t.terminal_id,
                         terminal_type: t.terminal_type,
                         source_id: 0,
+                        clock_source_id: 0,
                         is_input: true,
                         nr_channels: t.nr_channels,
                     });
@@ -1390,6 +1393,7 @@ impl UacTopology {
                         id: t.terminal_id,
                         terminal_type: t.terminal_type,
                         source_id: t.source_id,
+                        clock_source_id: 0,
                         is_input: false,
                         nr_channels: 0,
                     });
@@ -1431,6 +1435,7 @@ impl UacTopology {
                         id: t.terminal_id,
                         terminal_type: t.terminal_type,
                         source_id: 0,
+                        clock_source_id: t.clock_source_id,
                         is_input: true,
                         nr_channels: t.nr_channels,
                     });
@@ -1442,6 +1447,7 @@ impl UacTopology {
                         id: t.terminal_id,
                         terminal_type: t.terminal_type,
                         source_id: t.source_id,
+                        clock_source_id: 0,
                         is_input: false,
                         nr_channels: 0,
                     });
@@ -1684,13 +1690,10 @@ impl UacTopology {
     /// order) whose input pins list the source, with the 1-based
     /// pin number that selects it. `None` when no selector lists
     /// the source — the stream is clocked straight from the
-    /// source. This is the same "selector whose pins include the
-    /// resolved source" relation `clock_for_terminal` uses to
-    /// resolve through a selector; it does not by itself prove
-    /// the terminal is clocked through the selector (the
-    /// terminal's `bCSourceID` is not modelled — see the
-    /// `InputTerminal2` note), but a selector listing the
-    /// resolved source is the only in-model signal, and
+    /// source. A selector listing the resolved source is the
+    /// in-model signal that the stream is clocked through it
+    /// (the terminal's `bCSourceID` names the selector in that
+    /// case, and `clock_for_terminal` resolves through it);
     /// switching its pin to the resolved source is a no-op when
     /// the stream was already clocked from it.
     pub fn selector_for_source(&self, source_id: u8) -> Option<(&UacClock, u8)> {
@@ -1708,11 +1711,64 @@ impl UacTopology {
         None
     }
 
+    /// Resolve the clock entity named by `entity_id` to the
+    /// clock source driving it, for the terminal `terminal_id`
+    /// (UAC2): a source resolves directly; a selector resolves
+    /// to the pin whose source is associated with the terminal
+    /// (the sources' `assoc_terminal` fields name their
+    /// terminals); a multiplier follows `derives_from` down to
+    /// its source. `None` when the entity is unknown, a selector
+    /// names no source associated with the terminal, or a
+    /// multiplier chain dead-ends or cycles — the caller then
+    /// falls back to the `assoc_terminal` scan. Cycle-safe: an
+    /// entity is expanded at most once per call.
+    fn resolve_clock_entity(&self, entity_id: u8, terminal_id: u8) -> Option<&UacClock> {
+        let mut seen = Vec::new();
+        let mut id = entity_id;
+        loop {
+            if seen.contains(&id) {
+                return None;
+            }
+            seen.push(id);
+            let c = self.clocks.iter().find(|c| c.id == id)?;
+            match c.kind {
+                UacClockKind::Source => return Some(c),
+                UacClockKind::Selector => {
+                    for pin in &c.pins {
+                        if let Some(src) = self.clocks.iter().find(|s| {
+                            s.id == *pin
+                                && s.kind == UacClockKind::Source
+                                && s.assoc_terminal == terminal_id
+                        }) {
+                            return Some(src);
+                        }
+                    }
+                    return None;
+                }
+                UacClockKind::Multiplier => {
+                    if c.derives_from == 0 {
+                        return None;
+                    }
+                    id = c.derives_from;
+                }
+            }
+        }
+    }
+
     /// Resolve the clock entity that drives the stream linked to
-    /// `terminal_id` (UAC2): a source associated with the
-    /// terminal, else the selector/multiplier chain pointing at
-    /// one, else the device's only clock source.
+    /// `terminal_id` (UAC2): first the terminal's `bCSourceID`
+    /// (Table 4-9 — the spec mechanism for terminal→clock
+    /// association), then a source associated with the terminal,
+    /// else the selector/multiplier chain pointing at one, else
+    /// the device's only clock source.
     pub fn clock_for_terminal(&self, terminal_id: u8) -> Option<&UacClock> {
+        if let Some(t) = self.terminals.iter().find(|t| t.id == terminal_id) {
+            if t.clock_source_id != 0 {
+                if let Some(c) = self.resolve_clock_entity(t.clock_source_id, terminal_id) {
+                    return Some(c);
+                }
+            }
+        }
         if let Some(c) = self
             .clocks
             .iter()
