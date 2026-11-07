@@ -95,6 +95,9 @@
 pub mod hmc;
 mod interrupts;
 pub mod irq;
+/// Per-family MTU policy (issue #802): maxima, frame accounting
+/// and the register program for a requested MTU. Pure — no MMIO.
+pub(crate) mod mtu;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::AtomicBool;
 pub mod offload;
@@ -896,6 +899,13 @@ pub(super) struct Hardware {
     hmc: ManuallyDrop<hmc::LanHmc>,
     /// Each queue pair serializes its own descriptors and DMA ownership.
     queues: ManuallyDrop<alloc::vec::Vec<IrqSafeSpinLock<ring::QueuePair>>>,
+    /// Programmed MTU (payload bytes), issue #802. Probe default
+    /// 1500; changed only by [`Hardware::set_mtu`], which rewrites
+    /// each queue's RX context `rxmax` (disable → rewrite → enable)
+    /// before storing it. Survives recovery: `recover` reuses this
+    /// `Hardware` and its queue pairs, and `configure` re-applies
+    /// the stored per-queue `rx_max_frame`.
+    mtu: IrqSafeSpinLock<u32>,
     rss: rss::RssConfig,
     reset_discarded: u64,
     interrupts: Option<interrupts::Interrupts>,
@@ -1086,6 +1096,7 @@ impl Hardware {
             vsi: vsi::VsiParams::default(),
             hmc: ManuallyDrop::new(hmc),
             queues: ManuallyDrop::new(queues),
+            mtu: IrqSafeSpinLock::new(mtu::STD_MTU),
             rss: rss::RssConfig::default(),
             reset_discarded: 0,
             interrupts: Some(interrupts),
@@ -1215,7 +1226,7 @@ impl Hardware {
         let result = {
             let mut queue = self.queues[index].lock();
             // SAFETY: this PF owns the configured queue and its DMA buffers.
-            unsafe { queue.submit(&self.csr, frame, meta) }
+            unsafe { queue.submit(&self.csr, frame, meta, *self.mtu.lock()) }
         };
         if result == Err(I40eError::InvalidTxHead) {
             self.irq().fail();
@@ -1241,7 +1252,7 @@ impl Hardware {
         let result = {
             let mut queue = self.queues[index].lock();
             // SAFETY: this PF owns the configured queue and its DMA buffers.
-            unsafe { queue.submit_frame(&self.csr, buffer, offset, len, meta) }
+            unsafe { queue.submit_frame(&self.csr, buffer, offset, len, meta, *self.mtu.lock()) }
         };
         if matches!(result, Err((I40eError::InvalidTxHead, _))) {
             self.irq().fail();
@@ -1256,6 +1267,46 @@ impl Hardware {
             narf_net::TxMeta::plain(),
             self.rss.tx_queue(frame, self.queues.len()),
         )
+    }
+
+    /// Change the MTU (issue #802). Validates via the pure policy
+    /// module first (EINVAL 22 outside 68..=9706), no-ops when the
+    /// MTU is unchanged, otherwise rewrites every queue's RX
+    /// context `rxmax` — disable → rewrite → enable per queue,
+    /// mirroring the bring-up configure/enable sequence — and then
+    /// stores the new MTU. The RX/TX pools are fixed at the
+    /// max-frame size, so no reallocation is needed. A queue whose
+    /// enable never reflects is EIO; the stored MTU is untouched
+    /// on any failure, so the next `set_mtu` retries the whole
+    /// program (and the recovery pump owns a wedged device).
+    pub fn set_mtu(&self, mtu: u32) -> Result<(), i32> {
+        let program = mtu::mtu_transition(mtu).map_err(|e| e.0)?;
+        if program.mtu == *self.mtu.lock() {
+            return Ok(());
+        }
+        // SAFETY: `self.csr` is this PF's mapped CSR window and the
+        // HMC backing page is published (same assertion as
+        // bring-up's configure/enable sequence).
+        unsafe {
+            for (index, queue) in self.queues.iter().enumerate() {
+                let mut pair = queue.lock();
+                pair.disable(&self.csr, self.base_queue);
+                if let Err(e) =
+                    pair.reconfigure_rx_frame(&self.hmc, index as u32, program.rx_frame as u16)
+                {
+                    // Best-effort re-enable so the queue is not left
+                    // disabled; the stored MTU is untouched below.
+                    let _ = pair.enable(&self.csr, self.base_queue);
+                    return Err(match e {
+                        I40eError::BadQueueIndex => 22, // EINVAL
+                        _ => 5,                         // EIO
+                    });
+                }
+                pair.enable(&self.csr, self.base_queue).map_err(|_| 5i32)?;
+            }
+        }
+        *self.mtu.lock() = program.mtu;
+        Ok(())
     }
 
     /// Pop one received frame from queue 0, if any.
@@ -1888,7 +1939,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         i40e_send_frame,
         runtime::link_sample(nic.link_status()),
     );
-    nic.set_ifname(eth_name);
+    nic.set_ifname(eth_name.clone());
+    // MTU hook (issue #802): installed once the netdev name exists.
+    narf_net::iface::set_device_control(&eth_name, Arc::new(I40eMtuControl { nic: nic.clone() }));
 
     // Every PF is published under its own name. The X710 presents one
     // PF per port and the MS-03 has two, so this is the difference
@@ -1928,6 +1981,23 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     runtime::spawn_pumps(nic, rx_prod, tx_cons);
     Ok(())
+}
+
+// ── MTU control hook ────────────────────────────────────────────────
+
+/// `DeviceControl` adapter for the stack's MTU switch (issue #802):
+/// the hook only acts on MTU — MAC, promiscuous and multicast pass
+/// through untouched. Installed by `probe` after the netdev is
+/// published.
+#[derive(Debug)]
+pub struct I40eMtuControl {
+    nic: Arc<I40eNic>,
+}
+
+impl narf_net::iface::DeviceControl for I40eMtuControl {
+    fn configure(&self, config: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+        self.nic.set_mtu(config.mtu)
+    }
 }
 
 /// One probed PF, as the net stack sees it.
@@ -1973,7 +2043,7 @@ impl narf_net::Interface for I40eNicIface {
         self.nic.mac
     }
     fn mtu(&self) -> u32 {
-        1500
+        self.nic.mtu()
     }
     fn link_up(&self) -> bool {
         self.nic.link_up()
@@ -2002,7 +2072,7 @@ impl crate::HwNic for I40eNicIface {
         self.nic.mac
     }
     fn mtu(&self) -> u32 {
-        1500
+        self.nic.mtu()
     }
     fn link_up(&self) -> bool {
         self.nic.link_up()

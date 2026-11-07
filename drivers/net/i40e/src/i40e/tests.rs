@@ -577,8 +577,8 @@ fn smoke_i40e_rx_context_units() -> TestResult {
     if get("base") != Some(ring_phys / 128) {
         return TestResult::Fail("RX context base is not the address / 128");
     }
-    // dbuff counts 128-byte units too: a 2 KiB buffer is 16.
-    if get("dbuff") != Some(16) {
+    // dbuff counts 128-byte units too: a 9728-byte buffer is 76.
+    if get("dbuff") != Some(76) {
         return TestResult::Fail("dbuff must be the buffer size / 128");
     }
     if get("qlen") != Some(64) {
@@ -605,6 +605,26 @@ fn smoke_i40e_rx_context_units() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/i40e", smoke_i40e_rx_context_units);
+
+fn smoke_i40e_rx_context_jumbo_frame() -> TestResult {
+    use super::hmc::{ctx_field, read_ctx_field, RXQ_CTX_FIELDS};
+    use super::ring::{pack_rx_context, RxQueueContext};
+    // The max-MTU context: 9728-byte buffers (dbuff 76) with rxmax
+    // 9728 (9706 + 22). The 1500-default fixture above pins the
+    // same fields at 1522; this one pins the jumbo program.
+    let ctx = pack_rx_context(RxQueueContext {
+        ring_phys: 0x0000_0002_4680_0000u64,
+        qlen: 64,
+        buf_bytes: 9728,
+        max_frame: 9728,
+    });
+    let get = |name: &str| ctx_field(RXQ_CTX_FIELDS, name).map(|f| read_ctx_field(&ctx, f));
+    if get("dbuff") != Some(76) || get("rxmax") != Some(9728) {
+        return TestResult::Fail("jumbo RX context dbuff/rxmax wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_rx_context_jumbo_frame);
 
 // ── Descriptors ──────────────────────────────────────────────────────
 
@@ -1511,7 +1531,7 @@ fn smoke_i40e_offload_preparation() -> TestResult {
     for ipv6 in [false, true] {
         let mut packet = tcp_packet(ipv6, 200);
         let original = packet.clone();
-        let plan = TxPlan::parse(&packet, TxMeta::with_csum(L4CsumKind::Tcp)).unwrap();
+        let plan = TxPlan::parse(&packet, TxMeta::with_csum(L4CsumKind::Tcp), 1500).unwrap();
         plan.prepare(&mut packet);
         let transport = if ipv6 { 54 } else { 34 };
         // Independent pseudoheader sum for the fixed source/destination above.
@@ -1531,7 +1551,7 @@ fn smoke_i40e_offload_preparation() -> TestResult {
             return TestResult::Fail("checksum request did not prepare wire pseudoheader seed");
         }
         let mut tso = tcp_packet(ipv6, 9000);
-        let plan = TxPlan::parse(&tso, TxMeta::with_tso(1440)).unwrap();
+        let plan = TxPlan::parse(&tso, TxMeta::with_tso(1440), 1500).unwrap();
         plan.prepare(&mut tso);
         let length = if ipv6 { 18 } else { 16 };
         let (_, context) = plan.context.unwrap();
@@ -1562,7 +1582,7 @@ fn smoke_i40e_offload_rejects_malformed_packets() -> TestResult {
     use narf_net::{L4CsumKind, TxMeta};
     let packet = tcp_packet(false, 200);
     for len in 0..packet.len() {
-        if TxPlan::parse(&packet[..len], TxMeta::with_tso(100)).is_ok() {
+        if TxPlan::parse(&packet[..len], TxMeta::with_tso(100), 1500).is_ok() {
             return TestResult::Fail("truncated offload packet accepted");
         }
     }
@@ -1576,25 +1596,26 @@ fn smoke_i40e_offload_rejects_malformed_packets() -> TestResult {
     ] {
         let mut bad = packet.clone();
         bad[offset] = value;
-        if TxPlan::parse(&bad, TxMeta::with_tso(100)).is_ok() {
+        if TxPlan::parse(&bad, TxMeta::with_tso(100), 1500).is_ok() {
             return TestResult::Fail("malformed/fragmented/unsupported offload accepted");
         }
     }
     for mss in [0, 1, 63, 1461, 65535] {
-        if TxPlan::parse(&packet, TxMeta::with_tso(mss)).is_ok() {
+        if TxPlan::parse(&packet, TxMeta::with_tso(mss), 1500).is_ok() {
             return TestResult::Fail("out-of-profile MSS accepted");
         }
     }
     let mut v6 = tcp_packet(true, 200);
     v6[20] = 44;
-    if TxPlan::parse(&v6, TxMeta::with_tso(100)).is_ok()
-        || TxPlan::parse(&packet, TxMeta::with_csum(L4CsumKind::Udp)).is_ok()
+    if TxPlan::parse(&v6, TxMeta::with_tso(100), 1500).is_ok()
+        || TxPlan::parse(&packet, TxMeta::with_csum(L4CsumKind::Udp), 1500).is_ok()
         || TxPlan::parse(
             &packet,
             TxMeta {
                 vlan_tag: Some(1),
                 ..TxMeta::plain()
             },
+            1500,
         )
         .is_ok()
     {
@@ -1606,6 +1627,31 @@ kernel_test_in!(
     "drivers/net/i40e",
     smoke_i40e_offload_rejects_malformed_packets
 );
+
+fn smoke_i40e_offload_tso_mss_follows_mtu() -> TestResult {
+    use super::offload::TxPlan;
+    use narf_net::TxMeta;
+    let packet = tcp_packet(false, 200);
+    // At the 1500 default the old bound is unchanged: MSS 1460 is
+    // the largest that fits (20 + 20 + 1460 = 1500), 1461 is not.
+    if TxPlan::parse(&packet, TxMeta::with_tso(1460), 1500).is_err()
+        || TxPlan::parse(&packet, TxMeta::with_tso(1461), 1500).is_ok()
+    {
+        return TestResult::Fail("i40e TSO MSS bound drifted at MTU 1500");
+    }
+    // At a jumbo MTU the bound moves with it: MSS 8960 fits 9000
+    // (20 + 20 + 8960 = 9000) and 8961 does not; the same MSS is
+    // rejected at 1500, which is the pre-#802 failure this lane
+    // fixes (the stack offers ~8960 and TX used to fail it).
+    if TxPlan::parse(&packet, TxMeta::with_tso(8960), 9000).is_err()
+        || TxPlan::parse(&packet, TxMeta::with_tso(8961), 9000).is_ok()
+        || TxPlan::parse(&packet, TxMeta::with_tso(8960), 1500).is_ok()
+    {
+        return TestResult::Fail("i40e TSO MSS bound does not follow the MTU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_offload_tso_mss_follows_mtu);
 
 fn smoke_i40e_rx_metadata_is_conservative() -> TestResult {
     use super::offload::rx_metadata;
@@ -1646,7 +1692,7 @@ fn smoke_i40e_udp_and_vlan_offload() -> TestResult {
         let mut tagged = alloc::vec::Vec::from(&packet[..12]);
         tagged.extend_from_slice(&[0x81, 0, 0, 42]);
         tagged.extend_from_slice(&packet[12..]);
-        let plan = TxPlan::parse(&tagged, TxMeta::with_csum(L4CsumKind::Udp)).unwrap();
+        let plan = TxPlan::parse(&tagged, TxMeta::with_csum(L4CsumKind::Udp), 1500).unwrap();
         plan.prepare(&mut tagged);
         if plan.offset & 0x7f != 9
             || (plan.command & 0x300) != 0x300
@@ -1655,7 +1701,7 @@ fn smoke_i40e_udp_and_vlan_offload() -> TestResult {
             return TestResult::Fail("UDP VLAN header offsets or in-band tag changed");
         }
         tagged[transport + 4 + 4] = 0xff;
-        if TxPlan::parse(&tagged, TxMeta::with_csum(L4CsumKind::Udp)).is_ok() {
+        if TxPlan::parse(&tagged, TxMeta::with_csum(L4CsumKind::Udp), 1500).is_ok() {
             return TestResult::Fail("UDP length mismatch accepted");
         }
     }

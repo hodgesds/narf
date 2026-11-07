@@ -109,6 +109,21 @@ impl I40eNic {
     pub fn link_up(&self) -> bool {
         self.link_status().link_up
     }
+    /// Programmed MTU (issue #802): the hardware's, when leased,
+    /// else the 1500 default (no hardware generation is published
+    /// yet, or recovery is mid-rebuild).
+    pub fn mtu(&self) -> u32 {
+        self.lease()
+            .map(|(hw, _)| *hw.mtu.lock())
+            .unwrap_or(super::mtu::STD_MTU)
+    }
+    /// Change the MTU (issue #802). Fails while no hardware
+    /// generation is leased (recovery mid-rebuild); the caller
+    /// retries once the PF is back.
+    pub fn set_mtu(&self, mtu: u32) -> Result<(), i32> {
+        let (hw, _) = self.lease().ok_or(5i32)?; // EIO
+        hw.set_mtu(mtu)
+    }
     /// Submit using a stable Toeplitz flow hash. Recovery returns DeviceFailed
     /// until every queue and interrupt route has been restored.
     pub fn transmit_with_meta(
