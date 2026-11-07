@@ -229,18 +229,25 @@ pub fn parse_done_status(buf: &[u8]) -> Result<u32, MbimError> {
 
 // ─── Service UUIDs ───────────────────────────────────────────────────────────
 //
-// MBIM identifies services by 128-bit UUIDs carried in GUID wire order:
-// the first three fields are little-endian, the last eight bytes are raw
-// (the standard GUID encoding, MBIM 1.0 §10.1).
+// MBIM identifies services by 128-bit UUIDs carried as 16 bytes in the
+// order they appear in the UUID's canonical string form — NOT the
+// Windows GUID encoding (which little-endian-swaps the first three
+// fields). libmbim emits the bytes in string order, as does real
+// modem traffic: verified in-session against libmbim 1.31.2
+// (`MBIM_UUID_BASIC_CONNECT` plus a built DEVICE_CAPS query message,
+// issue #1710). Do NOT copy the Windows GUID byte order for new
+// service UUIDs.
 
 /// A 16-byte MBIM service UUID in wire order.
 pub type MbimUuid = [u8; 16];
 
-/// UUID_BASIC_CONNECT — a289cc33-bcbb-4518-bbdb-34ec7edfb873.
+/// UUID_BASIC_CONNECT — a289cc33-bcbb-8b4f-b6b0-133ec2aae6df.
 ///
-/// Source: MBIM 1.0 §10.1; libmbim `MBIM_UUID_BASIC_CONNECT`.
+/// Source: MBIM 1.0 §10.1; libmbim `MBIM_UUID_BASIC_CONNECT`
+/// (1.31.2, probed in-session for #1710 — the printable string and a
+/// built DEVICE_CAPS message both yield these wire bytes).
 pub const MBIM_UUID_BASIC_CONNECT: MbimUuid = [
-    0x33, 0xCC, 0x89, 0xA2, 0xBC, 0xBB, 0x45, 0x18, 0xBB, 0xDB, 0x34, 0xEC, 0x7E, 0xDF, 0xB8, 0x73,
+    0xA2, 0x89, 0xCC, 0x33, 0xBC, 0xBB, 0x8B, 0x4F, 0xB6, 0xB0, 0x13, 0x3E, 0xC2, 0xAA, 0xE6, 0xDF,
 ];
 
 // ─── MBIM_STATUS codes ───────────────────────────────────────────────────────
