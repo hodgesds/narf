@@ -1769,13 +1769,13 @@ fn smoke_net_e1000_arp_round_trip() -> TestResult {
     if !e1000::is_probed() {
         return TestResult::Skip("e1000 not probed");
     }
-    let mac = e1000::with_controller(|c| c.mac).unwrap_or([0; 6]);
+    let mac = e1000::with_controller(0, |c| c.mac).unwrap_or([0; 6]);
     let mut frame = [0u8; 64];
     let n = build_arp_request(&mut frame, mac, [10, 0, 2, 15], [10, 0, 2, 2]).unwrap_or(0);
     if n == 0 {
         return TestResult::Fail("build_arp_request");
     }
-    if !e1000::with_controller(|c| c.tx(&frame[..n]))
+    if !e1000::with_controller(0, |c| c.tx(&frame[..n]))
         .map(|r| r.is_ok())
         .unwrap_or(false)
     {
@@ -1785,7 +1785,7 @@ fn smoke_net_e1000_arp_round_trip() -> TestResult {
     let mut rx = [0u8; 1518];
     let mut got_any = false;
     for _ in 0..2_000_000u32 {
-        let len = e1000::with_controller(|c| c.rx_recv(&mut rx)).unwrap_or(0);
+        let len = e1000::with_controller(0, |c| c.rx_recv(&mut rx)).unwrap_or(0);
         if len > 0 {
             got_any = true;
             // Try parsing — any well-formed Ethernet frame counts.
