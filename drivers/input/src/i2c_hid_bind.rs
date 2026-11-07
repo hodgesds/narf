@@ -27,8 +27,8 @@
 //! Pump task
 //! ---------
 //! For each bound device the pump:
-//! - Calls `I2cHidDriver::start()` (read descriptor + RESET +
-//!   POWER_ON).
+//! - Calls `I2cHidDriver::bring_up()` (read descriptor + RESET
+//!   with bounded retry/backoff + POWER_ON).
 //! - Reads the Report Descriptor and parses it via `narf_hid`.
 //! - Detects a Microsoft Precision Touchpad profile via
 //!   `narf_hid::ptp::detect`. When present, pump-decoded contact
@@ -36,7 +36,10 @@
 //!   global ring.
 //! - Loops: wait on the wake flag (set by the GPIO ISR) — or, if
 //!   no GPIO IRQ is wired, yield + retry — read one input report,
-//!   decode, push.
+//!   decode, push. Bus errors back off, then escalate to a
+//!   RESET/re-bind; a device that cannot RESET after the bounded
+//!   budget is unregistered (router + sysfs) and the pump exits
+//!   (issue #771).
 //!
 //! Sources:
 //! - Microsoft "HID over I2C Protocol Specification" v1.0 — _DSM
@@ -61,14 +64,145 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use narf_aml::resource::ResourceItem;
 use narf_drivers_gpio::{GpioIrqConfig, GpioPull};
 use narf_drivers_i2c::{registry as i2c_registry, I2cBus};
+use narf_input::evdev::{DeviceId, DeviceNode};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::i2c_hid::{I2cHidDriver, I2cHidError, POWER_ON};
+use crate::i2c_hid::{I2cHidDriver, I2cHidError, RetryPolicy};
 
 /// Default HID descriptor register used when `_DSM` evaluation is
 /// unavailable. The Microsoft spec leaves this device-defined; AMD
 /// touchpad firmware ships with 0x0001 as the de-facto convention.
 const DEFAULT_HID_DESC_REGISTER: u16 = 0x0001;
+
+/// Consecutive bus errors in the report loop before the pump
+/// escalates to a RESET/re-bind attempt. Grounded in the tree's
+/// standing transient-error bound: USB CCID `MAX_RETRIES = 3`.
+const MAX_CONSECUTIVE_BUS_ERRORS: u32 = 3;
+
+/// RESET/re-bind attempts per recovery epoch before the pump
+/// gives up, unregisters the device and exits. Same CCID bound:
+/// a device that cannot RESET three times is wedged, not glitchy.
+const MAX_RESET_ATTEMPTS: u32 = 3;
+
+/// What the pump should do after a bus error in the report loop
+/// (issue #771). Pure decision — see `PumpRecovery`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// Transient error: sleep this long, then re-read.
+    Backoff(u64),
+    /// Wedged device: RESET + re-bring-up (re-bind), then re-read.
+    Reset,
+    /// Recovery budget spent: unregister + exit the pump.
+    GiveUp,
+}
+
+/// Report-loop recovery state machine (issue #771). Pure logic —
+/// no I/O, no sleep — so fixtures can drive it through the full
+/// error → backoff → RESET → give-up sequence without a bus.
+///
+/// Epochs: a successful report clears the consecutive-error
+/// count; a successful RESET clears both counts, starting a
+/// fresh epoch. The total work per epoch is bounded:
+/// `MAX_CONSECUTIVE_BUS_ERRORS` backoffs + `MAX_RESET_ATTEMPTS`
+/// resets, then `GiveUp` — the pump never spins forever on a
+/// wedged device again.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PumpRecovery {
+    consecutive_errors: u32,
+    reset_attempts: u32,
+    policy: RetryPolicy,
+}
+
+impl PumpRecovery {
+    pub fn new(policy: RetryPolicy) -> Self {
+        Self {
+            consecutive_errors: 0,
+            reset_attempts: 0,
+            policy,
+        }
+    }
+
+    /// One bus error arrived. Returns the next action.
+    pub fn on_bus_error(&mut self) -> RecoveryAction {
+        self.consecutive_errors += 1;
+        if self.consecutive_errors <= MAX_CONSECUTIVE_BUS_ERRORS {
+            return RecoveryAction::Backoff(self.policy.backoff_ms(self.consecutive_errors - 1));
+        }
+        if self.reset_attempts < MAX_RESET_ATTEMPTS {
+            self.reset_attempts += 1;
+            self.consecutive_errors = 0;
+            return RecoveryAction::Reset;
+        }
+        RecoveryAction::GiveUp
+    }
+
+    /// A report read cleanly: transient errors are forgiven.
+    pub fn on_report_ok(&mut self) {
+        self.consecutive_errors = 0;
+    }
+
+    /// A RESET/re-bind recovered the device: fresh epoch.
+    pub fn on_reset_ok(&mut self) {
+        self.consecutive_errors = 0;
+        self.reset_attempts = 0;
+    }
+}
+
+/// The evdev nodes one bound I2C-HID device owns (issue #771).
+/// The pump used to discard every `DeviceId` `register_device`
+/// returned, so no production path could ever unregister the
+/// device — the router + sysfs entries leaked for the life of the
+/// boot. `BoundNodes` keeps the ids and unregisters all of them
+/// when the pump gives up on a wedged device; the router's
+/// `DeviceChange::Removed` hook then unpublishes the sysfs
+/// `inputN`/`eventN` entries (see `filesystem::sysfs`).
+#[derive(Debug)]
+pub struct BoundNodes {
+    ids: Vec<DeviceId>,
+}
+
+impl BoundNodes {
+    pub fn new() -> Self {
+        Self { ids: Vec::new() }
+    }
+
+    /// Register a node and remember its id for later unregister.
+    pub fn register(
+        &mut self,
+        caps: narf_input::evdev::DeviceCaps,
+    ) -> alloc::sync::Arc<DeviceNode> {
+        let (id, node) = narf_input::evdev::ROUTER.register_device(caps);
+        self.ids.push(id);
+        node
+    }
+
+    /// Unregister every node this device owns. Idempotent —
+    /// `unregister_device` is a no-op for unknown ids.
+    pub fn unregister_all(&mut self) {
+        for id in self.ids.drain(..) {
+            narf_input::evdev::ROUTER.unregister_device(id);
+        }
+    }
+
+    /// Ids currently owned (test visibility).
+    pub fn ids(&self) -> &[DeviceId] {
+        &self.ids
+    }
+}
+
+impl Default for BoundNodes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// ACPI paths with a live pump task. `bind_all()` is re-runnable
+/// (it is the re-bind entry point after a pump gives up), so a
+/// second run must not spawn a duplicate pump for a device whose
+/// pump is still alive — two pumps would both read the same
+/// device and double-deliver every report. The pump removes its
+/// path on exit.
+static BOUND_PATHS: IrqSafeSpinLock<Vec<String>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Pin → wake-flag table consulted by the GPIO ISR. Single AMD FCH
 /// GPIO block per system, so the pin number alone keys the lookup;
@@ -84,6 +218,21 @@ fn on_gpio_irq(pin: u16) {
         if *p == pin {
             flag.store(true, Ordering::Release);
         }
+    }
+}
+
+/// Drop one pin → wake-flag entry (pump exit, or the
+/// `register_irq` failure path in `bind_one`). The flag itself is
+/// leaked by design (`Box::leak` in `bind_one`); only the lookup
+/// entry is removed so a rebound device does not accumulate stale
+/// entries.
+fn remove_pin_wake(pin: u16, flag: &'static AtomicBool) {
+    let mut g = PIN_WAKES.lock();
+    if let Some(idx) = g
+        .iter()
+        .position(|(p, f)| *p == pin && core::ptr::eq(*f, flag))
+    {
+        g.swap_remove(idx);
     }
 }
 
@@ -189,6 +338,13 @@ pub fn bind_all() -> usize {
 }
 
 fn bind_one(path: &str) -> bool {
+    // A live pump already owns this path — `bind_all()` is
+    // re-runnable (the re-bind entry point after a pump gives up),
+    // but a second pump for the same device would double-deliver
+    // every report.
+    if BOUND_PATHS.lock().iter().any(|p| p == path) {
+        return false;
+    }
     let items = match narf_aml::prt_crs::evaluate_crs_for(path) {
         Ok(v) => v,
         Err(e) => {
@@ -298,13 +454,7 @@ fn bind_one(path: &str) -> bool {
                     // Drop the dangling wake registration since the
                     // ISR will never fire — keeps the lookup table
                     // tidy.
-                    let mut g = PIN_WAKES.lock();
-                    if let Some(idx) = g
-                        .iter()
-                        .position(|(p, f)| *p == pin && core::ptr::eq(*f, wake_flag))
-                    {
-                        g.swap_remove(idx);
-                    }
+                    remove_pin_wake(pin, wake_flag);
                 }
             }
         }
@@ -339,12 +489,14 @@ fn bind_one(path: &str) -> bool {
         },
     };
     // Stackful: per-device i2c-hid input pump.
+    BOUND_PATHS.lock().push(device_path.clone());
     narf_scheduler::spawn_stackful(pump_task(
         device_path,
         identity,
         driver,
         wake_flag,
         wired_irq,
+        gpio_pin,
     ));
     true
 }
@@ -471,41 +623,52 @@ async fn sync_kbd_leds(
 
 /// Per-device pump future. Owns the driver. Loops forever — exits
 /// only if the bus returns a fatal error.
+///
+/// Lifecycle teardown lives here, not in the inner pump: on any
+/// exit the GPIO wake entry and the bound-path record are removed
+/// so a later `bind_all()` re-run can re-bind the device fresh.
+/// (Evdev nodes are unregistered by the inner pump's give-up arm —
+/// the only exit that runs after nodes exist; every earlier exit
+/// happens before registration.)
 async fn pump_task(
+    path: String,
+    identity: I2cHidIdentity,
+    driver: I2cHidDriver,
+    wake: &'static AtomicBool,
+    irq_wired: bool,
+    gpio_pin: Option<u16>,
+) {
+    pump_task_inner(path.clone(), identity, driver, wake, irq_wired).await;
+    if let Some(pin) = gpio_pin {
+        remove_pin_wake(pin, wake);
+    }
+    BOUND_PATHS.lock().retain(|p| *p != path);
+}
+
+async fn pump_task_inner(
     path: String,
     identity: I2cHidIdentity,
     mut driver: I2cHidDriver,
     wake: &'static AtomicBool,
     irq_wired: bool,
 ) {
-    let hid_desc = match driver.read_descriptor().await {
+    // Bounded bring-up (issue #771): descriptor + RESET with
+    // retry/backoff + POWER_ON. A device that cannot RESET after
+    // the bounded budget is wedged — the pump exits instead of
+    // limping on with a half-initialised device, as the old code
+    // did by swallowing the RESET failure.
+    let hid_desc = match driver.bring_up(&RetryPolicy::default()).await {
         Ok(d) => d,
         Err(e) => {
             let _ = writeln!(
                 narf_console::Writer,
-                "  i2c-hid-pump: {}: read_descriptor failed ({:?}); pump exiting",
+                "  i2c-hid-pump: {}: bring-up failed ({:?}); pump exiting",
                 path,
                 e
             );
             return;
         }
     };
-    if let Err(e) = driver.reset().await {
-        let _ = writeln!(
-            narf_console::Writer,
-            "  i2c-hid-pump: {}: RESET failed ({:?})",
-            path,
-            e
-        );
-    }
-    if let Err(e) = driver.set_power(POWER_ON).await {
-        let _ = writeln!(
-            narf_console::Writer,
-            "  i2c-hid-pump: {}: SET_POWER(ON) failed ({:?})",
-            path,
-            e
-        );
-    }
 
     let report_desc_blob = match driver.read_report_descriptor().await {
         Ok(b) => b,
@@ -581,7 +744,11 @@ async fn pump_task(
 
     // Register an evdev device node for the keyboard (and, if present,
     // the consumer row) so EV_KEY events reach `/dev/input/event*`
-    // consumers — the same path the i8042 PS/2 driver uses.
+    // consumers — the same path the i8042 PS/2 driver uses. Every
+    // node is owned by `bound`: if the pump later gives up on a
+    // wedged device, `bound.unregister_all()` removes them all
+    // (issue #771).
+    let mut bound = BoundNodes::new();
     let kbd_node = if keyboard.is_some() || consumer.is_some() {
         let mut caps = crate::i2c_hid_keyboard::build_keyboard_caps();
         if consumer.is_some() {
@@ -589,7 +756,7 @@ async fn pump_task(
         }
         let template = identity.caps("Keyboard", &hid_desc);
         caps.set_identity(&template.name, &template.phys, &template.uniq, template.id);
-        let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
+        let node = bound.register(caps);
         if let Some(kp) = &keyboard {
             crate::i2c_hid_keyboard::log_boot_summary(
                 &path,
@@ -611,21 +778,18 @@ async fn pump_task(
     let ptp_node = ptp.as_ref().map(|profile| {
         let caps =
             crate::i2c_hid_touch::build_ptp_caps(profile, &identity.caps("Touchpad", &hid_desc));
-        let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
-        node
+        bound.register(caps)
     });
     let touch_node = touchscreen.as_ref().map(|profile| {
         let caps = crate::i2c_hid_touch::build_touchscreen_caps(
             profile,
             &identity.caps("Touchscreen", &hid_desc),
         );
-        let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
-        node
+        bound.register(caps)
     });
     let pen_node = pen.as_ref().map(|profile| {
         let caps = crate::i2c_hid_touch::build_pen_caps(profile, &identity.caps("Pen", &hid_desc));
-        let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
-        node
+        bound.register(caps)
     });
 
     if let Some(profile) = &ptp {
@@ -681,8 +845,19 @@ async fn pump_task(
     };
     let mut kbd_led_sent: u16 = 0;
 
+    // Report-loop recovery state (issue #771). A wedged device
+    // used to spin this loop forever on bus errors; now transient
+    // errors back off, persistent ones escalate to RESET/re-bind,
+    // and a device that cannot RESET gives up boundedly — the
+    // pump unregisters its nodes and exits.
+    let mut recovery = PumpRecovery::new(RetryPolicy::default());
+    // Set while recovering: the next read must be attempted
+    // immediately, not gated on the GPIO wake flag — a wedged
+    // device never raises INT.
+    let mut recovery_pending = false;
+
     loop {
-        if irq_wired {
+        if irq_wired && !recovery_pending {
             // Wait for ISR to flip the flag. Yield each poll so peer
             // tasks (i8042, FB drain, init) make progress.
             while !wake.swap(false, Ordering::Acquire) {
@@ -691,14 +866,55 @@ async fn pump_task(
         } else {
             narf_scheduler::yield_now().await;
         }
+        recovery_pending = false;
 
         let n = match driver.read_input_report(&mut buf).await {
-            Ok(n) => n,
+            Ok(n) => {
+                recovery.on_report_ok();
+                n
+            }
             Err(I2cHidError::Bus(_)) => {
-                // Transient bus error: yield + retry. Persistent
-                // errors burn CPU but don't crash; we'd like a
-                // backoff here once the scheduler exposes one.
-                continue;
+                match recovery.on_bus_error() {
+                    RecoveryAction::Backoff(ms) => {
+                        narf_time::sleep_ms(ms).await;
+                        recovery_pending = true;
+                        continue;
+                    }
+                    RecoveryAction::Reset => {
+                        match driver.bring_up(&RetryPolicy::default()).await {
+                            Ok(_) => {
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "  i2c-hid-pump: {}: RESET/re-bind recovered the device",
+                                    path
+                                );
+                                recovery.on_reset_ok();
+                            }
+                            Err(e) => {
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "  i2c-hid-pump: {}: RESET/re-bind failed ({:?})",
+                                    path,
+                                    e
+                                );
+                                // Fall through to the next read: the
+                                // state machine advances toward GiveUp
+                                // on the next bus error.
+                            }
+                        }
+                        recovery_pending = true;
+                        continue;
+                    }
+                    RecoveryAction::GiveUp => {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "  i2c-hid-pump: {}: recovery budget spent; unregistering device, pump exiting",
+                            path
+                        );
+                        bound.unregister_all();
+                        return;
+                    }
+                }
             }
             Err(I2cHidError::BufferTooSmall) => {
                 // Resize once, retry next loop.
@@ -905,6 +1121,7 @@ fn resolve_hid_desc_register(path: &str) -> Option<u16> {
 #[doc(hidden)]
 pub fn __reset_for_test() {
     PIN_WAKES.lock().clear();
+    BOUND_PATHS.lock().clear();
 }
 
 /// Outcome of the PTP multi-touch mode-set request.
@@ -1111,4 +1328,130 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/input", smoke_i2c_hid_sensor_publication_round_trip);
+
+    // ── Issue #771: pump recovery + unregister ───────────────────
+    //
+    // Fixtures built from the lifecycle semantics themselves: the
+    // recovery state machine is driven through its full
+    // error → backoff → RESET → give-up sequence with no bus at
+    // all, and `BoundNodes` is proven to remove a device from the
+    // router + sysfs (the hook chain into `unpublish_input_device`
+    // is exercised end to end).
+
+    fn smoke_pump_recovery_backoff_then_reset_then_give_up() -> TestResult {
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_backoff_ms: 100,
+            max_backoff_ms: 30_000,
+        };
+        let mut r = PumpRecovery::new(policy);
+        // One wedged epoch, driven to exhaustion: 3 backoffs
+        // (100/200/400), RESET, 3 backoffs, RESET, 3 backoffs,
+        // RESET, 3 backoffs, then GiveUp. Exactly 3 RESETs —
+        // the pump never spins forever on a wedged device.
+        let want = [
+            RecoveryAction::Backoff(100),
+            RecoveryAction::Backoff(200),
+            RecoveryAction::Backoff(400),
+            RecoveryAction::Reset,
+            RecoveryAction::Backoff(100),
+            RecoveryAction::Backoff(200),
+            RecoveryAction::Backoff(400),
+            RecoveryAction::Reset,
+            RecoveryAction::Backoff(100),
+            RecoveryAction::Backoff(200),
+            RecoveryAction::Backoff(400),
+            RecoveryAction::Reset,
+            RecoveryAction::Backoff(100),
+            RecoveryAction::Backoff(200),
+            RecoveryAction::Backoff(400),
+            RecoveryAction::GiveUp,
+        ];
+        for w in want.iter() {
+            if r.on_bus_error() != *w {
+                return TestResult::Fail("recovery action sequence wrong");
+            }
+        }
+        // A successful report forgives transient errors: the
+        // next error backs off from 100 again, not 800.
+        let mut r2 = PumpRecovery::new(policy);
+        let _ = r2.on_bus_error();
+        let _ = r2.on_bus_error();
+        r2.on_report_ok();
+        if r2.on_bus_error() != RecoveryAction::Backoff(100) {
+            return TestResult::Fail("successful report did not reset the error count");
+        }
+        // A successful RESET starts a fresh epoch: the next
+        // error backs off from 100 and a full 3 RESETs are
+        // available again.
+        let mut r3 = PumpRecovery::new(policy);
+        let _ = r3.on_bus_error();
+        let _ = r3.on_bus_error();
+        let _ = r3.on_bus_error();
+        if r3.on_bus_error() != RecoveryAction::Reset {
+            return TestResult::Fail("expected Reset after 3 consecutive errors");
+        }
+        r3.on_reset_ok();
+        if r3.on_bus_error() != RecoveryAction::Backoff(100) {
+            return TestResult::Fail("successful RESET did not start a fresh epoch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input",
+        smoke_pump_recovery_backoff_then_reset_then_give_up
+    );
+
+    fn smoke_bound_nodes_unregister_removes_router_and_sysfs() -> TestResult {
+        use narf_input::evdev::{DeviceCaps, InputId, ROUTER};
+        crate::i2c_hid_bind::__reset_for_test();
+        narf_filesystem::sysfs::__reset_for_test();
+        narf_filesystem::sysfs::populate_input_class();
+
+        let mut bound = BoundNodes::new();
+        let mut caps = DeviceCaps::new();
+        caps.set_identity(
+            "test i2c-hid touchpad",
+            "i2c-TEST/input0",
+            "",
+            InputId::new(narf_input::evdev::bus::I2C, 0x04F3, 0x3045, 0x0001),
+        );
+        caps.add_key(30);
+        let node = bound.register(caps);
+        if bound.ids().len() != 1 {
+            return TestResult::Fail("bound node id was not recorded");
+        }
+        let id = bound.ids()[0];
+        let n = id.0 - 1;
+        let sysfs_input_present = || {
+            narf_filesystem::sysfs::get_root()
+                .get_child("devices")
+                .and_then(|d| d.get_child("platform"))
+                .and_then(|p| p.get_child("narf-input"))
+                .and_then(|ni| ni.get_child(&alloc::format!("input{}", n)))
+                .is_some()
+        };
+        if ROUTER.caps(id).is_none() || !node.is_alive() || !sysfs_input_present() {
+            return TestResult::Fail("registered node missing from router or sysfs");
+        }
+        // The give-up path: unregister everything the device owns.
+        bound.unregister_all();
+        if !bound.ids().is_empty() {
+            return TestResult::Fail("unregister_all did not drain the id list");
+        }
+        if ROUTER.caps(id).is_some()
+            || ROUTER.device_ids().contains(&id)
+            || node.is_alive()
+            || sysfs_input_present()
+        {
+            return TestResult::Fail("unregistered node still visible in router or sysfs");
+        }
+        // Idempotent: a second call is a no-op, not a panic.
+        bound.unregister_all();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input",
+        smoke_bound_nodes_unregister_removes_router_and_sysfs
+    );
 }

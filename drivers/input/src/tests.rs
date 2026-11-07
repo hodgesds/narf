@@ -40,6 +40,85 @@ fn smoke_i8042_decode_a_keystroke() -> TestResult {
 }
 kernel_test_in!("drivers/input", smoke_i8042_decode_a_keystroke);
 
+// ── Issue #771: PS/2 re-probe bookkeeping ────────────────────────
+//
+// `reprobe()` itself drives the 8042 ports, so no fixture can
+// run it in the test harness — but its unregister half (the part
+// that used to leak: `init()` discarded the evdev id) runs
+// through the same `drop_stale_registration` the hook calls, via
+// the `__drop_stale_*_registration_for_test` hooks. These
+// fixtures prove a seeded registration is fully removed from
+// the router and the driver's cached node — the exact state a
+// re-probe must leave behind before the fresh probe runs.
+
+fn smoke_i8042_reprobe_drops_stale_registration() -> TestResult {
+    use crate::i8042;
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+    i8042::__reset_for_test();
+    let mut caps = DeviceCaps::new();
+    caps.set_identity(
+        "test AT keyboard",
+        "isa0060/serio0/input0",
+        "",
+        narf_input::evdev::InputId::new(narf_input::evdev::bus::I8042, 0x0001, 0x0001, 0),
+    );
+    caps.add_key(30);
+    let (id, node) = ROUTER.register_device(caps);
+    i8042::__seed_kbd_registration_for_test(id, node.clone());
+    if i8042::kbd_evdev_node().is_none() || ROUTER.caps(id).is_none() {
+        return TestResult::Fail("seeded keyboard registration missing");
+    }
+    i8042::__drop_stale_kbd_registration_for_test();
+    if i8042::kbd_evdev_node().is_some()
+        || ROUTER.caps(id).is_some()
+        || ROUTER.device_ids().contains(&id)
+        || node.is_alive()
+    {
+        return TestResult::Fail("stale keyboard node still visible after re-probe drop");
+    }
+    // Defensive: the drop already unregistered; a no-op if so.
+    ROUTER.unregister_device(id);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_reprobe_drops_stale_registration
+);
+
+fn smoke_i8042_mouse_reprobe_drops_stale_registration() -> TestResult {
+    use crate::i8042_mouse;
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+    i8042_mouse::__reset_for_test();
+    let mut caps = DeviceCaps::new();
+    caps.set_identity(
+        "test PS/2 mouse",
+        "isa0060/serio1/input0",
+        "",
+        narf_input::evdev::InputId::new(narf_input::evdev::bus::I8042, 0x0002, 0x0001, 0),
+    );
+    caps.add_key(narf_input::evdev::key::BTN_LEFT);
+    let (id, node) = ROUTER.register_device(caps);
+    i8042_mouse::__seed_mouse_registration_for_test(id, node.clone());
+    if i8042_mouse::mouse_evdev_node().is_none() || ROUTER.caps(id).is_none() {
+        return TestResult::Fail("seeded mouse registration missing");
+    }
+    i8042_mouse::__drop_stale_mouse_registration_for_test();
+    if i8042_mouse::mouse_evdev_node().is_some()
+        || ROUTER.caps(id).is_some()
+        || ROUTER.device_ids().contains(&id)
+        || node.is_alive()
+    {
+        return TestResult::Fail("stale mouse node still visible after re-probe drop");
+    }
+    // Defensive: the drop already unregistered; a no-op if so.
+    ROUTER.unregister_device(id);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_i8042_mouse_reprobe_drops_stale_registration
+);
+
 fn smoke_i8042_modifier_tracking() -> TestResult {
     // Press LeftShift (make 0x2A), press 'A' (make 0x1E), release both.
     // The 'A' press event should carry SHIFT in its modifier bitset.
@@ -1010,12 +1089,12 @@ mod i2c_hid_smokes {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
     use async_trait::async_trait;
-    use core::sync::atomic::{AtomicI32, Ordering};
+    use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use narf_drivers_i2c::{I2cBus, I2cError, I2cOp};
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_lib::sync::IrqSafeSpinLock;
 
-    use crate::i2c_hid::{HidDescriptor, I2cHidDriver, I2cHidError, HID_DESC_LENGTH};
+    use crate::i2c_hid::{HidDescriptor, I2cHidDriver, I2cHidError, RetryPolicy, HID_DESC_LENGTH};
 
     #[derive(Debug)]
     pub(super) struct MockBus {
@@ -1024,6 +1103,13 @@ mod i2c_hid_smokes {
         canned_reads: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
         /// Captured Write payloads, one per I2cOp::Write.
         captured_writes: IrqSafeSpinLock<Vec<Vec<u8>>>,
+        /// Fail the next N transfers with `I2cError::Timeout`
+        /// (issue #771 fixtures: a wedging device). A failed
+        /// transfer records no writes — the command never reached
+        /// the device.
+        fail_next: AtomicUsize,
+        /// Total transfers attempted (failed + successful).
+        transfer_count: AtomicUsize,
     }
 
     impl MockBus {
@@ -1031,6 +1117,8 @@ mod i2c_hid_smokes {
             Self {
                 canned_reads: IrqSafeSpinLock::new(VecDeque::new()),
                 captured_writes: IrqSafeSpinLock::new(Vec::new()),
+                fail_next: AtomicUsize::new(0),
+                transfer_count: AtomicUsize::new(0),
             }
         }
         pub(super) fn stage_read(&self, data: Vec<u8>) {
@@ -1039,11 +1127,23 @@ mod i2c_hid_smokes {
         pub(super) fn writes(&self) -> Vec<Vec<u8>> {
             self.captured_writes.lock().clone()
         }
+        /// Fail the next `n` transfers with a bus timeout.
+        pub(super) fn fail_next(&self, n: usize) {
+            self.fail_next.store(n, Ordering::SeqCst);
+        }
+        pub(super) fn transfers(&self) -> usize {
+            self.transfer_count.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
     impl I2cBus for MockBus {
         async fn transfer(&self, _addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
+            self.transfer_count.fetch_add(1, Ordering::SeqCst);
+            if self.fail_next.load(Ordering::SeqCst) > 0 {
+                self.fail_next.fetch_sub(1, Ordering::SeqCst);
+                return Err(I2cError::Timeout);
+            }
             for op in ops.iter_mut() {
                 match op {
                     I2cOp::Write(data) => {
@@ -1286,6 +1386,203 @@ mod i2c_hid_smokes {
     kernel_test_in!(
         "drivers/input/i2c-hid",
         smoke_i2c_hid_reset_writes_command_then_polls_input
+    );
+
+    // ── Issue #771: bounded retry / backoff / give-up ─────────────
+    //
+    // The bounds are NOT invented here: the policy defaults come
+    // from the tree itself (CCID `MAX_RETRIES = 3`, i40e
+    // start-100 ms / double / cap-30 000 ms). These fixtures prove
+    // the driver honours them — a RESET failure retries with
+    // backoff then re-binds, and a permanently wedged device gives
+    // up after exactly the bounded number of attempts.
+
+    fn smoke_i2c_hid_retry_backoff_doubles_and_caps() -> TestResult {
+        let policy = RetryPolicy::default();
+        // i40e shape: 100, 200, 400, 800, ... capped at 30 000.
+        if policy.backoff_ms(0) != 100
+            || policy.backoff_ms(1) != 200
+            || policy.backoff_ms(2) != 400
+            || policy.backoff_ms(3) != 800
+            || policy.backoff_ms(8) != 25_600
+            || policy.backoff_ms(9) != 30_000
+            || policy.backoff_ms(30) != 30_000
+        {
+            return TestResult::Fail(
+                "default backoff sequence wrong (want 100/200/400/.../30000 cap)",
+            );
+        }
+        let small = RetryPolicy {
+            max_attempts: 2,
+            base_backoff_ms: 10,
+            max_backoff_ms: 25,
+        };
+        if small.backoff_ms(0) != 10 || small.backoff_ms(1) != 20 || small.backoff_ms(2) != 25 {
+            return TestResult::Fail("custom backoff cap wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_retry_backoff_doubles_and_caps
+    );
+
+    fn smoke_i2c_hid_reset_retries_then_rebinds() -> TestResult {
+        let bus = Arc::new(MockBus::new());
+        bus.stage_read(make_descriptor_bytes());
+        // 0-length post-RESET sentinel for the successful attempt.
+        bus.stage_read(alloc::vec![0u8, 0u8]);
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        let bus_for_check = bus.clone();
+        // Zero-backoff test policy: the backoff *values* are proven
+        // by the pure test above; here only the attempt counting
+        // matters, and sleeps must not slow the suite.
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_backoff_ms: 0,
+            max_backoff_ms: 0,
+        };
+        run_async(async move {
+            if drv.read_descriptor().await.is_err() {
+                return TestResult::Fail("descriptor read failed");
+            }
+            // Fail the next two transfers (two RESET attempts),
+            // then let the third through. Set here — after the
+            // descriptor read — so the failures land on RESET.
+            bus_for_check.fail_next(2);
+            if drv.reset_with_retry(&policy).await.is_err() {
+                return TestResult::Fail("reset should have succeeded on attempt 3");
+            }
+            // Transfers: 1 descriptor read + 2 failed RESET writes
+            // + 1 successful RESET write + 1 sentinel poll.
+            if bus_for_check.transfers() != 5 {
+                return TestResult::Fail(
+                    "expected exactly 5 transfers (1 desc + 3 RESET attempts + 1 poll)",
+                );
+            }
+            let writes = bus_for_check.writes();
+            if writes.len() != 3 {
+                return TestResult::Fail("expected desc + RESET + input-poll writes");
+            }
+            if writes[1] != alloc::vec![0x05, 0x00, 0x00, 0x01] {
+                return TestResult::Fail("RESET command framing wrong on the retry that landed");
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_reset_retries_then_rebinds
+    );
+
+    fn smoke_i2c_hid_reset_gives_up_boundedly() -> TestResult {
+        let bus = Arc::new(MockBus::new());
+        bus.stage_read(make_descriptor_bytes());
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        let bus_for_check = bus.clone();
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_backoff_ms: 0,
+            max_backoff_ms: 0,
+        };
+        run_async(async move {
+            if drv.read_descriptor().await.is_err() {
+                return TestResult::Fail("descriptor read failed");
+            }
+            // Wedged device: every transfer fails.
+            bus_for_check.fail_next(100);
+            match drv.reset_with_retry(&policy).await {
+                Err(I2cHidError::Bus(I2cError::Timeout)) => {}
+                _ => return TestResult::Fail("wedged device should have failed with Timeout"),
+            }
+            // Exactly max_attempts RESET attempts, then stop —
+            // no fourth attempt, no infinite spin.
+            if bus_for_check.transfers() != 4 {
+                return TestResult::Fail(
+                    "expected exactly 4 transfers (1 desc + 3 RESET attempts)",
+                );
+            }
+            // No RESET command ever landed on the bus.
+            let writes = bus_for_check.writes();
+            if writes.len() != 1 {
+                return TestResult::Fail("wedged device should have seen no RESET write land");
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_reset_gives_up_boundedly
+    );
+
+    fn smoke_i2c_hid_bring_up_returns_descriptor() -> TestResult {
+        let bus = Arc::new(MockBus::new());
+        bus.stage_read(make_descriptor_bytes());
+        bus.stage_read(alloc::vec![0u8, 0u8]);
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        let bus_for_check = bus.clone();
+        run_async(async move {
+            let policy = RetryPolicy {
+                max_attempts: 3,
+                base_backoff_ms: 0,
+                max_backoff_ms: 0,
+            };
+            match drv.bring_up(&policy).await {
+                Ok(d) => {
+                    if d.w_vendor_id != 0x04F3 {
+                        return TestResult::Fail("bring_up descriptor VID wrong");
+                    }
+                }
+                Err(_) => return TestResult::Fail("bring_up failed on a healthy bus"),
+            }
+            // Descriptor read + RESET write + sentinel poll +
+            // SET_POWER(ON) write.
+            let writes = bus_for_check.writes();
+            if writes.len() != 4 {
+                return TestResult::Fail("expected desc + RESET + poll + SET_POWER writes");
+            }
+            if writes[3] != alloc::vec![0x05, 0x00, 0x00, 0x08] {
+                return TestResult::Fail("SET_POWER(ON) command framing wrong");
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_bring_up_returns_descriptor
+    );
+
+    fn smoke_i2c_hid_bring_up_fails_on_bad_descriptor() -> TestResult {
+        let bus = Arc::new(MockBus::new());
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        let bus_for_check = bus.clone();
+        run_async(async move {
+            let policy = RetryPolicy {
+                max_attempts: 3,
+                base_backoff_ms: 0,
+                max_backoff_ms: 0,
+            };
+            // Fail the descriptor read itself: bring-up must fail
+            // fast (no RESET attempts against an unidentified
+            // device).
+            bus_for_check.fail_next(1);
+            match drv.bring_up(&policy).await {
+                Err(I2cHidError::Bus(I2cError::Timeout)) => {}
+                _ => return TestResult::Fail("bring_up should have failed on descriptor read"),
+            }
+            if bus_for_check.transfers() != 1 {
+                return TestResult::Fail("failed descriptor read must not trigger RESET attempts");
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_bring_up_fails_on_bad_descriptor
     );
 
     fn smoke_i2c_hid_set_power_validates_state() -> TestResult {
