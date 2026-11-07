@@ -21,8 +21,13 @@
 //! ALC256 family (`RealtekChip::uses_alc256_init`, Linux
 //! `alc256_init`) and ALC282/283 (Linux `alc282_coefs` /
 //! `alc283_coefs` via `alc_process_coef_fw`) — before the widget
-//! graph is built, and re-applies them on resume. The re-derived
-//! pin quirks in [`VERIFIED_QUIRK_TABLE`] are applied the same way:
+//! graph is built, and re-applies them on resume. The HP-pin
+//! tails of `alc282_init` / `alc283_init` run after the graph is
+//! built (they need the HP pin, known only post-enumerate) and
+//! again on resume; the ALC294/ALC700 parse-time coef updates
+//! ([`parse_table_for`], Linux `patch_alc269`) run once at probe
+//! before enumeration, never on resume. The re-derived pin quirks
+//! in [`VERIFIED_QUIRK_TABLE`] are applied the same way:
 //! every row and key was checked against Linux
 //! `sound/hda/codecs/realtek/alc269.c` (master and v6.6, 2026-11-05)
 //! before wiring, keyed on codec subsystem IDs from Linux's
@@ -51,9 +56,11 @@ pub const REALTEK_VENDOR_ID: u16 = 0x10EC;
 #[repr(u16)]
 pub enum RealtekChip {
     Alc215 = 0x0215,
+    Alc222 = 0x0222,
     Alc225 = 0x0225,
     Alc230 = 0x0230,
     Alc233 = 0x0233,
+    Alc234 = 0x0234,
     Alc235 = 0x0235,
     Alc236 = 0x0236,
     Alc245 = 0x0245,
@@ -79,6 +86,9 @@ pub enum RealtekChip {
     Alc300 = 0x0300,
     Alc623 = 0x0623,
     Alc700 = 0x0700,
+    Alc701 = 0x0701,
+    Alc703 = 0x0703,
+    Alc711 = 0x0711,
     /// "ALC3204" / "ALC3225" / ... are vendor-rebrands of ALC families
     /// for OEM SKUs. They share the underlying core register map but
     /// carry a distinct PCI subsystem ID.
@@ -104,9 +114,11 @@ impl RealtekChip {
         }
         match device {
             0x0215 => Some(RealtekChip::Alc215),
+            0x0222 => Some(RealtekChip::Alc222),
             0x0225 => Some(RealtekChip::Alc225),
             0x0230 => Some(RealtekChip::Alc230),
             0x0233 => Some(RealtekChip::Alc233),
+            0x0234 => Some(RealtekChip::Alc234),
             0x0235 => Some(RealtekChip::Alc235),
             0x0236 => Some(RealtekChip::Alc236),
             0x0245 => Some(RealtekChip::Alc245),
@@ -132,6 +144,9 @@ impl RealtekChip {
             0x0300 => Some(RealtekChip::Alc300),
             0x0623 => Some(RealtekChip::Alc623),
             0x0700 => Some(RealtekChip::Alc700),
+            0x0701 => Some(RealtekChip::Alc701),
+            0x0703 => Some(RealtekChip::Alc703),
+            0x0711 => Some(RealtekChip::Alc711),
             0x3204 => Some(RealtekChip::Alc3204),
             0x3225 => Some(RealtekChip::Alc3225),
             0x3236 => Some(RealtekChip::Alc3236),
@@ -149,9 +164,11 @@ impl RealtekChip {
     pub const fn name(self) -> &'static str {
         match self {
             RealtekChip::Alc215 => "ALC215",
+            RealtekChip::Alc222 => "ALC222",
             RealtekChip::Alc225 => "ALC225",
             RealtekChip::Alc230 => "ALC230",
             RealtekChip::Alc233 => "ALC233",
+            RealtekChip::Alc234 => "ALC234",
             RealtekChip::Alc235 => "ALC235",
             RealtekChip::Alc236 => "ALC236",
             RealtekChip::Alc245 => "ALC245",
@@ -177,6 +194,9 @@ impl RealtekChip {
             RealtekChip::Alc300 => "ALC300",
             RealtekChip::Alc623 => "ALC623",
             RealtekChip::Alc700 => "ALC700",
+            RealtekChip::Alc701 => "ALC701",
+            RealtekChip::Alc703 => "ALC703",
+            RealtekChip::Alc711 => "ALC711",
             RealtekChip::Alc3204 => "ALC3204",
             RealtekChip::Alc3225 => "ALC3225",
             RealtekChip::Alc3236 => "ALC3236",
@@ -374,10 +394,13 @@ pub const ALC270_INIT: &[CoefOp] = &[CoefOp::write(0x14, 0x0080)];
 /// poll loop — not a static table) plus `alc_default_init`
 /// (jack-sense-gated only). Empty table, by verification. The
 /// parse-time masked updates Linux issues for these arms
-/// (`alc_update_coef_idx(codec, 0x6b, 0x0018, ...)` for ALC274,
-/// `alc_update_coef_idx(codec, 0x4a, 1 << 15, 0)` for ALC700) run
-/// at codec parse, not at init/resume, so they are not in this
-/// table; wiring them needs a parse-time hook, a remainder (#1496).
+/// (`alc_update_coef_idx(codec, 0x6b, 0x0018, ...)` for the ALC294
+/// arm, `alc_update_coef_idx(codec, 0x4a, 1 << 15, 0)` for the
+/// ALC700 arm) run at codec patch, not at init/resume — they live
+/// in [`parse_table_for`], not here. Still unwired, as remainders:
+/// `alc294_hp_init`'s depop procedure (coefex nid 0x58 poll loop,
+/// 20 × 50 ms) and `alc_default_init`'s sense-gated PIN_OUT +
+/// amp-unmute tail.
 pub const ALC294_INIT: &[CoefOp] = &[];
 
 /// ALC280 init.
@@ -390,9 +413,11 @@ pub const ALC280_INIT: &[CoefOp] = &[CoefOp::write(0x35, 0x1080)];
 /// tables are identical in both). The rescued rows
 /// (0x35, 0x0000), (0x36, 0x0000) are absent from Linux entirely
 /// and were replaced. The sense-gated tail of `alc282_init`
-/// (0x78 capless HP-amp sequence, HP-pin mute / PIN_OUT) is not a
-/// static table and stays unwired. #1496 asked for the WRITE_COEF
-/// subset at minimum; the full table is wired because the RMW
+/// (0x78 capless HP-amp sequence, HP-pin mute / PIN_OUT) is not
+/// a static table: it is wired as the HP-pin tail in
+/// `runtime.rs::apply_hp_tail`, gated on the graph's HP pin
+/// (`hda_codec::Codec::hp_pin`) and jack sense. #1496 asked for
+/// the WRITE_COEF subset at minimum; the full table is wired because the RMW
 /// primitive built in this lane expresses the UPDATE_COEF rows
 /// exactly, in the same order — a write-only subset would leave
 /// the FIFO/clock, jack-detect and class-D bits Linux sets at
@@ -439,9 +464,11 @@ pub const ALC282_INIT: &[CoefOp] = &[
 /// addresses nid 0x53, not the coef node — the reason `CoefOp`
 /// carries a nid. The sense-gated tail of `alc283_init` (0x43
 /// capless HP-amp sequence, 0x46 update, HP-pin mute / PIN_OUT)
-/// is not a static table and stays unwired; the 0x46 update there
-/// is the same masked update ALC256's tail carries, but gated on
-/// the HP pin existing. Same full-table rationale as ALC282.
+/// is not a static table: it is wired as the HP-pin tail in
+/// `runtime.rs::apply_hp_tail`, gated on the graph's HP pin
+/// (`hda_codec::Codec::hp_pin`) and jack sense. The 0x46 update
+/// there is the same masked update ALC256's tail carries, but
+/// gated on the HP pin existing. Same full-table rationale as ALC282.
 pub const ALC283_INIT: &[CoefOp] = &[
     CoefOp::write(0x03, 0x0002),                    // Power Down Control
     CoefOp::update(0x05, 0xff3f, 0x0700),           // FIFO and filter clock
@@ -508,11 +535,11 @@ pub const ALC292_INIT: &[CoefOp] = &[CoefOp::write(0x6, 0x2104)];
 /// ALC293 init.
 pub const ALC293_INIT: &[CoefOp] = &[CoefOp::write(0x35, 0x0000)];
 
-/// ALC294 init — see the empty verified table above: the rescued
-/// rows (0x36, 0x5757), (0x67, 0x4060) are NOT restored here.
-/// Linux's `alc294_init` has no unconditional static coef ops
-/// (depop poll loop + sense-gated default init), so the table is
-/// empty; the rescued rows stay deleted as unverified (#776).
+// ALC294 init — see the empty verified table above: the rescued
+// rows (0x36, 0x5757), (0x67, 0x4060) are NOT restored here.
+// Linux's `alc294_init` has no unconditional static coef ops
+// (depop poll loop + sense-gated default init), so the table is
+// empty; the rescued rows stay deleted as unverified (#776).
 
 /// ALC295 init (Linux `alc269.c::alc295_init`).
 pub const ALC295_INIT: &[CoefOp] = &[
@@ -532,7 +559,9 @@ pub const ALC300_INIT: &[CoefOp] = &[];
 /// ALC623 init — Linux runs `alc222_init` for 0x10ec0623
 /// (dispatch shared with 0x10ec0222), and that hook is
 /// jack-sense-gated pin control only, with no coef writes at all.
-/// Empty table, by verification (#1496).
+/// Empty table, by verification (#1496). `alc222_init`'s
+/// sense-gated PIN_OUT + amp-unmute tail (HP pin + pin 0x14) is
+/// not a coef table and stays unwired, a remainder (#776).
 pub const ALC623_INIT: &[CoefOp] = &[];
 
 // "ALC32xx" rebrands share their core silicon with one of the above —
@@ -550,9 +579,11 @@ pub const ALC3287_INIT: &[CoefOp] = ALC287_INIT;
 pub fn init_table_for(chip: RealtekChip) -> &'static [CoefOp] {
     match chip {
         RealtekChip::Alc215 => ALC225_INIT,
+        RealtekChip::Alc222 => ALC623_INIT,
         RealtekChip::Alc225 => ALC225_INIT,
         RealtekChip::Alc230 => ALC230_INIT,
         RealtekChip::Alc233 => ALC233_INIT,
+        RealtekChip::Alc234 => ALC294_INIT,
         RealtekChip::Alc235 => ALC235_INIT,
         RealtekChip::Alc236 => ALC236_INIT,
         RealtekChip::Alc245 => ALC225_INIT,
@@ -578,6 +609,9 @@ pub fn init_table_for(chip: RealtekChip) -> &'static [CoefOp] {
         RealtekChip::Alc300 => ALC300_INIT,
         RealtekChip::Alc623 => ALC623_INIT,
         RealtekChip::Alc700 => ALC294_INIT,
+        RealtekChip::Alc701 => ALC294_INIT,
+        RealtekChip::Alc703 => ALC294_INIT,
+        RealtekChip::Alc711 => ALC294_INIT,
         RealtekChip::Alc3204 => ALC3204_INIT,
         RealtekChip::Alc3225 => ALC3225_INIT,
         RealtekChip::Alc3236 => ALC3236_INIT,
@@ -586,6 +620,87 @@ pub fn init_table_for(chip: RealtekChip) -> &'static [CoefOp] {
         RealtekChip::Alc3268 => ALC3268_INIT,
         RealtekChip::Alc3286 => ALC3286_INIT,
         RealtekChip::Alc3287 => ALC3287_INIT,
+    }
+}
+
+// ── Per-chip parse-time coef updates ──────────────────────────────
+//
+// Linux `sound/hda/codecs/realtek/alc269.c::patch_alc269` issues
+// two masked coef updates from its codec-variant dispatch switch,
+// before fixup selection (`snd_hda_pick_fixup`) and before the
+// auto-config parse (`alc269_parse_auto_config`) builds the widget
+// graph — i.e. at codec patch time, once, never re-run on resume
+// (the init hook is what re-runs on resume). The live path
+// mirrors that: [`parse_table_for`] is applied at probe before
+// enumeration, and NOT re-applied at reinit. Verified against
+// Linux master (2026-11-06, HEAD f66469d).
+//
+// - ALC294 arm (0x10ec0234/0274/0294):
+//   `alc_update_coef_idx(codec, 0x6b, 0x0018, (1<<4) | (1<<3))`
+//   — "UAJ MIC Vref control by verb".
+// - ALC700 arm (0x10ec0700/0701/0703/0711):
+//   `alc_update_coef_idx(codec, 0x4a, 1 << 15, 0)`
+//   — "Combo jack auto trigger control".
+//
+// The values are masked updates, not plain writes: bits outside
+// the mask are preserved, exactly as `alc_update_coef_idx` (and
+// the live path's `update_coef_idx`) requires — a failed coef
+// read skips the write, as Linux does on -1.
+
+/// ALC294-arm parse-time update (ALC234/274/294): set coef 0x6b
+/// bits 3–4 (UAJ MIC Vref control by verb).
+pub const ALC294_PARSE: &[CoefOp] = &[CoefOp::update(0x6b, 0x0018, 0x0018)];
+
+/// ALC700-arm parse-time update (ALC700/701/703/711): clear coef
+/// 0x4a bit 15 (Combo jack auto trigger control).
+pub const ALC700_PARSE: &[CoefOp] = &[CoefOp::update(0x4a, 0x8000, 0x0000)];
+
+/// Pick the parse-time coef table for a known chip. Empty for
+/// every chip outside the ALC294 and ALC700 dispatch arms.
+pub fn parse_table_for(chip: RealtekChip) -> &'static [CoefOp] {
+    match chip {
+        RealtekChip::Alc215 => &[],
+        RealtekChip::Alc222 => &[],
+        RealtekChip::Alc225 => &[],
+        RealtekChip::Alc230 => &[],
+        RealtekChip::Alc233 => &[],
+        RealtekChip::Alc234 => ALC294_PARSE,
+        RealtekChip::Alc235 => &[],
+        RealtekChip::Alc236 => &[],
+        RealtekChip::Alc245 => &[],
+        RealtekChip::Alc255 => &[],
+        RealtekChip::Alc256 => &[],
+        RealtekChip::Alc257 => &[],
+        RealtekChip::Alc270 => &[],
+        RealtekChip::Alc274 => ALC294_PARSE,
+        RealtekChip::Alc280 => &[],
+        RealtekChip::Alc282 => &[],
+        RealtekChip::Alc283 => &[],
+        RealtekChip::Alc285 => &[],
+        RealtekChip::Alc286 => &[],
+        RealtekChip::Alc287 => &[],
+        RealtekChip::Alc289 => &[],
+        RealtekChip::Alc290 => &[],
+        RealtekChip::Alc292 => &[],
+        RealtekChip::Alc293 => &[],
+        RealtekChip::Alc294 => ALC294_PARSE,
+        RealtekChip::Alc295 => &[],
+        RealtekChip::Alc298 => &[],
+        RealtekChip::Alc299 => &[],
+        RealtekChip::Alc300 => &[],
+        RealtekChip::Alc623 => &[],
+        RealtekChip::Alc700 => ALC700_PARSE,
+        RealtekChip::Alc701 => ALC700_PARSE,
+        RealtekChip::Alc703 => ALC700_PARSE,
+        RealtekChip::Alc711 => ALC700_PARSE,
+        RealtekChip::Alc3204 => &[],
+        RealtekChip::Alc3225 => &[],
+        RealtekChip::Alc3236 => &[],
+        RealtekChip::Alc3254 => &[],
+        RealtekChip::Alc3266 => &[],
+        RealtekChip::Alc3268 => &[],
+        RealtekChip::Alc3286 => &[],
+        RealtekChip::Alc3287 => &[],
     }
 }
 
@@ -907,8 +1022,17 @@ pub const fn quirk_count() -> usize {
 // The fixup also calls `hda_fixup_ideapad_acpi` (keyboard mute
 // LEDs via ACPI, `sound/hda/codecs/helpers/ideapad_hotkey_led.c`)
 // and chains `ALC287_FIXUP_YOGA9_14IAP7_BASS_SPK`, the coef verb
-// sequence below. The LED half is NOT ported: NARF has no ACPI
-// hotkey/LED machinery for it (remainder). The pin half is why
+// sequence below. The LED half is NOT ported (remainder, #776):
+// Linux's helper (PRE_PROBE, gated on subsystem vendor 0x17aa +
+// ACPI LHK2019/VPC2004 present) registers mute / mic-mute LED
+// class devices bound to the `audio-mute` / `mic-mute` triggers,
+// driven on the platform side by the Lenovo WMI hotkey-utilities
+// driver. NARF has the LED registry (`drivers/leds`), the ACPI
+// HID lookup (`narf_aml::find_device_by_hid`), and WMI hotkey
+// *event* decoding — but no `audio-mute` / `mic-mute` LED
+// trigger, no vmaster mute hook in the HDA path, and no Lenovo
+// WMI hotkey-utilities LED driver, so there is no sink for the
+// fixup half to drive. The pin half is why
 // the fixup exists at all: pin 0x17 (bass speakers) is wrongly
 // reported as unconnected (BIOS pin default 0x411111f0), so
 // without it the kernel configures speaker_outs=0 for the bass
@@ -957,45 +1081,45 @@ pub const QUIRK_YOGA9_BASS_SPK_SEQ: &[SeqVerb] = &[
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x41),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x0c),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x1a),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x0f),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x42),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x10),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x40),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x02),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x24),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x46),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x0c),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x2a),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x0f),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x46),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x10),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x44),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_COEF_INDEX | 0x26),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x02),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
-    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0x00),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
+    SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF),
     SeqVerb::new(COEF_NODE, crate::hda_codec::verb::SET_PROC_COEF | 0xb020),
 ];
 

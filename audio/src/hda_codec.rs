@@ -332,6 +332,39 @@ impl Codec {
         self.widgets.iter().find(|w| w.nid == nid)
     }
 
+    /// Linux `alc_get_hp_pin` (`sound/hda/codecs/realtek/realtek.c`):
+    /// the first headphone pin in the parsed pin config — the nid
+    /// the per-chip init hooks (`alc282_init`, `alc283_init`, ...)
+    /// sense and drive with their HP-pin tails. Linux's pin parser
+    /// (`sound/hda/common/auto_parser.c::snd_hda_parse_pin_defcfg`)
+    /// skips pins with no physical connection, so those never count;
+    /// pins with default device HP Out (0x2) land in `hp_pins`,
+    /// except sequence-0x0f ones, which are moved to the line-out
+    /// table — and `alc_get_hp_pin` then falls back to
+    /// `line_out_pins[0]` when `line_out_type == AC_JACK_HP_OUT`.
+    /// That fallback is the first HP-Out pin again on a
+    /// single-HP-jack machine (the whole ALC282/283 laptop class),
+    /// so this returns the first HP-Out pin of any sequence when no
+    /// non-0x0f one exists. Two deliberate deviations from Linux:
+    /// pins are scanned in widget (nid) order, not Linux's
+    /// (association, sequence) sort — the two agree whenever the
+    /// BIOS nids ascend with sequence, as on single-HP-jack
+    /// laptops — and when a genuine line-out coexists with a
+    /// sequence-0x0f HP pin, Linux's fallback may return the
+    /// line-out while this returns the HP pin.
+    pub fn hp_pin(&self) -> Option<u8> {
+        let hp_pins = self.widgets.iter().filter(|w| {
+            matches!(w.ty(), WidgetType::PinComplex)
+                && w.pin_config.is_some_and(|c| c.port_connectivity != 0x1)
+                && w.pin_config.is_some_and(|c| c.default_device == 0x2)
+        });
+        hp_pins
+            .clone()
+            .find(|w| w.pin_config.is_some_and(|c| c.sequence != 0x0f))
+            .or_else(|| hp_pins.clone().next())
+            .map(|w| w.nid)
+    }
+
     /// Graph-side pin-config override (Linux
     /// `snd_hda_codec_set_pincfg` — the value lives in the driver's
     /// pin cache, higher priority than the hardware's
