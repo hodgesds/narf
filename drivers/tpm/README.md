@@ -19,7 +19,17 @@ the follow-on lanes that compose it onto the canonical stack:
   ECC P-256/P-384), the PCR bank/selection model, and NV-index
   management. Its `pcr_extend` (multi-bank, `TPM_ST_SESSIONS`) was the
   reference encoding for the #937 fix; the canonical single-digest
-  builder now lives in `narf_tpm::commands`. Staged for #941/#944.
+  builder now lives in `narf_tpm::commands`. The #941 remainder is
+  complete here: `Quote` (delegating to the canonical codec —
+  `narf_tpm::commands::CommandBuilder::quote` — this layer encodes
+  nothing twice), `PCR_Event` / `PCR_Allocate`, `PolicyAuthorize`
+  (trial-session digest update per Part 3 §23.2.3; a non-trial
+  session's ticket cannot be validated without a hierarchy proof
+  value, so the fixture fails closed with `TPM_RC_POLICY`), and NV
+  completion — `NV_ReadPublic` (live attributes and the name over
+  them), `NV_Extend` / `NV_SetBits`, and the write / read / global
+  locks, enforced on every read and write path and cleared per the
+  STCLEAR rules on `Startup(TPM_SU_CLEAR)`. Staged for #941/#944.
 - **VFS bridges** (`devfs_bridge.rs`, `sysfs_bridge.rs`) — `/dev/tpm0`,
   `/dev/tpmrm0` and `/sys/class/tpm/tpm0/` implementations over an
   injected `TpmTransport`. Implemented and fixture-tested, instantiated
