@@ -105,6 +105,7 @@ members = [
     "drivers/input",
     "drivers/graphics",
     "drivers/platform",
+    "drivers/pwm-lpss",
     "drivers/soc/qcom",
     "input",
     "graphics",

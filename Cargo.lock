@@ -2066,6 +2066,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-pwm-lpss"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-pwm",
+ "narf-scheduler",
+]
+
+[[package]]
 name = "narf-drivers-qcom-soc"
 version = "0.0.0"
 dependencies = [
@@ -2756,6 +2772,7 @@ dependencies = [
  "narf-drivers-nvme",
  "narf-drivers-platform",
  "narf-drivers-psp",
+ "narf-drivers-pwm-lpss",
  "narf-drivers-serial",
  "narf-drivers-spi",
  "narf-drivers-storage",

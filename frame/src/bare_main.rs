@@ -3302,6 +3302,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_tpm::register_initcalls();
             narf_i3c::register_initcalls();
             narf_pwm::register_initcalls();
+            // Intel LPSS PWM controller (#1699): the first production
+            // `PwmDevice` implementor. Registers its PCI match entries
+            // at Stage::Subsys; the bus probe_all walk binds matched
+            // functions after this stage. DT-phandle registration of
+            // probed controllers waits on the #1700 registry (see the
+            // REBASE NOTE in narf-drivers-pwm-lpss).
+            narf_drivers_pwm_lpss::register_initcalls();
             narf_pmbus::register_initcalls();
             narf_spdm::register_initcalls();
             narf_scmi::register_initcalls();
