@@ -45,6 +45,7 @@
 pub mod block_bridge;
 pub mod card;
 pub mod cmd;
+pub mod pm;
 pub mod regs;
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -771,6 +772,13 @@ pub enum SlotAction {
 /// Called from the probe path (a card may already be inserted at
 /// boot) and from the card-poll task.
 pub fn poll_card_slot() {
+    // #839: never service the slot while the chip is powered down
+    // (system suspend or runtime gate) — BIPR reads on a powered-down
+    // chip are meaningless, and a removal/insertion is re-observed on
+    // the next ungate (resume re-checks card presence) instead.
+    if pm::is_powered_down() {
+        return;
+    }
     let action = {
         let mut g = RTSX.lock();
         match g.as_mut() {
@@ -794,6 +802,11 @@ pub fn spawn_card_poll_task() {
     narf_scheduler::spawn_stackful(async {
         loop {
             poll_card_slot();
+            // #839: idle-gate the reader when a card has sat unused
+            // past the autosuspend delay (only a Ready slot is gated;
+            // an empty slot stays powered so insertions keep being
+            // detected).
+            pm::try_idle_gate_at(narf_time::monotonic_ns());
             narf_time::sleep_cycles(narf_time::ns_to_cycles(500_000_000)).await;
         }
     });
@@ -833,6 +846,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
 
     *RTSX.lock() = Some(controller);
     PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
+    // #839: join the device_pm suspend/resume fan-out (idempotent on
+    // the name; handlers no-op before a controller exists).
+    pm::register();
 
     // A card may already be inserted at probe time (no card-detect
     // interrupt will fire for it — the same caveat Linux `rtsx_pci_init_hw`
@@ -844,8 +860,24 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
 /// Execute a closure with the global RTSX controller, returning `None`
 /// if the controller has not been probed.
 pub fn with_controller<R>(f: impl FnOnce(&mut RtsxController) -> R) -> Option<R> {
+    // #839: a system-suspended controller refuses new I/O; a transfer
+    // already past this check holds the RTSX lock the suspend handler
+    // waits on, and completes before the suspend proceeds.
+    if pm::is_system_suspended() {
+        return None;
+    }
     let mut g = RTSX.lock();
-    g.as_mut().map(f)
+    let ctrl = g.as_mut()?;
+    // #839: ungate under the lock — the idle monitor may have gated the
+    // controller after the suspend check; resume (re-init + re-identify
+    // + verify) before touching the hardware, and fail the I/O if the
+    // ungate fails.
+    if pm::is_runtime_gated() {
+        pm::resume_locked(ctrl).ok()?;
+    }
+    let r = f(ctrl);
+    pm::mark_busy();
+    Some(r)
 }
 
 /// Returns `true` if at least one RTSX controller has been probed.

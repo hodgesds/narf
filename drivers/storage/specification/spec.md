@@ -99,12 +99,31 @@ All driver code is derived strictly from the references below.
   (`sdhci0p<m>`) (#834). Register access runs through an
   `SdhciTransport` seam (BAR0 MMIO in production), so the
   identify → publish conversation is fixture-modelled end to end.
+  The driver registers `sdhci` with the `power` device_pm fan-out:
+  suspend refuses new I/O, drains the controller and cuts the SD
+  clock + card power (a busy DAT line aborts the suspend), resume
+  re-runs the bring-up hardware sequence and re-identifies the card,
+  revalidating CID + capacity + CCS before serving I/O again; a
+  mismatch keeps the controller suspended, and a card removed while
+  suspended unpublishes `sdhci0` instead of leaving a phantom.
+  After 5 s idle the monitor gates the card clock + power; the next
+  block I/O ungates synchronously (#839).
 - **RTSX** (`rtsx`): Realtek PCIe SD card reader — probe, card
   identify (real CID/CSD decoded via `sd_proto`), single-block
   CMD17 / CMD24 block I/O over the ping-pong buffer. Cards are
   published as `mmcblk0` with real CID sysfs identity and a
   partition scan (`mmcblk0p<m>`); card removal withdraws the
   partitions together with the parent (#834).
+  The driver registers `rtsx` with the `power` device_pm fan-out:
+  suspend powers the slot down (clock + card power off, SSC down,
+  BIER 0), resume re-inits the chip and re-identifies the card,
+  revalidating CID + capacity + capacity class before serving I/O
+  again; a mismatch keeps the controller suspended, and a card
+  removed while suspended unregisters `mmcblk0` (the poll task
+  registers whatever is inserted next). After 5 s idle the poll
+  task gates a `Ready` slot; the next block I/O ungates
+  synchronously. An empty slot is never gated, so insertions keep
+  being detected (#839).
 - **eMMC EXT_CSD** (`emmc`): clean-room JEDEC JESD84-B51 EXT_CSD
   register decoder. Parses revision, CARD_TYPE flags (HS_26 /
   HS_52 / HS200 / HS400 with 1V8 + 1V2 variants), bus width,

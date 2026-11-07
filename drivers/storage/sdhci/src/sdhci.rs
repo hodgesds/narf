@@ -368,8 +368,9 @@ impl Sdhci {
 
         // 8. Run the SD identification sequence.
         // SAFETY: `me.io` is the SDHCI register window set up above
-        // and `identify_sequence` runs exactly once here at
-        // bring-up, satisfying its single-call ownership precondition.
+        // and `identify_sequence` runs here at bring-up (its other
+        // call site is resume re-identification, #839), with no
+        // transfer in flight.
         let card = unsafe { me.identify_sequence() }?;
         *me.card.lock() = Some(card);
         Ok(me)
@@ -465,7 +466,8 @@ impl Sdhci {
     /// Run the SD identification sequence.
     ///
     /// # Safety
-    /// MMIO ownership; called only once at bring-up.
+    /// MMIO ownership; called once at bring-up and again on resume
+    /// re-identification (#839), with no transfer in flight.
     unsafe fn identify_sequence(&self) -> Result<SdCard, SdhciError> {
         // CMD0 (GO_IDLE_STATE) — no response.
         let _ = self.cmd(0, 0, RESP_NONE, false, 0, 0, 0)?;
@@ -723,6 +725,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Block.default_domain(),
     });
+    // #839: join the device_pm suspend/resume fan-out (idempotent
+    // on the name, so a re-probe re-registers the same handlers).
+    pm::register();
     Ok(())
 }
 
@@ -868,8 +873,23 @@ pub fn is_probed() -> bool {
 /// reentrant.
 pub fn with_controller<R>(f: impl FnOnce(&Sdhci) -> R) -> Option<R> {
     let ctrl = probed_sdhci()?;
+    // #839: a system-suspended controller refuses new I/O; a transfer
+    // already past this check holds the request gate the suspend
+    // handler waits on, and completes before the suspend proceeds.
+    if pm::is_system_suspended() {
+        return None;
+    }
     let _gate = ReqGate::acquire(&ctrl.req_gate);
-    Some(f(ctrl))
+    // #839: re-check under the gate — the idle monitor may have gated
+    // the controller after the suspend check; ungate (re-init +
+    // re-identify + verify) before touching the hardware, and fail
+    // the I/O if the ungate fails.
+    if pm::is_runtime_gated() {
+        pm::resume_locked(ctrl).ok()?;
+    }
+    let r = f(ctrl);
+    pm::mark_busy();
+    Some(r)
 }
 
 /// Test hook: install a controller built on a fixture
@@ -894,3 +914,8 @@ pub fn __reset_for_test() {
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod fixture_tests;
+
+/// Device power management: system suspend/resume + runtime idle
+/// gating (#839). The logic lives here so the data-path / init
+/// regions of this file stay untouched by the PM lane.
+pub mod pm;

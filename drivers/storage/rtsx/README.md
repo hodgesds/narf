@@ -19,4 +19,17 @@ over a register-level model of the chip and card.
 `BlockDeviceSync` and registers it in the block-device registry as
 `mmcblk0`. The crate is dual-build (built-in or loadable `.ko`).
 
+## Power management (#839)
+
+`src/rtsx/pm.rs` joins the `power` device_pm fan-out at probe:
+suspend powers the slot down (clock + card power off, SSC down,
+BIER 0); resume re-inits the chip and re-identifies the card,
+revalidating CID + capacity + capacity class before serving I/O
+again (a mismatch keeps the controller suspended; a card removed
+while suspended unregisters `mmcblk0`, and the poll task registers
+whatever is inserted next). After 5 s idle the card-poll task gates
+a `Ready` slot; the next block I/O ungates synchronously. An empty
+slot is never gated, so insertions keep being detected.
+Fixture-validated end to end in `pm.rs`.
+
 - Spec: [`../specification/spec.md`](../specification/spec.md)
