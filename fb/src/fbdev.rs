@@ -401,7 +401,15 @@ impl FileOps for DevFb0 {
                 // commit did; the other scanouts keep the no-op.
                 #[cfg(feature = "intel")]
                 narf_drivers_gpu::intel_gpu::fbdev_dpms(on);
-                #[cfg(not(feature = "intel"))]
+                // The AMD console's panel backlight goes off or on
+                // through the eDP sequencer (#1690): blank saves the
+                // last programmed level and fades the PWM; unblank
+                // relights at the saved level. Same return-0-whatever
+                // contract as the Intel side; the CRTC / timing-blank
+                // half has no AMD caller yet.
+                #[cfg(feature = "amdgpu")]
+                narf_drivers_gpu::amdgpu_panel_backlight::fbdev_dpms(on);
+                #[cfg(not(any(feature = "intel", feature = "amdgpu")))]
                 let _ = on;
                 Ok(0)
             }

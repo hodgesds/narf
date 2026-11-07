@@ -39,6 +39,16 @@
 //! `last_pwm_level` cache. A resume with no saved level programs
 //! nothing and leaves the panel at its firmware default.
 //!
+//! ## DPMS (#1690)
+//!
+//! The same state is driven from the `FBIOBLANK` ioctl via
+//! [`fbdev_dpms`]: blank saves the last programmed level and
+//! fades the panel (`BacklightPm::dpms_blank`), unblank relights
+//! at the saved level (`BacklightPm::dpms_unblank`). The fade
+//! goes through the sequencer when it is lit, and writes PWM 0
+//! directly when the panel is lit outside the sequencer (a fresh
+//! boot — `set_brightness` programs BL_PWM without sequencing).
+//!
 //! References (GPL-2.0-or-later):
 //! - `drivers/gpu/drm/amd/amdgpu/amdgpu_backlight.c` — the DRM
 //!   backlight device amdgpu registers for the internal panel.
@@ -223,6 +233,59 @@ impl BacklightPm {
         }
         r
     }
+
+    /// DPMS blank: save the device's last programmed level (if any)
+    /// and fade the panel. This is the DPMS half of the suspend
+    /// transition, driven from the `FBIOBLANK` ioctl via
+    /// [`fbdev_dpms`] rather than from system suspend.
+    ///
+    /// Two fades, by sequencer state:
+    /// - `BacklightOn` — the panel was lit through the sequencer
+    ///   (a previous suspend/resume cycle left it there): fade
+    ///   via `power_off_backlight` (PWM → 0, T7, BL_EN off).
+    /// - Anything else with a saved level — the panel is lit
+    ///   outside the sequencer: `set_brightness` programs BL_PWM
+    ///   directly without sequencing, so the probe-installed
+    ///   sequencer sits in `Off` on a fresh boot while the panel
+    ///   is lit. A sequencer-only fade would be a no-op there,
+    ///   so blank writes PWM 0 directly: the PWM write is the
+    ///   only host-owned transition (the rails are firmware
+    ///   no-ops), and the sequencer state is left alone — the
+    ///   unblank's resume-from-`Off` full chain re-lights it.
+    /// No saved level → nothing is lit that the host owns, and
+    /// blank is a no-op.
+    ///
+    /// The save is a blank-time snapshot: a brightness change
+    /// made while DPMS-blanked is overwritten by the unblank
+    /// relight at the blank-time level. (The suspend save cannot
+    /// go stale this way — the machine is asleep.)
+    pub fn dpms_blank<H: EdpPanelHw>(
+        &mut self,
+        current: Option<u32>,
+        sequencer: &mut EdpPanelSequencer,
+        hw: &mut H,
+    ) {
+        self.saved_pct = current;
+        if sequencer.state == EdpPanelState::BacklightOn {
+            let _ = sequencer.power_off_backlight(hw);
+        } else if current.is_some() {
+            hw.set_pwm(0);
+        }
+    }
+
+    /// DPMS unblank: relight through the sequencer at the level
+    /// the blank saved. No saved level → program nothing (the
+    /// panel was never blanked by this core, or was already lit).
+    /// A successful relight clears the save — one blank pairs
+    /// with one unblank; a failed relight keeps it so the next
+    /// unblank retries instead of silently dropping the level.
+    pub fn dpms_unblank<H: EdpPanelHw>(
+        &mut self,
+        sequencer: &mut EdpPanelSequencer,
+        hw: &mut H,
+    ) -> Result<(), PanelPowerError> {
+        self.resume(sequencer, hw)
+    }
 }
 
 /// Probe-installed PM state: the registered panel device, the one
@@ -359,6 +422,52 @@ fn amdgpu_bl_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     match state.pm.resume(&mut state.sequencer, &mut hw) {
         Ok(()) if hw.pwm_ok() => Ok(()),
         _ => Err(DeviceSuspendError::DriverError),
+    }
+}
+
+// ── DPMS hookup (#1690) ──────────────────────────────────────────
+
+/// `FBIOBLANK` on the AMD console: `drm_fb_helper_blank` →
+/// `drm_client_modeset_dpms` (Linux b90c984d), `on` being
+/// `mode == DRM_MODE_DPMS_ON` — the same entry point the Intel
+/// `fbdev_dpms` serves, dispatched from `fb::fbdev`'s `FBIOBLANK`
+/// handler. Only the backlight half is wired: blank saves the
+/// panel's last programmed level and fades it through the eDP
+/// sequencer; unblank relights at the saved level. The CRTC /
+/// timing-blank half has no AMD caller yet (the Navi22
+/// `link_set_dpms_off` / `link_set_dpms_on` equivalents cover
+/// HDMI and external DP SST only, never eDP) — this hookup does
+/// not invent one.
+///
+/// Infallible by design, like the suspend side: the fbdev ioctl
+/// returns 0 whatever the transition did (the Intel precedent),
+/// and a failed fade must not fail a blank. A failed unblank
+/// keeps the saved level (see `BacklightPm::dpms_unblank`), so
+/// the next unblank retries.
+///
+/// Interactions, documented not solved:
+/// - A brightness change made while DPMS-blanked is overwritten
+///   by the unblank relight at the blank-time level.
+/// - A DPMS blank active across a suspend/resume cycle is not
+///   preserved: resume relights at the saved level per the #1691
+///   semantics. Preserving the blank across S3 is a follow-up.
+/// - The unblank's full chain from `Off` busy-waits the T1–T5
+///   delays (~315 ms at defaults) on the calibrated TSC, the
+///   same shape as the PM resume path.
+pub fn fbdev_dpms(on: bool) {
+    let mut guard = BL_PM_STATE.lock();
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
+    if !crate::amdgpu::is_probed() {
+        return;
+    }
+    let mut hw = AmdgpuEdpPanelHw::new();
+    if on {
+        let _ = state.pm.dpms_unblank(&mut state.sequencer, &mut hw);
+    } else {
+        let current = state.panel.as_ref().and_then(|d| d.last_programmed_level());
+        state.pm.dpms_blank(current, &mut state.sequencer, &mut hw);
     }
 }
 
@@ -668,4 +777,189 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_amd_bl_pm_fanout_registers_and_runs);
+
+    // ── DPMS hookup (#1690) ──────────────────────────────────────
+
+    fn smoke_amd_bl_dpms_blank_fades_and_unblank_relights() -> TestResult {
+        // Sequencer-lit panel (a previous suspend/resume cycle
+        // left it BacklightOn): blank fades via the sequencer,
+        // unblank relights at the saved level.
+        let level = user_level_for_percent(55);
+        let mut seq = EdpPanelSequencer::new(EdpPowerSeq::default());
+        let mut hw = FakeHw::new();
+        let r = light_panel(&mut seq, &mut hw, level);
+        if r != TestResult::Pass {
+            return r;
+        }
+        hw.log.clear();
+        let mut pm = BacklightPm::new();
+        pm.dpms_blank(Some(55), &mut seq, &mut hw);
+        if pm.saved() != Some(55) {
+            return TestResult::Fail("DPMS blank did not save the level");
+        }
+        if hw.pwm_writes() != alloc::vec![0] {
+            return TestResult::Fail("DPMS blank did not fade PWM to 0");
+        }
+        if seq.state != EdpPanelState::BacklightOff {
+            return TestResult::Fail("DPMS blank did not leave BacklightOff");
+        }
+        // The sequencer fade ran its T7 + BL_EN half.
+        if !hw.log.iter().any(|e| *e == ("bl_en", 0)) {
+            return TestResult::Fail("DPMS blank skipped the BL_EN step");
+        }
+        hw.log.clear();
+        if pm.dpms_unblank(&mut seq, &mut hw).is_err() {
+            return TestResult::Fail("DPMS unblank failed");
+        }
+        if seq.state != EdpPanelState::BacklightOn {
+            return TestResult::Fail("DPMS unblank did not relight");
+        }
+        if hw.pwm_writes() != alloc::vec![level] {
+            return TestResult::Fail("DPMS unblank did not restore the saved level");
+        }
+        if pm.saved().is_some() {
+            return TestResult::Fail("successful unblank must clear the saved level");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_amd_bl_dpms_blank_fades_and_unblank_relights
+    );
+
+    fn smoke_amd_bl_dpms_blank_without_saved_level_is_noop() -> TestResult {
+        // Never-programmed panel, sequencer Off: blank saves
+        // nothing and touches nothing; unblank is a no-op too.
+        let mut seq = EdpPanelSequencer::new(EdpPowerSeq::default());
+        let mut hw = FakeHw::new();
+        let mut pm = BacklightPm::new();
+        pm.dpms_blank(None, &mut seq, &mut hw);
+        if pm.saved().is_some() {
+            return TestResult::Fail("DPMS blank with no level must save nothing");
+        }
+        if !hw.log.is_empty() {
+            return TestResult::Fail("DPMS blank with no level touched hardware");
+        }
+        if seq.state != EdpPanelState::Off {
+            return TestResult::Fail("DPMS blank with no level moved the sequencer");
+        }
+        if pm.dpms_unblank(&mut seq, &mut hw).is_err() {
+            return TestResult::Fail("DPMS unblank with no save must succeed");
+        }
+        if !hw.log.is_empty() {
+            return TestResult::Fail("DPMS unblank with no save touched hardware");
+        }
+        if seq.state != EdpPanelState::Off {
+            return TestResult::Fail("DPMS unblank with no save moved the sequencer");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_amd_bl_dpms_blank_without_saved_level_is_noop
+    );
+
+    fn smoke_amd_bl_dpms_repeated_blank_unblank_cycles() -> TestResult {
+        // Three blank/unblank cycles at 40%: every blank saves
+        // and fades, every unblank relights at the saved level,
+        // and the state never wedges.
+        let level = user_level_for_percent(40);
+        let mut seq = EdpPanelSequencer::new(EdpPowerSeq::default());
+        let mut hw = FakeHw::new();
+        let r = light_panel(&mut seq, &mut hw, level);
+        if r != TestResult::Pass {
+            return r;
+        }
+        let mut pm = BacklightPm::new();
+        for _ in 0..3 {
+            hw.log.clear();
+            pm.dpms_blank(Some(40), &mut seq, &mut hw);
+            if pm.saved() != Some(40) {
+                return TestResult::Fail("cycle blank lost the level");
+            }
+            if hw.pwm_writes() != alloc::vec![0] {
+                return TestResult::Fail("cycle blank did not fade");
+            }
+            if seq.state != EdpPanelState::BacklightOff {
+                return TestResult::Fail("cycle blank left a bad state");
+            }
+            hw.log.clear();
+            if pm.dpms_unblank(&mut seq, &mut hw).is_err() {
+                return TestResult::Fail("cycle unblank failed");
+            }
+            if seq.state != EdpPanelState::BacklightOn {
+                return TestResult::Fail("cycle unblank did not relight");
+            }
+            if hw.pwm_writes() != alloc::vec![level] {
+                return TestResult::Fail("cycle unblank did not restore the level");
+            }
+            if pm.saved().is_some() {
+                return TestResult::Fail("cycle unblank did not clear the save");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_amd_bl_dpms_repeated_blank_unblank_cycles
+    );
+
+    fn smoke_amd_bl_dpms_blank_fades_unsequenced_panel() -> TestResult {
+        // The fresh-boot production shape: the panel is lit via
+        // `set_brightness` (BL_PWM programmed directly) while the
+        // probe-installed sequencer still sits in `Off` — nothing
+        // ever sequenced it. A sequencer-only fade would be a
+        // no-op, so blank writes PWM 0 directly and leaves the
+        // sequencer alone; unblank then runs the full chain.
+        let level = user_level_for_percent(55);
+        let mut seq = EdpPanelSequencer::new(EdpPowerSeq::default());
+        let mut hw = FakeHw::new();
+        let mut pm = BacklightPm::new();
+        pm.dpms_blank(Some(55), &mut seq, &mut hw);
+        if pm.saved() != Some(55) {
+            return TestResult::Fail("unsequenced blank did not save the level");
+        }
+        if hw.pwm_writes() != alloc::vec![0] {
+            return TestResult::Fail("unsequenced blank did not fade PWM to 0");
+        }
+        // Direct PWM write only: no sequencer delay / BL_EN events.
+        if hw.log.iter().any(|e| e.0 == "delay" || e.0 == "bl_en") {
+            return TestResult::Fail("unsequenced blank ran sequencer steps");
+        }
+        if seq.state != EdpPanelState::Off {
+            return TestResult::Fail("unsequenced blank moved the sequencer");
+        }
+        hw.log.clear();
+        if pm.dpms_unblank(&mut seq, &mut hw).is_err() {
+            return TestResult::Fail("unblank after unsequenced blank failed");
+        }
+        if seq.state != EdpPanelState::BacklightOn {
+            return TestResult::Fail("unblank after unsequenced blank did not relight");
+        }
+        if hw.pwm_writes() != alloc::vec![level] {
+            return TestResult::Fail("unblank did not restore the saved level");
+        }
+        // The full power_on_video → power_on_backlight chain ran.
+        if !hw.log.iter().any(|e| *e == ("vdd", 1)) {
+            return TestResult::Fail("unblank skipped the VDD step of the full chain");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_amd_bl_dpms_blank_fades_unsequenced_panel
+    );
+
+    fn smoke_amd_bl_dpms_fbdev_entry_is_noop_unprobed() -> TestResult {
+        // The production `fbdev_dpms` entry with no panel
+        // installed (unprobed machine): both directions return
+        // without touching anything — no panic, no state.
+        super::fbdev_dpms(false);
+        super::fbdev_dpms(true);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_amd_bl_dpms_fbdev_entry_is_noop_unprobed
+    );
 }

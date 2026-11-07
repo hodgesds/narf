@@ -1,6 +1,26 @@
 # drivers/gpu/amdgpu — Specification
 
-> Status: **v0.11** (Stage 10 — DCN HUBP/OPP/OTG modeset codec).
+> Status: **v0.12** (Stage 10 — DCN HUBP/OPP/OTG modeset codec).
+>
+> ### v0.12 changes vs v0.11
+>
+> - **Panel backlight DPMS hookup** (`amdgpu_panel_backlight`,
+>   #1690 DPMS half): `FBIOBLANK` now dispatches to the AMD
+>   console as well as the Intel one — `fbdev_dpms(on)` drives
+>   the probe-installed `BacklightPm` state. Blank saves the
+>   panel's last programmed level and fades it: via the eDP
+>   sequencer's `power_off_backlight` when the sequencer is
+>   lit, or with a direct PWM-0 write when the panel is lit
+>   outside the sequencer (a fresh boot — `set_brightness`
+>   programs BL_PWM without sequencing, so a sequencer-only
+>   fade would be a no-op there). Unblank relights through
+>   the sequencer at the saved level (the `BacklightPm::resume`
+>   transition, including the full chain from `Off`). No saved
+>   level → both directions program nothing. The CRTC /
+>   timing-blank half has no AMD caller — the Navi22
+>   `link_set_dpms_off` / `link_set_dpms_on` equivalents cover
+>   HDMI and external DP SST only, never eDP — and the VDD/BL_EN
+>   rail drive stays the open half of #1690.
 >
 > ### v0.11 changes vs v0.10
 >
@@ -428,6 +448,15 @@ impl AmdGpu {
 /// `BacklightOn`). No saved level → resume programs nothing.
 /// `AmdgpuEdpPanelHw` is the production `EdpPanelHw`: real PWM,
 /// firmware-owned VDD/BL_EN rails (modeled, not driven).
+///
+/// Panel backlight DPMS (`amdgpu_panel_backlight`, #1690 DPMS
+/// half). `fbdev_dpms(on)` — dispatched from `fb::fbdev`'s
+/// `FBIOBLANK` handler — drives the same `BacklightPm` state:
+/// blank (`BacklightPm::dpms_blank`) saves the last programmed
+/// level and fades (sequencer `power_off_backlight` when lit,
+/// direct PWM-0 write when lit outside the sequencer); unblank
+/// (`BacklightPm::dpms_unblank`) relights at the saved level.
+/// No saved level → both directions program nothing.
 ```
 
 ## 8. Out of scope (Stage 3+)
