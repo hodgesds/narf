@@ -8244,3 +8244,644 @@ mod alps_smokes {
     }
     kernel_test_in!("drivers/input/alps", smoke_i8042_alps_feed_v2_interleaved);
 }
+// ── Synaptics absolute-mode enablement (#1675) ─────────────────────────────
+//
+// Fixtures built from the Synaptics/PS/2 spec itself (Linux
+// `drivers/input/mouse/synaptics.h` / `synaptics.c` /
+// `psmouse-base.c`, Synaptics TouchPad Interfacing Guide 2nd ed.),
+// never from impl constants: the fake transport records the exact
+// wire bytes, and the packet vectors come from the Guide's
+// Fig 3-18/3-20 layouts checked against Linux's decode formulas.
+
+/// Fake PS/2 transport: records every sent byte, replays canned
+/// replies. `send` returns `false` exactly once, on the Nth send
+/// (`fail_at`, 1-based; `None` = never), so a test can fail one
+/// command byte — e.g. the mode-set commit — and pin the driver's
+/// recovery behaviour.
+struct FakePs2 {
+    sent: alloc::vec::Vec<u8>,
+    replies: alloc::collections::VecDeque<u8>,
+    fail_at: Option<usize>,
+}
+
+impl FakePs2 {
+    fn new(replies: &[u8]) -> Self {
+        Self {
+            sent: alloc::vec::Vec::new(),
+            replies: replies.iter().copied().collect(),
+            fail_at: None,
+        }
+    }
+
+    fn failing(replies: &[u8], fail_at: usize) -> Self {
+        Self {
+            sent: alloc::vec::Vec::new(),
+            replies: replies.iter().copied().collect(),
+            fail_at: Some(fail_at),
+        }
+    }
+}
+
+impl crate::psmouse::Ps2Transport for FakePs2 {
+    fn send(&mut self, byte: u8) -> bool {
+        self.sent.push(byte);
+        Some(self.sent.len()) != self.fail_at
+    }
+
+    fn recv(&mut self) -> Option<u8> {
+        self.replies.pop_front()
+    }
+}
+
+/// One sliced command + GETINFO on the wire, spelled out
+/// literally (Linux `psmouse_sliced_command`: `0xE6`, then `0xE8`
+/// + each 2-bit slice, most significant first; the query number
+/// selects the response).
+fn syn_query_wire(query: u8) -> [u8; 10] {
+    [
+        0xE6,
+        0xE8,
+        (query >> 6) & 0x03,
+        0xE8,
+        (query >> 4) & 0x03,
+        0xE8,
+        (query >> 2) & 0x03,
+        0xE8,
+        query & 0x03,
+        0xE9,
+    ]
+}
+
+fn smoke_synaptics_query_mode_wire_sequence() -> TestResult {
+    use crate::psmouse;
+    // Replies, in order: detect GETINFO, identify, model,
+    // firmware, board (modes), capabilities, ext caps, ext caps
+    // 0x0c, resolution.
+    let replies = [
+        0x05, 0x47, 0x04, // detect: byte 1 == 0x47 → Synaptics
+        0x05, 0x47, 0x04, // identify: minor 5, major 4
+        0x01, 0x00, 0x80, // model: sensor 1, NEWABS (bit 7)
+        0x00, 0x07, 0x05, // firmware 0x000705
+        0x3B, 0x47, 0x00, // modes: board id 0xE47
+        0xC0, 0x47, 0x00, // caps: extended, 4 ext requests, submodel 0x47
+        0x00, 0x00, 0x00, // ext caps: none
+        0x00, 0x00, 0x00, // ext caps 0x0c: none
+        85, 0x80, 94, // resolution: 85 x 94 units/mm
+    ];
+    let mut fake = FakePs2::new(&replies);
+    let hw = match psmouse::synaptics_enable_absolute(&mut fake, psmouse::SYNAPTICS_RATE) {
+        Ok(hw) => hw,
+        Err(_e) => return TestResult::Fail("enablement must succeed on a Synaptics pad"),
+    };
+    // Queried hardware, decoded per Linux `synaptics_query_hardware`.
+    if hw.identity != 0x054704 || hw.model_id != 0x010080 || hw.firmware_id != 0x000705 {
+        return TestResult::Fail("identity/model/firmware decode wrong");
+    }
+    if hw.board_id != 0xE47 || hw.capabilities != 0xC04700 {
+        return TestResult::Fail("board/capabilities decode wrong");
+    }
+    if hw.x_res != 85 || hw.y_res != 94 || !hw.newabs {
+        return TestResult::Fail("resolution/newabs decode wrong");
+    }
+    // Mode byte (Linux `synaptics_set_mode`): ABSOLUTE | HIGH_RATE
+    // (rate 100 >= 80) | W_MODE (extended caps) | DISABLE_GESTURE
+    // (major 4 >= 4) = 0xC5.
+    if hw.mode != 0xC5 {
+        return TestResult::Fail("mode byte must be 0xC5 (abs+rate+W+disgest)");
+    }
+    // The slicing itself, pinned against the Guide §3.5.2 worked
+    // example: $C1 encodes as $E8 $03 $E8 $00 $E8 $00 $E8 $01
+    // (($03 × 64) + ($00 × 16) + ($00 × 4) + $01 = $C1).
+    if syn_query_wire(0xC1) != [0xE6, 0xE8, 0x03, 0xE8, 0x00, 0xE8, 0x00, 0xE8, 0x01, 0xE9] {
+        return TestResult::Fail("sliced-command encoding must match Guide §3.5.2");
+    }
+    // Exact wire: detect, then one sliced query + GETINFO per
+    // query (identify 0x00, model 0x03, firmware 0x0a, modes
+    // 0x01, caps 0x02, ext caps 0x09, ext caps 0x0c, resolution
+    // 0x08), then the mode set (sliced 0xC5 + SETRATE 0x14).
+    let mut want = alloc::vec::Vec::new();
+    for _ in 0..4 {
+        want.extend_from_slice(&[0xE8, 0x00]);
+    }
+    want.push(0xE9);
+    for q in [0x00, 0x03, 0x0a, 0x01, 0x02, 0x09, 0x0c, 0x08] {
+        want.extend_from_slice(&syn_query_wire(q));
+    }
+    want.extend_from_slice(&syn_query_wire(0xC5)[..9]);
+    want.extend_from_slice(&[0xF3, 0x14]);
+    if fake.sent != want {
+        return TestResult::Fail("query/mode wire sequence wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_query_mode_wire_sequence);
+
+fn smoke_synaptics_mode_byte_table() -> TestResult {
+    use crate::psmouse::{synaptics_mode_byte, SynapticsHw};
+    // Extended caps + major >= 4: 0x80 | 0x40 | 0x01 | 0x04.
+    let hw = SynapticsHw {
+        identity: 0x054704,
+        capabilities: 0xC04700,
+        ..SynapticsHw::default()
+    };
+    if synaptics_mode_byte(&hw, 100) != 0xC5 {
+        return TestResult::Fail("ext + major>=4 + rate 100 must be 0xC5");
+    }
+    // Extended caps + major 3 (no gesture bit): Guide Fig 2-15 $C1.
+    let hw = SynapticsHw {
+        identity: 0x054703,
+        capabilities: 0xC04700,
+        ..SynapticsHw::default()
+    };
+    if synaptics_mode_byte(&hw, 100) != 0xC1 {
+        return TestResult::Fail("ext + major 3 + rate 100 must be 0xC1");
+    }
+    // No extended caps + major >= 4: 0x80 | 0x40 | 0x04.
+    let hw = SynapticsHw {
+        identity: 0x054704,
+        capabilities: 0,
+        ..SynapticsHw::default()
+    };
+    if synaptics_mode_byte(&hw, 100) != 0xC4 {
+        return TestResult::Fail("no-ext + major>=4 + rate 100 must be 0xC4");
+    }
+    // No extended caps + major 3: Guide Fig 2-15 $C0.
+    let hw = SynapticsHw {
+        identity: 0x054703,
+        capabilities: 0,
+        ..SynapticsHw::default()
+    };
+    if synaptics_mode_byte(&hw, 100) != 0xC0 {
+        return TestResult::Fail("no-ext + major 3 + rate 100 must be 0xC0");
+    }
+    // Low rate drops HIGH_RATE even with extended caps + major >= 4.
+    let hw = SynapticsHw {
+        identity: 0x054704,
+        capabilities: 0xC04700,
+        ..SynapticsHw::default()
+    };
+    if synaptics_mode_byte(&hw, 40) != 0x85 {
+        return TestResult::Fail("rate 40 must drop HIGH_RATE (0x85)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_mode_byte_table);
+
+fn smoke_synaptics_decode_newabs_oldabs() -> TestResult {
+    use crate::psmouse::{decode_synaptics_newabs, decode_synaptics_oldabs, synaptics_invert_y};
+    // NEWABS vector (Guide Fig 3-18 / Linux NEWABS branch):
+    // [0x81,0x73,50,0xC4,0xE8,0xD0] → x=1000, y=2000, z=50,
+    // w=1, left. Y inverts to 5856-2000 = 3856.
+    let s = decode_synaptics_newabs(&[0x81, 0x73, 50, 0xC4, 0xE8, 0xD0]);
+    if s.x != 1000 || s.y != 2000 || s.z != 50 || s.w != 1 || !s.left || s.right {
+        return TestResult::Fail("NEWABS decode wrong");
+    }
+    if synaptics_invert_y(s.y) != 3856 {
+        return TestResult::Fail("Y inversion must be 5856-y");
+    }
+    // OLDABS vector (Guide Fig 3-20 / Linux OLDABS branch):
+    // [0xC5,0x03,0xE8,0xB2,0x07,0xD0] → x=1000, y=2000, z=50,
+    // w=2, left.
+    let s = decode_synaptics_oldabs(&[0xC5, 0x03, 0xE8, 0xB2, 0x07, 0xD0]);
+    if s.x != 1000 || s.y != 2000 || s.z != 50 || s.w != 2 || !s.left || s.right {
+        return TestResult::Fail("OLDABS decode wrong");
+    }
+    // Wrap-around (Linux `X_MAX_POSITIVE` 8176): exactly at the
+    // limit clamps to the axis maximum (6143); above it the value
+    // is a truncated negative (8184 → -8).
+    let s = decode_synaptics_newabs(&[0x80, 0x0F, 50, 0xD0, 0xF0, 0x00]);
+    if s.x != 6143 {
+        return TestResult::Fail("x == 8176 must clamp to XMAX 6143");
+    }
+    let s = decode_synaptics_newabs(&[0x80, 0x0F, 50, 0xD0, 0xF8, 0x00]);
+    if s.x != -8 {
+        return TestResult::Fail("x == 8184 must wrap to -8");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_decode_newabs_oldabs);
+
+fn smoke_synaptics_validate_bytes() -> TestResult {
+    use crate::psmouse::{synaptics_validate_byte, SynapticsPktType};
+    let newabs = [0x81u8, 0x73, 50, 0xC4, 0xE8, 0xD0];
+    let oldabs = [0xC5u8, 0x03, 0xE8, 0xB2, 0x07, 0xD0];
+    for i in 0..5 {
+        if !synaptics_validate_byte(&newabs, i, SynapticsPktType::NewAbsStrict) {
+            return TestResult::Fail("NEWABS vector must pass strict validation");
+        }
+        if !synaptics_validate_byte(&newabs, i, SynapticsPktType::NewAbsRelaxed) {
+            return TestResult::Fail("NEWABS vector must pass relaxed validation");
+        }
+        if !synaptics_validate_byte(&oldabs, i, SynapticsPktType::OldAbs) {
+            return TestResult::Fail("OLDABS vector must pass OLDABS validation");
+        }
+    }
+    // Byte 5 is never validated; a NEWABS byte 0 fails OLDABS.
+    if synaptics_validate_byte(&newabs, 5, SynapticsPktType::NewAbsStrict) {
+        return TestResult::Fail("idx 5 must not validate");
+    }
+    if synaptics_validate_byte(&newabs, 0, SynapticsPktType::OldAbs) {
+        return TestResult::Fail("NEWABS byte 0 must fail OLDABS validation");
+    }
+    // 0x88 passes relaxed (0x88 & 0xC0 == 0x80) but fails strict
+    // (0x88 & 0xC8 == 0x88): the strict/relaxed split.
+    let relaxed_only = [0x88u8, 0x73, 50, 0xC8, 0xE8, 0xD0];
+    if !synaptics_validate_byte(&relaxed_only, 0, SynapticsPktType::NewAbsRelaxed) {
+        return TestResult::Fail("0x88 must pass relaxed validation");
+    }
+    if synaptics_validate_byte(&relaxed_only, 0, SynapticsPktType::NewAbsStrict) {
+        return TestResult::Fail("0x88 must fail strict validation");
+    }
+    if !synaptics_validate_byte(&relaxed_only, 3, SynapticsPktType::NewAbsRelaxed) {
+        return TestResult::Fail("0xC8 must pass relaxed validation");
+    }
+    if synaptics_validate_byte(&relaxed_only, 3, SynapticsPktType::NewAbsStrict) {
+        return TestResult::Fail("0xC8 must fail strict validation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_validate_bytes);
+
+fn smoke_synaptics_query_failure_falls_back() -> TestResult {
+    use crate::i8042_mouse;
+    use crate::psmouse::{synaptics_enable_absolute, SynapticsEnableError, SYNAPTICS_RATE};
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, InputEvent};
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+
+    // The detect GETINFO answers "not Synaptics" (byte 1 != 0x47):
+    // enablement fails at Detect and sends nothing past the knock.
+    let mut fake = FakePs2::new(&[0x00, 0x00, 0x00]);
+    match synaptics_enable_absolute(&mut fake, SYNAPTICS_RATE) {
+        Err(SynapticsEnableError::Detect) => {}
+        _ => return TestResult::Fail("non-Synaptics detect must fail with Detect"),
+    }
+    let mut want = alloc::vec::Vec::new();
+    for _ in 0..4 {
+        want.extend_from_slice(&[0xE8, 0x00]);
+    }
+    want.push(0xE9);
+    if fake.sent != want {
+        return TestResult::Fail("failed detect must send only the knock");
+    }
+    // The pad stays a 3-byte relative mouse: a standard packet
+    // still decodes through the IRQ-path feed.
+    i8042_mouse::feed_byte_for_test(0x09);
+    i8042_mouse::feed_byte_for_test(5);
+    i8042_mouse::feed_byte_for_test(3);
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) if p.dx == 5 && p.dy == -3 => TestResult::Pass,
+        _ => TestResult::Fail("relative fallback packet must still decode"),
+    }
+}
+kernel_test_in!("drivers/input", smoke_synaptics_query_failure_falls_back);
+
+fn smoke_synaptics_mode_set_failure_reasserts_relative() -> TestResult {
+    use crate::psmouse::{synaptics_enable_absolute, SynapticsEnableError, SYNAPTICS_RATE};
+    // Same replies as the success fixture.
+    let replies = [
+        0x05, 0x47, 0x04, 0x05, 0x47, 0x04, 0x01, 0x00, 0x80, 0x00, 0x07, 0x05, 0x3B, 0x47, 0x00,
+        0xC0, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 85, 0x80, 94,
+    ];
+    // 89 sends precede the mode set (9 detect + 8x10 queries);
+    // fail the 100th send — the 0x14 commit byte of the mode set.
+    // The re-assert afterwards must complete (only that one send
+    // fails), so the pad ends back in relative mode.
+    let mut fake = FakePs2::failing(&replies, 100);
+    match synaptics_enable_absolute(&mut fake, SYNAPTICS_RATE) {
+        Err(SynapticsEnableError::ModeSet) => {}
+        _ => return TestResult::Fail("failed mode commit must fail with ModeSet"),
+    }
+    // 89 pre-mode sends + 11 mode-set sends + 11 best-effort
+    // mode-0 re-assert sends; the tail must be the relative
+    // mode-0 sequence (sliced 0x00 + SETRATE 0x14).
+    if fake.sent.len() != 111 {
+        return TestResult::Fail("mode-set failure must send 111 bytes");
+    }
+    let tail = &fake.sent[100..];
+    let mut want = alloc::vec::Vec::new();
+    want.extend_from_slice(&syn_query_wire(0x00)[..9]);
+    want.extend_from_slice(&[0xF3, 0x14]);
+    if tail != want.as_slice() {
+        return TestResult::Fail("mode-set failure must re-assert mode 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_synaptics_mode_set_failure_reasserts_relative
+);
+
+/// Absolute-mode evdev caps for the Synaptics IRQ fixtures
+/// (mirrors the caps `i8042_mouse::init` registers).
+fn synaptics_test_caps() -> narf_input::evdev::DeviceCaps {
+    use crate::psmouse;
+    use narf_input::{
+        evdev::{bus, key, prop, DeviceCaps, InputId},
+        AxisInfo,
+    };
+    let mut caps = DeviceCaps::new();
+    caps.set_identity(
+        "PS/2 Synaptics TouchPad",
+        "isa0060/serio1/input0",
+        "",
+        InputId::new(bus::I8042, 0x0002, 0x0001, 0),
+    );
+    caps.add_prop(prop::POINTER);
+    caps.add_abs_info(
+        narf_input::abs::ABS_X,
+        AxisInfo {
+            min: psmouse::SYN_X_MIN_NOMINAL,
+            max: psmouse::SYN_X_MAX_NOMINAL,
+            fuzz: 0,
+            flat: 0,
+            res: 0,
+        },
+    );
+    caps.add_abs_info(
+        narf_input::abs::ABS_Y,
+        AxisInfo {
+            min: psmouse::SYN_Y_MIN_NOMINAL,
+            max: psmouse::SYN_Y_MAX_NOMINAL,
+            fuzz: 0,
+            flat: 0,
+            res: 0,
+        },
+    );
+    caps.add_abs_info(
+        narf_input::abs::ABS_PRESSURE,
+        AxisInfo {
+            min: 0,
+            max: 255,
+            fuzz: 0,
+            flat: 0,
+            res: 0,
+        },
+    );
+    caps.add_key(key::BTN_LEFT);
+    caps.add_key(key::BTN_RIGHT);
+    caps.add_key(key::BTN_TOUCH);
+    caps
+}
+
+/// Register an evdev node for the Synaptics IRQ fixtures and point
+/// the IRQ-path dispatch at it. Returns `(device id, node, reader)`.
+fn synaptics_attach_evdev_for_test() -> (
+    narf_input::evdev::DeviceId,
+    alloc::sync::Arc<narf_input::evdev::DeviceNode>,
+    narf_input::evdev::Reader,
+) {
+    use narf_input::evdev::ROUTER;
+    let caps = synaptics_test_caps();
+    let (id, node) = ROUTER.register_device(caps);
+    let reader = ROUTER.open_reader(id).expect("reader");
+    crate::i8042_mouse::__set_evdev_node_for_test(&node);
+    (id, node, reader)
+}
+
+fn drain_evdev(
+    reader: &narf_input::evdev::Reader,
+) -> alloc::vec::Vec<narf_input::evdev::EvdevEvent> {
+    let mut events = alloc::vec::Vec::new();
+    while let Some(ev) = reader.poll_event() {
+        events.push(ev);
+    }
+    events
+}
+
+fn smoke_synaptics_absolute_irq_path() -> TestResult {
+    use crate::i8042_mouse;
+    use narf_input::{
+        __reset_global_ring_for_test, abs, cursor_abs_px,
+        evdev::{key, EventType, ROUTER},
+        init_global_ring, pop_global, set_scanout_dims, InputEvent, PointerButtons,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    set_scanout_dims(1024, 768);
+    let (id, _node, reader) = synaptics_attach_evdev_for_test();
+    i8042_mouse::set_synaptics_absolute_for_test(true);
+
+    // NEWABS packet: x=1000, y=2000 (→ 3856 inverted), z=50, w=1, left.
+    for b in [0x81, 0x73, 50, 0xC4, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Abs, abs::ABS_X, 1000)
+        && has(EventType::Abs, abs::ABS_Y, 3856)
+        && has(EventType::Abs, abs::ABS_PRESSURE, 50)
+        && has(EventType::Key, key::BTN_TOUCH, 1)
+        && has(EventType::Key, key::BTN_LEFT, 1)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 1;
+    if !ok {
+        ROUTER.unregister_device(id);
+        i8042_mouse::__reset_for_test();
+        return TestResult::Fail("first absolute frame missing ABS/pressure/touch/left/SYN");
+    }
+    // First finger-down sample: no legacy delta yet, but the
+    // cursor publishes at the true position (x clamps to the
+    // nominal min → 0; y maps 3856 → 618).
+    if cursor_abs_px() != Some((0, 618)) {
+        ROUTER.unregister_device(id);
+        i8042_mouse::__reset_for_test();
+        return TestResult::Fail("cursor_abs_px must publish the first sample");
+    }
+    if i8042_mouse::take_rel_delta() != (0, 0) {
+        ROUTER.unregister_device(id);
+        i8042_mouse::__reset_for_test();
+        return TestResult::Fail("first sample must not emit a legacy delta");
+    }
+
+    // Second packet, finger moved to x=2000 (y unchanged):
+    // px 0 → 135, py stays 618 → legacy delta (135, 0).
+    for b in [0x81, 0x77, 50, 0xC4, 0xD0, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Abs, abs::ABS_X, 2000)
+        && has(EventType::Abs, abs::ABS_Y, 3856)
+        && has(EventType::Abs, abs::ABS_PRESSURE, 50)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Key && e.code == key::BTN_TOUCH)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 1;
+    if !ok {
+        ROUTER.unregister_device(id);
+        i8042_mouse::__reset_for_test();
+        return TestResult::Fail("second absolute frame must move X without touch edges");
+    }
+    if i8042_mouse::take_rel_delta() != (135, 0) {
+        ROUTER.unregister_device(id);
+        i8042_mouse::__reset_for_test();
+        return TestResult::Fail("legacy bridge delta must be (135, 0)");
+    }
+    match pop_global() {
+        Some(InputEvent::Pointer(p))
+            if p.dx == 135 && p.dy == 0 && p.buttons.contains(PointerButtons::LEFT) => {}
+        _ => {
+            ROUTER.unregister_device(id);
+            i8042_mouse::__reset_for_test();
+            return TestResult::Fail("legacy ring must carry the (135, 0) pointer event");
+        }
+    }
+
+    // Finger lifts (z=0, no buttons): pressure 0, touch release,
+    // left release, one SYN — and no ABS_X/ABS_Y in the frame.
+    for b in [0x80, 0x73, 0, 0xC4, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Abs, abs::ABS_PRESSURE, 0)
+        && has(EventType::Key, key::BTN_TOUCH, 0)
+        && has(EventType::Key, key::BTN_LEFT, 0)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Abs && (e.code == abs::ABS_X || e.code == abs::ABS_Y))
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 1;
+    ROUTER.unregister_device(id);
+    i8042_mouse::__reset_for_test();
+    if !ok {
+        return TestResult::Fail("lift frame must release touch/left without X/Y");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_absolute_irq_path);
+
+fn smoke_synaptics_oldabs_irq_path() -> TestResult {
+    use crate::i8042_mouse;
+    use narf_input::{
+        __reset_global_ring_for_test, abs,
+        evdev::{key, EventType, ROUTER},
+        init_global_ring,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    let (id, _node, reader) = synaptics_attach_evdev_for_test();
+    i8042_mouse::set_synaptics_absolute_for_test(false);
+
+    // OLDABS packet: x=1000, y=2000 (→ 3856 inverted), z=50, w=2, left.
+    for b in [0xC5, 0x03, 0xE8, 0xB2, 0x07, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Abs, abs::ABS_X, 1000)
+        && has(EventType::Abs, abs::ABS_Y, 3856)
+        && has(EventType::Abs, abs::ABS_PRESSURE, 50)
+        && has(EventType::Key, key::BTN_TOUCH, 1)
+        && has(EventType::Key, key::BTN_LEFT, 1)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 1;
+    ROUTER.unregister_device(id);
+    i8042_mouse::__reset_for_test();
+    if !ok {
+        return TestResult::Fail("OLDABS IRQ frame missing ABS/pressure/touch/left/SYN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_oldabs_irq_path);
+
+fn smoke_synaptics_relaxed_validation_keeps_stream() -> TestResult {
+    use crate::i8042_mouse;
+    use narf_input::{
+        __reset_global_ring_for_test, abs,
+        evdev::{EventType, ROUTER},
+        init_global_ring,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    let (id, _node, reader) = synaptics_attach_evdev_for_test();
+    i8042_mouse::set_synaptics_absolute_for_test(true);
+
+    // Byte 0 0x88 / byte 3 0xC8 pass the relaxed masks but fail
+    // the strict ones. The first full packet must downgrade the
+    // stream to relaxed (Linux `synaptics_detect_pkt_type`) so
+    // the identical second packet still decodes instead of
+    // dropping bytes.
+    for _ in 0..2 {
+        for b in [0x88, 0x73, 50, 0xC8, 0xE8, 0xD0] {
+            i8042_mouse::feed_byte_for_test(b);
+        }
+    }
+    let events = drain_evdev(&reader);
+    let n = events
+        .iter()
+        .filter(|e| e.type_ == EventType::Abs && e.code == abs::ABS_X && e.value == 1000)
+        .count();
+    ROUTER.unregister_device(id);
+    i8042_mouse::__reset_for_test();
+    if n != 2 {
+        return TestResult::Fail("both relaxed packets must decode (ABS_X x2)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_synaptics_relaxed_validation_keeps_stream
+);
+
+fn smoke_synaptics_bad_byte_drops_partial_packet() -> TestResult {
+    use crate::i8042_mouse;
+    use narf_input::{
+        __reset_global_ring_for_test, abs,
+        evdev::{EventType, ROUTER},
+        init_global_ring,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    let (id, _node, reader) = synaptics_attach_evdev_for_test();
+    i8042_mouse::set_synaptics_absolute_for_test(true);
+
+    // Bad first byte (0x00 fails NEWABS validation) is dropped;
+    // the following good packet decodes.
+    i8042_mouse::feed_byte_for_test(0x00);
+    for b in [0x81, 0x73, 50, 0xC4, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    // Bad mid-packet byte 3 (0x00 fails the 0xC0 result) drops
+    // the partial packet; the following good packet decodes.
+    for b in [0x81, 0x73, 50, 0x00] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    for b in [0x81, 0x73, 50, 0xC4, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let n = events
+        .iter()
+        .filter(|e| e.type_ == EventType::Abs && e.code == abs::ABS_X && e.value == 1000)
+        .count();
+    ROUTER.unregister_device(id);
+    i8042_mouse::__reset_for_test();
+    if n != 2 {
+        return TestResult::Fail("exactly the two good packets must decode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_synaptics_bad_byte_drops_partial_packet
+);

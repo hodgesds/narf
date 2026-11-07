@@ -85,11 +85,9 @@
 //!      already enabled.
 //!   5. Restore the sample rate to 100 (the knocks leave it at 80,
 //!      or 40 after the Explorer tilt knock; Linux
-//!      `psmouse_initialize` does the same), then 0xD4 + 0xF4
-//!      (enable data reporting). The restore is skipped for
-//!      Elantech — a rate set loses register 0x07 on v4 hardware
+//!      `psmouse_initialize` does the same). The restore is skipped
+//!      for Elantech — a rate set loses register 0x07 on v4 hardware
 //!      (Linux `elantech_set_rate_restore_reg_07`).
-//!
 //! ALPS absolute mode (`crate::alps`): once a pad is identified
 //! (see `alps::probe_alps` — the probe itself lives with the
 //! vendor negotiation in `psmouse`, landed in #1676) the packet
@@ -104,6 +102,29 @@
 //! byte-for-byte the old behaviour. Wiring `alps::probe_alps`
 //! into `psmouse::negotiate_protocol` so the negotiated model
 //! selects the decoder is a follow-up (see the PR body).
+//!   6. Synaptics absolute-mode enablement (`crate::psmouse`):
+//!      detect (4x SETRES(0) + GETINFO, byte 0x47), query the
+//!      hardware (identify/model/firmware/board/capability/
+//!      resolution), then set the absolute mode byte (ABSOLUTE +
+//!      HIGH_RATE + W_MODE + DISABLE_GESTURE, committed with
+//!      SETRATE 0x14). Only attempted when the negotiated hardware
+//!      is Synaptics — an Elantech match claims the device outright
+//!      and must see no further probes. On success the pad streams
+//!      6-byte absolute packets; on any failure it stays a 3-byte
+//!      relative mouse.
+//!   7. Send 0xD4 + 0xF4 (enable data reporting). This flips the
+//!      mouse from "idle" to "actively sending packets" — for a
+//!      negotiated Synaptics pad, the 6-byte absolute stream.
+//!
+//! A negotiated Synaptics pad reports absolute finger position
+//! (`ABS_X` / `ABS_Y` / `ABS_PRESSURE` + `BTN_TOUCH`, Linux
+//! `synaptics_process_packet` semantics: BTN_TOUCH hysteresis
+//! `z > 30` on / `z < 25` off, X/Y only when `z > 0 && x > 1`).
+//! The legacy global ring still gets pixel-scale relative deltas
+//! derived from successive absolute samples (same shape as the
+//! virtio-tablet `abs_to_px` bridge), and the absolute cursor
+//! position is published via `set_cursor_abs_px` so the kernel
+//! cursor sits at the true finger position.
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
@@ -112,11 +133,11 @@ use narf_input::{
     abs,
     btn::{BTN_TOOL_DOUBLETAP, BTN_TOOL_QUADTAP, BTN_TOOL_TRIPLETAP},
     evdev::{
-        dispatch_key_to_node, dispatch_pointer_wheel_to_node, key, prop, rel, DeviceCaps, DeviceId,
-        DeviceNode, MtContactUpdate, MtEvdevState, ROUTER,
+        dispatch_key_to_node, dispatch_pointer_wheel_to_node, dispatch_synaptics_abs_to_node, key,
+        prop, rel, DeviceCaps, DeviceId, DeviceNode, MtContactUpdate, MtEvdevState, ROUTER,
     },
-    push_global, AbsoluteEvent, AxisInfo, InputEvent, PointerButtons, PointerEvent, ScrollEvent,
-    TouchEvent, TouchState,
+    push_global, scanout_dims, set_cursor_abs_px, AbsoluteEvent, AxisInfo, InputEvent,
+    PointerButtons, PointerEvent, ScrollEvent, TouchEvent, TouchState,
 };
 
 extern crate alloc;
@@ -154,8 +175,8 @@ pub struct State {
     /// Bytes 0..=7 of the in-flight packet. `phase` tracks how many
     /// bytes we've collected. When phase reaches the negotiated
     /// packet length (3 standard, 4 IntelliMouse/Explorer/Elantech
-    /// v1, 6 Elantech v2–v4 / ALPS, 8 ALPS v4 — see
-    /// `crate::psmouse::packet_len` and
+    /// v1, 6 Synaptics absolute / Elantech v2–v4 / ALPS, 8 ALPS v4
+    /// — see `crate::psmouse::packet_len` and
     /// `alps::AlpsDecoder::packet_len`), we emit the PointerEvent /
     /// ScrollEvent / absolute frame + reset to 0.
     pkt: [AtomicU8; 8],
@@ -170,6 +191,20 @@ pub struct State {
     /// bit2=middle, bit3=side/4th, bit4=extra/5th), so evdev
     /// `EV_KEY` events are emitted only on press/release edges.
     prev_buttons: AtomicU8,
+    /// Last finger-down absolute position in scanout pixels (for the
+    /// legacy relative bridge); `i32::MIN` = no sample yet.
+    prev_abs_px: AtomicI32,
+    prev_abs_py: AtomicI32,
+    /// BTN_TOUCH hysteresis state (Linux `synaptics_process_packet`:
+    /// asserts when `z > 30`, releases when `z < 25`).
+    touch_pressed: core::sync::atomic::AtomicBool,
+    /// Streaming Synaptics packet type, as a
+    /// [`psmouse::SynapticsPktType`] discriminant (0=NewAbs,
+    /// 1=Strict, 2=Relaxed, 3=OldAbs). Starts as
+    /// `SynapticsPktType::initial(newabs)`; a NEWABS pad is
+    /// classified strict/relaxed from its first full packet
+    /// (Linux `synaptics_detect_pkt_type`).
+    syn_pkt_type: AtomicU8,
     initialized: core::sync::atomic::AtomicBool,
 }
 
@@ -192,6 +227,10 @@ impl State {
             rel_wheel_acc: AtomicI32::new(0),
             rel_hwheel_acc: AtomicI32::new(0),
             prev_buttons: AtomicU8::new(0),
+            prev_abs_px: AtomicI32::new(i32::MIN),
+            prev_abs_py: AtomicI32::new(i32::MIN),
+            touch_pressed: core::sync::atomic::AtomicBool::new(false),
+            syn_pkt_type: AtomicU8::new(0),
             initialized: core::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -475,7 +514,8 @@ fn aux_reset() -> bool {
 }
 
 /// `crate::psmouse::Ps2Transport` over the i8042 AUX channel.
-/// Used by `psmouse::negotiate_protocol` during `init()`.
+/// Used by `psmouse::negotiate_protocol` and
+/// `psmouse::synaptics_enable_absolute` during `init()`.
 struct AuxTransport;
 
 impl Ps2Transport for AuxTransport {
@@ -494,13 +534,14 @@ impl Ps2Transport for AuxTransport {
 
 /// Re-enable the AUX (mouse) channel: enable AUX, restore the
 /// AUX-IRQ config, reset the mouse, set defaults, negotiate the
-/// protocol, restore the sample rate, enable data reporting.
+/// protocol, restore the sample rate, attempt Synaptics absolute-mode
+/// enablement, enable data reporting.
 /// Returns whether the mouse is reporting — best effort: a system
 /// without a PS/2 mouse returns `false`, not an error. A timeout
 /// in the controller-side config exchange is an `Err`, matching
 /// `init()`.
 ///
-/// Shared verbatim by `init()` (steps 1-4) and `resume()` (#770):
+/// Shared verbatim by `init()` (steps 1-7) and `resume()` (#770):
 /// resume re-runs exactly this bring-up instead of a second,
 /// drift-prone copy of the sequence.
 ///
@@ -549,7 +590,9 @@ fn enable_mouse_channel() -> Result<bool, InitError> {
     let mut reporting_ok = aux_reset();
 
     if reporting_ok {
-        // 4a. Set defaults (0xF6) — ACK.
+        // 4a. Set defaults (0xF6) — ACK. This also clears the
+        // Absolute mode bit (Guide §2.5), so the pad is in
+        // relative mode for the negotiation below.
         if !aux_send(psmouse::CMD_SET_DEFAULTS) {
             reporting_ok = false;
         }
@@ -586,9 +629,48 @@ fn enable_mouse_channel() -> Result<bool, InitError> {
         }
     }
 
+    if reporting_ok && psmouse::hardware() == psmouse::PsmouseHardware::Synaptics {
+        // 4d. Synaptics absolute-mode enablement (see
+        // `crate::psmouse`): detect, query, mode set. Must run
+        // while reporting is still disabled and before the 0xF4
+        // enable below. Only attempted on a negotiated Synaptics
+        // pad — an Elantech match claims the device outright and
+        // must see no further probes. On any failure the pad stays
+        // a 3-byte relative mouse — the packet parser keys off the
+        // negotiated length, so a failed enablement can never
+        // corrupt the stream.
+        match psmouse::synaptics_enable_absolute(&mut AuxTransport, psmouse::SYNAPTICS_RATE) {
+            Ok(hw) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  i8042-mouse: Synaptics pad: model {:#08x} fw {:#08x} caps {:#08x} mode {:#04x}",
+                    hw.model_id, hw.firmware_id, hw.capabilities, hw.mode,
+                );
+                psmouse::set_detected(
+                    psmouse::PsmouseHardware::Synaptics,
+                    psmouse::PsmouseProtocol::SynapticsAbsolute,
+                );
+                STATE.syn_pkt_type.store(
+                    psmouse::SynapticsPktType::initial(hw.newabs) as u8,
+                    Ordering::Release,
+                );
+            }
+            Err(e) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  i8042-mouse: Synaptics enablement failed ({:?}); staying relative",
+                    e,
+                );
+            }
+        }
+    }
+
     if reporting_ok {
-        // 4d. Enable data reporting (0xF4) — ACK. This flips the
-        // mouse from "idle" to "actively sending packets."
+        // 4e. Enable data reporting (0xF4) — ACK. This flips the
+        // mouse from "idle" to "actively sending packets" — for a
+        // negotiated Synaptics pad, the 6-byte absolute stream.
         if !aux_send(psmouse::CMD_ENABLE) {
             reporting_ok = false;
         }
@@ -619,101 +701,149 @@ pub unsafe fn init() -> Result<(), InitError> {
     STATE.initialized.store(true, Ordering::Release);
 
     // Register the PS/2 mouse as an evdev device. Capabilities
-    // follow the negotiated protocol: wheel mice advertise
-    // `REL_WHEEL`, Explorer mice add `REL_HWHEEL` (4.0 tilt) plus
-    // the 4th/5th buttons (`BTN_SIDE`/`BTN_EXTRA`). A Synaptics or
-    // ALPS pad detected by the vendor probes keeps its vendor name
-    // but reports relative packets until absolute mode lands. An
-    // Elantech pad reports absolute packets (`ABS_X`/`ABS_Y` +
-    // protocol-B MT slots) and no relative axes at all.
+    // follow the negotiated protocol: a Synaptics pad in absolute
+    // mode advertises ABS_X/ABS_Y (nominal ranges — the queried
+    // min/max are a later refinement) + ABS_PRESSURE + BTN_TOUCH
+    // + BTN_LEFT/RIGHT (Linux `set_input_params`); wheel mice
+    // advertise `REL_WHEEL`, Explorer mice add `REL_HWHEEL`
+    // (4.0 tilt) plus the 4th/5th buttons (`BTN_SIDE`/`BTN_EXTRA`).
+    // A Synaptics or ALPS pad detected by the vendor probes keeps
+    // its vendor name; an Elantech pad reports absolute packets
+    // (`ABS_X`/`ABS_Y` + protocol-B MT slots) and no relative axes
+    // at all.
     let proto = psmouse::protocol();
     let hw = psmouse::hardware();
+    let absolute = proto == psmouse::PsmouseProtocol::SynapticsAbsolute;
     let is_elantech = matches!(
         proto,
         psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech
     );
-    let name = match (hw, proto) {
-        (psmouse::PsmouseHardware::Elantech, _) => "PS/2 Elantech TouchPad",
-        (psmouse::PsmouseHardware::Synaptics, _) => "PS/2 Synaptics TouchPad",
-        (psmouse::PsmouseHardware::Alps, _) => "PS/2 ALPS TouchPad",
-        (_, psmouse::PsmouseProtocol::IntelliMouse) => "PS/2 Wheel Mouse",
-        (_, psmouse::PsmouseProtocol::Explorer | psmouse::PsmouseProtocol::ExplorerTilt) => {
-            "PS/2 Explorer Mouse"
-        }
-        _ => "PS/2 Generic Mouse",
-    };
     let mut caps = DeviceCaps::new();
-    caps.set_identity(
-        name,
-        "isa0060/serio1/input0",
-        "",
-        narf_input::evdev::InputId::new(narf_input::evdev::bus::I8042, 0x0002, 0x0001, 0),
-    );
-    caps.add_prop(narf_input::evdev::prop::POINTER);
-    if !is_elantech {
-        caps.add_rel(rel::REL_X);
-        caps.add_rel(rel::REL_Y);
-    }
-    caps.add_key(key::BTN_LEFT);
-    caps.add_key(key::BTN_RIGHT);
-    caps.add_key(key::BTN_MIDDLE);
-    match proto {
-        psmouse::PsmouseProtocol::IntelliMouse => {
-            caps.add_rel(rel::REL_WHEEL);
-        }
-        psmouse::PsmouseProtocol::Explorer => {
-            caps.add_rel(rel::REL_WHEEL);
-            caps.add_key(key::BTN_SIDE);
-            caps.add_key(key::BTN_EXTRA);
-        }
-        psmouse::PsmouseProtocol::ExplorerTilt => {
-            caps.add_rel(rel::REL_WHEEL);
-            caps.add_rel(rel::REL_HWHEEL);
-            caps.add_key(key::BTN_SIDE);
-            caps.add_key(key::BTN_EXTRA);
-        }
-        psmouse::PsmouseProtocol::Standard => {}
-        // Elantech absolute caps are declared in the `is_elantech`
-        // block just below (ABS_X/Y + MT slots, no REL axes).
-        psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech => {}
-    }
-    if is_elantech {
-        // Absolute axes + protocol-B MT slots, same shape as the
-        // I2C-HID touch driver (`add_mt_axes`): `ABS_X`/`ABS_Y`
-        // span the negotiated device ranges, `ABS_MT_SLOT` spans
-        // the 5 v4 slots, and pressure/width ride only when the
-        // firmware reports them.
-        if let Some(info) = psmouse::elantech_info() {
-            let axis = |max: u32| AxisInfo {
-                min: 0,
-                max: max as i32,
+    if absolute {
+        caps.set_identity(
+            "PS/2 Synaptics TouchPad",
+            "isa0060/serio1/input0",
+            "",
+            narf_input::evdev::InputId::new(narf_input::evdev::bus::I8042, 0x0002, 0x0001, 0),
+        );
+        caps.add_prop(narf_input::evdev::prop::POINTER);
+        caps.add_abs_info(
+            abs::ABS_X,
+            AxisInfo {
+                min: psmouse::SYN_X_MIN_NOMINAL,
+                max: psmouse::SYN_X_MAX_NOMINAL,
                 fuzz: 0,
                 flat: 0,
                 res: 0,
-            };
-            caps.add_abs_info(abs::ABS_X, axis(info.x_max));
-            caps.add_abs_info(abs::ABS_Y, axis(info.y_max));
-            caps.add_abs_info(abs::ABS_MT_SLOT, axis(4));
-            caps.add_abs_info(abs::ABS_MT_TRACKING_ID, axis(0xFFFF));
-            caps.add_abs_info(abs::ABS_MT_POSITION_X, axis(info.x_max));
-            caps.add_abs_info(abs::ABS_MT_POSITION_Y, axis(info.y_max));
-            if info.reports_pressure {
-                let pressure = axis(255);
-                caps.add_abs_info(abs::ABS_PRESSURE, pressure);
-                caps.add_abs_info(abs::ABS_TOOL_WIDTH, axis(15));
-                caps.add_abs_info(abs::ABS_MT_PRESSURE, pressure);
+            },
+        );
+        caps.add_abs_info(
+            abs::ABS_Y,
+            AxisInfo {
+                min: psmouse::SYN_Y_MIN_NOMINAL,
+                max: psmouse::SYN_Y_MAX_NOMINAL,
+                fuzz: 0,
+                flat: 0,
+                res: 0,
+            },
+        );
+        caps.add_abs_info(
+            abs::ABS_PRESSURE,
+            AxisInfo {
+                min: 0,
+                max: 255,
+                fuzz: 0,
+                flat: 0,
+                res: 0,
+            },
+        );
+        caps.add_key(key::BTN_LEFT);
+        caps.add_key(key::BTN_RIGHT);
+        caps.add_key(key::BTN_TOUCH);
+    } else {
+        let name = match (hw, proto) {
+            (psmouse::PsmouseHardware::Elantech, _) => "PS/2 Elantech TouchPad",
+            (psmouse::PsmouseHardware::Synaptics, _) => "PS/2 Synaptics TouchPad",
+            (psmouse::PsmouseHardware::Alps, _) => "PS/2 ALPS TouchPad",
+            (_, psmouse::PsmouseProtocol::IntelliMouse) => "PS/2 Wheel Mouse",
+            (_, psmouse::PsmouseProtocol::Explorer | psmouse::PsmouseProtocol::ExplorerTilt) => {
+                "PS/2 Explorer Mouse"
             }
-            caps.add_key(key::BTN_TOUCH);
-            caps.add_key(key::BTN_TOOL_FINGER);
-            caps.add_key(BTN_TOOL_DOUBLETAP);
-            caps.add_key(BTN_TOOL_TRIPLETAP);
-            if info.hw_version >= 2 {
-                caps.add_key(BTN_TOOL_QUADTAP);
+            _ => "PS/2 Generic Mouse",
+        };
+        let mut caps = DeviceCaps::new();
+        caps.set_identity(
+            name,
+            "isa0060/serio1/input0",
+            "",
+            narf_input::evdev::InputId::new(narf_input::evdev::bus::I8042, 0x0002, 0x0001, 0),
+        );
+        caps.add_prop(narf_input::evdev::prop::POINTER);
+        if !is_elantech {
+            caps.add_rel(rel::REL_X);
+            caps.add_rel(rel::REL_Y);
+        }
+        caps.add_key(key::BTN_LEFT);
+        caps.add_key(key::BTN_RIGHT);
+        caps.add_key(key::BTN_MIDDLE);
+        match proto {
+            psmouse::PsmouseProtocol::IntelliMouse => {
+                caps.add_rel(rel::REL_WHEEL);
             }
-            if info.buttonpad {
-                caps.add_prop(prop::BUTTONPAD);
+            psmouse::PsmouseProtocol::Explorer => {
+                caps.add_rel(rel::REL_WHEEL);
+                caps.add_key(key::BTN_SIDE);
+                caps.add_key(key::BTN_EXTRA);
             }
-            *ELANTECH_MT.lock() = Some(MtEvdevState::new(5));
+            psmouse::PsmouseProtocol::ExplorerTilt => {
+                caps.add_rel(rel::REL_WHEEL);
+                caps.add_rel(rel::REL_HWHEEL);
+                caps.add_key(key::BTN_SIDE);
+                caps.add_key(key::BTN_EXTRA);
+            }
+            psmouse::PsmouseProtocol::Standard => {}
+            // Elantech absolute caps are declared in the `is_elantech`
+            // block just below (ABS_X/Y + MT slots, no REL axes).
+            psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech => {}
+        }
+        if is_elantech {
+            // Absolute axes + protocol-B MT slots, same shape as the
+            // I2C-HID touch driver (`add_mt_axes`): `ABS_X`/`ABS_Y`
+            // span the negotiated device ranges, `ABS_MT_SLOT` spans
+            // the 5 v4 slots, and pressure/width ride only when the
+            // firmware reports them.
+            if let Some(info) = psmouse::elantech_info() {
+                let axis = |max: u32| AxisInfo {
+                    min: 0,
+                    max: max as i32,
+                    fuzz: 0,
+                    flat: 0,
+                    res: 0,
+                };
+                caps.add_abs_info(abs::ABS_X, axis(info.x_max));
+                caps.add_abs_info(abs::ABS_Y, axis(info.y_max));
+                caps.add_abs_info(abs::ABS_MT_SLOT, axis(4));
+                caps.add_abs_info(abs::ABS_MT_TRACKING_ID, axis(0xFFFF));
+                caps.add_abs_info(abs::ABS_MT_POSITION_X, axis(info.x_max));
+                caps.add_abs_info(abs::ABS_MT_POSITION_Y, axis(info.y_max));
+                if info.reports_pressure {
+                    let pressure = axis(255);
+                    caps.add_abs_info(abs::ABS_PRESSURE, pressure);
+                    caps.add_abs_info(abs::ABS_TOOL_WIDTH, axis(15));
+                    caps.add_abs_info(abs::ABS_MT_PRESSURE, pressure);
+                }
+                caps.add_key(key::BTN_TOUCH);
+                caps.add_key(key::BTN_TOOL_FINGER);
+                caps.add_key(BTN_TOOL_DOUBLETAP);
+                caps.add_key(BTN_TOOL_TRIPLETAP);
+                if info.hw_version >= 2 {
+                    caps.add_key(BTN_TOOL_QUADTAP);
+                }
+                if info.buttonpad {
+                    caps.add_prop(prop::BUTTONPAD);
+                }
+                *ELANTECH_MT.lock() = Some(MtEvdevState::new(5));
+            }
         }
     }
     let (dev_id, node_arc) = ROUTER.register_device(caps);
@@ -748,6 +878,10 @@ pub(crate) fn resume() {
     STATE.rel_wheel_acc.store(0, Ordering::Release);
     STATE.rel_hwheel_acc.store(0, Ordering::Release);
     STATE.prev_buttons.store(0, Ordering::Release);
+    STATE.prev_abs_px.store(i32::MIN, Ordering::Release);
+    STATE.prev_abs_py.store(i32::MIN, Ordering::Release);
+    STATE.touch_pressed.store(false, Ordering::Release);
+    STATE.syn_pkt_type.store(0, Ordering::Release);
     if !STATE.initialized.load(Ordering::Acquire) {
         return;
     }
@@ -875,6 +1009,158 @@ fn dispatch_packet_to_evdev(dx: i32, dy: i32, wheel: i32, hwheel: i32, buttons: 
     dispatch_pointer_wheel_to_node(node_ref, dx, dy, wheel, hwheel, &changes[..n]);
 }
 
+/// Route a decoded Synaptics absolute packet to the evdev node
+/// as one frame: ABS_X/ABS_Y (when `moved`), ABS_PRESSURE,
+/// BTN_TOUCH on hysteresis edges, BTN_LEFT/RIGHT on press/release
+/// edges, one SYN_REPORT (via `dispatch_synaptics_abs_to_node`).
+fn dispatch_absolute_to_evdev(
+    hw: &psmouse::SynapticsHwState,
+    y_inv: i32,
+    moved: bool,
+    touch: Option<bool>,
+) {
+    let raw = MOUSE_NODE_PTR.load(Ordering::Acquire);
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: `raw` is the `Arc::as_ptr` of the node stored once in `init()`
+    // before IRQ 12 is armed (or by `__set_evdev_node_for_test`, which keeps
+    // the Arc alive in `MOUSE_EVDEV_NODE`); the Arc is held alive, so the
+    // pointee outlives this borrow. Non-null checked just above.
+    let node_ref: &DeviceNode = unsafe { &*raw };
+
+    let cur_btn = (if hw.left { 0x01 } else { 0 }) | (if hw.right { 0x02 } else { 0 });
+    let prev_btn = STATE.prev_buttons.swap(cur_btn, Ordering::AcqRel);
+    let changed = cur_btn ^ prev_btn;
+    let mut changes: [(u16, bool); 2] = [(0, false); 2];
+    let mut n = 0;
+    if changed & 0x01 != 0 {
+        changes[n] = (key::BTN_LEFT, cur_btn & 0x01 != 0);
+        n += 1;
+    }
+    if changed & 0x02 != 0 {
+        changes[n] = (key::BTN_RIGHT, cur_btn & 0x02 != 0);
+        n += 1;
+    }
+    dispatch_synaptics_abs_to_node(
+        node_ref,
+        hw.x,
+        y_inv,
+        hw.z as i32,
+        moved,
+        touch,
+        &changes[..n],
+    );
+}
+
+/// Map an absolute sample onto the on-screen pixel `span` of its
+/// axis using the advertised range (virtio-tablet `abs_to_px`
+/// shape: clamp into the range, then scale linearly).
+fn syn_abs_to_px(v: i32, min: i32, max: i32, span: i64) -> i32 {
+    if max > min {
+        (((v.clamp(min, max) - min) as i64 * span) / (max - min) as i64) as i32
+    } else {
+        0
+    }
+}
+
+/// Decode a completed 6-byte Synaptics absolute packet (Linux
+/// `synaptics_process_packet`, single-finger path): evdev ABS +
+/// BTN_TOUCH + buttons, plus the legacy relative bridge.
+fn decode_absolute_packet() {
+    let mut buf = [0u8; 6];
+    for (i, slot) in STATE.pkt.iter().take(6).enumerate() {
+        buf[i] = slot.load(Ordering::Acquire);
+    }
+    let mut pkt_type =
+        psmouse::SynapticsPktType::from_u8(STATE.syn_pkt_type.load(Ordering::Acquire));
+    // The first full NEWABS packet classifies the pad as strict
+    // or relaxed (Linux `synaptics_detect_pkt_type`).
+    if pkt_type == psmouse::SynapticsPktType::NewAbs {
+        pkt_type = psmouse::synaptics_detect_pkt_type(&buf);
+        STATE.syn_pkt_type.store(pkt_type as u8, Ordering::Release);
+    }
+    let hw = match pkt_type {
+        psmouse::SynapticsPktType::OldAbs => psmouse::decode_synaptics_oldabs(&buf),
+        _ => psmouse::decode_synaptics_newabs(&buf),
+    };
+    // X/Y are reported only for a real finger (Linux:
+    // `hw.z > 0 && hw.x > 1`); pressure, touch and buttons are
+    // reported on every packet.
+    let moved = hw.z > 0 && hw.x > 1;
+    let y_inv = psmouse::synaptics_invert_y(hw.y);
+
+    // BTN_TOUCH hysteresis: asserts when `z > 30`, releases
+    // when `z < 25`; between the thresholds the state holds.
+    let touch_change = if hw.z > psmouse::SYN_TOUCH_ON_Z {
+        if STATE.touch_pressed.swap(true, Ordering::AcqRel) {
+            None
+        } else {
+            Some(true)
+        }
+    } else if hw.z < psmouse::SYN_TOUCH_OFF_Z {
+        if STATE.touch_pressed.swap(false, Ordering::AcqRel) {
+            Some(false)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    dispatch_absolute_to_evdev(&hw, y_inv, moved, touch_change);
+    narf_input::I8042_MOUSE_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Legacy bridge (virtio-tablet shape): map the absolute
+    // sample onto scanout pixels and publish the true cursor
+    // position; the delta between successive pixel samples
+    // keeps the legacy ring / rel accumulator moving at pixel
+    // scale instead of raw pad units. No scanout yet (dims 0) →
+    // skip the bridge for this frame; evdev above already
+    // carried the absolute position.
+    if moved {
+        let (scan_w, scan_h) = scanout_dims();
+        if scan_w != 0 && scan_h != 0 {
+            let px = syn_abs_to_px(
+                hw.x,
+                psmouse::SYN_X_MIN_NOMINAL,
+                psmouse::SYN_X_MAX_NOMINAL,
+                scan_w as i64,
+            )
+            .clamp(0, scan_w.saturating_sub(1) as i32);
+            let py = syn_abs_to_px(
+                y_inv,
+                psmouse::SYN_Y_MIN_NOMINAL,
+                psmouse::SYN_Y_MAX_NOMINAL,
+                scan_h as i64,
+            )
+            .clamp(0, scan_h.saturating_sub(1) as i32);
+            set_cursor_abs_px(px as u32, py as u32);
+            let prev_x = STATE.prev_abs_px.swap(px, Ordering::AcqRel);
+            let prev_y = STATE.prev_abs_py.swap(py, Ordering::AcqRel);
+            if prev_x != i32::MIN && prev_y != i32::MIN {
+                let dx = px - prev_x;
+                let dy = py - prev_y;
+                let mut buttons = PointerButtons::EMPTY;
+                if hw.left {
+                    buttons.insert(PointerButtons::LEFT);
+                }
+                if hw.right {
+                    buttons.insert(PointerButtons::RIGHT);
+                }
+                STATE.rel_dx_acc.fetch_add(dx, Ordering::Relaxed);
+                STATE.rel_dy_acc.fetch_add(dy, Ordering::Relaxed);
+                let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
+            }
+        }
+    } else {
+        // Finger lifted: the next touchdown starts a fresh
+        // stroke so the cursor cannot jump across the pad.
+        STATE.prev_abs_px.store(i32::MIN, Ordering::Release);
+        STATE.prev_abs_py.store(i32::MIN, Ordering::Release);
+    }
+}
+
 /// Shared packet state machine: one byte in, one packet out when
 /// the negotiated packet length is reached. Used by BOTH the IRQ
 /// handler and the test feed — a single decode path, so a 4-byte
@@ -883,16 +1169,11 @@ fn dispatch_packet_to_evdev(dx: i32, dy: i32, wheel: i32, hwheel: i32, buttons: 
 /// Elantech absolute packets take their own branch: byte 0 carries
 /// finger counts / traces / parity, not the PS/2 sync bit, so the
 /// `0x08` resync below would drop live v2/v3/v4 packets.
-/// Shared packet state machine: one byte in, one packet out when
-/// the negotiated packet length is reached. Used by BOTH the IRQ
-/// handler and the test feed — a single decode path, so a 4-byte
-/// packet can never be parsed as 3-byte in one path and 4-byte in
-/// the other (that would corrupt the stream, not just fail a test).
 /// ALPS absolute packets take the first branch while an ALPS
-/// protocol is active; Elantech absolute packets take their own
-/// branch (byte 0 carries finger counts / traces / parity, not
-/// the PS/2 sync bit, so the `0x08` resync below would drop live
-/// v2/v3/v4 packets); everything else is the relative path.
+/// protocol is active; everything else is the relative path.
+/// Synaptics absolute packets take their own branch too: bytes
+/// 0..=4 are validated per packet type and a bad byte drops the
+/// partial packet (Linux `synaptics_validate_byte`).
 fn feed_byte(byte: u8) {
     if ALPS_ACTIVE.load(Ordering::Acquire) {
         feed_byte_alps(byte);
@@ -901,9 +1182,39 @@ fn feed_byte(byte: u8) {
             psmouse::PsmouseProtocol::ElantechV1 | psmouse::PsmouseProtocol::Elantech => {
                 feed_elantech_byte(byte)
             }
+            psmouse::PsmouseProtocol::SynapticsAbsolute => feed_synaptics_byte(byte),
             _ => feed_relative_byte(byte),
         }
     }
+}
+
+/// Synaptics absolute-packet feed: collect 6 bytes, validating
+/// bytes 0..=4 per current packet type (Linux
+/// `synaptics_validate_byte`, idx 0..=4) and dropping the partial
+/// packet on the first bad byte; then decode.
+fn feed_synaptics_byte(byte: u8) {
+    let phase = STATE.phase.load(Ordering::Acquire) as usize;
+    if phase <= 4 {
+        let mut probe = [0u8; 6];
+        for (i, slot) in STATE.pkt.iter().take(6).enumerate() {
+            probe[i] = slot.load(Ordering::Acquire);
+        }
+        probe[phase] = byte;
+        let pkt_type =
+            psmouse::SynapticsPktType::from_u8(STATE.syn_pkt_type.load(Ordering::Acquire));
+        if !psmouse::synaptics_validate_byte(&probe, phase, pkt_type) {
+            STATE.phase.store(0, Ordering::Release);
+            return;
+        }
+    }
+    STATE.pkt[phase].store(byte, Ordering::Release);
+    let next = phase + 1;
+    if next < 6 {
+        STATE.phase.store(next as u8, Ordering::Release);
+        return;
+    }
+    STATE.phase.store(0, Ordering::Release);
+    decode_absolute_packet();
 }
 
 /// Elantech absolute-packet feed: collect `packet_len` bytes with
@@ -1217,6 +1528,10 @@ pub fn __reset_for_test() {
     STATE.rel_wheel_acc.store(0, Ordering::Release);
     STATE.rel_hwheel_acc.store(0, Ordering::Release);
     STATE.prev_buttons.store(0, Ordering::Release);
+    STATE.prev_abs_px.store(i32::MIN, Ordering::Release);
+    STATE.prev_abs_py.store(i32::MIN, Ordering::Release);
+    STATE.touch_pressed.store(false, Ordering::Release);
+    STATE.syn_pkt_type.store(0, Ordering::Release);
     *ELANTECH_STATE.lock() = psmouse::ElantechState::new();
     *ELANTECH_PREV.lock() = [psmouse::ElantechSlot::new(); 5];
     *ELANTECH_MT.lock() = None;
@@ -1247,6 +1562,29 @@ pub fn set_protocol_for_test(proto: psmouse::PsmouseProtocol) {
 pub fn set_elantech_for_test(proto: psmouse::PsmouseProtocol, info: &psmouse::ElantechInfo) {
     psmouse::set_elantech_info_for_test(info);
     psmouse::set_protocol_for_test(proto);
+}
+
+/// Test-only: force Synaptics absolute mode with the given packet
+/// flavour, so packet fixtures can feed 6-byte packets without a
+/// device. `__reset_for_test` restores `Standard`.
+pub fn set_synaptics_absolute_for_test(newabs: bool) {
+    psmouse::set_detected(
+        psmouse::PsmouseHardware::Synaptics,
+        psmouse::PsmouseProtocol::SynapticsAbsolute,
+    );
+    STATE.syn_pkt_type.store(
+        psmouse::SynapticsPktType::initial(newabs) as u8,
+        Ordering::Release,
+    );
+}
+
+/// Test-only: point the IRQ-path evdev dispatch at `node`
+/// (mirrors what `init()` does after registering the device).
+/// The node is kept alive in `MOUSE_EVDEV_NODE`; call
+/// `__reset_for_test` afterwards to release it.
+pub fn __set_evdev_node_for_test(node: &Arc<DeviceNode>) {
+    MOUSE_NODE_PTR.store(Arc::as_ptr(node) as *mut DeviceNode, Ordering::Release);
+    *MOUSE_EVDEV_NODE.lock() = Some(node.clone());
 }
 
 /// Test-only synthetic packet feed: same logic as the IRQ handler
