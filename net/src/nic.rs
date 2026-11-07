@@ -138,13 +138,39 @@ pub struct TrafficSchedule {
     pub preemptible_queues: u8,
 }
 
+/// Linux `IGC_MAX_RXNFC_RULES` (igc.h): 16 MAC + 8 ethertype + 32 flex
+/// + 8 VLAN-priority + 1 default-queue rule. The location space is 65
+///   even though each hardware table behind it is smaller.
+pub const MAX_RXNFC_RULES: u16 = 65;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlowRule {
     pub location: u16,
     pub queue: u16,
     pub ethertype: Option<u16>,
     pub destination_mac: Option<[u8; 6]>,
+    /// Linux `IGC_FILTER_FLAG_SRC_MAC_ADDR`: full-mask source-MAC match
+    /// (`h_u.ether_spec.h_source`, programmed via the RAL ASEL bit).
+    pub source_mac: Option<[u8; 6]>,
     pub vlan_priority: Option<u8>,
+    /// Linux `IGC_FILTER_FLAG_VLAN_ETYPE`: full-mask VLAN EtherType match
+    /// (`h_ext.vlan_etype`, FLOW_EXT). Flex-filter only.
+    pub vlan_etype: Option<u16>,
+    /// Linux `IGC_FILTER_FLAG_VLAN_TCI` with the full mask: whole-TCI
+    /// match (`h_ext.vlan_tci`, FLOW_EXT). Flex-filter only; the
+    /// priority-only form stays in `vlan_priority`.
+    pub vlan_tci: Option<u16>,
+    /// Linux `IGC_FILTER_FLAG_USER_DATA`: user-defined bytes
+    /// (`h_ext.data`, FLOW_EXT). Flex-filter only; matched only where
+    /// the corresponding `user_mask` byte is nonzero.
+    pub user_data: Option<[u8; 8]>,
+    /// Mask bytes for `user_data` (`m_ext.data`); `None` matches all
+    /// eight bytes.
+    pub user_mask: Option<[u8; 8]>,
+    /// Linux `IGC_FILTER_FLAG_DEFAULT_QUEUE`: the wildcard rule — no
+    /// match field at all, plain `ETHER_FLOW`, zero masks. Everything
+    /// unmatched goes to `queue` (MRQC default queue).
+    pub default_queue: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,6 +262,12 @@ pub trait NicControl: core::fmt::Debug + Send + Sync {
     /// bounds the committed value.
     fn check_coalesce(&self, _: u32, _: u32) -> Result<()> {
         Ok(())
+    }
+    /// Linux `ETHTOOL_GPERMADDR`: the permanent hardware address
+    /// (`dev->perm_addr`), unaffected by a later `set_mac`. Defaults to
+    /// -EOPNOTSUPP; igc returns the probe-time RAL0 address.
+    fn permanent_mac(&self) -> Result<[u8; 6]> {
+        Err(95)
     }
     fn nvm_info(&self) -> Result<(u32, u32)> {
         Err(95)
@@ -332,7 +364,10 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_lib::sync::IrqSafeSpinLock;
     #[derive(Debug)]
-    struct Model(IrqSafeSpinLock<Settings>);
+    struct Model(
+        IrqSafeSpinLock<Settings>,
+        IrqSafeSpinLock<alloc::vec::Vec<FlowRule>>,
+    );
     impl crate::iface::DeviceControl for Model {
         fn configure(&self, _: &crate::iface::DeviceConfig) -> Result<()> {
             Ok(())
@@ -355,6 +390,16 @@ mod tests {
                 name: String::from("rx_packets"),
                 value: 123
             }])
+        }
+        fn flow_rules(&self) -> Result<Vec<FlowRule>> {
+            Ok(self.1.lock().clone())
+        }
+        fn set_flow_rules(&self, rules: Vec<FlowRule>) -> Result<()> {
+            *self.1.lock() = rules;
+            Ok(())
+        }
+        fn permanent_mac(&self) -> Result<[u8; 6]> {
+            Ok([2, 1, 2, 3, 4, 5])
         }
     }
     fn defaults() -> Settings {
@@ -381,7 +426,10 @@ mod tests {
     }
     fn setup() -> (Interface, Arc<Model>) {
         let name = crate::iface::register("nic-control%d", [2, 1, 2, 3, 4, 5], send);
-        let m = Arc::new(Model(IrqSafeSpinLock::new(defaults())));
+        let m = Arc::new(Model(
+            IrqSafeSpinLock::new(defaults()),
+            IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+        ));
         crate::iface::set_device_control(&name, m.clone());
         (Interface(name), m)
     }
@@ -478,6 +526,190 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("net", smoke_ethtool_set_eeprom_routes_to_driver);
+    fn smoke_ethtool_rxnfc_gap14_and_gpermaddr() -> TestResult {
+        // GPERMADDR (0x20): 8-byte header, the size word, then the
+        // address. A buffer smaller than the address is -ETOOSMALL.
+        if crate::ethtool::header_size(0x20) != Some(8) {
+            return TestResult::Fail("GPERMADDR header size wrong");
+        }
+        let (name, _) = setup();
+        let mut perm = alloc::vec![0; 14];
+        put(&mut perm, 0, 0x20);
+        put(&mut perm, 4, 6);
+        if crate::ethtool::execute(&name.0, &mut perm).is_err()
+            || get(&perm, 4) != 6
+            || perm[8..14] != [2, 1, 2, 3, 4, 5]
+        {
+            return TestResult::Fail("GPERMADDR failed");
+        }
+        let mut small = alloc::vec![0; 13];
+        put(&mut small, 0, 0x20);
+        put(&mut small, 4, 5);
+        if crate::ethtool::execute(&name.0, &mut small) != Err(133) {
+            return TestResult::Fail("GPERMADDR small buffer accepted");
+        }
+        // RXNFC buffers are built from the uapi layout, not from the
+        // codec: flow_type @16, h_u @20 (h_dest @20, h_source @26,
+        // h_proto @32), h_ext @72 (vlan_etype @80, vlan_tci @82,
+        // data @84), m_u @92, m_ext @144 (vlan_etype @152,
+        // vlan_tci @154, data @156), ring_cookie @168, location @176,
+        // rule_cnt @184, rule_locs @188.
+        let put64 = |b: &mut [u8], at: usize, v: u64| {
+            b[at..at + 8].copy_from_slice(&v.to_ne_bytes());
+        };
+        let get64 = |b: &[u8], at: usize| u64::from_ne_bytes(b[at..at + 8].try_into().unwrap());
+        let mut rule = alloc::vec![0; 192];
+        let insert = |name: &str, b: &mut [u8]| crate::ethtool::execute(name, b);
+        // Source MAC, full mask.
+        put(&mut rule, 0, 0x32);
+        put(&mut rule, 16, 0x12);
+        rule[26..32].copy_from_slice(&[6, 5, 4, 3, 2, 1]);
+        rule[98..104].copy_from_slice(&[255; 6]);
+        put64(&mut rule, 168, 1);
+        put(&mut rule, 176, 5);
+        if insert(&name.0, &mut rule).is_err() {
+            return TestResult::Fail("RXNFC source-MAC insert failed");
+        }
+        // VLAN EtherType, full mask, FLOW_EXT.
+        rule.fill(0);
+        put(&mut rule, 0, 0x32);
+        put(&mut rule, 16, 0x12 | 0x80000000);
+        rule[80..82].copy_from_slice(&[0x81, 0x00]);
+        rule[152..154].copy_from_slice(&[255; 2]);
+        put(&mut rule, 176, 6);
+        if insert(&name.0, &mut rule).is_err() {
+            return TestResult::Fail("RXNFC VLAN-EtherType insert failed");
+        }
+        // User data with a partial mask.
+        rule.fill(0);
+        put(&mut rule, 0, 0x32);
+        put(&mut rule, 16, 0x12 | 0x80000000);
+        rule[84..92].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        rule[156..164].copy_from_slice(&[0xff, 0xff, 0, 0, 0, 0, 0, 0]);
+        put64(&mut rule, 168, 2);
+        put(&mut rule, 176, 7);
+        if insert(&name.0, &mut rule).is_err() {
+            return TestResult::Fail("RXNFC user-data insert failed");
+        }
+        // Full-TCI match.
+        rule.fill(0);
+        put(&mut rule, 0, 0x32);
+        put(&mut rule, 16, 0x12 | 0x80000000);
+        rule[82..84].copy_from_slice(&[0x12, 0x34]);
+        rule[154..156].copy_from_slice(&[255; 2]);
+        put(&mut rule, 176, 8);
+        if insert(&name.0, &mut rule).is_err() {
+            return TestResult::Fail("RXNFC full-TCI insert failed");
+        }
+        // Wildcard: plain ETHER_FLOW, no match field at all.
+        rule.fill(0);
+        put(&mut rule, 0, 0x32);
+        put(&mut rule, 16, 0x12);
+        put64(&mut rule, 168, 3);
+        put(&mut rule, 176, 9);
+        if insert(&name.0, &mut rule).is_err() {
+            return TestResult::Fail("RXNFC wildcard insert failed");
+        }
+        // RX_CLS_LOC_ANY takes the first free location (0).
+        rule.fill(0);
+        put(&mut rule, 0, 0x32);
+        put(&mut rule, 16, 0x12);
+        rule[32..34].copy_from_slice(&[0x88, 0xf7]);
+        rule[104..106].copy_from_slice(&[255; 2]);
+        put(&mut rule, 176, u32::MAX);
+        if insert(&name.0, &mut rule).is_err() || get(&rule, 176) != 0 {
+            return TestResult::Fail("RXNFC ANY location failed");
+        }
+        // Count and table size: 6 rules, 65 locations.
+        rule.fill(0);
+        put(&mut rule, 0, 0x2e);
+        if crate::ethtool::execute(&name.0, &mut rule).is_err()
+            || get(&rule, 184) != 6
+            || get64(&rule, 8) != 65
+        {
+            return TestResult::Fail("RXNFC count / 65 table size wrong");
+        }
+        // All locations, in location order.
+        let mut all = alloc::vec![0; 448];
+        put(&mut all, 0, 0x30);
+        put(&mut all, 184, 64);
+        if crate::ethtool::execute(&name.0, &mut all).is_err()
+            || get64(&all, 8) != 65
+            || get(&all, 184) != 6
+            || (0..6)
+                .map(|i| get(&all, 188 + i * 4))
+                .collect::<alloc::vec::Vec<u32>>()
+                != alloc::vec![0, 5, 6, 7, 8, 9]
+        {
+            return TestResult::Fail("RXNFC location list wrong");
+        }
+        // Get the user-data rule back: same bytes, FLOW_EXT, queue 2,
+        // and the table size in data, as Linux reports it.
+        rule.fill(0);
+        put(&mut rule, 0, 0x2f);
+        put(&mut rule, 176, 7);
+        if crate::ethtool::execute(&name.0, &mut rule).is_err()
+            || get(&rule, 16) != 0x12 | 0x80000000
+            || get64(&rule, 168) != 2
+            || get64(&rule, 8) != 65
+            || rule[84..92] != [1, 2, 3, 4, 5, 6, 7, 8]
+            || rule[156..164] != [0xff, 0xff, 0, 0, 0, 0, 0, 0]
+        {
+            return TestResult::Fail("RXNFC user-data round-trip wrong");
+        }
+        // Get the wildcard back: plain ETHER_FLOW, queue 3, zero masks.
+        rule.fill(0);
+        put(&mut rule, 0, 0x2f);
+        put(&mut rule, 176, 9);
+        if crate::ethtool::execute(&name.0, &mut rule).is_err()
+            || get(&rule, 16) != 0x12
+            || get64(&rule, 168) != 3
+            || rule[92..164].iter().any(|v| *v != 0)
+        {
+            return TestResult::Fail("RXNFC wildcard round-trip wrong");
+        }
+        // Rejections: a partial source-MAC mask, a bad VLAN TCI mask,
+        // and an empty FLOW_EXT rule (no match at all).
+        rule.fill(0);
+        put(&mut rule, 0, 0x32);
+        put(&mut rule, 16, 0x12);
+        rule[26..32].copy_from_slice(&[6, 5, 4, 3, 2, 1]);
+        rule[98..104].copy_from_slice(&[255, 255, 0, 0, 0, 0]);
+        put(&mut rule, 176, 10);
+        if insert(&name.0, &mut rule) != Err(95) {
+            return TestResult::Fail("partial source-MAC mask accepted");
+        }
+        rule.fill(0);
+        put(&mut rule, 0, 0x32);
+        put(&mut rule, 16, 0x12 | 0x80000000);
+        rule[82..84].copy_from_slice(&[0xe0, 0x00]);
+        rule[154..156].copy_from_slice(&[0xf0, 0]);
+        put(&mut rule, 176, 10);
+        if insert(&name.0, &mut rule) != Err(95) {
+            return TestResult::Fail("bad VLAN TCI mask accepted");
+        }
+        rule.fill(0);
+        put(&mut rule, 0, 0x32);
+        put(&mut rule, 16, 0x12 | 0x80000000);
+        put(&mut rule, 176, 10);
+        if insert(&name.0, &mut rule) != Err(22) {
+            return TestResult::Fail("empty FLOW_EXT rule accepted");
+        }
+        // Delete one rule; the count drops.
+        rule.fill(0);
+        put(&mut rule, 0, 0x31);
+        put(&mut rule, 176, 5);
+        if crate::ethtool::execute(&name.0, &mut rule).is_err() {
+            return TestResult::Fail("RXNFC delete failed");
+        }
+        rule.fill(0);
+        put(&mut rule, 0, 0x2e);
+        if crate::ethtool::execute(&name.0, &mut rule).is_err() || get(&rule, 184) != 5 {
+            return TestResult::Fail("RXNFC count after delete wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net", smoke_ethtool_rxnfc_gap14_and_gpermaddr);
     fn smoke_ethtool_variable_requests_are_bounded() -> TestResult {
         for (cmd, size, offset) in [
             (4, 12, 8),
