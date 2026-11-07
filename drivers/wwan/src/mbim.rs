@@ -297,6 +297,88 @@ pub const COMMAND_TYPE_QUERY: u32 = 0;
 /// MBIM_COMMAND_TYPE_SET.
 pub const COMMAND_TYPE_SET: u32 = 1;
 
+// ─── DSS service ─────────────────────────────────────────────────────────────
+//
+// MBIM 1.0 §10.5.38; libmbim `mbim-uuid.h` / `mbim-cid.h` / `mbim-dss.h` /
+// `mbim-enums.h` (libmbim 1.31.2). DSS is its OWN service — not a Basic
+// Connect CID — with a single command, DSS_CONNECT.
+//
+// Every value below was verified in-session against the reference
+// implementation rather than the spec PDF (the USB-IF MBIM 1.0 zip was
+// unfetchable from here): the libmbim headers pin the service UUID,
+// the CID, and the link-state values, and a C probe built a real
+// DSS_CONNECT set message with libmbim and dumped its bytes — the
+// 72-byte frame pinned in `smoke_mbim_dss_connect_set_pinned`
+// reproduces that dump exactly (transaction id aside). libmbim's
+// DSS_CONNECT response parser takes no out-parameters, so the
+// response carries no information-buffer fields: success is the
+// status code alone (the parser accepts both an empty info buffer
+// and a 24-byte echo of the set buffer).
+//
+// GUID WIRE ORDER — READ BEFORE TOUCHING: MBIM UUID wire bytes are
+// the bytes of the canonical UUID string IN ORDER (libmbim emits
+// them that way, and real-modem traffic captured from umbim confirms
+// it for the Basic Connect UUID). They are NOT the Windows-GUID
+// layout with the first three fields little-endian-swapped — the
+// in-tree MBIM_UUID_BASIC_CONNECT constant used to violate this
+// (wrong UUID value besides; fixed for #1710). Do not copy the
+// Windows-GUID pattern for new service UUIDs.
+
+/// UUID_DSS — c08a26dd-7718-4382-8482-6e0d583c4d0e.
+///
+/// Source: libmbim `MBIM_UUID_DSS` (1.31.2); wire bytes as emitted by
+/// libmbim's `mbim_message_dss_connect_set_new` (see the probe dump
+/// in the DSS fixture).
+pub const MBIM_UUID_DSS: MbimUuid = [
+    0xC0, 0x8A, 0x26, 0xDD, 0x77, 0x18, 0x43, 0x82, 0x84, 0x82, 0x6E, 0x0D, 0x58, 0x3C, 0x4D, 0x0E,
+];
+
+/// MBIM_CID_DSS_CONNECT (set only; the DSS service's only CID).
+pub const CID_DSS_CONNECT: u32 = 1;
+
+/// MBIM_DSS_LINK_STATE_DEACTIVATE.
+pub const DSS_LINK_DEACTIVATE: u32 = 0;
+/// MBIM_DSS_LINK_STATE_ACTIVATE.
+pub const DSS_LINK_ACTIVATE: u32 = 1;
+
+/// Size of MBIM_DSS_CONNECT (MBIM 1.0 §10.5.38): DeviceServiceId (16)
+/// + DssSessionId (4) + DssLinkState (4). The DeviceServiceId is the
+///   per-link GUID identifying which device service owns the stream
+///   (e.g. the modem-logging GUID below); the session id is the DSS
+///   session on the shared bulk pair.
+pub const DSS_CONNECT_INFO_LEN: usize = 24;
+
+/// ModemFileTransfer link GUID — 0EBB1CEB-AF2D-484D-8DF3-53BC51FD162C.
+///
+/// Source: Microsoft Learn "MB modem logging with DSS" ("When
+/// connecting or disconnecting from DSS, the following GUID is used
+/// for modem logging"); wire bytes as emitted by libmbim for that
+/// printable GUID (probe dump).
+pub const DSS_LINK_MODEM_FILE_TRANSFER: MbimUuid = [
+    0x0E, 0xBB, 0x1C, 0xEB, 0xAF, 0x2D, 0x48, 0x4D, 0x8D, 0xF3, 0x53, 0xBC, 0x51, 0xFD, 0x16, 0x2C,
+];
+
+/// Build the MBIM_DSS_CONNECT information buffer for a set: the link
+/// GUID (16 bytes, wire order), the DSS session id, and the link
+/// state (ACTIVATE / DEACTIVATE).
+pub fn build_dss_connect_set(
+    link: &MbimUuid,
+    session_id: u32,
+    link_state: u32,
+) -> [u8; DSS_CONNECT_INFO_LEN] {
+    let mut buf = [0u8; DSS_CONNECT_INFO_LEN];
+    buf[0..16].copy_from_slice(link);
+    buf[16..20].copy_from_slice(&session_id.to_le_bytes());
+    buf[20..24].copy_from_slice(&link_state.to_le_bytes());
+    buf
+}
+
+/// Build the MBIM_DSS_CONNECT buffer for deactivation: the same
+/// structure with DssLinkState = DEACTIVATE.
+pub fn build_dss_disconnect_set(link: &MbimUuid, session_id: u32) -> [u8; DSS_CONNECT_INFO_LEN] {
+    build_dss_connect_set(link, session_id, DSS_LINK_DEACTIVATE)
+}
+
 // ─── Fragment header ─────────────────────────────────────────────────────────
 
 /// The 8-byte fragment header that follows the message header in

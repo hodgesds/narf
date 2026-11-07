@@ -30,9 +30,13 @@ transport activation and user-facing modem policy remain out of scope.
   an NDP16 signature into `NdpStream::Ips` / `NdpStream::Dss`
   (Linux `USB_CDC_MBIM_NDP16_IPS_SIGN` / `_DSS_SIGN` from
   `include/uapi/linux/usb/cdc.h`, session in byte 3).
-  MBIM_CID_DSS_CONNECT is NOT part of this interface: its service
-  UUID, CID, and payload layout did not ground from any source
-  reachable for #1143, so no connect command is built.
+  `bearer::activate_dss_stream` / `deactivate_dss_stream` drive the
+  modem side: MBIM_CID_DSS_CONNECT on the DSS service
+  (UUID c08a26dd-7718-4382-8482-6e0d583c4d0e, CID 1, 24-byte
+  MBIM_DSS_CONNECT: link GUID + session id + link state, MBIM 1.0
+  §10.5.38, verified against libmbim 1.31.2). `usb_mbim::dss_connect`
+  / `dss_disconnect` are the USB activation APIs; `MbimModem::
+  dss_connect` / `dss_disconnect` are the session-layer commands.
 - `MbimTransport` is the asynchronous transport seam used by the MBIM
   session state machine. `usb_mbim::connect` is the USB activation API.
 - `SubscriberReadyInfo::parse` decodes the 28-byte MBIM fixed header:
@@ -47,7 +51,10 @@ transport activation and user-facing modem policy remain out of scope.
   descriptor, notification endpoint, data interface, and bulk pair
   form one complete function.
 - A refused MBIM connection publishes no bearer; disconnect retains
-  the netdev with carrier down.
+  the netdev with carrier down. A refused DSS connect registers no
+  stream port; a deactivated DSS stream's port goes stale (send/recv
+  fail `NotReady`, RX is dropped + counted) and re-activation reuses
+  it.
 - IPS and DSS are separate delivery namespaces: a DSS datagram is
   delivered only to its session's registered DSS stream port, an
   IPS datagram only to its session's netdev, and neither is ever

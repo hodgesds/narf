@@ -58,7 +58,7 @@ use narf_drivers_usb::xhci::EndpointConfig;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::bearer::{self, BearerTxSink};
-use crate::mbim::{DeviceCapsInfo, IpConfigurationInfo};
+use crate::mbim::{DeviceCapsInfo, IpConfigurationInfo, MbimUuid};
 use crate::session::{MbimModem, MbimTransport};
 use crate::{WwanError, WwanPort, WwanPortKind};
 
@@ -860,6 +860,45 @@ pub async fn disconnect(bearer: usize, session: u8) -> Result<(), WwanError> {
         g.take().ok_or(WwanError::NotReady)?
     };
     let result = bearer::deactivate_session(&mut modem, bearer, session).await;
+    let mut g = record.modem.lock();
+    *g = Some(modem);
+    result
+}
+
+/// Activate a DSS link on the modem behind bearer `bearer` and
+/// register the stream port that receives its datagrams (see
+/// crate::bearer::activate_dss_stream). `link` is the per-link GUID
+/// identifying the device service that owns the stream (e.g.
+/// `mbim::DSS_LINK_MODEM_FILE_TRANSFER` for modem logging); `session`
+/// is the DSS session id on the shared bulk pair. Returns the stream
+/// port name (`wwan{bearer}dss{session}`).
+pub async fn dss_connect(bearer: usize, session: u8, link: &MbimUuid) -> Result<String, WwanError> {
+    let record = record_for_bearer(bearer).ok_or(WwanError::NotReady)?;
+    if let Some(caps) = &record.caps {
+        if (session as u32) >= caps.max_sessions {
+            return Err(WwanError::NotReady);
+        }
+    }
+    let mut modem = {
+        let mut g = record.modem.lock();
+        g.take().ok_or(WwanError::NotReady)?
+    };
+    let result = bearer::activate_dss_stream(&mut modem, bearer, link, session).await;
+    let mut g = record.modem.lock();
+    *g = Some(modem);
+    result
+}
+
+/// Deactivate a DSS link on the modem behind bearer `bearer`. The
+/// stream port goes stale (send/recv fail `NotReady`) but stays
+/// registered; re-activation reuses it.
+pub async fn dss_disconnect(bearer: usize, session: u8, link: &MbimUuid) -> Result<(), WwanError> {
+    let record = record_for_bearer(bearer).ok_or(WwanError::NotReady)?;
+    let mut modem = {
+        let mut g = record.modem.lock();
+        g.take().ok_or(WwanError::NotReady)?
+    };
+    let result = bearer::deactivate_dss_stream(&mut modem, bearer, link, session).await;
     let mut g = record.modem.lock();
     *g = Some(modem);
     result

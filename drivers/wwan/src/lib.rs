@@ -17,9 +17,10 @@
 //     class-request bring-up, control port, RX/notification pumps
 //   - Raw-IP bearer → netdev handoff over the NCM NTB-16 framing
 //     with MBIM session-signed NDPs (Linux cdc_mbim's adaptation)
-//   - DSS stream demux + registry ports (datapath only; the
-//     MBIM_CID_DSS_CONNECT command values are still ungrounded —
-//     see #1143)
+//   - DSS streams: MBIM_CID_DSS_CONNECT (DSS service UUID
+//     c08a26dd-7718-4382-8482-6e0d583c4d0e, CID 1, 24-byte
+//     MBIM_DSS_CONNECT, MBIM 1.0 §10.5.38) connect/disconnect,
+//     bearer activation, and registry stream ports (see #1143)
 //   - QMI control-message header encode (Qualcomm QMI framing)
 //   - IOSM PCI device-ID table (XMM 7560 / 7360)
 //

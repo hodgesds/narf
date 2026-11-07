@@ -274,8 +274,10 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::{
     bearer::{self, BearerTxSink},
     mbim::{
-        build_command, build_connect_set, parse_command_head, ConnectSetParams, DeviceCapsInfo,
-        IpConfigurationInfo, COMMAND_TYPE_SET, MBIM_STATUS_FAILURE, MBIM_UUID_BASIC_CONNECT,
+        build_command, build_connect_set, build_dss_connect_set, build_dss_disconnect_set,
+        parse_command_head, ConnectSetParams, DeviceCapsInfo, IpConfigurationInfo, CID_DSS_CONNECT,
+        COMMAND_TYPE_SET, DSS_LINK_ACTIVATE, DSS_LINK_DEACTIVATE, DSS_LINK_MODEM_FILE_TRANSFER,
+        MBIM_STATUS_FAILURE, MBIM_UUID_BASIC_CONNECT, MBIM_UUID_DSS,
     },
     session::{MbimModem, MbimTransport},
     usb_mbim::find_mbim_function,
@@ -322,6 +324,9 @@ struct FakeState {
     session_ip: [Option<FakeIp>; 8],
     refuse_connect_status: Option<u32>,
     refuse_connect_state: Option<u32>,
+    refuse_dss_status: Option<u32>,
+    /// (link GUID, session) pairs with an active DSS link.
+    dss_active: Vec<([u8; 16], u32)>,
     fragment_caps: bool,
     indicate_before_caps: bool,
 }
@@ -345,21 +350,43 @@ fn fake_done(ty: u32, txn: u32, status: u32) -> Vec<u8> {
 }
 
 fn fake_command_done(txn: u32, cid: u32, status: u32, info: &[u8]) -> Vec<u8> {
+    // UUID_BASIC_CONNECT, wire order — a literal on purpose: the fake
+    // never copies the production constant, so a shared wrong value
+    // cannot pass silently (the pinning test below anchors the value
+    // to the libmbim-derived bytes instead).
+    fake_command_done_svc(
+        txn,
+        &[
+            0xA2, 0x89, 0xCC, 0x33, 0xBC, 0xBB, 0x8B, 0x4F, 0xB6, 0xB0, 0x13, 0x3E, 0xC2, 0xAA,
+            0xE6, 0xDF,
+        ],
+        cid,
+        status,
+        info,
+    )
+}
+
+/// Build a COMMAND_DONE for any service: unlike [`fake_command_done`]
+/// this honors `service`, so non-Basic-Connect services (DSS) can be
+/// faked — the session layer verifies the service UUID on COMMAND_DONE,
+/// so a DSS response must carry the DSS UUID. The Basic Connect path
+/// still passes its independent literal, never the production constant,
+/// so a shared wrong value cannot pass silently (the pinning test
+/// anchors the value to the libmbim-derived bytes).
+fn fake_command_done_svc(
+    txn: u32,
+    service: &[u8; 16],
+    cid: u32,
+    status: u32,
+    info: &[u8],
+) -> Vec<u8> {
     let mut v = Vec::new();
     fw32(&mut v, 0x8000_0003); // COMMAND_DONE
     fw32(&mut v, (48 + info.len()) as u32);
     fw32(&mut v, txn);
     fw32(&mut v, 1);
     fw32(&mut v, 0); // fragment header: single fragment
-
-    // UUID_BASIC_CONNECT, wire order — a literal on purpose: the fake
-    // never copies the production constant, so a shared wrong value
-    // cannot pass silently (the pinning test below anchors the value
-    // to the libmbim-derived bytes instead).
-    v.extend_from_slice(&[
-        0xA2, 0x89, 0xCC, 0x33, 0xBC, 0xBB, 0x8B, 0x4F, 0xB6, 0xB0, 0x13, 0x3E, 0xC2, 0xAA, 0xE6,
-        0xDF,
-    ]); // UUID_BASIC_CONNECT, wire order
+    v.extend_from_slice(service);
     fw32(&mut v, cid);
     fw32(&mut v, status);
     fw32(&mut v, info.len() as u32);
@@ -515,6 +542,8 @@ impl FakeModem {
                 session_ip,
                 refuse_connect_status: None,
                 refuse_connect_state: None,
+                refuse_dss_status: None,
+                dss_active: Vec::new(),
                 fragment_caps: false,
                 indicate_before_caps: false,
             })),
@@ -547,6 +576,9 @@ impl FakeModem {
     }
     fn set_refuse_connect_state(&self, nw_error: u32) {
         self.st.lock().refuse_connect_state = Some(nw_error);
+    }
+    fn set_refuse_dss_status(&self, status: u32) {
+        self.st.lock().refuse_dss_status = Some(status);
     }
     fn set_fragment_caps(&self) {
         self.st.lock().fragment_caps = true;
@@ -581,6 +613,64 @@ impl FakeModem {
                 let info_len = frd32(msg, 44) as usize;
                 let end = core::cmp::min(msg.len(), 48 + info_len);
                 let info = &msg[48..end];
+                // DSS service commands dispatch on the service UUID,
+                // not the CID alone: CID 1 is DEVICE_CAPS on Basic
+                // Connect but DSS_CONNECT on the DSS service.
+                if msg[20..36] == mbim::MBIM_UUID_DSS[..] {
+                    match cid {
+                        mbim::CID_DSS_CONNECT => {
+                            if cmd_type != COMMAND_TYPE_SET || info.len() < 24 {
+                                let r = fake_command_done_svc(
+                                    txn,
+                                    &mbim::MBIM_UUID_DSS,
+                                    cid,
+                                    MBIM_STATUS_FAILURE,
+                                    &[],
+                                );
+                                st.recv_control.push_back(r);
+                                return;
+                            }
+                            let mut link = [0u8; 16];
+                            link.copy_from_slice(&info[0..16]);
+                            let session = frd32(info, 16);
+                            let state = frd32(info, 20);
+                            if let Some(status) = st.refuse_dss_status {
+                                let r = fake_command_done_svc(
+                                    txn,
+                                    &mbim::MBIM_UUID_DSS,
+                                    cid,
+                                    status,
+                                    &[],
+                                );
+                                st.recv_control.push_back(r);
+                            } else {
+                                if state == mbim::DSS_LINK_ACTIVATE {
+                                    if !st.dss_active.contains(&(link, session)) {
+                                        st.dss_active.push((link, session));
+                                    }
+                                } else {
+                                    st.dss_active.retain(|l| *l != (link, session));
+                                }
+                                // The DSS_CONNECT response carries no
+                                // information-buffer fields.
+                                let r =
+                                    fake_command_done_svc(txn, &mbim::MBIM_UUID_DSS, cid, 0, &[]);
+                                st.recv_control.push_back(r);
+                            }
+                        }
+                        _ => {
+                            let r = fake_command_done_svc(
+                                txn,
+                                &mbim::MBIM_UUID_DSS,
+                                cid,
+                                MBIM_STATUS_FAILURE,
+                                &[],
+                            );
+                            st.recv_control.push_back(r);
+                        }
+                    }
+                    return;
+                }
                 match cid {
                     mbim::CID_DEVICE_CAPS => {
                         if st.indicate_before_caps {
@@ -1210,6 +1300,278 @@ fn smoke_mbim_dss_datapath() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wwan", smoke_mbim_dss_datapath);
+
+// ─── Fixture: DSS_CONNECT set pinned byte-for-byte ───────────────────────────
+//
+// The full COMMAND_MSG for a DSS_CONNECT set (modem-logging link,
+// session 5, ACTIVATE), written out field by field — but the bytes
+// are NOT this crate's invention: they reproduce, transaction id
+// aside, a message built by libmbim 1.31.2 itself
+// (`mbim_message_dss_connect_set_new` for the ModemFileTransfer GUID
+// 0EBB1CEB-AF2D-484D-8DF3-53BC51FD162C, session 5, ACTIVATE), dumped
+// byte-for-byte in-session. That dump is the fixture's authority:
+// MBIM 1.0 §10.5.38 in the USB-IF zip was unfetchable from here,
+// and the DSS service UUID (c08a26dd-7718-4382-8482-6e0d583c4d0e),
+// CID 1, and the 24-byte DeviceServiceId + SessionId + LinkState
+// layout all come from it. Production builders must reproduce it
+// exactly.
+
+fn smoke_mbim_dss_connect_set_pinned() -> TestResult {
+    let info = build_dss_connect_set(&DSS_LINK_MODEM_FILE_TRANSFER, 5, DSS_LINK_ACTIVATE);
+    // The 24-byte info buffer alone, as libmbim emitted it.
+    let expected_info: &[u8] = &[
+        0x0E, 0xBB, 0x1C, 0xEB, 0xAF, 0x2D, 0x48,
+        0x4D, // DeviceServiceId (link GUID, wire order)
+        0x8D, 0xF3, 0x53, 0xBC, 0x51, 0xFD, 0x16, 0x2C, //
+        0x05, 0x00, 0x00, 0x00, // DssSessionId = 5
+        0x01, 0x00, 0x00, 0x00, // DssLinkState = ACTIVATE
+    ];
+    if info.as_slice() != expected_info {
+        return TestResult::Fail("DSS_CONNECT info buffer differs from the libmbim dump");
+    }
+    let msg = build_command(7, &MBIM_UUID_DSS, CID_DSS_CONNECT, COMMAND_TYPE_SET, &info);
+    let expected: &[u8] = &[
+        0x03, 0x00, 0x00, 0x00, // MessageType = COMMAND_MSG (3)
+        0x48, 0x00, 0x00, 0x00, // MessageLength = 72
+        0x07, 0x00, 0x00, 0x00, // TransactionId = 7
+        0x01, 0x00, 0x00, 0x00, // Fragment: total = 1
+        0x00, 0x00, 0x00, 0x00, // Fragment: current = 0
+        0xC0, 0x8A, 0x26, 0xDD, 0x77, 0x18, 0x43, 0x82, // UUID_DSS (wire order)
+        0x84, 0x82, 0x6E, 0x0D, 0x58, 0x3C, 0x4D, 0x0E, //
+        0x01, 0x00, 0x00, 0x00, // CID = MBIM_CID_DSS_CONNECT (1)
+        0x01, 0x00, 0x00, 0x00, // CommandType = SET
+        0x18, 0x00, 0x00, 0x00, // InformationBufferLength = 24
+        0x0E, 0xBB, 0x1C, 0xEB, 0xAF, 0x2D, 0x48, 0x4D, // DeviceServiceId
+        0x8D, 0xF3, 0x53, 0xBC, 0x51, 0xFD, 0x16, 0x2C, //
+        0x05, 0x00, 0x00, 0x00, // DssSessionId = 5
+        0x01, 0x00, 0x00, 0x00, // DssLinkState = ACTIVATE
+    ];
+    if msg.len() != 72 {
+        return TestResult::Fail("DSS_CONNECT set is not the libmbim-shaped 72 bytes");
+    }
+    if msg.as_slice() != expected {
+        return TestResult::Fail("DSS_CONNECT set bytes differ from the libmbim-shaped frame");
+    }
+    // Deactivation differs from activation in exactly one word.
+    let down = build_dss_disconnect_set(&DSS_LINK_MODEM_FILE_TRANSFER, 5);
+    if down[..20] != info[..20] || down[20..24] != DSS_LINK_DEACTIVATE.to_le_bytes() {
+        return TestResult::Fail("DSS disconnect set is not the activate frame with state 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wwan", smoke_mbim_dss_connect_set_pinned);
+
+// ─── Fixture: DSS connect/disconnect session conversation ────────────────────
+
+fn smoke_mbim_dss_connect_session() -> TestResult {
+    let link = DSS_LINK_MODEM_FILE_TRANSFER;
+    // A DSS connect before OPEN is NotReady — the session driver
+    // refuses commands on a closed conversation.
+    let fake = FakeModem::new();
+    let mut modem = MbimModem::new(fake.clone());
+    let r = narf_scheduler::block_on(async { modem.dss_connect(&link, 5).await });
+    match r {
+        Err(WwanError::NotReady) => {}
+        _ => return TestResult::Fail("DSS connect on a closed modem did not fail NotReady"),
+    }
+
+    let fake = FakeModem::new();
+    let fake2 = fake.clone();
+    let mut modem = MbimModem::new(fake.clone());
+    let scenario = async move {
+        modem.open().await.map_err(|_| "open failed")?;
+        modem
+            .dss_connect(&link, 5)
+            .await
+            .map_err(|_| "DSS connect failed")?;
+        if modem.dss_link_state(&link, 5) != Some(DSS_LINK_ACTIVATE) {
+            return Err("DSS link state not ACTIVATE after connect");
+        }
+        // The host's sent DSS_CONNECT is the pinned frame (open took
+        // transaction 1, so this one carries transaction 2).
+        let sent = fake2.sent_control();
+        if sent.len() != 2 {
+            return Err("expected exactly OPEN + DSS_CONNECT on the control channel");
+        }
+        let msg = &sent[1];
+        if msg.len() != 72 {
+            return Err("sent DSS_CONNECT is not 72 bytes");
+        }
+        // The sent frame is a COMMAND_MSG (a host request), not a
+        // COMMAND_DONE / INDICATE_STATUS response — `parse_command_head`
+        // only parses responses, so it rejects a request head by design
+        // (InvalidLength for any other message type). Read the request
+        // head fields directly, as the fake modem does for sent frames.
+        if frd32(msg, 0) != MBIM_COMMAND_MSG {
+            return Err("sent DSS_CONNECT message type is not COMMAND_MSG");
+        }
+        if frd32(msg, 4) != 72 {
+            return Err("sent DSS_CONNECT message length is not 72");
+        }
+        if frd32(msg, 12) != 1 || frd32(msg, 16) != 0 {
+            return Err("sent DSS_CONNECT fragment header wrong");
+        }
+        if msg[20..36] != MBIM_UUID_DSS[..] || frd32(msg, 36) != CID_DSS_CONNECT {
+            return Err("sent DSS_CONNECT service/CID wrong");
+        }
+        if frd32(msg, 40) != COMMAND_TYPE_SET {
+            return Err("sent DSS_CONNECT command type is not SET");
+        }
+        if frd32(msg, 44) != 24 {
+            return Err("sent DSS_CONNECT information buffer length is not 24");
+        }
+        if msg[8..12] != [0x02, 0x00, 0x00, 0x00] {
+            return Err("sent DSS_CONNECT transaction id wrong");
+        }
+        if msg[48..72] != build_dss_connect_set(&link, 5, DSS_LINK_ACTIVATE) {
+            return Err("sent DSS_CONNECT info buffer wrong");
+        }
+        modem
+            .dss_disconnect(&link, 5)
+            .await
+            .map_err(|_| "DSS disconnect failed")?;
+        if modem.dss_link_state(&link, 5) != Some(DSS_LINK_DEACTIVATE) {
+            return Err("DSS link state not DEACTIVATE after disconnect");
+        }
+        let sent = fake2.sent_control();
+        if sent.len() != 3 || sent[2][48..72] != build_dss_disconnect_set(&link, 5) {
+            return Err("sent DSS disconnect info buffer wrong");
+        }
+        modem.close().await.map_err(|_| "close failed")?;
+        Ok::<(), &'static str>(())
+    };
+    match narf_scheduler::block_on(scenario) {
+        Ok(()) => {}
+        Err(tag) => return TestResult::Fail(tag),
+    }
+
+    // A refusing modem answers with its status code, and no link
+    // state is recorded.
+    let fake = FakeModem::new();
+    fake.set_refuse_dss_status(MBIM_STATUS_FAILURE);
+    let mut modem = MbimModem::new(fake.clone());
+    let r = narf_scheduler::block_on(async {
+        modem.open().await?;
+        modem.dss_connect(&link, 5).await
+    });
+    match r {
+        Err(WwanError::ModemStatus(s)) if s == MBIM_STATUS_FAILURE => {}
+        Err(_) => return TestResult::Fail("DSS refusal surfaced as the wrong error"),
+        Ok(()) => return TestResult::Fail("refused DSS connect reported success"),
+    }
+    if modem.dss_link_state(&link, 5).is_some() {
+        return TestResult::Fail("refused DSS connect recorded link state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wwan", smoke_mbim_dss_connect_session);
+
+// ─── Fixture: DSS stream activation end-to-end ───────────────────────────────
+//
+// Bearer-level: DSS_CONNECT on the modem, then the stream port; the
+// port carries the link's traffic, publishes NO netdev, goes stale
+// on deactivation, and re-activation reuses the same port.
+
+fn smoke_mbim_dss_activate_stream() -> TestResult {
+    let link = DSS_LINK_MODEM_FILE_TRANSFER;
+    let fake = FakeModem::new();
+    let fake2 = fake.clone();
+    let bearer_idx = bearer::register_bearer(fake.tx_sink(), [0x02, 0x4D, 0x42, 0x49, 0x4D, 0x04]);
+    let mut modem = MbimModem::new(fake.clone());
+    let scenario = async move {
+        modem.open().await.map_err(|_| "open failed")?;
+        let name = bearer::activate_dss_stream(&mut modem, bearer_idx, &link, 5)
+            .await
+            .map_err(|_| "activate DSS stream failed")?;
+        if name != alloc::format!("wwan{}dss5", bearer_idx) {
+            return Err("DSS stream port name wrong");
+        }
+        // A DSS stream is a byte stream, not an IP bearer: no netdev.
+        if bearer::session_iface_name(bearer_idx, 5).is_some() {
+            return Err("DSS activation published a netdev");
+        }
+        let port = match crate::port_by_name(&name) {
+            Some(p) if p.kind() == WwanPortKind::Dss => p,
+            _ => return Err("DSS port not findable in registry"),
+        };
+        // RX: a DSS datagram for session 5 lands in the port's queue.
+        let ntb = bearer::build_mbim_dss_ntb(11, 5, b"modem-log");
+        bearer::deliver_ntb(bearer_idx, &ntb).map_err(|_| "deliver DSS NTB failed")?;
+        let mut buf = [0u8; 32];
+        match port.recv(&mut buf) {
+            Ok(9) if &buf[..9] == b"modem-log" => {}
+            _ => return Err("DSS RX wrong"),
+        }
+        // TX: the port's payload leaves DSS-signed for session 5.
+        if port.send(b"ping").is_err() {
+            return Err("DSS port send failed");
+        }
+        let sent = fake2.sent_data();
+        if sent.len() != 1 {
+            return Err("DSS TX produced no NTB");
+        }
+        let tx = bearer::parse_mbim_ntb(&sent[0]).map_err(|_| "DSS TX NTB unparseable")?;
+        if tx.len() != 1 || tx[0].stream != bearer::NdpStream::Dss(5) || tx[0].data != b"ping" {
+            return Err("DSS TX NTB wrong");
+        }
+        // Deactivate: the port goes stale — no traffic either way —
+        // and RX for the deactivated stream is dropped + counted.
+        bearer::deactivate_dss_stream(&mut modem, bearer_idx, &link, 5)
+            .await
+            .map_err(|_| "deactivate DSS stream failed")?;
+        match port.send(b"late") {
+            Err(WwanError::NotReady) => {}
+            _ => return Err("stale DSS port still sends"),
+        }
+        match port.recv(&mut buf) {
+            Err(WwanError::NotReady) => {}
+            _ => return Err("stale DSS port still recvs"),
+        }
+        let drops_before = bearer::bearer_dss_drop_counters(bearer_idx).unwrap_or(0);
+        bearer::deliver_ntb(bearer_idx, &ntb).map_err(|_| "deliver after deactivate failed")?;
+        if bearer::bearer_dss_drop_counters(bearer_idx) != Some(drops_before + 1) {
+            return Err("deactivated DSS RX not dropped + counted");
+        }
+        // Re-activation reuses the same port (no duplicate entry).
+        let name2 = bearer::activate_dss_stream(&mut modem, bearer_idx, &link, 5)
+            .await
+            .map_err(|_| "re-activate DSS stream failed")?;
+        if name2 != name {
+            return Err("re-activation renamed the DSS port");
+        }
+        bearer::deliver_ntb(bearer_idx, &ntb).map_err(|_| "deliver after re-activate failed")?;
+        match port.recv(&mut buf) {
+            Ok(9) if &buf[..9] == b"modem-log" => {}
+            _ => return Err("re-activated DSS RX wrong"),
+        }
+        modem.close().await.map_err(|_| "close failed")?;
+        Ok::<(), &'static str>(())
+    };
+    match narf_scheduler::block_on(scenario) {
+        Ok(()) => {}
+        Err(tag) => return TestResult::Fail(tag),
+    }
+
+    // A refused DSS connect registers no port.
+    let fake = FakeModem::new();
+    fake.set_refuse_dss_status(MBIM_STATUS_FAILURE);
+    let b = bearer::register_bearer(fake.tx_sink(), [0x02, 0x4D, 0x42, 0x49, 0x4D, 0x05]);
+    let mut modem = MbimModem::new(fake.clone());
+    let r = narf_scheduler::block_on(async {
+        modem.open().await?;
+        bearer::activate_dss_stream(&mut modem, b, &link, 5).await
+    });
+    match r {
+        Err(WwanError::ModemStatus(s)) if s == MBIM_STATUS_FAILURE => {}
+        Err(_) => return TestResult::Fail("DSS activation refusal surfaced as the wrong error"),
+        Ok(_) => return TestResult::Fail("refused DSS activation reported success"),
+    }
+    if crate::port_by_name(&alloc::format!("wwan{}dss5", b)).is_some() {
+        return TestResult::Fail("refused DSS connect registered a port");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wwan", smoke_mbim_dss_activate_stream);
 
 // ─── Fixture: end-to-end two-session conversation ────────────────────────────
 
