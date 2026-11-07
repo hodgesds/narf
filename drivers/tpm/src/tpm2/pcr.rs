@@ -167,3 +167,20 @@ pub fn build_read_all_cmd(bank: HashBank) -> alloc::vec::Vec<u8> {
     let sel = PcrSelection::all(bank);
     super::commands::pcr_read(sel.hash_alg, &sel.bitmap)
 }
+
+/// Build a `TPM2_PCR_Event` command (Part 3 §22.3): hash
+/// `event_data` into PCR `pcr` — the TPM digests the event per
+/// allocated bank and extends the PCR with the digest, returning
+/// the digests. `event_data` may be empty (a zero-length event
+/// still extends) and at most 1024 bytes.
+pub fn build_event_cmd(pcr: u32, event_data: &[u8]) -> alloc::vec::Vec<u8> {
+    super::commands::pcr_event(pcr, event_data)
+}
+
+/// Build a `TPM2_PCR_Allocate` command (Part 3 §22.5): request a
+/// PCR allocation — `selections` is the `TPML_PCR_SELECTION` to
+/// store for the next `_TPM_Init`. Platform-authorized; the
+/// allocation in place is retained until that init.
+pub fn build_allocate_cmd(selections: &[(u16, &[u8])]) -> alloc::vec::Vec<u8> {
+    super::commands::pcr_allocate(selections)
+}

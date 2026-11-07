@@ -32,6 +32,16 @@
 //! | `start_auth_session`  | 0x176       | §11.1         |
 //! | `policy_pcr`          | 0x19F       | §19.7         |
 //! | `read_public`         | 0x169       | §23           |
+//! | `quote`               | 0x158       | §18.4         |
+//! | `pcr_event`           | 0x13C       | §22.3         |
+//! | `pcr_allocate`        | 0x12B       | §22.5         |
+//! | `policy_authorize`    | 0x16A       | §23.16        |
+//! | `nv_read_public`      | 0x169       | §31.6         |
+//! | `nv_extend`           | 0x136       | §31.9         |
+//! | `nv_set_bits`         | 0x135       | §31.10        |
+//! | `nv_write_lock`       | 0x138       | §31.11        |
+//! | `nv_global_write_lock` | 0x132      | §31.12        |
+//! | `nv_read_lock`        | 0x14F       | §31.14        |
 //!
 //! Structured response parsers (the pre-#941 layer had only
 //! GetRandom's): `parse_create_response`,
@@ -41,7 +51,10 @@
 //! `parse_pcr_selections` over its data),
 //! `parse_get_test_result_response`,
 //! `parse_start_auth_session_response`,
-//! `parse_read_public_response`.
+//! `parse_read_public_response`, `parse_pcr_event_response`,
+//! `parse_pcr_allocate_response`,
+//! `parse_nv_read_public_response`, `parse_quote_response`
+//! (the last through the canonical codec).
 //!
 //! Correction (#945): `parse_create_primary_response` previously
 //! shared `parse_create_response`'s parameter walk, but the two
@@ -60,6 +73,17 @@
 //! plus `parse_policy_get_digest_response`,
 //! `parse_pcr_read_response`, and the `response_rc` failure-class
 //! reader.
+//!
+//! The command-set remainder (#941) adds `quote` (a delegation to
+//! the canonical codec — this layer owns no second Quote
+//! encoding), `pcr_event` / `pcr_allocate`, `policy_authorize`,
+//! and the NV completion set (`nv_read_public`, `nv_extend`,
+//! `nv_set_bits`, `nv_write_lock`, `nv_read_lock`,
+//! `nv_global_write_lock`) with their response parsers. The
+//! section numbers on the new rows above are TCG Part 3 Rev 1.59;
+//! the older rows' numbers predate that revision check and are a
+//! separate doc-citation sweep — do not copy a § number from them.
+
 //!
 //! The hierarchy/session/object commands and the parsers are the
 //! #941 command-set completion: the audit found Clear without even
@@ -84,11 +108,14 @@ use super::{
     TPM_CC_CREATE, TPM_CC_CREATE_PRIMARY, TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
     TPM_CC_DICTIONARY_ATTACK_PARAMETERS, TPM_CC_EVICT_CONTROL, TPM_CC_FLUSH_CONTEXT,
     TPM_CC_GET_CAPABILITY, TPM_CC_GET_RANDOM, TPM_CC_GET_TEST_RESULT, TPM_CC_LOAD,
-    TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_INCREMENT, TPM_CC_NV_READ, TPM_CC_NV_UNDEFINE_SPACE,
-    TPM_CC_NV_WRITE, TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_GET_DIGEST,
-    TPM_CC_POLICY_PCR, TPM_CC_READ_PUBLIC, TPM_CC_SELF_TEST, TPM_CC_SHUTDOWN, TPM_CC_STARTUP,
-    TPM_CC_START_AUTH_SESSION, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL, TPM_RH_LOCKOUT, TPM_RH_OWNER,
-    TPM_RH_PLATFORM, TPM_RS_PW, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
+    TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_EXTEND, TPM_CC_NV_GLOBAL_WRITE_LOCK, TPM_CC_NV_INCREMENT,
+    TPM_CC_NV_READ, TPM_CC_NV_READ_LOCK, TPM_CC_NV_READ_PUBLIC, TPM_CC_NV_SET_BITS,
+    TPM_CC_NV_UNDEFINE_SPACE, TPM_CC_NV_WRITE, TPM_CC_NV_WRITE_LOCK, TPM_CC_PCR_ALLOCATE,
+    TPM_CC_PCR_EVENT, TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_AUTHORIZE,
+    TPM_CC_POLICY_GET_DIGEST, TPM_CC_POLICY_PCR, TPM_CC_READ_PUBLIC, TPM_CC_SELF_TEST,
+    TPM_CC_SHUTDOWN, TPM_CC_STARTUP, TPM_CC_START_AUTH_SESSION, TPM_CC_STIR_RANDOM, TPM_CC_UNSEAL,
+    TPM_RH_LOCKOUT, TPM_RH_NULL, TPM_RH_OWNER, TPM_RH_PLATFORM, TPM_RS_PW, TPM_ST_NO_SESSIONS,
+    TPM_ST_SESSIONS, TPM_ST_VERIFIED, TPM_SU_CLEAR,
 };
 use alloc::vec::Vec;
 
@@ -751,6 +778,221 @@ pub fn nv_increment(nv_index: u32) -> Vec<u8> {
     buf
 }
 
+// ── TPM command-set remainder (#941) ─────────────────────────────────
+//
+// Quote (drivers-layer delegation to the canonical codec),
+// PCR_Event / PCR_Allocate, PolicyAuthorize, and the NV completion
+// set. Section numbers are TCG Part 3 Rev 1.59.
+
+/// Build `TPM2_Quote(signHandle, qualifyingData, inScheme,
+/// PCRselect)` — Part 3 §18.4.
+///
+/// Delegates to the canonical codec
+/// (`narf_tpm::commands::CommandBuilder::quote`): this layer must
+/// not grow a second Quote encoding (#934 — the PolicyPCR
+/// command-code drift is what a second encoding buys). The signing
+/// handle is an authorization handle, so the frame is
+/// `TPM_ST_SESSIONS` with the empty password session; `scheme` is
+/// `(algorithm, hash)` — `(TPM_ALG_ECDSA, TPM_ALG_SHA256)` for the
+/// in-tree AK, `TPM_ALG_NULL` as the algorithm to use the key's
+/// own scheme; `qualifying_data` is the verifier's nonce, bound
+/// into the attestation as `extraData`.
+pub fn quote(
+    sign_handle: u32,
+    qualifying_data: &[u8],
+    scheme: (u16, u16),
+    selections: &[(u16, &[u8])],
+) -> Vec<u8> {
+    narf_tpm::commands::CommandBuilder::quote(sign_handle, qualifying_data, scheme, selections)
+}
+
+/// Build `TPM2_PCR_Event(pcrHandle, eventData)` — Part 3 §22.3.
+///
+/// The TPM hashes `event_data` per allocated bank, extends the
+/// PCR with the digest, and returns the digests. `event_data` may
+/// be empty and is at most 1024 bytes; `TPM_RH_NULL` as the handle
+/// hashes without extending. The PCR handle is an authorization
+/// handle, so the frame is `TPM_ST_SESSIONS` with the empty
+/// password session.
+pub fn pcr_event(pcr: u32, event_data: &[u8]) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_PCR_EVENT);
+    buf.extend_from_slice(&pcr.to_be_bytes());
+    push_password_session(&mut buf);
+    buf.extend_from_slice(&(event_data.len() as u16).to_be_bytes());
+    buf.extend_from_slice(event_data);
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_PCR_Allocate(authHandle, pcrAllocation)` —
+/// Part 3 §22.5.
+///
+/// Requests a PCR allocation to store for the next `_TPM_Init`;
+/// the allocation in place is retained until then, and only the
+/// banks listed in `pcr_allocation` change. Platform-authorized
+/// (`TPM_RH_PLATFORM`, empty password session).
+pub fn pcr_allocate(selections: &[(u16, &[u8])]) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_PCR_ALLOCATE);
+    buf.extend_from_slice(&TPM_RH_PLATFORM.to_be_bytes());
+    push_password_session(&mut buf);
+    buf.extend_from_slice(&(selections.len() as u32).to_be_bytes());
+    for (alg, mask) in selections {
+        buf.extend_from_slice(&alg.to_be_bytes());
+        buf.push(mask.len() as u8);
+        buf.extend_from_slice(mask);
+    }
+    finalise(&mut buf);
+    buf
+}
+
+/// The NULL `TPMT_TK_VERIFIED` ticket (Part 2 Table 97):
+/// `<TPM_ST_VERIFIED, TPM_RH_NULL, empty digest>` — the ticket a
+/// trial-session `policy_authorize` carries. A trial policy has
+/// no ticket to validate; the TPM extends the digest as if the
+/// ticket were valid (Part 3 §23.16 NOTE_2).
+pub fn null_verified_ticket() -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[0..2].copy_from_slice(&TPM_ST_VERIFIED.to_be_bytes());
+    out[2..6].copy_from_slice(&TPM_RH_NULL.to_be_bytes());
+    out[6..8].copy_from_slice(&0u16.to_be_bytes());
+    out
+}
+
+/// Build `TPM2_PolicyAuthorize(policySession, approvedPolicy,
+/// policyRef, keySign, checkTicket)` — Part 3 §23.16.
+///
+/// Lets a policy authority sign a new policy into an existing
+/// one: the TPM checks `approved_policy` against the session's
+/// current digest, validates `check_ticket` (a ticket produced by
+/// `TPM2_VerifySignature` over `H(approvedPolicy ‖ policyRef)`
+/// signed by `key_sign`), resets the digest to zero, and updates
+/// it with `PolicyUpdate(TPM_CC_PolicyAuthorize, keySign,
+/// policyRef)` (Part 3 §23.2.3). A trial session skips ticket
+/// validation — pass [`null_verified_ticket()`] for it.
+///
+/// The command has no authorization area — `policySession` is an
+/// operand, not an authorizer (Auth Index: None) — so it is
+/// `TPM_ST_NO_SESSIONS` framed, like `policy_get_digest`.
+/// `check_ticket` is the marshaled `TPMT_TK_VERIFIED` bytes as
+/// returned by `VerifySignature` (tag + hierarchy + digest);
+/// this builder does not interpret them.
+pub fn policy_authorize(
+    session_handle: u32,
+    approved_policy: &[u8],
+    policy_ref: &[u8],
+    key_sign: &[u8],
+    check_ticket: &[u8],
+) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_NO_SESSIONS, TPM_CC_POLICY_AUTHORIZE);
+    buf.extend_from_slice(&session_handle.to_be_bytes());
+    buf.extend_from_slice(&(approved_policy.len() as u16).to_be_bytes());
+    buf.extend_from_slice(approved_policy);
+    buf.extend_from_slice(&(policy_ref.len() as u16).to_be_bytes());
+    buf.extend_from_slice(policy_ref);
+    buf.extend_from_slice(&(key_sign.len() as u16).to_be_bytes());
+    buf.extend_from_slice(key_sign);
+    buf.extend_from_slice(check_ticket);
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_NV_ReadPublic(nvIndex)` — Part 3 §31.6.
+///
+/// No authorization and no sessions: returns the index's public
+/// area (`TPMS_NV_PUBLIC`) and its name. The public area carries
+/// the index's live attributes (a written or locked index reports
+/// `TPMA_NV_WRITTEN` / `TPMA_NV_WRITELOCKED` /
+/// `TPMA_NV_READLOCKED` SET).
+pub fn nv_read_public(nv_index: u32) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_NO_SESSIONS, TPM_CC_NV_READ_PUBLIC);
+    buf.extend_from_slice(&nv_index.to_be_bytes());
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_NV_Extend(authHandle, nvIndex, data)` — Part 3
+/// §31.9.
+///
+/// The index must be a `TPMA_NV_TYPE_EXTEND` index; the new value
+/// is `H(nameAlg ‖ old ‖ data)` — `data` may be larger than the
+/// index's defined size, and an unwritten index extends from the
+/// Zero Digest. Sets `TPMA_NV_WRITTEN`. The auth handle is the
+/// index itself (self-auth, empty password session), mirroring
+/// `nv_read` / `nv_write`.
+pub fn nv_extend(nv_index: u32, data: &[u8]) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_NV_EXTEND);
+    buf.extend_from_slice(&nv_index.to_be_bytes()); // authHandle
+    buf.extend_from_slice(&nv_index.to_be_bytes()); // nvIndex
+    push_password_session(&mut buf);
+    buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    buf.extend_from_slice(data);
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_NV_SetBits(authHandle, nvIndex, bits)` — Part 3
+/// §31.10.
+///
+/// The index must be a `TPMA_NV_TYPE_BITS` index; `bits` are ORed
+/// into its contents (an unwritten index ORs from all-zero bits).
+/// Sets `TPMA_NV_WRITTEN` even when no bits change. Self-auth,
+/// mirroring `nv_read` / `nv_write`.
+pub fn nv_set_bits(nv_index: u32, bits: u64) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_NV_SET_BITS);
+    buf.extend_from_slice(&nv_index.to_be_bytes()); // authHandle
+    buf.extend_from_slice(&nv_index.to_be_bytes()); // nvIndex
+    push_password_session(&mut buf);
+    buf.extend_from_slice(&bits.to_be_bytes());
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_NV_WriteLock(authHandle, nvIndex)` — Part 3
+/// §31.11.
+///
+/// SETs `TPMA_NV_WRITELOCKED`, inhibiting further writes. The
+/// index must carry `WRITEDEFINE` or `WRITE_STCLEAR`; it is not
+/// an error if the index is already locked. Self-auth, mirroring
+/// `nv_read` / `nv_write`.
+pub fn nv_write_lock(nv_index: u32) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_NV_WRITE_LOCK);
+    buf.extend_from_slice(&nv_index.to_be_bytes()); // authHandle
+    buf.extend_from_slice(&nv_index.to_be_bytes()); // nvIndex
+    push_password_session(&mut buf);
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_NV_ReadLock(authHandle, nvIndex)` — Part 3
+/// §31.14.
+///
+/// SETs `TPMA_NV_READLOCKED`, blocking further reads until the
+/// next `Startup(TPM_SU_CLEAR)`. The index must carry
+/// `READ_STCLEAR`; it is not an error if the index is already
+/// locked, and an unwritten index may be locked. Self-auth,
+/// mirroring `nv_read` / `nv_write`.
+pub fn nv_read_lock(nv_index: u32) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_NV_READ_LOCK);
+    buf.extend_from_slice(&nv_index.to_be_bytes()); // authHandle
+    buf.extend_from_slice(&nv_index.to_be_bytes()); // nvIndex
+    push_password_session(&mut buf);
+    finalise(&mut buf);
+    buf
+}
+
+/// Build `TPM2_NV_GlobalWriteLock(authHandle)` — Part 3 §31.12.
+///
+/// SETs `TPMA_NV_WRITELOCKED` on every index carrying
+/// `TPMA_NV_GLOBALLOCK`. `auth_handle` is `TPM_RH_OWNER` or
+/// `TPM_RH_PLATFORM`, empty password session.
+pub fn nv_global_write_lock(auth_handle: u32) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_SESSIONS, TPM_CC_NV_GLOBAL_WRITE_LOCK);
+    buf.extend_from_slice(&auth_handle.to_be_bytes());
+    push_password_session(&mut buf);
+    finalise(&mut buf);
+    buf
+}
+
 // ── Response parsing ─────────────────────────────────────────────────
 
 /// The response code of a raw response frame, without
@@ -1052,6 +1294,92 @@ pub fn parse_nv_read_response(raw: &[u8]) -> Result<Vec<u8>, &'static str> {
     let (_handle, params) = response_params(raw, false)?;
     let mut r = Reader::new(params);
     Ok(r.tpm2b()?.to_vec())
+}
+
+/// The outputs of `TPM2_PCR_Allocate` (Part 3 §22.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PcrAllocateOutputs {
+    /// `allocationSuccess` — YES when the requested allocation
+    /// can be satisfied (`size_needed <= size_available`).
+    pub allocation_success: bool,
+    /// `maxPCR` — the maximum number of PCR that may be in a bank.
+    pub max_pcr: u32,
+    /// `sizeNeeded` — octets required to satisfy the request.
+    pub size_needed: u32,
+    /// `sizeAvailable` — octets available, computed before the
+    /// allocation.
+    pub size_available: u32,
+}
+
+/// Parse a `TPM2_PCR_Allocate` response (Part 3 §22.5): the
+/// success flag and the three size words. The response is
+/// sessions-tagged; `allocationSuccess` is a `TPMI_YES_NO` byte.
+pub fn parse_pcr_allocate_response(raw: &[u8]) -> Result<PcrAllocateOutputs, &'static str> {
+    let (_handle, params) = response_params(raw, false)?;
+    let mut r = Reader::new(params);
+    let allocation_success = r.take(1)?[0] != 0;
+    let max_pcr = r.u32()?;
+    let size_needed = r.u32()?;
+    let size_available = r.u32()?;
+    Ok(PcrAllocateOutputs {
+        allocation_success,
+        max_pcr,
+        size_needed,
+        size_available,
+    })
+}
+
+/// Parse a `TPM2_PCR_Event` response (Part 3 §22.3): the
+/// `TPML_DIGEST_VALUES` — one `(algorithm, digest)` pair per bank
+/// the event was hashed for.
+pub fn parse_pcr_event_response(raw: &[u8]) -> Result<Vec<(u16, Vec<u8>)>, &'static str> {
+    let (_handle, params) = response_params(raw, false)?;
+    let mut r = Reader::new(params);
+    let count = r.u32()? as usize;
+    let mut digests = Vec::with_capacity(count);
+    for _ in 0..count {
+        let alg = r.u16()?;
+        digests.push((alg, r.tpm2b()?.to_vec()));
+    }
+    Ok(digests)
+}
+
+/// The outputs of `TPM2_NV_ReadPublic` (Part 3 §31.6): the
+/// index's public area and its name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NvReadPublicOutputs {
+    /// TPM2B_NV_PUBLIC inner bytes (TPMS_NV_PUBLIC, with the
+    /// index's live attributes).
+    pub public: Vec<u8>,
+    /// TPM2B_NAME — the index's name.
+    pub name: Vec<u8>,
+}
+
+/// Parse a `TPM2_NV_ReadPublic` response (Part 3 §31.6): the
+/// public area and the name. The response is no-sessions framed
+/// — its whole body is the parameter area.
+pub fn parse_nv_read_public_response(raw: &[u8]) -> Result<NvReadPublicOutputs, &'static str> {
+    let (_handle, params) = response_params(raw, false)?;
+    let mut r = Reader::new(params);
+    let public = r.tpm2b()?.to_vec();
+    let name = r.tpm2b()?.to_vec();
+    Ok(NvReadPublicOutputs { public, name })
+}
+
+/// Parse a `TPM2_Quote` response through the canonical codec
+/// (Part 3 §18.4): the attestation bytes, their parsed form, and
+/// the signature — see [`narf_tpm::attest::QuoteResponse`]. The
+/// canonical error maps onto this layer's `&'static str`
+/// convention: a non-zero response code reads "quote response
+/// error", a malformed frame reads "quote response malformed".
+pub fn parse_quote_response(raw: &[u8]) -> Result<narf_tpm::attest::QuoteResponse, &'static str> {
+    let parser = narf_tpm::commands::ResponseParser::new(raw).map_err(|e| match e {
+        narf_tpm::TpmError::Rc(_) => "quote response error",
+        _ => "quote response malformed",
+    })?;
+    parser
+        .parse_quote_response()
+        .map_err(|_| "quote response malformed")
 }
 
 /// Parse a `TPM2_GetTestResult` response: `(outData, testResult)`.

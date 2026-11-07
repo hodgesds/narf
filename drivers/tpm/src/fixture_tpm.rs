@@ -33,6 +33,20 @@
 //!   §31.13: a `TPMA_NV_COUNTER` index changes only via
 //!   `NV_Increment`; a defined-but-never-written index reads
 //!   back `TPM_RC_NV_UNINITIALIZED`, even at size zero.
+//! - **Command-set remainder (#941).** `Quote` returns a real
+//!   attestation (qualifying-data echo, composite digest
+//!   recomputed from the PCRs) with a structurally valid
+//!   placeholder signature — the fixture holds no signing key.
+//!   `PCR_Event` hashes the event and extends; `PCR_Allocate`
+//!   evaluates the request against the single SHA-256 bank.
+//!   `PolicyAuthorize` on a trial session applies the §23.2.3
+//!   update over a reset digest (a non-trial session fails
+//!   closed: the ticket HMAC cannot be verified without a proof
+//!   value). `NV_ReadPublic` returns the live public area and
+//!   the name over it; `NV_Extend` / `NV_SetBits` enforce their
+//!   index types; the write / read / global locks are enforced
+//!   on every write and read path and clear per the STCLEAR
+//!   rules on `Startup(TPM_SU_CLEAR)`.
 //! - **Startup gating:** every command before `TPM2_Startup`
 //!   fails with `TPM_RC_INITIALIZE`.
 //! - **Power-state sequencing (#1003).** `TPM2_Shutdown`
@@ -70,7 +84,10 @@
 //! lifecycle conversations; wrong answers here cannot mask an
 //! anchor defect): HMAC / parameter-encryption sessions,
 //! EK/AK hierarchies beyond template echo, persistence
-//! (EvictControl).
+//! (EvictControl), Quote signatures (no signing key),
+//! non-trial PolicyAuthorize ticket verification (no proof
+//! value), the PCR allocation store and its Shutdown(STATE)
+//! restriction (no `_TPM_Init` model to apply or clear them).
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -79,19 +96,29 @@ use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::devfs_bridge::TpmTransport;
-use crate::tpm2::nv::NV_ATTR_NO_DA;
+use crate::tpm2::nv::{
+    NV_ATTR_CLEAR_STCLEAR, NV_ATTR_GLOBALLOCK, NV_ATTR_NO_DA, NV_ATTR_READLOCKED,
+    NV_ATTR_READ_STCLEAR, NV_ATTR_WRITEDEFINE, NV_ATTR_WRITELOCKED, NV_ATTR_WRITE_STCLEAR,
+    NV_ATTR_WRITTEN,
+};
 use crate::tpm2::{
-    TPM_ALG_NULL, TPM_ALG_SHA256, TPM_CC_CLEAR, TPM_CC_CREATE, TPM_CC_CREATE_PRIMARY,
-    TPM_CC_DICTIONARY_ATTACK_LOCK_RESET, TPM_CC_DICTIONARY_ATTACK_PARAMETERS, TPM_CC_FLUSH_CONTEXT,
-    TPM_CC_GET_CAPABILITY, TPM_CC_GET_RANDOM, TPM_CC_LOAD, TPM_CC_NV_DEFINE_SPACE,
-    TPM_CC_NV_INCREMENT, TPM_CC_NV_READ, TPM_CC_NV_UNDEFINE_SPACE, TPM_CC_NV_WRITE,
-    TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_POLICY_GET_DIGEST, TPM_CC_POLICY_PCR,
-    TPM_CC_SHUTDOWN, TPM_CC_STARTUP, TPM_CC_START_AUTH_SESSION, TPM_CC_UNSEAL,
-    TPM_PT_LOCKOUT_COUNTER, TPM_PT_LOCKOUT_INTERVAL, TPM_PT_LOCKOUT_RECOVERY, TPM_PT_MANUFACTURER,
-    TPM_PT_MAX_AUTH_FAIL, TPM_RC_AUTH_FAIL, TPM_RC_BAD_AUTH, TPM_RC_COMMAND_CODE, TPM_RC_FAILURE,
-    TPM_RC_HANDLE, TPM_RC_INITIALIZE, TPM_RC_LOCKOUT, TPM_RC_NV_DEFINED, TPM_RC_NV_UNINITIALIZED,
-    TPM_RC_POLICY_FAIL, TPM_RC_SUCCESS, TPM_RC_VALUE, TPM_RH_ENDORSEMENT, TPM_RH_LOCKOUT,
-    TPM_RH_OWNER, TPM_RH_PLATFORM, TPM_SE_TRIAL, TPM_ST_SESSIONS, TPM_SU_CLEAR, TPM_SU_STATE,
+    TPM_ALG_NULL, TPM_ALG_RSASSA, TPM_ALG_SHA1, TPM_ALG_SHA256, TPM_ALG_SHA384, TPM_ALG_SHA512,
+    TPM_CC_CLEAR, TPM_CC_CREATE, TPM_CC_CREATE_PRIMARY, TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
+    TPM_CC_DICTIONARY_ATTACK_PARAMETERS, TPM_CC_FLUSH_CONTEXT, TPM_CC_GET_CAPABILITY,
+    TPM_CC_GET_RANDOM, TPM_CC_LOAD, TPM_CC_NV_DEFINE_SPACE, TPM_CC_NV_EXTEND,
+    TPM_CC_NV_GLOBAL_WRITE_LOCK, TPM_CC_NV_INCREMENT, TPM_CC_NV_READ, TPM_CC_NV_READ_LOCK,
+    TPM_CC_NV_READ_PUBLIC, TPM_CC_NV_SET_BITS, TPM_CC_NV_UNDEFINE_SPACE, TPM_CC_NV_WRITE,
+    TPM_CC_NV_WRITE_LOCK, TPM_CC_PCR_ALLOCATE, TPM_CC_PCR_EVENT, TPM_CC_PCR_EXTEND,
+    TPM_CC_PCR_READ, TPM_CC_POLICY_AUTHORIZE, TPM_CC_POLICY_GET_DIGEST, TPM_CC_POLICY_PCR,
+    TPM_CC_QUOTE, TPM_CC_SHUTDOWN, TPM_CC_STARTUP, TPM_CC_START_AUTH_SESSION, TPM_CC_UNSEAL,
+    TPM_GENERATED_VALUE, TPM_PT_LOCKOUT_COUNTER, TPM_PT_LOCKOUT_INTERVAL, TPM_PT_LOCKOUT_RECOVERY,
+    TPM_PT_MANUFACTURER, TPM_PT_MAX_AUTH_FAIL, TPM_RC_ATTRIBUTES, TPM_RC_AUTH_FAIL,
+    TPM_RC_BAD_AUTH, TPM_RC_COMMAND_CODE, TPM_RC_FAILURE, TPM_RC_HANDLE, TPM_RC_HASH,
+    TPM_RC_INITIALIZE, TPM_RC_LOCKOUT, TPM_RC_NV_DEFINED, TPM_RC_NV_LOCKED,
+    TPM_RC_NV_UNINITIALIZED, TPM_RC_POLICY, TPM_RC_POLICY_FAIL, TPM_RC_SIZE, TPM_RC_SUCCESS,
+    TPM_RC_TAG, TPM_RC_VALUE, TPM_RH_ENDORSEMENT, TPM_RH_LOCKOUT, TPM_RH_NULL, TPM_RH_OWNER,
+    TPM_RH_PLATFORM, TPM_SE_TRIAL, TPM_ST_ATTEST_QUOTE, TPM_ST_SESSIONS, TPM_ST_VERIFIED,
+    TPM_SU_CLEAR, TPM_SU_STATE,
 };
 
 // ── SHA-256 (FIPS 180-4), one-shot ───────────────────────────────
@@ -217,6 +244,12 @@ impl<'a> Cursor<'a> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
+    fn u64(&mut self) -> Result<u64, ()> {
+        let b = self.take(8)?;
+        Ok(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
     fn tpm2b(&mut self) -> Result<&'a [u8], ()> {
         let n = self.u16()? as usize;
         self.take(n)
@@ -341,6 +374,19 @@ struct NvEntry {
     /// The index's own auth value (the define command's `auth`
     /// parameter), checked on self-auth NV access.
     auth_value: Vec<u8>,
+    /// The TPMS_NV_PUBLIC inner bytes as defined — `NV_ReadPublic`
+    /// returns them with the live `WRITTEN` / `WRITELOCKED` /
+    /// `READLOCKED` bits patched in (Part 2 §13.4) and the name
+    /// computed over the live area.
+    public: Vec<u8>,
+    /// `TPMA_NV_WRITELOCKED`, SET by `NV_WriteLock` or
+    /// `NV_GlobalWriteLock` (Part 3 §31.11/§31.12); cleared on
+    /// `Startup(TPM_SU_CLEAR)` unless `WRITEDEFINE` is SET and
+    /// the index is written.
+    write_locked: bool,
+    /// `TPMA_NV_READLOCKED`, SET by `NV_ReadLock` (Part 3
+    /// §31.14); cleared by the next `Startup(TPM_SU_CLEAR)`.
+    read_locked: bool,
 }
 
 /// The fixture's manufactured DA defaults (Part 1 §19): the
@@ -350,6 +396,13 @@ struct NvEntry {
 /// modelled, so the intervals are reported, never applied.
 const DA_MAX_AUTH_FAIL_DEFAULT: u32 = 32;
 const DA_INTERVAL_DEFAULT: u32 = 600;
+
+/// TPMA_NV type field (bits 7:4) and its values (Part 2 §13.4):
+/// ordinary 0, counter 1, bits 2, extend 3.
+const TPMA_NV_NT_MASK: u32 = 0x0000_00F0;
+const TPMA_NV_NT_COUNTER: u32 = 0x0000_0010;
+const TPMA_NV_NT_BITS: u32 = 0x0000_0020;
+const TPMA_NV_NT_EXTEND: u32 = 0x0000_0030;
 
 struct State {
     started: bool,
@@ -566,11 +619,21 @@ impl FixtureTpm {
             TPM_CC_UNSEAL => Self::unseal(&mut st, tag, body),
             TPM_CC_PCR_READ => Self::pcr_read(&st, tag, body),
             TPM_CC_PCR_EXTEND => Self::pcr_extend(&mut st, tag, body),
+            TPM_CC_PCR_EVENT => Self::pcr_event(&mut st, tag, body),
+            TPM_CC_PCR_ALLOCATE => Self::pcr_allocate(&mut st, tag, body),
+            TPM_CC_POLICY_AUTHORIZE => Self::policy_authorize(&mut st, tag, body),
+            TPM_CC_QUOTE => Self::quote(&mut st, tag, body),
             TPM_CC_NV_DEFINE_SPACE => Self::nv_define(&mut st, tag, body),
             TPM_CC_NV_UNDEFINE_SPACE => Self::nv_undefine(&mut st, tag, body),
             TPM_CC_NV_READ => Self::nv_read(&mut st, tag, body),
             TPM_CC_NV_WRITE => Self::nv_write(&mut st, tag, body),
             TPM_CC_NV_INCREMENT => Self::nv_increment(&mut st, tag, body),
+            TPM_CC_NV_READ_PUBLIC => Self::nv_read_public(&st, tag, body),
+            TPM_CC_NV_EXTEND => Self::nv_extend(&mut st, tag, body),
+            TPM_CC_NV_SET_BITS => Self::nv_set_bits(&mut st, tag, body),
+            TPM_CC_NV_WRITE_LOCK => Self::nv_write_lock(&mut st, tag, body),
+            TPM_CC_NV_READ_LOCK => Self::nv_read_lock(&mut st, tag, body),
+            TPM_CC_NV_GLOBAL_WRITE_LOCK => Self::nv_global_write_lock(&mut st, tag, body),
             _ => fail(tag, TPM_RC_COMMAND_CODE),
         }
     }
@@ -593,6 +656,22 @@ impl FixtureTpm {
                 // A TPM Reset: the PCRs return to their power-on
                 // values (here, zero).
                 st.pcrs = [[0u8; 32]; 24];
+                // The STCLEAR NV state clears with the reset
+                // (Part 2 §13.4; Part 3 §31.11/§31.14):
+                // READLOCKED always; WRITELOCKED unless
+                // WRITEDEFINE is SET and the index is written
+                // (a written-but-never-locked index keeps its
+                // WRITTEN bit); and WRITTEN itself clears for
+                // CLEAR_STCLEAR indices.
+                for e in st.nv.values_mut() {
+                    e.read_locked = false;
+                    if e.attributes & NV_ATTR_WRITEDEFINE == 0 || !e.written {
+                        e.write_locked = false;
+                    }
+                    if e.attributes & NV_ATTR_CLEAR_STCLEAR != 0 {
+                        e.written = false;
+                    }
+                }
             }
             TPM_SU_STATE => {
                 if st.last_shutdown != Some(TPM_SU_STATE) {
@@ -1248,6 +1327,9 @@ impl FixtureTpm {
                 written: false,
                 auth_handle,
                 auth_value: auth,
+                public,
+                write_locked: false,
+                read_locked: false,
             },
         );
         ok(tag, &[])
@@ -1315,18 +1397,24 @@ impl FixtureTpm {
             Ok(v) => v,
             Err(()) => return fail(tag, TPM_RC_FAILURE),
         };
-        let (e_auth, e_attrs, e_written, e_data) = match st.nv.get(&index) {
+        let (e_auth, e_attrs, e_written, e_data, e_read_locked) = match st.nv.get(&index) {
             Some(e) => (
                 e.auth_value.clone(),
                 e.attributes,
                 e.written,
                 e.data.clone(),
+                e.read_locked,
             ),
             None => return fail(tag, TPM_RC_HANDLE),
         };
         if let Some(rc) = Self::nv_check_auth(st, auth_handle, index, &e_auth, e_attrs, &presented)
         {
             return fail(tag, rc);
+        }
+        // Part 3 §31.13 NOTE 1: authorization is checked before
+        // the read-lock status.
+        if e_read_locked {
+            return fail(tag, TPM_RC_NV_LOCKED);
         }
         // Part 3 §31.13: TPMA_NV_WRITTEN CLEAR ⇒ any data access
         // is TPM_RC_NV_UNINITIALIZED, even at size 0.
@@ -1342,8 +1430,6 @@ impl FixtureTpm {
     }
 
     fn nv_write(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
-        const TPMA_NV_NT_MASK: u32 = 0x0000_00F0;
-        const TPMA_NV_NT_COUNTER: u32 = 0x0000_0010;
         let mut c = Cursor::new(body);
         let parsed = (|| {
             let auth_handle = c.u32()?;
@@ -1369,6 +1455,12 @@ impl FixtureTpm {
             Some(e) => e,
             None => return fail(tag, TPM_RC_HANDLE),
         };
+        // A write-locked index refuses writes (Part 3 §31.11;
+        // the lock is checked after authorization, as for
+        // NV_Extend).
+        if entry.write_locked {
+            return fail(tag, TPM_RC_NV_LOCKED);
+        }
         // A counter index changes only via NV_Increment.
         if entry.attributes & TPMA_NV_NT_MASK == TPMA_NV_NT_COUNTER {
             return fail(tag, TPM_RC_VALUE);
@@ -1407,6 +1499,9 @@ impl FixtureTpm {
             Some(e) => e,
             None => return fail(tag, TPM_RC_HANDLE),
         };
+        if entry.write_locked {
+            return fail(tag, TPM_RC_NV_LOCKED);
+        }
         if entry.data.len() < 8 {
             return fail(tag, TPM_RC_VALUE);
         }
@@ -1415,6 +1510,543 @@ impl FixtureTpm {
         let next = u64::from_be_bytes(cur).wrapping_add(1);
         entry.data[..8].copy_from_slice(&next.to_be_bytes());
         entry.written = true;
+        ok(tag, &[])
+    }
+
+    // ── TPM command-set remainder (#941) ──────────────────────────
+
+    /// `TPM2_Quote` — Part 3 §18.4. The attestation content is
+    /// real: `extraData` echoes the command's qualifying data and
+    /// `pcrDigest` is recomputed from the fixture's PCR values, so
+    /// a verifier can check both through the canonical parser.
+    /// The signature is a structurally valid RSASSA placeholder
+    /// with an empty blob — the fixture holds no signing key, so
+    /// signature verification is out of its scope (no
+    /// `VerifySignature` model). The signing handle must be a
+    /// loaded object, a primary, or `TPM_RH_NULL` (an unsigned
+    /// attestation — silicon returns a NULL signature there, which
+    /// the canonical parser cannot represent, so the fixture
+    /// returns its placeholder instead).
+    fn quote(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
+        let mut c = Cursor::new(body);
+        let parsed = (|| {
+            let sign_handle = c.u32()?;
+            c.skip_auth_area()?;
+            let qualifying_data = c.tpm2b()?.to_vec();
+            let scheme_alg = c.u16()?;
+            if scheme_alg != TPM_ALG_NULL {
+                let _hash = c.u16()?;
+            }
+            let count = c.u32()?;
+            let mut selections: Vec<(u16, Vec<u8>)> = Vec::new();
+            for _ in 0..count {
+                let alg = c.u16()?;
+                let size = c.u8()? as usize;
+                let mask = c.take(size)?.to_vec();
+                selections.push((alg, mask));
+            }
+            Ok((sign_handle, qualifying_data, selections))
+        })();
+        let (sign_handle, qualifying_data, selections) = match parsed {
+            Ok(v) => v,
+            Err(()) => return fail(tag, TPM_RC_FAILURE),
+        };
+        let known = sign_handle == TPM_RH_NULL
+            || st.loaded.contains_key(&sign_handle)
+            || st.primaries.values().any(|h| *h == sign_handle);
+        if !known {
+            return fail(tag, TPM_RC_HANDLE);
+        }
+        // TPMS_ATTEST (Part 2 §10.12.8).
+        let mut attest = Vec::new();
+        attest.extend_from_slice(&TPM_GENERATED_VALUE.to_be_bytes());
+        attest.extend_from_slice(&TPM_ST_ATTEST_QUOTE.to_be_bytes());
+        attest.extend_from_slice(&0u16.to_be_bytes()); // qualifiedSigner: empty name
+        attest.extend_from_slice(&(qualifying_data.len() as u16).to_be_bytes());
+        attest.extend_from_slice(&qualifying_data);
+        attest.extend_from_slice(&0u64.to_be_bytes()); // clock
+        attest.extend_from_slice(&0u32.to_be_bytes()); // resetCount
+        attest.extend_from_slice(&0u32.to_be_bytes()); // restartCount
+        attest.push(1); // safe = TPM_YES
+        attest.extend_from_slice(&0u64.to_be_bytes()); // firmwareVersion
+        attest.extend_from_slice(&(selections.len() as u32).to_be_bytes());
+        let mut concat = Vec::new();
+        for (alg, mask) in &selections {
+            attest.extend_from_slice(&alg.to_be_bytes());
+            attest.push(mask.len() as u8);
+            attest.extend_from_slice(mask);
+            if *alg == TPM_ALG_SHA256 {
+                for (byte_idx, byte) in mask.iter().enumerate() {
+                    for bit in 0..8 {
+                        if byte & (1 << bit) != 0 {
+                            let idx = byte_idx * 8 + bit;
+                            if idx < 24 {
+                                concat.extend_from_slice(&st.pcrs[idx]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let digest = sha256(&concat);
+        attest.extend_from_slice(&(digest.len() as u16).to_be_bytes());
+        attest.extend_from_slice(&digest);
+        // TPMT_SIGNATURE placeholder (see the fn doc).
+        let mut signature = Vec::new();
+        signature.extend_from_slice(&TPM_ALG_RSASSA.to_be_bytes());
+        signature.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+        signature.extend_from_slice(&0u16.to_be_bytes());
+        let mut params = Vec::new();
+        params.extend_from_slice(&(attest.len() as u16).to_be_bytes());
+        params.extend_from_slice(&attest);
+        params.extend_from_slice(&signature);
+        ok(tag, &params)
+    }
+
+    /// `TPM2_PCR_Event` — Part 3 §22.3. The event is hashed per
+    /// bank (the fixture models the SHA-256 bank only) and the
+    /// digest extends the PCR as in `PCR_Extend`; the response
+    /// carries the digests computed. `TPM_RH_NULL` hashes without
+    /// extending. `Event.size` is 0..=1024.
+    fn pcr_event(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
+        const MAX_EVENT_SIZE: usize = 1024;
+        let mut c = Cursor::new(body);
+        let parsed = (|| {
+            let pcr = c.u32()?;
+            c.skip_auth_area()?;
+            let event = c.tpm2b()?.to_vec();
+            Ok((pcr, event))
+        })();
+        let (pcr, event) = match parsed {
+            Ok(v) => v,
+            Err(()) => return fail(tag, TPM_RC_FAILURE),
+        };
+        if event.len() > MAX_EVENT_SIZE {
+            return fail(tag, TPM_RC_SIZE);
+        }
+        let digest = sha256(&event);
+        if pcr != TPM_RH_NULL {
+            if pcr >= 24 {
+                return fail(tag, TPM_RC_HANDLE);
+            }
+            let mut input = Vec::with_capacity(64);
+            input.extend_from_slice(&st.pcrs[pcr as usize]);
+            input.extend_from_slice(&digest);
+            st.pcrs[pcr as usize] = sha256(&input);
+        }
+        let mut params = Vec::new();
+        params.extend_from_slice(&1u32.to_be_bytes()); // TPML_DIGEST_VALUES count
+        params.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+        params.extend_from_slice(&(digest.len() as u16).to_be_bytes());
+        params.extend_from_slice(&digest);
+        ok(tag, &params)
+    }
+
+    /// `TPM2_PCR_Allocate` — Part 3 §22.5. Platform-authorized.
+    /// The fixture models a single SHA-256 bank of 24 PCRs; the
+    /// request is evaluated, not stored — there is no `_TPM_Init`
+    /// model to apply it at. `sizeNeeded` counts requested PCRs
+    /// at 32 octets each; `sizeAvailable` is the bank's 768-octet
+    /// capacity. A request is satisfiable only when every
+    /// selection is SHA-256 with PCRs below 24 and the need fits.
+    /// The `Shutdown(STATE)` restriction of §22.5 NOTE_3 is not
+    /// modelled either: with no `_TPM_Init` to clear it, the flag
+    /// would wedge the fixture's STATE shutdown path permanently.
+    fn pcr_allocate(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
+        let mut c = Cursor::new(body);
+        let parsed = (|| {
+            let auth_handle = c.u32()?;
+            let presented = c.first_pw_auth()?;
+            let count = c.u32()?;
+            let mut entries: Vec<(u16, Vec<u8>)> = Vec::new();
+            for _ in 0..count {
+                let alg = c.u16()?;
+                let size = c.u8()? as usize;
+                let mask = c.take(size)?.to_vec();
+                entries.push((alg, mask));
+            }
+            Ok((auth_handle, presented, entries))
+        })();
+        let (auth_handle, presented, entries) = match parsed {
+            Ok(v) => v,
+            Err(()) => return fail(tag, TPM_RC_FAILURE),
+        };
+        if auth_handle != TPM_RH_PLATFORM {
+            return fail(tag, TPM_RC_HANDLE);
+        }
+        let expected = st.hierarchy_auth(auth_handle).to_vec();
+        if let Some(rc) = st.check_auth(&presented, &expected, true) {
+            return fail(tag, rc);
+        }
+        let mut needed: u32 = 0;
+        let mut satisfiable = true;
+        for (alg, mask) in &entries {
+            if *alg != TPM_ALG_SHA256 {
+                satisfiable = false;
+            }
+            for (byte_idx, byte) in mask.iter().enumerate() {
+                for bit in 0..8 {
+                    if byte & (1 << bit) != 0 {
+                        let idx = byte_idx * 8 + bit;
+                        if idx >= 24 {
+                            satisfiable = false;
+                        }
+                        needed = needed.saturating_add(32);
+                    }
+                }
+            }
+        }
+        let available: u32 = 24 * 32;
+        let success = satisfiable && needed <= available;
+        let mut params = Vec::new();
+        params.push(u8::from(success));
+        params.extend_from_slice(&24u32.to_be_bytes()); // maxPCR
+        params.extend_from_slice(&needed.to_be_bytes());
+        params.extend_from_slice(&available.to_be_bytes());
+        ok(tag, &params)
+    }
+
+    /// `TPM2_PolicyAuthorize` — Part 3 §23.16. The checks run in
+    /// the spec's order: the ticket must unmarshal as a
+    /// `TPMT_TK_VERIFIED` (tag `TPM_ST_VERIFIED`, hierarchy a
+    /// hierarchy or NULL); `keySign` must be a valid object name
+    /// (a known hash algorithm, the name the digest size of that
+    /// algorithm); `approvedPolicy` must be the session's current
+    /// digest. Then the digest is reset to zero and updated with
+    /// `PolicyUpdate(TPM_CC_PolicyAuthorize, keySign, policyRef)`
+    /// (Part 3 §23.2.3) — two hashes, size fields excluded.
+    ///
+    /// Ticket validation: a trial session extends as if the
+    /// ticket were valid, without verification. A non-trial
+    /// session needs the ticket's HMAC verified against the
+    /// hierarchy proof — the fixture holds no proof value and no
+    /// HMAC session model, so it cannot validate any ticket and
+    /// fails closed with `TPM_RC_POLICY` rather than pretend one
+    /// is valid.
+    fn policy_authorize(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
+        let mut c = Cursor::new(body);
+        let parsed = (|| {
+            let session = c.u32()?;
+            let approved_policy = c.tpm2b()?.to_vec();
+            let policy_ref = c.tpm2b()?.to_vec();
+            let key_sign = c.tpm2b()?.to_vec();
+            let ticket_tag = c.u16()?;
+            let ticket_hierarchy = c.u32()?;
+            let _ticket_digest = c.tpm2b()?.to_vec();
+            Ok((
+                session,
+                approved_policy,
+                policy_ref,
+                key_sign,
+                ticket_tag,
+                ticket_hierarchy,
+            ))
+        })();
+        let (handle, approved_policy, policy_ref, key_sign, ticket_tag, ticket_hierarchy) =
+            match parsed {
+                Ok(v) => v,
+                Err(()) => return fail(tag, TPM_RC_FAILURE),
+            };
+        let session = match st.sessions.get(&handle) {
+            Some(s) => s.clone(),
+            None => return fail(tag, TPM_RC_HANDLE),
+        };
+        if ticket_tag != TPM_ST_VERIFIED {
+            return fail(tag, TPM_RC_TAG);
+        }
+        if ticket_hierarchy != TPM_RH_OWNER
+            && ticket_hierarchy != TPM_RH_PLATFORM
+            && ticket_hierarchy != TPM_RH_ENDORSEMENT
+            && ticket_hierarchy != TPM_RH_NULL
+        {
+            return fail(tag, TPM_RC_VALUE);
+        }
+        let name_alg = match key_sign.len() {
+            n if n >= 2 => u16::from_be_bytes([key_sign[0], key_sign[1]]),
+            _ => return fail(tag, TPM_RC_HASH),
+        };
+        let digest_size = match name_alg {
+            TPM_ALG_SHA1 => 20,
+            TPM_ALG_SHA256 => 32,
+            TPM_ALG_SHA384 => 48,
+            TPM_ALG_SHA512 => 64,
+            _ => return fail(tag, TPM_RC_HASH),
+        };
+        if key_sign.len() != 2 + digest_size {
+            return fail(tag, TPM_RC_SIZE);
+        }
+        if approved_policy != session.policy_digest {
+            return fail(tag, TPM_RC_VALUE);
+        }
+        if session.kind != TPM_SE_TRIAL {
+            return fail(tag, TPM_RC_POLICY);
+        }
+        let mut step1 = Vec::new();
+        step1.extend_from_slice(&[0u8; 32]);
+        step1.extend_from_slice(&TPM_CC_POLICY_AUTHORIZE.to_be_bytes());
+        step1.extend_from_slice(&key_sign);
+        let d1 = sha256(&step1);
+        let mut step2 = Vec::new();
+        step2.extend_from_slice(&d1);
+        step2.extend_from_slice(&policy_ref);
+        let new_digest = sha256(&step2);
+        if let Some(s) = st.sessions.get_mut(&handle) {
+            s.policy_digest = new_digest;
+        }
+        ok(tag, &[])
+    }
+
+    /// `TPM2_NV_ReadPublic` — Part 3 §31.6. No authorization.
+    /// Returns the public area with its live attributes
+    /// (`WRITTEN` / `WRITELOCKED` / `READLOCKED` patched into the
+    /// define-time word) and the name computed over that live
+    /// area — which is why a written index has a different name
+    /// than an unwritten one (Part 3 §23.20 NOTE_2). Only the
+    /// SHA-256 nameAlg is computable here, like the PCR bank.
+    fn nv_read_public(st: &State, tag: u16, body: &[u8]) -> Vec<u8> {
+        let mut c = Cursor::new(body);
+        let index = match c.u32() {
+            Ok(v) => v,
+            Err(()) => return fail(tag, TPM_RC_FAILURE),
+        };
+        let entry = match st.nv.get(&index) {
+            Some(e) => e,
+            None => return fail(tag, TPM_RC_HANDLE),
+        };
+        let mut public = entry.public.clone();
+        if public.len() < 10 {
+            return fail(tag, TPM_RC_FAILURE);
+        }
+        let mut attrs = entry.attributes;
+        if entry.written {
+            attrs |= NV_ATTR_WRITTEN;
+        }
+        if entry.write_locked {
+            attrs |= NV_ATTR_WRITELOCKED;
+        }
+        if entry.read_locked {
+            attrs |= NV_ATTR_READLOCKED;
+        }
+        public[6..10].copy_from_slice(&attrs.to_be_bytes());
+        let name_alg = u16::from_be_bytes([public[4], public[5]]);
+        if name_alg != TPM_ALG_SHA256 {
+            return fail(tag, TPM_RC_HASH);
+        }
+        let mut name = Vec::with_capacity(34);
+        name.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+        name.extend_from_slice(&sha256(&public));
+        let mut params = Vec::new();
+        params.extend_from_slice(&tpm2b(&public));
+        params.extend_from_slice(&tpm2b(&name));
+        ok(tag, &params)
+    }
+
+    /// `TPM2_NV_Extend` — Part 3 §31.9, equation (41): the new
+    /// value is `H(nameAlg ‖ old ‖ data)`; an unwritten index
+    /// extends from the Zero Digest. `data` may be larger than
+    /// the index's defined size. Authorization is checked before
+    /// the lock status (§31.9 NOTE_2); a write-locked index
+    /// answers `TPM_RC_NV_LOCKED`, a non-extend index
+    /// `TPM_RC_ATTRIBUTES`. The result is one digest, so the
+    /// index must have been defined with a digest-sized area —
+    /// a define-time error surfacing here is `TPM_RC_VALUE`.
+    fn nv_extend(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
+        let mut c = Cursor::new(body);
+        let parsed = (|| {
+            let auth_handle = c.u32()?;
+            let index = c.u32()?;
+            let presented = c.first_pw_auth()?;
+            let data = c.tpm2b()?.to_vec();
+            Ok((auth_handle, index, presented, data))
+        })();
+        let (auth_handle, index, presented, data) = match parsed {
+            Ok(v) => v,
+            Err(()) => return fail(tag, TPM_RC_FAILURE),
+        };
+        let (e_auth, e_attrs, e_written, e_data) = match st.nv.get(&index) {
+            Some(e) => (
+                e.auth_value.clone(),
+                e.attributes,
+                e.written,
+                e.data.clone(),
+            ),
+            None => return fail(tag, TPM_RC_HANDLE),
+        };
+        if let Some(rc) = Self::nv_check_auth(st, auth_handle, index, &e_auth, e_attrs, &presented)
+        {
+            return fail(tag, rc);
+        }
+        let entry = match st.nv.get_mut(&index) {
+            Some(e) => e,
+            None => return fail(tag, TPM_RC_HANDLE),
+        };
+        if entry.write_locked {
+            return fail(tag, TPM_RC_NV_LOCKED);
+        }
+        if entry.attributes & TPMA_NV_NT_MASK != TPMA_NV_NT_EXTEND {
+            return fail(tag, TPM_RC_ATTRIBUTES);
+        }
+        let old = if e_written {
+            e_data
+        } else {
+            alloc::vec![0u8; 32]
+        };
+        let mut input = Vec::with_capacity(old.len() + data.len());
+        input.extend_from_slice(&old);
+        input.extend_from_slice(&data);
+        let new = sha256(&input);
+        if entry.data.len() != new.len() {
+            return fail(tag, TPM_RC_VALUE);
+        }
+        entry.data.copy_from_slice(&new);
+        entry.written = true;
+        ok(tag, &[])
+    }
+
+    /// `TPM2_NV_SetBits` — Part 3 §31.10: OR `bits` into a
+    /// bit-field index's contents; an unwritten index ORs from
+    /// all-zero bits. Sets `WRITTEN` even when no bits change.
+    /// Authorization first, then the write lock, then the NT
+    /// check (a non-bits index answers `TPM_RC_ATTRIBUTES`).
+    fn nv_set_bits(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
+        let mut c = Cursor::new(body);
+        let parsed = (|| {
+            let auth_handle = c.u32()?;
+            let index = c.u32()?;
+            let presented = c.first_pw_auth()?;
+            let bits = c.u64()?;
+            Ok((auth_handle, index, presented, bits))
+        })();
+        let (auth_handle, index, presented, bits) = match parsed {
+            Ok(v) => v,
+            Err(()) => return fail(tag, TPM_RC_FAILURE),
+        };
+        let (e_auth, e_attrs) = match st.nv.get(&index) {
+            Some(e) => (e.auth_value.clone(), e.attributes),
+            None => return fail(tag, TPM_RC_HANDLE),
+        };
+        if let Some(rc) = Self::nv_check_auth(st, auth_handle, index, &e_auth, e_attrs, &presented)
+        {
+            return fail(tag, rc);
+        }
+        let entry = match st.nv.get_mut(&index) {
+            Some(e) => e,
+            None => return fail(tag, TPM_RC_HANDLE),
+        };
+        if entry.write_locked {
+            return fail(tag, TPM_RC_NV_LOCKED);
+        }
+        if entry.attributes & TPMA_NV_NT_MASK != TPMA_NV_NT_BITS {
+            return fail(tag, TPM_RC_ATTRIBUTES);
+        }
+        if entry.data.len() != 8 {
+            return fail(tag, TPM_RC_VALUE);
+        }
+        let mut cur = [0u8; 8];
+        cur.copy_from_slice(&entry.data[..8]);
+        let next = u64::from_be_bytes(cur) | bits;
+        entry.data[..8].copy_from_slice(&next.to_be_bytes());
+        entry.written = true;
+        ok(tag, &[])
+    }
+
+    /// `TPM2_NV_WriteLock` — Part 3 §31.11: SETs
+    /// `TPMA_NV_WRITELOCKED`. The index must carry `WRITEDEFINE`
+    /// or `WRITE_STCLEAR`; locking an already-locked index is
+    /// not an error.
+    fn nv_write_lock(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
+        let mut c = Cursor::new(body);
+        let parsed = (|| {
+            let auth_handle = c.u32()?;
+            let index = c.u32()?;
+            let presented = c.first_pw_auth()?;
+            Ok((auth_handle, index, presented))
+        })();
+        let (auth_handle, index, presented) = match parsed {
+            Ok(v) => v,
+            Err(()) => return fail(tag, TPM_RC_FAILURE),
+        };
+        let (e_auth, e_attrs) = match st.nv.get(&index) {
+            Some(e) => (e.auth_value.clone(), e.attributes),
+            None => return fail(tag, TPM_RC_HANDLE),
+        };
+        if let Some(rc) = Self::nv_check_auth(st, auth_handle, index, &e_auth, e_attrs, &presented)
+        {
+            return fail(tag, rc);
+        }
+        if e_attrs & (NV_ATTR_WRITEDEFINE | NV_ATTR_WRITE_STCLEAR) == 0 {
+            return fail(tag, TPM_RC_ATTRIBUTES);
+        }
+        if let Some(e) = st.nv.get_mut(&index) {
+            e.write_locked = true;
+        }
+        ok(tag, &[])
+    }
+
+    /// `TPM2_NV_ReadLock` — Part 3 §31.14: SETs
+    /// `TPMA_NV_READLOCKED`, blocking reads until the next
+    /// `Startup(TPM_SU_CLEAR)`. The index must carry
+    /// `READ_STCLEAR`; locking an already-locked index is not an
+    /// error, and an unwritten index may be locked.
+    fn nv_read_lock(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
+        let mut c = Cursor::new(body);
+        let parsed = (|| {
+            let auth_handle = c.u32()?;
+            let index = c.u32()?;
+            let presented = c.first_pw_auth()?;
+            Ok((auth_handle, index, presented))
+        })();
+        let (auth_handle, index, presented) = match parsed {
+            Ok(v) => v,
+            Err(()) => return fail(tag, TPM_RC_FAILURE),
+        };
+        let (e_auth, e_attrs) = match st.nv.get(&index) {
+            Some(e) => (e.auth_value.clone(), e.attributes),
+            None => return fail(tag, TPM_RC_HANDLE),
+        };
+        if let Some(rc) = Self::nv_check_auth(st, auth_handle, index, &e_auth, e_attrs, &presented)
+        {
+            return fail(tag, rc);
+        }
+        if e_attrs & NV_ATTR_READ_STCLEAR == 0 {
+            return fail(tag, TPM_RC_ATTRIBUTES);
+        }
+        if let Some(e) = st.nv.get_mut(&index) {
+            e.read_locked = true;
+        }
+        ok(tag, &[])
+    }
+
+    /// `TPM2_NV_GlobalWriteLock` — Part 3 §31.12: SETs
+    /// `TPMA_NV_WRITELOCKED` on every index carrying
+    /// `TPMA_NV_GLOBALLOCK`. Owner- or platform-authorized. The
+    /// lock is enforced through the per-index bit — there is no
+    /// separate global flag — so an index defined with
+    /// `GLOBALLOCK` after this command is unaffected until the
+    /// next one (§31.12 NOTE).
+    fn nv_global_write_lock(st: &mut State, tag: u16, body: &[u8]) -> Vec<u8> {
+        let mut c = Cursor::new(body);
+        let parsed = (|| {
+            let auth_handle = c.u32()?;
+            let presented = c.first_pw_auth()?;
+            Ok((auth_handle, presented))
+        })();
+        let (auth_handle, presented) = match parsed {
+            Ok(v) => v,
+            Err(()) => return fail(tag, TPM_RC_FAILURE),
+        };
+        if auth_handle != TPM_RH_OWNER && auth_handle != TPM_RH_PLATFORM {
+            return fail(tag, TPM_RC_HANDLE);
+        }
+        let expected = st.hierarchy_auth(auth_handle).to_vec();
+        if let Some(rc) = st.check_auth(&presented, &expected, true) {
+            return fail(tag, rc);
+        }
+        for e in st.nv.values_mut() {
+            if e.attributes & NV_ATTR_GLOBALLOCK != 0 {
+                e.write_locked = true;
+            }
+        }
         ok(tag, &[])
     }
 }
