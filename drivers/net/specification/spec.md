@@ -358,7 +358,7 @@ continues. Hardware checksum results travel in `Frame::rx_meta`.
 `Interface::offloads` and `HwNic::caps` advertise TCP/UDP checksums for
 unfragmented IPv4 and IPv6 without extension headers, RX checksum reporting,
 and TCP TSO up to 65,535 Ethernet bytes. MSS is at least 64; each segment's
-IP packet must fit MTU 1500. IPv4/TCP options and up to two in-band VLAN tags
+IP packet must fit the programmed MTU (1500 at probe, up to 9706). IPv4/TCP options and up to two in-band VLAN tags
 are accepted. Offload packets use exact IP lengths without Ethernet padding.
 The driver builds pseudoheader seeds and TSO contexts; the caller need not
 produce Linux `CHECKSUM_PARTIAL` headers. Malformed lengths, IP fragments,
@@ -379,6 +379,8 @@ VSI IDs/queue-set handles and restores AQ, HMC, queue contexts, VLAN policy,
 RSS, filters, MSI-X and link reporting before publishing a new generation.
 Queue count, MAC, registered interface and IPC endpoints remain stable; resource
 shrinkage or a changed MAC fails the rebuild instead of silently changing them.
+A recovery rebuild re-applies the programmed MTU: the queue pairs survive the
+rebuild, so their stored `rxmax` is what `configure` writes back.
 
 `I40eNic::recovery_status()` reports recovery activity, generation (successful
 rebuild count), failed attempts and the last rebuild error. Failed attempts
@@ -393,7 +395,7 @@ All DMA allocations are owned before publication. Final teardown
 masks/disables MSI-X, removes and synchronizes handlers, then waits for PF reset
 before freeing DMA; failed final reset quarantines those allocations.
 Coherent DMA barriers include outer-shareable ordering on aarch64. Extra VSIs,
-DCB, jumbo frames, tunnels and VLAN insertion are outside this profile.
+DCB, tunnels and VLAN insertion are outside this profile.
 
 Memory-backed firmware tests exercise real AQ commands, multiqueue/RSS setup,
 failed reset DMA retention, failed rebuild retry, stable publication/IPC and
@@ -529,6 +531,40 @@ frame itself and builds its descriptors from the shared builders.
   count, RSS-format checksum decode, RSS fill/rearm words,
   indirection balance and routing properties). No silicon
   testing was possible; QEMU does not emulate these chips.
+
+### 3.3 Intel wired MTU surface (issue #802)
+
+Per-family MTU config + ring sizing on e1000, igb, ixgbe and
+i40e (igc already delivers 9216; the Realtek runtime switch is
+§3.2's Jumbo bullet). Every family validates 68..=max in a pure
+policy module (`mtu.rs`, fixture-pinned), programs hardware,
+then stores the MTU; a `DeviceControl` hook installed at probe
+lets the stack switch MTU at runtime. Buffers are fixed at the
+family max frame at probe, so an MTU change never reallocates.
+
+| Family | Max MTU | Max frame | Register program | Buffers |
+| ------ | ------: | --------: | ---------------- | ------: |
+| e1000 classic (82540/82545/82544) | 16110 | 16128 | RCTL.BSIZE 16K + LPE; FC watermarks from the MTU frame | 16384 |
+| e1000e (82574/PCH) | 9000 | 9022 | same RCTL program | 16384 |
+| igb (82575/82576/82580/I350/I210/I211) | 9216 | 9234 | RCTL.BSIZE 16K + SRRCTL.BSIZEPKT + RLPML (0x5004) = MTU+22 | 10240 |
+| ixgbe (82599/X540/X550/E610) | 9710 | 9728 | MAXFRS (0x04268) = MTU+18, per-queue SRRCTL.BSIZEPKT | 10240 |
+| i40e (X710/XL710/XXV710/X722) | 9706 | 9728 | RX queue context `rxmax` = MTU+22 (disable → rewrite → enable per queue) | 9728 |
+
+TX caps are the programmed MTU's wire size (MTU + 18) on
+e1000/igb/ixgbe; on i40e the offload planner caps non-TSO frames
+at the MTU (VLAN-aware) and TSO segments at the MTU, so a jumbo
+MSS (~8960) no longer fails TX. RX acceptance is MTU + 22
+except ixgbe, whose MAXFRS is MTU + 18 (the documented max
+frame). Suspend/resume and i40e recovery rebuilds re-apply the
+stored program, so neither shrinks the device back to 1500.
+Limits are grounded in the kernel.org driver docs (e1000 16110 /
+igb 9216 / ixgbe 9710) and the current i40e doc (9706 = 9728 − 22);
+the firmware-reported link-status max frame (9728) corroborates
+the i40e envelope. Only the silicon itself remains untested.
+Remainders: rtl8125/8126/8127 are still unwired (§3.2), and
+82574L may support a larger frame via e1000e's `DEFAULT_JUMBO`
+path — uncited in-tree, so it stays capped at the 9000 family
+envelope.
 
 ## 4. Invariants & safety properties
 

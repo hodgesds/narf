@@ -63,6 +63,10 @@ pub mod vmdq;
 /// programming, and the `EeeStatus` snapshot (see `eee.rs`).
 pub mod eee;
 
+/// Per-family MTU policy (issue #802): maxima, frame accounting and
+/// the register program for a requested MTU. Pure — no MMIO.
+pub(crate) mod mtu;
+
 // ── PCI device IDs ──────────────────────────────────────────────────
 //
 // Mirrors a subset of Linux's `igb_pci_tbl[]` in
@@ -127,6 +131,12 @@ const REG_IVAR0: u64 = 0x1700;
 /// IVAR_MISC — "other" causes to MSI-X vector number.
 const REG_IVAR_MISC: u64 = 0x1740;
 const REG_RCTL: u64 = 0x0100;
+/// RLPML — Receive Long Packet Maximum Length (0x5004): the RX length
+/// limit; frames longer than RLPML are dropped by the device. Same
+/// register as igc's (`igc/src/igc/hardware.rs` programs
+/// `mtu + 14 + 4 + 4` here); the VMOLR RLPML field is the per-VF
+/// shadow of the same limit (in-tree `vmdq.rs` `VMOLR_RLPML_MASK`).
+const REG_RLPML: u64 = 0x5004;
 const REG_TCTL: u64 = 0x0400;
 // igb (82575+) queue-0 RX descriptor window. Queues 0..3 use the
 // 0x2800 + 0x100*n window; the compact 0xC000 + 0x40*n window is for queues
@@ -1119,7 +1129,20 @@ const RCTL_UPE: u32 = 1 << 3; // Unicast promiscuous.
 const RCTL_MPE: u32 = 1 << 4; // Multicast promiscuous.
 const RCTL_BAM: u32 = 1 << 15; // Broadcast accept.
 const RCTL_BSIZE_2K: u32 = 0; // bits[17:16] = 0 → 2 KiB
+const RCTL_BSIZE_16K: u32 = 0x3 << 16; // bits[17:16] = 3 → 16 KiB
 const RCTL_SECRC: u32 = 1 << 26; // Strip Ethernet CRC.
+
+/// RCTL.BSIZE field for a programmed MTU: 16K for any jumbo MTU
+/// (Linux `igb_setup_rctl` workaround — the controller does not
+/// receive jumbo frames unless the RCTL buffer-size field is 16K
+/// when jumbo is in use), 2K otherwise.
+const fn rctl_bsize(mtu: u32) -> u32 {
+    if mtu > mtu::STD_MTU {
+        RCTL_BSIZE_16K
+    } else {
+        RCTL_BSIZE_2K
+    }
+}
 
 // TX descriptor Done bit (bit 0 of the write-back status byte at
 // descriptor offset 12 — same for the advanced write-back form).
@@ -1137,7 +1160,12 @@ const TX_TIMEOUT_NS: u64 = 5_000_000_000;
 /// Watchdog supervisor cadence, matching igc's 10 ms maintenance tick.
 const TX_WATCHDOG_POLL_NS: u64 = 10_000_000;
 const RX_RING_LEN: usize = 256;
-const FRAME_SIZE: usize = 2048;
+/// Per-slot DMA buffer size for the TX copy pool and the RX ring.
+/// Fixed at the family's max-frame size (issue #802): 10240 covers
+/// the 9238-byte max RX frame, so an MTU change never reallocates —
+/// it only reprograms RCTL/SRRCTL/RLPML. The TX cap is the
+/// *programmed MTU's* frame size, not this buffer size.
+const FRAME_SIZE: usize = mtu::RX_BUF_BYTES;
 
 fn previous_rx_slot(next_head: usize) -> usize {
     (next_head + RX_RING_LEN - 1) % RX_RING_LEN
@@ -1682,6 +1710,10 @@ pub struct Igb {
     vlan_filter: IrqSafeSpinLock<VlanFilter>,
     /// PCI device id (from probe), for VT family selection.
     device_id: u16,
+    /// Programmed MTU (payload bytes), issue #802. Probe default
+    /// 1500; changed only by [`Igb::set_mtu`], which reprograms
+    /// RCTL.BSIZE, SRRCTL.BSIZEPKT and RLPML before storing it.
+    mtu: IrqSafeSpinLock<u32>,
     /// SR-IOV / VMDq allocation, `None` until [`Igb::vt_allocate`].
     /// Lock order everywhere: `vt` before `vlan_filter`, never reversed.
     vt: IrqSafeSpinLock<Option<vmdq::VtState>>,
@@ -1903,18 +1935,31 @@ impl Igb {
             mmio.write32(q0.rdh, 0);
             mmio.write32(q0.rdt, (RX_RING_LEN - 1) as u32);
 
-            // SRRCTL — per-queue: buffer-size = 2 KiB, descriptor type =
-            // ADV_ONEBUF. Linux `igb_setup_srrctl`; queue 0 only.
+            // SRRCTL — per-queue: buffer-size from the MTU program
+            // (2 KiB at the 1500 default; 10 KiB at 9216),
+            // descriptor type = ADV_ONEBUF. Linux
+            // `igb_setup_srrctl`; queue 0 only. NOTE: BSIZEPKT is
+            // bits[6:0] in 1 KiB units — the value goes in
+            // unshifted; SRRCTL_BSIZEPKT_SHIFT is the *unit*
+            // conversion (value × 1024 = bytes), not a bit shift.
+            let program = mtu::mtu_transition(mtu::STD_MTU).expect("1500 is in range");
             let mut srrctl = mmio.read32(q0.srrctl);
             srrctl &= !(SRRCTL_BSIZEPKT_MASK | SRRCTL_DESCTYPE_MASK);
-            srrctl |= ((FRAME_SIZE as u32) >> SRRCTL_BSIZEPKT_SHIFT) & SRRCTL_BSIZEPKT_MASK;
+            srrctl |= program.srrctl_bsize & SRRCTL_BSIZEPKT_MASK;
             srrctl |= SRRCTL_DESCTYPE_ADV_ONEBUF;
             mmio.write32(q0.srrctl, srrctl);
 
             mmio.write32(
                 REG_RCTL,
-                RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
+                RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | rctl_bsize(mtu::STD_MTU),
             );
+
+            // RLPML — RX length limit for the programmed MTU (1522
+            // at 1500; 9238 at 9216). Bring-up previously left the
+            // reset default in place; programming it explicitly makes
+            // the acceptance limit follow the MTU instead of the
+            // reset value.
+            mmio.write32(REG_RLPML, program.rx_frame);
 
             // VET — tell the hardware 0x8100 is the VLAN EtherType so
             // tagged frames are recognised for VFTA filtering and the
@@ -1994,6 +2039,7 @@ impl Igb {
             tx_state: IrqSafeSpinLock::new(TxRingCursor::new()),
             vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
             device_id: device.id.device,
+            mtu: IrqSafeSpinLock::new(mtu::STD_MTU),
             vt: IrqSafeSpinLock::new(None),
             stats: IgbStats::default(),
             wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
@@ -2679,8 +2725,14 @@ impl Igb {
         // The register program lives in `pm::suspend_plan` so
         // fixtures drive the exact conversation against a fake
         // bank (issue #793); the live path runs it via `MmioBank`.
+        // Suspend keeps the programmed BSIZE (issue #802) so resume
+        // restores the jumbo program, not the 1500 default.
         let program = wol_suspend_program(*self.wol_filters.lock(), self.link_up(), runtime);
-        pm::suspend_plan(&pm::MmioBank::new(&self.mmio), &program);
+        pm::suspend_plan(
+            &pm::MmioBank::new(&self.mmio),
+            &program,
+            rctl_bsize(*self.mtu.lock()),
+        );
         crate::publish::publish_link(self.ifname(), crate::publish::LinkSample::DOWN);
         Ok(())
     }
@@ -2704,15 +2756,62 @@ impl Igb {
         // bank (issue #793); the live path runs it via `MmioBank`.
         // A handshake that never reflects leaves the device
         // suspended and reports `QueueEnableTimeout`.
+        // Restore the MTU program (issue #802): RCTL.BSIZE from
+        // the stored MTU, SRRCTL.BSIZEPKT and RLPML likewise. A
+        // D3 transition may have reset SRRCTL/RLPML, and RCTL
+        // is rewritten here unconditionally, so all three must
+        // follow the programmed MTU rather than the 1500 default
+        // — otherwise resume silently shrinks the device back
+        // to standard frames while the pools stay jumbo-sized.
         let vt_allocated = self.vt.lock().is_some();
+        let program = mtu::mtu_transition(*self.mtu.lock()).expect("stored MTU is always in range");
         pm::resume_plan(
             &pm::MmioBank::new(&self.mmio),
             self.irq_vector.is_some(),
             vt_allocated,
+            &program,
         )
         .map_err(|_| IgbError::QueueEnableTimeout)?;
         self.suspended.store(false, Ordering::Release);
         crate::publish::publish_link(self.ifname(), igb_link_sample(self));
+        Ok(())
+    }
+
+    /// Program a validated MTU (issue #802): SRRCTL.BSIZEPKT and
+    /// RLPML for the new frame size, RCTL.BSIZE via RMW (the
+    /// BSIZE field is the `0x3 << 16` bits, i.e. `RCTL_BSIZE_16K`
+    /// doubles as the field mask). Queue 0 only, like bring-up.
+    /// Safe to call while suspended — resume re-applies the stored
+    /// program from `self.mtu` unconditionally.
+    fn program_mtu(&self, program: mtu::MtuProgram) {
+        let q0 = queue_regs(0);
+        // SAFETY: mapped MMIO; SRRCTL/RCTL/RLPML are valid 32-bit
+        // registers in the igb window.
+        unsafe {
+            let mut srrctl = self.mmio.read32(q0.srrctl);
+            srrctl &= !(SRRCTL_BSIZEPKT_MASK | SRRCTL_DESCTYPE_MASK);
+            srrctl |= program.srrctl_bsize & SRRCTL_BSIZEPKT_MASK;
+            srrctl |= SRRCTL_DESCTYPE_ADV_ONEBUF;
+            self.mmio.write32(q0.srrctl, srrctl);
+            let rctl = self.mmio.read32(REG_RCTL);
+            let rctl = (rctl & !RCTL_BSIZE_16K) | rctl_bsize(program.mtu);
+            self.mmio.write32(REG_RCTL, rctl);
+            self.mmio.write32(REG_RLPML, program.rx_frame);
+        }
+    }
+
+    /// Change the MTU (issue #802). Validates via the pure policy
+    /// module first (EINVAL 22 outside 68..=9216), no-ops when the
+    /// MTU is unchanged, otherwise programs the hardware and then
+    /// stores the new MTU. The RX/TX pools are fixed at the
+    /// max-frame size, so no reallocation is needed.
+    pub fn set_mtu(&self, mtu: u32) -> Result<(), i32> {
+        let program = mtu::mtu_transition(mtu).map_err(|e| e.0)?;
+        if program.mtu == *self.mtu.lock() {
+            return Ok(());
+        }
+        self.program_mtu(program);
+        *self.mtu.lock() = program.mtu;
         Ok(())
     }
 
@@ -3100,7 +3199,7 @@ impl Igb {
         if self.recovering.load(Ordering::Acquire) {
             return Err(IgbError::Other("igb TX recovery in progress"));
         }
-        if frame.is_empty() || frame.len() > FRAME_SIZE {
+        if frame.is_empty() || frame.len() > mtu::frame_size(*self.mtu.lock()) as usize {
             return Err(IgbError::QueueTooSmall);
         }
         if let Some(tag) = meta.vlan_tag {
@@ -3152,7 +3251,10 @@ impl Igb {
     /// plain path is untouched — only a frame that actually requests a
     /// tag takes the two-slot path.
     fn tx_vlan(&self, frame: &[u8], tag: u16) -> Result<(), IgbError> {
-        if frame.is_empty() || frame.len() > FRAME_SIZE {
+        // The TX cap is the programmed MTU's wire size (issue #802):
+        // the VLAN tag rides in a context descriptor, never in the
+        // data buffer, so the cap is MTU + 18, not MTU + 22.
+        if frame.is_empty() || frame.len() > mtu::frame_size(*self.mtu.lock()) as usize {
             return Err(IgbError::QueueTooSmall);
         }
         let mut data_ticket = None;
@@ -3442,6 +3544,22 @@ impl Igb {
     }
 }
 
+// ── MTU control hook ────────────────────────────────────────────────
+
+/// `DeviceControl` adapter for the stack's MTU switch (issue #802):
+/// the hook only acts on MTU — MAC, promiscuous and multicast pass
+/// through untouched. Installed by `probe` after `iface::register`.
+#[derive(Debug)]
+pub struct IgbMtuControl {
+    controller: Arc<Igb>,
+}
+
+impl narf_net::iface::DeviceControl for IgbMtuControl {
+    fn configure(&self, config: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+        self.controller.set_mtu(config.mtu)
+    }
+}
+
 // ── HwNic adapter ───────────────────────────────────────────────────
 
 /// One probed port, as the net stack sees it.
@@ -3477,7 +3595,11 @@ impl narf_net::Interface for IgbNic {
         self.nic.mac()
     }
     fn mtu(&self) -> u32 {
-        1500
+        // Per-port programmed MTU (#802): read off this Nic's own
+        // controller, not the `CONTROLLERS` registry — the old
+        // singleton `with_controller` lookup is gone on main (#1633)
+        // and would report the wrong port's MTU on a second 8257x.
+        *self.nic.mtu.lock()
     }
     fn link_up(&self) -> bool {
         self.nic.link_up()
@@ -3509,7 +3631,9 @@ impl crate::HwNic for IgbNic {
         self.nic.mac()
     }
     fn mtu(&self) -> u32 {
-        1500
+        // Per-port programmed MTU (#802): read off this Nic's own
+        // controller — see the `Interface` impl above.
+        *self.nic.mtu.lock()
     }
     fn link_up(&self) -> bool {
         self.nic.link_up()
@@ -3626,8 +3750,11 @@ mod pm {
     /// engines, then arm WoL or stop DMA and power the PHY down.
     /// Transmit DMA stops in both branches (`__igb_close` has
     /// already stopped the TX unit before Linux arms wake
-    /// filtering); only the receive side differs.
-    pub fn suspend_plan(bank: &impl RegBank, program: &WolSuspendProgram) {
+    /// filtering); only the receive side differs. The RCTL word
+    /// keeps the programmed BSIZE (issue #802): the caller passes
+    /// `rctl_bsize` for its stored MTU so suspend preserves the
+    /// jumbo program for resume.
+    pub fn suspend_plan(bank: &impl RegBank, program: &WolSuspendProgram, rctl_bsize: u32) {
         let q0 = queue_regs(0);
         bank.write32(REG_IMC, !0u32);
         bank.write32(REG_EIMC, !0u32);
@@ -3635,7 +3762,7 @@ mod pm {
         bank.write32(q0.rxdctl, 0);
         bank.write32(REG_TCTL, TCTL_SUSPEND_OFF);
         if program.wufc != 0 {
-            bank.write32(REG_RCTL, RCTL_SUSPEND_ARMED);
+            bank.write32(REG_RCTL, RCTL_SUSPEND_ARMED | rctl_bsize);
             let ctrl = bank.read32(REG_CTRL);
             bank.write32(REG_CTRL, ctrl | CTRL_ADVD3WUC);
             bank.write32(REG_WUC, program.wuc);
@@ -3643,7 +3770,7 @@ mod pm {
         } else {
             bank.write32(REG_WUC, 0);
             bank.write32(REG_WUFC, 0);
-            bank.write32(REG_RCTL, RCTL_SUSPEND_OFF);
+            bank.write32(REG_RCTL, RCTL_SUSPEND_OFF | rctl_bsize);
             phy_write(bank, PHY_BMCR, PHY_BMCR_PWRDOWN);
         }
     }
@@ -3655,8 +3782,17 @@ mod pm {
     /// block (same program as bring-up step 9) — re-arming the
     /// mailbox cause only when VT is allocated. A handshake that
     /// never reflects returns `Err` before any unmasking, so the
-    /// caller leaves the device suspended.
-    pub fn resume_plan(bank: &impl RegBank, irq_bound: bool, vt_allocated: bool) -> Result<(), ()> {
+    /// caller leaves the device suspended. The MTU program
+    /// (issue #802) drives RCTL.BSIZE, SRRCTL.BSIZEPKT and RLPML
+    /// from the programmed MTU: a D3 transition may have reset
+    /// SRRCTL/RLPML, so all three follow the MTU rather than the
+    /// 1500 default.
+    pub fn resume_plan(
+        bank: &impl RegBank,
+        irq_bound: bool,
+        vt_allocated: bool,
+        mtu: &mtu::MtuProgram,
+    ) -> Result<(), ()> {
         let q0 = queue_regs(0);
         bank.write32(REG_WUS, wus_clear_word());
         bank.write32(REG_WUC, 0);
@@ -3664,9 +3800,15 @@ mod pm {
         phy_write(bank, PHY_BMCR, PHY_BMCR_ANENABLE | PHY_BMCR_ANRESTART);
         bank.write32(
             REG_RCTL,
-            RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
+            RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | rctl_bsize(mtu.mtu),
         );
         bank.write32(REG_TCTL, TCTL_EN | TCTL_PSP);
+        let mut srrctl = bank.read32(q0.srrctl);
+        srrctl &= !(SRRCTL_BSIZEPKT_MASK | SRRCTL_DESCTYPE_MASK);
+        srrctl |= mtu.srrctl_bsize & SRRCTL_BSIZEPKT_MASK;
+        srrctl |= SRRCTL_DESCTYPE_ADV_ONEBUF;
+        bank.write32(q0.srrctl, srrctl);
+        bank.write32(REG_RLPML, mtu.rx_frame);
         let txdctl = queue_enable_word(bank.read32(q0.txdctl));
         bank.write32(q0.txdctl, txdctl);
         let rxdctl = queue_enable_word(bank.read32(q0.rxdctl));
@@ -3785,6 +3927,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         g.push(dev.clone());
         g.len() - 1
     };
+    // MTU hook (issue #802): clone for the hook before `dev` is
+    // shared; installed after `iface::register` below.
+    let mtu_control = Arc::new(IgbMtuControl {
+        controller: dev.clone(),
+    });
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -3806,6 +3953,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
     };
     narf_net::iface::set_driver_info(&name, "igb", None, bus_info);
+    narf_net::iface::set_device_control(&name, mtu_control);
+    crate::publish::publish_link(&name, link_sample);
     narf_net::iface::set_offloads(
         &name,
         narf_net::OffloadCapabilities {
@@ -4073,9 +4222,9 @@ mod tests {
     use super::{
         alloc_coherent, channel, datapath_allowed, eitr_reg, eitr_to_usecs, ivar0_shared_vector,
         ivar_apply, ivar_misc_shared_vector, ivar_rx, ivar_scheme_for_device, ivar_tx,
-        max_queues_for_device, mrqc_word, previous_rx_slot, queue_disable_word,
-        queue_enable_reflected, queue_enable_word, queue_pairs, queue_regs, reta_entry, reta_reg,
-        reta_shift, reta_table, reta_word, rss_key_word, rss_queue_for_hash, rssrk_reg,
+        max_queues_for_device, mrqc_word, mtu, previous_rx_slot, queue_disable_word,
+        queue_enable_reflected, queue_enable_word, queue_pairs, queue_regs, rctl_bsize, reta_entry,
+        reta_reg, reta_shift, reta_table, reta_word, rss_key_word, rss_queue_for_hash, rssrk_reg,
         rxcsum_rss_word, rxdctl_word, strip_vlan_tag_in_place, txdctl_word, usecs_to_eitr,
         vfta_bit, vfta_word, wol_supported, wol_suspend_program, wus_clear_word,
         wus_delivered_wake_packet, AdvRxDescRead, AdvRxDescWb, AdvTxCtxtDesc, AdvTxDataDesc,
@@ -4086,15 +4235,16 @@ mod tests {
         IGB_MAX_QUEUES_82575, IGB_MAX_QUEUES_I211, IGB_STAT_NAMES, IVAR_VALID, MRQC_ENABLE_RSS_MQ,
         MRQC_ENABLE_VMDQ, MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4, MRQC_FIELD_IPV4_TCP,
         MRQC_FIELD_IPV4_UDP, MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP, MRQC_FIELD_IPV6_TCP_EX,
-        MRQC_FIELD_IPV6_UDP, PHY_BMCR_PWRDOWN, QUEUE_ENABLE, RAH_AV, RCTL_BAM, RCTL_EN, RCTL_MPE,
-        RCTL_SECRC, RCTL_SUSPEND_ARMED, RCTL_SUSPEND_OFF, RCTL_UPE, REG_CTRL, REG_EIAC, REG_EIAM,
-        REG_EIMC, REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC,
-        REG_MRQC, REG_RAH0, REG_RAL0, REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT,
-        REG_RETA_BASE, REG_RSSRK_BASE, REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0, REG_STATUS,
-        REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0, REG_VET, REG_VFTA_BASE,
-        REG_WUC, REG_WUFC, REG_WUS, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE, RXCSUM_CRCOFL, RXCSUM_PCSD,
-        RX_RING_LEN, RX_RING_N, SRRCTL_DESCTYPE_ADV_ONEBUF, TCTL_EN, TCTL_PSP, TCTL_SUSPEND_OFF,
-        TXD_STAT_DD, TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_N, TX_RING_USABLE,
+        MRQC_FIELD_IPV6_UDP, PHY_BMCR_PWRDOWN, QUEUE_ENABLE, RAH_AV, RCTL_BAM, RCTL_BSIZE_16K,
+        RCTL_EN, RCTL_MPE, RCTL_SECRC, RCTL_SUSPEND_ARMED, RCTL_SUSPEND_OFF, RCTL_UPE, REG_CTRL,
+        REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0,
+        REG_IVAR_MISC, REG_MRQC, REG_RAH0, REG_RAL0, REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN,
+        REG_RDT, REG_RETA_BASE, REG_RLPML, REG_RSSRK_BASE, REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0,
+        REG_STATUS, REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0, REG_VET,
+        REG_VFTA_BASE, REG_WUC, REG_WUFC, REG_WUS, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE,
+        RXCSUM_CRCOFL, RXCSUM_PCSD, RX_RING_LEN, RX_RING_N, SRRCTL_BSIZEPKT_MASK,
+        SRRCTL_DESCTYPE_ADV_ONEBUF, TCTL_EN, TCTL_PSP, TCTL_SUSPEND_OFF, TXD_STAT_DD,
+        TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_N, TX_RING_USABLE,
         TX_TIMEOUT_NS, VET_8021Q, VFTA_WORDS, WUC_PME_EN, WUFC_LNKC, WUFC_MAG, WUFC_MC, WUS_ARPD,
         WUS_IPV6,
     };
@@ -4122,6 +4272,49 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_extended_interrupt_layout);
+
+    fn smoke_mtu_register_program() -> TestResult {
+        // RLPML is the RX length limit at 0x5004 — the same offset
+        // igc programs (its fixture pins 9238 there at MTU 9216).
+        if REG_RLPML != 0x5004 {
+            return TestResult::Fail("igb RLPML offset drifted from 0x5004");
+        }
+        // RCTL.BSIZE: 2K at the standard MTU, 16K for any jumbo MTU.
+        if rctl_bsize(1500) != 0
+            || rctl_bsize(1501) != RCTL_BSIZE_16K
+            || rctl_bsize(9216) != RCTL_BSIZE_16K
+        {
+            return TestResult::Fail("igb RCTL BSIZE program drifted");
+        }
+        if RCTL_BSIZE_16K != 0x3 << 16 {
+            return TestResult::Fail("igb RCTL_BSIZE_16K constant drifted");
+        }
+        // SRRCTL.BSIZEPKT is bits[6:0] in 1 KiB units, unshifted:
+        // 2 at MTU 1500, 10 at MTU 9216 (10240-byte buffers).
+        let std = match mtu::mtu_transition(1500) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb MTU 1500 rejected"),
+        };
+        let max = match mtu::mtu_transition(9216) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb MTU 9216 rejected"),
+        };
+        if std.srrctl_bsize != 2 || max.srrctl_bsize != 10 {
+            return TestResult::Fail("igb SRRCTL BSIZEPKT program drifted");
+        }
+        if (std.srrctl_bsize & SRRCTL_BSIZEPKT_MASK) != 2
+            || (max.srrctl_bsize & SRRCTL_BSIZEPKT_MASK) != 10
+        {
+            return TestResult::Fail("igb SRRCTL BSIZEPKT field does not fit bits[6:0]");
+        }
+        // RLPML program: 1522 at MTU 1500, 9238 at MTU 9216 (the
+        // value igc pins at the same offset for the same MTU).
+        if mtu::rlpml(1500) != 1522 || mtu::rlpml(9216) != 9238 {
+            return TestResult::Fail("igb RLPML program drifted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_mtu_register_program);
 
     use super::{vmdq, Vec, IMS_VMMB};
     use narf_bus::{msix::__synth_msix_table, BarKind};
@@ -4155,6 +4348,7 @@ mod tests {
             tx_state: IrqSafeSpinLock::new(TxRingCursor::new()),
             vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
             device_id: IGB_I350_COPPER,
+            mtu: IrqSafeSpinLock::new(1500),
             vt: IrqSafeSpinLock::new(None),
             stats: IgbStats::default(),
             wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
@@ -5562,7 +5756,7 @@ mod tests {
         if !program.power_down_link || program.wufc != 0 {
             return TestResult::Fail("igb unarmed suspend program did not select power-down");
         }
-        super::pm::suspend_plan(&bank, &program);
+        super::pm::suspend_plan(&bank, &program, super::rctl_bsize(super::mtu::STD_MTU));
         let q0 = super::queue_regs(0);
         if bank.value(super::REG_IMC) != !0u32 || bank.value(super::REG_EIMC) != !0u32 {
             return TestResult::Fail("igb suspend did not mask interrupts");
@@ -5594,7 +5788,7 @@ mod tests {
         if program.wufc != super::WUFC_MAG || program.power_down_link {
             return TestResult::Fail("igb armed suspend program did not select magic-only");
         }
-        super::pm::suspend_plan(&bank, &program);
+        super::pm::suspend_plan(&bank, &program, super::rctl_bsize(super::mtu::STD_MTU));
         if bank.value(super::REG_RCTL) != super::RCTL_SUSPEND_ARMED {
             return TestResult::Fail("igb armed suspend did not keep receive on");
         }
@@ -5614,6 +5808,8 @@ mod tests {
     kernel_test_in!("drivers/net/igb", smoke_igb_pm_suspend_armed_keeps_receive);
 
     fn smoke_igb_pm_resume_renegotiates_and_unmasks() -> TestResult {
+        let mtu = super::mtu::mtu_transition(super::mtu::STD_MTU)
+            .expect("standard MTU is always in range");
         let bank = FakeBank::new();
         let none = super::WolFilters {
             link_change: false,
@@ -5622,8 +5818,12 @@ mod tests {
             multicast: false,
             broadcast: false,
         };
-        super::pm::suspend_plan(&bank, &super::wol_suspend_program(none, false, false));
-        if super::pm::resume_plan(&bank, true, false).is_err() {
+        super::pm::suspend_plan(
+            &bank,
+            &super::wol_suspend_program(none, false, false),
+            super::rctl_bsize(super::mtu::STD_MTU),
+        );
+        if super::pm::resume_plan(&bank, true, false, &mtu).is_err() {
             return TestResult::Fail("igb resume failed on a reflecting queue");
         }
         let q0 = super::queue_regs(0);
@@ -5652,16 +5852,24 @@ mod tests {
         }
         // Polled device: no vector bound, mask stays as suspend left it.
         let polled = FakeBank::new();
-        super::pm::suspend_plan(&polled, &super::wol_suspend_program(none, false, false));
-        if super::pm::resume_plan(&polled, false, false).is_err()
+        super::pm::suspend_plan(
+            &polled,
+            &super::wol_suspend_program(none, false, false),
+            super::rctl_bsize(super::mtu::STD_MTU),
+        );
+        if super::pm::resume_plan(&polled, false, false, &mtu).is_err()
             || polled.value(super::REG_IMS) != 0
         {
             return TestResult::Fail("igb resume armed IMS on a polled device");
         }
         // VT allocated: mailbox cause re-armed alongside IMS.
         let vt = FakeBank::new();
-        super::pm::suspend_plan(&vt, &super::wol_suspend_program(none, false, false));
-        if super::pm::resume_plan(&vt, true, true).is_err()
+        super::pm::suspend_plan(
+            &vt,
+            &super::wol_suspend_program(none, false, false),
+            super::rctl_bsize(super::mtu::STD_MTU),
+        );
+        if super::pm::resume_plan(&vt, true, true, &mtu).is_err()
             || vt.value(super::REG_IMS) != super::IMS_DEFAULT | super::IMS_VMMB
             || vt.value(super::vmdq::REG_MBVFIMR) != super::vmdq::MBVFIMR_ALL_VFS
         {
@@ -5671,8 +5879,14 @@ mod tests {
         // before unmasking.
         let stuck = FakeBank::new();
         stuck.stuck_queue.set(true);
-        super::pm::suspend_plan(&stuck, &super::wol_suspend_program(none, false, false));
-        if super::pm::resume_plan(&stuck, true, false).is_ok() || stuck.value(super::REG_IMS) != 0 {
+        super::pm::suspend_plan(
+            &stuck,
+            &super::wol_suspend_program(none, false, false),
+            super::rctl_bsize(super::mtu::STD_MTU),
+        );
+        if super::pm::resume_plan(&stuck, true, false, &mtu).is_ok()
+            || stuck.value(super::REG_IMS) != 0
+        {
             return TestResult::Fail("igb resume unmasked MSI-X with a stuck queue");
         }
         TestResult::Pass

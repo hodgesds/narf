@@ -314,6 +314,41 @@ fn smoke_ixgbe_srrctl_adv_onebuf() -> TestResult {
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_srrctl_adv_onebuf);
 
+fn smoke_ixgbe_mtu_register_program() -> TestResult {
+    use super::{mtu, vmdq};
+    // MAXFRS is the RX length limit at 0x04268, MFS bits 31:16 —
+    // the same register the SET_LPE handler already programs.
+    if vmdq::REG_MAXFRS != 0x04268 || vmdq::MAXFRS_MFS_SHIFT != 16 {
+        return TestResult::Fail("ixgbe MAXFRS offset/shift drifted");
+    }
+    if vmdq::MAX_JUMBO_FRAME != 9728 {
+        return TestResult::Fail("ixgbe MAX_JUMBO_FRAME drifted from 9728");
+    }
+    // Standard MTU: MAXFRS 1518<<16, SRRCTL 2 KiB.
+    let std = match mtu::mtu_transition(1500) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("ixgbe MTU 1500 rejected"),
+    };
+    if std.maxfrs != 1518 << 16 || std.srrctl_bsize != 2 {
+        return TestResult::Fail("ixgbe MTU 1500 register program drifted");
+    }
+    // Max MTU: MAXFRS 9728<<16 (the documented max frame),
+    // SRRCTL 10 KiB. The SRRCTL program word is the same shape
+    // bring-up writes: BSIZEPKT | ADV_ONEBUF.
+    let max = match mtu::mtu_transition(9710) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("ixgbe MTU 9710 rejected"),
+    };
+    if max.maxfrs != 9728 << 16 || max.srrctl_bsize != 10 {
+        return TestResult::Fail("ixgbe MTU 9710 register program drifted");
+    }
+    if max.srrctl_bsize | SRRCTL_DESCTYPE_ADV_ONEBUF != 0x0200_000A {
+        return TestResult::Fail("ixgbe SRRCTL jumbo program word drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_mtu_register_program);
+
 // ── Stage 5: live MSI-X enable (skips off real silicon) ────────────
 
 fn smoke_ixgbe_live_bring_up() -> TestResult {
@@ -1168,7 +1203,15 @@ fn smoke_ixgbe_pm_plans() -> TestResult {
     if bank.read32(0x05808) != 0 {
         return TestResult::Fail("suspend without WoL left filters armed");
     }
-    if resume_rebuild_plan(&mut bank, &QueueConfig::single(), &[0x1000], &[0x2000]).is_err() {
+    if resume_rebuild_plan(
+        &mut bank,
+        &QueueConfig::single(),
+        &[0x1000],
+        &[0x2000],
+        SRRCTL_BSIZE_2K,
+    )
+    .is_err()
+    {
         return TestResult::Fail("resume rebuild failed on the 1/1 config");
     }
     if bank.read32(tx.txdctl) & TXDCTL_ENABLE == 0
@@ -1223,7 +1266,15 @@ fn smoke_ixgbe_pm_resume_rebuild() -> TestResult {
     // 1. 1/1 rebuild programs bases, lengths, heads, tails,
     // enables, SRRCTL, FCTRL, RXEN, and the misc vector.
     let mut bank = FakeBank::new();
-    if resume_rebuild_plan(&mut bank, &QueueConfig::single(), &[0x1000], &[0x2000]).is_err() {
+    if resume_rebuild_plan(
+        &mut bank,
+        &QueueConfig::single(),
+        &[0x1000],
+        &[0x2000],
+        SRRCTL_BSIZE_2K,
+    )
+    .is_err()
+    {
         return TestResult::Fail("1/1 rebuild failed");
     }
     if bank.read32(tx0.tdbal) != 0x1000
@@ -1254,7 +1305,15 @@ fn smoke_ixgbe_pm_resume_rebuild() -> TestResult {
         ring_len: 32,
     };
     let mut bank = FakeBank::new();
-    if resume_rebuild_plan(&mut bank, &cfg2, &[0x1000, 0x3000], &[0x2000, 0x4000]).is_err() {
+    if resume_rebuild_plan(
+        &mut bank,
+        &cfg2,
+        &[0x1000, 0x3000],
+        &[0x2000, 0x4000],
+        SRRCTL_BSIZE_2K,
+    )
+    .is_err()
+    {
         return TestResult::Fail("2/2 rebuild failed");
     }
     if bank.read32(tx1.tdbal) != 0x3000
@@ -1277,7 +1336,7 @@ fn smoke_ixgbe_pm_resume_rebuild() -> TestResult {
     };
     let mut bank = FakeBank::new();
     bank.write32(tx0.tdbal, 0xDEAD);
-    if resume_rebuild_plan(&mut bank, &bad, &[], &[0x2000]).is_ok()
+    if resume_rebuild_plan(&mut bank, &bad, &[], &[0x2000], SRRCTL_BSIZE_2K).is_ok()
         || bank.read32(tx0.tdbal) != 0xDEAD
     {
         return TestResult::Fail("zero-queue config was not fail-closed");
@@ -1289,6 +1348,7 @@ fn smoke_ixgbe_pm_resume_rebuild() -> TestResult {
         &QueueConfig::single(),
         &[0x1000, 0x3000],
         &[0x2000],
+        SRRCTL_BSIZE_2K,
     )
     .is_ok()
         || bank.read32(tx0.tdbal) != 0xDEAD
@@ -4307,10 +4367,10 @@ fn smoke_ixgbe_multiqueue_register_conversation() -> TestResult {
         let tx_phys: u64 = 0x1_0000_1000 + (q as u64) * 0x1_0000;
         let rx_phys: u64 = 0x1_0000_8000 + (q as u64) * 0x1_0000;
         program_tx_queue(&mut bank, q, tx_phys, ring_len);
-        program_rx_queue(&mut bank, q, rx_phys, ring_len);
+        program_rx_queue(&mut bank, q, rx_phys, ring_len, SRRCTL_BSIZE_2K);
     }
     program_tx_queue(&mut bank, 63, 0x2_0000_3000, ring_len);
-    program_rx_queue(&mut bank, 63, 0x2_0000_9000, ring_len);
+    program_rx_queue(&mut bank, 63, 0x2_0000_9000, ring_len, SRRCTL_BSIZE_2K);
     for q in 0..4usize {
         let tx = match tx_queue_regs(q) {
             Some(t) => t,

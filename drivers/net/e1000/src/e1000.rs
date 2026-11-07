@@ -569,10 +569,10 @@ const PBA_RXA_MASK: u32 = 0xFFFF;
 /// Pause quanta loaded into transmitted pause frames (Linux
 /// e1000e `E1000_FC_PAUSE_TIME`, 0x0680 quanta ≈ 858 µs at 1 GbE).
 const FC_PAUSE_TIME: u32 = 0x0680;
-/// Largest frame this driver accepts (the existing tx_enqueue
-/// bound): used to cap the high watermark so one full-size frame
-/// still fits below it.
-const FC_MAX_FRAME: u32 = 1518;
+// NOTE: the flow-control high watermark is capped by the largest
+// frame that can arrive (`crate::mtu::rx_frame_size`, derived from
+// the programmed MTU at the call site) — the old `FC_MAX_FRAME`
+// 1518 literal is gone with the hardcoded MTU (issue #802).
 
 // TCTL bits.
 const TCTL_EN: u32 = 1 << 1;
@@ -651,13 +651,38 @@ pub enum RxCsumResult {
 const RCTL_EN: u32 = 1 << 1; // Receiver Enable
 const RCTL_UPE: u32 = 1 << 3; // Unicast Promiscuous
 const RCTL_MPE: u32 = 1 << 4; // Multicast Promiscuous
+/// Long Packet Enable (8254x SDM §13.4.22; same bit on e1000e):
+/// with LPE clear the receiver drops frames longer than the
+/// standard maximum; jumbo MTUs need it set. Linux `e1000` /
+/// `e1000e` set `E1000_RCTL_LPE` (0x20) whenever the MTU exceeds
+/// 1500.
+const RCTL_LPE: u32 = 1 << 5;
 const RCTL_BAM: u32 = 1 << 15; // Broadcast Accept
 const RCTL_BSIZE_2K: u32 = 0 << 16; // Buffer Size = 2048
-                                    // VLAN Filter Enable (8254x SDM §13.4.22). When set, a received
-                                    // 802.1Q frame (type matches VET) is accepted only if its VID bit
-                                    // is set in the VFTA; otherwise it is dropped (SDM §3.2.9).
+/// Buffer Size = 16384 (RCTL.BSIZE field 11b; Linux
+/// `E1000_RCTL_BSIZE_16384`). The only step that holds a jumbo
+/// frame; see `crate::mtu`.
+const RCTL_BSIZE_16K: u32 = 0x3 << 16;
+/// RCTL.BSIZE field mask (bits 17:16).
+const RCTL_BSIZE_MASK: u32 = 0x3 << 16;
+// VLAN Filter Enable (8254x SDM §13.4.22). When set, a received
+// 802.1Q frame (type matches VET) is accepted only if its VID bit
+// is set in the VFTA; otherwise it is dropped (SDM §3.2.9).
 const RCTL_VFE: u32 = 1 << 18; // VLAN Filter Enable
 const RCTL_SECRC: u32 = 1 << 26; // Strip Ethernet CRC
+
+/// RCTL.BSIZE + LPE bits for `mtu` (issue #802): the 16K buffer
+/// step plus Long Packet Enable once the MTU exceeds standard, the
+/// 2K step with LPE clear otherwise. Every RCTL program in this
+/// file (bring-up, suspend-off, resume, `program_mtu`) derives
+/// these two bits from this one function so the words cannot drift.
+const fn rctl_bsize_lpe(mtu: u32) -> u32 {
+    if mtu > crate::mtu::STD_MTU {
+        RCTL_BSIZE_16K | RCTL_LPE
+    } else {
+        RCTL_BSIZE_2K
+    }
+}
 
 // RX descriptor status flags.
 const RXD_STAT_DD: u8 = 1 << 0; // Done
@@ -725,8 +750,12 @@ const MAX_DATA_PER_TXD: usize = 4096;
 /// them and the device silently drops the rest — so the ring is sized to
 /// absorb a full burst. RDLEN = 256*16 = 4096 (128-byte-aligned, valid).
 const RX_RING_LEN: usize = 256;
-/// Buffer size for each RX entry — must match RCTL.BSIZE.
-const RX_BUF_LEN: usize = 2048;
+/// Buffer size for each RX entry, in bytes. Sized once for the
+/// family's largest frame (`crate::mtu::RX_BUF_BYTES`, 16384: the
+/// classic 16128-byte max frame); RCTL.BSIZE selects how much of
+/// it the device may use at the *current* MTU (2K at 1500, 16K
+/// when jumbo), so the allocation never moves on an MTU change.
+const RX_BUF_LEN: usize = crate::mtu::RX_BUF_BYTES;
 /// Maximum descriptors returned to hardware by one RX-pump pass. Batching the
 /// RDT doorbell avoids one MMIO write (and one QEMU VM exit) per Ethernet
 /// frame, while the finite budget prevents sustained RX from monopolising the
@@ -1411,7 +1440,8 @@ pub enum E1000Error {
     BarMapFailed,
     NoMemory,
     UnsupportedDevice,
-    /// Caller passed a frame larger than 1518 bytes.
+    /// Caller passed a frame larger than the programmed MTU's wire
+    /// size (`crate::mtu::frame_size`).
     FrameTooLong,
     /// TX descriptor never completed.
     TxTimeout,
@@ -2025,8 +2055,7 @@ pub struct E1000 {
     tx_state: IrqSafeSpinLock<TxQueueState>,
     /// RX descriptor-ring DMA buffer.
     rx_ring: DmaBuffer,
-    /// RX buffer pool — one DMA page per descriptor (`RX_BUF_LEN`
-    /// bytes consumed; remainder unused).
+    /// RX buffer pool — one `RX_BUF_LEN` allocation per descriptor.
     #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     rx_pool: alloc::vec::Vec<DmaBuffer>,
     /// Driver-side RX head cursor (next descriptor to inspect for
@@ -2042,6 +2071,14 @@ pub struct E1000 {
     /// Filtering is the bring-up default (no UPE|MPE); the stack
     /// adds addresses explicitly or requests promiscuous mode.
     multicast_filter: IrqSafeSpinLock<MulticastFilter>,
+    /// PCI device id this controller was probed for. Selects the
+    /// jumbo ceiling (`crate::mtu::max_mtu`): classic 8254x parts
+    /// take 16110, e1000e parts 9000.
+    did: u16,
+    /// Programmed interface MTU (issue #802). 1500 at bring-up; the
+    /// sole post-bring-up writer is `set_mtu` via the `DeviceControl`
+    /// hook. `Interface::mtu` / `HwNic::mtu` read it.
+    mtu: IrqSafeSpinLock<u32>,
     /// MAC address read from RAL/RAH at bring-up.
     pub mac: [u8; 6],
     /// True after CTRL_SLU has been set + STATUS reports link up.
@@ -2324,8 +2361,10 @@ impl E1000 {
         let tx_ring_dma = tx_ring.dma_addr();
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(TX_RING_LEN);
         for _ in 0..TX_RING_LEN {
-            let b =
-                alloc_coherent(4096, crate::BUILTIN_DOMAIN).map_err(|_| E1000Error::NoMemory)?;
+            // TX_BUF_BYTES covers the family's largest frame, so a
+            // jumbo TX copy always fits its slot (issue #802).
+            let b = alloc_coherent(crate::mtu::TX_BUF_BYTES, crate::BUILTIN_DOMAIN)
+                .map_err(|_| E1000Error::NoMemory)?;
             tx_pool.push(b);
         }
         // Zero the ring (alloc_coherent guarantees fresh memory but
@@ -2365,8 +2404,11 @@ impl E1000 {
         let rx_ring_dma = rx_ring.dma_addr();
         let mut rx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RX_RING_LEN);
         for i in 0..RX_RING_LEN {
-            let buf =
-                alloc_coherent(4096, crate::BUILTIN_DOMAIN).map_err(|_| E1000Error::NoMemory)?;
+            // RX_BUF_LEN covers the family's largest frame (issue
+            // #802); RCTL.BSIZE selects how much of it the device
+            // may use at the current MTU.
+            let buf = alloc_coherent(RX_BUF_LEN, crate::BUILTIN_DOMAIN)
+                .map_err(|_| E1000Error::NoMemory)?;
             // The descriptor carries the DEVICE address of the buffer.
             let buf_dma = buf.dma_addr();
             let desc = RxDesc {
@@ -2406,11 +2448,15 @@ impl E1000 {
             }
             // RCTL: enable, accept broadcast + exact-match unicast
             // (RAL0, re-programmed above) + hash multicast, strip
-            // CRC, 2K buffers. Unicast/multicast promiscuous are
-            // OFF by default — the old accept-all behavior is
-            // available explicitly via `set_promiscuous(true)`.
+            // CRC, 2K buffers at the initial MTU 1500. Unicast/multicast
+            // promiscuous are OFF by default — the old accept-all
+            // behavior is available explicitly via
+            // `set_promiscuous(true)`.
             // RCTL.MO bits are 0 in this value (window [47:36]).
-            mmio.write32(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2K);
+            mmio.write32(
+                REG_RCTL,
+                RCTL_EN | RCTL_BAM | RCTL_SECRC | rctl_bsize_lpe(crate::mtu::STD_MTU),
+            );
         }
 
         // 6. Set link up.
@@ -2533,6 +2579,8 @@ impl E1000 {
             rx_head: IrqSafeSpinLock::new(0),
             vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
             multicast_filter: IrqSafeSpinLock::new(MulticastFilter::new()),
+            did: device.id.device,
+            mtu: IrqSafeSpinLock::new(crate::mtu::STD_MTU),
             mac,
             link_up,
             _msix: msix,
@@ -2812,7 +2860,7 @@ impl E1000 {
         if let Some(e) = self.gate_error() {
             return Err(e);
         }
-        if frame.is_empty() || frame.len() > 1518 {
+        if frame.is_empty() || frame.len() > crate::mtu::frame_size(*self.mtu.lock()) as usize {
             return Err(E1000Error::FrameTooLong);
         }
         let mut ticket = None;
@@ -2871,7 +2919,11 @@ impl E1000 {
             }
             return Err(e);
         }
-        if len == 0 || len > 1518 {
+        // Single-frame zero-copy submission: the cap is the
+        // programmed MTU's wire size (issue #802). TSO super-frames
+        // never come through here (`tx_tso_owned` posts directly
+        // with its own MAX_TSO_FRAME cap).
+        if len == 0 || len > crate::mtu::frame_size(*self.mtu.lock()) as usize {
             if let Some(buf) = owned.take() {
                 self.tx_zc_pool.release(buf);
             }
@@ -2980,8 +3032,9 @@ impl E1000 {
     /// Transmit one frame with an 802.1Q tag inserted by hardware
     /// (VLE + `special` TCI, SDM §3.3.3.1). Ensures CTRL.VME is set
     /// first — without it VLE is ignored. Same single-descriptor
-    /// 1518-byte bound as `tx_enqueue`; the stack's untagged path
-    /// is untouched.
+    /// MTU-derived bound as `tx_enqueue` (the tag travels in the
+    /// context descriptor, not the frame buffer); the stack's
+    /// untagged path is untouched.
     pub fn tx_send_vlan(&self, frame: &[u8], tci: u16) -> Result<TxTicket, E1000Error> {
         // SAFETY: mapped MMIO; CTRL is a valid 32-bit register.
         unsafe {
@@ -3084,6 +3137,53 @@ impl E1000 {
                 .write32(REG_RAL0 + slot as u64 * REG_RAL_STRIDE + 4, 0);
         }
         true
+    }
+
+    /// Program a new interface MTU (issue #802), via the
+    /// `DeviceControl` hook. Validates against the per-device
+    /// ceiling before touching hardware (EINVAL 22); same-MTU is a
+    /// no-op. Hardware is programmed before the stored MTU moves,
+    /// so a reader never sees an MTU the device is not programmed
+    /// for. TX/RX buffers are already sized for the family maximum
+    /// at probe, so no ring rebuild is needed here.
+    pub fn set_mtu(&self, mtu: u32) -> Result<(), i32> {
+        const EINVAL: i32 = 22;
+        if mtu == *self.mtu.lock() {
+            return Ok(());
+        }
+        let program = crate::mtu::mtu_transition(self.did, mtu).map_err(|_| EINVAL)?;
+        self.program_mtu(&program);
+        *self.mtu.lock() = program.mtu;
+        Ok(())
+    }
+
+    /// Program the RCTL receive word for `program` (BSIZE step +
+    /// LPE), then re-derive the flow-control watermarks when pause
+    /// reception is armed — the thresholds were computed for the
+    /// old max frame (Linux's 2009 mtu-threshold fix, same shape).
+    /// A plain RCTL read-modify-write like the VLAN/promiscuous
+    /// paths; control-plane only, so the shared-RCTL race with
+    /// those paths is the pre-existing one.
+    fn program_mtu(&self, program: &crate::mtu::MtuProgram) {
+        // SAFETY: identity-mapped MMIO; RCTL is a valid 32-bit register.
+        unsafe {
+            let rctl = self.mmio.read32(REG_RCTL);
+            let rctl = (rctl & !(RCTL_BSIZE_MASK | RCTL_LPE)) | rctl_bsize_lpe(program.mtu);
+            self.mmio.write32(REG_RCTL, rctl);
+        }
+        // SAFETY: mapped MMIO; CTRL/PBA/FCRTL/FCRTH are valid
+        // 32-bit offsets within BAR0, and FCTTV/CTRL bits are
+        // untouched here.
+        unsafe {
+            let ctrl = self.mmio.read32(REG_CTRL);
+            if ctrl & (CTRL_RFCE | CTRL_TFCE) != 0 {
+                let pba = self.mmio.read32(REG_PBA) & PBA_RXA_MASK;
+                if let Some((low, high)) = flow_control_watermarks(pba, program.rx_frame) {
+                    self.mmio.write32(REG_FCRTL, low | FCRTL_XONE);
+                    self.mmio.write32(REG_FCRTH, high);
+                }
+            }
+        }
     }
 
     /// Explicit promiscuous fallback: `true` restores the old
@@ -3259,8 +3359,8 @@ impl E1000 {
             let buf_phys = desc.addr;
             for (i, b) in out.iter_mut().enumerate().take(len) {
                 // SAFETY: the RX buffer at `buf_phys` is an identity-mapped DMA
-                // page the device filled; `i < len <= RX_BUF_LEN`, so the byte
-                // address `buf_phys + i` stays within that page.
+                // buffer the device filled; `i < len <= RX_BUF_LEN`, so the byte
+                // address `buf_phys + i` stays within that buffer.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
                 *b = unsafe {
                     core::ptr::read_volatile(
@@ -3355,11 +3455,11 @@ impl E1000 {
                 // Descriptor `head` is backed by `rx_pool[head]` at probe and
                 // re-armed in place (the buffer address never changes), so the
                 // pairing is stable for the device's lifetime. Hand the stack a
-                // mutable slice straight into that identity-mapped page.
-                // SAFETY: the page is device-filled (DD set) and not concurrently
+                // mutable slice straight into that identity-mapped buffer.
+                // SAFETY: the buffer is device-filled (DD set) and not concurrently
                 // written (we re-arm only after `f` returns); it is identity-mapped
-                // and `len <= RX_BUF_LEN <= page size`, so the slice stays within
-                // the buffer. An XDP rewrite in `f` writes the DMA page we own.
+                // and `len <= RX_BUF_LEN`, so the slice stays within
+                // the buffer. An XDP rewrite in `f` writes the DMA buffer we own.
                 // VLAN: when CTRL.VME is set, hardware strips the tag and
                 // records the TCI in `special` (SDM §3.2). Re-tag in place
                 // before the stack sees the frame; the DMA page holds
@@ -3373,12 +3473,12 @@ impl E1000 {
                 // stripped (documented corner).
                 let page = self.rx_pool[head].cpu_mut_ptr_at::<u8>(0);
                 let deliver_len = if desc.special != 0 {
-                    // SAFETY: `page` is the base of the `rx_pool[head]` DMA page
-                    // (one page per descriptor, RX_BUF_LEN bytes consumed), which
+                    // SAFETY: `page` is the base of the `rx_pool[head]` DMA buffer
+                    // (one RX_BUF_LEN allocation per descriptor), which
                     // the driver owns; DD is set, so the device has finished
                     // writing it, and we re-arm only after `f` returns, so no
                     // concurrent device write aliases this slice. RX_BUF_LEN is
-                    // within the page, so the slice is in-bounds and non-null.
+                    // the allocation size, so the slice is in-bounds and non-null.
                     let page_slice = unsafe { core::slice::from_raw_parts_mut(page, RX_BUF_LEN) };
                     vlan_reinsert_tag(page_slice, len, desc.special).unwrap_or(len)
                 } else {
@@ -3575,7 +3675,12 @@ impl E1000 {
         // The register program lives in `pm::suspend_plan` so
         // fixtures drive the exact conversation against a fake
         // bank (issue #793); the live path runs it via `MmioBank`.
-        pm::suspend_plan(&mut pm::MmioBank::new(&self.mmio));
+        // Suspend-off keeps the programmed BSIZE/LPE so resume
+        // restores the jumbo program, not the 1500 default.
+        pm::suspend_plan(
+            &mut pm::MmioBank::new(&self.mmio),
+            Self::RCTL_SUSPEND_OFF | rctl_bsize_lpe(*self.mtu.lock()),
+        );
         self.lsc_pending.store(false, Ordering::Release);
         crate::publish::publish_link(self.ifname(), crate::publish::LinkSample::DOWN);
         Ok(())
@@ -3600,9 +3705,17 @@ impl E1000 {
         // fixtures drive the exact conversation against a fake
         // bank (issue #793); the words below are exactly the
         // bring-up program (RCTL at bring-up step 7, TCTL at
-        // step 6), so resume cannot drift from bring-up.
+        // step 6), so resume cannot drift from bring-up — except the
+        // BSIZE/LPE bits, which follow the programmed MTU (issue
+        // #802) rather than the 1500 default.
         pm::resume_plan(
             &mut pm::MmioBank::new(&self.mmio),
+            RCTL_EN
+                | RCTL_BAM
+                | RCTL_UPE
+                | RCTL_MPE
+                | RCTL_SECRC
+                | rctl_bsize_lpe(*self.mtu.lock()),
             self.irq_vector.is_some(),
         );
         self.suspended.store(false, Ordering::Release);
@@ -3905,24 +4018,25 @@ mod pm {
     /// write-1-to-clear; the ICR read drains any cause bits already
     /// latched), then stop the TX/RX DMA engines with the EN bits
     /// cleared and all filter/config bits kept, so resume restores
-    /// exactly what bring-up programmed.
-    pub fn suspend_plan(bank: &mut impl RegBank) {
+    /// exactly what bring-up programmed. The caller passes the
+    /// RCTL word with the programmed BSIZE/LPE (issue #802), so
+    /// suspend preserves the jumbo program for resume.
+    pub fn suspend_plan(bank: &mut impl RegBank, rctl: u32) {
         bank.write32(REG_IMC, !0u32);
         let _ = bank.read32(REG_ICR);
         bank.write32(REG_TCTL, E1000::TCTL_SUSPEND_OFF);
-        bank.write32(REG_RCTL, E1000::RCTL_SUSPEND_OFF);
+        bank.write32(REG_RCTL, rctl);
     }
 
     /// Resume register program: restore the bring-up RCTL/TCTL
     /// words, re-arm the interrupt mask only when a vector is bound
     /// (polled devices keep the all-masked state bring-up left them
     /// in), then sample live STATUS so the caller can republish link
-    /// from hardware rather than from a stale snapshot.
-    pub fn resume_plan(bank: &mut impl RegBank, irq_bound: bool) -> u32 {
-        bank.write32(
-            REG_RCTL,
-            RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
-        );
+    /// from hardware rather than from a stale snapshot. The caller
+    /// passes the RCTL word with the programmed BSIZE/LPE
+    /// (issue #802) rather than the 1500 default.
+    pub fn resume_plan(bank: &mut impl RegBank, rctl: u32, irq_bound: bool) -> u32 {
+        bank.write32(REG_RCTL, rctl);
         bank.write32(
             REG_TCTL,
             TCTL_EN | TCTL_PSP | TCTL_CT_15 | TCTL_COLD_63 | TCTL_RTLC,
@@ -3967,6 +4081,21 @@ fn live_controller(index: usize) -> Option<Arc<E1000>> {
         .get(index)
         .filter(|c| !c.detached.load(Ordering::Acquire))
         .cloned()
+}
+
+/// `DeviceControl` hook for the runtime MTU switch (issue #802).
+/// Mirrors r8169's `RtlMtuControl`: only the MTU is acted on —
+/// MAC/promiscuous/multicast changes pass through untouched (the
+/// same-MTU no-op keeps `try_set_mac` metadata-only, as before).
+#[derive(Debug)]
+pub struct E1000MtuControl {
+    controller: Arc<E1000>,
+}
+
+impl narf_net::iface::DeviceControl for E1000MtuControl {
+    fn configure(&self, config: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+        self.controller.set_mtu(config.mtu)
+    }
 }
 
 /// Detach the bound e1000 device at `index`, if any: device half
@@ -4064,6 +4193,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
     };
     narf_net::iface::set_driver_info(&name, "e1000", None, bus_info);
+    // Runtime MTU switch (issue #802): `try_set_mtu` validates
+    // against the per-device ceiling and programs RCTL before the
+    // registry commits the new MTU.
+    let _ = narf_net::iface::set_device_control(
+        &name,
+        Arc::new(E1000MtuControl {
+            controller: dev.clone(),
+        }),
+    );
+    let status = dev.read_status();
+    crate::publish::publish_link(&name, link_sample_from_status(status));
     narf_net::iface::set_offloads(
         &name,
         narf_net::OffloadCapabilities {
@@ -4533,7 +4673,11 @@ impl narf_net::Interface for E1000Nic {
         self.nic.mac
     }
     fn mtu(&self) -> u32 {
-        1500
+        // Per-port programmed MTU (#802): read off this Nic's own
+        // controller, not the `CONTROLLERS` registry — the old
+        // singleton `with_controller` lookup is gone on main (#1633)
+        // and would report the wrong port's MTU on a second 8254x.
+        *self.nic.mtu.lock()
     }
     fn link_up(&self) -> bool {
         // Probe-time value, gated on suspend. Live transitions still
@@ -4562,7 +4706,9 @@ impl crate::HwNic for E1000Nic {
         self.nic.mac
     }
     fn mtu(&self) -> u32 {
-        1500
+        // Per-port programmed MTU (#802): read off this Nic's own
+        // controller — see the `Interface` impl above.
+        *self.nic.mtu.lock()
     }
     fn link_up(&self) -> bool {
         // Same suspend gate as the `Interface` impl above.
@@ -4990,7 +5136,12 @@ impl E1000 {
             // SAFETY: mapped MMIO; PBA is a valid 32-bit register
             // offset within BAR0.
             let pba = unsafe { self.mmio.read32(REG_PBA) } & PBA_RXA_MASK;
-            match flow_control_watermarks(pba, FC_MAX_FRAME) {
+            // The high watermark leaves room for one full-size
+            // frame below it; the size follows the programmed MTU
+            // (issue #802), not the old 1518 literal — Linux fixed
+            // the same drift in 2009 ("flow control thresholds not
+            // correct when changing mtu").
+            match flow_control_watermarks(pba, crate::mtu::rx_frame_size(*self.mtu.lock())) {
                 Some((low, high)) => {
                     fcrtl = low | FCRTL_XONE;
                     fcrth = high;
@@ -6226,7 +6377,7 @@ mod tests {
         );
         bank.write32(super::REG_TCTL, super::TCTL_EN | super::TCTL_PSP);
         bank.write32(super::REG_IMS, super::IMS_DEFAULT);
-        super::pm::suspend_plan(&mut bank);
+        super::pm::suspend_plan(&mut bank, super::E1000::RCTL_SUSPEND_OFF);
         if bank.value(super::REG_IMC) != !0u32 {
             return TestResult::Fail("e1000 suspend did not mask interrupts");
         }
@@ -6253,13 +6404,19 @@ mod tests {
 
     fn smoke_e1000_pm_resume_restores_and_relinks() -> TestResult {
         let mut bank = FakeBank::new();
-        super::pm::suspend_plan(&mut bank);
+        super::pm::suspend_plan(&mut bank, super::E1000::RCTL_SUSPEND_OFF);
         // Live link: STATUS reports LU at 1000 Full.
         bank.write32(
             super::REG_STATUS,
             super::STATUS_LU | super::STATUS_SPEED_1000 | super::STATUS_FD,
         );
-        let status = super::pm::resume_plan(&mut bank, true);
+        let rctl = super::RCTL_EN
+            | super::RCTL_BAM
+            | super::RCTL_UPE
+            | super::RCTL_MPE
+            | super::RCTL_SECRC
+            | super::RCTL_BSIZE_2K;
+        let status = super::pm::resume_plan(&mut bank, rctl, true);
         if bank.value(super::REG_RCTL) & super::RCTL_EN == 0
             || bank.value(super::REG_TCTL) & super::TCTL_EN == 0
         {
@@ -6277,14 +6434,14 @@ mod tests {
         }
         // Polled device: no vector bound, mask stays as bring-up left it.
         let mut polled = FakeBank::new();
-        super::pm::suspend_plan(&mut polled);
-        let _ = super::pm::resume_plan(&mut polled, false);
+        super::pm::suspend_plan(&mut polled, super::E1000::RCTL_SUSPEND_OFF);
+        let _ = super::pm::resume_plan(&mut polled, rctl, false);
         if polled.value(super::REG_IMS) != 0 {
             return TestResult::Fail("e1000 resume armed IMS on a polled device");
         }
         // Suspend → resume → suspend is stable: a second cycle
         // programs the same words (idempotent fan-out).
-        super::pm::suspend_plan(&mut bank);
+        super::pm::suspend_plan(&mut bank, super::E1000::RCTL_SUSPEND_OFF);
         if bank.value(super::REG_RCTL) != super::E1000::RCTL_SUSPEND_OFF
             || bank.value(super::REG_TCTL) != super::E1000::TCTL_SUSPEND_OFF
         {
@@ -6296,4 +6453,26 @@ mod tests {
         "drivers/net/e1000",
         smoke_e1000_pm_resume_restores_and_relinks
     );
+
+    fn smoke_rctl_bsize_lpe_follows_mtu() -> TestResult {
+        // Standard MTU: 2K step (0), LPE clear — the bring-up word.
+        if super::rctl_bsize_lpe(1500) != super::RCTL_BSIZE_2K {
+            return TestResult::Fail("e1000 RCTL program not 2K at MTU 1500");
+        }
+        // Any jumbo MTU: 16K step + LPE, on every part (the buffer
+        // step is a property of RCTL, not of the device id).
+        if super::rctl_bsize_lpe(1501) != super::RCTL_BSIZE_16K | super::RCTL_LPE
+            || super::rctl_bsize_lpe(9000) != super::RCTL_BSIZE_16K | super::RCTL_LPE
+            || super::rctl_bsize_lpe(16110) != super::RCTL_BSIZE_16K | super::RCTL_LPE
+        {
+            return TestResult::Fail("e1000 RCTL program not 16K+LPE at jumbo MTU");
+        }
+        // The 16K step covers the classic max frame; the LPE bit is
+        // bit 5 (Linux E1000_RCTL_LPE).
+        if super::RCTL_LPE != 1 << 5 || super::RCTL_BSIZE_16K != 0x3 << 16 {
+            return TestResult::Fail("e1000 RCTL LPE/BSIZE_16K constants drifted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_rctl_bsize_lpe_follows_mtu);
 }
