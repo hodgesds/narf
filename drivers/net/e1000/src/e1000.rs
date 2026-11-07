@@ -61,7 +61,7 @@
 //! | 0x5400  | RAL  | Receive Address Low (MAC[0..4])   |
 //! | 0x5404  | RAH  | Receive Address High (MAC[4..6] + valid bit) |
 
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
@@ -6020,6 +6020,12 @@ mod tests {
                 tx_timeouts: AtomicU64::new(0),
                 tx_resets: AtomicU64::new(0),
                 recovering: AtomicBool::new(false),
+                // Fixture address: the test never probes a real device,
+                // so the zero PCIe address is only a registry key
+                // (same pattern as other driver fixtures).
+                addr: narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0, 0, 0, 0)),
+                ifname: crate::publish::IfName::new(),
+                lsc_pending: AtomicBool::new(false),
             };
             // Bring-up register program (steps 4–6), minus the IRQ
             // install: rings, filters, link up.
