@@ -1,3 +1,5 @@
+#![no_std]
+
 //! Intel Low Power Subsystem (LPSS) PWM controller driver.
 //!
 //! First production `PwmDevice` implementor in-tree (issue #1699):
@@ -47,6 +49,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -532,6 +535,7 @@ pub fn register_initcalls() {
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
     use alloc::sync::Arc as AllocArc;
     use core::future::Future;
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
