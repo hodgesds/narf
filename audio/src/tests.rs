@@ -345,8 +345,8 @@ kernel_test_in!("audio", smoke_audio_format_unsupported_rate_rejects);
 
 fn smoke_hda_quirks_table_contents() -> TestResult {
     use crate::hda::quirks::{
-        find_quirk, find_verified_quirk, first_for_chip, init_table_for, quirk_count,
-        verified_quirk_count, CoefOp, RealtekChip, QUIRK_TABLE, VERIFIED_QUIRK_TABLE,
+        find_quirk, find_verified_quirk, first_for_chip, init_table_for, parse_table_for,
+        quirk_count, verified_quirk_count, CoefOp, RealtekChip, QUIRK_TABLE, VERIFIED_QUIRK_TABLE,
     };
 
     // Rescued from drivers/sound/src/codec/{quirks,realtek}.rs (#783):
@@ -380,7 +380,7 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
         _ => return TestResult::Fail("first ALC256 quirk must be the Dell entry"),
     }
 
-    // Init tables: the 27 base tables hold 96 coef ops in total.
+    // Init tables: the 32 base tables hold 96 coef ops in total.
     // (#776: the rescued (0x46, 0x0000) ALC256 row and (0x1B,
     // 0x0c0b) ALC236 row were deleted as verified-wrong against
     // Linux `alc269.c`; #1496: the ALC256-family tables now hold
@@ -389,12 +389,14 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
     // ALC282/283 hold their full verified `alc*_coefs` tables,
     // and ALC294's rescued rows were deleted: `alc294_init` has
     // no unconditional static coef ops.)
-    const BASE_CHIPS: [RealtekChip; 27] = [
+    const BASE_CHIPS: [RealtekChip; 32] = [
         RealtekChip::Alc256,
         RealtekChip::Alc230,
         RealtekChip::Alc215,
+        RealtekChip::Alc222,
         RealtekChip::Alc225,
         RealtekChip::Alc233,
+        RealtekChip::Alc234,
         RealtekChip::Alc235,
         RealtekChip::Alc236,
         RealtekChip::Alc245,
@@ -417,6 +419,9 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
         RealtekChip::Alc300,
         RealtekChip::Alc623,
         RealtekChip::Alc700,
+        RealtekChip::Alc701,
+        RealtekChip::Alc703,
+        RealtekChip::Alc711,
     ];
     let total_rows: usize = BASE_CHIPS.iter().map(|c| init_table_for(*c).len()).sum();
     if total_rows != 96 {
@@ -471,17 +476,58 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
     // coef ops have empty tables.
     for chip in [
         RealtekChip::Alc215,
+        RealtekChip::Alc222,
         RealtekChip::Alc225,
+        RealtekChip::Alc234,
         RealtekChip::Alc245,
         RealtekChip::Alc274,
         RealtekChip::Alc299,
         RealtekChip::Alc300,
         RealtekChip::Alc623,
         RealtekChip::Alc700,
+        RealtekChip::Alc701,
+        RealtekChip::Alc703,
+        RealtekChip::Alc711,
     ] {
         if !init_table_for(chip).is_empty() {
             return TestResult::Fail("alc225/alc294/alc222/default init must be empty");
         }
+    }
+    // Parse-time tables (#776 remainders, Linux `patch_alc269`
+    // dispatch): the ALC294 arm (ALC234/274/294) carries the 0x6b
+    // UAJ MIC Vref update, the ALC700 arm (ALC700/701/703/711)
+    // the 0x4a combo-jack update; every other base chip parses
+    // nothing.
+    if parse_table_for(RealtekChip::Alc274) != [CoefOp::update(0x6b, 0x0018, 0x0018)] {
+        return TestResult::Fail("ALC274 parse table must hold the 0x6b update");
+    }
+    if parse_table_for(RealtekChip::Alc700) != [CoefOp::update(0x4a, 0x8000, 0x0000)] {
+        return TestResult::Fail("ALC700 parse table must hold the 0x4a update");
+    }
+    if parse_table_for(RealtekChip::Alc234) != parse_table_for(RealtekChip::Alc274)
+        || parse_table_for(RealtekChip::Alc294) != parse_table_for(RealtekChip::Alc274)
+    {
+        return TestResult::Fail("ALC234/294 must share the ALC274 parse table");
+    }
+    if parse_table_for(RealtekChip::Alc701) != parse_table_for(RealtekChip::Alc700)
+        || parse_table_for(RealtekChip::Alc703) != parse_table_for(RealtekChip::Alc700)
+        || parse_table_for(RealtekChip::Alc711) != parse_table_for(RealtekChip::Alc700)
+    {
+        return TestResult::Fail("ALC701/703/711 must share the ALC700 parse table");
+    }
+    for chip in [
+        RealtekChip::Alc222,
+        RealtekChip::Alc256,
+        RealtekChip::Alc282,
+        RealtekChip::Alc287,
+    ] {
+        if !parse_table_for(chip).is_empty() {
+            return TestResult::Fail("only the ALC294/ALC700 arms have parse updates");
+        }
+    }
+    let total_parse: usize = BASE_CHIPS.iter().map(|c| parse_table_for(*c).len()).sum();
+    if total_parse != 7 {
+        return TestResult::Fail("parse tables must hold 7 coef ops in total");
     }
     // Alias arms must resolve to the same tables as their base chips.
     if init_table_for(RealtekChip::Alc257) != init_table_for(RealtekChip::Alc256) {
@@ -498,13 +544,18 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
         return TestResult::Fail("0x10EC0230 must identify as ALC230");
     }
     if RealtekChip::from_vendor_id(0x10EC_0215) != Some(RealtekChip::Alc215)
+        || RealtekChip::from_vendor_id(0x10EC_0222) != Some(RealtekChip::Alc222)
         || RealtekChip::from_vendor_id(0x10EC_0225) != Some(RealtekChip::Alc225)
+        || RealtekChip::from_vendor_id(0x10EC_0234) != Some(RealtekChip::Alc234)
         || RealtekChip::from_vendor_id(0x10EC_0245) != Some(RealtekChip::Alc245)
         || RealtekChip::from_vendor_id(0x10EC_0274) != Some(RealtekChip::Alc274)
         || RealtekChip::from_vendor_id(0x10EC_0299) != Some(RealtekChip::Alc299)
         || RealtekChip::from_vendor_id(0x10EC_0300) != Some(RealtekChip::Alc300)
         || RealtekChip::from_vendor_id(0x10EC_0623) != Some(RealtekChip::Alc623)
         || RealtekChip::from_vendor_id(0x10EC_0700) != Some(RealtekChip::Alc700)
+        || RealtekChip::from_vendor_id(0x10EC_0701) != Some(RealtekChip::Alc701)
+        || RealtekChip::from_vendor_id(0x10EC_0703) != Some(RealtekChip::Alc703)
+        || RealtekChip::from_vendor_id(0x10EC_0711) != Some(RealtekChip::Alc711)
     {
         return TestResult::Fail("new RealtekChip variants must identify by device id");
     }
@@ -514,12 +565,25 @@ fn smoke_hda_quirks_table_contents() -> TestResult {
     if RealtekChip::Alc295.name() != "ALC295" {
         return TestResult::Fail("ALC295 name changed");
     }
+    if RealtekChip::Alc222.name() != "ALC222"
+        || RealtekChip::Alc234.name() != "ALC234"
+        || RealtekChip::Alc701.name() != "ALC701"
+        || RealtekChip::Alc703.name() != "ALC703"
+        || RealtekChip::Alc711.name() != "ALC711"
+    {
+        return TestResult::Fail("new sibling chip names changed");
+    }
     if !RealtekChip::Alc230.uses_alc256_init() || !RealtekChip::Alc230.has_verified_coef_init() {
         return TestResult::Fail("ALC230 must use alc256_init");
     }
     if !RealtekChip::Alc282.has_verified_coef_init()
         || !RealtekChip::Alc283.has_verified_coef_init()
         || RealtekChip::Alc287.has_verified_coef_init()
+        || RealtekChip::Alc222.has_verified_coef_init()
+        || RealtekChip::Alc234.has_verified_coef_init()
+        || RealtekChip::Alc701.has_verified_coef_init()
+        || RealtekChip::Alc703.has_verified_coef_init()
+        || RealtekChip::Alc711.has_verified_coef_init()
     {
         return TestResult::Fail("only the ALC256 family + ALC282/283 have verified coef init");
     }

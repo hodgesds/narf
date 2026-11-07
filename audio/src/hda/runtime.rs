@@ -107,6 +107,15 @@ pub(super) fn delay_us(us: u64) {
     narf_scheduler::responsive_spin_until(|| deadline.expired(), Deadline::after_us(us + 1000));
 }
 
+/// SET_AMP_GAIN_MUTE payload muting both output channels (HDA
+/// §7.3.3.9: bit 15 output amp, bits 13/12 left/right, bit 7
+/// mute; Linux `AMP_OUT_MUTE` in the Realtek init hooks).
+const AMP_OUT_MUTE: u32 = 0xB080;
+
+/// GET_PIN_SENSE presence bit (HDA §7.3.3.28; Linux
+/// `AC_PIN_SENSE_PRESENCE`).
+const PIN_SENSE_PRESENCE: u32 = 1 << 31;
+
 impl IntelHda {
     /// # Safety
     /// Caller exclusively owns this PCI function and its DMA engines.
@@ -315,6 +324,9 @@ impl IntelHda {
             // is consulted: none of the rescued `hda::quirks`
             // entries verified as a codec subsystem ID (see
             // `quirks.rs`).
+            // SAFETY: Read-only subsystem-ID parameter read on the root node of
+            // codec `cad` (present per the STATESTS mask above); this controller
+            // exclusively owns the command transport and the lease serializes it.
             let subsystem_id = unsafe {
                 dev.send_verb(make_verb(
                     cad,
@@ -324,19 +336,27 @@ impl IntelHda {
             }
             .ok()
             .filter(|&v| v != 0);
-            // #1496: verified codec fixups. The init coef table and
-            // a quirk's chained coef sequence run before the widget
-            // graph is built (Linux PRE_PROBE), so the graph is
-            // enumerated on the fixed-up codec; the pin /
-            // connection-list / preferred-DAC overrides patch the
-            // decoded graph afterwards (Linux's driver-side caches —
+            // #1496: verified codec fixups. The parse-time coef
+            // updates (#776 remainders, Linux `patch_alc269`
+            // dispatch) run first, once, before the widget graph
+            // is built; the init coef table and a quirk's chained
+            // coef sequence run before the widget graph is built
+            // (Linux PRE_PROBE), so the graph is enumerated on the
+            // fixed-up codec; the pin / connection-list /
+            // preferred-DAC overrides patch the decoded graph
+            // afterwards (Linux's driver-side caches —
             // `snd_hda_codec_set_pincfg` /
-            // `snd_hda_override_conn_list` — issue no verbs). A
-            // quirk matches only when BOTH the codec subsystem ID
-            // and the chip agree; anything else fails open to
-            // generic behavior.
+            // `snd_hda_override_conn_list` — issue no verbs). The
+            // ALC282/283 HP-pin tails run after enumeration
+            // (below): the HP pin is only known once the graph is
+            // built. A quirk matches only when BOTH the codec
+            // subsystem ID and the chip agree; anything else fails
+            // open to generic behavior.
             let chip = super::quirks::RealtekChip::from_vendor_id(vendor);
             if let Some(chip) = chip {
+                if !super::quirks::parse_table_for(chip).is_empty() {
+                    dev.apply_parse_coef(cad, chip)?;
+                }
                 if chip.has_verified_coef_init() {
                     dev.apply_coef_init(cad, chip)?;
                 }
@@ -366,6 +386,17 @@ impl IntelHda {
             }
             if let Some(quirk) = quirk {
                 Self::apply_quirk_to_graph(&mut graph, quirk);
+            }
+            // #776 remainders: the ALC282/283 HP-pin tails run
+            // after enumeration — the HP pin (`Codec::hp_pin`,
+            // Linux `alc_get_hp_pin`) is only known once the
+            // graph is built, and the quirk overrides above may
+            // have re-typed a pin. No HP pin, no tail: Linux
+            // returns early when `alc_get_hp_pin` is 0.
+            if let Some(chip) = chip {
+                if let Some(hp_pin) = graph.hp_pin() {
+                    dev.apply_hp_tail(cad, chip, hp_pin)?;
+                }
             }
             dev.codecs.push(CodecInfo {
                 addr: cad,
@@ -420,22 +451,44 @@ impl IntelHda {
     /// exactly as Linux's `__alc_update_coefex_idx` does when the
     /// read returns -1.
     fn apply_coef_init(&self, cad: u8, chip: super::quirks::RealtekChip) -> Result<(), HdaError> {
-        for op in super::quirks::init_table_for(chip) {
+        self.apply_coef_ops(cad, super::quirks::init_table_for(chip))
+    }
+
+    /// #776 remainders: issue a chip's parse-time coef table
+    /// (Linux `patch_alc269` dispatch, `super::quirks::parse_table_for`)
+    /// — the ALC294-arm 0x6b and ALC700-arm 0x4a masked updates. Probe-only: Linux's patch dispatch
+    /// runs once, so reinit deliberately does NOT call this.
+    /// Caller gates on the table being non-empty.
+    fn apply_parse_coef(&self, cad: u8, chip: super::quirks::RealtekChip) -> Result<(), HdaError> {
+        self.apply_coef_ops(cad, super::quirks::parse_table_for(chip))
+    }
+
+    /// Issue coef ops in order, exactly as Linux's
+    /// `alc_process_coef_fw` walks its table.
+    fn apply_coef_ops(&self, cad: u8, ops: &[super::quirks::CoefOp]) -> Result<(), HdaError> {
+        for op in ops {
             if op.is_write() {
-                self.verb(
-                    cad,
-                    op.nid,
-                    crate::hda_codec::verb::SET_COEF_INDEX | u32::from(op.idx),
-                )?;
-                self.verb(
-                    cad,
-                    op.nid,
-                    crate::hda_codec::verb::SET_PROC_COEF | u32::from(op.value),
-                )?;
+                self.write_coef_idx(cad, op.nid, op.idx, op.value)?;
             } else {
                 self.update_coef_idx(cad, op.nid, op.idx, op.mask, op.value)?;
             }
         }
+        Ok(())
+    }
+
+    /// Plain coef write: SET_COEF_INDEX then SET_PROC_COEF
+    /// (Linux `alc_write_coef_idx`).
+    fn write_coef_idx(&self, cad: u8, nid: u8, idx: u16, value: u16) -> Result<(), HdaError> {
+        self.verb(
+            cad,
+            nid,
+            crate::hda_codec::verb::SET_COEF_INDEX | u32::from(idx),
+        )?;
+        self.verb(
+            cad,
+            nid,
+            crate::hda_codec::verb::SET_PROC_COEF | u32::from(value),
+        )?;
         Ok(())
     }
 
@@ -487,6 +540,118 @@ impl IntelHda {
         for step in quirk.coef_seq {
             self.verb(cad, step.nid, step.verb)?;
         }
+        Ok(())
+    }
+
+    /// Linux `snd_hda_jack_detect`: GET_PIN_SENSE (HDA §7.3.3.28)
+    /// presence bit. A failed sense read counts as unplugged —
+    /// the HP tail still issues its verbs, only the sleeps are
+    /// skipped — so a sense failure never fails probe or reinit.
+    fn jack_present(&self, cad: u8, pin: u8) -> bool {
+        self.verb(cad, pin, crate::hda_codec::verb::GET_PIN_SENSE)
+            .is_ok_and(|sense| sense & PIN_SENSE_PRESENCE != 0)
+    }
+
+    /// #776 remainders: the HP-pin tail of `alc282_init` /
+    /// `alc283_init` (Linux `sound/hda/codecs/realtek/alc269.c`,
+    /// after the `alc*_restore_default_value` table). Runs after
+    /// enumeration — the HP pin is only known once the graph is
+    /// built — and again at reinit, because Linux re-runs the
+    /// init hook on resume. A chip with no tail is a no-op; the
+    /// caller skips the call entirely when the graph has no HP
+    /// pin, exactly as Linux returns early when `alc_get_hp_pin`
+    /// is 0.
+    fn apply_hp_tail(
+        &self,
+        cad: u8,
+        chip: super::quirks::RealtekChip,
+        hp_pin: u8,
+    ) -> Result<(), HdaError> {
+        match chip {
+            super::quirks::RealtekChip::Alc282 => self.apply_alc282_hp_tail(cad, hp_pin),
+            super::quirks::RealtekChip::Alc283 => self.apply_alc283_hp_tail(cad, hp_pin),
+            _ => Ok(()),
+        }
+    }
+
+    /// Linux `alc282_init` after `alc282_restore_default_value`:
+    /// sense the HP pin, read coef 0x78, drive the capless HP amp
+    /// to high-power mode (0x9004), mute the HP amp, set PIN_OUT,
+    /// then restore coef 0x78 — the sleeps only when a plug is
+    /// sensed. The 0x78 write itself is NOT sense-gated (only the
+    /// sleeps are); the restore is skipped when the read failed
+    /// (Linux: `if (coef78 != -1)`).
+    fn apply_alc282_hp_tail(&self, cad: u8, hp_pin: u8) -> Result<(), HdaError> {
+        let sense = self.jack_present(cad, hp_pin);
+        let coef78 = self.read_coef_idx(cad, super::quirks::COEF_NODE, 0x78).ok();
+        // Index 0x78 Direct Drive HP AMP LPM Control 1 —
+        // headphone capless set to high power mode.
+        self.write_coef_idx(cad, super::quirks::COEF_NODE, 0x78, 0x9004)?;
+        if sense {
+            delay_us(2_000);
+        }
+        self.verb(
+            cad,
+            hp_pin,
+            crate::hda_codec::verb::SET_AMP_GAIN_MUTE | AMP_OUT_MUTE,
+        )?;
+        if sense {
+            delay_us(85_000);
+        }
+        self.verb(
+            cad,
+            hp_pin,
+            crate::hda_codec::verb::SET_PIN_WIDGET_CONTROL
+                | u32::from(super::quirks::PIN_WIDGET_OUT),
+        )?;
+        if sense {
+            delay_us(100_000);
+        }
+        // Headphone capless set to normal mode — the value read
+        // before the high-power write.
+        if let Some(value) = coef78 {
+            self.write_coef_idx(cad, super::quirks::COEF_NODE, 0x78, (value & 0xFFFF) as u16)?;
+        }
+        Ok(())
+    }
+
+    /// Linux `alc283_init` after `alc283_restore_default_value`:
+    /// 30 ms settle, sense the HP pin, drive the capless HP amp
+    /// to high-power mode (0x43 = 0x9004), mute the HP amp, set
+    /// PIN_OUT, then the 0x46 3k pull-low update and back to
+    /// normal mode (0x43 = 0x9614). The 30 ms settle is
+    /// unconditional (Linux: the power pin needs time to wake
+    /// after resume); only the 85 ms sleeps are sense-gated.
+    fn apply_alc283_hp_tail(&self, cad: u8, hp_pin: u8) -> Result<(), HdaError> {
+        delay_us(30_000);
+        let sense = self.jack_present(cad, hp_pin);
+        // Index 0x43 Direct Drive HP AMP LPM Control 1 —
+        // headphone capless set to high power mode.
+        self.write_coef_idx(cad, super::quirks::COEF_NODE, 0x43, 0x9004)?;
+        self.verb(
+            cad,
+            hp_pin,
+            crate::hda_codec::verb::SET_AMP_GAIN_MUTE | AMP_OUT_MUTE,
+        )?;
+        if sense {
+            delay_us(85_000);
+        }
+        self.verb(
+            cad,
+            hp_pin,
+            crate::hda_codec::verb::SET_PIN_WIDGET_CONTROL
+                | u32::from(super::quirks::PIN_WIDGET_OUT),
+        )?;
+        if sense {
+            delay_us(85_000);
+        }
+        // Index 0x46 Combo jack auto switch control 2 — 3k pull
+        // low control for the headset jack. The same masked
+        // update ALC256's tail carries, gated on the HP pin
+        // existing.
+        self.update_coef_idx(cad, super::quirks::COEF_NODE, 0x46, 0x3000, 0x0000)?;
+        // Headphone capless set to normal mode.
+        self.write_coef_idx(cad, super::quirks::COEF_NODE, 0x43, 0x9614)?;
         Ok(())
     }
 
@@ -949,7 +1114,9 @@ impl IntelHda {
         // quirk's chained coef sequence is re-applied for the same
         // reason; its graph-side overrides (pins, connections,
         // preferred DACs) survive in the retained graph and need no
-        // re-application.
+        // re-application. The HP-pin tail is re-applied too (it is
+        // part of the init hook); the parse-time coef updates are
+        // NOT (Linux's patch dispatch runs once, at probe).
         for codec in &self.codecs {
             if let Some(chip) = super::quirks::RealtekChip::from_vendor_id(codec.vendor_id) {
                 if chip.has_verified_coef_init() {
@@ -961,6 +1128,11 @@ impl IntelHda {
                     .filter(|q| q.chip == chip)
                 {
                     self.apply_quirk_seq(codec.addr, quirk)?;
+                }
+                if let Some(graph) = self.graphs.iter().find(|g| g.addr == codec.addr) {
+                    if let Some(hp_pin) = graph.hp_pin() {
+                        self.apply_hp_tail(codec.addr, chip, hp_pin)?;
+                    }
                 }
             }
         }

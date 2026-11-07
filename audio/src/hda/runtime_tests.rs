@@ -55,6 +55,17 @@ struct Model {
     /// 0x10ec0282) so the #1496 full-table coef-init path has a
     /// chip to fix up.
     alc282: bool,
+    /// Analog variant: answer as the given codec vendor id
+    /// (0 = the default 0x10ec0287) — for the #776 remainder
+    /// fixtures (ALC274/ALC700 parse-time updates, same-arm
+    /// sibling IDs). The widget model stays the ALC287-shaped
+    /// one; the fixture proves verb traffic + CodecInfo, not
+    /// widget semantics.
+    codec_id: u32,
+    /// Analog variant: the default model's HP pin (nid 6) reports
+    /// a plug present on GET_PIN_SENSE — for the #776 HP-tail
+    /// tests' sense-plugged branch.
+    hp_plugged: bool,
     /// Analog variant: answer as a Lenovo Yoga 7 2-in-1 16AKP10
     /// (ALC287, codec subsystem id 0x17aa391d — the subsystem
     /// Linux itself matches on in
@@ -170,6 +181,23 @@ impl Model {
                         // the chip, not on a subsystem id.
                         (0, 0xf00, 0) => reply = 0x10ec0282,
                         _ => {}
+                    }
+                }
+                if self.codec_id != 0 && !self.ati && !self.navi22 {
+                    let nid = (command >> 20) as u8;
+                    let verb = (command >> 8) & 0xfff;
+                    let param = command as u8;
+                    if (nid, verb, param) == (0, 0xf00, 0) {
+                        reply = self.codec_id;
+                    }
+                }
+                // Default-model HP pin (nid 6, HP Out with
+                // presence capability) reports a plug present.
+                if self.hp_plugged && !self.ati && !self.navi22 {
+                    let nid = (command >> 20) as u8;
+                    let verb = (command >> 8) & 0xfff;
+                    if nid == 6 && verb == 0xf09 {
+                        reply = 0x8000_0000;
                     }
                 }
                 // Realtek coef registers (#1496): SET_COEF_INDEX
@@ -525,31 +553,70 @@ impl Fixture {
             false,
             false,
             false,
+            0,
+            false,
         )
     }
     /// The analog codec with a line-in pin beside the mic pin, for
     /// jack-driven capture-source switching tests.
     fn line_in() -> Result<Self, &'static str> {
-        Self::build_model(false, false, false, false, true, false, false, false, false)
+        Self::build_model(
+            false, false, false, false, true, false, false, false, false, 0, false,
+        )
     }
     /// The analog codec as an ALC256 (#776 coef-init fixture).
     fn alc256() -> Result<Self, &'static str> {
-        Self::build_model(false, false, false, false, false, true, false, false, false)
+        Self::build_model(
+            false, false, false, false, false, true, false, false, false, 0, false,
+        )
     }
     /// The analog codec as an ALC256 with coef 0x46 pre-seeded to
     /// 0xF5A5 (#1496 RMW fixture): the masked update must preserve
     /// the bits outside its mask.
     fn alc256_seeded() -> Result<Self, &'static str> {
-        Self::build_model(false, false, false, false, false, true, false, false, true)
+        Self::build_model(
+            false, false, false, false, false, true, false, false, true, 0, false,
+        )
     }
     /// The analog codec as an ALC282 (#1496 full-table coef-init fixture).
     fn alc282() -> Result<Self, &'static str> {
-        Self::build_model(false, false, false, false, false, false, true, false, false)
+        Self::build_model(
+            false, false, false, false, false, false, true, false, false, 0, false,
+        )
+    }
+    /// The analog codec as an ALC282 with a headphone plugged
+    /// (#776 HP-tail sense-plugged branch).
+    fn alc282_plugged() -> Result<Self, &'static str> {
+        Self::build_model(
+            false, false, false, false, false, false, true, false, false, 0, true,
+        )
+    }
+    /// The analog codec as an ALC283 (#776 HP-tail fixture).
+    fn alc283() -> Result<Self, &'static str> {
+        Self::build_model(
+            false, false, false, false, false, false, false, false, false, 0x10ec0283, false,
+        )
+    }
+    /// The analog codec as an ALC283 with a headphone plugged
+    /// (#776 HP-tail sense-plugged branch).
+    fn alc283_plugged() -> Result<Self, &'static str> {
+        Self::build_model(
+            false, false, false, false, false, false, false, false, false, 0x10ec0283, true,
+        )
+    }
+    /// The analog codec as the given Realtek codec vendor id
+    /// (#776 remainder fixtures: parse-time updates, sibling IDs).
+    fn with_codec(codec_id: u32) -> Result<Self, &'static str> {
+        Self::build_model(
+            false, false, false, false, false, false, false, false, false, codec_id, false,
+        )
     }
     /// The analog codec as a Lenovo Yoga 7 2-in-1 16AKP10 (ALC287,
     /// subsystem 0x17aa391d; #1496 verified-quirk fixture).
     fn yoga9() -> Result<Self, &'static str> {
-        Self::build_model(false, false, false, false, false, false, false, true, false)
+        Self::build_model(
+            false, false, false, false, false, false, false, true, false, 0, false,
+        )
     }
     /// The RX 6750 XT's HD-Audio function: 1002:ab28 runs without snoop.
     fn navi22() -> Result<Self, &'static str> {
@@ -563,6 +630,8 @@ impl Fixture {
             false,
             false,
             false,
+            0,
+            false,
         )
     }
     fn build_model(
@@ -575,6 +644,8 @@ impl Fixture {
         alc282: bool,
         yoga9: bool,
         seed_alc256_coef: bool,
+        codec_id: u32,
+        hp_plugged: bool,
     ) -> Result<Self, &'static str> {
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
@@ -618,6 +689,8 @@ impl Fixture {
                 alc256,
                 alc282,
                 yoga9,
+                codec_id,
+                hp_plugged,
                 coef_index: [(0x20, 0), (0x53, 0)],
                 coef: if seed_alc256_coef {
                     alloc::vec![(crate::hda::quirks::COEF_NODE, 0x46, 0xF5A5)]
@@ -2373,8 +2446,13 @@ fn native_hda_alc282_coef_table_applied() -> TestResult {
     }
     let verbs = &fixture.model.verbs;
     let coef_node = u32::from(crate::hda::quirks::COEF_NODE);
+    // The HP tail (#776 remainders) issues its own coef verbs on
+    // the same node after enumeration — count only the
+    // pre-enumeration traffic for the table.
+    let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
     let coef_verbs: Vec<u32> = verbs
         .iter()
+        .take(first_pincfg.unwrap_or(verbs.len()))
         .copied()
         .filter(|v| (*v >> 20) & 0xff == coef_node)
         .collect();
@@ -2412,8 +2490,10 @@ fn native_hda_alc282_coef_table_applied() -> TestResult {
         return TestResult::Fail("ALC282 init must end with the 0x6c write");
     }
     // The table runs before enumeration.
-    let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
-    let last_coef = verbs.iter().rposition(|v| (*v >> 20) & 0xff == coef_node);
+    let last_coef = verbs
+        .iter()
+        .take(first_pincfg.unwrap_or(verbs.len()))
+        .rposition(|v| (*v >> 20) & 0xff == coef_node);
     match (first_pincfg, last_coef) {
         (Some(at), Some(last)) if last < at => {}
         _ => return TestResult::Fail("ALC282 init must precede enumeration"),
@@ -2530,3 +2610,557 @@ fn native_hda_yoga9_bass_speaker_quirk_applied() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/hda", native_hda_yoga9_bass_speaker_quirk_applied);
+
+// ── #776 remainders: ALC282/283 HP-pin tails + parse-time coef ──
+// The expected verbs come from Linux `alc282_init` /
+// `alc283_init` and `patch_alc269` (`alc269.c`), not from the
+// implementation.
+
+/// #776 remainders: the verbs a probe issues after the last
+/// GET_CONFIG_DEFAULT on the coef node / the default model's HP
+/// pin (nid 6) — exactly the HP tail's traffic, since the
+/// post-enumeration probe path (`discover_paths`, `hdmi_ports`,
+/// `initial_hdmi_playback`) issues no verbs on those nids and
+/// `query_supported_formats` only reads the AFG.
+fn post_enumeration_tail_verbs(verbs: &[u32]) -> Vec<u32> {
+    let last_pincfg = verbs
+        .iter()
+        .rposition(|v| (*v >> 8) & 0xfff == 0xf1c)
+        .unwrap_or(0);
+    verbs
+        .iter()
+        .skip(last_pincfg + 1)
+        .copied()
+        .filter(|v| matches!((*v >> 20) & 0xff, 0x20 | 6))
+        .collect()
+}
+
+/// #776 remainders: an ALC282 codec gets the `alc282_init`
+/// HP-pin tail after enumeration — sense the HP pin (nid 6 in
+/// the default model), read coef 0x78, drive it to high-power
+/// mode (0x9004), mute the HP amp, set PIN_OUT, restore 0x78.
+/// Unplugged, so the sleeps are skipped but every verb is still
+/// issued, in Linux's order.
+fn native_hda_alc282_hp_tail_applied() -> TestResult {
+    let fixture = match Fixture::alc282() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x10ec0282 {
+        return TestResult::Fail("fixture codec must be ALC282");
+    }
+    let Some(graph) = dev.graphs.first() else {
+        return TestResult::Fail("fixture has no graph");
+    };
+    if graph.hp_pin() != Some(6) {
+        return TestResult::Fail("default model HP pin must be nid 6");
+    }
+    let verbs = &fixture.model.verbs;
+    let idx = |index: u32| make_verb(0, 0x20, crate::hda_codec::verb::SET_COEF_INDEX | index);
+    let get = make_verb(0, 0x20, crate::hda_codec::verb::GET_PROC_COEF);
+    let set = |value: u32| make_verb(0, 0x20, crate::hda_codec::verb::SET_PROC_COEF | value);
+    let sense = make_verb(0, 6, crate::hda_codec::verb::GET_PIN_SENSE);
+    let mute = make_verb(0, 6, crate::hda_codec::verb::SET_AMP_GAIN_MUTE | 0xB080);
+    let pin_out = make_verb(0, 6, crate::hda_codec::verb::SET_PIN_WIDGET_CONTROL | 0x40);
+    let expected: [u32; 9] = [
+        sense,
+        idx(0x78),
+        get,
+        idx(0x78),
+        set(0x9004),
+        mute,
+        pin_out,
+        idx(0x78),
+        set(0x0000),
+    ];
+    if post_enumeration_tail_verbs(verbs)[..] != expected[..] {
+        return TestResult::Fail("ALC282 HP tail must run in Linux order after enumeration");
+    }
+    let coef78 = fixture
+        .model
+        .coef
+        .iter()
+        .find(|(n, i, _)| *n == crate::hda::quirks::COEF_NODE && *i == 0x78)
+        .map(|(_, _, v)| *v);
+    if coef78 != Some(0x0000) {
+        return TestResult::Fail("ALC282 coef 0x78 must be restored after the tail");
+    }
+    if dev.outputs.is_empty() {
+        return TestResult::Fail("fixed-up codec must still route outputs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_alc282_hp_tail_applied);
+
+/// #776 remainders: an ALC283 codec gets the `alc283_init`
+/// HP-pin tail after enumeration — 30 ms settle, sense the HP
+/// pin, drive coef 0x43 to high-power mode (0x9004), mute the HP
+/// amp, set PIN_OUT, the 0x46 3k pull-low update, back to normal
+/// mode (0x43 = 0x9614). The full 33-op table still runs before
+/// enumeration (96 verbs, 15 GET_PROC_COEF reads).
+fn native_hda_alc283_hp_tail_applied() -> TestResult {
+    let fixture = match Fixture::alc283() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x10ec0283 {
+        return TestResult::Fail("fixture codec must be ALC283");
+    }
+    if codec.subsystem_id.is_some() {
+        return TestResult::Fail("ALC283 fixture must report no subsystem id");
+    }
+    let verbs = &fixture.model.verbs;
+    let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
+    let table_verbs: Vec<u32> = verbs
+        .iter()
+        .take(first_pincfg.unwrap_or(verbs.len()))
+        .copied()
+        .filter(|v| matches!((*v >> 20) & 0xff, 0x20 | 0x53))
+        .collect();
+    // 18 plain writes (2 verbs each) + 15 masked updates
+    // (4 verbs each) = 96 verbs.
+    if table_verbs.len() != 96 {
+        return TestResult::Fail("ALC283 init must issue 96 coef verbs");
+    }
+    let gets = table_verbs
+        .iter()
+        .filter(|v| (**v >> 8) & 0xfff == 0xc00)
+        .count();
+    if gets != 15 {
+        return TestResult::Fail("ALC283 init must read before each masked update");
+    }
+    let idx = |index: u32| make_verb(0, 0x20, crate::hda_codec::verb::SET_COEF_INDEX | index);
+    let get = make_verb(0, 0x20, crate::hda_codec::verb::GET_PROC_COEF);
+    let set = |value: u32| make_verb(0, 0x20, crate::hda_codec::verb::SET_PROC_COEF | value);
+    if table_verbs[0] != idx(0x03) || table_verbs[1] != set(0x0002) {
+        return TestResult::Fail("ALC283 init must start with the 0x03 write");
+    }
+    if table_verbs[92] != idx(0x1b)
+        || table_verbs[93] != get
+        || table_verbs[94] != idx(0x1b)
+        || table_verbs[95] != set(0x0000)
+    {
+        return TestResult::Fail("ALC283 init must end with the 0x1b update");
+    }
+    let sense = make_verb(0, 6, crate::hda_codec::verb::GET_PIN_SENSE);
+    let mute = make_verb(0, 6, crate::hda_codec::verb::SET_AMP_GAIN_MUTE | 0xB080);
+    let pin_out = make_verb(0, 6, crate::hda_codec::verb::SET_PIN_WIDGET_CONTROL | 0x40);
+    let expected: [u32; 11] = [
+        sense,
+        idx(0x43),
+        set(0x9004),
+        mute,
+        pin_out,
+        idx(0x46),
+        get,
+        idx(0x46),
+        set(0x0000),
+        idx(0x43),
+        set(0x9614),
+    ];
+    if post_enumeration_tail_verbs(verbs)[..] != expected[..] {
+        return TestResult::Fail("ALC283 HP tail must run in Linux order after enumeration");
+    }
+    let coef = |index: u16| {
+        fixture
+            .model
+            .coef
+            .iter()
+            .find(|(n, i, _)| *n == crate::hda::quirks::COEF_NODE && *i == index)
+            .map(|(_, _, v)| *v)
+    };
+    if coef(0x43) != Some(0x9614) || coef(0x46) != Some(0x0000) {
+        return TestResult::Fail("ALC283 coef state must hold the tail's final values");
+    }
+    if dev.outputs.is_empty() {
+        return TestResult::Fail("fixed-up codec must still route outputs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_alc283_hp_tail_applied);
+
+/// #776 remainders: the HP tail's sense-plugged branch issues
+/// the same verbs as the unplugged branch — Linux only gates the
+/// sleeps on sense, never the verbs — so a plugged ALC282 runs
+/// the identical 9-verb tail.
+fn native_hda_alc282_hp_tail_plugged() -> TestResult {
+    let fixture = match Fixture::alc282_plugged() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x10ec0282 {
+        return TestResult::Fail("fixture codec must be ALC282");
+    }
+    let verbs = &fixture.model.verbs;
+    let idx = |index: u32| make_verb(0, 0x20, crate::hda_codec::verb::SET_COEF_INDEX | index);
+    let get = make_verb(0, 0x20, crate::hda_codec::verb::GET_PROC_COEF);
+    let set = |value: u32| make_verb(0, 0x20, crate::hda_codec::verb::SET_PROC_COEF | value);
+    let sense = make_verb(0, 6, crate::hda_codec::verb::GET_PIN_SENSE);
+    let mute = make_verb(0, 6, crate::hda_codec::verb::SET_AMP_GAIN_MUTE | 0xB080);
+    let pin_out = make_verb(0, 6, crate::hda_codec::verb::SET_PIN_WIDGET_CONTROL | 0x40);
+    let expected: [u32; 9] = [
+        sense,
+        idx(0x78),
+        get,
+        idx(0x78),
+        set(0x9004),
+        mute,
+        pin_out,
+        idx(0x78),
+        set(0x0000),
+    ];
+    if post_enumeration_tail_verbs(verbs)[..] != expected[..] {
+        return TestResult::Fail("plugged ALC282 HP tail must issue the same verbs");
+    }
+    if dev.outputs.is_empty() {
+        return TestResult::Fail("fixed-up codec must still route outputs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_alc282_hp_tail_plugged);
+
+/// #776 remainders: the ALC283 tail's sense-plugged branch
+/// issues the same 11 verbs as the unplugged branch — Linux
+/// only gates the 85 ms sleeps on sense, never the verbs.
+fn native_hda_alc283_hp_tail_plugged() -> TestResult {
+    let fixture = match Fixture::alc283_plugged() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture codec must be ALC283");
+    };
+    if codec.vendor_id != 0x10ec0283 {
+        return TestResult::Fail("fixture codec must be ALC283");
+    }
+    let verbs = &fixture.model.verbs;
+    let idx = |index: u32| make_verb(0, 0x20, crate::hda_codec::verb::SET_COEF_INDEX | index);
+    let get = make_verb(0, 0x20, crate::hda_codec::verb::GET_PROC_COEF);
+    let set = |value: u32| make_verb(0, 0x20, crate::hda_codec::verb::SET_PROC_COEF | value);
+    let sense = make_verb(0, 6, crate::hda_codec::verb::GET_PIN_SENSE);
+    let mute = make_verb(0, 6, crate::hda_codec::verb::SET_AMP_GAIN_MUTE | 0xB080);
+    let pin_out = make_verb(0, 6, crate::hda_codec::verb::SET_PIN_WIDGET_CONTROL | 0x40);
+    let expected: [u32; 11] = [
+        sense,
+        idx(0x43),
+        set(0x9004),
+        mute,
+        pin_out,
+        idx(0x46),
+        get,
+        idx(0x46),
+        set(0x0000),
+        idx(0x43),
+        set(0x9614),
+    ];
+    if post_enumeration_tail_verbs(verbs)[..] != expected[..] {
+        return TestResult::Fail("plugged ALC283 HP tail must issue the same verbs");
+    }
+    if dev.outputs.is_empty() {
+        return TestResult::Fail("fixed-up codec must still route outputs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_alc283_hp_tail_plugged);
+
+/// #776 remainders: an ALC274 codec gets the ALC294-arm
+/// parse-time coef update at probe — `alc_update_coef_idx(codec,
+/// 0x6b, 0x0018, 0x0018)` (Linux `patch_alc269`, "UAJ MIC Vref
+/// control by verb") — a masked RMW update before enumeration.
+/// ALC274 has no init table, so this is the only coef traffic.
+fn native_hda_alc274_parse_coef_applied() -> TestResult {
+    let fixture = match Fixture::with_codec(0x10ec0274) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x10ec0274 {
+        return TestResult::Fail("fixture codec must be ALC274");
+    }
+    let verbs = &fixture.model.verbs;
+    let coef_node = u32::from(crate::hda::quirks::COEF_NODE);
+    let coef_verbs: Vec<u32> = verbs
+        .iter()
+        .copied()
+        .filter(|v| (*v >> 20) & 0xff == coef_node)
+        .collect();
+    let idx = |index: u32| {
+        make_verb(
+            0,
+            crate::hda::quirks::COEF_NODE,
+            crate::hda_codec::verb::SET_COEF_INDEX | index,
+        )
+    };
+    let get = make_verb(
+        0,
+        crate::hda::quirks::COEF_NODE,
+        crate::hda_codec::verb::GET_PROC_COEF,
+    );
+    let set = |value: u32| {
+        make_verb(
+            0,
+            crate::hda::quirks::COEF_NODE,
+            crate::hda_codec::verb::SET_PROC_COEF | value,
+        )
+    };
+    let expected: [u32; 4] = [idx(0x6b), get, idx(0x6b), set(0x0018)];
+    if coef_verbs[..] != expected[..] {
+        return TestResult::Fail("ALC274 parse update must be the 0x6b masked update");
+    }
+    let coef6b = fixture
+        .model
+        .coef
+        .iter()
+        .find(|(n, i, _)| *n == crate::hda::quirks::COEF_NODE && *i == 0x6b)
+        .map(|(_, _, v)| *v);
+    if coef6b != Some(0x0018) {
+        return TestResult::Fail("ALC274 coef 0x6b must hold the parsed update");
+    }
+    let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
+    let last_coef = verbs.iter().rposition(|v| (*v >> 20) & 0xff == coef_node);
+    match (first_pincfg, last_coef) {
+        (Some(at), Some(last)) if last < at => {}
+        _ => return TestResult::Fail("ALC274 parse update must precede enumeration"),
+    }
+    if dev.outputs.is_empty() {
+        return TestResult::Fail("fixed-up codec must still route outputs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_alc274_parse_coef_applied);
+
+/// #776 remainders: an ALC700 codec gets the ALC700-arm
+/// parse-time coef update at probe — `alc_update_coef_idx(codec,
+/// 0x4a, 1 << 15, 0)` (Linux `patch_alc269`, "Combo jack auto
+/// trigger control") — a masked RMW update before enumeration.
+/// ALC700 has no init table, so this is the only coef traffic.
+fn native_hda_alc700_parse_coef_applied() -> TestResult {
+    let fixture = match Fixture::with_codec(0x10ec0700) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let Some(codec) = dev.codecs().first() else {
+        return TestResult::Fail("fixture has no codec");
+    };
+    if codec.vendor_id != 0x10ec0700 {
+        return TestResult::Fail("fixture codec must be ALC700");
+    }
+    let verbs = &fixture.model.verbs;
+    let coef_node = u32::from(crate::hda::quirks::COEF_NODE);
+    let coef_verbs: Vec<u32> = verbs
+        .iter()
+        .copied()
+        .filter(|v| (*v >> 20) & 0xff == coef_node)
+        .collect();
+    let idx = |index: u32| {
+        make_verb(
+            0,
+            crate::hda::quirks::COEF_NODE,
+            crate::hda_codec::verb::SET_COEF_INDEX | index,
+        )
+    };
+    let get = make_verb(
+        0,
+        crate::hda::quirks::COEF_NODE,
+        crate::hda_codec::verb::GET_PROC_COEF,
+    );
+    let set = |value: u32| {
+        make_verb(
+            0,
+            crate::hda::quirks::COEF_NODE,
+            crate::hda_codec::verb::SET_PROC_COEF | value,
+        )
+    };
+    let expected: [u32; 4] = [idx(0x4a), get, idx(0x4a), set(0x0000)];
+    if coef_verbs[..] != expected[..] {
+        return TestResult::Fail("ALC700 parse update must be the 0x4a masked update");
+    }
+    let coef4a = fixture
+        .model
+        .coef
+        .iter()
+        .find(|(n, i, _)| *n == crate::hda::quirks::COEF_NODE && *i == 0x4a)
+        .map(|(_, _, v)| *v);
+    if coef4a != Some(0x0000) {
+        return TestResult::Fail("ALC700 coef 0x4a must hold the parsed update");
+    }
+    let first_pincfg = verbs.iter().position(|v| (*v >> 8) & 0xfff == 0xf1c);
+    let last_coef = verbs.iter().rposition(|v| (*v >> 20) & 0xff == coef_node);
+    match (first_pincfg, last_coef) {
+        (Some(at), Some(last)) if last < at => {}
+        _ => return TestResult::Fail("ALC700 parse update must precede enumeration"),
+    }
+    if dev.outputs.is_empty() {
+        return TestResult::Fail("fixed-up codec must still route outputs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_alc700_parse_coef_applied);
+
+/// #776 remainders: the same-arm sibling IDs dispatch to the same
+/// parse tables — ALC234 to the ALC294 arm (0x6b), ALC701/703/711
+/// to the ALC700 arm (0x4a) — and ALC222 identifies with no coef
+/// traffic at all (its `alc222_init` has no coef writes).
+fn native_hda_alc_sibling_ids_parse_and_identify() -> TestResult {
+    let idx = |index: u32| {
+        make_verb(
+            0,
+            crate::hda::quirks::COEF_NODE,
+            crate::hda_codec::verb::SET_COEF_INDEX | index,
+        )
+    };
+    let get = make_verb(
+        0,
+        crate::hda::quirks::COEF_NODE,
+        crate::hda_codec::verb::GET_PROC_COEF,
+    );
+    let set = |value: u32| {
+        make_verb(
+            0,
+            crate::hda::quirks::COEF_NODE,
+            crate::hda_codec::verb::SET_PROC_COEF | value,
+        )
+    };
+    let coef_verbs = |fixture: &Fixture| {
+        fixture
+            .model
+            .verbs
+            .iter()
+            .copied()
+            .filter(|v| (*v >> 20) & 0xff == u32::from(crate::hda::quirks::COEF_NODE))
+            .collect::<Vec<u32>>()
+    };
+    {
+        let fixture = match Fixture::with_codec(0x10ec0234) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let dev = fixture.controller.as_ref().unwrap().clone();
+        if dev.codecs().first().map_or(0, |c| c.vendor_id) != 0x10ec0234 {
+            return TestResult::Fail("fixture codec must be ALC234");
+        }
+        let expected: [u32; 4] = [idx(0x6b), get, idx(0x6b), set(0x0018)];
+        if coef_verbs(&fixture)[..] != expected[..] {
+            return TestResult::Fail("ALC234 must run the ALC294-arm parse update");
+        }
+        if dev.outputs.is_empty() {
+            return TestResult::Fail("ALC234 codec must still route outputs");
+        }
+    }
+    for vendor in [0x10ec0701u32, 0x10ec0703, 0x10ec0711] {
+        let fixture = match Fixture::with_codec(vendor) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let dev = fixture.controller.as_ref().unwrap().clone();
+        if dev.codecs().first().map_or(0, |c| c.vendor_id) != vendor {
+            return TestResult::Fail("fixture codec must be the ALC700-arm sibling");
+        }
+        let expected: [u32; 4] = [idx(0x4a), get, idx(0x4a), set(0x0000)];
+        if coef_verbs(&fixture)[..] != expected[..] {
+            return TestResult::Fail("ALC701/703/711 must run the ALC700-arm parse update");
+        }
+        if dev.outputs.is_empty() {
+            return TestResult::Fail("ALC700-arm sibling must still route outputs");
+        }
+    }
+    {
+        let fixture = match Fixture::with_codec(0x10ec0222) {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let dev = fixture.controller.as_ref().unwrap().clone();
+        if dev.codecs().first().map_or(0, |c| c.vendor_id) != 0x10ec0222 {
+            return TestResult::Fail("fixture codec must be ALC222");
+        }
+        if !coef_verbs(&fixture).is_empty() {
+            return TestResult::Fail("ALC222 must issue no coef verbs");
+        }
+        if dev.outputs.is_empty() {
+            return TestResult::Fail("ALC222 codec must still route outputs");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_alc_sibling_ids_parse_and_identify);
+
+/// #776 remainders: reinit re-applies the HP-pin tail (it is part
+/// of the init hook, which Linux re-runs on resume) — the HP amp
+/// mute verb on pin 6 goes from one occurrence at probe to two
+/// after a quiesce/reinit cycle.
+fn native_hda_pm_reinit_reapplies_hp_tail() -> TestResult {
+    let fixture = match Fixture::alc282() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let mute = make_verb(0, 6, crate::hda_codec::verb::SET_AMP_GAIN_MUTE | 0xB080);
+    let count = || fixture.model.verbs.iter().filter(|v| **v == mute).count();
+    if count() != 1 {
+        return TestResult::Fail("probe must run the HP tail once");
+    }
+    if dev.quiesce().is_err() {
+        return TestResult::Fail("quiesce idle controller");
+    }
+    if dev.reinit().is_err() {
+        return TestResult::Fail("reinit parked controller");
+    }
+    if count() != 2 {
+        return TestResult::Fail("reinit must re-apply the HP tail");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_pm_reinit_reapplies_hp_tail);
+
+/// #776 remainders: reinit does NOT re-apply the parse-time coef
+/// update — Linux's patch dispatch runs once, at probe, and the
+/// init hook (what re-runs on resume) never contained it. The
+/// SET_COEF_INDEX|0x6b verb occurs twice at probe (read + write)
+/// and stays at two after a quiesce/reinit cycle.
+fn native_hda_pm_reinit_does_not_reapply_parse_coef() -> TestResult {
+    let fixture = match Fixture::with_codec(0x10ec0274) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let idx6b = make_verb(
+        0,
+        crate::hda::quirks::COEF_NODE,
+        crate::hda_codec::verb::SET_COEF_INDEX | 0x6b,
+    );
+    let count = || fixture.model.verbs.iter().filter(|v| **v == idx6b).count();
+    if count() != 2 {
+        return TestResult::Fail("probe must apply the parse update once (read + write)");
+    }
+    if dev.quiesce().is_err() {
+        return TestResult::Fail("quiesce idle controller");
+    }
+    if dev.reinit().is_err() {
+        return TestResult::Fail("reinit parked controller");
+    }
+    if count() != 2 {
+        return TestResult::Fail("reinit must not re-apply the parse-time update");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda",
+    native_hda_pm_reinit_does_not_reapply_parse_coef
+);
