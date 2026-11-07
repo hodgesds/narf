@@ -1942,3 +1942,630 @@ kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_drm_registry_append_preserves_lost_identity_and_existing_cards
 );
+
+// ── Smoke 11: laptop DCN display audio — production apply path ──
+//
+// #778: the plan layer (#875/#1333) built the DTO/AFMT/ACR +
+// Azalia enable sequences but no production caller executed
+// them. These fixtures drive `AmdGpu::apply_modeset_plan` and
+// the teardown / HPD / resume methods against a RAM-backed
+// register window and assert, through the real chained
+// executor, that audio writes execute after video writes and
+// disable writes execute before the OTG master-enable clear.
+// `regs[0]` / `regs[1]` are the last MM_INDEX / MM_DATA pair
+// written — the final (addr, value) of the last executed
+// sequence — which is what discriminates the ordering.
+
+/// RAM-backed Renoir `AmdGpu` for display-audio apply fixtures.
+/// DCN bases: window 0 = 0x5000, window 2 = 0x9000 (the BASE_IDX
+/// 2 segment the audio blocks live in).
+#[cfg(feature = "amdgpu")]
+fn renoir_gpu_for_display_audio(regs: &mut [u32]) -> crate::amdgpu::AmdGpu {
+    use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, MAX_BASE_ADDRS};
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: regs.as_mut_ptr() as u64,
+        len: (regs.len() * 4) as u64,
+        kind: narf_bus::BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    let mut bases = [0u32; MAX_BASE_ADDRS];
+    bases[0] = 0x0000_5000;
+    bases[2] = 0x0000_9000;
+    crate::amdgpu::AmdGpu {
+        regs: map,
+        fb_bar: map,
+        chip: crate::amdgpu::__test_chip_info_for_pci_id(
+            crate::amdgpu::AMD_VENDOR,
+            crate::amdgpu::RENOIR,
+        )
+        .unwrap(),
+        vram: crate::amdgpu::VramInfo {
+            base: 0x8000_0000,
+            size: 2 << 30,
+            visible_size: 256 << 20,
+        },
+        mode: None,
+        fw_loaded: true,
+        gc_info: None,
+        vbios: None,
+        ip_blocks: alloc::vec![IpBlock {
+            hw_id: HW_ID_DCN,
+            instance: 0,
+            major: 2,
+            minor: 0,
+            revision: 1,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: bases,
+            num_bases: 3,
+        }],
+    }
+}
+
+/// One CEA-861 extension block for a stereo LPCM 48 kHz sink,
+/// built from the layout `parse_cea_audio_blocks` documents:
+/// tag 0x02, DTD offset, a tag-1 audio block carrying one SAD
+/// (`ShortAudioDescriptor::encode`), a tag-4 speaker block
+/// (FL/FR). The SAD bytes come from the in-tree encoder, never
+/// from hand-computed constants.
+#[cfg(feature = "amdgpu")]
+fn cea_stereo_lpcm48() -> [u8; 128] {
+    use crate::amdgpu_hdmi_audio::{AudioFormat, SampleRates, ShortAudioDescriptor};
+    let sad = ShortAudioDescriptor {
+        format: AudioFormat::LinearPcm,
+        channel_count: 2,
+        sample_rates: SampleRates {
+            r48k: true,
+            ..Default::default()
+        },
+        size_or_bitrate: 0x01,
+    };
+    let bytes = sad.encode();
+    let mut cea = [0u8; 128];
+    cea[0] = 0x02;
+    cea[1] = 0x03;
+    cea[2] = 12; // DTD offset: collection ends after both blocks
+    cea[4] = (1 << 5) | 3; // tag 1, len 3
+    cea[5..8].copy_from_slice(&bytes);
+    cea[8] = (4 << 5) | 3; // tag 4, len 3
+    cea[9] = 0x01; // speakers FL/FR
+    cea
+}
+
+/// KMS state for the laptop audio fixtures: eDP panel (connector
+/// 0, pipe 0) + external DP (connector 1, pipe 1). The DP
+/// connector's caps come from the synthetic CEA block above, so
+/// the plan negotiates from parsed EDID bytes, not hand-built
+/// structs.
+#[cfg(feature = "amdgpu")]
+fn laptop_audio_kms() -> crate::amdgpu_modeset::KmsState {
+    use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayPath};
+    use crate::amdgpu_hdmi_audio::parse_cea_audio_blocks;
+    use crate::amdgpu_modeset::{
+        feed_connector_audio_caps, ConnectorStatus, EncoderKind, KmsState,
+    };
+    let mut kms = KmsState::new(4);
+    kms.ingest_atom_paths([
+        DisplayPath {
+            connector_kind: ConnectorKind::Edp,
+            connector_index: 0,
+            device_tag: 0x0010,
+            gpu_object_id: 0x1100,
+        },
+        DisplayPath {
+            connector_kind: ConnectorKind::Dp,
+            connector_index: 0,
+            device_tag: 0x0001,
+            gpu_object_id: 0x1101,
+        },
+    ]);
+    // DP is external: flip Connected, bind its encoder, claim CRTCs.
+    kms.set_status(1, ConnectorStatus::Connected);
+    kms.push_encoder(EncoderKind::DigitalPort, 0, 0b0010);
+    kms.bind_encoder(1, 0).expect("bind DP encoder");
+    kms.pick_crtc(0).expect("pick eDP crtc");
+    kms.pick_crtc(1).expect("pick DP crtc");
+    // Feed the DP sink's caps from the synthetic CEA block.
+    let caps = parse_cea_audio_blocks(&cea_stereo_lpcm48());
+    let speakers = caps.speakers.unwrap_or(0x01);
+    if !feed_connector_audio_caps(&mut kms, 1, caps.sads, speakers) {
+        panic!("feed DP caps");
+    }
+    kms
+}
+
+#[cfg(feature = "amdgpu")]
+fn smoke_drm_laptop_display_audio_cea_feed() -> TestResult {
+    use crate::amdgpu_hdmi_audio::{parse_cea_audio_blocks, AudioFormat};
+    let caps = parse_cea_audio_blocks(&cea_stereo_lpcm48());
+    if caps.sads.len() != 1 {
+        return TestResult::Fail("CEA fixture must parse one SAD");
+    }
+    let sad = caps.sads[0];
+    if sad.format != AudioFormat::LinearPcm || sad.channel_count != 2 || !sad.sample_rates.r48k {
+        return TestResult::Fail("parsed SAD must be LPCM stereo 48 kHz");
+    }
+    if caps.speakers != Some(0x01) {
+        return TestResult::Fail("speaker block must yield 0x01");
+    }
+    // Malformed input degrades, never fails.
+    if !parse_cea_audio_blocks(&[0x00, 0x03, 0, 0]).sads.is_empty() {
+        return TestResult::Fail("non-CEA slice must yield empty caps");
+    }
+    let mut truncated = cea_stereo_lpcm48();
+    truncated[2] = 8; // collection ends at byte 8
+    truncated[4] = (1 << 5) | 6; // audio block claims 6 bytes, 3 remain
+    if !parse_cea_audio_blocks(&truncated).sads.is_empty() {
+        return TestResult::Fail("overrunning audio block must end the walk");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu/e2e", smoke_drm_laptop_display_audio_cea_feed);
+
+#[cfg(feature = "amdgpu")]
+fn smoke_drm_laptop_display_audio_apply_executes_audio_after_video() -> TestResult {
+    use crate::amdgpu::Family;
+    use crate::amdgpu_dcn::{OTG0_OTG_CONTROL, OTG_MASTER_EN};
+    use crate::amdgpu_modeset::{plan_modeset, CrtcState};
+    crate::amdgpu::reset_saved_display_audio_for_test();
+    let mut kms = laptop_audio_kms();
+    // eDP control: no audio endpoint on the internal panel.
+    let edp_plan = match plan_modeset(
+        &kms,
+        Family::Renoir,
+        0,
+        1920,
+        1080,
+        60,
+        1920,
+        0x8000_0000,
+        0x5000,
+        0x9000,
+    ) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("eDP plan failed"),
+    };
+    if !edp_plan.audio_writes.is_empty() {
+        return TestResult::Fail("internal panel plan must carry no audio writes");
+    }
+    let mut regs = alloc::vec![0u32; 8];
+    let mut gpu = renoir_gpu_for_display_audio(&mut regs);
+    // SAFETY: RAM-backed register window; the test owns it.
+    if unsafe { gpu.apply_modeset_plan(&mut kms, &edp_plan, 1920, 0x8000_0000) }.is_err() {
+        return TestResult::Fail("eDP apply failed");
+    }
+    // Video-only: the last executed write is the OTG master enable.
+    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
+        return TestResult::Fail("video-only apply must end with OTG_MASTER_EN");
+    }
+    if kms.crtcs[edp_plan.crtc_idx as usize].state != CrtcState::Active {
+        return TestResult::Fail("eDP CRTC must be Active after apply");
+    }
+    // DP: the plan carries audio, and the apply executes it after video.
+    let dp_plan = match plan_modeset(
+        &kms,
+        Family::Renoir,
+        1,
+        1920,
+        1080,
+        60,
+        1920,
+        0x8000_0000,
+        0x5000,
+        0x9000,
+    ) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("DP plan failed"),
+    };
+    if dp_plan.audio_writes.is_empty() {
+        return TestResult::Fail("DP plan must carry audio writes");
+    }
+    let last_video = match dp_plan.writes.last() {
+        Some(w) => *w,
+        None => return TestResult::Fail("DP plan has no video writes"),
+    };
+    if last_video.addr != 0x5000 + OTG0_OTG_CONTROL || last_video.value != OTG_MASTER_EN {
+        return TestResult::Fail("DP video writes must end with OTG_MASTER_EN");
+    }
+    let mut regs = alloc::vec![0u32; 8];
+    let mut gpu = renoir_gpu_for_display_audio(&mut regs);
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // `dp_plan` was built by `plan_modeset` against this `kms` for Renoir connector 1.
+    if unsafe { gpu.apply_modeset_plan(&mut kms, &dp_plan, 1920, 0x8000_0000) }.is_err() {
+        return TestResult::Fail("DP apply failed");
+    }
+    let last_audio = match dp_plan.audio_writes.last() {
+        Some(w) => *w,
+        None => return TestResult::Fail("DP plan lost its audio writes"),
+    };
+    if regs[0] != last_audio.addr || regs[1] != last_audio.value {
+        return TestResult::Fail("audio writes must execute after video writes");
+    }
+    if kms.crtcs[dp_plan.crtc_idx as usize].state != CrtcState::Active {
+        return TestResult::Fail("DP CRTC must be Active after apply");
+    }
+    // Bookkeeping recorded the mode.
+    match kms.crtcs[dp_plan.crtc_idx as usize].mode {
+        Some(m) if m.width == 1920 && m.height == 1080 && m.surface_phys == 0x8000_0000 => {}
+        _ => return TestResult::Fail("DP CRTC mode not recorded"),
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_drm_laptop_display_audio_apply_executes_audio_after_video
+);
+
+#[cfg(feature = "amdgpu")]
+fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
+    use crate::amdgpu::{Family, Mode};
+    use crate::amdgpu_dcn::{OTG0_OTG_CONTROL, OTG_MASTER_EN};
+    use crate::amdgpu_modeset::plan_modeset;
+    crate::amdgpu::reset_saved_display_audio_for_test();
+    let mut kms = laptop_audio_kms();
+    let dp_plan = match plan_modeset(
+        &kms,
+        Family::Renoir,
+        1,
+        1920,
+        1080,
+        60,
+        1920,
+        0x8000_0000,
+        0x5000,
+        0x9000,
+    ) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("DP plan failed"),
+    };
+    let last_audio = match dp_plan.audio_writes.last() {
+        Some(w) => *w,
+        None => return TestResult::Fail("DP plan must carry audio writes"),
+    };
+    // Control: no snapshot yet — set_mode ends with video only.
+    let mut regs = alloc::vec![0u32; 8];
+    let mut gpu = renoir_gpu_for_display_audio(&mut regs);
+    // SAFETY: RAM-backed register window; the test owns it.
+    if unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("control set_mode failed");
+    }
+    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
+        return TestResult::Fail("set_mode without saved audio must end with OTG_MASTER_EN");
+    }
+    // Apply the DP plan (snapshots its audio), then re-run set_mode
+    // for the same timing: audio replays after video (PM-resume shape).
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // `dp_plan` was built by `plan_modeset` against this `kms` for Renoir connector 1.
+    if unsafe { gpu.apply_modeset_plan(&mut kms, &dp_plan, 1920, 0x8000_0000) }.is_err() {
+        return TestResult::Fail("DP apply failed");
+    }
+    if regs[0] != last_audio.addr || regs[1] != last_audio.value {
+        return TestResult::Fail("apply must end with the audio writes");
+    }
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // 1920x1080 mode matches the applied plan's timing (the snapshot-replay path).
+    if unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("resume set_mode failed");
+    }
+    if regs[0] != last_audio.addr || regs[1] != last_audio.value {
+        return TestResult::Fail("set_mode must replay saved audio for the same timing");
+    }
+    // Stale timing: a different mode drops the snapshot instead of
+    // programming a DTO built for another pixel clock — and the
+    // drop sticks (a later same-timing modeset stays silent).
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // 1280x720 mode is a different timing from the applied plan (the stale-snapshot path).
+    if unsafe {
+        gpu.set_mode(Mode {
+            width: 1280,
+            height: 720,
+            stride: 1280,
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("stale set_mode failed");
+    }
+    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
+        return TestResult::Fail("stale timing must drop saved audio");
+    }
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // 1920x1080 mode re-runs the same timing after the snapshot was dropped.
+    if unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("second resume set_mode failed");
+    }
+    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
+        return TestResult::Fail("dropped snapshot must not resurrect");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_drm_laptop_display_audio_set_mode_replays_saved_audio
+);
+
+#[cfg(feature = "amdgpu")]
+fn smoke_drm_laptop_display_audio_disable_before_teardown() -> TestResult {
+    use crate::amdgpu::{Family, Mode};
+    use crate::amdgpu_dcn::{execute_modeset, DcnWrite, OTG0_OTG_CONTROL, OTG_MASTER_EN};
+    use crate::amdgpu_modeset::{plan_audio_disable, plan_modeset, CrtcState};
+    crate::amdgpu::reset_saved_display_audio_for_test();
+    let mut kms = laptop_audio_kms();
+    let dp_plan = match plan_modeset(
+        &kms,
+        Family::Renoir,
+        1,
+        1920,
+        1080,
+        60,
+        1920,
+        0x8000_0000,
+        0x5000,
+        0x9000,
+    ) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("DP plan failed"),
+    };
+    let mut regs = alloc::vec![0u32; 8];
+    let mut gpu = renoir_gpu_for_display_audio(&mut regs);
+    // SAFETY: RAM-backed register window; the test owns it.
+    if unsafe { gpu.apply_modeset_plan(&mut kms, &dp_plan, 1920, 0x8000_0000) }.is_err() {
+        return TestResult::Fail("DP apply failed");
+    }
+    // Expected teardown writes, computed by the plan layer.
+    let off = match plan_audio_disable(&kms, 1, 0x5000, 0x9000) {
+        Some(w) if !w.is_empty() => w,
+        _ => return TestResult::Fail("DP teardown must have audio writes"),
+    };
+    let last_off = *off.last().unwrap();
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 1 is the live DP stream whose audio was applied from `dp_plan`.
+    match unsafe { gpu.disable_display_audio(&kms, 1) } {
+        Ok(true) => {}
+        _ => return TestResult::Fail("disable must execute for a live DP stream"),
+    }
+    if regs[0] != last_off.addr || regs[1] != last_off.value {
+        return TestResult::Fail("disable writes must execute");
+    }
+    // Scanout is still live during the disable — the CRTC only
+    // goes down when the caller clears OTG_MASTER_EN afterwards.
+    if kms.crtcs[dp_plan.crtc_idx as usize].state != CrtcState::Active {
+        return TestResult::Fail("CRTC must stay Active through audio disable");
+    }
+    // The caller's OTG clear follows the disable — the ordering
+    // the fixture proves end to end.
+    // SAFETY: `gpu.regs` is the test-owned RAM register window; the write goes through the
+    // MM_INDEX/MM_DATA pair at its base, and the OTG address is latched, not dereferenced.
+    unsafe {
+        execute_modeset(
+            &gpu.regs,
+            &[DcnWrite {
+                addr: 0x5000 + OTG0_OTG_CONTROL,
+                value: 0,
+            }],
+        );
+    }
+    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != 0 {
+        return TestResult::Fail("OTG clear must land after the disable writes");
+    }
+    // Snapshot cleared: a later set_mode stays video-only.
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // disable just cleared the snapshot, so this is the video-only `set_mode` path.
+    if unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("set_mode after disable failed");
+    }
+    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
+        return TestResult::Fail("disable must clear the saved audio");
+    }
+    // Control: the internal panel has no audio endpoint to disable.
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 0 is the internal panel with no audio endpoint (nothing to disable).
+    match unsafe { gpu.disable_display_audio(&kms, 0) } {
+        Ok(false) => {}
+        _ => return TestResult::Fail("eDP disable must report nothing to do"),
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_drm_laptop_display_audio_disable_before_teardown
+);
+
+#[cfg(feature = "amdgpu")]
+fn smoke_drm_laptop_display_audio_hotplug_disconnect() -> TestResult {
+    use crate::amdgpu::{Family, Mode};
+    use crate::amdgpu_dcn::{OTG0_OTG_CONTROL, OTG_MASTER_EN};
+    use crate::amdgpu_modeset::{
+        plan_audio_disable, plan_modeset, ConnectorStatus, CrtcState, HotplugAudioAction,
+    };
+    crate::amdgpu::reset_saved_display_audio_for_test();
+    let mut kms = laptop_audio_kms();
+    let dp_plan = match plan_modeset(
+        &kms,
+        Family::Renoir,
+        1,
+        1920,
+        1080,
+        60,
+        1920,
+        0x8000_0000,
+        0x5000,
+        0x9000,
+    ) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("DP plan failed"),
+    };
+    let mut regs = alloc::vec![0u32; 8];
+    let mut gpu = renoir_gpu_for_display_audio(&mut regs);
+    // SAFETY: RAM-backed register window; the test owns it.
+    if unsafe { gpu.apply_modeset_plan(&mut kms, &dp_plan, 1920, 0x8000_0000) }.is_err() {
+        return TestResult::Fail("DP apply failed");
+    }
+    let off = match plan_audio_disable(&kms, 1, 0x5000, 0x9000) {
+        Some(w) if !w.is_empty() => w,
+        _ => return TestResult::Fail("DP teardown must have audio writes"),
+    };
+    let last_off = *off.last().unwrap();
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 1 is the live DP stream whose disable writes `plan_audio_disable` computed.
+    match unsafe { gpu.apply_hotplug_disconnect(&mut kms, 1) } {
+        Ok(HotplugAudioAction::DisableAudio { .. }) => {}
+        _ => return TestResult::Fail("DP disconnect must apply the disable action"),
+    }
+    if regs[0] != last_off.addr || regs[1] != last_off.value {
+        return TestResult::Fail("disconnect must execute the disable writes");
+    }
+    // The disconnect drops the CRTC binding and inactivates it.
+    if kms.connectors[1].status != ConnectorStatus::Disconnected
+        || kms.connectors[1].bound_crtc.is_some()
+        || kms.crtcs[dp_plan.crtc_idx as usize].state != CrtcState::Inactive
+        || kms.crtcs[dp_plan.crtc_idx as usize].mode.is_some()
+    {
+        return TestResult::Fail("disconnect must drop the CRTC binding");
+    }
+    // Snapshot cleared: a later set_mode stays video-only.
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // disconnect just cleared the snapshot, so this is the video-only `set_mode` path.
+    if unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("set_mode after disconnect failed");
+    }
+    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
+        return TestResult::Fail("disconnect must clear the saved audio");
+    }
+    // Control: the internal panel disconnects with no audio action.
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 0 is the internal panel, so the disconnect applies no audio action.
+    match unsafe { gpu.apply_hotplug_disconnect(&mut kms, 0) } {
+        Ok(HotplugAudioAction::None) => {}
+        _ => return TestResult::Fail("eDP disconnect must apply no audio action"),
+    }
+    // Control: unknown connector, no audio action.
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 99 is unknown, so the action degrades to `None` and no writes execute.
+    match unsafe { gpu.apply_hotplug_disconnect(&mut kms, 99) } {
+        Ok(HotplugAudioAction::None) => {}
+        _ => return TestResult::Fail("unknown connector must apply no audio action"),
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_drm_laptop_display_audio_hotplug_disconnect
+);
+
+#[cfg(feature = "amdgpu")]
+fn smoke_drm_laptop_display_audio_resume_rebuild() -> TestResult {
+    use crate::amdgpu::Family;
+    use crate::amdgpu_modeset::{
+        commit_modeset_full, plan_modeset, resume_display_audio_writes, ConnectorStatus,
+    };
+    crate::amdgpu::reset_saved_display_audio_for_test();
+    let mut kms = laptop_audio_kms();
+    // Program the DP mode in KMS state only (no MMIO yet): the
+    // resume helper rebuilds from state, not from a live plan.
+    let dp_plan = match plan_modeset(
+        &kms,
+        Family::Renoir,
+        1,
+        1920,
+        1080,
+        60,
+        1920,
+        0x8000_0000,
+        0x5000,
+        0x9000,
+    ) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("DP plan failed"),
+    };
+    commit_modeset_full(&mut kms, &dp_plan, 1920, 0x8000_0000);
+    let rebuilt = resume_display_audio_writes(&kms, 0x5000, 0x9000);
+    if rebuilt.is_empty() {
+        return TestResult::Fail("resume must rebuild writes for a Connected DP connector");
+    }
+    let last_rebuilt = *rebuilt.last().unwrap();
+    let mut regs = alloc::vec![0u32; 8];
+    let mut gpu = renoir_gpu_for_display_audio(&mut regs);
+    // SAFETY: RAM-backed register window; the test owns it.
+    match unsafe { gpu.resume_display_audio(&kms) } {
+        Ok(true) => {}
+        _ => return TestResult::Fail("resume must execute for a live DP stream"),
+    }
+    if regs[0] != last_rebuilt.addr || regs[1] != last_rebuilt.value {
+        return TestResult::Fail("resume must execute the rebuilt enable writes");
+    }
+    // Disconnected: nothing to rebuild, nothing executes.
+    kms.set_status(1, ConnectorStatus::Disconnected);
+    regs[0] = 0;
+    regs[1] = 0;
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and
+    // connector 1 is now Disconnected, so the resume reports nothing and writes nothing.
+    match unsafe { gpu.resume_display_audio(&kms) } {
+        Ok(false) => {}
+        _ => return TestResult::Fail("resume must report nothing after disconnect"),
+    }
+    if regs[0] != 0 || regs[1] != 0 {
+        return TestResult::Fail("resume after disconnect must not touch MMIO");
+    }
+    // Control: undiscoverable DCN bases — nothing executes.
+    gpu.ip_blocks.clear();
+    // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
+    // DCN bases are undiscoverable with `ip_blocks` cleared, so the resume writes nothing.
+    match unsafe { gpu.resume_display_audio(&kms) } {
+        Ok(false) => {}
+        _ => return TestResult::Fail("resume without DCN discovery must report nothing"),
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_drm_laptop_display_audio_resume_rebuild
+);

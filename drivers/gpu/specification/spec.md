@@ -14468,7 +14468,7 @@ not the dGPU owners. The surface:
   new_status, dcn_base, dcn_base2) -> HotplugAudioAction` maps
   a hotplug transition to its audio action: `ReprogramAudio`
   for a connect on an external HDMI/DP connector (the caller
-  runs `plan_modeset` + `execute_modeset_chained`),
+  runs `plan_modeset` + `AmdGpu::apply_modeset_plan`),
   `DisableAudio { writes }` for a disconnect (the
   `plan_audio_disable` writes, to execute before video
   teardown), `None` otherwise. The caller computes the action
@@ -14482,13 +14482,59 @@ not the dGPU owners. The surface:
   the PM resume handler to execute AFTER `set_mode`
   re-programs video.
 
+### Production apply path (`AmdGpu`)
+
+The plan layer above has a production caller on the driver
+struct that owns BAR5 (`drivers/gpu/src/amdgpu.rs`):
+
+- `AmdGpu::apply_modeset_plan(kms, plan, stride, surface)`
+  executes a plan — video writes, then the plan's audio writes
+  via `execute_modeset_chained` — then `commit_modeset_full` +
+  `mark_active`, and snapshots the audio half (timing +
+  connector + writes) for the resume re-run below. Guards mirror
+  `set_mode` (Navi4 rejected, firmware required). A plan built
+  for another family or device is a caller bug: the plan carries
+  no family tag to check.
+- `AmdGpu::disable_display_audio(kms, connector_idx)` executes
+  the `plan_audio_disable` writes and clears that connector's
+  saved audio. Call BEFORE the video teardown's OTG
+  master-enable clear. Returns `true` when disable writes
+  executed, `false` when the connector has no audio endpoint or
+  the DCN BASE_IDX 2 segment is undiscoverable.
+- `AmdGpu::apply_hotplug_disconnect(kms, connector_idx)` is the
+  audio half of an HPD disconnect: it computes the action from
+  the pre-transition state, applies the status change, then
+  executes the disable writes, and returns the action applied.
+  The IH dispatch calls this (not bare
+  `HpdEngine::apply_to_kms`) for disconnects. Connects need a
+  mode before a plan can be built, so the connect half stays
+  with the caller: `hotplug_audio_action` → `plan_modeset` →
+  `apply_modeset_plan`.
+- `AmdGpu::resume_display_audio(kms)` executes
+  `resume_display_audio_writes` — the multi-connector resume
+  path, for the PM resume handler to run after `set_mode`.
+- `set_mode` replays the saved audio: after re-programming
+  video it re-executes the snapshot's enable writes when the
+  timing matches — the PM-resume re-run, which takes the
+  non-KMS path. A different timing drops the snapshot instead
+  of programming a DTO built for another pixel clock; an empty
+  snapshot is a no-op, so `set_mode` behaviour is unchanged
+  until a plan has been applied. The snapshot covers the last
+  applied plan only; multi-connector resume goes through
+  `resume_display_audio`.
+
 Explicitly not in this surface: the IH ring's HPD dispatch into
 the `amdgpu_hpd` state machine has no production driver on this
-path, and neither does the plan layer have a production caller
-yet — the executor and the hotplug actions above are the
-contract those callers consume when they land. Intel
-display-side audio programming is out of scope while another
-agent works Intel GPU; no Intel modeset file is touched.
+path, no probe-time owner builds a `KmsState` from the ATOM
+display-object table yet, and no production EDID readback feeds
+`feed_connector_audio_caps` — so the apply path above waits for
+the KMS driver core to call it (connect half: a mode source for
+the reprogram plan; resume half: the KMS state for
+`resume_display_audio`). Until that lands, external-monitor
+audio still never reaches hardware on the laptop path, and
+#778 stays open on that remainder. Intel display-side audio
+programming is out of scope while another agent works Intel
+GPU; no Intel modeset file is touched.
 
 ### VirtIO-GPU rendering
 
