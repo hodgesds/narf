@@ -953,14 +953,25 @@ impl ForcedethNic {
     /// [`Self::refresh_link_state`] performs, without the `&mut`
     /// store. The RX pump holds only an `Arc<ForcedethNic>`, so the
     /// publication path (issue #791) samples through this.
+    ///
+    /// A failed MII transaction reports the last-known state
+    /// (`self.link_up`), not link-down: a transient bus error is
+    /// not a carrier loss, and reporting down would flap the
+    /// published carrier and suppress the TX watchdog's recovery
+    /// on a genuinely wedged ring. (A fixture's plain MMIO backing
+    /// page cannot emulate the chip's `MIIStatus` write-to-clear,
+    /// so its MII reads always fail with `MiiError` — the
+    /// fallback is what lets the watchdog fixture see link-up.)
     pub fn live_link_up(&self) -> bool {
         if self.phy_addr >= 32 {
             return false;
         }
         // sticky-low: double-read, as in refresh_link_state.
         let _ = mii_rw(&self.mmio, self.phy_addr, MII_BMSR, None);
-        let bmsr = mii_rw(&self.mmio, self.phy_addr, MII_BMSR, None).unwrap_or(0);
-        (bmsr as u16) & BMSR_LINK_UP != 0
+        match mii_rw(&self.mmio, self.phy_addr, MII_BMSR, None) {
+            Ok(bmsr) => (bmsr as u16) & BMSR_LINK_UP != 0,
+            Err(_) => self.link_up,
+        }
     }
 
     /// Re-evaluate the link state by re-reading BMSR.
@@ -1993,8 +2004,14 @@ mod tests {
                 },
             };
             // Seed the fake PHY's BMSR with link up (IEEE 802.3
-            // Clause 22 bit 2): the watchdog gates on the live link
-            // sample, and the fake MII glue returns MIIData verbatim.
+            // Clause 22 bit 2): the watchdog gates on the link
+            // sample. Note the seed is aspirational, not live: the
+            // plain backing page cannot emulate the chip's
+            // `MIIStatus` write-to-clear, so every `mii_rw` read
+            // in the fixture fails with `MiiError` and
+            // `live_link_up` falls back to the cached `link_up`
+            // (seeded `true` below) — that fallback, not the
+            // seeded BMSR value, is what the watchdog sees.
             // SAFETY: fixture-owned MMIO backing.
             unsafe {
                 csr.write32(REG_MII_DATA, BMSR_LINK_UP as u32);
@@ -2107,6 +2124,15 @@ mod tests {
     fn smoke_forcedeth_tx_timeout_recovery_fixture() -> TestResult {
         let fixture = TxTimeoutFixture::new();
         let device = &fixture.device;
+        // Link reads as up in the fixture: the plain MMIO backing
+        // page cannot emulate `MIIStatus` write-to-clear, so the
+        // live BMSR read fails and `live_link_up` falls back to
+        // the cached `link_up` (seeded true in the fixture). Pin
+        // that here so a fallback regression fails loudly instead
+        // of surfacing as a watchdog that never fires.
+        if !device.live_link_up() {
+            return TestResult::Fail("forcedeth live link read as down in the fixture");
+        }
         let frame = [0xAAu8; 64];
         // 1. Stall: the fake device never completes the descriptor,
         // so the synchronous post times out — the wedged ring, as
