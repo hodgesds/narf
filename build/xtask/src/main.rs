@@ -1909,6 +1909,10 @@ impl Arch {
                     // so the advanced-descriptor igb driver can be
                     // exercised on the same `n1` backend; the emulated
                     // 82576 drives the identical datapath as the i210).
+                    // `XTASK_QEMU_VMXNET3=1` swaps it for QEMU's
+                    // `vmxnet3` (0x07B0) instead, so the vmxnet3
+                    // datapath + publication smoke runs on the same
+                    // backend.
                     // [`legacy_nic_model`] is the single source of truth:
                     // the second NIC below always matches it.
                     let legacy_nic_dev = format!("{},netdev=n1", legacy_nic_model());
@@ -2158,6 +2162,10 @@ impl Arch {
                     // so the advanced-descriptor igb driver can be
                     // exercised on the same `n1` backend; the emulated
                     // 82576 drives the identical datapath as the i210).
+                    // `XTASK_QEMU_VMXNET3=1` swaps it for QEMU's
+                    // `vmxnet3` (0x07B0) instead, so the vmxnet3
+                    // datapath + publication smoke runs on the same
+                    // backend.
                     // [`legacy_nic_model`] is the single source of truth:
                     // the second NIC below always matches it.
                     let legacy_nic_dev = format!("{},netdev=n1", legacy_nic_model());
@@ -3505,14 +3513,19 @@ fn legacy_qemu_netdev_from(tap: Option<&str>, hostfwd: Option<&str>) -> String {
 /// extending this function, not by re-checking env at each call site.
 fn legacy_nic_model() -> &'static str {
     legacy_nic_model_from(
+        std::env::var("XTASK_QEMU_VMXNET3")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         std::env::var("XTASK_QEMU_IGB")
             .map(|v| v == "1")
             .unwrap_or(false),
     )
 }
 
-fn legacy_nic_model_from(igb: bool) -> &'static str {
-    if igb {
+fn legacy_nic_model_from(vmxnet3: bool, igb: bool) -> &'static str {
+    if vmxnet3 {
+        "vmxnet3"
+    } else if igb {
         "igb"
     } else {
         "e1000"
@@ -3556,9 +3569,12 @@ mod second_nic_tests {
     use super::*;
 
     #[test]
-    fn legacy_nic_model_defaults_to_e1000_and_igb_switch_selects_igb() {
-        assert_eq!(legacy_nic_model_from(false), "e1000");
-        assert_eq!(legacy_nic_model_from(true), "igb");
+    fn legacy_nic_model_defaults_to_e1000_and_switches_select_vmxnet3_then_igb() {
+        assert_eq!(legacy_nic_model_from(false, false), "e1000");
+        assert_eq!(legacy_nic_model_from(false, true), "igb");
+        assert_eq!(legacy_nic_model_from(true, false), "vmxnet3");
+        // vmxnet3 wins when both switches are set.
+        assert_eq!(legacy_nic_model_from(true, true), "vmxnet3");
     }
 
     #[test]
