@@ -1878,6 +1878,36 @@ impl Ixgbe {
         Ok(())
     }
 
+    /// The ethtool set-EEE entry point (Linux `ixgbe_set_eee` +
+    /// `ixgbe_validate_keee`, issue #794): validate the request
+    /// against the stored state — or the identification defaults
+    /// ([`eee::default_state`]) when nothing was ever configured
+    /// — then apply it live through [`Ixgbe::configure_eee`].
+    /// Only the enabled flag may move: a request whose TX-LPI
+    /// enable/timer or advertised set differs from stored fails
+    /// with `Other` (Linux `-EINVAL`); a request that changes
+    /// nothing succeeds without touching the firmware (Linux
+    /// converts `-EALREADY` to success). Returns
+    /// `UnsupportedDevice` on non-capable device ids.
+    pub fn set_eee(&self, req: eee::EeeRequest) -> Result<(), IxgbeError> {
+        if !eee::eee_capable(self.did) {
+            return Err(IxgbeError::UnsupportedDevice);
+        }
+        let stored = match *self.eee_state.lock() {
+            Some(state) => state,
+            None => match eee::default_state(self.did) {
+                Some(state) => state,
+                None => return Err(IxgbeError::UnsupportedDevice),
+            },
+        };
+        match eee::validate_request(true, &stored, &req) {
+            Ok(()) => {}
+            Err(eee::EeeError::AlreadyEnabled) => return Ok(()),
+            Err(e) => return Err(IxgbeError::Other(e.as_str())),
+        }
+        self.configure_eee(req.enabled)
+    }
+
     /// The ethtool-visible EEE snapshot, if `configure_eee` ran.
     /// `None` on non-capable device ids and before any
     /// configuration.
@@ -2402,6 +2432,7 @@ impl Ixgbe {
             vlan_filter_enabled: self.vlan_filter.lock().is_some(),
             wol_supported: wol::wol_allowed(self.did, *self.wol_board_cap.lock()),
             wol_armed: self.wol_armed.lock().is_some(),
+            eee: self.eee_status(),
             stats: ethtool::read_stats(&bank),
             queue_stats: ethtool::read_queue_stats(
                 &bank,

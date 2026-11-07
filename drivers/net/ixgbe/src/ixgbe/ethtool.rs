@@ -158,6 +158,11 @@ pub struct EthtoolInfo {
     pub vlan_filter_enabled: bool,
     pub wol_supported: bool,
     pub wol_armed: bool,
+    /// EEE snapshot (issue #794): `Some` once `configure_eee`
+    /// or `set_eee` ran on a capable part, `None` on
+    /// non-capable device ids and before any configuration —
+    /// unknown, not disabled.
+    pub eee: Option<super::eee::EeeStatus>,
     pub stats: NicStats,
     /// Per-queue interval packet counters (first 16 queues; see
     /// `QueueStats`). Read by the same snapshot as `stats`, so
@@ -176,8 +181,14 @@ impl EthtoolInfo {
     /// Render the snapshot as the one-line summary the control
     /// plane logs (stable field order for tests).
     pub fn summary(&self) -> alloc::string::String {
+        let eee = match self.eee {
+            Some(s) if s.enabled && s.active => "on,active",
+            Some(s) if s.enabled => "on,idle",
+            Some(_) => "off",
+            None => "n/a",
+        };
         alloc::format!(
-            "{} {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={} link={} txq={} rxq={} caps=0x{:x} rss={} vlan={} wol={}/{} rx_pkts={} tx_pkts={} tx_timeouts={} tx_resets={}",
+            "{} {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} mtu={} link={} txq={} rxq={} caps=0x{:x} rss={} vlan={} wol={}/{} eee={} rx_pkts={} tx_pkts={} tx_timeouts={} tx_resets={}",
             self.driver,
             self.version,
             self.mac[0],
@@ -195,6 +206,7 @@ impl EthtoolInfo {
             self.vlan_filter_enabled,
             self.wol_supported,
             self.wol_armed,
+            eee,
             self.stats.rx_good_packets,
             self.stats.tx_good_packets,
             self.tx_timeouts,
