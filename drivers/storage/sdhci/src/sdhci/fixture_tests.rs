@@ -1200,6 +1200,7 @@ impl FixtureTransport {
         FixtureTransport {
             state: IrqSafeSpinLock::new(FixtureState {
                 regs: [0; 0x100],
+                card_present: true,
                 image,
                 read_stage: Vec::new(),
                 read_cursor: 0,

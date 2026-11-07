@@ -675,6 +675,7 @@ mod tests {
             cid: [0x1111_2222, 0x3333_4444, 0x5555_6666, 0x7777_8888],
             if_cond_match: true,
             ccs: true,
+            s18a: false,
             capacity_blocks: 16_777_216,
         };
         if !card_identity_matches(&base, &base) {
