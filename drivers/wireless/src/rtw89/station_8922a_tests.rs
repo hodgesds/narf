@@ -42,10 +42,15 @@ fn base_req() -> Request {
 
 fn smoke_rtw89_8922a_admit_eht_golden() -> TestResult {
     let f = factory();
-    let facet = facet()?;
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
     let mut pool = MacIdPool::new();
-    let mut st = admit(&f, facet, &mut pool, &base_req())
-        .map_err(|_| TestResult::Fail("valid EHT admission refused"))?;
+    let mut st = match admit(&f, facet, &mut pool, &base_req()) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("valid EHT admission refused"),
+    };
     if st.own != f.mac
         || st.peer != base_req().peer
         || st.macid != 0
@@ -98,16 +103,17 @@ fn smoke_rtw89_8922a_admit_eht_golden() -> TestResult {
         return TestResult::Fail("facet TXWD EHT fields must be zero");
     }
     // BA-CAM: acquire + H2C golden (entry index = bitmap + 8).
-    let idx = st
-        .bacam
-        .acquire(0)
-        .map_err(|_| TestResult::Fail("BA-CAM acquire TID 0 failed"))?;
+    let idx = match st.bacam.acquire(0) {
+        Ok(idx) => idx,
+        Err(_) => return TestResult::Fail("BA-CAM acquire TID 0 failed"),
+    };
     if idx != 0 {
         return TestResult::Fail("BA-CAM first slot must be 0");
     }
-    let h2c = st
-        .ba_h2c(0, 0, 0, idx as u32)
-        .map_err(|_| TestResult::Fail("BA-CAM H2C build failed"))?;
+    let h2c = match st.ba_h2c(0, 0, 0, idx as u32) {
+        Ok(h2c) => h2c,
+        Err(_) => return TestResult::Fail("BA-CAM H2C build failed"),
+    };
     if h2c.w0 != 0x3 || h2c.w1 != 0x0800_0100 {
         return TestResult::Fail("BA-CAM H2C golden mismatch");
     }
@@ -123,7 +129,7 @@ fn smoke_rtw89_8922a_assoc_2g_ap() -> TestResult {
     // non-P2P => CCK1 lowest rate; AP mode => DATA_DCM mask;
     // EHT off => puncturing ignored; pads packed 2 bits each;
     // no station mode, no HE peer.
-    let t = super::cctl_g7::build_assoc(
+    let t = match super::cctl_g7::build_assoc(
         5,
         true,
         false,
@@ -135,8 +141,10 @@ fn smoke_rtw89_8922a_assoc_2g_ap() -> TestResult {
         1,
         false,
         false,
-    )
-    .map_err(|_| TestResult::Fail("valid assoc build refused"))?;
+    ) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("valid assoc build refused"),
+    };
     if t.c0 != 0x85
         || t.w[0] != 0x0600_0000
         || t.m[0] != 0x0600_0000
@@ -162,7 +170,10 @@ fn smoke_rtw89_8922a_assoc_2g_ap() -> TestResult {
 
 fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
     let f = factory();
-    let facet = facet()?;
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
     let mut pool = MacIdPool::new();
     let mut req = base_req();
     let cases: [(Request, Error); 9] = [
@@ -207,18 +218,20 @@ fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
         }
     }
     // Refusals must not consume MACIDs.
-    if pool
-        .alloc()
-        .map_err(|_| TestResult::Fail("pool drained by refusals"))?
-        != 0
-    {
+    let first = match pool.alloc() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("pool drained by refusals"),
+    };
+    if first != 0 {
         return TestResult::Fail("refused request consumed a MACID");
     }
     pool.free(0);
     // The legal 80 MHz request admits.
     req.width_mhz = 80;
-    let st = admit(&f, facet, &mut pool, &req)
-        .map_err(|_| TestResult::Fail("legal 80 MHz admission refused"))?;
+    let st = match admit(&f, facet, &mut pool, &req) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("legal 80 MHz admission refused"),
+    };
     if st.width_mhz != 80 || st.macid != 0 {
         return TestResult::Fail("80 MHz admission record mismatch");
     }
@@ -228,9 +241,10 @@ fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
 fn smoke_rtw89_8922a_macid_pool() -> TestResult {
     let mut pool = MacIdPool::new();
     for want in 0..32u8 {
-        let got = pool
-            .alloc()
-            .map_err(|_| TestResult::Fail("pool exhausted early"))?;
+        let got = match pool.alloc() {
+            Ok(got) => got,
+            Err(_) => return TestResult::Fail("pool exhausted early"),
+        };
         if got != want || !pool.is_used(want) {
             return TestResult::Fail("pool allocation order mismatch");
         }

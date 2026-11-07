@@ -120,7 +120,7 @@ fn smoke_rtw89_tx_8922a_header() -> TestResult {
     // Body with WDINFO_EN set must come out cleared; WP seq0
     // carries sequence | VALID; total = 32 + 8 + 6 (100-byte frame).
     let mut body = zero_body();
-    body[0..4].copy_from_slice(&(1 << 22).to_le_bytes());
+    body[0..4].copy_from_slice(&(1u32 << 22).to_le_bytes());
     let header = match build_header(&body, 7, 0x20000, 100) {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("build_header failed"),
