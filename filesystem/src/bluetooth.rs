@@ -212,6 +212,12 @@ pub enum BtSendError {
     NoCredits,
     /// SDU larger than the peer's MTU (LE CoC).
     TooBig,
+    /// The transport cannot carry this packet — e.g. SCO over a USB
+    /// controller that offers no isochronous endpoints, or a SCO
+    /// packet larger than the selected isoch alternate's budget.
+    /// Fail-closed: callers must not fall back to another endpoint
+    /// (in particular, never to bulk-OUT).
+    Unsupported,
     /// Channel belongs to an in-kernel service (SDP/RFCOMM), not a
     /// socket — use the service path, not `send`.
     WrongService,
@@ -491,6 +497,195 @@ pub fn bt_close_rfcomm(dev: u16, handle: u16, cid: u16, dlci: u8) -> bool {
     // SAFETY: only ever stored as `BtCloseRfcommHandler as usize`.
     let f: BtCloseRfcommHandler = unsafe { core::mem::transmute::<usize, BtCloseRfcommHandler>(h) };
     f(dev, handle, cid, dlci)
+}
+
+// ── SCO socket handlers (issue #814, SCO slice) ──────────────────────
+
+/// Outcome of an outbound SCO setup request (`bt_sco_connect` /
+/// `bt_sco_connect_status`). Mirrors Linux `sco.c`: `sco_connect`
+/// returns EHOSTUNREACH when no route exists, the setup runs
+/// asynchronously (BT_CONNECT + `bt_sock_wait_state`), and a refused
+/// setup surfaces the controller's HCI status.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BtScoConnectResult {
+    /// SCO link established: (SCO handle, SCO MTU, peer class of
+    /// device). The MTU is the controller's SCO MTU (Read Buffer
+    /// Size; 60 when unset — Linux `sco_conn_add`); the class is
+    /// zeros when the peer was never discovered.
+    Connected {
+        handle: u16,
+        mtu: u16,
+        dev_class: [u8; 3],
+    },
+    /// Setup in flight (paging and/or Setup Synchronous Connection
+    /// outstanding); poll `bt_sco_connect_status` for the outcome.
+    Pending,
+    /// No pump exists for this controller index.
+    NoPump,
+    /// A pump step currently owns the core, or another SCO setup is
+    /// already in flight on this controller; retry after the step.
+    Busy,
+    /// The peer cannot be paged: it was never discovered, so the
+    /// pump holds no paging parameters for it (never guessed).
+    UnknownPeer,
+    /// A SCO link (or setup) to this peer already exists and belongs
+    /// to another socket (Linux `sco_chan_add` EBUSY).
+    AlreadyConnected,
+    /// The controller refused the synchronous setup; the payload is
+    /// the HCI error status from Synchronous Connection Complete
+    /// (or the disconnect reason when the ACL died mid-setup).
+    Refused(u8),
+    /// The transport failed while the setup was in flight (the
+    /// controller is gone); the setup cannot complete.
+    Transport,
+    /// No setup is in flight for this peer and no link exists — the
+    /// setup was cancelled or its link went away before the status
+    /// was consumed.
+    Aborted,
+}
+
+/// One established SCO link, as claimed by `bt_sco_connect_status`:
+/// SCO handle, SCO MTU, peer class of device.
+pub type BtScoLink = (u16, u16, [u8; 3]);
+
+pub type BtScoConnectHandler =
+    fn(dev: u16, peer: [u8; 6], voice_setting: u16) -> BtScoConnectResult;
+pub type BtScoConnectStatusHandler = fn(dev: u16, peer: [u8; 6]) -> BtScoConnectResult;
+pub type BtSendScoHandler = fn(dev: u16, handle: u16, payload: &[u8]) -> Result<usize, BtSendError>;
+pub type BtDrainScoHandler = fn(dev: u16, handle: u16) -> Option<Vec<Vec<u8>>>;
+pub type BtScoRxPendingHandler = fn(dev: u16, handle: u16) -> bool;
+pub type BtDisconnectScoHandler = fn(dev: u16, handle: u16) -> bool;
+pub type BtScoCancelConnectHandler = fn(dev: u16, peer: [u8; 6]);
+
+static BT_SCO_CONNECT: AtomicUsize = AtomicUsize::new(0);
+static BT_SCO_CONNECT_STATUS: AtomicUsize = AtomicUsize::new(0);
+static BT_SEND_SCO: AtomicUsize = AtomicUsize::new(0);
+static BT_DRAIN_SCO: AtomicUsize = AtomicUsize::new(0);
+static BT_SCO_RX_PENDING: AtomicUsize = AtomicUsize::new(0);
+static BT_DISCONNECT_SCO: AtomicUsize = AtomicUsize::new(0);
+static BT_SCO_CANCEL_CONNECT: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the SCO socket handlers (narf_bluetooth::pump).
+#[allow(clippy::too_many_arguments)]
+pub fn install_bt_sco_handlers(
+    connect: BtScoConnectHandler,
+    status: BtScoConnectStatusHandler,
+    send: BtSendScoHandler,
+    drain: BtDrainScoHandler,
+    rx_pending: BtScoRxPendingHandler,
+    disconnect: BtDisconnectScoHandler,
+    cancel: BtScoCancelConnectHandler,
+) {
+    BT_SCO_CONNECT.store(connect as usize, Ordering::Release);
+    BT_SCO_CONNECT_STATUS.store(status as usize, Ordering::Release);
+    BT_SEND_SCO.store(send as usize, Ordering::Release);
+    BT_DRAIN_SCO.store(drain as usize, Ordering::Release);
+    BT_SCO_RX_PENDING.store(rx_pending as usize, Ordering::Release);
+    BT_DISCONNECT_SCO.store(disconnect as usize, Ordering::Release);
+    BT_SCO_CANCEL_CONNECT.store(cancel as usize, Ordering::Release);
+}
+
+/// Start an outbound SCO setup to `peer` on controller `dev`
+/// (`voice_setting`: the socket's BT_VOICE setting, default CVSD
+/// 0x0060). Pages the peer first when no ACL connection to it
+/// exists, then issues HCI_Setup_Synchronous_Connection on the ACL
+/// handle; the link completes on Synchronous Connection Complete.
+/// `Connected` only when a link to this peer already exists and is
+/// unclaimed; otherwise `Pending` (poll the status) or a terminal
+/// refusal.
+pub fn bt_sco_connect(dev: u16, peer: [u8; 6], voice_setting: u16) -> BtScoConnectResult {
+    let h = BT_SCO_CONNECT.load(Ordering::Acquire);
+    if h == 0 {
+        return BtScoConnectResult::NoPump;
+    }
+    // SAFETY: only ever stored as `BtScoConnectHandler as usize`.
+    let f: BtScoConnectHandler = unsafe { core::mem::transmute::<usize, BtScoConnectHandler>(h) };
+    f(dev, peer, voice_setting)
+}
+
+/// Poll the outcome of an outbound SCO setup to `peer` started by
+/// [`bt_sco_connect`]: `Connected` claims the established link,
+/// `Pending` means still in flight, `Refused`/`Aborted` are
+/// terminal. `NoPump` when no stack is installed.
+pub fn bt_sco_connect_status(dev: u16, peer: [u8; 6]) -> BtScoConnectResult {
+    let h = BT_SCO_CONNECT_STATUS.load(Ordering::Acquire);
+    if h == 0 {
+        return BtScoConnectResult::NoPump;
+    }
+    // SAFETY: only ever stored as `BtScoConnectStatusHandler as usize`.
+    let f: BtScoConnectStatusHandler =
+        unsafe { core::mem::transmute::<usize, BtScoConnectStatusHandler>(h) };
+    f(dev, peer)
+}
+
+/// Send `payload` as one SCO frame on the open link (`handle`) of
+/// controller `dev`. Returns the bytes sent. A payload larger than
+/// the link MTU is `TooBig` (the socket layer reports EINVAL, per
+/// Linux `sco_send_frame`); a transport that cannot carry SCO data
+/// is `Unsupported` (EOPNOTSUPP, fail-closed).
+pub fn bt_send_sco(dev: u16, handle: u16, payload: &[u8]) -> Result<usize, BtSendError> {
+    let h = BT_SEND_SCO.load(Ordering::Acquire);
+    if h == 0 {
+        return Err(BtSendError::NoPump);
+    }
+    // SAFETY: only ever stored as `BtSendScoHandler as usize`.
+    let f: BtSendScoHandler = unsafe { core::mem::transmute::<usize, BtSendScoHandler>(h) };
+    f(dev, handle, payload)
+}
+
+/// Drain staged inbound SCO frames for the open link (`handle`).
+/// `None` when no such link exists or no stack is installed.
+pub fn bt_drain_sco(dev: u16, handle: u16) -> Option<Vec<Vec<u8>>> {
+    let h = BT_DRAIN_SCO.load(Ordering::Acquire);
+    if h == 0 {
+        return None;
+    }
+    // SAFETY: only ever stored as `BtDrainScoHandler as usize`.
+    let f: BtDrainScoHandler = unsafe { core::mem::transmute::<usize, BtDrainScoHandler>(h) };
+    f(dev, handle)
+}
+
+/// Whether staged inbound SCO frames await on the open link
+/// (`handle`) — non-consuming peek for poll.
+pub fn bt_sco_rx_pending(dev: u16, handle: u16) -> bool {
+    let h = BT_SCO_RX_PENDING.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `BtScoRxPendingHandler as usize`.
+    let f: BtScoRxPendingHandler =
+        unsafe { core::mem::transmute::<usize, BtScoRxPendingHandler>(h) };
+    f(dev, handle)
+}
+
+/// Tear down the open SCO link (`handle`) on controller `dev`:
+/// remove it and send the controller HCI_Disconnect on the SCO
+/// handle. `false` when no stack is installed or no such link exists.
+pub fn bt_disconnect_sco(dev: u16, handle: u16) -> bool {
+    let h = BT_DISCONNECT_SCO.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `BtDisconnectScoHandler as usize`.
+    let f: BtDisconnectScoHandler =
+        unsafe { core::mem::transmute::<usize, BtDisconnectScoHandler>(h) };
+    f(dev, handle)
+}
+
+/// Cancel an in-flight outbound SCO setup to `peer` (shutdown/Drop
+/// of a socket whose connect never completed). A page already in
+/// flight is left running; its Connection Complete lands a plain
+/// ACL connection and issues no SCO setup. No-op when no stack is
+/// installed or no setup is in flight for this peer.
+pub fn bt_sco_cancel_connect(dev: u16, peer: [u8; 6]) {
+    let h = BT_SCO_CANCEL_CONNECT.load(Ordering::Acquire);
+    if h == 0 {
+        return;
+    }
+    // SAFETY: only ever stored as `BtScoCancelConnectHandler as usize`.
+    let f: BtScoCancelConnectHandler =
+        unsafe { core::mem::transmute::<usize, BtScoCancelConnectHandler>(h) };
+    f(dev, peer)
 }
 
 /// Channel-event wake sink. The pump publishes whenever a peer opens
