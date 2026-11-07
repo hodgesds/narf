@@ -393,11 +393,16 @@ fn bring_up_current(
 
     validate_probe_window(mmio_bar0.len)?;
     use narf_bus::pci::{self, cmd};
-    pci::set_command(cap, device, cmd::MEM_SPACE).map_err(|_| ProbeError::Authority)?;
+    pci::set_command(
+        cap,
+        device,
+        cmd::MEM_SPACE | cmd::BUS_MASTER | cmd::INTX_DISABLE,
+    )
+    .map_err(|_| ProbeError::Authority)?;
     let command = pci::read_command(cap, device).map_err(|_| ProbeError::Authority)?;
     if command == u16::MAX
         || command & (cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE)
-            != cmd::MEM_SPACE | cmd::INTX_DISABLE
+            != cmd::MEM_SPACE | cmd::BUS_MASTER | cmd::INTX_DISABLE
     {
         return Err(ProbeError::Authority);
     }

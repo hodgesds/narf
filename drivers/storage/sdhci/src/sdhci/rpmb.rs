@@ -128,6 +128,7 @@ impl From<ProtocolError> for RpmbError {
 /// copy from lingering on the stack.
 fn zeroize(buf: &mut [u8]) {
     for b in buf.iter_mut() {
+        // SAFETY: `b` references a valid mutable byte slice element in `buf`.
         unsafe { core::ptr::write_volatile(b as *mut u8, 0) };
     }
     compiler_fence(Ordering::SeqCst);
