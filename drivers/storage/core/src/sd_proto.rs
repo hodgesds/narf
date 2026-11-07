@@ -19,6 +19,14 @@
 pub const OCR_BUSY: u32 = 1 << 31;
 /// OCR bit 30 — Card Capacity Status. 1 = SDHC/SDXC, 0 = SDSC.
 pub const OCR_CCS: u32 = 1 << 30;
+/// OCR bit 24 — S18A: the card accepts a switch to 1.8 V signalling
+/// (SD Physical Layer Spec §4.2.4.1; Linux `SD_ROCR_S18A`).
+pub const OCR_S18A: u32 = 1 << 24;
+/// ACMD41 argument bit 24 — S18R: the host requests a switch to
+/// 1.8 V signalling (SD Physical Layer Spec §4.2.4.1; Linux
+/// `SD_OCR_S18R`). Same bit position as [`OCR_S18A`]; inert for
+/// cards that do not support the switch.
+pub const ACMD41_S18R: u32 = 1 << 24;
 /// OCR voltage window 3.2..3.3 V (bit 20).
 pub const OCR_3V3: u32 = 1 << 20;
 
@@ -107,6 +115,45 @@ impl R7 {
 
     pub fn matches_check(self, sent: u8) -> bool {
         self.check_pattern == sent
+    }
+}
+
+/// Decoded SCR register (SD Physical Layer Simplified Specification
+/// v4.10, Table 5-17 SCR fields / Table 5-21 supported bus widths).
+/// The 64-bit register arrives MSB-first over the data lines
+/// (ACMD51 SEND_SCR, 8-byte data block); `bytes[0]` is the most
+/// significant byte: SCR_STRUCTURE [63:60] | SD_SPEC [59:56] in
+/// `bytes[0]`, DATA_STAT_AFTER_ERASE [55] | SD_SECURITY [54:52] |
+/// SD_BUS_WIDTHS [51:48] in `bytes[1]`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Scr {
+    /// SD physical-layer spec version the card claims (SD_SPEC
+    /// field, bits [59:56]): 0 = v1.0–1.01, 1 = v1.10, 2 = v2.00,
+    /// 3 = v3.0x, 4 = v4.0x.
+    pub sd_spec: u8,
+    /// SD_BUS_WIDTHS field, bits [51:48]: bit 0 = 1-bit bus,
+    /// bit 2 = 4-bit bus.
+    pub bus_widths: u8,
+}
+
+impl Scr {
+    /// 1-bit bus supported (SD_BUS_WIDTHS bit 0).
+    pub const BUS_WIDTH_1: u8 = 1 << 0;
+    /// 4-bit bus supported (SD_BUS_WIDTHS bit 2).
+    pub const BUS_WIDTH_4: u8 = 1 << 2;
+
+    /// Parse the 8-byte SCR in wire order (byte 0 first).
+    pub fn parse(bytes: &[u8; 8]) -> Self {
+        Self {
+            sd_spec: (bytes[0] >> 4) & 0x0F,
+            bus_widths: bytes[1] & 0x0F,
+        }
+    }
+
+    /// True when the card reports a 4-bit data bus (SD_BUS_WIDTHS
+    /// bit 2) — the precondition for ACMD6 SET_BUS_WIDTH to 4-bit.
+    pub const fn supports_4bit(self) -> bool {
+        self.bus_widths & Self::BUS_WIDTH_4 != 0
     }
 }
 
@@ -235,5 +282,59 @@ impl Csd {
             }
             _ => None,
         }
+    }
+}
+
+/// Decoded CMD6 (SWITCH_FUNC) 512-bit status block (SD Physical
+/// Layer Spec §4.3.10; Linux `drivers/mmc/core/sd.c` `mmc_read_switch`
+/// / `sd_set_bus_speed_mode` lineage).
+///
+/// The 64-byte block arrives MSB-first over the data lines; byte
+/// indices below are wire order (byte 0 = status bits [511:504]):
+///
+/// - `status[13]` — Function Group 1 (access mode) support bitmask:
+///   bit 0 = SDR12, bit 1 = SDR25 / High Speed, bit 2 = SDR50,
+///   bit 3 = SDR104, bit 4 = DDR50 (Linux `SD_MODE_UHS_*`).
+/// - `status[16]` low nibble — Function Group 1 function currently
+///   selected (the value a mode-1 CMD6 switch just installed;
+///   Linux verifies `(status[16] & 0xF) == value`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SwitchStatus {
+    /// The 64-byte status block in wire order.
+    pub raw: [u8; 64],
+}
+
+// NOTE: no derived `Default` — on the pinned toolchain arrays only
+// implement `Default` up to 32 elements, so `#[derive(Default)]` on
+// the `[u8; 64]` field fails with E0277. Do not re-add it to the
+// derive; extend this manual impl instead.
+impl Default for SwitchStatus {
+    fn default() -> Self {
+        Self { raw: [0; 64] }
+    }
+}
+
+impl SwitchStatus {
+    /// Parse the 64-byte CMD6 status block in wire order.
+    pub fn parse(bytes: &[u8; 64]) -> Self {
+        Self { raw: *bytes }
+    }
+
+    /// Function Group 1 support bitmask (`status[13]`).
+    pub const fn group1_support(self) -> u8 {
+        self.raw[13]
+    }
+
+    /// Function Group 1 function currently selected
+    /// (`status[16]` low nibble).
+    pub const fn group1_function(self) -> u8 {
+        self.raw[16] & 0x0F
+    }
+
+    /// True when Function Group 1 reports support for the function
+    /// value `function` (0 = SDR12, 1 = SDR25, 2 = SDR50,
+    /// 3 = SDR104, 4 = DDR50).
+    pub const fn supports_function(self, function: u8) -> bool {
+        function < 8 && self.group1_support() & (1 << function) != 0
     }
 }

@@ -6,9 +6,16 @@ the SD Physical Layer Simplified Specification (both free from
 sdcard.org; section numbers in the source refer to them). It performs
 the full controller bring-up over the BAR0 MMIO window — software
 reset, power-on, init clock, and the CMD0/CMD8/ACMD41/CMD2/CMD3/CMD7
-identification handshake — plus single-block PIO transfers (CMD17/
-CMD24), with response and register decoding borrowed from
-`narf-drivers-storage-core` (`sd_proto`).
+identification handshake — then negotiates the data path (#837):
+25 MHz clock raise from the Capabilities base clock, 4-bit bus
+(ACMD51 SCR probe + ACMD6), and multi-block CMD18/CMD25 with
+Auto-CMD12 over SDMA/ADMA2 (coherent bounce buffer, PIO fallback),
+with response and register decoding borrowed from
+`narf-drivers-storage-core` (`sd_proto`). UHS-I (#838, stacked on
+#837) follows the bus-width step: ACMD41 S18R + CMD11 1.8 V
+signalling switch, CMD6 mode switch (SDR12/SDR25/SDR50/SDR104/DDR50),
+and CMD19 tuning with SDR25 fallback — a failed switch power-cycles
+the card and re-identifies at 3.3 V without UHS.
 
 The implementation lives in `src/sdhci.rs` (`Sdhci`, `SdCard`,
 `SdhciTransport` with its `MmioTransport`, `SdhciError`, `probe()`),
