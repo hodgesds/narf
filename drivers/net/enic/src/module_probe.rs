@@ -1,8 +1,10 @@
 //! Loadable-module registration path for enic.
 //!
 //! Registration-only: the probe thunk returns `-ENOSYS` because the device
-//! datapath ABI is not yet exported. The built-in build registers the full id
-//! table; this registers the primary id as the module-build proof. See
+//! datapath is explicitly not implemented (issue #798 — deferred out of
+//! desktop scope), not merely unexported. The built-in build registers the
+//! full id table and declines the same way via `ProbeError::NotForThisDriver`;
+//! this registers the primary id as the module-build proof. See
 //! `narf-drivers-net-e1000` for the rationale.
 
 const VENDOR: u16 = 0x1137;

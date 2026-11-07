@@ -1,9 +1,12 @@
 //! Broadcom NetXtreme-C/E NIC — dual-build (built-in or loadable `.ko`).
 //!
-//! See `narf-drivers-net-e1000` for the reference pattern. The real driver in
-//! [`bnxt`] compiles only for the built-in build; the `module` build registers
-//! through the `narf_register_pci_driver` KSYMTAB export (registration-only
-//! until the device datapath ABI lands).
+//! Explicit refusal marker, not a driver (issue #798): the bnxt datapath
+//! is deferred out of desktop scope, so [`bnxt::probe`] declines every
+//! device with `ProbeError::NotForThisDriver` and the device stays
+//! available to other claimants. See `narf-drivers-net-e1000` for the
+//! reference dual-build pattern. The `module` build registers through
+//! the `narf_register_pci_driver` KSYMTAB export; its probe thunk
+//! returns `-ENOSYS` for the same reason.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
