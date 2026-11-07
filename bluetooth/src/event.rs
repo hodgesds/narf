@@ -257,6 +257,9 @@ pub enum LeSubevent {
     /// LE Scan Request Received (§7.7.65.19).
     ScanRequestReceived = 0x13,
     ChannelSelectionAlgorithm = 0x14,
+    /// LE Periodic Advertising Sync Transfer Received [v1]
+    /// (§7.7.65.21 in Core 5.x; §7.7.65.24 in Core 6.1).
+    PeriodicAdvertisingSyncTransferReceived = 0x18,
 }
 
 impl LeSubevent {
@@ -280,6 +283,7 @@ impl LeSubevent {
             0x12 => Some(Self::AdvertisingSetTerminated),
             0x13 => Some(Self::ScanRequestReceived),
             0x14 => Some(Self::ChannelSelectionAlgorithm),
+            0x18 => Some(Self::PeriodicAdvertisingSyncTransferReceived),
             _ => None,
         }
     }
@@ -856,12 +860,11 @@ pub fn parse_num_supported_adv_sets(cc: &CommandComplete) -> Option<u8> {
     Some(cc.return_params[1])
 }
 
-// ── LE Periodic Advertising subevents (§7.7.65.14..16) ─────────────
+// ── LE Periodic Advertising subevents (§7.7.65.14..16, .21) ─────────
 //
-// Subevent 0x18 (Sync Transfer Received, §7.7.65.21) is the optional
-// remainder and is deliberately NOT decoded here; it needs its own
-// lane. Periodic advertising with responses (PAwR) is likewise out
-// of scope.
+// Subevent 0x18 is decoded below (§7.7.65.21, issue #1575).
+// Periodic advertising with responses (PAwR) — including the [v2]
+// form of the transfer event (subevent 0x26) — is out of scope.
 
 /// LE Periodic Advertising Sync Established subevent (§7.7.65.15).
 /// Subevent 0x0E.
@@ -1034,6 +1037,119 @@ impl LePeriodicAdvSyncLost {
         }
         Some(Self {
             sync_handle: u16::from_le_bytes([p[1], p[2]]),
+        })
+    }
+}
+
+/// LE Periodic Advertising Sync Transfer Received subevent [v1]
+/// (§7.7.65.21 in Core 5.x; §7.7.65.24 in Core 6.1).
+/// Subevent 0x18.
+///
+/// Layout (after the 0x3E + subevent-code bytes):
+/// ```text
+///   0:     u8  Status (0x00 = synchronised; 0x01..=0xFF =
+///               synchronisation failed, Controller Error Code)
+///   1..3:  u16 LE Connection_Handle (12 bits meaningful,
+///               0x0000..=0x0EFF) — the ACL connection the sync
+///               information arrived over
+///   3..5:  u16 LE Service_Data (peer-provided value)
+///   5..7:  u16 LE Sync_Handle (12 bits meaningful,
+///               0x0000..=0x0EFF; the Host shall ignore it when
+///               Status != 0)
+///   7:     u8  Advertising_SID (0x00..=0x0F)
+///   8:     u8  Advertiser_Address_Type (0x00 public,
+///               0x01 random, 0x02 public identity,
+///               0x03 random (static) identity)
+///   9..15: 6  Advertiser_Address (LE order)
+///   15:    u8  Advertiser_PHY (0x01 = 1M, 0x02 = 2M,
+///               0x03 = Coded)
+///   16..18: u16 LE Periodic_Advertising_Interval
+///               (0x0006..=0xFFFF, 1.25 ms units)
+///   18:    u8  Advertiser_Clock_Accuracy (0x00 = 500 ppm
+///               ... 0x07 = 20 ppm)
+/// ```
+/// 19 payload bytes (1 subevent byte + 19 = 20 params bytes).
+/// Grounded in the Core Specification text, not in the issue:
+/// the issue's expected shape omits Connection_Handle, puts
+/// Sync_Handle before Service_Data, and names a Sync_CTE_Type
+/// field — none of which the spec has for this event (there is
+/// no CTE type here; that field belongs to the Sync Established
+/// [v2] / Report events). The [v2] form of this event (subevent
+/// 0x26, Core 5.4+, four trailing PAwR bytes) is NOT decoded
+/// here — PAwR is out of scope (#1575).
+///
+/// Strict: short events, reserved SID / address-type / PHY /
+/// clock-accuracy values, an interval below 0x0006, and handles
+/// above 0x0EFF are all malformed. A failed transfer (Status
+/// != 0) still parses — the status is data for the state
+/// machine, which ignores the Sync_Handle per the spec — it is
+/// the layout that is validated here, not the outcome.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LePeriodicAdvSyncTransferReceived {
+    pub status: u8,
+    pub connection_handle: u16,
+    pub service_data: u16,
+    pub sync_handle: u16,
+    pub advertising_sid: u8,
+    pub advertiser_address_type: u8,
+    pub advertiser_address: [u8; 6],
+    pub advertiser_phy: u8,
+    pub periodic_advertising_interval: u16,
+    pub advertiser_clock_accuracy: u8,
+}
+
+impl LePeriodicAdvSyncTransferReceived {
+    pub fn parse(event: &Event) -> Option<Self> {
+        if event.code != EventCode::LeMeta as u8 {
+            return None;
+        }
+        let p = &event.params;
+        if p.is_empty() || p[0] != LeSubevent::PeriodicAdvertisingSyncTransferReceived as u8 {
+            return None;
+        }
+        // 1-byte subevent + 19-byte payload = 20 bytes.
+        if p.len() < 20 {
+            return None;
+        }
+        let connection_handle = u16::from_le_bytes([p[1], p[2]]);
+        let service_data = u16::from_le_bytes([p[3], p[4]]);
+        let sync_handle = u16::from_le_bytes([p[5], p[6]]);
+        let advertising_sid = p[7];
+        let advertiser_address_type = p[8];
+        let mut advertiser_address = [0u8; 6];
+        advertiser_address.copy_from_slice(&p[9..15]);
+        let advertiser_phy = p[15];
+        let periodic_advertising_interval = u16::from_le_bytes([p[16], p[17]]);
+        let advertiser_clock_accuracy = p[18];
+        if connection_handle > 0x0EFF || sync_handle > 0x0EFF {
+            return None;
+        }
+        if advertising_sid > 0x0F {
+            return None;
+        }
+        if advertiser_address_type > 0x03 {
+            return None;
+        }
+        if advertiser_phy != 0x01 && advertiser_phy != 0x02 && advertiser_phy != 0x03 {
+            return None;
+        }
+        if periodic_advertising_interval < 0x0006 {
+            return None;
+        }
+        if advertiser_clock_accuracy > 0x07 {
+            return None;
+        }
+        Some(Self {
+            status: p[1],
+            connection_handle,
+            service_data,
+            sync_handle,
+            advertising_sid,
+            advertiser_address_type,
+            advertiser_address,
+            advertiser_phy,
+            periodic_advertising_interval,
+            advertiser_clock_accuracy,
         })
     }
 }

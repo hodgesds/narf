@@ -423,7 +423,9 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   → Read Buffer Size → Set Event Mask). Periodic advertising
   opcodes (§7.8.61..63, §7.8.67..69) + LE Meta subevent parsers
   for Sync Established / Report / Sync Lost (§7.7.65.14..16,
-  subevents 0x0E..0x10).
+  subevents 0x0E..0x10) and Sync Transfer Received [v1]
+  (§7.7.65.21, subevent 0x18, #1575) — a transferred sync adopts
+  into `PeriodicSync` with no pending Create Sync.
 - **HCI pump** (`pump`): supervised per-controller event/ACL pump task
   composing the layers below into a running system — connection table,
   ACL flow control, raw-socket event fan-out, per-connection L2CAP
@@ -437,7 +439,9 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   Create / Cancel / Terminate (§7.8.67..69) with the
   `PeriodicSync` receiver machine (Creating → Synced → Idle on
   Sync Lost / Terminate, fragmented-report reassembly bounded at
-  251 bytes) driven by the §7.7.65.14..16 subevents.
+  251 bytes) driven by the §7.7.65.14..16 subevents, plus
+  transfer adoption from Idle on Sync Transfer Received
+  (§7.7.65.21, #1575).
 - **L2CAP** (`l2cap`): CID constants, B-frame codec, ACL fragment
   reassembler that handles the PB-flag rules from Vol 4 Part E §5.4.2,
   signalling-command codec + iterator, dynamic CID allocator, LE
