@@ -116,26 +116,6 @@ impl I40eNic {
     pub fn link_up(&self) -> bool {
         self.link_status().link_up
     }
-    /// Suspend this PF for system suspend (issue #793): quiesce
-    /// the hardware via [`super::Hardware::suspend`] and publish
-    /// link down. The queue/TX pumps idle on the `suspended` gate
-    /// until resume.
-    pub fn suspend(&self) -> Result<(), I40eError> {
-        let (hw, _) = self.lease().ok_or(I40eError::DeviceFailed)?;
-        hw.suspend()?;
-        crate::publish::publish_link(self.ifname(), crate::publish::LinkSample::DOWN);
-        Ok(())
-    }
-    /// Resume a suspended PF (issue #793): re-enable the hardware
-    /// via [`super::Hardware::resume`] and republish link from the
-    /// cached status sample — the ARQ pump refreshes it from
-    /// link-status events once interrupts re-arm.
-    pub fn resume(&self) -> Result<(), I40eError> {
-        let (hw, _) = self.lease().ok_or(I40eError::DeviceFailed)?;
-        hw.resume()?;
-        crate::publish::publish_link(self.ifname(), link_sample(hw.link_status()));
-        Ok(())
-    }
     /// Programmed MTU (issue #802): the hardware's, when leased,
     /// else the 1500 default (no hardware generation is published
     /// yet, or recovery is mid-rebuild).
@@ -218,30 +198,38 @@ impl I40eNic {
         Ok(())
     }
 
-    /// Suspend the PF for system sleep (Linux `i40e_io_suspend`
-    /// order): when WoL is enabled and the board record reports
-    /// the `WOL_MC_MAGIC_PKT_WAKE` capability, program the
-    /// firmware magic-wake filters, then write the PFPM arming
-    /// words — which happen regardless of the AQ outcome, as in
-    /// Linux — and publish link down. Idempotent: a second
-    /// suspend is a no-op. The PCI PME enable is the platform
-    /// power layer's job (`narf_bus::pci_pme`); this programs
-    /// only the device-side wake filtering. A failed
-    /// magic-wake AQ command is reported (Linux ignores it) but
-    /// does not stop the PFPM arming.
+    /// Suspend this PF for system suspend (issues #792, #793):
+    /// quiesce the hardware via [`super::Hardware::suspend`]
+    /// (mask interrupts, disable every LAN queue via the `pm`
+    /// plan, gate the hardware datapath), then program the
+    /// firmware magic-wake filters when WoL is enabled and the
+    /// board record reports the `WOL_MC_MAGIC_PKT_WAKE`
+    /// capability, and write the PFPM arming words — which happen
+    /// regardless of the AQ outcome, as in Linux — and publish
+    /// link down. The queue/TX pumps idle on the `suspended`
+    /// gate until resume. Idempotent: a second suspend is a
+    /// no-op. The PCI PME enable is the platform power layer's
+    /// job (`narf_bus::pci_pme`); this programs only the
+    /// device-side wake filtering. A failed magic-wake AQ command
+    /// is reported (Linux ignores it) but does not stop the PFPM
+    /// arming.
     ///
     /// Deviation from Linux, documented: Linux's suspend also
     /// tears the queues down (`i40e_prep_for_reset`) and its
     /// resume rebuilds the PF (`i40e_reset_and_rebuild`). NARF
-    /// suspend leaves the queues programmed and resume only
-    /// clears the arming; a rebuild-on-resume goes through the
-    /// existing recovery path and is follow-up work (see the PR
-    /// body).
+    /// suspend quiesces the queues via the `pm` plan instead of
+    /// a reset, and resume re-enables them through the same plan;
+    /// a rebuild-on-resume goes through the existing recovery
+    /// path and is follow-up work (see the PR body).
     pub fn suspend(&self) -> Result<(), I40eError> {
         let (hw, _) = self.lease().ok_or(I40eError::DeviceFailed)?;
         if self.suspended.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        // Issue #793: quiesce the hardware first — mask interrupts
+        // and disable every LAN queue via the `pm` plan, and gate
+        // the hardware datapath.
+        hw.suspend()?;
         let (enabled, mc_magic) = {
             let state = self.wol.lock();
             (state.enabled, state.board.mc_magic_wake)
@@ -257,20 +245,26 @@ impl I40eNic {
         aq_err
     }
 
-    /// Resume a suspended PF: clear the PFPM arming words and the
-    /// datapath gate, and republish link. Resuming a running PF is
-    /// a no-op. The gate is cleared even when the hardware lease
-    /// fails, so a failed device never wedges the datapath after
-    /// recovery. See [`Self::suspend`] for the documented
-    /// deviation from Linux's rebuild-on-resume.
+    /// Resume a suspended PF (issues #792, #793): re-enable the
+    /// hardware via [`super::Hardware::resume`] (re-enable every
+    /// LAN queue and re-arm interrupts via the `pm` plan), clear
+    /// the PFPM arming words and the datapath gate, and republish
+    /// link from the cached status sample — the ARQ pump refreshes
+    /// it from link-status events once interrupts re-arm.
+    /// Resuming a running PF is a no-op. The gate is cleared even
+    /// when the hardware lease fails, so a failed device never
+    /// wedges the datapath after recovery. See [`Self::suspend`]
+    /// for the documented deviation from Linux's
+    /// rebuild-on-resume.
     pub fn resume(&self) -> Result<(), I40eError> {
         if !self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
         let result = match self.lease() {
             Some((hw, _)) => {
+                let result = hw.resume();
                 hw.set_wol_pfpm(false);
-                Ok(())
+                result
             }
             None => Err(I40eError::DeviceFailed),
         };
