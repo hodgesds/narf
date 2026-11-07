@@ -501,10 +501,18 @@ pub struct ForcedethNic {
     wol_enabled: AtomicBool,
     /// True while the device is suspended (datapath gate).
     suspended: AtomicBool,
+    /// PCI address of the function this instance drives. Probe
+    /// refuses a second bind of the same address (issue #795): two
+    /// `ForcedethNic`s for one chip would drive one set of rings.
+    pub addr: narf_bus::BusAddr,
+    /// Interface name `publish_netdev_with_context` assigned this
+    /// instance (`eth%d`). Per-instance (i40e/igc pattern): the old
+    /// module-level `FORCEDETH_IFNAME` static could only name one NIC.
+    ifname: crate::publish::IfName,
 
     // IPC integration
-    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
-    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
 // SAFETY: The only non-Send/Sync members are the raw MMIO/DMA pointers
@@ -541,7 +549,7 @@ impl ForcedethNic {
     pub unsafe fn bring_up(
         device: &BusDevice,
         _cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<Self, NicError> {
+    ) -> Result<Arc<Self>, NicError> {
         // forcedeth.c §"start_nic": the chip lays operational
         // registers in BAR0, and the BAR is wired straight into MMIO
         // — there's no I/O alias to skip.
@@ -787,6 +795,8 @@ impl ForcedethNic {
             txrxctl_bits,
             wol_enabled: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
+            addr: device.addr,
+            ifname: crate::publish::IfName::new(),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
@@ -795,7 +805,13 @@ impl ForcedethNic {
         // pair fed here is the pair whose halves occupy the ring slots.
         spawn_pumps(nic.clone(), rx_prod, tx_cons);
 
-        Arc::try_unwrap(nic).map_err(|_| NicError::NoMemory)
+        // Return the `Arc` directly: unwrapping it back to `Self`
+        // (the old `Arc::try_unwrap` tail) always failed — the pump
+        // tasks above hold clones, so the refcount is above 1 and
+        // probe could never bind even the first NIC. e1000's
+        // bring_up documents the same trap (e1000.rs, bring_up
+        // step 9 comment).
+        Ok(nic)
     }
 
     /// Transmit a single Ethernet frame, polled. Frame must be in
@@ -1412,33 +1428,47 @@ fn mii_rw(mmio: &MmioRegion, addr: u8, reg: u32, value: Option<u32>) -> Result<u
     Ok(unsafe { mmio.read32(REG_MII_DATA) })
 }
 
-// ── Driver-match registration ───────────────────────────────────────
-
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<ForcedethNic>>> = IrqSafeSpinLock::new(None);
-
-/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
-/// `dev_alloc_name`). Set once at probe; the device lives as long as
-/// the kernel, so the name is leaked into a `&'static str`.
-static FORCEDETH_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
-
-/// This NIC's interface name; empty until it has registered.
-pub fn forcedeth_ifname() -> &'static str {
-    FORCEDETH_IFNAME.get()
+impl ForcedethNic {
+    /// This instance's published interface name (`eth%d`), or `""`
+    /// before probe publishes it. Per-instance state (i40e/igc
+    /// pattern); the pumps and the registry adapter read the name
+    /// off the device they serve, never a module-level static.
+    pub fn ifname(&self) -> &'static str {
+        self.ifname.get()
+    }
 }
 
-/// SendFn registered with `narf_net::iface` at probe time. Routes the
-/// kernel-side TCP stack's outbound frames through
-/// `ForcedethNic::transmit`. The Arc is cloned out rather than holding
-/// the IRQ-masking CONTROLLER lock across `transmit` (same reasoning
+// ── Driver-match registration ───────────────────────────────────────
+
+/// Every probed controller, by probe order. The index is the cookie
+/// the kernel-side stack's send path resolves through
+/// [`forcedeth_send_frame`] — the i40e `CONTROLLERS` pattern, so a
+/// second nForce NIC on the same machine probes, binds, and carries
+/// traffic instead of being dropped by a singleton slot (issue
+/// #795). The vec never shrinks, so a live controller's cookie
+/// stays valid for the kernel lifetime.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<ForcedethNic>>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// `SendCtxFn` registered with `narf_net::iface` at probe time. Routes
+/// the kernel-side TCP stack's outbound frames through
+/// `ForcedethNic::transmit`; the cookie is the controller's index in
+/// `CONTROLLERS`. The `Arc` is cloned out rather than holding the
+/// IRQ-masking `CONTROLLERS` lock across `transmit` (same reasoning
 /// as e1000's send path).
-fn forcedeth_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+fn forcedeth_send_frame(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = controller(cookie as usize).ok_or(())?;
     ctrl.transmit(frame, &meta).map_err(|_| ())
 }
 
-/// Probe entry — installed via `bus::register_pci_driver`. Idempotent.
+/// Probe entry — installed via `bus::register_pci_driver`. A second
+/// probe of the SAME function is a no-op success (the old idempotent
+/// behaviour): the bus re-walks devices, and rebuilding a second
+/// `ForcedethNic` for the same silicon would let two instances drive
+/// one chip's rings. A second FUNCTION binds as a new instance
+/// instead of being dropped (issue #795).
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    if CONTROLLERS.lock().iter().any(|c| c.addr == device.addr) {
         return Ok(());
     }
     // MEM_SPACE + BUS_MASTER: BAR0 maps the operational registers,
@@ -1461,11 +1491,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // satisfied.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let nic = match unsafe { ForcedethNic::bring_up(&device, &cap) } {
-        Ok(d) => Arc::new(d),
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
-    *CONTROLLER.lock() = Some(nic.clone());
+    // Retain before any ring DMA address reaches the device; the
+    // index is this instance's send-path cookie (see `CONTROLLERS`).
+    let index = {
+        let mut g = CONTROLLERS.lock();
+        g.push(nic.clone());
+        g.len() - 1
+    };
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
@@ -1476,18 +1512,20 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
 
     // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
-    // name + carrier metadata via the shared helper. This wires the
-    // LinkChg re-evaluation the bring-up comment deferred: the
-    // datapath's interrupts are masked in this stage, so the polled
-    // RX pump (spawned by `bring_up`) is the observer that republishes
-    // on a transition (issue #791). The frame-ring registration below
-    // stays.
-    let name = crate::publish::publish_netdev(
+    // name + carrier metadata via the shared helper, keyed by the
+    // `CONTROLLERS` index so each port's send path resolves to its
+    // own NIC (i40e pattern). This wires the LinkChg re-evaluation
+    // the bring-up comment deferred: the datapath's interrupts are
+    // masked in this stage, so the polled RX pump (spawned by
+    // `bring_up`) is the observer that republishes on a transition
+    // (issue #791). The frame-ring registration below stays.
+    let name = crate::publish::publish_netdev_with_context(
         nic.mac,
+        index as u64,
         forcedeth_send_frame,
         crate::publish::LinkSample::carrier_only(nic.live_link_up()),
     );
-    FORCEDETH_IFNAME.set(name);
+    nic.ifname.set(name);
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -1495,7 +1533,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(&auth, ForcedethHwNic);
+        let _ = narf_net::registry().register(
+            &auth,
+            ForcedethHwNic {
+                nic: nic.clone(),
+                name: "eth6",
+            },
+        );
     }
 
     // No pump spawn here: `bring_up` spawned the device's single RX/TX
@@ -1539,7 +1583,7 @@ async fn forcedeth_rx_pump(device: Arc<ForcedethNic>, mut rx_prod: Producer<Fram
         if up != last_up {
             last_up = up;
             crate::publish::publish_link(
-                forcedeth_ifname(),
+                device.ifname(),
                 crate::publish::LinkSample::carrier_only(up),
             );
         }
@@ -1554,7 +1598,7 @@ async fn forcedeth_rx_pump(device: Arc<ForcedethNic>, mut rx_prod: Producer<Fram
             // the kernel stack in place. The mirror is non-blocking —
             // a full/closed ring drops its copy, never the stack's
             // packet.
-            let name = forcedeth_ifname();
+            let name = device.ifname();
             crate::publish::dispatch_rx(
                 name,
                 &mut frame,
@@ -1629,76 +1673,74 @@ fn name_for(did: u16) -> &'static str {
     }
 }
 
-/// `true` once `probe` has installed a controller.
+/// One probed port, as the net stack sees it.
+///
+/// This owns its `Arc<ForcedethNic>` rather than looking the
+/// controller up in a module-level static. That is what makes
+/// multiple ports work: `Interface::rx_ring` / `tx_ring` return
+/// references borrowed from `&self`, so an interface with no storage
+/// of its own has to hand back a `static` — and every instance would
+/// then share one pair of rings, with the second port's frames
+/// landing in the first port's queue (i40e's `I40eNicIface`
+/// pattern).
 #[derive(Debug)]
-pub struct ForcedethHwNic;
+pub struct ForcedethHwNic {
+    /// This port's controller; the rings are borrowed out of it.
+    nic: Arc<ForcedethNic>,
+    /// Pre-publish fallback name, used by [`narf_net::Interface::name`]
+    /// before probe publishes the dynamic `eth%d` name.
+    name: &'static str,
+}
 
 impl narf_net::Interface for ForcedethHwNic {
     fn name(&self) -> &str {
         // The dynamic `eth%d` name once published (issue #784); the
         // old frame-ring name before probe gets that far.
-        let n = forcedeth_ifname();
+        let n = self.nic.ifname();
         if n.is_empty() {
-            "eth6"
+            self.name
         } else {
             n
         }
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up).unwrap_or(false)
+        self.nic.link_up
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-                if r.is_some() {
-                    // Ring consumer attached: enable the RX mirror
-                    // (e1000's `rx_mirror_enabled` moment).
-                    crate::publish::note_rx_mirror_attached(forcedeth_ifname());
-                }
-            }
-        });
-        &RING
+        // Ring consumer attached: enable the RX mirror (e1000's
+        // `rx_mirror_enabled` moment), keyed by this port's own
+        // published name.
+        crate::publish::note_rx_mirror_attached(self.nic.ifname());
+        &self.nic.rx_ipc_ring
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.nic.tx_ipc_ring
     }
 }
 
 impl crate::HwNic for ForcedethHwNic {
     fn name(&self) -> &'static str {
-        let n = forcedeth_ifname();
+        let n = self.nic.ifname();
         if n.is_empty() {
-            "eth6"
+            self.name
         } else {
             n
         }
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up).unwrap_or(false)
+        self.nic.link_up
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::NvidiaForcedeth
@@ -1710,49 +1752,42 @@ impl crate::HwNic for ForcedethHwNic {
         RING_LEN
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-                if r.is_some() {
-                    // Ring consumer attached: enable the RX mirror
-                    // (e1000's `rx_mirror_enabled` moment).
-                    crate::publish::note_rx_mirror_attached(forcedeth_ifname());
-                }
-            }
-        });
-        &RING
+        <Self as narf_net::Interface>::rx_ring(self)
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        <Self as narf_net::Interface>::tx_ring(self)
     }
 }
 
-pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+/// Number of probed controllers (issue #795).
+pub fn instance_count() -> usize {
+    CONTROLLERS.lock().len()
 }
 
-/// Test-side accessor: run `f` against the probed controller.
-pub fn with_controller<R>(f: impl FnOnce(&ForcedethNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(|a| f(a))
+/// `true` once at least one controller has been probed.
+pub fn is_probed() -> bool {
+    !CONTROLLERS.lock().is_empty()
+}
+
+/// The probed controller at `index`, if it exists. The index is the
+/// cookie probe assigned (see `CONTROLLERS`); it is stable for the
+/// kernel lifetime because the vec never shrinks.
+pub fn controller(index: usize) -> Option<Arc<ForcedethNic>> {
+    CONTROLLERS.lock().get(index).cloned()
+}
+
+/// Test-side accessor: run `f` against the probed controller at
+/// `index` (i40e shape).
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&ForcedethNic) -> R) -> Option<R> {
+    CONTROLLERS.lock().get(index).map(|a| f(a))
 }
 
 /// Mutable accessor — used by tests that need to drive PHY state
 /// refresh.
-pub fn with_controller_mut<R>(f: impl FnOnce(&mut ForcedethNic) -> R) -> Option<R> {
-    CONTROLLER
+pub fn with_controller_mut<R>(index: usize, f: impl FnOnce(&mut ForcedethNic) -> R) -> Option<R> {
+    CONTROLLERS
         .lock()
-        .as_mut()
+        .get_mut(index)
         .map(|a| f(Arc::get_mut(a).expect("ForcedethNic static has multiple owners")))
 }
 
@@ -1804,6 +1839,117 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/forcedeth", smoke_forcedeth_pci_match_table);
+
+    /// Same shape as `smoke_e1000_multi_instance_cookie_dispatch` in
+    /// `drivers/net/src/tests.rs` (see its doc comment): one live
+    /// instance at cookie 0, no instance at cookie 1, published iface
+    /// resolves by name, `send_on` dispatches through cookie 0,
+    /// re-probe keeps the same `Arc`, and the registry adapter borrows
+    /// the NIC's own rings. The QEMU test VM has no nForce NIC, so
+    /// only the no-silicon branch runs in CI; the live branch runs on
+    /// real hardware. This also pins the `bring_up` fix: before #795
+    /// the probe always failed here because `Arc::try_unwrap` could
+    /// never succeed once the pump tasks held clones — `is_probed()`
+    /// after probe would have been false.
+    fn smoke_forcedeth_multi_instance_cookie_dispatch() -> TestResult {
+        use narf_bus::driver_match::__reset_for_test;
+        use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+        use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+        // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window the test harness
+        // maps before running; `init` only walks that ECAM region and is safe to
+        // call repeatedly (idempotent on re-entry).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+        let devs = devices();
+        let has_fe = devs.iter().any(|d| {
+            matches!(&d.kind, BusKind::Pcie { .. })
+                && d.id.vendor == NV_VENDOR
+                && SUPPORTED_DEVICE_IDS.contains(&d.id.device)
+        });
+        if !has_fe {
+            if instance_count() != 0 {
+                return TestResult::Fail("instance_count != 0 with no forcedeth silicon");
+            }
+            if controller(0).is_some() {
+                return TestResult::Fail("controller(0) Some with no forcedeth silicon");
+            }
+            if is_probed() {
+                return TestResult::Fail("is_probed with no forcedeth silicon");
+            }
+            let frame = [0u8; 64];
+            if narf_net::iface::send_on("eth999", &frame).is_ok() {
+                return TestResult::Fail("send_on resolved a nonexistent iface");
+            }
+            return TestResult::Pass;
+        }
+        __reset_for_test();
+        register_pci_driver();
+        let authority = bootstrap_registry_authority();
+        if probe_all_pci(&authority).is_err() {
+            return TestResult::Fail("probe_all_pci");
+        }
+        if !is_probed() {
+            return TestResult::Fail("forcedeth not probed");
+        }
+        if instance_count() != 1 {
+            return TestResult::Fail("instance_count != 1 after single-NIC probe");
+        }
+        let ctrl = match controller(0) {
+            Some(c) => c,
+            None => return TestResult::Fail("controller(0) None after probe"),
+        };
+        if controller(1).is_some() {
+            return TestResult::Fail("controller(1) Some with one NIC");
+        }
+        if controller(usize::MAX).is_some() {
+            return TestResult::Fail("controller(MAX) Some");
+        }
+        let name = ctrl.ifname();
+        if name.is_empty() {
+            return TestResult::Fail("published name empty after probe");
+        }
+        if narf_net::iface::lookup(name).is_none() {
+            return TestResult::Fail("iface not published under its name");
+        }
+        let mut frame = [0u8; 64];
+        frame[..6].fill(0xFF);
+        frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+        frame[12] = 0xFF;
+        frame[13] = 0xFF;
+        if narf_net::iface::send_on(name, &frame).is_err() {
+            return TestResult::Fail("send_on cookie-0 TX failed");
+        }
+        let authority = bootstrap_registry_authority();
+        let _ = probe_all_pci(&authority);
+        let after = match controller(0) {
+            Some(c) => c,
+            None => return TestResult::Fail("controller(0) vanished across re-probe"),
+        };
+        if Arc::as_ptr(&after) != Arc::as_ptr(&ctrl) {
+            return TestResult::Fail("re-probe replaced controller(0)");
+        }
+        let ring_ptr =
+            narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+        if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
+            return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
+        }
+        if ctrl.rx_ipc_ring.lock().is_none() {
+            return TestResult::Fail("attach took the NIC's RX ring");
+        }
+        let tx_ptr =
+            narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+        if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
+            return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
+        }
+        if ctrl.tx_ipc_ring.lock().is_none() {
+            return TestResult::Fail("attach took the NIC's TX ring");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/forcedeth",
+        smoke_forcedeth_multi_instance_cookie_dispatch
+    );
 
     fn smoke_forcedeth_txrxctl_desc_encodings_match_linux() -> TestResult {
         // Cross-check our DESC_VER encodings against Linux's

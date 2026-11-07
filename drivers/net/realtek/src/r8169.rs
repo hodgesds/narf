@@ -412,10 +412,18 @@ pub struct RtlNic {
     /// Live MSI-X table — kept alive so the device's MSI-X enable
     /// stays sticky.
     msix: Option<narf_bus::MsixTable>,
+    /// PCI address of the function this instance drives. Probe
+    /// refuses a second bind of the same address (issue #795): two
+    /// `RtlNic`s for one chip would drive one set of rings.
+    pub addr: narf_bus::BusAddr,
+    /// Interface name `publish_netdev_with_context` assigned this
+    /// instance (`eth%d`). Per-instance (i40e/igc pattern): the old
+    /// module-level `R8169_IFNAME` static could only name one NIC.
+    ifname: crate::publish::IfName,
 
     // IPC integration
-    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
-    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
 // SAFETY: `RtlNic` is only `!Send` because of the raw MMIO/DMA pointers it
@@ -449,7 +457,7 @@ impl RtlNic {
     pub unsafe fn bring_up(
         device: &BusDevice,
         _cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<Self, NicError> {
+    ) -> Result<Arc<Self>, NicError> {
         // RTL8168 lays its operational registers in BAR2 (MMIO);
         // BAR0 is the legacy I/O alias. We always take the MMIO BAR.
         // SAFETY: caller-asserted exclusive ownership.
@@ -686,6 +694,8 @@ impl RtlNic {
             link_up,
             irq_vector: None,
             msix: None,
+            addr: device.addr,
+            ifname: crate::publish::IfName::new(),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
@@ -694,7 +704,13 @@ impl RtlNic {
         // pair fed here is the pair whose halves occupy the ring slots.
         spawn_pumps(rtl.clone(), rx_prod, tx_cons);
 
-        Arc::try_unwrap(rtl).map_err(|_| NicError::NoMemory)
+        // Return the `Arc` directly: unwrapping it back to `Self`
+        // (the old `Arc::try_unwrap` tail) always failed — the pump
+        // tasks above hold clones, so the refcount is above 1 and
+        // probe could never bind even the first NIC. e1000's
+        // bring_up documents the same trap (e1000.rs, bring_up
+        // step 9 comment).
+        Ok(rtl)
     }
 
     /// Bring up MSI-X with a single vector. Wires MSI-X table entry 0
@@ -1452,26 +1468,36 @@ impl RtlNic {
     }
 }
 
-// ── Driver-match registration ────────────────────────────────────────
-
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<RtlNic>>> = IrqSafeSpinLock::new(None);
-
-/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
-/// `dev_alloc_name`). Set once at probe; the device lives as long as
-/// the kernel, so the name is leaked into a `&'static str`.
-static R8169_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
-
-/// This NIC's interface name; empty until it has registered.
-pub fn r8169_ifname() -> &'static str {
-    R8169_IFNAME.get()
+impl RtlNic {
+    /// This instance's published interface name (`eth%d`), or `""`
+    /// before probe publishes it. Per-instance state (i40e/igc
+    /// pattern); the pumps and the registry adapter read the name
+    /// off the device they serve, never a module-level static.
+    pub fn ifname(&self) -> &'static str {
+        self.ifname.get()
+    }
 }
 
-/// SendFn registered with `narf_net::iface` at probe time. Routes the
-/// kernel-side TCP stack's outbound frames through `RtlNic::transmit`.
-/// The Arc is cloned out rather than holding the IRQ-masking
-/// CONTROLLER lock across `transmit` (same reasoning as e1000).
-fn r8169_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+// ── Driver-match registration ────────────────────────────────────────
+
+/// Every probed controller, by probe order. The index is the cookie
+/// the kernel-side stack's send path resolves through
+/// [`r8169_send_frame`] — the i40e `CONTROLLERS` pattern, so a
+/// second RTL8168 on the same machine probes, binds, and carries
+/// traffic instead of being dropped by a singleton slot (issue
+/// #795). The vec never shrinks, so a live controller's cookie
+/// stays valid for the kernel lifetime.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<RtlNic>>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// `SendCtxFn` registered with `narf_net::iface` at probe time. Routes
+/// the kernel-side TCP stack's outbound frames through
+/// `RtlNic::transmit`; the cookie is the controller's index in
+/// `CONTROLLERS`. The `Arc` is cloned out rather than holding the
+/// IRQ-masking `CONTROLLERS` lock across `transmit` (same reasoning
+/// as e1000's send path).
+fn r8169_send_frame(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = controller(cookie as usize).ok_or(())?;
     ctrl.transmit(frame, &meta).map_err(|_| ())
 }
 
@@ -1504,10 +1530,14 @@ fn r8169_link_sample(status: u8) -> crate::publish::LinkSample {
     }
 }
 
-/// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
-/// returns `Ok(())` when the controller is already brought up.
+/// Probe entry — installed via `bus::register_pci_driver`. A second
+/// probe of the SAME function is a no-op success (the old idempotent
+/// behaviour): the bus re-walks devices, and rebuilding a second
+/// `RtlNic` for the same silicon would let two instances drive one
+/// chip's rings. A second FUNCTION binds as a new instance instead
+/// of being dropped (issue #795).
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    if CONTROLLERS.lock().iter().any(|c| c.addr == device.addr) {
         return Ok(());
     }
     // MEM_SPACE + BUS_MASTER are both required: the chip DMAs the
@@ -1530,11 +1560,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // performs are valid.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = match unsafe { RtlNic::bring_up(&device, &cap) } {
-        Ok(d) => Arc::new(d),
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
-    *CONTROLLER.lock() = Some(dev.clone());
+    // Retain before any ring DMA address reaches the device; the
+    // index is this instance's send-path cookie (see `CONTROLLERS`).
+    let index = {
+        let mut g = CONTROLLERS.lock();
+        g.push(dev.clone());
+        g.len() - 1
+    };
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("r8169"),
@@ -1545,12 +1581,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
 
     // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
-    // name + carrier metadata via the shared helper. The frame-ring
-    // registration below stays.
-    let mac = with_controller(|c| c.mac).unwrap_or([0; 6]);
-    let status = with_controller(|c| c.phy_status()).unwrap_or(0);
-    let name = crate::publish::publish_netdev(mac, r8169_send_frame, r8169_link_sample(status));
-    R8169_IFNAME.set(name);
+    // name + carrier metadata via the shared helper, keyed by the
+    // `CONTROLLERS` index so each port's send path resolves to its
+    // own NIC (i40e pattern). The frame-ring registration below stays.
+    let mac = dev.mac;
+    let status = dev.phy_status();
+    let name = crate::publish::publish_netdev_with_context(
+        mac,
+        index as u64,
+        r8169_send_frame,
+        r8169_link_sample(status),
+    );
+    dev.ifname.set(name);
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -1558,7 +1600,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(&auth, Rtl8168Nic);
+        let _ = narf_net::registry().register(
+            &auth,
+            Rtl8168Nic {
+                nic: dev.clone(),
+                name: "eth3",
+            },
+        );
     }
 
     // Runtime MTU switch (#1276): install the DeviceControl hook
@@ -1569,8 +1617,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // before, so the stack ran software offload even at MTU
     // 1500 despite the driver's claimed Interface::offloads —
     // bind now publishes what the driver already claimed.
-    if let Some(ctrl) = CONTROLLER.lock().clone() {
-        let name = r8169_ifname();
+    if let Some(ctrl) = controller(index) {
+        let name = ctrl.ifname();
         let _ = narf_net::iface::set_device_control(
             name,
             Arc::new(RtlMtuControl {
@@ -1633,7 +1681,7 @@ async fn r8169_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RING
         let sample = r8169_link_sample(device.phy_status());
         if sample != last_sample {
             last_sample = sample;
-            crate::publish::publish_link(r8169_ifname(), sample);
+            crate::publish::publish_link(device.ifname(), sample);
         }
         if let Some((pkt, csum)) = device.receive_with_meta() {
             let dma_buf =
@@ -1655,7 +1703,7 @@ async fn r8169_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RING
             // the kernel stack in place. The mirror is non-blocking —
             // a full/closed ring drops its copy, never the stack's
             // packet.
-            let name = r8169_ifname();
+            let name = device.ifname();
             crate::publish::dispatch_rx(
                 name,
                 &mut frame,
@@ -1701,9 +1749,23 @@ pub fn register_pci_driver() {
     });
 }
 
-/// `true` once `probe` has installed a controller.
+/// One probed port, as the net stack sees it.
+///
+/// This owns its `Arc<RtlNic>` rather than looking the controller up
+/// in a module-level static. That is what makes multiple ports work:
+/// `Interface::rx_ring` / `tx_ring` return references borrowed from
+/// `&self`, so an interface with no storage of its own has to hand
+/// back a `static` — and every instance would then share one pair of
+/// rings, with the second port's frames landing in the first port's
+/// queue (i40e's `I40eNicIface` pattern).
 #[derive(Debug)]
-pub struct Rtl8168Nic;
+pub struct Rtl8168Nic {
+    /// This port's controller; the rings are borrowed out of it.
+    nic: Arc<RtlNic>,
+    /// Pre-publish fallback name, used by [`narf_net::Interface::name`]
+    /// before probe publishes the dynamic `eth%d` name.
+    name: &'static str,
+}
 
 /// `OffloadCapabilities` matching a validated MTU program: TX
 /// checksum + TSO follow the program; RX checksum and VLAN
@@ -1718,21 +1780,16 @@ fn offloads_for_program(program: crate::features::MtuProgram) -> narf_net::Offlo
     }
 }
 
-/// Current (TX checksum, TSO) advertisement derived from the
-/// programmed MTU (Linux `rtl8169_fix_features` rules, via
-/// `features::mtu_transition`). Pre-probe fallback is the full
-/// static advertisement, matching the old literals; a stored
-/// MTU that somehow fails validation withdraws TX offload
-/// (fail-closed — unreachable, since the hook only stores
-/// validated values).
-fn current_tx_offloads() -> (bool, bool) {
-    with_controller(|c| {
-        let mtu = *c.mtu.lock();
-        crate::features::mtu_transition(c.mac_version, mtu)
-            .map(|p| (p.tx_checksum, p.tso))
-            .unwrap_or((false, false))
-    })
-    .unwrap_or((true, true))
+/// Current (TX checksum, TSO) advertisement for `nic`, derived from
+/// its programmed MTU (Linux `rtl8169_fix_features` rules, via
+/// `features::mtu_transition`). A stored MTU that somehow fails
+/// validation withdraws TX offload (fail-closed — unreachable, since
+/// the hook only stores validated values).
+fn current_tx_offloads(nic: &RtlNic) -> (bool, bool) {
+    let mtu = *nic.mtu.lock();
+    crate::features::mtu_transition(nic.mac_version, mtu)
+        .map(|p| (p.tx_checksum, p.tso))
+        .unwrap_or((false, false))
 }
 
 /// Linux `EINVAL` for a rejected MTU (see `netlink_route.rs`).
@@ -1773,21 +1830,21 @@ impl narf_net::Interface for Rtl8168Nic {
     fn name(&self) -> &str {
         // The dynamic `eth%d` name once published (issue #784); the
         // old frame-ring name before probe gets that far.
-        let n = r8169_ifname();
+        let n = self.nic.ifname();
         if n.is_empty() {
-            "eth3"
+            self.name
         } else {
             n
         }
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
-        with_controller(|c| *c.mtu.lock()).unwrap_or(1500)
+        *self.nic.mtu.lock()
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up).unwrap_or(false)
+        self.nic.link_up
     }
     fn offloads(&self) -> narf_net::OffloadCapabilities {
         // The TSO byte cap is the TX slot buffer: a TSO packet is
@@ -1797,76 +1854,51 @@ impl narf_net::Interface for Rtl8168Nic {
         // follows the same version rule.) TX offload follows the
         // programmed MTU (#1276); RX checksum + VLAN insertion
         // are never withdrawn by the fix_features rules.
-        with_controller(|c| {
-            let mtu = *c.mtu.lock();
-            crate::features::mtu_transition(c.mac_version, mtu)
-                .map(offloads_for_program)
-                .unwrap_or(narf_net::OffloadCapabilities {
-                    tx_checksum: false,
-                    rx_checksum: true,
-                    max_tso_bytes: 0,
-                    vlan_insert: true,
-                })
-        })
-        .unwrap_or(narf_net::OffloadCapabilities {
-            tx_checksum: true,
-            rx_checksum: true,
-            max_tso_bytes: TX_BUF_LEN as u32,
-            vlan_insert: true,
-        })
+        let mtu = *self.nic.mtu.lock();
+        crate::features::mtu_transition(self.nic.mac_version, mtu)
+            .map(offloads_for_program)
+            .unwrap_or(narf_net::OffloadCapabilities {
+                tx_checksum: false,
+                rx_checksum: true,
+                max_tso_bytes: 0,
+                vlan_insert: true,
+            })
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-                if r.is_some() {
-                    // Ring consumer attached: enable the RX mirror
-                    // (e1000's `rx_mirror_enabled` moment).
-                    crate::publish::note_rx_mirror_attached(r8169_ifname());
-                }
-            }
-        });
-        &RING
+        // Ring consumer attached: enable the RX mirror (e1000's
+        // `rx_mirror_enabled` moment), keyed by this port's own
+        // published name.
+        crate::publish::note_rx_mirror_attached(self.nic.ifname());
+        &self.nic.rx_ipc_ring
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.nic.tx_ipc_ring
     }
 }
 
 impl crate::HwNic for Rtl8168Nic {
     fn name(&self) -> &'static str {
-        let n = r8169_ifname();
+        let n = self.nic.ifname();
         if n.is_empty() {
-            "eth3"
+            self.name
         } else {
             n
         }
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
-        with_controller(|c| *c.mtu.lock()).unwrap_or(1500)
+        *self.nic.mtu.lock()
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up).unwrap_or(false)
+        self.nic.link_up
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::RealtekRtl8168
     }
     fn caps(&self) -> crate::NicCaps {
-        let (tx_checksum, tso) = current_tx_offloads();
+        let (tx_checksum, tso) = current_tx_offloads(&self.nic);
         let mut caps = crate::NicCaps::RX_CSUM | crate::NicCaps::VLAN_TAGGING;
         if tx_checksum {
             caps = caps | crate::NicCaps::TX_CSUM;
@@ -1895,21 +1927,35 @@ fn max_tagged_frame(version: Option<u32>) -> u32 {
     crate::features::frame_for_mtu(crate::features::jumbo_max_mtu(ver)) + 4
 }
 
-pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+/// Number of probed controllers (issue #795).
+pub fn instance_count() -> usize {
+    CONTROLLERS.lock().len()
 }
 
-/// Test-side accessor: run `f` against the probed controller.
-pub fn with_controller<R>(f: impl FnOnce(&RtlNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(|a| f(a))
+/// `true` once at least one controller has been probed.
+pub fn is_probed() -> bool {
+    !CONTROLLERS.lock().is_empty()
+}
+
+/// The probed controller at `index`, if it exists. The index is the
+/// cookie probe assigned (see `CONTROLLERS`); it is stable for the
+/// kernel lifetime because the vec never shrinks.
+pub fn controller(index: usize) -> Option<Arc<RtlNic>> {
+    CONTROLLERS.lock().get(index).cloned()
+}
+
+/// Test-side accessor: run `f` against the probed controller at
+/// `index` (i40e shape).
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&RtlNic) -> R) -> Option<R> {
+    CONTROLLERS.lock().get(index).map(|a| f(a))
 }
 
 /// Mutable accessor — used by tests that want to switch on MSI-X
 /// after probe.
-pub fn with_controller_mut<R>(f: impl FnOnce(&mut RtlNic) -> R) -> Option<R> {
-    CONTROLLER
+pub fn with_controller_mut<R>(index: usize, f: impl FnOnce(&mut RtlNic) -> R) -> Option<R> {
+    CONTROLLERS
         .lock()
-        .as_mut()
+        .get_mut(index)
         .map(|a| f(Arc::get_mut(a).expect("RtlNic static has multiple owners")))
 }
 
