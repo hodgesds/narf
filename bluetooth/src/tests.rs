@@ -511,6 +511,49 @@ fn smoke_smp_pick_pairing_method_just_works() -> TestResult {
     if m != PairingMethod::OutOfBand {
         return TestResult::Fail("OOB flag should override");
     }
+    // Full Table 2.8 (MITM + SC, OOB clear): every
+    // initiator × responder combination. The display-role rows
+    // are the ones an earlier revision had transposed — the
+    // "Displays" side is the side with the display (§2.3.5.1).
+    use IoCapability::*;
+    let jw = PairingMethod::JustWorks;
+    let nc = PairingMethod::NumericComparison;
+    let id = PairingMethod::PasskeyEntryInitiatorDisplays;
+    let rd = PairingMethod::PasskeyEntryResponderDisplays;
+    let bi = PairingMethod::PasskeyEntryBothInput;
+    let table: [(IoCapability, IoCapability, PairingMethod); 25] = [
+        (DisplayOnly, DisplayOnly, jw),
+        (DisplayOnly, DisplayYesNo, jw),
+        (DisplayOnly, KeyboardOnly, id),
+        (DisplayOnly, NoInputNoOutput, jw),
+        (DisplayOnly, KeyboardDisplay, id),
+        (DisplayYesNo, DisplayOnly, jw),
+        (DisplayYesNo, DisplayYesNo, nc),
+        (DisplayYesNo, KeyboardOnly, id),
+        (DisplayYesNo, NoInputNoOutput, jw),
+        (DisplayYesNo, KeyboardDisplay, nc),
+        (KeyboardOnly, DisplayOnly, rd),
+        (KeyboardOnly, DisplayYesNo, rd),
+        (KeyboardOnly, KeyboardOnly, bi),
+        (KeyboardOnly, NoInputNoOutput, jw),
+        (KeyboardOnly, KeyboardDisplay, rd),
+        (NoInputNoOutput, DisplayOnly, jw),
+        (NoInputNoOutput, DisplayYesNo, jw),
+        (NoInputNoOutput, KeyboardOnly, jw),
+        (NoInputNoOutput, NoInputNoOutput, jw),
+        (NoInputNoOutput, KeyboardDisplay, jw),
+        (KeyboardDisplay, DisplayOnly, rd),
+        (KeyboardDisplay, DisplayYesNo, nc),
+        (KeyboardDisplay, KeyboardOnly, id),
+        (KeyboardDisplay, NoInputNoOutput, jw),
+        (KeyboardDisplay, KeyboardDisplay, nc),
+    ];
+    for (initiator, responder, want) in table {
+        let got = pick_pairing_method(initiator, responder, true, true, false);
+        if got != want {
+            return TestResult::Fail("Table 2.8 mismatch: wrong method for an IO-capability pair");
+        }
+    }
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/smp", smoke_smp_pick_pairing_method_just_works);

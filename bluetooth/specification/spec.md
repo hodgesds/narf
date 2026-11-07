@@ -283,8 +283,9 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   advertising (§7.8.61..63) and LE Extended Create Connection (§7.8.66)
   — follow-ups to #823 — and any mgmt/userspace trigger for these
   calls (future lane).
-  Pairing initiation (issue #888) is `pump::smp_initiate_pairing` (LE
-  Just Works initiator + bond store); host-initiated disconnect
+  Pairing initiation (issue #888, MITM methods #818) is
+  `pump::smp_initiate_pairing` (LE initiator + bond store, IO
+  capability from mgmt); host-initiated disconnect
   remains out of scope (no backend — the mgmt DISCONNECT
   remainder).
 - `mgmt` — the Linux Bluetooth Management API
@@ -311,10 +312,21 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   and LE random are NOT_SUPPORTED pending #1315 / a random-address
   backend) and publish DISCOVERING / DEVICE_FOUND per report;
   SET_SCAN_PARAMS stores the LE scan parameters (HCI §7.8.10
-  bounds). PAIR_DEVICE (LE Just Works only, existing connection
-  required) returns Command Status now and Command Complete when
-  the initiator session ends (SUCCESS / AUTH_FAILED /
-  DISCONNECTED); UNPAIR_DEVICE forgets the bond (idempotent) and
+  bounds). PAIR_DEVICE (LE, existing connection required,
+  per-pairing IO capability — any of the five §3.5.1 values, so
+  MITM methods are reachable) returns Command Status now and
+  Command Complete when the initiator session ends (SUCCESS /
+  AUTH_FAILED / DISCONNECTED); SET_IO_CAPABILITY stores the
+  controller-wide IO capability used by responder pairings and
+  Security-Request-triggered initiations. The MITM user flows run
+  through mgmt: USER_CONFIRM_REQUEST / USER_PASSKEY_REQUEST /
+  PASSKEY_NOTIFY events and USER_CONFIRM_REPLY / NEG_REPLY,
+  USER_PASSKEY_REPLY / NEG_REPLY commands; ADD/REMOVE_REMOTE_OOB_DATA
+  hold the peer's P-256 OOB data for the pump (LE: 71-byte form,
+  P-192 fields zero). PIN_CODE_REPLY / NEG_REPLY are recognised
+  and refused as NOT_SUPPORTED (BR/EDR-only, no legacy pairing
+  backend); READ_LOCAL_OOB_DATA is NOT_SUPPORTED (no stable local
+  SC keypair yet). UNPAIR_DEVICE forgets the bond (idempotent) and
   refuses disconnect=1 on a live connection (NOT_SUPPORTED).
   Known limits: mgmt issues its HCI synchronously, so while the
   pump task is draining the same transport a completion can be
@@ -472,16 +484,27 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   with ATT lock-step, response demultiplexing away from the GATT
   server, and notification/indication intake.
 - **SMP** (`smp`): Pairing PDU codec, IO-Capability + AuthReq
-  bitfields, pairing-method selector (table 2.8), LE Secure
-  Connections **Just Works** initiator + responder state machines
-  running the full §2.3.5.6 sequence: f4 Pairing Confirm values
-  generated and verified on both roles (§2.2.6, table 2.1), f5
-  MacKey + LTK derivation (§2.2.7), and f6 DHKey Check values
-  generated and verified on both roles (§2.2.8, table 2.2);
-  confirm / DHKey mismatches abort the exchange (Pairing Failed
-  0x04 / 0x0B via the pump). Numeric Comparison g2 helper
-  (§2.2.9). Crypto primitives injected through `SmpCrypto` trait
-  (P-256 keygen + DH, AES-CMAC, RNG).
+  bitfields, pairing-method selector (table 2.8 — OOB when one or
+  both sides hold OOB data, table 2.7), LE Secure Connections
+  initiator + responder state machines running the full §2.3.5.6
+  sequence for **Just Works, Numeric Comparison, Passkey Entry,
+  and Out of Band**: f4 Pairing Confirm values generated and
+  verified on both roles (§2.2.6, table 2.1), f5 MacKey + LTK
+  derivation (§2.2.7), and f6 DHKey Check values generated and
+  verified on both roles (§2.2.8, table 2.2); confirm / DHKey
+  mismatches abort the exchange (Pairing Failed 0x04 / 0x0B via
+  the pump). Numeric Comparison (§2.3.5.6.2) parks after the f5
+  derivation with the g2 value (§2.2.9) and resumes only on the
+  user's confirm (rejection aborts with Pairing Failed 0x0C);
+  Passkey Entry (§2.3.5.6.3) runs 20 Confirm/Random rounds, one
+  per passkey bit (Z = 0x80 | bit), ending with Na = Na20 /
+  Nb = Nb20 for stage 2; Out of Band (§2.3.5.6.4) commits each
+  side's own key to its OOB random, verifies the peer's OOB hash
+  against its public key, and uses the OOB randoms as the f6 R
+  values. The IO capability (and its MITM bit) is configurable
+  per session via `with_io_capability`, not hardcoded. Crypto
+  primitives injected through `SmpCrypto` trait (P-256 keygen +
+  DH, AES-CMAC, RNG).
 - **Bonding** (`bond_store` + pump SMP session): both roles negotiate
   bonding (both Bonding_Flags == 01) and Phase 3 key distribution
   (§3.6.1: IdKey + Sign, negotiated as the intersection of the two
@@ -496,11 +519,23 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   identity address / CSRK); LE LTK Requests are answered from the
   in-progress AuthComplete session first, then from the store on
   exact peer + EDIV/Rand match, else negative-replied. The pump
-  exposes `smp_initiate_pairing` (application trigger),
-  `smp_start_encryption` (re-encrypt from a bond), `forget_bond`,
-  and `bond_count`. No ATT-triggered pairing yet (no auth-gated
-  attribute exists); no on-disk bond persistence (bonds live for
-  the controller lifetime).
+  exposes `smp_initiate_pairing` (application trigger, IO
+  capability from mgmt's SET_IO_CAPABILITY store),
+  `smp_initiate_pairing_with_io` (per-pairing IO capability, as
+  PAIR_DEVICE carries), `smp_user_confirm` / `smp_user_passkey` /
+  `smp_user_passkey_cancel` (mgmt user replies), `smp_start_encryption`
+  (re-encrypt from a bond), `forget_bond`, `bond_count`, and
+  `bond_authenticated`. No ATT-triggered pairing yet (no auth-gated
+  attribute exists). The store encodes to a versioned image
+  (`BondStore::encode` / `decode`, strict fail-closed) and seals it
+  with ChaCha20-Poly1305 (`BondStore::seal` / `unseal`, AAD bound
+  to the controller + format version) under an explicitly
+  provisioned key (`set_bond_sealing_key`); the pump exposes the
+  latest sealed image (`sealed_bonds_image`) and restores from one
+  (`restore_sealed_bonds`). Sealing is disabled until a key is
+  provisioned, and no driver-domain file-write path exists yet to
+  carry the sealed image to disk — those two hookups, plus key
+  provisioning, are remainders.
 - **GATT server** (`gatt_server`): in-memory attribute database
   with handle assignment + permission flags, request handler that
   answers Read / Write / Read By Type / Read By Group Type / Find

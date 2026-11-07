@@ -11,9 +11,13 @@
 //! READ_INFO reports the dev_class / name / short_name the
 //! controller (or userspace, via SET_DEV_CLASS / SET_LOCAL_NAME)
 //! actually holds. Discovery is the landed GAP central initiator
-//! (#1312); pairing is the landed SMP initiator (#888), LE-only
-//! Just Works, with the async Linux completion model (Command
-//! Status now, Command Complete when the pairing finishes).
+//! (#1312); pairing is the landed SMP initiator (#888) with the
+//! MITM methods of #818: the IO capability is settable
+//! (SET_IO_CAPABILITY, or per-pairing via PAIR_DEVICE) and the
+//! user-confirm / passkey flows run through the mgmt
+//! USER_CONFIRM / USER_PASSKEY request events and reply commands,
+//! with the async Linux completion model (Command Status now,
+//! Command Complete when the pairing finishes).
 //!
 //! Wire format and status codes follow `/usr/src/linux`
 //! `net/bluetooth/mgmt.c` + `include/net/bluetooth/mgmt.h`.
@@ -52,8 +56,18 @@ const OP_SET_LE: u16 = 0x000d;
 const OP_SET_DEV_CLASS: u16 = 0x000e;
 const OP_SET_LOCAL_NAME: u16 = 0x000f;
 const OP_GET_CONNECTIONS: u16 = 0x0015;
+const OP_PIN_CODE_REPLY: u16 = 0x0016;
+const OP_PIN_CODE_NEG_REPLY: u16 = 0x0017;
+const OP_SET_IO_CAPABILITY: u16 = 0x0018;
 const OP_PAIR_DEVICE: u16 = 0x0019;
 const OP_UNPAIR_DEVICE: u16 = 0x001b;
+const OP_USER_CONFIRM_REPLY: u16 = 0x001c;
+const OP_USER_CONFIRM_NEG_REPLY: u16 = 0x001d;
+const OP_USER_PASSKEY_REPLY: u16 = 0x001e;
+const OP_USER_PASSKEY_NEG_REPLY: u16 = 0x001f;
+const OP_READ_LOCAL_OOB_DATA: u16 = 0x0020;
+const OP_ADD_REMOTE_OOB_DATA: u16 = 0x0021;
+const OP_REMOVE_REMOTE_OOB_DATA: u16 = 0x0022;
 const OP_START_DISCOVERY: u16 = 0x0023;
 const OP_STOP_DISCOVERY: u16 = 0x0024;
 const OP_SET_SCAN_PARAMS: u16 = 0x002c;
@@ -67,9 +81,14 @@ const EV_INDEX_REMOVED: u16 = 0x0005;
 const EV_NEW_SETTINGS: u16 = 0x0006;
 const EV_CLASS_OF_DEV_CHANGED: u16 = 0x0007;
 const EV_LOCAL_NAME_CHANGED: u16 = 0x0008;
+const EV_PIN_CODE_REQUEST: u16 = 0x000e;
+const EV_USER_CONFIRM_REQUEST: u16 = 0x000f;
+const EV_USER_PASSKEY_REQUEST: u16 = 0x0010;
+const EV_AUTH_FAILED: u16 = 0x0011;
 const EV_DEVICE_FOUND: u16 = 0x0012;
 const EV_DISCOVERING: u16 = 0x0013;
 const EV_DEVICE_UNPAIRED: u16 = 0x0016;
+const EV_PASSKEY_NOTIFY: u16 = 0x0017;
 
 // Status codes (mgmt.h MGMT_STATUS_*). The three the pump's
 // pairing-completion hooks report are `pub(crate)`.
@@ -139,6 +158,38 @@ static SCAN_PARAMS: IrqSafeSpinLock<BTreeMap<u16, (u16, u16)>> =
 static PENDING_PAIR: IrqSafeSpinLock<BTreeSet<(u16, [u8; 7])>> =
     IrqSafeSpinLock::new(BTreeSet::new());
 
+/// IO capability per controller, set by SET_IO_CAPABILITY
+/// (mgmt-api 0x0018) and used for responder pairings and
+/// Security-Request-triggered initiations; PAIR_DEVICE carries
+/// its own io_cap, which temporarily overrides this for that one
+/// pairing. Defaults to NoInputNoOutput (0x03) — the Just Works
+/// behaviour all earlier pairings had.
+static IO_CAPABILITY: IrqSafeSpinLock<BTreeMap<u16, u8>> = IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Remote OOB data per controller, set by ADD_REMOTE_OOB_DATA
+/// (mgmt-api 0x0021): peer address → the peer's P-256 OOB
+/// hash + randomizer. The pump reads it when a session for that
+/// peer starts; REMOVE_REMOTE_OOB_DATA clears it.
+static REMOTE_OOB: IrqSafeSpinLock<BTreeMap<u16, BTreeMap<[u8; 7], crate::smp::OobData>>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// IO capability the pump advertises for controller `index`:
+/// the SET_IO_CAPABILITY value, or NoInputNoOutput when unset.
+pub(crate) fn io_capability(index: u16) -> u8 {
+    *IO_CAPABILITY
+        .lock()
+        .get(&index)
+        .unwrap_or(&(crate::smp::IoCapability::NoInputNoOutput as u8))
+}
+
+/// Remote OOB data held for `peer` on controller `index`, if any.
+pub(crate) fn remote_oob(index: u16, peer: &[u8; 7]) -> Option<crate::smp::OobData> {
+    REMOTE_OOB
+        .lock()
+        .get(&index)
+        .and_then(|m| m.get(peer).copied())
+}
+
 /// Controllers whose local name / Class of Device userspace set via
 /// mgmt (SET_LOCAL_NAME / SET_DEV_CLASS). Power-on re-writes those
 /// stored values after HCI_Reset instead of re-reading the
@@ -155,13 +206,16 @@ static CLASS_SET: IrqSafeSpinLock<BTreeSet<u16>> = IrqSafeSpinLock::new(BTreeSet
 static DISCOV_TIMEOUT: IrqSafeSpinLock<BTreeSet<u16>> = IrqSafeSpinLock::new(BTreeSet::new());
 
 /// Test-only: drain all mgmt state (settings, discovery, scan
-/// parameters, pending pairings, userspace-set identity).
+/// parameters, pending pairings, userspace-set identity, IO
+/// capability, remote OOB data).
 #[doc(hidden)]
 pub fn __test_reset() {
     SETTINGS.lock().clear();
     DISCOVERING.lock().clear();
     SCAN_PARAMS.lock().clear();
     PENDING_PAIR.lock().clear();
+    IO_CAPABILITY.lock().clear();
+    REMOTE_OOB.lock().clear();
     NAME_SET.lock().clear();
     CLASS_SET.lock().clear();
     DISCOV_TIMEOUT.lock().clear();
@@ -659,8 +713,11 @@ fn get_connections(index: u16) -> Vec<u8> {
 /// PAIR_DEVICE (0x0019): `addr (6) + type (1) + io_cap (1)`.
 /// Powered-only; LE setting off → REJECTED. BR/EDR is
 /// NOT_SUPPORTED (no legacy pairing initiator; Classic is lane
-/// 1's, #1315). The initiator only speaks NoInputNoOutput
-/// (Just Works, #888) — any other io_cap is NOT_SUPPORTED, and a
+/// 1's, #1315). The io_cap temporarily overrides the controller's
+/// SET_IO_CAPABILITY value for this one pairing (mgmt-api) and is
+/// what the SMP initiator advertises — any of the five §3.5.1
+/// values is accepted, so MITM methods (Numeric Comparison,
+/// Passkey Entry) are reachable, not just Just Works (#818). A
 /// peer that is not connected is NOT_CONNECTED. A bonded peer is
 /// ALREADY_PAIRED. Success is asynchronous per mgmt(7): the reply
 /// is Command Status now, and the Command Complete arrives via
@@ -680,8 +737,8 @@ fn pair_device(index: u16, params: &[u8]) -> Vec<u8> {
     if addr_type != ADDR_LE_PUBLIC && addr_type != ADDR_LE_RANDOM {
         return cmd_status(index, OP_PAIR_DEVICE, STATUS_INVALID_PARAMS);
     }
-    if io_cap != crate::smp::IoCapability::NoInputNoOutput as u8 {
-        return cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_SUPPORTED);
+    if crate::smp::IoCapability::from_u8(io_cap).is_none() {
+        return cmd_status(index, OP_PAIR_DEVICE, STATUS_INVALID_PARAMS);
     }
     if current_settings(index) & SETTING_POWERED == 0 {
         return cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_POWERED);
@@ -711,7 +768,7 @@ fn pair_device(index: u16, params: &[u8]) -> Vec<u8> {
     let Some(handle) = conns.iter().find(|c| c.peer_addr == peer).map(|c| c.handle) else {
         return cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_CONNECTED);
     };
-    match crate::pump::smp_initiate_pairing(index as usize, handle) {
+    match crate::pump::smp_initiate_pairing_with_io(index as usize, handle, io_cap) {
         Some(Ok(())) => {
             PENDING_PAIR.lock().insert((index, peer));
             cmd_status(index, OP_PAIR_DEVICE, STATUS_SUCCESS)
@@ -726,6 +783,12 @@ fn pair_device(index: u16, params: &[u8]) -> Vec<u8> {
         }
         Some(Err(crate::pump::SmpInitiateError::NotLe)) => {
             cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_SUPPORTED)
+        }
+        Some(Err(crate::pump::SmpInitiateError::InvalidIoCap)) => {
+            // Unreachable from here: io_cap was validated against
+            // `IoCapability::from_u8` above, but the pump refuses
+            // out-of-range bytes with this error.
+            cmd_status(index, OP_PAIR_DEVICE, STATUS_INVALID_PARAMS)
         }
         None => cmd_status(index, OP_PAIR_DEVICE, STATUS_FAILED),
     }
@@ -795,6 +858,222 @@ fn unpair_device(index: u16, params: &[u8]) -> Vec<u8> {
     data.extend_from_slice(&params[..6]);
     data.push(addr_type);
     cmd_complete(index, OP_UNPAIR_DEVICE, STATUS_SUCCESS, &data)
+}
+
+/// SET_IO_CAPABILITY (0x0018): `io_cap (1)`. Usable while the
+/// controller is powered off (mgmt-api). The value is the §3.5.1
+/// IO capability the pump advertises for responder pairings and
+/// Security-Request-triggered initiations; PAIR_DEVICE's io_cap
+/// overrides it for one pairing. Returns Command Complete with
+/// no return parameters on success.
+fn set_io_capability(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_SET_IO_CAPABILITY, STATUS_INVALID_INDEX);
+    }
+    if params.is_empty() || crate::smp::IoCapability::from_u8(params[0]).is_none() {
+        return cmd_status(index, OP_SET_IO_CAPABILITY, STATUS_INVALID_PARAMS);
+    }
+    IO_CAPABILITY.lock().insert(index, params[0]);
+    cmd_complete(index, OP_SET_IO_CAPABILITY, STATUS_SUCCESS, &[])
+}
+
+/// Parse an `addr (6) + type (1)` parameter prefix into the
+/// pump's `[address_type, bd_addr]` shape. BR/EDR is
+/// NOT_SUPPORTED (no legacy pairing backend); any other type
+/// byte is INVALID_PARAMS.
+fn le_peer(params: &[u8]) -> Result<[u8; 7], u8> {
+    if params.len() < 7 {
+        return Err(STATUS_INVALID_PARAMS);
+    }
+    let addr_type = params[6];
+    if addr_type == ADDR_BREDR {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    if addr_type != ADDR_LE_PUBLIC && addr_type != ADDR_LE_RANDOM {
+        return Err(STATUS_INVALID_PARAMS);
+    }
+    let mut peer = [0u8; 7];
+    peer[0] = if addr_type == ADDR_LE_PUBLIC { 0 } else { 1 };
+    peer[1..7].copy_from_slice(&params[..6]);
+    Ok(peer)
+}
+
+/// `addr (6) + type (1)` return parameters for `peer`.
+fn addr_reply(peer: &[u8; 7]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(7);
+    data.extend_from_slice(&peer[1..7]);
+    data.push(if peer[0] == 0 {
+        ADDR_LE_PUBLIC
+    } else {
+        ADDR_LE_RANDOM
+    });
+    data
+}
+
+/// PIN_CODE_REPLY (0x0016) / PIN_CODE_NEG_REPLY (0x0017):
+/// `addr (6) + type (1) [+ pin_len (1) + pin (16)]`. The PIN
+/// Code Request event is BR/EDR-only and this stack has no BR/EDR
+/// pairing backend; LE passkey flows use USER_PASSKEY_REPLY.
+/// The commands are recognised and validated, then refused as
+/// NOT_SUPPORTED rather than answered UNKNOWN_COMMAND.
+fn pin_code_reply(index: u16, opcode: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, opcode, STATUS_INVALID_INDEX);
+    }
+    let need = if opcode == OP_PIN_CODE_REPLY { 24 } else { 7 };
+    if params.len() < need {
+        return cmd_status(index, opcode, STATUS_INVALID_PARAMS);
+    }
+    if let Err(status) = le_peer(params) {
+        return cmd_status(index, opcode, status);
+    }
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return cmd_status(index, opcode, STATUS_NOT_POWERED);
+    }
+    cmd_status(index, opcode, STATUS_NOT_SUPPORTED)
+}
+
+/// USER_CONFIRM_REPLY (0x001c) / USER_CONFIRM_NEG_REPLY (0x001d):
+/// `addr (6) + type (1)`. Answers a pending Numeric Comparison
+/// park for that peer. No parked confirm → NOT_CONNECTED; no
+/// pump → FAILED. Success is Command Complete with the
+/// address back.
+fn user_confirm_reply(index: u16, opcode: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, opcode, STATUS_INVALID_INDEX);
+    }
+    let peer = match le_peer(params) {
+        Ok(peer) => peer,
+        Err(status) => return cmd_status(index, opcode, status),
+    };
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return cmd_status(index, opcode, STATUS_NOT_POWERED);
+    }
+    match crate::pump::smp_user_confirm(index as usize, &peer, opcode == OP_USER_CONFIRM_REPLY) {
+        Some(true) => cmd_complete(index, opcode, STATUS_SUCCESS, &addr_reply(&peer)),
+        Some(false) => cmd_status(index, opcode, STATUS_NOT_CONNECTED),
+        None => cmd_status(index, opcode, STATUS_FAILED),
+    }
+}
+
+/// USER_PASSKEY_REPLY (0x001e): `addr (6) + type (1) + passkey
+/// (4, LE)`; USER_PASSKEY_NEG_REPLY (0x001f): `addr (6) +
+/// type (1)`. The passkey is six decimal digits — anything above
+/// 999999 is INVALID_PARAMS. A negative reply fails the parked
+/// passkey entry (Pairing Failed 0x01 at the pump).
+fn user_passkey_reply(index: u16, opcode: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, opcode, STATUS_INVALID_INDEX);
+    }
+    let peer = match le_peer(params) {
+        Ok(peer) => peer,
+        Err(status) => return cmd_status(index, opcode, status),
+    };
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return cmd_status(index, opcode, STATUS_NOT_POWERED);
+    }
+    if opcode == OP_USER_PASSKEY_REPLY {
+        if params.len() < 11 {
+            return cmd_status(index, opcode, STATUS_INVALID_PARAMS);
+        }
+        let passkey = u32::from_le_bytes([params[7], params[8], params[9], params[10]]);
+        if passkey > 999_999 {
+            return cmd_status(index, opcode, STATUS_INVALID_PARAMS);
+        }
+        match crate::pump::smp_user_passkey(index as usize, &peer, passkey) {
+            Some(true) => cmd_complete(index, opcode, STATUS_SUCCESS, &addr_reply(&peer)),
+            Some(false) => cmd_status(index, opcode, STATUS_NOT_CONNECTED),
+            None => cmd_status(index, opcode, STATUS_FAILED),
+        }
+    } else {
+        match crate::pump::smp_user_passkey_cancel(index as usize, &peer) {
+            Some(true) => cmd_complete(index, opcode, STATUS_SUCCESS, &addr_reply(&peer)),
+            Some(false) => cmd_status(index, opcode, STATUS_NOT_CONNECTED),
+            None => cmd_status(index, opcode, STATUS_FAILED),
+        }
+    }
+}
+
+/// READ_LOCAL_OOB_DATA (0x0020): refused as NOT_SUPPORTED.
+/// Minting local OOB data means committing a public key in the
+/// OOB hash (`f4(PK, PK, r, 0)`) that the pairing must then use,
+/// and sessions generate a fresh keypair per pairing — there is
+/// no stable local SC keypair to hash yet. Emitting OOB data
+/// for a key that will never be used would silently break the
+/// peer's authentication, so the command is refused until the
+/// stable-keypair gap is closed (remainder).
+fn read_local_oob_data(index: u16) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_READ_LOCAL_OOB_DATA, STATUS_INVALID_INDEX);
+    }
+    if current_settings(index) & SETTING_POWERED == 0 {
+        return cmd_status(index, OP_READ_LOCAL_OOB_DATA, STATUS_NOT_POWERED);
+    }
+    cmd_status(index, OP_READ_LOCAL_OOB_DATA, STATUS_NOT_SUPPORTED)
+}
+
+/// ADD_REMOTE_OOB_DATA (0x0021): `addr (6) + type (1) +
+/// hash_192 (16) + rand_192 (16) [+ hash_256 (16) + rand_256
+/// (16)]`. For LE the P-256 pair is the OOB data and the P-192
+/// fields must be zero (mgmt-api); a 39-byte call carries no LE
+/// OOB data and is INVALID_PARAMS. Usable while unpowered; the
+/// data is held until a session for that peer starts.
+fn add_remote_oob_data(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_ADD_REMOTE_OOB_DATA, STATUS_INVALID_INDEX);
+    }
+    if params.len() != 39 && params.len() != 71 {
+        return cmd_status(index, OP_ADD_REMOTE_OOB_DATA, STATUS_INVALID_PARAMS);
+    }
+    let peer = match le_peer(params) {
+        Ok(peer) => peer,
+        Err(status) => return cmd_status(index, OP_ADD_REMOTE_OOB_DATA, status),
+    };
+    if params.len() != 71 {
+        return cmd_status(index, OP_ADD_REMOTE_OOB_DATA, STATUS_INVALID_PARAMS);
+    }
+    if params[7..39] != [0u8; 32] {
+        return cmd_status(index, OP_ADD_REMOTE_OOB_DATA, STATUS_INVALID_PARAMS);
+    }
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&params[39..55]);
+    let mut randomizer = [0u8; 16];
+    randomizer.copy_from_slice(&params[55..71]);
+    REMOTE_OOB
+        .lock()
+        .entry(index)
+        .or_default()
+        .insert(peer, crate::smp::OobData { hash, randomizer });
+    cmd_complete(
+        index,
+        OP_ADD_REMOTE_OOB_DATA,
+        STATUS_SUCCESS,
+        &addr_reply(&peer),
+    )
+}
+
+/// REMOVE_REMOTE_OOB_DATA (0x0022): `addr (6) + type (1)`.
+/// An all-zero address clears every entry for the controller.
+/// Usable while unpowered.
+fn remove_remote_oob_data(index: u16, params: &[u8]) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, OP_REMOVE_REMOTE_OOB_DATA, STATUS_INVALID_INDEX);
+    }
+    let peer = match le_peer(params) {
+        Ok(peer) => peer,
+        Err(status) => return cmd_status(index, OP_REMOVE_REMOTE_OOB_DATA, status),
+    };
+    if params[..6] == [0u8; 6] {
+        let _ = REMOTE_OOB.lock().remove(&index);
+    } else if let Some(map) = REMOTE_OOB.lock().get_mut(&index) {
+        map.remove(&peer);
+    }
+    cmd_complete(
+        index,
+        OP_REMOVE_REMOTE_OOB_DATA,
+        STATUS_SUCCESS,
+        &addr_reply(&peer),
+    )
 }
 
 /// Advertised mgmt protocol version/revision (`MGMT_VERSION` / `MGMT_REVISION`).
@@ -1049,6 +1328,60 @@ pub fn pairing_complete(index: usize, peer: [u8; 7], status: u8) {
     ));
 }
 
+/// USER_CONFIRM_REQUEST event (0x000f): `addr (6) + type (1) +
+/// confirm_hint (1) + value (4, LE)`. Raised when an SMP
+/// session parks at Numeric Comparison — the user confirms the
+/// displayed value matches the peer's, via USER_CONFIRM_REPLY,
+/// or rejects it via USER_CONFIRM_NEG_REPLY. `confirm_hint` 0
+/// means a full numeric comparison (not a simple Yes/No).
+pub fn user_confirm_request(index: usize, peer: [u8; 7], value: u32) {
+    let mut data = Vec::with_capacity(12);
+    data.extend_from_slice(&peer[1..7]);
+    data.push(if peer[0] == 0 {
+        ADDR_LE_PUBLIC
+    } else {
+        ADDR_LE_RANDOM
+    });
+    data.push(0);
+    data.extend_from_slice(&value.to_le_bytes());
+    narf_filesystem::bluetooth::publish_mgmt_event(&frame(
+        EV_USER_CONFIRM_REQUEST,
+        index as u16,
+        &data,
+    ));
+}
+
+/// USER_PASSKEY_REQUEST event (0x0010): `addr (6) + type (1)`.
+/// Raised when an SMP session parks for a typed-in passkey —
+/// answered by USER_PASSKEY_REPLY (or cancelled by
+/// USER_PASSKEY_NEG_REPLY).
+pub fn user_passkey_request(index: usize, peer: [u8; 7]) {
+    narf_filesystem::bluetooth::publish_mgmt_event(&frame(
+        EV_USER_PASSKEY_REQUEST,
+        index as u16,
+        &addr_reply(&peer),
+    ));
+}
+
+/// PASSKEY_NOTIFY event (0x0017): `addr (6) + type (1) +
+/// passkey (4, LE) + entered (1)`. Informational — the session
+/// generated a passkey to display on this device, and the peer
+/// is typing it in. `entered` counts the digits the peer has
+/// entered so far; this stack never sets the keypress bit, so
+/// it is always 0.
+pub fn passkey_notify(index: usize, peer: [u8; 7], passkey: u32) {
+    let mut data = Vec::with_capacity(12);
+    data.extend_from_slice(&peer[1..7]);
+    data.push(if peer[0] == 0 {
+        ADDR_LE_PUBLIC
+    } else {
+        ADDR_LE_RANDOM
+    });
+    data.extend_from_slice(&passkey.to_le_bytes());
+    data.push(0);
+    narf_filesystem::bluetooth::publish_mgmt_event(&frame(EV_PASSKEY_NOTIFY, index as u16, &data));
+}
+
 /// Handle one mgmt command frame (as received on an `HCI_CHANNEL_CONTROL`
 /// socket) and return the reply frame(s) to queue back to userspace. A
 /// malformed (too-short) frame yields no reply — the socket layer rejects
@@ -1095,8 +1428,18 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
                 OP_SET_DEV_CLASS,
                 OP_SET_LOCAL_NAME,
                 OP_GET_CONNECTIONS,
+                OP_PIN_CODE_REPLY,
+                OP_PIN_CODE_NEG_REPLY,
+                OP_SET_IO_CAPABILITY,
                 OP_PAIR_DEVICE,
                 OP_UNPAIR_DEVICE,
+                OP_USER_CONFIRM_REPLY,
+                OP_USER_CONFIRM_NEG_REPLY,
+                OP_USER_PASSKEY_REPLY,
+                OP_USER_PASSKEY_NEG_REPLY,
+                OP_READ_LOCAL_OOB_DATA,
+                OP_ADD_REMOTE_OOB_DATA,
+                OP_REMOVE_REMOTE_OOB_DATA,
                 OP_START_DISCOVERY,
                 OP_STOP_DISCOVERY,
                 OP_SET_SCAN_PARAMS,
@@ -1110,9 +1453,14 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
                 EV_NEW_SETTINGS,
                 EV_CLASS_OF_DEV_CHANGED,
                 EV_LOCAL_NAME_CHANGED,
+                EV_PIN_CODE_REQUEST,
+                EV_USER_CONFIRM_REQUEST,
+                EV_USER_PASSKEY_REQUEST,
+                EV_AUTH_FAILED,
                 EV_DEVICE_FOUND,
                 EV_DISCOVERING,
                 EV_DEVICE_UNPAIRED,
+                EV_PASSKEY_NOTIFY,
             ];
             let mut data = Vec::new();
             data.extend_from_slice(&(ops.len() as u16).to_le_bytes());
@@ -1199,8 +1547,18 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
         OP_START_DISCOVERY => alloc::vec![start_discovery(index, params)],
         OP_STOP_DISCOVERY => alloc::vec![stop_discovery(index, params)],
         OP_GET_CONNECTIONS => alloc::vec![get_connections(index)],
+        OP_PIN_CODE_REPLY => alloc::vec![pin_code_reply(index, opcode, params)],
+        OP_PIN_CODE_NEG_REPLY => alloc::vec![pin_code_reply(index, opcode, params)],
+        OP_SET_IO_CAPABILITY => alloc::vec![set_io_capability(index, params)],
         OP_PAIR_DEVICE => alloc::vec![pair_device(index, params)],
         OP_UNPAIR_DEVICE => alloc::vec![unpair_device(index, params)],
+        OP_USER_CONFIRM_REPLY => alloc::vec![user_confirm_reply(index, opcode, params)],
+        OP_USER_CONFIRM_NEG_REPLY => alloc::vec![user_confirm_reply(index, opcode, params)],
+        OP_USER_PASSKEY_REPLY => alloc::vec![user_passkey_reply(index, opcode, params)],
+        OP_USER_PASSKEY_NEG_REPLY => alloc::vec![user_passkey_reply(index, opcode, params)],
+        OP_READ_LOCAL_OOB_DATA => alloc::vec![read_local_oob_data(index)],
+        OP_ADD_REMOTE_OOB_DATA => alloc::vec![add_remote_oob_data(index, params)],
+        OP_REMOVE_REMOTE_OOB_DATA => alloc::vec![remove_remote_oob_data(index, params)],
         _ => alloc::vec![cmd_status(index, opcode, STATUS_UNKNOWN_COMMAND)],
     }
 }
@@ -2121,9 +2479,11 @@ mod tests {
         let br = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &bredr_params));
         let br_ok = is_cmd_status(&br, OP_PAIR_DEVICE, STATUS_NOT_SUPPORTED);
         let mut mitm_params = pair_params;
-        mitm_params[7] = 0x01; // DisplayYesNo
+        mitm_params[7] = 0x01; // DisplayYesNo — accepted now (#818):
+                               // without a connection the pairing cannot start, so the
+                               // refusal is NOT_CONNECTED, not NOT_SUPPORTED.
         let mitm = handle(&mgmt_cmd(OP_PAIR_DEVICE, index, &mitm_params));
-        let mitm_ok = is_cmd_status(&mitm, OP_PAIR_DEVICE, STATUS_NOT_SUPPORTED);
+        let mitm_ok = is_cmd_status(&mitm, OP_PAIR_DEVICE, STATUS_NOT_CONNECTED);
         let mut unpair_params = [0u8; 8];
         unpair_params[..6].copy_from_slice(&peer6);
         unpair_params[6] = 0x01;
@@ -2169,7 +2529,9 @@ mod tests {
             return TestResult::Fail("PAIR_DEVICE without a connection was not NOT_CONNECTED");
         }
         if !br_ok || !mitm_ok {
-            return TestResult::Fail("PAIR_DEVICE BR/EDR / MITM was not NOT_SUPPORTED");
+            return TestResult::Fail(
+                "PAIR_DEVICE BR/EDR not NOT_SUPPORTED / MITM io_cap not accepted",
+            );
         }
         if !un_ok {
             return TestResult::Fail("UNPAIR_DEVICE of an unknown peer was not success");
@@ -2190,5 +2552,149 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_pair_unpair_and_get_connections);
+    /// #818: SET_IO_CAPABILITY stores the controller's IO
+    /// capability (default NoInputNoOutput), the user-confirm /
+    /// passkey replies refuse cleanly with no parked session, and
+    /// the BR/EDR-only / unimplemented replies are NOT_SUPPORTED
+    /// rather than UNKNOWN_COMMAND.
+    fn smoke_mgmt_io_capability_and_user_replies() -> TestResult {
+        let (lt, index) = setup_controller(controller::ControllerInfo::default());
+        // Default capability before any SET is NoInputNoOutput.
+        if io_capability(index) != crate::smp::IoCapability::NoInputNoOutput as u8 {
+            cleanup_mgmt();
+            return TestResult::Fail("default IO capability is not NoInputNoOutput");
+        }
+        let set = handle(&mgmt_cmd(OP_SET_IO_CAPABILITY, index, &[0x04]));
+        let set_ok = is_cmd_complete(&set, OP_SET_IO_CAPABILITY, STATUS_SUCCESS)
+            && io_capability(index) == 0x04;
+        let bad = handle(&mgmt_cmd(OP_SET_IO_CAPABILITY, index, &[0x05]));
+        let bad_ok = is_cmd_status(&bad, OP_SET_IO_CAPABILITY, STATUS_INVALID_PARAMS);
+        let empty = handle(&mgmt_cmd(OP_SET_IO_CAPABILITY, index, &[]));
+        let empty_ok = is_cmd_status(&empty, OP_SET_IO_CAPABILITY, STATUS_INVALID_PARAMS);
+        let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut addr_params = [0u8; 7];
+        addr_params[..6].copy_from_slice(&peer6);
+        addr_params[6] = 0x01; // LE public
+        let confirm = handle(&mgmt_cmd(OP_USER_CONFIRM_REPLY, index, &addr_params));
+        let confirm_ok = is_cmd_status(&confirm, OP_USER_CONFIRM_REPLY, STATUS_NOT_CONNECTED);
+        let confirm_neg = handle(&mgmt_cmd(OP_USER_CONFIRM_NEG_REPLY, index, &addr_params));
+        let confirm_neg_ok = is_cmd_status(
+            &confirm_neg,
+            OP_USER_CONFIRM_NEG_REPLY,
+            STATUS_NOT_CONNECTED,
+        );
+        let mut passkey_params = [0u8; 11];
+        passkey_params[..7].copy_from_slice(&addr_params);
+        passkey_params[7..11].copy_from_slice(&123456u32.to_le_bytes());
+        let passkey = handle(&mgmt_cmd(OP_USER_PASSKEY_REPLY, index, &passkey_params));
+        let passkey_ok = is_cmd_status(&passkey, OP_USER_PASSKEY_REPLY, STATUS_NOT_CONNECTED);
+        let passkey_neg = handle(&mgmt_cmd(OP_USER_PASSKEY_NEG_REPLY, index, &addr_params));
+        let passkey_neg_ok = is_cmd_status(
+            &passkey_neg,
+            OP_USER_PASSKEY_NEG_REPLY,
+            STATUS_NOT_CONNECTED,
+        );
+        passkey_params[7..11].copy_from_slice(&1_000_000u32.to_le_bytes());
+        let too_big = handle(&mgmt_cmd(OP_USER_PASSKEY_REPLY, index, &passkey_params));
+        let too_big_ok = is_cmd_status(&too_big, OP_USER_PASSKEY_REPLY, STATUS_INVALID_PARAMS);
+        let short = handle(&mgmt_cmd(OP_USER_PASSKEY_REPLY, index, &addr_params));
+        let short_ok = is_cmd_status(&short, OP_USER_PASSKEY_REPLY, STATUS_INVALID_PARAMS);
+        let mut pin_params = [0u8; 24];
+        pin_params[..7].copy_from_slice(&addr_params);
+        pin_params[7] = 4;
+        let pin = handle(&mgmt_cmd(OP_PIN_CODE_REPLY, index, &pin_params));
+        let pin_ok = is_cmd_status(&pin, OP_PIN_CODE_REPLY, STATUS_NOT_SUPPORTED);
+        let pin_neg = handle(&mgmt_cmd(OP_PIN_CODE_NEG_REPLY, index, &addr_params));
+        let pin_neg_ok = is_cmd_status(&pin_neg, OP_PIN_CODE_NEG_REPLY, STATUS_NOT_SUPPORTED);
+        let oob = handle(&mgmt_cmd(OP_READ_LOCAL_OOB_DATA, index, &[]));
+        let oob_ok = is_cmd_status(&oob, OP_READ_LOCAL_OOB_DATA, STATUS_NOT_SUPPORTED);
+        // Power off: the user replies are power-gated.
+        enqueue_power_off_cc(&lt);
+        let off = handle(&mgmt_cmd(OP_SET_POWERED, index, &[0]));
+        let off_ok = is_cmd_complete(&off, OP_SET_POWERED, STATUS_SUCCESS);
+        let gated = handle(&mgmt_cmd(OP_USER_CONFIRM_REPLY, index, &addr_params));
+        let gated_ok = is_cmd_status(&gated, OP_USER_CONFIRM_REPLY, STATUS_NOT_POWERED);
+        cleanup_mgmt();
+        if !set_ok || !bad_ok || !empty_ok || !powered {
+            return TestResult::Fail("SET_IO_CAPABILITY store/validation failed");
+        }
+        if !confirm_ok || !confirm_neg_ok || !passkey_ok || !passkey_neg_ok {
+            return TestResult::Fail("user reply with no parked session was not NOT_CONNECTED");
+        }
+        if !too_big_ok || !short_ok {
+            return TestResult::Fail("USER_PASSKEY_REPLY validation failed");
+        }
+        if !pin_ok || !pin_neg_ok || !oob_ok {
+            return TestResult::Fail("PIN / local-OOB replies were not NOT_SUPPORTED");
+        }
+        if !off_ok || !gated_ok {
+            return TestResult::Fail("user replies were not power-gated");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_io_capability_and_user_replies);
+
+    /// #818: ADD/REMOVE_REMOTE_OOB_DATA validation and round-trip
+    /// through the pump-facing accessor. ADD works unpowered; LE
+    /// needs the 71-byte form with zero P-192 fields.
+    fn smoke_mgmt_remote_oob_data() -> TestResult {
+        let (_lt, index) = setup_controller(controller::ControllerInfo::default());
+        let peer6 = [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5];
+        let mut peer = [0u8; 7];
+        peer[1..7].copy_from_slice(&peer6);
+        let mut add_params = [0u8; 71];
+        add_params[..6].copy_from_slice(&peer6);
+        add_params[6] = 0x01; // LE public
+                              // P-192 fields (bytes 7..39) stay zero for LE.
+        add_params[39..55].copy_from_slice(&[0xAB; 16]);
+        add_params[55..71].copy_from_slice(&[0xCD; 16]);
+        let add = handle(&mgmt_cmd(OP_ADD_REMOTE_OOB_DATA, index, &add_params));
+        let add_ok = is_cmd_complete(&add, OP_ADD_REMOTE_OOB_DATA, STATUS_SUCCESS)
+            && add[0][9..15] == peer6[..]
+            && add[0][15] == 0x01;
+        let stored = remote_oob(index, &peer);
+        let stored_ok = stored
+            == Some(crate::smp::OobData {
+                hash: [0xAB; 16],
+                randomizer: [0xCD; 16],
+            });
+        let short = handle(&mgmt_cmd(OP_ADD_REMOTE_OOB_DATA, index, &add_params[..39]));
+        let short_ok = is_cmd_status(&short, OP_ADD_REMOTE_OOB_DATA, STATUS_INVALID_PARAMS);
+        let mut nonzero192 = add_params;
+        nonzero192[7] = 1;
+        let nz = handle(&mgmt_cmd(OP_ADD_REMOTE_OOB_DATA, index, &nonzero192));
+        let nz_ok = is_cmd_status(&nz, OP_ADD_REMOTE_OOB_DATA, STATUS_INVALID_PARAMS);
+        let mut bredr = add_params;
+        bredr[6] = 0x00;
+        let br = handle(&mgmt_cmd(OP_ADD_REMOTE_OOB_DATA, index, &bredr));
+        let br_ok = is_cmd_status(&br, OP_ADD_REMOTE_OOB_DATA, STATUS_NOT_SUPPORTED);
+        let mut rm_params = [0u8; 7];
+        rm_params[..6].copy_from_slice(&peer6);
+        rm_params[6] = 0x01;
+        let rm = handle(&mgmt_cmd(OP_REMOVE_REMOTE_OOB_DATA, index, &rm_params));
+        let rm_ok = is_cmd_complete(&rm, OP_REMOVE_REMOTE_OOB_DATA, STATUS_SUCCESS)
+            && remote_oob(index, &peer).is_none();
+        let rm_unknown = handle(&mgmt_cmd(OP_REMOVE_REMOTE_OOB_DATA, index, &rm_params));
+        let rm_unknown_ok = is_cmd_complete(&rm_unknown, OP_REMOVE_REMOTE_OOB_DATA, STATUS_SUCCESS);
+        // Re-add, then an all-zero address clears every entry.
+        let _ = handle(&mgmt_cmd(OP_ADD_REMOTE_OOB_DATA, index, &add_params));
+        let mut clear_params = [0u8; 7];
+        clear_params[6] = 0x01;
+        let clear = handle(&mgmt_cmd(OP_REMOVE_REMOTE_OOB_DATA, index, &clear_params));
+        let clear_ok = is_cmd_complete(&clear, OP_REMOVE_REMOTE_OOB_DATA, STATUS_SUCCESS)
+            && remote_oob(index, &peer).is_none();
+        cleanup_mgmt();
+        if !add_ok || !stored_ok {
+            return TestResult::Fail("ADD_REMOTE_OOB_DATA store failed");
+        }
+        if !short_ok || !nz_ok || !br_ok {
+            return TestResult::Fail("ADD_REMOTE_OOB_DATA validation failed");
+        }
+        if !rm_ok || !rm_unknown_ok || !clear_ok {
+            return TestResult::Fail("REMOVE_REMOTE_OOB_DATA failed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_remote_oob_data);
 }
