@@ -71,13 +71,13 @@ pub enum TransportError {
 /// `Arc<dyn BytePort>` and frames bytes over it.
 ///
 /// The serial registry (`narf_drivers_serial::registry`) publishes
-/// descriptors only — base, stride, clock, IRQ, name, baud — so a
-/// byte port is built by rebuilding the UART handle from the
-/// descriptor, the same shape `filesystem::console_tty` uses for
-/// probed-UART ttys (`Uart8250::new` / `new_mmio` + polled
+/// descriptors only — base, stride, clock, IRQ, name, baud, kind,
+/// mapped VA — so a byte port is built by rebuilding the UART handle
+/// from the descriptor, the same shape `filesystem::console_tty` uses
+/// for probed-UART ttys (`Uart8250::new` / `new_mmio` + polled
 /// `write_byte` / `read_byte`). [`crate::h5_transport::Uart8250BytePort`]
-/// is the 8250 implementation; fixtures substitute a scripted peer
-/// behind this trait.
+/// is the 8250 implementation and [`crate::h5_transport::Pl011BytePort`]
+/// the PL011 one; fixtures substitute a scripted peer behind this trait.
 pub trait BytePort: Send + Sync + Debug {
     /// Write bytes to the port. May block briefly on the UART's
     /// transmit-holding-empty bit (the 8250 implementation spins on

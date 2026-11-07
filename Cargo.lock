@@ -915,6 +915,7 @@ name = "narf-bluetooth"
 version = "0.0.0"
 dependencies = [
  "narf-audio",
+ "narf-boot",
  "narf-bus",
  "narf-capabilities",
  "narf-console",
@@ -929,6 +930,7 @@ dependencies = [
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
  "narf-power",
  "narf-scheduler",
  "narf-time",
