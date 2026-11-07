@@ -444,8 +444,13 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   `MAC_INIT`, wait for ROM) + `fw::setup`, and unparks the pump —
   the transport survives, so the HCI index is kept and
   `register_ready_transport` is not re-run.
-  Out of scope here: a sysfs store path for `idle_timeout` —
-  follow-up.
+  The `idle_timeout` sysfs attribute is writable (#1577): a store
+  parses milliseconds (0 = never autosuspend) and calls
+  `pm::set_idle_timeout_ms`, rejecting negative / non-numeric /
+  out-of-range input with `EINVAL`.
+  Out of scope here: PCIe controllers (`btintel_pcie` never enters
+  the HCI controller registry, so it has no index to key this
+  state off) — follow-up.
 
 ## Scope
 

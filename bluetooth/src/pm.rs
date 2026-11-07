@@ -182,7 +182,8 @@ pub fn idle_timeout_ms(index: usize) -> u32 {
 /// Set controller `index`'s idle timeout (ms). `0` disables
 /// autosuspend for the controller (Linux semantics); any other
 /// value is the idle window after which the hub pass may gate its
-/// port. No sysfs store path writes this yet.
+/// port. Writable from userspace via the sysfs `idle_timeout`
+/// store path (`sysfs_bridge`); see #1577.
 pub fn set_idle_timeout_ms(index: usize, ms: u32) {
     update(index, |s| s.idle_timeout_ms = ms);
 }
