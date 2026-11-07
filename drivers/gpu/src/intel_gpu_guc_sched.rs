@@ -755,6 +755,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
             batches,
             batch_count: batch_count as u8,
             wq,
+            comm: None,
+            pid: None,
+            snapshot_time: None,
         })
     }
 
@@ -1687,6 +1690,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                                 now_ns: now,
                                 state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
                                 engines: self.engines,
+                                process_name: None,
+                                pid: None,
+                                snapshot_time: None,
                             },
                             contexts,
                             |offset| {
@@ -2151,6 +2157,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             now_ns: now,
                             state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
                             engines: self.engines,
+                            process_name: None,
+                            pid: None,
+                            snapshot_time: None,
                         },
                         contexts,
                         |_| None,

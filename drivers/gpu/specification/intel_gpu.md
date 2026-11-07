@@ -7271,3 +7271,32 @@ Legacy Intel graphics tooling (such as Intel GPA, gputop, and Mesa perf query la
 Fixtures added:
 - `drivers/gpu/intel_gpu_oa`: `smoke_i915_perf_open_add_remove_config_and_stream`, `smoke_oa_test_session_i915_header`.
 - `drivers/gpu/intel_gpu_render`: `smoke_i915_perf_getparam_and_query_config`.
+
+### Xe OAR/OAC Exec-Queue Streams & Steered Manual Capture — native fixtures added
+
+This slice adds context-attached OA stream support on native Xe queues alongside steered manual error capture and diagnostic process facts:
+
+1. **Xe OAR/OAC Exec-Queue Streams (`intel_gpu_oa`):**
+   - Supports `DRM_XE_OA_PROPERTY_EXEC_QUEUE_ID` in `intel_gpu_oa::open`.
+   - Validates queue existence (rejects missing queues with `NotFound`/`-ENOENT`) and single-lane width (rejects parallel queues `width > 1` with `EOPNOTSUPP`).
+   - Validates engine-class format compatibility:
+     - Render queue (class 0 / RCS0): allows OAR and OAG formats; rejects OAC formats with `InvalidData`.
+     - Compute queue (class 4 / CCS0..3): allows OAC and OAG formats; rejects OAR formats with `InvalidData`.
+     - System-wide streams (`exec_queue` absent): rejects context-only OAR/OAC formats with `InvalidData`.
+   - Privilege policy:
+     - Unprivileged callers can open event/batch-triggered streams on their own queue (`sample: false`), with stream ioctls (`ENABLE`, `DISABLE`, `CONFIG`, `STATUS`) and reads permitted without physical authority.
+     - Periodic timer sampling (`sample: true`) and preemption holding (`no_preempt: true`, property 9) require privilege (`Gate::PHYSICAL`).
+   - `Session`: records `exec_queue: Option<u32>`, `no_preempt: bool`, and `privileged: bool` with exposed accessors.
+
+2. **Steered Manual Capture (`intel_gpu_guc_capture`):**
+   - `capture_manual_steered(family, engine, steered, read, read_steered)` reads steered render/compute extension registers (`lists.steered`) using MCR steering into `self.regs[CLASS]` with flags `STEERING_NEEDED | (group << 12) | (instance << 20)`.
+   - `print_dump` formats steered registers grouped by DSS under `\tDSS_{dss}:` headings matching Linux `xe_guc_capture`.
+
+3. **Coredump Process and Snapshot Time Facts (`intel_gpu_guc_capture`):**
+   - `Queue` and `Capture`/`Report` carry optional `comm: Option<&'static str>`, `pid: Option<u32>`, and `snapshot_time: Option<(u64, u32)>`.
+   - `print_dump` outputs `Process: {name} [{pid}]` (fallback `Process: unavailable`) and `Snapshot time: {secs}.{nanos:09}` (fallback `Snapshot time: unavailable`).
+
+Fixtures added:
+- `drivers/gpu/intel_gpu_oa`: `smoke_oa_exec_queue_oar_oac_streams`.
+- `drivers/gpu/intel_gpu_error`: `smoke_guc_capture_manual_steered_and_dss_formatting`.
+- `drivers/gpu/intel_gpu_error`: `smoke_coredump_process_and_snapshot_time_formatting`.

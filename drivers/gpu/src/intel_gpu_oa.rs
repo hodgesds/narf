@@ -759,6 +759,16 @@ pub(crate) async fn open(
     if p.format == 0 || format.size == 0 || !oag_format(format.kind) {
         return Err(FsError::InvalidData.into());
     }
+    if exec.is_some() {
+        if hwe == Engine::Rcs0 && format.kind == OAC {
+            return Err(FsError::InvalidData.into());
+        }
+        if hwe.is_compute() && format.kind == OAR {
+            return Err(FsError::InvalidData.into());
+        }
+    } else if format.kind == OAR || format.kind == OAC {
+        return Err(FsError::InvalidData.into());
+    }
     if p.exponent >= 0 && !p.sample {
         return Err(FsError::InvalidData.into());
     }
@@ -786,10 +796,6 @@ pub(crate) async fn open(
         // xe_oa_alloc_oa_buffer: the retained reservation is the only buffer.
         return Err(FsError::OutOfMemory.into());
     }
-    if exec.is_some() {
-        // xe_oa_configure_oa_context: OAR/OAC exec-queue streams.
-        return Err(Error::Errno(EOPNOTSUPP));
-    }
     let session = Session::new(
         device,
         format,
@@ -801,6 +807,9 @@ pub(crate) async fn open(
         permit,
         config,
         false,
+        (p.exec_queue > 0).then_some(p.exec_queue as u32),
+        p.no_preempt,
+        privileged,
     );
     let mut pending = PendingOpen {
         session: session.clone(),
@@ -814,9 +823,11 @@ pub(crate) async fn open(
             },
         )
         .await?;
-    if let Err(error) = gate.check() {
-        session.fail(error);
-        return Err(error.into());
+    if privileged {
+        if let Err(error) = gate.check() {
+            session.fail(error);
+            return Err(error.into());
+        }
     }
     let file = Arc::new(File {
         session,
@@ -989,6 +1000,9 @@ pub(crate) async fn i915_open(
         hwe,
         permit,
         config,
+        true,
+        None,
+        false,
         true,
     );
 
@@ -1360,6 +1374,9 @@ pub struct Session {
     /// The attached unit's host pages, for xe_oa_mmap.
     pages: IrqSafeSpinLock<Option<Arc<Pages>>>,
     pub(crate) is_i915: bool,
+    exec_queue: Option<u32>,
+    no_preempt: bool,
+    privileged: bool,
 }
 impl core::fmt::Debug for Session {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1379,6 +1396,9 @@ impl Session {
         permit: Permit,
         config: Arc<Config>,
         is_i915: bool,
+        exec_queue: Option<u32>,
+        no_preempt: bool,
+        privileged: bool,
     ) -> Arc<Self> {
         // Xe2+ OAG overrun mode writes no partial report at the buffer end.
         let circ = if device.profile() == Profile::Xe2 && sample {
@@ -1403,7 +1423,19 @@ impl Session {
             lock: Mutex::new(()),
             pages: IrqSafeSpinLock::new(None),
             is_i915,
+            exec_queue,
+            no_preempt,
+            privileged,
         })
+    }
+    pub(crate) fn exec_queue(&self) -> Option<u32> {
+        self.exec_queue
+    }
+    pub(crate) fn no_preempt(&self) -> bool {
+        self.no_preempt
+    }
+    pub(crate) fn privileged(&self) -> bool {
+        self.privileged
     }
     pub(crate) fn device(&self) -> Device {
         self.device
@@ -1561,9 +1593,13 @@ impl Drop for File {
 }
 impl File {
     fn authority(&self) -> Result<(), FsError> {
-        self.gate
-            .check()
-            .inspect_err(|&error| self.session.fail(error))
+        if self.session.privileged {
+            self.gate
+                .check()
+                .inspect_err(|&error| self.session.fail(error))
+        } else {
+            Ok(())
+        }
     }
     async fn ioctl(&self, cmd: u32, arg: u64, user: &dyn IoctlContext) -> Result<u64, Error> {
         let _stream_lock = self.session.lock.lock().await;
@@ -1721,7 +1757,7 @@ impl FileOps for File {
         1
     }
     fn poll_readiness(&self) -> u32 {
-        if (self.gate.capable)() {
+        if !self.session.privileged || (self.gate.capable)() {
             self.session.ready.mask()
         } else {
             POLL_ERR | POLL_HUP
@@ -2490,6 +2526,9 @@ pub(crate) fn test_session(
             0,
         )),
         false,
+        None,
+        false,
+        true,
     )
 }
 
@@ -2518,6 +2557,9 @@ pub(crate) fn test_session_i915(
             0,
             0,
         )),
+        true,
+        None,
+        false,
         true,
     )
 }
