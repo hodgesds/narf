@@ -726,7 +726,7 @@ impl Igc {
             return crate::publish::LinkSample::DOWN;
         }
         let status = self.hw.read(8);
-        if status == u32::MAX || status & 2 == 0 || !hardware::phy_has_link(&self.hw) {
+        if status == u32::MAX || status & 2 == 0 {
             return crate::publish::LinkSample::DOWN;
         }
         decode_link(status)

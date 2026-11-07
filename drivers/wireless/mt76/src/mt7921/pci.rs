@@ -437,7 +437,11 @@ fn bring_up_current(
 
     // ── Stage 1: driver-own + firmware-load stub + EFUSE ─────────
     //
+    // Linux mt7921_pci_probe calls mt792xe_mcu_fw_pmctrl (HOST_SET_OWN)
+    // before __mt792xe_mcu_drv_pmctrl (HOST_CLR_OWN) to synchronize
+    // power management controller state.
     // SAFETY: BAR0 mapped + owned.
+    let _ = unsafe { mac::give_firmware_own(&mmio_bar0) };
     let driver_owned = match unsafe { mac::take_driver_own(&mmio_bar0) } {
         Ok(()) => true,
         Err(mac::PowerError::Timeout) => return Err(ProbeError::DriverOwnTimeout),

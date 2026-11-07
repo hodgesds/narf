@@ -9034,7 +9034,14 @@ impl SocketFile {
                     Some(a) if a.body.len() < SOCKADDR_IN6_BODY_LEN => {
                         return SocketOpResult::Err(SockError::InvalidArg)
                     }
-                    Some(a) if a.family != AF_INET6 && a.family != AF_UNSPEC => {
+                    Some(mut a) if a.family == AF_UNSPEC => {
+                        a.family = AF_INET6;
+                        match inet6_sockaddr_scoped(&a) {
+                            Ok(parsed) => Some(parsed),
+                            Err(e) => return SocketOpResult::Err(e),
+                        }
+                    }
+                    Some(a) if a.family != AF_INET6 => {
                         return SocketOpResult::Err(SockError::AfNoSupport)
                     }
                     Some(a) => match inet6_sockaddr_scoped(&a) {
