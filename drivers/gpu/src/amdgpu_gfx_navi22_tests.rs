@@ -91,6 +91,7 @@ pub(crate) fn gpu() -> AmdGpu {
             visible_size: 256 << 20,
         },
         mode: None,
+        backlight_percent: None,
         fw_loaded: false,
         gc_info: None,
         vbios: None,

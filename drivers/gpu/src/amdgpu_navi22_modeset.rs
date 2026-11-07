@@ -2584,6 +2584,7 @@ fn snapshot(gpu: &AmdGpu) -> Result<AmdGpu, Error> {
         gc_info: None,
         vbios: None,
         mode: None,
+        backlight_percent: None,
         fw_loaded: false,
     })
 }

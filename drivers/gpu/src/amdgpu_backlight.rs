@@ -148,6 +148,39 @@ pub fn active_duty_count(brightness_u16: u16, period_cntl: u32) -> u32 {
     count + ((active >> (bit_count - 1)) as u32 & 1)
 }
 
+/// Inverse of [`active_duty_count`]: recover the programmed
+/// brightness percentage from the active duty count read back out
+/// of `BL_PWM_CNTL.BL_ACTIVE_INT_FRAC_CNT` and the period VBIOS
+/// programmed (`BL_PWM_PERIOD_CNTL`).
+///
+///   bit_count       = BITCNT, or 16 when BITCNT is zero
+///   masked_period   = PERIOD & ((1 << bit_count) - 1)
+///   brightness      = active_count * (1 << bit_count) / masked_period
+///   percent         = brightness * 100 / 0xFFFF
+///
+/// Returns `None` when the period carries no duty to scale
+/// against (masked period zero) — the caller falls back to full
+/// brightness rather than inventing a level from a dead register.
+/// Endpoints are exact: a zero count reads back 0%, a full-scale
+/// count reads back 100%.
+pub fn percent_for_active_count(active_count: u32, period_cntl: u32) -> Option<u8> {
+    let bitcnt = (period_cntl & BL_PWM_PERIOD_BITCNT_MASK) >> BL_PWM_PERIOD_BITCNT_SHIFT;
+    let bit_count = if bitcnt == 0 { 16 } else { bitcnt };
+    let period = period_cntl & BL_PWM_PERIOD_MASK;
+    let masked_period = if bit_count >= 32 {
+        period
+    } else {
+        period & ((1u32 << bit_count) - 1)
+    };
+    if masked_period == 0 {
+        return None;
+    }
+    let count = active_count & BL_ACTIVE_INT_FRAC_CNT_MASK;
+    let brightness = ((count as u64) << bit_count) / masked_period as u64;
+    let brightness = brightness.min(0xFFFF) as u32;
+    Some(((brightness * 100) / 0xFFFF).min(100) as u8)
+}
+
 /// Build the one-shot PWM init sequence for `instance`: program the period,
 /// then enable the PWM.
 ///
@@ -418,6 +451,47 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_user_level_pct_round_trip);
+
+    /// `percent_for_active_count` inverts `active_duty_count`:
+    /// the level a first modeset reads back out of the panel
+    /// (#948) must be the level `set_backlight` would program.
+    /// Periods come from the DC semantics, not the implementation:
+    /// a full 16-bit period with BITCNT 0, a BITCNT-scaled period,
+    /// and a dead (zero) period.
+    fn smoke_percent_for_active_count_round_trip() -> TestResult {
+        // Endpoints are exact.
+        if percent_for_active_count(0, 0xFFFF) != Some(0) {
+            return TestResult::Fail("zero duty not 0%");
+        }
+        if percent_for_active_count(0xFFFF, 0xFFFF) != Some(100) {
+            return TestResult::Fail("full duty not 100%");
+        }
+        // A dead period carries no duty to scale against.
+        if percent_for_active_count(0x8000, 0).is_some() {
+            return TestResult::Fail("zero period must be unrecoverable");
+        }
+        if percent_for_active_count(0x8000, 0x0001_0000).is_some() {
+            return TestResult::Fail("BITCNT-only period must be unrecoverable");
+        }
+        // Round-trip through the forward arithmetic, both at the
+        // 16-bit period VBIOS programs and at a BITCNT-scaled one
+        // (period 0x2000 in 2^14 units: BITCNT 14, raw 0xE2000).
+        for period_cntl in [0xFFFF, 0x000E_2000] {
+            for pct in [0u8, 1, 25, 50, 75, 99, 100] {
+                let level = user_level_for_percent(pct);
+                let count = active_duty_count(level, period_cntl);
+                let back = percent_for_active_count(count, period_cntl);
+                let Some(back) = back else {
+                    return TestResult::Fail("round-trip lost the level");
+                };
+                if back.abs_diff(pct) > 1 {
+                    return TestResult::Fail("round-trip drifted by >1%");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_percent_for_active_count_round_trip);
 
     /// Mock eDP HW that records GPIO + PWM + delay calls.
     struct MockEdpHw {
