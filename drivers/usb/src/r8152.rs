@@ -642,10 +642,6 @@ pub const RD_UDP_CS_V2: u32 = 1 << 11;
 pub const RX_IPF_V2: u32 = 1 << 26;
 pub const RX_UDPF_V2: u32 = 1 << 25;
 pub const RX_TCPF_V2: u32 = 1 << 24;
-/// FCS bytes trailing each RX frame inside the descriptor's
-/// length field (Linux `ETH_FCS_LEN`); the v2 walk strips
-/// them, so `RxSegment.len` stays "delivered frame bytes".
-pub const RX_FCS_LEN: usize = 4;
 /// TX descriptor length / aggregation alignment for v2
 /// (Linux `tx_desc_v2`, `r8157_desc_init`: `tx_desc.size` =
 /// 16, `tx_desc.align` = 16).
@@ -3549,6 +3545,7 @@ async fn mdi_swap_if_reversed(dev: &USBDevice) -> Result<(), ()> {
 /// for it), and whether a failed PHY patch request aborted the
 /// run — Linux returns from `*_hw_phy_cfg` on it, so later steps
 /// become no-ops, including the patch release.
+#[derive(Debug)]
 pub struct PhyInitCtx<'a> {
     version: RtlVersion,
     fw: Option<&'a [u8]>,
