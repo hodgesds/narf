@@ -33,6 +33,11 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use narf_input::{
+    evdev::{DeviceNode, MtContactUpdate, MtEvdevState},
+    push_global, InputEvent, PointerButtons, PointerEvent, TouchEvent, TouchState,
+};
+
 pub use narf_input::rmi4::{
     F01DeviceStatus, Finger, PdtEntry, Rmi4Error, TouchpadReport, F01_CONFIGURED,
     F01_DEVICE_CONTROL, F01_NOSLEEP, F01_REPORT_RATE_HIGH, F01_SLEEP_NORMAL, F01_SLEEP_RESERVED,
@@ -397,4 +402,282 @@ pub fn walk_pdt_page(
 /// doesn't expose that function.
 pub fn find_function(table: &[PdtEntry], function_number: u8) -> Option<&PdtEntry> {
     table.iter().find(|e| e.function_number == function_number)
+}
+
+// ── Shared device probe (HID + SMBus) ─────────────────────────────
+//
+// Both transports run the same probe — PDT walk on page 0, F$01
+// product-info query, locate the 2D sensor (F$11 or F$12) and the
+// F$30 buttons — and both need the same interrupt-source map, so
+// it lives here once instead of once per transport.
+
+/// One probed RMI4 device: the page-0 PDT plus the functions the
+/// pump needs, resolved once at bind time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rmi4DeviceProbe {
+    pub table: Vec<PdtEntry>,
+    pub product: F01ProductInfo,
+    pub f11: Option<PdtEntry>,
+    pub f12: Option<PdtEntry>,
+    pub f30: Option<PdtEntry>,
+    /// GPIO/LED line count from the F$30 query (0 when the device
+    /// has no F$30 function or the query read failed — the button
+    /// reader then defaults to a 1-byte bitmap).
+    pub f30_gpio_count: u8,
+    /// `(function_number, interrupt-source bitmask)` in PDT scan
+    /// order — see [`build_interrupt_map`].
+    pub interrupt_map: Vec<(u8, u8)>,
+}
+
+impl Rmi4DeviceProbe {
+    /// Interrupt-source bitmask owned by `function_number`
+    /// (0 when the function is absent or owns no sources).
+    pub fn source_mask_for(&self, function_number: u8) -> u8 {
+        self.interrupt_map
+            .iter()
+            .find(|(f, _)| *f == function_number)
+            .map(|(_, m)| *m)
+            .unwrap_or(0)
+    }
+
+    /// Function owning interrupt-source bit `bit`, if any.
+    pub fn function_for_source(&self, bit: u8) -> Option<u8> {
+        self.interrupt_map
+            .iter()
+            .find(|(_, m)| m & (1 << bit) != 0)
+            .map(|(f, _)| *f)
+    }
+}
+
+/// Assign interrupt-source bits to PDT entries in scan order:
+/// the first entry's sources take the lowest bits, the next
+/// entry follows, and so on (Linux `rmi_driver.c` assigns
+/// sources in the same scan order). Only the first 8 sources are
+/// mapped — the F$01 interrupt-status registers beyond the first
+/// byte belong to functions no laptop touchpad exposes, and the
+/// ATTN bitmap the HID transport decodes is one byte.
+pub fn build_interrupt_map(table: &[PdtEntry]) -> Vec<(u8, u8)> {
+    let mut out = Vec::new();
+    let mut bit: u32 = 0;
+    for e in table {
+        let mut mask = 0u8;
+        for _ in 0..e.interrupt_source_count {
+            if bit < 8 {
+                mask |= 1 << bit;
+            }
+            bit += 1;
+        }
+        out.push((e.function_number, mask));
+    }
+    out
+}
+
+/// Probe a device over a synchronous transport: walk the page-0
+/// PDT, read the F$01 product-info query block, and resolve the
+/// 2D sensor + F$30 entries. Fails when the device has no F$01
+/// or no 2D sensor — the caller then falls back to generic HID
+/// routing (or, for SMBus, declines the device).
+pub fn probe_device(transport: &mut dyn Rmi4Transport) -> Result<Rmi4DeviceProbe, TransportError> {
+    let table = walk_pdt_page(transport, 0)?;
+    let f01 = find_function(&table, F01_DEVICE_CONTROL)
+        .copied()
+        .ok_or(TransportError::Protocol)?;
+    let mut query = [0u8; 11];
+    transport.read_block(f01.query_base as u16, &mut query)?;
+    let product = F01ProductInfo::decode(&query).map_err(|_| TransportError::Short)?;
+    let f11 = find_function(&table, F11_2D_TOUCHPAD).copied();
+    let f12 = find_function(&table, F12_2D_TOUCHPAD_NEXT).copied();
+    let f30 = find_function(&table, F30_GPIO_LED).copied();
+    if f11.is_none() && f12.is_none() {
+        return Err(TransportError::Protocol);
+    }
+    // F$30 GPIO/LED line count from its query registers (2 bytes
+    // at the query base). Defaults to 8 (one button byte) when
+    // the function exists but the query read fails, and 0 when
+    // there is no F$30 function at all.
+    let mut f30_gpio_count = if f30.is_some() { 8 } else { 0 };
+    if let Some(f30e) = &f30 {
+        let mut qbuf = [0u8; 2];
+        if transport
+            .read_block(f30e.query_base as u16, &mut qbuf)
+            .is_ok()
+        {
+            if let Ok(q) = F30Query::decode(&qbuf) {
+                f30_gpio_count = q.gpio_led_count;
+            }
+        }
+    }
+    let interrupt_map = build_interrupt_map(&table);
+    Ok(Rmi4DeviceProbe {
+        table,
+        product,
+        f11,
+        f12,
+        f30,
+        f30_gpio_count,
+        interrupt_map,
+    })
+}
+
+// ── Shared contact pump (HID + SMBus + Elan) ───────────────────────
+//
+// Every vendor transport ends the same way: a positional array of
+// contacts (slot = index) plus a clickpad button state, published
+// as `TouchEvent`s on the global ring, a relative-pointer feed
+// off the first contact, and a slot-protocol-B frame on the
+// device's evdev node. One implementation keeps the three
+// transports' event streams identical.
+
+/// Maximum simultaneously tracked contacts in the shared RMI4
+/// pump. Matches the F$11/F$12 five-finger panels with room for
+/// the ten-object F$12 parts.
+pub const RMI4_PUMP_MAX_SLOTS: usize = 10;
+
+/// One normalised 2D contact for the shared pump. Coordinates
+/// are raw device units; the pump normalises them against the
+/// caller's axis ranges for the global ring and passes them raw
+/// to the evdev frame (libinput maps them through the caps'
+/// `EVIOCGABS` ranges, as the PTP path does).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rmi4Contact {
+    pub present: bool,
+    pub x: i32,
+    pub y: i32,
+    pub pressure: i32,
+}
+
+/// Axis ranges the shared pump normalises contacts against.
+/// One bound per axis; the pump maps raw device units into the
+/// global ring through [`TouchEvent::normalise_axis`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rmi4PumpBounds {
+    pub x_min: i32,
+    pub x_max: i32,
+    pub y_min: i32,
+    pub y_max: i32,
+}
+
+/// Per-device pump state shared by the HID, SMBus, and Elan
+/// transports.
+#[derive(Debug)]
+pub struct Rmi4PumpState {
+    slots: [bool; RMI4_PUMP_MAX_SLOTS],
+    last_pos: [(i32, i32); RMI4_PUMP_MAX_SLOTS],
+    evdev: MtEvdevState,
+    last_pointer: Option<(i32, i32)>,
+    last_button: bool,
+}
+
+impl Rmi4PumpState {
+    pub fn new() -> Self {
+        Self {
+            slots: [false; RMI4_PUMP_MAX_SLOTS],
+            last_pos: [(0, 0); RMI4_PUMP_MAX_SLOTS],
+            evdev: MtEvdevState::new(RMI4_PUMP_MAX_SLOTS),
+            last_pointer: None,
+            last_button: false,
+        }
+    }
+
+    /// Pump one frame. `contacts` is positional (index = slot);
+    /// entries past [`RMI4_PUMP_MAX_SLOTS`] are dropped.
+    /// `btn_left` is `None` when the button state is unknown this
+    /// frame (no F$30 source fired) — the pump then holds the
+    /// previous button state instead of synthesising a release.
+    /// Returns the number of `TouchEvent`s pushed to the global ring.
+    pub fn pump_contacts(
+        &mut self,
+        node: Option<&DeviceNode>,
+        contacts: &[Rmi4Contact],
+        btn_left: Option<bool>,
+        bounds: Rmi4PumpBounds,
+    ) -> usize {
+        let mut pushed = 0usize;
+        let mut updates: Vec<MtContactUpdate> = Vec::new();
+        let mut first: Option<(i32, i32)> = None;
+        for (i, c) in contacts.iter().enumerate().take(RMI4_PUMP_MAX_SLOTS) {
+            let slot = i as u8;
+            if c.present {
+                if first.is_none() {
+                    first = Some((c.x, c.y));
+                }
+                let state = if self.slots[i] {
+                    TouchState::Move
+                } else {
+                    TouchState::Down
+                };
+                let _ = push_global(InputEvent::Touch(TouchEvent {
+                    slot,
+                    tracking_id: Some(i as i32),
+                    id: i as u16,
+                    x: TouchEvent::normalise_axis(c.x, bounds.x_min, bounds.x_max) as i32,
+                    y: TouchEvent::normalise_axis(c.y, bounds.y_min, bounds.y_max) as i32,
+                    pressure: c.pressure,
+                    state,
+                }));
+                updates.push(MtContactUpdate {
+                    slot: i,
+                    active: true,
+                    tracking_id: i as i32,
+                    x: c.x,
+                    y: c.y,
+                    pressure: Some(c.pressure),
+                });
+                self.slots[i] = true;
+                self.last_pos[i] = (c.x, c.y);
+                pushed += 1;
+            } else if self.slots[i] {
+                let (lx, ly) = self.last_pos[i];
+                let _ = push_global(InputEvent::Touch(TouchEvent {
+                    slot,
+                    tracking_id: Some(i as i32),
+                    id: i as u16,
+                    x: TouchEvent::normalise_axis(lx, bounds.x_min, bounds.x_max) as i32,
+                    y: TouchEvent::normalise_axis(ly, bounds.y_min, bounds.y_max) as i32,
+                    pressure: 0,
+                    state: TouchState::Up,
+                }));
+                updates.push(MtContactUpdate {
+                    slot: i,
+                    active: false,
+                    tracking_id: i as i32,
+                    x: lx,
+                    y: ly,
+                    pressure: None,
+                });
+                self.slots[i] = false;
+                pushed += 1;
+            }
+        }
+        // `None` holds the previous button state (see above).
+        let btn = btn_left.unwrap_or(self.last_button);
+        if let Some(node) = node {
+            self.evdev.dispatch_frame(node, &updates, btn, false);
+        }
+        // Relative-pointer feed off the first contact, mirroring
+        // the PTP pump's first-contact semantics.
+        let (dx, dy) = match (first, self.last_pointer) {
+            (Some((x, y)), Some((px, py))) => (x - px, y - py),
+            (Some(_), None) => (0, 0),
+            (None, _) => (0, 0),
+        };
+        self.last_pointer = first;
+        let button_changed = btn != self.last_button;
+        self.last_button = btn;
+        if dx != 0 || dy != 0 || button_changed {
+            let buttons = if btn {
+                PointerButtons::LEFT
+            } else {
+                PointerButtons::EMPTY
+            };
+            let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
+        }
+        pushed
+    }
+}
+
+impl Default for Rmi4PumpState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
