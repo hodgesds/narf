@@ -3938,3 +3938,292 @@ kernel_test_in!(
     "power/service",
     smoke_power_service_critical_battery_warning_edge
 );
+
+fn smoke_power_monitor_poll_feeds_lid_close_to_policy() -> TestResult {
+    use crate::bootstrap_power_authority;
+    use crate::monitor;
+    use crate::service::{self, PowerAction, StateProviders};
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use narf_acpi::ac_adapter::AcAdapterState;
+    use narf_acpi::lid::LidState;
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    #[derive(Debug)]
+    struct Recorder(IrqSafeSpinLock<Vec<PowerAction>>);
+    impl service::ActionExecutor for Recorder {
+        fn execute(&self, action: PowerAction) {
+            self.0.lock().push(action);
+        }
+    }
+
+    service::__reset_for_test();
+    monitor::__reset_for_test();
+    let cap = bootstrap_power_authority();
+    let recorder = Arc::new(Recorder(IrqSafeSpinLock::new(Vec::new())));
+    if service::install_action_executor(&cap, recorder.clone()).is_err() {
+        return TestResult::Fail("install_action_executor rejected the bootstrap cap");
+    }
+
+    // Lid driven by a flag so the fixture — not the EC — moves it.
+    let closed = Arc::new(AtomicBool::new(false));
+    let lid_flag = closed.clone();
+    let providers = StateProviders {
+        ac_adapter: Some(Arc::new(|| Some(AcAdapterState::Online))),
+        lid: Some(Arc::new(move || {
+            Some(if lid_flag.load(Ordering::Acquire) {
+                LidState::Closed
+            } else {
+                LidState::Open
+            })
+        })),
+        battery: Some(Arc::new(|| Some(service_test_battery(false)))),
+        ..Default::default()
+    };
+    if service::register_state_providers(&cap, providers).is_err() {
+        return TestResult::Fail("register_state_providers rejected the bootstrap cap");
+    }
+
+    // Poll 1 (lid open) seeds the baseline: no request, but the
+    // snapshot is cached for latest().
+    let snap = monitor::poll_once();
+    if monitor::poll_count() != 1 {
+        return TestResult::Fail("poll_count did not advance on the first poll");
+    }
+    if snap.lid != Some(LidState::Open) {
+        return TestResult::Fail("first poll did not read the lid provider");
+    }
+    if monitor::latest().is_none_or(|s| s.lid != Some(LidState::Open)) {
+        return TestResult::Fail("latest() did not cache the first poll's snapshot");
+    }
+    if service::pending_actions() != 0 {
+        return TestResult::Fail("baseline poll queued an action");
+    }
+
+    // Lid closes between polls: the watcher feeds the transition
+    // into the service intake, and the default policy requests
+    // suspend. Pumping executes exactly one Suspend.
+    closed.store(true, Ordering::Release);
+    let snap = monitor::poll_once();
+    if snap.lid != Some(LidState::Closed) {
+        return TestResult::Fail("second poll did not read the closed lid");
+    }
+    if service::pending_actions() != 1 {
+        return TestResult::Fail("lid-close poll did not queue the Suspend bit");
+    }
+    if service::stats().lid_closes != 1 {
+        return TestResult::Fail("lid-close poll was not counted once");
+    }
+    if service::pump_pending() != 1 {
+        return TestResult::Fail("pump did not execute the polled suspend request");
+    }
+    {
+        let got = recorder.0.lock();
+        if got.as_slice() != [PowerAction::Suspend] {
+            return TestResult::Fail("executor did not receive exactly [Suspend]");
+        }
+    }
+
+    // Lid stays closed: the feed is edge-triggered, so a further
+    // poll requests nothing.
+    let _ = monitor::poll_once();
+    if service::pending_actions() != 0 || service::stats().lid_closes != 1 {
+        return TestResult::Fail("steady closed lid re-requested suspend");
+    }
+
+    // Lid opens: fed as an open, which requests nothing.
+    closed.store(false, Ordering::Release);
+    let _ = monitor::poll_once();
+    if service::pending_actions() != 0 || service::stats().lid_opens != 1 {
+        return TestResult::Fail("lid-open poll was not fed as a single open");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/service",
+    smoke_power_monitor_poll_feeds_lid_close_to_policy
+);
+
+fn smoke_power_monitor_poll_feeds_ac_transition_to_cache() -> TestResult {
+    use crate::bootstrap_power_authority;
+    use crate::monitor;
+    use crate::service::{self, StateProviders};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use narf_acpi::ac_adapter::AcAdapterState;
+
+    service::__reset_for_test();
+    monitor::__reset_for_test();
+    let cap = bootstrap_power_authority();
+
+    // AC provider driven by flags: `present` gates whether it
+    // answers at all, `online` its reported state. Dropping the
+    // provider proves the poll fed the event-cached fallback.
+    let present = Arc::new(AtomicBool::new(true));
+    let online = Arc::new(AtomicBool::new(true));
+    let p = present.clone();
+    let o = online.clone();
+    let providers = StateProviders {
+        ac_adapter: Some(Arc::new(move || {
+            if !p.load(Ordering::Acquire) {
+                return None;
+            }
+            Some(if o.load(Ordering::Acquire) {
+                AcAdapterState::Online
+            } else {
+                AcAdapterState::Offline
+            })
+        })),
+        ..Default::default()
+    };
+    if service::register_state_providers(&cap, providers).is_err() {
+        return TestResult::Fail("register_state_providers rejected the bootstrap cap");
+    }
+
+    // Poll 1 (online) seeds the baseline without feeding.
+    let snap = monitor::poll_once();
+    if snap.ac_adapter != Some(AcAdapterState::Online) {
+        return TestResult::Fail("first poll did not read the AC provider");
+    }
+    // Poll 2 (offline) feeds the transition into the cache.
+    online.store(false, Ordering::Release);
+    let snap = monitor::poll_once();
+    if snap.ac_adapter != Some(AcAdapterState::Offline) {
+        return TestResult::Fail("second poll did not read the offline AC state");
+    }
+    // Provider goes silent: the snapshot falls back to the cached
+    // offline state the poll fed — not to "unknown".
+    present.store(false, Ordering::Release);
+    let snap = monitor::poll_once();
+    if snap.ac_adapter != Some(AcAdapterState::Offline) {
+        return TestResult::Fail("snapshot did not fall back to the poll-fed AC cache");
+    }
+    // And the reverse direction: online again, re-fed, then silent.
+    present.store(true, Ordering::Release);
+    online.store(true, Ordering::Release);
+    let _ = monitor::poll_once();
+    present.store(false, Ordering::Release);
+    let snap = monitor::poll_once();
+    if snap.ac_adapter != Some(AcAdapterState::Online) {
+        return TestResult::Fail("snapshot did not fall back to the re-fed AC cache");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/service",
+    smoke_power_monitor_poll_feeds_ac_transition_to_cache
+);
+
+fn smoke_power_monitor_poll_fires_critical_warning_and_caches_latest() -> TestResult {
+    use crate::bootstrap_power_authority;
+    use crate::monitor;
+    use crate::service::{self, StateProviders};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use narf_acpi::ac_adapter::AcAdapterState;
+
+    service::__reset_for_test();
+    monitor::__reset_for_test();
+    let cap = bootstrap_power_authority();
+
+    let critical = Arc::new(AtomicBool::new(true));
+    let crit = critical.clone();
+    let providers = StateProviders {
+        ac_adapter: Some(Arc::new(|| Some(AcAdapterState::Offline))),
+        battery: Some(Arc::new(move || {
+            Some(service_test_battery(crit.load(Ordering::Acquire)))
+        })),
+        ..Default::default()
+    };
+    if service::register_state_providers(&cap, providers).is_err() {
+        return TestResult::Fail("register_state_providers rejected the bootstrap cap");
+    }
+    let warnings = Arc::new(AtomicU64::new(0));
+    let w = warnings.clone();
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        w.fetch_add(1, Ordering::AcqRel);
+    });
+    if service::install_warning_hook(&cap, hook).is_err() {
+        return TestResult::Fail("install_warning_hook rejected the bootstrap cap");
+    }
+
+    // The very first poll already fires: the snapshot's own hook is
+    // live from poll one (only the intake feed is baseline-seeded).
+    let _ = monitor::poll_once();
+    if warnings.load(Ordering::Acquire) != 1 || service::stats().warnings_fired != 1 {
+        return TestResult::Fail("first poll did not fire the critical-battery warning");
+    }
+    if monitor::latest().is_none_or(|s| !s.is_running_low_on_battery()) {
+        return TestResult::Fail("latest() did not cache the critical snapshot");
+    }
+    // Still critical: no re-fire.
+    let _ = monitor::poll_once();
+    if warnings.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("warning hook re-fired while still critical");
+    }
+    // Recover, then go critical again: fires a second time, and the
+    // cached snapshot tracks the recovery in between.
+    critical.store(false, Ordering::Release);
+    let _ = monitor::poll_once();
+    if monitor::latest().is_none_or(|s| s.is_running_low_on_battery()) {
+        return TestResult::Fail("latest() did not track the battery recovery");
+    }
+    critical.store(true, Ordering::Release);
+    let _ = monitor::poll_once();
+    if warnings.load(Ordering::Acquire) != 2 {
+        return TestResult::Fail("warning hook did not re-fire on a fresh critical transition");
+    }
+    if monitor::poll_count() != 4 {
+        return TestResult::Fail("poll_count is not 4 after four polls");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/service",
+    smoke_power_monitor_poll_fires_critical_warning_and_caches_latest
+);
+
+fn smoke_power_monitor_first_poll_seeds_baseline() -> TestResult {
+    use crate::bootstrap_power_authority;
+    use crate::monitor;
+    use crate::service::{self, StateProviders};
+    use alloc::sync::Arc;
+    use narf_acpi::ac_adapter::AcAdapterState;
+    use narf_acpi::lid::LidState;
+
+    service::__reset_for_test();
+    monitor::__reset_for_test();
+    let cap = bootstrap_power_authority();
+    let providers = StateProviders {
+        ac_adapter: Some(Arc::new(|| Some(AcAdapterState::Online))),
+        lid: Some(Arc::new(|| Some(LidState::Closed))),
+        battery: Some(Arc::new(|| Some(service_test_battery(false)))),
+        ..Default::default()
+    };
+    if service::register_state_providers(&cap, providers).is_err() {
+        return TestResult::Fail("register_state_providers rejected the bootstrap cap");
+    }
+
+    // Lid already closed when the watcher starts (e.g. a docked
+    // laptop): the first poll seeds the baseline and must NOT
+    // request suspend — the event path owns the initial state.
+    let snap = monitor::poll_once();
+    if snap.lid != Some(LidState::Closed) {
+        return TestResult::Fail("first poll did not read the closed lid");
+    }
+    if service::pending_actions() != 0 || service::stats().suspend_requests != 0 {
+        return TestResult::Fail("baseline poll requested suspend for a pre-closed lid");
+    }
+    // Still closed on the next poll: still nothing — the closed
+    // state is the baseline, not a transition.
+    let _ = monitor::poll_once();
+    if service::pending_actions() != 0 || service::stats().suspend_requests != 0 {
+        return TestResult::Fail("steady pre-closed lid requested suspend");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/service",
+    smoke_power_monitor_first_poll_seeds_baseline
+);

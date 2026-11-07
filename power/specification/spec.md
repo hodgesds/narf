@@ -1309,6 +1309,39 @@ implausible values, a nonzero status error code, a malformed
 block string) is reported absent by the provider — never
 published with fabricated values.
 
+#### 3.7.1 Power monitor — the periodic watcher (Refs #750)
+
+```rust
+// monitor: the periodic watcher; re-enables the bisect-disabled
+// `power-monitor` initcall (the stub evaluated live AML on the boot
+// path and could hang the bring-up laptop).
+pub const POLL_INTERVAL_MS: u64 = 5_000;
+pub fn poll_once() -> LaptopStateSnapshot;
+pub fn latest() -> Option<LaptopStateSnapshot>;
+pub fn poll_count() -> u64;
+pub fn start_watcher();                 // Stage::Late initcall
+```
+
+The `power-monitor` initcall only spawns the watcher task; every
+poll runs from task context via `service::snapshot()`, so no AML
+method is ever evaluated on the boot path and a slow or hung EC
+method can wedge at most the watcher task — never boot, and never
+the service worker (a separate task). Each poll produces a fused
+snapshot (which is what fires the edge-triggered critical-battery
+warning hook — the watcher is the first production caller of
+`snapshot()`), diffs the AC and lid fields against the previous
+poll, and feeds genuine transitions into the service intake
+(`on_ac_changed` / `on_lid_changed`), so a transition the EC /
+AML-Notify event path missed still reaches policy. The feed is
+edge-triggered: a lid that stays closed across polls requests
+suspend exactly once. The first poll only seeds the baseline and
+feeds nothing — the event path owns the initial state, so a lid
+already closed at watcher start (e.g. a docked laptop) never
+suspends the machine on a poll. The latest snapshot is cached for
+`latest()` so diagnostics and the UI can read the last polled state
+without re-evaluating AML; the watcher owns the button-counter
+drain cadence.
+
 ## 4. Invariants & safety properties
 
 - Suspend never returns without either `WokeUp` or `Aborted`;

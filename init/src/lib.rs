@@ -339,8 +339,8 @@ pub fn run_stage(stage: Stage) -> StageStats {
         // synchronously from the BSP, so there's no preemption
         // signal to fire on a stuck initcall. Logging the
         // overrun lets bring-up bisect which call ate the budget;
-        // re-enabling the BISECT-DISABLED power-monitor (see
-        // `power/src/lib.rs:199`) is the canonical regression
+        // the re-enabled `power-monitor` watcher (see
+        // `power/src/monitor.rs`) is the canonical regression
         // case this watchdog was wired for.
         let took_ms = cycles_to_ms(dt);
         if took_ms > ic.budget_ms as u64 {
