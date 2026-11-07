@@ -1438,18 +1438,27 @@ kernel_test_in!("drivers/nvme", smoke_admin_get_set_features_power_qemu);
 
 fn smoke_admin_aer_post_qemu() -> TestResult {
     // End-to-end: bring up and post 4 AER commands into the admin queue.
-    // The QEMU NVMe emulation does not fire async events, so we just
-    // verify the doorbell writes don't panic / corrupt the queue and
-    // the controller remains in a coherent state (subsequent IDENTIFY
-    // still completes successfully).
+    // The count 4 comes from the NVMe Base Spec 2.0c §5.2 floor — hosts
+    // SHOULD keep at least AERL+1 AER requests outstanding, and the
+    // spec-recommended floor is ≥4 — never from the driver's own
+    // ADMIN_Q_DEPTH constant. The fixture proves the admin queue holds
+    // all 4 at once by asserting the SQ occupancy rises by exactly 4;
+    // on the old depth-4 queue the post cap (depth - 1 = 3) would have
+    // silently posted only 3.
     //
-    // NVMe Base Spec 2.0c §5.2: hosts SHOULD keep at least AERL+1
-    // AER requests outstanding. AERL is capped to 4 by spec; QEMU
-    // reports 0 (1 slot) but accepts up to 3 before returning "Cmd
-    // Limit Exceeded" on the 4th. We cap at min(3, ADMIN_Q_DEPTH-1).
+    // The QEMU NVMe emulation does not fire async events, but it caps
+    // accepted AERs below the spec floor (reports AERL=0, accepts up to
+    // 3, completes a 4th with "Cmd Limit Exceeded"), so the controller
+    // may land a stray error completion in the admin CQ. Coherence is
+    // therefore checked on the I/O path (`read_lba`, whose CQ is
+    // separate) rather than with another admin command: on main there
+    // is no CID-matched completion tracking (#1619), so an admin
+    // submit could consume the stray AER completion as its own.
     use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
     // SAFETY: kernel-test runs at boot with the allocator online and the
     // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
     // window base, identity-mapped. `init` is idempotent (last call wins).
@@ -1473,19 +1482,41 @@ fn smoke_admin_aer_post_qemu() -> TestResult {
     if ctrl.bring_up(&dev_cap).is_err() {
         return TestResult::Fail("bring_up failed");
     }
-    // Post 1 AER (safe even with a shallow queue depth).
-    if ctrl.post_aer_commands(1).is_err() {
-        return TestResult::Fail("post_aer_commands failed");
+    if ctrl.create_io_queue().is_err() {
+        return TestResult::Fail("create_io_queue failed");
     }
-    // The controller remains functional — verify with a typed NS identify.
+    // Bring-up sanity on the admin path while the CQ is still clean
+    // (no AERs posted yet): IDENTIFY must complete.
     match ctrl.identify_namespace_typed(1) {
         Ok(ns) => {
             if ns.nsze == 0 {
-                return TestResult::Fail("NSZE is 0 after AER post");
+                return TestResult::Fail("NSZE is 0 after bring-up");
             }
         }
-        Err(_) => return TestResult::Fail("identify_namespace_typed failed after AER post"),
+        Err(_) => return TestResult::Fail("identify_namespace_typed failed after bring-up"),
     }
+    // Spec §5.2 floor: 4 AERs outstanding at once.
+    let before = ctrl.admin_sq_occupancy();
+    if ctrl.post_aer_commands(4).is_err() {
+        return TestResult::Fail("post_aer_commands failed");
+    }
+    let after = ctrl.admin_sq_occupancy();
+    if after != before + 4 {
+        return TestResult::Fail("admin SQ occupancy did not rise by 4 after posting 4 AERs");
+    }
+    // The controller remains functional with 4 AERs outstanding —
+    // verify on the I/O path (separate CQ, see header comment).
+    let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent failed"),
+    };
+    if ctrl.read_lba(0, 1, &buf).is_err() {
+        return TestResult::Fail("read_lba failed with 4 AERs outstanding");
+    }
+    // Best-effort tidy-up: consume any surplus-AER error completion
+    // QEMU landed in the admin CQ. No assertion on the drained count —
+    // whether the 4th AER completed already is QEMU's timing, not spec.
+    let _ = ctrl.drain_aer();
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_admin_aer_post_qemu);
