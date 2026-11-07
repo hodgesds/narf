@@ -230,6 +230,17 @@ pub fn shutdown(su: u16) -> Vec<u8> {
     buf
 }
 
+/// Build a complete TPM2_SelfTest command (Part 3 §9.5).
+/// `full` is the TPMI_YES_NO operand: `true` runs the full
+/// self-test, `false` runs only the tests not yet run in this
+/// power cycle. A TPM in failure mode answers `TPM_RC_FAILURE`.
+pub fn self_test(full: bool) -> Vec<u8> {
+    let mut buf = begin_command(TPM_ST_NO_SESSIONS, TPM_CC_SELF_TEST);
+    buf.push(if full { 1 } else { 0 });
+    finalise(&mut buf);
+    buf
+}
+
 /// Build a complete TPM2_GetRandom command (Part 3 §16.1).
 pub fn get_random(bytes_requested: u16) -> Vec<u8> {
     let mut buf = begin_command(TPM_ST_NO_SESSIONS, TPM_CC_GET_RANDOM);

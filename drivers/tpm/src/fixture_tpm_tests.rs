@@ -23,10 +23,10 @@ use crate::tpm2::nv::{NvIndex, NARF_SUSPEND_EPOCH_NV, NV_ATTR_PLATFORM_RW};
 use crate::tpm2::{
     TPM_ALG_SHA256, TPM_CAP_TPM_PROPERTIES, TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
     TPM_CC_DICTIONARY_ATTACK_PARAMETERS, TPM_CC_NV_INCREMENT, TPM_CC_POLICY_GET_DIGEST,
-    TPM_PT_LOCKOUT_COUNTER, TPM_RC_AUTH_FAIL, TPM_RC_BAD_AUTH, TPM_RC_FAILURE, TPM_RC_HANDLE,
-    TPM_RC_LOCKOUT, TPM_RC_NV_DEFINED, TPM_RC_NV_UNINITIALIZED, TPM_RC_POLICY_FAIL, TPM_RC_SUCCESS,
-    TPM_RH_NULL, TPM_RH_PLATFORM, TPM_RS_PW, TPM_SE_POLICY, TPM_SE_TRIAL, TPM_SU_CLEAR,
-    TPM_SU_STATE,
+    TPM_CC_SELF_TEST, TPM_PT_LOCKOUT_COUNTER, TPM_RC_AUTH_FAIL, TPM_RC_BAD_AUTH, TPM_RC_FAILURE,
+    TPM_RC_HANDLE, TPM_RC_LOCKOUT, TPM_RC_NV_DEFINED, TPM_RC_NV_UNINITIALIZED, TPM_RC_POLICY_FAIL,
+    TPM_RC_SUCCESS, TPM_RC_VALUE, TPM_RH_NULL, TPM_RH_PLATFORM, TPM_RS_PW, TPM_SE_POLICY,
+    TPM_SE_TRIAL, TPM_SU_CLEAR, TPM_SU_STATE,
 };
 
 const POLICY_MASK: [u8; 3] = [0xFF, 0x06, 0x00];
@@ -395,6 +395,56 @@ fn smoke_fixture_startup_gating() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/tpm/fixture", smoke_fixture_startup_gating);
+
+// ── Lifecycle: SelfTest (#942, Part 3 §9.5) ─────────────────────
+
+fn smoke_fixture_self_test() -> TestResult {
+    let t = Arc::new(FixtureTpm::new());
+    // Before Startup, SelfTest is gated like every other command.
+    let resp = t.submit(&cmds::self_test(false)).unwrap_or_default();
+    if rc(&resp) != crate::tpm2::TPM_RC_INITIALIZE {
+        return TestResult::Fail("pre-Startup SelfTest was not TPM_RC_INITIALIZE");
+    }
+    if ok_submit(&t, &cmds::startup_clear()).is_err() {
+        return TestResult::Fail("Startup failed");
+    }
+    // Incremental then full: both succeed; the first marks the
+    // tests done, the second re-runs them.
+    if ok_submit(&t, &cmds::self_test(false)).is_err() {
+        return TestResult::Fail("incremental SelfTest failed");
+    }
+    if !t.self_test_done() {
+        return TestResult::Fail("SelfTest did not mark the tests done");
+    }
+    if ok_submit(&t, &cmds::self_test(true)).is_err() {
+        return TestResult::Fail("full SelfTest failed");
+    }
+    // A bad TPMI_YES_NO operand is a value error.
+    let mut bad = cmds::self_test(false);
+    bad[10] = 2;
+    let resp = t.submit(&bad).unwrap_or_default();
+    if rc(&resp) != TPM_RC_VALUE {
+        return TestResult::Fail("SelfTest(fullTest=2) was not TPM_RC_VALUE");
+    }
+    // Failure mode answers TPM_RC_FAILURE, and leaving it
+    // restores the success path.
+    t.set_failure_mode(true);
+    let resp = t.submit(&cmds::self_test(false)).unwrap_or_default();
+    if rc(&resp) != TPM_RC_FAILURE {
+        return TestResult::Fail("failure-mode SelfTest was not TPM_RC_FAILURE");
+    }
+    t.set_failure_mode(false);
+    if ok_submit(&t, &cmds::self_test(false)).is_err() {
+        return TestResult::Fail("SelfTest failed after leaving failure mode");
+    }
+    // The builder pins the command code from the spec, not from
+    // the fixture's dispatch table.
+    if TPM_CC_SELF_TEST != 0x0000_0143 {
+        return TestResult::Fail("TPM_CC_SELF_TEST constant is wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/tpm/fixture", smoke_fixture_self_test);
 
 // ── Lifecycle: DA builder byte pins (#1003) ─────────────────────
 

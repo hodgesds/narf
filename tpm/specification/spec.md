@@ -45,6 +45,12 @@ pub trait TpmDevice: Send + Sync {
     /// Lifecycle: submit TPM2_Startup (provided; see below).
     async fn startup(&self, startup_type: StartupType) -> Result<(), TpmError>;
 
+    /// Lifecycle: submit TPM2_SelfTest (provided; see below).
+    async fn self_test(&self, full: bool) -> Result<(), TpmError>;
+
+    /// Lifecycle: submit TPM2_Shutdown (provided; see below).
+    async fn shutdown(&self, shutdown_type: StartupType) -> Result<(), TpmError>;
+
     /// Identity: query TPM2_GetCapability live (provided; §3.1).
     async fn query_info(&self) -> Result<TpmInfo, TpmError>;
 
@@ -79,6 +85,27 @@ trait folds both into the caller's goal state (`Clear` +
 Shutdown(STATE) → Startup(STATE) suspend/resume sequencing that
 consumes the `State` form is owned by the power-suspend program
 (#1003), not by this interface.
+
+**Lifecycle (`self_test`, #942).** `TPM2_SelfTest` (Part 3 §9.5)
+is the edge that proves the TPM can execute commands before any
+consumer depends on it. Provided method over the canonical codec:
+`full` is the TPMI_YES_NO operand (`true` runs the full test,
+`false` runs only the tests not yet run in this power cycle). A
+TPM in failure mode answers `TPM_RC_FAILURE`, which propagates as
+`TpmError::Rc(TpmRc::Failure)` — never folded, never retried. The
+production probe submits the incremental form after Startup and
+refuses to register a device that fails it, so a failure-mode TPM
+surfaces at probe with a named error instead of as unexplained
+command failures later.
+
+**Lifecycle (`shutdown`, #942).** `TPM2_Shutdown` (Part 3 §9.4)
+prepares the TPM for power loss. Provided method over the
+canonical codec; the operand reuses `StartupType`: `Clear`
+discards state (the reboot / power-off teardown the platform
+shutdown hook submits), `State` saves it for a resume. The
+`State` form's sequencing is owned by the power-suspend program
+(#1003); this method is the raw operation, with no response-code
+folding.
 
 **Identity (`query_info`, #941).** `get_info` is the synchronous
 cached read; `query_info` is the live query behind it. It is a
@@ -152,7 +179,14 @@ consumers:
   first registered device. An empty registry means measured boot
   records into its software shadow only, and boot reporting must say
   so — no hardware anchoring may be claimed.
-- Registration is boot-lifetime: there is no production unregister.
+- `unregister(device: &Arc<dyn TpmDevice>) -> bool` (#942) —
+  removes exactly that device, by `Arc` identity; returns whether
+  a registration was removed, and removing a device that was never
+  registered (or was already removed) is a no-op `false`. The
+  production caller is the platform probe's teardown path: after
+  `TPM2_Shutdown(CLEAR)` on the reboot / power-off hook, the
+  shut-down device stops being a dispatch target. Registration is
+  otherwise boot-lifetime: there is no driver unbind in-tree.
   `__reset_for_test` (doc-hidden) exists for kernel-test fixtures
   only, so a fixture that registers a mock can restore the empty
   state for later tests.
