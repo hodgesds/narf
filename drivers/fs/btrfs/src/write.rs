@@ -97,11 +97,18 @@ fn leaf_insert(buf: &mut [u8], slot: usize, key: &BtrfsKey, body: &[u8]) -> Resu
     let n = nritems(buf)? as usize;
     let dsize = body.len();
     // Lowest data offset in use (start of free space; data grows down).
-    let mut min_off = nodesize - HEADER_SIZE;
-    for i in 0..n {
-        let (off, _size) = leaf_item_span(buf, i)?;
-        min_off = min_off.min(off);
-    }
+    let min_off = if n == 0 {
+        nodesize - HEADER_SIZE
+    } else if dsize == 0 {
+        leaf_item_span(buf, n - 1)?.0
+    } else {
+        let mut m = nodesize - HEADER_SIZE;
+        for i in 0..n {
+            let (off, _size) = leaf_item_span(buf, i)?;
+            m = m.min(off);
+        }
+        m
+    };
     let items_end = HEADER_SIZE + n * LEAF_ITEM_SIZE;
     let free = (HEADER_SIZE + min_off)
         .checked_sub(items_end)
@@ -117,15 +124,17 @@ fn leaf_insert(buf: &mut [u8], slot: usize, key: &BtrfsKey, body: &[u8]) -> Resu
     } else {
         leaf_item_span(buf, slot - 1)?.0
     };
-    let data_lo = HEADER_SIZE + min_off;
-    let data_hi = HEADER_SIZE + boundary;
-    buf.copy_within(data_lo..data_hi, data_lo - dsize);
-    // Items whose data moved (offset < boundary, i.e. slots >= slot) drop by dsize.
-    for i in 0..n {
-        let base = HEADER_SIZE + i * LEAF_ITEM_SIZE + format::DISK_KEY_SIZE;
-        let o = format::le32(buf, base)? as usize;
-        if o < boundary {
-            buf[base..base + 4].copy_from_slice(&((o - dsize) as u32).to_le_bytes());
+    if dsize > 0 {
+        let data_lo = HEADER_SIZE + min_off;
+        let data_hi = HEADER_SIZE + boundary;
+        buf.copy_within(data_lo..data_hi, data_lo - dsize);
+        // Items whose data moved (offset < boundary, i.e. slots >= slot) drop by dsize.
+        for i in 0..n {
+            let base = HEADER_SIZE + i * LEAF_ITEM_SIZE + format::DISK_KEY_SIZE;
+            let o = format::le32(buf, base)? as usize;
+            if o < boundary {
+                buf[base..base + 4].copy_from_slice(&((o - dsize) as u32).to_le_bytes());
+            }
         }
     }
 
@@ -136,7 +145,9 @@ fn leaf_insert(buf: &mut [u8], slot: usize, key: &BtrfsKey, body: &[u8]) -> Resu
 
     // Place the new body + item entry.
     let new_off = boundary - dsize;
-    buf[HEADER_SIZE + new_off..HEADER_SIZE + new_off + dsize].copy_from_slice(body);
+    if dsize > 0 {
+        buf[HEADER_SIZE + new_off..HEADER_SIZE + new_off + dsize].copy_from_slice(body);
+    }
     let ie = HEADER_SIZE + slot * LEAF_ITEM_SIZE;
     buf[ie..ie + 8].copy_from_slice(&key.objectid.to_le_bytes());
     buf[ie + 8] = key.item_type;
@@ -168,23 +179,25 @@ fn leaf_delete(buf: &mut [u8], slot: usize) -> Result<(), FsError> {
         return Err(FsError::InvalidData);
     }
     let (off, size) = leaf_item_span(buf, slot)?;
-    let mut min_off = nodesize - HEADER_SIZE;
-    for i in 0..n {
-        let (o, _s) = leaf_item_span(buf, i)?;
-        min_off = min_off.min(o);
-    }
-    // Move the data below the hole up by `size`, then bump those items' offsets.
-    let data_start = HEADER_SIZE + min_off;
-    let hole_start = HEADER_SIZE + off;
-    buf.copy_within(data_start..hole_start, data_start + size);
-    for i in 0..n {
-        if i == slot {
-            continue;
+    if size > 0 {
+        let mut min_off = nodesize - HEADER_SIZE;
+        for i in 0..n {
+            let (o, _s) = leaf_item_span(buf, i)?;
+            min_off = min_off.min(o);
         }
-        let base = HEADER_SIZE + i * LEAF_ITEM_SIZE + format::DISK_KEY_SIZE;
-        let o = format::le32(buf, base)? as usize;
-        if o < off {
-            buf[base..base + 4].copy_from_slice(&((o + size) as u32).to_le_bytes());
+        // Move the data below the hole up by `size`, then bump those items' offsets.
+        let data_start = HEADER_SIZE + min_off;
+        let hole_start = HEADER_SIZE + off;
+        buf.copy_within(data_start..hole_start, data_start + size);
+        for i in 0..n {
+            if i == slot {
+                continue;
+            }
+            let base = HEADER_SIZE + i * LEAF_ITEM_SIZE + format::DISK_KEY_SIZE;
+            let o = format::le32(buf, base)? as usize;
+            if o < off {
+                buf[base..base + 4].copy_from_slice(&((o + size) as u32).to_le_bytes());
+            }
         }
     }
     // Remove the item entry by shifting the following entries left.
@@ -563,14 +576,21 @@ fn fst_mark_used(
     }
     let end = start + len;
     let n = nritems(fst_leaf)? as usize;
+    let cand = leaf_lower_bound(
+        fst_leaf,
+        n,
+        &BtrfsKey::new(start, format::FREE_SPACE_EXTENT_KEY, u64::MAX),
+    )?;
     let mut found: Option<(usize, u64, u64)> = None;
-    for i in 0..n {
+    for i in (0..cand).rev() {
         let k = leaf_item_key(fst_leaf, i)?;
-        if k.item_type == format::FREE_SPACE_EXTENT_KEY
-            && k.objectid <= start
-            && end <= k.objectid.saturating_add(k.offset)
-        {
-            found = Some((i, k.objectid, k.offset));
+        if k.objectid < bg_start {
+            break;
+        }
+        if k.item_type == format::FREE_SPACE_EXTENT_KEY {
+            if k.objectid <= start && end <= k.objectid.saturating_add(k.offset) {
+                found = Some((i, k.objectid, k.offset));
+            }
             break;
         }
     }
@@ -618,8 +638,15 @@ fn fst_mark_free(
     let mut new_start = start;
     let mut new_end = start + len;
     let n = nritems(fst_leaf)? as usize;
+    let center = leaf_lower_bound(
+        fst_leaf,
+        n,
+        &BtrfsKey::new(start, format::FREE_SPACE_EXTENT_KEY, 0),
+    )?;
+    let lo = center.saturating_sub(4);
+    let hi = (center + 4).min(n);
     let mut to_delete: Vec<usize> = Vec::new();
-    for i in 0..n {
+    for i in lo..hi {
         let k = leaf_item_key(fst_leaf, i)?;
         if k.item_type != format::FREE_SPACE_EXTENT_KEY {
             continue;
@@ -1213,14 +1240,21 @@ pub(crate) const MAX_BATCH_OPS: usize = 512;
 ///  * `gen` — one generation for every node the batch stamps, matching the one
 ///    superblock it eventually writes.
 #[derive(Debug)]
+pub(crate) struct SubvolBatch {
+    cow: CowState,
+    base_root: (u64, u8),
+    qgroup: Option<Vec<QgroupCharge>>,
+    ops: usize,
+}
+
+#[derive(Debug)]
 pub(crate) struct FsBatch {
     gen: u64,
-    /// The subvolume tree this batch COWs. One core serves every mount of the
-    /// filesystem, so an operation through a mount of another subvolume first
-    /// commits this batch (see [`batch_begin`]).
-    tree_id: u64,
+    /// Per-subvolume COW states staged into this batch. One core serves every
+    /// mount of the filesystem, and `commit_txn` commits all modified
+    /// subvolumes together via `Txn.fs` and `Txn.extra_trees`.
+    trees: BTreeMap<u64, SubvolBatch>,
     alloc: Allocator,
-    cow: CowState,
     dropped_data: Vec<DataRefId>,
     /// Extra references to existing extents: a PREALLOC/REG extent split in
     /// two by a write-to-convert or a punched hole leaves two file items with
@@ -1232,14 +1266,6 @@ pub(crate) struct FsBatch {
     /// interval below. Cycles rather than `Instant` because the test hook has
     /// to move it backwards, and `Instant` only adds.
     opened_at: u64,
-    /// The fs-tree root as of the last commit, to restore if this batch's own
-    /// commit fails. Staging publishes each operation's root so that reads
-    /// inside the batch see it; a failed commit has to take that back.
-    base_root: (u64, u8),
-    /// The qgroups this transaction's subvolume charges against, with their
-    /// committed usage and limits. Read on the first reservation and reused:
-    /// the quota tree does not move until this transaction commits.
-    qgroup: Option<Vec<QgroupCharge>>,
     /// Bytes reserved against each qgroup by operations of this transaction
     /// that have been staged, so two writes that each fit but do not fit
     /// together cannot both be admitted. Released when the transaction
@@ -1268,9 +1294,14 @@ impl FsBatch {
         self.ops > 0
     }
 
-    /// The subvolume tree this batch COWs.
+    /// A representative subvolume tree this batch COWs.
     pub(crate) fn tree_id(&self) -> u64 {
-        self.tree_id
+        self.trees
+            .iter()
+            .find(|(_, t)| t.ops > 0)
+            .or_else(|| self.trees.iter().next())
+            .map(|(&id, _)| id)
+            .unwrap_or(format::FS_TREE_OBJECTID)
     }
 }
 
@@ -1283,24 +1314,12 @@ impl FsBatch {
 async fn batch_begin<'a, B: BlockDevice + 'static>(
     vol: &'a BtrfsVolume<B>,
 ) -> Result<narf_lib::mutex::MutexGuard<'a, Option<FsBatch>>, FsError> {
-    let mut guard = loop {
-        // Never open a batch while a commit is in flight: its generation and
-        // allocator would come from the superblock and free-space tree that
-        // commit is about to replace.
-        let txn = vol.txn_lock().lock().await;
-        let guard = vol.fs_batch().lock().await;
-        drop(txn);
-        match guard.as_ref() {
-            // The open batch belongs to another mount's subvolume. A batch
-            // COWs exactly one fs tree, so commit it before this operation
-            // starts its own.
-            Some(batch) if batch.tree_id != vol.fs_tree_id() => {
-                drop(guard);
-                flush_batch(vol).await?;
-            }
-            _ => break guard,
-        }
-    };
+    // Never open a batch while a commit is in flight: its generation and
+    // allocator would come from the superblock and free-space tree that
+    // commit is about to replace.
+    let txn = vol.txn_lock().lock().await;
+    let mut guard = vol.fs_batch().lock().await;
+    drop(txn);
     if guard.is_none() {
         // The generation the batch commits at. `commit_roots` does not run
         // until the batch closes, so every operation inside it derives the
@@ -1310,26 +1329,36 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
             .generation
             .checked_add(1)
             .ok_or(FsError::InvalidData)?;
-        let (fs_root, fs_level) = vol.fs_tree_root();
-        let cow = PathCow::new_shared(vol, gen, fs_root, fs_level, vol.fs_tree_id())
-            .await?
-            .suspend()
-            .0;
         *guard = Some(FsBatch {
             gen,
-            tree_id: vol.fs_tree_id(),
+            trees: BTreeMap::new(),
             alloc: Allocator::build(vol).await?,
-            cow,
             dropped_data: Vec::new(),
             added_data: Vec::new(),
             new_data: Vec::new(),
             ops: 0,
-            base_root: (fs_root, fs_level),
             opened_at: narf_time::now_cycles(),
-            qgroup: None,
             reserved: BTreeMap::new(),
             op_reserved: BTreeMap::new(),
         });
+    }
+    let tree_id = vol.fs_tree_id();
+    let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
+    if !batch.trees.contains_key(&tree_id) {
+        let (fs_root, fs_level) = vol.fs_tree_root();
+        let cow = PathCow::new_shared(vol, batch.gen, fs_root, fs_level, tree_id)
+            .await?
+            .suspend()
+            .0;
+        batch.trees.insert(
+            tree_id,
+            SubvolBatch {
+                cow,
+                base_root: (fs_root, fs_level),
+                qgroup: None,
+                ops: 0,
+            },
+        );
     }
     Ok(guard)
 }
@@ -1526,7 +1555,7 @@ pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(
                 continue; // remounted read-only: nothing may commit
             }
             let tree = match core.fs_batch().lock().await.as_ref() {
-                Some(batch) => batch.tree_id,
+                Some(batch) => batch.tree_id(),
                 None => continue,
             };
             let view = BtrfsVolume::view_for_tree(&core, tree);
@@ -1535,9 +1564,14 @@ pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(
     });
 }
 
-/// Whether the open batch, if any, has already COWed the fs tree.
+/// Whether the open batch, if any, has already COWed `vol`'s fs tree.
 async fn batch_owns_fs_tree<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> bool {
-    matches!(vol.fs_batch().lock().await.as_ref(), Some(b) if b.ops > 0)
+    vol.fs_batch()
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|b| b.trees.get(&vol.fs_tree_id()))
+        .is_some_and(|t| t.ops > 0)
 }
 
 /// Add one operation's fs-tree edits and data-ref deltas to the open batch.
@@ -1582,12 +1616,20 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
     // edited, so the error paths below have nothing to restore for it. The
     // allocator cannot be handled that way — `apply_edits` needs it by mutable
     // reference and carves from it in place — so those paths do put it back.
+    let tree_id = vol.fs_tree_id();
+    let other_tree_changes: usize = batch
+        .trees
+        .iter()
+        .filter(|(&id, _)| id != tree_id)
+        .map(|(_, t)| t.cow.pending.len() + t.cow.freed.len())
+        .sum();
     let snapshot_alloc = batch.alloc.clone();
-    let snapshot_cow = batch.cow.clone();
+    let subvol = batch.trees.get_mut(&tree_id).ok_or(FsError::InvalidData)?;
+    let snapshot_cow = subvol.cow.clone();
     let mut cow = PathCow::resume(
         vol,
         batch.gen,
-        core::mem::replace(&mut batch.cow, snapshot_cow),
+        core::mem::replace(&mut subvol.cow, snapshot_cow),
     );
     if let Err(e) = cow.apply_edits(&mut batch.alloc, edits).await {
         batch.alloc = snapshot_alloc;
@@ -1610,6 +1652,7 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
             + new_data.len()
             + dropped_data.len()
             + added_data.len()
+            + other_tree_changes
             + state.pending.len()
             + state.freed.len();
         let free = batch.alloc.free_bytes(format::BLOCK_GROUP_METADATA);
@@ -1632,8 +1675,10 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
             return Err(e);
         }
     }
-    batch.cow = state;
-    let (root, level) = batch.cow.root();
+    let subvol = batch.trees.get_mut(&tree_id).ok_or(FsError::InvalidData)?;
+    subvol.cow = state;
+    subvol.ops += 1;
+    let (root, level) = subvol.cow.root();
     vol.advance_fs_root(root, level);
     // A data extent this batch allocated and has now released never reached
     // the extent tree, so it must not be recorded as a drop: `commit_txn`
@@ -1771,7 +1816,11 @@ async fn commit_batch<B: BlockDevice + 'static>(
         // superblock write to publish a tree identical to the committed one.
         return Ok(());
     }
-    let base_root = batch.base_root;
+    let base_roots: Vec<(u64, (u64, u8))> = batch
+        .trees
+        .iter()
+        .map(|(&id, t)| (id, t.base_root))
+        .collect();
     let silent_losses = origin.silent_losses(batch.ops);
     let result = commit_batch_inner(vol, batch).await;
     if let Err(error) = &result {
@@ -1809,16 +1858,41 @@ async fn commit_batch<B: BlockDevice + 'static>(
         // The blocks the batch wrote stay on disk, unreferenced by any tree
         // and unrecorded in the extent tree, which is the same state a crash
         // between the node writes and the superblock write leaves behind.
-        vol.advance_fs_root(base_root.0, base_root.1);
+        for (tree_id, (root, level)) in base_roots {
+            BtrfsVolume::view_for_tree(vol.core(), tree_id).advance_fs_root(root, level);
+        }
     }
     result
 }
 
 async fn commit_batch_inner<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
-    batch: FsBatch,
+    mut batch: FsBatch,
 ) -> Result<(), FsError> {
-    let out = batch.cow.into_cow_out();
+    let primary_id = vol.fs_tree_id();
+    let primary = batch
+        .trees
+        .remove(&primary_id)
+        .ok_or(FsError::InvalidData)?;
+    let out = primary.cow.into_cow_out();
+    let mut extra_trees = Vec::new();
+    for (tree_id, subvol) in batch.trees {
+        if subvol.ops == 0 {
+            continue;
+        }
+        let extra = subvol.cow.into_cow_out();
+        extra_trees.push(ExtraTree {
+            owner: tree_id,
+            commit: FsCommit {
+                nodes: Vec::new(),
+                new_blocks: extra.nodes.iter().map(|&(a, _, l)| (a, l)).collect(),
+                freed: extra.freed,
+                root: extra.root_addr,
+                level: extra.root_level,
+                refs: extra.refs,
+            },
+        });
+    }
     commit_txn(
         vol,
         batch.gen,
@@ -1843,7 +1917,7 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
             dropped_meta: Vec::new(),
             new_data: batch.new_data,
             root_flags: None,
-            extra_trees: Vec::new(),
+            extra_trees,
             root_edits: Vec::new(),
             retired_meta: Vec::new(),
             qgroup_create: None,
@@ -1877,11 +1951,13 @@ async fn flush_batch_from<B: BlockDevice + 'static>(
     let _txn = vol.txn_lock().lock().await;
     let batch = vol.fs_batch().lock().await.take();
     match batch {
-        Some(batch) if batch.tree_id == vol.fs_tree_id() => commit_batch(vol, batch, origin).await,
-        // Staged through a mount of another subvolume (or the commit timer):
-        // commit it as that subvolume, so its ROOT_ITEM and live root move.
+        Some(batch) if batch.trees.contains_key(&vol.fs_tree_id()) => {
+            commit_batch(vol, batch, origin).await
+        }
+        // Staged through mounts of other subvolumes (or the commit timer):
+        // commit it anchored at one of its subvolumes.
         Some(batch) => {
-            let owner = BtrfsVolume::view_for_tree(vol.core(), batch.tree_id);
+            let owner = BtrfsVolume::view_for_tree(vol.core(), batch.tree_id());
             commit_batch(&owner, batch, origin).await
         }
         None => Ok(()),
@@ -4252,10 +4328,11 @@ async fn qgroup_reserve<B: BlockDevice + 'static>(
     if vol.quota_override() && narf_filesystem::caller_capable(CAP_SYS_RESOURCE) {
         return Ok(());
     }
-    if batch.qgroup.is_none() {
-        batch.qgroup = Some(qgroup_charge_chain(vol, root_id).await?);
+    let subvol = batch.trees.get_mut(&root_id).ok_or(FsError::InvalidData)?;
+    if subvol.qgroup.is_none() {
+        subvol.qgroup = Some(qgroup_charge_chain(vol, root_id).await?);
     }
-    let chain = batch.qgroup.clone().unwrap_or_default();
+    let chain = subvol.qgroup.clone().unwrap_or_default();
     for q in &chain {
         // Outstanding reservations count against the limit alongside committed
         // usage: two writes that each fit but do not fit together must not

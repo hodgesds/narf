@@ -272,6 +272,12 @@ impl Scanout {
             _ => Err(Error::Busy),
         }
     }
+    fn live(&self) -> Result<(), Error> {
+        match self.state {
+            State::Running | State::Flipping => Ok(()),
+            _ => Err(Error::Busy),
+        }
+    }
 
     /// Subscribe to the pipe's pflip and vupdate sources, then enable them
     /// in HUBP/OTG (`dm_pflip_high_irq`/`dm_vupdate_high_irq` sources of
@@ -393,7 +399,7 @@ impl Scanout {
         &mut self,
         bounds: Option<crate::amdgpu_freesync::Drr>,
     ) -> Result<(), Error> {
-        self.running()?;
+        self.live()?;
         if bounds.is_some_and(|b| {
             b.v_total_min < self.timing.v_total
                 || b.v_total_min > b.v_total_max
@@ -760,7 +766,7 @@ impl Scanout {
         at: (i32, i32),
         mut flush: impl FnMut() -> Result<(), Error>,
     ) -> Result<cursor::Shown, Error> {
-        self.running()?;
+        self.live()?;
         if !(1..=cursor::CURSOR_MAX).contains(&width)
             || !(1..=cursor::CURSOR_MAX).contains(&height)
             || pixels.len() != (width * height) as usize
@@ -804,7 +810,7 @@ impl Scanout {
     }
     /// Move the shown cursor; an image must have been set.
     pub fn move_cursor(&mut self, at: (i32, i32)) -> Result<cursor::Shown, Error> {
-        self.running()?;
+        self.live()?;
         let view = (self.timing.h_active, self.timing.v_active);
         let clocks = (self.refclk_khz, self.timing.pixel_clock_khz);
         self.cursor.move_to(at, view, clocks)

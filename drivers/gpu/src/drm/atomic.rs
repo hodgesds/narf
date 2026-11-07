@@ -374,14 +374,24 @@ impl AtomicState {
         // Connectors — encoder binding.  Linux walks encoders too;
         // we keep encoder choice fixed (one encoder per connector).
         for cs in &self.connectors {
-            let conn = card
+            let encoder_id = card
                 .connectors
-                .iter_mut()
+                .iter()
                 .find(|c| c.id == cs.id)
-                .ok_or(AtomicError::UnknownConnector)?;
-            // No-op: we don't track which CRTC a connector is bound to
-            // in `Card`; we just verify the binding is consistent.
-            let _ = conn;
+                .ok_or(AtomicError::UnknownConnector)?
+                .encoder_id;
+            if let Some(crtc_id) = cs.crtc_id {
+                for enc in &mut card.encoders {
+                    if Some(enc.id) != encoder_id && enc.crtc_id == Some(crtc_id) {
+                        enc.crtc_id = None;
+                    }
+                }
+            }
+            if let Some(enc_id) = encoder_id {
+                if let Some(enc) = card.encoders.iter_mut().find(|e| e.id == enc_id) {
+                    enc.crtc_id = cs.crtc_id;
+                }
+            }
         }
         // Planes — write primary plane FB into the bound CRTC's
         // primary_fb so the legacy CRTC fbs reflect the atomic commit.

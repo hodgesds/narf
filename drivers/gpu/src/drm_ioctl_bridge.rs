@@ -6462,6 +6462,20 @@ fn atomic_commit(
             )?;
             #[cfg(feature = "amdgpu")]
             let cursors = crate::drm_native_planes::cursor_changes(&card, &state);
+            #[cfg(feature = "amdgpu")]
+            let route_changes: Vec<(u32, Option<u32>)> = state
+                .connectors
+                .iter()
+                .filter_map(|c| {
+                    let current = card
+                        .connector(c.id)
+                        .ok()
+                        .and_then(|x| x.encoder_id)
+                        .and_then(|id| card.encoder(id).ok())
+                        .and_then(|e| e.crtc_id);
+                    (current != c.crtc_id).then_some((c.id, c.crtc_id))
+                })
+                .collect();
             if let Err(error) = state.core_commit(&mut card) {
                 let _ = writeln!(
                     narf_console::Writer,
@@ -6525,17 +6539,9 @@ fn atomic_commit(
             if amdgpu {
                 // Routing first: a mode is checked against the connector the
                 // CRTC drives. Any encoder may drive any native CRTC.
-                for c in &state.connectors {
-                    let current = card
-                        .connector(c.id)
-                        .ok()
-                        .and_then(|x| x.encoder_id)
-                        .and_then(|id| card.encoder(id).ok())
-                        .and_then(|e| e.crtc_id);
-                    if current != c.crtc_id {
-                        let display = c.crtc_id.and_then(crate::amdgpu_native_kms::crtc_display);
-                        crate::amdgpu_native_kms::request_connector_crtc(c.id, display);
-                    }
+                for (conn_id, crtc_id) in route_changes {
+                    let display = crtc_id.and_then(crate::amdgpu_native_kms::crtc_display);
+                    crate::amdgpu_native_kms::request_connector_crtc(conn_id, display);
                 }
                 for crtc in &state.crtcs {
                     let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc.id) else {
@@ -7707,6 +7713,23 @@ fn handle_setcrtc_decoded(
             crtc.enabled = req.fb_id != 0;
             if requested.is_some() || req.fb_id == 0 {
                 crtc.mode = requested;
+            }
+        }
+        #[cfg(feature = "amdgpu")]
+        if let Some(conn_id) = native_connector {
+            let enc_id = card.connector(conn_id).ok().and_then(|c| c.encoder_id);
+            for enc in &mut card.encoders {
+                if Some(enc.id) == enc_id {
+                    enc.crtc_id = (req.fb_id != 0).then_some(req.crtc_id);
+                } else if enc.crtc_id == Some(req.crtc_id) {
+                    enc.crtc_id = None;
+                }
+            }
+        } else if req.fb_id == 0 {
+            for enc in &mut card.encoders {
+                if enc.crtc_id == Some(req.crtc_id) {
+                    enc.crtc_id = None;
+                }
             }
         }
         // drm_atomic_helper_set_config: the primary shows the framebuffer
