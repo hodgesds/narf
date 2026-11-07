@@ -232,6 +232,22 @@ impl BondStore {
         self.bonds.iter().find(|b| &b.peer_addr == peer_addr)
     }
 
+    /// Record the peer IRK for an already-bonded peer (mgmt
+    /// LOAD_IRKS, issue #815): the IRK arrives independently of
+    /// the LTK, so a bond created by pairing gains its peer IRK
+    /// when userspace later loads it. Returns false when no bond
+    /// exists for the peer — the IRK is then held only in the
+    /// mgmt-level IRK list, never fabricated into a bond.
+    pub fn set_peer_irk(&mut self, peer_addr: &[u8; 7], irk: [u8; 16]) -> bool {
+        match self.bonds.iter_mut().find(|b| &b.peer_addr == peer_addr) {
+            Some(bond) => {
+                bond.peer_irk = Some(irk);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Look up the bond answering an LE LTK Request: peer address
     /// must match and the event's EDIV/Rand must match the stored
     /// values exactly. Anything else returns `None` (the caller

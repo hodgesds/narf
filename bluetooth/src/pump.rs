@@ -6757,6 +6757,21 @@ pub fn forget_bond(index: usize, peer_addr: &[u8; 7]) -> Option<bool> {
     with_core(index, |core| core.forget_bond(peer_addr))
 }
 
+/// Store a bond for controller `index`, replacing any bond for
+/// the same peer (mgmt LOAD_LONG_TERM_KEYS, issue #815). Returns
+/// `None` when the controller has no pump.
+pub fn store_bond(index: usize, bond: Bond) -> Option<()> {
+    with_core(index, |core| core.bonds.store(bond))
+}
+
+/// Record the peer IRK for controller `index`'s existing bond
+/// (mgmt LOAD_IRKS, issue #815). Returns `None` when the
+/// controller has no pump, `Some(false)` when no bond exists
+/// for the peer.
+pub fn set_peer_irk(index: usize, peer_addr: &[u8; 7], irk: [u8; 16]) -> Option<bool> {
+    with_core(index, |core| core.bonds.set_peer_irk(peer_addr, irk))
+}
+
 /// Bond count for controller `index`, if it has a pump.
 pub fn bond_count(index: usize) -> Option<usize> {
     let pumps = PUMPS.lock();

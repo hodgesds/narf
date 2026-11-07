@@ -343,12 +343,37 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   when the controller refuses the HCI command). UNPAIR_DEVICE
   forgets the bond (idempotent) and disconnects a live connection
   first when disconnect=1.
+  SET_ADVERTISING drives the legacy advertising HCI sequence
+  (Set Advertising Parameters / Data / Scan Response Data /
+  Advertise Enable; mode 0x02 connectable, 0x01 non-connectable
+  with a fresh non-resolvable random address when connectable
+  is off) and is re-applied on power-on; SET_BREDR toggles the
+  BR/EDR bit with the Linux couplings (unpowered disable also
+  clears discoverable/SSP/link-security/fast-connectable,
+  powered disable is REJECTED, powered re-enable is REJECTED
+  while a static address is set or secure-connections is on).
+  SET_STATIC_ADDRESS records a static-random identity address
+  (powered is REJECTED, non-ANY needs the static bits) and
+  SET_PRIVACY records mode + local IRK (powered is REJECTED);
+  power-on programs the random address — an RPA generated from
+  HCI LE Rand + LE Encrypt (`ah`) when privacy is on, else the
+  static address — and the controller resolving list from the
+  loaded IRKs (Clear + Add per entry + Address Resolution
+  Enable). LOAD_LONG_TERM_KEYS stores accepted LTKs as real
+  bonds (invalid entries skipped, debug key type skipped);
+  LOAD_IRKS replaces the host IRK list (one invalid entry
+  fails the whole command) and mirrors peer IRKs into existing
+  bonds. LOAD_LINK_KEYS is not dispatched (no BR/EDR link-key
+  store or consumer exists).
   Known limits: mgmt issues its HCI synchronously, so while the
   pump task is draining the same transport a completion can be
   consumed by the pump instead (a single command path via the
   pump/CmdQueue is the follow-up); the discoverable timeout is
-  accepted but never enforced (no mgmt timer); power-off does not
-  drop live pump connections.
+  accepted but never enforced (no mgmt timer); the RPA is
+  generated once per power epoch and never rotated (no mgmt
+  timer); LOAD_LONG_TERM_KEYS merges into the bond store
+  instead of the kernel's clear-first, so live pairings keep
+  their bonds; power-off does not drop live pump connections.
   GATT client (issue #1313): `pump::gatt_client_discover_services` /
   `discover_characteristics` / `discover_descriptors` / `read` /
   `write` / `subscribe` issue ATT requests over a central-role

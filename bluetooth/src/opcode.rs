@@ -285,6 +285,24 @@ pub const HCI_LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST: u16 = opcode(OGF_LE_CONT
 /// HCI_LE_Clear_Filter_Accept_List (§7.8.15).
 pub const HCI_LE_CLEAR_FILTER_ACCEPT_LIST: u16 = opcode(OGF_LE_CONTROLLER, 0x0010);
 
+// ── LE Resolving List (§7.8.38..44) ──────────────────────────────
+// OCFs 0x0027/0x0029/0x002D per Vol 4 Part E §7.8.38/§7.8.40/§7.8.44,
+// cross-checked against the TI BLE stack HCI opcode table (0x2027
+// Add Device to Resolving List, 0x2029 Clear Resolving List,
+// 0x202D Set Address Resolution Enable in the 0x201A..0x2034 LE
+// sequence) and the Nordic nRF documentation (0x202C Read Local
+// Resolvable Address, the adjacent command). Issued by mgmt
+// SET_PRIVACY / LOAD_IRKS (issue #815): the controller resolves
+// peer RPAs against this list when address resolution is enabled.
+/// HCI_LE_Add_Device_To_Resolving_List (§7.8.38). 39-byte param:
+/// peer identity address type (1) + peer identity address (6) +
+/// peer IRK (16) + local IRK (16).
+pub const HCI_LE_ADD_DEVICE_TO_RESOLVING_LIST: u16 = opcode(OGF_LE_CONTROLLER, 0x0027);
+/// HCI_LE_Clear_Resolving_List (§7.8.40). No params.
+pub const HCI_LE_CLEAR_RESOLVING_LIST: u16 = opcode(OGF_LE_CONTROLLER, 0x0029);
+/// HCI_LE_Set_Address_Resolution_Enable (§7.8.44). 1-byte param.
+pub const HCI_LE_SET_ADDRESS_RESOLUTION_ENABLE: u16 = opcode(OGF_LE_CONTROLLER, 0x002D);
+
 // ── LE Crypto helpers (§7.8.22, §7.8.23) ──────────────────────────
 /// HCI_LE_Encrypt (§7.8.22). 32-byte param: key (16) + plaintext (16).
 /// Returns 16-byte ciphertext via Command Complete.
@@ -324,6 +342,13 @@ mod selftest_ext {
     // §7.8.22: OGF=0x08 OCF=0x0017 → 0x2017.
     const _: () = assert!(HCI_LE_ENCRYPT == 0x2017);
     // §7.8.23: OGF=0x08 OCF=0x0018 → 0x2018.
+    const _: () = assert!(HCI_LE_RAND == 0x2018);
+    // §7.8.38: OGF=0x08 OCF=0x0027 → 0x2027.
+    const _: () = assert!(HCI_LE_ADD_DEVICE_TO_RESOLVING_LIST == 0x2027);
+    // §7.8.40: OGF=0x08 OCF=0x0029 → 0x2029.
+    const _: () = assert!(HCI_LE_CLEAR_RESOLVING_LIST == 0x2029);
+    // §7.8.44: OGF=0x08 OCF=0x002D → 0x202D.
+    const _: () = assert!(HCI_LE_SET_ADDRESS_RESOLUTION_ENABLE == 0x202D);
     const _: () = assert!(HCI_LE_RAND == 0x2018);
     // §7.8.61: OGF=0x08 OCF=0x003E → 0x203E.
     const _: () = assert!(HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS == 0x203E);
