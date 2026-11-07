@@ -929,6 +929,7 @@ dependencies = [
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -1575,6 +1576,7 @@ dependencies = [
  "narf-console",
  "narf-driver-runtime",
  "narf-drivers",
+ "narf-drivers-net-aqc1xx",
  "narf-drivers-net-atheros",
  "narf-drivers-net-bnxt",
  "narf-drivers-net-core",
@@ -1593,6 +1595,30 @@ dependencies = [
  "narf-drivers-net-vmxnet3",
  "narf-firmware",
  "narf-init",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-aqc1xx"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
  "narf-interrupts",
  "narf-io",
  "narf-ipc",
@@ -2042,6 +2068,7 @@ dependencies = [
  "narf-drivers",
  "narf-drivers-tpm",
  "narf-filesystem",
+ "narf-firmware-fdt",
  "narf-firmware-smbios",
  "narf-init",
  "narf-input",
@@ -2299,6 +2326,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]
@@ -2322,6 +2350,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]

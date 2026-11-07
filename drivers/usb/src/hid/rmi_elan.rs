@@ -1018,9 +1018,7 @@ impl fmt::Debug for RmiElanKind {
                 .debug_struct("Rmi")
                 .field("probe", probe)
                 .finish_non_exhaustive(),
-            Self::Elan {
-                params, quirks, ..
-            } => f
+            Self::Elan { params, quirks, .. } => f
                 .debug_struct("Elan")
                 .field("params", params)
                 .field("quirks", quirks)

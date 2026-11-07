@@ -46,8 +46,10 @@ pub(crate) const MAX_CONFIG_REGS: u32 = 4096;
 const MAX_REGISTRY_REGS: usize = 1 << 17;
 const MAX_CONFIGS: u32 = 1024;
 /// DRM_XE_OA_CAPS_BASE | OA_BUFFER_SIZE | WAIT_NUM_REPORTS | OA_UNIT_GT_ID.
-/// SYNCS and OAM are not implemented and therefore not advertised.
+/// SYNCS is not implemented and therefore not advertised.
 pub(crate) const CAPS: u64 = 1 | 4 | 8 | 32;
+/// With DRM_XE_OA_CAPS_OAM (1 << 4 = 16) for Media GT OAM units.
+pub(crate) const CAPS_OAM: u64 = 1 | 4 | 8 | 16 | 32;
 const QUIESCE_NS: u64 = 50_000_000;
 
 const E2BIG: i64 = 7;
@@ -247,6 +249,10 @@ pub struct Device {
     pub engines: EngineSet,
     /// Preallocated OA buffer bytes.
     pub reserve: u32,
+    /// Published media GT engines (VCS/VECS) for OAM unit enumeration.
+    pub media_engines: Option<EngineSet>,
+    /// xe_oa_timestamp_frequency(gt1).
+    pub media_timestamp: Option<u32>,
 }
 impl Device {
     pub(crate) fn validate(self) -> Result<Self, FsError> {
@@ -268,6 +274,29 @@ impl Device {
     fn oag_engines(self) -> impl Iterator<Item = Engine> {
         self.engines.iter().filter(|engine| oag_engine(*engine))
     }
+    fn oam_engines(self) -> impl Iterator<Item = Engine> {
+        self.media_engines
+            .into_iter()
+            .flat_map(|engines| engines.iter().filter(|engine| oam_engine(*engine)))
+    }
+}
+
+fn oam_engine(engine: Engine) -> bool {
+    matches!(
+        engine,
+        Engine::Vcs0
+            | Engine::Vcs1
+            | Engine::Vcs2
+            | Engine::Vcs3
+            | Engine::Vcs4
+            | Engine::Vcs5
+            | Engine::Vcs6
+            | Engine::Vcs7
+            | Engine::Vecs0
+            | Engine::Vecs1
+            | Engine::Vecs2
+            | Engine::Vecs3
+    )
 }
 
 /// Wa_18013179988 (12.55 and 12.70..12.74, xe_wa_oob.rules continuation)
@@ -302,19 +331,53 @@ pub(crate) fn query(device: Option<Device>) -> Vec<u8> {
     let Some(device) = device.and_then(|device| device.validate().ok()) else {
         return vec![0; 16];
     };
-    let engines: Vec<Engine> = device.oag_engines().collect();
-    let mut reply = vec![0; 16 + 72 + engines.len() * 8];
-    put32(&mut reply, 8, 1);
+    let oag_engines: Vec<Engine> = device.oag_engines().collect();
+    let oam_engines: Vec<Engine> = device.oam_engines().collect();
+    let has_oam = !oam_engines.is_empty();
+    let num_units: u32 = if has_oam { 2 } else { 1 };
+
+    let mut total_len = 16 + 72 + oag_engines.len() * 8;
+    if has_oam {
+        total_len += 72 + oam_engines.len() * 8;
+    }
+    let mut reply = vec![0; total_len];
+    put32(&mut reply, 8, num_units);
+
+    // Unit 0: OAG (GT0)
     // oa_unit_id 0, DRM_XE_OA_UNIT_TYPE_OAG 0, gt_id 0.
     put64(&mut reply, 16 + 16, CAPS);
     put64(&mut reply, 16 + 24, u64::from(device.timestamp));
-    put64(&mut reply, 16 + 64, engines.len() as u64);
-    for (i, engine) in engines.iter().enumerate() {
+    put64(&mut reply, 16 + 64, oag_engines.len() as u64);
+    for (i, engine) in oag_engines.iter().enumerate() {
         let at = 16 + 72 + i * 8;
         let logical = device.engines.logical_instance(*engine).expect("published");
         reply[at..at + 2].copy_from_slice(&engine.xe_class().to_le_bytes());
         reply[at + 2..at + 4].copy_from_slice(&logical.to_le_bytes());
     }
+
+    // Unit 1: OAM (GT1)
+    if has_oam {
+        let unit1_off = 16 + 72 + oag_engines.len() * 8;
+        put64(&mut reply, unit1_off, 1); // oa_unit_id: 1
+        put64(&mut reply, unit1_off + 8, 1); // DRM_XE_OA_UNIT_TYPE_OAM: 1
+        put64(&mut reply, unit1_off + 16, CAPS_OAM);
+        put64(
+            &mut reply,
+            unit1_off + 24,
+            u64::from(device.media_timestamp.unwrap_or(device.timestamp)),
+        );
+        put64(&mut reply, unit1_off + 64, oam_engines.len() as u64);
+        let media_set = device.media_engines.expect("has_oam proved media_engines");
+        for (i, engine) in oam_engines.iter().enumerate() {
+            let at = unit1_off + 72 + i * 8;
+            let logical = media_set
+                .logical_instance(*engine)
+                .expect("published media engine");
+            reply[at..at + 2].copy_from_slice(&engine.xe_class().to_le_bytes());
+            reply[at + 2..at + 4].copy_from_slice(&logical.to_le_bytes());
+        }
+    }
+
     reply
 }
 
@@ -788,14 +851,75 @@ pub(crate) fn add_config(
     Ok(u64::from(id))
 }
 
-/// xe_oa_register: `metrics` under the card's primary-minor node. NARF
-/// publishes it only with the OA opt-in, when the unit can exist.
+/// xe_oa_register: `metrics` and `oa` telemetry under the card's primary-minor node.
+/// NARF publishes them only with the OA opt-in, when the unit can exist.
 static METRICS: [IrqSafeSpinLock<Option<Arc<narf_filesystem::sysfs::Kobject>>>; 64] =
+    [const { IrqSafeSpinLock::new(None) }; 64];
+static OA_NODES: [IrqSafeSpinLock<Option<Arc<narf_filesystem::sysfs::Kobject>>>; 64] =
     [const { IrqSafeSpinLock::new(None) }; 64];
 
 pub(crate) fn populate_card(card: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
     if enabled() {
         install_metrics(card, node);
+        install_oa(card, node);
+    }
+}
+
+pub(crate) fn oa_status_string(card: u32) -> alloc::string::String {
+    let active = ACTIVE
+        .get(card as usize)
+        .is_some_and(|a| a.load(Ordering::Acquire));
+    let num_configs = REGISTRY
+        .get(card as usize)
+        .map_or(0, |r| r.lock().configs.len());
+    let enabled_str = if enabled() { "enabled" } else { "disabled" };
+    let capable_str = if capable() { "yes" } else { "no" };
+    let active_str = if active { "active" } else { "idle" };
+
+    alloc::format!(
+        "oa_support: {}\n\
+         oa_capable: {}\n\
+         oa_status: {}\n\
+         oa_buffer_size: {}\n\
+         oa_configs: {}\n\
+         oa_overflows: 0\n",
+        enabled_str,
+        capable_str,
+        active_str,
+        DEFAULT_BUFFER,
+        num_configs,
+    )
+}
+
+fn install_oa(card: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
+    let Some(slot) = OA_NODES.get(card as usize) else {
+        return;
+    };
+    let mut slot = slot.lock();
+    if slot.is_none() {
+        let oa_kobj = narf_filesystem::sysfs::Kobject::new_child(node.clone(), "oa");
+        narf_filesystem::sysfs::kobject_add_attr(&oa_kobj, "oa_status", move || {
+            oa_status_string(card)
+        });
+        narf_filesystem::sysfs::kobject_add_attr(&oa_kobj, "oa_buffer_size", move || {
+            alloc::format!("{DEFAULT_BUFFER}\n")
+        });
+        narf_filesystem::sysfs::kobject_add_attr(&oa_kobj, "oa_active", move || {
+            let active = ACTIVE
+                .get(card as usize)
+                .is_some_and(|a| a.load(Ordering::Acquire));
+            alloc::format!("{}\n", if active { 1 } else { 0 })
+        });
+        narf_filesystem::sysfs::kobject_add_attr(&oa_kobj, "oa_configs_count", move || {
+            let num_configs = REGISTRY
+                .get(card as usize)
+                .map_or(0, |r| r.lock().configs.len());
+            alloc::format!("{num_configs}\n")
+        });
+        narf_filesystem::sysfs::kobject_add_attr(&oa_kobj, "oa_overflow_count", move || {
+            alloc::string::String::from("0\n")
+        });
+        *slot = Some(oa_kobj);
     }
 }
 fn install_metrics(card: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
@@ -837,6 +961,7 @@ fn metrics_remove(card: u32, uuid: &[u8; 36]) {
 #[cfg(feature = "kernel-test")]
 pub(crate) fn install_metrics_for_test(card: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
     install_metrics(card, node);
+    install_oa(card, node);
 }
 
 /// xe_oa_remove_config_ioctl.
@@ -1428,6 +1553,19 @@ impl<A: BootAllocator> Unit<A> {
         reference_clock: u32,
         rpm_config0: u32,
     ) -> Option<Device> {
+        self.device_with_media(card, engines, reference_clock, rpm_config0, None, None)
+    }
+    pub(crate) fn device_with_media(
+        &self,
+        card: u32,
+        engines: EngineSet,
+        reference_clock: u32,
+        rpm_config0: u32,
+        media_engines: Option<EngineSet>,
+        media_reference_clock: Option<u32>,
+    ) -> Option<Device> {
+        let media_timestamp = media_reference_clock
+            .map(|ref_clk| timestamp_frequency(self.graphics, ref_clk, rpm_config0));
         Device {
             card,
             platform: self.platform,
@@ -1435,6 +1573,8 @@ impl<A: BootAllocator> Unit<A> {
             timestamp: timestamp_frequency(self.graphics, reference_clock, rpm_config0),
             engines,
             reserve: self.backing.as_ref()?.size_pages() * 4096,
+            media_engines,
+            media_timestamp,
         }
         .validate()
         .ok()

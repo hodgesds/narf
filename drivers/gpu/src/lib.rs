@@ -773,6 +773,8 @@ pub mod intel_gpu_gt_registers;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gt_runtime;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_gt_sysfs;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gtt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc;

@@ -120,6 +120,14 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn media_gt_rc6_residency_ms(&self) -> Option<u64> {
         None
     }
+    /// Confirmed SLPC status (limits, range, profile) for the main graphics GT (GT0).
+    fn main_gt_slpc_status(&self) -> Option<crate::intel_gpu_slpc::Status> {
+        None
+    }
+    /// Accumulated RC6 residency in milliseconds for the main graphics GT (GT0).
+    fn main_gt_rc6_residency_ms(&self) -> Option<u64> {
+        None
+    }
     /// Cached physical automatic global-reset availability for this live user
     /// epoch. Default refusal; discovery alone is not a recovery owner. No I/O.
     fn reset_availability_epoch(&self) -> Option<u64> {
