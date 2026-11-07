@@ -1329,7 +1329,8 @@ fn feed_byte_alps(byte: u8) {
             alps.ext_phase = 1;
             return;
         }
-        alps.ext[alps.ext_phase as usize] = byte;
+        let ext_phase = alps.ext_phase as usize;
+        alps.ext[ext_phase] = byte;
         alps.ext_phase += 1;
         if alps.ext_phase < 3 {
             return;
