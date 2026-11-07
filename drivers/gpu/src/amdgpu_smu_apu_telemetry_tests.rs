@@ -12,7 +12,10 @@
 //! the ids rather than echoing them.
 
 use super::*;
-use core::task::{Context, Poll, Waker};
+use core::{
+    future::Future,
+    task::{Context, Poll, Waker},
+};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::amdgpu_smu::{
@@ -576,8 +579,7 @@ fn apu_monitor_publishes_first_refresh_then_exits_on_epoch_change() -> TestResul
         return TestResult::Fail("publish_dram_addr failed");
     }
     let epoch = begin_epoch();
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let mut fut = alloc::boxed::Box::pin(monitor(&mut owner, &mut smu, epoch));
     // First poll: refresh + publish, then Pending on the 1 s sleep.
     if !matches!(fut.as_mut().poll(&mut cx), Poll::Pending) {

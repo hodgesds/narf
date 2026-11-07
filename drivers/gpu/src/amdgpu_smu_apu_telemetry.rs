@@ -125,6 +125,10 @@ pub trait MetricsBuffer {
     fn sync_after_transfer(&mut self);
     /// Buffer length in bytes.
     fn len(&self) -> usize;
+    /// Whether the buffer holds no bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl MetricsBuffer for DmaBuffer {
@@ -227,6 +231,7 @@ impl ApuError {
 /// on main. The buffer (`B: MetricsBuffer`) is owned: the SMU retains
 /// `DriverDramAddr` after acknowledgement, so the owner must be kept
 /// alive for the device lifetime (see the module docs).
+#[derive(Debug)]
 pub struct ApuTelemetryOwner<B: MetricsBuffer> {
     version: SmuVersion,
     mp1_base: u32,
