@@ -3371,10 +3371,12 @@ mod i2c_hid_touch_smokes {
                 None,
                 &contacts,
                 Some(decoded.btn_left),
-                0,
-                params.max_x as i32,
-                0,
-                params.max_y as i32,
+                crate::rmi4_core::Rmi4PumpBounds {
+                    x_min: 0,
+                    x_max: params.max_x as i32,
+                    y_min: 0,
+                    y_max: params.max_y as i32,
+                },
             );
             if pushed < 1 {
                 return TestResult::Fail("pump pushed 0 events");
@@ -3388,6 +3390,162 @@ mod i2c_hid_touch_smokes {
         })
     }
     kernel_test_in!("drivers/input/i2c-hid", smoke_fake_i2c_hid_elan_end_to_end);
+
+    // ── End-to-end FakeI2cHid Elan mute-LED drive (issue #1684) ──
+    //
+    // Stages the same Elan descriptor + probe exchange as the bind
+    // test above, but with the HP Pavilion X2 product id (0x074D)
+    // so classification yields the HAS_LED row; then drives the
+    // node's EV_LED LED_MUTE bit through the pump's
+    // `sync_elan_mute_led` and checks the captured SET_FEATURE
+    // wire bytes — the 0xBC mute-LED report Linux's
+    // `elan_mute_led_set_brigtness()` sends — on mute/unmute, and
+    // that repeats and non-LED devices send nothing.
+    fn smoke_fake_i2c_hid_elan_mute_led_end_to_end() -> TestResult {
+        use super::i2c_hid_smokes::{make_descriptor_bytes, run_async, MockBus};
+        use crate::hid_elan::{classify_device, ElanMuteLed, ElanQuirks, ELAN_MUTE_LED_REPORT};
+        use crate::i2c_hid::{I2cHidDriver, POWER_ON};
+        use crate::i2c_hid_bind::{elan_probe, sync_elan_mute_led};
+        use alloc::sync::Arc;
+        use narf_drivers_i2c::I2cBus;
+        use narf_input::evdev::{led, DeviceCaps, EvdevEvent, EventType, ROUTER};
+
+        let bus = Arc::new(MockBus::new());
+        let mut hid_desc = make_descriptor_bytes();
+        let put16 = |buf: &mut [u8], off: usize, v: u16| {
+            buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        put16(&mut hid_desc, 10, 64); // wMaxInputLength
+        put16(&mut hid_desc, 14, 32); // wMaxOutputLength
+        put16(&mut hid_desc, 22, 0x074D);
+        // (1) HID descriptor. (2) RESET sentinel.
+        bus.stage_read(hid_desc);
+        bus.stage_read(alloc::vec![0u8; 2]);
+        // (3)-(5) Parameter GET responses: [len=7][5-byte report].
+        // MAX_X = 0x1234, MAX_Y = 0x0500, RES x/y = 0x10/0x10.
+        for resp in [
+            [0x0D, 0x05, 0x03, 0x34, 0x12],
+            [0x0D, 0x05, 0x03, 0x00, 0x05],
+            [0x0D, 0x05, 0x03, 0x10, 0x10],
+        ] {
+            bus.stage_read(alloc::vec![0x07, 0x00]);
+            bus.stage_read(resp.to_vec());
+        }
+
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x10, 0x0001);
+        let bus_for_check = bus.clone();
+        run_async(async move {
+            if drv.read_descriptor().await.is_err() {
+                return TestResult::Fail("HID descriptor read failed");
+            }
+            if drv.reset().await.is_err() {
+                return TestResult::Fail("RESET failed");
+            }
+            if drv.set_power(POWER_ON).await.is_err() {
+                return TestResult::Fail("SET_POWER(ON) failed");
+            }
+            let desc = match drv.descriptor() {
+                Some(d) => d,
+                None => return TestResult::Fail("no descriptor after read"),
+            };
+            // Classify: HP X2 product id under a generic PNP0C50
+            // _HID must yield the HAS_LED row.
+            let elan_match = match classify_device("PNP0C50", desc.w_vendor_id, desc.w_product_id) {
+                Some(m) => m,
+                None => return TestResult::Fail("HP X2 did not classify as Elan"),
+            };
+            let has_led = elan_match.quirks.contains(ElanQuirks::HAS_LED);
+            if !has_led {
+                return TestResult::Fail("HP X2 row must carry HAS_LED");
+            }
+            let params = match elan_probe(&drv).await {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail("Elan probe failed"),
+            };
+            let caps = crate::i2c_hid_touch::build_elan_caps(&params, &DeviceCaps::new(), has_led);
+            if !caps.ledbit.get(led::LED_MUTE) {
+                return TestResult::Fail("HAS_LED caps must declare LED_MUTE");
+            }
+            let (id, node) = ROUTER.register_device(caps);
+            let fail = |msg: &'static str| {
+                ROUTER.unregister_device(id);
+                TestResult::Fail(msg)
+            };
+            // Mute-LED SET_FEATURE frames on the wire: 16-byte
+            // writes whose byte 8 echoes report id 0xBC.
+            let mute_frames = || {
+                bus_for_check
+                    .writes()
+                    .into_iter()
+                    .filter(|w| w.len() == 16 && w[8] == ELAN_MUTE_LED_REPORT)
+                    .collect::<alloc::vec::Vec<alloc::vec::Vec<u8>>>()
+            };
+            // Expected frame (Microsoft HID-over-I2C §7.2):
+            // [cmd reg 0x0005 LE][(Feature 0x03 << 4) | (0xBC & 0x0f)
+            //  = 0x3C][opcode 0x03][data reg 0x0006 LE][total len
+            //  2+1+7 = 10 LE][report id 0xBC][0x02][on][0 × 5].
+            let expect_frame = |on: bool| {
+                let mut v = alloc::vec![0x05, 0x00, 0x3C, 0x03, 0x06, 0x00, 0x0A, 0x00, 0xBC, 0x02];
+                v.push(if on { 1 } else { 0 });
+                v.extend_from_slice(&[0u8; 5]);
+                v
+            };
+            // Dispatch an EV_LED LED_MUTE event the way a userspace
+            // mic/audio-mute write would.
+            let set_mute = |node: &Arc<narf_input::evdev::DeviceNode>, on: bool| {
+                let now = narf_time::monotonic_ns();
+                let _ = node.dispatch(EvdevEvent {
+                    time: now,
+                    type_: EventType::Led,
+                    code: led::LED_MUTE,
+                    value: i32::from(on),
+                });
+                let _ = node.dispatch(EvdevEvent::syn_report(now));
+            };
+
+            let mut led = ElanMuteLed::new(has_led);
+            // Mute on → one 0xBC frame, LED lit.
+            set_mute(&node, true);
+            sync_elan_mute_led(&drv, &node, &mut led).await;
+            let frames = mute_frames();
+            if frames.len() != 1 {
+                return fail("mute-on must send exactly one 0xBC frame");
+            }
+            if frames[0] != expect_frame(true) {
+                return fail("mute-on frame bytes wrong");
+            }
+            // Repeat (no state change) → no second frame.
+            set_mute(&node, true);
+            sync_elan_mute_led(&drv, &node, &mut led).await;
+            if mute_frames().len() != 1 {
+                return fail("repeated mute-on must not re-send");
+            }
+            // Mute off → one clearing frame.
+            set_mute(&node, false);
+            sync_elan_mute_led(&drv, &node, &mut led).await;
+            let frames = mute_frames();
+            if frames.len() != 2 {
+                return fail("mute-off must send exactly one 0xBC frame");
+            }
+            if frames[1] != expect_frame(false) {
+                return fail("mute-off frame bytes wrong");
+            }
+            // Non-LED device: mute on, sync → still no new frame.
+            let mut no_led = ElanMuteLed::new(false);
+            set_mute(&node, true);
+            sync_elan_mute_led(&drv, &node, &mut no_led).await;
+            if mute_frames().len() != 2 {
+                return fail("non-LED device must never send a 0xBC frame");
+            }
+            ROUTER.unregister_device(id);
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_fake_i2c_hid_elan_mute_led_end_to_end
+    );
 
     // ── End-to-end FakeI2cHid RMI4-over-HID bind ─────────────────
     //
@@ -4685,6 +4843,266 @@ fn smoke_hid_elan_mute_led_feature_encode() -> TestResult {
 kernel_test_in!(
     "drivers/input/hid-elan",
     smoke_hid_elan_mute_led_feature_encode
+);
+
+// ─── hid-elan mute-LED driving (issue #1684) ────────────────────────
+//
+// Fixtures are built from the Linux `hid-elan.c` report shape
+// (`[0xBC, 0x02, brightness, 0, 0, 0, 0, 0]`, 8 bytes), not from
+// the driver's own encoder: the fake transport records every
+// SET_FEATURE body and the assertions compare literal wire bytes.
+
+/// Fake `ElanHidIo` transport: records every SET_FEATURE body and
+/// can be made to fail the next SET, so the mute-LED fixtures
+/// prove the exact bytes the driver sends on a mute transition.
+#[derive(Debug)]
+struct FakeElanIo {
+    set_calls: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    fail_set: bool,
+}
+
+impl FakeElanIo {
+    fn new() -> Self {
+        Self {
+            set_calls: alloc::vec::Vec::new(),
+            fail_set: false,
+        }
+    }
+}
+
+impl crate::hid_elan::ElanHidIo for FakeElanIo {
+    fn set_feature(&mut self, report: &[u8]) -> Result<(), crate::rmi4_core::TransportError> {
+        if self.fail_set {
+            return Err(crate::rmi4_core::TransportError::NotReady);
+        }
+        self.set_calls.push(report.to_vec());
+        Ok(())
+    }
+
+    fn get_feature(
+        &mut self,
+        _report_id: u8,
+        dst: &mut [u8],
+    ) -> Result<usize, crate::rmi4_core::TransportError> {
+        for b in dst.iter_mut() {
+            *b = 0;
+        }
+        Ok(dst.len())
+    }
+}
+
+fn smoke_hid_elan_mute_led_drives_on_mute_transition() -> TestResult {
+    use crate::hid_elan::{ElanMuteLed, MuteLedDrive};
+    let mut io = FakeElanIo::new();
+    // HP X2: HAS_LED.
+    let mut led = ElanMuteLed::new(true);
+    // Mute on → exactly one 0xBC report, LED lit.
+    match led.set_muted(&mut io, true) {
+        Ok(MuteLedDrive::Driven(true)) => {}
+        _ => return TestResult::Fail("mute-on must drive the LED"),
+    }
+    if io.set_calls.len() != 1 {
+        return TestResult::Fail("mute-on must send exactly one report");
+    }
+    if io.set_calls[0] != alloc::vec![0xBC, 0x02, 0x01, 0, 0, 0, 0, 0] {
+        return TestResult::Fail("mute-on report bytes wrong");
+    }
+    // Repeating mute-on sends nothing — the LED is already lit.
+    match led.set_muted(&mut io, true) {
+        Ok(MuteLedDrive::Unchanged) => {}
+        _ => return TestResult::Fail("repeated mute-on must be Unchanged"),
+    }
+    if io.set_calls.len() != 1 {
+        return TestResult::Fail("repeated mute-on must not re-send");
+    }
+    // Mute off → one clearing report.
+    match led.set_muted(&mut io, false) {
+        Ok(MuteLedDrive::Driven(false)) => {}
+        _ => return TestResult::Fail("mute-off must drive the LED"),
+    }
+    if io.set_calls.len() != 2 {
+        return TestResult::Fail("mute-off must send exactly one report");
+    }
+    if io.set_calls[1] != alloc::vec![0xBC, 0x02, 0x00, 0, 0, 0, 0, 0] {
+        return TestResult::Fail("mute-off report bytes wrong");
+    }
+    // Repeating mute-off sends nothing.
+    match led.set_muted(&mut io, false) {
+        Ok(MuteLedDrive::Unchanged) => {}
+        _ => return TestResult::Fail("repeated mute-off must be Unchanged"),
+    }
+    if io.set_calls.len() != 2 {
+        return TestResult::Fail("repeated mute-off must not re-send");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_mute_led_drives_on_mute_transition
+);
+
+fn smoke_hid_elan_mute_led_never_touched_without_has_led() -> TestResult {
+    use crate::hid_elan::{ElanMuteLed, MuteLedDrive};
+    use narf_input::evdev::led::LED_MUTE;
+    let mut io = FakeElanIo::new();
+    // Toshiba Click L9W: no HAS_LED.
+    let mut led = ElanMuteLed::new(false);
+    match led.set_muted(&mut io, true) {
+        Ok(MuteLedDrive::NotPresent) => {}
+        _ => return TestResult::Fail("non-LED mute-on must be NotPresent"),
+    }
+    match led.set_muted(&mut io, false) {
+        Ok(MuteLedDrive::NotPresent) => {}
+        _ => return TestResult::Fail("non-LED mute-off must be NotPresent"),
+    }
+    // Even with the evdev mute bit set, nothing is ever sent.
+    let bitmap = 1u16 << LED_MUTE;
+    match led.sync_from_led_bitmap(&mut io, bitmap) {
+        Ok(MuteLedDrive::NotPresent) => {}
+        _ => return TestResult::Fail("non-LED bitmap sync must be NotPresent"),
+    }
+    match led.sync_from_led_bitmap(&mut io, 0) {
+        Ok(MuteLedDrive::NotPresent) => {}
+        _ => return TestResult::Fail("non-LED bitmap clear must be NotPresent"),
+    }
+    if !io.set_calls.is_empty() {
+        return TestResult::Fail("non-LED device must never see a SET_FEATURE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_mute_led_never_touched_without_has_led
+);
+
+fn smoke_hid_elan_mute_led_follows_evdev_bitmap() -> TestResult {
+    use crate::hid_elan::{ElanMuteLed, MuteLedDrive};
+    use narf_input::evdev::led::LED_MUTE;
+    let mut io = FakeElanIo::new();
+    let mut led = ElanMuteLed::new(true);
+    // LED_MUTE bit set in the input-core bitmap → LED on.
+    let bitmap = 1u16 << LED_MUTE;
+    match led.sync_from_led_bitmap(&mut io, bitmap) {
+        Ok(MuteLedDrive::Driven(true)) => {}
+        _ => return TestResult::Fail("LED_MUTE set must drive the LED on"),
+    }
+    if io.set_calls.len() != 1 || io.set_calls[0][2] != 1 {
+        return TestResult::Fail("bitmap-sync ON report wrong");
+    }
+    // A bitmap without LED_MUTE clears the LED, even when other
+    // LED bits (e.g. CapsLock) are set — the LED mirrors the
+    // mute bit exactly, nothing else.
+    let other_bits = 1u16 << narf_input::evdev::led::LED_CAPSL;
+    match led.sync_from_led_bitmap(&mut io, other_bits) {
+        Ok(MuteLedDrive::Driven(false)) => {}
+        _ => return TestResult::Fail("unrelated LED bits must clear the mute LED"),
+    }
+    if io.set_calls.len() != 2 || io.set_calls[1][2] != 0 {
+        return TestResult::Fail("bitmap-sync OFF report wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_mute_led_follows_evdev_bitmap
+);
+
+fn smoke_hid_elan_mute_led_failed_send_retries() -> TestResult {
+    use crate::hid_elan::{ElanMuteLed, MuteLedDrive};
+    let mut io = FakeElanIo::new();
+    io.fail_set = true;
+    let mut led = ElanMuteLed::new(true);
+    // Failed send → error, driven state stays off, nothing recorded.
+    match led.set_muted(&mut io, true) {
+        Err(_) => {}
+        _ => return TestResult::Fail("failed send must return Err"),
+    }
+    if led.driven() {
+        return TestResult::Fail("driven state must stay off after a failed send");
+    }
+    if !io.set_calls.is_empty() {
+        return TestResult::Fail("failed send must not record a report");
+    }
+    // Retry after the bus recovers → the report goes out.
+    io.fail_set = false;
+    match led.set_muted(&mut io, true) {
+        Ok(MuteLedDrive::Driven(true)) => {}
+        _ => return TestResult::Fail("retry after failure must drive the LED"),
+    }
+    if io.set_calls.len() != 1 {
+        return TestResult::Fail("retry must send exactly one report");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_mute_led_failed_send_retries
+);
+
+fn smoke_hid_elan_mute_led_class_device() -> TestResult {
+    use crate::hid_elan::{ElanDeviceParams, ELAN_MUTE_LED_MAX_BRIGHTNESS, ELAN_MUTE_LED_NAME};
+    use crate::i2c_hid_touch::build_elan_caps;
+    use narf_drivers_leds::LedDevice;
+    use narf_input::evdev::{led, DeviceCaps, ROUTER};
+    narf_drivers_leds::__reset_all_for_test();
+    let params = ElanDeviceParams {
+        max_x: 1000,
+        max_y: 500,
+        res_x_dots_per_mm: 10,
+        res_y_dots_per_mm: 10,
+    };
+    // HAS_LED caps declare LED_MUTE; non-LED caps declare none.
+    let caps = build_elan_caps(&params, &DeviceCaps::new(), true);
+    if !caps.ledbit.get(led::LED_MUTE) {
+        return TestResult::Fail("HAS_LED caps must declare LED_MUTE");
+    }
+    let plain = build_elan_caps(&params, &DeviceCaps::new(), false);
+    if plain.ledbit.get(led::LED_MUTE) {
+        return TestResult::Fail("non-LED caps must not declare LED_MUTE");
+    }
+    let (id, node) = ROUTER.register_device(caps);
+    let fail = |msg: &'static str| {
+        narf_drivers_leds::unregister_led(ELAN_MUTE_LED_NAME);
+        ROUTER.unregister_device(id);
+        TestResult::Fail(msg)
+    };
+    let dev = crate::hid_elan::register_mute_led(node.clone());
+    let found = match narf_drivers_leds::lookup_led_by_name(ELAN_MUTE_LED_NAME) {
+        Some(d) => d,
+        None => return fail("elan:red:mute not in the LED registry"),
+    };
+    if found.name() != ELAN_MUTE_LED_NAME {
+        return fail("registered LED name wrong");
+    }
+    if found.max_brightness() != ELAN_MUTE_LED_MAX_BRIGHTNESS || found.max_brightness() != 1 {
+        return fail("mute LED max_brightness must be 1");
+    }
+    if dev.brightness() != 0 {
+        return fail("mute LED brightness must start at 0");
+    }
+    // A sysfs-style brightness write lands on the node's LED_MUTE
+    // bit (the single source of mute state the pump syncs from).
+    dev.set_brightness(1);
+    if node.led_state() & (1u16 << led::LED_MUTE) == 0 {
+        return fail("brightness 1 must set the node's LED_MUTE bit");
+    }
+    if dev.brightness() != 1 {
+        return fail("brightness() must read back 1");
+    }
+    dev.set_brightness(0);
+    if node.led_state() & (1u16 << led::LED_MUTE) != 0 {
+        return fail("brightness 0 must clear the node's LED_MUTE bit");
+    }
+    if dev.brightness() != 0 {
+        return fail("brightness() must read back 0");
+    }
+    narf_drivers_leds::unregister_led(ELAN_MUTE_LED_NAME);
+    ROUTER.unregister_device(id);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-elan",
+    smoke_hid_elan_mute_led_class_device
 );
 
 fn smoke_hid_elan_resolution_convert() -> TestResult {

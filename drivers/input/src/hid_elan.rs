@@ -32,7 +32,12 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+use narf_drivers_leds::{register_led, LedDevice, Trigger};
+use narf_input::evdev::{led as evled, DeviceNode, EvdevEvent, EventType};
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::rmi4_core::TransportError;
 
@@ -456,6 +461,239 @@ pub fn enable_absolute_mode<T: ElanHidIo>(io: &mut T) -> Result<(), TransportErr
 pub fn set_mute_led<T: ElanHidIo>(io: &mut T, on: bool) -> Result<(), TransportError> {
     let body = encode_mute_led(on);
     io.set_feature(&body)
+}
+
+// ── Mute-LED driving (issue #1684) ─────────────────────────────────
+//
+// Linux grounding (`hid-elan.c`, torvalds/linux master):
+// - `elan_mute_led_set_brigtness()` (:411-444): `led_state = !!value`,
+//   Feature report `[0xBC, 0x02, led_state, 0, 0, 0, 0, 0]`, success
+//   requires the raw request to transfer all 8 bytes; the cached
+//   `mute_led_state` is updated only on success.
+// - `elan_init_mute_led()` (:446-459): LED class device named
+//   `"elan:red:mute"`, `default_trigger = "audio-mute"`,
+//   `max_brightness = LED_ON` (1), `LED_HW_PLUGGABLE`.
+// - `elan_probe()` (:498): the LED is registered only when the
+//   device-id row carries `ELAN_HAS_LED`.
+//
+// The LED is the *audio*-mute LED (Linux default trigger
+// `audio-mute`): it lights when the audio mixer is muted, not on
+// microphone mute specifically. NARF has no `audio-mute` trigger
+// in the LED trigger engine yet (remainder: file the trigger
+// wiring as a follow-up), so the mute state the driver follows is
+// the input core's per-device EV_LED bitmap — `LED_MUTE` (0x07) on
+// the Elan evdev node — owned by `narf_input::evdev::DeviceNode`
+// and written by userspace EV_LED writes or by the
+// `elan:red:mute` LED class device below. The i2c-HID pump polls
+// that bitmap after every Elan report (the tree's established
+// pattern for pump-owned producers; see `sync_kbd_leds`) and
+// issues the 0xBC Feature report only when the mute state moved
+// since the last successful send.
+
+/// LED class name for the Elan mute LED (Linux
+/// `elan_init_mute_led()`, `hid-elan.c:451`).
+pub const ELAN_MUTE_LED_NAME: &str = "elan:red:mute";
+
+/// Maximum brightness of the mute LED (Linux `LED_ON`,
+/// `hid-elan.c:454` — the LED is on/off only).
+pub const ELAN_MUTE_LED_MAX_BRIGHTNESS: u32 = 1;
+
+/// Outcome of one mute-LED drive attempt.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MuteLedDrive {
+    /// Device has no mute LED (`HAS_LED` clear) — nothing was sent.
+    NotPresent,
+    /// Desired state already driven — no report sent.
+    Unchanged,
+    /// A 0xBC feature report was sent with this brightness.
+    Driven(bool),
+}
+
+/// Mute-LED driver state for one Elan touchpad.
+///
+/// The state machine is transport-agnostic: the sync `ElanHidIo`
+/// path (`set_muted` / `sync_from_led_bitmap`) and the async
+/// i2c-HID pump (`pending_drive` + `mark_driven` around
+/// `I2cHidDriver::set_feature_report`) share the same decision —
+/// send a report only when the device has the LED and the desired
+/// state differs from the last successfully driven state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ElanMuteLed {
+    has_led: bool,
+    /// Last brightness successfully driven to hardware (Linux
+    /// `mute_led_state`, `hid-elan.c:44,442` — updated only on
+    /// success, so a failed send retries on the next sync).
+    /// Starts `false`: the LED core's initial brightness is
+    /// LED_OFF, so the first transition worth sending is mute-on,
+    /// and a device that never mutes never sees a report.
+    driven: bool,
+}
+
+impl ElanMuteLed {
+    /// Create the mute-LED state for a bound device. `has_led`
+    /// comes from the device-id row's `HAS_LED` quirk, detected at
+    /// probe/bind time.
+    pub fn new(has_led: bool) -> Self {
+        Self {
+            has_led,
+            driven: false,
+        }
+    }
+
+    /// Whether this device exposes a mute LED.
+    pub fn has_led(&self) -> bool {
+        self.has_led
+    }
+
+    /// Last brightness successfully driven to hardware.
+    pub fn driven(&self) -> bool {
+        self.driven
+    }
+
+    /// Pure drive decision: `Some(muted)` iff a feature report
+    /// must be sent — the device has the LED and the desired state
+    /// differs from the last driven state. `None` on non-LED
+    /// devices and on repeats of the current state, so the LED is
+    /// never touched on either.
+    pub fn pending_drive(&self, muted: bool) -> Option<bool> {
+        if !self.has_led || muted == self.driven {
+            None
+        } else {
+            Some(muted)
+        }
+    }
+
+    /// Record a successful drive (called by the async pump after
+    /// `set_feature_report` succeeds; the sync path does it
+    /// inline in `set_muted`).
+    pub fn mark_driven(&mut self, muted: bool) {
+        self.driven = muted;
+    }
+
+    /// Drive the LED to `muted` over the sync `ElanHidIo` path
+    /// (USB-HID transport / fixtures). No-op on non-LED devices
+    /// and on repeats; updates the driven state only on success.
+    pub fn set_muted<T: ElanHidIo>(
+        &mut self,
+        io: &mut T,
+        muted: bool,
+    ) -> Result<MuteLedDrive, TransportError> {
+        let Some(on) = self.pending_drive(muted) else {
+            return Ok(if self.has_led {
+                MuteLedDrive::Unchanged
+            } else {
+                MuteLedDrive::NotPresent
+            });
+        };
+        set_mute_led(io, on)?;
+        self.driven = on;
+        Ok(MuteLedDrive::Driven(on))
+    }
+
+    /// Read mute state out of an input-core LED bitmap and drive
+    /// the LED to match. The bitmap is the node's `led_state()`;
+    /// see `mute_from_led_bitmap`.
+    pub fn sync_from_led_bitmap<T: ElanHidIo>(
+        &mut self,
+        io: &mut T,
+        led_bitmap: u16,
+    ) -> Result<MuteLedDrive, TransportError> {
+        self.set_muted(io, mute_from_led_bitmap(led_bitmap))
+    }
+}
+
+/// Extract the mute state from an input-core LED bitmap: the
+/// `LED_MUTE` bit (Linux `include/uapi/linux/input-event-codes.h`,
+/// `LED_MUTE = 0x07`) is the audio-mute indicator the Elan LED
+/// mirrors.
+pub fn mute_from_led_bitmap(led_bitmap: u16) -> bool {
+    led_bitmap & (1u16 << evled::LED_MUTE) != 0
+}
+
+/// LED class device for the Elan mute LED (`elan:red:mute`,
+/// Linux `elan_init_mute_led()`).
+///
+/// `set_brightness` dispatches an `EV_LED` / `LED_MUTE` event to
+/// the bound evdev node, so the input core stays the single source
+/// of mute state: a sysfs brightness write and a userspace evdev
+/// `EV_LED` write converge on the same bitmap, and the i2c-HID
+/// pump (the only task that can issue the async feature report)
+/// polls that bitmap and drives the hardware. The trigger is
+/// `Trigger::None` — NARF has no `audio-mute` trigger in the LED
+/// trigger engine yet, so nothing drives the LED automatically
+/// from mixer state; that wiring is a follow-up, not this lane.
+pub struct ElanMuteLedClass {
+    node: Arc<DeviceNode>,
+    trigger: IrqSafeSpinLock<Trigger>,
+}
+
+impl ElanMuteLedClass {
+    /// Create the class device bound to an already-registered
+    /// Elan evdev node. The node must carry `LED_MUTE` in its
+    /// ledbit (see `build_elan_caps` with `has_led`).
+    pub fn new(node: Arc<DeviceNode>) -> Self {
+        Self {
+            node,
+            trigger: IrqSafeSpinLock::new(Trigger::None),
+        }
+    }
+}
+
+impl core::fmt::Debug for ElanMuteLedClass {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ElanMuteLedClass")
+            .field("name", &ELAN_MUTE_LED_NAME)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LedDevice for ElanMuteLedClass {
+    fn name(&self) -> &str {
+        ELAN_MUTE_LED_NAME
+    }
+
+    fn max_brightness(&self) -> u32 {
+        ELAN_MUTE_LED_MAX_BRIGHTNESS
+    }
+
+    fn brightness(&self) -> u32 {
+        u32::from(mute_from_led_bitmap(self.node.led_state()))
+    }
+
+    fn set_brightness(&self, level: u32) {
+        let now = narf_time::monotonic_ns();
+        let value = i32::from(level != 0);
+        // Dispatch the EV_LED event the same way a userspace
+        // write() would, followed by the SYN_REPORT frame marker
+        // every evdev stream carries.
+        let _ = self.node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Led,
+            code: evled::LED_MUTE,
+            value,
+        });
+        let _ = self.node.dispatch(EvdevEvent::syn_report(now));
+    }
+
+    fn current_trigger(&self) -> Trigger {
+        self.trigger.lock().clone()
+    }
+
+    fn set_trigger(&self, trigger: Trigger) {
+        *self.trigger.lock() = trigger;
+    }
+}
+
+/// Register the mute LED class device for a bound HAS_LED Elan
+/// touchpad, publishing `/sys/class/leds/elan:red:mute/`.
+/// Call once per bound device, after its evdev node is
+/// registered; a same-name re-registration replaces the old
+/// device (LED registry idempotency convention). Returns the
+/// registered device.
+pub fn register_mute_led(node: Arc<DeviceNode>) -> Arc<ElanMuteLedClass> {
+    let dev = Arc::new(ElanMuteLedClass::new(node));
+    register_led(dev.clone());
+    dev
 }
 
 // ── Clickpad classification ────────────────────────────────────────

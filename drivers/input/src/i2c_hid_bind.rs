@@ -621,6 +621,37 @@ async fn sync_kbd_leds(
     }
 }
 
+/// Push the Elan touchpad node's mute-LED state to the device
+/// when it moved since the last successful send. Runs in pump
+/// (task) context — the pump owns the driver. Mirrors
+/// `sync_kbd_leds`: the input core owns the mute state (`EV_LED`
+/// `LED_MUTE` bit on the node's bitmap, written by userspace
+/// `EV_LED` writes or by the `elan:red:mute` LED class device);
+/// the pump diffs it against the last driven state after every
+/// Elan report and issues the 0xBC feature report only on change.
+/// A failed send leaves the driven state stale so the next report
+/// retries. Non-LED devices never reach here — their
+/// `ElanMuteLed` answers `None` to every decision — but the
+/// guard holds even if one did.
+pub(crate) async fn sync_elan_mute_led(
+    driver: &I2cHidDriver,
+    node: &narf_input::evdev::DeviceNode,
+    led: &mut crate::hid_elan::ElanMuteLed,
+) {
+    let Some(on) = led.pending_drive(crate::hid_elan::mute_from_led_bitmap(node.led_state()))
+    else {
+        return;
+    };
+    let body = crate::hid_elan::encode_mute_led(on);
+    if driver
+        .set_feature_report(crate::hid_elan::ELAN_MUTE_LED_REPORT, &body[1..])
+        .await
+        .is_ok()
+    {
+        led.mark_driven(on);
+    }
+}
+
 /// Per-device pump future. Owns the driver. Loops forever — exits
 /// only if the bus returns a fatal error.
 ///
@@ -755,6 +786,7 @@ async fn pump_task_inner(
     let mut rmi_state = crate::rmi4_core::Rmi4PumpState::new();
     let mut elan_params: Option<crate::hid_elan::ElanDeviceParams> = None;
     let mut elan_node: Option<Arc<narf_input::evdev::DeviceNode>> = None;
+    let mut elan_mute_led: Option<crate::hid_elan::ElanMuteLed> = None;
     let mut elan_state = crate::rmi4_core::Rmi4PumpState::new();
     if let Some(quirks) = crate::hid_rmi::classify_device(
         &identity.acpi_hid,
@@ -795,27 +827,41 @@ async fn pump_task_inner(
                 );
             }
         }
-    } else if crate::hid_elan::classify_device(
+    } else if let Some(elan_match) = crate::hid_elan::classify_device(
         &identity.acpi_hid,
         hid_desc.w_vendor_id,
         hid_desc.w_product_id,
-    )
-    .is_some()
-    {
+    ) {
         match elan_probe(&driver).await {
             Ok(params) => {
+                // HAS_LED comes from the device-id row (Linux
+                // `ELAN_HAS_LED` driver_data); the prefix/VID
+                // fallback rows carry no quirks, so an unlisted
+                // Elan VID never gets an LED it may not have.
+                let elan_has_led = elan_match
+                    .quirks
+                    .contains(crate::hid_elan::ElanQuirks::HAS_LED);
                 let _ = writeln!(
                     narf_console::Writer,
-                    "  i2c-hid-pump: {}: Elan vendor-format bound (max_x={}, max_y={})",
+                    "  i2c-hid-pump: {}: Elan vendor-format bound (max_x={}, max_y={}, mute_led={})",
                     path,
                     params.max_x,
                     params.max_y,
+                    elan_has_led,
                 );
                 let caps = crate::i2c_hid_touch::build_elan_caps(
                     &params,
                     &identity.caps("Touchpad", &hid_desc),
+                    elan_has_led,
                 );
                 let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
+                if elan_has_led {
+                    // Publishes /sys/class/leds/elan:red:mute/;
+                    // brightness writes land on the node's LED_MUTE
+                    // bit, which the pump syncs to hardware below.
+                    crate::hid_elan::register_mute_led(node.clone());
+                }
+                elan_mute_led = Some(crate::hid_elan::ElanMuteLed::new(elan_has_led));
                 elan_node = Some(node);
                 elan_params = Some(params);
             }
@@ -1093,11 +1139,20 @@ async fn pump_task_inner(
                         Some(node.as_ref()),
                         &contacts,
                         Some(report.btn_left),
-                        0,
-                        params.max_x as i32,
-                        0,
-                        params.max_y as i32,
+                        crate::rmi4_core::Rmi4PumpBounds {
+                            x_min: 0,
+                            x_max: params.max_x as i32,
+                            y_min: 0,
+                            y_max: params.max_y as i32,
+                        },
                     );
+                    // Mute LED follows the node's LED_MUTE bit
+                    // (issue #1684); a change since the last send
+                    // issues the 0xBC feature report, a failure
+                    // retries on the next Elan report.
+                    if let Some(mute) = elan_mute_led.as_mut() {
+                        sync_elan_mute_led(&driver, node, mute).await;
+                    }
                 }
                 continue;
             }
@@ -1394,7 +1449,17 @@ pub(crate) async fn pump_rmi_attn(
                         pressure: o.z as i32,
                     })
                     .collect();
-                state.pump_contacts(Some(node), &contacts, btn_left, 0, 0xFFFF, 0, 0xFFFF);
+                state.pump_contacts(
+                    Some(node),
+                    &contacts,
+                    btn_left,
+                    crate::rmi4_core::Rmi4PumpBounds {
+                        x_min: 0,
+                        x_max: 0xFFFF,
+                        y_min: 0,
+                        y_max: 0xFFFF,
+                    },
+                );
             }
         }
         return;
@@ -1424,7 +1489,17 @@ pub(crate) async fn pump_rmi_attn(
                         pressure: 0,
                     })
                     .collect();
-                state.pump_contacts(Some(node), &contacts, btn_left, 0, 0x0FFF, 0, 0x0FFF);
+                state.pump_contacts(
+                    Some(node),
+                    &contacts,
+                    btn_left,
+                    crate::rmi4_core::Rmi4PumpBounds {
+                        x_min: 0,
+                        x_max: 0x0FFF,
+                        y_min: 0,
+                        y_max: 0x0FFF,
+                    },
+                );
             }
         }
     }

@@ -507,6 +507,7 @@ fn map_hid_error(e: I2cHidError) -> TransportError {
 /// Holds only a shared reference — the bind pump keeps calling
 /// `driver.read_input_report` directly for its report loop, which
 /// is fine because every driver method takes `&self`.
+#[derive(Debug)]
 pub struct HidRmiSession<'d> {
     driver: &'d I2cHidDriver,
     output_report_size: usize,

@@ -28,6 +28,7 @@ narf-scheduler      = { path = "../../scheduler" }
 narf-aml            = { path = "../../aml" }
 narf-console        = { path = "../../console" }
 narf-drivers-virtio = { path = "../virtio" }
+narf-drivers-leds   = { path = "../leds" }
 narf-drivers-platform = { path = "../platform" }
 narf-kernel-test    = { path = "../../verification/kernel-test" }
 narf-bus            = { path = "../../bus" }
