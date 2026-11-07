@@ -4927,6 +4927,7 @@ pub fn bond_authenticated(index: usize, peer_addr: &[u8; 7]) -> Option<bool> {
     with_core(index, |core| {
         core.bonds.lookup(peer_addr).map(|b| b.authenticated)
     })
+    .flatten()
 }
 
 // ── The step ────────────────────────────────────────────────────────
@@ -12215,8 +12216,8 @@ mod tests {
         fake: &ScriptedTransport,
         want_ltk: &[u8; 16],
     ) -> Result<(), &'static str> {
-        let start_enc = fake
-            .sent_commands()
+        let sent = fake.sent_commands();
+        let start_enc = sent
             .iter()
             .find(|c| c.opcode == op::HCI_LE_START_ENCRYPTION);
         let mut want_start_enc = Vec::with_capacity(26);

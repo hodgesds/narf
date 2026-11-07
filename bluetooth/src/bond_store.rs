@@ -87,10 +87,10 @@ pub struct BondStore {
 }
 
 impl Bond {
-    /// Encode one bond as a record: peer address (7) + LTK (16)
-    /// + EDIV (2 LE) + Rand (8) + authenticated (1) + presence
-    /// flags (1: bit 0 IRK, bit 1 identity address, bit 2 CSRK)
-    /// + the present optional keys in IRK / identity-address /
+    /// Encode one bond as a record: peer address (7), LTK (16),
+    /// EDIV (2 LE), Rand (8), authenticated (1), presence flags
+    /// (1: bit 0 IRK, bit 1 identity address, bit 2 CSRK), then
+    /// the present optional keys in IRK / identity-address /
     /// CSRK order. This is our own on-disk record layout, not a
     /// wire format — the version byte on the store image is the
     /// evolution point.
@@ -149,7 +149,7 @@ impl Bond {
             return None;
         }
         let mut pos = 35;
-        let mut take = |bytes: &[u8], pos: &mut usize, n: usize| -> Option<Vec<u8>> {
+        let take = |bytes: &[u8], pos: &mut usize, n: usize| -> Option<Vec<u8>> {
             if bytes.len() < *pos + n {
                 return None;
             }

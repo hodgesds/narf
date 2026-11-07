@@ -784,6 +784,12 @@ fn pair_device(index: u16, params: &[u8]) -> Vec<u8> {
         Some(Err(crate::pump::SmpInitiateError::NotLe)) => {
             cmd_status(index, OP_PAIR_DEVICE, STATUS_NOT_SUPPORTED)
         }
+        Some(Err(crate::pump::SmpInitiateError::InvalidIoCap)) => {
+            // Unreachable from here: io_cap was validated against
+            // `IoCapability::from_u8` above, but the pump refuses
+            // out-of-range bytes with this error.
+            cmd_status(index, OP_PAIR_DEVICE, STATUS_INVALID_PARAMS)
+        }
         None => cmd_status(index, OP_PAIR_DEVICE, STATUS_FAILED),
     }
 }
