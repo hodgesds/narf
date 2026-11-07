@@ -40,6 +40,7 @@ mod cachyos_gate;
 mod cachyos_root;
 mod ci_clippy;
 mod composition;
+mod configs;
 mod crate_release;
 mod http3_smoke;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
@@ -1048,6 +1049,15 @@ struct BuildArgs {
     /// Forward-list of cargo features to enable. Comma-separated.
     #[arg(long, default_value = "")]
     features: String,
+
+    /// Named build configuration from the closed registry in
+    /// `configs.rs`: `all` (every driver group — the default build,
+    /// unchanged) or `minimal` (always-on core only; the net and
+    /// storage driver groups are neither compiled into the kernel
+    /// nor registered). Unioned with `--features`; CI passes names,
+    /// not feature vectors.
+    #[arg(long, value_name = "NAME")]
+    config: Option<String>,
 
     /// External kernel composition manifest. The file can live outside this
     /// checkout and select crates as built-ins or loadable modules.
@@ -4580,6 +4590,31 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
             .any(|component| component.signature.is_none())
     {
         ensure_feature(&mut features, "module-allow-unsigned");
+    }
+    // Named build configuration (`--config`, closed registry in
+    // `configs.rs`): `all` leaves the invocation untouched — frame's
+    // defaults already include every driver group, so the build is
+    // bit-for-bit today's. A subset config drops frame's defaults
+    // and selects its core/group features explicitly, unioned with
+    // the caller's `--features` like everything above.
+    let mut no_default_features = false;
+    if let Some(name) = &args.config {
+        if args.package != "narf-frame" {
+            bail!("--config selects narf-frame feature groups and requires --package narf-frame");
+        }
+        let config = configs::lookup(name).ok_or_else(|| {
+            anyhow!(
+                "unknown --config {name:?} (registered: {})",
+                configs::names().collect::<Vec<_>>().join(", ")
+            )
+        })?;
+        no_default_features = config.no_default_features;
+        for feature in config.features {
+            ensure_feature(&mut features, feature);
+        }
+    }
+    if no_default_features {
+        cmd.arg("--no-default-features");
     }
     if !features.is_empty() {
         cmd.arg("--features").arg(&features);
