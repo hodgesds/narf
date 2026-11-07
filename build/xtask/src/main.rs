@@ -1908,7 +1908,15 @@ impl Arch {
                     // `igb` (82576, 0x10C9) so the advanced-descriptor igb
                     // driver can be exercised on the same `n1` backend. The
                     // emulated 82576 drives the identical datapath as the i210.
-                    let legacy_nic_dev = if std::env::var("XTASK_QEMU_IGB")
+                    // `XTASK_QEMU_VMXNET3=1` swaps it for QEMU's `vmxnet3`
+                    // (0x07B0) instead, so the vmxnet3 datapath + publication
+                    // smoke runs on the same backend.
+                    let legacy_nic_dev = if std::env::var("XTASK_QEMU_VMXNET3")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                    {
+                        "vmxnet3,netdev=n1"
+                    } else if std::env::var("XTASK_QEMU_IGB")
                         .map(|v| v == "1")
                         .unwrap_or(false)
                     {
@@ -2158,7 +2166,15 @@ impl Arch {
                     // `igb` (82576, 0x10C9) so the advanced-descriptor igb
                     // driver can be exercised on the same `n1` backend. The
                     // emulated 82576 drives the identical datapath as the i210.
-                    let legacy_nic_dev = if std::env::var("XTASK_QEMU_IGB")
+                    // `XTASK_QEMU_VMXNET3=1` swaps it for QEMU's `vmxnet3`
+                    // (0x07B0) instead, so the vmxnet3 datapath + publication
+                    // smoke runs on the same backend.
+                    let legacy_nic_dev = if std::env::var("XTASK_QEMU_VMXNET3")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                    {
+                        "vmxnet3,netdev=n1"
+                    } else if std::env::var("XTASK_QEMU_IGB")
                         .map(|v| v == "1")
                         .unwrap_or(false)
                     {

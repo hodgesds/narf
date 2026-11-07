@@ -107,6 +107,31 @@ pub const RCD_GEN_SHIFT: u32 = 31;
 /// TxCompDesc: gen bit at bit 31 of dword 3.
 pub const TCD_GEN_SHIFT: u32 = 31;
 
+// ── Completion-descriptor field positions ───────────────────────────
+// `vmxnet3_defs.h` `Vmxnet3_TxCompDesc` / `Vmxnet3_RxCompDesc`
+// (little-endian bitfields). The datapath decodes through these, never
+// through a magic literal, so a layout drift fails loudly here first.
+
+/// TxCompDesc dword0: EOP TxDesc index, bits[11:0].
+pub const TCD_TXIDX_MASK: u32 = (1 << 12) - 1;
+/// RxCompDesc dword0: RxDesc index, bits[11:0].
+pub const RCD_RXD_IDX_MASK: u32 = (1 << 12) - 1;
+/// RxCompDesc dword0: End Of Packet, bit 14.
+pub const RCD_EOP_SHIFT: u32 = 14;
+/// RxCompDesc dword0: Start Of Packet, bit 15.
+pub const RCD_SOP_SHIFT: u32 = 15;
+/// RxCompDesc dword2: received length, bits[13:0].
+pub const RCD_LEN_MASK: u32 = (1 << 14) - 1;
+/// RxCompDesc dword2: error flag, bit 14.
+pub const RCD_ERR_SHIFT: u32 = 14;
+
+/// TX descriptor gen bit as a mask (dword2 bit 14). Used by the SOP
+/// publish flip: the staged SOP desc carries `gen ^ 1` and the final
+/// write XORs this bit in once the rest of the packet is posted
+/// (`vmxnet3_drv.c::vmxnet3_tq_xmit`, "finally flips the GEN bit of
+/// the SOP desc").
+pub const TXD_GEN_BIT: u32 = 1 << TXD_GEN_SHIFT;
+
 // ── Ring sizing ─────────────────────────────────────────────────────
 // Linux defaults from `vmxnet3_int.h`: TX 512, RX 1024, comp ring
 // matched to the ring it tracks. Stage 2 uses 256 across the board
@@ -138,6 +163,9 @@ pub const RX_BUF_LEN: usize = 1536;
 pub const TX_BUF_LEN: usize = 1536;
 /// Default MTU advertised in `Vmxnet3_MiscConf.mtu`.
 pub const DEFAULT_MTU: usize = 1500;
+/// Largest Ethernet frame the TX path accepts: 1500 MTU + 14-byte
+/// header + 4-byte FCS. Matches the `FrameTooLong` rule ([1, 1518]).
+pub const MAX_FRAME_LEN: usize = 1518;
 
 // ── RX mode bits ────────────────────────────────────────────────────
 // `vmxnet3_defs.h` enum.
