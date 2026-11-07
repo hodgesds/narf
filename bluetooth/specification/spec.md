@@ -408,10 +408,13 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   policy sysfs `idle_timeout` reports — default 30 000 ms (the USB
   hub autosuspend window), 0 meaning "never autosuspend" — and the
   btusb suspend hook vetoes gating for a 0-timeout controller.
+  The `idle_timeout` sysfs attribute is writable (#1577): a store
+  parses milliseconds (0 = never autosuspend) and calls
+  `pm::set_idle_timeout_ms`, rejecting negative / non-numeric /
+  out-of-range input with `EINVAL`.
   Out of scope here: PCIe controllers (`btintel_pcie` never enters
   the HCI controller registry, so it has no index to key this
-  state off) and a sysfs store path for `idle_timeout` — both
-  follow-up.
+  state off) — follow-up.
 
 ## Scope
 

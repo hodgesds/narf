@@ -22,7 +22,10 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr, Kobject};
+use narf_filesystem::sysfs::{
+    class_device_register, class_register, kobject_add_attr, kobject_add_writable_attr, Kobject,
+};
+use narf_filesystem::FsError;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::controller::ControllerInfo;
@@ -159,10 +162,33 @@ pub fn register_hci_controller(
     // (see `crate::pm`). Default is the USB hub autosuspend
     // window (30 s); 0 means "never autosuspend" (Linux semantics).
     // Linux: `hdev->idle_timeout`.
+    //
+    // Writable (#1577): the store parses the written value as
+    // milliseconds (0 = never autosuspend) and calls
+    // `pm::set_idle_timeout_ms`; negative, non-numeric, empty, or
+    // out-of-`u32`-range input is rejected with `EINVAL`
+    // (`FsError::InvalidData`) and leaves the policy unchanged.
+    // Linux: `hci_dev.idle_timeout` is writable via the same
+    // `sysfs` attribute (`net/bluetooth/hci_sysfs.c`).
     let index_for_idle = index;
-    kobject_add_attr(&hci_kobj, "idle_timeout", move || {
-        format!("{}\n", crate::pm::idle_timeout_ms(index_for_idle))
-    });
+    let index_for_idle_store = index;
+    kobject_add_writable_attr(
+        &hci_kobj,
+        "idle_timeout",
+        move || format!("{}\n", crate::pm::idle_timeout_ms(index_for_idle)),
+        move |buf| {
+            let s = core::str::from_utf8(buf)
+                .map_err(|_| FsError::InvalidData)?
+                .trim();
+            // `u32::from_str` rejects a leading `-` (negative), any
+            // non-digit, and values above `u32::MAX`, so a single
+            // parse is the whole validation: 0 = never autosuspend,
+            // anything else = idle window in ms.
+            let ms: u32 = s.parse().map_err(|_| FsError::InvalidData)?;
+            crate::pm::set_idle_timeout_ms(index_for_idle_store, ms);
+            Ok(())
+        },
+    );
 
     // `sniff_max_interval` — ms, default 800 (0x0320 slots × 0.625 ms).
     // Linux: `hdev->sniff_max_interval` (default 800).
@@ -383,6 +409,87 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/sysfs", smoke_sysfs_hci_idle_timeout_live);
+
+    // ── smoke: idle_timeout store round-trips + rejects bad input ──
+    //
+    // #1577: the sysfs store is the only userspace writer of the
+    // pm idle policy. Values come from the sysfs/PM semantics
+    // themselves (0 = never autosuspend, else ms; anything
+    // negative / non-numeric / out of `u32` range is `EINVAL`),
+    // never from impl constants.
+
+    fn smoke_sysfs_hci_idle_timeout_store_roundtrip() -> TestResult {
+        __reset_for_test();
+        crate::pm::__reset_for_test();
+        let kobj = register_hci_controller(0, make_info(), &[]);
+        if !kobj.attr_is_writable("idle_timeout") {
+            return TestResult::Fail("idle_timeout attr is not writable");
+        }
+        // Store 5000 ms, then read it back through the same attr.
+        match kobj.attr_store("idle_timeout", b"5000\n") {
+            Some(Ok(())) => {}
+            Some(Err(_)) => return TestResult::Fail("store of 5000 rejected"),
+            None => return TestResult::Fail("idle_timeout has no store path"),
+        }
+        let val = match kobj.attr_show("idle_timeout") {
+            Some(v) => v,
+            None => return TestResult::Fail("idle_timeout attr missing after store"),
+        };
+        if val.trim() != "5000" {
+            return TestResult::Fail("idle_timeout did not read back the stored value");
+        }
+        if crate::pm::idle_timeout_ms(0) != 5_000 {
+            return TestResult::Fail("idle_timeout store did not reach the pm policy");
+        }
+        // Store 0 (never autosuspend) round-trips too.
+        if kobj
+            .attr_store("idle_timeout", b"0")
+            .is_some_and(|r| r.is_err())
+        {
+            return TestResult::Fail("store of 0 rejected");
+        }
+        if kobj.attr_show("idle_timeout").as_deref().map(str::trim) != Some("0") {
+            return TestResult::Fail("idle_timeout did not read back 0");
+        }
+        crate::pm::__reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/sysfs",
+        smoke_sysfs_hci_idle_timeout_store_roundtrip
+    );
+
+    fn smoke_sysfs_hci_idle_timeout_store_rejects_invalid() -> TestResult {
+        __reset_for_test();
+        crate::pm::__reset_for_test();
+        let kobj = register_hci_controller(0, make_info(), &[]);
+        // Pin a known-good value first: a rejected store must leave
+        // the policy untouched.
+        if kobj
+            .attr_store("idle_timeout", b"7000")
+            .is_some_and(|r| r.is_err())
+        {
+            return TestResult::Fail("setup store of 7000 rejected");
+        }
+        for bad in ["-1", "abc", "", "12ms", "4294967296"] {
+            match kobj.attr_store("idle_timeout", bad.as_bytes()) {
+                Some(Err(_)) => {}
+                Some(Ok(())) => {
+                    return TestResult::Fail("invalid idle_timeout store accepted");
+                }
+                None => return TestResult::Fail("idle_timeout has no store path"),
+            }
+            if crate::pm::idle_timeout_ms(0) != 7_000 {
+                return TestResult::Fail("rejected store changed the pm policy");
+            }
+        }
+        crate::pm::__reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/sysfs",
+        smoke_sysfs_hci_idle_timeout_store_rejects_invalid
+    );
 
     // ── smoke: connection child ──────────────────────────────────────
 
