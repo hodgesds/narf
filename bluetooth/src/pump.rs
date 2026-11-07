@@ -519,6 +519,13 @@ pub struct PumpCore {
     /// creating / synced / lost. Driven by `dispatch_event` (sync
     /// subevents + command completions) and the `periodic_adv_*` API.
     periodic_sync: gap::PeriodicSync,
+    /// Outcome of the most recent §7.8.89..92 sync-transfer
+    /// command (issue #1654), from its Command Complete. The
+    /// transfer commands change no phase — the sync stays Synced
+    /// and the train stays Enabled — so the completion is recorded
+    /// here rather than in either state machine; the pump API /
+    /// fixtures read it via `periodic_sync_transfer_last_outcome`.
+    last_sync_transfer: Option<gap::SyncTransferOutcome>,
     /// Page deferred while an inquiry is being cancelled:
     /// `classic_connect` from Inquiring issues Inquiry_Cancel first
     /// and only issues Create_Connection once Inquiry Complete
@@ -572,6 +579,7 @@ impl fmt::Debug for PumpCore {
             .field("classic_phase", &self.classic.phase)
             .field("periodic_adv_phase", &self.periodic_adv.phase)
             .field("periodic_sync_phase", &self.periodic_sync.phase)
+            .field("last_sync_transfer", &self.last_sync_transfer)
             .field("bonds", &self.bonds.len())
             .field("claimed", &self.claimed.len())
             .field("pending_acl", &self.pending_acl.len())
@@ -617,6 +625,7 @@ impl PumpCore {
             classic: classic::ClassicCentral::new(),
             periodic_adv: gap::PeriodicAdvertiser::new(),
             periodic_sync: gap::PeriodicSync::new(),
+            last_sync_transfer: None,
             pending_page: None,
             pending_scan_mode: None,
             pending_name: None,
@@ -1506,12 +1515,143 @@ impl PumpCore {
         Ok(())
     }
 
+    /// Transfer our established sync to a connected device
+    /// (§7.8.89, issue #1654). Only from Synced, and only for the
+    /// sync we actually hold — transferring a handle we do not hold
+    /// would draw Unknown Advertising Identifier (0x42) from the
+    /// controller, so the pump refuses first. The peer connection
+    /// must exist in the connection table (otherwise the controller
+    /// would return Unknown Connection Identifier, 0x02). State is
+    /// checked before the handle ranges, matching Create Sync. The
+    /// command completes once the information is queued, before it
+    /// is actually sent; the outcome lands in `last_sync_transfer`
+    /// and the sync stays Synced either way.
+    pub fn periodic_adv_sync_transfer(
+        &mut self,
+        connection_handle: u16,
+        service_data: u16,
+        sync_handle: u16,
+    ) -> Result<(), PeriodicError> {
+        if self.periodic_sync.phase != PeriodicSyncPhase::Synced
+            || self.periodic_sync.sync_handle != Some(sync_handle)
+        {
+            return Err(PeriodicError::WrongPhase);
+        }
+        if self.connection(connection_handle).is_none() {
+            return Err(PeriodicError::WrongPhase);
+        }
+        if connection_handle > gap::PA_SYNC_HANDLE_MAX || sync_handle > gap::PA_SYNC_HANDLE_MAX {
+            return Err(PeriodicError::BadParameter);
+        }
+        self.send_command(
+            op::HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER,
+            &gap::build_periodic_adv_sync_transfer(connection_handle, service_data, sync_handle),
+        )
+        .map_err(|_| PeriodicError::Transport)?;
+        Ok(())
+    }
+
+    /// Transfer our own periodic advertising set's sync information
+    /// to a connected device (§7.8.90, issue #1654). Only while the
+    /// train is Enabled for `advertising_handle` — the controller
+    /// returns Command Disallowed (0x0C) for a train that is not in
+    /// progress and Unknown Advertising Identifier (0x42) for a
+    /// handle with no set, so the pump refuses first. The peer
+    /// connection must exist in the connection table. The outcome
+    /// lands in `last_sync_transfer`; the train stays Enabled
+    /// either way.
+    pub fn periodic_adv_set_info_transfer(
+        &mut self,
+        connection_handle: u16,
+        service_data: u16,
+        advertising_handle: u8,
+    ) -> Result<(), PeriodicError> {
+        if self.periodic_adv.phase != PeriodicAdvertiserPhase::Enabled
+            || self.periodic_adv.advertising_handle != Some(advertising_handle)
+        {
+            return Err(PeriodicError::WrongPhase);
+        }
+        if self.connection(connection_handle).is_none() {
+            return Err(PeriodicError::WrongPhase);
+        }
+        if connection_handle > gap::PA_SYNC_HANDLE_MAX
+            || advertising_handle > gap::PA_ADV_HANDLE_MAX
+        {
+            return Err(PeriodicError::BadParameter);
+        }
+        self.send_command(
+            op::HCI_LE_PERIODIC_ADVERTISING_SET_INFO_TRANSFER,
+            &gap::build_periodic_adv_set_info_transfer(
+                connection_handle,
+                service_data,
+                advertising_handle,
+            ),
+        )
+        .map_err(|_| PeriodicError::Transport)?;
+        Ok(())
+    }
+
+    /// Set how the controller processes periodic advertising sync
+    /// information received over a connection (§7.8.91, issue
+    /// #1654). Only for a connection in the table; the mode / skip
+    /// / timeout / CTE ranges are validated host-side. The values
+    /// override the §7.8.92 defaults (and any earlier §7.8.91
+    /// values) for this connection; they do not affect sync
+    /// information already received. The outcome lands in
+    /// `last_sync_transfer`.
+    pub fn periodic_adv_set_sync_transfer_parameters(
+        &mut self,
+        params: gap::PeriodicAdvertisingSyncTransferParameters,
+    ) -> Result<(), PeriodicError> {
+        if self.connection(params.connection_handle).is_none() {
+            return Err(PeriodicError::WrongPhase);
+        }
+        if !params.is_valid() {
+            return Err(PeriodicError::BadParameter);
+        }
+        self.send_command(
+            op::HCI_LE_SET_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+            &params.encode(),
+        )
+        .map_err(|_| PeriodicError::Transport)?;
+        Ok(())
+    }
+
+    /// Set the default transfer parameters for all subsequent LE
+    /// connections (§7.8.92, issue #1654). No connection or phase
+    /// requirement: the values are the initial mode / skip /
+    /// timeout / CTE type for connections made after this command,
+    /// and the command does not affect existing connections. Only
+    /// the parameter ranges are validated host-side. The outcome
+    /// lands in `last_sync_transfer`.
+    pub fn periodic_adv_set_default_sync_transfer_parameters(
+        &mut self,
+        params: gap::PeriodicAdvertisingDefaultSyncTransferParameters,
+    ) -> Result<(), PeriodicError> {
+        if !params.is_valid() {
+            return Err(PeriodicError::BadParameter);
+        }
+        self.send_command(
+            op::HCI_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+            &params.encode(),
+        )
+        .map_err(|_| PeriodicError::Transport)?;
+        Ok(())
+    }
+
     /// Advance the periodic state machines on a completed periodic
     /// command. Shared by the Command Complete and Command Status
     /// arms: the §7.8.61..63 broadcaster commands and Terminate
     /// Sync return Complete, while Create Sync returns Status
     /// first and completes later via Sync Established.
-    fn on_periodic_command_done(&mut self, opcode: u16, status: u8) {
+    ///
+    /// `return_params` is `Some` for a Command Complete (the
+    /// return parameters after the opcode, starting with the status
+    /// byte) and `None` for a Command Status. Only a Command
+    /// Complete records a §7.8.89..92 transfer outcome: those
+    /// commands never return Command Status, so a Status event for
+    /// one of them is not its completion.
+    fn on_periodic_command_done(&mut self, opcode: u16, status: u8, return_params: Option<&[u8]>) {
         match opcode {
             op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS => {
                 self.periodic_adv.note_parameters_set(status);
@@ -1532,6 +1672,30 @@ impl PumpCore {
             }
             op::HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC => {
                 self.periodic_sync.note_terminated(status);
+            }
+            op::HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER
+            | op::HCI_LE_PERIODIC_ADVERTISING_SET_INFO_TRANSFER
+            | op::HCI_LE_SET_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS => {
+                // §7.8.89..91 return Status + Connection_Handle.
+                // The transfer changes no phase, so the outcome is
+                // recorded for the API / fixtures.
+                if let Some(ret) = return_params {
+                    self.last_sync_transfer = Some(gap::SyncTransferOutcome {
+                        opcode,
+                        status,
+                        connection_handle: ret.get(1..3).map(|b| u16::from_le_bytes([b[0], b[1]])),
+                    });
+                }
+            }
+            op::HCI_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS => {
+                // §7.8.92 returns Status only.
+                if return_params.is_some() {
+                    self.last_sync_transfer = Some(gap::SyncTransferOutcome {
+                        opcode,
+                        status,
+                        connection_handle: None,
+                    });
+                }
             }
             _ => {}
         }
@@ -2818,7 +2982,7 @@ impl PumpCore {
                     if let Some(status) = cc.status() {
                         self.on_central_command_done(cc.opcode, status);
                         self.on_classic_command_done(cc.opcode, status);
-                        self.on_periodic_command_done(cc.opcode, status);
+                        self.on_periodic_command_done(cc.opcode, status, Some(cc.return_params));
                         self.on_ext_central_command_done(cc.opcode, status);
                         self.on_ext_adv_command_done(
                             cc.opcode,
@@ -2832,7 +2996,7 @@ impl PumpCore {
                 if let Some(cs) = CommandStatus::parse(event) {
                     self.on_central_command_done(cs.opcode, cs.status);
                     self.on_classic_command_done(cs.opcode, cs.status);
-                    self.on_periodic_command_done(cs.opcode, cs.status);
+                    self.on_periodic_command_done(cs.opcode, cs.status, None);
                     self.on_ext_central_command_done(cs.opcode, cs.status);
                     self.on_ext_adv_command_done(cs.opcode, cs.status, None);
                 }
@@ -4246,6 +4410,69 @@ pub fn periodic_adv_cancel_create_sync(index: usize) -> Result<(), PeriodicError
 /// Terminate an established sync on controller `index` (§7.8.69).
 pub fn periodic_adv_terminate_sync(index: usize) -> Result<(), PeriodicError> {
     with_pump_core_periodic(index, |core| core.periodic_adv_terminate_sync())?
+}
+
+/// Transfer the established sync to a connected device on
+/// controller `index` (§7.8.89, #1654). This is the trigger surface
+/// a future mgmt/userspace lane will call; today it is
+/// fixture-driven.
+pub fn periodic_adv_sync_transfer(
+    index: usize,
+    connection_handle: u16,
+    service_data: u16,
+    sync_handle: u16,
+) -> Result<(), PeriodicError> {
+    with_pump_core_periodic(index, |core| {
+        core.periodic_adv_sync_transfer(connection_handle, service_data, sync_handle)
+    })?
+}
+
+/// Transfer our own periodic advertising set's sync information to
+/// a connected device on controller `index` (§7.8.90, #1654).
+pub fn periodic_adv_set_info_transfer(
+    index: usize,
+    connection_handle: u16,
+    service_data: u16,
+    advertising_handle: u8,
+) -> Result<(), PeriodicError> {
+    with_pump_core_periodic(index, |core| {
+        core.periodic_adv_set_info_transfer(connection_handle, service_data, advertising_handle)
+    })?
+}
+
+/// Set the per-connection transfer parameters on controller `index`
+/// (§7.8.91, #1654).
+pub fn periodic_adv_set_sync_transfer_parameters(
+    index: usize,
+    params: gap::PeriodicAdvertisingSyncTransferParameters,
+) -> Result<(), PeriodicError> {
+    with_pump_core_periodic(index, |core| {
+        core.periodic_adv_set_sync_transfer_parameters(params)
+    })?
+}
+
+/// Set the default transfer parameters on controller `index`
+/// (§7.8.92, #1654).
+pub fn periodic_adv_set_default_sync_transfer_parameters(
+    index: usize,
+    params: gap::PeriodicAdvertisingDefaultSyncTransferParameters,
+) -> Result<(), PeriodicError> {
+    with_pump_core_periodic(index, |core| {
+        core.periodic_adv_set_default_sync_transfer_parameters(params)
+    })?
+}
+
+/// Outcome of the most recent §7.8.89..92 sync-transfer command on
+/// controller `index`, if its core is not currently owned by a pump
+/// step.
+pub fn periodic_sync_transfer_last_outcome(index: usize) -> Option<gap::SyncTransferOutcome> {
+    let pumps = PUMPS.lock();
+    pumps
+        .iter()
+        .find(|s| s.index == index)?
+        .core
+        .as_ref()
+        .and_then(|c| c.last_sync_transfer)
 }
 
 /// Current periodic advertiser phase for controller `index`, if its
@@ -12526,6 +12753,585 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_periodic_adv_sync_flow);
+
+    /// #1654: the sender-side sync-transfer conversation against
+    /// the scripted controller — transfer our sync (§7.8.89) and
+    /// our advertising set's info (§7.8.90) to a connected device,
+    /// per-connection (§7.8.91) and default (§7.8.92) transfer
+    /// parameters, each byte-pinned against its spec section, with
+    /// Command Complete outcomes (success, 0x42 / 0x02 / 0x11
+    /// rejections, short return) recorded and the sync / train
+    /// phases unchanged by every transfer.
+    ///
+    /// Counts are relative to the bring-up baseline: #1560's
+    /// absolute counts went stale when #815 added the Read Local
+    /// Name + Read Class of Device bring-up phases, so this test
+    /// records the baseline instead of assuming it.
+    fn smoke_pump_periodic_adv_sync_transfer_flow() -> TestResult {
+        use crate::gap::{
+            PeerAddressType, PeriodicAdvDataOperation, PeriodicAdvertisingCreateSync,
+            PeriodicAdvertisingDefaultSyncTransferParameters, PeriodicAdvertisingParameters,
+            PeriodicAdvertisingSyncTransferParameters, SyncTransferOutcome,
+        };
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        // Commands sent so far are exactly the bring-up sequence;
+        // every assertion below counts from this baseline.
+        let base = fake.sent_command_params().len();
+        let sent_is = |want: &[(u16, &[u8])]| -> bool {
+            let sent = fake.sent_command_params();
+            if sent.len() != base + want.len() {
+                return false;
+            }
+            want.iter().enumerate().all(|(i, (opcode, params))| {
+                sent[base + i].0 == *opcode && sent[base + i].1 == *params
+            })
+        };
+        // 1. Rejections before anything exists: no sync to
+        // transfer, no train enabled, no connection, and the
+        // default-parameters struct refuses a reserved mode.
+        if periodic_adv_sync_transfer(0, 0x0001, 0xBEEF, 0x0007) != Err(PeriodicError::WrongPhase) {
+            reset_all();
+            return TestResult::Fail("sync transfer accepted with no sync");
+        }
+        if periodic_adv_set_info_transfer(0, 0x0001, 0xBEEF, 0x00) != Err(PeriodicError::WrongPhase)
+        {
+            reset_all();
+            return TestResult::Fail("set info transfer accepted with no train");
+        }
+        if periodic_adv_set_sync_transfer_parameters(
+            0,
+            PeriodicAdvertisingSyncTransferParameters {
+                connection_handle: 0x0001,
+                mode: 0x02,
+                skip: 0,
+                sync_timeout: 0x03E8,
+                cte_type: 0x00,
+            },
+        ) != Err(PeriodicError::WrongPhase)
+        {
+            reset_all();
+            return TestResult::Fail("transfer parameters accepted with no connection");
+        }
+        if periodic_adv_set_default_sync_transfer_parameters(
+            0,
+            PeriodicAdvertisingDefaultSyncTransferParameters {
+                mode: 0x04,
+                skip: 0,
+                sync_timeout: 0x03E8,
+                cte_type: 0x00,
+            },
+        ) != Err(PeriodicError::BadParameter)
+        {
+            reset_all();
+            return TestResult::Fail("default transfer parameters accepted mode 0x04");
+        }
+        if !sent_is(&[]) {
+            reset_all();
+            return TestResult::Fail("rejected transfer commands reached the controller");
+        }
+        if periodic_sync_transfer_last_outcome(0).is_some() {
+            reset_all();
+            return TestResult::Fail("transfer outcome recorded before any transfer");
+        }
+        // 2. Establish the peer connection, the broadcaster train,
+        // and the receiver sync (same pinned bytes as #1560).
+        fake.enqueue_event(le_connection_complete(0x0001, peer));
+        let _ = pump_once(0);
+        let params = PeriodicAdvertisingParameters::for_handle(0x00);
+        if periodic_adv_set_parameters(0, params).is_err() {
+            reset_all();
+            return TestResult::Fail("periodic_adv_set_parameters rejected");
+        }
+        if !sent_is(&[(
+            op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS,
+            &[0x00, 0x50, 0x00, 0x50, 0x00, 0x01, 0x00],
+        )]) {
+            reset_all();
+            return TestResult::Fail("Set Periodic Adv Parameters bytes mismatch");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS, &[0]));
+        let _ = pump_once(0);
+        if periodic_adv_set_data(
+            0,
+            0x00,
+            PeriodicAdvDataOperation::Complete,
+            &[0x02, 0x01, 0x06],
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("periodic_adv_set_data rejected from Configured");
+        }
+        if !sent_is(&[
+            (
+                op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS,
+                &[0x00, 0x50, 0x00, 0x50, 0x00, 0x01, 0x00],
+            ),
+            (
+                op::HCI_LE_SET_PERIODIC_ADVERTISING_DATA,
+                &[0x00, 0x03, 0x03, 0x02, 0x01, 0x06],
+            ),
+        ]) {
+            reset_all();
+            return TestResult::Fail("Set Periodic Adv Data bytes mismatch");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_PERIODIC_ADVERTISING_DATA, &[0]));
+        let _ = pump_once(0);
+        if periodic_adv_set_enable(0, true).is_err() {
+            reset_all();
+            return TestResult::Fail("periodic_adv_set_enable rejected from Configured");
+        }
+        fake.enqueue_event(cc(op::HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE, &[0]));
+        let _ = pump_once(0);
+        if periodic_adv_phase(0) != Some(crate::gap::PeriodicAdvertiserPhase::Enabled) {
+            reset_all();
+            return TestResult::Fail("phase not Enabled after enable complete");
+        }
+        let req = PeriodicAdvertisingCreateSync::to_advertiser(0x01, PeerAddressType::Public, peer);
+        if periodic_adv_create_sync(0, req).is_err() {
+            reset_all();
+            return TestResult::Fail("periodic_adv_create_sync rejected from Idle");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC, 0));
+        let _ = pump_once(0);
+        fake.enqueue_event(le_periodic_adv_sync_established(0x00, 0x0007, 0x01, peer));
+        let _ = pump_once(0);
+        let snap = periodic_sync_snapshot(0);
+        if snap.as_ref().map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Synced)
+            || snap.as_ref().and_then(|s| s.sync_handle) != Some(0x0007)
+        {
+            reset_all();
+            return TestResult::Fail("Sync Established did not land the sync");
+        }
+        // 3. Rejections with state present: a sync handle we do not
+        // hold, an unknown connection, and out-of-range transfer
+        // parameters for the live connection.
+        if periodic_adv_sync_transfer(0, 0x0001, 0xBEEF, 0x0009) != Err(PeriodicError::WrongPhase) {
+            reset_all();
+            return TestResult::Fail("sync transfer accepted for a foreign sync handle");
+        }
+        if periodic_adv_sync_transfer(0, 0x0002, 0xBEEF, 0x0007) != Err(PeriodicError::WrongPhase) {
+            reset_all();
+            return TestResult::Fail("sync transfer accepted for an unknown connection");
+        }
+        if periodic_adv_set_info_transfer(0, 0x0002, 0xBEEF, 0x00) != Err(PeriodicError::WrongPhase)
+        {
+            reset_all();
+            return TestResult::Fail("set info transfer accepted for an unknown connection");
+        }
+        let bad_params: [PeriodicAdvertisingSyncTransferParameters; 5] = [
+            // Mode 0x04 is reserved (§7.8.91).
+            PeriodicAdvertisingSyncTransferParameters {
+                connection_handle: 0x0001,
+                mode: 0x04,
+                skip: 0,
+                sync_timeout: 0x03E8,
+                cte_type: 0x00,
+            },
+            // Skip above 0x01F3.
+            PeriodicAdvertisingSyncTransferParameters {
+                connection_handle: 0x0001,
+                mode: 0x02,
+                skip: 0x01F4,
+                sync_timeout: 0x03E8,
+                cte_type: 0x00,
+            },
+            // Timeout below 0x000A.
+            PeriodicAdvertisingSyncTransferParameters {
+                connection_handle: 0x0001,
+                mode: 0x02,
+                skip: 0,
+                sync_timeout: 0x0009,
+                cte_type: 0x00,
+            },
+            // Reserved CTE_Type bit 3.
+            PeriodicAdvertisingSyncTransferParameters {
+                connection_handle: 0x0001,
+                mode: 0x02,
+                skip: 0,
+                sync_timeout: 0x03E8,
+                cte_type: 0x08,
+            },
+            // All non-reserved CTE_Type bits set (0x17): the
+            // controller refuses with Command Disallowed.
+            PeriodicAdvertisingSyncTransferParameters {
+                connection_handle: 0x0001,
+                mode: 0x02,
+                skip: 0,
+                sync_timeout: 0x03E8,
+                cte_type: 0x17,
+            },
+        ];
+        for params in bad_params {
+            if periodic_adv_set_sync_transfer_parameters(0, params)
+                != Err(PeriodicError::BadParameter)
+            {
+                reset_all();
+                return TestResult::Fail("out-of-range transfer parameters accepted");
+            }
+        }
+        if !sent_is(&[
+            (
+                op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS,
+                &[0x00, 0x50, 0x00, 0x50, 0x00, 0x01, 0x00],
+            ),
+            (
+                op::HCI_LE_SET_PERIODIC_ADVERTISING_DATA,
+                &[0x00, 0x03, 0x03, 0x02, 0x01, 0x06],
+            ),
+            (op::HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE, &[0x01, 0x00]),
+            (
+                op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC,
+                &[
+                    0x02, 0x01, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x00, 0x00, 0xE8, 0x03,
+                    0xFF,
+                ],
+            ),
+        ]) {
+            reset_all();
+            return TestResult::Fail("rejected transfer commands reached the controller");
+        }
+        // 4. §7.8.89 happy path: connection 0x0001, service data
+        // 0xBEEF, sync 0x0007 — 6 bytes, little-endian handles.
+        if periodic_adv_sync_transfer(0, 0x0001, 0xBEEF, 0x0007).is_err() {
+            reset_all();
+            return TestResult::Fail("sync transfer rejected from Synced");
+        }
+        let sent = fake.sent_command_params();
+        let last = match sent.last() {
+            Some(c) => c,
+            None => {
+                reset_all();
+                return TestResult::Fail("no command sent for sync transfer");
+            }
+        };
+        if last.0 != op::HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER
+            || last.1 != [0x01, 0x00, 0xEF, 0xBE, 0x07, 0x00]
+        {
+            reset_all();
+            return TestResult::Fail("Sync Transfer bytes mismatch");
+        }
+        // Command Complete (status 0 + echoed connection handle):
+        // the outcome is recorded and the sync stays Synced.
+        fake.enqueue_event(cc(
+            op::HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER,
+            &[0, 0x01, 0x00],
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_transfer_last_outcome(0)
+            != Some(SyncTransferOutcome {
+                opcode: op::HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER,
+                status: 0,
+                connection_handle: Some(0x0001),
+            })
+            || periodic_sync_snapshot(0).map(|s| s.phase)
+                != Some(crate::gap::PeriodicSyncPhase::Synced)
+        {
+            reset_all();
+            return TestResult::Fail("Sync Transfer success outcome wrong");
+        }
+        // A Command Status for this opcode is not its completion:
+        // it records nothing.
+        fake.enqueue_event(cs(op::HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER, 0));
+        let _ = pump_once(0);
+        if periodic_sync_transfer_last_outcome(0)
+            != Some(SyncTransferOutcome {
+                opcode: op::HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER,
+                status: 0,
+                connection_handle: Some(0x0001),
+            })
+        {
+            reset_all();
+            return TestResult::Fail("Command Status overwrote the transfer outcome");
+        }
+        // 5. §7.8.89 error path: Unknown Advertising Identifier
+        // (0x42) — the transfer failed, the sync is untouched.
+        if periodic_adv_sync_transfer(0, 0x0001, 0xBEEF, 0x0007).is_err() {
+            reset_all();
+            return TestResult::Fail("sync transfer rejected before its 0x42 complete");
+        }
+        fake.enqueue_event(cc(
+            op::HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER,
+            &[0x42, 0x01, 0x00],
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_transfer_last_outcome(0)
+            != Some(SyncTransferOutcome {
+                opcode: op::HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER,
+                status: 0x42,
+                connection_handle: Some(0x0001),
+            })
+            || periodic_sync_snapshot(0).map(|s| s.phase)
+                != Some(crate::gap::PeriodicSyncPhase::Synced)
+        {
+            reset_all();
+            return TestResult::Fail("Sync Transfer 0x42 outcome wrong");
+        }
+        // 6. §7.8.90 happy path: our train (handle 0x00) to the
+        // same connection — 5 bytes.
+        if periodic_adv_set_info_transfer(0, 0x0001, 0xBEEF, 0x00).is_err() {
+            reset_all();
+            return TestResult::Fail("set info transfer rejected from Enabled");
+        }
+        let sent = fake.sent_command_params();
+        let last = match sent.last() {
+            Some(c) => c,
+            None => {
+                reset_all();
+                return TestResult::Fail("no command sent for set info transfer");
+            }
+        };
+        if last.0 != op::HCI_LE_PERIODIC_ADVERTISING_SET_INFO_TRANSFER
+            || last.1 != [0x01, 0x00, 0xEF, 0xBE, 0x00]
+        {
+            reset_all();
+            return TestResult::Fail("Set Info Transfer bytes mismatch");
+        }
+        fake.enqueue_event(cc(
+            op::HCI_LE_PERIODIC_ADVERTISING_SET_INFO_TRANSFER,
+            &[0, 0x01, 0x00],
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_transfer_last_outcome(0)
+            != Some(SyncTransferOutcome {
+                opcode: op::HCI_LE_PERIODIC_ADVERTISING_SET_INFO_TRANSFER,
+                status: 0,
+                connection_handle: Some(0x0001),
+            })
+            || periodic_adv_phase(0) != Some(crate::gap::PeriodicAdvertiserPhase::Enabled)
+        {
+            reset_all();
+            return TestResult::Fail("Set Info Transfer success outcome wrong");
+        }
+        // 7. §7.8.90 error path: Unknown Connection Identifier
+        // (0x02) — the train stays Enabled.
+        if periodic_adv_set_info_transfer(0, 0x0001, 0xBEEF, 0x00).is_err() {
+            reset_all();
+            return TestResult::Fail("set info transfer rejected before its 0x02 complete");
+        }
+        fake.enqueue_event(cc(
+            op::HCI_LE_PERIODIC_ADVERTISING_SET_INFO_TRANSFER,
+            &[0x02, 0x01, 0x00],
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_transfer_last_outcome(0)
+            != Some(SyncTransferOutcome {
+                opcode: op::HCI_LE_PERIODIC_ADVERTISING_SET_INFO_TRANSFER,
+                status: 0x02,
+                connection_handle: Some(0x0001),
+            })
+            || periodic_adv_phase(0) != Some(crate::gap::PeriodicAdvertiserPhase::Enabled)
+        {
+            reset_all();
+            return TestResult::Fail("Set Info Transfer 0x02 outcome wrong");
+        }
+        // 8. §7.8.91 happy path: mode 0x02 (reports on, no
+        // duplicate filtering), skip 0, 10 s timeout, CTE 0x00 —
+        // 8 bytes.
+        if periodic_adv_set_sync_transfer_parameters(
+            0,
+            PeriodicAdvertisingSyncTransferParameters {
+                connection_handle: 0x0001,
+                mode: 0x02,
+                skip: 0,
+                sync_timeout: 0x03E8,
+                cte_type: 0x00,
+            },
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("set transfer parameters rejected for a live connection");
+        }
+        let sent = fake.sent_command_params();
+        let last = match sent.last() {
+            Some(c) => c,
+            None => {
+                reset_all();
+                return TestResult::Fail("no command sent for set transfer parameters");
+            }
+        };
+        if last.0 != op::HCI_LE_SET_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS
+            || last.1 != [0x01, 0x00, 0x02, 0x00, 0x00, 0xE8, 0x03, 0x00]
+        {
+            reset_all();
+            return TestResult::Fail("Set Transfer Parameters bytes mismatch");
+        }
+        fake.enqueue_event(cc(
+            op::HCI_LE_SET_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+            &[0, 0x01, 0x00],
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_transfer_last_outcome(0)
+            != Some(SyncTransferOutcome {
+                opcode: op::HCI_LE_SET_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+                status: 0,
+                connection_handle: Some(0x0001),
+            })
+        {
+            reset_all();
+            return TestResult::Fail("Set Transfer Parameters success outcome wrong");
+        }
+        // 9. §7.8.91 short return: status only, no echoed handle.
+        if periodic_adv_set_sync_transfer_parameters(
+            0,
+            PeriodicAdvertisingSyncTransferParameters {
+                connection_handle: 0x0001,
+                mode: 0x01,
+                skip: 0,
+                sync_timeout: 0x03E8,
+                cte_type: 0x00,
+            },
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("set transfer parameters rejected before short complete");
+        }
+        fake.enqueue_event(cc(
+            op::HCI_LE_SET_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+            &[0],
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_transfer_last_outcome(0)
+            != Some(SyncTransferOutcome {
+                opcode: op::HCI_LE_SET_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+                status: 0,
+                connection_handle: None,
+            })
+        {
+            reset_all();
+            return TestResult::Fail("short Set Transfer Parameters complete misread");
+        }
+        // 10. §7.8.92 happy path: mode 0x01, skip 0, 10 s timeout,
+        // CTE 0x00 — 6 bytes, no connection handle, and the return
+        // carries Status only.
+        if periodic_adv_set_default_sync_transfer_parameters(
+            0,
+            PeriodicAdvertisingDefaultSyncTransferParameters {
+                mode: 0x01,
+                skip: 0,
+                sync_timeout: 0x03E8,
+                cte_type: 0x00,
+            },
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("set default transfer parameters rejected");
+        }
+        let sent = fake.sent_command_params();
+        let last = match sent.last() {
+            Some(c) => c,
+            None => {
+                reset_all();
+                return TestResult::Fail("no command sent for set default transfer parameters");
+            }
+        };
+        if last.0 != op::HCI_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS
+            || last.1 != [0x01, 0x00, 0x00, 0xE8, 0x03, 0x00]
+        {
+            reset_all();
+            return TestResult::Fail("Set Default Transfer Parameters bytes mismatch");
+        }
+        fake.enqueue_event(cc(
+            op::HCI_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+            &[0],
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_transfer_last_outcome(0)
+            != Some(SyncTransferOutcome {
+                opcode: op::HCI_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+                status: 0,
+                connection_handle: None,
+            })
+        {
+            reset_all();
+            return TestResult::Fail("Set Default Transfer Parameters success outcome wrong");
+        }
+        // 11. §7.8.92 error path: Unsupported Feature or Parameter
+        // Value (0x11, e.g. mode 0x03 without ADI support).
+        if periodic_adv_set_default_sync_transfer_parameters(
+            0,
+            PeriodicAdvertisingDefaultSyncTransferParameters {
+                mode: 0x03,
+                skip: 0,
+                sync_timeout: 0x03E8,
+                cte_type: 0x00,
+            },
+        )
+        .is_err()
+        {
+            reset_all();
+            return TestResult::Fail("set default transfer parameters rejected before 0x11");
+        }
+        fake.enqueue_event(cc(
+            op::HCI_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+            &[0x11],
+        ));
+        let _ = pump_once(0);
+        if periodic_sync_transfer_last_outcome(0)
+            != Some(SyncTransferOutcome {
+                opcode: op::HCI_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+                status: 0x11,
+                connection_handle: None,
+            })
+        {
+            reset_all();
+            return TestResult::Fail("Set Default Transfer Parameters 0x11 outcome wrong");
+        }
+        // 12. §7.8.89 BadParameter: a held sync handle above
+        // 0x0EFF is refused even though the sync, the connection,
+        // and the service data are all otherwise valid.
+        fake.enqueue_event(le_periodic_adv_sync_lost(0x0007));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).map(|s| s.phase) != Some(crate::gap::PeriodicSyncPhase::Idle) {
+            reset_all();
+            return TestResult::Fail("Sync Lost did not return to Idle");
+        }
+        if periodic_adv_create_sync(0, req).is_err() {
+            reset_all();
+            return TestResult::Fail("periodic_adv_create_sync rejected for the second sync");
+        }
+        fake.enqueue_event(cs(op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC, 0));
+        let _ = pump_once(0);
+        fake.enqueue_event(le_periodic_adv_sync_established(0x00, 0x0F00, 0x01, peer));
+        let _ = pump_once(0);
+        if periodic_sync_snapshot(0).and_then(|s| s.sync_handle) != Some(0x0F00) {
+            reset_all();
+            return TestResult::Fail("out-of-range sync handle not adopted for the probe");
+        }
+        let before = fake.sent_command_params().len();
+        if periodic_adv_sync_transfer(0, 0x0001, 0xBEEF, 0x0F00) != Err(PeriodicError::BadParameter)
+        {
+            reset_all();
+            return TestResult::Fail("sync transfer accepted an out-of-range sync handle");
+        }
+        if fake.sent_command_params().len() != before {
+            reset_all();
+            return TestResult::Fail("out-of-range sync transfer reached the controller");
+        }
+        // The refused command recorded no outcome: the last one is
+        // still the §7.8.92 0x11 rejection.
+        let ok = periodic_sync_transfer_last_outcome(0)
+            == Some(SyncTransferOutcome {
+                opcode: op::HCI_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS,
+                status: 0x11,
+                connection_handle: None,
+            });
+        reset_all();
+        if !ok {
+            return TestResult::Fail("refused transfer overwrote the last outcome");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_periodic_adv_sync_transfer_flow);
 
     /// #1560: failure paths fail closed — out-of-order API calls are
     /// rejected, out-of-range parameters never reach the controller,

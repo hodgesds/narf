@@ -6662,6 +6662,157 @@ kernel_test_in!(
     smoke_gap_periodic_adv_terminate_sync_encoding
 );
 
+// ── LE Periodic Advertising — sync-transfer builders (#1654) ─────────
+//
+// Layouts from Vol 4 Part E §7.8.89..92 (Core 6.1 text, read
+// in-session), not from the implementation: the builders below are
+// checked byte-for-byte against the spec sections, and the range
+// checks against the spec ranges (handles 0x0000..=0x0EFF,
+// advertising handle 0x00..=0xEF, mode 0x00..=0x03, skip
+// 0x0000..=0x01F3, timeout 0x000A..=0x4000, CTE_Type reserved bits
+// clear and not all non-reserved bits set).
+fn smoke_gap_periodic_adv_sync_transfer_encoding() -> TestResult {
+    use crate::gap::{
+        build_periodic_adv_set_info_transfer, build_periodic_adv_sync_transfer,
+        PeriodicAdvertisingDefaultSyncTransferParameters,
+        PeriodicAdvertisingSyncTransferParameters,
+    };
+    // §7.8.89: connection 0x0001, service data 0xBEEF, sync 0x0007.
+    if build_periodic_adv_sync_transfer(0x0001, 0xBEEF, 0x0007)
+        != [0x01, 0x00, 0xEF, 0xBE, 0x07, 0x00]
+    {
+        return TestResult::Fail("Sync Transfer bytes wrong");
+    }
+    // §7.8.90: connection 0x0001, service data 0xBEEF, set 0x00.
+    if build_periodic_adv_set_info_transfer(0x0001, 0xBEEF, 0x00) != [0x01, 0x00, 0xEF, 0xBE, 0x00]
+    {
+        return TestResult::Fail("Set Info Transfer bytes wrong");
+    }
+    // §7.8.91: connection 0x0001, mode 0x02, skip 0, timeout
+    // 0x03E8 (10 s), CTE 0x00.
+    let params = PeriodicAdvertisingSyncTransferParameters {
+        connection_handle: 0x0001,
+        mode: 0x02,
+        skip: 0,
+        sync_timeout: 0x03E8,
+        cte_type: 0x00,
+    };
+    if !params.is_valid() {
+        return TestResult::Fail("valid §7.8.91 parameters rejected");
+    }
+    if params.encode() != [0x01, 0x00, 0x02, 0x00, 0x00, 0xE8, 0x03, 0x00] {
+        return TestResult::Fail("Set Transfer Parameters bytes wrong");
+    }
+    // §7.8.92: mode 0x01, skip 0, timeout 0x03E8, CTE 0x00.
+    let defaults = PeriodicAdvertisingDefaultSyncTransferParameters {
+        mode: 0x01,
+        skip: 0,
+        sync_timeout: 0x03E8,
+        cte_type: 0x00,
+    };
+    if !defaults.is_valid() {
+        return TestResult::Fail("valid §7.8.92 parameters rejected");
+    }
+    if defaults.encode() != [0x01, 0x00, 0x00, 0xE8, 0x03, 0x00] {
+        return TestResult::Fail("Set Default Transfer Parameters bytes wrong");
+    }
+    // Boundary values are valid: mode 0x03, skip 0x01F3, timeout
+    // 0x000A..=0x4000, CTE 0x10 (no-CTE only).
+    let edge = PeriodicAdvertisingSyncTransferParameters {
+        connection_handle: 0x0EFF,
+        mode: 0x03,
+        skip: 0x01F3,
+        sync_timeout: 0x4000,
+        cte_type: 0x10,
+    };
+    if !edge.is_valid() {
+        return TestResult::Fail("boundary §7.8.91 parameters rejected");
+    }
+    // Each out-of-range field is invalid on its own.
+    let bad: [(PeriodicAdvertisingSyncTransferParameters, &str); 7] = [
+        (
+            PeriodicAdvertisingSyncTransferParameters {
+                connection_handle: 0x0F00,
+                ..params
+            },
+            "connection handle above 0x0EFF",
+        ),
+        (
+            PeriodicAdvertisingSyncTransferParameters {
+                mode: 0x04,
+                ..params
+            },
+            "reserved mode",
+        ),
+        (
+            PeriodicAdvertisingSyncTransferParameters {
+                skip: 0x01F4,
+                ..params
+            },
+            "skip above 0x01F3",
+        ),
+        (
+            PeriodicAdvertisingSyncTransferParameters {
+                sync_timeout: 0x0009,
+                ..params
+            },
+            "timeout below 0x000A",
+        ),
+        (
+            PeriodicAdvertisingSyncTransferParameters {
+                sync_timeout: 0x4001,
+                ..params
+            },
+            "timeout above 0x4000",
+        ),
+        (
+            PeriodicAdvertisingSyncTransferParameters {
+                cte_type: 0x08,
+                ..params
+            },
+            "reserved CTE_Type bit",
+        ),
+        (
+            PeriodicAdvertisingSyncTransferParameters {
+                cte_type: 0x17,
+                ..params
+            },
+            "all CTE_Type bits set",
+        ),
+    ];
+    for (p, what) in bad {
+        if p.is_valid() {
+            return TestResult::Fail(what);
+        }
+    }
+    // The §7.8.92 struct validates the same bounds minus the
+    // connection handle.
+    let bad_defaults = [
+        PeriodicAdvertisingDefaultSyncTransferParameters {
+            mode: 0x04,
+            ..defaults
+        },
+        PeriodicAdvertisingDefaultSyncTransferParameters {
+            skip: 0x01F4,
+            ..defaults
+        },
+        PeriodicAdvertisingDefaultSyncTransferParameters {
+            cte_type: 0xE8,
+            ..defaults
+        },
+    ];
+    for p in bad_defaults {
+        if p.is_valid() {
+            return TestResult::Fail("invalid §7.8.92 parameters accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gap",
+    smoke_gap_periodic_adv_sync_transfer_encoding
+);
+
 // ── LE Periodic Advertising — event parsers (#1560) ─────────────────
 
 fn le_meta_event(subevent: u8, payload: &[u8]) -> crate::hci::Event {

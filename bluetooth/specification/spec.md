@@ -421,7 +421,8 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   Command Status decoders, transport trait + USB class triple, full
   bring-up state machine (Reset → Read Local Version → Read BD_ADDR
   → Read Buffer Size → Set Event Mask). Periodic advertising
-  opcodes (§7.8.61..63, §7.8.67..69) + LE Meta subevent parsers
+  opcodes (§7.8.61..63, §7.8.67..69, §7.8.89..92 sender-side sync
+  transfer) + LE Meta subevent parsers
   for Sync Established / Report / Sync Lost (§7.7.65.14..16,
   subevents 0x0E..0x10).
 - **HCI pump** (`pump`): supervised per-controller event/ACL pump task
@@ -437,7 +438,14 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   Create / Cancel / Terminate (§7.8.67..69) with the
   `PeriodicSync` receiver machine (Creating → Synced → Idle on
   Sync Lost / Terminate, fragmented-report reassembly bounded at
-  251 bytes) driven by the §7.7.65.14..16 subevents.
+  251 bytes) driven by the §7.7.65.14..16 subevents. Sender-side
+  sync transfer (#1654): Sync Transfer (§7.8.89, only for the
+  sync currently held, to a live connection), Set Info Transfer
+  (§7.8.90, only while our train is Enabled), per-connection
+  (§7.8.91) and default (§7.8.92) transfer parameters; all four
+  return Command Complete and the outcome is recorded as the
+  pump's last sync-transfer outcome — the transfers change no
+  phase.
 - **L2CAP** (`l2cap`): CID constants, B-frame codec, ACL fragment
   reassembler that handles the PB-flag rules from Vol 4 Part E §5.4.2,
   signalling-command codec + iterator, dynamic CID allocator, LE
