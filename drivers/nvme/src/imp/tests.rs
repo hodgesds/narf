@@ -1477,6 +1477,12 @@ fn smoke_admin_aer_post_qemu() -> TestResult {
     if ctrl.post_aer_commands(1).is_err() {
         return TestResult::Fail("post_aer_commands failed");
     }
+    // CID tracking: the posted AER is outstanding until it
+    // completes (#1619). An admin submit behind it must still
+    // return its own completion, never the AER's.
+    if ctrl.aer_outstanding() != 1 {
+        return TestResult::Fail("aer_outstanding != 1 after AER post");
+    }
     // The controller remains functional — verify with a typed NS identify.
     match ctrl.identify_namespace_typed(1) {
         Ok(ns) => {
@@ -1485,6 +1491,14 @@ fn smoke_admin_aer_post_qemu() -> TestResult {
             }
         }
         Err(_) => return TestResult::Fail("identify_namespace_typed failed after AER post"),
+    }
+    // No event fired on QEMU, so there is nothing to drain and the
+    // AER is still outstanding.
+    if ctrl.drain_aer() != 0 {
+        return TestResult::Fail("drain_aer returned non-zero with no events");
+    }
+    if ctrl.aer_outstanding() != 1 {
+        return TestResult::Fail("aer_outstanding != 1 after drain with no events");
     }
     TestResult::Pass
 }
