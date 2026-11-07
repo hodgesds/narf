@@ -845,7 +845,7 @@ impl Drop for PendingContext<'_> {
 #[derive(Debug)]
 pub struct RenderFile {
     pub gem: GemState,
-    pub(crate) syncobjs: IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>,
+    pub(crate) syncobjs: Arc<IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>>,
     namespaces: IrqSafeSpinLock<Namespaces>,
     xe: crate::intel_gpu_xe::XeFile,
 }
@@ -857,11 +857,13 @@ impl Default for RenderFile {
 }
 
 impl RenderFile {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             gem: GemState::new(),
             xe: crate::intel_gpu_xe::XeFile::new(),
-            syncobjs: IrqSafeSpinLock::new(crate::drm::syncobj::SyncObjTable::new()),
+            syncobjs: Arc::new(IrqSafeSpinLock::new(
+                crate::drm::syncobj::SyncObjTable::new(),
+            )),
             namespaces: IrqSafeSpinLock::new(Namespaces::new()),
         }
     }
@@ -2388,7 +2390,7 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests {
     use super::*;
-    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_kernel_test::{TestResult, kernel_test_in};
 
     pub(crate) struct User {
         bytes: IrqSafeSpinLock<Vec<u8>>,

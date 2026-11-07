@@ -122,11 +122,13 @@ pub(crate) struct Capture {
     pub snapshot_time: Option<(u64, u32)>,
 }
 impl Capture {
+    #[allow(dead_code)]
     pub(crate) fn with_process(mut self, name: &'static str, pid: u32) -> Self {
         self.process_name = Some(name);
         self.pid = Some(pid);
         self
     }
+    #[allow(dead_code)]
     pub(crate) fn with_snapshot_time(mut self, secs: u64, nanos: u32) -> Self {
         self.snapshot_time = Some((secs, nanos));
         self

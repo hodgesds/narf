@@ -470,7 +470,7 @@ impl UserContext {
             .and_then(|set| set.iter().next())
             .ok_or(FsError::InvalidData)?;
         if !(2..=MAX_PARALLEL_WIDTH).contains(&lanes.len())
-            || !(first.is_copy() || first.is_compute())
+            || !(first.is_copy() || first.is_compute() || first.is_media())
             || lanes.iter().any(|set| {
                 set.iter().next().is_none()
                     || set

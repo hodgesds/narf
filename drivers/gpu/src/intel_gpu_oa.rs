@@ -9,6 +9,7 @@
 //! only under that owner. Metric configurations are emitted as source
 //! MI_LOAD_REGISTER_IMM groups from privileged kernel ring jobs.
 use crate::{
+    drm::syncobj::SyncObjTable,
     intel_gpu_aux::MmioWindow,
     intel_gpu_engine::{Engine, EngineSet},
     intel_gpu_gt::GtPlatform,
@@ -16,12 +17,13 @@ use crate::{
     intel_gpu_rcs::GpuBacking,
     intel_gpu_uapi::{put32, put64, u32_at, u64_at},
     intel_gpu_user::UserBackend,
+    intel_gpu_xe_sync::Sync as XeSync,
 };
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, fence};
 use narf_filesystem::{
-    FileOps, FileType, FsError, FsFuture, IoctlContext, MmapBacking, MmapLifetime, Mode,
-    PrivatePfnMap, ReadOptions, Stat, POLL_ERR, POLL_HUP, POLL_IN,
+    FileOps, FileType, FsError, FsFuture, IoctlContext, MmapBacking, MmapLifetime, Mode, POLL_ERR,
+    POLL_HUP, POLL_IN, PrivatePfnMap, ReadOptions, Stat,
 };
 use narf_lib::{mutex::Mutex, readiness::Readiness, sync::IrqSafeSpinLock};
 
@@ -34,7 +36,7 @@ const MAX_BUFFER: u64 = 128 << 20;
 /// NOA_PROGRAM_ADDITIONAL_DELAY_US after the configuration job retires.
 pub(crate) const NOA_DELAY_NS: u64 = 500_000;
 const MAX_USER_EXTENSIONS: usize = 16;
-const MAX_SYNCS: u64 = 1024;
+const MAX_SYNCS: u64 = 2;
 /// MI_LOAD_REGISTER_IMM_MAX_REGS.
 const LRI_GROUP: usize = 126;
 /// Registers per privileged ring job. Jobs retire in order before the next
@@ -45,11 +47,10 @@ pub(crate) const LRI_JOB: usize = 3 * LRI_GROUP;
 pub(crate) const MAX_CONFIG_REGS: u32 = 4096;
 const MAX_REGISTRY_REGS: usize = 1 << 17;
 const MAX_CONFIGS: u32 = 1024;
-/// DRM_XE_OA_CAPS_BASE | OA_BUFFER_SIZE | WAIT_NUM_REPORTS | OA_UNIT_GT_ID.
-/// SYNCS is not implemented and therefore not advertised.
-pub(crate) const CAPS: u64 = 1 | 4 | 8 | 32;
+/// DRM_XE_OA_CAPS_BASE | SYNCS | OA_BUFFER_SIZE | WAIT_NUM_REPORTS | OA_UNIT_GT_ID.
+pub(crate) const CAPS: u64 = 1 | 2 | 4 | 8 | 32;
 /// With DRM_XE_OA_CAPS_OAM (1 << 4 = 16) for Media GT OAM units.
-pub(crate) const CAPS_OAM: u64 = 1 | 4 | 8 | 16 | 32;
+pub(crate) const CAPS_OAM: u64 = 1 | 2 | 4 | 8 | 16 | 32;
 const QUIESCE_NS: u64 = 50_000_000;
 
 const E2BIG: i64 = 7;
@@ -278,6 +279,9 @@ impl Device {
         self.media_engines
             .into_iter()
             .flat_map(|engines| engines.iter().filter(|engine| oam_engine(*engine)))
+    }
+    pub fn has_oam(self) -> bool {
+        self.oam_engines().next().is_some()
     }
 }
 
@@ -510,7 +514,8 @@ static REGISTRY: [IrqSafeSpinLock<Registry>; 64] = [const {
         regs: 0,
     })
 }; 64];
-static ACTIVE: [AtomicBool; 64] = [const { AtomicBool::new(false) }; 64];
+static ACTIVE: [[AtomicBool; 2]; 64] =
+    [const { [AtomicBool::new(false), AtomicBool::new(false)] }; 64];
 
 pub(crate) fn lookup(card: u32, id: u64) -> Option<Arc<Config>> {
     let id = u32::try_from(id).ok()?;
@@ -582,6 +587,7 @@ enum Origin {
 }
 /// struct xe_oa_open_param, with the source C widths.
 struct Params {
+    oa_unit: u32,
     sample: bool,
     metric_set: u32,
     format: usize,
@@ -598,6 +604,7 @@ struct Params {
 impl Params {
     fn new() -> Self {
         Self {
+            oa_unit: 0,
             sample: false,
             metric_set: 0,
             format: 0,
@@ -625,8 +632,8 @@ impl Params {
             return invalid;
         }
         match property {
-            // xe_oa_lookup_oa_unit takes a u32 id; only OAG unit 0 exists.
-            1 if value as u32 == 0 => {}
+            1 if value == 0 => self.oa_unit = 0,
+            1 if value == 1 && device.has_oam() => self.oa_unit = 1,
             1 => return invalid,
             2 => self.sample = value != 0,
             3 => self.metric_set = value as u32,
@@ -637,11 +644,12 @@ impl Params {
             7 => self.exec_queue = value as i32,
             8 => self.engine_instance = value as i32,
             9 => self.no_preempt = value != 0,
-            10 if value > MAX_SYNCS => return invalid,
+            10 if value == 0 || value > MAX_SYNCS => return invalid,
             10 => self.num_syncs = value as i32,
+            11 if value == 0 => return invalid,
             11 => self.syncs = value,
             12 if !value.is_power_of_two() || !(MIN_BUFFER..=MAX_BUFFER).contains(&value) => {
-                return invalid
+                return invalid;
             }
             12 => self.buffer = value,
             13 if value == 0 => return invalid,
@@ -694,9 +702,10 @@ pub(crate) async fn observation(
     param: u64,
     user: &dyn IoctlContext,
     queues: QueueLookup<'_>,
+    syncobjs: Option<Arc<IrqSafeSpinLock<SyncObjTable>>>,
 ) -> Result<u64, FsError> {
     errno(match op {
-        0 => open(backend, param, user, queues, Gate::PHYSICAL).await,
+        0 => open(backend, param, user, queues, Gate::PHYSICAL, syncobjs).await,
         1 => add_config(backend.as_deref(), param, user, Gate::PHYSICAL),
         2 => remove_config(backend.as_deref(), param, user, Gate::PHYSICAL),
         _ => Err(FsError::InvalidData.into()),
@@ -719,11 +728,15 @@ pub(crate) async fn open(
     user: &dyn IoctlContext,
     queues: QueueLookup<'_>,
     gate: Gate,
+    syncobjs: Option<Arc<IrqSafeSpinLock<SyncObjTable>>>,
 ) -> Result<u64, Error> {
     let device = device_of(backend.as_deref())?;
     let backend = backend.ok_or(FsError::NoDevice)?;
     let mut p = Params::new();
     extensions(device, Origin::Open, param, user, &mut p)?;
+    if (p.num_syncs != 0 && p.syncs == 0) || (p.num_syncs == 0 && p.syncs != 0) {
+        return Err(FsError::InvalidData.into());
+    }
     let mut exec = None;
     if p.exec_queue > 0 {
         let (class, width) = queues(p.exec_queue as u32).ok_or(FsError::NotFound)?;
@@ -745,29 +758,47 @@ pub(crate) async fn open(
     if exec.is_none() && !p.sample {
         return Err(FsError::InvalidData.into());
     }
-    // xe_oa_assign_hwe: the exec queue's logical engine must attach to OAG;
-    // otherwise the first OAG engine in hw-engine order (RCS0, then CCS).
-    let hwe = match exec {
-        Some(class) => device
+    // OAM does not support periodic sampling.
+    if p.oa_unit == 1 && (p.sample || p.exponent >= 0) {
+        return Err(FsError::InvalidData.into());
+    }
+    // xe_oa_assign_hwe: for OAG, render/compute engines; for OAM, media engines.
+    let hwe = match (p.oa_unit, exec) {
+        (0, Some(class)) => device
             .engines
             .from_class_instance(class, p.engine_instance as u16)
             .filter(|engine| oag_engine(*engine)),
-        None => device.oag_engines().next(),
+        (0, None) => device.oag_engines().next(),
+        (1, Some(class)) => {
+            let media = device.media_engines.ok_or(FsError::InvalidData)?;
+            media
+                .from_class_instance(class, p.engine_instance as u16)
+                .filter(|engine| oam_engine(*engine))
+        }
+        (1, None) => device.oam_engines().next(),
+        _ => return Err(FsError::InvalidData.into()),
     }
     .ok_or(FsError::InvalidData)?;
     let format = FORMATS[p.format];
-    if p.format == 0 || format.size == 0 || !oag_format(format.kind) {
+    let valid_format = match p.oa_unit {
+        0 => oag_format(format.kind),
+        1 => format.kind == MPEC,
+        _ => false,
+    };
+    if p.format == 0 || format.size == 0 || !valid_format {
         return Err(FsError::InvalidData.into());
     }
-    if exec.is_some() {
-        if hwe == Engine::Rcs0 && format.kind == OAC {
+    if p.oa_unit == 0 {
+        if exec.is_some() {
+            if hwe == Engine::Rcs0 && format.kind == OAC {
+                return Err(FsError::InvalidData.into());
+            }
+            if hwe.is_compute() && format.kind == OAR {
+                return Err(FsError::InvalidData.into());
+            }
+        } else if format.kind == OAR || format.kind == OAC {
             return Err(FsError::InvalidData.into());
         }
-        if hwe.is_compute() && format.kind == OAR {
-            return Err(FsError::InvalidData.into());
-        }
-    } else if format.kind == OAR || format.kind == OAC {
-        return Err(FsError::InvalidData.into());
     }
     if p.exponent >= 0 && !p.sample {
         return Err(FsError::InvalidData.into());
@@ -782,14 +813,13 @@ pub(crate) async fn open(
         return Err(FsError::InvalidData.into());
     }
     // xe_oa_stream_open_ioctl_locked.
-    let permit = Permit::take(device.card)?;
-    if p.num_syncs != 0 && p.syncs == 0 {
-        return Err(FsError::InvalidData.into());
-    }
-    if p.num_syncs != 0 {
-        // OA syncs (DRM_XE_OA_CAPS_SYNCS) are not implemented.
-        return Err(Error::Errno(EOPNOTSUPP));
-    }
+    let permit = Permit::take(device.card, p.oa_unit)?;
+    let sync = if p.num_syncs > 0 {
+        let table = syncobjs.as_ref().ok_or(FsError::InvalidData)?;
+        Some(XeSync::read(user, p.syncs, p.num_syncs as u32, table)?)
+    } else {
+        None
+    };
     // xe_oa_stream_init.
     let config = lookup(device.card, u64::from(p.metric_set)).ok_or(FsError::InvalidData)?;
     if buffer > u64::from(device.reserve) {
@@ -815,6 +845,9 @@ pub(crate) async fn open(
         session: session.clone(),
         committed: false,
     };
+    if let Some(sync) = &sync {
+        sync.wait().await;
+    }
     backend
         .oa_control(
             session.clone(),
@@ -829,10 +862,17 @@ pub(crate) async fn open(
             return Err(error.into());
         }
     }
+    if let Some(sync) = &sync {
+        sync.publish(crate::drm::syncobj::stub());
+        if let Some((address, value)) = sync.user_fence {
+            user.write_u64_release(address, value)?;
+        }
+    }
     let file = Arc::new(File {
         session,
         backend,
         gate,
+        syncobjs,
     });
     let fd = user.install_file(file, false)?;
     pending.committed = true;
@@ -987,7 +1027,7 @@ pub(crate) async fn i915_open(
     let buffer = u64::from(DEFAULT_BUFFER);
     let wait = 1u64;
 
-    let permit = Permit::take(device.card)?;
+    let permit = Permit::take(device.card, 0)?;
     let config = lookup(device.card, metric_set).ok_or(FsError::InvalidData)?;
 
     let session = Session::new(
@@ -1025,6 +1065,7 @@ pub(crate) async fn i915_open(
         session,
         backend,
         gate,
+        syncobjs: None,
     });
     let cloexec = (flags & I915_PERF_FLAG_FD_CLOEXEC) != 0;
     let fd = user.install_file(file, cloexec)?;
@@ -1109,7 +1150,7 @@ pub(crate) fn populate_card(card: u32, node: &Arc<narf_filesystem::sysfs::Kobjec
 pub(crate) fn oa_status_string(card: u32) -> alloc::string::String {
     let active = ACTIVE
         .get(card as usize)
-        .is_some_and(|a| a.load(Ordering::Acquire));
+        .is_some_and(|units| units.iter().any(|a| a.load(Ordering::Acquire)));
     let num_configs = REGISTRY
         .get(card as usize)
         .map_or(0, |r| r.lock().configs.len());
@@ -1148,7 +1189,7 @@ fn install_oa(card: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
         narf_filesystem::sysfs::kobject_add_attr(&oa_kobj, "oa_active", move || {
             let active = ACTIVE
                 .get(card as usize)
-                .is_some_and(|a| a.load(Ordering::Acquire));
+                .is_some_and(|units| units.iter().any(|a| a.load(Ordering::Acquire)));
             alloc::format!("{}\n", if active { 1 } else { 0 })
         });
         narf_filesystem::sysfs::kobject_add_attr(&oa_kobj, "oa_configs_count", move || {
@@ -1307,25 +1348,41 @@ pub(crate) fn i915_add_config(
     Ok(u64::from(id))
 }
 
-struct Permit {
+pub(crate) struct Permit {
     card: u32,
+    unit: u32,
     held: AtomicBool,
 }
 impl Permit {
     /// oa_unit->exclusive_stream.
-    fn take(card: u32) -> Result<Self, FsError> {
-        ACTIVE[card as usize]
+    pub(crate) fn take(card: u32, unit: u32) -> Result<Self, FsError> {
+        if unit >= 2 {
+            return Err(FsError::InvalidData);
+        }
+        ACTIVE
+            .get(card as usize)
+            .and_then(|units| units.get(unit as usize))
+            .ok_or(FsError::NoDevice)?
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| FsError::Busy)?;
         Ok(Self {
             card,
+            unit,
             held: AtomicBool::new(true),
         })
     }
     fn release(&self) {
         if self.held.swap(false, Ordering::AcqRel) {
-            ACTIVE[self.card as usize].store(false, Ordering::Release);
+            if let Some(units) = ACTIVE.get(self.card as usize) {
+                if let Some(active) = units.get(self.unit as usize) {
+                    active.store(false, Ordering::Release);
+                }
+            }
         }
+    }
+    #[allow(dead_code)]
+    pub(crate) fn unit(&self) -> u32 {
+        self.unit
     }
 }
 impl Drop for Permit {
@@ -1428,17 +1485,24 @@ impl Session {
             privileged,
         })
     }
+    #[allow(dead_code)]
     pub(crate) fn exec_queue(&self) -> Option<u32> {
         self.exec_queue
     }
+    #[allow(dead_code)]
     pub(crate) fn no_preempt(&self) -> bool {
         self.no_preempt
     }
+    #[allow(dead_code)]
     pub(crate) fn privileged(&self) -> bool {
         self.privileged
     }
     pub(crate) fn device(&self) -> Device {
         self.device
+    }
+    #[allow(dead_code)]
+    pub(crate) fn oa_unit(&self) -> u32 {
+        self.permit.unit
     }
     /// The engine whose kernel queue retires configuration jobs.
     pub(crate) fn engine(&self) -> Engine {
@@ -1577,6 +1641,7 @@ pub(crate) struct File {
     session: Arc<Session>,
     backend: Arc<dyn UserBackend>,
     gate: Gate,
+    syncobjs: Option<Arc<IrqSafeSpinLock<SyncObjTable>>>,
 }
 impl core::fmt::Debug for File {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1624,26 +1689,42 @@ impl File {
             CONFIG => {
                 // xe_oa_config_locked / i915_perf_config_locked returns the previous configuration id.
                 let old = session.config().id;
-                let config = if session.is_i915 {
-                    lookup(session.device.card, arg).ok_or(FsError::InvalidData)?
+                if session.is_i915 {
+                    let config = lookup(session.device.card, arg).ok_or(FsError::InvalidData)?;
+                    self.backend
+                        .oa_control(session.clone(), Request::Config(config.clone()))
+                        .await?;
+                    *session.config.lock() = config;
+                    Ok(u64::from(old))
                 } else {
                     let mut p = Params::new();
                     extensions(session.device, Origin::Config, arg, user, &mut p)?;
                     let config = lookup(session.device.card, u64::from(p.metric_set))
                         .ok_or(FsError::NoDevice)?;
-                    if p.num_syncs != 0 && p.syncs == 0 {
+                    if (p.num_syncs != 0 && p.syncs == 0) || (p.num_syncs == 0 && p.syncs != 0) {
                         return Err(FsError::InvalidData.into());
                     }
-                    if p.num_syncs != 0 {
-                        return Err(Error::Errno(EOPNOTSUPP));
+                    let sync = if p.num_syncs > 0 {
+                        let table = self.syncobjs.as_ref().ok_or(FsError::InvalidData)?;
+                        Some(XeSync::read(user, p.syncs, p.num_syncs as u32, table)?)
+                    } else {
+                        None
+                    };
+                    if let Some(sync) = &sync {
+                        sync.wait().await;
                     }
-                    config
-                };
-                self.backend
-                    .oa_control(session.clone(), Request::Config(config.clone()))
-                    .await?;
-                *session.config.lock() = config;
-                Ok(u64::from(old))
+                    self.backend
+                        .oa_control(session.clone(), Request::Config(config.clone()))
+                        .await?;
+                    *session.config.lock() = config;
+                    if let Some(sync) = &sync {
+                        sync.publish(crate::drm::syncobj::stub());
+                        if let Some((address, value)) = sync.user_fence {
+                            user.write_u64_release(address, value)?;
+                        }
+                    }
+                    Ok(u64::from(old))
+                }
             }
             STATUS => {
                 user.write(arg, &session.status_bytes())?;
@@ -2436,11 +2517,7 @@ impl<A: BootAllocator> Unit<A> {
             // Clear the report id and timestamp to detect unlanded reports;
             // zero a report entirely when reports straddle the ring end.
             let clear = if circ % size == 0 {
-                if session.format.header64 {
-                    16
-                } else {
-                    8
-                }
+                if session.format.header64 { 16 } else { 8 }
             } else {
                 size
             };
@@ -2516,7 +2593,7 @@ pub(crate) fn test_session(
         1,
         buffer,
         device.oag_engines().next().expect("OAG engine"),
-        Permit::take(device.card).expect("free OA unit"),
+        Permit::take(device.card, 0).expect("free OA unit"),
         Arc::new(Config::new(
             1,
             [b'0'; 36],
@@ -2548,7 +2625,7 @@ pub(crate) fn test_session_i915(
         1,
         buffer,
         device.oag_engines().next().expect("OAG engine"),
-        Permit::take(device.card).expect("free OA unit"),
+        Permit::take(device.card, 0).expect("free OA unit"),
         Arc::new(Config::new(
             1,
             [b'0'; 36],

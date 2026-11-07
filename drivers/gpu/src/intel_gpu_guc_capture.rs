@@ -1060,11 +1060,13 @@ pub(crate) struct Queue {
 const JOB_TIMEOUT_MS: u32 = 5000;
 const PREEMPT_TIMEOUT_US: u32 = 500_000;
 impl Queue {
+    #[allow(dead_code)]
     pub(crate) fn with_process(mut self, name: &'static str, pid: u32) -> Self {
         self.comm = Some(name);
         self.pid = Some(pid);
         self
     }
+    #[allow(dead_code)]
     pub(crate) fn with_snapshot_time(mut self, secs: u64, nanos: u32) -> Self {
         self.snapshot_time = Some((secs, nanos));
         self

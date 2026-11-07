@@ -9,7 +9,7 @@ use core::{
     sync::atomic::{AtomicU64, AtomicUsize},
     task::{Context, Poll, Waker},
 };
-use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_kernel_test::{TestResult, kernel_test_in};
 
 const MTL: GtPlatform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
 const LNL: GtPlatform = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
@@ -196,6 +196,12 @@ impl IoctlContext for Wire {
             .ok_or(FsError::BadAddress)?
             .copy_from_slice(source);
         Ok(())
+    }
+    fn write_u64_release(&self, address: u64, value: u64) -> Result<(), FsError> {
+        if address & 7 != 0 {
+            return Err(FsError::InvalidData);
+        }
+        self.write(address, &value.to_le_bytes())
     }
     fn nonblocking(&self) -> bool {
         false
@@ -390,7 +396,7 @@ fn smoke_oa_query_units_formats_and_timestamp() -> TestResult {
     assert_eq!(reply.len(), 16 + 72 + 2 * 8);
     assert_eq!(u32_at(&reply, 8), 1);
     assert_eq!((u32_at(&reply, 16 + 8), u32_at(&reply, 16 + 12)), (0, 0));
-    assert_eq!(u64_at(&reply, 16 + 16), 0x2d);
+    assert_eq!(u64_at(&reply, 16 + 16), CAPS);
     assert_eq!(u64_at(&reply, 16 + 24), 19_200_000);
     assert_eq!(u64_at(&reply, 16 + 64), 2);
     // RENDER/0 then COMPUTE/0 on gt 0; BCS0 has no OA unit.
@@ -456,11 +462,11 @@ fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
     let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
     let open_at = |props: &[(u32, u64)], gate: Gate, queues: QueueLookup<'_>| {
         let at = wire.chain(0x1000, props);
-        ready(open(Some(backend.clone()), at, &wire, queues, gate))
+        ready(open(Some(backend.clone()), at, &wire, queues, gate, None))
     };
     let invalid = Err(Error::Fs(FsError::InvalidData));
     assert_eq!(
-        ready(open(None, 0x1000, &wire, &none, ALLOW)),
+        ready(open(None, 0x1000, &wire, &none, ALLOW, None)),
         Err(Error::Fs(FsError::NoDevice))
     );
     // Seventeen chained extensions are E2BIG; the walk reads before parsing.
@@ -472,20 +478,21 @@ fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
             0x7fff_0000,
             &wire,
             &none,
-            ALLOW
+            ALLOW,
+            None
         )),
         Err(Error::Fs(FsError::BadAddress))
     );
     let at = wire.chain(0x1000, &[(2, 1)]);
     wire.put(at + 8, &1u32.to_le_bytes());
     assert_eq!(
-        ready(open(Some(backend.clone()), at, &wire, &none, ALLOW)),
+        ready(open(Some(backend.clone()), at, &wire, &none, ALLOW, None)),
         invalid
     );
     let at = wire.chain(0x1000, &[(2, 1)]);
     wire.put(at + 20, &1u32.to_le_bytes());
     assert_eq!(
-        ready(open(Some(backend.clone()), at, &wire, &none, ALLOW)),
+        ready(open(Some(backend.clone()), at, &wire, &none, ALLOW, None)),
         invalid
     );
     for props in [
@@ -536,7 +543,7 @@ fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
         props
     };
     assert_eq!(open_at(&with(&[(13, 513)]), ALLOW, &none), invalid);
-    let busy = Permit::take(51).unwrap();
+    let busy = Permit::take(51, 0).unwrap();
     assert_eq!(
         open_at(&with(&[]), ALLOW, &none),
         Err(Error::Fs(FsError::Busy))
@@ -545,7 +552,7 @@ fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
     assert_eq!(open_at(&with(&[(10, 1)]), ALLOW, &none), invalid);
     assert_eq!(
         open_at(&with(&[(10, 1), (11, 0x4000)]), ALLOW, &none),
-        Err(Error::Errno(EOPNOTSUPP))
+        invalid
     );
     assert_eq!(open_at(&with(&[(3, 99)]), ALLOW, &none), invalid);
     assert_eq!(
@@ -743,7 +750,7 @@ kernel_test_in!(
 fn open_stream(backend: &Arc<Backend>, wire: &Wire, props: &[(u32, u64)]) -> Arc<dyn FileOps> {
     let at = wire.chain(0x1000, props);
     assert_eq!(
-        ready(open(Some(backend.clone()), at, wire, &none, ALLOW)),
+        ready(open(Some(backend.clone()), at, wire, &none, ALLOW, None)),
         Ok(41)
     );
     wire.file()
@@ -1086,7 +1093,7 @@ fn smoke_oa_descriptor_authority_blocking_config_and_reopen() -> TestResult {
         &[(2, 1), (4, A24U40), (3, first), (5, 9), (12, 128 << 10)],
     );
     assert_eq!(
-        ready(open(Some(backend.clone()), at, &wire, &none, gate)),
+        ready(open(Some(backend.clone()), at, &wire, &none, gate, None)),
         Ok(41)
     );
     let installed = wire.file();
@@ -1098,7 +1105,7 @@ fn smoke_oa_descriptor_authority_blocking_config_and_reopen() -> TestResult {
             0x1000,
             &[(2, 1), (4, A24U40), (3, first), (5, 9), (12, 128 << 10)],
         );
-        ready(open(Some(backend.clone()), at, &wire, &none, gate)).unwrap();
+        ready(open(Some(backend.clone()), at, &wire, &none, gate, None)).unwrap();
         wire.file()
     };
     let session = session_of(&backend);
@@ -1107,6 +1114,7 @@ fn smoke_oa_descriptor_authority_blocking_config_and_reopen() -> TestResult {
         session: session.clone(),
         backend: backend.clone(),
         gate,
+        syncobjs: None,
     };
     assert_eq!(file.poll_readiness(), POLL_ERR | POLL_HUP);
     let mut out = [0u8; 256];
@@ -1161,7 +1169,7 @@ fn unit_with_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<Session>) 
         1,
         128 << 10,
         Engine::Rcs0,
-        Permit::take(card).unwrap(),
+        Permit::take(card, 0).unwrap(),
         config,
         false,
         None,
@@ -1360,6 +1368,7 @@ fn smoke_oa_mmap_source_checks_then_private_pfn_backing() -> TestResult {
         session: session_of(&backend),
         backend: backend.clone(),
         gate: DENY,
+        syncobjs: None,
     };
     assert_eq!(
         denied.validate_mmap(0, 4096, READ | 2, 1),
@@ -1417,7 +1426,8 @@ fn smoke_oa_mmap_pages_hold_stream_and_survive_unit_release() -> TestResult {
             wire.chain(0x1000, &props),
             &wire,
             &none,
-            ALLOW
+            ALLOW,
+            None
         )),
         Err(Error::Fs(FsError::Busy))
     ));
@@ -1733,7 +1743,14 @@ fn smoke_oa_exec_queue_oar_oac_streams() -> TestResult {
 
     let open_at = |props: &[(u32, u64)], gate: Gate| {
         let at = wire.chain(0x1000, props);
-        ready(open(Some(backend.clone()), at, &wire, &queue_lookup, gate))
+        ready(open(
+            Some(backend.clone()),
+            at,
+            &wire,
+            &queue_lookup,
+            gate,
+            None,
+        ))
     };
 
     // 1. Parallel queues are rejected with EOPNOTSUPP:
@@ -1843,4 +1860,387 @@ fn smoke_oa_exec_queue_oar_oac_streams() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_exec_queue_oar_oac_streams
+);
+
+fn smoke_oa_syncs_infence_outfence_and_user_fence() -> TestResult {
+    use crate::drm::syncobj::{BinaryFence, SyncObjTable};
+
+    let backend = Backend::new(device(53, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let table = Arc::new(IrqSafeSpinLock::new(SyncObjTable::new()));
+
+    // 1. Create in-fence (pre-signalled) and out-fence syncobjs:
+    let in_fence = BinaryFence::signalled();
+    let in_handle = table.lock().create_with_fence(in_fence).unwrap();
+    let out_handle = table.lock().create(0).unwrap();
+
+    // Setup 48-byte drm_xe_sync entries in wire memory at 0x6000:
+    let sync_addr = 0x6000u64;
+    let mut sync_bytes = [0u8; 48 * 2];
+    // Sync 0: flags=0, handle=in_handle
+    put32(&mut sync_bytes, 8, 0); // kind = 0 (SYNCOBJ)
+    put32(&mut sync_bytes, 12, 0); // flags = 0 (IN)
+    put64(&mut sync_bytes, 16, u64::from(in_handle));
+    // Sync 1: flags=1, handle=out_handle
+    put32(&mut sync_bytes, 48 + 8, 0); // kind = 0
+    put32(&mut sync_bytes, 48 + 12, 1); // flags = 1 (OUT)
+    put64(&mut sync_bytes, 48 + 16, u64::from(out_handle));
+    wire.put(sync_addr, &sync_bytes);
+
+    let props = [
+        (2u32, 1u64),
+        (4, A24U40),
+        (3, config),
+        (12, 128 << 10),
+        (10, 2), // num_syncs = 2
+        (11, sync_addr),
+    ];
+    let at = wire.chain(0x1000, &props);
+    let fd = ready(open(
+        Some(backend.clone()),
+        at,
+        &wire,
+        &none,
+        ALLOW,
+        Some(table.clone()),
+    ))
+    .unwrap();
+    assert_eq!(fd, 41);
+    let file = wire.file();
+
+    // Verify out-fence syncobj was published:
+    let out_core = table.lock().get(out_handle).unwrap().core().clone();
+    assert!(out_core.fence().is_some_and(|f| f.is_signalled()));
+
+    // 2. Test CONFIG ioctl on stream file with user-fence:
+    let config2 = add(&backend, &wire, 2, &[(0x9884, 2)]);
+    let user_fence_addr = 0x8000u64;
+    wire.put(user_fence_addr, &0u64.to_le_bytes());
+
+    // Single sync entry at 0x6100: user-fence
+    let mut uf_sync = [0u8; 48];
+    put32(&mut uf_sync, 8, 2); // kind = 2 (USER_FENCE)
+    put32(&mut uf_sync, 12, 1); // flags = 1 (OUT)
+    put64(&mut uf_sync, 16, user_fence_addr); // handle = memory address
+    put64(&mut uf_sync, 24, 0x1234_5678_9abc_def0); // point = value to write
+    wire.put(0x6100, &uf_sync);
+
+    let cfg_props = [(3u32, config2), (10, 1), (11, 0x6100)];
+    let cfg_at = wire.chain(0x2000, &cfg_props);
+    assert_eq!(ready(file.ioctl_user(CONFIG, cfg_at, &wire)), Ok(config));
+
+    // Verify user-fence value was written:
+    let mut read_uf = [0u8; 8];
+    wire.read(user_fence_addr, &mut read_uf).unwrap();
+    assert_eq!(u64::from_le_bytes(read_uf), 0x1234_5678_9abc_def0);
+
+    // 3. Invalid sync parameters:
+    // num_syncs > MAX_SYNCS (2):
+    let bad_props = [
+        (2u32, 1u64),
+        (4, A24U40),
+        (3, config),
+        (12, 128 << 10),
+        (10, 3), // num_syncs > 2 -> invalid
+        (11, sync_addr),
+    ];
+    let bad_at = wire.chain(0x3000, &bad_props);
+    assert_eq!(
+        ready(open(
+            Some(backend.clone()),
+            bad_at,
+            &wire,
+            &none,
+            ALLOW,
+            Some(table.clone()),
+        )),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    // num_syncs == 0 with property 10:
+    let bad_props0 = [
+        (2u32, 1u64),
+        (4, A24U40),
+        (3, config),
+        (12, 128 << 10),
+        (10, 0),
+        (11, sync_addr),
+    ];
+    let bad_at0 = wire.chain(0x3100, &bad_props0);
+    assert_eq!(
+        ready(open(
+            Some(backend.clone()),
+            bad_at0,
+            &wire,
+            &none,
+            ALLOW,
+            Some(table.clone()),
+        )),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    // syncs == 0 with num_syncs != 0:
+    let bad_props_nosync = [
+        (2u32, 1u64),
+        (4, A24U40),
+        (3, config),
+        (12, 128 << 10),
+        (10, 1),
+    ];
+    let bad_at_nosync = wire.chain(0x3200, &bad_props_nosync);
+    assert_eq!(
+        ready(open(
+            Some(backend.clone()),
+            bad_at_nosync,
+            &wire,
+            &none,
+            ALLOW,
+            Some(table.clone()),
+        )),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    drop(file);
+    backend.poll(1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_syncs_infence_outfence_and_user_fence
+);
+
+fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
+    let mut mtl = device(54, MTL, 1270);
+    mtl.media_engines = Some(EngineSet::of(&[Engine::Vcs0, Engine::Vcs1, Engine::Vecs0]));
+    mtl.media_timestamp = Some(19_200_000);
+    assert!(mtl.has_oam());
+
+    let backend = Backend::new(mtl);
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+
+    // Media exec queue: queue 20 has class 2 (VCS), width 1.
+    // Render exec queue: queue 10 has class 0 (RCS), width 1.
+    let queues = |id: u32| match id {
+        20 => Some((2, 1)),
+        10 => Some((0, 1)),
+        _ => None,
+    };
+
+    // Formats:
+    // MPEC 192-byte format (format 8): kind MPEC (4), select 1, counter_size 0, bc 0
+    let mpec192 = 4u64 | (1u64 << 8);
+    // MPEC 128-byte format (format 9): kind MPEC (4), select 2, counter_size 0, bc 0
+    let mpec128 = 4u64 | (2u64 << 8);
+    let oag256 = A24U40;
+
+    // 1. Open OAM Unit 1 stream with media exec queue and MPEC format succeeds:
+    let oam_props = [
+        (1u32, 1u64), // oa_unit = 1 (OAM)
+        (7, 20),      // exec_queue = 20 (VCS)
+        (4, mpec192), // MPEC 192-byte format
+        (3, config),
+        (12, 128 << 10),
+    ];
+    let at = wire.chain(0x1000, &oam_props);
+    let fd = ready(open(Some(backend.clone()), at, &wire, &queues, ALLOW, None)).unwrap();
+    assert_eq!(fd, 41);
+    let oam_file = wire.file();
+    let oam_session = session_of(&backend);
+    assert_eq!(oam_session.oa_unit(), 1);
+    assert_eq!(oam_session.format.kind, MPEC);
+    assert_eq!(oam_session.engine(), Engine::Vcs0);
+
+    // 2. While OAM Unit 1 is active, another open on Unit 1 returns Busy:
+    let at_busy = wire.chain(0x1100, &oam_props);
+    assert_eq!(
+        ready(open(
+            Some(backend.clone()),
+            at_busy,
+            &wire,
+            &queues,
+            ALLOW,
+            None
+        )),
+        Err(Error::Fs(FsError::Busy))
+    );
+
+    // 3. Concurrency: While OAM Unit 1 is active, Unit 0 (OAG) can be opened simultaneously!
+    let oag_props = [
+        (1u32, 0u64), // oa_unit = 0 (OAG)
+        (2, 1),       // sample = true
+        (4, oag256),  // OAG format
+        (3, config),
+        (12, 128 << 10),
+    ];
+    let at_oag = wire.chain(0x1200, &oag_props);
+    let fd_oag = ready(open(
+        Some(backend.clone()),
+        at_oag,
+        &wire,
+        &queues,
+        ALLOW,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(fd_oag, 41);
+    let oag_file = wire.file();
+
+    // Both units active on card 54:
+    assert!(ACTIVE[54][0].load(Ordering::Acquire));
+    assert!(ACTIVE[54][1].load(Ordering::Acquire));
+
+    // Trying to open Unit 0 again also returns Busy:
+    let at_oag_busy = wire.chain(0x1300, &oag_props);
+    assert_eq!(
+        ready(open(
+            Some(backend.clone()),
+            at_oag_busy,
+            &wire,
+            &queues,
+            ALLOW,
+            None
+        )),
+        Err(Error::Fs(FsError::Busy))
+    );
+
+    // Close Unit 1: Unit 1 becomes idle while Unit 0 remains active:
+    drop(oam_file);
+    assert!(!ACTIVE[54][1].load(Ordering::Acquire));
+    assert!(ACTIVE[54][0].load(Ordering::Acquire));
+
+    // Now Unit 1 can be opened again with MPEC 128:
+    let oam128_props = [
+        (1u32, 1u64),
+        (7, 20),
+        (4, mpec128),
+        (3, config),
+        (12, 128 << 10),
+    ];
+    let at_oam128 = wire.chain(0x1400, &oam128_props);
+    let fd_oam128 = ready(open(
+        Some(backend.clone()),
+        at_oam128,
+        &wire,
+        &queues,
+        ALLOW,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(fd_oam128, 41);
+    let oam_file2 = wire.file();
+    drop(oam_file2);
+    drop(oag_file);
+    assert!(!ACTIVE[54][0].load(Ordering::Acquire));
+    assert!(!ACTIVE[54][1].load(Ordering::Acquire));
+
+    // 4. Reject non-MPEC formats on OAM Unit 1:
+    let non_mpec_on_oam = [
+        (1u32, 1u64),
+        (7, 20),
+        (4, oag256), // OAG format on OAM
+        (3, config),
+        (12, 128 << 10),
+    ];
+    let at_bad_fmt = wire.chain(0x1500, &non_mpec_on_oam);
+    assert_eq!(
+        ready(open(
+            Some(backend.clone()),
+            at_bad_fmt,
+            &wire,
+            &queues,
+            ALLOW,
+            None
+        )),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    // 5. Reject MPEC formats on OAG Unit 0:
+    let mpec_on_oag = [
+        (1u32, 0u64),
+        (7, 10),
+        (4, mpec192), // MPEC format on OAG
+        (3, config),
+        (12, 128 << 10),
+    ];
+    let at_mpec_oag = wire.chain(0x1600, &mpec_on_oag);
+    assert_eq!(
+        ready(open(
+            Some(backend.clone()),
+            at_mpec_oag,
+            &wire,
+            &queues,
+            ALLOW,
+            None
+        )),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    // 6. Reject periodic timer sampling on OAM Unit 1:
+    let sample_on_oam = [
+        (1u32, 1u64),
+        (7, 20),
+        (4, mpec192),
+        (2, 1), // sample = true -> rejected on OAM
+        (3, config),
+        (12, 128 << 10),
+    ];
+    let at_sample_oam = wire.chain(0x1700, &sample_on_oam);
+    assert_eq!(
+        ready(open(
+            Some(backend.clone()),
+            at_sample_oam,
+            &wire,
+            &queues,
+            ALLOW,
+            None
+        )),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    let exp_on_oam = [
+        (1u32, 1u64),
+        (7, 20),
+        (4, mpec192),
+        (5, 5), // exponent = 5 -> rejected on OAM
+        (3, config),
+        (12, 128 << 10),
+    ];
+    let at_exp_oam = wire.chain(0x1800, &exp_on_oam);
+    assert_eq!(
+        ready(open(
+            Some(backend.clone()),
+            at_exp_oam,
+            &wire,
+            &queues,
+            ALLOW,
+            None
+        )),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    // 7. Reject oa_unit == 1 on device without media engines (no OAM):
+    let mtl_no_oam = device(55, MTL, 1270);
+    assert!(!mtl_no_oam.has_oam());
+    let backend_no_oam = Backend::new(mtl_no_oam);
+    let at_no_oam = wire.chain(0x1900, &oam_props);
+    assert_eq!(
+        ready(open(
+            Some(backend_no_oam),
+            at_no_oam,
+            &wire,
+            &queues,
+            ALLOW,
+            None
+        )),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    backend.poll(1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_media_gt_oam_unit1_stream_support
 );

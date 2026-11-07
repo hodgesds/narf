@@ -10,7 +10,7 @@ use crate::{
     intel_gpu_user::{UserBatch, UserContext},
     intel_gpu_xe_sync::Sync,
     intel_gpu_xe_uapi as abi,
-    intel_gpu_xe_vm::{read, zero, Bind, Vm},
+    intel_gpu_xe_vm::{Bind, Vm, read, zero},
 };
 use alloc::{
     boxed::Box,
@@ -595,7 +595,7 @@ impl XeFile {
         // calc_validate_logical_mask's parallel checks, like the VM lookup
         // below, precede xe_exec_queue_create and so the extension chain.
         let lanes = if width > 1 {
-            if !matches!(class, 1 | 4) {
+            if !matches!(class, 1..=4) {
                 return Err(FsError::InvalidData);
             }
             let mut lanes =
@@ -687,7 +687,7 @@ impl XeFile {
         address: u64,
         user: &dyn IoctlContext,
         gem: &GemState,
-        syncobjs: &IrqSafeSpinLock<SyncObjTable>,
+        syncobjs: &Arc<IrqSafeSpinLock<SyncObjTable>>,
     ) -> Option<Result<u64, FsError>> {
         match cmd {
             abi::GEM_CREATE if info.platform.is_discrete() && info.vram.is_some() => {
@@ -705,7 +705,7 @@ impl XeFile {
             ),
             abi::EXEC => Some(self.exec(info, address, user, syncobjs).await.map(|_| 0)),
             abi::WAIT_USER_FENCE => Some(self.wait_user(address, user).await.map(|_| 0)),
-            abi::OBSERVATION => Some(self.observation(info, address, user).await),
+            abi::OBSERVATION => Some(self.observation(info, address, user, syncobjs).await),
             _ => self.dispatch(info, cmd, address, user, gem),
         }
     }
@@ -717,6 +717,7 @@ impl XeFile {
         info: &DeviceInfo,
         address: u64,
         user: &dyn IoctlContext,
+        syncobjs: &Arc<IrqSafeSpinLock<SyncObjTable>>,
     ) -> Result<u64, FsError> {
         let wire = read(user, address, 32)?;
         if u64_at(&wire, 0) != 0 {
@@ -740,6 +741,7 @@ impl XeFile {
                     u64_at(&wire, 24),
                     user,
                     &queues,
+                    Some(syncobjs.clone()),
                 )
                 .await
             }

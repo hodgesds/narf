@@ -721,7 +721,7 @@ while any allowed engine is making real progress. Diagnostics report an exact
 observed engine or unavailable, plus the placement set; the template engine
 is never substituted for physical evidence. Disable/deregister/final-TLB and
 full-reset ownership rules retain the whole virtual context and residency.
-Single-row width-two through width-four parallel COPY/COMPUTE queues retain
+Single-row width-two through width-four parallel COPY/COMPUTE/VIDEO (VCS/VECS) queues retain
 one persistent image/ring per lane, a common context serial/epoch, an immutable
 shared VM graph and a copied batch address per lane. Published dense logical
 instances must be adjacent and same-class; actual engine availability bounds
@@ -753,11 +753,10 @@ completed lanes cannot mask a remaining stall. All placements survive close,
 cancel and reset until existing retirement proofs complete. Qualified physical
 sets permit compute 2×2, 2×3 and 3×2; one RCS0 cannot form a parallel render group,
 and COPY0/1 permits only one distinct two-lane row. Unsupported physical widths
-remain refused. Pinned Linux's platform descriptors give every current
+remain refused. Parallel queue creation (width > 1) accepts COPY (class 1), VCS (class 2), VECS (class 3), and COMPUTE (class 4) with contiguous placement rows on the matching GT; class 0 (Render) or class 5 (Bind) with width > 1, or COMPUTE/VIDEO on a GT without published instances, return EINVAL. Pinned Linux's platform descriptors give every current
 profile a zero multi-queue class mask; CGP groups and dynamic multi-queue
 properties remain unadvertised pending independent platform qualification.
-VIDEO classes, and COMPUTE on a GT
-without a published compute instance, return EINVAL. `UserStatus::engines` carries the GT's
+`UserStatus::engines` carries the GT's
 published `EngineSet`; ENGINES lists exactly that set in xe_hw_engine order
 and engine-cycle queries for an unpublished class return EINVAL after the
 syntax and readiness checks. EXEC_QUEUE_CREATE extensions follow
@@ -1017,10 +1016,10 @@ facts only with the live epoch. These are the card, platform, graphics
 version, OA timestamp frequency, published engines and reservation.
 Query 8 (`drm_xe_query_oa_units`) has zero units until then. After that it
 has one OAG unit (id 0, gt 0) with the published render and compute
-engines. Its capabilities are BASE, OA_BUFFER_SIZE, WAIT_NUM_REPORTS and
-OA_UNIT_GT_ID. When the standalone media GT is published, Query 8 also
+engines. Its capabilities are BASE, SYNCS (`DRM_XE_OA_CAPS_SYNCS`), OA_BUFFER_SIZE, WAIT_NUM_REPORTS and
+OA_UNIT_GT_ID (value 47). When the standalone media GT is published, Query 8 also
 enumerates unit 1 (OAM, gt 1) with published VCS/VECS engines and CAPS_OAM
-(including DRM_XE_OA_CAPS_OAM). Sysfs `/sys/class/drm/card<N>/oa/` exposes
+(including `DRM_XE_OA_CAPS_SYNCS` and `DRM_XE_OA_CAPS_OAM`, value 63). Sysfs `/sys/class/drm/card<N>/oa/` exposes
 live `oa_status`, `oa_buffer_size`, `oa_active`, `oa_configs_count`, and
 `oa_overflow_count`.
 
@@ -1039,7 +1038,9 @@ or op is EINVAL. The OA ops follow `xe_oa.c`'s errno order and C widths:
 - Extensions are E2BIG past sixteen, then EFAULT/EINVAL.
 - An exec queue is ENOENT or EOPNOTSUPP (width > 1).
 - Privilege is EACCES. Unprivileged open is permitted for an exec queue stream without sampling (`sample: false`); periodic timer sampling (`sample: true`), preemption holding (`no_preempt: true`), or queue-less global streams require current CAP_PERFMON/CAP_SYS_ADMIN.
-- A second stream per card is EBUSY.
+- Stream open and `DRM_XE_OA_IOCTL_CONFIG` accept `DRM_XE_OA_PROPERTY_NUM_SYNCS` (10) and `DRM_XE_OA_PROPERTY_SYNCS` (11) for up to two syncs: in-fences are awaited, and out-fences and user-fences are signaled on completion.
+- Unit 1 (OAM) streams require `device.has_oam()`, an exec queue mapped to a media engine (VCS/VECS), and an MPEC format (8 or 9), rejecting timer sampling; non-MPEC formats on OAM and MPEC formats on OAG (Unit 0) are rejected.
+- Concurrency permits are maintained independently per unit (`ACTIVE: [[AtomicBool; 2]; 64]`), so Unit 0 and Unit 1 can be open simultaneously on the same card; a second stream on the same unit is EBUSY.
 - Add returns EADDRINUSE for a duplicate uuid and otherwise the lowest
   free id from 1. Remove returns ENOENT for an unknown id.
 
