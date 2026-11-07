@@ -60,7 +60,7 @@ pub const TPM_CC_EVICT_CONTROL: u32 = 0x0000_0120;
 pub const TPM_CC_CREATE_PRIMARY: u32 = 0x0000_0131;
 pub const TPM_CC_QUOTE: u32 = 0x0000_0158;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x0000_0165;
-pub const TPM_CC_READ_PUBLIC: u32 = 0x0000_0169;
+pub const TPM_CC_READ_PUBLIC: u32 = 0x0000_0173;
 
 // ── TPM_SU values (Part 2 §6.9) — operand to TPM2_Startup ─────────
 
