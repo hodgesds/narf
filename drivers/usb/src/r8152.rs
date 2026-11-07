@@ -31,15 +31,26 @@
 //!   (`RX_IPF` / `RX_UDPF` / `RX_TCPF`); the pump decodes them
 //!   (`rx_csum_result`) and drops device-verified corrupt frames
 //!   (`rx_segment_deliverable`), with an IPv4/UDP zero-checksum
-//!   exception. The v1 layout is used for all generations; the
-//!   RTL8157 v2 descriptor layout is not decoded.
+//!   exception. The v1 layout is used for every generation
+//!   except the RTL8157 (VER_16), which uses the 16-byte v2
+//!   descriptor (`rx_desc_v2`, Linux `r8157_desc_init`):
+//!   the length moves to `opts1` bits 17..31 and counts the
+//!   trailing FCS, the VLAN tag moves to `opts1` bit 3 (TCI in
+//!   the high half of `opts2`), all checksum report/fail bits
+//!   move into `opts3`, and segments align to 16 bytes
+//!   (`parse_rx_aggregate_v2`, `rx_csum_result_v2`).
 //! - **TX**: each bulk-OUT transfer is one 8-byte `tx_desc`
 //!   (`opts1 = len | TX_FS | TX_LS`, plus GTSENDV4/V6 +
 //!   transport-offset for hardware TSO) followed by the frame,
 //!   zero-padded to a 4-byte multiple (`TX_ALIGN`). `opts2`
 //!   carries the offloads the stack requested via `TxMeta`:
 //!   VLAN insert, IPv4/IPv6 + TCP/UDP checksum generation, or
-//!   the TSO MSS — plain frames still encode `opts2 = 0`.
+//!   the TSO MSS — plain frames still encode `opts2 = 0`. The
+//!   RTL8157 uses the 16-byte v2 TX descriptor instead
+//!   (`tx_desc_v2`: same `opts1`/`opts2`, plus
+//!   `opts3 = len << 4` and `opts4 = TX_SIG`, padded to 16),
+//!   with a tighter transport-offset cap (`TCPHO_MAX_2` =
+//!   0x3FF, `build_tx_segment_meta_v2`).
 //!
 //! The MAC address is **read from the device** (`PLA_IDR`, or
 //! `PLA_BACKUP` on the GbE generations, with the other as fallback)
@@ -388,6 +399,71 @@ pub const RD_UDP_CS: u32 = 1 << 23;
 pub const RX_IPF: u32 = 1 << 23;
 pub const RX_UDPF: u32 = 1 << 22;
 pub const RX_TCPF: u32 = 1 << 21;
+
+// ── RTL8157 v2 descriptor formats (Linux `rx_desc_v2` /
+// `tx_desc_v2`, `r8157_desc_init`) ──────────────────────────
+//
+// RTL8157 (VER_16, `PLA_TCR1` 0x1030) uses a different packet
+// descriptor format from every earlier generation (upstream
+// Linux `drivers/net/usb/r8152.c`, RTL8157 series merged
+// 2026-03, based on Realtek's out-of-tree driver): both
+// descriptors shrink to 16 bytes (4 × u32), the RX length
+// moves to the top of `opts1` and counts the trailing FCS,
+// and every checksum bit moves into RX `opts3`.
+
+/// RX aggregation segment header length for v2 (`rx_desc_v2`,
+/// 4 × u32).
+pub const RX_DESC_V2_LEN: usize = 16;
+/// RX aggregation alignment for v2 (Linux `r8157_desc_init`:
+/// `rx_desc.align = 16` — the next segment starts at the next
+/// 16-byte boundary after frame + FCS).
+pub const RX_DESC_V2_ALIGN: usize = 16;
+/// `rx_desc_v2.opts1` frame-length mask / shift (Linux
+/// `RX_LEN_MASK_2` / `rx_v2_get_len`): bits 17..31 hold the
+/// frame length INCLUDING the trailing FCS (`RX_FCS_LEN`).
+pub const RX_V2_LEN_MASK: u32 = 0xFFFE_0000;
+pub const RX_V2_LEN_SHIFT: u32 = 17;
+/// `rx_desc_v2.opts1` VLAN-tag-present bit (Linux
+/// `RX_VLAN_TAG_2`); the TCI itself lives in the high half of
+/// `opts2` (see [`rx_vlan_tag_v2`]).
+pub const RX_V2_VLAN_TAG_BIT: u32 = 1 << 3;
+/// `rx_desc_v2.opts1` descriptor-version field mask (Linux
+/// `RX_VER_MASK`). Linux's walk does not validate it, and
+/// neither does this parser — it is defined here so a reader
+/// of a raw descriptor can name the low two bits.
+pub const RX_V2_VER_MASK: u32 = 0x3;
+/// `rx_desc_v2.opts3` RX checksum report bits (Linux
+/// `RD_*_CS_2`): which checksums the chip examined on this
+/// frame. Unlike v1, report and fail bits share `opts3`.
+pub const RD_IPV4_CS_V2: u32 = 1 << 14;
+pub const RD_IPV6_CS_V2: u32 = 1 << 15;
+pub const RD_TCP_CS_V2: u32 = 1 << 10;
+pub const RD_UDP_CS_V2: u32 = 1 << 11;
+/// `rx_desc_v2.opts3` RX checksum fail bits (Linux `IPF_2` /
+/// `UDPF_2` / `TCPF_2`): the examined checksum was wrong.
+pub const RX_IPF_V2: u32 = 1 << 26;
+pub const RX_UDPF_V2: u32 = 1 << 25;
+pub const RX_TCPF_V2: u32 = 1 << 24;
+/// FCS bytes trailing each RX frame inside the descriptor's
+/// length field (Linux `ETH_FCS_LEN`); the v2 walk strips
+/// them, so `RxSegment.len` stays "delivered frame bytes".
+pub const RX_FCS_LEN: usize = 4;
+/// TX descriptor length / aggregation alignment for v2
+/// (Linux `tx_desc_v2`, `r8157_desc_init`: `tx_desc.size` =
+/// 16, `tx_desc.align` = 16).
+pub const TX_DESC_V2_LEN: usize = 16;
+pub const TX_DESC_V2_ALIGN: usize = 16;
+/// `tx_desc_v2.opts3` length encoding (Linux `tx_v2_set_len`:
+/// `len << 4`).
+pub const TX_V2_LEN_SHIFT: u32 = 4;
+/// `tx_desc_v2.opts4` signature (Linux `TX_SIG`: `0x15 << 27`).
+pub const TX_V2_SIG: u32 = 0x15 << 27;
+/// TX transport-offset cap for v2 (Linux `TCPHO_MAX_2`: 0x3FF,
+/// vs `TX_TCPHO_MAX` 0x7FF for v1). The TSO cap is unchanged
+/// (`TX_GTTCPHO_MAX`): Linux's `r8157_tx_csum` tightens only
+/// the non-GSO checksum path and delegates TSO to the shared
+/// `r8152_tx_csum`.
+pub const TX_TCPHO_MAX_V2: u32 = 0x3FF;
 
 // ── Datapath descriptor formats ──────────────────────────────────
 
@@ -1287,9 +1363,9 @@ pub fn rx_vlan_tag_from_opts2(opts2: u32) -> Option<u16> {
 
 /// What the device concluded about a received frame's checksums,
 /// decoded from the v1 `rx_desc` report bits (Linux
-/// `r8152_rx_csum`). Follows the in-tree v1 descriptor layout
-/// used for all generations; the RTL8157 v2 descriptor layout
-/// (Linux `r8157_rx_csum`) is not decoded here.
+/// `r8152_rx_csum`). The RTL8157 v2 descriptor carries the same
+/// verdict in different bit positions — see
+/// [`rx_csum_result_v2`] (Linux `r8157_rx_csum`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RxCsumResult {
     /// The device did not examine L3/L4 (non-IP frame, or no
@@ -1335,6 +1411,115 @@ pub fn rx_csum_result(opts2: u32, opts3: u32) -> RxCsumResult {
     } else {
         RxCsumResult::NotChecked
     }
+}
+
+/// Whether a chip version uses the v2 packet descriptor format
+/// (Linux `rtl_ops_init`: only `RTL_VER_16` — the RTL8157 —
+/// selects `r8157_desc_init`; every other version selects
+/// `r8152_desc_init`). The RTL8159 is documented in the same
+/// upstream series as sharing the v2 format, but Linux master
+/// carries no version id for it, so it is not selected here
+/// until its `PLA_TCR1` id is known.
+pub fn uses_rx_desc_v2(version: RtlVersion) -> bool {
+    matches!(version, RtlVersion::Ver16)
+}
+
+/// Decode the raw frame length from a v2 `rx_desc_v2` `opts1`
+/// word (Linux `r8157_rx_len` / `rx_v2_get_len`): bits 17..31.
+/// The value INCLUDES the trailing FCS (`RX_FCS_LEN`); the
+/// walk strips it before reporting the segment length.
+pub fn rx_len_v2(opts1: u32) -> u32 {
+    (opts1 & RX_V2_LEN_MASK) >> RX_V2_LEN_SHIFT
+}
+
+/// Extract the VLAN tag (TCI) from a v2 `rx_desc_v2` word pair:
+/// `opts1` bit 3 marks a tag (Linux `RX_VLAN_TAG_2`) and the
+/// TCI sits in the HIGH half of `opts2`, byte-swapped (Linux
+/// `r8157_rx_vlan_tag` applies `swab16` to `(opts2 >> 16) &
+/// 0xffff`). Note the two moves from v1: the present-bit left
+/// `opts2` for `opts1`, and the TCI moved from the low half of
+/// `opts2` to the high half.
+pub fn rx_vlan_tag_v2(opts1: u32, opts2: u32) -> Option<u16> {
+    if opts1 & RX_V2_VLAN_TAG_BIT != 0 {
+        Some((((opts2 >> 16) & 0xFFFF) as u16).swap_bytes())
+    } else {
+        None
+    }
+}
+
+/// Decode the RX checksum verdict from a v2 `rx_desc_v2`
+/// `opts3` word, mirroring Linux `r8157_rx_csum` with the same
+/// fail-closed deviation as [`rx_csum_result`]: Linux's
+/// `CHECKSUM_NONE` conflates "checked and failed" with "not
+/// checked" (both go to the stack, which re-verifies in
+/// software). NARF's stack has no RX software-verification
+/// consumer, so this function must distinguish them — any
+/// checked protocol failed means `Bad`, even when Linux's
+/// first branch (IPv4 examined + IP fail) would return `NONE`
+/// before looking at a passing L4 result. All report and fail
+/// bits live in `opts3` here (v1 splits them across `opts2` /
+/// `opts3`); fail bits for protocols the device did not mark
+/// checked are ignored, as in Linux.
+pub fn rx_csum_result_v2(opts3: u32) -> RxCsumResult {
+    if opts3 & (RD_IPV4_CS_V2 | RD_IPV6_CS_V2) == 0 {
+        return RxCsumResult::NotChecked;
+    }
+    let ip_fail = opts3 & RD_IPV4_CS_V2 != 0 && opts3 & RX_IPF_V2 != 0;
+    let l4_fail = (opts3 & RD_UDP_CS_V2 != 0 && opts3 & RX_UDPF_V2 != 0)
+        || (opts3 & RD_TCP_CS_V2 != 0 && opts3 & RX_TCPF_V2 != 0);
+    if ip_fail || l4_fail {
+        return RxCsumResult::Bad {
+            ip: ip_fail,
+            l4: l4_fail,
+        };
+    }
+    let l4_ok = (opts3 & RD_UDP_CS_V2 != 0 && opts3 & RX_UDPF_V2 == 0)
+        || (opts3 & RD_TCP_CS_V2 != 0 && opts3 & RX_TCPF_V2 == 0);
+    if l4_ok {
+        RxCsumResult::Good
+    } else {
+        RxCsumResult::NotChecked
+    }
+}
+
+/// Walk an RTL8157 (v2) RX aggregation buffer into its frames,
+/// mirroring Linux's `rx_bottom` walk with `r8157_desc_init`'s
+/// geometry: 16-byte descriptors, the length field counting
+/// frame + FCS (stripped here, so `RxSegment.len` stays
+/// "delivered frame bytes"), and the next descriptor at the
+/// next 16-byte boundary. Stops at the first segment whose
+/// length field is implausible (< `RX_MIN_FRAME` including the
+/// FCS, or running past the buffer) — the stream cannot be
+/// resynced past a bad descriptor.
+///
+/// This walk deliberately does NOT share the v1 walk's
+/// frame-bytes-only convention: the v1 walk treats the length
+/// field as delivered bytes with no FCS strip and no
+/// inter-segment alignment, which is a pre-existing divergence
+/// from Linux's walk (see the remainder in the PR body). The
+/// v2 walk follows the evidence — a v2 fixture built the v1
+/// way would agree with a wrong walk and pass while real
+/// silicon would fail.
+pub fn parse_rx_aggregate_v2(buf: &[u8]) -> Vec<RxSegment> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + RX_DESC_V2_LEN <= buf.len() {
+        let opts1 = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let opts2 = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+        let opts3 = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
+        let pkt_len = rx_len_v2(opts1) as usize;
+        if pkt_len < RX_MIN_FRAME as usize || off + RX_DESC_V2_LEN + pkt_len > buf.len() {
+            break;
+        }
+        out.push(RxSegment {
+            offset: off + RX_DESC_V2_LEN,
+            len: pkt_len - RX_FCS_LEN,
+            vlan_tag: rx_vlan_tag_v2(opts1, opts2),
+            csum: rx_csum_result_v2(opts3),
+        });
+        off = (off + RX_DESC_V2_LEN + pkt_len + RX_DESC_V2_ALIGN - 1) & !(RX_DESC_V2_ALIGN - 1);
+    }
+    out
 }
 
 /// Whether an IPv4/UDP frame carries a zero UDP checksum field,
@@ -1463,6 +1648,28 @@ pub fn build_tx_segment(frame: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
     Ok(())
 }
 
+/// Append one v2 TX segment (`tx_desc_v2` + frame, padded to a
+/// 16-byte multiple) for `frame` to `out` — the RTL8157 form
+/// (Linux `r8157_tx_len` + `r8152_tx_csum`): `opts1`/`opts2`
+/// are laid out exactly as in v1 (length + FS/LS, no offload),
+/// then `opts3 = len << 4` and `opts4 = TX_SIG`. A `plain`
+/// meta produces exactly `build_tx_segment_meta_v2`'s bytes.
+pub fn build_tx_segment_v2(frame: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
+    if frame.len() > TX_LEN_MASK as usize {
+        return Err(());
+    }
+    let opts1 = (frame.len() as u32 & TX_LEN_MASK) | TX_FS | TX_LS;
+    out.extend_from_slice(&opts1.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // opts2: no csum offload
+    out.extend_from_slice(&((frame.len() as u32) << TX_V2_LEN_SHIFT).to_le_bytes()); // opts3
+    out.extend_from_slice(&TX_V2_SIG.to_le_bytes()); // opts4
+    out.extend_from_slice(frame);
+    while out.len() % TX_DESC_V2_ALIGN != 0 {
+        out.push(0);
+    }
+    Ok(())
+}
+
 /// What the TX offload encoder needs from a frame's headers:
 /// IP version, L4 protocol, and the transport-header offset
 /// (the value the descriptor's TCPHO/GTTCPHO fields carry).
@@ -1527,29 +1734,19 @@ pub fn tx_l3_info(frame: &[u8]) -> Option<TxL3Info> {
     }
 }
 
-/// Append one TX segment honouring `meta` (Linux `r8152_tx_csum`
-/// + `r8152_tx_vlan_tag` for the v1 descriptor):
-/// - `vlan_tag`: `opts2 = TX_VLAN_TAG | swab16(tag)`.
-/// - `csum_l4` (no TSO): IPV4/IPV6_CS + TCP/UDP_CS +
-///   `transport_offset << TCPHO_SHIFT`. SCTP is rejected
-///   (the chip has no SCTP offload); a csum request whose
-///   protocol does not match the frame, or whose frame is
-///   unparseable, is rejected — never silently sent with a
-///   partial checksum.
-/// - `tso_mss`: GTSENDV4/GTSENDV6 + `transport_offset <<
-///   GTTCPHO_SHIFT` + `min(mss, MSS_MAX) << MSS_SHIFT`
-///   (Linux clamps the MSS). Non-TCP frames are rejected;
-///   frames the hardware cannot encode (transport offset
-///   past `GTTCPHO_MAX`, or longer than `TX_LEN_MASK`) are
-///   rejected here — the send path falls back to software GSO
-///   for TCP frames it cannot encode.
-///
-/// A `plain` meta produces exactly `build_tx_segment`'s bytes.
-pub fn build_tx_segment_meta(
-    frame: &[u8],
-    meta: narf_net::TxMeta,
-    out: &mut Vec<u8>,
-) -> Result<(), ()> {
+/// Compute the shared `opts1` / `opts2` pair for one TX
+/// segment from `meta` (Linux `r8152_tx_csum`): the `opts1` /
+/// `opts2` layout is identical in the v1 and v2 descriptors
+/// (same offsets, same bits — Linux's v2 path delegates to the
+/// shared `r8152_tx_csum` for these words). Only the
+/// non-GSO checksum transport-offset cap differs per
+/// generation: v1 `TX_TCPHO_MAX`, v2 `TX_TCPHO_MAX_V2`
+/// (Linux `r8157_tx_csum` enforces the tighter cap before
+/// delegating); the TSO cap (`TX_GTTCPHO_MAX`) is the same for
+/// both. Rejection rules match [`build_tx_segment_meta`]:
+/// SCTP, protocol/frame mismatches, and unparseable frames are
+/// rejected — never silently sent with a partial checksum.
+fn tx_desc_opts(frame: &[u8], meta: narf_net::TxMeta, tcpho_max: u32) -> Result<(u32, u32), ()> {
     if frame.len() > TX_LEN_MASK as usize {
         return Err(());
     }
@@ -1576,17 +1773,71 @@ pub fn build_tx_segment_meta(
             narf_net::L4CsumKind::Sctp => return Err(()),
         };
         let info = tx_l3_info(frame).ok_or(())?;
-        if info.protocol != want || info.transport_offset as u32 > TX_TCPHO_MAX {
+        if info.protocol != want || info.transport_offset as u32 > tcpho_max {
             return Err(());
         }
         opts2 |= if info.is_ipv4 { TX_IPV4_CS } else { TX_IPV6_CS }
             | if want == 6 { TX_TCP_CS } else { TX_UDP_CS }
             | ((info.transport_offset as u32) << TX_TCPHO_SHIFT);
     }
+    Ok((opts1, opts2))
+}
+
+/// Append one TX segment honouring `meta` (Linux `r8152_tx_csum`
+/// + `r8152_tx_vlan_tag` for the v1 descriptor):
+/// - `vlan_tag`: `opts2 = TX_VLAN_TAG | swab16(tag)`.
+/// - `csum_l4` (no TSO): IPV4/IPV6_CS + TCP/UDP_CS +
+///   `transport_offset << TCPHO_SHIFT`. SCTP is rejected
+///   (the chip has no SCTP offload); a csum request whose
+///   protocol does not match the frame, or whose frame is
+///   unparseable, is rejected — never silently sent with a
+///   partial checksum.
+/// - `tso_mss`: GTSENDV4/GTSENDV6 + `transport_offset <<
+///   GTTCPHO_SHIFT` + `min(mss, MSS_MAX) << MSS_SHIFT`
+///   (Linux clamps the MSS). Non-TCP frames are rejected;
+///   frames the hardware cannot encode (transport offset
+///   past `GTTCPHO_MAX`, or longer than `TX_LEN_MASK`) are
+///   rejected here — the send path falls back to software GSO
+///   for TCP frames it cannot encode.
+///
+/// A `plain` meta produces exactly `build_tx_segment`'s bytes.
+pub fn build_tx_segment_meta(
+    frame: &[u8],
+    meta: narf_net::TxMeta,
+    out: &mut Vec<u8>,
+) -> Result<(), ()> {
+    let (opts1, opts2) = tx_desc_opts(frame, meta, TX_TCPHO_MAX)?;
     out.extend_from_slice(&opts1.to_le_bytes());
     out.extend_from_slice(&opts2.to_le_bytes());
     out.extend_from_slice(frame);
     while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    Ok(())
+}
+
+/// Append one v2 TX segment honouring `meta` — the RTL8157 form
+/// (Linux `r8157_tx_csum` + `r8157_tx_len`): `opts1`/`opts2`
+/// are exactly the v1 words from [`tx_desc_opts`] (same offload
+/// bits, same VLAN encoding), then `opts3 = len << 4` and
+/// `opts4 = TX_SIG`, and the segment pads to a 16-byte
+/// multiple. The one behavioural difference from v1 is the
+/// tighter non-GSO checksum transport-offset cap
+/// (`TX_TCPHO_MAX_V2` = 0x3FF); the TSO cap is unchanged.
+///
+/// A `plain` meta produces exactly `build_tx_segment_v2`'s bytes.
+pub fn build_tx_segment_meta_v2(
+    frame: &[u8],
+    meta: narf_net::TxMeta,
+    out: &mut Vec<u8>,
+) -> Result<(), ()> {
+    let (opts1, opts2) = tx_desc_opts(frame, meta, TX_TCPHO_MAX_V2)?;
+    out.extend_from_slice(&opts1.to_le_bytes());
+    out.extend_from_slice(&opts2.to_le_bytes());
+    out.extend_from_slice(&((frame.len() as u32) << TX_V2_LEN_SHIFT).to_le_bytes());
+    out.extend_from_slice(&TX_V2_SIG.to_le_bytes());
+    out.extend_from_slice(frame);
+    while out.len() % TX_DESC_V2_ALIGN != 0 {
         out.push(0);
     }
     Ok(())
@@ -2144,8 +2395,24 @@ fn rtl_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<()
     }
     let (slot_id, bulk_out_dci) = tx_target(idx).ok_or(())?;
     let controller = RTL_DEVICES.lock().get(idx).ok_or(())?.controller;
+    // RTL8157 (VER_16) speaks the v2 TX descriptor format;
+    // every other version speaks v1. The builders differ in
+    // descriptor length, the opts3/opts4 tail, padding, and
+    // the checksum transport-offset cap.
+    let v2 = RTL_DEVICES
+        .lock()
+        .get(idx)
+        .map(|d| uses_rx_desc_v2(d.version))
+        .unwrap_or(false);
+    let build = |frame: &[u8], meta: narf_net::TxMeta, seg: &mut Vec<u8>| -> Result<(), ()> {
+        if v2 {
+            build_tx_segment_meta_v2(frame, meta, seg)
+        } else {
+            build_tx_segment_meta(frame, meta, seg)
+        }
+    };
     let mut seg = Vec::new();
-    if build_tx_segment_meta(frame, meta, &mut seg).is_ok() {
+    if build(frame, meta, &mut seg).is_ok() {
         return rtl_send_segment(controller, slot_id, bulk_out_dci, &seg);
     }
     // Hardware encode failed. Only TCP super-frames get the
@@ -2167,7 +2434,7 @@ fn rtl_send_frame(idx: usize, frame: &[u8], meta: narf_net::TxMeta) -> Result<()
     };
     for s in &segments {
         let mut seg = Vec::new();
-        build_tx_segment_meta(s, seg_meta, &mut seg)?;
+        build(s, seg_meta, &mut seg)?;
         rtl_send_segment(controller, slot_id, bulk_out_dci, &seg)?;
     }
     Ok(())
@@ -2482,11 +2749,22 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
                 errors = 0;
                 let dev = {
                     let g = RTL_DEVICES.lock();
-                    g.get(idx).map(|d| (d.iface_name.clone(), d.hub_port))
+                    g.get(idx)
+                        .map(|d| (d.iface_name.clone(), d.hub_port, d.version))
                 };
-                if let Some((name, hub_port)) = dev {
+                if let Some((name, hub_port, version)) = dev {
                     let mut delivered = 0usize;
-                    for seg in parse_rx_aggregate(&buf[..n]) {
+                    // RTL8157 (VER_16) speaks the v2 descriptor
+                    // format; every other version speaks v1. The
+                    // two walks differ in stride, length
+                    // semantics, and checksum bit positions, so
+                    // the wrong parser desyncs the stream.
+                    let segs = if uses_rx_desc_v2(version) {
+                        parse_rx_aggregate_v2(&buf[..n])
+                    } else {
+                        parse_rx_aggregate(&buf[..n])
+                    };
+                    for seg in segs {
                         let raw = &buf[seg.offset..seg.offset + seg.len];
                         // With CPCR_RX_VLAN / RCR1 VLAN enabled
                         // at bind, the chip strips a VLAN tag
@@ -3189,6 +3467,304 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_rx_aggregate_csum_carriage);
+
+    /// One v2 RX segment, built from the Linux `rx_desc_v2`
+    /// format (never from the parser under test): 16-byte
+    /// descriptor, length in `opts1` bits 17..31 counting
+    /// frame + FCS, VLAN present-bit in `opts1` with the TCI
+    /// in the high half of `opts2`, checksum report/fail bits
+    /// in `opts3`; frame bytes, then a 4-byte FCS marker, then
+    /// zero pad to the next 16-byte boundary.
+    fn push_v2_seg(buf: &mut Vec<u8>, frame: &[u8], opts1_extra: u32, opts2: u32, opts3: u32) {
+        let pkt_len = frame.len() + RX_FCS_LEN;
+        let opts1 = ((pkt_len as u32) << RX_V2_LEN_SHIFT) | opts1_extra;
+        buf.extend_from_slice(&opts1.to_le_bytes());
+        buf.extend_from_slice(&opts2.to_le_bytes());
+        buf.extend_from_slice(&opts3.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]); // opts4
+        buf.extend_from_slice(frame);
+        buf.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // FCS marker
+        while buf.len() % RX_DESC_V2_ALIGN != 0 {
+            buf.push(0);
+        }
+    }
+
+    fn smoke_r8152_rx_v2_decode() -> TestResult {
+        // Length: bits 17..31, low bits ignored.
+        if rx_len_v2((104u32 << RX_V2_LEN_SHIFT) | 0x2) != 104 {
+            return TestResult::Fail("v2 length decode wrong");
+        }
+        // VLAN: present-bit in opts1, TCI in the HIGH half of
+        // opts2, byte-swapped (0x0064 <-> 0x6400).
+        if rx_vlan_tag_v2(RX_V2_VLAN_TAG_BIT, 0x6400_0000) != Some(0x0064) {
+            return TestResult::Fail("v2 VLAN tag decode wrong");
+        }
+        if rx_vlan_tag_v2(0, 0x6400_0000).is_some() {
+            return TestResult::Fail("v2 tag bit clear must mean no tag");
+        }
+        // A v1-shaped VLAN word must NOT decode as v2: v1 puts
+        // the present-bit in opts2 bit 16 and the TCI in the
+        // low half — both are the wrong places for v2.
+        if rx_vlan_tag_v2(0, RX_VLAN_TAG_BIT | 0x6400).is_some() {
+            return TestResult::Fail("v1 VLAN word must not decode as v2");
+        }
+        // Checksum verdicts, all bits in opts3.
+        if rx_csum_result_v2(0) != RxCsumResult::NotChecked
+            || rx_csum_result_v2(RD_IPV4_CS_V2 | RD_TCP_CS_V2) != RxCsumResult::Good
+            || rx_csum_result_v2(RD_IPV6_CS_V2 | RD_UDP_CS_V2) != RxCsumResult::Good
+            || rx_csum_result_v2(RD_IPV4_CS_V2) != RxCsumResult::NotChecked
+            || rx_csum_result_v2(RX_TCPF_V2) != RxCsumResult::NotChecked
+        {
+            return TestResult::Fail("v2 csum good/unchecked verdicts wrong");
+        }
+        if rx_csum_result_v2(RD_IPV4_CS_V2 | RD_TCP_CS_V2 | RX_TCPF_V2)
+            != (RxCsumResult::Bad {
+                ip: false,
+                l4: true,
+            })
+            || rx_csum_result_v2(RD_IPV6_CS_V2 | RD_UDP_CS_V2 | RX_UDPF_V2)
+                != (RxCsumResult::Bad {
+                    ip: false,
+                    l4: true,
+                })
+            || rx_csum_result_v2(RD_IPV4_CS_V2 | RX_IPF_V2)
+                != (RxCsumResult::Bad {
+                    ip: true,
+                    l4: false,
+                })
+        {
+            return TestResult::Fail("v2 csum bad verdicts wrong");
+        }
+        // Fail-closed deviation from Linux: IPv4 + IP fail is
+        // Bad even when an L4 check passed (Linux's first
+        // branch returns NONE before looking at L4).
+        if rx_csum_result_v2(RD_IPV4_CS_V2 | RX_IPF_V2 | RD_TCP_CS_V2)
+            != (RxCsumResult::Bad {
+                ip: true,
+                l4: false,
+            })
+        {
+            return TestResult::Fail("v2 IP-fail must dominate a passing L4");
+        }
+        // Version selection: only VER_16 (RTL8157) speaks v2.
+        if !uses_rx_desc_v2(RtlVersion::Ver16)
+            || uses_rx_desc_v2(RtlVersion::Ver15)
+            || uses_rx_desc_v2(RtlVersion::Ver10)
+            || uses_rx_desc_v2(RtlVersion::Unknown)
+            || version_from_tcr1(0x1030) != RtlVersion::Ver16
+        {
+            return TestResult::Fail("v2 version selection wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_rx_v2_decode);
+
+    fn smoke_r8152_rx_aggregate_walk_v2() -> TestResult {
+        // Three frames, then a runt descriptor. The 100-byte
+        // frame forces the 16-byte alignment step (its segment
+        // ends at offset 200, the next descriptor sits at 208);
+        // a walk without the alignment would read the pad as a
+        // descriptor and stop after two frames.
+        let f1 = datagram_frame(60, 0xA5);
+        let f2 = datagram_frame(100, 0x3C);
+        let f3 = datagram_frame(61, 0x77);
+        let mut buf = alloc::vec::Vec::new();
+        push_v2_seg(
+            &mut buf,
+            &f1,
+            RX_V2_VLAN_TAG_BIT,
+            0x6400_0000,
+            RD_IPV4_CS_V2 | RD_TCP_CS_V2,
+        );
+        push_v2_seg(&mut buf, &f2, 0, 0, 0);
+        push_v2_seg(&mut buf, &f3, 0, 0, 0);
+        // Runt descriptor: length 10 < ETH_ZLEN.
+        buf.extend_from_slice(&((10u32) << RX_V2_LEN_SHIFT).to_le_bytes());
+        buf.extend_from_slice(&[0u8; 12]);
+        buf.extend_from_slice(&[0u8; 10]);
+        let segs = parse_rx_aggregate_v2(&buf);
+        if segs.len() != 3 {
+            return TestResult::Fail("v2 aggregate walk yielded wrong frame count");
+        }
+        // seg0: desc [0..16), frame [16..76), FCS [76..80).
+        // seg1: desc [80..96), frame [96..196), FCS [196..200),
+        // pad [200..208). seg2: desc [208..224), frame
+        // [224..285), FCS [285..289).
+        if segs[0]
+            != (RxSegment {
+                offset: RX_DESC_V2_LEN,
+                len: 60,
+                vlan_tag: Some(0x0064),
+                csum: RxCsumResult::Good,
+            })
+        {
+            return TestResult::Fail("v2 first segment location/verdict wrong");
+        }
+        if segs[1]
+            != (RxSegment {
+                offset: 96,
+                len: 100,
+                vlan_tag: None,
+                csum: RxCsumResult::NotChecked,
+            })
+        {
+            return TestResult::Fail("v2 second segment location wrong");
+        }
+        if segs[2]
+            != (RxSegment {
+                offset: 224,
+                len: 61,
+                vlan_tag: None,
+                csum: RxCsumResult::NotChecked,
+            })
+        {
+            return TestResult::Fail("v2 third segment location wrong");
+        }
+        // Delivered bytes are the frames only — the FCS marker
+        // is stripped, never handed to the stack.
+        if &buf[segs[0].offset..segs[0].offset + segs[0].len] != f1.as_slice()
+            || &buf[segs[1].offset..segs[1].offset + segs[1].len] != f2.as_slice()
+            || &buf[segs[2].offset..segs[2].offset + segs[2].len] != f3.as_slice()
+        {
+            return TestResult::Fail("v2 segment payload bytes wrong");
+        }
+        if buf[segs[0].offset + segs[0].len..segs[0].offset + segs[0].len + 4]
+            != [0xDE, 0xAD, 0xBE, 0xEF]
+        {
+            return TestResult::Fail("v2 FCS marker not where the length says");
+        }
+        // The v1 parser on the same buffer must NOT reproduce
+        // these segments: v2 opts1 low bits read as length 0,
+        // so it stops immediately. This pins that the layouts
+        // actually differ — the finding this issue verifies.
+        if !parse_rx_aggregate(&buf).is_empty() {
+            return TestResult::Fail("v1 parser must not walk a v2 buffer");
+        }
+        // Truncated tail: length field runs past the buffer.
+        let mut bad = alloc::vec::Vec::new();
+        bad.extend_from_slice(&((500u32) << RX_V2_LEN_SHIFT).to_le_bytes());
+        bad.extend_from_slice(&[0u8; 12]);
+        bad.extend_from_slice(&[0u8; 60]);
+        if !parse_rx_aggregate_v2(&bad).is_empty() {
+            return TestResult::Fail("v2 over-long segment not rejected");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_rx_aggregate_walk_v2);
+
+    fn smoke_r8152_tx_segment_v2() -> TestResult {
+        let frame = datagram_frame(61, 0x5A);
+        let mut out = Vec::new();
+        if build_tx_segment_v2(&frame, &mut out).is_err() {
+            return TestResult::Fail("clean v2 frame rejected");
+        }
+        // 16-byte desc + 61-byte frame = 77, padded to 80.
+        if out.len() != 80 {
+            return TestResult::Fail("v2 TX segment padding wrong");
+        }
+        let opts1 = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        let opts2 = u32::from_le_bytes(out[4..8].try_into().unwrap());
+        let opts3 = u32::from_le_bytes(out[8..12].try_into().unwrap());
+        let opts4 = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        if opts1 != 61 | TX_FS | TX_LS {
+            return TestResult::Fail("v2 TX opts1 wrong");
+        }
+        if opts2 != 0 {
+            return TestResult::Fail("v2 TX opts2 not zero");
+        }
+        if opts3 != 61 << TX_V2_LEN_SHIFT {
+            return TestResult::Fail("v2 TX opts3 length wrong");
+        }
+        if opts4 != TX_V2_SIG {
+            return TestResult::Fail("v2 TX opts4 signature wrong");
+        }
+        if out[16..77] != frame[..] || out[77..] != [0, 0, 0] {
+            return TestResult::Fail("v2 TX payload/padding bytes wrong");
+        }
+        // Oversize frame (> TX_LEN_MASK) refused.
+        let big = datagram_frame(TX_LEN_MASK as usize + 1, 0);
+        if build_tx_segment_v2(&big, &mut Vec::new()).is_ok() {
+            return TestResult::Fail("v2 oversize frame accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_tx_segment_v2);
+
+    fn smoke_r8152_tx_segment_meta_v2() -> TestResult {
+        let frame = ipv4_tcp_frame(10);
+        // Plain meta reproduces build_tx_segment_v2 byte for byte.
+        let mut plain_meta = Vec::new();
+        let mut plain = Vec::new();
+        if build_tx_segment_meta_v2(&frame, narf_net::TxMeta::plain(), &mut plain_meta).is_err()
+            || build_tx_segment_v2(&frame, &mut plain).is_err()
+            || plain_meta != plain
+        {
+            return TestResult::Fail("v2 plain meta must match the plain builder");
+        }
+        // VLAN insert: opts2 = TAG_BIT | swab16(0x1234), with
+        // the v2 opts3/opts4 tail.
+        let mut out = Vec::new();
+        let meta = narf_net::TxMeta {
+            vlan_tag: Some(0x1234),
+            ..narf_net::TxMeta::plain()
+        };
+        if build_tx_segment_meta_v2(&frame, meta, &mut out).is_err() {
+            return TestResult::Fail("v2 VLAN frame rejected");
+        }
+        let opts2 = u32::from_le_bytes(out[4..8].try_into().unwrap());
+        let opts3 = u32::from_le_bytes(out[8..12].try_into().unwrap());
+        let opts4 = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        if opts2 != TX_VLAN_TAG_BIT | 0x3412 {
+            return TestResult::Fail("v2 VLAN opts2 wrong");
+        }
+        if opts3 != (frame.len() as u32) << TX_V2_LEN_SHIFT || opts4 != TX_V2_SIG {
+            return TestResult::Fail("v2 VLAN tail wrong");
+        }
+        // IPv4/TCP checksum offload: IPV4_CS | TCP_CS | 34<<17.
+        let mut out = Vec::new();
+        let meta = narf_net::TxMeta::with_csum(narf_net::L4CsumKind::Tcp);
+        if build_tx_segment_meta_v2(&frame, meta, &mut out).is_err() {
+            return TestResult::Fail("v2 csum frame rejected");
+        }
+        let opts2 = u32::from_le_bytes(out[4..8].try_into().unwrap());
+        if opts2 != TX_IPV4_CS | TX_TCP_CS | (34 << TX_TCPHO_SHIFT) {
+            return TestResult::Fail("v2 csum opts2 wrong");
+        }
+        // Hardware TSO: GTSENDV4 + 34<<18 in opts1, 1460<<17
+        // in opts2 — the TSO cap is unchanged from v1.
+        let mut out = Vec::new();
+        let meta = narf_net::TxMeta::with_tso(1460);
+        if build_tx_segment_meta_v2(&frame, meta, &mut out).is_err() {
+            return TestResult::Fail("v2 TSO frame rejected");
+        }
+        let opts1 = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        let opts2 = u32::from_le_bytes(out[4..8].try_into().unwrap());
+        let len = frame.len() as u32;
+        if opts1 != len | TX_FS | TX_LS | TX_GTSENDV4 | (34 << TX_GTTCPHO_SHIFT) {
+            return TestResult::Fail("v2 TSO opts1 wrong");
+        }
+        if opts2 != 1460 << TX_MSS_SHIFT {
+            return TestResult::Fail("v2 TSO opts2 wrong");
+        }
+        // The v2 checksum transport-offset cap is tighter than
+        // v1's (0x3FF vs 0x7FF); the constant pins the Linux
+        // `TCPHO_MAX_2` value the encoder enforces.
+        if TX_TCPHO_MAX_V2 != 0x3FF || TX_TCPHO_MAX_V2 >= TX_TCPHO_MAX {
+            return TestResult::Fail("v2 TCPHO cap wrong");
+        }
+        // Rejection: SCTP csum is rejected, as in v1.
+        if build_tx_segment_meta_v2(
+            &frame,
+            narf_net::TxMeta::with_csum(narf_net::L4CsumKind::Sctp),
+            &mut Vec::new(),
+        )
+        .is_ok()
+        {
+            return TestResult::Fail("v2 SCTP offload must be rejected");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_tx_segment_meta_v2);
 
     fn smoke_r8152_tx_segment_build() -> TestResult {
         let frame = datagram_frame(61, 0x5A);
