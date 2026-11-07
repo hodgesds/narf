@@ -4,7 +4,7 @@
 //! layout sourced from the public Intel 82599 / X540 / X550
 //! datasheets. No GPL Linux source consulted.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -178,6 +178,14 @@ pub const ADVTXD_VLAN_SHIFT: u32 = 16;
 /// Non-TSO frame cap (existing behavior: MTU-sized frames only;
 /// jumbo is a separate issue).
 pub const TX_LEN_MAX: usize = 1518;
+
+/// TX watchdog timeout (Linux `dev->watchdog_timeo` is 5 s by
+/// default, and igc's supervisor uses the same 5 s): a TX
+/// descriptor posted longer ago than this with DD still clear is
+/// a wedged ring, not congestion.
+const TX_TIMEOUT_NS: u64 = 5_000_000_000;
+/// Watchdog supervisor cadence, matching igc's 10 ms maintenance tick.
+const TX_WATCHDOG_POLL_NS: u64 = 10_000_000;
 /// TSO frame cap for `tx()`: the per-slot copy buffer is 4096
 /// bytes (see bring_up), so a copied TSO superframe cannot run
 /// longer. Advertised as `max_tso_bytes` (see probe).
@@ -492,6 +500,12 @@ pub(crate) struct TxQueueState {
     /// on return). Indexed by descriptor slot.
     pub(crate) tx_pool: Vec<DmaBuffer>,
     pub(crate) tx_tail: IrqSafeSpinLock<u32>,
+    /// Cycle counter at which each TX slot was posted (`0` = no
+    /// descriptor outstanding), indexed by descriptor slot. The
+    /// watchdog treats an aged entry as a wedged ring. Stamped by
+    /// `tx_on_queue` / `tx_frame_on_queue` after the TDT doorbell,
+    /// cleared when the slot's DD bit sets.
+    pub(crate) tx_posted_at: IrqSafeSpinLock<Vec<u64>>,
 }
 
 impl core::fmt::Debug for TxQueueState {
@@ -518,6 +532,26 @@ impl core::fmt::Debug for RxQueueState {
         f.debug_struct("RxQueueState")
             .field("rx_slots_len", &self.rx_slots.lock().len())
             .finish_non_exhaustive()
+    }
+}
+
+/// True when any posted TX descriptor has waited longer than
+/// `timeout` cycles with DD still clear — the ring is wedged (igc
+/// `Queue::stalled` shape, per-slot so a later post cannot mask
+/// an older stuck one). Factored pure so the fixture pins the
+/// decision the watchdog uses.
+fn tx_stalled(posted_at: &[u64], now: u64, timeout: u64) -> bool {
+    posted_at
+        .iter()
+        .any(|&posted| posted != 0 && now.wrapping_sub(posted) > timeout)
+}
+
+/// Clear a slot's post time only if it still holds the stamp this
+/// post recorded: a later post to the same slot (after wraparound)
+/// must not have its stamp wiped by the earlier post's completion.
+fn tx_note_completed(posted_at: &mut [u64], slot: usize, stamped: u64) {
+    if posted_at[slot] == stamped {
+        posted_at[slot] = 0;
     }
 }
 
@@ -590,6 +624,25 @@ pub struct Ixgbe {
     /// True while the datapath is quiesced (suspend/detach): tx/rx
     /// paths refuse work instead of feeding a stopped device.
     pub quiesced: IrqSafeSpinLock<bool>,
+    /// TX stall recoveries (Linux `tx_timeout_count`): incremented
+    /// by the watchdog supervisor when it fires `recover()` on a
+    /// ring stalled 5 s, mirroring igc's `tx_timeouts`.
+    tx_timeouts: AtomicU64,
+    /// Controller resets performed by [`Ixgbe::recover`].
+    tx_resets: AtomicU64,
+    /// Set while [`Ixgbe::recover`] owns the reset sequence: TX
+    /// posts fail fast instead of racing the ring reprogram (a post
+    /// landing mid-reset could be zeroed with the stale ring or
+    /// never rung).
+    recovering: AtomicBool,
+    /// TX ring epoch, advanced by [`Ixgbe::recover`] on every
+    /// recovery. A `tx_on_queue` / `tx_frame_on_queue` whose DD
+    /// poll straddles a reset sees DD set because the reset zeroed
+    /// the ring and a later frame completed on the reused slot —
+    /// not because its frame went out. The epoch distinguishes a
+    /// real completion from a reset, so that caller reports
+    /// `TxTimeout` instead of a success it did not earn.
+    tx_epoch: AtomicU64,
     /// Stage 5: MSI-X table once enabled.
     pub(crate) msix: Option<MsixTable>,
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -816,6 +869,7 @@ impl Ixgbe {
                 tx_ring,
                 tx_pool,
                 tx_tail: IrqSafeSpinLock::new(0),
+                tx_posted_at: IrqSafeSpinLock::new(alloc::vec![0u64; ring_len]),
             });
         }
 
@@ -907,6 +961,10 @@ impl Ixgbe {
             eee_state: IrqSafeSpinLock::new(None),
             wol_board_cap: IrqSafeSpinLock::new(wol::WolBoardCap::default()),
             quiesced: IrqSafeSpinLock::new(false),
+            tx_timeouts: AtomicU64::new(0),
+            tx_resets: AtomicU64::new(0),
+            recovering: AtomicBool::new(false),
+            tx_epoch: AtomicU64::new(0),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -939,6 +997,11 @@ impl Ixgbe {
     pub fn tx_on_queue(&self, q: usize, frame: &[u8], meta: &TxMeta) -> Result<(), IxgbeError> {
         if *self.quiesced.lock() {
             return Err(IxgbeError::Other("device quiesced"));
+        }
+        // Fail fast while recovery owns the reset sequence: a post
+        // landing mid-reset could be zeroed with the stale ring.
+        if self.recovering.load(Ordering::Acquire) {
+            return Err(IxgbeError::Other("ixgbe TX recovery in progress"));
         }
         let queue = self
             .tx_queues
@@ -1007,6 +1070,18 @@ impl Ixgbe {
         *tail_g = next_tail;
         drop(tail_g);
 
+        // Post time for the watchdog (see `tx_stalled`): stamped
+        // once the TDT doorbell has rung, on the data descriptor's
+        // slot (a context descriptor, when present, occupies the
+        // tail slot and carries no DD write-back).
+        let stamped = narf_time::now_cycles();
+        queue.tx_posted_at.lock()[data_slot] = stamped;
+        // TX epoch at post time: if a watchdog recovery resets the
+        // ring while this poll runs, a later frame's DD on the
+        // reused slot can read set — the epoch check below keeps
+        // that from reporting as a completion.
+        let epoch = self.tx_epoch.load(Ordering::Acquire);
+
         // Poll DD: olinfo's low 4 bits of [3:0] (status) carry DD.
         // Advanced write-back lays status at olinfo[3:0]
         // (§7.2.3.2.4 write-back layout). 250 ms wall-clock budget
@@ -1018,6 +1093,20 @@ impl Ixgbe {
         );
         if !done {
             return Err(IxgbeError::TxTimeout);
+        }
+        // A reset during the poll zeroes the ring, so a later
+        // frame's DD on the reused slot can read set even though
+        // this frame never went out: the epoch distinguishes a real
+        // completion from a reset.
+        if epoch != self.tx_epoch.load(Ordering::Acquire) {
+            return Err(IxgbeError::TxTimeout);
+        }
+        // DD set: the descriptor completed, so its post time is
+        // void (conditional clear — a later post to this slot must
+        // keep its own stamp).
+        {
+            let mut posted = queue.tx_posted_at.lock();
+            tx_note_completed(&mut posted, data_slot, stamped);
         }
         // (no scratch drop — buffer is persistent in tx_pool)
         Ok(())
@@ -1042,6 +1131,11 @@ impl Ixgbe {
     pub fn tx_frame_on_queue(&self, q: usize, frame: &Frame) -> Result<(), IxgbeError> {
         if *self.quiesced.lock() {
             return Err(IxgbeError::Other("device quiesced"));
+        }
+        // Fail fast while recovery owns the reset sequence (see
+        // `tx_on_queue`).
+        if self.recovering.load(Ordering::Acquire) {
+            return Err(IxgbeError::Other("ixgbe TX recovery in progress"));
         }
         let queue = self
             .tx_queues
@@ -1116,6 +1210,15 @@ impl Ixgbe {
         *tail_g = next_tail;
         drop(tail_g);
 
+        // Post time for the watchdog (see `tx_on_queue`): stamped
+        // once the TDT doorbell has rung, on the data descriptor's
+        // slot.
+        let stamped = narf_time::now_cycles();
+        queue.tx_posted_at.lock()[data_slot] = stamped;
+        // TX epoch at post time (see `tx_on_queue`): a reset during
+        // the DD poll must not report as a completion.
+        let epoch = self.tx_epoch.load(Ordering::Acquire);
+
         // Poll DD; the device reads the frame's buffer directly in this window.
         let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
@@ -1124,6 +1227,20 @@ impl Ixgbe {
         );
         if !done {
             return Err(IxgbeError::TxTimeout);
+        }
+        // A reset during the poll zeroes the ring, so a later
+        // frame's DD on the reused slot can read set even though
+        // this frame never went out: the epoch distinguishes a real
+        // completion from a reset.
+        if epoch != self.tx_epoch.load(Ordering::Acquire) {
+            return Err(IxgbeError::TxTimeout);
+        }
+        // DD set: the descriptor completed, so its post time is
+        // void (conditional clear — a later post to this slot must
+        // keep its own stamp).
+        {
+            let mut posted = queue.tx_posted_at.lock();
+            tx_note_completed(&mut posted, data_slot, stamped);
         }
         Ok(())
     }
@@ -1926,6 +2043,316 @@ impl Ixgbe {
         Ok(())
     }
 
+    /// TX stall recoveries (Linux `tx_timeout_count`).
+    pub fn tx_timeouts(&self) -> u64 {
+        self.tx_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Controller resets performed by [`Ixgbe::recover`].
+    pub fn tx_resets(&self) -> u64 {
+        self.tx_resets.load(Ordering::Relaxed)
+    }
+
+    /// One watchdog pass (shared by the supervisor task and the
+    /// fixture): if the link is up and a TX descriptor has waited
+    /// past the timeout, count the timeout and recover. Returns
+    /// true when recovery fired.
+    fn check_tx_watchdog_at(&self, now: u64) -> bool {
+        if *self.quiesced.lock() || self.recovering.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.read_links() & LINKS_UP == 0 {
+            return false;
+        }
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        let stalled = self
+            .tx_queues
+            .iter()
+            .any(|q| tx_stalled(&q.tx_posted_at.lock(), now, timeout));
+        if !stalled {
+            return false;
+        }
+        self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+        self.recover().is_ok()
+    }
+
+    /// TX-timeout recovery (Linux `ixgbe_tx_timeout` +
+    /// `ixgbe_reset` shape): master-reset the MAC, reprogram the
+    /// rings and filters from the bring-up values and the recorded
+    /// feature state, and restart. The TX cursors are reset —
+    /// descriptors posted before the reset will never complete —
+    /// and the RX descriptors are re-primed from the pool. A reset
+    /// that never self-clears reports `ResetTimeout` and leaves
+    /// the device stopped; a concurrent recovery reports `Other`
+    /// without touching the device; a quiesced device refuses
+    /// outright. FCoE state is NOT replayed: `configure_fcoe`
+    /// records only the queue list, not `sriov_pool`, so a
+    /// faithful replay is impossible from recorded state
+    /// (follow-up: record the full `FcoeConfig`). WoL is not
+    /// re-armed either: it only matters across suspend, and
+    /// `resume` does not re-arm it either.
+    pub fn recover(&self) -> Result<(), IxgbeError> {
+        if *self.quiesced.lock() {
+            return Err(IxgbeError::Other("device quiesced"));
+        }
+        if self.recovering.swap(true, Ordering::AcqRel) {
+            return Err(IxgbeError::Other("ixgbe TX recovery already in progress"));
+        }
+        // Advance the TX epoch before the reset: any `tx_on_queue`
+        // / `tx_frame_on_queue` whose DD poll straddles the reset
+        // sees DD set because the reset zeroed the ring and a later
+        // frame completed on the reused slot — the epoch lets it
+        // report `TxTimeout` instead of a success it did not earn.
+        self.tx_epoch.fetch_add(1, Ordering::Release);
+        let result = self.recover_inner();
+        self.recovering.store(false, Ordering::Release);
+        if result.is_ok() {
+            self.tx_resets.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn recover_inner(&self) -> Result<(), IxgbeError> {
+        // Fail-closed preamble (same as `resume`): every
+        // validation runs before any register or ring memory is
+        // touched.
+        let cfg = &self.queue_config;
+        cfg.validate()
+            .map_err(|_| IxgbeError::Other("invalid queue config"))?;
+        if self.tx_queues.len() != cfg.num_tx || self.rx_queues.len() != cfg.num_rx {
+            return Err(IxgbeError::Other("queue count != configured queue count"));
+        }
+        for q in self.tx_queues.iter() {
+            if q.tx_pool.len() != cfg.ring_len {
+                return Err(IxgbeError::Other("tx pool size != ring length"));
+            }
+        }
+        for q in self.rx_queues.iter() {
+            if q.rx_slots.lock().len() != cfg.ring_len {
+                return Err(IxgbeError::Other("rx slot count != ring length"));
+            }
+        }
+        // Snapshot the recorded feature state before touching the
+        // device: the replays below reprogram it after the reset.
+        let vmdq = *self.vmdq_cfg.lock();
+        let rss = self.rss_cfg.lock().clone();
+        let vlan = self.vlan_filter.lock().clone();
+        let dcb = self.dcb_cfg.lock().clone();
+        let eee_enabled = self.eee_state.lock().as_ref().map(|s| s.enabled());
+        // 1. Mask interrupts, stop the receiver at the master
+        // enable, and disable every TX/RX queue.
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            bank.write32(REG_EIMC, 0xFFFF_FFFF);
+            let _ = bank.read32(REG_EICR);
+            bank.clear_bits(REG_RXCTRL, RXCTRL_RXEN);
+            for q in 0..cfg.num_tx {
+                if let Some(tx) = queues::tx_queue_regs(q) {
+                    bank.clear_bits(tx.txdctl, pm::XDCTL_ENABLE_PM);
+                }
+            }
+            for q in 0..cfg.num_rx {
+                if let Some(rx) = queues::rx_queue_regs(q) {
+                    bank.clear_bits(rx.rxdctl, pm::XDCTL_ENABLE_PM);
+                }
+            }
+        }
+        // 2. Master reset — CTRL.LRST | CTRL.RST (bring-up step
+        // 2). Datasheet §4.6.3.1: CTRL.RST self-clears within
+        // 1 ms typical; 100 ms is the wedge threshold.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_CTRL, CTRL_RST_MASK);
+        }
+        let cleared = narf_scheduler::responsive_spin_until(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { self.mmio.read32(REG_CTRL) } & CTRL_RST_MASK == 0,
+            narf_time::Deadline::after_ms(100),
+        );
+        if !cleared {
+            return Err(IxgbeError::ResetTimeout);
+        }
+        // Datasheet §4.6.3.2 — wait ~10 ms for FW handshake
+        // (bring-up step 2 tail).
+        let tsc_hz = narf_time::calibrate_clocks();
+        if tsc_hz > 0 {
+            narf_time::busy_wait_cycles((tsc_hz / 1000) * 10);
+        } else {
+            for _ in 0..1_000_000 {
+                core::hint::spin_loop();
+            }
+        }
+        // 3. Re-mask after reset, and tell firmware the OS driver
+        // is still loaded (bring-up steps 3 + 5).
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_EIMC, 0xFFFF_FFFF);
+            let _ = self.mmio.read32(REG_EICR);
+            let cur = self.mmio.read32(REG_CTRL_EXT);
+            self.mmio
+                .write32(REG_CTRL_EXT, cur | CTRL_EXT_DRV_LOAD | CTRL_EXT_NS_DIS);
+        }
+        // 4. Zero each TX ring: stale descriptors must not reach
+        // the device after re-enable (resume step 1).
+        // SAFETY: identity-mapped DMA ring page.
+        unsafe {
+            for q in self.tx_queues.iter() {
+                for i in 0..(cfg.ring_len * 16) {
+                    core::ptr::write_volatile(q.tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
+                }
+            }
+        }
+        // 5. Re-arm every RX descriptor from the buffer its slot
+        // currently owns (resume step 2).
+        for q in self.rx_queues.iter() {
+            let rx_phys = q.rx_ring.dma_addr().raw();
+            {
+                let slots = q.rx_slots.lock();
+                for (i, buf) in slots.iter().enumerate() {
+                    let desc = AdvRxDescRead::new(buf.dma_addr().raw());
+                    // SAFETY: identity-mapped DMA ring page.
+                    unsafe {
+                        core::ptr::write_volatile(
+                            narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
+                                .kernel_mut_ptr::<AdvRxDescRead>(),
+                            desc,
+                        );
+                    }
+                }
+            }
+        }
+        // Descriptor writes must be visible before the device
+        // reads the rebuilt rings (same fence discipline as the
+        // RX pump's re-arm path).
+        compiler_fence(Ordering::SeqCst);
+        // 6. Reprogram the station address from the recorded MAC.
+        // The reset may have cleared RAR0; the write is idempotent
+        // either way (same encoding as `read_mac_from_rar` decodes,
+        // plus the address-valid bit).
+        let ral = (self.mac[0] as u32)
+            | ((self.mac[1] as u32) << 8)
+            | ((self.mac[2] as u32) << 16)
+            | ((self.mac[3] as u32) << 24);
+        let rah = (self.mac[4] as u32) | ((self.mac[5] as u32) << 8) | RAH_AV;
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_RAL0, ral);
+            self.mmio.write32(REG_RAH0, rah);
+        }
+        // 7. Reprogram rings + enables, one entry per queue, and
+        // restore the bring-up receive filter + master enable
+        // (resume step 3).
+        {
+            let tx_bases: Vec<u64> = self
+                .tx_queues
+                .iter()
+                .map(|q| q.tx_ring.dma_addr().raw())
+                .collect();
+            let rx_bases: Vec<u64> = self
+                .rx_queues
+                .iter()
+                .map(|q| q.rx_ring.dma_addr().raw())
+                .collect();
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            pm::resume_rebuild_plan(&mut bank, cfg, &tx_bases, &rx_bases)
+                .map_err(IxgbeError::Other)?;
+        }
+        // 8. Replay the recorded filter/feature state the reset
+        // wiped. Order mirrors the runtime composition: VMDq first
+        // (it owns MTQC/MRQC — `enable_vmdq_rss` requires VT mode
+        // already on), then RSS (VMDq-RSS when VT mode is on,
+        // RSS-only otherwise), VLAN, DCB, FDIR, EEE. DCB/RSS
+        // composition is unvalidated at runtime and stays so here.
+        if let Some(cfg) = vmdq {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            vmdq::enable_virtualization(&mut bank, &cfg)
+                .map_err(|_| IxgbeError::Other("bad VMDq config"))?;
+        }
+        if let Some(rss) = &rss {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            if vmdq.is_some() {
+                vmdq::enable_vmdq_rss(&mut bank, rss)
+                    .map_err(|_| IxgbeError::Other("bad VMDq RSS config"))?;
+            } else {
+                rss.apply(&mut bank);
+            }
+        }
+        if let Some(filter) = &vlan {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            filter.apply(&mut bank);
+        }
+        if let Some(cfg) = &dcb {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            cfg.apply(&mut bank, self.did).map_err(|e| match e {
+                dcb::DcbError::Device => IxgbeError::UnsupportedDevice,
+                _ => IxgbeError::Other("bad DCB config"),
+            })?;
+        }
+        self.fdir_restore()?;
+        if let Some(enabled) = eee_enabled {
+            self.configure_eee(enabled)?;
+        }
+        // 9. Re-arm the MSI-X routing + unmasking when a table is
+        // enabled (`enable_msix_queue_vectors` shape). The
+        // single-vector path armed only vector 0 via EIMS bit 0,
+        // while this replays the per-queue arm (OTHER via EIMS bit
+        // 31, queue vectors via EIMS_EX); the IVAR routing is
+        // identical for a 1/1 config and the datapath stays polled
+        // with no consumer, so the union unmasking is the safe
+        // post-reset state — Linux likewise re-enables every queue
+        // interrupt after a reset.
+        if self.msix.is_some() {
+            let cfg = self.queue_config;
+            {
+                let mut bank = queues::MmioBank::new(&self.mmio);
+                route_all_queue_vectors(&mut bank, &cfg);
+            }
+            let n = cfg.num_tx.max(cfg.num_rx);
+            let low: u32 = if n >= 32 {
+                0xFFFF_FFFF
+            } else {
+                (1u32 << n) - 1
+            };
+            let high: u32 = if n >= 64 {
+                0xFFFF_FFFF
+            } else if n > 32 {
+                (1u32 << (n - 32)) - 1
+            } else {
+                0
+            };
+            // SAFETY: identity-mapped MMIO.
+            unsafe {
+                self.mmio.write32(REG_GPIE, (1 << 4) | (1 << 5) | (1 << 6));
+                self.mmio.write32(REG_EIAM, low);
+                if high != 0 {
+                    self.mmio.write32(REG_EIAM_EX0, high);
+                }
+                self.mmio.write32(REG_EIMS, EIMS_OTHER_CAUSE);
+                if low != 0 {
+                    self.mmio.write32(REG_EIMS_EX0, low);
+                }
+                if high != 0 {
+                    self.mmio.write32(REG_EIMS_EX1, high);
+                }
+            }
+        }
+        // 10. Reset the pump cursors to the rebuilt state, clear
+        // every post time, and refresh + republish link from live
+        // LINKS (resume step 4, plus the publish).
+        for q in self.tx_queues.iter() {
+            *q.tx_tail.lock() = 0;
+            q.tx_posted_at.lock().fill(0);
+        }
+        for q in self.rx_queues.iter() {
+            *q.rx_head.lock() = 0;
+        }
+        // SAFETY: identity-mapped MMIO.
+        let links = unsafe { self.mmio.read32(REG_LINKS) };
+        *self.link_up.lock() = links & LINKS_UP != 0;
+        crate::publish::publish_link(ixgbe_ifname(), ixgbe_link_sample(links));
+        Ok(())
+    }
+
     /// Prepare detach: suspend with no WoL + clear DRV_LOAD, and
     /// mark quiesced. The framework half (CONTROLLER slot, mirror
     /// note, iface unregister) is `detach_controller`.
@@ -1960,6 +2387,8 @@ impl Ixgbe {
                 self.queue_config.num_rx,
                 self.queue_config.num_tx,
             ),
+            tx_timeouts: self.tx_timeouts(),
+            tx_resets: self.tx_resets(),
         }
     }
 
@@ -2415,6 +2844,10 @@ fn spawn_pumps(
             });
         }
     }
+    let d = device;
+    narf_scheduler::spawn(async move {
+        ixgbe_watchdog_pump(d).await;
+    });
 }
 
 async fn ixgbe_rx_pump(device: Arc<Ixgbe>, q: usize, observe_link: bool) {
@@ -2468,6 +2901,19 @@ async fn ixgbe_tx_pump(device: Arc<Ixgbe>, q: usize, mut tx_cons: Consumer<Frame
     // buffer and forcing plain metadata.
     while let Ok(frame) = tx_cons.recv().await {
         let _ = device.tx_frame_on_queue(q, &frame);
+    }
+}
+
+/// TX-timeout supervisor (igc maintenance-task shape): every 10 ms
+/// run one watchdog pass; a queue stalled 5 s with carrier up is
+/// recovered and counted. The pass itself gates on detach/suspend
+/// (quiesced) and on an in-flight recovery, so this loop is only a
+/// timer.
+async fn ixgbe_watchdog_pump(device: Arc<Ixgbe>) {
+    let tick = narf_time::ns_to_cycles(TX_WATCHDOG_POLL_NS);
+    loop {
+        narf_time::sleep_cycles(tick).await;
+        device.check_tx_watchdog_at(narf_time::now_cycles());
     }
 }
 
