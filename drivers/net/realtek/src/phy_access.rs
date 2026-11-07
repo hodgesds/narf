@@ -883,8 +883,14 @@ pub const fn rtlgen_decode_speed(val: u16) -> Option<u32> {
 /// `rtlgen_read_status` lets `rtlgen_decode_speed` overwrite
 /// `genphy_read_status`'s result. An undecodable word leaves
 /// the Clause-22 result untouched. Duplex always stays with
-/// the Clause-22 resolution: the speed word carries none.
+/// the Clause-22 resolution: the speed word carries none. A
+/// down link stays down whatever the word says: the speed word
+/// is a negotiated-rate register, and a down link has no
+/// negotiated rate to report.
 pub fn rtlgen_apply_speed(c22: PhyLink, speed_val: u16) -> PhyLink {
+    if !c22.link_up {
+        return c22;
+    }
     match rtlgen_decode_speed(speed_val) {
         Some(speed) => PhyLink {
             speed_mbps: Some(speed),
