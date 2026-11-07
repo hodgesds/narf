@@ -128,6 +128,19 @@ pub fn register_initcalls() {
         sdhci::pm::spawn_idle_monitor_task();
         InitResult::Ok
     });
+    // SDHCI card-detect poll (#836): same shape as RTSX — no IRQ
+    // handler is registered, so a Stage::Late task polls the
+    // Present State card level and identifies on insert /
+    // unpublishes on remove. NotPresent when no SDHCI controller
+    // probed (the USB supervisor rule).
+    #[cfg(feature = "sdhci")]
+    narf_init::register(Stage::Late, "sdhci-card-poll", || {
+        if !sdhci::is_probed() {
+            return InitResult::NotPresent;
+        }
+        sdhci::spawn_card_poll_task();
+        InitResult::Ok
+    });
     // Intel VMD must register at Stage::Device because its probe appends
     // children into the bus registry that the *same* PCI walk's later probes
     // would not otherwise see. Keeping VMD at Stage::Device leaves the

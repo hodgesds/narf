@@ -117,7 +117,13 @@ All driver code is derived strictly from the references below.
   at 3.3 V without UHS. Fixture-validated end to end (S18A, switch
   status, tuning engine, DAT levels, power-cycle recovery).
   Identified cards are published as `sdhci0` with a partition scan
-  (`sdhci0p<m>`) (#834). Register access runs through an
+  (`sdhci0p<m>`) (#834). An empty slot at probe installs the
+  controller with no card known instead of failing probe, and a
+  Stage::Late poll task reconciles the Present State card level
+  with the known card: identify-on-insert, teardown-on-remove
+  (parent + partitions withdrawn, CMD/DAT lines reset) (#836). The
+  Card Insertion / Removal status bits (§2.2.18) are acknowledged
+  but the Present State level is authoritative. Register access runs through an
   `SdhciTransport` seam (BAR0 MMIO in production), so the
   identify → negotiate → publish conversation is fixture-modelled
   end to end, including a modelled DMA engine that walks the
