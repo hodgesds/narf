@@ -33,6 +33,7 @@ pub mod prp;
 pub mod shutdown;
 
 mod tests;
+mod tests_cid;
 mod tests_dsm;
 mod tests_flush;
 mod tests_gate;
@@ -314,6 +315,20 @@ struct Cqe {
 
 const _: () = assert!(core::mem::size_of::<Cqe>() == 16);
 
+impl Cqe {
+    /// Does this completion belong to the waiter for `cid` (NVMe
+    /// base spec §4.6: the CQE's `cid` echoes the submission's
+    /// CDW0 bits 16..31)? This one comparison is the whole of
+    /// CID-matched completion tracking: a waiter owns exactly the
+    /// CQE carrying its CID, never merely the next entry at the CQ
+    /// head. The phase tag is checked separately by the caller —
+    /// it says whether the entry is a fresh completion at all.
+    #[inline]
+    fn is_for(&self, cid: u16) -> bool {
+        self.cid == cid
+    }
+}
+
 // ── Controller ──────────────────────────────────────────────────────
 
 /// Admin queue depth — 8 entries: the SQ is 8 × 64 = 512 B and the CQ
@@ -523,14 +538,6 @@ pub struct Controller {
     vs: u32,
     /// Flush commands completed (see [`Controller::flush_nsid`]).
     flushes_completed: u64,
-    /// AERs posted at bring-up and not yet drained (see
-    /// [`Controller::post_aer_commands`] /
-    /// [`Controller::drain_aer_events`]). Diagnostic for tests + the
-    /// AER supervisor: `drain_aer_events` reposts one AER per
-    /// drained completion, so in steady state this stays at
-    /// `AER_POST_COUNT`; it is only ever incremented here, never
-    /// decremented by the drain.
-    aer_outstanding: u8,
 }
 
 impl core::fmt::Debug for Controller {
@@ -565,24 +572,25 @@ struct Queue {
     db_stride: u64,
     /// Next command id to assign (monotonic, wraps at u16).
     next_cid: u16,
-    /// Stray admin-CQ completions stashed by
-    /// [`Queue::submit_raw_ms`]: `cmd_specific` words of CQEs whose
-    /// CID is not the one the current submit is waiting for. On the
-    /// admin queue (qid 0) those can only be Asynchronous Event
-    /// Request completions — every other admin command goes through
-    /// `submit_raw_ms` under the slot gate, so no second normal
-    /// command can be in flight — and they are consumed here rather
-    /// than mistaken for the awaited command's completion once AERs
-    /// are posted at bring-up (#928). [`Controller::drain_aer`]
-    /// drains this stash first (decoding + reposting one AER per
-    /// entry) before peeking the live CQ. Bounded at 4: at most
-    /// `ADMIN_Q_DEPTH - 1` AERs are ever outstanding, so the stash
-    /// can never overflow; a further stray (queue corruption) is
-    /// consumed and dropped so a wedged queue still times out
-    /// instead of spinning on the wrong CQE forever.
-    stray_aer: [u32; 4],
+    /// Event words (`CQE.cmd_specific`, NVMe §5.2) of AER
+    /// completions that arrived at the CQ head ahead of the
+    /// command a waiter was matching (see
+    /// [`Queue::submit_raw_ms`]). Bounded by `ADMIN_Q_DEPTH - 1`:
+    /// at most that many AERs can be outstanding, so at most that
+    /// many strays can precede one awaited CQE. Only used on the
+    /// admin queue (`qid == 0`); I/O queues drop strays instead.
+    stray_aer: [u32; (ADMIN_Q_DEPTH - 1) as usize],
     /// Number of valid entries in `stray_aer`.
     stray_aer_len: u8,
+    /// CIDs of the AER commands currently outstanding on this
+    /// queue (posted by [`Controller::post_aer_commands`],
+    /// reposted by [`Controller::drain_aer`]). Lets every
+    /// completion consumer tell an AER completion from another
+    /// command's CQE by CID alone — the CQE carries no opcode
+    /// (NVMe §4.6). Only used on the admin queue (`qid == 0`).
+    aer_cids: [u16; (ADMIN_Q_DEPTH - 1) as usize],
+    /// Number of valid entries in `aer_cids`.
+    aer_cids_len: u8,
 }
 
 impl Queue {
@@ -596,8 +604,60 @@ impl Queue {
         REG_DOORBELL_BASE + (2 * (self.qid as u64) + 1) * self.db_stride
     }
 
-    /// Pop the oldest stashed stray AER event word, if any (see
-    /// `stray_aer`).
+    /// Advance the CQ head past the entry just consumed (flipping
+    /// the phase tag on wrap) and ring the CQ head doorbell so the
+    /// controller can reuse the slot. Callers must have established
+    /// that the head entry is a fresh completion (phase tag
+    /// matches `cq_phase`); this only moves the pointer.
+    fn advance_head(&mut self, bar0: &MmioRegion) {
+        self.cq_head = (self.cq_head + 1) % self.depth;
+        if self.cq_head == 0 {
+            self.cq_phase ^= 1;
+        }
+        // SAFETY: identity-mapped MMIO doorbell.
+        unsafe {
+            bar0.write32(self.cq_db_off(), self.cq_head as u32);
+        }
+    }
+
+    /// Record `cid` as an outstanding AER on this queue. Silent
+    /// no-op when the table is full: callers cap posts at
+    /// `ADMIN_Q_DEPTH - 1`, so this only fires if a burst
+    /// over-posts — the untracked completion is then dropped
+    /// rather than stashed, never misrouted.
+    fn track_aer_cid(&mut self, cid: u16) {
+        if (self.aer_cids_len as usize) < self.aer_cids.len() {
+            self.aer_cids[self.aer_cids_len as usize] = cid;
+            self.aer_cids_len += 1;
+        }
+    }
+
+    /// Forget `cid` as an outstanding AER; true when it was
+    /// present. Swap-remove: order in the table is meaningless.
+    fn untrack_aer_cid(&mut self, cid: u16) -> bool {
+        for i in 0..self.aer_cids_len as usize {
+            if self.aer_cids[i] == cid {
+                self.aer_cids_len -= 1;
+                self.aer_cids[i] = self.aer_cids[self.aer_cids_len as usize];
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Is `cid` an outstanding AER on this queue?
+    fn is_aer_cid(&self, cid: u16) -> bool {
+        self.aer_cids[..self.aer_cids_len as usize].contains(&cid)
+    }
+
+    /// Outstanding AER count. Diagnostic for tests + the AER
+    /// supervisor.
+    pub fn aer_outstanding(&self) -> usize {
+        self.aer_cids_len as usize
+    }
+
+    /// Take the oldest stashed stray AER event word, if any
+    /// (see [`Queue::submit_raw_ms`]).
     fn take_stray_aer(&mut self) -> Option<u32> {
         if self.stray_aer_len == 0 {
             return None;
@@ -655,17 +715,18 @@ impl Queue {
         }
 
         // Wait for OUR completion, not just the next one: once AERs
-        // are posted at bring-up (#928) an AER completion can sit at
-        // the admin CQ head ahead of this command's CQE. Consuming
-        // it as ours would report a spurious success — and for
-        // IDENTIFY-class commands, parse a DMA buffer the controller
-        // had not written yet. So loop on the CQ head until the CQE
-        // carrying our CID arrives, stashing stray completions
-        // (AERs on qid 0) in `stray_aer` for `drain_aer`, within the
-        // caller's overall `timeout_ms` budget. At most
-        // `ADMIN_Q_DEPTH - 1` strays can precede ours (that is the
-        // AER cap), so the loop is bounded by the deadline, not by
-        // stray count.
+        // are posted, an AER completion can sit at the CQ head
+        // ahead of this command's CQE. Consuming it as ours would
+        // report a spurious success — and for IDENTIFY-class
+        // commands, parse a DMA buffer the controller had not
+        // written yet. So loop on the CQ head until the CQE
+        // carrying our CID arrives, within the caller's overall
+        // `timeout_ms` budget. A stray whose CID is an outstanding
+        // AER is stashed for `drain_aer` (admin queue only); any
+        // other stray — another command's late completion, only
+        // possible if the single-submitter invariant was broken —
+        // is consumed and dropped so it can never be mistaken for
+        // a later command's completion either.
         let deadline = narf_time::Deadline::after_ms(timeout_ms);
         loop {
             if deadline.expired() {
@@ -682,28 +743,21 @@ impl Queue {
                 )?
             };
 
-            self.cq_head = (self.cq_head + 1) % self.depth;
-            if self.cq_head == 0 {
-                self.cq_phase ^= 1;
-            }
-            // SAFETY: identity-mapped MMIO doorbell.
-            unsafe {
-                bar0.write32(self.cq_db_off(), self.cq_head as u32);
-            }
-
-            if cqe.cid == cid {
+            self.advance_head(bar0);
+            if cqe.is_for(cid) {
                 return Ok(cqe);
             }
-            // Stray completion. On the admin queue this is an AER
-            // (every normal admin command goes through here under
-            // the slot gate, so no second one can be in flight);
-            // stash its event word for `drain_aer`. On an I/O
-            // queue the same shape guards against a corrupted head
-            // wedging the wait: the stray is consumed and dropped.
-            if self.qid == 0 && (self.stray_aer_len as usize) < self.stray_aer.len() {
-                self.stray_aer[self.stray_aer_len as usize] = cqe.cmd_specific;
-                self.stray_aer_len += 1;
+            if self.qid == 0 && self.untrack_aer_cid(cqe.cid) {
+                // Stray AER completion: park its §5.2 event word
+                // for `drain_aer`; the CQE itself is already off
+                // the CQ.
+                if (self.stray_aer_len as usize) < self.stray_aer.len() {
+                    self.stray_aer[self.stray_aer_len as usize] = cqe.cmd_specific;
+                    self.stray_aer_len += 1;
+                }
             }
+            // Otherwise: another command's completion. Consumed
+            // and dropped above; keep waiting for ours.
         }
     }
 
@@ -738,6 +792,29 @@ impl Queue {
             });
         }
         Ok(cqe)
+    }
+}
+
+/// Post one Async Event Request SQE into the admin queue and
+/// track its CID as outstanding. Rings the SQ tail doorbell but
+/// does NOT wait for completion — AERs complete only when an
+/// async event fires. Shared by [`Controller::post_aer_commands`]
+/// (burst post) and [`Controller::drain_aer`] (one repost per
+/// drained completion, keeping the in-flight count stable).
+fn post_one_aer(admin: &mut Queue, bar0: &MmioRegion) {
+    let cid = admin.next_cid;
+    admin.next_cid = admin.next_cid.wrapping_add(1);
+    admin.track_aer_cid(cid);
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = (AdminOpcode::AsyncEventRequest as u32) | ((cid as u32) << 16);
+    // SAFETY: admin queue is page-aligned; sq_tail bounded.
+    unsafe {
+        write_sqe(&admin.sq_buf, admin.sq_tail, &sqe);
+    }
+    admin.sq_tail = (admin.sq_tail + 1) % admin.depth;
+    // SAFETY: identity-mapped MMIO doorbell.
+    unsafe {
+        bar0.write32(admin.sq_db_off(), admin.sq_tail as u32);
     }
 }
 
@@ -869,7 +946,6 @@ impl Controller {
             primary_nsid: DEFAULT_NSID,
             vs: 0,
             flushes_completed: 0,
-            aer_outstanding: 0,
         }
     }
 
@@ -1425,8 +1501,10 @@ impl Controller {
             cq_phase: 1, // first valid CQE has phase = 1
             db_stride: caps.doorbell_stride(),
             next_cid: 0,
-            stray_aer: [0; 4],
+            stray_aer: [0; (ADMIN_Q_DEPTH - 1) as usize],
             stray_aer_len: 0,
+            aer_cids: [0; (ADMIN_Q_DEPTH - 1) as usize],
+            aer_cids_len: 0,
         });
         self.bar0_region = Some(bar0);
         if let Err(e) = self.bring_up_enabled(cap, &device, caps, ready_ms) {
@@ -1812,8 +1890,10 @@ impl Controller {
             cq_phase: 1,
             db_stride: admin.db_stride,
             next_cid: 0,
-            stray_aer: [0; 4],
+            stray_aer: [0; (ADMIN_Q_DEPTH - 1) as usize],
             stray_aer_len: 0,
+            aer_cids: [0; (ADMIN_Q_DEPTH - 1) as usize],
+            aer_cids_len: 0,
         });
         self.io_queue_locks.push(IrqSafeSpinLock::new(()));
         Ok(())
@@ -2003,8 +2083,10 @@ impl Controller {
             cq_phase: 1,
             db_stride: admin_stride,
             next_cid: 0,
-            stray_aer: [0; 4],
+            stray_aer: [0; (ADMIN_Q_DEPTH - 1) as usize],
             stray_aer_len: 0,
+            aer_cids: [0; (ADMIN_Q_DEPTH - 1) as usize],
+            aer_cids_len: 0,
         })
     }
 
@@ -2637,32 +2719,9 @@ impl Controller {
         // room for a non-AER admin command to slip through.
         let cap = (ADMIN_Q_DEPTH - 1).min(count as u16) as u8;
         for _ in 0..cap {
-            let mut sqe = Sqe::zero();
-            sqe.cdw0 = AdminOpcode::AsyncEventRequest as u32;
-            // Ring the doorbell but do NOT wait for completion here —
-            // AERs complete only when an async event fires. We post
-            // the SQE into the ring directly, advancing sq_tail, and
-            // let the controller hold the slot open.
-            let cid = admin.next_cid;
-            admin.next_cid = admin.next_cid.wrapping_add(1);
-            sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
-            // SAFETY: admin queue is page-aligned; sq_tail < depth.
-            unsafe {
-                write_sqe(&admin.sq_buf, admin.sq_tail, &sqe);
-            }
-            admin.sq_tail = (admin.sq_tail + 1) % admin.depth;
-            // SAFETY: identity-mapped MMIO doorbell.
-            unsafe {
-                bar0.write32(admin.sq_db_off(), admin.sq_tail as u32);
-            }
+            post_one_aer(admin, bar0);
         }
-        self.aer_outstanding = self.aer_outstanding.saturating_add(cap);
         Ok(())
-    }
-
-    /// AERs posted and not yet drained (see `aer_outstanding`).
-    pub fn aer_outstanding(&self) -> u8 {
-        self.aer_outstanding
     }
 
     // ── Admin: AER drain ──────────────────────────────────────────────
@@ -2675,6 +2734,11 @@ impl Controller {
     /// [`Queue::submit_raw_ms`] when an AER CQE landed at the admin
     /// CQ head ahead of the command that submit was waiting for,
     /// then live CQ entries whose phase tag matches `cq_phase`.
+    /// CID-matched: only CQEs whose CID is an outstanding AER are
+    /// consumed here. A head entry carrying another CID is a normal
+    /// admin command's completion — consuming it would poison that
+    /// command's waiter (the mirror image of the `submit_raw_ms`
+    /// bug) — so the drain stops and leaves it for its waiter.
     /// Each drained entry is decoded (§5.2 CDW0 layout); a Notice
     /// with Namespace Attribute Changed sets `ns_changed`.
     ///
@@ -2709,7 +2773,9 @@ impl Controller {
         // ── 1. Stashed strays ──────────────────────────────────
         // Already consumed from the CQ by `submit_raw_ms`; decode
         // + repost one AER each. Bounded with the live loop below
-        // at depth-1 per pass.
+        // at depth-1 per pass. Reposting goes through
+        // `post_one_aer`, so the fresh AER's CID is tracked —
+        // the drain never loses track of an outstanding AER.
         while out.drained < (ADMIN_Q_DEPTH - 1) as u8 {
             let Some(ev) = admin.take_stray_aer() else {
                 break;
@@ -2719,24 +2785,15 @@ impl Controller {
             }
             out.drained += 1;
             // Repost one AER to keep the in-flight count stable.
-            let cid = admin.next_cid;
-            admin.next_cid = admin.next_cid.wrapping_add(1);
-            let mut sqe = Sqe::zero();
-            sqe.cdw0 = (AdminOpcode::AsyncEventRequest as u32) | ((cid as u32) << 16);
-            // SAFETY: admin queue is page-aligned; sq_tail bounded.
-            unsafe {
-                write_sqe(&admin.sq_buf, admin.sq_tail, &sqe);
-            }
-            admin.sq_tail = (admin.sq_tail + 1) % admin.depth;
-            // SAFETY: identity-mapped MMIO doorbell.
-            unsafe {
-                bar0.write32(admin.sq_db_off(), admin.sq_tail as u32);
-            }
+            post_one_aer(admin, bar0);
         }
 
         // ── 2. Live admin CQ ────────────────────────────────────
         // Peek every slot from the current head forward; stop when
-        // the phase tag doesn't match (no more completions).
+        // the phase tag doesn't match (no more completions), or
+        // when the head entry is not an outstanding AER's
+        // completion (another command's CQE — leave it for its
+        // waiter).
         loop {
             // SAFETY: admin CQ DMA buffer is live + identity-mapped;
             // cq_head is always < admin.depth.
@@ -2745,6 +2802,14 @@ impl Controller {
             if (cqe.status & 1) != (admin.cq_phase & 1) {
                 break; // no more completed entries
             }
+            // CID gate: only an outstanding AER's completion is
+            // consumed here. A head entry carrying another CID is
+            // a normal admin command's completion — leave it for
+            // its waiter.
+            if !admin.is_aer_cid(cqe.cid) {
+                break;
+            }
+            admin.untrack_aer_cid(cqe.cid);
 
             // Decode async event (§5.2 CDW0 layout) via the shared
             // decoder: Notice + Namespace Attribute Changed means
@@ -2753,35 +2818,14 @@ impl Controller {
                 out.ns_changed = true;
             }
 
-            admin.cq_head = (admin.cq_head + 1) % admin.depth;
-            if admin.cq_head == 0 {
-                admin.cq_phase ^= 1;
-            }
-            // Advance the CQ head doorbell so the controller can reuse
-            // the slot.
-            // SAFETY: identity-mapped MMIO doorbell.
-            unsafe {
-                bar0.write32(admin.cq_db_off(), admin.cq_head as u32);
-            }
+            admin.advance_head(bar0);
             out.drained += 1;
 
-            // Repost one AER to keep the in-flight count stable.
-            // ADMIN_Q_DEPTH is 8; we cap posting at depth-1 to leave
-            // room for non-AER admin commands.
-            let cid = admin.next_cid;
-            admin.next_cid = admin.next_cid.wrapping_add(1);
-            let mut sqe = Sqe::zero();
-            sqe.cdw0 = (AdminOpcode::AsyncEventRequest as u32) | ((cid as u32) << 16);
-            // SAFETY: admin queue is page-aligned; sq_tail bounded.
-            unsafe {
-                write_sqe(&admin.sq_buf, admin.sq_tail, &sqe);
-            }
-            admin.sq_tail = (admin.sq_tail + 1) % admin.depth;
-            // SAFETY: identity-mapped MMIO doorbell.
-            unsafe {
-                bar0.write32(admin.sq_db_off(), admin.sq_tail as u32);
-            }
-
+            // Repost one AER to keep the in-flight count stable
+            // (tracked, via `post_one_aer`). ADMIN_Q_DEPTH is 8;
+            // we cap posting at depth-1 to leave room for
+            // non-AER admin commands.
+            post_one_aer(admin, bar0);
             // Bound the loop: never process more than depth-1 slots
             // in one pass to prevent re-draining freshly reposted AERs.
             if out.drained >= (ADMIN_Q_DEPTH - 1) as u8 {
@@ -2808,6 +2852,21 @@ impl Controller {
             Some(a) => (a.sq_tail + a.depth - a.cq_head) % a.depth,
             None => 0,
         }
+    }
+
+    /// Outstanding AER count on the admin queue: CIDs tracked in
+    /// `aer_cids` (posted, not yet completed). A completion stashed
+    /// by `submit_raw_ms` untracks its CID, so the count drops
+    /// until `drain_aer` reposts the AER. Diagnostic for tests +
+    /// the AER supervisor.
+    pub fn aer_outstanding(&self) -> usize {
+        self.admin.as_ref().map_or(0, |a| a.aer_outstanding())
+    }
+
+    /// Stray AER event words parked by `submit_raw_ms` and not yet
+    /// drained by `drain_aer`. Diagnostic for tests.
+    pub fn stray_aer_len(&self) -> u8 {
+        self.admin.as_ref().map_or(0, |a| a.stray_aer_len)
     }
 
     /// Per-queue lock count — always equal to `io_queue_count()`.
@@ -2986,7 +3045,8 @@ impl Controller {
     }
 
     /// Submit a prebuilt SQE on I/O queue `qi` and wait for its
-    /// MSI-X completion, draining the CQE. Shared core of
+    /// MSI-X completion, draining the CQE carrying our CID (see
+    /// [`Self::try_take_io_cqe`]). Shared core of
     /// [`Self::submit_io_irq`] and the `nvm_io_*` production paths
     /// (#928): the wait is IRQ-driven — the dispatch table's
     /// `fire_count` for the queue's vector, bumped by the ISR —
@@ -3001,11 +3061,13 @@ impl Controller {
     fn submit_sqe_irq(&mut self, qi: usize, mut sqe: Sqe) -> Result<(), NvmeError> {
         let v = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        let baseline = narf_interrupts::fire_count(v);
+        let opcode = (sqe.cdw0 & 0xFF) as u8;
+        let deadline = narf_time::Deadline::after_ms(5_000);
 
         // Auto-CID + ring SQ tail doorbell. Scoped so the queue
-        // borrow ends before the wait below.
-        {
+        // borrow ends before the wait below; the CID is kept for
+        // the drain loop.
+        let cid = {
             let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
             let cid = io.next_cid;
             io.next_cid = io.next_cid.wrapping_add(1);
@@ -3019,50 +3081,82 @@ impl Controller {
             unsafe {
                 bar0.write32(io.sq_db_off(), io.sq_tail as u32);
             }
-        }
+            cid
+        };
 
-        let done = narf_scheduler::responsive_spin_until(
-            || {
-                if narf_interrupts::fire_count(v) > baseline {
-                    return true;
-                }
-                let Some(io) = self.io_queues.get(qi) else {
-                    return false;
-                };
-                // SAFETY: cq_buf is a live identity-mapped DMA page.
-                let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-                (cqe.status & 1) == (io.cq_phase & 1)
-            },
-            narf_time::Deadline::after_ms(5_000),
-        );
-        if !done {
-            // The command (and its data / PRP-list pages) may still be
-            // live in the device; stop trusting this queue.
-            self.dead = true;
-            return Err(NvmeError::CompletionTimeout);
+        // Wait for OUR completion: loop until the CQE carrying our
+        // CID arrives at the head (see `try_take_io_cqe`). Each
+        // wait is bounded by the shared 5 s deadline; the
+        // fire_count baseline is re-read per iteration and the CQE
+        // phase is always re-checked, so an MSI that lands between
+        // iterations cannot be missed.
+        loop {
+            if self.try_take_io_cqe(qi, cid, opcode)? {
+                return Ok(());
+            }
+            if deadline.expired() {
+                // The command (and its data / PRP-list pages) may
+                // still be live in the device; stop trusting this
+                // queue.
+                self.dead = true;
+                return Err(NvmeError::CompletionTimeout);
+            }
+            let remaining_ms = narf_time::cycles_to_ns(deadline.remaining_cycles()) / 1_000_000;
+            let baseline = narf_interrupts::fire_count(v);
+            let done = narf_scheduler::responsive_spin_until(
+                || {
+                    if narf_interrupts::fire_count(v) > baseline {
+                        return true;
+                    }
+                    let Some(io) = self.io_queues.get(qi) else {
+                        return false;
+                    };
+                    // SAFETY: cq_buf is a live identity-mapped DMA page.
+                    let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
+                    (cqe.status & 1) == (io.cq_phase & 1)
+                },
+                narf_time::Deadline::after_ms(remaining_ms.max(1)),
+            );
+            if !done {
+                // The command (and its data / PRP-list pages) may still be
+                // live in the device; stop trusting this queue.
+                self.dead = true;
+                return Err(NvmeError::CompletionTimeout);
+            }
         }
+    }
 
-        // Drain the CQE.
+    /// Try once to consume the CQE carrying `cid` from I/O queue
+    /// `qi`. Returns `Ok(true)` when our CQE arrived (and its NVMe
+    /// status was zero), `Ok(false)` when nothing for us is pending
+    /// — no fresh CQE at the head, or the head CQE was a stray
+    /// (consumed and dropped, never mistaken for ours) — and `Err`
+    /// when our CQE arrived with a nonzero status. Callers loop:
+    /// wait, retry. Shared by the sync and async IRQ-driven I/O
+    /// paths so both match completions by CID.
+    fn try_take_io_cqe(&mut self, qi: usize, cid: u16, opcode: u8) -> Result<bool, NvmeError> {
         let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-        // SAFETY: same buffer.
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        // SAFETY: cq_buf is a live identity-mapped DMA page.
         let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-        io.cq_head = (io.cq_head + 1) % io.depth;
-        if io.cq_head == 0 {
-            io.cq_phase ^= 1;
+        if (cqe.status & 1) != (io.cq_phase & 1) {
+            return Ok(false); // no fresh completion at the head
         }
-        // SAFETY: identity-mapped MMIO doorbell.
-        unsafe {
-            bar0.write32(io.cq_db_off(), io.cq_head as u32);
+        io.advance_head(bar0);
+        if !cqe.is_for(cid) {
+            // Stray completion (another submitter's late CQE, or a
+            // corrupted head): consumed and dropped above. The
+            // caller waits and retries for ours.
+            return Ok(false);
         }
-
         let nvme_status = cqe.status >> 1;
         if nvme_status != 0 {
             return Err(NvmeError::CommandFailed {
-                cmd: (sqe.cdw0 & 0xFF) as u8,
+                cmd: opcode,
                 status: nvme_status,
             });
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Submit an NVM Read/Write to a round-robin-picked I/O queue
@@ -3102,7 +3196,7 @@ impl Controller {
 
     /// Begin an IRQ-driven I/O submission: build the SQE, pick a
     /// queue, construct the IRQ wait future, then write the SQE +
-    /// ring the doorbell. Returns `(queue index, vector, wait)`.
+    /// ring the doorbell. Returns `(queue index, cid, vector, wait)`.
     ///
     /// This is the `block_on` / `IrqSafeSpinLock`-across-await
     /// restructure (AGENTS.md): NO await happens here and NO
@@ -3127,7 +3221,15 @@ impl Controller {
         lba: u64,
         n_blocks: u16,
         buf: &DmaBuffer,
-    ) -> Result<(usize, u8, narf_time::Timeout<narf_interrupts::WaitForIrq>), NvmeError> {
+    ) -> Result<
+        (
+            usize,
+            u16,
+            u8,
+            narf_time::Timeout<narf_interrupts::WaitForIrq>,
+        ),
+        NvmeError,
+    > {
         if self.io_queues.is_empty() {
             return Err(NvmeError::NoIoQueue);
         }
@@ -3159,8 +3261,8 @@ impl Controller {
         let wait = narf_interrupts::wait_for_irq_until(v, deadline);
 
         // Submit + ring doorbell. All self-borrows released at
-        // the closing brace.
-        {
+        // the closing brace; the CID is kept for the drain loop.
+        let cid = {
             let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
             let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
             let cid = io.next_cid;
@@ -3175,52 +3277,60 @@ impl Controller {
             unsafe {
                 bar0.write32(io.sq_db_off(), io.sq_tail as u32);
             }
-        }
+            cid
+        };
 
-        Ok((qi, v, wait))
+        Ok((qi, cid, v, wait))
     }
 
     /// Finish an IRQ-driven I/O submission begun by
     /// [`Self::submit_io_begin`], after the caller awaited the
-    /// returned wait future: drain the head CQE of queue `qi` and
-    /// ring the CQ-head doorbell. The CQE phase must have flipped
-    /// (the IRQ fired); if it has not, returns `CompletionTimeout`
-    /// and marks the controller dead — the command may still be
-    /// live in the device, so its buffers must not be reused. The
-    /// `opcode` is only for the [`NvmeError::CommandFailed`]
-    /// report (the CQE carries no opcode).
-    pub fn submit_io_finish(&mut self, qi: usize, opcode: u8) -> Result<(), NvmeError> {
-        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        // SAFETY: cq_buf is a live identity-mapped DMA page.
-        let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-        if (cqe.status & 1) != (io.cq_phase & 1) {
-            // The IRQ fired but our CQE is not at the head: the
-            // completion was lost (or the IRQ belonged to another
-            // queue sharing the vector). Same treatment as the sync
-            // path's timeout — the buffers may still be DMA targets.
-            self.dead = true;
-            return Err(NvmeError::CompletionTimeout);
+    /// returned wait future: drain the CQE carrying `cid` from
+    /// queue `qi` (see [`Self::try_take_io_cqe`]) and ring the
+    /// CQ-head doorbell. The head CQE may be a stray — another
+    /// submitter's late completion — which is consumed and
+    /// dropped; only our own CQE is accepted. Bounded by the
+    /// queue depth: after `depth` consumed entries without ours,
+    /// the queue wrapped without our completion. The CQE phase
+    /// must have flipped (the IRQ fired); if it has not, returns
+    /// `CompletionTimeout` and marks the controller dead — the
+    /// command may still be live in the device, so its buffers
+    /// must not be reused. The `opcode` is only for the
+    /// [`NvmeError::CommandFailed`] report (the CQE carries no
+    /// opcode).
+    pub fn submit_io_finish(&mut self, qi: usize, cid: u16, opcode: u8) -> Result<(), NvmeError> {
+        // At most `depth` head entries can precede ours (the queue
+        // holds no more than that); each iteration consumes one,
+        // so the loop always terminates.
+        let depth = self
+            .io_queues
+            .get(qi)
+            .map_or(1, |q| q.depth.max(1) as usize);
+        for _ in 0..depth {
+            if self.try_take_io_cqe(qi, cid, opcode)? {
+                return Ok(());
+            }
+            // `try_take_io_cqe` consumed a stray, or nothing was
+            // fresh at the head: peek to tell which.
+            let Some(io) = self.io_queues.get(qi) else {
+                self.dead = true;
+                return Err(NvmeError::CompletionTimeout);
+            };
+            // SAFETY: cq_buf is a live identity-mapped DMA page.
+            let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
+            if (cqe.status & 1) != (io.cq_phase & 1) {
+                // The IRQ fired but our CQE is not at the head: the
+                // completion was lost (or the IRQ belonged to another
+                // queue sharing the vector). Same treatment as the sync
+                // path's timeout — the buffers may still be DMA targets.
+                self.dead = true;
+                return Err(NvmeError::CompletionTimeout);
+            }
+            // A fresh stray was consumed above; loop for the next slot.
         }
-        io.cq_head = (io.cq_head + 1) % io.depth;
-        if io.cq_head == 0 {
-            io.cq_phase ^= 1;
-        }
-        // SAFETY: identity-mapped MMIO doorbell. Writing here
-        // tells the controller it's free to MSI again on the
-        // next completion past head.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            bar0.write32(io.cq_db_off(), io.cq_head as u32);
-        }
-        let nvme_status = cqe.status >> 1;
-        if nvme_status != 0 {
-            return Err(NvmeError::CommandFailed {
-                cmd: opcode,
-                status: nvme_status,
-            });
-        }
-        Ok(())
+        // The queue wrapped without our completion.
+        self.dead = true;
+        Err(NvmeError::CompletionTimeout)
     }
 
     /// Async sibling of `submit_io_irq`. Submits the command,
@@ -3239,9 +3349,11 @@ impl Controller {
     /// whole-controller serialisation for the I/O duration, the
     /// same as the sync path. Callers that need the gate released
     /// across the await use `submit_io_begin` / `submit_io_finish`
-    /// directly. Concurrent async submissions to one queue still
-    /// need CID-matched completion tracking (filed remainder);
-    /// until then, one async I/O is in flight per controller.
+    /// directly. Completion matching is CID-aware (see
+    /// [`Self::try_take_io_cqe`]); true concurrency still needs a
+    /// per-queue CID waiter table + the `InstalledController`
+    /// request-gate → async-Mutex migration, so until then one
+    /// async I/O is in flight per controller.
     pub async fn submit_io_irq_async(
         &mut self,
         opcode: u8,
@@ -3255,7 +3367,7 @@ impl Controller {
         if n_blocks == 0 {
             return Ok(());
         }
-        let (qi, _v, wait) = self.submit_io_begin(opcode, lba, n_blocks, buf)?;
+        let (qi, cid, _v, wait) = self.submit_io_begin(opcode, lba, n_blocks, buf)?;
 
         // Park until the MSI-X completion fires OR the 30 s
         // deadline expires. The first poll returns Ready if MSI
@@ -3271,9 +3383,9 @@ impl Controller {
             }
         }
 
-        // Drain the CQE + ring CQ-head doorbell on the SAME queue
-        // we submitted on.
-        self.submit_io_finish(qi, opcode)
+        // Drain the CQE carrying our CID + ring CQ-head doorbell
+        // on the SAME queue we submitted on.
+        self.submit_io_finish(qi, cid, opcode)
     }
 
     /// Validate an NVM Read/Write against the controller and namespace

@@ -163,18 +163,21 @@ multipath / fabrics (defer).
   vector + installed handler each. Production submissions
   (`nvm_io_dma`, `nvm_io_multipage`, hence every block-layer read /
   write) route through `submit_sqe_irq` — IRQ-driven wait on the
-  queue's vector `fire_count` with a CQE-phase fallback, 5 s budget
-  — whenever the picked queue has a vector; the polled
+  queue's vector `fire_count` with a CQE-phase fallback, 5 s budget,
+  CID-matched drain — whenever the picked queue has a vector; the polled
   `Queue::submit` stays the fallback for vector-less boots.
   `submit_io_irq_async` is the async form, composed from
   `submit_io_begin` (SQE + doorbell, wait future constructed
-  pre-doorbell) + await + `submit_io_finish` (CQE drain); the split
+  pre-doorbell) + await + `submit_io_finish` (CID-aware CQE drain);
+  the split
   lets a caller release the slot gate across the await — no
   `IrqSafeSpinLock` is ever held across a suspension point and no
   `block_on` appears on this path. The composed async form still
   holds the slot gate (an atomic, IRQs live) across the await, so
-  one async I/O is in flight per controller until CID-matched
-  completion tracking lands. Bring-up enables Async Event
+  one async I/O is in flight per controller; completion matching is
+  CID-aware (see §10.1) — true concurrency still needs the
+  per-queue CID waiter table + the request-gate → async-Mutex
+  migration. Bring-up enables Async Event
   Configuration (SMART/health + namespace-attribute-changed, FID
   0x0B) and posts 3 AERs (§5.2 recommends ≥4; the depth-8 admin
   queue could host 7 — see §8.4 — but QEMU accepts only 3 before
@@ -358,7 +361,77 @@ NVMe-specific public API beyond that.
 - **Concurrent async I/O (#928 remainder).** `submit_io_irq_async`
   holds the slot gate across its await (sound — the gate is an
   atomic, IRQs live — but one async I/O in flight per controller).
-  True concurrency needs CID-matched completion tracking so
-  several async submitters can share one queue; until then the
-  async block-layer submit stays eager-sync through the sync IRQ
-  path.
+  Completion matching is CID-aware since #1619 (§10.1); true
+  concurrency still needs a per-queue CID waiter table +
+  routing `BlockDevice::submit` through `submit_io_irq_async`,
+  gated on the `InstalledController` request-gate → async-Mutex
+  migration — until then the async block-layer submit stays
+  eager-sync through the sync IRQ path.
+
+### 10.1 CID-matched completion tracking (delivered, #1619)
+
+**Delivered:** every completion consumer matches by CID (NVMe
+base spec §4.6: the CQE's `cid` echoes the submission's CDW0
+bits 16..31), never merely by taking the next entry at the CQ
+head:
+
+- `Queue::submit_raw_ms` (polled admin + I/O submit) loops on
+  the CQ head until the CQE carrying its own CID arrives, within
+  the caller's timeout budget. A stray whose CID is an
+  outstanding AER is stashed (`stray_aer`, bounded by
+  `ADMIN_Q_DEPTH - 1`) for `drain_aer`; any other stray is
+  consumed and dropped.
+- `Controller::drain_aer` consumes only CQEs whose CID is an
+  outstanding AER (tracked per admin queue in `aer_cids`),
+  drains the `stray_aer` stash first, and reposts one AER per
+  drained completion. A head entry carrying another CID is a
+  normal admin command's completion and is left for its waiter.
+- `Controller::submit_io_irq` / `submit_io_irq_async` drain
+  through `try_take_io_cqe`: only the CQE carrying the
+  submitted CID is accepted; strays are consumed and dropped
+  and the wait repeats within the command deadline. The sync
+  path loops inside `submit_sqe_irq` (5 s budget); the async
+  form is `submit_io_begin` (which returns the CID) + await +
+  `submit_io_finish`, whose CID-aware drain re-checks the head
+  after the await — the lost-wakeup window the old single-shot
+  form's pre-doorbell construction handled is closed by the
+  pre-doorbell future construction plus that re-check.
+- Diagnostics: `Controller::aer_outstanding()` (AER CIDs still
+  tracked on the admin queue — a completion stashed by
+  `submit_raw_ms` untracks its CID, so the count drops until
+  `drain_aer` reposts) and `Controller::stray_aer_len()`.
+
+**Fixture:** `imp/tests_cid.rs` drives the real
+`submit_raw_ms` loop against a RAM-backed fake controller
+with spec-laid-out pre-posted CQEs (§4.6): a stray AER error
+completion at the admin head is skipped (event word stashed,
+then drained + reposted) and the submit returns its own CQE;
+an I/O-queue stray is dropped, never stashed. A live AER
+event cannot be synthesised on QEMU from the harness (no QMP
+hot-attach), so the live event half is silicon-only — the
+same carve-out as the AER supervisor.
+
+**Rebase note:** #1617 (IRQ/multi-queue datapath + AER) landed
+first, so this PR rebased onto it and dropped the duplicate
+admin half #1617 already carried (`submit_raw_ms` CID loop,
+`stray_aer`, the AER-supervisor wiring) — keeping the
+`aer_cids` tracking, the `try_take_io_cqe` I/O drain, the
+`tests_cid.rs` fixture, and the DSM model-controller CID
+tagging (which #1617 also carried, so that commit was
+skipped as already-applied). The CID-aware drain was wired
+into #1617's `submit_io_begin` / `submit_io_finish` split
+(`begin` returns the CID, `finish` takes it) and into
+`submit_sqe_irq`, instead of the branch's pre-#1617
+monolithic async loop.
+
+**Remainders (not this change):**
+
+- True concurrent async I/O still needs a per-queue CID waiter
+  table + routing `BlockDevice::submit` through
+  `submit_io_irq_async` — all gated on the
+  `InstalledController` request-gate → async-Mutex migration,
+  since the gate serialises the whole controller today and no
+  second submitter can exist to wait.
+- A multi-submitter smoke belongs with that migration, not
+  here: through the gate it would only prove sequential
+  submits, not concurrency.
