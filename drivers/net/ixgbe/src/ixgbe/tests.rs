@@ -347,13 +347,125 @@ fn smoke_ixgbe_live_bring_up() -> TestResult {
     if !super::is_probed() {
         return TestResult::Fail("ixgbe not probed");
     }
-    let mac = super::with_controller(|c| c.mac).unwrap_or([0; 6]);
+    let mac = super::with_controller(0, |c| c.mac).unwrap_or([0; 6]);
     if mac == [0; 6] || mac == [0xFF; 6] {
         return TestResult::Fail("MAC reads as all-zero or all-FF");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_live_bring_up);
+
+// ── Multi-instance (issue #795) ────────────────────────────────────
+
+/// Same shape as `smoke_e1000_multi_instance_cookie_dispatch` in
+/// `drivers/net/src/tests.rs` (see its doc comment): one live
+/// instance at cookie 0, no instance at cookie 1, published iface
+/// resolves by name, `send_on` dispatches through cookie 0,
+/// re-probe keeps the same `Arc`, and the registry adapter borrows
+/// the NIC's own rings. The QEMU test VM has no ixgbe NIC, so only
+/// the no-silicon branch runs in CI; the live branch runs on real
+/// hardware.
+fn smoke_ixgbe_multi_instance_cookie_dispatch() -> TestResult {
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: the kernel-test runner executes post-boot, so the memory
+    // map and allocator are online; `ECAM_DEFAULT_BASE` is the standard
+    // MMCONFIG window and the enumerator only reads 4-byte config words,
+    // rejecting all-1s for unpopulated slots.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has = devs.iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == IXGBE_VENDOR
+            && (d.id.device == IXGBE_DEV_82599EB
+                || d.id.device == IXGBE_DEV_X540
+                || d.id.device == IXGBE_DEV_X550
+                || d.id.device == IXGBE_DEV_X550EM_X)
+    });
+    if !has {
+        if super::instance_count() != 0 {
+            return TestResult::Fail("instance_count != 0 with no ixgbe silicon");
+        }
+        if super::controller(0).is_some() {
+            return TestResult::Fail("controller(0) Some with no ixgbe silicon");
+        }
+        if super::is_probed() {
+            return TestResult::Fail("is_probed with no ixgbe silicon");
+        }
+        let frame = [0u8; 64];
+        if narf_net::iface::send_on("eth999", &frame).is_ok() {
+            return TestResult::Fail("send_on resolved a nonexistent iface");
+        }
+        return TestResult::Pass;
+    }
+    __reset_for_test();
+    super::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !super::is_probed() {
+        return TestResult::Fail("ixgbe not probed");
+    }
+    if super::instance_count() != 1 {
+        return TestResult::Fail("instance_count != 1 after single-NIC probe");
+    }
+    let ctrl = match super::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) None after probe"),
+    };
+    if super::controller(1).is_some() {
+        return TestResult::Fail("controller(1) Some with one NIC");
+    }
+    if super::controller(usize::MAX).is_some() {
+        return TestResult::Fail("controller(MAX) Some");
+    }
+    let name = ctrl.ifname();
+    if name.is_empty() {
+        return TestResult::Fail("published name empty after probe");
+    }
+    if narf_net::iface::lookup(name).is_none() {
+        return TestResult::Fail("iface not published under its name");
+    }
+    let mut frame = [0u8; 64];
+    frame[..6].fill(0xFF);
+    frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+    frame[12] = 0xFF;
+    frame[13] = 0xFF;
+    if narf_net::iface::send_on(name, &frame).is_err() {
+        return TestResult::Fail("send_on cookie-0 TX failed");
+    }
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    let after = match super::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) vanished across re-probe"),
+    };
+    if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrl) {
+        return TestResult::Fail("re-probe replaced controller(0)");
+    }
+    let ring_ptr = narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+    if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
+    }
+    if ctrl.rx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("attach took the NIC's RX ring");
+    }
+    let tx_ptr = narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+    if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
+    }
+    if ctrl.tx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("attach took the NIC's TX ring");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_multi_instance_cookie_dispatch
+);
 
 // ── Stage 6: HwNic adapter surface ─────────────────────────────────
 
@@ -367,7 +479,7 @@ fn smoke_ixgbe_hwnic_surface() -> TestResult {
     // Also assert the `model()` method returns IntelIxgbe — verified
     // via with_controller if the device is bound; otherwise just
     // assert the surface exists without crashing.
-    if let Some(model) = super::with_controller(|c| c.model()) {
+    if let Some(model) = super::with_controller(0, |c| c.model()) {
         if model != NicModel::IntelIxgbe {
             return TestResult::Fail("model() mismatch");
         }

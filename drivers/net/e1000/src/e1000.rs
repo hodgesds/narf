@@ -61,7 +61,7 @@
 //! | 0x5400  | RAL  | Receive Address Low (MAC[0..4])   |
 //! | 0x5404  | RAH  | Receive Address High (MAC[4..6] + valid bit) |
 
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
@@ -1268,14 +1268,15 @@ pub fn rx_drop_reason(desc: &RxDesc) -> Option<RxDropReason> {
     None
 }
 
-/// Report one RX-verdict drop to the stack counters.
-fn count_rx_drop(reason: RxDropReason) {
+/// Report one RX-verdict drop to the stack counters, under `name` —
+/// the interface the frame arrived on.
+fn count_rx_drop(name: &str, reason: RxDropReason) {
     match reason {
         RxDropReason::CrcError => {
-            narf_net::iface::note_rx_crc_error(e1000_ifname(), 1);
+            narf_net::iface::note_rx_crc_error(name, 1);
         }
         RxDropReason::FrameError | RxDropReason::CsumFail => {
-            narf_net::iface::note_rx_drop(e1000_ifname(), 1);
+            narf_net::iface::note_rx_drop(name, 1);
         }
     }
 }
@@ -1863,11 +1864,11 @@ pub struct E1000 {
 
     // IPC integration
     rx_ipc_prod: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
-    rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     /// Raw-frame mirroring stays off until a registry consumer actually takes
     /// `rx_ipc_ring`; the in-kernel TCP stack otherwise pays no copy/allocation.
     rx_mirror_enabled: AtomicBool,
-    tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     /// Set by `detach_device`: every datapath entry point fails fast
     /// once this is set (igb pattern, spec §3 / issue #789). The async
     /// pumps are not torn down on detach — they hold `Arc<E1000>` —
@@ -1877,6 +1878,18 @@ pub struct E1000 {
     /// refuse TX and RX while this is set, and the interface
     /// publishes link down.
     suspended: AtomicBool,
+    /// PCI address of the function this instance drives. Probe
+    /// refuses a second bind of the same live address (issue #795):
+    /// two `E1000`s for one chip would drive one set of rings.
+    pub addr: narf_bus::BusAddr,
+    /// Interface name `publish_netdev_with_context` assigned this
+    /// instance (`eth%d`). Per-instance (i40e/igc pattern): the old
+    /// module-level `E1000_IFNAME` static could only name one NIC.
+    ifname: crate::publish::IfName,
+    /// Link Status Change pending, set by the ISR when ICR reports
+    /// LSC. Per-instance: the old module-level `LSC_PENDING` could
+    /// only flag one NIC's transition (issue #791).
+    lsc_pending: AtomicBool,
 }
 
 // SAFETY: `E1000` only auto-fails `Send` because `MmioRegion`/`DmaBuffer`
@@ -1903,14 +1916,12 @@ impl core::fmt::Debug for E1000 {
     }
 }
 
-/// Link Status Change pending, set by the ISR when ICR reports LSC.
-/// The ISR does no lock or allocation work; the RX pump (task
-/// context) consumes the flag, re-samples STATUS, and republishes the
-/// iface link metadata — before this, carrier was a probe-time
-/// photograph because the ISR read ICR only to acknowledge it
-/// (issue #791).
-static LSC_PENDING: AtomicBool = AtomicBool::new(false);
-
+/// Link Status Change pending lives on the controller now
+/// (`E1000::lsc_pending`): the ISR sets the flag of the device whose
+/// vector fired, and that device's RX pump (task context) consumes
+/// it, re-samples STATUS, and republishes the iface link metadata.
+/// A module-level flag could only name one NIC's transition
+/// (issue #791 vs #795).
 /// Decode a STATUS word into a publication sample. Shared by probe
 /// (initial state) and the RX pump's LSC drain (every transition).
 fn link_sample_from_status(status: u32) -> crate::publish::LinkSample {
@@ -1934,38 +1945,43 @@ fn link_sample_from_status(status: u32) -> crate::publish::LinkSample {
     }
 }
 
-/// MMIO base of the IRQ-attached e1000, shared with the static ISR
-/// so it can read ICR (auto-clear, §13.4.17) and deassert legacy
-/// INTx. 0 = no controller bound (handler short-circuits).
-///
-/// Single-controller invariant matches the rest of the driver:
-/// `CONTROLLER` is a single `Option<E1000>` slot below.
-static ISR_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
-
-/// Sync ISR: read ICR to acknowledge + deassert level-triggered INTx,
-/// then return. The dispatch layer (`narf_interrupts::dispatch::on_irq`)
-/// bumps the per-vector fire-count and wakes the registered waker; the
-/// `rx_async`/`tx_async` consumers then run the actual descriptor
-/// drain on a normal task.
-fn e1000_isr() {
-    let base = ISR_MMIO_BASE.load(Ordering::Acquire);
-    if base == 0 {
-        return;
+/// Sync ISR, demultiplexed by vector: `install_handler_named`
+/// passes the vector back as the cookie, and the handler acks only
+/// the controllers bound to that vector — the igc `ISR_HW` pattern,
+/// without the table, since the vector already lives on the
+/// controller. The old static `ISR_MMIO_BASE` could only ack one
+/// NIC: a second e1000 overwrote it, leaving the first device's
+/// level-triggered INTx unacknowledged (issue #795). Detached
+/// controllers are skipped: detach masks the device, so a stale
+/// in-flight interrupt must not revive it. The dispatch layer
+/// (`narf_interrupts::dispatch::on_irq`) bumps the per-vector
+/// fire-count and wakes the registered waker; the `rx_async` /
+/// `tx_async` consumers then run the actual descriptor drain on a
+/// normal task.
+fn e1000_isr(cookie: u64) -> narf_interrupts::dispatch::IrqStatus {
+    let vector = cookie as u8;
+    for dev in CONTROLLERS.lock().iter() {
+        if dev.detached.load(Ordering::Acquire) || dev.irq_vector != Some(vector) {
+            continue;
+        }
+        // SAFETY: `dev.mmio` is the device's BAR0 mapping, valid for
+        // the controller lifetime; ICR (offset 0xC0) is well inside
+        // the e1000 register window. The read auto-clears all pending
+        // cause bits per 8254x SDM §13.4.17 — the documented
+        // acknowledge for level-triggered INTx delivery and a no-op
+        // for MSI-X (which is edge-triggered but tolerates the read).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let icr = unsafe { narf_arch::mmio::read32(dev.mmio.virt + REG_ICR) };
+        // LSC is in the default IMS mask, so a link transition reaches
+        // this read; record it for the pump instead of discarding the
+        // cause word (issue #791). The RX pump (task context)
+        // consumes the per-device flag, re-samples STATUS, and
+        // republishes the iface link metadata.
+        if icr & IMS_LSC != 0 {
+            dev.lsc_pending.store(true, Ordering::Release);
+        }
     }
-    // SAFETY: `base` is the device's BAR0 phys, identity-mapped at
-    // bring-up; ICR (offset 0xC0) is well inside the e1000 register
-    // window. The read auto-clears all pending cause bits per 8254x
-    // SDM §13.4.17 — this is the documented acknowledge for
-    // level-triggered INTx delivery and a no-op for MSI-X (which
-    // is edge-triggered but tolerates the read).
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let icr = unsafe { narf_arch::mmio::read32(base + REG_ICR) };
-    // LSC is in the default IMS mask, so a link transition reaches
-    // this read; record it for the pump instead of discarding the
-    // cause word (issue #791).
-    if icr & IMS_LSC != 0 {
-        LSC_PENDING.store(true, Ordering::Release);
-    }
+    narf_interrupts::dispatch::IrqStatus::Handled
 }
 
 impl E1000 {
@@ -2223,14 +2239,13 @@ impl E1000 {
             },
         };
 
-        // Publish MMIO base for the static ISR before installing the
-        // handler — otherwise an early INTx could race and find a
-        // zero base.
-        if irq_vector.is_some() {
-            ISR_MMIO_BASE.store(mmio.virt, Ordering::Release);
-        }
+        // Install the ISR with the vector as its cookie, so the
+        // handler can demultiplex by vector (see `e1000_isr`). An early
+        // interrupt racing bring-up finds no controller bound to the
+        // vector yet and is ignored; IMS is programmed below, so no
+        // cause can fire before the device is up.
         if let Some(v) = irq_vector {
-            narf_interrupts::install_handler(v, e1000_isr);
+            narf_interrupts::dispatch::install_handler_named(v, "e1000", u64::from(v), e1000_isr);
         }
 
         // 8. Adjust the PCI Command register based on which IRQ path
@@ -2315,6 +2330,9 @@ impl E1000 {
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
             detached: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
+            addr: device.addr,
+            ifname: crate::publish::IfName::new(),
+            lsc_pending: AtomicBool::new(false),
         };
 
         // Pump tasks are spawned by the caller (probe) once it has
@@ -2989,7 +3007,7 @@ impl E1000 {
                 return 0;
             }
             if let Some(reason) = rx_drop_reason(&desc) {
-                count_rx_drop(reason);
+                count_rx_drop(self.ifname(), reason);
                 // Rearm the dropped descriptor: clear status, leave
                 // addr as-is. RDT advances below once a deliverable
                 // frame is found, or on the empty-exit above.
@@ -3107,7 +3125,7 @@ impl E1000 {
             // hands them back), but `f` — and therefore the stack and
             // the RX mirror — never sees them.
             if let Some(reason) = rx_drop_reason(&desc) {
-                count_rx_drop(reason);
+                count_rx_drop(self.ifname(), reason);
             } else {
                 let len = (desc.length as usize).min(RX_BUF_LEN);
                 // Descriptor `head` is backed by `rx_pool[head]` at probe and
@@ -3336,8 +3354,8 @@ impl E1000 {
             self.mmio.write32(REG_TCTL, Self::TCTL_SUSPEND_OFF);
             self.mmio.write32(REG_RCTL, Self::RCTL_SUSPEND_OFF);
         }
-        LSC_PENDING.store(false, Ordering::Release);
-        crate::publish::publish_link(e1000_ifname(), crate::publish::LinkSample::DOWN);
+        self.lsc_pending.store(false, Ordering::Release);
+        crate::publish::publish_link(self.ifname(), crate::publish::LinkSample::DOWN);
         Ok(())
     }
 
@@ -3374,7 +3392,7 @@ impl E1000 {
         }
         self.suspended.store(false, Ordering::Release);
         let status = self.read_status();
-        crate::publish::publish_link(e1000_ifname(), link_sample_from_status(status));
+        crate::publish::publish_link(self.ifname(), link_sample_from_status(status));
         Ok(())
     }
 
@@ -3386,7 +3404,6 @@ impl E1000 {
     /// [`e1000_detach`].
     fn detach_device(&self) {
         self.detached.store(true, Ordering::Release);
-        ISR_MMIO_BASE.store(0, Ordering::Release);
         // SAFETY: identity-mapped MMIO.
         unsafe {
             self.mmio.write32(REG_IMC, !0u32);
@@ -3396,34 +3413,78 @@ impl E1000 {
     }
 }
 
+impl E1000 {
+    /// This instance's published interface name (`eth%d`), or `""`
+    /// before probe publishes it. Per-instance state (i40e/igc
+    /// pattern); the pumps and the registry adapter read the name
+    /// off the device they serve, never a module-level static.
+    pub fn ifname(&self) -> &'static str {
+        self.ifname.get()
+    }
+}
+
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<E1000>>> = IrqSafeSpinLock::new(None);
+/// Every probed controller, by probe order. The index is the cookie
+/// the kernel-side stack's send path resolves through
+/// [`e1000_send_frame`] — the i40e `CONTROLLERS` pattern, so a second
+/// 8254x on the same machine probes, binds, and carries traffic
+/// instead of being dropped by a singleton slot (issue #795). The
+/// vec never shrinks: detaches mark the device in place instead of
+/// removing its slot, so a live controller's cookie stays valid for
+/// the kernel lifetime.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<E1000>>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-/// Detach the bound e1000 device, if any: device half (mask, stop
-/// DMA, drop the ISR base, set the datapath gate), then the
-/// registry half the net spec §3 obliges — publish link down, clear
-/// the RX-mirror attach note for the interface name (names are
+/// The probed controller at `index`, if it is live (probed and not
+/// detached). The index is the cookie probe assigned (see
+/// `CONTROLLERS`); it is stable because the vec never shrinks.
+fn live_controller(index: usize) -> Option<Arc<E1000>> {
+    CONTROLLERS
+        .lock()
+        .get(index)
+        .filter(|c| !c.detached.load(Ordering::Acquire))
+        .cloned()
+}
+
+/// Detach the bound e1000 device at `index`, if any: device half
+/// (mask, stop DMA, drop the ISR base, set the datapath gate), then
+/// the registry half the net spec §3 obliges — publish link down,
+/// clear the RX-mirror attach note for the interface name (names are
 /// lowest-free-allocated and reused), and unregister the interface.
-/// Idempotent: a second call finds no controller and does nothing.
-/// The async pumps are not joined (they hold `Arc<E1000>` clones),
-/// but every datapath entry point fails fast once detached, so a
-/// parked pump can no longer touch the device.
-pub fn e1000_detach() {
-    let controller = CONTROLLER.lock().take();
-    let Some(device) = controller else {
+/// Idempotent: an out-of-range index or an already-detached device
+/// does nothing. The async pumps are not joined (they hold
+/// `Arc<E1000>` clones), but every datapath entry point fails fast
+/// once detached, so a parked pump can no longer touch the device.
+/// The `CONTROLLERS` slot is kept so other controllers' cookies
+/// stay valid.
+pub fn e1000_detach(index: usize) {
+    let Some(device) = CONTROLLERS.lock().get(index).cloned() else {
         return;
     };
+    if device.detached.load(Ordering::Acquire) {
+        return;
+    }
     device.detach_device();
-    let name = e1000_ifname();
+    let name = device.ifname();
     crate::publish::publish_link(name, crate::publish::LinkSample::DOWN);
     crate::publish::clear_rx_mirror_attached(name);
     let _ = narf_net::iface::unregister(name);
-    *E1000_IFNAME.lock() = None;
 }
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    // A second probe of the SAME live function is a no-op success
+    // (the old idempotent behaviour): the bus re-walks devices, and
+    // rebuilding a second `E1000` for the same silicon would let two
+    // instances drive one chip's rings. A second FUNCTION binds as a
+    // new instance instead of being dropped (issue #795). A detached
+    // entry does not block a re-probe of its address, so a hot
+    // re-bind after detach can reclaim the function.
+    if CONTROLLERS
+        .lock()
+        .iter()
+        .any(|c| c.addr == device.addr && !c.detached.load(Ordering::Acquire))
+    {
         return Ok(());
     }
     // Enable MEM_SPACE + BUS_MASTER. Leave the legacy INTx path
@@ -3443,7 +3504,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     *dev_inner.rx_ipc_prod.lock() = Some(rx_prod);
     let dev = Arc::new(dev_inner);
-    *CONTROLLER.lock() = Some(dev.clone());
+    // Retain before any ring DMA address reaches the device; the
+    // index is this instance's send-path cookie (see `CONTROLLERS`).
+    let index = {
+        let mut g = CONTROLLERS.lock();
+        g.push(dev.clone());
+        g.len() - 1
+    };
     spawn_pumps(dev.clone(), tx_cons);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -3458,8 +3525,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // kernel-side busy-wait paths (ARP / TCP handshake) pull
     // frames off the NIC ring directly while spinning, since the
     // spawned RX-pump task can't run while a syscall is parked
-    // in `responsive_spin_until`.
-    let name = narf_net::iface::register("eth%d", dev.mac, e1000_send_frame);
+    // in `responsive_spin_until`. The send hook carries this
+    // instance's `CONTROLLERS` index as its cookie, so each port's
+    // outbound frames resolve to its own NIC.
+    let name = crate::publish::publish_netdev_with_context(
+        dev.mac,
+        index as u64,
+        e1000_send_frame,
+        link_sample_from_status(dev.read_status()),
+    );
     // `e1000_get_drvinfo`: driver "e1000", no version (the core reports the
     // kernel release), bus_info = pci_name().
     let bus_info = match device.addr {
@@ -3467,8 +3541,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
     };
     narf_net::iface::set_driver_info(&name, "e1000", None, bus_info);
-    let status = dev.read_status();
-    crate::publish::publish_link(&name, link_sample_from_status(status));
     narf_net::iface::set_offloads(
         &name,
         narf_net::OffloadCapabilities {
@@ -3479,24 +3551,29 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             ..Default::default()
         },
     );
-    *E1000_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
+    dev.ifname.set(name.clone());
     narf_net::iface::install_rx_drain(rx_pump_step);
     // The legacy e1000 has one RX queue and delivers ordinary MTU-sized
     // descriptors, so software GRO is what amortizes the shared stack work at
     // gigabit packet rates. The coalescer excludes loopback and preserves
     // control/options boundaries; the RX pump flushes it whenever the ring is
     // drained to empty.
-    let _ = narf_net::iface::set_software_gro(e1000_ifname(), true);
+    let _ = narf_net::iface::set_software_gro(&name, true);
     // Opt into zero-copy TX (P-F): the stack builds egress frames straight into
     // a pooled DMA buffer and hands it to `e1000_send_frame_zc`, which DMAs it
     // without the per-frame slice copy `e1000_send_frame` does. The 64 KiB
     // buffers also hold a complete bounded TSO super-frame; completion returns
-    // them to the same TX-ring-deep recycling pool.
-    narf_net::iface::enable_zero_copy_tx_pool(
-        e1000_ifname(),
+    // them to the same TX-ring-deep recycling pool. The context form
+    // carries this instance's `CONTROLLERS` index as its cookie (igc
+    // pattern), so a second port's zero-copy frames resolve to its
+    // own pool instead of the first port's.
+    narf_net::iface::enable_zero_copy_tx_context(
+        &name,
+        index as u64,
         e1000_send_frame_zc,
-        dev.tx_zc_pool.clone(),
+        alloc::vec![dev.tx_zc_pool.clone()],
         0,
+        false,
     );
 
     // Stage-4 registry (cap-gated)
@@ -3505,7 +3582,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(&auth, E1000Nic);
+        let _ = narf_net::registry().register(&auth, E1000Nic { nic: dev.clone() });
     }
 
     Ok(())
@@ -3542,9 +3619,9 @@ async fn e1000_rx_pump(device: Arc<E1000>) {
         // transition; re-sample STATUS in task context and republish.
         // The pump wakes on the same interrupt (LSC is in IMS_DEFAULT)
         // or on the 10 ms fallback, so this adds no polling loop.
-        if LSC_PENDING.swap(false, Ordering::AcqRel) {
+        if device.lsc_pending.swap(false, Ordering::AcqRel) {
             let status = device.read_status();
-            crate::publish::publish_link(e1000_ifname(), link_sample_from_status(status));
+            crate::publish::publish_link(device.ifname(), link_sample_from_status(status));
         }
         let irq_waiter = device.irq_vector.map(|vector| {
             narf_interrupts::wait_for_irq_until(
@@ -3562,7 +3639,7 @@ async fn e1000_rx_pump(device: Arc<E1000>) {
         narf_net::tcp_stack::gro_flush();
         let missed = device.read_mpc();
         if missed > 0 {
-            narf_net::iface::note_rx_overrun(e1000_ifname(), missed as u64);
+            narf_net::iface::note_rx_overrun(device.ifname(), missed as u64);
         }
         match irq_waiter {
             Some(waiter) => {
@@ -3598,19 +3675,20 @@ fn dispatch_rx_frame(device: &E1000, frame: &mut [u8]) {
             }
         }
     }
-    narf_net::iface::on_rx_frame_from(e1000_ifname(), frame);
+    narf_net::iface::on_rx_frame_from(device.ifname(), frame);
 }
 
-/// SendFn registered with `narf_net::iface` at probe time. Routes
-/// the kernel-side TCP stack's outbound frames through E1000::tx.
-fn e1000_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    // Clone the Arc out rather than holding the IRQ-masking CONTROLLER
+/// `SendCtxFn` registered with `narf_net::iface` at probe time. Routes
+/// the kernel-side TCP stack's outbound frames through E1000::tx; the
+/// cookie is the controller's index in `CONTROLLERS`.
+fn e1000_send_frame(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    // Clone the Arc out rather than holding the IRQ-masking CONTROLLERS
     // lock across `tx`, which busy-polls the DD bit for up to 250 ms.
     // Holding it here masked interrupts on this CPU for the whole
     // hardware wait and made every concurrent sender (and the RX pump)
     // spin on the same lock, interrupts masked — a thundering herd that
-    // starves timers and RCU. See `probed_controller`.
-    let ctrl = probed_controller().ok_or(())?;
+    // starves timers and RCU. See `controller`.
+    let ctrl = live_controller(cookie as usize).ok_or(())?;
     if let Some(mss) = meta.tso_mss {
         let mut buf = ctrl.tx_zc_pool.try_acquire().ok_or(())?;
         if frame.len() > buf.len() {
@@ -3634,12 +3712,19 @@ fn e1000_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
         .map_err(|_| ())
 }
 
-/// Zero-copy `SendFrameFn` (P-F): the stack built this frame directly into a
+/// Zero-copy `SendFrameCtxFn` (P-F): the stack built this frame directly into a
 /// DMA buffer from the controller's shared TX pool. Transfer ownership to the
 /// descriptor ring and return after publication; completion reclaim recycles
-/// the buffer only after hardware writes DD.
-fn e1000_send_frame_zc(mut frame: narf_net::Frame, meta: narf_net::TxMeta) -> Result<(), ()> {
-    let ctrl = probed_controller().ok_or(())?;
+/// the buffer only after hardware writes DD. The cookie is the
+/// controller's index in `CONTROLLERS` (see `enable_zero_copy_tx_context`
+/// in probe); resolving it here is what keeps a second port's
+/// zero-copy frames out of the first port's pool.
+fn e1000_send_frame_zc(
+    cookie: u64,
+    mut frame: narf_net::Frame,
+    meta: narf_net::TxMeta,
+) -> Result<(), ()> {
+    let ctrl = live_controller(cookie as usize).ok_or(())?;
     let context = match meta.tso_mss {
         Some(mss) => match prepare_ipv4_tso(frame.payload_mut(), mss) {
             Ok(context) => Some(context),
@@ -3666,22 +3751,37 @@ fn e1000_send_frame_zc(mut frame: narf_net::Frame, meta: narf_net::TxMeta) -> Re
     }
 }
 
-/// Drain one frame from the RX ring + dispatch it through the
-/// network stack's RX handler. Returns true iff the ring advanced (a
-/// frame was delivered, or a verdict-dropped frame was consumed).
-/// Called from a kernel-side polling task spawned at boot.
+/// Drain one frame from each live controller's RX ring + dispatch it
+/// through the network stack's RX handler. Returns true iff any ring
+/// advanced (a frame was delivered, or a verdict-dropped frame was
+/// consumed). Called from a kernel-side polling task spawned at boot.
+/// Every live port is drained (not just the first): with one global
+/// drain step, a second NIC's replies would otherwise stall until its
+/// async pump gets CPU — which never happens while the syscall is
+/// parked (issue #795).
 pub fn rx_pump_step() -> bool {
     // Zero-copy: dispatch the frame straight out of its RX DMA page rather than
     // copying it into a scratch buffer first (P-F). Same lock discipline as
     // `e1000_send_frame` — `rx_recv_in_place` holds only the controller's
-    // `rx_head` lock across the synchronous stack dispatch, never CONTROLLER,
+    // `rx_head` lock across the synchronous stack dispatch, never CONTROLLERS,
     // so a TX stuck in its 250 ms DD poll cannot stall RX. An attached XDP
     // program rewriting header bytes writes the DMA page directly, which the
     // driver owns until it re-arms the slot after dispatch returns.
-    match probed_controller() {
-        Some(c) => c.rx_recv_in_place(|frame| dispatch_rx_frame(&c, frame)),
-        None => false,
+    // Clone the handles out first so no `CONTROLLERS` lock is held
+    // across the synchronous stack dispatch.
+    let controllers: alloc::vec::Vec<Arc<E1000>> = CONTROLLERS
+        .lock()
+        .iter()
+        .filter(|c| !c.detached.load(Ordering::Acquire))
+        .cloned()
+        .collect();
+    let mut any = false;
+    for c in controllers {
+        if c.rx_recv_in_place(|frame| dispatch_rx_frame(&c, frame)) {
+            any = true;
+        }
     }
+    any
 }
 
 /// Every Intel device id this driver claims. Kept as a single
@@ -3866,76 +3966,62 @@ fn name_for(did: u16) -> &'static str {
     }
 }
 
-/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
-/// `dev_alloc_name`). Set once at probe; the device lives as long as the
-/// kernel, so the name is leaked into a `&'static str`.
-static E1000_IFNAME: narf_lib::sync::IrqSafeSpinLock<Option<&'static str>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-
-/// This NIC's interface name; empty until it has registered.
-pub fn e1000_ifname() -> &'static str {
-    E1000_IFNAME.lock().unwrap_or("")
-}
-
+/// The `narf_net::Interface` + `HwNic` adapter probe registers for
+/// one e1000 instance. Holds the instance's `Arc<E1000>` directly:
+/// the old zero-sized `E1000Nic` resolved every call through the
+/// module-level `CONTROLLER` singleton, so a second 8254x's
+/// interface reported the first port's MAC, link state, and rings
+/// (issue #795). The rings are borrowed from the NIC's own
+/// `rx_ipc_ring` / `tx_ipc_ring` fields. The name always comes from
+/// `E1000::ifname()`, which is `""` before probe publishes it
+/// (matching the old `e1000_ifname()` default).
 #[derive(Debug)]
-pub struct E1000Nic;
+pub struct E1000Nic {
+    nic: Arc<E1000>,
+}
 
 impl narf_net::Interface for E1000Nic {
     fn name(&self) -> &str {
-        e1000_ifname()
+        self.nic.ifname()
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        // Probe-time value, gated on suspend (detached reads as
-        // false via the `None` controller). Live transitions still
+        // Probe-time value, gated on suspend. Live transitions still
         // arrive via `publish_link` / the LSC drain.
-        with_controller(|c| c.link_up && !c.suspended.load(Ordering::Acquire)).unwrap_or(false)
+        self.nic.link_up && !self.nic.suspended.load(Ordering::Acquire)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-                if r.is_some() {
-                    c.rx_mirror_enabled.store(true, Ordering::Release);
-                }
-            }
-        });
-        &RING
+        // Ring consumer attached: enable this instance's RX mirror —
+        // the old take-into-static set `rx_mirror_enabled` at this
+        // moment — and record the attach under this port's own name,
+        // so detach can clear it. The flag is one-way, never cleared.
+        self.nic.rx_mirror_enabled.store(true, Ordering::Release);
+        crate::publish::note_rx_mirror_attached(self.nic.ifname());
+        &self.nic.rx_ipc_ring
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.nic.tx_ipc_ring
     }
 }
 
 impl crate::HwNic for E1000Nic {
     fn name(&self) -> &'static str {
-        e1000_ifname()
+        self.nic.ifname()
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
         // Same suspend gate as the `Interface` impl above.
-        with_controller(|c| c.link_up && !c.suspended.load(Ordering::Acquire)).unwrap_or(false)
+        self.nic.link_up && !self.nic.suspended.load(Ordering::Acquire)
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::IntelE1000
@@ -3957,41 +4043,61 @@ impl crate::HwNic for E1000Nic {
     }
 }
 
+/// True iff at least one controller is live (probed and not
+/// detached).
 pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+    CONTROLLERS
+        .lock()
+        .iter()
+        .any(|c| !c.detached.load(Ordering::Acquire))
 }
 
-/// Clone the installed controller handle, holding `CONTROLLER` only for
-/// the refcount bump.
+/// Number of live controllers. The index of a controller in
+/// `CONTROLLERS` is its send-path cookie; the vec never shrinks, so
+/// a live controller's cookie is stable for the kernel lifetime.
+pub fn instance_count() -> usize {
+    CONTROLLERS
+        .lock()
+        .iter()
+        .filter(|c| !c.detached.load(Ordering::Acquire))
+        .count()
+}
+
+/// Clone the controller handle at `index`, holding `CONTROLLERS`
+/// only for the refcount bump.
 ///
-/// `CONTROLLER` is an `IrqSafeSpinLock`, so holding it across a device
-/// round-trip masks interrupts on the waiting CPU for the whole wait and
-/// forces every other CPU touching the NIC to spin with interrupts
-/// masked too — `tx` busy-polls the descriptor DD bit for up to 250 ms,
-/// which starves timers and RCU exactly like the virtio-blk CONTROLLER
-/// herd. Cloning the `Arc` out instead keeps the device alive without
-/// any lock held; mutual exclusion on the rings is provided by the
-/// controller's own `tx_state`/`rx_head` locks, which are held only
-/// across the bounded descriptor post/drain, never across the DD poll.
-pub fn probed_controller() -> Option<Arc<E1000>> {
-    CONTROLLER.lock().clone()
+/// `CONTROLLERS` is an `IrqSafeSpinLock`, so holding it across a
+/// device round-trip masks interrupts on the waiting CPU for the
+/// whole wait and forces every other CPU touching the NIC to spin
+/// with interrupts masked too — `tx` busy-polls the descriptor DD
+/// bit for up to 250 ms, which starves timers and RCU exactly like
+/// the virtio-blk CONTROLLER herd. Cloning the `Arc` out instead
+/// keeps the device alive without any lock held; mutual exclusion
+/// on the rings is provided by the controller's own
+/// `tx_state`/`rx_head` locks, which are held only across the
+/// bounded descriptor post/drain, never across the DD poll.
+/// Returns `None` for an out-of-range index or a detached device.
+pub fn controller(index: usize) -> Option<Arc<E1000>> {
+    live_controller(index)
 }
 
-/// Run `f` against the probed controller WITHOUT holding `CONTROLLER`
-/// for the duration — see [`probed_controller`]. `f` may block or poll
-/// the device; interrupts keep their caller-supplied state throughout.
-pub fn with_controller<R>(f: impl FnOnce(&E1000) -> R) -> Option<R> {
-    probed_controller().map(|a| f(&a))
+/// Run `f` against the controller at `index` WITHOUT holding
+/// `CONTROLLERS` for the duration — see [`controller`]. `f` may
+/// block or poll the device; interrupts keep their caller-supplied
+/// state throughout.
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&E1000) -> R) -> Option<R> {
+    controller(index).map(|a| f(&a))
 }
 
-/// IRQ-driven RX. Constructs the `wait_for_irq` future *before*
+/// IRQ-driven RX on the controller at `index`. Constructs the
+/// `wait_for_irq` future *before*
 /// inspecting the ring (so an IRQ that lands between the ring drain
 /// and the await still wakes us — the future snapshots fire-count
 /// at construction). On wake, drains one frame into `out` and
 /// returns the byte count. Returns 0 if no controller is bound or
 /// no IRQ vector is wired (caller should fall back to `rx_recv`).
-pub async fn rx_async(out: &mut [u8]) -> usize {
-    let vector = match with_controller(|c| c.irq_vector).flatten() {
+pub async fn rx_async(index: usize, out: &mut [u8]) -> usize {
+    let vector = match with_controller(index, |c| c.irq_vector).flatten() {
         Some(v) => v,
         None => return 0,
     };
@@ -4005,7 +4111,7 @@ pub async fn rx_async(out: &mut [u8]) -> usize {
     let waiter = narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(250));
     // Fast path: there might already be a frame ready (e.g. an IRQ
     // landed before we got here). Drain it without awaiting.
-    if let Some(n) = with_controller(|c| {
+    if let Some(n) = with_controller(index, |c| {
         if c.rx_has_pending() {
             Some(c.rx_recv(out))
         } else {
@@ -4021,19 +4127,21 @@ pub async fn rx_async(out: &mut [u8]) -> usize {
     // Slow path: await the next RX IRQ OR timeout, then drain
     // whatever the ring has (Ok or Err: drain either way).
     let _ = waiter.await;
-    with_controller(|c| c.rx_recv(out)).unwrap_or(0)
+    with_controller(index, |c| c.rx_recv(out)).unwrap_or(0)
 }
 
-/// IRQ-driven TX. Posts `frame` to the TX ring then awaits TXDW.
+/// IRQ-driven TX on the controller at `index`. Posts `frame` to the
+/// TX ring then awaits TXDW.
 /// Mirrors the polled `tx` semantics (one frame per call) but parks
 /// the caller on the IRQ instead of spinning on DD. Falls back to
 /// the polled `tx` path if no IRQ vector is wired.
-pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
-    let vector = match with_controller(|c| c.irq_vector).flatten() {
+pub async fn tx_async(index: usize, frame: &[u8]) -> Result<(), E1000Error> {
+    let vector = match with_controller(index, |c| c.irq_vector).flatten() {
         Some(v) => v,
         None => {
             // No IRQ wired — synchronous path is the only option.
-            return with_controller(|c| c.tx(frame)).unwrap_or(Err(E1000Error::UnsupportedDevice));
+            return with_controller(index, |c| c.tx(frame))
+                .unwrap_or(Err(E1000Error::UnsupportedDevice));
         }
     };
     // Construct the future first, then enqueue. If the device
@@ -4043,7 +4151,7 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     // normally; if it doesn't, the IRQ isn't wired right and we
     // should bail rather than stall.
     let waiter = narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(500));
-    let ticket = match with_controller(|c| c.tx_enqueue(frame, true, None))
+    let ticket = match with_controller(index, |c| c.tx_enqueue(frame, true, None))
         .unwrap_or(Err(E1000Error::UnsupportedDevice))
     {
         Ok(s) => s,
@@ -4058,7 +4166,7 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     // deadline; if we hit 5 spurious wakes the caller's higher-
     // level timeout (sys_send, etc.) will abort us.
     let _ = waiter.await;
-    while !with_controller(|c| c.tx_slot_done(ticket)).unwrap_or(false) {
+    while !with_controller(index, |c| c.tx_slot_done(ticket)).unwrap_or(false) {
         let _ =
             narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(500)).await;
     }
