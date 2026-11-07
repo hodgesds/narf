@@ -1,9 +1,11 @@
 //! Chelsio T4/T5/T6 NIC — dual-build (built-in or loadable `.ko`).
 //!
-//! See `narf-drivers-net-e1000` for the reference pattern. The real driver in
-//! [`cxgb4`] compiles only for the built-in build; the `module` build registers
-//! through the `narf_register_pci_driver` KSYMTAB export (registration-only
-//! until the device datapath ABI lands).
+//! See `narf-drivers-net-e1000` for the reference pattern. There is
+//! no datapath: cxgb4 is explicitly not implemented (issue #799) —
+//! the built-in build in [`cxgb4`] registers a refusal-only PCI
+//! match, and the `module` build registers through the
+//! `narf_register_pci_driver` KSYMTAB export with a probe that
+//! returns `-ENOSYS`.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
