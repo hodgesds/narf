@@ -3954,6 +3954,12 @@ fn smoke_usb_uvc_reassembly_config_from_negotiated() -> TestResult {
         uvc_version: 0x0150,
         clock_frequency: 48_000_000,
         controller: 0,
+        pu_unit_id: 0,
+        ct_unit_id: 0,
+        controls: alloc::vec![],
+        hub_port: None,
+        last_stream: None,
+        suspended_stream: None,
     };
     let config = device.reassembly_config();
     if config != ReassemblyConfig::stream_based(16, 0) {
@@ -10928,6 +10934,7 @@ fn smoke_usb_uvc_stream_based_pump_completes_on_length() -> TestResult {
         &*transport,
         7,
         &blob,
+        None,
     )) {
         Ok(idx) => idx,
         Err(_) => {
@@ -11068,6 +11075,7 @@ fn smoke_uvc_v4l2_controls_from_descriptors_e2e() -> TestResult {
         &*transport,
         7,
         &blob,
+        None,
     )) {
         Ok(idx) => idx,
         Err(_) => return TestResult::Fail("bind against the modelled controls camera failed"),

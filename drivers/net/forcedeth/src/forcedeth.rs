@@ -591,15 +591,13 @@ pub enum NicError {
     MiiError,
     /// Frame outside [1, 1518].
     FrameTooLong,
-    /// The datapath was used while the device is suspended.
+    /// The device is suspended for system suspend (issue #793):
+    /// the datapath gates refuse TX and RX while suspended.
     Suspended,
     /// `transmit` couldn't find a free TX descriptor.
     TxRingFull,
     /// `transmit` polled too long for VALID to clear.
     TxTimeout,
-    /// The device is suspended for system suspend (issue #793):
-    /// the datapath gates refuse TX and RX while suspended.
-    Suspended,
 }
 
 // ── Descriptor in-memory shape ──────────────────────────────────────
@@ -2574,6 +2572,10 @@ mod tests {
                 link_up: true,
                 phy_addr: 0,
                 txrxctl_bits: TXRXCTL_DESC_2,
+                wol_enabled: AtomicBool::new(false),
+                suspended: AtomicBool::new(false),
+                addr: narf_bus::BusAddr::Mmio(mem.phys_addr()),
+                ifname: crate::publish::IfName::new(),
                 rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
                 tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
             };
