@@ -117,6 +117,20 @@ pub(crate) struct Capture {
     pub now_ns: u64,
     pub state: GtState,
     pub engines: EngineSet,
+    pub process_name: Option<&'static str>,
+    pub pid: Option<u32>,
+    pub snapshot_time: Option<(u64, u32)>,
+}
+impl Capture {
+    pub(crate) fn with_process(mut self, name: &'static str, pid: u32) -> Self {
+        self.process_name = Some(name);
+        self.pid = Some(pid);
+        self
+    }
+    pub(crate) fn with_snapshot_time(mut self, secs: u64, nanos: u32) -> Self {
+        self.snapshot_time = Some((secs, nanos));
+        self
+    }
 }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum RegisterAccess {

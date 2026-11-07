@@ -404,6 +404,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 now_ns,
                 state: self.state,
                 engines: self.engines().unwrap_or_default(),
+                process_name: None,
+                pid: None,
+                snapshot_time: None,
             },
             self.parts.scheduler.as_ref().map_or_else(
                 || crate::intel_gpu_error::Contexts::new(0),

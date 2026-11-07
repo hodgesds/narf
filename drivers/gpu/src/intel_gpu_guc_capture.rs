@@ -514,17 +514,31 @@ impl Node {
     /// xe_engine_manual_capture for one engine: global, class and instance
     /// lists in source order. `read` returns None once current wake or PCI
     /// authority is lost; capture stops there, never retrying. NARF omits the
-    /// steered render/compute extension, whose unicast reads need MCR
-    /// steering writes in the failure path. guc_id and LRCA stay zero, as
-    /// the source's node is taken before its devcoredump is captured.
+    /// steered render/compute extension unless `capture_manual_steered` is called.
+    /// guc_id and LRCA stay zero, as the source's node is taken before its
+    /// devcoredump is captured.
     pub(crate) fn capture_manual(
         &mut self,
         family: Family,
         engine: Engine,
+        read: impl FnMut(u64) -> Option<u32>,
+    ) {
+        self.capture_manual_steered(family, engine, None, read, |_, _, _| None);
+    }
+
+    /// `capture_manual` including steered render/compute extension registers
+    /// when `steered` is provided. `read_steered` is called with (offset, group, instance).
+    pub(crate) fn capture_manual_steered(
+        &mut self,
+        family: Family,
+        engine: Engine,
+        steered: Option<&[Descr]>,
         mut read: impl FnMut(u64) -> Option<u32>,
+        mut read_steered: impl FnMut(u32, u32, u32) -> Option<u32>,
     ) {
         self.init();
         let class = capture_class(engine);
+        let mut partial = false;
         'types: for ty in 0..TYPES {
             let Some(list) = family.list(0, ty, class) else {
                 continue;
@@ -548,9 +562,33 @@ impl Node {
                 self.count[ty] = index + 1;
             }
         }
+        if class == 0 && !self.lost {
+            if let Some(steered_list) = steered {
+                for descr in steered_list {
+                    if self.count[CLASS] >= self.capacity() {
+                        partial = true;
+                        break;
+                    }
+                    let group = (descr.flags >> 12) & 0x1f;
+                    let instance = (descr.flags >> 20) & 0xf;
+                    let Some(value) = read_steered(descr.offset, group, instance) else {
+                        self.lost = true;
+                        break;
+                    };
+                    let index = self.count[CLASS];
+                    self.regs[CLASS][index] = Reg {
+                        offset: descr.offset,
+                        value,
+                        flags: descr.flags,
+                        mask: descr.mask,
+                    };
+                    self.count[CLASS] += 1;
+                }
+            }
+        }
         self.class = engine.guc_class();
         self.instance = engine.physical_instance();
-        self.partial = false;
+        self.partial = partial;
         self.locked = true;
         self.source = Source::Manual;
     }
@@ -1014,11 +1052,23 @@ pub(crate) struct Queue {
     pub batches: [u64; QUEUE_LANES],
     pub batch_count: u8,
     pub wq: Option<Wq>,
+    pub comm: Option<&'static str>,
+    pub pid: Option<u32>,
+    pub snapshot_time: Option<(u64, u32)>,
 }
 /// xe_guc_submit.c's job timeout and the PREEMPTION_TIMEOUT policy NARF sends.
 const JOB_TIMEOUT_MS: u32 = 5000;
 const PREEMPT_TIMEOUT_US: u32 = 500_000;
 impl Queue {
+    pub(crate) fn with_process(mut self, name: &'static str, pid: u32) -> Self {
+        self.comm = Some(name);
+        self.pid = Some(pid);
+        self
+    }
+    pub(crate) fn with_snapshot_time(mut self, secs: u64, nanos: u32) -> Self {
+        self.snapshot_time = Some((secs, nanos));
+        self
+    }
     /// EXEC_QUEUE_STATE_* bits NARF's phases imply: REGISTERED(0),
     /// ENABLED(1), PENDING_ENABLE(2), PENDING_DISABLE(3), RESET(6), BANNED(9).
     fn schedule_state(&self) -> u32 {
@@ -1091,14 +1141,26 @@ pub(crate) fn print_dump(
     }
     writeln!(out, "kernel: narf")?;
     writeln!(out, "module: narf-drivers-gpu")?;
-    writeln!(out, "Snapshot time: unavailable")?;
+    let snapshot_time = queue
+        .and_then(|q| q.snapshot_time)
+        .or(report.capture.snapshot_time);
+    match snapshot_time {
+        Some((secs, nanos)) => writeln!(out, "Snapshot time: {secs}.{nanos:09}")?,
+        None => writeln!(out, "Snapshot time: unavailable")?,
+    }
     writeln!(
         out,
         "Uptime: {}.{:09}",
         report.capture.now_ns / 1_000_000_000,
         report.capture.now_ns % 1_000_000_000
     )?;
-    writeln!(out, "Process: unavailable")?;
+    let process = queue
+        .and_then(|q| q.comm.zip(q.pid))
+        .or_else(|| report.capture.process_name.zip(report.capture.pid));
+    match process {
+        Some((name, pid)) => writeln!(out, "Process: {name} [{pid}]")?,
+        None => writeln!(out, "Process: unavailable")?,
+    }
     writeln!(out, "PCI ID: 0x{:04x}", device.device_id)?;
     writeln!(out, "PCI revision: 0x{:02x}", device.revision)?;
     writeln!(out, "GT id: 0\n\tTile: 0\n\tType: main")?;
@@ -1269,6 +1331,7 @@ pub(crate) fn print(
 
 fn print_by_list_order(out: &mut impl Write, regs: &[Reg], list: &[Descr]) -> fmt::Result {
     let mut last = 0u32;
+    let mut current_dss: Option<u32> = None;
     for descr in list {
         let Some(reg) = regs
             .iter()
@@ -1276,6 +1339,14 @@ fn print_by_list_order(out: &mut impl Write, regs: &[Reg], list: &[Descr]) -> fm
         else {
             continue;
         };
+        if descr.flags & STEERING_NEEDED != 0 {
+            if current_dss != Some(descr.dss) {
+                writeln!(out, "\tDSS_{}:", descr.dss)?;
+                current_dss = Some(descr.dss);
+            }
+            writeln!(out, "\t\t{}: 0x{:08x}", descr.name, reg.value)?;
+            continue;
+        }
         match descr.width {
             Width::Low => last = reg.value,
             Width::High => writeln!(
@@ -1284,9 +1355,6 @@ fn print_by_list_order(out: &mut impl Write, regs: &[Reg], list: &[Descr]) -> fm
                 descr.name,
                 u64::from(reg.value) << 32 | u64::from(last)
             )?,
-            Width::Dword if descr.flags & STEERING_NEEDED != 0 => {
-                writeln!(out, "\t{}[{}]: 0x{:08x}", descr.name, descr.dss, reg.value)?
-            }
             Width::Dword => writeln!(out, "\t{}: 0x{:08x}", descr.name, reg.value)?,
         }
     }

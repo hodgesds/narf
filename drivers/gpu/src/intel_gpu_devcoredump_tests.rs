@@ -62,6 +62,9 @@ fn report() -> Report {
             now_ns: 90,
             state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
             engines: EngineSet::of(&[Engine::Rcs0, Engine::Bcs8]),
+            process_name: None,
+            pid: None,
+            snapshot_time: None,
         },
         super::super::Contexts::new(0),
         |_| Some(0x1234),
@@ -809,6 +812,9 @@ fn smoke_coredump_xe_text_section_queue_job_engine_and_bounds() -> TestResult {
         batches,
         batch_count: 1,
         wq: None,
+        comm: None,
+        pid: None,
+        snapshot_time: None,
     };
     let index = free_slot();
     let dump = xe_capture(
@@ -928,4 +934,122 @@ fn smoke_coredump_xe_text_section_queue_job_engine_and_bounds() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_error",
     smoke_coredump_xe_text_section_queue_job_engine_and_bounds
+);
+
+fn smoke_coredump_process_and_snapshot_time_formatting() -> TestResult {
+    use crate::intel_gpu_error::capture;
+    use alloc::string::String;
+
+    let device = capture::Device {
+        device_id: 0xe20b,
+        revision: 3,
+        gmd_id: (20 << 22) | (1 << 14) | 4,
+        reference_clock: Some(100_000_000),
+    };
+    let lists = capture::Lists::new(capture::Family::XeHpg, true, 0x1, 0, 4).unwrap();
+    let rep = report();
+
+    // 1. Process and snapshot time from Queue:
+    let queue = capture::Queue {
+        id: 5,
+        lrca: 0x12_3000,
+        engine: Engine::Rcs0,
+        placements: EngineSet::of(&[Engine::Rcs0]),
+        logical_mask: 1,
+        width: 1,
+        stamp: 77,
+        kernel: false,
+        priority: 2,
+        timeslice_us: 1000,
+        low_latency: true,
+        phase: super::super::ContextPhase::Running,
+        timed_out: true,
+        reset: false,
+        batches: [0; capture::QUEUE_LANES],
+        batch_count: 0,
+        wq: None,
+        comm: None,
+        pid: None,
+        snapshot_time: None,
+    }
+    .with_process("render_app", 4321)
+    .with_snapshot_time(1700000000, 500000000);
+
+    let mut text = String::new();
+    capture::print_dump(&mut text, &device, &rep, Some(&queue), None, &lists, 0, 0).unwrap();
+    assert!(text.contains("Snapshot time: 1700000000.500000000\n"));
+    assert!(text.contains("Process: render_app [4321]\n"));
+
+    // 2. Fallback to Report when Queue has no process or snapshot time:
+    let mut report_with_facts = rep;
+    report_with_facts.capture = report_with_facts
+        .capture
+        .with_process("compute_app", 8765)
+        .with_snapshot_time(1700000001, 250000000);
+
+    let queue_empty = capture::Queue {
+        id: 6,
+        lrca: 0x12_4000,
+        engine: Engine::Ccs0,
+        placements: EngineSet::of(&[Engine::Ccs0]),
+        logical_mask: 1,
+        width: 1,
+        stamp: 78,
+        kernel: false,
+        priority: 2,
+        timeslice_us: 1000,
+        low_latency: false,
+        phase: super::super::ContextPhase::Running,
+        timed_out: false,
+        reset: false,
+        batches: [0; capture::QUEUE_LANES],
+        batch_count: 0,
+        wq: None,
+        comm: None,
+        pid: None,
+        snapshot_time: None,
+    };
+
+    let mut text2 = String::new();
+    capture::print_dump(
+        &mut text2,
+        &device,
+        &report_with_facts,
+        Some(&queue_empty),
+        None,
+        &lists,
+        0,
+        0,
+    )
+    .unwrap();
+    assert!(text2.contains("Snapshot time: 1700000001.250000000\n"));
+    assert!(text2.contains("Process: compute_app [8765]\n"));
+
+    // 3. Fallback to Report with no queue:
+    let mut text3 = String::new();
+    capture::print_dump(
+        &mut text3,
+        &device,
+        &report_with_facts,
+        None,
+        None,
+        &lists,
+        0,
+        0,
+    )
+    .unwrap();
+    assert!(text3.contains("Snapshot time: 1700000001.250000000\n"));
+    assert!(text3.contains("Process: compute_app [8765]\n"));
+
+    // 4. Default fallback when neither has them:
+    let mut text4 = String::new();
+    capture::print_dump(&mut text4, &device, &rep, None, None, &lists, 0, 0).unwrap();
+    assert!(text4.contains("Snapshot time: unavailable\n"));
+    assert!(text4.contains("Process: unavailable\n"));
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_error",
+    smoke_coredump_process_and_snapshot_time_formatting
 );

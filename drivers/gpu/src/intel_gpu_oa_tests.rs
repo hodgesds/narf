@@ -553,13 +553,19 @@ fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
         Err(Error::Fs(FsError::OutOfMemory))
     );
     assert_eq!(
-        open_at(&[(7, 3), (4, A24U40), (3, config)], DENY, &render_queue),
+        open_at(&[(7, 4), (4, A24U40), (3, config)], DENY, &render_queue),
         Err(Error::Errno(EOPNOTSUPP))
     );
     assert!(
         backend.hw.take().is_empty(),
         "refusals never touch the unit"
     );
+    // Valid exec queue stream open succeeds unprivileged when sample=false:
+    let _fd = open_at(&[(7, 3), (4, A24U40), (3, config)], DENY, &render_queue).unwrap();
+    let file = wire.file();
+    drop(file);
+    backend.poll(1);
+    let _ = backend.hw.take();
     // C truncation: a 2^32 wait becomes 0 and then the default of one; the
     // unit id and metric set are u32 as in the source.
     assert_eq!(
@@ -1158,6 +1164,9 @@ fn unit_with_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<Session>) 
         Permit::take(card).unwrap(),
         config,
         false,
+        None,
+        false,
+        true,
     );
     let request = Request::Open { enable: true };
     let io = Window(hw.clone());
@@ -1703,4 +1712,135 @@ fn smoke_oa_test_session_i915_header() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_test_session_i915_header
+);
+
+fn smoke_oa_exec_queue_oar_oac_streams() -> TestResult {
+    let backend = Backend::new(device(63, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+
+    let queue_lookup = |id: u32| match id {
+        10 => Some((0, 1)),
+        11 => Some((4, 1)),
+        12 => Some((0, 2)),
+        13 => Some((4, 2)),
+        _ => None,
+    };
+
+    const OAR256: u64 = 1 | 5 << 8;
+    const OAC320: u64 = 3 | 1 << 8;
+    const OAC192: u64 = 3 | 2 << 8;
+
+    let open_at = |props: &[(u32, u64)], gate: Gate| {
+        let at = wire.chain(0x1000, props);
+        ready(open(Some(backend.clone()), at, &wire, &queue_lookup, gate))
+    };
+
+    // 1. Parallel queues are rejected with EOPNOTSUPP:
+    assert_eq!(
+        open_at(&[(7, 12), (4, OAR256), (3, config)], ALLOW),
+        Err(Error::Errno(EOPNOTSUPP))
+    );
+    assert_eq!(
+        open_at(&[(7, 13), (4, OAC320), (3, config)], ALLOW),
+        Err(Error::Errno(EOPNOTSUPP))
+    );
+
+    // 2. Non-existent queue is rejected with NotFound:
+    assert_eq!(
+        open_at(&[(7, 99), (4, OAR256), (3, config)], ALLOW),
+        Err(Error::Fs(FsError::NotFound))
+    );
+
+    // 3. Format mismatch:
+    // OAC on Render queue -> InvalidData
+    assert_eq!(
+        open_at(&[(7, 10), (4, OAC320), (3, config)], ALLOW),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+    assert_eq!(
+        open_at(&[(7, 10), (4, OAC192), (3, config)], ALLOW),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+    // OAR on Compute queue -> InvalidData
+    assert_eq!(
+        open_at(&[(7, 11), (4, OAR256), (3, config)], ALLOW),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    // 4. OAR or OAC without exec_queue -> InvalidData
+    assert_eq!(
+        open_at(&[(4, OAR256), (3, config), (2, 1)], ALLOW),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+    assert_eq!(
+        open_at(&[(4, OAC320), (3, config), (2, 1)], ALLOW),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    // 5. Render queue with OAR:
+    // 5a. Unprivileged open (sample=false) succeeds with DENY gate:
+    let _fd = open_at(&[(7, 10), (4, OAR256), (3, config)], DENY).unwrap();
+    let file = wire.file();
+    let session = session_of(&backend);
+    assert_eq!(session.exec_queue(), Some(10));
+    assert!(!session.no_preempt());
+    assert!(!session.privileged());
+    assert_eq!(session.format.kind, OAR);
+    assert_eq!(session.engine(), Engine::Rcs0);
+    // Unprivileged operations succeed:
+    assert_eq!(ready(file.ioctl_user(ENABLE, 0, &wire)), Ok(0));
+    assert_eq!(ready(file.ioctl_user(DISABLE, 0, &wire)), Ok(0));
+    assert_eq!(file.poll_readiness(), 0);
+    drop(file);
+    backend.poll(1);
+    let _ = backend.hw.take();
+
+    // 5b. Periodic timer sampling (sample=true) requires privilege:
+    assert_eq!(
+        open_at(&[(7, 10), (4, OAR256), (3, config), (2, 1), (5, 5)], DENY),
+        Err(Error::Fs(FsError::PermissionDenied))
+    );
+    let _fd = open_at(&[(7, 10), (4, OAR256), (3, config), (2, 1), (5, 5)], ALLOW).unwrap();
+    let file = wire.file();
+    let session = session_of(&backend);
+    assert!(session.privileged());
+    assert_eq!(session.exec_queue(), Some(10));
+    drop(file);
+    backend.poll(2);
+    let _ = backend.hw.take();
+
+    // 5c. no_preempt requires privilege:
+    assert_eq!(
+        open_at(&[(7, 10), (4, OAR256), (3, config), (9, 1)], DENY),
+        Err(Error::Fs(FsError::PermissionDenied))
+    );
+    let _fd = open_at(&[(7, 10), (4, OAR256), (3, config), (9, 1)], ALLOW).unwrap();
+    let file = wire.file();
+    let session = session_of(&backend);
+    assert!(session.no_preempt());
+    assert!(session.privileged());
+    drop(file);
+    backend.poll(3);
+    let _ = backend.hw.take();
+
+    // 6. Compute queue with OAC:
+    // 6a. Unprivileged open (sample=false) succeeds with DENY gate:
+    let _fd = open_at(&[(7, 11), (4, OAC320), (3, config)], DENY).unwrap();
+    let file = wire.file();
+    let session = session_of(&backend);
+    assert_eq!(session.exec_queue(), Some(11));
+    assert!(!session.no_preempt());
+    assert!(!session.privileged());
+    assert_eq!(session.format.kind, OAC);
+    assert_eq!(session.engine(), Engine::Ccs0);
+    drop(file);
+    backend.poll(4);
+    let _ = backend.hw.take();
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_exec_queue_oar_oac_streams
 );

@@ -522,3 +522,78 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_error",
     smoke_guc_capture_manual_fallback_reads_source_lists
 );
+
+fn smoke_guc_capture_manual_steered_and_dss_formatting() -> TestResult {
+    let lists = Lists::new(Family::XeHpg, true, 0x23, 0, 4).unwrap();
+    let mut node = Node::new(lists.max_regs()).unwrap();
+    let mut regular_reads = Vec::new();
+    let mut steered_reads = Vec::new();
+
+    node.capture_manual_steered(
+        Family::XeHpg,
+        Engine::Rcs0,
+        Some(lists.steered()),
+        |offset| {
+            regular_reads.push(offset);
+            Some(0x1000_0000 | offset as u32)
+        },
+        |offset, group, instance| {
+            steered_reads.push((offset, group, instance));
+            Some(0x2000_0000 | (group << 8) | instance)
+        },
+    );
+
+    assert_eq!(node.source, Source::Manual);
+    assert!(!node.lost);
+    assert!(!node.partial);
+    assert_eq!(steered_reads.len(), lists.steered().len());
+
+    // Verify print output contains DSS headings:
+    let facts = Facts {
+        engine: Engine::Rcs0,
+        logical: 0,
+        wake_ref: 1,
+    };
+    let mut out = String::new();
+    print(&mut out, facts, &node, &lists).unwrap();
+
+    assert!(out.contains("\tDSS_0:\n"));
+    assert!(out.contains("\t\tSAMPLER_INSTDONE: 0x20000000\n"));
+    assert!(out.contains("\t\tROW_INSTDONE: 0x20000000\n"));
+    assert!(out.contains("\tDSS_1:\n"));
+    assert!(out.contains("\t\tSAMPLER_INSTDONE: 0x20000001\n"));
+    assert!(out.contains("\tDSS_5:\n"));
+    assert!(out.contains("\t\tSAMPLER_INSTDONE: 0x20000101\n"));
+
+    // Non-render/compute engine ignores steered registers:
+    let mut non_rc_node = Node::new(lists.max_regs()).unwrap();
+    let mut non_rc_steered = Vec::new();
+    non_rc_node.capture_manual_steered(
+        Family::XeHpg,
+        Engine::Vecs1,
+        Some(lists.steered()),
+        |offset| Some(offset as u32),
+        |offset, group, instance| {
+            non_rc_steered.push((offset, group, instance));
+            Some(1)
+        },
+    );
+    assert!(non_rc_steered.is_empty(), "Vecs1 ignores steered extension");
+
+    // Steered read failure triggers node.lost:
+    let mut fail_node = Node::new(lists.max_regs()).unwrap();
+    fail_node.capture_manual_steered(
+        Family::XeHpg,
+        Engine::Rcs0,
+        Some(lists.steered()),
+        |offset| Some(offset as u32),
+        |_offset, _group, _instance| None,
+    );
+    assert!(fail_node.lost);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_error",
+    smoke_guc_capture_manual_steered_and_dss_formatting
+);

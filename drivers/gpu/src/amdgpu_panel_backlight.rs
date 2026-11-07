@@ -252,8 +252,8 @@ impl BacklightPm {
     ///   only host-owned transition (the rails are firmware
     ///   no-ops), and the sequencer state is left alone — the
     ///   unblank's resume-from-`Off` full chain re-lights it.
-    /// No saved level → nothing is lit that the host owns, and
-    /// blank is a no-op.
+    ///   No saved level → nothing is lit that the host owns, and
+    ///   blank is a no-op.
     ///
     /// The save is a blank-time snapshot: a brightness change
     /// made while DPMS-blanked is overwritten by the unblank
@@ -804,7 +804,7 @@ mod tests {
             return TestResult::Fail("DPMS blank did not leave BacklightOff");
         }
         // The sequencer fade ran its T7 + BL_EN half.
-        if !hw.log.iter().any(|e| *e == ("bl_en", 0)) {
+        if !hw.log.contains(&("bl_en", 0)) {
             return TestResult::Fail("DPMS blank skipped the BL_EN step");
         }
         hw.log.clear();
@@ -940,7 +940,7 @@ mod tests {
             return TestResult::Fail("unblank did not restore the saved level");
         }
         // The full power_on_video → power_on_backlight chain ran.
-        if !hw.log.iter().any(|e| *e == ("vdd", 1)) {
+        if !hw.log.contains(&("vdd", 1)) {
             return TestResult::Fail("unblank skipped the VDD step of the full chain");
         }
         TestResult::Pass

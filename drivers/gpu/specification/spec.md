@@ -1037,8 +1037,8 @@ or op is EINVAL. The OA ops follow `xe_oa.c`'s errno order and C widths:
 
 - Open, add and remove are ENODEV without the owner.
 - Extensions are E2BIG past sixteen, then EFAULT/EINVAL.
-- An exec queue is ENOENT or EOPNOTSUPP (width).
-- Privilege is EACCES. Current CAP_PERFMON/CAP_SYS_ADMIN is required.
+- An exec queue is ENOENT or EOPNOTSUPP (width > 1).
+- Privilege is EACCES. Unprivileged open is permitted for an exec queue stream without sampling (`sample: false`); periodic timer sampling (`sample: true`), preemption holding (`no_preempt: true`), or queue-less global streams require current CAP_PERFMON/CAP_SYS_ADMIN.
 - A second stream per card is EBUSY.
 - Add returns EADDRINUSE for a duplicate uuid and otherwise the lowest
   free id from 1. Remove returns ENOENT for an unknown id.
@@ -1064,8 +1064,8 @@ full-reset proofs. NARF limits:
 - Sizes above the reservation are ENOMEM.
 - A configuration holds at most 4096 registers, 131072 per card, and a
   card holds at most 1024 ids.
-- Current authority is rechecked on every read and control.
-- OA syncs and OAR/OAC exec-queue streams are EOPNOTSUPP.
+- Current authority is rechecked on every read and control for privileged streams.
+- OA syncs remain EOPNOTSUPP. OAR and OAC exec-queue streams (`DRM_XE_OA_PROPERTY_EXEC_QUEUE_ID`) are supported on single-width Render (OAR) and Compute (OAC) queues. Engine-format mismatches (OAC on Render, OAR on Compute) or queue-less OAR/OAC streams are EINVAL.
 - mmap follows `xe_oa_mmap`'s checks: EACCES without privilege, EINVAL
   unless the length is the whole buffer, and EINVAL for write, exec or
   MAP_SHARED(_VALIDATE); the maximum protection is read. A mapping that
@@ -2549,8 +2549,9 @@ registers 8 and manual engine registers 16. The text follows
 `__xe_devcoredump_read` order. The header block names the reason ("Timedout
 job - seqno, lrc_seqno, guc_id, flags" for a timeout or GuC reset), PCI
 ID/revision, GMD_ID IP version (0.0.0 before GMD) and CS reference clock, all
-sampled once at preparation. Snapshot time, process and kernel release are
-unavailable. The Contexts block gives the first guilty context's GuC id,
+sampled once at preparation. Snapshot time (`{secs}.{nanos:09}`) and
+process (`{name} [{pid}]`) are formatted from the guilty queue or error report
+(fallback to unavailable); kernel release is unavailable. The Contexts block gives the first guilty context's GuC id,
 name, class, logical mask, width, the 5000 ms timeout, timeslice, the 500000 us
 preemption timeout, EXEC_QUEUE_STATE bits implied by its phase, the KERNEL and
 LOW_LATENCY flags and, for groups, the workqueue descriptor and up to 64
@@ -2583,8 +2584,9 @@ matches the queue's template GuC class, GuC id and LRC GGTT address, accepting
 any reported instance among its placements, and releases the consumed node at
 the next notification. Without a match, the node taken at the context's
 timeout is used: the global, class and instance lists of the first placement,
-read under the forcewake proof before scheduling is disabled, without the
-steered extension and with guc_id/LRCA zero. Without the opt-in the ADS, log
+read under the forcewake proof before scheduling is disabled; manual capture
+can capture steered extension registers via MCR steering (`capture_manual_steered`),
+formatted under `DSS_{dss}:` headings matching Linux `xe_guc_capture`. Without the opt-in the ADS, log
 and bundle are unchanged apart from the version.
 
 Opening and every read, including empty/EOF reads, require current
