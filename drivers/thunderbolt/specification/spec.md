@@ -102,11 +102,16 @@ such controllers; it never starts, resets, or speaks to the ICM firmware.
   then each index's Vendor/Product/Firmware identity, last/cable status,
   authentication status and Link Configuration register are read back
   through the USB4 Port Capability (`PORT_CS_1`/`PORT_CS_2`, Table 8-13).
-  Topology scan runs it for every link-up lane-0 port and publishes the
-  chain as `Port::retimers`; an enumeration or agreement fault is
-  published as the typed `Port::retimer_fault`, never folded into the
-  empty-chain state. `retimer::sb_read`/`sb_write`/`port_op` are the raw
-  sideband and Port Operation primitives underneath; each takes an
+  The authentication status is read immediately after enumeration, before
+  any Port Operation touches the retimer: the Opcode register carries the
+  NVM authentication outcome, and a Port Operation completion would
+  overwrite it with a clean 0 (Linux `tb_retimer_scan` reads it the same
+  way, "before doing anything else"). Topology scan runs it for every
+  link-up lane-0 port and publishes the chain as `Port::retimers`; an
+  enumeration or agreement fault is published as the typed
+  `Port::retimer_fault`, never folded into the empty-chain state.
+  `retimer::sb_read`/`sb_write`/`port_op` are the raw sideband and Port
+  Operation primitives underneath; each takes an
   `retimer::SbChannel` (the route/port/capability/target/index addressing
   of one transaction, built by `SbChannel::retimer`/`SbChannel::router`)
   and is generic over the config-space seam, which is therefore public
@@ -118,6 +123,32 @@ such controllers; it never starts, resets, or speaks to the ICM firmware.
   the retimer and unassigns its index; the outcome is read with
   `retimer::auth_status` after re-enumeration). Writes and
   authentication are refused for cable retimers.
+  `retimer::authenticate_and_rescan` is the post-authentication
+  bookkeeping: authenticate followed by `scan_link`, returning the fresh
+  chain with each retimer's new `auth_status` recorded. The caller must
+  allow the restart to settle first — Linux advises five seconds or more
+  (`retimer::AUTH_RESTART_SETTLE_MS`) — and the re-enumeration returns a
+  typed error when the retimer has not come back yet.
+- `retimer::scan_link_down(ctl, route, port)` is the link-down scan for
+  a link with no trained link (Linux `tb_retimer_scan` as driven by the
+  offline/rescan flow): `retimer::router_offline_mode` takes the port
+  offline (`ROUTER_OFFLINE_MODE`, Metadata 0; `router_online_mode`
+  restores it with Metadata 1, both raw opcode writes with no completion
+  poll, Linux `usb4_port_set_router_offline`), the Broadcast RT
+  enumeration runs, the authentication statuses are read, an inbound
+  sideband session is opened on every retimer index
+  (`SET_INBOUND_SBTX`, best-effort), the chain is probed, the opened
+  sessions are closed in reverse index order (`UNSET_INBOUND_SBTX`,
+  best-effort), and the port is brought back online — on failure as well
+  as on success. No agreement check runs: there is no trained link to
+  agree with, so each retimer's Link Configuration is recorded as read
+  and only chain termination is enforced. This is an explicit maintenance
+  operation, not part of the periodic topology scan (taking a port offline
+  on every pass would suppress hotplug and fight link training); its
+  driver is the retimer firmware-update orchestration (issue #1122 item
+  1), and the platform retimer power-on step Linux performs first
+  (`tb_acpi_power_on_retimers`) has no NARF equivalent yet, so the
+  function assumes the retimers are already powered.
 - `retimer::margining_caps`, `hw_margin`, `sw_margin`,
   `sw_margin_errors` and `sw_margin_errors_ext` are the lane-margining
   Port Operations (USB4 v2.0 §8.3.2.4: `RDCP`/`RHMG`/`RSMG`/`RDSW`),
@@ -356,12 +387,20 @@ transitions, and renegotiating the programmed REMOTE_CAP envelope itself
 in response to allocation changes (today the source re-trains within the
 granted envelope).
 Retimer remainders: no caller yet supplies a firmware image to the NVM
-surface (image provenance and update policy are unbuilt); enumeration
-covers trained links only, so the link-down path (router offline mode
-plus `SET_INBOUND_SBTX` orchestration before training) is engine-only;
-lane margining Port Operations (`RDCP`/`RHMG`/`RSMG`/`RDSW`) are
-implemented as a fixture-proved protocol surface with no caller wiring
-them into a margining workflow yet; and `reconcile`
+surface (image provenance and update policy are unbuilt — issue #1122
+item 1, awaiting Daniel's call); the link-down scan is orchestrated as
+an explicit maintenance operation (`retimer::scan_link_down`: router
+offline mode plus `SET_INBOUND_SBTX`/`UNSET_INBOUND_SBTX` session
+management around a scan before training, port restored online on
+failure as well as success) but has no driver yet — the periodic
+topology scan still covers trained links only, and the platform
+retimer power-on step has no NARF equivalent; post-authentication
+bookkeeping is a production function (`retimer::authenticate_and_rescan`,
+with the authentication status read before any Port Operation can
+overwrite it) awaiting the same image-supply caller; lane margining
+Port Operations (`RDCP`/`RHMG`/`RSMG`/`RDSW`) are implemented as a
+fixture-proved protocol surface with no caller wiring them into a
+margining workflow yet; and `reconcile`
 hard-gates tunnel programming on a port's `retimer_fault` (see §3):
 a path over a faulted lane port is refused with
 `Error::RetimerFault` before any configuration write, per-tunnel,
