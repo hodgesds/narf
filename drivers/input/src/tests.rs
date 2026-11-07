@@ -7374,3 +7374,873 @@ mod smbus_rmi_smokes {
         smoke_smbus_rmi_attn_f01_bringup_writes_configured
     );
 }
+
+// ── ALPS absolute-mode smokes (#1674) ────────────────────────────────────────
+//
+// Fixture discipline (#746): every packet vector below was built
+// from the Linux ALPS spec itself (`alps.txt` v3.19 for v1–v5,
+// `drivers/input/mouse/alps.c` v6.6 for v6–v8) and checked
+// against an independent Python transcription of the Linux
+// formulas — never from the implementation's constants. Two
+// vectors the first draft carried were wrong as *wire* packets
+// and were corrected here (see the comments): a packet's first
+// byte must satisfy the model's `(b0 & mask0) == byte0` check
+// that Linux `alps_process_byte` applies to every packet, so
+// bits the coordinate macros ignore still have to carry the
+// sync pattern — the v3 bitmap packet is `0xCF` (not `0xC0`),
+// the v7 TWO packet is `0xC8` (not `0x80`), the v7 IDLE packet
+// is `0x48` (not `0x00`), and the v8 packets carry `0x18` in
+// bits 3–4 of byte 0.
+mod alps_smokes {
+    use alloc::vec::Vec;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use crate::alps::*;
+    use crate::i8042_mouse;
+    use narf_input::{
+        __reset_global_ring_for_test, abs, init_global_ring, pop_global, InputEvent,
+        PointerButtons, TouchState,
+    };
+
+    /// Fake PS/2 transport: records every sent byte, serves
+    /// canned reply bytes in order, auto-ACKs every send (like
+    /// a real pad replying `0xFA`). The knock sequences are
+    /// fixture-pinned byte-for-byte instead of trusted from the
+    /// implementation.
+    struct FakeAlpsTransport {
+        sent: Vec<u8>,
+        replies: Vec<u8>,
+        next_reply: usize,
+    }
+
+    impl FakeAlpsTransport {
+        fn new(replies: &[u8]) -> Self {
+            FakeAlpsTransport {
+                sent: Vec::new(),
+                replies: replies.to_vec(),
+                next_reply: 0,
+            }
+        }
+
+        fn consumed_all(&self) -> bool {
+            self.next_reply == self.replies.len()
+        }
+    }
+
+    impl AlpsTransport for FakeAlpsTransport {
+        fn send(&mut self, byte: u8) -> bool {
+            self.sent.push(byte);
+            true
+        }
+
+        fn recv(&mut self) -> Option<u8> {
+            let b = self.replies.get(self.next_reply).copied();
+            if b.is_some() {
+                self.next_reply += 1;
+            }
+            b
+        }
+    }
+
+    /// First Touchpad report in a decode, if any.
+    fn touchpad_fields(d: AlpsDecode) -> Option<AlpsFields> {
+        for ev in d.events.iter().flatten() {
+            if let AlpsEvent::Touchpad(f) = *ev {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    fn decode(protocol: AlpsProtocol, packet: &[u8]) -> AlpsDecode {
+        AlpsDecoder::new(protocol).decode(packet)
+    }
+
+    fn feed(packet: &[u8]) {
+        for b in packet {
+            i8042_mouse::feed_byte_for_test(*b);
+        }
+    }
+
+    fn reset_ring_and_mouse() {
+        init_global_ring(16);
+        __reset_global_ring_for_test();
+        i8042_mouse::__reset_for_test();
+    }
+
+    fn smoke_alps_model_table_lookup() -> TestResult {
+        if ALPS_MODEL_TABLE.len() != 21 {
+            return TestResult::Fail("model table must carry 21 Linux rows");
+        }
+        // V1: UMAX-530T.
+        let m = match lookup_model(&[0x33, 0x02, 0x0a]) {
+            Some(m) => m,
+            None => return TestResult::Fail("V1 signature not in table"),
+        };
+        if m.version != AlpsVersion::V1 || m.byte0 != 0x88 || m.mask0 != 0xf8 {
+            return TestResult::Fail("V1 row wrong");
+        }
+        // V6: Dell XT2.
+        let m = match lookup_model(&[0x73, 0x00, 0x14]) {
+            Some(m) => m,
+            None => return TestResult::Fail("V6 signature not in table"),
+        };
+        if m.version != AlpsVersion::V6 || m.byte0 != 0xff || m.mask0 != 0xff {
+            return TestResult::Fail("V6 row wrong");
+        }
+        // V2 + wheel: Toshiba Satellite S2400-103.
+        let m = match lookup_model(&[0x63, 0x02, 0x3c]) {
+            Some(m) => m,
+            None => return TestResult::Fail("V2 wheel signature not in table"),
+        };
+        if m.version != AlpsVersion::V2 || m.flags & FLAG_WHEEL == 0 {
+            return TestResult::Fail("V2 wheel row wrong");
+        }
+        // 73-02-64 is NOT a table row (it falls through to the
+        // V4/V3 fallback chain in `identify`).
+        if lookup_model(&[0x73, 0x02, 0x64]).is_some() {
+            return TestResult::Fail("73-02-64 must not be a table row");
+        }
+        if lookup_model(&[0x00, 0x00, 0x00]).is_some() {
+            return TestResult::Fail("unknown signature must miss");
+        }
+        // The suspicious first row is kept deliberately (Linux
+        // "XXX" comment) — same signature, same flags.
+        let m = match lookup_model(&[0x20, 0x02, 0x0e]) {
+            Some(m) => m,
+            None => return TestResult::Fail("suspicious first row missing"),
+        };
+        if m.version != AlpsVersion::V2 || m.flags & FLAG_PASS == 0 {
+            return TestResult::Fail("suspicious first row wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_model_table_lookup);
+
+    fn smoke_alps_identify_fallbacks() -> TestResult {
+        // Table hit wins regardless of the EC report.
+        let p = identify(&[0x33, 0x02, 0x0a], &[0x00, 0x00, 0x00]);
+        if p.map(|p| p.version) != Some(AlpsVersion::V1) {
+            return TestResult::Fail("table hit must win");
+        }
+        let cases: [([u8; 3], [u8; 3], Option<AlpsVersion>); 9] = [
+            (
+                [0x73, 0x02, 0x64],
+                [0x73, 0x02, 0x8a],
+                Some(AlpsVersion::V4),
+            ),
+            (
+                [0x73, 0x03, 0x50],
+                [0x73, 0x01, 0x00],
+                Some(AlpsVersion::V5),
+            ),
+            (
+                [0x00, 0x00, 0x00],
+                [0x88, 0xb0, 0x00],
+                Some(AlpsVersion::V7),
+            ),
+            (
+                [0x00, 0x00, 0x00],
+                [0x88, 0x08, 0x00],
+                Some(AlpsVersion::V3Rushmore),
+            ),
+            (
+                [0x73, 0x02, 0x64],
+                [0x88, 0x07, 0x95],
+                Some(AlpsVersion::V3),
+            ),
+            (
+                [0x73, 0x03, 0x14],
+                [0x73, 0x03, 0x14],
+                Some(AlpsVersion::V8),
+            ),
+            (
+                [0x73, 0x03, 0x28],
+                [0x73, 0x03, 0x28],
+                Some(AlpsVersion::V8),
+            ),
+            // V9 is identified only to be refused.
+            ([0x73, 0x03, 0xc8], [0x73, 0x03, 0xc8], None),
+            ([0x00, 0x00, 0x00], [0x00, 0x00, 0x00], None),
+        ];
+        for (e7, ec, want) in cases {
+            let got = identify(&e7, &ec).map(|p| p.version);
+            if got != want {
+                return TestResult::Fail("identify fallback wrong");
+            }
+        }
+        if !is_ss4plus_device(&[0x73, 0x03, 0x28]) {
+            return TestResult::Fail("73-03-28 must be SS4-Plus");
+        }
+        if is_ss4plus_device(&[0x73, 0x03, 0x14]) {
+            return TestResult::Fail("73-03-14 must not be SS4-Plus");
+        }
+        if !e6_report_valid(&[0x00, 0x00, 0x0a]) || !e6_report_valid(&[0x00, 0x00, 0x64]) {
+            return TestResult::Fail("E6 valid replies rejected");
+        }
+        if e6_report_valid(&[0x00, 0x00, 0x00]) || e6_report_valid(&[0x08, 0x00, 0x0a]) {
+            return TestResult::Fail("E6 invalid replies accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_identify_fallbacks);
+
+    fn smoke_alps_probe_wire_v3() -> TestResult {
+        // E6 `00-00-0A`, E7 `73-02-64`, EC `88-07-95` — a v3 pad.
+        let mut t = FakeAlpsTransport::new(&[0x00, 0x00, 0x0a, 0x73, 0x02, 0x64, 0x88, 0x07, 0x95]);
+        let proto = match probe_alps(&mut t) {
+            Some(p) => p,
+            None => return TestResult::Fail("v3 pad not identified"),
+        };
+        if proto != ALPS_V3_PROTOCOL {
+            return TestResult::Fail("probe must return the v3 protocol");
+        }
+        // Wire: E6 report, E7 report, EC report, exit (EA).
+        // Per alps.txt / #1676 the SETRES argument is the report
+        // byte itself (E6/E7/EC), not Linux's literal 0x00.
+        let want: [u8; 16] = [
+            0xe8, 0xe6, 0xe6, 0xe6, 0xe9, 0xe8, 0xe7, 0xe7, 0xe7, 0xe9, 0xe8, 0xec, 0xec, 0xec,
+            0xe9, 0xea,
+        ];
+        if t.sent != want {
+            return TestResult::Fail("probe wire bytes wrong");
+        }
+        if !t.consumed_all() {
+            return TestResult::Fail("probe did not consume all replies");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_probe_wire_v3);
+
+    fn smoke_alps_probe_rejects_non_alps() -> TestResult {
+        // Bad E6 reply: only the E6 report goes out.
+        let mut t = FakeAlpsTransport::new(&[0x00, 0x00, 0x00]);
+        if probe_alps(&mut t).is_some() {
+            return TestResult::Fail("bad E6 must reject");
+        }
+        if t.sent != [0xe8, 0xe6, 0xe6, 0xe6, 0xe9] {
+            return TestResult::Fail("bad-E6 probe wire wrong");
+        }
+        // Good E6 but unidentifiable E7/EC: still rejected.
+        let mut t = FakeAlpsTransport::new(&[0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        if probe_alps(&mut t).is_some() {
+            return TestResult::Fail("unidentifiable pad must reject");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_probe_rejects_non_alps);
+
+    fn smoke_alps_decode_v1() -> TestResult {
+        // x=1000 y=500 z=50, left. (p0 0x8F: (0x8F & 0xF8) == 0x88.)
+        let proto = lookup_model(&[0x33, 0x02, 0x0a]).unwrap().protocol();
+        let f = match touchpad_fields(decode(proto, &[0x8f, 0x68, 0x10, 0x03, 0x74, 0x32])) {
+            Some(f) => f,
+            None => return TestResult::Fail("v1 packet produced no report"),
+        };
+        if f.st.x != 1000 || f.st.y != 500 || f.pressure != 50 {
+            return TestResult::Fail("v1 coordinates wrong");
+        }
+        if !f.left || f.right || f.fingers != 1 || !f.touch {
+            return TestResult::Fail("v1 buttons/fingers/touch wrong");
+        }
+        if f.mt[0].x != 1000 || f.mt[0].y != 500 {
+            return TestResult::Fail("v1 mt[0] must mirror st");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v1);
+
+    fn smoke_alps_decode_v2() -> TestResult {
+        let proto = lookup_model(&[0x63, 0x02, 0x0a]).unwrap().protocol();
+        // x=1500 y=700 z=30, right+middle. z=30 does NOT set
+        // BTN_TOUCH (hysteresis: set above 30).
+        let f = match touchpad_fields(decode(proto, &[0xf8, 0x5c, 0x58, 0x56, 0x3c, 0x1e])) {
+            Some(f) => f,
+            None => return TestResult::Fail("v2 packet produced no report"),
+        };
+        if f.st.x != 1500 || f.st.y != 700 || f.pressure != 30 {
+            return TestResult::Fail("v2 coordinates wrong");
+        }
+        if f.left || !f.right || !f.middle || f.fingers != 1 {
+            return TestResult::Fail("v2 buttons/fingers wrong");
+        }
+        if f.touch {
+            return TestResult::Fail("v2 z=30 must not set touch");
+        }
+        // Same packet with z=31 sets touch.
+        let f = match touchpad_fields(decode(proto, &[0xf8, 0x5c, 0x58, 0x56, 0x3c, 0x1f])) {
+            Some(f) => f,
+            None => return TestResult::Fail("v2 z=31 packet produced no report"),
+        };
+        if !f.touch {
+            return TestResult::Fail("v2 z=31 must set touch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v2);
+
+    fn smoke_alps_decode_v3_pinnacle() -> TestResult {
+        // Single touch: x=1000 y=800 z=60, left.
+        let f = match touchpad_fields(decode(
+            ALPS_V3_PROTOCOL,
+            &[0x8f, 0x3e, 0x32, 0x01, 0x20, 0x3c],
+        )) {
+            Some(f) => f,
+            None => return TestResult::Fail("v3 ST packet produced no report"),
+        };
+        if f.st.x != 1000 || f.st.y != 800 || f.pressure != 60 || !f.left {
+            return TestResult::Fail("v3 ST coordinates/buttons wrong");
+        }
+        if f.fingers != 1 {
+            return TestResult::Fail("v3 ST must report one finger");
+        }
+        // Bitmap sequence: the position packet (first_mp) is
+        // stashed with no report; the bitmap packet completes it.
+        let mut dec = AlpsDecoder::new(ALPS_V3_PROTOCOL);
+        let d = dec.decode(&[0x8f, 0x3e, 0x32, 0x01, 0x60, 0x3c]);
+        if !d.is_empty() {
+            return TestResult::Fail("v3 first_mp packet must be stashed");
+        }
+        // Bitmap first byte is 0xCF, not 0xC0: bit 0x40 marks
+        // the bitmap, and the first-byte check needs the 0x8F
+        // sync bits too (0xCF & 0x8F == 0x8F).
+        let f = match touchpad_fields(dec.decode(&[0xcf, 0x06, 0x0c, 0x00, 0x00, 0x01])) {
+            Some(f) => f,
+            None => return TestResult::Fail("v3 bitmap packet produced no report"),
+        };
+        if f.fingers != 2 {
+            return TestResult::Fail("v3 bitmap must report two fingers");
+        }
+        if f.mt[0].x != 1000 || f.mt[0].y != 800 {
+            return TestResult::Fail("v3 bitmap mt[0] wrong");
+        }
+        if f.mt[1].x != 428 || f.mt[1].y != 980 {
+            return TestResult::Fail("v3 bitmap mt[1] wrong");
+        }
+        if f.x_map != 0x18 || f.y_map != 0x18 {
+            return TestResult::Fail("v3 bitmap maps wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v3_pinnacle);
+
+    fn smoke_alps_decode_v3_rushmore_bitmap() -> TestResult {
+        let mut dec = AlpsDecoder::new(ALPS_V3_RUSHMORE_PROTOCOL);
+        let d = dec.decode(&[0x8f, 0x3e, 0x32, 0x01, 0x60, 0x3c]);
+        if !d.is_empty() {
+            return TestResult::Fail("rushmore first_mp packet must be stashed");
+        }
+        let f = match touchpad_fields(dec.decode(&[0xcf, 0x06, 0x0c, 0x00, 0x00, 0x41])) {
+            Some(f) => f,
+            None => return TestResult::Fail("rushmore bitmap produced no report"),
+        };
+        if f.fingers != 2 || f.mt[0].x != 1000 || f.mt[0].y != 800 {
+            return TestResult::Fail("rushmore bitmap mt[0]/fingers wrong");
+        }
+        if f.mt[1].x != 428 || f.mt[1].y != 980 {
+            return TestResult::Fail("rushmore bitmap mt[1] wrong");
+        }
+        if f.x_map != 0x18 || f.y_map != 0x18 {
+            return TestResult::Fail("rushmore bitmap maps wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v3_rushmore_bitmap);
+
+    fn smoke_alps_decode_v3_trackstick() -> TestResult {
+        // dx=-14 dy=-1 pressure=32, no buttons.
+        let d = decode(ALPS_V3_PROTOCOL, &[0xef, 0x10, 0x08, 0x00, 0x20, 0x3f]);
+        match d.events[0] {
+            Some(AlpsEvent::Trackstick {
+                dx,
+                dy,
+                pressure,
+                left,
+                right,
+                middle,
+            }) => {
+                if dx != -14 || dy != -1 || pressure != 32 {
+                    return TestResult::Fail("v3 stick dx/dy/pressure wrong");
+                }
+                if left || right || middle {
+                    return TestResult::Fail("v3 stick must report no buttons");
+                }
+            }
+            _ => return TestResult::Fail("v3 stick packet not decoded as trackstick"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v3_trackstick);
+
+    fn smoke_alps_decode_v4() -> TestResult {
+        let mut dec = AlpsDecoder::new(ALPS_V4_PROTOCOL);
+        let p1 = [0x8f, 0x3e, 0x32, 0x20, 0x01, 0x3c, 0x46, 0x18];
+        let p2 = [0x8f, 0x3e, 0x32, 0x20, 0x01, 0x3c, 0x00, 0x78];
+        let p3 = [0x8f, 0x3e, 0x32, 0x20, 0x01, 0x3c, 0x00, 0x00];
+        for p in [&p1, &p2] {
+            let f = match touchpad_fields(dec.decode(p)) {
+                Some(f) => f,
+                None => return TestResult::Fail("v4 fragment produced no report"),
+            };
+            if f.fingers != 1 || f.st.x != 1000 || f.st.y != 800 {
+                return TestResult::Fail("v4 fragment must report one finger at st");
+            }
+        }
+        let f = match touchpad_fields(dec.decode(&p3)) {
+            Some(f) => f,
+            None => return TestResult::Fail("v4 third packet produced no report"),
+        };
+        if f.fingers != 2 {
+            return TestResult::Fail("v4 third packet must report two fingers");
+        }
+        if f.mt[0].x != 1000 || f.mt[0].y != 800 {
+            return TestResult::Fail("v4 mt[0] wrong");
+        }
+        if f.mt[1].x != 500 || f.mt[1].y != 210 {
+            return TestResult::Fail("v4 mt[1] wrong");
+        }
+        if f.x_map != 0x318 || f.y_map != 0x318 {
+            return TestResult::Fail("v4 bitmap maps wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v4);
+
+    fn smoke_alps_decode_v5() -> TestResult {
+        // Dolphin single touch: x=1000 y=800 z=60, left.
+        let f = match touchpad_fields(decode(
+            ALPS_V5_PROTOCOL,
+            &[0xc8, 0x68, 0x20, 0x01, 0x67, 0x3c],
+        )) {
+            Some(f) => f,
+            None => return TestResult::Fail("v5 packet produced no report"),
+        };
+        if f.st.x != 1000 || f.st.y != 800 || f.pressure != 60 {
+            return TestResult::Fail("v5 coordinates wrong");
+        }
+        if !f.left || f.fingers != 1 || !f.touch {
+            return TestResult::Fail("v5 buttons/fingers/touch wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v5);
+
+    fn smoke_alps_decode_v6() -> TestResult {
+        let proto = lookup_model(&[0x73, 0x00, 0x14]).unwrap().protocol();
+        // Touchpad: x=1000 y=800 z=50, left.
+        let f = match touchpad_fields(decode(proto, &[0xff, 0xe8, 0x20, 0x39, 0x30, 0x32])) {
+            Some(f) => f,
+            None => return TestResult::Fail("v6 packet produced no report"),
+        };
+        if f.st.x != 1000 || f.st.y != 800 || f.pressure != 50 {
+            return TestResult::Fail("v6 coordinates wrong");
+        }
+        if !f.left || f.right || f.fingers != 1 || !f.touch {
+            return TestResult::Fail("v6 buttons/fingers/touch wrong");
+        }
+        // Trackpoint: dx=4 dy=-2 pressure=32.
+        let d = decode(proto, &[0xff, 0x10, 0x08, 0x00, 0x20, 0x7f]);
+        match d.events[0] {
+            Some(AlpsEvent::Trackstick {
+                dx, dy, pressure, ..
+            }) => {
+                if dx != 4 || dy != -2 || pressure != 32 {
+                    return TestResult::Fail("v6 stick dx/dy/pressure wrong");
+                }
+            }
+            _ => return TestResult::Fail("v6 stick packet not decoded as trackstick"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v6);
+
+    fn smoke_alps_decode_v7() -> TestResult {
+        // TWO, single finger: mt[0]=(1000,1047), left. First
+        // byte is 0xC8, not 0x80: the left bit (0x80) plus the
+        // 0x48 sync bits the first-byte check requires.
+        let f = match touchpad_fields(decode(
+            ALPS_V7_PROTOCOL,
+            &[0xc8, 0x7d, 0x5f, 0xd8, 0xff, 0xbf],
+        )) {
+            Some(f) => f,
+            None => return TestResult::Fail("v7 TWO packet produced no report"),
+        };
+        if f.fingers != 1 || f.mt[0].x != 1000 || f.mt[0].y != 1047 {
+            return TestResult::Fail("v7 TWO mt[0]/fingers wrong");
+        }
+        if f.mt[1].x != 0 || f.mt[1].y != 0 {
+            return TestResult::Fail("v7 false-positive second touch must clear");
+        }
+        if !f.left || f.pressure != 0x30 {
+            return TestResult::Fail("v7 TWO buttons/pressure wrong");
+        }
+        // IDLE: no fingers. First byte 0x48 — a 0x00 first byte
+        // would be refused by the first-byte check, and the
+        // real idle packet carries the 0x48 sync bits.
+        let f = match touchpad_fields(decode(
+            ALPS_V7_PROTOCOL,
+            &[0x48, 0x00, 0x40, 0x48, 0x00, 0x00],
+        )) {
+            Some(f) => f,
+            None => return TestResult::Fail("v7 IDLE packet produced no report"),
+        };
+        if f.fingers != 0 {
+            return TestResult::Fail("v7 IDLE must report zero fingers");
+        }
+        // Trackstick: dx=16 dy=0 pressure=32, left.
+        let d = decode(ALPS_V7_PROTOCOL, &[0x48, 0x01, 0x10, 0x00, 0x06, 0x20]);
+        match d.events[0] {
+            Some(AlpsEvent::Trackstick {
+                dx,
+                dy,
+                pressure,
+                left,
+                ..
+            }) => {
+                if dx != 16 || dy != 0 || pressure != 32 || !left {
+                    return TestResult::Fail("v7 stick dx/dy/pressure/buttons wrong");
+                }
+            }
+            _ => return TestResult::Fail("v7 stick packet not decoded as trackstick"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v7);
+
+    fn smoke_alps_decode_v8() -> TestResult {
+        // ONE: mt[0]=(1000,800), pressure 96, left. Byte 0
+        // carries 0x18 in bits 3–4 (the v8 sync pattern) plus
+        // the left button in bit 5 — 0x38, not 0x20.
+        let f = match touchpad_fields(decode(
+            ALPS_V8_PROTOCOL,
+            &[0x38, 0xed, 0x00, 0x88, 0x0c, 0x60],
+        )) {
+            Some(f) => f,
+            None => return TestResult::Fail("v8 ONE packet produced no report"),
+        };
+        if f.fingers != 1 || f.mt[0].x != 1000 || f.mt[0].y != 800 {
+            return TestResult::Fail("v8 ONE mt[0]/fingers wrong");
+        }
+        if f.pressure != 96 || !f.left {
+            return TestResult::Fail("v8 ONE pressure/buttons wrong");
+        }
+        // STICK: dx=16 dy=-8 pressure=32.
+        let d = decode(ALPS_V8_PROTOCOL, &[0x18, 0x10, 0x08, 0x28, 0x20, 0x00]);
+        match d.events[0] {
+            Some(AlpsEvent::Trackstick {
+                dx, dy, pressure, ..
+            }) => {
+                if dx != 16 || dy != -8 || pressure != 32 {
+                    return TestResult::Fail("v8 stick dx/dy/pressure wrong");
+                }
+            }
+            _ => return TestResult::Fail("v8 stick packet not decoded as trackstick"),
+        }
+        // TWO (standard macros): mt[0]=(96,192), mt[1]=(320,384).
+        let f = match touchpad_fields(decode(
+            ALPS_V8_PROTOCOL,
+            &[0x1b, 0x01, 0x06, 0x1a, 0x08, 0x0c],
+        )) {
+            Some(f) => f,
+            None => return TestResult::Fail("v8 TWO packet produced no report"),
+        };
+        if f.fingers != 2 || f.mt[0].x != 96 || f.mt[0].y != 192 {
+            return TestResult::Fail("v8 TWO mt[0]/fingers wrong");
+        }
+        if f.mt[1].x != 320 || f.mt[1].y != 384 {
+            return TestResult::Fail("v8 TWO mt[1] wrong");
+        }
+        if f.pressure != 0x30 {
+            return TestResult::Fail("v8 TWO pressure wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v8);
+
+    fn smoke_alps_decode_v2_interleaved() -> TestResult {
+        // 9-byte frame: ALPS head + bare PS/2 + ALPS tail.
+        let proto = AlpsProtocol {
+            version: AlpsVersion::V2,
+            byte0: 0xf8,
+            mask0: 0xf8,
+            flags: FLAG_PS2_INTERLEAVED,
+        };
+        let mut dec = AlpsDecoder::new(proto);
+        let frame: [u8; 9] = [0xf8, 0x5c, 0x58, 0x0f, 0x05, 0x03, 0x56, 0x3c, 0x1e];
+        let d = dec.decode_interleaved_v2(&frame);
+        match d.events[0] {
+            Some(AlpsEvent::BarePs2 {
+                dx,
+                dy,
+                left,
+                right,
+                middle,
+            }) => {
+                if dx != 5 || dy != -3 {
+                    return TestResult::Fail("interleaved bare dx/dy wrong");
+                }
+                if left || right || middle {
+                    return TestResult::Fail("interleaved bare buttons must be ignored");
+                }
+            }
+            _ => return TestResult::Fail("interleaved frame must start with BarePs2"),
+        }
+        let f = match touchpad_fields(d) {
+            Some(f) => f,
+            None => return TestResult::Fail("interleaved frame must end with Touchpad"),
+        };
+        if f.st.x != 1500 || f.st.y != 700 || f.pressure != 30 || !f.right {
+            return TestResult::Fail("interleaved touchpad report wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_decode_v2_interleaved);
+
+    fn smoke_alps_rejects_non_alps_packet() -> TestResult {
+        let proto = lookup_model(&[0x63, 0x02, 0x0a]).unwrap().protocol();
+        let dec = AlpsDecoder::new(proto);
+        // A standard PS/2 packet (sync bit, no ALPS first byte).
+        if dec.is_valid_first_byte(0x08) {
+            return TestResult::Fail("0x08 must fail the v2 first-byte check");
+        }
+        if !decode(proto, &[0x08, 0x00, 0x00, 0x00, 0x00, 0x00]).is_empty() {
+            return TestResult::Fail("non-ALPS packet must decode to no events");
+        }
+        if !decode(proto, &[0xf8, 0x5c]).is_empty() {
+            return TestResult::Fail("short packet must decode to no events");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_rejects_non_alps_packet);
+
+    fn smoke_alps_enable_v1_v2_wire() -> TestResult {
+        let mut t = FakeAlpsTransport::new(&[]);
+        if !enter_absolute_mode(&mut t, AlpsVersion::V1) {
+            return TestResult::Fail("v1 enable failed");
+        }
+        if t.sent != [0xf5, 0xf5, 0xf5, 0xf5, 0xf4, 0xf0] {
+            return TestResult::Fail("v1/v2 enable wire wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_enable_v1_v2_wire);
+
+    fn smoke_alps_enable_v5_wire() -> TestResult {
+        let mut t = FakeAlpsTransport::new(&[]);
+        if !enter_absolute_mode(&mut t, AlpsVersion::V5) {
+            return TestResult::Fail("v5 enable failed");
+        }
+        if t.sent != [0xea, 0xf3, 0x64, 0xf3, 0x28] {
+            return TestResult::Fail("v5 enable wire wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_enable_v5_wire);
+
+    fn smoke_alps_enable_v6_wire() -> TestResult {
+        // The GETID nibble inside the 0x181 word returns 2 bytes.
+        let mut t = FakeAlpsTransport::new(&[0x00, 0x00]);
+        if !enter_absolute_mode(&mut t, AlpsVersion::V6) {
+            return TestResult::Fail("v6 enable failed");
+        }
+        let want: [u8; 23] = [
+            0xec, 0xe9, 0xf5, 0xf5, 0xe7, 0xe6, 0xe7, 0xe9, 0xf4, 0xf4, 0xe8, 0x00, 0xf4, 0xf4,
+            0xf4, 0xf4, 0xf3, 0x01, 0xf2, 0xf3, 0x01, 0xf5, 0xec,
+        ];
+        if t.sent != want {
+            return TestResult::Fail("v6 monitor-mode wire wrong");
+        }
+        if !t.consumed_all() {
+            return TestResult::Fail("v6 enable did not consume all replies");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_enable_v6_wire);
+
+    fn smoke_alps_enable_v8_wire() -> TestResult {
+        // Enter-command-mode replies: a valid firmware id.
+        let mut t = FakeAlpsTransport::new(&[0x73, 0x03, 0x14]);
+        if !enter_absolute_mode(&mut t, AlpsVersion::V8) {
+            return TestResult::Fail("v8 enable failed");
+        }
+        let want: [u8; 21] = [
+            0xea, 0xea, 0xf3, 0x64, 0xf3, 0x28, 0xea, 0xec, 0xec, 0xec, 0xe9, 0xec, 0xf0, 0xf0,
+            0xf6, 0xe8, 0x02, 0xe7, 0xf0, 0xea, 0xf4,
+        ];
+        if t.sent != want {
+            return TestResult::Fail("v8 enable wire wrong");
+        }
+        if !t.consumed_all() {
+            return TestResult::Fail("v8 enable did not consume all replies");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_enable_v8_wire);
+
+    fn smoke_alps_enable_v3_wire() -> TestResult {
+        // Replies: command-mode entry (88-07-95), then the
+        // GETINFO echo for each register read (0x0004, 0x0006,
+        // 0x0007, 0x0144, 0x0159, 0x0162) with value 0x00.
+        let mut t = FakeAlpsTransport::new(&[
+            0x88, 0x07, 0x95, 0x00, 0x04, 0x00, 0x00, 0x06, 0x00, 0x00, 0x07, 0x00, 0x01, 0x44,
+            0x00, 0x01, 0x59, 0x00, 0x01, 0x62, 0x00,
+        ]);
+        if !enter_absolute_mode(&mut t, AlpsVersion::V3) {
+            return TestResult::Fail("v3 enable failed");
+        }
+        if t.sent.len() < 4 || t.sent[..4] != [0xec, 0xec, 0xec, 0xe9] {
+            return TestResult::Fail("v3 enable must start with command-mode entry");
+        }
+        let n = t.sent.len();
+        if t.sent[n - 4..] != [0xea, 0xf3, 0x64, 0xf4] {
+            return TestResult::Fail("v3 enable must end with exit + SETRATE 0x64 + ENABLE");
+        }
+        if !t.consumed_all() {
+            return TestResult::Fail("v3 enable did not consume all replies");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_alps_enable_v3_wire);
+
+    fn smoke_i8042_alps_feed_v6_touchpad() -> TestResult {
+        reset_ring_and_mouse();
+        let proto = lookup_model(&[0x73, 0x00, 0x14]).unwrap().protocol();
+        i8042_mouse::set_alps_protocol(proto, [0x73, 0x00, 0x14]);
+        // Touch down: x=1000 y=800 z=50, left.
+        feed(&[0xff, 0xe8, 0x20, 0x39, 0x30, 0x32]);
+        match pop_global() {
+            Some(InputEvent::Touch(t)) => {
+                if t.slot != 0 || t.x != 1000 || t.y != 800 || t.pressure != 50 {
+                    return TestResult::Fail("ALPS Touch down shape wrong");
+                }
+                if t.state != TouchState::Down {
+                    return TestResult::Fail("first touch must be Down");
+                }
+            }
+            _ => return TestResult::Fail("no Touch event for ALPS packet"),
+        }
+        match pop_global() {
+            Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_X && a.value == 1000 => {}
+            _ => return TestResult::Fail("ABS_X event wrong"),
+        }
+        match pop_global() {
+            Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_Y && a.value == 800 => {}
+            _ => return TestResult::Fail("ABS_Y event wrong"),
+        }
+        match pop_global() {
+            Some(InputEvent::Absolute(a)) if a.axis == abs::ABS_PRESSURE && a.value == 50 => {}
+            _ => return TestResult::Fail("ABS_PRESSURE event wrong"),
+        }
+        match pop_global() {
+            Some(InputEvent::Pointer(p)) => {
+                if p.dx != 0 || p.dy != 0 || !p.buttons.contains(PointerButtons::LEFT) {
+                    return TestResult::Fail("ALPS Pointer button event wrong");
+                }
+            }
+            _ => return TestResult::Fail("no Pointer event for ALPS button edge"),
+        }
+        if pop_global().is_some() {
+            return TestResult::Fail("ALPS down packet emitted extra events");
+        }
+        // Touchpad packets never touch the relative accumulator.
+        if i8042_mouse::take_rel_delta() != (0, 0) {
+            return TestResult::Fail("touchpad must not accumulate rel delta");
+        }
+        // Lift (z=0): a single Touch Up reusing the last position.
+        feed(&[0xff, 0xe8, 0x20, 0x39, 0x30, 0x00]);
+        match pop_global() {
+            Some(InputEvent::Touch(t)) => {
+                if t.state != TouchState::Up || t.x != 1000 || t.y != 800 || t.pressure != 0 {
+                    return TestResult::Fail("ALPS Touch up shape wrong");
+                }
+            }
+            _ => return TestResult::Fail("no Touch Up for ALPS lift"),
+        }
+        if pop_global().is_some() {
+            return TestResult::Fail("ALPS lift emitted extra events");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_i8042_alps_feed_v6_touchpad);
+
+    fn smoke_i8042_alps_feed_rejects_standard_packet() -> TestResult {
+        reset_ring_and_mouse();
+        let proto = lookup_model(&[0x63, 0x02, 0x0a]).unwrap().protocol();
+        i8042_mouse::set_alps_protocol(proto, [0x63, 0x02, 0x0a]);
+        // A standard 3-byte PS/2 packet must be dropped whole.
+        feed(&[0x08, 0x01, 0x02]);
+        if pop_global().is_some() {
+            return TestResult::Fail("ALPS-active feed must drop standard packets");
+        }
+        // …but a real v2 packet still decodes afterwards.
+        feed(&[0xf8, 0x5c, 0x58, 0x56, 0x3c, 0x1e]);
+        match pop_global() {
+            Some(InputEvent::Touch(t)) => {
+                if t.x != 1500 || t.y != 700 {
+                    return TestResult::Fail("v2 packet after rejection decoded wrong");
+                }
+            }
+            _ => return TestResult::Fail("v2 packet after rejection produced no Touch"),
+        }
+        // Clearing the protocol restores the 3-byte path.
+        i8042_mouse::clear_alps_protocol();
+        __reset_global_ring_for_test();
+        feed(&[0x09, 0x05, 0x03]);
+        match pop_global() {
+            Some(InputEvent::Pointer(p)) => {
+                if p.dx != 5 || p.dy != -3 || !p.buttons.contains(PointerButtons::LEFT) {
+                    return TestResult::Fail("cleared feed did not restore 3-byte decode");
+                }
+            }
+            _ => return TestResult::Fail("no Pointer after clearing ALPS protocol"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/alps",
+        smoke_i8042_alps_feed_rejects_standard_packet
+    );
+
+    fn smoke_i8042_alps_feed_v2_interleaved() -> TestResult {
+        reset_ring_and_mouse();
+        // The table's interleaved row expects byte0 0xff; the
+        // verified frame's ALPS part starts 0xF8, so the test
+        // protocol mirrors the frame (same version + flag).
+        let proto = AlpsProtocol {
+            version: AlpsVersion::V2,
+            byte0: 0xf8,
+            mask0: 0xf8,
+            flags: FLAG_PS2_INTERLEAVED,
+        };
+        i8042_mouse::set_alps_protocol(proto, [0x00, 0x00, 0x00]);
+        // The 6-byte ALPS part alone emits nothing — it waits
+        // for its 3 extension bytes.
+        feed(&[0xf8, 0x5c, 0x58, 0x0f, 0x05, 0x03]);
+        if pop_global().is_some() {
+            return TestResult::Fail("stashed interleaved packet must not emit yet");
+        }
+        feed(&[0x56, 0x3c, 0x1e]);
+        // Bare PS/2 part first: relative motion, no buttons.
+        match pop_global() {
+            Some(InputEvent::Pointer(p)) => {
+                if p.dx != 5 || p.dy != -3 || p.buttons != PointerButtons::EMPTY {
+                    return TestResult::Fail("interleaved bare motion wrong");
+                }
+            }
+            _ => return TestResult::Fail("no Pointer for interleaved bare part"),
+        }
+        match pop_global() {
+            Some(InputEvent::Touch(t)) => {
+                if t.x != 1500 || t.y != 700 || t.state != TouchState::Down {
+                    return TestResult::Fail("interleaved touchpad report wrong");
+                }
+            }
+            _ => return TestResult::Fail("no Touch for interleaved ALPS part"),
+        }
+        if i8042_mouse::take_rel_delta() != (5, -3) {
+            return TestResult::Fail("interleaved bare motion must accumulate rel delta");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/alps", smoke_i8042_alps_feed_v2_interleaved);
+}
