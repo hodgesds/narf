@@ -261,6 +261,7 @@ impl Fixture {
             rss: rss::RssConfig::default(),
             reset_discarded: 0,
             interrupts: Some(interrupts::Interrupts::simulated(csr, queues)),
+            suspended: AtomicBool::new(false),
         };
         *MODEL.lock() = &mut *firmware as *mut Firmware as usize;
         if !PUMP_REGISTERED.swap(true, Ordering::AcqRel) {

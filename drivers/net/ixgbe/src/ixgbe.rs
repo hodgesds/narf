@@ -2400,7 +2400,7 @@ impl Ixgbe {
         // SAFETY: identity-mapped MMIO.
         let links = unsafe { self.mmio.read32(REG_LINKS) };
         *self.link_up.lock() = links & LINKS_UP != 0;
-        crate::publish::publish_link(ixgbe_ifname(), ixgbe_link_sample(links));
+        crate::publish::publish_link(self.ifname(), ixgbe_link_sample(links));
         Ok(())
     }
 
@@ -2491,6 +2491,22 @@ impl Ixgbe {
     pub fn read_links(&self) -> u32 {
         // SAFETY: identity-mapped MMIO.
         unsafe { self.mmio.read32(REG_LINKS) }
+    }
+}
+
+impl narf_power::device_pm::DevicePmOps for Ixgbe {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        // System suspend with no WoL arming: the `suspend` plan
+        // disarms the wake filters. Arming a configured WoL policy
+        // on system suspend is a follow-up (e1000's gap-6 shape);
+        // the runtime `suspend(Some(cfg))` path stays for callers
+        // that already hold a `WolConfig`.
+        self.suspend(None)
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
     }
 }
 
@@ -2810,6 +2826,7 @@ pub fn detach_controller(index: usize) {
     if !name.is_empty() {
         crate::publish::clear_rx_mirror_attached(name);
         let _ = narf_net::iface::unregister(name);
+        narf_power::device_pm::unregister_device_pm(name);
     }
 }
 
@@ -2932,6 +2949,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         },
     );
     dev.ifname.set(name);
+
+    // Device-PM registration (#793): system suspend fans out
+    // through `Ixgbe::suspend(None)` / `Ixgbe::resume` via the
+    // `DevicePmOps` impl above. The registry is idempotent on the
+    // interface name; detach withdraws the entry. The suspend/resume
+    // register plans are fixture-pinned in `ixgbe::pm` (`tests.rs`).
+    narf_power::device_pm::register_device_pm_ops(dev.ifname(), dev.clone());
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {

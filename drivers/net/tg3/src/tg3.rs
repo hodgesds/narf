@@ -34,7 +34,7 @@
 extern crate alloc;
 
 use core::fmt::Write as _;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 use narf_driver_runtime::{
@@ -131,8 +131,6 @@ const REG_GRC_MISC_CFG: u64 = 0x6804;
 // All bit positions mirror Linux `tg3.h`.
 
 // MISC_HOST_CTRL (0x0068).
-const MISC_HOST_CTRL_BYTE_SWAP: u32 = 0x0000_0004;
-const MISC_HOST_CTRL_WORD_SWAP: u32 = 0x0000_0008;
 const MISC_HOST_CTRL_PCISTATE_RW: u32 = 0x0000_0010;
 const MISC_HOST_CTRL_CLKREG_RW: u32 = 0x0000_0020;
 const MISC_HOST_CTRL_INDIR_ACCESS: u32 = 0x0000_0080;
@@ -176,6 +174,240 @@ const MII_BMSR_LINK_UP: u16 = 0x0004;
 /// the internal copper PHY to address 1 (see `tp->phy_addr` init in
 /// `tg3_get_invariants`).
 const PHY_ADDR_INTERNAL: u8 = 0x01;
+
+// ── Suspend / resume register plans (issue #793) ────────────────────
+
+/// The chip-reset register program, factored over a minimal bank so
+/// fixtures drive the exact sequence against a fake bank (end-to-end
+/// register writes, no silicon) while the live path runs it against
+/// BAR0 via [`MmioBank`]. Same shape as igc's `Registers` trait
+/// (`read` / `write` / `wait` / `delay`).
+///
+/// This is the *same* sequence `Tg3Nic::chip_reset` runs at
+/// bring-up, moved here verbatim so bring-up and resume share one
+/// program: `chip_reset` delegates to [`chip_reset_plan`].
+///
+/// Suspend / resume shape for this Stage-1 driver:
+/// * Suspend has NO register program. Stage 1 programs no interrupt
+///   mask and no MAC TX/RX enable (no BD ring init, no IRQ binding),
+///   so there is no register to quiesce — the quiesce is the
+///   `suspended` datapath gate in `Tg3Nic::transmit` / `receive`
+///   plus the link-down publication. (Linux's `tg3_suspend` closes
+///   the device; the NARF equivalent at this stage is the gate.)
+/// * Resume re-runs the full chip reset via [`chip_reset_plan`]
+///   (the MAC-side re-init bring-up performs) and re-samples link
+///   from BMSR. No PHY power-down, and no BMCR AN-restart: the PHY
+///   stays powered so its autoneg advertisement persists, and the
+///   MI_COM write opcode (`MI_COM_CMD_WRITE`) is not in this tree
+///   — only the read path is grounded (`__tg3_readphy`), so a
+///   BMCR write would be an invented constant.
+mod pm {
+    use super::{
+        GRC_MISC_CFG_CORECLK_RESET, GRC_MODE_HOST_SENDBDS, GRC_MODE_HOST_STACKUP,
+        GRC_MODE_INT_ON_MAC_ATTN, MAC_MI_MODE_DEFAULT_CLK, MISC_HOST_CTRL_CLKREG_RW,
+        MISC_HOST_CTRL_INDIR_ACCESS, MISC_HOST_CTRL_PCISTATE_RW, MISC_HOST_CTRL_TAGGED_STATUS,
+        REG_GRC_MISC_CFG, REG_GRC_MODE, REG_MAC_MI_MODE, REG_MISC_HOST_CTRL,
+    };
+    use narf_bus::MmioRegion;
+
+    /// Minimal register-bank abstraction so the register
+    /// conversation can be exercised against a fake bank in
+    /// fixtures and against real MMIO in the driver via
+    /// [`MmioBank`].
+    pub trait RegBank {
+        fn read32(&self, offset: u64) -> u32;
+        fn write32(&self, offset: u64, value: u32);
+        fn wait(&self, us: u64, ready: impl FnMut() -> bool) -> bool;
+        fn delay(&self, us: u64);
+    }
+
+    /// [`RegBank`] over a real BAR0 mapping.
+    #[derive(Debug)]
+    pub struct MmioBank<'a> {
+        mmio: &'a MmioRegion,
+    }
+
+    impl<'a> MmioBank<'a> {
+        pub fn new(mmio: &'a MmioRegion) -> Self {
+            Self { mmio }
+        }
+    }
+
+    impl RegBank for MmioBank<'_> {
+        fn read32(&self, offset: u64) -> u32 {
+            // SAFETY: the driver owns BAR0 exclusively; the caller
+            // guarantees `offset` is a valid device register.
+            unsafe { self.mmio.read32(offset) }
+        }
+        fn write32(&self, offset: u64, value: u32) {
+            // SAFETY: same as above.
+            unsafe { self.mmio.write32(offset, value) }
+        }
+        fn wait(&self, us: u64, ready: impl FnMut() -> bool) -> bool {
+            narf_scheduler::responsive_spin_until(ready, narf_time::Deadline::after_us(us))
+        }
+        fn delay(&self, us: u64) {
+            let deadline = narf_time::Deadline::after_us(us);
+            narf_scheduler::responsive_spin_until(|| deadline.expired(), deadline);
+        }
+    }
+
+    /// The `MISC_HOST_CTRL` word `chip_reset` programs (host-side
+    /// endian-swap bits off — NARF + BCM are both little-endian).
+    pub const fn misc_host_ctrl_word() -> u32 {
+        MISC_HOST_CTRL_INDIR_ACCESS
+            | MISC_HOST_CTRL_PCISTATE_RW
+            | MISC_HOST_CTRL_CLKREG_RW
+            | MISC_HOST_CTRL_TAGGED_STATUS
+    }
+
+    /// The `GRC_MODE` word `chip_reset` programs (host stackup +
+    /// send-BD ring + IRQ on MAC attention).
+    pub const fn grc_mode_word() -> u32 {
+        GRC_MODE_HOST_STACKUP | GRC_MODE_HOST_SENDBDS | GRC_MODE_INT_ON_MAC_ATTN
+    }
+
+    /// Chip-reset register program — the exact sequence
+    /// `Tg3Nic::chip_reset` ran at bring-up:
+    /// 1. Program MISC_HOST_CTRL to a known-good state.
+    /// 2. Fire the core-clock reset (self-clearing per `tg3.h`).
+    /// 3. Wait up to 250 ms for the reset bit to drop (some 575X
+    ///    chips won't answer PCI cfg accesses while resetting).
+    /// 4. Re-program MISC_HOST_CTRL (the reset clears the
+    ///    indirect-access bit on some 575X parts).
+    /// 5. Program GRC_MODE (host stackup).
+    /// 6. Program the MII clock divider, then settle ~1 ms before
+    ///    the MI bus is stable.
+    ///
+    /// Returns whether the core-clock reset bit cleared in time.
+    /// The post-reset programming runs regardless — a timed-out
+    /// reset still leaves the host-side registers programmed.
+    pub fn chip_reset_plan(bank: &impl RegBank) -> bool {
+        let misc_host = misc_host_ctrl_word();
+        bank.write32(REG_MISC_HOST_CTRL, misc_host);
+        bank.write32(REG_GRC_MISC_CFG, GRC_MISC_CFG_CORECLK_RESET);
+        let cleared = bank.wait(250_000, || {
+            bank.read32(REG_GRC_MISC_CFG) & GRC_MISC_CFG_CORECLK_RESET == 0
+        });
+        bank.write32(REG_MISC_HOST_CTRL, misc_host);
+        bank.write32(REG_GRC_MODE, grc_mode_word());
+        bank.write32(REG_MAC_MI_MODE, MAC_MI_MODE_DEFAULT_CLK);
+        bank.delay(1_000);
+        cleared
+    }
+
+    #[cfg(any(test, feature = "builtin"))]
+    mod tests {
+        use super::*;
+        use narf_kernel_test::{kernel_test_in, TestResult};
+
+        /// In-memory register bank for the PM fixtures: 32 KiB of
+        /// BAR0 window, covering MISC_HOST_CTRL (0x0068),
+        /// MAC_MI_MODE (0x0454), GRC_MODE (0x6800) and
+        /// GRC_MISC_CFG (0x6804). Emulates the self-clearing
+        /// core-clock reset bit: the first read after the reset
+        /// write still shows it set, the second shows it clear —
+        /// the wait loop polls, then succeeds.
+        struct FakeBank {
+            regs: core::cell::RefCell<alloc::vec::Vec<u32>>,
+            reset_reads: core::cell::RefCell<u32>,
+            stuck_reset: bool,
+            delays_us: core::cell::RefCell<alloc::vec::Vec<u64>>,
+        }
+
+        impl FakeBank {
+            fn new(stuck_reset: bool) -> Self {
+                Self {
+                    regs: core::cell::RefCell::new(alloc::vec![0u32; 0x8000 / 4]),
+                    reset_reads: core::cell::RefCell::new(0),
+                    stuck_reset,
+                    delays_us: core::cell::RefCell::new(alloc::vec::Vec::new()),
+                }
+            }
+            fn get(&self, offset: u64) -> u32 {
+                *self.regs.borrow().get((offset / 4) as usize).unwrap_or(&0)
+            }
+        }
+
+        impl RegBank for FakeBank {
+            fn read32(&self, offset: u64) -> u32 {
+                if offset == REG_GRC_MISC_CFG && !self.stuck_reset {
+                    let mut reads = self.reset_reads.borrow_mut();
+                    *reads += 1;
+                    // First read still shows the bit (chip busy
+                    // re-initialising); the second shows it clear.
+                    if *reads >= 2 {
+                        let mut regs = self.regs.borrow_mut();
+                        if let Some(slot) = regs.get_mut((offset / 4) as usize) {
+                            *slot &= !GRC_MISC_CFG_CORECLK_RESET;
+                        }
+                    }
+                }
+                self.get(offset)
+            }
+            fn write32(&self, offset: u64, value: u32) {
+                if let Some(slot) = self.regs.borrow_mut().get_mut((offset / 4) as usize) {
+                    *slot = value;
+                }
+            }
+            fn wait(&self, _us: u64, mut ready: impl FnMut() -> bool) -> bool {
+                for _ in 0..1000 {
+                    if ready() {
+                        return true;
+                    }
+                }
+                false
+            }
+            fn delay(&self, us: u64) {
+                self.delays_us.borrow_mut().push(us);
+            }
+        }
+
+        fn smoke_tg3_pm_chip_reset_plan_reprograms() -> TestResult {
+            let bank = FakeBank::new(false);
+            if !chip_reset_plan(&bank) {
+                return TestResult::Fail("tg3 chip reset plan reported the reset bit stuck");
+            }
+            if bank.read32(REG_MISC_HOST_CTRL) != misc_host_ctrl_word() {
+                return TestResult::Fail("tg3 reset plan did not program MISC_HOST_CTRL");
+            }
+            if bank.read32(REG_GRC_MODE) != grc_mode_word() {
+                return TestResult::Fail("tg3 reset plan did not program GRC_MODE");
+            }
+            if bank.read32(REG_MAC_MI_MODE) != MAC_MI_MODE_DEFAULT_CLK {
+                return TestResult::Fail("tg3 reset plan did not program MAC_MI_MODE");
+            }
+            if bank.read32(REG_GRC_MISC_CFG) & GRC_MISC_CFG_CORECLK_RESET != 0 {
+                return TestResult::Fail("tg3 reset plan left the core-clock reset bit set");
+            }
+            if *bank.delays_us.borrow() != [1000u64] {
+                return TestResult::Fail("tg3 reset plan did not run the 1 ms MI settle");
+            }
+            // A second reset is stable.
+            if !chip_reset_plan(&bank) {
+                return TestResult::Fail("tg3 second reset plan drifted from the first");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!("drivers/net/tg3", smoke_tg3_pm_chip_reset_plan_reprograms);
+
+        fn smoke_tg3_pm_chip_reset_plan_timeout_fails_closed() -> TestResult {
+            let bank = FakeBank::new(true);
+            if chip_reset_plan(&bank) {
+                return TestResult::Fail("tg3 reset plan claimed success on a stuck reset bit");
+            }
+            // The post-reset programming still ran.
+            if bank.read32(REG_GRC_MODE) != grc_mode_word() {
+                return TestResult::Fail("tg3 timed-out reset plan skipped the GRC_MODE program");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!(
+            "drivers/net/tg3",
+            smoke_tg3_pm_chip_reset_plan_timeout_fails_closed
+        );
+    }
+}
 
 // ── BD ring sizing ─────────────────────────────────────────────────
 
@@ -349,6 +581,12 @@ pub enum NicError {
     FrameTooLong,
     /// `transmit` couldn't find a free TX descriptor.
     TxRingFull,
+    /// The core-clock reset bit didn't clear inside the 250 ms
+    /// budget during a resume re-init (issue #793).
+    ResetTimeout,
+    /// The device is suspended for system suspend (issue #793):
+    /// the datapath gates refuse TX and RX while suspended.
+    Suspended,
     /// Data path not implemented yet (placeholder for paths not
     /// fully wired to silicon yet).
     NotImplemented,
@@ -422,6 +660,9 @@ pub struct Tg3Nic {
     /// instance (`eth%d`). Per-instance (i40e/igc pattern): the old
     /// module-level `TG3_IFNAME` static could only name one NIC.
     ifname: crate::publish::IfName,
+    /// Set by `suspend`, cleared by `resume`: the datapath gates
+    /// refuse TX and RX while this is set (issue #793).
+    suspended: AtomicBool,
 
     // IPC integration
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -649,6 +890,7 @@ impl Tg3Nic {
             reset_done,
             addr: device.addr,
             ifname: crate::publish::IfName::new(),
+            suspended: AtomicBool::new(false),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
@@ -687,85 +929,12 @@ impl Tg3Nic {
     /// `mmio` covers BAR0 of an owned tg3 device.
     #[allow(clippy::erasing_op)]
     unsafe fn chip_reset(mmio: &MmioRegion) -> bool {
-        // 1. Program MISC_HOST_CTRL to a known-good state. Linux's
-        //    `tg3_get_invariants` sets these in `tp->misc_host_ctrl`
-        //    before reset; we keep the host-side endian-swap bits
-        //    off (NARF + BCM are both little-endian on x86_64).
-        //    INDIR_ACCESS + PCISTATE_RW + CLKREG_RW open the
-        //    indirect-register window the bring-up walk uses;
-        //    TAGGED_STATUS gates the tagged-IRQ feature we need
-        //    in Stage 2.
-        let misc_host = MISC_HOST_CTRL_INDIR_ACCESS
-            | MISC_HOST_CTRL_PCISTATE_RW
-            | MISC_HOST_CTRL_CLKREG_RW
-            | MISC_HOST_CTRL_TAGGED_STATUS
-            | (MISC_HOST_CTRL_BYTE_SWAP * 0)
-            | (MISC_HOST_CTRL_WORD_SWAP * 0);
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            mmio.write32(REG_MISC_HOST_CTRL, misc_host);
-        }
-
-        // 2. Fire the core-clock reset. Bit is self-clearing per
-        //    `tg3.h` (line 1749) — once the chip finishes its
-        //    internal re-init the bit drops to 0.
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            mmio.write32(REG_GRC_MISC_CFG, GRC_MISC_CFG_CORECLK_RESET);
-        }
-
-        // 3. Per the Linux comment block at tg3.c:9259:
-        //    "we have to delay before the PCI read back. Some 575X
-        //     chips even will not respond to a PCI cfg access when
-        //     the reset command is given to the chip."
-        //    `udelay(120)` is the Linux value. NARF's
-        //    `responsive_spin_until` is the closest analog — it
-        //    spin-waits while ticking the kernel sleep_pumps so the
-        //    framebuffer cursor + serial drain stay alive on a slow
-        //    reset. 250 ms wall-clock budget covers worst-case
-        //    PCIe re-train.
-        let cleared = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { mmio.read32(REG_GRC_MISC_CFG) } & GRC_MISC_CFG_CORECLK_RESET == 0,
-            narf_time::Deadline::after_ms(250),
-        );
-
-        // 4. Re-program MISC_HOST_CTRL after reset — the
-        //    core-clock reset clears the indirect-access bit on
-        //    some 575X parts and we need it back on before any
-        //    further register access.
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            mmio.write32(REG_MISC_HOST_CTRL, misc_host);
-        }
-
-        // 5. Program GRC_MODE. HOST_STACKUP tells the chip to drive
-        //    its descriptor rings from host memory (vs. the on-die
-        //    SRAM that NetXtreme II uses); HOST_SENDBDS gates the
-        //    send-BD ring; INT_ON_MAC_ATTN makes MAC attention
-        //    events raise an IRQ (used by Stage 2's link-change
-        //    handler).
-        let grc_mode = GRC_MODE_HOST_STACKUP | GRC_MODE_HOST_SENDBDS | GRC_MODE_INT_ON_MAC_ATTN;
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            mmio.write32(REG_GRC_MODE, grc_mode);
-        }
-
-        // 6. Program the MII clock divider. Default 0x1F gives
-        //    ~2.5 MHz MDC at 80 MHz MAC clock. Auto-poll OFF for
-        //    Stage 1 — software drives PHY reads via __tg3_readphy.
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            mmio.write32(REG_MAC_MI_MODE, MAC_MI_MODE_DEFAULT_CLK);
-        }
-        // Per `__tg3_readphy`, ~80 us after MAC_MI_MODE writes
-        // before the bus is stable. We hand off a fast spin —
-        // 80 us is below our `Deadline` resolution but
-        // `responsive_spin_until` polls in a tight loop and the
-        // first iteration alone is several us.
-        let _ = narf_scheduler::responsive_spin_until(|| true, narf_time::Deadline::after_ms(1));
-
-        cleared
+        // The register program lives in `pm::chip_reset_plan`
+        // (issue #793) so bring-up and resume share one sequence
+        // and fixtures can drive it against a fake bank; this
+        // wrapper keeps the original `unsafe` contract (caller
+        // owns the device's MMIO window).
+        pm::chip_reset_plan(&pm::MmioBank::new(mmio))
     }
 
     /// Read a 16-bit MII-Clause-22 register through MAC_MI_COM. This
@@ -848,6 +1017,41 @@ impl Tg3Nic {
         unsafe { self.mmio.read32(REG_MAC_MI_STAT) }
     }
 
+    /// Suspend the device for system suspend (issue #793): set the
+    /// datapath gate and publish link down. A second suspend is a
+    /// no-op success. There is no register program on suspend —
+    /// Stage 1 programs no interrupt mask and no MAC TX/RX enable,
+    /// so there is no register to quiesce (see the `pm` module
+    /// header); the rings persist untouched.
+    pub fn suspend(&self) -> Result<(), NicError> {
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        crate::publish::publish_link(self.ifname(), crate::publish::LinkSample::DOWN);
+        Ok(())
+    }
+
+    /// Resume a suspended device (issue #793): re-run the full chip
+    /// reset via the `pm` plan — the MAC-side re-init bring-up
+    /// performs — then re-sample link from BMSR and republish it.
+    /// Resuming a running device is a no-op success. A timed-out
+    /// reset fails closed (`ResetTimeout`) with the device still
+    /// suspended, so resume can be retried.
+    pub fn resume(&self) -> Result<(), NicError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !pm::chip_reset_plan(&pm::MmioBank::new(&self.mmio)) {
+            return Err(NicError::ResetTimeout);
+        }
+        self.suspended.store(false, Ordering::Release);
+        crate::publish::publish_link(
+            self.ifname(),
+            crate::publish::LinkSample::carrier_only(self.live_link_up()),
+        );
+        Ok(())
+    }
+
     /// Stage 2: copy `frame` into the next TX slot's buffer, write a
     /// fully-formed TX descriptor, advance the producer index. Does
     /// not yet ring the SNDHOST_PROD_IDX mailbox — that's Stage 3
@@ -857,6 +1061,9 @@ impl Tg3Nic {
     /// Returns `Ok(slot)` so a caller (or smoke test) can locate the
     /// produced descriptor in the ring without re-deriving it.
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<u32, NicError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(NicError::Suspended);
+        }
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
         }
@@ -904,6 +1111,9 @@ impl Tg3Nic {
     /// value we put there at bring-up). A real wire-fed RX would
     /// have the chip write a non-zero `idx_len` length field.
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        if self.suspended.load(Ordering::Acquire) {
+            return None;
+        }
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RX_STD_RING_LEN;
         let desc_ptr = self
@@ -1022,6 +1232,17 @@ impl Tg3Nic {
     }
 }
 
+impl narf_power::device_pm::DevicePmOps for Tg3Nic {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.suspend()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        self.resume()
+            .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)
+    }
+}
+
 // ── Driver-match registration ────────────────────────────────────────
 
 /// Every probed controller, by probe order. The index is the cookie
@@ -1103,6 +1324,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         crate::publish::LinkSample::carrier_only(dev.live_link_up()),
     );
     dev.ifname.set(name);
+
+    // Device-PM registration (#793): system suspend fans out
+    // through `Tg3Nic::suspend` / `Tg3Nic::resume` via the
+    // `DevicePmOps` impl below. The registry is idempotent on the
+    // interface name. There is no tg3 detach path to withdraw the
+    // entry from yet — the CONTROLLER slot is never drained either,
+    // so the entry lives as long as the device does.
+    narf_power::device_pm::register_device_pm_ops(dev.ifname(), dev.clone());
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {

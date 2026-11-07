@@ -23,6 +23,8 @@ pub mod features;
 #[cfg(feature = "builtin")]
 pub mod phy_access;
 #[cfg(feature = "builtin")]
+pub mod pm;
+#[cfg(feature = "builtin")]
 pub mod r8169;
 #[cfg(feature = "builtin")]
 pub mod rtl8125;
