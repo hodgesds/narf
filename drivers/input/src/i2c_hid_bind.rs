@@ -632,6 +632,19 @@ async fn pump_task(
         log_ptp_mode_set_result(&path, set_ptp_multi_touch_mode(&driver, profile).await);
     }
 
+    // Record the device for system suspend/resume (#770): the PM
+    // hooks rebuild a throwaway driver from this snapshot (bus +
+    // descriptor + precomputed PTP mode report) because the pump
+    // owns its driver instance. The mode bytes are recomputed
+    // here rather than plumbed out of `set_ptp_multi_touch_mode`
+    // so that helper's signature stays untouched.
+    crate::i2c_hid_pm::record_device(
+        &driver,
+        ptp.as_ref().and_then(|p| {
+            narf_hid::ptp::build_mode_feature_report(p, narf_hid::ptp::mode::MULTI_TOUCH)
+        }),
+    );
+
     if let Some(ts_profile) = &touchscreen {
         // One-line boot summary per the touchscreen Stage-0 spec.
         crate::i2c_hid_touch::log_boot_summary(&path, ts_profile);

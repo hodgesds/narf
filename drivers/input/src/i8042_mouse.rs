@@ -273,20 +273,22 @@ impl Ps2Transport for AuxTransport {
     }
 }
 
-/// Bring up the PS/2 mouse channel. Best-effort — most QEMU configs
-/// don't expose a PS/2 mouse (USB / virtio-mouse instead), in
-/// which case the device-side commands will time out and we
-/// proceed without sending PointerEvents.
+/// Re-enable the AUX (mouse) channel: enable AUX, restore the
+/// AUX-IRQ config, reset the mouse, set defaults, negotiate the
+/// protocol, restore the sample rate, enable data reporting.
+/// Returns whether the mouse is reporting — best effort: a system
+/// without a PS/2 mouse returns `false`, not an error. A timeout
+/// in the controller-side config exchange is an `Err`, matching
+/// `init()`.
 ///
-/// # Safety
-/// BSP-only at the time of call; assumes `i8042::init` already
-/// ran (so the keyboard channel is configured). Concurrent agents
-/// driving 0x60/0x64 are forbidden.
-pub unsafe fn init() -> Result<(), InitError> {
-    if STATE.initialized.load(Ordering::Acquire) {
-        return Ok(());
-    }
-
+/// Shared verbatim by `init()` (steps 1-4) and `resume()` (#770):
+/// resume re-runs exactly this bring-up instead of a second,
+/// drift-prone copy of the sequence.
+///
+/// Exclusive-access contract (same as `init()`): `i8042::init`
+/// already ran and no other agent is driving the 8042 ports
+/// concurrently.
+fn enable_mouse_channel() -> Result<bool, InitError> {
     // 1. Enable AUX channel.
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: 0x64 cmd.
@@ -361,6 +363,26 @@ pub unsafe fn init() -> Result<(), InitError> {
         }
     }
 
+    Ok(reporting_ok)
+}
+
+/// Bring up the PS/2 mouse channel. Best-effort — most QEMU configs
+/// don't expose a PS/2 mouse (USB / virtio-mouse instead), in
+/// which case the device-side commands will time out and we
+/// proceed without sending PointerEvents.
+///
+/// # Safety
+/// BSP-only at the time of call; assumes `i8042::init` already
+/// ran (so the keyboard channel is configured). Concurrent agents
+/// driving 0x60/0x64 are forbidden.
+pub unsafe fn init() -> Result<(), InitError> {
+    if STATE.initialized.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    // 1-4. Enable the AUX channel + reset the mouse + enable reporting.
+    // Shared with `resume()`; see `enable_mouse_channel`.
+    let reporting_ok = enable_mouse_channel()?;
     let _ = reporting_ok; // tracked via STATE.initialized only; mouse
                           // doesn't have a separate panel atom yet.
     STATE.initialized.store(true, Ordering::Release);
@@ -417,6 +439,36 @@ pub unsafe fn init() -> Result<(), InitError> {
     *MOUSE_EVDEV_NODE.lock() = Some(node_arc);
 
     Ok(())
+}
+
+// ── Device power management (#770) ─────────────────────────────
+//
+// The mouse channel is covered by the single "i8042" device-PM
+// entry registered by `crate::i8042`; `i8042::pm_resume` calls
+// this after re-enabling the keyboard channel.
+//
+// Resume: drop any partial packet + stale relative deltas (motion +
+// wheel — the controller reset below means pre-suspend bytes will
+// never complete — a split packet would otherwise wedge the phase
+// machine or inject a stale jump), reset the button edge tracker
+// (the reset leaves all buttons up; a button still held after
+// resume must re-emit its press edge), then re-run the channel
+// bring-up `init()` used. No-op when the mouse never
+// initialised; the evdev node is NOT re-registered.
+
+/// Re-enable the AUX channel after suspend. No-op when the mouse
+/// never initialised.
+pub(crate) fn resume() {
+    STATE.phase.store(0, Ordering::Release);
+    STATE.rel_dx_acc.store(0, Ordering::Release);
+    STATE.rel_dy_acc.store(0, Ordering::Release);
+    STATE.rel_wheel_acc.store(0, Ordering::Release);
+    STATE.rel_hwheel_acc.store(0, Ordering::Release);
+    STATE.prev_buttons.store(0, Ordering::Release);
+    if !STATE.initialized.load(Ordering::Acquire) {
+        return;
+    }
+    let _ = enable_mouse_channel();
 }
 
 /// Return the evdev `DeviceNode` for the PS/2 mouse if registered.
