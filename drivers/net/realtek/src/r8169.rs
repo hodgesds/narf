@@ -404,8 +404,10 @@ pub struct RtlNic {
     mtu: IrqSafeSpinLock<u32>,
     /// Last WoL option set programmed via [`RtlNic::set_wol_opts`].
     wol_opts: IrqSafeSpinLock<crate::features::WolOpts>,
-    /// True when PHYStatus.LinkSts read 1 at bring-up. We don't yet
-    /// re-poll on LinkChg interrupts.
+    /// True when PHYStatus.LinkSts read 1 at bring-up. Probe-time
+    /// snapshot only — the RX pump re-samples PHYStatus every pass
+    /// and republishes transitions into iface metadata (issue #791),
+    /// which is where live carrier lives; see `r8169_rx_pump`.
     pub link_up: bool,
     /// IDT vector wired to MSI-X entry 0, when MSI-X is enabled.
     pub irq_vector: Option<u8>,
@@ -655,8 +657,11 @@ impl RtlNic {
         // 7. PHYStatus snapshot. The PHY sub-block runs auto-neg in
         //    the background; on a live cabled link the LinkSts bit
         //    reads 1 within ~3 seconds of reset. We capture the
-        //    current state — a follow-up wires LinkChg-driven
-        //    re-evaluation.
+        //    current state for the probe-time sample and the
+        //    `Interface::link_up` snapshot; the RX pump re-samples
+        //    PHYStatus every pass and republishes transitions
+        //    (issue #791) — LinkChg re-evaluation lives there, not
+        //    in a follow-up.
         // SAFETY: same.
         let phystat = unsafe { mmio.read8(REG_PHYSTAT) };
         let link_up = phystat & PHYSTAT_LINKSTS != 0;
@@ -1527,6 +1532,10 @@ fn r8169_link_sample(status: u8) -> crate::publish::LinkSample {
         } else {
             narf_net::iface::LinkDuplex::Half
         }),
+        // PHYStatus reports no media state; r8169 parts are fixed
+        // copper, not caged modules (issue #791).
+        media_available: None,
+        phy_type: None,
     }
 }
 

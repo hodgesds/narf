@@ -240,6 +240,20 @@ pub struct NetIfaceEntry {
     pub carrier_down_count: u32,
     pub speed_mbps: Option<u32>,
     pub duplex: Option<LinkDuplex>,
+    /// Transceiver/module presence, when the driver reports it
+    /// (issue #791 / #867): `Some(true)` = a module is seated, even
+    /// when the link is down; `Some(false)` = an empty cage;
+    /// `None` = the family reports no media state. Unlike
+    /// speed/duplex it is NOT cleared on carrier-down — a seated
+    /// SFP+ with no link is still seated, which is exactly the
+    /// distinction the carrier-down sample must preserve.
+    pub media_available: Option<bool>,
+    /// Raw firmware PHY-type code, when the driver reports one
+    /// (issue #791 / #867). The code is family-defined — for i40e
+    /// it is the AQ `get_link_status` phy_type byte
+    /// (`I40E_PHY_TYPE_*`); decoding it to a name is #867's table
+    /// work, not this field's job.
+    pub phy_type: Option<u8>,
     /// Authoritative software-path counters shared by sysfs, procfs, and
     /// rtnetlink. Driver-specific error paths can add to these through the
     /// accounting helpers below as they gain detailed hardware reporting.
@@ -851,6 +865,8 @@ fn register_inner(
     let carrier_down_count = old.as_ref().map_or(0, |old| old.carrier_down_count);
     let speed_mbps = old.as_ref().and_then(|old| old.speed_mbps);
     let duplex = old.as_ref().and_then(|old| old.duplex);
+    let media_available = old.as_ref().and_then(|old| old.media_available);
+    let phy_type = old.as_ref().and_then(|old| old.phy_type);
     let stats = old.as_ref().map_or_else(
         || IfaceCounterSnapshot::empty(&name),
         |old| old.stats.clone(),
@@ -917,6 +933,8 @@ fn register_inner(
         carrier_down_count,
         speed_mbps,
         duplex,
+        media_available,
+        phy_type,
         stats,
         offloads: old
             .as_ref()
@@ -1456,6 +1474,13 @@ pub struct NetIfaceSnapshot {
     pub carrier_down_count: u32,
     pub speed_mbps: Option<u32>,
     pub duplex: Option<LinkDuplex>,
+    /// Transceiver/module presence, mirrored from the entry
+    /// (issue #791 / #867). Survives carrier-down: a seated module
+    /// with no link still reads `Some(true)`.
+    pub media_available: Option<bool>,
+    /// Raw firmware PHY-type code, mirrored from the entry
+    /// (issue #791 / #867). Family-defined; see the entry field.
+    pub phy_type: Option<u8>,
     pub stats: IfaceCounterSnapshot,
     /// Offloads this interface's send path honors; the stack requests them
     /// via [`crate::TxMeta`] rather than computing in software.
@@ -1663,6 +1688,8 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         carrier_down_count: entry.carrier_down_count,
         speed_mbps: entry.speed_mbps,
         duplex: entry.duplex,
+        media_available: entry.media_available,
+        phy_type: entry.phy_type,
         stats: entry.stats.clone(),
         offloads: entry.offloads,
         software_gro: entry.software_gro,
@@ -1956,6 +1983,26 @@ pub fn set_link_metadata_for(
     true
 }
 
+/// Publish a driver's latest transceiver/module observation
+/// (issue #791 / #867). Independent of carrier on purpose: a
+/// seated module with no link, and an empty cage on a healthy PF,
+/// are the two states this exists to distinguish, so a
+/// carrier-down sample must still land here. `None` leaves the
+/// stored value untouched — a family that reports no media state
+/// never clears another sample's.
+pub fn set_link_media(name: &str, media_available: Option<bool>, phy_type: Option<u8>) -> bool {
+    let _capture = monitor::PUBLISH.lock();
+    let mut guard = IFACES.lock();
+    let Some(entry) = guard
+        .as_mut()
+        .and_then(|entries| entries.iter_mut().find(|entry| entry.name == name))
+    else {
+        return false;
+    };
+    update_link_media(entry, media_available, phy_type);
+    true
+}
+
 /// Withdraw this physical registration's carrier after DOWN/namespace
 /// retirement. The immutable registration identity survives those changes,
 /// but a same-name/index/MAC rebind gets a fresh identity. This can only
@@ -2097,6 +2144,31 @@ fn update_link_metadata(
     }
     entry.speed_mbps = carrier.then_some(speed_mbps).flatten();
     entry.duplex = carrier.then_some(duplex).flatten();
+}
+
+fn update_link_media(
+    entry: &mut NetIfaceEntry,
+    media_available: Option<bool>,
+    phy_type: Option<u8>,
+) {
+    // Carrier-independent by design (see `set_link_media`): only
+    // `Some` overwrites, so a carrier-down sample carrying the
+    // module state still lands, and a media-blind sample never
+    // erases a previous observation. One exception: an empty cage
+    // has no PHY type, so `media_available = Some(false)` clears
+    // any stale type — a reader must never see a type for a
+    // module that is no longer seated.
+    if let Some(media_available) = media_available {
+        entry.media_available = Some(media_available);
+        if !media_available {
+            entry.phy_type = None;
+        }
+    }
+    if entry.media_available != Some(false) {
+        if let Some(phy_type) = phy_type {
+            entry.phy_type = Some(phy_type);
+        }
+    }
 }
 
 pub fn set_mtu(name: &str, mtu: u32) -> bool {

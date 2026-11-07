@@ -542,3 +542,46 @@ fn smoke_i40e_all_queues_deliver_and_rearm() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/i40e", smoke_i40e_all_queues_deliver_and_rearm);
+
+/// Link-sample media fixture (issue #791 / #867). The params array
+/// is the same spec-shaped `struct i40e_aqc_get_link_status` frame
+/// the decode smoke in `tests.rs` builds (command_flags:le16,
+/// phy_type:u8, link_speed:u8, link_info:u8, …): the sample must
+/// carry carrier + speed + media state together into `iface`
+/// metadata, and the down sample must still carry the cage state —
+/// a seated module with no link is not an empty cage.
+fn smoke_i40e_link_sample_media() -> TestResult {
+    let mut p = [0u8; 16];
+    p[2] = 0x07; // phy_type (raw AQ byte; name decode is #867)
+    p[3] = 1 << 3; // I40E_LINK_SPEED_10GB
+    p[4] = LINK_INFO_LINK_UP | LINK_INFO_MEDIA_AVAILABLE;
+    p[8..10].copy_from_slice(&9728u16.to_le_bytes());
+    let up = link_sample(LinkStatus::parse(&p));
+    if !up.carrier || up.speed_mbps != Some(10000) {
+        return TestResult::Fail("10G up sample lost carrier or speed");
+    }
+    if up.media_available != Some(true) || up.phy_type != Some(0x07) {
+        return TestResult::Fail("up sample dropped media_available or phy_type");
+    }
+    // Seated module, link down: carrier false, but the cage state
+    // and the PHY type still publish.
+    let mut seated_down = [0u8; 16];
+    seated_down[2] = 0x07;
+    seated_down[4] = LINK_INFO_MEDIA_AVAILABLE;
+    let down = link_sample(LinkStatus::parse(&seated_down));
+    if down.carrier || down.speed_mbps.is_some() {
+        return TestResult::Fail("down sample must clear carrier and speed");
+    }
+    if down.media_available != Some(true) || down.phy_type != Some(0x07) {
+        return TestResult::Fail("down sample dropped the seated-module state");
+    }
+    // Empty cage: PF healthy, link down, no media.
+    let mut empty = [0u8; 16];
+    empty[4] = 0;
+    let cage = link_sample(LinkStatus::parse(&empty));
+    if cage.carrier || cage.media_available != Some(false) {
+        return TestResult::Fail("empty cage must read down with no media");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_link_sample_media);

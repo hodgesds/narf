@@ -173,6 +173,10 @@ pub fn merge_phy_sample(base: LinkSample, phy: PhyLink) -> LinkSample {
         carrier: true,
         speed_mbps: phy.speed_mbps.or(base.speed_mbps),
         duplex: phy.duplex.or(base.duplex),
+        // Media state comes from the in-band side, never the PHY
+        // read — preserve the base sample's media fields.
+        media_available: base.media_available,
+        phy_type: base.phy_type,
     }
 }
 
