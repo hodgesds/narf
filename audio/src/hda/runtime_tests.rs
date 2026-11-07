@@ -175,12 +175,11 @@ impl Model {
                     let nid = (command >> 20) as u8;
                     let verb = (command >> 8) & 0xfff;
                     let param = command as u8;
-                    match (nid, verb, param) {
-                        // ALC282 codec id; the subsystem read stays
-                        // 0 (unknown) — `alc282_init` is keyed on
-                        // the chip, not on a subsystem id.
-                        (0, 0xf00, 0) => reply = 0x10ec0282,
-                        _ => {}
+                    // ALC282 codec id; the subsystem read stays
+                    // 0 (unknown) — `alc282_init` is keyed on
+                    // the chip, not on a subsystem id.
+                    if (nid, verb, param) == (0, 0xf00, 0) {
+                        reply = 0x10ec0282;
                     }
                 }
                 if self.codec_id != 0 && !self.ati && !self.navi22 {
@@ -2596,10 +2595,14 @@ fn native_hda_yoga9_bass_speaker_quirk_applied() -> TestResult {
     // index pin 0x17 sends is the index into the OVERRIDDEN
     // list ([0x02, 0x03] → 0), not the hardware list
     // ([0x06, 0x08, 0x02, 0x03] → 2).
+    // SAFETY: The fixture exclusively owns this controller and no
+    // output stream has been started in this test, so the
+    // `setup_default_output_path` precondition holds (caller owns
+    // this controller and has stopped its output stream).
     if unsafe { dev.setup_default_output_path() }.is_err() {
         return TestResult::Fail("configure default output path");
     }
-    let select = make_verb(0, 0x17, (0x701 << 8) | 0);
+    let select = make_verb(0, 0x17, 0x701 << 8);
     if !fixture.model.verbs.contains(&select) {
         return TestResult::Fail("bass pin must select index 0 of its overridden list");
     }
