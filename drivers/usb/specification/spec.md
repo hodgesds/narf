@@ -675,8 +675,20 @@ also consult upstream Linux GPL sources.
   camera and asserts the transfer conversation through the real V4L2
   dispatch. The pump receives through a single receive call site that
   dispatches on the active endpoint's transport (`isoch_in` /
-  `bulk_in`), behind which the depth-4 isochronous pipelining work (#808)
-  slots in without changing the composition.
+  `bulk_in`); isochronous streams whose transport advertises
+  `isoch_pipeline_depth() > 1` run the pipelined receive (#808,
+  `pump_video_frames_pipelined`), which adopts the video crate's
+  depth-4 `IsocScheduler` over the owned-buffer receive
+  (`isoch_in_owned`, one buffer per in-flight transfer, packets fed
+  in submission order) and is proven by the high-bandwidth fixture
+  (`smoke_uvc_isoc_pipeline_high_bandwidth`: six four-packet frames,
+  `ISOC_DEPTH` transfers observed in flight at once, frames
+  dequeued byte-exact and in order). Bulk streams and depth-1
+  transports stay on the single-shot receive. The live `Xhci`
+  transport advertises depth 1 — its isochronous transfers share
+  one 4096-byte DMA page per endpoint and completions carry slot +
+  endpoint identity only — so multi-TRB pipelining on hardware
+  awaits #885 (per-transfer buffers and TRB identity).
 - UVC payload headers (1.5 §2.4.3.3) are decoded by
   `uvc::UvcPayloadHeader::parse` (mirrored by `narf-drivers-video`'s
   `PayloadHeader::decode`) for every format class: frame-based
