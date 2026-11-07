@@ -724,6 +724,9 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     // Base the map ends up at; 0 until it is built. Published to the
     // accessors after the CR3 swap.
     let mut dmap_base: u64 = 0;
+    // Physical extent the map ends up covering; 0 until it is built.
+    // Published alongside the base (see `direct_map_activate_at`).
+    let mut dmap_phys_end: u64 = 0;
     if build_direct_map {
         let want_chunks = max_ram_phys.div_ceil(CHUNK_BYTES).max(1);
         let dmap_chunks = want_chunks.min(crate::addr::KERNEL_DIRECT_MAP_PML4_SLOTS as u64);
@@ -732,6 +735,12 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         // canonical VA needs bits 63..48 set too. Without this the base is
         // non-canonical and the first access #GPs rather than faulting.
         dmap_base = 0xFFFF_0000_0000_0000 | ((dmap_pml4_base as u64) << 39);
+        // Every chunk's PDPT is filled with all 512 x 1-GiB entries, so the
+        // map covers [0, dmap_chunks * 512 GiB) — including the whole of
+        // chunk 0 regardless of how much RAM is installed. That extent is
+        // the bound the ACPI table-window check must use (see
+        // `direct_map_phys_end`); it is NOT the top of boot-donated RAM.
+        dmap_phys_end = dmap_chunks * CHUNK_BYTES;
         for chunk in 0..dmap_chunks {
             // PDPT frames come from the buddy: the early phys ceiling is
             // still armed (the caller releases it only after we return),
@@ -789,7 +798,7 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     // was built (RAM <= 512 GiB) the flag stays false and every frame is
     // reached at `phys == virt` through the low identity map.
     if build_direct_map {
-        crate::addr::direct_map_activate_at(dmap_base);
+        crate::addr::direct_map_activate_at(dmap_base, dmap_phys_end);
         // `narf-arch` cannot call `kernel_ptr` (narf-memory depends on it, so
         // the reverse would be a cycle), and its ACPI table parser can no
         // longer rely on a low identity map — that is gone as of this

@@ -1170,6 +1170,45 @@ pub fn phys_alloc_ceiling() -> u64 {
     managed_phys_end()
 }
 
+/// End of the physical window the kernel can actually reach through
+/// [`PhysAddr::kernel_ptr`], for the CURRENT stage of boot — the bound the
+/// SEC-F2 ACPI table-window check (`acpi::check_table_window`) validates
+/// firmware table pointers against.
+///
+/// This is deliberately NOT [`phys_alloc_ceiling`]. That is the top of
+/// boot-donated *Usable* RAM, which the frame allocator may hand out — but
+/// firmware tables live in ACPI-reclaimable RAM above it, and the high-half
+/// direct map covers them anyway: on x86_64 `init_mmu` fills every chunk's
+/// PDPT with all 512 x 1-GiB entries, so the map spans `[0, dmap_chunks *
+/// 512 GiB)` regardless of installed RAM. Bounding the check by the
+/// allocator ceiling therefore rejects every table deterministically (all
+/// of SRAT/MADT/MCFG/FADT/... skipped with `OutOfMappedWindow`, 0 PCIe
+/// devices bound — main b59be050, CI run 42309866130); the direct-map
+/// extent is the correct bound.
+///
+/// Stages, x86_64: direct-map extent once `init_mmu` publishes it, else
+/// [`EARLY_PHYS_CEILING`] (4 GiB — the pre-`init_mmu` identity map covers
+/// `[0, 4 GiB)`). Other arches: [`phys_alloc_ceiling`] unchanged — there is
+/// no ACPI production consumer there (aarch64 uses DT for PCIe) and the
+/// TTBR1 window covers installed RAM.
+///
+/// Fail-closed: 0 (nothing published yet — direct map not live and the
+/// early ceiling already released) rejects every table.
+pub fn mapped_window_end() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let end = crate::addr::direct_map_phys_end();
+        if end != 0 {
+            return end;
+        }
+        EARLY_PHYS_CEILING.load(core::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        phys_alloc_ceiling()
+    }
+}
+
 /// Allow the allocator to return frames at any physical address.
 /// Call once a kernel direct map covers all installed RAM.
 pub fn release_early_ceiling() {
