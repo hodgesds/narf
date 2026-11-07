@@ -485,6 +485,26 @@ pub fn e610_defaults(is_2_5g_t: bool) -> (EeeSpeeds, EeeSpeeds) {
     (speeds, speeds)
 }
 
+/// The identification-default EEE state for a capable device —
+/// what a first `set_eee` validates against when no state was
+/// ever configured (and what the live status flows start from).
+/// `None` for non-capable device ids. The FW-PHY default comes
+/// from `x550em_a_defaults` (the firmware PHY-ID check that
+/// `status_fw_phy` performs is a live step, not part of this
+/// model default); the E610 default is did-selected, exactly as
+/// `status_e610` builds it.
+pub fn default_state(did: u16) -> Option<EeeState> {
+    if !eee_capable(did) {
+        return None;
+    }
+    let (supported, advertised) = if is_e610(did) {
+        e610_defaults(did == DEV_E610_2_5G_T)
+    } else {
+        x550em_a_defaults()
+    };
+    Some(EeeState::new(supported, advertised))
+}
+
 /// ACI EEE-capability word for an advertised set, exactly
 /// Linux `ixgbe_setup_eee_e610`'s mapping: 2.5G → BIT(12),
 /// 5G → BIT(11), 10G → BIT(2). 100M/1G advertised speeds set
@@ -650,6 +670,19 @@ pub enum EeeError {
     /// Enabled flag already equals stored (`-EALREADY`,
     /// converted to success by the caller).
     AlreadyEnabled,
+}
+
+impl EeeError {
+    /// Static message for the `IxgbeError::Other` mapping.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EeeError::NotCapable => "eee not capable",
+            EeeError::TxLpiMismatch => "eee tx-lpi mismatch",
+            EeeError::TxLpiTimerMismatch => "eee tx-lpi timer mismatch",
+            EeeError::AdvertisedMismatch => "eee advertised set mismatch",
+            EeeError::AlreadyEnabled => "eee already in requested state",
+        }
+    }
 }
 
 /// Mirror Linux `ixgbe_validate_keee`, in its check order:

@@ -58,6 +58,11 @@ use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 /// and applies the dispatcher's programs.
 pub mod vmdq;
 
+/// EEE (802.3az) advertisement + ethtool get/set for the copper
+/// parts (issue #794): Clause 45 MMD advertisement, IPCNFG/EEER
+/// programming, and the `EeeStatus` snapshot (see `eee.rs`).
+pub mod eee;
+
 // ── PCI device IDs ──────────────────────────────────────────────────
 //
 // Mirrors a subset of Linux's `igb_pci_tbl[]` in
@@ -840,7 +845,9 @@ pub const fn wus_clear_word() -> u32 {
 // (set_wol, set_rxfh, set_coalesce, set_ringparam) are deliberately
 // absent: changing rings or the RETA table on a live device needs
 // the stop/reconfigure sequence the PM commit adds, and advertising
-// setters before it would be a lie.
+// setters before it would be a lie. EEE set is the exception (see
+// `Igb::set_eee`): it programs PHY advertisement + MAC LPI live
+// with no datapath stop, the way Linux's `igb_set_eee` does.
 
 /// Driver version reported by the ethtool surface (matches the
 /// module version in `lib.rs`).
@@ -918,6 +925,12 @@ pub struct EthtoolInfo {
     pub wol: WolFilters,
     pub rss_indir_size: usize,
     pub rss_key_size: usize,
+    /// EEE status from a live PHY/MAC read (issue #794): `None`
+    /// while the part is not EEE-capable (fiber/SerDes/SGMII) or
+    /// the PHY does not answer MDIC — unknown, not disabled.
+    /// A live read costs up to 16 MDIC transactions; the snapshot
+    /// is a control-plane query, not a datapath read.
+    pub eee: Option<narf_net::nic::EeeStatus>,
     pub stats: EthtoolStats,
 }
 
@@ -1022,7 +1035,12 @@ const CTRL_FRCDPLX: u32 = 1 << 12; // Force duplex.
 // MDIC (PHY access). opcode: 01=write, 10=read. PHY addr 1 (internal).
 const MDIC_PHY_ADDR: u32 = 1 << 21; // phyaddr = 1 at bits[25:21]
 const MDIC_OP_WRITE: u32 = 0b01 << 26;
+const MDIC_OP_READ: u32 = 0b10 << 26;
 const MDIC_READY: u32 = 1 << 28;
+/// MDIC transaction-error bit (bit 30, read path only) — the
+/// e1000 crate's `MDIC_ERROR` / Linux `E1000_MDIC_ERROR`. Used
+/// by the EEE MDIO path (`igb/eee.rs`).
+const MDIC_ERROR: u32 = 1 << 30;
 // PHY BMCR (reg 0): autoneg enable + restart kicks QEMU igb's PHY to
 // complete negotiation and raise BMSR link status → STATUS.LU.
 const PHY_BMCR: u32 = 0;
@@ -1931,8 +1949,39 @@ impl Igb {
             wol: *self.wol_filters.lock(),
             rss_indir_size: RETA_SIZE,
             rss_key_size: RSS_KEY_SIZE,
+            eee: self.eee_status().ok(),
             stats: self.stats.snapshot(),
         }
+    }
+
+    /// EEE status from live PHY/MAC registers (issue #794; see
+    /// `igb/eee.rs`). `Err` on fiber/SerDes/SGMII parts (no copper
+    /// PHY to negotiate EEE on) and on MDIC timeout/completion
+    /// errors. This is a live read, not a stored shadow — it
+    /// reflects what the hardware advertises right now.
+    pub fn eee_status(&self) -> Result<narf_net::nic::EeeStatus, IgbError> {
+        if !eee::eee_capable_device(self.device_id) {
+            return Err(IgbError::Other("eee requires copper media"));
+        }
+        eee::eee_status(&eee::MmioEeeRegs(&self.mmio))
+    }
+
+    /// Enable or disable EEE advertisement (issue #794; see
+    /// `igb/eee.rs`): programs the MMD advertisement, the IPCNFG
+    /// advertise bits and the EEER LPI bits, then restarts PHY
+    /// autoneg so the new advertisement goes on the wire. This is
+    /// the exception to the "no set-side ethtool ops" rule in the
+    /// surface comment above: unlike ring/RETA changes it needs no
+    /// stop/reconfigure sequence — Linux's `igb_set_eee` applies
+    /// it live the same way. `Err` on non-copper parts and on
+    /// MDIC errors. See `eee.rs` for the forced-link caveat: the
+    /// advertisement is programmed and reported, while `active`
+    /// stays false until a partner negotiates EEE.
+    pub fn set_eee(&self, enable: bool) -> Result<(), IgbError> {
+        if !eee::eee_capable_device(self.device_id) {
+            return Err(IgbError::Other("eee requires copper media"));
+        }
+        eee::set_eee(&eee::MmioEeeRegs(&self.mmio), enable)
     }
 
     /// Opt a VID into the hardware VLAN filter: update the shadow and

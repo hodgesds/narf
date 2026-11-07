@@ -690,6 +690,18 @@ transport):
   does (2.5G → BIT(12), 5G → BIT(11), 10G → BIT(2));
   100M/1G map to nothing. E610 defaults: 2.5G_T →
   {2.5G}, other E610 → {2.5G, 5G, 10G}.
+- ethtool set entry point (issue #794): `Ixgbe::set_eee`
+  validates the request against the stored state — or the
+  identification defaults (`eee::default_state`: X550EM_A
+  → 100M|1G, E610 → the defaults above) when nothing was
+  ever configured — then applies it through
+  `configure_eee`. Only the enabled flag may move; a
+  no-op request succeeds without touching the firmware
+  (Linux converts `-EALREADY` to success). ethtool get:
+  `EthtoolInfo.eee` is the stored `EeeStatus` (None
+  before any configuration / on non-capable parts), and
+  the one-line `summary()` carries an `eee=` token
+  (`on,active` / `on,idle` / `off` / `n/a`).
 
 ### Datasheet grounding — MET for the X550 MAC block
 

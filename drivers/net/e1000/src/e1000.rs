@@ -488,6 +488,55 @@ pub const IPCNFG_EEE_AN_MASK: u32 = IPCNFG_EEE_1G_AN | IPCNFG_EEE_100M_AN;
 /// low-power-idle while the link is still negotiating.
 pub const EEER_LPI_MASK: u32 = EEER_TX_LPI_EN | EEER_RX_LPI_EN | EEER_LPI_FC;
 
+/// EEE (IEEE 802.3az) Clause 45 MMD device + registers, and the
+/// `narf_net::nic::EeeStatus` advertisement encoding shared with
+/// igc (`drivers/net/igc/src/hardware.rs` `modes()`).
+///
+/// * MMD device 7 is the PCS; registers 60/61 are the EEE
+///   advertisement / link-partner advertisement, 62/63 the
+///   advertisement-2 pair that carries 2.5GBASE-T (IEEE 802.3
+///   Table 45-89/45-90 region; in-tree precedent: igc reads
+///   exactly 7/60, 7/61, 7/62, 7/63 for its EEE status).
+/// * Clause 45 access rides Clause 22 MDIO through registers 13
+///   (MMDAC, MMD access control) and 14 (MMDAAD, address/data);
+///   the data phase sets MMDAC bit 14 (`0x4000`, "data, no address
+///   post-increment") — the same sequence as igc's `mmd()`.
+/// * Advertisement bits in `EeeStatus` are 8 = 100BASE-TX, 16 =
+///   1000BASE-T, 32 = 2.5GBASE-T (igc's `modes()` closure).
+/// * MMD 7/60 bit 1 = 100BASE-TX EEE, bit 2 = 1000BASE-T EEE;
+///   MMD 7/62 bit 0 = 2.5GBASE-T EEE (the same decode as igc).
+/// * PCH parts (I217/I218/I219) advertise 100M + 1G only: IPCNFG
+///   carries exactly the `EEE_1G_AN` / `EEE_100M_AN` bits above —
+///   there is no 2.5G advertisement bit on these parts, so a 2.5G
+///   request bit is masked out of the IPCNFG word (never
+///   programmed), while the MMD decode still reports it if a
+///   partner advertises it.
+pub const EEE_MMD_DEV: u16 = 7;
+/// MMD EEE advertisement register (Clause 45, device 7).
+pub const EEE_MMD_ADV: u16 = 60;
+/// MMD link-partner EEE advertisement register (Clause 45, device 7).
+pub const EEE_MMD_LP_ADV: u16 = 61;
+/// MMD EEE advertisement-2 register (Clause 45, device 7; 2.5G).
+pub const EEE_MMD_ADV2: u16 = 62;
+/// MMD link-partner EEE advertisement-2 register (Clause 45, device 7).
+pub const EEE_MMD_LP_ADV2: u16 = 63;
+/// Clause 22 MMD access-control register (MMDAC).
+pub const PHY_MMDAC: u32 = 13;
+/// Clause 22 MMD access address/data register (MMDAAD).
+pub const PHY_MMDAAD: u32 = 14;
+/// MMDAC function field for the data phase (bit 14: data access,
+/// no address post-increment) — igc's `mmd()` writes
+/// `dev | 0x4000` here.
+pub const MMDAC_FUN_DATA: u16 = 0x4000;
+/// `EeeStatus` advertised/partner bit: 100BASE-TX EEE.
+pub const EEE_ADV_100M: u32 = 1 << 3;
+/// `EeeStatus` advertised/partner bit: 1000BASE-T EEE.
+pub const EEE_ADV_1G: u32 = 1 << 4;
+/// `EeeStatus` advertised/partner bit: 2.5GBASE-T EEE.
+pub const EEE_ADV_2_5G: u32 = 1 << 5;
+/// Speeds a PCH part can advertise EEE on (100M + 1G only).
+pub const EEE_PCH_SUPPORTED: u32 = EEE_ADV_100M | EEE_ADV_1G;
+
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6; // Set Link Up
@@ -1477,6 +1526,62 @@ fn mdic_data(word: u32) -> u16 {
     (word & MDIC_DATA_MASK) as u16
 }
 
+/// Decode an EEE advertisement pair (MMD 7/60 + 7/62) into the
+/// `narf_net::nic::EeeStatus` bit encoding: MMD 7/60 bit 1 →
+/// 100BASE-TX (8), bit 2 → 1000BASE-T (16); MMD 7/62 bit 0 →
+/// 2.5GBASE-T (32). Same decode as igc's `modes()` closure.
+fn eee_modes_from_mmd(local: u16, local2: u16) -> u32 {
+    (if local & 0x2 != 0 { EEE_ADV_100M } else { 0 })
+        | (if local & 0x4 != 0 { EEE_ADV_1G } else { 0 })
+        | (if local2 & 0x1 != 0 { EEE_ADV_2_5G } else { 0 })
+}
+
+/// Next IPCNFG word for an advertised set: rewrite only the PCH
+/// EEE-advertise bits (1G bit 14, 100M bit 12 — `IPCNFG_EEE_AN_MASK`)
+/// and preserve every other field. A 2.5G request bit has no IPCNFG
+/// bit on PCH parts and is dropped, never programmed.
+fn eee_ipcnfg_next(current: u32, advertised: u32) -> u32 {
+    (current & !IPCNFG_EEE_AN_MASK)
+        | (if advertised & EEE_ADV_100M != 0 {
+            IPCNFG_EEE_100M_AN
+        } else {
+            0
+        })
+        | (if advertised & EEE_ADV_1G != 0 {
+            IPCNFG_EEE_1G_AN
+        } else {
+            0
+        })
+}
+
+/// Next EEER word for an enable/disable: rewrite only the LPI mask
+/// (TX LPI EN bit 16, RX LPI EN bit 17, LPI frame counter bit 18)
+/// and preserve every other field. Mirrors the enable side of
+/// `disable_eee_pchlan` (which clears exactly this mask).
+fn eee_eeer_next(current: u32, enable: bool) -> u32 {
+    (current & !EEER_LPI_MASK) | (if enable { EEER_LPI_MASK } else { 0 })
+}
+
+/// EEE status from scripted register state: `advertised` is the
+/// programmed set (IPCNFG decode), `partner` the link-partner set
+/// (MMD 7/61+63 decode). Active is the negotiated intersection —
+/// the same derivation ixgbe's FW-PHY path uses (`advertised ∩
+/// link-partner non-empty`) — gated on live link-up; `tx_lpi`
+/// is EEER TX-LPI-EN as read.
+fn eee_status_from(
+    advertised: u32,
+    partner: u32,
+    link_up: bool,
+    tx_lpi: bool,
+) -> narf_net::nic::EeeStatus {
+    narf_net::nic::EeeStatus {
+        advertised,
+        partner,
+        active: link_up && (advertised & partner) != 0,
+        tx_lpi,
+    }
+}
+
 /// Compose a 32-bit PHY identifier from the PHYSID1/PHYSID2 reads
 /// (Linux `e1000_get_phy_id` shape: ID1 in the high half).
 fn phy_id_from(id1: u16, id2: u16) -> u32 {
@@ -1753,6 +1858,29 @@ fn mdic_write(mmio: &MmioRegion, reg: u32, data: u16) -> Result<(), E1000Error> 
         return Err(E1000Error::PhyMdioTimeout);
     }
     Ok(())
+}
+
+/// Read a Clause 45 MMD register through the Clause 22 MDIO
+/// window: MMDAC = device, MMDAAD = register, MMDAC =
+/// device | `MMDAC_FUN_DATA` (data phase), then read MMDAAD;
+/// MMDAC is restored to 0 afterwards. Exactly igc's `mmd()`
+/// sequence; a cleanup failure is an error too, matching igc
+/// (a failed restore must not be silently swallowed — the next
+/// MDIO access would address the wrong device).
+/// Callers own SWFLAG scoping (see `E1000::phy_read`).
+///
+/// Only the read side exists here: the PCH set path programs
+/// IPCNFG/EEER only (exactly Linux's `e1000_set_eee_pchlan`),
+/// so no MMD write helper is provided — an unused one would be
+/// dead code, and inventing a use for it would diverge from Linux.
+fn mmd_read(mmio: &MmioRegion, dev: u16, reg: u16) -> Result<u16, E1000Error> {
+    mdic_write(mmio, PHY_MMDAC, dev)?;
+    mdic_write(mmio, PHY_MMDAAD, reg)?;
+    mdic_write(mmio, PHY_MMDAC, dev | MMDAC_FUN_DATA)?;
+    let result = mdic_read(mmio, PHY_MMDAAD);
+    let cleanup = mdic_write(mmio, PHY_MMDAC, 0);
+    cleanup?;
+    result
 }
 
 /// Program auto-negotiation advertisement and restart negotiation
@@ -4106,6 +4234,110 @@ impl E1000 {
         r
     }
 
+    /// EEE status from live registers (Linux `e1000e_get_eee`
+    /// shape for PCH parts): advertised from IPCNFG (the PCH
+    /// advertisement store — `e1000_set_eee_pchlan` programs
+    /// exactly these bits), link-partner advertisement from the
+    /// PHY's Clause 45 MMD 7/61+63, TX-LPI from EEER bit 16,
+    /// link-up from live STATUS.LU (not the probe-time `link_up`
+    /// field — the LSC drain owns that sample). Active is the
+    /// negotiated intersection, derived by [`eee_status_from`].
+    /// Post-bring-up only (same SWFLAG constraint as
+    /// [`E1000::phy_read`]); the handshake is held once across
+    /// the whole read sequence, not per MDIC access.
+    pub fn eee_status(&self) -> Result<narf_net::nic::EeeStatus, E1000Error> {
+        let owned = if self.pch_part {
+            acquire_phy_swflag(&self.mmio)?
+        } else {
+            false
+        };
+        let r = self.eee_status_locked();
+        if self.pch_part {
+            release_phy_swflag(&self.mmio, owned);
+        }
+        r
+    }
+
+    fn eee_status_locked(&self) -> Result<narf_net::nic::EeeStatus, E1000Error> {
+        // SAFETY: identity-mapped MMIO; IPCNFG/EEER/STATUS are
+        // inside the e1000 BAR0 register window on every PCH part.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let ipcnfg = unsafe { self.mmio.read32(REG_IPCNFG) };
+        // SAFETY: EEER (0x0E30) is a 32-bit EEE control/status register
+        // inside the mapped BAR0 window on every PCH part.
+        let eeer = unsafe { self.mmio.read32(REG_EEER) };
+        // SAFETY: STATUS (0x0008) is a 32-bit read-only status register
+        // inside the mapped BAR0 window on every PCH part.
+        let status = unsafe { self.mmio.read32(REG_STATUS) };
+        let partner = mmd_read(&self.mmio, EEE_MMD_DEV, EEE_MMD_LP_ADV)?;
+        let partner2 = mmd_read(&self.mmio, EEE_MMD_DEV, EEE_MMD_LP_ADV2)?;
+        let advertised = (if ipcnfg & IPCNFG_EEE_100M_AN != 0 {
+            EEE_ADV_100M
+        } else {
+            0
+        }) | (if ipcnfg & IPCNFG_EEE_1G_AN != 0 {
+            EEE_ADV_1G
+        } else {
+            0
+        });
+        Ok(eee_status_from(
+            advertised,
+            eee_modes_from_mmd(partner, partner2),
+            status & STATUS_LU != 0,
+            eeer & EEER_TX_LPI_EN != 0,
+        ))
+    }
+
+    /// Enable or disable EEE advertisement (Linux
+    /// `e1000_set_eee_pchlan` + an autoneg restart): enabled
+    /// programs IPCNFG 1G+100M advertise bits and the EEER LPI
+    /// bits; disabled clears exactly those bits (the inverse of
+    /// [`disable_eee_pchlan`], which bring-up runs before
+    /// CTRL.SLU). The autoneg restart puts the new advertisement
+    /// on the wire — without it the advertisement would only
+    /// take effect at the next renegotiation (igc's `setup_link`
+    /// restarts AN after writing its EEE advertisement for the
+    /// same reason). Already-in-state is a no-op (no link flap).
+    /// Post-bring-up only (same SWFLAG constraint as
+    /// [`E1000::phy_read`]).
+    pub fn set_eee(&self, enable: bool) -> Result<(), E1000Error> {
+        let owned = if self.pch_part {
+            acquire_phy_swflag(&self.mmio)?
+        } else {
+            false
+        };
+        let r = self.set_eee_locked(enable);
+        if self.pch_part {
+            release_phy_swflag(&self.mmio, owned);
+        }
+        r
+    }
+
+    fn set_eee_locked(&self, enable: bool) -> Result<(), E1000Error> {
+        let advertised = if enable { EEE_PCH_SUPPORTED } else { 0 };
+        // SAFETY: identity-mapped MMIO; IPCNFG/EEER are inside the
+        // e1000 BAR0 register window on every PCH part.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let ipcnfg = unsafe { self.mmio.read32(REG_IPCNFG) };
+        // SAFETY: EEER (0x0E30) is a 32-bit EEE control/status register
+        // inside the mapped BAR0 window on every PCH part.
+        let eeer = unsafe { self.mmio.read32(REG_EEER) };
+        let ipcnfg_next = eee_ipcnfg_next(ipcnfg, advertised);
+        let eeer_next = eee_eeer_next(eeer, enable);
+        if ipcnfg_next == ipcnfg && eeer_next == eeer {
+            return Ok(());
+        }
+        // SAFETY: identity-mapped MMIO (same registers as above).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe {
+            self.mmio.write32(REG_IPCNFG, ipcnfg_next);
+            self.mmio.write32(REG_EEER, eeer_next);
+        }
+        let bmcr = mdic_read(&self.mmio, PHY_BMCR)?;
+        mdic_write(&self.mmio, PHY_BMCR, aneg_bmcr_restart(bmcr))?;
+        Ok(())
+    }
+
     /// Read the PHY identifier (PHYSID1/PHYSID2 composed per
     /// `phy_id_from`). Fails closed with `PhyNotPresent` when the
     /// read returns the no-device signature rather than inventing
@@ -4708,6 +4940,91 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_bmsr_link_decode);
+
+    fn smoke_eee_mmd_mode_decode() -> TestResult {
+        // MMD 7/60 = 0b110 (100M + 1G), 7/62 = 0b1 (2.5G): the full
+        // narf_net encoding 0x38. Each bit decodes independently.
+        if super::eee_modes_from_mmd(0x6, 0x1) != 0x38 {
+            return TestResult::Fail("e1000 EEE MMD mode decode wrong for 100M+1G+2.5G");
+        }
+        if super::eee_modes_from_mmd(0x2, 0x0) != super::EEE_ADV_100M
+            || super::eee_modes_from_mmd(0x4, 0x0) != super::EEE_ADV_1G
+            || super::eee_modes_from_mmd(0x0, 0x1) != super::EEE_ADV_2_5G
+            || super::eee_modes_from_mmd(0x0, 0x0) != 0
+        {
+            return TestResult::Fail("e1000 EEE MMD mode decode wrong for a single speed");
+        }
+        // Bits outside the EEE fields (e.g. capability bits in the
+        // same words) must not leak into the advertisement.
+        if super::eee_modes_from_mmd(0xFFF9, 0xFFFE) != 0 {
+            return TestResult::Fail("e1000 EEE MMD mode decode leaked non-EEE bits");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_eee_mmd_mode_decode);
+
+    fn smoke_eee_ipcnfg_eeer_words() -> TestResult {
+        // PCH advertisement is IPCNFG bits 12 (100M) + 14 (1G):
+        // the supported set programs 0x5000, nothing else.
+        if super::eee_ipcnfg_next(0, super::EEE_PCH_SUPPORTED) != 0x5000 {
+            return TestResult::Fail("e1000 EEE IPCNFG word wrong for the PCH set");
+        }
+        if super::eee_ipcnfg_next(0, 0) != 0 {
+            return TestResult::Fail("e1000 EEE IPCNFG word not cleared for disable");
+        }
+        // A 2.5G-only request has no IPCNFG bit on PCH parts: it
+        // clears the PCH advertise bits and sets nothing, while
+        // unrelated IPCNFG fields are preserved.
+        if super::eee_ipcnfg_next(0xFFFF_FFFF, super::EEE_ADV_2_5G) != 0xFFFF_AFFF {
+            return TestResult::Fail("e1000 EEE IPCNFG word programmed 2.5G on a PCH part");
+        }
+        if super::eee_ipcnfg_next(0x0000_0001, super::EEE_ADV_100M) != 0x0000_1001 {
+            return TestResult::Fail("e1000 EEE IPCNFG word did not preserve other bits");
+        }
+        // EEER: enable sets exactly the LPI mask (0x70000), disable
+        // clears exactly it, other bits preserved.
+        if super::eee_eeer_next(0, true) != 0x70000 || super::eee_eeer_next(0x70000, false) != 0 {
+            return TestResult::Fail("e1000 EEE EEER word wrong for enable/disable");
+        }
+        if super::eee_eeer_next(0x8000_0001, true) != 0x8007_0001
+            || super::eee_eeer_next(0x8007_0001, false) != 0x8000_0001
+        {
+            return TestResult::Fail("e1000 EEE EEER word did not preserve other bits");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_eee_ipcnfg_eeer_words);
+
+    fn smoke_eee_status_derivation() -> TestResult {
+        // Scripted register state: IPCNFG advertises 100M+1G,
+        // partner advertises the same, link up, TX LPI on.
+        let up = super::eee_status_from(
+            super::EEE_PCH_SUPPORTED,
+            super::eee_modes_from_mmd(0x6, 0x0),
+            true,
+            true,
+        );
+        if !up.active || up.advertised != 0x18 || up.partner != 0x18 || !up.tx_lpi {
+            return TestResult::Fail("e1000 EEE status wrong for negotiated link");
+        }
+        // No link → not active even with matching advertisements.
+        let down = super::eee_status_from(super::EEE_PCH_SUPPORTED, 0x18, false, true);
+        if down.active {
+            return TestResult::Fail("e1000 EEE status active without link");
+        }
+        // Disjoint advertisements → not active (partner is 100M-only).
+        let disjoint = super::eee_status_from(0x10, 0x08, true, false);
+        if disjoint.active || disjoint.tx_lpi {
+            return TestResult::Fail("e1000 EEE status active for disjoint advertisements");
+        }
+        // Disabled locally (advertised 0) → not active, tx_lpi as read.
+        let off = super::eee_status_from(0, 0x18, true, false);
+        if off.active {
+            return TestResult::Fail("e1000 EEE status active while disabled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/e1000", smoke_eee_status_derivation);
 
     fn smoke_rx_csum_result_matrix() -> TestResult {
         // Pin the descriptor bit values against the Linux literals
