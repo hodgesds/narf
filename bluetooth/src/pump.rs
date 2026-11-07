@@ -159,7 +159,8 @@ use crate::event::{
     CommandStatus, DisconnectionComplete, EventCode, LeAdvertisingSetTerminated,
     LeChannelSelectionAlgorithm, LeConnectionComplete, LeEnhancedConnectionComplete,
     LeLongTermKeyRequest, LePeriodicAdvReport, LePeriodicAdvSyncEstablished, LePeriodicAdvSyncLost,
-    LePeriodicAdvSyncTransferReceived, LeScanRequestReceived, LeScanTimeout, NumberOfCompletedPackets, RemoteNameRequestComplete,
+    LePeriodicAdvSyncTransferReceived, LeScanRequestReceived, LeScanTimeout,
+    NumberOfCompletedPackets, RemoteNameRequestComplete,
 };
 use crate::gap::{
     self, AdvertisingSetPhase, CentralPhase, ExtendedScannerPhase, PeriodicAdvertiserPhase,
