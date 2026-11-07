@@ -36,6 +36,11 @@ const MAX_DLCS: usize = 61;
 struct SessionDlc {
     dlci: u8,
     open: bool,
+    /// True when WE initiated this DLC (SABM sent by us): our UIH
+    /// and DISC frames then carry C/R=1 (TS 07.10 §5.1.1 — the
+    /// initiator sets C/R=1, the responder 0). Responder-side DLCs
+    /// (peer SABM) keep C/R=0.
+    initiator: bool,
     rx: Vec<Vec<u8>>,
 }
 
@@ -79,6 +84,46 @@ impl RfcommSession {
             .filter(|d| d.open)
             .map(|d| d.dlci)
             .collect()
+    }
+
+    /// Whether `dlci` was opened by us (initiator) — our UIH/DISC
+    /// frames on it carry C/R=1. False for responder-side DLCs and
+    /// unknown DLCIs.
+    pub fn is_dlc_initiator(&self, dlci: u8) -> bool {
+        self.dlcs
+            .iter()
+            .any(|d| d.dlci == dlci && d.open && d.initiator)
+    }
+
+    /// Initiator side (#1532): record that the peer answered our
+    /// SABM on DLCI 0 with UA — the multiplexer is open. The
+    /// responder's `feed` ignores UA, so the initiator records it
+    /// explicitly instead.
+    pub fn mux_opened(&mut self) {
+        self.mux_open = true;
+    }
+
+    /// Initiator side (#1532): record that the peer answered our
+    /// SABM on `dlci` with UA — the DLC is open, initiated by us
+    /// (C/R=1 on our frames), with a cleared receive queue.
+    pub fn dlc_opened(&mut self, dlci: u8) {
+        match self.dlcs.iter_mut().find(|d| d.dlci == dlci) {
+            Some(dlc) => {
+                dlc.open = true;
+                dlc.initiator = true;
+                dlc.rx.clear();
+            }
+            None => {
+                if self.dlcs.len() < MAX_DLCS {
+                    self.dlcs.push(SessionDlc {
+                        dlci,
+                        open: true,
+                        initiator: true,
+                        rx: Vec::new(),
+                    });
+                }
+            }
+        }
     }
 
     /// Close `dlci` from our side (the socket layer sends the DISC
@@ -149,6 +194,7 @@ impl RfcommSession {
                 match idx {
                     Some(i) => {
                         self.dlcs[i].open = true;
+                        self.dlcs[i].initiator = false;
                         self.dlcs[i].rx.clear();
                     }
                     None => {
@@ -158,6 +204,7 @@ impl RfcommSession {
                         self.dlcs.push(SessionDlc {
                             dlci: frame.dlci,
                             open: true,
+                            initiator: false,
                             rx: Vec::new(),
                         });
                     }
@@ -283,4 +330,45 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/rfcomm-session", rfcomm_session_dlc_queries);
+
+    /// #1532: the initiator side — UA receipts open the mux/DLC
+    /// with C/R=1, and a responder-opened DLC stays C/R=0.
+    fn rfcomm_session_initiator_open() -> TestResult {
+        let mut session = RfcommSession::new();
+        if session.is_dlc_initiator(2) {
+            return TestResult::Fail("unknown DLC must not read initiator");
+        }
+        // Our SABM on DLCI 0 answered with UA: mux opens.
+        session.mux_opened();
+        if !session.is_mux_open() {
+            return TestResult::Fail("mux_opened should open the mux");
+        }
+        // Our SABM on DLCI 3 answered with UA: DLC opens, initiator.
+        session.dlc_opened(3);
+        if !session.is_dlc_open(3) || !session.is_dlc_initiator(3) {
+            return TestResult::Fail("dlc_opened should open an initiator DLC");
+        }
+        // Data stages on the initiator DLC.
+        let rsp = session.feed(&Frame::uih(3, false, alloc::vec![b'k']));
+        if !rsp.is_empty() || session.drain_rx(3) != alloc::vec![alloc::vec![b'k']] {
+            return TestResult::Fail("initiator DLC should stage UIH data");
+        }
+        // A peer SABM on DLCI 4 opens a responder DLC (C/R=0).
+        let rsp = session.feed(&Frame::sabm(4, true));
+        if rsp.len() != 1 || rsp[0].frame_type != FRAME_UA {
+            return TestResult::Fail("peer SABM should get UA");
+        }
+        if !session.is_dlc_open(4) || session.is_dlc_initiator(4) {
+            return TestResult::Fail("peer-opened DLC must read responder-side");
+        }
+        // Re-opening an initiator DLC via dlc_opened keeps it
+        // initiator and clears staged data.
+        let _ = session.feed(&Frame::uih(3, false, alloc::vec![b'z']));
+        session.dlc_opened(3);
+        if !session.is_dlc_initiator(3) || !session.drain_rx(3).is_empty() {
+            return TestResult::Fail("dlc_opened should clear rx and keep initiator");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/rfcomm-session", rfcomm_session_initiator_open);
 }
