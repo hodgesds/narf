@@ -73,12 +73,12 @@
 //! page-select to register `0xFF`, which unimplemented-register
 //! writes ignore or NAK.
 //!
-//! The ATTN-driven report pump is NOT part of this module yet:
-//! the SMBus controller is shared with hwmon (JC42) and the SBS
-//! battery driver, so a polling pump would contend with them,
-//! and the attention GPIO/IRQ has no wiring (Linux gets it from
-//! the PS/2 companion). The transport + probe land here; the
-//! pump is a follow-up once the attention source is routed.
+//! The ATTN-driven report pump lives in [`crate::smbus_rmi_attn`]:
+//! it routes the attention GPIO/IRQ from the touchpad's ACPI
+//! `GpioInt` (falling back to a coordinated status poll through
+//! the shared controller when no IRQ is routable) and services
+//! each attention by reading the F$01 interrupt status and
+//! pumping F$12/F$11 + F$30 through this transport.
 
 extern crate alloc;
 
@@ -215,6 +215,27 @@ pub struct SmbusRmiTransport<H: SmbusIo> {
     map_next: usize,
 }
 
+/// Device-side session state the ATTN pump carries between
+/// service passes.
+///
+/// The pump cannot hold a [`SmbusRmiTransport`] across awaits:
+/// the transport borrows the shared controller out of
+/// [`narf_drivers_platform::smbus::with_controller`], which
+/// holds the controller spinlock for the closure only. So each
+/// pass rebuilds a transport from this state
+/// ([`SmbusRmiTransport::from_state`]) and writes it back
+/// ([`SmbusRmiTransport::into_state`]) — the negotiated
+/// version, the v1 page cache, and the v2 mapping table survive
+/// across passes, so the device-side mapping table is not
+/// re-programmed on every touch frame.
+#[derive(Clone, Debug, Default)]
+pub struct SmbusRmiSessionState {
+    version: Option<SmbusRmiVersion>,
+    page: Option<u8>,
+    map: [MappingEntry; RMI_SMB2_MAP_SIZE],
+    map_next: usize,
+}
+
 impl<H: SmbusIo> SmbusRmiTransport<H> {
     pub fn new(io: H, addr: u8) -> Self {
         Self {
@@ -224,6 +245,31 @@ impl<H: SmbusIo> SmbusRmiTransport<H> {
             page: None,
             map: [MappingEntry::default(); RMI_SMB2_MAP_SIZE],
             map_next: 0,
+        }
+    }
+
+    /// Rebuild a transport from pump-carried session state —
+    /// same negotiated version / page / mapping table as the
+    /// transport the state came from, so no re-negotiation or
+    /// mapping-table re-programming happens on the next pass.
+    pub fn from_state(io: H, addr: u8, state: SmbusRmiSessionState) -> Self {
+        Self {
+            io,
+            addr,
+            version: state.version,
+            page: state.page,
+            map: state.map,
+            map_next: state.map_next,
+        }
+    }
+
+    /// Hand the session state back to the pump after a pass.
+    pub fn into_state(self) -> SmbusRmiSessionState {
+        SmbusRmiSessionState {
+            version: self.version,
+            page: self.page,
+            map: self.map,
+            map_next: self.map_next,
         }
     }
 
@@ -436,13 +482,27 @@ impl<H: SmbusIo> Rmi4Transport for SmbusRmiTransport<H> {
 /// unrecognised, or the device is not a Synaptics part — the
 /// caller declines the address in all those cases.
 pub fn probe_at<H: SmbusIo>(io: H, addr: u8) -> Option<(SmbusRmiVersion, Rmi4DeviceProbe)> {
+    probe_at_with_state(io, addr).map(|(version, probe, _)| (version, probe))
+}
+
+/// [`probe_at`] plus the post-probe session state, so the ATTN
+/// pump can rebuild the transport without re-negotiating the
+/// version or re-programming the v2 mapping table. The state
+/// captures the transport exactly as the probe left it (v1 page
+/// 0 selected; v2 mapping slots programmed by the PDT walk and
+/// query reads).
+pub fn probe_at_with_state<H: SmbusIo>(
+    io: H,
+    addr: u8,
+) -> Option<(SmbusRmiVersion, Rmi4DeviceProbe, SmbusRmiSessionState)> {
     let mut transport = SmbusRmiTransport::new(io, addr);
     let version = transport.probe_version().ok()?;
     let probe = probe_device(&mut transport).ok()?;
     if !probe.product.is_synaptics() {
         return None;
     }
-    Some((version, probe))
+    let state = transport.into_state();
+    Some((version, probe, state))
 }
 
 /// Probe the default Synaptics address (`0x2C`) on the platform
@@ -450,8 +510,17 @@ pub fn probe_at<H: SmbusIo>(io: H, addr: u8) -> Option<(SmbusRmiVersion, Rmi4Dev
 /// probe on success. Runs inside `with_controller`, so the
 /// transport never outlives the controller borrow.
 pub fn probe_smbus_rmi() -> Option<Rmi4DeviceProbe> {
+    probe_smbus_rmi_with_state().map(|(probe, _)| probe)
+}
+
+/// [`probe_smbus_rmi`] plus the post-probe session state, for
+/// the ATTN pump ([`crate::smbus_rmi_attn`]): the pump needs the
+/// probe and the transport state together, and re-probing here
+/// is the only way to get both — the Stage::Device probe above
+/// keeps only the probe.
+pub fn probe_smbus_rmi_with_state() -> Option<(Rmi4DeviceProbe, SmbusRmiSessionState)> {
     narf_drivers_platform::smbus::with_controller(|c| {
-        let (version, probe) = probe_at(c, SMBUS_RMI_DEFAULT_ADDR)?;
+        let (version, probe, state) = probe_at_with_state(c, SMBUS_RMI_DEFAULT_ADDR)?;
         let _ = writeln!(
             narf_console::Writer,
             "  smbus-rmi: bound addr={:#04x} version={:?} manufacturer={} f11={} f12={} f30={}",
@@ -462,7 +531,7 @@ pub fn probe_smbus_rmi() -> Option<Rmi4DeviceProbe> {
             probe.f12.is_some(),
             probe.f30.is_some(),
         );
-        Some(probe)
+        Some((probe, state))
     })
     .flatten()
 }
