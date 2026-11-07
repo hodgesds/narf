@@ -44,8 +44,8 @@ use crate::pkt::{write_eth_header, ETHERTYPE_IPV6, ETH_HDR_LEN};
 use crate::pkt_dhcpv6::{MT_INFORMATION_REQUEST, MT_SOLICIT};
 use crate::pkt_ipv6::{
     pseudo_checksum, router_advertisement, Ipv6Header, ICMPV6_NEIGHBOR_SOLICITATION,
-    ICMPV6_ROUTER_SOLICITATION, IPV6_HDR_LEN, NEXT_HEADER_ICMPV6, RA_FLAG_MANAGED,
-    RA_FLAG_OTHER_CONFIG,
+    ICMPV6_ROUTER_SOLICITATION, IPV6_HDR_LEN, NA_FLAG_OVERRIDE, NA_FLAG_SOLICITED,
+    NEXT_HEADER_ICMPV6, NEXT_HEADER_UDP, RA_FLAG_MANAGED, RA_FLAG_OTHER_CONFIG,
 };
 use crate::resolv_conf;
 
@@ -784,13 +784,20 @@ fn smoke_v6_ns_for_our_addr_triggers_na() -> TestResult {
     slaac::dad_passed(IFACE, &ll); // addr → Preferred
 
     // Build a Neighbor Solicitation targeting our link-local.
-    let ns_body = ndp::build_ns(ll, [0x02, 0x00, 0x00, 0x00, 0x00, 0x99]);
+    let peer_ip: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+    let peer_mac: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    let ns_body = ndp::build_ns(ll, peer_mac);
 
     // Inject into on_ns.
-    let result = ndp::on_ns(IFACE, Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x99]), &ns_body);
+    let result = ndp::on_ns(IFACE, peer_ip, Some(peer_mac), &ns_body);
 
     match result {
-        ndp::NdRxResult::SendBody(na_body) => {
+        ndp::NdRxResult::SendBody {
+            body: na_body,
+            src_ip: na_src,
+            dst_ip: na_dst,
+            dst_mac,
+        } => {
             // Verify it's an NA (type 136).
             if na_body.is_empty() || na_body[0] != 136 {
                 return TestResult::Fail("NA body has wrong ICMPv6 type (expected 136)");
@@ -802,6 +809,32 @@ fn smoke_v6_ns_for_our_addr_triggers_na() -> TestResult {
             let na_target: [u8; 16] = na_body[8..24].try_into().unwrap();
             if na_target != ll {
                 return TestResult::Fail("NA target != our link-local addr");
+            }
+            // The reply is addressed back to the solicitor: IPv6 src is
+            // the target, dst is the solicitor, L2 dst is the Source LL
+            // Address option the NS carried (RFC 4861 §7.2.4).
+            if na_src != ll {
+                return TestResult::Fail("NA src != target addr (RFC 4861 §7.2.4)");
+            }
+            if na_dst != peer_ip {
+                return TestResult::Fail("NA dst != solicitation source");
+            }
+            if dst_mac != Some(peer_mac) {
+                return TestResult::Fail("NA dst_mac != Source LL Address option");
+            }
+            // The Target LL Address option must carry OUR real MAC —
+            // the old [0; 6] placeholder is gone.
+            let mut found_tlla = false;
+            for opt in crate::pkt_ipv6::iter_nd_options(&na_body[24..]) {
+                if opt.typ == 2 && opt.data.len() >= 6 {
+                    let opt_mac: [u8; 6] = opt.data[..6].try_into().unwrap();
+                    if opt_mac == MAC {
+                        found_tlla = true;
+                    }
+                }
+            }
+            if !found_tlla {
+                return TestResult::Fail("NA Target LL Address option != iface MAC");
             }
         }
         ndp::NdRxResult::DadConflict(_) => {
@@ -1250,3 +1283,804 @@ kernel_test_in!(
     "net/ipv6_e2e",
     smoke_v6_proc_ipv6_route_reflects_default_route
 );
+// ── ICMPv6 transmit fixtures (#1536) ─────────────────────────────────
+//
+// The transmit surface built by this lane: Echo Reply / solicited NA /
+// unsolicited NA / RFC 4443 errors, emitted through the fake device
+// and asserted byte for byte (Ethernet + IPv6 + ICMPv6 header,
+// checksum, payload) — spec-fixture discipline: every expected byte
+// comes from RFC 4443 / RFC 4861 / RFC 8200, never from the code
+// under test.
+
+/// A decoded captured Ethernet + IPv6 frame: (ethernet destination MAC,
+/// ethernet source MAC, IPv6 header, L4 body bytes).
+type DecodedV6Frame = ([u8; 6], [u8; 6], Ipv6Header, Vec<u8>);
+
+/// Decode a captured Ethernet frame into a [`DecodedV6Frame`].
+/// Returns `None` when the frame is not a well-formed Ethernet + IPv6
+/// frame.
+fn decode_v6_frame(frame: &[u8]) -> Option<DecodedV6Frame> {
+    if frame.len() < ETH_HDR_LEN + IPV6_HDR_LEN + 4 {
+        return None;
+    }
+    let mut dst_mac = [0u8; 6];
+    let mut src_mac = [0u8; 6];
+    dst_mac.copy_from_slice(&frame[0..6]);
+    src_mac.copy_from_slice(&frame[6..12]);
+    if u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_IPV6 {
+        return None;
+    }
+    let ip = Ipv6Header::decode(&frame[ETH_HDR_LEN..]).ok()?;
+    let body_start = ETH_HDR_LEN + IPV6_HDR_LEN;
+    let body_end = body_start + ip.payload_length as usize;
+    if frame.len() < body_end {
+        return None;
+    }
+    Some((dst_mac, src_mac, ip, frame[body_start..body_end].to_vec()))
+}
+
+/// The ICMPv6 checksum verifies iff the pseudo-header checksum over
+/// the stamped message is zero (RFC 4443 §2.3).
+fn icmp6_checksum_ok(src: [u8; 16], dst: [u8; 16], body: &[u8]) -> bool {
+    pseudo_checksum(src, dst, NEXT_HEADER_ICMPV6, body) == 0
+}
+
+/// Seed the neighbor cache with a Reachable peer, as if address
+/// resolution already ran for it.
+fn seed_peer(iface: &str, peer_ip: [u8; 16], peer_mac: [u8; 6]) {
+    ndp::neigh_upsert(ndp::Neigh {
+        iface: String::from(iface),
+        ip: peer_ip,
+        mac: Some(peer_mac),
+        state: ndp::NeighState::Reachable,
+        is_router: false,
+        deadline_ns: 0,
+    });
+}
+
+// ── Smoke 19: Echo Request injection → Echo Reply emitted ────────────
+//
+// The receive side used to build the reply and drop it; the transmit
+// surface now puts exact wire bytes on the device.
+//
+// Linux ref: `icmpv6.c icmpv6_echo_reply()` — type 129, id/seq/data
+// echoed unmodified (RFC 4443 §4.2); source is the request's
+// destination (RFC 4443 §2.2(a)).
+
+fn smoke_v6_icmp6_tx_echo_reply_emitted() -> TestResult {
+    const IFACE: &str = "v6e2e-19";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    // Inject an Echo Request from the peer to our link-local.
+    let req_body = crate::ipv6::icmp6_sock::build_echo_request(0xBEEF, 7, b"narf-v6");
+    let frame = build_icmpv6_frame(PEER_MAC, MAC, PEER_IP, ll, &req_body);
+    ipv6_stack::rx_frame(IFACE, &frame[ETH_HDR_LEN..]);
+
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one emitted frame (Echo Reply)");
+    }
+    let (dst_mac, src_mac, ip, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("emitted frame does not decode as IPv6"),
+    };
+    if dst_mac != PEER_MAC {
+        return TestResult::Fail("Echo Reply eth dst != peer MAC");
+    }
+    if src_mac != MAC {
+        return TestResult::Fail("Echo Reply eth src != our MAC");
+    }
+    if ip.src_ip != ll || ip.dst_ip != PEER_IP {
+        return TestResult::Fail("Echo Reply IPv6 src/dst wrong (want our ll -> peer)");
+    }
+    if ip.next_header != NEXT_HEADER_ICMPV6 {
+        return TestResult::Fail("Echo Reply next-header != 58");
+    }
+    if ip.hop_limit != 64 {
+        return TestResult::Fail("Echo Reply hop limit != 64");
+    }
+    if ip.payload_length as usize != body.len() {
+        return TestResult::Fail("Echo Reply IPv6 payload length mismatch");
+    }
+    if body.len() < 8 || body[0] != 129 || body[1] != 0 {
+        return TestResult::Fail("Echo Reply type/code != 129/0");
+    }
+    if u16::from_be_bytes([body[4], body[5]]) != 0xBEEF {
+        return TestResult::Fail("Echo Reply id mismatch");
+    }
+    if u16::from_be_bytes([body[6], body[7]]) != 7 {
+        return TestResult::Fail("Echo Reply seq mismatch");
+    }
+    if &body[8..] != b"narf-v6" {
+        return TestResult::Fail("Echo Reply payload not echoed unmodified (RFC 4443 §4.2)");
+    }
+    if !icmp6_checksum_ok(ip.src_ip, ip.dst_ip, &body) {
+        return TestResult::Fail("Echo Reply checksum does not verify (RFC 4443 §2.3)");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_tx_echo_reply_emitted);
+
+// ── Smoke 20: Echo Reply queued on a cold cache, flushed by NA ───────
+//
+// Same as smoke 19 but the neighbor cache is cold: the reply is
+// queued (not dropped), an NS solicits the peer, and the peer's NA
+// flushes the exact reply bytes.
+//
+// Linux ref: `ndisc.c ndisc_recv_na()` → `neigh_update()` sends
+//   queued packets (`__neigh_event_send` / `neigh_resolve_output`).
+
+fn smoke_v6_icmp6_tx_echo_reply_queued_until_na() -> TestResult {
+    const IFACE: &str = "v6e2e-20";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+
+    // No neighbor entry: inject the Echo Request.
+    let req_body = crate::ipv6::icmp6_sock::build_echo_request(0xBEEF, 7, b"narf-v6");
+    let frame = build_icmpv6_frame(PEER_MAC, MAC, PEER_IP, ll, &req_body);
+    ipv6_stack::rx_frame(IFACE, &frame[ETH_HDR_LEN..]);
+
+    // The reply is queued, not sent — but resolution solicits the peer:
+    // exactly one NS to the peer's solicited-node multicast.
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one frame (the NS soliciting the peer)");
+    }
+    let (_, _, ip, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("solicitation frame does not decode as IPv6"),
+    };
+    if body.is_empty() || body[0] != 135 {
+        return TestResult::Fail("first frame is not a Neighbor Solicitation");
+    }
+    if ip.dst_ip != addrs::solicited_node_multicast(&PEER_IP) {
+        return TestResult::Fail("NS dst != peer solicited-node multicast");
+    }
+    if body.len() < 24 || body[8..24] != PEER_IP {
+        return TestResult::Fail("NS target != peer addr");
+    }
+    if ipv6_stack::__pending_icmp6_test_count(0) != 1 {
+        return TestResult::Fail("Echo Reply not queued pending resolution");
+    }
+
+    // The peer answers the NS with an NA → the queued reply flushes.
+    let na_body = ndp::build_na(PEER_IP, PEER_MAC, false);
+    let na_frame = build_icmpv6_frame(PEER_MAC, MAC, PEER_IP, ll, &na_body);
+    ipv6_stack::rx_frame(IFACE, &na_frame[ETH_HDR_LEN..]);
+
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one flushed frame (Echo Reply)");
+    }
+    let (dst_mac, _, ip, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("flushed frame does not decode as IPv6"),
+    };
+    if dst_mac != PEER_MAC || body.is_empty() || body[0] != 129 {
+        return TestResult::Fail("flushed frame is not the Echo Reply to the peer");
+    }
+    if ip.src_ip != ll || ip.dst_ip != PEER_IP {
+        return TestResult::Fail("flushed Echo Reply src/dst wrong");
+    }
+    if !icmp6_checksum_ok(ip.src_ip, ip.dst_ip, &body) {
+        return TestResult::Fail("flushed Echo Reply checksum does not verify");
+    }
+    if ipv6_stack::__pending_icmp6_test_count(0) != 0 {
+        return TestResult::Fail("pending queue not drained after NA");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_tx_echo_reply_queued_until_na);
+
+// ── Smoke 21: NS injection → solicited NA emitted end-to-end ─────────
+//
+// The full RX→TX path: the NS arrives as a frame, the NA leaves as a
+// frame. Flags S|O, hop limit 255, Target LL Address = our MAC.
+//
+// Linux ref: `ndisc.c ndisc_recv_ns()` → `ndisc_send_na()`
+//   (RFC 4861 §7.2.4).
+
+fn smoke_v6_icmp6_tx_solicited_na_emitted() -> TestResult {
+    const IFACE: &str = "v6e2e-21";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+
+    // Inject an NS from the peer (with Source LL Address option)
+    // targeting our link-local, sent to its solicited-node multicast.
+    let ns_body = ndp::build_ns(ll, PEER_MAC);
+    let frame = build_icmpv6_frame(
+        PEER_MAC,
+        MAC,
+        PEER_IP,
+        addrs::solicited_node_multicast(&ll),
+        &ns_body,
+    );
+    ipv6_stack::rx_frame(IFACE, &frame[ETH_HDR_LEN..]);
+
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one emitted frame (solicited NA)");
+    }
+    let (dst_mac, src_mac, ip, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("emitted frame does not decode as IPv6"),
+    };
+    if dst_mac != PEER_MAC {
+        return TestResult::Fail("NA eth dst != solicitor MAC (Source LL Address option)");
+    }
+    if src_mac != MAC {
+        return TestResult::Fail("NA eth src != our MAC");
+    }
+    if ip.src_ip != ll || ip.dst_ip != PEER_IP {
+        return TestResult::Fail("NA IPv6 src/dst wrong (want target -> solicitor)");
+    }
+    if ip.hop_limit != 255 {
+        return TestResult::Fail("NA hop limit != 255 (RFC 4861 §7.1.2)");
+    }
+    if ip.next_header != NEXT_HEADER_ICMPV6 {
+        return TestResult::Fail("NA next-header != 58");
+    }
+    if body.len() < 24 || body[0] != 136 || body[1] != 0 {
+        return TestResult::Fail("NA type/code != 136/0");
+    }
+    let flags = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    if flags != (NA_FLAG_SOLICITED | NA_FLAG_OVERRIDE) {
+        return TestResult::Fail("solicited NA flags != S|O (RFC 4861 §7.2.4)");
+    }
+    if body[8..24] != ll {
+        return TestResult::Fail("NA target != our addr");
+    }
+    let mut found_tlla = false;
+    for opt in crate::pkt_ipv6::iter_nd_options(&body[24..]) {
+        if opt.typ == 2 && opt.data.len() >= 6 {
+            let opt_mac: [u8; 6] = opt.data[..6].try_into().unwrap();
+            if opt_mac == MAC {
+                found_tlla = true;
+            }
+        }
+    }
+    if !found_tlla {
+        return TestResult::Fail("NA Target LL Address option != iface MAC");
+    }
+    if !icmp6_checksum_ok(ip.src_ip, ip.dst_ip, &body) {
+        return TestResult::Fail("NA checksum does not verify");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_tx_solicited_na_emitted);
+
+// ── Smoke 22: DAD probe → multicast NA, Solicited clear ──────────────
+//
+// A DAD NS (source `::`, no SLLA option) targeting our Preferred
+// address is answered with a Solicited-clear NA multicast to
+// ff02::1, so the peer's DAD fails (RFC 4861 §7.2.4).
+
+fn smoke_v6_icmp6_tx_dad_probe_gets_multicast_na() -> TestResult {
+    const IFACE: &str = "v6e2e-22";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+
+    // DAD probe: source ::, no Source LL Address option.
+    let ns_body = ndp::build_dad_ns(ll);
+    let frame = build_icmpv6_frame(
+        PEER_MAC,
+        multicast_mac(&ll),
+        [0; 16],
+        addrs::solicited_node_multicast(&ll),
+        &ns_body,
+    );
+    ipv6_stack::rx_frame(IFACE, &frame[ETH_HDR_LEN..]);
+
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one emitted frame (multicast NA)");
+    }
+    let (dst_mac, _, ip, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("emitted frame does not decode as IPv6"),
+    };
+    if dst_mac != [0x33, 0x33, 0, 0, 0, 0x01] {
+        return TestResult::Fail("DAD reply eth dst != all-nodes multicast MAC");
+    }
+    if ip.dst_ip != addrs::ALL_NODES_MULTICAST {
+        return TestResult::Fail("DAD reply IPv6 dst != ff02::1");
+    }
+    if ip.src_ip != ll {
+        return TestResult::Fail("DAD reply IPv6 src != target addr");
+    }
+    if ip.hop_limit != 255 {
+        return TestResult::Fail("DAD reply hop limit != 255");
+    }
+    if body.len() < 24 || body[0] != 136 || body[1] != 0 {
+        return TestResult::Fail("DAD reply type/code != 136/0");
+    }
+    let flags = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    if flags & NA_FLAG_SOLICITED != 0 {
+        return TestResult::Fail("DAD reply Solicited flag must be clear (RFC 4861 §7.2.4)");
+    }
+    if flags & NA_FLAG_OVERRIDE == 0 {
+        return TestResult::Fail("DAD reply Override flag must be set");
+    }
+    if !icmp6_checksum_ok(ip.src_ip, ip.dst_ip, &body) {
+        return TestResult::Fail("DAD reply checksum does not verify");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/ipv6_e2e",
+    smoke_v6_icmp6_tx_dad_probe_gets_multicast_na
+);
+
+// ── Smoke 23: unsolicited NA, one per usable address (#1536) ──────────
+//
+// The headline surface: `send_unsolicited_na` announces every
+// Preferred/Deprecated address to ff02::1 (Solicited clear, Override
+// set) and skips Tentative addresses, which DAD still owns.
+//
+// Linux ref: `netdev_notify_peers()` → `ndisc_notify()`
+//   (RFC 4861 §7.2.6).
+
+fn smoke_v6_icmp6_tx_unsolicited_na_per_address() -> TestResult {
+    const IFACE: &str = "v6e2e-23";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    // A Preferred global address and a Tentative one.
+    let global: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ];
+    addrs::add(addrs::Ipv6IfAddr {
+        iface: String::from(IFACE),
+        addr: global,
+        prefix_len: 64,
+        state: addrs::AddrState::Preferred,
+        scope: addrs::AddrScope::Global,
+        preferred_deadline_ns: u64::MAX,
+        valid_deadline_ns: u64::MAX,
+        temporary: false,
+    });
+    let tentative: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+    ];
+    addrs::add(addrs::Ipv6IfAddr {
+        iface: String::from(IFACE),
+        addr: tentative,
+        prefix_len: 64,
+        state: addrs::AddrState::Tentative,
+        scope: addrs::AddrScope::Global,
+        preferred_deadline_ns: u64::MAX,
+        valid_deadline_ns: u64::MAX,
+        temporary: false,
+    });
+
+    let sent = ipv6_stack::send_unsolicited_na(IFACE);
+    if sent != 2 {
+        return TestResult::Fail("expected 2 unsolicited NAs (link-local + global, not tentative)");
+    }
+    let frames = drain_v6();
+    if frames.len() != 2 {
+        return TestResult::Fail("expected exactly 2 emitted frames");
+    }
+    for frame in &frames {
+        let (dst_mac, src_mac, ip, body) = match decode_v6_frame(frame) {
+            Some(t) => t,
+            None => return TestResult::Fail("unsolicited NA does not decode as IPv6"),
+        };
+        if dst_mac != [0x33, 0x33, 0, 0, 0, 0x01] {
+            return TestResult::Fail("unsolicited NA eth dst != all-nodes multicast MAC");
+        }
+        if src_mac != MAC {
+            return TestResult::Fail("unsolicited NA eth src != our MAC");
+        }
+        if ip.dst_ip != addrs::ALL_NODES_MULTICAST {
+            return TestResult::Fail("unsolicited NA dst != ff02::1");
+        }
+        if ip.src_ip != ll && ip.src_ip != global {
+            return TestResult::Fail("unsolicited NA src is not one of our usable addresses");
+        }
+        if ip.hop_limit != 255 {
+            return TestResult::Fail("unsolicited NA hop limit != 255");
+        }
+        if ip.next_header != NEXT_HEADER_ICMPV6 {
+            return TestResult::Fail("unsolicited NA next-header != 58");
+        }
+        if body.len() < 24 || body[0] != 136 || body[1] != 0 {
+            return TestResult::Fail("unsolicited NA type/code != 136/0");
+        }
+        let flags = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+        if flags & NA_FLAG_SOLICITED != 0 {
+            return TestResult::Fail(
+                "unsolicited NA Solicited flag must be clear (RFC 4861 §7.2.6)",
+            );
+        }
+        if flags & NA_FLAG_OVERRIDE == 0 {
+            return TestResult::Fail("unsolicited NA Override flag must be set");
+        }
+        // Target == IPv6 source, and the TLLA option carries our MAC.
+        let target: [u8; 16] = body[8..24].try_into().unwrap();
+        if target != ip.src_ip {
+            return TestResult::Fail("unsolicited NA target != its IPv6 source");
+        }
+        let mut found_tlla = false;
+        for opt in crate::pkt_ipv6::iter_nd_options(&body[24..]) {
+            if opt.typ == 2 && opt.data.len() >= 6 {
+                let opt_mac: [u8; 6] = opt.data[..6].try_into().unwrap();
+                if opt_mac == MAC {
+                    found_tlla = true;
+                }
+            }
+        }
+        if !found_tlla {
+            return TestResult::Fail("unsolicited NA Target LL Address option != iface MAC");
+        }
+        if !icmp6_checksum_ok(ip.src_ip, ip.dst_ip, &body) {
+            return TestResult::Fail("unsolicited NA checksum does not verify");
+        }
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_tx_unsolicited_na_per_address);
+
+// ── Smoke 24: RFC 4443 error messages, exact bytes + truncation ──────
+//
+// Destination Unreachable (code 4) quotes the whole short invoking
+// packet; Packet Too Big truncates a 2040-byte invoking packet to the
+// 1232-byte §2.4(c) bound (1280 min MTU − 40 IPv6 − 8 ICMPv6 header).
+
+fn smoke_v6_icmp6_tx_error_messages() -> TestResult {
+    const IFACE: &str = "v6e2e-24";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    // Invoking packet: IPv6 header (UDP) from the peer to our ll.
+    let mut invoking = Vec::new();
+    let ip = Ipv6Header {
+        version: 6,
+        payload_length: 8,
+        next_header: NEXT_HEADER_UDP,
+        hop_limit: 64,
+        src_ip: PEER_IP,
+        dst_ip: ll,
+        ..Default::default()
+    };
+    invoking.extend_from_slice(&ip.encode());
+    invoking.extend_from_slice(&[0x12, 0x34, 0x56, 0x78, 0, 8, 0, 0]);
+
+    // Destination Unreachable, code 4 (port unreachable).
+    match ipv6_stack::send_icmp6_error(
+        IFACE,
+        ll,
+        ipv6_stack::Icmp6ErrorKind::DestinationUnreachable(4),
+        &invoking,
+    ) {
+        Ok(()) => {}
+        Err(_) => return TestResult::Fail("Destination Unreachable send failed"),
+    }
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one DU frame");
+    }
+    let (dst_mac, _, ip6, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("DU frame does not decode as IPv6"),
+    };
+    if dst_mac != PEER_MAC {
+        return TestResult::Fail("DU eth dst != peer MAC");
+    }
+    if ip6.src_ip != ll || ip6.dst_ip != PEER_IP {
+        return TestResult::Fail("DU IPv6 src/dst wrong (want our ll -> invoking source)");
+    }
+    if ip6.hop_limit != 64 || ip6.next_header != NEXT_HEADER_ICMPV6 {
+        return TestResult::Fail("DU hop limit / next-header wrong");
+    }
+    if body.len() < 8 || body[0] != 1 || body[1] != 4 {
+        return TestResult::Fail("DU type/code != 1/4");
+    }
+    if body[4..8] != [0, 0, 0, 0] {
+        return TestResult::Fail("DU unused field must be zero (RFC 4443 §3.1)");
+    }
+    if body[8..] != invoking[..] {
+        return TestResult::Fail("DU quoted invoking packet differs");
+    }
+    if !icmp6_checksum_ok(ip6.src_ip, ip6.dst_ip, &body) {
+        return TestResult::Fail("DU checksum does not verify");
+    }
+
+    // Packet Too Big with an oversized invoking packet (2040 bytes):
+    // the quoted portion is truncated to 1232 bytes (RFC 4443 §2.4(c)).
+    let mut big = Vec::new();
+    let ip2 = Ipv6Header {
+        version: 6,
+        payload_length: 2000,
+        next_header: NEXT_HEADER_UDP,
+        hop_limit: 64,
+        src_ip: PEER_IP,
+        dst_ip: ll,
+        ..Default::default()
+    };
+    big.extend_from_slice(&ip2.encode());
+    big.extend_from_slice(&vec![0xABu8; 2000]);
+    match ipv6_stack::send_icmp6_error(
+        IFACE,
+        ll,
+        ipv6_stack::Icmp6ErrorKind::PacketTooBig(1280),
+        &big,
+    ) {
+        Ok(()) => {}
+        Err(_) => return TestResult::Fail("Packet Too Big send failed"),
+    }
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one PTB frame");
+    }
+    let (_, _, ip6, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("PTB frame does not decode as IPv6"),
+    };
+    if body.len() < 8 || body[0] != 2 || body[1] != 0 {
+        return TestResult::Fail("PTB type/code != 2/0");
+    }
+    if u32::from_be_bytes(body[4..8].try_into().unwrap()) != 1280 {
+        return TestResult::Fail("PTB MTU field != 1280 (RFC 4443 §3.2)");
+    }
+    if body.len() != 8 + 1232 {
+        return TestResult::Fail(
+            "PTB quoted invoking packet not truncated to 1232 bytes (RFC 4443 §2.4(c))",
+        );
+    }
+    if body[8..] != big[..1232] {
+        return TestResult::Fail("PTB quoted bytes != invoking packet prefix");
+    }
+    if ip6.payload_length as usize != body.len() {
+        return TestResult::Fail("PTB IPv6 payload length mismatch");
+    }
+    if !icmp6_checksum_ok(ip6.src_ip, ip6.dst_ip, &body) {
+        return TestResult::Fail("PTB checksum does not verify");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_tx_error_messages);
+
+// ── Smoke 25: RFC 4443 §2.4(e) error suppression ──────────────────────
+//
+// No error in response to an ICMPv6 error (e.1), a Redirect (e.2), a
+// multicast-destined packet (e.3 — except PTB), or a packet whose
+// source does not uniquely identify a node (e.6).
+
+fn smoke_v6_icmp6_tx_error_suppression() -> TestResult {
+    const IFACE: &str = "v6e2e-25";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    fn invoking_packet(src: [u8; 16], dst: [u8; 16], nh: u8, l4_first: u8) -> Vec<u8> {
+        let mut p = Vec::new();
+        let ip = Ipv6Header {
+            version: 6,
+            payload_length: 8,
+            next_header: nh,
+            hop_limit: 64,
+            src_ip: src,
+            dst_ip: dst,
+            ..Default::default()
+        };
+        p.extend_from_slice(&ip.encode());
+        p.extend_from_slice(&[l4_first, 0, 0, 0, 0, 0, 0, 0]);
+        p
+    }
+
+    use ipv6_stack::{Icmp6ErrorKind, Icmp6SendError};
+    // (e.1) Invoking packet is itself an ICMPv6 error (type 1).
+    let err_invoking = invoking_packet(PEER_IP, ll, NEXT_HEADER_ICMPV6, 1);
+    match ipv6_stack::send_icmp6_error(
+        IFACE,
+        ll,
+        Icmp6ErrorKind::DestinationUnreachable(3),
+        &err_invoking,
+    ) {
+        Err(Icmp6SendError::ErrorSuppressed) => {}
+        _ => {
+            return TestResult::Fail(
+                "error in response to an ICMPv6 error was not suppressed (RFC 4443 §2.4(e.1))",
+            );
+        }
+    }
+    // (e.2) Invoking packet is a Redirect (type 137).
+    let redir_invoking = invoking_packet(PEER_IP, ll, NEXT_HEADER_ICMPV6, 137);
+    match ipv6_stack::send_icmp6_error(
+        IFACE,
+        ll,
+        Icmp6ErrorKind::DestinationUnreachable(3),
+        &redir_invoking,
+    ) {
+        Err(Icmp6SendError::ErrorSuppressed) => {}
+        _ => {
+            return TestResult::Fail(
+                "error in response to a Redirect was not suppressed (RFC 4443 §2.4(e.2))",
+            );
+        }
+    }
+    // (e.3) Multicast-destined invoking packet: DU suppressed...
+    let mcast_invoking = invoking_packet(PEER_IP, addrs::ALL_NODES_MULTICAST, NEXT_HEADER_UDP, 0);
+    match ipv6_stack::send_icmp6_error(
+        IFACE,
+        ll,
+        Icmp6ErrorKind::DestinationUnreachable(3),
+        &mcast_invoking,
+    ) {
+        Err(Icmp6SendError::ErrorSuppressed) => {}
+        _ => {
+            return TestResult::Fail(
+                "error for a multicast-destined packet was not suppressed (RFC 4443 §2.4(e.3))",
+            );
+        }
+    }
+    // ...but Packet Too Big is the (e.3) exception.
+    match ipv6_stack::send_icmp6_error(
+        IFACE,
+        ll,
+        Icmp6ErrorKind::PacketTooBig(1280),
+        &mcast_invoking,
+    ) {
+        Ok(()) => {}
+        _ => {
+            return TestResult::Fail(
+                "Packet Too Big for a multicast-destined packet must be allowed (RFC 4443 §2.4(e.3))",
+            );
+        }
+    }
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one PTB frame");
+    }
+    // (e.6) Unspecified source.
+    let unspec_invoking = invoking_packet([0; 16], ll, NEXT_HEADER_UDP, 0);
+    match ipv6_stack::send_icmp6_error(
+        IFACE,
+        ll,
+        Icmp6ErrorKind::DestinationUnreachable(3),
+        &unspec_invoking,
+    ) {
+        Err(Icmp6SendError::ErrorSuppressed) => {}
+        _ => {
+            return TestResult::Fail(
+                "error for an Unspecified-source packet was not suppressed (RFC 4443 §2.4(e.6))",
+            );
+        }
+    }
+    if !drain_v6().is_empty() {
+        return TestResult::Fail("suppressed errors emitted frames");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_tx_error_suppression);
+
+// ── Smoke 26: Echo Request originate (warm + cold cache) ──────────────
+//
+// `send_echo_request` emits type 128 from the scope-matched source;
+// a cold neighbor cache returns NeighborPending and solicits once.
+
+fn smoke_v6_icmp6_tx_echo_request() -> TestResult {
+    const IFACE: &str = "v6e2e-26";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    match ipv6_stack::send_echo_request(IFACE, PEER_IP, 0x1234, 3, b"ping") {
+        Ok(4) => {}
+        Ok(_) => return TestResult::Fail("send_echo_request returned wrong length"),
+        Err(_) => return TestResult::Fail("send_echo_request failed with warm cache"),
+    }
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one Echo Request frame");
+    }
+    let (dst_mac, _, ip, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("Echo Request frame does not decode as IPv6"),
+    };
+    if dst_mac != PEER_MAC {
+        return TestResult::Fail("Echo Request eth dst != peer MAC");
+    }
+    if ip.src_ip != ll || ip.dst_ip != PEER_IP {
+        return TestResult::Fail("Echo Request IPv6 src/dst wrong");
+    }
+    if ip.hop_limit != 64 {
+        return TestResult::Fail("Echo Request hop limit != 64");
+    }
+    if body.len() < 8 || body[0] != 128 || body[1] != 0 {
+        return TestResult::Fail("Echo Request type/code != 128/0");
+    }
+    if u16::from_be_bytes([body[4], body[5]]) != 0x1234 {
+        return TestResult::Fail("Echo Request id mismatch");
+    }
+    if u16::from_be_bytes([body[6], body[7]]) != 3 {
+        return TestResult::Fail("Echo Request seq mismatch");
+    }
+    if &body[8..] != b"ping" {
+        return TestResult::Fail("Echo Request payload mismatch");
+    }
+    if !icmp6_checksum_ok(ip.src_ip, ip.dst_ip, &body) {
+        return TestResult::Fail("Echo Request checksum does not verify");
+    }
+
+    // Cold cache: a second iface without a neighbor entry queues and
+    // returns NeighborPending (the NS it solicits with is the only frame).
+    const IFACE2: &str = "v6e2e-26b";
+    reset_v6(IFACE2, MAC);
+    let ll2 = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE2, MAC, 0);
+    slaac::dad_passed(IFACE2, &ll2);
+    match ipv6_stack::send_echo_request(IFACE2, PEER_IP, 0x1234, 4, b"ping") {
+        Err(ipv6_stack::Icmp6SendError::NeighborPending) => {}
+        _ => return TestResult::Fail("cold-cache Echo Request did not return NeighborPending"),
+    }
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one NS frame on cold cache");
+    }
+    let (_, _, _, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("cold-cache frame does not decode as IPv6"),
+    };
+    if body.is_empty() || body[0] != 135 {
+        return TestResult::Fail("cold-cache frame is not a Neighbor Solicitation");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_tx_echo_request);

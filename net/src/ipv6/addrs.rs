@@ -341,6 +341,11 @@ pub fn link_local_from_mac(mac: [u8; 6]) -> [u8; 16] {
     a
 }
 
+/// The all-nodes link-local multicast address ff02::1 (RFC 4291
+/// §2.7.1). Unsolicited Neighbor Advertisements go here (RFC 4861
+/// §7.2.6); so do DAD-probe replies (RFC 4861 §7.2.4).
+pub const ALL_NODES_MULTICAST: [u8; 16] = [0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+
 /// Form the solicited-node multicast address for `target`
 /// (RFC 4291 §2.7.1): `ff02::1:ff` || target[13..16].
 pub fn solicited_node_multicast(target: &[u8; 16]) -> [u8; 16] {

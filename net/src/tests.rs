@@ -4518,7 +4518,7 @@ fn smoke_ipv6_na_encode_flags() -> TestResult {
 kernel_test_in!("net/ipv6", smoke_ipv6_na_encode_flags);
 
 /// NDP RX dispatch: inbound NS for one of our addresses → caller
-/// gets a SendBody(NA).
+/// gets a SendBody NA addressed back to the solicitor.
 fn smoke_ipv6_ndp_rx_ns_for_us_emits_na() -> TestResult {
     use crate::ipv6::addrs::{self, AddrScope, AddrState, Ipv6IfAddr};
     use crate::ipv6::ndp::{self, build_ns, on_ns, NdRxResult};
@@ -4542,8 +4542,12 @@ fn smoke_ipv6_ndp_rx_ns_for_us_emits_na() -> TestResult {
     });
     let mac = [0x02, 0, 0, 0, 0, 1];
     let ns = build_ns(us, mac);
-    match on_ns("eth0", Some(mac), &ns) {
-        NdRxResult::SendBody(body) => {
+    let mut peer = [0u8; 16];
+    peer[0] = 0xFE;
+    peer[1] = 0x80;
+    peer[15] = 0x01;
+    match on_ns("eth0", peer, Some(mac), &ns) {
+        NdRxResult::SendBody { body, .. } => {
             if body[0] != crate::pkt_ipv6::ICMPV6_NEIGHBOR_ADVERTISEMENT {
                 return TestResult::Fail("response is not an NA");
             }
@@ -4581,7 +4585,8 @@ fn smoke_ipv6_dad_conflict_via_ns() -> TestResult {
         temporary: false,
     });
     let ns = build_dad_ns(us);
-    match on_ns("eth0", None, &ns) {
+    // A DAD NS carries the Unspecified Address as its source.
+    match on_ns("eth0", [0; 16], None, &ns) {
         NdRxResult::DadConflict(addr) => {
             if addr != us {
                 return TestResult::Fail("DadConflict carries wrong addr");

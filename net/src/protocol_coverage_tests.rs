@@ -1493,7 +1493,7 @@ fn smoke_cov_ndp_rejects_invalid_messages() -> TestResult {
     let r_mc = on_na(IFACE, &na_mc);
     let mut ns = crate::pkt_ipv6::neighbor_solicitation(target, &[]);
     ns[1] = 7;
-    let r_ns = on_ns(IFACE, None, &ns);
+    let r_ns = on_ns(IFACE, v6(0x33), None, &ns);
     let ra = router_advertisement(64, 0, 1800, 0, 0, &[]);
     let r_ra_global = on_ra(IFACE, v6(0x32), &ra, 0);
     let mut ra_code = ra.clone();

@@ -227,6 +227,18 @@ pub fn build_dad_ns(target: [u8; 16]) -> Vec<u8> {
     neighbor_solicitation(target, &[])
 }
 
+/// Build an unsolicited Neighbor Advertisement body (RFC 4861
+/// §7.2.6): Solicited clear, Override set, Router clear (host),
+/// Target LL Address option = our MAC. The caller multicasts it to
+/// ff02::1 with hop limit 255 and source = `target`.
+pub fn build_unsolicited_na(target: [u8; 16], src_mac: [u8; 6]) -> Vec<u8> {
+    let mut opts = Vec::new();
+    let mut data = Vec::with_capacity(6);
+    data.extend_from_slice(&src_mac);
+    let _ = append_nd_option(&mut opts, ND_OPT_TARGET_LINK_LAYER_ADDR, &data);
+    neighbor_advertisement(NA_FLAG_OVERRIDE, target, &opts)
+}
+
 /// Build a Neighbor Advertisement body for `target` with the S/O
 /// flags set (Solicited + Override). Includes a Target LL Address
 /// option.
@@ -247,8 +259,20 @@ pub fn build_na(target: [u8; 16], src_mac: [u8; 6], router: bool) -> Vec<u8> {
 /// Result of dispatching an inbound ICMPv6 ND message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NdRxResult {
-    /// Caller should emit this ICMPv6 body in reply (no header bytes).
-    SendBody(Vec<u8>),
+    /// Caller should emit this ICMPv6 body in reply, addressed as
+    /// carried: `src_ip` is the advertisement's IPv6 source (the
+    /// target address), `dst_ip` its IPv6 destination (the
+    /// solicitation's source, or ff02::1 for a DAD probe from `::`),
+    /// and `dst_mac` the link-layer destination when the solicitation
+    /// supplied it (Source LL Address option). `dst_mac: None` means
+    /// the transmit path resolves the MAC via the neighbor cache, or
+    /// maps it for a multicast `dst_ip`.
+    SendBody {
+        body: Vec<u8>,
+        src_ip: [u8; 16],
+        dst_ip: [u8; 16],
+        dst_mac: Option<[u8; 6]>,
+    },
     /// State updated; no reply needed.
     Updated,
     /// Message ignored.
@@ -260,13 +284,22 @@ pub enum NdRxResult {
 
 /// Process an inbound Neighbor Solicitation. If the `target` matches
 /// one of *our* iface addresses, emit a Neighbor Advertisement.
-pub fn on_ns(iface: &str, src_mac_opt: Option<[u8; 6]>, body: &[u8]) -> NdRxResult {
-    on_ns_in(iface_namespace(iface), iface, src_mac_opt, body)
+/// `src_ip` is the solicitation's IPv6 source: `::` marks a DAD probe
+/// (RFC 4861 §7.2.4 — the reply is then Solicited-clear, multicast to
+/// ff02::1); anything else gets a solicited unicast NA.
+pub fn on_ns(
+    iface: &str,
+    src_ip: [u8; 16],
+    src_mac_opt: Option<[u8; 6]>,
+    body: &[u8],
+) -> NdRxResult {
+    on_ns_in(iface_namespace(iface), iface, src_ip, src_mac_opt, body)
 }
 
 pub fn on_ns_in(
     net_ns_id: u64,
     iface: &str,
+    src_ip: [u8; 16],
     src_mac_opt: Option<[u8; 6]>,
     body: &[u8],
 ) -> NdRxResult {
@@ -305,9 +338,35 @@ pub fn on_ns_in(
         if local.state == AddrState::Tentative {
             return NdRxResult::DadConflict(target);
         }
-        // It's our final address; reply with an NA.
-        // (Caller fills in source MAC; we just produce the body.)
-        return NdRxResult::SendBody(build_na(target, [0; 6], false));
+        // It's our final address; reply with an NA. The body carries
+        // our real MAC in the Target LL Address option (an unregistered
+        // iface keeps the old [0; 6] placeholder — only test fixtures
+        // hit that path).
+        let mac = crate::iface::lookup_in(net_ns_id, iface)
+            .map(|snap| snap.mac)
+            .unwrap_or([0; 6]);
+        if src_ip == [0; 16] {
+            // DAD probe from a peer claiming our address (RFC 4861
+            // §7.2.4): Solicited clear, multicast to the all-nodes
+            // address. The peer's DAD fails on receipt.
+            return NdRxResult::SendBody {
+                body: build_unsolicited_na(target, mac),
+                src_ip: target,
+                dst_ip: super::addrs::ALL_NODES_MULTICAST,
+                dst_mac: None,
+            };
+        }
+        // Solicited NA (RFC 4861 §7.2.4): Solicited + Override set,
+        // unicast to the solicitation's source. The link-layer
+        // destination is the Source LL Address option when present;
+        // otherwise the transmit path resolves it via the neighbor
+        // cache (queueing + soliciting when it is not there yet).
+        return NdRxResult::SendBody {
+            body: build_na(target, mac, false),
+            src_ip: target,
+            dst_ip: src_ip,
+            dst_mac: sll.or(src_mac_opt),
+        };
     }
     NdRxResult::Ignored
 }

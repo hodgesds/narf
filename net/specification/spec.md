@@ -1521,6 +1521,34 @@ References (public-only, all IETF documents):
   namespace-keyed queue and emitted when the Neighbor Advertisement updates
   the cache; queue exhaustion returns `ENOBUFS` rather than reporting a
   datagram as sent and dropping it.
+- `ipv6_stack::send_icmp6_in` is the ICMPv6 transmit entry point
+  (`#1536`): it resolves the link-layer destination (RFC 2464 §7
+  multicast mapping for ff00::/8, neighbor-cache lookup otherwise),
+  stamps the RFC 4443 §2.3 pseudo-header checksum, and emits the
+  Ethernet + IPv6 frame through the interface's device path. A unicast
+  cache miss queues the complete message in a bounded,
+  namespace-keyed pending queue (same shape as the UDP one) and
+  solicits the neighbor; `neighbor_resolved` flushes it when the NA
+  arrives. Typed wrappers: `send_echo_request_in` (RFC 4443 §4.1),
+  `send_ns_in` (RFC 4861 §7.2.2), `send_unsolicited_na[_in]` — one
+  unsolicited NA per Preferred/Deprecated address to ff02::1, Solicited
+  clear, Override set, hop limit 255 (RFC 4861 §7.2.6; the
+  `netdev_notify_peers` analog the virtio-net announce path calls
+  alongside gratuitous ARP) — and `send_icmp6_error_in` for the RFC
+  4443 §3 errors (Destination Unreachable codes 0–6, Packet Too Big
+  with the next-hop MTU, Time Exceeded codes 0–1, Parameter Problem
+  codes 0–2 with Pointer), quoting the invoking packet truncated to
+  the §2.4(c) bound (1232 bytes) and applying the §2.4(e) suppression
+  rules (no error for an ICMPv6 error, a Redirect, a multicast-destined
+  packet except Packet Too Big / Parameter Problem code 2, or a
+  non-identifying source). §2.4(f) rate limiting is NOT implemented
+  (token bucket is a follow-up lane). RX answers Echo Requests
+  (RFC 4443 §2.2 source rules) and solicited NS→NA replies (RFC 4861
+  §7.2.4, including the DAD-probe multicast reply) through the same
+  surface; `ndp::on_ns` returns the reply body plus its IPv6
+  source/destination and the solicitor's link-layer address, and
+  builds the NA with the interface's real MAC in the Target LL Address
+  option.
 - Native TCP6 RX validates the IPv6 pseudo-header checksum before entering the
   shared TCP state machine. Active and passive opens use IPv6 FIB/source
   selection and NDP, emit Ethernet+IPv6+TCP frames, and retain native IPv6
