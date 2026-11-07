@@ -50,6 +50,24 @@ pub trait PwmDevice {
 }
 ```
 
+### 3.3 Controller Registry
+
+```rust
+pub fn register_controller(phandle: u32, dev: Arc<dyn PwmDevice>);
+pub fn lookup_controller(phandle: u32) -> Option<Arc<dyn PwmDevice>>;
+pub fn unregister_controller(phandle: u32);
+```
+
+PWM controller drivers register the `PwmDevice` they drive under
+the controller node's Devicetree phandle, so DT-described consumers
+(a `pwm-fan` node whose `pwms` specifier carries that phandle, an
+LED, a backlight) can resolve the controller the board description
+points at. One phandle, one controller; last registration wins.
+A consumer probe that runs before its controller registers gets
+`None` and must treat that as a retryable miss (deferred probe),
+not a hard failure — controller drivers register no later than
+Stage::Device for their consumers to bind at boot.
+
 ## 4. Capability Gating
 
 - `Cap<PwmCapType, Write>`: Authority to change configuration and enable/disable a PWM channel.

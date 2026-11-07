@@ -195,6 +195,14 @@ pub fn register_initcalls() {
         fan::init();
         InitResult::Ok
     });
+    // DT `pwm-fan` nodes (#911): claim the compatible through the
+    // bus DT-match table; the Stage::Device `probe_all_dt` walk
+    // binds each enabled node, resolving its PWM controller from
+    // the `narf_pwm` registry.
+    narf_init::register(Stage::Subsys, "pwm-fan-dt", || {
+        fan::register_dt_driver();
+        InitResult::Ok
+    });
     // Platform thermal suspend/resume (#916): registers the
     // `platform-thermal` device_pm entry so resume re-asserts the
     // last cooling level. After the thermal and fan initcalls;
