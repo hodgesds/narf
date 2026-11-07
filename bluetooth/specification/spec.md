@@ -380,15 +380,23 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   server channel (DLCI `2*channel+1` per TS 07.10 §5.4, matched
   leniently on the direction bit), `pump::send_rfcomm` /
   `drain_rfcomm_rx` / `rfcomm_rx_pending` move UIH frames on the
-  open DLC (C/R 0 — responder), and `pump::close_rfcomm_dlc`
+  open DLC (C/R follows the DLC side: 1 for an initiator-opened
+  DLC, 0 for a responder-opened one), and `pump::close_rfcomm_dlc`
   sends DISC and forgets the DLC (the mux survives). Claims are
   (handle, local CID, DLCI) and are released at every
   channel-removal site, so a reused CID is never shadowed. The
   pump publishes `narf_filesystem::bluetooth::publish_bt_channel_event`
   when a Generic channel opens or data lands on a
   socket-claimable channel, so parked poll/accept waiters re-run
-  their readiness scan. Out of scope here: `connect()` (no
-  outbound channel-open client — #889), SCO (#817), fixed-CID
+  their readiness scan. Outbound opens (#1532):
+  `pump::connect` / `connect_ready` / `cancel_connect` (registered
+  as the filesystem broker's `bt_connect` / `bt_connect_ready` /
+  `bt_cancel_connect`) start-or-poll an outbound LE CoC, BR/EDR
+  Connection Request, or RFCOMM SABM/DLC open: the first call
+  starts the open and reports Pending, a later call completes it
+  (Open / OpenRfcomm) or reports the terminal Refused / Failed
+  outcome; cancelling drops the record and tears down any
+  half-opened channel. Out of scope here: SCO (#817), fixed-CID
   sockets (ATT/SMP/signalling stay routed to the pump's own
   server/responder), and SDP-channel sockets (service-owned).
 - `pm` — per-controller power-management state (issue #820). Three

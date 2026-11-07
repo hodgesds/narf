@@ -215,6 +215,14 @@ pub fn register_initcalls() {
             crate::pump::rfcomm_rx_pending,
             crate::pump::close_rfcomm_dlc,
         );
+        // Stage: install the outbound-connect handlers (issue
+        // #1532) so AF_BLUETOOTH connect() reaches the pump's
+        // L2CAP/RFCOMM channel-open client.
+        narf_filesystem::bluetooth::install_bt_connect_handlers(
+            crate::pump::connect,
+            crate::pump::connect_ready,
+            crate::pump::cancel_connect,
+        );
         InitResult::Ok
     });
 }
