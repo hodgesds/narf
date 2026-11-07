@@ -16,4 +16,16 @@ with `SdhciBlockDevice` implementing `BlockDeviceSync` for the block
 layer and `src/sdhci/fixture_tests.rs` holding the fixtures. The crate
 is dual-build (built-in or loadable `.ko`, `src/module_probe.rs`).
 
+Card detect (#836): an empty slot at probe installs the controller
+with no card known instead of failing probe, and a Stage::Late poll
+task (`spawn_card_poll_task`, 500 ms cadence — no IRQ handler is
+registered, as in RTSX) reconciles the Present State card level with
+the known card: identify-on-insert, teardown-on-remove (block devices
+`sdhci0` + `sdhci0p<N>` withdrawn, CMD/DAT lines reset). The Card
+Insertion / Removal interrupt status bits (SDHCI 3.00 §2.2.18) are
+enabled and acknowledged, but the Present State level is
+authoritative — a command's blanket NIS clear can wipe an edge before
+the poller sees it. The controller itself is never uninstalled: only
+the card state toggles, so the install-once address invariant holds.
+
 - Spec: [`../specification/spec.md`](../specification/spec.md)
