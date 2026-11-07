@@ -1142,8 +1142,19 @@ fn smoke_ahci_two_hba_irq_completion() -> TestResult {
     // Cookie = the fake ABAR's address: `FakeAhciMmio`'s only
     // field is its backing store, so the struct address is the
     // ABAR base the production ISR dereferences.
-    let base_a = &*hba_a.0.borrow() as *const FakeAhciMmio as u64;
-    let base_b = &*hba_b.0.borrow() as *const FakeAhciMmio as u64;
+    //
+    // NOTE: `RefCell::as_ptr`, NOT `&*borrow() as *const _`: a
+    // borrow taken through an `as` cast is lifetime-extended to
+    // the end of this block, so the shared borrow would still be
+    // live when the routing half takes `borrow_mut()` in
+    // `raise_irq` and panics `RefCell already borrowed` (CI run
+    // 42339048990). `as_ptr` takes no borrow, so the routing
+    // half may borrow freely; the fakes are owned by locals
+    // that outlive the handlers, so the pointers stay valid.
+    // `as_ptr` yields the value's address, identical to the
+    // `&*borrow()` address it replaces (verified on host).
+    let base_a = hba_a.0.as_ptr() as u64;
+    let base_b = hba_b.0.as_ptr() as u64;
     narf_interrupts::dispatch::install_handler_named(v_a, "ahci", base_a, ahci_isr);
     narf_interrupts::dispatch::install_handler_named(v_b, "ahci", base_b, ahci_isr);
 
