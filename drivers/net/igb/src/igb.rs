@@ -3679,16 +3679,18 @@ impl crate::HwNic for IgbNic {
 // MSI-X. A handshake that never reflects leaves the device
 // suspended.
 mod pm {
+    use super::mtu;
     use super::vmdq;
     use super::{
         ivar0_shared_vector, ivar_misc_shared_vector, queue_enable_reflected, queue_enable_word,
-        queue_regs, wus_clear_word, MmioRegion, WolSuspendProgram, CTRL_ADVD3WUC, EITR_CNT_IGNR,
-        EITR_START, GPIE_EIAME, GPIE_MULTIPLE_MSIX, GPIE_NSICR, GPIE_PBA, IMS_DEFAULT, IMS_VMMB,
-        MDIC_OP_WRITE, MDIC_PHY_ADDR, MDIC_READY, MSIX_VECTOR0_MASK, PHY_BMCR, PHY_BMCR_ANENABLE,
-        PHY_BMCR_ANRESTART, PHY_BMCR_PWRDOWN, RCTL_BAM, RCTL_BSIZE_2K, RCTL_EN, RCTL_MPE,
-        RCTL_SECRC, RCTL_SUSPEND_ARMED, RCTL_SUSPEND_OFF, RCTL_UPE, REG_CTRL, REG_EIAC, REG_EIAM,
-        REG_EIMC, REG_EIMS, REG_EITR0, REG_GPIE, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC,
-        REG_MDIC, REG_RCTL, REG_TCTL, REG_WUC, REG_WUFC, REG_WUS, TCTL_EN, TCTL_PSP,
+        queue_regs, rctl_bsize, wus_clear_word, MmioRegion, WolSuspendProgram, CTRL_ADVD3WUC,
+        EITR_CNT_IGNR, EITR_START, GPIE_EIAME, GPIE_MULTIPLE_MSIX, GPIE_NSICR, GPIE_PBA,
+        IMS_DEFAULT, IMS_VMMB, MDIC_OP_WRITE, MDIC_PHY_ADDR, MDIC_READY, MSIX_VECTOR0_MASK,
+        PHY_BMCR, PHY_BMCR_ANENABLE, PHY_BMCR_ANRESTART, PHY_BMCR_PWRDOWN, RCTL_BAM, RCTL_BSIZE_2K,
+        RCTL_EN, RCTL_MPE, RCTL_SECRC, RCTL_SUSPEND_ARMED, RCTL_SUSPEND_OFF, RCTL_UPE, REG_CTRL,
+        REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS, REG_EITR0, REG_GPIE, REG_IMC, REG_IMS, REG_IVAR0,
+        REG_IVAR_MISC, REG_MDIC, REG_RCTL, REG_RLPML, REG_TCTL, REG_WUC, REG_WUFC, REG_WUS,
+        SRRCTL_BSIZEPKT_MASK, SRRCTL_DESCTYPE_ADV_ONEBUF, SRRCTL_DESCTYPE_MASK, TCTL_EN, TCTL_PSP,
         TCTL_SUSPEND_OFF,
     };
 
@@ -5461,6 +5463,7 @@ mod tests {
                 tx_state: IrqSafeSpinLock::new(TxRingCursor::new()),
                 vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
                 device_id: IGB_I210_COPPER,
+                mtu: IrqSafeSpinLock::new(mtu::STD_MTU),
                 vt: IrqSafeSpinLock::new(None),
                 stats: IgbStats::default(),
                 wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
@@ -5472,6 +5475,13 @@ mod tests {
                 ready: true,
                 _msix: None,
                 irq_vector: None,
+                // Fixture-owned MMIO backing is this instance's address;
+                // no second fixture shares it, so the probe-time
+                // duplicate-bind refusal can never fire here.
+                addr: narf_bus::BusAddr::Mmio(mem.phys_addr()),
+                ifname: crate::publish::IfName::new(),
+                lsc_pending: AtomicBool::new(false),
+                mb_pending: AtomicBool::new(false),
                 rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
                 tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
             };
