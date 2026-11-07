@@ -419,8 +419,12 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
         if ctrl.bring_up(&dev_cap).is_err() {
             return TestResult::Fail("Controller::bring_up failed");
         }
-        if ctrl.create_io_queue().is_err() {
-            return TestResult::Fail("Controller::create_io_queue failed");
+        // Preferred queue setup (#928): negotiate + MSI-X pairs,
+        // falling back to the single polled pair. Either way the
+        // block-layer I/O below runs through the routed submission
+        // path (`nvm_io_dma` → IRQ when a vector exists).
+        if ctrl.create_io_queues_preferred(&dev_cap).is_err() {
+            return TestResult::Fail("Controller::create_io_queues_preferred failed");
         }
         // `install_controller` leaks the previous slot rather than
         // dropping it, so any reference an I/O path might still hold
@@ -720,6 +724,343 @@ fn smoke_nvme_multi_queue_granted() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_multi_queue_granted);
+
+fn smoke_nvme_probe_wires_msix_irq_datapath() -> TestResult {
+    // Probe-equivalent composition (#928): bring_up +
+    // create_io_queues_preferred, then production I/O through
+    // read_lba / write_lba must complete via the IRQ path — MSI
+    // fire_count advances on the queues' vectors — and round-robin
+    // must spread submissions across queues when more than one pair
+    // was granted. The polled path stays covered by the
+    // create_io_queue smokes.
+    use super::Controller;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let nvme_dev = devices()
+        .iter()
+        .find(|d| {
+            matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+        })
+        .copied();
+    let Some(dev) = nvme_dev else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    let granted = match ctrl.create_io_queues_preferred(&dev_cap) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("create_io_queues_preferred failed"),
+    };
+    if granted == 0 || ctrl.io_queue_count() != granted {
+        return TestResult::Fail("io_queue_count() != granted");
+    }
+    if ctrl.io_irq_vectors().len() != granted {
+        return TestResult::Fail("expected one IRQ vector per granted queue pair");
+    }
+    let vectors: [u8; 8] = {
+        let mut v = [0u8; 8];
+        v[..granted].copy_from_slice(ctrl.io_irq_vectors());
+        v
+    };
+    // SAFETY: APIC is initialised; MSI lands in our IDT vectors.
+    unsafe {
+        narf_arch::enable_interrupts();
+    }
+    let mut baseline = [0u64; 8];
+    for (i, v) in vectors.iter().enumerate().take(granted) {
+        baseline[i] = narf_interrupts::fire_count(*v);
+    }
+    let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent failed"),
+    };
+    let phys = buf.dma_addr().raw();
+    // Eight write+read round trips through the production
+    // read_lba/write_lba path: 16 submissions, round-robin across
+    // the granted queues.
+    for round in 0..8u8 {
+        // SAFETY: identity-mapped DMA page.
+        unsafe {
+            for i in 0..512usize {
+                core::ptr::write_volatile(
+                    (narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>()).add(i),
+                    (i as u8).wrapping_mul(7).wrapping_add(round),
+                );
+            }
+        }
+        if ctrl.write_lba(1, 1, &buf).is_err() {
+            return TestResult::Fail("write_lba via IRQ path failed");
+        }
+        // SAFETY: same.
+        unsafe {
+            for i in 0..4096usize {
+                core::ptr::write_volatile(
+                    (narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>()).add(i),
+                    0,
+                );
+            }
+        }
+        if ctrl.read_lba(1, 1, &buf).is_err() {
+            return TestResult::Fail("read_lba via IRQ path failed");
+        }
+        for i in 0..512usize {
+            // SAFETY: `phys` is the live identity-mapped 4-KiB DMA page from
+            // `alloc_coherent`; `i < 512` stays well within the page.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            let v = unsafe {
+                core::ptr::read_volatile(
+                    (narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>()).add(i),
+                )
+            };
+            if v != (i as u8).wrapping_mul(7).wrapping_add(round) {
+                return TestResult::Fail("IRQ-path read-back pattern mismatch");
+            }
+        }
+    }
+    let mut advanced = 0usize;
+    for (i, v) in vectors.iter().enumerate().take(granted) {
+        if narf_interrupts::fire_count(*v) > baseline[i] {
+            advanced += 1;
+        }
+    }
+    // SAFETY: counterpart to the enable_interrupts above.
+    unsafe {
+        narf_arch::disable_interrupts();
+    }
+    if advanced == 0 {
+        return TestResult::Fail("no IRQ vector saw an MSI delivery on the IRQ path");
+    }
+    if granted >= 2 && advanced < 2 {
+        return TestResult::Fail("round-robin did not spread I/O across queues");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_probe_wires_msix_irq_datapath);
+
+fn smoke_nvme_submit_io_irq_async_round_trip() -> TestResult {
+    // Await `submit_io_irq_async` from a sync test context via a
+    // manual poll loop (same no-op-waker shape as the block-device
+    // async smoke): the future parks on `wait_for_irq` and resolves
+    // when the MSI lands — no `block_on`, no executor needed. The
+    // begin/await/finish split is what makes this possible without
+    // holding any lock across the await.
+    use super::{Controller, IoOpcode};
+    use core::future::Future;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let nvme_dev = devices()
+        .iter()
+        .find(|d| {
+            matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+        })
+        .copied();
+    let Some(dev) = nvme_dev else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    if ctrl.create_io_queues_msix(&dev_cap, 1).is_err() {
+        return TestResult::Fail("create_io_queues_msix failed");
+    }
+    // SAFETY: APIC is initialised; MSI lands in our IDT vector.
+    unsafe {
+        narf_arch::enable_interrupts();
+    }
+    let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent failed"),
+    };
+    let phys = buf.dma_addr().raw();
+    // SAFETY: identity-mapped DMA page.
+    unsafe {
+        for i in 0..512usize {
+            core::ptr::write_volatile(
+                (narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>()).add(i),
+                (i as u8).wrapping_mul(11),
+            );
+        }
+    }
+    // Poll a future to completion, bounded at 5 s. The no-op waker
+    // never wakes us — each poll re-checks `fire_count`, so the MSI
+    // resolves the wait on the next poll after delivery.
+    fn poll_until<F: Future>(f: F) -> Option<F::Output> {
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        unsafe fn no_op(_: *const ()) {}
+        const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+        // SAFETY: vtable holds null-pointer-clean stubs.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
+        let mut ctx = Context::from_waker(&waker);
+        let mut pinned = core::pin::pin!(f);
+        let deadline = narf_time::Deadline::after_ms(5_000);
+        loop {
+            match pinned.as_mut().poll(&mut ctx) {
+                Poll::Ready(v) => return Some(v),
+                Poll::Pending => {
+                    if deadline.expired() {
+                        return None;
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+    let r = poll_until(ctrl.submit_io_irq_async(IoOpcode::Write as u8, 1, 1, &buf));
+    let Some(r) = r else {
+        return TestResult::Fail("submit_io_irq_async(Write) never resolved");
+    };
+    if r.is_err() {
+        return TestResult::Fail("submit_io_irq_async(Write) failed");
+    }
+    // SAFETY: same identity-mapped DMA page.
+    unsafe {
+        for i in 0..4096usize {
+            core::ptr::write_volatile(
+                (narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>()).add(i),
+                0,
+            );
+        }
+    }
+    let r = poll_until(ctrl.submit_io_irq_async(IoOpcode::Read as u8, 1, 1, &buf));
+    let Some(r) = r else {
+        return TestResult::Fail("submit_io_irq_async(Read) never resolved");
+    };
+    if r.is_err() {
+        return TestResult::Fail("submit_io_irq_async(Read) failed");
+    }
+    for i in 0..512usize {
+        // SAFETY: `phys` is the live identity-mapped 4-KiB DMA page from
+        // `alloc_coherent`; `i < 512` stays well within the page.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let v = unsafe {
+            core::ptr::read_volatile((narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>()).add(i))
+        };
+        if v != (i as u8).wrapping_mul(11) {
+            return TestResult::Fail("async IRQ read-back pattern mismatch");
+        }
+    }
+    // SAFETY: counterpart to the enable_interrupts above.
+    unsafe {
+        narf_arch::disable_interrupts();
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_submit_io_irq_async_round_trip);
+
+fn smoke_nvme_aer_event_decode_unit() -> TestResult {
+    // Pure decoder check, no device needed: the AER completion word
+    // (CQE cmd_specific, NVMe Base Spec 2.0c §5.2 CDW0 layout) is a
+    // namespace-change event only for type Notice (0x02) with
+    // information Namespace Attribute Changed (0x00). The values
+    // come from the spec table + Linux `NVME_AER_NOTICE_NS_CHANGED`,
+    // not from the driver's own constants.
+    use super::admin::async_event_is_ns_change;
+    // type 2, info 0x00 → rescan.
+    if !async_event_is_ns_change(0x0000_0002) {
+        return TestResult::Fail("Notice + NS-attribute-changed should trigger a rescan");
+    }
+    // Log-page byte must not affect the decode.
+    if !async_event_is_ns_change(0x0200_0002) {
+        return TestResult::Fail("log-page byte should not affect the decode");
+    }
+    // Same type, firmware-activation info (0x01) → no rescan.
+    if async_event_is_ns_change(0x0000_0102) {
+        return TestResult::Fail("Notice + firmware activation should not trigger a rescan");
+    }
+    // Same type, telemetry-log-changed info (0x02) → no rescan.
+    if async_event_is_ns_change(0x0000_0202) {
+        return TestResult::Fail("Notice + telemetry change should not trigger a rescan");
+    }
+    // SMART / Health status (0x01) with info 0x00 → no rescan.
+    if async_event_is_ns_change(0x0000_0001) {
+        return TestResult::Fail("SMART event should not trigger a rescan");
+    }
+    // Error status (0x00) → no rescan.
+    if async_event_is_ns_change(0x0000_0000) {
+        return TestResult::Fail("error event should not trigger a rescan");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_aer_event_decode_unit);
+
+fn smoke_nvme_rescan_no_change_qemu() -> TestResult {
+    // Rescan against the static QEMU controller: no namespace
+    // change is possible without a hot-attach, so the rescan must
+    // report `Ok(false)` and leave the registered set untouched.
+    // (A live namespace-change event cannot be synthesised on
+    // QEMU from the harness — no QMP — so the event→rescan wiring
+    // is covered by the decode unit test + the supervisor path;
+    // this pins the no-change half + the scan itself.)
+    use super::Controller;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let nvme_dev = devices()
+        .iter()
+        .find(|d| {
+            matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+        })
+        .copied();
+    let Some(dev) = nvme_dev else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    let before = ctrl.namespaces().len();
+    match ctrl.rescan_namespaces() {
+        Ok(false) => {}
+        Ok(true) => {
+            return TestResult::Fail("rescan reported a change on a static QEMU controller");
+        }
+        Err(_) => return TestResult::Fail("rescan_namespaces failed"),
+    }
+    if ctrl.namespaces().len() != before {
+        return TestResult::Fail("rescan changed the namespace set without reporting it");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_rescan_no_change_qemu);
 
 fn smoke_nvme_pick_queue_round_robins() -> TestResult {
     // Unit-style validator for `pick_queue`'s round-robin: build a
@@ -1437,23 +1778,24 @@ fn smoke_admin_get_set_features_power_qemu() -> TestResult {
 kernel_test_in!("drivers/nvme", smoke_admin_get_set_features_power_qemu);
 
 fn smoke_admin_aer_post_qemu() -> TestResult {
-    // End-to-end: bring up and post 4 AER commands into the admin queue.
-    // The count 4 comes from the NVMe Base Spec 2.0c §5.2 floor — hosts
-    // SHOULD keep at least AERL+1 AER requests outstanding, and the
-    // spec-recommended floor is ≥4 — never from the driver's own
-    // ADMIN_Q_DEPTH constant. The fixture proves the admin queue holds
-    // all 4 at once by asserting the SQ occupancy rises by exactly 4;
-    // on the old depth-4 queue the post cap (depth - 1 = 3) would have
-    // silently posted only 3.
+    // End-to-end: bring-up posts the AERs itself (#928) — 3 outstanding —
+    // and the controller stays coherent with them outstanding: the admin
+    // queue's CID-aware submit must not mistake a (future) AER
+    // completion for an admin command's CQE.
     //
-    // The QEMU NVMe emulation does not fire async events, but it caps
-    // accepted AERs below the spec floor (reports AERL=0, accepts up to
-    // 3, completes a 4th with "Cmd Limit Exceeded"), so the controller
-    // may land a stray error completion in the admin CQ. Coherence is
-    // therefore checked on the I/O path (`read_lba`, whose CQ is
-    // separate) rather than with another admin command: on main there
-    // is no CID-matched completion tracking (#1619), so an admin
-    // submit could consume the stray AER completion as its own.
+    // NVMe Base Spec 2.0c §5.2: hosts SHOULD keep at least AERL+1
+    // AER requests outstanding, and the spec-recommended floor is ≥4.
+    // QEMU reports AERL=0 yet accepts up to 3 before returning "Cmd
+    // Limit Exceeded" on the 4th, so the controller may land a stray
+    // error completion in the admin CQ. The fixture proves the admin
+    // queue holds 4 more AERs at once by asserting the SQ occupancy
+    // rises by exactly 4 after posting them on top of bring-up's 3;
+    // coherence is then checked on the I/O path (`read_lba`, whose CQ
+    // is separate) as well as on the admin path (IDENTIFY through the
+    // CID-aware submit). The QEMU NVMe emulation does not fire async
+    // events, so the drain stays empty with only bring-up's 3
+    // outstanding; the rescan-on-event half is covered by
+    // `smoke_nvme_rescan_no_change_qemu` + the decode unit test below.
     use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
@@ -1482,11 +1824,17 @@ fn smoke_admin_aer_post_qemu() -> TestResult {
     if ctrl.bring_up(&dev_cap).is_err() {
         return TestResult::Fail("bring_up failed");
     }
+    // Bring-up posted the AERs: 3 outstanding (QEMU accepts 3,
+    // rejects the 4th — posting one more here would be the 4th).
+    if ctrl.aer_outstanding() != 3 {
+        return TestResult::Fail("bring_up should post 3 AERs");
+    }
     if ctrl.create_io_queue().is_err() {
         return TestResult::Fail("create_io_queue failed");
     }
-    // Bring-up sanity on the admin path while the CQ is still clean
-    // (no AERs posted yet): IDENTIFY must complete.
+    // Bring-up sanity on the admin path with the AERs outstanding
+    // (uncompleted, so no AER CQE sits at the CQ head): IDENTIFY must
+    // complete through the CID-aware submit.
     match ctrl.identify_namespace_typed(1) {
         Ok(ns) => {
             if ns.nsze == 0 {
@@ -1495,7 +1843,16 @@ fn smoke_admin_aer_post_qemu() -> TestResult {
         }
         Err(_) => return TestResult::Fail("identify_namespace_typed failed after bring-up"),
     }
-    // Spec §5.2 floor: 4 AERs outstanding at once.
+    // No event fired: the drain stays empty and the AER count is
+    // unchanged (drain + repost is net-zero).
+    if ctrl.drain_aer() != 0 {
+        return TestResult::Fail("drain_aer returned non-zero with no events");
+    }
+    if ctrl.aer_outstanding() != 3 {
+        return TestResult::Fail("AER count changed across an empty drain");
+    }
+    // Spec §5.2 floor: 4 more AERs outstanding at once, on top of
+    // bring-up's 3.
     let before = ctrl.admin_sq_occupancy();
     if ctrl.post_aer_commands(4).is_err() {
         return TestResult::Fail("post_aer_commands failed");
@@ -1504,14 +1861,14 @@ fn smoke_admin_aer_post_qemu() -> TestResult {
     if after != before + 4 {
         return TestResult::Fail("admin SQ occupancy did not rise by 4 after posting 4 AERs");
     }
-    // The controller remains functional with 4 AERs outstanding —
+    // The controller remains functional with 7 AERs outstanding —
     // verify on the I/O path (separate CQ, see header comment).
     let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
         Ok(b) => b,
         Err(_) => return TestResult::Fail("alloc_coherent failed"),
     };
     if ctrl.read_lba(0, 1, &buf).is_err() {
-        return TestResult::Fail("read_lba failed with 4 AERs outstanding");
+        return TestResult::Fail("read_lba failed with 7 AERs outstanding");
     }
     // Best-effort tidy-up: consume any surplus-AER error completion
     // QEMU landed in the admin CQ. No assertion on the drained count —

@@ -145,11 +145,48 @@ multipath / fabrics (defer).
   Flush every namespace + CC.SHN (the shutdown path), queue teardown and
   CC.EN clear (Linux `nvme_suspend` = `nvme_dev_disable(shutdown = true)`).
   `resume` (`Controller::resume_pm`) is a full re-init — `bring_up` +
-  `create_io_queue` (Linux `nvme_resume` = controller reset) — followed by
+  `create_io_queues_preferred` (Linux `nvme_resume` = controller reset) — followed by
   an identity re-check against the pre-suspend snapshot (Identify
   serial/model/NN + the registered namespace set; the firmware revision is
   not compared). A mismatch leaves the controller torn down and fails the
   resume rather than serving a different disk under the old registrations.
+- **Interrupt / multi-queue datapath + AER** (#928). Probe runs
+  `Controller::create_io_queues_preferred`: Set Features — Number of
+  Queues (FID 0x07, NVMe Base Spec 2.0c §5.27) + per-queue MSI-X pairs
+  (`create_io_queues_msix`), falling back to the single polled pair
+  (`create_io_queue`) only when MSI-X is unavailable or the negotiation
+  is refused before any queue was created (`NvmeError::Msix` is the
+  contract for "nothing created yet"; any other error stops the
+  controller instead). MSI-X entry 0 stays the admin queue's (Linux
+  `nvme_create_cq`: `vector = num_vecs == 1 ? 0 : qid`); I/O queues
+  use entries `1..=granted` with `IV = qid`, `IEN = 1`, one IDT
+  vector + installed handler each. Production submissions
+  (`nvm_io_dma`, `nvm_io_multipage`, hence every block-layer read /
+  write) route through `submit_sqe_irq` — IRQ-driven wait on the
+  queue's vector `fire_count` with a CQE-phase fallback, 5 s budget
+  — whenever the picked queue has a vector; the polled
+  `Queue::submit` stays the fallback for vector-less boots.
+  `submit_io_irq_async` is the async form, composed from
+  `submit_io_begin` (SQE + doorbell, wait future constructed
+  pre-doorbell) + await + `submit_io_finish` (CQE drain); the split
+  lets a caller release the slot gate across the await — no
+  `IrqSafeSpinLock` is ever held across a suspension point and no
+  `block_on` appears on this path. The composed async form still
+  holds the slot gate (an atomic, IRQs live) across the await, so
+  one async I/O is in flight per controller until CID-matched
+  completion tracking lands. Bring-up enables Async Event
+  Configuration (SMART/health + namespace-attribute-changed, FID
+  0x0B) and posts 3 AERs (§5.2 recommends ≥4; the depth-8 admin
+  queue could host 7 — see §8.4 — but QEMU accepts only 3 before
+  returning "Cmd Limit Exceeded" on the 4th, so 3 is the posted
+  count — see §10). The admin
+  submit path is CID-aware: a stray AER completion at the CQ head
+  is stashed (`Queue::stray_aer`) for `drain_aer_events`, never
+  mistaken for the awaited command's CQE. A Stage::Late supervisor
+  task parks on each instance's admin vector (250 ms deadline) and
+  drains AERs; a namespace-attribute-changed Notice triggers
+  `Controller::rescan_namespaces` + withdraw/re-publish of the
+  block devices, the same pair `recover_slot` uses after a reset.
 - `/dev/nvme<C>`: one controller node per instance
   (`narf_filesystem::devfs::register_nvme_controller(instance, node,
   namespaces)`); `NVME_IOCTL_IO_CMD` / `NVME_IOCTL_IO64_CMD` are refused
@@ -310,4 +347,18 @@ NVMe-specific public API beyond that.
 
 ## 10. Open questions
 
-(none — all v0.1 questions resolved in §8)
+- **AER posted count vs §5.2 floor (#928 remainder).** Bring-up
+  posts 3 AERs (`AER_POST_COUNT`); NVMe Base Spec 2.0c §5.2
+  recommends ≥4 outstanding. The admin-depth half is resolved:
+  #1618 raised `ADMIN_Q_DEPTH` to 8 (§8.4), so the queue could
+  host 7. The count stays 3 because QEMU reports AERL=0 yet
+  accepts only 3 and returns "Cmd Limit Exceeded" on the 4th;
+  raising the posted count toward `depth - 1` is a follow-up for
+  silicon that accepts more.
+- **Concurrent async I/O (#928 remainder).** `submit_io_irq_async`
+  holds the slot gate across its await (sound — the gate is an
+  atomic, IRQs live — but one async I/O in flight per controller).
+  True concurrency needs CID-matched completion tracking so
+  several async submitters can share one queue; until then the
+  async block-layer submit stays eager-sync through the sync IRQ
+  path.
