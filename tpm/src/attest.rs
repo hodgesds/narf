@@ -490,8 +490,15 @@ pub fn verify_quote(
 //   has any measurement been extended this boot? The quote
 //   composition refuses to quote an untouched PCR set — an empty
 //   history signed as if it were a measured boot.
+// - `firmware_replay_mismatch` — `frame::measure`'s sticky flag:
+//   did the PCR 0–7 read-back cross-check prove the replayed
+//   firmware shadow disagrees with hardware? The quote composition
+//   refuses quotes over PCRs 0–7 while this is set (#1071) — a
+//   quote over a shadow the hardware contradicts would attest a
+//   chain that never ran.
 //
-// Uninstalled hooks fail closed: no extends observed, empty log.
+// Uninstalled hooks fail closed: no extends observed, empty log,
+// no mismatch.
 
 /// The measurement probes `frame::measure` installs at measured
 /// boot (plain function pointers: the probes are pure reads of
@@ -500,6 +507,7 @@ pub fn verify_quote(
 pub struct MeasurementHooks {
     pub event_log: fn() -> Vec<u8>,
     pub extends_observed: fn() -> bool,
+    pub firmware_replay_mismatch: fn() -> bool,
 }
 
 static MEASUREMENT_HOOKS: IrqSafeSpinLock<Option<MeasurementHooks>> = IrqSafeSpinLock::new(None);
@@ -525,6 +533,17 @@ pub fn event_log_bytes() -> Vec<u8> {
 pub fn extends_observed() -> bool {
     match *MEASUREMENT_HOOKS.lock() {
         Some(hooks) => (hooks.extends_observed)(),
+        None => false,
+    }
+}
+
+/// Whether the firmware replay has been proven to disagree with
+/// the hardware PCRs 0–7, per the installed hook. Fails closed:
+/// `false` when uninstalled (no cross-check has proven a
+/// mismatch, so there is nothing to refuse on).
+pub fn firmware_replay_mismatch() -> bool {
+    match *MEASUREMENT_HOOKS.lock() {
+        Some(hooks) => (hooks.firmware_replay_mismatch)(),
         None => false,
     }
 }

@@ -3474,6 +3474,40 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // Stage::Late initcalls: FB console + virtio-gpu splash.
             narf_init::register(narf_init::Stage::Late, "measured-boot", || {
                 narf_scheduler::spawn(async move {
+                    // Firmware TCG event-log ingest (#1071): replay
+                    // the firmware's measurements into the shadow
+                    // and the head of the log FIRST, before the
+                    // hooks publish the log and before this pass's
+                    // own extends run. A missing log is not fatal
+                    // (non-EFI boot, or firmware that does not
+                    // publish one) — the cross-check below surfaces
+                    // the resulting gap instead of assuming a log
+                    // exists; a malformed log fails closed (nothing
+                    // replayed) and is reported.
+                    match measure::ingest_firmware_event_log() {
+                        Ok(ingest) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  measured-boot: firmware event log ingested: {} main + {} final events{}",
+                                ingest.main_events,
+                                ingest.final_events,
+                                if ingest.full_chain { " (full chain)" } else { " (final-events only)" }
+                            );
+                        }
+                        Err(measure::FirmwareIngestError::NoFirmwareLog) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  measured-boot: no firmware event log published (non-EFI or no TCG2 table)"
+                            );
+                        }
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  measured-boot: firmware event log ingest failed: {:?}",
+                                e
+                            );
+                        }
+                    }
                     // Attestation hooks (#945): publish the
                     // measurement log + extend-observed flag to
                     // `narf_tpm::attest` before this pass's own
@@ -3592,6 +3626,48 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 e
                             );
                         }
+                    }
+
+                    // PCR 0–7 read-back cross-check (#1071): compare
+                    // the replayed shadow against the hardware PCRs
+                    // and report the outcome before the summary. A
+                    // mismatch is a WARNING, not a silent gap — the
+                    // quote composition refuses quotes over PCRs
+                    // 0–7 while it is set.
+                    if measure::hardware_dispatch_active() {
+                        let check = measure::cross_check_pcrs_0_7().await;
+                        if check.checked {
+                            if check.mismatched.iter().any(|&m| m) {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  measured-boot: WARNING firmware replay mismatch — quotes over PCRs 0-7 refused"
+                                );
+                                for (i, &m) in check.mismatched.iter().enumerate() {
+                                    if m {
+                                        let _ = writeln!(
+                                            console::Writer,
+                                            "    PCR {} disagrees with hardware",
+                                            i
+                                        );
+                                    }
+                                }
+                            } else {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  measured-boot: firmware replay matches hardware PCRs 0-7"
+                                );
+                            }
+                        } else if check.read_failed {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  measured-boot: PCR 0-7 cross-check inconclusive (PCR read failed)"
+                            );
+                        }
+                    } else {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  measured-boot: PCR 0-7 cross-check not run (no TPM registered)"
+                        );
                     }
 
                     // Log completion. Report the actual dispatch

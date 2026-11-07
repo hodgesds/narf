@@ -54,6 +54,18 @@ pub struct FirmwareHandoff {
     pub smbios_entry: Option<SmbiosEntryCopy>,  // first tag 13 starting "_SM_"
 }
 pub fn firmware_handoff() -> FirmwareHandoff;   // EMPTY on PVH / aarch64 / before parse_raw
+
+// EFI configuration-table lookup for the firmware TPM event logs
+// (#1071). The table walk is generic over the GUID; the TCG2
+// pair is surfaced together:
+pub struct Tcg2LogTables {
+    pub main_log: Option<u64>,     // LINUX_EFI_TPM_EVENT_LOG_GUID
+    pub final_events: Option<u64>, // EFI_TCG2_FINAL_EVENTS_TABLE_GUID
+}
+pub fn find_efi_config_table(efi_system_table: u64, guid: &[u8; 16],
+                             read: &dyn Fn(u64, &mut [u8]) -> bool) -> Option<u64>;
+pub fn tcg2_log_tables(efi_system_table: u64,
+                       read: &dyn Fn(u64, &mut [u8]) -> bool) -> Tcg2LogTables;
 ```
 
 Multiboot2 tag 13's payload is `u8 major, u8 minor, u8 reserved[6]`
