@@ -741,6 +741,10 @@ fn pixelfmt_fourcc(p: crate::uvc::PixelFmt) -> Option<(u32, &'static str, bool)>
         PixelFmt::Nv12 => (V4L2_PIX_FMT_NV12, "NV12 4:2:0", false),
         PixelFmt::Mjpeg => (V4L2_PIX_FMT_MJPEG, "Motion-JPEG", true),
         PixelFmt::FrameBased => (fourcc(b'H', b'2', b'6', b'4'), "H.264", true),
+        // Stream-based transports have no V4L2 fourcc: their segment
+        // size is negotiated, not described by frame modes, so they
+        // are not offered for STREAMON selection (#1334 remainder).
+        PixelFmt::StreamBased => return None,
         PixelFmt::Unknown => return None,
     })
 }

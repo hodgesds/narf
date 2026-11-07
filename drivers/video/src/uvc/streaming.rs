@@ -10,10 +10,10 @@
 //! building `uvc_streaming::formats[]`.
 
 use super::descriptor::{
-    DescError, FormatFrameBased, FormatMjpeg, FormatUncompressed, FrameFrameBased, FrameMjpeg,
-    FrameUncompressed, CS_INTERFACE, GUID_FORMAT_NV12, GUID_FORMAT_YUY2, VS_FORMAT_FRAME_BASED,
-    VS_FORMAT_MJPEG, VS_FORMAT_UNCOMPRESSED, VS_FRAME_FRAME_BASED, VS_FRAME_MJPEG,
-    VS_FRAME_UNCOMPRESSED,
+    DescError, FormatFrameBased, FormatMjpeg, FormatStreamBased, FormatUncompressed,
+    FrameFrameBased, FrameMjpeg, FrameUncompressed, CS_INTERFACE, GUID_FORMAT_NV12,
+    GUID_FORMAT_YUY2, VS_FORMAT_FRAME_BASED, VS_FORMAT_MJPEG, VS_FORMAT_STREAM_BASED,
+    VS_FORMAT_UNCOMPRESSED, VS_FRAME_FRAME_BASED, VS_FRAME_MJPEG, VS_FRAME_UNCOMPRESSED,
 };
 use alloc::vec::Vec;
 
@@ -31,6 +31,11 @@ pub enum PixelFmt {
     Nv12,
     /// Frame-based compressed (H.264, H.265). Passthrough.
     FrameBased,
+    /// Stream-based transport (e.g. MPEG-2 TS, `VS_FORMAT_STREAM_BASED`).
+    /// Passthrough: segment boundaries are in-band, so frame size comes
+    /// from Probe/Commit `dwMaxVideoFrameSize`, not frame descriptors —
+    /// a stream-based format has no frame modes.
+    StreamBased,
     /// Unrecognised GUID.
     Unknown,
 }
@@ -274,6 +279,23 @@ pub fn parse_streaming_descriptors(blob: &[u8]) -> Result<Vec<StreamFormat>, Str
                     if let Some(fmt) = formats.last_mut() {
                         fmt.frames.push(mode);
                     }
+                }
+            }
+            VS_FORMAT_STREAM_BASED => {
+                if let Ok(f) = FormatStreamBased::parse(slice) {
+                    // Stream-based formats have no frame descriptors:
+                    // the frame/segment size is negotiated in
+                    // Probe/Commit, so `frames` stays empty and
+                    // `default_frame_index` is 0 (never a valid,
+                    // 1-based frame index). `packet_length` is recorded
+                    // on the parsed descriptor; the reassembler needs
+                    // only the negotiated max segment size, not it.
+                    formats.push(StreamFormat {
+                        format_index: f.format_index,
+                        pixel_fmt: PixelFmt::StreamBased,
+                        default_frame_index: 0,
+                        frames: Vec::new(),
+                    });
                 }
             }
             _ => { /* VS_INPUT_HEADER, VS_OUTPUT_HEADER, colorimetry — skip */ }

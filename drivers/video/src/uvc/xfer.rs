@@ -13,7 +13,7 @@
 //! in-flight transfers mirrors the value of `UVC_URBS` = 5 in the
 //! Linux driver.
 
-use super::payload::{FrameReassembler, PushResult};
+use super::payload::{FrameReassembler, PushResult, ReassemblyConfig};
 use alloc::vec::Vec;
 
 // ── Transfer constants ───────────────────────────────────────────────
@@ -88,14 +88,29 @@ pub struct StreamHandle {
 
 impl StreamHandle {
     /// Create a streaming handle for the given slot/DCI pair.
+    ///
+    /// Uses the legacy reassembler config (FID/EOF completion,
+    /// unbounded). Prefer [`new_with_config`](Self::new_with_config)
+    /// for negotiated streams so the reassembler completes on buffer
+    /// fullness and caps accumulation at the negotiated frame size.
     pub fn new(mode: TransferMode, slot_id: u8, dci: u8) -> Self {
+        Self::new_with_config(mode, slot_id, dci, ReassemblyConfig::default())
+    }
+
+    /// Create a streaming handle with an explicit reassembler config.
+    pub fn new_with_config(
+        mode: TransferMode,
+        slot_id: u8,
+        dci: u8,
+        config: ReassemblyConfig,
+    ) -> Self {
         let packet_buf = alloc::vec![0; ISOC_PACKET_SIZE];
         Self {
             mode,
             slot_id,
             dci,
             packet_buf,
-            reassembler: FrameReassembler::new(),
+            reassembler: FrameReassembler::with_config(config),
             frame_queue: Vec::new(),
             stats: StreamStats::default(),
         }

@@ -58,6 +58,12 @@ also consult upstream Linux GPL sources.
   (FRAME_UNCOMPRESSED).
 - **Universal Serial Bus Device Class Definition for Video Devices:
   Frame-Based Payload, Revision 1.5** — USB-IF. Public.
+- **Universal Serial Bus Device Class Definition for Video Devices:
+  Stream Based Payload, Revision 1.5** — USB-IF. Public. §2.1
+  (payload header — FID/EOF meaningful only per `bmFramingInfo`
+  D0/D1), §2.2 (packet-oriented iff `dwPacketLength` non-zero, else
+  byte-oriented; empty (micro)frames legal mid-stream), §3.1.1
+  (24-byte `VS_FORMAT_STREAM_BASED` descriptor).
 
 ### UVC payload header (1.5 §2.4.3.3)
 
@@ -757,6 +763,31 @@ also consult upstream Linux GPL sources.
   EOF completion (§2.4.3.7). BFH D4 is the payload-specific bit (not
   reserved) and is surfaced, not acted on; D5 (STI) reads as
   intra-coded for temporally-encoded streams.
+- Stream-based completion (#1334, UVC 1.5 §2.4.3.7 + §4.3.1.1 Table
+  4-47, Stream Based Payload 1.5 §2.1/§2.2/§3.1.1): stream-based
+  formats (`VS_FORMAT_STREAM_BASED`, 0x12) carry boundaries in-band,
+  so FID/EOF are optional — each bit is meaningful only when the
+  negotiated `bmFramingInfo` says so (D0 = FID required, sender
+  toggles FID at least every `dwMaxVideoFrameSize` bytes; D1 = EOF
+  may be present). Both reassemblers (`uvc::UvcFrameReassembler`,
+  mirrored by `narf-drivers-video`'s `FrameReassembler`) therefore
+  take a `ReassemblyConfig`: in stream-based mode FID/EOF are
+  honoured only per `bmFramingInfo`, and a segment completes when
+  accumulation reaches the negotiated `dwMaxVideoFrameSize` —
+  buffer-fullness completion, the fallback §2.4.3.7 names
+  explicitly. That same negotiated size caps accumulation in every
+  mode (a push past it is clamped, the frame completes at the bound,
+  excess bytes are dropped and counted), so no stream can grow the
+  buffer unbounded. The pump derives the config from the negotiated
+  control retained on the device record at activation
+  (`UvcDevice::negotiated`); a stream-based format is recognised
+  from the retained format table (`VS_FORMAT_STREAM_BASED`
+  descriptors are parsed into `PixelFmt::StreamBased` with no frame
+  modes — frame size comes from Probe/Commit). Short or empty
+  transfers are NOT boundaries: §2.2.1 allows empty (micro)frames
+  mid-stream. Not yet wired: STREAMON selection of stream-based
+  formats (no V4L2 fourcc mapping) and `bmFramingInfo` validation
+  (D1/D2 without D0 is a device error per Table 4-47).
 - GET_CUR(PROBE) version validation (#1244, 1.5 §4.3.1.1): on a
   34-byte (1.1+) response the device's preferred version must lie
   inside its own declared [min, max] range (device resets min/max

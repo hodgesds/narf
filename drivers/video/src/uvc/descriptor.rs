@@ -49,6 +49,7 @@ pub const VS_FORMAT_MJPEG: u8 = 0x06;
 pub const VS_FRAME_MJPEG: u8 = 0x07;
 pub const VS_FORMAT_FRAME_BASED: u8 = 0x10;
 pub const VS_FRAME_FRAME_BASED: u8 = 0x11;
+pub const VS_FORMAT_STREAM_BASED: u8 = 0x12;
 
 // ── Terminal type constants (UVC 1.5 §B) ────────────────────────────
 
@@ -619,6 +620,40 @@ impl FormatFrameBased {
             interlace_flags: buf[25],
             copy_protect: buf[26] != 0,
             variable_size: buf[27] != 0,
+        })
+    }
+}
+
+/// VS_FORMAT_STREAM_BASED (Stream Based Payload spec §3.1.1 Table 3-1,
+/// 24 bytes; subtype 0x12 per core UVC 1.5 Table A-6).
+///
+/// Stream-based formats (e.g. MPEG-2 TS) carry their frame/segment
+/// boundaries in-band, so there are no frame descriptors after this
+/// one: the frame size comes from Probe/Commit `dwMaxVideoFrameSize`,
+/// not from a frame descriptor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormatStreamBased {
+    pub format_index: u8,
+    /// GUID identifying the stream-encoding format.
+    pub guid_format: [u8; 16],
+    /// `dwPacketLength`: non-zero = packet-oriented stream of
+    /// format-specific packets this size; zero = byte-oriented (or
+    /// variable-size packets). Stream Based Payload spec §2.2.
+    pub packet_length: u32,
+}
+
+impl FormatStreamBased {
+    pub fn parse(buf: &[u8]) -> Result<Self, DescError> {
+        check_cs(buf, VS_FORMAT_STREAM_BASED)?;
+        if buf.len() < 24 {
+            return Err(DescError::Short);
+        }
+        let mut guid_format = [0u8; 16];
+        guid_format.copy_from_slice(&buf[4..20]);
+        Ok(Self {
+            format_index: buf[3],
+            guid_format,
+            packet_length: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
         })
     }
 }
