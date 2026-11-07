@@ -27,7 +27,10 @@ const FAKE_DEPTH: u16 = 16;
 /// (doorbell offsets at 0x1000+ land in the second page), the I/O
 /// queue's SQ/CQ are coherent pages the test inspects afterwards,
 /// and every CQE is pre-posted with the phase bit set so submissions
-/// complete synchronously. CQE 0 carries a caller-chosen status word
+/// complete synchronously, each carrying the CID of the command it
+/// completes (CQE DW3, offset 12) — a real controller tags every
+/// completion that way, and `submit_raw_ms` waits for the CQE
+/// carrying its own CID. CQE 0 carries a caller-chosen status word
 /// so a test can make the first command fail.
 struct FakeCtrl {
     ctrl: Controller,
@@ -47,13 +50,19 @@ fn fake_controller(oncs: u16, nsze: u64, cqe0_status: u16) -> Option<FakeCtrl> {
     let cq_ptr = cq.cpu_ptr::<u8>();
     let dsm_ptr = dsm.cpu_ptr::<u8>();
     let dsm_dma = dsm.dma_addr().raw();
-    // Pre-post every completion: status word = phase bit (offset 14
-    // in the 16-byte CQE) plus the NVMe status field above it.
+    // Pre-post every completion: CID (offset 12 in the 16-byte
+    // CQE) = the slot index, since the driver assigns CIDs
+    // sequentially from 0 and the k-th submission consumes CQE k;
+    // status word = phase bit (offset 14) plus the NVMe status
+    // field above it. Pre-posting every CQE with CID 0 made the
+    // second submission consume all 16 entries as strays and time
+    // out waiting for a phase-flipped CQE that never comes.
     // SAFETY: `cq` is a live 4 KiB coherent page; FAKE_DEPTH CQEs
     // occupy its first 256 bytes.
     unsafe {
         for i in 0..FAKE_DEPTH as usize {
             let status = if i == 0 { cqe0_status } else { 1 };
+            core::ptr::write_volatile(cq_ptr.add(i * 16 + 12) as *mut u16, i as u16);
             core::ptr::write_volatile(cq_ptr.add(i * 16 + 14) as *mut u16, status);
         }
     }
