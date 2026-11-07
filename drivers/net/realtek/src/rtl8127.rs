@@ -2539,7 +2539,8 @@ fn rtl8127_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
 /// Decode a PHYStatus byte into a publication sample via the family's
 /// existing `PhyStatus::parse`. The ≥1G bit covers 1G/2.5G/5G/10G
 /// alike on this part, so 1000 is published as the in-band lower
-/// bound; exact negotiated-rate decode is PHY work (issue #790).
+/// bound; exact negotiated-rate decode is
+/// [`rtl8127_link_sample_with_phy`] (PHY work, issue #790).
 fn rtl8127_link_sample(status: u8) -> crate::publish::LinkSample {
     let s = PhyStatus::parse(status);
     if !s.link_up {
@@ -2562,6 +2563,37 @@ fn rtl8127_link_sample(status: u8) -> crate::publish::LinkSample {
         } else {
             narf_net::iface::LinkDuplex::Half
         }),
+    }
+}
+
+/// Resolve the exact negotiated rate via the shared PHY trait
+/// (issue #790) when the in-band PHYStatus byte only proves
+/// "≥1G" — on this part that covers 1G/2.5G/5G/10G alike.
+/// 10/100 come straight from the byte — they are exact there —
+/// and a down link never touches the PHY. The PHY read is the
+/// `rtlgen` algorithm (`crate::phy::Phy` implemented by
+/// `PhyAccess`): Clause-22 resolution plus the page 0xa43
+/// register 0x12 speed word, merged over the in-band lower
+/// bound so any PHY error (or an undecodable speed word) keeps
+/// the byte's rate instead of inventing or dropping one. (The
+/// RTL8127-internal PHY is the RTL8261C 10G PHY; it follows
+/// the same `rtlgen` path as the 8125/8126 internal PHYs.)
+///
+/// A fresh `PhyAccess` per call is stateless (the trait impl
+/// never touches the latched `ocp_base`), so this cannot divert
+/// the config-table or firmware paths. Callers gate on the
+/// PHYStatus byte changing (see queue 0's pump): the PHY read
+/// runs on link transitions only, never on the per-pass hot path.
+fn rtl8127_link_sample_with_phy(device: &Rtl8127Nic, status: u8) -> crate::publish::LinkSample {
+    use crate::phy::Phy;
+    let base = rtl8127_link_sample(status);
+    if !base.carrier || !PhyStatus::parse(status).speed_1000m_or_above {
+        return base;
+    }
+    let access = crate::phy_access::PhyAccess::new(&device.mmio);
+    match access.read_status() {
+        Ok(link) => crate::phy::merge_phy_sample(base, link),
+        Err(_) => base,
     }
 }
 
@@ -2653,8 +2685,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // name + carrier metadata via the shared helper. The frame-ring
     // registration below stays.
     let mac = with_controller(|c| c.mac).unwrap_or([0; 6]);
-    let status = with_controller(|c| c.phy_status()).unwrap_or(0);
-    let name = crate::publish::publish_netdev(mac, rtl8127_send_frame, rtl8127_link_sample(status));
+    let name = crate::publish::publish_netdev(
+        mac,
+        rtl8127_send_frame,
+        with_controller(|c| {
+            let status = c.phy_status();
+            rtl8127_link_sample_with_phy(c, status)
+        })
+        .unwrap_or(crate::publish::LinkSample::DOWN),
+    );
     RTL8127_IFNAME.set(name);
 
     let auth = match narf_net::trusted_net_authority() {
@@ -2695,13 +2734,22 @@ async fn rtl8127_rx_pump(device: Arc<Rtl8127Nic>, queue: usize) {
     // `refresh_link_state(&mut self)`, it is safe to call while pumps
     // hold Arc clones. A transition republishes the iface metadata;
     // the cached `Interface::link_up` snapshot is left as-is.
-    let mut last_sample = rtl8127_link_sample(device.phy_status());
+    // The PHYStatus byte gates the PHY read (see
+    // `rtl8127_link_sample_with_phy`): the exact-rate decode
+    // runs only when the byte changes, so the per-pass hot path
+    // stays one MMIO byte read, as before.
+    let mut last_status = device.phy_status();
+    let mut last_sample = rtl8127_link_sample_with_phy(&device, last_status);
     loop {
         if queue == 0 {
-            let sample = rtl8127_link_sample(device.phy_status());
-            if sample != last_sample {
-                last_sample = sample;
-                crate::publish::publish_link(rtl8127_ifname(), sample);
+            let status = device.phy_status();
+            if status != last_status {
+                last_status = status;
+                let sample = rtl8127_link_sample_with_phy(&device, status);
+                if sample != last_sample {
+                    last_sample = sample;
+                    crate::publish::publish_link(rtl8127_ifname(), sample);
+                }
             }
         }
         if let Some((pkt, csum, _hash)) = device.receive_on_queue(queue) {

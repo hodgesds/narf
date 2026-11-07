@@ -142,8 +142,17 @@ const INT_LINKCHG: u16 = 1 << 5;
 const INT_RDU: u16 = 1 << 4;
 const INT_TDU: u16 = 1 << 7;
 
-// PHYStatus bits.
+// PHYStatus bits (same layout as the 8125 family: Linux `enum
+// rtl_register_content` — bit 7 TBI_Enable, bit 6 TxFlowCtrl,
+// bit 5 RxFlowCtrl, bit 4 _1000bpsF, bit 3 _100bps, bit 2
+// _10bps, bit 1 LinkStatus, bit 0 FullDup). On this 1G-ceiling
+// part the byte is the exact rate — no multigig rate hides
+// behind the 1000M bit, so no PHY read is needed to report it.
 pub const PHYSTAT_LINKSTS: u8 = 1 << 1;
+pub const PHYSTAT_FULLDUP: u8 = 1 << 0;
+const PHYSTAT_10BPS: u8 = 1 << 2;
+const PHYSTAT_100BPS: u8 = 1 << 3;
+const PHYSTAT_1000BPSF: u8 = 1 << 4;
 
 // TX descriptor flags (word0 high bits).
 const TXD_OWN: u32 = 1 << 31;
@@ -1172,12 +1181,33 @@ fn r8169_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     ctrl.transmit(frame, &meta).map_err(|_| ())
 }
 
-/// Decode a PHYStatus byte into a publication sample. Only the link
-/// bit is decoded in-tree for this family (`PHYSTAT_LINKSTS`);
-/// speed/duplex decode is PHY work (issue #790), so the sample is
-/// carrier-only rather than a guessed rate.
+/// Decode a PHYStatus byte into a publication sample. The byte
+/// carries the full rate on this 1G-ceiling part (10/100/1000
+/// bits + duplex), so speed and duplex are reported from it
+/// directly (issue #790) — unlike the multigig family, no rate
+/// hides behind the 1000M bit and no PHY read is needed.
 fn r8169_link_sample(status: u8) -> crate::publish::LinkSample {
-    crate::publish::LinkSample::carrier_only(status & PHYSTAT_LINKSTS != 0)
+    if status & PHYSTAT_LINKSTS == 0 {
+        return crate::publish::LinkSample::DOWN;
+    }
+    let speed_mbps = if status & PHYSTAT_1000BPSF != 0 {
+        Some(1000)
+    } else if status & PHYSTAT_100BPS != 0 {
+        Some(100)
+    } else if status & PHYSTAT_10BPS != 0 {
+        Some(10)
+    } else {
+        None
+    };
+    crate::publish::LinkSample {
+        carrier: true,
+        speed_mbps,
+        duplex: Some(if status & PHYSTAT_FULLDUP != 0 {
+            narf_net::iface::LinkDuplex::Full
+        } else {
+            narf_net::iface::LinkDuplex::Half
+        }),
+    }
 }
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
@@ -1570,4 +1600,56 @@ pub fn with_controller_mut<R>(f: impl FnOnce(&mut RtlNic) -> R) -> Option<R> {
         .lock()
         .as_mut()
         .map(|a| f(Arc::get_mut(a).expect("RtlNic static has multiple owners")))
+}
+
+#[cfg(target_arch = "x86_64")]
+mod tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use super::{
+        r8169_link_sample, PHYSTAT_1000BPSF, PHYSTAT_100BPS, PHYSTAT_10BPS, PHYSTAT_FULLDUP,
+        PHYSTAT_LINKSTS,
+    };
+
+    fn smoke_r8169_link_sample_decodes() -> TestResult {
+        use narf_net::iface::LinkDuplex;
+        // The bytes are built from the PHYStatus map in this
+        // file (0x6C: bit 1 LinkSts, bit 0 FullDup, bit 2 10M,
+        // bit 3 100M, bit 4 1000M): only those bits prove a rate.
+        let up_1g = r8169_link_sample(PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_1000BPSF);
+        if !up_1g.carrier
+            || up_1g.speed_mbps != Some(1000)
+            || up_1g.duplex != Some(LinkDuplex::Full)
+        {
+            return TestResult::Fail("r8169 1G full-duplex PHYStatus word decoded wrong");
+        }
+        let up_100h = r8169_link_sample(PHYSTAT_LINKSTS | PHYSTAT_100BPS);
+        if !up_100h.carrier
+            || up_100h.speed_mbps != Some(100)
+            || up_100h.duplex != Some(LinkDuplex::Half)
+        {
+            return TestResult::Fail("r8169 100M half-duplex PHYStatus word decoded wrong");
+        }
+        let up_10 = r8169_link_sample(PHYSTAT_LINKSTS | PHYSTAT_FULLDUP | PHYSTAT_10BPS);
+        if up_10.speed_mbps != Some(10) {
+            return TestResult::Fail("r8169 10M PHYStatus word decoded wrong");
+        }
+        // Link up with no speed bit: carrier is real, the rate
+        // is not proven — never a guessed rate.
+        let up_norate = r8169_link_sample(PHYSTAT_LINKSTS | PHYSTAT_FULLDUP);
+        if !up_norate.carrier || up_norate.speed_mbps.is_some() {
+            return TestResult::Fail("r8169 link-up without a speed bit must not guess a rate");
+        }
+        // Every speed bit without LinkSts must not read as up.
+        let no_link =
+            r8169_link_sample(PHYSTAT_FULLDUP | PHYSTAT_1000BPSF | PHYSTAT_100BPS | PHYSTAT_10BPS);
+        if no_link.carrier || no_link.speed_mbps.is_some() {
+            return TestResult::Fail("r8169 PHYStatus without LinkSts must read as down");
+        }
+        if r8169_link_sample(0) != crate::publish::LinkSample::DOWN {
+            return TestResult::Fail("r8169 zero PHYStatus must read as DOWN");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/r8169", smoke_r8169_link_sample_decodes);
 }
