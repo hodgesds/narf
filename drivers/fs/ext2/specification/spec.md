@@ -41,6 +41,16 @@ The driver implements `narf_filesystem::FsInstance` for `Ext2Volume`.
 Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 `DirOps`.
 
+FITRIM (`fstrim`, #1166) is the first discard caller: `Ext2Volume::fitrim`
+scans the block bitmaps for free blocks in the requested byte range,
+coalesces contiguous free runs of at least `minlen`, and issues one
+`BlockDevice::discard` per run. It is reachable as the Linux FITRIM
+ioctl (`0xC018_5879`, `struct fstrim_range` — see `src/fitrim.rs`) on
+both a file fd (`FileOps::ioctl_user`) and a directory fd
+(`DirOps::ioctl_async`, the path `fstrim(8)` uses on the mount point).
+A device without `BlockFeature::Discard` fails the ioctl with
+`EOPNOTSUPP` rather than reporting a trim that never happened.
+
 ### Key Structs
 
 - `Ext2Volume<B: BlockDevice>`: Root structure for a mounted volume.

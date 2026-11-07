@@ -31,6 +31,7 @@ extern crate alloc;
 pub mod dir;
 pub mod dir_mut;
 pub mod extent;
+pub mod fitrim;
 pub mod group_desc;
 pub mod htree;
 pub mod inode;
