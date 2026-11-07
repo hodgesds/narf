@@ -268,7 +268,10 @@ fn apu_publish_programs_dram_addr_high_then_low_v13() -> TestResult {
     let msg = MP1_BASE + MP1_C2PMSG_MSG_REL;
     let expected: [(u32, u32); 6] = [
         (resp, 0),
-        (arg, 0x1234_5678),
+        // High 32 bits of 0x0000_1234_5678_9000 are 0x0000_1234, not
+        // 0x1234_5678 (that is bits 16..47): the split is (addr >> 32)
+        // then (addr as u32), as in the discrete owner's upload.
+        (arg, 0x0000_1234),
         (msg, 0x0D), // V13 SetDriverDramAddrHigh
         (resp, 0),
         (arg, 0x5678_9000),
@@ -301,7 +304,10 @@ fn apu_publish_programs_dram_addr_high_then_low_v12() -> TestResult {
     let msg = MP1_BASE + MP1_C2PMSG_MSG_REL;
     let expected: [(u32, u32); 6] = [
         (resp, 0),
-        (arg, 0x1234_5678),
+        // High 32 bits of 0x0000_1234_5678_9000 are 0x0000_1234 (see
+        // the v13 test: 0x1234_5678 would be bits 16..47, not the
+        // upper half).
+        (arg, 0x0000_1234),
         (msg, 0x1A), // V12 SetDriverDramAddrHigh
         (resp, 0),
         (arg, 0x5678_9000),
