@@ -5,6 +5,8 @@
 //!   - `rps_cur_freq_mhz`: current operating / target frequency in MHz
 //!   - `rps_act_freq_mhz`: actual measured operating frequency in MHz
 //!   - `rc6_residency_ms`: media C6 (MC6) residency in milliseconds
+//!   - `rc6p_residency_ms`: legacy RC6p residency (always 0)
+//!   - `rc6pp_residency_ms`: legacy RC6pp residency (always 0)
 //!   - `freq_factor_scale`: scaling multiplier ("1.00\n")
 //!   - `throttle_reasons`: bitmask / string representation ("0\n")
 //!   - `gt_min_freq_mhz`: minimum allowed frequency (RPn or range minimum)
@@ -13,16 +15,20 @@
 //!   - `gt_RP1_freq_mhz`: efficient / base frequency (RPe)
 //!   - `gt_RPn_freq_mhz`: minimum hardware frequency (RPn)
 //!   - `slpc_status`: "running", "disabled", or "unavailable"
+//!   - `slpc_power_profile`: "base" or "power_saving"
 //! - `/sys/class/drm/card<N>/device/tile0/gt1/` (Xe-style attributes):
 //!   - `freq0/cur_freq`, `freq0/act_freq`, `freq0/min_freq`, `freq0/max_freq`
-//!   - `freq0/rp0_freq`, `freq0/rpe_freq`, `freq0/rpn_freq`
+//!   - `freq0/rp0_freq`, `freq0/rpe_freq`, `freq0/rpn_freq`, `freq0/power_profile`
+//!   - `gtidle/name`: "gt1-mc\n"
+//!   - `gtidle/idle_residency_ms`: MC6 residency in ms
+//!   - `gtidle/idle_status`: "gt-c6\n" or "gt-c0\n"
 //!   - `gtidle/gt1-mc`: MC6 residency in ms
 //!
 //! When `narf.intel.media_gt=1` is absent or the media GT is unpublished,
 //! queries return empty strings or "unavailable\n", matching Linux behavior.
 
 use alloc::{format, string::String, sync::Arc};
-use narf_filesystem::sysfs::{get_or_create_child, kobject_add_attr, Kobject};
+use narf_filesystem::sysfs::{Kobject, get_or_create_child, kobject_add_attr};
 
 use crate::intel_gpu_user::UserBackend;
 
@@ -38,6 +44,8 @@ pub struct MediaGtTelemetry {
     pub rpe_freq_mhz: u32,
     pub rpn_freq_mhz: u32,
     pub is_running: bool,
+    pub power_profile: &'static str,
+    pub idle_status: &'static str,
 }
 
 impl MediaGtTelemetry {
@@ -46,11 +54,21 @@ impl MediaGtTelemetry {
         let media_gt = backend.media_gt()?;
         let slpc = backend.media_gt_slpc_status();
         let rc6_ms = backend.media_gt_rc6_residency_ms().unwrap_or(0);
+        let hw_act = backend.media_gt_act_freq_mhz();
+        let idle_status = if hw_act == Some(0) && rc6_ms > 0 {
+            "gt-c6"
+        } else {
+            "gt-c0"
+        };
 
         if let Some(status) = slpc {
+            let power_profile = match status.profile {
+                crate::intel_gpu_slpc::PowerProfile::Base => "base",
+                crate::intel_gpu_slpc::PowerProfile::PowerSaving => "power_saving",
+            };
             Some(Self {
                 cur_freq_mhz: status.range.min_mhz,
-                act_freq_mhz: status.range.min_mhz,
+                act_freq_mhz: hw_act.filter(|&f| f > 0).unwrap_or(status.range.min_mhz),
                 rc6_residency_ms: rc6_ms,
                 min_freq_mhz: status.range.min_mhz,
                 max_freq_mhz: status.range.max_mhz,
@@ -58,13 +76,15 @@ impl MediaGtTelemetry {
                 rpe_freq_mhz: status.limits.rpe_mhz,
                 rpn_freq_mhz: status.limits.rpn_mhz,
                 is_running: true,
+                power_profile,
+                idle_status,
             })
         } else {
             // Media GT is published but SLPC status not yet active
             let ref_mhz = (media_gt.reference_clock / 1_000_000).max(100);
             Some(Self {
                 cur_freq_mhz: ref_mhz,
-                act_freq_mhz: ref_mhz,
+                act_freq_mhz: hw_act.filter(|&f| f > 0).unwrap_or(ref_mhz),
                 rc6_residency_ms: rc6_ms,
                 min_freq_mhz: 100,
                 max_freq_mhz: 1150,
@@ -72,6 +92,8 @@ impl MediaGtTelemetry {
                 rpe_freq_mhz: 500,
                 rpn_freq_mhz: 100,
                 is_running: false,
+                power_profile: "base",
+                idle_status,
             })
         }
     }
@@ -110,6 +132,12 @@ pub(crate) fn populate_card(
         kobject_add_attr(&gt1_kobj, "rc6_residency_ms", move || {
             r().map_or_else(String::new, |t| format!("{}\n", t.rc6_residency_ms))
         });
+    }
+    {
+        kobject_add_attr(&gt1_kobj, "rc6p_residency_ms", move || "0\n".into());
+    }
+    {
+        kobject_add_attr(&gt1_kobj, "rc6pp_residency_ms", move || "0\n".into());
     }
     {
         kobject_add_attr(&gt1_kobj, "freq_factor_scale", move || "1.00\n".into());
@@ -162,6 +190,12 @@ pub(crate) fn populate_card(
             )
         });
     }
+    {
+        let r = resolve;
+        kobject_add_attr(&gt1_kobj, "slpc_power_profile", move || {
+            r().map_or_else(String::new, |t| format!("{}\n", t.power_profile))
+        });
+    }
 
     // 2) If dev_node is present: /sys/class/drm/card<N>/device/tile0/gt1/
     if let Some(dev) = dev_node {
@@ -198,7 +232,20 @@ pub(crate) fn populate_card(
         kobject_add_attr(&freq0, "rpn_freq", move || {
             r().map_or_else(String::new, |t| format!("{}\n", t.rpn_freq_mhz))
         });
+        let r = resolve;
+        kobject_add_attr(&freq0, "power_profile", move || {
+            r().map_or_else(String::new, |t| format!("{}\n", t.power_profile))
+        });
 
+        kobject_add_attr(&gtidle, "name", move || "gt1-mc\n".into());
+        let r = resolve;
+        kobject_add_attr(&gtidle, "idle_residency_ms", move || {
+            r().map_or_else(String::new, |t| format!("{}\n", t.rc6_residency_ms))
+        });
+        let r = resolve;
+        kobject_add_attr(&gtidle, "idle_status", move || {
+            r().map_or_else(String::new, |t| format!("{}\n", t.idle_status))
+        });
         let r = resolve;
         kobject_add_attr(&gtidle, "gt1-mc", move || {
             r().map_or_else(String::new, |t| format!("{}\n", t.rc6_residency_ms))

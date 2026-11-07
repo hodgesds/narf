@@ -1,10 +1,10 @@
 //! Tests for Graphics Main GT (GT0) telemetry and sysfs attributes.
 
 use alloc::{format, sync::Arc};
-use narf_filesystem::sysfs::{Kobject, __reset_for_test};
-use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_filesystem::sysfs::{__reset_for_test, Kobject};
+use narf_kernel_test::{TestResult, kernel_test_in};
 
-use crate::drm_registry::{register_drm_card, DrmCard};
+use crate::drm_registry::{DrmCard, register_drm_card};
 use crate::intel_gpu_engine::EngineSet;
 use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_slpc::{FrequencyRange, Limits, PowerProfile, Status as SlpcStatus};
@@ -164,10 +164,12 @@ fn smoke_intel_main_gt_telemetry_live() -> TestResult {
     assert_eq!(freq0.attr_show("rp0_freq").as_deref(), Some("1400\n"));
     assert_eq!(freq0.attr_show("rpe_freq").as_deref(), Some("800\n"));
     assert_eq!(freq0.attr_show("rpn_freq").as_deref(), Some("200\n"));
+    assert_eq!(freq0.attr_show("power_profile").as_deref(), Some("base\n"));
     assert_eq!(
         gtidle.attr_show("idle_residency_ms").as_deref(),
         Some("4500\n")
     );
+    assert_eq!(gtidle.attr_show("idle_status").as_deref(), Some("gt-c0\n"));
     assert_eq!(gtidle.attr_show("name").as_deref(), Some("gt0-rc6\n"));
 
     TestResult::Pass

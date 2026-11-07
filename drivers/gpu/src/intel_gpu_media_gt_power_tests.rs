@@ -7,11 +7,11 @@
 // regs/xe_regs.h (MTL_MEDIAP_STATE_CAP, MTL_MPE_FREQUENCY),
 // regs/xe_gt_regs.h (RC_CONTROL, RC_STATE, POWERGATE_ENABLE) and
 // abi/guc_actions_slpc_abi.h, with GT1's GT registers at the GSI offset.
-use super::media_gt_sched::{media_hw, media_tick, media_until, start_media, Hw};
+use super::media_gt_sched::{Hw, media_hw, media_tick, media_until, start_media};
 use super::*;
 use crate::intel_gpu_engine::Engine;
 use crate::intel_gpu_exec::PpgttProbeResult;
-use crate::intel_gpu_gt::media::{retire, MediaGuc, MediaGucError, MediaGucState, Retire};
+use crate::intel_gpu_gt::media::{MediaGuc, MediaGucError, MediaGucState, Retire, retire};
 use crate::intel_gpu_guc_sched::SchedulingError;
 use crate::intel_gpu_slpc::{FrequencyRange, Limits, PowerProfile, SlpcError, SlpcState};
 use crate::intel_gpu_user::{UserBatch, UserContext};
@@ -90,7 +90,10 @@ fn run_to_terminal(
         let now = from + tick * 1_000_000;
         let polled = media_tick(guc, w, hw, now);
         if guc.publication().is_some() {
-            assert!(guc.slpc_status().is_some(), "GT1 published before SLPC RUNNING");
+            assert!(
+                guc.slpc_status().is_some(),
+                "GT1 published before SLPC RUNNING"
+            );
         }
         if polled.is_ready() {
             return (now, polled);
@@ -155,10 +158,7 @@ fn smoke_media_gt_slpc_limits_decode_gt1_fuses_only() -> TestResult {
     ] {
         let window = fuses(cap, efficient);
         let limits = Limits::read_media(&window).unwrap();
-        assert_eq!(
-            (limits.rpn_mhz, limits.rpe_mhz, limits.rp0_mhz),
-            expected
-        );
+        assert_eq!((limits.rpn_mhz, limits.rpe_mhz, limits.rp0_mhz), expected);
         assert_eq!((limits.min_mhz, limits.max_mhz), (expected.0, expected.2));
         assert_eq!(
             *window.reads.borrow(),
@@ -207,7 +207,10 @@ fn smoke_media_gt_slpc_limits_decode_gt1_fuses_only() -> TestResult {
         MEDIA_PG
     );
     assert_eq!(powergate_enable(EngineSet::of(&[Engine::Vecs1])), 0x2);
-    assert_eq!(powergate_enable(EngineSet::of(&[Engine::Vcs7])), 0x2 | 0b11 << 17);
+    assert_eq!(
+        powergate_enable(EngineSet::of(&[Engine::Vcs7])),
+        0x2 | 0b11 << 17
+    );
     assert_eq!(powergate_enable(EngineSet::default()), 0);
     TestResult::Pass
 }
@@ -273,6 +276,14 @@ fn smoke_media_gt_slpc_start_bounds_profile_and_rc6_on_media_guc() -> TestResult
     }
     assert!(gt1_only(&w));
 
+    // GT1 MC6 residency (MTL_MEDIA_MC6 0x138048 in 1.28 us units) and actual
+    // CAGF frequency (MTL_MIRROR_TARGET_WP1 0x380c60 bits [8:0] in 16.67 MHz units).
+    w.0.borrow_mut()
+        .regs
+        .extend([(0x138048, 10_000), (0x380c60, (0xdead << 9) | 63)]);
+    assert_eq!(guc.mc6_residency_ms(), Some(12));
+    assert_eq!(guc.act_freq_mhz(), Some(1050));
+
     // Media-GT recovery: the stop first hands C6 back to the host
     // (xe_uc_gucrc_disable), disables C6 and powergating through GT1's window
     // and only then resets the media GuC.
@@ -280,6 +291,8 @@ fn smoke_media_gt_slpc_start_bounds_profile_and_rc6_on_media_guc() -> TestResult
     let ct = ct_memory(&w);
     guc.begin_stop(now + 1);
     assert_eq!(guc.slpc_status(), None);
+    assert_eq!(guc.mc6_residency_ms(), None);
+    assert_eq!(guc.act_freq_mhz(), None);
     assert_eq!(queued(&ct), [(0x3004, vec![0])]);
     assert_power_down_before_reset(&w, from);
     let (_, polled) = media_until(&mut guc, &w, &mut hw, now + 2, |p| p.is_ready());
@@ -388,12 +401,12 @@ fn smoke_media_gt_slpc_failures_stop_gt1_and_disable_c6() -> TestResult {
         ))))
     );
     assert!(slpc_trace(&w).is_empty());
-    assert!(!w
-        .0
-        .borrow()
-        .memory
-        .values()
-        .any(|m| m.borrow().len() == 2048 && m.borrow()[0] == 8192));
+    assert!(
+        !w.0.borrow()
+            .memory
+            .values()
+            .any(|m| m.borrow().len() == 2048 && m.borrow()[0] == 8192)
+    );
     let (_, polled) = media_until(&mut guc, &w, &mut hw, now + 1, |p| {
         *p == Poll::Ready(Ok(MediaGucState::Stopped))
     });
@@ -411,10 +424,10 @@ fn smoke_media_gt_slpc_failures_stop_gt1_and_disable_c6() -> TestResult {
     let (now, polled) = run_to_terminal(&mut guc, &w, &mut hw, 1);
     assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Running)));
     let trace = slpc_trace(&w);
-    assert_eq!(trace[trace.len() - 2..], [
-        (0x3003, vec![0x602, 26, 1]),
-        (0x3003, vec![0x602, 27, 0]),
-    ]);
+    assert_eq!(
+        trace[trace.len() - 2..],
+        [(0x3003, vec![0x602, 26, 1]), (0x3003, vec![0x602, 27, 0]),]
+    );
     assert_eq!(guc.slpc_status().unwrap().profile, PowerProfile::Base);
     SLPC_FIXTURE_MODE.store(0, Relaxed);
 

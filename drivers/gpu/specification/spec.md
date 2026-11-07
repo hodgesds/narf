@@ -2112,11 +2112,16 @@ bounds by readback, then sends GUCRC_FIRMWARE_CONTROL, the compute strategy (a
 refusal is ignored) and the Base profile. `MediaGuc` publishes GT1 only after
 SLPC is Running, and any start failure stops GT1 (`MediaGucError::Slpc`), as
 xe_uc_load_hw fails. `MediaGuc::slpc_status` reports the confirmed status
-while GT1 is published. Before any reset of a GuC that started media power,
+while GT1 is published, `MediaGuc::mc6_residency_ms` reads `MTL_MEDIA_MC6`
+(`0x138048`, 1.28 us units) and `MediaGuc::act_freq_mhz` reads
+`MTL_MIRROR_TARGET_WP1` (`0x380c60`, bits [8:0] in 16.67 MHz units). Before any reset of a GuC that started media power,
 with wake held, the owner sends GUCRC_HOST_CONTROL if firmware control was
 handed over, then writes RC_CONTROL, RC_STATE and POWERGATE_ENABLE to zero at
-GT1's GSI copies. The main GT's sequence and stop are unchanged. GT1 has no
-sysfs or UAPI power interface: the per-card controls below remain GT0's.
+GT1's GSI copies. The main GT's sequence and stop are unchanged. Read-only
+per-GT frequency and idle telemetry is exposed through `intel_gpu_gt_sysfs`
+(`gt/`, `gt0/`, `device/tile0/gt0/{freq0,gtidle}/`) and
+`intel_gpu_media_gt_sysfs` (`gt1/`, `device/tile0/gt1/{freq0,gtidle}/`);
+writable per-card SLPC controls below remain GT0's.
 
 `intel_gpu_power_controls::PowerControls` supplies a bounded per-card mailbox
 through `UserBackend::power_controls`. The GT owner explicitly activates a
@@ -2133,10 +2138,13 @@ Intel card sysfs nodes expose writable `gt_min_freq_mhz`, `gt_max_freq_mhz`,
 (`base` or `power-saving`). Read-only `gt_RPn_freq_mhz`, `gt_RP1_freq_mhz`,
 `gt_RP0_freq_mhz` and `slpc_status` report confirmed limits and mailbox state.
 The gt_* names follow i915; slpc_* files and asynchronous store acceptance
-are NARF extensions, not the Xe freq0 sysfs ABI. They control GT0 only; the
-Xe per-GT `tile0/gt1/freq0` and `gtidle` trees are absent, so the media GT has
-no frequency or idle attributes. Callbacks resolve the current
-per-card backend and perform no MMIO. Every writable SLPC callback requires
+are NARF extensions, not the Xe freq0 sysfs ABI. Writable controls apply to
+GT0 only, while read-only `tile0/gt0/{freq0,gtidle}` and
+`tile0/gt1/{freq0,gtidle}` trees (`cur_freq`, `act_freq`, `min_freq`,
+`max_freq`, `rp0_freq`, `rpe_freq`, `rpn_freq`, `power_profile`, `name`,
+`idle_residency_ms`, `idle_status`, `gt1-mc`) plus `gt0/` and `gt1/`
+telemetry attributes (`rps_*_freq_mhz`, `rc6*_residency_ms`, `slpc_status`,
+`slpc_power_profile`) report GT0 and GT1 telemetry through `UserBackend`. Every writable SLPC callback requires
 current initial-namespace CAP_SYS_ADMIN; reads remain cached. Only confirmed user policy survives
 close; a newly activated GT revalidates it against fresh limits and replays
 range then profile with acknowledgments. Queued/unacknowledged old-epoch
