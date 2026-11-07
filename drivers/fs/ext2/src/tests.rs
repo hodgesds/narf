@@ -6691,3 +6691,359 @@ kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext3_dirty_journal_read_only_replays_in_memory_only
 );
+
+// ── FITRIM — first discard caller (#1166) ─────────────────────────
+
+/// Block device that advertises discard and records every range
+/// handed to [`narf_block::BlockDevice::discard`], so the FITRIM
+/// fixture can prove freed ranges actually reach the driver's
+/// trim hook instead of trusting the volume's word for it.
+#[derive(Debug)]
+struct RecordingDiscardBlock {
+    inner: alloc::sync::Arc<narf_block::ram::RamBlockDevice>,
+    discards: narf_lib::sync::IrqSafeSpinLock<Vec<narf_block::LbaRange>>,
+}
+
+impl narf_block::BlockDevice for RecordingDiscardBlock {
+    fn logical_block_size(&self) -> u32 {
+        self.inner.logical_block_size()
+    }
+    fn physical_block_size(&self) -> u32 {
+        self.inner.physical_block_size()
+    }
+    fn capacity_blocks(&self) -> u64 {
+        self.inner.capacity_blocks()
+    }
+    fn supports(&self, feature: narf_block::BlockFeature) -> bool {
+        feature == narf_block::BlockFeature::Discard || self.inner.supports(feature)
+    }
+    fn submit(
+        &self,
+        request: narf_block::BlockRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        self.inner.submit(request)
+    }
+    fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.flush()
+    }
+    fn discard(
+        &self,
+        range: narf_block::LbaRange,
+    ) -> impl core::future::Future<Output = ()> + Send {
+        self.discards.lock().push(range);
+        self.inner.discard(range)
+    }
+    fn cancel(
+        &self,
+        tag: u64,
+    ) -> impl core::future::Future<Output = narf_block::CancelResult> + Send {
+        self.inner.cancel(tag)
+    }
+}
+
+/// Mount the deterministic `build_ext2_image` volume on a
+/// discard-recording device. Returns the device (for the recorded
+/// ranges) and the mounted volume.
+fn fitrim_fixture() -> Option<(
+    alloc::sync::Arc<RecordingDiscardBlock>,
+    alloc::sync::Arc<crate::volume::Ext2Volume<RecordingDiscardBlock>>,
+)> {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+    let device = alloc::sync::Arc::new(RecordingDiscardBlock {
+        inner: RamBlockDevice::from_image(512, build_ext2_image(b"page cache")),
+        discards: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+    });
+    let volume = poll_once(crate::volume::Ext2Volume::mount(
+        device.clone(),
+        DomainId::DRIVER_0,
+    ))?
+    .ok()?;
+    Some((device, volume))
+}
+
+/// Count the free blocks the fixture image's own block bitmap
+/// reports, independent of `fitrim`'s scan: bit `i` of group 0
+/// maps to absolute block `1 + i` (`s_first_data_block = 1` in
+/// `build_ext2_image`), and the group holds
+/// `total_blocks - 1` valid bits.
+fn free_blocks_in_test_image(
+    volume: &crate::volume::Ext2Volume<RecordingDiscardBlock>,
+) -> Option<u64> {
+    let mut bitmap = vec![0u8; volume.block_size()];
+    if !matches!(poll_once(volume.read_block(3, &mut bitmap)), Some(Ok(()))) {
+        return None;
+    }
+    let bits = volume.superblock.total_blocks() - 1;
+    let mut free = 0u64;
+    for bit in 0..bits {
+        let byte = (bit / 8) as usize;
+        if byte < bitmap.len() && (bitmap[byte] >> (bit % 8)) & 1 == 0 {
+            free += 1;
+        }
+    }
+    Some(free)
+}
+
+/// True when every LBA in `[start, start + blocks)` is covered by
+/// some recorded discard range.
+fn discards_cover(discards: &[narf_block::LbaRange], start: u64, blocks: u64) -> bool {
+    (start..start + blocks).all(|lba| {
+        discards
+            .iter()
+            .any(|r| lba >= r.start && lba < r.start + r.blocks)
+    })
+}
+
+/// FITRIM over the whole fixture volume trims exactly the free
+/// blocks the on-disk bitmap reports, as whole-filesystem-block
+/// discard ranges, and the blocks freed just before the call are
+/// among them — the freed ranges reach the driver trim hook.
+fn smoke_ext2_fitrim_trims_freed_blocks() -> TestResult {
+    let (device, volume) = match fitrim_fixture() {
+        Some(pair) => pair,
+        None => return TestResult::Fail("fitrim fixture mount failed"),
+    };
+    // Allocate then free a contiguous run, so the fixture has a
+    // known-free run to look for in the recorded discards.
+    let mut freed = Vec::new();
+    for _ in 0..4 {
+        match poll_once(volume.alloc_block()) {
+            Some(Ok(block)) => freed.push(block),
+            _ => return TestResult::Fail("alloc_block failed in fitrim fixture"),
+        }
+    }
+    for block in &freed {
+        if !matches!(poll_once(volume.free_block(*block)), Some(Ok(()))) {
+            return TestResult::Fail("free_block failed in fitrim fixture");
+        }
+    }
+    let fs_bytes = volume.superblock.total_blocks() * volume.block_size() as u64;
+    let trimmed = match poll_once(volume.fitrim(0, fs_bytes, 0)) {
+        Some(Ok(trimmed)) => trimmed,
+        Some(Err(_)) => return TestResult::Fail("fitrim failed on the fixture volume"),
+        None => return TestResult::Fail("fitrim did not complete on first poll"),
+    };
+    let free_blocks = match free_blocks_in_test_image(&volume) {
+        Some(free) => free,
+        None => return TestResult::Fail("could not read fixture block bitmap"),
+    };
+    if trimmed != free_blocks * 1024 {
+        return TestResult::Fail("fitrim trimmed bytes disagree with the on-disk free bitmap");
+    }
+    let discards = device.discards.lock();
+    let mut recorded_lbas = 0u64;
+    for range in discards.iter() {
+        // 1024-byte filesystem blocks on a 512-byte device: every
+        // discard must start and end on a whole-filesystem-block
+        // boundary (even LBA, even length).
+        if range.start % 2 != 0 || range.blocks % 2 != 0 {
+            return TestResult::Fail("fitrim discard is not whole-filesystem-block aligned");
+        }
+        recorded_lbas += range.blocks;
+    }
+    if recorded_lbas != free_blocks * 2 {
+        return TestResult::Fail("recorded discard LBAs disagree with the on-disk free bitmap");
+    }
+    for block in &freed {
+        if !discards_cover(&discards, block * 2, 2) {
+            return TestResult::Fail("freed block never reached the driver trim hook");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_fitrim_trims_freed_blocks);
+
+/// `minlen` filters short runs: the fixture image's largest free
+/// run is 52 blocks (bits 11..=62 clear — blocks 12..=63), so a
+/// 53-block minimum trims nothing and records no discard.
+fn smoke_ext2_fitrim_minlen_filters_short_runs() -> TestResult {
+    let (device, volume) = match fitrim_fixture() {
+        Some(pair) => pair,
+        None => return TestResult::Fail("fitrim fixture mount failed"),
+    };
+    let fs_bytes = volume.superblock.total_blocks() * volume.block_size() as u64;
+    let trimmed = match poll_once(volume.fitrim(0, fs_bytes, 53 * 1024)) {
+        Some(Ok(trimmed)) => trimmed,
+        Some(Err(_)) => return TestResult::Fail("fitrim with minlen failed"),
+        None => return TestResult::Fail("fitrim with minlen did not complete on first poll"),
+    };
+    if trimmed != 0 {
+        return TestResult::Fail("fitrim with a 53-block minlen trimmed a shorter run");
+    }
+    if !device.discards.lock().is_empty() {
+        return TestResult::Fail("fitrim with a 53-block minlen recorded a discard");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_fitrim_minlen_filters_short_runs
+);
+
+/// A device without discard support fails FITRIM with
+/// `Unsupported` (EOPNOTSUPP) instead of reporting a trim that
+/// never happened, and malformed ranges fail with `InvalidData`.
+fn smoke_ext2_fitrim_rejects_unsupported_device_and_bad_ranges() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+    // Plain RamBlockDevice never claims Discard.
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"page cache"));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("fitrim error-fixture mount failed"),
+    };
+    if !matches!(
+        poll_once(volume.fitrim(0, 1024, 0)),
+        Some(Err(narf_filesystem::FsError::Unsupported))
+    ) {
+        return TestResult::Fail("fitrim on a no-discard device did not report Unsupported");
+    }
+    let (_, volume) = match fitrim_fixture() {
+        Some(pair) => pair,
+        None => return TestResult::Fail("fitrim fixture mount failed"),
+    };
+    let fs_bytes = volume.superblock.total_blocks() * volume.block_size() as u64;
+    if !matches!(
+        poll_once(volume.fitrim(fs_bytes, 1024, 0)),
+        Some(Err(narf_filesystem::FsError::InvalidData))
+    ) {
+        return TestResult::Fail("fitrim past the end of the volume did not report InvalidData");
+    }
+    if !matches!(
+        poll_once(volume.fitrim(0, 0, 0)),
+        Some(Err(narf_filesystem::FsError::InvalidData))
+    ) {
+        return TestResult::Fail("zero-length fitrim did not report InvalidData");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_fitrim_rejects_unsupported_device_and_bad_ranges
+);
+
+/// The `fstrim_range` wire image is three little-endian u64s
+/// (start/len/minlen) and round-trips; a short image is rejected.
+/// Also pins the FITRIM ioctl number itself.
+fn smoke_ext2_fitrim_wire_range_round_trips() -> TestResult {
+    use crate::fitrim::{FstrimRange, FITRIM, FSTRIM_RANGE_LEN};
+    if FITRIM != 0xC018_5879 {
+        return TestResult::Fail("FITRIM is not _IOWR('X', 121, struct fstrim_range)");
+    }
+    let range = FstrimRange {
+        start: 4096,
+        len: 1 << 20,
+        minlen: 8192,
+    };
+    let image = range.encode();
+    if image.len() != FSTRIM_RANGE_LEN {
+        return TestResult::Fail("fstrim_range image is not 24 bytes");
+    }
+    match FstrimRange::decode(&image) {
+        Ok(back) if back == range => {}
+        _ => return TestResult::Fail("fstrim_range did not survive an encode/decode round trip"),
+    }
+    if u64::from_le_bytes(image[0..8].try_into().unwrap()) != 4096
+        || u64::from_le_bytes(image[8..16].try_into().unwrap()) != 1 << 20
+        || u64::from_le_bytes(image[16..24].try_into().unwrap()) != 8192
+    {
+        return TestResult::Fail("fstrim_range wire layout is not start/len/minlen LE u64s");
+    }
+    if !matches!(
+        FstrimRange::decode(&image[..23]),
+        Err(narf_filesystem::FsError::InvalidData)
+    ) {
+        return TestResult::Fail("short fstrim_range image did not report InvalidData");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_fitrim_wire_range_round_trips);
+
+/// `IoctlContext` fake for the file-fd FITRIM path: serves the
+/// stored `fstrim_range` image on read and captures the write-back.
+struct FitrimTestCtx {
+    input: [u8; 24],
+    output: narf_lib::sync::IrqSafeSpinLock<Vec<u8>>,
+}
+
+impl narf_filesystem::IoctlContext for FitrimTestCtx {
+    fn read(&self, _address: u64, destination: &mut [u8]) -> Result<(), narf_filesystem::FsError> {
+        let n = destination.len().min(self.input.len());
+        destination[..n].copy_from_slice(&self.input[..n]);
+        Ok(())
+    }
+    fn write(&self, _address: u64, source: &[u8]) -> Result<(), narf_filesystem::FsError> {
+        *self.output.lock() = source.to_vec();
+        Ok(())
+    }
+    fn nonblocking(&self) -> bool {
+        false
+    }
+}
+
+/// FITRIM reaches the volume through both ioctl transports: the
+/// directory fd (`DirOps::ioctl_async`, the path `fstrim(8)` uses
+/// on the mount point) and a regular-file fd
+/// (`FileOps::ioctl_user`). Both report the same trimmed bytes,
+/// and the discards land on the driver trim hook.
+fn smoke_ext2_fitrim_ioctl_paths() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let (device, volume) = match fitrim_fixture() {
+        Some(pair) => pair,
+        None => return TestResult::Fail("fitrim fixture mount failed"),
+    };
+    let fs_bytes = volume.superblock.total_blocks() * volume.block_size() as u64;
+    let input = crate::fitrim::FstrimRange {
+        start: 0,
+        len: fs_bytes,
+        minlen: 0,
+    }
+    .encode();
+    // Directory fd.
+    let root = volume.root();
+    let reply = match poll_once(root.ioctl_async(crate::fitrim::FITRIM, 0, &input, 24)) {
+        Some(Ok(reply)) => reply,
+        _ => return TestResult::Fail("FITRIM on the root directory fd failed"),
+    };
+    if reply.result != 0 || reply.output.len() != 24 {
+        return TestResult::Fail("FITRIM directory reply is malformed");
+    }
+    let trimmed_dir = match crate::fitrim::FstrimRange::decode(&reply.output) {
+        Ok(range) => range.len,
+        Err(_) => return TestResult::Fail("FITRIM directory reply did not decode"),
+    };
+    // Regular-file fd.
+    let file = match poll_once(root.lookup_async("data")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("lookup of the fitrim fixture file failed"),
+    };
+    let ctx = FitrimTestCtx {
+        input,
+        output: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+    };
+    if !matches!(
+        poll_once(file.ioctl_user(crate::fitrim::FITRIM, 0x1000, &ctx)),
+        Some(Ok(0))
+    ) {
+        return TestResult::Fail("FITRIM on the file fd failed");
+    }
+    let written = ctx.output.lock().clone();
+    let trimmed_file = match crate::fitrim::FstrimRange::decode(&written) {
+        Ok(range) => range.len,
+        Err(_) => return TestResult::Fail("FITRIM file write-back did not decode"),
+    };
+    // Discard is idempotent — the bitmap is unchanged — so both
+    // transports trim the same free set.
+    if trimmed_dir == 0 || trimmed_file == 0 {
+        return TestResult::Fail("FITRIM ioctl path trimmed nothing");
+    }
+    if trimmed_dir != trimmed_file {
+        return TestResult::Fail("FITRIM directory and file transports disagree");
+    }
+    if device.discards.lock().is_empty() {
+        return TestResult::Fail("FITRIM ioctl paths recorded no driver discard");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_fitrim_ioctl_paths);
