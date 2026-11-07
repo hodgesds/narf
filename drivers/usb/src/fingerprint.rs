@@ -49,7 +49,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
+use crate::xhci::{EndpointConfig, EndpointKind};
 
 // ── Vendor + USB-ID table ─────────────────────────────────────────────
 
@@ -329,25 +329,29 @@ impl FingerprintDevice {
     /// `bulk_out_ep` (0 = interrupt-only, exactly the ELAN
     /// encoding).
     ///
-    /// Caller must hold an `Arc<Xhci>` — call from async context or
-    /// via `narf_scheduler::block_on`.
-    pub async fn read_response(&self, xhci: &Xhci, buf: &mut [u8]) -> Result<usize, FpError> {
+    /// The `transport` is the same [`FpTransport`] seam the bind
+    /// path and the `/dev/fp<N>` node use — production passes
+    /// `XhciFpTransport` for the reader's controller, fixtures
+    /// pass a modelled device. Call from async context or via
+    /// `narf_scheduler::block_on`.
+    pub async fn read_response(
+        &self,
+        transport: &dyn FpTransport,
+        buf: &mut [u8],
+    ) -> Result<usize, FpError> {
         match self.vendor {
             // Elan dispatches through the branch's `read_interrupt_in`
             // helper, whose body is identical to the inlined arm it
             // replaces (arm-once + 500 ms poll loop); no behavior change.
-            FpVendor::Elan => self.read_interrupt_in(xhci, buf).await,
-            FpVendor::Synaptics | FpVendor::Goodix | FpVendor::Validity => xhci
-                .bulk_in(self.slot_id, self.bulk_in_ep, buf)
-                .await
-                .map_err(|_| FpError::EndpointConfig),
+            FpVendor::Elan => self.read_interrupt_in(transport, buf).await,
+            FpVendor::Synaptics | FpVendor::Goodix | FpVendor::Validity => {
+                transport.bulk_in(self.slot_id, self.bulk_in_ep, buf).await
+            }
             FpVendor::Wbdi => {
                 if self.bulk_out_ep == 0 {
-                    self.read_interrupt_in(xhci, buf).await
+                    self.read_interrupt_in(transport, buf).await
                 } else {
-                    xhci.bulk_in(self.slot_id, self.bulk_in_ep, buf)
-                        .await
-                        .map_err(|_| FpError::EndpointConfig)
+                    transport.bulk_in(self.slot_id, self.bulk_in_ep, buf).await
                 }
             }
         }
@@ -358,18 +362,21 @@ impl FingerprintDevice {
     /// `poll_interrupt_in` stages the next TRB after every completed
     /// transfer, so keep exactly one TRB outstanding for this
     /// endpoint's persistent DMA buffer.
-    async fn read_interrupt_in(&self, xhci: &Xhci, buf: &mut [u8]) -> Result<usize, FpError> {
+    async fn read_interrupt_in(
+        &self,
+        transport: &dyn FpTransport,
+        buf: &mut [u8],
+    ) -> Result<usize, FpError> {
         if !self.armed.swap(true, Ordering::AcqRel) {
-            xhci.arm_interrupt_in(
+            transport.arm_interrupt_in(
                 self.slot_id,
                 self.bulk_in_ep,
                 self.in_max_packet.min(64) as u32,
-            )
-            .map_err(|_| FpError::EndpointConfig)?;
+            )?;
         }
         let deadline = narf_time::Deadline::after_ms(500);
         loop {
-            match xhci.poll_interrupt_in(self.slot_id, self.bulk_in_ep, buf) {
+            match transport.poll_interrupt_in(self.slot_id, self.bulk_in_ep, buf) {
                 Ok(Some(n)) => return Ok(n),
                 Ok(None) => {
                     if deadline.expired() {
@@ -386,14 +393,17 @@ impl FingerprintDevice {
     ///
     /// Not applicable to ELAN (interrupt-IN only). Returns an error
     /// if called on an ELAN device that has no bulk-OUT endpoint.
-    pub async fn send_command(&self, xhci: &Xhci, cmd: &[u8]) -> Result<(), FpError> {
+    pub async fn send_command(
+        &self,
+        transport: &dyn FpTransport,
+        cmd: &[u8],
+    ) -> Result<(), FpError> {
         if self.bulk_out_ep == 0 {
             return Err(FpError::EndpointsMissing);
         }
-        let transferred = xhci
+        let transferred = transport
             .bulk_out(self.slot_id, self.bulk_out_ep, cmd)
-            .await
-            .map_err(|_| FpError::EndpointConfig)?;
+            .await?;
         require_full_transfer(transferred, cmd.len())
     }
 }
@@ -658,8 +668,9 @@ pub fn __test_push(dev: Arc<FingerprintDevice>) {
 // ── /dev/fp0 FileOps bridge ───────────────────────────────────────────
 
 /// Test-only: build a `/dev/fp<N>` node for `dev` over an explicit
-/// transport, so smokes can drive the ioctl surface without silicon
-/// (production nodes come from `lookup_fp` with `XhciFpTransport`).
+/// transport, so smokes can drive the ioctl + data-plane surfaces
+/// without silicon (production nodes come from `lookup_fp` with
+/// `XhciFpTransport`).
 #[doc(hidden)]
 pub fn __test_fp_node(
     dev: Arc<FingerprintDevice>,
@@ -668,13 +679,22 @@ pub fn __test_fp_node(
     Arc::new(FpFileNode { dev, transport })
 }
 
-// ── Control-transfer transport seam ───────────────────────────────────
+// ── Controller transport seam ────────────────────────────────────────
 
-/// The control-transfer operations the `/dev/fp<N>` ioctl surface
-/// needs from a bound reader. Production implements it over the
-/// global xHCI controller; fixtures implement it with a modelled
-/// device so the published surface is exercised without silicon
+/// The controller operations the fingerprint stack needs from a
+/// bound reader: EP0 control transfers (the `/dev/fp<N>` ioctl
+/// surface), endpoint configuration + bulk/interrupt transfers
+/// (the bind path and the FileOps data plane). Production
+/// implements it over the global xHCI controller
+/// (`XhciFpTransport`, resolving the controller by id per call);
+/// fixtures implement it with a modelled device so the bind,
+/// transfer, and WBDI conversations are exercised without silicon
 /// (the CCID bridge's `CcidTransport` seam, same shape).
+///
+/// One seam for the whole stack on purpose: the bind path, the
+/// data plane, and the ioctl surface all talk to the same
+/// controller, so a fixture that models the device exercises the
+/// production paths, not parallel copies of them.
 pub trait FpTransport: Send + Sync {
     /// EP0 control-IN transfer (device-to-host). `out` length must
     /// equal the requested `w_length`; returns bytes actually read.
@@ -699,17 +719,137 @@ pub trait FpTransport: Send + Sync {
         w_index: u16,
         data: &'a [u8],
     ) -> FpFuture<'a, Result<usize, FpError>>;
+    /// Controller id this transport talks to (index into
+    /// `xhci::controller_by_id` for the production transport;
+    /// the fake's fixed id). The bind path records it on the
+    /// device so `lookup_fp` nodes resolve the same controller.
+    fn controller_id(&self) -> u8;
+    /// Configure the slot's endpoints (xHCI Configure Endpoint
+    /// command). The bind path issues this before
+    /// SET_CONFIGURATION; a failure aborts the bind with
+    /// `FpError::EndpointConfig` and registers nothing.
+    fn configure_endpoints<'a>(
+        &'a self,
+        slot_id: u8,
+        endpoints: &'a [EndpointConfig],
+    ) -> FpFuture<'a, Result<(), FpError>>;
+    /// Bulk-IN transfer on DCI `dci`; returns bytes read.
+    fn bulk_in<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        buf: &'a mut [u8],
+    ) -> FpFuture<'a, Result<usize, FpError>>;
+    /// Bulk-OUT transfer on DCI `dci`; returns bytes written.
+    /// Callers enforce the full-transfer rule (`send_command`
+    /// rejects a short count); the transport reports honestly.
+    fn bulk_out<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        data: &'a [u8],
+    ) -> FpFuture<'a, Result<usize, FpError>>;
+    /// Arm the interrupt-IN endpoint (ELAN / interrupt-bound
+    /// WBDI): one TRB outstanding for the endpoint's persistent
+    /// DMA buffer. The `u64` the xHCI call returns (the DMA
+    /// buffer address) is not needed by the poller, so the seam
+    /// reports unit.
+    fn arm_interrupt_in(&self, slot_id: u8, dci: u8, len: u32) -> Result<(), FpError>;
+    /// Poll a completed interrupt-IN transfer into `buf`:
+    /// `Ok(Some(n))` = `n` bytes received, `Ok(None)` = nothing
+    /// yet, `Err` = controller-side error.
+    fn poll_interrupt_in(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        buf: &mut [u8],
+    ) -> Result<Option<usize>, FpError>;
 }
 
 /// Boxed future returned by [`FpTransport`] methods.
 pub type FpFuture<'a, T> = core::pin::Pin<Box<dyn core::future::Future<Output = T> + Send + 'a>>;
 
 /// Production transport: a bound reader driven over its own controller
-/// (index into `xhci::controller_by_id`).
+/// (index into `xhci::controller_by_id`). `pub(crate)` so the
+/// attach cascade can build one for the controller it holds; the
+/// id field stays private.
 #[derive(Debug)]
-struct XhciFpTransport(u8);
+pub(crate) struct XhciFpTransport(u8);
+
+impl XhciFpTransport {
+    /// Production transport for the controller with this id.
+    /// `pub(crate)` so the attach cascade can hand the bind
+    /// path a transport for the controller it already holds
+    /// (the bind functions take `&dyn FpTransport`, never `&Xhci`).
+    pub(crate) fn for_controller(controller: u8) -> Self {
+        Self(controller)
+    }
+}
 
 impl FpTransport for XhciFpTransport {
+    fn controller_id(&self) -> u8 {
+        self.0
+    }
+
+    fn configure_endpoints<'a>(
+        &'a self,
+        slot_id: u8,
+        endpoints: &'a [EndpointConfig],
+    ) -> FpFuture<'a, Result<(), FpError>> {
+        Box::pin(async move {
+            let xhci = crate::xhci::controller_by_id(self.0).ok_or(FpError::EndpointConfig)?;
+            xhci.configure_endpoints(slot_id, endpoints)
+                .await
+                .map_err(|_| FpError::EndpointConfig)
+        })
+    }
+
+    fn bulk_in<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        buf: &'a mut [u8],
+    ) -> FpFuture<'a, Result<usize, FpError>> {
+        Box::pin(async move {
+            let xhci = crate::xhci::controller_by_id(self.0).ok_or(FpError::EndpointConfig)?;
+            xhci.bulk_in(slot_id, dci, buf)
+                .await
+                .map_err(|_| FpError::EndpointConfig)
+        })
+    }
+
+    fn bulk_out<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        data: &'a [u8],
+    ) -> FpFuture<'a, Result<usize, FpError>> {
+        Box::pin(async move {
+            let xhci = crate::xhci::controller_by_id(self.0).ok_or(FpError::EndpointConfig)?;
+            xhci.bulk_out(slot_id, dci, data)
+                .await
+                .map_err(|_| FpError::EndpointConfig)
+        })
+    }
+
+    fn arm_interrupt_in(&self, slot_id: u8, dci: u8, len: u32) -> Result<(), FpError> {
+        let xhci = crate::xhci::controller_by_id(self.0).ok_or(FpError::EndpointConfig)?;
+        xhci.arm_interrupt_in(slot_id, dci, len)
+            .map(|_| ())
+            .map_err(|_| FpError::EndpointConfig)
+    }
+
+    fn poll_interrupt_in(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        buf: &mut [u8],
+    ) -> Result<Option<usize>, FpError> {
+        let xhci = crate::xhci::controller_by_id(self.0).ok_or(FpError::EndpointConfig)?;
+        xhci.poll_interrupt_in(slot_id, dci, buf)
+            .map_err(|_| FpError::EndpointConfig)
+    }
+
     fn control_in<'a>(
         &'a self,
         slot_id: u8,
@@ -828,11 +968,15 @@ impl narf_filesystem::FileOps for FpFileNode {
 
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         let dev = self.dev.clone();
+        // The data plane runs over the node's own transport — the
+        // same seam the ioctl surface uses — so a node built over a
+        // modelled device (fixtures) reads from the model, and a
+        // production node resolves its controller per call through
+        // `XhciFpTransport`. No separate controller lookup here:
+        // the transport owns that resolution.
+        let transport = self.transport.clone();
         Box::pin(async move {
-            let xhci = crate::xhci::controller_by_id(dev.controller).ok_or(
-                narf_filesystem::FsError::Io(narf_block::BlockError::IOError),
-            )?;
-            dev.read_response(&xhci, buf)
+            dev.read_response(transport.as_ref(), buf)
                 .await
                 .map_err(|_| narf_filesystem::FsError::Io(narf_block::BlockError::IOError))
         })
@@ -843,11 +987,9 @@ impl narf_filesystem::FileOps for FpFileNode {
         let len = buf.len();
         // Clone buf into an owned Vec so the future can be 'static.
         let owned: alloc::vec::Vec<u8> = buf.to_vec();
+        let transport = self.transport.clone();
         Box::pin(async move {
-            let xhci = crate::xhci::controller_by_id(dev.controller).ok_or(
-                narf_filesystem::FsError::Io(narf_block::BlockError::IOError),
-            )?;
-            dev.send_command(&xhci, &owned)
+            dev.send_command(transport.as_ref(), &owned)
                 .await
                 .map(|()| len)
                 .map_err(|_| narf_filesystem::FsError::Io(narf_block::BlockError::IOError))
@@ -1017,6 +1159,36 @@ fn parse_fp_name(name: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
+/// Test-only transport override for `lookup_fp`, so
+/// kernel-test smokes can drive the devfs-returned `/dev/fp<N>`
+/// node over a modelled device (the production node resolves
+/// its controller per call through `XhciFpTransport`, which a
+/// fake controller can never satisfy — it is not an `Xhci`).
+/// Always `None` outside fixtures; the smoke that sets it must
+/// clear it before returning (same discipline as the
+/// capability-hook swap in the open-gate smoke).
+static FP_TEST_TRANSPORT: IrqSafeSpinLock<Option<Arc<dyn FpTransport>>> =
+    IrqSafeSpinLock::new(None);
+
+/// Test-only: make `lookup_fp` build nodes over `transport`
+/// instead of the production `XhciFpTransport` for the bound
+/// reader's controller. Pass `None` to restore production
+/// resolution.
+#[doc(hidden)]
+pub fn __test_set_fp_transport(transport: Option<Arc<dyn FpTransport>>) {
+    *FP_TEST_TRANSPORT.lock() = transport;
+}
+
+/// Resolve the transport a `lookup_fp` node talks through: the
+/// test override when one is installed, else the production
+/// `XhciFpTransport` for the reader's controller.
+fn transport_for(dev: &FingerprintDevice) -> Arc<dyn FpTransport> {
+    if let Some(t) = FP_TEST_TRANSPORT.lock().as_ref() {
+        return t.clone();
+    }
+    Arc::new(XhciFpTransport(dev.controller))
+}
+
 /// Devfs provider lookup: `/dev/fp<N>` resolves to the bound
 /// reader at registry index `N`, or nothing when no such reader
 /// is bound. Nodes are built on demand from the registry, so
@@ -1025,11 +1197,8 @@ fn parse_fp_name(name: &str) -> Option<usize> {
 pub fn lookup_fp(name: &str) -> Option<Arc<dyn narf_filesystem::FileOps>> {
     let idx = parse_fp_name(name)?;
     let dev = FP_DEVICES.lock().get(idx)?.clone();
-    let controller = dev.controller;
-    Some(Arc::new(FpFileNode {
-        dev,
-        transport: Arc::new(XhciFpTransport(controller)),
-    }) as Arc<dyn narf_filesystem::FileOps>)
+    let transport = transport_for(&dev);
+    Some(Arc::new(FpFileNode { dev, transport }) as Arc<dyn narf_filesystem::FileOps>)
 }
 
 /// Devfs provider enumeration: one `fp<N>` per bound reader, in
@@ -1100,9 +1269,15 @@ fn register_bound_device(dev: Arc<FingerprintDevice>) -> usize {
 /// 4. Registers the device in [`FP_DEVICES`].
 /// 5. Logs a single summary line.
 ///
+/// The controller operations run over `transport` (the
+/// [`FpTransport`] seam): production passes `XhciFpTransport`
+/// for the addressed controller, fixtures pass a modelled
+/// device. No `&Xhci` here on purpose — the bind conversation
+/// is fixture-testable only through the seam.
+///
 /// Returns `Ok(())` on success. On failure the caller frees the slot.
 pub async fn try_bind_fingerprint_already_addressed(
-    xhci_dev: &Xhci,
+    transport: &dyn FpTransport,
     slot_id: u8,
     vid: u16,
     pid: u16,
@@ -1118,7 +1293,7 @@ pub async fn try_bind_fingerprint_already_addressed(
         } => alloc::vec![bulk_in, bulk_out],
         FpEndpoints::InterruptIn { intr_in, .. } => alloc::vec![intr_in],
     };
-    xhci_dev
+    transport
         .configure_endpoints(slot_id, &ep_configs)
         .await
         .map_err(|_| FpError::EndpointConfig)?;
@@ -1128,7 +1303,7 @@ pub async fn try_bind_fingerprint_already_addressed(
         FpEndpoints::Bulk { config_value, .. } => config_value,
         FpEndpoints::InterruptIn { config_value, .. } => config_value,
     };
-    xhci_dev
+    transport
         .control_out(
             slot_id,
             0x00,
@@ -1142,7 +1317,7 @@ pub async fn try_bind_fingerprint_already_addressed(
 
     // Build the FingerprintDevice record.
     let mut dev = device_from_endpoints(slot_id, vendor, &eps);
-    dev.controller = xhci_dev.id();
+    dev.controller = transport.controller_id();
     let dev = Arc::new(dev);
 
     {
@@ -1205,7 +1380,7 @@ pub async fn try_bind_fingerprint_already_addressed(
 /// Returns the registry index of the registered device; it
 /// publishes as `/dev/fp<N>` via the devfs provider registry.
 pub async fn try_bridge_wbdi_already_addressed(
-    xhci_dev: &Xhci,
+    transport: &dyn FpTransport,
     slot_id: u8,
     cfg: &[u8],
 ) -> Result<usize, FpError> {
@@ -1217,7 +1392,7 @@ pub async fn try_bridge_wbdi_already_addressed(
         } => alloc::vec![bulk_in, bulk_out],
         FpEndpoints::InterruptIn { intr_in, .. } => alloc::vec![intr_in],
     };
-    xhci_dev
+    transport
         .configure_endpoints(slot_id, &ep_configs)
         .await
         .map_err(|_| FpError::EndpointConfig)?;
@@ -1226,7 +1401,7 @@ pub async fn try_bridge_wbdi_already_addressed(
         FpEndpoints::Bulk { config_value, .. } => config_value,
         FpEndpoints::InterruptIn { config_value, .. } => config_value,
     };
-    xhci_dev
+    transport
         .control_out(
             slot_id,
             0x00,
@@ -1239,7 +1414,7 @@ pub async fn try_bridge_wbdi_already_addressed(
         .map_err(|_| FpError::SetConfiguration)?;
 
     let mut dev = device_from_endpoints(slot_id, FpVendor::Wbdi, &eps);
-    dev.controller = xhci_dev.id();
+    dev.controller = transport.controller_id();
     let dev = Arc::new(dev);
     {
         use core::fmt::Write as _;

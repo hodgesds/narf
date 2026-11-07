@@ -1244,9 +1244,20 @@ async fn dispatch_after_address(
         // expose vendor class 0xFF but omit the MS OS 2.0 descriptor,
         // so the WBDI recogniser would never fire for them. At most
         // ~10 lines per the scope spec.
+        //
+        // The fingerprint bind path (table bind + WBDI
+        // recogniser/bridge) talks to the controller through the
+        // `FpTransport` seam, so fixtures can drive it against a
+        // modelled device; production builds the transport for the
+        // controller this cascade already holds.
+        let fp_transport = crate::fingerprint::XhciFpTransport::for_controller(xhci_dev.id());
         if fingerprint::classify_vid_pid(dev_vid, dev_pid).is_some()
             && fingerprint::try_bind_fingerprint_already_addressed(
-                xhci_dev, slot_id, dev_vid, dev_pid, &cfg_blob,
+                &fp_transport,
+                slot_id,
+                dev_vid,
+                dev_pid,
+                &cfg_blob,
             )
             .await
             .is_ok()
@@ -1312,10 +1323,12 @@ async fn dispatch_after_address(
         // this comment previously carried was wrong: the code has
         // always matched WINUSB/WBDI.)
         if let Ok(entry) =
-            crate::wbdi::try_bind_wbdi_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+            crate::wbdi::try_bind_wbdi_already_addressed(&fp_transport, slot_id, &cfg_blob).await
         {
             match crate::fingerprint::try_bridge_wbdi_already_addressed(
-                xhci_dev, slot_id, &cfg_blob,
+                &fp_transport,
+                slot_id,
+                &cfg_blob,
             )
             .await
             {

@@ -49,7 +49,7 @@
 
 extern crate alloc;
 
-use crate::xhci::Xhci;
+use crate::fingerprint::FpTransport;
 
 /// MS OS 2.0 Platform Capability UUID, encoded as a 16-byte
 /// little-endian GUID per the MS OS 2.0 spec §3.4 Table 4.
@@ -171,11 +171,19 @@ pub(crate) fn find_ms_os_20_platform_cap(blob: &[u8]) -> Option<(u8, u16)> {
 /// Issue GET_DESCRIPTOR(BOS) and search the returned blob for an
 /// MS OS 2.0 Platform Capability descriptor. Returns
 /// `(vendor_code, ms_os_desc_total_length)` on match.
-async fn fetch_ms_os_20_platform_cap(xhci_dev: &Xhci, slot_id: u8) -> Option<(u8, u16)> {
+///
+/// The transfers run over `transport` (the fingerprint
+/// [`FpTransport`] seam): production passes `XhciFpTransport`
+/// for the addressed controller, fixtures pass a modelled
+/// device, so the BOS fetch is fixture-testable without silicon.
+async fn fetch_ms_os_20_platform_cap(
+    transport: &dyn FpTransport,
+    slot_id: u8,
+) -> Option<(u8, u16)> {
     // Stage 1: 5-byte BOS header to learn wTotalLength
     // (USB 3.1 §9.6.2.1).
     let mut head = [0u8; 5];
-    xhci_dev
+    transport
         .control_in(
             slot_id,
             0x80, // device-to-host | standard | device
@@ -194,7 +202,7 @@ async fn fetch_ms_os_20_platform_cap(xhci_dev: &Xhci, slot_id: u8) -> Option<(u8
         return None;
     }
     let mut blob = alloc::vec![0u8; total];
-    xhci_dev
+    transport
         .control_in(
             slot_id,
             0x80,
@@ -257,15 +265,19 @@ pub(crate) fn is_wbdi_descriptor_set(blob: &[u8]) -> bool {
 /// recognised reader into the fingerprint stack; see
 /// `fingerprint::try_bridge_wbdi_already_addressed`.
 ///
+/// The control transfers run over `transport` (the fingerprint
+/// [`FpTransport`] seam), so the BOS fetch + vendor request
+/// conversation is fixture-testable against a modelled device.
+///
 /// **Slot lifecycle**: does NOT call `disable_slot` on failure. The
 /// dispatcher owns the slot.
 pub async fn try_bind_wbdi_already_addressed(
-    xhci_dev: &Xhci,
+    transport: &dyn FpTransport,
     slot_id: u8,
     cfg: &[u8],
 ) -> Result<WbdiDevice, WbdiBindError> {
     let vendor_iface = find_vendor_interface(cfg).ok_or(WbdiBindError::NoVendorInterface)?;
-    let (vendor_code, total_set) = fetch_ms_os_20_platform_cap(xhci_dev, slot_id)
+    let (vendor_code, total_set) = fetch_ms_os_20_platform_cap(transport, slot_id)
         .await
         .ok_or(WbdiBindError::NoMsOs20PlatformCap)?;
     let total_set = total_set as usize;
@@ -276,7 +288,7 @@ pub async fn try_bind_wbdi_already_addressed(
     // device), bRequest=vendor_code, wValue=0,
     // wIndex=MS_OS_20_DESCRIPTOR_INDEX (=0x07).
     let mut blob = alloc::vec![0u8; total_set];
-    xhci_dev
+    transport
         .control_in(
             slot_id,
             0xC0,

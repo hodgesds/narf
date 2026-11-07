@@ -295,6 +295,18 @@ also consult upstream Linux GPL sources.
   enumeration agree by construction, so readdir never advertises a
   phantom node. There is no static `fp0` entry and no separate
   node global anymore (#920).
+- The fingerprint bind, data-plane, and WBDI-recognition paths
+  talk to the controller through one seam, `fingerprint::FpTransport`
+  (issue #923): endpoint configuration, SET_CONFIGURATION, bulk
+  transfers, interrupt-IN arm/poll, and EP0 control transfers.
+  Production implements it as `XhciFpTransport` (resolving the
+  controller by id per call); the attach cascade builds it for the
+  controller it holds, and `/dev/fp<N>` nodes carry it, so the
+  bind conversation (`try_bind_fingerprint_already_addressed`),
+  the WBDI conversation (BOS fetch → vendor request → bridge),
+  and node read/write are all fixture-testable against a modelled
+  device. `lookup_fp` consults a test-only transport override so
+  fixtures can drive the devfs-returned node over the model.
 - The `/dev/fp<N>` control surface is two NARF-local ioctls
   (Linux `_IOC` encoding, type `'P'`, 0x50):
   `FP_IOC_CTRL_TRANSFER` (nr 0) issues one EP0 vendor control
