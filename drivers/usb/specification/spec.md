@@ -145,7 +145,7 @@ also consult upstream Linux GPL sources.
   Slot ids and root-port numbers are unique only within a controller, so
   every binding carries its controller: slot/port-keyed registries are
   `xhci::PerController` (one registry per controller: hubs, boot/report
-  keyboards, mice, touchpads, consumer, generic HID, ACM, vendor serial,
+  keyboards, mice, touchpads, RMI/Elan touchpads, consumer, generic HID, ACM, vendor serial,
   xpad), and index-keyed records (MSC, fingerprint, CDC-NCM/ECM, r8152, UVC,
   UAC, CCID, CTAP, btusb) store a `controller` field. Per-slot detach and
   recovery teardown take the controller (`attach::detach_all_bindings(id)`,
@@ -205,7 +205,7 @@ also consult upstream Linux GPL sources.
   later index, so a cached index silently retargets after a detach
   (#892); every use resolves the hub by slot id under one lock
   hold. The pumped HID classes (boot keyboard, boot mouse,
-  PTP touchpad, consumer control) record the same `hub_port`
+  PTP touchpad, RMI/Elan touchpad, consumer control, generic HID) record the same `hub_port`
   context through their `try_bind_*_already_addressed` binders;
   their pumps feed on each completed interrupt-IN report, and the
   supervisor resumes suspended HID-bound ports immediately before
@@ -213,6 +213,23 @@ also consult upstream Linux GPL sources.
   opening a fresh idle window — a suspended port gates the very
   interrupt endpoint the pump polls, so the resume has to come
   from the supervisor side of the pump, not from report traffic.
+- USB-HID RMI4 / Elan touchpads (issue #1681): after the PTP branch
+  in the attach cascade, `hid::rmi_elan` classifies by VID/PID
+  against the existing `RMI_DEVICE_TABLE` / `ELAN_DEVICE_TABLE`
+  (Elan I2C-HID rows never match on USB), binds the HID interface
+  (Elan prefers interface 1, per Linux `hid-elan.c`), and probes
+  through a synchronous `HidIo` / `ElanHidIo` backend over xHCI
+  (interrupt-OUT output reports, control SET_REPORT Feature
+  reports, control GET_REPORT Feature reads, bounded interrupt-IN
+  wait). The sync backend bridges to the async xHCI control path
+  with `block_on_spin` (the `btusb` precedent — the halting
+  `block_on` would panic inside the supervisor's executor poll).
+  A failed vendor probe falls back to generic HID for the same
+  interface (`hid::generic::try_bind_generic_already_armed`, which
+  does not re-arm the already-armed interrupt-IN endpoint), so the
+  device is never dropped by this branch. The generic HID pump is
+  wired into the supervisor's pump cycle so fallback bindings
+  actually deliver reports.
 - NIC idle-suspend (#1256): the USB NIC drivers (r8152, CDC-NCM,
   CDC-ECM) participate in hub idle-suspend through a class
   suspend-hook registry (`class_registry::register_suspend_hook`,

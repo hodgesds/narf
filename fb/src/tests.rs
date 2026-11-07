@@ -102,6 +102,23 @@ fn smoke_fb_picker_selects_a_backend() -> TestResult {
 }
 kernel_test_in!("fb", smoke_fb_picker_selects_a_backend);
 
+// Moved here from `drivers/input` (where it was the crate's only
+// use of `narf-fb`, which closed a `usb -> input-driver -> fb ->
+// usb` dependency cycle once USB-HID RMI4/Elan gained a
+// `narf-input-driver` edge; see #1721). The test asserts on the fb
+// backend picker, so this crate owns it; registration keeps the
+// original `"drivers/graphics"` grouping.
+fn smoke_generic_fb_discovery() -> TestResult {
+    use crate::last_picked_backend;
+    if let Some(name) = last_picked_backend() {
+        if name == "generic-fb" || name == "bochs-display" || name == "virtio-gpu" {
+            return TestResult::Pass;
+        }
+    }
+    TestResult::Skip("no framebuffer backend picked")
+}
+kernel_test_in!("drivers/graphics", smoke_generic_fb_discovery);
+
 fn smoke_fb_writer_fill_clips_and_paints() -> TestResult {
     use crate::{bootstrap_writer, FbWriter, Rect};
     use narf_graphics::Pixel32;

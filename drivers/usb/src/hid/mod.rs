@@ -78,6 +78,7 @@ pub mod logitech_hidpp;
 pub mod microsoft;
 pub mod mouse;
 pub mod report_descriptor;
+pub mod rmi_elan;
 pub mod touchpad;
 pub mod wacom;
 pub mod wacom_features;
@@ -890,6 +891,7 @@ pub fn hub_ports(controller: u8) -> alloc::vec::Vec<(u8, u8)> {
     };
     v.extend(mouse::hub_ports(controller));
     v.extend(touchpad::hub_ports(controller));
+    v.extend(rmi_elan::hub_ports(controller));
     v.extend(consumer::hub_ports(controller));
     v.extend(generic::hub_ports(controller));
     v.sort_unstable();

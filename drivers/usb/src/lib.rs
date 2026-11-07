@@ -318,7 +318,13 @@ fn pump_bound_devices(controller: &xhci::Xhci) {
     hid::pump_all(controller);
     hid::mouse::pump_all(controller);
     hid::touchpad::pump_all(controller);
+    hid::rmi_elan::pump_all(controller);
     hid::consumer::pump_all(controller);
+    // Generic HID was bound but never pumped until #1681 wired it
+    // in: the RMI/Elan vendor-probe fallback binds generic devices,
+    // and a bound-but-unpumped generic device would be silently
+    // dead. Pump it alongside the other HID classes.
+    hid::generic::pump_all(controller);
     cdc_acm::pump_all(controller);
     serial::port::pump_all(controller);
     xpad::pump_all(controller);
@@ -592,6 +598,8 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                     AttachOutcome::Keyboard
                     | AttachOutcome::Mouse
                     | AttachOutcome::Touchpad
+                    | AttachOutcome::RmiElanTouchpad
+                    | AttachOutcome::GenericHid
                     | AttachOutcome::ConsumerControl
                     | AttachOutcome::SerialAcm
                     | AttachOutcome::SerialVendor
@@ -733,6 +741,8 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                         AttachOutcome::Keyboard
                         | AttachOutcome::Mouse
                         | AttachOutcome::Touchpad
+                        | AttachOutcome::RmiElanTouchpad
+                        | AttachOutcome::GenericHid
                         | AttachOutcome::ConsumerControl
                         | AttachOutcome::SerialAcm
                         | AttachOutcome::SerialVendor
