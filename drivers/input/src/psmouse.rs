@@ -2065,6 +2065,7 @@ pub fn decode_synaptics_oldabs(buf: &[u8; 6]) -> SynapticsHwState {
 }
 
 /// Synaptics absolute packet flavour, for byte validation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SynapticsPktType {
     /// NEWABS, not yet classified strict/relaxed (validates with

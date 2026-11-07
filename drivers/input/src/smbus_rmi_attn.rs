@@ -108,14 +108,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use narf_aml::resource::ResourceItem;
 use narf_drivers_gpio::{GpioIrqConfig, GpioPull};
 use narf_input::evdev::{bus, DeviceCaps, DeviceNode, InputId, ROUTER};
-use narf_input::rmi4::TouchpadReport;
+use narf_input::rmi4::{f01_device_control_byte, TouchpadReport};
 
 use crate::hid_rmi::{clickpad_btn_left, USB_VENDOR_ID_SYNAPTICS};
 use crate::i2c_hid_touch::build_rmi_caps;
 use crate::rmi4_core::{
-    decode_f12_data1, decode_f30_buttons, f01_device_control_byte, find_function, Rmi4Contact,
-    Rmi4DeviceProbe, Rmi4PumpState, Rmi4Transport, TransportError, F01_DEVICE_CONTROL,
-    F01_SLEEP_NORMAL, F11_2D_TOUCHPAD, F12_2D_TOUCHPAD_NEXT, F12_OBJECT_SIZE, F30_GPIO_LED,
+    decode_f12_data1, decode_f30_buttons, find_function, Rmi4Contact, Rmi4DeviceProbe,
+    Rmi4PumpState, Rmi4Transport, TransportError, F01_DEVICE_CONTROL, F01_SLEEP_NORMAL,
+    F11_2D_TOUCHPAD, F12_2D_TOUCHPAD_NEXT, F12_OBJECT_SIZE, F30_GPIO_LED,
 };
 use crate::smbus_rmi::{
     probe_smbus_rmi_with_state, SmbusRmiSessionState, SmbusRmiTransport, SMBUS_RMI_DEFAULT_ADDR,
@@ -329,7 +329,17 @@ pub fn service_attn(
                             pressure: o.z as i32,
                         })
                         .collect();
-                    return Ok(state.pump_contacts(node, &contacts, btn_left, 0, 0xFFFF, 0, 0xFFFF));
+                    return Ok(state.pump_contacts(
+                        node,
+                        &contacts,
+                        btn_left,
+                        crate::rmi4_core::Rmi4PumpBounds {
+                            x_min: 0,
+                            x_max: 0xFFFF,
+                            y_min: 0,
+                            y_max: 0xFFFF,
+                        },
+                    ));
                 }
             }
             return Ok(0);
@@ -351,7 +361,17 @@ pub fn service_attn(
                             pressure: 0,
                         })
                         .collect();
-                    return Ok(state.pump_contacts(node, &contacts, btn_left, 0, 0x0FFF, 0, 0x0FFF));
+                    return Ok(state.pump_contacts(
+                        node,
+                        &contacts,
+                        btn_left,
+                        crate::rmi4_core::Rmi4PumpBounds {
+                            x_min: 0,
+                            x_max: 0x0FFF,
+                            y_min: 0,
+                            y_max: 0x0FFF,
+                        },
+                    ));
                 }
             }
             return Ok(0);
@@ -361,7 +381,17 @@ pub fn service_attn(
     // coincident button bit): pump the button state with no
     // contacts rather than dropping the frame.
     if sources & probe.source_mask_for(F30_GPIO_LED) != 0 {
-        return Ok(state.pump_contacts(node, &[], btn_left, 0, 0xFFFF, 0, 0xFFFF));
+        return Ok(state.pump_contacts(
+            node,
+            &[],
+            btn_left,
+            crate::rmi4_core::Rmi4PumpBounds {
+                x_min: 0,
+                x_max: 0xFFFF,
+                y_min: 0,
+                y_max: 0xFFFF,
+            },
+        ));
     }
     Ok(0)
 }
