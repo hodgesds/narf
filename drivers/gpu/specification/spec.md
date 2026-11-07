@@ -4623,6 +4623,31 @@ fabric constraints remain with the display owner. Runtime commands run from
 PMFW rejection restores the previous state as in Linux, while timeout,
 revocation, device loss or cancellation leave the owner unusable.
 
+APU machines (Renoir SMU 12.0, Phoenix SMU 13.0.4) have their own
+telemetry owner, `amdgpu_smu_apu_telemetry::ApuTelemetryOwner`, because
+the discrete owners' VRAM transfer buffer does not exist there: the
+owner holds a DMA-coherent page-sized buffer and publishes its device
+address with `SetDriverDramAddrHigh` then `SetDriverDramAddrLow`
+(Linux `smu_v13_0_set_driver_table_location`), then on a 1 s cadence
+sends `TransferTableSmu2Dram` with `TABLE_SMU_METRICS` — 7 on both
+APU generations (`smu12_driver_if.h`, `smu13_driver_if_v13_0_4.h`;
+the discrete value is 5 and must not be "unified" with it) — and
+decodes the staged bytes (`parse_metrics` for 13.0.4, 160 bytes;
+`parse_metrics_v12` for Renoir, 148 bytes, from `smu12_driver_if.h`).
+The power fields are watts on Renoir (`CurrentSocketPower`,
+`ApuPower`, `dGpuPower` in `[W]`) and milliwatts on Phoenix, so the
+two decoders keep distinct types. The staging area is zeroed before
+each transfer, so an acknowledged but unwritten table decodes as
+zeros rather than stale data. The last sample is published like the
+discrete owners' `Snapshot` — retained across a clean rejection,
+never fabricated — and the monitor exits on a terminal SMU failure
+or an epoch change. The owner does not itself register the
+`gpu_temp_mc` provider: that half belongs to the discrete-owner
+provider module (`amdgpu_smu_temp`, PR #1697) and is a rebase
+remainder there, and attaching the owner at APU bring-up (the
+`'static` owner + mailbox slot, cf. `amdgpu_navi22_power::start`)
+is a separate integration step.
+
 `unsafe deep_sleep_control().await` is `smu_v14_0_deep_sleep_control(true)`
 as SMU 14.0.2 maps it: for each DS feature of Linux's walk the board supports
 (FeaturesToRun), in Linux's order DS_GFXCLK, DS_UCLK, DS_FCLK, DS_SOCCLK,
