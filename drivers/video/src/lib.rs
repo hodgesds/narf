@@ -1,6 +1,13 @@
-//! narf-drivers-video — Camera ISP driver scaffold.
+//! narf-drivers-video — Camera ISP refusal markers + UVC driver.
 //!
-//! Stage-0/1: PCI probe, MMIO mapping, firmware-name resolution, and
+//! The integrated ISPs below are NOT drivers yet (#811): each ISP
+//! probe declines its devices with `ProbeError::NotForThisDriver`
+//! before touching the hardware, so no ISP is ever presented as
+//! bound and no video node is registered for one. The PCI ID and
+//! firmware-name tables survive as the per-platform scoping data
+//! for those refusals (see each module's `refusal_reason`).
+//!
+//! Stage-0/1: PCI ID tables, firmware-name constants, and
 //! V4L2-compatible buffer-queue types for:
 //!
 //! | IP             | PCI IDs                                  | Firmware blob                    |
@@ -26,11 +33,14 @@
 //! - **Stage 0 (this commit)** — Crate skeleton, PCI ID tables,
 //!   firmware-name constants, buffer-queue types, pixel-format enum,
 //!   MIPI-CSI sensor-driver trait. No MMIO programming.
-//! - **Stage 1 (this commit)** — PCI probe registration + BAR mapping
-//!   + firmware-name resolution + bound-driver record.
+//! - **Stage 1 (this commit)** — PCI probe registration. The ISP
+//!   probes register their PCI matches and then decline every
+//!   device honestly (#811) instead of claiming hardware they
+//!   cannot drive; the UVC USB path is the working camera route.
 //! - **Stage 2+ (future)** — Firmware load via PSP / CSE paths,
 //!   MIPI-CSI receiver bringup, per-sensor I2C configuration,
-//!   DMA scatter-gather ring, V4L2 buffer dequeue path.
+//!   DMA scatter-gather ring, V4L2 buffer dequeue path. Needs
+//!   Daniel's hardware confirmation (#811).
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -221,9 +231,11 @@ pub type Result<T> = core::result::Result<T, CameraError>;
 /// Camera device abstraction.
 ///
 /// Each ISP driver (IPU3, IPU6, AMD MP2) implements this trait.
-/// Stage-1: `set_format` and `start_streaming` return
-/// `Err(CameraError::NotImplemented)` — they become functional in
-/// Stage-2 when firmware loading and MIPI-CSI bringup land.
+/// No instance can exist while the ISP probes refuse (#811), so
+/// these methods are unreachable today; `set_format` and
+/// `start_streaming` return `Err(CameraError::NotImplemented)` and
+/// become functional in Stage-2 when firmware loading and MIPI-CSI
+/// bringup land.
 pub trait Camera: core::fmt::Debug {
     /// Immutable access to the driver's buffer queue.
     fn buffer_queue(&self) -> &BufferQueue;
