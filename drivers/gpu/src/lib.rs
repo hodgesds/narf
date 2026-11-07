@@ -632,6 +632,8 @@ pub mod amdgpu_smu_navi48;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_navi48_telemetry;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_smu_temp;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_v12;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_v13;
@@ -984,6 +986,17 @@ pub fn register_initcalls() {
     #[cfg(feature = "amdgpu")]
     narf_init::register(Stage::Late, "amdgpu-dp-bridge", || {
         amdgpu_dp_bridge::register_bridge();
+        InitResult::Ok
+    });
+    // Stage::Late: publish the discrete SMU temperature into the
+    // power service's fused snapshot (#1186). The provider reads
+    // the last published telemetry sample live at snapshot time,
+    // so driver probe order does not matter; merge semantics make
+    // it order-independent against the platform composition and
+    // the hwmon CPU registration.
+    #[cfg(feature = "amdgpu")]
+    narf_init::register(Stage::Late, "amdgpu-power-providers", || {
+        amdgpu_smu_temp::register_gpu_temp_provider();
         InitResult::Ok
     });
     // No "gpu-backlight" initcall: the unified dispatcher it logged

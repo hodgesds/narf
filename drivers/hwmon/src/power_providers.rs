@@ -54,12 +54,10 @@ pub fn cpu_temp_mc() -> Option<i32> {
 /// order-independent against the platform composition: it fills
 /// only `cpu_temp_mc` and leaves every other field untouched.
 ///
-/// `gpu_temp_mc` deliberately stays unset: the amdgpu SMU
-/// temperature exists only as a decode of a metrics-table
-/// snapshot with no live in-kernel handle and no production
-/// reader, so there is no honest reading to publish yet — that
-/// half of #914 remains open until the GPU telemetry is
-/// published through a live handle.
+/// `gpu_temp_mc` stays unset here: the GPU crate owns the SMU
+/// telemetry source, so it registers that provider itself
+/// (`amdgpu_smu_temp::register_gpu_temp_provider`, Stage::Late
+/// initcall `amdgpu-power-providers` in narf-drivers-gpu).
 pub fn register_temp_providers() {
     let cap = bootstrap_power_authority();
     let providers = StateProviders {
