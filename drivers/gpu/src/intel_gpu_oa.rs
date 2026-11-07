@@ -470,11 +470,31 @@ pub(crate) fn config_jobs(regs: &[(u32, u32)]) -> Vec<Job> {
 /// struct xe_oa_config: immutable uuid and validated register list.
 #[derive(Debug)]
 pub struct Config {
-    id: u32,
-    uuid: [u8; 36],
-    regs: Vec<(u32, u32)>,
+    pub(crate) id: u32,
+    pub(crate) uuid: [u8; 36],
+    pub(crate) regs: Vec<(u32, u32)>,
+    pub(crate) n_mux: u32,
+    pub(crate) n_bool: u32,
+    pub(crate) n_flex: u32,
 }
 impl Config {
+    pub(crate) fn new(
+        id: u32,
+        uuid: [u8; 36],
+        regs: Vec<(u32, u32)>,
+        n_mux: u32,
+        n_bool: u32,
+        n_flex: u32,
+    ) -> Self {
+        Self {
+            id,
+            uuid,
+            regs,
+            n_mux,
+            n_bool,
+            n_flex,
+        }
+    }
     pub(crate) fn regs(&self) -> &[(u32, u32)] {
         &self.regs
     }
@@ -492,9 +512,38 @@ static REGISTRY: [IrqSafeSpinLock<Registry>; 64] = [const {
 }; 64];
 static ACTIVE: [AtomicBool; 64] = [const { AtomicBool::new(false) }; 64];
 
-fn lookup(card: u32, id: u64) -> Option<Arc<Config>> {
+pub(crate) fn lookup(card: u32, id: u64) -> Option<Arc<Config>> {
     let id = u32::try_from(id).ok()?;
-    REGISTRY[card as usize].lock().configs.get(&id).cloned()
+    REGISTRY
+        .get(card as usize)?
+        .lock()
+        .configs
+        .get(&id)
+        .cloned()
+}
+
+pub(crate) fn query_config_ids(card: u32) -> Vec<u64> {
+    let Some(reg) = REGISTRY.get(card as usize) else {
+        return Vec::new();
+    };
+    let registry = reg.lock();
+    let mut ids: Vec<u64> = registry.configs.keys().map(|&k| u64::from(k)).collect();
+    ids.sort_unstable();
+    ids
+}
+
+pub(crate) fn query_config_by_id(card: u32, id: u64) -> Option<Arc<Config>> {
+    lookup(card, id)
+}
+
+pub(crate) fn query_config_by_uuid(card: u32, uuid: &[u8; 36]) -> Option<Arc<Config>> {
+    REGISTRY
+        .get(card as usize)?
+        .lock()
+        .configs
+        .values()
+        .find(|c| c.uuid == *uuid)
+        .cloned()
 }
 
 /// lib/uuid.c uuid_is_valid.
@@ -751,6 +800,7 @@ pub(crate) async fn open(
         hwe,
         permit,
         config,
+        false,
     );
     let mut pending = PendingOpen {
         session: session.clone(),
@@ -789,6 +839,183 @@ impl Drop for PendingOpen {
             self.session.permit.release();
         }
     }
+}
+
+pub(crate) fn map_i915_format(format_id: u64) -> Option<Format> {
+    match format_id {
+        7 => Some(FORMATS[0]),
+        8 => Some(FORMATS[1]),
+        9 => Some(FORMATS[2]),
+        10..=12 => Some(FORMATS[3]),
+        13 => Some(FORMATS[8]),
+        14 => Some(FORMATS[9]),
+        idx if (idx as usize) < FORMATS.len() && FORMATS[idx as usize].size > 0 => {
+            Some(FORMATS[idx as usize])
+        }
+        _ => None,
+    }
+}
+
+/// DRM_IOCTL_I915_PERF_OPEN: 16 bytes struct drm_i915_perf_open_param.
+pub(crate) async fn i915_open(
+    backend: Option<Arc<dyn UserBackend>>,
+    param: u64,
+    user: &dyn IoctlContext,
+    gate: Gate,
+) -> Result<u64, Error> {
+    let device = device_of(backend.as_deref())?;
+    let backend = backend.ok_or(FsError::NoDevice)?;
+    let mut open_param = [0u8; 16];
+    user.read(param, &mut open_param)?;
+    let flags = u32_at(&open_param, 0);
+    let num_props = u32_at(&open_param, 4);
+    let props_ptr = u64_at(&open_param, 8);
+
+    const I915_PERF_FLAG_FD_CLOEXEC: u32 = 1 << 0;
+    const I915_PERF_FLAG_FD_NONBLOCK: u32 = 1 << 1;
+    const I915_PERF_FLAG_DISABLED: u32 = 1 << 2;
+    let known_flags =
+        I915_PERF_FLAG_FD_CLOEXEC | I915_PERF_FLAG_FD_NONBLOCK | I915_PERF_FLAG_DISABLED;
+    if flags & !known_flags != 0 {
+        return Err(FsError::InvalidData.into());
+    }
+    if num_props == 0 || num_props >= 11 {
+        return Err(FsError::InvalidData.into());
+    }
+    if props_ptr == 0 {
+        return Err(FsError::BadAddress.into());
+    }
+
+    let mut single_context = false;
+    let mut sample_oa = false;
+    let mut metric_set = 0u64;
+    let mut oa_format = 0u64;
+    let mut exponent = None;
+    let mut engine_class = None;
+    let mut engine_instance = None;
+
+    for i in 0..u64::from(num_props) {
+        let at = props_ptr.checked_add(i * 16).ok_or(FsError::BadAddress)?;
+        let mut prop_bytes = [0u8; 16];
+        user.read(at, &mut prop_bytes)?;
+        let prop_id = u64_at(&prop_bytes, 0);
+        let prop_val = u64_at(&prop_bytes, 8);
+        if prop_id == 0 || prop_id >= 11 {
+            return Err(FsError::InvalidData.into());
+        }
+        match prop_id {
+            crate::intel_gpu_uapi::PERF_PROP_CTX_HANDLE => {
+                single_context = true;
+            }
+            crate::intel_gpu_uapi::PERF_PROP_SAMPLE_OA => {
+                sample_oa = prop_val != 0;
+            }
+            crate::intel_gpu_uapi::PERF_PROP_OA_METRICS_SET => {
+                if prop_val == 0 {
+                    return Err(FsError::InvalidData.into());
+                }
+                metric_set = prop_val;
+            }
+            crate::intel_gpu_uapi::PERF_PROP_OA_FORMAT => {
+                if prop_val == 0 {
+                    return Err(FsError::InvalidData.into());
+                }
+                oa_format = prop_val;
+            }
+            crate::intel_gpu_uapi::PERF_PROP_OA_EXPONENT => {
+                if prop_val > 31 {
+                    return Err(FsError::InvalidData.into());
+                }
+                exponent = Some(prop_val as u8);
+            }
+            crate::intel_gpu_uapi::PERF_PROP_HOLD_PREEMPTION => {
+                // HOLD_PREEMPTION accepted
+            }
+            crate::intel_gpu_uapi::PERF_PROP_GLOBAL_SSEU => {
+                return Err(FsError::Unsupported.into());
+            }
+            crate::intel_gpu_uapi::PERF_PROP_POLL_OA_PERIOD => {
+                if prop_val < 100_000 {
+                    return Err(FsError::InvalidData.into());
+                }
+            }
+            crate::intel_gpu_uapi::PERF_PROP_OA_ENGINE_CLASS => {
+                engine_class = Some(prop_val as u16);
+            }
+            crate::intel_gpu_uapi::PERF_PROP_OA_ENGINE_INSTANCE => {
+                engine_instance = Some(prop_val as u16);
+            }
+            _ => return Err(FsError::InvalidData.into()),
+        }
+    }
+
+    if !sample_oa && !single_context {
+        return Err(FsError::InvalidData.into());
+    }
+    if sample_oa {
+        gate.check()?;
+    }
+
+    let hwe = match engine_class {
+        Some(class) => device
+            .engines
+            .from_class_instance(class, engine_instance.unwrap_or(0))
+            .filter(|engine| oag_engine(*engine)),
+        None => device.oag_engines().next(),
+    }
+    .ok_or(FsError::InvalidData)?;
+
+    let format = map_i915_format(oa_format).ok_or(FsError::InvalidData)?;
+    if !oag_format(format.kind) {
+        return Err(FsError::InvalidData.into());
+    }
+    if exponent.is_some() && !sample_oa {
+        return Err(FsError::InvalidData.into());
+    }
+
+    let buffer = u64::from(DEFAULT_BUFFER);
+    let wait = 1u64;
+
+    let permit = Permit::take(device.card)?;
+    let config = lookup(device.card, metric_set).ok_or(FsError::InvalidData)?;
+
+    let session = Session::new(
+        device,
+        format,
+        sample_oa,
+        exponent,
+        wait,
+        buffer as u32,
+        hwe,
+        permit,
+        config,
+        true,
+    );
+
+    let mut pending = PendingOpen {
+        session: session.clone(),
+        committed: false,
+    };
+
+    let disabled = (flags & I915_PERF_FLAG_DISABLED) != 0;
+    backend
+        .oa_control(session.clone(), Request::Open { enable: !disabled })
+        .await?;
+
+    if let Err(error) = gate.check() {
+        session.fail(error);
+        return Err(error.into());
+    }
+
+    let file = Arc::new(File {
+        session,
+        backend,
+        gate,
+    });
+    let cloexec = (flags & I915_PERF_FLAG_FD_CLOEXEC) != 0;
+    let fd = user.install_file(file, cloexec)?;
+    pending.committed = true;
+    Ok(fd as u64)
 }
 
 /// xe_oa_add_config_ioctl.
@@ -844,7 +1071,7 @@ pub(crate) fn add_config(
     registry.regs += regs.len();
     registry
         .configs
-        .insert(id, Arc::new(Config { id, uuid, regs }));
+        .insert(id, Arc::new(Config::new(id, uuid, regs, n, 0, 0)));
     // create_dynamic_oa_sysfs_entry: metrics/<uuid>/id, under the same lock
     // so a racing REMOVE_CONFIG cannot leave a stale directory.
     metrics_add(device.card, &uuid, id);
@@ -984,6 +1211,88 @@ pub(crate) fn remove_config(
     Ok(0)
 }
 
+/// DRM_IOCTL_I915_PERF_ADD_CONFIG: 72 bytes struct drm_i915_perf_oa_config.
+pub(crate) fn i915_add_config(
+    backend: Option<&dyn UserBackend>,
+    param: u64,
+    user: &dyn IoctlContext,
+    gate: Gate,
+) -> Result<u64, Error> {
+    let device = device_of(backend)?;
+    gate.check()?;
+    let mut wire = [0u8; 72];
+    user.read(param, &mut wire)?;
+    let uuid: [u8; 36] = wire[..36].try_into().unwrap();
+    if !uuid_valid(&uuid) {
+        return Err(FsError::InvalidData.into());
+    }
+    let n_mux = u32_at(&wire, 36);
+    let n_bool = u32_at(&wire, 40);
+    let n_flex = u32_at(&wire, 44);
+    let mux_ptr = u64_at(&wire, 48);
+    let bool_ptr = u64_at(&wire, 56);
+    let flex_ptr = u64_at(&wire, 64);
+
+    if (n_mux == 0 || mux_ptr == 0)
+        && (n_bool == 0 || bool_ptr == 0)
+        && (n_flex == 0 || flex_ptr == 0)
+    {
+        return Err(FsError::InvalidData.into());
+    }
+
+    let n_total = n_mux as usize + n_bool as usize + n_flex as usize;
+    let budget = |registry: &Registry| registry.regs + n_total > MAX_REGISTRY_REGS;
+    if n_total > MAX_CONFIG_REGS as usize || budget(&REGISTRY[device.card as usize].lock()) {
+        return Err(FsError::OutOfMemory.into());
+    }
+
+    let mut regs = Vec::new();
+    regs.try_reserve_exact(n_total)
+        .map_err(|_| FsError::OutOfMemory)?;
+
+    let read_group = |ptr: u64, count: u32, dest: &mut Vec<(u32, u32)>| -> Result<(), Error> {
+        if count == 0 || ptr == 0 {
+            return Ok(());
+        }
+        for i in 0..u64::from(count) {
+            let at = ptr.checked_add(i * 8).ok_or(FsError::BadAddress)?;
+            let mut word = [0u8; 4];
+            user.read(at, &mut word)?;
+            let addr = u32::from_le_bytes(word);
+            if !valid_register(device.graphics, addr) {
+                return Err(FsError::InvalidData.into());
+            }
+            user.read(at.checked_add(4).ok_or(FsError::BadAddress)?, &mut word)?;
+            let val = u32::from_le_bytes(word);
+            dest.push((addr & 0x3f_ffff, val));
+        }
+        Ok(())
+    };
+
+    read_group(bool_ptr, n_bool, &mut regs)?;
+    read_group(flex_ptr, n_flex, &mut regs)?;
+    read_group(mux_ptr, n_mux, &mut regs)?;
+
+    let mut registry = REGISTRY[device.card as usize].lock();
+    if registry.configs.values().any(|config| config.uuid == uuid) {
+        return Err(Error::Errno(EADDRINUSE));
+    }
+    if budget(&registry) {
+        return Err(FsError::OutOfMemory.into());
+    }
+
+    let id = (1..=MAX_CONFIGS)
+        .find(|id| !registry.configs.contains_key(id))
+        .ok_or(FsError::NoSpace)?;
+    registry.regs += regs.len();
+    registry.configs.insert(
+        id,
+        Arc::new(Config::new(id, uuid, regs, n_mux, n_bool, n_flex)),
+    );
+    metrics_add(device.card, &uuid, id);
+    Ok(u64::from(id))
+}
+
 struct Permit {
     card: u32,
     held: AtomicBool,
@@ -1050,6 +1359,7 @@ pub struct Session {
     lock: Mutex<()>,
     /// The attached unit's host pages, for xe_oa_mmap.
     pages: IrqSafeSpinLock<Option<Arc<Pages>>>,
+    pub(crate) is_i915: bool,
 }
 impl core::fmt::Debug for Session {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1068,6 +1378,7 @@ impl Session {
         hwe: Engine,
         permit: Permit,
         config: Arc<Config>,
+        is_i915: bool,
     ) -> Arc<Self> {
         // Xe2+ OAG overrun mode writes no partial report at the buffer end.
         let circ = if device.profile() == Profile::Xe2 && sample {
@@ -1091,6 +1402,7 @@ impl Session {
             stop: AtomicBool::new(false),
             lock: Mutex::new(()),
             pages: IrqSafeSpinLock::new(None),
+            is_i915,
         })
     }
     pub(crate) fn device(&self) -> Device {
@@ -1274,18 +1586,23 @@ impl File {
                 Ok(0)
             }
             CONFIG => {
-                // xe_oa_config_locked returns the previous configuration id.
+                // xe_oa_config_locked / i915_perf_config_locked returns the previous configuration id.
                 let old = session.config().id;
-                let mut p = Params::new();
-                extensions(session.device, Origin::Config, arg, user, &mut p)?;
-                let config = lookup(session.device.card, u64::from(p.metric_set))
-                    .ok_or(FsError::NoDevice)?;
-                if p.num_syncs != 0 && p.syncs == 0 {
-                    return Err(FsError::InvalidData.into());
-                }
-                if p.num_syncs != 0 {
-                    return Err(Error::Errno(EOPNOTSUPP));
-                }
+                let config = if session.is_i915 {
+                    lookup(session.device.card, arg).ok_or(FsError::InvalidData)?
+                } else {
+                    let mut p = Params::new();
+                    extensions(session.device, Origin::Config, arg, user, &mut p)?;
+                    let config = lookup(session.device.card, u64::from(p.metric_set))
+                        .ok_or(FsError::NoDevice)?;
+                    if p.num_syncs != 0 && p.syncs == 0 {
+                        return Err(FsError::InvalidData.into());
+                    }
+                    if p.num_syncs != 0 {
+                        return Err(Error::Errno(EOPNOTSUPP));
+                    }
+                    config
+                };
                 self.backend
                     .oa_control(session.clone(), Request::Config(config.clone()))
                     .await?;
@@ -2059,12 +2376,21 @@ impl<A: BootAllocator> Unit<A> {
         let tail = self.tail;
         let mut copied = 0usize;
         let mut error = None;
+        let header_len = if session.is_i915 { 8 } else { 0 };
+        let rec_size = header_len + size as usize;
         while head != tail {
-            if out.len() - copied < size as usize {
+            if out.len() - copied < rec_size {
                 error = Some(FsError::NoSpace);
                 break;
             }
-            for (i, chunk) in out[copied..copied + size as usize]
+            if session.is_i915 {
+                let total_rec_size = (8 + size) as u16;
+                put32(&mut out[copied..copied + 4], 0, 1); // DRM_I915_PERF_RECORD_SAMPLE
+                out[copied + 4..copied + 6].copy_from_slice(&0u16.to_le_bytes());
+                out[copied + 6..copied + 8].copy_from_slice(&total_rec_size.to_le_bytes());
+            }
+            let report_offset = copied + header_len;
+            for (i, chunk) in out[report_offset..report_offset + size as usize]
                 .chunks_exact_mut(4)
                 .enumerate()
             {
@@ -2085,7 +2411,7 @@ impl<A: BootAllocator> Unit<A> {
             for i in (0..clear).step_by(4) {
                 backing.write32(u64::from(wrap(head + i)), 0);
             }
-            copied += size as usize;
+            copied += rec_size;
             head = wrap(head + size);
         }
         if copied != 0 {
@@ -2155,11 +2481,44 @@ pub(crate) fn test_session(
         buffer,
         device.oag_engines().next().expect("OAG engine"),
         Permit::take(device.card).expect("free OA unit"),
-        Arc::new(Config {
-            id: 1,
-            uuid: [b'0'; 36],
-            regs: regs.to_vec(),
-        }),
+        Arc::new(Config::new(
+            1,
+            [b'0'; 36],
+            regs.to_vec(),
+            regs.len() as u32,
+            0,
+            0,
+        )),
+        false,
+    )
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn test_session_i915(
+    device: Device,
+    format: usize,
+    buffer: u32,
+    exponent: Option<u8>,
+    regs: &[(u32, u32)],
+) -> Arc<Session> {
+    Session::new(
+        device,
+        FORMATS[format],
+        true,
+        exponent,
+        1,
+        buffer,
+        device.oag_engines().next().expect("OAG engine"),
+        Permit::take(device.card).expect("free OA unit"),
+        Arc::new(Config::new(
+            1,
+            [b'0'; 36],
+            regs.to_vec(),
+            regs.len() as u32,
+            0,
+            0,
+        )),
+        true,
     )
 }
 

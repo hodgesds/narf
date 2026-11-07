@@ -1146,11 +1146,7 @@ fn unit_with_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<Session>) 
         || true,
     )
     .unwrap();
-    let config = Arc::new(Config {
-        id: 1,
-        uuid: uuid(1),
-        regs: vec![(0x9888, 1)],
-    });
+    let config = Arc::new(Config::new(1, uuid(1), vec![(0x9888, 1)], 1, 0, 0));
     let session = Session::new(
         device(card, MTL, 1270),
         FORMATS[5],
@@ -1161,6 +1157,7 @@ fn unit_with_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<Session>) 
         Engine::Rcs0,
         Permit::take(card).unwrap(),
         config,
+        false,
     );
     let request = Request::Open { enable: true };
     let io = Window(hw.clone());
@@ -1587,4 +1584,123 @@ fn smoke_oa_sysfs_telemetry_and_status() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_sysfs_telemetry_and_status
+);
+
+fn smoke_i915_perf_open_add_remove_config_and_stream() -> TestResult {
+    let backend = Backend::new(device(60, MTL, 1270));
+    let wire = Wire::new();
+
+    // 1. i915_add_config:
+    let u1 = uuid(1);
+    let mut config_bytes = [0u8; 72];
+    config_bytes[..36].copy_from_slice(&u1);
+    put32(&mut config_bytes, 36, 1);
+    put32(&mut config_bytes, 40, 1);
+    put32(&mut config_bytes, 44, 0);
+    put64(&mut config_bytes, 48, 0x2000);
+    put64(&mut config_bytes, 56, 0x2010);
+    put64(&mut config_bytes, 64, 0);
+    wire.put(0x1000, &config_bytes);
+
+    wire.put(0x2000, &0x9888u32.to_le_bytes());
+    wire.put(0x2004, &0x1111u32.to_le_bytes());
+    wire.put(0x2010, &0x9888u32.to_le_bytes());
+    wire.put(0x2014, &0x2222u32.to_le_bytes());
+
+    let id1 = i915_add_config(Some(&*backend), 0x1000, &wire, ALLOW).unwrap();
+    assert!(id1 >= 1);
+
+    // Duplicate uuid fails with EADDRINUSE
+    assert_eq!(
+        i915_add_config(Some(&*backend), 0x1000, &wire, ALLOW),
+        Err(Error::Errno(EADDRINUSE))
+    );
+
+    // Add second config with uuid(2)
+    let u2 = uuid(2);
+    config_bytes[..36].copy_from_slice(&u2);
+    wire.put(0x1100, &config_bytes);
+    let id2 = i915_add_config(Some(&*backend), 0x1100, &wire, ALLOW).unwrap();
+    assert_ne!(id1, id2);
+
+    // Verify lookup helpers
+    let ids = query_config_ids(60);
+    assert!(ids.contains(&id1));
+    assert!(ids.contains(&id2));
+    assert_eq!(query_config_by_id(60, id1).unwrap().uuid, u1);
+    assert_eq!(query_config_by_uuid(60, &u2).unwrap().id, id2 as u32);
+
+    // 2. i915_open:
+    let mut open_bytes = [0u8; 16];
+    put32(&mut open_bytes, 0, 0);
+    put32(&mut open_bytes, 4, 4);
+    put64(&mut open_bytes, 8, 0x3100);
+    wire.put(0x3000, &open_bytes);
+
+    let props = [
+        (crate::intel_gpu_uapi::PERF_PROP_SAMPLE_OA, 1u64),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_METRICS_SET, id1),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_FORMAT, 10), // A32u40 -> 256 bytes
+        (crate::intel_gpu_uapi::PERF_PROP_OA_EXPONENT, 5),
+    ];
+    for (i, &(prop_id, val)) in props.iter().enumerate() {
+        let at = 0x3100 + i as u64 * 16;
+        let mut p = [0u8; 16];
+        put64(&mut p, 0, prop_id);
+        put64(&mut p, 8, val);
+        wire.put(at, &p);
+    }
+
+    assert_eq!(
+        ready(i915_open(Some(backend.clone()), 0x3000, &wire, ALLOW)),
+        Ok(41)
+    );
+    let file = wire.file();
+
+    // 3. Stream ioctls:
+    assert_eq!(ready(file.ioctl_user(ENABLE, 0, &wire)), Ok(0));
+    assert_eq!(ready(file.ioctl_user(DISABLE, 0, &wire)), Ok(0));
+    assert_eq!(ready(file.ioctl_user(CONFIG, id2, &wire)), Ok(id1));
+    assert_eq!(
+        ready(file.ioctl_user(CONFIG, 99999, &wire)),
+        Err(FsError::InvalidData)
+    );
+    assert_eq!(ready(file.ioctl_user(ENABLE, 0, &wire)), Ok(0));
+
+    // 4. Stream read: check i915 record header
+    let hw = &backend.hw;
+    let circ = DEFAULT_BUFFER;
+    hw.report(0, 256, 0x42, circ);
+    hw.set(OATAILPTR, BASE + 256);
+    let mut out = vec![0u8; 512];
+    let n = ready(file.read_with_options(0, &mut out, ReadOptions { nonblocking: true })).unwrap();
+    assert_eq!(n, 8 + 256);
+    assert_eq!(u32_at(&out, 0), 1); // DRM_I915_PERF_RECORD_SAMPLE
+    assert_eq!(u16::from_le_bytes([out[4], out[5]]), 0); // pad
+    assert_eq!(u16::from_le_bytes([out[6], out[7]]), 264); // size (8 + 256)
+
+    // 5. remove_config:
+    wire.put(0x4000, &id1.to_le_bytes());
+    assert_eq!(remove_config(Some(&*backend), 0x4000, &wire, ALLOW), Ok(0));
+    assert!(query_config_by_id(60, id1).is_none());
+
+    drop(file);
+    backend.poll(1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_i915_perf_open_add_remove_config_and_stream
+);
+
+fn smoke_oa_test_session_i915_header() -> TestResult {
+    let dev = device(62, MTL, 1270);
+    let session = test_session_i915(dev, 3, DEFAULT_BUFFER, Some(5), &[(0x9888, 1)]);
+    assert!(session.is_i915);
+    assert_eq!(session.format.size, 256);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_test_session_i915_header
 );

@@ -1284,14 +1284,46 @@ The i915 compatibility GETPARAM discovery path reports observed PCI revision
 (32), union DSS count (33), actual fused EU count (34), timestamp frequency
 (51) and OA timestamp frequency (57: `DeviceFacts::oa_timestamp_frequency`,
 the clock with Wa_18013179988's CTC shift on 12.55 and 12.70–12.74, sampled
-with the clock and independent of the OA opt-in). PERF_REVISION (54) stays 0
-without i915 perf. Missing or mismatched topology/facts return ENODEV, never zero; immutable
+with the clock and independent of the OA opt-in). PERF_REVISION (54) reports 1
+when the OA unit is published, and 0 otherwise. Missing or mismatched topology/facts return ENODEV, never zero; immutable
 facts survive a stopped GT without MMIO or wake. HAS_SCHEDULER (41) reports
 ENABLED | PRIORITY (3) while live and 0 otherwise, leaving the
 preemption/semaphore/busy-stat/static-priority-map capability bits clear;
 context PRIORITY and PERSISTENCE checks read the same value. Obsolete UMS parameters 1/2/3/14 return ENODEV. Legacy
 slice/subslice masks 46/47 return EINVAL on Xe_HP-and-later profiles, as in
 Linux; callers use full topology queries.
+
+#### i915 perf UAPI compatibility and dynamic metrics
+
+The legacy i915 perf UAPI provides backwards compatibility for tools (such as
+Intel GPA, gputop, and Mesa metrics) on render nodes:
+- `DRM_IOCTL_I915_PERF_OPEN` (0x76): accepts a 16-byte `drm_i915_perf_open_param`
+  structure (`flags`, `num_properties`, `properties_ptr`). Decodes property array
+  entries (SAMPLE_OA, OA_METRICS_SET, OA_FORMAT, OA_EXPONENT, etc.) and allocates
+  a dedicated i915-formatted stream file descriptor.
+- `DRM_IOCTL_I915_PERF_ADD_CONFIG` (0x77): accepts a 72-byte `drm_i915_perf_oa_config`
+  structure (`uuid`, `n_mux_regs`, `n_boolean_regs`, `n_flex_regs`, pointers to register pairs).
+  Validates whitelist register addresses, requires unique UUIDs per card, allocates
+  a dynamic positive config ID, and stages register sets for ring reconfiguration.
+- `DRM_IOCTL_I915_PERF_REMOVE_CONFIG` (0x78): takes an 8-byte u64 config ID and
+  removes an unreferenced dynamic configuration.
+- Stream ioctls on the stream file descriptor:
+  - `I915_PERF_IOCTL_ENABLE` (0x6900): activates OA report generation.
+  - `I915_PERF_IOCTL_DISABLE` (0x6901): halts OA sampling.
+  - `I915_PERF_IOCTL_CONFIG` (0x6902): accepts `arg` directly as a u64 metric set ID,
+    reconfigures the OA unit, and returns the previous config ID.
+- Stream reading: reports delivered through the i915 stream fd prepend an 8-byte
+  `drm_i915_perf_record_header` (`type = 1` for `DRM_I915_PERF_RECORD_SAMPLE`,
+  `pad = 0`, `size = 8 + report_size`).
+- Query item 3 (`DRM_I915_QUERY_PERF_CONFIG`):
+  - `DRM_I915_QUERY_PERF_CONFIG_LIST` (1): reports registered config count and IDs
+    (`48 + 8 * n_configs` bytes).
+  - `DRM_I915_QUERY_PERF_CONFIG_DATA_FOR_UUID` (2): retrieves config metadata and
+    registers for a given 36-byte UUID (`48 + 72` bytes header + registers).
+  - `DRM_I915_QUERY_PERF_CONFIG_DATA_FOR_ID` (3): retrieves config metadata and
+    registers for a given 64-bit config ID.
+  - Unknown configurations return `-ENOENT` (-2) in `item.length`. Probing with
+    capacity 0 returns required buffer length without reading register pointers.
 
 #### i915 selected capture and live diagnostic protection
 
