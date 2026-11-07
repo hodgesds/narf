@@ -201,6 +201,39 @@ pub const HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC_CANCEL: u16 = opcode(OGF_LE_CO
 /// HCI_LE_Periodic_Advertising_Terminate_Sync (§7.8.69). 2-byte
 /// parameter: sync_handle (2 LE).
 pub const HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC: u16 = opcode(OGF_LE_CONTROLLER, 0x0046);
+
+// ── LE Periodic Advertising Sync Transfer, sender side (§7.8.89..92) ─
+// OCFs 0x005A..0x005D per Vol 4 Part E §7.8.89..92, read in-session
+// from the Core 6.1 Part E text (issue #1654). All four return
+// Command Complete; 0x005A/0x005B/0x005C return Status +
+// Connection_Handle, 0x005D returns Status only. The receiver half
+// (Sync Transfer Received subevent 0x18, §7.7.65.21) is #1575 and
+// is deliberately NOT an opcode here — it is an event, not a command.
+/// HCI_LE_Periodic_Advertising_Sync_Transfer (§7.8.89). 6-byte
+/// parameter: connection_handle (2 LE) + service_data (2 LE) +
+/// sync_handle (2 LE). Returns Command Complete (Status +
+/// Connection_Handle). The command may complete once the sync
+/// information is queued, before it is actually sent.
+pub const HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER: u16 = opcode(OGF_LE_CONTROLLER, 0x005A);
+/// HCI_LE_Periodic_Advertising_Set_Info_Transfer (§7.8.90). 5-byte
+/// parameter: connection_handle (2 LE) + service_data (2 LE) +
+/// advertising_handle (1). Returns Command Complete (Status +
+/// Connection_Handle). Sends sync information about the periodic
+/// advertising in one of our own advertising sets.
+pub const HCI_LE_PERIODIC_ADVERTISING_SET_INFO_TRANSFER: u16 = opcode(OGF_LE_CONTROLLER, 0x005B);
+/// HCI_LE_Set_Periodic_Advertising_Sync_Transfer_Parameters
+/// (§7.8.91). 8-byte parameter: connection_handle (2 LE) + mode
+/// (1) + skip (2 LE) + sync_timeout (2 LE) + cte_type (1).
+/// Returns Command Complete (Status + Connection_Handle).
+pub const HCI_LE_SET_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS: u16 =
+    opcode(OGF_LE_CONTROLLER, 0x005C);
+/// HCI_LE_Set_Default_Periodic_Advertising_Sync_Transfer_Parameters
+/// (§7.8.92). 6-byte parameter: mode (1) + skip (2 LE) +
+/// sync_timeout (2 LE) + cte_type (1). Returns Command Complete
+/// (Status only). Applies to all subsequent LE connections; it does
+/// not affect existing connections.
+pub const HCI_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS: u16 =
+    opcode(OGF_LE_CONTROLLER, 0x005D);
 // ── LE Extended Advertising (§7.8.52..7.8.60) ──────────────────────
 //
 // Bluetooth 5 advertising sets (issue #823). OCFs 0x0035..0x003D
@@ -304,6 +337,15 @@ mod selftest_ext {
     const _: () = assert!(HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC_CANCEL == 0x2045);
     // §7.8.69: OGF=0x08 OCF=0x0046 → 0x2046.
     const _: () = assert!(HCI_LE_PERIODIC_ADVERTISING_TERMINATE_SYNC == 0x2046);
+    // §7.8.89: OGF=0x08 OCF=0x005A → 0x205A.
+    const _: () = assert!(HCI_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER == 0x205A);
+    // §7.8.90: OGF=0x08 OCF=0x005B → 0x205B.
+    const _: () = assert!(HCI_LE_PERIODIC_ADVERTISING_SET_INFO_TRANSFER == 0x205B);
+    // §7.8.91: OGF=0x08 OCF=0x005C → 0x205C.
+    const _: () = assert!(HCI_LE_SET_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS == 0x205C);
+    // §7.8.92: OGF=0x08 OCF=0x005D → 0x205D.
+    const _: () =
+        assert!(HCI_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS == 0x205D);
     // §7.1.5: OGF=0x01 OCF=0x0005 → 0x0405.
     const _: () = assert!(HCI_CREATE_CONNECTION == 0x0405);
     // §7.1.19: OGF=0x01 OCF=0x0019 → 0x0419.
