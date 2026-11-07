@@ -56,14 +56,23 @@
 //!
 //! ## Scope limits (honest)
 //!
-//! The version-switched PHY init layer is implemented for the
-//! original RTL8153 family only (VER_03–VER_06, Linux's
-//! `r8153_hw_phy_cfg` — see the §881 section in the code); every
-//! other chip version keeps reset defaults until its sequence is
-//! ported, and the firmware-blob step
-//! (`rtl8152_apply_firmware`) is not reproduced for any version
-//! (it loads per-version firmware files NARF does not ship).
-//! Tracked as follow-up issues.
+//! The version-switched PHY init layer covers every known chip
+//! version (Linux's `r8152b_hw_phy_cfg`, `r8153_hw_phy_cfg`,
+//! `r8153b_hw_phy_cfg`, `r8153c_hw_phy_cfg`, `r8156_hw_phy_cfg`,
+//! `r8156b_hw_phy_cfg`, `r8157_hw_phy_cfg` — see the §881 section
+//! in the code), and the firmware-blob step
+//! (`rtl8152_apply_firmware`) is implemented over the
+//! `narf_firmware` registry: the per-version blob is fetched by
+//! its Linux file name and validated (SHA-256 header checksum +
+//! per-block rules) before any block is applied. NARF ships no
+//! firmware blobs itself — a version whose blob is absent from
+//! the registry runs its table without the firmware step, like
+//! Linux's failed `request_firmware` (warn and continue).
+//! TEST_01 and unknown versions keep reset defaults. Still open:
+//! the USB/LPM init layers for the other families (Linux's
+//! `r8152b_init` / `r8153b_init` / `r8156_init`, the counterpart
+//! of the VER_03–VER_06 `r8153_init` layer already ported) —
+//! tracked as follow-up issues.
 
 extern crate alloc;
 
@@ -319,6 +328,192 @@ pub const ADVERTISE_PAUSE_ASYM: u16 = 0x0800;
 /// `MDIO_EEE_1000T | MDIO_EEE_100TX` = `0x0004 | 0x0002`).
 pub const EEE_ADV_8153: u16 = 0x0006;
 
+// ── Per-family PHY-init registers (Linux `r8152.c` register header) ──
+// Addresses/bits for the RTL8152 (VER_01/02/07), RTL8153B
+// (VER_08/09), RTL8156 (VER_10/11), RTL8156B (VER_12/13/15), RTL8153C
+// (VER_14) and RTL8157 (VER_16/17) PHY-init sequences. Same sourcing
+// as the VER_03–VER_06 constants above: the Linux register header.
+
+/// Second PHY SRAM bank (Linux `OCP_SRAM2_ADDR` / `OCP_SRAM2_DATA`).
+pub const OCP_SRAM2_ADDR: u16 = 0xB87C;
+pub const OCP_SRAM2_DATA: u16 = 0xB87E;
+/// PHY control config (Linux `OCP_NCTL_CFG`).
+pub const OCP_NCTL_CFG: u16 = 0xA42C;
+/// System-clock divider config (Linux `OCP_SYSCLK_CFG`).
+pub const OCP_SYSCLK_CFG: u16 = 0xC416;
+/// 10GBASE-T control (Linux `OCP_10GBT_CTRL`).
+pub const OCP_10GBT_CTRL: u16 = 0xA5D4;
+/// Interrupt enable (Linux `OCP_INTR_EN`).
+pub const OCP_INTR_EN: u16 = 0xA424;
+/// EEE configuration registers for the FE family (Linux
+/// `OCP_EEE_CONFIG1/2/3`, `OCP_EEE_AR`, `OCP_EEE_DATA`).
+pub const OCP_EEE_CONFIG1: u16 = 0x2080;
+pub const OCP_EEE_CONFIG2: u16 = 0x2092;
+pub const OCP_EEE_CONFIG3: u16 = 0x2094;
+pub const OCP_EEE_AR: u16 = 0xA41A;
+pub const OCP_EEE_DATA: u16 = 0xA41C;
+/// Second EEE advertisement register, 2.5G/5G families (Linux
+/// `OCP_EEE_ADV2`).
+pub const OCP_EEE_ADV2: u16 = 0xA6D4;
+/// ALDPS configuration register, FE family (Linux
+/// `OCP_ALDPS_CONFIG`).
+pub const OCP_ALDPS_CONFIG: u16 = 0x2010;
+/// PHY patch request/status + lock (Linux `OCP_PHY_PATCH_CMD`,
+/// `OCP_PHY_PATCH_STAT`, `OCP_PHY_LOCK`).
+pub const OCP_PHY_PATCH_CMD: u16 = 0xB820;
+pub const OCP_PHY_PATCH_STAT: u16 = 0xB800;
+pub const OCP_PHY_LOCK: u16 = 0xB82E;
+/// ADC bias offset register (Linux `OCP_ADC_IOFFSET`).
+pub const OCP_ADC_IOFFSET: u16 = 0xBCFC;
+
+/// `OCP_NCTL_CFG` bits.
+pub const NCTL_CFG_PGA_RETURN_EN: u16 = 0x0002;
+/// `OCP_DOWN_SPEED` bits (2.5G/5G families).
+pub const DOWN_SPEED_EN_EEE_CMODE: u16 = 0x4000;
+pub const DOWN_SPEED_EN_EEE_1000: u16 = 0x2000;
+pub const DOWN_SPEED_EN_EEE_100: u16 = 0x1000;
+pub const DOWN_SPEED_EN_10M_CLKDIV: u16 = 0x0800;
+/// `OCP_PHY_PATCH_CMD` / `OCP_PHY_PATCH_STAT` bits.
+pub const PATCH_REQUEST: u16 = 0x0010;
+pub const PATCH_READY: u16 = 0x0040;
+/// `OCP_PHY_LOCK` bit.
+pub const PHY_LOCK_PATCH_LOCK: u16 = 0x0001;
+/// SRAM green-config bits (Linux `SRAM_GREEN_CFG`, `GREEN_ETH_EN`,
+/// `R_TUNE_EN`).
+pub const SRAM_GREEN_CFG: u16 = 0x8011;
+pub const GREEN_ETH_EN: u16 = 0x8000;
+pub const GREEN_CFG_R_TUNE_EN: u16 = 0x0800;
+/// `OCP_INTR_EN` bits.
+pub const INTR_EN_SPEED_FORCE: u16 = 0x0008;
+/// `OCP_10GBT_CTRL` bits.
+pub const CTRL_10GBT_ADV2_5G_F_R: u16 = 0x0020;
+/// Clock-divider encodings (Linux `clk_div_expo(5)` /
+/// `sysclk_div_expo(5)`).
+pub const CLK_DIV_EXPO_5: u16 = 0x0050;
+pub const SYSCLK_DIV_EXPO_5: u16 = 0x0500;
+/// `OCP_ALDPS_CONFIG` bits (FE family).
+pub const ALDPS_CFG_ENPWRSAVE: u16 = 0x8000;
+pub const ALDPS_CFG_ENPDNPS: u16 = 0x0200;
+pub const ALDPS_CFG_LINKENA: u16 = 0x0100;
+pub const ALDPS_CFG_DIS_SDSAVE: u16 = 0x0010;
+/// `OCP_ALDPS_CONFIG` full values (Linux `r8152_aldps_en`).
+pub const ALDPS_CFG_8152_ENABLE: u16 = 0x8310;
+pub const ALDPS_CFG_8152_DISABLE: u16 = 0x0310;
+/// FE-family EEE config bits (Linux `r8152_eee_en`).
+pub const EEE_10_CAP: u16 = 0x2000;
+pub const EEE_NWAY_EN: u16 = 0x1000;
+pub const EEE_TX_QUIET_EN: u16 = 0x0200;
+pub const EEE_RX_QUIET_EN: u16 = 0x0100;
+pub const EEE_RG_DACQUIET_EN: u16 = 0x0400;
+pub const EEE_RG_LDVQUIET_EN: u16 = 0x0200;
+/// `OCP_EEE_CONFIG1` sd-rise-time mask / values
+/// (Linux `sd_rise_time_mask`, `sd_rise_time(1)` / `(7)`).
+pub const EEE_SD_RISE_TIME_MASK: u16 = 0x0070;
+pub const EEE_SD_RISE_TIME_1: u16 = 0x0010;
+pub const EEE_SD_RISE_TIME_7: u16 = 0x0070;
+/// `OCP_EEE_CONFIG3` fast-SNR mask / values
+/// (Linux `fast_snr_mask`, `fast_snr(42)` / `(511)`).
+pub const EEE_FAST_SNR_MASK: u16 = 0xFF80;
+pub const EEE_FAST_SNR_42: u16 = 0x1500;
+pub const EEE_FAST_SNR_511: u16 = 0xFF80;
+/// MMD indirect-access function codes (Linux `FUN_ADDR` /
+/// `FUN_DATA`) and the AN MMD (Linux `MDIO_MMD_AN`,
+/// `MDIO_AN_EEE_ADV`).
+pub const MMD_FUN_ADDR: u16 = 0x0000;
+pub const MMD_FUN_DATA: u16 = 0x4000;
+pub const MDIO_MMD_AN: u16 = 7;
+pub const MDIO_AN_EEE_ADV: u16 = 60;
+/// MDIO EEE advertisement bits (Linux `include/uapi/linux/mdio.h`).
+pub const MDIO_EEE_100TX: u16 = 0x0002;
+pub const MDIO_EEE_1000T: u16 = 0x0004;
+pub const MDIO_EEE_10GT: u16 = 0x0008;
+pub const MDIO_EEE_2_5GT: u16 = 0x0001;
+pub const MDIO_EEE_5GT: u16 = 0x0002;
+/// `eee_adv` per family (Linux `rtl_ops_init`).
+pub const EEE_ADV_8152: u16 = 0x0002;
+pub const EEE_ADV_8157: u16 = 0x000E;
+
+/// MAC power control 4 (Linux `PLA_MAC_PWR_CTRL4`) + speed-down bit.
+pub const PLA_MAC_PWR_CTRL4: u16 = 0xE0CE;
+pub const MAC_PWR_CTRL4_EEE_SPDWN_EN: u16 = 0x0001;
+/// 2.5G EEE TX wake timer (Linux `PLA_EEE_TXTWSYS_2P5G`).
+pub const PLA_EEE_TXTWSYS_2P5G: u16 = 0xE058;
+/// USB configuration (Linux `PLA_USB_CFG`) + link-IP bits.
+pub const PLA_USB_CFG: u16 = 0xE952;
+pub const USB_CFG_EN_XG_LIP: u16 = 0x0002;
+pub const USB_CFG_EN_G_LIP: u16 = 0x0004;
+/// EFUSE command/data (Linux `PLA_EFUSE_CMD`, `PLA_EFUSE_DATA`).
+pub const PLA_EFUSE_CMD: u16 = 0xDD02;
+pub const PLA_EFUSE_DATA: u16 = 0xDD00;
+pub const EFUSE_READ_CMD: u16 = 0x8000;
+pub const EFUSE_DATA_BIT16: u16 = 0x0080;
+/// UPHY timer (Linux `PLA_UPHY_TIMER`).
+pub const PLA_UPHY_TIMER: u16 = 0xD388;
+/// Breakpoint registers (Linux `PLA_BP_0`, `PLA_BP_BA`,
+/// `PLA_BP_EN`).
+pub const PLA_BP_0: u16 = 0xFC28;
+pub const PLA_BP_BA: u16 = 0xFC26;
+pub const PLA_BP_EN: u16 = 0xFC38;
+/// MAC debug pre/post (Linux `PLA_MACDBG_PRE` / `PLA_MACDBG_POST`,
+/// VER_04 only; `PLA_MACDBG_PRE` shares its address with
+/// `PLA_INDICATE_FALG`).
+pub const PLA_MACDBG_PRE: u16 = 0xD38C;
+pub const PLA_MACDBG_POST: u16 = 0xD38E;
+pub const MACDBG_DEBUG_OE: u16 = 0x0001;
+pub const MACDBG_DEBUG_LTSSM: u16 = 0x0082;
+/// PHY patch GPIO control (Linux `PLA_POL_GPIO_CTRL`).
+pub const PLA_POL_GPIO_CTRL: u16 = 0xDC6A;
+pub const POL_GPIO_GPHY_PATCH: u16 = 0x0010;
+/// GPHY control (Linux `PLA_GPHY_CTRL`).
+pub const PLA_GPHY_CTRL: u16 = 0xD3AE;
+pub const GPHY_CTRL_FLASH: u16 = 0x0002;
+/// PHY firmware version SRAM cell (Linux `SRAM_GPHY_FW_VER`).
+pub const SRAM_GPHY_FW_VER: u16 = 0x801E;
+
+/// U1/U2 idle timer (Linux `USB_U1U2_TIMER`).
+pub const USB_U1U2_TIMER: u16 = 0xD4DA;
+/// UPS configuration (Linux `USB_UPS_CFG`) + saw-count mask.
+pub const USB_UPS_CFG: u16 = 0xD842;
+pub const UPS_CFG_SAW_CNT_1MS_MASK: u16 = 0x0FFF;
+pub const UPS_CFG_MID_REVERSE: u16 = 0x0020;
+/// Flow-control timer (Linux `USB_FC_TIMER`).
+pub const USB_FC_TIMER: u16 = 0xD340;
+pub const FC_TIMER_CTRL_EN: u16 = 0x8000;
+/// Misc 1 (Linux `USB_MISC_1`) + BND mask.
+pub const USB_MISC_1: u16 = 0xD81F;
+pub const MISC_1_BND_MASK: u16 = 0x0004;
+/// Firmware control/task (Linux `USB_FW_CTRL`, `USB_FW_TASK`).
+pub const USB_FW_CTRL: u16 = 0xD334;
+pub const FW_CTRL_FLOW_CTRL_PATCH_OPT: u16 = 0x0002;
+pub const FW_CTRL_FLOW_CTRL_PATCH_2: u16 = 0x0100;
+pub const USB_FW_TASK: u16 = 0xD4E8;
+pub const FW_TASK_FC_PATCH: u16 = 0x0002;
+/// Firmware fix enables (Linux `USB_FW_FIX_EN0/1`).
+pub const USB_FW_FIX_EN0: u16 = 0xCFCA;
+pub const USB_FW_FIX_EN1: u16 = 0xCFCC;
+pub const FW_FIX_SUSPEND: u16 = 0x4000;
+pub const FW_FIX_IP_RESET_EN: u16 = 0x0200;
+/// Watchdog-1 control (Linux `USB_WDT1_CTRL`).
+pub const USB_WDT1_CTRL: u16 = 0xE404;
+pub const WDT1_EN: u16 = 0x0001;
+/// CSTMR (Linux `USB_CSTMR`) + force-SuperSpeed bit.
+pub const USB_CSTMR: u16 = 0xCFEF;
+pub const CSTMR_FORCE_SUPER: u16 = 0x0001;
+/// Breakpoint 4 (Linux `USB_BP_4` = `PLA_BP_4`) + SuperSpeed-only value.
+pub const USB_BP_4: u16 = 0xFC30;
+pub const BP4_SUPER_ONLY: u16 = 0x1578;
+/// GPHY control, USB window (Linux `USB_GPHY_CTRL`) + bits.
+pub const USB_GPHY_CTRL: u16 = 0xD284;
+pub const GPHY_CTRL_BYPASS_FLASH: u16 = 0x0020;
+pub const GPHY_CTRL_PATCH_DONE: u16 = 0x0004;
+pub const GPHY_CTRL_BACKUP_RESTRORE: u16 = 0x0040;
+/// UPHY3 MDCM DIO (Linux `USB_UPHY3_MDCMDIO`).
+pub const USB_UPHY3_MDCMDIO: u16 = 0xD480;
+/// Second breakpoint-enable register (Linux `USB_BP2_EN`).
+pub const USB_BP2_EN: u16 = 0xFC48;
+/// U3P3 check enable (Linux `U3P3_CHECK_EN`, VER_05 only).
+pub const EXTRA_STATUS_U3P3_CHECK_EN: u16 = 0x0080;
+
 // `PLA_CR` bits.
 pub const CR_RST: u8 = 0x10;
 pub const CR_RE: u8 = 0x08;
@@ -543,17 +738,21 @@ async fn ocp_write_byte(dev: &USBDevice, mcu: u16, addr: u16, value: u8) -> Resu
 // Linux `drivers/net/usb/r8152.c` switches its PHY/firmware init on
 // the `PLA_TCR1` version field (the high half of the `PLA_TCR0`
 // dword Linux reads). The datapath runs on reset defaults without
-// this layer; the table below reproduces Linux's
-// `r8153_hw_phy_cfg` for the original RTL8153 family
-// (VER_03–VER_06 — the chip in most USB-C docks and GbE dongles,
-// the most common version, implemented here because no chip
-// version is on hand in this VM and no symptom has been observed
-// to drive a symptom-led port per #881's scoping instruction).
-// Every other version keeps reset defaults until its sequence is
-// ported (see the remainder issue); the firmware-blob step
-// (`rtl8152_apply_firmware`) is deliberately NOT reproduced — it
-// loads per-version firmware files NARF does not ship, so the
-// sequence runs around that step in Linux's order otherwise.
+// this layer; the tables below reproduce Linux's per-family
+// `*_hw_phy_cfg` sequences for every known version —
+// `r8152b_hw_phy_cfg` (VER_01/02/07), `r8153_hw_phy_cfg`
+// (VER_03–VER_06), `r8153b_hw_phy_cfg` (VER_08/09),
+// `r8153c_hw_phy_cfg` (VER_14, which is `r8153b_hw_phy_cfg` plus a
+// driver-internal flag with no wire effect), `r8156_hw_phy_cfg`
+// (VER_10/11), `r8156b_hw_phy_cfg` (VER_12/13/15) and
+// `r8157_hw_phy_cfg` (VER_16/17) — in Linux's order, with the
+// firmware-blob step (`rtl8152_apply_firmware`) as an
+// [`PhyInitOp::ApplyFirmware`] step at Linux's position in each
+// sequence (see the firmware section below). TEST_01 and unknown
+// versions keep reset defaults. Every table entry is grounded in
+// the Linux source; no chip version is on hand in this VM, so
+// only the silicon itself remains untested (fixture-validated
+// end-to-end, per #1255's symptom-led rule).
 
 /// Chip version, decoded from the `PLA_TCR1` version field.
 /// Names follow Linux's `rtl_version` enum.
@@ -608,6 +807,29 @@ pub fn version_from_tcr1(raw: u16) -> RtlVersion {
     }
 }
 
+/// How the firmware step decides `power_cut` (Linux
+/// `rtl8152_apply_firmware(tp, power_cut)`), per family. The
+/// status-gated modes read `OCP_PHY_STATUS` at the step, exactly
+/// where Linux's `r8153_phy_status(tp, 0)` call sits in each
+/// `*_hw_phy_cfg`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FirmwarePowerCut {
+    /// Always `power_cut = false` (Linux `r8152b_hw_phy_cfg` and
+    /// `r8153_hw_phy_cfg`).
+    Never,
+    /// `power_cut = true` when the PHY status is PWRDN or
+    /// EXT_INIT (Linux `r8153b_hw_phy_cfg` / `r8153c_hw_phy_cfg`);
+    /// after a power-cut application the BMCR power-down bit is
+    /// cleared.
+    OnPwrdnOrExtInit,
+    /// `power_cut = true` only when the PHY status is EXT_INIT
+    /// (Linux `r8156_hw_phy_cfg`, `r8156b_hw_phy_cfg`,
+    /// `r8157_hw_phy_cfg`); after a power-cut application the
+    /// `0xa468` bits 3|1 are cleared, plus `0xa466` bit 0 when
+    /// `clear_a466` is set (`r8156b` / `r8157` only).
+    OnExtInit { clear_a466: bool },
+}
+
 /// One step of a version-switched PHY init sequence, in the order
 /// Linux executes it. The executor below interprets each step
 /// through the existing OCP accessors; the table itself is pure
@@ -629,6 +851,8 @@ pub enum PhyInitOp {
     PlaWordSetBits { addr: u16, bits: u16 },
     /// PLA word clear-bits.
     PlaWordClrBits { addr: u16, bits: u16 },
+    /// PLA word plain write.
+    PlaWordWrite { addr: u16, value: u16 },
     /// USB-window word set-bits.
     UsbWordSetBits { addr: u16, bits: u16 },
     /// MDIO set-bits via `OCP_BASE_MII + reg * 2`.
@@ -667,25 +891,86 @@ pub enum PhyInitOp {
     /// `PLA_ALDPS_POLL` for `ALDPS_POLL_DONE` (proceeds even if
     /// the poll never completes, like the reset poll in bind).
     AldpsDisable,
+    /// OCP PHY-register clear-then-set (Linux `ocp_reg_w0w1`):
+    /// read, `(cur & !clear) | set`, write.
+    OcpRegW0W1 { addr: u16, clear: u16, set: u16 },
+    /// SRAM read-modify-write (Linux `sram_write_w0w1`): read the
+    /// cell, `(cur & !clear) | set`, write the data register.
+    SramW0W1 { addr: u16, clear: u16, set: u16 },
+    /// Second SRAM bank read-modify-write (Linux
+    /// `sram2_write_w0w1`).
+    Sram2W0W1 { addr: u16, clear: u16, set: u16 },
+    /// Second SRAM bank write: `OCP_SRAM2_ADDR := addr`, then
+    /// `OCP_SRAM2_DATA := value` (Linux `sram2_write`).
+    Sram2Write { addr: u16, value: u16 },
+    /// SRAM address register alone (Linux `ocp_reg_write(tp,
+    /// OCP_SRAM_ADDR, addr)`): starts a burst of data writes.
+    SramAddrWrite { addr: u16 },
+    /// SRAM data register alone (Linux `ocp_reg_write(tp,
+    /// OCP_SRAM_DATA, value)`): one burst word, address already
+    /// set (auto-increments on the chip).
+    SramDataWrite { value: u16 },
+    /// Second SRAM bank address register alone (Linux
+    /// `ocp_reg_write(tp, OCP_SRAM2_ADDR, addr)`).
+    Sram2AddrWrite { addr: u16 },
+    /// Second SRAM bank data register alone (Linux
+    /// `ocp_reg_write(tp, OCP_SRAM2_DATA, value)`).
+    Sram2DataWrite { value: u16 },
+    /// USB-window word test-and-clear (Linux
+    /// `ocp_word_test_and_clr_bits`): read, write back cleared
+    /// only when any of `bits` is set.
+    UsbWordTestAndClrBits { addr: u16, bits: u16 },
+    /// MDIO test-and-clear via `OCP_BASE_MII + reg * 2` (Linux
+    /// `r8152_mdio_test_and_clr_bit`).
+    MdioTestAndClrBits { reg: u16, bits: u16 },
+    /// MMD indirect write (Linux `r8152_mmd_write`): select the
+    /// device/register through `OCP_EEE_AR` / `OCP_EEE_DATA`,
+    /// write the value, deselect.
+    MmdWrite { dev: u16, reg: u16, value: u16 },
+    /// Firmware-blob step (Linux `rtl8152_apply_firmware`) at
+    /// this position in the sequence, with the family's
+    /// `power_cut` rule. A missing blob is a no-op (Linux's
+    /// failed `request_firmware`: warn and continue); a blob
+    /// that fails validation is logged and skipped, never a
+    /// bind failure.
+    ApplyFirmware { mode: FirmwarePowerCut },
+    /// PHY patch request/release (Linux
+    /// `rtl_phy_patch_request`): set (or clear) `PATCH_REQUEST`
+    /// in `OCP_PHY_PATCH_CMD` and wait for `PATCH_READY` to
+    /// set (or clear). A failed *request* aborts the rest of
+    /// the sequence — Linux returns from `*_hw_phy_cfg` on it —
+    /// so the executor marks the run aborted and later steps
+    /// become no-ops.
+    PhyPatchRequest { request: bool },
+    /// Flash-load wait (Linux `r8156b_wait_loading_flash`):
+    /// when `PLA_GPHY_CTRL` says the PHY boots from flash and
+    /// `USB_GPHY_CTRL` does not bypass it, poll for
+    /// `GPHY_PATCH_DONE` (best-effort).
+    WaitLoadingFlash,
+    /// ADC bias calibration from efuse (Linux
+    /// `r8153b_hw_phy_cfg`): read efuse offset `0x7d`, drop the
+    /// dummy bit, write the rebuilt value to `OCP_ADC_IOFFSET`
+    /// unless it is `0xffff`.
+    AdcBiasFromEfuse,
+    /// UPS-mode TX link-pulse timing (Linux
+    /// `r8153b_hw_phy_cfg`): read the sawtooth count at OCP
+    /// `0xc426`, derive the 1 ms counter and program
+    /// `USB_UPS_CFG` — skipped when the count reads zero.
+    UpsTimingFromSawCnt,
+    /// MDI pair swap when the board is reversed (Linux
+    /// `r8156_hw_phy_cfg` VER_11): when `USB_UPS_CFG` reports
+    /// `MID_REVERSE` and OCP `0xd068` bit 1 is set, swap the
+    /// p0/p3 and p1/p2 lanes plus the `0xbd5a`/`0xbd5c` and
+    /// `0xbc18`/`0xbc1a` pairs.
+    MdiSwapIfReversed,
 }
 
-/// The `r8153_hw_phy_cfg` sequence for the original RTL8153
-/// family, in Linux's order, with the firmware-blob step omitted
-/// (see the section header). Returns an empty sequence for every
-/// other version — those keep reset defaults until ported.
-/// Version gates inside the sequence: `CTAP_SHORT_EN` clears only
-/// on VER_03; the U2P3 enable lands only on VER_05/VER_06 (Linux
-/// enables it for VER_05/VER_06/default and skips VER_03/VER_04).
-pub fn r8153_phy_init_ops(version: RtlVersion) -> Vec<PhyInitOp> {
+/// EEE-disable steps shared by the VER_03–VER_06 / VER_08 / VER_09 /
+/// VER_14 sequences (Linux `r8153_eee_en(tp, false)` plus the
+/// `OCP_EEE_ADV := 0` write in `rtl_eee_enable`).
+fn eee_disable_ops_8153() -> Vec<PhyInitOp> {
     use PhyInitOp::*;
-    match version {
-        RtlVersion::Ver03 | RtlVersion::Ver04 | RtlVersion::Ver05 | RtlVersion::Ver06 => {}
-        _ => return Vec::new(),
-    }
-    let mut ops = vec![
-        // Disable ALDPS before updating the PHY parameters.
-        AldpsDisable,
-        // Disable EEE before updating the PHY parameters.
+    vec![
         PlaWordClrBits {
             addr: PLA_EEE_CR,
             bits: EEE_CR_RX_EN | EEE_CR_TX_EN,
@@ -698,7 +983,136 @@ pub fn r8153_phy_init_ops(version: RtlVersion) -> Vec<PhyInitOp> {
             addr: OCP_EEE_ADV,
             value: 0,
         },
-        // [rtl8152_apply_firmware skipped: no firmware blobs.]
+    ]
+}
+
+/// EEE-enable steps shared by the VER_03–VER_06 / VER_08 / VER_09 /
+/// VER_14 sequences (Linux `r8153_eee_en(tp, true)` plus the
+/// `OCP_EEE_ADV := eee_adv` write). `adv` is the family's
+/// `eee_adv` (Linux `rtl_ops_init`).
+fn eee_enable_ops_8153(adv: u16) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    vec![
+        PlaWordSetBits {
+            addr: PLA_EEE_CR,
+            bits: EEE_CR_RX_EN | EEE_CR_TX_EN,
+        },
+        OcpRegSetBits {
+            addr: OCP_EEE_CFG,
+            bits: EEE_CFG_EEE10_EN,
+        },
+        OcpRegWrite {
+            addr: OCP_EEE_ADV,
+            value: adv,
+        },
+    ]
+}
+
+/// EEE-disable steps shared by the VER_10–VER_13 / VER_15–VER_17
+/// sequences (Linux `r8156_eee_en(tp, false)` plus the
+/// `OCP_EEE_ADV := 0` write).
+fn eee_disable_ops_8156() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = eee_disable_ops_8153();
+    ops.push(OcpRegW0W1 {
+        addr: OCP_EEE_ADV2,
+        clear: MDIO_EEE_2_5GT | MDIO_EEE_5GT,
+        set: 0,
+    });
+    ops
+}
+
+/// EEE-enable steps shared by the VER_10–VER_13 / VER_15–VER_17
+/// sequences (Linux `r8156_eee_en(tp, true)` plus the
+/// `OCP_EEE_ADV := eee_adv` write). `adv` is the family's
+/// `eee_adv`, `adv2` its `eee_adv2` (Linux `rtl_ops_init`).
+fn eee_enable_ops_8156(adv: u16, adv2: u16) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = eee_enable_ops_8153(adv);
+    ops.push(OcpRegW0W1 {
+        addr: OCP_EEE_ADV2,
+        clear: (MDIO_EEE_2_5GT | MDIO_EEE_5GT) & !adv2,
+        set: adv2,
+    });
+    ops
+}
+
+/// Flow-control advertisement (Linux `r8152b_enable_fc`).
+fn enable_fc_op() -> PhyInitOp {
+    PhyInitOp::MdioSetBits {
+        reg: MII_ADVERTISE,
+        bits: ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM,
+    }
+}
+
+/// ALDPS re-enable (Linux `r8153_aldps_en(tp, true)`).
+fn aldps_enable_op() -> PhyInitOp {
+    PhyInitOp::OcpRegSetBits {
+        addr: OCP_POWER_CFG,
+        bits: POWER_CFG_EN_ALDPS,
+    }
+}
+
+/// The `r8152b_hw_phy_cfg` sequence for the RTL8152 family
+/// (VER_01/02/07), in Linux's order: firmware first (no file
+/// exists for these versions, so the step is a no-op in Linux),
+/// then EEE enable (`r8152_eee_en` + MMD advertisement),
+/// ALDPS enable (`r8152_aldps_en`) and flow control.
+fn phy_init_ops_8152b() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    vec![
+        ApplyFirmware {
+            mode: FirmwarePowerCut::Never,
+        },
+        // EEE enable (Linux: eee_en is true for VER_01/02/07).
+        PlaWordSetBits {
+            addr: PLA_EEE_CR,
+            bits: EEE_CR_RX_EN | EEE_CR_TX_EN,
+        },
+        OcpRegW0W1 {
+            addr: OCP_EEE_CONFIG1,
+            clear: EEE_SD_RISE_TIME_MASK,
+            set: EEE_10_CAP | EEE_NWAY_EN | EEE_TX_QUIET_EN | EEE_RX_QUIET_EN | EEE_SD_RISE_TIME_1,
+        },
+        OcpRegSetBits {
+            addr: OCP_EEE_CONFIG2,
+            bits: EEE_RG_DACQUIET_EN | EEE_RG_LDVQUIET_EN,
+        },
+        OcpRegW0W1 {
+            addr: OCP_EEE_CONFIG3,
+            clear: EEE_FAST_SNR_MASK,
+            set: EEE_FAST_SNR_42,
+        },
+        MmdWrite {
+            dev: MDIO_MMD_AN,
+            reg: MDIO_AN_EEE_ADV,
+            value: EEE_ADV_8152,
+        },
+        // ALDPS enable (r8152_aldps_en writes the whole config word).
+        OcpRegWrite {
+            addr: OCP_ALDPS_CONFIG,
+            value: ALDPS_CFG_8152_ENABLE,
+        },
+        enable_fc_op(),
+    ]
+}
+
+/// The `r8153_hw_phy_cfg` sequence for the original RTL8153
+/// family, in Linux's order. Version gates inside the sequence:
+/// `CTAP_SHORT_EN` clears only on VER_03; the U2P3 enable lands
+/// only on VER_05/VER_06 (Linux enables it for VER_05/VER_06/
+/// default and skips VER_03/VER_04).
+fn phy_init_ops_8153(version: RtlVersion) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = vec![
+        // Disable ALDPS before updating the PHY parameters.
+        AldpsDisable,
+    ];
+    ops.extend(eee_disable_ops_8153());
+    ops.push(ApplyFirmware {
+        mode: FirmwarePowerCut::Never,
+    });
+    ops.extend([
         OcpRegSetBits {
             addr: OCP_POWER_CFG,
             bits: POWER_CFG_EEE_CLKDIV_EN,
@@ -733,35 +1147,16 @@ pub fn r8153_phy_init_ops(version: RtlVersion) -> Vec<PhyInitOp> {
             addr: SRAM_10M_AMP2,
             value: 0x0208,
         },
-        // Re-enable EEE (Linux: eee_en is true for VER_03–VER_06).
-        PlaWordSetBits {
-            addr: PLA_EEE_CR,
-            bits: EEE_CR_RX_EN | EEE_CR_TX_EN,
-        },
-        OcpRegSetBits {
-            addr: OCP_EEE_CFG,
-            bits: EEE_CFG_EEE10_EN,
-        },
-        OcpRegWrite {
-            addr: OCP_EEE_ADV,
-            value: EEE_ADV_8153,
-        },
-        // Re-enable ALDPS.
-        OcpRegSetBits {
-            addr: OCP_POWER_CFG,
-            bits: POWER_CFG_EN_ALDPS,
-        },
-        // Flow-control advertisement (r8152b_enable_fc).
-        MdioSetBits {
-            reg: MII_ADVERTISE,
-            bits: ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM,
-        },
-    ];
+    ]);
+    // Re-enable EEE (Linux: eee_en is true for VER_03–VER_06).
+    ops.extend(eee_enable_ops_8153(EEE_ADV_8153));
+    ops.push(aldps_enable_op());
+    ops.push(enable_fc_op());
     if version == RtlVersion::Ver03 {
         // VER_03 only: clear CTAP_SHORT_EN, immediately after the
-        // EEE disable (Linux's position in the sequence).
+        // firmware step (Linux's position in the sequence).
         ops.insert(
-            4,
+            5,
             OcpRegClrBits {
                 addr: OCP_EEE_CFG,
                 bits: EEE_CFG_CTAP_SHORT_EN,
@@ -775,6 +1170,2076 @@ pub fn r8153_phy_init_ops(version: RtlVersion) -> Vec<PhyInitOp> {
         });
     }
     ops
+}
+
+/// The `r8153b_hw_phy_cfg` sequence for the RTL8153B family
+/// (VER_08/09) and, through `r8153c_hw_phy_cfg`, VER_14 — the
+/// latter only sets a driver-internal flag (`ups_info.r_tune`)
+/// after calling this sequence, which has no wire effect, so
+/// both share this table. In Linux's order.
+fn phy_init_ops_8153b() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = vec![
+        UsbWordTestAndClrBits {
+            addr: USB_MISC_0,
+            bits: PCUT_STATUS,
+        },
+        // Disable ALDPS before updating the PHY parameters.
+        AldpsDisable,
+    ];
+    ops.extend(eee_disable_ops_8153());
+    ops.extend([
+        // U1/U2/L1 idle timer. 500 us.
+        UsbWordWrite {
+            addr: USB_U1U2_TIMER,
+            value: 500,
+        },
+        ApplyFirmware {
+            mode: FirmwarePowerCut::OnPwrdnOrExtInit,
+        },
+    ]);
+    // Green ethernet (Linux: GREEN_ETHERNET is set in
+    // r8153b_init / r8153c_init, so always enabled here).
+    ops.extend([
+        SramWrite {
+            addr: 0x8045,
+            value: 0,
+        },
+        SramWrite {
+            addr: 0x804D,
+            value: 0x1222,
+        },
+        SramWrite {
+            addr: 0x805D,
+            value: 0x0022,
+        },
+        SramW0W1 {
+            addr: SRAM_GREEN_CFG,
+            clear: 0,
+            set: GREEN_ETH_EN,
+        },
+        SramW0W1 {
+            addr: SRAM_GREEN_CFG,
+            clear: 0,
+            set: GREEN_CFG_R_TUNE_EN,
+        },
+        OcpRegSetBits {
+            addr: OCP_NCTL_CFG,
+            bits: NCTL_CFG_PGA_RETURN_EN,
+        },
+        AdcBiasFromEfuse,
+        UpsTimingFromSawCnt,
+        PlaWordSetBits {
+            addr: PLA_PHY_PWR,
+            bits: PHY_PWR_PFM_PWM_SWITCH,
+        },
+        // Advance EEE, gated on the PHY patch request.
+        PhyPatchRequest { request: true },
+        OcpRegSetBits {
+            addr: OCP_POWER_CFG,
+            bits: POWER_CFG_EEE_CLKDIV_EN,
+        },
+        OcpRegSetBits {
+            addr: OCP_DOWN_SPEED,
+            bits: DOWN_SPEED_EN_EEE_CMODE | DOWN_SPEED_EN_EEE_1000 | DOWN_SPEED_EN_10M_CLKDIV,
+        },
+        OcpRegWrite {
+            addr: OCP_SYSCLK_CFG,
+            value: 0,
+        },
+        OcpRegWrite {
+            addr: OCP_SYSCLK_CFG,
+            value: CLK_DIV_EXPO_5,
+        },
+        PhyPatchRequest { request: false },
+    ]);
+    // Re-enable EEE (Linux: eee_en is true for VER_08/09/14).
+    ops.extend(eee_enable_ops_8153(EEE_ADV_8153));
+    ops.push(aldps_enable_op());
+    ops.push(enable_fc_op());
+    ops
+}
+
+/// Shared prefix of `r8156_hw_phy_cfg` (VER_10/11): power-cut
+/// clear, firmware step, ALDPS/EEE disable, LAN_ON poll, PHY
+/// power switch.
+fn phy_init_ops_8156_prefix() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = vec![
+        UsbWordTestAndClrBits {
+            addr: USB_MISC_0,
+            bits: PCUT_STATUS,
+        },
+        ApplyFirmware {
+            mode: FirmwarePowerCut::OnExtInit { clear_a466: false },
+        },
+        // Disable ALDPS before updating the PHY parameters.
+        AldpsDisable,
+    ];
+    ops.extend(eee_disable_ops_8156());
+    ops.extend([
+        PhyStatusPollLanOn,
+        PlaWordSetBits {
+            addr: PLA_PHY_PWR,
+            bits: PHY_PWR_PFM_PWM_SWITCH,
+        },
+    ]);
+    ops
+}
+
+/// Shared tail of `r8156_hw_phy_cfg` (VER_10/11): green mode,
+/// lite-mode clears, EEE re-enable (only when `eee_en` — true
+/// for VER_11, false for VER_10), ALDPS, flow control, U2P3.
+fn phy_init_ops_8156_tail(eee_en: bool, adv: u16, adv2: u16) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = vec![
+        SramW0W1 {
+            addr: SRAM_GREEN_CFG,
+            clear: 0,
+            set: GREEN_ETH_EN,
+        },
+        OcpRegClrBits {
+            addr: 0xA428,
+            bits: 0x0200,
+        },
+        OcpRegClrBits {
+            addr: 0xA5EA,
+            bits: 0x0001,
+        },
+    ];
+    if eee_en {
+        ops.extend(eee_enable_ops_8156(adv, adv2));
+    }
+    ops.push(aldps_enable_op());
+    ops.push(enable_fc_op());
+    ops.push(UsbWordSetBits {
+        addr: USB_U2P3_CTRL,
+        bits: U2P3_ENABLE,
+    });
+    ops
+}
+
+/// The `r8156_hw_phy_cfg` sequence for the RTL8156 family
+/// (VER_10/11), in Linux's order.
+fn phy_init_ops_8156(version: RtlVersion) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = phy_init_ops_8156_prefix();
+    match version {
+        RtlVersion::Ver10 => {
+            ops.extend([
+                OcpRegW0W1 {
+                    addr: 0xAD40,
+                    clear: 0x03FF,
+                    set: 0x0084,
+                },
+                OcpRegSetBits {
+                    addr: 0xAD4E,
+                    bits: 0x0010,
+                },
+                OcpRegW0W1 {
+                    addr: 0xAD16,
+                    clear: 0x03FF,
+                    set: 0x0006,
+                },
+                OcpRegW0W1 {
+                    addr: 0xAD32,
+                    clear: 0x003F,
+                    set: 0x0006,
+                },
+                OcpRegClrBits {
+                    addr: 0xAC08,
+                    bits: 0x1100,
+                },
+                OcpRegW0W1 {
+                    addr: 0xAC8A,
+                    clear: 0x8000,
+                    set: 0x7000,
+                },
+                OcpRegSetBits {
+                    addr: 0xAD18,
+                    bits: 0x0400,
+                },
+                OcpRegSetBits {
+                    addr: 0xAD1A,
+                    bits: 0x03FF,
+                },
+                OcpRegSetBits {
+                    addr: 0xAD1C,
+                    bits: 0x03FF,
+                },
+                SramW0W1 {
+                    addr: 0x80EA,
+                    clear: 0xFF00,
+                    set: 0xC400,
+                },
+                SramW0W1 {
+                    addr: 0x80EB,
+                    clear: 0x0700,
+                    set: 0x0300,
+                },
+                SramW0W1 {
+                    addr: 0x80F8,
+                    clear: 0xFF00,
+                    set: 0x1C00,
+                },
+                SramW0W1 {
+                    addr: 0x80F1,
+                    clear: 0xFF00,
+                    set: 0x3000,
+                },
+                SramW0W1 {
+                    addr: 0x80FE,
+                    clear: 0xFF00,
+                    set: 0xA500,
+                },
+                SramW0W1 {
+                    addr: 0x8102,
+                    clear: 0xFF00,
+                    set: 0x5000,
+                },
+                SramW0W1 {
+                    addr: 0x8015,
+                    clear: 0xFF00,
+                    set: 0x3300,
+                },
+                SramW0W1 {
+                    addr: 0x8100,
+                    clear: 0xFF00,
+                    set: 0x7000,
+                },
+                SramW0W1 {
+                    addr: 0x8014,
+                    clear: 0xFF00,
+                    set: 0xF000,
+                },
+                SramW0W1 {
+                    addr: 0x8016,
+                    clear: 0xFF00,
+                    set: 0x6500,
+                },
+                SramW0W1 {
+                    addr: 0x80DC,
+                    clear: 0xFF00,
+                    set: 0xED00,
+                },
+                SramW0W1 {
+                    addr: 0x80DF,
+                    clear: 0,
+                    set: 0x0100,
+                },
+                SramW0W1 {
+                    addr: 0x80E1,
+                    clear: 0x0100,
+                    set: 0,
+                },
+                OcpRegW0W1 {
+                    addr: 0xBF06,
+                    clear: 0x003F,
+                    set: 0x0038,
+                },
+                SramWrite {
+                    addr: 0x819F,
+                    value: 0xDDB6,
+                },
+                OcpRegWrite {
+                    addr: 0xBC34,
+                    value: 0x5555,
+                },
+                OcpRegW0W1 {
+                    addr: 0xBF0A,
+                    clear: 0x0E00,
+                    set: 0x0A00,
+                },
+                OcpRegClrBits {
+                    addr: 0xBD2C,
+                    bits: 0x2000,
+                },
+            ]);
+        }
+        RtlVersion::Ver11 => {
+            ops.extend([
+                OcpRegSetBits {
+                    addr: 0xAD16,
+                    bits: 0x03FF,
+                },
+                OcpRegW0W1 {
+                    addr: 0xAD32,
+                    clear: 0x003F,
+                    set: 0x0006,
+                },
+                OcpRegClrBits {
+                    addr: 0xAC08,
+                    bits: 0x1100,
+                },
+                OcpRegW0W1 {
+                    addr: 0xACC0,
+                    clear: 0x0003,
+                    set: 0x0002,
+                },
+                OcpRegW0W1 {
+                    addr: 0xAD40,
+                    clear: 0x00E7,
+                    set: 0x0044,
+                },
+                OcpRegClrBits {
+                    addr: 0xAC14,
+                    bits: 0x0080,
+                },
+                OcpRegClrBits {
+                    addr: 0xAC80,
+                    bits: 0x0300,
+                },
+                OcpRegW0W1 {
+                    addr: 0xAC5E,
+                    clear: 0x0007,
+                    set: 0x0002,
+                },
+                OcpRegWrite {
+                    addr: 0xAD4C,
+                    value: 0x00A8,
+                },
+                OcpRegWrite {
+                    addr: 0xAC5C,
+                    value: 0x01FF,
+                },
+                OcpRegW0W1 {
+                    addr: 0xAC8A,
+                    clear: 0x00F0,
+                    set: 0x0030,
+                },
+                Sram2W0W1 {
+                    addr: 0x8157,
+                    clear: 0xFF00,
+                    set: 0x0500,
+                },
+                Sram2W0W1 {
+                    addr: 0x8159,
+                    clear: 0xFF00,
+                    set: 0x0700,
+                },
+                // AAGC.
+                Sram2Write {
+                    addr: 0x80A2,
+                    value: 0x0153,
+                },
+                Sram2Write {
+                    addr: 0x809C,
+                    value: 0x0153,
+                },
+                // EEE parameter.
+                PlaWordWrite {
+                    addr: PLA_EEE_TXTWSYS_2P5G,
+                    value: 0x0056,
+                },
+                PlaWordSetBits {
+                    addr: PLA_USB_CFG,
+                    bits: USB_CFG_EN_XG_LIP | USB_CFG_EN_G_LIP,
+                },
+                // XG PLL.
+                SramWrite {
+                    addr: 0x8257,
+                    value: 0x020F,
+                },
+                // GIGA Master.
+                SramWrite {
+                    addr: 0x80EA,
+                    value: 0x7843,
+                },
+                // Advance EEE, gated on the PHY patch request.
+                PhyPatchRequest { request: true },
+                PlaWordSetBits {
+                    addr: PLA_MAC_PWR_CTRL4,
+                    bits: MAC_PWR_CTRL4_EEE_SPDWN_EN,
+                },
+                OcpRegW0W1 {
+                    addr: OCP_DOWN_SPEED,
+                    clear: DOWN_SPEED_EN_EEE_100 | DOWN_SPEED_EN_EEE_1000,
+                    set: DOWN_SPEED_EN_10M_CLKDIV,
+                },
+                OcpRegClrBits {
+                    addr: OCP_POWER_CFG,
+                    bits: POWER_CFG_EEE_CLKDIV_EN,
+                },
+                OcpRegWrite {
+                    addr: OCP_SYSCLK_CFG,
+                    value: 0,
+                },
+                OcpRegWrite {
+                    addr: OCP_SYSCLK_CFG,
+                    value: SYSCLK_DIV_EXPO_5,
+                },
+                PhyPatchRequest { request: false },
+                // Enable ADC Ibias Cal.
+                OcpRegSetBits {
+                    addr: 0xD068,
+                    bits: 0x2000,
+                },
+                // Enable Thermal Sensor.
+                SramW0W1 {
+                    addr: 0x81A2,
+                    clear: 0x0100,
+                    set: 0,
+                },
+                OcpRegW0W1 {
+                    addr: 0xB54C,
+                    clear: 0xFF00,
+                    set: 0xDB00,
+                },
+                // Nway 2.5G Lite.
+                OcpRegClrBits {
+                    addr: 0xA454,
+                    bits: 0x0001,
+                },
+                // CS DSP solution.
+                OcpRegSetBits {
+                    addr: OCP_10GBT_CTRL,
+                    bits: CTRL_10GBT_ADV2_5G_F_R,
+                },
+                OcpRegClrBits {
+                    addr: 0xAD4E,
+                    bits: 0x0010,
+                },
+                OcpRegClrBits {
+                    addr: 0xA86A,
+                    bits: 0x0001,
+                },
+                MdiSwapIfReversed,
+                // Notify the MAC when the speed is changed to force mode.
+                OcpRegSetBits {
+                    addr: OCP_INTR_EN,
+                    bits: INTR_EN_SPEED_FORCE,
+                },
+            ]);
+        }
+        _ => {}
+    }
+    // VER_10: eee_en is false in Linux (zero-initialised);
+    // VER_11: eee_en is true, eee_adv 0x0006, eee_adv2 2.5GT.
+    let (eee_en, adv, adv2) = match version {
+        RtlVersion::Ver11 => (true, EEE_ADV_8153, MDIO_EEE_2_5GT),
+        _ => (false, EEE_ADV_8153, 0),
+    };
+    ops.extend(phy_init_ops_8156_tail(eee_en, adv, adv2));
+    ops
+}
+
+/// Shared prefix of `r8156b_hw_phy_cfg` (VER_12/13/15) and
+/// `r8157_hw_phy_cfg` (VER_16/17): power-cut clear, firmware
+/// step, BMCR power-down test-and-clear, ALDPS/EEE disable,
+/// LAN_ON poll, PHY power switch. `set_pfm_pwm` selects the
+/// switch direction: the 8156B family sets it (PFM/PWM mode),
+/// the 8157 family clears it (PFM mode).
+fn phy_init_ops_8156b_prefix(clear_a466: bool, set_pfm_pwm: bool) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = vec![
+        UsbWordTestAndClrBits {
+            addr: USB_MISC_0,
+            bits: PCUT_STATUS,
+        },
+        ApplyFirmware {
+            mode: FirmwarePowerCut::OnExtInit { clear_a466 },
+        },
+        MdioTestAndClrBits {
+            reg: MII_BMCR,
+            bits: BMCR_PDOWN,
+        },
+        // Disable ALDPS before updating the PHY parameters.
+        AldpsDisable,
+    ];
+    ops.extend(eee_disable_ops_8156());
+    ops.extend([
+        PhyStatusPollLanOn,
+        if set_pfm_pwm {
+            PlaWordSetBits {
+                addr: PLA_PHY_PWR,
+                bits: PHY_PWR_PFM_PWM_SWITCH,
+            }
+        } else {
+            PlaWordClrBits {
+                addr: PLA_PHY_PWR,
+                bits: PHY_PWR_PFM_PWM_SWITCH,
+            }
+        },
+    ]);
+    ops
+}
+
+/// Shared tail of `r8156b_hw_phy_cfg` (VER_12/13/15): force-mode
+/// interrupt, patch-gated Advance EEE, green mode, lite-mode
+/// clears, EEE re-enable, ALDPS, flow control, U2P3.
+fn phy_init_ops_8156b_tail() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = vec![
+        // Notify the MAC when the speed is changed to force mode.
+        OcpRegSetBits {
+            addr: OCP_INTR_EN,
+            bits: INTR_EN_SPEED_FORCE,
+        },
+        // Advance EEE, gated on the PHY patch request.
+        PhyPatchRequest { request: true },
+        PlaWordSetBits {
+            addr: PLA_MAC_PWR_CTRL4,
+            bits: MAC_PWR_CTRL4_EEE_SPDWN_EN,
+        },
+        OcpRegW0W1 {
+            addr: OCP_DOWN_SPEED,
+            clear: DOWN_SPEED_EN_EEE_100 | DOWN_SPEED_EN_EEE_1000,
+            set: DOWN_SPEED_EN_10M_CLKDIV,
+        },
+        OcpRegClrBits {
+            addr: OCP_POWER_CFG,
+            bits: POWER_CFG_EEE_CLKDIV_EN,
+        },
+        PhyPatchRequest { request: false },
+        SramW0W1 {
+            addr: SRAM_GREEN_CFG,
+            clear: 0,
+            set: GREEN_ETH_EN,
+        },
+        OcpRegClrBits {
+            addr: 0xA428,
+            bits: 0x0200,
+        },
+        OcpRegClrBits {
+            addr: 0xA5EA,
+            bits: 0x0001,
+        },
+    ];
+    // EEE re-enable (Linux: eee_en is true for VER_12/13/15).
+    ops.extend(eee_enable_ops_8156(EEE_ADV_8153, MDIO_EEE_2_5GT));
+    ops.push(aldps_enable_op());
+    ops.push(enable_fc_op());
+    ops.push(UsbWordSetBits {
+        addr: USB_U2P3_CTRL,
+        bits: U2P3_ENABLE,
+    });
+    ops
+}
+
+/// The `r8156b_hw_phy_cfg` sequence for the RTL8156B family
+/// (VER_12/13/15), in Linux's order.
+fn phy_init_ops_8156b(version: RtlVersion) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = Vec::new();
+    match version {
+        RtlVersion::Ver12 => {
+            ops.extend([
+                OcpRegWrite {
+                    addr: 0xBF86,
+                    value: 0x9000,
+                },
+                OcpRegSetBits {
+                    addr: 0xC402,
+                    bits: 0x0400,
+                },
+                OcpRegClrBits {
+                    addr: 0xC402,
+                    bits: 0x0400,
+                },
+                OcpRegWrite {
+                    addr: 0xBD86,
+                    value: 0x1010,
+                },
+                OcpRegWrite {
+                    addr: 0xBD88,
+                    value: 0x1010,
+                },
+                OcpRegW0W1 {
+                    addr: 0xBD4E,
+                    clear: 0x0C00,
+                    set: 0x0800,
+                },
+                OcpRegW0W1 {
+                    addr: 0xBF46,
+                    clear: 0x0F00,
+                    set: 0x0700,
+                },
+            ]);
+        }
+        RtlVersion::Ver13 | RtlVersion::Ver15 => {
+            ops.push(WaitLoadingFlash);
+        }
+        _ => {}
+    }
+    ops.extend(phy_init_ops_8156b_prefix(true, true));
+    match version {
+        RtlVersion::Ver12 => {
+            ops.extend([
+                OcpRegSetBits {
+                    addr: 0xBC08,
+                    bits: 0x000C,
+                },
+                SramW0W1 {
+                    addr: 0x8FFF,
+                    clear: 0xFF00,
+                    set: 0x0400,
+                },
+                OcpRegSetBits {
+                    addr: 0xACDA,
+                    bits: 0xFF00,
+                },
+                OcpRegSetBits {
+                    addr: 0xACDE,
+                    bits: 0xF000,
+                },
+                OcpRegWrite {
+                    addr: 0xAC8C,
+                    value: 0x0FFC,
+                },
+                OcpRegWrite {
+                    addr: 0xAC46,
+                    value: 0xB7B4,
+                },
+                OcpRegWrite {
+                    addr: 0xAC50,
+                    value: 0x0FBC,
+                },
+                OcpRegWrite {
+                    addr: 0xAC3C,
+                    value: 0x9240,
+                },
+                OcpRegWrite {
+                    addr: 0xAC4E,
+                    value: 0x0DB4,
+                },
+                OcpRegWrite {
+                    addr: 0xACC6,
+                    value: 0x0707,
+                },
+                OcpRegWrite {
+                    addr: 0xACC8,
+                    value: 0xA0D3,
+                },
+                OcpRegWrite {
+                    addr: 0xAD08,
+                    value: 0x0007,
+                },
+                Sram2Write {
+                    addr: 0x8560,
+                    value: 0x19CC,
+                },
+                Sram2Write {
+                    addr: 0x8562,
+                    value: 0x19CC,
+                },
+                Sram2Write {
+                    addr: 0x8564,
+                    value: 0x19CC,
+                },
+                Sram2Write {
+                    addr: 0x8566,
+                    value: 0x147D,
+                },
+                Sram2Write {
+                    addr: 0x8568,
+                    value: 0x147D,
+                },
+                Sram2Write {
+                    addr: 0x856A,
+                    value: 0x147D,
+                },
+                Sram2Write {
+                    addr: 0x8FFE,
+                    value: 0x0907,
+                },
+                Sram2Write {
+                    addr: 0x80D6,
+                    value: 0x2801,
+                },
+                Sram2Write {
+                    addr: 0x80F2,
+                    value: 0x2801,
+                },
+                Sram2Write {
+                    addr: 0x80F4,
+                    value: 0x6077,
+                },
+                OcpRegWrite {
+                    addr: 0xB506,
+                    value: 0x01E7,
+                },
+                Sram2Write {
+                    addr: 0x8013,
+                    value: 0x0700,
+                },
+                Sram2Write {
+                    addr: 0x8FB9,
+                    value: 0x2801,
+                },
+                Sram2Write {
+                    addr: 0x8FBA,
+                    value: 0x0100,
+                },
+                Sram2Write {
+                    addr: 0x8FBC,
+                    value: 0x1900,
+                },
+                Sram2Write {
+                    addr: 0x8FBE,
+                    value: 0xE100,
+                },
+                Sram2Write {
+                    addr: 0x8FC0,
+                    value: 0x0800,
+                },
+                Sram2Write {
+                    addr: 0x8FC2,
+                    value: 0xE500,
+                },
+                Sram2Write {
+                    addr: 0x8FC4,
+                    value: 0x0F00,
+                },
+                Sram2Write {
+                    addr: 0x8FC6,
+                    value: 0xF100,
+                },
+                Sram2Write {
+                    addr: 0x8FC8,
+                    value: 0x0400,
+                },
+                Sram2Write {
+                    addr: 0x8FCA,
+                    value: 0xF300,
+                },
+                Sram2Write {
+                    addr: 0x8FCC,
+                    value: 0xFD00,
+                },
+                Sram2Write {
+                    addr: 0x8FCE,
+                    value: 0xFF00,
+                },
+                Sram2Write {
+                    addr: 0x8FD0,
+                    value: 0xFB00,
+                },
+                Sram2Write {
+                    addr: 0x8FD2,
+                    value: 0x0100,
+                },
+                Sram2Write {
+                    addr: 0x8FD4,
+                    value: 0xF400,
+                },
+                Sram2Write {
+                    addr: 0x8FD6,
+                    value: 0xFF00,
+                },
+                Sram2Write {
+                    addr: 0x8FD8,
+                    value: 0xF600,
+                },
+                PlaByteSetBits {
+                    addr: PLA_USB_CFG,
+                    bits: (USB_CFG_EN_XG_LIP | USB_CFG_EN_G_LIP) as u8,
+                },
+                Sram2Write {
+                    addr: 0x813D,
+                    value: 0x390E,
+                },
+                Sram2Write {
+                    addr: 0x814F,
+                    value: 0x790E,
+                },
+                Sram2Write {
+                    addr: 0x80B0,
+                    value: 0x0F31,
+                },
+                OcpRegSetBits {
+                    addr: 0xBF4C,
+                    bits: 0x0002,
+                },
+                OcpRegSetBits {
+                    addr: 0xBCCA,
+                    bits: 0x0300,
+                },
+                Sram2Write {
+                    addr: 0x8141,
+                    value: 0x320E,
+                },
+                Sram2Write {
+                    addr: 0x8153,
+                    value: 0x720E,
+                },
+                Sram2Write {
+                    addr: 0x8529,
+                    value: 0x050E,
+                },
+                OcpRegClrBits {
+                    addr: OCP_EEE_CFG,
+                    bits: EEE_CFG_CTAP_SHORT_EN,
+                },
+                SramWrite {
+                    addr: 0x816C,
+                    value: 0xC4A0,
+                },
+                SramWrite {
+                    addr: 0x8170,
+                    value: 0xC4A0,
+                },
+                SramWrite {
+                    addr: 0x8174,
+                    value: 0x04A0,
+                },
+                SramWrite {
+                    addr: 0x8178,
+                    value: 0x04A0,
+                },
+                SramWrite {
+                    addr: 0x817C,
+                    value: 0x0719,
+                },
+                SramWrite {
+                    addr: 0x8FF4,
+                    value: 0x0400,
+                },
+                SramWrite {
+                    addr: 0x8FF1,
+                    value: 0x0404,
+                },
+                OcpRegWrite {
+                    addr: 0xBF4A,
+                    value: 0x001B,
+                },
+                Sram2Write {
+                    addr: 0x8033,
+                    value: 0x7C13,
+                },
+                Sram2Write {
+                    addr: 0x8037,
+                    value: 0x7C13,
+                },
+                Sram2Write {
+                    addr: 0x803B,
+                    value: 0xFC32,
+                },
+                Sram2Write {
+                    addr: 0x803F,
+                    value: 0x7C13,
+                },
+                Sram2Write {
+                    addr: 0x8043,
+                    value: 0x7C13,
+                },
+                Sram2Write {
+                    addr: 0x8047,
+                    value: 0x7C13,
+                },
+                Sram2Write {
+                    addr: 0x8145,
+                    value: 0x370E,
+                },
+                Sram2Write {
+                    addr: 0x8157,
+                    value: 0x770E,
+                },
+                Sram2Write {
+                    addr: 0x8169,
+                    value: 0x0D0A,
+                },
+                Sram2Write {
+                    addr: 0x817B,
+                    value: 0x1D0A,
+                },
+                SramW0W1 {
+                    addr: 0x8217,
+                    clear: 0xFF00,
+                    set: 0x5000,
+                },
+                SramW0W1 {
+                    addr: 0x821A,
+                    clear: 0xFF00,
+                    set: 0x5000,
+                },
+                SramWrite {
+                    addr: 0x80DA,
+                    value: 0x0403,
+                },
+                SramW0W1 {
+                    addr: 0x80DC,
+                    clear: 0xFF00,
+                    set: 0x1000,
+                },
+                SramWrite {
+                    addr: 0x80B3,
+                    value: 0x0384,
+                },
+                SramWrite {
+                    addr: 0x80B7,
+                    value: 0x2007,
+                },
+                SramW0W1 {
+                    addr: 0x80BA,
+                    clear: 0xFF00,
+                    set: 0x6C00,
+                },
+                SramWrite {
+                    addr: 0x80B5,
+                    value: 0xF009,
+                },
+                SramW0W1 {
+                    addr: 0x80BD,
+                    clear: 0xFF00,
+                    set: 0x9F00,
+                },
+                SramWrite {
+                    addr: 0x80C7,
+                    value: 0xF083,
+                },
+                SramWrite {
+                    addr: 0x80DD,
+                    value: 0x03F0,
+                },
+                SramW0W1 {
+                    addr: 0x80DF,
+                    clear: 0xFF00,
+                    set: 0x1000,
+                },
+                SramWrite {
+                    addr: 0x80CB,
+                    value: 0x2007,
+                },
+                SramW0W1 {
+                    addr: 0x80CE,
+                    clear: 0xFF00,
+                    set: 0x6C00,
+                },
+                SramWrite {
+                    addr: 0x80C9,
+                    value: 0x8009,
+                },
+                SramW0W1 {
+                    addr: 0x80D1,
+                    clear: 0xFF00,
+                    set: 0x8000,
+                },
+                SramWrite {
+                    addr: 0x80A3,
+                    value: 0x200A,
+                },
+                SramWrite {
+                    addr: 0x80A5,
+                    value: 0xF0AD,
+                },
+                SramWrite {
+                    addr: 0x809F,
+                    value: 0x6073,
+                },
+                SramWrite {
+                    addr: 0x80A1,
+                    value: 0x000B,
+                },
+                SramW0W1 {
+                    addr: 0x80A9,
+                    clear: 0xFF00,
+                    set: 0xC000,
+                },
+                // Patch-gated register block (Linux returns from
+                // hw_phy_cfg when the request fails).
+                PhyPatchRequest { request: true },
+                OcpRegClrBits {
+                    addr: 0xB896,
+                    bits: 0x0001,
+                },
+                OcpRegClrBits {
+                    addr: 0xB892,
+                    bits: 0xFF00,
+                },
+                OcpRegWrite {
+                    addr: 0xB88E,
+                    value: 0xC23E,
+                },
+                OcpRegWrite {
+                    addr: 0xB890,
+                    value: 0x0000,
+                },
+                OcpRegWrite {
+                    addr: 0xB88E,
+                    value: 0xC240,
+                },
+                OcpRegWrite {
+                    addr: 0xB890,
+                    value: 0x0103,
+                },
+                OcpRegWrite {
+                    addr: 0xB88E,
+                    value: 0xC242,
+                },
+                OcpRegWrite {
+                    addr: 0xB890,
+                    value: 0x0507,
+                },
+                OcpRegWrite {
+                    addr: 0xB88E,
+                    value: 0xC244,
+                },
+                OcpRegWrite {
+                    addr: 0xB890,
+                    value: 0x090B,
+                },
+                OcpRegWrite {
+                    addr: 0xB88E,
+                    value: 0xC246,
+                },
+                OcpRegWrite {
+                    addr: 0xB890,
+                    value: 0x0C0E,
+                },
+                OcpRegWrite {
+                    addr: 0xB88E,
+                    value: 0xC248,
+                },
+                OcpRegWrite {
+                    addr: 0xB890,
+                    value: 0x1012,
+                },
+                OcpRegWrite {
+                    addr: 0xB88E,
+                    value: 0xC24A,
+                },
+                OcpRegWrite {
+                    addr: 0xB890,
+                    value: 0x1416,
+                },
+                OcpRegSetBits {
+                    addr: 0xB896,
+                    bits: 0x0001,
+                },
+                PhyPatchRequest { request: false },
+                OcpRegSetBits {
+                    addr: 0xA86A,
+                    bits: 0x0001,
+                },
+                OcpRegSetBits {
+                    addr: 0xA6F0,
+                    bits: 0x0001,
+                },
+                OcpRegWrite {
+                    addr: 0xBFA0,
+                    value: 0xD70D,
+                },
+                OcpRegWrite {
+                    addr: 0xBFA2,
+                    value: 0x4100,
+                },
+                OcpRegWrite {
+                    addr: 0xBFA4,
+                    value: 0xE868,
+                },
+                OcpRegWrite {
+                    addr: 0xBFA6,
+                    value: 0xDC59,
+                },
+                OcpRegWrite {
+                    addr: 0xB54C,
+                    value: 0x3C18,
+                },
+                OcpRegClrBits {
+                    addr: 0xBFA4,
+                    bits: 0x0020,
+                },
+                SramW0W1 {
+                    addr: 0x817D,
+                    clear: 0,
+                    set: 0x1000,
+                },
+            ]);
+        }
+        RtlVersion::Ver13 => {
+            // 2.5G INRX, then fall through to the VER_15 arm.
+            ops.extend([
+                OcpRegW0W1 {
+                    addr: 0xAC46,
+                    clear: 0x00F0,
+                    set: 0x0090,
+                },
+                OcpRegW0W1 {
+                    addr: 0xAD30,
+                    clear: 0x0003,
+                    set: 0x0001,
+                },
+            ]);
+            ops.extend(phy_init_ops_8156b_1315());
+        }
+        RtlVersion::Ver15 => {
+            ops.extend(phy_init_ops_8156b_1315());
+        }
+        _ => {}
+    }
+    ops.extend(phy_init_ops_8156b_tail());
+    ops
+}
+
+/// The VER_13/VER_15 shared arm of `r8156b_hw_phy_cfg` (Linux's
+/// `case RTL_VER_15` fall-through target).
+fn phy_init_ops_8156b_1315() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = vec![
+        // EEE parameter.
+        Sram2Write {
+            addr: 0x80F5,
+            value: 0x760E,
+        },
+        Sram2Write {
+            addr: 0x8107,
+            value: 0x360E,
+        },
+        Sram2W0W1 {
+            addr: 0x8551,
+            clear: 0xFF00,
+            set: 0x0800,
+        },
+        // ADC_PGA parameter.
+        OcpRegW0W1 {
+            addr: 0xBF00,
+            clear: 0xE000,
+            set: 0xA000,
+        },
+        OcpRegW0W1 {
+            addr: 0xBF46,
+            clear: 0x0F00,
+            set: 0x0300,
+        },
+    ];
+    // Green Table-PGA, 1G full viterbi.
+    for addr in [
+        0x8044u16, 0x804A, 0x8050, 0x8056, 0x805C, 0x8062, 0x8068, 0x806E, 0x8074, 0x807A,
+    ] {
+        ops.push(SramWrite {
+            addr,
+            value: 0x2417,
+        });
+    }
+    ops.push(OcpRegW0W1 {
+        addr: 0xBF84,
+        clear: 0xE000,
+        set: 0xA000,
+    });
+    ops
+}
+
+/// Shared tail of `r8157_hw_phy_cfg` (VER_16/17): patch-gated
+/// Advance EEE, green mode, lite-mode clears, EEE re-enable,
+/// ALDPS, flow control. Unlike the other families there is no
+/// U2P3 enable here (Linux uses the separate `r8157_u2p3en`
+/// path).
+fn phy_init_ops_8157_tail(adv: u16, adv2: u16) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = vec![
+        // Advance EEE, gated on the PHY patch request.
+        PhyPatchRequest { request: true },
+        PlaWordSetBits {
+            addr: PLA_MAC_PWR_CTRL4,
+            bits: MAC_PWR_CTRL4_EEE_SPDWN_EN,
+        },
+        OcpRegW0W1 {
+            addr: OCP_DOWN_SPEED,
+            clear: DOWN_SPEED_EN_EEE_100 | DOWN_SPEED_EN_EEE_1000,
+            set: DOWN_SPEED_EN_10M_CLKDIV,
+        },
+        OcpRegSetBits {
+            addr: OCP_POWER_CFG,
+            bits: POWER_CFG_EEE_CLKDIV_EN,
+        },
+        PhyPatchRequest { request: false },
+        SramW0W1 {
+            addr: SRAM_GREEN_CFG,
+            clear: 0,
+            set: GREEN_ETH_EN,
+        },
+        OcpRegClrBits {
+            addr: 0xA428,
+            bits: 0x0200,
+        },
+        OcpRegClrBits {
+            addr: 0xA5EA,
+            bits: 0x0003,
+        },
+    ];
+    // EEE re-enable (Linux: eee_en is true for VER_16/17).
+    ops.extend(eee_enable_ops_8156(adv, adv2));
+    ops.push(aldps_enable_op());
+    ops.push(enable_fc_op());
+    ops
+}
+
+/// The `r8157_hw_phy_cfg` sequence for the RTL8157 family
+/// (VER_16/17), in Linux's order.
+fn phy_init_ops_8157(version: RtlVersion) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = vec![WaitLoadingFlash];
+    ops.extend(phy_init_ops_8156b_prefix(true, false));
+    // r8157 clears the PFM/PWM switch (PFM mode) where the other
+    // families set it — handled by the `set_pfm_pwm` argument
+    // above. First version-specific act in Linux:
+    ops.extend([
+        // Advanced Power Saving parameter.
+        OcpRegSetBits {
+            addr: OCP_POWER_CFG,
+            bits: 0x0003,
+        },
+        // Disable ALDPS force mode.
+        OcpRegClrBits {
+            addr: 0xA44A,
+            bits: 0x0004,
+        },
+    ]);
+    match version {
+        RtlVersion::Ver16 => {
+            ops.extend(phy_init_ops_8157_ver16());
+        }
+        RtlVersion::Ver17 => {
+            ops.extend(phy_init_ops_8157_ver17());
+        }
+        _ => {}
+    }
+    // VER_16: eee_adv 0x0006, eee_adv2 2.5GT|5GT; VER_17:
+    // eee_adv 0x000E, eee_adv2 2.5GT|5GT.
+    let adv = match version {
+        RtlVersion::Ver17 => EEE_ADV_8157,
+        _ => EEE_ADV_8153,
+    };
+    ops.extend(phy_init_ops_8157_tail(adv, MDIO_EEE_2_5GT | MDIO_EEE_5GT));
+    ops
+}
+
+/// The VER_16 arm of `r8157_hw_phy_cfg`.
+fn phy_init_ops_8157_ver16() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let mut ops = vec![
+        // XG_INRX parameter.
+        SramW0W1 {
+            addr: 0x8183,
+            clear: 0xFF00,
+            set: 0x5900,
+        },
+        OcpRegSetBits {
+            addr: 0xA654,
+            bits: 0x0800,
+        },
+        OcpRegSetBits {
+            addr: 0xB648,
+            bits: 0x4000,
+        },
+        OcpRegClrBits {
+            addr: 0xAD2C,
+            bits: 0x8000,
+        },
+        OcpRegSetBits {
+            addr: 0xAD94,
+            bits: 0x0020,
+        },
+        OcpRegSetBits {
+            addr: 0xADA0,
+            bits: 0x0002,
+        },
+        OcpRegW0W1 {
+            addr: 0xAE06,
+            clear: 0xFC00,
+            set: 0x7C00,
+        },
+        Sram2W0W1 {
+            addr: 0x8647,
+            clear: 0xFF00,
+            set: 0xE600,
+        },
+        Sram2W0W1 {
+            addr: 0x8036,
+            clear: 0xFF00,
+            set: 0x3000,
+        },
+        Sram2W0W1 {
+            addr: 0x8078,
+            clear: 0xFF00,
+            set: 0x3000,
+        },
+        // Green mode.
+        Sram2W0W1 {
+            addr: 0x89E9,
+            clear: 0xFF00,
+            set: 0,
+        },
+        Sram2W0W1 {
+            addr: 0x8FFD,
+            clear: 0xFF00,
+            set: 0x0100,
+        },
+        Sram2W0W1 {
+            addr: 0x8FFE,
+            clear: 0xFF00,
+            set: 0x0200,
+        },
+        Sram2W0W1 {
+            addr: 0x8FFF,
+            clear: 0xFF00,
+            set: 0x0400,
+        },
+        // Recognize AQC/Bcom function.
+        SramW0W1 {
+            addr: 0x8018,
+            clear: 0xFF00,
+            set: 0x7700,
+        },
+        SramAddrWrite { addr: 0x8F9C },
+        SramDataWrite { value: 0x0005 },
+        SramDataWrite { value: 0x0000 },
+        SramDataWrite { value: 0x00ED },
+        SramDataWrite { value: 0x0502 },
+        SramDataWrite { value: 0x0B00 },
+        SramDataWrite { value: 0xD401 },
+        SramW0W1 {
+            addr: 0x8FA8,
+            clear: 0xFF00,
+            set: 0x2900,
+        },
+        // RFI_corr_thd 5g.
+        Sram2W0W1 {
+            addr: 0x814B,
+            clear: 0xFF00,
+            set: 0x1100,
+        },
+        Sram2W0W1 {
+            addr: 0x814D,
+            clear: 0xFF00,
+            set: 0x1100,
+        },
+        Sram2W0W1 {
+            addr: 0x814F,
+            clear: 0xFF00,
+            set: 0x0B00,
+        },
+        Sram2W0W1 {
+            addr: 0x8142,
+            clear: 0xFF00,
+            set: 0x0100,
+        },
+        Sram2W0W1 {
+            addr: 0x8144,
+            clear: 0xFF00,
+            set: 0x0100,
+        },
+        Sram2W0W1 {
+            addr: 0x8150,
+            clear: 0xFF00,
+            set: 0x0100,
+        },
+        // RFI_corr_thd 2p5g.
+        Sram2W0W1 {
+            addr: 0x8118,
+            clear: 0xFF00,
+            set: 0x0700,
+        },
+        Sram2W0W1 {
+            addr: 0x811A,
+            clear: 0xFF00,
+            set: 0x0700,
+        },
+        Sram2W0W1 {
+            addr: 0x811C,
+            clear: 0xFF00,
+            set: 0x0500,
+        },
+        Sram2W0W1 {
+            addr: 0x810F,
+            clear: 0xFF00,
+            set: 0x0100,
+        },
+        Sram2W0W1 {
+            addr: 0x8111,
+            clear: 0xFF00,
+            set: 0x0100,
+        },
+        Sram2W0W1 {
+            addr: 0x811D,
+            clear: 0xFF00,
+            set: 0x0100,
+        },
+        // RFI parameter.
+        OcpRegClrBits {
+            addr: 0xAD1C,
+            bits: 0x0100,
+        },
+        OcpRegW0W1 {
+            addr: 0xADE8,
+            clear: 0xFFC0,
+            set: 0x1400,
+        },
+        Sram2W0W1 {
+            addr: 0x864B,
+            clear: 0xFF00,
+            set: 0x9D00,
+        },
+        Sram2W0W1 {
+            addr: 0x862C,
+            clear: 0xFF00,
+            set: 0x1200,
+        },
+        SramAddrWrite { addr: 0x8566 },
+        SramDataWrite { value: 0x003F },
+        SramDataWrite { value: 0x3F02 },
+        SramDataWrite { value: 0x023C },
+        SramDataWrite { value: 0x3B0A },
+        SramDataWrite { value: 0x1C00 },
+        SramDataWrite { value: 0x0000 },
+        SramDataWrite { value: 0x0000 },
+        SramDataWrite { value: 0x0000 },
+        SramDataWrite { value: 0x0000 },
+        // RFI-color noise gen parameter 5g.
+        OcpRegSetBits {
+            addr: 0xAD9C,
+            bits: 0x0020,
+        },
+        Sram2W0W1 {
+            addr: 0x8122,
+            clear: 0xFF00,
+            set: 0x0C00,
+        },
+        Sram2AddrWrite { addr: 0x82C8 },
+    ];
+    for value in [
+        0x03EDu16, 0x03FF, 0x0009, 0x03FE, 0x000B, 0x0021, 0x03F7, 0x03B8, 0x03E0, 0x0049, 0x0049,
+        0x03E0, 0x03B8, 0x03F7, 0x0021, 0x000B, 0x03FE, 0x0009, 0x03FF, 0x03ED,
+    ] {
+        ops.push(Sram2DataWrite { value });
+    }
+    ops.extend([
+        // RFI-color noise gen parameter 2p5g.
+        Sram2W0W1 {
+            addr: 0x80EF,
+            clear: 0xFF00,
+            set: 0x0C00,
+        },
+        Sram2AddrWrite { addr: 0x82A0 },
+    ]);
+    for value in [
+        0x000Eu16, 0x03FE, 0x03ED, 0x0006, 0x001A, 0x03F1, 0x03D8, 0x0023, 0x0054, 0x0322, 0x00DD,
+        0x03AB, 0x03DC, 0x0027, 0x000E, 0x03E5, 0x03F9, 0x0012, 0x0001, 0x03F1,
+    ] {
+        ops.push(Sram2DataWrite { value });
+    }
+    ops.extend([
+        // Modify thermal speed down threshold.
+        OcpRegW0W1 {
+            addr: 0xB54C,
+            clear: 0xFFC0,
+            set: 0x3700,
+        },
+        // XG compatibility modification.
+        OcpRegSetBits {
+            addr: 0xB648,
+            bits: 0x0040,
+        },
+        Sram2W0W1 {
+            addr: 0x8082,
+            clear: 0xFF00,
+            set: 0x5D00,
+        },
+        Sram2W0W1 {
+            addr: 0x807C,
+            clear: 0xFF00,
+            set: 0x5000,
+        },
+        Sram2W0W1 {
+            addr: 0x809D,
+            clear: 0xFF00,
+            set: 0x5000,
+        },
+    ]);
+    ops
+}
+
+/// The VER_17 arm of `r8157_hw_phy_cfg`.
+fn phy_init_ops_8157_ver17() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    let ops = vec![
+        // Disable bypass turn off clk in ALDPS.
+        PlaByteClrBits {
+            addr: 0xD3C8,
+            bits: 0x01,
+        },
+        // Power level tuning: test mode power level.
+        SramW0W1 {
+            addr: 0x8415,
+            clear: 0xFF00,
+            set: 0x9300,
+        },
+        // Normal link power level 10G, 5G, 2.5G.
+        SramW0W1 {
+            addr: 0x81A3,
+            clear: 0xFF00,
+            set: 0x0F00,
+        },
+        SramW0W1 {
+            addr: 0x81AE,
+            clear: 0xFF00,
+            set: 0x0F00,
+        },
+        SramW0W1 {
+            addr: 0x81B9,
+            clear: 0xFF00,
+            set: 0xB900,
+        },
+        // Normal link TX filter.
+        Sram2W0W1 {
+            addr: 0x83B0,
+            clear: 0x0E00,
+            set: 0,
+        },
+        Sram2W0W1 {
+            addr: 0x83C5,
+            clear: 0x0E00,
+            set: 0,
+        },
+        Sram2W0W1 {
+            addr: 0x83DA,
+            clear: 0x0E00,
+            set: 0,
+        },
+        Sram2W0W1 {
+            addr: 0x83EF,
+            clear: 0x0E00,
+            set: 0,
+        },
+        // AFE power saving for 2.5G & 5G.
+        SramWrite {
+            addr: 0x8173,
+            value: 0x8620,
+        },
+        SramWrite {
+            addr: 0x8175,
+            value: 0x8671,
+        },
+        SramW0W1 {
+            addr: 0x817C,
+            clear: 0,
+            set: 0x2000,
+        },
+        SramW0W1 {
+            addr: 0x8187,
+            clear: 0,
+            set: 0x2000,
+        },
+        SramW0W1 {
+            addr: 0x8192,
+            clear: 0,
+            set: 0x2000,
+        },
+        SramW0W1 {
+            addr: 0x819D,
+            clear: 0,
+            set: 0x2000,
+        },
+        SramW0W1 {
+            addr: 0x81A8,
+            clear: 0x2000,
+            set: 0,
+        },
+        SramW0W1 {
+            addr: 0x81B3,
+            clear: 0x2000,
+            set: 0,
+        },
+        SramW0W1 {
+            addr: 0x81BE,
+            clear: 0,
+            set: 0x2000,
+        },
+        SramW0W1 {
+            addr: 0x817D,
+            clear: 0xFF00,
+            set: 0xA600,
+        },
+        SramW0W1 {
+            addr: 0x8188,
+            clear: 0xFF00,
+            set: 0xA600,
+        },
+        SramW0W1 {
+            addr: 0x8193,
+            clear: 0xFF00,
+            set: 0xA600,
+        },
+        SramW0W1 {
+            addr: 0x819E,
+            clear: 0xFF00,
+            set: 0xA600,
+        },
+        SramW0W1 {
+            addr: 0x81A9,
+            clear: 0xFF00,
+            set: 0x1400,
+        },
+        SramW0W1 {
+            addr: 0x81B4,
+            clear: 0xFF00,
+            set: 0x1400,
+        },
+        SramW0W1 {
+            addr: 0x81BF,
+            clear: 0xFF00,
+            set: 0xA600,
+        },
+        // RFI parameter: disable preset FBE.
+        OcpRegClrBits {
+            addr: 0xAEAA,
+            bits: 0x0028,
+        },
+        // Modify PGA for 5G&10G.
+        Sram2Write {
+            addr: 0x84F0,
+            value: 0x201C,
+        },
+        Sram2Write {
+            addr: 0x84F2,
+            value: 0x3117,
+        },
+        // RFI parameter.
+        OcpRegWrite {
+            addr: 0xAEC6,
+            value: 0x0000,
+        },
+        OcpRegWrite {
+            addr: 0xAE20,
+            value: 0xFFFF,
+        },
+        OcpRegWrite {
+            addr: 0xAECE,
+            value: 0xFFFF,
+        },
+        OcpRegWrite {
+            addr: 0xAED2,
+            value: 0xFFFF,
+        },
+        OcpRegWrite {
+            addr: 0xAEC8,
+            value: 0x0000,
+        },
+        OcpRegClrBits {
+            addr: 0xAED0,
+            bits: 0x0001,
+        },
+        OcpRegWrite {
+            addr: 0xADB8,
+            value: 0x0150,
+        },
+        Sram2W0W1 {
+            addr: 0x8197,
+            clear: 0xFF00,
+            set: 0x5000,
+        },
+        Sram2W0W1 {
+            addr: 0x8231,
+            clear: 0xFF00,
+            set: 0x5000,
+        },
+        Sram2W0W1 {
+            addr: 0x82CB,
+            clear: 0xFF00,
+            set: 0x5000,
+        },
+        Sram2W0W1 {
+            addr: 0x82CD,
+            clear: 0xFF00,
+            set: 0x5700,
+        },
+        Sram2W0W1 {
+            addr: 0x8233,
+            clear: 0xFF00,
+            set: 0x5700,
+        },
+        Sram2W0W1 {
+            addr: 0x8199,
+            clear: 0xFF00,
+            set: 0x5700,
+        },
+        Sram2Write {
+            addr: 0x815A,
+            value: 0x0150,
+        },
+        Sram2Write {
+            addr: 0x81F4,
+            value: 0x0150,
+        },
+        Sram2Write {
+            addr: 0x828E,
+            value: 0x0150,
+        },
+        Sram2Write {
+            addr: 0x81B1,
+            value: 0x0000,
+        },
+        Sram2Write {
+            addr: 0x824B,
+            value: 0x0000,
+        },
+        Sram2Write {
+            addr: 0x82E5,
+            value: 0x0000,
+        },
+        Sram2W0W1 {
+            addr: 0x84F7,
+            clear: 0xFF00,
+            set: 0x2800,
+        },
+        OcpRegSetBits {
+            addr: 0xAEC2,
+            bits: 0x1000,
+        },
+        Sram2W0W1 {
+            addr: 0x81B3,
+            clear: 0xFF00,
+            set: 0xAD00,
+        },
+        Sram2W0W1 {
+            addr: 0x824D,
+            clear: 0xFF00,
+            set: 0xAD00,
+        },
+        Sram2W0W1 {
+            addr: 0x82E7,
+            clear: 0xFF00,
+            set: 0xAD00,
+        },
+        OcpRegW0W1 {
+            addr: 0xAE4E,
+            clear: 0x000F,
+            set: 0x0001,
+        },
+        Sram2W0W1 {
+            addr: 0x82CE,
+            clear: 0xF000,
+            set: 0x4000,
+        },
+        // 5G shift sel, default = '04'; 10G shift sel, default = '03'.
+        Sram2W0W1 {
+            addr: 0x83A5,
+            clear: 0xFF00,
+            set: 0x0400,
+        },
+        Sram2W0W1 {
+            addr: 0x83A6,
+            clear: 0xFF00,
+            set: 0x0400,
+        },
+        Sram2W0W1 {
+            addr: 0x83A7,
+            clear: 0xFF00,
+            set: 0x0400,
+        },
+        Sram2W0W1 {
+            addr: 0x83A8,
+            clear: 0xFF00,
+            set: 0x0400,
+        },
+        // XG INRX parameters: RC coefficients.
+        Sram2Write {
+            addr: 0x84AC,
+            value: 0x0000,
+        },
+        Sram2Write {
+            addr: 0x84AE,
+            value: 0x0000,
+        },
+        Sram2Write {
+            addr: 0x84B0,
+            value: 0xF818,
+        },
+        Sram2W0W1 {
+            addr: 0x84B2,
+            clear: 0xFF00,
+            set: 0x6000,
+        },
+        // Training AAGC PAR (with uc2 patch).
+        Sram2Write {
+            addr: 0x8FFC,
+            value: 0x6008,
+        },
+        Sram2Write {
+            addr: 0x8FFE,
+            value: 0xF450,
+        },
+        // DAC BGK.
+        Sram2W0W1 {
+            addr: 0x8015,
+            clear: 0,
+            set: 0x0200,
+        },
+        Sram2W0W1 {
+            addr: 0x8016,
+            clear: 0,
+            set: 0x0800,
+        },
+        Sram2W0W1 {
+            addr: 0x8FE6,
+            clear: 0xFF00,
+            set: 0x0800,
+        },
+        Sram2Write {
+            addr: 0x8FE4,
+            value: 0x2114,
+        },
+        // 10G PBO table.
+        Sram2Write {
+            addr: 0x8647,
+            value: 0xA7B1,
+        },
+        Sram2Write {
+            addr: 0x8649,
+            value: 0xBBCA,
+        },
+        Sram2W0W1 {
+            addr: 0x864B,
+            clear: 0xFF00,
+            set: 0xDC00,
+        },
+        // 2.5G ado power window size.
+        Sram2W0W1 {
+            addr: 0x8154,
+            clear: 0xC000,
+            set: 0x4000,
+        },
+        Sram2W0W1 {
+            addr: 0x8158,
+            clear: 0xC000,
+            set: 0,
+        },
+        // 10G lock far.
+        Sram2Write {
+            addr: 0x826C,
+            value: 0xFFFF,
+        },
+        Sram2Write {
+            addr: 0x826E,
+            value: 0xFFFF,
+        },
+        // XG INRX parameter.
+        Sram2W0W1 {
+            addr: 0x8872,
+            clear: 0xFF00,
+            set: 0x0E00,
+        },
+        SramW0W1 {
+            addr: 0x8012,
+            clear: 0,
+            set: 0x0800,
+        },
+        SramW0W1 {
+            addr: 0x8012,
+            clear: 0,
+            set: 0x4000,
+        },
+        OcpRegSetBits {
+            addr: 0xB576,
+            bits: 0x0001,
+        },
+        SramW0W1 {
+            addr: 0x834A,
+            clear: 0xFF00,
+            set: 0x0700,
+        },
+        Sram2W0W1 {
+            addr: 0x8217,
+            clear: 0x3F00,
+            set: 0x2A00,
+        },
+        SramW0W1 {
+            addr: 0x81B1,
+            clear: 0xFF00,
+            set: 0x0B00,
+        },
+        Sram2W0W1 {
+            addr: 0x8FED,
+            clear: 0xFF00,
+            set: 0x4E00,
+        },
+        // Slave about EC mu of datamode AAGC and DAC BG.
+        Sram2W0W1 {
+            addr: 0x88AC,
+            clear: 0xFF00,
+            set: 0x2300,
+        },
+        // Improve UBE.
+        OcpRegSetBits {
+            addr: 0xBF0C,
+            bits: 0x3800,
+        },
+        // Close Sparse NEC, improve connect 5EUU cable performance.
+        Sram2W0W1 {
+            addr: 0x88DE,
+            clear: 0xFF00,
+            set: 0,
+        },
+        // 5G slave compatibility issue.
+        Sram2Write {
+            addr: 0x80B4,
+            value: 0x5195,
+        },
+        // XG Test Mode: xgtstm_map_tbl for mdi_cap_sel.
+        SramWrite {
+            addr: 0x8370,
+            value: 0x8671,
+        },
+        SramWrite {
+            addr: 0x8372,
+            value: 0x86C8,
+        },
+        // xgtstm_amp_map_tbl for REG_IBX_UP_SHIFT_L.
+        SramWrite {
+            addr: 0x8401,
+            value: 0x86C8,
+        },
+        SramWrite {
+            addr: 0x8403,
+            value: 0x86DA,
+        },
+        SramW0W1 {
+            addr: 0x8406,
+            clear: 0x1800,
+            set: 0x1000,
+        },
+        SramW0W1 {
+            addr: 0x8408,
+            clear: 0x1800,
+            set: 0x1000,
+        },
+        SramW0W1 {
+            addr: 0x840A,
+            clear: 0x1800,
+            set: 0x1000,
+        },
+        SramW0W1 {
+            addr: 0x840C,
+            clear: 0x1800,
+            set: 0x1000,
+        },
+        SramW0W1 {
+            addr: 0x840E,
+            clear: 0x1800,
+            set: 0x1000,
+        },
+        SramW0W1 {
+            addr: 0x8410,
+            clear: 0x1800,
+            set: 0x1000,
+        },
+        SramW0W1 {
+            addr: 0x8412,
+            clear: 0x1800,
+            set: 0x1000,
+        },
+        SramW0W1 {
+            addr: 0x8414,
+            clear: 0x1800,
+            set: 0x1000,
+        },
+        SramW0W1 {
+            addr: 0x8416,
+            clear: 0x1800,
+            set: 0x1000,
+        },
+        // Cable Test Patch.
+        SramWrite {
+            addr: 0x82BD,
+            value: 0x1F40,
+        },
+        // Thermal sensor parameters.
+        OcpRegW0W1 {
+            addr: 0xBFB4,
+            clear: 0x07FF,
+            set: 0x0328,
+        },
+        OcpRegWrite {
+            addr: 0xBFB6,
+            value: 0x3E14,
+        },
+        // spdchg_gtx_shape_100M.
+        SramAddrWrite { addr: 0x81C4 },
+        SramDataWrite { value: 0x003B },
+        SramDataWrite { value: 0x0086 },
+        SramDataWrite { value: 0x00B7 },
+        SramDataWrite { value: 0x00DB },
+        SramDataWrite { value: 0x00FE },
+        SramDataWrite { value: 0x00FE },
+        SramDataWrite { value: 0x00FE },
+        SramDataWrite { value: 0x00FE },
+        SramDataWrite { value: 0x00C3 },
+        SramDataWrite { value: 0x0078 },
+        SramDataWrite { value: 0x0047 },
+        SramDataWrite { value: 0x0023 },
+        // lsbmsk_parameters (RL6961_lsbmsk_parameter_250207).
+        Sram2Write {
+            addr: 0x88D7,
+            value: 0x01A0,
+        },
+        Sram2Write {
+            addr: 0x88D9,
+            value: 0x01A0,
+        },
+        Sram2Write {
+            addr: 0x8FFA,
+            value: 0x002A,
+        },
+        Sram2Write {
+            addr: 0x8FEE,
+            value: 0xFFDF,
+        },
+        Sram2Write {
+            addr: 0x8FF0,
+            value: 0xFFFF,
+        },
+        Sram2Write {
+            addr: 0x8FF2,
+            value: 0x0A4A,
+        },
+        Sram2Write {
+            addr: 0x8FF4,
+            value: 0xAA5A,
+        },
+        Sram2Write {
+            addr: 0x8FF6,
+            value: 0x0A4A,
+        },
+        Sram2Write {
+            addr: 0x8FF8,
+            value: 0xAA5A,
+        },
+        Sram2W0W1 {
+            addr: 0x88D5,
+            clear: 0xFF00,
+            set: 0x0200,
+        },
+    ];
+    ops
+}
+
+/// The version-switched PHY init sequence for `version`, in
+/// Linux's order (see the per-family builders above). Returns an
+/// empty sequence for TEST_01 and unknown versions — those keep
+/// reset defaults, never a bind failure.
+pub fn phy_init_ops(version: RtlVersion) -> Vec<PhyInitOp> {
+    match version {
+        RtlVersion::Ver01 | RtlVersion::Ver02 | RtlVersion::Ver07 => phy_init_ops_8152b(),
+        RtlVersion::Ver03 | RtlVersion::Ver04 | RtlVersion::Ver05 | RtlVersion::Ver06 => {
+            phy_init_ops_8153(version)
+        }
+        RtlVersion::Ver08 | RtlVersion::Ver09 | RtlVersion::Ver14 => phy_init_ops_8153b(),
+        RtlVersion::Ver10 | RtlVersion::Ver11 => phy_init_ops_8156(version),
+        RtlVersion::Ver12 | RtlVersion::Ver13 | RtlVersion::Ver15 => phy_init_ops_8156b(version),
+        RtlVersion::Ver16 | RtlVersion::Ver17 => phy_init_ops_8157(version),
+        _ => Vec::new(),
+    }
+}
+
+/// Backwards-compatible name for the original RTL8153-family
+/// builder: the VER_03–VER_06 sequence.
+pub fn r8153_phy_init_ops(version: RtlVersion) -> Vec<PhyInitOp> {
+    match version {
+        RtlVersion::Ver03 | RtlVersion::Ver04 | RtlVersion::Ver05 | RtlVersion::Ver06 => {
+            phy_init_ops_8153(version)
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Derive the OCP window access for a PHY register address:
@@ -817,19 +3282,239 @@ async fn pla_word_clr_bits(dev: &USBDevice, addr: u16, bits: u16) -> Result<(), 
     ocp_write_word(dev, MCU_TYPE_PLA, addr, cur & !bits).await
 }
 
+/// SRAM cell write: `OCP_SRAM_ADDR := addr`, then
+/// `OCP_SRAM_DATA := value` (Linux `sram_write`).
+async fn sram_write(dev: &USBDevice, addr: u16, value: u16) -> Result<(), ()> {
+    ocp_reg_write(dev, OCP_SRAM_ADDR, addr).await?;
+    ocp_reg_write(dev, OCP_SRAM_DATA, value).await
+}
+
+/// SRAM cell read: `OCP_SRAM_ADDR := addr`, then read
+/// `OCP_SRAM_DATA` (Linux `sram_read`).
+async fn sram_read(dev: &USBDevice, addr: u16) -> Result<u16, ()> {
+    ocp_reg_write(dev, OCP_SRAM_ADDR, addr).await?;
+    ocp_reg_read(dev, OCP_SRAM_DATA).await
+}
+
+/// Second SRAM bank cell read (Linux `sram2_read`).
+async fn sram2_read(dev: &USBDevice, addr: u16) -> Result<u16, ()> {
+    ocp_reg_write(dev, OCP_SRAM2_ADDR, addr).await?;
+    ocp_reg_read(dev, OCP_SRAM2_DATA).await
+}
+
+/// Second SRAM bank write: `OCP_SRAM2_ADDR := addr`, then
+/// `OCP_SRAM2_DATA := value` (Linux `sram2_write`).
+async fn sram2_write(dev: &USBDevice, addr: u16, value: u16) -> Result<(), ()> {
+    ocp_reg_write(dev, OCP_SRAM2_ADDR, addr).await?;
+    ocp_reg_write(dev, OCP_SRAM2_DATA, value).await
+}
+
+/// Poll `OCP_PHY_STATUS` for any of LAN_ON / PWRDN / EXT_INIT
+/// (Linux `r8153_phy_status(tp, 0)`), returning the status value
+/// seen — the last read when the poll never completes, like the
+/// reset poll in bind. Cooperative yields between reads, never a
+/// busy spin on a hardware register.
+async fn poll_phy_status_any(dev: &USBDevice) -> Result<u16, ()> {
+    let mut status = 0u16;
+    for _ in 0..500 {
+        status = ocp_reg_read(dev, OCP_PHY_STATUS).await? & PHY_STAT_MASK;
+        if status == PHY_STAT_LAN_ON || status == PHY_STAT_PWRDN || status == PHY_STAT_EXT_INIT {
+            break;
+        }
+        narf_scheduler::yield_now().await;
+    }
+    Ok(status)
+}
+
+/// PHY patch request/release (Linux `rtl_phy_patch_request(tp,
+/// request, wait)`): set (or clear) `PATCH_REQUEST` in
+/// `OCP_PHY_PATCH_CMD` and, when `wait` is set, wait for
+/// `PATCH_READY` to set (or clear), 1 ms between polls, up to
+/// 5000 iterations. Returns `Ok(true)` when the patch state
+/// reached the requested value (or when `wait` is false — Linux
+/// sets the bit and returns immediately), `Ok(false)` when a
+/// *request* timed out — Linux logs the failure, releases the
+/// request without waiting, and returns `-ETIME` (the caller
+/// then returns from `*_hw_phy_cfg`). The release path never
+/// returns `Ok(false)`. The table-level `PhyPatchRequest` steps
+/// always pass `wait = true`; the firmware-internal calls pass
+/// `!power_cut`, as in Linux.
+async fn phy_patch_request(dev: &USBDevice, request: bool, wait: bool) -> Result<bool, ()> {
+    let check = if request {
+        ocp_reg_set_bits(dev, OCP_PHY_PATCH_CMD, PATCH_REQUEST).await?;
+        0
+    } else {
+        ocp_reg_clr_bits(dev, OCP_PHY_PATCH_CMD, PATCH_REQUEST).await?;
+        PATCH_READY
+    };
+    if !wait {
+        return Ok(true);
+    }
+    for _ in 0..5000 {
+        narf_time::sleep_ms(1).await;
+        let stat = ocp_reg_read(dev, OCP_PHY_PATCH_STAT).await?;
+        if (stat & PATCH_READY) ^ check != 0 {
+            break;
+        }
+    }
+    if request {
+        let stat = ocp_reg_read(dev, OCP_PHY_PATCH_STAT).await?;
+        if stat & PATCH_READY == 0 {
+            // Release without waiting, as Linux does on failure.
+            ocp_reg_clr_bits(dev, OCP_PHY_PATCH_CMD, PATCH_REQUEST).await?;
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Efuse word read (Linux `r8152_efuse_read`): issue the read
+/// command, then assemble the 17-bit value from the command
+/// register's bit 16 and the data register.
+async fn efuse_read(dev: &USBDevice, addr: u8) -> Result<u32, ()> {
+    ocp_write_word(
+        dev,
+        MCU_TYPE_PLA,
+        PLA_EFUSE_CMD,
+        EFUSE_READ_CMD | addr as u16,
+    )
+    .await?;
+    let cmd = ocp_read_word(dev, MCU_TYPE_PLA, PLA_EFUSE_CMD).await?;
+    let data = ocp_read_word(dev, MCU_TYPE_PLA, PLA_EFUSE_DATA).await?;
+    Ok(((u32::from(cmd) & u32::from(EFUSE_DATA_BIT16)) << 9) | u32::from(data))
+}
+
+/// MDI pair swap when the board is reversed (Linux
+/// `r8156_hw_phy_cfg` VER_11): when `USB_UPS_CFG` reports
+/// `MID_REVERSE` and OCP `0xd068` bit 1 is set, swap the p0/p3
+/// and p1/p2 lanes through the `0xd068` selector / `0xd06a` data
+/// pair, then the `0xbd5a`/`0xbd5c` and `0xbc18`/`0xbc1a` pairs.
+async fn mdi_swap_if_reversed(dev: &USBDevice) -> Result<(), ()> {
+    let ups = ocp_read_word(dev, MCU_TYPE_USB, USB_UPS_CFG).await?;
+    let sel = ocp_reg_read(dev, 0xD068).await?;
+    if ups & UPS_CFG_MID_REVERSE == 0 || sel & 0x0002 == 0 {
+        return Ok(());
+    }
+    let mut data = ocp_reg_read(dev, 0xD068).await?;
+    data &= !0x001F;
+    data |= 0x0001; // p0
+    ocp_reg_write(dev, 0xD068, data).await?;
+    let swap_a = ocp_reg_read(dev, 0xD06A).await?;
+    data &= !0x0018;
+    data |= 0x0018; // p3
+    ocp_reg_write(dev, 0xD068, data).await?;
+    let swap_b = ocp_reg_read(dev, 0xD06A).await?;
+    data &= !0x0018; // p0
+    ocp_reg_write(dev, 0xD068, data).await?;
+    ocp_reg_write(dev, 0xD06A, (swap_a & !0x07FF) | (swap_b & 0x07FF)).await?;
+    data |= 0x0018; // p3
+    ocp_reg_write(dev, 0xD068, data).await?;
+    ocp_reg_write(dev, 0xD06A, (swap_b & !0x07FF) | (swap_a & 0x07FF)).await?;
+    data &= !0x0018;
+    data |= 0x0008; // p1
+    ocp_reg_write(dev, 0xD068, data).await?;
+    let swap_a = ocp_reg_read(dev, 0xD06A).await?;
+    data &= !0x0018;
+    data |= 0x0010; // p2
+    ocp_reg_write(dev, 0xD068, data).await?;
+    let swap_b = ocp_reg_read(dev, 0xD06A).await?;
+    data &= !0x0018;
+    data |= 0x0008; // p1
+    ocp_reg_write(dev, 0xD068, data).await?;
+    ocp_reg_write(dev, 0xD06A, (swap_a & !0x07FF) | (swap_b & 0x07FF)).await?;
+    data &= !0x0018;
+    data |= 0x0010; // p2
+    ocp_reg_write(dev, 0xD068, data).await?;
+    ocp_reg_write(dev, 0xD06A, (swap_b & !0x07FF) | (swap_a & 0x07FF)).await?;
+    let swap_a = ocp_reg_read(dev, 0xBD5A).await?;
+    let swap_b = ocp_reg_read(dev, 0xBD5C).await?;
+    ocp_reg_write(
+        dev,
+        0xBD5A,
+        (swap_a & !0x1F1F) | ((swap_b & 0x001F) << 8) | ((swap_b >> 8) & 0x001F),
+    )
+    .await?;
+    ocp_reg_write(
+        dev,
+        0xBD5C,
+        (swap_b & !0x1F1F) | ((swap_a & 0x001F) << 8) | ((swap_a >> 8) & 0x001F),
+    )
+    .await?;
+    let swap_a = ocp_reg_read(dev, 0xBC18).await?;
+    let swap_b = ocp_reg_read(dev, 0xBC1A).await?;
+    ocp_reg_write(
+        dev,
+        0xBC18,
+        (swap_a & !0x1F1F) | ((swap_b & 0x001F) << 8) | ((swap_b >> 8) & 0x001F),
+    )
+    .await?;
+    ocp_reg_write(
+        dev,
+        0xBC1A,
+        (swap_b & !0x1F1F) | ((swap_a & 0x001F) << 8) | ((swap_a >> 8) & 0x001F),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Execution context threaded through one `phy_init_ops` run:
+/// the chip version, the firmware blob (if the registry has one
+/// for it), and whether a failed PHY patch request aborted the
+/// run — Linux returns from `*_hw_phy_cfg` on it, so later steps
+/// become no-ops, including the patch release.
+pub struct PhyInitCtx<'a> {
+    version: RtlVersion,
+    fw: Option<&'a [u8]>,
+    patch_aborted: bool,
+}
+
+impl<'a> PhyInitCtx<'a> {
+    fn new(version: RtlVersion, fw: Option<&'a [u8]>) -> Self {
+        Self {
+            version,
+            fw,
+            patch_aborted: false,
+        }
+    }
+}
+
 /// Execute one [`PhyInitOp`] against the device.
-async fn apply_phy_init_op(dev: &USBDevice, op: PhyInitOp) -> Result<(), ()> {
+async fn apply_phy_init_op(
+    dev: &USBDevice,
+    ctx: &mut PhyInitCtx<'_>,
+    op: PhyInitOp,
+) -> Result<(), ()> {
     use PhyInitOp::*;
+    // A failed patch request aborts the rest of the sequence
+    // (Linux returns from `*_hw_phy_cfg` on it).
+    if ctx.patch_aborted {
+        return Ok(());
+    }
     match op {
         OcpRegSetBits { addr, bits } => ocp_reg_set_bits(dev, addr, bits).await,
         OcpRegClrBits { addr, bits } => ocp_reg_clr_bits(dev, addr, bits).await,
         OcpRegWrite { addr, value } => ocp_reg_write(dev, addr, value).await,
-        SramWrite { addr, value } => {
-            ocp_reg_write(dev, OCP_SRAM_ADDR, addr).await?;
-            ocp_reg_write(dev, OCP_SRAM_DATA, value).await
+        OcpRegW0W1 { addr, clear, set } => {
+            let cur = ocp_reg_read(dev, addr).await?;
+            ocp_reg_write(dev, addr, (cur & !clear) | set).await
         }
+        SramWrite { addr, value } => sram_write(dev, addr, value).await,
+        SramW0W1 { addr, clear, set } => {
+            let cur = sram_read(dev, addr).await?;
+            ocp_reg_write(dev, OCP_SRAM_DATA, (cur & !clear) | set).await
+        }
+        Sram2W0W1 { addr, clear, set } => {
+            let cur = sram2_read(dev, addr).await?;
+            ocp_reg_write(dev, OCP_SRAM2_DATA, (cur & !clear) | set).await
+        }
+        Sram2Write { addr, value } => sram2_write(dev, addr, value).await,
+        SramAddrWrite { addr } => ocp_reg_write(dev, OCP_SRAM_ADDR, addr).await,
+        SramDataWrite { value } => ocp_reg_write(dev, OCP_SRAM_DATA, value).await,
+        Sram2AddrWrite { addr } => ocp_reg_write(dev, OCP_SRAM2_ADDR, addr).await,
+        Sram2DataWrite { value } => ocp_reg_write(dev, OCP_SRAM2_DATA, value).await,
         PlaWordSetBits { addr, bits } => pla_word_set_bits(dev, addr, bits).await,
         PlaWordClrBits { addr, bits } => pla_word_clr_bits(dev, addr, bits).await,
+        PlaWordWrite { addr, value } => ocp_write_word(dev, MCU_TYPE_PLA, addr, value).await,
         UsbWordSetBits { addr, bits } => {
             let cur = ocp_read_word(dev, MCU_TYPE_USB, addr).await?;
             ocp_write_word(dev, MCU_TYPE_USB, addr, cur | bits).await
@@ -843,6 +3528,37 @@ async fn apply_phy_init_op(dev: &USBDevice, op: PhyInitOp) -> Result<(), ()> {
             ocp_write_word(dev, MCU_TYPE_USB, addr, cur & !bits).await
         }
         UsbWordWrite { addr, value } => ocp_write_word(dev, MCU_TYPE_USB, addr, value).await,
+        UsbWordTestAndClrBits { addr, bits } => {
+            let cur = ocp_read_word(dev, MCU_TYPE_USB, addr).await?;
+            if cur & bits != 0 {
+                ocp_write_word(dev, MCU_TYPE_USB, addr, cur & !bits).await
+            } else {
+                Ok(())
+            }
+        }
+        MdioTestAndClrBits { reg, bits } => {
+            let addr = OCP_BASE_MII + reg * 2;
+            let cur = ocp_reg_read(dev, addr).await?;
+            if cur & bits != 0 {
+                ocp_reg_write(dev, addr, cur & !bits).await
+            } else {
+                Ok(())
+            }
+        }
+        MmdWrite {
+            dev: mmd_dev,
+            reg,
+            value,
+        } => {
+            // Linux `r8152_mmd_write`: select the device/register
+            // through `OCP_EEE_AR` / `OCP_EEE_DATA`, write the
+            // value, deselect.
+            ocp_reg_write(dev, OCP_EEE_AR, MMD_FUN_ADDR | mmd_dev).await?;
+            ocp_reg_write(dev, OCP_EEE_DATA, reg).await?;
+            ocp_reg_write(dev, OCP_EEE_AR, MMD_FUN_DATA | mmd_dev).await?;
+            ocp_reg_write(dev, OCP_EEE_DATA, value).await?;
+            ocp_reg_write(dev, OCP_EEE_AR, 0).await
+        }
         UsbByteSetBits { addr, bits } => {
             let cur = ocp_read_byte(dev, MCU_TYPE_USB, addr).await?;
             ocp_write_byte(dev, MCU_TYPE_USB, addr, cur | bits).await
@@ -877,16 +3593,7 @@ async fn apply_phy_init_op(dev: &USBDevice, op: PhyInitOp) -> Result<(), ()> {
             Ok(())
         }
         PhyStatusPollAny => {
-            for _ in 0..500 {
-                let status = ocp_reg_read(dev, OCP_PHY_STATUS).await? & PHY_STAT_MASK;
-                if status == PHY_STAT_LAN_ON
-                    || status == PHY_STAT_PWRDN
-                    || status == PHY_STAT_EXT_INIT
-                {
-                    break;
-                }
-                narf_scheduler::yield_now().await;
-            }
+            poll_phy_status_any(dev).await?;
             Ok(())
         }
         PhyStatusPollLanOn => {
@@ -910,16 +3617,1295 @@ async fn apply_phy_init_op(dev: &USBDevice, op: PhyInitOp) -> Result<(), ()> {
             }
             Ok(())
         }
+        ApplyFirmware { mode } => {
+            // Resolve `power_cut` from the PHY status, exactly
+            // where Linux's `r8153_phy_status(tp, 0)` call sits
+            // in each `*_hw_phy_cfg`.
+            let (power_cut, clear_a466) = match mode {
+                FirmwarePowerCut::Never => (false, false),
+                FirmwarePowerCut::OnPwrdnOrExtInit => {
+                    let status = poll_phy_status_any(dev).await?;
+                    (
+                        status == PHY_STAT_PWRDN || status == PHY_STAT_EXT_INIT,
+                        false,
+                    )
+                }
+                FirmwarePowerCut::OnExtInit { clear_a466 } => {
+                    let status = poll_phy_status_any(dev).await?;
+                    (status == PHY_STAT_EXT_INIT, clear_a466)
+                }
+            };
+            if let Some(fw) = ctx.fw {
+                match apply_firmware(dev, ctx.version, fw, power_cut).await {
+                    Ok(()) => {}
+                    // A failed validation is skipped, never a bind
+                    // failure (Linux warn-and-continue; this crate
+                    // has no logging sink, so the skip is silent
+                    // here — the validation itself is covered by
+                    // the pure `check_firmware` tests).
+                    Err(FwError::Transfer) => return Err(()),
+                    Err(_) => {}
+                }
+            }
+            if power_cut {
+                match mode {
+                    FirmwarePowerCut::OnPwrdnOrExtInit => {
+                        let addr = OCP_BASE_MII + MII_BMCR * 2;
+                        ocp_reg_clr_bits(dev, addr, BMCR_PDOWN).await?;
+                    }
+                    FirmwarePowerCut::OnExtInit { .. } => {
+                        if clear_a466 {
+                            ocp_reg_clr_bits(dev, 0xA466, 0x0001).await?;
+                        }
+                        ocp_reg_clr_bits(dev, 0xA468, 0x0008 | 0x0002).await?;
+                    }
+                    FirmwarePowerCut::Never => {}
+                }
+            }
+            Ok(())
+        }
+        PhyPatchRequest { request } => {
+            if !phy_patch_request(dev, request, true).await? {
+                // Request timed out: abort the rest of the
+                // sequence (Linux returns from `*_hw_phy_cfg`).
+                ctx.patch_aborted = true;
+            }
+            Ok(())
+        }
+        WaitLoadingFlash => {
+            // Linux `r8156b_wait_loading_flash`: when the PHY
+            // boots from flash and the bypass is off, poll for
+            // `GPHY_PATCH_DONE` (best-effort, 100 × 1 ms).
+            let gphy = ocp_read_word(dev, MCU_TYPE_PLA, PLA_GPHY_CTRL).await?;
+            let usb_gphy = ocp_read_word(dev, MCU_TYPE_USB, USB_GPHY_CTRL).await?;
+            if gphy & GPHY_CTRL_FLASH != 0 && usb_gphy & GPHY_CTRL_BYPASS_FLASH == 0 {
+                for _ in 0..100 {
+                    let cur = ocp_read_word(dev, MCU_TYPE_USB, USB_GPHY_CTRL).await?;
+                    if cur & GPHY_CTRL_PATCH_DONE != 0 {
+                        break;
+                    }
+                    narf_time::sleep_ms(1).await;
+                }
+            }
+            Ok(())
+        }
+        AdcBiasFromEfuse => {
+            // Linux `r8153b_hw_phy_cfg`: read efuse offset 0x7d
+            // to get a 17-bit value, drop the dummy bit (bit 3)
+            // to rebuild the real 16-bit value, write it to the
+            // ADC ioffset unless it is 0xffff.
+            let ocp_data = efuse_read(dev, 0x7D).await?;
+            let data = (((ocp_data & 0x1FFF0) >> 1) | (ocp_data & 0x7)) as u16;
+            if data != 0xFFFF {
+                ocp_reg_write(dev, OCP_ADC_IOFFSET, data).await?;
+            }
+            Ok(())
+        }
+        UpsTimingFromSawCnt => {
+            // Linux `r8153b_hw_phy_cfg`: rg_saw_cnt = OCP reg
+            // 0xC426 bits [13:0]; swr_cnt_1ms_ini = 16000000 /
+            // rg_saw_cnt, programmed into `USB_UPS_CFG` — skipped
+            // when the count reads zero.
+            let saw = ocp_reg_read(dev, 0xC426).await? & 0x3FFF;
+            if saw != 0 {
+                let swr = ((16_000_000u32 / u32::from(saw)) as u16) & UPS_CFG_SAW_CNT_1MS_MASK;
+                let cur = ocp_read_word(dev, MCU_TYPE_USB, USB_UPS_CFG).await?;
+                ocp_write_word(
+                    dev,
+                    MCU_TYPE_USB,
+                    USB_UPS_CFG,
+                    (cur & !UPS_CFG_SAW_CNT_1MS_MASK) | swr,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        MdiSwapIfReversed => mdi_swap_if_reversed(dev).await,
     }
 }
 
 /// Run the version-switched PHY init sequence for `version`
-/// before CR RE/TE enable. Unknown and not-yet-ported versions
-/// are a no-op (reset defaults), never a bind failure.
-pub async fn apply_phy_init(dev: &USBDevice, version: RtlVersion) -> Result<(), ()> {
-    for op in r8153_phy_init_ops(version) {
-        apply_phy_init_op(dev, op).await?;
+/// before CR RE/TE enable, applying the firmware blob `fw` at
+/// Linux's position in the sequence (`None` when the registry
+/// has no blob for the version — Linux's failed
+/// `request_firmware`: warn and continue). Unknown and
+/// not-yet-ported versions are a no-op (reset defaults), never a
+/// bind failure.
+pub async fn apply_phy_init(
+    dev: &USBDevice,
+    version: RtlVersion,
+    fw: Option<&[u8]>,
+) -> Result<(), ()> {
+    let mut ctx = PhyInitCtx::new(version, fw);
+    for op in phy_init_ops(version) {
+        apply_phy_init_op(dev, &mut ctx, op).await?;
     }
+    Ok(())
+}
+
+// ── Firmware loading (issue #1255) ───────────────────────────────
+//
+// Linux `drivers/net/usb/r8152.c` loads one firmware file per
+// chip version (`rtl_fw_init`): the file is a 64-byte header (a
+// 32-byte SHA-256 checksum over the version field to the end of
+// the file, then a 32-byte version string) followed by blocks;
+// each block is an 8-byte header (`type`, `length`) plus a
+// type-specific body. `check_firmware` validates the whole file
+// before `rtl8152_apply_firmware` walks it. The blobs
+// themselves are NOT shipped in-tree: bind fetches the file for
+// the version from the `narf_firmware` registry (see
+// `firmware_name_for`) and the loader below consumes its bytes.
+// No blob byte is embedded here or in any fixture — test images
+// are built in-test from these layouts with checksums computed
+// by the same SHA-256 implementation, and the real files were
+// validated structurally off-line (see the PR body).
+//
+// Two deliberate deviations from Linux, both fail-closed:
+//  - Linux's block walk would loop forever on a zero-length
+//    block and reads block fields without bounds checks.
+//    `check_firmware` rejects a zero-length block and every
+//    field read below is bounds-checked against the block.
+//  - Linux's apply helpers are `void` and swallow transfer
+//    errors. NARF propagates them (`FwError::Transfer`) like
+//    the table ops, so a dead device fails bind instead of
+//    limping on with half-applied firmware — except the two
+//    `generic_ocp_write` calls in `fw_mac_apply`, where Linux
+//    explicitly returns from the block on failure and the loop
+//    continues with the next block.
+
+/// Firmware block types (Linux `rtl_fw_type`).
+pub const RTL_FW_END: u32 = 0;
+pub const RTL_FW_PLA: u32 = 1;
+pub const RTL_FW_USB: u32 = 2;
+pub const RTL_FW_PHY_START: u32 = 3;
+pub const RTL_FW_PHY_STOP: u32 = 4;
+pub const RTL_FW_PHY_NC: u32 = 5;
+pub const RTL_FW_PHY_FIXUP: u32 = 6;
+pub const RTL_FW_PHY_UNION_NC: u32 = 7;
+pub const RTL_FW_PHY_UNION_NC1: u32 = 8;
+pub const RTL_FW_PHY_UNION_NC2: u32 = 9;
+pub const RTL_FW_PHY_UNION_UC2: u32 = 10;
+pub const RTL_FW_PHY_UNION_UC: u32 = 11;
+pub const RTL_FW_PHY_UNION_MISC: u32 = 12;
+pub const RTL_FW_PHY_SPEED_UP: u32 = 13;
+pub const RTL_FW_PHY_VER: u32 = 14;
+
+/// Firmware file header size: 32-byte checksum + 32-byte
+/// version string (Linux `struct fw_header`, `RTL_VER_SIZE` 32).
+pub const FW_HEADER_LEN: usize = 64;
+/// Firmware block header size: `type` + `length`
+/// (Linux `struct fw_block`).
+pub const FW_BLOCK_HDR_LEN: usize = 8;
+/// `struct fw_mac` size (Linux, `__packed`).
+pub const FW_MAC_LEN: usize = 63;
+/// `struct fw_phy_nc` size (Linux, `__packed`).
+pub const FW_PHY_NC_LEN: usize = 40;
+/// `struct fw_phy_union` size (Linux, `__packed`).
+pub const FW_PHY_UNION_LEN: usize = 58;
+/// `struct fw_phy_fixup` / `struct fw_phy_ver` /
+/// `struct fw_phy_patch_key` / `struct fw_phy_speed_up` size
+/// (Linux, `__packed` — all four are 16 bytes).
+pub const FW_PHY_SMALL_LEN: usize = 16;
+
+/// Firmware file name for `version` (Linux `rtl_fw_init`),
+/// or `None` when Linux loads no file for the version
+/// (VER_01/02/03/07/08/10/12 — `apply_firmware` is a no-op
+/// there). The names are the `MODULE_FIRMWARE` paths under
+/// `rtl_nic/`; the registry holds the blob under the same name.
+pub fn firmware_name_for(version: RtlVersion) -> Option<&'static str> {
+    match version {
+        RtlVersion::Ver04 => Some("rtl_nic/rtl8153a-2.fw"),
+        RtlVersion::Ver05 => Some("rtl_nic/rtl8153a-3.fw"),
+        RtlVersion::Ver06 => Some("rtl_nic/rtl8153a-4.fw"),
+        RtlVersion::Ver09 => Some("rtl_nic/rtl8153b-2.fw"),
+        RtlVersion::Ver11 => Some("rtl_nic/rtl8156a-2.fw"),
+        RtlVersion::Ver13 | RtlVersion::Ver15 => Some("rtl_nic/rtl8156b-2.fw"),
+        RtlVersion::Ver14 => Some("rtl_nic/rtl8153c-1.fw"),
+        RtlVersion::Ver16 => Some("rtl_nic/rtl8157-1.fw"),
+        RtlVersion::Ver17 => Some("rtl_nic/rtl8159-1.fw"),
+        _ => None,
+    }
+}
+
+/// Version string from a firmware image's header (the 32-byte
+/// version field, up to the first NUL), or `""` when the image
+/// is too small or the field is not valid UTF-8. Logging only —
+/// never used to select behaviour.
+pub fn firmware_version(fw: &[u8]) -> &str {
+    if fw.len() < FW_HEADER_LEN {
+        return "";
+    }
+    let raw = &fw[32..FW_HEADER_LEN];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    core::str::from_utf8(&raw[..end]).unwrap_or("")
+}
+
+/// Why a firmware image failed validation (or application).
+/// `Transfer` is the only variant that fails bind — a dead
+/// device mid-apply; every validation variant is skipped by
+/// the executor, never a bind failure (Linux warn-and-continue).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FwError {
+    /// Image smaller than the 64-byte header.
+    TooSmall,
+    /// SHA-256 over `fw[32..]` does not match `fw[0..32]`.
+    BadChecksum,
+    /// A block header runs past the end of the image, or a
+    /// block's length runs past it.
+    Truncated,
+    /// A zero-length block (Linux would loop forever here).
+    ZeroLength,
+    /// A block length that violates its type's rule (END not 8,
+    /// PHY_START not 16, PHY_STOP not 8, FIXUP/VER not 16).
+    BadLength,
+    /// A block type seen twice where Linux allows it once
+    /// (PLA, USB, PHY_NC/UNION_*, SPEED_UP, VER).
+    Duplicate,
+    /// A block in an order Linux forbids (START after any PHY
+    /// block, STOP without START, a UNION/NC/VER after STOP or
+    /// before START, …).
+    OutOfOrder,
+    /// START seen without a matching STOP by the end of the file.
+    UnpairedStart,
+    /// A block whose fields violate its type's per-version rule
+    /// (`is_fw_mac_ok` / `is_fw_phy_nc_ok` /
+    /// `is_fw_phy_union_ok` / `is_fw_phy_fixup_ok` /
+    /// `is_fw_phy_speed_up_ok` / `is_fw_phy_ver_ok`).
+    InvalidBlock,
+    /// A USB transfer failed while applying the image.
+    Transfer,
+}
+
+/// Little-endian readers over a block slice; `None` on a short
+/// read (fail-closed — the caller treats it as invalid).
+fn fw_le_u16(block: &[u8], off: usize) -> Option<u16> {
+    block
+        .get(off..off + 2)
+        .map(|s| u16::from_le_bytes([s[0], s[1]]))
+}
+
+fn fw_le_u32(block: &[u8], off: usize) -> Option<u32> {
+    block
+        .get(off..off + 4)
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+/// SHA-256 of `fw[32..]` against `fw[0..32]` (Linux
+/// `rtl8152_fw_verify_checksum`).
+pub fn fw_checksum_ok(fw: &[u8]) -> bool {
+    if fw.len() < FW_HEADER_LEN {
+        return false;
+    }
+    let mut h = narf_crypto::sha256::Sha256::new();
+    h.update(&fw[32..]);
+    h.finalize() == fw[..32]
+}
+
+/// Per-version `fw_mac` expectations (Linux
+/// `rtl8152_is_fw_mac_ok`): `(fw_reg, bp_ba_addr, bp_en_addr,
+/// bp_start, max_bp)`. `None` when the block type is invalid
+/// for the version — PLA is invalid for VER_10/16/17, USB is
+/// invalid for VER_01/02/07/10/16/17. Note VER_01/02/07 PLA
+/// has `bp_en_addr = 0` (no enable register).
+fn fw_mac_expect(version: RtlVersion, is_pla: bool) -> Option<(u16, u16, u16, u16, u16)> {
+    if is_pla {
+        match version {
+            RtlVersion::Ver01 | RtlVersion::Ver02 | RtlVersion::Ver07 => {
+                Some((0xF800, PLA_BP_BA, 0, PLA_BP_0, 8))
+            }
+            RtlVersion::Ver03
+            | RtlVersion::Ver04
+            | RtlVersion::Ver05
+            | RtlVersion::Ver06
+            | RtlVersion::Ver08
+            | RtlVersion::Ver09
+            | RtlVersion::Ver11
+            | RtlVersion::Ver12
+            | RtlVersion::Ver13
+            | RtlVersion::Ver15 => Some((0xF800, PLA_BP_BA, PLA_BP_EN, PLA_BP_0, 8)),
+            RtlVersion::Ver14 => Some((0xF800, PLA_BP_BA, USB_BP2_EN, PLA_BP_0, 16)),
+            _ => None,
+        }
+    } else {
+        match version {
+            RtlVersion::Ver03 | RtlVersion::Ver04 | RtlVersion::Ver05 | RtlVersion::Ver06 => {
+                Some((0xF800, PLA_BP_BA, PLA_BP_EN, PLA_BP_0, 8))
+            }
+            RtlVersion::Ver08
+            | RtlVersion::Ver09
+            | RtlVersion::Ver11
+            | RtlVersion::Ver12
+            | RtlVersion::Ver13
+            | RtlVersion::Ver14
+            | RtlVersion::Ver15 => Some((0xE600, PLA_BP_BA, USB_BP2_EN, PLA_BP_0, 16)),
+            _ => None,
+        }
+    }
+}
+
+/// Linux `rtl8152_is_fw_mac_ok` over a block slice.
+fn is_fw_mac_ok(version: RtlVersion, is_pla: bool, block: &[u8]) -> bool {
+    let Some((fw_reg, bp_ba, bp_en, bp_start, max_bp)) = fw_mac_expect(version, is_pla) else {
+        return false;
+    };
+    let Some(fw_offset) = fw_le_u16(block, 8) else {
+        return false;
+    };
+    if (fw_offset as usize) < FW_MAC_LEN {
+        return false;
+    }
+    let Some(length) = fw_le_u32(block, 4) else {
+        return false;
+    };
+    if (length as usize) < fw_offset as usize {
+        return false;
+    }
+    let data_len = length as usize - fw_offset as usize;
+    if data_len < 4 || data_len & 3 != 0 {
+        return false;
+    }
+    if fw_le_u16(block, 10) != Some(fw_reg)
+        || fw_le_u16(block, 12) != Some(bp_ba)
+        || fw_le_u16(block, 16) != Some(bp_en)
+        || fw_le_u16(block, 20) != Some(bp_start)
+    {
+        return false;
+    }
+    let Some(bp_num) = fw_le_u16(block, 22) else {
+        return false;
+    };
+    if bp_num > max_bp {
+        return false;
+    }
+    for i in bp_num..max_bp {
+        if fw_le_u16(block, 24 + 2 * i as usize) != Some(0) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Linux `rtl8152_is_fw_phy_nc_ok` over a block slice (VER_04–
+/// VER_06 only: `fw_reg` 0xa014, `ba_reg` 0xa012, `patch_en`
+/// 0xa01a, `mode_reg` 0xb820, `bp_start` 0xa000, `bp_num` ≤ 4).
+fn is_fw_phy_nc_ok(version: RtlVersion, block: &[u8]) -> bool {
+    if !matches!(
+        version,
+        RtlVersion::Ver04 | RtlVersion::Ver05 | RtlVersion::Ver06
+    ) {
+        return false;
+    }
+    let Some(fw_offset) = fw_le_u16(block, 8) else {
+        return false;
+    };
+    if (fw_offset as usize) < FW_PHY_NC_LEN {
+        return false;
+    }
+    let Some(length) = fw_le_u32(block, 4) else {
+        return false;
+    };
+    if (length as usize) < fw_offset as usize {
+        return false;
+    }
+    let data_len = length as usize - fw_offset as usize;
+    if data_len == 0 || data_len & 1 != 0 {
+        return false;
+    }
+    if fw_le_u16(block, 10) != Some(0xA014)
+        || fw_le_u16(block, 12) != Some(0xA012)
+        || fw_le_u16(block, 16) != Some(0xA01A)
+        || fw_le_u16(block, 20) != Some(0xB820)
+        || fw_le_u16(block, 28) != Some(0xA000)
+    {
+        return false;
+    }
+    match fw_le_u16(block, 30) {
+        Some(bp_num) => bp_num <= 4,
+        None => false,
+    }
+}
+
+/// Linux `rtl8152_is_fw_phy_union_ok` over a block slice
+/// (VER_10/11/12/13/15 only: `fw_offset` ≥ 58, data length
+/// even, `pre_num` ≤ 2, `bp_num` ≤ 8).
+fn is_fw_phy_union_ok(version: RtlVersion, block: &[u8]) -> bool {
+    if !matches!(
+        version,
+        RtlVersion::Ver10
+            | RtlVersion::Ver11
+            | RtlVersion::Ver12
+            | RtlVersion::Ver13
+            | RtlVersion::Ver15
+    ) {
+        return false;
+    }
+    let Some(fw_offset) = fw_le_u16(block, 8) else {
+        return false;
+    };
+    if (fw_offset as usize) < FW_PHY_UNION_LEN {
+        return false;
+    }
+    let Some(length) = fw_le_u32(block, 4) else {
+        return false;
+    };
+    if (length as usize) <= fw_offset as usize {
+        return false;
+    }
+    if (length as usize - fw_offset as usize) & 1 != 0 {
+        return false;
+    }
+    match (block.get(56), block.get(57)) {
+        (Some(&pre_num), Some(&bp_num)) => pre_num <= 2 && bp_num <= 8,
+        _ => false,
+    }
+}
+
+/// Linux `rtl8152_is_fw_phy_fixup_ok` over a block slice
+/// (VER_10/11/12/13/15 only: length 16, `setting.addr` is
+/// `OCP_PHY_PATCH_CMD`, `setting.data` is bit 7).
+fn is_fw_phy_fixup_ok(version: RtlVersion, block: &[u8]) -> bool {
+    if !matches!(
+        version,
+        RtlVersion::Ver10
+            | RtlVersion::Ver11
+            | RtlVersion::Ver12
+            | RtlVersion::Ver13
+            | RtlVersion::Ver15
+    ) {
+        return false;
+    }
+    if fw_le_u32(block, 4) != Some(FW_PHY_SMALL_LEN as u32) {
+        return false;
+    }
+    fw_le_u16(block, 8) == Some(OCP_PHY_PATCH_CMD) && fw_le_u16(block, 10) == Some(0x0080)
+}
+
+/// Linux `rtl8152_is_fw_phy_speed_up_ok` over a block slice
+/// (VER_13/15/16/17 only: `fw_offset` ≥ 16, data length a
+/// multiple of 4, `fw_reg` 0x9A00).
+fn is_fw_phy_speed_up_ok(version: RtlVersion, block: &[u8]) -> bool {
+    if !matches!(
+        version,
+        RtlVersion::Ver13 | RtlVersion::Ver15 | RtlVersion::Ver16 | RtlVersion::Ver17
+    ) {
+        return false;
+    }
+    let Some(fw_offset) = fw_le_u16(block, 8) else {
+        return false;
+    };
+    if (fw_offset as usize) < FW_PHY_SMALL_LEN {
+        return false;
+    }
+    let Some(length) = fw_le_u32(block, 4) else {
+        return false;
+    };
+    if (length as usize) <= fw_offset as usize {
+        return false;
+    }
+    if (length as usize - fw_offset as usize) & 3 != 0 {
+        return false;
+    }
+    fw_le_u16(block, 12) == Some(0x9A00)
+}
+
+/// Linux `rtl8152_is_fw_phy_ver_ok` over a block slice
+/// (VER_10/11/12/13/15 only: length 16, `ver.addr` is
+/// `SRAM_GPHY_FW_VER`).
+fn is_fw_phy_ver_ok(version: RtlVersion, block: &[u8]) -> bool {
+    if !matches!(
+        version,
+        RtlVersion::Ver10
+            | RtlVersion::Ver11
+            | RtlVersion::Ver12
+            | RtlVersion::Ver13
+            | RtlVersion::Ver15
+    ) {
+        return false;
+    }
+    if fw_le_u32(block, 4) != Some(FW_PHY_SMALL_LEN as u32) {
+        return false;
+    }
+    fw_le_u16(block, 8) == Some(SRAM_GPHY_FW_VER)
+}
+
+/// Block-walk state for `check_firmware` (Linux's `fw_flags`
+/// bitmask, as named fields).
+#[derive(Default)]
+struct FwWalk {
+    pla: bool,
+    usb: bool,
+    start: bool,
+    stop: bool,
+    nc: bool,
+    nc1: bool,
+    nc2: bool,
+    uc2: bool,
+    uc: bool,
+    speed_up: bool,
+    ver: bool,
+}
+
+/// Validate a whole firmware image for `version` (Linux
+/// `rtl8152_check_firmware`): header size, SHA-256 checksum,
+/// then the block walk from offset 64, advancing
+/// `i += ALIGN(length, 8)`. Unknown block types are warned and
+/// skipped in Linux — here they are skipped silently (this
+/// crate has no logging sink). A file with no END block is
+/// accepted when START/STOP pair up, as in Linux.
+pub fn check_firmware(version: RtlVersion, fw: &[u8]) -> Result<(), FwError> {
+    if fw.len() < FW_HEADER_LEN {
+        return Err(FwError::TooSmall);
+    }
+    if !fw_checksum_ok(fw) {
+        return Err(FwError::BadChecksum);
+    }
+    let mut flags = FwWalk::default();
+    let mut i = FW_HEADER_LEN;
+    while i < fw.len() {
+        if i + FW_BLOCK_HDR_LEN > fw.len() {
+            return Err(FwError::Truncated);
+        }
+        let ty = fw_le_u32(fw, i).unwrap_or(u32::MAX);
+        let len = fw_le_u32(fw, i + 4).unwrap_or(0) as usize;
+        if len == 0 {
+            return Err(FwError::ZeroLength);
+        }
+        if i + len > fw.len() {
+            return Err(FwError::Truncated);
+        }
+        let block = &fw[i..i + len];
+        match ty {
+            RTL_FW_END => {
+                if len != FW_BLOCK_HDR_LEN {
+                    return Err(FwError::BadLength);
+                }
+                if flags.start && !flags.stop {
+                    return Err(FwError::UnpairedStart);
+                }
+                return Ok(());
+            }
+            RTL_FW_PLA => {
+                if flags.pla {
+                    return Err(FwError::Duplicate);
+                }
+                if !is_fw_mac_ok(version, true, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+                flags.pla = true;
+            }
+            RTL_FW_USB => {
+                if flags.usb {
+                    return Err(FwError::Duplicate);
+                }
+                if !is_fw_mac_ok(version, false, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+                flags.usb = true;
+            }
+            RTL_FW_PHY_START => {
+                if flags.start
+                    || flags.nc
+                    || flags.nc1
+                    || flags.nc2
+                    || flags.uc2
+                    || flags.uc
+                    || flags.stop
+                {
+                    return Err(FwError::OutOfOrder);
+                }
+                if len != FW_PHY_SMALL_LEN {
+                    return Err(FwError::BadLength);
+                }
+                flags.start = true;
+            }
+            RTL_FW_PHY_STOP => {
+                if flags.stop || !flags.start {
+                    return Err(FwError::OutOfOrder);
+                }
+                if len != FW_BLOCK_HDR_LEN {
+                    return Err(FwError::BadLength);
+                }
+                flags.stop = true;
+            }
+            RTL_FW_PHY_NC => {
+                if !flags.start || flags.stop {
+                    return Err(FwError::OutOfOrder);
+                }
+                if flags.nc {
+                    return Err(FwError::Duplicate);
+                }
+                if !is_fw_phy_nc_ok(version, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+                flags.nc = true;
+            }
+            RTL_FW_PHY_UNION_NC => {
+                if !flags.start || flags.nc1 || flags.nc2 || flags.uc2 || flags.uc || flags.stop {
+                    return Err(FwError::OutOfOrder);
+                }
+                if flags.nc {
+                    return Err(FwError::Duplicate);
+                }
+                if !is_fw_phy_union_ok(version, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+                flags.nc = true;
+            }
+            RTL_FW_PHY_UNION_NC1 => {
+                if !flags.start || flags.nc2 || flags.uc2 || flags.uc || flags.stop {
+                    return Err(FwError::OutOfOrder);
+                }
+                if flags.nc1 {
+                    return Err(FwError::Duplicate);
+                }
+                if !is_fw_phy_union_ok(version, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+                flags.nc1 = true;
+            }
+            RTL_FW_PHY_UNION_NC2 => {
+                if !flags.start || flags.uc2 || flags.uc || flags.stop {
+                    return Err(FwError::OutOfOrder);
+                }
+                if flags.nc2 {
+                    return Err(FwError::Duplicate);
+                }
+                if !is_fw_phy_union_ok(version, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+                flags.nc2 = true;
+            }
+            RTL_FW_PHY_UNION_UC2 => {
+                if !flags.start || flags.uc || flags.stop {
+                    return Err(FwError::OutOfOrder);
+                }
+                if flags.uc2 {
+                    return Err(FwError::Duplicate);
+                }
+                if !is_fw_phy_union_ok(version, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+                flags.uc2 = true;
+            }
+            RTL_FW_PHY_UNION_UC => {
+                if !flags.start || flags.stop {
+                    return Err(FwError::OutOfOrder);
+                }
+                if flags.uc {
+                    return Err(FwError::Duplicate);
+                }
+                if !is_fw_phy_union_ok(version, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+                flags.uc = true;
+            }
+            RTL_FW_PHY_UNION_MISC => {
+                if !is_fw_phy_union_ok(version, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+            }
+            RTL_FW_PHY_FIXUP => {
+                if !is_fw_phy_fixup_ok(version, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+            }
+            RTL_FW_PHY_SPEED_UP => {
+                if flags.speed_up {
+                    return Err(FwError::Duplicate);
+                }
+                if !is_fw_phy_speed_up_ok(version, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+                flags.speed_up = true;
+            }
+            RTL_FW_PHY_VER => {
+                if flags.start
+                    || flags.nc
+                    || flags.nc1
+                    || flags.nc2
+                    || flags.uc2
+                    || flags.uc
+                    || flags.stop
+                {
+                    return Err(FwError::OutOfOrder);
+                }
+                if flags.ver {
+                    return Err(FwError::Duplicate);
+                }
+                if !is_fw_phy_ver_ok(version, block) {
+                    return Err(FwError::InvalidBlock);
+                }
+                flags.ver = true;
+            }
+            _ => {
+                // Unknown type: warned and skipped in Linux.
+            }
+        }
+        // Next block (Linux `i += ALIGN(length, 8)`).
+        i += (len + 7) & !7;
+    }
+    if flags.start && !flags.stop {
+        return Err(FwError::UnpairedStart);
+    }
+    Ok(())
+}
+
+/// Firmware-path chunked OCP write (Linux `generic_ocp_write`
+/// with byteen 0xff, the only value the firmware path ever
+/// uses, so no start/end byte-enable splitting): `size` and
+/// `index` must be 4-aligned, `size` nonzero,
+/// `index + size ≤ 0xffff`; data goes out in ≤ 512-byte control
+/// transfers with `wIndex = mcu | BYTE_EN_DWORD`.
+async fn generic_ocp_write(dev: &USBDevice, index: u16, data: &[u8], mcu: u16) -> Result<(), ()> {
+    if data.is_empty() || data.len() & 3 != 0 || index & 3 != 0 {
+        return Err(());
+    }
+    if u32::from(index) + data.len() as u32 > 0xFFFF {
+        return Err(());
+    }
+    let mut off = 0usize;
+    while off < data.len() {
+        let n = core::cmp::min(512, data.len() - off);
+        let wvalue = index.wrapping_add(off as u16);
+        dev.control_out(
+            REQT_WRITE,
+            REQ_SET_REGS,
+            wvalue,
+            mcu | BYTE_EN_DWORD,
+            &data[off..off + n],
+        )
+        .await
+        .map_err(|_| ())?;
+        off += n;
+    }
+    Ok(())
+}
+
+/// Clear the break points for one window (Linux
+/// `rtl_clear_bp`): disable the enable register for the
+/// version/window, burst zeros over the break-point registers,
+/// wait 3 ms for the firmware to stop, then clear the base
+/// address register.
+async fn clear_bp(dev: &USBDevice, version: RtlVersion, mcu: u16) -> Result<(), ()> {
+    let bp_num: usize = match version {
+        RtlVersion::Ver08
+        | RtlVersion::Ver09
+        | RtlVersion::Ver10
+        | RtlVersion::Ver11
+        | RtlVersion::Ver12
+        | RtlVersion::Ver13
+        | RtlVersion::Ver15 => {
+            if mcu == MCU_TYPE_USB {
+                ocp_write_word(dev, MCU_TYPE_USB, USB_BP2_EN, 0).await?;
+                16
+            } else {
+                ocp_write_byte(dev, mcu, PLA_BP_EN, 0).await?;
+                8
+            }
+        }
+        RtlVersion::Ver03 | RtlVersion::Ver04 | RtlVersion::Ver05 | RtlVersion::Ver06 => {
+            ocp_write_byte(dev, mcu, PLA_BP_EN, 0).await?;
+            8
+        }
+        RtlVersion::Ver01 | RtlVersion::Ver02 | RtlVersion::Ver07 => 8,
+        _ => {
+            ocp_write_word(dev, mcu, USB_BP2_EN, 0).await?;
+            16
+        }
+    };
+    // Return value ignored in Linux.
+    let zeros = [0u8; 32];
+    let _ = generic_ocp_write(dev, PLA_BP_0, &zeros[..bp_num * 2], mcu).await;
+    // Wait 3 ms to make sure the firmware is stopped.
+    narf_time::sleep_ms(3).await;
+    ocp_write_word(dev, mcu, PLA_BP_BA, 0).await
+}
+
+/// Apply one PLA/USB firmware block (Linux
+/// `rtl8152_fw_mac_apply`): skip when the stored version byte
+/// (read from the USB window) is already at least the block's
+/// version; otherwise clear the break points, apply the data,
+/// program the break-point base/array/enable, and store the
+/// version byte. A failed `generic_ocp_write` returns from the
+/// block early (Linux's explicit check) while the loop
+/// continues with the next block; other transfer errors
+/// propagate.
+async fn fw_mac_apply(
+    dev: &USBDevice,
+    version: RtlVersion,
+    block: &[u8],
+    is_pla: bool,
+) -> Result<(), ()> {
+    let mcu = if is_pla { MCU_TYPE_PLA } else { MCU_TYPE_USB };
+    let fw_ver_reg = fw_le_u16(block, 60).unwrap_or(0);
+    let fw_ver_data = block.get(62).copied().unwrap_or(0);
+    if fw_ver_reg != 0 {
+        let cur = ocp_read_byte(dev, MCU_TYPE_USB, fw_ver_reg).await?;
+        if cur >= fw_ver_data {
+            return Ok(());
+        }
+    }
+    clear_bp(dev, version, mcu).await?;
+    // Enable backup/restore of MACDBG. Required after clearing
+    // PLA break points and before applying the PLA firmware.
+    if version == RtlVersion::Ver04 && is_pla {
+        let post = ocp_read_word(dev, MCU_TYPE_PLA, PLA_MACDBG_POST).await?;
+        if post & MACDBG_DEBUG_OE == 0 {
+            ocp_write_word(dev, MCU_TYPE_PLA, PLA_MACDBG_PRE, MACDBG_DEBUG_LTSSM).await?;
+            ocp_write_word(dev, MCU_TYPE_PLA, PLA_MACDBG_POST, MACDBG_DEBUG_LTSSM).await?;
+        }
+    }
+    let fw_offset = fw_le_u16(block, 8).unwrap_or(0) as usize;
+    let fw_reg = fw_le_u16(block, 10).unwrap_or(0);
+    let length = fw_le_u32(block, 4).unwrap_or(0) as usize;
+    let data_len = length.saturating_sub(fw_offset);
+    let data = block.get(fw_offset..fw_offset + data_len).unwrap_or(&[]);
+    if generic_ocp_write(dev, fw_reg, data, mcu).await.is_err() {
+        return Ok(());
+    }
+    let bp_ba_addr = fw_le_u16(block, 12).unwrap_or(0);
+    let bp_ba_value = fw_le_u16(block, 14).unwrap_or(0);
+    ocp_write_word(dev, mcu, bp_ba_addr, bp_ba_value).await?;
+    let bp_start = fw_le_u16(block, 20).unwrap_or(0);
+    let bp_num = fw_le_u16(block, 22).unwrap_or(0) as usize;
+    let bp_len = (bp_num * 2).next_multiple_of(4);
+    let bp_bytes = block.get(24..24 + bp_len).unwrap_or(&[]);
+    if generic_ocp_write(dev, bp_start, bp_bytes, mcu)
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    let bp_en_addr = fw_le_u16(block, 16).unwrap_or(0);
+    if bp_en_addr != 0 {
+        let bp_en_value = fw_le_u16(block, 18).unwrap_or(0);
+        ocp_write_word(dev, mcu, bp_en_addr, bp_en_value).await?;
+    }
+    if fw_ver_reg != 0 {
+        ocp_write_byte(dev, MCU_TYPE_USB, fw_ver_reg, fw_ver_data).await?;
+    }
+    Ok(())
+}
+
+/// Apply one PHY_NC block (Linux `rtl8152_fw_phy_nc_apply`):
+/// mode-pre, base address, burst the data through the SRAM
+/// window, patch-enable, break points, mode-post.
+async fn fw_phy_nc_apply(dev: &USBDevice, block: &[u8]) -> Result<(), ()> {
+    let mode_reg = fw_le_u16(block, 20).unwrap_or(0);
+    let mode_pre = fw_le_u16(block, 22).unwrap_or(0);
+    let mode_post = fw_le_u16(block, 24).unwrap_or(0);
+    let ba_reg = fw_le_u16(block, 12).unwrap_or(0);
+    let ba_data = fw_le_u16(block, 14).unwrap_or(0);
+    let patch_en_addr = fw_le_u16(block, 16).unwrap_or(0);
+    let patch_en_value = fw_le_u16(block, 18).unwrap_or(0);
+    let fw_reg = fw_le_u16(block, 10).unwrap_or(0);
+    let bp_start = fw_le_u16(block, 28).unwrap_or(0);
+    let bp_num = fw_le_u16(block, 30).unwrap_or(0) as usize;
+    let fw_offset = fw_le_u16(block, 8).unwrap_or(0) as usize;
+    let length = fw_le_u32(block, 4).unwrap_or(0) as usize;
+    sram_write(dev, mode_reg, mode_pre).await?;
+    sram_write(dev, ba_reg, ba_data).await?;
+    let num = length.saturating_sub(fw_offset) / 2;
+    ocp_reg_write(dev, OCP_SRAM_ADDR, fw_reg).await?;
+    for k in 0..num {
+        let v = fw_le_u16(block, fw_offset + 2 * k).unwrap_or(0);
+        ocp_reg_write(dev, OCP_SRAM_DATA, v).await?;
+    }
+    sram_write(dev, patch_en_addr, patch_en_value).await?;
+    let mut bp_index = bp_start;
+    for k in 0..bp_num {
+        let v = fw_le_u16(block, 32 + 2 * k).unwrap_or(0);
+        sram_write(dev, bp_index, v).await?;
+        bp_index += 2;
+    }
+    sram_write(dev, mode_reg, mode_post).await?;
+    Ok(())
+}
+
+/// Apply one PHY union block (Linux
+/// `rtl8152_fw_phy_union_apply`): pre-sets, burst the data
+/// through the SRAM window, break points, break-point enable.
+async fn fw_phy_union_apply(dev: &USBDevice, block: &[u8]) -> Result<(), ()> {
+    let fw_offset = fw_le_u16(block, 8).unwrap_or(0) as usize;
+    let fw_reg = fw_le_u16(block, 10).unwrap_or(0);
+    let length = fw_le_u32(block, 4).unwrap_or(0) as usize;
+    let pre_num = block.get(56).copied().unwrap_or(0) as usize;
+    for k in 0..pre_num {
+        let addr = fw_le_u16(block, 12 + 4 * k).unwrap_or(0);
+        let data = fw_le_u16(block, 14 + 4 * k).unwrap_or(0);
+        sram_write(dev, addr, data).await?;
+    }
+    let num = length.saturating_sub(fw_offset) / 2;
+    ocp_reg_write(dev, OCP_SRAM_ADDR, fw_reg).await?;
+    for k in 0..num {
+        let v = fw_le_u16(block, fw_offset + 2 * k).unwrap_or(0);
+        ocp_reg_write(dev, OCP_SRAM_DATA, v).await?;
+    }
+    let bp_num = block.get(57).copied().unwrap_or(0) as usize;
+    for k in 0..bp_num {
+        let addr = fw_le_u16(block, 20 + 4 * k).unwrap_or(0);
+        let data = fw_le_u16(block, 22 + 4 * k).unwrap_or(0);
+        sram_write(dev, addr, data).await?;
+    }
+    if bp_num != 0 {
+        let bp_en_addr = fw_le_u16(block, 52).unwrap_or(0);
+        if bp_en_addr != 0 {
+            let bp_en_data = fw_le_u16(block, 54).unwrap_or(0);
+            sram_write(dev, bp_en_addr, bp_en_data).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply one PHY fixup block (Linux `rtl8152_fw_phy_fixup`):
+/// read-modify-write one OCP register per `bit_cmd`
+/// (AND/OR/NOT/XOR). An unknown command applies nothing.
+async fn fw_phy_fixup(dev: &USBDevice, block: &[u8]) -> Result<(), ()> {
+    let addr = fw_le_u16(block, 8).unwrap_or(0);
+    let setting = fw_le_u16(block, 10).unwrap_or(0);
+    let bit_cmd = fw_le_u16(block, 12).unwrap_or(0);
+    let cur = ocp_reg_read(dev, addr).await?;
+    let new = match bit_cmd {
+        0 => cur & setting,
+        1 => cur | setting,
+        2 => cur & !setting,
+        3 => cur ^ setting,
+        _ => return Ok(()),
+    };
+    ocp_reg_write(dev, addr, new).await
+}
+
+/// Apply one PHY version block (Linux `rtl8152_fw_phy_ver`):
+/// when the stored version at `ver.addr` is already at least
+/// the block's version, return 0 (patching is skipped for the
+/// rest of the file); otherwise store the version and return
+/// it (nonzero — patching continues).
+async fn fw_phy_ver(dev: &USBDevice, block: &[u8]) -> Result<u16, ()> {
+    let ver_addr = fw_le_u16(block, 8).unwrap_or(0);
+    let ver = fw_le_u16(block, 10).unwrap_or(0);
+    if sram_read(dev, ver_addr).await? >= ver {
+        return Ok(0);
+    }
+    sram_write(dev, ver_addr, ver).await?;
+    Ok(ver)
+}
+
+/// Set (or clear) the PHY patch key (Linux
+/// `rtl_patch_key_set`): with a key, write it and lock the
+/// SRAM; without one, unlock and clear the key register.
+/// Linux's `PATCH_LOCK` is bit 0 — the same bit as
+/// `PHY_PATCH_LOCK`.
+async fn patch_key_set(dev: &USBDevice, key_addr: u16, patch_key: u16) -> Result<(), ()> {
+    if patch_key != 0 && key_addr != 0 {
+        sram_write(dev, key_addr, patch_key).await?;
+        sram_write(dev, OCP_PHY_LOCK, PHY_LOCK_PATCH_LOCK).await?;
+    } else if key_addr != 0 {
+        sram_write(dev, 0x0000, 0x0000).await?;
+        ocp_reg_clr_bits(dev, OCP_PHY_LOCK, PHY_LOCK_PATCH_LOCK).await?;
+        sram_write(dev, key_addr, 0x0000).await?;
+    }
+    // key_addr == 0: Linux WARN_ON_ONCEs; nothing to do here.
+    Ok(())
+}
+
+/// PHY_START step (Linux `rtl_pre_ram_code`): request the patch
+/// and set the key. Returns `false` when the request timed
+/// out — the caller ignores the result, as in Linux.
+async fn pre_ram_code(
+    dev: &USBDevice,
+    key_addr: u16,
+    patch_key: u16,
+    wait: bool,
+) -> Result<bool, ()> {
+    if !phy_patch_request(dev, true, wait).await? {
+        return Ok(false);
+    }
+    patch_key_set(dev, key_addr, patch_key).await?;
+    Ok(true)
+}
+
+/// PHY_STOP step (Linux `rtl_post_ram_code`): clear the key and
+/// release the patch.
+async fn post_ram_code(dev: &USBDevice, key_addr: u16, wait: bool) -> Result<(), ()> {
+    patch_key_set(dev, key_addr, 0).await?;
+    let _ = phy_patch_request(dev, false, wait).await;
+    Ok(())
+}
+
+/// Apply one SPEED_UP block (Linux `rtl_ram_code_speed_up`):
+/// skip when the stored PHY firmware version is already at
+/// least the block's; otherwise patch-request, stream the data
+/// in 2048-byte chunks through the USB window, and release.
+/// The `POL_GPHY_PATCH` poll yields between reads (the file's
+/// no-busy-spin convention) where Linux does 1000 back-to-back
+/// reads; a timed-out chunk stops the stream, as in Linux.
+async fn ram_code_speed_up(dev: &USBDevice, block: &[u8], wait: bool) -> Result<(), ()> {
+    let version = fw_le_u16(block, 10).unwrap_or(0);
+    let fw_reg = fw_le_u16(block, 12).unwrap_or(0);
+    let fw_offset = fw_le_u16(block, 8).unwrap_or(0) as usize;
+    let length = fw_le_u32(block, 4).unwrap_or(0) as usize;
+    if sram_read(dev, SRAM_GPHY_FW_VER).await? >= version {
+        return Ok(());
+    }
+    let mut len = length.saturating_sub(fw_offset);
+    let mut off = fw_offset;
+    if !phy_patch_request(dev, true, wait).await? {
+        return Ok(());
+    }
+    while len > 0 {
+        let size = core::cmp::min(len, 2048);
+        let cur = ocp_read_word(dev, MCU_TYPE_USB, USB_GPHY_CTRL).await?;
+        ocp_write_word(
+            dev,
+            MCU_TYPE_USB,
+            USB_GPHY_CTRL,
+            cur | GPHY_CTRL_PATCH_DONE | GPHY_CTRL_BACKUP_RESTRORE,
+        )
+        .await?;
+        // Return value ignored in Linux.
+        let data = block.get(off..off + size).unwrap_or(&[]);
+        let _ = generic_ocp_write(dev, fw_reg, data, MCU_TYPE_USB).await;
+        off += size;
+        len -= size;
+        let cur = ocp_read_word(dev, MCU_TYPE_PLA, PLA_POL_GPIO_CTRL).await?;
+        ocp_write_word(
+            dev,
+            MCU_TYPE_PLA,
+            PLA_POL_GPIO_CTRL,
+            cur | POL_GPIO_GPHY_PATCH,
+        )
+        .await?;
+        let mut i = 0;
+        loop {
+            let cur = ocp_read_word(dev, MCU_TYPE_PLA, PLA_POL_GPIO_CTRL).await?;
+            if cur & POL_GPIO_GPHY_PATCH == 0 || i >= 1000 {
+                break;
+            }
+            narf_scheduler::yield_now().await;
+            i += 1;
+        }
+        if i >= 1000 {
+            break;
+        }
+    }
+    let _ = phy_patch_request(dev, false, wait).await;
+    Ok(())
+}
+
+/// Wait for the watchdog timer to be ready (Linux
+/// `r8153_pre_firmware_1`): poll `USB_WDT1_CTRL` for `WTD1_EN`
+/// clear, up to 104 × 1 ms.
+async fn wait_wdt1_ready(dev: &USBDevice) -> Result<(), ()> {
+    for _ in 0..104 {
+        let v = ocp_read_byte(dev, MCU_TYPE_USB, USB_WDT1_CTRL).await?;
+        if v & (WDT1_EN as u8) == 0 {
+            break;
+        }
+        narf_time::sleep_ms(1).await;
+    }
+    Ok(())
+}
+
+/// USB-window word set-bits helper (read-modify-write).
+async fn usb_word_set_bits(dev: &USBDevice, addr: u16, bits: u16) -> Result<(), ()> {
+    let cur = ocp_read_word(dev, MCU_TYPE_USB, addr).await?;
+    ocp_write_word(dev, MCU_TYPE_USB, addr, cur | bits).await
+}
+
+/// USB-window word clear-bits helper (read-modify-write).
+async fn usb_word_clr_bits(dev: &USBDevice, addr: u16, bits: u16) -> Result<(), ()> {
+    let cur = ocp_read_word(dev, MCU_TYPE_USB, addr).await?;
+    ocp_write_word(dev, MCU_TYPE_USB, addr, cur & !bits).await
+}
+
+/// USB-window byte set-bits helper (read-modify-write).
+async fn usb_byte_set_bits(dev: &USBDevice, addr: u16, bits: u8) -> Result<(), ()> {
+    let cur = ocp_read_byte(dev, MCU_TYPE_USB, addr).await?;
+    ocp_write_byte(dev, MCU_TYPE_USB, addr, cur | bits).await
+}
+
+/// Pre-firmware hook for `version` (Linux `rtl_fw_init`'s
+/// `pre_fw`): VER_04 waits for the watchdog timer, VER_05
+/// does that plus clearing `FW_FIX_SUSPEND`, VER_09/VER_14
+/// enable the flow-control timer at 1 s. Other versions have
+/// no pre hook.
+async fn apply_pre_fw(dev: &USBDevice, version: RtlVersion) -> Result<(), ()> {
+    match version {
+        RtlVersion::Ver04 => wait_wdt1_ready(dev).await,
+        RtlVersion::Ver05 => {
+            wait_wdt1_ready(dev).await?;
+            usb_word_clr_bits(dev, USB_FW_FIX_EN0, FW_FIX_SUSPEND).await
+        }
+        RtlVersion::Ver09 | RtlVersion::Ver14 => {
+            ocp_write_word(
+                dev,
+                MCU_TYPE_USB,
+                USB_FC_TIMER,
+                FC_TIMER_CTRL_EN | (1000 / 8),
+            )
+            .await
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Post-firmware hook for `version` (Linux `rtl_fw_init`'s
+/// `post_fw`): VER_04 sets the super-only break point when
+/// forced-super and resets the UPHY timer to 36 ms; VER_05
+/// adds the U3P3 check, `FW_FIX_SUSPEND` and USB2-PHY
+/// L1/suspend; VER_06 sets USB2-PHY L1/suspend plus
+/// `FW_IP_RESET_EN`; VER_09 enables the BND break point, the
+/// flow-control patch and `FW_IP_RESET_EN`; VER_11 sets
+/// `FW_IP_RESET_EN` and writes the U3-PHY MDCMDIO pair; VER_14
+/// sets the flow-control patch 2. Other versions have no post
+/// hook.
+async fn apply_post_fw(dev: &USBDevice, version: RtlVersion) -> Result<(), ()> {
+    match version {
+        RtlVersion::Ver04 => {
+            if ocp_read_byte(dev, MCU_TYPE_USB, USB_CSTMR).await? & (CSTMR_FORCE_SUPER as u8) != 0 {
+                ocp_write_word(dev, MCU_TYPE_USB, USB_BP_4, BP4_SUPER_ONLY).await?;
+            }
+            ocp_write_word(dev, MCU_TYPE_PLA, PLA_UPHY_TIMER, 36000 / 16).await
+        }
+        RtlVersion::Ver05 => {
+            if ocp_read_byte(dev, MCU_TYPE_USB, USB_CSTMR).await? & (CSTMR_FORCE_SUPER as u8) != 0 {
+                pla_word_set_bits(dev, PLA_BP_EN, 0x0001).await?;
+            }
+            ocp_write_word(dev, MCU_TYPE_PLA, PLA_UPHY_TIMER, 36000 / 16).await?;
+            ocp_write_word(
+                dev,
+                MCU_TYPE_PLA,
+                PLA_EXTRA_STATUS,
+                EXTRA_STATUS_U3P3_CHECK_EN | 4,
+            )
+            .await?;
+            usb_word_set_bits(dev, USB_FW_FIX_EN0, FW_FIX_SUSPEND).await?;
+            usb_byte_set_bits(dev, USB_USB2PHY, USB2PHY_L1 | USB2PHY_SUSPEND).await
+        }
+        RtlVersion::Ver06 => {
+            usb_byte_set_bits(dev, USB_USB2PHY, USB2PHY_L1 | USB2PHY_SUSPEND).await?;
+            usb_word_set_bits(dev, USB_FW_FIX_EN1, FW_FIX_IP_RESET_EN).await
+        }
+        RtlVersion::Ver09 => {
+            if ocp_read_byte(dev, MCU_TYPE_USB, USB_MISC_1).await? & (MISC_1_BND_MASK as u8) != 0 {
+                pla_word_set_bits(dev, PLA_BP_EN, 0x0001).await?;
+            }
+            usb_word_set_bits(dev, USB_FW_CTRL, FW_CTRL_FLOW_CTRL_PATCH_OPT).await?;
+            usb_word_set_bits(dev, USB_FW_TASK, FW_TASK_FC_PATCH).await?;
+            usb_word_set_bits(dev, USB_FW_FIX_EN1, FW_FIX_IP_RESET_EN).await
+        }
+        RtlVersion::Ver11 => {
+            usb_word_set_bits(dev, USB_FW_FIX_EN1, FW_FIX_IP_RESET_EN).await?;
+            ocp_write_dword(dev, MCU_TYPE_USB, USB_UPHY3_MDCMDIO, 0x4026_840E).await?;
+            ocp_write_dword(dev, MCU_TYPE_USB, USB_UPHY3_MDCMDIO, 0x4001_ACC9).await
+        }
+        RtlVersion::Ver14 => {
+            usb_word_set_bits(dev, USB_FW_CTRL, FW_CTRL_FLOW_CTRL_PATCH_2).await?;
+            usb_word_set_bits(dev, USB_FW_TASK, FW_TASK_FC_PATCH).await
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Apply a validated firmware image for `version` (Linux
+/// `rtl8152_apply_firmware`): pre hook, then the block walk
+/// from offset 64 advancing `i += ALIGN(length, 8)` — END
+/// stops the walk, unknown types are skipped — then the post
+/// hook. `patch_phy` starts set and is cleared by a PHY_VER
+/// block whose version is already stored (later patch blocks
+/// are then skipped); PHY_NC applies regardless. Validation
+/// failures surface as `FwError` (never a bind failure — the
+/// executor records and skips them); transfer errors surface
+/// as `FwError::Transfer`.
+pub async fn apply_firmware(
+    dev: &USBDevice,
+    version: RtlVersion,
+    fw: &[u8],
+    power_cut: bool,
+) -> Result<(), FwError> {
+    check_firmware(version, fw)?;
+    // `rtl_reset_ocp_base` is a no-op in NARF (no ocp_base
+    // cache; the OCP accessors always write the base first).
+    apply_pre_fw(dev, version)
+        .await
+        .map_err(|_| FwError::Transfer)?;
+    let mut patch_phy = true;
+    let mut key_addr = 0u16;
+    let mut i = FW_HEADER_LEN;
+    while i < fw.len() {
+        let ty = fw_le_u32(fw, i).unwrap_or(RTL_FW_END);
+        let len = fw_le_u32(fw, i + 4).unwrap_or(0) as usize;
+        if len == 0 {
+            break;
+        }
+        let block = &fw[i..core::cmp::min(i + len, fw.len())];
+        match ty {
+            RTL_FW_END => break,
+            RTL_FW_PLA => {
+                fw_mac_apply(dev, version, block, true)
+                    .await
+                    .map_err(|_| FwError::Transfer)?;
+            }
+            RTL_FW_USB => {
+                fw_mac_apply(dev, version, block, false)
+                    .await
+                    .map_err(|_| FwError::Transfer)?;
+            }
+            RTL_FW_PHY_START => {
+                if patch_phy {
+                    let key_reg = fw_le_u16(block, 8).unwrap_or(0);
+                    let key_data = fw_le_u16(block, 10).unwrap_or(0);
+                    key_addr = key_reg;
+                    let _ = pre_ram_code(dev, key_addr, key_data, !power_cut).await;
+                }
+            }
+            RTL_FW_PHY_STOP => {
+                if patch_phy {
+                    let _ = post_ram_code(dev, key_addr, !power_cut).await;
+                }
+            }
+            RTL_FW_PHY_NC => {
+                fw_phy_nc_apply(dev, block)
+                    .await
+                    .map_err(|_| FwError::Transfer)?;
+            }
+            RTL_FW_PHY_VER => {
+                patch_phy = fw_phy_ver(dev, block)
+                    .await
+                    .map_err(|_| FwError::Transfer)?
+                    != 0;
+            }
+            RTL_FW_PHY_UNION_NC
+            | RTL_FW_PHY_UNION_NC1
+            | RTL_FW_PHY_UNION_NC2
+            | RTL_FW_PHY_UNION_UC2
+            | RTL_FW_PHY_UNION_UC
+            | RTL_FW_PHY_UNION_MISC => {
+                if patch_phy {
+                    fw_phy_union_apply(dev, block)
+                        .await
+                        .map_err(|_| FwError::Transfer)?;
+                }
+            }
+            RTL_FW_PHY_FIXUP => {
+                if patch_phy {
+                    fw_phy_fixup(dev, block)
+                        .await
+                        .map_err(|_| FwError::Transfer)?;
+                }
+            }
+            RTL_FW_PHY_SPEED_UP => {
+                ram_code_speed_up(dev, block, !power_cut)
+                    .await
+                    .map_err(|_| FwError::Transfer)?;
+            }
+            _ => {}
+        }
+        i += (len + 7) & !7;
+    }
+    apply_post_fw(dev, version)
+        .await
+        .map_err(|_| FwError::Transfer)?;
     Ok(())
 }
 
@@ -1201,8 +5187,11 @@ pub async fn apply_usb_init(
     burst_size: u16,
     link_ok: bool,
 ) -> Result<(), ()> {
+    // The USB/LPM layer never contains the firmware or patch
+    // steps, so the context carries no blob.
+    let mut ctx = PhyInitCtx::new(version, None);
     for op in r8153_init_ops(version, speed, burst_size, link_ok) {
-        apply_phy_init_op(dev, op).await?;
+        apply_phy_init_op(dev, &mut ctx, op).await?;
     }
     Ok(())
 }
@@ -2280,10 +6269,23 @@ async fn bind(device: Arc<USBDevice>, hub_port: Option<(u8, u8)>) -> Result<usiz
         .unwrap_or(false);
     apply_usb_init(&device, version, device.speed(), burst_size, link_ok).await?;
     let coalesce_us = coalesce_for_speed(device.speed());
+    // Firmware blob for the chip version, from the registry
+    // (Linux `rtl8152_request_firmware`, probe-time in Linux).
+    // The cap is held alive across the init sequence so the blob
+    // view stays valid; a missing blob is Linux's failed
+    // `request_firmware` — warn and continue, never a bind
+    // failure (this crate has no logging sink, so the absence is
+    // silent here and visible only as the skipped step).
+    let fw_cap = firmware_name_for(version).and_then(crate::btusb::firmware_cap);
+    let fw_view = match &fw_cap {
+        Some(cap) => narf_firmware::view_of(cap).ok(),
+        None => None,
+    };
+    let fw = fw_view.as_ref().map(|v| v.bytes);
     // PHY/firmware init for the chip version, before CR RE/TE
-    // enable. Unknown / not-yet-ported versions are a no-op here
-    // (reset defaults); VER_03–VER_06 run r8153_hw_phy_cfg.
-    apply_phy_init(&device, version).await?;
+    // enable. Unknown versions are a no-op here (reset
+    // defaults); every known version runs its `*_hw_phy_cfg`.
+    apply_phy_init(&device, version, fw).await?;
     // Station address from the device itself — never invented.
     let mac = read_station_address(&device, gen).await?;
     // Multicast table wide open (RCR_AM does the policy), then the
@@ -3685,32 +7687,54 @@ pub mod tests {
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_ocp_reg_window);
 
     fn smoke_r8152_phy_init_table_shape() -> TestResult {
-        // Only VER_03–VER_06 get a sequence; everything else is
-        // reset defaults (empty table, never a bind failure).
-        if !r8153_phy_init_ops(RtlVersion::Ver01).is_empty()
-            || !r8153_phy_init_ops(RtlVersion::Ver08).is_empty()
-            || !r8153_phy_init_ops(RtlVersion::Ver16).is_empty()
-            || !r8153_phy_init_ops(RtlVersion::Unknown).is_empty()
+        // Every known version gets a sequence; TEST_01 and
+        // unknown versions keep reset defaults (empty table,
+        // never a bind failure).
+        for version in [
+            RtlVersion::Ver01,
+            RtlVersion::Ver02,
+            RtlVersion::Ver03,
+            RtlVersion::Ver04,
+            RtlVersion::Ver05,
+            RtlVersion::Ver06,
+            RtlVersion::Ver07,
+            RtlVersion::Ver08,
+            RtlVersion::Ver09,
+            RtlVersion::Ver10,
+            RtlVersion::Ver11,
+            RtlVersion::Ver12,
+            RtlVersion::Ver13,
+            RtlVersion::Ver14,
+            RtlVersion::Ver15,
+            RtlVersion::Ver16,
+            RtlVersion::Ver17,
+        ] {
+            if phy_init_ops(version).is_empty() {
+                return TestResult::Fail("known version must have a PHY table");
+            }
+        }
+        if !phy_init_ops(RtlVersion::Test01).is_empty()
+            || !phy_init_ops(RtlVersion::Unknown).is_empty()
         {
             return TestResult::Fail("unported version must have an empty PHY table");
         }
-        let v03 = r8153_phy_init_ops(RtlVersion::Ver03);
-        let v04 = r8153_phy_init_ops(RtlVersion::Ver04);
-        let v05 = r8153_phy_init_ops(RtlVersion::Ver05);
-        let v06 = r8153_phy_init_ops(RtlVersion::Ver06);
+        let v03 = phy_init_ops(RtlVersion::Ver03);
+        let v04 = phy_init_ops(RtlVersion::Ver04);
+        let v05 = phy_init_ops(RtlVersion::Ver05);
+        let v06 = phy_init_ops(RtlVersion::Ver06);
         // VER_03 carries exactly one more step than VER_04: the
-        // CTAP_SHORT_EN clear at position 4 (right after the EEE
-        // disable).
+        // CTAP_SHORT_EN clear at position 5 (right after the
+        // firmware step).
         if v03.len() != v04.len() + 1 {
             return TestResult::Fail("VER_03 table must exceed VER_04 by the CTAP step");
         }
-        if v03[4]
+        if v03[5]
             != (PhyInitOp::OcpRegClrBits {
                 addr: OCP_EEE_CFG,
                 bits: EEE_CFG_CTAP_SHORT_EN,
             })
         {
-            return TestResult::Fail("VER_03 table must clear CTAP_SHORT_EN fourth");
+            return TestResult::Fail("VER_03 table must clear CTAP_SHORT_EN fifth");
         }
         if v04.iter().any(|op| {
             *op == (PhyInitOp::OcpRegClrBits {
@@ -3748,6 +7772,83 @@ pub mod tests {
             })
         {
             return TestResult::Fail("PHY table must disable EEE second");
+        }
+        // Every known version carries exactly one firmware step,
+        // at Linux's position in its sequence.
+        for version in [
+            RtlVersion::Ver01,
+            RtlVersion::Ver02,
+            RtlVersion::Ver03,
+            RtlVersion::Ver04,
+            RtlVersion::Ver05,
+            RtlVersion::Ver06,
+            RtlVersion::Ver07,
+            RtlVersion::Ver08,
+            RtlVersion::Ver09,
+            RtlVersion::Ver10,
+            RtlVersion::Ver11,
+            RtlVersion::Ver12,
+            RtlVersion::Ver13,
+            RtlVersion::Ver14,
+            RtlVersion::Ver15,
+            RtlVersion::Ver16,
+            RtlVersion::Ver17,
+        ] {
+            let ops = phy_init_ops(version);
+            if ops
+                .iter()
+                .filter(|op| matches!(op, PhyInitOp::ApplyFirmware { .. }))
+                .count()
+                != 1
+            {
+                return TestResult::Fail("each PHY table must carry exactly one firmware step");
+            }
+        }
+        // VER_14 reuses the VER_08/VER_09 table (Linux's
+        // `r8153c_hw_phy_cfg` is `r8153b_hw_phy_cfg` plus a
+        // driver-internal flag with no wire effect); VER_01/02/07
+        // share one table too.
+        if phy_init_ops(RtlVersion::Ver14) != phy_init_ops(RtlVersion::Ver08)
+            || phy_init_ops(RtlVersion::Ver14) != phy_init_ops(RtlVersion::Ver09)
+        {
+            return TestResult::Fail("VER_14 table must equal the VER_08/VER_09 table");
+        }
+        if phy_init_ops(RtlVersion::Ver01) != phy_init_ops(RtlVersion::Ver02)
+            || phy_init_ops(RtlVersion::Ver01) != phy_init_ops(RtlVersion::Ver07)
+        {
+            return TestResult::Fail("VER_01/02/07 tables must be identical");
+        }
+        // VER_10 is the only version with EEE disabled at the end
+        // (Linux's `eee_en` is false there); VER_11 re-enables it.
+        let eee_enable = PhyInitOp::PlaWordSetBits {
+            addr: PLA_EEE_CR,
+            bits: EEE_CR_RX_EN | EEE_CR_TX_EN,
+        };
+        if phy_init_ops(RtlVersion::Ver10).contains(&eee_enable) {
+            return TestResult::Fail("VER_10 table must not re-enable EEE");
+        }
+        if !phy_init_ops(RtlVersion::Ver11).contains(&eee_enable) {
+            return TestResult::Fail("VER_11 table must re-enable EEE");
+        }
+        // The 8157 family has no U2P3 enable in its table (Linux
+        // uses the separate `r8157_u2p3en` path); the 8156B family
+        // ends with it.
+        if phy_init_ops(RtlVersion::Ver16).contains(&u2p3)
+            || phy_init_ops(RtlVersion::Ver17).contains(&u2p3)
+        {
+            return TestResult::Fail("VER_16/17 tables must not enable U2P3");
+        }
+        if phy_init_ops(RtlVersion::Ver12).last() != Some(&u2p3)
+            || phy_init_ops(RtlVersion::Ver13).last() != Some(&u2p3)
+            || phy_init_ops(RtlVersion::Ver15).last() != Some(&u2p3)
+        {
+            return TestResult::Fail("VER_12/13/15 tables must end with U2P3 enable");
+        }
+        // The legacy builder still serves VER_03–VER_06 only.
+        if r8153_phy_init_ops(RtlVersion::Ver03) != v03
+            || !r8153_phy_init_ops(RtlVersion::Ver08).is_empty()
+        {
+            return TestResult::Fail("legacy r8153 builder must stay VER_03–VER_06 only");
         }
         TestResult::Pass
     }
@@ -3933,24 +8034,52 @@ pub mod tests {
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_coalesce_for_speed);
 
     /// Modelled register file for the PHY-init conversation: PLA
-    /// words, OCP PHY registers, SRAM cells, USB-window words and
-    /// MDIO registers as small association lists. The executor
-    /// mirrors the production op semantics (read-modify-write
-    /// for set/clr-bits, two-step SRAM writes); the ALDPS poll
-    /// is modelled as satisfied.
-    /// All polls are modelled the same way. Byte ops touch
-    /// the low byte of the word at `addr` (all byte-op addresses
-    /// in the sequences are even, so this is exact there); a
-    /// dword write splits low@`addr`, high@`addr + 1`.
+    /// words, OCP PHY registers, SRAM cells (both banks), USB-window
+    /// words and MDIO registers as small association lists. The
+    /// executor mirrors the production op semantics
+    /// (read-modify-write for set/clr-bits, two-step SRAM writes,
+    /// auto-incrementing burst pointers after an address write);
+    /// the ALDPS poll is modelled as satisfied. All polls are
+    /// modelled the same way. Byte ops touch the low byte of the
+    /// word at `addr` (all byte-op addresses in the sequences are
+    /// even, so this is exact there); a dword write splits
+    /// low@`addr`, high@`addr + 1`. The firmware step is modelled
+    /// as a counted no-op (`fw_steps`) — the blob walk itself is
+    /// covered by the pure `check_firmware` tests — and the patch
+    /// request always succeeds, so `patch_aborted` never sets in
+    /// the model (the abort path is a thin flag in the executor).
+    /// `efuse_7d` is the preloaded 17-bit efuse value the ADC
+    /// calibration reads.
     struct ModelRegs {
         pla: Vec<(u16, u16)>,
         ocp: Vec<(u16, u16)>,
         sram: Vec<(u16, u16)>,
+        sram2: Vec<(u16, u16)>,
         usb: Vec<(u16, u16)>,
         mdio: Vec<(u16, u16)>,
+        sram_ptr: u16,
+        sram2_ptr: u16,
+        fw_steps: usize,
+        patch_aborted: bool,
+        efuse_7d: u32,
     }
 
     impl ModelRegs {
+        fn new() -> Self {
+            Self {
+                pla: Vec::new(),
+                ocp: Vec::new(),
+                sram: Vec::new(),
+                sram2: Vec::new(),
+                usb: Vec::new(),
+                mdio: Vec::new(),
+                sram_ptr: 0,
+                sram2_ptr: 0,
+                fw_steps: 0,
+                patch_aborted: false,
+                efuse_7d: 0,
+            }
+        }
         fn get(map: &[(u16, u16)], addr: u16) -> u16 {
             map.iter()
                 .find(|(a, _)| *a == addr)
@@ -3966,6 +8095,12 @@ pub mod tests {
         }
         fn apply(&mut self, op: PhyInitOp) {
             use PhyInitOp::*;
+            // A failed patch request aborts the rest of the
+            // sequence; the model never fails one, so this only
+            // guards the flag's plumbing.
+            if self.patch_aborted {
+                return;
+            }
             match op {
                 OcpRegSetBits { addr, bits } => {
                     let cur = Self::get(&self.ocp, addr);
@@ -3976,7 +8111,32 @@ pub mod tests {
                     Self::set(&mut self.ocp, addr, cur & !bits);
                 }
                 OcpRegWrite { addr, value } => Self::set(&mut self.ocp, addr, value),
+                OcpRegW0W1 { addr, clear, set } => {
+                    let cur = Self::get(&self.ocp, addr);
+                    Self::set(&mut self.ocp, addr, (cur & !clear) | set);
+                }
                 SramWrite { addr, value } => Self::set(&mut self.sram, addr, value),
+                SramW0W1 { addr, clear, set } => {
+                    let cur = Self::get(&self.sram, addr);
+                    Self::set(&mut self.sram, addr, (cur & !clear) | set);
+                }
+                Sram2W0W1 { addr, clear, set } => {
+                    let cur = Self::get(&self.sram2, addr);
+                    Self::set(&mut self.sram2, addr, (cur & !clear) | set);
+                }
+                Sram2Write { addr, value } => Self::set(&mut self.sram2, addr, value),
+                SramAddrWrite { addr } => self.sram_ptr = addr,
+                SramDataWrite { value } => {
+                    let ptr = self.sram_ptr;
+                    Self::set(&mut self.sram, ptr, value);
+                    self.sram_ptr = ptr.wrapping_add(2);
+                }
+                Sram2AddrWrite { addr } => self.sram2_ptr = addr,
+                Sram2DataWrite { value } => {
+                    let ptr = self.sram2_ptr;
+                    Self::set(&mut self.sram2, ptr, value);
+                    self.sram2_ptr = ptr.wrapping_add(2);
+                }
                 PlaWordSetBits { addr, bits } => {
                     let cur = Self::get(&self.pla, addr);
                     Self::set(&mut self.pla, addr, cur | bits);
@@ -3985,6 +8145,7 @@ pub mod tests {
                     let cur = Self::get(&self.pla, addr);
                     Self::set(&mut self.pla, addr, cur & !bits);
                 }
+                PlaWordWrite { addr, value } => Self::set(&mut self.pla, addr, value),
                 UsbWordSetBits { addr, bits } => {
                     let cur = Self::get(&self.usb, addr);
                     Self::set(&mut self.usb, addr, cur | bits);
@@ -3999,6 +8160,136 @@ pub mod tests {
                     Self::set(&mut self.usb, addr, cur & !bits);
                 }
                 UsbWordWrite { addr, value } => Self::set(&mut self.usb, addr, value),
+                UsbWordTestAndClrBits { addr, bits } => {
+                    let cur = Self::get(&self.usb, addr);
+                    if cur & bits != 0 {
+                        Self::set(&mut self.usb, addr, cur & !bits);
+                    }
+                }
+                MdioTestAndClrBits { reg, bits } => {
+                    let addr = OCP_BASE_MII + reg * 2;
+                    let cur = Self::get(&self.mdio, addr);
+                    if cur & bits != 0 {
+                        Self::set(&mut self.mdio, addr, cur & !bits);
+                    }
+                }
+                MmdWrite { dev, reg, value } => {
+                    // Linux `r8152_mmd_write`: select, write,
+                    // deselect — only the final state is modelled.
+                    Self::set(&mut self.ocp, OCP_EEE_AR, MMD_FUN_ADDR | dev);
+                    Self::set(&mut self.ocp, OCP_EEE_DATA, reg);
+                    Self::set(&mut self.ocp, OCP_EEE_AR, MMD_FUN_DATA | dev);
+                    Self::set(&mut self.ocp, OCP_EEE_DATA, value);
+                    Self::set(&mut self.ocp, OCP_EEE_AR, 0);
+                }
+                ApplyFirmware { .. } => {
+                    self.fw_steps += 1;
+                }
+                PhyPatchRequest { .. } => {
+                    // Modelled as success: the request bit sets
+                    // and PATCH_READY is already set.
+                }
+                WaitLoadingFlash => {}
+                AdcBiasFromEfuse => {
+                    // Rebuild the 16-bit value from the preloaded
+                    // 17-bit efuse word, as in Linux.
+                    let raw = self.efuse_7d;
+                    let data = (((raw & 0x1FFF0) >> 1) | (raw & 0x7)) as u16;
+                    if data != 0xFFFF {
+                        Self::set(&mut self.ocp, OCP_ADC_IOFFSET, data);
+                    }
+                }
+                UpsTimingFromSawCnt => {
+                    let saw = Self::get(&self.ocp, 0xC426) & 0x3FFF;
+                    if saw != 0 {
+                        let swr =
+                            ((16_000_000u32 / u32::from(saw)) as u16) & UPS_CFG_SAW_CNT_1MS_MASK;
+                        let cur = Self::get(&self.usb, USB_UPS_CFG);
+                        Self::set(
+                            &mut self.usb,
+                            USB_UPS_CFG,
+                            (cur & !UPS_CFG_SAW_CNT_1MS_MASK) | swr,
+                        );
+                    }
+                }
+                MdiSwapIfReversed => {
+                    let ups = Self::get(&self.usb, USB_UPS_CFG);
+                    let sel = Self::get(&self.ocp, 0xD068);
+                    if ups & UPS_CFG_MID_REVERSE == 0 || sel & 0x0002 == 0 {
+                        return;
+                    }
+                    let mut data = Self::get(&self.ocp, 0xD068);
+                    data &= !0x001F;
+                    data |= 0x0001; // p0
+                    Self::set(&mut self.ocp, 0xD068, data);
+                    let swap_a = Self::get(&self.ocp, 0xD06A);
+                    data &= !0x0018;
+                    data |= 0x0018; // p3
+                    Self::set(&mut self.ocp, 0xD068, data);
+                    let swap_b = Self::get(&self.ocp, 0xD06A);
+                    data &= !0x0018; // p0
+                    Self::set(&mut self.ocp, 0xD068, data);
+                    Self::set(
+                        &mut self.ocp,
+                        0xD06A,
+                        (swap_a & !0x07FF) | (swap_b & 0x07FF),
+                    );
+                    data |= 0x0018; // p3
+                    Self::set(&mut self.ocp, 0xD068, data);
+                    Self::set(
+                        &mut self.ocp,
+                        0xD06A,
+                        (swap_b & !0x07FF) | (swap_a & 0x07FF),
+                    );
+                    data &= !0x0018;
+                    data |= 0x0008; // p1
+                    Self::set(&mut self.ocp, 0xD068, data);
+                    let swap_a = Self::get(&self.ocp, 0xD06A);
+                    data &= !0x0018;
+                    data |= 0x0010; // p2
+                    Self::set(&mut self.ocp, 0xD068, data);
+                    let swap_b = Self::get(&self.ocp, 0xD06A);
+                    data &= !0x0018;
+                    data |= 0x0008; // p1
+                    Self::set(&mut self.ocp, 0xD068, data);
+                    Self::set(
+                        &mut self.ocp,
+                        0xD06A,
+                        (swap_a & !0x07FF) | (swap_b & 0x07FF),
+                    );
+                    data &= !0x0018;
+                    data |= 0x0010; // p2
+                    Self::set(&mut self.ocp, 0xD068, data);
+                    Self::set(
+                        &mut self.ocp,
+                        0xD06A,
+                        (swap_b & !0x07FF) | (swap_a & 0x07FF),
+                    );
+                    let swap_a = Self::get(&self.ocp, 0xBD5A);
+                    let swap_b = Self::get(&self.ocp, 0xBD5C);
+                    Self::set(
+                        &mut self.ocp,
+                        0xBD5A,
+                        (swap_a & !0x1F1F) | ((swap_b & 0x001F) << 8) | ((swap_b >> 8) & 0x001F),
+                    );
+                    Self::set(
+                        &mut self.ocp,
+                        0xBD5C,
+                        (swap_b & !0x1F1F) | ((swap_a & 0x001F) << 8) | ((swap_a >> 8) & 0x001F),
+                    );
+                    let swap_a = Self::get(&self.ocp, 0xBC18);
+                    let swap_b = Self::get(&self.ocp, 0xBC1A);
+                    Self::set(
+                        &mut self.ocp,
+                        0xBC18,
+                        (swap_a & !0x1F1F) | ((swap_b & 0x001F) << 8) | ((swap_b >> 8) & 0x001F),
+                    );
+                    Self::set(
+                        &mut self.ocp,
+                        0xBC1A,
+                        (swap_b & !0x1F1F) | ((swap_a & 0x001F) << 8) | ((swap_a >> 8) & 0x001F),
+                    );
+                }
                 UsbByteSetBits { addr, bits } => {
                     let cur = Self::get(&self.usb, addr);
                     let lo = (cur as u8 | bits) as u16;
@@ -4053,16 +8344,10 @@ pub mod tests {
         // end with ALDPS re-enabled, EEE on with the 8153
         // advertisement, the SRAM tuning cells programmed, and
         // the VER_03-only CTAP clear applied.
-        let mut m = ModelRegs {
-            pla: Vec::new(),
-            ocp: Vec::new(),
-            sram: Vec::new(),
-            usb: Vec::new(),
-            mdio: Vec::new(),
-        };
+        let mut m = ModelRegs::new();
         ModelRegs::set(&mut m.ocp, OCP_POWER_CFG, POWER_CFG_EN_ALDPS);
         ModelRegs::set(&mut m.ocp, OCP_EEE_CFG, EEE_CFG_CTAP_SHORT_EN);
-        for op in r8153_phy_init_ops(RtlVersion::Ver03) {
+        for op in phy_init_ops(RtlVersion::Ver03) {
             m.apply(op);
         }
         let power = ModelRegs::get(&m.ocp, OCP_POWER_CFG);
@@ -4096,32 +8381,23 @@ pub mod tests {
         {
             return TestResult::Fail("modelled MDIO flow-control end state wrong");
         }
+        if m.fw_steps != 1 {
+            return TestResult::Fail("VER_03 conversation must carry exactly one firmware step");
+        }
         // VER_04 from the same preload: CTAP_SHORT_EN survives
         // (no clear step), everything else matches.
-        let mut m4 = ModelRegs {
-            pla: Vec::new(),
-            ocp: Vec::new(),
-            sram: Vec::new(),
-            usb: Vec::new(),
-            mdio: Vec::new(),
-        };
+        let mut m4 = ModelRegs::new();
         ModelRegs::set(&mut m4.ocp, OCP_POWER_CFG, POWER_CFG_EN_ALDPS);
         ModelRegs::set(&mut m4.ocp, OCP_EEE_CFG, EEE_CFG_CTAP_SHORT_EN);
-        for op in r8153_phy_init_ops(RtlVersion::Ver04) {
+        for op in phy_init_ops(RtlVersion::Ver04) {
             m4.apply(op);
         }
         if ModelRegs::get(&m4.ocp, OCP_EEE_CFG) != EEE_CFG_EEE10_EN | EEE_CFG_CTAP_SHORT_EN {
             return TestResult::Fail("VER_04 must preserve CTAP_SHORT_EN");
         }
         // VER_05: U2P3 enabled, CTAP untouched.
-        let mut m5 = ModelRegs {
-            pla: Vec::new(),
-            ocp: Vec::new(),
-            sram: Vec::new(),
-            usb: Vec::new(),
-            mdio: Vec::new(),
-        };
-        for op in r8153_phy_init_ops(RtlVersion::Ver05) {
+        let mut m5 = ModelRegs::new();
+        for op in phy_init_ops(RtlVersion::Ver05) {
             m5.apply(op);
         }
         if ModelRegs::get(&m5.usb, USB_U2P3_CTRL) != U2P3_ENABLE {
@@ -4133,6 +8409,824 @@ pub mod tests {
         "drivers/usb/r8152",
         smoke_r8152_phy_init_modelled_conversation
     );
+
+    fn smoke_r8152_phy_init_ver01_conversation() -> TestResult {
+        // VER_01 (RTL8152): firmware step first, then the 8152
+        // EEE enable (CONFIG1/2/3 + MMD advertisement), ALDPS
+        // enable as a whole-word write, flow control.
+        let mut m = ModelRegs::new();
+        for op in phy_init_ops(RtlVersion::Ver01) {
+            m.apply(op);
+        }
+        if m.fw_steps != 1 {
+            return TestResult::Fail("VER_01 conversation must carry one firmware step");
+        }
+        if ModelRegs::get(&m.pla, PLA_EEE_CR) != EEE_CR_RX_EN | EEE_CR_TX_EN {
+            return TestResult::Fail("VER_01 PLA_EEE_CR end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_EEE_CONFIG1) != 0x3310 {
+            return TestResult::Fail("VER_01 EEE_CONFIG1 end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_EEE_CONFIG2) != 0x0600 {
+            return TestResult::Fail("VER_01 EEE_CONFIG2 end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_EEE_CONFIG3) != 0x1500 {
+            return TestResult::Fail("VER_01 EEE_CONFIG3 end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_EEE_AR) != 0
+            || ModelRegs::get(&m.ocp, OCP_EEE_DATA) != EEE_ADV_8152
+        {
+            return TestResult::Fail("VER_01 MMD advertisement end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_ALDPS_CONFIG) != ALDPS_CFG_8152_ENABLE {
+            return TestResult::Fail("VER_01 ALDPS config end state wrong");
+        }
+        if ModelRegs::get(&m.mdio, OCP_BASE_MII + MII_ADVERTISE * 2)
+            != ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM
+        {
+            return TestResult::Fail("VER_01 MDIO flow-control end state wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_ver01_conversation);
+
+    fn smoke_r8152_phy_init_ver08_conversation() -> TestResult {
+        // VER_08 (RTL8153B): power-cut clear, U1/U2 timer, green
+        // mode, ADC efuse calibration, UPS timing, patch-gated
+        // Advance EEE, EEE re-enable.
+        let mut m = ModelRegs::new();
+        ModelRegs::set(&mut m.usb, USB_MISC_0, PCUT_STATUS);
+        ModelRegs::set(&mut m.ocp, 0xC426, 0x1000);
+        m.efuse_7d = 0x1234;
+        for op in phy_init_ops(RtlVersion::Ver08) {
+            m.apply(op);
+        }
+        if m.fw_steps != 1 {
+            return TestResult::Fail("VER_08 conversation must carry one firmware step");
+        }
+        if ModelRegs::get(&m.usb, USB_MISC_0) != 0 {
+            return TestResult::Fail("VER_08 must clear the power-cut status");
+        }
+        if ModelRegs::get(&m.usb, USB_U1U2_TIMER) != 500 {
+            return TestResult::Fail("VER_08 U1/U2 timer wrong");
+        }
+        if ModelRegs::get(&m.sram, 0x8045) != 0
+            || ModelRegs::get(&m.sram, 0x804D) != 0x1222
+            || ModelRegs::get(&m.sram, 0x805D) != 0x0022
+            || ModelRegs::get(&m.sram, SRAM_GREEN_CFG) != GREEN_ETH_EN | GREEN_CFG_R_TUNE_EN
+        {
+            return TestResult::Fail("VER_08 green-mode end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_NCTL_CFG) != NCTL_CFG_PGA_RETURN_EN {
+            return TestResult::Fail("VER_08 NCTL_CFG end state wrong");
+        }
+        // efuse 0x1234 -> ((0x1230) >> 1) | 0x4 = 0x091C.
+        if ModelRegs::get(&m.ocp, OCP_ADC_IOFFSET) != 0x091C {
+            return TestResult::Fail("VER_08 ADC ioffset end state wrong");
+        }
+        // saw 0x1000 -> 16000000 / 4096 = 3906 (0xF42).
+        if ModelRegs::get(&m.usb, USB_UPS_CFG) != 0x0F42 {
+            return TestResult::Fail("VER_08 UPS timing end state wrong");
+        }
+        if ModelRegs::get(&m.pla, PLA_PHY_PWR) != PHY_PWR_PFM_PWM_SWITCH {
+            return TestResult::Fail("VER_08 PLA_PHY_PWR end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_DOWN_SPEED)
+            != DOWN_SPEED_EN_EEE_CMODE | DOWN_SPEED_EN_EEE_1000 | DOWN_SPEED_EN_10M_CLKDIV
+        {
+            return TestResult::Fail("VER_08 DOWN_SPEED end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_SYSCLK_CFG) != CLK_DIV_EXPO_5 {
+            return TestResult::Fail("VER_08 SYSCLK_CFG end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_POWER_CFG) != POWER_CFG_EEE_CLKDIV_EN | POWER_CFG_EN_ALDPS {
+            return TestResult::Fail("VER_08 POWER_CFG end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_EEE_ADV) != EEE_ADV_8153 {
+            return TestResult::Fail("VER_08 EEE_ADV end state wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_ver08_conversation);
+
+    fn smoke_r8152_phy_init_ver10_conversation() -> TestResult {
+        // VER_10 (RTL8156): EEE stays disabled at the end
+        // (eee_en is false), green mode on, lite-mode clears
+        // applied, U2P3 enabled.
+        let mut m = ModelRegs::new();
+        ModelRegs::set(&mut m.ocp, 0xA428, 0x0200);
+        ModelRegs::set(&mut m.ocp, 0xA5EA, 0x0001);
+        for op in phy_init_ops(RtlVersion::Ver10) {
+            m.apply(op);
+        }
+        if m.fw_steps != 1 {
+            return TestResult::Fail("VER_10 conversation must carry one firmware step");
+        }
+        if ModelRegs::get(&m.pla, PLA_EEE_CR) != 0
+            || ModelRegs::get(&m.ocp, OCP_EEE_CFG) != 0
+            || ModelRegs::get(&m.ocp, OCP_EEE_ADV) != 0
+            || ModelRegs::get(&m.ocp, OCP_EEE_ADV2) != 0
+        {
+            return TestResult::Fail("VER_10 must leave EEE disabled");
+        }
+        if ModelRegs::get(&m.sram, SRAM_GREEN_CFG) != GREEN_ETH_EN {
+            return TestResult::Fail("VER_10 green-mode end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, 0xA428) != 0 || ModelRegs::get(&m.ocp, 0xA5EA) != 0 {
+            return TestResult::Fail("VER_10 lite-mode clears wrong");
+        }
+        if ModelRegs::get(&m.sram, 0x819F) != 0xDDB6 || ModelRegs::get(&m.ocp, 0xBC34) != 0x5555 {
+            return TestResult::Fail("VER_10 arm end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_POWER_CFG) != POWER_CFG_EN_ALDPS {
+            return TestResult::Fail("VER_10 POWER_CFG end state wrong");
+        }
+        if ModelRegs::get(&m.usb, USB_U2P3_CTRL) != U2P3_ENABLE {
+            return TestResult::Fail("VER_10 must enable U2P3");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_ver10_conversation);
+
+    fn smoke_r8152_phy_init_ver11_conversation() -> TestResult {
+        // VER_11 (RTL8156): EEE re-enabled with the 2.5G
+        // advertisement, ADC Ibias cal, thermal sensor, 2.5G
+        // force-mode interrupt. The MDI swap is skipped here
+        // (no MID_REVERSE reported); the swap itself is covered
+        // by the dedicated test below.
+        let mut m = ModelRegs::new();
+        ModelRegs::set(&mut m.ocp, 0xA428, 0x0200);
+        ModelRegs::set(&mut m.ocp, 0xA5EA, 0x0001);
+        for op in phy_init_ops(RtlVersion::Ver11) {
+            m.apply(op);
+        }
+        if m.fw_steps != 1 {
+            return TestResult::Fail("VER_11 conversation must carry one firmware step");
+        }
+        if ModelRegs::get(&m.pla, PLA_EEE_CR) != EEE_CR_RX_EN | EEE_CR_TX_EN
+            || ModelRegs::get(&m.ocp, OCP_EEE_CFG) != EEE_CFG_EEE10_EN
+            || ModelRegs::get(&m.ocp, OCP_EEE_ADV) != EEE_ADV_8153
+            || ModelRegs::get(&m.ocp, OCP_EEE_ADV2) != MDIO_EEE_2_5GT
+        {
+            return TestResult::Fail("VER_11 EEE end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, 0xD068) != 0x2000 {
+            return TestResult::Fail("VER_11 ADC Ibias cal end state wrong");
+        }
+        if ModelRegs::get(&m.sram, 0x81A2) != 0
+            || ModelRegs::get(&m.ocp, 0xB54C) != 0xDB00
+            || ModelRegs::get(&m.ocp, 0xA454) != 0
+            || ModelRegs::get(&m.ocp, OCP_10GBT_CTRL) != CTRL_10GBT_ADV2_5G_F_R
+            || ModelRegs::get(&m.ocp, OCP_INTR_EN) != INTR_EN_SPEED_FORCE
+        {
+            return TestResult::Fail("VER_11 arm end state wrong");
+        }
+        if ModelRegs::get(&m.pla, PLA_EEE_TXTWSYS_2P5G) != 0x0056 {
+            return TestResult::Fail("VER_11 EEE TX window end state wrong");
+        }
+        if ModelRegs::get(&m.pla, PLA_USB_CFG) != USB_CFG_EN_XG_LIP | USB_CFG_EN_G_LIP {
+            return TestResult::Fail("VER_11 USB_CFG end state wrong");
+        }
+        if ModelRegs::get(&m.sram2, 0x80A2) != 0x0153 || ModelRegs::get(&m.sram2, 0x809C) != 0x0153
+        {
+            return TestResult::Fail("VER_11 AAGC end state wrong");
+        }
+        if ModelRegs::get(&m.usb, USB_U2P3_CTRL) != U2P3_ENABLE {
+            return TestResult::Fail("VER_11 must enable U2P3");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_ver11_conversation);
+
+    fn smoke_r8152_phy_init_mdi_swap() -> TestResult {
+        // The MDI swap alone, with reversed lanes reported and
+        // distinct break-point pairs preloaded: the 0xbd5a/0xbd5c
+        // and 0xbc18/0xbc1a pairs must exchange their low halves.
+        let mut m = ModelRegs::new();
+        ModelRegs::set(&mut m.usb, USB_UPS_CFG, UPS_CFG_MID_REVERSE);
+        ModelRegs::set(&mut m.ocp, 0xD068, 0x0002);
+        ModelRegs::set(&mut m.ocp, 0xBD5A, 0x1111);
+        ModelRegs::set(&mut m.ocp, 0xBD5C, 0x2222);
+        ModelRegs::set(&mut m.ocp, 0xBC18, 0x3333);
+        ModelRegs::set(&mut m.ocp, 0xBC1A, 0x4444);
+        m.apply(PhyInitOp::MdiSwapIfReversed);
+        if ModelRegs::get(&m.ocp, 0xBD5A) != 0x0202 || ModelRegs::get(&m.ocp, 0xBD5C) != 0x3131 {
+            return TestResult::Fail("MDI swap 0xbd5a/0xbd5c pair wrong");
+        }
+        if ModelRegs::get(&m.ocp, 0xBC18) != 0x2424 || ModelRegs::get(&m.ocp, 0xBC1A) != 0x5353 {
+            return TestResult::Fail("MDI swap 0xbc18/0xbc1a pair wrong");
+        }
+        // Without MID_REVERSE the swap is a no-op.
+        let mut m2 = ModelRegs::new();
+        ModelRegs::set(&mut m2.ocp, 0xD068, 0x0002);
+        ModelRegs::set(&mut m2.ocp, 0xBD5A, 0x1111);
+        ModelRegs::set(&mut m2.ocp, 0xBD5C, 0x2222);
+        m2.apply(PhyInitOp::MdiSwapIfReversed);
+        if ModelRegs::get(&m2.ocp, 0xBD5A) != 0x1111 || ModelRegs::get(&m2.ocp, 0xBD5C) != 0x2222 {
+            return TestResult::Fail("MDI swap must not run without MID_REVERSE");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_mdi_swap);
+
+    fn smoke_r8152_phy_init_ver12_conversation() -> TestResult {
+        // VER_12 (RTL8156B): version pre-switch, green
+        // table/PGA arm, patch-gated register block, EEE
+        // re-enable with 2.5G, U2P3.
+        let mut m = ModelRegs::new();
+        for op in phy_init_ops(RtlVersion::Ver12) {
+            m.apply(op);
+        }
+        if m.fw_steps != 1 {
+            return TestResult::Fail("VER_12 conversation must carry one firmware step");
+        }
+        if ModelRegs::get(&m.ocp, 0xBF86) != 0x9000
+            || ModelRegs::get(&m.ocp, 0xC402) != 0
+            || ModelRegs::get(&m.ocp, 0xBD86) != 0x1010
+            || ModelRegs::get(&m.ocp, 0xBD88) != 0x1010
+            || ModelRegs::get(&m.ocp, 0xBD4E) != 0x0800
+            || ModelRegs::get(&m.ocp, 0xBF46) != 0x0700
+        {
+            return TestResult::Fail("VER_12 pre-switch end state wrong");
+        }
+        if ModelRegs::get(&m.sram2, 0x8560) != 0x19CC
+            || ModelRegs::get(&m.sram2, 0x80D6) != 0x2801
+            || ModelRegs::get(&m.sram2, 0x80F4) != 0x6077
+            || ModelRegs::get(&m.sram, 0x816C) != 0xC4A0
+            || ModelRegs::get(&m.sram, 0x817C) != 0x0719
+        {
+            return TestResult::Fail("VER_12 arm end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, 0xBFA0) != 0xD70D
+            || ModelRegs::get(&m.ocp, 0xBFA2) != 0x4100
+            || ModelRegs::get(&m.ocp, 0xBFA4) != 0xE848
+            || ModelRegs::get(&m.ocp, 0xBFA6) != 0xDC59
+            || ModelRegs::get(&m.ocp, 0xB54C) != 0x3C18
+            || ModelRegs::get(&m.sram, 0x817D) != 0x1000
+        {
+            return TestResult::Fail("VER_12 patch-block end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_INTR_EN) != INTR_EN_SPEED_FORCE
+            || ModelRegs::get(&m.ocp, OCP_EEE_ADV) != EEE_ADV_8153
+            || ModelRegs::get(&m.ocp, OCP_EEE_ADV2) != MDIO_EEE_2_5GT
+            || ModelRegs::get(&m.ocp, OCP_POWER_CFG) != POWER_CFG_EN_ALDPS
+        {
+            return TestResult::Fail("VER_12 tail end state wrong");
+        }
+        if ModelRegs::get(&m.usb, USB_U2P3_CTRL) != U2P3_ENABLE {
+            return TestResult::Fail("VER_12 must enable U2P3");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_ver12_conversation);
+
+    fn smoke_r8152_phy_init_ver13_conversation() -> TestResult {
+        // VER_13 (RTL8156B): the 2.5G INRX arm on top of the
+        // VER_15 arm, flash wait first.
+        let mut m = ModelRegs::new();
+        for op in phy_init_ops(RtlVersion::Ver13) {
+            m.apply(op);
+        }
+        if m.fw_steps != 1 {
+            return TestResult::Fail("VER_13 conversation must carry one firmware step");
+        }
+        if !phy_init_ops(RtlVersion::Ver13).contains(&PhyInitOp::WaitLoadingFlash) {
+            return TestResult::Fail("VER_13 table must wait for flash load");
+        }
+        if ModelRegs::get(&m.ocp, 0xAC46) != 0x0090 || ModelRegs::get(&m.ocp, 0xAD30) != 0x0001 {
+            return TestResult::Fail("VER_13 INRX arm end state wrong");
+        }
+        if ModelRegs::get(&m.sram2, 0x80F5) != 0x760E
+            || ModelRegs::get(&m.sram2, 0x8107) != 0x360E
+            || ModelRegs::get(&m.ocp, 0xBF00) != 0xA000
+            || ModelRegs::get(&m.sram, 0x8044) != 0x2417
+            || ModelRegs::get(&m.sram, 0x807A) != 0x2417
+            || ModelRegs::get(&m.ocp, 0xBF84) != 0xA000
+        {
+            return TestResult::Fail("VER_13 shared arm end state wrong");
+        }
+        if ModelRegs::get(&m.usb, USB_U2P3_CTRL) != U2P3_ENABLE {
+            return TestResult::Fail("VER_13 must enable U2P3");
+        }
+        // VER_15 is VER_13 without the two INRX steps.
+        if phy_init_ops(RtlVersion::Ver15).len() != phy_init_ops(RtlVersion::Ver13).len() - 2 {
+            return TestResult::Fail("VER_15 table must be VER_13 minus the INRX steps");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_ver13_conversation);
+
+    fn smoke_r8152_phy_init_ver16_conversation() -> TestResult {
+        // VER_16 (RTL8157): flash wait, BMCR power-down
+        // test-and-clear, PFM mode (PHY_PWR switch cleared),
+        // burst tables, patch-gated Advance EEE, no U2P3.
+        let mut m = ModelRegs::new();
+        ModelRegs::set(&mut m.pla, PLA_PHY_PWR, PHY_PWR_PFM_PWM_SWITCH);
+        ModelRegs::set(&mut m.mdio, OCP_BASE_MII + MII_BMCR * 2, BMCR_PDOWN);
+        ModelRegs::set(&mut m.ocp, 0xA44A, 0x0004);
+        for op in phy_init_ops(RtlVersion::Ver16) {
+            m.apply(op);
+        }
+        if m.fw_steps != 1 {
+            return TestResult::Fail("VER_16 conversation must carry one firmware step");
+        }
+        if !phy_init_ops(RtlVersion::Ver16).contains(&PhyInitOp::WaitLoadingFlash) {
+            return TestResult::Fail("VER_16 table must wait for flash load");
+        }
+        if ModelRegs::get(&m.mdio, OCP_BASE_MII + MII_BMCR * 2) != 0 {
+            return TestResult::Fail("VER_16 must clear BMCR power-down");
+        }
+        if ModelRegs::get(&m.pla, PLA_PHY_PWR) != 0 {
+            return TestResult::Fail("VER_16 must clear the PFM/PWM switch (PFM mode)");
+        }
+        if ModelRegs::get(&m.ocp, OCP_POWER_CFG)
+            != 0x0003 | POWER_CFG_EEE_CLKDIV_EN | POWER_CFG_EN_ALDPS
+        {
+            return TestResult::Fail("VER_16 POWER_CFG end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, 0xA44A) != 0 {
+            return TestResult::Fail("VER_16 must clear the ALDPS force-mode bit");
+        }
+        if ModelRegs::get(&m.sram, 0x8183) != 0x5900
+            || ModelRegs::get(&m.ocp, 0xA654) != 0x0800
+            || ModelRegs::get(&m.ocp, 0xB648) != 0x4040
+            || ModelRegs::get(&m.sram2, 0x8647) != 0xE600
+        {
+            return TestResult::Fail("VER_16 arm end state wrong");
+        }
+        // Burst tables: the 6-word block at 0x8f9c, the 9-word
+        // block at 0x8566, the 20-word RFI blocks at 0x82c8 and
+        // 0x82a0.
+        if ModelRegs::get(&m.sram, 0x8F9C) != 0x0005
+            || ModelRegs::get(&m.sram, 0x8FA0) != 0x00ED
+            || ModelRegs::get(&m.sram, 0x8FA6) != 0xD401
+            || ModelRegs::get(&m.sram, 0x8566) != 0x003F
+            || ModelRegs::get(&m.sram, 0x8568) != 0x3F02
+            || ModelRegs::get(&m.sram, 0x856E) != 0x0000
+        {
+            return TestResult::Fail("VER_16 SRAM burst end state wrong");
+        }
+        if ModelRegs::get(&m.sram2, 0x82C8) != 0x03ED
+            || ModelRegs::get(&m.sram2, 0x82CE) != 0x03FE
+            || ModelRegs::get(&m.sram2, 0x82D2) != 0x0021
+            || ModelRegs::get(&m.sram2, 0x82EE) != 0x03ED
+            || ModelRegs::get(&m.sram2, 0x82A0) != 0x000E
+            || ModelRegs::get(&m.sram2, 0x82AA) != 0x03F1
+            || ModelRegs::get(&m.sram2, 0x82C6) != 0x03F1
+        {
+            return TestResult::Fail("VER_16 SRAM2 burst end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_DOWN_SPEED) != DOWN_SPEED_EN_10M_CLKDIV
+            || ModelRegs::get(&m.ocp, OCP_EEE_ADV) != EEE_ADV_8153
+            || ModelRegs::get(&m.ocp, OCP_EEE_ADV2) != MDIO_EEE_2_5GT | MDIO_EEE_5GT
+            || ModelRegs::get(&m.sram, SRAM_GREEN_CFG) != GREEN_ETH_EN
+        {
+            return TestResult::Fail("VER_16 tail end state wrong");
+        }
+        if ModelRegs::get(&m.usb, USB_U2P3_CTRL) != 0 {
+            return TestResult::Fail("VER_16 must not enable U2P3");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_ver16_conversation);
+
+    fn smoke_r8152_phy_init_ver17_conversation() -> TestResult {
+        // VER_17 (RTL8157): 10G advertisement, PBO table,
+        // thermal sensor, cable-test patch, no U2P3.
+        let mut m = ModelRegs::new();
+        ModelRegs::set(&mut m.pla, 0xD3C8, 0x0001);
+        for op in phy_init_ops(RtlVersion::Ver17) {
+            m.apply(op);
+        }
+        if m.fw_steps != 1 {
+            return TestResult::Fail("VER_17 conversation must carry one firmware step");
+        }
+        if ModelRegs::get(&m.pla, 0xD3C8) != 0 {
+            return TestResult::Fail("VER_17 must clear the ALDPS clock-bypass bit");
+        }
+        if ModelRegs::get(&m.sram, 0x8415) != 0x9300
+            || ModelRegs::get(&m.sram, 0x81A3) != 0x0F00
+            || ModelRegs::get(&m.sram, 0x81B9) != 0xB900
+            || ModelRegs::get(&m.sram, 0x8173) != 0x8620
+        {
+            return TestResult::Fail("VER_17 power-level end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, 0xAE20) != 0xFFFF
+            || ModelRegs::get(&m.ocp, 0xAEC6) != 0
+            || ModelRegs::get(&m.ocp, 0xADB8) != 0x0150
+        {
+            return TestResult::Fail("VER_17 RFI end state wrong");
+        }
+        if ModelRegs::get(&m.sram2, 0x8647) != 0xA7B1
+            || ModelRegs::get(&m.sram2, 0x8649) != 0xBBCA
+            || ModelRegs::get(&m.sram2, 0x826C) != 0xFFFF
+            || ModelRegs::get(&m.sram2, 0x826E) != 0xFFFF
+        {
+            return TestResult::Fail("VER_17 PBO end state wrong");
+        }
+        if ModelRegs::get(&m.sram, 0x81C4) != 0x003B
+            || ModelRegs::get(&m.sram, 0x81C6) != 0x0086
+            || ModelRegs::get(&m.sram, 0x81DA) != 0x0023
+        {
+            return TestResult::Fail("VER_17 shape-table burst end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, 0xBFB4) != 0x0328
+            || ModelRegs::get(&m.ocp, 0xBFB6) != 0x3E14
+            || ModelRegs::get(&m.ocp, OCP_EEE_ADV) != EEE_ADV_8157
+            || ModelRegs::get(&m.ocp, OCP_EEE_ADV2) != MDIO_EEE_2_5GT | MDIO_EEE_5GT
+        {
+            return TestResult::Fail("VER_17 tail end state wrong");
+        }
+        if ModelRegs::get(&m.usb, USB_U2P3_CTRL) != 0 {
+            return TestResult::Fail("VER_17 must not enable U2P3");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_ver17_conversation);
+
+    /// Minimal firmware-image builder for the `check_firmware`
+    /// tests. Images are built from the Linux struct layouts
+    /// with literal field values from `r8152.c` — never the
+    /// implementation's constants, so a wrong constant cannot
+    /// make code and fixture agree — and the SHA-256 header
+    /// checksum is computed by the same implementation the
+    /// loader uses. Each block is padded to an 8-byte boundary,
+    /// as the loader's `ALIGN(length, 8)` advance requires.
+    struct FwTestImage {
+        bytes: Vec<u8>,
+    }
+
+    impl FwTestImage {
+        fn new(version: &str) -> Self {
+            let mut bytes = alloc::vec![0u8; 64];
+            let v = version.as_bytes();
+            let n = core::cmp::min(v.len(), 31);
+            bytes[32..32 + n].copy_from_slice(&v[..n]);
+            Self { bytes }
+        }
+        /// Append a block: `type` + `length` header, `body`
+        /// bytes, zero padding to an 8-byte boundary.
+        fn block(&mut self, ty: u32, body: &[u8]) {
+            let len = 8 + body.len();
+            self.bytes.extend_from_slice(&ty.to_le_bytes());
+            self.bytes.extend_from_slice(&(len as u32).to_le_bytes());
+            self.bytes.extend_from_slice(body);
+            while self.bytes.len() % 8 != 0 {
+                self.bytes.push(0);
+            }
+        }
+        /// Append a block with an explicit (possibly lying)
+        /// length field, for invalid-image tests.
+        fn block_with_len(&mut self, ty: u32, len: u32, body: &[u8]) {
+            self.bytes.extend_from_slice(&ty.to_le_bytes());
+            self.bytes.extend_from_slice(&len.to_le_bytes());
+            self.bytes.extend_from_slice(body);
+            while self.bytes.len() % 8 != 0 {
+                self.bytes.push(0);
+            }
+        }
+        fn finish(mut self) -> Vec<u8> {
+            let mut h = narf_crypto::sha256::Sha256::new();
+            h.update(&self.bytes[32..]);
+            let sum = h.finalize();
+            self.bytes[..32].copy_from_slice(&sum);
+            self.bytes
+        }
+    }
+
+    /// Recompute the header checksum of a mutated test image
+    /// in place, so a mutation trips its own check rather than
+    /// `BadChecksum`.
+    fn resign_fw(img: &mut [u8]) {
+        let mut h = narf_crypto::sha256::Sha256::new();
+        h.update(&img[32..]);
+        let sum = h.finalize();
+        img[..32].copy_from_slice(&sum);
+    }
+
+    fn put_u16(buf: &mut [u8], off: usize, v: u16) {
+        buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// `fw_mac` body (55 bytes after the block header):
+    /// fw_offset, fw_reg, bp_ba_addr, bp_ba_value, bp_en_addr,
+    /// bp_en_value, bp_start, bp_num, bp[16], reserved,
+    /// fw_ver_reg, fw_ver_data — then `data_len` bytes of
+    /// firmware data.
+    fn fw_mac_body(
+        fw_offset: u16,
+        fw_reg: u16,
+        bp_ba: u16,
+        bp_en: u16,
+        bp_start: u16,
+        bp_num: u16,
+        data_len: usize,
+    ) -> Vec<u8> {
+        let mut b = alloc::vec![0u8; 55 + data_len];
+        put_u16(&mut b, 0, fw_offset);
+        put_u16(&mut b, 2, fw_reg);
+        put_u16(&mut b, 4, bp_ba);
+        put_u16(&mut b, 8, bp_en);
+        put_u16(&mut b, 12, bp_start);
+        put_u16(&mut b, 14, bp_num);
+        b
+    }
+
+    /// `fw_phy_nc` body (32 bytes after the block header):
+    /// fw_offset, fw_reg, ba_reg, ba_data, patch_en_addr,
+    /// patch_en_value, mode_reg, mode_pre, mode_post, reserved,
+    /// bp_start, bp_num, bp[4] — then `data_len` bytes.
+    fn fw_phy_nc_body(data_len: usize) -> Vec<u8> {
+        let mut b = alloc::vec![0u8; 32 + data_len];
+        put_u16(&mut b, 0, 40); // fw_offset
+        put_u16(&mut b, 2, 0xA014); // fw_reg
+        put_u16(&mut b, 4, 0xA012); // ba_reg
+        put_u16(&mut b, 8, 0xA01A); // patch_en_addr
+        put_u16(&mut b, 12, 0xB820); // mode_reg
+        put_u16(&mut b, 20, 0xA000); // bp_start
+        b
+    }
+
+    /// `fw_phy_union` body (50 bytes after the block header):
+    /// fw_offset, fw_reg, pre_set[2], bp[8], bp_en, pre_num,
+    /// bp_num — then `data_len` bytes.
+    fn fw_phy_union_body(data_len: usize) -> Vec<u8> {
+        let mut b = alloc::vec![0u8; 50 + data_len];
+        put_u16(&mut b, 0, 58); // fw_offset
+                                // pre_num (byte 48) and bp_num (byte 49) stay zero.
+        b
+    }
+
+    /// Valid VER_04 image (mirrors the real rtl8153a-2.fw block
+    /// order): PHY_START, PHY_NC, PHY_STOP, USB, PLA, END.
+    /// Layout: header 0..64; PHY_START 64..80; PHY_NC 80..180
+    /// (len 100, padded to 184); PHY_STOP 184..192; USB
+    /// 192..259 (len 67, padded to 264); PLA 264..331 (len 67,
+    /// padded to 336); END 336..344.
+    fn valid_ver04_image() -> Vec<u8> {
+        let mut img = FwTestImage::new("rtl8153a-2 v1 10/23/19");
+        img.block(3, &[0u8; 8]); // PHY_START (patch key)
+        img.block(5, &fw_phy_nc_body(60)); // PHY_NC
+        img.block(4, &[]); // PHY_STOP
+        img.block(2, &fw_mac_body(63, 0xF800, 0xFC26, 0xFC38, 0xFC28, 0, 4)); // USB
+        img.block(1, &fw_mac_body(63, 0xF800, 0xFC26, 0xFC38, 0xFC28, 0, 4)); // PLA
+        img.block(0, &[]); // END
+        img.finish()
+    }
+
+    /// Valid VER_11 image (mirrors the real rtl8156a-2.fw block
+    /// order, subset): USB, PLA, PHY_VER, PHY_START, UNION_NC,
+    /// PHY_STOP, END.
+    fn valid_ver11_image() -> Vec<u8> {
+        let mut img = FwTestImage::new("rtl8156a-2 v2 04/27/23");
+        img.block(2, &fw_mac_body(63, 0xE600, 0xFC26, 0xFC48, 0xFC28, 0, 4)); // USB
+        img.block(1, &fw_mac_body(63, 0xF800, 0xFC26, 0xFC38, 0xFC28, 0, 4)); // PLA
+        let mut ver = [0u8; 8];
+        put_u16(&mut ver, 0, 0x801E); // ver.addr = SRAM_GPHY_FW_VER
+        put_u16(&mut ver, 2, 0x0102); // ver.data
+        img.block(14, &ver); // PHY_VER
+        img.block(3, &[0u8; 8]); // PHY_START
+        img.block(7, &fw_phy_union_body(2)); // UNION_NC
+        img.block(4, &[]); // PHY_STOP
+        img.block(0, &[]); // END
+        img.finish()
+    }
+
+    fn smoke_r8152_firmware_name_for() -> TestResult {
+        let cases = [
+            (RtlVersion::Ver04, Some("rtl_nic/rtl8153a-2.fw")),
+            (RtlVersion::Ver05, Some("rtl_nic/rtl8153a-3.fw")),
+            (RtlVersion::Ver06, Some("rtl_nic/rtl8153a-4.fw")),
+            (RtlVersion::Ver09, Some("rtl_nic/rtl8153b-2.fw")),
+            (RtlVersion::Ver11, Some("rtl_nic/rtl8156a-2.fw")),
+            (RtlVersion::Ver13, Some("rtl_nic/rtl8156b-2.fw")),
+            (RtlVersion::Ver15, Some("rtl_nic/rtl8156b-2.fw")),
+            (RtlVersion::Ver14, Some("rtl_nic/rtl8153c-1.fw")),
+            (RtlVersion::Ver16, Some("rtl_nic/rtl8157-1.fw")),
+            (RtlVersion::Ver17, Some("rtl_nic/rtl8159-1.fw")),
+        ];
+        for (version, want) in cases {
+            if firmware_name_for(version) != want {
+                return TestResult::Fail("firmware_name_for mapping wrong");
+            }
+        }
+        for version in [
+            RtlVersion::Ver01,
+            RtlVersion::Ver02,
+            RtlVersion::Ver03,
+            RtlVersion::Ver07,
+            RtlVersion::Ver08,
+            RtlVersion::Ver10,
+            RtlVersion::Ver12,
+            RtlVersion::Test01,
+            RtlVersion::Unknown,
+        ] {
+            if firmware_name_for(version).is_some() {
+                return TestResult::Fail("version without a file must map to None");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_firmware_name_for);
+
+    fn smoke_r8152_firmware_checksum() -> TestResult {
+        let img = valid_ver04_image();
+        if !fw_checksum_ok(&img) {
+            return TestResult::Fail("valid image must pass the checksum");
+        }
+        if firmware_version(&img) != "rtl8153a-2 v1 10/23/19" {
+            return TestResult::Fail("firmware_version must return the header string");
+        }
+        // Corrupt one version byte: checksum fails.
+        let mut bad = img.clone();
+        bad[40] ^= 0xFF;
+        if fw_checksum_ok(&bad) {
+            return TestResult::Fail("corrupted version field must fail the checksum");
+        }
+        // Corrupt one firmware byte: checksum fails.
+        let mut bad = img.clone();
+        bad[100] ^= 0xFF;
+        if fw_checksum_ok(&bad) {
+            return TestResult::Fail("corrupted firmware byte must fail the checksum");
+        }
+        if fw_checksum_ok(&[]) || fw_checksum_ok(&img[..63]) {
+            return TestResult::Fail("short image must fail the checksum");
+        }
+        if !firmware_version(&[]).is_empty() || !firmware_version(&img[..63]).is_empty() {
+            return TestResult::Fail("short image must have no version string");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_firmware_checksum);
+
+    fn smoke_r8152_firmware_check_valid() -> TestResult {
+        if check_firmware(RtlVersion::Ver04, &valid_ver04_image()) != Ok(()) {
+            return TestResult::Fail("valid VER_04 image rejected");
+        }
+        if check_firmware(RtlVersion::Ver11, &valid_ver11_image()) != Ok(()) {
+            return TestResult::Fail("valid VER_11 image rejected");
+        }
+        // VER_16: SPEED_UP only, then END.
+        let mut img = FwTestImage::new("rtl8157-1 v1 01/01/25");
+        let mut speed = [0u8; 8];
+        put_u16(&mut speed, 0, 16); // fw_offset
+        put_u16(&mut speed, 2, 1); // version
+        put_u16(&mut speed, 4, 0x9A00); // fw_reg
+        let mut body = speed.to_vec();
+        body.extend_from_slice(&[0u8; 4]);
+        img.block(13, &body); // SPEED_UP, len 20
+        img.block(0, &[]); // END
+        if check_firmware(RtlVersion::Ver16, &img.finish()) != Ok(()) {
+            return TestResult::Fail("valid VER_16 SPEED_UP image rejected");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_firmware_check_valid);
+
+    fn smoke_r8152_firmware_check_invalid() -> TestResult {
+        // Too small.
+        if check_firmware(RtlVersion::Ver04, &valid_ver04_image()[..63]) != Err(FwError::TooSmall) {
+            return TestResult::Fail("short image must be TooSmall");
+        }
+        // Bad checksum.
+        let mut img = valid_ver04_image();
+        img[40] ^= 0xFF;
+        if check_firmware(RtlVersion::Ver04, &img) != Err(FwError::BadChecksum) {
+            return TestResult::Fail("corrupted image must be BadChecksum");
+        }
+        // Zero-length block (Linux would loop forever here).
+        let mut img = FwTestImage::new("test");
+        img.block_with_len(1, 0, &[]);
+        if check_firmware(RtlVersion::Ver04, &img.finish()) != Err(FwError::ZeroLength) {
+            return TestResult::Fail("zero-length block must be ZeroLength");
+        }
+        // Truncated block: length runs past the end.
+        let mut img = FwTestImage::new("test");
+        img.block_with_len(1, 1000, &[0u8; 8]);
+        if check_firmware(RtlVersion::Ver04, &img.finish()) != Err(FwError::Truncated) {
+            return TestResult::Fail("overlong block must be Truncated");
+        }
+        // END with length != 8.
+        let mut img = FwTestImage::new("test");
+        img.block_with_len(0, 9, &[0u8; 1]);
+        if check_firmware(RtlVersion::Ver04, &img.finish()) != Err(FwError::BadLength) {
+            return TestResult::Fail("END length != 8 must be BadLength");
+        }
+        // Duplicate PLA.
+        let mut img = FwTestImage::new("test");
+        img.block(1, &fw_mac_body(63, 0xF800, 0xFC26, 0xFC38, 0xFC28, 0, 4));
+        img.block(1, &fw_mac_body(63, 0xF800, 0xFC26, 0xFC38, 0xFC28, 0, 4));
+        img.block(0, &[]);
+        if check_firmware(RtlVersion::Ver04, &img.finish()) != Err(FwError::Duplicate) {
+            return TestResult::Fail("duplicate PLA must be Duplicate");
+        }
+        // STOP without START.
+        let mut img = FwTestImage::new("test");
+        img.block(4, &[]);
+        img.block(0, &[]);
+        if check_firmware(RtlVersion::Ver04, &img.finish()) != Err(FwError::OutOfOrder) {
+            return TestResult::Fail("STOP without START must be OutOfOrder");
+        }
+        // START without STOP.
+        let mut img = FwTestImage::new("test");
+        img.block(3, &[0u8; 8]);
+        img.block(0, &[]);
+        if check_firmware(RtlVersion::Ver04, &img.finish()) != Err(FwError::UnpairedStart) {
+            return TestResult::Fail("START without STOP must be UnpairedStart");
+        }
+        // USB block with the wrong fw_reg.
+        let mut img = valid_ver04_image();
+        put_u16(&mut img, 202, 0x0000);
+        resign_fw(&mut img);
+        if check_firmware(RtlVersion::Ver04, &img) != Err(FwError::InvalidBlock) {
+            return TestResult::Fail("USB block with wrong fw_reg must be InvalidBlock");
+        }
+        // PHY_NC block with the wrong fw_reg.
+        let mut img = valid_ver04_image();
+        put_u16(&mut img, 90, 0x0000);
+        resign_fw(&mut img);
+        if check_firmware(RtlVersion::Ver04, &img) != Err(FwError::InvalidBlock) {
+            return TestResult::Fail("PHY_NC block with wrong fw_reg must be InvalidBlock");
+        }
+        // UNION_NC is not valid for VER_04.
+        let mut img = FwTestImage::new("test");
+        img.block(3, &[0u8; 8]);
+        img.block(7, &fw_phy_union_body(2));
+        img.block(4, &[]);
+        img.block(0, &[]);
+        if check_firmware(RtlVersion::Ver04, &img.finish()) != Err(FwError::InvalidBlock) {
+            return TestResult::Fail("UNION_NC on VER_04 must be InvalidBlock");
+        }
+        // SPEED_UP is not valid for VER_04.
+        let mut img = FwTestImage::new("test");
+        let mut speed = [0u8; 8];
+        put_u16(&mut speed, 0, 16);
+        put_u16(&mut speed, 2, 1);
+        put_u16(&mut speed, 4, 0x9A00);
+        let mut body = speed.to_vec();
+        body.extend_from_slice(&[0u8; 4]);
+        img.block(13, &body);
+        img.block(0, &[]);
+        if check_firmware(RtlVersion::Ver04, &img.finish()) != Err(FwError::InvalidBlock) {
+            return TestResult::Fail("SPEED_UP on VER_04 must be InvalidBlock");
+        }
+        // PHY_VER with the wrong address.
+        let mut img = FwTestImage::new("test");
+        let mut ver = [0u8; 8];
+        put_u16(&mut ver, 0, 0x0000);
+        put_u16(&mut ver, 2, 0x0102);
+        img.block(14, &ver);
+        img.block(0, &[]);
+        if check_firmware(RtlVersion::Ver11, &img.finish()) != Err(FwError::InvalidBlock) {
+            return TestResult::Fail("PHY_VER with wrong addr must be InvalidBlock");
+        }
+        // PHY_VER after START is out of order.
+        let mut img = FwTestImage::new("test");
+        img.block(3, &[0u8; 8]);
+        let mut ver = [0u8; 8];
+        put_u16(&mut ver, 0, 0x801E);
+        put_u16(&mut ver, 2, 0x0102);
+        img.block(14, &ver);
+        img.block(4, &[]);
+        img.block(0, &[]);
+        if check_firmware(RtlVersion::Ver11, &img.finish()) != Err(FwError::OutOfOrder) {
+            return TestResult::Fail("PHY_VER after START must be OutOfOrder");
+        }
+        // FIXUP with the wrong setting address.
+        let mut img = FwTestImage::new("test");
+        let mut fix = [0u8; 8];
+        put_u16(&mut fix, 0, 0x0000);
+        put_u16(&mut fix, 2, 0x0080);
+        img.block(6, &fix);
+        img.block(0, &[]);
+        if check_firmware(RtlVersion::Ver11, &img.finish()) != Err(FwError::InvalidBlock) {
+            return TestResult::Fail("FIXUP with wrong addr must be InvalidBlock");
+        }
+        // PLA block is not valid for VER_16.
+        let mut img = FwTestImage::new("test");
+        img.block(1, &fw_mac_body(63, 0xF800, 0xFC26, 0xFC38, 0xFC28, 0, 4));
+        img.block(0, &[]);
+        if check_firmware(RtlVersion::Ver16, &img.finish()) != Err(FwError::InvalidBlock) {
+            return TestResult::Fail("PLA block on VER_16 must be InvalidBlock");
+        }
+        // Unknown block type is skipped.
+        let mut img = FwTestImage::new("test");
+        img.block(99, &[]);
+        img.block(0, &[]);
+        if check_firmware(RtlVersion::Ver04, &img.finish()) != Ok(()) {
+            return TestResult::Fail("unknown block type must be skipped");
+        }
+        // No END block at all, but START/STOP pair up: accepted,
+        // as in Linux.
+        let mut img = FwTestImage::new("test");
+        img.block(3, &[0u8; 8]);
+        img.block(4, &[]);
+        if check_firmware(RtlVersion::Ver04, &img.finish()) != Ok(()) {
+            return TestResult::Fail("missing END with paired START/STOP must be accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_firmware_check_invalid);
 
     fn ipv4_tcp_frame(payload_len: usize) -> Vec<u8> {
         let mut f = alloc::vec![0u8; 14 + 20 + 20 + payload_len];
