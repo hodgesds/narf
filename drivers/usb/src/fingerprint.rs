@@ -144,7 +144,12 @@ pub enum FpEndpoints {
 /// Walk a Configuration Descriptor for the first vendor-class (0xFF)
 /// interface and resolve endpoints appropriate for `vendor`.
 ///
-/// - Synaptics / Goodix / Validity: require bulk-IN + bulk-OUT.
+/// Resolution rule (#923 fixtures): the recorded interface number is
+/// the first matching interface, but endpoints accumulate only for the
+/// latest matching interface — each new matching interface resets the
+/// accumulated endpoints, so endpoints never resolve to an earlier HID
+/// or vendor interface.
+////// - Synaptics / Goodix / Validity: require bulk-IN + bulk-OUT.
 /// - ELAN: require interrupt-IN (may also have bulk pair; we take
 ///   interrupt-IN because that is the polling path libfprint uses).
 /// - WBDI (vendor unknown): prefer a bulk-IN + bulk-OUT pair — the
@@ -176,10 +181,17 @@ pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, Fp
             // Interface Descriptor (USB 2.0 §9.6.5) — bInterfaceClass at +5.
             4 if len >= 9 => {
                 in_match = cfg[i + 5] == 0xFF; // vendor class
-                if in_match && interface.is_none() {
-                    interface = Some(cfg[i + 2]);
-                    // Clear any endpoints accumulated for a prior
-                    // non-matching interface in a composite device.
+                if in_match {
+                    if interface.is_none() {
+                        interface = Some(cfg[i + 2]);
+                    }
+                    // A new matching interface resets endpoint
+                    // resolution: endpoints accumulate only for the
+                    // latest matching interface, so the second
+                    // matching interface wins the endpoints while
+                    // the recorded interface number stays the first
+                    // (#923 fixtures pin this — endpoints must never
+                    // resolve to an earlier HID or vendor interface).
                     bulk_in = None;
                     bulk_out = None;
                     intr_in = None;

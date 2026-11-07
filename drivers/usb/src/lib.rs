@@ -51,6 +51,8 @@ pub mod xpad;
 
 #[cfg(feature = "kernel-test")]
 mod e2e_tests;
+#[cfg(test)]
+mod host_test_shims;
 mod tests;
 
 /// Stage::Subsys initcalls for this driver crate.
