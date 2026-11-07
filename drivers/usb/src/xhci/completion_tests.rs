@@ -223,3 +223,105 @@ kernel_test_in!(
     "drivers/usb/xhci",
     smoke_xhci_command_receipts_clear_for_recovery
 );
+
+/// #884: a timed-out waiter retires its own receipt instead of
+/// leaking it. Fixture is built from the xHCI event format
+/// itself (§6.4.2.2: a Command Completion Event names its
+/// command TRB by pointer in dwords 0..1 with TRB type 33): the
+/// retire drops the reservation, the entry re-reserves, and a
+/// full small ring keeps turning over after a timeout instead
+/// of wedging with CmdRingFull at wrap.
+fn smoke_xhci_command_receipt_retires_on_timeout() -> TestResult {
+    let mut commands = Commands::new(2);
+    if commands.reserve(0, 0x3000, 5) != Ok(()) || !commands.active() {
+        return TestResult::Fail("receipt did not reserve");
+    }
+    if !commands.retire_pointer(0x3000) || commands.active() {
+        return TestResult::Fail("timeout retire left the receipt active");
+    }
+    if commands.reserve(0, 0x3000, 5) != Ok(()) {
+        return TestResult::Fail("retired entry did not reserve again");
+    }
+    // Retiring an unknown pointer, or one whose receipt was
+    // already consumed, is a no-op — never drops a live receipt.
+    if commands.retire_pointer(0x9999) {
+        return TestResult::Fail("retire claimed an unknown pointer");
+    }
+    commands.reserve(1, 0x3010, 5).unwrap();
+    commands.record(command(0x3010));
+    if commands.take_matching(&mut |_| true) != Ok(Some(command(0x3010))) {
+        return TestResult::Fail("consumed receipt did not release");
+    }
+    if commands.retire_pointer(0x3010) {
+        return TestResult::Fail("retire dropped an already-consumed receipt");
+    }
+    // The #884 wedge, in miniature: a 2-entry ring with one
+    // timed-out entry still accepts the next command at wrap.
+    let mut ring = Commands::new(2);
+    ring.reserve(0, 0x3000, 5).unwrap();
+    ring.reserve(1, 0x3010, 5).unwrap();
+    if ring.reserve(0, 0x3000, 5) != Err(Conflict) {
+        return TestResult::Fail("live entry was overwritten before retire");
+    }
+    ring.retire_pointer(0x3000);
+    if ring.reserve(0, 0x3000, 5) != Ok(()) {
+        return TestResult::Fail("ring wedged at wrap after timeout retire");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_command_receipt_retires_on_timeout
+);
+
+/// #884: a CCE that arrives after its waiter timed out is
+/// swallowed at the demux instead of landing in the lossy
+/// command-event queue, where it could be misattributed to the
+/// next command recycled onto the same ring entry. Once the
+/// entry is re-reserved the tombstone lifts, and the new
+/// command's own CCE latches normally.
+fn smoke_xhci_late_cce_after_retire_is_swallowed() -> TestResult {
+    let mut commands = Commands::new(1);
+    commands.reserve(0, 0x3000, 5).unwrap();
+    if !commands.retire_pointer(0x3000) {
+        return TestResult::Fail("retire did not drop the receipt");
+    }
+    if !commands.record(command(0x3000)) {
+        return TestResult::Fail("late CCE was not swallowed after retire");
+    }
+    if commands.active() || commands.take_matching(&mut |_| true) != Ok(None) {
+        return TestResult::Fail("swallowed CCE left a receipt behind");
+    }
+    if commands.reserve(0, 0x3000, 5) != Ok(()) {
+        return TestResult::Fail("retired entry did not reserve again");
+    }
+    commands.record(command(0x3000));
+    if commands.take_matching(&mut |_| true) != Ok(Some(command(0x3000))) {
+        return TestResult::Fail("re-reserved entry swallowed its own CCE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_late_cce_after_retire_is_swallowed
+);
+
+/// Recovery must drop the retired-pointer tombstones along with
+/// the receipts: ring pointers repeat after the cursors restart
+/// at zero, and a stale tombstone would swallow the recycled
+/// entry's own completion forever.
+fn smoke_xhci_clear_drops_retired_pointers() -> TestResult {
+    let mut commands = Commands::new(1);
+    commands.reserve(0, 0x3000, 5).unwrap();
+    commands.retire_pointer(0x3000);
+    commands.clear();
+    if commands.reserve(0, 0x3000, 5) != Ok(()) {
+        return TestResult::Fail("cleared entry did not reserve again");
+    }
+    commands.record(command(0x3000));
+    if commands.take_matching(&mut |_| true) != Ok(Some(command(0x3000))) {
+        return TestResult::Fail("stale tombstone swallowed a post-recovery CCE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/xhci", smoke_xhci_clear_drops_retired_pointers);

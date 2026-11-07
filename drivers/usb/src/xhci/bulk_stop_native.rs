@@ -73,7 +73,9 @@ impl Bus for Xhci {
         };
         let slot = (words[3] >> 24) as u8;
         let event = self
-            .await_event(|event| bulk_owner::command_matches(event, slot, command))
+            .await_command_event(command, |event| {
+                bulk_owner::command_matches(event, slot, command)
+            })
             .await?;
         let code = (event[2] >> 24) as u8;
         if code != 1 {
