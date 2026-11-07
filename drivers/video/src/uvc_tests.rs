@@ -792,3 +792,126 @@ fn smoke_uvc_control_routing_missing_unit() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/video/uvc", smoke_uvc_control_routing_missing_unit);
+
+// ── Smoke 17: descriptor-built control list (#809) ──────────────────
+//
+// The fixtures are built from the UVC spec's own bitmap tables
+// (§3.7.2.5 Table 3-9 PU, §3.7.2.3 Table 3-6 CT), never from the
+// implementation's constants: bit N advertises selector N+1.
+
+fn smoke_uvc_supported_controls_from_bitmaps() -> TestResult {
+    use crate::uvc::control::{supported_controls, ControlId};
+
+    // PU bitmap 0x5F (the uvc_tests PU smoke's own fixture bytes):
+    // bits 0,1,2,3,4,6 → backlight, brightness, contrast, gain,
+    // power-line frequency, saturation.
+    // CT bitmap 0x0E: bits 1,2,3 → AE mode, AE priority, exposure.
+    let ids = supported_controls(0x5F, 0x0E);
+    let expect = [
+        ControlId::Backlight,
+        ControlId::Brightness,
+        ControlId::Contrast,
+        ControlId::Gain,
+        ControlId::PowerLineFrequency,
+        ControlId::Saturation,
+        ControlId::AeMode,
+        ControlId::AePriority,
+        ControlId::ExposureTimeAbsolute,
+    ];
+    if ids != expect {
+        return TestResult::Fail("bitmap 0x5F/0x0E must map to the 9 spec controls");
+    }
+    // Bits with no V4L2 integer mapping are skipped, never advertised:
+    // PU bit 11 (white-balance component, a 4-byte two-field control),
+    // PU bit 13 (digital multiplier, no V4L2 CID), CT bit 0 (scanning
+    // mode, no V4L2 CID), CT bit 12 (pan/tilt absolute, 8 bytes).
+    let ids = supported_controls(1 << 11 | 1 << 13, 1 | 1 << 12);
+    if !ids.is_empty() {
+        return TestResult::Fail("unmapped bitmap bits must advertise no controls");
+    }
+    // Empty bitmaps → empty list: a descriptor-less device advertises
+    // nothing, it does not fall back to an invented table.
+    if !supported_controls(0, 0).is_empty() {
+        return TestResult::Fail("empty bitmaps must advertise no controls");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/video/uvc",
+    smoke_uvc_supported_controls_from_bitmaps
+);
+
+fn smoke_uvc_control_id_mappings_roundtrip() -> TestResult {
+    use crate::uvc::control::{supported_controls, ControlId};
+
+    // Every control the bitmaps can advertise round-trips through its
+    // V4L2 id and its (selector, is_ct) pair — the two mappings the
+    // bind path and the ioctl path respectively rely on.
+    for id in supported_controls(0xFFFF, 0x1FFFF) {
+        let v4l2 = id.v4l2_id();
+        if ControlId::from_v4l2_id(v4l2) != Some(id) {
+            return TestResult::Fail("V4L2 id must round-trip to the ControlId");
+        }
+        let (selector, is_ct) = id.selector_and_is_ct();
+        if ControlId::from_selector(selector, is_ct) != Some(id) {
+            return TestResult::Fail("selector pair must round-trip to the ControlId");
+        }
+        if id.name().is_empty() {
+            return TestResult::Fail("every control needs a QUERYCTRL name");
+        }
+    }
+    // Unknown V4L2 ids and selectors map to nothing.
+    if ControlId::from_v4l2_id(0xDEAD_BEEF).is_some() {
+        return TestResult::Fail("unknown V4L2 id must map to nothing");
+    }
+    if ControlId::from_selector(0x00, false).is_some()
+        || ControlId::from_selector(0x13, false).is_some()
+    {
+        return TestResult::Fail("out-of-range PU selector must map to nothing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video/uvc", smoke_uvc_control_id_mappings_roundtrip);
+
+fn smoke_uvc_control_value_codec() -> TestResult {
+    use crate::uvc::control::{decode_control_value, encode_control_value};
+
+    // 1-byte boolean/enum.
+    if decode_control_value(&[1]) != Some(1) || decode_control_value(&[0]) != Some(0) {
+        return TestResult::Fail("1-byte values must decode as the byte");
+    }
+    // 2-byte signed LE (brightness -64).
+    if decode_control_value(&[0xC0, 0xFF]) != Some(-64) {
+        return TestResult::Fail("2-byte values must decode as LE i16");
+    }
+    // 4-byte unsigned LE (exposure 10000), clamped into i32.
+    if decode_control_value(&[0x10, 0x27, 0x00, 0x00]) != Some(10_000) {
+        return TestResult::Fail("4-byte values must decode as LE u32");
+    }
+    if decode_control_value(&[0xFF, 0xFF, 0xFF, 0xFF]) != Some(i32::MAX) {
+        return TestResult::Fail("4-byte values above i32::MAX must clamp");
+    }
+    // Lengths with no single-integer mapping are rejected.
+    if decode_control_value(&[1, 2, 3]).is_some()
+        || decode_control_value(&[1, 2, 3, 4, 5, 6, 7, 8]).is_some()
+        || decode_control_value(&[]).is_some()
+    {
+        return TestResult::Fail("3/8/0-byte values must not decode");
+    }
+    // Encode round-trips the decode for every supported length.
+    let mut buf = [0u8; 4];
+    if !encode_control_value(1, 1, &mut buf) || buf[0] != 1 {
+        return TestResult::Fail("1-byte encode must write the byte");
+    }
+    if !encode_control_value(-64, 2, &mut buf) || buf[..2] != [0xC0, 0xFF] {
+        return TestResult::Fail("2-byte encode must write LE i16");
+    }
+    if !encode_control_value(10_000, 4, &mut buf) || buf != [0x10, 0x27, 0x00, 0x00] {
+        return TestResult::Fail("4-byte encode must write LE u32");
+    }
+    if encode_control_value(1, 3, &mut buf) || encode_control_value(1, 8, &mut buf) {
+        return TestResult::Fail("unsupported lengths must refuse to encode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/video/uvc", smoke_uvc_control_value_codec);
