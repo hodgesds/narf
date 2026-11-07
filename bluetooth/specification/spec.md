@@ -320,7 +320,14 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   per-pairing IO capability — any of the five §3.5.1 values, so
   MITM methods are reachable) returns Command Status now and
   Command Complete when the initiator session ends (SUCCESS /
-  AUTH_FAILED / DISCONNECTED); SET_IO_CAPABILITY stores the
+  AUTH_FAILED / DISCONNECTED / CANCELLED);
+  CANCEL_PAIR_DEVICE (issue #1528)
+  aborts an in-flight mgmt-started pairing via
+  `pump::smp_cancel_pairing` (Pairing Failed, Unspecified Reason,
+  Vol 3 Part H §3.5.5) and completes the pending PAIR_DEVICE
+  with CANCELLED — a cancel with no pending pairing for that
+  peer is INVALID_PARAMS, as in the kernel.
+  SET_IO_CAPABILITY stores the
   controller-wide IO capability used by responder pairings and
   Security-Request-triggered initiations. The MITM user flows run
   through mgmt: USER_CONFIRM_REQUEST / USER_PASSKEY_REQUEST /
