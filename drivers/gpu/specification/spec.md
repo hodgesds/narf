@@ -4730,7 +4730,12 @@ After a successful retained boot, `amdgpu_navi48_platform::run` starts
 `amdgpu_navi48_power`. Through the shared `amdgpu_hwmon` it publishes `/sys/class/hwmon/hwmon<N>` (first free N)
 named `amdgpu` and spawns a monitor that refreshes telemetry every second,
 holding the platform owner only for each refresh, like Linux's cached metrics
-table. Attributes follow Linux amdgpu_pm.c for an SMU14.0.2 dGPU: `temp1..3`
+table. The last published edge temperature also feeds the power service:
+`amdgpu_smu_temp::gpu_temp_mc` reads it live and the Stage::Late
+`amdgpu-power-providers` initcall registers it as the service's
+`gpu_temp_mc` provider, so the fused snapshot carries the GPU package
+temperature; with no published sample the field stays unknown, never
+fabricated. Attributes follow Linux amdgpu_pm.c for an SMU14.0.2 dGPU: `temp1..3`
 (edge/junction/mem) `_input/_label/_crit/_crit_hyst` (-273150)/`_emergency`;
 with PMFW fan control, read-only `pwm1` (0–255), `pwm1_enable` 2 (automatic),
 `pwm1_min/max`, `fan1_input/min/max`; `in0` (vddgfx, mV); `power1_average`,
@@ -11037,7 +11042,12 @@ features running at boot still run. `ColdBoot::power_limits()` and
 
 `amdgpu_navi22_platform::run` then starts `amdgpu_navi22_power`: the shared
 `amdgpu_hwmon` node `/sys/class/hwmon/hwmon<N>` named `amdgpu` and a 1 s
-monitor that takes the owner lock per refresh. Attributes are the Linux SMU11
+monitor that takes the owner lock per refresh. The last published edge
+temperature also feeds the power service: `amdgpu_smu_temp::gpu_temp_mc`
+reads it live and the Stage::Late `amdgpu-power-providers` initcall
+registers it as the service's `gpu_temp_mc` provider, so the fused
+snapshot carries the GPU package temperature; with no published sample
+the field stays unknown, never fabricated. Attributes are the Linux SMU11
 dGPU set, read-only: `temp1..3` (edge/junction/mem) with crit/crit_hyst
 (-273150)/emergency; with a fan `pwm1` (register duty), `pwm1_enable` 2,
 `pwm1_min/max`, `fan1_input/min/max/target`, `fan1_enable` 0; `in0` vddgfx and
