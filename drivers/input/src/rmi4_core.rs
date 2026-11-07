@@ -546,6 +546,17 @@ pub struct Rmi4Contact {
     pub pressure: i32,
 }
 
+/// Axis ranges the shared pump normalises contacts against.
+/// One bound per axis; the pump maps raw device units into the
+/// global ring through [`TouchEvent::normalise_axis`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rmi4PumpBounds {
+    pub x_min: i32,
+    pub x_max: i32,
+    pub y_min: i32,
+    pub y_max: i32,
+}
+
 /// Per-device pump state shared by the HID, SMBus, and Elan
 /// transports.
 #[derive(Debug)]
@@ -579,10 +590,7 @@ impl Rmi4PumpState {
         node: Option<&DeviceNode>,
         contacts: &[Rmi4Contact],
         btn_left: Option<bool>,
-        x_min: i32,
-        x_max: i32,
-        y_min: i32,
-        y_max: i32,
+        bounds: Rmi4PumpBounds,
     ) -> usize {
         let mut pushed = 0usize;
         let mut updates: Vec<MtContactUpdate> = Vec::new();
@@ -602,8 +610,8 @@ impl Rmi4PumpState {
                     slot,
                     tracking_id: Some(i as i32),
                     id: i as u16,
-                    x: TouchEvent::normalise_axis(c.x, x_min, x_max) as i32,
-                    y: TouchEvent::normalise_axis(c.y, y_min, y_max) as i32,
+                    x: TouchEvent::normalise_axis(c.x, bounds.x_min, bounds.x_max) as i32,
+                    y: TouchEvent::normalise_axis(c.y, bounds.y_min, bounds.y_max) as i32,
                     pressure: c.pressure,
                     state,
                 }));
@@ -624,8 +632,8 @@ impl Rmi4PumpState {
                     slot,
                     tracking_id: Some(i as i32),
                     id: i as u16,
-                    x: TouchEvent::normalise_axis(lx, x_min, x_max) as i32,
-                    y: TouchEvent::normalise_axis(ly, y_min, y_max) as i32,
+                    x: TouchEvent::normalise_axis(lx, bounds.x_min, bounds.x_max) as i32,
+                    y: TouchEvent::normalise_axis(ly, bounds.y_min, bounds.y_max) as i32,
                     pressure: 0,
                     state: TouchState::Up,
                 }));
