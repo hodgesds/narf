@@ -190,11 +190,59 @@ pub async fn try_bind_generic(
         .arm_interrupt_in(slot_id, interrupt_in_dci, MAX_GENERIC_REPORT as u32)
         .map_err(HidError::Xhci)?;
 
+    register_generic(
+        xhci_dev,
+        slot_id,
+        interface_num,
+        interrupt_in_dci,
+        descriptor,
+        port,
+        hub_port,
+    )
+    .await
+}
+
+/// Bind a generic HID interface whose interrupt-IN endpoint the
+/// caller already armed (the RMI/Elan vendor-probe fallback, issue
+/// #1681): same registration, no second TRB staged on the
+/// endpoint — a second arm would queue two TRBs against the one
+/// endpoint DMA page.
+pub async fn try_bind_generic_already_armed(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    interface_num: u8,
+    interrupt_in_dci: u8,
+    descriptor_blob: &[u8],
+    port: u8,
+    hub_port: Option<(u8, u8)>,
+) -> Result<(), HidError> {
+    let descriptor = parse(descriptor_blob).map_err(|_| HidError::NotBootKeyboard)?;
+    register_generic(
+        xhci_dev,
+        slot_id,
+        interface_num,
+        interrupt_in_dci,
+        descriptor,
+        port,
+        hub_port,
+    )
+    .await
+}
+
+async fn register_generic(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    interface_num: u8,
+    interrupt_in_dci: u8,
+    descriptor: ReportDescriptor,
+    port: u8,
+    hub_port: Option<(u8, u8)>,
+) -> Result<(), HidError> {
     // Register with the evdev ROUTER.
     // Identity (#874) is best-effort: on descriptor-fetch failure
-    // the synthetic caps below stand and the bind proceeds. Note
-    // this binder currently has no production caller; it is wired
-    // so a future caller publishes identity from the first bind.
+    // the synthetic caps below stand and the bind proceeds. The
+    // RMI/Elan vendor-probe fallback (#1681) is the first
+    // production caller; it publishes identity from the first bind.
     let mut caps = generic_evdev_caps(&descriptor);
     if let Some(id) =
         resolve_usb_identity(xhci_dev, slot_id, port, hub_port, "USB HID Device").await

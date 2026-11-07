@@ -26,7 +26,6 @@ narf-hid            = { path = "../../hid" }
 narf-filesystem     = { path = "../../filesystem" }
 narf-scheduler      = { path = "../../scheduler" }
 narf-aml            = { path = "../../aml" }
-narf-fb             = { path = "../../fb" }
 narf-console        = { path = "../../console" }
 narf-drivers-virtio = { path = "../virtio" }
 narf-kernel-test    = { path = "../../verification/kernel-test" }
