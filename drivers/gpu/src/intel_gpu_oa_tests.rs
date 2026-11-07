@@ -234,6 +234,8 @@ fn device(card: u32, platform: GtPlatform, graphics: u16) -> Device {
         timestamp: 19_200_000,
         engines: EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0]),
         reserve: DEFAULT_BUFFER,
+        media_engines: None,
+        media_timestamp: None,
     }
 }
 
@@ -1533,4 +1535,56 @@ fn smoke_oa_metrics_sysfs_uuid_id_follows_registry() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_metrics_sysfs_uuid_id_follows_registry
+);
+
+fn smoke_oa_query_units_with_oam() -> TestResult {
+    let mut mtl = device(51, MTL, 1270);
+    mtl.media_engines = Some(EngineSet::of(&[Engine::Vcs0, Engine::Vecs0]));
+    mtl.media_timestamp = Some(19_200_000);
+
+    let reply = query(Some(mtl));
+    assert_eq!(reply.len(), 16 + 72 + 2 * 8 + 72 + 2 * 8);
+    assert_eq!(u32_at(&reply, 8), 2);
+
+    let u0 = 16;
+    assert_eq!(u64_at(&reply, u0), 0);
+    assert_eq!(u64_at(&reply, u0 + 8), 0);
+    assert_eq!(u64_at(&reply, u0 + 16), CAPS);
+    assert_eq!(u64_at(&reply, u0 + 24), 19_200_000);
+    assert_eq!(u64_at(&reply, u0 + 64), 2);
+
+    let u1 = u0 + 72 + 2 * 8;
+    assert_eq!(u64_at(&reply, u1), 1);
+    assert_eq!(u64_at(&reply, u1 + 8), 1);
+    assert_eq!(u64_at(&reply, u1 + 16), CAPS_OAM);
+    assert_eq!(u64_at(&reply, u1 + 24), 19_200_000);
+    assert_eq!(u64_at(&reply, u1 + 64), 2);
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_gpu_oa", smoke_oa_query_units_with_oam);
+
+fn smoke_oa_sysfs_telemetry_and_status() -> TestResult {
+    use narf_filesystem::sysfs::Kobject;
+    let card = Kobject::new_root("card47");
+    install_metrics_for_test(47, &card);
+
+    let oa = card.get_child("oa").expect("oa child exists");
+    let status = oa.attr_show("oa_status").expect("oa_status attr");
+    assert!(status.contains("oa_buffer_size: 16777216"));
+    assert!(status.contains("oa_configs: 0"));
+
+    assert_eq!(
+        oa.attr_show("oa_buffer_size").as_deref(),
+        Some("16777216\n")
+    );
+    assert_eq!(oa.attr_show("oa_active").as_deref(), Some("0\n"));
+    assert_eq!(oa.attr_show("oa_configs_count").as_deref(), Some("0\n"));
+    assert_eq!(oa.attr_show("oa_overflow_count").as_deref(), Some("0\n"));
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_sysfs_telemetry_and_status
 );

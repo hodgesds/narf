@@ -1018,7 +1018,18 @@ version, OA timestamp frequency, published engines and reservation.
 Query 8 (`drm_xe_query_oa_units`) has zero units until then. After that it
 has one OAG unit (id 0, gt 0) with the published render and compute
 engines. Its capabilities are BASE, OA_BUFFER_SIZE, WAIT_NUM_REPORTS and
-OA_UNIT_GT_ID. SYNCS and OAM are absent.
+OA_UNIT_GT_ID. When the standalone media GT is published, Query 8 also
+enumerates unit 1 (OAM, gt 1) with published VCS/VECS engines and CAPS_OAM
+(including DRM_XE_OA_CAPS_OAM). Sysfs `/sys/class/drm/card<N>/oa/` exposes
+live `oa_status`, `oa_buffer_size`, `oa_active`, `oa_configs_count`, and
+`oa_overflow_count`.
+
+**Main-GT performance telemetry (`intel_gpu_gt_sysfs`).** Exposes `/sys/class/drm/card<N>/gt/`
+and `/sys/class/drm/card<N>/gt0/` with live or sampled `rps_cur_freq_mhz`, `rps_act_freq_mhz`,
+`rc6_residency_ms`, `rc6p_residency_ms`, `rc6pp_residency_ms`, `freq_factor_scale`,
+`throttle_reasons`, `gt_min_freq_mhz`, `gt_max_freq_mhz`, `gt_RP0_freq_mhz`,
+`gt_RP1_freq_mhz`, `gt_RPn_freq_mhz`, and `slpc_status`, mirrored into Xe-style
+`/sys/class/drm/card<N>/device/tile0/gt0/freq0/` and `gtidle/` nodes.
 
 The observation ioctl reads its 32-byte param and checks extensions. It
 routes type 0 to OA ops 0..2 and type 1 op 0 to EU-stall. Every other type

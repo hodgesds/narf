@@ -1987,6 +1987,7 @@ fn renoir_gpu_for_display_audio(regs: &mut [u32]) -> crate::amdgpu::AmdGpu {
             visible_size: 256 << 20,
         },
         mode: None,
+        backlight_percent: None,
         fw_loaded: true,
         gc_info: None,
         vbios: None,

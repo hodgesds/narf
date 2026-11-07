@@ -1109,6 +1109,22 @@ impl crate::intel_gpu_user::UserBackend for Backend {
         let state = owner.state.try_lock()?;
         state.media_guc.as_ref().map(|_| 0)
     }
+    fn main_gt_slpc_status(&self) -> Option<crate::intel_gpu_slpc::Status> {
+        if self.epoch.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let owner = self.owner.upgrade()?;
+        let state = owner.state.try_lock()?;
+        state.gt.as_ref().and_then(|gt| gt.slpc_status())
+    }
+    fn main_gt_rc6_residency_ms(&self) -> Option<u64> {
+        if self.epoch.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let owner = self.owner.upgrade()?;
+        let state = owner.state.try_lock()?;
+        state.gt.as_ref().map(|_| 0)
+    }
     fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
         let epoch = self.epoch.load(Ordering::Acquire);
         let version = self.version.load(Ordering::Relaxed);
