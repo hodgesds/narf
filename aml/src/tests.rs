@@ -3784,11 +3784,11 @@ kernel_test_in!("aml", smoke_aml_sec1290_dsdt_bad_checksum_rejected);
 /// length addition overflows.
 fn smoke_aml_sec1290_table_out_of_window_rejected() -> TestResult {
     crate::__reset_for_test();
-    let ceiling = narf_memory::phys_alloc_ceiling();
-    if ceiling == 0 {
-        return TestResult::Fail("phys_alloc_ceiling is 0 (allocator not initialized?)");
+    let window_end = narf_memory::mapped_window_end();
+    if window_end == 0 {
+        return TestResult::Fail("mapped_window_end is 0 (allocator not initialized?)");
     }
-    for phys in [ceiling, u64::MAX] {
+    for phys in [window_end, u64::MAX] {
         match unsafe { crate::walk_aml_table(phys, "\\") } {
             Err(crate::AmlError::Acpi(narf_acpi::AcpiError::OutOfMappedWindow)) => {}
             Ok(_) => return TestResult::Fail("out-of-window table accepted"),
