@@ -318,6 +318,42 @@ impl State {
         self.pending = None;
         Ok(Some(transferred))
     }
+
+    /// Isochronous completion (#885): the same pointer-match,
+    /// generation, and residue discipline as [`State::complete`],
+    /// but a Short Packet (CC 13) is a normal outcome in *either*
+    /// direction. An isoch OUT packet may be cut short by the
+    /// device's per-frame budget and an isoch IN packet by the
+    /// device sourcing fewer bytes than the buffer; xHCI 1.2
+    /// §4.11.2.2 / §6.4.2.1 treats CC 13 on an Isoch TRB as a
+    /// completed transfer, not an error. Bulk keeps its narrower
+    /// rule (CC 13 only for IN) in `complete`.
+    pub fn complete_isoch(
+        &mut self,
+        generation: u64,
+        token: &Token,
+        event: &[u32; 4],
+        consume: impl FnOnce(usize),
+    ) -> Result<Option<usize>, Error> {
+        self.validate(generation, token)?;
+        if !token.matches(event) {
+            return Ok(None);
+        }
+        let code = (event[2] >> 24) as u8;
+        if code != 1 && code != 13 {
+            self.pending.as_mut().unwrap().poisoned = true;
+            return Err(Error::Completion(code));
+        }
+        let residue = (event[2] & 0xff_ffff) as usize;
+        if residue > token.length {
+            self.pending.as_mut().unwrap().poisoned = true;
+            return Err(Error::Malformed);
+        }
+        let transferred = token.length - residue;
+        consume(transferred);
+        self.pending = None;
+        Ok(Some(transferred))
+    }
 }
 
 /// Serialize the shared EP0 scratch page. An error or dropped operation does

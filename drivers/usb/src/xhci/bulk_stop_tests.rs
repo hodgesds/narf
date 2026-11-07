@@ -35,6 +35,9 @@ struct Model {
 struct Fake(IrqSafeSpinLock<Model>);
 impl Fake {
     fn new(enq: usize, cycle: u32) -> (Self, Token) {
+        Self::new_with(enq, cycle, Direction::In)
+    }
+    fn new_with(enq: usize, cycle: u32, direction: Direction) -> (Self, Token) {
         let mut state = State::new();
         let token = state
             .begin(
@@ -43,7 +46,7 @@ impl Fake {
                     slot: 2,
                     dci: 3,
                 },
-                Direction::In,
+                direction,
                 4096,
                 || 0x1000,
             )
@@ -150,6 +153,39 @@ fn smoke_usb_bulk_stop_exact_commands_and_successor_quarantine() -> TestResult {
 kernel_test_in!(
     "drivers/usb/bulk_stop",
     smoke_usb_bulk_stop_exact_commands_and_successor_quarantine
+);
+
+/// Isochronous timeout retirement (#885) reuses the same Stop +
+/// Set TR Dequeue coordinator as bulk: the exact command words,
+/// the successor forced-event quarantine, and the stale receipt
+/// after commit are identical for an isoch OUT token. The
+/// coordinator never inspects transfer direction — only the
+/// token's slot/DCI/serial/TRB identity.
+fn smoke_usb_isoch_stop_reuses_stop_setdequeue_coordinator() -> TestResult {
+    let (bus, token) = Fake::new_with(1, 1, Direction::Out);
+    if narf_scheduler::block_on(run(&bus, &token)).is_err() {
+        return TestResult::Fail("isoch Stop+SetDequeue failed");
+    }
+    let m = bus.0.lock();
+    if m.ops
+        != [
+            [0, 0, 0, 15 << 10 | 2 << 24 | 3 << 16],
+            [0x1011, 0, 0, 16 << 10 | 2 << 24 | 3 << 16],
+        ]
+        || m.state.active()
+        || !m.queue.is_empty()
+        || m.commits != 1
+    {
+        return TestResult::Fail("isoch stop sequence diverged from bulk coordinator");
+    }
+    if m.state.validate(9, &token) != Err(bulk_owner::Error::Stale) {
+        return TestResult::Fail("cancelled isoch receipt remained valid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/bulk_stop",
+    smoke_usb_isoch_stop_reuses_stop_setdequeue_coordinator
 );
 fn smoke_usb_bulk_stop_link_cycle_canonicalization() -> TestResult {
     for cycle in [0, 1] {

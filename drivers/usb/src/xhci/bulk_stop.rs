@@ -1,4 +1,5 @@
-//! One-shot cancellation of a retained non-stream bulk TD.
+//! One-shot cancellation of a retained non-stream bulk TD, and of a
+//! retained isochronous TD (#885 timeout retirement).
 //! Intel xHCI1.2b§4.6.9–10: Stop transfers TD ownership, then Set TR Dequeue
 //! invalidates cached transfer state. Neither Future Drop nor timeout does so.
 //! https://cdrdv2-public.intel.com/625472/625472_xHCI_Rev1_2b.pdf

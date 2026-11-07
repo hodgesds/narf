@@ -1,4 +1,8 @@
 //! xHCI adapter for the real Stop Endpoint / Set TR Dequeue coordinator.
+//! Serves both the bulk TDs (`Xhci::stop_bulk`) and the isochronous
+//! TDs (`Xhci::stop_isoch`, #885 timeout retirement): the coordinator
+//! is endpoint-type agnostic, and the claim/context/commit steps
+//! dispatch on the endpoint kind to the matching owner state.
 use super::{
     bulk_owner,
     bulk_stop::{self, Bus, Context, Plan},
@@ -28,13 +32,24 @@ impl Bus for Xhci {
             .get_mut(usize::from(token.endpoint() - 2))
             .and_then(Option::as_mut)
             .ok_or(XhciError::CmdFailed(0xfa))?;
-        if !matches!(ep.kind, EndpointKind::BulkIn | EndpointKind::BulkOut) {
+        if !matches!(
+            ep.kind,
+            EndpointKind::BulkIn
+                | EndpointKind::BulkOut
+                | EndpointKind::IsochIn
+                | EndpointKind::IsochOut
+        ) {
             return Err(XhciError::CmdFailed(0xf8));
         }
-        let identity = ep
-            .bulk
-            .begin_stop(device.generation, token)
-            .map_err(super::bulk_error)?;
+        let identity = if ep.kind.is_isochronous() {
+            ep.isoch
+                .begin_stop(device.generation, token)
+                .map_err(super::bulk_error)?
+        } else {
+            ep.bulk
+                .begin_stop(device.generation, token)
+                .map_err(super::bulk_error)?
+        };
         device.endpoint_configuration = true;
         Plan::new(
             identity,
@@ -80,9 +95,15 @@ impl Bus for Xhci {
             .get(usize::from(plan.identity.dci - 2))
             .and_then(Option::as_ref)
             .ok_or(XhciError::CmdFailed(0xfa))?;
-        ep.bulk
-            .validate_stop(plan.identity)
-            .map_err(super::bulk_error)?;
+        if ep.kind.is_isochronous() {
+            ep.isoch
+                .validate_stop(plan.identity)
+                .map_err(super::bulk_error)?;
+        } else {
+            ep.bulk
+                .validate_stop(plan.identity)
+                .map_err(super::bulk_error)?;
+        }
         let offset = usize::from(plan.identity.dci) * self.context_stride() as usize;
         d._device_ctx.sync(offset, 16);
         device_dma_barrier();
@@ -124,14 +145,26 @@ impl Bus for Xhci {
             .get_mut(usize::from(plan.identity.dci - 2))
             .and_then(Option::as_mut)
             .ok_or(XhciError::CmdFailed(0xfa))?;
-        ep.bulk
-            .validate_stop(plan.identity)
-            .map_err(super::bulk_error)?;
+        if ep.kind.is_isochronous() {
+            ep.isoch
+                .validate_stop(plan.identity)
+                .map_err(super::bulk_error)?;
+        } else {
+            ep.bulk
+                .validate_stop(plan.identity)
+                .map_err(super::bulk_error)?;
+        }
         ep.enq = plan.enqueue;
         ep.pcs = plan.cycle;
-        ep.bulk
-            .finish_stop(plan.identity)
-            .map_err(super::bulk_error)?;
+        if ep.kind.is_isochronous() {
+            ep.isoch
+                .finish_stop(plan.identity)
+                .map_err(super::bulk_error)?;
+        } else {
+            ep.bulk
+                .finish_stop(plan.identity)
+                .map_err(super::bulk_error)?;
+        }
         d.endpoint_configuration = false;
         Ok(())
     }
