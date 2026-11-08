@@ -27,10 +27,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use narf_filesystem::{dma_buf::DmaResvUsage, FsError, IoctlContext};
+use narf_filesystem::{FsError, IoctlContext, dma_buf::DmaResvUsage};
 use narf_io::DmaBuffer;
 
-use crate::drm::ioctl::{dispatch, DrmIoctlError, DrmIoctlResult, IoctlCmd};
+use crate::drm::ioctl::{DrmIoctlError, DrmIoctlResult, IoctlCmd, dispatch};
 use crate::drm::render_node::DrmFileCtx;
 use crate::drm_uapi::{
     self, DrmModeAtomicUapi, DrmModeCardResUapi, DrmModeCreateDumbUapi, DrmModeCrtcUapi,
@@ -1967,7 +1967,7 @@ unsafe fn guarded_copy(dst: *mut u8, src: *const u8, len: usize) -> Result<(), F
 pub(crate) mod kernel_test_buffers {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    use narf_lib::percpu::{current_cpu, MAX_CPUS};
+    use narf_lib::percpu::{MAX_CPUS, current_cpu};
 
     /// Per-CPU strict window `[start, end)`: `start == 0` means no strict
     /// scope is open; otherwise only kernel ranges inside the window pass.
@@ -2693,13 +2693,12 @@ fn handle_getconnector(
     };
 
     // Pass 2: fill the modes array when the user gave a buffer big enough.
-    if modes_ptr != 0 && user_count_modes > 0 && !modes.is_empty() {
-        let n = (user_count_modes as usize).min(modes.len());
-        let mut buf: Vec<u8> = Vec::with_capacity(n * 68);
-        for m in &modes[..n] {
+    if modes_ptr != 0 && (user_count_modes as usize) >= modes.len() && !modes.is_empty() {
+        let mut buf: Vec<u8> = Vec::with_capacity(modes.len() * 68);
+        for m in &modes {
             buf.extend_from_slice(&mode_to_bytes(m));
         }
-        // SAFETY: user-supplied modes_ptr, sized for >= n entries.
+        // SAFETY: user-supplied modes_ptr, sized for >= modes.len() entries.
         unsafe { copy_out(modes_ptr as usize, &buf)? };
     }
     // Single encoder id into the encoders array.
@@ -2720,12 +2719,11 @@ fn handle_getconnector(
             .unwrap_or(0);
         connector_properties(&card, info.connector_id, crtc_id)
     };
-    if props_ptr != 0 && prop_values_ptr != 0 && user_count_props > 0 {
-        let n = (user_count_props as usize).min(props.len());
-        let prop_ids: Vec<u8> = props[..n].iter().flat_map(|p| p.to_le_bytes()).collect();
-        let prop_values: Vec<u8> = values[..n].iter().flat_map(|v| v.to_le_bytes()).collect();
-        // SAFETY: both are user out-pointers sized for at least `n` properties;
-        // ids are u32, values u64.
+    if props_ptr != 0 && prop_values_ptr != 0 && user_count_props as usize >= props.len() {
+        let prop_ids: Vec<u8> = props.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let prop_values: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // SAFETY: both are user out-pointers sized for every property after
+        // the counting pass; ids are u32, values u64.
         unsafe {
             copy_out(props_ptr as usize, &prop_ids)?;
             copy_out(prop_values_ptr as usize, &prop_values)?;
@@ -3309,14 +3307,13 @@ fn handle_getplane_res(
             .collect();
         planes
     };
-    if plane_id_ptr != 0 && user_count > 0 {
-        let n = (user_count as usize).min(planes.len());
-        let mut buf: Vec<u8> = Vec::with_capacity(n * 4);
-        for id in &planes[..n] {
+    if plane_id_ptr != 0 && user_count as usize >= planes.len() {
+        let mut buf: Vec<u8> = Vec::with_capacity(planes.len() * 4);
+        for id in &planes {
             buf.extend_from_slice(&id.to_le_bytes());
         }
         // SAFETY: `plane_id_ptr` is the user out-array; we write exactly
-        // `n` <= `user_count` ids of 4 bytes each.
+        // `planes.len()` <= `user_count` ids of 4 bytes each.
         unsafe { copy_out(plane_id_ptr as usize, &buf)? };
     }
     bytes[8..12].copy_from_slice(&(planes.len() as u32).to_le_bytes());
@@ -3388,11 +3385,10 @@ fn handle_getplane(
     out[16..20].copy_from_slice(&0u32.to_le_bytes()); // gamma_size
 
     // The plane's formats (XRGB8888 on the CPU-copy cards); two-pass.
-    if fmt_ptr != 0 && user_fmt_count > 0 {
-        let n = (user_fmt_count as usize).min(formats.len());
-        let bytes: Vec<u8> = formats[..n].iter().flat_map(|f| f.to_le_bytes()).collect();
+    if fmt_ptr != 0 && user_fmt_count as usize >= formats.len() {
+        let bytes: Vec<u8> = formats.iter().flat_map(|f| f.to_le_bytes()).collect();
         // SAFETY: `fmt_ptr` is the user format-array out-pointer with room
-        // for n formats (checked above).
+        // for every format (checked above).
         unsafe { copy_out(fmt_ptr as usize, &bytes)? };
     }
     out[20..24].copy_from_slice(&(formats.len() as u32).to_le_bytes()); // count_format_types
@@ -3436,7 +3432,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         out[24..24 + name.len()].copy_from_slice(name);
         out[56..60].copy_from_slice(&0u32.to_le_bytes()); // count_values
         out[60..64].copy_from_slice(&0u32.to_le_bytes()); // count_enum_blobs
-                                                          // SAFETY: `arg` is the validated 64-byte out-pointer.
+        // SAFETY: `arg` is the validated 64-byte out-pointer.
         unsafe { copy_out(arg, &out)? };
         return Ok(0);
     }
@@ -3658,29 +3654,27 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
 
     let values_ptr = u64::from_le_bytes(out[0..8].try_into().unwrap());
     let user_values_count = u32::from_le_bytes(out[56..60].try_into().unwrap());
-    if values_ptr != 0 && user_values_count > 0 && !enums.is_empty() {
-        let n = (user_values_count as usize).min(enums.len());
-        let mut buf = alloc::vec![0u8; n * 8];
-        for (i, (val, _)) in enums[..n].iter().enumerate() {
+    if values_ptr != 0 && user_values_count as usize >= enums.len() && !enums.is_empty() {
+        let mut buf = alloc::vec![0u8; enums.len() * 8];
+        for (i, (val, _)) in enums.iter().enumerate() {
             buf[i * 8..i * 8 + 8].copy_from_slice(&val.to_le_bytes());
         }
         // SAFETY: `values_ptr` is the user array out-pointer sized
-        // for at least `n` entries of 8 bytes each.
+        // for `user_values_count` >= `enums.len()` entries of 8 bytes each.
         unsafe { copy_out(values_ptr as usize, &buf)? };
     }
 
     let enum_blob_ptr = u64::from_le_bytes(out[8..16].try_into().unwrap());
     let user_enum_count = u32::from_le_bytes(out[60..64].try_into().unwrap());
-    if enum_blob_ptr != 0 && user_enum_count > 0 && !enums.is_empty() {
-        let n = (user_enum_count as usize).min(enums.len());
-        let mut buf = alloc::vec![0u8; n * 40];
-        for (i, (val, nm)) in enums[..n].iter().enumerate() {
+    if enum_blob_ptr != 0 && user_enum_count as usize >= enums.len() && !enums.is_empty() {
+        let mut buf = alloc::vec![0u8; enums.len() * 40];
+        for (i, (val, nm)) in enums.iter().enumerate() {
             let base = i * 40;
             buf[base..base + 8].copy_from_slice(&val.to_le_bytes());
             buf[base + 8..base + 8 + nm.len().min(32)].copy_from_slice(&nm[..nm.len().min(32)]);
         }
         // SAFETY: `enum_blob_ptr` is the user enum-array out-pointer sized
-        // for at least `n` entries of 40 bytes each.
+        // for `user_enum_count` >= `enums.len()` entries of 40 bytes each.
         unsafe { copy_out(enum_blob_ptr as usize, &buf)? };
     }
     out[56..60].copy_from_slice(&(enums.len() as u32).to_le_bytes()); // count_values
@@ -5262,17 +5256,16 @@ fn handle_obj_getproperties(
             return Err(invalid_at(line!()));
         }
     };
-    if props_ptr != 0 && values_ptr != 0 && user_count > 0 {
-        let n = (user_count as usize).min(props.len());
-        let mut prop_bytes = Vec::with_capacity(n * 4);
-        let mut value_bytes = Vec::with_capacity(n * 8);
-        for prop in &props[..n] {
+    if props_ptr != 0 && values_ptr != 0 && user_count as usize >= props.len() {
+        let mut prop_bytes = Vec::with_capacity(props.len() * 4);
+        let mut value_bytes = Vec::with_capacity(values.len() * 8);
+        for prop in &props {
             prop_bytes.extend_from_slice(&prop.to_le_bytes());
         }
-        for value in &values[..n] {
+        for value in &values {
             value_bytes.extend_from_slice(&value.to_le_bytes());
         }
-        // SAFETY: both arrays were advertised with at least `n`
+        // SAFETY: both arrays were advertised with at least `props.len()`
         // entries; property ids are u32 and values are u64.
         unsafe {
             copy_out(props_ptr as usize, &prop_bytes)?;

@@ -23,7 +23,7 @@
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{BusDevice, BusDeviceCap, MmioRegion, map_bar_control};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -377,6 +377,19 @@ pub unsafe fn bring_up(
     invoke(cap, || bring_up_current(device, cap)).map_err(|_| ProbeError::Authority)?
 }
 
+/// PCI command bits the identity/driver-own probe runs with.
+///
+/// Bus mastering is deliberately absent. The probe only touches BAR0
+/// registers; no host DMA ring exists yet, and the function may still carry
+/// WFDMA ring bases inherited from firmware or a previous OS (a warm reboot
+/// from Linux does not necessarily reset the M.2 card). With the IOMMU in
+/// identity mode, enabling bus mastering here lets that stale state DMA into
+/// arbitrary physical memory. Bus mastering is granted only by the firmware
+/// transport, after it has reprogrammed and proven its own rings
+/// (`firmware_transport_hw::restore_bus` / `resume_dma`).
+pub(super) const PROBE_COMMAND: u16 =
+    narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE;
+
 fn bring_up_current(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
@@ -393,16 +406,10 @@ fn bring_up_current(
 
     validate_probe_window(mmio_bar0.len)?;
     use narf_bus::pci::{self, cmd};
-    pci::set_command(
-        cap,
-        device,
-        cmd::MEM_SPACE | cmd::BUS_MASTER | cmd::INTX_DISABLE,
-    )
-    .map_err(|_| ProbeError::Authority)?;
+    pci::set_command(cap, device, PROBE_COMMAND).map_err(|_| ProbeError::Authority)?;
     let command = pci::read_command(cap, device).map_err(|_| ProbeError::Authority)?;
     if command == u16::MAX
-        || command & (cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE)
-            != cmd::MEM_SPACE | cmd::BUS_MASTER | cmd::INTX_DISABLE
+        || command & (cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE) != PROBE_COMMAND
     {
         return Err(ProbeError::Authority);
     }
@@ -560,8 +567,8 @@ pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
     controller.as_ref().map(f)
 }
 
-pub(super) fn claim_firmware_transport(
-) -> Result<Option<super::firmware_transport::Transport>, super::firmware_transport::Error> {
+pub(super) fn claim_firmware_transport()
+-> Result<Option<super::firmware_transport::Transport>, super::firmware_transport::Error> {
     use super::firmware_transport::{Error, Firmware, Transport};
     let Some((device, authority)) = *FIRMWARE_BINDING.lock() else {
         return Ok(None);

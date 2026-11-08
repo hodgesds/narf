@@ -1449,11 +1449,7 @@ impl Card {
     /// The current DRM master open ID, if any.
     pub fn current_master(&self) -> Option<u64> {
         let cur = self.current_master.load(Ordering::Acquire);
-        if cur == 0 {
-            None
-        } else {
-            Some(cur)
-        }
+        if cur == 0 { None } else { Some(cur) }
     }
 
     /// Whether `open_id` is the current DRM master. Drives `DrmFileCtx`'s
@@ -1469,31 +1465,18 @@ impl Card {
     /// the current one it was opened under).
     pub fn has_unique(&self, open_id: u64) -> bool {
         let cur = self.current_master.load(Ordering::Acquire);
-        self.unique_masters.contains(&open_id)
-            || (cur != 0 && self.unique_masters.contains(&cur))
+        self.unique_masters.contains(&open_id) || (cur != 0 && self.unique_masters.contains(&cur))
     }
     /// The master's unique name goes with its last open.
     pub fn release_unique(&mut self, open_id: u64) {
         self.unique_masters.retain(|&o| o != open_id);
     }
     pub fn is_master(&self, open_id: u64) -> bool {
-        if open_id == 0 {
-            return false;
-        }
-        let cur = self.current_master.load(Ordering::Acquire);
-        if cur == 0 {
-            // Master-free device adopts the active primary client
-            // (e.g. user session compositor starting while greeter was exiting).
-            if self
-                .current_master
-                .compare_exchange(0, open_id, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return true;
-            }
-            return self.current_master.load(Ordering::Acquire) == open_id;
-        }
-        cur == open_id
+        // Pure query. Master is acquired only by the first primary open
+        // (`master_open`) or an explicit `SET_MASTER`; adopting here would let
+        // any auxiliary open that merely asks steal master from the
+        // compositor that is about to call SET_MASTER.
+        open_id != 0 && self.current_master.load(Ordering::Acquire) == open_id
     }
 
     /// `DRM_IOCTL_SET_MASTER`. `Ok` if `open_id` already holds master or the
@@ -1538,9 +1521,9 @@ impl Card {
     /// if this open held it, freeing the device for the next `SET_MASTER`
     /// (the greeter→user-session handoff path).
     pub fn master_release(&mut self, open_id: u64) {
-        let _ = self
-            .current_master
-            .compare_exchange(open_id, 0, Ordering::AcqRel, Ordering::Acquire);
+        let _ =
+            self.current_master
+                .compare_exchange(open_id, 0, Ordering::AcqRel, Ordering::Acquire);
         #[cfg(feature = "intel")]
         {
             self.intel_restore_pending |= self.intel_display;
@@ -2952,7 +2935,7 @@ impl Card {
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
-    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_kernel_test::{TestResult, kernel_test_in};
 
     /// A dumb buffer whose last GEM/fb reference is dropped (GEM_CLOSE /
     /// DESTROY_DUMB / RMFB) while a userspace mmap of it is STILL live must not
@@ -3028,7 +3011,7 @@ pub mod tests {
     /// becomes SCANOUT. An open's framebuffers leave with it.
     #[cfg(feature = "intel")]
     fn smoke_intel_framebuffers_follow_intel_framebuffer_init() -> TestResult {
-        use crate::drm::fb_cmd::{FbCmd, FB_MODIFIERS};
+        use crate::drm::fb_cmd::{FB_MODIFIERS, FbCmd};
         use crate::intel_gpu_gem::GemState;
         let gem = GemState::new();
         let create = |size| {

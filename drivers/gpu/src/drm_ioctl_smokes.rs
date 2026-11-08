@@ -31,7 +31,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec;
 use narf_filesystem::{FileOps, FsError};
-use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_kernel_test::{TestResult, kernel_test_in};
 
 use crate::drm::card::{
     Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
@@ -51,10 +51,10 @@ fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Result<
     crate::drm_ioctl_bridge::dispatch_card(card_index, SMOKE_MASTER_ID, cmd, arg, render)
 }
 use crate::drm_uapi::{
-    ioc, ioc_dir, ioc_nr, ioc_size, ioc_type, iow, iowr, DrmModeAtomicUapi, DrmModeCardResUapi,
-    DrmVersionUapi, DRM_IOCTL_BASE, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_ATOMIC,
-    DRM_IOCTL_MODE_GETPLANE, DRM_IOCTL_MODE_GETPLANERESOURCES, DRM_IOCTL_MODE_GETRESOURCES,
-    DRM_IOCTL_MODE_SETCRTC, DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_VERSION, IOC_READ, IOC_WRITE,
+    DRM_IOCTL_BASE, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_ATOMIC, DRM_IOCTL_MODE_GETPLANE,
+    DRM_IOCTL_MODE_GETPLANERESOURCES, DRM_IOCTL_MODE_GETRESOURCES, DRM_IOCTL_MODE_SETCRTC,
+    DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_VERSION, DrmModeAtomicUapi, DrmModeCardResUapi,
+    DrmVersionUapi, IOC_READ, IOC_WRITE, ioc, ioc_dir, ioc_nr, ioc_size, ioc_type, iow, iowr,
 };
 use alloc::format;
 use alloc::string::String;
@@ -206,7 +206,7 @@ kernel_test_in!(
 
 fn smoke_drm_native_connector_timings_count_copy_and_admission() -> TestResult {
     use crate::drm::card::NativeOutput;
-    use crate::drm::ioctl::{mode_to_wire, DrmModeModeInfo};
+    use crate::drm::ioctl::{DrmModeModeInfo, mode_to_wire};
     let idx = register_test_card();
     let ms = crate::drm_registry::mode_state(idx).unwrap();
     let mode = crate::Mode {
@@ -2299,12 +2299,12 @@ kernel_test_in!(
 /// GEM handles and bad nested pointers. Keep those distinctions at the bridge
 /// so `sys_ioctl` can return EINVAL, ENOENT, and EFAULT respectively.
 fn smoke_virtgpu_ioctl_linux_error_classes() -> TestResult {
-    use crate::drm_ioctl_bridge::{copy_in, dispatch_virtgpu_render, VirtGpuRenderState};
+    use crate::drm_ioctl_bridge::{VirtGpuRenderState, copy_in, dispatch_virtgpu_render};
     use crate::drm_uapi::{
-        DrmVirtGpuGetCapsUapi, DrmVirtGpuMapUapi, DrmVirtGpuResourceCreateBlobUapi,
-        DrmVirtGpuResourceInfoUapi, DrmVirtGpuWaitUapi, DRM_IOCTL_VIRTGPU_GET_CAPS,
-        DRM_IOCTL_VIRTGPU_MAP, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, DRM_IOCTL_VIRTGPU_WAIT,
-        DRM_VIRTGPU_NR_RESOURCE_CREATE_BLOB,
+        DRM_IOCTL_VIRTGPU_GET_CAPS, DRM_IOCTL_VIRTGPU_MAP, DRM_IOCTL_VIRTGPU_RESOURCE_INFO,
+        DRM_IOCTL_VIRTGPU_WAIT, DRM_VIRTGPU_NR_RESOURCE_CREATE_BLOB, DrmVirtGpuGetCapsUapi,
+        DrmVirtGpuMapUapi, DrmVirtGpuResourceCreateBlobUapi, DrmVirtGpuResourceInfoUapi,
+        DrmVirtGpuWaitUapi,
     };
 
     let state = VirtGpuRenderState::new();
@@ -2503,7 +2503,7 @@ kernel_test_in!(
 #[allow(dead_code)]
 fn smoke_drm_page_flip_linux_errno_parity() -> TestResult {
     use crate::drm_devfs_bridge::DriCardFile;
-    use crate::drm_uapi::{DrmModePageFlipUapi, DRM_IOCTL_MODE_PAGE_FLIP};
+    use crate::drm_uapi::{DRM_IOCTL_MODE_PAGE_FLIP, DrmModePageFlipUapi};
 
     let name = format!("card{}", crate::drm_registry::count());
     let mut card = make_test_card();
@@ -2595,7 +2595,7 @@ kernel_test_in!(
 
 #[allow(dead_code)]
 fn smoke_drm_create_dumb_basic() -> TestResult {
-    use crate::drm_uapi::{DrmModeCreateDumbUapi, DRM_IOCTL_MODE_CREATE_DUMB};
+    use crate::drm_uapi::{DRM_IOCTL_MODE_CREATE_DUMB, DrmModeCreateDumbUapi};
     let idx = register_test_card();
     let mut req = DrmModeCreateDumbUapi {
         height: 64,
@@ -2638,7 +2638,7 @@ kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_create_dumb_basic);
 #[allow(dead_code)]
 fn smoke_drm_map_dumb_resolves_to_phys() -> TestResult {
     use crate::drm::card::DumbBacking;
-    use crate::drm_uapi::{DrmModeMapDumbUapi, DRM_IOCTL_MODE_MAP_DUMB};
+    use crate::drm_uapi::{DRM_IOCTL_MODE_MAP_DUMB, DrmModeMapDumbUapi};
     // Build a card + manually insert a fake dumb backing so we can
     // exercise MAP_DUMB without needing the buddy allocator.
     let idx = {
@@ -2915,7 +2915,7 @@ kernel_test_in!(
 #[allow(dead_code)]
 fn smoke_drm_setcrtc_with_fb_succeeds() -> TestResult {
     use crate::drm::card::DumbBacking;
-    use crate::drm_uapi::{DrmModeCrtcUapi, DRM_IOCTL_MODE_SETCRTC};
+    use crate::drm_uapi::{DRM_IOCTL_MODE_SETCRTC, DrmModeCrtcUapi};
     // Build a card with a fake dumb backing + framebuffer.
     let idx = {
         let name = format!("card{}", crate::drm_registry::count());
@@ -2991,7 +2991,7 @@ kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_setcrtc_with_fb_succeeds);
 /// matches Linux `drm_auth.c`.
 #[allow(dead_code)]
 fn smoke_drm_master_arbitration() -> TestResult {
-    use crate::drm_uapi::{DrmModeCrtcUapi, DRM_IOCTL_MODE_SETCRTC};
+    use crate::drm_uapi::{DRM_IOCTL_MODE_SETCRTC, DrmModeCrtcUapi};
     // Fresh card — device master is free.
     let idx = register_test_card_unmastered();
     let set_master = ioc(0, DRM_IOCTL_BASE, 0x1E, 0);
@@ -3073,6 +3073,48 @@ fn smoke_drm_master_arbitration() -> TestResult {
     }
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_master_arbitration);
+
+/// Regression: the per-ioctl master gate is a pure query. On a master-free
+/// card, a non-master open issuing a master-only ioctl must get EACCES and
+/// must NOT silently become master; otherwise any helper that pokes the
+/// primary node during a greeter → session handoff steals master and the
+/// compositor's own SET_MASTER then fails with EBUSY.
+fn smoke_drm_master_gate_does_not_adopt() -> TestResult {
+    use crate::drm_uapi::{DRM_IOCTL_MODE_SETCRTC, DrmModeCrtcUapi};
+    let idx = register_test_card_unmastered();
+    let set_master = ioc(0, DRM_IOCTL_BASE, 0x1E, 0);
+    const HELPER: u64 = 0x0C33;
+    const COMPOSITOR: u64 = 0x0D44;
+    let master = || crate::drm_registry::mode_state(idx).and_then(|ms| ms.lock().current_master());
+    let mut crtc = DrmModeCrtcUapi {
+        crtc_id: 11,
+        ..Default::default()
+    };
+    match crate::drm_ioctl_bridge::dispatch_card(
+        idx,
+        HELPER,
+        DRM_IOCTL_MODE_SETCRTC,
+        &mut crtc as *mut _ as usize,
+        false,
+    ) {
+        Err(FsError::PermissionDenied) => {}
+        _ => return TestResult::Fail("non-master SETCRTC on a master-free card should be EACCES"),
+    }
+    if master().is_some() {
+        return TestResult::Fail("master gate query adopted the caller as master");
+    }
+    if crate::drm_ioctl_bridge::dispatch_card(idx, COMPOSITOR, set_master, 0, false) != Ok(0) {
+        return TestResult::Fail("compositor SET_MASTER after a helper query should succeed");
+    }
+    if master() != Some(COMPOSITOR) {
+        return TestResult::Fail("compositor should hold master after SET_MASTER");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_master_gate_does_not_adopt
+);
 
 /// The first primary open of a master-free card auto-acquires DRM master
 /// (drm_master_open), and closing that fd auto-drops it (drm_master_release)
@@ -3709,7 +3751,7 @@ kernel_test_in!(
 fn smoke_drm_native_planes_refuse_what_scanout_cannot_show() -> TestResult {
     use crate::drm::atomic::{AtomicState, CrtcState, PlaneState};
     use crate::drm::card::DumbBacking;
-    use crate::drm_uapi::{DrmModeCrtcUapi, DRM_IOCTL_MODE_SETCRTC};
+    use crate::drm_uapi::{DRM_IOCTL_MODE_SETCRTC, DrmModeCrtcUapi};
     const XR24: u32 = 0x3432_5258;
     const AR24: u32 = 0x3432_5241;
     const RG16: u32 = 0x3631_4752;
@@ -3925,7 +3967,7 @@ kernel_test_in!(
 fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
     use crate::drm::atomic::{AtomicState, PlaneState};
     use crate::drm::card::{CardError, DumbBacking, PixelFormat};
-    use crate::drm_uapi::{DrmModeCrtcUapi, DRM_IOCTL_MODE_SETCRTC};
+    use crate::drm_uapi::{DRM_IOCTL_MODE_SETCRTC, DrmModeCrtcUapi};
     const FORMATS: &[u32] = &crate::amdgpu_navi48_kms::PLANE_FORMATS;
     let idx = register_test_card();
     let Some(ms) = crate::drm_registry::mode_state(idx) else {
@@ -4354,8 +4396,8 @@ kernel_test_in!(
 fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
     use crate::amdgpu_gem::{GemState, VramHeap};
     use crate::drm_uapi::{
-        DrmModeCreateDumbUapi, DRM_IOCTL_MODE_ADDFB2, DRM_IOCTL_MODE_CREATE_DUMB,
-        DRM_IOCTL_MODE_DESTROY_DUMB, DRM_IOCTL_MODE_MAP_DUMB,
+        DRM_IOCTL_MODE_ADDFB2, DRM_IOCTL_MODE_CREATE_DUMB, DRM_IOCTL_MODE_DESTROY_DUMB,
+        DRM_IOCTL_MODE_MAP_DUMB, DrmModeCreateDumbUapi,
     };
     const OWNER: u64 = 0xd0b1;
     const BAR: u64 = 0xb500_0000;
@@ -4865,7 +4907,7 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
         // A 32x32 XRGB8888 framebuffer in GFX12 256B_2D tiles, which DC
         // can scan vertically (rotation 90/270).
         let tiled_fb = {
-            use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS};
+            use crate::amdgpu_dm_modifiers::{FB_MODIFIERS, FbCmd};
             let tiling = crate::amdgpu_dcn401_otg::Tiling {
                 swizzle: crate::amdgpu_dcn401_otg::Swizzle::S256B2D,
                 dcc: None,
@@ -5367,7 +5409,7 @@ kernel_test_in!(
 // native display's (this card has none).
 #[cfg(feature = "amdgpu")]
 fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
-    use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS};
+    use crate::amdgpu_dm_modifiers::{FB_MODIFIERS, FbCmd};
     use crate::drm::card::DumbBacking;
     use crate::drm_native_planes as planes;
     const XR24: u32 = 0x3432_5258;
@@ -5971,7 +6013,7 @@ kernel_test_in!(
 /// a blob GETPROPBLOB serves — a kernel blob when the mode was not set
 /// through an atomic MODE_ID — which survives garbage collection.
 fn smoke_drm_committed_mode_identity_and_mode_id_readback() -> TestResult {
-    use crate::drm::card::{mode_equal, NativeOutput};
+    use crate::drm::card::{NativeOutput, mode_equal};
     use crate::drm::ioctl::DrmModeModeInfo;
     let rb = DrmModeModeInfo {
         clock: 533_250,
