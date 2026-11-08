@@ -90,9 +90,10 @@ KASLR_SLIDE_FIXED = 0x00000000;
  *
  * 0x1000_0000 puts the copy at 0x5008_0000..0x541e_6db0. QEMU's virt machine
  * places the kernel, the initrd and the DTB all inside the first 256 MiB of RAM
- * (the DTB lands at 0x4f00_0000, just under the 0x5000_0000 mark), so starting
- * above that clears every one of them; it also still fits inside boot-smoke's
- * 512 MiB, not just the suite's 1 GiB. */
+ * (the DTB sits immediately above the kernel image and the initrd above the
+ * DTB, both placed dynamically by xtask), so starting above that clears every
+ * one of them; it also still fits inside boot-smoke's 512 MiB, not just the
+ * suite's 1 GiB. */
 /* Master switch for physical relocation. With it on and KASLR_PHYS_FIXED at 0,
  * `.Lfdt_pick` in boot.S chooses the target from the DTB at boot. */
 KASLR_PHYS_ENABLE = 1;

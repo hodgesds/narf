@@ -638,9 +638,11 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
 /// The scanned range is identity-mapped Normal memory by the boot
 /// stub (lo_L1[1] = 1 GiB block at PA 0x4000_0000).
 unsafe fn scan_for_dtb() -> Option<PhysAddr> {
-    // First, fast-path: xtask force-loads the QEMU virt DTB at a
-    // fixed `DTB_LOAD_ADDR` via `-device loader`, so a single
-    // direct check usually wins.
+    // First, fast-path: a loader may still place the QEMU virt DTB at
+    // the historical fixed address via `-device loader`, so a single
+    // direct check usually wins. xtask now places the DTB dynamically
+    // above the kernel image (`dtb_load_addr`), so this usually misses
+    // and the scan below is the operative path.
     const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
     // SAFETY: address is inside the lo_L1[1] Normal-mapped block.
     let v = unsafe { core::ptr::read_volatile(DTB_LOAD_ADDR as *const u32) }.to_be();

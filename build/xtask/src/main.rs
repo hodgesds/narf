@@ -2310,9 +2310,17 @@ impl Arch {
                 .join(" ");
                 let initrd = TEST_INITRD.lock().ok().and_then(|g| g.clone());
                 let template = qemu_virt_dtb_path_with_cmdline(&append, initrd.as_deref());
+                // The DTB sits immediately above the kernel image's
+                // PT_LOAD/BSS extents (`dtb_load_addr`): the kernel has
+                // grown past the old fixed address (0x4f000000), so a
+                // fixed DTB overlaps the kernel's segment 3 and QEMU
+                // refuses to start. The guest finds the DTB by scanning
+                // low RAM for the FDT magic, so the address is dynamic.
+                // The initrd goes above the DTB's 1 MiB reservation.
+                let dtb_load = aarch64_initrd::dtb_load_addr(kernel_path)?;
                 let (dtb, initrd_addr) = if let Some(ird) = initrd.as_deref() {
                     let (path, address) =
-                        aarch64_initrd::place(kernel_path, &template, ird, DTB_LOAD_ADDR)?;
+                        aarch64_initrd::place(kernel_path, &template, ird, dtb_load)?;
                     (path, Some(address))
                 } else {
                     (template, None)
@@ -2322,7 +2330,7 @@ impl Arch {
                     format!(
                         "loader,file={},addr={:#x},force-raw=on",
                         dtb.display(),
-                        DTB_LOAD_ADDR
+                        dtb_load
                     ),
                 ]);
 
@@ -2355,8 +2363,6 @@ impl Arch {
         })
     }
 }
-
-const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
 
 /// Initramfs to hand the guest, if any.
 ///
