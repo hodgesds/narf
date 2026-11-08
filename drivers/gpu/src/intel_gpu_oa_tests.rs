@@ -556,10 +556,6 @@ fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
     );
     assert_eq!(open_at(&with(&[(3, 99)]), ALLOW, &none), invalid);
     assert_eq!(
-        open_at(&with(&[(12, 32 << 20)]), ALLOW, &none),
-        Err(Error::Fs(FsError::OutOfMemory))
-    );
-    assert_eq!(
         open_at(&[(7, 4), (4, A24U40), (3, config)], DENY, &render_queue),
         Err(Error::Errno(EOPNOTSUPP))
     );
@@ -567,6 +563,24 @@ fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
         backend.hw.take().is_empty(),
         "refusals never touch the unit"
     );
+    // A 32 MiB buffer is inside the Linux range: the unit grows its
+    // reservation past the 16 MiB default instead of returning ENOMEM.
+    let _fd = open_at(&with(&[(12, 32 << 20)]), ALLOW, &none).unwrap();
+    let file32 = wire.file();
+    assert_eq!(ready(file32.ioctl_user(INFO, 0x5000, &wire)), Ok(0));
+    let mut bytes = [0u8; 40];
+    wire.read(0x5000, &mut bytes).unwrap();
+    assert_eq!(u64_at(&bytes, 8), 32 << 20);
+    assert!(oa_status_string(51).contains("oa_buffer_size: 33554432"));
+    // buffer_field(32 MiB) == 5 in the programmed OABUFFER word.
+    assert!(backend
+        .hw
+        .take()
+        .iter()
+        .any(|&(reg, value)| reg == OABUFFER && value == BASE | 1 | 5 << 3));
+    drop(file32);
+    backend.poll(1);
+    let _ = backend.hw.take();
     // Valid exec queue stream open succeeds unprivileged when sample=false:
     let _fd = open_at(&[(7, 3), (4, A24U40), (3, config)], DENY, &render_queue).unwrap();
     let file = wire.file();
@@ -598,6 +612,125 @@ fn smoke_oa_open_property_privilege_and_errno_order() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_open_property_privilege_and_errno_order
+);
+
+/// Configurable OA buffer size (issue #1777): the Linux 128 KiB..=128 MiB
+/// range, 16 MiB default, out-of-range refusal, reservation growth past
+/// the default, and growth refused while a user mapping aliases the old
+/// pages. The session's INFO size, the programmed OABUFFER field and the
+/// sysfs `oa_buffer_size` node all track the requested size.
+fn smoke_oa_buffer_size_min_max_default_out_of_range() -> TestResult {
+    use narf_filesystem::sysfs::Kobject;
+    const READ: u32 = 1;
+    const PRIVATE: u32 = 2;
+    let backend = Backend::over(device(61, MTL, 1270), Hw::with_host_pages());
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let base = [(2u32, 1u64), (4, A24U40), (3, config)];
+    let open_at = |props: &[(u32, u64)]| {
+        let at = wire.chain(0x1000, props);
+        ready(open(Some(backend.clone()), at, &wire, &none, ALLOW, None))
+    };
+    let with = |size: Option<u64>| {
+        let mut props = base.to_vec();
+        if let Some(size) = size {
+            props.push((12, size));
+        }
+        props
+    };
+    let info = |file: &Arc<dyn FileOps>| {
+        assert_eq!(ready(file.ioctl_user(INFO, 0x5000, &wire)), Ok(0));
+        let mut bytes = [0u8; 40];
+        wire.read(0x5000, &mut bytes).unwrap();
+        u64_at(&bytes, 8)
+    };
+    let invalid = Err(Error::Fs(FsError::InvalidData));
+
+    // Out of range on either side, non-power-of-two, and an explicit zero.
+    for size in [64 << 10, 256 << 20, 3 << 17, 0] {
+        assert_eq!(open_at(&with(Some(size))), invalid);
+    }
+    assert!(
+        backend.hw.take().is_empty(),
+        "refusals never touch the unit"
+    );
+
+    // Default: no property 12 keeps the 16 MiB reservation.
+    let _fd = open_at(&with(None)).unwrap();
+    let file = wire.file();
+    assert_eq!(info(&file), 16 << 20);
+    assert!(oa_status_string(61).contains("oa_buffer_size: 16777216"));
+    drop(file);
+    backend.poll(1);
+
+    // Minimum: 128 KiB opens against the 16 MiB reservation, no growth,
+    // and mmap still demands the whole session buffer.
+    let _fd = open_at(&with(Some(128 << 10))).unwrap();
+    let file = wire.file();
+    assert_eq!(info(&file), 128 << 10);
+    assert_eq!(file.validate_mmap(0, 128 << 10, READ, PRIVATE), Ok(READ));
+    assert_eq!(
+        file.validate_mmap(0, 16 << 20, READ, PRIVATE),
+        Err(FsError::InvalidData)
+    );
+    assert!(oa_status_string(61).contains("oa_buffer_size: 16777216"));
+    drop(file);
+    backend.poll(1);
+
+    // A live mapping pins the reservation: growth past it is ENOMEM, and
+    // the refused open leaves the unit usable once the mapping drops.
+    let _fd = open_at(&with(None)).unwrap();
+    let file = wire.file();
+    let mapping = file.mmap_backing(0, 16 << 20).unwrap();
+    drop(file);
+    assert_eq!(
+        open_at(&with(Some(32 << 20))),
+        Err(Error::Fs(FsError::OutOfMemory))
+    );
+    drop(mapping);
+    backend.poll(1);
+    let _fd = open_at(&with(Some(32 << 20))).unwrap();
+    let file = wire.file();
+    assert_eq!(info(&file), 32 << 20);
+    assert!(oa_status_string(61).contains("oa_buffer_size: 33554432"));
+    assert!(backend
+        .hw
+        .take()
+        .iter()
+        .any(|&(reg, value)| reg == OABUFFER && value == BASE | 1 | 5 << 3));
+    drop(file);
+    backend.poll(1);
+    let _ = backend.hw.take();
+
+    // Maximum: 128 MiB grows the reservation; the sysfs node follows it,
+    // and the OABUFFER field is buffer_field(128 MiB) == 7.
+    let _fd = open_at(&with(Some(128 << 20))).unwrap();
+    let file = wire.file();
+    assert_eq!(info(&file), 128 << 20);
+    assert!(oa_status_string(61).contains("oa_buffer_size: 134217728"));
+    assert!(backend
+        .hw
+        .take()
+        .iter()
+        .any(|&(reg, value)| reg == OABUFFER && value == BASE | 1 | 7 << 3));
+    let card = Kobject::new_root("card61");
+    install_metrics_for_test(61, &card);
+    let oa = card.get_child("oa").expect("oa child exists");
+    assert_eq!(
+        oa.attr_show("oa_buffer_size").as_deref(),
+        Some("134217728\n")
+    );
+    assert!(oa
+        .attr_show("oa_status")
+        .is_some_and(|status| status.contains("oa_buffer_size: 134217728")));
+    drop(file);
+    backend.poll(1);
+    assert!(backend.unit.lock().as_ref().unwrap().idle());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_buffer_size_min_max_default_out_of_range
 );
 
 fn smoke_oa_config_registry_errno_order_ids_and_whitelists() -> TestResult {

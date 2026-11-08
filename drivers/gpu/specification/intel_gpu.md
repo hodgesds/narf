@@ -6074,7 +6074,9 @@ module is `intel_gpu_oa`.
 
 The exact boot opt-in `narf.intel.oa=1` reserves one 16 MiB coherent GGTT
 buffer per card before scheduling starts, the same rule as EU-stall
-sampling. The GT owner keeps it. Writing OACONTROL=0 and the masked
+sampling. A stream that opens a larger buffer, up to the 128 MiB Linux
+maximum, grows the reservation at attach; the reservation never shrinks.
+The GT owner keeps it. Writing OACONTROL=0 and the masked
 MMIO-trigger disable follows `__xe_oa_init_oa_units`. The OAG unit is
 published only for main-GT profiles the source qualifies: DG2 12.55,
 MTL/Arrow 12.70/12.71/12.74, BMG 20.01/20.02 and LNL 20.04. Format masks
@@ -6155,8 +6157,10 @@ poisons the unit.
 
 NARF bounds and differences from the source:
 
-- Buffer sizes above the 16 MiB reservation return ENOMEM, where the
-  source would allocate.
+- A buffer above the current reservation grows it up to 128 MiB at
+  attach; growth returns ENOMEM while a user mapping aliases the old
+  pages or when the allocator refuses, where the source would allocate.
+  The sysfs `oa_buffer_size` node publishes the live reservation.
 - Configurations are capped at 4096 registers (ENOMEM), 131072 registers
   per card (ENOMEM) and 1024 ids (ENOSPC).
 - Current authority is required at every read and control (EACCES); the
@@ -6172,6 +6176,7 @@ Fixtures, all new and unexecuted in this slice, are in
 
 - `smoke_oa_query_units_formats_and_timestamp`
 - `smoke_oa_open_property_privilege_and_errno_order`
+- `smoke_oa_buffer_size_min_max_default_out_of_range`
 - `smoke_oa_config_registry_errno_order_ids_and_whitelists`
 - `smoke_oa_lri_groups_and_ordered_ring_jobs`
 - `smoke_oa_source_register_sequences_per_profile`
@@ -6181,7 +6186,7 @@ Fixtures, all new and unexecuted in this slice, are in
 - `smoke_oa_reset_suspend_loss_and_buffer_retention`
 - `smoke_oa_hardware_bmg_reservation_ring_job_read_and_reset_retirement`
 
-The first nine drive real units, sessions and descriptors against a
+The first ten drive real units, sessions and descriptors against a
 register and memory model. The last drives the real BMG `GuCGt` through the
 existing GuC model:
 
@@ -6433,15 +6438,15 @@ splits and moves:
 - Shared futex keying treats the range as private.
 
 **The OA buffer.** A request that passes the unchanged `xe_oa_mmap` checks
-now maps the stream's first buffer-size pages of the 16 MiB reservation from
-the VMA start, write-back. As in the source, the offset is ignored.
+now maps the stream's first buffer-size pages of the unit's reservation
+(16 MiB by default, grown up to 128 MiB) from the VMA start, write-back. As in the source, the offset is ignored.
 `GpuBacking::host_frame` supplies the pages; only `FrameBacking` has them, so
 model and device-local backings stay ENODEV. Each mapping holds a token on
 the unit's page set. Because the mapping also holds the file, close(fd)
 keeps the stream and its exclusive unit until munmap, as `vm_file` does.
 Once the unit releases the reservation after a GT reset, suspend or
 teardown, new mappings are ENODEV. A unit released while a token lives never
-returns the reservation to its allocator. The 16 MiB GGTT range stays
+returns the reservation to its allocator. The reservation's GGTT range stays
 quarantined, where Linux would keep the BO until the last VMA closes.
 
 NARF gaps: `/proc/<pid>/maps` prints the range as shared (`s`), not `p`,
