@@ -1120,7 +1120,7 @@ pub(crate) fn program_rings(regs: &impl RegIo, tx_phys: u64, rx_phys: u64) {
         DESC_LEN_MSK | RXD_HDR_SPLIT | RXD_VL_STRIP,
         ((RING_LEN as u32 / 8) << DESC_LEN_SHIFT) & DESC_LEN_MSK,
     );
-    regs.write32(reg_rx_dma_buf_size(0), ((RX_BUF_LEN as u32 / 1024) & 0x1F));
+    regs.write32(reg_rx_dma_buf_size(0), (RX_BUF_LEN as u32 / 1024) & 0x1F);
     let (rx_map_reg, rx_map_msk, rx_map_shift) = itr_map_rx_field(0);
     regs.rmw32(rx_map_reg, rx_map_msk, 0 << rx_map_shift);
     regs.set_bit(rx_map_reg, itr_map_rx_en_bit(0));
