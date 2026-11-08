@@ -400,8 +400,19 @@ fn dump_len(r: &narf_memory::address_space::Region) -> u64 {
         && !r.perms.contains(narf_memory::address_space::RegionPerms::WRITE)
     {
         0
+    } else if r.phys.is_empty() {
+        0
     } else {
-        r.len
+        // Dump up to the highest backed page, bounded by r.len.
+        // Trimming unmaterialized tails avoids writing tens of megabytes of zeroes
+        // for sparse thread arenas (e.g. 64 MB thread arenas with only a few pages resident)
+        // and keeps the crash dump from exhausting RLIMIT_CORE before thread stacks are written.
+        r.phys
+            .indexed()
+            .rfind(|(_, phys)| phys.raw() != 0)
+            .map_or(0, |(idx, _)| {
+                ((idx as u64) + 1).saturating_mul(4096).min(r.len)
+            })
     }
 }
 
