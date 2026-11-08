@@ -256,7 +256,15 @@ impl Profile {
                         Some(Vec::new())
                     }
                     (262, "sta_info") => {
-                        let mac: [u8; 6] = body.try_into().unwrap();
+                        // A GET query buffer is zero-padded to the reply
+                        // maximum (Linux bcdc.c; `command_scoped` builds
+                        // `maximum`-sized bodies), so the body is the
+                        // 6-byte MAC followed by zero padding — not
+                        // exactly 6 bytes. The MAC is the prefix, as real
+                        // firmware reads it.
+                        assert!(body.len() >= 6, "sta_info query shorter than a MAC");
+                        let mut mac = [0u8; 6];
+                        mac.copy_from_slice(&body[..6]);
                         let Some(peer) = self.peers.get(&mac) else {
                             self.status = -30;
                             return Some(Vec::new());
