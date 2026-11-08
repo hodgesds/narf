@@ -269,6 +269,7 @@ impl ChannelState {
 }
 
 /// One bound LPSS PWM controller.
+#[derive(Debug)]
 pub struct LpssPwm {
     name: String,
     mmio: MmioRegion,

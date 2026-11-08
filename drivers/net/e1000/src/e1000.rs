@@ -3976,9 +3976,8 @@ impl E1000 {
 // restart; no WoL arming — WoL (audit gap 6) lands as its own item.
 mod pm {
     use super::{
-        MmioRegion, IMS_DEFAULT, RCTL_BAM, RCTL_BSIZE_2K, RCTL_EN, RCTL_MPE, RCTL_SECRC, RCTL_UPE,
-        REG_ICR, REG_IMC, REG_IMS, REG_RCTL, REG_STATUS, REG_TCTL, TCTL_COLD_63, TCTL_CT_15,
-        TCTL_EN, TCTL_PSP, TCTL_RTLC,
+        MmioRegion, IMS_DEFAULT, REG_ICR, REG_IMC, REG_IMS, REG_RCTL, REG_STATUS, REG_TCTL,
+        TCTL_COLD_63, TCTL_CT_15, TCTL_EN, TCTL_PSP, TCTL_RTLC,
     };
     use crate::e1000::E1000;
 
