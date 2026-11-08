@@ -1,5 +1,16 @@
 //! Place QEMU's manually loaded initrd after actual ELF physical/BSS extents.
 //! The dumpdtb kernel stub remains separate; only chosen initrd bounds change.
+//!
+//! The DTB is force-loaded immediately above the kernel image's PT_LOAD/BSS
+//! extents (`dtb_load_addr`), and the initrd goes above the DTB's extent.
+//! The DTB used to sit at a fixed address (0x4f000000), but the kernel
+//! image has grown past it — its segment 3 now spans 0x4c600000..0x4f8ad908,
+//! covering the fixed DTB address, so QEMU refuses to start ("Some ROM
+//! regions are overlapping"). The guest finds the DTB wherever it lands:
+//! both the Rust `scan_for_dtb` and the stub's `.Lfdt_pick` scan low RAM
+//! for the FDT magic, and the relocation avoid-table is built from the
+//! found address, so neither side assumes a fixed DTB address. The guest
+//! reads the initrd bounds from /chosen either way.
 use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,6 +25,23 @@ const ALIGN: u64 = 1024 * 1024;
 const DTB_MAX: usize = 2 * 1024 * 1024;
 const PH_MAX: usize = 4096;
 
+/// Where QEMU's `loader` device puts the DTB: immediately above the
+/// kernel image's PT_LOAD/BSS extents, 1 MiB-aligned. The DTB used to
+/// sit at a fixed address (0x4f000000), but the kernel image has grown
+/// past it — its segment 3 now spans 0x4c600000..0x4f8ad908, covering
+/// the fixed DTB address, so QEMU refuses to start ("Some ROM regions
+/// are overlapping"). The guest finds the DTB wherever it lands: both
+/// the Rust `scan_for_dtb` and the stub's `.Lfdt_pick` scan low RAM
+/// for the FDT magic, and the relocation avoid-table is built from the
+/// found address, so a dynamic address needs no guest change.
+pub(crate) fn dtb_load_addr(kernel: &Path) -> Result<u64> {
+    kernel_end(kernel)?
+        .max(FLOOR)
+        .checked_add(ALIGN - 1)
+        .context("DTB load alignment overflow")
+        .map(|end| end & !(ALIGN - 1))
+}
+
 pub(crate) fn place(
     kernel: &Path,
     dtb: &Path,
@@ -21,7 +49,7 @@ pub(crate) fn place(
     dtb_load: u64,
 ) -> Result<(PathBuf, u64)> {
     let memory_end = kernel_end(kernel)?;
-    let start = memory_end
+    let mut start = memory_end
         .max(FLOOR)
         .checked_add(ALIGN - 1)
         .context("initrd alignment overflow")?
@@ -33,13 +61,37 @@ pub(crate) fn place(
         "initrd must be a nonempty regular file"
     );
     let length = metadata.len();
-    let end = start.checked_add(length).context("initrd end overflow")?;
-    ensure!(
-        end <= dtb_load,
-        "initrd {start:#x}..{end:#x} overlaps DTB at {dtb_load:#x}"
-    );
-
+    let mut end = start.checked_add(length).context("initrd end overflow")?;
     let mut bytes = read_dtb(dtb)?;
+    if end > dtb_load {
+        // The kernel image has outgrown the window below the DTB: its
+        // PT_LOAD/BSS extents now end past the DTB's address, so no
+        // initrd placed after them can end at or before it. Fall back to
+        // placing the initrd above the DTB's own extent instead. The
+        // DTB address itself is dynamic (`dtb_load_addr`, above the
+        // kernel image) — the guest finds it by scanning low RAM for
+        // the FDT magic, so neither side assumes the initrd sits below
+        // it: the Rust memory map reserves the patched /chosen bounds
+        // as-is, and the stub records them in its relocation
+        // avoid-table, so above-DTB placement is safe for both. The
+        // reservation covers the whole loaded file rounded up to ALIGN:
+        // QEMU reserves a whole 1 MiB for the DTB ROM region (observed:
+        // a small DTB file at 0x4f000000 reserves
+        // 0x4f000000..0x4f100000), so placing the initrd at
+        // dtb_load + file length would land it inside that reservation.
+        let dtb_end = dtb_load
+            .checked_add(bytes.len() as u64)
+            .and_then(|end| end.checked_add(ALIGN - 1))
+            .context("DTB end overflow")?
+            & !(ALIGN - 1);
+        start = dtb_end
+            .max(start)
+            .checked_add(ALIGN - 1)
+            .context("initrd alignment overflow")?
+            & !(ALIGN - 1);
+        end = start.checked_add(length).context("initrd end overflow")?;
+    }
+
     let digest = Sha256::digest(&bytes);
     let (first, last) = initrd_properties(&bytes)?;
     patch(&mut bytes, first, start)?;
@@ -367,9 +419,9 @@ fn write_clone(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    struct Temp(PathBuf);
+    pub(crate) struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -386,6 +438,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    /// Minimal AArch64 ELF64 kernel fixture for tests that must hand
+    /// `qemu_args` a real kernel path: aarch64 reads the kernel ELF's
+    /// PT_LOAD/BSS extents to place the DTB above it, so a fake path no
+    /// longer suffices. Returns the temp dir (keep it alive until the
+    /// caller is done — dropping it deletes the file) and the kernel path.
+    pub(crate) fn write_minimal_kernel_elf(loads: &[(u64, u64)]) -> (Temp, PathBuf) {
+        let temp = Temp::new();
+        let path = temp.0.join("kernel.elf");
+        fs::write(&path, elf(loads)).unwrap();
+        (temp, path)
     }
     fn elf(loads: &[(u64, u64)]) -> Vec<u8> {
         let mut bytes = vec![0; 1024];
@@ -560,7 +623,7 @@ mod tests {
         }
     }
     #[test]
-    fn small_kernel_floor_exact_dtb_boundary_and_address_length_keys() {
+    fn small_kernel_floor_exact_dtb_boundary_and_above_dtb_fallback() {
         let temp = Temp::new();
         let tree = dtb(4, 0);
         let (kernel, dtb, initrd) = files(&temp, &elf(&[(0x4008_0000, 4096)]), &tree.bytes, 16);
@@ -572,7 +635,14 @@ mod tests {
             .unwrap()
             .set_len(17)
             .unwrap();
-        assert!(place(&kernel, &dtb, &initrd, FLOOR + 16).is_err());
+        // One byte too long to end at the DTB: the initrd no longer fits
+        // below it, so it moves above the DTB's extent instead of failing.
+        let dtb_end = (FLOOR + 16) + tree.bytes.len() as u64;
+        let expected = (dtb_end + ALIGN - 1) & !(ALIGN - 1);
+        assert_eq!(
+            place(&kernel, &dtb, &initrd, FLOOR + 16).unwrap().1,
+            expected
+        );
         let second = place(&kernel, &dtb, &initrd, 0x4f00_0000).unwrap().0;
         assert_ne!(first, second);
         File::options()
@@ -582,6 +652,46 @@ mod tests {
             .set_len(0)
             .unwrap();
         assert!(place(&kernel, &dtb, &initrd, 0x4f00_0000).is_err());
+    }
+    #[test]
+    fn kernel_past_fixed_dtb_moves_dtb_above_kernel_and_initrd_above_dtb() {
+        // Regression for #1749, completed by the #1780 follow-up: the
+        // kernel-test kernel's PT_LOAD/BSS extents end past the old fixed
+        // DTB address (0x4f000000), so the DTB itself must move above the
+        // kernel image — the #1780 fix only moved the initrd, and QEMU
+        // still refused to start because the kernel's segment 3
+        // (0x4c600000..0x4f8ad908) covered the fixed DTB address
+        // (run 42443722851, "Some ROM regions are overlapping"). With
+        // the dynamic address the layout is: kernel ends 0x4f812345,
+        // DTB at 0x4f900000..0x4fa00000 (QEMU reserves a whole 1 MiB
+        // for it), initrd at 0x4fa00000..0x4fa05608.
+        let temp = Temp::new();
+        let tree = dtb(4, 0);
+        let raw = elf(&[(0x4008_0000, 0x1000), (0x4f80_0000, 0x12345)]);
+        let (kernel, dtb, initrd) = files(&temp, &raw, &tree.bytes, 0x5608);
+        assert_eq!(kernel_end(&kernel).unwrap(), 0x4f81_2345);
+        let dtb_load = dtb_load_addr(&kernel).unwrap();
+        assert_eq!(dtb_load, 0x4f90_0000);
+        let (output, start) = place(&kernel, &dtb, &initrd, dtb_load).unwrap();
+        assert_eq!(start, 0x4fa0_0000);
+        let mut expected = tree.bytes.clone();
+        expected[tree.start..tree.start + 4].copy_from_slice(&[0x4f, 0xa0, 0, 0]);
+        expected[tree.end..tree.end + 4].copy_from_slice(&[0x4f, 0xa0, 0x56, 0x08]);
+        assert_eq!(fs::read(&output).unwrap(), expected);
+        assert_eq!(fs::read(&dtb).unwrap(), tree.bytes);
+    }
+    #[test]
+    fn dtb_load_addr_sits_above_kernel_end_and_floor() {
+        let tree = dtb(4, 0);
+        // Tiny kernel: FLOOR dominates.
+        let temp = Temp::new();
+        let (kernel, _, _) = files(&temp, &elf(&[(0x4008_0000, 4096)]), &tree.bytes, 16);
+        assert_eq!(dtb_load_addr(&kernel).unwrap(), FLOOR);
+        // Kernel ending past FLOOR: kernel end dominates, 1 MiB-aligned.
+        let temp = Temp::new();
+        let raw = elf(&[(0x4008_0000, 0x1000), (0x4f80_0000, 0x12345)]);
+        let (kernel, _, _) = files(&temp, &raw, &tree.bytes, 16);
+        assert_eq!(dtb_load_addr(&kernel).unwrap(), 0x4f90_0000);
     }
     #[test]
     fn elf_header_table_and_segment_failures_are_checked() {

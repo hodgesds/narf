@@ -2310,9 +2310,17 @@ impl Arch {
                 .join(" ");
                 let initrd = TEST_INITRD.lock().ok().and_then(|g| g.clone());
                 let template = qemu_virt_dtb_path_with_cmdline(&append, initrd.as_deref());
+                // The DTB sits immediately above the kernel image's
+                // PT_LOAD/BSS extents (`dtb_load_addr`): the kernel has
+                // grown past the old fixed address (0x4f000000), so a
+                // fixed DTB overlaps the kernel's segment 3 and QEMU
+                // refuses to start. The guest finds the DTB by scanning
+                // low RAM for the FDT magic, so the address is dynamic.
+                // The initrd goes above the DTB's 1 MiB reservation.
+                let dtb_load = aarch64_initrd::dtb_load_addr(kernel_path)?;
                 let (dtb, initrd_addr) = if let Some(ird) = initrd.as_deref() {
                     let (path, address) =
-                        aarch64_initrd::place(kernel_path, &template, ird, DTB_LOAD_ADDR)?;
+                        aarch64_initrd::place(kernel_path, &template, ird, dtb_load)?;
                     (path, Some(address))
                 } else {
                     (template, None)
@@ -2322,7 +2330,7 @@ impl Arch {
                     format!(
                         "loader,file={},addr={:#x},force-raw=on",
                         dtb.display(),
-                        DTB_LOAD_ADDR
+                        dtb_load
                     ),
                 ]);
 
@@ -2355,8 +2363,6 @@ impl Arch {
         })
     }
 }
-
-const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
 
 /// Initramfs to hand the guest, if any.
 ///
@@ -12352,6 +12358,12 @@ mod kernel_test_feature_tests {
     fn audio_controllers_have_independent_qemu_backends() {
         use super::{Arch, GpuBackend, HwProfile};
         use std::collections::BTreeSet;
+        // aarch64 `qemu_args` reads the kernel ELF's PT_LOAD/BSS extents
+        // to place the DTB above it, so the fake "kernel" path no longer
+        // suffices: hand it a real minimal ELF fixture instead (the
+        // x86_64 arm never opens the file, so the same path works there).
+        let (_kernel_temp, kernel) =
+            crate::aarch64_initrd::tests::write_minimal_kernel_elf(&[(0x4008_0000, 0x1000)]);
         for arch in [Arch::X86_64, Arch::Aarch64] {
             for profile in [
                 HwProfile::Full,
@@ -12360,13 +12372,7 @@ mod kernel_test_feature_tests {
                 HwProfile::Minimal,
             ] {
                 let args = arch
-                    .qemu_args(
-                        std::path::Path::new("kernel"),
-                        "none",
-                        profile,
-                        GpuBackend::Virtio2d,
-                        "",
-                    )
+                    .qemu_args(&kernel, "none", profile, GpuBackend::Virtio2d, "")
                     .unwrap();
                 let backends: Vec<_> = args
                     .windows(2)

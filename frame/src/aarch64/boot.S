@@ -591,8 +591,10 @@ _start_rust_entry:
      * it silently declined to relocate at all.
      *
      * Same three-step search the Rust side already does in `scan_for_dtb`:
-     * the handoff pointer, then the fixed address xtask force-loads the blob at,
-     * then a bounded scan of low RAM for the magic.
+     * the handoff pointer, then the historical fixed address a loader
+     * may still place the blob at, then a bounded scan of low RAM for
+     * the magic. xtask now places the DTB dynamically above the kernel
+     * image, so the scan is usually the operative step.
      */
     movz w1, #0xfeed
     movk w1, #0xd00d, lsl #16           /* w1 = FDT magic, host order */
