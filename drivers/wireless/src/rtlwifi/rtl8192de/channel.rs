@@ -40,7 +40,7 @@
 //! the IQK reload (`rtl92d_phy_reload_iqk_setting`), and the LCK
 //! in-progress wait — all calibration-table work owned by later lanes.
 
-use super::phy::{self, Path, PgStore};
+use super::phy::{self, PgStore};
 use super::txpower::{self, Efuse};
 use super::{Band, BandSet, MacPhyMode, RfType};
 use crate::rtlwifi::firmware_transport::Io;
