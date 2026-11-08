@@ -9,10 +9,11 @@ use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_modeset::Mode,
     intel_gpu_vrr::{
-        capture_mode_from_hw, cmrr_disable, cmrr_enable, install_vbt, installed_vrr,
-        is_cmrr_active, is_vrr_active, mode_vrefresh, msa_timing_par_ignore_wanted, on_plane_flip,
-        populate_card, program_cmrr_timings, program_fixed_rr_timings, program_vrr_timings,
-        readback_vrr, recompute_timings_for_modeset, reconcile_vrr_at_setup,
+        capture_mode_from_hw, cmrr_disable, cmrr_enable, cmrr_get_vtotal, install_vbt,
+        installed_vrr, is_cmrr_active, is_cmrr_frac_required, is_vrr_active, mode_vrefresh,
+        msa_timing_par_ignore_wanted, on_plane_flip, populate_card, program_cmrr_timings,
+        program_fixed_rr_timings, program_vrr_timings, readback_vrr, recompute_timings_for_modeset,
+        reconcile_vrr_at_setup, request_cmrr_enabled, request_vrr_enabled,
         set_context_latency_for_crtc, sink_vrr_range, vrr_disable, vrr_enable, vrr_excludes_psr,
         vrr_is_variable, vrr_send_push, vrr_status_string, CmrrRate, CmrrTimings, DisplayVrrIp,
         VbtVrr, VrrComputeOpts, VrrConnectorKind, VrrRange, VrrTimings, VrrTranscoder,
@@ -81,6 +82,47 @@ fn mode_1080p60() -> Mode {
         v_total: 1125,
         v_sync_start: 1084,
         v_sync_end: 1089,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    }
+}
+
+/// 1920x1080 at 59.940 Hz: the same totals as [`mode_1080p60`] with
+/// the NTSC pixel clock (148352 kHz). The nominal refresh rounds to
+/// 60 Hz, so the precise-vs-nominal gap is 0.07 Hz — below the CMRR
+/// tolerance.
+fn mode_1080p59_940() -> Mode {
+    Mode {
+        pixel_clock_khz: 148_352,
+        ..mode_1080p60()
+    }
+}
+
+/// 1920x1080 at 119.880 Hz: the same totals with the doubled NTSC
+/// clock (296703 kHz). The nominal refresh rounds to 120 Hz, so the
+/// precise-vs-nominal gap is 0.12 Hz — above the CMRR tolerance.
+fn mode_1080p119_88() -> Mode {
+    Mode {
+        pixel_clock_khz: 296_703,
+        ..mode_1080p60()
+    }
+}
+
+/// Synthetic tolerance-boundary mode: htotal = vtotal = 1000, so the
+/// precise refresh is exactly `clock_khz / 1000` Hz and the nominal
+/// is its rounding. Clock 119900 kHz gives a 0.10 Hz gap (at the
+/// tolerance: required); 119910 kHz gives a 0.09 Hz gap (below: not).
+fn mode_tol_boundary(clock_khz: u32) -> Mode {
+    Mode {
+        pixel_clock_khz: clock_khz,
+        h_active: 800,
+        h_total: 1000,
+        h_sync_start: 840,
+        h_sync_end: 880,
+        v_active: 960,
+        v_total: 1000,
+        v_sync_start: 970,
+        v_sync_end: 975,
         h_sync_positive: true,
         v_sync_positive: true,
     }
@@ -416,33 +458,54 @@ fn smoke_intel_cmrr_rate_fractions_and_timings_computation() -> TestResult {
         None
     );
 
-    // 1080p60 on Display 14 at exact 60 Hz: M == N
+    // 1080p60 on Display 14 at exact 60 Hz: the derived vtotal is the
+    // mode's (1125) and M/N come from `cmrr_get_vtotal` — M = 1125,
+    // N = 60 * 2200 (NOT the old fixed 1e9 precision pair M == N).
     let t60 = CmrrTimings::compute(&m, CmrrRate::Fps60, DisplayVrrIp::Display14)
         .expect("Display 14 60Hz CMRR");
-    assert_eq!(t60.cmrr_n, 1_000_000_000);
-    assert_eq!(t60.cmrr_m, 1_000_000_000);
+    assert_eq!(t60.cmrr_n, 132_000);
+    assert_eq!(t60.cmrr_m, 1125);
     assert_eq!(t60.vmin, 1125);
     assert_eq!(t60.vmax, 1125);
     assert_eq!(t60.flipline, 1125);
     assert_eq!(t60.guardband, 45);
 
-    // 1080p60 on Display 20 at 59.940 Hz: M = 999_000_999
+    // 1080p60 on Display 20 at 59.940 Hz: a /1001 content rate takes
+    // the 1001/1000 multipliers, so M = 148500000 * 1001 / 132000000
+    // = 1126 (truncating) and N = 60 * 2200 * 1000 = 132_000_000.
+    // The derived vtotal is still the mode's 1125.
     let t59 = CmrrTimings::compute(&m, CmrrRate::Fps59_940, DisplayVrrIp::Display20)
         .expect("Display 20 59.940Hz CMRR");
-    assert_eq!(t59.cmrr_n, 1_000_000_000);
-    assert_eq!(t59.cmrr_m, 999_000_999);
+    assert_eq!(t59.cmrr_n, 132_000_000);
+    assert_eq!(t59.cmrr_m, 1126);
+    assert_eq!(t59.vmin, 1125);
+    assert_eq!(t59.vmax, 1125);
+    assert_eq!(t59.flipline, 1125);
 
-    // 1080p60 on Display 30 at 24 Hz: M = 400_000_000
+    // 1080p60 on Display 30 at 24 Hz: an integral rate takes the 1/1
+    // multipliers, so M = 148500000 / 132000 = 1125 and N =
+    // 60 * 2200 = 132_000. The refresh inside N is always the *mode's*
+    // refresh (60 Hz); the content rate only selects the multipliers,
+    // which is why the 24 Hz and 60 Hz cases agree here.
     let t24 = CmrrTimings::compute(&m, CmrrRate::Fps24, DisplayVrrIp::Display30)
         .expect("Display 30 24Hz CMRR");
-    assert_eq!(t24.cmrr_n, 1_000_000_000);
-    assert_eq!(t24.cmrr_m, 400_000_000);
+    assert_eq!(t24.cmrr_n, 132_000);
+    assert_eq!(t24.cmrr_m, 1125);
+    assert_eq!(t24.vmin, 1125);
+    assert_eq!(t24.vmax, 1125);
+    assert_eq!(t24.flipline, 1125);
 
-    // 1080p60 on Display 30 at 23.976 Hz: M = 399_600_399
+    // 1080p60 on Display 30 at 23.976 Hz: /1001 again, M = 1126,
+    // N = 132_000_000 — same as the 59.940 case, because only the
+    // multipliers change with the rate; the refresh in N is the
+    // mode's 60 Hz in both cases.
     let t23 = CmrrTimings::compute(&m, CmrrRate::Fps23_976, DisplayVrrIp::Display30)
         .expect("Display 30 23.976Hz CMRR");
-    assert_eq!(t23.cmrr_n, 1_000_000_000);
-    assert_eq!(t23.cmrr_m, 399_600_399);
+    assert_eq!(t23.cmrr_n, 132_000_000);
+    assert_eq!(t23.cmrr_m, 1126);
+    assert_eq!(t23.vmin, 1125);
+    assert_eq!(t23.vmax, 1125);
+    assert_eq!(t23.flipline, 1125);
 
     TestResult::Pass
 }
@@ -1038,6 +1101,7 @@ fn smoke_intel_vrr_per_modeset_compute() -> TestResult {
         Some(range),
         DisplayVrrIp::Gen12,
         Default::default(),
+        VrrConnectorKind::DisplayPort,
     )
     .expect("recompute stores timings");
     assert_eq!(VRR_STATE.mode(crtc_id), Some(m));
@@ -1046,7 +1110,14 @@ fn smoke_intel_vrr_per_modeset_compute() -> TestResult {
     assert_eq!(stored.pipeline_full, 45);
 
     assert_eq!(
-        recompute_timings_for_modeset(crtc_id, &m, None, DisplayVrrIp::Gen12, Default::default()),
+        recompute_timings_for_modeset(
+            crtc_id,
+            &m,
+            None,
+            DisplayVrrIp::Gen12,
+            Default::default(),
+            VrrConnectorKind::DisplayPort,
+        ),
         None
     );
     assert_eq!(VRR_STATE.range(crtc_id), None);
@@ -1058,6 +1129,7 @@ fn smoke_intel_vrr_per_modeset_compute() -> TestResult {
             Some(floor60),
             DisplayVrrIp::Gen12,
             Default::default(),
+            VrrConnectorKind::DisplayPort,
         ),
         None
     );
@@ -1493,3 +1565,301 @@ fn smoke_intel_vrr_reconcile_cmrr() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/intel_gpu_vrr", smoke_intel_vrr_reconcile_cmrr);
+
+// ── Test 20: CMRR fractional-refresh requirement (`is_cmrr_frac_required`) ──
+//
+// Pins the Linux tolerance check against modes built from the spec
+// formulas, not from the code under test: every expected verdict
+// below is derived by hand from `intel_vrr.c`.
+fn smoke_intel_cmrr_frac_required() -> TestResult {
+    let ip = DisplayVrrIp::Display14;
+
+    // Integral refresh: nominal == precise, difference 0.
+    assert!(!is_cmrr_frac_required(&mode_1080p60(), ip));
+
+    // 59.94 Hz: nominal 60, precise 59.94 — the 0.07 Hz gap is BELOW
+    // the 0.10 Hz tolerance, so CMRR is NOT required. This is the
+    // counterintuitive pin: the most common fractional mode does not
+    // trigger the check.
+    assert!(!is_cmrr_frac_required(&mode_1080p59_940(), ip));
+
+    // 119.88 Hz: nominal 120, precise 119.88 — the 0.12 Hz gap is
+    // ABOVE the tolerance, so CMRR IS required.
+    assert!(is_cmrr_frac_required(&mode_1080p119_88(), ip));
+
+    // Tolerance boundary, synthetic 1000x1000-total modes: a 0.10 Hz
+    // gap (diff == tolerance) requires CMRR; a 0.09 Hz gap does not.
+    assert!(is_cmrr_frac_required(&mode_tol_boundary(119_900), ip));
+    assert!(!is_cmrr_frac_required(&mode_tol_boundary(119_910), ip));
+
+    // A real 23.976 Hz mode (clock 59340 kHz): nominal 24, precise
+    // 23.976 — the 0.024 Hz gap is far below tolerance.
+    let m23976 = Mode {
+        pixel_clock_khz: 59_340,
+        ..mode_1080p60()
+    };
+    assert!(!is_cmrr_frac_required(&m23976, ip));
+
+    // No CMRR support, no requirement — even for the 119.88 Hz mode
+    // that requires it on Display 14.
+    assert!(!is_cmrr_frac_required(
+        &mode_1080p119_88(),
+        DisplayVrrIp::Gen12
+    ));
+    assert!(!is_cmrr_frac_required(
+        &mode_1080p119_88(),
+        DisplayVrrIp::Display13
+    ));
+
+    // Degenerate modes never require CMRR (no division by zero).
+    let zero_clock = Mode {
+        pixel_clock_khz: 0,
+        ..mode_1080p60()
+    };
+    assert!(!is_cmrr_frac_required(&zero_clock, ip));
+    let zero_htotal = Mode {
+        h_total: 0,
+        ..mode_1080p60()
+    };
+    assert!(!is_cmrr_frac_required(&zero_htotal, ip));
+    let zero_vtotal = Mode {
+        v_total: 0,
+        ..mode_1080p60()
+    };
+    assert!(!is_cmrr_frac_required(&zero_vtotal, ip));
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_gpu_vrr", smoke_intel_cmrr_frac_required);
+
+// ── Test 21: CMRR M/N + vtotal derivation (`cmrr_get_vtotal`) ───────────────
+//
+// Pins the Linux derivation against hand-computed values (see
+// `cmrr_get_vtotal`): the derived vtotal is NOT the mode's vtotal in
+// general, and the /1001 multipliers apply only when
+// `video_mode_required` is true.
+fn smoke_intel_cmrr_get_vtotal() -> TestResult {
+    let m60 = mode_1080p60();
+    let m5994 = mode_1080p59_940();
+    let m11988 = mode_1080p119_88();
+
+    // 1080p60, video=false: M = 148500000 / 132000 = 1125,
+    // N = 60 * 2200 = 132000, vtotal = ceil(148500000 / 132000) = 1125.
+    assert_eq!(cmrr_get_vtotal(&m60, false), Some((1125, 132_000, 1125)));
+    // Same mode, video=true: the 1001/1000 multipliers give
+    // M = 148500000 * 1001 / 132000000 = 1126 (truncating),
+    // N = 60 * 2200 * 1000 = 132_000_000, vtotal unchanged at 1125.
+    assert_eq!(cmrr_get_vtotal(&m60, true), Some((1126, 132_000_000, 1125)));
+
+    // 59.94 Hz mode, video=false: the derived vtotal is 1124, NOT
+    // the mode's 1125 — ceil(148352000 / 132000) = 1124 — and
+    // M = 148352000 / 132000 = 1123 (truncating). This is the pin
+    // that catches the old "vtotal is always the mode's" behavior.
+    assert_eq!(cmrr_get_vtotal(&m5994, false), Some((1123, 132_000, 1124)));
+    // Same mode, video=true: M = 148352000 * 1001 / 132000000 =
+    // 1125, N = 132_000_000, vtotal still 1124.
+    assert_eq!(
+        cmrr_get_vtotal(&m5994, true),
+        Some((1125, 132_000_000, 1124))
+    );
+
+    // 119.88 Hz mode, video=false: M = 296703000 / 264000 = 1123,
+    // N = 120 * 2200 = 264000, vtotal = ceil(296703000 / 264000) = 1124.
+    assert_eq!(cmrr_get_vtotal(&m11988, false), Some((1123, 264_000, 1124)));
+    // Same mode, video=true: M = 296703000 * 1001 / 264000000 = 1124,
+    // N = 264_000_000, vtotal 1124.
+    assert_eq!(
+        cmrr_get_vtotal(&m11988, true),
+        Some((1124, 264_000_000, 1124))
+    );
+
+    // Degenerate modes derive nothing.
+    let zero_clock = Mode {
+        pixel_clock_khz: 0,
+        ..m60
+    };
+    assert_eq!(cmrr_get_vtotal(&zero_clock, false), None);
+    let zero_htotal = Mode { h_total: 0, ..m60 };
+    assert_eq!(cmrr_get_vtotal(&zero_htotal, false), None);
+    let zero_vtotal = Mode { v_total: 0, ..m60 };
+    assert_eq!(cmrr_get_vtotal(&zero_vtotal, false), None);
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_gpu_vrr", smoke_intel_cmrr_get_vtotal);
+
+// ── Test 22: CMRR auto-enable on fractional refresh (#1771) ─────────────────
+//
+// Drives `recompute_timings_for_modeset` — the per-modeset compute —
+// and asserts the CMRR arming in `VRR_STATE`. There is no controller
+// in the test guest, so `request_cmrr_enabled` stores the flag
+// without programming hardware; the assertions are on the stored
+// state, which is exactly what the modeset arms.
+fn smoke_intel_cmrr_auto_enable() -> TestResult {
+    let crtc_id = 1;
+    let ip = DisplayVrrIp::Display14;
+    let m60 = mode_1080p60();
+    let m5994 = mode_1080p59_940();
+    let m11988 = mode_1080p119_88();
+
+    // Start clean: no VRR, no CMRR, no auto mark.
+    VRR_STATE.set_enabled(crtc_id, false);
+    VRR_STATE.set_cmrr_enabled(crtc_id, false);
+    VRR_STATE.set_cmrr_auto(crtc_id, false);
+    VRR_STATE.set_cmrr_timings(crtc_id, None);
+
+    // eDP + 119.88 Hz + no range: CMRR auto-arms from the mode
+    // alone (the eDP path publishes no range yet). The timings are
+    // the `compute_auto` derivation: M = 1123, N = 264000,
+    // vtotal 1124.
+    let _ = recompute_timings_for_modeset(
+        crtc_id,
+        &m11988,
+        None,
+        ip,
+        Default::default(),
+        VrrConnectorKind::EmbeddedDisplayPort,
+    );
+    assert!(VRR_STATE.is_cmrr_enabled(crtc_id));
+    assert!(VRR_STATE.is_cmrr_auto(crtc_id));
+    let armed = VRR_STATE
+        .cmrr_timings(crtc_id)
+        .expect("auto-armed CMRR timings");
+    assert_eq!(armed.cmrr_m, 1123);
+    assert_eq!(armed.cmrr_n, 264_000);
+    assert_eq!(armed.vmin, 1124);
+    assert_eq!(armed.vmax, 1124);
+    assert_eq!(armed.flipline, 1124);
+
+    // A modeset to a different fractional mode re-derives: the
+    // 119.88 timings are replaced, not kept stale. (59.94 does not
+    // require CMRR, so the tolerance-boundary 119.9 Hz mode stands
+    // in as the second fractional mode.)
+    let m1199 = mode_tol_boundary(119_900);
+    let _ = recompute_timings_for_modeset(
+        crtc_id,
+        &m1199,
+        None,
+        ip,
+        Default::default(),
+        VrrConnectorKind::EmbeddedDisplayPort,
+    );
+    assert!(VRR_STATE.is_cmrr_enabled(crtc_id));
+    assert!(VRR_STATE.is_cmrr_auto(crtc_id));
+    let rearmed = VRR_STATE
+        .cmrr_timings(crtc_id)
+        .expect("re-derived CMRR timings");
+    // N = 120 * 1000 = 120000, M = 119900000 / 120000 = 999,
+    // vtotal = ceil(119900000 / 120000) = 1000.
+    assert_eq!(rearmed.cmrr_m, 999);
+    assert_eq!(rearmed.cmrr_n, 120_000);
+    assert_eq!(rearmed.vmin, 1000);
+
+    // A modeset to an integral mode disarms the auto CMRR.
+    let _ = recompute_timings_for_modeset(
+        crtc_id,
+        &m60,
+        None,
+        ip,
+        Default::default(),
+        VrrConnectorKind::EmbeddedDisplayPort,
+    );
+    assert!(!VRR_STATE.is_cmrr_enabled(crtc_id));
+    assert!(!VRR_STATE.is_cmrr_auto(crtc_id));
+    assert_eq!(VRR_STATE.cmrr_timings(crtc_id), None);
+
+    // A 59.94 Hz mode does NOT auto-arm (below tolerance).
+    let _ = recompute_timings_for_modeset(
+        crtc_id,
+        &m5994,
+        None,
+        ip,
+        Default::default(),
+        VrrConnectorKind::EmbeddedDisplayPort,
+    );
+    assert!(!VRR_STATE.is_cmrr_enabled(crtc_id));
+    assert!(!VRR_STATE.is_cmrr_auto(crtc_id));
+
+    // External DisplayPort never auto-arms, even for 119.88 Hz.
+    let _ = recompute_timings_for_modeset(
+        crtc_id,
+        &m11988,
+        None,
+        ip,
+        Default::default(),
+        VrrConnectorKind::DisplayPort,
+    );
+    assert!(!VRR_STATE.is_cmrr_enabled(crtc_id));
+
+    // A CMRR-incapable IP never auto-arms.
+    let _ = recompute_timings_for_modeset(
+        crtc_id,
+        &m11988,
+        None,
+        DisplayVrrIp::Gen12,
+        Default::default(),
+        VrrConnectorKind::EmbeddedDisplayPort,
+    );
+    assert!(!VRR_STATE.is_cmrr_enabled(crtc_id));
+
+    // VRR enabled wins (Linux's else-if): with VRR on, eDP +
+    // 119.88 Hz does not auto-arm CMRR.
+    VRR_STATE.set_enabled(crtc_id, true);
+    let _ = recompute_timings_for_modeset(
+        crtc_id,
+        &m11988,
+        None,
+        ip,
+        Default::default(),
+        VrrConnectorKind::EmbeddedDisplayPort,
+    );
+    assert!(!VRR_STATE.is_cmrr_enabled(crtc_id));
+    VRR_STATE.set_enabled(crtc_id, false);
+
+    // Enabling VRR disarms an already auto-armed CMRR.
+    let _ = recompute_timings_for_modeset(
+        crtc_id,
+        &m11988,
+        None,
+        ip,
+        Default::default(),
+        VrrConnectorKind::EmbeddedDisplayPort,
+    );
+    assert!(VRR_STATE.is_cmrr_auto(crtc_id));
+    request_vrr_enabled(crtc_id, true);
+    assert!(VRR_STATE.is_enabled(crtc_id));
+    assert!(!VRR_STATE.is_cmrr_enabled(crtc_id));
+    assert!(!VRR_STATE.is_cmrr_auto(crtc_id));
+    assert_eq!(VRR_STATE.cmrr_timings(crtc_id), None);
+    request_vrr_enabled(crtc_id, false);
+
+    // A manual sysfs-style enable is never disarmed by a modeset:
+    // arm manually, modeset to an integral mode, and the manual
+    // enable + timings stand.
+    let manual = CmrrTimings::compute(&m60, CmrrRate::Fps60, ip).expect("manual CMRR timings");
+    VRR_STATE.set_cmrr_timings(crtc_id, Some(manual));
+    request_cmrr_enabled(crtc_id, true);
+    assert!(!VRR_STATE.is_cmrr_auto(crtc_id));
+    let _ = recompute_timings_for_modeset(
+        crtc_id,
+        &m60,
+        None,
+        ip,
+        Default::default(),
+        VrrConnectorKind::EmbeddedDisplayPort,
+    );
+    assert!(VRR_STATE.is_cmrr_enabled(crtc_id));
+    assert_eq!(VRR_STATE.cmrr_timings(crtc_id), Some(manual));
+
+    // Clean up so later tests start from a known state.
+    VRR_STATE.set_enabled(crtc_id, false);
+    VRR_STATE.set_cmrr_enabled(crtc_id, false);
+    VRR_STATE.set_cmrr_auto(crtc_id, false);
+    VRR_STATE.set_cmrr_timings(crtc_id, None);
+    VRR_STATE.set_mode(crtc_id, None);
+    VRR_STATE.set_range(crtc_id, None);
+    VRR_STATE.set_timings(crtc_id, None);
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_gpu_vrr", smoke_intel_cmrr_auto_enable);

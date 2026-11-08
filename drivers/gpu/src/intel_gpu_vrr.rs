@@ -507,6 +507,100 @@ impl VrrTimings {
 
 // ── CMRR (Content-Matched Refresh Rate) ──────────────────────────────────────
 
+/// Fixed-point precision for the CMRR fractional-refresh tolerance
+/// check: refresh rates are compared in hundredths of a hertz.
+/// Linux `intel_vrr.c`: `#define FIXED_POINT_PRECISION 100`.
+pub const FIXED_POINT_PRECISION: u32 = 100;
+
+/// Tolerance for the CMRR fractional-refresh check, in
+/// [`FIXED_POINT_PRECISION`] units (i.e. 0.10 Hz). Linux
+/// `intel_vrr.c`: `#define CMRR_PRECISION_TOLERANCE 10`.
+pub const CMRR_PRECISION_TOLERANCE: u32 = 10;
+
+/// Linux `is_cmrr_frac_required`
+/// (`drivers/gpu/drm/i915/display/intel_vrr.c`, #1771): true when the
+/// mode's nominal refresh exceeds the refresh implied by its pixel
+/// clock and totals by at least [`CMRR_PRECISION_TOLERANCE`] — i.e.
+/// the panel is running a fractional refresh (e.g. 119.88 Hz against
+/// a 120 Hz nominal) and needs CMRR to hit the exact rate.
+///
+/// Two notes on the port. First, Linux compares against
+/// `drm_mode_vrefresh`, the mode's *nominal* integer refresh; NARF
+/// has no nominal field on [`Mode`], so [`mode_vrefresh`] (the
+/// refresh rounded from the same clock/totals) stands in for it —
+/// the two agree whenever the mode's clock and totals are consistent
+/// with its nominal refresh, which is the EDID case. Second, Linux
+/// compares the *signed* difference against the tolerance; a
+/// negative difference (nominal below the precise refresh) never
+/// meets it, so the saturating unsigned form below is equivalent.
+///
+/// Consequences worth knowing: a 59.94 Hz mode does NOT require CMRR
+/// (nominal 60, precise 59.94, difference 0.07 Hz < 0.10 Hz), while a
+/// 119.88 Hz mode does (difference 0.12 Hz). The check fires only
+/// for high-refresh /1001 modes in practice.
+pub fn is_cmrr_frac_required(mode: &Mode, ip: DisplayVrrIp) -> bool {
+    if !ip.supports_cmrr() {
+        return false;
+    }
+    if mode.h_total == 0 || mode.v_total == 0 {
+        return false;
+    }
+    // actual_refresh_k = drm_mode_vrefresh * FIXED_POINT_PRECISION
+    let actual_refresh_k = u64::from(mode_vrefresh(mode)) * u64::from(FIXED_POINT_PRECISION);
+    // pixel_clock_per_line = clock * 1000 / htotal
+    let pixel_clock_per_line = u64::from(mode.pixel_clock_khz) * 1000 / u64::from(mode.h_total);
+    // calculated_refresh_k = pixel_clock_per_line * FIXED_POINT_PRECISION / vtotal
+    let calculated_refresh_k =
+        pixel_clock_per_line * u64::from(FIXED_POINT_PRECISION) / u64::from(mode.v_total);
+    actual_refresh_k.saturating_sub(calculated_refresh_k) >= u64::from(CMRR_PRECISION_TOLERANCE)
+}
+
+/// Linux `cmrr_get_vtotal`
+/// (`drivers/gpu/drm/i915/display/intel_vrr.c`, #1771): derive the
+/// CMRR vtotal and the M/N dividers from the committed mode.
+/// Returns `(cmrr_m, cmrr_n, vtotal)`.
+///
+/// Linux stores M/N on the crtc state as a side effect and returns
+/// only the vtotal; this port returns all three so the derivation
+/// stays a pure function. Linux computes in `u32` (with `do_div`
+/// for the 64-bit dividend); this port widens to `u64`, which is
+/// strictly safer — `refresh * htotal * 1000` can exceed `u32` for
+/// high-refresh modes — and agrees with Linux on every realistic
+/// mode.
+///
+/// `video_mode_required` selects the 1001/1000 multipliers for the
+/// /1001 (NTSC) target rates. The derived vtotal is
+/// `DIV_ROUND_UP(clock * 1000 * multiplier_n, cmrr_n)` and is NOT
+/// the mode's vtotal in general: a 59.94 Hz mode (clock 148352 kHz,
+/// htotal 2200) derives 1124, not 1125 — that one-line difference
+/// is the CMRR adjustment, and it is what the old fixed-`1e9`
+/// computation missed (it always returned the mode's vtotal).
+pub fn cmrr_get_vtotal(mode: &Mode, video_mode_required: bool) -> Option<(u64, u64, u32)> {
+    if mode.h_total == 0 || mode.v_total == 0 || mode.pixel_clock_khz == 0 {
+        return None;
+    }
+    if mode.v_total <= mode.v_active || mode.v_sync_start > mode.v_total {
+        return None;
+    }
+    let refresh = u64::from(mode_vrefresh(mode));
+    if refresh == 0 {
+        return None;
+    }
+    let (multiplier_m, multiplier_n) = if video_mode_required {
+        (1001u64, 1000u64)
+    } else {
+        (1u64, 1u64)
+    };
+    let clock_hz = u64::from(mode.pixel_clock_khz) * 1000;
+    let htotal = u64::from(mode.h_total);
+    let cmrr_n = refresh * htotal * multiplier_n;
+    // DIV_ROUND_UP(clock_hz * multiplier_n, cmrr_n)
+    let vtotal = u32::try_from((clock_hz * multiplier_n).div_ceil(cmrr_n)).ok()?;
+    // Truncating division, as in Linux (`do_div`).
+    let cmrr_m = (clock_hz * multiplier_m) / cmrr_n;
+    Some((cmrr_m, cmrr_n, vtotal))
+}
+
 /// Target content frame rate for Content-Matched Refresh Rate (CMRR).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmrrRate {
@@ -547,6 +641,18 @@ impl CmrrRate {
             Self::Fps60 => (60, 1),
             Self::Custom { num, den } => (num as u64, den as u64),
         }
+    }
+
+    /// True for the /1001 (NTSC) rates — the "video mode" of Linux
+    /// `cmrr_get_vtotal`'s `video_mode_required` flag, which selects
+    /// the 1001/1000 multipliers. Resolves the open TODO in Linux
+    /// `intel_vrr_compute_config` ("Compute precise target refresh
+    /// rate to determine if video_mode_required should be true.
+    /// Currently false."): the content rate NARF carries *is* the
+    /// target rate, so a /1001 content rate is a video-mode target
+    /// and an integral rate is not.
+    pub const fn is_video_mode(self) -> bool {
+        self.fraction().1 == 1001
     }
 
     /// String representation of the standard rate in Hz (e.g. "59.940").
@@ -612,36 +718,45 @@ pub struct CmrrTimings {
 
 impl CmrrTimings {
     /// Compute transcoder CMRR M and N dividers and timing registers for a given mode and content frame rate.
+    ///
+    /// Linux-aligned (#1771): the dividers and the vtotal come from
+    /// [`cmrr_get_vtotal`] (`intel_vrr.c`), not from a fixed 1e9
+    /// precision constant — `vmin = vmax = flipline` is the *derived*
+    /// vtotal, which differs from the mode's vtotal when the mode's
+    /// pixel clock does not divide evenly (a 59.94 Hz mode derives
+    /// 1124, not 1125). The old fixed-precision M/N values
+    /// (1_000_000_000 / 999_000_999 / 400_000_000 / 399_600_399) were
+    /// the pre-Linux-alignment computation and are superseded.
     pub fn compute(mode: &Mode, rate: CmrrRate, ip: DisplayVrrIp) -> Option<Self> {
         if !ip.supports_cmrr() {
-            return None;
-        }
-        if mode.h_total == 0 || mode.v_total == 0 || mode.pixel_clock_khz == 0 {
-            return None;
-        }
-        if mode.v_total <= mode.v_active || mode.v_sync_start > mode.v_total {
             return None;
         }
         let (fps_num, fps_den) = rate.fraction();
         if fps_num == 0 || fps_den == 0 {
             return None;
         }
+        let (cmrr_m, cmrr_n, vtotal) = cmrr_get_vtotal(mode, rate.is_video_mode())?;
+        Some(Self::from_derived(mode, cmrr_m, cmrr_n, vtotal, ip))
+    }
 
-        let pixel_clock_hz = u64::from(mode.pixel_clock_khz) * 1000;
-        let htotal = u64::from(mode.h_total);
-        let vtotal = u64::from(mode.v_total);
-
-        // Fixed precision multiplier (1_000_000_000)
-        let cmrr_n = 1_000_000_000u64;
-        let num =
-            u128::from(htotal) * u128::from(vtotal) * u128::from(fps_num) * u128::from(cmrr_n);
-        let den = u128::from(pixel_clock_hz) * u128::from(fps_den);
-        if den == 0 {
+    /// Compute CMRR timings for the auto-enable path: the mode's own
+    /// fractional refresh decides, so `video_mode_required` is false
+    /// — exactly Linux's `cmrr_get_vtotal(crtc_state, false)` call in
+    /// the CMRR branch of `intel_vrr_compute_config`.
+    pub fn compute_auto(mode: &Mode, ip: DisplayVrrIp) -> Option<Self> {
+        if !ip.supports_cmrr() {
             return None;
         }
-        let cmrr_m = u64::try_from(num / den).ok()?;
+        let (cmrr_m, cmrr_n, vtotal) = cmrr_get_vtotal(mode, false)?;
+        Some(Self::from_derived(mode, cmrr_m, cmrr_n, vtotal, ip))
+    }
 
-        let vmin = u32::from(mode.v_total);
+    /// Build timings from already-derived M/N/vtotal. The vtotal is
+    /// the derived one (not the mode's); the VSYNC offsets still come
+    /// from the mode's totals, as in Linux (the AS-SDP VSYNC block
+    /// uses the adjusted mode's `crtc_vtotal`).
+    fn from_derived(mode: &Mode, cmrr_m: u64, cmrr_n: u64, vtotal: u32, ip: DisplayVrrIp) -> Self {
+        let vmin = vtotal;
         let vmax = vmin;
         let flipline = vmin;
 
@@ -657,7 +772,7 @@ impl CmrrTimings {
             0
         };
 
-        Some(Self {
+        Self {
             cmrr_m,
             cmrr_n,
             vmin,
@@ -666,7 +781,7 @@ impl CmrrTimings {
             guardband,
             vsync_start,
             vsync_end,
-        })
+        }
     }
 }
 
@@ -958,6 +1073,11 @@ pub fn program_fixed_rr_timings(
 pub struct VrrState {
     enabled: [AtomicBool; 4],
     cmrr_enabled: [AtomicBool; 4],
+    /// True when the CMRR arming came from the per-modeset auto-enable
+    /// (#1771), false when it came from a manual sysfs request. The
+    /// modeset disarms only auto-armed CMRR (a manual enable is the
+    /// user's explicit setting); a manual request clears this flag.
+    cmrr_auto: [AtomicBool; 4],
     timings: [IrqSafeSpinLock<Option<VrrTimings>>; 4],
     cmrr_timings: [IrqSafeSpinLock<Option<CmrrTimings>>; 4],
     range: [IrqSafeSpinLock<Option<VrrRange>>; 4],
@@ -981,6 +1101,12 @@ impl VrrState {
                 AtomicBool::new(false),
             ],
             cmrr_enabled: [
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+            ],
+            cmrr_auto: [
                 AtomicBool::new(false),
                 AtomicBool::new(false),
                 AtomicBool::new(false),
@@ -1047,6 +1173,18 @@ impl VrrState {
     pub fn is_cmrr_enabled(&self, crtc_id: u32) -> bool {
         Self::crtc_index(crtc_id)
             .map(|idx| self.cmrr_enabled[idx].load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    pub fn set_cmrr_auto(&self, crtc_id: u32, auto: bool) {
+        if let Some(idx) = Self::crtc_index(crtc_id) {
+            self.cmrr_auto[idx].store(auto, Ordering::SeqCst);
+        }
+    }
+
+    pub fn is_cmrr_auto(&self, crtc_id: u32) -> bool {
+        Self::crtc_index(crtc_id)
+            .map(|idx| self.cmrr_auto[idx].load(Ordering::SeqCst))
             .unwrap_or(false)
     }
 
@@ -1136,6 +1274,15 @@ pub fn installed_vrr() -> VbtVrr {
     *VBT_VRR.lock()
 }
 
+/// Disarm an auto-enabled CMRR (state + hardware). Only ever called
+/// when [`VRR_STATE::is_cmrr_auto`] is true; a manual sysfs enable is
+/// never disarmed by the modeset or by a VRR request.
+fn disarm_auto_cmrr(crtc_id: u32) {
+    request_cmrr_enabled(crtc_id, false);
+    VRR_STATE.set_cmrr_auto(crtc_id, false);
+    VRR_STATE.set_cmrr_timings(crtc_id, None);
+}
+
 /// Recompute a CRTC's VRR timings from the mode actually committed
 /// by a modeset and the sink range discovery published for it.
 ///
@@ -1147,12 +1294,34 @@ pub fn installed_vrr() -> VbtVrr {
 /// outside the range, `vmin >= vmax`, interlace/joiner) — and
 /// returns the timings. Pipe-A only by construction: callers pass
 /// CRTC 1.
+///
+/// CMRR auto-enable (#1771, the CMRR branch of Linux
+/// `intel_vrr_compute_config`): when the connector is eDP, VRR is
+/// not enabled, and the mode's fractional refresh requires CMRR
+/// ([`is_cmrr_frac_required`]), CMRR timings are computed from the
+/// mode ([`CmrrTimings::compute_auto`]) and applied. The arming is
+/// marked auto, so a later modeset disarms it when the conditions no
+/// longer hold — and re-derives it when the mode changes — without
+/// ever touching a manual sysfs enable (a manual enable stands, and
+/// a manual request clears the auto mark). A sysfs CMRR disable
+/// lasts until the next modeset, which re-evaluates the requirement
+/// from the committed mode, as Linux's compute does on every modeset.
+///
+/// Two deliberate deviations from Linux's branch. (a) Linux also
+/// gates on the mode being inside the sink range, but NARF's eDP
+/// path publishes no range yet (the range stays `None` until eDP
+/// discovery publishes it), so the auto-enable does not require one
+/// — the CMRR derivation needs only the mode. Once eDP discovery
+/// publishes the panel range, the in-range gate can be re-added.
+/// (b) `video_mode_required` is false, exactly as Linux passes it
+/// today.
 pub fn recompute_timings_for_modeset(
     crtc_id: u32,
     mode: &Mode,
     range: Option<VrrRange>,
     ip: DisplayVrrIp,
     opts: VrrComputeOpts,
+    kind: VrrConnectorKind,
 ) -> Option<VrrTimings> {
     VRR_STATE.set_mode(crtc_id, Some(*mode));
     VRR_STATE.set_range(crtc_id, range);
@@ -1164,6 +1333,28 @@ pub fn recompute_timings_for_modeset(
     opts.scl = set_context_latency_for_crtc(crtc_id);
     let timings = range.and_then(|r| VrrTimings::compute_config(mode, r, ip, opts));
     VRR_STATE.set_timings(crtc_id, timings);
+
+    // CMRR auto-enable / auto-disarm (see the doc comment above).
+    let cmrr_required = kind == VrrConnectorKind::EmbeddedDisplayPort
+        && !VRR_STATE.is_enabled(crtc_id)
+        && is_cmrr_frac_required(mode, ip);
+    if cmrr_required && (VRR_STATE.is_cmrr_auto(crtc_id) || !VRR_STATE.is_cmrr_enabled(crtc_id)) {
+        match CmrrTimings::compute_auto(mode, ip) {
+            Some(cmrr) => {
+                VRR_STATE.set_cmrr_timings(crtc_id, Some(cmrr));
+                request_cmrr_enabled(crtc_id, true);
+                VRR_STATE.set_cmrr_auto(crtc_id, true);
+            }
+            None => {
+                // Cannot derive CMRR for this mode: fail closed.
+                if VRR_STATE.is_cmrr_auto(crtc_id) {
+                    disarm_auto_cmrr(crtc_id);
+                }
+            }
+        }
+    } else if !cmrr_required && VRR_STATE.is_cmrr_auto(crtc_id) {
+        disarm_auto_cmrr(crtc_id);
+    }
     timings
 }
 
@@ -1265,6 +1456,15 @@ fn sync_msa_timing_par_ignore(crtc_id: u32) {
 pub fn request_vrr_enabled(crtc_id: u32, enabled: bool) {
     VRR_STATE.set_enabled(crtc_id, enabled);
 
+    // VRR and CMRR are mutually exclusive timing sets (Linux
+    // `intel_vrr_compute_config` picks one branch): enabling VRR
+    // disarms an *auto*-enabled CMRR so the CMRR timings are not left
+    // armed beside the VRR ones. A manual sysfs CMRR enable is the
+    // user's explicit setting and is left alone.
+    if enabled && VRR_STATE.is_cmrr_auto(crtc_id) {
+        disarm_auto_cmrr(crtc_id);
+    }
+
     // Apply to hardware if controller is initialized
     let trans = VrrTranscoder::for_crtc(crtc_id);
     crate::intel_gpu::with_controller(|dev| {
@@ -1292,6 +1492,11 @@ pub fn request_vrr_enabled(crtc_id: u32, enabled: bool) {
 
 /// Retain and apply a CRTC's CMRR request.
 pub fn request_cmrr_enabled(crtc_id: u32, enabled: bool) {
+    // A request through this path is a manual action (sysfs, or the
+    // auto-enable applying its own decision): it clears the auto
+    // mark. The auto-enable sets the mark again *after* calling this
+    // function, so the ordering is: clear here, mark there.
+    VRR_STATE.set_cmrr_auto(crtc_id, false);
     VRR_STATE.set_cmrr_enabled(crtc_id, enabled);
 
     let trans = VrrTranscoder::for_crtc(crtc_id);

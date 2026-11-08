@@ -301,6 +301,7 @@ impl IntelDpBridge {
                         range,
                         ip,
                         crate::intel_gpu_vrr::VrrComputeOpts::default(),
+                        crate::intel_gpu_vrr::VrrConnectorKind::DisplayPort,
                     );
                     // The sink's MSA-ignore bit follows the VRR
                     // state at every modeset (see `activate_on_pipe`).
