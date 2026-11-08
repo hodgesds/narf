@@ -426,6 +426,11 @@ pub fn register_in_tree_bundle(blobs: &[(&'static str, &'static [u8])]) {
 /// `fw_get_filesystem_firmware`): drivers' `request_firmware()` finds
 /// blobs from both sources; the root partition takes precedence.
 pub fn register_initcalls() {
+    register_initramfs_scan_initcall();
+}
+
+/// Register the `firmware-scan-initramfs` initcall at `Stage::Late`.
+pub fn register_initramfs_scan_initcall() {
     use narf_init::{InitResult, Stage};
     // Install image-owned trust roots before an in-tree registration or
     // either filesystem scan can attempt to verify a signed blob.
@@ -456,16 +461,15 @@ pub fn register_initcalls() {
             Err(_) => InitResult::Error("scan_initramfs failed"),
         }
     });
+}
 
+/// Register the `firmware-scan-rootfs` initcall at `Stage::Late`.
+/// Must be called AFTER `root-mount-auto` and `root-mount-settled` so the root
+/// partition is mounted when the scan executes.
+pub fn register_rootfs_scan_initcall() {
+    use narf_init::{InitResult, Stage};
     // ── firmware-scan-rootfs (Stage::Late, registered AFTER
     //    firmware-scan-initramfs and root-mount-auto) ─────────────────
-    //
-    // `root-mount-auto` is registered by `frame/src/bare_main.rs` at
-    // Stage::Late before this crate's `register_initcalls` runs, which
-    // means registration order is:
-    //   1. root-mount-auto        (frame/src/bare_main.rs)
-    //   2. firmware-scan-initramfs (this fn, registered just above)
-    //   3. firmware-scan-rootfs   (this fn, registered just below)
     //
     // Stage::Late initcalls run in registration order (narf-init
     // spec), so root-mount-auto is guaranteed to complete before

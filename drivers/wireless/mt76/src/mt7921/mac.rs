@@ -83,6 +83,19 @@ pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
         // SAFETY: BAR0 mapped + owned.
         unsafe { write_lpctl(mmio, PCIE_LPCR_HOST_CLR_OWN)? };
 
+        // Flushes posted PCIe write; check if already clear (fast path matching
+        // Linux mt76_rr right after mt76_wr).
+        last = match unsafe { read_lpctl(mmio) } {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        if last == READ_GONE_U32 {
+            return Err(PowerError::DeviceGone);
+        }
+        if (last & PCIE_LPCR_HOST_OWN_SYNC) == 0 {
+            return Ok(());
+        }
+
         // Linux always pauses 2..3 ms after the CLR write when ASPM
         // is in the picture. We don't track ASPM yet; the conservative
         // path is to always pause briefly — it matches `usleep_range`
@@ -90,8 +103,8 @@ pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
         let settle = Deadline::after_ms(3);
         narf_scheduler::responsive_spin_until(|| false, settle);
 
-        // Poll OWN_SYNC for clear. 50 ms wall-clock budget per attempt,
-        // matching Linux's `mt76_poll_msec_tick(50, 1)`.
+        // Poll OWN_SYNC for clear. 100 ms wall-clock budget per attempt,
+        // matching Linux's `read_poll_timeout` with 1 ms slots.
         let deadline = Deadline::after_ms(DRV_OWN_POLL_MS);
         let mut access_error = None;
         let cleared = narf_scheduler::responsive_spin_until(
@@ -108,7 +121,18 @@ pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
                     // Surface device-gone as a hard early-out.
                     return true;
                 }
-                (last & PCIE_LPCR_HOST_OWN_SYNC) == 0
+                if (last & PCIE_LPCR_HOST_OWN_SYNC) == 0 {
+                    return true;
+                }
+                // Pause 1 ms between register reads (Linux:
+                // read_poll_timeout with 1000 us sleep), preventing MMIO
+                // read flooding from saturating the PCIe link while ConnAC boots.
+                let step = Deadline::after_ms(1);
+                while !step.expired() {
+                    narf_scheduler::sleep_pumps::run();
+                    core::hint::spin_loop();
+                }
+                false
             },
             deadline,
         );
@@ -139,11 +163,21 @@ pub unsafe fn give_firmware_own(mmio: &MmioRegion) -> Result<(), PowerError> {
         // SAFETY: BAR0 mapped + owned.
         unsafe { write_lpctl(mmio, PCIE_LPCR_HOST_SET_OWN)? };
 
+        let mut last = match unsafe { read_lpctl(mmio) } {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        if last == READ_GONE_U32 {
+            return Err(PowerError::DeviceGone);
+        }
+        if (last & PCIE_LPCR_HOST_OWN_SYNC) != 0 {
+            return Ok(());
+        }
+
         // Poll OWN_SYNC for the SET-direction completion (Linux:
         // `mt76_poll_msec_tick(MT_CONN_ON_LPCTL, OWN_SYNC, 4, 50, 1)`
         // — value 4 = BIT(2) set).
         let deadline = Deadline::after_ms(DRV_OWN_POLL_MS);
-        let mut last: u32 = 0;
         let mut access_error = None;
         let set = narf_scheduler::responsive_spin_until(
             || {
@@ -158,7 +192,15 @@ pub unsafe fn give_firmware_own(mmio: &MmioRegion) -> Result<(), PowerError> {
                 if last == READ_GONE_U32 {
                     return true;
                 }
-                (last & PCIE_LPCR_HOST_OWN_SYNC) != 0
+                if (last & PCIE_LPCR_HOST_OWN_SYNC) != 0 {
+                    return true;
+                }
+                let step = Deadline::after_ms(1);
+                while !step.expired() {
+                    narf_scheduler::sleep_pumps::run();
+                    core::hint::spin_loop();
+                }
+                false
             },
             deadline,
         );

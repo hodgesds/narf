@@ -901,6 +901,111 @@ kernel_test_in!(
     smoke_sysfs_net_boot_add_uses_canonical_device_paths
 );
 
+fn smoke_sysfs_net_wireless_phy80211_symlink_and_devtype() -> TestResult {
+    use crate::sysfs::{NetIfaceInfo, NetPciParent};
+
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+    fn wireless_device() -> Vec<NetIfaceInfo> {
+        alloc::vec![NetIfaceInfo {
+            name: "wlan0".to_string(),
+            mac: [0x14, 0x5a, 0xfc, 0x12, 0x34, 0x56],
+            mtu: 1500,
+            link_up: false,
+            carrier: false,
+            ifindex: 3,
+            loopback: false,
+            promisc: false,
+            allmulti: false,
+            name_assign_type: 1,
+            tx_queue_len: 1000,
+            is_wireless: true,
+            pci_parent: Some(NetPciParent {
+                segment: 0,
+                bus: 0x0e,
+                device: 0,
+                function: 0,
+                vendor_id: 0x14c3,
+                device_id: 0x0616,
+                subsystem_vendor_id: 0x14c3,
+                subsystem_device_id: 0x0616,
+                class: 0x028000,
+                driver: "mt7921e".to_string(),
+            }),
+            ..NetIfaceInfo::default()
+        },]
+    }
+
+    crate::sysfs::install_net_snapshot_hook(wireless_device);
+    crate::sysfs::populate_net_class();
+
+    let result = (|| {
+        let root = crate::sysfs::get_root();
+        let class_net = root
+            .get_child("class")
+            .and_then(|class| class.get_child("net"))
+            .ok_or("/sys/class/net missing")?;
+        if class_net.get_symlink("wlan0").as_deref()
+            != Some("../../devices/pci0000:0e/0000:0e:00.0/net/wlan0")
+        {
+            return Err("/sys/class/net/wlan0 is not canonical symlink");
+        }
+        let pci_device = root
+            .get_child("devices")
+            .and_then(|devices| devices.get_child("pci0000:0e"))
+            .and_then(|host| host.get_child("0000:0e:00.0"))
+            .ok_or("canonical PCI parent missing")?;
+        let canonical = pci_device
+            .get_child("net")
+            .and_then(|net| net.get_child("wlan0"))
+            .ok_or("canonical PCI-backed wlan0 missing")?;
+        if canonical.attr_show("uevent").as_deref()
+            != Some("INTERFACE=wlan0\nIFINDEX=3\nDEVTYPE=wlan\n")
+        {
+            return Err("wlan0 uevent missing DEVTYPE=wlan");
+        }
+        if canonical.get_symlink("phy80211").as_deref()
+            != Some("../../../../../class/ieee80211/phy0")
+        {
+            return Err("wlan0 missing phy80211 symlink to /sys/class/ieee80211/phy0");
+        }
+        let phy0 = root
+            .get_child("class")
+            .and_then(|class| class.get_child("ieee80211"))
+            .and_then(|ieee| ieee.get_child("phy0"))
+            .ok_or("/sys/class/ieee80211/phy0 missing")?;
+        if phy0.attr_show("index").as_deref() != Some("0\n") {
+            return Err("phy0 index != 0");
+        }
+        if phy0.attr_show("name").as_deref() != Some("phy0\n") {
+            return Err("phy0 name != phy0");
+        }
+        if phy0.attr_show("macaddress").as_deref() != Some("14:5a:fc:12:34:56\n") {
+            return Err("phy0 macaddress mismatch");
+        }
+        if phy0.get_symlink("subsystem").as_deref() != Some("../../../class/ieee80211") {
+            return Err("phy0 subsystem symlink mismatch");
+        }
+        if phy0.get_symlink("device").as_deref() != Some("../../../devices/pci0000:0e/0000:0e:00.0")
+        {
+            return Err("phy0 device symlink mismatch");
+        }
+        Ok(())
+    })();
+
+    crate::sysfs::install_net_snapshot_hook(Vec::new);
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_sysfs_net_wireless_phy80211_symlink_and_devtype
+);
+
 // ── Test 6: Uevent ring FIFO order ────────────────────────────────────
 
 fn smoke_uevent_ring_fifo() -> TestResult {

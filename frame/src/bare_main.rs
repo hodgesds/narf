@@ -3316,15 +3316,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_initramfs::register_initcalls();
             narf_filesystem::register_initcalls();
             narf_firmware::register_initcalls();
-            // After the firmware scans above, so the Bluetooth
-            // controller's firmware download can find its blobs.
-            #[cfg(target_arch = "x86_64")]
-            narf_bluetooth::register_firmware_initcalls();
-            // Same ordering requirement: the RTL8127 PHY firmware
-            // patch has to run after the firmware scans above.
-            narf_drivers_net::register_late_firmware_initcalls();
             // Bluetooth bring-up runs after the firmware download
-            // above has had its chance to register a transport, since
+            // has had its chance to register a transport, since
             // Stage::Late runs in registration order.
             narf_init::register(narf_init::Stage::Late, "bluetooth-bringup", || {
                 let cap = narf_bluetooth::bootstrap_bluetooth_authority();
@@ -3985,6 +3978,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_block::disk_policy::mark_root_mount_settled();
                 narf_init::InitResult::Ok
             });
+
+            // Rootfs firmware scan must execute AFTER the root filesystem is mounted
+            // by root-mount-auto so /lib/firmware/ exists.
+            narf_firmware::register_rootfs_scan_initcall();
+            #[cfg(target_arch = "x86_64")]
+            narf_bluetooth::register_firmware_initcalls();
+            narf_drivers_net::register_late_firmware_initcalls();
 
             // Test vehicle for `cargo xtask btrfs-rootrw-interop`: systemd-
             // and pacman-shaped writes on the mounted root, run only when the
@@ -4710,6 +4710,51 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     last_stage.name()
                 );
             }
+            // HPET bring-up and TSC calibration before IOMMU probe and initcall
+            // stages, so all driver probes, delays, and timeouts (e.g. Wi-Fi
+            // driver ownership, link training, IOMMU completion) measure true
+            // wall-clock time rather than running 4.7x fast on high-frequency CPUs.
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(
+                    feature = "kernel-test",
+                    not(any(feature = "boot-smoke", feature = "idt-selftest"))
+                )
+            ))]
+            {
+                init_hpet_and_calibrate_tsc();
+
+                // Anchor CLOCK_REALTIME to CMOS RTC now that the TSC timebase is
+                // calibrated. Must run single-threaded before SMP wake-ups
+                // (CMOS ports 0x70/0x71 unsynchronised).
+                // SAFETY: CPL=0, single-threaded boot context; CMOS ports 0x70/0x71 unowned.
+                match unsafe { narf_arch::x86_64::rtc::read_now() } {
+                    Ok(rtc) => {
+                        let unix_secs = rtc.to_unix_seconds();
+                        if unix_secs > 0 {
+                            let target_ns = (unix_secs as i128) * 1_000_000_000;
+                            let mono_ns = narf_time::monotonic_ns() as i128;
+                            let offset_ns = (target_ns - mono_ns) as i64;
+                            narf_time::set_wall_offset_uncapped(offset_ns);
+                            let _ = writeln!(
+                                console::Writer,
+                                "  rtc: wall clock anchored to CMOS (unix {unix_secs}s, offset {offset_ns}ns)"
+                            );
+                        } else {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  rtc: CMOS epoch <= 0 ({unix_secs}); wall clock left boot-relative"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  rtc: CMOS read failed ({e:?}); wall clock left boot-relative"
+                        );
+                    }
+                }
+            }
             // IOMMU probe before any initcall probes a driver, so no device
             // holds a physical DMA address yet and the `iommu.passthrough=0`
             // opt-in can enter PerDomain (narf_io::iommu::init docs). Without
@@ -4908,14 +4953,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
     {
-        // Give the tests the production timebase: the same HPET bring-up
-        // and TSC calibration the real boot runs, so `monotonic_ns` and every
-        // `Deadline` count nanoseconds rather than raw TSC cycles.
-        #[cfg(target_arch = "x86_64")]
-        init_hpet_and_calibrate_tsc();
-        // Timestamp kernel log records with the kernel's monotonic clock
-        // (CLOCK_MONOTONIC's source).
-        console::klog::set_clock(narf_time::monotonic_ns);
         // `test_subsystem=a,b,c` selects those subsystems (prefix-matched:
         // `filesystem` selects `filesystem/page_cache` too). This is the
         // change-based CI path — `cargo xtask affected` computes the
@@ -5125,58 +5162,7 @@ fn run_async_demo() -> ! {
     // can't land on ours. Start a periodic timer and enable CPU
     // IRQs — the async demo below runs with real timer-driven
     // interrupts visible through `timer_ticks()`.
-    // Bring up HPET FIRST so the clockevent registry has access
-    // to it during probe. Earlier code ran `select_primary`
-    // before `hpet::init` — HPET's `supported()` then returned
-    // false because hpet::is_present() was false, so the HPET
-    // backend was silently rejected and only LAPIC was tried.
-    // Real-HW result on Renoir 4700U: clk=none:0 (LAPIC vec 32
-    // doesn't deliver, HPET never tried).
-    #[cfg(target_arch = "x86_64")]
-    {
-        // HPET bring-up and TSC calibration, shared with the kernel-test
-        // boot (see `init_hpet_and_calibrate_tsc`).
-        init_hpet_and_calibrate_tsc();
-
-        // Anchor CLOCK_REALTIME to the CMOS RTC now that the TSC timebase is
-        // calibrated (so `monotonic_ns()` is accurate). Linux does this in
-        // `read_persistent_clock()` at boot. Without it the wall clock stays
-        // boot-relative — epoch 1970 — which makes PAM's `unix_chkpwd` see
-        // every account's password "changed in the future", derails
-        // `user@.service` (systemd --user) session setup so the user session
-        // bus never comes up, and skews every TLS/cert/mtime/timer check.
-        // Must run single-threaded (before SMP wake-ups: CMOS 0x70/0x71 is
-        // unsynchronised) and before the vDSO vvar is published, so both the
-        // kernel syscall and the vDSO fast path read real wall time.
-        // SAFETY: CPL=0, single-threaded here; CMOS ports 0x70/0x71 unowned.
-        match unsafe { narf_arch::x86_64::rtc::read_now() } {
-            Ok(rtc) => {
-                let unix_secs = rtc.to_unix_seconds();
-                if unix_secs > 0 {
-                    let target_ns = (unix_secs as i128) * 1_000_000_000;
-                    let mono_ns = narf_time::monotonic_ns() as i128;
-                    let offset_ns = (target_ns - mono_ns) as i64;
-                    narf_time::set_wall_offset_uncapped(offset_ns);
-                    let _ = writeln!(
-                        console::Writer,
-                        "  rtc: wall clock anchored to CMOS (unix {unix_secs}s, offset {offset_ns}ns)"
-                    );
-                } else {
-                    let _ = writeln!(
-                        console::Writer,
-                        "  rtc: CMOS epoch <= 0 ({unix_secs}); wall clock left boot-relative"
-                    );
-                }
-            }
-            Err(e) => {
-                let _ = writeln!(
-                    console::Writer,
-                    "  rtc: CMOS read failed ({e:?}); wall clock left boot-relative"
-                );
-            }
-        }
-    }
-
+    // Candidate tick sources: LAPIC primary, HPET fallback.
     #[cfg(target_arch = "x86_64")]
     {
         // Register candidate tick sources. LAPIC first (highest

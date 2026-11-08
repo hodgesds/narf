@@ -191,7 +191,9 @@ fn install_proc_ext_hooks() {
                             let narf_bus::BusAddr::Pcie(address) = device.addr else {
                                 return None;
                             };
-                            if alloc::format!("{address:?}") != bus_info {
+                            let expected = alloc::format!("{address:?}");
+                            let bus_str = bus_info.strip_prefix("pcie:").unwrap_or(&bus_info);
+                            if bus_str != expected {
                                 return None;
                             }
                             Some(narf_filesystem::sysfs::NetPciParent {
@@ -209,9 +211,12 @@ fn install_proc_ext_hooks() {
                         })
                     },
                 );
+                let is_wireless = nic.name.starts_with("wlan")
+                    || nic.link_layer == narf_net::iface::LinkLayer::Ieee80211Radiotap;
                 narf_filesystem::sysfs::NetIfaceInfo {
                     loopback: nic.name == "lo",
                     name: nic.name,
+                    is_wireless,
                     mac: nic.mac,
                     mtu: nic.mtu,
                     link_up: nic.link_up,

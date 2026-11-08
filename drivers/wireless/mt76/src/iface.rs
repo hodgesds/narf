@@ -1478,6 +1478,11 @@ pub(crate) fn register_scan_iface_profile(
         let _ = writeln!(narf_console::Writer, "mt76: regulatory policy: {}", error);
     }
     iface.name = narf_net::iface::register("wlan%d", info.capabilities.mac, send_frame);
+    let bus_info = match crate::mt7921::pci::bound_bus_addr() {
+        Some(narf_bus::BusAddr::Pcie(pci)) => alloc::format!("{pci:?}"),
+        _ => alloc::string::String::new(),
+    };
+    narf_net::iface::set_driver_info(&iface.name, "mt7921e", Some("0.1.0"), bus_info);
     publish_link(&iface.name, false);
     let iface = Arc::new(iface);
     let cap = match narf_net::registry().register(&authority, RegisteredIface(iface.clone())) {

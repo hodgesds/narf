@@ -317,6 +317,7 @@ pub struct NetIfaceInfo {
     pub napi_defer_hard_irqs: u32,
     pub proto_down: bool,
     pub threaded: bool,
+    pub is_wireless: bool,
     pub stats: NetIfaceStats,
     pub pci_parent: Option<NetPciParent>,
 }
@@ -1434,6 +1435,42 @@ pub fn populate_net_class() {
             ),
         };
         class_net.add_symlink(name_owned.clone(), class_target);
+
+        if info.is_wireless {
+            let class_ieee80211 = {
+                let class_dir = get_or_create_child(&root, "class");
+                get_or_create_child(&class_dir, "ieee80211")
+            };
+            let phy0 = get_or_create_child(&class_ieee80211, "phy0");
+            kobject_add_attr(&phy0, "index", || "0\n".to_string());
+            kobject_add_attr(&phy0, "name", || "phy0\n".to_string());
+            let mac = info.mac;
+            kobject_add_attr(&phy0, "macaddress", move || {
+                format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                )
+            });
+            add_writable_uevent(&phy0, "DEVNAME=phy0\n".to_string());
+            phy0.add_symlink("subsystem", "../../../class/ieee80211");
+            if let Some(parent) = info.pci_parent.as_ref() {
+                let host_name = format!("pci{:04x}:{:02x}", parent.segment, parent.bus);
+                let slot_name = format!(
+                    "{:04x}:{:02x}:{:02x}.{}",
+                    parent.segment, parent.bus, parent.device, parent.function
+                );
+                phy0.add_symlink(
+                    "device",
+                    format!("../../../devices/{host_name}/{slot_name}"),
+                );
+            }
+            let phy_target = if info.pci_parent.is_some() {
+                "../../../../../class/ieee80211/phy0"
+            } else {
+                "../../../../class/ieee80211/phy0"
+            };
+            kobj.add_symlink("phy80211", phy_target);
+        }
         let ifindex = info.ifindex;
         let loopback = info.loopback;
         // Linux `net/core/net-sysfs.c`. udev keys the device on `ifindex`
@@ -1634,10 +1671,11 @@ pub fn populate_net_class() {
         // the coldplug walker derives SUBSYSTEM=net and `udevadm info` accepts
         // the syspath. Linux ref: `net/core/net-sysfs.c` (netdev_register_kobject)
         // exposes INTERFACE + IFINDEX in the netdev uevent.
-        add_writable_uevent(
-            &kobj,
-            format!("INTERFACE={}\nIFINDEX={}\n", name_owned, ifindex),
-        );
+        let mut uevent_str = format!("INTERFACE={}\nIFINDEX={}\n", name_owned, ifindex);
+        if info.is_wireless {
+            uevent_str.push_str("DEVTYPE=wlan\n");
+        }
+        add_writable_uevent(&kobj, uevent_str);
         kobj.add_symlink("subsystem", subsystem_target);
 
         // Linux's `netstat_group` is present on every netdev. Read the same

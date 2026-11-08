@@ -574,6 +574,11 @@ pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
     controller.as_ref().map(f)
 }
 
+/// The bus address of the currently bound MT7921 device, if any.
+pub fn bound_bus_addr() -> Option<narf_bus::BusAddr> {
+    FIRMWARE_BINDING.lock().as_ref().map(|(dev, _)| dev.addr)
+}
+
 pub(super) fn claim_firmware_transport(
 ) -> Result<Option<super::firmware_transport::Transport>, super::firmware_transport::Error> {
     use super::firmware_transport::{Error, Firmware, Transport};
