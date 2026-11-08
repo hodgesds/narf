@@ -1575,6 +1575,9 @@ impl Session {
 /// (bo->ttm.ttm->pages). In Linux the VMA's file keeps the stream and its
 /// BO alive until munmap; here each mapping holds a [`PageMapping`] token and
 /// the unit never returns the pages to its allocator while one is live.
+/// When the unit drops with mappings live, the reservation is handed to
+/// the last mapping instead: its drop returns it to the allocator
+/// (free at last munmap), never while a mapping still aliases it.
 pub(crate) struct Pages {
     /// Physical page addresses; empty when the backing has no host frames.
     frames: Vec<u64>,
@@ -1585,6 +1588,103 @@ struct PageState {
     /// The unit gave the reservation up; no new mapping may alias it.
     released: bool,
     maps: usize,
+    /// Free installed by `Unit::drop` when the reservation is freeable
+    /// but still mapped: run once, by the last mapping's drop, after
+    /// the lock is released. `None` until installed, and taken (never
+    /// run twice) by whoever observes the last map go.
+    pending_free: Option<PendingFree>,
+}
+
+/// The allocator and backing a dropping unit hands to the last live
+/// mapping, so the reservation is freed at the last munmap instead of
+/// leaked. It is type-erased to a raw pointer plus a free function:
+/// `Pages` must stay `Send + Sync` (its tokens cross threads as
+/// `MmapLifetime`) while `A`/`A::Backing` carry no `Send` bound — the
+/// `GpuAllocator` contract does not promise it, and test backings hold
+/// `Rc` — so a `Box<dyn FnOnce() + Send>` cannot be stored here.
+struct DeferredFree<A: BootAllocator> {
+    allocator: A,
+    backing: A::Backing,
+}
+
+/// A deferred OA reservation free: a heap [`DeferredFree`] erased to a
+/// raw pointer plus the function that reconstructs and frees it.
+/// The pointer travels as [`CrossThreadPtr`] and the function pointer is
+/// plain data, so this is `Send + Sync`; the box contents are only ever
+/// touched through `run`.
+///
+/// # Safety
+///
+/// - The box is built from owned values; after `into_raw` the stored
+///   pointer is the only access path to it — nothing aliases it.
+/// - Installed at most once: only `Unit::drop` installs, and a unit
+///   drops once with its backing taken once (`Option::take`).
+/// - Run at most once: the slot is taken under the `Pages` lock, only
+///   by `PageMapping::drop`, and `run` consumes this value; the free
+///   function reconstructs the box exactly once via `from_raw`.
+/// - Dropping this without `run` leaks the box (and the reservation),
+///   by design: the unreachable second-install path prefers a leak to
+///   a double free. There is deliberately no `Drop` impl.
+/// - Thread use: `run` executes `allocator.free(backing)` on the
+///   unmapping thread, so it assumes the allocator tolerates use from
+///   that thread. That is true of every allocator in the tree — the
+///   production `SharedArena` is already shared across threads behind
+///   locks, and the test allocators are `Arc`-based — but it is not
+///   enforced by a trait bound: a future `!Send` allocator would be
+///   unsound here. A `Send` bound on `GpuAllocator::Backing` was
+///   considered and rejected: the test backings in `intel_gpu_media`
+///   and `intel_gpu_rcs` hold `Rc`, and converting those fixtures is
+///   out of scope for this fix.
+///
+/// A raw pointer that may cross threads. The address itself is plain
+/// data; sending it is sound because the pointed-to box is only ever
+/// touched by the thread that takes the `PageState` slot, which
+/// reconstructs it with exclusive ownership (see `PendingFree`).
+struct CrossThreadPtr(*mut ());
+// SAFETY: sending the pointer is sound because after `Box::into_raw` it is
+// the only access path to the box — nothing aliases it — and the box is
+// only ever touched by the thread that takes the `PageState` slot under
+// the `Pages` lock and reconstructs it with exclusive ownership in
+// `PendingFree::run`, which consumes the value; moving the pointer to
+// another thread cannot create a second access path.
+unsafe impl Send for CrossThreadPtr {}
+// SAFETY: sharing a reference is sound because the pointer is never
+// dereferenced through a shared reference — the only dereference is the
+// `Box::from_raw` inside `PendingFree::run`, which requires exclusive
+// ownership of the `PendingFree` (slot taken under the lock, value
+// consumed), so no thread can touch the box through `&CrossThreadPtr`.
+unsafe impl Sync for CrossThreadPtr {}
+
+struct PendingFree {
+    /// `Box<DeferredFree<A>>` as a raw pointer; valid until `run`.
+    ptr: CrossThreadPtr,
+    /// Reconstructs the box exactly once and frees the reservation.
+    free: fn(*mut ()),
+}
+impl PendingFree {
+    fn new<A: BootAllocator>(allocator: A, backing: A::Backing) -> Self {
+        fn free<A: BootAllocator>(ptr: *mut ()) {
+            // SAFETY: `ptr` came from `Box::into_raw` in `new` with this
+            // same `A`, and `run` is the only caller, consuming the slot
+            // exactly once — so this reconstructs the one live box.
+            let deferred = unsafe { Box::from_raw(ptr as *mut DeferredFree<A>) };
+            let DeferredFree {
+                mut allocator,
+                backing,
+            } = *deferred;
+            allocator.free(backing);
+        }
+        let ptr =
+            CrossThreadPtr(Box::into_raw(Box::new(DeferredFree { allocator, backing })) as *mut ());
+        Self {
+            ptr,
+            free: free::<A>,
+        }
+    }
+    /// Run the deferred free exactly once, consuming this value.
+    fn run(self) {
+        (self.free)(self.ptr.0);
+    }
 }
 impl Pages {
     fn new(frames: Vec<u64>) -> Arc<Self> {
@@ -1624,16 +1724,44 @@ impl Pages {
         state.released = true;
         state.maps != 0
     }
+    /// Install the free deferred by the dropping unit: run when the last
+    /// live mapping drops. The caller has already closed the reservation
+    /// to new mappings via [`Pages::release`], so `maps` can only fall
+    /// from here. A unit owns one backing and drops once, so at most one
+    /// free is ever installed; a second install drops the `PendingFree`
+    /// without running it, leaking the backing rather than risking a
+    /// double free.
+    fn defer_free(&self, free: PendingFree) {
+        let mut state = self.state.lock();
+        if state.pending_free.is_none() {
+            state.pending_free = Some(free);
+        }
+        // Otherwise `free` drops here without running: the backing
+        // leaks instead of being freed twice. Unreachable in practice.
+    }
     #[cfg(feature = "kernel-test")]
     pub(crate) fn live_maps(&self) -> usize {
         self.state.lock().maps
     }
 }
-/// One user mapping's hold on the OA buffer pages.
+/// One user mapping's hold on the OA buffer pages. The last mapping's
+/// drop returns a reservation the unit handed over to the allocator.
 struct PageMapping(Arc<Pages>);
 impl Drop for PageMapping {
     fn drop(&mut self) {
-        self.0.state.lock().maps -= 1;
+        let pending = {
+            let mut state = self.0.state.lock();
+            state.maps -= 1;
+            if state.maps == 0 && state.released {
+                state.pending_free.take()
+            } else {
+                None
+            }
+        };
+        // Run outside the lock: the free must never re-enter this state.
+        if let Some(free) = pending {
+            free.run();
+        }
     }
 }
 
@@ -1897,7 +2025,10 @@ enum Quiesce {
 /// Closing or disabling never frees or rebinds the buffer; only verified full
 /// GT reset releases storage that the unit was ever pointed at.
 pub(crate) struct Unit<A: BootAllocator> {
-    allocator: A,
+    /// `Some` until the unit's drop takes it: either freed there, or
+    /// handed to the last live mapping with the backing (free at last
+    /// munmap). `Option` because `Drop` must move it out of `&mut self`.
+    allocator: Option<A>,
     backing: Option<A::Backing>,
     pages: Arc<Pages>,
     platform: GtPlatform,
@@ -1963,7 +2094,7 @@ impl<A: BootAllocator> Unit<A> {
             return Err(error);
         }
         Ok(Self {
-            allocator,
+            allocator: Some(allocator),
             backing: Some(backing),
             pages: Pages::new(frames),
             platform,
@@ -2549,15 +2680,33 @@ impl<A: BootAllocator> Unit<A> {
 impl<A: BootAllocator> Drop for Unit<A> {
     fn drop(&mut self) {
         self.invalidate();
-        if let Some(backing) = self.backing.take() {
-            // A user mapping still aliasing the pages keeps them: the
-            // reservation is never returned to the allocator.
-            let mapped = self.pages.release();
-            if (!self.exposed || self.retired) && !mapped {
-                self.allocator.free(backing);
-            } else {
-                core::mem::forget(backing);
-            }
+        let Some(backing) = self.backing.take() else {
+            return;
+        };
+        // The allocator is only ever taken here; a missing one is
+        // unreachable, but forgetting the backing is the safe fallback
+        // (a leak, never a double free).
+        let Some(mut allocator) = self.allocator.take() else {
+            core::mem::forget(backing);
+            return;
+        };
+        // Close the reservation to new mappings first: a mapping handed
+        // out before this point still aliases the pages.
+        let mapped = self.pages.release();
+        if (!self.exposed || self.retired) && !mapped {
+            allocator.free(backing);
+        } else if (!self.exposed || self.retired) && mapped {
+            // Freeable but still aliased: hand the reservation to the
+            // last live mapping instead of forgetting it. The last
+            // `PageMapping` drop returns it to the allocator; a token
+            // that never drops keeps it, as before. `release_after_reset`
+            // composes here: it sets `retired`, so the unit drops down
+            // this path, and the single deferred free is the only free.
+            self.pages.defer_free(PendingFree::new(allocator, backing));
+        } else {
+            // Exposed without a reset proof: the engine may still DMA
+            // into the reservation, so it is deliberately retained.
+            core::mem::forget(backing);
         }
     }
 }
