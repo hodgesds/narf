@@ -75,6 +75,11 @@ pub const VRR_FLIPLINE_MASK: u32 = 0x000f_ffff;
 pub const VRR_CTL_PIPELINE_FULL_MASK: u32 = 0x7f8;
 /// Shift of the `TRANS_VRR_CTL` pipeline-full field.
 pub const VRR_CTL_PIPELINE_FULL_SHIFT: u32 = 3;
+/// Bound for the VRR-disable live-status wait: 1000 ms, matching
+/// Linux's `intel_de_wait_for_clear(..., VRR_EN_LIVE, 1000)` in
+/// `intel_vrr_disable` (`intel_vrr.c`; the timeout parameter is in
+/// milliseconds — `intel_de.h` renamed it `timeout_ms` explicitly).
+pub const VRR_DISABLE_TIMEOUT_NS: u64 = 1_000_000_000;
 
 /// Max hardware vertical total supported by the VRR registers (13 bits).
 pub const VRR_MAX_VTOTAL_HW: u32 = 0x1fff;
@@ -156,6 +161,21 @@ impl DisplayVrrIp {
     /// Whether `TRANS_VRR_VSYNC` (`base + 0x078`) is supported (display 14+).
     pub const fn has_vrr_vsync(self) -> bool {
         matches!(self, Self::Display14 | Self::Display20 | Self::Display30)
+    }
+
+    /// Whether the display supports Adaptive-Sync SDP (`HAS_AS_SDP`:
+    /// `DISPLAY_VER >= 13`, `intel_display_device.h`). This is the gate
+    /// Linux's `intel_vrr_disable` uses for clearing `TRANS_VRR_VSYNC`
+    /// — wider than [`Self::has_vrr_vsync`], which gates *programming*
+    /// the VSYNC register with a value (display 14+). On display 13 the
+    /// register is never programmed with a value by this module, but
+    /// clearing it to 0 on disable follows Linux exactly and is harmless
+    /// there.
+    pub const fn has_as_sdp(self) -> bool {
+        matches!(
+            self,
+            Self::Display13 | Self::Display14 | Self::Display20 | Self::Display30
+        )
     }
 
     /// Whether `EMP_AS_SDP_TL` (`base + 0x204`) is supported (display 20+).
@@ -869,12 +889,46 @@ pub fn vrr_enable(
     }
 }
 
+/// Wait for the masked `TRANS_VRR_STATUS` bits to clear, bounded by
+/// [`VRR_DISABLE_TIMEOUT_NS`]. Samples expiry before the read, so the
+/// read that ends a timed-out wait follows the deadline
+/// (`read_poll_timeout` semantics, as in `intel_gpu_modeset::wait_bit`).
+/// Returns [`FsError::TimedOut`] when the bits stay set past the bound
+/// (Linux ignores the wait's result here; this module surfaces it
+/// instead), [`FsError::NoDevice`] when the window is gone.
+fn wait_vrr_status_clear(
+    io: &(impl MmioWindow + ?Sized),
+    trans: VrrTranscoder,
+    mask: u32,
+) -> Result<(), FsError> {
+    let base = trans.base();
+    let budget = narf_time::wall::ns_to_cycles(VRR_DISABLE_TIMEOUT_NS);
+    let start = narf_time::now_cycles();
+    loop {
+        let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
+        let status = io.read32(base + TRANS_VRR_STATUS_OFFSET);
+        if status == u32::MAX || !io.display_access_ok() {
+            return Err(FsError::NoDevice);
+        }
+        if status & mask == 0 {
+            return Ok(());
+        }
+        if expired {
+            return Err(FsError::TimedOut);
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Disable VRR on the specified transcoder: clears `VRR_CTL_VRR_ENABLE`, waits for
-/// `VRR_STATUS_VRR_EN_LIVE` to clear, then resets `TRANS_PUSH`.
+/// `VRR_STATUS_VRR_EN_LIVE` to clear (bounded by [`VRR_DISABLE_TIMEOUT_NS`]; an
+/// expiry is `FsError::TimedOut`, not a silent success), then resets `TRANS_PUSH`
+/// and clears `TRANS_VRR_VSYNC` on AS-SDP displays. Linux order
+/// (`intel_vrr_disable`): CTL → wait-for-clear → PUSH = 0 → VSYNC = 0.
 pub fn vrr_disable(
     io: &(impl MmioWindow + ?Sized),
     trans: VrrTranscoder,
-    _ip: DisplayVrrIp,
+    ip: DisplayVrrIp,
 ) -> Result<(), FsError> {
     let base = trans.base();
     let ctl = io.read32(base + TRANS_VRR_CTL_OFFSET);
@@ -889,18 +943,15 @@ pub fn vrr_disable(
     let new_ctl = (ctl & !VRR_CTL_VRR_ENABLE) | VRR_CTL_FLIP_LINE_EN;
     io.write32(base + TRANS_VRR_CTL_OFFSET, new_ctl);
 
-    // Wait for hardware to exit VRR live state (bounded to 10,000 polls)
-    for _ in 0..10_000 {
-        let status = io.read32(base + TRANS_VRR_STATUS_OFFSET);
-        if status == u32::MAX || !io.display_access_ok() {
-            return Err(FsError::NoDevice);
-        }
-        if status & VRR_STATUS_VRR_EN_LIVE == 0 {
-            break;
-        }
-    }
+    // Wait for hardware to exit VRR live state (timed, not poll-count
+    // bounded: the old 10,000-poll loop returned Ok even when the bit
+    // never cleared).
+    wait_vrr_status_clear(io, trans, VRR_STATUS_VRR_EN_LIVE)?;
 
     io.write32(base + TRANS_PUSH_OFFSET, 0);
+    if ip.has_as_sdp() {
+        io.write32(base + TRANS_VRR_VSYNC_OFFSET, 0);
+    }
     if io.display_access_ok() {
         Ok(())
     } else {
@@ -909,13 +960,30 @@ pub fn vrr_disable(
 }
 
 /// Send a push event on `TRANS_PUSH` to terminate vblank early on an armed page flip.
+///
+/// Linux (`intel_vrr_send_push`) writes `TRANS_PUSH_EN | TRANS_PUSH_SEND`; the
+/// SEND bit is what terminates the vblank — EN alone only arms the push.
 pub fn vrr_send_push(io: &(impl MmioWindow + ?Sized), trans: VrrTranscoder) -> Result<(), FsError> {
-    io.write32(trans.base() + TRANS_PUSH_OFFSET, TRANS_PUSH_EN);
+    io.write32(
+        trans.base() + TRANS_PUSH_OFFSET,
+        TRANS_PUSH_EN | TRANS_PUSH_SEND,
+    );
     if io.display_access_ok() {
         Ok(())
     } else {
         Err(FsError::NoDevice)
     }
+}
+
+/// Query whether the last push event was sent on the transcoder
+/// (`TRANS_PUSH_SEND` set). Returns false when VRR is not enabled,
+/// as in Linux (`intel_vrr_is_push_sent`).
+pub fn is_push_sent(io: &(impl MmioWindow + ?Sized), trans: VrrTranscoder) -> bool {
+    if !is_vrr_active(io, trans) {
+        return false;
+    }
+    let push = io.read32(trans.base() + TRANS_PUSH_OFFSET);
+    push != u32::MAX && (push & TRANS_PUSH_SEND != 0)
 }
 
 /// Query whether VRR is currently active in hardware on the transcoder.
@@ -1453,7 +1521,18 @@ fn sync_msa_timing_par_ignore(crtc_id: u32) {
 }
 
 /// Retain and apply a CRTC's VRR request (from DRM `VRR_ENABLED`).
-pub fn request_vrr_enabled(crtc_id: u32, enabled: bool) {
+///
+/// The request is retained in [`VRR_STATE`] first, so a modeset that
+/// follows applies it even when the controller is not up yet or no
+/// timings are stored yet. The direct apply below is the
+/// toggle-on-a-live-pipeline path: when the controller is up and
+/// timings are stored, program + enable now. A missing controller is
+/// not an error — the modeset is the applier then — and missing
+/// timings are not either: the next modeset recomputes them from the
+/// committed mode + sink range and applies them. A hardware failure
+/// on the direct apply (`NoDevice`, or the disable's timeout) is
+/// returned to the caller instead of swallowed.
+pub fn request_vrr_enabled(crtc_id: u32, enabled: bool) -> Result<(), FsError> {
     VRR_STATE.set_enabled(crtc_id, enabled);
 
     // VRR and CMRR are mutually exclusive timing sets (Linux
@@ -1467,16 +1546,18 @@ pub fn request_vrr_enabled(crtc_id: u32, enabled: bool) {
 
     // Apply to hardware if controller is initialized
     let trans = VrrTranscoder::for_crtc(crtc_id);
-    crate::intel_gpu::with_controller(|dev| {
+    let applied = crate::intel_gpu::with_controller(|dev| {
         let ip = DisplayVrrIp::from_generation(dev.chip.generation);
         let io = dev.mode_window();
         if enabled {
             if let Some(timings) = VRR_STATE.timings(crtc_id) {
-                let _ = program_vrr_timings(&io, trans, ip, &timings);
-                let _ = vrr_enable(&io, trans, ip, timings.guardband);
+                program_vrr_timings(&io, trans, ip, &timings)?;
+                vrr_enable(&io, trans, ip, timings.guardband)?;
             }
+            // No timings stored: retained above; the next modeset
+            // recomputes + applies them. Nothing to program yet.
         } else {
-            let _ = vrr_disable(&io, trans, ip);
+            vrr_disable(&io, trans, ip)?;
         }
         // The set-context-latency is a plain register write:
         // program it with the TG state (wa_14015401596 floor).
@@ -1484,10 +1565,15 @@ pub fn request_vrr_enabled(crtc_id: u32, enabled: bool) {
             trans.base() + TRANS_SET_CONTEXT_LATENCY_OFFSET,
             set_context_latency_for_crtc(crtc_id),
         );
+        Ok(())
     });
     // The sink's MSA-ignore bit follows the toggle: set on enable,
     // cleared on disable, via the slow-AUX snapshot path.
     sync_msa_timing_par_ignore(crtc_id);
+    match applied {
+        None => Ok(()),
+        Some(result) => result,
+    }
 }
 
 /// Retain and apply a CRTC's CMRR request.
@@ -1889,11 +1975,11 @@ pub fn populate_card(_index: u32, node: &alloc::sync::Arc<narf_filesystem::sysfs
                 .trim();
             match s {
                 "1" | "true" | "on" => {
-                    request_vrr_enabled(1, true);
+                    request_vrr_enabled(1, true)?;
                     Ok(())
                 }
                 "0" | "false" | "off" => {
-                    request_vrr_enabled(1, false);
+                    request_vrr_enabled(1, false)?;
                     Ok(())
                 }
                 _ => Err(FsError::InvalidData),

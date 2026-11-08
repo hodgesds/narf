@@ -2,6 +2,7 @@
 
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::cell::{Cell, RefCell};
+use narf_filesystem::FsError;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::{
@@ -10,18 +11,19 @@ use crate::{
     intel_gpu_modeset::Mode,
     intel_gpu_vrr::{
         capture_mode_from_hw, cmrr_disable, cmrr_enable, cmrr_get_vtotal, install_vbt,
-        installed_vrr, is_cmrr_active, is_cmrr_frac_required, is_vrr_active, mode_vrefresh,
-        msa_timing_par_ignore_wanted, on_plane_flip, populate_card, program_cmrr_timings,
-        program_fixed_rr_timings, program_vrr_timings, readback_vrr, recompute_timings_for_modeset,
-        reconcile_vrr_at_setup, request_cmrr_enabled, request_vrr_enabled,
-        set_context_latency_for_crtc, sink_vrr_range, vrr_disable, vrr_enable, vrr_excludes_psr,
-        vrr_is_variable, vrr_send_push, vrr_status_string, CmrrRate, CmrrTimings, DisplayVrrIp,
-        VbtVrr, VrrComputeOpts, VrrConnectorKind, VrrRange, VrrTimings, VrrTranscoder,
-        EMP_AS_SDP_TL_OFFSET, TRANSCODER_A_BASE, TRANS_CMRR_M_HI_OFFSET, TRANS_CMRR_M_LO_OFFSET,
-        TRANS_CMRR_N_HI_OFFSET, TRANS_CMRR_N_LO_OFFSET, TRANS_PUSH_EN, TRANS_PUSH_OFFSET,
-        TRANS_VRR_CTL_OFFSET, TRANS_VRR_FLIPLINE_OFFSET, TRANS_VRR_VMAX_OFFSET,
-        TRANS_VRR_VMIN_OFFSET, TRANS_VRR_VSYNC_OFFSET, VRR_CTL_CMRR_ENABLE, VRR_CTL_FLIP_LINE_EN,
-        VRR_CTL_IGN_MAX_STRETCH, VRR_CTL_VRR_ENABLE, VRR_STATE,
+        installed_vrr, is_cmrr_active, is_cmrr_frac_required, is_push_sent, is_vrr_active,
+        mode_vrefresh, msa_timing_par_ignore_wanted, on_plane_flip, populate_card,
+        program_cmrr_timings, program_fixed_rr_timings, program_vrr_timings, readback_vrr,
+        recompute_timings_for_modeset, reconcile_vrr_at_setup, request_cmrr_enabled,
+        request_vrr_enabled, set_context_latency_for_crtc, sink_vrr_range, vrr_disable, vrr_enable,
+        vrr_excludes_psr, vrr_is_variable, vrr_send_push, vrr_status_string, CmrrRate, CmrrTimings,
+        DisplayVrrIp, VbtVrr, VrrComputeOpts, VrrConnectorKind, VrrRange, VrrTimings,
+        VrrTranscoder, EMP_AS_SDP_TL_OFFSET, TRANSCODER_A_BASE, TRANS_CMRR_M_HI_OFFSET,
+        TRANS_CMRR_M_LO_OFFSET, TRANS_CMRR_N_HI_OFFSET, TRANS_CMRR_N_LO_OFFSET, TRANS_PUSH_EN,
+        TRANS_PUSH_OFFSET, TRANS_PUSH_SEND, TRANS_VRR_CTL_OFFSET, TRANS_VRR_FLIPLINE_OFFSET,
+        TRANS_VRR_STATUS_OFFSET, TRANS_VRR_VMAX_OFFSET, TRANS_VRR_VMIN_OFFSET,
+        TRANS_VRR_VSYNC_OFFSET, VRR_CTL_CMRR_ENABLE, VRR_CTL_FLIP_LINE_EN, VRR_CTL_IGN_MAX_STRETCH,
+        VRR_CTL_VRR_ENABLE, VRR_STATE, VRR_STATUS_VRR_EN_LIVE,
     },
 };
 
@@ -647,11 +649,12 @@ fn smoke_intel_vrr_cmrr_state_and_flip_push() -> TestResult {
     VRR_STATE.set_cmrr_enabled(crtc_id, true);
     assert!(VRR_STATE.is_cmrr_enabled(crtc_id));
 
-    // Flip push triggers under CMRR enabled state
+    // Flip push triggers under CMRR enabled state. The push writes EN | SEND
+    // (V2, per Linux `intel_vrr_send_push`), not EN alone.
     on_plane_flip(crtc_id, &io);
     assert_eq!(
         io.written(TRANSCODER_A_BASE + TRANS_PUSH_OFFSET),
-        vec![TRANS_PUSH_EN]
+        vec![TRANS_PUSH_EN | TRANS_PUSH_SEND]
     );
 
     // Clean up
@@ -1877,12 +1880,12 @@ fn smoke_intel_cmrr_auto_enable() -> TestResult {
         VrrConnectorKind::EmbeddedDisplayPort,
     );
     assert!(VRR_STATE.is_cmrr_auto(crtc_id));
-    request_vrr_enabled(crtc_id, true);
+    let _ = request_vrr_enabled(crtc_id, true);
     assert!(VRR_STATE.is_enabled(crtc_id));
     assert!(!VRR_STATE.is_cmrr_enabled(crtc_id));
     assert!(!VRR_STATE.is_cmrr_auto(crtc_id));
     assert_eq!(VRR_STATE.cmrr_timings(crtc_id), None);
-    request_vrr_enabled(crtc_id, false);
+    let _ = request_vrr_enabled(crtc_id, false);
 
     // A manual sysfs-style enable is never disarmed by a modeset:
     // arm manually, modeset to an integral mode, and the manual
@@ -1914,3 +1917,116 @@ fn smoke_intel_cmrr_auto_enable() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/intel_gpu_vrr", smoke_intel_cmrr_auto_enable);
+// ── Test: push SEND bit + is_push_sent readback ──────────────────────────────
+
+fn smoke_intel_vrr_push_send_bit_and_readback() -> TestResult {
+    let io = MockMmio::new();
+    let trans = VrrTranscoder::A;
+    let base = trans.base();
+
+    // No push sent before enable: not active, SEND clear.
+    assert!(!is_push_sent(&io, trans));
+
+    // A SEND bit stuck in the register without VRR enabled does not
+    // read back as sent (Linux gates on VRR enabled).
+    io.set(base + TRANS_PUSH_OFFSET, TRANS_PUSH_SEND);
+    assert!(!is_push_sent(&io, trans));
+
+    // Enable for Display 14 with guardband 42: PUSH is armed with EN
+    // only (no SEND yet), and nothing reads back as sent.
+    io.set(base + TRANS_PUSH_OFFSET, 0);
+    vrr_enable(&io, trans, DisplayVrrIp::Display14, 42).unwrap();
+    assert_eq!(io.written(base + TRANS_PUSH_OFFSET), vec![TRANS_PUSH_EN]);
+    assert!(!is_push_sent(&io, trans));
+
+    // A flip push writes EN | SEND and reads back as sent.
+    vrr_send_push(&io, trans).unwrap();
+    assert_eq!(
+        io.written(base + TRANS_PUSH_OFFSET),
+        vec![TRANS_PUSH_EN, TRANS_PUSH_EN | TRANS_PUSH_SEND]
+    );
+    assert!(is_push_sent(&io, trans));
+
+    // Disable resets PUSH to 0: nothing reads back as sent.
+    vrr_disable(&io, trans, DisplayVrrIp::Display14).unwrap();
+    assert_eq!(*io.written(base + TRANS_PUSH_OFFSET).last().unwrap(), 0);
+    assert!(!is_push_sent(&io, trans));
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_push_send_bit_and_readback
+);
+
+// ── Test: disable clears VSYNC (AS SDP) and times out on a stuck live bit ───
+
+fn smoke_intel_vrr_disable_clears_vsync_and_times_out() -> TestResult {
+    let m = mode_1080p60();
+    let range = VrrRange::new(48, 144).unwrap();
+    let trans = VrrTranscoder::C;
+    let base = trans.base();
+
+    // AS-SDP timings program a nonzero VSYNC on display 14.
+    let io = MockMmio::new();
+    let t_sdp = VrrTimings::compute_config(
+        &m,
+        range,
+        DisplayVrrIp::Display14,
+        VrrComputeOpts {
+            as_sdp: true,
+            ..Default::default()
+        },
+    )
+    .expect("AS-SDP compute");
+    program_vrr_timings(&io, trans, DisplayVrrIp::Display14, &t_sdp).unwrap();
+    let vsync_val = ((36 & 0x1fff) << 16) | 41;
+    assert_eq!(io.written(base + TRANS_VRR_VSYNC_OFFSET), vec![vsync_val]);
+
+    // Enable, then disable: the live bit is clear in the mock, so the
+    // disable succeeds and VSYNC is cleared to 0 after PUSH is reset.
+    vrr_enable(&io, trans, DisplayVrrIp::Display14, t_sdp.guardband).unwrap();
+    vrr_disable(&io, trans, DisplayVrrIp::Display14).unwrap();
+    assert_eq!(
+        io.written(base + TRANS_VRR_VSYNC_OFFSET),
+        vec![vsync_val, 0]
+    );
+    assert_eq!(*io.written(base + TRANS_PUSH_OFFSET).last().unwrap(), 0);
+
+    // A live bit that never clears times out instead of returning Ok:
+    // ~1000 ms of real time in the harness (bounded, not unbounded).
+    let stuck = MockMmio::new();
+    stuck.set(
+        base + TRANS_VRR_CTL_OFFSET,
+        VRR_CTL_VRR_ENABLE | VRR_CTL_FLIP_LINE_EN,
+    );
+    stuck.set(base + TRANS_VRR_STATUS_OFFSET, VRR_STATUS_VRR_EN_LIVE);
+    let err = vrr_disable(&stuck, trans, DisplayVrrIp::Display14).unwrap_err();
+    assert_eq!(err, FsError::TimedOut);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_disable_clears_vsync_and_times_out
+);
+
+// ── Test: request_vrr_enabled retains the request without a controller ───────
+
+fn smoke_intel_vrr_request_retained_without_controller() -> TestResult {
+    let crtc_id = 1;
+
+    // No controller is initialized in the harness, so the direct apply
+    // is skipped — but the request is retained for the next modeset.
+    VRR_STATE.set_enabled(crtc_id, false);
+    assert!(request_vrr_enabled(crtc_id, true).is_ok());
+    assert!(VRR_STATE.is_enabled(crtc_id));
+    assert!(request_vrr_enabled(crtc_id, false).is_ok());
+    assert!(!VRR_STATE.is_enabled(crtc_id));
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_request_retained_without_controller
+);

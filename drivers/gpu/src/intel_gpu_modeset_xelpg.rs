@@ -879,6 +879,9 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             crate::intel_gpu_xe3lpd::program_vrr_timings(self.mmio, &mode)
                 .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
         }
+        // Non-Xe3 VRR timings for the mode this run commits (the Xe3
+        // branch above programs its always-on TG instead).
+        self.program_vrr_for_modeset(&mode)?;
         if let Some((src_w, src_h, ref scaler)) = scaler_plan {
             self.program_pipe_source(src_w, src_h);
             self.program_scaler(scaler);
@@ -1044,6 +1047,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             self.program_trans_ddi_func_ctl(trained_lanes, pipe_bpp);
         }
         self.enable_transcoder()?;
+        // VRR enable, after the transcoder is live (non-Xe3 only).
+        self.enable_vrr_for_modeset()?;
         let (plane_w, plane_h) = scaler_plan
             .as_ref()
             .map_or((mode.h_active, mode.v_active), |(w, h, _)| (*w, *h));
@@ -1698,6 +1703,9 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
             let _ = crate::intel_gpu_xelpg_dsc::set_sink_decompression(&mut aux, false);
         }
+        // VRR off before the transcoder stops (non-Xe3 only; the
+        // display-30 TG stops after the transcoder below).
+        self.disable_vrr_for_modeset();
         let off = PipeIdx::A.base() + PIPECONF_OFFSET;
         let conf = self.mmio.read32(off);
         self.mmio.write32(off, conf & !PIPECONF_ENABLE);
@@ -1984,6 +1992,100 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             return Err(ModesetError::PipelineEnableUnavailable);
         }
         Ok(())
+    }
+
+    /// The VRR IP for this run's display IP (MTL/ARL 14.00, LNL
+    /// 20.00). Display 30 (PTL) is `None`: its always-on VRR timing
+    /// generator is owned by `intel_gpu_xe3lpd`, not the generic VRR
+    /// path — the generic hooks below must never run on it.
+    fn vrr_ip(&self) -> Option<crate::intel_gpu_vrr::DisplayVrrIp> {
+        match self.ip {
+            crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp => {
+                Some(crate::intel_gpu_vrr::DisplayVrrIp::Display14)
+            }
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd => {
+                Some(crate::intel_gpu_vrr::DisplayVrrIp::Display20)
+            }
+            crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd => None,
+        }
+    }
+
+    /// Program this run's VRR timings for the mode being committed
+    /// (`intel_vrr_set_transcoder_timings` follows
+    /// `intel_set_transcoder_timings`). Same recompute-first shape as
+    /// the Gen12 orchestrator's `program_vrr_for_modeset`: the stored
+    /// timings describe the previous mode, never this one. Skipped
+    /// entirely on display 30 (always-on TG owned by `intel_gpu_xe3lpd`).
+    fn program_vrr_for_modeset(&mut self, mode: &Mode) -> Result<(), ModesetError> {
+        let Some(ip) = self.vrr_ip() else {
+            return Ok(());
+        };
+        // This orchestrator drives Pipe A / CRTC 1 only.
+        let crtc = 1;
+        // CMRR auto-enable is eDP-only: Port A is the built-in panel, so
+        // it maps to EmbeddedDisplayPort; every other port conservatively
+        // maps to Other (no auto-enable). This must agree with the
+        // post-modeset recompute in `modeset_display_family` for the
+        // same CRTC, or the auto-enable state would flap between the two.
+        let kind = match self.port {
+            XeLpgPort::A => crate::intel_gpu_vrr::VrrConnectorKind::EmbeddedDisplayPort,
+            _ => crate::intel_gpu_vrr::VrrConnectorKind::Other,
+        };
+        let timings = crate::intel_gpu_vrr::recompute_timings_for_modeset(
+            crtc,
+            mode,
+            crate::intel_gpu_vrr::VRR_STATE.range(crtc),
+            ip,
+            crate::intel_gpu_vrr::VrrComputeOpts::default(),
+            kind,
+        );
+        if crate::intel_gpu_vrr::VRR_STATE.is_enabled(crtc) {
+            if let Some(timings) = timings {
+                let trans = crate::intel_gpu_vrr::VrrTranscoder::A;
+                crate::intel_gpu_vrr::program_vrr_timings(self.mmio, trans, ip, &timings)
+                    .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enable VRR after the transcoder is live (`intel_vrr_enable`
+    /// runs after `intel_enable_transcoder` in Linux's
+    /// `intel_crtc_enable`). Only when VRR is requested and timings
+    /// were programmed for this run. Skipped on display 30.
+    fn enable_vrr_for_modeset(&mut self) -> Result<(), ModesetError> {
+        let Some(ip) = self.vrr_ip() else {
+            return Ok(());
+        };
+        let crtc = 1;
+        if crate::intel_gpu_vrr::VRR_STATE.is_enabled(crtc) {
+            if let Some(timings) = crate::intel_gpu_vrr::VRR_STATE.timings(crtc) {
+                crate::intel_gpu_vrr::vrr_enable(
+                    self.mmio,
+                    crate::intel_gpu_vrr::VrrTranscoder::A,
+                    ip,
+                    timings.guardband,
+                )
+                .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Disable VRR before the transcoder stops (`intel_vrr_disable`
+    /// runs before the transcoder disable in Linux's
+    /// `intel_crtc_disable`). Best effort: the pipeline is being torn
+    /// down regardless (see the Gen12 orchestrator's
+    /// `disable_vrr_for_modeset`). Skipped on display 30, whose TG
+    /// stops after the transcoder below.
+    fn disable_vrr_for_modeset(&mut self) {
+        if let Some(ip) = self.vrr_ip() {
+            let _ = crate::intel_gpu_vrr::vrr_disable(
+                self.mmio,
+                crate::intel_gpu_vrr::VrrTranscoder::A,
+                ip,
+            );
+        }
     }
 
     /// A fresh common frame, current source enable and the actual primary
@@ -4077,6 +4179,182 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset_xelpg",
         smoke_mtl_modeset_bigjoiner_join_and_disable
+    );
+
+    /// Minimal MMIO window for the VRR sequencing fixture: records
+    /// writes and serves canned reads (default 0). The VRR helpers
+    /// only touch the transcoder VRR registers, so the full `MtlFake`
+    /// sink model is not needed here.
+    #[derive(Debug)]
+    struct SeqMmio {
+        writes: RefCell<Vec<(u64, u32)>>,
+        reads: RefCell<Vec<(u64, u32)>>,
+    }
+
+    impl SeqMmio {
+        fn new() -> Self {
+            Self {
+                writes: RefCell::new(Vec::new()),
+                reads: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn set_read(&self, off: u64, val: u32) {
+            self.reads.borrow_mut().push((off, val));
+        }
+
+        fn writes_to(&self, off: u64) -> Vec<u32> {
+            self.writes
+                .borrow()
+                .iter()
+                .filter(|(o, _)| *o == off)
+                .map(|(_, v)| *v)
+                .collect()
+        }
+    }
+
+    impl MmioWindow for SeqMmio {
+        fn read32(&self, off: u64) -> u32 {
+            let mut v = 0u32;
+            for (o, val) in self.reads.borrow().iter() {
+                if *o == off {
+                    v = *val;
+                }
+            }
+            v
+        }
+
+        fn write32(&self, off: u64, val: u32) {
+            self.writes.borrow_mut().push((off, val));
+        }
+    }
+
+    // ── VRR modeset sequencing (#1769) ───────────────────────────────────
+    //
+    // Drives the Xe-LPG VRR helpers directly (the full `modeset_checked`
+    // needs the panel power sequencer + link training): timings
+    // programmed, TG enabled after, disable clears CTL + PUSH + VSYNC.
+    // Display 30 takes none of the generic path — its always-on TG is
+    // owned by `intel_gpu_xe3lpd`.
+
+    fn smoke_vrr_xelpg_sequences_timings_enable_disable_and_skips_xe3() -> TestResult {
+        use crate::intel_gpu_pipes::Transcoder;
+        use crate::intel_gpu_vrr::{
+            DisplayVrrIp, VrrComputeOpts, VrrRange, VrrTimings, TRANS_PUSH_EN, TRANS_PUSH_OFFSET,
+            TRANS_VRR_CTL_OFFSET, TRANS_VRR_VMAX_OFFSET, TRANS_VRR_VMIN_OFFSET,
+            TRANS_VRR_VSYNC_OFFSET, VRR_CTL_FLIP_LINE_EN, VRR_CTL_VRR_ENABLE, VRR_STATE,
+        };
+        let mode = Mode {
+            pixel_clock_khz: 148_500,
+            h_active: 1920,
+            h_total: 2200,
+            h_sync_start: 2008,
+            h_sync_end: 2052,
+            v_active: 1080,
+            v_total: 1125,
+            v_sync_start: 1084,
+            v_sync_end: 1089,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        };
+        let range = VrrRange::new(48, 144).unwrap();
+        VRR_STATE.set_range(1, Some(range));
+        VRR_STATE.set_enabled(1, true);
+
+        // Display 14 (MTL/ARL, the default IP): timings are programmed
+        // with the −1 form, then the TG is enabled.
+        let mmio = SeqMmio::new();
+        let mut ms = XeLpgModeset::new(&mmio, XeLpgPort::A);
+        if ms.program_vrr_for_modeset(&mode).is_err() {
+            VRR_STATE.set_enabled(1, false);
+            VRR_STATE.set_range(1, None);
+            return TestResult::Fail("XeLPG VRR timings programming failed");
+        }
+        let expected = VrrTimings::compute_config(
+            &mode,
+            range,
+            DisplayVrrIp::Display14,
+            VrrComputeOpts::default(),
+        )
+        .expect("1080p60 against 48..144 computes on display 14");
+        let base = Transcoder::A.base();
+        // Display 14 writes val − 1.
+        if mmio.writes_to(base + TRANS_VRR_VMIN_OFFSET) != alloc::vec![expected.vmin - 1] {
+            VRR_STATE.set_enabled(1, false);
+            VRR_STATE.set_range(1, None);
+            return TestResult::Fail("XeLPG VRR VMIN must be the computed vmin − 1");
+        }
+        if mmio.writes_to(base + TRANS_VRR_VMAX_OFFSET) != alloc::vec![expected.vmax - 1] {
+            VRR_STATE.set_enabled(1, false);
+            VRR_STATE.set_range(1, None);
+            return TestResult::Fail("XeLPG VRR VMAX must be the computed vmax − 1");
+        }
+        if ms.enable_vrr_for_modeset().is_err() {
+            VRR_STATE.set_enabled(1, false);
+            VRR_STATE.set_range(1, None);
+            return TestResult::Fail("XeLPG VRR enable failed");
+        }
+        // Disable: CTL ENABLE clears and PUSH resets, with VSYNC
+        // cleared too (display 14 is AS SDP).
+        mmio.set_read(
+            base + TRANS_VRR_CTL_OFFSET,
+            VRR_CTL_VRR_ENABLE | VRR_CTL_FLIP_LINE_EN,
+        );
+        ms.disable_vrr_for_modeset();
+        // The request is retained state, not a one-shot: clear it now so
+        // later fixtures in this harness process start from fixed refresh.
+        VRR_STATE.set_enabled(1, false);
+        VRR_STATE.set_range(1, None);
+        VRR_STATE.set_timings(1, None);
+        VRR_STATE.set_mode(1, None);
+
+        // Order: timings programmed before the TG is enabled.
+        let writes = mmio.writes.borrow();
+        let vmin_pos = writes
+            .iter()
+            .position(|(o, _)| *o == base + TRANS_VRR_VMIN_OFFSET);
+        let ctl_pos = writes
+            .iter()
+            .position(|(o, v)| *o == base + TRANS_VRR_CTL_OFFSET && v & VRR_CTL_VRR_ENABLE != 0);
+        if !matches!((vmin_pos, ctl_pos), (Some(v), Some(c)) if v < c) {
+            return TestResult::Fail("XeLPG VRR order must be timings, then TG enable");
+        }
+        // The disable's CTL write is the last one and clears ENABLE
+        // (flip-line kept); PUSH was reset to 0 and VSYNC cleared.
+        if writes
+            .iter()
+            .filter(|(o, _)| *o == base + TRANS_VRR_CTL_OFFSET)
+            .next_back()
+            .map(|(_, v)| *v)
+            != Some(VRR_CTL_FLIP_LINE_EN)
+        {
+            return TestResult::Fail("XeLPG VRR disable must clear CTL ENABLE last");
+        }
+        drop(writes);
+        if mmio.writes_to(base + TRANS_PUSH_OFFSET) != alloc::vec![TRANS_PUSH_EN, 0] {
+            return TestResult::Fail("XeLPG TRANS_PUSH must arm then reset to 0");
+        }
+        if mmio.writes_to(base + TRANS_VRR_VSYNC_OFFSET) != alloc::vec![0] {
+            return TestResult::Fail("XeLPG VRR disable must clear VSYNC on AS SDP");
+        }
+
+        // Display 30 (PTL): the generic hooks are skipped entirely.
+        let mmio3 = SeqMmio::new();
+        let mut ms3 = XeLpgModeset::new(&mmio3, XeLpgPort::A)
+            .with_display_ip(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd);
+        if ms3.program_vrr_for_modeset(&mode).is_err() || ms3.enable_vrr_for_modeset().is_err() {
+            return TestResult::Fail("Xe3 VRR hooks must succeed by skipping");
+        }
+        ms3.disable_vrr_for_modeset();
+        if !mmio3.writes.borrow().is_empty() {
+            return TestResult::Fail("Xe3 must not take the generic VRR path");
+        }
+
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_vrr_xelpg_sequences_timings_enable_disable_and_skips_xe3
     );
 
     include!("intel_gpu_modeset_xelpg_failclosed_tests.rs");

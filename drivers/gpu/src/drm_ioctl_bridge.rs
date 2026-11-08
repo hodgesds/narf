@@ -4454,7 +4454,7 @@ fn handle_set_property(
             }
             #[cfg(feature = "intel")]
             Some(VrrRequest::Intel(crtc, enabled)) => {
-                crate::intel_gpu_vrr::request_vrr_enabled(crtc, enabled);
+                crate::intel_gpu_vrr::request_vrr_enabled(crtc, enabled)?;
             }
             _ => {}
         }
@@ -6745,7 +6745,7 @@ fn atomic_commit(
             }
             #[cfg(feature = "intel")]
             VrrRequest::Intel(crtc, enabled) => {
-                crate::intel_gpu_vrr::request_vrr_enabled(crtc, enabled);
+                crate::intel_gpu_vrr::request_vrr_enabled(crtc, enabled)?;
             }
             #[allow(unreachable_patterns)]
             _ => {}
