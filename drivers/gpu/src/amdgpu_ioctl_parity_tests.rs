@@ -131,6 +131,7 @@ fn amdgpu_cs_accepts_cp_gfx_shadow_like_linux() -> TestResult {
         m.as_mut_ptr() as usize,
         &state,
         &gem,
+        None,
     )
     .is_err()
     {

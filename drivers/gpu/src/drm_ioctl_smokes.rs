@@ -3074,13 +3074,55 @@ fn smoke_drm_master_arbitration() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_master_arbitration);
 
+/// Regression: the per-ioctl master gate is a pure query. On a master-free
+/// card, a non-master open issuing a master-only ioctl must get EACCES and
+/// must NOT silently become master; otherwise any helper that pokes the
+/// primary node during a greeter → session handoff steals master and the
+/// compositor's own SET_MASTER then fails with EBUSY.
+fn smoke_drm_master_gate_does_not_adopt() -> TestResult {
+    use crate::drm_uapi::{DrmModeCrtcUapi, DRM_IOCTL_MODE_SETCRTC};
+    let idx = register_test_card_unmastered();
+    let set_master = ioc(0, DRM_IOCTL_BASE, 0x1E, 0);
+    const HELPER: u64 = 0x0C33;
+    const COMPOSITOR: u64 = 0x0D44;
+    let master = || crate::drm_registry::mode_state(idx).and_then(|ms| ms.lock().current_master());
+    let mut crtc = DrmModeCrtcUapi {
+        crtc_id: 11,
+        ..Default::default()
+    };
+    match crate::drm_ioctl_bridge::dispatch_card(
+        idx,
+        HELPER,
+        DRM_IOCTL_MODE_SETCRTC,
+        &mut crtc as *mut _ as usize,
+        false,
+    ) {
+        Err(FsError::PermissionDenied) => {}
+        _ => return TestResult::Fail("non-master SETCRTC on a master-free card should be EACCES"),
+    }
+    if master().is_some() {
+        return TestResult::Fail("master gate query adopted the caller as master");
+    }
+    if crate::drm_ioctl_bridge::dispatch_card(idx, COMPOSITOR, set_master, 0, false) != Ok(0) {
+        return TestResult::Fail("compositor SET_MASTER after a helper query should succeed");
+    }
+    if master() != Some(COMPOSITOR) {
+        return TestResult::Fail("compositor should hold master after SET_MASTER");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_master_gate_does_not_adopt
+);
+
 /// The first primary open of a master-free card auto-acquires DRM master
 /// (drm_master_open), and closing that fd auto-drops it (drm_master_release)
 /// so the next session can take over.
 #[allow(dead_code)]
 fn smoke_drm_master_autodrop_on_close() -> TestResult {
     let idx = register_test_card_unmastered();
-    let master = || crate::drm_registry::mode_state(idx).and_then(|ms| ms.lock().current_master);
+    let master = || crate::drm_registry::mode_state(idx).and_then(|ms| ms.lock().current_master());
     if master().is_some() {
         return TestResult::Fail("a freshly registered card should have no master");
     }
@@ -6488,3 +6530,53 @@ fn smoke_drm_cursor_only_native_planes() -> TestResult {
 }
 #[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_cursor_only_native_planes);
+
+/// Regression (Commit #15360 flip stall): flip tickets reserved for atomic
+/// presentation must be reliably completed by complete_flip_ticket so KWin
+/// or any compositor polling the DRM card fd for DRM_EVENT_FLIP_COMPLETE does
+/// not hang indefinitely.
+#[cfg(feature = "amdgpu")]
+fn smoke_drm_atomic_flip_ticket_completion() -> TestResult {
+    use crate::drm::card::{complete_flip_ticket, flips};
+    let display = 0;
+    let ticket = flips(display).lock().reserve();
+    if flips(display).lock().stamp(ticket).is_some() {
+        return TestResult::Fail("reserved ticket stamped before completion");
+    }
+    complete_flip_ticket(display, Some(ticket));
+    if flips(display).lock().stamp(ticket).is_none() {
+        return TestResult::Fail("complete_flip_ticket failed to stamp ticket");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_atomic_flip_ticket_completion
+);
+
+/// Regression (Commit #15360): if present_native_planes cannot present on a CRTC,
+/// it must complete the reserved ticket immediately rather than leaking it.
+#[cfg(feature = "amdgpu")]
+fn smoke_drm_present_native_planes_completes_ticket_on_rejection() -> TestResult {
+    use crate::drm::card::flips;
+    let display = 0;
+    let ticket = flips(display).lock().reserve();
+    // Non-existent CRTC id 9999 has no display mapping.
+    crate::drm_ioctl_bridge::present_native_planes(
+        0,
+        9999,
+        None,
+        core::array::from_fn(|_| None),
+        Some(ticket),
+    );
+    if flips(display).lock().stamp(ticket).is_none() {
+        return TestResult::Fail("present_native_planes leaked ticket on invalid CRTC");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_present_native_planes_completes_ticket_on_rejection
+);

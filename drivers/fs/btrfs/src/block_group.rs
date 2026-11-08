@@ -70,16 +70,37 @@ pub(crate) async fn read_block_groups<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     tree: u64,
 ) -> Result<Vec<(u64, u64, Vec<u8>)>, FsError> {
-    let mut cursor = Cursor::seek(vol, tree, &BtrfsKey::new(0, 0, 0)).await?;
     let mut out = Vec::new();
-    while let Some((k, body)) = cursor.current()? {
-        if k.item_type == format::BLOCK_GROUP_ITEM_KEY {
+    let mut next_start = 0u64;
+    loop {
+        let mut cursor = Cursor::seek(vol, tree, &BtrfsKey::new(next_start, 0, 0)).await?;
+        let Some((mut k, mut body)) = cursor.current()? else {
+            break;
+        };
+        let obj = k.objectid;
+        while k.objectid == obj && k.item_type < format::BLOCK_GROUP_ITEM_KEY {
+            cursor.advance().await?;
+            let Some(cur) = cursor.current()? else {
+                return Ok(out);
+            };
+            (k, body) = cur;
+        }
+        if k.objectid == obj && k.item_type == format::BLOCK_GROUP_ITEM_KEY {
             if body.len() < BLOCK_GROUP_ITEM_SIZE {
                 return Err(FsError::InvalidData);
             }
             out.push((k.objectid, k.offset, body.to_vec()));
+            let Some(next) = k.objectid.checked_add(k.offset.max(1)) else {
+                break;
+            };
+            next_start = next;
+        } else {
+            let step = vol.logical_chunk_remaining(obj).unwrap_or(1).max(1);
+            let Some(next) = obj.checked_add(step) else {
+                break;
+            };
+            next_start = next;
         }
-        cursor.advance().await?;
     }
     Ok(out)
 }

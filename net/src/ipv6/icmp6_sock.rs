@@ -19,6 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use narf_lib::readiness::Readiness;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::pkt_ipv6::{Icmpv6Header, ICMPV6_ECHO_REPLY, ICMPV6_ECHO_REQUEST};
@@ -35,12 +36,14 @@ pub struct Icmp6Msg {
 
 #[derive(Debug)]
 struct Sock {
-    /// `None` → accept every type. `Some(mask)` → 256-bit type filter
-    /// where bit `t` set means "deliver type t" (RFC 3542 §3.2 sentinel).
-    type_filter: Option<[u32; 8]>,
+    /// 256-bit type filter where bit `t` set means "block type t"
+    /// (Linux `struct icmp6_filter` semantics: 0 = pass, 1 = block).
+    /// Default `[0u32; 8]` passes all types.
+    filter: [u32; 8],
     queue: VecDeque<Icmp6Msg>,
     /// Echo session id used to match Echo Replies to Echo Requests.
     echo_id: u16,
+    readiness: Arc<Readiness>,
 }
 
 static SOCKS: IrqSafeSpinLock<BTreeMap<u32, Arc<IrqSafeSpinLock<Sock>>>> =
@@ -51,9 +54,10 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 pub fn open(echo_id: u16) -> u32 {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let s = Sock {
-        type_filter: None,
+        filter: [0u32; 8],
         queue: VecDeque::new(),
         echo_id,
+        readiness: Arc::new(Readiness::new(crate::raw_sock::POLL_OUT)),
     };
     SOCKS.lock().insert(id, Arc::new(IrqSafeSpinLock::new(s)));
     id
@@ -64,18 +68,43 @@ pub fn close(id: u32) -> bool {
     SOCKS.lock().remove(&id).is_some()
 }
 
-/// Replace the type filter. `types = &[]` means "allow nothing"; a
-/// type appears in `types` iff it should be delivered.
+/// Query the durable readiness handle for a raw ICMPv6 socket.
+pub fn readiness(id: u32) -> Option<Arc<Readiness>> {
+    let arc = SOCKS.lock().get(&id).cloned()?;
+    let r = arc.lock().readiness.clone();
+    Some(r)
+}
+
+/// Set the raw 256-bit filter (`struct icmp6_filter`, 0 = pass, 1 = block).
+pub fn set_filter_raw(id: u32, filter: [u32; 8]) -> bool {
+    let arc = match SOCKS.lock().get(&id).cloned() {
+        Some(a) => a,
+        None => return false,
+    };
+    arc.lock().filter = filter;
+    true
+}
+
+/// Get the raw 256-bit filter (`struct icmp6_filter`, 0 = pass, 1 = block).
+pub fn get_filter_raw(id: u32) -> Option<[u32; 8]> {
+    let arc = SOCKS.lock().get(&id).cloned()?;
+    let f = arc.lock().filter;
+    Some(f)
+}
+
+/// Replace the type filter with an allow-list of types.
+/// `types = &[]` means "allow nothing"; a type appears in `types` iff it
+/// should be passed (clears the block bit).
 pub fn set_filter(id: u32, types: &[u8]) -> bool {
     let arc = match SOCKS.lock().get(&id).cloned() {
         Some(a) => a,
         None => return false,
     };
-    let mut mask = [0u32; 8];
+    let mut mask = [!0u32; 8];
     for &t in types {
-        mask[(t / 32) as usize] |= 1u32 << (t % 32);
+        mask[(t / 32) as usize] &= !(1u32 << (t % 32));
     }
-    arc.lock().type_filter = Some(mask);
+    arc.lock().filter = mask;
     true
 }
 
@@ -92,37 +121,56 @@ pub fn on_rx(src_ip: [u8; 16], dst_ip: [u8; 16], typ: u8, code: u8, body: &[u8])
     };
     for arc in &socks {
         let mut g = arc.lock();
-        let pass = match g.type_filter {
-            None => true,
-            Some(mask) => {
-                let w = (typ / 32) as usize;
-                let b = 1u32 << (typ % 32);
-                (mask[w] & b) != 0
-            }
-        };
+        let w = (typ / 32) as usize;
+        let b = 1u32 << (typ % 32);
+        let blocked = (g.filter[w] & b) != 0;
+        if blocked {
+            continue;
+        }
         // Echo Reply matching: if the socket has an echo_id, only
         // deliver Echo Replies whose icmp6.id matches.
-        if pass && typ == ICMPV6_ECHO_REPLY && body.len() >= 8 {
+        if g.echo_id != 0 && typ == ICMPV6_ECHO_REPLY && body.len() >= 8 {
             let id = u16::from_be_bytes([body[4], body[5]]);
             if id != g.echo_id {
                 continue;
             }
         }
-        if pass {
-            // Cap the queue to 16 messages; oldest drops.
-            if g.queue.len() >= 16 {
-                g.queue.pop_front();
-            }
-            g.queue.push_back(msg.clone());
+        // Cap the queue to 64 messages; oldest drops.
+        if g.queue.len() >= 64 {
+            g.queue.pop_front();
         }
+        g.queue.push_back(msg.clone());
+        g.readiness.set(crate::raw_sock::POLL_IN, 0);
+        g.readiness.notify(crate::raw_sock::POLL_IN);
     }
 }
 
 /// Take the next inbound message. Returns `None` if the queue is empty.
 pub fn next_msg(id: u32) -> Option<Icmp6Msg> {
     let arc = SOCKS.lock().get(&id).cloned()?;
-    let m = arc.lock().queue.pop_front();
-    m
+    let mut g = arc.lock();
+    let m = g.queue.pop_front()?;
+    if g.queue.is_empty() {
+        g.readiness.set(0, crate::raw_sock::POLL_IN);
+    }
+    Some(m)
+}
+
+/// Check whether the socket has any inbound message pending.
+pub fn has_msg(id: u32) -> bool {
+    let arc = match SOCKS.lock().get(&id).cloned() {
+        Some(a) => a,
+        None => return false,
+    };
+    let empty = arc.lock().queue.is_empty();
+    !empty
+}
+
+/// Peek the length of the next inbound message body.
+pub fn next_msg_len(id: u32) -> Option<usize> {
+    let arc = SOCKS.lock().get(&id).cloned()?;
+    let len = arc.lock().queue.front().map(|m| m.body.len());
+    len
 }
 
 /// Build an ICMPv6 Echo Request body (header + id + sequence + payload).

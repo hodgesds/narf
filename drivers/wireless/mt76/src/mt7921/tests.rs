@@ -182,6 +182,29 @@ kernel_test_in!(
     smoke_mt7921_probe_validates_real_bar_geometry
 );
 
+/// Regression (Navi22 desktop, kwin heap corruption after warm reboot):
+/// the identity/driver-own probe must never enable PCI bus mastering. The
+/// probe owns no DMA rings, and an MT7922 that was not reset across a warm
+/// reboot still carries the previous OS's WFDMA ring bases; with the IOMMU
+/// in identity mode a probe-time BUS_MASTER grant lets it write into
+/// arbitrary physical memory. Only the firmware transport, after
+/// reprogramming its own rings, may set BUS_MASTER.
+fn smoke_mt7921_probe_never_grants_bus_master() -> TestResult {
+    use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+    let bits = super::pci::PROBE_COMMAND;
+    if bits & BUS_MASTER != 0 {
+        return TestResult::Fail("probe command grants bus mastering before rings exist");
+    }
+    if bits & (MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE {
+        return TestResult::Fail("probe command must decode BAR0 with INTx masked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7921_probe_never_grants_bus_master
+);
+
 fn smoke_mt7921_l1_remap_direct_window() -> TestResult {
     if l1_remap(0) != 0
         || l1_remap(MT_PCIE_MAC_INT_ENABLE) != 0x10188

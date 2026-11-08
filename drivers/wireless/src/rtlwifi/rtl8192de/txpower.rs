@@ -335,7 +335,7 @@ impl Efuse {
                 out.pwrgroup_ht40[rfpath][ch] = pwrinfo.ht40maxoffset[rfpath][group];
                 let pwr = pwrinfo.ht40_1sindex[rfpath][group];
                 let diff = pwrinfo.ht40_2sindexdiff[rfpath][group];
-                out.ht40_2s[rfpath][ch] = if pwr > diff { pwr - diff } else { 0 };
+                out.ht40_2s[rfpath][ch] = pwr.saturating_sub(diff);
             }
         }
         Ok(out)
@@ -452,8 +452,10 @@ fn pwr_diff_limit(
 
 /// `_rtl92d_get_txpower_writeval_by_regulatory` for rate `index` (0..6).
 /// Regulatory 1 applies the factory table only once all
-/// `MAX_PG_GROUP` groups are loaded (`pwrgroup_cnt == 1` sets a group
-/// that the `< MAX_PG_GROUP` break then discards — ported as written).
+/// `MAX_PG_GROUP` groups are loaded. (Linux also sets a group when
+/// `pwrgroup_cnt == 1` that the `< MAX_PG_GROUP` break then discards;
+/// that store is provably dead here — `1 < MAX_PG_GROUP` — so it is
+/// omitted rather than ported as written.)
 pub fn writeval(
     efuse: &Efuse,
     mcs_offset: &[[u32; 16]; phy::MAX_PG_GROUP],
@@ -464,15 +466,12 @@ pub fn writeval(
     base: ([u32; 2], [u32; 2]),
 ) -> [u32; 2] {
     let mut out = [0u32; 2];
-    let mut chnlgroup = 0usize;
+    let mut chnlgroup: usize;
     for (rf, slot) in out.iter_mut().enumerate() {
         let b = if index < 2 { base.0[rf] } else { base.1[rf] };
         let col = index + if rf != 0 { 8 } else { 0 };
         *slot = match efuse.regulatory {
             1 => {
-                if pwrgroup_cnt == 1 {
-                    chnlgroup = 0;
-                }
                 if pwrgroup_cnt < phy::MAX_PG_GROUP as u8 {
                     0
                 } else {
@@ -605,6 +604,12 @@ pub struct PowerLevels {
 /// `rtl92d_phy_set_txpower_level(channel)` at the current width.
 /// `place` handling, CCK/OFDM selection and the 2.4 GHz record follow
 /// `_rtl92d_get_txpower_index` / `_rtl92d_ccxpower_index_check`.
+// Eight args (one over the lint limit): the parameters span device
+// config (`rf_type`, `pg`), channel context (`channel`, `band`,
+// `bw40`) and mode (`scanning`), so no single natural bundle exists;
+// bundling would churn the production `channel.rs` call site and five
+// test sites for no behavioral gain. Revisit if the signature grows.
+#[allow(clippy::too_many_arguments)]
 pub fn set_level(
     io: &impl Io,
     efuse: &Efuse,

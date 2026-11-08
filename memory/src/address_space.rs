@@ -3582,12 +3582,20 @@ impl AddressSpace {
                 return Err(AddressSpaceError::Overlap);
             }
             // In-place O(1) extension only for an exactly-adjacent heap tail
-            // with identical perms (`tail_perms` includes `BRK_HEAP`, so a
-            // foreign anonymous neighbour never matches). A perms mismatch —
-            // e.g. `mlockall(MCL_FUTURE)` changed the future-lock bits —
-            // gets a distinct tail VMA instead, so earlier heap pages never
+            // with compatible perms (`tail_perms` includes `BRK_HEAP`, so a
+            // foreign anonymous neighbour never matches). After fork(), the
+            // existing heap tail has `RegionPerms::COW` set; in-place growth
+            // must still succeed so the heap remains a single contiguous VMA
+            // rather than fragmenting into distinct VMAs across forks. A real
+            // perms mismatch — e.g. `mlockall(MCL_FUTURE)` changed the future-lock
+            // bits — gets a distinct tail VMA instead, so earlier heap pages never
             // change status retroactively.
-            Some(p) => p.base.as_u64().saturating_add(p.len) == grow_lo && p.perms == tail_perms,
+            Some(p) => {
+                let adjacent = p.base.as_u64().saturating_add(p.len) == grow_lo;
+                let perms_match =
+                    (p.perms.0 & !RegionPerms::COW.0) == (tail_perms.0 & !RegionPerms::COW.0);
+                adjacent && perms_match
+            }
             None => false,
         };
         if extend_in_place {

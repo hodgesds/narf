@@ -38,6 +38,7 @@
 //! page-table writes at all there is nothing to defer.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_filesystem::FsError;
@@ -1237,6 +1238,7 @@ pub fn dispatch(
     arg: usize,
     vm: &VmState,
     gem: &crate::amdgpu_gem::GemState,
+    syncobjs: Option<&IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>>,
 ) -> Result<u64, FsError> {
     if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_VA {
         return Err(FsError::Unsupported);
@@ -1245,7 +1247,7 @@ pub fn dispatch(
         Some(card) => Some(crate::amdgpu_gem::try_placement_live(card)?.ok_or(FsError::Busy)?),
         None => None,
     };
-    dispatch_inner(cmd, arg, vm, gem)
+    dispatch_inner(cmd, arg, vm, gem, syncobjs)
 }
 
 /// User ioctl path parks for an in-progress relocation instead of reporting
@@ -1255,6 +1257,7 @@ pub async fn dispatch_async(
     arg: usize,
     vm: &VmState,
     gem: &crate::amdgpu_gem::GemState,
+    syncobjs: Option<&IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>>,
 ) -> Option<Result<u64, FsError>> {
     if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_VA {
         return None;
@@ -1266,26 +1269,79 @@ pub async fn dispatch_async(
         },
         None => None,
     };
-    Some(dispatch_inner(cmd, arg, vm, gem))
+    Some(dispatch_inner(cmd, arg, vm, gem, syncobjs))
 }
 
 fn dispatch_inner(
-    _cmd: u32,
+    cmd: u32,
     arg: usize,
     vm: &VmState,
     gem: &crate::amdgpu_gem::GemState,
+    syncobjs: Option<&IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>>,
 ) -> Result<u64, FsError> {
     // `struct drm_amdgpu_gem_va`: handle u32, _pad u32, operation u32,
-    // flags u32, va_address u64, offset_in_bo u64, map_size u64.
+    // flags u32, va_address u64, offset_in_bo u64, map_size u64,
+    // vm_timeline_point u64, vm_timeline_syncobj_out u32, num_syncobj_handles u32,
+    // input_fence_syncobj_handles u64.
+    // Modern Mesa/libdrm with DRM >= 3.64 passes the 64-byte layout.
+    let in_size = if drm_uapi::ioc_size(cmd) >= 64 {
+        64
+    } else {
+        40
+    };
     // SAFETY: `arg` is the ioctl pointer the trap layer validated (or
     // kernel-owned on the test path); `copy_in` bounds-checks and brackets it.
-    let bytes = unsafe { copy_in(arg, 40)? };
+    let bytes = unsafe { copy_in(arg, in_size)? };
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let operation = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let flags = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
     let va_raw = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
     let offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
     let size = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+    let (
+        vm_timeline_point,
+        vm_timeline_syncobj_out,
+        num_syncobj_handles,
+        input_fence_syncobj_handles,
+    ) = if in_size >= 64 {
+        let point = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+        let syncobj_out = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
+        let num_in = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
+        let in_handles = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
+        (point, syncobj_out, num_in, in_handles)
+    } else {
+        (0, 0, 0, 0)
+    };
+
+    if num_syncobj_handles > 0 && input_fence_syncobj_handles != 0 {
+        if let Some(syncobjs) = syncobjs {
+            // SAFETY: bounds-checked copy of input syncobj handle array
+            let handle_bytes = unsafe {
+                copy_in(
+                    input_fence_syncobj_handles as usize,
+                    (num_syncobj_handles as usize) * 4,
+                )?
+            };
+            let handles: Vec<u32> = handle_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let fences: Vec<Option<Arc<dyn crate::drm::syncobj::DmaFence>>> = {
+                let table = syncobjs.lock();
+                let mut f = Vec::new();
+                for h in handles {
+                    let obj = table.get(h).map_err(|_| FsError::NotFound)?;
+                    f.push(obj.fence());
+                }
+                f
+            };
+            for fence in fences.into_iter().flatten() {
+                while !fence.is_signalled() {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
 
     let va = validate_va(&vm.geometry, va_raw, size, flags)?;
 
@@ -1396,6 +1452,22 @@ fn dispatch_inner(
         }
         _ => unreachable!("operation validated above"),
     }
+
+    if vm_timeline_syncobj_out != 0 {
+        if let Some(syncobjs) = syncobjs {
+            let table = syncobjs.lock();
+            let obj = table
+                .get(vm_timeline_syncobj_out)
+                .map_err(|_| FsError::NotFound)?;
+            let fence = crate::drm::syncobj::stub();
+            if vm_timeline_point != 0 {
+                obj.core().add_point(fence, vm_timeline_point);
+            } else {
+                obj.core().replace_fence(Some(fence));
+            }
+        }
+    }
+
     Ok(0)
 }
 

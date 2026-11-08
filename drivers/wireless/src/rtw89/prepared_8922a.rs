@@ -193,7 +193,7 @@ impl super::irq::Regs for MmioRegs<'_> {
 /// `pci::bring_up` for a probed 8922A device and retained on
 /// `Rtw89Device`; the transport sequence runs when the mac_pre_init
 /// owner drives it (see module docs).
-pub(super) struct Prepared8922a {
+pub(crate) struct Prepared8922a {
     factory: BeFactory,
     chip_version: u8,
     pool: station_8922a::MacIdPool,

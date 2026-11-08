@@ -222,6 +222,9 @@ unsafe fn bring_up_registers(
     // readers only touch in-range EFUSE registers on this owned window.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let mac = if is_8922a {
+        // SAFETY: Caller owns powered BAR2 exclusively (just-mapped,
+        // baseline power-on done above); the BE EFUSE reader only
+        // touches in-range EFUSE registers on this owned window.
         let factory = unsafe { super::efuse_be::read_factory(&mmio_bar2, chip_version) }
             .map_err(|error| ProbeError::Efuse(error.as_efuse_error()))?;
         if !efuse::mac_is_valid(factory.mac) {
@@ -231,6 +234,9 @@ unsafe fn bring_up_registers(
         factory_8922a = Some(factory);
         mac
     } else {
+        // SAFETY: Caller owns powered BAR2 exclusively (just-mapped,
+        // baseline power-on done above); the AX EFUSE reader only
+        // touches in-range EFUSE registers on this owned window.
         unsafe { efuse::read_mac(&mmio_bar2, chip_id, chip_version) }.map_err(ProbeError::Efuse)?
     };
 
@@ -759,10 +765,10 @@ impl Rtw89Device {
 
     /// BE interrupt arm for a probed 8922A device: `rtw89_pci_request_irq`
     /// + `rtw89_pci_ops_start` through the Prepared owner — bind one
-    /// MSI vector to `line` and enable the v2 mask. Returns the CPU
-    /// vector; the caller (the future start/worker owner) records it
-    /// and drives `irq_service_8922a` / `irq_rearm_8922a` from the
-    /// line's wakeups. Refused until the rings are programmed.
+    ///   MSI vector to `line` and enable the v2 mask. Returns the CPU
+    ///   vector; the caller (the future start/worker owner) records it
+    ///   and drives `irq_service_8922a` / `irq_rearm_8922a` from the
+    ///   line's wakeups. Refused until the rings are programmed.
     ///
     /// # Safety
     /// Same live-ring/no-reset contract as [`Self::submit_be_data`].

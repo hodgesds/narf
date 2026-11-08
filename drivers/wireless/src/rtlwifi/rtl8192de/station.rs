@@ -152,7 +152,7 @@ pub enum MediaKind {
 }
 
 /// `_rtl92de_set_media_status` for a station (`linked` = `link_state
-/// >= MAC80211_LINKED`) or `NL80211_IFTYPE_UNSPECIFIED` (`linked`
+/// \>= MAC80211_LINKED`) or `NL80211_IFTYPE_UNSPECIFIED` (`linked`
 /// false). LED control is not composed.
 pub fn set_media_status(io: &impl Io, bcn: &mut BcnCtrl, kind: MediaKind) -> Result<(), Error> {
     let msr = io.read8(REG_MSR)? & 0xfc;
@@ -416,6 +416,31 @@ pub fn erp_changed(
     Ok(())
 }
 
+/// Rate-configuration inputs for [`configure_rates`]: the peer's
+/// supported set and the basic set, the BSS capability and ERP octet,
+/// HT enable and the programmed prime subcarrier, plus the firmware
+/// version and Cisco flag for the basic-rate write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RateConfig {
+    /// Peer's supported rates (Linux passes `sta->supp_rates[0]`).
+    pub rates: u16,
+    /// Basic rates; must name 1 Mb/s (the 2.4 GHz
+    /// `rate_control_send_low` rate) and only rates the RRSR mask keeps.
+    pub basic: u16,
+    /// BSS capability word (slot and ACK preamble source).
+    pub capability: u16,
+    /// BSS ERP octet, if an ERP element is present.
+    pub erp: Option<u8>,
+    /// HT enabled (`ht_enable`).
+    pub ht: bool,
+    /// Programmed prime subcarrier.
+    pub prime_sc: u8,
+    /// Firmware version for the basic-rate write.
+    pub fw_version: u16,
+    /// Cisco-compatibility flag for the basic-rate write.
+    pub cisco: bool,
+}
+
 /// Authentication-time `BSS_CHANGED_BASIC_RATES` / ERP and the channel
 /// access rows for a 2.4 GHz legacy-or-HT station (the BSSID is
 /// [`set_bssid`]): RRSR and `INIRTS_RATE_SEL` ([`basic_rate`] of
@@ -427,17 +452,17 @@ pub fn erp_changed(
 /// `ht_enable`), at the programmed `prime_sc`. `basic` must name
 /// 1 Mb/s (the 2.4 GHz `rate_control_send_low` rate) and only rates
 /// the RRSR mask keeps.
-pub fn configure_rates(
-    io: &impl Io,
-    rates: u16,
-    basic: u16,
-    capability: u16,
-    erp: Option<u8>,
-    ht: bool,
-    prime_sc: u8,
-    fw_version: u16,
-    cisco: bool,
-) -> Result<(), Error> {
+pub fn configure_rates(io: &impl Io, config: RateConfig) -> Result<(), Error> {
+    let RateConfig {
+        rates,
+        basic,
+        capability,
+        erp,
+        ht,
+        prime_sc,
+        fw_version,
+        cisco,
+    } = config;
     if rates & basic & 1 == 0 || basic & !0x15f != 0 || rates & !0xfff != 0 {
         return Err(Error::Packet);
     }

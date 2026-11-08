@@ -324,6 +324,84 @@ mod tests {
     }
     kernel_test_in!("userspace", smoke_brk_single_growable_vma);
 
+    /// After fork(), the parent's existing heap tail has `RegionPerms::COW` set.
+    /// Subsequent `brk(2)` growth in either parent or child must extend the heap
+    /// VMA in place rather than creating split disjoint VMAs.
+    fn smoke_brk_single_growable_vma_after_fork() -> TestResult {
+        let base = BRK_DEFAULT_BASE;
+        // SAFETY: kernel tests run with paging live and the frame allocator
+        // initialised, satisfying new_for_user's contract.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(a) => a,
+            Err(_) => return TestResult::Fail("new_for_user failed"),
+        };
+
+        if brk_core(&aspace, 0) != base {
+            return TestResult::Fail("initial brk(0) failed");
+        }
+        let initial_grow = base + 4 * 0x1000;
+        if brk_core(&aspace, initial_grow) != initial_grow {
+            return TestResult::Fail("initial grow failed");
+        }
+        if heap_vma_count(&aspace) != 1 {
+            return TestResult::Fail("pre-fork heap has more than one VMA");
+        }
+
+        // Fork the address space.
+        // SAFETY: paging is live in a kernel test; `aspace` is a freshly built
+        // user AS with no concurrent writers.
+        let child = match unsafe { aspace.clone_for_fork() } {
+            Ok(c) => c,
+            Err(_) => return TestResult::Fail("clone_for_fork failed"),
+        };
+
+        // Verify that the parent heap region has COW set.
+        let parent_heap = aspace.lookup(VirtAddr::new(base)).expect("parent heap absent");
+        if !parent_heap.perms.contains(narf_memory::address_space::RegionPerms::COW) {
+            return TestResult::Fail("fork did not mark parent heap as COW");
+        }
+
+        // Grow brk in the parent by another 4 pages.
+        let parent_grow = initial_grow + 4 * 0x1000;
+        if brk_core(&aspace, parent_grow) != parent_grow {
+            return TestResult::Fail("parent grow after fork failed");
+        }
+        if heap_vma_count(&aspace) != 1 {
+            return TestResult::Fail("parent grow after fork split heap into multiple VMAs");
+        }
+        if aspace.lookup(VirtAddr::new(base)).map(|r| r.len) != Some(8 * 0x1000) {
+            return TestResult::Fail("parent heap len did not expand to 8 pages");
+        }
+
+        // Grow brk in the child by 8 pages.
+        let child_grow = initial_grow + 8 * 0x1000;
+        if brk_core(&child, child_grow) != child_grow {
+            return TestResult::Fail("child grow after fork failed");
+        }
+        if heap_vma_count(&child) != 1 {
+            return TestResult::Fail("child grow after fork split heap into multiple VMAs");
+        }
+        if child.lookup(VirtAddr::new(base)).map(|r| r.len) != Some(12 * 0x1000) {
+            return TestResult::Fail("child heap len did not expand to 12 pages");
+        }
+
+        // Shrink brk in parent.
+        let shrink_to = base + 2 * 0x1000;
+        if brk_core(&aspace, shrink_to) != shrink_to {
+            return TestResult::Fail("parent shrink after fork failed");
+        }
+        if heap_vma_count(&aspace) != 1 {
+            return TestResult::Fail("parent shrink split heap");
+        }
+        if aspace.lookup(VirtAddr::new(base)).map(|r| r.len) != Some(2 * 0x1000) {
+            return TestResult::Fail("parent heap len did not shrink to 2 pages");
+        }
+
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_brk_single_growable_vma_after_fork);
+
+
     /// A user MAP_FIXED mapping at the conventional heap base is not a brk
     /// VMA. The in-place grow optimization must reject the collision rather
     /// than append frames to that foreign mapping and let a later brk shrink

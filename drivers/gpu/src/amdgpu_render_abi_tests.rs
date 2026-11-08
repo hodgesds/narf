@@ -152,6 +152,7 @@ fn render_abi_user_fence_reaches_the_bo_after_completion() -> TestResult {
         va.as_mut_ptr() as usize,
         &vm,
         &gem,
+        None,
     )
     .is_err()
     {
@@ -527,7 +528,7 @@ fn rdna2_visible_vram_eviction_roundtrip_and_pins() -> TestResult {
     placement[8..16].copy_from_slice(&u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM).to_le_bytes());
     op(&state, placement.as_ptr() as usize).unwrap();
     let nr = crate::drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_VA;
-    if crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state).is_err() {
+    if crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state, None).is_err() {
         return TestResult::Fail("setup: shared BO GPU mapping");
     }
     placement[8..16].copy_from_slice(&u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT).to_le_bytes());
@@ -538,7 +539,7 @@ fn rdna2_visible_vram_eviction_roundtrip_and_pins() -> TestResult {
     va[8..12].copy_from_slice(&uapi::AMDGPU_VA_OP_CLEAR.to_le_bytes());
     va[16..24].copy_from_slice(&(0x2_0000_0000u64 + 4096).to_le_bytes());
     va[32..40].copy_from_slice(&4096u64.to_le_bytes());
-    crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state).unwrap();
+    crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state, None).unwrap();
     if state.object(b).unwrap().system() {
         return TestResult::Fail("split GPU mapping dropped its address lease");
     }
@@ -556,14 +557,14 @@ fn rdna2_visible_vram_eviction_roundtrip_and_pins() -> TestResult {
     va[8..12].copy_from_slice(&uapi::AMDGPU_VA_OP_MAP.to_le_bytes());
     va[16..24].copy_from_slice(&0x2_0000_0000u64.to_le_bytes());
     va[32..40].copy_from_slice(&(3 * 4096u64).to_le_bytes());
-    crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state).unwrap();
+    crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state, None).unwrap();
     let peer_vm = crate::amdgpu_vm::VmState::for_card(CARD);
     let mut peer_va = va;
     peer_va[..4].copy_from_slice(&imported.to_le_bytes());
     peer_va[16..24].copy_from_slice(&0x3_0000_0000u64.to_le_bytes());
     peer_va[24..32].copy_from_slice(&4096u64.to_le_bytes());
     peer_va[32..40].copy_from_slice(&(2 * 4096u64).to_le_bytes());
-    crate::amdgpu_vm::dispatch(nr, peer_va.as_ptr() as usize, &peer_vm, &peer).unwrap();
+    crate::amdgpu_vm::dispatch(nr, peer_va.as_ptr() as usize, &peer_vm, &peer, None).unwrap();
     let peer_tlb = peer_vm.tlb_seq();
     let tables = vm.table_count();
     let tlb = vm.tlb_seq();
@@ -593,7 +594,7 @@ fn rdna2_visible_vram_eviction_roundtrip_and_pins() -> TestResult {
     va[8..12].copy_from_slice(&uapi::AMDGPU_VA_OP_CLEAR.to_le_bytes());
     va[16..24].copy_from_slice(&(0x2_0000_0000u64 + 4096).to_le_bytes());
     va[32..40].copy_from_slice(&4096u64.to_le_bytes());
-    crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state).unwrap();
+    crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state, None).unwrap();
     // Cancellation while waiting for a reservation fence must leave the
     // tables and their leases unchanged, and release submission admission.
     let busy = Arc::new(Busy(core::sync::atomic::AtomicBool::new(false)));
@@ -634,7 +635,7 @@ fn rdna2_visible_vram_eviction_roundtrip_and_pins() -> TestResult {
             return TestResult::Fail("migration released mapping before active VM job");
         }
         if try_placement(CARD).is_some()
-            || crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state)
+            || crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state, None)
                 != Err(FsError::Busy)
         {
             return TestResult::Fail("active relocation admitted concurrent VA edits");
@@ -862,6 +863,7 @@ fn rdna2_hidden_readback_preserves_vm_and_rolls_back_failure() -> TestResult {
         va.as_ptr() as usize,
         &vm,
         &state,
+        None,
     )
     .unwrap();
     let pte = vm.leaf_entry(0x2_0000_2000);

@@ -2470,7 +2470,20 @@ fn smoke_rtl8192de_qos_ht() -> TestResult {
     // Full chain: rates 0x00ff / basic 0x000f, capability 0x0420
     // (short preamble + short slot), HT off, firmware 0x0f.
     let io = de_mac_fake();
-    if station::configure_rates(&io, 0x00ff, 0x000f, 0x0420, None, false, 0, 0x0f, false).is_err()
+    if station::configure_rates(
+        &io,
+        station::RateConfig {
+            rates: 0x00ff,
+            basic: 0x000f,
+            capability: 0x0420,
+            erp: None,
+            ht: false,
+            prime_sc: 0,
+            fw_version: 0x0f,
+            cisco: false,
+        },
+    )
+    .is_err()
         || de_mac_read8(&io, mac::REG_RRSR) != 0x5f
         || de_mac_read8(&io, mac::REG_RRSR + 1) != 0x00
         || de_mac_read8(&io, mac::REG_INIRTS_RATE_SEL) != 6
@@ -2481,7 +2494,21 @@ fn smoke_rtl8192de_qos_ht() -> TestResult {
         return TestResult::Fail("8192DE configure_rates chain");
     }
     // 1 Mb/s must be in both sets.
-    if station::configure_rates(&io, 0x00fe, 0x000f, 0x0420, None, false, 0, 0x0f, false).is_ok() {
+    if station::configure_rates(
+        &io,
+        station::RateConfig {
+            rates: 0x00fe,
+            basic: 0x000f,
+            capability: 0x0420,
+            erp: None,
+            ht: false,
+            prime_sc: 0,
+            fw_version: 0x0f,
+            cisco: false,
+        },
+    )
+    .is_ok()
+    {
         return TestResult::Fail("8192DE configure_rates missing 1M admitted");
     }
     TestResult::Pass

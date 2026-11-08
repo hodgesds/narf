@@ -36,7 +36,6 @@
 //! inside `rtl92d_phy_rf6052_config`'s DMDP flow) and the RF table
 //! loads themselves — those belong to the PHY/BB/RF config lane.
 
-use super::tables;
 use super::RfType;
 use crate::rtlwifi::firmware_transport::Io;
 use crate::rtlwifi::prepare::Error;

@@ -12881,6 +12881,9 @@ paths; only the tables differ.
   the card and render nodes' `mmap_lifetime`), as a VMA holds its object. CLEAR and REPLACE split partly covered mappings
   (`amdgpu_vm_bo_clear_mappings`): the remainders keep their records,
   offsets and entries; only the covered range's entries are cleared.
+  `DRM_IOCTL_AMDGPU_GEM_VA` accepts both the legacy 40-byte and modern 64-byte
+  (DRM >= 3.64) layouts, waiting on `input_fence_syncobj_handles` and signaling
+  `vm_timeline_syncobj_out` at `vm_timeline_point` once mapping operations complete.
   Once a job ran in an address space (`VmState::note_job`), what it drops —
   removed records' buffers, emptied page tables, and the whole space when
   its file closes — waits in the card's deferred list

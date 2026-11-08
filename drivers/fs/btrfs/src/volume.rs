@@ -129,10 +129,14 @@ struct NodeCache {
     epoch: u64,
 }
 
-/// Cached nodes. At a 16 KiB nodesize this bounds the cache at 4 MiB, which
-/// comfortably holds the working set a commit's fixed point revisits while
-/// staying a fixed, predictable cost.
-const NODE_CACHE_MAX: usize = 256;
+/// Cached nodes. At a 16 KiB nodesize this bounds the cache at 4 MiB in
+/// kernel-test and 64 MiB in production, comfortably holding the working set a
+/// commit's fixed point revisits while staying a fixed, predictable cost.
+const NODE_CACHE_MAX: usize = if cfg!(feature = "kernel-test") {
+    256
+} else {
+    4096
+};
 
 /// Commits allowed to stage before the superblock is forced out.
 ///

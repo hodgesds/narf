@@ -196,7 +196,6 @@ pub(super) fn validate_socket_create(
                     0 | IPPROTO_UDP => Ok((domain, kind, IPPROTO_UDP)),
                     _ => Err(EPROTONOSUPPORT),
                 },
-                SOCK_RAW if domain == AF_INET6 => Err(EAFNOSUPPORT),
                 SOCK_DGRAM => match protocol {
                     0 | IPPROTO_UDP => Ok((domain, kind, IPPROTO_UDP)),
                     IPPROTO_ICMP => Ok((domain, kind, protocol)),

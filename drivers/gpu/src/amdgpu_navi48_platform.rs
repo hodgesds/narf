@@ -670,7 +670,7 @@ pub(crate) async fn pci_function() -> Option<(
 }
 /// Whether the native display monitor owns the outputs (otherwise the
 /// connector state is unknown and runtime suspend scans the board ports).
-pub(crate) fn native_display_running() -> bool {
+pub fn native_display_running() -> bool {
     DISPLAY_GENERATION.load(Ordering::Acquire) != 0
 }
 /// Whether DRM presentation is held off for a suspend: from dm_suspend's

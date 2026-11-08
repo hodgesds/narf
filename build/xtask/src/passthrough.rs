@@ -627,6 +627,8 @@ pub fn firmware_globs_for(vendor: u16, device: u16) -> &'static [&'static str] {
     match (vendor, device) {
         // Navi 22 (RX 6700 / 6700 XT / 6750 XT / 6800M / 6850M XT).
         (0x1002, 0x73c0..=0x73df) => &["amdgpu/navy_flounder*"],
+        // MediaTek MT7922 802.11ax Wi-Fi.
+        (0x14c3, 0x0616) => &["mediatek/WIFI_MT7922*", "mediatek/WIFI_RAM_CODE_MT7922*"],
         _ => &[],
     }
 }
@@ -1358,6 +1360,10 @@ mod tests {
         assert_eq!(
             firmware_globs_for(0x1002, 0x73df),
             &["amdgpu/navy_flounder*"]
+        );
+        assert_eq!(
+            firmware_globs_for(0x14c3, 0x0616),
+            &["mediatek/WIFI_MT7922*", "mediatek/WIFI_RAM_CODE_MT7922*",]
         );
         // Its HD-audio function and unrelated cards need nothing.
         assert!(firmware_globs_for(0x1002, 0xab28).is_empty());

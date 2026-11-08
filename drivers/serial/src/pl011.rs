@@ -26,8 +26,10 @@ extern crate alloc;
 
 use core::fmt::Write;
 use narf_console::Writer;
+#[cfg(any(target_arch = "aarch64", feature = "kernel-test", test))]
 use narf_memory::PhysAddr;
 
+#[cfg(any(target_arch = "aarch64", feature = "kernel-test", test))]
 use crate::uart_8250::UartBase;
 
 // ── Register offsets ────────────────────────────────────────────────

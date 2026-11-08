@@ -2722,8 +2722,8 @@ fn handle_getconnector(
     if props_ptr != 0 && prop_values_ptr != 0 && user_count_props as usize >= props.len() {
         let prop_ids: Vec<u8> = props.iter().flat_map(|p| p.to_le_bytes()).collect();
         let prop_values: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        // SAFETY: both are user out-pointers the caller sized for every
-        // property after the counting pass; ids are u32, values u64.
+        // SAFETY: both are user out-pointers sized for every property after
+        // the counting pass; ids are u32, values u64.
         unsafe {
             copy_out(props_ptr as usize, &prop_ids)?;
             copy_out(prop_values_ptr as usize, &prop_values)?;
@@ -3654,7 +3654,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
 
     let values_ptr = u64::from_le_bytes(out[0..8].try_into().unwrap());
     let user_values_count = u32::from_le_bytes(out[56..60].try_into().unwrap());
-    if values_ptr != 0 && user_values_count as usize >= enums.len() {
+    if values_ptr != 0 && user_values_count as usize >= enums.len() && !enums.is_empty() {
         let mut buf = alloc::vec![0u8; enums.len() * 8];
         for (i, (val, _)) in enums.iter().enumerate() {
             buf[i * 8..i * 8 + 8].copy_from_slice(&val.to_le_bytes());
@@ -3666,12 +3666,12 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
 
     let enum_blob_ptr = u64::from_le_bytes(out[8..16].try_into().unwrap());
     let user_enum_count = u32::from_le_bytes(out[60..64].try_into().unwrap());
-    if enum_blob_ptr != 0 && user_enum_count as usize >= enums.len() {
+    if enum_blob_ptr != 0 && user_enum_count as usize >= enums.len() && !enums.is_empty() {
         let mut buf = alloc::vec![0u8; enums.len() * 40];
         for (i, (val, nm)) in enums.iter().enumerate() {
             let base = i * 40;
             buf[base..base + 8].copy_from_slice(&val.to_le_bytes());
-            buf[base + 8..base + 8 + nm.len()].copy_from_slice(nm);
+            buf[base + 8..base + 8 + nm.len().min(32)].copy_from_slice(&nm[..nm.len().min(32)]);
         }
         // SAFETY: `enum_blob_ptr` is the user enum-array out-pointer sized
         // for `user_enum_count` >= `enums.len()` entries of 40 bytes each.
@@ -5041,11 +5041,11 @@ fn handle_getpropblob(
         }
     };
 
-    // Second pass: drm_mode_getblob_ioctl copies only when the caller's
-    // length is exactly the blob's (a first pass with any other length,
-    // usually 0, just learns it).
-    if user_len as usize == edid.len() && !edid.is_empty() {
-        // SAFETY: user-supplied `data_ptr` the caller sized for edid.len().
+    // Second pass: drm_mode_getblob_ioctl copies when the caller's
+    // buffer is large enough for the blob (a first pass with 0 or smaller length
+    // just learns it).
+    if data_ptr != 0 && (user_len as usize) >= edid.len() && !edid.is_empty() {
+        // SAFETY: user-supplied `data_ptr` sized for >= edid.len().
         unsafe { copy_out(data_ptr as usize, &edid)? };
     }
     // Always report the true length (drives the caller's allocation).
@@ -6462,6 +6462,20 @@ fn atomic_commit(
             )?;
             #[cfg(feature = "amdgpu")]
             let cursors = crate::drm_native_planes::cursor_changes(&card, &state);
+            #[cfg(feature = "amdgpu")]
+            let route_changes: Vec<(u32, Option<u32>)> = state
+                .connectors
+                .iter()
+                .filter_map(|c| {
+                    let current = card
+                        .connector(c.id)
+                        .ok()
+                        .and_then(|x| x.encoder_id)
+                        .and_then(|id| card.encoder(id).ok())
+                        .and_then(|e| e.crtc_id);
+                    (current != c.crtc_id).then_some((c.id, c.crtc_id))
+                })
+                .collect();
             if let Err(error) = state.core_commit(&mut card) {
                 let _ = writeln!(
                     narf_console::Writer,
@@ -6525,17 +6539,9 @@ fn atomic_commit(
             if amdgpu {
                 // Routing first: a mode is checked against the connector the
                 // CRTC drives. Any encoder may drive any native CRTC.
-                for c in &state.connectors {
-                    let current = card
-                        .connector(c.id)
-                        .ok()
-                        .and_then(|x| x.encoder_id)
-                        .and_then(|id| card.encoder(id).ok())
-                        .and_then(|e| e.crtc_id);
-                    if current != c.crtc_id {
-                        let display = c.crtc_id.and_then(crate::amdgpu_native_kms::crtc_display);
-                        crate::amdgpu_native_kms::request_connector_crtc(c.id, display);
-                    }
+                for (conn_id, crtc_id) in route_changes {
+                    let display = crtc_id.and_then(crate::amdgpu_native_kms::crtc_display);
+                    crate::amdgpu_native_kms::request_connector_crtc(conn_id, display);
                 }
                 for crtc in &state.crtcs {
                     let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc.id) else {
@@ -6728,7 +6734,7 @@ fn atomic_commit(
                     ))
                 })
                 .collect();
-            Some((presentations, native_presentations))
+            Some((presentations, native_presentations, flip_tickets))
         }
     };
     for request in vrr_requests {
@@ -6779,15 +6785,17 @@ fn atomic_commit(
             req.flags,
             presentation
                 .as_ref()
-                .is_some_and(|(p, n)| !p.is_empty() || !n.is_empty()),
+                .is_some_and(|(p, n, _)| !p.is_empty() || !n.is_empty()),
         );
     }
-    let (presentation, native_presentation) = match presentation {
-        Some((p, n)) => (Some(p), n),
-        None => (None, Vec::new()),
+    let (presentation, native_presentation, flip_tickets) = match presentation {
+        Some((p, n, t)) => (Some(p), n, t),
+        None => (None, Vec::new(), Vec::new()),
     };
+    let mut dispatched_crtcs: Vec<u32> = Vec::new();
     #[cfg(feature = "amdgpu")]
     for (crtc_id, primary, overlays, ticket) in native_presentation {
+        dispatched_crtcs.push(crtc_id);
         present_native_planes(card_index, crtc_id, primary, overlays, ticket);
     }
     #[cfg(not(feature = "amdgpu"))]
@@ -6804,6 +6812,7 @@ fn atomic_commit(
         placement,
     ) in presentation.into_iter().flatten()
     {
+        dispatched_crtcs.push(crtc_id);
         if let Some(resource) = resource {
             present_virgl_frame(&resource, width, height)?;
         } else if let Some(frame) = gem_frame {
@@ -6822,6 +6831,20 @@ fn atomic_commit(
             );
         } else {
             note_missing_backing("ATOMIC", fb_id);
+            #[cfg(feature = "amdgpu")]
+            let display = crate::amdgpu_native_kms::crtc_display(crtc_id).unwrap_or(0);
+            #[cfg(not(feature = "amdgpu"))]
+            let display = 0;
+            crate::drm::card::complete_flip_ticket(display, flip_ticket);
+        }
+    }
+    for &(crtc_id, ticket) in &flip_tickets {
+        if !dispatched_crtcs.contains(&crtc_id) {
+            #[cfg(feature = "amdgpu")]
+            let display = crate::amdgpu_native_kms::crtc_display(crtc_id).unwrap_or(0);
+            #[cfg(not(feature = "amdgpu"))]
+            let display = 0;
+            crate::drm::card::complete_flip_ticket(display, Some(ticket));
         }
     }
     Ok(0)
@@ -7709,6 +7732,23 @@ fn handle_setcrtc_decoded(
                 crtc.mode = requested;
             }
         }
+        #[cfg(feature = "amdgpu")]
+        if let Some(conn_id) = native_connector {
+            let enc_id = card.connector(conn_id).ok().and_then(|c| c.encoder_id);
+            for enc in &mut card.encoders {
+                if Some(enc.id) == enc_id {
+                    enc.crtc_id = (req.fb_id != 0).then_some(req.crtc_id);
+                } else if enc.crtc_id == Some(req.crtc_id) {
+                    enc.crtc_id = None;
+                }
+            }
+        } else if req.fb_id == 0 {
+            for enc in &mut card.encoders {
+                if enc.crtc_id == Some(req.crtc_id) {
+                    enc.crtc_id = None;
+                }
+            }
+        }
         // drm_atomic_helper_set_config: the primary shows the framebuffer
         // whole at the mode again; the overlays stay as committed.
         #[cfg(feature = "amdgpu")]
@@ -8452,7 +8492,7 @@ fn fb_frame(fb: &crate::drm::card::Framebuffer, phys: u64) -> crate::drm::card::
 /// together through its back buffers; when it cannot, the primary takes
 /// `present_frame`'s fallback.
 #[cfg(feature = "amdgpu")]
-fn present_native_planes(
+pub(crate) fn present_native_planes(
     card_index: u32,
     crtc_id: u32,
     primary: Option<crate::drm::card::PlaneFrame>,
@@ -8460,6 +8500,7 @@ fn present_native_planes(
     ticket: Option<u64>,
 ) {
     let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) else {
+        crate::drm::card::complete_flip_ticket(0, ticket);
         return;
     };
     if primary.is_none() && overlays.iter().all(Option::is_none) {
@@ -8476,7 +8517,9 @@ fn present_native_planes(
         return;
     }
     if let Some(f) = fallback {
-        present_frame(card_index, crtc_id, f, None);
+        present_frame(card_index, crtc_id, f, ticket);
+    } else {
+        crate::drm::card::complete_flip_ticket(display, ticket);
     }
 }
 
@@ -8534,6 +8577,7 @@ fn present_frame(
             }
             // A GEM framebuffer is scanned out in place or not at all.
             if gem {
+                crate::drm::card::complete_flip_ticket(display, flip_ticket);
                 return;
             }
             // Only the console's display has a CPU front to copy onto, and
@@ -8541,6 +8585,7 @@ fn present_frame(
             if display != crate::amdgpu_native_kms::console_pipe()
                 || !matches!(src_format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888)
             {
+                crate::drm::card::complete_flip_ticket(display, flip_ticket);
                 return;
             }
         }

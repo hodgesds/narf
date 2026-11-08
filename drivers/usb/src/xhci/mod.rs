@@ -1889,9 +1889,16 @@ impl Xhci {
     }
 
     /// Install this controller's supervisor waker so the demux can poke
-    /// it on a Port Status Change Event. Replaces any previous waker.
+    /// it on a Port Status Change Event or Interrupt-IN Transfer Event.
+    /// Replaces any previous waker.
     pub fn register_supervisor_waker(&self, w: core::task::Waker) {
         *self.supervisor_waker.lock() = Some(w);
+    }
+
+    /// Returns `true` when the demux queue holds at least one pending
+    /// Transfer Event (e.g. a completed HID Interrupt-IN report).
+    pub fn has_pending_transfer_events(&self) -> bool {
+        !self.transfer_events.lock().is_empty()
     }
 
     /// Wake this controller's supervisor if it registered a waker. The
@@ -2479,6 +2486,11 @@ impl Xhci {
         let mut g = queue.lock();
         if event_wait::enqueue(&mut g, ev) {
             self.events_overflowed.fetch_add(1, Ordering::Relaxed);
+        }
+        drop(g);
+        drop(_publication);
+        if ty == TRB_TYPE_TRANSFER_EVENT {
+            self.wake_supervisor();
         }
         Some(ev)
     }

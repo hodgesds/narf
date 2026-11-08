@@ -298,7 +298,11 @@ impl Peer {
                     self.hold_tx_ba,
                 ));
             }
-            if frame.len() == 30 && frame[24..26] == [3, 2] && frame[28..30] == [39, 0] {
+            if frame.len() == 30
+                && frame[24..26] == [3, 2]
+                && (frame[27] & 8) != 0
+                && frame[28..30] == [39, 0]
+            {
                 let parameter = u16::from_le_bytes([frame[26], frame[27]]);
                 let tid = usize::from(parameter >> 12);
                 if parameter & 0x0fff != 0x0800 || tid >= 6 || tid != 0 && !self.any_tid {

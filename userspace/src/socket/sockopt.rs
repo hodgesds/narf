@@ -150,6 +150,9 @@ pub const IPV6_TRANSPARENT: u32 = 75;
 pub const IPV6_UNICAST_IF: u32 = 76;
 pub const IPV6_RECVFRAGSIZE: u32 = 77;
 pub const IPV6_FREEBIND: u32 = 78;
+
+pub const IPPROTO_ICMPV6: u32 = 58;
+pub const ICMP6_FILTER: u32 = 1;
 const IPV6_MIN_MTU: i32 = 1280;
 /// `IPV6_DEFAULT_MCASTHOPS` (`include/net/ipv6.h`).
 const IPV6_DEFAULT_MCASTHOPS: i32 = 1;
@@ -730,6 +733,9 @@ impl SocketFile {
             IPPROTO_IP if self.ip_level_applies() => self.ip_set(name, value),
             IPPROTO_IP if self.domain == AF_INET6 => Some(ENOPROTOOPT_R),
             IPPROTO_IPV6 if self.domain == AF_INET6 => self.ipv6_set(name, value),
+            IPPROTO_ICMPV6 if self.domain == AF_INET6 && self.kind == SOCK_RAW => {
+                self.icmp6_set(name, value)
+            }
             IPPROTO_UDP if self.is_udp() => Some(self.udp_set(name, value)),
             _ => None,
         }
@@ -751,8 +757,55 @@ impl SocketFile {
             SOL_SOCKET => self.sol_socket_get(name, buf),
             IPPROTO_IP if self.ip_level_applies() => self.ip_get(name, buf),
             IPPROTO_IPV6 if self.domain == AF_INET6 => self.ipv6_get(name, buf),
+            IPPROTO_ICMPV6 if self.domain == AF_INET6 && self.kind == SOCK_RAW => {
+                self.icmp6_get(name, buf)
+            }
             IPPROTO_UDP if self.is_udp() => Some(self.udp_get(name, buf)),
             _ => None,
+        }
+    }
+
+    pub(super) fn icmp6_set(&self, name: u32, value: &[u8]) -> Option<SocketOpResult> {
+        if name != ICMP6_FILTER {
+            return Some(ENOPROTOOPT_R);
+        }
+        if value.len() < 32 {
+            return Some(EINVAL_R);
+        }
+        let mut filter = [0u32; 8];
+        for (i, chunk) in value[..32].chunks_exact(4).enumerate() {
+            filter[i] = u32::from_ne_bytes(chunk.try_into().unwrap());
+        }
+        let mut state = self.state.lock();
+        if let SocketState::Inet6Raw {
+            icmp6_filter,
+            icmp6_sock_id,
+            ..
+        } = &mut *state
+        {
+            *icmp6_filter = filter;
+            if let Some(id) = *icmp6_sock_id {
+                narf_net::ipv6::icmp6_sock::set_filter_raw(id, filter);
+            }
+            Some(OK)
+        } else {
+            Some(ENOPROTOOPT_R)
+        }
+    }
+
+    pub(super) fn icmp6_get(&self, name: u32, buf: &mut [u8]) -> Option<SocketOpResult> {
+        if name != ICMP6_FILTER {
+            return Some(ENOPROTOOPT_R);
+        }
+        let state = self.state.lock();
+        if let SocketState::Inet6Raw { icmp6_filter, .. } = &*state {
+            let mut bytes = [0u8; 32];
+            for (i, word) in icmp6_filter.iter().enumerate() {
+                bytes[i * 4..(i + 1) * 4].copy_from_slice(&word.to_ne_bytes());
+            }
+            Some(put_bytes(buf, &bytes))
+        } else {
+            Some(ENOPROTOOPT_R)
         }
     }
 

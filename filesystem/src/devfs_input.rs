@@ -1277,15 +1277,33 @@ fn input_alias_name(kind: InputAliasKind, caps: &narf_input::evdev::DeviceCaps) 
     }
 }
 
+static INPUT_BY_ID_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
+    IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+static INPUT_BY_PATH_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
+    IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+pub(crate) fn __reset_input_links_for_test() {
+    INPUT_BY_ID_LINKS.lock().clear();
+    INPUT_BY_PATH_LINKS.lock().clear();
+}
+
 /// One `/dev/input/by-id` or `/dev/input/by-path` directory. Entries
 /// are symlinks to `../eventN`, regenerated from the live router on
 /// every lookup/enumeration so replug + removal stay consistent.
+/// Also supports dynamic symlink creation and unlinking by udev.
 #[derive(Debug)]
 struct DevInputAliasDir {
     kind: InputAliasKind,
 }
 
 impl DevInputAliasDir {
+    fn dynamic_map(&self) -> &'static IrqSafeSpinLock<crate::devfs::DynamicMap> {
+        match self.kind {
+            InputAliasKind::ById => &INPUT_BY_ID_LINKS,
+            InputAliasKind::ByPath => &INPUT_BY_PATH_LINKS,
+        }
+    }
+
     fn entries(&self) -> Vec<(String, DeviceId)> {
         narf_input::evdev::snapshot_devices()
             .iter()
@@ -1303,6 +1321,9 @@ impl DirOps for DevInputAliasDir {
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        if let Some(file) = crate::devfs::dynamic_lookup_file(self.dynamic_map(), name) {
+            return Some(file);
+        }
         let (_, id) = self.entries().into_iter().find(|(n, _)| n == name)?;
         let event_n = id.0.saturating_sub(1);
         Some(crate::devfs::symlink_file(
@@ -1312,16 +1333,24 @@ impl DirOps for DevInputAliasDir {
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        Box::new(core::iter::empty())
+        Box::new(
+            self.enumerate(0, usize::MAX)
+                .into_iter()
+                .map(|(name, file_type)| DirEntry {
+                    name: alloc::borrow::Cow::Owned(name),
+                    file_type,
+                }),
+        )
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
-        self.entries()
-            .into_iter()
-            .skip(cursor)
-            .take(max)
-            .map(|(name, _)| (name, FileType::Symlink))
-            .collect()
+        let mut list = crate::devfs::dynamic_enumerate(self.dynamic_map());
+        for (name, _) in self.entries() {
+            if !list.iter().any(|(n, _)| n == &name) {
+                list.push((name, FileType::Symlink));
+            }
+        }
+        list.into_iter().skip(cursor).take(max).collect()
     }
 
     fn enumerate_async<'a>(
@@ -1330,6 +1359,16 @@ impl DirOps for DevInputAliasDir {
         max: usize,
     ) -> FsFuture<'a, Vec<(String, FileType)>> {
         Box::pin(async move { Ok(self.enumerate(cursor, max)) })
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        let result = crate::devfs::dynamic_symlink(self.dynamic_map(), name, target);
+        Box::pin(async move { result })
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_unlink(self.dynamic_map(), name);
+        Box::pin(async move { result })
     }
 }
 
@@ -1613,6 +1652,61 @@ fn smoke_evdev_usb_identity_aliases() -> narf_kernel_test::TestResult {
     }
 }
 narf_kernel_test::kernel_test_in!("filesystem/devfs_input", smoke_evdev_usb_identity_aliases);
+
+fn smoke_devfs_input_dynamic_symlink_create_and_unlink() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    __reset_input_links_for_test();
+    let dir = DevInputDir;
+    let Some(by_path) = dir.lookup_dir("by-path") else {
+        return TestResult::Fail("/dev/input/by-path directory missing");
+    };
+    let name = "platform-narf-test-kbd";
+    let target = "../event0";
+
+    // 1. symlink creation
+    let sym = match narf_scheduler::block_on(by_path.symlink(name, target)) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("by-path.symlink failed"),
+    };
+    if sym.stat().mode.file_type != FileType::Symlink {
+        return TestResult::Fail("created entry is not a symlink");
+    }
+
+    // 2. lookup finds the dynamic symlink
+    let found = match by_path.lookup(name) {
+        Some(f) => f,
+        None => return TestResult::Fail("lookup failed to find dynamic symlink"),
+    };
+    if found.stat().mode.file_type != FileType::Symlink {
+        return TestResult::Fail("lookup found entry is not a symlink");
+    }
+
+    // 3. enumerate includes the dynamic symlink
+    let entries = by_path.enumerate(0, 64);
+    if !entries
+        .iter()
+        .any(|(n, t)| n == name && *t == FileType::Symlink)
+    {
+        return TestResult::Fail("enumerate did not include dynamic symlink");
+    }
+
+    // 4. unlink
+    if narf_scheduler::block_on(by_path.unlink(name)).is_err() {
+        return TestResult::Fail("by-path.unlink failed");
+    }
+
+    // 5. verify lookup no longer finds it
+    if by_path.lookup(name).is_some() {
+        return TestResult::Fail("dynamic symlink survived unlink");
+    }
+
+    __reset_input_links_for_test();
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_devfs_input_dynamic_symlink_create_and_unlink
+);
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

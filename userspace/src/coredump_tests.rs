@@ -174,3 +174,41 @@ fn smoke_coredump_skips_device_mappings() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/coredump", smoke_coredump_skips_device_mappings);
+
+fn smoke_coredump_sparse_anonymous_trimmed() -> TestResult {
+    use narf_memory::address_space::{Region, RegionPerms};
+    let anon_perms = RegionPerms(RegionPerms::READ.0 | RegionPerms::WRITE.0);
+    let empty_region = Region {
+        base: narf_memory::VirtAddr::new(0x1000_0000),
+        len: 64 * 1024 * 1024,
+        perms: anon_perms,
+        phys: narf_memory::region_backing::RegionBacking::new(),
+    };
+    if dump_len(&empty_region) != 0 {
+        return TestResult::Fail("unbacked sparse region must dump 0 bytes");
+    }
+
+    let mut sparse_backing = narf_memory::region_backing::RegionBacking::new();
+    if sparse_backing.reserve_slot(2).is_err() {
+        return TestResult::Fail("backing reservation failed");
+    }
+    if let Some(slot) = sparse_backing.get_mut(2) {
+        *slot = PhysAddr::new(0x2000);
+    } else {
+        return TestResult::Fail("backing slot 2 absent");
+    }
+    let sparse_region = Region {
+        base: narf_memory::VirtAddr::new(0x1000_0000),
+        len: 64 * 1024 * 1024,
+        perms: anon_perms,
+        phys: sparse_backing,
+    };
+    if dump_len(&sparse_region) != 3 * 4096 {
+        return TestResult::Fail("sparse region must only dump up to highest resident page");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/coredump",
+    smoke_coredump_sparse_anonymous_trimmed
+);

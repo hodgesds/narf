@@ -249,7 +249,7 @@ fn rdna2_cpu_mappings_revoke_rebind_and_refuse_pins() -> TestResult {
         va[16..24].copy_from_slice(&0x2_0000_0000u64.to_le_bytes());
         va[32..40].copy_from_slice(&(3 * 4096u64).to_le_bytes());
         let nr = crate::drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_VA;
-        crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state)
+        crate::amdgpu_vm::dispatch(nr, va.as_ptr() as usize, &vm, &state, None)
             .map_err(|_| "GPU VA mapping failed")?;
         let check = |label: &'static str| -> Result<(), &'static str> {
             let frames = object.frames(0, 3 * 4096).map_err(|_| label)?;
@@ -414,6 +414,7 @@ fn rdna2_cpu_mappings_revoke_rebind_and_refuse_pins() -> TestResult {
             },
             &vm,
             &state,
+            None,
         )
         .map_err(|_| "GPU VA unmap failed")?;
         relocate(&object, false).map_err(|_| "unmapped BO refused GTT move")?;

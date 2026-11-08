@@ -1338,6 +1338,7 @@ struct VendorProbeParams {
 /// Run the vendor probe and register the binding. Every error is
 /// mapped to `HidError::NotBootKeyboard` — the value is only a
 /// "not bound" signal for the generic-HID fallback in the caller.
+#[allow(clippy::too_many_arguments)]
 async fn probe_and_register(
     xhci_dev: &Xhci,
     slot_id: u8,

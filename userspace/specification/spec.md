@@ -1876,6 +1876,14 @@ while a V6ONLY reservation remains independent. NARF's family demux lock may
 nest the reservation lock, but the reservation layer never enters either
 family table, providing a fixed lock order without an IPv4/IPv6 ABBA path.
 
+AF_INET6 registers `SOCK_RAW` with `IPPROTO_ICMPV6` (58) and other raw protocols;
+opening one requires `CAP_NET_RAW` authority and must not return `EAFNOSUPPORT`.
+Native IPv6 raw sockets retain 128-bit local and peer addresses, link-local /
+scope-id routing, and Linux RFC 3542 input filtering via `setsockopt`/`getsockopt`
+with `IPPROTO_ICMPV6` level and `ICMP6_FILTER` (256-bit type mask where bit 0
+passes and 1 blocks). Inbound ICMPv6 messages deliver via `narf_net::ipv6::icmp6_sock`
+with per-socket durable readiness cells for poll and epoll.
+
 Internet sockets implement the legacy network-device ioctl ABI for
 `SIOCGIFNAME`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFMTU`,
 `SIOCGIFHWADDR`, and `SIOCGIFINDEX`. `SIOCGIFNAME` consumes `ifr_ifindex` and

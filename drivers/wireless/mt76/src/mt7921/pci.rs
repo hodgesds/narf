@@ -377,6 +377,19 @@ pub unsafe fn bring_up(
     invoke(cap, || bring_up_current(device, cap)).map_err(|_| ProbeError::Authority)?
 }
 
+/// PCI command bits the identity/driver-own probe runs with.
+///
+/// Bus mastering is deliberately absent. The probe only touches BAR0
+/// registers; no host DMA ring exists yet, and the function may still carry
+/// WFDMA ring bases inherited from firmware or a previous OS (a warm reboot
+/// from Linux does not necessarily reset the M.2 card). With the IOMMU in
+/// identity mode, enabling bus mastering here lets that stale state DMA into
+/// arbitrary physical memory. Bus mastering is granted only by the firmware
+/// transport, after it has reprogrammed and proven its own rings
+/// (`firmware_transport_hw::restore_bus` / `resume_dma`).
+pub(super) const PROBE_COMMAND: u16 =
+    narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE;
+
 fn bring_up_current(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
@@ -393,14 +406,21 @@ fn bring_up_current(
 
     validate_probe_window(mmio_bar0.len)?;
     use narf_bus::pci::{self, cmd};
-    pci::set_command(cap, device, cmd::MEM_SPACE).map_err(|_| ProbeError::Authority)?;
+    pci::set_command(cap, device, PROBE_COMMAND).map_err(|_| ProbeError::Authority)?;
     let command = pci::read_command(cap, device).map_err(|_| ProbeError::Authority)?;
     if command == u16::MAX
-        || command & (cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE)
-            != cmd::MEM_SPACE | cmd::INTX_DISABLE
+        || command & (cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE) != PROBE_COMMAND
     {
         return Err(ProbeError::Authority);
     }
+
+    let _ = narf_bus::pci::set_power_state(cap, device, narf_bus::pci::PciPowerState::D0);
+    let _ = narf_bus::pci_express::clear_and_set_link_control(
+        cap,
+        device,
+        narf_bus::pci_express::LNKCTL_ASPMC,
+        0,
+    );
 
     let _ = writeln!(
         narf_console::Writer,
@@ -432,6 +452,9 @@ fn bring_up_current(
 
     // ── Stage 1: driver-own + firmware-load stub + EFUSE ─────────
     //
+    // Linux mt7921_pci_probe calls __mt792xe_mcu_drv_pmctrl (HOST_CLR_OWN)
+    // to take driver ownership. (mt792xe_mcu_fw_pmctrl / HOST_SET_OWN is
+    // only used during suspend/sleep, not during probe).
     // SAFETY: BAR0 mapped + owned.
     let driver_owned = match unsafe { mac::take_driver_own(&mmio_bar0) } {
         Ok(()) => true,
@@ -549,6 +572,11 @@ pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
         return None;
     }
     controller.as_ref().map(f)
+}
+
+/// The bus address of the currently bound MT7921 device, if any.
+pub fn bound_bus_addr() -> Option<narf_bus::BusAddr> {
+    FIRMWARE_BINDING.lock().as_ref().map(|(dev, _)| dev.addr)
 }
 
 pub(super) fn claim_firmware_transport(

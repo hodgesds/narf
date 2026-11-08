@@ -199,6 +199,67 @@ pub(crate) struct ElfPrpsinfo {
     pr_psargs: [u8; 80],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct ElfSiginfo {
+    pub(crate) si_signo: i32,
+    pub(crate) si_code: i32,
+    pub(crate) si_errno: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct ElfTimeval {
+    pub(crate) tv_sec: i64,
+    pub(crate) tv_usec: i64,
+}
+
+/// Linux `struct elf_prstatus` for `NT_PRSTATUS` (note type 1).
+/// 336 bytes on x86_64, with `pr_reg` at offset 112.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ElfPrstatus {
+    pub(crate) pr_info: ElfSiginfo,
+    pub(crate) pr_cursig: i16,
+    pub(crate) _pad0: [u8; 2],
+    pub(crate) pr_sigpend: u64,
+    pub(crate) pr_sighold: u64,
+    pub(crate) pr_pid: i32,
+    pub(crate) pr_ppid: i32,
+    pub(crate) pr_pgrp: i32,
+    pub(crate) pr_sid: i32,
+    pub(crate) pr_utime: ElfTimeval,
+    pub(crate) pr_stime: ElfTimeval,
+    pub(crate) pr_cutime: ElfTimeval,
+    pub(crate) pr_cstime: ElfTimeval,
+    pub(crate) pr_reg: user_regs_struct,
+    pub(crate) pr_fpvalid: i32,
+    pub(crate) _pad1: i32,
+}
+
+impl Default for ElfPrstatus {
+    fn default() -> Self {
+        Self {
+            pr_info: ElfSiginfo::default(),
+            pr_cursig: 0,
+            _pad0: [0; 2],
+            pr_sigpend: 0,
+            pr_sighold: 0,
+            pr_pid: 0,
+            pr_ppid: 0,
+            pr_pgrp: 0,
+            pr_sid: 0,
+            pr_utime: ElfTimeval::default(),
+            pr_stime: ElfTimeval::default(),
+            pr_cutime: ElfTimeval::default(),
+            pr_cstime: ElfTimeval::default(),
+            pr_reg: user_regs_struct::default(),
+            pr_fpvalid: 1,
+            _pad1: 0,
+        }
+    }
+}
+
 impl Default for ElfPrpsinfo {
     fn default() -> Self {
         Self {
@@ -279,9 +340,40 @@ pub(crate) fn build_note_segment(
     prpsinfo: &ElfPrpsinfo,
     auxv: &[u8],
 ) -> Vec<u8> {
+    build_note_segment_with_signal(regs, 0, prpsinfo, auxv)
+}
+
+pub(crate) fn build_note_segment_with_signal(
+    regs: &user_regs_struct,
+    signum: u32,
+    prpsinfo: &ElfPrpsinfo,
+    auxv: &[u8],
+) -> Vec<u8> {
     let mut buf = Vec::new();
-    // SAFETY: both are live locals of exactly their declared size.
-    push_note(&mut buf, b"CORE", 1, unsafe { slice_from_ref(regs) });
+    let prstatus = ElfPrstatus {
+        pr_info: ElfSiginfo {
+            si_signo: signum as i32,
+            si_code: 0,
+            si_errno: 0,
+        },
+        pr_cursig: signum as i16,
+        _pad0: [0; 2],
+        pr_sigpend: 0,
+        pr_sighold: 0,
+        pr_pid: prpsinfo.pr_pid,
+        pr_ppid: prpsinfo.pr_ppid,
+        pr_pgrp: prpsinfo.pr_pgrp,
+        pr_sid: prpsinfo.pr_sid,
+        pr_utime: ElfTimeval::default(),
+        pr_stime: ElfTimeval::default(),
+        pr_cutime: ElfTimeval::default(),
+        pr_cstime: ElfTimeval::default(),
+        pr_reg: *regs,
+        pr_fpvalid: 1,
+        _pad1: 0,
+    };
+    // SAFETY: `prstatus` is a live local of exactly this size (336 bytes on x86_64).
+    push_note(&mut buf, b"CORE", 1, unsafe { slice_from_ref(&prstatus) });
     // SAFETY: `prpsinfo` is a live reference to a `#[repr(C)]` struct of
     // exactly this size, read as bytes for the note descriptor.
     push_note(&mut buf, b"CORE", 3, unsafe { slice_from_ref(prpsinfo) });
@@ -296,13 +388,35 @@ pub(crate) fn build_note_segment(
 /// marks with a non-write-back memory type (DRM GEM VRAM BAR frames, which
 /// may lie far above the kernel direct map, e.g. a ReBAR at 992 GiB). Their
 /// PT_LOAD keeps `p_memsz` with `p_filesz = 0`.
+/// File-backed private read-only mappings (executable and library .text) are
+/// also omitted from file payload (`p_filesz = 0`), matching Linux's coredump
+/// filter and ensuring stacks and writable heaps fit within RLIMIT_CORE.
 fn dump_len(r: &narf_memory::address_space::Region) -> u64 {
     let device = narf_memory::memtype::region_may_request(r.perms)
         && r.perms.memory_type() != narf_memory::MemoryType::WriteBack;
-    if device {
+    // Device mappings, file-backed private read-only mappings, and
+    // unmaterialized regions all dump nothing (see the doc comment above).
+    if device
+        || (r
+            .perms
+            .contains(narf_memory::address_space::RegionPerms::FILE_DEMAND)
+            && !r
+                .perms
+                .contains(narf_memory::address_space::RegionPerms::WRITE))
+        || r.phys.is_empty()
+    {
         0
     } else {
-        r.len
+        // Dump up to the highest backed page, bounded by r.len.
+        // Trimming unmaterialized tails avoids writing tens of megabytes of zeroes
+        // for sparse thread arenas (e.g. 64 MB thread arenas with only a few pages resident)
+        // and keeps the crash dump from exhausting RLIMIT_CORE before thread stacks are written.
+        r.phys
+            .indexed()
+            .rfind(|(_, phys)| phys.raw() != 0)
+            .map_or(0, |(idx, _)| {
+                ((idx as u64) + 1).saturating_mul(4096).min(r.len)
+            })
     }
 }
 
@@ -483,7 +597,7 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
         }
     }
     let auxv = crate::handlers::proc_auxv_of(pid);
-    let note_buf = build_note_segment(&user_regs, &prpsinfo, &auxv);
+    let note_buf = build_note_segment_with_signal(&user_regs, signum, &prpsinfo, &auxv);
     let note_size = note_buf.len() as u64;
     let (phoff, note_offset, data_offset) = metadata_offsets(num_phdrs, note_buf.len());
     ehdr.e_phoff = phoff;

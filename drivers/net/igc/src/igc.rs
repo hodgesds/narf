@@ -726,7 +726,7 @@ impl Igc {
             return crate::publish::LinkSample::DOWN;
         }
         let status = self.hw.read(8);
-        if status == u32::MAX || status & 2 == 0 || !hardware::phy_has_link(&self.hw) {
+        if status == u32::MAX || status & 2 == 0 {
             return crate::publish::LinkSample::DOWN;
         }
         decode_link(status)
@@ -1365,12 +1365,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     narf_power::device_pm::register_device_pm_ops(controller.name(), controller.clone());
     narf_bus::pcie_recovery::register_error_callback(controller.device.addr, controller.clone());
     narf_net::iface::set_open_stop(controller.name(), admin_hook);
-    narf_net::iface::set_driver_info(
-        controller.name(),
-        "igc",
-        Some("0.1.0"),
-        alloc::format!("{:?}", device.addr),
-    );
+    let bus_info = match device.addr {
+        narf_bus::BusAddr::Pcie(pci) => alloc::format!("{pci:?}"),
+        narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
+    };
+    narf_net::iface::set_driver_info(controller.name(), "igc", Some("0.1.0"), bus_info);
     // Firmware version for ETHTOOL_GDRVINFO (Linux igc_ethtool_get_drvinfo):
     // best-effort; a failed NVM/PHY read leaves the field blank and never
     // fails probe.
