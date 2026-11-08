@@ -67,47 +67,49 @@ fn intel_kms_dirtyfb_errnos_follow_drm_mode_dirtyfb_ioctl_order() -> TestResult 
             framebuffer(&mode, 7, true),
             Err(FsError::NotImplemented)
         ));
-        return TestResult::Pass;
     }
-    let fb = framebuffer(&mode, 7, true).unwrap();
-    let queue = queue::Queue::new(mode.clone());
-    let cpu = Cpu::new();
-    // drm_ioctl copies the request (-EFAULT) before drm_ioctl_permit
-    // refuses a non-master (-EACCES).
-    assert_eq!(
-        admit_dirty(&queue, 8, 4090, &cpu),
-        Some(FsError::BadAddress)
-    );
-    put_dirty(&cpu, 0, fb, 0, 0, 0);
-    assert_eq!(
-        admit_dirty(&queue, 8, 0, &cpu),
-        Some(FsError::PermissionDenied)
-    );
-    // drm_framebuffer_lookup (-ENOENT) precedes every clip check.
-    put_dirty(&cpu, 0, 999, 0, 1, 0);
-    assert_eq!(admit_dirty(&queue, 7, 0, &cpu), Some(FsError::NotFound));
-    // The -EINVAL checks, in order: count without pointer (and the
-    // reverse), an odd annotated copy, then a negative or excessive count.
-    for (flags, num_clips, clips_ptr) in [
-        (0, 1, 0),
-        (0, 0, 0x100),
-        (1, 3, 0x100),
-        (0, 257, 0x100),
-        (0, 0x8000_0000, 0x100),
-    ] {
-        put_dirty(&cpu, 0, fb, flags, num_clips, clips_ptr);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fb = framebuffer(&mode, 7, true).unwrap();
+        let queue = queue::Queue::new(mode.clone());
+        let cpu = Cpu::new();
+        // drm_ioctl copies the request (-EFAULT) before drm_ioctl_permit
+        // refuses a non-master (-EACCES).
         assert_eq!(
-            admit_dirty(&queue, 7, 0, &cpu),
-            Some(FsError::InvalidData),
-            "flags {flags:#x} clips {num_clips} ptr {clips_ptr:#x}"
+            admit_dirty(&queue, 8, 4090, &cpu),
+            Some(FsError::BadAddress)
         );
+        put_dirty(&cpu, 0, fb, 0, 0, 0);
+        assert_eq!(
+            admit_dirty(&queue, 8, 0, &cpu),
+            Some(FsError::PermissionDenied)
+        );
+        // drm_framebuffer_lookup (-ENOENT) precedes every clip check.
+        put_dirty(&cpu, 0, 999, 0, 1, 0);
+        assert_eq!(admit_dirty(&queue, 7, 0, &cpu), Some(FsError::NotFound));
+        // The -EINVAL checks, in order: count without pointer (and the
+        // reverse), an odd annotated copy, then a negative or excessive count.
+        for (flags, num_clips, clips_ptr) in [
+            (0, 1, 0),
+            (0, 0, 0x100),
+            (1, 3, 0x100),
+            (0, 257, 0x100),
+            (0, 0x8000_0000, 0x100),
+        ] {
+            put_dirty(&cpu, 0, fb, flags, num_clips, clips_ptr);
+            assert_eq!(
+                admit_dirty(&queue, 7, 0, &cpu),
+                Some(FsError::InvalidData),
+                "flags {flags:#x} clips {num_clips} ptr {clips_ptr:#x}"
+            );
+        }
+        // The clip copy (-EFAULT) comes last.
+        put_dirty(&cpu, 0, fb, 0, 2, 4090);
+        assert_eq!(admit_dirty(&queue, 7, 0, &cpu), Some(FsError::BadAddress));
+        // Unknown flag bits are masked (DRM_MODE_FB_DIRTY_FLAGS & r->flags).
+        put_dirty(&cpu, 0, fb, 0xffff_fffc, 0, 0);
+        assert_eq!(admit_dirty(&queue, 7, 0, &cpu), None);
     }
-    // The clip copy (-EFAULT) comes last.
-    put_dirty(&cpu, 0, fb, 0, 2, 4090);
-    assert_eq!(admit_dirty(&queue, 7, 0, &cpu), Some(FsError::BadAddress));
-    // Unknown flag bits are masked (DRM_MODE_FB_DIRTY_FLAGS & r->flags).
-    put_dirty(&cpu, 0, fb, 0xffff_fffc, 0, 0);
-    assert_eq!(admit_dirty(&queue, 7, 0, &cpu), None);
     TestResult::Pass
 }
 kernel_test_in!(
@@ -126,45 +128,48 @@ fn intel_kms_dirtyfb_clips_become_the_present_damage() -> TestResult {
             framebuffer(&mode, 7, true),
             Err(FsError::NotImplemented)
         ));
-        return TestResult::Pass;
     }
-    let fb = framebuffer(&mode, 7, true).unwrap();
-    let other = framebuffer(&mode, 7, true).unwrap();
-    mode.lock().crtcs[0].primary_fb = Some(fb);
-    let cpu = Cpu::new();
-    put_dirty(&cpu, 0, fb, 1, 4, 0x100);
-    put_clips(
-        &cpu,
-        0x100,
-        &[[1, 2, 3, 4], [0, 9, 9, 9], [5, 6, 7, 8], [0, 0, 1, 1]],
-    );
-    let Ok(Request::Dirty(id, damage)) = Request::copy_dirty(0, &cpu, true, |id| id == fb) else {
-        panic!("DIRTYFB request not decoded");
-    };
-    // ANNOTATE_COPY: clips 0 and 2 (drm_atomic_helper_dirtyfb's src_inc 2).
-    assert_eq!(id, fb);
-    assert_eq!(
-        damage,
-        Damage::Clips(alloc::vec![Rect::new(1, 2, 3, 4), Rect::new(5, 6, 7, 8)])
-    );
-    let geometry = Geometry {
-        width: 64,
-        height: 32,
-        pitch: 256,
-    };
-    // The primary's framebuffer: a present of it carrying the damage.
-    let plan = Plan::stage(&mode.lock(), Request::Dirty(fb, damage.clone()), geometry).unwrap();
-    assert!(matches!(plan.action, Action::Present));
-    assert_eq!(plan.damage, damage);
-    // Any other framebuffer is shown nowhere: nothing to commit.
-    let plan = Plan::stage(&mode.lock(), Request::Dirty(other, damage), geometry).unwrap();
-    assert!(matches!(plan.action, Action::Noop));
-    // A clipless DIRTYFB damages the whole plane.
-    put_dirty(&cpu, 0, fb, 0, 0, 0);
-    let Ok(Request::Dirty(_, damage)) = Request::copy_dirty(0, &cpu, true, |_| true) else {
-        panic!("clipless DIRTYFB not decoded");
-    };
-    assert_eq!(damage, Damage::Full);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fb = framebuffer(&mode, 7, true).unwrap();
+        let other = framebuffer(&mode, 7, true).unwrap();
+        mode.lock().crtcs[0].primary_fb = Some(fb);
+        let cpu = Cpu::new();
+        put_dirty(&cpu, 0, fb, 1, 4, 0x100);
+        put_clips(
+            &cpu,
+            0x100,
+            &[[1, 2, 3, 4], [0, 9, 9, 9], [5, 6, 7, 8], [0, 0, 1, 1]],
+        );
+        let Ok(Request::Dirty(id, damage)) = Request::copy_dirty(0, &cpu, true, |id| id == fb)
+        else {
+            panic!("DIRTYFB request not decoded");
+        };
+        // ANNOTATE_COPY: clips 0 and 2 (drm_atomic_helper_dirtyfb's src_inc 2).
+        assert_eq!(id, fb);
+        assert_eq!(
+            damage,
+            Damage::Clips(alloc::vec![Rect::new(1, 2, 3, 4), Rect::new(5, 6, 7, 8)])
+        );
+        let geometry = Geometry {
+            width: 64,
+            height: 32,
+            pitch: 256,
+        };
+        // The primary's framebuffer: a present of it carrying the damage.
+        let plan = Plan::stage(&mode.lock(), Request::Dirty(fb, damage.clone()), geometry).unwrap();
+        assert!(matches!(plan.action, Action::Present));
+        assert_eq!(plan.damage, damage);
+        // Any other framebuffer is shown nowhere: nothing to commit.
+        let plan = Plan::stage(&mode.lock(), Request::Dirty(other, damage), geometry).unwrap();
+        assert!(matches!(plan.action, Action::Noop));
+        // A clipless DIRTYFB damages the whole plane.
+        put_dirty(&cpu, 0, fb, 0, 0, 0);
+        let Ok(Request::Dirty(_, damage)) = Request::copy_dirty(0, &cpu, true, |_| true) else {
+            panic!("clipless DIRTYFB not decoded");
+        };
+        assert_eq!(damage, Damage::Full);
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -200,42 +205,44 @@ fn intel_kms_fb_damage_clips_validates_like_drm_atomic_set_property() -> TestRes
             framebuffer(&mode, 7, true),
             Err(FsError::NotImplemented)
         ));
-        return TestResult::Pass;
     }
-    let fb = framebuffer(&mode, 7, true).unwrap();
-    let clips = rects_blob(&[[0, 4, 64, 6], [10, 20, 12, 21]]);
-    let good = mode.lock().create_property_blob(clips.clone()).unwrap();
-    let partial = mode
-        .lock()
-        .create_property_blob(alloc::vec![0; 20])
-        .unwrap();
-    let geometry = Geometry {
-        width: 64,
-        height: 32,
-        pitch: 256,
-    };
-    let stage = |value: u64| Plan::stage(&mode.lock(), damage_frame(fb, value), geometry);
-    // No blob: a full-plane update.
-    assert_eq!(stage(0).unwrap().damage, Damage::Full);
-    // The blob's rectangles, unclamped.
-    let expected = Damage::from_blob(&clips).unwrap();
-    assert_eq!(stage(u64::from(good)).unwrap().damage, expected);
-    // drm_property_lookup_blob takes the id as u32.
-    assert_eq!(
-        stage(1u64 << 32 | u64::from(good)).unwrap().damage,
-        expected
-    );
-    // An unknown blob, and one that is not whole drm_mode_rects: -EINVAL.
-    assert!(matches!(stage(0x7777), Err(FsError::InvalidData)));
-    assert!(matches!(
-        stage(u64::from(partial)),
-        Err(FsError::InvalidData)
-    ));
-    // FB_DAMAGE_CLIPS alone does not turn a commit into a color commit.
-    assert!(matches!(
-        stage(u64::from(good)).unwrap().action,
-        Action::Present
-    ));
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fb = framebuffer(&mode, 7, true).unwrap();
+        let clips = rects_blob(&[[0, 4, 64, 6], [10, 20, 12, 21]]);
+        let good = mode.lock().create_property_blob(clips.clone()).unwrap();
+        let partial = mode
+            .lock()
+            .create_property_blob(alloc::vec![0; 20])
+            .unwrap();
+        let geometry = Geometry {
+            width: 64,
+            height: 32,
+            pitch: 256,
+        };
+        let stage = |value: u64| Plan::stage(&mode.lock(), damage_frame(fb, value), geometry);
+        // No blob: a full-plane update.
+        assert_eq!(stage(0).unwrap().damage, Damage::Full);
+        // The blob's rectangles, unclamped.
+        let expected = Damage::from_blob(&clips).unwrap();
+        assert_eq!(stage(u64::from(good)).unwrap().damage, expected);
+        // drm_property_lookup_blob takes the id as u32.
+        assert_eq!(
+            stage(1u64 << 32 | u64::from(good)).unwrap().damage,
+            expected
+        );
+        // An unknown blob, and one that is not whole drm_mode_rects: -EINVAL.
+        assert!(matches!(stage(0x7777), Err(FsError::InvalidData)));
+        assert!(matches!(
+            stage(u64::from(partial)),
+            Err(FsError::InvalidData)
+        ));
+        // FB_DAMAGE_CLIPS alone does not turn a commit into a color commit.
+        assert!(matches!(
+            stage(u64::from(good)).unwrap().action,
+            Action::Present
+        ));
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -306,42 +313,44 @@ fn intel_kms_commit_damage_reaches_the_display_owner() -> TestResult {
             framebuffer(&mode, 7, true),
             Err(FsError::NotImplemented)
         ));
-        return TestResult::Pass;
     }
-    let fb = framebuffer(&mode, 7, true).unwrap();
-    let clips = rects_blob(&[[0, 8, 64, 9]]);
-    let blob = mode.lock().create_property_blob(clips.clone()).unwrap();
-    let cpu = Cpu::new();
-    let out = OutFences::new(Vec::new());
-    let mut probe = Probe { seen: Vec::new() };
-    for (request, expected) in [
-        (
-            damage_frame(fb, u64::from(blob)),
-            Damage::from_blob(&clips).unwrap(),
-        ),
-        (damage_frame(fb, 0), Damage::Full),
-        (
-            Request::Dirty(fb, Damage::Clips(alloc::vec![Rect::new(1, 1, 2, 2)])),
-            Damage::Clips(alloc::vec![Rect::new(1, 1, 2, 2)]),
-        ),
-    ] {
-        {
-            let mut call = core::pin::pin!(execute(
-                &mut probe,
-                &mode,
-                7,
-                request,
-                &cpu,
-                None,
-                Some(&out)
-            ));
-            assert_eq!(
-                call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-                Poll::Ready(Ok(0))
-            );
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fb = framebuffer(&mode, 7, true).unwrap();
+        let clips = rects_blob(&[[0, 8, 64, 9]]);
+        let blob = mode.lock().create_property_blob(clips.clone()).unwrap();
+        let cpu = Cpu::new();
+        let out = OutFences::new(Vec::new());
+        let mut probe = Probe { seen: Vec::new() };
+        for (request, expected) in [
+            (
+                damage_frame(fb, u64::from(blob)),
+                Damage::from_blob(&clips).unwrap(),
+            ),
+            (damage_frame(fb, 0), Damage::Full),
+            (
+                Request::Dirty(fb, Damage::Clips(alloc::vec![Rect::new(1, 1, 2, 2)])),
+                Damage::Clips(alloc::vec![Rect::new(1, 1, 2, 2)]),
+            ),
+        ] {
+            {
+                let mut call = core::pin::pin!(execute(
+                    &mut probe,
+                    &mode,
+                    7,
+                    request,
+                    &cpu,
+                    None,
+                    Some(&out)
+                ));
+                assert_eq!(
+                    call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Ok(0))
+                );
+            }
+            assert_eq!(probe.seen.pop(), Some(expected));
+            assert_eq!(mode.lock().crtcs[0].primary_fb, Some(fb));
         }
-        assert_eq!(probe.seen.pop(), Some(expected));
-        assert_eq!(mode.lock().crtcs[0].primary_fb, Some(fb));
     }
     TestResult::Pass
 }
