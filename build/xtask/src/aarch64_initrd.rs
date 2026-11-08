@@ -1,5 +1,10 @@
 //! Place QEMU's manually loaded initrd after actual ELF physical/BSS extents.
 //! The dumpdtb kernel stub remains separate; only chosen initrd bounds change.
+//!
+//! The initrd goes below the force-loaded DTB when it fits there. When the
+//! kernel image has grown past the DTB's fixed address, it goes above the
+//! DTB's extent instead. The guest reads the bounds from /chosen either way,
+//! so neither placement needs the other side to assume an ordering.
 use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::{
@@ -21,7 +26,7 @@ pub(crate) fn place(
     dtb_load: u64,
 ) -> Result<(PathBuf, u64)> {
     let memory_end = kernel_end(kernel)?;
-    let start = memory_end
+    let mut start = memory_end
         .max(FLOOR)
         .checked_add(ALIGN - 1)
         .context("initrd alignment overflow")?
@@ -33,13 +38,32 @@ pub(crate) fn place(
         "initrd must be a nonempty regular file"
     );
     let length = metadata.len();
-    let end = start.checked_add(length).context("initrd end overflow")?;
-    ensure!(
-        end <= dtb_load,
-        "initrd {start:#x}..{end:#x} overlaps DTB at {dtb_load:#x}"
-    );
-
+    let mut end = start.checked_add(length).context("initrd end overflow")?;
     let mut bytes = read_dtb(dtb)?;
+    if end > dtb_load {
+        // The kernel image has outgrown the window below the DTB: its
+        // PT_LOAD/BSS extents now end past the DTB's fixed address, so no
+        // initrd placed after them can end at or before it. Fall back to
+        // placing the initrd above the DTB's own extent instead. The DTB
+        // address cannot move — the guest hard-codes it too, in both its
+        // Rust DTB scan and the boot stub's relocation-target walk — but
+        // neither side assumes the initrd sits below it: the Rust memory
+        // map reserves the patched /chosen bounds as-is, and the stub
+        // records them in its relocation avoid-table, so above-DTB
+        // placement is safe for both. The reservation covers the whole
+        // loaded file, which is what QEMU's loader writes, not just the
+        // FDT totalsize.
+        let dtb_end = dtb_load
+            .checked_add(bytes.len() as u64)
+            .context("DTB end overflow")?;
+        start = dtb_end
+            .max(start)
+            .checked_add(ALIGN - 1)
+            .context("initrd alignment overflow")?
+            & !(ALIGN - 1);
+        end = start.checked_add(length).context("initrd end overflow")?;
+    }
+
     let digest = Sha256::digest(&bytes);
     let (first, last) = initrd_properties(&bytes)?;
     patch(&mut bytes, first, start)?;
@@ -560,7 +584,7 @@ mod tests {
         }
     }
     #[test]
-    fn small_kernel_floor_exact_dtb_boundary_and_address_length_keys() {
+    fn small_kernel_floor_exact_dtb_boundary_and_above_dtb_fallback() {
         let temp = Temp::new();
         let tree = dtb(4, 0);
         let (kernel, dtb, initrd) = files(&temp, &elf(&[(0x4008_0000, 4096)]), &tree.bytes, 16);
@@ -572,7 +596,14 @@ mod tests {
             .unwrap()
             .set_len(17)
             .unwrap();
-        assert!(place(&kernel, &dtb, &initrd, FLOOR + 16).is_err());
+        // One byte too long to end at the DTB: the initrd no longer fits
+        // below it, so it moves above the DTB's extent instead of failing.
+        let dtb_end = (FLOOR + 16) + tree.bytes.len() as u64;
+        let expected = (dtb_end + ALIGN - 1) & !(ALIGN - 1);
+        assert_eq!(
+            place(&kernel, &dtb, &initrd, FLOOR + 16).unwrap().1,
+            expected
+        );
         let second = place(&kernel, &dtb, &initrd, 0x4f00_0000).unwrap().0;
         assert_ne!(first, second);
         File::options()
@@ -582,6 +613,26 @@ mod tests {
             .set_len(0)
             .unwrap();
         assert!(place(&kernel, &dtb, &initrd, 0x4f00_0000).is_err());
+    }
+    #[test]
+    fn kernel_past_dtb_places_initrd_above_dtb_extent() {
+        // Regression for #1749: the kernel-test kernel's PT_LOAD/BSS
+        // extents end past the fixed DTB address, so the initrd placed
+        // after them starts at 0x4f900000 — past the DTB at 0x4f000000 —
+        // and the old `end <= dtb_load` check failed the job before QEMU
+        // ran. The same addresses must now place cleanly above the DTB.
+        let temp = Temp::new();
+        let tree = dtb(4, 0);
+        let raw = elf(&[(0x4008_0000, 0x1000), (0x4f80_0000, 0x12345)]);
+        let (kernel, dtb, initrd) = files(&temp, &raw, &tree.bytes, 0x5608);
+        assert_eq!(kernel_end(&kernel).unwrap(), 0x4f81_2345);
+        let (output, start) = place(&kernel, &dtb, &initrd, 0x4f00_0000).unwrap();
+        assert_eq!(start, 0x4f90_0000);
+        let mut expected = tree.bytes.clone();
+        expected[tree.start..tree.start + 4].copy_from_slice(&[0x4f, 0x90, 0, 0]);
+        expected[tree.end..tree.end + 4].copy_from_slice(&[0x4f, 0x90, 0x56, 0x08]);
+        assert_eq!(fs::read(&output).unwrap(), expected);
+        assert_eq!(fs::read(&dtb).unwrap(), tree.bytes);
     }
     #[test]
     fn elf_header_table_and_segment_failures_are_checked() {
