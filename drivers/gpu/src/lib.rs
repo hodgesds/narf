@@ -354,6 +354,8 @@ pub mod amdgpu_hwmon;
 pub mod amdgpu_ih;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_ih7;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_ih_drainer;
 #[path = "amdgpu_ih_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_ih;
