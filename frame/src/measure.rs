@@ -379,11 +379,6 @@ pub fn firmware_replay_mismatch() -> bool {
     FIRMWARE_REPLAY_MISMATCH.load(Ordering::Acquire)
 }
 
-/// The last PCR 0–7 cross-check outcome, if one ran.
-pub fn last_cross_check() -> Option<PcrCrossCheck> {
-    *LAST_CROSS_CHECK.lock()
-}
-
 /// Read firmware-table bytes out of physical memory through the
 /// boot identity map. Mirrors the guards in
 /// `firmware/smbios`'s `KernelPhys`: the address must be non-zero

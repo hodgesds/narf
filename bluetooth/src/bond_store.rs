@@ -129,7 +129,10 @@ impl Bond {
     /// or an unknown presence flag. Strict: unknown flag bits
     /// fail the record rather than being skipped.
     pub fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
-        if bytes.len() < 36 {
+        // Fixed part: peer address (7) + LTK (16) + EDIV (2) +
+        // Rand (8) + authenticated (1) + flags (1) = 35 bytes;
+        // a bond with no optional keys is exactly 35 bytes.
+        if bytes.len() < 35 {
             return None;
         }
         let mut peer_addr = [0u8; 7];
