@@ -305,9 +305,6 @@ static FIRMWARE_INGEST: IrqSafeSpinLock<Option<FirmwareIngest>> = IrqSafeSpinLoc
 /// PCRs 0–7 while it is set.
 static FIRMWARE_REPLAY_MISMATCH: AtomicBool = AtomicBool::new(false);
 
-/// The last PCR 0–7 cross-check outcome, if one ran.
-static LAST_CROSS_CHECK: IrqSafeSpinLock<Option<PcrCrossCheck>> = IrqSafeSpinLock::new(None);
-
 /// The outcome of a firmware event-log ingest.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FirmwareIngest {
@@ -377,11 +374,6 @@ pub fn firmware_ingest() -> Option<FirmwareIngest> {
 /// through the attestation hooks.
 pub fn firmware_replay_mismatch() -> bool {
     FIRMWARE_REPLAY_MISMATCH.load(Ordering::Acquire)
-}
-
-/// The last PCR 0–7 cross-check outcome, if one ran.
-pub fn last_cross_check() -> Option<PcrCrossCheck> {
-    *LAST_CROSS_CHECK.lock()
 }
 
 /// Read firmware-table bytes out of physical memory through the
@@ -633,14 +625,12 @@ pub async fn cross_check_pcrs_0_7() -> PcrCrossCheck {
         }
     }
     if out.read_failed {
-        *LAST_CROSS_CHECK.lock() = Some(out);
         return out;
     }
     out.checked = true;
     if out.mismatched.iter().any(|&m| m) {
         FIRMWARE_REPLAY_MISMATCH.store(true, Ordering::Release);
     }
-    *LAST_CROSS_CHECK.lock() = Some(out);
     out
 }
 
@@ -899,7 +889,6 @@ pub fn __reset_for_test() {
     FIRMWARE_INGESTED.store(false, Ordering::Release);
     *FIRMWARE_INGEST.lock() = None;
     FIRMWARE_REPLAY_MISMATCH.store(false, Ordering::Release);
-    *LAST_CROSS_CHECK.lock() = None;
 }
 
 fn record(
@@ -1440,11 +1429,15 @@ fn fw_push_u32(out: &mut Vec<u8>, v: u32) {
 
 fn fw_spec_id_record() -> Vec<u8> {
     // TCG_PCR_EVENT: PCR 0, EV_NO_ACTION, 20 zero digest bytes,
-    // event = TCG_EfiSpecIdEventStruct ("Spec ID Event03",
+    // event = TCG_EfiSpecIdEventStruct ("Spec ID Event03" + NUL,
     // platformClass 0, specVersion 2.0, errata 0, uintnSize 2,
     // numberOfAlgorithms 2: SHA-1/20 + SHA-256/32, vendorInfo "").
+    // The signature is 16 bytes: the 15 ASCII bytes plus the NUL
+    // terminator the TCG spec counts in TCG_SPECID_SIG. A 15-byte
+    // signature shifts every later field one byte early and the
+    // parser rejects the log (BadSpecIdVersion at the major byte).
     let mut body = Vec::new();
-    body.extend_from_slice(b"Spec ID Event03");
+    body.extend_from_slice(b"Spec ID Event03\0");
     fw_push_u32(&mut body, 0);
     body.push(0);
     body.push(2);
