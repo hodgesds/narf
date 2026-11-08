@@ -8785,8 +8785,27 @@ only the 255 cap and the guardband→pipeline_full derivation are
 fetched), the VBT `vrr_feature_enabled` per-panel bit layout (offset 56
 verified from Linux 6.12 VBT defs; bit 0 / panel 0 assumed), and which
 DPCD bit reports AS-SDP support (discovery passes `as_sdp = false`
-until resolved). Sequencing (modeset/push/disable), DPCD+PSR, CMRR and
-readback remain separate lanes (#1769–#1772).
+until resolved). Sequencing (modeset/push/disable), DPCD+PSR and
+CMRR remain separate lanes (#1769–#1771); readback landed in #1772.
+
+VRR readback/sanitize at install/modeset setup (#1772):
+`readback_vrr` is the `intel_vrr_get_config` decode — one
+transcoder's registers into `VrrReadback`: CTL enable/CMRR/flip-line
+bits, VMIN/VMAX/FLIPLINE (register value + 1 when `FLIP_LINE_EN` is
+set), VSYNC on display 14+, CMRR M/N, guardband (display 14+,
+CTL[15:0]) or pipeline-full (Gen12/display 13, CTL[10:3]) —
+returning `None` on dead MMIO (CTL reads all-ones).
+`reconcile_vrr_at_setup` publishes the decoded state into
+`VRR_STATE` and, at install, surfaces the reconciled enable state
+to the atomic `Card::vrr_enabled` slot; a GOP-left fixed-RR TG
+(VRR on, `vmin == vmax`, CMRR off) is disabled in hardware first,
+per the upstream GOP-readback fix. CMRR is exempt from the
+fixed-RR rule — it programs `vmin == vmax == vtotal` by design.
+The sink range is not recovered from registers; the per-modeset
+recompute replaces the timings from the committed mode and range
+anyway. The `TRANS_VRR_STATUS` live bits are deliberately not
+trusted: the `i915_reg.h` copy on file and the V1 constants
+disagree on bit 28.
 
 `info_packet(timing, range, hdmi, active)` builds the ordinary AMD FreeSync
 v1 SPD (the primary non-PCON/non-replay packet), using the same effective
