@@ -352,12 +352,10 @@ fn load_and_start() -> Result<(), LoadError> {
         overlapping_count += 1;
     }
     let partition =
-        partition_load_span(page_start, alloc_end, &mut overlapping[..overlapping_count]).map_err(
-            |error| {
+        partition_load_span(page_start, alloc_end, &mut overlapping[..overlapping_count])
+            .inspect_err(|_| {
                 print_overlapping_map(&map, page_start, page_end);
-                error
-            },
-        )?;
+            })?;
     for &(run_start, run_end) in partition.free_runs() {
         let pages = usize::try_from((run_end - run_start) / PAGE_SIZE)
             .map_err(|_| LoadError::Arithmetic)?;
