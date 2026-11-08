@@ -32,10 +32,63 @@ const FDT_HEADER_SIZE: usize = 40;
 // while allowing that real configuration-table payload.
 const MAX_DTB_SIZE: usize = 4 * 1024 * 1024;
 const MAX_KERNEL_LOAD_SPAN: u64 = 1024 * 1024 * 1024;
+/// Most firmware-occupied holes the kernel's file-backed span can straddle.
+/// AAVMF parks one 128 KiB BOOT_SERVICES_DATA block inside it; eight is
+/// headroom for denser firmware layouts, and anything more fails loudly
+/// instead of silently dropping a hole.
+const MAX_SPAN_HOLES: usize = 8;
+/// Most memory-map entries that can overlap the file-backed span. The span
+/// is under 1 GiB by the check above; three cover the observed AAVMF map.
+const MAX_SPAN_ENTRIES: usize = 32;
+/// Most staged file ranges (one per hole × segment overlap) deferred past
+/// ExitBootServices. A hole normally sits inside a single segment.
+const MAX_HOLE_FILLS: usize = 16;
 const EFI_DTB_TABLE_GUID: uefi::Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
 const KERNEL_HASH_MARKER: [u8; 20] = *b"NARF_KERNEL_BLAKE2B=";
 const KERNEL_HASH_PLACEHOLDER: [u8; 64] = [0xa5; 64];
 const KERNEL_HASH_BUFFER_SIZE: usize = 4096;
+
+/// One memory-map entry overlapping the kernel's file-backed span.
+#[derive(Clone, Copy, Debug)]
+struct MapEntry {
+    start: u64,
+    end: u64,
+    ty: MemoryType,
+}
+
+/// The file-backed span split at firmware-occupied holes: free runs are
+/// claimed with `AllocateAddress`, holes are deferred past ExitBootServices.
+struct SpanPartition {
+    free_runs: [(u64, u64); MAX_SPAN_HOLES + 1],
+    free_count: usize,
+    holes: [(u64, u64); MAX_SPAN_HOLES],
+    hole_count: usize,
+}
+
+impl SpanPartition {
+    fn free_runs(&self) -> &[(u64, u64)] {
+        &self.free_runs[..self.free_count]
+    }
+
+    fn holes(&self) -> &[(u64, u64)] {
+        &self.holes[..self.hole_count]
+    }
+}
+
+/// File bytes staged before ExitBootServices for one hole: after the
+/// firmware releases the pages, they are copied to `dest`.
+#[derive(Clone, Copy)]
+struct HoleFill {
+    dest: u64,
+    staging: u64,
+    len: usize,
+}
+
+const EMPTY_HOLE_FILL: HoleFill = HoleFill {
+    dest: 0,
+    staging: 0,
+    len: 0,
+};
 
 #[repr(C)]
 struct KernelHashBinding {
@@ -133,6 +186,10 @@ fn main() -> Status {
 }
 
 fn load_and_start() -> Result<(), LoadError> {
+    // One line on the success path, so a silent hang can tell the loader
+    // apart from the firmware: if this line is missing, the loader never
+    // ran (or its console output never reached serial).
+    uefi::println!("NARF UEFI loader: starting");
     let dtb = system::with_config_table(|tables| {
         tables
             .iter()
@@ -223,11 +280,15 @@ fn load_and_start() -> Result<(), LoadError> {
     // contract, and it removes the size ceiling entirely rather than buying
     // headroom that the next 215 KB of growth would eat.
     let alloc_end = align_up(elf.file_backed_end, PAGE_SIZE).ok_or(LoadError::Arithmetic)?;
+    // One snapshot for the tail validation, the hole-tolerant allocation
+    // below, and the allocation-failure diagnostics. The snapshot may list
+    // its own backing buffer as a LOADER_DATA hole inside the span; the
+    // partition below treats that like any other reclaimable hole.
+    let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| LoadError::Allocation)?;
     // The deferred tail must be memory the OS actually owns after
     // ExitBootServices. Anything else (MMIO, runtime-services, reserved) would
     // make the post-EBS zeroing corrupt something, so refuse to boot instead.
     if alloc_end < page_end {
-        let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| LoadError::Allocation)?;
         let mut covered = alloc_end;
         while covered < page_end {
             let Some(descriptor) = map.entries().find(|d| {
@@ -244,14 +305,7 @@ fn load_and_start() -> Result<(), LoadError> {
                 );
                 return Err(LoadError::Allocation);
             };
-            if !matches!(
-                descriptor.ty,
-                MemoryType::CONVENTIONAL
-                    | MemoryType::BOOT_SERVICES_CODE
-                    | MemoryType::BOOT_SERVICES_DATA
-                    | MemoryType::LOADER_CODE
-                    | MemoryType::LOADER_DATA
-            ) {
+            if !is_reclaimable_after_ebs(descriptor.ty) {
                 uefi::println!(
                     "NARF UEFI loader: .bss tail crosses non-reclaimable {:?} at {:#x}",
                     descriptor.ty,
@@ -265,44 +319,128 @@ fn load_and_start() -> Result<(), LoadError> {
         }
     }
 
-    let pages =
-        usize::try_from((alloc_end - page_start) / PAGE_SIZE).map_err(|_| LoadError::Arithmetic)?;
-    let allocation = boot::allocate_pages(
-        AllocateType::Address(page_start),
-        MemoryType::LOADER_DATA,
-        pages,
-    )
-    .map_err(|_| {
-        if let Ok(map) = boot::memory_map(MemoryType::LOADER_DATA) {
-            for descriptor in map.entries() {
-                let end = descriptor
-                    .phys_start
-                    .saturating_add(descriptor.page_count.saturating_mul(PAGE_SIZE));
-                if descriptor.phys_start < page_end && page_start < end {
-                    uefi::println!(
-                        "NARF UEFI loader: map {:?} {:#x}-{:#x}",
-                        descriptor.ty,
-                        descriptor.phys_start,
-                        end
-                    );
-                }
-            }
+    // Claim the file-backed prefix around firmware-occupied holes instead
+    // of one AllocateAddress for the whole span. A single call needs the
+    // entire range free, so one firmware block inside it fails the whole
+    // allocation: AAVMF parks 128 KiB of BOOT_SERVICES_DATA at
+    // 0x44000000, which the file-backed prefix grew past once the kernel
+    // passed ~63 MiB of file-backed bytes, and the loader died with
+    // `Allocation` even though RAM is plentiful. Each free run is claimed
+    // on its own; each hole's file bytes are staged now and written after
+    // ExitBootServices, once the firmware has released the pages.
+    let mut overlapping: [MapEntry; MAX_SPAN_ENTRIES] = [MapEntry {
+        start: 0,
+        end: 0,
+        ty: MemoryType::CONVENTIONAL,
+    }; MAX_SPAN_ENTRIES];
+    let mut overlapping_count = 0usize;
+    for descriptor in map.entries() {
+        let start = descriptor.phys_start;
+        let end = start.saturating_add(descriptor.page_count.saturating_mul(PAGE_SIZE));
+        if end <= page_start || start >= alloc_end {
+            continue;
         }
-        LoadError::Allocation
-    })?;
-    if allocation.as_ptr() as u64 != page_start {
-        return Err(LoadError::Allocation);
+        if overlapping_count == MAX_SPAN_ENTRIES {
+            uefi::println!("NARF UEFI loader: too many memory-map entries in load span");
+            return Err(LoadError::Allocation);
+        }
+        overlapping[overlapping_count] = MapEntry {
+            start,
+            end,
+            ty: descriptor.ty,
+        };
+        overlapping_count += 1;
+    }
+    let partition =
+        partition_load_span(page_start, alloc_end, &mut overlapping[..overlapping_count])
+            .inspect_err(|_| {
+                print_overlapping_map(&map, page_start, page_end);
+            })?;
+    for &(run_start, run_end) in partition.free_runs() {
+        let pages = usize::try_from((run_end - run_start) / PAGE_SIZE)
+            .map_err(|_| LoadError::Arithmetic)?;
+        let allocation = boot::allocate_pages(
+            AllocateType::Address(run_start),
+            MemoryType::LOADER_DATA,
+            pages,
+        )
+        .map_err(|_| {
+            print_overlapping_map(&map, page_start, page_end);
+            LoadError::Allocation
+        })?;
+        if allocation.as_ptr() as u64 != run_start {
+            return Err(LoadError::Allocation);
+        }
+    }
+    // Stage each hole's file-backed bytes before ExitBootServices: the
+    // pages are firmware-owned until then, so they cannot be written yet,
+    // and the filesystem is gone afterwards.
+    let mut fills: [HoleFill; MAX_HOLE_FILLS] = [EMPTY_HOLE_FILL; MAX_HOLE_FILLS];
+    let mut fill_count = 0usize;
+    for &(hole_start, hole_end) in partition.holes() {
+        uefi::println!(
+            "NARF UEFI loader: deferring hole {:#x}-{:#x} past ExitBootServices",
+            hole_start,
+            hole_end
+        );
+        for segment in elf.segments() {
+            let file_start = segment.physical.max(hole_start);
+            let file_end = (segment.physical + segment.file_size).min(hole_end);
+            if file_start >= file_end {
+                continue;
+            }
+            if fill_count == MAX_HOLE_FILLS {
+                uefi::println!("NARF UEFI loader: too many deferred hole fills");
+                return Err(LoadError::Allocation);
+            }
+            let len = usize::try_from(file_end - file_start).map_err(|_| LoadError::Arithmetic)?;
+            let pages = len
+                .checked_add(PAGE_SIZE as usize - 1)
+                .ok_or(LoadError::Arithmetic)?
+                / PAGE_SIZE as usize;
+            let staging =
+                boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
+                    .map_err(|_| LoadError::Allocation)?;
+            // SAFETY: the staging pages were just allocated for this fill
+            // and are exclusively owned by this loader.
+            let buffer = unsafe { slice::from_raw_parts_mut(staging.as_ptr(), len) };
+            read_exact_at(
+                &mut kernel,
+                segment.file_offset + (file_start - segment.physical),
+                buffer,
+            )?;
+            fills[fill_count] = HoleFill {
+                dest: file_start,
+                staging: staging.as_ptr() as u64,
+                len,
+            };
+            fill_count += 1;
+        }
     }
 
     for segment in elf.segments() {
-        let source_len = usize::try_from(segment.file_size).map_err(|_| LoadError::Arithmetic)?;
         let zero_len = usize::try_from(segment.memory_size - segment.file_size)
             .map_err(|_| LoadError::Arithmetic)?;
-        // SAFETY: parse_program_headers proved every segment lies in the
-        // allocated range, which remains exclusively owned by this loader.
-        let destination =
-            unsafe { slice::from_raw_parts_mut(segment.physical as *mut u8, source_len) };
-        read_exact_at(&mut kernel, segment.file_offset, destination)?;
+        // Copy the file-backed bytes, skipping firmware-occupied holes:
+        // those bytes were staged above and are written after
+        // ExitBootServices, once the firmware has released the pages.
+        let seg_start = segment.physical;
+        let seg_end = seg_start + segment.file_size;
+        let mut cursor = seg_start;
+        for &(hole_start, hole_end) in partition.holes() {
+            if hole_end <= seg_start || hole_start >= seg_end {
+                continue;
+            }
+            let skip_start = hole_start.max(seg_start);
+            let skip_end = hole_end.min(seg_end);
+            if skip_start > cursor {
+                copy_segment_piece(&mut kernel, segment, cursor, skip_start)?;
+            }
+            cursor = skip_end.max(cursor);
+        }
+        if cursor < seg_end {
+            copy_segment_piece(&mut kernel, segment, cursor, seg_end)?;
+        }
         // The p_memsz - p_filesz tail is zeroed AFTER ExitBootServices — see
         // the allocation comment above. Part of it may still belong to
         // firmware right now.
@@ -316,6 +454,18 @@ fn load_and_start() -> Result<(), LoadError> {
     // loaded pages and the firmware-owned DTB intentionally remain live.
     let memory_map = unsafe { boot::exit_boot_services(None) };
     core::mem::forget(memory_map);
+
+    // The staged hole bytes go in first: the staging buffers may sit inside
+    // the .bss tail, so they are copied before the tail zeroing below wipes
+    // them.
+    for fill in &fills[..fill_count] {
+        // SAFETY: the staging buffer holds exactly `len` file bytes read
+        // before ExitBootServices, and `dest` is inside the validated load
+        // span, in pages the firmware has now released.
+        unsafe {
+            ptr::copy_nonoverlapping(fill.staging as *const u8, fill.dest as *mut u8, fill.len);
+        }
+    }
 
     // Boot services are gone, so every BOOT_SERVICES_* range is now ordinary
     // free memory owned by us — including the .bss tail deliberately left
@@ -587,6 +737,126 @@ const fn ranges_overlap(
     left_start < right_end && right_start < left_end
 }
 
+/// Memory the OS owns after ExitBootServices, so the loader may write it
+/// once boot services are gone — the same rule the .bss-tail validation
+/// already applies. Anything else (runtime services, reserved, MMIO) must
+/// refuse to boot instead of corrupting it.
+fn is_reclaimable_after_ebs(ty: MemoryType) -> bool {
+    matches!(
+        ty,
+        MemoryType::CONVENTIONAL
+            | MemoryType::BOOT_SERVICES_CODE
+            | MemoryType::BOOT_SERVICES_DATA
+            | MemoryType::LOADER_CODE
+            | MemoryType::LOADER_DATA
+    )
+}
+
+/// Print the memory-map entries overlapping the load span, so an allocation
+/// failure names the firmware reservation that caused it.
+fn print_overlapping_map(map: &impl MemoryMap, page_start: u64, page_end: u64) {
+    for descriptor in map.entries() {
+        let end = descriptor
+            .phys_start
+            .saturating_add(descriptor.page_count.saturating_mul(PAGE_SIZE));
+        if descriptor.phys_start < page_end && page_start < end {
+            uefi::println!(
+                "NARF UEFI loader: map {:?} {:#x}-{:#x}",
+                descriptor.ty,
+                descriptor.phys_start,
+                end
+            );
+        }
+    }
+}
+
+/// Split `[page_start, alloc_end)` at firmware-occupied holes.
+///
+/// `AllocateAddress` needs the whole range free, so a single firmware block
+/// inside the span — AAVMF parks 128 KiB of BOOT_SERVICES_DATA at
+/// 0x44000000, which the file-backed prefix grew past once the kernel
+/// passed ~63 MiB of file-backed bytes — fails the entire allocation even
+/// though RAM is plentiful. Free runs are claimed one by one; each hole
+/// must be reclaimable after ExitBootServices (checked here) so its bytes
+/// can be staged and written once the firmware releases the pages.
+///
+/// `entries` is sorted in place; entries outside the span are ignored.
+fn partition_load_span(
+    page_start: u64,
+    alloc_end: u64,
+    entries: &mut [MapEntry],
+) -> Result<SpanPartition, LoadError> {
+    let mut partition = SpanPartition {
+        free_runs: [(0, 0); MAX_SPAN_HOLES + 1],
+        free_count: 0,
+        holes: [(0, 0); MAX_SPAN_HOLES],
+        hole_count: 0,
+    };
+    if alloc_end <= page_start {
+        return Ok(partition);
+    }
+    entries.sort_unstable_by_key(|entry| entry.start);
+    let mut cursor = page_start;
+    for entry in entries.iter() {
+        if entry.end <= cursor || entry.start >= alloc_end {
+            continue;
+        }
+        let start = entry.start.max(cursor);
+        let end = entry.end.min(alloc_end);
+        if start > cursor {
+            // A stretch of the span no entry covers: not free, not a known
+            // reservation — refuse rather than guess.
+            return Err(LoadError::Allocation);
+        }
+        if matches!(entry.ty, MemoryType::CONVENTIONAL) {
+            if partition.free_count > 0 && partition.free_runs[partition.free_count - 1].1 == start
+            {
+                partition.free_runs[partition.free_count - 1].1 = end;
+            } else {
+                if partition.free_count == partition.free_runs.len() {
+                    return Err(LoadError::Allocation);
+                }
+                partition.free_runs[partition.free_count] = (start, end);
+                partition.free_count += 1;
+            }
+        } else {
+            if !is_reclaimable_after_ebs(entry.ty) {
+                return Err(LoadError::Allocation);
+            }
+            if partition.hole_count == partition.holes.len() {
+                return Err(LoadError::Allocation);
+            }
+            partition.holes[partition.hole_count] = (start, end);
+            partition.hole_count += 1;
+        }
+        cursor = end;
+    }
+    if cursor < alloc_end {
+        return Err(LoadError::Allocation);
+    }
+    Ok(partition)
+}
+
+/// Copy one hole-free piece of a segment's file-backed bytes to its
+/// physical address.
+fn copy_segment_piece(
+    kernel: &mut RegularFile,
+    segment: &LoadSegment,
+    from: u64,
+    to: u64,
+) -> Result<(), LoadError> {
+    let len = usize::try_from(to - from).map_err(|_| LoadError::Arithmetic)?;
+    // SAFETY: the caller only passes pieces inside the segment's
+    // file-backed range, which parse_program_headers proved lies in the
+    // allocated range exclusively owned by this loader.
+    let destination = unsafe { slice::from_raw_parts_mut(from as *mut u8, len) };
+    read_exact_at(
+        kernel,
+        segment.file_offset + (from - segment.physical),
+        destination,
+    )
+}
+
 const fn align_down(value: u64, alignment: u64) -> u64 {
     value & !(alignment - 1)
 }
@@ -703,5 +973,153 @@ mod tests {
             expected_kernel_hash(),
             Err(LoadError::MissingKernelTrust)
         ));
+    }
+
+    fn conventional(start: u64, end: u64) -> MapEntry {
+        MapEntry {
+            start,
+            end,
+            ty: MemoryType::CONVENTIONAL,
+        }
+    }
+
+    fn firmware_hole(start: u64, end: u64) -> MapEntry {
+        MapEntry {
+            start,
+            end,
+            ty: MemoryType::BOOT_SERVICES_DATA,
+        }
+    }
+
+    #[test]
+    fn partition_keeps_one_run_without_holes() {
+        let mut entries = [conventional(0x4008_0000, 0x4800_0000)];
+        let partition = partition_load_span(0x4008_0000, 0x4400_0000, &mut entries).unwrap();
+        assert_eq!(
+            partition.free_runs(),
+            [(0x4008_0000u64, 0x4400_0000u64)].as_slice()
+        );
+        assert!(partition.holes().is_empty());
+    }
+
+    #[test]
+    fn partition_splits_one_firmware_hole() {
+        // The observed AAVMF map: 128 KiB of BOOT_SERVICES_DATA at
+        // 0x44000000 inside the file-backed span.
+        let mut entries = [
+            conventional(0x4000_0000, 0x4400_0000),
+            firmware_hole(0x4400_0000, 0x4402_0000),
+            conventional(0x4402_0000, 0x476f_2000),
+        ];
+        let partition = partition_load_span(0x4008_0000, 0x4700_0000, &mut entries).unwrap();
+        assert_eq!(
+            partition.free_runs(),
+            [
+                (0x4008_0000u64, 0x4400_0000u64),
+                (0x4402_0000u64, 0x4700_0000u64),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            partition.holes(),
+            [(0x4400_0000u64, 0x4402_0000u64)].as_slice()
+        );
+    }
+
+    #[test]
+    fn partition_accepts_unsorted_entries() {
+        let mut entries = [
+            conventional(0x4402_0000, 0x476f_2000),
+            firmware_hole(0x4400_0000, 0x4402_0000),
+            conventional(0x4000_0000, 0x4400_0000),
+        ];
+        let partition = partition_load_span(0x4008_0000, 0x4700_0000, &mut entries).unwrap();
+        assert_eq!(
+            partition.holes(),
+            [(0x4400_0000u64, 0x4402_0000u64)].as_slice()
+        );
+        assert_eq!(partition.free_runs().len(), 2);
+    }
+
+    #[test]
+    fn partition_rejects_non_reclaimable_hole() {
+        let mut entries = [
+            conventional(0x4000_0000, 0x4400_0000),
+            MapEntry {
+                start: 0x4400_0000,
+                end: 0x4402_0000,
+                ty: MemoryType::RUNTIME_SERVICES_DATA,
+            },
+            conventional(0x4402_0000, 0x476f_2000),
+        ];
+        assert!(matches!(
+            partition_load_span(0x4008_0000, 0x4700_0000, &mut entries),
+            Err(LoadError::Allocation)
+        ));
+    }
+
+    #[test]
+    fn partition_rejects_gap_in_span() {
+        let mut entries = [
+            conventional(0x4000_0000, 0x4200_0000),
+            conventional(0x4300_0000, 0x476f_2000),
+        ];
+        assert!(matches!(
+            partition_load_span(0x4008_0000, 0x4700_0000, &mut entries),
+            Err(LoadError::Allocation)
+        ));
+    }
+
+    #[test]
+    fn partition_rejects_too_many_holes() {
+        // 19 alternating entries need 9 holes, over the cap of 8.
+        let mut entries = [conventional(0, 0); MAX_SPAN_HOLES * 2 + 3];
+        let mut start = 0x4008_0000u64;
+        for (i, entry) in entries.iter_mut().enumerate() {
+            let end = start + 0x1000;
+            *entry = if i % 2 == 0 {
+                conventional(start, end)
+            } else {
+                firmware_hole(start, end)
+            };
+            start = end;
+        }
+        assert!(matches!(
+            partition_load_span(0x4008_0000, start, &mut entries),
+            Err(LoadError::Allocation)
+        ));
+    }
+
+    #[test]
+    fn partition_empty_span_allocates_nothing() {
+        let mut entries = [conventional(0x4000_0000, 0x4800_0000)];
+        let partition = partition_load_span(0x4008_0000, 0x4008_0000, &mut entries).unwrap();
+        assert!(partition.free_runs().is_empty());
+        assert!(partition.holes().is_empty());
+    }
+
+    #[test]
+    fn reclaimable_after_ebs_matches_tail_rule() {
+        for ty in [
+            MemoryType::CONVENTIONAL,
+            MemoryType::BOOT_SERVICES_CODE,
+            MemoryType::BOOT_SERVICES_DATA,
+            MemoryType::LOADER_CODE,
+            MemoryType::LOADER_DATA,
+        ] {
+            assert!(is_reclaimable_after_ebs(ty), "{ty:?} must be reclaimable");
+        }
+        for ty in [
+            MemoryType::RUNTIME_SERVICES_CODE,
+            MemoryType::RUNTIME_SERVICES_DATA,
+            MemoryType::ACPI_RECLAIM,
+            MemoryType::MMIO,
+            MemoryType::RESERVED,
+        ] {
+            assert!(
+                !is_reclaimable_after_ebs(ty),
+                "{ty:?} must not be reclaimable"
+            );
+        }
     }
 }
