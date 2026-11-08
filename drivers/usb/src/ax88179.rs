@@ -1540,11 +1540,23 @@ pub mod tests {
         if seg[4..8] != [0x00, 0x80, 0x00, 0x80] {
             return TestResult::Fail("TX padding flag missing");
         }
-        // No flag when not aligned, and no panic on max_packet 0.
+        // The same frame flags at 512 too: 1024 is a multiple of
+        // 512 as well, and the modulus is the endpoint maxpacket,
+        // not a hardcoded 1024.
         let seg = build_tx_segment(&frame, 512);
+        if seg[4..8] != [0x00, 0x80, 0x00, 0x80] {
+            return TestResult::Fail("TX padding flag missing at 512");
+        }
+        // No flag when not aligned: (1015 + 8) = 1023 is not a
+        // multiple of 512 — the 1016-byte frame above *is*
+        // (1024 % 512 == 0), so it must still flag at 512, per
+        // Linux `ax88179_tx_fixup` (`(len + 8) % maxpacket`).
+        let short = [0xBBu8; 1015];
+        let seg = build_tx_segment(&short, 512);
         if seg[4..8] != [0, 0, 0, 0] {
             return TestResult::Fail("TX padding flag spurious");
         }
+        // No panic on max_packet 0.
         let seg = build_tx_segment(&frame, 0);
         if seg[4..8] != [0, 0, 0, 0] {
             return TestResult::Fail("TX zero-maxpacket flag spurious");

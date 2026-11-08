@@ -9892,7 +9892,15 @@ impl crate::uvc::UvcTransport for FixtureTransport {
             }
             return Ok(data.len());
         }
-        if b_request == crate::uvc::VS_REQ_SET_CUR && w_value == crate::uvc::VS_PROBE_CONTROL {
+        // wIndex disambiguates PROBE/COMMIT (bare interface
+        // number, high byte 0) from unit controls (unit id in the
+        // high byte): the brightness selector 0x02 collides with
+        // VS_COMMIT_CONTROL (0x0200), so a wValue-only dispatch
+        // would mis-log its SET_CUR as a COMMIT.
+        if b_request == crate::uvc::VS_REQ_SET_CUR
+            && w_value == crate::uvc::VS_PROBE_CONTROL
+            && (w_index >> 8) == 0
+        {
             let payload = data.to_vec();
             state.log.push(FixtureXfer::SetCurProbe {
                 payload: payload.clone(),
@@ -9903,7 +9911,10 @@ impl crate::uvc::UvcTransport for FixtureTransport {
             state.probe = Some(payload);
             return Ok(data.len());
         }
-        if b_request == crate::uvc::VS_REQ_SET_CUR && w_value == crate::uvc::VS_COMMIT_CONTROL {
+        if b_request == crate::uvc::VS_REQ_SET_CUR
+            && w_value == crate::uvc::VS_COMMIT_CONTROL
+            && (w_index >> 8) == 0
+        {
             state.log.push(FixtureXfer::SetCurCommit {
                 payload: data.to_vec(),
             });
@@ -9946,7 +9957,17 @@ impl crate::uvc::UvcTransport for FixtureTransport {
         out: &mut [u8],
     ) -> Result<usize, crate::xhci::XhciError> {
         let mut state = self.state.lock();
-        if b_request == crate::uvc::VS_REQ_GET_CUR && w_value == crate::uvc::VS_PROBE_CONTROL {
+        // PROBE/COMMIT vs unit control are told apart by wIndex,
+        // not wValue: a VS request carries the bare interface
+        // number (high byte 0), a unit control carries the unit id
+        // in the high byte — and the brightness selector (0x02)
+        // collides with VS_COMMIT_CONTROL (0x0200), so a wValue-only
+        // dispatch mis-logs its SET_CUR as a COMMIT (and a
+        // selector-0x01 GET_CUR as a PROBE).
+        if b_request == crate::uvc::VS_REQ_GET_CUR
+            && w_value == crate::uvc::VS_PROBE_CONTROL
+            && (w_index >> 8) == 0
+        {
             state.log.push(FixtureXfer::GetCurProbe);
             let mut accepted = state.probe.clone().unwrap_or_default();
             // The device fills in its own frame size + payload size.
@@ -10838,6 +10859,12 @@ fn smoke_uvc_isoc_pipeline_high_bandwidth() -> TestResult {
         let _ = fixture_poll(pump.as_mut());
         match fixture_dqbuf(&dev, &events, &ctx) {
             FixtureDqbuf::Frame(bytes) => {
+                // Return the buffer so the six frames below have
+                // somewhere to land: only two buffers exist and
+                // the pump never fills a dequeued one.
+                if fixture_qbuf_index(&dev, &events, &ctx, ctx.get_u32(0)).is_err() {
+                    return TestResult::Fail("QBUF should succeed");
+                }
                 warm = Some(bytes);
                 break;
             }
@@ -10872,6 +10899,9 @@ fn smoke_uvc_isoc_pipeline_high_bandwidth() -> TestResult {
         let _ = fixture_poll(pump.as_mut());
         match fixture_dqbuf(&dev, &events, &ctx) {
             FixtureDqbuf::Frame(bytes) => {
+                if fixture_qbuf_index(&dev, &events, &ctx, ctx.get_u32(0)).is_err() {
+                    return TestResult::Fail("QBUF should succeed");
+                }
                 got.push(bytes);
                 if got.len() == expected.len() {
                     break;
@@ -12505,6 +12535,26 @@ fn fixture_qbuf_all(
         if fixture_ioctl(dev, events, ctx, fixture_ioc(3, 15, 88))? != 0 {
             return Err("QBUF should succeed");
         }
+    }
+    Ok(())
+}
+
+/// QBUF one capture buffer by index: the standard capture-loop
+/// step of returning a dequeued buffer so the pump can fill it
+/// again. Without it a multi-frame dequeue loop strands every
+/// buffer in the dequeued state and DQBUF goes EINVAL once none
+/// is queued.
+fn fixture_qbuf_index(
+    dev: &FixtureDevice,
+    events: &FixtureEvents,
+    ctx: &FixtureCtx,
+    index: u32,
+) -> Result<(), &'static str> {
+    ctx.put_u32(0, index);
+    ctx.put_u32(4, 1);
+    ctx.put_u32(60, 1);
+    if fixture_ioctl(dev, events, ctx, fixture_ioc(3, 15, 88))? != 0 {
+        return Err("QBUF should succeed");
     }
     Ok(())
 }

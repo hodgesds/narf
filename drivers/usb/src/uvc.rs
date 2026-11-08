@@ -2116,6 +2116,9 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
             slot_id,
             endpoint,
             video_node,
+            reassembly,
+            controller,
+            hub_port,
             packet_size,
         )
         .await;
@@ -2205,13 +2208,15 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
 /// (`Vec` moved into the owned-buffer receive and returned with
 /// the result), so no slot ever aliases another's buffer.
 ///
-/// Lifecycle mirrors the single-shot loop: exit is checked at every
-/// loop top and again after a transfer completes, before its packet
-/// is fed — a packet completing from a transfer that straddled
-/// STREAMOFF is dropped, never delivered into the successor
-/// stream's reset queues. Errors count in consumption order;
+/// Lifecycle mirrors the single-shot loop: exit is checked after
+/// each poll round — after a transfer completes, before its packet
+/// is fed, and when no transfer completed, before yielding — so a
+/// stale pump consumes its in-flight completion (never leaving it
+/// queued for the successor stream) and still exits promptly with
+/// no traffic. Errors count in consumption order;
 /// eight consecutive errors end the pump with `CaptureFailed`,
 /// same as the single-shot loop.
+#[allow(clippy::too_many_arguments)] // pump context: identity + negotiated config + hub accounting.
 async fn pump_video_frames_pipelined<T: UvcTransport>(
     idx: usize,
     transport: &T,
@@ -2219,6 +2224,9 @@ async fn pump_video_frames_pipelined<T: UvcTransport>(
     slot_id: u8,
     endpoint: UvcStreamingEndpoint,
     video_node: usize,
+    reassembly: ReassemblyConfig,
+    controller: u8,
+    hub_port: Option<(u8, u8)>,
     packet_size: usize,
 ) -> Result<(), UvcError> {
     use core::task::{Context, Poll};
@@ -2239,13 +2247,16 @@ async fn pump_video_frames_pipelined<T: UvcTransport>(
     let mut in_flight: [Option<IsochFut<'_>>; ISOC_DEPTH] = [None, None, None, None];
     let mut completed: [Option<IsochResult>; ISOC_DEPTH] = [None, None, None, None];
     let mut head = 0usize;
-    let mut reassembler = UvcFrameReassembler::new();
+    // Same negotiated completion/cap config as the single-shot
+    // loop: a stream-based stream completes on buffer fullness at
+    // the negotiated dwMaxVideoFrameSize (#1334), and a bounded
+    // frame-based stream caps accumulation there. The legacy
+    // default config never completes a stream-based segment that
+    // signals neither FID nor EOF.
+    let mut reassembler = UvcFrameReassembler::with_config(reassembly);
     let mut consecutive_errors = 0u8;
 
     loop {
-        if take_pump_exit_request(idx, generation) {
-            return Ok(());
-        }
         // Refill: launch into every free slot while the scheduler
         // has room. A free slot always holds its buffer: the buffer
         // returns to the slot with its completed result.
@@ -2287,6 +2298,18 @@ async fn pump_video_frames_pipelined<T: UvcTransport>(
         // Consume the ring head — and only the head — so packets
         // feed the reassembler in submission order.
         let Some((buf, result)) = completed[head].take() else {
+            // No completion yet: the exit check lives here, after
+            // the poll, rather than at the loop top. A stale pump
+            // must consume its in-flight completions before
+            // exiting — the single-shot loop consumes the transfer
+            // it was parked in, and exiting here first would leave
+            // a completed packet queued for the successor stream
+            // (an errored wake packet would poison its first
+            // frame). With no completion the check still exits
+            // promptly, without waiting for traffic.
+            if take_pump_exit_request(idx, generation) {
+                return Ok(());
+            }
             narf_scheduler::yield_now().await;
             continue;
         };
@@ -2296,12 +2319,21 @@ async fn pump_video_frames_pipelined<T: UvcTransport>(
         // stream. This check subsumes the single-shot loop's
         // pre-delivery check — delivery follows the feed with no
         // await between, so nothing can interleave a stop there.
+        // Consuming the packet before exiting is what keeps it out
+        // of the successor stream's queue.
         if take_pump_exit_request(idx, generation) {
             return Ok(());
         }
         match result {
             Ok(received) if received != 0 => {
                 consecutive_errors = 0;
+                // Hub idle-suspend accounting (#807), as in the
+                // single-shot loop: every completed transfer resets
+                // the port's idle timer, so a streaming camera never
+                // idles into a port suspend.
+                if let Some((hub_slot, port)) = hub_port {
+                    crate::attach::mark_port_activity(controller, hub_slot, port);
+                }
                 // Clamp, don't trust: a transport reporting more
                 // bytes than its buffer held must not panic the pump.
                 let n = received.min(buf.len());

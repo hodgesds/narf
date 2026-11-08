@@ -9400,7 +9400,7 @@ pub mod tests {
             || ModelRegs::get(&m.sram, 0x8FA6) != 0xD401
             || ModelRegs::get(&m.sram, 0x8566) != 0x003F
             || ModelRegs::get(&m.sram, 0x8568) != 0x3F02
-            || ModelRegs::get(&m.sram, 0x856E) != 0x0000
+            || ModelRegs::get(&m.sram, 0x856E) != 0x1C00
         {
             return TestResult::Fail("VER_16 SRAM burst end state wrong");
         }

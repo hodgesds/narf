@@ -279,6 +279,15 @@ fn register_class_driver_inner(
     unbind: Option<UsbUnbindFn>,
 ) -> Result<(), UsbProbeError> {
     let mut g = REGISTRY.lock();
+    // Registration tolerates duplicates (defensive test initcalls
+    // re-register, and a full boot already registered every driver
+    // from the Stage::Subsys initcalls): a second registration
+    // under the same name is a no-op success, so duplicates never
+    // consume `MAX_DRIVERS` slots and crowd later drivers out with
+    // a spurious `RegistryFull`.
+    if g.iter().any(|entry| entry.name == name) {
+        return Ok(());
+    }
     if g.len() >= MAX_DRIVERS {
         return Err(UsbProbeError::RegistryFull);
     }

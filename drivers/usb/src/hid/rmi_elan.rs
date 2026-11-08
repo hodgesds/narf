@@ -1732,7 +1732,7 @@ pub(crate) mod tests {
 
     /// Page-0 register image with a three-function PDT (F$01, F$12,
     /// F$30) + terminator, an F$01 product-info block at 0x10, and
-    /// an F$30 query block at 0xB0. Same layout as the
+    /// an F$30 query block at its query base 0x90. Same layout as the
     /// `smoke_rmi4_pdt_three_function_walk` fixture in
     /// `drivers/input/src/tests.rs`, with F$12 in place of F$11.
     fn rmi_page_image() -> [u8; 256] {
@@ -1767,9 +1767,11 @@ pub(crate) mod tests {
         // firmware 0x1234, date, tester, serial.
         page[0x10..0x10 + 11]
             .copy_from_slice(&[0x01, 0x10, 0x34, 0x12, 24, 5, 29, 0x42, 0x42, 0xCA, 0xFE]);
-        // F$30 query at query base 0xB0: HAS_GPIO + 8 lines.
-        page[0xB0] = 0x08;
-        page[0xB0 + 1] = 0x08;
+        // F$30 query at its query base 0x90 (the PDT entry's
+        // query base — 0xB0 is the control base, not the query
+        // base): HAS_GPIO + 8 lines.
+        page[0x90] = 0x08;
+        page[0x90 + 1] = 0x08;
         page
     }
 
