@@ -35,6 +35,11 @@ pub const TRANS_CMRR_M_LO_OFFSET: u64 = 0x4f0;
 pub const TRANS_CMRR_M_HI_OFFSET: u64 = 0x4f4;
 pub const TRANS_CMRR_N_LO_OFFSET: u64 = 0x4f8;
 pub const TRANS_CMRR_N_HI_OFFSET: u64 = 0x4fc;
+/// `TRANS_SET_CONTEXT_LATENCY`, relative to the transcoder base
+/// (transcoder A: 0x6007c). Same value as the private offset in
+/// `intel_gpu_xelpg_pipes` (kept separate so this module does not
+/// depend on the pipe-enable module for one constant).
+pub const TRANS_SET_CONTEXT_LATENCY_OFFSET: u64 = 0x7c;
 
 // ── Transcoder Base Addresses ────────────────────────────────────────────────
 
@@ -339,6 +344,13 @@ pub struct VrrComputeOpts {
     /// lane); discovery callers pass `false` until it is resolved,
     /// and the PR body records it.
     pub as_sdp: bool,
+    /// The set-context-latency the guardband is computed against
+    /// (Linux "drm/i915/vrr: Use SCL for computing guardband",
+    /// 2025-09-25): the guardband is the vblank length minus the
+    /// SCL, so the late phase subtracts it. 0 is the pre-SCL
+    /// behaviour; the modeset path passes
+    /// [`set_context_latency_for_crtc`].
+    pub scl: u32,
 }
 
 /// Late-phase guardband shared by VRR and CMRR.
@@ -346,13 +358,15 @@ pub struct VrrComputeOpts {
 /// Linux `intel_vrr_compute_config_late` / "drm/i915/vrr: Use SCL
 /// for computing guardband" (2025-09-25): "guardband is equal to the
 /// vblank length so ideally it should be computed as difference
-/// between the vmin vtotal and vactive". On TGL there is no
-/// `TRANS_SET_CONTEXT_LATENCY`, so there is no SCL term to add and
-/// the guardband is `vmin − vblank_start` with `vblank_start =
-/// v_active`. The pre-existing NARF clamps are kept: at least 8
-/// lines, at most the blanking length `vtotal − v_active`.
-fn late_guardband(vmin: u32, mode: &Mode) -> u16 {
-    let guard = u64::from(vmin.saturating_sub(u32::from(mode.v_active))).max(8);
+/// between the vmin vtotal and vactive", minus the set-context
+/// latency (the lines before the double-buffering point the
+/// register programming needs). The pre-existing NARF clamps are
+/// kept: at least 8 lines, at most the blanking length
+/// `vtotal − v_active`.
+fn late_guardband(vmin: u32, mode: &Mode, scl: u32) -> u16 {
+    let guard = u64::from(vmin.saturating_sub(u32::from(mode.v_active)))
+        .saturating_sub(u64::from(scl))
+        .max(8);
     let max_guard = u64::from(mode.v_total.saturating_sub(mode.v_active)).min(0xffff);
     u16::try_from(guard.min(max_guard)).unwrap_or(8)
 }
@@ -446,7 +460,7 @@ impl VrrTimings {
             vsync_end,
             as_sdp: opts.as_sdp,
         };
-        timings.compute_config_late(mode, ip);
+        timings.compute_config_late(mode, ip, opts.scl);
         Some(timings)
     }
 
@@ -469,8 +483,8 @@ impl VrrTimings {
     /// conservative placeholder and records it as UNVERIFIED in the
     /// PR body; the exact conversion is a follow-up once the
     /// formula is readable.
-    pub fn compute_config_late(&mut self, mode: &Mode, ip: DisplayVrrIp) {
-        self.guardband = late_guardband(self.vmin, mode);
+    pub fn compute_config_late(&mut self, mode: &Mode, ip: DisplayVrrIp, scl: u32) {
+        self.guardband = late_guardband(self.vmin, mode, scl);
         self.pipeline_full = if ip == DisplayVrrIp::Gen12 {
             self.guardband.min(255)
         } else {
@@ -623,7 +637,10 @@ impl CmrrTimings {
         let vsync_end = u32::from(mode.v_total.saturating_sub(mode.v_sync_end));
 
         let guardband = if ip.uses_guardband_in_ctl() {
-            late_guardband(vmin, mode)
+            // The CMRR TG runs, so the set-context-latency floor is
+            // 1 (wa_14015401596: PSR/PR with VRR needs SCL >= 1;
+            // PSR may qualify under the fixed-RR CMRR TG).
+            late_guardband(vmin, mode, 1)
         } else {
             0
         };
@@ -1127,9 +1144,109 @@ pub fn recompute_timings_for_modeset(
 ) -> Option<VrrTimings> {
     VRR_STATE.set_mode(crtc_id, Some(*mode));
     VRR_STATE.set_range(crtc_id, range);
+    // The guardband is computed against the set-context-latency
+    // the TG will run with (Linux "Use SCL for computing
+    // guardband"); the modeset path programs that SCL alongside
+    // the timings.
+    let mut opts = opts;
+    opts.scl = set_context_latency_for_crtc(crtc_id);
     let timings = range.and_then(|r| VrrTimings::compute_config(mode, r, ip, opts));
     VRR_STATE.set_timings(crtc_id, timings);
     timings
+}
+
+/// Whether the VRR timing generator on `crtc_id` runs at a variable
+/// refresh rate: VRR enabled and the TG not running at a fixed rate.
+///
+/// Linux `intel_psr_compute_config` and the DPCD MSA-ignore rule
+/// both key off `vrr.enable && !vrr.fixed_rr`. Fixed-RR in NARF is
+/// CMRR (`is_cmrr_enabled` — CMRR timings have `vmin == vmax` by
+/// construction in `CmrrTimings::compute`); the standalone fixed-RR
+/// TG programmer (`program_fixed_rr_timings`) has no production
+/// caller yet, so CMRR is the only live fixed-RR mode.
+pub fn vrr_is_variable(crtc_id: u32) -> bool {
+    VRR_STATE.is_enabled(crtc_id) && !VRR_STATE.is_cmrr_enabled(crtc_id)
+}
+
+/// Whether VRR on `crtc_id` excludes PSR (Linux
+/// `intel_psr_compute_config`: "Current PSR panels don't work
+/// reliably with VRR enabled. So if VRR is enabled, do not enable
+/// PSR", relaxed upstream to allow PSR with the fixed-RR VRR TG
+/// only).
+pub fn vrr_excludes_psr(crtc_id: u32) -> bool {
+    vrr_is_variable(crtc_id)
+}
+
+/// Whether the sink on `crtc_id` wants DPCD MSA-timing-par-ignore
+/// programmed: VRR runs at a variable rate and VRR timings are
+/// programmed. Timings imply the sink advertised MSA-ignore — the
+/// range gate in `sink_vrr_range` only publishes a range when the
+/// sink's DPCD reports it — so no separate caps check is needed
+/// here. Fixed-RR (CMRR) is skipped: the sink receives valid MSA
+/// timing parameters at the fixed rate.
+pub fn msa_timing_par_ignore_wanted(crtc_id: u32) -> bool {
+    vrr_is_variable(crtc_id) && VRR_STATE.timings(crtc_id).is_some()
+}
+
+/// The `TRANS_SET_CONTEXT_LATENCY` value for `crtc_id`: 1 while the
+/// VRR timing generator runs on the CRTC, 0 otherwise.
+///
+/// Wa_14015401596 (display 13/14): program set-context-latency to
+/// at least 1 when PSR1/PSR2/Panel Replay is enabled with VRR
+/// ("Panel Replay VSC SDP not getting sent when VRR is enabled and
+/// W1 and W2 are 0"). The modeset/toggle paths cannot know whether
+/// PSR will qualify — that happens after the first latch, in KMS
+/// state unreachable from here — so the VRR-TG-running floor is
+/// used: one line of programming window is harmless when PSR does
+/// not engage, and PSR may qualify under the fixed-RR (CMRR) TG.
+/// Linux computes SCL from `has_psr` and writes 0 without it; the
+/// 1-line reservation is the safe side of the workaround.
+pub fn set_context_latency_for_crtc(crtc_id: u32) -> u32 {
+    if VRR_STATE.is_enabled(crtc_id) || VRR_STATE.is_cmrr_enabled(crtc_id) {
+        1
+    } else {
+        0
+    }
+}
+
+/// The display pipe driven by `crtc_id`, for resolving the live
+/// connector (CRTC 1..=4 map to pipes A..=D; anything else has no
+/// pipe). Mirrors `VrrTranscoder::for_crtc` but fallible: a CRTC
+/// with no pipe has no sink to program.
+fn pipe_for_crtc(crtc_id: u32) -> Option<crate::intel_gpu_pipes::Pipe> {
+    use crate::intel_gpu_pipes::Pipe;
+    match crtc_id {
+        1 => Some(Pipe::A),
+        2 => Some(Pipe::B),
+        3 => Some(Pipe::C),
+        4 => Some(Pipe::D),
+        _ => None,
+    }
+}
+
+/// Bring the sink's DPCD MSA-ignore bit in line with the current
+/// VRR state for `crtc_id`, after a VRR/CMRR toggle.
+///
+/// The DPCD write is a slow AUX transaction: it runs off a
+/// `DisplayInfo` snapshot (see its docs — slow AUX/modeset work
+/// must not retain CONTROLLER while framebuffer pumps query it),
+/// never under the controller lock. Best-effort: an unreachable
+/// AUX leaves the sink's bit as it was; the DP modeset path
+/// re-syncs it on the next modeset. A CRTC with no live pipe
+/// owner has no sink to program and is skipped, never guessed.
+fn sync_msa_timing_par_ignore(crtc_id: u32) {
+    let _ = crate::intel_gpu::with_display_info(|display| {
+        let io = display.mode_window();
+        if let Some(pipe) = pipe_for_crtc(crtc_id) {
+            if let Some(owner) = crate::intel_gpu_multipipe::pipe_owner(pipe) {
+                let _ = crate::intel_gpu_dp::set_msa_timing_par_ignore(
+                    &io,
+                    owner.ddi,
+                    msa_timing_par_ignore_wanted(crtc_id),
+                );
+            }
+        }
+    });
 }
 
 /// Retain and apply a CRTC's VRR request (from DRM `VRR_ENABLED`).
@@ -1149,7 +1266,16 @@ pub fn request_vrr_enabled(crtc_id: u32, enabled: bool) {
         } else {
             let _ = vrr_disable(&io, trans, ip);
         }
+        // The set-context-latency is a plain register write:
+        // program it with the TG state (wa_14015401596 floor).
+        io.write32(
+            trans.base() + TRANS_SET_CONTEXT_LATENCY_OFFSET,
+            set_context_latency_for_crtc(crtc_id),
+        );
     });
+    // The sink's MSA-ignore bit follows the toggle: set on enable,
+    // cleared on disable, via the slow-AUX snapshot path.
+    sync_msa_timing_par_ignore(crtc_id);
 }
 
 /// Retain and apply a CRTC's CMRR request.
@@ -1168,7 +1294,16 @@ pub fn request_cmrr_enabled(crtc_id: u32, enabled: bool) {
         } else {
             let _ = cmrr_disable(&io, trans, ip);
         }
+        // CMRR runs the VRR TG, so the set-context-latency floor
+        // applies here too (wa_14015401596).
+        io.write32(
+            trans.base() + TRANS_SET_CONTEXT_LATENCY_OFFSET,
+            set_context_latency_for_crtc(crtc_id),
+        );
     });
+    // CMRR is the fixed-RR TG: enabling it clears the sink's
+    // MSA-ignore bit, disabling it re-evaluates from the VRR state.
+    sync_msa_timing_par_ignore(crtc_id);
 }
 
 /// Invoked on a completed/armed primary plane flip to trigger dynamic VRR/CMRR push.

@@ -2632,11 +2632,25 @@ impl<M: Platform> Guard<'_, M> {
     /// activates it, so later frame changes in this session still run with
     /// PSR exited.
     fn psr_after_latch(&mut self) {
-        if self.device.generation != Generation::MeteorLake
-            || self.state.current.is_none()
-            || self.state.psr.is_some()
-            || self.state.psr_refused.is_some()
-        {
+        if self.device.generation != Generation::MeteorLake || self.state.current.is_none() {
+            return;
+        }
+        // Linux `intel_psr_compute_config` (fixed-RR TG relaxation):
+        // PSR panels don't work reliably with VRR enabled, so PSR is
+        // refused while the VRR TG on CRTC 1 (the Pipe-A panel) runs
+        // at a variable rate. A running PSR is disabled at the next
+        // latch after VRR turns on; the refusal is deliberately NOT
+        // latched (`Refusal::VrrEnabled` is not in `latched()`), so
+        // toggling VRR off re-qualifies PSR at the next latch —
+        // re-evaluation is the absence of stored state, not a
+        // clear path.
+        if crate::intel_gpu_vrr::vrr_excludes_psr(1) {
+            if self.state.psr.is_some() {
+                psr_disable(&mut self.state, &self.device.platform, None);
+            }
+            return;
+        }
+        if self.state.psr.is_some() || self.state.psr_refused.is_some() {
             return;
         }
         let refusal = match self.psr_qualify() {
@@ -2714,6 +2728,15 @@ impl<M: Platform> Guard<'_, M> {
         if timing.flags & DRM_MODE_FLAG_INTERLACE != 0 {
             return Err(Refusal::Interlaced);
         }
+        // Linux `intel_psr_compute_config` (fixed-RR TG relaxation):
+        // no sink conversation for a panel VRR excludes — PSR is
+        // refused while the VRR TG on CRTC 1 runs at a variable
+        // rate. `psr_after_latch` gates first in the latch path;
+        // this is the compute-level refusal for any other caller,
+        // and it is not latched, so a VRR toggle re-qualifies.
+        if crate::intel_gpu_vrr::vrr_excludes_psr(1) {
+            return Err(Refusal::VrrEnabled);
+        }
         // The card's mode must be the one transcoder A is running
         // (TRANS_HTOTAL / TRANS_VTOTAL, active and total minus one).
         let console = self.console_geometry();
@@ -2755,6 +2778,7 @@ impl<M: Platform> Guard<'_, M> {
                 &mut PsrAux(platform),
                 &sink,
                 platform.psr_pci_ids(),
+                crate::intel_gpu_vrr::vrr_excludes_psr(1),
             )
             .and_then(|source| compute_psr2(&sink, &timing, &panel, &source))
         } else {

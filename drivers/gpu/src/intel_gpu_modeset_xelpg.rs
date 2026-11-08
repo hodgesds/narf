@@ -1766,10 +1766,13 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         let xe3 = self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd;
         if xe3 {
             // intel_set_transcoder_timings, display >= 13: the set-context
-            // latency first (0 without PSR), which the display-30 VRR
-            // guardband assumes.
-            self.mmio
-                .write32(crate::intel_gpu_xe3lpd::TRANS_SET_CONTEXT_LATENCY_A, 0);
+            // latency first — the VRR-TG value (1 while the TG runs on
+            // CRTC 1, 0 otherwise; wa_14015401596 floor), which the
+            // display-30 VRR guardband assumes.
+            self.mmio.write32(
+                crate::intel_gpu_xe3lpd::TRANS_SET_CONTEXT_LATENCY_A,
+                crate::intel_gpu_vrr::set_context_latency_for_crtc(1),
+            );
         }
         self.mmio.write32(base + TRANS_HTOTAL_OFFSET, prog.htotal);
         self.mmio.write32(base + TRANS_HBLANK_OFFSET, prog.hblank);

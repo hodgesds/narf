@@ -289,6 +289,13 @@ impl IntelDpBridge {
                         ip,
                         crate::intel_gpu_vrr::VrrComputeOpts::default(),
                     );
+                    // The sink's MSA-ignore bit follows the VRR
+                    // state at every modeset (see `activate_on_pipe`).
+                    let _ = crate::intel_gpu_dp::set_msa_timing_par_ignore(
+                        &mmio,
+                        ddi,
+                        crate::intel_gpu_vrr::msa_timing_par_ignore_wanted(1),
+                    );
                 }
                 Ok(())
             }
