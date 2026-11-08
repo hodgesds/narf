@@ -14657,10 +14657,53 @@ struct that owns BAR5 (`drivers/gpu/src/amdgpu.rs`):
   the pre-transition state, applies the status change, then
   executes the disable writes, and returns the action applied.
   The IH dispatch calls this (not bare
-  `HpdEngine::apply_to_kms`) for disconnects. Connects need a
-  mode before a plan can be built, so the connect half stays
-  with the caller: `hotplug_audio_action` → `plan_modeset` →
-  `apply_modeset_plan`.
+  `HpdEngine::apply_to_kms`) for disconnects.
+- `AmdGpu::modeset_connector(connector_idx, mode, refresh_hz,
+  surface)` is the connect-half production caller: it picks a
+  CRTC, builds the plan (`plan_modeset`) and applies it
+  (`apply_modeset_plan`), so the audio enable sequence runs for
+  external HDMI/DP when the BASE_IDX 2 segment resolves. The
+  caller supplies the mode — on a hotplug connect that is the
+  sink's EDID preferred mode; there is no safe default to invent
+  for an unknown sink. Returns `ConnectorDisconnected` for a
+  connector HPD has not marked `Connected` yet, `NotReady` when
+  KMS was never initialised, firmware is not loaded, or the DCN
+  block is undiscoverable.
+- `AmdGpu::handle_hotplug_event(ctxid, asserted, tsc)` feeds one
+  IH HPD cookie into the driver-owned `HpdMachine` — the seam the
+  IH ring drainer calls. The pin level comes from the caller
+  (`hpd_asserted` readback at drain time). A disconnect on a
+  stable-connected pin runs the audio teardown through
+  `apply_hotplug_disconnect`; a firmware-not-loaded teardown
+  still drops the connector's CRTC binding. Returns `None` for a
+  context id that is not an HPD event.
+- `AmdGpu::poll_hotplug(tsc)` samples the HPD debounce timers —
+  call from the driver's main loop or a scheduled wakeup — and
+  returns the connector indices that stabilised as connected,
+  marked `Connected` in KMS. The caller modesets each with its
+  mode via `modeset_connector`.
+- `AmdGpu::feed_connector_edid(connector_idx, edid)` scans a full
+  EDID blob's extension blocks for the CEA-861 block and feeds
+  the parsed audio caps into the connector (a missing speaker
+  block falls back to the FL/FR baseline 0x01). Returns `false`
+  when there is no CEA block, no KMS state, or the connector
+  index is out of range.
+- Probe-time KMS ownership: `probe()` calls
+  `AmdGpu::init_kms_from_vbios` after capturing the VBIOS, which
+  builds the topology via `AmdGpu::kms_from_vbios` (ATOM
+  display-object table 0x05 → `KmsState::ingest_atom_paths` +
+  encoder binding from the path chains, DIG via Linux's
+  `translate_encoder_to_transmitter`; 6 CRTCs on Navi3, 4
+  elsewhere) and binds HPD sources via
+  `AmdGpu::bind_hpd_from_inventory` (inventory per-path HPD
+  selectors matched by `usDeviceTag`). Best-effort: any parse
+  failure leaves KMS empty and probe continues — the panel path
+  (`set_mode`) does not need it. `DisplayObjectTable` walks by
+  each path record's own `usSize` (header + chain), not a fixed
+  8 — a chained path is longer than 8 bytes.
+- The PM resume handler runs `AmdGpu::resume_display_audio`
+  against the owned KMS state after `set_mode` re-programs the
+  saved mode — the multi-connector resume path.
 - `AmdGpu::resume_display_audio(kms)` executes
   `resume_display_audio_writes` — the multi-connector resume
   path, for the PM resume handler to run after `set_mode`.
@@ -14674,18 +14717,15 @@ struct that owns BAR5 (`drivers/gpu/src/amdgpu.rs`):
   applied plan only; multi-connector resume goes through
   `resume_display_audio`.
 
-Explicitly not in this surface: the IH ring's HPD dispatch into
-the `amdgpu_hpd` state machine has no production driver on this
-path, no probe-time owner builds a `KmsState` from the ATOM
-display-object table yet, and no production EDID readback feeds
-`feed_connector_audio_caps` — so the apply path above waits for
-the KMS driver core to call it (connect half: a mode source for
-the reprogram plan; resume half: the KMS state for
-`resume_display_audio`). Until that lands, external-monitor
-audio still never reaches hardware on the laptop path, and
-#778 stays open on that remainder. Intel display-side audio
-programming is out of scope while another agent works Intel
-GPU; no Intel modeset file is touched.
+Explicitly not in this surface: the live IH ring drainer that
+produces the cookies `handle_hotplug_event` consumes, the live
+DDC/AUX transport read that produces the EDID blob
+`feed_connector_edid` consumes, and the DRM/fb caller that
+supplies connect modes to `modeset_connector` — those are the
+remaining integration points; the KMS core now owns the state
+and the apply calls. Intel display-side audio programming is
+out of scope while another agent works Intel GPU; no Intel
+modeset file is touched.
 
 ### VirtIO-GPU rendering
 

@@ -151,7 +151,12 @@ pub enum EncoderKind {
 #[derive(Clone, Debug)]
 pub struct Encoder {
     pub kind: EncoderKind,
-    /// ATOM `ObjectLink::instance` for this encoder.
+    /// The DIG / transmitter index this encoder drives — derived
+    /// from the ATOM encoder object via Linux's
+    /// `translate_encoder_to_transmitter` (UNIPHY pair + enum id),
+    /// NOT the raw `ENCODER_OBJECT_ID_*` (0x1e/0x20/0x21/0x25):
+    /// the display-audio request uses this value directly as the
+    /// DIG whose AFMT block the enable sequence programs.
     pub instance: u8,
     /// Connectors this encoder can drive. One-to-many on boards
     /// with shared transmitters; one-to-one on most laptops.
@@ -768,6 +773,11 @@ pub enum KmsError {
     NoFreeCrtc,
     NoCrtc,
     UnsupportedMode,
+    /// The driver cannot program a mode yet: KMS state was never
+    /// initialised at probe, firmware is not loaded, or the DCN
+    /// block is undiscoverable. The specific cause goes in the
+    /// caller's console log; the variant only says "not ready".
+    NotReady,
 }
 
 // ── Helpers exposed for amdgpu_dcn re-export ─────────────────────

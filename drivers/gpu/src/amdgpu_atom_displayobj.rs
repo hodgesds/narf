@@ -183,6 +183,10 @@ pub struct DisplayObjectTable<'a> {
     n_paths: usize,
     /// Walking offset within `raw` for the next `next()` call.
     cursor: usize,
+    /// Paths already yielded. The table declares `n_paths`; the
+    /// walk stops there even if a corrupt `usSize` would otherwise
+    /// carry the cursor into non-path data.
+    yielded: usize,
 }
 
 impl<'a> DisplayObjectTable<'a> {
@@ -205,6 +209,7 @@ impl<'a> DisplayObjectTable<'a> {
             raw,
             n_paths,
             cursor: 8,
+            yielded: 0,
         })
     }
 
@@ -221,6 +226,7 @@ impl<'a> DisplayObjectTable<'a> {
     /// Reset the iterator's cursor to the first path.
     pub fn rewind(&mut self) {
         self.cursor = 8;
+        self.yielded = 0;
     }
 
     /// Iterate the object-chain links following the 8-byte path
@@ -240,6 +246,55 @@ impl<'a> DisplayObjectTable<'a> {
             cursor: start,
             end,
         }
+    }
+
+    /// Read the next path together with its object chain. The
+    /// chain iterator is built from the table's raw slice (not via
+    /// `chain_at`, which borrows `self` while the cursor still
+    /// needs advancing).
+    ///
+    /// Stride is the path record's own `usSize` — the 8-byte header
+    /// plus its chain — not a fixed 8: a path with a chain is longer
+    /// than 8 bytes, and stepping 8 lands mid-chain, decoding chain
+    /// words as path headers. A `usSize` below 8 is corrupt; the
+    /// walk steps the header so a bad record cannot stall it.
+    pub fn next_with_chain(&mut self) -> Option<(DisplayPath, ObjectLinkIter<'a>)> {
+        if self.yielded >= self.n_paths {
+            return None;
+        }
+        if self.cursor + 8 > self.raw.len() {
+            return None;
+        }
+        let off = self.cursor;
+        let device_tag = u16::from_le_bytes([self.raw[off], self.raw[off + 1]]);
+        let size = u16::from_le_bytes([self.raw[off + 2], self.raw[off + 3]]) as usize;
+        let conn_obj_id = u16::from_le_bytes([self.raw[off + 4], self.raw[off + 5]]);
+        let gpu_obj_id = u16::from_le_bytes([self.raw[off + 6], self.raw[off + 7]]);
+        let stride = size.max(8);
+        let chain = ObjectLinkIter {
+            raw: self.raw,
+            cursor: off + 8,
+            end: (off + stride).min(self.raw.len()),
+        };
+        self.cursor += stride;
+        self.yielded += 1;
+        // LINUX-GAP: these two were the other way round — the connector kind
+        // was decoded from the high byte and the index from the low. The
+        // object's own id is bits **7:0** and the enum id (which instance of
+        // that connector type) is bits 11:8, so a DisplayPort connector
+        // (0x3113) read as kind 0x31 and index 0x13.
+        let link = ObjectLink::from_raw(conn_obj_id);
+        let connector_kind = ConnectorKind::from_object_enum(link.instance);
+        let connector_index = link.enum_id;
+        Some((
+            DisplayPath {
+                device_tag,
+                connector_kind,
+                connector_index,
+                gpu_object_id: gpu_obj_id,
+            },
+            chain,
+        ))
     }
 }
 
@@ -270,32 +325,6 @@ impl<'a> Iterator for ObjectLinkIter<'a> {
 impl<'a> Iterator for DisplayObjectTable<'a> {
     type Item = DisplayPath;
     fn next(&mut self) -> Option<DisplayPath> {
-        let paths_end = 8 + self.n_paths * 8;
-        if self.cursor >= paths_end {
-            return None;
-        }
-        if self.cursor + 8 > self.raw.len() {
-            return None;
-        }
-        let off = self.cursor;
-        let device_tag = u16::from_le_bytes([self.raw[off], self.raw[off + 1]]);
-        let _size = u16::from_le_bytes([self.raw[off + 2], self.raw[off + 3]]);
-        let conn_obj_id = u16::from_le_bytes([self.raw[off + 4], self.raw[off + 5]]);
-        let gpu_obj_id = u16::from_le_bytes([self.raw[off + 6], self.raw[off + 7]]);
-        self.cursor += 8;
-        // LINUX-GAP: these two were the other way round — the connector kind
-        // was decoded from the high byte and the index from the low. The
-        // object's own id is bits **7:0** and the enum id (which instance of
-        // that connector type) is bits 11:8, so a DisplayPort connector
-        // (0x3113) read as kind 0x31 and index 0x13.
-        let link = ObjectLink::from_raw(conn_obj_id);
-        let connector_kind = ConnectorKind::from_object_enum(link.instance);
-        let connector_index = link.enum_id;
-        Some(DisplayPath {
-            device_tag,
-            connector_kind,
-            connector_index,
-            gpu_object_id: gpu_obj_id,
-        })
+        self.next_with_chain().map(|(path, _chain)| path)
     }
 }
