@@ -1635,12 +1635,24 @@ struct DeferredFree<A: BootAllocator> {
 ///   considered and rejected: the test backings in `intel_gpu_media`
 ///   and `intel_gpu_rcs` hold `Rc`, and converting those fixtures is
 ///   out of scope for this fix.
+///
 /// A raw pointer that may cross threads. The address itself is plain
 /// data; sending it is sound because the pointed-to box is only ever
 /// touched by the thread that takes the `PageState` slot, which
 /// reconstructs it with exclusive ownership (see `PendingFree`).
 struct CrossThreadPtr(*mut ());
+// SAFETY: sending the pointer is sound because after `Box::into_raw` it is
+// the only access path to the box — nothing aliases it — and the box is
+// only ever touched by the thread that takes the `PageState` slot under
+// the `Pages` lock and reconstructs it with exclusive ownership in
+// `PendingFree::run`, which consumes the value; moving the pointer to
+// another thread cannot create a second access path.
 unsafe impl Send for CrossThreadPtr {}
+// SAFETY: sharing a reference is sound because the pointer is never
+// dereferenced through a shared reference — the only dereference is the
+// `Box::from_raw` inside `PendingFree::run`, which requires exclusive
+// ownership of the `PendingFree` (slot taken under the lock, value
+// consumed), so no thread can touch the box through `&CrossThreadPtr`.
 unsafe impl Sync for CrossThreadPtr {}
 
 struct PendingFree {
