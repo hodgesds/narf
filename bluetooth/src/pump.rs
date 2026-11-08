@@ -12425,8 +12425,10 @@ mod tests {
             reset_all();
             return TestResult::Fail("ext_adv_start rejected from Idle");
         }
-        let mut params1 = crate::gap::ExtendedAdvertisingParameters::default();
-        params1.handle = 0x01;
+        let params1 = crate::gap::ExtendedAdvertisingParameters {
+            handle: 0x01,
+            ..Default::default()
+        };
         if ext_adv_start(0, params1, &data, None) != Err(CentralError::WrongPhase) {
             reset_all();
             return TestResult::Fail("second start mid-chain must be WrongPhase");
@@ -12826,7 +12828,7 @@ mod tests {
     kernel_test_in!("bluetooth/pump", smoke_pump_classic_failure_and_malformed);
 
     /// HCI_Inquiry_Result_with_RSSI event (§7.7.33): Num_Responses
-    /// + one 14-byte entry (BD_ADDR, PSRM, Reserved, CoD,
+    /// and one 14-byte entry (BD_ADDR, PSRM, Reserved, CoD,
     /// Clock_Offset, RSSI).
     fn inquiry_result_with_rssi_event(
         bd_addr: [u8; 6],
@@ -14857,7 +14859,6 @@ mod tests {
     const MGMT_OP_USER_CONFIRM_REPLY: u16 = 0x001c;
     const MGMT_OP_USER_CONFIRM_NEG_REPLY: u16 = 0x001d;
     const MGMT_OP_USER_PASSKEY_REPLY: u16 = 0x001e;
-    const MGMT_OP_USER_PASSKEY_NEG_REPLY: u16 = 0x001f;
     const MGMT_OP_ADD_REMOTE_OOB_DATA: u16 = 0x0021;
     const MGMT_EV_CMD_COMPLETE: u16 = 0x0001;
     const MGMT_EV_CMD_STATUS: u16 = 0x0002;
@@ -15270,14 +15271,12 @@ mod tests {
     }
 
     /// Keys of an mgmt-initiated pairing once the public keys are
-    /// exchanged: both sides' public keys (wire order), the
-    /// peer-side DHKey, and the initiator's stage-1 commitment
+    /// exchanged: both sides' public-key x-coordinates (wire order),
+    /// the peer-side DHKey, and the initiator's stage-1 commitment
     /// Ca (verified by the peer once Na is revealed).
     struct MgmtPairKeys {
         pump_pk_x: [u8; 32],
-        pump_pk_y: [u8; 32],
         peer_pk_x: [u8; 32],
-        peer_pk_y: [u8; 32],
         peer_dh: [u8; 32],
         ca: [u8; 16],
     }
@@ -15344,13 +15343,15 @@ mod tests {
         ca.copy_from_slice(&first[0][1..17]);
         Ok(MgmtPairKeys {
             pump_pk_x,
-            pump_pk_y,
             peer_pk_x,
-            peer_pk_y,
             peer_dh,
             ca,
         })
     }
+
+    /// Result of the 20 passkey rounds: the round-19 nonces (Na20, Nb20)
+    /// and the initiator's DHKey Check.
+    type PasskeyRoundResult = ([u8; 16], [u8; 16], [u8; 16]);
 
     /// Drive all 20 passkey rounds (§2.3.5.6.3) against the
     /// scripted peer, which uses `passkey` for every round.
@@ -15367,7 +15368,7 @@ mod tests {
         keys: &MgmtPairKeys,
         passkey: u32,
         first_cai: [u8; 16],
-    ) -> Result<([u8; 16], [u8; 16], [u8; 16]), &'static str> {
+    ) -> Result<PasskeyRoundResult, &'static str> {
         let mut cai = first_cai;
         for round in 0..20u8 {
             let z = smp::passkey_bit_z(passkey, round);
@@ -16076,9 +16077,7 @@ mod tests {
         cai0.copy_from_slice(&first[0][1..17]);
         let keys = MgmtPairKeys {
             pump_pk_x,
-            pump_pk_y,
             peer_pk_x,
-            peer_pk_y,
             peer_dh,
             ca: cai0,
         };
@@ -16197,7 +16196,7 @@ mod tests {
         }
         // The peer's OOB data: rb is the randomizer, the hash is
         // f4(PKbx, PKbx, rb, 0) over the peer's known keypair.
-        let (peer_px, peer_py) = peer_public(SMP888_PEER_PRIV);
+        let (peer_px, _) = peer_public(SMP888_PEER_PRIV);
         let peer_pk_x = fe_to_wire(&peer_px);
         let rb: [u8; 16] = [0xCC; 16];
         let hash = peer_f4(&sbox, &peer_pk_x, &peer_pk_x, &rb, 0);

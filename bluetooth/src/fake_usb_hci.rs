@@ -64,7 +64,7 @@
 //!   event accounting in each test stays exact instead of being
 //!   inflated by auto-acked commands the pump may issue.
 //! - No real firmware blob: the image is synthetic (a CSS header
-//!   + two embedded HCI commands), sized and framed by the
+//!   and two embedded HCI commands), sized and framed by the
 //!   documented rules, so the download proves framing and
 //!   ordering, not a vendor signature check.
 

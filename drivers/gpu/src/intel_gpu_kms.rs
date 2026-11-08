@@ -3003,6 +3003,7 @@ impl<M: Platform> Guard<'_, M> {
         self.state.panel_off
     }
     #[cfg(any(test, feature = "kernel-test"))]
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn psr(&self) -> Option<crate::intel_gpu_psr::Psr> {
         self.state.psr
     }

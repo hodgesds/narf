@@ -4112,8 +4112,8 @@ mod tests {
     );
 
     /// #815 (remainder tranche): SET_ADVERTISING issues the legacy
-    /// advertising HCI sequence (parameters + data + scan response
-    /// + enable) while powered, validates the value, rejects with
+    /// advertising HCI sequence (parameters, data, scan response,
+    /// enable) while powered, validates the value, rejects with
     /// LE off, records while unpowered and applies on power-on,
     /// and no-ops on a repeat of the same mode. Mode 0x01 with
     /// connectable off advertises non-connectable from a fresh

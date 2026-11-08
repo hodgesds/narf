@@ -203,6 +203,7 @@ impl MockPlatform {
         platform.gen12_defaults();
         platform
     }
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn with_display_ip(self, ip: crate::intel_gpu_xe2lpd::DisplayIp) -> Self {
         self.0.lock().display_ip = Some(ip);
         self
@@ -316,6 +317,7 @@ impl MockPlatform {
     pub(crate) fn meteor(&self) -> Device<Self> {
         Device::new(self.clone(), Generation::MeteorLake, 0x1000000, console())
     }
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn panther(&self) -> Device<Self> {
         Device::new(self.clone(), Generation::PantherLake, 0x1000000, console())
     }
@@ -325,6 +327,7 @@ impl MockPlatform {
         saved.stride_bytes = pitch;
         Device::new(self.clone(), Generation::MeteorLake, 0x1000000, saved)
     }
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn panther_pitch(&self, pitch: u32) -> Device<Self> {
         self.set(0x70188, pitch / 64);
         let mut saved = console();
