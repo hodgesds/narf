@@ -10,16 +10,16 @@ use crate::{
     intel_gpu_modeset::Mode,
     intel_gpu_vrr::{
         capture_mode_from_hw, cmrr_disable, cmrr_enable, install_vbt, installed_vrr,
-        is_cmrr_active, is_vrr_active, mode_vrefresh, on_plane_flip, populate_card,
-        program_cmrr_timings, program_fixed_rr_timings, program_vrr_timings,
-        recompute_timings_for_modeset, sink_vrr_range, vrr_disable, vrr_enable, vrr_send_push,
-        vrr_status_string, CmrrRate, CmrrTimings, DisplayVrrIp, VbtVrr, VrrComputeOpts,
-        VrrConnectorKind, VrrRange, VrrTimings, VrrTranscoder, EMP_AS_SDP_TL_OFFSET,
-        TRANSCODER_A_BASE, TRANS_CMRR_M_HI_OFFSET, TRANS_CMRR_M_LO_OFFSET, TRANS_CMRR_N_HI_OFFSET,
-        TRANS_CMRR_N_LO_OFFSET, TRANS_PUSH_EN, TRANS_PUSH_OFFSET, TRANS_VRR_CTL_OFFSET,
-        TRANS_VRR_FLIPLINE_OFFSET, TRANS_VRR_VMAX_OFFSET, TRANS_VRR_VMIN_OFFSET,
-        TRANS_VRR_VSYNC_OFFSET, VRR_CTL_CMRR_ENABLE, VRR_CTL_FLIP_LINE_EN, VRR_CTL_IGN_MAX_STRETCH,
-        VRR_CTL_VRR_ENABLE, VRR_STATE,
+        is_cmrr_active, is_vrr_active, mode_vrefresh, msa_timing_par_ignore_wanted, on_plane_flip,
+        populate_card, program_cmrr_timings, program_fixed_rr_timings, program_vrr_timings,
+        recompute_timings_for_modeset, set_context_latency_for_crtc, sink_vrr_range, vrr_disable,
+        vrr_enable, vrr_excludes_psr, vrr_is_variable, vrr_send_push, vrr_status_string, CmrrRate,
+        CmrrTimings, DisplayVrrIp, VbtVrr, VrrComputeOpts, VrrConnectorKind, VrrRange, VrrTimings,
+        VrrTranscoder, EMP_AS_SDP_TL_OFFSET, TRANSCODER_A_BASE, TRANS_CMRR_M_HI_OFFSET,
+        TRANS_CMRR_M_LO_OFFSET, TRANS_CMRR_N_HI_OFFSET, TRANS_CMRR_N_LO_OFFSET, TRANS_PUSH_EN,
+        TRANS_PUSH_OFFSET, TRANS_VRR_CTL_OFFSET, TRANS_VRR_FLIPLINE_OFFSET, TRANS_VRR_VMAX_OFFSET,
+        TRANS_VRR_VMIN_OFFSET, TRANS_VRR_VSYNC_OFFSET, VRR_CTL_CMRR_ENABLE, VRR_CTL_FLIP_LINE_EN,
+        VRR_CTL_IGN_MAX_STRETCH, VRR_CTL_VRR_ENABLE, VRR_STATE,
     },
 };
 
@@ -1153,4 +1153,119 @@ fn smoke_intel_vrr_vbt_feature_flag() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_vrr",
     smoke_intel_vrr_vbt_feature_flag
+);
+
+// ── Test 18: PSR×VRR Exclusion and DPCD-Want Follow the Fixed-RR Rule ────────
+
+fn smoke_vrr_psr_exclusion_and_dpcd_want_follow_the_fixed_rr_rule() -> TestResult {
+    let m = mode_1080p60();
+    let range = VrrRange::new(48, 144).unwrap();
+    let timings = VrrTimings::compute(&m, range, DisplayVrrIp::Display14).unwrap();
+
+    // VRR off, CMRR off, no timings: nothing excludes PSR, nothing
+    // wants the DPCD bit, SCL is 0.
+    VRR_STATE.set_enabled(1, false);
+    VRR_STATE.set_cmrr_enabled(1, false);
+    VRR_STATE.set_timings(1, None);
+    assert!(!vrr_is_variable(1));
+    assert!(!vrr_excludes_psr(1));
+    assert!(!msa_timing_par_ignore_wanted(1));
+    assert_eq!(set_context_latency_for_crtc(1), 0);
+
+    // VRR on, variable rate, timings programmed: PSR excluded, the
+    // sink wants MSA-ignore, SCL is the wa floor 1.
+    VRR_STATE.set_enabled(1, true);
+    VRR_STATE.set_timings(1, Some(timings));
+    assert!(vrr_is_variable(1));
+    assert!(vrr_excludes_psr(1));
+    assert!(msa_timing_par_ignore_wanted(1));
+    assert_eq!(set_context_latency_for_crtc(1), 1);
+
+    // VRR on but no timings (mode outside the range, or no range):
+    // PSR is still excluded, but there is nothing to program on
+    // the sink, so the DPCD bit is not wanted.
+    VRR_STATE.set_timings(1, None);
+    assert!(vrr_excludes_psr(1));
+    assert!(!msa_timing_par_ignore_wanted(1));
+
+    // Fixed-RR TG (CMRR on): PSR is allowed again and the sink
+    // must NOT get MSA-ignore — it receives valid MSA timing at
+    // the fixed rate. The TG still runs, so SCL stays 1.
+    VRR_STATE.set_timings(1, Some(timings));
+    VRR_STATE.set_cmrr_enabled(1, true);
+    assert!(!vrr_is_variable(1));
+    assert!(!vrr_excludes_psr(1));
+    assert!(!msa_timing_par_ignore_wanted(1));
+    assert_eq!(set_context_latency_for_crtc(1), 1);
+
+    // CMRR alone (VRR property off) is also a running TG: SCL 1,
+    // no PSR exclusion, no DPCD want.
+    VRR_STATE.set_enabled(1, false);
+    assert!(!vrr_excludes_psr(1));
+    assert!(!msa_timing_par_ignore_wanted(1));
+    assert_eq!(set_context_latency_for_crtc(1), 1);
+
+    // An unknown CRTC has no VRR state at all.
+    assert!(!vrr_is_variable(9));
+    assert!(!vrr_excludes_psr(9));
+    assert!(!msa_timing_par_ignore_wanted(9));
+    assert_eq!(set_context_latency_for_crtc(9), 0);
+
+    // Restore the shared state.
+    VRR_STATE.set_enabled(1, false);
+    VRR_STATE.set_cmrr_enabled(1, false);
+    VRR_STATE.set_timings(1, None);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_vrr_psr_exclusion_and_dpcd_want_follow_the_fixed_rr_rule
+);
+
+// ── Test 19: Guardband Subtracts the Set-Context-Latency ────────────────────
+
+fn smoke_vrr_guardband_subtracts_set_context_latency() -> TestResult {
+    let m = mode_1080p60();
+    let range = VrrRange::new(48, 144).unwrap();
+
+    // 1080p60, range 48–144: vmin 1125, v_active 1080, so the
+    // guardband is 45 with SCL 0 (Linux "Use SCL for computing
+    // guardband": guardband = vmin − v_active − SCL).
+    let base = VrrTimings::compute_config(
+        &m,
+        range,
+        DisplayVrrIp::Display14,
+        VrrComputeOpts::default(),
+    )
+    .unwrap();
+    assert_eq!(base.guardband, 45);
+    let one = VrrTimings::compute_config(
+        &m,
+        range,
+        DisplayVrrIp::Display14,
+        VrrComputeOpts {
+            scl: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(one.guardband, 44);
+    // The floor holds: a huge SCL cannot drive the guardband
+    // below the 8-line minimum.
+    let huge = VrrTimings::compute_config(
+        &m,
+        range,
+        DisplayVrrIp::Display14,
+        VrrComputeOpts {
+            scl: 100,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(huge.guardband, 8);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_vrr_guardband_subtracts_set_context_latency
 );

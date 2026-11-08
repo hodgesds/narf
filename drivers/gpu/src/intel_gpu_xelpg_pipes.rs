@@ -540,7 +540,15 @@ impl Pipes {
         // intel_set_transcoder_timings, intel_vrr_set_transcoder_timings,
         // TRANS_MULT, hsw_set_frame_start_delay, hsw_set_transconf.
         let base = pipe.transcoder().base();
-        checked(io, base + TRANS_SET_CONTEXT_LATENCY_OFFSET, 0)?;
+        // intel_set_transcoder_timings: the set-context-latency is
+        // the VRR-TG value (1 while the TG runs on this CRTC's
+        // pipe, 0 otherwise — wa_14015401596 floor), not a
+        // hardcoded 0; the VRR guardband is computed against it.
+        checked(
+            io,
+            base + TRANS_SET_CONTEXT_LATENCY_OFFSET,
+            crate::intel_gpu_vrr::set_context_latency_for_crtc(pipe as u32 + 1),
+        )?;
         checked(io, base + TRANS_VSYNCSHIFT_OFFSET, 0)?;
         for (off, v) in [
             (TRANS_HTOTAL_OFFSET, trans.htotal),

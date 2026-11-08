@@ -1965,7 +1965,11 @@ pub(crate) struct DisplayInfo {
 }
 
 impl DisplayInfo {
-    fn mode_window(&self) -> ModeWindow {
+    /// A mode window over the snapshot's mapping, for slow AUX /
+    /// modeset work that must not retain CONTROLLER (see the
+    /// struct docs). `pub(crate)` so the VRR toggle path can run
+    /// its DPCD write off the snapshot.
+    pub(crate) fn mode_window(&self) -> ModeWindow {
         ModeWindow::new(self.gtt_mmadr, self.device, self.cap)
     }
 }

@@ -26,7 +26,8 @@ fn psr2_sink() -> Sinkd {
     sink
 }
 
-/// Display 14.00 C0, 8 bpc, four lanes at HBR2, no SCL, no DSC or joiner.
+/// Display 14.00 C0, 8 bpc, four lanes at HBR2, no SCL, no DSC or joiner,
+/// no VRR exclusion.
 fn source() -> Psr2Source {
     Psr2Source {
         step: 8,
@@ -36,6 +37,7 @@ fn source() -> Psr2Source {
         set_context_latency: 0,
         stream_split: false,
         fw_sync_quirk: false,
+        vrr_excludes_psr: false,
     }
 }
 
@@ -111,6 +113,16 @@ fn smoke_psr2_refusals_fall_back_with_typed_reasons() -> TestResult {
     aux.dpcd.insert(0x02e, 0);
     let no_alpm = Sink::read(&mut aux).unwrap();
     assert_eq!(qualify(&no_alpm, &t, &source()), Err(Psr2Refusal::NoSinkSu));
+    // VRR exclusion (Linux `intel_psr_compute_config`, fixed-RR TG
+    // relaxation): refused before any sink fact is consulted — even
+    // a sink that would otherwise qualify, and it wins over a
+    // sink-side refusal too.
+    let vrr = Psr2Source {
+        vrr_excludes_psr: true,
+        ..source()
+    };
+    assert_eq!(qualify(&sink, &t, &vrr), Err(Psr2Refusal::VrrEnabled));
+    assert_eq!(qualify(&no_alpm, &t, &vrr), Err(Psr2Refusal::VrrEnabled));
     // DSC, a joiner or the splitter on Pipe A.
     let split = Psr2Source {
         stream_split: true,
@@ -232,7 +244,13 @@ fn smoke_psr2_source_reads_the_live_pipe_and_link() -> TestResult {
     regs.set(0x6007c, 0);
     let dell = Some((0x7d55, 0x1028, 0x0cc7));
     assert_eq!(
-        psr2_source(&regs, &mut psr2_sink(), &sink, Some((0x7d55, 0x8086, 1))),
+        psr2_source(
+            &regs,
+            &mut psr2_sink(),
+            &sink,
+            Some((0x7d55, 0x8086, 1)),
+            false
+        ),
         Ok(Psr2Source {
             step: 2,
             pipe_bpp: 30,
@@ -241,7 +259,32 @@ fn smoke_psr2_source_reads_the_live_pipe_and_link() -> TestResult {
             set_context_latency: 0,
             stream_split: false,
             fw_sync_quirk: false,
+            vrr_excludes_psr: false,
         })
+    );
+    // The caller's VRR fact is carried into the source verbatim:
+    // `psr2_source` itself reads no VRR state.
+    assert!(
+        psr2_source(
+            &regs,
+            &mut psr2_sink(),
+            &sink,
+            Some((0x7d55, 0x8086, 1)),
+            true
+        )
+        .unwrap()
+        .vrr_excludes_psr
+    );
+    assert!(
+        !psr2_source(
+            &regs,
+            &mut psr2_sink(),
+            &sink,
+            Some((0x7d55, 0x8086, 1)),
+            false
+        )
+        .unwrap()
+        .vrr_excludes_psr
     );
     // QUIRK_FW_SYNC_LEN needs the Dell Precision 5490 and the 38:ec:11 OUI.
     let mut aux = psr2_sink();
@@ -250,12 +293,12 @@ fn smoke_psr2_source_reads_the_live_pipe_and_link() -> TestResult {
     }
     let dell_sink = Sink::read(&mut aux).unwrap();
     assert!(
-        psr2_source(&regs, &mut aux, &dell_sink, dell)
+        psr2_source(&regs, &mut aux, &dell_sink, dell, false)
             .unwrap()
             .fw_sync_quirk
     );
     assert!(
-        !psr2_source(&regs, &mut psr2_sink(), &sink, dell)
+        !psr2_source(&regs, &mut psr2_sink(), &sink, dell, false)
             .unwrap()
             .fw_sync_quirk
     );
@@ -270,7 +313,7 @@ fn smoke_psr2_source_reads_the_live_pipe_and_link() -> TestResult {
     for (register, bit) in [(0x78000, 31), (0x78000, 30), (0x78000, 29), (0x78004, 31)] {
         regs.set(register, 1 << bit);
         assert!(
-            psr2_source(&regs, &mut psr2_sink(), &sink, dell)
+            psr2_source(&regs, &mut psr2_sink(), &sink, dell, false)
                 .unwrap()
                 .stream_split
         );
@@ -278,7 +321,7 @@ fn smoke_psr2_source_reads_the_live_pipe_and_link() -> TestResult {
     }
     // Unknown: display 14.01, a BPC encoding with no pipe_bpp, no PCI
     // identity, an unset link, an unreadable register.
-    let unknown = |regs: &Regs, aux: &mut Sinkd, pci| psr2_source(regs, aux, &sink, pci);
+    let unknown = |regs: &Regs, aux: &mut Sinkd, pci| psr2_source(regs, aux, &sink, pci, false);
     regs.set(0x510a0, (14 << 22) | (1 << 14));
     assert_eq!(
         unknown(&regs, &mut psr2_sink(), dell),

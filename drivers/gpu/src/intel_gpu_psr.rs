@@ -358,6 +358,14 @@ pub enum Refusal {
     NoSetPowerCap,
     /// `DRM_MODE_FLAG_INTERLACE`.
     Interlaced,
+    /// VRR is enabled on the CRTC and the timing generator runs at
+    /// a variable rate (Linux `intel_psr_compute_config`: "Current
+    /// PSR panels don't work reliably with VRR enabled. So if VRR
+    /// is enabled, do not enable PSR", relaxed upstream to allow
+    /// PSR with the fixed-RR VRR TG only). Deliberately NOT
+    /// latched: VRR can toggle off, and the next latch must
+    /// re-evaluate and re-qualify PSR — see `psr_after_latch`.
+    VrrEnabled,
     /// `drm_dp_psr_setup_time` returned `-EINVAL`.
     InvalidSetupTime,
     /// The setup time does not fit `vtotal - vdisplay - 1` lines.
@@ -711,6 +719,12 @@ pub fn sink_cfg_psr1() -> u8 {
 /// retried at the next qualification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Psr2Refusal {
+    /// VRR is enabled on the CRTC and the timing generator runs at
+    /// a variable rate (Linux `intel_psr_compute_config`, fixed-RR
+    /// TG relaxation): PSR2 is refused before any sink fact is
+    /// consulted. Set by the caller from `VRR_STATE` via
+    /// [`Psr2Source::vrr_excludes_psr`].
+    VrrEnabled,
     /// `psr_caps.su_support` is false (`_psr_init_dpcd`): PSR version 3,
     /// the Y-coordinate requirement and AUX-wake ALPM are not all present.
     NoSinkSu,
@@ -755,6 +769,13 @@ pub struct Psr2Source {
     pub stream_split: bool,
     /// `QUIRK_FW_SYNC_LEN` applies (`intel_dp_aux_fw_sync_len` + 2).
     pub fw_sync_quirk: bool,
+    /// VRR is enabled on the CRTC and the timing generator runs at
+    /// a variable rate, so PSR is excluded (Linux
+    /// `intel_psr_compute_config` + the fixed-RR TG relaxation).
+    /// Read from `VRR_STATE` by the caller — this struct stays
+    /// platform-neutral — and refused as
+    /// [`Psr2Refusal::VrrEnabled`] by [`compute_psr2`].
+    pub vrr_excludes_psr: bool,
 }
 
 /// A qualified PSR2 configuration with selective fetch (display 14 has no
@@ -798,14 +819,23 @@ pub fn psr2_block_count_lines(io_wake_lines: u8, fast_wake_lines: u8) -> u32 {
 /// `psr2_granularity_check`, then `intel_psr_compute_config_late`'s
 /// vblank check. Defaults hold: `enable_psr` -1 and
 /// `enable_psr2_sel_fetch` true, `psr_safest_params` false, no pipe CRC,
-/// no VRR (so `_intel_psr_min_set_context_latency` is 0), no early
-/// transport below display 20, and no DC3CO (its exit line is disabled).
+/// no early transport below display 20, and no DC3CO (its exit line is
+/// disabled). VRR is refused up front (`source.vrr_excludes_psr`):
+/// with VRR the set-context-latency the late check subtracts is the
+/// VRR-TG value (at least 1, wa_14015401596), not the no-VRR 0 the
+/// old doc assumed.
 pub(crate) fn compute_psr2(
     sink: &Sink,
     timing: &crate::intel_gpu_dsb::Timing,
     panel: &crate::intel_gpu_vbt::PsrPanel,
     source: &Psr2Source,
 ) -> Result<Psr2, Psr2Refusal> {
+    // Linux `intel_psr_compute_config` (fixed-RR TG relaxation):
+    // PSR panels don't work reliably with VRR enabled, so refuse
+    // before any sink fact is consulted.
+    if source.vrr_excludes_psr {
+        return Err(Psr2Refusal::VrrEnabled);
+    }
     if !sink.su_support() {
         return Err(Psr2Refusal::NoSinkSu);
     }
@@ -960,11 +990,15 @@ pub fn sink_link_rate<A: AuxChannel + ?Sized>(aux: &mut A) -> Option<u32> {
 
 /// Read the live Pipe-A facts [`compute_psr2`] needs. `pci` is the device
 /// and subsystem identity behind `QUIRK_FW_SYNC_LEN`.
+/// `vrr_excludes_psr` is the caller's VRR fact (read from
+/// `VRR_STATE`): the register/aux reads below cannot know it, and
+/// [`compute_psr2`] refuses on it before any of them is used.
 pub fn psr2_source<M: MmioWindow + ?Sized, A: AuxChannel + ?Sized>(
     regs: &M,
     aux: &mut A,
     sink: &Sink,
     pci: Option<(u16, u16, u16)>,
+    vrr_excludes_psr: bool,
 ) -> Result<Psr2Source, Psr2Refusal> {
     let get = |register| match regs.read32(register) {
         u32::MAX => Err(Psr2Refusal::Unknown),
@@ -999,6 +1033,7 @@ pub fn psr2_source<M: MmioWindow + ?Sized, A: AuxChannel + ?Sized>(
         set_context_latency,
         stream_split,
         fw_sync_quirk,
+        vrr_excludes_psr,
     })
 }
 

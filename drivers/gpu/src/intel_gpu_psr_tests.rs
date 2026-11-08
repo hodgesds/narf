@@ -297,6 +297,9 @@ fn smoke_psr_qualify_follows_compute_config() -> TestResult {
         Refusal::InterruptDelivery,
         Refusal::Inherited,
         Refusal::Unavailable,
+        // VRR can toggle off, so a VRR refusal is re-evaluated at
+        // the next latch rather than latched for the card's life.
+        Refusal::VrrEnabled,
     ] {
         assert!(!r.latched());
     }

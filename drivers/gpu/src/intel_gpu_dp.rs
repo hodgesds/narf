@@ -547,6 +547,56 @@ pub fn vrr_range_from_aux<M: MmioWindow + ?Sized>(
     )
 }
 
+/// DPCD `DP_DOWNSPREAD_CTRL` (0x107): the sink's downspread/MSA
+/// control byte (DP 1.4a §2.5.3 / Linux `drm_dp.h`
+/// `DP_DOWNSPREAD_CTRL`).
+const DP_DOWNSPREAD_CTRL: u32 = 0x107;
+
+/// `DP_MSA_TIMING_PAR_IGNORE_EN` (bit 7 of `DP_DOWNSPREAD_CTRL`):
+/// "source may send invalid data for MSA Timing Params" (Linux
+/// `drm_dp.h`). Distinct from the capability bit the sink reports
+/// (`DP_MSA_TIMING_PAR_IGNORED`, bit 6 of DPCD 0x007, read by
+/// `sink_vrr_range`): this is the bit the *source* writes to tell
+/// the sink to ignore MSA timing.
+const DP_MSA_TIMING_PAR_IGNORE_EN: u8 = 1 << 7;
+
+/// Program the sink's DPCD MSA-timing-par-ignore bit for VRR
+/// (Linux `intel_dp_sink_set_msa_timing_par_ignore_state` /
+/// `intel_dp_update_downspread_ctrl`, 2021 i915 VRR series): set
+/// it when VRR runs at a variable rate on this connector so the
+/// sink ignores MSA timing parameters, clear it on disable and for
+/// fixed refresh rate.
+///
+/// Read-modify-write of the single byte: NARF's Intel link
+/// training never programs `DP_DOWNSPREAD_CTRL`, so the byte holds
+/// whatever the sink/firmware left there — notably the spread
+/// spectrum bit (bit 4) — and a fresh write of just this bit would
+/// clobber it. Linux builds the byte from its own link config
+/// (MSA bit + SSC); NARF tracks no SSC state, so the RMW is the
+/// faithful equivalent. Callers gate on the sink advertising
+/// MSA-ignore (see `intel_gpu_vrr::msa_timing_par_ignore_wanted`).
+/// A write is skipped when the bit is already in the wanted
+/// state, so a modeset with VRR off costs one AUX read, not a
+/// write.
+pub fn set_msa_timing_par_ignore<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    ddi: Ddi,
+    enable: bool,
+) -> Result<(), AuxError> {
+    let mut aux = IntelAux::new(mmio, ddi);
+    let mut current = [0u8; 1];
+    aux.dpcd_read(DP_DOWNSPREAD_CTRL, &mut current)?;
+    let next = if enable {
+        current[0] | DP_MSA_TIMING_PAR_IGNORE_EN
+    } else {
+        current[0] & !DP_MSA_TIMING_PAR_IGNORE_EN
+    };
+    if next != current[0] {
+        aux.dpcd_write(DP_DOWNSPREAD_CTRL, &[next])?;
+    }
+    Ok(())
+}
+
 /// Phase 2 of a connect: modeset at the negotiated plan, then
 /// publish display audio if the sink's EDID carries audio.
 /// Audio publication order matters: the ELD lands in the
@@ -614,6 +664,16 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
             probe.vrr_range,
             ip,
             crate::intel_gpu_vrr::VrrComputeOpts::default(),
+        );
+        // The sink's MSA-ignore bit follows the VRR state at every
+        // modeset: set when VRR runs variable-rate on this
+        // connector, cleared otherwise (fresh sink, VRR off,
+        // fixed-RR). Best-effort: an AUX failure must not fail
+        // the modeset; the VRR toggle path re-syncs it too.
+        let _ = set_msa_timing_par_ignore(
+            mmio,
+            probe.ddi,
+            crate::intel_gpu_vrr::msa_timing_par_ignore_wanted(1),
         );
     }
 
@@ -778,6 +838,10 @@ pub mod tests {
         fail_bw: [u8; 2],
         /// Tamper switch: NACK every transaction.
         nack_all: bool,
+        /// `DP_DOWNSPREAD_CTRL` (0x107): the sink's downspread/MSA
+        /// control byte, served verbatim so the VRR MSA-ignore
+        /// write/read-modify-write is observable.
+        downspread_ctrl: u8,
         /// Every request frame, verbatim, in order.
         wire_log: Vec<Vec<u8>>,
         /// I²C transaction shape: (command nibble, data length)
@@ -800,6 +864,7 @@ pub mod tests {
                 powered: false,
                 fail_bw: [0, 0],
                 nack_all: false,
+                downspread_ctrl: 0,
                 wire_log: Vec::new(),
                 i2c_log: Vec::new(),
             }
@@ -870,6 +935,7 @@ pub mod tests {
                             0x00
                         }
                     }
+                    0x107 => self.downspread_ctrl,
                     _ => 0,
                 };
                 out.push(b);
@@ -902,6 +968,9 @@ pub mod tests {
                     if !self.powered {
                         self.cr_locked = false;
                     }
+                }
+                0x107 => {
+                    self.downspread_ctrl = data[0];
                 }
                 _ => {}
             }
@@ -1466,6 +1535,56 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_dp_edid_over_aux_i2c_shape);
+
+    fn smoke_dp_msa_timing_par_ignore_write_and_clear() -> TestResult {
+        let caps = fixture_caps(BW_HBR2, 4);
+        let edid = fixture_edid(148_500, 1920, 1080, b"MSA IGNORE");
+        let mmio = SinkMmio::new(Ddi::B, DpSink::new(caps, edid));
+        // The sink powers up with spread-spectrum on (bit 4) and
+        // MSA-ignore clear: the write is a read-modify-write that
+        // preserves the SSC bit (DP 1.4a §2.5.3; Linux
+        // `DP_DOWNSPREAD_CTRL` 0x107, `DP_MSA_TIMING_PAR_IGNORE_EN`
+        // bit 7).
+        mmio.sink.borrow_mut().downspread_ctrl = 0x10;
+        if set_msa_timing_par_ignore(&mmio, Ddi::B, true).is_err() {
+            return TestResult::Fail("enable write must succeed");
+        }
+        if mmio.sink.borrow().downspread_ctrl != 0x90 {
+            return TestResult::Fail("enable must set bit 7 and keep bit 4 (SSC)");
+        }
+        // Enable is one read + one write on the wire.
+        if mmio.sink.borrow().wire_log.len() != 2 {
+            return TestResult::Fail("enable must be a read-modify-write (2 AUX frames)");
+        }
+        // Re-enabling is a read with no write: the bit is already
+        // in the wanted state, so the byte is left alone.
+        if set_msa_timing_par_ignore(&mmio, Ddi::B, true).is_err() {
+            return TestResult::Fail("re-enable must succeed");
+        }
+        if mmio.sink.borrow().downspread_ctrl != 0x90 {
+            return TestResult::Fail("re-enable must leave the byte alone");
+        }
+        if mmio.sink.borrow().wire_log.len() != 3 {
+            return TestResult::Fail("re-enable must be a read with no write (1 AUX frame)");
+        }
+        // Disable clears only bit 7.
+        if set_msa_timing_par_ignore(&mmio, Ddi::B, false).is_err() {
+            return TestResult::Fail("disable write must succeed");
+        }
+        if mmio.sink.borrow().downspread_ctrl != 0x10 {
+            return TestResult::Fail("disable must clear bit 7 and keep bit 4 (SSC)");
+        }
+        // A NACKed AUX transaction fails instead of programming.
+        mmio.sink.borrow_mut().nack_all = true;
+        if set_msa_timing_par_ignore(&mmio, Ddi::B, true).is_ok() {
+            return TestResult::Fail("a NACKed AUX write must fail");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_dp_msa_timing_par_ignore_write_and_clear
+    );
 
     fn smoke_dp_disconnect_tears_down() -> TestResult {
         let caps = fixture_caps(BW_HBR2, 4);
