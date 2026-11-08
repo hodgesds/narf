@@ -8,16 +8,16 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 
-pub(super) type Cleanup = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub(crate) type Cleanup = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// One owner of the presentation gate, acquired before the first await.
-pub(super) struct Gate {
+pub(crate) struct Gate {
     flag: &'static AtomicBool,
     release: fn(),
     held: bool,
 }
 impl Gate {
-    pub(super) fn claim(flag: &'static AtomicBool, release: fn()) -> Option<Self> {
+    pub(crate) fn claim(flag: &'static AtomicBool, release: fn()) -> Option<Self> {
         flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
         Some(Self {
@@ -27,7 +27,7 @@ impl Gate {
         })
     }
     /// Transfer exclusion to the parked suspend, until its resume finishes.
-    pub(super) fn park(mut self) {
+    pub(crate) fn park(mut self) {
         self.held = false;
     }
 }
@@ -44,13 +44,13 @@ impl Drop for Gate {
 /// a partially completed hardware transaction or a retained owner. The
 /// operation checks `cancelled` before starting, and before parking a
 /// successful suspend; a cancelled suspend rolls back through resume.
-pub(super) struct Retained<F: Future + Send + 'static, C: FnOnce(Cleanup)> {
+pub(crate) struct Retained<F: Future + Send + 'static, C: FnOnce(Cleanup)> {
     future: Option<Pin<Box<F>>>,
     cancelled: Arc<AtomicBool>,
     continue_cancelled: Option<C>,
 }
 impl<F: Future + Send + 'static, C: FnOnce(Cleanup)> Retained<F, C> {
-    pub(super) fn new(future: F, cancelled: Arc<AtomicBool>, continue_cancelled: C) -> Self {
+    pub(crate) fn new(future: F, cancelled: Arc<AtomicBool>, continue_cancelled: C) -> Self {
         Self {
             future: Some(Box::pin(future)),
             cancelled,

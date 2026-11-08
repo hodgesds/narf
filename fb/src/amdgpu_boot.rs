@@ -209,10 +209,36 @@ pub(super) fn start() -> InitResult {
         // native modeset so display-dependent features see its admission;
         // each feature still passes its own gate. `amdgpu.rdna2_pg=none`
         // programs none.
+        //
+        // Runtime PM (`amdgpu.runpm`, GFXOFF autosuspend) arms GFXOFF
+        // through this same application: the first application is the only
+        // one that can start the GFXOFF controller, so the mode is decided
+        // here and the opt-in augmented with it.
+        let runpm = narf_drivers_gpu::amdgpu_navi22_runtime_pm::parse_runpm(
+            narf_boot::args().value("amdgpu.runpm"),
+        );
+        let gfxoff = narf_scheduler::block_on_spin(platform::gfxoff_available());
+        let runtime_mode = narf_drivers_gpu::amdgpu_navi22_runtime_pm::detect_mode(
+            runpm,
+            gfxoff,
+            narf_drivers_gpu::amdgpu_navi22_runtime_pm::Platform::current(),
+        );
         if let Some(value) = options.power_saving {
-            // SAFETY: after a successful firmware run; the TDR sampler takes
-            // GFXOFF references and no other GC MMIO client runs yet.
-            let _ = narf_scheduler::block_on_spin(unsafe { platform::power_saving(value) });
+            if runtime_mode == narf_drivers_gpu::amdgpu_navi22_runtime_pm::Mode::GfxOff {
+                let optin = narf_drivers_gpu::amdgpu_navi22_power_policy::OptIn::parse(Some(value))
+                    .with(
+                        narf_drivers_gpu::amdgpu_navi22_power_policy::Feature::GfxOff,
+                        true,
+                    );
+                // SAFETY: after a successful firmware run; the TDR sampler takes
+                // GFXOFF references and no other GC MMIO client runs yet.
+                let _ =
+                    narf_scheduler::block_on_spin(unsafe { platform::power_saving_optin(optin) });
+            } else {
+                // SAFETY: after a successful firmware run; the TDR sampler takes
+                // GFXOFF references and no other GC MMIO client runs yet.
+                let _ = narf_scheduler::block_on_spin(unsafe { platform::power_saving(value) });
+            }
         }
         // Automatic GPU recovery after a hang (Linux `amdgpu.gpu_recovery`).
         // Kernel CPU writers of the boot framebuffer go behind the console
@@ -227,6 +253,21 @@ pub(super) fn start() -> InitResult {
         // Publish the sysfs power controls (`pp_features`,
         // `power_dpm_force_performance_level`) with the running PMFW mask.
         narf_scheduler::block_on_spin(narf_drivers_gpu::amdgpu_rdna2_power_controls::publish());
+        // S3 through the async system-PM phase (quiesce, save PCI state;
+        // resume rebuilds the owner, as recovery does).
+        // SAFETY: same console hook and user-mapping policy as recovery.
+        unsafe { platform::register_system_pm() };
+        // Runtime PM (`amdgpu.runpm`, GFXOFF autosuspend). A kernel
+        // console drawing into this GPU's VRAM, the boot framebuffer or
+        // the native scanout, keeps it active, as fbcon's lit display
+        // keeps Linux's dGPU awake.
+        let console_on_gpu =
+            !console_off_gpu || narf_boot::args().has_flag("amdgpu.native_display");
+        // SAFETY: the S3 contract above (console hook, user mappings)
+        // covers runtime suspend, which never pauses the console.
+        narf_scheduler::block_on_spin(unsafe {
+            narf_drivers_gpu::amdgpu_navi22_runtime_pm::register(runpm, console_on_gpu)
+        });
     }
     // `amdgpu.dcfeaturemask`: bit 0x400 (Linux's DC_FRL_MASK)
     // enables HDMI FRL when TMDS cannot carry a mode. Decimal or 0x hex.

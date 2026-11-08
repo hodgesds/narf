@@ -2930,7 +2930,8 @@ impl ColdBoot {
 }
 
 /// The explicit `amdgpu.navi22_pg` opt-in (amdgpu_navi22_power_saving).
-/// Never reached on a default boot.
+/// Reached on a default boot: the fb handoff applies the default list
+/// (`BootOptions::power_saving`) after the native modeset.
 impl ColdBoot {
     fn power_saving_parts(
         &mut self,
@@ -3012,6 +3013,19 @@ impl ColdBoot {
     pub(crate) async fn running_features(&mut self) -> Result<u64, Error> {
         let smu = self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)?;
         smu.running_features().await.map_err(Error::Smu)
+    }
+    /// This owner's PCI function and device authority, for runtime-PM
+    /// registration (as `amdgpu_navi48_boot::ColdBoot::pci_function`).
+    pub(crate) fn pci_function(
+        &self,
+    ) -> Option<(
+        narf_bus::BusDevice,
+        narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    )> {
+        Some((
+            crate::amdgpu::pci_device()?,
+            self.sequence.backend.authority,
+        ))
     }
     /// AllowGfxOff/DisallowGfxOff for the GFXOFF controller, refused unless
     /// the opt-in enabled FEATURE_GFXOFF.

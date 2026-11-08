@@ -584,6 +584,466 @@ pub async unsafe fn recover() -> Result<boot::Report, crate::amdgpu_navi22_recov
     result
 }
 
+// ── Suspend / resume (#1760) ────────────────────────────────────────────
+//
+// Runtime suspend keeps the retained owner: the rings drain, the services
+// withdraw and the display stops, the GFXOFF controller (armed by the boot
+// power-saving application) powers GC down, and the PCI layer moves the
+// function to D3hot. Resume re-enables GC for the resume work, restarts
+// the services and relights the display. IH is never disabled on this
+// path — `Ih::disable` leaves the ring quarantined with no re-arm — so
+// there is no owner rebuild to pay for.
+//
+// System (S3) suspend goes through the recovery shape instead: the
+// console pauses and IH is disabled, and resume rebuilds the owner with
+// `into_recovery`, as recovery does. That rebuild needs a recoverable
+// owner, and a trained GDDR6 owner is not one (`ColdBoot::recoverable`:
+// GDDR6 retention/replay is not wired), so S3 refuses on trained
+// hardware rather than suspending into a lost device. Runtime suspend has
+// no such gate: the retained owner is all it needs.
+//
+// D3hot may reset engine registers (IH ring pointers, queue doorbells)
+// that only a fresh owner re-initializes; if the hardware run shows lost
+// interrupts or stalled rings after a runtime resume, the resume must
+// rebuild the owner — which needs GDDR6 retention first.
+
+/// How long suspend waits for submitted jobs (the GFX job timeout).
+const RING_DRAIN_MS: u64 = 10_000;
+
+/// Whether every ring's submitted jobs completed within `ms`, polling the
+/// fence progress each millisecond. True without queues; false when the
+/// owner is gone or not firmware-ready (suspend refuses).
+async fn rings_idle(ms: u64) -> bool {
+    let deadline = narf_time::Deadline::after_ms(ms);
+    loop {
+        match queue_progress().await {
+            Ok(samples) => {
+                if samples
+                    .iter()
+                    .all(|p| crate::amdgpu_fence_navi22::signaled(p.signaled, p.emitted))
+                {
+                    return true;
+                }
+            }
+            Err(_) => return false,
+        }
+        if deadline.expired() {
+            return false;
+        }
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+    }
+}
+
+/// A withdrawn owner between quiesce and resume.
+struct Suspended {
+    /// IH endpoints collected at quiesce; closed with DeviceLost if the
+    /// resume fails (the ring is quarantined on success, as in recovery).
+    interrupts: alloc::vec::Vec<crate::amdgpu_ih_navi22::Handle>,
+    /// Runtime (GFXOFF + D3hot, retained owner) vs system (S3, rebuilt owner).
+    runtime: bool,
+}
+static SUSPENDED: narf_lib::sync::IrqSafeSpinLock<Option<Suspended>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The running owner's PCI function and device authority.
+pub(crate) async fn pci_function() -> Option<(
+    narf_bus::BusDevice,
+    narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+)> {
+    OWNER.lock().await.as_ref()?.pci_function()
+}
+
+/// Whether PMFW's running feature mask carries `FEATURE_GFXOFF`: the
+/// chip/PMFW can gate GC, as `EnableAllSmuFeatures` enables it at SMU
+/// init. The capability signal for `amdgpu_navi22_runtime_pm::detect_mode`.
+pub async fn gfxoff_available() -> bool {
+    running_features()
+        .await
+        .is_ok_and(|mask| mask & crate::amdgpu_navi22_power_policy::SMU_GFXOFF != 0)
+}
+
+/// Whether the boot power-saving application admitted GFXOFF: the SMU bit
+/// is enabled and the GFXOFF controller runs. Checked by
+/// `amdgpu_navi22_runtime_pm::register` before it registers the PCI device.
+pub async fn gfxoff_armed() -> bool {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .and_then(|boot| boot.power_saving())
+        .is_some_and(|applied| applied.plan.policy.gfxoff())
+}
+
+/// Whether the native display stack is up (so the runtime-PM `CONNECTED`
+/// state is published rather than scanned): display engines were
+/// requested and a modeset state is retained.
+pub(crate) fn native_display_running() -> bool {
+    display_engines_requested() && modeset_state().is_some()
+}
+
+/// Discover board sinks for runtime suspend (`None`: no display information).
+pub(crate) async fn scan_connected() -> Option<bool> {
+    let reports = detect_displays().await.ok()?;
+    Some(reports.iter().any(|r| {
+        matches!(
+            r.detection,
+            crate::amdgpu_navi22_display::Detection::Connected(_)
+        )
+    }))
+}
+
+/// The S3 and runtime suspend shared by [`prepare_suspend`] and
+/// [`runtime_suspend`]; `runtime` selects the retained-owner form.
+/// Cancellation rolls the card back through [`resume_gated`], as
+/// `amdgpu_navi48_platform::suspend_device` does.
+///
+/// # Safety
+/// As [`prepare_suspend`].
+async unsafe fn suspend_device(
+    runtime: bool,
+    reference: Option<SystemPmReference>,
+) -> Result<(), boot::Error> {
+    let cancelled = alloc::sync::Arc::new(AtomicBool::new(false));
+    let observe = cancelled.clone();
+    let operation = async move {
+        let _transition = RECOVERY.lock().await;
+        if observe.load(Ordering::Acquire) {
+            return Err(boot::Error::Busy);
+        }
+        // SAFETY: the caller transfers its exclusions to the retained
+        // operation; cancellation requests rollback without cancelling MMIO.
+        let result = unsafe { suspend_gated(runtime) }.await;
+        if result.is_ok() {
+            if observe.load(Ordering::Acquire) {
+                // Resume now owns the parked device. Do not let this guard's
+                // later Drop clear a newer transition's state after resume
+                // has restored the card.
+                if let Some(reference) = reference {
+                    reference.park();
+                }
+                // SAFETY: this operation parked the device; the system has
+                // not entered S3/D3.
+                let _ = unsafe { resume_gated(runtime) }.await;
+            } else if let Some(reference) = reference {
+                reference.park();
+            }
+        }
+        result
+    };
+    crate::suspend_transition::Retained::new(operation, cancelled, |cleanup| {
+        narf_scheduler::spawn(cleanup);
+    })
+    .await
+}
+
+/// `suspend_device` with the rings drained and the services withdrawn.
+///
+/// # Safety
+/// As [`prepare_suspend`].
+async unsafe fn suspend_gated(runtime: bool) -> Result<(), boot::Error> {
+    if SUSPENDED.lock().is_some() {
+        return Err(boot::Error::Busy);
+    }
+    if !runtime {
+        // Refuse before touching hardware state: a trained owner cannot be
+        // rebuilt (see `ColdBoot::recoverable`), so an S3 resume could not
+        // restore it.
+        let owner = OWNER.lock().await;
+        if owner.as_ref().is_none_or(|boot| !boot.recoverable()) {
+            return Err(boot::Error::Busy);
+        }
+    }
+    // New submissions must stop before the drain means anything; the drain
+    // samples fences, so a job submitted after it would be cancelled by
+    // the unregister instead of awaited. The window is one poll period.
+    if !rings_idle(RING_DRAIN_MS).await {
+        return Err(boot::Error::Busy);
+    }
+    if !runtime {
+        console(true);
+    }
+    crate::amdgpu_navi22_cs::unregister();
+    crate::amdgpu_rdna2_power_controls::withdraw();
+    crate::amdgpu_vcn_navi22::idle::stop();
+    crate::amdgpu_navi22_tdr::stop();
+    crate::amdgpu_navi22_thermal::stop();
+    crate::amdgpu_navi22_power::stop(None);
+    let interrupts = {
+        let mut owner = OWNER.lock().await;
+        let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+        withdraw_for_reset(boot).await;
+        let mut interrupts = alloc::vec::Vec::new();
+        if let Some(ih) = boot.interrupts() {
+            interrupts.push(ih);
+        }
+        if !runtime {
+            // SAFETY: the caller accepted the whole-device contract; S3
+            // discards PMFW's GFXOFF state, as a reset does.
+            unsafe { boot.quiesce_for_reset() }.await?;
+        }
+        interrupts
+    };
+    // Jobs submitted between the drain sample and the unregister above are
+    // cancelled rather than hung: the submitter is gone and nothing will
+    // signal their fences.
+    crate::amdgpu_fence_navi22::abandon_all();
+    *SUSPENDED.lock() = Some(Suspended {
+        interrupts,
+        runtime,
+    });
+    Ok(())
+}
+
+/// Linux `amdgpu_pmops_runtime_suspend` for GFXOFF after the runtime-PM
+/// checks: drain the rings (amdgpu_fence_wait_empty, bounded here), then
+/// quiesce the services and withdraw the display without pausing the
+/// console, and park. The GFXOFF controller — armed by the boot
+/// power-saving application — powers GC down once its references drain;
+/// the PCI layer then saves config state and moves the function to D3hot.
+/// A drain timeout is `Busy` with the device running. After success only
+/// [`runtime_resume`] may touch the card.
+///
+/// # Safety
+/// As [`prepare_suspend`]. The caller (runtime PM) proved no display is lit
+/// and holds no console writer on this GPU's VRAM.
+pub async unsafe fn runtime_suspend() -> Result<(), boot::Error> {
+    // SAFETY: forwarded contract.
+    unsafe { suspend_device(true, None) }.await
+}
+
+/// S3 through the async system-PM phase: drain, quiesce and park (see
+/// [`runtime_suspend`]), pausing the console and disabling IH as recovery
+/// does. Refuses on a trained owner: without GDDR6 retention the resume
+/// could not rebuild it (see `ColdBoot::recoverable`).
+///
+/// # Safety
+/// As [`recover`]: no external CPU mapping user, PCI or firmware owner may
+/// touch the card until resume. Runs from the async system-PM prepare phase.
+/// After cancellation the same exclusions persist while executor cleanup
+/// completes; a failed resume retains the device's quarantine.
+pub async unsafe fn prepare_suspend() -> Result<(), boot::Error> {
+    // SAFETY: forwarded contract.
+    unsafe { suspend_device(false, None) }.await
+}
+
+/// Rebuild or restart the parked owner. Runtime resume keeps the retained
+/// owner (IH was never disabled); system resume rebuilds it, as recovery
+/// does. A failure is terminal, as a failed recovery.
+///
+/// # Safety
+/// As [`prepare_suspend`]; the parked suspend came from [`suspend_device`].
+pub async unsafe fn resume_from_suspend() -> Result<(), boot::Error> {
+    // SAFETY: forwarded contract.
+    unsafe { resume_device(false) }.await
+}
+
+/// Linux `amdgpu_pmops_runtime_resume` for GFXOFF, after the PCI layer
+/// restored D0 and the config header: restart the services and relight
+/// the display on the retained owner.
+///
+/// # Safety
+/// As [`resume_from_suspend`]; the parked suspend came from
+/// [`runtime_suspend`].
+pub async unsafe fn runtime_resume() -> Result<(), boot::Error> {
+    // SAFETY: forwarded contract.
+    unsafe { resume_device(true) }.await
+}
+
+async unsafe fn resume_device(runtime: bool) -> Result<(), boot::Error> {
+    let operation = async move {
+        let _transition = RECOVERY.lock().await;
+        // SAFETY: resume's caller transfers its exclusions to the retained
+        // operation, so dropping the wait cannot drop the hardware owner.
+        unsafe { resume_gated(runtime) }.await
+    };
+    crate::suspend_transition::Retained::new(
+        operation,
+        alloc::sync::Arc::new(AtomicBool::new(false)),
+        |cleanup| {
+            narf_scheduler::spawn(cleanup);
+        },
+    )
+    .await
+}
+
+/// Resume while the retained operation holds RECOVERY.
+async unsafe fn resume_gated(runtime: bool) -> Result<(), boot::Error> {
+    let mut suspended = {
+        let mut parked = SUSPENDED.lock();
+        if parked.as_ref().is_none_or(|s| s.runtime != runtime) {
+            return Err(boot::Error::Busy);
+        }
+        parked.take().unwrap()
+    };
+    // SAFETY: parked by `suspend_device` with the matching flavor.
+    let result = if runtime {
+        // SAFETY: the parked state was written by `runtime_suspend`
+        // (matching flavor checked above); the retained operation holds
+        // RECOVERY for the whole resume.
+        unsafe { resume_retained() }.await
+    } else {
+        // SAFETY: the parked state was written by `prepare_suspend`
+        // (matching flavor checked above); the retained operation holds
+        // RECOVERY for the whole resume.
+        unsafe { resume_rebuilt(&mut suspended) }.await
+    };
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi22 {}resume {:?}",
+        if runtime { "runtime " } else { "" },
+        result.as_ref().map(|_| ())
+    );
+    if result.is_err() {
+        lose_suspended(&mut suspended);
+    } else if !runtime {
+        // A lost device keeps the console quarantined, as a failed recovery does.
+        console(false);
+    }
+    result
+}
+
+/// Restart the retained owner: GC stays powered for the resume work, then
+/// gates again when idle; the reference is inert while GFXOFF is off.
+///
+/// # Safety
+/// Parked by [`runtime_suspend`].
+async unsafe fn resume_retained() -> Result<(), boot::Error> {
+    // Must not be awaited while holding the platform owner lock.
+    let _gc = crate::amdgpu_navi22_gfxoff::Reference::acquire().await.ok();
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+    start_services(boot).await;
+    relight_after_recovery();
+    // The boot power-saving application was never removed (suspend does
+    // not undo it), so nothing is re-applied here: a remove would stop
+    // the GFXOFF controller for the rest of the boot.
+    Ok(())
+}
+
+/// Rebuild the owner, as recovery does: mode1 reset, fresh owner, full
+/// bring-up, then services and the display. VRAM contents are lost, as in
+/// recovery (user mappings are not revoked).
+///
+/// # Safety
+/// Parked by [`prepare_suspend`].
+async unsafe fn resume_rebuilt(suspended: &mut Suspended) -> Result<(), boot::Error> {
+    let device = amdgpu::pci_device().ok_or(boot::Error::Busy)?;
+    let mut owner = OWNER.lock().await;
+    let old = owner.take().ok_or(boot::Error::Invalid)?;
+    // SAFETY: quiesce completed; probe's PCI function for this GPU.
+    let new = match unsafe { old.into_recovery(device) } {
+        Ok(new) => new,
+        Err(error) => return Err(error),
+    };
+    if let Some(ih) = new.interrupts() {
+        suspended.interrupts.push(ih);
+    }
+    // Retained before running, so cancellation keeps the new owner.
+    let boot = owner.insert(new);
+    boot.run().await?;
+    start_services(boot).await;
+    relight_after_recovery();
+    drop(owner);
+    // Best effort, as in `resume_retained`.
+    // SAFETY: `boot.run()` succeeded above, so the boot published these
+    // controls; `start_services` started the GC MMIO clients (CS/TDR),
+    // which take a GFXOFF reference; the OWNER lock was dropped just
+    // above and this task holds no lock the platform takes.
+    if let Err(error) = unsafe { replace_power_saving(requested_power_saving()) }.await {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: navi22 resume: power saving not re-applied: {error:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A failed resume loses the device, as a failed recovery does.
+fn lose_suspended(suspended: &mut Suspended) {
+    crate::amdgpu_vcn_navi22::idle::stop();
+    crate::amdgpu_navi22_gfxoff::device_lost();
+    crate::amdgpu_navi22_cs::abandon(narf_filesystem::FsError::NoDevice);
+    crate::amdgpu_navi22_tdr::stop();
+    crate::amdgpu_navi22_thermal::stop();
+    crate::amdgpu_navi22_power::stop(Some(crate::amdgpu_smu_navi22::Error::DeviceGone));
+    crate::amdgpu_fence_navi22::abandon_all();
+    for ih in &suspended.interrupts {
+        ih.close(crate::amdgpu_ih_navi22::Closed::DeviceLost);
+    }
+    suspended.interrupts.clear();
+}
+
+/// device_prepare's reference follows its retained suspend through a
+/// cancellation rollback. Only an accepted suspend hands it to resume.
+struct SystemPmReference {
+    held: bool,
+}
+impl SystemPmReference {
+    fn park(mut self) {
+        self.held = false;
+    }
+}
+impl Drop for SystemPmReference {
+    fn drop(&mut self) {
+        if self.held {
+            crate::amdgpu_navi22_runtime_pm::system_complete();
+        }
+    }
+}
+
+struct SystemPm;
+impl narf_power::system_pm::AsyncSystemPm for SystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            // device_prepare: a runtime-PM reference for the transition,
+            // resuming a runtime-suspended card first (pci_pm_prepare).
+            let reference = SystemPmReference { held: true };
+            crate::amdgpu_navi22_runtime_pm::system_prepare().await;
+            // SAFETY: register_system_pm's caller accepted the contract.
+            unsafe { suspend_device(false, Some(reference)) }
+                .await
+                .map_err(|_| narf_power::device_pm::DeviceSuspendError::Busy)
+        })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            let reference = SystemPmReference { held: true };
+            // SAFETY: as above.
+            // Retain device_complete together with resume: cancellation
+            // cannot release its reference before the hardware is restored.
+            let operation = async move {
+                let _reference = reference;
+                // SAFETY: register_system_pm accepted resume's exclusions;
+                // the retained operation keeps them through cancellation.
+                unsafe { resume_from_suspend() }
+                    .await
+                    .map_err(|_| narf_power::device_pm::DeviceSuspendError::DriverError)
+            };
+            crate::suspend_transition::Retained::new(
+                operation,
+                alloc::sync::Arc::new(AtomicBool::new(false)),
+                |cleanup| {
+                    narf_scheduler::spawn(cleanup);
+                },
+            )
+            .await
+        })
+    }
+}
+
+/// Register Navi22 S3 with the async system-PM phase.
+///
+/// # Safety
+/// The caller accepts [`prepare_suspend`]'s contract for every user, as
+/// [`set_automatic_recovery`] does for recovery.
+pub unsafe fn register_system_pm() {
+    narf_power::system_pm::register_async_system_pm(
+        "amdgpu-navi22",
+        alloc::sync::Arc::new(SystemPm),
+    );
+}
+
 /// ReenableAcDcInterrupt through the retained SMU owner.
 pub(crate) async fn reenable_acdc() -> Result<(), crate::amdgpu_smu_navi22::Error> {
     let mut owner = OWNER.lock().await;
@@ -2844,6 +3304,24 @@ pub async unsafe fn power_saving(
             narf_console::Writer,
             "amdgpu: navi22 power saving: unrecognised amdgpu.rdna2_pg={value}; nothing enabled"
         );
+        return Err(boot::Error::Invalid);
+    }
+    // SAFETY: forwarded caller contract.
+    unsafe { apply_optin(optin) }.await
+}
+
+/// Apply the power-saving opt-in (see [`power_saving`]) without parsing
+/// a `amdgpu.rdna2_pg=` value: the fb handoff's single application, which
+/// the runtime-PM mode decision augments with GFXOFF before the first
+/// application (a stopped GFXOFF controller never restarts, so the
+/// arming cannot be a later re-application).
+///
+/// # Safety
+/// As [`power_saving`].
+pub async unsafe fn power_saving_optin(
+    optin: crate::amdgpu_navi22_power_policy::OptIn,
+) -> Result<crate::amdgpu_navi22_power_saving::Applied, boot::Error> {
+    if optin.is_empty() {
         return Err(boot::Error::Invalid);
     }
     // SAFETY: forwarded caller contract.

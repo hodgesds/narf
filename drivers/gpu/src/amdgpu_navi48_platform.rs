@@ -3,6 +3,7 @@
 use crate::amdgpu_dcn401_dml as dml;
 use crate::amdgpu_dcn401_otg::SurfaceFormat;
 use crate::amdgpu_navi48_display as display;
+use crate::suspend_transition;
 use crate::{amdgpu, amdgpu_navi48_boot as boot, amdgpu_vram_boot as vram};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -22,8 +23,6 @@ mod gangs;
 mod idle;
 #[path = "amdgpu_navi48_platform_media.rs"]
 mod media_clients;
-#[path = "amdgpu_navi48_suspend_transition.rs"]
-mod suspend_transition;
 #[path = "amdgpu_navi48_platform_transfer.rs"]
 mod transfer;
 pub(crate) fn media_idle_reader(jpeg: bool) -> bool {
