@@ -487,17 +487,46 @@ pub(crate) fn lri(regs: &[(u32, u32)]) -> Vec<u32> {
     words
 }
 /// One privileged kernel ring job of a configuration. Only this module
-/// builds jobs, from registry-validated register addresses.
+/// builds jobs, from registry-validated register addresses. A per-context
+/// job (from `per_context_job`) programs the bound exec queue's context —
+/// OACTXCONTROL, OAR/OAC_OACONTROL and RING_CONTEXT_CONTROL — and must
+/// retire on that queue through `submit_trusted_on_user_context`, never on
+/// the kernel ring: the RING_CONTEXT_CONTROL write is per-context saved
+/// state, so retiring it on a fresh kernel context programs the wrong
+/// context. Configuration jobs are not per-context and retire on the
+/// kernel ring through `submit_commands`.
 #[derive(Debug)]
-pub struct Job(Vec<u32>);
+pub struct Job {
+    words: Vec<u32>,
+    per_context: bool,
+}
 impl Job {
     pub(crate) fn words(&self) -> &[u32] {
-        &self.0
+        &self.words
+    }
+
+    /// Whether this job programs the bound exec queue's context and must
+    /// retire on that queue.
+    pub(crate) fn per_context(&self) -> bool {
+        self.per_context
+    }
+
+    /// A per-context job from source registers and values.
+    fn for_context(words: Vec<u32>) -> Self {
+        Self {
+            words,
+            per_context: true,
+        }
     }
 }
 /// The ordered kernel ring jobs for one configuration.
 pub(crate) fn config_jobs(regs: &[(u32, u32)]) -> Vec<Job> {
-    regs.chunks(LRI_JOB).map(|regs| Job(lri(regs))).collect()
+    regs.chunks(LRI_JOB)
+        .map(|regs| Job {
+            words: lri(regs),
+            per_context: false,
+        })
+        .collect()
 }
 
 /// xe_oa_configure_oar_context / xe_oa_configure_oac_context: the three
@@ -507,19 +536,16 @@ pub(crate) fn config_jobs(regs: &[(u32, u32)]) -> Vec<Job> {
 /// not format kind, as in Linux: Render writes OAR_OACONTROL, Compute
 /// writes OAC_OACONTROL with CTX_CTRL_RUN_ALONE.
 ///
-/// NOTE: the job retires through the same kernel-ring path as
-/// configuration jobs, on a fresh kernel context (Linux submits its LRI on
-/// `stream->exec_q`; NARF has no submit-trusted-words-on-user-context
-/// entry point yet). The OAR/OAC_OACONTROL writes name fixed unit
-/// addresses and land regardless of context. The RING_CONTEXT_CONTROL
-/// write does NOT reach the bound queue: that register is per-context
-/// saved state (`xe_lrc.c::reg_offsets`, `intel_gpu_engine::xcs_image`),
-/// and the kernel-ring job runs on the kernel context, not the bound
-/// queue. Whether OACTXCONTROL is context-saved is UNVERIFIED in-tree
-/// (it is absent from `reg_offsets`), so its effect through this path is
-/// unknown. Closing the gap needs a trusted-submit-on-user-context entry
-/// point; until then the job is built, validated and sequenced, but its
-/// per-context effect on silicon is UNVERIFIED.
+/// NOTE: the job is tagged per-context and `Gt::submit_oa_job` routes it
+/// through `scheduler.submit_trusted_on_user_context`, so it retires on
+/// the bound exec queue's context (Linux submits its LRI on
+/// `stream->exec_q`), and the RING_CONTEXT_CONTROL write reaches that
+/// queue's saved state: that register is per-context saved state
+/// (`xe_lrc.c::reg_offsets`, `intel_gpu_engine::xcs_image`). The
+/// OAR/OAC_OACONTROL writes name fixed unit addresses and land regardless
+/// of context. Whether OACTXCONTROL is context-saved is UNVERIFIED
+/// in-tree (it is absent from `reg_offsets`), so its effect through this
+/// path is unknown; this path does not depend on it.
 /// The two-word head of the owned breadcrumb MI_FLUSH_DW that every
 /// `resident_ring` job ends with (also the marker the user-fence splice
 /// in `intel_gpu_guc_sched::submit_inner` searches for). The per-batch
@@ -640,7 +666,6 @@ pub(crate) fn splice_query(words: &mut Vec<u32>, sampler: &QuerySampler) -> bool
     words.splice(at..at, query);
     true
 }
-
 fn per_context_job(session: &Session, enable: bool) -> Option<Job> {
     session.exec_queue?;
     let base = session.hwe.base();
@@ -664,8 +689,7 @@ fn per_context_job(session: &Session, enable: bool) -> Option<Job> {
             masked(ctx_bits, if enable { ctx_bits } else { 0 }),
         ),
     ];
-    let mut jobs = config_jobs(&regs);
-    jobs.pop()
+    Some(Job::for_context(lri(&regs)))
 }
 
 /// struct xe_oa_config: immutable uuid and validated register list.
@@ -1796,7 +1820,10 @@ impl Session {
     /// Retain-and-validate the exec queue at enable time (Linux keeps
     /// `stream->exec_q` for the config batches): the binding must still be
     /// alive and bound to this session's engine, else the queue is gone.
-    fn validate_binding(&self) -> Result<(), FsError> {
+    /// `Gt::submit_oa_job` calls this again at submit time, so a queue
+    /// that died between `begin` and the submit fails clean instead of
+    /// retiring a per-context job on a gone queue.
+    pub(crate) fn validate_binding(&self) -> Result<(), FsError> {
         let Some(id) = self.exec_queue else {
             return Ok(());
         };

@@ -1073,13 +1073,18 @@ OACONTROL programming in `finish`, and on DISABLE it retires before the
 global disable. Compute additionally selects its CCS in OAG OACONTROL
 before the job retires. A DISABLE with a gone queue skips the job and
 still runs the global disable; teardown retires no LRI disable. The job
-retires on the kernel ring, on a fresh kernel context, not on the bound
-exec queue itself: the fixed-address OAR/OAC_OACONTROL writes land, but
-the RING_CONTEXT_CONTROL write programs the kernel context, not the
-bound queue's saved state (that register is per-context saved state),
-and OACTXCONTROL's effect through this path is unverified. A
-trusted-submit-on-user-context entry point is the follow-up that closes
-the gap.
+retires on the bound exec queue itself through the scheduler's
+`submit_trusted_on_user_context` entry point, which claims the queue's
+`UserContext` and submits the trusted LRI words as a prefix-only job on
+that context (width-one contexts only; parallel contexts are refused).
+`Gt::submit_oa_job` re-validates the binding at submit time, so a queue
+that died between `begin` and the submit fails with ENOENT instead of
+retiring on a gone queue, and a per-context job never falls back to the
+kernel ring. The fixed-address OAR/OAC_OACONTROL writes land regardless
+of context, and the RING_CONTEXT_CONTROL write reaches the bound queue's
+saved state (that register is per-context saved state); OACTXCONTROL's
+effect through this path is unverified (whether it is context-saved is
+unverified in-tree).
 
 Stream descriptors are read-only and take ioctls 0x6900..0x6904
 (ENABLE/DISABLE/CONFIG/STATUS/INFO); anything else is EINVAL. Reads copy
@@ -1619,6 +1624,8 @@ PPGTT/CPU mappings. Hardware command privilege checking and the reverified RCS
 register whitelist apply throughout nested batches and concurrent CPU changes
 to leaf BOs. Leaf mappings are untrusted; no software opcode whitelist or GPU
 NX bit is claimed. Secure dispatch is always refused.
+
+`GuCScheduler::submit_trusted_on_user_context` is the trusted-words-on-user-context entry point: it claims a bound `UserContext` and submits trusted MI_LRI words as a prefix-only job on that context, so per-context OA programming retires on the bound exec queue (Linux submits its LRI on `stream->exec_q`). The words carry the same trust contract as `submit_commands` — they must not alter GGTT or PPGTT page tables, rings, access policy, another context's saved state, or completion evidence — and the caller must have validated the binding first. Width-one contexts only; parallel contexts are refused, since prefix-only submissions cannot serve parallel lanes. `Gt::submit_oa_job` routes per-context OA jobs (`Job::per_context`) through this entry point and re-validates the binding at submit time, so a queue that died between `begin` and the submit fails with ENOENT instead of retiring on a gone queue; a per-context job never falls back to the kernel ring. Configuration jobs keep the kernel-ring path through `submit_commands`.
 
 `UserContext` retains a private saved LRC body between jobs, sized and
 header-checked for its engine (copy: one engine-state page; gen12_xcs layout

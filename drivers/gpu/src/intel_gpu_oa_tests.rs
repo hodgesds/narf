@@ -2175,12 +2175,16 @@ fn smoke_oa_per_context_lri_batch_contents() -> TestResult {
         session.queue_binding().unwrap().context.engine(),
         Engine::Rcs0
     );
+    let enable = per_context_job(&session, true).unwrap();
+    assert!(enable.per_context());
     assert_eq!(
-        per_context_job(&session, true).unwrap().words(),
+        enable.words(),
         &[0x1100_0005, 0x2360, 1, 0x2960, 0xb, 0x2244, 0x0100_0100][..]
     );
+    let disable = per_context_job(&session, false).unwrap();
+    assert!(disable.per_context());
     assert_eq!(
-        per_context_job(&session, false).unwrap().words(),
+        disable.words(),
         &[0x1100_0005, 0x2360, 0, 0x2960, 0xa, 0x2244, 0x0100_0000][..]
     );
     drop(session);
@@ -2189,15 +2193,22 @@ fn smoke_oa_per_context_lri_batch_contents() -> TestResult {
     // Compute adds CTX_CTRL_RUN_ALONE to the context-control mask.
     let session = test_session_exec(dev, 6, DEFAULT_BUFFER, Engine::Ccs0, 11, alive.clone());
     assert!(session.programs_per_context());
+    let enable = per_context_job(&session, true).unwrap();
+    assert!(enable.per_context());
     assert_eq!(
-        per_context_job(&session, true).unwrap().words(),
+        enable.words(),
         &[0x1100_0005, 0x1a360, 1, 0x15114, 3, 0x1a244, 0x0180_0180][..]
     );
+    let disable = per_context_job(&session, false).unwrap();
+    assert!(disable.per_context());
     assert_eq!(
-        per_context_job(&session, false).unwrap().words(),
+        disable.words(),
         &[0x1100_0005, 0x1a360, 0, 0x15114, 2, 0x1a244, 0x0180_0000][..]
     );
     drop(session);
+
+    // Configuration jobs are not per-context: they retire on the kernel ring.
+    assert!(!config_jobs(&[(0x9888, 1)])[0].per_context());
 
     // No exec queue, or a video engine, programs nothing.
     let session = test_session(dev, 4, DEFAULT_BUFFER, None, &[(0x9888, 1)]);

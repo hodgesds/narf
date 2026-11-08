@@ -1118,6 +1118,60 @@ impl<A: BootAllocator> GuCScheduler<A> {
         self.submit(now, engine, None, Some(words.to_vec()))
     }
 
+    /// Submit trusted LRI words on a bound user context, for per-context
+    /// OA programming (see `intel_gpu_oa::per_context_job`).
+    ///
+    /// # Safety
+    ///
+    /// `words` must be trusted MI_LRI groups that cannot alter GGTT or
+    /// PPGTT page tables, rings, access policy, another context's saved
+    /// state, or completion evidence: they program the bound context's own
+    /// live OA state (OACTXCONTROL, OAR/OAC_OACONTROL) plus its
+    /// per-context saved RING_CONTEXT_CONTROL — the same contract as
+    /// `submit_commands`, except the words run on `context`'s claimed
+    /// context, not on a fresh kernel context. The caller must have
+    /// validated the binding (the queue is alive and bound to this
+    /// engine) before calling.
+    ///
+    /// The context must be width one: prefix-only submissions cannot
+    /// serve parallel lanes (`parallel::prepare` needs a resident batch
+    /// and a user claim for width > 1).
+    pub(crate) unsafe fn submit_trusted_on_user_context(
+        &mut self,
+        now: u64,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        words: &[u32],
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.admit()?;
+        if words.is_empty() {
+            return Err(SchedulingError::Address);
+        }
+        let Some(epoch) = self.user_epoch() else {
+            return Err(SchedulingError::State);
+        };
+        let engine = context.engine();
+        let placements = context.placements();
+        // GSCCS0 is reserved for the kernel (xe_hw_engine_is_reserved).
+        if engine.reserved() || placements.iter().any(Engine::reserved) {
+            return Err(SchedulingError::State);
+        }
+        if context.parallel().is_some() {
+            return Err(SchedulingError::State);
+        }
+        if self.engines.logical_mask(placements).is_none()
+            || placements.iter().any(|candidate| {
+                candidate.lrc_pages(self.platform) != engine.lrc_pages(self.platform)
+            })
+        {
+            return Err(SchedulingError::State);
+        }
+        let claim = context
+            .claim(epoch, engine.lrc_pages(self.platform))
+            .map_err(SchedulingError::Residency)?;
+        self.user_submitted = true;
+        self.submit_inner(now, engine, None, Some(words.to_vec()), Some(claim), None)
+    }
+
     fn submit(
         &mut self,
         now: u64,

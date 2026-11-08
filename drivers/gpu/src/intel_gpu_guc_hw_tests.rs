@@ -1788,6 +1788,13 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     if image.borrow()[1024 + 0x33] != 0 {
                         execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, stamp, base, false);
                     } else if tail != 32 {
+                        // Hardware context-save for RING_CONTEXT_CONTROL, the
+                        // image's first group address (`first`, engine base
+                        // + 0x244): snapshot the live value before the ring
+                        // runs, and copy it back into the image's value slot
+                        // below only if the ring changed it. Other
+                        // context-saved registers are not modeled.
+                        let rcc_before = d.regs.get(&u64::from(first)).copied();
                         let (svg, used) =
                             crate::intel_gpu_context::tests::execute(&ring[1..], &mut d.regs);
                         // A privileged OA configuration job: LRI groups to
@@ -1798,7 +1805,15 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                                 ((gmd >> 22) * 100 + ((gmd >> 14) & 255)) as u16,
                                 ring[2],
                             );
-                        if oa {
+                        // A per-context OA job is likewise LRI-only: its
+                        // three pairs name OACTXCONTROL, OAR/OAC_OACONTROL
+                        // and RING_CONTEXT_CONTROL, in that order — header
+                        // 0x1100_0005 (MI_LOAD_REGISTER_IMM for 3 registers)
+                        // and the third pair's address is `first` — so it
+                        // carries no state commands either.
+                        let per_context =
+                            ring.len() > 6 && ring[1] == 0x1100_0005 && ring[6] == first;
+                        if oa || per_context {
                             assert!(svg.is_empty(), "OA jobs carry no state commands");
                         } else if gen12 || ptl {
                             // Source Wa14019789679 ends at graphics20.04;
@@ -1817,6 +1832,14 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         }
                         assert_eq!(ring[0], 0x04000001);
                         assert_eq!(ring[used + 1] & 0xfffffdff, 0x7a000004);
+                        // Context-save: the ring ran on this context, so a
+                        // RING_CONTEXT_CONTROL write it made reaches the
+                        // image's value slot (image word 1027), which
+                        // `ContextClaim::restore` copies into the next image
+                        // and `UserJob::capture` persists as saved state.
+                        if d.regs.get(&u64::from(first)).copied() != rcc_before {
+                            image.borrow_mut()[1027] = d.regs[&u64::from(first)];
+                        }
                         // Opaque device-saved state, outside the hand-written
                         // register restore groups. The driver must copy it.
                         image.borrow_mut()[0x2000 / 4] = 0xc01dcafe;
@@ -1831,7 +1854,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         }];
                         // Fixture-only opaque save area, not a claimed hardware
                         // SVG layout. Capture proves every header reaches clones.
-                        if !gen12 && !ptl && !oa {
+                        if !gen12 && !ptl && !oa && !per_context {
                             image.borrow_mut()[0x2100 / 4..0x2100 / 4 + 50].copy_from_slice(&svg);
                         }
                     } else {

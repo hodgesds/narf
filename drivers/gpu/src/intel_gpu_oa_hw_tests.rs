@@ -169,3 +169,146 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_hardware_bmg_reservation_ring_job_read_and_reset_retirement
 );
+
+fn smoke_oa_per_context_job_executes_on_bound_queue_and_saves_state() -> TestResult {
+    let (io, arena) = model();
+    io.0.borrow_mut().regs.extend([
+        (0xdfc, 0),
+        (0xa188, 2),
+        (0xa278, 2),
+        (0xd84, 0),
+        (0xfd0, 1),
+        (0x913c, 5),
+        (0x9144, 6),
+        (0x9134, 5),
+        (0x9114, 0x10),
+        (0x9118, 1),
+        (0x138000, (18 << 16) | 180),
+        (0x13800c, 90),
+        (0x145998, (6 << 16) | 60),
+        (0x145ef0, 30 << 8),
+        (0xd8c, (20 << 22) | (1 << 14)),
+    ]);
+    let boot = GuCBoot::stage_image(
+        io.clone(),
+        arena.clone(),
+        GtPlatform::Battlemage,
+        CssImage::parse(&image(), 70).unwrap(),
+        BootConfig {
+            device_id: 0xe20b,
+            revision: 3,
+            huc_upload_bytes: 0,
+            uncached_mocs: Some(3),
+        },
+    )
+    .unwrap();
+    let mut gt = GuCGt::from_staged_hardware(boot).unwrap();
+    hardware_discovery(&mut gt, &io, 0xdfc);
+    hardware_scheduling(&mut gt, &io);
+    let completion = gt.begin_context_defaults(26).unwrap();
+    let mut registered = BTreeMap::new();
+    for now in 27..300 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        if completion.result().is_some() {
+            break;
+        }
+        service_contexts(&io, &mut registered, true);
+    }
+    assert_eq!(completion.result(), Some(Ok(())));
+    assert!(gt.user_epoch().is_some() && gt.idle());
+    let facts = gt.device_facts().unwrap();
+    let device = gt.oa_device(48, &facts).unwrap();
+
+    // A bound Rcs0 queue 10 whose liveness the test controls, so the stale
+    // path below can kill it between `begin` and the submit.
+    let alive_flag = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
+    let alive: alloc::sync::Arc<dyn Fn() -> bool + Send + Sync> = {
+        let flag = alive_flag.clone();
+        alloc::sync::Arc::new(move || flag.load(core::sync::atomic::Ordering::Relaxed))
+    };
+    // PEC64u32 (320 bytes) with an empty configuration: `begin` returns only
+    // the per-context job, tagged for the bound queue.
+    let session = oa::test_session_exec(
+        device,
+        12,
+        128 << 10,
+        crate::intel_gpu_engine::Engine::Rcs0,
+        10,
+        alive,
+    );
+    let request = oa::Request::Open { enable: true };
+    let jobs = gt.oa_begin(&session, &request, 700, || true).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].per_context());
+    let oacontrol = jobs[0].words()[4];
+    let fence = gt.submit_oa_job(701, &session, &jobs[0]).unwrap();
+    for now in 702..900 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        if fence.result().is_some() {
+            break;
+        }
+        service_contexts(&io, &mut registered, true);
+    }
+    assert_eq!(fence.result(), Some(Ok(())));
+    // The LRI landed live on the bound queue's context...
+    assert_eq!(
+        (
+            io.0.borrow().regs[&0x2360],
+            io.0.borrow().regs[&0x2960],
+            io.0.borrow().regs[&0x2244],
+        ),
+        (1, oacontrol, 0x0100_0100)
+    );
+    // ...and, unlike the kernel-ring path, reached the bound queue's saved
+    // state: RING_CONTEXT_CONTROL is the image's first group value slot
+    // (saved word 3). The fence only signals after capture, so this also
+    // proves the job retired on the bound context, not a fresh kernel one.
+    assert_eq!(
+        session.queue_binding().unwrap().context.saved_word(3),
+        Some(0x0100_0100)
+    );
+
+    // A queue that dies between `begin` and the submit fails clean at the
+    // submit (ENOENT), never falling back to the kernel ring.
+    let jobs = gt
+        .oa_begin(&session, &oa::Request::Enable, 910, || true)
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].per_context());
+    alive_flag.store(false, core::sync::atomic::Ordering::Relaxed);
+    assert!(matches!(
+        gt.submit_oa_job(911, &session, &jobs[0]),
+        Err(FsError::NotFound)
+    ));
+    alive_flag.store(true, core::sync::atomic::Ordering::Relaxed);
+
+    // Disable retires on the bound queue too, clearing the saved bit.
+    let jobs = gt
+        .oa_begin(&session, &oa::Request::Disable, 920, || true)
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].per_context());
+    let fence = gt.submit_oa_job(921, &session, &jobs[0]).unwrap();
+    for now in 922..1000 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        if fence.result().is_some() {
+            break;
+        }
+        service_contexts(&io, &mut registered, true);
+    }
+    assert_eq!(fence.result(), Some(Ok(())));
+    assert_eq!(io.0.borrow().regs[&0x2244], 0x0100_0000);
+    assert_eq!(
+        session.queue_binding().unwrap().context.saved_word(3),
+        Some(0x0100_0000)
+    );
+    gt.oa_finish(&session, &oa::Request::Disable, 1000, || true)
+        .unwrap();
+    drop(gt);
+    drop(session);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_per_context_job_executes_on_bound_queue_and_saves_state
+);
