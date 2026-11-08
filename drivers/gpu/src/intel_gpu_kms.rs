@@ -1167,6 +1167,16 @@ impl Display {
     }
 }
 
+impl<M: Platform> Device<M> {
+    /// The CRTC id this display owns: Pipe A is CRTC 1. The `Device`
+    /// owns the Pipe-A panel only (see `pipe_owner(Pipe::A)`), so the
+    /// id is derived from the owned pipe rather than hardcoded at each
+    /// call site.
+    pub(crate) fn crtc_id(&self) -> u32 {
+        Pipe::A as u32 + 1
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Guard<'a, M: Platform> {
     device: &'a Device<M>,
@@ -2629,7 +2639,7 @@ impl<M: Platform> Guard<'_, M> {
         if let (Some(sf), Some(psr)) = (&selective, self.state.psr.as_mut()) {
             psr.program_sel_fetch_cursor(&self.device.platform, sf);
         }
-        crate::intel_gpu_vrr::on_plane_flip(1, &self.device.platform);
+        crate::intel_gpu_vrr::on_plane_flip(self.device.crtc_id(), &self.device.platform);
         let stamp = self
             .finish_pending()
             .await?
@@ -4216,7 +4226,7 @@ impl<M: Platform> Guard<'_, M> {
         }
         let stamp = self.finish_color().await?.ok_or(FsError::NoDevice)?;
         if primary.is_some() {
-            crate::intel_gpu_vrr::on_plane_flip(1, &self.device.platform);
+            crate::intel_gpu_vrr::on_plane_flip(self.device.crtc_id(), &self.device.platform);
         }
         if coefficients.is_none()
             && lut.is_none()

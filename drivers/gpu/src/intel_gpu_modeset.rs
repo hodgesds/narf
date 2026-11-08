@@ -424,6 +424,21 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.pipe.transcoder()
     }
 
+    /// The CRTC id this run programs (Pipe A→1, B→2, C→3, D→4), the
+    /// `intel_gpu_vrr::VrrTranscoder` numbering.
+    fn crtc_id(&self) -> u32 {
+        self.pipe as u32 + 1
+    }
+
+    /// The VRR IP for this run's display family (unknown family keeps
+    /// display 12's, as `program_transcoder` does).
+    fn vrr_ip(&self) -> crate::intel_gpu_vrr::DisplayVrrIp {
+        match self.gen12_family {
+            Some(family) => crate::intel_gpu_vrr::DisplayVrrIp::from_gen12_platform(family),
+            None => crate::intel_gpu_vrr::DisplayVrrIp::Gen12,
+        }
+    }
+
     /// Set the explicit DBUF share for this pipe's primary
     /// plane, as `(start_block, end_block)` in DBUF blocks
     /// (see `intel_gpu_multipipe::dbuf_shares`).
@@ -761,6 +776,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // — HTOTAL / VTOTAL / HSYNC / VSYNC registers.
         self.program_transcoder(&mode);
 
+        // Step 6b: VRR timings for the mode this run commits
+        // (`intel_vrr_set_transcoder_timings` follows
+        // `intel_set_transcoder_timings`).
+        self.program_vrr_for_modeset(&mode)?;
+
         // Step 7: program pipe — source rectangle + scaling.
         // For native-resolution modeset, source == destination.
         self.program_pipe(&mode);
@@ -870,6 +890,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // Sequence matters: transcoder pulls timing from PLL, pipe
         // needs transcoder to be live, plane scans into pipe.
         self.enable_transcoder();
+        // VRR enable, after the transcoder is live.
+        self.enable_vrr_for_modeset()?;
         self.enable_pipe();
         self.enable_plane();
 
@@ -1030,6 +1052,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if !wait_bit(self.mmio, pipe_off, PIPECONF_STATE, false, 100_000_000) {
             return Err(ModesetError::PipelineStopUnavailable);
         }
+
+        // VRR off before the transcoder stops.
+        self.disable_vrr_for_modeset();
 
         // 3) Transcoder: same pattern as pipe. On Gen12 the
         //    transcoder CONF register is aliased into the pipe
@@ -1598,6 +1623,81 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // Poll state-active. 100 ms cap matches i915's
         // `intel_wait_for_pipe_off` budget.
         let _ = wait_bit(self.mmio, off, PIPECONF_STATE, true, 100_000_000);
+    }
+
+    /// Program this run's VRR timings for the mode being committed
+    /// (`intel_vrr_set_transcoder_timings`, called from transcoder
+    /// configuration in Linux's `hsw_configure_cpu_transcoder`).
+    ///
+    /// Recomputes from the mode this run commits and the sink range
+    /// discovery published — the stored timings are from the previous
+    /// modeset (or install) and describe the previous mode, so they
+    /// are never programmed as-is. A missing range (or an uncappable
+    /// mode) clears the stored timings and leaves fixed refresh; the
+    /// range itself is a sink property that only changes on sink
+    /// change, and the DP paths' post-modeset recompute refreshes it
+    /// from discovery, so a stale range can lag by at most one modeset.
+    /// Programs the limits only when VRR is requested for this CRTC.
+    fn program_vrr_for_modeset(&mut self, mode: &Mode) -> Result<(), ModesetError> {
+        let crtc = self.crtc_id();
+        let ip = self.vrr_ip();
+        // CMRR auto-enable is eDP-only: the orchestrator knows the port,
+        // not the connector type, so DDI A (the built-in panel) maps to
+        // EmbeddedDisplayPort and every other port conservatively maps to
+        // Other (no auto-enable). The DP/HDMI activate paths call the
+        // recompute with their own kind; this must agree with the
+        // post-modeset recompute in `modeset_display_family` for the
+        // same CRTC, or the auto-enable state would flap between the two.
+        let kind = match self.ddi {
+            Ddi::A => crate::intel_gpu_vrr::VrrConnectorKind::EmbeddedDisplayPort,
+            _ => crate::intel_gpu_vrr::VrrConnectorKind::Other,
+        };
+        let timings = crate::intel_gpu_vrr::recompute_timings_for_modeset(
+            crtc,
+            mode,
+            crate::intel_gpu_vrr::VRR_STATE.range(crtc),
+            ip,
+            crate::intel_gpu_vrr::VrrComputeOpts::default(),
+            kind,
+        );
+        if crate::intel_gpu_vrr::VRR_STATE.is_enabled(crtc) {
+            if let Some(timings) = timings {
+                let trans = crate::intel_gpu_vrr::VrrTranscoder::for_crtc(crtc);
+                crate::intel_gpu_vrr::program_vrr_timings(self.mmio, trans, ip, &timings)
+                    .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enable VRR after the transcoder is live (`intel_vrr_enable`
+    /// runs after `intel_enable_transcoder` in Linux's
+    /// `intel_crtc_enable`). Only when VRR is requested and timings
+    /// were programmed for this run; a missing-timing run stays at
+    /// fixed refresh.
+    fn enable_vrr_for_modeset(&mut self) -> Result<(), ModesetError> {
+        let crtc = self.crtc_id();
+        if crate::intel_gpu_vrr::VRR_STATE.is_enabled(crtc) {
+            if let Some(timings) = crate::intel_gpu_vrr::VRR_STATE.timings(crtc) {
+                let ip = self.vrr_ip();
+                let trans = crate::intel_gpu_vrr::VrrTranscoder::for_crtc(crtc);
+                crate::intel_gpu_vrr::vrr_enable(self.mmio, trans, ip, timings.guardband)
+                    .map_err(|_| ModesetError::PipelineEnableUnavailable)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Disable VRR before the transcoder stops (`intel_vrr_disable`
+    /// runs before the transcoder disable in Linux's
+    /// `intel_crtc_disable`). Best effort: the pipeline is being torn
+    /// down regardless, so a `NoDevice`/timeout here must not fail
+    /// the disable — the failure surfaces through
+    /// `request_vrr_enabled`'s return value on the direct toggle path.
+    fn disable_vrr_for_modeset(&mut self) {
+        let crtc = self.crtc_id();
+        let trans = crate::intel_gpu_vrr::VrrTranscoder::for_crtc(crtc);
+        let _ = crate::intel_gpu_vrr::vrr_disable(self.mmio, trans, self.vrr_ip());
     }
 
     /// Enable this run's pipe. Same register block as the
@@ -3539,6 +3639,134 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_external_display_family_uses_exact_pci_ids_and_rejects_generation_aliases
+    );
+
+    // ── VRR modeset sequencing (#1769) ───────────────────────────────────
+    //
+    // The full-run fixture drives the real `modeset()` over the scripted
+    // sink with VRR requested and asserts the Linux order in the write
+    // log: timings programmed during transcoder configuration, TG
+    // enabled after the transcoder. The disable fixture drives
+    // `disable_pipeline()` with VRR live and asserts the disable lands
+    // between the pipe stop and the transcoder stop.
+
+    fn smoke_vrr_modeset_full_run_sequences_timings_then_enable() -> TestResult {
+        use crate::intel_gpu_pipes::{Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET};
+        use crate::intel_gpu_vrr::{
+            DisplayVrrIp, VrrComputeOpts, VrrRange, VrrTimings, TRANS_VRR_CTL_OFFSET,
+            TRANS_VRR_VMAX_OFFSET, TRANS_VRR_VMIN_OFFSET, VRR_CTL_VRR_ENABLE, VRR_STATE,
+        };
+        let range = VrrRange::new(48, 144).unwrap();
+        VRR_STATE.set_range(1, Some(range));
+        VRR_STATE.set_enabled(1, true);
+
+        // DSSM strap: 19.2 MHz (field 1), as in the non-VRR full run.
+        let mmio = ScriptedSinkMmio::new(1 << 29);
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        let mode = match ms.modeset(&fb_1080p(), None) {
+            Ok(m) => m,
+            Err(_) => {
+                VRR_STATE.set_enabled(1, false);
+                VRR_STATE.set_range(1, None);
+                return TestResult::Fail("VRR full modeset over scripted sink must succeed");
+            }
+        };
+        // The request is retained state, not a one-shot: clear it now so
+        // later fixtures in this harness process start from fixed refresh.
+        VRR_STATE.set_enabled(1, false);
+        VRR_STATE.set_range(1, None);
+        VRR_STATE.set_timings(1, None);
+        VRR_STATE.set_mode(1, None);
+
+        // The timings programmed are the ones computed for the mode this
+        // run committed (Gen12 writes them directly, no −1).
+        let expected = VrrTimings::compute_config(
+            &mode,
+            range,
+            DisplayVrrIp::Gen12,
+            VrrComputeOpts::default(),
+        )
+        .expect("1080p60 against 48..144 computes on Gen12");
+        let base = Transcoder::A.base();
+        if mmio.writes_to(base + TRANS_VRR_VMIN_OFFSET) != alloc::vec![expected.vmin] {
+            return TestResult::Fail("VRR VMIN must be the computed vmin");
+        }
+        if mmio.writes_to(base + TRANS_VRR_VMAX_OFFSET) != alloc::vec![expected.vmax] {
+            return TestResult::Fail("VRR VMAX must be the computed vmax");
+        }
+
+        // Order in the full write log: timings programmed before the TG
+        // is enabled, and the TG is enabled after the transcoder.
+        let writes = mmio.writes.borrow();
+        let pos = |off: u64, pred: &dyn Fn(u32) -> bool| {
+            writes.iter().position(|(o, v)| *o == off && pred(*v))
+        };
+        let vmin_pos = pos(base + TRANS_VRR_VMIN_OFFSET, &|_| true);
+        let pipeconf_enable_pos = pos(Pipe::A.base() + PIPECONF_OFFSET, &|v| {
+            v & PIPECONF_ENABLE != 0
+        });
+        let ctl_enable_pos = pos(base + TRANS_VRR_CTL_OFFSET, &|v| {
+            v & VRR_CTL_VRR_ENABLE != 0
+        });
+        match (vmin_pos, pipeconf_enable_pos, ctl_enable_pos) {
+            (Some(vmin), Some(tg), Some(ctl)) if vmin < ctl && tg < ctl => TestResult::Pass,
+            _ => TestResult::Fail("VRR order must be timings, then transcoder, then TG enable"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_vrr_modeset_full_run_sequences_timings_then_enable
+    );
+
+    fn smoke_vrr_disable_precedes_transcoder_stop() -> TestResult {
+        use crate::intel_gpu_pipes::{Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET};
+        use crate::intel_gpu_vrr::{
+            TRANS_PUSH_OFFSET, TRANS_VRR_CTL_OFFSET, VRR_CTL_FLIP_LINE_EN, VRR_CTL_VRR_ENABLE,
+        };
+        let mut mmio = FakeMmio::new();
+        mmio.state_offset = 0;
+        mmio.state_value = 0;
+        // VRR live on transcoder A before the disable.
+        let base = Transcoder::A.base();
+        mmio.set_read(
+            base + TRANS_VRR_CTL_OFFSET,
+            VRR_CTL_VRR_ENABLE | VRR_CTL_FLIP_LINE_EN,
+        );
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.disable_pipeline();
+
+        // VRR CTL must be cleared (ENABLE off, flip-line kept).
+        let ctl_writes = mmio.writes_to(base + TRANS_VRR_CTL_OFFSET);
+        if ctl_writes != alloc::vec![VRR_CTL_FLIP_LINE_EN] {
+            return TestResult::Fail("VRR CTL must clear ENABLE on disable");
+        }
+        // PUSH reset to 0.
+        if mmio.writes_to(base + TRANS_PUSH_OFFSET) != alloc::vec![0] {
+            return TestResult::Fail("TRANS_PUSH must reset to 0 on disable");
+        }
+        // Order: pipe stop, then VRR off, then transcoder stop. The pipe
+        // and transcoder CONF writes share one offset on Gen12, so the
+        // two clears to that offset bracket the VRR CTL clear.
+        let writes = mmio.writes.borrow();
+        let pipeconf_clears: alloc::vec::Vec<usize> = writes
+            .iter()
+            .enumerate()
+            .filter(|(_, (o, v))| {
+                *o == Pipe::A.base() + PIPECONF_OFFSET && v & PIPECONF_ENABLE == 0
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let vrr_pos = writes
+            .iter()
+            .position(|(o, _)| *o == base + TRANS_VRR_CTL_OFFSET);
+        match (pipeconf_clears.as_slice(), vrr_pos) {
+            ([first, second], Some(vrr)) if *first < vrr && vrr < *second => TestResult::Pass,
+            _ => TestResult::Fail("VRR disable must land between pipe and transcoder stop"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_vrr_disable_precedes_transcoder_stop
     );
 }
 
