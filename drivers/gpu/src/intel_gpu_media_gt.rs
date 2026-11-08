@@ -66,7 +66,7 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_engine::{Engine, EngineSet};
 use crate::intel_gpu_gt::GtPlatform;
 use crate::intel_gpu_gt_hw::{MTL_GLOBAL_MOCS, MTL_L3CC};
-use crate::intel_gpu_topology::{MIRROR_FUSE3, XEHP_FUSE4, xelpg_l3_bank_mask};
+use crate::intel_gpu_topology::{xelpg_l3_bank_mask, MIRROR_FUSE3, XEHP_FUSE4};
 use core::task::Poll;
 
 /// Default-off opt-in for the whole MTL/Arrow media GT path (lifecycle owner,

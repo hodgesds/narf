@@ -2390,7 +2390,7 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests {
     use super::*;
-    use narf_kernel_test::{TestResult, kernel_test_in};
+    use narf_kernel_test::{kernel_test_in, TestResult};
 
     pub(crate) struct User {
         bytes: IrqSafeSpinLock<Vec<u8>>,

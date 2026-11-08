@@ -10,7 +10,7 @@ use crate::{
     intel_gpu_user::{UserBatch, UserContext},
     intel_gpu_xe_sync::Sync,
     intel_gpu_xe_uapi as abi,
-    intel_gpu_xe_vm::{Bind, Vm, read, zero},
+    intel_gpu_xe_vm::{read, zero, Bind, Vm},
 };
 use alloc::{
     boxed::Box,

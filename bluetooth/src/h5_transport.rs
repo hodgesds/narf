@@ -247,9 +247,7 @@ impl Pl011BytePort {
         let UartBase::Mmio(_) = info.base else {
             return None;
         };
-        let Some(va) = info.virt else {
-            return None;
-        };
+        let va = info.virt?;
         // SAFETY: `va` is the probe-installed mapping for this
         // entry (see `UartInfo::virt`); the handle lives only as
         // long as the mapping does (ioremap mappings persist until

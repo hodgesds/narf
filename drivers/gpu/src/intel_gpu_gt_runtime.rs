@@ -3790,7 +3790,7 @@ pub(crate) fn probe_discrete(
 mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
-    use narf_kernel_test::{TestResult, kernel_test_in};
+    use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_gt_compute_boot_selection_is_unambiguous_and_immutable() -> TestResult {
         use narf_boot::args::KernelCmdline;
@@ -4002,8 +4002,8 @@ mod tests {
         "drivers/gpu/intel_gpu_gt",
         smoke_gt_pci_identity_and_virtualization_admission
     );
-    fn smoke_gt_discrete_display_inventory_denies_absent_planes_and_refuses_each_live_fetcher()
-    -> TestResult {
+    fn smoke_gt_discrete_display_inventory_denies_absent_planes_and_refuses_each_live_fetcher(
+    ) -> TestResult {
         use core::cell::Cell;
         struct Io {
             live: Option<u64>,
@@ -4019,7 +4019,11 @@ mod tests {
                 if self.unavailable == Some(r) {
                     return u32::MAX;
                 }
-                if self.live == Some(r) { 1 << 31 } else { 0 }
+                if self.live == Some(r) {
+                    1 << 31
+                } else {
+                    0
+                }
             }
             fn write32(&self, _: u64, _: u32) {
                 panic!("read-only discrete display admission wrote MMIO")

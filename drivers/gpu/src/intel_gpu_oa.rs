@@ -20,10 +20,10 @@ use crate::{
     intel_gpu_xe_sync::Sync as XeSync,
 };
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering, fence};
+use core::sync::atomic::{fence, AtomicBool, Ordering};
 use narf_filesystem::{
-    FileOps, FileType, FsError, FsFuture, IoctlContext, MmapBacking, MmapLifetime, Mode, POLL_ERR,
-    POLL_HUP, POLL_IN, PrivatePfnMap, ReadOptions, Stat,
+    FileOps, FileType, FsError, FsFuture, IoctlContext, MmapBacking, MmapLifetime, Mode,
+    PrivatePfnMap, ReadOptions, Stat, POLL_ERR, POLL_HUP, POLL_IN,
 };
 use narf_lib::{mutex::Mutex, readiness::Readiness, sync::IrqSafeSpinLock};
 
@@ -2517,7 +2517,11 @@ impl<A: BootAllocator> Unit<A> {
             // Clear the report id and timestamp to detect unlanded reports;
             // zero a report entirely when reports straddle the ring end.
             let clear = if circ % size == 0 {
-                if session.format.header64 { 16 } else { 8 }
+                if session.format.header64 {
+                    16
+                } else {
+                    8
+                }
             } else {
                 size
             };

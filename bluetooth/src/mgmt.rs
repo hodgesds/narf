@@ -251,8 +251,7 @@ static ADVERTISING: IrqSafeSpinLock<BTreeMap<u16, u8>> = IrqSafeSpinLock::new(BT
 /// programmed into the controller at power-on (LE Set Random
 /// Address), never at set time — the kernel programs it during
 /// setup, and setting it is limited to the powered-off state.
-static STATIC_ADDR: IrqSafeSpinLock<BTreeMap<u16, [u8; 6]>> =
-    IrqSafeSpinLock::new(BTreeMap::new());
+static STATIC_ADDR: IrqSafeSpinLock<BTreeMap<u16, [u8; 6]>> = IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Privacy mode + local IRK recorded by SET_PRIVACY (0x002f),
 /// keyed by HCI index: (mode, local IRK). Present only while
@@ -268,8 +267,7 @@ static PRIVACY: IrqSafeSpinLock<BTreeMap<u16, (u8, [u8; 16])>> =
 /// into existing bonds' `peer_irk` where one exists, but an IRK
 /// for a peer with no bond yet lives only here — it is never
 /// fabricated into a bond.
-static IRKS: IrqSafeSpinLock<BTreeMap<u16, Vec<IrkEntry>>> =
-    IrqSafeSpinLock::new(BTreeMap::new());
+static IRKS: IrqSafeSpinLock<BTreeMap<u16, Vec<IrkEntry>>> = IrqSafeSpinLock::new(BTreeMap::new());
 
 /// One loaded IRK: the peer's identity address (`[address-type,
 /// bd_addr]`, the same 7-byte shape the pump tracks) and the key.
@@ -287,8 +285,7 @@ struct IrkEntry {
 /// SET_PRIVACY, so a new epoch always gets a fresh RPA. RPA
 /// rotation on a timer (the spec's 15-minute recommendation) is
 /// future work — there is no mgmt timer yet.
-static CURRENT_RPA: IrqSafeSpinLock<BTreeMap<u16, [u8; 6]>> =
-    IrqSafeSpinLock::new(BTreeMap::new());
+static CURRENT_RPA: IrqSafeSpinLock<BTreeMap<u16, [u8; 6]>> = IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Random address currently programmed into the controller, keyed
 /// by HCI index. Lets [`program_random_address`] skip a redundant
@@ -353,6 +350,7 @@ fn set_setting_bit(index: u16, bit: u32, on: bool) -> u32 {
 /// - When the controller is not powered, the setting is recorded
 ///   and applied on the next power-on (no HCI now) — except a
 ///   discoverable-with-timeout, which is NOT_POWERED while off.
+///
 /// A failed HCI write leaves the bitmap unchanged and replies
 /// CMD_STATUS with the failure (FAILED, or TIMEOUT when the
 /// Command Complete never arrived).
@@ -1562,7 +1560,11 @@ fn static_in_use(index: u16, settings: u32) -> bool {
 
 /// Privacy mode recorded by SET_PRIVACY (0 = off).
 fn privacy_mode(index: u16) -> u8 {
-    PRIVACY.lock().get(&index).map(|(mode, _)| *mode).unwrap_or(0)
+    PRIVACY
+        .lock()
+        .get(&index)
+        .map(|(mode, _)| *mode)
+        .unwrap_or(0)
 }
 
 /// Local IRK recorded by SET_PRIVACY, if privacy is on.
@@ -1689,9 +1691,8 @@ fn generate_rpa(index: u16) -> Result<[u8; 6], u8> {
         let prand = [(rand[3] & 0x3f) | 0x40, rand[2], rand[1]];
         // Random part (22 bits) must contain at least one 0 and
         // one 1 — all-zero or all-one is not a prand.
-        let random_part = ((u32::from(prand[0] & 0x3f)) << 16)
-            | (u32::from(prand[1]) << 8)
-            | u32::from(prand[2]);
+        let random_part =
+            ((u32::from(prand[0] & 0x3f)) << 16) | (u32::from(prand[1]) << 8) | u32::from(prand[2]);
         if random_part == 0 || random_part == (1 << 22) - 1 {
             continue;
         }
@@ -1843,8 +1844,16 @@ fn apply_advertising_with(index: u16, settings: u32) -> Result<(), u8> {
     params.push(0); // accept all scan/connect requests
     issue(index, op::HCI_LE_SET_ADVERTISING_PARAMETERS, &params)?;
     let (adv_data, scan_rsp) = build_adv_data(index, settings);
-    issue(index, op::HCI_LE_SET_ADVERTISING_DATA, &adv_data_param(&adv_data))?;
-    issue(index, op::HCI_LE_SET_SCAN_RESPONSE_DATA, &adv_data_param(&scan_rsp))?;
+    issue(
+        index,
+        op::HCI_LE_SET_ADVERTISING_DATA,
+        &adv_data_param(&adv_data),
+    )?;
+    issue(
+        index,
+        op::HCI_LE_SET_SCAN_RESPONSE_DATA,
+        &adv_data_param(&scan_rsp),
+    )?;
     issue(index, op::HCI_LE_SET_ADVERTISING_ENABLE, &[1]).map(|_| ())
 }
 
@@ -1875,7 +1884,12 @@ fn set_advertising(index: u16, params: &[u8]) -> Vec<u8> {
     }
     let mode = advertising_mode(index);
     if val == mode {
-        return cmd_complete(index, OP_SET_ADVERTISING, STATUS_SUCCESS, &settings.to_le_bytes());
+        return cmd_complete(
+            index,
+            OP_SET_ADVERTISING,
+            STATUS_SUCCESS,
+            &settings.to_le_bytes(),
+        );
     }
     let powered = settings & SETTING_POWERED != 0;
     let record_only = !powered
@@ -1887,7 +1901,12 @@ fn set_advertising(index: u16, params: &[u8]) -> Vec<u8> {
         ADVERTISING.lock().insert(index, val);
         let new = set_setting_bit(index, SETTING_ADVERTISING, val != 0);
         narf_filesystem::bluetooth::publish_mgmt_event(&new_settings(index, new));
-        return cmd_complete(index, OP_SET_ADVERTISING, STATUS_SUCCESS, &new.to_le_bytes());
+        return cmd_complete(
+            index,
+            OP_SET_ADVERTISING,
+            STATUS_SUCCESS,
+            &new.to_le_bytes(),
+        );
     }
     // Live path: run the HCI first, record only on success.
     ADVERTISING.lock().insert(index, val);
@@ -1895,7 +1914,12 @@ fn set_advertising(index: u16, params: &[u8]) -> Vec<u8> {
         Ok(()) => {
             let new = set_setting_bit(index, SETTING_ADVERTISING, val != 0);
             narf_filesystem::bluetooth::publish_mgmt_event(&new_settings(index, new));
-            cmd_complete(index, OP_SET_ADVERTISING, STATUS_SUCCESS, &new.to_le_bytes())
+            cmd_complete(
+                index,
+                OP_SET_ADVERTISING,
+                STATUS_SUCCESS,
+                &new.to_le_bytes(),
+            )
         }
         Err(status) => {
             if mode == 0 {
@@ -1975,10 +1999,7 @@ fn set_bredr(index: u16, params: &[u8]) -> Vec<u8> {
         &[u8::from(new & SETTING_FAST_CONNECTABLE != 0)],
     )
     .map(|_| ());
-    if result.is_ok()
-        && advertising_mode(index) != 0
-        && !DISCOVERING.lock().contains_key(&index)
-    {
+    if result.is_ok() && advertising_mode(index) != 0 && !DISCOVERING.lock().contains_key(&index) {
         result = apply_advertising_with(index, new);
     }
     if let Err(status) = result {
@@ -2031,7 +2052,12 @@ fn set_static_address(index: u16, params: &[u8]) -> Vec<u8> {
     // the new one.
     PROGRAMMED_RANDOM_ADDR.lock().remove(&index);
     narf_filesystem::bluetooth::publish_mgmt_event(&new_settings(index, settings));
-    cmd_complete(index, OP_SET_STATIC_ADDRESS, STATUS_SUCCESS, &settings.to_le_bytes())
+    cmd_complete(
+        index,
+        OP_SET_STATIC_ADDRESS,
+        STATUS_SUCCESS,
+        &settings.to_le_bytes(),
+    )
 }
 
 /// SET_PRIVACY (0x002f): `mode` (1) + local IRK (16) (mgmt(7)).
@@ -2071,7 +2097,12 @@ fn set_privacy(index: u16, params: &[u8]) -> Vec<u8> {
     CURRENT_RPA.lock().remove(&index);
     PROGRAMMED_RANDOM_ADDR.lock().remove(&index);
     narf_filesystem::bluetooth::publish_mgmt_event(&new_settings(index, settings));
-    cmd_complete(index, OP_SET_PRIVACY, STATUS_SUCCESS, &settings.to_le_bytes())
+    cmd_complete(
+        index,
+        OP_SET_PRIVACY,
+        STATUS_SUCCESS,
+        &settings.to_le_bytes(),
+    )
 }
 
 /// LOAD_LONG_TERM_KEYS (0x0013): `count` (2) + `count` entries
@@ -4081,8 +4112,8 @@ mod tests {
     );
 
     /// #815 (remainder tranche): SET_ADVERTISING issues the legacy
-    /// advertising HCI sequence (parameters + data + scan response
-    /// + enable) while powered, validates the value, rejects with
+    /// advertising HCI sequence (parameters, data, scan response,
+    /// enable) while powered, validates the value, rejects with
     /// LE off, records while unpowered and applies on power-on,
     /// and no-ops on a repeat of the same mode. Mode 0x01 with
     /// connectable off advertises non-connectable from a fresh
@@ -4124,7 +4155,9 @@ mod tests {
         let want: [(u16, &[u8]); 4] = [
             (
                 op::HCI_LE_SET_ADVERTISING_PARAMETERS,
-                &[0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00],
+                &[
+                    0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00,
+                ],
             ),
             (op::HCI_LE_SET_ADVERTISING_DATA, &adv_params),
             (op::HCI_LE_SET_SCAN_RESPONSE_DATA, &[0u8; 32]),
@@ -4137,12 +4170,8 @@ mod tests {
                 .all(|(c, (o, p))| c.opcode == *o && c.params.as_slice() == *p);
         // Advertising bit set in READ_INFO.
         let info = handle(&mgmt_cmd(OP_READ_INFO, index, &[]));
-        let bit_set = u32::from_le_bytes([
-            info[0][22],
-            info[0][23],
-            info[0][24],
-            info[0][25],
-        ]) & SETTING_ADVERTISING
+        let bit_set = u32::from_le_bytes([info[0][22], info[0][23], info[0][24], info[0][25]])
+            & SETTING_ADVERTISING
             != 0;
         // Repeat of the same mode issues no HCI.
         let sent_len = lt.sent_commands().len();
@@ -4194,7 +4223,9 @@ mod tests {
             ),
             (
                 op::HCI_LE_SET_ADVERTISING_PARAMETERS,
-                &[0x00, 0x08, 0x00, 0x08, 0x02, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00],
+                &[
+                    0x00, 0x08, 0x00, 0x08, 0x02, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00,
+                ],
             ),
             (op::HCI_LE_SET_ADVERTISING_DATA, &adv_params),
             (op::HCI_LE_SET_SCAN_RESPONSE_DATA, &[0u8; 32]),
@@ -4243,14 +4274,14 @@ mod tests {
     fn smoke_mgmt_static_address_and_privacy() -> TestResult {
         let (lt, index) = setup_controller(controller::ControllerInfo::default());
         // SET_STATIC_ADDRESS validation (unpowered).
-        let bad_bits = handle(
-            &mgmt_cmd(OP_SET_STATIC_ADDRESS, index, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x01]),
-        );
-        let bad_bits_ok =
-            is_cmd_status(&bad_bits, OP_SET_STATIC_ADDRESS, STATUS_INVALID_PARAMS);
+        let bad_bits = handle(&mgmt_cmd(
+            OP_SET_STATIC_ADDRESS,
+            index,
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x01],
+        ));
+        let bad_bits_ok = is_cmd_status(&bad_bits, OP_SET_STATIC_ADDRESS, STATUS_INVALID_PARAMS);
         let bad_none = handle(&mgmt_cmd(OP_SET_STATIC_ADDRESS, index, &[0xff; 6]));
-        let bad_none_ok =
-            is_cmd_status(&bad_none, OP_SET_STATIC_ADDRESS, STATUS_INVALID_PARAMS);
+        let bad_none_ok = is_cmd_status(&bad_none, OP_SET_STATIC_ADDRESS, STATUS_INVALID_PARAMS);
         let static_addr = [0x11, 0x22, 0x33, 0x44, 0x55, 0xC1];
         let ok = handle(&mgmt_cmd(OP_SET_STATIC_ADDRESS, index, &static_addr));
         let static_ok = is_cmd_complete(&ok, OP_SET_STATIC_ADDRESS, STATUS_SUCCESS)
@@ -4292,8 +4323,8 @@ mod tests {
             op::HCI_LE_ENCRYPT,
             0,
             &[
-                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-                0x0D, 0x0E, 0x0F,
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                0x0E, 0x0F,
             ],
         ));
         lt.enqueue_event(cc(op::HCI_LE_SET_RANDOM_ADDRESS, 0, &[]));
@@ -4326,8 +4357,7 @@ mod tests {
         let priv_rej = handle(&mgmt_cmd(OP_SET_PRIVACY, index, &priv_params));
         let priv_rej_ok = is_cmd_status(&priv_rej, OP_SET_PRIVACY, STATUS_REJECTED);
         let static_rej = handle(&mgmt_cmd(OP_SET_STATIC_ADDRESS, index, &static_addr));
-        let static_rej_ok =
-            is_cmd_status(&static_rej, OP_SET_STATIC_ADDRESS, STATUS_REJECTED);
+        let static_rej_ok = is_cmd_status(&static_rej, OP_SET_STATIC_ADDRESS, STATUS_REJECTED);
         // Power off, privacy off, power on: the static address is
         // programmed (no RPA, no resolving list).
         enqueue_power_off_cc(&lt);
@@ -4336,8 +4366,7 @@ mod tests {
         priv_off[0] = 0x00;
         let po = handle(&mgmt_cmd(OP_SET_PRIVACY, index, &priv_off));
         let po_ok = is_cmd_complete(&po, OP_SET_PRIVACY, STATUS_SUCCESS)
-            && u32::from_le_bytes([po[0][9], po[0][10], po[0][11], po[0][12]])
-                & SETTING_PRIVACY
+            && u32::from_le_bytes([po[0][9], po[0][10], po[0][11], po[0][12]]) & SETTING_PRIVACY
                 == 0;
         enqueue_power_on_ccs(&lt, &[0u8; 248], &[0u8; 3], false, false);
         lt.enqueue_event(cc(op::HCI_LE_SET_RANDOM_ADDRESS, 0, &[]));
@@ -4374,7 +4403,9 @@ mod tests {
             return TestResult::Fail("SET_PRIVACY(0x00) / power-on with privacy off failed");
         }
         if !static_seq {
-            return TestResult::Fail("power-on with privacy off did not program the static address");
+            return TestResult::Fail(
+                "power-on with privacy off did not program the static address",
+            );
         }
         TestResult::Pass
     }
@@ -4389,7 +4420,11 @@ mod tests {
     fn smoke_mgmt_load_keys() -> TestResult {
         let (lt, index) = setup_controller(controller::ControllerInfo::default());
         // LOAD_LONG_TERM_KEYS: length must match the count.
-        let short = handle(&mgmt_cmd(OP_LOAD_LONG_TERM_KEYS, index, &[0x01, 0x00, 0xAA]));
+        let short = handle(&mgmt_cmd(
+            OP_LOAD_LONG_TERM_KEYS,
+            index,
+            &[0x01, 0x00, 0xAA],
+        ));
         let short_ok = is_cmd_status(&short, OP_LOAD_LONG_TERM_KEYS, STATUS_INVALID_PARAMS);
         // One entry with an invalid address type (BR/EDR) is
         // skipped: success, no bond.
@@ -4476,8 +4511,8 @@ mod tests {
             op::HCI_LE_ENCRYPT,
             0,
             &[
-                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-                0x0D, 0x0E, 0x0F,
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                0x0E, 0x0F,
             ],
         ));
         lt.enqueue_event(cc(op::HCI_LE_SET_RANDOM_ADDRESS, 0, &[]));
@@ -4556,7 +4591,9 @@ mod tests {
             return TestResult::Fail("LOAD_IRKS (privacy off) issued HCI instead of storing");
         }
         if !powered2 || !list_seq {
-            return TestResult::Fail("power-on did not program the resolving list from loaded IRKs");
+            return TestResult::Fail(
+                "power-on did not program the resolving list from loaded IRKs",
+            );
         }
         if !live_ok {
             return TestResult::Fail("LOAD_IRKS while powered+privacy did not re-program the list");
@@ -4603,9 +4640,7 @@ mod tests {
         lt.enqueue_event(cc(op::HCI_WRITE_PAGE_SCAN_TYPE, 0, &[]));
         let en = handle(&mgmt_cmd(OP_SET_BREDR, index, &[1]));
         let en_ok = is_cmd_complete(&en, OP_SET_BREDR, STATUS_SUCCESS)
-            && u32::from_le_bytes([en[0][9], en[0][10], en[0][11], en[0][12]])
-                & SETTING_BREDR
-                != 0
+            && u32::from_le_bytes([en[0][9], en[0][10], en[0][11], en[0][12]]) & SETTING_BREDR != 0
             && lt
                 .sent_commands()
                 .last()
