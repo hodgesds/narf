@@ -200,6 +200,18 @@ impl Scope {
             mbss: features.mbss && !other_secondary_active,
         }
     }
+    /// Whether this scope writes (and therefore must save and restore) the
+    /// `SAVED` var at `index`. A secondary never writes the device-wide
+    /// PHY modes (`nmode`, `vhtmode`), and writes `apsta` only when it
+    /// takes the radio down (`down_apsta`); a GO writes neither. The
+    /// offloads and the per-BSS vars are written by every scope.
+    fn writes_saved(self, index: usize) -> bool {
+        match self {
+            Self::Primary => true,
+            Self::Secondary { down_apsta, .. } => index >= 2 && (index != 3 || down_apsta),
+            Self::Go { .. } => index >= 2 && index != 3,
+        }
+    }
     fn primary(self) -> bool {
         self == Self::Primary
     }
@@ -254,6 +266,13 @@ impl Saved {
         }
         let mut vars = [Variable::UnknownRead; 9];
         for (index, name) in SAVED.iter().enumerate() {
+            // Never touch a var this scope does not write: a secondary
+            // program must contain no `apsta` command at all (Linux
+            // `start_ap` leaves the device-wide STA/AP mode to the
+            // primary), and the PHY modes belong to the primary alone.
+            if !scope.writes_saved(index) {
+                continue;
+            }
             vars[index] = match get_int(runtime, &guard, name).await {
                 Ok(value) => Variable::Known(value),
                 Err(Error::Firmware(code)) if index >= 6 && code as i32 == -23 => {
@@ -344,12 +363,8 @@ impl Saved {
             set_int(runtime, &guard, name, 0).await?;
         }
         for (index, (name, value)) in SAVED.iter().zip(self.vars).enumerate() {
-            // A secondary never wrote the device-wide PHY modes.
-            if index < 2 && !self.scope.primary() {
-                continue;
-            }
-            // Nor did a GO write `apsta` (a down-only setting).
-            if index == 3 && go {
+            // Restore only what this scope wrote (`read` only saved those).
+            if !self.scope.writes_saved(index) {
                 continue;
             }
             match value {

@@ -84,8 +84,12 @@ fn smoke_brcmf_chip_profile_admission_and_asset_names() -> TestResult {
         ),
         // 4354 raw PCI id binds in Linux, but no PCIe firmware row exists.
         (BRCM_CC_4354, 1, pci(0x4354, (0, 0)), None),
-        // OTP board selection is not part of the chip-only admission.
-        (BRCM_CC_4364, 4, pci(0x4464, (0x106b, 0x07bf)), None),
+        // OTP board selection is not part of the chip-only admission:
+        // `admit()` is the PCI/profile lookup Linux performs for OTP
+        // chips too (`BRCMF_PCIE_DEVICE(BRCM_PCIE_4364_DEVICE_ID,
+        // WCC_SEED)`); the OTP gate lives in `BoardProfile::admits`
+        // and the signed selection claim, not here.
+        (BRCM_CC_4364, 4, pci(0x4464, (0x106b, 0x07bf)), Some(None)),
         // BCM43752 (seeded PCI id): no CPU table fact, Linux dispatch.
         (BRCM_CC_43752, 1, pci(0x449d, (0, 0)), Some(None)),
         // Linux keys the seed on the PCI id, so a covered chip under a
@@ -410,7 +414,7 @@ fn smoke_brcmf_chip_profile_random_seed_footer_below_nvram() -> TestResult {
     };
     let size = 2 * 16 * 8192u32;
     for (identity, chip_id, device, base, seeded) in [
-        (0x1001_a9e8, BRCM_CC_43752, 0x449d, 0x170000, true),
+        (0x1001_aae8, BRCM_CC_43752, 0x449d, 0x170000, true),
         (0x1002_4356, BRCM_CC_4356, 0x43ec, 0x180000, false),
     ] {
         let bus = model(identity, chip::CORE_ARM_CR4, None, base);
