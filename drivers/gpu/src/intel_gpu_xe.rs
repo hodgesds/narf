@@ -1078,6 +1078,22 @@ impl XeFile {
             if queue.vm.userptrs_stale() {
                 continue;
             }
+            // Per-batch OA query (issue #1774): refuse to submit while
+            // the query sampler's buffer is not resident-writable in
+            // this VM, so the MI_REPORT_PERF_COUNT the submit path
+            // appends cannot fault the batch on an unmapped or
+            // read-only VA. `state` (the VM state lock) is held across
+            // this check and the submit below, so the mappings cannot
+            // change between them.
+            if let Some(sampler) = queue.context.query_sampler() {
+                if !crate::intel_gpu_exec::mappings_cover(
+                    &state.mappings,
+                    sampler.address(),
+                    u64::from(sampler.size()),
+                ) {
+                    return Err(FsError::InvalidData);
+                }
+            }
             match backend
                 .submit(queue.context.clone(), UserBatch(resident))
                 .await

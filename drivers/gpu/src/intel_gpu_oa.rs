@@ -520,6 +520,127 @@ pub(crate) fn config_jobs(regs: &[(u32, u32)]) -> Vec<Job> {
 /// unknown. Closing the gap needs a trusted-submit-on-user-context entry
 /// point; until then the job is built, validated and sequenced, but its
 /// per-context effect on silicon is UNVERIFIED.
+/// The two-word head of the owned breadcrumb MI_FLUSH_DW that every
+/// `resident_ring` job ends with (also the marker the user-fence splice
+/// in `intel_gpu_guc_sched::submit_inner` searches for). The per-batch
+/// OA query splices immediately before this marker, so it executes
+/// after the user's batch returns to the ring and before the
+/// completion write.
+pub(crate) const BREADCRUMB_MARKER: [u32; 2] = [0x7a000004, 0x01104080];
+
+/// MI_REPORT_PERF_COUNT, Gen8+ 4-dword form (all NARF platforms are
+/// Gen12+): [header, address low, address high, report ID]. Opcode
+/// 0x28 (2013 Sandybridge patch "MI_REPORT_PERF_COUNT is now opcode
+/// 0x28"; IGT tests/perf.c `GEN8_MI_REPORT_PERF_COUNT` and mesa i965
+/// `emit_mi_report_perf_count` both emit `(0x28 << 23) | (4 - 2)`).
+/// No GTT-select bit is set: the address is a PPGTT address (see
+/// [`QuerySampler`]). The Gen6 3-dword form (32-bit address) predates
+/// Gen8 and does not apply here.
+const MI_REPORT_PERF_COUNT_HEADER: u32 = (0x28 << 23) | (4 - 2);
+
+/// The per-batch OA query sampler for a query-mode OAR/OAC stream.
+///
+/// Linux never emits MI_REPORT_PERF_COUNT from the kernel: userspace
+/// (mesa) inserts it into its own batch, targeting a userspace-provided
+/// address in the per-process GPU address space (lkml 2015, Robert
+/// Bragg: "the kernel shouldn't be emitting MI_REPORT_PERF_COUNT
+/// commands"; "the gpu stores the samples at the userspace provided
+/// address in the per-process gpu address space"). NARF has no
+/// userspace mesa emitting batches, so the kernel's exec path emits one
+/// query per batch on a queue with a live query-mode stream (see
+/// [`splice_query`]), targeting the query buffer the stream's opener
+/// provided (open properties 14/15) in the bound context's PPGTT. The
+/// report lands in the opener's buffer; the report ID (a per-stream
+/// sequence, never 0) tells userspace the report has landed and which
+/// batch it belongs to (mesa instead uses the fixed magic 0xd2e9c607
+/// and checks report[0] == report ID).
+///
+/// The destination is a PPGTT address, never GGTT: the i915 command
+/// parser requires MI_REPORT_PERF_COUNT_GGTT == 0 for userspace
+/// batches, and the GPU forces the per-process address space for this
+/// command (the GTT select bit is not obeyed). The buffer is separate
+/// from the periodic OA circular buffer (i915's command-stream capture
+/// likewise keeps CS-based reports in a separate buffer from the
+/// periodic one), and the exec path refuses to submit while the range
+/// is not resident-writable in the context's VM.
+#[derive(Debug)]
+pub(crate) struct QuerySampler {
+    /// PPGTT address of the query buffer in the bound context's VM.
+    address: u64,
+    /// Buffer size in bytes (a multiple of `report_size`, at least one
+    /// report; validated at open).
+    size: u32,
+    /// One report's size in bytes (the stream format's size).
+    report_size: u32,
+    /// (next slot, next report ID). Slots rotate 0..slots; report IDs
+    /// run 1, 2, ... and wrap to 1, never 0 (0 means "no report" to the
+    /// OA read path's unlanded-report detection).
+    state: IrqSafeSpinLock<(u32, u32)>,
+}
+
+impl QuerySampler {
+    /// Build a sampler for a validated query buffer: `size` is a
+    /// nonzero multiple of `report_size`, and `address` is aligned to
+    /// `report_size` (checked at open; a caller that skips the check
+    /// gets slots that still stay inside the buffer, but the report
+    /// addresses are only report-aligned when the base is).
+    pub(crate) fn new(address: u64, size: u32, report_size: u32) -> Self {
+        Self {
+            address,
+            size,
+            report_size,
+            state: IrqSafeSpinLock::new((0, 1)),
+        }
+    }
+    /// PPGTT address of the query buffer, for the exec path's residency
+    /// check.
+    pub(crate) fn address(&self) -> u64 {
+        self.address
+    }
+    /// Query buffer size in bytes, for the exec path's residency check.
+    pub(crate) fn size(&self) -> u32 {
+        self.size
+    }
+    /// The MI_REPORT_PERF_COUNT for the next batch: the next slot's
+    /// address in the query buffer and the next report ID. Each call
+    /// advances the slot (rotating within the buffer) and the report ID
+    /// (wrapping to 1, never 0), so consecutive batches land in
+    /// consecutive slots with distinct IDs.
+    pub(crate) fn next_query(&self) -> [u32; 4] {
+        let slots = (self.size / self.report_size).max(1);
+        let mut state = self.state.lock();
+        let (slot, id) = *state;
+        let address = self.address + u64::from(slot) * u64::from(self.report_size);
+        state.0 = (slot + 1) % slots;
+        state.1 = if id == u32::MAX { 1 } else { id + 1 };
+        [
+            MI_REPORT_PERF_COUNT_HEADER,
+            address as u32,
+            (address >> 32) as u32,
+            id,
+        ]
+    }
+}
+
+/// Splice one MI_REPORT_PERF_COUNT from `sampler` into `words`
+/// immediately before the owned breadcrumb, so it executes after the
+/// user's batch returns to the ring and before the completion write.
+/// Returns false (and leaves `words` untouched) when the breadcrumb
+/// marker is absent, so a ring that was not built by `resident_ring`
+/// never gains a query. Called from `submit_inner` for the resident
+/// (render/compute) ring only: video engines do not support
+/// MI_REPORT_PERF_COUNT (Linux `xe_oa_configure_oa_context` returns 0
+/// for them), and the query-mode stream is bound to a render/compute
+/// queue.
+pub(crate) fn splice_query(words: &mut Vec<u32>, sampler: &QuerySampler) -> bool {
+    let Some(at) = words.windows(2).position(|v| v == BREADCRUMB_MARKER) else {
+        return false;
+    };
+    let query = sampler.next_query();
+    words.splice(at..at, query);
+    true
+}
+
 fn per_context_job(session: &Session, enable: bool) -> Option<Job> {
     session.exec_queue?;
     let base = session.hwe.base();
@@ -688,6 +809,12 @@ struct Params {
     syncs: u64,
     buffer: u64,
     wait: i32,
+    /// PPGTT address of the opener's query-report buffer in the bound
+    /// context's VM (open property 14). 0 means no query sampling.
+    query_address: u64,
+    /// Query-report buffer size in bytes (open property 15). 0 means no
+    /// query sampling.
+    query_size: u64,
 }
 impl Params {
     fn new() -> Self {
@@ -705,6 +832,8 @@ impl Params {
             syncs: 0,
             buffer: 0,
             wait: 0,
+            query_address: 0,
+            query_size: 0,
         }
     }
     /// xe_oa_set_property_funcs_open / _config.
@@ -746,6 +875,13 @@ impl Params {
             12 => self.buffer = value,
             13 if value == 0 => return invalid,
             13 => self.wait = value as i32,
+            // Query sampling (issue #1774): the opener's per-batch
+            // report buffer in the bound context's PPGTT. Both or
+            // neither; the cross-checks (bound exec queue, query mode,
+            // render/compute engine, size/alignment against the format)
+            // run at open, where the format and engine are known.
+            14 => self.query_address = value,
+            15 => self.query_size = value,
             _ => return invalid,
         }
         Ok(())
@@ -918,6 +1054,24 @@ pub(crate) async fn open(
             return Err(FsError::InvalidData.into());
         }
     }
+    // Query sampling (issue #1774): both properties or neither, on a
+    // query-mode stream (bound exec queue, no periodic sampling) whose
+    // engine supports MI_REPORT_PERF_COUNT (render/compute only; Linux
+    // xe_oa_configure_oa_context returns 0 for video engines). The
+    // buffer holds whole reports, at least one, and the base is
+    // report-aligned so every rotated slot is report-aligned.
+    if (p.query_address == 0) != (p.query_size == 0)
+        || (p.query_address != 0
+            && (exec.is_none()
+                || p.sample
+                || !(hwe == Engine::Rcs0 || hwe.is_compute())
+                || p.query_size > MAX_BUFFER
+                || p.query_size < u64::from(format.size)
+                || p.query_size % u64::from(format.size) != 0
+                || p.query_address % u64::from(format.size) != 0))
+    {
+        return Err(FsError::InvalidData.into());
+    }
     if p.exponent >= 0 && !p.sample {
         return Err(FsError::InvalidData.into());
     }
@@ -958,6 +1112,8 @@ pub(crate) async fn open(
         (p.exec_queue > 0).then_some(p.exec_queue as u32),
         binding,
         p.no_preempt,
+        p.query_address,
+        p.query_size,
         privileged,
     );
     let mut pending = PendingOpen {
@@ -1163,6 +1319,8 @@ pub(crate) async fn i915_open(
         None,
         None,
         false,
+        0,
+        0,
         true,
     );
 
@@ -1556,6 +1714,13 @@ pub struct Session {
     /// at enable time; None for queue-less and i915 streams.
     binding: Option<QueueBinding>,
     no_preempt: bool,
+    /// PPGTT address of the opener's per-batch query-report buffer in
+    /// the bound context's VM (open property 14). 0 when the stream does
+    /// no query sampling.
+    query_address: u64,
+    /// Query-report buffer size in bytes (open property 15). 0 when the
+    /// stream does no query sampling.
+    query_size: u64,
     privileged: bool,
 }
 impl core::fmt::Debug for Session {
@@ -1579,6 +1744,8 @@ impl Session {
         exec_queue: Option<u32>,
         binding: Option<QueueBinding>,
         no_preempt: bool,
+        query_address: u64,
+        query_size: u64,
         privileged: bool,
     ) -> Arc<Self> {
         // Xe2+ OAG overrun mode writes no partial report at the buffer end.
@@ -1607,6 +1774,8 @@ impl Session {
             exec_queue,
             binding,
             no_preempt,
+            query_address,
+            query_size,
             privileged,
         })
     }
@@ -2671,6 +2840,29 @@ impl<A: BootAllocator> Unit<A> {
             control |= PES_DISAG_EN;
         }
         io.rmw(OACONTROL, OACONTROL_USED, control)?;
+        // NO_PREEMPT + query sampling (issue #1774), applied only once
+        // the MMIO enable has succeeded: the schedule override and the
+        // per-batch query sampler live on the bound context from here
+        // until disable, so the next claim's GuC Policy KLVs carry
+        // quantum 0 / preempt timeout 0 and the exec path emits one
+        // MI_REPORT_PERF_COUNT per batch. A stream with no bound queue
+        // (or no query buffer) applies nothing.
+        if session.no_preempt() {
+            if let Some(binding) = session.queue_binding() {
+                binding.context.oa_apply_no_preempt();
+            }
+        }
+        if session.query_address != 0 {
+            if let Some(binding) = session.queue_binding() {
+                binding
+                    .context
+                    .set_query_sampler(Some(Arc::new(QuerySampler::new(
+                        session.query_address,
+                        session.query_size as u32,
+                        session.format.size,
+                    ))));
+            }
+        }
         self.active = true;
         self.next_poll = now.saturating_add(POLL_NS);
         session.set_enabled(true);
@@ -2686,6 +2878,17 @@ impl<A: BootAllocator> Unit<A> {
         now: u64,
     ) -> Result<(), FsError> {
         session.set_enabled(false);
+        // NO_PREEMPT + query sampling (issue #1774): restore the bound
+        // context's schedule and stop the per-batch query. This runs
+        // before the active early-return on purpose, so a disable of a
+        // stream whose MMIO was never enabled still cannot leak the
+        // override; both restores are idempotent no-ops when nothing
+        // was applied. The retained binding still names the context
+        // even when the queue itself is gone.
+        if let Some(binding) = session.queue_binding() {
+            binding.context.oa_restore_no_preempt();
+            binding.context.set_query_sampler(None);
+        }
         if !self.active {
             return Ok(());
         }
@@ -2762,6 +2965,16 @@ impl<A: BootAllocator> Unit<A> {
             self.per_context = false;
             self.stop_metric_set(&mut io)
         })();
+        // NO_PREEMPT + query sampling (issue #1774): the GT is stopping
+        // and this path clears `active` without going through
+        // `disable`, so restore the bound context's schedule and clear
+        // the query sampler here before the session is dropped.
+        if let Some(session) = &self.session {
+            if let Some(binding) = session.queue_binding() {
+                binding.context.oa_restore_no_preempt();
+                binding.context.set_query_sampler(None);
+            }
+        }
         self.invalidate();
         self.session = None;
         self.quiesce = None;
@@ -3044,6 +3257,8 @@ pub(crate) fn test_session(
         None,
         None,
         false,
+        0,
+        0,
         true,
     )
 }
@@ -3077,6 +3292,8 @@ pub(crate) fn test_session_exec(
             alive,
         )),
         false,
+        0,
+        0,
         true,
     )
 }
@@ -3110,6 +3327,8 @@ pub(crate) fn test_session_i915(
         None,
         None,
         false,
+        0,
+        0,
         true,
     )
 }

@@ -6167,8 +6167,12 @@ NARF bounds and differences from the source:
   source checks only at open and mmap.
 - OA syncs and OAR/OAC exec-queue streams are implemented with native
   fixtures, including per-context OAR/OAC programming at enable/disable;
-  NO_PREEMPT is accepted at open with its timeslice/preempt-timeout
-  programming still to do (#1774).
+  NO_PREEMPT (property 9) holds the bound queue at timeslice 0 and
+  preempt timeout 0 from enable until disable, restoring the saved
+  schedule at disable and on close (#1774); MI_REPORT_PERF_COUNT query
+  sampling (open properties 14/15: the opener's per-batch report
+  buffer in the bound context's PPGTT) emits one query per batch in
+  the exec path (#1774).
 - There is no mmap of the OA buffer, no `metrics/<uuid>/id` sysfs
   directory and no `observation_paranoid` sysctl.
 - Media-GT OAM, OAM_SAG and MERT units, PTL and Gen12 are not published.
@@ -7294,6 +7298,8 @@ This slice adds context-attached OA stream support on native Xe queues alongside
      - Unprivileged callers can open event/batch-triggered streams on their own queue (`sample: false`), with stream ioctls (`ENABLE`, `DISABLE`, `CONFIG`, `STATUS`) and reads permitted without physical authority.
      - Periodic timer sampling (`sample: true`) and preemption holding (`no_preempt: true`, property 9) require privilege (`Gate::PHYSICAL`).
    - `Session`: records `exec_queue: Option<u32>`, `no_preempt: bool`, and `privileged: bool` with exposed accessors.
+   - NO_PREEMPT (#1774): at enable the bound context's schedule is saved and its timeslice held at 0 (Linux `xe_oa_disable_preempt_timeslice`, which sets timeslice and preempt timeout to 0); the GuC Policy KLVs then carry EXECUTION_QUANTUM 0 and preempt timeout 0 for the next claim. Disable (and close/teardown) restores the saved pair — the user's own quantum, not the engine-class default Linux restores. A `configure_schedule` while the override is live records the new pair as the saved values, so the restore does not clobber a reconfiguration.
+   - MI_REPORT_PERF_COUNT query sampling (#1774): open properties 14 (query buffer address) and 15 (query buffer size) name the opener's per-batch report buffer in the bound context's PPGTT; both or neither, query-mode streams only (bound queue, no periodic sampling, render/compute engine), whole reports, at least one, base report-aligned. At enable the exec path registers a sampler on the bound context; each submitted batch splices one Gen8+ 4-dword `MI_REPORT_PERF_COUNT` (`(0x28 << 23) | (4 - 2)`, address, per-stream report-ID sequence starting at 1) before the owned breadcrumb, so the report lands in the next rotating slot. The exec path refuses to submit while the buffer is not resident-writable in the VM. The destination is a PPGTT address, never GGTT: the i915 command parser requires `MI_REPORT_PERF_COUNT_GGTT == 0` and the GPU forces the per-process address space for this command.
 
 2. **Steered Manual Capture (`intel_gpu_guc_capture`):**
    - `capture_manual_steered(family, engine, steered, read, read_steered)` reads steered render/compute extension registers (`lists.steered`) using MCR steering into `self.regs[CLASS]` with flags `STEERING_NEEDED | (group << 12) | (instance << 20)`.
