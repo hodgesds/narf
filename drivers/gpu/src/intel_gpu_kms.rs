@@ -1339,6 +1339,22 @@ pub(crate) fn install(
             .set_cmrr_rate(1, Some(crate::intel_gpu_vrr::CmrrRate::Fps59_940));
         crate::intel_gpu_vrr::VRR_STATE.set_cmrr_timings(1, Some(cmrr_timings));
     }
+    // VRR readback/sanitize at install (#1772): reconcile whatever
+    // VRR state firmware/GOP left on Pipe A before the atomic path
+    // publishes it, and surface the reconciled enable state to the
+    // registered card.
+    let reconciled = crate::intel_gpu_vrr::reconcile_vrr_at_setup(
+        &display.platform.window,
+        crate::intel_gpu_vrr::VrrTranscoder::A,
+        ip,
+        1,
+    );
+    if let Some(card) = crate::drm_registry::mode_state(index) {
+        let mut card = card.lock();
+        if let Some(slot) = card.vrr_enabled.iter_mut().find(|(id, _)| *id == 1) {
+            slot.1 = reconciled.enabled;
+        }
+    }
     display.platform.console_published(&console);
 }
 pub(crate) fn display(index: u32) -> Option<Arc<Display>> {

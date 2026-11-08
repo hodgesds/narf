@@ -282,6 +282,19 @@ impl IntelDpBridge {
                 if pipe == crate::intel_gpu_pipes::Pipe::A {
                     let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_gen12_platform(family);
                     let range = crate::intel_gpu_dp::vrr_range_from_aux(&mmio, ddi);
+                    // VRR readback/sanitize at modeset setup (#1772):
+                    // reconcile any GOP-left VRR state on Pipe A
+                    // before the per-modeset compute publishes fresh
+                    // timings. The atomic-path surface is the install
+                    // hook's job (no card index in scope here); the
+                    // sequencing lane (#1769) owns publishing modeset
+                    // results to the card.
+                    crate::intel_gpu_vrr::reconcile_vrr_at_setup(
+                        &mmio,
+                        crate::intel_gpu_vrr::VrrTranscoder::A,
+                        ip,
+                        1,
+                    );
                     crate::intel_gpu_vrr::recompute_timings_for_modeset(
                         1,
                         &mode,

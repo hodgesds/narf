@@ -64,6 +64,18 @@ pub const VRR_STATUS_FLIP_BEING_PUSHED: u32 = 1 << 26;
 pub const TRANS_PUSH_EN: u32 = 1 << 31;
 pub const TRANS_PUSH_SEND: u32 = 1 << 30;
 
+/// `TRANS_VRR_VMIN` field mask (`i915_reg.h` `VRR_VMIN_MASK`, GENMASK(15, 0)).
+pub const VRR_VMIN_MASK: u32 = 0xffff;
+/// `TRANS_VRR_VMAX` field mask (`i915_reg.h` `VRR_VMAX_MASK`, GENMASK(19, 0)).
+pub const VRR_VMAX_MASK: u32 = 0x000f_ffff;
+/// `TRANS_VRR_FLIPLINE` field mask (`i915_reg.h` `VRR_FLIPLINE_MASK`, GENMASK(19, 0)).
+pub const VRR_FLIPLINE_MASK: u32 = 0x000f_ffff;
+/// `TRANS_VRR_CTL` pipeline-full field mask, Gen12/display 13
+/// (`i915_reg.h` `VRR_CTL_PIPELINE_FULL_MASK`, GENMASK(10, 3)).
+pub const VRR_CTL_PIPELINE_FULL_MASK: u32 = 0x7f8;
+/// Shift of the `TRANS_VRR_CTL` pipeline-full field.
+pub const VRR_CTL_PIPELINE_FULL_SHIFT: u32 = 3;
+
 /// Max hardware vertical total supported by the VRR registers (13 bits).
 pub const VRR_MAX_VTOTAL_HW: u32 = 0x1fff;
 
@@ -1375,6 +1387,234 @@ pub fn capture_mode_from_hw(io: &(impl MmioWindow + ?Sized), trans: VrrTranscode
         h_sync_positive: false,
         v_sync_positive: false,
     })
+}
+
+/// Decoded VRR register state read back from one transcoder.
+///
+/// Linux `intel_vrr_get_config` equivalent (the decode half):
+/// `TRANS_VRR_CTL` (enable, CMRR, flip-line), `TRANS_VRR_VMIN` /
+/// `TRANS_VRR_VMAX` / `TRANS_VRR_FLIPLINE` (register value + 1 when
+/// `FLIP_LINE_EN` is set), `TRANS_VRR_VSYNC` (display 14+), CMRR
+/// M/N, and the guardband (display 14+, `TRANS_VRR_CTL[15:0]`) or
+/// pipeline-full (Gen12/display 13, `TRANS_VRR_CTL[10:3]`).
+///
+/// Field masks are grounded in `i915_reg.h` (`VRR_VMIN_MASK`,
+/// `VRR_VMAX_MASK`, `VRR_FLIPLINE_MASK`, `VRR_CTL_PIPELINE_FULL_MASK`,
+/// `XELPD_VRR_CTL_VRR_GUARDBAND_MASK`); the CMRR-enable bit and the
+/// `TRANS_VRR_VSYNC` / CMRR M/N offsets are the V1 lane's constants
+/// (no CMRR/VSYNC definitions in the `i915_reg.h` copy on file).
+///
+/// The `TRANS_VRR_STATUS` live bits are NOT used here: the copy of
+/// `i915_reg.h` on file says bit 28 is `NO_FLIP_FRAME`, while the
+/// V1 lane's `VRR_STATUS_CMRR_EN_LIVE` constant puts the CMRR live
+/// bit at 28 — the two disagree, so readback trusts the CTL
+/// enable/CMRR bits only. See the V1 notes in the spec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VrrReadback {
+    pub enabled: bool,
+    pub cmrr_enabled: bool,
+    pub flipline_en: bool,
+    pub vmin: u32,
+    pub vmax: u32,
+    pub flipline: u32,
+    pub guardband: u16,
+    pub pipeline_full: u16,
+    pub vsync_start: u32,
+    pub vsync_end: u32,
+    pub cmrr_m: u64,
+    pub cmrr_n: u64,
+}
+
+/// Read back one transcoder's VRR registers into a [`VrrReadback`].
+///
+/// Returns `None` when the MMIO window is dead (the CTL register
+/// reads all-ones, the same dead-window signal `vrr_disable` uses)
+/// or `display_access_ok` reports the display registers as
+/// inaccessible. `vmin`/`vmax`/`flipline` are the programmed values:
+/// the register value + 1 when `FLIP_LINE_EN` is set (Linux
+/// `intel_vrr_get_config`), the register value directly otherwise.
+///
+/// GEN12 ENCODE TENSION: NARF's Gen12 write path stores the value
+/// directly while Linux's programming path applies vmin − 1 (the
+/// V1 lane's open UNVERIFIED item); readback follows Linux's decode
+/// and documents the discrepancy here rather than silently
+/// re-encoding the write path's convention.
+pub fn readback_vrr(
+    io: &(impl MmioWindow + ?Sized),
+    trans: VrrTranscoder,
+    ip: DisplayVrrIp,
+) -> Option<VrrReadback> {
+    let base = trans.base();
+    let ctl = io.read32(base + TRANS_VRR_CTL_OFFSET);
+    if ctl == u32::MAX || !io.display_access_ok() {
+        return None;
+    }
+    let enabled = ctl & VRR_CTL_VRR_ENABLE != 0;
+    let cmrr_enabled = ctl & VRR_CTL_CMRR_ENABLE != 0;
+    let flipline_en = ctl & VRR_CTL_FLIP_LINE_EN != 0;
+    // Register values are one less than the stored vtotal when the
+    // flip line is enabled; without it the register holds the value
+    // directly. The field mask applies before the +1.
+    let plus_one = u32::from(flipline_en);
+    let vmin = (io.read32(base + TRANS_VRR_VMIN_OFFSET) & VRR_VMIN_MASK) + plus_one;
+    let vmax = (io.read32(base + TRANS_VRR_VMAX_OFFSET) & VRR_VMAX_MASK) + plus_one;
+    let flipline = (io.read32(base + TRANS_VRR_FLIPLINE_OFFSET) & VRR_FLIPLINE_MASK) + plus_one;
+    // Guardband (display 14+, low 16 bits of CTL) or pipeline-full
+    // (Gen12/display 13, CTL[10:3]) — never both, per the IP.
+    let (guardband, pipeline_full) = if ip.uses_guardband_in_ctl() {
+        (u16::try_from(ctl & VRR_CTL_GUARDBAND_MASK).unwrap_or(0), 0)
+    } else {
+        (
+            0,
+            u16::try_from((ctl & VRR_CTL_PIPELINE_FULL_MASK) >> VRR_CTL_PIPELINE_FULL_SHIFT)
+                .unwrap_or(0),
+        )
+    };
+    let (vsync_start, vsync_end) = if ip.has_vrr_vsync() {
+        let vsync = io.read32(base + TRANS_VRR_VSYNC_OFFSET);
+        if vsync == u32::MAX {
+            // Dead register on an otherwise live window: report
+            // no VSYNC rather than a bogus 0x1fff/0x1fff range.
+            (0, 0)
+        } else {
+            (vsync & 0x1fff, (vsync >> 16) & 0x1fff)
+        }
+    } else {
+        (0, 0)
+    };
+    let (cmrr_m, cmrr_n) = if cmrr_enabled {
+        let m_lo = io.read32(base + TRANS_CMRR_M_LO_OFFSET) as u64;
+        let m_hi = io.read32(base + TRANS_CMRR_M_HI_OFFSET) as u64;
+        let n_lo = io.read32(base + TRANS_CMRR_N_LO_OFFSET) as u64;
+        let n_hi = io.read32(base + TRANS_CMRR_N_HI_OFFSET) as u64;
+        ((m_hi << 32) | m_lo, (n_hi << 32) | n_lo)
+    } else {
+        (0, 0)
+    };
+    Some(VrrReadback {
+        enabled,
+        cmrr_enabled,
+        flipline_en,
+        vmin,
+        vmax,
+        flipline,
+        guardband,
+        pipeline_full,
+        vsync_start,
+        vsync_end,
+        cmrr_m,
+        cmrr_n,
+    })
+}
+
+/// Outcome of [`reconcile_vrr_at_setup`]: the readback (if any),
+/// whether a fixed-RR TG was disabled, and the enabled state
+/// published to [`VRR_STATE`] (and, at install, to the atomic
+/// `Card::vrr_enabled` slot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VrrReconcileOutcome {
+    pub readback: Option<VrrReadback>,
+    pub disabled_fixed_rr: bool,
+    pub enabled: bool,
+}
+
+/// Publish a decoded readback into [`VRR_STATE`]. The CMRR timings
+/// are only overwritten when CMRR is actually on in hardware: the
+/// install seed stores default 59.94 Hz CMRR timings so CMRR can be
+/// enabled later without a modeset, and clearing them on a VRR-off
+/// readback would take that away.
+fn publish_readback(crtc_id: u32, ip: DisplayVrrIp, rb: &VrrReadback) {
+    VRR_STATE.set_enabled(crtc_id, rb.enabled);
+    VRR_STATE.set_cmrr_enabled(crtc_id, rb.cmrr_enabled);
+    if rb.enabled {
+        VRR_STATE.set_timings(
+            crtc_id,
+            Some(VrrTimings {
+                vmin: rb.vmin,
+                vmax: rb.vmax,
+                flipline: rb.flipline,
+                guardband: rb.guardband,
+                pipeline_full: rb.pipeline_full,
+                vsync_start: rb.vsync_start,
+                vsync_end: rb.vsync_end,
+                as_sdp: ip.has_vrr_vsync() && (rb.vsync_start != 0 || rb.vsync_end != 0),
+            }),
+        );
+    } else {
+        VRR_STATE.set_timings(crtc_id, None);
+    }
+    if rb.cmrr_enabled {
+        VRR_STATE.set_cmrr_timings(
+            crtc_id,
+            Some(CmrrTimings {
+                cmrr_m: rb.cmrr_m,
+                cmrr_n: rb.cmrr_n,
+                vmin: rb.vmin,
+                vmax: rb.vmax,
+                flipline: rb.flipline,
+                guardband: rb.guardband,
+                vsync_start: rb.vsync_start,
+                vsync_end: rb.vsync_end,
+            }),
+        );
+    }
+}
+
+/// Read back one transcoder's VRR registers and reconcile the
+/// GOP-left state at install/modeset setup (Linux
+/// `intel_vrr_get_config` + the GOP-readback sanitize, #1772).
+///
+/// - No readable state (dead MMIO): `VRR_STATE` is left untouched.
+/// - VRR off in hardware: publish disabled (enable off, timings
+///   cleared) so later modesets start from a known-off TG.
+/// - VRR on with fixed-RR timings (`vmin == vmax`) and CMRR off:
+///   the TG is running a fixed rate, not variable refresh — disable
+///   it ([`vrr_disable`]) and publish disabled. CMRR is exempt: it
+///   programs `vmin == vmax == vtotal` by design (the rate varies
+///   via M/N, not via the vtotal range).
+/// - VRR on with a real variable range (`vmin < vmax`): publish the
+///   readback timings + enable flags into `VRR_STATE`. The sink
+///   range is NOT recovered from registers (only the programmed
+///   vmin/vmax are visible); it stays whatever discovery published,
+///   and the per-modeset recompute replaces the timings from the
+///   committed mode + range anyway.
+///
+/// Returns the outcome; callers at install surface `enabled` to
+/// the atomic path. The caller passes the transcoder matching the
+/// CRTC (`VrrTranscoder::A` for CRTC 1 / Pipe A).
+pub fn reconcile_vrr_at_setup(
+    io: &(impl MmioWindow + ?Sized),
+    trans: VrrTranscoder,
+    ip: DisplayVrrIp,
+    crtc_id: u32,
+) -> VrrReconcileOutcome {
+    let Some(rb) = readback_vrr(io, trans, ip) else {
+        return VrrReconcileOutcome {
+            readback: None,
+            disabled_fixed_rr: false,
+            enabled: VRR_STATE.is_enabled(crtc_id),
+        };
+    };
+    // Fixed-RR TG, not CMRR: disable it in hardware, then publish off.
+    if rb.enabled && !rb.cmrr_enabled && rb.vmin == rb.vmax && vrr_disable(io, trans, ip).is_ok() {
+        VRR_STATE.set_enabled(crtc_id, false);
+        VRR_STATE.set_cmrr_enabled(crtc_id, false);
+        VRR_STATE.set_timings(crtc_id, None);
+        return VrrReconcileOutcome {
+            readback: Some(rb),
+            disabled_fixed_rr: true,
+            enabled: false,
+        };
+    }
+    // Otherwise (not a fixed-RR TG, or the disable failed and the TG is
+    // still on in hardware): publish the readback as-is rather than
+    // claim it is off.
+    publish_readback(crtc_id, ip, &rb);
+    VrrReconcileOutcome {
+        readback: Some(rb),
+        disabled_fixed_rr: false,
+        enabled: rb.enabled,
+    }
 }
 
 /// Generate a multi-line formatted summary of the VRR and CMRR engine state across all pipes.

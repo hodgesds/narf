@@ -656,8 +656,20 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
     // the range discovery published for the sink, instead of reusing
     // install-time timings. AS SDP is not yet resolved from DPCD
     // (UNVERIFIED), so VSYNC stays off; see `VrrComputeOpts`.
+    // VRR readback/sanitize at modeset setup (#1772): reconcile
+    // any GOP-left VRR state on Pipe A before the per-modeset
+    // compute publishes fresh timings. The atomic-path surface
+    // (Card::vrr_enabled) is the install hook's job — this path
+    // has no card index in scope — and the sequencing lane (#1769)
+    // owns publishing modeset results to the card.
     if pipe == Pipe::A {
         let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_gen12_platform(family);
+        crate::intel_gpu_vrr::reconcile_vrr_at_setup(
+            mmio,
+            crate::intel_gpu_vrr::VrrTranscoder::A,
+            ip,
+            1,
+        );
         crate::intel_gpu_vrr::recompute_timings_for_modeset(
             1,
             &mode,

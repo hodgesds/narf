@@ -12,12 +12,13 @@ use crate::{
         capture_mode_from_hw, cmrr_disable, cmrr_enable, install_vbt, installed_vrr,
         is_cmrr_active, is_vrr_active, mode_vrefresh, msa_timing_par_ignore_wanted, on_plane_flip,
         populate_card, program_cmrr_timings, program_fixed_rr_timings, program_vrr_timings,
-        recompute_timings_for_modeset, set_context_latency_for_crtc, sink_vrr_range, vrr_disable,
-        vrr_enable, vrr_excludes_psr, vrr_is_variable, vrr_send_push, vrr_status_string, CmrrRate,
-        CmrrTimings, DisplayVrrIp, VbtVrr, VrrComputeOpts, VrrConnectorKind, VrrRange, VrrTimings,
-        VrrTranscoder, EMP_AS_SDP_TL_OFFSET, TRANSCODER_A_BASE, TRANS_CMRR_M_HI_OFFSET,
-        TRANS_CMRR_M_LO_OFFSET, TRANS_CMRR_N_HI_OFFSET, TRANS_CMRR_N_LO_OFFSET, TRANS_PUSH_EN,
-        TRANS_PUSH_OFFSET, TRANS_VRR_CTL_OFFSET, TRANS_VRR_FLIPLINE_OFFSET, TRANS_VRR_VMAX_OFFSET,
+        readback_vrr, recompute_timings_for_modeset, reconcile_vrr_at_setup,
+        set_context_latency_for_crtc, sink_vrr_range, vrr_disable, vrr_enable, vrr_excludes_psr,
+        vrr_is_variable, vrr_send_push, vrr_status_string, CmrrRate, CmrrTimings, DisplayVrrIp,
+        VbtVrr, VrrComputeOpts, VrrConnectorKind, VrrRange, VrrTimings, VrrTranscoder,
+        EMP_AS_SDP_TL_OFFSET, TRANSCODER_A_BASE, TRANS_CMRR_M_HI_OFFSET, TRANS_CMRR_M_LO_OFFSET,
+        TRANS_CMRR_N_HI_OFFSET, TRANS_CMRR_N_LO_OFFSET, TRANS_PUSH_EN, TRANS_PUSH_OFFSET,
+        TRANS_VRR_CTL_OFFSET, TRANS_VRR_FLIPLINE_OFFSET, TRANS_VRR_VMAX_OFFSET,
         TRANS_VRR_VMIN_OFFSET, TRANS_VRR_VSYNC_OFFSET, VRR_CTL_CMRR_ENABLE, VRR_CTL_FLIP_LINE_EN,
         VRR_CTL_IGN_MAX_STRETCH, VRR_CTL_VRR_ENABLE, VRR_STATE,
     },
@@ -1269,3 +1270,226 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_vrr",
     smoke_vrr_guardband_subtracts_set_context_latency
 );
+
+// ── VRR readback / GOP-left-state reconcile (#1772) ──────────────────────────
+//
+// Register values are built from the spec, not from the code under
+// test: offsets from `i915_reg.h` (TRANS_VRR_CTL 0x420, VMIN 0x434,
+// VMAX 0x424, FLIPLINE 0x438, VSYNC 0x078, CMRR M/N 0x4f0–0x4fc),
+// field masks from the same header (VMIN GENMASK(15, 0), VMAX /
+// FLIPLINE GENMASK(19, 0), PIPELINE_FULL GENMASK(10, 3), GUARDBAND
+// GENMASK(15, 0)), the +1-under-FLIP_LINE_EN rule and the
+// fixed-RR sanitize from the issue. The programmed vtots are
+// realistic GOP-left values (1080p60 vtotal 1125, vmax 1450 ≈ a
+// ~46 Hz floor). The CMRR M/N lo/hi split mirrors the write path
+// (`program_cmrr_timings` stores lo then hi), so the fixture pins
+// the readback∘write round-trip, not a second copy of a guess.
+
+fn smoke_intel_vrr_readback_decode() -> TestResult {
+    let base = TRANSCODER_A_BASE;
+
+    // GOP left VRR on with a real variable range (display 13):
+    // register values are one less than the stored vtotal while
+    // FLIP_LINE_EN is set.
+    let io = MockMmio::new();
+    io.set(
+        base + TRANS_VRR_CTL_OFFSET,
+        VRR_CTL_VRR_ENABLE | VRR_CTL_FLIP_LINE_EN,
+    );
+    io.set(base + TRANS_VRR_VMIN_OFFSET, 1124);
+    io.set(base + TRANS_VRR_VMAX_OFFSET, 1449);
+    io.set(base + TRANS_VRR_FLIPLINE_OFFSET, 1124);
+    let rb =
+        readback_vrr(&io, VrrTranscoder::A, DisplayVrrIp::Display13).expect("live window decodes");
+    assert!(rb.enabled);
+    assert!(!rb.cmrr_enabled);
+    assert!(rb.flipline_en);
+    assert_eq!(rb.vmin, 1125);
+    assert_eq!(rb.vmax, 1450);
+    assert_eq!(rb.flipline, 1125);
+    assert_eq!(rb.guardband, 0);
+    assert_eq!(rb.pipeline_full, 0);
+    assert_eq!((rb.vsync_start, rb.vsync_end), (0, 0));
+    assert_eq!((rb.cmrr_m, rb.cmrr_n), (0, 0));
+
+    // Gen12: the pipeline-full field lives in CTL[10:3].
+    let io = MockMmio::new();
+    io.set(
+        base + TRANS_VRR_CTL_OFFSET,
+        VRR_CTL_VRR_ENABLE | VRR_CTL_FLIP_LINE_EN | (42 << 3),
+    );
+    io.set(base + TRANS_VRR_VMIN_OFFSET, 1124);
+    io.set(base + TRANS_VRR_VMAX_OFFSET, 1300);
+    io.set(base + TRANS_VRR_FLIPLINE_OFFSET, 1124);
+    let rb =
+        readback_vrr(&io, VrrTranscoder::A, DisplayVrrIp::Gen12).expect("Gen12 window decodes");
+    assert_eq!(rb.pipeline_full, 42);
+    assert_eq!(rb.guardband, 0);
+    assert_eq!(rb.vmin, 1125);
+    assert_eq!(rb.vmax, 1301);
+    assert_eq!(rb.flipline, 1125);
+
+    // Display 14: guardband in CTL[15:0] + packed VSYNC
+    // (end in the high half, start in the low half).
+    let io = MockMmio::new();
+    io.set(
+        base + TRANS_VRR_CTL_OFFSET,
+        VRR_CTL_VRR_ENABLE | VRR_CTL_FLIP_LINE_EN | 44,
+    );
+    io.set(base + TRANS_VRR_VMIN_OFFSET, 1124);
+    io.set(base + TRANS_VRR_VMAX_OFFSET, 1449);
+    io.set(base + TRANS_VRR_FLIPLINE_OFFSET, 1124);
+    io.set(base + TRANS_VRR_VSYNC_OFFSET, ((45 & 0x1fff) << 16) | 41);
+    let rb = readback_vrr(&io, VrrTranscoder::A, DisplayVrrIp::Display14)
+        .expect("display 14 window decodes");
+    assert_eq!(rb.guardband, 44);
+    assert_eq!(rb.pipeline_full, 0);
+    assert_eq!((rb.vsync_start, rb.vsync_end), (41, 45));
+    assert_eq!(rb.vmin, 1125);
+
+    // No FLIP_LINE_EN: the register holds the value directly,
+    // no +1 — the decode must not apply the adjustment blindly.
+    let io = MockMmio::new();
+    io.set(base + TRANS_VRR_CTL_OFFSET, VRR_CTL_VRR_ENABLE);
+    io.set(base + TRANS_VRR_VMIN_OFFSET, 1125);
+    io.set(base + TRANS_VRR_VMAX_OFFSET, 1450);
+    io.set(base + TRANS_VRR_FLIPLINE_OFFSET, 1125);
+    let rb = readback_vrr(&io, VrrTranscoder::A, DisplayVrrIp::Display13)
+        .expect("flip-line-off window decodes");
+    assert!(!rb.flipline_en);
+    assert_eq!((rb.vmin, rb.vmax, rb.flipline), (1125, 1450, 1125));
+
+    // VRR off in hardware decodes as disabled, not as an error.
+    let io = MockMmio::new();
+    io.set(base + TRANS_VRR_CTL_OFFSET, 0);
+    let rb = readback_vrr(&io, VrrTranscoder::A, DisplayVrrIp::Display13)
+        .expect("VRR-off window decodes");
+    assert!(!rb.enabled);
+    assert_eq!((rb.vmin, rb.vmax, rb.flipline), (0, 0, 0));
+
+    // Dead MMIO (CTL reads all-ones) yields no readback.
+    let io = MockMmio::new();
+    io.set(base + TRANS_VRR_CTL_OFFSET, u32::MAX);
+    assert_eq!(
+        readback_vrr(&io, VrrTranscoder::A, DisplayVrrIp::Display13),
+        None
+    );
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_gpu_vrr", smoke_intel_vrr_readback_decode);
+
+fn smoke_intel_vrr_reconcile_fixed_rr() -> TestResult {
+    let base = TRANSCODER_A_BASE;
+    let stale = VrrTimings {
+        vmin: 1125,
+        vmax: 1450,
+        flipline: 1125,
+        guardband: 44,
+        pipeline_full: 0,
+        vsync_start: 0,
+        vsync_end: 0,
+        as_sdp: false,
+    };
+    // Seed stale enabled state so the reconcile must actively
+    // clear it, not merely leave a default.
+    VRR_STATE.set_enabled(1, true);
+    VRR_STATE.set_timings(1, Some(stale));
+
+    // GOP left VRR on with FIXED-RR timings (vmin == vmax):
+    // the TG is running a fixed rate, so the reconcile disables
+    // it in hardware and publishes disabled.
+    let io = MockMmio::new();
+    io.set(
+        base + TRANS_VRR_CTL_OFFSET,
+        VRR_CTL_VRR_ENABLE | VRR_CTL_FLIP_LINE_EN,
+    );
+    io.set(base + TRANS_VRR_VMIN_OFFSET, 1124);
+    io.set(base + TRANS_VRR_VMAX_OFFSET, 1124);
+    io.set(base + TRANS_VRR_FLIPLINE_OFFSET, 1124);
+    let outcome = reconcile_vrr_at_setup(&io, VrrTranscoder::A, DisplayVrrIp::Display13, 1);
+    assert!(outcome.disabled_fixed_rr);
+    assert!(!outcome.enabled);
+    let rb = outcome.readback.expect("fixed-RR readback exists");
+    assert_eq!((rb.vmin, rb.vmax), (1125, 1125));
+    assert!(!VRR_STATE.is_enabled(1));
+    assert_eq!(VRR_STATE.timings(1), None);
+    // The hardware TG was actually disabled: CTL rewritten with
+    // ENABLE cleared (FLIP_LINE_EN kept), then a push sent.
+    assert_eq!(
+        io.written(base + TRANS_VRR_CTL_OFFSET),
+        vec![VRR_CTL_FLIP_LINE_EN]
+    );
+    assert_eq!(io.written(base + TRANS_PUSH_OFFSET), vec![0]);
+
+    // GOP left VRR off: publish disabled with no hardware writes.
+    VRR_STATE.set_enabled(1, true);
+    VRR_STATE.set_timings(1, Some(stale));
+    let io = MockMmio::new();
+    io.set(base + TRANS_VRR_CTL_OFFSET, 0);
+    let outcome = reconcile_vrr_at_setup(&io, VrrTranscoder::A, DisplayVrrIp::Display13, 1);
+    assert!(!outcome.disabled_fixed_rr);
+    assert!(!outcome.enabled);
+    assert!(!VRR_STATE.is_enabled(1));
+    assert_eq!(VRR_STATE.timings(1), None);
+    assert!(io.written(base + TRANS_VRR_CTL_OFFSET).is_empty());
+
+    // Dead MMIO: state is left untouched, not reset.
+    VRR_STATE.set_enabled(1, true);
+    VRR_STATE.set_timings(1, Some(stale));
+    let io = MockMmio::new();
+    io.set(base + TRANS_VRR_CTL_OFFSET, u32::MAX);
+    let outcome = reconcile_vrr_at_setup(&io, VrrTranscoder::A, DisplayVrrIp::Display13, 1);
+    assert_eq!(outcome.readback, None);
+    assert!(!outcome.disabled_fixed_rr);
+    assert!(outcome.enabled);
+    assert!(VRR_STATE.is_enabled(1));
+    assert_eq!(VRR_STATE.timings(1), Some(stale));
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_reconcile_fixed_rr
+);
+
+fn smoke_intel_vrr_reconcile_cmrr() -> TestResult {
+    let base = TRANSCODER_A_BASE;
+    // GOP left CMRR on: vmin == vmax is BY DESIGN (the rate varies
+    // via M/N, not the vtotal range), so the fixed-RR sanitize
+    // must NOT disable the TG.
+    VRR_STATE.set_enabled(1, false);
+    let io = MockMmio::new();
+    io.set(
+        base + TRANS_VRR_CTL_OFFSET,
+        VRR_CTL_VRR_ENABLE | VRR_CTL_CMRR_ENABLE | VRR_CTL_FLIP_LINE_EN | 44,
+    );
+    io.set(base + TRANS_VRR_VMIN_OFFSET, 1124);
+    io.set(base + TRANS_VRR_VMAX_OFFSET, 1124);
+    io.set(base + TRANS_VRR_FLIPLINE_OFFSET, 1124);
+    io.set(base + TRANS_VRR_VSYNC_OFFSET, ((45 & 0x1fff) << 16) | 41);
+    io.set(base + TRANS_CMRR_M_LO_OFFSET, 0x1234_5678);
+    io.set(base + TRANS_CMRR_M_HI_OFFSET, 0x0000_0002);
+    io.set(base + TRANS_CMRR_N_LO_OFFSET, 0x3b9a_ca00);
+    io.set(base + TRANS_CMRR_N_HI_OFFSET, 0x0000_0000);
+    let outcome = reconcile_vrr_at_setup(&io, VrrTranscoder::A, DisplayVrrIp::Display14, 1);
+    assert!(!outcome.disabled_fixed_rr);
+    assert!(outcome.enabled);
+    let rb = outcome.readback.expect("CMRR readback exists");
+    assert!(rb.cmrr_enabled);
+    assert_eq!(rb.cmrr_m, 0x0000_0002_1234_5678);
+    assert_eq!(rb.cmrr_n, 1_000_000_000);
+    assert_eq!((rb.vmin, rb.vmax), (1125, 1125));
+    assert_eq!(rb.guardband, 44);
+    assert!(VRR_STATE.is_enabled(1));
+    assert!(VRR_STATE.is_cmrr_enabled(1));
+    let cmrr = VRR_STATE.cmrr_timings(1).expect("CMRR timings published");
+    assert_eq!(cmrr.cmrr_m, 0x0000_0002_1234_5678);
+    assert_eq!(cmrr.cmrr_n, 1_000_000_000);
+    assert_eq!((cmrr.vmin, cmrr.vmax), (1125, 1125));
+    // No hardware writes at all: nothing needed disabling.
+    assert!(io.written(base + TRANS_VRR_CTL_OFFSET).is_empty());
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_gpu_vrr", smoke_intel_vrr_reconcile_cmrr);
