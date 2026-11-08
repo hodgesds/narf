@@ -350,6 +350,7 @@ fn set_setting_bit(index: u16, bit: u32, on: bool) -> u32 {
 /// - When the controller is not powered, the setting is recorded
 ///   and applied on the next power-on (no HCI now) — except a
 ///   discoverable-with-timeout, which is NOT_POWERED while off.
+///
 /// A failed HCI write leaves the bitmap unchanged and replies
 /// CMD_STATUS with the failure (FAILED, or TIMEOUT when the
 /// Command Complete never arrived).
