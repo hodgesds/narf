@@ -359,6 +359,10 @@ fn render_queue(id: u32) -> Option<(u16, usize, QueueBinding)> {
     let (class, width, engine) = match id {
         3 => (0, 1, Engine::Rcs0),
         4 => (4, 2, Engine::Ccs0),
+        // Width-1 compute queue, mirroring smoke_oa_exec_queue_oar_oac_streams'
+        // id 11: the only queue OAC formats can bind (OAC on render is
+        // rejected; a width-2 compute queue is rejected with EOPNOTSUPP).
+        11 => (4, 1, Engine::Ccs0),
         _ => return None,
     };
     Some((
@@ -897,6 +901,22 @@ fn open_stream(backend: &Arc<Backend>, wire: &Wire, props: &[(u32, u64)]) -> Arc
     );
     wire.file()
 }
+/// open_stream bound to an exec queue: OAR/OAC formats are per-context-only
+/// since d9594ad0d1 and cannot open system-wide. The caller passes the queue
+/// id as property 7 in `props` and the resolver that answers it.
+fn open_stream_on_queue(
+    backend: &Arc<Backend>,
+    wire: &Wire,
+    props: &[(u32, u64)],
+    queues: QueueLookup<'_>,
+) -> Arc<dyn FileOps> {
+    let at = wire.chain(0x1000, props);
+    assert_eq!(
+        ready(open(Some(backend.clone()), at, wire, queues, ALLOW, None)),
+        Ok(41)
+    );
+    wire.file()
+}
 fn session_of(backend: &Backend) -> Arc<Session> {
     backend
         .unit
@@ -978,14 +998,19 @@ fn smoke_oa_source_register_sequences_per_profile() -> TestResult {
     }
     let backend = Backend::new(device(54, MTL, 1271));
     let config = add(&backend, &wire, 1, &[(0x9888, 0)]);
+    // This half used OAC192, which can no longer open system-wide
+    // (d9594ad0d1). The format is incidental here — this half proves the
+    // 12.71 TLB skip and the buffer field, both format-independent — so it
+    // uses the OAG format, as the first half does; OAC192 coverage lives in
+    // the read-wrap test (per-context) and the exec-queue tests.
     let file = open_stream(
         &backend,
         &wire,
-        &[(2, 1), (4, OAC192), (3, config), (12, 256 << 10)],
+        &[(2, 1), (4, A24U40), (3, config), (12, 256 << 10)],
     );
     let writes = backend.hw.take();
     assert!(writes.contains(&(OABUFFER, BASE | 1 | 1 << 3)));
-    assert!(writes.contains(&(OACONTROL, (2 << 2) | 1)));
+    assert!(writes.contains(&(OACONTROL, (5 << 2) | 1)));
     assert!(writes.contains(&(OAGLBCTXCTRL, 1)));
     assert_eq!(ready(file.ioctl_user(DISABLE, 0, &wire)), Ok(0));
     assert_eq!(backend.hw.take(), vec![(OACONTROL, 0)]);
@@ -1109,10 +1134,16 @@ fn smoke_oa_read_wrap_clear_enospc_status_eio_and_info() -> TestResult {
     let backend = Backend::new(device(58, MTL, 1270));
     let wire = Wire::new();
     let config = add(&backend, &wire, 1, &[(0x9888, 0)]);
-    let file = open_stream(
+    // OAC192 is per-context-only since d9594ad0d1: a system-wide open is
+    // rejected with InvalidData. The 192-byte report size is load-bearing
+    // here (the straddle arithmetic below needs circ % 192 != 0, and no
+    // 192-byte format decodes system-wide on MTL), so the test binds the
+    // width-1 compute queue (id 11) instead of switching format.
+    let file = open_stream_on_queue(
         &backend,
         &wire,
-        &[(2, 1), (4, OAC192), (3, config), (12, 128 << 10)],
+        &[(2, 1), (4, OAC192), (3, config), (7, 11), (12, 128 << 10)],
+        &render_queue,
     );
     let session = session_of(&backend);
     let hw = &backend.hw;
