@@ -4,7 +4,7 @@
 
 use alloc::vec::Vec;
 
-use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
+use narf_kernel_test::{kernel_test_in, kt_assert_eq, TestResult};
 
 use crate::cmd_db::{CmdDb, CmdDbError};
 

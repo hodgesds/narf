@@ -18,10 +18,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 use super::{
     build_link_options, build_rx_desc, build_tx_desc, decode_fw_version, decode_mac_from_shared,
     decode_rx_wb, fw_version_word, link_rate_to_mbps, link_sample, mac_filter_words,
-    mac_is_invalid, name_for, read_filter_caps, read_fw_version, read_link_status,
-    read_permanent_mac, speed_mask_for, FilterCaps, LinkStatus, RegIo, RxCsumResult, RxdWb, TxDesc,
-    AQC_DEV_113, AQC_DEV_113C, AQC_DEV_113CA, AQC_DEV_113CS, AQC_DEV_113DEV, AQC_DEV_114CS,
-    AQC_DEV_115C, AQC_DEV_116C, AQC_VENDOR, RING_LEN, RX_BUF_LEN,
+    mac_is_invalid, name_for, read_link_status, speed_mask_for, FilterCaps, LinkStatus, RegIo,
+    RxCsumResult, RxdWb, TxDesc, AQC_DEV_113, AQC_DEV_113C, AQC_DEV_113CA, AQC_DEV_113CS,
+    AQC_DEV_113DEV, AQC_DEV_114CS, AQC_DEV_115C, AQC_DEV_116C, AQC_VENDOR, RING_LEN, RX_BUF_LEN,
 };
 
 // ── Spec literals (transcribed from Linux atlantic; independent ────

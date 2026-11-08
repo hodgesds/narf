@@ -12,7 +12,7 @@ use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 
 use crate::aoss::{Qmp, QmpError};
 use crate::fixtures::{run, FakeDelay, FakeRegs};
-use crate::io::{read_bytes, RegIo};
+use crate::io::read_bytes;
 use crate::ipc::Kick;
 
 const SUB: &str = "drivers/soc/qcom";
