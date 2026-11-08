@@ -632,8 +632,12 @@ impl Params {
             return invalid;
         }
         match property {
-            1 if value == 0 => self.oa_unit = 0,
-            1 if value == 1 && device.has_oam() => self.oa_unit = 1,
+            // xe_oa_lookup_oa_unit takes a u32 id (Linux truncates the
+            // u64 property value on the call); only units 0 (OAG) and 1
+            // (OAM) exist. Compare the truncated id, not the raw value,
+            // so a 2^32 unit id still opens unit 0.
+            1 if value as u32 == 0 => self.oa_unit = 0,
+            1 if value as u32 == 1 && device.has_oam() => self.oa_unit = 1,
             1 => return invalid,
             2 => self.sample = value != 0,
             3 => self.metric_set = value as u32,
