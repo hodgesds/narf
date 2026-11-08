@@ -2256,8 +2256,10 @@ kernel_test_in!(
 /// gt_id 1) with its own clock and GMD_ID, lists VCS/VECS with gt_id 1 and
 /// dense GT1 logical instances after GT0's engines, and an exec queue on
 /// gt_id 1 runs a real GuC submission in GT1's epoch. Unknown GT, wrong-GT
-/// class, absent instance, mixed GT, width and VM refusals keep Linux's
-/// xe_exec_queue_create_ioctl errnos and order, before any allocation.
+/// class, absent instance, mixed GT and VM refusals keep Linux's
+/// xe_exec_queue_create_ioctl errnos and order, before any allocation. A
+/// contiguous width-2 VCS row creates a parallel queue instead (a9fbb03fd;
+/// spec §3 pins width > 1 for COPY/VCS/VECS/COMPUTE with contiguous rows).
 fn smoke_xe_mtl_media_gt1_published_queries_queues_and_exec() -> TestResult {
     use super::super::media_gt_sched::{media_until, start_media, Hw};
     use crate::intel_gpu_engine::{Engine, EngineSet};
@@ -2345,12 +2347,6 @@ fn smoke_xe_mtl_media_gt1_published_queries_queues_and_exec() -> TestResult {
             vm,
             FsError::InvalidData,
         ),
-        (
-            alloc::vec![eci(2, 0, 1), eci(2, 1, 1)],
-            2,
-            vm,
-            FsError::InvalidData,
-        ),
         // Unknown GT precedes the VM lookup; a valid GT1 engine reaches it.
         (alloc::vec![eci(2, 0, 2)], 1, 999, FsError::InvalidData),
         (alloc::vec![eci(2, 0, 1)], 1, 999, FsError::NotFound),
@@ -2365,6 +2361,11 @@ fn smoke_xe_mtl_media_gt1_published_queries_queues_and_exec() -> TestResult {
     let (bind, bind_id) = try_queue(&[eci(5, 0, 1)], 1, vm);
     assert_eq!(bind, Ok(0));
     assert_ne!(bind_id, 0);
+    // A contiguous width-2 VCS row on GT1 is a parallel queue, not a
+    // refusal (a9fbb03fd; spec §3): logical 0/1 are physical VCS0/VCS2.
+    let (parallel, parallel_id) = try_queue(&[eci(2, 0, 1), eci(2, 1, 1)], 2, vm);
+    assert_eq!(parallel, Ok(0));
+    assert_ne!(parallel_id, 0);
     // VCS logical 1 on GT1 is physical VCS2; it runs a real media GuC job.
     let (result, queue) = try_queue(&[eci(2, 1, 1)], 1, vm);
     assert_eq!(result, Ok(0));
@@ -2402,7 +2403,7 @@ fn smoke_xe_mtl_media_gt1_published_queries_queues_and_exec() -> TestResult {
     assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
     assert_eq!(pending.context.check_epoch(status.epoch), Ok(()));
     user.mapping.lock().take();
-    for id in [queue, bind_id] {
+    for id in [queue, bind_id, parallel_id] {
         assert_eq!(close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, id), Ok(0));
     }
     assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
