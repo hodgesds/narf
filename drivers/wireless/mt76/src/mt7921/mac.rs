@@ -25,6 +25,8 @@
 
 #![allow(dead_code)]
 
+use core::fmt::Write;
+
 use narf_bus::MmioRegion;
 use narf_time::Deadline;
 
@@ -75,6 +77,7 @@ unsafe fn write_lpctl(mmio: &MmioRegion, v: u32) -> Result<(), PowerError> {
 /// # Safety
 /// `mmio` is the live BAR0 region; caller owns the device.
 pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
+    let mut last: u32 = 0;
     for _ in 0..DRV_OWN_RETRY_COUNT {
         // Tell the link to give ownership to the driver.
         // SAFETY: BAR0 mapped + owned.
@@ -90,7 +93,6 @@ pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
         // Poll OWN_SYNC for clear. 50 ms wall-clock budget per attempt,
         // matching Linux's `mt76_poll_msec_tick(50, 1)`.
         let deadline = Deadline::after_ms(DRV_OWN_POLL_MS);
-        let mut last: u32 = 0;
         let mut access_error = None;
         let cleared = narf_scheduler::responsive_spin_until(
             || {
@@ -121,6 +123,10 @@ pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
             return Ok(());
         }
     }
+    let _ = writeln!(
+        narf_console::Writer,
+        "  mt7921: take_driver_own timeout (last lpctl={last:#x})"
+    );
     Err(PowerError::Timeout)
 }
 

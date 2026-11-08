@@ -923,6 +923,7 @@ impl Rig {
             va.as_mut_ptr() as usize,
             &rig.vm,
             &rig.gem,
+            Some(&rig.syncobjs),
         )
         .unwrap();
         let mut c = [0u8; 16];
@@ -1564,3 +1565,52 @@ fn sync_implicit_sync_follows_linux() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm-sync", sync_implicit_sync_follows_linux);
+
+#[cfg(feature = "amdgpu")]
+fn gem_va_timeline_syncobj_signals() -> TestResult {
+    let card = 0x7ffe_0522;
+    let rig = Rig::new(card);
+    let bo = rig.bo(4096);
+
+    let syncobj_out = {
+        let mut table = rig.syncobjs.lock();
+        table.create(0).expect("create syncobj")
+    };
+
+    let mut va = [0u8; 64];
+    va[0..4].copy_from_slice(&bo.to_le_bytes());
+    va[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+    va[12..16]
+        .copy_from_slice(&(u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE).to_le_bytes());
+    va[16..24].copy_from_slice(&0x2_0000_0000u64.to_le_bytes());
+    va[24..32].copy_from_slice(&0u64.to_le_bytes());
+    va[32..40].copy_from_slice(&4096u64.to_le_bytes());
+    va[40..48].copy_from_slice(&5u64.to_le_bytes());
+    va[48..52].copy_from_slice(&syncobj_out.to_le_bytes());
+
+    let cmd = crate::drm_uapi::iowr(
+        crate::drm_uapi::DRM_IOCTL_BASE,
+        crate::drm_uapi::DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+        64,
+    );
+
+    let res = crate::amdgpu_vm::dispatch(
+        cmd,
+        va.as_mut_ptr() as usize,
+        &rig.vm,
+        &rig.gem,
+        Some(&rig.syncobjs),
+    );
+    if res.is_err() {
+        return TestResult::Fail("amdgpu_vm::dispatch failed with 64-byte payload");
+    }
+
+    let table = rig.syncobjs.lock();
+    let obj = table.get(syncobj_out).expect("get syncobj");
+    let fence = obj.core().find_fence(5);
+    match fence {
+        Ok(f) if f.is_signalled() => TestResult::Pass,
+        _ => TestResult::Fail("timeline point 5 was not signalled by GEM_VA"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm-sync", gem_va_timeline_syncobj_signals);

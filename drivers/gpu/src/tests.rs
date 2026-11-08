@@ -11195,7 +11195,7 @@ fn smoke_amdgpu_vm_gem_va_maps_and_validates() -> TestResult {
         r[16..24].copy_from_slice(&va.to_le_bytes());
         r[24..32].copy_from_slice(&offset.to_le_bytes());
         r[32..40].copy_from_slice(&size.to_le_bytes());
-        vm::dispatch(va_cmd, r.as_mut_ptr() as usize, &state, &gem)
+        vm::dispatch(va_cmd, r.as_mut_ptr() as usize, &state, &gem, None)
     };
     const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
     const BASE_VA: u64 = 0x1_0000_0000;
@@ -11316,7 +11316,7 @@ fn smoke_amdgpu_vm_gem_va_maps_and_validates() -> TestResult {
     foreign[12..16].copy_from_slice(&RW.to_le_bytes());
     foreign[16..24].copy_from_slice(&BASE_VA.to_le_bytes());
     foreign[32..40].copy_from_slice(&4096u64.to_le_bytes());
-    if vm::dispatch(va_cmd, foreign.as_mut_ptr() as usize, &state, &gem).is_ok() {
+    if vm::dispatch(va_cmd, foreign.as_mut_ptr() as usize, &state, &gem, None).is_ok() {
         return TestResult::Fail("a VA map naming a foreign GEM handle must be refused");
     }
 
@@ -11400,7 +11400,7 @@ fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
         r[16..24].copy_from_slice(&va.to_le_bytes());
         r[24..32].copy_from_slice(&offset.to_le_bytes());
         r[32..40].copy_from_slice(&size.to_le_bytes());
-        vm::dispatch(va_cmd, r.as_mut_ptr() as usize, &state, &gem)
+        vm::dispatch(va_cmd, r.as_mut_ptr() as usize, &state, &gem, None)
     };
     const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
     // An address with a distinct index at every level, so a swapped shift
@@ -11840,6 +11840,7 @@ fn smoke_amdgpu_vm_activate_programs_both_hubs() -> TestResult {
         map.as_mut_ptr() as usize,
         &state,
         &gem,
+        None,
     )
     .is_err()
     {
@@ -12070,6 +12071,7 @@ fn smoke_amdgpu_vm_gmc12_tables() -> TestResult {
             map.as_mut_ptr() as usize,
             &state,
             &gem,
+            None,
         )
     };
     // Two pages in different leaf tables, so one unmap empties a directory
@@ -12167,6 +12169,7 @@ fn gem_va_on(
         map.as_mut_ptr() as usize,
         vm,
         gem,
+        None,
     )
 }
 
@@ -12617,6 +12620,7 @@ fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
             m.as_mut_ptr() as usize,
             &state,
             &gem,
+            None,
         )
     };
     const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
@@ -12985,6 +12989,7 @@ fn smoke_amdgpu_cs_submits_through_a_card_submitter() -> TestResult {
         m.as_mut_ptr() as usize,
         &state,
         &gem,
+        None,
     )
     .is_err()
     {
@@ -14691,6 +14696,7 @@ fn smoke_amdgpu_vm_prt_ranges_back_sparse_binding() -> TestResult {
             r.as_mut_ptr() as usize,
             &state,
             &gem,
+            None,
         )
     };
     const BASE: u64 = 0x5_0000_0000;

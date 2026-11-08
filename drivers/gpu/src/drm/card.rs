@@ -1506,14 +1506,13 @@ impl Card {
         if cur == open_id {
             return Ok(());
         }
-        if cur == 0 {
-            if self
+        if cur == 0
+            && self
                 .current_master
                 .compare_exchange(0, open_id, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
-            {
-                return Ok(());
-            }
+        {
+            return Ok(());
         }
         Err(MasterBusy)
     }

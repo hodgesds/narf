@@ -440,6 +440,7 @@ fn navi48_lost_upload_keeps_actual_placement_and_gpu_ptes() -> TestResult {
         va.as_ptr() as usize,
         &vm,
         &gem,
+        None,
     )
     .unwrap();
     let pte = vm.leaf_entry(0x2_0000_0000);

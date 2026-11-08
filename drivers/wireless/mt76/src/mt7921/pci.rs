@@ -414,6 +414,14 @@ fn bring_up_current(
         return Err(ProbeError::Authority);
     }
 
+    let _ = narf_bus::pci::set_power_state(cap, device, narf_bus::pci::PciPowerState::D0);
+    let _ = narf_bus::pci_express::clear_and_set_link_control(
+        cap,
+        device,
+        narf_bus::pci_express::LNKCTL_ASPMC,
+        0,
+    );
+
     let _ = writeln!(
         narf_console::Writer,
         "  mt7921: BAR0 mapped ({} bytes); reading identity",
