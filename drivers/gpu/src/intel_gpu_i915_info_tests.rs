@@ -440,6 +440,15 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
         assert_eq!(credentials.asked(), 1 << ADMIN);
         credentials.grant(&[ADMIN]);
         assert_eq!(set(id, 0, 5, 0), Ok(()));
+        // PROTECTED_CONTENT is proto-only, so it is checked before the first
+        // GETPARAM below: a lookup finalizes a proto-context, and after that
+        // ctx_setparam refuses PROTECTED_CONTENT with -EINVAL.
+        if live {
+            assert_eq!(set(id, 0, 13, 0), Err(FsError::InvalidData));
+        } else {
+            assert_eq!(set(id, 99, 13, 0), Ok(()));
+            assert_eq!(set(id, 99, 13, 1), Err(FsError::NoDevice));
+        }
         // RECOVERABLE defaults to 1 (Linux UAPI).
         assert_eq!(get(id, 8), Ok(1), "RECOVERABLE defaults to 1");
         // RECOVERABLE: size, then 0 clears and anything else sets it.
@@ -450,14 +459,6 @@ fn smoke_i915_context_params_follow_set_proto_ctx_param_and_ctx_setparam() -> Te
         assert_eq!(set(id, 1, 11, 1), Err(FsError::InvalidData));
         assert_eq!(set(id, 0, 11, 0), Err(FsError::NoDevice));
         assert_eq!(set(id, 0, 11, 5), Ok(()));
-        // PROTECTED_CONTENT: no size check on a proto, 0 clears, anything
-        // else needs PXP (-ENODEV); ctx_setparam refuses it.
-        if live {
-            assert_eq!(set(id, 0, 13, 0), Err(FsError::InvalidData));
-        } else {
-            assert_eq!(set(id, 99, 13, 0), Ok(()));
-            assert_eq!(set(id, 99, 13, 1), Err(FsError::NoDevice));
-        }
         assert_eq!(credentials.asked(), 1 << ADMIN);
         // GETPARAM ignores the input size and reports size 0; this lookup
         // finalizes the proto-context.

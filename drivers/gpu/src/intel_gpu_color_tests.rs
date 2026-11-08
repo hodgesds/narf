@@ -109,10 +109,11 @@ fn smoke_intel_ctm_inherited_color_paths_refuse_without_writes() -> TestResult {
         ));
         assert_eq!(*io.0.lock(), before);
     }
-    assert!(matches!(
-        Owner::capture(&registers(), Generation::PantherLake),
-        Err(FsError::Unsupported)
-    ));
+    // PantherLake is admitted since eb930b194 (Display 30, same MTL color
+    // profile: 129 degamma / 1024 gamma entries), so clean registers capture
+    // successfully and the owner reports double-buffered LUT support.
+    let panther = Owner::capture(&registers(), Generation::PantherLake).unwrap();
+    assert!(panther.double_buffered_lut());
     TestResult::Pass
 }
 kernel_test_in!(
