@@ -126,6 +126,9 @@ pub mod stun;
 pub mod tcp;
 pub mod tcp_stack;
 pub mod tls;
+pub mod tls_client;
+pub mod tls_x25519;
+pub mod tls_x509;
 pub mod udp_gso;
 pub mod udp_sock;
 pub mod wireguard;
@@ -160,6 +163,8 @@ mod tcp_robust_tests;
 mod tcp_timer_e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod tls_client_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod udp_gso_tests;
 
