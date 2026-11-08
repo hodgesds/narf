@@ -3334,6 +3334,26 @@ fn clear_saved_display_audio(connector_idx: u8) {
 pub(crate) fn reset_saved_display_audio_for_test() {
     *SAVED_DISPLAY_AUDIO.lock() = None;
 }
+
+/// Test-only probe for the saved display-audio snapshot: whether
+/// one is held for `connector_idx`. The e2e snapshot-lifecycle
+/// tests assert on this instead of the last-write latch after
+/// `set_mode`: on an APU the modeset tail applies the panel
+/// backlight last (#948), so the latch holds a BL_PWM write and
+/// cannot show whether audio replayed or stayed silent. The
+/// snapshot state is the contract itself — retained on a
+/// same-timing modeset (the match arm runs, and it executes the
+/// replay writes unconditionally), dropped on a stale timing or a
+/// teardown — so observing it proves the lifecycle directly.
+/// Same gating as `reset_saved_display_audio_for_test`.
+#[cfg(feature = "kernel-test")]
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn has_saved_display_audio_for_test(connector_idx: u8) -> bool {
+    SAVED_DISPLAY_AUDIO
+        .lock()
+        .as_ref()
+        .is_some_and(|s| s.connector_idx == connector_idx)
+}
 static PM_SUSPENDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {

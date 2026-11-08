@@ -2203,8 +2203,7 @@ kernel_test_in!(
 
 #[cfg(feature = "amdgpu")]
 fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
-    use crate::amdgpu::{Family, Mode};
-    use crate::amdgpu_dcn::{OTG0_OTG_CONTROL, OTG_MASTER_EN};
+    use crate::amdgpu::{has_saved_display_audio_for_test, Family, Mode};
     use crate::amdgpu_modeset::plan_modeset;
     crate::amdgpu::reset_saved_display_audio_for_test();
     let mut kms = laptop_audio_kms();
@@ -2227,7 +2226,12 @@ fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
         Some(w) => *w,
         None => return TestResult::Fail("DP plan must carry audio writes"),
     };
-    // Control: no snapshot yet — set_mode ends with video only.
+    // Control: no snapshot yet — set_mode runs the video-only path.
+    // The last-write latch cannot show that on this APU fixture:
+    // the modeset tail applies the panel backlight last (#948), so
+    // the latch holds a BL_PWM write whether audio replayed or not.
+    // Observe the snapshot instead — a bare set_mode must neither
+    // create one nor resurrect anything.
     let mut regs = alloc::vec![0u32; 8];
     let mut gpu = renoir_gpu_for_display_audio(&mut regs);
     // SAFETY: RAM-backed register window; the test owns it.
@@ -2242,8 +2246,8 @@ fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
     {
         return TestResult::Fail("control set_mode failed");
     }
-    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
-        return TestResult::Fail("set_mode without saved audio must end with OTG_MASTER_EN");
+    if has_saved_display_audio_for_test(1) {
+        return TestResult::Fail("set_mode without saved audio must not create a snapshot");
     }
     // Apply the DP plan (snapshots its audio), then re-run set_mode
     // for the same timing: audio replays after video (PM-resume shape).
@@ -2255,6 +2259,16 @@ fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
     if regs[0] != last_audio.addr || regs[1] != last_audio.value {
         return TestResult::Fail("apply must end with the audio writes");
     }
+    if !has_saved_display_audio_for_test(1) {
+        return TestResult::Fail("apply must snapshot the audio");
+    }
+    // The replay writes cannot be observed on the last-write latch:
+    // the backlight tail (#948) writes after the replay on this APU,
+    // so the latch holds a BL_PWM write either way. Retention is the
+    // observation instead — the same-timing match arm runs only when
+    // the snapshot survives, and that arm executes the replay writes
+    // unconditionally, so a retained snapshot plus a successful
+    // set_mode proves the replay ran.
     // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
     // 1920x1080 mode matches the applied plan's timing (the snapshot-replay path).
     if unsafe {
@@ -2268,8 +2282,8 @@ fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
     {
         return TestResult::Fail("resume set_mode failed");
     }
-    if regs[0] != last_audio.addr || regs[1] != last_audio.value {
-        return TestResult::Fail("set_mode must replay saved audio for the same timing");
+    if !has_saved_display_audio_for_test(1) {
+        return TestResult::Fail("set_mode must retain the snapshot for the same timing");
     }
     // Stale timing: a different mode drops the snapshot instead of
     // programming a DTO built for another pixel clock — and the
@@ -2287,7 +2301,7 @@ fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
     {
         return TestResult::Fail("stale set_mode failed");
     }
-    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
+    if has_saved_display_audio_for_test(1) {
         return TestResult::Fail("stale timing must drop saved audio");
     }
     // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
@@ -2303,7 +2317,7 @@ fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
     {
         return TestResult::Fail("second resume set_mode failed");
     }
-    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
+    if has_saved_display_audio_for_test(1) {
         return TestResult::Fail("dropped snapshot must not resurrect");
     }
     TestResult::Pass
@@ -2316,8 +2330,8 @@ kernel_test_in!(
 
 #[cfg(feature = "amdgpu")]
 fn smoke_drm_laptop_display_audio_disable_before_teardown() -> TestResult {
-    use crate::amdgpu::{Family, Mode};
-    use crate::amdgpu_dcn::{execute_modeset, DcnWrite, OTG0_OTG_CONTROL, OTG_MASTER_EN};
+    use crate::amdgpu::{has_saved_display_audio_for_test, Family, Mode};
+    use crate::amdgpu_dcn::{execute_modeset, DcnWrite, OTG0_OTG_CONTROL};
     use crate::amdgpu_modeset::{plan_audio_disable, plan_modeset, CrtcState};
     crate::amdgpu::reset_saved_display_audio_for_test();
     let mut kms = laptop_audio_kms();
@@ -2378,7 +2392,10 @@ fn smoke_drm_laptop_display_audio_disable_before_teardown() -> TestResult {
     if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != 0 {
         return TestResult::Fail("OTG clear must land after the disable writes");
     }
-    // Snapshot cleared: a later set_mode stays video-only.
+    // Snapshot cleared: a later set_mode must not replay the
+    // disabled audio. The last-write latch cannot show that on
+    // this APU fixture — the modeset tail applies the panel
+    // backlight last (#948) — so observe the snapshot directly.
     // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
     // disable just cleared the snapshot, so this is the video-only `set_mode` path.
     if unsafe {
@@ -2392,7 +2409,7 @@ fn smoke_drm_laptop_display_audio_disable_before_teardown() -> TestResult {
     {
         return TestResult::Fail("set_mode after disable failed");
     }
-    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
+    if has_saved_display_audio_for_test(1) {
         return TestResult::Fail("disable must clear the saved audio");
     }
     // Control: the internal panel has no audio endpoint to disable.
@@ -2412,8 +2429,7 @@ kernel_test_in!(
 
 #[cfg(feature = "amdgpu")]
 fn smoke_drm_laptop_display_audio_hotplug_disconnect() -> TestResult {
-    use crate::amdgpu::{Family, Mode};
-    use crate::amdgpu_dcn::{OTG0_OTG_CONTROL, OTG_MASTER_EN};
+    use crate::amdgpu::{has_saved_display_audio_for_test, Family, Mode};
     use crate::amdgpu_modeset::{
         plan_audio_disable, plan_modeset, ConnectorStatus, CrtcState, HotplugAudioAction,
     };
@@ -2462,7 +2478,10 @@ fn smoke_drm_laptop_display_audio_hotplug_disconnect() -> TestResult {
     {
         return TestResult::Fail("disconnect must drop the CRTC binding");
     }
-    // Snapshot cleared: a later set_mode stays video-only.
+    // Snapshot cleared: a later set_mode must not replay the
+    // disconnected audio. The last-write latch cannot show that on
+    // this APU fixture — the modeset tail applies the panel
+    // backlight last (#948) — so observe the snapshot directly.
     // SAFETY: `gpu` is the only `AmdGpu` over the test-owned RAM register window, and the
     // disconnect just cleared the snapshot, so this is the video-only `set_mode` path.
     if unsafe {
@@ -2476,7 +2495,7 @@ fn smoke_drm_laptop_display_audio_hotplug_disconnect() -> TestResult {
     {
         return TestResult::Fail("set_mode after disconnect failed");
     }
-    if regs[0] != 0x5000 + OTG0_OTG_CONTROL || regs[1] != OTG_MASTER_EN {
+    if has_saved_display_audio_for_test(1) {
         return TestResult::Fail("disconnect must clear the saved audio");
     }
     // Control: the internal panel disconnects with no audio action.
