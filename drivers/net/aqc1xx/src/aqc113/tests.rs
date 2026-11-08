@@ -609,11 +609,11 @@ fn smoke_aqc113_fake_bringup_conversation() -> TestResult {
     }
     // 3. Version + MAC.
     match super::read_fw_version(&fake) {
-        Ok(v) if v == 0x0100_1234 => {}
+        Ok(0x0100_1234) => {}
         _ => return TestResult::Fail("fw version != 0x01001234"),
     }
     match super::read_permanent_mac(&fake) {
-        Some(m) if m == [0x52, 0x54, 0x00, 0xAB, 0xCD, 0xEF] => {}
+        Some([0x52, 0x54, 0x00, 0xAB, 0xCD, 0xEF]) => {}
         _ => return TestResult::Fail("permanent MAC misread from the fake"),
     }
     // 4. TX/RX path + MAC filter + MPI_INIT + interrupts.

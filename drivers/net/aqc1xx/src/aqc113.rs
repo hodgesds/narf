@@ -263,7 +263,7 @@ pub(crate) const REG_RPF_MCST_MSK: u64 = 0x5270;
 pub(crate) const REG_RPF_MCST_FLR_BASE: u64 = 0x5250;
 /// RPF VLAN TPID register — inner (bits [15:0], default `0x8100`)
 /// + outer (bits [31:16], default `0x88A8`)
-/// (`HW_ATL_RPF_VL_INNER_TPID_ADR` / `HW_ATL_RPF_VL_OUTER_TPID_ADR`).
+///   (`HW_ATL_RPF_VL_INNER_TPID_ADR` / `HW_ATL_RPF_VL_OUTER_TPID_ADR`).
 pub(crate) const REG_RPF_VLAN_TPID: u64 = 0x5284;
 /// RPF VLAN control — promiscuous mode (bit 1) + accept-untagged
 /// (bit 2) + untagged action (bits [5:3])
@@ -396,10 +396,10 @@ pub(crate) const SH_OUT_LINK_STATUS_DWORD: u64 = 5;
 /// Computed from the `fw_interface_out` field order in
 /// `hw_atl2_utils.h`: transaction(1) + version(4) + link_status(1)
 /// + wol_status(380) + rsvd(1) + rsvd2(1) + mac_health(2) +
-/// rsvd3(1) + rsvd4(1) + phy_health(2) + rsvd5(1) + rsvd6(1) +
-/// cable_diag(5) + rsvd7(1) + device_link_caps(1) + rsvd8(1) +
-/// sleep_proxy_caps(3) + rsvd9(1) + lkp_link_caps(1) + rsvd10(1) +
-/// core_dump(37) + rsvd11(1) + statistics(29) = 477.
+///   rsvd3(1) + rsvd4(1) + phy_health(2) + rsvd5(1) + rsvd6(1) +
+///   cable_diag(5) + rsvd7(1) + device_link_caps(1) + rsvd8(1) +
+///   sleep_proxy_caps(3) + rsvd9(1) + lkp_link_caps(1) + rsvd10(1) +
+///   core_dump(37) + rsvd11(1) + statistics(29) = 477.
 pub(crate) const SH_OUT_FILTER_CAPS_DWORD: u64 = 477;
 
 /// Host mode ACTIVE (`AQ_HOST_MODE_ACTIVE`).
@@ -789,10 +789,8 @@ pub fn decode_rx_wb(wb: &RxdWb, frame_max: u32) -> RxDecode {
     let pkt_len = wb.pkt_len as u32;
 
     let mut l4_ok = false;
-    if csum_en & 0x2 != 0 {
-        if (pkt_type & 0x1C) == 0x04 || (pkt_type & 0x1C) == 0x00 {
-            l4_ok = (rx_stat & 0x4) == 0 && (rx_stat & 0x8) != 0;
-        }
+    if csum_en & 0x2 != 0 && ((pkt_type & 0x1C) == 0x04 || (pkt_type & 0x1C) == 0x00) {
+        l4_ok = (rx_stat & 0x4) == 0 && (rx_stat & 0x8) != 0;
     }
     let mut cso_err = (rx_stat & 0x6) != 0;
     if pkt_len <= 60 {
@@ -1122,10 +1120,7 @@ pub(crate) fn program_rings(regs: &impl RegIo, tx_phys: u64, rx_phys: u64) {
         DESC_LEN_MSK | RXD_HDR_SPLIT | RXD_VL_STRIP,
         ((RING_LEN as u32 / 8) << DESC_LEN_SHIFT) & DESC_LEN_MSK,
     );
-    regs.write32(
-        reg_rx_dma_buf_size(0),
-        ((RX_BUF_LEN as u32 / 1024) & 0x1F) | (0 << 8),
-    );
+    regs.write32(reg_rx_dma_buf_size(0), ((RX_BUF_LEN as u32 / 1024) & 0x1F));
     let (rx_map_reg, rx_map_msk, rx_map_shift) = itr_map_rx_field(0);
     regs.rmw32(rx_map_reg, rx_map_msk, 0 << rx_map_shift);
     regs.set_bit(rx_map_reg, itr_map_rx_en_bit(0));
@@ -1459,6 +1454,8 @@ impl AqcNic {
         // desc + 8). The 250 ms budget mirrors the RTL8125
         // driver's polled-TX budget.
         let done = narf_scheduler::responsive_spin_until(
+            // SAFETY: identity-mapped DMA ring; desc_addr + 8 is the ctl word of the
+            // in-bounds descriptor at slot < RING_LEN; volatile read only.
             || unsafe {
                 core::ptr::read_volatile(
                     narf_memory::PhysAddr::new(desc_addr + 8).kernel_ptr::<u32>(),
@@ -1521,7 +1518,7 @@ impl AqcNic {
         compiler_fence(Ordering::SeqCst);
         // Advance the tail past the refilled descriptor so the NIC
         // may use it again.
-        let next_tail = ((slot as u32 + 1) % RING_LEN as u32) as u32;
+        let next_tail = (slot as u32 + 1) % RING_LEN as u32;
         // SAFETY: identity-mapped MMIO.
         unsafe {
             self.mmio.write32(reg_rx_dma_tail(0), next_tail);
