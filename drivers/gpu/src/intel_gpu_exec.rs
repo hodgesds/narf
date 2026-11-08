@@ -480,6 +480,47 @@ pub(crate) struct VmMapping {
     pub dumpable: bool,
 }
 
+/// Whether `[address, address + size)` is fully covered by writable VM
+/// mappings. The exec path uses this to fail closed before submitting a
+/// batch whose OA query sampler would write its report outside the
+/// context's resident-writable VM (the MI write would otherwise fault
+/// the batch on the GPU). Coverage is computed over the mappings that
+/// overlap the range, walked in VA order, so a range spanning several
+/// mappings is handled; a read-only mapping does not cover (the query
+/// writes the report).
+pub(crate) fn mappings_cover(mappings: &[VmMapping], address: u64, size: u64) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let Some(end) = address.checked_add(size) else {
+        return false;
+    };
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    for m in mappings {
+        if !m.writable {
+            continue;
+        }
+        let Some(m_end) = m.va.checked_add(m.length) else {
+            continue;
+        };
+        if m.va < end && address < m_end {
+            spans.push((m.va.max(address), m_end.min(end)));
+        }
+    }
+    spans.sort_unstable();
+    let mut covered = address;
+    for (start, span_end) in spans {
+        if start > covered {
+            return false;
+        }
+        covered = covered.max(span_end);
+        if covered >= end {
+            return true;
+        }
+    }
+    covered >= end
+}
+
 pub(crate) struct DiagnosticVm<'a> {
     pub address: u64,
     pub length: u64,

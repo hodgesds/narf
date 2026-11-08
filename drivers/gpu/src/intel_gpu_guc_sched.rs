@@ -1296,7 +1296,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     // GGTT breadcrumb. ResidentBatch validated writable residency.
                     let before_breadcrumb = words
                         .windows(2)
-                        .position(|v| v == [0x7a000004, 0x01104080])
+                        .position(|v| v == crate::intel_gpu_oa::BREADCRUMB_MARKER)
                         .expect("owned completion stream");
                     words.splice(
                         before_breadcrumb..before_breadcrumb,
@@ -1309,6 +1309,20 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             0,
                         ],
                     );
+                }
+                // Per-batch OA query (issue #1774): one
+                // MI_REPORT_PERF_COUNT per batch on a queue with a live
+                // query-mode OAR/OAC stream, spliced before the owned
+                // breadcrumb so it runs after the user's batch returns
+                // to the ring. The sampler lives on the claimed
+                // context; a parallel submit (width > 1) cannot carry
+                // one (the OA open rejects width > 1 queues), so the
+                // splice is skipped there rather than sampling only the
+                // parent lane.
+                if width == 1 {
+                    if let Some(sampler) = user.as_ref().and_then(|claim| claim.query_sampler()) {
+                        crate::intel_gpu_oa::splice_query(&mut words, &sampler);
+                    }
                 }
                 words
             }
@@ -1825,6 +1839,12 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             .user
                             .as_ref()
                             .map_or((3, 1000, false), |user| user.policy());
+                        // OA NO_PREEMPT (issue #1774): while the override
+                        // is live the preempt timeout is 0, matching the
+                        // timeslice 0 the override holds on the context;
+                        // otherwise the engine-class default.
+                        let no_preempt =
+                            context.user.as_ref().is_some_and(|job| job.oa_no_preempt());
                         policy_priority = Some(priority);
                         // xe_guc_submit.c init_policies + guc_klvs_abi.h:
                         // SLPM_GT_FREQUENCY key 0x2005, one value, COMPUTE
@@ -1838,7 +1858,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             0x20010001,
                             timeslice,
                             0x20020001,
-                            preemption_timeout_us(context.engine),
+                            if no_preempt {
+                                0
+                            } else {
+                                preemption_timeout_us(context.engine)
+                            },
                             0x20050001,
                             if low_latency { 1 << 28 } else { 0 },
                         ]

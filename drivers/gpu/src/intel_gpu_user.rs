@@ -361,6 +361,17 @@ struct State {
     /// The same pair for the job in flight, fixed at its claim except that
     /// a later request on this context raises its priority (queue_request).
     job_policy: (u32, u32),
+    /// Saved (priority, timeslice) while an OA NO_PREEMPT stream holds
+    /// this queue at timeslice 0 + preempt timeout 0 (Linux
+    /// xe_oa_disable_preempt_timeslice, which sets both to 0 and restores
+    /// the class defaults at disable). `Some` while the override is live;
+    /// the live `policy` then carries timeslice 0 and this holds the
+    /// user's own pair for the restore. `None` when no override is live.
+    oa_saved: Option<(u32, u32)>,
+    /// The OA query sampler registered on this context while a query-mode
+    /// OAR/OAC stream holds it (set at OA enable, cleared at disable).
+    /// `None` when no query-mode stream is live on this queue.
+    query_sampler: Option<Arc<crate::intel_gpu_oa::QuerySampler>>,
     /// i915 requests queued and not yet staged, per GuC band.
     queued: [u32; 4],
     /// The band of the i915 request whose submission attempt is next to
@@ -532,6 +543,8 @@ impl UserContext {
                 guilty: 0,
                 policy: (GUC_PRIORITY_NORMAL, 1000),
                 job_policy: (GUC_PRIORITY_NORMAL, 1000),
+                oa_saved: None,
+                query_sampler: None,
                 queued: [0; 4],
                 staged: None,
                 low_latency: false,
@@ -598,15 +611,89 @@ impl UserContext {
         {
             return Err(FsError::InvalidData);
         }
-        self.state.lock().policy = (priority, timeslice);
+        // While an OA NO_PREEMPT override is live the timeslice the GuC
+        // sees stays 0; record the user's new pair as the saved values so
+        // the restore applies them, and apply the priority (which the
+        // override does not touch) to the live pair at once.
+        let mut state = self.state.lock();
+        if let Some(saved) = state.oa_saved.as_mut() {
+            *saved = (priority, timeslice);
+            state.policy.0 = priority;
+        } else {
+            state.policy = (priority, timeslice);
+        }
         Ok(())
     }
     /// Store an i915 ctx->sched.priority (guc_context_init and add_to_context
     /// map it through map_i915_prio_to_guc_prio). Like
     /// i915_gem_context.c::set_priority it sends GuC nothing: requests
     /// queued from now on carry it, and earlier ones keep their own.
+    /// While an OA NO_PREEMPT override is live the saved pair takes the
+    /// new priority too, so the restore does not clobber it.
     pub(crate) fn set_i915_priority(&self, priority: i32) {
-        self.state.lock().policy.0 = map_i915_prio_to_guc_prio(priority);
+        let mapped = map_i915_prio_to_guc_prio(priority);
+        let mut state = self.state.lock();
+        if let Some(saved) = state.oa_saved.as_mut() {
+            saved.0 = mapped;
+        }
+        state.policy.0 = mapped;
+    }
+    /// Whether an OA NO_PREEMPT override is live on this context.
+    pub(crate) fn oa_no_preempt(&self) -> bool {
+        self.state.lock().oa_saved.is_some()
+    }
+    /// Apply the OA NO_PREEMPT schedule override (Linux
+    /// xe_oa_disable_preempt_timeslice, which sets timeslice and preempt
+    /// timeout to 0): save the user's (priority, timeslice) and hold the
+    /// live timeslice at 0, so the next claim's GuC Policy KLVs carry
+    /// EXECUTION_QUANTUM 0 and preempt timeout 0. Idempotent: a second
+    /// apply while the override is live keeps the original saved pair.
+    /// The user-facing setter rejects timeslice 0, exactly as Linux's
+    /// userspace setter rejects it while the OA path sets it directly,
+    /// so this bypasses `configure_schedule`'s range check on purpose.
+    pub(crate) fn oa_apply_no_preempt(&self) {
+        let mut state = self.state.lock();
+        if state.oa_saved.is_none() {
+            state.oa_saved = Some(state.policy);
+            state.policy.1 = 0;
+        }
+    }
+    /// Restore the schedule an OA NO_PREEMPT override held (Linux
+    /// xe_oa_enable_preempt_timeslice): the saved (priority, timeslice)
+    /// becomes live again, so the next claim's GuC Policy KLVs carry the
+    /// user's own quantum and the engine-class preempt timeout. Linux
+    /// restores the class defaults, which would discard a user-set
+    /// quantum; NARF restores the saved pair instead, so a queue that
+    /// was reconfigured while the override was live keeps its newest
+    /// setting (see `configure_schedule`). Idempotent.
+    pub(crate) fn oa_restore_no_preempt(&self) {
+        let mut state = self.state.lock();
+        if let Some(saved) = state.oa_saved.take() {
+            state.policy = saved;
+        }
+    }
+    /// The GuC priority and execution quantum a request queued now would
+    /// carry. Test-only: the production schedule surface is
+    /// `configure_schedule` (which rejects timeslice 0) plus the OA
+    /// override above.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn schedule_for_test(&self) -> (u32, u32) {
+        self.state.lock().policy
+    }
+    /// Register or clear the OA query sampler on this context. Set at OA
+    /// enable for a query-mode stream, cleared at disable (and on
+    /// teardown), so the exec path emits one MI_REPORT_PERF_COUNT per
+    /// batch only while the stream is live.
+    pub(crate) fn set_query_sampler(
+        &self,
+        sampler: Option<Arc<crate::intel_gpu_oa::QuerySampler>>,
+    ) {
+        self.state.lock().query_sampler = sampler;
+    }
+    /// The OA query sampler registered on this context, if a query-mode
+    /// OAR/OAC stream holds it.
+    pub(crate) fn query_sampler(&self) -> Option<Arc<crate::intel_gpu_oa::QuerySampler>> {
+        self.state.lock().query_sampler.clone()
     }
     /// The GuC priority a request queued now would carry.
     #[cfg(any(test, feature = "kernel-test"))]
@@ -792,6 +879,12 @@ impl ContextClaim {
     pub(crate) fn parallel_placements(&self) -> Option<&[crate::intel_gpu_engine::EngineSet]> {
         self.context.parallel_placements()
     }
+    /// The OA query sampler registered on this context, if a query-mode
+    /// OAR/OAC stream holds it. The exec path reads this at submit time
+    /// to emit one MI_REPORT_PERF_COUNT per batch.
+    pub(crate) fn query_sampler(&self) -> Option<Arc<crate::intel_gpu_oa::QuerySampler>> {
+        self.context.query_sampler()
+    }
     pub(crate) fn restore(&self, image: &impl GpuBacking) {
         self.restore_lane(image, 0);
     }
@@ -843,6 +936,12 @@ impl UserJob {
     pub(crate) fn policy(&self) -> (u32, u32, bool) {
         let state = self.context.state.lock();
         (state.job_policy.0, state.job_policy.1, state.low_latency)
+    }
+    /// Whether an OA NO_PREEMPT override is live on this job's context.
+    /// The GuC Policy KLVs read this to emit preempt timeout 0 while the
+    /// override holds, and the engine-class default once it is restored.
+    pub(crate) fn oa_no_preempt(&self) -> bool {
+        self.context.oa_no_preempt()
     }
     /// This job's current GuC priority, raised by later submissions.
     pub(crate) fn priority(&self) -> u32 {

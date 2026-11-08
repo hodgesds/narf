@@ -1317,6 +1317,8 @@ fn unit_with_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<Session>) 
         None,
         None,
         false,
+        0,
+        0,
         true,
     );
     let request = Request::Open { enable: true };
@@ -1358,6 +1360,8 @@ fn unit_with_unexposed_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<
         None,
         None,
         false,
+        0,
+        0,
         true,
     );
     let request = Request::Open { enable: false };
@@ -2283,6 +2287,254 @@ fn smoke_oa_per_context_enable_disable_sequence() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_per_context_enable_disable_sequence
+);
+
+fn smoke_oa_no_preempt_enable_disable_restores_schedule() -> TestResult {
+    let backend = Backend::new(device(61, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let alive = Arc::new(AtomicBool::new(true));
+    // Retain the bound context so the fixture can read its schedule.
+    let ctx = crate::intel_gpu_user::UserContext::for_engine(Engine::Rcs0);
+    let queues = |id: u32| {
+        let probe = alive.clone();
+        let ctx = ctx.clone();
+        match id {
+            10 => Some((
+                0,
+                1,
+                QueueBinding::new(10, ctx, Arc::new(move || probe.load(Ordering::Relaxed))),
+            )),
+            _ => None,
+        }
+    };
+    const OAR256: u64 = 1 | 5 << 8;
+
+    let open_at = |props: &[(u32, u64)], gate: Gate| {
+        let at = wire.chain(0x1000, props);
+        ready(open(Some(backend.clone()), at, &wire, &queues, gate, None))
+    };
+
+    // no_preempt needs privilege (Linux: no_preempt without an exec queue
+    // is -EINVAL, and the open marks the stream privileged).
+    assert_eq!(
+        open_at(&[(7, 10), (4, OAR256), (3, config), (9, 1)], DENY),
+        Err(Error::Fs(FsError::PermissionDenied))
+    );
+    let _fd = open_at(&[(7, 10), (4, OAR256), (3, config), (9, 1)], ALLOW).unwrap();
+    let file = wire.file();
+    let session = session_of(&backend);
+    assert!(session.enabled());
+    assert!(session.no_preempt());
+    assert!(session.privileged());
+    // Enable holds the queue at timeslice 0 (default schedule is
+    // (NORMAL, 1000): GuC priority 3, EXECUTION_QUANTUM 1000 us).
+    assert_eq!(ctx.schedule_for_test(), (3, 0));
+    assert!(ctx.oa_no_preempt());
+
+    // Disable restores the saved schedule.
+    assert_eq!(ready(file.ioctl_user(DISABLE, 0, &wire)), Ok(0));
+    assert!(!session.enabled());
+    assert_eq!(ctx.schedule_for_test(), (3, 1000));
+    assert!(!ctx.oa_no_preempt());
+
+    // Re-enable applies it again.
+    assert_eq!(ready(file.ioctl_user(ENABLE, 0, &wire)), Ok(0));
+    assert!(session.enabled());
+    assert_eq!(ctx.schedule_for_test(), (3, 0));
+    assert!(ctx.oa_no_preempt());
+
+    // Close without disable: teardown restores the schedule too (Linux
+    // xe_oa_destroy_locked disables the stream, which restores).
+    drop(file);
+    backend.poll(1);
+    assert_eq!(ctx.schedule_for_test(), (3, 1000));
+    assert!(!ctx.oa_no_preempt());
+    assert!(!backend.unit.lock().as_ref().unwrap().per_context);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_no_preempt_enable_disable_restores_schedule
+);
+
+fn smoke_oa_query_sampler_report_ids_and_slots_rotate() -> TestResult {
+    // OAR256 format: report size 256. A 1024-byte buffer holds 4 slots.
+    let sampler = QuerySampler::new(0x1_0000, 1024, 256);
+    // Gen8+ form: (0x28 << 23) | (4 - 2), address, report ID.
+    assert_eq!(sampler.next_query(), [0x14000002, 0x1_0000, 0, 1]);
+    assert_eq!(sampler.next_query(), [0x14000002, 0x1_0100, 0, 2]);
+    assert_eq!(sampler.next_query(), [0x14000002, 0x1_0200, 0, 3]);
+    assert_eq!(sampler.next_query(), [0x14000002, 0x1_0300, 0, 4]);
+    // Fifth batch wraps to slot 0 with the next report ID.
+    assert_eq!(sampler.next_query(), [0x14000002, 0x1_0000, 0, 5]);
+    // A 64-bit address splits across the two address dwords.
+    let high = QuerySampler::new(0x1_0000_0000, 256, 256);
+    assert_eq!(high.next_query(), [0x14000002, 0, 1, 1]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_query_sampler_report_ids_and_slots_rotate
+);
+
+fn smoke_oa_query_splice_lands_before_breadcrumb() -> TestResult {
+    // A resident-ring-shaped word stream: preparser + batch start, then
+    // the owned breadcrumb (the exact marker + tail resident_ring
+    // emits). The sampler targets slot 0 of a 512-byte buffer.
+    let sampler = QuerySampler::new(0x2_0000, 512, 256);
+    let mut words = vec![
+        0x04000001, 0x02800101, 0x7a000404, 0x20344c1c, 0xd0, 0, 0, 0, 0x02800100, 0x18800101, 0,
+        0, 0x04000000, 0x7a000004, 0x01104080, 0x1234, 0, 7, 0, 0x01000000, 0x04000001, 0x02800000,
+    ];
+    assert!(splice_query(&mut words, &sampler));
+    // The 4 query dwords sit immediately before the breadcrumb marker.
+    let at = words
+        .windows(2)
+        .position(|v| v == BREADCRUMB_MARKER)
+        .unwrap();
+    assert_eq!(&words[at - 4..at], &[0x14000002, 0x2_0000, 0, 1]);
+    // A second batch advances to slot 1 with report ID 2.
+    assert!(splice_query(&mut words, &sampler));
+    let at = words
+        .windows(2)
+        .position(|v| v == BREADCRUMB_MARKER)
+        .unwrap();
+    assert_eq!(&words[at - 4..at], &[0x14000002, 0x2_0100, 0, 2]);
+    // No breadcrumb marker: nothing is spliced.
+    let mut bare = vec![0x04000001, 0x02800101];
+    assert!(!splice_query(&mut bare, &sampler));
+    assert_eq!(bare, vec![0x04000001, 0x02800101]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_query_splice_lands_before_breadcrumb
+);
+
+fn smoke_oa_query_open_validation_and_sampler_lifecycle() -> TestResult {
+    let backend = Backend::new(device(64, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let alive = Arc::new(AtomicBool::new(true));
+    let ctx = crate::intel_gpu_user::UserContext::for_engine(Engine::Rcs0);
+    let queues = |id: u32| {
+        let probe = alive.clone();
+        let ctx = ctx.clone();
+        match id {
+            10 => Some((
+                0,
+                1,
+                QueueBinding::new(10, ctx, Arc::new(move || probe.load(Ordering::Relaxed))),
+            )),
+            _ => None,
+        }
+    };
+    const OAR256: u64 = 1 | 5 << 8;
+    const OAG256: u64 = 5 << 8;
+
+    let open_at = |props: &[(u32, u64)], gate: Gate| {
+        let at = wire.chain(0x1000, props);
+        ready(open(Some(backend.clone()), at, &wire, &queues, gate, None))
+    };
+
+    // Both query properties or neither.
+    assert_eq!(
+        open_at(&[(7, 10), (4, OAR256), (3, config), (14, 0x1_0000)], ALLOW),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+    assert_eq!(
+        open_at(&[(7, 10), (4, OAR256), (3, config), (15, 1024)], ALLOW),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+    // Query sampling needs a bound queue (OAG is queue-less-legal, so
+    // this isolates the bound-queue rule).
+    assert_eq!(
+        open_at(
+            &[(4, OAG256), (3, config), (14, 0x1_0000), (15, 1024)],
+            ALLOW
+        ),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+    // Query sampling is the !sample mechanism: periodic sampling plus a
+    // query buffer is rejected.
+    assert_eq!(
+        open_at(
+            &[
+                (7, 10),
+                (4, OAR256),
+                (3, config),
+                (14, 0x1_0000),
+                (15, 1024),
+                (2, 1)
+            ],
+            ALLOW
+        ),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+    // The buffer holds whole reports, at least one, base report-aligned.
+    assert_eq!(
+        open_at(
+            &[(7, 10), (4, OAR256), (3, config), (14, 0x1_0000), (15, 100)],
+            ALLOW
+        ),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+    assert_eq!(
+        open_at(
+            &[
+                (7, 10),
+                (4, OAR256),
+                (3, config),
+                (14, 0x1_0001),
+                (15, 1024)
+            ],
+            ALLOW
+        ),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+
+    // A query-mode stream opens unprivileged (Linux: query sampling
+    // with OAR/OAC, without global stream access, is unprivileged).
+    let _fd = open_at(
+        &[
+            (7, 10),
+            (4, OAR256),
+            (3, config),
+            (14, 0x1_0000),
+            (15, 1024),
+        ],
+        DENY,
+    )
+    .unwrap();
+    let file = wire.file();
+    let session = session_of(&backend);
+    assert!(session.enabled());
+    assert!(!session.privileged());
+    assert_eq!(session.query_address, 0x1_0000);
+    assert_eq!(session.query_size, 1024);
+    // Enable registered the sampler on the bound context.
+    let sampler = ctx.query_sampler().expect("sampler registered at enable");
+    assert_eq!(sampler.address(), 0x1_0000);
+    assert_eq!(sampler.size(), 1024);
+
+    // Disable clears it; re-enable registers a fresh one.
+    assert_eq!(ready(file.ioctl_user(DISABLE, 0, &wire)), Ok(0));
+    assert!(ctx.query_sampler().is_none());
+    assert_eq!(ready(file.ioctl_user(ENABLE, 0, &wire)), Ok(0));
+    assert!(ctx.query_sampler().is_some());
+
+    // Close clears it too.
+    drop(file);
+    backend.poll(1);
+    assert!(ctx.query_sampler().is_none());
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_query_open_validation_and_sampler_lifecycle
 );
 
 fn smoke_oa_per_context_stale_queue_fails_enable() -> TestResult {
