@@ -2464,6 +2464,89 @@ impl AmdGpu {
         connected
     }
 
+    /// Drain one batch of decoded IH ring entries into the HPD state
+    /// machine (#1785) — the live IH ring drainer. Each entry's HPD
+    /// context id is decoded, the pin level is read back with
+    /// `hpd_asserted` at drain time, and the cookie is fed to
+    /// `handle_hotplug_event`. Non-HPD entries are counted and
+    /// skipped; a plug cookie whose pin cannot be read back is
+    /// dropped rather than guessed at.
+    ///
+    /// The readback and the feed cannot share one borrow — the
+    /// readback needs `&self`, the feed needs `&mut self` — so the
+    /// pin level is read once per plug cookie, in ring order, into a
+    /// staged table before the feed pass runs. Both passes happen in
+    /// this same drain call, so the level a cookie is fed with is the
+    /// level read for that cookie moments earlier; a cable yanked
+    /// between the passes is corrected by the disconnect cookie the
+    /// falling edge raises on the next drain, exactly as it would be
+    /// for a read done inline. The staged entry also carries its
+    /// pin index, and the feed pass fails a cookie closed if the
+    /// staging ever disagrees with the ring order.
+    pub fn drain_ih_hotplug(
+        &mut self,
+        ivs: &[crate::amdgpu_ih_navi22::Iv],
+        tsc: u64,
+    ) -> crate::amdgpu_ih_drainer::IhHpdDrain {
+        use crate::amdgpu_ih_drainer::drain_ih_hpd_ivs;
+        // Stage 1: one pin readback per plug cookie, in ring order.
+        // Sink IRQs need no level; non-HPD entries need nothing.
+        let mut staged: Vec<(u8, Option<bool>)> = Vec::new();
+        for iv in ivs {
+            let Some(hpd) = iv.hpd() else {
+                continue;
+            };
+            if hpd.rx {
+                continue;
+            }
+            // SAFETY: probe gave us BAR ownership, still held; a
+            // read-only status register through the MM_INDEX/MM_DATA
+            // pair.
+            let level = unsafe { self.hpd_asserted(hpd.instance) };
+            staged.push((hpd.instance, level));
+        }
+        // Stage 2: feed the batch. The pin closure consumes the
+        // staged levels in the same ring order the drainer consults
+        // them; a staging/ring disagreement fails closed.
+        let mut next = 0usize;
+        drain_ih_hpd_ivs(
+            ivs,
+            tsc,
+            |instance| {
+                let (staged_instance, level) = staged.get(next).copied().unwrap_or((u8::MAX, None));
+                next += 1;
+                if staged_instance == instance {
+                    level
+                } else {
+                    None
+                }
+            },
+            |ctxid, asserted, tsc| self.handle_hotplug_event(ctxid, asserted, tsc),
+        )
+    }
+
+    /// Drain one batch and sample the HPD debounce timers (#1785) —
+    /// the scheduled-wakeup entry point. A connect only becomes
+    /// `Connected` in the `poll_hotplug` half, so a driver loop must
+    /// call this on a tick (see `serve_ih_hpd` in
+    /// `amdgpu_ih_drainer`, which ticks every [`IH_HPD_POLL_MS`])
+    /// even when no cookie arrived since the last call. Returns the
+    /// drain report plus the connector indices that stabilised as
+    /// connected in this poll, marked `Connected` in KMS; the caller
+    /// modesets each with its mode (EDID preferred mode) via
+    /// `modeset_connector`.
+    ///
+    /// [`IH_HPD_POLL_MS`]: crate::amdgpu_ih_drainer::IH_HPD_POLL_MS
+    pub fn service_hotplug(
+        &mut self,
+        ivs: &[crate::amdgpu_ih_navi22::Iv],
+        tsc: u64,
+    ) -> (crate::amdgpu_ih_drainer::IhHpdDrain, Vec<u8>) {
+        let report = self.drain_ih_hotplug(ivs, tsc);
+        let connected = self.poll_hotplug(tsc);
+        (report, connected)
+    }
+
     /// Program the panel backlight to `percent` (0–100). Caller's
     /// 0 typically lands at the panel's hardware minimum (the panel
     /// usually won't fully extinguish even with USER_LEVEL = 0 —
@@ -3728,9 +3811,12 @@ mod navi22_ownership_tests {
 mod hdmi_dp_audio_kms_tests {
     use super::*;
     use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayPath};
+    use crate::amdgpu_dcn::DC_HPD_SENSE_DELAYED;
     use crate::amdgpu_dcn20_audio::{AFMT_AUDIO_PACKET_CONTROL, DCCG_AUDIO_DTO_SOURCE, DIG_STRIDE};
     use crate::amdgpu_hdmi_audio::AudioFormat;
     use crate::amdgpu_hpd::{HpdMachine, HpdOutcome, HpdSource};
+    use crate::amdgpu_ih_drainer::IhHpdDrain;
+    use crate::amdgpu_ih_navi22::Iv;
     use crate::amdgpu_modeset::{plan_modeset, ConnectorStatus, CrtcState, EncoderKind, KmsState};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -4028,6 +4114,144 @@ mod hdmi_dp_audio_kms_tests {
     kernel_test_in!(
         "drivers/gpu",
         smoke_amdgpu_kms_hotplug_connect_disconnect_audio
+    );
+
+    /// Live IH ring drainer (#1785): a fake IH ring — raw 32-byte
+    /// cookies decoded by `Iv::decode` — plus pin levels staged in
+    /// the fixture latch drives the full connect/disconnect round
+    /// trip through `drain_ih_hotplug` + `service_hotplug`: a vblank
+    /// cookie and an out-of-range context id are skipped, an unbound
+    /// HPD2 cookie is unmapped, an HPD6 cookie has no sense register
+    /// and is dropped, the HPD1 plug debounces and then marks the
+    /// connector Connected, modeset programs audio (AFMT enable
+    /// last), a sink-IRQ cookie passes through without a pin read,
+    /// and the disconnect tears audio down (DTO release last) and
+    /// frees the CRTC.
+    fn smoke_amdgpu_kms_ih_drainer_connect_disconnect_audio() -> TestResult {
+        let _guard = KmsGuard;
+        let mut words = [0u32; 16];
+        let mut gpu = fixture_gpu(&mut words, true);
+        *KMS_STATE.lock() = Some(kms_hdmi_edp());
+        let mut hpd = HpdMachine::with_debounce(100);
+        hpd.bind(HpdSource::Hpd1, 0);
+        *HPD_STATE.lock() = Some(hpd);
+
+        /// One raw 32-byte ring cookie: DCE client, the given
+        /// source id, `src_data[0]` = the HPD context id.
+        fn cookie(src: u8, ctxid: u32) -> Iv {
+            Iv::decode([0x04 | (u32::from(src) << 8), 0, 0, 0, ctxid, 0, 0, 0])
+        }
+        // Pin levels are staged in the latch: `hpd_asserted` reads
+        // the DATA word (words[1]) through the MM_INDEX/MM_DATA
+        // pair, so staging words[1] stages the pin level the next
+        // read returns. (The AFMT/DTO assertions below read the same
+        // latch as the last INDEX/DATA pair, so the level is
+        // re-staged before every drain that needs one.)
+        words[1] = DC_HPD_SENSE_DELAYED;
+        let ring = [
+            cookie(0x3c, 0), // pipe 0 vblank: not HPD
+            cookie(9, 1),    // plug, HPD2: no binding
+            cookie(9, 5),    // plug, HPD6: no sense register
+            cookie(9, 0),    // plug, HPD1, pin high
+            cookie(9, 12),   // context id past 11: not an HPD event
+        ];
+        let report = gpu.drain_ih_hotplug(&ring, 1000);
+        if report
+            != (IhHpdDrain {
+                fed: 2,
+                skipped_non_hpd: 2,
+                skipped_pin_unreadable: 1,
+                unmapped: 1,
+                short_pulse: 0,
+            })
+        {
+            return TestResult::Fail("drainer counts wrong on the connect batch");
+        }
+        {
+            let guard = KMS_STATE.lock();
+            let Some(kms) = guard.as_ref() else {
+                return TestResult::Fail("KMS state missing after drain");
+            };
+            if kms.connectors[0].status != ConnectorStatus::Disconnected {
+                return TestResult::Fail("connect cookie must debounce, not connect");
+            }
+        }
+        // No cookies: the scheduled poll samples the debounce timers.
+        let (report, connected) = gpu.service_hotplug(&[], 1050);
+        if report != IhHpdDrain::default() || !connected.is_empty() {
+            return TestResult::Fail("poll before the window must emit nothing");
+        }
+        let (report, connected) = gpu.service_hotplug(&[], 1200);
+        if report != IhHpdDrain::default() || connected != alloc::vec![0] {
+            return TestResult::Fail("poll after the window must emit connector 0");
+        }
+        {
+            let guard = KMS_STATE.lock();
+            let Some(kms) = guard.as_ref() else {
+                return TestResult::Fail("KMS state missing after poll");
+            };
+            if kms.connectors[0].status != ConnectorStatus::Connected {
+                return TestResult::Fail("poll must mark the connector Connected");
+            }
+        }
+        if gpu
+            .modeset_connector(0, mode_1080p(), 60, 0x8000_0000)
+            .is_err()
+        {
+            return TestResult::Fail("modeset after connect failed");
+        }
+        let afmt = 0x9000 + AFMT_AUDIO_PACKET_CONTROL + 2 * DIG_STRIDE;
+        if words[0] != afmt || words[1] != 1 {
+            return TestResult::Fail("modeset after connect did not enable audio");
+        }
+        // Disconnect batch: a sink IRQ first (no pin read — the
+        // staged level is irrelevant to it), then the plug with the
+        // pin low.
+        words[1] = 0;
+        let ring = [cookie(9, 6), cookie(9, 0)];
+        let report = gpu.drain_ih_hotplug(&ring, 2000);
+        if report.fed != 2 || report.short_pulse != 1 {
+            return TestResult::Fail("drainer counts wrong on the disconnect batch");
+        }
+        // DTO source released last, value 0.
+        if words[0] != 0x5000 + DCCG_AUDIO_DTO_SOURCE || words[1] != 0 {
+            return TestResult::Fail("disconnect must end with the DTO release");
+        }
+        {
+            let guard = KMS_STATE.lock();
+            let Some(kms) = guard.as_ref() else {
+                return TestResult::Fail("KMS state missing after disconnect");
+            };
+            if kms.connectors[0].status != ConnectorStatus::Disconnected {
+                return TestResult::Fail("disconnect must mark the connector Disconnected");
+            }
+            if kms.connectors[0].bound_crtc.is_some() {
+                return TestResult::Fail("disconnect must drop the CRTC binding");
+            }
+        }
+        // A second disconnect on the idle pin: the drain still reads
+        // the pin back (the INDEX latch takes the HPD status
+        // register's byte address) but no teardown writes execute.
+        words[1] = 0;
+        let report = gpu.drain_ih_hotplug(&[cookie(9, 0)], 3000);
+        if report.fed != 1 {
+            return TestResult::Fail("second disconnect must still feed");
+        }
+        let hpd_index = (0x9000
+            + crate::amdgpu_dcn::for_pipe(
+                crate::amdgpu_dcn::HPD0_DC_HPD_INT_STATUS,
+                0,
+                crate::amdgpu_dcn::HPD_STRIDE,
+            ))
+            * 4;
+        if words[0] != hpd_index || words[1] != 0 {
+            return TestResult::Fail("spurious disconnect wrote registers");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_amdgpu_kms_ih_drainer_connect_disconnect_audio
     );
 
     /// EDID feed: a CEA block with one LPCM stereo 48 kHz SAD and
