@@ -1,5 +1,6 @@
 use alloc::{vec, vec::Vec};
 use narf_crypto::bip_cmac::Igtk;
+use narf_wireless::association::channel::CHANNELS_5GHZ;
 use narf_wireless::eapol::{self, HmacPrimitive, KeyFrame, Ptk};
 use narf_wireless::sae::SaeSession;
 use zeroize::{Zeroize, Zeroizing};
@@ -134,7 +135,11 @@ impl FakeAp {
         if ssid.is_empty()
             || ssid.len() > 32
             || !(1..=13).contains(&channel)
-                && !matches!(channel, 36 | 40 | 44 | 48 | 149 | 153 | 157 | 161 | 165)
+                // 5 GHz validity is the canonical CHANNELS_5GHZ list
+                // (wireless/src/association/channel.rs, Linux mt76/mac80211
+                // geometry) — including the DFS channels a radar-channel
+                // beacon needs. Do not re-list a subset here.
+                && !CHANNELS_5GHZ.contains(&channel)
             || !(1..=2007).contains(&aid)
             || plan.station == plan.bssid
             || [plan.station, plan.bssid]

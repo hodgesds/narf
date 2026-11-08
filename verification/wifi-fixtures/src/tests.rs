@@ -376,7 +376,9 @@ case!(wifi_fixture_legacy_rate_profile_wire_and_five_ghz_bounds, {
         ap.with_legacy_rates(&[0x82]).is_err(),
         "late rate profile replacement"
     );
-    for channel in [36, 40, 44, 48, 149, 153, 157, 161, 165] {
+    // Every canonical 5 GHz channel — including the DFS channels a
+    // radar-channel beacon needs — opens with the channel on the wire.
+    for channel in narf_wireless::association::channel::CHANNELS_5GHZ {
         let ap = FakeAp::open(PLAN, b"narf", channel, 42).map_err(|_| "5GHz fixture profile")?;
         ensure!(
             ap.beacon().windows(3).any(|w| w == [3, 1, channel]),
@@ -384,10 +386,10 @@ case!(wifi_fixture_legacy_rate_profile_wire_and_five_ghz_bounds, {
         );
         ensure!(ap.with_basic_1mbps().is_err(), "5GHz CCK fallback offered");
     }
-    for channel in [0, 14, 35, 52, 100, 144, 166, 255] {
+    for channel in [0, 14, 35, 166, 255] {
         ensure!(
             FakeAp::open(PLAN, b"narf", channel, 42).is_err(),
-            "unsupported/DFS fixture channel"
+            "unsupported fixture channel"
         );
     }
     for channel in [1, 2, 5, 17, 61, 93, 233, 253] {
