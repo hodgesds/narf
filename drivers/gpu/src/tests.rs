@@ -1020,6 +1020,299 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
 #[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_displayobj_iter_paths);
 
+/// A display-object table whose paths carry chains must walk by
+/// `usSize`, not by a fixed 8: path 0 is 14 bytes (8-byte header +
+/// 3 chain links), so a fixed-stride walk would land mid-chain
+/// and decode the chain words as a bogus second path (#1712).
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_atom_displayobj_variable_stride_paths() -> TestResult {
+    use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayObjectTable};
+    // 8-byte header + 14 + 14 + 8 = 44 bytes of table.
+    let mut t = alloc::vec![0u8; 8 + 14 + 14 + 8];
+    t[0..2].copy_from_slice(&44u16.to_le_bytes());
+    t[2] = 1; // format_revision
+    t[3] = 0; // content_revision
+    t[4..6].copy_from_slice(&0x0001u16.to_le_bytes());
+    t[6] = 3; // num_paths
+              // Path 0: HDMI-A enum 2, 14 bytes: encoder UNIPHY1 enum 1
+              // (0x2120), connector, sentinel.
+    let off = 8;
+    t[off..off + 2].copy_from_slice(&0x0002u16.to_le_bytes()); // device_tag
+    t[off + 2..off + 4].copy_from_slice(&14u16.to_le_bytes()); // usSize
+    t[off + 4..off + 6].copy_from_slice(&0x320Cu16.to_le_bytes()); // HDMI-A
+    t[off + 6..off + 8].copy_from_slice(&0x1101u16.to_le_bytes()); // GPU obj
+    t[off + 8..off + 10].copy_from_slice(&0x2120u16.to_le_bytes()); // encoder
+    t[off + 10..off + 12].copy_from_slice(&0x320Cu16.to_le_bytes()); // connector
+    t[off + 12..off + 14].copy_from_slice(&0u16.to_le_bytes()); // sentinel
+                                                                // Path 1: DP enum 1, 14 bytes: encoder UNIPHY enum 1 (0x211E),
+                                                                // connector, sentinel.
+    let off = 22;
+    t[off..off + 2].copy_from_slice(&0x0001u16.to_le_bytes());
+    t[off + 2..off + 4].copy_from_slice(&14u16.to_le_bytes());
+    t[off + 4..off + 6].copy_from_slice(&0x3113u16.to_le_bytes()); // DP
+    t[off + 6..off + 8].copy_from_slice(&0x1100u16.to_le_bytes());
+    t[off + 8..off + 10].copy_from_slice(&0x211Eu16.to_le_bytes()); // encoder
+    t[off + 10..off + 12].copy_from_slice(&0x3113u16.to_le_bytes());
+    t[off + 12..off + 14].copy_from_slice(&0u16.to_le_bytes());
+    // Path 2: eDP enum 1, 8 bytes, no chain.
+    let off = 36;
+    t[off..off + 2].copy_from_slice(&0x0004u16.to_le_bytes());
+    t[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+    t[off + 4..off + 6].copy_from_slice(&0x3114u16.to_le_bytes()); // eDP
+    t[off + 6..off + 8].copy_from_slice(&0x1102u16.to_le_bytes());
+    let mut tbl = match DisplayObjectTable::parse(&t) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("variable-stride table parse rejected"),
+    };
+    let (p0, mut chain0) = match tbl.next_with_chain() {
+        Some(p) => p,
+        None => return TestResult::Fail("path 0 missing"),
+    };
+    if p0.connector_kind != ConnectorKind::HdmiA || p0.connector_index != 2 {
+        return TestResult::Fail("path 0 not HDMI-A enum 2");
+    }
+    let l0 = match chain0.next() {
+        Some(l) => l,
+        None => return TestResult::Fail("path 0 chain missing encoder"),
+    };
+    if !l0.is_encoder() || l0.enum_id != 1 || l0.instance != 0x20 {
+        return TestResult::Fail("path 0 chain first link not UNIPHY1 enum 1");
+    }
+    let (p1, mut chain1) = match tbl.next_with_chain() {
+        Some(p) => p,
+        None => return TestResult::Fail("path 1 missing"),
+    };
+    if p1.connector_kind != ConnectorKind::Dp || p1.connector_index != 1 {
+        return TestResult::Fail("path 1 not DP enum 1 (stride walked into chain)");
+    }
+    let l1 = match chain1.next() {
+        Some(l) => l,
+        None => return TestResult::Fail("path 1 chain missing encoder"),
+    };
+    if !l1.is_encoder() || l1.enum_id != 1 || l1.instance != 0x1e {
+        return TestResult::Fail("path 1 chain first link not UNIPHY enum 1");
+    }
+    let p2 = match tbl.next() {
+        Some(p) => p,
+        None => return TestResult::Fail("path 2 missing"),
+    };
+    if p2.connector_kind != ConnectorKind::Edp {
+        return TestResult::Fail("path 2 not eDP");
+    }
+    if tbl.next().is_some() {
+        return TestResult::Fail("iterator yielded extra path");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_amdgpu_atom_displayobj_variable_stride_paths
+);
+
+/// Minimal fake VBIOS carrying a display-object table at data
+/// table 0x05: ROM header at 0x100, master data directory at
+/// 0x140 (6 tables), display-object table at 0x180 — the same
+/// 3-path layout as the variable-stride test above (HDMI-A enum 2
+/// with a UNIPHY1 chain, DP enum 1 with a UNIPHY chain, eDP enum 1
+/// chain-less).
+#[cfg(feature = "amdgpu")]
+fn fake_vbios_with_display_paths() -> alloc::vec::Vec<u8> {
+    fn put_path(image: &mut [u8], off: usize, tag: u16, size: u16, conn: u16, gpu: u16) {
+        image[off..off + 2].copy_from_slice(&tag.to_le_bytes());
+        image[off + 2..off + 4].copy_from_slice(&size.to_le_bytes());
+        image[off + 4..off + 6].copy_from_slice(&conn.to_le_bytes());
+        image[off + 6..off + 8].copy_from_slice(&gpu.to_le_bytes());
+    }
+    let mut image = alloc::vec![0u8; 0x200];
+    image[0..2].copy_from_slice(&[0x55, 0xaa]);
+    // ROM header pointer at 0x48.
+    image[0x48..0x4a].copy_from_slice(&0x0100u16.to_le_bytes());
+    // ATOM ROM header at 0x100: structure size 0x24, "ATOM", no
+    // command-table directory, data directory at 0x140.
+    let hdr = 0x100;
+    image[hdr..hdr + 2].copy_from_slice(&0x0024u16.to_le_bytes());
+    image[hdr + 2] = 1;
+    image[hdr + 3] = 0;
+    image[hdr + 4..hdr + 8].copy_from_slice(b"ATOM");
+    image[hdr + 0x1e..hdr + 0x20].copy_from_slice(&0u16.to_le_bytes());
+    image[hdr + 0x20..hdr + 0x22].copy_from_slice(&0x0140u16.to_le_bytes());
+    // Master data directory at 0x140: size 16 → 6 tables; entry 5
+    // points at the display-object table (0x180).
+    let dir = 0x140;
+    image[dir..dir + 2].copy_from_slice(&16u16.to_le_bytes());
+    image[dir + 4 + 5 * 2..dir + 4 + 5 * 2 + 2].copy_from_slice(&0x0180u16.to_le_bytes());
+    // Display-object table at 0x180 (44 bytes, same paths as above).
+    let tab = 0x180;
+    image[tab..tab + 2].copy_from_slice(&44u16.to_le_bytes());
+    image[tab + 2] = 1;
+    image[tab + 3] = 0;
+    image[tab + 4..tab + 6].copy_from_slice(&0x0001u16.to_le_bytes());
+    image[tab + 6] = 3;
+    put_path(&mut image, tab + 8, 0x0002, 14, 0x320c, 0x1101);
+    image[tab + 16..tab + 18].copy_from_slice(&0x2120u16.to_le_bytes());
+    image[tab + 18..tab + 20].copy_from_slice(&0x320cu16.to_le_bytes());
+    image[tab + 20..tab + 22].copy_from_slice(&0u16.to_le_bytes());
+    put_path(&mut image, tab + 22, 0x0001, 14, 0x3113, 0x1100);
+    image[tab + 30..tab + 32].copy_from_slice(&0x211eu16.to_le_bytes());
+    image[tab + 32..tab + 34].copy_from_slice(&0x3113u16.to_le_bytes());
+    image[tab + 34..tab + 36].copy_from_slice(&0u16.to_le_bytes());
+    put_path(&mut image, tab + 36, 0x0004, 8, 0x3114, 0x1102);
+    image
+}
+
+/// Probe-time KMS ownership (#1712): the fake VBIOS builds 3
+/// connectors (HDMI + DP disconnected, eDP connected), 4 CRTCs on
+/// Phoenix, and 2 encoders bound by DIG — HDMI on DIG 2 (UNIPHY1
+/// enum 1), DP on DIG 0 (UNIPHY enum 1). The eDP path has no chain
+/// and stays encoder-less.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_kms_from_vbios_topology() -> TestResult {
+    use crate::amdgpu::Family;
+    use crate::amdgpu_atom_displayobj::ConnectorKind;
+    use crate::amdgpu_modeset::ConnectorStatus;
+    let image = fake_vbios_with_display_paths();
+    let (kms, hpd) = crate::amdgpu::AmdGpu::kms_from_vbios(&image, Family::Phoenix);
+    if kms.connectors.len() != 3 {
+        return TestResult::Fail("topology must mint 3 connectors");
+    }
+    if kms.crtcs.len() != 4 {
+        return TestResult::Fail("Phoenix topology must mint 4 CRTCs");
+    }
+    let (hdmi, dp, edp) = (&kms.connectors[0], &kms.connectors[1], &kms.connectors[2]);
+    if hdmi.kind != ConnectorKind::HdmiA
+        || hdmi.instance != 2
+        || hdmi.device_tag != 0x0002
+        || hdmi.status != ConnectorStatus::Disconnected
+    {
+        return TestResult::Fail("connector 0 not HDMI-A enum 2 disconnected");
+    }
+    if dp.kind != ConnectorKind::Dp
+        || dp.instance != 1
+        || dp.device_tag != 0x0001
+        || dp.status != ConnectorStatus::Disconnected
+    {
+        return TestResult::Fail("connector 1 not DP enum 1 disconnected");
+    }
+    if edp.kind != ConnectorKind::Edp || edp.status != ConnectorStatus::Connected {
+        return TestResult::Fail("connector 2 not eDP connected");
+    }
+    if kms.encoders.len() != 2 {
+        return TestResult::Fail("topology must bind 2 encoders");
+    }
+    let (enc_hdmi, enc_dp) = (&kms.encoders[0], &kms.encoders[1]);
+    if enc_hdmi.instance != 2 || !enc_hdmi.supports_connector(0) {
+        return TestResult::Fail("HDMI encoder not DIG 2 for connector 0");
+    }
+    if enc_dp.instance != 0 || !enc_dp.supports_connector(1) {
+        return TestResult::Fail("DP encoder not DIG 0 for connector 1");
+    }
+    if hdmi.bound_encoder != Some(0) || dp.bound_encoder != Some(1) {
+        return TestResult::Fail("encoder bindings wrong");
+    }
+    if edp.bound_encoder.is_some() {
+        return TestResult::Fail("chain-less eDP must stay encoder-less");
+    }
+    if hpd
+        .connector_for(crate::amdgpu_hpd::HpdSource::Hpd1)
+        .is_some()
+    {
+        return TestResult::Fail("topology build must not bind HPD sources");
+    }
+    // Unreadable VBIOS degrades to an empty topology, never an error.
+    let (empty, _) = crate::amdgpu::AmdGpu::kms_from_vbios(&[0u8; 16], Family::Phoenix);
+    if !empty.connectors.is_empty() {
+        return TestResult::Fail("garbage VBIOS must yield an empty topology");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_from_vbios_topology);
+
+/// HPD binding from inventory paths (#1712): selectors bind by
+/// device tag, 0 means no pin, an unknown tag binds nothing.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_hpd_bind_from_inventory() -> TestResult {
+    use crate::amdgpu_atom_displayobj::ConnectorKind;
+    use crate::amdgpu_dcn_inventory::{Connector as InvConnector, Path as InvPath};
+    use crate::amdgpu_hpd::HpdSource;
+    use crate::amdgpu_modeset::{Connector, ConnectorStatus, KmsState};
+    let mut kms = KmsState::new(4);
+    kms.connectors.push(Connector {
+        kind: ConnectorKind::HdmiA,
+        instance: 2,
+        status: ConnectorStatus::Disconnected,
+        bound_crtc: None,
+        bound_encoder: None,
+        device_tag: 0x0002,
+        audio_caps: None,
+    });
+    kms.connectors.push(Connector {
+        kind: ConnectorKind::Dp,
+        instance: 1,
+        status: ConnectorStatus::Disconnected,
+        bound_crtc: None,
+        bound_encoder: None,
+        device_tag: 0x0001,
+        audio_caps: None,
+    });
+    let mut hpd = crate::amdgpu_hpd::HpdMachine::new();
+    let paths = [
+        InvPath {
+            connector: InvConnector::DisplayPort,
+            connector_instance: 1,
+            transmitter: 0,
+            aux: None,
+            hpd: 1,
+            device_tag: 0x0001,
+            max_speed_mhz: 0,
+        },
+        InvPath {
+            connector: InvConnector::HdmiTypeA,
+            connector_instance: 2,
+            transmitter: 2,
+            aux: None,
+            hpd: 2,
+            device_tag: 0x0002,
+            max_speed_mhz: 0,
+        },
+        InvPath {
+            connector: InvConnector::EmbeddedDisplayPort,
+            connector_instance: 1,
+            transmitter: 0,
+            aux: None,
+            hpd: 0,
+            device_tag: 0x0004,
+            max_speed_mhz: 0,
+        },
+        InvPath {
+            connector: InvConnector::Other(0x05),
+            connector_instance: 0,
+            transmitter: 0,
+            aux: None,
+            hpd: 3,
+            device_tag: 0x00ff,
+            max_speed_mhz: 0,
+        },
+    ];
+    crate::amdgpu::AmdGpu::bind_hpd_from_inventory(&kms, &mut hpd, &paths);
+    if hpd.connector_for(HpdSource::Hpd1) != Some(1) {
+        return TestResult::Fail("HPD1 must bind to the DP connector (tag 0x0001)");
+    }
+    if hpd.connector_for(HpdSource::Hpd2) != Some(0) {
+        return TestResult::Fail("HPD2 must bind to the HDMI connector (tag 0x0002)");
+    }
+    if hpd.connector_for(HpdSource::Hpd3).is_some() {
+        return TestResult::Fail("unknown device tag must bind nothing");
+    }
+    if hpd.connector_for(HpdSource::Hpd4).is_some() {
+        return TestResult::Fail("eDP with selector 0 must bind nothing");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu", smoke_amdgpu_hpd_bind_from_inventory);
+
 fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
     // StubAux that returns canned EDID bytes for I2C reads at
     // the 7-bit slave address 0x50, and checks the Linux

@@ -2117,6 +2117,353 @@ impl AmdGpu {
         Ok(true)
     }
 
+    /// Encoder kind for a connector kind, for probe-time encoder
+    /// binding. `None` for an unrecognised connector object — the
+    /// connector still mints in KMS, it just gets no encoder.
+    fn encoder_kind_for_connector(
+        kind: crate::amdgpu_atom_displayobj::ConnectorKind,
+    ) -> Option<crate::amdgpu_modeset::EncoderKind> {
+        use crate::amdgpu_atom_displayobj::ConnectorKind;
+        use crate::amdgpu_modeset::EncoderKind;
+        match kind {
+            ConnectorKind::Dp | ConnectorKind::Edp | ConnectorKind::Usbc => {
+                Some(EncoderKind::DigitalPort)
+            }
+            ConnectorKind::HdmiA | ConnectorKind::HdmiB => Some(EncoderKind::Hdmi),
+            ConnectorKind::DviI | ConnectorKind::DviD => Some(EncoderKind::Dvi),
+            ConnectorKind::Vga => Some(EncoderKind::Dac),
+            ConnectorKind::Lvds => Some(EncoderKind::Panel),
+            ConnectorKind::Unknown(_) => None,
+        }
+    }
+
+    /// Build the probe-time KMS topology from a VBIOS image (#1712).
+    ///
+    /// Pure over the image bytes: parse the ATOM display-object
+    /// table (data table 0x05), mint one connector per path and one
+    /// CRTC per pipe, then bind each path's first chain encoder to
+    /// its connector. The encoder's DIG comes from the chain link
+    /// via `translate_encoder_to_transmitter`; a non-UNIPHY encoder
+    /// (no DIG) keeps its enum id as the instance, which the audio
+    /// path never reads for those kinds. Connectors sharing one
+    /// transmitter share one encoder entry (the possible-connectors
+    /// mask gains each connector's bit).
+    ///
+    /// Any parse failure yields an empty topology (no connectors)
+    /// instead of an error: probe must not fail because the display
+    /// table is unreadable — the panel path (`set_mode`) works
+    /// without KMS, and the caller logs the empty result.
+    pub(crate) fn kms_from_vbios(
+        vbios: &[u8],
+        family: Family,
+    ) -> (
+        crate::amdgpu_modeset::KmsState,
+        crate::amdgpu_hpd::HpdMachine,
+    ) {
+        use crate::amdgpu_atom_displayobj::DisplayObjectTable;
+        use crate::amdgpu_modeset::KmsState;
+        // Desktop Navi3 needs 6 pipes; everything else ships 4
+        // (KmsState::new's own doc).
+        let n_pipes = if family == Family::Navi3 { 6 } else { 4 };
+        let mut kms = KmsState::new(n_pipes);
+        let hpd = crate::amdgpu_hpd::HpdMachine::new();
+        let Ok(atom) = crate::amdgpu_atombios::Atombios::parse(vbios) else {
+            return (kms, hpd);
+        };
+        let Ok(raw) = atom.data_table(0x05) else {
+            return (kms, hpd);
+        };
+        let Ok(mut table) = DisplayObjectTable::parse(raw) else {
+            return (kms, hpd);
+        };
+        // Walk once, collecting (path, first encoder link): ingest
+        // needs the paths in order, and encoder binding needs the
+        // connector index each path becomes.
+        let mut paths = Vec::new();
+        while let Some((path, mut chain)) = table.next_with_chain() {
+            let encoder = chain.find(|link| link.is_encoder());
+            paths.push((path, encoder));
+        }
+        kms.ingest_atom_paths(paths.iter().map(|(path, _)| *path));
+        for (connector_idx, (path, encoder)) in paths.iter().enumerate() {
+            let Some(link) = encoder else { continue };
+            let Some(kind) = Self::encoder_kind_for_connector(path.connector_kind) else {
+                continue;
+            };
+            // The possible-connectors mask is a u32; a connector past
+            // bit 31 cannot be represented there, so it stays
+            // encoder-less (still modesettable — the plan layer falls
+            // back to the connector's own instance for the DIG).
+            if connector_idx >= 32 {
+                continue;
+            }
+            let connector_idx = connector_idx as u8;
+            // The DIG is the transmitter the encoder object maps to
+            // (Linux `translate_encoder_to_transmitter`); a
+            // non-UNIPHY encoder has no DIG, so its enum id stands
+            // in as the instance (audio never reads it there).
+            let raw =
+                ((link.kind as u16) << 12) | ((link.enum_id as u16) << 8) | (link.instance as u16);
+            let instance = crate::amdgpu_dcn_inventory::transmitter(raw).unwrap_or(link.enum_id);
+            // Share one encoder entry per transmitter.
+            let encoder_idx = match kms.encoders.iter().position(|enc| enc.instance == instance) {
+                Some(idx) => {
+                    kms.encoders[idx].possible_connectors |= 1u32 << connector_idx;
+                    idx as u8
+                }
+                None => {
+                    kms.push_encoder(kind, instance, 1u32 << connector_idx);
+                    (kms.encoders.len() - 1) as u8
+                }
+            };
+            let _ = kms.bind_encoder(connector_idx, encoder_idx);
+        }
+        (kms, hpd)
+    }
+
+    /// Bind HPD sources to KMS connectors from the inventory's
+    /// per-path HPD selectors (#1712). The match key is the ATOM
+    /// `usDeviceTag`, which both the display-object table and the
+    /// inventory's display-object-info table carry for a path. A
+    /// selector of 0 means the board declares no HPD pin for that
+    /// connector; a tag with no KMS connector, or a selector past
+    /// HPD6, binds nothing.
+    pub(crate) fn bind_hpd_from_inventory(
+        kms: &crate::amdgpu_modeset::KmsState,
+        hpd: &mut crate::amdgpu_hpd::HpdMachine,
+        paths: &[crate::amdgpu_dcn_inventory::Path],
+    ) {
+        use crate::amdgpu_hpd::HpdSource;
+        for path in paths {
+            if path.hpd == 0 {
+                continue;
+            }
+            let Some(src) = HpdSource::from_index(path.hpd - 1) else {
+                continue;
+            };
+            let Some((connector_idx, _)) = kms
+                .connectors
+                .iter()
+                .enumerate()
+                .find(|(_, conn)| conn.device_tag == path.device_tag)
+            else {
+                continue;
+            };
+            hpd.bind(src, connector_idx as u8);
+        }
+    }
+
+    /// Probe-time KMS ownership (#1712). Builds the topology from
+    /// the captured VBIOS, binds HPD sources from the inventory's
+    /// per-path selectors when that parse succeeds, and publishes
+    /// both statics. Best-effort throughout: a missing VBIOS or an
+    /// unreadable table leaves KMS empty (the panel path does not
+    /// need it) and logs one line; probe never fails here.
+    fn init_kms_from_vbios(&self) {
+        use core::fmt::Write as _;
+        let Some(vbios) = self.vbios.as_ref() else {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: no VBIOS image; KMS topology stays empty",
+            );
+            return;
+        };
+        let (kms, mut hpd) = Self::kms_from_vbios(vbios.bytes(), self.chip.family);
+        match crate::amdgpu_dcn_inventory::display_paths(self, vbios.bytes()) {
+            Ok(paths) => Self::bind_hpd_from_inventory(&kms, &mut hpd, &paths),
+            Err(_) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: inventory HPD parse failed; hotplug sources stay unbound",
+                );
+            }
+        }
+        let n_connectors = kms.connectors.len();
+        let n_encoders = kms.encoders.len();
+        if n_connectors == 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: ATOM display-object table unreadable; KMS topology stays empty",
+            );
+        } else {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: KMS topology: {n_connectors} connectors, {n_encoders} encoders",
+            );
+        }
+        *KMS_STATE.lock() = Some(kms);
+        *HPD_STATE.lock() = Some(hpd);
+    }
+
+    /// Modeset one KMS connector with display audio (#1712) — the
+    /// connect-half production caller the plan layer was waiting
+    /// for. Picks a CRTC, builds the plan (video + the DCN audio
+    /// enable sequence for external HDMI/DP when the BASE_IDX 2
+    /// segment resolves), and applies it. The caller supplies the
+    /// mode — on a hotplug connect that is the sink's EDID
+    /// preferred mode; there is no safe default to invent for an
+    /// unknown sink. Internal panels modeset through here too (the
+    /// plan layer carries no audio for them). Returns
+    /// `ConnectorDisconnected` for a connector HPD has not marked
+    /// `Connected` yet.
+    pub fn modeset_connector(
+        &mut self,
+        connector_idx: u8,
+        mode: Mode,
+        refresh_hz: u32,
+        surface_phys: u64,
+    ) -> Result<(), crate::amdgpu_modeset::KmsError> {
+        use crate::amdgpu_modeset::{plan_modeset, KmsError};
+        if self.chip.family == Family::Navi4 {
+            return Err(KmsError::UnsupportedMode);
+        }
+        if !self.fw_loaded {
+            return Err(KmsError::NotReady);
+        }
+        let dcn_base = self
+            .ip_block_base(amdgpu_discovery::HW_ID_DCN, 0)
+            .ok_or(KmsError::NotReady)?;
+        let dcn_base2 = self
+            .ip_block_base_idx(amdgpu_discovery::HW_ID_DCN, 0, 2)
+            .unwrap_or(0);
+        let mut guard = KMS_STATE.lock();
+        let kms = guard.as_mut().ok_or(KmsError::NotReady)?;
+        kms.pick_crtc(connector_idx)?;
+        let plan = plan_modeset(
+            kms,
+            self.chip.family,
+            connector_idx,
+            mode.width,
+            mode.height,
+            refresh_hz,
+            mode.stride,
+            surface_phys,
+            dcn_base,
+            dcn_base2,
+        )?;
+        // SAFETY: probe gave us BAR ownership, still held.
+        unsafe { self.apply_modeset_plan(kms, &plan, mode.stride, surface_phys) }
+            .map_err(|_| KmsError::NotReady)?;
+        Ok(())
+    }
+
+    /// Feed one connector's audio caps from a full EDID blob (#1712).
+    /// Scans the extension blocks for the CEA-861 block (tag 0x02),
+    /// parses its audio blocks, and feeds the result into the KMS
+    /// connector. The live DDC/AUX read that produces the blob per
+    /// connector is follow-up work; this is the feed call the issue
+    /// names as missing. A missing speaker block falls back to the
+    /// FL/FR baseline (0x01) every HDMI sink must accept. Returns
+    /// `true` when a CEA block was found and fed — even when it
+    /// carries no audio blocks (known-empty caps, not unknown) —
+    /// `false` when there is no CEA block, no KMS state, or the
+    /// connector index is out of range.
+    pub fn feed_connector_edid(&self, connector_idx: u8, edid: &[u8]) -> bool {
+        use crate::amdgpu_hdmi_audio::parse_cea_audio_blocks;
+        use crate::amdgpu_modeset::feed_connector_audio_caps;
+        // Base block is 128 bytes; byte 126 is the extension count.
+        if edid.len() < 128 {
+            return false;
+        }
+        let count = edid[126] as usize;
+        let mut guard = KMS_STATE.lock();
+        let Some(kms) = guard.as_mut() else {
+            return false;
+        };
+        for index in 0..count {
+            let off = 128 * (index + 1);
+            let Some(block) = edid.get(off..off + 128) else {
+                break;
+            };
+            if block[0] != 0x02 {
+                continue;
+            }
+            let caps = parse_cea_audio_blocks(block);
+            let speakers = caps.speakers.unwrap_or(0x01);
+            return feed_connector_audio_caps(kms, connector_idx, caps.sads, speakers);
+        }
+        false
+    }
+
+    /// Feed one IH HPD cookie into the driver-owned HPD state
+    /// machine (#1712) — the seam the IH ring drainer calls. The
+    /// pin level comes from the caller (`hpd_asserted` readback at
+    /// drain time); the cookie alone cannot say connect vs
+    /// disconnect. A disconnect on a stable-connected pin runs the
+    /// audio teardown through `apply_hotplug_disconnect` (never a
+    /// bare status flip — the disable writes must execute while
+    /// scanout is still live). Returns `None` for a context id
+    /// that is not an HPD event; `Some(UnmappedSource)` when the
+    /// machine is not initialised or the source has no bound
+    /// connector.
+    pub fn handle_hotplug_event(
+        &mut self,
+        ctxid: u8,
+        asserted: bool,
+        tsc: u64,
+    ) -> Option<crate::amdgpu_hpd::HpdOutcome> {
+        use crate::amdgpu_hpd::{HpdEvent, HpdOutcome};
+        use crate::amdgpu_modeset::ConnectorStatus;
+        let event = HpdEvent::from_ih_cookie(ctxid, asserted, tsc)?;
+        let outcome = {
+            let mut guard = HPD_STATE.lock();
+            let Some(hpd) = guard.as_mut() else {
+                return Some(HpdOutcome::UnmappedSource);
+            };
+            hpd.handle(event)
+        };
+        if let HpdOutcome::Disconnected { connector_idx } = outcome {
+            let mut guard = KMS_STATE.lock();
+            if let Some(kms) = guard.as_mut() {
+                // SAFETY: probe gave us BAR ownership, still held.
+                let applied = unsafe { self.apply_hotplug_disconnect(kms, connector_idx) };
+                if applied.is_err() {
+                    // Firmware not loaded (or Navi4): the teardown
+                    // never ran, but the pin is gone either way —
+                    // drop the connector's CRTC binding so a later
+                    // modeset does not reuse a dead pipe.
+                    kms.set_status(connector_idx, ConnectorStatus::Disconnected);
+                }
+            }
+        }
+        Some(outcome)
+    }
+
+    /// Sample the HPD debounce timers at `tsc` (#1712). Call from
+    /// the driver's main loop or a scheduled wakeup — a connect
+    /// only becomes `Connected` here, after the debounce window,
+    /// never at event time. Returns the connector indices that
+    /// stabilised as connected in this poll, marked `Connected` in
+    /// KMS; the caller modesets each with its mode (EDID preferred
+    /// mode) via `modeset_connector`.
+    pub fn poll_hotplug(&mut self, tsc: u64) -> Vec<u8> {
+        use crate::amdgpu_hpd::{HpdMachine, HpdOutcome, HpdSource};
+        let mut connected = Vec::new();
+        {
+            let mut guard = HPD_STATE.lock();
+            let Some(hpd) = guard.as_mut() else {
+                return connected;
+            };
+            for index in 0..6u8 {
+                let Some(src) = HpdSource::from_index(index) else {
+                    continue;
+                };
+                if let HpdOutcome::Connected { connector_idx } = hpd.sample_at(src, tsc) {
+                    connected.push(connector_idx);
+                }
+            }
+        }
+        if !connected.is_empty() {
+            let mut guard = KMS_STATE.lock();
+            if let Some(kms) = guard.as_mut() {
+                for &connector_idx in &connected {
+                    HpdMachine::apply_to_kms(kms, HpdOutcome::Connected { connector_idx });
+                }
+            }
+        }
+        connected
+    }
+
     /// Program the panel backlight to `percent` (0–100). Caller's
     /// 0 typically lands at the panel's hardware minimum (the panel
     /// usually won't fully extinguish even with USER_LEVEL = 0 —
@@ -2735,6 +3082,17 @@ static DISCRETE_OWNED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 static PCI_AUTHORITY: IrqSafeSpinLock<Option<Cap<BusDeviceCap, Write>>> =
     IrqSafeSpinLock::new(None);
 static PCI_DEVICE: IrqSafeSpinLock<Option<BusDevice>> = IrqSafeSpinLock::new(None);
+/// Probe-owned KMS topology (#1712): the connectors/encoders/CRTCs
+/// built from the VBIOS ATOM display-object table, plus the HPD
+/// source bindings. `None` until `probe()` runs
+/// `init_kms_from_vbios`; the panel path (`set_mode`) does not need
+/// it. Lock order is CONTROLLER → KMS_STATE and CONTROLLER →
+/// HPD_STATE; HPD_STATE and KMS_STATE are never held at once (each
+/// is dropped before the other is taken).
+static KMS_STATE: IrqSafeSpinLock<Option<crate::amdgpu_modeset::KmsState>> =
+    IrqSafeSpinLock::new(None);
+static HPD_STATE: IrqSafeSpinLock<Option<crate::amdgpu_hpd::HpdMachine>> =
+    IrqSafeSpinLock::new(None);
 pub(crate) fn pci_device() -> Option<BusDevice> {
     *PCI_DEVICE.lock()
 }
@@ -2810,6 +3168,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
     }
     dev.vbios = vbios.ok();
+    // Probe-time KMS ownership (#1712): build the topology from the
+    // VBIOS ATOM display-object table so the modeset/display-audio
+    // apply path has a state to act on. Best-effort — failure leaves
+    // KMS empty and the panel path (`set_mode`) is unaffected.
+    dev.init_kms_from_vbios();
     let vbios_version = dev.vbios.as_ref().and_then(|bios| bios.version());
     let is_apu = dev.is_apu();
     // Captured before the move into CONTROLLER; both are Copy.
@@ -3071,6 +3434,21 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
             unsafe { d.set_mode(mode) }
         });
     }
+    // Multi-connector display-audio resume (#1712): re-execute the
+    // audio enable writes for every still-Connected external
+    // connector with a programmed mode, after `set_mode` above
+    // re-programmed video. The `set_mode` snapshot re-run covers
+    // the last applied plan only; this is the multi-connector path.
+    // A missing KMS state (probe never built one) is a silent
+    // no-op — the snapshot path above already handled that case.
+    let _ = with_controller_mut(|d| {
+        let mut guard = KMS_STATE.lock();
+        let Some(kms) = guard.as_mut() else {
+            return;
+        };
+        // SAFETY: probe gave us BAR ownership, still held.
+        let _ = unsafe { d.resume_display_audio(kms) };
+    });
     if !crate::amdgpu_usbc::resume() {
         PM_SUSPENDED.store(true, core::sync::atomic::Ordering::Release);
         return Err(narf_power::device_pm::DeviceSuspendError::DriverError);
@@ -3322,4 +3700,405 @@ mod navi22_ownership_tests {
         "drivers/gpu/amdgpu/navi22",
         navi22_boot_claim_excludes_legacy_access_and_suspend
     );
+}
+
+// ── HDMI/DP audio KMS apply fixtures (#1712) ─────────────────────
+
+#[cfg(feature = "kernel-test")]
+mod hdmi_dp_audio_kms_tests {
+    use super::*;
+    use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayPath};
+    use crate::amdgpu_dcn20_audio::{AFMT_AUDIO_PACKET_CONTROL, DCCG_AUDIO_DTO_SOURCE, DIG_STRIDE};
+    use crate::amdgpu_hdmi_audio::AudioFormat;
+    use crate::amdgpu_hpd::{HpdMachine, HpdOutcome, HpdSource};
+    use crate::amdgpu_modeset::{plan_modeset, ConnectorStatus, CrtcState, EncoderKind, KmsState};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// Words-backed fixture GPU (Phoenix APU) with DCN bases
+    /// resolved: base 0x5000, BASE_IDX 2 segment 0x9000 when
+    /// `base2` — the same bases the modeset plan tests use.
+    fn fixture_gpu(words: &mut [u32; 16], base2: bool) -> AmdGpu {
+        let mut gpu = crate::amdgpu_gfx_navi22::tests::gpu();
+        gpu.regs.virt = words.as_mut_ptr() as u64;
+        gpu.regs.len = (words.len() * 4) as u64;
+        gpu.fw_loaded = true;
+        gpu.chip = __test_chip_info_for_pci_id(AMD_VENDOR, PHOENIX_HAWKPOINT1).unwrap();
+        for block in gpu.ip_blocks.iter_mut() {
+            if block.hw_id == crate::amdgpu_discovery::HW_ID_GC {
+                (block.major, block.minor, block.revision) = (11, 0, 1);
+            }
+            if block.hw_id == crate::amdgpu_discovery::HW_ID_DCN {
+                block.num_bases = if base2 { 3 } else { 1 };
+                block.base_addrs[0] = 0x5000;
+                block.base_addrs[2] = 0x9000;
+            }
+        }
+        gpu
+    }
+
+    /// KMS with one HDMI connector (index 0, DIG 2, initially
+    /// Disconnected) and one eDP connector (index 1, Connected,
+    /// chain-less). Mirrors the fake-VBIOS topology.
+    fn kms_hdmi_edp() -> KmsState {
+        let mut kms = KmsState::new(4);
+        kms.ingest_atom_paths(
+            [
+                DisplayPath {
+                    device_tag: 0x0002,
+                    connector_kind: ConnectorKind::HdmiA,
+                    connector_index: 2,
+                    gpu_object_id: 0x1101,
+                },
+                DisplayPath {
+                    device_tag: 0x0004,
+                    connector_kind: ConnectorKind::Edp,
+                    connector_index: 1,
+                    gpu_object_id: 0x1102,
+                },
+            ]
+            .iter()
+            .copied(),
+        );
+        kms.push_encoder(EncoderKind::Hdmi, 2, 0b0001);
+        kms.bind_encoder(0, 0).expect("bind HDMI encoder");
+        kms
+    }
+
+    /// Installs the test KMS/HPD state into the driver statics and
+    /// clears both on drop — the statics are process-global, like
+    /// CONTROLLER, so a test must not leak them into the next one.
+    /// Also clears the saved display-audio snapshot, which
+    /// `apply_modeset_plan` writes: a later `set_mode` test with
+    /// matching timing would otherwise replay this test's audio
+    /// writes into its own fixture.
+    struct KmsGuard;
+    impl Drop for KmsGuard {
+        fn drop(&mut self) {
+            *KMS_STATE.lock() = None;
+            *HPD_STATE.lock() = None;
+            *SAVED_DISPLAY_AUDIO.lock() = None;
+        }
+    }
+
+    fn mode_1080p() -> Mode {
+        Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        }
+    }
+
+    /// HDMI modeset executes the audio enable sequence after video:
+    /// the last INDEX/DATA pair is the AFMT sample-send un-mute on
+    /// DIG 2's block, and KMS records the modeset.
+    fn smoke_amdgpu_kms_modeset_hdmi_audio_executes() -> TestResult {
+        let _guard = KmsGuard;
+        let mut words = [0u32; 16];
+        let mut gpu = fixture_gpu(&mut words, true);
+        if gpu.ip_block_base(crate::amdgpu_discovery::HW_ID_DCN, 0) != Some(0x5000) {
+            return TestResult::Fail("fixture DCN base not resolved");
+        }
+        let mut kms = kms_hdmi_edp();
+        kms.set_status(0, ConnectorStatus::Connected);
+        *KMS_STATE.lock() = Some(kms);
+        *HPD_STATE.lock() = Some(HpdMachine::new());
+        if gpu
+            .modeset_connector(0, mode_1080p(), 60, 0x8000_0000)
+            .is_err()
+        {
+            return TestResult::Fail("HDMI modeset_connector failed");
+        }
+        // AFMT_AUDIO_PACKET_CONTROL on DIG 2, sample-send bit set.
+        let afmt = 0x9000 + AFMT_AUDIO_PACKET_CONTROL + 2 * DIG_STRIDE;
+        if words[0] != afmt || words[1] != 1 {
+            return TestResult::Fail("HDMI modeset did not end with the AFMT enable");
+        }
+        let guard = KMS_STATE.lock();
+        let Some(kms) = guard.as_ref() else {
+            return TestResult::Fail("KMS state missing after modeset");
+        };
+        let conn = &kms.connectors[0];
+        let Some(crtc_idx) = conn.bound_crtc else {
+            return TestResult::Fail("HDMI connector has no bound CRTC after modeset");
+        };
+        let crtc = &kms.crtcs[crtc_idx as usize];
+        if crtc.state != CrtcState::Active {
+            return TestResult::Fail("HDMI CRTC not Active after modeset");
+        }
+        if crtc
+            .mode
+            .is_none_or(|m| m.width != 1920 || m.height != 1080)
+        {
+            return TestResult::Fail("HDMI CRTC mode wrong after modeset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_modeset_hdmi_audio_executes);
+
+    /// The internal panel modesets video-only: the plan carries no
+    /// audio writes and the latch holds the plan's last video write.
+    fn smoke_amdgpu_kms_modeset_edp_video_only() -> TestResult {
+        let _guard = KmsGuard;
+        let mut words = [0u32; 16];
+        let mut gpu = fixture_gpu(&mut words, true);
+        *KMS_STATE.lock() = Some(kms_hdmi_edp());
+        *HPD_STATE.lock() = Some(HpdMachine::new());
+        if gpu
+            .modeset_connector(1, mode_1080p(), 60, 0x8000_0000)
+            .is_err()
+        {
+            return TestResult::Fail("eDP modeset_connector failed");
+        }
+        let guard = KMS_STATE.lock();
+        let Some(kms) = guard.as_ref() else {
+            return TestResult::Fail("KMS state missing after modeset");
+        };
+        let plan = match plan_modeset(
+            kms,
+            Family::Phoenix,
+            1,
+            1920,
+            1080,
+            60,
+            1920,
+            0x8000_0000,
+            0x5000,
+            0x9000,
+        ) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("eDP plan rebuild failed"),
+        };
+        if !plan.audio_writes.is_empty() {
+            return TestResult::Fail("eDP plan must carry no audio writes");
+        }
+        let Some(last) = plan.writes.last() else {
+            return TestResult::Fail("eDP plan has no video writes");
+        };
+        if words[0] != last.addr || words[1] != last.value {
+            return TestResult::Fail("eDP modeset latch is not the last video write");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_modeset_edp_video_only);
+
+    /// Without the BASE_IDX 2 segment an HDMI modeset still
+    /// succeeds but programs video only — no spurious audio enable.
+    fn smoke_amdgpu_kms_modeset_no_base2_video_only() -> TestResult {
+        let _guard = KmsGuard;
+        let mut words = [0u32; 16];
+        let mut gpu = fixture_gpu(&mut words, false);
+        let mut kms = kms_hdmi_edp();
+        kms.set_status(0, ConnectorStatus::Connected);
+        *KMS_STATE.lock() = Some(kms);
+        *HPD_STATE.lock() = Some(HpdMachine::new());
+        if gpu
+            .modeset_connector(0, mode_1080p(), 60, 0x8000_0000)
+            .is_err()
+        {
+            return TestResult::Fail("HDMI modeset without base2 failed");
+        }
+        let guard = KMS_STATE.lock();
+        let Some(kms) = guard.as_ref() else {
+            return TestResult::Fail("KMS state missing after modeset");
+        };
+        let plan = match plan_modeset(
+            kms,
+            Family::Phoenix,
+            0,
+            1920,
+            1080,
+            60,
+            1920,
+            0x8000_0000,
+            0x5000,
+            0,
+        ) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("no-base2 plan rebuild failed"),
+        };
+        if !plan.audio_writes.is_empty() {
+            return TestResult::Fail("plan without base2 must carry no audio writes");
+        }
+        let Some(last) = plan.writes.last() else {
+            return TestResult::Fail("no-base2 plan has no video writes");
+        };
+        if words[0] != last.addr || words[1] != last.value {
+            return TestResult::Fail("no-base2 modeset latch is not the last video write");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_modeset_no_base2_video_only);
+
+    /// Full hotplug round trip: unmapped source drops, connect
+    /// debounces and then marks the connector Connected, modeset
+    /// programs audio, disconnect tears audio down (latch ends on
+    /// the DTO release) and frees the CRTC, and a second disconnect
+    /// on the idle pin writes nothing.
+    fn smoke_amdgpu_kms_hotplug_connect_disconnect_audio() -> TestResult {
+        let _guard = KmsGuard;
+        let mut words = [0u32; 16];
+        let mut gpu = fixture_gpu(&mut words, true);
+        *KMS_STATE.lock() = Some(kms_hdmi_edp());
+        let mut hpd = HpdMachine::with_debounce(100);
+        hpd.bind(HpdSource::Hpd1, 0);
+        *HPD_STATE.lock() = Some(hpd);
+        // HPD2 has no binding.
+        if gpu.handle_hotplug_event(1, true, 1000) != Some(HpdOutcome::UnmappedSource) {
+            return TestResult::Fail("unbound HPD source must be UnmappedSource");
+        }
+        // Connect on HPD1: debounce pending.
+        if gpu.handle_hotplug_event(0, true, 1000) != Some(HpdOutcome::NoChange) {
+            return TestResult::Fail("connect must debounce (NoChange)");
+        }
+        if !gpu.poll_hotplug(1050).is_empty() {
+            return TestResult::Fail("poll before the window must emit nothing");
+        }
+        if gpu.poll_hotplug(1200) != alloc::vec![0] {
+            return TestResult::Fail("poll after the window must emit connector 0");
+        }
+        {
+            let guard = KMS_STATE.lock();
+            let Some(kms) = guard.as_ref() else {
+                return TestResult::Fail("KMS state missing after poll");
+            };
+            if kms.connectors[0].status != ConnectorStatus::Connected {
+                return TestResult::Fail("poll must mark the connector Connected");
+            }
+        }
+        if gpu
+            .modeset_connector(0, mode_1080p(), 60, 0x8000_0000)
+            .is_err()
+        {
+            return TestResult::Fail("modeset after connect failed");
+        }
+        let afmt = 0x9000 + AFMT_AUDIO_PACKET_CONTROL + 2 * DIG_STRIDE;
+        if words[0] != afmt || words[1] != 1 {
+            return TestResult::Fail("modeset after connect did not enable audio");
+        }
+        if gpu.handle_hotplug_event(0, false, 2000)
+            != Some(HpdOutcome::Disconnected { connector_idx: 0 })
+        {
+            return TestResult::Fail("disconnect must emit Disconnected");
+        }
+        // DTO source released last, value 0.
+        if words[0] != 0x5000 + DCCG_AUDIO_DTO_SOURCE || words[1] != 0 {
+            return TestResult::Fail("disconnect must end with the DTO release");
+        }
+        {
+            let guard = KMS_STATE.lock();
+            let Some(kms) = guard.as_ref() else {
+                return TestResult::Fail("KMS state missing after disconnect");
+            };
+            if kms.connectors[0].status != ConnectorStatus::Disconnected {
+                return TestResult::Fail("disconnect must mark the connector Disconnected");
+            }
+            if kms.connectors[0].bound_crtc.is_some() {
+                return TestResult::Fail("disconnect must drop the CRTC binding");
+            }
+        }
+        let (w0, w1) = (words[0], words[1]);
+        if gpu.handle_hotplug_event(0, false, 3000) != Some(HpdOutcome::NoChange) {
+            return TestResult::Fail("second disconnect must be NoChange");
+        }
+        if words[0] != w0 || words[1] != w1 {
+            return TestResult::Fail("spurious disconnect wrote registers");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_amdgpu_kms_hotplug_connect_disconnect_audio
+    );
+
+    /// EDID feed: a CEA block with one LPCM stereo 48 kHz SAD and
+    /// an FL/FR speaker block lands in the connector's caps; an
+    /// EDID with no extensions and an out-of-range connector both
+    /// return false.
+    fn smoke_amdgpu_kms_feed_connector_edid() -> TestResult {
+        let _guard = KmsGuard;
+        let mut words = [0u32; 16];
+        let gpu = fixture_gpu(&mut words, true);
+        *KMS_STATE.lock() = Some(kms_hdmi_edp());
+        *HPD_STATE.lock() = Some(HpdMachine::new());
+        let mut edid = [0u8; 256];
+        edid[126] = 1;
+        let cea = &mut edid[128..256];
+        cea[0] = 0x02; // CEA-861 tag
+        cea[1] = 0x03; // revision
+        cea[2] = 10; // DTD offset: collection is bytes 4..10
+        cea[4] = 0x23; // audio data block, tag 1, length 3
+        cea[5] = 0x09; // LPCM (1), stereo (channels - 1 = 1)
+        cea[6] = 0x04; // sample rates: 48 kHz
+        cea[7] = 0x00; // 16-bit
+        cea[8] = 0x81; // speaker allocation block, tag 4, length 1
+        cea[9] = 0x01; // FL/FR
+        if !gpu.feed_connector_edid(0, &edid) {
+            return TestResult::Fail("CEA feed must succeed");
+        }
+        {
+            let guard = KMS_STATE.lock();
+            let Some(kms) = guard.as_ref() else {
+                return TestResult::Fail("KMS state missing after feed");
+            };
+            let Some(caps) = &kms.connectors[0].audio_caps else {
+                return TestResult::Fail("feed left no audio caps");
+            };
+            if caps.sads.len() != 1 || caps.sads[0].format != AudioFormat::LinearPcm {
+                return TestResult::Fail("fed SAD wrong");
+            }
+            if caps.speakers != 0x01 {
+                return TestResult::Fail("fed speaker mask wrong");
+            }
+        }
+        let mut edid0 = [0u8; 128];
+        edid0[126] = 0;
+        if gpu.feed_connector_edid(0, &edid0) {
+            return TestResult::Fail("feed without extensions must fail");
+        }
+        if gpu.feed_connector_edid(9, &edid) {
+            return TestResult::Fail("feed to a missing connector must fail");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_feed_connector_edid);
+
+    /// Resume re-executes the audio enable writes for the
+    /// still-Connected connector after video is re-programmed:
+    /// wipe the latch, run `resume_display_audio`, and the AFMT
+    /// enable is rewritten.
+    fn smoke_amdgpu_kms_resume_reenables_audio() -> TestResult {
+        let _guard = KmsGuard;
+        let mut words = [0u32; 16];
+        let mut gpu = fixture_gpu(&mut words, true);
+        let mut kms = kms_hdmi_edp();
+        kms.set_status(0, ConnectorStatus::Connected);
+        *KMS_STATE.lock() = Some(kms);
+        *HPD_STATE.lock() = Some(HpdMachine::new());
+        if gpu
+            .modeset_connector(0, mode_1080p(), 60, 0x8000_0000)
+            .is_err()
+        {
+            return TestResult::Fail("modeset for resume setup failed");
+        }
+        // Wipe the latch: resume must rewrite the enable itself.
+        words = [0u32; 16];
+        let resumed = {
+            let guard = KMS_STATE.lock();
+            let Some(kms) = guard.as_ref() else {
+                return TestResult::Fail("KMS state missing for resume");
+            };
+            // SAFETY: fixture owns the words-backed BAR5.
+            unsafe { gpu.resume_display_audio(kms) }
+        };
+        match resumed {
+            Ok(true) => {}
+            _ => return TestResult::Fail("resume_display_audio must execute writes"),
+        }
+        let afmt = 0x9000 + AFMT_AUDIO_PACKET_CONTROL + 2 * DIG_STRIDE;
+        if words[0] != afmt || words[1] != 1 {
+            return TestResult::Fail("resume did not rewrite the AFMT enable");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_resume_reenables_audio);
 }

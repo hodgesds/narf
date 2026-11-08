@@ -274,7 +274,10 @@ fn table(vbios: &[u8], index: u16) -> Result<&[u8], Error> {
 
 /// `translate_encoder_to_transmitter`: UNIPHY and its numbered siblings each
 /// carry two transmitters, selected by the object's enum id.
-fn transmitter(encoder_objid: u16) -> Result<u8, Error> {
+///
+/// `pub(crate)` so the KMS probe owner can derive the same DIG index for a
+/// chain encoder instead of duplicating this table (single authority).
+pub(crate) fn transmitter(encoder_objid: u16) -> Result<u8, Error> {
     if (encoder_objid & OBJECT_TYPE_MASK) >> OBJECT_TYPE_SHIFT != TYPE_ENCODER {
         return Err(Error::Unsupported);
     }
