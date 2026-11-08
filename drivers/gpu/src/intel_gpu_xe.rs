@@ -729,9 +729,18 @@ impl XeFile {
                 let queues = |id: u32| {
                     self.names.lock().queues.get(&id).map(|queue| {
                         let context = &queue.context;
+                        // The binding retains the queue (liveness probe) and
+                        // its GuC context, so OA enable time can fail cleanly
+                        // when the queue is gone.
+                        let probe = queue.clone();
                         (
                             context.engine().xe_class(),
                             context.parallel().map_or(1, <[_]>::len),
+                            crate::intel_gpu_oa::QueueBinding::new(
+                                id,
+                                context.clone(),
+                                Arc::new(move || probe.check().is_ok()),
+                            ),
                         )
                     })
                 };

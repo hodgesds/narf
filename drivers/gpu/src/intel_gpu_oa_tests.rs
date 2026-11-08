@@ -6,7 +6,7 @@ use crate::intel_gpu_guc_boot::BootError;
 use crate::intel_gpu_rcs::{GpuAllocator, SubmitError};
 use core::{
     future::Future,
-    sync::atomic::{AtomicU64, AtomicUsize},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize},
     task::{Context, Poll, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -352,15 +352,24 @@ impl UserBackend for Backend {
         Box::pin(async { Err(FsError::Unsupported) })
     }
 }
-fn none(_: u32) -> Option<(u16, usize)> {
+fn none(_: u32) -> Option<(u16, usize, QueueBinding)> {
     None
 }
-fn render_queue(id: u32) -> Option<(u16, usize)> {
-    match id {
-        3 => Some((0, 1)),
-        4 => Some((4, 2)),
-        _ => None,
-    }
+fn render_queue(id: u32) -> Option<(u16, usize, QueueBinding)> {
+    let (class, width, engine) = match id {
+        3 => (0, 1, Engine::Rcs0),
+        4 => (4, 2, Engine::Ccs0),
+        _ => return None,
+    };
+    Some((
+        class,
+        width,
+        QueueBinding::new(
+            id,
+            crate::intel_gpu_user::UserContext::for_engine(engine),
+            Arc::new(|| true),
+        ),
+    ))
 }
 fn uuid(n: u8) -> [u8; 36] {
     let mut uuid = *b"01234567-89ab-cdef-0123-456789abcde0";
@@ -1306,6 +1315,7 @@ fn unit_with_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<Session>) 
         config,
         false,
         None,
+        None,
         false,
         true,
     );
@@ -1971,12 +1981,23 @@ fn smoke_oa_exec_queue_oar_oac_streams() -> TestResult {
     let wire = Wire::new();
     let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
 
-    let queue_lookup = |id: u32| match id {
-        10 => Some((0, 1)),
-        11 => Some((4, 1)),
-        12 => Some((0, 2)),
-        13 => Some((4, 2)),
-        _ => None,
+    let queue_lookup = |id: u32| {
+        let (class, width, engine) = match id {
+            10 => (0, 1, Engine::Rcs0),
+            11 => (4, 1, Engine::Ccs0),
+            12 => (0, 2, Engine::Rcs0),
+            13 => (4, 2, Engine::Ccs0),
+            _ => return None,
+        };
+        Some((
+            class,
+            width,
+            QueueBinding::new(
+                id,
+                crate::intel_gpu_user::UserContext::for_engine(engine),
+                Arc::new(|| true),
+            ),
+        ))
     };
 
     const OAR256: u64 = 1 | 5 << 8;
@@ -2102,6 +2123,269 @@ fn smoke_oa_exec_queue_oar_oac_streams() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_exec_queue_oar_oac_streams
+);
+
+fn smoke_oa_per_context_lri_batch_contents() -> TestResult {
+    let dev = device(60, MTL, 1270);
+    let alive: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
+
+    // OAR format 4: select 5, size 256, kind OAR. __format_to_oactrl with
+    // the OAR counter-select mask (bits 3:1) is (5 << 1) & 0xe = 0xa.
+    let session = test_session_exec(dev, 4, DEFAULT_BUFFER, Engine::Rcs0, 10, alive.clone());
+    assert!(session.programs_per_context());
+    assert_eq!(session.queue_binding().unwrap().id, 10);
+    assert!(session.queue_binding().unwrap().alive());
+    assert_eq!(
+        session.queue_binding().unwrap().context.engine(),
+        Engine::Rcs0
+    );
+    assert_eq!(
+        per_context_job(&session, true).unwrap().words(),
+        &[0x1100_0005, 0x2360, 1, 0x2960, 0xb, 0x2244, 0x0100_0100][..]
+    );
+    assert_eq!(
+        per_context_job(&session, false).unwrap().words(),
+        &[0x1100_0005, 0x2360, 0, 0x2960, 0xa, 0x2244, 0x0100_0000][..]
+    );
+    drop(session);
+
+    // OAC format 6: select 1, size 320, kind OAC; control is (1 << 1) & 0xe = 2.
+    // Compute adds CTX_CTRL_RUN_ALONE to the context-control mask.
+    let session = test_session_exec(dev, 6, DEFAULT_BUFFER, Engine::Ccs0, 11, alive.clone());
+    assert!(session.programs_per_context());
+    assert_eq!(
+        per_context_job(&session, true).unwrap().words(),
+        &[0x1100_0005, 0x1a360, 1, 0x15114, 3, 0x1a244, 0x0180_0180][..]
+    );
+    assert_eq!(
+        per_context_job(&session, false).unwrap().words(),
+        &[0x1100_0005, 0x1a360, 0, 0x15114, 2, 0x1a244, 0x0180_0000][..]
+    );
+    drop(session);
+
+    // No exec queue, or a video engine, programs nothing.
+    let session = test_session(dev, 4, DEFAULT_BUFFER, None, &[(0x9888, 1)]);
+    assert!(!session.programs_per_context());
+    assert!(per_context_job(&session, true).is_none());
+    drop(session);
+    let session = test_session_exec(dev, 4, DEFAULT_BUFFER, Engine::Vcs0, 20, alive);
+    assert!(!session.programs_per_context());
+    assert!(per_context_job(&session, true).is_none());
+    drop(session);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_per_context_lri_batch_contents
+);
+
+fn smoke_oa_per_context_enable_disable_sequence() -> TestResult {
+    let backend = Backend::new(device(61, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let alive = Arc::new(AtomicBool::new(true));
+    let queues = |id: u32| {
+        let probe = alive.clone();
+        match id {
+            10 => Some((
+                0,
+                1,
+                QueueBinding::new(
+                    10,
+                    crate::intel_gpu_user::UserContext::for_engine(Engine::Rcs0),
+                    Arc::new(move || probe.load(Ordering::Relaxed)),
+                ),
+            )),
+            _ => None,
+        }
+    };
+    const OAR256: u64 = 1 | 5 << 8;
+
+    // Open enables: the per-context job retires first, then the config job.
+    let at = wire.chain(0x1000, &[(7, 10), (4, OAR256), (3, config)]);
+    assert_eq!(
+        ready(open(Some(backend.clone()), at, &wire, &queues, DENY, None)),
+        Ok(41)
+    );
+    let file = wire.file();
+    let session = session_of(&backend);
+    assert!(session.enabled());
+    assert_eq!(backend.jobs.lock().len(), 2);
+    assert_eq!(
+        backend.jobs.lock()[0],
+        vec![0x1100_0005, 0x2360, 1, 0x2960, 0xb, 0x2244, 0x0100_0100]
+    );
+    assert_eq!(backend.jobs.lock()[1], vec![0x1100_0001, 0x9888, 1]);
+    assert_eq!(backend.hw.get(0x2360), 1);
+    assert_eq!(backend.hw.get(0x2960), 0xb);
+    assert_eq!(backend.hw.get(0x2244), 0x0100_0100);
+
+    // Disable retires the per-context disable job before the global counter
+    // is cleared; re-enable programs it again.
+    assert_eq!(ready(file.ioctl_user(DISABLE, 0, &wire)), Ok(0));
+    assert!(!session.enabled());
+    assert_eq!(backend.hw.get(0x2360), 0);
+    assert_eq!(backend.hw.get(0x2960), 0xa);
+    assert_eq!(backend.hw.get(0x2244), 0x0100_0000);
+    assert_eq!(backend.hw.get(OACONTROL) & COUNTER_ENABLE, 0);
+    assert_eq!(ready(file.ioctl_user(ENABLE, 0, &wire)), Ok(0));
+    assert!(session.enabled());
+    assert_eq!(backend.hw.get(0x2360), 1);
+    assert_eq!(backend.hw.get(0x2960), 0xb);
+    assert_eq!(backend.hw.get(0x2244), 0x0100_0100);
+    drop(file);
+    backend.poll(1);
+    assert!(!backend.unit.lock().as_ref().unwrap().per_context);
+
+    // Compute: the CCS select is programmed before the OAC LRI retires.
+    let dev = Device {
+        card: 62,
+        platform: MTL,
+        graphics: 1270,
+        timestamp: 19_200_000,
+        engines: EngineSet::of(&[Engine::Rcs0, Engine::Ccs1]),
+        reserve: DEFAULT_BUFFER,
+        media_engines: None,
+        media_timestamp: None,
+    };
+    let backend = Backend::new(dev);
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let queues = |id: u32| match id {
+        11 => Some((
+            4,
+            1,
+            QueueBinding::new(
+                11,
+                crate::intel_gpu_user::UserContext::for_engine(Engine::Ccs1),
+                Arc::new(|| true),
+            ),
+        )),
+        _ => None,
+    };
+    const OAC320: u64 = 3 | 1 << 8;
+    // No engine-instance property: with engines [Rcs0, Ccs1], compute
+    // logical instance 0 is Ccs1 (physical instance 1).
+    let at = wire.chain(0x1000, &[(7, 11), (4, OAC320), (3, config)]);
+    assert_eq!(
+        ready(open(Some(backend.clone()), at, &wire, &queues, DENY, None)),
+        Ok(41)
+    );
+    assert_eq!(backend.hw.get(0x1c360), 1);
+    assert_eq!(backend.hw.get(0x15114), 3);
+    assert_eq!(backend.hw.get(0x1c244), 0x0180_0180);
+    assert_eq!(backend.hw.get(OACONTROL) & CCS_SELECT, 1u32 << 16);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_per_context_enable_disable_sequence
+);
+
+fn smoke_oa_per_context_stale_queue_fails_enable() -> TestResult {
+    let backend = Backend::new(device(59, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let alive = Arc::new(AtomicBool::new(true));
+    let queues = |id: u32| {
+        let probe = alive.clone();
+        match id {
+            10 => Some((
+                0,
+                1,
+                QueueBinding::new(
+                    10,
+                    crate::intel_gpu_user::UserContext::for_engine(Engine::Rcs0),
+                    Arc::new(move || probe.load(Ordering::Relaxed)),
+                ),
+            )),
+            _ => None,
+        }
+    };
+    const OAR256: u64 = 1 | 5 << 8;
+
+    // Open disabled so the enable path below is exercised on its own.
+    let at = wire.chain(0x1000, &[(7, 10), (4, OAR256), (3, config), (6, 1)]);
+    assert_eq!(
+        ready(open(Some(backend.clone()), at, &wire, &queues, DENY, None)),
+        Ok(41)
+    );
+    let session = session_of(&backend);
+    assert!(!session.enabled());
+
+    // The queue is gone: enable fails cleanly with NotFound and the stream
+    // stays disabled with no per-context registers programmed.
+    alive.store(false, Ordering::Relaxed);
+    assert_eq!(
+        ready(backend.oa_control(session.clone(), Request::Enable)),
+        Err(FsError::NotFound)
+    );
+    assert!(!session.enabled());
+    assert_eq!(backend.hw.get(0x2360), 0);
+
+    // The queue is back: enable succeeds. A later disable still runs the
+    // global disable even after the queue goes away again.
+    alive.store(true, Ordering::Relaxed);
+    assert_eq!(
+        ready(backend.oa_control(session.clone(), Request::Enable)),
+        Ok(())
+    );
+    assert!(session.enabled());
+    assert_eq!(backend.hw.get(0x2360), 1);
+    alive.store(false, Ordering::Relaxed);
+    assert_eq!(
+        ready(backend.oa_control(session.clone(), Request::Disable)),
+        Ok(())
+    );
+    assert!(!session.enabled());
+    assert_eq!(backend.hw.get(OACONTROL) & COUNTER_ENABLE, 0);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_per_context_stale_queue_fails_enable
+);
+
+fn smoke_oa_per_context_open_with_dead_queue_fails_clean() -> TestResult {
+    let backend = Backend::new(device(58, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let _ = backend.hw.take();
+    // The queue is already gone when open runs: the binding's probe is dead.
+    let queues = |id: u32| match id {
+        10 => Some((
+            0,
+            1,
+            QueueBinding::new(
+                10,
+                crate::intel_gpu_user::UserContext::for_engine(Engine::Rcs0),
+                Arc::new(|| false),
+            ),
+        )),
+        _ => None,
+    };
+    const OAR256: u64 = 1 | 5 << 8;
+
+    // Open-with-enable fails with NotFound before attach programs any
+    // metric-set state: no jobs retire and no registers are written.
+    let at = wire.chain(0x1000, &[(7, 10), (4, OAR256), (3, config)]);
+    assert_eq!(
+        ready(open(Some(backend.clone()), at, &wire, &queues, DENY, None)),
+        Err(Error::Fs(FsError::NotFound))
+    );
+    assert!(backend.jobs.lock().is_empty());
+    assert!(backend.hw.take().is_empty());
+    assert_eq!(backend.hw.get(0x2360), 0);
+    assert_eq!(backend.hw.get(0x2960), 0);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_per_context_open_with_dead_queue_fails_clean
 );
 
 fn smoke_oa_syncs_infence_outfence_and_user_fence() -> TestResult {
@@ -2265,8 +2549,24 @@ fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
     // Media exec queue: queue 20 has class 2 (VCS), width 1.
     // Render exec queue: queue 10 has class 0 (RCS), width 1.
     let queues = |id: u32| match id {
-        20 => Some((2, 1)),
-        10 => Some((0, 1)),
+        20 => Some((
+            2,
+            1,
+            QueueBinding::new(
+                20,
+                crate::intel_gpu_user::UserContext::for_engine(Engine::Vcs0),
+                Arc::new(|| true),
+            ),
+        )),
+        10 => Some((
+            0,
+            1,
+            QueueBinding::new(
+                10,
+                crate::intel_gpu_user::UserContext::for_engine(Engine::Rcs0),
+                Arc::new(|| true),
+            ),
+        )),
         _ => None,
     };
 

@@ -17,7 +17,7 @@ use crate::{
     intel_gpu_guc_boot::BootAllocator,
     intel_gpu_rcs::GpuBacking,
     intel_gpu_uapi::{put32, put64, u32_at, u64_at},
-    intel_gpu_user::UserBackend,
+    intel_gpu_user::{UserBackend, UserContext},
     intel_gpu_xe_sync::Sync as XeSync,
 };
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
@@ -98,6 +98,22 @@ const SQCNT1: u64 = 0x8718;
 const SQCNT1_BITS: u32 = (1 << 30) | (1 << 29);
 const ROW_CHICKEN: u64 = 0xe4f0;
 const ROW_CHICKEN2: u64 = 0xe4f4;
+/// OAR unit: regs/xe_oa_regs.h OAR_OACONTROL.
+const OAR_OACONTROL: u32 = 0x2960;
+/// OAC unit: regs/xe_oa_regs.h OAC_OACONTROL.
+const OAC_OACONTROL: u32 = 0x15114;
+/// OACTXCONTROL(base): regs/xe_oa_regs.h, engine base + 0x360.
+const OACTXCONTROL_OFF: u32 = 0x360;
+/// OA_COUNTER_RESUME: regs/xe_oa_regs.h, OACTXCONTROL bit 0.
+const OA_COUNTER_RESUME: u32 = 1;
+/// RING_CONTEXT_CONTROL(base): regs/xe_engine_regs.h, engine base + 0x244.
+const RING_CONTEXT_CONTROL_OFF: u32 = 0x244;
+/// CTX_CTRL_OAC_CONTEXT_ENABLE: regs/xe_engine_regs.h, bit 8.
+const CTX_CTRL_OAC_CONTEXT_ENABLE: u32 = 1 << 8;
+/// CTX_CTRL_RUN_ALONE: regs/xe_engine_regs.h, bit 7.
+const CTX_CTRL_RUN_ALONE: u32 = 1 << 7;
+/// OAR_OACONTROL_COUNTER_SEL_MASK: regs/xe_oa_regs.h GENMASK(3, 1).
+const OAR_COUNTER_SEL_MASK: u32 = 0xe;
 
 const fn masked(mask: u32, value: u32) -> u32 {
     (mask << 16) | value
@@ -176,6 +192,14 @@ impl Format {
     /// __format_to_oactrl for the OAG counter-select field (bits 4:2).
     fn control(self) -> u32 {
         ((self.select << 2) & COUNTER_SEL)
+            | u32::from(self.bc) << 9
+            | u32::from(self.counter_size) << 8
+    }
+    /// __format_to_oactrl with OAR_OACONTROL_COUNTER_SEL_MASK (bits 3:1):
+    /// the select sits one bit lower than in the OAG OACONTROL field
+    /// (bits 4:2); BC and counter-size keep their OACONTROL positions.
+    fn per_context_control(self) -> u32 {
+        ((self.select << 1) & OAR_COUNTER_SEL_MASK)
             | u32::from(self.bc) << 9
             | u32::from(self.counter_size) << 8
     }
@@ -476,6 +500,55 @@ pub(crate) fn config_jobs(regs: &[(u32, u32)]) -> Vec<Job> {
     regs.chunks(LRI_JOB).map(|regs| Job(lri(regs))).collect()
 }
 
+/// xe_oa_configure_oar_context / xe_oa_configure_oac_context: the three
+/// MI_LRI pairs, in source order, as one privileged kernel ring job, or
+/// None when the stream names no exec queue or its engine class programs
+/// nothing (Linux: video engines return 0). Dispatched by engine class,
+/// not format kind, as in Linux: Render writes OAR_OACONTROL, Compute
+/// writes OAC_OACONTROL with CTX_CTRL_RUN_ALONE.
+///
+/// NOTE: the job retires through the same kernel-ring path as
+/// configuration jobs, on a fresh kernel context (Linux submits its LRI on
+/// `stream->exec_q`; NARF has no submit-trusted-words-on-user-context
+/// entry point yet). The OAR/OAC_OACONTROL writes name fixed unit
+/// addresses and land regardless of context. The RING_CONTEXT_CONTROL
+/// write does NOT reach the bound queue: that register is per-context
+/// saved state (`xe_lrc.c::reg_offsets`, `intel_gpu_engine::xcs_image`),
+/// and the kernel-ring job runs on the kernel context, not the bound
+/// queue. Whether OACTXCONTROL is context-saved is UNVERIFIED in-tree
+/// (it is absent from `reg_offsets`), so its effect through this path is
+/// unknown. Closing the gap needs a trusted-submit-on-user-context entry
+/// point; until then the job is built, validated and sequenced, but its
+/// per-context effect on silicon is UNVERIFIED.
+fn per_context_job(session: &Session, enable: bool) -> Option<Job> {
+    if session.exec_queue.is_none() {
+        return None;
+    }
+    let base = session.hwe.base();
+    let control = session.format.per_context_control() | u32::from(enable);
+    let (oacontrol, ctx_bits) = match session.hwe {
+        Engine::Rcs0 => (OAR_OACONTROL, CTX_CTRL_OAC_CONTEXT_ENABLE),
+        engine if engine.is_compute() => (
+            OAC_OACONTROL,
+            CTX_CTRL_OAC_CONTEXT_ENABLE | CTX_CTRL_RUN_ALONE,
+        ),
+        _ => return None,
+    };
+    let regs = [
+        (
+            base + OACTXCONTROL_OFF,
+            if enable { OA_COUNTER_RESUME } else { 0 },
+        ),
+        (oacontrol, control),
+        (
+            base + RING_CONTEXT_CONTROL_OFF,
+            masked(ctx_bits, if enable { ctx_bits } else { 0 }),
+        ),
+    ];
+    let mut jobs = config_jobs(&regs);
+    jobs.pop()
+}
+
 /// struct xe_oa_config: immutable uuid and validated register list.
 #[derive(Debug)]
 pub struct Config {
@@ -713,8 +786,32 @@ fn extensions(
     }
 }
 
-/// Facts of a native Xe exec queue: user engine class and parallel width.
-pub(crate) type QueueLookup<'a> = &'a (dyn Fn(u32) -> Option<(u16, usize)> + Sync);
+/// Retained exec-queue binding (Linux `stream->exec_q`): the queue id, the
+/// GuC-schedulable context the per-context LRI job targets, and a liveness
+/// probe owned by the queue. Held by the session from open until close so
+/// enable time can fail cleanly when the queue is gone instead of
+/// programming a dead context.
+pub(crate) struct QueueBinding {
+    pub(crate) id: u32,
+    pub(crate) context: Arc<UserContext>,
+    alive: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+impl QueueBinding {
+    pub(crate) fn new(
+        id: u32,
+        context: Arc<UserContext>,
+        alive: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        Self { id, context, alive }
+    }
+    pub(crate) fn alive(&self) -> bool {
+        (self.alive)()
+    }
+}
+
+/// Facts of a native Xe exec queue: user engine class, parallel width and
+/// the retained binding for per-context programming.
+pub(crate) type QueueLookup<'a> = &'a (dyn Fn(u32) -> Option<(u16, usize, QueueBinding)> + Sync);
 
 /// DRM_XE_OBSERVATION with observation_type OA.
 pub(crate) async fn observation(
@@ -759,12 +856,14 @@ pub(crate) async fn open(
         return Err(FsError::InvalidData.into());
     }
     let mut exec = None;
+    let mut binding = None;
     if p.exec_queue > 0 {
-        let (class, width) = queues(p.exec_queue as u32).ok_or(FsError::NotFound)?;
+        let (class, width, queue_binding) = queues(p.exec_queue as u32).ok_or(FsError::NotFound)?;
         if width > 1 {
             return Err(Error::Errno(EOPNOTSUPP));
         }
         exec = Some(class);
+        binding = Some(queue_binding);
     }
     let mut privileged = exec.is_none() || p.sample;
     if p.no_preempt {
@@ -859,6 +958,7 @@ pub(crate) async fn open(
         config,
         false,
         (p.exec_queue > 0).then_some(p.exec_queue as u32),
+        binding,
         p.no_preempt,
         privileged,
     );
@@ -1062,6 +1162,7 @@ pub(crate) async fn i915_open(
         permit,
         config,
         true,
+        None,
         None,
         false,
         true,
@@ -1453,6 +1554,9 @@ pub struct Session {
     pages: IrqSafeSpinLock<Option<Arc<Pages>>>,
     pub(crate) is_i915: bool,
     exec_queue: Option<u32>,
+    /// The retained exec-queue binding (Linux `stream->exec_q`), validated
+    /// at enable time; None for queue-less and i915 streams.
+    binding: Option<QueueBinding>,
     no_preempt: bool,
     privileged: bool,
 }
@@ -1475,6 +1579,7 @@ impl Session {
         config: Arc<Config>,
         is_i915: bool,
         exec_queue: Option<u32>,
+        binding: Option<QueueBinding>,
         no_preempt: bool,
         privileged: bool,
     ) -> Arc<Self> {
@@ -1502,6 +1607,7 @@ impl Session {
             pages: IrqSafeSpinLock::new(None),
             is_i915,
             exec_queue,
+            binding,
             no_preempt,
             privileged,
         })
@@ -1509,6 +1615,31 @@ impl Session {
     #[allow(dead_code)]
     pub(crate) fn exec_queue(&self) -> Option<u32> {
         self.exec_queue
+    }
+    /// The retained exec-queue binding, if this stream names one.
+    #[allow(dead_code)]
+    pub(crate) fn queue_binding(&self) -> Option<&QueueBinding> {
+        self.binding.as_ref()
+    }
+    /// Whether this stream programs per-context OA: an exec queue on a
+    /// render or compute engine (Linux xe_oa_configure_oa_context).
+    fn programs_per_context(&self) -> bool {
+        self.exec_queue.is_some() && (self.hwe == Engine::Rcs0 || self.hwe.is_compute())
+    }
+    /// Retain-and-validate the exec queue at enable time (Linux keeps
+    /// `stream->exec_q` for the config batches): the binding must still be
+    /// alive and bound to this session's engine, else the queue is gone.
+    fn validate_binding(&self) -> Result<(), FsError> {
+        let Some(id) = self.exec_queue else {
+            return Ok(());
+        };
+        let Some(binding) = &self.binding else {
+            return Err(FsError::NotFound);
+        };
+        if binding.id != id || !binding.alive() || binding.context.engine() != self.hwe {
+            return Err(FsError::NotFound);
+        }
+        Ok(())
     }
     #[allow(dead_code)]
     pub(crate) fn no_preempt(&self) -> bool {
@@ -2090,6 +2221,8 @@ pub(crate) struct Unit<A: BootAllocator> {
     tail: u32,
     configured: bool,
     active: bool,
+    /// Per-context OAR/OAC programming is live on the bound exec queue.
+    per_context: bool,
     exposed: bool,
     poisoned: bool,
     retired: bool,
@@ -2141,6 +2274,7 @@ impl<A: BootAllocator> Unit<A> {
             tail: 0,
             configured: false,
             active: false,
+            per_context: false,
             exposed: false,
             poisoned: false,
             retired: false,
@@ -2241,21 +2375,82 @@ impl<A: BootAllocator> Unit<A> {
             lost: false,
         };
         match request {
-            Request::Open { .. } => {
+            Request::Open { enable } => {
+                if *enable {
+                    // A gone queue fails before attach programs
+                    // metric-set state for a stream that never runs.
+                    session.validate_binding()?;
+                }
                 self.attach(&mut io, session, now)?;
                 let result = self.metric_set(&mut io, session);
                 self.wrap(result)?;
-                Ok(config_jobs(session.config().regs()))
+                let mut jobs = config_jobs(session.config().regs());
+                if *enable {
+                    // xe_oa_enable_metric_set configures OAR/OAC before
+                    // emitting the metric-set configuration.
+                    if let Some(job) = self.per_context_enable(&mut io, session)? {
+                        jobs.insert(0, job);
+                    }
+                }
+                Ok(jobs)
             }
             Request::Config(config) => {
                 self.admit(session)?;
                 Ok(config_jobs(config.regs()))
             }
-            Request::Enable | Request::Disable => {
+            Request::Enable => {
                 self.admit(session)?;
-                Ok(Vec::new())
+                Ok(self
+                    .per_context_enable(&mut io, session)?
+                    .into_iter()
+                    .collect())
+            }
+            Request::Disable => {
+                self.admit(session)?;
+                Ok(self.per_context_disable(session)?.into_iter().collect())
             }
         }
+    }
+    /// Validate the retained exec-queue binding and build the per-context
+    /// enable job (Linux xe_oa_enable_metric_set's "Configure OAR/OAC").
+    /// Compute additionally selects its CCS in OAG OACONTROL first, so the
+    /// OAC_OACONTROL LRI below is accepted (Linux
+    /// xe_oa_configure_oac_context).
+    fn per_context_enable<M: MmioWindow, F: FnMut() -> bool>(
+        &mut self,
+        io: &mut Io<'_, M, F>,
+        session: &Session,
+    ) -> Result<Option<Job>, FsError> {
+        session.validate_binding()?;
+        let Some(job) = per_context_job(session, true) else {
+            return Ok(None);
+        };
+        if session.hwe.is_compute() {
+            io.rmw(
+                OACONTROL,
+                CCS_SELECT,
+                (session.hwe.physical_instance() << 16) & CCS_SELECT,
+            )?;
+        }
+        Ok(Some(job))
+    }
+    /// Build the per-context disable job (Linux xe_oa_disable_metric_set's
+    /// configure_oa_context(false)). A queue that is already gone takes
+    /// its context with it, so the disable job is skipped and the global
+    /// disable below still runs; the enable path, unlike disable, must
+    /// fail cleanly instead.
+    fn per_context_disable(&mut self, session: &Session) -> Result<Option<Job>, FsError> {
+        if !self.per_context {
+            return Ok(None);
+        }
+        let Some(job) = per_context_job(session, false) else {
+            return Ok(None);
+        };
+        if session.validate_binding().is_err() {
+            self.per_context = false;
+            return Ok(None);
+        }
+        Ok(Some(job))
     }
     /// The register phase after configuration retirement.
     pub(crate) fn finish(
@@ -2481,6 +2676,7 @@ impl<A: BootAllocator> Unit<A> {
         self.active = true;
         self.next_poll = now.saturating_add(POLL_NS);
         session.set_enabled(true);
+        self.per_context = session.programs_per_context();
         Ok(())
     }
     /// xe_oa_disable: clear OACONTROL, wait for the counter, then the
@@ -2497,6 +2693,7 @@ impl<A: BootAllocator> Unit<A> {
         }
         io.rmw(OACONTROL, OACONTROL_USED, 0)?;
         self.active = false;
+        self.per_context = false;
         self.quiesce = Some((Quiesce::Counter, now.saturating_add(QUIESCE_NS)));
         self.advance(io, now)
     }
@@ -2537,6 +2734,9 @@ impl<A: BootAllocator> Unit<A> {
         let Some(session) = self.session.clone() else {
             return Ok(true);
         };
+        // Teardown retires no LRI disable: it has no job channel, and the
+        // bits are context state (Linux clears them only at stream destroy,
+        // not on plain disable).
         if self.active {
             self.disable(io, &session, now)?;
         }
@@ -2561,6 +2761,7 @@ impl<A: BootAllocator> Unit<A> {
                 io.rmw(OACONTROL, OACONTROL_USED, 0)?;
                 self.active = false;
             }
+            self.per_context = false;
             self.stop_metric_set(&mut io)
         })();
         self.invalidate();
@@ -2843,6 +3044,40 @@ pub(crate) fn test_session(
         )),
         false,
         None,
+        None,
+        false,
+        true,
+    )
+}
+
+/// A sampling stream on `device` bound to an exec queue, for GT-model
+/// fixtures outside this module. The binding's liveness probe is `alive`.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn test_session_exec(
+    device: Device,
+    format: usize,
+    buffer: u32,
+    engine: Engine,
+    queue: u32,
+    alive: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Arc<Session> {
+    Session::new(
+        device,
+        FORMATS[format],
+        true,
+        None,
+        1,
+        buffer,
+        engine,
+        Permit::take(device.card, 0).expect("free OA unit"),
+        Arc::new(Config::new(1, [b'0'; 36], Vec::new(), 0, 0, 0)),
+        false,
+        Some(queue),
+        Some(QueueBinding::new(
+            queue,
+            UserContext::for_engine(engine),
+            alive,
+        )),
         false,
         true,
     )
@@ -2874,6 +3109,7 @@ pub(crate) fn test_session_i915(
             0,
         )),
         true,
+        None,
         None,
         false,
         true,

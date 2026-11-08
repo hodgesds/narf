@@ -1101,7 +1101,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
     /// # Safety
     /// `words` must be trusted source MI_LOAD_REGISTER_IMM groups whose
     /// registers cannot alter GGTT, page tables, rings, register access
-    /// policy, context/transport state or completion evidence.
+    /// policy, another context's saved state, or completion evidence.
+    /// Writes to the executing context's own live registers are permitted
+    /// (OA per-context programming relies on this), but they program the
+    /// kernel context that retires the job, not any bound user queue.
     pub(crate) unsafe fn submit_commands(
         &mut self,
         now: u64,

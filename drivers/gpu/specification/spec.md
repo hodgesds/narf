@@ -1055,6 +1055,32 @@ and mux tables. They are emitted as MI_LOAD_REGISTER_IMM groups of at most
 registers, on the stream's first OAG engine, and retires before the next
 job; the 500 us NOA delay follows.
 
+Per-context OAR/OAC programming (`xe_oa_configure_oar_context` /
+`xe_oa_configure_oac_context`) rides the same job path. The session
+retains the exec queue's `QueueBinding` from open — the queue id, its GuC
+`UserContext`, and a liveness probe — and `Unit::begin` validates the
+binding before attach on Open-with-enable and at enable time (a gone
+queue fails with ENOENT) and returns the
+three-pair MI_LOAD_REGISTER_IMM job: `OACTXCONTROL` (engine base + 0x360)
+with `OA_COUNTER_RESUME`, `OAR_OACONTROL` (0x2960, Render) or
+`OAC_OACONTROL` (0x15114, Compute) with the format's counter select in
+bits 3:1 plus enable, and `RING_CONTEXT_CONTROL` (engine base + 0x244)
+with the masked `CTX_CTRL_OAC_CONTEXT_ENABLE` bit (plus
+`CTX_CTRL_RUN_ALONE` for Compute). On Open with enable, the per-context
+job retires before the configuration jobs, matching Linux's
+configure-before-emit order; on ENABLE it retires before the global
+OACONTROL programming in `finish`, and on DISABLE it retires before the
+global disable. Compute additionally selects its CCS in OAG OACONTROL
+before the job retires. A DISABLE with a gone queue skips the job and
+still runs the global disable; teardown retires no LRI disable. The job
+retires on the kernel ring, on a fresh kernel context, not on the bound
+exec queue itself: the fixed-address OAR/OAC_OACONTROL writes land, but
+the RING_CONTEXT_CONTROL write programs the kernel context, not the
+bound queue's saved state (that register is per-context saved state),
+and OACTXCONTROL's effect through this path is unverified. A
+trusted-submit-on-user-context entry point is the follow-up that closes
+the gap.
+
 Stream descriptors are read-only and take ioctls 0x6900..0x6904
 (ENABLE/DISABLE/CONFIG/STATUS/INFO); anything else is EINVAL. Reads copy
 whole reports and clear headers, or whole straddling reports. They then
@@ -1071,7 +1097,7 @@ full-reset proofs. NARF limits:
 - A configuration holds at most 4096 registers, 131072 per card, and a
   card holds at most 1024 ids.
 - Current authority is rechecked on every read and control for privileged streams.
-- OA syncs remain EOPNOTSUPP. OAR and OAC exec-queue streams (`DRM_XE_OA_PROPERTY_EXEC_QUEUE_ID`) are supported on single-width Render (OAR) and Compute (OAC) queues. Engine-format mismatches (OAC on Render, OAR on Compute) or queue-less OAR/OAC streams are EINVAL.
+- OA syncs are supported (in-fences awaited, out-fences and user-fences signaled). OAR and OAC exec-queue streams (`DRM_XE_OA_PROPERTY_EXEC_QUEUE_ID`) are supported on single-width Render (OAR) and Compute (OAC) queues, with per-context OAR/OAC programming at enable/disable (see above). Engine-format mismatches (OAC on Render, OAR on Compute) or queue-less OAR/OAC streams are EINVAL.
 - mmap follows `xe_oa_mmap`'s checks: EACCES without privilege, EINVAL
   unless the length is the whole buffer, and EINVAL for write, exec or
   MAP_SHARED(_VALIDATE); the maximum protection is read. A mapping that
