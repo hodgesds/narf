@@ -361,14 +361,16 @@ fn smoke_intel_vrr_enable_disable_sequencing() -> TestResult {
     assert_eq!(io.written(base + TRANS_VRR_CTL_OFFSET), vec![expected_ctl]);
     assert!(is_vrr_active(&io, trans));
 
-    // Send dynamic flip push
+    // Send dynamic flip push: writes EN | SEND (V2, per Linux
+    // `intel_vrr_send_push`), so the history's second entry is EN | SEND.
     vrr_send_push(&io, trans).unwrap();
     assert_eq!(
         io.written(base + TRANS_PUSH_OFFSET),
-        vec![TRANS_PUSH_EN, TRANS_PUSH_EN]
+        vec![TRANS_PUSH_EN, TRANS_PUSH_EN | TRANS_PUSH_SEND]
     );
 
-    // Disable: clears VRR_ENABLE, keeps FLIP_LINE_EN and guardband, resets PUSH
+    // Disable: clears VRR_ENABLE, keeps FLIP_LINE_EN and guardband, resets PUSH.
+    // The history keeps the EN | SEND push from the send above.
     vrr_disable(&io, trans, DisplayVrrIp::Display14).unwrap();
     let expected_disable_ctl = VRR_CTL_FLIP_LINE_EN | 42;
     assert_eq!(
@@ -377,7 +379,7 @@ fn smoke_intel_vrr_enable_disable_sequencing() -> TestResult {
     );
     assert_eq!(
         io.written(base + TRANS_PUSH_OFFSET),
-        vec![TRANS_PUSH_EN, TRANS_PUSH_EN, 0]
+        vec![TRANS_PUSH_EN, TRANS_PUSH_EN | TRANS_PUSH_SEND, 0]
     );
     assert!(!is_vrr_active(&io, trans));
 
@@ -422,11 +424,12 @@ fn smoke_intel_vrr_state_and_plane_flip() -> TestResult {
     VRR_STATE.set_enabled(crtc_id, true);
     assert!(VRR_STATE.is_enabled(crtc_id));
 
-    // Flip triggers dynamic push
+    // Flip triggers dynamic push. The push writes EN | SEND
+    // (V2, per Linux `intel_vrr_send_push`), not EN alone.
     on_plane_flip(crtc_id, &io);
     assert_eq!(
         io.written(TRANSCODER_A_BASE + TRANS_PUSH_OFFSET),
-        vec![TRANS_PUSH_EN]
+        vec![TRANS_PUSH_EN | TRANS_PUSH_SEND]
     );
 
     // Clean up so later tests start from a known state.
