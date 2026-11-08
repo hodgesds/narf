@@ -1080,8 +1080,11 @@ full-reset proofs. NARF limits:
   the offset, write-back. `GpuBacking::host_frame` supplies the pages
   (`FrameBacking` only); a backing without host pages, or a reservation the
   unit already released, is ENODEV. Each mapping holds a lifetime token, and
-  a unit dropped or released after reset while a token lives never returns
-  the reservation to its allocator.
+  a unit dropped or released after reset while a token lives hands the
+  reservation to the last token: it is returned to its allocator when the
+  last mapping drops, never while one is live, and exactly once. An exposed
+  unit dropped without a reset proof still retains its reservation (the
+  engine may still DMA into it).
 - With the opt-in, `metrics/<uuid>/id` (the decimal id) appears under the
   card node with ADD_CONFIG and disappears with REMOVE_CONFIG.
 - `dev.xe.observation_paranoid` (0644, 0..=1, default 1) is registered with

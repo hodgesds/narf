@@ -1188,6 +1188,46 @@ fn unit_with_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<Session>) 
     (unit, session)
 }
 
+/// Like [`unit_with_stream`], but opened disabled: the stream attaches
+/// (so the session holds the unit's pages and a mapping can alias them)
+/// without enabling the unit, so it is never exposed.
+fn unit_with_unexposed_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<Session>) {
+    let mut unit = Unit::new(
+        Allocator(hw.clone()),
+        MTL,
+        1270,
+        &Window(hw.clone()),
+        || true,
+    )
+    .unwrap();
+    let config = Arc::new(Config::new(1, uuid(1), vec![(0x9888, 1)], 1, 0, 0));
+    let session = Session::new(
+        device(card, MTL, 1270),
+        FORMATS[5],
+        true,
+        Some(5),
+        1,
+        128 << 10,
+        Engine::Rcs0,
+        Permit::take(card, 0).unwrap(),
+        config,
+        false,
+        None,
+        false,
+        true,
+    );
+    let request = Request::Open { enable: false };
+    let io = Window(hw.clone());
+    assert_eq!(
+        unit.begin(&io, &session, &request, 0, || true)
+            .unwrap()
+            .len(),
+        1
+    );
+    unit.finish(&io, &session, &request, 0, || true).unwrap();
+    (unit, session)
+}
+
 fn smoke_oa_reset_suspend_loss_and_buffer_retention() -> TestResult {
     // begin_stop (reset or system suspend): terminal stream, halt, release.
     let hw = Hw::new();
@@ -1387,8 +1427,8 @@ kernel_test_in!(
 /// pages of the reservation from the VMA start whatever vm_pgoff is, mapped
 /// write-back. Each mapping holds the pages: a descriptor close while mapped
 /// keeps the stream (the VMA holds the file), the last unmap ends it and the
-/// unit admits the next stream, and a GT release while mapped never returns
-/// the reservation to its allocator.
+/// unit admits the next stream, and a GT release while mapped defers the
+/// reservation to the last munmap instead of leaking it.
 fn smoke_oa_mmap_pages_hold_stream_and_survive_unit_release() -> TestResult {
     let size = 256usize << 10;
     let pages = size / 4096;
@@ -1444,9 +1484,12 @@ fn smoke_oa_mmap_pages_hold_stream_and_survive_unit_release() -> TestResult {
     assert!(Arc::ptr_eq(&session.pages.lock().clone().unwrap(), &held));
 
     // A verified GT reset while mapped: the stream is terminal, new
-    // mappings are ENODEV, the live one keeps its pages and the reservation
-    // is never freed.
+    // mappings are ENODEV, the live ones keep their pages, and the
+    // reservation is freed at the last munmap — never while mapped, and
+    // exactly once (the fixture allocator panics on a second free).
     let mapping = file.mmap_backing(0, size).unwrap();
+    let mapping_two = file.mmap_backing(0, size).unwrap();
+    assert_eq!(held.live_maps(), 2);
     let mut unit = backend.unit.lock().take().unwrap();
     unit.invalidate();
     unit.halt(&Window(hw.clone()), || true);
@@ -1460,12 +1503,78 @@ fn smoke_oa_mmap_pages_hold_stream_and_survive_unit_release() -> TestResult {
         (1, 0)
     );
     assert!(matches!(file.mmap_backing(0, size), Err(FsError::NoDevice)));
-    assert_eq!(held.live_maps(), 1);
+    assert_eq!(held.live_maps(), 2);
     assert_eq!(mapping.frames, expected);
     drop(mapping);
+    assert_eq!(held.live_maps(), 1);
+    assert_eq!(
+        (
+            hw.live.load(Ordering::Relaxed),
+            hw.freed.load(Ordering::Relaxed)
+        ),
+        (1, 0)
+    );
+    drop(mapping_two);
     assert_eq!(held.live_maps(), 0);
-    assert_eq!(hw.freed.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        (
+            hw.live.load(Ordering::Relaxed),
+            hw.freed.load(Ordering::Relaxed)
+        ),
+        (0, 1)
+    );
     drop(file);
+    drop(session);
+
+    // An exposed unit dropped without a reset proof while mapped keeps
+    // the deliberate retention: the engine may still DMA into the
+    // reservation, so even the last munmap must not free it.
+    let hw = Hw::with_host_pages();
+    let (unit, session) = unit_with_stream(40, &hw);
+    let probe = session.pages.lock().clone().unwrap();
+    let mapping = probe.map(64).unwrap();
+    drop(unit);
+    assert_eq!(
+        (
+            hw.live.load(Ordering::Relaxed),
+            hw.freed.load(Ordering::Relaxed)
+        ),
+        (1, 0)
+    );
+    drop(mapping);
+    assert_eq!(probe.live_maps(), 0);
+    assert_eq!(
+        (
+            hw.live.load(Ordering::Relaxed),
+            hw.freed.load(Ordering::Relaxed)
+        ),
+        (1, 0)
+    );
+    drop(session);
+
+    // An unexposed unit dropped while mapped defers the same way: no
+    // free while the mapping lives, free at the last munmap.
+    let hw = Hw::with_host_pages();
+    let (unit, session) = unit_with_unexposed_stream(41, &hw);
+    let probe = session.pages.lock().clone().unwrap();
+    let mapping = probe.map(64).unwrap();
+    drop(unit);
+    assert_eq!(
+        (
+            hw.live.load(Ordering::Relaxed),
+            hw.freed.load(Ordering::Relaxed)
+        ),
+        (1, 0)
+    );
+    drop(mapping);
+    assert_eq!(probe.live_maps(), 0);
+    assert_eq!(
+        (
+            hw.live.load(Ordering::Relaxed),
+            hw.freed.load(Ordering::Relaxed)
+        ),
+        (0, 1)
+    );
     drop(session);
 
     // Without a live mapping the same release frees the reservation.
