@@ -633,11 +633,12 @@ fn smoke_intel_vrr_cmrr_state_and_flip_push() -> TestResult {
     VRR_STATE.set_cmrr_enabled(crtc_id, true);
     assert!(VRR_STATE.is_cmrr_enabled(crtc_id));
 
-    // Flip push triggers under CMRR enabled state
+    // Flip push triggers under CMRR enabled state. The push writes EN | SEND
+    // (V2, per Linux `intel_vrr_send_push`), not EN alone.
     on_plane_flip(crtc_id, &io);
     assert_eq!(
         io.written(TRANSCODER_A_BASE + TRANS_PUSH_OFFSET),
-        vec![TRANS_PUSH_EN]
+        vec![TRANS_PUSH_EN | TRANS_PUSH_SEND]
     );
 
     // Clean up
