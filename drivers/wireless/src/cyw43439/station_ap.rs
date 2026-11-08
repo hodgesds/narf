@@ -27,8 +27,15 @@ impl<R: Fullmac> Station<R> {
         self.connection.map(|grant| grant.primary_channel())
     }
     pub(crate) fn ap_channel(&self, policy: &Policy, primary: u8) -> Result<Channel, Error> {
-        if !R::PRIMARY_AP
-            || self.operation
+        // No `R::PRIMARY_AP` gate here: `prepare_in` calls this on the
+        // rebound secondary station as well, whose runtime is a
+        // `vif_bsscfg::Bsscfg` (`PRIMARY_AP` stays false for a bsscfg by
+        // design — it is an interface-0 authority). The authority gates
+        // live in the callers (`Session::prepare` requires `PRIMARY_AP`;
+        // `prepare_secondary` requires a non-primary `Scope` and
+        // `Scope::admits` requires `SECONDARY_AP`); the channel itself is
+        // constrained by the policy, the domain and the channel list below.
+        if self.operation
             || self.bssid.is_some()
             || self.roam.is_some()
             || self.connection.is_some()

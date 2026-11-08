@@ -1006,7 +1006,10 @@ impl Firmware {
             while flow.read != producer {
                 let at = usize::from(flow.read) * 48;
                 let tx = &state.dma[&flow.address][at..at + 48];
-                assert_eq!(&tx[..4], &[0xf, 0, 0, 0]);
+                // The descriptor's second byte is the interface index
+                // (`msgbuf::TxPost` `CommonHdr.ifidx`): a secondary flow
+                // posts with ifidx 1, not 0.
+                assert_eq!(&tx[..4], &[0xf, flow.ifidx, 0, 0]);
                 assert_eq!(tx[23], 1);
                 let request = u32::from_le_bytes(tx[4..8].try_into().unwrap());
                 let body = u64::from_le_bytes(tx[32..40].try_into().unwrap());

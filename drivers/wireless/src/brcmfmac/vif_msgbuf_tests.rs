@@ -93,10 +93,25 @@ fn secondary_ifidx() -> Result<(), &'static str> {
         return Err("secondary event not dispatched by ifidx");
     }
     // Data on ifidx 1: its own (ifidx, tid, da) flow, sourced from VIF.
-    station
-        .runtime
-        .send_vif_data(1, &frame(), 0)
-        .map_err(|_| "secondary data admission")?;
+    // The first send on a new flow opens the ring and reports `Busy`
+    // so the caller retries; the frame is only sent on the second call,
+    // which finds the existing flow (`begin_data`).
+    let mut sent = false;
+    for _ in 0..8 {
+        match station.runtime.send_vif_data(1, &frame(), 0) {
+            Ok(()) => {
+                sent = true;
+                break;
+            }
+            Err(crate::cyw43439::runtime::Error::Busy) => {
+                station.runtime.poll().map_err(|_| "data poll")?;
+            }
+            Err(_) => return Err("secondary data admission"),
+        }
+    }
+    if !sent {
+        return Err("secondary data admission");
+    }
     for _ in 0..8 {
         station.runtime.poll().map_err(|_| "data poll")?;
     }
@@ -455,9 +470,12 @@ fn primary_station_secondary_ap_channel_refusal() -> Result<(), &'static str> {
         .map_err(|_| "AP control reservation")?;
         let (mut ap_config, settings) = config(false);
         ap_config.beacon_head[10..22].copy_from_slice(&[VIF, VIF].concat());
-        // Primary STA is on channel 6 (2437 MHz); channel 5 (2432 MHz)
-        // must be refused by the STA+AP single-channel rule.
-        ap_config.frequency_mhz = 2432;
+        // Primary STA is on channel 6 (2437 MHz); channel 1 (2412 MHz)
+        // must be refused by the STA+AP single-channel rule. Channel 1
+        // is in the fixture's channel list ([1, 6, 11]); any channel
+        // outside it would be refused earlier by the channel-support
+        // check instead of by the single-channel rule.
+        ap_config.frequency_mhz = 2412;
         let before = bus.commands().len();
         match block(vap.start_ap_with_settings_async(&authority, ap_config, settings)) {
             Err(narf_wireless::WirelessError::NotSupported) => {}
