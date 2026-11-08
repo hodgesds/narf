@@ -16662,7 +16662,11 @@ mod tests {
         // captured its features, but the mgmt IO-capability store
         // is controller-global — the Security-Request test below
         // pins the default NoInputNoOutput Pairing Request.
-        let restore_io = crate::mgmt::handle(&mgmt_frame(MGMT_OP_SET_IO_CAPABILITY, 0, &[0x00]));
+        let restore_io = crate::mgmt::handle(&mgmt_frame(
+            MGMT_OP_SET_IO_CAPABILITY,
+            0,
+            &[smp::IoCapability::NoInputNoOutput as u8],
+        ));
         if restore_io.len() != 1
             || u16::from_le_bytes([restore_io[0][0], restore_io[0][1]]) != MGMT_EV_CMD_COMPLETE
             || u16::from_le_bytes([restore_io[0][6], restore_io[0][7]]) != MGMT_OP_SET_IO_CAPABILITY
