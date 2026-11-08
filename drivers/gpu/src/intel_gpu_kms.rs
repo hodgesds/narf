@@ -962,8 +962,7 @@ pub(crate) async fn console_dpms_for_bar(
     let index = display.platform.index;
     display
         .console_dpms(on, || {
-            crate::drm_registry::mode_state(index)
-                .is_some_and(|card| card.lock().has_master())
+            crate::drm_registry::mode_state(index).is_some_and(|card| card.lock().has_master())
         })
         .await
 }

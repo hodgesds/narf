@@ -85,10 +85,8 @@ pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
 
         // Flushes posted PCIe write; check if already clear (fast path matching
         // Linux mt76_rr right after mt76_wr).
-        last = match unsafe { read_lpctl(mmio) } {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        // SAFETY: BAR0 mapped + owned.
+        last = unsafe { read_lpctl(mmio) }?;
         if last == READ_GONE_U32 {
             return Err(PowerError::DeviceGone);
         }
@@ -163,10 +161,8 @@ pub unsafe fn give_firmware_own(mmio: &MmioRegion) -> Result<(), PowerError> {
         // SAFETY: BAR0 mapped + owned.
         unsafe { write_lpctl(mmio, PCIE_LPCR_HOST_SET_OWN)? };
 
-        let mut last = match unsafe { read_lpctl(mmio) } {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        // SAFETY: BAR0 mapped + owned.
+        let mut last = unsafe { read_lpctl(mmio) }?;
         if last == READ_GONE_U32 {
             return Err(PowerError::DeviceGone);
         }

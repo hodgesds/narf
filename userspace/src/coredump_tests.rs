@@ -208,5 +208,7 @@ fn smoke_coredump_sparse_anonymous_trimmed() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace/coredump", smoke_coredump_sparse_anonymous_trimmed);
-
+kernel_test_in!(
+    "userspace/coredump",
+    smoke_coredump_sparse_anonymous_trimmed
+);

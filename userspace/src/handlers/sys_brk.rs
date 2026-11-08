@@ -329,6 +329,8 @@ mod tests {
     /// VMA in place rather than creating split disjoint VMAs.
     fn smoke_brk_single_growable_vma_after_fork() -> TestResult {
         let base = BRK_DEFAULT_BASE;
+        // SAFETY: kernel tests run with paging live and the frame allocator
+        // initialised, satisfying new_for_user's contract.
         let aspace = match unsafe { AddressSpace::new_for_user() } {
             Ok(a) => a,
             Err(_) => return TestResult::Fail("new_for_user failed"),
@@ -346,6 +348,8 @@ mod tests {
         }
 
         // Fork the address space.
+        // SAFETY: paging is live in a kernel test; `aspace` is a freshly built
+        // user AS with no concurrent writers.
         let child = match unsafe { aspace.clone_for_fork() } {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("clone_for_fork failed"),

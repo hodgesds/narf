@@ -394,13 +394,17 @@ pub(crate) fn build_note_segment_with_signal(
 fn dump_len(r: &narf_memory::address_space::Region) -> u64 {
     let device = narf_memory::memtype::region_may_request(r.perms)
         && r.perms.memory_type() != narf_memory::MemoryType::WriteBack;
-    if device {
-        0
-    } else if r.perms.contains(narf_memory::address_space::RegionPerms::FILE_DEMAND)
-        && !r.perms.contains(narf_memory::address_space::RegionPerms::WRITE)
+    // Device mappings, file-backed private read-only mappings, and
+    // unmaterialized regions all dump nothing (see the doc comment above).
+    if device
+        || (r
+            .perms
+            .contains(narf_memory::address_space::RegionPerms::FILE_DEMAND)
+            && !r
+                .perms
+                .contains(narf_memory::address_space::RegionPerms::WRITE))
+        || r.phys.is_empty()
     {
-        0
-    } else if r.phys.is_empty() {
         0
     } else {
         // Dump up to the highest backed page, bounded by r.len.
