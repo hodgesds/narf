@@ -398,6 +398,44 @@ mod tests {
         navi22_power_saving_default_boot_plans_nothing
     );
 
+    /// The default boot list (`BootOptions::power_saving`,
+    /// "cg,gfxcg,hubpg,memdpm,fclkdpm,ds,wm") plans the idle gates
+    /// admission allows and never admits GFXOFF: idle power-gating is on
+    /// by default, GFXOFF stays opt-in (runtime PM arms it separately,
+    /// through the same first application).
+    fn navi22_power_saving_default_list_gates_idle_without_gfxoff() -> TestResult {
+        let Some(list) = crate::amdgpu_rdna2::options::BootOptions::parse("").power_saving else {
+            return TestResult::Fail("default boot has no power-saving list");
+        };
+        let optin = OptIn::parse(Some(list));
+        if optin.contains(Feature::GfxOff) {
+            return TestResult::Fail("default list opts into GFXOFF");
+        }
+        let guarded = DriverReadiness {
+            gfxoff_safe_gc_access: true,
+            rlc_safe_mode: true,
+            recovery_validated: false,
+        };
+        let wm = DisplayAdmission {
+            watermarks: true,
+            ..kms_admission()
+        };
+        let p = plan(optin, Some(&wm), &guarded);
+        if p.policy.gfxoff()
+            || p.smu_enable() != 0
+            || p.blocks() != Blocks::GFX.union(Blocks::SOC)
+            || p.policy.gate(Feature::MemoryDpm) != policy::Gate::Allowed
+            || p.refusals[Feature::GfxOff as usize] != Some(Refusal::NotOptedIn(Feature::GfxOff))
+        {
+            return TestResult::Fail("default list plan");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/navi22-power",
+        navi22_power_saving_default_list_gates_idle_without_gfxoff
+    );
+
     fn navi22_power_saving_plan_enforces_admission() -> TestResult {
         let all = OptIn::parse(Some("gfxoff,cg,gfxcg,hubpg,memdpm,fclkdpm,ds,wm"));
         let unguarded = DriverReadiness {

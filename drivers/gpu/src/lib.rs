@@ -480,6 +480,12 @@ pub mod amdgpu_rdna2_recovery;
 /// Compatibility alias for the original Navi22 API.
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_recovery as amdgpu_navi22_recovery;
+#[path = "amdgpu_navi22_runtime_pm.rs"]
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_rdna2_runtime_pm;
+/// Compatibility alias for the original Navi22 API.
+#[cfg(feature = "amdgpu")]
+pub use amdgpu_rdna2_runtime_pm as amdgpu_navi22_runtime_pm;
 #[path = "amdgpu_navi22_scanout.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_scanout;
@@ -581,6 +587,11 @@ pub mod amdgpu_rdna4;
 mod amdgpu_reg_window;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_reset;
+/// Cancellation-pinned PM operations, shared by the Navi48 and Navi22
+/// suspend paths (hoisted from the Navi48 platform module).
+#[path = "amdgpu_navi48_suspend_transition.rs"]
+#[cfg(feature = "amdgpu")]
+pub(crate) mod suspend_transition;
 /// Compatibility alias for the original Navi22 API.
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_reset as amdgpu_reset_navi22;
