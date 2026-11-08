@@ -4,9 +4,10 @@
 //!
 //! Only the main-GT OAG unit of the qualified DG2 (12.55), MTL/Arrow
 //! (12.70/12.71/12.74), BMG (20.01/20.02) and LNL (20.04) profiles is
-//! published. Its one GGTT buffer is preallocated before scheduling and is
-//! retained by the GT owner; hardware head/tail and register programming run
-//! only under that owner. Metric configurations are emitted as source
+//! published. Its one GGTT buffer is preallocated (16 MiB) before
+//! scheduling and is retained by the GT owner; a stream that opens a
+//! larger buffer, up to the 128 MiB Linux maximum, grows it at attach.
+//! Hardware head/tail and register programming run only under that owner. Metric configurations are emitted as source
 //! MI_LOAD_REGISTER_IMM groups from privileged kernel ring jobs.
 use crate::{
     drm::syncobj::SyncObjTable,
@@ -20,7 +21,7 @@ use crate::{
     intel_gpu_xe_sync::Sync as XeSync,
 };
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
 use narf_filesystem::{
     FileOps, FileType, FsError, FsFuture, IoctlContext, MmapBacking, MmapLifetime, Mode,
     PrivatePfnMap, ReadOptions, Stat, POLL_ERR, POLL_HUP, POLL_IN,
@@ -30,7 +31,11 @@ use narf_lib::{mutex::Mutex, readiness::Readiness, sync::IrqSafeSpinLock};
 /// DEFAULT_POLL_FREQUENCY_HZ 200.
 pub(crate) const POLL_NS: u64 = 1_000_000_000 / 200;
 /// DEFAULT_XE_OA_BUFFER_SIZE; also the preallocated NARF reservation.
+/// A stream that opens a larger buffer, up to MAX_BUFFER, grows the
+/// reservation at attach; the reservation never shrinks.
 pub(crate) const DEFAULT_BUFFER: u32 = 16 << 20;
+/// The Linux OA buffer range (`include/uapi/drm/xe_drm.h:3853-3861`):
+/// 128 KiB..=128 MiB, power of two, enforced on property 12.
 const MIN_BUFFER: u64 = 128 << 10;
 const MAX_BUFFER: u64 = 128 << 20;
 /// NOA_PROGRAM_ADDITIONAL_DELAY_US after the configuration job retires.
@@ -516,6 +521,18 @@ static REGISTRY: [IrqSafeSpinLock<Registry>; 64] = [const {
 }; 64];
 static ACTIVE: [[AtomicBool; 2]; 64] =
     [const { [AtomicBool::new(false), AtomicBool::new(false)] }; 64];
+/// The unit's live OA reservation per card, in bytes. The boot reservation
+/// is DEFAULT_BUFFER; a stream that opens a larger buffer grows it (up to
+/// MAX_BUFFER) at attach, and the sysfs `oa_buffer_size` node publishes
+/// this value, never the stale default.
+static RESERVE: [AtomicU32; 64] = [const { AtomicU32::new(DEFAULT_BUFFER) }; 64];
+
+/// The live reservation for `card`, for the sysfs OA telemetry.
+fn reserve_of(card: u32) -> u32 {
+    RESERVE
+        .get(card as usize)
+        .map_or(DEFAULT_BUFFER, |reserve| reserve.load(Ordering::Acquire))
+}
 
 pub(crate) fn lookup(card: u32, id: u64) -> Option<Arc<Config>> {
     let id = u32::try_from(id).ok()?;
@@ -825,11 +842,11 @@ pub(crate) async fn open(
         None
     };
     // xe_oa_stream_init.
+    // No reserve check here: `buffer` is already validated to the Linux
+    // 128 KiB..=128 MiB range by property 12 (or the 16 MiB default), and
+    // the unit grows its retained reservation to the requested size at
+    // attach. A failed growth returns ENOMEM from `oa_control` below.
     let config = lookup(device.card, u64::from(p.metric_set)).ok_or(FsError::InvalidData)?;
-    if buffer > u64::from(device.reserve) {
-        // xe_oa_alloc_oa_buffer: the retained reservation is the only buffer.
-        return Err(FsError::OutOfMemory.into());
-    }
     let session = Session::new(
         device,
         format,
@@ -1172,7 +1189,7 @@ pub(crate) fn oa_status_string(card: u32) -> alloc::string::String {
         enabled_str,
         capable_str,
         active_str,
-        DEFAULT_BUFFER,
+        reserve_of(card),
         num_configs,
     )
 }
@@ -1188,7 +1205,7 @@ fn install_oa(card: u32, node: &Arc<narf_filesystem::sysfs::Kobject>) {
             oa_status_string(card)
         });
         narf_filesystem::sysfs::kobject_add_attr(&oa_kobj, "oa_buffer_size", move || {
-            alloc::format!("{DEFAULT_BUFFER}\n")
+            alloc::format!("{}\n", reserve_of(card))
         });
         narf_filesystem::sysfs::kobject_add_attr(&oa_kobj, "oa_active", move || {
             let active = ACTIVE
@@ -1728,13 +1745,6 @@ impl Pages {
         state.released = true;
         state.maps != 0
     }
-    /// Install the free deferred by the dropping unit: run when the last
-    /// live mapping drops. The caller has already closed the reservation
-    /// to new mappings via [`Pages::release`], so `maps` can only fall
-    /// from here. A unit owns one backing and drops once, so at most one
-    /// free is ever installed; a second install drops the `PendingFree`
-    /// without running it, leaking the backing rather than risking a
-    /// double free.
     fn defer_free(&self, free: PendingFree) {
         let mut state = self.state.lock();
         if state.pending_free.is_none() {
@@ -1743,7 +1753,7 @@ impl Pages {
         // Otherwise `free` drops here without running: the backing
         // leaks instead of being freed twice. Unreachable in practice.
     }
-    #[cfg(feature = "kernel-test")]
+    /// Live user mappings on this page set; growth refuses while nonzero.
     pub(crate) fn live_maps(&self) -> usize {
         self.state.lock().maps
     }
@@ -2025,6 +2035,44 @@ enum Quiesce {
     Tlb,
 }
 
+/// Allocate and validate one OA reservation of `pages` pages: coherent
+/// for the device, exactly the requested size, 64-byte aligned in the
+/// GGTT and inside the 4 GiB OA window. A failed validation frees the
+/// backing, as `Unit::new` did inline before this helper existed.
+fn alloc_reservation<A: BootAllocator>(
+    allocator: &mut A,
+    pages: u32,
+) -> Result<A::Backing, FsError> {
+    let backing = allocator.alloc(pages).map_err(|_| FsError::OutOfMemory)?;
+    if !backing.coherent_for_device()
+        || backing.size_pages() != pages
+        || backing.ggtt_offset() & 63 != 0
+        || u64::from(backing.ggtt_offset()) + u64::from(pages) * 4096 > 1 << 32
+    {
+        allocator.free(backing);
+        return Err(FsError::Unsupported);
+    }
+    Ok(backing)
+}
+
+/// The host pages a user mapping may alias; empty for device-local or
+/// model backings, whose mappings are then ENODEV. Returns `None` only
+/// when the frame list itself cannot be allocated.
+fn host_frames<B: GpuBacking>(backing: &B, pages: u32) -> Option<Vec<u64>> {
+    let mut frames = Vec::new();
+    frames.try_reserve_exact(pages as usize).ok()?;
+    for page in 0..pages {
+        match backing.host_frame(page) {
+            Some(frame) if frame != 0 => frames.push(frame),
+            _ => {
+                frames.clear();
+                break;
+            }
+        }
+    }
+    Some(frames)
+}
+
 /// The main-GT OAG unit and its retained buffer, owned by GuCGt's Parts.
 /// Closing or disabling never frees or rebinds the buffer; only verified full
 /// GT reset releases storage that the unit was ever pointed at.
@@ -2059,31 +2107,16 @@ impl<A: BootAllocator> Unit<A> {
     ) -> Result<Self, FsError> {
         Profile::of(platform, graphics).ok_or(FsError::Unsupported)?;
         let pages = DEFAULT_BUFFER / 4096;
-        let backing = allocator.alloc(pages).map_err(|_| FsError::OutOfMemory)?;
-        if !backing.coherent_for_device()
-            || backing.size_pages() != pages
-            || backing.ggtt_offset() & 63 != 0
-            || u64::from(backing.ggtt_offset()) + u64::from(DEFAULT_BUFFER) > 1 << 32
-        {
-            allocator.free(backing);
-            return Err(FsError::Unsupported);
-        }
+        let backing = alloc_reservation(&mut allocator, pages)?;
         // The host pages a user mapping may alias; none for device-local or
         // model backings, whose mappings are then ENODEV.
-        let mut frames = Vec::new();
-        if frames.try_reserve_exact(pages as usize).is_err() {
-            allocator.free(backing);
-            return Err(FsError::OutOfMemory);
-        }
-        for page in 0..pages {
-            match backing.host_frame(page) {
-                Some(frame) if frame != 0 => frames.push(frame),
-                _ => {
-                    frames.clear();
-                    break;
-                }
+        let frames = match host_frames(&backing, pages) {
+            Some(frames) => frames,
+            None => {
+                allocator.free(backing);
+                return Err(FsError::OutOfMemory);
             }
-        }
+        };
         // Counters off and the MMIO trigger disabled until there is a stream.
         let mut io = Io {
             io,
@@ -2246,6 +2279,52 @@ impl<A: BootAllocator> Unit<A> {
         };
         self.wrap(result)
     }
+    /// Grow the retained reservation to `size` bytes when a stream requests
+    /// more than the unit holds. The reservation is a high-water mark: it
+    /// never shrinks, so a later small stream reuses the larger buffer.
+    /// Growth refuses (ENOMEM) while a user mapping still aliases the old
+    /// pages — freeing them under a live VMA would hand it a recycled
+    /// range — and frees the old backing before allocating, so the unit
+    /// never holds two reservations at once. A failed allocation leaves
+    /// the unit without a backing; later opens then fail NoDevice until
+    /// the GT is re-prepared.
+    fn grow(&mut self, size: u32, card: u32) -> Result<(), FsError> {
+        let current = self
+            .backing
+            .as_ref()
+            .map_or(0, |backing| backing.size_pages() * 4096);
+        if size <= current {
+            return Ok(());
+        }
+        if self.pages.live_maps() != 0 {
+            return Err(FsError::OutOfMemory);
+        }
+        // The allocator is `Option` only so `Drop` can move it out; it
+        // is only ever taken there, so a live unit always has one. A
+        // missing one is unreachable, but fail closed (NoDevice) rather
+        // than panic, matching the unit's no-backing convention.
+        let Some(allocator) = self.allocator.as_mut() else {
+            return Err(FsError::NoDevice);
+        };
+        if let Some(old) = self.backing.take() {
+            allocator.free(old);
+        }
+        let pages = size / 4096;
+        let backing = alloc_reservation(&mut *allocator, pages)?;
+        let frames = match host_frames(&backing, pages) {
+            Some(frames) => frames,
+            None => {
+                allocator.free(backing);
+                return Err(FsError::OutOfMemory);
+            }
+        };
+        self.pages = Pages::new(frames);
+        self.backing = Some(backing);
+        if let Some(reserve) = RESERVE.get(card as usize) {
+            reserve.store(size, Ordering::Release);
+        }
+        Ok(())
+    }
     fn attach<M: MmioWindow, F: FnMut() -> bool>(
         &mut self,
         io: &mut Io<'_, M, F>,
@@ -2256,9 +2335,7 @@ impl<A: BootAllocator> Unit<A> {
             return Err(FsError::NoDevice);
         }
         let device = session.device;
-        if (device.platform, device.graphics) != (self.platform, self.graphics)
-            || device.reserve != self.backing.as_ref().map_or(0, |b| b.size_pages() * 4096)
-        {
+        if (device.platform, device.graphics) != (self.platform, self.graphics) {
             return Err(FsError::NoDevice);
         }
         if let Some(old) = &self.session {
@@ -2284,6 +2361,11 @@ impl<A: BootAllocator> Unit<A> {
         if session.stop.load(Ordering::Acquire) {
             return Err(FsError::NoDevice);
         }
+        // The reservation follows the stream: a buffer inside the Linux
+        // range grows the retained backing past the 16 MiB default
+        // (ENOMEM while a user mapping aliases the old pages, or when
+        // the allocator refuses). The session then maps the new pages.
+        self.grow(session.buffer, device.card)?;
         *session.pages.lock() = Some(self.pages.clone());
         self.session = Some(session.clone());
         Ok(())
