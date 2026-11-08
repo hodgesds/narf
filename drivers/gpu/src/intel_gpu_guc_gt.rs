@@ -1052,10 +1052,17 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         self.admit_scheduling().map_err(|_| FsError::NoDevice)?;
         let scheduler = self.parts.scheduler.as_mut().ok_or(FsError::NoDevice)?;
-        // SAFETY: Jobs are built only by intel_gpu_oa from source LRI groups
-        // whose addresses passed xe_oa_is_valid_config_reg_addr: OA/NOA
-        // flex, boolean-counter and mux registers, never GGTT, PPGTT, ring,
-        // context, access-policy or breadcrumb state.
+        // SAFETY: Jobs are built only by intel_gpu_oa from source LRI groups:
+        // configuration jobs name OA/NOA flex, boolean-counter and mux
+        // registers that passed xe_oa_is_valid_config_reg_addr, and
+        // per-context jobs name three fixed engine-relative registers
+        // (OACTXCONTROL, OAR/OAC_OACONTROL, RING_CONTEXT_CONTROL). None
+        // names GGTT, PPGTT, ring, access-policy or breadcrumb state, and
+        // the per-context writes touch only the executing context's live OA
+        // state plus the OA unit's fixed control registers — they cannot
+        // reach another context's saved image, which is why per-context
+        // delivery on the bound queue needs a trusted-submit entry point
+        // (see intel_gpu_oa::per_context_job).
         match unsafe { scheduler.submit_commands(now, session.engine(), job.words()) } {
             Ok((_, fence)) => Ok(fence),
             Err(SchedulingError::Busy | SchedulingError::Full) => Err(FsError::WouldBlock),
