@@ -46,6 +46,12 @@ pub struct ExecRequest {
     /// Legacy ring/index plus BSD selector bits. The context resolves its
     /// engine-map index before interpreting legacy-only selector flags.
     pub ring: u32,
+    /// Linux `I915_REQUEST_NOPREEMPT` for this request: set by the
+    /// execbuffer path when the submission carries the ext_perf extension
+    /// on a context pinned by a HOLD_PREEMPTION OA stream. The scheduler
+    /// honors it at submit; submission is NotImplemented today, so the
+    /// flag is recorded here as the software-complete seam.
+    pub no_preempt: bool,
     pub batch_va: u64,
     pub batch_len: u64,
     pub objects: Vec<ExecObject>,
@@ -280,6 +286,62 @@ impl ExecWire {
         u32_at(&self.request, 24) == u32::MAX
     }
 
+    pub(crate) fn flags(&self) -> u64 {
+        u64_at(&self.request, 40)
+    }
+
+    /// With I915_EXEC_USE_EXTENSIONS set, the extension chain head; with
+    /// it clear, the DRI1 cliprects pointer. Only the extension path reads
+    /// it as a chain (see `perf_extension`).
+    pub(crate) fn cliprects_ptr(&self) -> u64 {
+        u64_at(&self.request, 32)
+    }
+
+    /// Linux `parse_execbuf2_extensions`: when I915_EXEC_USE_EXTENSIONS is
+    /// set, `cliprects_ptr` heads a chain of `i915_user_extension`
+    /// structs; walk it and return the OA format selector of the
+    /// `drm_i915_gem_execbuffer_ext_perf` extension, if present. Any other
+    /// extension name is rejected (NARF defines no other execbuffer
+    /// extension), a second perf extension is rejected (Linux requires the
+    /// chain to hold each extension at most once), and a nonzero perf
+    /// `flags` word is rejected (MBZ). Without USE_EXTENSIONS the
+    /// cliprects fields are clip rects, not extensions, and no walk
+    /// happens. The caller applies the HOLD_PREEMPTION rule to the
+    /// returned selector; this function only parses and validates it.
+    pub(crate) fn perf_extension(&self, user: &dyn IoctlContext) -> Result<Option<u64>, FsError> {
+        if self.flags() & abi::EXEC_USE_EXTENSIONS == 0 {
+            return Ok(None);
+        }
+        let mut perf: Option<u64> = None;
+        abi::user_extensions(user, self.cliprects_ptr(), |address, name| {
+            if name != abi::EXECBUFFER_EXT_PERF {
+                return Err(FsError::InvalidData);
+            }
+            if perf.is_some() {
+                return Err(FsError::InvalidData);
+            }
+            let mut word = [0u8; 8];
+            user.read(
+                address
+                    .checked_add(abi::EXECBUFFER_EXT_PERF_FLAGS_OFF)
+                    .ok_or(FsError::BadAddress)?,
+                &mut word,
+            )?;
+            if u64::from_le_bytes(word) != 0 {
+                return Err(FsError::InvalidData);
+            }
+            user.read(
+                address
+                    .checked_add(abi::EXECBUFFER_EXT_PERF_OA_FORMAT_OFF)
+                    .ok_or(FsError::BadAddress)?,
+                &mut word,
+            )?;
+            perf = Some(u64::from_le_bytes(word));
+            Ok(())
+        })?;
+        Ok(perf)
+    }
+
     /// eb_lookup_vmas and the batch selection, after the fences.
     pub(crate) fn resolve(self, gem: &GemState) -> Result<ExecRequest, FsError> {
         let request = &self.request;
@@ -367,6 +429,9 @@ impl ExecWire {
         Ok(ExecRequest {
             context_id: u64_at(request, 48) as u32,
             ring: (flags & (0x3f | abi::EXEC_BSD_MASK)) as u32,
+            // Set by the execbuffer path after the HOLD_PREEMPTION check;
+            // resolution alone cannot see the extension or the namespace.
+            no_preempt: false,
             batch_va: batch.va + start,
             batch_len,
             objects,
@@ -899,6 +964,7 @@ impl PpgttProbeResult {
         let batch = ExecRequest {
             ring: 0,
             context_id: 0,
+            no_preempt: false,
             batch_va: PROBE_CODE,
             batch_len: PROBE_WORDS.len() as u64 * 4,
             objects: alloc::vec![

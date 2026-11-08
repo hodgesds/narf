@@ -3231,6 +3231,7 @@ pub mod tests {
         let request = ExecRequest {
             ring: 0,
             context_id: 0,
+            no_preempt: false,
             batch_va: va,
             batch_len: 8,
             objects: alloc::vec![ExecObject {

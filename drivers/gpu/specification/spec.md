@@ -1081,6 +1081,38 @@ and OACTXCONTROL's effect through this path is unverified. A
 trusted-submit-on-user-context entry point is the follow-up that closes
 the gap.
 
+i915 per-context open (`PERF_PROP_CTX_HANDLE`, 1) looks the handle up
+in the opening file's render namespace and pins it: the session
+records `specific_ctx_id` (the context's hardware id — today the gem
+handle, until the engine layer carries a distinct LRC tag) and
+`specific_ctx_id_mask` = 0x1fffff (21 bits, from the Gen8+ OA patch
+series). An unknown handle is ENOENT; a handle that does not fit in a
+u32 is EINVAL. The pin is released when the stream file closes, or
+when a failed open rolls back (`PendingOpen::drop`). At read time,
+each copied report's CTX_ID dword — report[2] for 32-bit headers,
+report[4] for 64-bit headers (`Format.header64`) — is overwritten
+with `INVALID_CTX_ID` (0xffffffff) when the report's valid bit is
+clear (Gen12: BIT(16) of the RPT_ID/reason word), unconditionally for
+every i915 stream, or when the stream is pinned and the stamped id
+differs from `specific_ctx_id`. The valid bit itself is left alone so
+userspace can tell the kernel squashed the id. `PERF_PROP_HOLD_PREEMPTION`
+(6) is only valid with `CTX_HANDLE` (otherwise EINVAL) and is
+privileged (the open takes the capability gate). The execbuffer2 path
+parses `drm_i915_gem_execbuffer_ext_perf` when `USE_EXTENSIONS` is set
+— extension id 1 and the field layout after the 32-byte
+`i915_user_extension` base are UNVERIFIED against the uAPI header and
+must be confirmed there — and a request runs no-preempt only when the
+extension is present AND the submitted context holds a
+HOLD_PREEMPTION pin. The no-preempt flag is a scheduler seam today:
+submission itself is NotImplemented. OACTXCONTROL (engine base +
+0x360) is NOT written into the pinned context's saved LRC image by
+this change: the template lists do not carry it, and adding it with a
+zero default would clobber the live programming on the next context
+switch (registers absent from the image keep their live value;
+registers in the image are restored from it). A pin-time/attach-time
+image-value hook, modelled on the RCS `patch_pdp_values` pattern, is
+the tracked remainder.
+
 Stream descriptors are read-only and take ioctls 0x6900..0x6904
 (ENABLE/DISABLE/CONFIG/STATUS/INFO); anything else is EINVAL. Reads copy
 whole reports and clear headers, or whole straddling reports. They then
@@ -1098,6 +1130,7 @@ full-reset proofs. NARF limits:
   card holds at most 1024 ids.
 - Current authority is rechecked on every read and control for privileged streams.
 - OA syncs are supported (in-fences awaited, out-fences and user-fences signaled). OAR and OAC exec-queue streams (`DRM_XE_OA_PROPERTY_EXEC_QUEUE_ID`) are supported on single-width Render (OAR) and Compute (OAC) queues, with per-context OAR/OAC programming at enable/disable (see above). Engine-format mismatches (OAC on Render, OAR on Compute) or queue-less OAR/OAC streams are EINVAL.
+- i915 per-context streams (`PERF_PROP_CTX_HANDLE`) are supported with context lookup, pinning and read-time report filtering (see above). `HOLD_PREEMPTION` requires `CTX_HANDLE` and the capability gate; the execbuffer `ext_perf` extension gates the no-preempt request flag. The OACTXCONTROL value in the pinned context's saved LRC image is NOT written by this change (tracked remainder).
 - mmap follows `xe_oa_mmap`'s checks: EACCES without privilege, EINVAL
   unless the length is the whole buffer, and EINVAL for write, exec or
   MAP_SHARED(_VALIDATE); the maximum protection is read. A mapping that

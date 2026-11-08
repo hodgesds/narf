@@ -3071,6 +3071,7 @@ fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
             let batch = ExecRequest {
                 ring: 0,
                 context_id: 0,
+                no_preempt: false,
                 batch_va: 0x1234_0000_0000,
                 batch_len: 24,
                 objects: alloc::vec![
@@ -3160,6 +3161,7 @@ fn smoke_hardware_reservation_cache_failure_releases_before_retry() -> TestResul
     let batch = ExecRequest {
         ring: 0,
         context_id: 0,
+        no_preempt: false,
         batch_va: 0x1234_0000_0000,
         batch_len: 24,
         objects: alloc::vec![

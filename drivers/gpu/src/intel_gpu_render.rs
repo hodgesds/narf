@@ -432,6 +432,15 @@ struct Namespaces {
     contexts: BTreeMap<u32, Context>,
     vms: BTreeMap<u32, Arc<Vm>>,
     bsd_default: Option<crate::intel_gpu_engine::Engine>,
+    /// HOLD_PREEMPTION references per gem context: how many open i915 OA
+    /// streams pinned this context with HOLD_PREEMPTION set. The
+    /// execbuffer path consults this set (see `oa_holds_preemption`); the
+    /// count matters because two hold streams may pin one context, and
+    /// one stream's close must not drop the other's hold. This is the
+    /// NARF analogue of Linux storing the preemption setting in
+    /// intel_context: NARF has no per-context OA slot, so the namespace
+    /// carries the reference count instead.
+    oa_hold_preempt: BTreeMap<u32, u32>,
 }
 
 impl Namespaces {
@@ -444,7 +453,51 @@ impl Namespaces {
             contexts: BTreeMap::new(),
             vms: BTreeMap::new(),
             bsd_default: None,
+            oa_hold_preempt: BTreeMap::new(),
         }
+    }
+
+    /// Pin a context for a single-context i915 OA stream: the handle must
+    /// name a context in this namespace (handle 0 never does — it is not
+    /// a userspace-allocated context). When `hold` is set, also record
+    /// one HOLD_PREEMPTION reference for the execbuffer path. Returns
+    /// false (and records nothing) when the handle is unknown.
+    ///
+    /// NOTE: the pin does not keep the context alive. Linux refcounts the
+    /// context so a destroy only drops the caller's reference; NARF has
+    /// no context refcount, so a destroy of a pinned context still
+    /// succeeds (the Linux-observable result) and the pin's record simply
+    /// stops matching new reports. Context ids are never reused
+    /// (`next_context` only increments), so a stale pin cannot alias a
+    /// new context. A refcount belongs with the LRC-image hook (see
+    /// `intel_gpu_oa::per_context_job`); revisit this when it lands.
+    fn oa_pin(&mut self, id: u32, hold: bool) -> bool {
+        if id == 0 || !self.contexts.contains_key(&id) {
+            return false;
+        }
+        if hold {
+            *self.oa_hold_preempt.entry(id).or_insert(0) += 1;
+        }
+        true
+    }
+
+    /// Drop one HOLD_PREEMPTION pin reference; the id leaves the set when
+    /// the last referencing stream closes. No-op when the id holds no
+    /// reference (a non-hold pin, or an already-released one).
+    fn oa_unpin_hold(&mut self, id: u32) {
+        if let Some(count) = self.oa_hold_preempt.get_mut(&id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.oa_hold_preempt.remove(&id);
+            }
+        }
+    }
+
+    /// Whether any open HOLD_PREEMPTION OA stream pins this context: the
+    /// execbuffer path's half of the `eb_oa_config` rule (the other half
+    /// is the ext_perf extension on the request itself).
+    fn oa_holds_preemption(&self, id: u32) -> bool {
+        self.oa_hold_preempt.contains_key(&id)
     }
 
     fn reserve_context(&mut self) -> Result<(u32, u64), FsError> {
@@ -846,7 +899,11 @@ impl Drop for PendingContext<'_> {
 pub struct RenderFile {
     pub gem: GemState,
     pub(crate) syncobjs: Arc<IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>>,
-    namespaces: IrqSafeSpinLock<Namespaces>,
+    /// Shared (not merely borrowed) so the i915 OA pin's release callback
+    /// — built during PERF_OPEN dispatch — can outlive the dispatch and
+    /// unpin the context when the stream closes. Every other use goes
+    /// through `Arc`'s deref to the lock and is unchanged.
+    namespaces: Arc<IrqSafeSpinLock<Namespaces>>,
     xe: crate::intel_gpu_xe::XeFile,
 }
 
@@ -864,7 +921,7 @@ impl RenderFile {
             syncobjs: Arc::new(IrqSafeSpinLock::new(
                 crate::drm::syncobj::SyncObjTable::new(),
             )),
-            namespaces: IrqSafeSpinLock::new(Namespaces::new()),
+            namespaces: Arc::new(IrqSafeSpinLock::new(Namespaces::new())),
         }
     }
 
@@ -980,11 +1037,33 @@ impl RenderFile {
         }
         if cmd == abi::PERF_OPEN {
             let backend = info.backend.clone();
+            // The pin lookup closes over this file's namespace: the
+            // context must exist here (contexts are per file in Linux,
+            // and so is the pin), and the release callback must outlive
+            // this dispatch, hence the shared namespaces handle.
+            let namespaces = self.namespaces.clone();
+            let pin = |id: u32, hold: bool| -> Option<crate::intel_gpu_oa::PinToken> {
+                let unpin_ns = namespaces.clone();
+                if !namespaces.lock().oa_pin(id, hold) {
+                    return None;
+                }
+                // The hardware context id is the gem handle: NARF
+                // programs no distinct LRC tag per context yet (see
+                // intel_gpu_oa::PinToken).
+                Some(crate::intel_gpu_oa::PinToken::new(
+                    id,
+                    id,
+                    Arc::new(move |id| {
+                        unpin_ns.lock().oa_unpin_hold(id);
+                    }),
+                ))
+            };
             return Some(crate::intel_gpu_oa::errno(
                 crate::intel_gpu_oa::i915_open(
                     backend,
                     arg,
                     user,
+                    &pin,
                     crate::intel_gpu_oa::Gate::PHYSICAL,
                 )
                 .await,
@@ -1024,6 +1103,10 @@ impl RenderFile {
     ) -> Result<u64, FsError> {
         use crate::intel_gpu_user::{OutputError, UserOutput};
         let wire = crate::intel_gpu_exec::ExecWire::read(user, arg, true)?;
+        // Linux parses the execbuffer extensions
+        // (parse_execbuf2_extensions) before the fence array and the
+        // object lookups.
+        let perf_ext = wire.perf_extension(user)?;
         let sync = crate::intel_gpu_exec_sync::SyncRequest::read(
             user,
             wire.raw_request(),
@@ -1036,7 +1119,20 @@ impl RenderFile {
             namespaces.select(wire.context_id(), wire.ring(), info)?
         };
         let dr4_fixed_up = wire.dr4_fixed_up();
-        let request = wire.resolve(&self.gem)?;
+        let mut request = wire.resolve(&self.gem)?;
+        // Linux eb_oa_config: the request must not be preempted when the
+        // execbuffer carries the ext_perf extension on a context pinned by
+        // a HOLD_PREEMPTION OA stream. Either half alone does not hold
+        // preemption: an ext_perf on an unpinned context, or a pinned hold
+        // context submitting without the extension, both run normally.
+        if perf_ext.is_some()
+            && self
+                .namespaces
+                .lock()
+                .oa_holds_preemption(request.context_id)
+        {
+            request.no_preempt = true;
+        }
         request.validate_for_gt(info.platform)?;
         if request.has_async() && !info.object_async_ready() {
             return Err(FsError::NoDevice);
@@ -4383,6 +4479,36 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_render",
         smoke_i915_perf_getparam_and_query_config
+    );
+
+    /// HOLD_PREEMPTION refcount: two hold streams pinning one context
+    /// must not drop each other's hold when the first stream closes.
+    /// A non-hold pin records nothing for the execbuffer path, and
+    /// releasing a non-held id is a no-op, not an underflow.
+    fn smoke_oa_hold_preemption_refcount() -> TestResult {
+        let mut namespaces = Namespaces::new();
+        assert!(!namespaces.oa_pin(0, true));
+        assert!(!namespaces.oa_pin(7, true));
+        assert!(!namespaces.oa_holds_preemption(7));
+        namespaces
+            .contexts
+            .insert(7, Context::new(Arc::new(Vm { _identity: 0 }), true));
+        assert!(namespaces.oa_pin(7, false));
+        assert!(!namespaces.oa_holds_preemption(7));
+        assert!(namespaces.oa_pin(7, true));
+        assert!(namespaces.oa_pin(7, true));
+        assert!(namespaces.oa_holds_preemption(7));
+        namespaces.oa_unpin_hold(7);
+        assert!(namespaces.oa_holds_preemption(7));
+        namespaces.oa_unpin_hold(7);
+        assert!(!namespaces.oa_holds_preemption(7));
+        namespaces.oa_unpin_hold(7);
+        assert!(!namespaces.oa_holds_preemption(7));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_oa_hold_preemption_refcount
     );
 
     include!("intel_gpu_sync_tests.rs");

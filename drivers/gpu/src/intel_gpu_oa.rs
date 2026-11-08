@@ -115,6 +115,21 @@ const CTX_CTRL_RUN_ALONE: u32 = 1 << 7;
 /// OAR_OACONTROL_COUNTER_SEL_MASK: regs/xe_oa_regs.h GENMASK(3, 1).
 const OAR_COUNTER_SEL_MASK: u32 = 0xe;
 
+/// OA report CTX_ID field width: Linux `ctx_id = report32[2] & 0x1fffff`
+/// (drm/i915/perf Gen8+ OA support); the field holds a 21-bit context id.
+/// The same mask bounds `specific_ctx_id` recorded at pin time.
+const CTX_ID_MASK: u32 = 0x1f_ffff;
+/// Gen12 OA report context-valid bit in the RPT_ID/reason word (report[0]):
+/// Linux `gen8_valid_ctx_bit`, BIT(16) on Gen12. The bit differs between
+/// generations (Gen8 vs Gen9 in the original patch), so this constant is
+/// Gen12-only; do not reuse it for another generation without checking
+/// that generation's OA ops table.
+const GEN12_VALID_CTX_BIT: u32 = 1 << 16;
+/// Squashed CTX_ID: Linux INVALID_CTX_ID. All-ones can never be a real
+/// 21-bit context id, so userspace can tell the kernel squashed the field.
+/// The valid bit is left alone on a squash for the same reason.
+const INVALID_CTX_ID: u32 = u32::MAX;
+
 const fn masked(mask: u32, value: u32) -> u32 {
     (mask << 16) | value
 }
@@ -947,6 +962,57 @@ impl QueueBinding {
 /// the retained binding for per-context programming.
 pub(crate) type QueueLookup<'a> = &'a (dyn Fn(u32) -> Option<(u16, usize, QueueBinding)> + Sync);
 
+/// The pinned gem context of a single-context i915 OA stream (Linux
+/// `stream->ctx` after `oa_pin_context`): the gem handle userspace named,
+/// the hardware context id silicon stamps into OA reports, and the release
+/// callback the stream's close runs. The hardware id is the gem handle:
+/// NARF programs no distinct LRC tag per context yet (see the
+/// OACTXCONTROL note on [`per_context_job`]), so the id the filter matches
+/// is the id the execbuffer path submits under. Once the engine layer
+/// carries a distinct LRC tag, the pin lookup must return that tag here.
+/// The release half of a context pin: called with the gem handle when
+/// the stream that pinned the context closes or its open rolls back.
+/// A named alias (rather than the bare `Arc<dyn Fn ...>`) keeps the
+/// `Session.pin` field under clippy's `type_complexity` threshold.
+pub(crate) type PinRelease = Arc<dyn Fn(u32) + Send + Sync>;
+
+pub(crate) struct PinToken {
+    pub(crate) gem_handle: u32,
+    pub(crate) hw_ctx_id: u32,
+    unpin: PinRelease,
+}
+
+impl PinToken {
+    pub(crate) fn new(gem_handle: u32, hw_ctx_id: u32, unpin: PinRelease) -> Self {
+        Self {
+            gem_handle,
+            hw_ctx_id,
+            unpin,
+        }
+    }
+}
+
+/// Look up a gem context by handle for `DRM_I915_PERF_PROP_CTX_HANDLE` and
+/// pin it for the stream's lifetime: `pin(handle, hold_preemption)` returns
+/// `None` when the handle names no context in this file's namespace (the
+/// open fails with NotFound). The `hold_preemption` argument records the
+/// HOLD_PREEMPTION stream on the pinned context for the execbuffer path;
+/// it is part of the pin because the lookup owns the namespace the exec
+/// path consults. The returned token's release callback runs when the
+/// stream closes (see [`Session::release_pin`]).
+pub(crate) type ContextPin<'a> = &'a (dyn Fn(u32, bool) -> Option<PinToken> + Sync);
+
+/// The per-context identity a single-context i915 stream filters on
+/// (Linux `stream->specific_ctx_id` / `specific_ctx_id_mask`). The id is
+/// masked to the 21-bit CTX_ID field width at pin time; the mask is the
+/// field width, so the filter compares the full stamped id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PinnedContext {
+    pub(crate) gem_handle: u32,
+    pub(crate) specific_ctx_id: u32,
+    pub(crate) specific_ctx_id_mask: u32,
+}
+
 /// DRM_XE_OBSERVATION with observation_type OA.
 pub(crate) async fn observation(
     backend: Option<Arc<dyn UserBackend>>,
@@ -1163,6 +1229,9 @@ impl Drop for PendingOpen {
             self.session.fail(FsError::NoDevice);
             self.session.stop.store(true, Ordering::Release);
             self.session.permit.release();
+            // A pin taken for this open is released with it; the
+            // committed path releases from File's drop instead.
+            self.session.release_pin();
         }
     }
 }
@@ -1187,6 +1256,7 @@ pub(crate) async fn i915_open(
     backend: Option<Arc<dyn UserBackend>>,
     param: u64,
     user: &dyn IoctlContext,
+    pin: ContextPin<'_>,
     gate: Gate,
 ) -> Result<u64, Error> {
     let device = device_of(backend.as_deref())?;
@@ -1213,6 +1283,8 @@ pub(crate) async fn i915_open(
     }
 
     let mut single_context = false;
+    let mut ctx_handle = None;
+    let mut hold_preemption = false;
     let mut sample_oa = false;
     let mut metric_set = 0u64;
     let mut oa_format = 0u64;
@@ -1232,6 +1304,7 @@ pub(crate) async fn i915_open(
         match prop_id {
             crate::intel_gpu_uapi::PERF_PROP_CTX_HANDLE => {
                 single_context = true;
+                ctx_handle = Some(prop_val);
             }
             crate::intel_gpu_uapi::PERF_PROP_SAMPLE_OA => {
                 sample_oa = prop_val != 0;
@@ -1255,7 +1328,10 @@ pub(crate) async fn i915_open(
                 exponent = Some(prop_val as u8);
             }
             crate::intel_gpu_uapi::PERF_PROP_HOLD_PREEMPTION => {
-                // HOLD_PREEMPTION accepted
+                // HOLD_PREEMPTION is only valid with CTX_HANDLE (checked
+                // below) and is privileged; the stream records it on the
+                // session and on the pinned context for the execbuffer path.
+                hold_preemption = true;
             }
             crate::intel_gpu_uapi::PERF_PROP_GLOBAL_SSEU => {
                 return Err(FsError::Unsupported.into());
@@ -1275,10 +1351,16 @@ pub(crate) async fn i915_open(
         }
     }
 
+    if hold_preemption && !single_context {
+        // Linux: HOLD_PREEMPTION is only valid when a context is named
+        // with DRM_I915_PERF_PROP_CTX_HANDLE; without one there is
+        // nothing to hold preemption for.
+        return Err(FsError::InvalidData.into());
+    }
     if !sample_oa && !single_context {
         return Err(FsError::InvalidData.into());
     }
-    if sample_oa {
+    if sample_oa || hold_preemption {
         gate.check()?;
     }
 
@@ -1305,6 +1387,18 @@ pub(crate) async fn i915_open(
     let permit = Permit::take(device.card, 0)?;
     let config = lookup(device.card, metric_set).ok_or(FsError::InvalidData)?;
 
+    // Pin the named context before the session exists: a stream that
+    // cannot name its context fails here, before any unit state is taken.
+    // A handle that does not fit in a u32 names no gem context.
+    let mut pinned = None;
+    if single_context {
+        let handle = ctx_handle
+            .and_then(|handle| u32::try_from(handle).ok())
+            .ok_or(FsError::InvalidData)?;
+        let token = pin(handle, hold_preemption).ok_or(FsError::NotFound)?;
+        pinned = Some(token);
+    }
+
     let session = Session::new(
         device,
         format,
@@ -1318,11 +1412,14 @@ pub(crate) async fn i915_open(
         true,
         None,
         None,
-        false,
+        hold_preemption,
         0,
         0,
         true,
     );
+    if let Some(token) = pinned {
+        session.set_pin(token);
+    }
 
     let mut pending = PendingOpen {
         session: session.clone(),
@@ -1722,6 +1819,10 @@ pub struct Session {
     /// stream does no query sampling.
     query_size: u64,
     privileged: bool,
+    /// The pinned gem context for a single-context i915 stream, with the
+    /// release callback the stream's close runs. None for global and Xe
+    /// streams. Set once by `i915_open` after the pin lookup succeeds.
+    pin: IrqSafeSpinLock<Option<(PinnedContext, PinRelease)>>,
 }
 impl core::fmt::Debug for Session {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1777,6 +1878,7 @@ impl Session {
             query_address,
             query_size,
             privileged,
+            pin: IrqSafeSpinLock::new(None),
         })
     }
     #[allow(dead_code)]
@@ -1811,6 +1913,71 @@ impl Session {
     #[allow(dead_code)]
     pub(crate) fn no_preempt(&self) -> bool {
         self.no_preempt
+    }
+    /// Record the pinned context from a successful CTX_HANDLE lookup.
+    /// Called once by `i915_open` before the stream is attached; the
+    /// release callback runs from `release_pin` when the stream closes.
+    /// The hardware id is masked to the 21-bit CTX_ID field width here,
+    /// so the read-time filter compares the full stamped id.
+    pub(crate) fn set_pin(&self, token: PinToken) {
+        let PinToken {
+            gem_handle,
+            hw_ctx_id,
+            unpin,
+        } = token;
+        *self.pin.lock() = Some((
+            PinnedContext {
+                gem_handle,
+                specific_ctx_id: hw_ctx_id & CTX_ID_MASK,
+                specific_ctx_id_mask: CTX_ID_MASK,
+            },
+            unpin,
+        ));
+    }
+    /// The pinned context, if this is a single-context i915 stream.
+    pub(crate) fn pinned_ctx(&self) -> Option<PinnedContext> {
+        self.pin.lock().as_ref().map(|(pinned, _)| *pinned)
+    }
+    /// Release the pinned context exactly once: take the record, then run
+    /// its release callback outside the lock. No-op when nothing is
+    /// pinned. Called from `File`'s drop (stream close) and from
+    /// `PendingOpen`'s drop (open rollback).
+    pub(crate) fn release_pin(&self) {
+        let taken = self.pin.lock().take();
+        if let Some((pinned, unpin)) = taken {
+            (unpin)(pinned.gem_handle);
+        }
+    }
+    /// Linux `gen8_append_oa_reports` / `oa_context_id_squash`, applied to
+    /// one report already copied into the read buffer: when the report's
+    /// context-valid bit is clear, or when this is a single-context stream
+    /// and the stamped id is not the pinned one, overwrite the CTX_ID
+    /// field with INVALID_CTX_ID. The valid bit is left alone so userspace
+    /// can tell the kernel squashed the id. The CTX_ID dword is report[2]
+    /// for 32-bit headers and report[4] for 64-bit headers (Linux
+    /// `oa_context_id`); the reason word holding the valid bit is always
+    /// report[0]. A report too short to hold the CTX_ID dword is left
+    /// alone: no OA format is that small, and guessing would corrupt the
+    /// counters that follow. Non-i915 sessions never reach this function;
+    /// their filtering is per exec queue, not per context id.
+    pub(crate) fn filter_report(&self, report: &mut [u8]) {
+        if !self.is_i915 {
+            return;
+        }
+        let idx = if self.format.header64 { 4 } else { 2 };
+        if report.len() < (idx + 1) * 4 {
+            return;
+        }
+        let reason = u32::from_le_bytes(report[0..4].try_into().unwrap());
+        let valid = reason & GEN12_VALID_CTX_BIT != 0;
+        let at = idx * 4;
+        let ctx_id = u32::from_le_bytes(report[at..at + 4].try_into().unwrap()) & CTX_ID_MASK;
+        let mismatch = self
+            .pinned_ctx()
+            .is_some_and(|pinned| ctx_id != pinned.specific_ctx_id);
+        if !valid || mismatch {
+            report[at..at + 4].copy_from_slice(&INVALID_CTX_ID.to_le_bytes());
+        }
     }
     #[allow(dead_code)]
     pub(crate) fn privileged(&self) -> bool {
@@ -2094,6 +2261,9 @@ impl Drop for File {
         // the unit becomes available to the next exclusive open.
         self.session.stop.store(true, Ordering::Release);
         self.session.permit.release();
+        // Closing the stream releases its context pin (and with it one
+        // HOLD_PREEMPTION reference on that context, if it held one).
+        self.session.release_pin();
     }
 }
 impl File {
@@ -3142,6 +3312,11 @@ impl<A: BootAllocator> Unit<A> {
             {
                 let at = wrap(head + i as u32 * 4);
                 chunk.copy_from_slice(&backing.read32(u64::from(at)).to_le_bytes());
+            }
+            if session.is_i915 {
+                // Linux gen8_append_oa_reports: squash a foreign or
+                // invalid context id before userspace sees the report.
+                session.filter_report(&mut out[report_offset..report_offset + size as usize]);
             }
             // Clear the report id and timestamp to detect unlanded reports;
             // zero a report entirely when reports straddle the ring end.
