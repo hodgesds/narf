@@ -943,6 +943,10 @@ impl PumpCore {
     /// BR/EDR channels otherwise. Service channels (SDP/RFCOMM) are
     /// never claimable — they belong to the pump's own services.
     /// Returns (ACL handle, local CID, peer CID, peer address).
+    /// The peer address is in the socket domain: `Connection.peer_addr`
+    /// is HCI domain, so an LE peer converts here (0 public -> 1,
+    /// 1 random -> 2) exactly as the outbound `take` converts on
+    /// `Open` — the socket layer reports this peer verbatim.
     pub fn take_pending_channel(&mut self, psm: u16, le: bool) -> Option<(u16, u16, u16, [u8; 7])> {
         for conn in self.connections.iter() {
             for ch in conn.channels.iter() {
@@ -961,7 +965,12 @@ impl PumpCore {
                 };
                 if matches && !self.is_claimed(conn.handle, local_cid, 0) {
                     self.claimed.push((conn.handle, local_cid, 0));
-                    return Some((conn.handle, local_cid, peer_cid, conn.peer_addr));
+                    return Some((
+                        conn.handle,
+                        local_cid,
+                        peer_cid,
+                        hci_peer_to_socket(conn.peer_addr, le),
+                    ));
                 }
             }
         }

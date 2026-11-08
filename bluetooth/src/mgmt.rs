@@ -3172,6 +3172,11 @@ mod tests {
         let (lt, index) = setup_controller(controller::ControllerInfo::default());
         let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
         // SET_CONNECTABLE(1) → WRITE_SCAN_ENABLE [0x02] (page only).
+        // The power-on seed answers exactly the ten power-on
+        // commands, so each set-mode command below needs its own
+        // Command Complete enqueued first — otherwise `issue`
+        // waits the 5.5 s bring-up budget and fails closed.
+        lt.enqueue_event(cc(op::HCI_WRITE_SCAN_ENABLE, 0, &[]));
         let r = handle(&mgmt_cmd(OP_SET_CONNECTABLE, index, &[1]));
         let conn_ok = is_cmd_complete(&r, OP_SET_CONNECTABLE, STATUS_SUCCESS);
         let scan_conn = lt
@@ -3180,6 +3185,7 @@ mod tests {
             .map(|c| c.opcode == op::HCI_WRITE_SCAN_ENABLE && c.params == [0x02])
             .unwrap_or(false);
         // SET_SSP(1) → WRITE_SIMPLE_PAIRING_MODE [0x01].
+        lt.enqueue_event(cc(op::HCI_WRITE_SIMPLE_PAIRING_MODE, 0, &[]));
         let r = handle(&mgmt_cmd(OP_SET_SSP, index, &[1]));
         let ssp_ok = is_cmd_complete(&r, OP_SET_SSP, STATUS_SUCCESS);
         let ssp_sent = lt
@@ -3188,6 +3194,7 @@ mod tests {
             .map(|c| c.opcode == op::HCI_WRITE_SIMPLE_PAIRING_MODE && c.params == [0x01])
             .unwrap_or(false);
         // SET_DISCOVERABLE(1, timeout 0) → WRITE_SCAN_ENABLE [0x03].
+        lt.enqueue_event(cc(op::HCI_WRITE_SCAN_ENABLE, 0, &[]));
         let r = handle(&mgmt_cmd(OP_SET_DISCOVERABLE, index, &[1, 0, 0]));
         let disc_ok = is_cmd_complete(&r, OP_SET_DISCOVERABLE, STATUS_SUCCESS);
         let scan_both = lt
@@ -3197,6 +3204,7 @@ mod tests {
             .unwrap_or(false);
         // SET_CONNECTABLE(0) also switches discoverable off:
         // WRITE_SCAN_ENABLE [0x00].
+        lt.enqueue_event(cc(op::HCI_WRITE_SCAN_ENABLE, 0, &[]));
         let r = handle(&mgmt_cmd(OP_SET_CONNECTABLE, index, &[0]));
         let conn_off_ok = is_cmd_complete(&r, OP_SET_CONNECTABLE, STATUS_SUCCESS);
         let scan_none = lt
@@ -3995,7 +4003,11 @@ mod tests {
         let mut disc_params = [0u8; 7];
         disc_params[..6].copy_from_slice(&peer6);
         disc_params[6] = 0x01; // LE public
-        let echo_ok = |r: &[Vec<u8>]| r[0][9..15] == peer6[..] && r[0][15] == 0x01;
+
+        // The reply echoes the address + type as passed, so the
+        // expected type is a parameter: the bad-type case echoes
+        // 0x03, the valid cases echo 0x01.
+        let echo_ok = |r: &[Vec<u8>], t: u8| r[0][9..15] == peer6[..] && r[0][15] == t;
         let bad_idx = handle(&mgmt_cmd(OP_DISCONNECT, 0x00ff, &disc_params));
         let bad_idx_ok = is_cmd_status(&bad_idx, OP_DISCONNECT, STATUS_INVALID_INDEX);
         let short = handle(&mgmt_cmd(OP_DISCONNECT, index, &[0xA0, 0xA1, 0xA2]));
@@ -4003,12 +4015,13 @@ mod tests {
         let mut bad_type = disc_params;
         bad_type[6] = 0x03;
         let bt = handle(&mgmt_cmd(OP_DISCONNECT, index, &bad_type));
-        let bt_ok = is_cmd_complete(&bt, OP_DISCONNECT, STATUS_INVALID_PARAMS) && echo_ok(&bt);
+        let bt_ok =
+            is_cmd_complete(&bt, OP_DISCONNECT, STATUS_INVALID_PARAMS) && echo_ok(&bt, 0x03);
         let np = handle(&mgmt_cmd(OP_DISCONNECT, index, &disc_params));
-        let np_ok = is_cmd_complete(&np, OP_DISCONNECT, STATUS_NOT_POWERED) && echo_ok(&np);
+        let np_ok = is_cmd_complete(&np, OP_DISCONNECT, STATUS_NOT_POWERED) && echo_ok(&np, 0x01);
         let powered = power_on(&lt, index, &[0u8; 248], &[0u8; 3], false, false);
         let nc = handle(&mgmt_cmd(OP_DISCONNECT, index, &disc_params));
-        let nc_ok = is_cmd_complete(&nc, OP_DISCONNECT, STATUS_NOT_CONNECTED) && echo_ok(&nc);
+        let nc_ok = is_cmd_complete(&nc, OP_DISCONNECT, STATUS_NOT_CONNECTED) && echo_ok(&nc, 0x01);
         let cmds = handle(&mgmt_cmd(OP_READ_COMMANDS, MGMT_INDEX_NONE, &[]));
         let advertised = {
             let c = &cmds[0];
