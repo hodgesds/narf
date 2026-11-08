@@ -58,6 +58,17 @@ fn admit_dirty(queue: &queue::Queue, open: u64, arg: u64, cpu: &Cpu) -> Option<F
 
 fn intel_kms_dirtyfb_errnos_follow_drm_mode_dirtyfb_ioctl_order() -> TestResult {
     let mode = mode();
+    // WC GEM allocation is NotImplemented off x86_64 (kernel_root is
+    // unsupported there); assert the error and stop, like the
+    // neighbouring wc test does.
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(matches!(
+            framebuffer(&mode, 7, true),
+            Err(FsError::NotImplemented)
+        ));
+        return TestResult::Pass;
+    }
     let fb = framebuffer(&mode, 7, true).unwrap();
     let queue = queue::Queue::new(mode.clone());
     let cpu = Cpu::new();
@@ -106,6 +117,17 @@ kernel_test_in!(
 
 fn intel_kms_dirtyfb_clips_become_the_present_damage() -> TestResult {
     let mode = mode();
+    // WC GEM allocation is NotImplemented off x86_64 (kernel_root is
+    // unsupported there); assert the error and stop, like the
+    // neighbouring wc test does.
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(matches!(
+            framebuffer(&mode, 7, true),
+            Err(FsError::NotImplemented)
+        ));
+        return TestResult::Pass;
+    }
     let fb = framebuffer(&mode, 7, true).unwrap();
     let other = framebuffer(&mode, 7, true).unwrap();
     mode.lock().crtcs[0].primary_fb = Some(fb);
@@ -169,6 +191,17 @@ fn rects_blob(rects: &[[i32; 4]]) -> Vec<u8> {
 
 fn intel_kms_fb_damage_clips_validates_like_drm_atomic_set_property() -> TestResult {
     let mode = mode();
+    // WC GEM allocation is NotImplemented off x86_64 (kernel_root is
+    // unsupported there); assert the error and stop, like the
+    // neighbouring wc test does.
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(matches!(
+            framebuffer(&mode, 7, true),
+            Err(FsError::NotImplemented)
+        ));
+        return TestResult::Pass;
+    }
     let fb = framebuffer(&mode, 7, true).unwrap();
     let clips = rects_blob(&[[0, 4, 64, 6], [10, 20, 12, 21]]);
     let good = mode.lock().create_property_blob(clips.clone()).unwrap();
@@ -264,6 +297,17 @@ impl Backend for Probe {
 
 fn intel_kms_commit_damage_reaches_the_display_owner() -> TestResult {
     let mode = mode();
+    // WC GEM allocation is NotImplemented off x86_64 (kernel_root is
+    // unsupported there); assert the error and stop, like the
+    // neighbouring wc test does.
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(matches!(
+            framebuffer(&mode, 7, true),
+            Err(FsError::NotImplemented)
+        ));
+        return TestResult::Pass;
+    }
     let fb = framebuffer(&mode, 7, true).unwrap();
     let clips = rects_blob(&[[0, 8, 64, 9]]);
     let blob = mode.lock().create_property_blob(clips.clone()).unwrap();
