@@ -676,6 +676,7 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
             probe.vrr_range,
             ip,
             crate::intel_gpu_vrr::VrrComputeOpts::default(),
+            crate::intel_gpu_vrr::VrrConnectorKind::DisplayPort,
         );
         // The sink's MSA-ignore bit follows the VRR state at every
         // modeset: set when VRR runs variable-rate on this

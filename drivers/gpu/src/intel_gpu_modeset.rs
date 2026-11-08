@@ -1892,7 +1892,12 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
     mode: Option<&Mode>,
 ) -> Result<Mode, ModesetError> {
     use crate::intel_gpu::Generation;
-    match generation {
+    // This function is the built-in panel (DDI A / Port A, i.e. eDP)
+    // modeset: takeover, resume re-light, and the Xe_LPG takeover all
+    // route through it. External DP never comes here — it has its own
+    // activate path (`intel_gpu_dp`) that calls the recompute with
+    // `DisplayPort`.
+    let result = match generation {
         Generation::TigerLake | Generation::AlderLake => {
             let mut ms = Modeset::new(mmio, Ddi::A);
             if let Some(family) = family {
@@ -1914,7 +1919,26 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
             }
         }
         Generation::LunarLake | Generation::PantherLake => Err(ModesetError::UnsupportedGeneration),
+    };
+    if let Ok(committed) = &result {
+        // Per-modeset VRR/CMRR compute for the panel (#1771): a
+        // fractional-refresh eDP mode auto-enables CMRR from the
+        // committed mode. The range is whatever discovery has
+        // published for CRTC 1 (`None` until eDP discovery publishes
+        // the panel range); the CMRR auto-enable does not require a
+        // range — see `recompute_timings_for_modeset`.
+        let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_generation(generation);
+        let range = crate::intel_gpu_vrr::VRR_STATE.range(1);
+        crate::intel_gpu_vrr::recompute_timings_for_modeset(
+            1,
+            committed,
+            range,
+            ip,
+            crate::intel_gpu_vrr::VrrComputeOpts::default(),
+            crate::intel_gpu_vrr::VrrConnectorKind::EmbeddedDisplayPort,
+        );
     }
+    result
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
