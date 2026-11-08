@@ -1060,13 +1060,38 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         // names GGTT, PPGTT, ring, access-policy or breadcrumb state, and
         // the per-context writes touch only the executing context's live OA
         // state plus the OA unit's fixed control registers — they cannot
-        // reach another context's saved image, which is why per-context
-        // delivery on the bound queue needs a trusted-submit entry point
-        // (see intel_gpu_oa::per_context_job).
-        match unsafe { scheduler.submit_commands(now, session.engine(), job.words()) } {
-            Ok((_, fence)) => Ok(fence),
-            Err(SchedulingError::Busy | SchedulingError::Full) => Err(FsError::WouldBlock),
-            Err(_) => Err(FsError::NoDevice),
+        // reach another context's saved image. A per-context job retires on
+        // the bound queue through `submit_trusted_on_user_context`, never
+        // on the kernel ring: the RING_CONTEXT_CONTROL write is per-context
+        // saved state, so the kernel-ring path would program the wrong
+        // context (see intel_gpu_oa::per_context_job).
+        if job.per_context() {
+            // Re-validate at submit time: a queue that died between `begin`
+            // and this submit fails clean instead of retiring on a gone
+            // queue. Never fall back to the kernel ring for a per-context
+            // job — that fallback is the bug.
+            session.validate_binding()?;
+            let binding = session.queue_binding().ok_or(FsError::NoDevice)?;
+            if !binding.alive() {
+                return Err(FsError::NoDevice);
+            }
+            // SAFETY: per-context job words are trusted LRI groups built
+            // only by intel_gpu_oa (see the SAFETY comment above).
+            match unsafe {
+                scheduler.submit_trusted_on_user_context(now, binding.context.clone(), job.words())
+            } {
+                Ok((_, fence)) => Ok(fence),
+                Err(SchedulingError::Busy | SchedulingError::Full) => Err(FsError::WouldBlock),
+                Err(_) => Err(FsError::NoDevice),
+            }
+        } else {
+            // SAFETY: configuration job words are trusted LRI groups built
+            // only by intel_gpu_oa (see the SAFETY comment above).
+            match unsafe { scheduler.submit_commands(now, session.engine(), job.words()) } {
+                Ok((_, fence)) => Ok(fence),
+                Err(SchedulingError::Busy | SchedulingError::Full) => Err(FsError::WouldBlock),
+                Err(_) => Err(FsError::NoDevice),
+            }
         }
     }
     /// The register phase after the configuration jobs retired.

@@ -746,6 +746,16 @@ impl UserContext {
     pub(crate) fn busy(&self) -> bool {
         self.state.lock().busy
     }
+    /// One word of the context's saved register image, as `restore` copies
+    /// it into a fresh LRC image at 4096 + index * 4: index 3 is the
+    /// RING_CONTEXT_CONTROL value slot (the image's first `reg_offsets`
+    /// group names that register first). `None` only before the first claim
+    /// allocates the image; after a claim with no capture yet it reads the
+    /// allocated zero.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn saved_word(&self, index: usize) -> Option<u32> {
+        self.state.lock().image.get(index).copied()
+    }
     pub(crate) fn can_rebind(&self) -> bool {
         let state = self.state.lock();
         state.epoch == 0 && !state.busy
