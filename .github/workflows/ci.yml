@@ -875,12 +875,20 @@ jobs:
       fail-fast: false
       matrix:
         arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
-    # The GPU group is ~2300 tests; at the primary suite's per-test
-    # TCG rate that is on the order of 5-10 minutes, so 1200s of QEMU
-    # time carries real headroom while halving the worst-case cost of
-    # a #879 hang versus the primary job's 2400s cap.
+    # The GPU group is ~2300 tests; measured on main run 42434596939
+    # (2cd8320a) the x86_64 test phase ran ~159 tests/min (970 OK in
+    # ~6 min before the kill), so the suite needs ~15 min of QEMU
+    # time — 1200s per boot still carries real headroom while halving
+    # the worst-case cost of a #879 hang versus the primary job's
+    # 2400s cap.
     # timeout-minutes is the second backstop (build + boot + slack).
-    timeout-minutes: 45
+    # Measured 2026-11-08: the kernel build alone takes ~39 min
+    # (x86_64) to ~43 min (aarch64) on GHA, so 45 min killed a
+    # healthy, passing x86_64 run mid-suite (#1751). 75 min covers
+    # the ~39-43 min build + ~15 min suite + ~17 min slack. No
+    # split: the suite is a single build-bound invocation, so
+    # splitting would not remove the build cost from either shard.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
