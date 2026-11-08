@@ -230,6 +230,15 @@ pub struct RpmbFrame {
     pub bytes: [u8; RPMB_FRAME_SIZE],
 }
 
+// NOTE: manual impl, not `#[derive(Default)]`: the pinned toolchain
+// (nightly-2025-09-14) only implements `Default` for arrays up to 32
+// elements, and `bytes` is `[u8; RPMB_FRAME_SIZE]` (512).
+impl Default for RpmbFrame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RpmbFrame {
     /// An all-zero frame.
     pub fn new() -> Self {
