@@ -18,10 +18,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 use super::{
     build_link_options, build_rx_desc, build_tx_desc, decode_fw_version, decode_mac_from_shared,
     decode_rx_wb, fw_version_word, link_rate_to_mbps, link_sample, mac_filter_words,
-    mac_is_invalid, name_for, read_filter_caps, read_fw_version, read_link_status,
-    read_permanent_mac, speed_mask_for, FilterCaps, LinkStatus, RegIo, RxCsumResult, RxdWb, TxDesc,
-    AQC_DEV_113, AQC_DEV_113C, AQC_DEV_113CA, AQC_DEV_113CS, AQC_DEV_113DEV, AQC_DEV_114CS,
-    AQC_DEV_115C, AQC_DEV_116C, AQC_VENDOR, RING_LEN, RX_BUF_LEN,
+    mac_is_invalid, name_for, read_link_status, speed_mask_for, FilterCaps, LinkStatus, RegIo,
+    RxCsumResult, RxdWb, TxDesc, AQC_DEV_113, AQC_DEV_113C, AQC_DEV_113CA, AQC_DEV_113CS,
+    AQC_DEV_113DEV, AQC_DEV_114CS, AQC_DEV_115C, AQC_DEV_116C, AQC_VENDOR, RING_LEN, RX_BUF_LEN,
 };
 
 // ── Spec literals (transcribed from Linux atlantic; independent ────
@@ -609,11 +608,11 @@ fn smoke_aqc113_fake_bringup_conversation() -> TestResult {
     }
     // 3. Version + MAC.
     match super::read_fw_version(&fake) {
-        Ok(v) if v == 0x0100_1234 => {}
+        Ok(0x0100_1234) => {}
         _ => return TestResult::Fail("fw version != 0x01001234"),
     }
     match super::read_permanent_mac(&fake) {
-        Some(m) if m == [0x52, 0x54, 0x00, 0xAB, 0xCD, 0xEF] => {}
+        Some([0x52, 0x54, 0x00, 0xAB, 0xCD, 0xEF]) => {}
         _ => return TestResult::Fail("permanent MAC misread from the fake"),
     }
     // 4. TX/RX path + MAC filter + MPI_INIT + interrupts.
