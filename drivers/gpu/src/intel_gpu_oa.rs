@@ -521,9 +521,7 @@ pub(crate) fn config_jobs(regs: &[(u32, u32)]) -> Vec<Job> {
 /// point; until then the job is built, validated and sequenced, but its
 /// per-context effect on silicon is UNVERIFIED.
 fn per_context_job(session: &Session, enable: bool) -> Option<Job> {
-    if session.exec_queue.is_none() {
-        return None;
-    }
+    session.exec_queue?;
     let base = session.hwe.base();
     let control = session.format.per_context_control() | u32::from(enable);
     let (oacontrol, ctx_bits) = match session.hwe {
