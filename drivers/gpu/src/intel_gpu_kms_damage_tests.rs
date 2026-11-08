@@ -4,11 +4,14 @@
 //! `drm_property_replace_blob_from_id` on the FB_DAMAGE_CLIPS blob, and the
 //! plan's damage reaching the display owner. Linux b90c984d.
 use super::*;
+#[cfg(target_arch = "x86_64")]
 use crate::drm::fb_cmd::{Damage, Rect};
 
 /// `DRM_IOWR('d', 0xB1, struct drm_mode_fb_dirty_cmd)`.
+#[cfg(target_arch = "x86_64")]
 const DIRTYFB: u32 = 0xc018_64b1;
 
+#[cfg(target_arch = "x86_64")]
 fn put_dirty(cpu: &Cpu, at: usize, fb: u32, flags: u32, num_clips: u32, clips_ptr: u64) {
     let mut bytes = cpu.bytes.lock();
     for (i, word) in [fb, flags, 0xdead_beef, num_clips].into_iter().enumerate() {
@@ -17,6 +20,7 @@ fn put_dirty(cpu: &Cpu, at: usize, fb: u32, flags: u32, num_clips: u32, clips_pt
     bytes[at + 16..at + 24].copy_from_slice(&clips_ptr.to_le_bytes());
 }
 
+#[cfg(target_arch = "x86_64")]
 fn put_clips(cpu: &Cpu, at: usize, rects: &[[u16; 4]]) {
     let mut bytes = cpu.bytes.lock();
     for (i, rect) in rects.iter().enumerate() {
@@ -28,6 +32,7 @@ fn put_clips(cpu: &Cpu, at: usize, rects: &[[u16; 4]]) {
 }
 
 /// One DIRTYFB admission: `None` when admitted, else its error.
+#[cfg(target_arch = "x86_64")]
 fn admit_dirty(queue: &queue::Queue, open: u64, arg: u64, cpu: &Cpu) -> Option<FsError> {
     let events = Events::new(IrqSafeSpinLock::new(Default::default()));
     let geometry = Geometry {
@@ -177,6 +182,7 @@ kernel_test_in!(
     intel_kms_dirtyfb_clips_become_the_present_damage
 );
 
+#[cfg(target_arch = "x86_64")]
 fn damage_frame(fb: u32, damage: u64) -> Request {
     let Request::Atomic(mut a) = atomic_frame(fb, 0) else {
         unreachable!()
@@ -187,6 +193,7 @@ fn damage_frame(fb: u32, damage: u64) -> Request {
     Request::Atomic(a)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn rects_blob(rects: &[[i32; 4]]) -> Vec<u8> {
     rects
         .iter()
@@ -251,9 +258,11 @@ kernel_test_in!(
 );
 
 /// A display owner that records the damage each present carries.
+#[cfg(target_arch = "x86_64")]
 struct Probe {
     seen: Vec<Damage>,
 }
+#[cfg(target_arch = "x86_64")]
 impl Backend for Probe {
     fn geometry(&self) -> Geometry {
         Geometry {
