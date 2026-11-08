@@ -27,10 +27,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use narf_filesystem::{FsError, IoctlContext, dma_buf::DmaResvUsage};
+use narf_filesystem::{dma_buf::DmaResvUsage, FsError, IoctlContext};
 use narf_io::DmaBuffer;
 
-use crate::drm::ioctl::{DrmIoctlError, DrmIoctlResult, IoctlCmd, dispatch};
+use crate::drm::ioctl::{dispatch, DrmIoctlError, DrmIoctlResult, IoctlCmd};
 use crate::drm::render_node::DrmFileCtx;
 use crate::drm_uapi::{
     self, DrmModeAtomicUapi, DrmModeCardResUapi, DrmModeCreateDumbUapi, DrmModeCrtcUapi,
@@ -1967,7 +1967,7 @@ unsafe fn guarded_copy(dst: *mut u8, src: *const u8, len: usize) -> Result<(), F
 pub(crate) mod kernel_test_buffers {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    use narf_lib::percpu::{MAX_CPUS, current_cpu};
+    use narf_lib::percpu::{current_cpu, MAX_CPUS};
 
     /// Per-CPU strict window `[start, end)`: `start == 0` means no strict
     /// scope is open; otherwise only kernel ranges inside the window pass.
@@ -3432,7 +3432,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         out[24..24 + name.len()].copy_from_slice(name);
         out[56..60].copy_from_slice(&0u32.to_le_bytes()); // count_values
         out[60..64].copy_from_slice(&0u32.to_le_bytes()); // count_enum_blobs
-        // SAFETY: `arg` is the validated 64-byte out-pointer.
+                                                          // SAFETY: `arg` is the validated 64-byte out-pointer.
         unsafe { copy_out(arg, &out)? };
         return Ok(0);
     }
@@ -6734,7 +6734,7 @@ fn atomic_commit(
                     ))
                 })
                 .collect();
-            Some((presentations, native_presentations))
+            Some((presentations, native_presentations, flip_tickets))
         }
     };
     for request in vrr_requests {
@@ -6785,15 +6785,17 @@ fn atomic_commit(
             req.flags,
             presentation
                 .as_ref()
-                .is_some_and(|(p, n)| !p.is_empty() || !n.is_empty()),
+                .is_some_and(|(p, n, _)| !p.is_empty() || !n.is_empty()),
         );
     }
-    let (presentation, native_presentation) = match presentation {
-        Some((p, n)) => (Some(p), n),
-        None => (None, Vec::new()),
+    let (presentation, native_presentation, flip_tickets) = match presentation {
+        Some((p, n, t)) => (Some(p), n, t),
+        None => (None, Vec::new(), Vec::new()),
     };
+    let mut dispatched_crtcs: Vec<u32> = Vec::new();
     #[cfg(feature = "amdgpu")]
     for (crtc_id, primary, overlays, ticket) in native_presentation {
+        dispatched_crtcs.push(crtc_id);
         present_native_planes(card_index, crtc_id, primary, overlays, ticket);
     }
     #[cfg(not(feature = "amdgpu"))]
@@ -6810,6 +6812,7 @@ fn atomic_commit(
         placement,
     ) in presentation.into_iter().flatten()
     {
+        dispatched_crtcs.push(crtc_id);
         if let Some(resource) = resource {
             present_virgl_frame(&resource, width, height)?;
         } else if let Some(frame) = gem_frame {
@@ -6828,6 +6831,20 @@ fn atomic_commit(
             );
         } else {
             note_missing_backing("ATOMIC", fb_id);
+            #[cfg(feature = "amdgpu")]
+            let display = crate::amdgpu_native_kms::crtc_display(crtc_id).unwrap_or(0);
+            #[cfg(not(feature = "amdgpu"))]
+            let display = 0;
+            crate::drm::card::complete_flip_ticket(display, flip_ticket);
+        }
+    }
+    for &(crtc_id, ticket) in &flip_tickets {
+        if !dispatched_crtcs.contains(&crtc_id) {
+            #[cfg(feature = "amdgpu")]
+            let display = crate::amdgpu_native_kms::crtc_display(crtc_id).unwrap_or(0);
+            #[cfg(not(feature = "amdgpu"))]
+            let display = 0;
+            crate::drm::card::complete_flip_ticket(display, Some(ticket));
         }
     }
     Ok(0)
@@ -8475,7 +8492,7 @@ fn fb_frame(fb: &crate::drm::card::Framebuffer, phys: u64) -> crate::drm::card::
 /// together through its back buffers; when it cannot, the primary takes
 /// `present_frame`'s fallback.
 #[cfg(feature = "amdgpu")]
-fn present_native_planes(
+pub(crate) fn present_native_planes(
     card_index: u32,
     crtc_id: u32,
     primary: Option<crate::drm::card::PlaneFrame>,
@@ -8483,6 +8500,7 @@ fn present_native_planes(
     ticket: Option<u64>,
 ) {
     let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc_id) else {
+        crate::drm::card::complete_flip_ticket(0, ticket);
         return;
     };
     if primary.is_none() && overlays.iter().all(Option::is_none) {
@@ -8499,7 +8517,9 @@ fn present_native_planes(
         return;
     }
     if let Some(f) = fallback {
-        present_frame(card_index, crtc_id, f, None);
+        present_frame(card_index, crtc_id, f, ticket);
+    } else {
+        crate::drm::card::complete_flip_ticket(display, ticket);
     }
 }
 
@@ -8557,6 +8577,7 @@ fn present_frame(
             }
             // A GEM framebuffer is scanned out in place or not at all.
             if gem {
+                crate::drm::card::complete_flip_ticket(display, flip_ticket);
                 return;
             }
             // Only the console's display has a CPU front to copy onto, and
@@ -8564,6 +8585,7 @@ fn present_frame(
             if display != crate::amdgpu_native_kms::console_pipe()
                 || !matches!(src_format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888)
             {
+                crate::drm::card::complete_flip_ticket(display, flip_ticket);
                 return;
             }
         }

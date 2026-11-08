@@ -185,6 +185,7 @@ pub fn present_planes(
 ) -> bool {
     if navi22() {
         if overlays.iter().any(Option::is_some) {
+            crate::drm::card::complete_flip_ticket(display, ticket);
             return false;
         }
         crate::amdgpu_navi22_platform::present_plane(display, primary, ticket)

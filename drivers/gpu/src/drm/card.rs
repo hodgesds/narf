@@ -933,6 +933,18 @@ pub fn flips(display: u8) -> &'static narf_lib::sync::IrqSafeSpinLock<FlipLog> {
     &FLIPS[usize::from(display).min(FLIPS.len() - 1)]
 }
 
+/// Complete hardware flip tickets up to `ticket` on `display` immediately,
+/// stamping them with the current monotonic timestamp.
+pub fn complete_flip_ticket(display: u8, ticket: Option<u64>) {
+    let Some(ticket) = ticket else {
+        return;
+    };
+    let mut log = flips(display).lock();
+    let sequence = log.last().map_or(0, |s| s.sequence);
+    let ns = narf_time::wall::monotonic_ns();
+    log.complete(ticket, FlipStamp { ns, sequence });
+}
+
 /// The full timing a CRTC was committed with, and the MODE_ID blob that
 /// names it (Linux's `drm_crtc_state::mode` / `mode_blob`). `crate::Mode`
 /// keeps only size and refresh, which cannot tell two timings of one
@@ -1449,7 +1461,11 @@ impl Card {
     /// The current DRM master open ID, if any.
     pub fn current_master(&self) -> Option<u64> {
         let cur = self.current_master.load(Ordering::Acquire);
-        if cur == 0 { None } else { Some(cur) }
+        if cur == 0 {
+            None
+        } else {
+            Some(cur)
+        }
     }
 
     /// Whether `open_id` is the current DRM master. Drives `DrmFileCtx`'s
@@ -2935,7 +2951,7 @@ impl Card {
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
-    use narf_kernel_test::{TestResult, kernel_test_in};
+    use narf_kernel_test::{kernel_test_in, TestResult};
 
     /// A dumb buffer whose last GEM/fb reference is dropped (GEM_CLOSE /
     /// DESTROY_DUMB / RMFB) while a userspace mmap of it is STILL live must not
@@ -3011,7 +3027,7 @@ pub mod tests {
     /// becomes SCANOUT. An open's framebuffers leave with it.
     #[cfg(feature = "intel")]
     fn smoke_intel_framebuffers_follow_intel_framebuffer_init() -> TestResult {
-        use crate::drm::fb_cmd::{FB_MODIFIERS, FbCmd};
+        use crate::drm::fb_cmd::{FbCmd, FB_MODIFIERS};
         use crate::intel_gpu_gem::GemState;
         let gem = GemState::new();
         let create = |size| {

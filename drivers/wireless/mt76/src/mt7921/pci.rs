@@ -23,7 +23,7 @@
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use narf_bus::{BusDevice, BusDeviceCap, MmioRegion, map_bar_control};
+use narf_bus::{map_bar_control, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -444,11 +444,10 @@ fn bring_up_current(
 
     // ── Stage 1: driver-own + firmware-load stub + EFUSE ─────────
     //
-    // Linux mt7921_pci_probe calls mt792xe_mcu_fw_pmctrl (HOST_SET_OWN)
-    // before __mt792xe_mcu_drv_pmctrl (HOST_CLR_OWN) to synchronize
-    // power management controller state.
+    // Linux mt7921_pci_probe calls __mt792xe_mcu_drv_pmctrl (HOST_CLR_OWN)
+    // to take driver ownership. (mt792xe_mcu_fw_pmctrl / HOST_SET_OWN is
+    // only used during suspend/sleep, not during probe).
     // SAFETY: BAR0 mapped + owned.
-    let _ = unsafe { mac::give_firmware_own(&mmio_bar0) };
     let driver_owned = match unsafe { mac::take_driver_own(&mmio_bar0) } {
         Ok(()) => true,
         Err(mac::PowerError::Timeout) => return Err(ProbeError::DriverOwnTimeout),
@@ -567,8 +566,8 @@ pub fn with_controller<R>(f: impl FnOnce(&Mt7921Device) -> R) -> Option<R> {
     controller.as_ref().map(f)
 }
 
-pub(super) fn claim_firmware_transport()
--> Result<Option<super::firmware_transport::Transport>, super::firmware_transport::Error> {
+pub(super) fn claim_firmware_transport(
+) -> Result<Option<super::firmware_transport::Transport>, super::firmware_transport::Error> {
     use super::firmware_transport::{Error, Firmware, Transport};
     let Some((device, authority)) = *FIRMWARE_BINDING.lock() else {
         return Ok(None);
