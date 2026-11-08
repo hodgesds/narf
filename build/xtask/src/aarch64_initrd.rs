@@ -419,9 +419,9 @@ fn write_clone(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    struct Temp(PathBuf);
+    pub(crate) struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -438,6 +438,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    /// Minimal AArch64 ELF64 kernel fixture for tests that must hand
+    /// `qemu_args` a real kernel path: aarch64 reads the kernel ELF's
+    /// PT_LOAD/BSS extents to place the DTB above it, so a fake path no
+    /// longer suffices. Returns the temp dir (keep it alive until the
+    /// caller is done — dropping it deletes the file) and the kernel path.
+    pub(crate) fn write_minimal_kernel_elf(loads: &[(u64, u64)]) -> (Temp, PathBuf) {
+        let temp = Temp::new();
+        let path = temp.0.join("kernel.elf");
+        fs::write(&path, elf(loads)).unwrap();
+        (temp, path)
     }
     fn elf(loads: &[(u64, u64)]) -> Vec<u8> {
         let mut bytes = vec![0; 1024];

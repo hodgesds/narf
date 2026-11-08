@@ -12358,6 +12358,12 @@ mod kernel_test_feature_tests {
     fn audio_controllers_have_independent_qemu_backends() {
         use super::{Arch, GpuBackend, HwProfile};
         use std::collections::BTreeSet;
+        // aarch64 `qemu_args` reads the kernel ELF's PT_LOAD/BSS extents
+        // to place the DTB above it, so the fake "kernel" path no longer
+        // suffices: hand it a real minimal ELF fixture instead (the
+        // x86_64 arm never opens the file, so the same path works there).
+        let (_kernel_temp, kernel) =
+            crate::aarch64_initrd::tests::write_minimal_kernel_elf(&[(0x4008_0000, 0x1000)]);
         for arch in [Arch::X86_64, Arch::Aarch64] {
             for profile in [
                 HwProfile::Full,
@@ -12366,13 +12372,7 @@ mod kernel_test_feature_tests {
                 HwProfile::Minimal,
             ] {
                 let args = arch
-                    .qemu_args(
-                        std::path::Path::new("kernel"),
-                        "none",
-                        profile,
-                        GpuBackend::Virtio2d,
-                        "",
-                    )
+                    .qemu_args(&kernel, "none", profile, GpuBackend::Virtio2d, "")
                     .unwrap();
                 let backends: Vec<_> = args
                     .windows(2)
