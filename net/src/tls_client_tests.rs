@@ -42,29 +42,33 @@ use crate::tls_client::{
     hkdf_expand_label, traffic_keys, Cipher, ClientConfig, SliceTransport, TlsClient, TlsError,
 };
 use crate::tls_x509::{parse_certificate, sha256, RootStore, X509Error};
+use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 
 /// Hex decoder for the trace constants.
 fn hex(s: &str) -> Vec<u8> {
     let s = s.as_bytes();
     let mut out = Vec::with_capacity(s.len() / 2);
     for pair in s.chunks(2) {
-        let hi = (pair[0] as char).to_digit(16).unwrap() as u8;
-        let lo = (pair[1] as char).to_digit(16).unwrap() as u8;
+        // A malformed fixture literal must fail the test at its
+        // assertion, not panic the guest: fall back to 0 and let the
+        // vector check fail.
+        let hi = (pair[0] as char).to_digit(16).unwrap_or(0) as u8;
+        let lo = (pair[1] as char).to_digit(16).unwrap_or(0) as u8;
         out.push((hi << 4) | lo);
     }
     out
 }
 
 fn arr32(s: &str) -> [u8; 32] {
-    hex(s).try_into().unwrap()
+    hex(s).try_into().unwrap_or([0; 32])
 }
 
 fn arr16(s: &str) -> [u8; 16] {
-    hex(s).try_into().unwrap()
+    hex(s).try_into().unwrap_or([0; 16])
 }
 
 fn arr12(s: &str) -> [u8; 12] {
-    hex(s).try_into().unwrap()
+    hex(s).try_into().unwrap_or([0; 12])
 }
 
 // ─── RFC 8448 §3 inputs ────────────────────────────────────────────────────
@@ -248,9 +252,13 @@ fn seal_aes_record(key: &[u8; 16], iv: &[u8; 12], seq: u64, plaintext: &[u8]) ->
     }
     let mut buf = plaintext.to_vec();
     let cipher = Aes128Gcm::new(GcmKey::<Aes128Gcm>::from_slice(key));
-    let tag = cipher
-        .encrypt_in_place_detached(GcmNonce::from_slice(&nonce), &header, &mut buf)
-        .expect("aes-gcm seal");
+    // A seal failure is impossible for valid key/nonce/lengths; return
+    // an empty record so the caller's length/prefix checks fail the test
+    // instead of panicking the guest.
+    let Ok(tag) = cipher.encrypt_in_place_detached(GcmNonce::from_slice(&nonce), &header, &mut buf)
+    else {
+        return Vec::new();
+    };
     let mut out = Vec::with_capacity(5 + total);
     out.extend_from_slice(&header);
     out.extend_from_slice(&buf);
@@ -260,62 +268,64 @@ fn seal_aes_record(key: &[u8; 16], iv: &[u8; 12], seq: u64, plaintext: &[u8]) ->
 
 /// The server-flight record, built by encrypting the trace plaintext
 /// with the trace server handshake keys (seq 0).
-fn flight_record() -> Vec<u8> {
+// Building a flight record is itself an assertion (it anchors the
+// construction to the RFC bytes), so these helpers report failure
+// instead of panicking: the caller fails the test with the reason.
+fn flight_record() -> Result<Vec<u8>, &'static str> {
     let mut inner = flight_plaintext();
     inner.push(0x16); // inner content type: handshake
     let record = seal_aes_record(&arr16(S_HS_KEY), &arr12(S_HS_IV), 0, &inner);
-    assert_eq!(record.len(), 679, "flight record length");
-    assert_eq!(
-        &record[..21],
-        hex(FLIGHT_RECORD_PREFIX).as_slice(),
-        "flight record prefix must match the RFC ciphertext"
-    );
-    record
+    if record.len() != 679 {
+        return Err("flight record length");
+    }
+    if &record[..21] != hex(FLIGHT_RECORD_PREFIX).as_slice() {
+        return Err("flight record prefix must match the RFC ciphertext");
+    }
+    Ok(record)
 }
 
 /// The NewSessionTicket record (server ap keys, seq 0).
-fn nst_record() -> Vec<u8> {
+fn nst_record() -> Result<Vec<u8>, &'static str> {
     let mut inner = hex(NEW_SESSION_TICKET);
     inner.push(0x16);
     let record = seal_aes_record(&arr16(S_AP_KEY), &arr12(S_AP_IV), 0, &inner);
-    assert_eq!(record.len(), 227, "NST record length");
-    assert_eq!(
-        &record[..21],
-        hex(NST_RECORD_PREFIX).as_slice(),
-        "NST record prefix must match the RFC ciphertext"
-    );
-    record
+    if record.len() != 227 {
+        return Err("NST record length");
+    }
+    if &record[..21] != hex(NST_RECORD_PREFIX).as_slice() {
+        return Err("NST record prefix must match the RFC ciphertext");
+    }
+    Ok(record)
 }
 
 /// The server application-data record (server ap keys, seq 1).
-fn server_app_record() -> Vec<u8> {
+fn server_app_record() -> Result<Vec<u8>, &'static str> {
     let mut inner = app_payload();
     inner.push(0x17); // inner content type: application_data
     let record = seal_aes_record(&arr16(S_AP_KEY), &arr12(S_AP_IV), 1, &inner);
-    assert_eq!(record.len(), 72, "server app record length");
-    assert_eq!(
-        &record[..21],
-        hex(SERVER_APP_RECORD_PREFIX).as_slice(),
-        "server app record prefix must match the RFC ciphertext"
-    );
-    record
+    if record.len() != 72 {
+        return Err("server app record length");
+    }
+    if &record[..21] != hex(SERVER_APP_RECORD_PREFIX).as_slice() {
+        return Err("server app record prefix must match the RFC ciphertext");
+    }
+    Ok(record)
 }
 
 /// A store trusting the RFC 8448 trace certificate (self-signed,
 /// pinned by the test).
 fn rfc_store() -> RootStore<'static> {
     let mut store = RootStore::new();
-    store
-        .add_root_der(Box::leak(hex(CERT_DER).into_boxed_slice()))
-        .expect("RFC cert parses");
+    // An unparsable fixture cert leaves the store empty, so the chain
+    // assertions fail the test instead of panicking the guest.
+    let _ = store.add_root_der(Box::leak(hex(CERT_DER).into_boxed_slice()));
     store
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 /// The key schedule against every intermediate value in RFC 8448 §3.
-#[test]
-fn key_schedule_matches_rfc8448() {
+fn key_schedule_matches_rfc8448() -> TestResult {
     let ch = &hex(CLIENT_HELLO_RECORD)[5..];
     let sh = &hex(SERVER_HELLO_RECORD)[5..];
     let mut transcript = Vec::with_capacity(ch.len() + sh.len());
@@ -324,20 +334,20 @@ fn key_schedule_matches_rfc8448() {
 
     // Early secret + derived (empty transcript hash).
     let early = hkdf_extract(None, &[0u8; 32]);
-    assert_eq!(early, arr32(EARLY_SECRET));
+    kt_assert_eq!(early, arr32(EARLY_SECRET));
     let derived = derive_secret(&early, "derived", &sha256(b""));
-    assert_eq!(derived, arr32(DERIVED_SECRET));
+    kt_assert_eq!(derived, arr32(DERIVED_SECRET));
 
     // Handshake secret + traffic secrets/keys.
     let (c_keys, s_keys, c_hs, s_hs, hs_secret) =
         derive_handshake_secrets(Cipher::Aes128Gcm, &arr32(SHARED_SECRET), &transcript);
-    assert_eq!(hs_secret, arr32(HANDSHAKE_SECRET));
-    assert_eq!(c_hs, arr32(C_HS_TRAFFIC));
-    assert_eq!(s_hs, arr32(S_HS_TRAFFIC));
-    assert_eq!(&c_keys.key[..16], arr16(C_HS_KEY).as_slice());
-    assert_eq!(c_keys.iv, arr12(C_HS_IV));
-    assert_eq!(&s_keys.key[..16], arr16(S_HS_KEY).as_slice());
-    assert_eq!(s_keys.iv, arr12(S_HS_IV));
+    kt_assert_eq!(hs_secret, arr32(HANDSHAKE_SECRET));
+    kt_assert_eq!(c_hs, arr32(C_HS_TRAFFIC));
+    kt_assert_eq!(s_hs, arr32(S_HS_TRAFFIC));
+    kt_assert_eq!(&c_keys.key[..16], arr16(C_HS_KEY).as_slice());
+    kt_assert_eq!(c_keys.iv, arr12(C_HS_IV));
+    kt_assert_eq!(&s_keys.key[..16], arr16(S_HS_KEY).as_slice());
+    kt_assert_eq!(s_keys.iv, arr12(S_HS_IV));
 
     // Master secret + application traffic secrets/keys. The transcript
     // is now CH || SH || EE || Cert || CV || server Finished.
@@ -345,58 +355,65 @@ fn key_schedule_matches_rfc8448() {
     full.extend_from_slice(&flight_plaintext());
     let derived2 = derive_secret(&hs_secret, "derived", &sha256(b""));
     let master = hkdf_extract(Some(&derived2), &[0u8; 32]);
-    assert_eq!(master, arr32(MASTER_SECRET));
+    kt_assert_eq!(master, arr32(MASTER_SECRET));
     let th = sha256(&full);
     let c_ap = derive_secret(&master, "c ap traffic", &th);
     let s_ap = derive_secret(&master, "s ap traffic", &th);
-    assert_eq!(c_ap, arr32(C_AP_TRAFFIC));
-    assert_eq!(s_ap, arr32(S_AP_TRAFFIC));
+    kt_assert_eq!(c_ap, arr32(C_AP_TRAFFIC));
+    kt_assert_eq!(s_ap, arr32(S_AP_TRAFFIC));
     let c_ap_keys = traffic_keys(Cipher::Aes128Gcm, &c_ap);
     let s_ap_keys = traffic_keys(Cipher::Aes128Gcm, &s_ap);
-    assert_eq!(&c_ap_keys.key[..16], arr16(C_AP_KEY).as_slice());
-    assert_eq!(c_ap_keys.iv, arr12(C_AP_IV));
-    assert_eq!(&s_ap_keys.key[..16], arr16(S_AP_KEY).as_slice());
-    assert_eq!(s_ap_keys.iv, arr12(S_AP_IV));
+    kt_assert_eq!(&c_ap_keys.key[..16], arr16(C_AP_KEY).as_slice());
+    kt_assert_eq!(c_ap_keys.iv, arr12(C_AP_IV));
+    kt_assert_eq!(&s_ap_keys.key[..16], arr16(S_AP_KEY).as_slice());
+    kt_assert_eq!(s_ap_keys.iv, arr12(S_AP_IV));
 
     // Exporter + resumption masters.
     let exp = derive_secret(&master, "exp master", &th);
-    assert_eq!(exp, arr32(EXP_MASTER));
+    kt_assert_eq!(exp, arr32(EXP_MASTER));
     let mut with_client_finished = full.clone();
     with_client_finished.extend_from_slice(&hex(
         "14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61",
     ));
     let res = derive_secret(&master, "res master", &sha256(&with_client_finished));
-    assert_eq!(res, arr32(RES_MASTER));
+    kt_assert_eq!(res, arr32(RES_MASTER));
 
     // Finished verify_data values.
     let s_finished_key = hkdf_expand_label(&s_hs, "finished", b"", 32);
-    assert_eq!(
+    kt_assert_eq!(
         hmac_sha256(&s_finished_key, &sha256(&full)).as_slice(),
         hex(SERVER_FINISHED_VERIFY).as_slice()
     );
     let c_finished_key = hkdf_expand_label(&c_hs, "finished", b"", 32);
-    assert_eq!(
+    kt_assert_eq!(
         hmac_sha256(&c_finished_key, &sha256(&full)).as_slice(),
         hex(CLIENT_FINISHED_VERIFY).as_slice()
     );
+    TestResult::Pass
 }
+
+kernel_test_in!("net/tls", key_schedule_matches_rfc8448);
 
 /// The ClientHello builder reproduces the RFC 8448 §3 record
 /// byte-exactly (same random, same ephemeral key, same extension set).
-#[test]
-fn client_hello_matches_rfc8448_record() {
+fn client_hello_matches_rfc8448_record() -> TestResult {
     let store = rfc_store();
     let config = rfc_config(&store);
-    let pub_key = crate::tls_x25519::x25519_public(&arr32(CLIENT_PRIV)).unwrap();
+    let Some(pub_key) = crate::tls_x25519::x25519_public(&arr32(CLIENT_PRIV)) else {
+        return TestResult::Fail("x25519 public key");
+    };
     let hello = build_client_hello(&config, &arr32(CLIENT_RANDOM), &pub_key);
     let mut expected = Vec::with_capacity(201);
     expected.push(0x16);
     expected.extend_from_slice(&[0x03, 0x01]);
     expected.extend_from_slice(&(196u16).to_be_bytes());
     expected.extend_from_slice(&hello);
-    assert_eq!(expected.len(), 201);
-    assert_eq!(expected, hex(CLIENT_HELLO_RECORD));
+    kt_assert_eq!(expected.len(), 201);
+    kt_assert_eq!(expected, hex(CLIENT_HELLO_RECORD));
+    TestResult::Pass
 }
+
+kernel_test_in!("net/tls", client_hello_matches_rfc8448_record);
 
 /// The client's close_notify record (24 bytes), RFC 8448 §3.
 const EXPECTED_CLIENT_CLOSE_NOTIFY_RECORD: &str =
@@ -406,36 +423,53 @@ const EXPECTED_CLIENT_CLOSE_NOTIFY_RECORD: &str =
 /// the trace's ClientHello and Finished records byte-exactly, exchange
 /// the trace's application data, and handle the NewSessionTicket and
 /// close_notify.
-#[test]
-fn full_handshake_matches_rfc8448() {
+fn full_handshake_matches_rfc8448() -> TestResult {
     let store = rfc_store();
     let config = rfc_config(&store);
     let mut input = Vec::new();
     input.extend_from_slice(&hex(SERVER_HELLO_RECORD));
-    input.extend_from_slice(&flight_record());
-    input.extend_from_slice(&nst_record());
-    input.extend_from_slice(&server_app_record());
+    let flight = match flight_record() {
+        Ok(r) => r,
+        Err(e) => return TestResult::Fail(e),
+    };
+    input.extend_from_slice(&flight);
+    let nst = match nst_record() {
+        Ok(r) => r,
+        Err(e) => return TestResult::Fail(e),
+    };
+    input.extend_from_slice(&nst);
+    let server_app = match server_app_record() {
+        Ok(r) => r,
+        Err(e) => return TestResult::Fail(e),
+    };
+    input.extend_from_slice(&server_app);
     input.extend_from_slice(&hex(SERVER_CLOSE_NOTIFY_RECORD));
     let transport = SliceTransport::new(Box::leak(input.into_boxed_slice()));
-    let mut client = TlsClient::connect(transport, config).expect("handshake succeeds");
-    assert_eq!(client.negotiated_cipher(), Some(Cipher::Aes128Gcm));
+    let Ok(mut client) = TlsClient::connect(transport, config) else {
+        return TestResult::Fail("handshake succeeds");
+    };
+    kt_assert_eq!(client.negotiated_cipher(), Some(Cipher::Aes128Gcm));
 
     // ClientHello + Finished, byte-exact.
     let mut expected = hex(CLIENT_HELLO_RECORD);
     expected.extend_from_slice(&hex(EXPECTED_CLIENT_FINISHED_RECORD));
-    assert_eq!(client.transport().written(), expected.as_slice());
+    kt_assert_eq!(client.transport().written(), expected.as_slice());
 
     // Application data out: byte-exact record.
-    client.send_app_data(&app_payload()).expect("send app data");
+    if client.send_app_data(&app_payload()).is_err() {
+        return TestResult::Fail("send app data");
+    }
     expected.extend_from_slice(&hex(EXPECTED_CLIENT_APP_RECORD));
-    assert_eq!(client.transport().written(), expected.as_slice());
+    kt_assert_eq!(client.transport().written(), expected.as_slice());
 
     // Application data in (the NewSessionTicket is consumed inline).
-    let got = client.recv_app_data().expect("recv app data");
-    assert_eq!(got, app_payload());
+    let Ok(got) = client.recv_app_data() else {
+        return TestResult::Fail("recv app data");
+    };
+    kt_assert_eq!(got, app_payload());
 
     // The server's close_notify ends the connection.
-    assert_eq!(
+    kt_assert_eq!(
         client.recv_app_data(),
         Err(TlsError::Closed),
         "server close_notify"
@@ -444,8 +478,11 @@ fn full_handshake_matches_rfc8448() {
     // Our close_notify is the trace's record.
     client.close();
     expected.extend_from_slice(&hex(EXPECTED_CLIENT_CLOSE_NOTIFY_RECORD));
-    assert_eq!(client.transport().written(), expected.as_slice());
+    kt_assert_eq!(client.transport().written(), expected.as_slice());
+    TestResult::Pass
 }
+
+kernel_test_in!("net/tls", full_handshake_matches_rfc8448);
 
 /// ChaCha20-Poly1305 at the record layer: key derivation (32-byte
 /// keys), seal/open round-trip, cross-check of the seal against the
@@ -456,18 +493,17 @@ fn full_handshake_matches_rfc8448() {
 /// server's private key is published in RFC 8448 §2, but this lane
 /// does not implement RSA signing); the record layer and derivation
 /// are the client-specific ChaCha logic, and they are covered here.
-#[test]
-fn chacha_record_layer() {
+fn chacha_record_layer() -> TestResult {
     use narf_crypto::aead::chacha20_poly1305_seal;
 
     let secret = [7u8; 32];
     let keys = traffic_keys(Cipher::ChaCha20Poly1305, &secret);
-    assert_eq!(keys.key_len, 32);
-    assert_eq!(
+    kt_assert_eq!(keys.key_len, 32);
+    kt_assert_eq!(
         keys.key,
         hkdf_expand_label(&secret, "key", b"", 32).as_slice()
     );
-    assert_eq!(
+    kt_assert_eq!(
         keys.iv,
         hkdf_expand_label(&secret, "iv", b"", 12).as_slice()
     );
@@ -483,12 +519,12 @@ fn chacha_record_layer() {
     }
     let mut expected = b"hello tls".to_vec();
     let tag2 = chacha20_poly1305_seal(&keys.key, &nonce, &aad, &mut expected);
-    assert_eq!(tag, tag2);
-    assert_eq!(plaintext, expected);
+    kt_assert_eq!(tag, tag2);
+    kt_assert_eq!(plaintext, expected);
 
     // Open round-trips; a flipped tag fails.
     let mut ct = plaintext.clone();
-    assert!(aead_open(
+    kt_assert!(aead_open(
         Cipher::ChaCha20Poly1305,
         &keys,
         5,
@@ -496,11 +532,11 @@ fn chacha_record_layer() {
         &mut ct,
         &tag
     ));
-    assert_eq!(ct, b"hello tls");
+    kt_assert_eq!(ct, b"hello tls");
     let mut bad_tag = tag;
     bad_tag[0] ^= 1;
     let mut ct2 = plaintext.clone();
-    assert!(!aead_open(
+    kt_assert!(!aead_open(
         Cipher::ChaCha20Poly1305,
         &keys,
         5,
@@ -511,11 +547,11 @@ fn chacha_record_layer() {
 
     // The AES path round-trips too (16-byte keys).
     let aes_keys = traffic_keys(Cipher::Aes128Gcm, &secret);
-    assert_eq!(aes_keys.key_len, 16);
+    kt_assert_eq!(aes_keys.key_len, 16);
     let mut pt = b"aes test".to_vec();
     let tag = aead_seal(Cipher::Aes128Gcm, &aes_keys, 0, &aad, &mut pt);
     let mut ct = pt.clone();
-    assert!(aead_open(
+    kt_assert!(aead_open(
         Cipher::Aes128Gcm,
         &aes_keys,
         0,
@@ -523,139 +559,187 @@ fn chacha_record_layer() {
         &mut ct,
         &tag
     ));
-    assert_eq!(ct, b"aes test");
+    kt_assert_eq!(ct, b"aes test");
+    TestResult::Pass
 }
+
+kernel_test_in!("net/tls", chacha_record_layer);
 
 // ─── Chain tests (openssl fixtures) ─────────────────────────────────────────
 
 fn fixture_store(ca: &[u8]) -> RootStore<'static> {
     let mut store = RootStore::new();
-    store
-        .add_root_der(Box::leak(ca.to_vec().into_boxed_slice()))
-        .expect("fixture CA parses");
+    // An unparsable fixture CA leaves the store empty, so the chain
+    // assertions fail the test instead of panicking the guest.
+    let _ = store.add_root_der(Box::leak(ca.to_vec().into_boxed_slice()));
     store
 }
 
-fn leaf(der: &[u8]) -> crate::tls_x509::Certificate<'_> {
-    parse_certificate(der).expect("fixture leaf parses")
-}
-
-#[test]
-fn chain_ec_valid() {
+fn chain_ec_valid() -> TestResult {
     let store = fixture_store(include_bytes!("tls_fixtures/ca_ec.der"));
-    let chain = [leaf(include_bytes!("tls_fixtures/leaf_ec.der"))];
-    assert!(store
+    let Ok(leaf_cert) = parse_certificate(include_bytes!("tls_fixtures/leaf_ec.der")) else {
+        return TestResult::Fail("fixture leaf parses");
+    };
+    let chain = [leaf_cert];
+    kt_assert!(store
         .verify_chain(&chain, Some("example.com"), OPENSSL_NOW)
         .is_ok());
+    TestResult::Pass
 }
 
-#[test]
-fn chain_ed25519_valid() {
+kernel_test_in!("net/tls", chain_ec_valid);
+
+fn chain_ed25519_valid() -> TestResult {
     let store = fixture_store(include_bytes!("tls_fixtures/ca_ed.der"));
-    let chain = [leaf(include_bytes!("tls_fixtures/leaf_ed.der"))];
-    assert!(store
+    let Ok(leaf_cert) = parse_certificate(include_bytes!("tls_fixtures/leaf_ed.der")) else {
+        return TestResult::Fail("fixture leaf parses");
+    };
+    let chain = [leaf_cert];
+    kt_assert!(store
         .verify_chain(&chain, Some("example.com"), OPENSSL_NOW)
         .is_ok());
+    TestResult::Pass
 }
 
-#[test]
-fn chain_rsa_valid() {
+kernel_test_in!("net/tls", chain_ed25519_valid);
+
+fn chain_rsa_valid() -> TestResult {
     let store = fixture_store(include_bytes!("tls_fixtures/ca_rsa.der"));
-    let chain = [leaf(include_bytes!("tls_fixtures/leaf_rsa.der"))];
-    assert!(store
+    let Ok(leaf_cert) = parse_certificate(include_bytes!("tls_fixtures/leaf_rsa.der")) else {
+        return TestResult::Fail("fixture leaf parses");
+    };
+    let chain = [leaf_cert];
+    kt_assert!(store
         .verify_chain(&chain, Some("example.com"), OPENSSL_NOW)
         .is_ok());
+    TestResult::Pass
 }
 
-#[test]
-fn chain_wrong_ca_rejected() {
+kernel_test_in!("net/tls", chain_rsa_valid);
+
+fn chain_wrong_ca_rejected() -> TestResult {
     let store = fixture_store(include_bytes!("tls_fixtures/ca_ec.der"));
-    let chain = [leaf(include_bytes!("tls_fixtures/leaf_wrongca.der"))];
-    assert_eq!(
+    let Ok(leaf_cert) = parse_certificate(include_bytes!("tls_fixtures/leaf_wrongca.der")) else {
+        return TestResult::Fail("fixture leaf parses");
+    };
+    let chain = [leaf_cert];
+    kt_assert_eq!(
         store.verify_chain(&chain, Some("example.com"), OPENSSL_NOW),
         Err(X509Error::UnknownIssuer)
     );
+    TestResult::Pass
 }
 
-#[test]
-fn chain_expired_rejected() {
+kernel_test_in!("net/tls", chain_wrong_ca_rejected);
+
+fn chain_expired_rejected() -> TestResult {
     let store = fixture_store(include_bytes!("tls_fixtures/ca_ec.der"));
-    let chain = [leaf(include_bytes!("tls_fixtures/leaf_expired.der"))];
-    assert_eq!(
+    let Ok(leaf_cert) = parse_certificate(include_bytes!("tls_fixtures/leaf_expired.der")) else {
+        return TestResult::Fail("fixture leaf parses");
+    };
+    let chain = [leaf_cert];
+    kt_assert_eq!(
         store.verify_chain(&chain, Some("example.com"), OPENSSL_NOW),
         Err(X509Error::Expired)
     );
+    TestResult::Pass
 }
 
-#[test]
-fn chain_not_yet_valid_rejected() {
+kernel_test_in!("net/tls", chain_expired_rejected);
+
+fn chain_not_yet_valid_rejected() -> TestResult {
     let store = fixture_store(include_bytes!("tls_fixtures/ca_ec.der"));
-    let chain = [leaf(include_bytes!("tls_fixtures/leaf_ec.der"))];
-    assert_eq!(
+    let Ok(leaf_cert) = parse_certificate(include_bytes!("tls_fixtures/leaf_ec.der")) else {
+        return TestResult::Fail("fixture leaf parses");
+    };
+    let chain = [leaf_cert];
+    kt_assert_eq!(
         store.verify_chain(&chain, Some("example.com"), 1_700_000_000),
         Err(X509Error::NotYetValid)
     );
+    TestResult::Pass
 }
 
-#[test]
-fn chain_hostname_mismatch_rejected() {
+kernel_test_in!("net/tls", chain_not_yet_valid_rejected);
+
+fn chain_hostname_mismatch_rejected() -> TestResult {
     let store = fixture_store(include_bytes!("tls_fixtures/ca_ec.der"));
-    let chain = [leaf(include_bytes!("tls_fixtures/leaf_ec.der"))];
-    assert_eq!(
+    let Ok(leaf_cert) = parse_certificate(include_bytes!("tls_fixtures/leaf_ec.der")) else {
+        return TestResult::Fail("fixture leaf parses");
+    };
+    let chain = [leaf_cert];
+    kt_assert_eq!(
         store.verify_chain(&chain, Some("other.com"), OPENSSL_NOW),
         Err(X509Error::HostnameMismatch)
     );
+    TestResult::Pass
 }
 
-#[test]
-fn chain_cn_fallback_matches() {
+kernel_test_in!("net/tls", chain_hostname_mismatch_rejected);
+
+fn chain_cn_fallback_matches() -> TestResult {
     let store = fixture_store(include_bytes!("tls_fixtures/ca_ec.der"));
-    let chain = [leaf(include_bytes!("tls_fixtures/leaf_cn.der"))];
-    assert!(store
+    let Ok(leaf_cert) = parse_certificate(include_bytes!("tls_fixtures/leaf_cn.der")) else {
+        return TestResult::Fail("fixture leaf parses");
+    };
+    let chain = [leaf_cert];
+    kt_assert!(store
         .verify_chain(&chain, Some("example.com"), OPENSSL_NOW)
         .is_ok());
-    assert_eq!(
+    kt_assert_eq!(
         store.verify_chain(&chain, Some("other.com"), OPENSSL_NOW),
         Err(X509Error::HostnameMismatch)
     );
+    TestResult::Pass
 }
 
-#[test]
-fn chain_wildcard_matches_one_label() {
+kernel_test_in!("net/tls", chain_cn_fallback_matches);
+
+fn chain_wildcard_matches_one_label() -> TestResult {
     let store = fixture_store(include_bytes!("tls_fixtures/ca_ec.der"));
-    let chain = [leaf(include_bytes!("tls_fixtures/leaf_wild.der"))];
-    assert!(store
+    let Ok(leaf_cert) = parse_certificate(include_bytes!("tls_fixtures/leaf_wild.der")) else {
+        return TestResult::Fail("fixture leaf parses");
+    };
+    let chain = [leaf_cert];
+    kt_assert!(store
         .verify_chain(&chain, Some("foo.example.com"), OPENSSL_NOW)
         .is_ok());
-    assert_eq!(
+    kt_assert_eq!(
         store.verify_chain(&chain, Some("a.b.example.com"), OPENSSL_NOW),
         Err(X509Error::HostnameMismatch)
     );
-    assert_eq!(
+    kt_assert_eq!(
         store.verify_chain(&chain, Some("example.com"), OPENSSL_NOW),
         Err(X509Error::HostnameMismatch)
     );
+    TestResult::Pass
 }
 
-#[test]
-fn rfc_cert_parses_and_self_verifies() {
+kernel_test_in!("net/tls", chain_wildcard_matches_one_label);
+
+fn rfc_cert_parses_and_self_verifies() -> TestResult {
     let der = hex(CERT_DER);
-    let cert = parse_certificate(&der).expect("RFC cert parses");
-    assert_eq!(cert.cn, Some(b"rsa".as_slice()));
-    assert!(cert.san_dns.is_empty());
-    assert!(!cert.is_ca);
-    assert_eq!(cert.not_before, 1_469_829_039); // 2016-07-30T01:23:59Z
-    assert_eq!(cert.not_after, 1_785_452_239); // 2026-07-30T01:23:59Z
-    assert!(matches!(
+    let Ok(cert) = parse_certificate(&der) else {
+        return TestResult::Fail("RFC cert parses");
+    };
+    kt_assert_eq!(cert.cn, Some(b"rsa".as_slice()));
+    kt_assert!(cert.san_dns.is_empty());
+    kt_assert!(!cert.is_ca);
+    kt_assert_eq!(cert.not_before, 1_469_829_039); // 2016-07-30T01:23:59Z
+    kt_assert_eq!(cert.not_after, 1_785_452_239); // 2026-07-30T01:23:59Z
+    kt_assert!(matches!(
         cert.spki,
         crate::tls_x509::Spki::Rsa { e: 65537, .. }
     ));
     // Self-signed: verifies with its own key, and chains to itself
     // as a pinned root.
-    assert!(crate::tls_x509::verify_cert_signature(&cert, &cert));
+    kt_assert!(crate::tls_x509::verify_cert_signature(&cert, &cert));
     let store = rfc_store();
-    assert!(store.verify_chain(&[cert], None, RFC_NOW).is_ok());
+    kt_assert!(store.verify_chain(&[cert], None, RFC_NOW).is_ok());
+    TestResult::Pass
 }
+
+kernel_test_in!("net/tls", rfc_cert_parses_and_self_verifies);
 
 // ─── Negative handshake fixtures ────────────────────────────────────────────
 
@@ -675,8 +759,7 @@ fn run_handshake<'a>(
     TlsClient::connect(transport, config)
 }
 
-#[test]
-fn handshake_bad_finished_mac_rejected() {
+fn handshake_bad_finished_mac_rejected() -> TestResult {
     let store = rfc_store();
     // Flip a byte in the server Finished verify_data, then seal.
     let mut plaintext = flight_plaintext();
@@ -685,12 +768,16 @@ fn handshake_bad_finished_mac_rejected() {
     let mut inner = plaintext;
     inner.push(0x16);
     let flight = seal_aes_record(&arr16(S_HS_KEY), &arr12(S_HS_IV), 0, &inner);
-    let err = run_handshake(handshake_input_with_flight(&flight), &store).unwrap_err();
-    assert_eq!(err, TlsError::BadFinished);
+    let Err(err) = run_handshake(handshake_input_with_flight(&flight), &store) else {
+        return TestResult::Fail("handshake must fail");
+    };
+    kt_assert_eq!(err, TlsError::BadFinished);
+    TestResult::Pass
 }
 
-#[test]
-fn handshake_bad_chain_rejected() {
+kernel_test_in!("net/tls", handshake_bad_finished_mac_rejected);
+
+fn handshake_bad_chain_rejected() -> TestResult {
     let store = rfc_store();
     // Flip a byte inside the certificate signature, then seal.
     let mut plaintext = flight_plaintext();
@@ -699,27 +786,48 @@ fn handshake_bad_chain_rejected() {
     let mut inner = plaintext;
     inner.push(0x16);
     let flight = seal_aes_record(&arr16(S_HS_KEY), &arr12(S_HS_IV), 0, &inner);
-    let err = run_handshake(handshake_input_with_flight(&flight), &store).unwrap_err();
-    assert!(matches!(err, TlsError::CertError(_)), "got {err:?}");
+    let Err(err) = run_handshake(handshake_input_with_flight(&flight), &store) else {
+        return TestResult::Fail("handshake must fail");
+    };
+    kt_assert!(matches!(err, TlsError::CertError(_)), "got {err:?}");
+    TestResult::Pass
 }
 
-#[test]
-fn handshake_wrong_version_rejected() {
+kernel_test_in!("net/tls", handshake_bad_chain_rejected);
+
+fn handshake_wrong_version_rejected() -> TestResult {
     let store = rfc_store();
     // ServerHello supported_versions 0x0304 -> 0x0303.
     let mut sh = hex(SERVER_HELLO_RECORD);
     let n = sh.len();
-    assert_eq!(&sh[n - 2..], &[0x03, 0x04]);
+    kt_assert_eq!(&sh[n - 2..], &[0x03, 0x04]);
     sh[n - 1] = 0x03;
     let mut input = sh;
-    input.extend_from_slice(&flight_record());
-    let err = run_handshake(input, &store).unwrap_err();
-    assert_eq!(err, TlsError::UnsupportedVersion);
+    let flight = match flight_record() {
+        Ok(r) => r,
+        Err(e) => return TestResult::Fail(e),
+    };
+    input.extend_from_slice(&flight);
+    let Err(err) = run_handshake(input, &store) else {
+        return TestResult::Fail("handshake must fail");
+    };
+    kt_assert_eq!(err, TlsError::UnsupportedVersion);
+    TestResult::Pass
 }
 
-#[test]
-fn handshake_unknown_ca_rejected() {
+kernel_test_in!("net/tls", handshake_wrong_version_rejected);
+
+fn handshake_unknown_ca_rejected() -> TestResult {
     let store = RootStore::new();
-    let err = run_handshake(handshake_input_with_flight(&flight_record()), &store).unwrap_err();
-    assert_eq!(err, TlsError::CertError(X509Error::UnknownIssuer));
+    let flight = match flight_record() {
+        Ok(r) => r,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let Err(err) = run_handshake(handshake_input_with_flight(&flight), &store) else {
+        return TestResult::Fail("handshake must fail");
+    };
+    kt_assert_eq!(err, TlsError::CertError(X509Error::UnknownIssuer));
+    TestResult::Pass
 }
+
+kernel_test_in!("net/tls", handshake_unknown_ca_rejected);
