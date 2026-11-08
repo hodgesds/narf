@@ -400,8 +400,18 @@ fn smoke_intel_vrr_state_and_plane_flip() -> TestResult {
     let io = MockMmio::new();
     let crtc_id = 1;
 
-    // Disabled initially
+    // Start clean: no VRR, no CMRR, no auto mark, no mode/range/
+    // timings. Earlier tests (notably the reconcile test) publish
+    // CMRR state into slot 1 and never clean it up; without this
+    // reset the disabled-case flip below pushes and the assertion
+    // fires (#1835).
     VRR_STATE.set_enabled(crtc_id, false);
+    VRR_STATE.set_cmrr_enabled(crtc_id, false);
+    VRR_STATE.set_cmrr_auto(crtc_id, false);
+    VRR_STATE.set_cmrr_timings(crtc_id, None);
+    VRR_STATE.set_mode(crtc_id, None);
+    VRR_STATE.set_range(crtc_id, None);
+    VRR_STATE.set_timings(crtc_id, None);
     assert!(!VRR_STATE.is_enabled(crtc_id));
     on_plane_flip(crtc_id, &io);
     assert!(io.written(TRANSCODER_A_BASE + TRANS_PUSH_OFFSET).is_empty());
@@ -417,8 +427,14 @@ fn smoke_intel_vrr_state_and_plane_flip() -> TestResult {
         vec![TRANS_PUSH_EN]
     );
 
-    // Clean up
+    // Clean up so later tests start from a known state.
     VRR_STATE.set_enabled(crtc_id, false);
+    VRR_STATE.set_cmrr_enabled(crtc_id, false);
+    VRR_STATE.set_cmrr_auto(crtc_id, false);
+    VRR_STATE.set_cmrr_timings(crtc_id, None);
+    VRR_STATE.set_mode(crtc_id, None);
+    VRR_STATE.set_range(crtc_id, None);
+    VRR_STATE.set_timings(crtc_id, None);
     TestResult::Pass
 }
 kernel_test_in!(
@@ -1585,6 +1601,17 @@ fn smoke_intel_vrr_reconcile_cmrr() -> TestResult {
     assert_eq!((cmrr.vmin, cmrr.vmax), (1125, 1125));
     // No hardware writes at all: nothing needed disabling.
     assert!(io.written(base + TRANS_VRR_CTL_OFFSET).is_empty());
+
+    // Clean up so later tests start from a known state: this test
+    // leaves CMRR enabled on slot 1, which makes the next test's
+    // disabled-case flip push (#1835).
+    VRR_STATE.set_enabled(1, false);
+    VRR_STATE.set_cmrr_enabled(1, false);
+    VRR_STATE.set_cmrr_auto(1, false);
+    VRR_STATE.set_cmrr_timings(1, None);
+    VRR_STATE.set_mode(1, None);
+    VRR_STATE.set_range(1, None);
+    VRR_STATE.set_timings(1, None);
 
     TestResult::Pass
 }
