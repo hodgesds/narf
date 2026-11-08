@@ -49,6 +49,7 @@ pub const CONTENT_TYPE_HEARTBEAT: u8 = 24;
 
 // ── ProtocolVersion values (RFC 8446 §B.1) ────────────────────────
 
+pub const TLS_VERSION_TLS_1_0: u16 = 0x0301;
 pub const TLS_VERSION_TLS_1_2: u16 = 0x0303;
 pub const TLS_VERSION_TLS_1_3: u16 = 0x0304;
 
@@ -121,6 +122,36 @@ pub const EXT_OID_FILTERS: u16 = 48;
 pub const EXT_POST_HANDSHAKE_AUTH: u16 = 49;
 pub const EXT_SIGNATURE_ALGORITHMS_CERT: u16 = 50;
 pub const EXT_KEY_SHARE: u16 = 51;
+pub const EXT_RECORD_SIZE_LIMIT: u16 = 28;
+pub const EXT_EXTENDED_MASTER_SECRET: u16 = 23;
+pub const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
+
+// ── CipherSuite (RFC 8446 §B.4) ─────────────────────────────────────
+//
+// Only the two suites the client implements (SHA-256 HKDF only, so no
+// SHA-384 suite and no P-384).
+pub const CIPHER_TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+pub const CIPHER_TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1302;
+
+// ── SignatureScheme (RFC 8446 §4.2.3) ───────────────────────────────
+//
+// Only the SHA-256 schemes the client verifies.
+pub const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
+pub const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+pub const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
+pub const SIG_ED25519: u16 = 0x0807;
+
+// ── NamedGroup (RFC 8446 §4.2.7) ─────────────────────────────────────
+//
+// X25519 only — the only Diffie-Hellman group implemented.
+pub const GROUP_X25519: u16 = 0x001d;
+
+/// The HelloRetryRequest magic random (RFC 8446 §4.1.3): a ServerHello
+/// carrying this random is a HelloRetryRequest, not a real ServerHello.
+pub const HRR_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TlsError {

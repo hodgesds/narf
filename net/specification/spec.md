@@ -1628,6 +1628,40 @@ its Ethernet driver brings up a link. References (public-only):
   ExtensionType values (server_name = 0, supported_versions = 43,
   key_share = 51, etc.). **No crypto** — codec-only.
 
+### TLS 1.3 client (`tls_client`, `tls_x25519`, `tls_x509`)
+- **RFC 8446** — TLS 1.3 (E. Rescorla, Aug 2018). §4.1.2 ClientHello
+  (extension order: SNI, renegotiation_info, supported_groups,
+  extended_master_secret, key_share, supported_versions,
+  signature_algorithms, psk_key_exchange_modes, record_size_limit).
+  §4.1.3 ServerHello + HelloRetryRequest (magic random, cookie as
+  first extension, second HRR is fatal). §7.1 key schedule
+  (Derive-Secret / HKDF-Expand-Label, transcript hashes; the
+  KeyUpdate "traffic upd" context is EMPTY, not the empty hash).
+  §7.2 KeyUpdate (ratchet both directions). §5.2 AEAD record
+  protection (nonce = IV XOR seq, AAD = 5-byte header, inner
+  plaintext split on the last non-zero byte). §4.4.2 Certificate
+  (X.509 chain, SAN else CN hostname, single-label wildcard).
+  §4.6.1 NewSessionTicket (parsed, discarded — no PSK resumption).
+  **RFC 8448** — §3 full-handshake test vectors (fixture anchor).
+  **RFC 7748** — §5.2 X25519 (Montgomery ladder, all-zero shared
+  secret rejected).
+- Surfaced: `TlsClient::connect` / `send_app_data` /
+  `recv_app_data` / `close` / `negotiated_cipher` over a
+  `Transport` trait (`SliceTransport` for fixtures, `TcpTransport`
+  over `tcp::core`); `ClientConfig` (server_name, roots, offered
+  suites/groups/sig-algs, hostname-check flag); `RootStore`
+  (empty by default, `add_root_der` provisioning; a pinned
+  non-CA cert authenticates only itself as a leaf, never as an
+  issuer). Production ciphersuites: TLS_AES_128_GCM_SHA256
+  (0x1301) + TLS_CHACHA20_POLY1305_SHA256 (0x1302); groups:
+  X25519 only; signature schemes: rsa_pkcs1_sha256,
+  ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, ed25519 (SHA-256
+  only — no SHA-384 suite, no P-384). Cert validity uses an
+  injected `now_unix`; the caller owns clock accuracy (no
+  SNTP/NTP client in tree). Known gap: no full ChaCha handshake
+  fixture (record layer + derivation covered; a ChaCha handshake
+  needs re-signing CertificateVerify for a different transcript).
+
 ### HTTP/1.1 framing (`http`)
 - **RFC 9112** — HTTP/1.1 (R. Fielding et al, June 2022). §3
   Message Format. §4 Request Line. §5 Status Line. §6 Field Lines.

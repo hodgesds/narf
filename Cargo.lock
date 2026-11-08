@@ -2353,6 +2353,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-crypto",
  "narf-driver-macros",
  "narf-drivers",
  "narf-drivers-storage-core",
@@ -2964,6 +2965,8 @@ dependencies = [
  "narf-drivers",
  "narf-drivers-gpio",
  "narf-drivers-i2c",
+ "narf-drivers-leds",
+ "narf-drivers-platform",
  "narf-drivers-virtio",
  "narf-filesystem",
  "narf-hid",
@@ -3075,8 +3078,10 @@ dependencies = [
 name = "narf-net"
 version = "0.0.0"
 dependencies = [
+ "aes-gcm",
  "narf-capabilities",
  "narf-console",
+ "narf-crypto",
  "narf-io",
  "narf-ipc",
  "narf-kernel-test",
