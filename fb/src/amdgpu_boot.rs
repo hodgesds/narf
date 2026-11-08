@@ -144,8 +144,9 @@ pub(super) fn start() -> InitResult {
             let runpm = narf_drivers_gpu::amdgpu_navi48_runtime_pm::parse_runpm(
                 narf_boot::args().value("amdgpu.runpm"),
             );
-            let console_on_gpu =
-                !console_off_gpu || narf_boot::args().has_flag("amdgpu.native_display");
+            let console_on_gpu = !console_off_gpu
+                || options.native_display
+                || narf_boot::args().has_flag("amdgpu.native_display");
             // SAFETY: the S3 contract above (console hook, user mappings)
             // covers runtime suspend, which never pauses the console.
             narf_scheduler::block_on_spin(unsafe {
@@ -261,8 +262,10 @@ pub(super) fn start() -> InitResult {
         // console drawing into this GPU's VRAM, the boot framebuffer or
         // the native scanout, keeps it active, as fbcon's lit display
         // keeps Linux's dGPU awake.
-        let console_on_gpu =
-            !console_off_gpu || narf_boot::args().has_flag("amdgpu.native_display");
+        let console_on_gpu = !console_off_gpu
+            || options.native_display
+            || platform::native_display_running()
+            || narf_boot::args().has_flag("amdgpu.native_display");
         // SAFETY: the S3 contract above (console hook, user mappings)
         // covers runtime suspend, which never pauses the console.
         narf_scheduler::block_on_spin(unsafe {

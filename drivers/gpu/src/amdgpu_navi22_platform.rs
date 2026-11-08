@@ -676,7 +676,7 @@ pub async fn gfxoff_armed() -> bool {
 /// Whether the native display stack is up (so the runtime-PM `CONNECTED`
 /// state is published rather than scanned): display engines were
 /// requested and a modeset state is retained.
-pub(crate) fn native_display_running() -> bool {
+pub fn native_display_running() -> bool {
     display_engines_requested() && modeset_state().is_some()
 }
 
@@ -1580,6 +1580,8 @@ async unsafe fn light(
     restart_vblank();
     publish_console(boot);
     crate::amdgpu_navi22_kms::publish();
+    let delta = crate::amdgpu_navi22_runtime_pm::displays_changed(1 << (route & 7), true);
+    crate::amdgpu_navi22_runtime_pm::apply_display_refs(delta);
     if back.is_ok() {
         present_committed_again();
     }
@@ -1603,6 +1605,8 @@ async unsafe fn unlight(boot: &mut boot::ColdBoot) -> Result<(), boot::Error> {
     }
     crate::amdgpu_navi22_kms::KMS.lock().crtc.shown = None;
     crate::amdgpu_navi22_kms::publish();
+    let delta = crate::amdgpu_navi22_runtime_pm::displays_changed(0, false);
+    crate::amdgpu_navi22_runtime_pm::apply_display_refs(delta);
     result
 }
 
