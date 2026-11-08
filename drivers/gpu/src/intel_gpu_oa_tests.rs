@@ -1356,6 +1356,7 @@ fn unit_with_unexposed_stream(card: u32, hw: &Arc<Hw>) -> (Unit<Allocator>, Arc<
         config,
         false,
         None,
+        None,
         false,
         true,
     );
