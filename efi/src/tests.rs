@@ -341,7 +341,11 @@ fn tcg2_push_u64(v: &mut alloc::vec::Vec<u8>, x: u64) {
 /// vendorInfoSize u8 (0 here, no vendor info).
 fn tcg2_spec_id_body(algs: &[(u16, u16)]) -> alloc::vec::Vec<u8> {
     let mut v = alloc::vec::Vec::new();
-    v.extend_from_slice(b"Spec ID Event03");
+    // The signature is 16 bytes: the 15 ASCII bytes plus the NUL
+    // terminator the TCG spec counts in TCG_SPECID_SIG. A 15-byte
+    // signature shifts every later field one byte early and the
+    // parser rejects the log (TooManyAlgorithms at the nAlgs field).
+    v.extend_from_slice(b"Spec ID Event03\0");
     tcg2_push_u32(&mut v, 0); // platformClass: CLIENT
     v.push(0); // specVersionMinor
     v.push(2); // specVersionMajor
