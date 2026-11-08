@@ -1107,20 +1107,22 @@ impl LePeriodicAdvSyncTransferReceived {
         if p.is_empty() || p[0] != LeSubevent::PeriodicAdvertisingSyncTransferReceived as u8 {
             return None;
         }
-        // 1-byte subevent + 19-byte payload = 20 bytes.
+        // 1-byte subevent + 19-byte payload = 20 bytes. The
+        // payload fields start at p[1] (Status); every field
+        // after it is offset by one from the subevent byte.
         if p.len() < 20 {
             return None;
         }
-        let connection_handle = u16::from_le_bytes([p[1], p[2]]);
-        let service_data = u16::from_le_bytes([p[3], p[4]]);
-        let sync_handle = u16::from_le_bytes([p[5], p[6]]);
-        let advertising_sid = p[7];
-        let advertiser_address_type = p[8];
+        let connection_handle = u16::from_le_bytes([p[2], p[3]]);
+        let service_data = u16::from_le_bytes([p[4], p[5]]);
+        let sync_handle = u16::from_le_bytes([p[6], p[7]]);
+        let advertising_sid = p[8];
+        let advertiser_address_type = p[9];
         let mut advertiser_address = [0u8; 6];
-        advertiser_address.copy_from_slice(&p[9..15]);
-        let advertiser_phy = p[15];
-        let periodic_advertising_interval = u16::from_le_bytes([p[16], p[17]]);
-        let advertiser_clock_accuracy = p[18];
+        advertiser_address.copy_from_slice(&p[10..16]);
+        let advertiser_phy = p[16];
+        let periodic_advertising_interval = u16::from_le_bytes([p[17], p[18]]);
+        let advertiser_clock_accuracy = p[19];
         if connection_handle > 0x0EFF || sync_handle > 0x0EFF {
             return None;
         }

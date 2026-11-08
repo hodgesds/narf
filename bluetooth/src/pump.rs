@@ -441,7 +441,12 @@ enum OutboundState {
 /// One in-flight outbound channel-open (#1532).
 #[derive(Clone, Copy, Debug)]
 struct OutboundOpen {
-    /// Peer address: `[address type, bdaddr...]`.
+    /// Peer address in the HCI domain (`[address type,
+    /// bdaddr...]`, 0 public / 1 random): this is what
+    /// `Connection.peer_addr` holds, so the live-ACL lookup and
+    /// `advance_outbound_on_acl` compare equal. The socket-domain
+    /// peer is converted on entry (`socket_peer_to_hci`) and back
+    /// on `Open` (`hci_peer_to_socket`).
     peer: [u8; 7],
     kind: OutboundKind,
     state: OutboundState,
@@ -1324,6 +1329,9 @@ impl PumpCore {
         le: bool,
         rfcomm: bool,
     ) -> BtConnectStatus {
+        // Socket domain in, HCI domain from here on: the record
+        // must match `Connection.peer_addr` (see the API header).
+        let peer = socket_peer_to_hci(peer);
         // A connect() retry while one is in flight (or after it
         // finished) polls the live record.
         if let Some(pos) = self
@@ -1375,7 +1383,8 @@ impl PumpCore {
         let mut addr6 = [0u8; 6];
         addr6.copy_from_slice(&peer[1..7]);
         if le {
-            let peer_type = if peer[0] == 2 {
+            // `peer` is HCI domain here: 1 is LE random.
+            let peer_type = if peer[0] == 1 {
                 gap::PeerAddressType::Random
             } else {
                 gap::PeerAddressType::Public
@@ -1406,6 +1415,7 @@ impl PumpCore {
     /// Whether an outbound open to `peer` has completed and is
     /// ready to take (non-consuming peek for poll writability).
     pub fn connect_outbound_ready(&self, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool {
+        let peer = socket_peer_to_hci(peer);
         self.outbound
             .iter()
             .any(|o| o.matches(peer, psm, le, rfcomm) && o.state == OutboundState::Open)
@@ -1416,6 +1426,7 @@ impl PumpCore {
     /// half-open channel survives the socket that asked for it.
     /// `false` when nothing is in flight.
     pub fn cancel_outbound(&mut self, peer: [u8; 7], psm: u16, le: bool, rfcomm: bool) -> bool {
+        let peer = socket_peer_to_hci(peer);
         let Some(pos) = self
             .outbound
             .iter()
@@ -1465,16 +1476,20 @@ impl PumpCore {
         match self.outbound[pos].state {
             OutboundState::Open => {
                 let rec = self.outbound.remove(pos);
+                // Back to the socket domain for the tuple: the
+                // socket layer reports this peer verbatim.
+                let le = matches!(rec.kind, OutboundKind::LeCoc { .. });
+                let peer = hci_peer_to_socket(rec.peer, le);
                 if rfcomm {
                     BtConnectStatus::OpenRfcomm((
                         rec.handle,
                         rec.local_cid,
                         rec.peer_cid,
                         rec.dlci,
-                        rec.peer,
+                        peer,
                     ))
                 } else {
-                    BtConnectStatus::Open((rec.handle, rec.local_cid, rec.peer_cid, rec.peer))
+                    BtConnectStatus::Open((rec.handle, rec.local_cid, rec.peer_cid, peer))
                 }
             }
             OutboundState::Refused(result) => {
@@ -4778,8 +4793,21 @@ impl PumpCore {
                                         // lingers in the
                                         // session table, but
                                         // the pairing itself
-                                        // completed.
-                                        (outs, bond, Some(i.state == smp::PairingState::Done))
+                                        // completed. When the
+                                        // peer still owes
+                                        // distribution keys the
+                                        // session parks in
+                                        // WaitDistribution and
+                                        // the pairing is NOT
+                                        // terminal yet — the
+                                        // feed path completes
+                                        // it when Done is
+                                        // reached, so report
+                                        // None here rather
+                                        // than a premature
+                                        // failure.
+                                        let done = i.state == smp::PairingState::Done;
+                                        (outs, bond, if done { Some(true) } else { None })
                                     }
                                 };
                                 if bond.is_some() {
@@ -6142,6 +6170,40 @@ pub fn drain_rfcomm_rx(dev: u16, handle: u16, cid: u16, dlci: u8) -> Option<Vec<
 // The socket layer's `connect()` reaches the pump's outbound client
 // through these, via the filesystem broker. `psm` is the LE/BR-EDR
 // PSM, or the RFCOMM server channel when `rfcomm` is true.
+//
+// Address domains: peers arrive here in the Linux sockaddr domain
+// (byte 0: 0 BR/EDR, 1 LE public, 2 LE random), but the pump
+// tracks connections in the HCI domain (`Connection.peer_addr`:
+// 0 public, 1 random — see `handle_le_connection_complete`).
+// Outbound records store the HCI domain so the live-ACL lookup
+// and `advance_outbound_on_acl` match; the `Open` tuples convert
+// back, because the socket layer puts byte 0 verbatim into the
+// sockaddr address-type byte.
+
+/// Convert a socket-domain peer address to the HCI domain.
+fn socket_peer_to_hci(peer: [u8; 7]) -> [u8; 7] {
+    let mut hci = peer;
+    hci[0] = match peer[0] {
+        1 => 0, // LE public
+        2 => 1, // LE random
+        t => t, // BR/EDR (0) and anything else: unchanged
+    };
+    hci
+}
+
+/// Convert an HCI-domain peer address back to the socket domain.
+/// `le` disambiguates HCI 0 (LE public vs BR/EDR).
+fn hci_peer_to_socket(peer: [u8; 7], le: bool) -> [u8; 7] {
+    let mut sock = peer;
+    if le {
+        sock[0] = match peer[0] {
+            0 => 1, // LE public
+            1 => 2, // LE random
+            t => t,
+        };
+    }
+    sock
+}
 
 /// Start (or poll) an outbound L2CAP/RFCOMM channel open on
 /// controller `dev`. See [`PumpCore::connect_outbound`]. `NoPump`
@@ -9743,9 +9805,11 @@ mod tests {
             return TestResult::Fail("connect should stay Pending before the response");
         }
         // Peer answers: success, peer CID 0x0041, MTU 1024, MPS
-        // 256, 8 credits.
+        // 256, 8 credits. Per §4.23 the response carries DCID =
+        // the responder's CID (0x0041) first, SCID = our CID
+        // (0x0040) second.
         let rsp =
-            l2cap::build_le_credit_based_connection_response(0x01, 0x0040, 0x0041, 0, 1024, 256, 8);
+            l2cap::build_le_credit_based_connection_response(0x01, 0x0041, 0x0040, 0, 1024, 256, 8);
         let mut payload = Vec::new();
         rsp.encode(&mut payload);
         fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_LE_SIGNALLING, payload)));
@@ -10081,9 +10145,10 @@ mod tests {
             return TestResult::Fail("BR/EDR Connection Request bytes mismatch");
         }
         // Peer answers pending first (§4.3 result 1): still
-        // pending, no Configure Request yet.
+        // pending, no Configure Request yet. DCID is the
+        // responder's CID (0x0041), SCID ours (0x0040).
         let pending =
-            l2cap::build_connection_response(0x01, 0x0040, 0x0041, l2cap::CONN_RESULT_PENDING, 0);
+            l2cap::build_connection_response(0x01, 0x0041, 0x0040, l2cap::CONN_RESULT_PENDING, 0);
         let mut payload = Vec::new();
         pending.encode(&mut payload);
         fake.enqueue_acl(acl_packet(handle, &BFrame::new(CID_SIGNALLING, payload)));
@@ -10100,11 +10165,12 @@ mod tests {
             reset_all();
             return TestResult::Fail("Configure Request must wait for the final response");
         }
-        // Final response: success, peer CID 0x0041.
+        // Final response: success, peer CID 0x0041 (DCID first,
+        // our SCID second — §4.3).
         let rsp = l2cap::build_connection_response(
             0x01,
-            0x0040,
             0x0041,
+            0x0040,
             l2cap::CONN_RESULT_SUCCESS,
             l2cap::CONN_STATUS_NO_INFORMATION,
         );
@@ -10301,11 +10367,12 @@ mod tests {
             reset_all();
             return TestResult::Fail("RFCOMM mux Connection Request bytes mismatch");
         }
-        // Peer accepts the mux.
+        // Peer accepts the mux (DCID = peer's 0x0041, SCID =
+        // ours 0x0040 — §4.3).
         let rsp = l2cap::build_connection_response(
             0x01,
-            0x0040,
             0x0041,
+            0x0040,
             l2cap::CONN_RESULT_SUCCESS,
             l2cap::CONN_STATUS_NO_INFORMATION,
         );
@@ -11279,9 +11346,11 @@ mod tests {
         }
         let sent = fake.sent_command_params();
         let expect_params: [u8; 7] = [0x00, 0x30, 0x00, 0x30, 0x00, 0x00, 0x00];
-        if sent.len() != 6
-            || sent[5].0 != op::HCI_LE_SET_SCAN_PARAMETERS
-            || sent[5].1 != expect_params
+        // Bring-up is 7 commands (#815), so the first post-bring-up
+        // command sits at index 7.
+        if sent.len() != 8
+            || sent[7].0 != op::HCI_LE_SET_SCAN_PARAMETERS
+            || sent[7].1 != expect_params
         {
             reset_all();
             return TestResult::Fail("Set Scan Parameters bytes mismatch");
@@ -11294,7 +11363,7 @@ mod tests {
         fake.enqueue_event(cc(op::HCI_LE_SET_SCAN_PARAMETERS, &[0]));
         let _ = pump_once(0);
         let sent = fake.sent_command_params();
-        if sent.len() != 7 || sent[6].0 != op::HCI_LE_SET_SCAN_ENABLE || sent[6].1 != [0x01, 0x00] {
+        if sent.len() != 9 || sent[8].0 != op::HCI_LE_SET_SCAN_ENABLE || sent[8].1 != [0x01, 0x00] {
             reset_all();
             return TestResult::Fail("Set Scan Enable(1) not issued on parameters complete");
         }
@@ -11346,7 +11415,8 @@ mod tests {
             return TestResult::Fail("central_connect rejected from Scanning");
         }
         let sent = fake.sent_command_params();
-        if sent.len() != 8 || sent[7].0 != op::HCI_LE_SET_SCAN_ENABLE || sent[7].1 != [0x00, 0x00] {
+        if sent.len() != 10 || sent[9].0 != op::HCI_LE_SET_SCAN_ENABLE || sent[9].1 != [0x00, 0x00]
+        {
             reset_all();
             return TestResult::Fail("connect did not disable scan first");
         }
@@ -11364,9 +11434,9 @@ mod tests {
             0x30, 0x00, 0x30, 0x00, 0x00, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x00, 0x18,
             0x00, 0x28, 0x00, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00,
         ];
-        if sent.len() != 9
-            || sent[8].0 != op::HCI_LE_CREATE_CONNECTION
-            || sent[8].1 != expect_create
+        if sent.len() != 11
+            || sent[10].0 != op::HCI_LE_CREATE_CONNECTION
+            || sent[10].1 != expect_create
         {
             reset_all();
             return TestResult::Fail("LE Create Connection bytes mismatch");
@@ -11726,9 +11796,11 @@ mod tests {
             0x00, 0x00, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x01, 0x30, 0x00, 0x30, 0x00,
             0x18, 0x00, 0x28, 0x00, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00,
         ];
-        if sent.len() != 6
-            || sent[5].0 != op::HCI_LE_EXTENDED_CREATE_CONNECTION
-            || sent[5].1 != expect_params
+        // Bring-up is 7 commands (#815): the extended create is
+        // the 8th command sent.
+        if sent.len() != 8
+            || sent[7].0 != op::HCI_LE_EXTENDED_CREATE_CONNECTION
+            || sent[7].1 != expect_params
         {
             reset_all();
             return TestResult::Fail("LE Extended Create Connection bytes mismatch");
@@ -11982,8 +12054,8 @@ mod tests {
             == Err(CentralError::WrongPhase);
         ok &= central_stop_scan(0) == Err(CentralError::WrongPhase);
         ok &= central_phase(99).is_none() && central_peers(99).is_none();
-        // No extra commands beyond bring-up + the one direct Create.
-        ok &= fake.sent_command_params().len() == 6;
+        // No extra commands beyond bring-up (7) + the one direct Create.
+        ok &= fake.sent_command_params().len() == 8;
         reset_all();
         if !ok {
             return TestResult::Fail("wrong-phase call issued a command or wrong error");
@@ -12013,9 +12085,10 @@ mod tests {
         }
         let sent = fake.sent_command_params();
         let expect_params: [u8; 8] = [0x00, 0x00, 0x01, 0x00, 0x30, 0x00, 0x30, 0x00];
-        if sent.len() != 6
-            || sent[5].0 != op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS
-            || sent[5].1 != expect_params
+        // Bring-up is 7 commands (#815): parameters are the 8th.
+        if sent.len() != 8
+            || sent[7].0 != op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS
+            || sent[7].1 != expect_params
         {
             reset_all();
             return TestResult::Fail("Set Extended Scan Parameters bytes mismatch");
@@ -12028,9 +12101,9 @@ mod tests {
         fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_SCAN_PARAMETERS, &[0]));
         let _ = pump_once(0);
         let sent = fake.sent_command_params();
-        if sent.len() != 7
-            || sent[6].0 != op::HCI_LE_SET_EXTENDED_SCAN_ENABLE
-            || sent[6].1 != [0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+        if sent.len() != 9
+            || sent[8].0 != op::HCI_LE_SET_EXTENDED_SCAN_ENABLE
+            || sent[8].1 != [0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
         {
             reset_all();
             return TestResult::Fail(
@@ -12213,9 +12286,10 @@ mod tests {
             0x00, 0x13, 0x00, 0xA0, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x01, 0x00, 0x01, 0x00, 0x00,
         ];
-        if sent.len() != 6
-            || sent[5].0 != op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS
-            || sent[5].1 != expect_params
+        // Bring-up is 7 commands (#815): parameters are the 8th.
+        if sent.len() != 8
+            || sent[7].0 != op::HCI_LE_SET_EXTENDED_ADVERTISING_PARAMETERS
+            || sent[7].1 != expect_params
         {
             reset_all();
             return TestResult::Fail("Set Extended Advertising Parameters bytes mismatch");
@@ -12238,9 +12312,9 @@ mod tests {
         let expect_data: [u8; 13] = [
             0x00, 0x03, 0x01, 0x09, 0x02, 0x01, 0x06, 0x05, 0x09, b'N', b'A', b'R', b'F',
         ];
-        if sent.len() != 7
-            || sent[6].0 != op::HCI_LE_SET_EXTENDED_ADVERTISING_DATA
-            || sent[6].1 != expect_data
+        if sent.len() != 9
+            || sent[8].0 != op::HCI_LE_SET_EXTENDED_ADVERTISING_DATA
+            || sent[8].1 != expect_data
         {
             reset_all();
             return TestResult::Fail(
@@ -12257,9 +12331,9 @@ mod tests {
         fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_ADVERTISING_DATA, &[0]));
         let _ = pump_once(0);
         let sent = fake.sent_command_params();
-        if sent.len() != 8
-            || sent[7].0 != op::HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA
-            || sent[7].1 != [0x00, 0x03, 0x01, 0x03, 0x02, 0x01, 0x06]
+        if sent.len() != 10
+            || sent[9].0 != op::HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA
+            || sent[9].1 != [0x00, 0x03, 0x01, 0x03, 0x02, 0x01, 0x06]
         {
             reset_all();
             return TestResult::Fail("Set Extended Scan Response Data not issued on data complete");
@@ -12268,9 +12342,9 @@ mod tests {
         fake.enqueue_event(cc(op::HCI_LE_SET_EXTENDED_SCAN_RESPONSE_DATA, &[0]));
         let _ = pump_once(0);
         let sent = fake.sent_command_params();
-        if sent.len() != 9
-            || sent[8].0 != op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE
-            || sent[8].1 != [0x01, 0x01, 0x00, 0x00, 0x00, 0x00]
+        if sent.len() != 11
+            || sent[10].0 != op::HCI_LE_SET_EXTENDED_ADVERTISING_ENABLE
+            || sent[10].1 != [0x01, 0x01, 0x00, 0x00, 0x00, 0x00]
         {
             reset_all();
             return TestResult::Fail(
@@ -12407,7 +12481,8 @@ mod tests {
             reset_all();
             return TestResult::Fail("oversize advertising data must be BadData");
         }
-        if fake.sent_command_params().len() != 5 {
+        // Bring-up is 7 commands (#815): nothing else sent yet.
+        if fake.sent_command_params().len() != 7 {
             reset_all();
             return TestResult::Fail("BadData start must not issue a command");
         }
@@ -12512,7 +12587,8 @@ mod tests {
         }
         let sent = fake.sent_command_params();
         let expect_inquiry: [u8; 5] = [0x33, 0x8B, 0x9E, 0x08, 0x00];
-        if sent.len() != 6 || sent[5].0 != op::HCI_INQUIRY || sent[5].1 != expect_inquiry {
+        // Bring-up is 7 commands (#815): the inquiry is the 8th.
+        if sent.len() != 8 || sent[7].0 != op::HCI_INQUIRY || sent[7].1 != expect_inquiry {
             reset_all();
             return TestResult::Fail("HCI_Inquiry bytes mismatch");
         }
@@ -13582,7 +13658,11 @@ mod tests {
             .encode(),
         );
         let _ = pump_once(0);
-        if sco_rx_pending(0, 0x0043) || drain_sco_rx(0, 0x0043).is_some() {
+        // `drain_sco_rx` returns `Some(vec![])` for an existing
+        // link with no staged frames (`None` means no such link),
+        // so "staged nothing" is an empty drain, not an absent
+        // one — the link itself survives from step 4.
+        if sco_rx_pending(0, 0x0043) || drain_sco_rx(0, 0x0043) != Some(alloc::vec![]) {
             reset_all();
             return TestResult::Fail("isoch-less transport staged an inbound SCO frame");
         }
@@ -14242,6 +14322,11 @@ mod tests {
             return TestResult::Fail("hid info readback mismatch");
         }
         // Boot protocol selection: write [0x00] to Protocol Mode.
+        // Discovery sent 6 ATT requests (initial + continuation
+        // per phase) and the two reads 2 more — the 8-packet
+        // bring-up ACL budget is spent, so credit it back or
+        // this Write Request never leaves the pump.
+        smp888_replenish(&fake, handle);
         if hogp_protocol_mode_write(0, handle) != Some((0x0018, [0x00])) {
             reset_all();
             return TestResult::Fail("protocol mode write target mismatch");
@@ -14855,6 +14940,7 @@ mod tests {
     /// (bluetooth/src/mgmt.rs; kept local so the pump fixture does
     /// not depend on mgmt's private consts).
     const MGMT_OP_SET_POWERED: u16 = 0x0005;
+    const MGMT_OP_SET_IO_CAPABILITY: u16 = 0x0018;
     const MGMT_OP_PAIR_DEVICE: u16 = 0x0019;
     const MGMT_OP_USER_CONFIRM_REPLY: u16 = 0x001c;
     const MGMT_OP_USER_CONFIRM_NEG_REPLY: u16 = 0x001d;
@@ -15371,6 +15457,13 @@ mod tests {
     ) -> Result<PasskeyRoundResult, &'static str> {
         let mut cai = first_cai;
         for round in 0..20u8 {
+            // 20 rounds x 2 PDUs = 40 ACL packets against the
+            // controller's 8-packet bring-up budget: credit it
+            // back every round or the flush stalls mid-exchange
+            // (a real controller returns NumberOfCompletedPackets
+            // as packets complete; the scripted one only does
+            // when the test says so).
+            smp888_replenish(fake, SMP888_HANDLE);
             let z = smp::passkey_bit_z(passkey, round);
             // Deterministic distinct peer nonce per round (the
             // peer's real nonce is random; the fixture pins the
@@ -16542,6 +16635,18 @@ mod tests {
         if let Err(m) = smp888_bring_up_connect(&fake) {
             return fail(m);
         }
+        // The responder advertises the controller's
+        // SET_IO_CAPABILITY value (default NoInputNoOutput); the
+        // byte-exact response below is DisplayYesNo + MITM, so
+        // set it before the peer's Pairing Request arrives.
+        let set_io = crate::mgmt::handle(&mgmt_frame(MGMT_OP_SET_IO_CAPABILITY, 0, &[0x01]));
+        if set_io.len() != 1
+            || u16::from_le_bytes([set_io[0][0], set_io[0][1]]) != MGMT_EV_CMD_COMPLETE
+            || u16::from_le_bytes([set_io[0][6], set_io[0][7]]) != MGMT_OP_SET_IO_CAPABILITY
+            || set_io[0][8] != 0
+        {
+            return fail("mgmt SET_IO_CAPABILITY did not complete SUCCESS");
+        }
         // Peer requests pairing with IdKey|Sign both directions.
         let rsp = smp888_step_acls(
             &fake,
@@ -16552,6 +16657,18 @@ mod tests {
         // MITM, IdKey|Sign both directions.
         if rsp.len() != 1 || rsp[0] != alloc::vec![0x02, 0x01, 0x00, 0x0D, 16, 0x06, 0x06] {
             return fail("responder Pairing Response bytes wrong");
+        }
+        // Restore the default: the responder session already
+        // captured its features, but the mgmt IO-capability store
+        // is controller-global — the Security-Request test below
+        // pins the default NoInputNoOutput Pairing Request.
+        let restore_io = crate::mgmt::handle(&mgmt_frame(MGMT_OP_SET_IO_CAPABILITY, 0, &[0x00]));
+        if restore_io.len() != 1
+            || u16::from_le_bytes([restore_io[0][0], restore_io[0][1]]) != MGMT_EV_CMD_COMPLETE
+            || u16::from_le_bytes([restore_io[0][6], restore_io[0][7]]) != MGMT_OP_SET_IO_CAPABILITY
+            || restore_io[0][8] != 0
+        {
+            return fail("mgmt SET_IO_CAPABILITY restore did not complete SUCCESS");
         }
         let (peer_px, peer_py) = peer_public(SMP888_PEER_PRIV);
         let peer_pk_x = fe_to_wire(&peer_px);
@@ -17304,9 +17421,10 @@ mod tests {
             return TestResult::Fail("periodic_adv_set_parameters rejected");
         }
         let sent = fake.sent_command_params();
-        if sent.len() != 6
-            || sent[5].0 != op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS
-            || sent[5].1 != [0x00, 0x50, 0x00, 0x50, 0x00, 0x01, 0x00]
+        // Bring-up is 7 commands (#815): parameters are the 8th.
+        if sent.len() != 8
+            || sent[7].0 != op::HCI_LE_SET_PERIODIC_ADVERTISING_PARAMETERS
+            || sent[7].1 != [0x00, 0x50, 0x00, 0x50, 0x00, 0x01, 0x00]
         {
             reset_all();
             return TestResult::Fail("Set Periodic Adv Parameters bytes mismatch");
@@ -17330,9 +17448,9 @@ mod tests {
             return TestResult::Fail("periodic_adv_set_data rejected from Configured");
         }
         let sent = fake.sent_command_params();
-        if sent.len() != 7
-            || sent[6].0 != op::HCI_LE_SET_PERIODIC_ADVERTISING_DATA
-            || sent[6].1 != [0x00, 0x03, 0x03, 0x02, 0x01, 0x06]
+        if sent.len() != 9
+            || sent[8].0 != op::HCI_LE_SET_PERIODIC_ADVERTISING_DATA
+            || sent[8].1 != [0x00, 0x03, 0x03, 0x02, 0x01, 0x06]
         {
             reset_all();
             return TestResult::Fail("Set Periodic Adv Data bytes mismatch");
@@ -17344,9 +17462,9 @@ mod tests {
             return TestResult::Fail("periodic_adv_set_enable rejected from Configured");
         }
         let sent = fake.sent_command_params();
-        if sent.len() != 8
-            || sent[7].0 != op::HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE
-            || sent[7].1 != [0x01, 0x00]
+        if sent.len() != 10
+            || sent[9].0 != op::HCI_LE_SET_PERIODIC_ADVERTISING_ENABLE
+            || sent[9].1 != [0x01, 0x00]
         {
             reset_all();
             return TestResult::Fail("Set Periodic Adv Enable bytes mismatch");
@@ -17369,9 +17487,9 @@ mod tests {
         let want_create: [u8; 14] = [
             0x02, 0x01, 0x00, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0x00, 0x00, 0xE8, 0x03, 0xFF,
         ];
-        if sent.len() != 9
-            || sent[8].0 != op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC
-            || sent[8].1 != want_create
+        if sent.len() != 11
+            || sent[10].0 != op::HCI_LE_PERIODIC_ADVERTISING_CREATE_SYNC
+            || sent[10].1 != want_create
         {
             reset_all();
             return TestResult::Fail("Create Sync bytes mismatch");
@@ -18248,7 +18366,8 @@ mod tests {
             reset_all();
             return TestResult::Fail("terminate/cancel accepted from Idle");
         }
-        if fake.sent_command_params().len() != 5 {
+        // Bring-up is 7 commands (#815): nothing else sent yet.
+        if fake.sent_command_params().len() != 7 {
             reset_all();
             return TestResult::Fail("rejected calls emitted commands");
         }
@@ -18271,7 +18390,7 @@ mod tests {
             reset_all();
             return TestResult::Fail("out-of-range Create Sync accepted");
         }
-        if fake.sent_command_params().len() != 5 {
+        if fake.sent_command_params().len() != 7 {
             reset_all();
             return TestResult::Fail("bad parameters emitted commands");
         }

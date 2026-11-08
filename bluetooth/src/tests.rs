@@ -7163,6 +7163,17 @@ fn seed_bringup_sequence(lt: &LoopbackTransport, bd_addr: [u8; 6]) {
         &[0x40, 0x01, 0x40, 0x10, 0x00, 0x08, 0x00],
     ));
     lt.enqueue_event(make_command_complete(op::HCI_SET_EVENT_MASK, 0x00, &[]));
+    // Identity reads (§7.4.14/§7.4.23, issue #815): bring-up
+    // reads the local name (248 bytes) and Class of Device after
+    // the event mask, so the seed must answer both.
+    let mut name = [0u8; 248];
+    name[..9].copy_from_slice(b"narf-pump");
+    lt.enqueue_event(make_command_complete(op::HCI_READ_LOCAL_NAME, 0x00, &name));
+    lt.enqueue_event(make_command_complete(
+        op::HCI_READ_CLASS_OF_DEVICE,
+        0x00,
+        &[0x04, 0x0C, 0x02],
+    ));
 }
 
 /// `bring_up_all` is what turns a registered transport into a usable

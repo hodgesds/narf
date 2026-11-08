@@ -128,6 +128,13 @@ fn script_successful_bringup(fake: &ScriptedTransport) {
         &[0, 0xFE, 0x03, 64, 0x08, 0x00, 0x04, 0x00],
     ));
     fake.enqueue_event(cc(op::HCI_SET_EVENT_MASK, &[0]));
+    // Identity reads (§7.4.14/§7.4.23, issue #815): bring-up
+    // reads the local name and Class of Device after the event
+    // mask, so the script must answer both.
+    let mut name_ret = alloc::vec![0u8; 249];
+    name_ret[1..10].copy_from_slice(b"narf-pump");
+    fake.enqueue_event(cc(op::HCI_READ_LOCAL_NAME, &name_ret));
+    fake.enqueue_event(cc(op::HCI_READ_CLASS_OF_DEVICE, &[0, 0x04, 0x0C, 0x02]));
 }
 
 fn le_connection_complete(handle: u16, peer: [u8; 6]) -> Event {
