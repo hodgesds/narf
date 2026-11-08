@@ -424,7 +424,10 @@ fn smoke_intel_cmrr_rate_fractions_and_timings_computation() -> TestResult {
     assert_eq!(t60.vmin, 1125);
     assert_eq!(t60.vmax, 1125);
     assert_eq!(t60.flipline, 1125);
-    assert_eq!(t60.guardband, 45);
+    // Guardband is 44, not the 45-line vblank: CMRR compute
+    // subtracts the SCL-1 floor (wa_14015401596) like the VRR
+    // late phase, so 1125 - 1080 - 1 = 44.
+    assert_eq!(t60.guardband, 44);
 
     // 1080p60 on Display 20 at 59.940 Hz: M = 999_000_999
     let t59 = CmrrTimings::compute(&m, CmrrRate::Fps59_940, DisplayVrrIp::Display20)
@@ -484,13 +487,25 @@ fn smoke_intel_cmrr_register_programming_and_sequencing() -> TestResult {
     assert!(!is_cmrr_active(&io, trans));
     cmrr_enable(&io, trans, DisplayVrrIp::Display14, timings.guardband).unwrap();
     assert_eq!(io.written(base + TRANS_PUSH_OFFSET), vec![TRANS_PUSH_EN]);
-    let expected_ctl = VRR_CTL_VRR_ENABLE | VRR_CTL_CMRR_ENABLE | VRR_CTL_FLIP_LINE_EN | 45;
+    // The enable CTL carries the computed guardband (44: the
+    // 45-line vblank minus the SCL-1 floor), pinned via the
+    // timings rather than a literal so the next formula change
+    // does not strand the expectation again.
+    let expected_ctl = VRR_CTL_VRR_ENABLE
+        | VRR_CTL_CMRR_ENABLE
+        | VRR_CTL_FLIP_LINE_EN
+        | u32::from(timings.guardband);
     assert_eq!(io.written(base + TRANS_VRR_CTL_OFFSET), vec![expected_ctl]);
     assert!(is_cmrr_active(&io, trans));
 
     // Disable CMRR
     cmrr_disable(&io, trans, DisplayVrrIp::Display14).unwrap();
-    let expected_disable_ctl = VRR_CTL_FLIP_LINE_EN | 42;
+    // Disable is a read-modify-write: it clears VRR_ENABLE and
+    // CMRR_ENABLE and preserves the guardband the enable
+    // programmed — NOT Test 6's 42, which was copy-pasted here
+    // (Test 6 enables with an explicit guardband of 42; this
+    // test enables with timings.guardband).
+    let expected_disable_ctl = VRR_CTL_FLIP_LINE_EN | u32::from(timings.guardband);
     assert_eq!(
         io.written(base + TRANS_VRR_CTL_OFFSET),
         vec![expected_ctl, expected_disable_ctl]
@@ -736,6 +751,15 @@ kernel_test_in!(
 fn smoke_intel_vrr_state_mode_and_rate_accessors() -> TestResult {
     let crtc_id = 1;
     let m = mode_1080p60();
+
+    // VRR_STATE is process-global: earlier tests in this binary
+    // legitimately leave a mode behind — the DP `connect()` smokes
+    // run on Pipe A and publish the sink mode (2560x1440 @ 241.5 MHz
+    // from the QHD EDID fixture) via `recompute_timings_for_modeset`,
+    // and nothing clears the slot. Reset it first so this test
+    // checks the accessors, not test execution order.
+    VRR_STATE.set_mode(crtc_id, None);
+    VRR_STATE.set_cmrr_rate(crtc_id, None);
 
     assert_eq!(VRR_STATE.mode(crtc_id), None);
     assert_eq!(VRR_STATE.cmrr_rate(crtc_id), None);
