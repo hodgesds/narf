@@ -876,8 +876,14 @@ async unsafe fn resume_gated(runtime: bool) -> Result<(), boot::Error> {
     };
     // SAFETY: parked by `suspend_device` with the matching flavor.
     let result = if runtime {
+        // SAFETY: the parked state was written by `runtime_suspend`
+        // (matching flavor checked above); the retained operation holds
+        // RECOVERY for the whole resume.
         unsafe { resume_retained() }.await
     } else {
+        // SAFETY: the parked state was written by `prepare_suspend`
+        // (matching flavor checked above); the retained operation holds
+        // RECOVERY for the whole resume.
         unsafe { resume_rebuilt(&mut suspended) }.await
     };
     use core::fmt::Write as _;
@@ -934,14 +940,15 @@ async unsafe fn resume_rebuilt(suspended: &mut Suspended) -> Result<(), boot::Er
     }
     // Retained before running, so cancellation keeps the new owner.
     let boot = owner.insert(new);
-    let report = boot.run().await;
-    if let Err(error) = report {
-        return Err(error);
-    }
+    boot.run().await?;
     start_services(boot).await;
     relight_after_recovery();
     drop(owner);
     // Best effort, as in `resume_retained`.
+    // SAFETY: `boot.run()` succeeded above, so the boot published these
+    // controls; `start_services` started the GC MMIO clients (CS/TDR),
+    // which take a GFXOFF reference; the OWNER lock was dropped just
+    // above and this task holds no lock the platform takes.
     if let Err(error) = unsafe { replace_power_saving(requested_power_saving()) }.await {
         use core::fmt::Write as _;
         let _ = writeln!(
