@@ -117,7 +117,7 @@ process_snapshots() {
                 pid=${process##*/}
                 printf -v sample '%spid=%s comm=%s\n' "$sample" "$pid" "$comm"
                 case "$comm" in
-                    systemd|plasmalogin*|plasma-login*|startplasma*|kwin*|plasma*|ksplash*|kded*|konsole*|cachyos-hello|systemd-execut*|systemd-tmpfile*|mount|\(mount\)|dbus*|systemd-logind|systemd-journal*|journalctl|timeout)
+                    systemd|plasmalogin*|plasma-login*|startplasma*|kwin*|systemd-execut*|systemd-tmpfile*|mount|\(mount\)|dbus*|systemd-logind|systemd-journal*|journalctl|timeout)
                         for field in status syscall wchan; do
                             if [ -r "$process/$field" ]; then
                                 printf -v sample '%s%s:\n%s\n' "$sample" "$field" "$(<"$process/$field")"
