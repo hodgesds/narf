@@ -103,6 +103,23 @@ pub const EXEC_BATCH_FIRST: u64 = 1 << 18;
 pub const EXEC_FENCE_ARRAY: u64 = 1 << 19;
 pub const EXEC_FENCE_SUBMIT: u64 = 1 << 20;
 pub const EXEC_USE_EXTENSIONS: u64 = 1 << 21;
+
+/// Execbuffer extension names (`drm_i915_gem_execbuffer_ext_*`,
+/// include/uapi/drm/i915_drm.h). TIMELINE_FENCES = 0 is VERIFIED against the
+/// kernel uAPI documentation rendered from that header. PERF = 1 is
+/// UNVERIFIED: it is the next extension id in the series that added these
+/// two extensions (timeline fences, then the perf config), in that order;
+/// confirm against i915_drm.h before relying on the value on silicon.
+pub const EXECBUFFER_EXT_TIMELINE_FENCES: u32 = 0;
+pub const EXECBUFFER_EXT_PERF: u32 = 1;
+
+/// `struct drm_i915_gem_execbuffer_ext_perf` wire layout: a 32-byte
+/// `i915_user_extension` base, then `flags` (MBZ) and `oa_format`. The base
+/// size is VERIFIED (see `user_extensions`); the field order after the base
+/// is UNVERIFIED against the uAPI header — confirm before relying on it on
+/// silicon. Offsets are byte offsets from the extension struct's start.
+pub const EXECBUFFER_EXT_PERF_FLAGS_OFF: u64 = 32;
+pub const EXECBUFFER_EXT_PERF_OA_FORMAT_OFF: u64 = 40;
 pub const OBJECT_WRITE: u64 = 1 << 2;
 pub const OBJECT_SUPPORTS_48B: u64 = 1 << 3;
 pub const OBJECT_PINNED: u64 = 1 << 4;

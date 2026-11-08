@@ -1959,7 +1959,13 @@ fn smoke_i915_perf_open_add_remove_config_and_stream() -> TestResult {
     }
 
     assert_eq!(
-        ready(i915_open(Some(backend.clone()), 0x3000, &wire, ALLOW)),
+        ready(i915_open(
+            Some(backend.clone()),
+            0x3000,
+            &wire,
+            &|_, _| None,
+            ALLOW
+        )),
         Ok(41)
     );
     let file = wire.file();
@@ -2010,6 +2016,411 @@ fn smoke_oa_test_session_i915_header() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_test_session_i915_header
+);
+
+/// A fixture model of the render namespace's pin lookup: gem handles
+/// 1..=8 exist; anything else is unknown. Records every pin and release
+/// so the open/close lifecycle is observable without a render file. The
+/// hardware id is the gem handle, matching the production lookup's model
+/// until the engine layer carries a distinct LRC tag.
+struct PinModel {
+    pinned: Arc<IrqSafeSpinLock<Vec<u32>>>,
+    released: Arc<IrqSafeSpinLock<Vec<u32>>>,
+}
+
+impl PinModel {
+    fn new() -> Self {
+        Self {
+            pinned: Arc::new(IrqSafeSpinLock::new(Vec::new())),
+            released: Arc::new(IrqSafeSpinLock::new(Vec::new())),
+        }
+    }
+
+    fn lookup(&self) -> impl Fn(u32, bool) -> Option<PinToken> + Sync {
+        let pinned = self.pinned.clone();
+        let released = self.released.clone();
+        move |id: u32, _hold: bool| -> Option<PinToken> {
+            if !(1..=8).contains(&id) {
+                return None;
+            }
+            pinned.lock().push(id);
+            let released = released.clone();
+            Some(PinToken::new(
+                id,
+                id,
+                Arc::new(move |id| {
+                    released.lock().push(id);
+                }),
+            ))
+        }
+    }
+}
+
+/// Drive `i915_open` with a property list, as the smoke test does by hand.
+fn open_i915_props(
+    backend: &Arc<Backend>,
+    wire: &Wire,
+    props: &[(u64, u64)],
+    pin: ContextPin<'_>,
+) -> Result<u64, Error> {
+    let mut open_bytes = [0u8; 16];
+    put32(&mut open_bytes, 0, 0);
+    put32(&mut open_bytes, 4, props.len() as u32);
+    put64(&mut open_bytes, 8, 0x3100);
+    wire.put(0x3000, &open_bytes);
+    for (i, &(prop_id, val)) in props.iter().enumerate() {
+        let at = 0x3100 + i as u64 * 16;
+        let mut p = [0u8; 16];
+        put64(&mut p, 0, prop_id);
+        put64(&mut p, 8, val);
+        wire.put(at, &p);
+    }
+    ready(i915_open(Some(backend.clone()), 0x3000, wire, pin, ALLOW))
+}
+
+/// The session an `i915_open` attached to the fixture backend's unit.
+fn attached_session(backend: &Arc<Backend>) -> Arc<Session> {
+    backend
+        .unit
+        .lock()
+        .as_ref()
+        .unwrap()
+        .session
+        .clone()
+        .unwrap()
+}
+
+fn smoke_i915_ctx_handle_open_pins_context_and_releases_on_close() -> TestResult {
+    let backend = Backend::new(device(40, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let model = PinModel::new();
+    let pin = model.lookup();
+    let props = [
+        (crate::intel_gpu_uapi::PERF_PROP_SAMPLE_OA, 1u64),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_METRICS_SET, config),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_FORMAT, 10),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_EXPONENT, 5),
+        (crate::intel_gpu_uapi::PERF_PROP_CTX_HANDLE, 3),
+    ];
+    assert_eq!(open_i915_props(&backend, &wire, &props, &pin), Ok(41));
+    assert_eq!(*model.pinned.lock(), vec![3]);
+    assert!(model.released.lock().is_empty());
+    let session = attached_session(&backend);
+    assert_eq!(
+        session.pinned_ctx(),
+        Some(PinnedContext {
+            gem_handle: 3,
+            specific_ctx_id: 3,
+            specific_ctx_id_mask: CTX_ID_MASK,
+        })
+    );
+    assert!(!session.no_preempt());
+    drop(wire.file());
+    assert_eq!(*model.released.lock(), vec![3]);
+    backend.poll(1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_i915_ctx_handle_open_pins_context_and_releases_on_close
+);
+
+fn smoke_i915_ctx_handle_open_unknown_context_fails() -> TestResult {
+    let backend = Backend::new(device(41, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let model = PinModel::new();
+    let pin = model.lookup();
+    let base = [
+        (crate::intel_gpu_uapi::PERF_PROP_SAMPLE_OA, 1u64),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_METRICS_SET, config),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_FORMAT, 10),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_EXPONENT, 5),
+    ];
+    // Handle 9 names no context in the fixture namespace.
+    let mut props = base.to_vec();
+    props.push((crate::intel_gpu_uapi::PERF_PROP_CTX_HANDLE, 9));
+    assert_eq!(
+        open_i915_props(&backend, &wire, &props, &pin),
+        Err(Error::Fs(FsError::NotFound))
+    );
+    assert!(model.pinned.lock().is_empty());
+    // A handle that does not fit in a u32 names no gem context either.
+    // The failed open above released its permit (Permit::drop), so this
+    // second attempt is not shadowed by the first.
+    let mut props = base.to_vec();
+    props.push((crate::intel_gpu_uapi::PERF_PROP_CTX_HANDLE, 0x1_0000_0005));
+    assert_eq!(
+        open_i915_props(&backend, &wire, &props, &pin),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+    assert!(model.pinned.lock().is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_i915_ctx_handle_open_unknown_context_fails
+);
+
+fn smoke_i915_hold_preemption_requires_single_context() -> TestResult {
+    let backend = Backend::new(device(42, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let model = PinModel::new();
+    let pin = model.lookup();
+    // HOLD_PREEMPTION with no CTX_HANDLE: there is no context to hold
+    // preemption for.
+    let props = [
+        (crate::intel_gpu_uapi::PERF_PROP_SAMPLE_OA, 1u64),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_METRICS_SET, config),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_FORMAT, 10),
+        (crate::intel_gpu_uapi::PERF_PROP_HOLD_PREEMPTION, 1u64),
+    ];
+    assert_eq!(
+        open_i915_props(&backend, &wire, &props, &pin),
+        Err(Error::Fs(FsError::InvalidData))
+    );
+    assert!(model.pinned.lock().is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_i915_hold_preemption_requires_single_context
+);
+
+fn smoke_i915_hold_preemption_open_records_no_preempt() -> TestResult {
+    let backend = Backend::new(device(43, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let model = PinModel::new();
+    let pin = model.lookup();
+    let props = [
+        (crate::intel_gpu_uapi::PERF_PROP_SAMPLE_OA, 1u64),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_METRICS_SET, config),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_FORMAT, 10),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_EXPONENT, 5),
+        (crate::intel_gpu_uapi::PERF_PROP_CTX_HANDLE, 3),
+        (crate::intel_gpu_uapi::PERF_PROP_HOLD_PREEMPTION, 1u64),
+    ];
+    assert_eq!(open_i915_props(&backend, &wire, &props, &pin), Ok(41));
+    assert_eq!(*model.pinned.lock(), vec![3]);
+    let session = attached_session(&backend);
+    assert!(session.no_preempt());
+    assert_eq!(session.pinned_ctx().map(|p| p.gem_handle), Some(3));
+    drop(wire.file());
+    assert_eq!(*model.released.lock(), vec![3]);
+    backend.poll(1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_i915_hold_preemption_open_records_no_preempt
+);
+
+/// A 256-byte OA report whose words the filter can read: word 0 is the
+/// RPT_ID/reason word, word 2 the CTX_ID field.
+fn report256(reason: u32, ctx_id: u32) -> [u8; 256] {
+    let mut report = [0u8; 256];
+    report[0..4].copy_from_slice(&reason.to_le_bytes());
+    report[4..8].copy_from_slice(&0x1234u32.to_le_bytes());
+    report[8..12].copy_from_slice(&ctx_id.to_le_bytes());
+    for (i, chunk) in report[12..].chunks_exact_mut(4).enumerate() {
+        chunk.copy_from_slice(&(0xaa00_0000u32 | i as u32).to_le_bytes());
+    }
+    report
+}
+
+fn smoke_i915_filter_report_squashes_foreign_and_invalid_ctx() -> TestResult {
+    // 32-bit header: CTX_ID is report[2].
+    let dev = device(48, MTL, 1270);
+    let session = test_session_i915(dev, 3, DEFAULT_BUFFER, Some(5), &[(0x9888, 1)]);
+    assert!(!session.format.header64);
+    session.set_pin(PinToken::new(3, 3, Arc::new(|_: u32| {})));
+    let valid = GEN12_VALID_CTX_BIT | 0x42;
+    let mut own = report256(valid, 3);
+    session.filter_report(&mut own);
+    assert_eq!(u32::from_le_bytes(own[8..12].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(own[0..4].try_into().unwrap()), valid);
+    let mut foreign = report256(valid, 9);
+    session.filter_report(&mut foreign);
+    assert_eq!(
+        u32::from_le_bytes(foreign[8..12].try_into().unwrap()),
+        INVALID_CTX_ID
+    );
+    assert_eq!(u32::from_le_bytes(foreign[0..4].try_into().unwrap()), valid);
+    let mut invalid = report256(0x42, 3);
+    session.filter_report(&mut invalid);
+    assert_eq!(
+        u32::from_le_bytes(invalid[8..12].try_into().unwrap()),
+        INVALID_CTX_ID
+    );
+    assert_eq!(u32::from_le_bytes(invalid[0..4].try_into().unwrap()), 0x42);
+
+    // No pin: the invalid-bit squash still applies (Linux squashes it in
+    // the general append path), but a foreign id is left alone — there is
+    // no single context to filter against.
+    let dev = device(39, MTL, 1270);
+    let open_session = test_session_i915(dev, 3, DEFAULT_BUFFER, Some(5), &[(0x9888, 1)]);
+    assert!(open_session.pinned_ctx().is_none());
+    let mut invalid_open = report256(0x42, 3);
+    open_session.filter_report(&mut invalid_open);
+    assert_eq!(
+        u32::from_le_bytes(invalid_open[8..12].try_into().unwrap()),
+        INVALID_CTX_ID
+    );
+    let mut foreign_open = report256(valid, 9);
+    open_session.filter_report(&mut foreign_open);
+    assert_eq!(
+        u32::from_le_bytes(foreign_open[8..12].try_into().unwrap()),
+        9
+    );
+
+    // 64-bit header: CTX_ID is report[4]; report[2] is untouched.
+    let dev = device(49, MTL, 1270);
+    let session64 = test_session_i915(dev, 6, DEFAULT_BUFFER, None, &[(0x9888, 1)]);
+    assert!(session64.format.header64);
+    assert_eq!(session64.format.size, 320);
+    session64.set_pin(PinToken::new(3, 3, Arc::new(|_: u32| {})));
+    let mut report64 = [0u8; 320];
+    report64[0..4].copy_from_slice(&valid.to_le_bytes());
+    report64[8..12].copy_from_slice(&0x7777u32.to_le_bytes());
+    report64[16..20].copy_from_slice(&9u32.to_le_bytes());
+    session64.filter_report(&mut report64);
+    assert_eq!(
+        u32::from_le_bytes(report64[16..20].try_into().unwrap()),
+        INVALID_CTX_ID
+    );
+    assert_eq!(
+        u32::from_le_bytes(report64[8..12].try_into().unwrap()),
+        0x7777
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_i915_filter_report_squashes_foreign_and_invalid_ctx
+);
+
+fn smoke_i915_read_filters_foreign_context_reports() -> TestResult {
+    let backend = Backend::new(device(38, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let model = PinModel::new();
+    let pin = model.lookup();
+    let props = [
+        (crate::intel_gpu_uapi::PERF_PROP_SAMPLE_OA, 1u64),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_METRICS_SET, config),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_FORMAT, 10),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_EXPONENT, 5),
+        (crate::intel_gpu_uapi::PERF_PROP_CTX_HANDLE, 3),
+    ];
+    assert_eq!(open_i915_props(&backend, &wire, &props, &pin), Ok(41));
+    let file = wire.file();
+    assert_eq!(ready(file.ioctl_user(ENABLE, 0, &wire)), Ok(0));
+
+    // Two reports in the ring: the pinned context's, then another
+    // context's. Only the second may be squashed.
+    let hw = &backend.hw;
+    let valid = GEN12_VALID_CTX_BIT | 0x42;
+    for (base, ctx_id) in [(0u32, 3u32), (256u32, 9u32)] {
+        let report = report256(valid, ctx_id);
+        for (i, chunk) in report.chunks_exact(4).enumerate() {
+            hw.word(
+                base + i as u32 * 4,
+                u32::from_le_bytes(chunk.try_into().unwrap()),
+            );
+        }
+    }
+    hw.set(OATAILPTR, BASE + 512);
+    let mut out = vec![0u8; 2 * (8 + 256)];
+    let n = ready(file.read_with_options(0, &mut out, ReadOptions { nonblocking: true })).unwrap();
+    assert_eq!(n, 2 * (8 + 256));
+    // Record 0: report at out[8..264]; CTX_ID at out[16..20].
+    assert_eq!(u32::from_le_bytes(out[16..20].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), valid);
+    // Record 1: report at out[272..528]; CTX_ID at out[280..284].
+    assert_eq!(
+        u32::from_le_bytes(out[280..284].try_into().unwrap()),
+        INVALID_CTX_ID
+    );
+    // The squash leaves the valid bit alone.
+    assert_eq!(u32::from_le_bytes(out[272..276].try_into().unwrap()), valid);
+    drop(file);
+    backend.poll(1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_i915_read_filters_foreign_context_reports
+);
+
+/// A 64-byte execbuffer2 request at 0x4000 with one object at 0x5000:
+/// `cliprects_ptr` at 0x6000 heads the extension chain when
+/// USE_EXTENSIONS is set, and is a plain zero otherwise.
+fn exec_wire_with_extensions(wire: &Wire, use_extensions: bool) -> crate::intel_gpu_exec::ExecWire {
+    let mut request = [0u8; 64];
+    put64(&mut request, 0, 0x5000);
+    put32(&mut request, 8, 1);
+    put64(
+        &mut request,
+        40,
+        crate::intel_gpu_uapi::EXEC_NO_RELOC
+            | if use_extensions {
+                crate::intel_gpu_uapi::EXEC_USE_EXTENSIONS
+            } else {
+                0
+            },
+    );
+    if use_extensions {
+        put64(&mut request, 32, 0x6000);
+    }
+    wire.put(0x4000, &request);
+    wire.put(0x5000, &[0u8; 56]);
+    crate::intel_gpu_exec::ExecWire::read(wire, 0x4000, true).unwrap()
+}
+
+/// One `i915_user_extension` head at `at`: 32-byte base (next, name,
+/// flags, rsvd) plus the ext_perf `flags` and `oa_format` words.
+fn perf_extension_wire(wire: &Wire, at: u64, next: u64, name: u32, flags: u64, oa_format: u64) {
+    let mut ext = [0u8; 48];
+    put64(&mut ext, 0, next);
+    put32(&mut ext, 8, name);
+    put64(&mut ext, 32, flags);
+    put64(&mut ext, 40, oa_format);
+    wire.put(at, &ext);
+}
+
+fn smoke_execbuffer_ext_perf_parses_oa_format() -> TestResult {
+    use crate::intel_gpu_uapi::EXECBUFFER_EXT_PERF;
+    let wire = Wire::new();
+    // A perf extension with a zero flags word yields its OA format.
+    perf_extension_wire(&wire, 0x6000, 0, EXECBUFFER_EXT_PERF, 0, 10);
+    let exec = exec_wire_with_extensions(&wire, true);
+    assert_eq!(exec.perf_extension(&wire), Ok(Some(10)));
+    // Without USE_EXTENSIONS the cliprects fields are clip rects, not
+    // extensions: no walk happens.
+    let exec = exec_wire_with_extensions(&wire, false);
+    assert_eq!(exec.perf_extension(&wire), Ok(None));
+    // An unknown extension name is rejected.
+    perf_extension_wire(&wire, 0x6000, 0, 99, 0, 10);
+    let exec = exec_wire_with_extensions(&wire, true);
+    assert_eq!(exec.perf_extension(&wire), Err(FsError::InvalidData));
+    // A second perf extension is rejected (Linux holds each extension
+    // at most once).
+    perf_extension_wire(&wire, 0x6000, 0x6040, EXECBUFFER_EXT_PERF, 0, 10);
+    perf_extension_wire(&wire, 0x6040, 0, EXECBUFFER_EXT_PERF, 0, 10);
+    let exec = exec_wire_with_extensions(&wire, true);
+    assert_eq!(exec.perf_extension(&wire), Err(FsError::InvalidData));
+    // A nonzero perf flags word is rejected (MBZ).
+    perf_extension_wire(&wire, 0x6000, 0, EXECBUFFER_EXT_PERF, 1, 10);
+    let exec = exec_wire_with_extensions(&wire, true);
+    assert_eq!(exec.perf_extension(&wire), Err(FsError::InvalidData));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_execbuffer_ext_perf_parses_oa_format
 );
 
 fn smoke_oa_exec_queue_oar_oac_streams() -> TestResult {
