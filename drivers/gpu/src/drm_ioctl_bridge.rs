@@ -6060,9 +6060,25 @@ fn atomic_commit(
                             // set_out_fence_for_crtc treats 0 as clear).
                             crtc_state.out_fence_ptr = (value != 0).then_some(value);
                         }
-                        // Not a modeset: amdgpu_dm reprograms DRR in place.
-                        CRTC_VRR_ENABLED_PROP_ID => vrr_enabled
-                            .push((object_id, vrr_enabled_value(&card, object_id, value)?)),
+                        CRTC_VRR_ENABLED_PROP_ID => {
+                            let value = vrr_enabled_value(&card, object_id, value)?;
+                            vrr_enabled.push((object_id, value));
+                            // The value lives in atomic state now (Linux:
+                            // `drm_crtc_state::vrr_enabled`), not only in
+                            // the side-channel `vrr_enabled` vec.
+                            crtc_state.vrr_enabled = Some(value);
+                            // Linux `intel_vrr_check_modeset`: a
+                            // `uapi.vrr_enabled` change is a full modeset
+                            // on Intel. Other drivers (amdgpu_dm
+                            // reprograms DRR in place; virtio has no
+                            // modeset) keep the old no-modeset shape.
+                            if crate::drm_registry::driver_name(card_index) == Some("intel-gpu")
+                                && crtc_vrr_enabled(&card, object_id)
+                                    .is_some_and(|old| old != value)
+                            {
+                                crtc_state.vrr_changed = true;
+                            }
+                        }
                         _ => return Err(invalid_at(line!())),
                     }
                 }
@@ -6087,7 +6103,8 @@ fn atomic_commit(
                             card.committed_timing(object_id)
                                 .is_none_or(|old| !crate::drm::card::mode_equal(&old, wire))
                         });
-                crtc_state.mode_changed = crtc_state.mode != old_mode || timing_changed;
+                crtc_state.mode_changed =
+                    crtc_state.mode != old_mode || timing_changed || crtc_state.vrr_changed;
                 crtc_state.active_changed = crtc_state.active != old_active;
                 if let Some(crtc_ids) = event_crtc_ids.as_mut() {
                     if !crtc_ids.contains(&crtc_state.id) {
@@ -6173,11 +6190,12 @@ fn atomic_commit(
                     let old = card.crtc(c.id).ok().map(|o| (o.enabled, o.mode));
                     let _ = writeln!(
                         narf_console::Writer,
-                        "  drm: ModesetNotAllowed crtc {}: mode_changed={} active_changed={} connectors_changed={} old={:?} new=({}, {:?})",
+                        "  drm: ModesetNotAllowed crtc {}: mode_changed={} active_changed={} connectors_changed={} vrr_changed={} old={:?} new=({}, {:?})",
                         c.id,
                         c.mode_changed,
                         c.active_changed,
                         c.connectors_changed,
+                        c.vrr_changed,
                         old,
                         c.active,
                         c.mode

@@ -272,6 +272,24 @@ impl IntelDpBridge {
                     mode.v_active,
                     mode.pixel_clock_khz,
                 );
+                // Per-modeset VRR compute (Pipe A only): the timings
+                // are recomputed from the mode this modeset committed
+                // and the range a fresh AUX read reports for the sink,
+                // instead of reusing install-time timings. An
+                // unreachable AUX (or a non-capable sink) clears the
+                // stored range/timings, so no stale timings can ever
+                // engage VRR for an unknown sink.
+                if pipe == crate::intel_gpu_pipes::Pipe::A {
+                    let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_gen12_platform(family);
+                    let range = crate::intel_gpu_dp::vrr_range_from_aux(&mmio, ddi);
+                    crate::intel_gpu_vrr::recompute_timings_for_modeset(
+                        1,
+                        &mode,
+                        range,
+                        ip,
+                        crate::intel_gpu_vrr::VrrComputeOpts::default(),
+                    );
+                }
                 Ok(())
             }
             Err(ModesetError::EdidUnavailable) => {

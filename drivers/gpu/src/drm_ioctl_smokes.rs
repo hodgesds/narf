@@ -136,6 +136,26 @@ fn register_test_virtio_card() -> u32 {
     idx
 }
 
+/// A test Intel card: same shape as the virtio fixture, but driven by
+/// `IntelGpuCard` so the bridge resolves `driver_name(idx)` to
+/// "intel-gpu" and the Intel-only VRR modeset forcing applies.
+fn register_test_intel_card() -> u32 {
+    let name = format!("card{}", crate::drm_registry::count());
+    let card = Arc::new(crate::drm_devfs_bridge::IntelGpuCard::new(
+        name, 0x8086, 0x9a49, 0x8086, 0x0000,
+    ));
+    let mut state = make_test_card();
+    state.driver_name = "intel-gpu";
+    state.driver_desc = "NARF Intel GPU driver";
+    state.native_atomic = true;
+    state.version = (0, 1, 0);
+    let idx = crate::drm_registry::register_drm_card_with_state(card, state);
+    if let Some(ms) = crate::drm_registry::mode_state(idx) {
+        ms.lock().master_open(SMOKE_MASTER_ID);
+    }
+    idx
+}
+
 /// The actual Linux ADDFB word and 28-byte buffer through the user-copy
 /// bridge, including preserving every input byte and adjacent memory.
 fn smoke_drm_legacy_addfb_user_buffer_and_rmfb() -> TestResult {
@@ -1044,6 +1064,74 @@ fn smoke_drm_ioctl_vrr_properties() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_vrr_properties);
+
+// ── Atomic VRR on Intel: a toggle is a modeset ────────────────────────────
+//
+// Linux `intel_vrr_check_modeset` forces a full modeset when
+// `uapi.vrr_enabled` changes, so an Intel atomic commit that toggles
+// VRR_ENABLED needs ALLOW_MODESET; the same commit on virtio needs
+// none (the test above). A same-value commit needs no modeset, and
+// TEST_ONLY validates without applying.
+fn smoke_drm_ioctl_vrr_intel_modeset() -> TestResult {
+    let idx = register_test_intel_card();
+    let Some(ms) = crate::drm_registry::mode_state(idx) else {
+        return TestResult::Fail("no intel mode state");
+    };
+    ms.lock().vrr_enabled = alloc::vec![(11, false), (12, false)];
+    let atomic = |flags: u32, value: u64| {
+        let objects = [11u32];
+        let prop_counts = [1u32];
+        let props = [0x63u32];
+        let values = [value];
+        let mut req = DrmModeAtomicUapi {
+            flags,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: prop_counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    let value = |crtc: u32| {
+        ms.lock()
+            .vrr_enabled
+            .iter()
+            .find(|&&(id, _)| id == crtc)
+            .map(|&(_, v)| v)
+    };
+    // A toggle without ALLOW_MODESET is refused and applies nothing.
+    if atomic(0, 1) != Err(FsError::InvalidData) || value(11) != Some(false) {
+        return TestResult::Fail("Intel VRR toggle without ALLOW_MODESET");
+    }
+    // TEST_ONLY with ALLOW_MODESET validates without applying.
+    if atomic(0x0100 | 0x0400, 1) != Ok(0) || value(11) != Some(false) {
+        return TestResult::Fail("Intel VRR TEST_ONLY applied");
+    }
+    // The same toggle with ALLOW_MODESET commits.
+    if atomic(0x0400, 1) != Ok(0) || value(11) != Some(true) || value(12) != Some(false) {
+        return TestResult::Fail("Intel VRR toggle with ALLOW_MODESET");
+    }
+    // A same-value commit needs no modeset.
+    if atomic(0, 1) != Ok(0) || value(11) != Some(true) {
+        return TestResult::Fail("Intel VRR same-value needs modeset");
+    }
+    // Toggling back without ALLOW_MODESET is refused again.
+    if atomic(0, 0) != Err(FsError::InvalidData) || value(11) != Some(true) {
+        return TestResult::Fail("Intel VRR toggle-back without ALLOW_MODESET");
+    }
+    if atomic(0x0400, 0) != Ok(0) || value(11) != Some(false) {
+        return TestResult::Fail("Intel VRR toggle-back with ALLOW_MODESET");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_vrr_intel_modeset);
 
 // ── CRTC CTM / GAMMA_LUT and connector Colorspace / HDR_OUTPUT_METADATA ─
 //

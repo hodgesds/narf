@@ -361,6 +361,8 @@ fn smoke_atomic_add_crtc_update_active() -> TestResult {
         mode_changed: true,
         active_changed: true,
         connectors_changed: false,
+        vrr_enabled: None,
+        vrr_changed: false,
         out_fence_ptr: None,
     });
 
@@ -467,6 +469,8 @@ fn smoke_atomic_check_only_happy_path() -> TestResult {
         mode_changed: true,
         active_changed: true,
         connectors_changed: false,
+        vrr_enabled: None,
+        vrr_changed: false,
         out_fence_ptr: None,
     });
     state.connectors.push(ConnectorState {
@@ -533,6 +537,8 @@ fn smoke_atomic_check_only_rejects_invalid_mode() -> TestResult {
         mode_changed: true,
         active_changed: true,
         connectors_changed: false,
+        vrr_enabled: None,
+        vrr_changed: false,
         out_fence_ptr: None,
     });
     state.planes.push(PlaneState {
@@ -632,6 +638,8 @@ fn smoke_atomic_commit_applies_crtc_mode() -> TestResult {
         mode_changed: true,
         active_changed: true,
         connectors_changed: false,
+        vrr_enabled: None,
+        vrr_changed: false,
         out_fence_ptr: None,
     });
     state.connectors.push(ConnectorState {
@@ -724,6 +732,8 @@ fn smoke_atomic_commit_page_flip_updates_primary_fb() -> TestResult {
             mode_changed: true,
             active_changed: true,
             connectors_changed: false,
+            vrr_enabled: None,
+            vrr_changed: false,
             out_fence_ptr: None,
         });
         state.connectors.push(ConnectorState {
@@ -985,6 +995,8 @@ fn smoke_atomic_syncobj_signalled_after_commit() -> TestResult {
         mode_changed: true,
         active_changed: true,
         connectors_changed: false,
+        vrr_enabled: None,
+        vrr_changed: false,
         out_fence_ptr: None,
     });
     state.connectors.push(ConnectorState {

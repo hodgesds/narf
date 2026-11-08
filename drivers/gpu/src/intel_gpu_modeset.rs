@@ -31,11 +31,18 @@
 //! ## Out of scope (Stage 2+)
 //!
 //! - PSR (Panel Self Refresh) — eDP power saving
-//! - VRR (Variable Refresh Rate)
 //! - HDR metadata / wide-gamut colorspace
 //! - Cursor + overlay + sprite planes
 //! - DMC firmware loading (required for runtime PM, not boot
 //!   modeset)
+//!
+//! VRR (Variable Refresh Rate) is NOT out of scope any more: the
+//! foundation landed in #1768 (honest sink capability via
+//! `intel_gpu_vrr::sink_vrr_range`, `vrr_enabled` in atomic
+//! `CrtcState` forcing a modeset on toggle, and per-modeset timing
+//! recompute from the committed mode + sink range). What remains in
+//! later lanes is the sequencing (modeset/push/disable, #1769),
+//! DPCD+PSR (#1770), CMRR (#1771) and readback (#1772).
 //!
 //! ## Reference
 //!

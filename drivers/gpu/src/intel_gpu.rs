@@ -1678,7 +1678,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 timings: alloc::vec::Vec::new(),
                 color_format: None,
                 broadcast_rgb: Some(0),
-                vrr_capable: Some(true),
+                // Unknown until the panel's EDID/DPCD discovery runs:
+                // the old hardcoded `Some(true)` claimed VRR for a
+                // sink whose range no one had read. `None` withholds
+                // the `vrr_capable` property until discovery publishes
+                // the range (DP: `probe_sink`; the panel range is
+                // published by eDP discovery).
+                vrr_capable: None,
                 colorspace: Some(0),
                 hdr_output_metadata: Some(0),
                 max_bpc: Some(8),

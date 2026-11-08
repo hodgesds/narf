@@ -128,6 +128,9 @@ impl Io {
                 tps3_supported: true,
                 enhanced_framing: true,
                 training_aux_rd_interval: 0,
+                // The fixture link never advertised Ignore-MSA, so
+                // no sink on it is VRR-capable.
+                msa_timing_par_ignored: false,
             },
             audio_published: false,
         }

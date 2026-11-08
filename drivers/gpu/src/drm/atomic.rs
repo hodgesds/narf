@@ -107,6 +107,16 @@ pub struct CrtcState {
     pub active_changed: bool,
     /// Was the connector binding changed?
     pub connectors_changed: bool,
+    /// The `VRR_ENABLED` value this commit requests, when the commit
+    /// touches the property (`None` = untouched). Linux carries
+    /// `vrr_enabled` in `struct drm_crtc_state` the same way.
+    pub vrr_enabled: Option<bool>,
+    /// Did the commit toggle `VRR_ENABLED` against the committed
+    /// value? Linux's `intel_vrr_check_modeset` forces a full
+    /// modeset on a toggle (`mode_changed = true`); the Intel
+    /// driver sets this, other drivers leave it clear (amdgpu_dm
+    /// reprograms DRR in place).
+    pub vrr_changed: bool,
     /// `OUT_FENCE_PTR` — a userspace `s32*` the commit writes a sync_file
     /// fd into; the fence signals at this commit's simulated vblank.
     /// `None` when the commit did not request an out-fence (a value of 0
@@ -118,7 +128,7 @@ impl CrtcState {
     /// Did this commit ask for a full modeset?  Linux uses
     /// `drm_atomic_crtc_needs_modeset` for the same predicate.
     pub fn needs_modeset(&self) -> bool {
-        self.mode_changed || self.active_changed || self.connectors_changed
+        self.mode_changed || self.active_changed || self.connectors_changed || self.vrr_changed
     }
 }
 
@@ -352,6 +362,14 @@ impl AtomicState {
                 .ok_or(AtomicError::UnknownCrtc)?;
             crtc.mode = cs.mode;
             crtc.enabled = cs.enable;
+            // The committed VRR state flows through the atomic commit
+            // like the mode does (Linux: `drm_crtc_state::vrr_enabled`);
+            // a commit that did not touch the property leaves it alone.
+            if let Some(vrr) = cs.vrr_enabled {
+                if let Some(slot) = card.vrr_enabled.iter_mut().find(|(id, _)| *id == cs.id) {
+                    slot.1 = vrr;
+                }
+            }
         }
         // Connectors — encoder binding.  Linux walks encoders too;
         // we keep encoder choice fixed (one encoder per connector).
