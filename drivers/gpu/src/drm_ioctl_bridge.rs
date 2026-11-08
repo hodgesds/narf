@@ -3658,27 +3658,29 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
 
     let values_ptr = u64::from_le_bytes(out[0..8].try_into().unwrap());
     let user_values_count = u32::from_le_bytes(out[56..60].try_into().unwrap());
-    if values_ptr != 0 && user_values_count as usize >= enums.len() {
-        let mut buf = alloc::vec![0u8; enums.len() * 8];
-        for (i, (val, _)) in enums.iter().enumerate() {
+    if values_ptr != 0 && user_values_count > 0 && !enums.is_empty() {
+        let n = (user_values_count as usize).min(enums.len());
+        let mut buf = alloc::vec![0u8; n * 8];
+        for (i, (val, _)) in enums[..n].iter().enumerate() {
             buf[i * 8..i * 8 + 8].copy_from_slice(&val.to_le_bytes());
         }
         // SAFETY: `values_ptr` is the user array out-pointer sized
-        // for `user_values_count` >= `enums.len()` entries of 8 bytes each.
+        // for at least `n` entries of 8 bytes each.
         unsafe { copy_out(values_ptr as usize, &buf)? };
     }
 
     let enum_blob_ptr = u64::from_le_bytes(out[8..16].try_into().unwrap());
     let user_enum_count = u32::from_le_bytes(out[60..64].try_into().unwrap());
-    if enum_blob_ptr != 0 && user_enum_count as usize >= enums.len() {
-        let mut buf = alloc::vec![0u8; enums.len() * 40];
-        for (i, (val, nm)) in enums.iter().enumerate() {
+    if enum_blob_ptr != 0 && user_enum_count > 0 && !enums.is_empty() {
+        let n = (user_enum_count as usize).min(enums.len());
+        let mut buf = alloc::vec![0u8; n * 40];
+        for (i, (val, nm)) in enums[..n].iter().enumerate() {
             let base = i * 40;
             buf[base..base + 8].copy_from_slice(&val.to_le_bytes());
-            buf[base + 8..base + 8 + nm.len()].copy_from_slice(nm);
+            buf[base + 8..base + 8 + nm.len().min(32)].copy_from_slice(&nm[..nm.len().min(32)]);
         }
         // SAFETY: `enum_blob_ptr` is the user enum-array out-pointer sized
-        // for `user_enum_count` >= `enums.len()` entries of 40 bytes each.
+        // for at least `n` entries of 40 bytes each.
         unsafe { copy_out(enum_blob_ptr as usize, &buf)? };
     }
     out[56..60].copy_from_slice(&(enums.len() as u32).to_le_bytes()); // count_values
@@ -5045,11 +5047,11 @@ fn handle_getpropblob(
         }
     };
 
-    // Second pass: drm_mode_getblob_ioctl copies only when the caller's
-    // length is exactly the blob's (a first pass with any other length,
-    // usually 0, just learns it).
-    if user_len as usize == edid.len() && !edid.is_empty() {
-        // SAFETY: user-supplied `data_ptr` the caller sized for edid.len().
+    // Second pass: drm_mode_getblob_ioctl copies when the caller's
+    // buffer is large enough for the blob (a first pass with 0 or smaller length
+    // just learns it).
+    if data_ptr != 0 && (user_len as usize) >= edid.len() && !edid.is_empty() {
+        // SAFETY: user-supplied `data_ptr` sized for >= edid.len().
         unsafe { copy_out(data_ptr as usize, &edid)? };
     }
     // Always report the true length (drives the caller's allocation).

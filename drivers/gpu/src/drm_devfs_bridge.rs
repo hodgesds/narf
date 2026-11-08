@@ -289,9 +289,17 @@ impl Drop for DriCardFile {
             ms.release_unique(self.open_id);
             #[cfg(feature = "amdgpu")]
             if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
-                for crtc in shown {
-                    if let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc) {
-                        crate::amdgpu_native_kms::request_display_active(display, false);
+                let live_opens = OPEN_COUNT.get(self.index as usize)
+                    .map_or(0, |c| c.load(core::sync::atomic::Ordering::Acquire));
+                // Only unlight the CRTCs if this was the final open of the device.
+                // During greeter->user session handoff, the user session already has
+                // card0 open; unlighting display causes the monitor to lose HDMI clock
+                // and flash black before the user compositor takes over.
+                if live_opens <= 1 {
+                    for crtc in shown {
+                        if let Some(display) = crate::amdgpu_native_kms::crtc_display(crtc) {
+                            crate::amdgpu_native_kms::request_display_active(display, false);
+                        }
                     }
                 }
             }

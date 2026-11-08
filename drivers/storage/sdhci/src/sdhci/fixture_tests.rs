@@ -1202,7 +1202,6 @@ impl FixtureTransport {
                 regs: [0; 0x100],
                 card_present: true,
                 image,
-                card_present: true,
                 read_stage: Vec::new(),
                 read_cursor: 0,
                 write_stage: Vec::new(),

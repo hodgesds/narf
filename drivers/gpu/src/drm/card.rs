@@ -23,6 +23,7 @@ use super::gem::GemTable;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 // ── Connector ──────────────────────────────────────────────────────────
 
@@ -1065,7 +1066,7 @@ pub struct Card {
     /// this is held. Replaces the old "every primary fd is implicitly master"
     /// model, which let a greeter and a user-session compositor both drive the
     /// same scanout with no handoff.
-    pub(crate) current_master: Option<u64>,
+    pub(crate) current_master: AtomicU64,
     /// Opens whose master has its unique name (the bus id) filled in by
     /// SET_VERSION 1.1+ (drm_set_busid). GET_UNIQUE answers an empty name
     /// until then, which libdrm's drmOpenByName depends on.
@@ -1356,7 +1357,7 @@ impl Card {
             next_property_blob_id: 1,
             vblank_seq: 0,
             next_vblank_ns: 0,
-            current_master: None,
+            current_master: AtomicU64::new(0),
             unique_masters: Vec::new(),
             released_backing: Vec::new(),
             magics: Vec::new(),
@@ -1430,14 +1431,29 @@ impl Card {
     /// becomes its master automatically. No-op if a master already exists —
     /// a later opener stays non-master until it runs `SET_MASTER`.
     pub fn master_open(&mut self, open_id: u64) {
-        if self.current_master.is_none() {
-            self.current_master = Some(open_id);
+        if open_id != 0 {
+            let _ = self.current_master.compare_exchange(
+                0,
+                open_id,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 
     /// Whether any open currently holds DRM master.
     pub fn has_master(&self) -> bool {
-        self.current_master.is_some()
+        self.current_master.load(Ordering::Acquire) != 0
+    }
+
+    /// The current DRM master open ID, if any.
+    pub fn current_master(&self) -> Option<u64> {
+        let cur = self.current_master.load(Ordering::Acquire);
+        if cur == 0 {
+            None
+        } else {
+            Some(cur)
+        }
     }
 
     /// Whether `open_id` is the current DRM master. Drives `DrmFileCtx`'s
@@ -1452,39 +1468,66 @@ impl Card {
     /// unique name was set (file_priv->master: the open's own master, or
     /// the current one it was opened under).
     pub fn has_unique(&self, open_id: u64) -> bool {
+        let cur = self.current_master.load(Ordering::Acquire);
         self.unique_masters.contains(&open_id)
-            || self
-                .current_master
-                .is_some_and(|m| self.unique_masters.contains(&m))
+            || (cur != 0 && self.unique_masters.contains(&cur))
     }
     /// The master's unique name goes with its last open.
     pub fn release_unique(&mut self, open_id: u64) {
         self.unique_masters.retain(|&o| o != open_id);
     }
     pub fn is_master(&self, open_id: u64) -> bool {
-        self.current_master == Some(open_id)
+        if open_id == 0 {
+            return false;
+        }
+        let cur = self.current_master.load(Ordering::Acquire);
+        if cur == 0 {
+            // Master-free device adopts the active primary client
+            // (e.g. user session compositor starting while greeter was exiting).
+            if self
+                .current_master
+                .compare_exchange(0, open_id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+            return self.current_master.load(Ordering::Acquire) == open_id;
+        }
+        cur == open_id
     }
 
     /// `DRM_IOCTL_SET_MASTER`. `Ok` if `open_id` already holds master or the
     /// device master was free (it now holds it); `Err` (→ `EBUSY`) if another
     /// open currently holds master. Mirrors `drm_setmaster_ioctl`.
     pub fn set_master(&mut self, open_id: u64) -> Result<(), MasterBusy> {
-        match self.current_master {
-            Some(m) if m == open_id => Ok(()),
-            Some(_) => Err(MasterBusy),
-            None => {
-                self.current_master = Some(open_id);
-                Ok(())
+        if open_id == 0 {
+            return Err(MasterBusy);
+        }
+        let cur = self.current_master.load(Ordering::Acquire);
+        if cur == open_id {
+            return Ok(());
+        }
+        if cur == 0 {
+            if self
+                .current_master
+                .compare_exchange(0, open_id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
             }
         }
+        Err(MasterBusy)
     }
 
     /// `DRM_IOCTL_DROP_MASTER`. `Ok` if `open_id` held master (now released);
     /// `Err` (→ `EINVAL`) if it was not the current master. Mirrors
     /// `drm_dropmaster_ioctl`, which returns `-EINVAL` for a non-master caller.
     pub fn drop_master(&mut self, open_id: u64) -> Result<(), NotCurrentMaster> {
-        if self.current_master == Some(open_id) {
-            self.current_master = None;
+        if self
+            .current_master
+            .compare_exchange(open_id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             Ok(())
         } else {
             Err(NotCurrentMaster)
@@ -1495,13 +1538,13 @@ impl Card {
     /// if this open held it, freeing the device for the next `SET_MASTER`
     /// (the greeter→user-session handoff path).
     pub fn master_release(&mut self, open_id: u64) {
-        if self.current_master == Some(open_id) {
-            self.current_master = None;
-            #[cfg(feature = "intel")]
-            {
-                self.intel_restore_pending |= self.intel_display;
-                self.intel_clear_ctm();
-            }
+        let _ = self
+            .current_master
+            .compare_exchange(open_id, 0, Ordering::AcqRel, Ordering::Acquire);
+        #[cfg(feature = "intel")]
+        {
+            self.intel_restore_pending |= self.intel_display;
+            self.intel_clear_ctm();
         }
     }
 
