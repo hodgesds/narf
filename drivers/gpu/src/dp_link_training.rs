@@ -834,6 +834,11 @@ pub fn train_link<A: AuxChannel>(
 const DPCD_DPCD_REV: u32 = 0x0_0000;
 const DPCD_MAX_LINK_RATE: u32 = 0x0_0001;
 const DPCD_MAX_LANE_COUNT: u32 = 0x0_0002;
+/// DPCD 0x0007 — `DPCD_MSA_TIMING_PAR_IGNORED` (bit 6): the sink
+/// ignores the MSA timing parameters, which is what lets the source
+/// vary the refresh rate (VESA Adaptive-Sync / Linux
+/// `drm_dp_sink_is_capable_without_timing_msa`).
+const DPCD_MSA_TIMING_PAR_IGNORED: u32 = 0x0_0007;
 const DPCD_TRAINING_AUX_RD_INTERVAL: u32 = 0x0_000E;
 
 /// Size of the receiver-capability field read in one burst.
@@ -888,6 +893,13 @@ pub struct DpcdCaps {
     pub tps3_supported: bool,
     /// `MAX_LANE_COUNT` bit 7 — enhanced framing supported.
     pub enhanced_framing: bool,
+    /// DPCD 0x0007 bit 6 — the sink ignores MSA timing parameters
+    /// (`DPCD_MSA_TIMING_PAR_IGNORED`). Linux's VRR capability gate
+    /// (`intel_vrr_is_capable`, via
+    /// `drm_dp_sink_is_capable_without_timing_msa`) requires this bit:
+    /// without it the sink holds the source to the MSA timings and the
+    /// refresh cannot vary.
+    pub msa_timing_par_ignored: bool,
     /// Raw `TRAINING_AUX_RD_INTERVAL` byte (DPCD 0x000E); see
     /// [`DpcdCaps::aux_rd_interval_us`].
     pub training_aux_rd_interval: u8,
@@ -905,6 +917,9 @@ impl DpcdCaps {
             max_lanes: lanes,
             tps3_supported: lane_byte & 0x40 != 0,
             enhanced_framing: lane_byte & 0x80 != 0,
+            msa_timing_par_ignored: raw[(DPCD_MSA_TIMING_PAR_IGNORED - DPCD_DPCD_REV) as usize]
+                & crate::amdgpu_freesync::DPCD_MSA_TIMING_PAR_IGNORED
+                != 0,
             training_aux_rd_interval: raw[(DPCD_TRAINING_AUX_RD_INTERVAL - DPCD_DPCD_REV) as usize],
         }
     }

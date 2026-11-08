@@ -117,6 +117,17 @@ impl DisplayVrrIp {
         }
     }
 
+    /// The display IP for a Gen12 platform family (the DP discovery
+    /// path knows the family, not the `Generation`).
+    pub const fn from_gen12_platform(family: crate::intel_gpu_gt::Gen12Platform) -> Self {
+        match family {
+            crate::intel_gpu_gt::Gen12Platform::TigerLake => Self::Gen12,
+            crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+            | crate::intel_gpu_gt::Gen12Platform::AlderLakeS
+            | crate::intel_gpu_gt::Gen12Platform::AlderLakeN => Self::Display13,
+        }
+    }
+
     /// Whether VMIN, VMAX, and FLIPLINE write `val - 1` (display 13+) or `val` (Gen12).
     pub const fn uses_vtotal_minus_one(self) -> bool {
         matches!(
@@ -161,8 +172,12 @@ pub struct VrrRange {
 }
 
 impl VrrRange {
+    /// Linux requires the EDID range spread to be **> 10 Hz**
+    /// (`intel_vrr_is_capable`: `max_vfreq - min_vfreq > 10`); a
+    /// 10 Hz spread is not enough for a reasonable Adaptive-Sync
+    /// experience.
     pub const fn new(min_hz: u16, max_hz: u16) -> Option<Self> {
-        if min_hz != 0 && max_hz > min_hz && (max_hz - min_hz) >= 10 {
+        if min_hz != 0 && max_hz > min_hz && (max_hz - min_hz) > 10 {
             Some(Self { min_hz, max_hz })
         } else {
             None
@@ -190,6 +205,69 @@ impl VrrRange {
         }
         Self::from_edid(edid)
     }
+
+    /// Parse VRR range from an EDID and decoded DPCD receiver
+    /// capabilities — the [`DpcdCaps`] form of
+    /// [`Self::from_edid_and_dpcd`], for the discovery path, which
+    /// holds the decoded caps rather than the raw 16-byte block.
+    pub fn from_edid_and_dpcd_caps(
+        edid: &[u8],
+        caps: &crate::dp_link_training::DpcdCaps,
+    ) -> Option<Self> {
+        if !caps.msa_timing_par_ignored {
+            return None;
+        }
+        Self::from_edid(edid)
+    }
+}
+
+/// The connector kind a VRR capability decision is made for.
+///
+/// Linux `intel_vrr_is_capable` gates on it: eDP additionally
+/// requires the VBT `vrr` flag; HDMI and anything else is never
+/// VRR-capable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VrrConnectorKind {
+    /// External DisplayPort.
+    DisplayPort,
+    /// Embedded DisplayPort (laptop panel).
+    EmbeddedDisplayPort,
+    /// HDMI (including via a DP-HDMI protocol converter).
+    Hdmi,
+    /// Anything else (VGA, DVI, ...).
+    Other,
+}
+
+/// Linux `intel_vrr_is_capable`
+/// (`drivers/gpu/drm/i915/display/intel_vrr.c`): `HAS_VRR` and an
+/// EDID range spread > 10 Hz; DP/eDP require the DPCD Ignore-MSA
+/// bit; eDP additionally requires the VBT `vrr` flag
+/// ([`installed_vrr`], BDB_LFP_POWER `vrr_feature_enabled`, BDB
+/// 233+); HDMI/other → false.
+///
+/// Returns the sink's VRR range when capable, `None` otherwise.
+/// The eDP branch reads the installed VBT projection; the DP branch
+/// needs none.
+pub fn sink_vrr_range(
+    edid: &[u8],
+    dpcd: Option<&crate::dp_link_training::DpcdCaps>,
+    kind: VrrConnectorKind,
+    has_vrr: bool,
+) -> Option<VrrRange> {
+    if !has_vrr {
+        return None;
+    }
+    match kind {
+        VrrConnectorKind::EmbeddedDisplayPort => {
+            if !matches!(installed_vrr(), VbtVrr::Present(true)) {
+                return None;
+            }
+        }
+        VrrConnectorKind::DisplayPort => {}
+        VrrConnectorKind::Hdmi | VrrConnectorKind::Other => return None,
+    }
+    let caps = dpcd?;
+    VrrRange::from_edid_and_dpcd_caps(edid, caps)
 }
 
 // ── Modeline Refresh Helper ──────────────────────────────────────────────────
@@ -206,23 +284,125 @@ pub fn mode_vrefresh(mode: &Mode) -> u32 {
 
 // ── VRR Timings ──────────────────────────────────────────────────────────────
 
+/// Transcoder VRR timing registers for one mode + sink range.
+///
+/// Stored semantics follow current Linux (`intel_vrr_compute_config`
+/// after the 2025-09 Ville series, "Hide the ICL/TGL
+/// `intel_vrr_flipline_offset()` mangling better" and "Move the TGL
+/// SCL mangling of vmin/vmax/flipline deeper"): `vmin` and `flipline`
+/// are **equal** and match the minimum vtotal; the ICL/TGL −1
+/// adjustment lives in the low-level programming path, not in the
+/// stored state. (The older Linux formula stored `vmin = V − 1`,
+/// `flipline = V`; the two agree on the values actually programmed
+/// on display 13+, where the register write subtracts one — see
+/// [`program_vrr_timings`].)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VrrTimings {
+    /// Minimum vtotal (lines).
     pub vmin: u32,
+    /// Maximum vtotal (lines).
     pub vmax: u32,
+    /// Flip line (lines); equals `vmin`.
     pub flipline: u32,
+    /// Late-phase guardband (lines); stored for every IP, packed
+    /// into `TRANS_VRR_CTL` only on display 14+.
     pub guardband: u16,
+    /// Gen12 delayed-vblank scanline value derived from the
+    /// guardband (0 on display 13+, which uses the guardband
+    /// register instead). See [`VrrTimings::compute_config_late`].
+    pub pipeline_full: u16,
+    /// VSYNC start/end (lines from the end of the frame); only
+    /// meaningful when [`VrrTimings::as_sdp`] is set.
     pub vsync_start: u32,
     pub vsync_end: u32,
+    /// The sink supports Adaptive-Sync SDP: only then are
+    /// `TRANS_VRR_VSYNC` / `EMP_AS_SDP_TL` programmed.
+    pub as_sdp: bool,
+}
+
+/// Options for [`VrrTimings::compute_config`] beyond mode/range/IP:
+/// the facts Linux's `intel_vrr_compute_config` takes from the
+/// connector/pipe state rather than the mode itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VrrComputeOpts {
+    /// Interlaced mode: Linux bails on interlaced modes outright.
+    /// (NARF modes are progressive today; the flag exists so the
+    /// bail is fixture-testable and the day an interlaced mode
+    /// arrives it is refused rather than silently programmed.)
+    pub interlaced: bool,
+    /// Bigjoiner pipe: Linux bails on joiner pipes. The Pipe-A
+    /// modeset path never joins; the flag is the bail's input.
+    pub joiner: bool,
+    /// The sink supports Adaptive-Sync SDP: only then does Linux
+    /// program `TRANS_VRR_VSYNC` / `EMP_AS_SDP_TL`. Which DPCD
+    /// bit reports this is UNVERIFIED (no Bspec access in this
+    /// lane); discovery callers pass `false` until it is resolved,
+    /// and the PR body records it.
+    pub as_sdp: bool,
+}
+
+/// Late-phase guardband shared by VRR and CMRR.
+///
+/// Linux `intel_vrr_compute_config_late` / "drm/i915/vrr: Use SCL
+/// for computing guardband" (2025-09-25): "guardband is equal to the
+/// vblank length so ideally it should be computed as difference
+/// between the vmin vtotal and vactive". On TGL there is no
+/// `TRANS_SET_CONTEXT_LATENCY`, so there is no SCL term to add and
+/// the guardband is `vmin − vblank_start` with `vblank_start =
+/// v_active`. The pre-existing NARF clamps are kept: at least 8
+/// lines, at most the blanking length `vtotal − v_active`.
+fn late_guardband(vmin: u32, mode: &Mode) -> u16 {
+    let guard = u64::from(vmin.saturating_sub(u32::from(mode.v_active))).max(8);
+    let max_guard = u64::from(mode.v_total.saturating_sub(mode.v_active)).min(0xffff);
+    u16::try_from(guard.min(max_guard)).unwrap_or(8)
 }
 
 impl VrrTimings {
     /// Compute transcoder VRR timing registers for a given mode, sink VRR range, and display IP.
+    ///
+    /// Legacy single-call shape: AS SDP is unknown, so VSYNC follows
+    /// the display IP as #1590 did (display 14+). The modeset path
+    /// uses [`Self::compute_config`] with the real sink value.
     pub fn compute(mode: &Mode, range: VrrRange, ip: DisplayVrrIp) -> Option<Self> {
+        Self::compute_config(
+            mode,
+            range,
+            ip,
+            VrrComputeOpts {
+                as_sdp: ip.has_vrr_vsync(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Linux `intel_vrr_compute_config` equivalent: recompute the
+    /// timings from the mode actually committed by a modeset and the
+    /// sink's range, on every modeset.
+    ///
+    /// - `vmin = max(vtotal, ceil(clock / (htotal · max_vfreq)))`,
+    ///   `vmax = max(vtotal, clock / (htotal · min_vfreq))`
+    ///   (HW-clamped); bails when `vmin >= vmax` — there is no room
+    ///   to vary, so no degenerate range is programmed (the old code
+    ///   clamped `vmax` up to `vmin` instead).
+    /// - Bails on interlaced modes and joiner pipes.
+    /// - `flipline = vmin` (stored semantics per the 2025-09 Linux
+    ///   refactor; see the struct docs).
+    /// - VSYNC start/end are computed only when AS SDP is supported.
+    /// - The late phase ([`Self::compute_config_late`]) fills the
+    ///   guardband (and the Gen12 `pipeline_full` value).
+    pub fn compute_config(
+        mode: &Mode,
+        range: VrrRange,
+        ip: DisplayVrrIp,
+        opts: VrrComputeOpts,
+    ) -> Option<Self> {
         if mode.h_total == 0 || mode.v_total == 0 || mode.pixel_clock_khz == 0 {
             return None;
         }
         if mode.v_total <= mode.v_active || mode.v_sync_start > mode.v_total {
+            return None;
+        }
+        if opts.interlaced || opts.joiner {
             return None;
         }
         let hz = mode_vrefresh(mode);
@@ -230,37 +410,72 @@ impl VrrTimings {
             return None;
         }
 
-        let vmin = u32::from(mode.v_total);
-        // Minimum refresh rate corresponds to maximum frame duration / vtotal:
-        // lines = (pixel_clock_khz * 1000) / (h_total * min_hz)
         let num = u64::from(mode.pixel_clock_khz) * 1000;
-        let denom = u64::from(mode.h_total) * u64::from(range.min_hz);
-        if denom == 0 {
+        let denom_max = u64::from(mode.h_total) * u64::from(range.max_hz);
+        if denom_max == 0 {
             return None;
         }
-        let raw_vmax = u32::try_from(num / denom).ok()?;
-        let vmax = raw_vmax.min(VRR_MAX_VTOTAL_HW).max(vmin);
-        let flipline = vmin;
+        let vmin_from_max = u32::try_from(num.div_ceil(denom_max)).ok()?;
+        let vmin = u32::from(mode.v_total).max(vmin_from_max);
+        let denom_min = u64::from(mode.h_total) * u64::from(range.min_hz);
+        if denom_min == 0 {
+            return None;
+        }
+        let raw_vmax = u32::try_from(num / denom_min).ok()?;
+        let vmax = raw_vmax.min(VRR_MAX_VTOTAL_HW).max(u32::from(mode.v_total));
+        if vmin >= vmax {
+            return None;
+        }
 
-        let vsync_start = u32::from(mode.v_total.saturating_sub(mode.v_sync_start));
-        let vsync_end = u32::from(mode.v_total.saturating_sub(mode.v_sync_end));
+        let (vsync_start, vsync_end) = if opts.as_sdp {
+            (
+                u32::from(mode.v_total.saturating_sub(mode.v_sync_start)),
+                u32::from(mode.v_total.saturating_sub(mode.v_sync_end)),
+            )
+        } else {
+            (0, 0)
+        };
 
-        let guardband = if ip.uses_guardband_in_ctl() {
-            let guard = u64::from(vsync_start + 1).max(8);
-            let max_guard = u64::from(mode.v_total.saturating_sub(mode.v_active)).min(0xffff);
-            u16::try_from(guard.min(max_guard)).unwrap_or(8)
+        let mut timings = Self {
+            vmin,
+            vmax,
+            flipline: vmin,
+            guardband: 0,
+            pipeline_full: 0,
+            vsync_start,
+            vsync_end,
+            as_sdp: opts.as_sdp,
+        };
+        timings.compute_config_late(mode, ip);
+        Some(timings)
+    }
+
+    /// Linux `intel_vrr_compute_config_late` equivalent: the
+    /// guardband phase, run once the final mode is known.
+    ///
+    /// The guardband is the vblank length at the minimum vtotal
+    /// ([`late_guardband`]); Linux 2025-09 ("Store guardband in
+    /// crtc state even for icl/tgl") stores it in the state even for
+    /// ICL/TGL, which has no guardband register — the hardware
+    /// instead consumes the derived `pipeline_full` value.
+    ///
+    /// `pipeline_full` conversion: UNVERIFIED. What the fetched
+    /// Linux sources establish is that the guardband is converted
+    /// into the `pipeline_full` representation the ICL/TGL hardware
+    /// consumes, and that the value is capped at 255 scanlines
+    /// ("we don't currently handle the maximum limit of 255
+    /// scanlines for the pipeline_full in a very nice way"). NARF
+    /// uses the identity-with-clamp (`min(guardband, 255)`) as the
+    /// conservative placeholder and records it as UNVERIFIED in the
+    /// PR body; the exact conversion is a follow-up once the
+    /// formula is readable.
+    pub fn compute_config_late(&mut self, mode: &Mode, ip: DisplayVrrIp) {
+        self.guardband = late_guardband(self.vmin, mode);
+        self.pipeline_full = if ip == DisplayVrrIp::Gen12 {
+            self.guardband.min(255)
         } else {
             0
         };
-
-        Some(Self {
-            vmin,
-            vmax,
-            flipline,
-            guardband,
-            vsync_start,
-            vsync_end,
-        })
     }
 }
 
@@ -408,9 +623,7 @@ impl CmrrTimings {
         let vsync_end = u32::from(mode.v_total.saturating_sub(mode.v_sync_end));
 
         let guardband = if ip.uses_guardband_in_ctl() {
-            let guard = u64::from(vsync_start + 1).max(8);
-            let max_guard = u64::from(mode.v_total.saturating_sub(mode.v_active)).min(0xffff);
-            u16::try_from(guard.min(max_guard)).unwrap_or(8)
+            late_guardband(vmin, mode)
         } else {
             0
         };
@@ -432,6 +645,24 @@ impl CmrrTimings {
 
 /// Program the transcoder VRR timing limit registers (`TRANS_VRR_VMIN`, `TRANS_VRR_VMAX`,
 /// `TRANS_VRR_FLIPLINE`, and `TRANS_VRR_VSYNC` / `EMP_AS_SDP_TL` where supported).
+///
+/// Register values: display 13+ writes `val - 1`, Gen12 writes the
+/// stored value directly (#1590). Whether Gen12 should instead apply
+/// a −1 to VMIN when programming is UNVERIFIED: fetched Linux
+/// (2025-09, "Hide the ICL/TGL `intel_vrr_flipline_offset()` mangling
+/// better") hides a vmin−1 / flipline+1 adjustment in the low-level
+/// ICL/TGL programming path so the stored `vmin`/`flipline` stay
+/// equal to the minimum vtotal, and notes "the actual register value
+/// will no longer match crtc_state->vrr.vmin on ICL/TGL". No Bspec
+/// was readable in this lane to resolve which side is right, so the
+/// #1590 register values are kept as-is and the discrepancy is
+/// recorded in the PR body rather than guessed at.
+///
+/// `TRANS_VRR_VSYNC` / `EMP_AS_SDP_TL` are programmed only when the
+/// timings carry AS SDP support (`timings.as_sdp`): Linux programs
+/// `EMP_AS_SDP_TL` for the DP Adaptive-Sync SDP case, and VSYNC is
+/// likewise AS-SDP-gated rather than written unconditionally on
+/// display 14+.
 pub fn program_vrr_timings(
     io: &(impl MmioWindow + ?Sized),
     trans: VrrTranscoder,
@@ -452,12 +683,12 @@ pub fn program_vrr_timings(
         io.write32(base + TRANS_VRR_FLIPLINE_OFFSET, timings.flipline);
     }
 
-    if ip.has_vrr_vsync() {
+    if ip.has_vrr_vsync() && timings.as_sdp {
         let vsync_val = ((timings.vsync_end & 0x1fff) << 16) | (timings.vsync_start & 0x1fff);
         io.write32(base + TRANS_VRR_VSYNC_OFFSET, vsync_val);
     }
 
-    if ip.has_emp_as_sdp() {
+    if ip.has_emp_as_sdp() && timings.as_sdp {
         io.write32(base + EMP_AS_SDP_TL_OFFSET, timings.vsync_start & 0x1fff);
     }
 
@@ -563,8 +794,13 @@ pub fn program_cmrr_timings(
         vmax: timings.vmax,
         flipline: timings.flipline,
         guardband: timings.guardband,
+        pipeline_full: 0,
         vsync_start: timings.vsync_start,
         vsync_end: timings.vsync_end,
+        // CMRR keeps #1590's unconditional VSYNC programming on
+        // display 14+ (its AS-SDP gating is the sequencing lane's
+        // call); the VRR path gates on the sink instead.
+        as_sdp: ip.has_vrr_vsync(),
     };
     program_vrr_timings(io, trans, ip, &vrr_timings)?;
 
@@ -837,6 +1073,64 @@ impl VrrState {
 }
 
 pub static VRR_STATE: VrrState = VrrState::new();
+
+/// The VBT facts VRR consumes for the Pipe-A eDP panel: the
+/// `vrr_feature_enabled` flag Linux's `intel_vrr_is_capable` gates
+/// eDP on. Mirrors the `VbtPsr` install pattern
+/// (`intel_gpu_psr::install_vbt`): the probe installs the
+/// projection once, consumers read it via [`installed_vrr`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VbtVrr {
+    /// No VBT: eDP VRR is never capable (as in Linux, where
+    /// `intel_bios_vrr` is false without a VBT).
+    Missing,
+    /// The VBT's `vrr_feature_enabled` value for the panel.
+    Present(bool),
+}
+
+impl VbtVrr {
+    /// `intel_bios_init` for the panel: the VBT's VRR feature flag.
+    pub fn from_vbt(vbt: &crate::intel_gpu_vbt::Vbt) -> Self {
+        Self::Present(vbt.vrr_feature_enabled())
+    }
+}
+
+static VBT_VRR: IrqSafeSpinLock<VbtVrr> = IrqSafeSpinLock::new(VbtVrr::Missing);
+
+/// Install the probe's VBT facts ([`VbtVrr::Missing`] without a VBT).
+pub fn install_vbt(vbt: VbtVrr) {
+    *VBT_VRR.lock() = vbt;
+}
+
+/// The installed VBT facts.
+pub fn installed_vrr() -> VbtVrr {
+    *VBT_VRR.lock()
+}
+
+/// Recompute a CRTC's VRR timings from the mode actually committed
+/// by a modeset and the sink range discovery published for it.
+///
+/// This is the per-modeset compute (`intel_vrr_compute_config`
+/// equivalent): the modeset path calls it with the real mode on
+/// every modeset instead of reusing install-time timings. It stores
+/// the mode + range in [`VRR_STATE`] and the fresh timings — or
+/// clears them when there is no range or the compute bails (mode
+/// outside the range, `vmin >= vmax`, interlace/joiner) — and
+/// returns the timings. Pipe-A only by construction: callers pass
+/// CRTC 1.
+pub fn recompute_timings_for_modeset(
+    crtc_id: u32,
+    mode: &Mode,
+    range: Option<VrrRange>,
+    ip: DisplayVrrIp,
+    opts: VrrComputeOpts,
+) -> Option<VrrTimings> {
+    VRR_STATE.set_mode(crtc_id, Some(*mode));
+    VRR_STATE.set_range(crtc_id, range);
+    let timings = range.and_then(|r| VrrTimings::compute_config(mode, r, ip, opts));
+    VRR_STATE.set_timings(crtc_id, timings);
+    timings
+}
 
 /// Retain and apply a CRTC's VRR request (from DRM `VRR_ENABLED`).
 pub fn request_vrr_enabled(crtc_id: u32, enabled: bool) {

@@ -5,18 +5,21 @@ use core::cell::{Cell, RefCell};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::{
+    dp_link_training::DpcdCaps,
     intel_gpu_aux::MmioWindow,
     intel_gpu_modeset::Mode,
     intel_gpu_vrr::{
-        capture_mode_from_hw, cmrr_disable, cmrr_enable, is_cmrr_active, is_vrr_active,
-        mode_vrefresh, on_plane_flip, populate_card, program_cmrr_timings,
-        program_fixed_rr_timings, program_vrr_timings, vrr_disable, vrr_enable, vrr_send_push,
-        vrr_status_string, CmrrRate, CmrrTimings, DisplayVrrIp, VrrRange, VrrTimings,
-        VrrTranscoder, EMP_AS_SDP_TL_OFFSET, TRANSCODER_A_BASE, TRANS_CMRR_M_HI_OFFSET,
-        TRANS_CMRR_M_LO_OFFSET, TRANS_CMRR_N_HI_OFFSET, TRANS_CMRR_N_LO_OFFSET, TRANS_PUSH_EN,
-        TRANS_PUSH_OFFSET, TRANS_VRR_CTL_OFFSET, TRANS_VRR_FLIPLINE_OFFSET, TRANS_VRR_VMAX_OFFSET,
-        TRANS_VRR_VMIN_OFFSET, TRANS_VRR_VSYNC_OFFSET, VRR_CTL_CMRR_ENABLE, VRR_CTL_FLIP_LINE_EN,
-        VRR_CTL_IGN_MAX_STRETCH, VRR_CTL_VRR_ENABLE, VRR_STATE,
+        capture_mode_from_hw, cmrr_disable, cmrr_enable, install_vbt, installed_vrr,
+        is_cmrr_active, is_vrr_active, mode_vrefresh, on_plane_flip, populate_card,
+        program_cmrr_timings, program_fixed_rr_timings, program_vrr_timings,
+        recompute_timings_for_modeset, sink_vrr_range, vrr_disable, vrr_enable, vrr_send_push,
+        vrr_status_string, CmrrRate, CmrrTimings, DisplayVrrIp, VbtVrr, VrrComputeOpts,
+        VrrConnectorKind, VrrRange, VrrTimings, VrrTranscoder, EMP_AS_SDP_TL_OFFSET,
+        TRANSCODER_A_BASE, TRANS_CMRR_M_HI_OFFSET, TRANS_CMRR_M_LO_OFFSET, TRANS_CMRR_N_HI_OFFSET,
+        TRANS_CMRR_N_LO_OFFSET, TRANS_PUSH_EN, TRANS_PUSH_OFFSET, TRANS_VRR_CTL_OFFSET,
+        TRANS_VRR_FLIPLINE_OFFSET, TRANS_VRR_VMAX_OFFSET, TRANS_VRR_VMIN_OFFSET,
+        TRANS_VRR_VSYNC_OFFSET, VRR_CTL_CMRR_ENABLE, VRR_CTL_FLIP_LINE_EN, VRR_CTL_IGN_MAX_STRETCH,
+        VRR_CTL_VRR_ENABLE, VRR_STATE,
     },
 };
 
@@ -109,6 +112,10 @@ fn smoke_intel_vrr_range_limits() -> TestResult {
     assert_eq!(VrrRange::new(50, 55), None);
     assert_eq!(VrrRange::new(50, 59), None);
 
+    // Invalid: delta exactly 10 Hz — Linux requires spread > 10 Hz
+    // (`intel_vrr_is_capable`), not >= 10.
+    assert_eq!(VrrRange::new(50, 60), None);
+
     // Mode refresh calculation
     let m = mode_1080p60();
     assert_eq!(mode_vrefresh(&m), 60);
@@ -171,15 +178,23 @@ fn smoke_intel_vrr_timings_computation() -> TestResult {
     let m = mode_1080p60();
     let range = VrrRange::new(48, 144).unwrap();
 
-    // Gen12 computation
+    // Gen12 computation: vmin is the minimum vtotal (1125 — the
+    // max_vfreq term, ceil(148.5MHz / (2200 * 144)) = 469, is below
+    // vtotal), flipline == vmin, guardband is the vblank length at
+    // the minimum vtotal (1125 - 1080 = 45) and is stored even for
+    // Gen12 (Linux 2025-09), where the hardware consumes the
+    // derived pipeline_full value instead.
     let t_gen12 = VrrTimings::compute(&m, range, DisplayVrrIp::Gen12).expect("Gen12 timings");
     assert_eq!(t_gen12.vmin, 1125);
     // vmax = (148500 * 1000) / (2200 * 48) = 148500000 / 105600 = 1406
     assert_eq!(t_gen12.vmax, 1406);
     assert_eq!(t_gen12.flipline, 1125);
-    assert_eq!(t_gen12.guardband, 0); // Gen12 does not pack guardband into CTL
-    assert_eq!(t_gen12.vsync_start, 1125 - 1084); // 41
-    assert_eq!(t_gen12.vsync_end, 1125 - 1089); // 36
+    assert_eq!(t_gen12.guardband, 45);
+    assert_eq!(t_gen12.pipeline_full, 45);
+    // Gen12 has no VSYNC register, so the legacy compute leaves the
+    // AS-SDP-gated VSYNC fields clear.
+    assert_eq!(t_gen12.vsync_start, 0);
+    assert_eq!(t_gen12.vsync_end, 0);
 
     // Display 14 (Meteor Lake / Xe_LPG) computation
     let t_display14 =
@@ -187,8 +202,11 @@ fn smoke_intel_vrr_timings_computation() -> TestResult {
     assert_eq!(t_display14.vmin, 1125);
     assert_eq!(t_display14.vmax, 1406);
     assert_eq!(t_display14.flipline, 1125);
-    // Guardband: (vsync_start + 1).max(8) = 42
-    assert_eq!(t_display14.guardband, 42);
+    // Guardband: vmin - v_active = 1125 - 1080 = 45 (Linux
+    // `intel_vrr_compute_config_late`: the vblank length at the
+    // minimum vtotal).
+    assert_eq!(t_display14.guardband, 45);
+    assert_eq!(t_display14.pipeline_full, 0);
     assert_eq!(t_display14.vsync_start, 41);
     assert_eq!(t_display14.vsync_end, 36);
 
@@ -405,7 +423,7 @@ fn smoke_intel_cmrr_rate_fractions_and_timings_computation() -> TestResult {
     assert_eq!(t60.vmin, 1125);
     assert_eq!(t60.vmax, 1125);
     assert_eq!(t60.flipline, 1125);
-    assert_eq!(t60.guardband, 42);
+    assert_eq!(t60.guardband, 45);
 
     // 1080p60 on Display 20 at 59.940 Hz: M = 999_000_999
     let t59 = CmrrTimings::compute(&m, CmrrRate::Fps59_940, DisplayVrrIp::Display20)
@@ -465,7 +483,7 @@ fn smoke_intel_cmrr_register_programming_and_sequencing() -> TestResult {
     assert!(!is_cmrr_active(&io, trans));
     cmrr_enable(&io, trans, DisplayVrrIp::Display14, timings.guardband).unwrap();
     assert_eq!(io.written(base + TRANS_PUSH_OFFSET), vec![TRANS_PUSH_EN]);
-    let expected_ctl = VRR_CTL_VRR_ENABLE | VRR_CTL_CMRR_ENABLE | VRR_CTL_FLIP_LINE_EN | 42;
+    let expected_ctl = VRR_CTL_VRR_ENABLE | VRR_CTL_CMRR_ENABLE | VRR_CTL_FLIP_LINE_EN | 45;
     assert_eq!(io.written(base + TRANS_VRR_CTL_OFFSET), vec![expected_ctl]);
     assert!(is_cmrr_active(&io, trans));
 
@@ -740,4 +758,399 @@ fn smoke_intel_vrr_state_mode_and_rate_accessors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_vrr",
     smoke_intel_vrr_state_mode_and_rate_accessors
+);
+
+// ── Test 15: Sink Capability Matrix (`intel_vrr_is_capable`) ──────────────
+
+/// A synthetic 128-byte EDID 1.4 with a range descriptor covering
+/// `min_hz..=max_hz`.
+fn fixture_edid_range(min_hz: u8, max_hz: u8) -> [u8; 128] {
+    let mut edid = [0u8; 128];
+    edid[0..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
+    edid[0x12] = 1;
+    edid[0x13] = 4;
+    edid[0x18] = 0x01; // Continuous frequency supported
+    let desc = &mut edid[108..126];
+    desc[0] = 0;
+    desc[1] = 0;
+    desc[2] = 0;
+    desc[3] = 0xfd; // Range descriptor tag
+    desc[4] = 0x00;
+    desc[5] = min_hz;
+    desc[6] = max_hz;
+    desc[7] = 30;
+    desc[8] = 160;
+    desc[9] = 20;
+    desc[10] = 0x01;
+    edid
+}
+
+/// A decoded DPCD caps block with the Ignore-MSA bit as requested.
+fn fixture_dpcd_caps(msa_ignored: bool) -> DpcdCaps {
+    let mut raw = [0u8; 16];
+    raw[0] = 0x14; // DPCD_REV 1.4
+    raw[1] = 0x1e; // MAX_LINK_RATE HBR3
+    raw[2] = 0x84; // 4 lanes, enhanced framing
+    if msa_ignored {
+        raw[7] = 0x40; // DPCD_MSA_TIMING_PAR_IGNORED
+    }
+    DpcdCaps::decode(&raw)
+}
+
+fn smoke_intel_vrr_sink_capability_matrix() -> TestResult {
+    let edid = fixture_edid_range(48, 144);
+
+    // DPCD decode retains the Ignore-MSA bit.
+    assert!(fixture_dpcd_caps(true).msa_timing_par_ignored);
+    assert!(!fixture_dpcd_caps(false).msa_timing_par_ignored);
+
+    // DP, bit set, spread 96 Hz: capable.
+    assert_eq!(
+        sink_vrr_range(
+            &edid,
+            Some(&fixture_dpcd_caps(true)),
+            VrrConnectorKind::DisplayPort,
+            true,
+        ),
+        VrrRange::new(48, 144)
+    );
+
+    // DP, DPCD Ignore-MSA bit clear: not capable.
+    assert_eq!(
+        sink_vrr_range(
+            &edid,
+            Some(&fixture_dpcd_caps(false)),
+            VrrConnectorKind::DisplayPort,
+            true,
+        ),
+        None
+    );
+
+    // DP, no DPCD read at all: not capable.
+    assert_eq!(
+        sink_vrr_range(&edid, None, VrrConnectorKind::DisplayPort, true),
+        None
+    );
+
+    // DP, EDID range spread exactly 10 Hz (48..58): not capable —
+    // Linux requires spread > 10 Hz.
+    let narrow = fixture_edid_range(48, 58);
+    assert_eq!(
+        sink_vrr_range(
+            &narrow,
+            Some(&fixture_dpcd_caps(true)),
+            VrrConnectorKind::DisplayPort,
+            true,
+        ),
+        None
+    );
+
+    // DP, EDID without any range descriptor: not capable.
+    assert_eq!(
+        sink_vrr_range(
+            &[0u8; 128],
+            Some(&fixture_dpcd_caps(true)),
+            VrrConnectorKind::DisplayPort,
+            true,
+        ),
+        None
+    );
+
+    // HDMI, everything else in order: never capable.
+    assert_eq!(
+        sink_vrr_range(
+            &edid,
+            Some(&fixture_dpcd_caps(true)),
+            VrrConnectorKind::Hdmi,
+            true,
+        ),
+        None
+    );
+
+    // No VRR hardware: never capable.
+    assert_eq!(
+        sink_vrr_range(
+            &edid,
+            Some(&fixture_dpcd_caps(true)),
+            VrrConnectorKind::DisplayPort,
+            false,
+        ),
+        None
+    );
+
+    // eDP: the VBT gate decides. No VBT installed → not capable.
+    install_vbt(VbtVrr::Missing);
+    assert_eq!(
+        sink_vrr_range(
+            &edid,
+            Some(&fixture_dpcd_caps(true)),
+            VrrConnectorKind::EmbeddedDisplayPort,
+            true,
+        ),
+        None
+    );
+    // VBT says VRR is enabled → capable.
+    install_vbt(VbtVrr::Present(true));
+    assert_eq!(
+        sink_vrr_range(
+            &edid,
+            Some(&fixture_dpcd_caps(true)),
+            VrrConnectorKind::EmbeddedDisplayPort,
+            true,
+        ),
+        VrrRange::new(48, 144)
+    );
+    // VBT says VRR is disabled → not capable (and the DPCD bit is
+    // still required on top of the VBT flag).
+    install_vbt(VbtVrr::Present(false));
+    assert_eq!(
+        sink_vrr_range(
+            &edid,
+            Some(&fixture_dpcd_caps(true)),
+            VrrConnectorKind::EmbeddedDisplayPort,
+            true,
+        ),
+        None
+    );
+    assert_eq!(
+        sink_vrr_range(
+            &edid,
+            Some(&fixture_dpcd_caps(false)),
+            VrrConnectorKind::EmbeddedDisplayPort,
+            true,
+        ),
+        None
+    );
+    // Restore the no-VBT state so later tests see a clean global.
+    install_vbt(VbtVrr::Missing);
+    assert_eq!(installed_vrr(), VbtVrr::Missing);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_sink_capability_matrix
+);
+
+// ── Test 16: Per-Modeset Compute (`intel_vrr_compute_config`) ─────────────
+
+fn smoke_intel_vrr_per_modeset_compute() -> TestResult {
+    let m = mode_1080p60();
+    let range = VrrRange::new(48, 144).unwrap();
+
+    // Interlace and joiner bail.
+    assert_eq!(
+        VrrTimings::compute_config(
+            &m,
+            range,
+            DisplayVrrIp::Display14,
+            VrrComputeOpts {
+                interlaced: true,
+                ..Default::default()
+            },
+        ),
+        None
+    );
+    assert_eq!(
+        VrrTimings::compute_config(
+            &m,
+            range,
+            DisplayVrrIp::Display14,
+            VrrComputeOpts {
+                joiner: true,
+                ..Default::default()
+            },
+        ),
+        None
+    );
+
+    // vmin >= vmax bails instead of clamping: a 60 Hz mode against a
+    // range whose floor is 60 Hz has no room to vary
+    // (vmax = 1125 = vmin).
+    let floor60 = VrrRange::new(60, 144).unwrap();
+    assert_eq!(
+        VrrTimings::compute_config(&m, floor60, DisplayVrrIp::Display14, Default::default()),
+        None
+    );
+    // Same for a 48 Hz mode against a 48 Hz floor.
+    let mut m48 = m;
+    m48.pixel_clock_khz = 118_800; // 2200 * 1125 * 48 / 1000
+    assert_eq!(mode_vrefresh(&m48), 48);
+    assert_eq!(
+        VrrTimings::compute_config(&m48, range, DisplayVrrIp::Display14, Default::default()),
+        None
+    );
+
+    // A mode just above the floor has room: 60 Hz against 48..144
+    // computes, with flipline == vmin.
+    let t = VrrTimings::compute_config(&m, range, DisplayVrrIp::Display14, Default::default())
+        .expect("in-range compute");
+    assert_eq!(t.vmin, 1125);
+    assert_eq!(t.vmax, 1406);
+    assert_eq!(t.flipline, t.vmin);
+
+    // AS-SDP gating: without it the VSYNC fields stay clear and the
+    // registers stay unwritten on display 14+.
+    let io = MockMmio::new();
+    let t_no_sdp = VrrTimings::compute_config(
+        &m,
+        range,
+        DisplayVrrIp::Display14,
+        VrrComputeOpts {
+            as_sdp: false,
+            ..Default::default()
+        },
+    )
+    .expect("no-SDP compute");
+    assert_eq!(t_no_sdp.vsync_start, 0);
+    assert_eq!(t_no_sdp.vsync_end, 0);
+    program_vrr_timings(&io, VrrTranscoder::C, DisplayVrrIp::Display14, &t_no_sdp).unwrap();
+    assert!(io
+        .written(VrrTranscoder::C.base() + TRANS_VRR_VSYNC_OFFSET)
+        .is_empty());
+    // With AS SDP the VSYNC register is written.
+    let t_sdp = VrrTimings::compute_config(
+        &m,
+        range,
+        DisplayVrrIp::Display14,
+        VrrComputeOpts {
+            as_sdp: true,
+            ..Default::default()
+        },
+    )
+    .expect("AS-SDP compute");
+    assert_eq!(t_sdp.vsync_start, 41);
+    assert_eq!(t_sdp.vsync_end, 36);
+    program_vrr_timings(&io, VrrTranscoder::C, DisplayVrrIp::Display14, &t_sdp).unwrap();
+    assert_eq!(
+        io.written(VrrTranscoder::C.base() + TRANS_VRR_VSYNC_OFFSET),
+        vec![((36 & 0x1fff) << 16) | 41]
+    );
+
+    // Per-modeset recompute stores mode + range + timings in the
+    // global state, and clears them when the sink has no range or
+    // the compute bails.
+    let crtc_id = 1;
+    let stored = recompute_timings_for_modeset(
+        crtc_id,
+        &m,
+        Some(range),
+        DisplayVrrIp::Gen12,
+        Default::default(),
+    )
+    .expect("recompute stores timings");
+    assert_eq!(VRR_STATE.mode(crtc_id), Some(m));
+    assert_eq!(VRR_STATE.range(crtc_id), Some(range));
+    assert_eq!(VRR_STATE.timings(crtc_id), Some(stored));
+    assert_eq!(stored.pipeline_full, 45);
+
+    assert_eq!(
+        recompute_timings_for_modeset(crtc_id, &m, None, DisplayVrrIp::Gen12, Default::default()),
+        None
+    );
+    assert_eq!(VRR_STATE.range(crtc_id), None);
+    assert_eq!(VRR_STATE.timings(crtc_id), None);
+    assert_eq!(
+        recompute_timings_for_modeset(
+            crtc_id,
+            &m,
+            Some(floor60),
+            DisplayVrrIp::Gen12,
+            Default::default(),
+        ),
+        None
+    );
+    assert_eq!(VRR_STATE.range(crtc_id), Some(floor60));
+    assert_eq!(VRR_STATE.timings(crtc_id), None);
+
+    // Clean up.
+    VRR_STATE.set_mode(crtc_id, None);
+    VRR_STATE.set_range(crtc_id, None);
+    VRR_STATE.set_timings(crtc_id, None);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_per_modeset_compute
+);
+
+// ── Test 17: VBT VRR Feature Flag ──────────────────────────────────────────
+//
+// The flag lives in the BDB_LFP_POWER block (id 44) at offset 56;
+// the fixture VBT below is built with the same block walker the
+// production parser uses (a `$VBT` header + BDB header + blocks).
+fn fixture_vbt_with_lfp_power(vrr_bits: u16) -> alloc::vec::Vec<u8> {
+    // BDB header: "BIOS_DATA_BLOCK", version 233, header_size 32.
+    // Block layout after the 32-byte BDB header: [id 44][size le16]
+    // [136 bytes of LFP_POWER data]. The VBT header points at the
+    // BDB offset; the parser only needs the BDB walk to find it.
+    let mut bdb = alloc::vec::Vec::new();
+    bdb.extend_from_slice(b"BIOS_DATA_BLOCK");
+    bdb.push(0); // 16-byte signature
+    bdb.extend_from_slice(&233u16.to_le_bytes()); // version
+    bdb.extend_from_slice(&32u16.to_le_bytes()); // header_size
+    let bdb_size_pos = bdb.len();
+    bdb.extend_from_slice(&0u16.to_le_bytes()); // bdb_size (patched below)
+                                                // Pad to the 32-byte header.
+    while bdb.len() < 32 {
+        bdb.push(0);
+    }
+    bdb.push(44); // BDB_LFP_POWER
+    bdb.extend_from_slice(&136u16.to_le_bytes());
+    let mut block = [0u8; 136];
+    block[56] = (vrr_bits & 0xff) as u8;
+    block[57] = (vrr_bits >> 8) as u8;
+    bdb.extend_from_slice(&block);
+    let bdb_size = bdb.len() as u16;
+    bdb[bdb_size_pos..bdb_size_pos + 2].copy_from_slice(&bdb_size.to_le_bytes());
+    bdb
+}
+
+fn smoke_intel_vrr_vbt_feature_flag() -> TestResult {
+    use crate::intel_gpu_vbt::Vbt;
+
+    // The fixture has no `$VBT` header, so parse it the way the
+    // production path does after `validate_vbt`: build the full
+    // image with a header pointing at the BDB. `Vbt::parse` takes
+    // the whole image; construct one: "$VBT" + padding to offset
+    // 32, then the BDB block bytes.
+    let build_image = |vrr_bits: u16| -> alloc::vec::Vec<u8> {
+        let mut img = alloc::vec::Vec::new();
+        img.extend_from_slice(b"$VBT");
+        while img.len() < 20 {
+            img.push(0);
+        }
+        // version (u16 @ 20), header_size (u16 @ 22), vbt_size (u16
+        // @ 24), checksum (u8 @ 26), reserved (u8 @ 27),
+        // bdb_offset (u32 @ 28).
+        img.extend_from_slice(&233u16.to_le_bytes());
+        img.extend_from_slice(&32u16.to_le_bytes());
+        let vbt_size_pos = img.len();
+        img.extend_from_slice(&0u16.to_le_bytes());
+        img.push(0);
+        img.push(0);
+        img.extend_from_slice(&32u32.to_le_bytes()); // bdb_offset
+        let bdb = fixture_vbt_with_lfp_power(vrr_bits);
+        img.extend_from_slice(&bdb);
+        let vbt_size = img.len() as u16;
+        img[vbt_size_pos..vbt_size_pos + 2].copy_from_slice(&vbt_size.to_le_bytes());
+        img
+    };
+
+    // Bit 0 set → the Pipe-A panel's VRR flag reads enabled.
+    let vbt = Vbt::parse(&build_image(0x0001)).expect("fixture VBT parses");
+    assert!(vbt.vrr_feature_enabled());
+    // No bits set → disabled.
+    let vbt = Vbt::parse(&build_image(0x0000)).expect("fixture VBT parses");
+    assert!(!vbt.vrr_feature_enabled());
+    // Only panel 1's bit set → panel 0 still reads disabled.
+    let vbt = Vbt::parse(&build_image(0x0002)).expect("fixture VBT parses");
+    assert!(!vbt.vrr_feature_enabled());
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vrr",
+    smoke_intel_vrr_vbt_feature_flag
 );

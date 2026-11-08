@@ -8708,6 +8708,60 @@ the serialized async stream updater to reprogram each live scanout's DRR
 no modeset; the display monitor converges the same at the end of every
 pass, including after a relight.
 
+### Intel VRR foundation (DP Adaptive-Sync)
+
+Intel VRR capability is honest, not hardcoded: `intel_gpu_vrr::sink_vrr_range`
+implements Linux `intel_vrr_is_capable` — the DPCD Ignore-MSA bit plus an
+EDID monitor-range spread greater than 10 Hz for DP/eDP, the VBT `vrr`
+flag (`Vbt::vrr_feature_enabled`, BDB_LFP_POWER offset 56, version ≥ 233)
+for eDP, HDMI and other connectors always false. `VrrRange::from_edid_and_dpcd_caps`
+is the EDID+DPCD half of the same gate. The DP discovery path
+(`intel_gpu_dp::probe_sink`) publishes the range; the eDP panel's
+`NativeOutput::vrr_capable` stays `None` until discovery publishes it
+(install no longer seeds `Some(true)`), so the `vrr_capable` property is
+withheld while the range is unknown, and the stored range/timings are
+cleared when a modeset's fresh AUX read finds no capability.
+
+`vrr_enabled` lives in atomic state (`drm::atomic::CrtcState::vrr_enabled:
+Option<bool>` alongside `vrr_changed`), not only in the `Card::vrr_enabled`
+side channel: the atomic decode in `drm_ioctl_bridge` records the
+requested value and, on the Intel driver only, sets `vrr_changed` when
+the value differs from the committed one, which folds into
+`needs_modeset` and `mode_changed` (Linux `intel_vrr_check_modeset`)
+so a VRR toggle is a full modeset that ALLOW_MODESET must permit.
+Other drivers keep the old shape (amdgpu_dm reprograms DRR in place;
+virtio needs no modeset). The atomic commit writes the value into
+`Card::vrr_enabled` and the post-commit apply step programs it.
+
+Timings are recomputed on every modeset from the committed mode and the
+sink range (`intel_gpu_vrr::recompute_timings_for_modeset`, called by
+`intel_gpu_dp::activate_on_pipe` and the DP-alt bridge's
+`bind_and_modeset`, Pipe A only), replacing the install-time seed
+(`intel_gpu_kms` seeds the mode only; range and timings start `None`).
+`VrrTimings::compute_config` is the `intel_vrr_compute_config`
+equivalent: `vmin = max(vtotal, ceil(clock / (htotal * max_vfreq)))`,
+`vmax = max(vtotal, floor(clock / (htotal * min_vfreq)))`, bail when
+`vmin >= vmax`, bail on interlaced or joiner modes, `flipline == vmin`,
+VSYNC only when AS SDP is supported (`VrrComputeOpts::as_sdp`).
+`compute_config_late` is the display-13+ late phase: the guardband is
+the vblank length at the minimum vtotal (`vmin - v_active`, floored at
+8, capped by `vtotal - v_active`), stored for all IPs, and Gen12
+derives `pipeline_full` (the value the hardware consumes instead of a
+guardband register) from it, clamped to 255 scanlines. The legacy
+`VrrTimings::compute` wrapper keeps the install/CMRR call sites'
+behaviour (`as_sdp` from the IP's VSYNC support).
+
+UNVERIFIED in this foundation: the Gen12 −1 write discrepancy (the
+register values from #1590 are kept; fetched Linux says ICL/TGL
+low-level code applies −1 to VMIN, but no Bspec was readable), the
+exact `pipeline_full` conversion (identity-with-255-clamp placeholder;
+only the 255 cap and the guardband→pipeline_full derivation are
+fetched), the VBT `vrr_feature_enabled` per-panel bit layout (offset 56
+verified from Linux 6.12 VBT defs; bit 0 / panel 0 assumed), and which
+DPCD bit reports AS-SDP support (discovery passes `as_sdp = false`
+until resolved). Sequencing (modeset/push/disable), DPCD+PSR, CMRR and
+readback remain separate lanes (#1769–#1772).
+
 `info_packet(timing, range, hdmi, active)` builds the ordinary AMD FreeSync
 v1 SPD (the primary non-PCON/non-replay packet), using the same effective
 range as the totals: HDMI header 83/01/08/00, DP header 00/83/1b/04,

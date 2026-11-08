@@ -1120,6 +1120,27 @@ impl Vbt {
         })
     }
 
+    /// BDB_LFP_POWER `vrr_feature_enabled` (BDB 233+, Linux 6.12
+    /// `intel_vbt_defs.h` `struct bdb_lfp_power`): the `u16` at block
+    /// offset 56 — packed layout `u8 lfp_feature_bits`, `als[5]` (4 B
+    /// each), `u8 lace_aggressiveness_profile`, seven `u16` fields
+    /// (`dpst`, `psr`, `drrs`, `lace_support`, `adt`, `dmrrs`,
+    /// `adb`), `u16 lace_enabled_status`, `aggressivenes[16]` (1 B
+    /// each), `u16 hobl`, then `u16 vrr_feature_enabled`.
+    ///
+    /// Linux's `intel_vrr_is_capable` gates eDP on the VBT `vrr`
+    /// flag; this is the only VRR field in the VBT definitions.
+    /// The per-panel bit layout is UNVERIFIED (no `intel_bios.c`
+    /// consumer was readable in this lane): like the neighbouring
+    /// PSR enable at offset 24, the field is read as a per-panel
+    /// bitmask and the Pipe-A panel (LFP1, panel 0) is bit 0. A VBT
+    /// older than BDB 233 or a short block reads as disabled.
+    pub fn vrr_feature_enabled(&self) -> bool {
+        self.lfp_power
+            .as_deref()
+            .is_some_and(|w| self.version >= 233 && panel_bits(u32::from(le16(w, 56)), 0, 1) != 0)
+    }
+
     /// `parse_psr` + the PSR enable for `panel` (0-15).
     pub fn psr_panel(&self, panel: u8) -> PsrPanel {
         let p = (panel & 0xF) as usize;
@@ -1735,6 +1756,18 @@ pub fn install_for_probe(
         return VbtInstall::NotApplicable;
     }
     let found = asls.and_then(discover);
+    // The Pipe-A eDP panel's VRR feature flag (Linux
+    // `intel_vrr_is_capable`'s VBT gate); installed for every
+    // generation the VBT applies to, not just Meteor Lake — the
+    // panel on Tiger/Alder Lake reads the same flag. Without a VBT
+    // the projection is Missing and eDP VRR is never capable.
+    crate::intel_gpu_vrr::install_vbt(
+        found
+            .as_ref()
+            .map_or(crate::intel_gpu_vrr::VbtVrr::Missing, |(vbt, _)| {
+                crate::intel_gpu_vrr::VbtVrr::from_vbt(vbt)
+            }),
+    );
     // The Pipe-A eDP PSR facts (intel_bios_init_panel's parse_psr and PSR
     // enable); without a VBT, psr.enable stays false as in Linux.
     if generation == Generation::MeteorLake {

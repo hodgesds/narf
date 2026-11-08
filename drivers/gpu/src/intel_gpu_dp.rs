@@ -421,6 +421,12 @@ pub struct DpSinkProbe {
     pub mode: Mode,
     /// The negotiated link configuration for that mode.
     pub negotiated: NegotiatedLink,
+    /// The sink's VRR range when it is VRR-capable (Linux
+    /// `intel_vrr_is_capable`: DPCD Ignore-MSA bit + EDID range
+    /// spread > 10 Hz); `None` otherwise. Published to the VRR
+    /// state on activation so the per-modeset compute uses the
+    /// sink's real range.
+    pub vrr_range: Option<crate::intel_gpu_vrr::VrrRange>,
     /// The complete EDID bytes (`edid_len` valid).
     pub edid: [u8; EDID_CAPACITY],
     /// Valid byte count in `edid`.
@@ -498,14 +504,47 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(mmio: &M, ddi: Ddi) -> Result<DpSinkPr
     // programs today.
     let demand = crate::dp_link_training::stream_demand_kbps(mode.pixel_clock_khz, 24);
     let negotiated = negotiate(&INTEL_SOURCE_CAPS, &caps, demand);
+    // VRR capability is decided here, at discovery, from the same
+    // DPCD caps + EDID the probe already read (Linux
+    // `intel_vrr_is_capable`). `HAS_VRR` holds for every display IP
+    // this driver supports (Gen12 through display 30); the VBT gate
+    // does not apply to external DP, only to eDP.
+    let vrr_range = crate::intel_gpu_vrr::sink_vrr_range(
+        &edid[..edid_len],
+        Some(&caps),
+        crate::intel_gpu_vrr::VrrConnectorKind::DisplayPort,
+        true,
+    );
     Ok(DpSinkProbe {
         ddi,
         caps,
         mode,
         negotiated,
+        vrr_range,
         edid,
         edid_len,
     })
+}
+
+/// The sink's VRR range from a fresh AUX read (DPCD caps + full
+/// EDID), for callers that modeset without a [`DpSinkProbe`] — the
+/// DP-Alt bridge, whose legacy modeset path owns EDID itself.
+/// Best-effort: `None` when AUX is unreachable or the sink is not
+/// VRR-capable.
+pub fn vrr_range_from_aux<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    ddi: Ddi,
+) -> Option<crate::intel_gpu_vrr::VrrRange> {
+    let mut aux = IntelAux::new(mmio, ddi);
+    let caps = read_caps(&mut aux).ok()?;
+    let mut edid = [0u8; EDID_CAPACITY];
+    let edid_len = read_full_edid(&mut aux, &mut edid).ok()?;
+    crate::intel_gpu_vrr::sink_vrr_range(
+        &edid[..edid_len],
+        Some(&caps),
+        crate::intel_gpu_vrr::VrrConnectorKind::DisplayPort,
+        true,
+    )
 }
 
 /// Phase 2 of a connect: modeset at the negotiated plan, then
@@ -560,6 +599,22 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
         intel_gpu_audio::audio_codec_enable(mmio, pipe.transcoder());
         intel_gpu_audio::set_eld_valid(mmio, pipe.transcoder(), true);
         audio_published = true;
+    }
+
+    // Per-modeset VRR compute (Pipe A only): the timings are
+    // recomputed from the mode this modeset actually committed and
+    // the range discovery published for the sink, instead of reusing
+    // install-time timings. AS SDP is not yet resolved from DPCD
+    // (UNVERIFIED), so VSYNC stays off; see `VrrComputeOpts`.
+    if pipe == Pipe::A {
+        let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_gen12_platform(family);
+        crate::intel_gpu_vrr::recompute_timings_for_modeset(
+            1,
+            &mode,
+            probe.vrr_range,
+            ip,
+            crate::intel_gpu_vrr::VrrComputeOpts::default(),
+        );
     }
 
     Ok(DpConnection {
