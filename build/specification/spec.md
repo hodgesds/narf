@@ -203,6 +203,10 @@ and CI compiler-cache integration.
   distinct MAC (52:54:00:12:34:56, then counting the last octet upward).
   Kernel-test config:
   `XTASK_QEMU_SECOND_NIC=1 cargo xtask test --arch=x86_64 --subsystem drivers/net/e1000`.
+  CI runs that invocation as the `run_second_nic` shard of the `kernel-test`
+  job (x86_64 only) whenever the e1000 driver, the net hub, or the bus
+  changes, a frame/verification change re-links the test harness, or the
+  run is full.
 - `cargo xtask affected --base REF --head REF --event EVENT` computes CI jobs,
   directly changed packages, reverse-dependent packages, and kernel subsystem
   filters from Cargo metadata and Rust registration tokens. PRs use their head

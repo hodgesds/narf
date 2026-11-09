@@ -199,6 +199,7 @@ pub struct Plan {
     pub run_large_memory: bool,
     pub run_xapic: bool,
     pub run_virtio_mmio: bool,
+    pub run_second_nic: bool,
     pub run_user_mode: bool,
     pub run_gpu_tests: bool,
     pub subsystems: BTreeSet<String>,
@@ -478,6 +479,10 @@ pub fn plan(
         || seeds.contains(KERNEL_BIN);
     p.run_virtio_mmio = p.full
         || has_any(&["narf-drivers-virtio", "narf-bus", "narf-io", "narf-arch"])
+        || seeds.contains(KERNEL_BIN)
+        || seeds.contains(VERIFICATION);
+    p.run_second_nic = p.full
+        || has_any(&["narf-drivers-net-e1000", "narf-drivers-net", "narf-bus"])
         || seeds.contains(KERNEL_BIN)
         || seeds.contains(VERIFICATION);
     p.run_user_mode = p.full
@@ -864,6 +869,7 @@ fn plan_value(p: &Plan) -> serde_json::Value {
         "run_net_smoke": p.run_net_smoke, "run_feature_matrix": p.run_feature_matrix,
         "run_uefi": p.run_uefi, "run_large_memory": p.run_large_memory,
         "run_xapic": p.run_xapic, "run_virtio_mmio": p.run_virtio_mmio,
+        "run_second_nic": p.run_second_nic,
         "run_user_mode": p.run_user_mode, "run_gpu_tests": p.run_gpu_tests,
     })
 }
@@ -1356,6 +1362,7 @@ mod tests {
         );
         assert!(p.run_kernel_test);
         assert!(!p.run_large_memory && !p.run_xapic && !p.run_virtio_mmio && !p.run_user_mode);
+        assert!(!p.run_second_nic);
         let p = plan(
             &["filesystem/src/lib.rs".into()],
             &fixture(),
@@ -1366,6 +1373,24 @@ mod tests {
         );
         assert!(p.run_user_mode);
         assert!(!p.run_large_memory && !p.run_xapic && !p.run_virtio_mmio);
+        assert!(!p.run_second_nic);
+    }
+
+    #[test]
+    fn second_nic_shard_follows_net_driver_changes() {
+        for file in ["drivers/net/src/tests.rs", "drivers/net/e1000/src/e1000.rs"] {
+            let p = plan(
+                &[file.into()],
+                &fixture(),
+                &tags(),
+                &BTreeMap::new(),
+                "pull_request",
+                false,
+            );
+            assert!(!p.full, "{file} must stay a scoped run");
+            assert!(p.run_second_nic, "{file} must select the second-NIC shard");
+            assert!(!p.run_large_memory && !p.run_xapic && !p.run_virtio_mmio && !p.run_user_mode);
+        }
     }
 
     #[test]
@@ -1380,7 +1405,12 @@ mod tests {
                 false,
             );
             assert!(
-                p.full && p.run_large_memory && p.run_xapic && p.run_user_mode && p.run_virtio_mmio
+                p.full
+                    && p.run_large_memory
+                    && p.run_xapic
+                    && p.run_user_mode
+                    && p.run_virtio_mmio
+                    && p.run_second_nic
             );
             assert_eq!(p.clippy_crates.len(), fixture().len());
         }

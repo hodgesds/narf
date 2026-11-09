@@ -57,6 +57,7 @@ jobs:
       run_large_memory: ${{ steps.affected.outputs.run_large_memory }}
       run_xapic: ${{ steps.affected.outputs.run_xapic }}
       run_virtio_mmio: ${{ steps.affected.outputs.run_virtio_mmio }}
+      run_second_nic: ${{ steps.affected.outputs.run_second_nic }}
       run_user_mode: ${{ steps.affected.outputs.run_user_mode }}
       run_boot_smoke: ${{ steps.affected.outputs.run_boot_smoke }}
       run_kernel_test: ${{ steps.affected.outputs.run_kernel_test }}
@@ -832,6 +833,27 @@ jobs:
         run: |
           cargo xtask test --arch=x86_64 --features cgroup-all,container \
             --subsystem interrupts --kernel-tests-only
+
+      # Two same-family NICs (issue #1632): `XTASK_QEMU_SECOND_NIC=1`
+      # attaches a second legacy NIC of the same model as the first on
+      # its own user-mode netdev `n2`, so the e1000 multi-instance
+      # fixture's two-device branch runs — `instance_count() == 2`,
+      # distinct names/MACs, and cookie-1 send routing. Scoped to
+      # `drivers/net/e1000` — a guard against regression, not a second
+      # full run. x86_64 only: the `drivers/net` test module is
+      # `#![cfg(target_arch = "x86_64")]`, so the fixture does not
+      # exist on aarch64. Gated on the affected plan's
+      # `run_second_nic`: the e1000 driver, the net hub, or the bus
+      # changed, a frame/verification change re-linked the test
+      # harness, or the run is full.
+      - name: cargo xtask test — second legacy NIC, two-device e1000
+        if: matrix.arch == 'x86_64' && needs.changes.outputs.run_second_nic == 'true'
+        env:
+          XTASK_QEMU_TIMEOUT_SECS: "2400"
+          XTASK_QEMU_SECOND_NIC: "1"
+        run: |
+          cargo xtask test --arch=x86_64 --features cgroup-all,container \
+            --subsystem drivers/net/e1000 --kernel-tests-only
 
       # Run the tests the `user-mode-e2e` feature gates. The clippy pass in
       # `clippy-kernel` proves they COMPILE on both arches; this proves they
