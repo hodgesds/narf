@@ -1072,6 +1072,14 @@ fn model_runtime(w: &Window, base: u32, start: u32, current: u32, active: bool) 
     let ring_base = image.borrow()[1024 + 9];
     let ring = w.0.borrow().memory[&ring_base].clone();
     let stamp = ring.borrow()[7];
+    // The CTX_TIMESTAMP value slot follows the second LRI group, which
+    // #1821 moved on non-Gen12 render (issue #1871): 0x25 on non-Gen12
+    // Rcs0, 0x23 elsewhere — the same predicate production resolves
+    // through Engine::timestamp_value_slot. The user-batch path always
+    // runs on Rcs0 (submit_user_inner → submit_ppgtt_probe_on(Rcs0)).
+    let slot = w.0.borrow().profile.map_or(0x23, |platform| {
+        crate::intel_gpu_engine::Engine::Rcs0.timestamp_value_slot(platform)
+    });
     assert_eq!(
         &ring.borrow()[..7],
         &[
@@ -1087,14 +1095,14 @@ fn model_runtime(w: &Window, base: u32, start: u32, current: u32, active: bool) 
     assert_eq!(image.borrow()[1024 + 0x13], base + 0x901);
     assert_eq!(
         &image.borrow()[0x900 / 4..0x910 / 4],
-        &[0x10400002, base + 0x108c, 0, 1]
+        &[0x10400002, base + 0x1000 + slot as u32 * 4, 0, 1]
     );
     let engine_base = image.borrow()[1024 + 2] - 0x244;
     {
         let mut words = image.borrow_mut();
         words[0x808 / 4] = stamp;
         words[0x810 / 4] = start;
-        words[1024 + 0x23] = if active { 1 } else { current };
+        words[1024 + slot as usize] = if active { 1 } else { current };
     }
     let mut device = w.0.borrow_mut();
     device.regs.insert(u64::from(engine_base + 0x3a8), current);
