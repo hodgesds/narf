@@ -11,6 +11,8 @@
 
 #![allow(dead_code)]
 
+use core::fmt;
+
 /// A field element in GF(2^130 - 5).
 /// Represented as 5 26-bit limbs to prevent 64-bit overflow during multiplication.
 /// Base field prime P = 2^130 - 5.
@@ -170,13 +172,28 @@ impl FieldElement {
 }
 
 /// Poly1305 state machine.
-#[derive(Debug)]
 pub struct Poly1305 {
     h: FieldElement,
     r: FieldElement,
     s: [u32; 4],
     buffer: [u8; 16],
     buffer_len: usize,
+}
+
+/// SEC-C2 (#1551): `r` and `s` ARE the one-time key halves and
+/// `h`/`buffer` hold key-derived / in-flight message state —
+/// `Debug` is hand-written and redacts them; only the public
+/// `buffer_len` prints. The derived `Debug` printed all five fields.
+impl fmt::Debug for Poly1305 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Poly1305")
+            .field("h", &"<redacted>")
+            .field("r", &"<redacted: 16 bytes>")
+            .field("s", &"<redacted: 16 bytes>")
+            .field("buffer", &"<redacted>")
+            .field("buffer_len", &self.buffer_len)
+            .finish()
+    }
 }
 
 impl Poly1305 {

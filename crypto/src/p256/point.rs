@@ -29,17 +29,32 @@
 //! recommendation in 802.11-2020 §12.4 NOTE: the loop runs the same
 //! number of operations regardless of the scalar's bit pattern.
 
+use core::fmt;
+
 use super::field::Fp;
 use super::scalar::Scalar;
 use super::{CURVE_B, GENERATOR_X, GENERATOR_Y};
 
 /// Affine point — (x, y) on the curve, OR the point-at-infinity
 /// (encoded as `infinity == true`, x/y ignored).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AffinePoint {
     pub x: Fp,
     pub y: Fp,
     pub infinity: bool,
+}
+
+/// SEC-C2 (#1551): an affine point can hold a secret intermediate
+/// (ECDH shared point, SAE values) — `Debug` is hand-written and
+/// redacts the coordinates; only the public `infinity` flag prints.
+impl fmt::Debug for AffinePoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AffinePoint")
+            .field("x", &"<redacted>")
+            .field("y", &"<redacted>")
+            .field("infinity", &self.infinity)
+            .finish()
+    }
 }
 
 impl AffinePoint {
@@ -121,11 +136,23 @@ impl AffinePoint {
 }
 
 /// Jacobian projective coordinates. Z = 0 marks the point at infinity.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ProjectivePoint {
     pub x: Fp,
     pub y: Fp,
     pub z: Fp,
+}
+
+/// SEC-C2 (#1551): same redaction as `AffinePoint` — projective
+/// coordinates can hold the same secret intermediates.
+impl fmt::Debug for ProjectivePoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProjectivePoint")
+            .field("x", &"<redacted>")
+            .field("y", &"<redacted>")
+            .field("z", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ProjectivePoint {
