@@ -7173,8 +7173,8 @@ mod smbus_rmi_smokes {
             if count as usize > buf.len() {
                 return Err(SmbusError::Failed);
             }
-            for i in 0..count as usize {
-                buf[i] = self.read_mem(rmiaddr.wrapping_add(i as u16));
+            for (i, slot) in buf.iter_mut().enumerate().take(count as usize) {
+                *slot = self.read_mem(rmiaddr.wrapping_add(i as u16));
             }
             Ok(count as usize)
         }
@@ -8629,7 +8629,7 @@ impl crate::psmouse::Ps2Transport for FakePs2 {
 /// One sliced command + GETINFO on the wire, spelled out
 /// literally (Linux `psmouse_sliced_command`: `0xE6`, then `0xE8`
 /// + each 2-bit slice, most significant first; the query number
-/// selects the response).
+///   selects the response).
 fn syn_query_wire(query: u8) -> [u8; 10] {
     [
         0xE6,

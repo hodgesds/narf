@@ -88,20 +88,20 @@
 //!      `psmouse_initialize` does the same). The restore is skipped
 //!      for Elantech — a rate set loses register 0x07 on v4 hardware
 //!      (Linux `elantech_set_rate_restore_reg_07`).
-//! ALPS absolute mode (`crate::alps`): once a pad is identified
-//! (see `alps::probe_alps` — the probe itself lives with the
-//! vendor negotiation in `psmouse`, landed in #1676) the packet
-//! length becomes 6 bytes (8 for v4) and complete packets are
-//! decoded by `alps::AlpsDecoder`. Touchpad reports ride the
-//! global ring as `TouchEvent`s (one per live slot, with `Down` /
-//! `Move` / `Up` state) plus single-touch `AbsoluteEvent`s, and
-//! evdev via the slot-protocol-B emitter (`MtEvdevState`).
-//! Trackstick and bare-PS/2 packets ride the relative
-//! `PointerEvent` path. Activation is explicit
-//! (`set_alps_protocol`); until then the 3-byte path below is
-//! byte-for-byte the old behaviour. Wiring `alps::probe_alps`
-//! into `psmouse::negotiate_protocol` so the negotiated model
-//! selects the decoder is a follow-up (see the PR body).
+//!      ALPS absolute mode (`crate::alps`): once a pad is identified
+//!      (see `alps::probe_alps` — the probe itself lives with the
+//!      vendor negotiation in `psmouse`, landed in #1676) the packet
+//!      length becomes 6 bytes (8 for v4) and complete packets are
+//!      decoded by `alps::AlpsDecoder`. Touchpad reports ride the
+//!      global ring as `TouchEvent`s (one per live slot, with `Down` /
+//!      `Move` / `Up` state) plus single-touch `AbsoluteEvent`s, and
+//!      evdev via the slot-protocol-B emitter (`MtEvdevState`).
+//!      Trackstick and bare-PS/2 packets ride the relative
+//!      `PointerEvent` path. Activation is explicit
+//!      (`set_alps_protocol`); until then the 3-byte path below is
+//!      byte-for-byte the old behaviour. Wiring `alps::probe_alps`
+//!      into `psmouse::negotiate_protocol` so the negotiated model
+//!      selects the decoder is a follow-up (see the PR body).
 //!   6. Synaptics absolute-mode enablement (`crate::psmouse`):
 //!      detect (4x SETRES(0) + GETINFO, byte 0x47), query the
 //!      hardware (identify/model/firmware/board/capability/
@@ -1771,8 +1771,8 @@ fn feed_byte_alps(byte: u8) {
 
     // Packet complete.
     let mut pkt = [0u8; 8];
-    for i in 0..len {
-        pkt[i] = STATE.pkt[i].load(Ordering::Acquire);
+    for (i, slot) in pkt.iter_mut().enumerate().take(len) {
+        *slot = STATE.pkt[i].load(Ordering::Acquire);
     }
     STATE.phase.store(0, Ordering::Release);
     let interleaved = alps.interleaved_collecting;
