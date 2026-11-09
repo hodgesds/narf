@@ -84,17 +84,17 @@
 //!
 //! ## Remainders
 //!
-//! - F$12 object count is 5, mirroring the HID pump's
-//!   multi-source fallback — the true count comes from the
-//!   F$12 Query 1 register at probe time (same remainder as
-//!   the HID path).
 //! - F$01-only ATTNs (device-status changes, e.g. "reset
 //!   occurred") are acknowledged by the status read and
 //!   otherwise ignored; reset recovery (re-probe) is a
 //!   follow-up, not part of this pump.
-//! - Axis ranges are the decoder field widths (F$12 u16,
-//!   F$11 12-bit), as in the HID pump — the true sensor
-//!   maxima from the F$11/F$12 queries would narrow them.
+//!
+//! The F$12 object count and the axis ranges used to be
+//! placeholders (5 objects, decoder field widths); they now
+//! come from the F$11/F$12 sensor-maximum queries decoded at
+//! probe time (`Rmi4DeviceProbe::f12_max_objects` /
+//! `sensor_bounds`), falling back to the old placeholders
+//! when a query read fails.
 
 extern crate alloc;
 
@@ -127,15 +127,6 @@ use crate::smbus_rmi::{
 /// steady-state cost is one SMBus byte-read per tick through
 /// the shared controller (see the module docs).
 pub const SMBUS_RMI_POLL_INTERVAL_MS: u64 = 16;
-
-/// F$12 objects decoded per service pass — mirrors the HID
-/// pump's multi-source fallback (true count from the F$12
-/// Query 1 register is a remainder).
-pub const SMBUS_RMI_F12_MAX_OBJECTS: usize = 5;
-
-/// F$11 fingers decoded per service pass — mirrors the HID
-/// pump (1 finger-state byte + 5 bytes per finger).
-pub const SMBUS_RMI_F11_MAX_FINGERS: usize = 5;
 
 // ── Attention GPIO routing ─────────────────────────────────────────
 
@@ -317,9 +308,13 @@ pub fn service_attn(
     let f11_mask = probe.source_mask_for(F11_2D_TOUCHPAD);
     if f12_mask != 0 && sources & f12_mask != 0 {
         if let Some(f12) = &probe.f12 {
-            let mut buf = [0u8; SMBUS_RMI_F12_MAX_OBJECTS * F12_OBJECT_SIZE];
+            // `probe.f12_max_objects()` objects, decoded at
+            // probe time from the F$12 Data-1 descriptor
+            // (fallback 5).
+            let nobj = probe.f12_max_objects();
+            let mut buf = alloc::vec![0u8; nobj * F12_OBJECT_SIZE];
             if transport.read_block(f12.data_base as u16, &mut buf).is_ok() {
-                if let Ok(objs) = decode_f12_data1(&buf, SMBUS_RMI_F12_MAX_OBJECTS) {
+                if let Ok(objs) = decode_f12_data1(&buf, nobj) {
                     let contacts: Vec<Rmi4Contact> = objs
                         .iter()
                         .map(|o| Rmi4Contact {
@@ -333,12 +328,7 @@ pub fn service_attn(
                         node,
                         &contacts,
                         btn_left,
-                        crate::rmi4_core::Rmi4PumpBounds {
-                            x_min: 0,
-                            x_max: 0xFFFF,
-                            y_min: 0,
-                            y_max: 0xFFFF,
-                        },
+                        probe.sensor_bounds(),
                     ));
                 }
             }
@@ -347,10 +337,13 @@ pub fn service_attn(
     }
     if f11_mask != 0 && sources & f11_mask != 0 {
         if let Some(f11) = &probe.f11 {
-            // F$11 frame: 1 finger-state byte + 5 bytes per finger.
-            let mut buf = [0u8; 1 + SMBUS_RMI_F11_MAX_FINGERS * 5];
+            // F$11 frame: 1 finger-state byte + 5 bytes per
+            // finger; the finger count comes from the F$11
+            // Query 1 register at probe time (fallback 5).
+            let nfingers = probe.f11_max_fingers();
+            let mut buf = alloc::vec![0u8; 1 + nfingers * 5];
             if transport.read_block(f11.data_base as u16, &mut buf).is_ok() {
-                if let Ok(rep) = TouchpadReport::parse(&buf, SMBUS_RMI_F11_MAX_FINGERS) {
+                if let Ok(rep) = TouchpadReport::parse(&buf, nfingers) {
                     let contacts: Vec<Rmi4Contact> = rep
                         .fingers
                         .iter()
@@ -365,12 +358,7 @@ pub fn service_attn(
                         node,
                         &contacts,
                         btn_left,
-                        crate::rmi4_core::Rmi4PumpBounds {
-                            x_min: 0,
-                            x_max: 0x0FFF,
-                            y_min: 0,
-                            y_max: 0x0FFF,
-                        },
+                        probe.sensor_bounds(),
                     ));
                 }
             }
@@ -381,17 +369,7 @@ pub fn service_attn(
     // coincident button bit): pump the button state with no
     // contacts rather than dropping the frame.
     if sources & probe.source_mask_for(F30_GPIO_LED) != 0 {
-        return Ok(state.pump_contacts(
-            node,
-            &[],
-            btn_left,
-            crate::rmi4_core::Rmi4PumpBounds {
-                x_min: 0,
-                x_max: 0xFFFF,
-                y_min: 0,
-                y_max: 0xFFFF,
-            },
-        ));
+        return Ok(state.pump_contacts(node, &[], btn_left, probe.sensor_bounds()));
     }
     Ok(0)
 }

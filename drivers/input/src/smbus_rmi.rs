@@ -522,13 +522,16 @@ pub fn probe_smbus_rmi_with_state() -> Option<(Rmi4DeviceProbe, SmbusRmiSessionS
         let (version, probe, state) = probe_at_with_state(c, SMBUS_RMI_DEFAULT_ADDR)?;
         let _ = writeln!(
             narf_console::Writer,
-            "  smbus-rmi: bound addr={:#04x} version={:?} manufacturer={} f11={} f12={} f30={}",
+            "  smbus-rmi: bound addr={:#04x} version={:?} manufacturer={} f11={} f12={} f30={} max={}x{} slots={}",
             SMBUS_RMI_DEFAULT_ADDR,
             version,
             probe.product.manufacturer_id,
             probe.f11.is_some(),
             probe.f12.is_some(),
             probe.f30.is_some(),
+            probe.sensor_axis_maxima().0,
+            probe.sensor_axis_maxima().1,
+            probe.sensor_slots(),
         );
         Some((probe, state))
     })
