@@ -801,20 +801,33 @@ fn navi22_trained_owner_survives_recovery_rebuild() -> TestResult {
         )
     }
     .unwrap();
+    // SAFETY: same constructor as `unfinished` above: no I/O, the trainer
+    // only allocates its preimage/cache, and every step below refuses
+    // before touching the device.
     let mut boot = unsafe {
         ColdBoot::new_with_training(&trained_gpu, authority, &pool, boot_firmware, exchange)
     }
     .unwrap();
     // A cold-path control: its finished trainer must cold-train (`run`),
     // not replay, when its owner has no reset to replay after.
+    // SAFETY: same constructor as `unfinished` above: no I/O, the trainer
+    // only allocates its preimage/cache, and every step below refuses
+    // before touching the device.
     let mut cold = unsafe {
         ColdBoot::new_with_training(&trained_gpu, authority, &pool, firmware(), exchange)
     }
     .unwrap();
     for owner in [&mut unfinished, &mut boot] {
+        // SAFETY: register reads are backed by the zeroed fixture regs and
+        // the pool is the consistent aperture for them; each owner
+        // exclusively owns its fixture-GPU snapshot, authority and pool
+        // slice, and no other PSP owner exists in this test.
         let psp =
             unsafe { psp::Psp::new_rdna2(&owner.sequence.backend.gpu, authority, &pool) }.unwrap();
         owner.sequence.backend.psp = Some(psp);
+        // SAFETY: forwarded whole-GPU/pool/PCI ownership from the owner;
+        // no I/O or interrupt routing occurs during construction, and no
+        // other IH owner exists in this test.
         let ih = unsafe {
             crate::amdgpu_ih_navi22::Ih::new_rdna2(
                 &owner.sequence.backend.gpu,
