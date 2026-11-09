@@ -308,16 +308,23 @@ complete `rtnl_link_stats64` counter set. `set_link_state` changes only
 administrative `IFF_UP`; a driver publishes an authoritative PHY sample with
 `set_link_metadata(name, carrier, speed_mbps, duplex)`. A driver whose
 hardware reports transceiver/module state publishes it separately with
-`set_link_media(name, media_available, phy_type)` (issue #791 / #867):
+`set_link_media(name, media_available, phy_type, phy_type_name)` (issue #791 / #867):
 `media_available` is `Some(true)` while a module is seated even when the
 link is down and `Some(false)` for an empty cage, and it is deliberately
 NOT cleared on carrier-down; `phy_type` is the family's raw firmware
-PHY-type code (`I40E_PHY_TYPE_*` for i40e — decoding it to a name is
-#867's table work), and an empty cage clears it, so no type is ever
-reported for a module that is no longer seated. `publish_link` in the
+PHY-type code (`I40E_PHY_TYPE_*` for i40e), and an empty cage clears it, so no type is ever
+reported for a module that is no longer seated. The fourth argument,
+`phy_type_name`, is the decoded name for that code (issue #867) — for
+i40e the `I40E_PHY_TYPE_*` suffix (`"SFI"`, `"10GBASE_SR"`) from the
+sourced Linux table; other families publish their own table's names as
+they gain decodes, `None` until then. It follows the raw code exactly:
+it survives carrier-down and clears with an empty cage. `publish_link` in the
 shared driver publication layer forwards a sample's media fields
 through `set_link_media` when present. Rtnetlink/sysfs surfacing of
-the media fields is still open (see #867). A driver whose
+the media fields is still open (see #867): the fields exist in entry
+and snapshot metadata so a consumer can read them, but no
+sysfs/rtnetlink file renders them yet — that surfacing decision is the
+documented remainder, not a silent drop.
 hardware must be started on `IFF_UP` (`ndo_open` / `ndo_stop`) installs
 `iface::set_open_stop(name, hook: fn(&str, bool)) -> bool` after `register`
 (registration clears it); `set_link_state` calls the hook on every real

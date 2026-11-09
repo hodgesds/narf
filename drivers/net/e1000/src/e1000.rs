@@ -2194,6 +2194,7 @@ fn link_sample_from_status(status: u32) -> crate::publish::LinkSample {
         // fixed copper/fiber, not caged modules (issue #791).
         media_available: None,
         phy_type: None,
+        phy_type_name: None,
     }
 }
 
