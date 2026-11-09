@@ -260,6 +260,20 @@ pub fn wall_offset_ns() -> i64 {
     WALL_OFFSET_NS.load(Ordering::Acquire)
 }
 
+/// Add `delta_ns` to the monotonic→wall offset — step or slew the wall
+/// clock without touching monotonic time.
+///
+/// This is the NTP discipline loop's actuator (`narf_time::ntp::tick_second`
+/// folds each second's phase chunk in here, and `ntp::apply_sample` folds a
+/// step in here): NARF has no timekeeper multiplier to steer, so the wall
+/// offset is where phase corrections land. Atomic, so it is safe from the
+/// tick handler's IRQ context as well as from syscall context.
+pub fn adjust_wall_offset_ns(delta_ns: i64) {
+    if delta_ns != 0 {
+        WALL_OFFSET_NS.fetch_add(delta_ns, Ordering::AcqRel);
+    }
+}
+
 /// Begin a leap-smear over `window_ns` — gradually fold a `delta_ns`
 /// correction into the wall offset instead of stepping. Negative
 /// deltas smear backwards; zero is rejected because it's nonsense.
