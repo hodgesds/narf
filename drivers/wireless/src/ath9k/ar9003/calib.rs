@@ -22,7 +22,10 @@
 //! `ath9k_hw_loadnf` + `ath9k_hw_start_nfcal(ah, true)`, and the periodic
 //! `ar9003_hw_calibrate` driven by `link.c::ath_ani_calibrate` (ANI is not
 //! part of this owner), with the AR9300 `ar9003_hw_set_nf_limits` limits
-//! and the `ar9300_cca_regs` control-chain NF registers.
+//! and the `ar9300_cca_regs` control-chain NF registers. On MCI parts
+//! the MCI calibration handshake (`mci::init_cal_req` / `init_cal_done`,
+//! `mci::start_reset` / `end_reset`) wraps this calibration when the
+//! link is enabled; the handshake lives in `mci`, not here.
 //!
 //! TX IQ calibration as Linux runs it on AR9300: `ar9003_hw_init_cal_settings`
 //! enables `TX_IQ_CAL`, so `init_cal_pcoem` programs the
