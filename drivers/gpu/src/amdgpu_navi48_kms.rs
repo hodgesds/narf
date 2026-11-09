@@ -348,14 +348,12 @@ pub fn apply_routed_vrr(
             have.modes = modes;
             have.connector_type = c.kind;
         }
-        let is_hdmi_or_dp = matches!(c.kind, ConnectorType::HdmiA | ConnectorType::DisplayPort);
-        let color_format = if c.kind == ConnectorType::HdmiA {
-            Some(Default::default())
-        } else {
-            None
-        };
+        // The amdgpu_dm connector properties stay unattached here:
+        // apply_routed_native and the Navi22 post-pass attach them per
+        // platform, preserving committed values; the bare path attaches
+        // none (and drops any), as the VRR pair already does.
         native.push(NativeOutput {
-            color_format,
+            color_format: None,
             connector: connector_id(c.index),
             edid: edid.map(<[u8]>::to_vec),
             timings,
@@ -363,9 +361,9 @@ pub fn apply_routed_vrr(
             // all these ever are.
             broadcast_rgb: Some(crate::amdgpu_navi48_boot::broadcast_rgb()),
             vrr_capable: vrr_capable.map(|v| v.get(n).copied().unwrap_or(false)),
-            colorspace: if is_hdmi_or_dp { Some(0) } else { None },
-            hdr_output_metadata: if is_hdmi_or_dp { Some(0) } else { None },
-            max_bpc: Some(crate::amdgpu_navi48_boot::max_bpc()),
+            colorspace: None,
+            hdr_output_metadata: None,
+            max_bpc: None,
         });
     }
     // The CRTCs' vblanks are the displays' hardware ones, and their planes
