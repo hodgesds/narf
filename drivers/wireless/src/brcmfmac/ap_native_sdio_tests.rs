@@ -86,6 +86,71 @@ struct SdioBound {
     database: Arc<narf_wireless::reg::db::Database>,
     name: String,
 }
+/// Surface the inner `Station::initialize_live` failure instead of
+/// collapsing every step into the one shared reason string: all 16 SDIO
+/// tests build through `SdioBound::build`, so a single string hides which
+/// step actually failed in the guest (#1812). One distinct string per
+/// `crate::cyw43439::runtime::Error` variant (and per transport cause
+/// under `Transport`); the fixture error type stays `&'static str`, so a
+/// firmware code is never embedded in the string.
+fn station_init_error(error: crate::cyw43439::runtime::Error) -> &'static str {
+    use crate::cyw43439::runtime::Error;
+    use crate::cyw43439::transport::TransportError;
+    match error {
+        // `initialize_inner` returns `Transport` from every firmware
+        // command (version, CLM chunk load, country, bus configuration,
+        // PHY probe, iovar sets/gets, channel list) and from the
+        // event/write paths; the transport cause is what the code can
+        // distinguish here.
+        Error::Transport(TransportError::BadFraming) => {
+            "SDIO AP actual BCDC/Station initialization: transport bad framing"
+        }
+        Error::Transport(TransportError::Busy) => {
+            "SDIO AP actual BCDC/Station initialization: transport busy"
+        }
+        Error::Transport(TransportError::Denied) => {
+            "SDIO AP actual BCDC/Station initialization: transport denied"
+        }
+        Error::Transport(TransportError::ChipFlowError) => {
+            "SDIO AP actual BCDC/Station initialization: transport chip flow error"
+        }
+        Error::Transport(TransportError::LengthOverflow) => {
+            "SDIO AP actual BCDC/Station initialization: transport length overflow"
+        }
+        Error::Transport(TransportError::AddressOverflow) => {
+            "SDIO AP actual BCDC/Station initialization: transport address overflow"
+        }
+        Error::Transport(TransportError::Timeout) => {
+            "SDIO AP actual BCDC/Station initialization: transport timeout"
+        }
+        Error::Transport(TransportError::NotReady) => {
+            "SDIO AP actual BCDC/Station initialization: transport not ready"
+        }
+        Error::Transport(TransportError::Other(_)) => {
+            "SDIO AP actual BCDC/Station initialization: transport other"
+        }
+        // CLM/country validation, the MAC check, the `mfp` reply shape,
+        // and the channel-list parse all return `Malformed`; the variant
+        // cannot name which of those steps failed.
+        Error::Malformed => "SDIO AP actual BCDC/Station initialization: malformed",
+        // Firmware version reply other than 2, or no usable channel.
+        Error::Unsupported => "SDIO AP actual BCDC/Station initialization: unsupported",
+        // Policy authority: snapshot absent at `initialize_live` entry,
+        // snapshot gone or country changed across `refresh_policy` /
+        // `check_initial` / `enable`, or the channel list emptied by the
+        // post-init retain. All three collapse to this one variant, so
+        // the string names the class, not the sub-cause.
+        Error::Authority => "SDIO AP actual BCDC/Station initialization: authority",
+        Error::Busy => "SDIO AP actual BCDC/Station initialization: busy",
+        Error::Timeout => "SDIO AP actual BCDC/Station initialization: timeout",
+        Error::Failed => "SDIO AP actual BCDC/Station initialization: failed",
+        Error::EventOverflow => "SDIO AP actual BCDC/Station initialization: event overflow",
+        // Firmware refusals (`clmload_status` nonzero, a refused iovar,
+        // a firmware event status/reason). The numeric code cannot be
+        // embedded in a `&'static str`.
+        Error::Firmware(_) => "SDIO AP actual BCDC/Station initialization: firmware",
+    }
+}
 impl SdioBound {
     fn new() -> Result<Self, &'static str> {
         Self::new_capability(b"ap sta wme\0", true)
@@ -160,7 +225,7 @@ impl SdioBound {
             &assets.clm,
             database.clone(),
         ))?
-        .map_err(|_| "SDIO AP actual BCDC/Station initialization")?;
+        .map_err(station_init_error)?;
         let name = narf_net::iface::register("wlan%d", OWN, sdio_send);
         let device = sdio_shell(name.clone(), station);
         // Production `attach_runtime` registers the netdev capability and
@@ -1451,4 +1516,125 @@ fn smoke_cyw_sdio_reset_power_cycles_reboots_replays_and_rejoins_same_netdev() -
 kernel_test_in!(
     "drivers/wireless/cyw43439/sdio",
     smoke_cyw_sdio_reset_power_cycles_reboots_replays_and_rejoins_same_netdev
+);
+
+/// #1812 diagnostic: a policy loss before firmware-up makes
+/// `Station::initialize_live` fail with `Error::Authority`, and the
+/// surfaced fixture string must name the authority step instead of the
+/// shared BCDC/Station string. The msgbuf adapter stands in for the SDIO
+/// one here: both drive the same `initialize_live` and the same
+/// `runtime::Error`, and the SDIO path itself cannot run on the host
+/// (firmware registry install fails OutOfMemory without the kernel
+/// frame/DMA allocator).
+fn sdio_station_init_error_surfaces_authority() -> Result<(), &'static str> {
+    use crate::cyw43439::runtime::Error;
+    use crate::cyw43439::transport::TransportError;
+    for version in [5, 6] {
+        let database = Arc::new(narf_wireless::reg::db::Database::new());
+        database.install(firmware::domain());
+        let Ok((adapter, bus)) = firmware::create(version, true) else {
+            return Err("native bootstrap owner");
+        };
+        bus.clear_policy_on(86, database.clone());
+        let result = ready(Station::initialize_live(adapter, &[], database))?;
+        let Err(error) = result else {
+            return Err("policy loss during setup still initialized the station");
+        };
+        if !matches!(error, Error::Authority) {
+            return Err("policy loss during setup did not fail with authority");
+        }
+        if station_init_error(error) != "SDIO AP actual BCDC/Station initialization: authority" {
+            return Err("authority failure did not surface the authority step");
+        }
+        if bus.commands().iter().any(|(command, _, _)| *command == 2) {
+            return Err("policy loss during setup enabled firmware");
+        }
+    }
+    // Every inner variant maps to a distinct surfaced string.
+    let cases = [
+        (
+            Error::Transport(TransportError::BadFraming),
+            "SDIO AP actual BCDC/Station initialization: transport bad framing",
+        ),
+        (
+            Error::Transport(TransportError::Busy),
+            "SDIO AP actual BCDC/Station initialization: transport busy",
+        ),
+        (
+            Error::Transport(TransportError::Denied),
+            "SDIO AP actual BCDC/Station initialization: transport denied",
+        ),
+        (
+            Error::Transport(TransportError::ChipFlowError),
+            "SDIO AP actual BCDC/Station initialization: transport chip flow error",
+        ),
+        (
+            Error::Transport(TransportError::LengthOverflow),
+            "SDIO AP actual BCDC/Station initialization: transport length overflow",
+        ),
+        (
+            Error::Transport(TransportError::AddressOverflow),
+            "SDIO AP actual BCDC/Station initialization: transport address overflow",
+        ),
+        (
+            Error::Transport(TransportError::Timeout),
+            "SDIO AP actual BCDC/Station initialization: transport timeout",
+        ),
+        (
+            Error::Transport(TransportError::NotReady),
+            "SDIO AP actual BCDC/Station initialization: transport not ready",
+        ),
+        (
+            Error::Transport(TransportError::Other(0)),
+            "SDIO AP actual BCDC/Station initialization: transport other",
+        ),
+        (
+            Error::Malformed,
+            "SDIO AP actual BCDC/Station initialization: malformed",
+        ),
+        (
+            Error::Unsupported,
+            "SDIO AP actual BCDC/Station initialization: unsupported",
+        ),
+        (
+            Error::Authority,
+            "SDIO AP actual BCDC/Station initialization: authority",
+        ),
+        (
+            Error::Busy,
+            "SDIO AP actual BCDC/Station initialization: busy",
+        ),
+        (
+            Error::Timeout,
+            "SDIO AP actual BCDC/Station initialization: timeout",
+        ),
+        (
+            Error::Failed,
+            "SDIO AP actual BCDC/Station initialization: failed",
+        ),
+        (
+            Error::EventOverflow,
+            "SDIO AP actual BCDC/Station initialization: event overflow",
+        ),
+        (
+            Error::Firmware(1),
+            "SDIO AP actual BCDC/Station initialization: firmware",
+        ),
+    ];
+    for (error, expected) in cases {
+        if station_init_error(error) != expected {
+            return Err("inner station error did not surface its step");
+        }
+    }
+    Ok(())
+}
+fn smoke_cyw_sdio_station_init_error_surfaces_authority() -> TestResult {
+    match sdio_station_init_error_surfaces_authority() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/cyw43439/sdio",
+    smoke_cyw_sdio_station_init_error_surfaces_authority
 );
