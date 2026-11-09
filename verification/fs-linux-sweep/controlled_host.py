@@ -5,6 +5,7 @@ The cgroup partition follows docs.kernel.org/admin-guide/cgroup-v2.html.
 No host-wide ASLR change is needed: both benchmark guests opt out per process.
 """
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
@@ -76,8 +77,25 @@ def restore_policy(base, original):
     (base / "scaling_max_freq").write_text(original["scaling_max_freq"] + "\n")
     (base / "scaling_min_freq").write_text(original["scaling_min_freq"] + "\n")
     (base / "energy_performance_preference").write_text(original["energy_performance_preference"] + "\n")
+    deadline = time.monotonic() + 5
+    while any(read(base / name) != value for name, value in original.items()) and time.monotonic() < deadline:
+        time.sleep(0.1)
     if any(read(base / name) != value for name, value in original.items()):
         raise RuntimeError(f"restoration verification failed for {base}")
+
+
+def remove_partition(group):
+    group = Path(group)
+    if not group.exists(): return
+    if read(group / "cgroup.procs"): raise RuntimeError("temporary cgroup still populated")
+    (group / "cpuset.cpus.partition").write_text("member\n")
+    (group / "cpuset.cpus.exclusive").write_text("\n")
+    until = time.monotonic() + 15
+    while True:
+        try: group.rmdir(); return
+        except OSError as error:
+            if error.errno != errno.EBUSY or time.monotonic() >= until: raise
+            time.sleep(0.1)
 
 
 def initial_window(state, seconds=30):
@@ -110,18 +128,29 @@ def plan():
                   if read(p / "name") == "nvme" and (p / "device").resolve().name == "nvme0")
     return dict(cpus=cpus, frequency_khz=nominal.pop(), cgroup=f"/sys/fs/cgroup/narf-fs-bench-{os.getpid()}",
                 sensors={"cpu": str(cpu_sensor / "temp1_input"), "nvme": str(sensor / "temp1_input")},
-                limits={"cpu": 70000, "nvme": int(read(sensor / "temp1_crit")) - 5000},
+                # AMD specifies Tjmax=100 C for the Ryzen 9 7940HX; retain
+                # a 15 C margin instead of treating ordinary 70 C as a throttle.
+                limits={"cpu": 85000, "nvme": int(read(sensor / "temp1_crit")) - 5000},
                 storage_alarm=str(sensor / "temp1_alarm"), storage=disk)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--apply", action="store_true")
+    p.add_argument("--restore-existing", action="store_true")
     p.add_argument("--workdir", type=Path, required=True)
     p.add_argument("--narf-kernel", type=Path, required=True)
     p.add_argument("--linux-kernel", type=Path, required=True)
     p.add_argument("--samples", type=int, default=100)
     args = p.parse_args()
+    if args.restore_existing:
+        state = json.loads((args.workdir / "host-controls.json").read_text())
+        remove_partition(Path(state["cgroup"]))
+        for name, original in [("cpufreq/boost", state["boost_original"]), ("smt/control", state["smt_original"])]:
+            (CPU_ROOT / name).write_text(original + "\n")
+        for directory, original in state["policies_original"].items(): restore_policy(directory, original)
+        (args.workdir / "host-restoration.json").write_text(json.dumps(dict(errors=[], restored=True, recovery=True)) + "\n")
+        return 0
     state = plan()
     if not args.apply:
         print(json.dumps(state, indent=2)); return 0
@@ -188,9 +217,8 @@ def main():
                     except ProcessLookupError: pass
                 until = time.monotonic() + 5
                 while read(group / "cgroup.procs") and time.monotonic() < until: time.sleep(0.05)
-                (group / "cpuset.cpus.partition").write_text("member\n")
-                group.rmdir()
-            except OSError as e: errors.append(str(e))
+                remove_partition(group)
+            except (OSError, RuntimeError) as e: errors.append(str(e))
         # Restore global capabilities before their per-policy limits. Boost and
         # CPU hotplug may themselves change the visible policy bounds.
         for path, original in [(CPU_ROOT / "cpufreq/boost", state["boost_original"]),

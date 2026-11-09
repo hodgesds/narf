@@ -294,4 +294,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        status = "PreconditionFailed" if "PreconditionFailed" in str(error) else "InvalidRun"
+        print(json.dumps(dict(status=status, performance_record=False, reason=str(error))), flush=True)
+        sys.exit(1)

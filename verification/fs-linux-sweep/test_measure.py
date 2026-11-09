@@ -1,4 +1,5 @@
 """Reject incomplete evidence and exercise reversible host-control helpers."""
+import errno
 from pathlib import Path
 import tempfile
 import unittest
@@ -79,6 +80,17 @@ class HostControls(unittest.TestCase):
             (root / "scaling_governor").write_text("performance")
             host.restore_policy(root, original)
             self.assertEqual({name: host.read(root / name) for name in original}, original)
+
+    def test_partition_removal_retries_transient_busy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            group = Path(directory)
+            (group / "cgroup.procs").write_text("")
+            with patch.object(Path, "rmdir", side_effect=[OSError(errno.EBUSY, "busy"), None]) as remove, \
+                 patch.object(host.time, "sleep"):
+                host.remove_partition(group)
+                self.assertEqual(remove.call_count, 2)
+            (group / "cgroup.procs").write_text("123")
+            with self.assertRaises(RuntimeError): host.remove_partition(group)
 
 
 if __name__ == "__main__": unittest.main()

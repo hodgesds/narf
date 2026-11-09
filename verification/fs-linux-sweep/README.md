@@ -102,6 +102,10 @@ start and throughout each guest. A 30-second window must show temperatures
 below the tripwires and all reserved cores below 5% load before collection.
 It snapshots all frequency policies before hotplug/governor changes and
 restores policies, preferences, SMT, boost and the partition on every exit.
+The CPU tripwire is 85°C, retaining 15°C below AMD's specified 100°C maximum
+for this runner's [Ryzen 9 7940HX](https://www.amd.com/en/products/processors/laptop/ryzen/7000-series/amd-ryzen-9-7940hx.html).
+An interrupted cleanup can be retried with `--restore-existing` and the same
+work directory; saved policies are verified after asynchronous transitions.
 Missing controls abort the run; `--pilot` produces no performance record.
 
 ```sh
