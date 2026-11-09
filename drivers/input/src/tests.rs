@@ -7090,15 +7090,23 @@ mod smbus_rmi_smokes {
     const OP_WRITE_WORD: u8 = 3;
     const OP_READ_BLOCK: u8 = 4;
     const OP_WRITE_BLOCK: u8 = 5;
+    /// I2C block read (`read_i2c_block_data`).
+    const OP_READ_I2C_BLOCK: u8 = 6;
 
     /// Faithful miniature RMI4-over-SMBus device (see the module
-    /// docs). Page-0 only; reads on any other page return zero.
+    /// docs). Page-0 only for the flat image, plus a page-1 bank
+    /// for the page-boundary test; reads on any other page return
+    /// zero. `packets` models multi-byte packet registers: a
+    /// read at a registered address streams that packet's bytes,
+    /// not the flat-memory window at the following addresses.
     #[derive(Debug)]
     struct FakeSmbus {
         mem: IrqSafeSpinLock<[u8; 256]>,
+        mem1: IrqSafeSpinLock<[u8; 256]>,
         page: IrqSafeSpinLock<u8>,
         version: u8,
         map: IrqSafeSpinLock<[(u16, u8); 8]>,
+        packets: IrqSafeSpinLock<Vec<(u16, Vec<u8>)>>,
         writes: IrqSafeSpinLock<Vec<(u8, u8, Vec<u8>)>>,
         reads: IrqSafeSpinLock<Vec<(u8, u8)>>,
     }
@@ -7107,26 +7115,54 @@ mod smbus_rmi_smokes {
         fn new(mem: [u8; 256], version: u8) -> Self {
             Self {
                 mem: IrqSafeSpinLock::new(mem),
+                mem1: IrqSafeSpinLock::new([0u8; 256]),
                 page: IrqSafeSpinLock::new(0),
                 version,
                 map: IrqSafeSpinLock::new([(0, 0); 8]),
+                packets: IrqSafeSpinLock::new(Vec::new()),
                 writes: IrqSafeSpinLock::new(Vec::new()),
                 reads: IrqSafeSpinLock::new(Vec::new()),
             }
         }
 
+        /// Register a multi-byte packet register: a read of K
+        /// bytes at `addr` (full 16-bit RMI address) returns
+        /// the packet's first K bytes — this is what makes an
+        /// F$12 descriptor packet different from consecutive
+        /// scalar registers, whose K bytes live at K
+        /// consecutive addresses.
+        fn register_packet(&self, addr: u16, bytes: &[u8]) {
+            self.packets.lock().push((addr, bytes.to_vec()));
+        }
+
+        fn packet_at(&self, addr: u16) -> Option<Vec<u8>> {
+            self.packets
+                .lock()
+                .iter()
+                .find(|(a, _)| *a == addr)
+                .map(|(_, b)| b.clone())
+        }
+
         fn read_mem(&self, addr: u16) -> u8 {
-            if *self.page.lock() != 0 || addr >= 256 {
+            if addr >= 256 {
                 return 0;
             }
-            self.mem.lock()[addr as usize]
+            match *self.page.lock() {
+                0 => self.mem.lock()[addr as usize],
+                1 => self.mem1.lock()[addr as usize],
+                _ => 0,
+            }
         }
 
         fn write_mem(&self, addr: u16, value: u8) {
-            if *self.page.lock() != 0 || addr >= 256 {
+            if addr >= 256 {
                 return;
             }
-            self.mem.lock()[addr as usize] = value;
+            match *self.page.lock() {
+                0 => self.mem.lock()[addr as usize] = value,
+                1 => self.mem1.lock()[addr as usize] = value,
+                _ => {}
+            }
         }
     }
 
@@ -7135,6 +7171,12 @@ mod smbus_rmi_smokes {
             self.reads.lock().push((OP_READ_BYTE, cmd));
             if cmd == 0xFD {
                 return Ok(self.version);
+            }
+            let full = ((*self.page.lock() as u16) << 8) | cmd as u16;
+            if let Some(pkt) = self.packet_at(full) {
+                if let Some(b) = pkt.first() {
+                    return Ok(*b);
+                }
             }
             Ok(self.read_mem(cmd as u16))
         }
@@ -7151,8 +7193,16 @@ mod smbus_rmi_smokes {
         }
         fn read_word_data(&self, _addr: u8, cmd: u8) -> Result<u16, SmbusError> {
             self.reads.lock().push((OP_READ_WORD, cmd));
-            let lo = self.read_mem(cmd as u16);
-            let hi = self.read_mem(cmd.wrapping_add(1) as u16);
+            let full = ((*self.page.lock() as u16) << 8) | cmd as u16;
+            let pkt = self.packet_at(full);
+            let lo = match &pkt {
+                Some(p) if !p.is_empty() => p[0],
+                _ => self.read_mem(cmd as u16),
+            };
+            let hi = match &pkt {
+                Some(p) if p.len() > 1 => p[1],
+                _ => self.read_mem(cmd.wrapping_add(1) as u16),
+            };
             Ok(u16::from_le_bytes([lo, hi]))
         }
         fn write_word_data(&self, _addr: u8, cmd: u8, value: u16) -> Result<(), SmbusError> {
@@ -7177,6 +7227,33 @@ mod smbus_rmi_smokes {
                 *slot = self.read_mem(rmiaddr.wrapping_add(i as u16));
             }
             Ok(count as usize)
+        }
+        fn read_i2c_block_data(
+            &self,
+            _addr: u8,
+            cmd: u8,
+            buf: &mut [u8],
+        ) -> Result<usize, SmbusError> {
+            self.reads.lock().push((OP_READ_I2C_BLOCK, cmd));
+            if buf.is_empty() || buf.len() > 32 {
+                return Err(SmbusError::Failed);
+            }
+            let full = ((*self.page.lock() as u16) << 8) | cmd as u16;
+            if let Some(pkt) = self.packet_at(full) {
+                // A packet register streams its own bytes; a
+                // read longer than the packet is short, never
+                // padded with the next register's bytes.
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                return Ok(n);
+            }
+            // No packet here: scalar registers stream the
+            // consecutive-address window (the device
+            // auto-increments), as the flat image models.
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = self.read_mem(cmd.wrapping_add(i as u8) as u16);
+            }
+            Ok(buf.len())
         }
         fn write_block_data(&self, _addr: u8, cmd: u8, data: &[u8]) -> Result<(), SmbusError> {
             self.writes
@@ -7281,14 +7358,18 @@ mod smbus_rmi_smokes {
         {
             return TestResult::Fail("v1 probe must page-select to 0");
         }
-        // The 6-byte PDT entry at 0xE9 is assembled from word
-        // reads at 0xE9 / 0xEB / 0xED (no plain block-read op on
-        // the ICH host — see the transport docs).
+        // The 6-byte PDT entry at 0xE9 is one I2C block read —
+        // a single master-recv, the form the v1 device speaks
+        // (see the transport docs). No word/byte assembly.
         let reads = fake.reads.lock();
-        for cmd in [0xE9u8, 0xEB, 0xED] {
-            if !reads.iter().any(|(op, c)| *op == OP_READ_WORD && *c == cmd) {
-                return TestResult::Fail("PDT entry must be read as words at 0xE9/0xEB/0xED");
-            }
+        if !reads
+            .iter()
+            .any(|(op, c)| *op == OP_READ_I2C_BLOCK && *c == 0xE9)
+        {
+            return TestResult::Fail("PDT entry must be one I2C block read at 0xE9");
+        }
+        if reads.iter().any(|(op, _)| *op == OP_READ_WORD) {
+            return TestResult::Fail("v1 reads must not assemble blocks from word reads");
         }
         TestResult::Pass
     }
@@ -7493,6 +7574,185 @@ mod smbus_rmi_smokes {
     }
     kernel_test_in!("drivers/input/smbus-rmi", smoke_smbus_rmi_f12_data_decode);
 
+    fn smoke_smbus_rmi_v1_f12_descriptor_packets() -> TestResult {
+        // F$12 register-descriptor layout (Linux
+        // `rmi_read_register_desc`): 1 size byte at the query
+        // base, the N-byte presence packet at query+1, the
+        // S-byte structure packet at query+1+N. The packets
+        // are multi-byte registers: every byte of a packet
+        // streams from the ONE packet address, so a block
+        // assembled from word/byte reads at incrementing
+        // addresses mixes in the next register's first byte.
+        let mut mem = synaptics_page0();
+        // Size byte N=3 at the F$12 query base (0x00).
+        mem[0x00] = 0x03;
+        // The flat window disagrees with the packets on
+        // purpose: 0x02 holds 0x99 (the next register's byte)
+        // and 0x06 holds 0x00 (an F$12 Data1 byte).
+        mem[0x02] = 0x99;
+        let fake = FakeSmbus::new(mem, 0x00); // v1
+        fake.register_packet(0x01, &[0x11, 0x22, 0x33]);
+        fake.register_packet(0x04, &[0x44, 0x55, 0x66]);
+        // The old assembly, spelled out through the fake:
+        // word(0x01) + byte(0x02) mixes the presence packet
+        // with the next register's byte, and word(0x04) +
+        // byte(0x06) does the same to the structure packet.
+        let w = match fake.read_word_data(SMBUS_RMI_DEFAULT_ADDR, 0x01) {
+            Ok(w) => w,
+            Err(_) => return TestResult::Fail("fake word read failed"),
+        };
+        let b = match fake.read_byte_data(SMBUS_RMI_DEFAULT_ADDR, 0x02) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("fake byte read failed"),
+        };
+        if [w.to_le_bytes()[0], w.to_le_bytes()[1], b] == [0x11, 0x22, 0x33] {
+            return TestResult::Fail("fixture must make the old presence assembly wrong");
+        }
+        let w = match fake.read_word_data(SMBUS_RMI_DEFAULT_ADDR, 0x04) {
+            Ok(w) => w,
+            Err(_) => return TestResult::Fail("fake word read failed"),
+        };
+        let b = match fake.read_byte_data(SMBUS_RMI_DEFAULT_ADDR, 0x06) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("fake byte read failed"),
+        };
+        if [w.to_le_bytes()[0], w.to_le_bytes()[1], b] == [0x44, 0x55, 0x66] {
+            return TestResult::Fail("fixture must make the old structure assembly wrong");
+        }
+        let mark = fake.reads.lock().len();
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        let mut size = [0u8; 1];
+        if t.read_block(0x00, &mut size).is_err() {
+            return TestResult::Fail("descriptor size read failed");
+        }
+        if size != [0x03] {
+            return TestResult::Fail("descriptor size byte wrong");
+        }
+        let mut presence = [0u8; 3];
+        if t.read_block(0x01, &mut presence).is_err() {
+            return TestResult::Fail("presence packet read failed");
+        }
+        if presence != [0x11, 0x22, 0x33] {
+            return TestResult::Fail("presence packet bytes wrong");
+        }
+        let mut structure = [0u8; 3];
+        if t.read_block(0x04, &mut structure).is_err() {
+            return TestResult::Fail("structure packet read failed");
+        }
+        if structure != [0x44, 0x55, 0x66] {
+            return TestResult::Fail("structure packet bytes wrong");
+        }
+        // One single-transaction I2C block read per packet —
+        // plus the probe's version-byte read, nothing else.
+        let reads = fake.reads.lock();
+        if reads[mark..]
+            != [
+                (OP_READ_BYTE, 0xFD),
+                (OP_READ_I2C_BLOCK, 0x00),
+                (OP_READ_I2C_BLOCK, 0x01),
+                (OP_READ_I2C_BLOCK, 0x04),
+            ]
+        {
+            return TestResult::Fail("each descriptor read must be one I2C block read");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_v1_f12_descriptor_packets
+    );
+
+    fn smoke_smbus_rmi_v1_packet_read_page_boundary() -> TestResult {
+        // A read straddling a page boundary is split into one
+        // I2C block read per page, with a page-select between
+        // them — a single transaction never crosses the
+        // boundary (the device auto-increment wraps inside
+        // the page, and 0xFF is the page-select register
+        // itself). The byte at 0xFF reads back as the flat
+        // image byte there (0x5A here); on hardware it is the
+        // page-select register's value, so a descriptor packet
+        // laid out across 0xFF would not parse — RMI4 layout
+        // keeps packets inside a page, so this is a
+        // documented corner, not a supported layout.
+        let mut mem = synaptics_page0();
+        mem[0xFE] = 0xAA;
+        mem[0xFF] = 0x5A;
+        let fake = FakeSmbus::new(mem, 0x00); // v1
+        fake.mem1.lock()[0x00] = 0xCC;
+        fake.mem1.lock()[0x01] = 0xDD;
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        let mark = fake.reads.lock().len();
+        let mut buf = [0u8; 4];
+        if t.read_block(0xFE, &mut buf).is_err() {
+            return TestResult::Fail("page-straddling read failed");
+        }
+        if buf != [0xAA, 0x5A, 0xCC, 0xDD] {
+            return TestResult::Fail("page-straddling read bytes wrong");
+        }
+        let reads = fake.reads.lock();
+        if reads[mark..] != [(OP_READ_I2C_BLOCK, 0xFE), (OP_READ_I2C_BLOCK, 0x00)] {
+            return TestResult::Fail("straddling read must be two per-page I2C block reads");
+        }
+        drop(reads);
+        // Exactly one page-select to page 1 — between the two
+        // chunks (the probe selected page 0 once already).
+        let writes = fake.writes.lock();
+        let to_page1 = writes
+            .iter()
+            .filter(|(op, cmd, data)| *op == OP_WRITE_BYTE && *cmd == 0xFF && data == &[1])
+            .count();
+        if to_page1 != 1 {
+            return TestResult::Fail("straddling read must page-select to 1 once");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_v1_packet_read_page_boundary
+    );
+
+    fn smoke_smbus_rmi_v1_packet_read_chunks_at_32() -> TestResult {
+        // A 40-byte read is two I2C block reads (32 + 8): the
+        // SMBus 32-byte block cap binds every chunk, with the
+        // address advancing like the reference v1 loop. Flat
+        // scalar registers stream consecutive addresses, so
+        // the second chunk continues at 0x60.
+        let mut mem = synaptics_page0();
+        for i in 0..40usize {
+            mem[0x40 + i] = 0x40 + i as u8;
+        }
+        let fake = FakeSmbus::new(mem, 0x00); // v1
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        let mark = fake.reads.lock().len();
+        let mut buf = [0u8; 40];
+        if t.read_block(0x40, &mut buf).is_err() {
+            return TestResult::Fail("40-byte v1 read failed");
+        }
+        for (i, &byte) in buf.iter().enumerate() {
+            if byte != 0x40 + i as u8 {
+                return TestResult::Fail("40-byte v1 read bytes wrong");
+            }
+        }
+        let reads = fake.reads.lock();
+        if reads[mark..] != [(OP_READ_I2C_BLOCK, 0x40), (OP_READ_I2C_BLOCK, 0x60)] {
+            return TestResult::Fail("40-byte read must be I2C block reads at 0x40 and 0x60");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_v1_packet_read_chunks_at_32
+    );
+
     // ── ATTN pump (issue #1682) ─────────────────────────────────
     //
     // The fake device is the attention source here: the F$01
@@ -7536,7 +7796,7 @@ mod smbus_rmi_smokes {
         // (0x14) — not the device-status byte at 0x13.
         let reads = fake.reads.lock();
         let post_probe = &reads[n_reads_before..];
-        if post_probe.first() != Some(&(OP_READ_BYTE, 0x14)) {
+        if post_probe.first() != Some(&(OP_READ_I2C_BLOCK, 0x14)) {
             return TestResult::Fail(
                 "ATTN service must read the F$01 interrupt status at 0x14 first",
             );
@@ -7622,7 +7882,7 @@ mod smbus_rmi_smokes {
         // Only the one status-byte read after the probe — no
         // F$12 / F$30 data reads on a spurious wake.
         let reads = fake.reads.lock();
-        if reads[n_reads_before..] != [(OP_READ_BYTE, 0x14)] {
+        if reads[n_reads_before..] != [(OP_READ_I2C_BLOCK, 0x14)] {
             return TestResult::Fail("zero-source ATTN must issue exactly one status read");
         }
         TestResult::Pass
