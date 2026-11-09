@@ -1408,6 +1408,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Directory metadata is write-through. Complete deferred inode teardown
     /// before flushing the device, and preserve a failed flush as an error.
     pub(crate) async fn sync_metadata(&self) -> Result<(), FsError> {
+        if self.read_only {
+            return Ok(());
+        }
         let _update = self.inode_update_lock.lock().await;
         self.drain_orphans_locked().await?;
         self.device.flush_result().await.map_err(FsError::Io)
@@ -1417,6 +1420,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// just the inode used to obtain the syncfs descriptor. Never keep the
     /// icache spinlock across I/O or nest the inode-update mutex.
     pub(crate) async fn sync_filesystem(&self) -> Result<(), FsError> {
+        if self.read_only {
+            return Ok(());
+        }
         let nodes: Vec<_> = self
             .icache
             .lock()

@@ -5621,6 +5621,46 @@ kernel_test_in!(
     smoke_ext2_sync_reports_device_flush_failure
 );
 
+fn smoke_ext2_read_only_syncfs_does_not_write_mapped_pages() -> TestResult {
+    use crate::{testing, volume::Ext2Volume};
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+    let device = GatedCountingBlock::new(testing::hard_link_image(&[0x5a; 6000]));
+    let volume = match poll_once(Ext2Volume::mount_read_only(
+        device.clone(),
+        DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("read-only mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    if !matches!(poll_once(file.mmap_fault_async(0)), Some(Ok(_))) {
+        return TestResult::Fail("read-only mmap fault failed");
+    }
+    for result in [
+        poll_once(root.fsync(false)),
+        poll_once(root.syncfs()),
+        poll_once(file.syncfs()),
+    ] {
+        if !matches!(result, Some(Ok(()))) {
+            return TestResult::Fail("syncfs tried to write a read-only volume");
+        }
+    }
+    if device.writes.load(Ordering::Relaxed) != 0 || device.flushes.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("read-only sync issued write/flush I/O");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_read_only_syncfs_does_not_write_mapped_pages
+);
+
 /// Truncating DOWN releases every block wholly past the new EOF
 /// (`ext4_truncate` -> `ext4_ind_truncate` / `ext4_ext_remove_space`). NARF
 /// shrank only `i_size` and kept the blocks mapped, so the next extension —
