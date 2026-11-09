@@ -10,6 +10,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new(full: bool) -> Self {
+        Self::new_inner(full, false)
+    }
+    /// The model device has no EHT PHY by default; tests for EHT-gated
+    /// behavior build it with one. (`Arc::get_mut` cannot enable EHT
+    /// after the fact: the device is built with `Arc::new_cyclic`, so
+    /// its self-`Weak` always defeats `get_mut` — see #1863.)
+    fn new_with_eht(full: bool) -> Self {
+        Self::new_inner(full, true)
+    }
+    fn new_inner(full: bool, eht: bool) -> Self {
         let (mut hardware, firmware) = super::super::runtime::model::create(full);
         let source = hardware.source_fence().unwrap();
         let (producer, consumer) = narf_ipc::channel();
@@ -23,6 +33,8 @@ impl Fixture {
         hardware
             .install_rf_policy(super::super::mld_policy::Authority::Station(fence.clone()))
             .unwrap();
+        let mut phy = super::super::ht_vht::Local::from_nvm(0, 1, 1);
+        phy.eht = eht;
         let device = Arc::new_cyclic(|me| Device {
             test_name: None,
             me: me.clone(),
@@ -70,7 +82,7 @@ impl Fixture {
             six_channels: Vec::new(),
             tx_chains: 1,
             rx_chains: 1,
-            phy: super::super::ht_vht::Local::from_nvm(0, 1, 1),
+            phy,
             firmware: Vec::new(),
             pnvm: None,
             up: AtomicBool::new(true),
@@ -420,15 +432,11 @@ fn smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_and_link_reconf() -> Tes
     // The station MLD Capabilities and Operations field advertises
     // negotiated TTLM (SAME, #1553 verified) and link reconfiguration
     // (0x2000, wire layout verified #1553) and nothing else.
-    // `supports_mlo` keys off `phy.eht`, which the model fixture
-    // leaves clear, so enable it on this device.
-    let mut fixture = Fixture::new(false);
-    let caps = {
-        let device = Arc::get_mut(fixture.device.as_mut().unwrap())
-            .expect("device fixture has outstanding references");
-        device.phy.eht = true;
-        narf_wireless::WirelessNetIface::iftype_extended_capabilities(device)
-    };
+    // `supports_mlo` keys off `phy.eht`, so build the fixture device
+    // with an EHT PHY.
+    let fixture = Fixture::new_with_eht(false);
+    let device = fixture.device.as_ref().unwrap();
+    let caps = narf_wireless::WirelessNetIface::iftype_extended_capabilities(&**device);
     if caps.len() != 1 {
         return TestResult::Fail(
             "MLO device did not report exactly one station extended-capability record",
