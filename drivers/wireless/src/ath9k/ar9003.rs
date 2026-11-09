@@ -29,6 +29,7 @@ pub(super) mod packet;
 pub(super) mod phy;
 pub(super) mod power;
 pub(super) mod templates;
+pub(super) mod wow;
 
 use super::identity::{BringUpError, RegisterIo};
 
@@ -238,6 +239,26 @@ impl Revision {
     /// `AR_SREV_9580`.
     pub fn ar9580(&self) -> bool {
         self.chip == Chip::Ar9580
+    }
+
+    /// `AR_SREV_9462`.
+    pub fn ar9462(&self) -> bool {
+        self.chip == Chip::Ar9462
+    }
+
+    /// `AR_SREV_9462_20_OR_LATER` (`decode` admits only macRev 2/3).
+    pub fn ar9462_20_or_later(&self) -> bool {
+        self.chip == Chip::Ar9462 && self.mac_rev >= AR_SREV_REVISION_9462_20
+    }
+
+    /// `AR_SREV_9565`.
+    pub fn ar9565(&self) -> bool {
+        self.chip == Chip::Ar9565
+    }
+
+    /// `AR_SREV_9485`.
+    pub fn ar9485(&self) -> bool {
+        self.chip == Chip::Ar9485
     }
 
     /// `AR_SREV_9462_21`.

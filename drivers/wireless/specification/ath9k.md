@@ -876,6 +876,42 @@ They compose the production lifetime helpers with complete model cold-reset
 primitives; they do not instantiate the singleton native PCI controller.
 Release/native execution and physical acceptance remain pending.
 
+### 3.12 Optional AR9462-subsystem-only Wake-on-Wireless
+
+Wake-on-Wireless is implemented at the AR9003 hardware layer in
+`ar9003::wow` (Linux `ar9003_wow.c`, `wow.c`, `pci.c`, `hw.c` @
+`cbbddb6`): pattern programming (`ath9k_hw_wow_apply_pattern`, 16 slots,
+8 legacy), the keep-alive null-data frame, WoW enable (PME/D1D3 arming,
+beacon/keep-alive/magic-packet events, WoW-sleep power mode) and wakeup
+reason decode (`ath9k_hw_wow_wakeup`) with event clearing and RSSI
+threshold restore. The PCI table carries `ATH9K_PCI_WOW` (`0x0010`) on
+thirteen AR9462 (`0x0034`) subsystem entries (`pci.c:330-395`, under
+`CONFIG_ATH9K_PCOEM`) and on no AR9485, AR9580, AR9565 or AR1111 entry:
+WoW is AR9462-subsystem-only, which answers the open question from the
+AR9485 step-1 lane (#1382). Full pattern support (16 slots, 14 user
+patterns) applies to AR9462 2.0-or-later and AR9565 1.1-or-later;
+anything else gets the legacy 8 slots and 6 user patterns (the `hw.c`
+max-patterns selection).
+
+Two restores stay with the caller: the PCIe power-save restore in
+wakeup (`ath9k_hw_configpcipowersave(ah, false)`; the AR9003 SerDes
+restore is PR #1911, unmerged) is reported as
+`Wakeup::restore_pcie_powersave`, and the TSF2 restart is reported as
+`Wakeup::tsf2_restart` because Linux only restarts it when a TSF2
+generic timer was enabled and this tree has no generic-timer table yet.
+MCI is not implemented: the WoW layer threads an `mci_enabled` flag
+that is always false until the MCI subsystem (#1912 §1) lands, and the
+MCI power-save branch conservatively skips the station powersave set.
+The owner-level suspend/resume wiring (`ath9k_suspend` /
+`ath9k_resume`: ANI/btcoex stop, interrupt-mask save/restore,
+associated-station and single-VIF gates) is not in this PR; it needs a
+WoW branch on the `ar9300_owner` suspend path. The 5 GHz
+per-chip-refusal design question (#1912 §5) stays open and blocks
+calling the board-delta work complete. Seven native cases are written,
+covering the PCI table, pattern slots and overflow, keep-alive packing,
+enable traces for AR9462/2 GHz and AR9485/5 GHz, wakeup decode/clear
+and the Rx-DMA stop timeout; they run under `kernel-test` in CI.
+
 ## 4. Invariants
 
 - PCI parking is verified by command-register readback before BAR sizing: BME
