@@ -2084,3 +2084,142 @@ fn smoke_v6_icmp6_tx_echo_request() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_tx_echo_request);
+
+// ── Smoke 27: RFC 4443 §2.4(f) originated-error rate limiting ────────
+//
+// A burst of errors past the token bucket emits at most B=10; the
+// 11th returns `RateLimited` and emits nothing. The bucket then
+// refills at N=10/s, exercised deterministically through the
+// limiter's injected clock (`try_acquire(now_ns)`), plus a
+// `configure` round-trip (burst 2, rate 2/s) and a reset that
+// restores the RFC defaults.
+
+fn smoke_v6_icmp6_tx_error_rate_limit() -> TestResult {
+    const IFACE: &str = "v6e2e-27";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    // Invoking packet: IPv6 header (UDP) from the peer to our ll.
+    let mut invoking = Vec::new();
+    let ip = Ipv6Header {
+        version: 6,
+        payload_length: 8,
+        next_header: NEXT_HEADER_UDP,
+        hop_limit: 64,
+        src_ip: PEER_IP,
+        dst_ip: ll,
+        ..Default::default()
+    };
+    invoking.extend_from_slice(&ip.encode());
+    invoking.extend_from_slice(&[0x12, 0x34, 0x56, 0x78, 0, 8, 0, 0]);
+
+    // Burst: the RFC default bucket (B=10) admits exactly ten errors.
+    for _ in 0..ipv6_stack::ICMPV6_ERROR_RATE_LIMIT_BURST {
+        match ipv6_stack::send_icmp6_error(
+            IFACE,
+            ll,
+            ipv6_stack::Icmp6ErrorKind::DestinationUnreachable(4),
+            &invoking,
+        ) {
+            Ok(()) => {}
+            Err(_) => {
+                return TestResult::Fail("burst error send failed before the bucket drained");
+            }
+        }
+    }
+    let frames = drain_v6();
+    if frames.len() != ipv6_stack::ICMPV6_ERROR_RATE_LIMIT_BURST as usize {
+        return TestResult::Fail("expected exactly B=10 DU frames in the burst");
+    }
+    if ipv6_stack::icmp6_error_rate_limiter().tokens_available() != 0 {
+        return TestResult::Fail("bucket not empty after a B=10 burst");
+    }
+    // The 11th error in the burst is rate-limited and emits nothing.
+    match ipv6_stack::send_icmp6_error(
+        IFACE,
+        ll,
+        ipv6_stack::Icmp6ErrorKind::DestinationUnreachable(4),
+        &invoking,
+    ) {
+        Err(ipv6_stack::Icmp6SendError::RateLimited) => {}
+        _ => {
+            return TestResult::Fail(
+                "11th error in a burst was not rate limited (RFC 4443 §2.4(f))",
+            );
+        }
+    }
+    if !drain_v6().is_empty() {
+        return TestResult::Fail("rate-limited error emitted a frame");
+    }
+
+    // Refill at N=10/s, deterministic via the injected clock. The
+    // bucket is empty at t=0 (reset); 99 ms refills nothing, 100 ms
+    // refills exactly one token, and a further second refills the
+    // whole bucket.
+    let limiter = ipv6_stack::icmp6_error_rate_limiter();
+    limiter.__reset_for_test();
+    for _ in 0..ipv6_stack::ICMPV6_ERROR_RATE_LIMIT_BURST {
+        if !limiter.try_acquire(0) {
+            return TestResult::Fail("empty-bucket drain failed at t=0");
+        }
+    }
+    if limiter.try_acquire(0) {
+        return TestResult::Fail("drained bucket admitted an error at t=0");
+    }
+    if limiter.try_acquire(99_000_000) {
+        return TestResult::Fail("bucket refilled before 100 ms at N=10/s");
+    }
+    if !limiter.try_acquire(100_000_000) {
+        return TestResult::Fail("bucket did not refill one token after 100 ms at N=10/s");
+    }
+    if limiter.try_acquire(100_000_000) {
+        return TestResult::Fail("bucket admitted a second error at t=100 ms");
+    }
+    if !limiter.try_acquire(1_100_000_000) {
+        return TestResult::Fail("bucket did not refill after a further second at N=10/s");
+    }
+    if limiter.tokens_available() != ipv6_stack::ICMPV6_ERROR_RATE_LIMIT_BURST - 1 {
+        return TestResult::Fail("refill did not restore the full bucket minus one token");
+    }
+
+    // Configurable parameters (RFC 4443 §2.4(f) SHOULD): burst 2 at
+    // 2/s admits two, then one token per 500 ms.
+    limiter.configure(2, 2);
+    if limiter.burst() != 2 || limiter.rate_per_sec() != 2 {
+        return TestResult::Fail("configure did not report burst 2 / rate 2/s");
+    }
+    if limiter.tokens_available() != 2 {
+        return TestResult::Fail("configure to burst 2 did not clamp tokens to 2");
+    }
+    if !limiter.try_acquire(1_100_000_000) || !limiter.try_acquire(1_100_000_000) {
+        return TestResult::Fail("reconfigured burst-2 bucket did not admit two errors");
+    }
+    if limiter.try_acquire(1_100_000_000) {
+        return TestResult::Fail("reconfigured burst-2 bucket admitted a third error");
+    }
+    if limiter.try_acquire(1_599_000_000) {
+        return TestResult::Fail("reconfigured bucket refilled before 500 ms at 2/s");
+    }
+    if !limiter.try_acquire(1_600_000_000) {
+        return TestResult::Fail("reconfigured bucket did not refill one token after 500 ms");
+    }
+
+    // Leave the suite clean: defaults restored, bucket full.
+    limiter.__reset_for_test();
+    if limiter.burst() != ipv6_stack::ICMPV6_ERROR_RATE_LIMIT_BURST
+        || limiter.rate_per_sec() != ipv6_stack::ICMPV6_ERROR_RATE_LIMIT_PER_SEC
+        || limiter.tokens_available() != ipv6_stack::ICMPV6_ERROR_RATE_LIMIT_BURST
+    {
+        return TestResult::Fail("reset did not restore the RFC defaults with a full bucket");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_tx_error_rate_limit);

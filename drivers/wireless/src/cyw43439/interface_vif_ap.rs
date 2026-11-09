@@ -289,16 +289,28 @@ impl<R: Fullmac + 'static> Device<R> {
             }
         }
         // A P2P GO starts on its own connection bsscfg (`Scope::Go`).
+        // Both scopes carry the vif's firmware indices: a secondary
+        // AP / GO firmware event arrives stamped with this pair, and
+        // the AP session admits exactly it (`ap_wire::event_transition`).
+        let entry = state
+            .secondaries
+            .iter()
+            .find(|slot| slot.cookie == cookie)
+            .map(|slot| slot.link.entry())
+            .ok_or(WirelessError::Denied)?;
         let scope = if shell.role == Role::P2pGo {
-            let bsscfgidx = state
-                .secondaries
-                .iter()
-                .find(|slot| slot.cookie == cookie)
-                .map(|slot| slot.link.entry().bsscfgidx)
-                .ok_or(WirelessError::Denied)?;
-            Scope::Go { bsscfgidx }
+            Scope::Go {
+                ifidx: entry.ifidx,
+                bsscfgidx: entry.bsscfgidx,
+            }
         } else {
-            Scope::secondary(features, other_ap, other_secondary_active)
+            Scope::secondary(
+                features,
+                other_ap,
+                other_secondary_active,
+                entry.ifidx,
+                entry.bsscfgidx,
+            )
         };
         let mode = Mode {
             generation: host.generation.clone(),

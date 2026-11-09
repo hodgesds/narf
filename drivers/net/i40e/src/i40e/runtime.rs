@@ -295,11 +295,16 @@ async fn delay(ms: u64) {
 /// SFP+ with no link still publishes `media_available = Some(true)`
 /// (and the down sample keeps it), while an empty cage publishes
 /// `Some(false)` — the distinction #791's endpoint requires.
-/// `phy_type` stays the raw AQ byte; decoding it to a name is
-/// #867's table work.
+/// `phy_type` carries the raw AQ byte and `phy_type_name` its
+/// decode from the sourced `I40E_PHY_TYPE_*` table (issue #867);
+/// an empty cage has no type to name, so its sample carries
+/// `phy_type_name = None` even though the raw byte reads 0x00.
 pub(super) fn link_sample(status: LinkStatus) -> crate::publish::LinkSample {
     let media_available = Some(status.media_available);
     let phy_type = Some(status.phy_type);
+    let phy_type_name = status
+        .media_available
+        .then_some(status.phy_type_decoded().name());
     if !status.link_up {
         return crate::publish::LinkSample {
             carrier: false,
@@ -307,6 +312,7 @@ pub(super) fn link_sample(status: LinkStatus) -> crate::publish::LinkSample {
             duplex: None,
             media_available,
             phy_type,
+            phy_type_name,
         };
     }
     let speed_mbps = match status.speed() {
@@ -326,6 +332,7 @@ pub(super) fn link_sample(status: LinkStatus) -> crate::publish::LinkSample {
         duplex: None,
         media_available,
         phy_type,
+        phy_type_name,
     }
 }
 

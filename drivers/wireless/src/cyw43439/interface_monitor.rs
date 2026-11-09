@@ -127,6 +127,13 @@ impl<R: Fullmac + 'static> Device<R> {
             self.lifecycle.monitor.close();
             if self.ap_mode() == 6 {
                 self.up.store(false, Ordering::Release);
+            } else if self.ap_mode() == 3 {
+                // Admin link-down retires this endpoint's AP program (the
+                // driver's ndo_stop equivalent): a retired program must not
+                // keep the device link up. Monitor mode above keeps its own
+                // direct drop; AP mode goes through the AP carrier so the
+                // generation advances and link metadata is withdrawn.
+                self.ap_carrier(false);
             }
             return;
         }

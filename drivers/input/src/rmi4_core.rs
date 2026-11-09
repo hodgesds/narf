@@ -313,6 +313,467 @@ pub fn classic_clickpad_buttons(bitmap: u32) -> (bool, bool, bool) {
     ((bitmap & 1) != 0, (bitmap & 2) != 0, (bitmap & 4) != 0)
 }
 
+// ── F$11 / F$12 sensor-maximum queries ─────────────────────────────
+//
+// Linux references:
+//   * `drivers/input/rmi4/rmi_f11.c` — Query 1 finger count
+//     (`rmi_f11_get_query_parameters`, `f11_2d_construct_data`)
+//     and the control-register sensor maxima
+//     (`F11_CTRL_SENSOR_MAX_X_POS_OFFSET` 6 /
+//     `F11_CTRL_SENSOR_MAX_Y_POS_OFFSET` 8, read in
+//     `rmi_f11_initialize`).
+//   * `drivers/input/rmi4/rmi_f12.c` — Query 0 descriptor flag,
+//     the three register descriptors (`rmi_f12_probe`), the
+//     Control-8 sensor tuning (`rmi_f12_read_sensor_tuning`)
+//     and the Data-1 object count (`sensor->nbr_fingers =
+//     item->num_subpackets`).
+//   * `drivers/input/rmi4/rmi_driver.c` — the register-descriptor
+//     wire format (`rmi_read_register_desc`): one size byte, a
+//     presence packet register (all bytes at one RMI address),
+//     then the structure packet at the next address. The
+//     presence register is a *packet* register — its bytes share
+//     a single RMI address and the structure follows at
+//     presence_address + 1 (upstream revert of the incorrect
+//     `presence_address + presence_size` calculation, June 2026).
+//
+// One deliberate divergence from Linux: a descriptor/query
+// failure here never fails the probe. Linux returns -ENODEV
+// when F$12 has no register descriptors; we fall back to the
+// previous placeholder values (5 objects/fingers, field-width
+// axis ranges) so a descriptor quirk on one touchpad cannot
+// brick the device. The probe fields stay `None` and every
+// consumer uses the same defaults the pumps used before.
+//
+// Object-type enable bits: Linux exposes no F$12
+// object-type-enable register — object types arrive per object
+// in F$12 Data 1 byte 0 and are dispatched on by
+// `F12Object::is_touching_finger` (see `f12_object`). The
+// issue's "object-type enable bits" sub-item is therefore not
+// decoded: there is no grounded layout for it in `rmi_f12.c`
+// or the S3402 product spec, and inventing one would be a
+// fabrication. If the RMI4 specification names such a register,
+// it can be added against that passage.
+
+/// F$11 Query 1 finger-count field mask (Linux
+/// `RMI_F11_NR_FINGERS_MASK` in `rmi_f11.c`).
+pub const F11_QUERY_NR_FINGERS_MASK: u8 = 0x07;
+
+/// F$11 control-register offsets of the sensor-maximum
+/// positions (Linux `F11_CTRL_SENSOR_MAX_X_POS_OFFSET` /
+/// `F11_CTRL_SENSOR_MAX_Y_POS_OFFSET` in `rmi_f11.c`). Each
+/// maximum is a little-endian u16 at `control_base + offset`.
+pub const F11_CTRL_SENSOR_MAX_X_POS_OFFSET: u16 = 6;
+pub const F11_CTRL_SENSOR_MAX_Y_POS_OFFSET: u16 = 8;
+
+/// F$12 Query 0 bit: the device carries register descriptors
+/// (Linux `rmi_f12_probe`: `!(buf & BIT(0))` → -ENODEV).
+pub const F12_QUERY_HAS_DESCRIPTORS: u8 = 1 << 0;
+
+/// F$12 Control register 8: sensor tuning — subpacket 0 is the
+/// sensor maximum X/Y (Linux `rmi_f12_read_sensor_tuning`).
+pub const F12_CTRL_SENSOR_TUNING: u8 = 8;
+
+/// F$12 Data register 1: sensed objects — `num_subpackets` is
+/// the maximum reported object count (Linux `rmi_f12_probe`:
+/// `sensor->nbr_fingers = item->num_subpackets`).
+pub const F12_DATA_OBJECT_DATA: u8 = 1;
+
+/// Largest presence register a descriptor may carry (Linux
+/// `rmi_read_register_desc`: `size_presence_reg > 35` → -EIO).
+pub const RMI_REG_DESC_PRESENCE_MAX: usize = 35;
+
+/// Largest register-descriptor structure this parser reads.
+/// Linux imposes no cap (it `kzalloc`s `struct_size`); real
+/// F$12 descriptors are tens of bytes, so 512 is generous
+/// headroom and bounds a lying `struct_size` from allocating
+/// an unbounded buffer.
+pub const RMI_REG_DESC_STRUCT_MAX: usize = 512;
+
+/// Subpacket-map width in bits (Linux
+/// `RMI_REG_DESC_SUBPACKET_BITS` = 37 bytes × 8).
+pub const RMI_REG_DESC_SUBPACKET_BITS: usize = 296;
+
+/// Fallback sensor values, used when the query/control reads
+/// fail: the placeholders the pumps used before this decode
+/// existed (5 objects/fingers; field-width axis ranges).
+pub const RMI4_FALLBACK_MAX_COUNT: usize = 5;
+pub const RMI4_FALLBACK_F11_MAX: u16 = 0x0FFF;
+pub const RMI4_FALLBACK_F12_MAX: u16 = 0xFFFF;
+
+/// Decoded F$11 sensor limits: the sensor-maximum X/Y from
+/// Control registers 6/8 and the finger count from Query 1.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct F11SensorInfo {
+    pub max_x: u16,
+    pub max_y: u16,
+    pub max_fingers: usize,
+}
+
+impl F11SensorInfo {
+    /// Finger count from F$11 Query 1 (Linux
+    /// `rmi_f11_get_query_parameters`: `nr_fingers = query_buf[0]
+    /// & RMI_F11_NR_FINGERS_MASK`; `f11_2d_construct_data`:
+    /// `nbr_fingers = nr_fingers == 5 ? 10 : nr_fingers + 1`).
+    pub fn fingers_from_query1(query1: u8) -> usize {
+        let nr = query1 & F11_QUERY_NR_FINGERS_MASK;
+        if nr == 5 {
+            10
+        } else {
+            nr as usize + 1
+        }
+    }
+}
+
+/// Decoded F$12 sensor limits: the sensor-maximum X/Y from
+/// Control 8 and the maximum reported object count from the
+/// Data-1 descriptor.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct F12SensorInfo {
+    pub max_x: u16,
+    pub max_y: u16,
+    pub max_objects: usize,
+}
+
+/// One packet register from an RMI4 register descriptor
+/// (Linux `struct rmi_register_desc_item` in `rmi_driver.h`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RmiRegDescItem {
+    /// Register number within its block (query / control /
+    /// data).
+    pub reg: u8,
+    /// Register size in bytes.
+    pub reg_size: usize,
+    /// Number of subpackets the register carries
+    /// (`num_subpackets` — for F$12 Data 1, the maximum
+    /// reported object count).
+    pub num_subpackets: u16,
+    /// Subpacket presence map, bit `n` = subpacket `n` present
+    /// (Linux `subpacket_map`, 296 bits).
+    subpacket_map: [u64; 5],
+}
+
+impl RmiRegDescItem {
+    /// Whether subpacket `n` is present in this register
+    /// (Linux `rmi_register_desc_has_subpacket`).
+    pub fn has_subpacket(&self, subpacket: u8) -> bool {
+        let bit = subpacket as usize;
+        if bit >= RMI_REG_DESC_SUBPACKET_BITS {
+            return false;
+        }
+        (self.subpacket_map[bit / 64] >> (bit % 64)) & 1 != 0
+    }
+}
+
+/// A parsed RMI4 register descriptor: the packet registers of
+/// one kind (query / control / data) present on the device, in
+/// ascending register order (Linux `struct
+/// rmi_register_descriptor`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RmiRegDescriptor {
+    pub items: Vec<RmiRegDescItem>,
+}
+
+impl RmiRegDescriptor {
+    /// The descriptor item for register `reg`, if present.
+    pub fn item(&self, reg: u8) -> Option<&RmiRegDescItem> {
+        self.items.iter().find(|i| i.reg == reg)
+    }
+
+    /// Byte offset of register `reg` within its register block:
+    /// the sum of the sizes of the registers before it (Linux
+    /// `rmi_register_desc_calc_reg_offset`). `None` when the
+    /// register is absent.
+    pub fn reg_offset(&self, reg: u8) -> Option<usize> {
+        let mut offset = 0usize;
+        for item in &self.items {
+            if item.reg == reg {
+                return Some(offset);
+            }
+            offset += item.reg_size;
+        }
+        None
+    }
+}
+
+/// Split a descriptor presence block into the structure size
+/// and the presence-bitmap start (Linux
+/// `rmi_read_register_desc`: `buf[0] == 0` means the structure
+/// size is the little-endian u16 in `buf[1..3]` and the bitmap
+/// starts at `buf[3]`; otherwise the size is `buf[0]` and the
+/// bitmap starts at `buf[1]`).
+pub fn register_descriptor_header(presence: &[u8]) -> Result<(usize, usize), Rmi4Error> {
+    if presence.is_empty() {
+        return Err(Rmi4Error::Short);
+    }
+    if presence[0] == 0 {
+        if presence.len() < 3 {
+            return Err(Rmi4Error::Short);
+        }
+        Ok((u16::from_le_bytes([presence[1], presence[2]]) as usize, 3))
+    } else {
+        Ok((presence[0] as usize, 1))
+    }
+}
+
+/// Parse a register descriptor from its presence block and its
+/// structure bytes (Linux `rmi_read_register_desc`, structure
+/// half). The presence bitmap lists the registers present, in
+/// ascending order; each structure entry is a register size
+/// (one byte, or `0` + little-endian u16, or `0` + `0x0000` +
+/// little-endian u32) followed by subpacket-map bytes of 7 bits
+/// each, bit 7 set = another map byte follows.
+///
+/// Short-structure tolerance (upstream, June 2026 — some
+/// touchpads report a structure size too small for the number
+/// of registers claimed): an entry that runs past the end of
+/// the structure is dropped, along with the entries after it,
+/// instead of failing the whole parse.
+pub fn parse_register_descriptor(
+    presence: &[u8],
+    structure: &[u8],
+) -> Result<RmiRegDescriptor, Rmi4Error> {
+    let (_struct_size, bitmap_start) = register_descriptor_header(presence)?;
+    // Registers present, ascending: bit `b` of bitmap byte `i`
+    // is register `(i - bitmap_start) * 8 + b`.
+    let mut regs: Vec<u8> = Vec::new();
+    for (i, byte) in presence.iter().enumerate().skip(bitmap_start) {
+        for b in 0..8 {
+            if byte & (1 << b) != 0 {
+                let reg = (i - bitmap_start) * 8 + b;
+                if reg < 256 {
+                    regs.push(reg as u8);
+                }
+            }
+        }
+    }
+    let mut items = Vec::with_capacity(regs.len());
+    let mut offset = 0usize;
+    for reg in regs {
+        // Register size: 1 byte, or 0 + LE16, or 0 + 0x0000 +
+        // LE32 (Linux `rmi_read_register_desc`).
+        if offset >= structure.len() {
+            break;
+        }
+        let mut reg_size = structure[offset] as usize;
+        offset += 1;
+        if reg_size == 0 {
+            if offset + 2 > structure.len() {
+                break;
+            }
+            reg_size = u16::from_le_bytes([structure[offset], structure[offset + 1]]) as usize;
+            offset += 2;
+        }
+        if reg_size == 0 {
+            if offset + 4 > structure.len() {
+                break;
+            }
+            reg_size = u32::from_le_bytes([
+                structure[offset],
+                structure[offset + 1],
+                structure[offset + 2],
+                structure[offset + 3],
+            ]) as usize;
+            offset += 4;
+        }
+        if reg_size == 0 {
+            // A zero-size register is unparseable — stop here,
+            // as with a short structure.
+            break;
+        }
+        // Subpacket map: 7 bits per byte, bit 7 = continue.
+        let mut map = [0u64; 5];
+        let mut map_offset = 0usize;
+        let mut complete = false;
+        while offset < structure.len() {
+            let byte = structure[offset];
+            offset += 1;
+            for b in 0..7 {
+                if byte & (1 << b) != 0 && map_offset < RMI_REG_DESC_SUBPACKET_BITS {
+                    map[map_offset / 64] |= 1 << (map_offset % 64);
+                }
+                map_offset += 1;
+            }
+            if byte & 0x80 == 0 {
+                complete = true;
+                break;
+            }
+        }
+        if !complete {
+            break;
+        }
+        let num_subpackets = map.iter().map(|w| w.count_ones() as u16).sum::<u16>();
+        items.push(RmiRegDescItem {
+            reg,
+            reg_size,
+            num_subpackets,
+            subpacket_map: map,
+        });
+    }
+    Ok(RmiRegDescriptor { items })
+}
+
+/// Read one register descriptor from the device at RMI address
+/// `addr` (Linux `rmi_read_register_desc`): 1 size byte at
+/// `addr`, the presence packet (`size` bytes, all at the single
+/// packet address `addr + 1`), then the structure packet at
+/// `addr + 2`. Each F$12 descriptor occupies three RMI
+/// addresses this way, which is why Linux advances
+/// `query_addr` by 3 between the query/control/data
+/// descriptors in `rmi_f12_probe`.
+pub fn read_register_descriptor(
+    transport: &mut dyn Rmi4Transport,
+    addr: u16,
+) -> Result<RmiRegDescriptor, TransportError> {
+    let mut size = [0u8; 1];
+    transport.read_block(addr, &mut size)?;
+    let presence_len = size[0] as usize;
+    if presence_len > RMI_REG_DESC_PRESENCE_MAX {
+        return Err(TransportError::Protocol);
+    }
+    if presence_len == 0 {
+        return Ok(RmiRegDescriptor::default());
+    }
+    let mut presence = alloc::vec![0u8; presence_len];
+    transport.read_block(addr + 1, &mut presence)?;
+    let (struct_size, _) =
+        register_descriptor_header(&presence).map_err(|_| TransportError::Protocol)?;
+    if struct_size > RMI_REG_DESC_STRUCT_MAX {
+        return Err(TransportError::Protocol);
+    }
+    let mut structure = alloc::vec![0u8; struct_size];
+    transport.read_block(addr + 2, &mut structure)?;
+    parse_register_descriptor(&presence, &structure).map_err(|_| TransportError::Protocol)
+}
+
+/// Decode the F$12 Control-8 sensor-tuning subpacket 0: the
+/// sensor maximum X/Y as two little-endian u16s (Linux
+/// `rmi_f12_read_sensor_tuning`: `sensor->max_x =
+/// (buf[offset + 1] << 8) | buf[offset]`, same for Y).
+/// Returns `None` when subpacket 0 is absent or the block is
+/// shorter than the 4 maximum bytes.
+pub fn decode_f12_sensor_tuning(item: &RmiRegDescItem, ctrl8: &[u8]) -> Option<(u16, u16)> {
+    if !item.has_subpacket(0) || ctrl8.len() < 4 {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([ctrl8[0], ctrl8[1]]),
+        u16::from_le_bytes([ctrl8[2], ctrl8[3]]),
+    ))
+}
+
+/// Decode the F$11 sensor limits over a synchronous transport:
+/// Query 1 (finger count) plus the control-register sensor
+/// maxima. Any failed read leaves that piece at its fallback
+/// value; a failed Query 1 read returns `None` (no finger
+/// count, no maxima — the caller keeps the placeholders).
+pub fn decode_f11_sensor(
+    transport: &mut dyn Rmi4Transport,
+    f11: &PdtEntry,
+) -> Option<F11SensorInfo> {
+    let mut query1 = [0u8; 1];
+    transport
+        .read_block(f11.query_base as u16 + 1, &mut query1)
+        .ok()?;
+    let mut info = F11SensorInfo {
+        max_x: RMI4_FALLBACK_F11_MAX,
+        max_y: RMI4_FALLBACK_F11_MAX,
+        max_fingers: F11SensorInfo::fingers_from_query1(query1[0]),
+    };
+    // Control registers 6..9 hold the maxima (two LE u16s in
+    // one 4-byte read at control_base + 6).
+    let mut ctrl = [0u8; 4];
+    if transport
+        .read_block(
+            f11.control_base as u16 + F11_CTRL_SENSOR_MAX_X_POS_OFFSET,
+            &mut ctrl,
+        )
+        .is_ok()
+    {
+        let max_x = u16::from_le_bytes([ctrl[0], ctrl[1]]);
+        let max_y = u16::from_le_bytes([ctrl[2], ctrl[3]]);
+        if max_x > 0 {
+            info.max_x = max_x;
+        }
+        if max_y > 0 {
+            info.max_y = max_y;
+        }
+    }
+    Some(info)
+}
+
+/// Decode the F$12 sensor limits over a synchronous transport:
+/// the Query-0 descriptor flag, the control + data register
+/// descriptors, the Control-8 sensor tuning (maxima) and the
+/// Data-1 object count. Any failed step leaves that piece at
+/// its fallback value; `None` only when no descriptor parsed
+/// at all (Linux would fail the probe here — see the section
+/// docs — we fall back to the placeholders instead).
+pub fn decode_f12_sensor(
+    transport: &mut dyn Rmi4Transport,
+    f12: &PdtEntry,
+) -> Option<F12SensorInfo> {
+    let mut query0 = [0u8; 1];
+    transport
+        .read_block(f12.query_base as u16, &mut query0)
+        .ok()?;
+    if (query0[0] & F12_QUERY_HAS_DESCRIPTORS) == 0 {
+        return None;
+    }
+    // Descriptors live at query_base + 1 (query), + 4
+    // (control), + 7 (data), three RMI addresses apart (Linux
+    // `rmi_f12_probe`). The query descriptor itself is never
+    // consumed after parsing — Linux reads it, we skip it.
+    let ctrl_desc = read_register_descriptor(transport, f12.query_base as u16 + 4).ok();
+    let data_desc = read_register_descriptor(transport, f12.query_base as u16 + 7).ok();
+    if ctrl_desc.is_none() && data_desc.is_none() {
+        return None;
+    }
+    let mut info = F12SensorInfo {
+        max_x: RMI4_FALLBACK_F12_MAX,
+        max_y: RMI4_FALLBACK_F12_MAX,
+        max_objects: RMI4_FALLBACK_MAX_COUNT,
+    };
+    if let Some(desc) = &ctrl_desc {
+        if let Some(item) = desc.item(F12_CTRL_SENSOR_TUNING) {
+            // Linux caps the tuning read at its 15-byte buffer.
+            if item.reg_size <= 15 {
+                if let Some(offset) = desc.reg_offset(F12_CTRL_SENSOR_TUNING) {
+                    let mut buf = [0u8; 15];
+                    if transport
+                        .read_block(
+                            f12.control_base as u16 + offset as u16,
+                            &mut buf[..item.reg_size],
+                        )
+                        .is_ok()
+                    {
+                        if let Some((max_x, max_y)) =
+                            decode_f12_sensor_tuning(item, &buf[..item.reg_size])
+                        {
+                            if max_x > 0 {
+                                info.max_x = max_x;
+                            }
+                            if max_y > 0 {
+                                info.max_y = max_y;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(desc) = &data_desc {
+        if let Some(data1) = desc.item(F12_DATA_OBJECT_DATA) {
+            if data1.num_subpackets > 0 {
+                // Clamped to the pump's fixed slot table (Linux
+                // allocates `nbr_fingers` slots dynamically; our
+                // `Rmi4PumpState` holds `RMI4_PUMP_MAX_SLOTS`).
+                info.max_objects = (data1.num_subpackets as usize).min(RMI4_PUMP_MAX_SLOTS);
+            }
+        }
+    }
+    Some(info)
+}
+
 // ── Transport abstraction ──────────────────────────────────────────
 //
 // Every concrete RMI4 driver (hid-rmi, smbus-rmi, future i2c-rmi)
@@ -424,6 +885,13 @@ pub struct Rmi4DeviceProbe {
     /// has no F$30 function or the query read failed — the button
     /// reader then defaults to a 1-byte bitmap).
     pub f30_gpio_count: u8,
+    /// Decoded F$11 sensor limits (`None` when the device has
+    /// no F$11 function or the query/control reads failed —
+    /// consumers use the fallback values then).
+    pub f11_sensor: Option<F11SensorInfo>,
+    /// Decoded F$12 sensor limits (`None` when the device has
+    /// no F$12 function or no register descriptor parsed).
+    pub f12_sensor: Option<F12SensorInfo>,
     /// `(function_number, interrupt-source bitmask)` in PDT scan
     /// order — see [`build_interrupt_map`].
     pub interrupt_map: Vec<(u8, u8)>,
@@ -446,6 +914,60 @@ impl Rmi4DeviceProbe {
             .iter()
             .find(|(_, m)| m & (1 << bit) != 0)
             .map(|(f, _)| *f)
+    }
+
+    /// Maximum F$11 fingers the sensor reports (fallback 5,
+    /// the placeholder the pumps used before the F$11 query
+    /// was decoded).
+    pub fn f11_max_fingers(&self) -> usize {
+        self.f11_sensor
+            .map(|s| s.max_fingers)
+            .unwrap_or(RMI4_FALLBACK_MAX_COUNT)
+    }
+
+    /// Maximum F$12 objects the sensor reports (fallback 5).
+    pub fn f12_max_objects(&self) -> usize {
+        self.f12_sensor
+            .map(|s| s.max_objects)
+            .unwrap_or(RMI4_FALLBACK_MAX_COUNT)
+    }
+
+    /// Sensor-maximum X/Y: F$12 preferred (a device never
+    /// exposes both as its touch sensor); field-width fallbacks
+    /// when nothing decoded.
+    pub fn sensor_axis_maxima(&self) -> (u16, u16) {
+        if let Some(f12) = self.f12_sensor {
+            return (f12.max_x, f12.max_y);
+        }
+        if let Some(f11) = self.f11_sensor {
+            return (f11.max_x, f11.max_y);
+        }
+        if self.f12.is_some() {
+            (RMI4_FALLBACK_F12_MAX, RMI4_FALLBACK_F12_MAX)
+        } else {
+            (RMI4_FALLBACK_F11_MAX, RMI4_FALLBACK_F11_MAX)
+        }
+    }
+
+    /// Simultaneous-contact slots for the caps: the decoded
+    /// object/finger count of whichever sensor is present.
+    pub fn sensor_slots(&self) -> usize {
+        if self.f12.is_some() {
+            self.f12_max_objects()
+        } else {
+            self.f11_max_fingers()
+        }
+    }
+
+    /// Axis ranges the shared pump normalises contacts against.
+    pub fn sensor_bounds(&self) -> Rmi4PumpBounds {
+        let (max_x, max_y) = self.sensor_axis_maxima();
+        Rmi4PumpBounds {
+            x_min: 0,
+            x_max: max_x as i32,
+            y_min: 0,
+            y_max: max_y as i32,
+        }
     }
 }
 
@@ -508,6 +1030,11 @@ pub fn probe_device(transport: &mut dyn Rmi4Transport) -> Result<Rmi4DeviceProbe
         }
     }
     let interrupt_map = build_interrupt_map(&table);
+    // F$11 / F$12 sensor maxima (best-effort — a failed read
+    // leaves the probe field `None` and the consumers fall
+    // back to the placeholders).
+    let f11_sensor = f11.as_ref().and_then(|f| decode_f11_sensor(transport, f));
+    let f12_sensor = f12.as_ref().and_then(|f| decode_f12_sensor(transport, f));
     Ok(Rmi4DeviceProbe {
         table,
         product,
@@ -515,6 +1042,8 @@ pub fn probe_device(transport: &mut dyn Rmi4Transport) -> Result<Rmi4DeviceProbe
         f12,
         f30,
         f30_gpio_count,
+        f11_sensor,
+        f12_sensor,
         interrupt_map,
     })
 }

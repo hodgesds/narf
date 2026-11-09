@@ -720,6 +720,11 @@ fn go_ps() -> R {
         "GO PS reset template NoA is not index 2 zero",
     )?;
     // CTWindow beyond the 7-bit field is refused, not truncated.
+    // Drop the previous fixture first: a `let` RHS is evaluated before
+    // the old binding drops, so without this the new Guard builds while
+    // the old fixture still owns the interface and its live-owner
+    // require fails ("live iwlwifi owner exists").
+    drop(f);
     let f = Fixture::new(None, None)?;
     f.admin.set_link(false).map_err(|_| "GO PS bad DOWN")?;
     f.device().set_iftype(9).map_err(|_| "GO PS bad role")?;
@@ -742,6 +747,9 @@ fn go_ps() -> R {
         "GO PS CTWindow 200 reached native START",
     )?;
     // Ordinary APs still refuse GO power-save fields.
+    // (See above: the previous fixture must be dropped before rebinding,
+    // or the new Guard's live-owner require fails.)
+    drop(f);
     let f = Fixture::new(None, None)?;
     f.admin.set_link(false).map_err(|_| "AP PS DOWN")?;
     f.admin.set_link(true).map_err(|_| "AP PS UP")?;

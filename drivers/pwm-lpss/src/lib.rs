@@ -705,7 +705,7 @@ mod tests {
         // Channel 3 lives at 3 * 0x400 = 0xC00; channels 0-2 untouched.
         // SAFETY: fake backing, offsets in range.
         let ctrl3 = unsafe { fake_read(ptr, 0xC00) };
-        if ctrl3 != 0x1555_C0 {
+        if ctrl3 != 0x0015_55C0 {
             return TestResult::Fail("BXT ch3 ctrl != 0x1555C0 (base_unit 5461, on_time_div 192)");
         }
         for ch in 0..3u64 {
@@ -741,7 +741,7 @@ mod tests {
         }
         // SAFETY: fake backing, channel 0 in range.
         let ctrl = unsafe { fake_read(ptr, 0x00) };
-        if ctrl != 0x1555_3F {
+        if ctrl != 0x0015_553F {
             return TestResult::Fail("BXT inversed ctrl != 0x15553F (on_time_div 63)");
         }
         TestResult::Pass

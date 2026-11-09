@@ -210,8 +210,11 @@ pub fn start_ih_hpd(handle: &Handle) -> Result<(), StartError> {
 /// Each pass pulls every queued IV off the subscription (`try_next`
 /// drains the ring when the mailbox is empty), feeds the batch
 /// through the legacy controller (`AmdGpu::service_hotplug`, which
-/// drains and then samples the debounce timers), reports newly
-/// connected connectors, and sleeps [`IH_HPD_POLL_MS`]. The sleep —
+/// drains and then samples the debounce timers), modesets newly
+/// connected connectors with their EDID preferred modes
+/// (`AmdGpu::modeset_newly_connected`, #1787 — a connector with
+/// no EDID fed yet is logged and left unmodeset, never given an
+/// invented mode), and sleeps [`IH_HPD_POLL_MS`]. The sleep —
 /// not the IV wait — is the scheduled wakeup the debounce poll
 /// needs: a connect only becomes `Connected` in `poll_hotplug`,
 /// and no further cookie is guaranteed to arrive after the plug.
@@ -220,10 +223,7 @@ pub fn start_ih_hpd(handle: &Handle) -> Result<(), StartError> {
 /// becomes subscribable again) when the subscription closes or is
 /// revoked, or when the legacy controller goes away — a discrete
 /// claim after start must not leave the task squatting on the
-/// exclusive HPD source. Connects are reported on the console; the
-/// caller modesets each with its mode (EDID preferred mode) via
-/// `modeset_connector` — the mode source itself is #1712 item 4,
-/// still missing, so this task reports and does not modeset.
+/// exclusive HPD source.
 pub async fn serve_ih_hpd(mut subscription: Subscription) {
     use core::fmt::Write as _;
     loop {
@@ -250,21 +250,56 @@ pub async fn serve_ih_hpd(mut subscription: Subscription) {
             }
         }
         let tsc = narf_time::now_cycles();
-        match crate::amdgpu::with_controller_mut(|gpu| gpu.service_hotplug(&batch[..count], tsc)) {
-            Some((_, connected)) => {
-                for connector_idx in connected {
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "amdgpu: IH HPD connector {connector_idx} connected",
-                    );
-                }
-            }
+        let connected = match crate::amdgpu::with_controller_mut(|gpu| {
+            gpu.service_hotplug(&batch[..count], tsc)
+        }) {
+            Some((_, connected)) => connected,
             None => {
                 let _ = writeln!(
                     narf_console::Writer,
                     "amdgpu: IH HPD drainer stopping: no legacy controller",
                 );
                 return;
+            }
+        };
+        // DRM/fb caller (#1787): modeset each connector this tick
+        // marked `Connected`, with its stored EDID preferred mode.
+        // A second controller lookup (rather than reusing the
+        // service borrow) keeps each `with_controller_mut` closure
+        // short-lived; a controller gone between the two passes
+        // stops the task instead of modesetting into the void.
+        let outcomes =
+            match crate::amdgpu::with_controller_mut(|gpu| gpu.modeset_newly_connected(&connected))
+            {
+                Some(outcomes) => outcomes,
+                None => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: IH HPD drainer stopping: no legacy controller",
+                    );
+                    return;
+                }
+            };
+        for (connector_idx, outcome) in outcomes {
+            match outcome {
+                Ok(true) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: IH HPD connector {connector_idx} modeset to EDID preferred mode",
+                    );
+                }
+                Ok(false) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: IH HPD connector {connector_idx} connected but no EDID preferred mode; leaving unmodeset",
+                    );
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: IH HPD connector {connector_idx} modeset failed: {error:?}",
+                    );
+                }
             }
         }
         narf_time::SleepUntil::new(narf_time::Deadline::after_ms(IH_HPD_POLL_MS).as_instant())

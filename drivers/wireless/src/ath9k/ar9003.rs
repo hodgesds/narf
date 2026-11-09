@@ -14,6 +14,7 @@
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 pub(super) mod board;
+pub(super) mod btcoex;
 pub(super) mod calib;
 pub(super) mod edma;
 pub(super) mod eeprom;
@@ -25,13 +26,25 @@ pub(super) mod initvals_ar9565;
 pub(super) mod initvals_ar9580;
 pub(super) mod irq;
 pub(super) mod mac;
+pub(super) mod mci;
 pub(super) mod packet;
 pub(super) mod phy;
 pub(super) mod power;
+pub(super) mod serdes;
 pub(super) mod templates;
+pub(super) mod wow;
 
 use super::identity::{BringUpError, RegisterIo};
 
+/// `hw.h::ATH9K_HW_CAP_MCI` (`BIT(15)`): the chip carries the MCI
+/// Bluetooth-coexistence engine (AR9462/AR9565 unless the OTP
+/// 4.9 GHz disable is set; see `fill_cap_info`).
+pub(super) const HW_CAP_MCI: u32 = 1 << 15;
+/// `reg.h::AR_ENT_OTP`: the OTP word holding the `ent_mode` bits.
+pub(super) const AR_ENT_OTP: u64 = 0x40d8;
+/// `reg.h::AR_ENT_OTP_49GHZ_DISABLE`: `ent_mode` bit clearing the MCI
+/// capability.
+pub(super) const AR_ENT_OTP_49GHZ_DISABLE: u32 = 0x0010_0000;
 /// `reg.h::AR_SREV_VERSION_9300`.
 pub(super) const AR_SREV_VERSION_9300: u32 = 0x1c0;
 /// `reg.h::AR_SREV_REVISION_9300_22`.
@@ -54,6 +67,9 @@ pub(super) const AR_SREV_REVISION_9565_11: u8 = 2;
 pub(super) const AR_SREV_REVISION_9580_10: u8 = 4;
 /// `reg.h::AR_SREV_VERSION_9485`.
 pub(super) const AR_SREV_VERSION_9485: u32 = 0x240;
+/// `reg.h::AR_SREV_VERSION_9340`: no modeled chip carries it, but the
+/// `TX_IQ_ON_AGC_CAL` gate (`9485_OR_LATER` non-9340) names it.
+pub(super) const AR_SREV_VERSION_9340: u32 = 0x300;
 /// `reg.h::AR_SREV_REVISION_9485_11`: `AR_SREV_9485_11_OR_LATER` is
 /// macRev >= 1; no 1.0 tables exist anywhere in the Linux ath9k tree.
 pub(super) const AR_SREV_REVISION_9485_11: u8 = 1;
@@ -230,6 +246,35 @@ impl Revision {
         })
     }
 
+    /// `AR_SREV_9300_20_OR_LATER` (`reg.h`: `macVersion >=
+    /// `AR_SREV_VERSION_9300`). Every modeled chip satisfies it.
+    pub fn ar9300_20_or_later(&self) -> bool {
+        self.chip.mac_version() >= AR_SREV_VERSION_9300
+    }
+
+    /// `AR_SREV_9485_OR_LATER` (`reg.h`: `macVersion >=
+    /// `AR_SREV_VERSION_9485`).
+    pub fn ar9485_or_later(&self) -> bool {
+        self.chip.mac_version() >= AR_SREV_VERSION_9485
+    }
+
+    /// `AR_SREV_9340` (`reg.h`: `macVersion == AR_SREV_VERSION_9340`).
+    /// No modeled chip carries it; the predicate keeps the
+    /// `TX_IQ_ON_AGC_CAL` gate literal.
+    pub fn ar9340(&self) -> bool {
+        self.chip.mac_version() == AR_SREV_VERSION_9340
+    }
+
+    /// `AR_SREV_9565` (`reg.h`: `macVersion == AR_SREV_VERSION_9565`).
+    pub fn ar9565(&self) -> bool {
+        self.chip == Chip::Ar9565
+    }
+
+    /// `AR_SREV_9485` (`reg.h`: `macVersion == AR_SREV_VERSION_9485`).
+    pub fn ar9485(&self) -> bool {
+        self.chip == Chip::Ar9485
+    }
+
     /// `AR_SREV_9300_22`.
     pub fn ar9300_22(&self) -> bool {
         self.chip == Chip::Ar9300 && self.mac_rev == AR_SREV_REVISION_9300_22
@@ -238,6 +283,26 @@ impl Revision {
     /// `AR_SREV_9580`.
     pub fn ar9580(&self) -> bool {
         self.chip == Chip::Ar9580
+    }
+
+    /// `AR_SREV_9462`.
+    pub fn ar9462(&self) -> bool {
+        self.chip == Chip::Ar9462
+    }
+
+    /// `AR_SREV_9462_20_OR_LATER` (`decode` admits only macRev 2/3).
+    pub fn ar9462_20_or_later(&self) -> bool {
+        self.chip == Chip::Ar9462 && self.mac_rev >= AR_SREV_REVISION_9462_20
+    }
+
+    /// `AR_SREV_9565`.
+    pub fn ar9565(&self) -> bool {
+        self.chip == Chip::Ar9565
+    }
+
+    /// `AR_SREV_9485`.
+    pub fn ar9485(&self) -> bool {
+        self.chip == Chip::Ar9485
     }
 
     /// `AR_SREV_9462_21`.
@@ -423,7 +488,8 @@ pub(super) fn power_on(io: &mut impl RegisterIo, wa: u32) -> Result<(), BringUpE
 /// `hw.c::ath9k_hw_set_power_awake` for an AR9300 (no MCI): `AR_WA`, a
 /// power-on reset only when the RTC reports SHUTDOWN (the AR9003 path does
 /// not reprogram the PLL here), force wake, the `POWER_UP_TIME / 50` poll and
-/// `AR_STA_ID1_PWR_SAV` clear.
+/// `AR_STA_ID1_PWR_SAV` clear. (The MCI power-awake LNA workaround is
+/// `mci::set_power_awake`.)
 pub(super) fn set_power_awake(io: &mut impl RegisterIo, wa: u32) -> Result<(), BringUpError> {
     wa_write(io, wa);
     let status = io.read32(AR_RTC_STATUS);
@@ -510,6 +576,23 @@ pub(super) struct Identified {
     pub powered: PoweredOn,
     pub restored: eeprom::Restored,
     pub identity: eeprom::Identity,
+    /// The `AR_ENT_OTP` word (`hw.c::ath9k_hw_fill_cap_info`).
+    pub ent_mode: u32,
+    /// The capability word from `fill_cap_info` (so far only
+    /// `HW_CAP_MCI`).
+    pub hw_caps: u32,
+}
+
+/// `hw.c::ath9k_hw_fill_cap_info`'s MCI capability, as a pure function
+/// for testing: AR9462/AR9565 carry MCI unless `ent_mode` has the OTP
+/// 4.9 GHz disable set. (Linux also reads `ent_mode` as `0x3BDA000`
+/// for the AR9561, which has no in-tree variant.)
+pub(super) fn fill_cap_info(chip: Chip, ent_mode: u32) -> u32 {
+    let mut hw_caps = 0u32;
+    if (chip == Chip::Ar9462 || chip == Chip::Ar9565) && ent_mode & AR_ENT_OTP_49GHZ_DISABLE == 0 {
+        hw_caps |= HW_CAP_MCI;
+    }
+    hw_caps
 }
 
 /// `ath9k_hw_init` for an AR9003 PCI device: device/silicon match before
@@ -524,10 +607,16 @@ pub(super) fn identify(io: &mut impl RegisterIo, device: u16) -> Result<Identifi
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
+    // Every in-tree AR9003 part satisfies `AR_SREV_9300_20_OR_LATER`
+    // (macVersion >= 0x1c0), so `ent_mode` is the `AR_ENT_OTP` word.
+    let ent_mode = io.read32(AR_ENT_OTP);
+    let hw_caps = fill_cap_info(chip, ent_mode);
     Ok(Identified {
         powered,
         restored,
         identity,
+        ent_mode,
+        hw_caps,
     })
 }
 

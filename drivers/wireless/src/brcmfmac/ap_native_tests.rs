@@ -798,13 +798,32 @@ fn policy_and_pm() -> Result<(), &'static str> {
     b.bus.d3_ack(true);
     ready(Endpoint::suspend(&*b.device))?
         .map_err(|_| "AP system suspend actual BSS/flow/D3 stop")?;
-    if b.device.link_up() || original.current().is_ok() || b.bus.dma_enabled() {
-        return Err("AP system suspend retained RF/data/copy owner");
+    // D3 suspend retires the RF link and the AP data/copy owner, but
+    // retains DMA by design: Linux `brcmf_pcie_pm_enter_D3` touches
+    // neither BME nor the rings (the bus only goes DOWN), and NARF
+    // `brcmfmac.md` "System suspend" keeps the rings retained for the
+    // hot `leave_d3` resume; BME is cleared only by the confirmed stop
+    // (`Runtime::quiesce`, removal/reset). The station D3/D0 smoke
+    // asserts the same retention (`dma.len()` unchanged, `dropped == 0`).
+    if b.device.link_up() {
+        return Err("AP system suspend left RF/link up");
+    }
+    if original.current().is_ok() {
+        return Err("AP system suspend retained data/copy owner");
+    }
+    if !b.bus.dma_enabled() {
+        return Err("AP system suspend freed DMA rings (D3 retains rings/BME)");
     }
     b.bus.d0_alive();
     ready(Endpoint::resume(&*b.device))?.map_err(|_| "AP actual hot D0 receipt")?;
-    if b.device.link_up() || original.current().is_ok() {
-        return Err("AP hot resume replayed old BSS/key/copy authority");
+    if b.device.link_up() {
+        return Err("AP hot resume re-raised RF/link");
+    }
+    if original.current().is_ok() {
+        return Err("AP hot resume replayed data/copy authority");
+    }
+    if !b.bus.dma_enabled() {
+        return Err("AP hot resume lost DMA rings");
     }
     b.start(false)?;
     b.peer(false)?;

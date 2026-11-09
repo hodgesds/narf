@@ -108,6 +108,8 @@ pub enum RootMountError {
     /// A selected LUKS container could not be opened by the installed boot
     /// credential provider or failed authenticated metadata/keyslot checks.
     LuksUnlock(narf_block::encrypted::LuksOpenError),
+    /// The decrypted view could not be registered (including a name collision).
+    LuksMapping(narf_block::BlockIoError),
     /// The selected root filesystem was found, but construction of its
     /// session-writable tmpfs overlay failed.
     TmpfsOverlay(FsError),
@@ -324,7 +326,27 @@ pub fn try_mount_root(
         narf_boot::args().has_flag("systemd_pid1"),
         &spec,
     );
-    try_mount_root_with_options(authority, spec.selector.as_ref(), options)
+    let result = try_mount_root_with_options(authority, spec.selector.as_ref(), options);
+    if (narf_boot::args().value("rd.luks.key").is_some()
+        || narf_boot::args().value("rd.luks.prompt").is_some())
+        && result.is_err()
+    {
+        panic!(
+            "encrypted root required; refusing initramfs fallback: {:?}",
+            result
+        );
+    }
+    result
+}
+
+struct PendingRootMapping(bool);
+
+impl Drop for PendingRootMapping {
+    fn drop(&mut self) {
+        if self.0 {
+            narf_block::unregister_block_device("cryptroot");
+        }
+    }
 }
 
 /// Like [`try_mount_root`] but with the selector resolved already.
@@ -400,15 +422,15 @@ pub fn try_mount_root_with_options(
             saw_candidate = true;
         }
         let mut dev = entry.dev.clone();
-        let mut unlocked_luks = false;
+        let mut unlocked_luks = None;
         let detect = match detect_filesystem(&dev) {
             Ok(Some(t)) => t,
             Ok(None) | Err(_) => {
                 match narf_block::encrypted::open_luks_with_provider(dev.clone()) {
                     Ok(unlocked) => {
-                        dev = Arc::new(unlocked);
-                        unlocked_luks = true;
-                        match detect_filesystem(&dev) {
+                        let detected = narf_block::fs_detect::detect_filesystem_sync(&unlocked);
+                        unlocked_luks = Some(unlocked);
+                        match detected {
                             Ok(Some(t)) => t,
                             Ok(None) | Err(_) => continue,
                         }
@@ -421,8 +443,15 @@ pub fn try_mount_root_with_options(
                 }
             }
         };
+        if unlocked_luks.is_none()
+            && (narf_boot::args().value("rd.luks.key").is_some()
+                || narf_boot::args().value("rd.luks.prompt").is_some())
+        {
+            continue;
+        }
         if let Some(crate::root_selector::RootSelector::ByFsUuid(target)) = selector {
-            let inner_uuid_matches = narf_block::partition::discover_volume_uuid(dev.as_ref())
+            let volume: &dyn BlockDeviceSync = unlocked_luks.as_ref().map_or(dev.as_ref(), |v| v);
+            let inner_uuid_matches = narf_block::partition::discover_volume_uuid(volume)
                 .is_some_and(|uuid| uuid.eq_ignore_ascii_case(target));
             if !outer_uuid_matches && !inner_uuid_matches {
                 continue;
@@ -436,7 +465,7 @@ pub fn try_mount_root_with_options(
         // A retry of the same root (the boot path falls back to a second
         // walk after a failed mount) finds it designated already.
         let already = narf_block::disk_policy::designated_root() == Some(entry.name);
-        if options.designate && !unlocked_luks && !already {
+        if options.designate && !already {
             let designated = selector
                 .and_then(|sel| match sel {
                     crate::root_selector::RootSelector::ByFsUuid(uuid) => {
@@ -445,19 +474,30 @@ pub fn try_mount_root_with_options(
                     _ => None,
                 })
                 .ok_or(narf_block::disk_policy::PolicyError::NoRootUuidArg)
-                .and_then(|uuid| narf_block::disk_policy::designate_root(entry.name, uuid));
+                .and_then(|uuid| match unlocked_luks.as_ref() {
+                    Some(view) => {
+                        narf_block::disk_policy::designate_encrypted_root(entry.name, uuid, view)
+                    }
+                    None => narf_block::disk_policy::designate_root(entry.name, uuid),
+                });
             if let Err(error) = designated {
                 return Err(RootMountError::Designate(error));
             }
         }
-        let fs = if options.flags.is_some() || options.read_only {
-            if unlocked_luks {
-                // The named constructors resolve a registry name; the unlocked
-                // view is not registered until after the mount succeeds.
-                last_error = Some(RootMountError::NoFactory(detect));
-                continue;
-            }
-            match build_named_root(detect, entry.name, &options) {
+        let mut mapping = PendingRootMapping(false);
+        let device_name = if let Some(unlocked) = unlocked_luks {
+            narf_block::registry::register_encrypted_root("cryptroot", entry.name, unlocked)
+                .map_err(RootMountError::LuksMapping)?;
+            mapping.0 = true;
+            dev = narf_block::find_block_device("cryptroot").ok_or(RootMountError::LuksMapping(
+                narf_block::BlockIoError::DeviceRemoved,
+            ))?;
+            "cryptroot"
+        } else {
+            entry.name
+        };
+        let fs = if options.flags.is_some() || options.read_only || options.designate {
+            match build_named_root(detect, device_name, &options) {
                 Ok(fs) => fs,
                 Err(error) => {
                     last_error = Some(error);
@@ -497,14 +537,7 @@ pub fn try_mount_root_with_options(
         let _handle = crate::registry()
             .mount_arc(authority, "/", fs)
             .map_err(|e| RootMountError::FactoryFailed(detect, e))?;
-        let device_name = if unlocked_luks {
-            // Same disk identity as its container, so the write policy
-            // treats the unlocked view exactly like the medium it lives on.
-            narf_block::register_partition_device("cryptroot", entry.name, dev, None);
-            "cryptroot"
-        } else {
-            entry.name
-        };
+        mapping.0 = false;
         return Ok(MountReport {
             device_name: String::from(device_name),
             fs_type: detect,

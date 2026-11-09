@@ -57,6 +57,8 @@ pub enum LuksCredentialError {
     Unavailable,
     Declined,
     TooLarge,
+    Cancelled,
+    TimedOut,
 }
 
 /// Unified boot-open failure for either supported LUKS generation.
@@ -75,12 +77,21 @@ pub enum LuksOpenError {
 pub type LuksPassphraseProvider =
     fn(&LuksVolumeInfo) -> Result<Zeroizing<Vec<u8>>, LuksCredentialError>;
 
-static LUKS_PASSPHRASE_PROVIDER: IrqSafeSpinLock<Option<LuksPassphraseProvider>> =
+static LUKS_PASSPHRASE_PROVIDER: IrqSafeSpinLock<Option<(LuksPassphraseProvider, u8)>> =
     IrqSafeSpinLock::new(None);
 
 /// Install or replace the boot-time LUKS passphrase policy.
 pub fn install_luks_passphrase_provider(provider: LuksPassphraseProvider) {
-    *LUKS_PASSPHRASE_PROVIDER.lock() = Some(provider);
+    install_luks_passphrase_provider_with_attempts(provider, 1);
+}
+
+/// Install a bounded retry policy (1–5 attempts). Only a wrong passphrase is
+/// retried; provider cancellation and malformed/unsupported metadata are final.
+pub fn install_luks_passphrase_provider_with_attempts(
+    provider: LuksPassphraseProvider,
+    attempts: u8,
+) {
+    *LUKS_PASSPHRASE_PROVIDER.lock() = Some((provider, attempts.clamp(1, 5)));
 }
 
 /// Remove the credential provider (primarily for isolated kernel tests).
@@ -124,17 +135,28 @@ pub fn open_luks_with_provider(
     inner: Arc<dyn BlockDeviceSync>,
 ) -> Result<EncryptedBlockDevice, LuksOpenError> {
     let info = probe_luks_volume(inner.as_ref())?.ok_or(LuksOpenError::NotLuks)?;
-    let provider = (*LUKS_PASSPHRASE_PROVIDER.lock())
+    let (provider, attempts) = (*LUKS_PASSPHRASE_PROVIDER.lock())
         .ok_or(LuksOpenError::Credential(LuksCredentialError::Unavailable))?;
-    let passphrase = provider(&info).map_err(LuksOpenError::Credential)?;
-    match info.version {
-        LuksVersion::Luks1 => {
-            EncryptedBlockDevice::open_luks1(inner, &passphrase).map_err(LuksOpenError::Luks1)
-        }
-        LuksVersion::Luks2 => {
-            EncryptedBlockDevice::open_luks2(inner, &passphrase).map_err(LuksOpenError::Luks2)
+    for attempt in 0..attempts {
+        let passphrase = provider(&info).map_err(LuksOpenError::Credential)?;
+        let result = match info.version {
+            LuksVersion::Luks1 => EncryptedBlockDevice::open_luks1(inner.clone(), &passphrase)
+                .map_err(LuksOpenError::Luks1),
+            LuksVersion::Luks2 => EncryptedBlockDevice::open_luks2(inner.clone(), &passphrase)
+                .map_err(LuksOpenError::Luks2),
+        };
+        drop(passphrase);
+        if attempt + 1 == attempts
+            || !matches!(
+                result,
+                Err(LuksOpenError::Luks1(Luks1Error::WrongPassphrase))
+                    | Err(LuksOpenError::Luks2(Luks2Error::WrongPassphrase))
+            )
+        {
+            return result;
         }
     }
+    unreachable!("attempt count is nonzero")
 }
 
 /// Wrapper around the 64-byte AES-XTS Volume Key. Construction is
@@ -297,6 +319,11 @@ impl core::fmt::Debug for EncryptedBlockDevice {
 }
 
 impl EncryptedBlockDevice {
+    /// Verify that this authenticated adapter wraps this exact registration.
+    pub(crate) fn wraps(&self, device: &Arc<dyn BlockDeviceSync>) -> bool {
+        Arc::ptr_eq(&self.inner, device)
+    }
+
     /// Attempts to "mount" an encrypted volume by unsealed its key.
     /// This is marked `async` because it may involve TPM interaction.
     ///
@@ -602,7 +629,14 @@ impl BlockDeviceSync for EncryptedBlockDevice {
         // For Stage 4, we'll use a stack-allocated or temporary buffer.
         // To be safe, we'll allocate a Vec for now (requires `alloc`).
         let mut encrypted = data[..required].to_vec();
-        self.crypt_buffer(true, lba, &mut encrypted)?;
+        self.crypt_buffer(true, lba, &mut encrypted)
+            .inspect_err(|error| {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "encrypted block: encryption at LBA {lba} failed: {error:?}"
+                );
+            })?;
         let scale = u64::from(self.lba_size()) / u64::from(self.inner.lba_size());
         let inner_lba = lba
             .checked_mul(scale)
@@ -612,5 +646,12 @@ impl BlockDeviceSync for EncryptedBlockDevice {
             .checked_mul(scale)
             .ok_or(BlockIoError::OutOfRange)?;
         self.write_inner_blocks(inner_lba, inner_blocks, &encrypted)
+            .inspect_err(|error| {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "encrypted block: write at LBA {lba} ({n_blocks} blocks) failed: {error:?}"
+                );
+            })
     }
 }

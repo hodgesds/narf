@@ -29,6 +29,18 @@ each dependency is in [Running on Linux](RUNNING_ON_LINUX.md#1-prerequisites).
 
 ## Build, boot, and test
 
+The x86_64 native EFI path builds one file with its kernel and initramfs:
+
+```sh
+cargo xtask efi-image
+cargo xtask efi-image --run
+cargo xtask efi-image --smoke
+```
+
+See [native EFI installation and running](NATIVE_UEFI.md) for prerequisites,
+custom archives/command lines, ESP installation, and the distinction from the
+existing Limine-backed media commands; native x86 packages use EFI images.
+
 The `xtask` command is the supported front end. Optimized (`release`) builds
 are the default; pass `--debug` when debug assertions or debug symbols matter.
 

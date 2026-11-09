@@ -254,7 +254,7 @@ loader_kind=limine
 [ ! -f "$source_dir/arch" ] || payload_arch=$(sed -n '1p' "$source_dir/arch")
 [ ! -f "$source_dir/loader-kind" ] || loader_kind=$(sed -n '1p' "$source_dir/loader-kind")
 case "$payload_arch:$loader_kind" in
-    x86_64:limine)
+    x86_64:limine|x86_64:native)
         pe_machine=6486
         bls_arch=x64
         ;;
@@ -267,6 +267,16 @@ case "$payload_arch:$loader_kind" in
         exit 1
         ;;
 esac
+
+# An adopted Multiboot entry carries host root/firmware policy which cannot
+# silently be replaced by an embedded command line. Require an explicit host
+# menu migration before switching this installation to the native image.
+if [ "$loader_kind" = native ] && [ -n "$host_limine_config" ] &&
+    [ "$command_name" != remove ]; then
+    echo "narf-uefi: migrate the adopted host Limine entry to an EFI chainload of /EFI/NARF/narf.efi first" >&2
+    echo "narf-uefi: then remove the saved adoption record $limine_state_file and rerun" >&2
+    exit 1
+fi
 
 has_other_limine() {
     for efi_candidate in "$esp"/EFI/*/*.efi "$esp"/EFI/*/*.EFI; do
@@ -293,12 +303,16 @@ case "$command_name" in
     status)
         check_host_limine || exit 1
         missing=0
-        for path in "$loader" "$kernel" "$bls_entry"; do
+        for path in "$loader" "$bls_entry"; do
             if [ ! -f "$path" ]; then
                 echo "missing: $path"
                 missing=1
             fi
         done
+        if [ "$loader_kind" != native ] && [ ! -f "$kernel" ]; then
+            echo "missing: $kernel"
+            missing=1
+        fi
         if [ "$loader_kind" = limine ] && [ ! -f "$config" ]; then
             echo "missing: $config"
             missing=1
@@ -335,14 +349,18 @@ case "$command_name" in
             fi
             if [ "$version" != "$packaged_version" ] ||
                 [ "$loader_matches" -ne 1 ] ||
-                ! cmp -s "$source_dir/narf-frame" "$kernel"; then
+                { [ "$loader_kind" != native ] && ! cmp -s "$source_dir/narf-frame" "$kernel"; }; then
                 echo "stale: ESP payload does not match packaged NARF $packaged_version"
                 current=0
             fi
         fi
         echo "ESP: $esp"
         echo "loader: $loader"
-        echo "kernel: $kernel"
+        if [ "$loader_kind" = native ]; then
+            echo "kernel/initramfs/command line: embedded in EFI image"
+        else
+            echo "kernel: $kernel"
+        fi
         echo "version: ${version:-unknown}"
         echo "architecture: $payload_arch"
         if [ -n "$host_limine_kernel" ]; then
@@ -432,6 +450,12 @@ actual_kernel_hash=$(b2sum -l 512 "$source_kernel" | awk '{print $1}')
     echo "narf-uefi: packaged kernel does not match its BLAKE2b digest" >&2
     exit 1
 }
+if [ "$loader_kind" = native ]; then
+    python3 "$source_dir/native-efi.py" "$source_loader" --kernel "$source_kernel" >/dev/null || {
+        echo "narf-uefi: invalid native image or mismatched embedded kernel" >&2
+        exit 1
+    }
+fi
 if [ "$loader_kind" = limine ] &&
     ! grep -Fqx "    path: boot():/EFI/NARF/narf-frame#$kernel_hash" "$source_config"; then
     echo "narf-uefi: Limine configuration is not bound to the packaged kernel" >&2
@@ -537,7 +561,9 @@ tmp_bls=$esp/loader/entries/.narf.conf.$$
 trap 'rm -f "$tmp_loader" "$tmp_kernel" "$tmp_config" ${tmp_grub_fallback:+"$tmp_grub_fallback"} ${tmp_signed_loader:+"$tmp_signed_loader"} ${tmp_host_kernel:+"$tmp_host_kernel"} ${tmp_host_backup:+"$tmp_host_backup"} "$tmp_bls"' EXIT HUP INT TERM
 
 install -m 0644 "$source_loader" "$tmp_loader"
-install -m 0644 "$source_kernel" "$tmp_kernel"
+if [ "$loader_kind" != native ]; then
+    install -m 0644 "$source_kernel" "$tmp_kernel"
+fi
 if [ "$sbctl_sign" = yes ]; then
     tmp_signed_loader=$efi_dir/.narf.efi.signed.$$
     if ! sbctl sign --output "$tmp_signed_loader" "$tmp_loader"; then
@@ -570,7 +596,9 @@ chmod 0644 "$tmp_bls"
 # Publish the kernel and its config before the discoverable EFI/BLS entry
 # points. A power loss can leave harmless dot-temporaries, but no new entry
 # points at an absent kernel.
-mv -f "$tmp_kernel" "$kernel"
+if [ "$loader_kind" != native ]; then
+    mv -f "$tmp_kernel" "$kernel"
+fi
 if [ "$loader_kind" = limine ]; then
     mv -f "$tmp_config" "$config"
 else
@@ -581,6 +609,15 @@ if [ "$manage_grub_fallback" -eq 1 ]; then
 fi
 mv -f "$tmp_loader" "$loader"
 mv -f "$tmp_bls" "$bls_entry"
+if [ "$loader_kind" = native ]; then
+    # The complete new payload is published before removing obsolete managed
+    # sidecars. A failed copy/sign leaves the previous installation intact.
+    rm -f "$kernel"
+    if [ -f "$grub_fallback_config" ] && grep -Fqx "$config_marker" "$grub_fallback_config"; then
+        rm -f "$grub_fallback_config"
+        rmdir "$grub_fallback_dir" 2>/dev/null || true
+    fi
+fi
 if [ -n "$tmp_host_kernel" ]; then
     # Stage the legacy copy only after replacing the primary copy: two
     # simultaneous kernel temporaries do not fit alongside the firmware

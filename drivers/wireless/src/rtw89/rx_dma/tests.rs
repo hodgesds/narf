@@ -728,3 +728,60 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_rx_refuses_open_rx_before_publication
 );
+
+fn smoke_rtw8852a_rx_prepare_takes_ax_geometry_and_ltr_trigger() -> TestResult {
+    let mut f = Fixture::new();
+    // Seed the full A DMA-stop state: A stops ACH4/6, CH8, CH12
+    // (`B_AX_TX_STOP1_MASK`) plus CH10/11 (`B_AX_TX_STOP2_ALL`), a
+    // superset of B's V1 mask; the shared stopped readback must hold.
+    f.model.bytes[0x1010..0x1014].copy_from_slice(&0xf5f03u32.to_le_bytes());
+    f.model.bytes[0x1310..0x1314].copy_from_slice(&3u32.to_le_bytes());
+    // SAFETY: private RAM model with no DMA/reset/IRQ producer; the fixture
+    // retains every allocation and fences it before destruction.
+    if ready(unsafe { f.rx.prepare_for(&mut f.model, ChipId::Rtl8852A, 4) }) != Some(Ok(()))
+        || f.rx.state() != State::Polling
+    {
+        return TestResult::Fail("A RXQ/RPQ preparation did not reach Polling");
+    }
+    let m = &f.model;
+    // AX baseline ring addresses (rtw8852ae.c `rtw89_pci_ch_dma_addr_set`),
+    // RXQ 0x1100 / RPQ 0x1108, with the 0x1010 stop bits minus RXQ/RPQ.
+    let rings = f.rx.rings.as_ref().unwrap();
+    if rings[0].regs.desa_l != 0x1100
+        || rings[1].regs.desa_l != 0x1108
+        || m.raw(0x1010) != 0xf5f00
+        || m.raw(0x1000) & (1 << 13) == 0
+        || m.raw(0x8380) & 2 == 0
+    {
+        return TestResult::Fail("A RX geometry differs from rtw8852a_pci_info");
+    }
+    // A-only LTR software trigger (pci.c `mac_post_init_ax`): 0x8410 bit 5.
+    // 8-byte address-info mode (A/B only): 0x8810 bit 0 set, 0x9a00 bit 1
+    // clear. The V1 release registers stay untouched.
+    if m.raw(0x8410) & (1 << 5) == 0
+        || m.raw(0x8810) & 1 == 0
+        || m.raw(0x9a00) & 2 != 0
+        || m.raw(0x7880) != 0
+        || m.raw(0x1200) != 0
+    {
+        return TestResult::Fail("A LTR trigger or address-info mode missing");
+    }
+    let payload: Vec<u8> = (0..40).collect();
+    if !f.model.inject(&f.rx, 0, 0, &packet(0, &payload)) {
+        return TestResult::Fail("A device model did not follow actual AX RXBD allocations");
+    }
+    let events = f.rx.poll(&mut f.model, 1).unwrap();
+    if !matches!(events.as_slice(), [Event::Wifi(_, bytes)] if bytes == &payload[..36]) {
+        return TestResult::Fail("A RXQ did not deliver the actual DMA frame");
+    }
+    // B keeps its own path: no A-only LTR trigger bit.
+    let mut b = Fixture::new();
+    if b.prepare() != Some(Ok(())) || b.model.raw(0x8410) & (1 << 5) != 0 {
+        return TestResult::Fail("B RX prepare set the A-only LTR trigger");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_rx_prepare_takes_ax_geometry_and_ltr_trigger
+);

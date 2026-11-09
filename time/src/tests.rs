@@ -1404,3 +1404,273 @@ fn smoke_sleep_helpers_use_wall_time() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time", smoke_sleep_helpers_use_wall_time);
+
+// ── NTP discipline loop (issue #1764) ────────────────────────────────
+//
+// The SNTP client's entry point is `ntp::apply_sample` and the per-second
+// drain is `ntp::tick_second`. These smokes drive both directly (no
+// network): a small offset slews off one exponential chunk per second, a
+// large one steps at once, panic/unsynced samples are refused, and the
+// PLL learns frequency from the interval between `ADJ_OFFSET` updates.
+// Every test resets the NTP state and the wall offset first and last —
+// both are process-global and the adjtimex syscall tests assert the boot
+// defaults.
+
+fn smoke_ntp_apply_sample_small_offset_slews_via_tick() -> TestResult {
+    use crate::ntp::{adjtimex, apply_sample, tick_second, DisciplineOutcome, Timex};
+    use crate::{ntp, wall};
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    const NOW_SEC: i64 = 1_700_000_000;
+
+    // +50 ms: under the 128 ms step threshold, so it slews.
+    match apply_sample(50_000_000, 2_000_000, 1_000_000, 2, NOW_SEC) {
+        DisciplineOutcome::Slewed(50_000_000) => {}
+        _ => return TestResult::Fail("a 50 ms sample should slew, not step or refuse"),
+    }
+    // No step yet: the wall offset has not moved.
+    if wall::wall_offset_ns() != 0 {
+        return TestResult::Fail("a slewed sample stepped the wall clock");
+    }
+    // The daemon took over: STA_PLL set, STA_UNSYNC clear, TIME_OK.
+    let mut tx = Timex::default();
+    if adjtimex(&mut tx, NOW_SEC, 0) != ntp::TIME_OK {
+        return TestResult::Fail("a disciplined clock should answer TIME_OK");
+    }
+    if tx.status & ntp::STA_PLL == 0 || tx.status & ntp::STA_UNSYNC != 0 {
+        return TestResult::Fail("apply_sample should take over discipline (PLL on, sync clear)");
+    }
+    // The phase reads back as the 50_000 µs that was fed in.
+    if tx.offset != 50_000 {
+        return TestResult::Fail("ADJ_OFFSET phase did not read back");
+    }
+    // First sample, zero interval: no frequency learned yet.
+    if tx.freq != 0 {
+        return TestResult::Fail("a zero-interval sample should learn no frequency");
+    }
+
+    // One second's drain: chunk = time_offset >> (SHIFT_PLL + constant) =
+    // 50 ms >> 4 (boot constant 2) = 3_125_000 ns, folded into the wall.
+    // The range admits a second chunk if a live tick boundary crossed
+    // mid-test and the `on_tick` hook ran `tick_second` concurrently (the
+    // hook fires once per wall second from IRQ context); the readback
+    // range admits the same one-or-two-chunks outcomes (46_875, 43_945).
+    tick_second();
+    let moved = wall::wall_offset_ns();
+    if !(3_125_000..=6_200_000).contains(&moved) {
+        return TestResult::Fail("tick_second did not slew one exponential chunk");
+    }
+    let mut tx = Timex::default();
+    let _ = adjtimex(&mut tx, NOW_SEC, 0);
+    if !(40_000..=46_875).contains(&tx.offset) {
+        return TestResult::Fail("tick_second did not drain ~1/16 of the phase");
+    }
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_ntp_apply_sample_small_offset_slews_via_tick);
+
+fn smoke_ntp_apply_sample_large_offset_steps() -> TestResult {
+    use crate::ntp::{adjtimex, apply_sample, DisciplineOutcome, Timex};
+    use crate::{ntp, wall};
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    const NOW_SEC: i64 = 1_700_000_000;
+
+    // +3600 s: over the 128 ms step threshold, so it steps at once.
+    match apply_sample(3_600_000_000_000, 1_000_000, 1_000_000, 2, NOW_SEC) {
+        DisciplineOutcome::Stepped(3_600_000_000_000) => {}
+        _ => return TestResult::Fail("a 3600 s sample should step, not slew or refuse"),
+    }
+    if wall::wall_offset_ns() != 3_600_000_000_000 {
+        return TestResult::Fail("a stepped sample did not move the wall offset by the offset");
+    }
+    // The step consumed the pending phase.
+    let mut tx = Timex::default();
+    let _ = adjtimex(&mut tx, NOW_SEC, 0);
+    if tx.offset != 0 {
+        return TestResult::Fail("a step should clear the pending phase");
+    }
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_ntp_apply_sample_large_offset_steps);
+
+fn smoke_ntp_apply_sample_refuses_panic_and_unsynced() -> TestResult {
+    use crate::ntp::{adjtimex, apply_sample, DisciplineOutcome, Timex};
+    use crate::{ntp, wall};
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    const NOW_SEC: i64 = 1_700_000_000;
+
+    // Over the 1000 s panic threshold: refused, clock untouched.
+    match apply_sample(1_000_000_000_001, 1_000_000, 1_000_000, 2, NOW_SEC) {
+        DisciplineOutcome::Ignored(_) => {}
+        _ => return TestResult::Fail("an over-panic-threshold sample should be refused"),
+    }
+    // Stratum 16 (unsynchronised) and stratum 0 (kiss-o'-death): refused.
+    match apply_sample(1_000_000, 1_000_000, 1_000_000, 16, NOW_SEC) {
+        DisciplineOutcome::Ignored(_) => {}
+        _ => return TestResult::Fail("a stratum-16 sample should be refused"),
+    }
+    match apply_sample(1_000_000, 1_000_000, 1_000_000, 0, NOW_SEC) {
+        DisciplineOutcome::Ignored(_) => {}
+        _ => return TestResult::Fail("a stratum-0 sample should be refused"),
+    }
+    if wall::wall_offset_ns() != 0 {
+        return TestResult::Fail("a refused sample moved the wall clock");
+    }
+    let mut tx = Timex::default();
+    if adjtimex(&mut tx, NOW_SEC, 0) != ntp::TIME_ERROR {
+        return TestResult::Fail("refused samples should leave the clock undisciplined");
+    }
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_ntp_apply_sample_refuses_panic_and_unsynced);
+
+fn smoke_ntp_tick_second_drains_small_phase_to_zero() -> TestResult {
+    use crate::ntp::{adjtimex, apply_sample, tick_second, Timex};
+    use crate::{ntp, wall};
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    const NOW_SEC: i64 = 1_700_000_000;
+
+    // +1 µs: the exponential chunk rounds to zero within a few seconds,
+    // and then the whole remainder is delivered (Linux `second_overflow()`
+    // convergence rule) — the phase must reach exactly zero, not stall.
+    match apply_sample(1_000, 1_000_000, 1_000_000, 2, NOW_SEC) {
+        crate::ntp::DisciplineOutcome::Slewed(1_000) => {}
+        _ => return TestResult::Fail("a 1 µs sample should slew"),
+    }
+    // The drain is exponential (1/16 of the remainder per second at the
+    // boot constant), so a 1 µs phase needs ~340 seconds to reach the
+    // sub-16-unit remainder the convergence rule delivers whole.
+    for _ in 0..500 {
+        tick_second();
+    }
+    let mut tx = Timex::default();
+    let _ = adjtimex(&mut tx, NOW_SEC, 0);
+    if tx.offset != 0 {
+        return TestResult::Fail("a 1 µs phase did not converge to zero");
+    }
+    // The wall moved by the whole microsecond, up to per-tick ns truncation.
+    let moved = wall::wall_offset_ns();
+    if !(900..=1_000).contains(&moved) {
+        return TestResult::Fail("a 1 µs phase did not slew into the wall clock");
+    }
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_ntp_tick_second_drains_small_phase_to_zero);
+
+fn smoke_ntp_tick_second_maxerror_saturation_marks_unsync() -> TestResult {
+    use crate::ntp::{adjtimex, apply_sample, tick_second, Timex};
+    use crate::{ntp, wall};
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    const NOW_SEC: i64 = 1_700_000_000;
+
+    // A fresh sample resets the error estimates to ~2 ms; then silence.
+    // `tick_second` bumps maxerror 500 µs/s, so after 32_000 s of silence
+    // it saturates at NTP_PHASE_LIMIT and the clock is marked unsynced —
+    // Linux's `second_overflow()` rule: a clock nobody has fed for ~4.4
+    // hours is no longer trusted.
+    match apply_sample(1_000_000, 2_000_000, 1_000_000, 2, NOW_SEC) {
+        crate::ntp::DisciplineOutcome::Slewed(_) => {}
+        _ => return TestResult::Fail("a 1 ms sample should slew"),
+    }
+    for _ in 0..32_000 {
+        tick_second();
+    }
+    let mut tx = Timex::default();
+    if adjtimex(&mut tx, NOW_SEC, 0) != ntp::TIME_ERROR {
+        return TestResult::Fail("a long-unfed clock should answer TIME_ERROR");
+    }
+    if tx.status & ntp::STA_UNSYNC == 0 {
+        return TestResult::Fail("maxerror saturation should mark STA_UNSYNC");
+    }
+    if tx.maxerror != 16_000_000 {
+        return TestResult::Fail("maxerror should clamp at NTP_PHASE_LIMIT");
+    }
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "time",
+    smoke_ntp_tick_second_maxerror_saturation_marks_unsync
+);
+
+/// The PLL frequency half of `ntp_update_offset()`: two `ADJ_OFFSET`
+/// updates 64 s apart, both reporting a +100 µs phase error, mean the
+/// oscillator runs fast — the second update must learn a positive
+/// `time_freq`. The first update (zero interval after the PLL turn-on)
+/// learns nothing.
+///
+/// Expected value, from Linux `kernel/time/ntp.c` with the boot constant
+/// 2: the interval clamps to `1 << (SHIFT_PLL + 1 + 2)` = 32 s, so
+/// `freq_adj = (100_000 ns * 32) << (32 - 2 * (2 + 2 + 2))` =
+/// 3_355_443_200_000, which reads back as 51_200 scaled ppm
+/// (0.78 ppm) through the `PPM_SCALE` round-trip.
+fn smoke_ntp_update_offset_learns_frequency() -> TestResult {
+    use crate::ntp;
+    use crate::ntp::{adjtimex, Timex, ADJ_OFFSET, ADJ_STATUS, STA_PLL};
+
+    ntp::__test_reset();
+    const NOW_SEC: i64 = 1_700_000_000;
+
+    // Turn the PLL on (resets time_reftime to NOW_SEC).
+    let mut tx = Timex {
+        modes: ADJ_STATUS,
+        status: STA_PLL,
+        ..Timex::default()
+    };
+    let _ = adjtimex(&mut tx, NOW_SEC, 0);
+
+    // First update at the turn-on instant: zero interval, no learning.
+    let mut tx = Timex {
+        modes: ADJ_OFFSET,
+        offset: 100,
+        ..Timex::default()
+    };
+    let _ = adjtimex(&mut tx, NOW_SEC, 0);
+    if tx.freq != 0 {
+        return TestResult::Fail("a zero-interval update should learn no frequency");
+    }
+    if tx.offset != 100 {
+        return TestResult::Fail("the first ADJ_OFFSET phase did not read back");
+    }
+
+    // Second update 64 s later, same +100 µs error: positive frequency.
+    let mut tx = Timex {
+        modes: ADJ_OFFSET,
+        offset: 100,
+        ..Timex::default()
+    };
+    let _ = adjtimex(&mut tx, NOW_SEC + 64, 0);
+    if tx.freq != 51_200 {
+        return TestResult::Fail("the PLL should learn +51_200 scaled ppm from a repeated error");
+    }
+    if tx.offset != 100 {
+        return TestResult::Fail("the second ADJ_OFFSET phase did not read back");
+    }
+
+    ntp::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_ntp_update_offset_learns_frequency);

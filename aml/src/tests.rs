@@ -3633,8 +3633,9 @@ fn write_table_to_frame(
         Err(_) => return Err("alloc_frame"),
     };
     let phys = frame.start_address().raw();
-    // SAFETY: exclusively-owned frame, reached through the direct map.
     let dst = frame.start_address().kernel_mut_ptr::<u8>();
+    // SAFETY: the exclusively owned frame is mapped, the source fits in it,
+    // and the source allocation does not overlap the destination frame.
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
     }
@@ -3709,6 +3710,8 @@ fn smoke_aml_sec1290_dsdt_valid_loads() -> TestResult {
         Ok(v) => v,
         Err(m) => return TestResult::Fail(m),
     };
+    // SAFETY: phys holds the complete table in our mapped frame, which
+    // remains allocated until the walk returns.
     let n = match unsafe { crate::walk_aml_table(phys, "\\") } {
         Ok(n) => n,
         Err(_) => {
@@ -3737,6 +3740,8 @@ fn smoke_aml_sec1290_dsdt_valid_loads() -> TestResult {
         Ok(v) => v,
         Err(m) => return TestResult::Fail(m),
     };
+    // SAFETY: phys holds the complete table in our mapped frame, which
+    // remains allocated until the walk returns.
     let n = match unsafe { crate::walk_aml_table(phys, "\\") } {
         Ok(n) => n,
         Err(_) => {
@@ -3765,6 +3770,8 @@ fn smoke_aml_sec1290_dsdt_bad_checksum_rejected() -> TestResult {
         Ok(v) => v,
         Err(m) => return TestResult::Fail(m),
     };
+    // SAFETY: the bad-checksum table is fully backed by our mapped frame,
+    // which remains allocated until the walk returns.
     let r = unsafe { crate::walk_aml_table(phys, "\\") };
     narf_memory::frame::free_frame(frame);
     match r {
@@ -3789,6 +3796,8 @@ fn smoke_aml_sec1290_table_out_of_window_rejected() -> TestResult {
         return TestResult::Fail("mapped_window_end is 0 (allocator not initialized?)");
     }
     for phys in [window_end, u64::MAX] {
+        // SAFETY: both physical addresses fail the initial window check,
+        // which returns before any pointer is dereferenced.
         match unsafe { crate::walk_aml_table(phys, "\\") } {
             Err(crate::AmlError::Acpi(narf_acpi::AcpiError::OutOfMappedWindow)) => {}
             Ok(_) => return TestResult::Fail("out-of-window table accepted"),
@@ -3839,6 +3848,8 @@ fn smoke_aml_sec1290_store_cap_enforced() -> TestResult {
         Err(m) => return TestResult::Fail(m),
     };
     let before = crate::aml_total_len();
+    // SAFETY: phys holds the complete table in our mapped frame, which
+    // remains allocated until the walk returns.
     let r = unsafe { crate::walk_aml_table(phys, "\\") };
     narf_memory::frame::free_frame(frame);
     match r {

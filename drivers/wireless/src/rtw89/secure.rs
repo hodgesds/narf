@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 //! AX physical fuse interpretation and checked hardware-signature selection.
 //! References: Linux rtw89/efuse.c recognizers and fw.c MSS pool selectors.
+//! The BE (RTL8922A) fuse state enters through [`Fuses::from_be`]
+//! (`efuse_be::read_secure`): the same MSS triple + magnitude rule,
+//! with the BE magnitude (`sb_sel_mgn`) carried so a formatted
+//! section's `sb_sel_ver` is checked against it instead of zero.
 
-use super::{fwdl::SignaturePool, mac::ChipId};
+use super::{efuse_be::SecureInfo, fwdl::SignaturePool, mac::ChipId};
 use core::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +31,12 @@ pub struct Fuses {
     enabled: bool,
     legacy: Option<u8>,
     modern: Option<Modern>,
+    /// Formatted-section magnitude the image must match
+    /// (`sb_sel_mgn`, fw.c `__parse_formatted_mssc`). AX never
+    /// programs one, so AX fuses carry 0 and the check below is the
+    /// old exact-zero rule; BE carries 0x8000100 or 0xC000180 from
+    /// the secure fuse window (`efuse_be::SB_SEL_MGN`).
+    sb_sel_mgn: u32,
 }
 
 /// Host policy, independent of the firmware-supplied blacklist version/bit.
@@ -48,9 +58,12 @@ impl Blacklist {
     /// is returned here; the matching signature is still required. RTL8852A
     /// (also NULL upstream) takes the authenticated-board-policy path via
     /// [`Blacklist::board_8852a`] instead: no signature-only fallback.
+    /// RTL8922A carries the same version-0/all-clear default list as
+    /// 8852B/8852C (`rtw8922a_chip_info.fw_blacklist =
+    /// &rtw89_fw_blacklist_default`, `rtw8922a.c:3215`).
     pub fn upstream(chip: ChipId) -> Option<Self> {
         match chip {
-            ChipId::Rtl8852B | ChipId::Rtl8852C => Some(Self {
+            ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8922A => Some(Self {
                 version: 0,
                 bits: [0; 32],
                 chip_list: true,
@@ -114,6 +127,7 @@ impl Fuses {
                 enabled: false,
                 legacy: None,
                 modern: None,
+                sb_sel_mgn: 0,
             });
         }
         let legacy = match (255 - b1, 15 - (b2 & 15), 7 - ((b2 >> 4) & 7)) {
@@ -150,7 +164,37 @@ impl Fuses {
             enabled: true,
             legacy,
             modern,
+            sb_sel_mgn: 0,
         })
+    }
+    /// BE fuse state from the secure-window read, `efuse_be::read_secure`
+    /// (Linux `rtw89_efuse_read_fw_secure_be` and
+    /// `rtw89_efuse_recognize_mss_info_v1`). The MSS triple is the
+    /// Linux-mapped device index, customer and key, via
+    /// `efuse_be::MssDevType::index`, so the formatted-pool selection
+    /// below is the same `fw.c::__get_mssc_key_idx` rule the AX decoder
+    /// feeds. Secure boot off — default cryp-sel, invalid cryp-sel
+    /// index, or failed MSS decode — never enables signature selection,
+    /// and a secure-boot-on state without an MSS selection is fail-closed
+    /// the same way. There is no legacy (v0 indexed) selection for BE:
+    /// Linux only recognizes the v1 triple for these chips.
+    pub fn from_be(chip: ChipId, info: SecureInfo) -> Self {
+        let modern = if info.secure_boot {
+            info.mss_dev_type.map(|device| Modern {
+                device: device.index(),
+                customer: info.mss_cust_idx,
+                key: info.mss_key_num,
+            })
+        } else {
+            None
+        };
+        Self {
+            chip,
+            enabled: info.secure_boot && modern.is_some(),
+            legacy: None,
+            modern,
+            sb_sel_mgn: info.sb_sel_mgn.unwrap_or(0),
+        }
     }
     pub fn chip(self) -> ChipId {
         self.chip
@@ -175,9 +219,14 @@ impl Fuses {
             return Ok(None);
         }
         let (index, stride, length) = if pool.bitmap {
-            // AX sb_sel_mgn is zero. This field overlaps key_sign_len: an
-            // explicit incompatible selector must not be silently truncated.
-            if u32at(content, 58)? != 0 {
+            // fw.c `__parse_formatted_mssc`: a nonzero section
+            // magnitude (`sb_sel_ver`, content offset 58) must equal
+            // the fuse magnitude (`sb_sel_mgn`); otherwise this
+            // section is ignored. AX never programs a magnitude, so
+            // its `sb_sel_mgn` is zero and this is the old exact-zero
+            // rule; BE compares against 0x8000100 / 0xC000180.
+            let magnitude = u32at(content, 58)?;
+            if magnitude != 0 && magnitude != self.sb_sel_mgn {
                 return Ok(None);
             }
             let Some(selection) = self.modern else {

@@ -1995,9 +1995,31 @@ fn publish_input_device(id: narf_input::evdev::DeviceId, emit: bool) {
         let attr_uniq = dev_uniq.clone();
         kobject_add_attr(&inputn, "uniq", move || format!("{}\n", attr_uniq));
     }
-    // (The id quartet rides the uevent PRODUCT= line below; the
-    // sysfs `id/` subdirectory shape is a follow-up, not faked
-    // here with slash-named attrs the VFS cannot walk.)
+    // ── `id/` subdirectory: …/inputN/id/{bustype,vendor,product,version}
+    // A real child kobject, not slash-named attrs (the VFS cannot walk
+    // those). Linux ref: drivers/input/input.c `input_dev_id_attr_group`
+    // (.name = "id", attrs bustype/vendor/product/version); each show
+    // emits "%04x\n" (`INPUT_DEV_ID_ATTR`). The values come from the
+    // same `dev_id` the uevent PRODUCT= line below is built from, so
+    // the sysfs files and the uevent line can never disagree. The
+    // uevent line itself stays "%x/%x/%x/%x" per `input_dev_uevent`.
+    let id_dir = Kobject::new_child(inputn.clone(), "id");
+    {
+        let bustype = dev_id.bustype;
+        kobject_add_attr(&id_dir, "bustype", move || format!("{:04x}\n", bustype));
+    }
+    {
+        let vendor = dev_id.vendor;
+        kobject_add_attr(&id_dir, "vendor", move || format!("{:04x}\n", vendor));
+    }
+    {
+        let product = dev_id.product;
+        kobject_add_attr(&id_dir, "product", move || format!("{:04x}\n", product));
+    }
+    {
+        let version = dev_id.version;
+        kobject_add_attr(&id_dir, "version", move || format!("{:04x}\n", version));
+    }
     // A `uevent` file is what sd_device_new_from_syspath uses to accept a
     // directory as a device (so the parent walk resolves it). Writable, like
     // the child eventN below: `udevadm trigger --action=add` walks /sys and

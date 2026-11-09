@@ -354,9 +354,12 @@ pub fn set_clock_range<M: SmuMmio>(
 // from that buffer. `smu_v13_0_4_ppt.c::smu_v13_0_4_get_smu_metrics_data`
 // is the reader.
 //
-// The DMA buffer and the transfer handshake are not wired up yet. The decoder
-// below is, so that when they are, the field offsets are not guessed: they
-// come from `offsetof` on `SmuMetrics_t` in `smu13_driver_if_v13_0_4.h`.
+// The DMA buffer and the transfer handshake now live in the owner
+// below (`amdgpu_smu_apu_telemetry`); what is still unwired is the
+// attach — no APU platform singleton exists to retain the owner and
+// spawn its monitor, so nothing refreshes the table yet. The decoder
+// below is, so the field offsets are not guessed: they come from
+// `offsetof` on `SmuMetrics_t` in `smu13_driver_if_v13_0_4.h`.
 //
 // The owner that wires them up is `amdgpu_smu_apu_telemetry`
 // (`ApuTelemetryOwner`): a DMA-coherent buffer published with
