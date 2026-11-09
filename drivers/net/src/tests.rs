@@ -3203,6 +3203,7 @@ fn smoke_netdev_carrier_transitions() -> TestResult {
             duplex: Some(narf_net::iface::LinkDuplex::Full),
             media_available: None,
             phy_type: None,
+            phy_type_name: None,
         },
     ) {
         return TestResult::Fail("publish_link rejected the up transition");
@@ -3240,7 +3241,8 @@ fn smoke_netdev_media_publication() -> TestResult {
     let Some(down0) = narf_net::iface::lookup(&name) else {
         return TestResult::Fail("media fixture iface missing after publish");
     };
-    if down0.media_available.is_some() || down0.phy_type.is_some() {
+    if down0.media_available.is_some() || down0.phy_type.is_some() || down0.phy_type_name.is_some()
+    {
         return TestResult::Fail("media fixture did not start unknown");
     }
     if !publish_link(
@@ -3251,6 +3253,7 @@ fn smoke_netdev_media_publication() -> TestResult {
             duplex: None,
             media_available: Some(true),
             phy_type: Some(0x07),
+            phy_type_name: Some("SFI"),
         },
     ) {
         return TestResult::Fail("publish_link rejected the media up sample");
@@ -3260,6 +3263,9 @@ fn smoke_netdev_media_publication() -> TestResult {
     };
     if up.media_available != Some(true) || up.phy_type != Some(0x07) {
         return TestResult::Fail("media state did not reach iface metadata");
+    }
+    if up.phy_type_name != Some("SFI") {
+        return TestResult::Fail("decoded phy_type name did not reach iface metadata");
     }
     // Link down, module still seated: carrier and speed clear,
     // media and PHY type survive.
@@ -3271,6 +3277,7 @@ fn smoke_netdev_media_publication() -> TestResult {
             duplex: None,
             media_available: Some(true),
             phy_type: Some(0x07),
+            phy_type_name: Some("SFI"),
         },
     ) {
         return TestResult::Fail("publish_link rejected the media down sample");
@@ -3284,6 +3291,9 @@ fn smoke_netdev_media_publication() -> TestResult {
     if down1.media_available != Some(true) || down1.phy_type != Some(0x07) {
         return TestResult::Fail("down sample dropped the seated-module state");
     }
+    if down1.phy_type_name != Some("SFI") {
+        return TestResult::Fail("down sample dropped the decoded phy_type name");
+    }
     // Empty cage: media flips to absent, and the PHY type of the
     // removed module clears with it — an empty cage has no type.
     if !publish_link(
@@ -3294,6 +3304,7 @@ fn smoke_netdev_media_publication() -> TestResult {
             duplex: None,
             media_available: Some(false),
             phy_type: None,
+            phy_type_name: None,
         },
     ) {
         return TestResult::Fail("publish_link rejected the empty-cage sample");
@@ -3301,7 +3312,10 @@ fn smoke_netdev_media_publication() -> TestResult {
     let Some(cage) = narf_net::iface::lookup(&name) else {
         return TestResult::Fail("media fixture iface missing after cage sample");
     };
-    if cage.media_available != Some(false) || cage.phy_type.is_some() {
+    if cage.media_available != Some(false)
+        || cage.phy_type.is_some()
+        || cage.phy_type_name.is_some()
+    {
         return TestResult::Fail("empty-cage sample did not land media state");
     }
     TestResult::Pass

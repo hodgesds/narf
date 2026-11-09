@@ -1595,6 +1595,7 @@ fn r8169_link_sample(status: u8) -> crate::publish::LinkSample {
         // copper, not caged modules (issue #791).
         media_available: None,
         phy_type: None,
+        phy_type_name: None,
     }
 }
 

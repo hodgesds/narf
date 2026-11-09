@@ -2967,6 +2967,7 @@ fn ixgbe_link_sample(links: u32) -> crate::publish::LinkSample {
         duplex: None,
         media_available: None,
         phy_type: None,
+        phy_type_name: None,
     }
 }
 
