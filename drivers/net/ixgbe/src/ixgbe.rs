@@ -620,6 +620,11 @@ pub struct Ixgbe {
     pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
     /// Programmed VMDq config, if `configure_vmdq` ran.
     pub vmdq_cfg: IrqSafeSpinLock<Option<vmdq::VmdqConfig>>,
+    /// Per-VF PF-side mailbox state, owned by the mailbox pump
+    /// ([`Ixgbe::vt_mailbox_pump_step`]). Fresh at bring-up; reset
+    /// by `configure_vmdq` so a VT re-enable starts from a clean
+    /// VF epoch instead of inheriting stale MACs / API versions.
+    pub vf_table: IrqSafeSpinLock<vmdq::VfTable>,
     /// FCoE RX queues programmed by `configure_fcoe`, if it ran
     /// (empty = not configured). The queue list is the FCRETA
     /// round-robin set; DDP contexts themselves are consumer
@@ -1011,6 +1016,7 @@ impl Ixgbe {
             dcb_cfg: IrqSafeSpinLock::new(None),
             vlan_filter: IrqSafeSpinLock::new(None),
             vmdq_cfg: IrqSafeSpinLock::new(None),
+            vf_table: IrqSafeSpinLock::new(vmdq::VfTable::new()),
             fcoe_queues: IrqSafeSpinLock::new(Vec::new()),
             fdir_state: IrqSafeSpinLock::new(fdir::FdirState::default()),
             wol_armed: IrqSafeSpinLock::new(None),
@@ -1813,11 +1819,12 @@ impl Ixgbe {
 
     /// Enable SR-IOV / VMDq (VT mode, 64 pools x 2 queues). Opt-in
     /// and orthogonal to bring-up: the PF keeps pool 0 (queues 0/1)
-    /// and VF `i` maps to pool `i+1`; the VF mailbox dispatcher in
-    /// `vmdq` is fixture-proven but awaits an interrupt pump, and
-    /// PCI SR-IOV config-space enablement is a separate follow-up.
-    /// Callers must have RX/TX quiesced while reprogramming the
-    /// queue layout.
+    /// and VF `i` maps to pool `i+1`; the VF mailbox pump
+    /// ([`Ixgbe::vt_mailbox_pump_step`]) starts serving VF messages
+    /// from the 10 ms watchdog tick once this runs, and PCI SR-IOV
+    /// config-space enablement is a separate follow-up. Callers
+    /// must have RX/TX quiesced while reprogramming the queue
+    /// layout.
     pub fn configure_vmdq(&self, cfg: vmdq::VmdqConfig) -> Result<(), IxgbeError> {
         {
             let mut bank = queues::MmioBank::new(&self.mmio);
@@ -1825,6 +1832,10 @@ impl Ixgbe {
                 .map_err(|_| IxgbeError::Other("bad VMDq config"))?;
         }
         *self.vmdq_cfg.lock() = Some(cfg);
+        // Fresh VT epoch: drop any VF state from a previous
+        // enablement (stale MACs / API versions must not leak
+        // into the new one).
+        *self.vf_table.lock() = vmdq::VfTable::new();
         // VT mode rewrote `MRQC` to VMDQEN: a previously recorded
         // RSS-only config no longer matches the hardware, so drop
         // the record (callers re-apply RSS via `configure_vmdq_rss`).
@@ -1847,6 +1858,27 @@ impl Ixgbe {
         }
         *self.rss_cfg.lock() = Some(rss);
         Ok(())
+    }
+
+    /// Run one PF↔VF mailbox-pump pass (Linux `ixgbe_msg_task` via
+    /// [`vmdq::mailbox_pump_step`]): consume MBVFICR / VFLRE,
+    /// dispatch each pending VF message through the `vmdq`
+    /// dispatcher, and write the reply back. Polled, not
+    /// interrupt-driven: this driver has no ISR yet (the datapath
+    /// is polled — see `ixgbe_rx_pump`), so the 10 ms watchdog
+    /// tick calls this; the `EICR_MAILBOX` misc-vector routing is
+    /// a follow-up (see `vmdq`). No-op when VT is not configured
+    /// (`configure_vmdq` never ran) or the device is quiesced.
+    pub fn vt_mailbox_pump_step(&self) -> vmdq::MailboxPumpOutcome {
+        if *self.quiesced.lock() {
+            return vmdq::MailboxPumpOutcome::default();
+        }
+        if self.vmdq_cfg.lock().is_none() {
+            return vmdq::MailboxPumpOutcome::default();
+        }
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        let mut table = self.vf_table.lock();
+        vmdq::mailbox_pump_step(&mut bank, &mut table, vmdq::MAX_VFS)
     }
 
     /// Program FCoE (Ethertype filters for FCoE/FIP, FCRETA
@@ -3185,12 +3217,16 @@ async fn ixgbe_tx_pump(device: Arc<Ixgbe>, q: usize, mut tx_cons: Consumer<Frame
 /// run one watchdog pass; a queue stalled 5 s with carrier up is
 /// recovered and counted. The pass itself gates on detach/suspend
 /// (quiesced) and on an in-flight recovery, so this loop is only a
-/// timer.
+/// timer. The same tick is the mailbox pump's firing path (issue
+/// #1261): a pending VF message is dispatched and answered within
+/// one tick — `vt_mailbox_pump_step` no-ops until `configure_vmdq`
+/// runs, so the tick costs nothing on a non-VT device.
 async fn ixgbe_watchdog_pump(device: Arc<Ixgbe>) {
     let tick = narf_time::ns_to_cycles(TX_WATCHDOG_POLL_NS);
     loop {
         narf_time::sleep_cycles(tick).await;
         device.check_tx_watchdog_at(narf_time::now_cycles());
+        device.vt_mailbox_pump_step();
     }
 }
 
