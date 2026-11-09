@@ -187,12 +187,14 @@ fn mci_send_gating() -> TestResult {
     if send_message(
         &mut io,
         &mut btcoex.mci,
-        Msg::Gpm,
-        0,
-        &payload,
-        16,
-        true,
-        true,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done: true,
+            check_bt: true,
+        },
     ) {
         return TestResult::Fail("send_message succeeded with MCI mode off");
     }
@@ -208,12 +210,14 @@ fn mci_send_gating() -> TestResult {
     if send_message(
         &mut io,
         &mut btcoex.mci,
-        Msg::Gpm,
-        0,
-        &payload,
-        16,
-        true,
-        true,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done: true,
+            check_bt: true,
+        },
     ) {
         return TestResult::Fail("send_message succeeded while BT sleeps");
     }
@@ -221,12 +225,14 @@ fn mci_send_gating() -> TestResult {
     if !send_message(
         &mut io,
         &mut btcoex.mci,
-        Msg::Gpm,
-        0,
-        &payload,
-        16,
-        true,
-        false,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done: true,
+            check_bt: false,
+        },
     ) {
         return TestResult::Fail("unchecked send failed while BT sleeps");
     }

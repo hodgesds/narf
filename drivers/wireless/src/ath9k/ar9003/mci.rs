@@ -453,9 +453,9 @@ pub(in crate::ath9k) enum GpmCoexOpcode {
     Noop = 8,
 }
 
-/// `ar9003_mci.h::enum ath_mci_gpm_coex_profile_type` is driver-layer
-/// (`mci.c::ath_mci_profile`); it is not transcribed here — the hw layer
-/// never parses profile fields. See §3.12.
+// `ar9003_mci.h::enum ath_mci_gpm_coex_profile_type` is driver-layer
+// (`mci.c::ath_mci_profile`); it is not transcribed here — the hw layer
+// never parses profile fields. See §3.12.
 
 /// `ar9003_mci.h::MCI_GPM_COEX_QUERY_BT_ALL_INFO`.
 const MCI_GPM_COEX_QUERY_BT_ALL_INFO: u8 = 1 << 0;
@@ -860,6 +860,18 @@ fn wait_for_interrupt(io: &mut impl RegisterIo, address: u64, bit: u32, mut time
     0
 }
 
+/// Arguments for [`send_message`]: the message to send (`header`, `flag`,
+/// `payload` of `len` bytes) plus how to send it (`wait_done` waits on
+/// `SW_MSG_DONE`; `check_bt` refuses the send while BT sleeps).
+pub(in crate::ath9k) struct SendMessageParams<'a> {
+    pub(in crate::ath9k) header: Msg,
+    pub(in crate::ath9k) flag: u32,
+    pub(in crate::ath9k) payload: &'a [u32],
+    pub(in crate::ath9k) len: u8,
+    pub(in crate::ath9k) wait_done: bool,
+    pub(in crate::ath9k) check_bt: bool,
+}
+
 /// `ar9003_mci.c::ar9003_mci_send_message`: send one MCI message.
 /// `payload` is the little-endian words for `AR_MCI_TX_PAYLOAD0..3`
 /// (`len` bytes; a short slice only writes the words it holds — callers
@@ -870,13 +882,16 @@ fn wait_for_interrupt(io: &mut impl RegisterIo, address: u64, bit: u32, mut time
 pub(in crate::ath9k) fn send_message(
     io: &mut impl RegisterIo,
     mci: &mut Mci,
-    header: Msg,
-    flag: u32,
-    payload: &[u32],
-    len: u8,
-    wait_done: bool,
-    check_bt: bool,
+    args: SendMessageParams<'_>,
 ) -> bool {
+    let SendMessageParams {
+        header,
+        flag,
+        payload,
+        len,
+        wait_done,
+        check_bt,
+    } = args;
     let saved_mci_int_en = io.read32(AR_MCI_INTERRUPT_EN);
     let regval = io.read32(AR_BTCOEX_CTRL);
     if regval == 0xdeadbeef || regval == u32::MAX || regval & AR_BTCOEX_CTRL_MCI_MODE_EN == 0 {
@@ -928,7 +943,18 @@ pub(in crate::ath9k) fn send_message(
 /// all-ones payload, then 5 µs.
 fn remote_reset(io: &mut impl RegisterIo, mci: &mut Mci, wait_done: bool) {
     let payload = [0xffff_ffffu32, 0xffff_ffff, 0xffff_ffff, 0xffff_ff00];
-    send_message(io, mci, Msg::RemoteReset, 0, &payload, 16, wait_done, false);
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::RemoteReset,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done,
+            check_bt: false,
+        },
+    );
     io.delay_us(5);
 }
 
@@ -936,7 +962,18 @@ fn remote_reset(io: &mut impl RegisterIo, mci: &mut Mci, wait_done: bool) {
 /// zero word.
 fn send_lna_transfer(io: &mut impl RegisterIo, mci: &mut Mci, wait_done: bool) {
     let payload = [0x0000_0000u32];
-    send_message(io, mci, Msg::LnaTrans, 0, &payload, 1, wait_done, false);
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::LnaTrans,
+            flag: 0,
+            payload: &payload,
+            len: 1,
+            wait_done,
+            check_bt: false,
+        },
+    );
 }
 
 /// `ar9003_mci.c::ar9003_mci_send_req_wake`: `MCI_REQ_WAKE` with the
@@ -945,12 +982,14 @@ fn send_req_wake(io: &mut impl RegisterIo, mci: &mut Mci, wait_done: bool) {
     send_message(
         io,
         mci,
-        Msg::ReqWake,
-        MCI_FLAG_DISABLE_TIMESTAMP,
-        &[],
-        0,
-        wait_done,
-        false,
+        SendMessageParams {
+            header: Msg::ReqWake,
+            flag: MCI_FLAG_DISABLE_TIMESTAMP,
+            payload: &[],
+            len: 0,
+            wait_done,
+            check_bt: false,
+        },
     );
     io.delay_us(5);
 }
@@ -961,12 +1000,14 @@ fn send_sys_waking(io: &mut impl RegisterIo, mci: &mut Mci, wait_done: bool) {
     send_message(
         io,
         mci,
-        Msg::SysWaking,
-        MCI_FLAG_DISABLE_TIMESTAMP,
-        &[],
-        0,
-        wait_done,
-        false,
+        SendMessageParams {
+            header: Msg::SysWaking,
+            flag: MCI_FLAG_DISABLE_TIMESTAMP,
+            payload: &[],
+            len: 0,
+            wait_done,
+            check_bt: false,
+        },
     );
 }
 
@@ -974,7 +1015,18 @@ fn send_sys_waking(io: &mut impl RegisterIo, mci: &mut Mci, wait_done: bool) {
 /// `0x70000000` word.
 fn send_lna_take(io: &mut impl RegisterIo, mci: &mut Mci, wait_done: bool) {
     let payload = [0x7000_0000u32];
-    send_message(io, mci, Msg::LnaTake, 0, &payload, 1, wait_done, false);
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::LnaTake,
+            flag: 0,
+            payload: &payload,
+            len: 1,
+            wait_done,
+            check_bt: false,
+        },
+    );
 }
 
 /// `ar9003_mci.c::ar9003_mci_send_sys_sleeping`: `MCI_SYS_SLEEPING`
@@ -983,12 +1035,14 @@ fn send_sys_sleeping(io: &mut impl RegisterIo, mci: &mut Mci, wait_done: bool) {
     send_message(
         io,
         mci,
-        Msg::SysSleeping,
-        MCI_FLAG_DISABLE_TIMESTAMP,
-        &[],
-        0,
-        wait_done,
-        false,
+        SendMessageParams {
+            header: Msg::SysSleeping,
+            flag: MCI_FLAG_DISABLE_TIMESTAMP,
+            payload: &[],
+            len: 0,
+            wait_done,
+            check_bt: false,
+        },
     );
 }
 
@@ -1004,7 +1058,18 @@ fn send_coex_version_query(io: &mut impl RegisterIo, mci: &mut Mci, wait_done: b
         GpmSubtype::CoexAgent as u8,
         GpmCoexOpcode::VersionQuery as u8,
     );
-    send_message(io, mci, Msg::Gpm, 0, &payload, 16, wait_done, true);
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done,
+            check_bt: true,
+        },
+    );
 }
 
 /// `ar9003_mci.c::ar9003_mci_send_coex_version_response`: answer a BT
@@ -1027,7 +1092,18 @@ fn send_coex_version_response(io: &mut impl RegisterIo, mci: &mut Mci, wait_done
         MCI_GPM_COEX_B_MINOR_VERSION,
         mci.wlan_ver_minor,
     );
-    send_message(io, mci, Msg::Gpm, 0, &payload, 16, wait_done, true);
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done,
+            check_bt: true,
+        },
+    );
 }
 
 /// `ar9003_mci.c::ar9003_mci_send_coex_wlan_channels`: send the current
@@ -1045,7 +1121,18 @@ fn send_coex_wlan_channels(io: &mut impl RegisterIo, mci: &mut Mci, wait_done: b
         GpmCoexOpcode::WlanChannels as u8,
     );
     let payload = mci.wlan_channels;
-    send_message(io, mci, Msg::Gpm, 0, &payload, 16, wait_done, true);
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done,
+            check_bt: true,
+        },
+    );
     gpm_set_type_opcode(&mut mci.wlan_channels, 0xff, 0xff);
 }
 
@@ -1070,7 +1157,19 @@ fn send_coex_bt_status_query(
         GpmCoexOpcode::StatusQuery as u8,
     );
     put_byte(&mut payload, MCI_GPM_COEX_B_BT_BITMAP, query_type);
-    if !send_message(io, mci, Msg::Gpm, 0, &payload, 16, wait_done, true) && query_btinfo {
+    if !send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done,
+            check_bt: true,
+        },
+    ) && query_btinfo
+    {
         mci.need_flush_btinfo = true;
     }
     if query_btinfo {
@@ -1105,7 +1204,18 @@ fn send_coex_halt_bt_gpm(io: &mut impl RegisterIo, mci: &mut Mci, halt: bool, wa
             HaltBtGpm::Unhalt as u8,
         );
     }
-    send_message(io, mci, Msg::Gpm, 0, &payload, 16, wait_done, true);
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done,
+            check_bt: true,
+        },
+    );
 }
 
 /// `ar9003_mci.c::ar9003_mci_send_coex_bt_flags`: a `BT_UPDATE_FLAGS`
@@ -1132,7 +1242,18 @@ fn send_coex_bt_flags(
             ((bt_flags >> (i * 8)) & 0xff) as u8,
         );
     }
-    send_message(io, mci, Msg::Gpm, 0, &payload, 16, wait_done, true)
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done,
+            check_bt: true,
+        },
+    )
 }
 
 /// `ar9003_mci.c::ar9003_mci_queue_unsent_gpm`: when a GPM could not be
@@ -1485,7 +1606,18 @@ fn wait_for_gpm(
             let mut payload = [0u32; 4];
             gpm_set_cal_type(&mut payload, GpmSubtype::WlanCalGrant as u8);
             gpm_type_want = GpmSubtype::BtCalDone as u8;
-            send_message(io, mci, Msg::Gpm, 0, &payload, 16, false, false);
+            send_message(
+                io,
+                mci,
+                SendMessageParams {
+                    header: Msg::Gpm,
+                    flag: 0,
+                    payload: &payload,
+                    len: 16,
+                    wait_done: false,
+                    check_bt: false,
+                },
+            );
             continue;
         }
         let slot: [u8; 16] = mci.gpm_buf[off..off + 16]
@@ -1987,7 +2119,18 @@ pub(in crate::ath9k) fn init_cal_req(
     gpm_set_cal_type(&mut payload, GpmSubtype::WlanCalReq as u8);
     payload[MCI_GPM_WLAN_CAL_W_SEQUENCE] = mci.wlan_cal_seq;
     mci.wlan_cal_seq = mci.wlan_cal_seq.wrapping_add(1);
-    send_message(io, mci, Msg::Gpm, 0, &payload, 16, true, false);
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done: true,
+            check_bt: false,
+        },
+    );
     if wait_for_gpm(io, mci, GpmSubtype::BtCalGrant as u8, 0, 50000) == 0 {
         *is_reusable = false;
     }
@@ -2002,7 +2145,18 @@ pub(in crate::ath9k) fn init_cal_done(io: &mut impl RegisterIo, mci: &mut Mci) {
     gpm_set_cal_type(&mut payload, GpmSubtype::WlanCalDone as u8);
     payload[MCI_GPM_WLAN_CAL_W_SEQUENCE] = mci.wlan_cal_done;
     mci.wlan_cal_done = mci.wlan_cal_done.wrapping_add(1);
-    send_message(io, mci, Msg::Gpm, 0, &payload, 16, true, false);
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done: true,
+            check_bt: false,
+        },
+    );
 }
 
 /// `ar9003_mci_setup`: fill the DMA GPM buffer with the reserved
@@ -2340,7 +2494,18 @@ fn cal_msg(io: &mut impl RegisterIo, mci: &mut Mci, subtype: u8, outcome: &mut I
     } else if subtype == GpmSubtype::BtCalGrant as u8 {
         let mut payload = [0u32; 4];
         gpm_set_cal_type(&mut payload, GpmSubtype::WlanCalDone as u8);
-        send_message(io, mci, Msg::Gpm, 0, &payload, 16, false, true);
+        send_message(
+            io,
+            mci,
+            SendMessageParams {
+                header: Msg::Gpm,
+                flag: 0,
+                payload: &payload,
+                len: 16,
+                wait_done: false,
+                check_bt: true,
+            },
+        );
     }
 }
 
@@ -2367,7 +2532,18 @@ pub(in crate::ath9k) fn start_reset(io: &mut impl RegisterIo, mci: &mut Mci, is_
     disable_interrupt(io);
     let mut payload = [0u32; 4];
     gpm_set_cal_type(&mut payload, GpmSubtype::WlanCalGrant as u8);
-    send_message(io, mci, Msg::Gpm, 0, &payload, 16, true, false);
+    send_message(
+        io,
+        mci,
+        SendMessageParams {
+            header: Msg::Gpm,
+            flag: 0,
+            payload: &payload,
+            len: 16,
+            wait_done: true,
+            check_bt: false,
+        },
+    );
     // Wait for BT calibration to complete (25 ms).
     wait_for_gpm(io, mci, GpmSubtype::BtCalDone as u8, 0, 25000);
     mci.bt_state = BtState::Awake;
@@ -2456,8 +2632,30 @@ pub(in crate::ath9k) fn handle_interrupt(
     }
     if mci_int_rxmsg & AR_MCI_INTERRUPT_RX_MSG_REQ_WAKE != 0 {
         let payload = [0xffff_ffffu32, 0xffff_ffff, 0xffff_ffff, 0xffff_ff00];
-        send_message(io, mci, Msg::RemoteReset, 0, &payload, 16, true, false);
-        send_message(io, mci, Msg::SysWaking, 0, &[], 0, true, false);
+        send_message(
+            io,
+            mci,
+            SendMessageParams {
+                header: Msg::RemoteReset,
+                flag: 0,
+                payload: &payload,
+                len: 16,
+                wait_done: true,
+                check_bt: false,
+            },
+        );
+        send_message(
+            io,
+            mci,
+            SendMessageParams {
+                header: Msg::SysWaking,
+                flag: 0,
+                payload: &[],
+                len: 0,
+                wait_done: true,
+                check_bt: false,
+            },
+        );
         mci_int_rxmsg &= !AR_MCI_INTERRUPT_RX_MSG_REQ_WAKE;
         state(io, mci, MciState::ResetReqWake)?;
         state(io, mci, MciState::SetBtAwake)?;

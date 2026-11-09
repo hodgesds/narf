@@ -256,10 +256,12 @@ pub(in crate::ath9k) fn cause(
     if isr == 0 && sync == 0 && async_cause == 0 {
         return Ok(None);
     }
-    let mut events = Events::default();
     // `ar9003_mac.c`: the async mask gains MCI when enabled, and
     // `ar9003_mci_get_isr` runs whenever the async cause has the bit.
-    events.mci = mci_enabled && async_cause & ASYNC_CAUSE_MCI != 0;
+    let mut events = Events {
+        mci: mci_enabled && async_cause & ASYNC_CAUSE_MCI != 0,
+        ..Default::default()
+    };
     if isr != 0 {
         if isr & ISR_BCNMISC != 0 {
             // RAC clears the secondary causes; no write-back here.
