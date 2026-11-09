@@ -96,6 +96,8 @@ KVM, two vCPUs pinned to host CPUs 8/9, a worker pinned to guest CPU 0, and
 serialized invariant-TSC cycles (lower is better). Verification is outside the
 timed intervals. Both kernels use `noatime`; ASLR must be disabled in the
 benchmark and QEMU processes. No host-wide ASLR change is required.
+The collector/thermal monitor uses host CPU 10; QEMU emulator/I/O threads
+use CPU 11, separate from the guest vCPUs and collector.
 
 The host-specific `controlled_host.py` requires review before use elsewhere:
 it reserves the entire CPUs 8–15 LLC in an isolated cgroup partition, disables

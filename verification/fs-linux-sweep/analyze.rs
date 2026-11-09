@@ -41,6 +41,7 @@ fn main() {
             .or_default()
             .push(value);
     }
+    assert!(!groups.is_empty(), "no measurement groups supplied");
     let mut rows = Vec::new();
     let mut welch_ps = Vec::new();
     let mut mwu_ps = Vec::new();

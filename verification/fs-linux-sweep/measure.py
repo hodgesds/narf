@@ -129,6 +129,16 @@ def guest(command, env, log, qmp_path, controls, argv_record):
                 if os.sched_getaffinity(cpu["thread-id"]) != {target}: raise RuntimeError("vCPU pin failed")
                 placement.append(dict(guest_cpu=cpu["cpu-index"], host_cpu=target, thread_id=cpu["thread-id"]))
             tgid = next(line.split()[1] for line in Path(f"/proc/{cpus[0]['thread-id']}/status").read_text().splitlines() if line.startswith("Tgid:"))
+            vcpu_threads = {cpu["thread-id"] for cpu in cpus}
+            emulator_threads = []
+            for task in Path(f"/proc/{tgid}/task").iterdir():
+                tid = int(task.name)
+                if tid not in vcpu_threads:
+                    try:
+                        os.sched_setaffinity(tid, {11})
+                        emulator_threads.append(tid)
+                    except ProcessLookupError:
+                        pass
             actual = Path(f"/proc/{tgid}/cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
             if int(Path(f"/proc/{tgid}/personality").read_text(), 16) & 0x40000 == 0:
                 raise RuntimeError("PreconditionFailed: QEMU ASLR still enabled")
@@ -145,7 +155,8 @@ def guest(command, env, log, qmp_path, controls, argv_record):
                     raise RuntimeError("guest workload failed: " + str(log))
                 if time.monotonic() > until: raise RuntimeError("guest timeout: " + str(log))
                 time.sleep(0.05)
-            return proc.returncode, dict(placement=placement, qemu_argv=actual, thermal_before=before, thermal_history=history)
+            return proc.returncode, dict(placement=placement, emulator_threads_cpu11=emulator_threads,
+                                         qemu_argv=actual, thermal_before=before, thermal_history=history)
         finally:
             if qmp: qmp.close()
             if proc.poll() is None:
@@ -241,7 +252,7 @@ def main():
     if controls:
         print("Verifying 30-second thermal and idle-LLC window", flush=True)
         report["initial_window"] = host.initial_window(controls)
-    os.sched_setaffinity(0, {11})
+    os.sched_setaffinity(0, {10})
     template = None
     rng = random.Random(1729)
     total = 1 if args.pilot else args.samples

@@ -149,7 +149,8 @@ def main():
     args = p.parse_args()
     if args.restore_existing:
         state = json.loads((args.workdir / "host-controls.json").read_text())
-        remove_partition(Path(state["cgroup"]))
+        if state.get("cgroup_created", False):
+            remove_partition(Path(state["cgroup"]))
         for name, original in [("cpufreq/boost", state["boost_original"]), ("smt/control", state["smt_original"])]:
             (CPU_ROOT / name).write_text(original + "\n")
         for directory, original in state["policies_original"].items(): restore_policy(directory, original)
@@ -161,6 +162,7 @@ def main():
     args.workdir.mkdir(parents=True, exist_ok=False)
     group = Path(state["cgroup"])
     group_created = False
+    state["cgroup_created"] = False
     child = None
     errors = []
     state["originals"] = {}
@@ -192,6 +194,8 @@ def main():
             write(base / "scaling_max_freq", state["frequency_khz"])
         group.mkdir()
         group_created = True
+        state["cgroup_created"] = True
+        state_path.write_text(json.dumps(state, indent=2) + "\n")
         (group / "cpuset.mems").write_text(read("/sys/fs/cgroup/cpuset.mems.effective") + "\n")
         (group / "cpuset.cpus").write_text("8-15\n")
         (group / "cpuset.cpus.exclusive").write_text("8-15\n")
@@ -200,7 +204,7 @@ def main():
         state_path.write_text(json.dumps(state, indent=2) + "\n")
         def enter():
             (group / "cgroup.procs").write_text(str(os.getpid()) + "\n")
-            os.sched_setaffinity(0, {11})
+            os.sched_setaffinity(0, {10})
         command = ["setarch", "x86_64", "-R", sys.executable, str(Path(__file__).with_name("measure.py")),
                    "--workdir", str(args.workdir), "--prepared-directory", "--samples", str(args.samples),
                    "--narf-kernel", str(args.narf_kernel.resolve()), "--linux-kernel", str(args.linux_kernel.resolve())]
