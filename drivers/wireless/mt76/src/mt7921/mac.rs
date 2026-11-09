@@ -46,28 +46,79 @@ pub enum PowerError {
     /// BAR reads returned the all-FF sentinel mid-handshake. Link
     /// dropped while we were polling.
     DeviceGone,
+    /// WFSYS reset did not latch the requested state.
+    ResetRejected,
+    /// WFSYS did not report initialization complete after reset release.
+    ResetTimeout,
 }
 
-const READ_GONE_U32: u32 = 0xFFFF_FFFF;
-
-/// Read MT_CONN_ON_LPCTL through its fixed CONN_HOST_CSR window.
-///
-/// # Safety
-/// Caller owns BAR0 exclusively.
-#[inline]
-unsafe fn read_lpctl(mmio: &MmioRegion) -> Result<u32, PowerError> {
-    // SAFETY: BAR0 mapped + owned per `# Safety`.
-    unsafe { registers::read32(mmio, MT_CONN_ON_LPCTL) }.map_err(|_| PowerError::InvalidWindow)
+struct ProbePower<'a>(&'a MmioRegion);
+impl super::mac_power::Io for ProbePower<'_> {
+    fn stage(&mut self, stage: super::mac_power::Stage) {
+        let _ = writeln!(narf_console::Writer, "  mt7921: probe power {stage:?}");
+    }
+    fn read(&mut self, address: u32) -> Result<u32, PowerError> {
+        // SAFETY: the enclosing probe owns the mapped BAR and L1 selector.
+        unsafe { registers::read32(self.0, address) }.map_err(|_| PowerError::InvalidWindow)
+    }
+    fn write(&mut self, address: u32, value: u32) -> Result<(), PowerError> {
+        // SAFETY: same current probe invocation and checked register window.
+        unsafe { registers::write32(self.0, address, value) }.map_err(|_| PowerError::InvalidWindow)
+    }
+    fn delay(&mut self, ms: u64) {
+        narf_scheduler::responsive_spin_until(|| false, Deadline::after_ms(ms));
+    }
+    fn poll(
+        &mut self,
+        address: u32,
+        mask: u32,
+        expected: u32,
+        ms: u64,
+    ) -> Result<bool, PowerError> {
+        let mut error = None;
+        let ready = narf_scheduler::responsive_spin_until(
+            || match self.read(address) {
+                Ok(u32::MAX) => {
+                    error = Some(PowerError::DeviceGone);
+                    true
+                }
+                Ok(value) if value & mask == expected => true,
+                Ok(_) => {
+                    self.delay(1);
+                    false
+                }
+                Err(failed) => {
+                    error = Some(failed);
+                    true
+                }
+            },
+            Deadline::after_ms(ms),
+        );
+        error.map_or(Ok(ready), Err)
+    }
 }
 
-/// Write MT_CONN_ON_LPCTL through its fixed CONN_HOST_CSR window.
+/// Normalize ownership and reset WFSYS before the first firmware transport.
 ///
 /// # Safety
-/// As `read_lpctl`.
-#[inline]
-unsafe fn write_lpctl(mmio: &MmioRegion, v: u32) -> Result<(), PowerError> {
-    // SAFETY: BAR0 mapped + owned per `# Safety`.
-    unsafe { registers::write32(mmio, MT_CONN_ON_LPCTL, v) }.map_err(|_| PowerError::InvalidWindow)
+/// The caller owns BAR0 and its selector under the current PCI invocation,
+/// has verified PCI bus mastering is disabled, and has no live DMA owner.
+pub(super) unsafe fn initialize_probe(mmio: &MmioRegion) -> Result<(), PowerError> {
+    let result = super::mac_power::initialize(&mut ProbePower(mmio));
+    if let Err(error) = result {
+        if !matches!(error, PowerError::DeviceGone | PowerError::InvalidWindow) {
+            // SAFETY: the failed probe still holds the current PCI invocation;
+            // mastering remains parked and the checked selector is exclusive.
+            let own = unsafe { registers::read32(mmio, MT_CONN_ON_LPCTL) };
+            // Only the always-accessible HIF ownership register is safe here.
+            // A timeout is not permission to access unowned WFSYS registers.
+            let _ = writeln!(
+                narf_console::Writer,
+                "  mt7921: probe power failed {error:?}: lpctl={own:x?}"
+            );
+        }
+    }
+    result
 }
 
 /// Take driver ownership of the PCIe link. Idempotent — if firmware
@@ -77,141 +128,15 @@ unsafe fn write_lpctl(mmio: &MmioRegion, v: u32) -> Result<(), PowerError> {
 /// # Safety
 /// `mmio` is the live BAR0 region; caller owns the device.
 pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
-    let mut last: u32 = 0;
-    for _ in 0..DRV_OWN_RETRY_COUNT {
-        // Tell the link to give ownership to the driver.
-        // SAFETY: BAR0 mapped + owned.
-        unsafe { write_lpctl(mmio, PCIE_LPCR_HOST_CLR_OWN)? };
-
-        // Flushes posted PCIe write; check if already clear (fast path matching
-        // Linux mt76_rr right after mt76_wr).
-        // SAFETY: BAR0 mapped + owned.
-        last = unsafe { read_lpctl(mmio) }?;
-        if last == READ_GONE_U32 {
-            return Err(PowerError::DeviceGone);
-        }
-        if (last & PCIE_LPCR_HOST_OWN_SYNC) == 0 {
-            return Ok(());
-        }
-
-        // Linux always pauses 2..3 ms after the CLR write when ASPM
-        // is in the picture. We don't track ASPM yet; the conservative
-        // path is to always pause briefly — it matches `usleep_range`
-        // shape and never wedges the handshake.
-        let settle = Deadline::after_ms(3);
-        narf_scheduler::responsive_spin_until(|| false, settle);
-
-        // Poll OWN_SYNC for clear. 100 ms wall-clock budget per attempt,
-        // matching Linux's `read_poll_timeout` with 1 ms slots.
-        let deadline = Deadline::after_ms(DRV_OWN_POLL_MS);
-        let mut access_error = None;
-        let cleared = narf_scheduler::responsive_spin_until(
-            || {
-                // SAFETY: BAR0 mapped + owned.
-                last = match unsafe { read_lpctl(mmio) } {
-                    Ok(value) => value,
-                    Err(error) => {
-                        access_error = Some(error);
-                        return true;
-                    }
-                };
-                if last == READ_GONE_U32 {
-                    // Surface device-gone as a hard early-out.
-                    return true;
-                }
-                if (last & PCIE_LPCR_HOST_OWN_SYNC) == 0 {
-                    return true;
-                }
-                // Pause 1 ms between register reads (Linux:
-                // read_poll_timeout with 1000 us sleep), preventing MMIO
-                // read flooding from saturating the PCIe link while ConnAC boots.
-                let step = Deadline::after_ms(1);
-                while !step.expired() {
-                    narf_scheduler::sleep_pumps::run();
-                    core::hint::spin_loop();
-                }
-                false
-            },
-            deadline,
-        );
-
-        if let Some(error) = access_error {
-            return Err(error);
-        }
-        if last == READ_GONE_U32 {
-            return Err(PowerError::DeviceGone);
-        }
-        if cleared {
-            return Ok(());
-        }
-    }
-    let _ = writeln!(
-        narf_console::Writer,
-        "  mt7921: take_driver_own timeout (last lpctl={last:#x})"
-    );
-    Err(PowerError::Timeout)
+    super::mac_power::take_driver(&mut ProbePower(mmio))
 }
 
-/// Hand ownership back to firmware (entering radio-off / suspend).
+/// Give HIF ownership to firmware through the checked CONN_HOST_CSR window.
 ///
 /// # Safety
-/// As `take_driver_own`.
+/// `mmio` is the live BAR0 region; caller owns the device and selector.
 pub unsafe fn give_firmware_own(mmio: &MmioRegion) -> Result<(), PowerError> {
-    for _ in 0..DRV_OWN_RETRY_COUNT {
-        // SAFETY: BAR0 mapped + owned.
-        unsafe { write_lpctl(mmio, PCIE_LPCR_HOST_SET_OWN)? };
-
-        // SAFETY: BAR0 mapped + owned.
-        let mut last = unsafe { read_lpctl(mmio) }?;
-        if last == READ_GONE_U32 {
-            return Err(PowerError::DeviceGone);
-        }
-        if (last & PCIE_LPCR_HOST_OWN_SYNC) != 0 {
-            return Ok(());
-        }
-
-        // Poll OWN_SYNC for the SET-direction completion (Linux:
-        // `mt76_poll_msec_tick(MT_CONN_ON_LPCTL, OWN_SYNC, 4, 50, 1)`
-        // — value 4 = BIT(2) set).
-        let deadline = Deadline::after_ms(DRV_OWN_POLL_MS);
-        let mut access_error = None;
-        let set = narf_scheduler::responsive_spin_until(
-            || {
-                // SAFETY: BAR0 mapped + owned.
-                last = match unsafe { read_lpctl(mmio) } {
-                    Ok(value) => value,
-                    Err(error) => {
-                        access_error = Some(error);
-                        return true;
-                    }
-                };
-                if last == READ_GONE_U32 {
-                    return true;
-                }
-                if (last & PCIE_LPCR_HOST_OWN_SYNC) != 0 {
-                    return true;
-                }
-                let step = Deadline::after_ms(1);
-                while !step.expired() {
-                    narf_scheduler::sleep_pumps::run();
-                    core::hint::spin_loop();
-                }
-                false
-            },
-            deadline,
-        );
-
-        if let Some(error) = access_error {
-            return Err(error);
-        }
-        if last == READ_GONE_U32 {
-            return Err(PowerError::DeviceGone);
-        }
-        if set {
-            return Ok(());
-        }
-    }
-    Err(PowerError::Timeout)
+    super::mac_power::give_firmware(&mut ProbePower(mmio))
 }
 
 /// Disable PCIe L0s entry while the driver owns the link. Mirrors

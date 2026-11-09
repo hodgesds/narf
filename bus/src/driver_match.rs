@@ -753,6 +753,10 @@ static DEVICE_CTXS: IrqSafeSpinLock<Vec<DeviceCtx>> = IrqSafeSpinLock::new(Vec::
 #[path = "module_wireless_tests.rs"]
 mod module_wireless_tests;
 
+#[cfg(feature = "kernel-test")]
+#[path = "module_probe_tests.rs"]
+mod module_probe_tests;
+
 fn install_device_ctx(owner: u64, token: u64, device: BusDevice, cap: Cap<BusDeviceCap, Write>) {
     // A reprobe replaces the old ownership record only after disabling the
     // command bits it enabled.
@@ -891,16 +895,77 @@ pub(crate) fn module_device_publish<T>(
     ctx.cap.invoke(DeviceOp(publish)).map_err(|_| -19)
 }
 
-/// Enable PCI command bits (e.g. MEM_SPACE | BUS_MASTER) on a module-owned
-/// device. Reached from the `narf_pci_enable` kernel-ABI export. Returns 0, or
-/// a negative errno. The op is cap-gated through the context's device cap.
+/// Normalize a fresh module context before its initial BAR/DMA setup.
+pub fn module_pci_prepare_probe(owner: u64, token: u64) -> i32 {
+    let (device, cap) = {
+        let contexts = DEVICE_CTXS.lock();
+        let Some(ctx) = contexts
+            .iter()
+            .find(|c| c.owner == owner && c.token == token)
+        else {
+            return -19;
+        };
+        // Initial probe only. A live module owner must use its own stop /
+        // recovery sequence, not park an active context through this entry.
+        if !ctx.bars.is_empty()
+            || !ctx.dmabufs.is_empty()
+            || ctx.msix.is_some()
+            || ctx.poller.is_some()
+            || ctx.net_iface.is_some()
+        {
+            return -16;
+        }
+        (ctx.device, ctx.cap)
+    };
+    // D0 transition waits must not retain DEVICE_CTXS's IRQ spinlock.
+    match cap.invoke(DeviceOp(|| {
+        crate::pci::prepare_memory_probe(&cap, &device)?;
+        // This opt-in preparation is for the kernel's cached coherent DMA
+        // allocations. Preserve other PCIe controls and RW1C Device Status.
+        // SAFETY: the exact current function invocation encloses this walk.
+        let express = match unsafe { crate::pci_cap::find_cap(&device, 0x10) } {
+            Ok(capability) => capability,
+            Err(crate::pci_cap::CapError::NoCapList) => None,
+            Err(_) => return Err(crate::pci::PciError::NotReady),
+        };
+        if let Some(express) = express {
+            if !(0x40..=0xf4).contains(&express) || express % 4 != 0 {
+                return Err(crate::pci::PciError::NotReady);
+            }
+            let offset = (express + 8) as u16;
+            let before = crate::pci::read_config32(&cap, &device, offset)?;
+            if before == u32::MAX {
+                return Err(crate::pci::PciError::NotReady);
+            }
+            let wanted = before as u16 & !0x0800;
+            if wanted != before as u16 {
+                crate::pci::write_config32(&cap, &device, offset, u32::from(wanted))?;
+            }
+            let after = crate::pci::read_config32(&cap, &device, offset)?;
+            if after == u32::MAX || after as u16 != wanted {
+                return Err(crate::pci::PciError::NotReady);
+            }
+        }
+        Ok::<_, crate::pci::PciError>(())
+    })) {
+        Ok(Ok(())) => 0,
+        _ => -5,
+    }
+}
+
+/// Enable PCI command bits through the module's current device authority.
 pub fn module_pci_enable(owner: u64, token: u64, bits: u16) -> i32 {
     let mut g = DEVICE_CTXS.lock();
     let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
         return -19; // -ENODEV
     };
     match ctx.cap.invoke(DeviceOp(|| {
-        crate::pci::set_command(&ctx.cap, &ctx.device, bits)
+        crate::pci::set_command(&ctx.cap, &ctx.device, bits)?;
+        let command = crate::pci::read_command(&ctx.cap, &ctx.device)?;
+        if command == u16::MAX || command & bits != bits {
+            return Err(crate::pci::PciError::NotReady);
+        }
+        Ok(())
     })) {
         Ok(Ok(_)) => {
             ctx.enabled_bits |= bits;

@@ -48,6 +48,8 @@ pub mod fwdl;
 pub(crate) mod he;
 pub(crate) mod ht20;
 pub mod mac;
+mod mac_power;
+mod mac_power_tests;
 pub mod mcu;
 mod p2p_cnm;
 mod p2p_wire;

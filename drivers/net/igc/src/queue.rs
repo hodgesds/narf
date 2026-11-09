@@ -115,6 +115,23 @@ pub(crate) struct Queue {
     rx: IrqSafeSpinLock<Rx>,
 }
 
+/// Read-only evidence for a failed completion path, collected before reset.
+/// Each descriptor word is sampled independently while DMA may still run;
+/// this snapshot is never proof that the device released a buffer.
+#[derive(Debug)]
+pub(crate) struct CompletionSnapshot {
+    pub tx_dma: u64,
+    pub tx_cpu: usize,
+    pub tx_next: usize,
+    pub tx_clean: usize,
+    pub tx_end: Option<usize>,
+    pub tx_words: [u32; 4],
+    pub rx_dma: u64,
+    pub rx_cpu: usize,
+    pub rx_head: usize,
+    pub rx_words: [u32; 4],
+}
+
 fn allocate(bytes: usize) -> Result<DmaBuffer, IgcError> {
     alloc_coherent(bytes, DomainId::DRIVER_0).map_err(|_| IgcError::Other("DMA allocation failed"))
 }
@@ -189,6 +206,41 @@ impl Queue {
             r.csum_err,
             r.alloc_failed,
         ]
+    }
+
+    pub(crate) fn completion_snapshot(&self) -> CompletionSnapshot {
+        let (tx_next, tx_clean, tx_end, tx_words) = {
+            let tx = self.tx.lock();
+            let end = tx.pending.front().map(|packet| packet.end);
+            let slot = end.unwrap_or(tx.clean);
+            // SAFETY: the TX lock pins this in-bounds descriptor slot. Read
+            // individual words as in done(); do not reclaim or modify DMA.
+            let words = core::array::from_fn(|i| unsafe {
+                ptr::read_volatile(self.tx_ring.cpu_ptr_at::<u32>((slot * 16 + i * 4) as u64))
+            });
+            (tx.next, tx.clean, end, words)
+        };
+        let rx = self.rx.lock();
+        // SAFETY: the RX lock pins the in-bounds next-to-clean slot. This
+        // observes words without claiming DD, reading payload or rearming it.
+        let rx_words = core::array::from_fn(|i| unsafe {
+            ptr::read_volatile(
+                self.rx_ring
+                    .cpu_ptr_at::<u32>((rx.head * 16 + i * 4) as u64),
+            )
+        });
+        CompletionSnapshot {
+            tx_dma: self.tx_ring.dma_addr().raw(),
+            tx_cpu: self.tx_ring.cpu_ptr::<u8>() as usize,
+            tx_next,
+            tx_clean,
+            tx_end,
+            tx_words,
+            rx_dma: self.rx_ring.dma_addr().raw(),
+            rx_cpu: self.rx_ring.cpu_ptr::<u8>() as usize,
+            rx_head: rx.head,
+            rx_words,
+        }
     }
 
     /// # Safety

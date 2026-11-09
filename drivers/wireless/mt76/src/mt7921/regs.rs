@@ -181,9 +181,9 @@ pub const MT_MCU_CMD_WAKE_RX_PCIE: u32 = 1 << 0;
 // doesn't wedge if the chip is absent.
 
 /// Number of CLR_OWN write retries (Linux: `MT792x_DRV_OWN_RETRY_COUNT`).
-pub const DRV_OWN_RETRY_COUNT: usize = 30;
+pub const DRV_OWN_RETRY_COUNT: usize = 10;
 /// Per-retry wall-clock budget for the OWN_SYNC poll, in ms.
-pub const DRV_OWN_POLL_MS: u64 = 100;
+pub const DRV_OWN_POLL_MS: u64 = 50;
 
 // ── Firmware filenames ─────────────────────────────────────────────
 //

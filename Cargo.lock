@@ -3011,6 +3011,7 @@ dependencies = [
  "narf-acpi",
  "narf-boot",
  "narf-capabilities",
+ "narf-console",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",

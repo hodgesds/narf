@@ -15,7 +15,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use narf_capabilities::{Cap, Write};
+use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_memory::PhysAddr;
 
 use crate::device::{BusDevice, BusKind};
@@ -57,6 +57,8 @@ pub enum PciError {
     CapNotPresent,
     /// Config-space offset was misaligned or outside the 4 KiB window.
     BadOffset,
+    /// A function disappeared or did not latch the required parked/D0 state.
+    NotReady,
 }
 
 impl From<narf_capabilities::CapError> for PciError {
@@ -334,6 +336,78 @@ pub fn set_power_state(
         );
     }
     Ok(())
+}
+
+/// Park inherited mastering and memory decoding, enter D0, and restore BARs
+/// lost on D3hot exit before a driver sizes/maps them. Leaves INTx disabled
+/// and MEM_SPACE/BUS_MASTER clear; the driver enables memory only after its
+/// control mapping exists, and mastering only after owning its DMA rings.
+///
+/// Use for initial probe or after the caller has stopped its live owner.
+/// Parking alone is not proof that outstanding DMA completed.
+pub fn prepare_memory_probe(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Result<Option<PciPowerState>, PciError> {
+    struct Prepare<'a>(&'a BusDevice);
+    impl CapOp<BusDeviceCap, Write> for Prepare<'_> {
+        type Output = Result<Option<PciPowerState>, PciError>;
+        fn execute(self, cap: &Cap<BusDeviceCap, Write>) -> Result<Self::Output, CapError> {
+            Ok(prepare_memory_probe_current(cap, self.0))
+        }
+    }
+    cap.invoke(Prepare(device)).map_err(PciError::from)?
+}
+
+fn prepare_memory_probe_current(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Result<Option<PciPowerState>, PciError> {
+    let park = || {
+        if read_command(cap, device)? == u16::MAX {
+            return Err(PciError::NotReady);
+        }
+        clear_command(cap, device, cmd::BUS_MASTER | cmd::MEM_SPACE)?;
+        set_command(cap, device, cmd::INTX_DISABLE)?;
+        if read_command(cap, device)? & (cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE)
+            != cmd::INTX_DISABLE
+        {
+            return Err(PciError::NotReady);
+        }
+        Ok(())
+    };
+    park()?;
+    let previous = match power_state(cap, device) {
+        Ok(Some(state)) => state,
+        Err(PciError::CapNotPresent) => return Ok(None),
+        Ok(None) => return Err(PciError::NotReady),
+        Err(error) => return Err(error),
+    };
+    if previous != PciPowerState::D0 {
+        const OFFSETS: [u16; 7] = [0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x30];
+        let mut bars = [0u32; 7];
+        for (i, offset) in OFFSETS.iter().enumerate() {
+            bars[i] = read_config32(cap, device, *offset)?;
+        }
+        set_power_state(cap, device, PciPowerState::D0)?;
+        narf_scheduler::responsive_spin_until(
+            || false,
+            narf_time::Deadline::after_ms(PM_D3HOT_DELAY_MS),
+        );
+        if power_state(cap, device)? != Some(PciPowerState::D0) {
+            return Err(PciError::NotReady);
+        }
+        // A soft reset on D3hot exit can also clear Command. Re-park before
+        // restoring any address decoder; never restore inherited BME.
+        park()?;
+        for (offset, value) in OFFSETS.into_iter().zip(bars) {
+            write_config32(cap, device, offset, value)?;
+            if read_config32(cap, device, offset)? != value {
+                return Err(PciError::NotReady);
+            }
+        }
+    }
+    Ok(Some(previous))
 }
 
 /// A type-1 (bridge) header's secondary and subordinate bus numbers
