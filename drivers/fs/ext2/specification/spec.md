@@ -66,6 +66,11 @@ A device without `BlockFeature::Discard` fails the ioctl with
 - The per-volume DMA scratch pool is a bounded async resource. Exhaustion
   registers the filesystem task's waker; returning a buffer wakes one waiter.
   Dropping a waiting future removes its own registration.
+- File and directory `fsync` finish queued last-reference inode teardown
+  and report device-flush errors. `syncfs` through either kind of descriptor
+  writes dirty pages of all live inodes in the volume before that teardown
+  and flush. Open unlinked inodes remain allocated until their last reference
+  drops; a sync must not reclaim a file still open or mapped.
 
 ## 4. Invariants
 

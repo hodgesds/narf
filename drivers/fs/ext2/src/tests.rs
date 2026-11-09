@@ -1103,6 +1103,9 @@ pub(crate) struct GatedCountingBlock {
     pub(crate) inner: alloc::sync::Arc<narf_block::ram::RamBlockDevice>,
     pub(crate) held: core::sync::atomic::AtomicBool,
     pub(crate) reads: core::sync::atomic::AtomicUsize,
+    writes: core::sync::atomic::AtomicUsize,
+    flushes: core::sync::atomic::AtomicUsize,
+    fail_flush: core::sync::atomic::AtomicBool,
 }
 
 impl GatedCountingBlock {
@@ -1111,6 +1114,9 @@ impl GatedCountingBlock {
             inner: narf_block::ram::RamBlockDevice::from_image(512, image),
             held: core::sync::atomic::AtomicBool::new(false),
             reads: core::sync::atomic::AtomicUsize::new(0),
+            writes: core::sync::atomic::AtomicUsize::new(0),
+            flushes: core::sync::atomic::AtomicUsize::new(0),
+            fail_flush: core::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -1134,6 +1140,9 @@ impl narf_block::BlockDevice for GatedCountingBlock {
     ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
         use core::sync::atomic::Ordering;
         let gated = matches!(request.op, narf_block::BlockOp::Read);
+        if matches!(request.op, narf_block::BlockOp::Write { .. }) {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+        }
         if gated {
             self.reads.fetch_add(1, Ordering::Relaxed);
         }
@@ -1153,6 +1162,16 @@ impl narf_block::BlockDevice for GatedCountingBlock {
     }
     fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
         self.inner.flush()
+    }
+    async fn flush_result(&self) -> Result<(), narf_block::BlockError> {
+        use core::sync::atomic::Ordering;
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        if self.fail_flush.load(Ordering::Relaxed) {
+            Err(narf_block::BlockError::IOError)
+        } else {
+            self.inner.flush().await;
+            Ok(())
+        }
     }
     fn discard(
         &self,
@@ -5444,6 +5463,162 @@ fn smoke_ext2_unlink_keeps_an_open_inode_until_its_last_reference() -> TestResul
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_unlink_keeps_an_open_inode_until_its_last_reference
+);
+
+/// Sync must retain an open unlinked inode, then release it after close
+/// without waiting for another create/write to happen on this filesystem.
+fn smoke_ext2_sync_reclaims_closed_unlinked_inode() -> TestResult {
+    use crate::{testing, volume::Ext2Volume};
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    for filesystem_wide in [false, true] {
+        let device = GatedCountingBlock::new(testing::hard_link_image(&[0x5a; 6000]));
+        let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("mount failed"),
+        };
+        let root = volume.root();
+        let file = match poll_once(root.lookup_async("data")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("lookup failed"),
+        };
+        if !matches!(poll_once(root.unlink("data")), Some(Ok(())))
+            || !matches!(poll_once(root.unlink("link")), Some(Ok(())))
+        {
+            return TestResult::Fail("unlink failed");
+        }
+        let sync = || {
+            if filesystem_wide {
+                root.syncfs()
+            } else {
+                root.fsync(false)
+            }
+        };
+        if !matches!(poll_once(sync()), Some(Ok(()))) {
+            return TestResult::Fail("sync while open failed");
+        }
+        let bit = testing::FILE_INO as usize - 1;
+        let allocated =
+            || device.inner.snapshot()[4 * testing::BLOCK_SIZE + bit / 8] & (1 << (bit % 8)) != 0;
+        let mut data = [0; 6000];
+        if !allocated()
+            || !matches!(poll_once(file.read(0, &mut data)), Some(Ok(6000)))
+            || data != [0x5a; 6000]
+        {
+            return TestResult::Fail("sync reclaimed an open unlinked inode");
+        }
+        drop(file);
+        if !matches!(poll_once(sync()), Some(Ok(()))) || allocated() {
+            return TestResult::Fail("sync left a closed unlinked inode allocated");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_sync_reclaims_closed_unlinked_inode
+);
+
+/// A directory or an unrelated regular file is a valid syncfs descriptor;
+/// both must reach dirty mmap folios belonging to another live inode.
+fn smoke_ext2_syncfs_writes_other_inode_dirty_pages() -> TestResult {
+    use crate::{testing, volume::Ext2Volume};
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    for directory in [false, true] {
+        let device = GatedCountingBlock::new(testing::hard_link_image(&[0x5a; 6000]));
+        let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("mount failed"),
+        };
+        let root = volume.root();
+        let other = match poll_once(root.create("other")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("create failed"),
+        };
+        let file = match poll_once(root.lookup_async("data")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("lookup failed"),
+        };
+        if !matches!(poll_once(file.mmap_fault_async(0)), Some(Ok(_))) {
+            return TestResult::Fail("could not dirty a mapped page");
+        }
+        let before = device.writes.load(Ordering::Relaxed);
+        let sync = || {
+            if directory {
+                root.syncfs()
+            } else {
+                other.syncfs()
+            }
+        };
+        if !matches!(poll_once(sync()), Some(Ok(())))
+            || device.writes.load(Ordering::Relaxed) <= before
+        {
+            return TestResult::Fail("syncfs did not write another inode's dirty page");
+        }
+        let after = device.writes.load(Ordering::Relaxed);
+        if !matches!(poll_once(sync()), Some(Ok(())))
+            || device.writes.load(Ordering::Relaxed) != after
+        {
+            return TestResult::Fail("successful writeback left the page dirty");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_syncfs_writes_other_inode_dirty_pages
+);
+
+fn smoke_ext2_sync_reports_device_flush_failure() -> TestResult {
+    use crate::{testing, volume::Ext2Volume};
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    let device = GatedCountingBlock::new(testing::hard_link_image(b"flush me"));
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    for failed in [true, false] {
+        device.fail_flush.store(failed, Ordering::Relaxed);
+        let before = device.flushes.load(Ordering::Relaxed);
+        for result in [
+            poll_once(file.fsync(false)),
+            poll_once(file.syncfs()),
+            poll_once(root.fsync(false)),
+            poll_once(root.syncfs()),
+        ] {
+            let correct = if failed {
+                matches!(
+                    result,
+                    Some(Err(FsError::Io(narf_block::BlockError::IOError)))
+                )
+            } else {
+                matches!(result, Some(Ok(())))
+            };
+            if !correct {
+                return TestResult::Fail("sync did not preserve device flush outcome");
+            }
+        }
+        if device.flushes.load(Ordering::Relaxed) != before + 4 {
+            return TestResult::Fail("sync skipped a device flush");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_sync_reports_device_flush_failure
 );
 
 /// Truncating DOWN releases every block wholly past the new EOF
