@@ -1515,6 +1515,21 @@ kernel_test_in!(
 /// the interleave observable: poll op A (transfer A lands in the
 /// scratch buffer, A pends), poll op B (transfer B lands in the
 /// same scratch buffer, B pends), poll A again (A copies out).
+
+// ── Partial-sector read-modify-write race (#1996) ──────────────────
+//
+// Harness shape shared with #1990 / #1988 (`DeferredDmaDevice`,
+// `drive`, `poll_two`): a fake block device whose submits transfer
+// on the first poll and pend exactly once, so `poll_two` can
+// interleave two operations at their submit await points. Deduped against #1990's copy on rebase.
+
+/// A fake block device whose submits transfer on the first poll,
+/// then pend exactly once, so a concurrent op can interleave, and
+/// complete on the second poll. The transfer lands in the shared
+/// DMA scratch buffer at submit time — the interleave observable:
+/// poll op A (transfer A lands in the scratch buffer, A pends),
+/// poll op B (transfer B lands in the same scratch buffer, B
+/// pends), poll A again (A copies out).
 ///
 /// Deviation from the `BlockDevice::submit` contract, documented
 /// here rather than hidden: a pending submit never wakes its waker
@@ -1727,6 +1742,118 @@ kernel_test_in!(
     smoke_fat_concurrent_read_sector_returns_own_bytes
 );
 
+/// Mount the `build_fat12_image(128, b"narf\n")` fixture on a
+/// [`DeferredDmaDevice`] and look up its one file, `NARF.TXT`
+/// (cluster 2, data sector 4). Returns the device (for post-write
+/// snapshots), the mounted volume, and the file node.
+fn mount_deferred_volume_with_file() -> Option<(
+    alloc::sync::Arc<DeferredDmaDevice>,
+    alloc::sync::Arc<super::volume::FatVolume<DeferredDmaDevice>>,
+    alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+)> {
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::FatVolume;
+
+    let img = build_fat12_image(128, b"narf\n");
+    let device = DeferredDmaDevice::from_image(512, img);
+    let volume = drive(FatVolume::mount(device.clone(), DomainId::DRIVER_0))?.ok()?;
+    let root = volume.root();
+    let file = drive(root.lookup_async("NARF.TXT"))?.ok()?;
+    Some((device, volume, file))
+}
+
+/// Two concurrent partial-sector writes to different offsets of
+/// one sector must both survive: each patch lands in its own slice
+/// of the shared sector, and the bytes neither write keep their
+/// on-disk contents.
+///
+/// Harness limitation, stated plainly: this test cannot fail
+/// pre-fix under single-threaded cooperative polling. The
+/// read → patch → write span holds no pended await between the
+/// read completing and the write submitting, so under `poll_two`
+/// the span runs inside one poll of its task and no other task
+/// can run inside it — and on the bare-main tree the shared DMA
+/// scratch buffer additionally hands the second reader the first
+/// writer's staged bytes, so the second patch is laid on top of
+/// the first rather than on the pre-write sector. (On the
+/// #1990-stacked tree the same poll-atomicity follows from the
+/// barging `io` mutex: the releasing task re-acquires `io` in the
+/// same poll.) Post-#1990 the race is therefore an SMP race: two
+/// CPUs genuinely overlapping the sequences, both reading the
+/// pre-write sector into their own buffers before either writes
+/// back. The deterministic FAIL-pre-fix / PASS-post-fix evidence
+/// for the race itself is the host simulation (see the PR body),
+/// which models that two-CPU overlap with barriers. What this
+/// fixture does pin down in CI: the fix's end-state invariant
+/// through the real `write` path, and liveness of the chosen
+/// design — the tempting alternative (hold `io` across the
+/// sequence) nests the same mutex and parks forever, so
+/// `poll_two` would return `None` here and the test would fail
+/// instead of hanging the suite.
+fn smoke_fat_concurrent_partial_sector_writes_both_patches_survive() -> TestResult {
+    let (device, _volume, file) = match mount_deferred_volume_with_file() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount + lookup on deferred device failed"),
+    };
+    // Both writes land in the file's single data sector (sector 4):
+    // A patches [16..144), B patches [272..400). The ranges
+    // [0..16), [144..272), [400..512) are never written and must
+    // keep the fixture bytes ("narf\n" + zeros).
+    let data_a = alloc::vec![0xA1u8; 128];
+    let data_b = alloc::vec![0xB2u8; 128];
+    let fut_a = file.write(16, &data_a);
+    let fut_b = file.write(272, &data_b);
+    let (ra, rb) = poll_two(fut_a, fut_b);
+    match (ra, rb) {
+        (Some(Ok(128)), Some(Ok(128))) => {}
+        _ => return TestResult::Fail("concurrent partial-sector writes did not complete"),
+    }
+    if file.stat().size != 400 {
+        return TestResult::Fail("stat.size after concurrent partial writes wrong");
+    }
+    let mut back = alloc::vec![0u8; 400];
+    match drive(file.read(0, &mut back)) {
+        Some(Ok(400)) => {}
+        _ => return TestResult::Fail("read-back of the written sector did not complete"),
+    }
+    if &back[0..5] != b"narf\n" || back[5..16].iter().any(|b| *b != 0) {
+        return TestResult::Fail("bytes before the first patch changed");
+    }
+    if back[16..144].iter().any(|b| *b != 0xA1) {
+        return TestResult::Fail("patch A lost to the concurrent write");
+    }
+    if back[144..272].iter().any(|b| *b != 0) {
+        return TestResult::Fail("bytes between the patches changed");
+    }
+    if back[272..400].iter().any(|b| *b != 0xB2) {
+        return TestResult::Fail("patch B lost to the concurrent write");
+    }
+    let stored = device.snapshot();
+    let sec = 4 * 512;
+    if &stored[sec..sec + 5] != b"narf\n" || stored[sec + 5..sec + 16].iter().any(|b| *b != 0) {
+        return TestResult::Fail("device sector: bytes before the first patch changed");
+    }
+    if stored[sec + 16..sec + 144].iter().any(|b| *b != 0xA1) {
+        return TestResult::Fail("device sector does not hold patch A");
+    }
+    if stored[sec + 144..sec + 272].iter().any(|b| *b != 0) {
+        return TestResult::Fail("device sector: bytes between the patches changed");
+    }
+    if stored[sec + 272..sec + 400].iter().any(|b| *b != 0xB2) {
+        return TestResult::Fail("device sector does not hold patch B");
+    }
+    if stored[sec + 400..sec + 512].iter().any(|b| *b != 0) {
+        return TestResult::Fail("device sector: bytes after the second patch changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_concurrent_partial_sector_writes_both_patches_survive
+);
+
 /// A `read_sector` racing a `write_sector` must return the sector's
 /// on-disk bytes, not the bytes the write just staged into the
 /// shared scratch buffer. The read is polled first: before #1988
@@ -1759,3 +1886,35 @@ fn smoke_fat_read_sector_racing_write_sector() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/fat", smoke_fat_read_sector_racing_write_sector);
+
+/// A single partial-sector write still lands exactly its own slice
+/// of the sector and leaves the surrounding bytes untouched.
+fn smoke_fat_single_partial_sector_write() -> TestResult {
+    let (device, _volume, file) = match mount_deferred_volume_with_file() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount + lookup on deferred device failed"),
+    };
+    let data = alloc::vec![0xC3u8; 128];
+    match drive(file.write(16, &data)) {
+        Some(Ok(128)) => {}
+        _ => return TestResult::Fail("single partial-sector write did not complete"),
+    }
+    let mut back = alloc::vec![0u8; 144];
+    match drive(file.read(0, &mut back)) {
+        Some(Ok(144)) => {}
+        _ => return TestResult::Fail("read-back of the written sector did not complete"),
+    }
+    if &back[0..5] != b"narf\n" || back[5..16].iter().any(|b| *b != 0) {
+        return TestResult::Fail("bytes before the patch changed");
+    }
+    if back[16..144].iter().any(|b| *b != 0xC3) {
+        return TestResult::Fail("single partial-sector write read back wrong bytes");
+    }
+    let stored = device.snapshot();
+    let sec = 4 * 512;
+    if stored[sec + 144..sec + 512].iter().any(|b| *b != 0) {
+        return TestResult::Fail("bytes after the patch changed in the device sector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_single_partial_sector_write);
