@@ -57,6 +57,13 @@ const PHY_WATCHDOG_STATUS: u64 = 0xa7c0;
 const PHY_WATCHDOG_STATUS_CLR: u32 = 0x8;
 
 const MAC_IRQ: u32 = 0x2;
+/// `reg.h::AR_INTR_ASYNC_CAUSE_MCI` / `AR_INTR_ASYNC_MASK_MCI` /
+/// `AR_INTR_ASYNC_ENABLE_MCI` (all `0x80`): the async-cause bit
+/// `ar9003_hw_get_isr` routes to `ar9003_mci_get_isr`.
+const ASYNC_CAUSE_MCI: u32 = 0x80;
+/// `hw.h::ATH9K_INT_MCI`: the `ath9k_int` bit `ar9003_mci_get_isr`
+/// sets. In NARF the owner reads it as `Events::mci`.
+pub(in crate::ath9k) const INT_MCI: u32 = 0x200;
 const SYNC_FATAL: u32 = 0x20 | 0x40;
 const SYNC_CPL_TIMEOUT: u32 = 0x1000;
 
@@ -137,6 +144,11 @@ pub(in crate::ath9k) struct Events {
     pub bb_watchdog: Option<u32>,
     pub fatal: bool,
     pub sync_cause: u32,
+    /// `ATH9K_INT_MCI`: the async cause carried the MCI bit while MCI
+    /// was enabled. The owner runs `mci::get_isr` plus
+    /// `mci::handle_interrupt` on its `RegisterIo` path when this is
+    /// set; live-owner wiring is a follow-up, not this lane.
+    pub mci: bool,
 }
 
 impl Events {
@@ -224,10 +236,17 @@ pub(in crate::ath9k) fn kill(port: &impl Port, msi: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// `ar9003_hw_get_isr` (RAC supported, no MCI, RX mitigation on, TX
-/// mitigation off), masked by `imr` as `ath_isr` masks by imask. `None` is
-/// "not pending" (or a removed card returning all ones from `AR_ISR_RAC`).
-pub(in crate::ath9k) fn cause(port: &impl Port, imr: u32) -> Result<Option<Events>, Error> {
+/// `ar9003_hw_get_isr` (RAC supported, MCI routed when `mci_enabled`,
+/// RX mitigation on, TX mitigation off), masked by `imr` as `ath_isr`
+/// masks by imask. `None` is "not pending" (or a removed card returning
+/// all ones from `AR_ISR_RAC`). When `events.mci` is set the owner runs
+/// `mci::get_isr` plus `mci::handle_interrupt` on its `RegisterIo`
+/// path (`ar9003_mci_get_isr` is the Linux half of that pair).
+pub(in crate::ath9k) fn cause(
+    port: &impl Port,
+    imr: u32,
+    mci_enabled: bool,
+) -> Result<Option<Events>, Error> {
     let mut isr = 0;
     let async_cause = port.read(ASYNC_CAUSE)?;
     if async_cause & MAC_IRQ != 0 && port.read(RTC_STATUS)? & 0xf == 2 {
@@ -238,6 +257,9 @@ pub(in crate::ath9k) fn cause(port: &impl Port, imr: u32) -> Result<Option<Event
         return Ok(None);
     }
     let mut events = Events::default();
+    // `ar9003_mac.c`: the async mask gains MCI when enabled, and
+    // `ar9003_mci_get_isr` runs whenever the async cause has the bit.
+    events.mci = mci_enabled && async_cause & ASYNC_CAUSE_MCI != 0;
     if isr != 0 {
         if isr & ISR_BCNMISC != 0 {
             // RAC clears the secondary causes; no write-back here.

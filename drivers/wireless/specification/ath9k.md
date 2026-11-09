@@ -876,6 +876,81 @@ They compose the production lifetime helpers with complete model cold-reset
 primitives; they do not instantiate the singleton native PCI controller.
 Release/native execution and physical acceptance remain pending.
 
+### 3.12 MCI Bluetooth coexistence (AR9462/AR9565)
+
+The MCI engine (`drivers/wireless/src/ath9k/ar9003/mci.rs`, ported from
+Linux `drivers/net/wireless/ath/ath9k/ar9003_mci.c` @ `cbbddb6`) and its
+btcoex glue (`ar9003/btcoex.rs`, from `btcoex.c`) implement the MCI
+message exchange between WLAN and the on-chip BT controller.
+
+Capability: `identify()` reads `AR_ENT_OTP` (`0x40d8`) and
+`fill_cap_info` sets `ATH9K_HW_CAP_MCI` (`BIT(15)`) for AR9462/AR9565
+unless `AR_ENT_OTP_49GHZ_DISABLE` (`0x00100000`) is set.
+`btcoex::mci_is_enabled` is `btcoex_enabled && hw_caps &
+ATH9K_HW_CAP_MCI` (`hw.h::ath9k_hw_mci_is_enabled`).
+
+Scheme: `btcoex::init_scheme` selects NONE when coexistence is
+disabled, MCI when the capability is set, 3WIRE otherwise (every AR9003
+part satisfies `AR_SREV_9300_20_OR_LATER`, so the AR9280 2WIRE branch is
+unreachable). `btcoex::init_mci` installs the Linux defaults, including
+the `0x2201` (AR9462) / `0xa4c1` (other) config word, the BT 3.0 default
+version, and the WLAN channel map `[0, 0xffffffff, 0xffffffff,
+0x7fffffff]`.
+
+Engine: `Mci` owns the 16-slot GPM ring (`[u8; 256]`, no allocation).
+`send_message` sends one MCI message (header byte, `len`, timestamp
+flag) and waits for `SW_MSG_DONE`; it returns false and queues the GPM
+when MCI mode is off or BT sleeps. `handle_interrupt` is the
+`ath_mci_intr` bottom half: it walks the GPM ring, dispatching
+calibration GPMs to the cal handshake and coex-agent GPMs to the profile
+handler, and reports a BT calibration reset request. `get_isr` latches
+the raw/RX-message causes and `CONT_STATUS`, returning false on a
+dead-card read. `irq::cause` reports `Events.mci` when the async cause
+carries the MCI bit (`0x80`, `ATH9K_INT_MCI` `0x200`) while MCI is
+enabled; the owner runs `get_isr` plus `handle_interrupt` on its
+`RegisterIo` path when it is set.
+
+Calibration: `init_cal_req` / `init_cal_done` exchange the WLAN
+calibration request/done GPMs; `start_reset` grants BT its window and
+waits up to 25 ms for calibration done; `end_reset` wakes BT back up
+and reports `EndReset::RecalibrationNeeded` when the caller must re-run
+calibration (re-arming the TIMING4 gain/DC/IQ-cal bit via
+`set_timing4_gain_dc_iq_cal`).
+
+Channel map: `update_wlan_channels` rebuilds the WLAN channel map for
+the current 2 GHz channel (±10 MHz, ±20 more for HT40, plus a 7-channel
+guard) and sends it to BT; 5 GHz channels are skipped.
+`get_max_txpower` caps concurrent-TX power at `0x14` (HT20) / `0x10`
+(HT40) when concurrent TX is on, else no cap.
+
+Weights: `btcoex::set_weight` / `bt_stomp` program the WLAN weight
+tables (`mci_wlan_weights` for AR9462/AR9565, `ar9003_wlan_weights`
+otherwise) with the concurrent-TX priority overlay; `enable_mci` /
+`disable_mci` write the weights and the quiet-ack CTS enable.
+
+GPIO: `observation_set_up` routes the MCI (or TX/RX, or BT) observation
+signals to GPIO 0..3 (and 5) per the `ATH_MCI_CONFIG_MCI_OBS_*` bits;
+the MCI GPIO mux values are `MCI_WLAN_DATA 0x16`, `MCI_WLAN_CLK 0x17`,
+`MCI_BT_DATA 0x18`, `MCI_BT_CLK 0x19`.
+
+Deliberate deviations, all documented in code: the Linux deadbeef spin
+loops (`reset_req_wakeup`, `set_power_awake`) are bounded at 1000
+iterations instead of looping forever on a dead card; `end_reset` does
+not run calibration itself — the caller owns the run. Linux never
+assigns `mci->wlan_ver_major/minor`, so the coex version response
+answers 0.0, kept verbatim. AIC is hard-disabled in Linux
+(`ar9003_aic.c` returns false), so the AIC states read 0.
+
+Not in this step: the live-owner integration (owner holds `Btcoex`,
+`service_begin` routes `Events.mci`, reset path calls
+`start_reset`/`end_reset`, periodic `check_bt`, channel change calls
+`switch_2g5g`/`update_wlan_channels`); the driver-layer BT profile list
+and duty-cycle scheme; the 2WIRE/3WIRE btcoex enable/init paths; the WoW
+`mci_enabled` flag integration (open draft PR #1921 wires it once MCI
+lands). Fixture tests cover the message exchange end to end, capability
+gating per chip/OTP, interrupt routing, GPIO mux programming, the GPM
+walk, and the calibration handshake.
+
 ## 4. Invariants
 
 - PCI parking is verified by command-register readback before BAR sizing: BME
@@ -1205,8 +1280,8 @@ AR9287 calibration branches and two-chain masks; AR9280 `eeprom_def.c`,
 `ar9280_initvals` (AR9280_2) and 5 GHz; AR5416/AR9160 the AR5008 PHY
 (`ar5008_phy.c` analog RF banks) and `eeprom_def.c`; AR9380/AR9485/AR9580/
 AR9462/AR9565 the AR9003 EDMA TX-status/RX-FIFO path (`ar9003_mac.c`),
-`eeprom_9003.c`, per-chip `ar9003_*_initvals.h`, `ar9003_calib.c`, plus MCI
-for AR9462/AR9565.
+`eeprom_9003.c`, per-chip `ar9003_*_initvals.h` and `ar9003_calib.c`.
+(MCI for AR9462/AR9565 is ported; see §3.12.)
 
 **Per-chip profile foundation (`ar9287_enablement`).** `chips.rs` decodes `AR_SREV` exactly as
 `hw.c::ath9k_hw_read_revisions` (new `0xff` format: `(srev & 0xfffc0000) >> 12`
@@ -2331,7 +2406,7 @@ the 755 default-selected 2 GHz HT20 rows for each of 2.0 and 2.1, and
 every TX/RX gain mode with the mode 2/3 override arrays, computed
 from the local Linux headers) and
 `smoke_ath9k_ar9462_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: MCI Bluetooth coexistence, WoW
+Remainder, not in this step: WoW
 (`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`), the AR9462 board-value
 deltas (`thermo_cal`, switch tables) and per-chip calibration branches.
 **AR9485 (`ar9485_enablement`, in progress — not claimed).** Step 1
@@ -2376,7 +2451,7 @@ executed):
 the 648 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
 computed from the local Linux headers) and
 `smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: MCI Bluetooth coexistence, WoW, the
+Remainder, not in this step: WoW, the
 AR9485 board-value deltas and per-chip calibration branches (including
 the 9485 antenna-diversity/LNA-diversity code), and the SerDes
 `pll_pwrsave` conditional programming.
@@ -2425,7 +2500,7 @@ unchanged. Smokes (written, not executed):
 the 711 default-selected 2 GHz HT20 rows for each of 1.0 and 1.1, and
 every TX/RX gain mode, computed from the local Linux headers) and
 `smoke_ath9k_ar9565_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: MCI Bluetooth coexistence, WoW
+Remainder, not in this step: WoW
 (`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0036`), the AR9565 board-value
 deltas and per-chip calibration branches, and the SerDes `pll_pwrsave`
 gating.

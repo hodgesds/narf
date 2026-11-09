@@ -402,6 +402,44 @@ kernel_test_in!(
     smoke_ath9k_ar9300_identify_power_on_and_restore
 );
 
+fn smoke_ath9k_ar9003_mci_cap_gating() -> TestResult {
+    // `hw.c::ath9k_hw_fill_cap_info`: AR9462/AR9565 carry MCI unless
+    // the OTP 4.9 GHz disable is set; no other in-tree part does.
+    if fill_cap_info(Chip::Ar9462, 0) != HW_CAP_MCI
+        || fill_cap_info(Chip::Ar9565, 0) != HW_CAP_MCI
+        || fill_cap_info(Chip::Ar9462, AR_ENT_OTP_49GHZ_DISABLE) != 0
+        || fill_cap_info(Chip::Ar9565, AR_ENT_OTP_49GHZ_DISABLE) != 0
+        || fill_cap_info(Chip::Ar9462, AR_ENT_OTP_49GHZ_DISABLE | 0x40) != 0
+        || fill_cap_info(Chip::Ar9300, 0) != 0
+        || fill_cap_info(Chip::Ar9580, 0) != 0
+        || fill_cap_info(Chip::Ar9485, 0) != 0
+    {
+        return TestResult::Fail("MCI capability gating differs");
+    }
+    if HW_CAP_MCI != 1 << 15 {
+        return TestResult::Fail("ATH9K_HW_CAP_MCI is not BIT(15)");
+    }
+    // `identify()` on 0x0030 reads `AR_ENT_OTP` (the fixture returns 0)
+    // and reports no MCI capability for the AR9300.
+    let mut io = Chip9300::new(SREV_9300_22);
+    let identified = match identify(&mut io, 0x0030) {
+        Ok(identified) => identified,
+        Err(_) => return TestResult::Fail("AR9300 identification failed"),
+    };
+    if identified.ent_mode != 0 || identified.hw_caps != 0 {
+        return TestResult::Fail("AR9300 identification reported MCI facts");
+    }
+    if !io.ops.contains(&Op::Read(AR_ENT_OTP)) {
+        return TestResult::Fail("identify did not read AR_ENT_OTP");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9003_mci_cap_gating
+);
+
 /// FNV-1a over `(addr, value)` little-endian pairs, 2 GHz HT20 column.
 fn fnv(tables: &[&[[u32; 2]]], modal: &[&[[u32; 5]]]) -> (u64, usize) {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
