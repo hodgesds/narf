@@ -4779,11 +4779,11 @@ zeros rather than stale data. The last sample is published like the
 discrete owners' `Snapshot` — retained across a clean rejection,
 never fabricated — and the monitor exits on a terminal SMU failure
 or an epoch change. The owner does not itself register the
-`gpu_temp_mc` provider: that half belongs to the discrete-owner
-provider module (`amdgpu_smu_temp`, PR #1697) and is a rebase
-remainder there, and attaching the owner at APU bring-up (the
-`'static` owner + mailbox slot, cf. `amdgpu_navi22_power::start`)
-is a separate integration step.
+`gpu_temp_mc` provider: `amdgpu_smu_temp::gpu_temp_mc` reads its
+last published sample after the discrete owners, and attaching the
+owner at APU bring-up (the `'static` owner + mailbox slot, cf.
+`amdgpu_navi22_power::start`) is a separate integration step — no
+APU platform singleton exists on main to attach it to.
 
 `unsafe deep_sleep_control().await` is `smu_v14_0_deep_sleep_control(true)`
 as SMU 14.0.2 maps it: for each DS feature of Linux's walk the board supports
