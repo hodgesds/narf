@@ -106,7 +106,7 @@ impl PreferredMode {
     /// Derive the preferred mode from one `edid_timings` entry.
     /// Refresh is the pixel clock over the frame (`pixel_clock_khz
     /// * 1000 / (h_total * v_total)`); a zero total is a malformed
-    /// timing, not a 0 Hz mode.
+    ///   timing, not a 0 Hz mode.
     pub fn from_dml_timing(timing: &crate::amdgpu_dml::Timing) -> Option<Self> {
         if timing.h_total == 0 || timing.v_total == 0 {
             return None;
