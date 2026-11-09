@@ -1,6 +1,7 @@
 use super::chip_8922a;
 use super::efuse_be::BeFactory;
 use super::eht::EhtStation;
+use super::ppe_tests::IES_E1_EHT_PPE_NSS2;
 use super::ra_mask::{HeCaps, HtCaps, VhtCaps};
 use super::station_8922a::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -22,7 +23,7 @@ fn facet() -> Result<EhtStation, TestResult> {
     EhtStation::new_8922ae().ok_or(TestResult::Fail("8922AE EHT facet must build"))
 }
 
-fn base_req() -> Request {
+fn base_req() -> Request<'static> {
     Request {
         peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB],
         band: Band::Ghz5,
@@ -35,7 +36,7 @@ fn base_req() -> Request {
         station_mode: true,
         eht_support: true,
         punctured: 0,
-        pads: [0; 5],
+        peer_ies: &[],
         has_he: true,
         mgq_rpt_en: false,
         p2p: false,
@@ -178,7 +179,7 @@ fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
     };
     let mut pool = MacIdPool::new();
     let mut req = base_req();
-    let cases: [(Request, Error); 9] = [
+    let cases: [(Request<'_>, Error); 8] = [
         (
             Request {
                 band: Band::Ghz6,
@@ -205,13 +206,6 @@ fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
         (Request { primary: 0, ..req }, Error::BadPrimary),
         (Request { aid: 0x1000, ..req }, Error::AidOutOfRange),
         (Request { port: 8, ..req }, Error::PortOutOfRange),
-        (
-            Request {
-                pads: [4, 0, 0, 0, 0],
-                ..req
-            },
-            Error::PadsOutOfRange,
-        ),
     ];
     for (case, want) in cases.iter() {
         match admit(&f, facet, &mut pool, case) {
@@ -236,6 +230,40 @@ fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
     };
     if st.width_mhz != 80 || st.macid != 0 {
         return TestResult::Fail("80 MHz admission record mismatch");
+    }
+    TestResult::Pass
+}
+
+fn smoke_rtw89_8922a_admit_ppe_from_peer_ies() -> TestResult {
+    // Admission parses the Assoc PPE pads from the peer's IEs:
+    // the E1 fixture (EHT PPE, NSS=2) yields [3, 1, 0, 3, 1],
+    // packed 2 bits each into assoc CCTL w5: 3 | 1<<2 | 0<<4 |
+    // 3<<6 | 1<<8 = 0x1C7. The same request with empty IEs
+    // admits with zero pads (no EHT/HE peer), as before.
+    let f = factory();
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
+    let mut pool = MacIdPool::new();
+    let req = Request {
+        peer_ies: IES_E1_EHT_PPE_NSS2,
+        ..base_req()
+    };
+    let st = match admit(&f, facet, &mut pool, &req) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("admission with peer IEs refused"),
+    };
+    if st.pads != [3, 1, 0, 3, 1] || st.assoc_cctl.w[5] != 0x1C7 {
+        return TestResult::Fail("admitted station pads mismatch");
+    }
+    st.release_macid(&mut pool);
+    let st = match admit(&f, facet, &mut pool, &base_req()) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("admission without peer IEs refused"),
+    };
+    if st.pads != [0; 5] || st.assoc_cctl.w[5] != 0 {
+        return TestResult::Fail("empty-IE admission pads must stay zero");
     }
     TestResult::Pass
 }
@@ -271,6 +299,10 @@ fn smoke_rtw89_8922a_macid_pool() -> TestResult {
 }
 
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_admit_eht_golden);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_admit_ppe_from_peer_ies
+);
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_assoc_2g_ap);
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_admit_refusals);
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_macid_pool);

@@ -78,7 +78,7 @@ fn factory() -> BeFactory {
     }
 }
 
-fn base_req() -> Request {
+fn base_req() -> Request<'static> {
     Request {
         peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB],
         band: Band::Ghz5,
@@ -91,7 +91,7 @@ fn base_req() -> Request {
         station_mode: true,
         eht_support: true,
         punctured: 0,
-        pads: [0; 5],
+        peer_ies: &[],
         has_he: true,
         mgq_rpt_en: false,
         p2p: false,
