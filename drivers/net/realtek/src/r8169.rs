@@ -232,13 +232,12 @@ pub const RX_BUF_LEN: usize = 16383;
 /// here at 16 KiB (the family buffer bound).
 pub const TX_BUF_LEN: usize = 16384;
 
-/// MTPS units are 128 bytes; MTPS == 0 is reserved/illegal per
-/// §2.21. The bring-up value is computed from the chip's jumbo
-/// frame size (per-version override for VER_31..33), not a fixed
-/// constant, so no `MTPS_DEFAULT` remains.
-///
-/// Max RX packet length (RMS register, 14-bit): the buffer bound
-/// 16383, matching Linux's `rtl_set_rx_max_size`.
+// MTPS units are 128 bytes; MTPS == 0 is reserved/illegal per
+// §2.21. The bring-up value is computed from the chip's jumbo
+// frame size (per-version override for VER_31..33), not a fixed
+// constant, so no `MTPS_DEFAULT` remains.
+// Max RX packet length (RMS register, 14-bit): the buffer bound
+// 16383, matching Linux's `rtl_set_rx_max_size`.
 
 /// True when any posted TX descriptor has waited longer than
 /// `timeout` cycles with OWN still set — the ring is wedged (igc
