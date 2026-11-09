@@ -371,9 +371,17 @@ impl Engine {
             _ => 2,
         }
     }
-    /// First MI_LOAD_REGISTER_IMM header of the hardware-saved image.
+    /// First MI_LOAD_REGISTER_IMM header of the hardware-saved image
+    /// (the GuC context image built by `context_image` in guc_sched.rs,
+    /// which delegates to `xcs_image` on Gen12 — not the execlists
+    /// template on its own). Both builders carry OACTXCONTROL in the
+    /// RCS first group (issue #1821): 14 registers on Gen12, 16 off it.
     pub(crate) fn first_lri(self, platform: GtPlatform) -> u32 {
-        if platform.is_gen12() || self.is_copy() && !platform.is_xe2() {
+        if self == Self::Rcs0 && platform.is_gen12() {
+            0x1108101b
+        } else if self == Self::Rcs0 {
+            0x1108101f
+        } else if platform.is_gen12() || self.is_copy() && !platform.is_xe2() {
             0x11081019 // gen12_xcs_offsets: 13 registers, no PRT_BB_STATE
         } else {
             0x1108101d
@@ -799,6 +807,15 @@ pub(crate) mod tests {
         assert_eq!(Engine::Ccs0.lrc_pages(GtPlatform::Battlemage), 3);
         assert_eq!(Engine::Ccs0.lrc_pages(GtPlatform::Alchemist), 14);
         assert_eq!(Engine::Ccs0.first_lri(GtPlatform::Alchemist), 0x1108101d);
+        // Rcs0's first group carries OACTXCONTROL (issue #1821):
+        // 16 registers off Gen12, 14 on it.
+        assert_eq!(Engine::Rcs0.first_lri(GtPlatform::Alchemist), 0x1108101f);
+        assert_eq!(
+            Engine::Rcs0.first_lri(GtPlatform::Gen12(
+                crate::intel_gpu_gt::Gen12Platform::TigerLake
+            )),
+            0x1108101b
+        );
         let set = EngineSet::of(&[Engine::Rcs0, Engine::Ccs0]);
         assert!(set.contains(Engine::Ccs0) && !set.contains(Engine::Bcs0));
         assert_eq!(set.iter().collect::<Vec<_>>(), [Engine::Rcs0, Engine::Ccs0]);

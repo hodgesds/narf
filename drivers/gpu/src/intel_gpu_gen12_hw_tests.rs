@@ -103,7 +103,16 @@ fn smoke_gen12_guc_lrc_ads_restore_and_private_execution() -> TestResult {
             for engine in [Engine::Rcs0, Engine::Bcs0] {
                 let class = engine.guc_class() as usize;
                 let golden = d.memory[&ads[(0x1014 + class * 4) / 4]].borrow();
-                assert_eq!(golden[1025], 0x11081019);
+                // Rcs0's first group carries OACTXCONTROL (issue #1821):
+                // 14 registers on Gen12.
+                assert_eq!(
+                    golden[1025],
+                    if engine == Engine::Rcs0 {
+                        0x1108101b
+                    } else {
+                        0x11081019
+                    }
+                );
                 assert_eq!(golden[1024 + 0x21], 0x11081011);
                 assert_eq!(golden[1024 + 0x61], 0x01000000);
                 assert_eq!((golden[1024 + 0x13], golden[1024 + 0x15]), (0, 0));
