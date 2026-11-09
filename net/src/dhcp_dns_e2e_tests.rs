@@ -127,6 +127,23 @@ fn reset_all(iface_name: &'static str) {
 
 // ── DHCP synthetic packet helpers ──────────────────────────────────────────
 
+/// Shared field bundle for the synthetic DHCP OFFER/ACK packet builders
+/// below. The OFFER and ACK builders take the same eight fields, which
+/// exceeds clippy's `too_many_arguments` limit (7) when passed one by
+/// one; bundling them in a struct keeps every call site a single
+/// named-field literal, so no value can be silently misordered.
+#[derive(Clone, Copy)]
+struct DhcpPacketParams<'a> {
+    xid: u32,
+    yiaddr: [u8; 4],
+    server_id: [u8; 4],
+    lease_secs: u32,
+    gateway: [u8; 4],
+    dns: &'a [[u8; 4]],
+    subnet: [u8; 4],
+    ntp: &'a [[u8; 4]],
+}
+
 /// Build a synthetic DHCP OFFER as if the server sent it.
 ///
 /// `xid` must match the XID the client used in DISCOVER.
@@ -139,7 +156,7 @@ fn build_offer_bytes(
     dns: &[[u8; 4]],
     subnet: [u8; 4],
 ) -> Vec<u8> {
-    build_offer_bytes_ntp(
+    build_offer_bytes_ntp(DhcpPacketParams {
         xid,
         yiaddr,
         server_id,
@@ -147,22 +164,13 @@ fn build_offer_bytes(
         gateway,
         dns,
         subnet,
-        &[],
-    )
+        ntp: &[],
+    })
 }
 
 /// Same as [`build_offer_bytes`], plus an option-42 (NTP servers,
 /// RFC 2132 §8.3) payload carrying `ntp` (empty = option omitted).
-fn build_offer_bytes_ntp(
-    xid: u32,
-    yiaddr: [u8; 4],
-    server_id: [u8; 4],
-    lease_secs: u32,
-    gateway: [u8; 4],
-    dns: &[[u8; 4]],
-    subnet: [u8; 4],
-    ntp: &[[u8; 4]],
-) -> Vec<u8> {
+fn build_offer_bytes_ntp(params: DhcpPacketParams<'_>) -> Vec<u8> {
     let mut chaddr = [0u8; 16];
     chaddr[..6].copy_from_slice(&IFACE_MAC);
     let hdr = DhcpHeader {
@@ -170,11 +178,11 @@ fn build_offer_bytes_ntp(
         htype: HTYPE_ETHERNET,
         hlen: 6,
         hops: 0,
-        xid,
+        xid: params.xid,
         secs: 0,
         flags: 0,
         ciaddr: [0; 4],
-        yiaddr,
+        yiaddr: params.yiaddr,
         siaddr: [0; 4],
         giaddr: [0; 4],
         chaddr,
@@ -184,25 +192,25 @@ fn build_offer_bytes_ntp(
     // Options.
     append_message_type(&mut pkt, DHCPOFFER);
     // server-id
-    append_option(&mut pkt, OPT_SERVER_IDENTIFIER, &server_id);
+    append_option(&mut pkt, OPT_SERVER_IDENTIFIER, &params.server_id);
     // lease time
-    append_option(&mut pkt, OPT_LEASE_TIME, &lease_secs.to_be_bytes());
+    append_option(&mut pkt, OPT_LEASE_TIME, &params.lease_secs.to_be_bytes());
     // subnet mask
-    append_option(&mut pkt, OPT_SUBNET_MASK, &subnet);
+    append_option(&mut pkt, OPT_SUBNET_MASK, &params.subnet);
     // router
-    append_option(&mut pkt, OPT_ROUTER, &gateway);
+    append_option(&mut pkt, OPT_ROUTER, &params.gateway);
     // DNS servers
-    if !dns.is_empty() {
+    if !params.dns.is_empty() {
         let mut dns_bytes: Vec<u8> = Vec::new();
-        for addr in dns {
+        for addr in params.dns {
             dns_bytes.extend_from_slice(addr);
         }
         append_option(&mut pkt, OPT_DNS_SERVER, &dns_bytes);
     }
     // NTP servers (option 42, RFC 2132 §8.3): one 4-byte address each.
-    if !ntp.is_empty() {
+    if !params.ntp.is_empty() {
         let mut ntp_bytes: Vec<u8> = Vec::new();
-        for addr in ntp {
+        for addr in params.ntp {
             ntp_bytes.extend_from_slice(addr);
         }
         append_option(&mut pkt, OPT_NTP_SERVERS, &ntp_bytes);
@@ -222,7 +230,7 @@ fn build_ack_bytes(
     dns: &[[u8; 4]],
     subnet: [u8; 4],
 ) -> Vec<u8> {
-    build_ack_bytes_ntp(
+    build_ack_bytes_ntp(DhcpPacketParams {
         xid,
         yiaddr,
         server_id,
@@ -230,24 +238,13 @@ fn build_ack_bytes(
         gateway,
         dns,
         subnet,
-        &[],
-    )
+        ntp: &[],
+    })
 }
 
 /// Same as [`build_ack_bytes`], plus an option-42 (NTP servers) payload.
-fn build_ack_bytes_ntp(
-    xid: u32,
-    yiaddr: [u8; 4],
-    server_id: [u8; 4],
-    lease_secs: u32,
-    gateway: [u8; 4],
-    dns: &[[u8; 4]],
-    subnet: [u8; 4],
-    ntp: &[[u8; 4]],
-) -> Vec<u8> {
-    let mut pkt = build_offer_bytes_ntp(
-        xid, yiaddr, server_id, lease_secs, gateway, dns, subnet, ntp,
-    );
+fn build_ack_bytes_ntp(params: DhcpPacketParams<'_>) -> Vec<u8> {
+    let mut pkt = build_offer_bytes_ntp(params);
     // Replace msg-type byte: options start at DHCP_HDR_LEN (240).
     // The first option after position 240 is OPT_DHCP_MESSAGE_TYPE (53).
     // byte 241 = tag=53, byte 242 = len=1, byte 243 = type value.
@@ -1405,12 +1402,29 @@ fn dhcp_ntp_respond(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     let dns = [[8u8, 8, 8, 8]];
     match msg_type {
         DHCPDISCOVER => {
-            let offer =
-                build_offer_bytes_ntp(xid, offered, server_id, 3600, gw, &dns, subnet, &ntp);
+            let offer = build_offer_bytes_ntp(DhcpPacketParams {
+                xid,
+                yiaddr: offered,
+                server_id,
+                lease_secs: 3600,
+                gateway: gw,
+                dns: &dns,
+                subnet,
+                ntp: &ntp,
+            });
             inject_dhcp_udp(&offer);
         }
         DHCPREQUEST => {
-            let ack = build_ack_bytes_ntp(xid, offered, server_id, 3600, gw, &dns, subnet, &ntp);
+            let ack = build_ack_bytes_ntp(DhcpPacketParams {
+                xid,
+                yiaddr: offered,
+                server_id,
+                lease_secs: 3600,
+                gateway: gw,
+                dns: &dns,
+                subnet,
+                ntp: &ntp,
+            });
             inject_dhcp_udp(&ack);
         }
         _ => {}
