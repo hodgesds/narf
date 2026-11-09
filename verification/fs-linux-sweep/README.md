@@ -11,9 +11,9 @@ This is **diagnostic infrastructure**, not the statistical performance gate.
 Without `--diagnostic`, the runner reports structured `PreconditionFailed` and
 exits before making images or booting guests. Diagnostic runs retain raw elapsed
 times but emit no performance record, speed ratios, or regression decisions.
-The required controlled-host checks and independent sampling/statistical
-analysis in [verification §8](../specification/spec.md#8-performance-testing--statistical-protocol)
-must be implemented before promoting this workload to a performance gate.
+The separate controlled measurement runner below implements independent
+sampling and [verification §8](../specification/spec.md#8-performance-testing--statistical-protocol)
+statistics for a larger workload.
 TCG is useful for functional checks only.
 
 ## Run
@@ -83,3 +83,66 @@ or `btrfs check --readonly --check-data-csum` must pass, and independently
 extracted files (`debugfs rdump` or `btrfs restore`) must match expected bytes.
 Neither checker repairs an image. Persistent readback checks accepted writes;
 they do not prove power-loss durability or journal recovery semantics.
+
+## Controlled measurements
+
+`measure.py` runs the same static `bench.c` binary on both kernels with matching
+QEMU machine, devices, CPU model, memory and writeback cache settings. It uses
+KVM, two vCPUs pinned to host CPUs 8/9, a worker pinned to guest CPU 0, and
+serialized invariant-TSC cycles (lower is better). Verification is outside the
+timed intervals. Both kernels use `noatime`; ASLR must be disabled in the
+benchmark and QEMU processes. No host-wide ASLR change is required.
+
+The host-specific `controlled_host.py` requires review before use elsewhere:
+it reserves the entire CPUs 8–15 LLC in an isolated cgroup partition, disables
+SMT and boost, and fixes those cores at their firmware-reported nominal
+frequency under the performance governor. It checks effective isolation,
+policies, CPU/NVMe temperature tripwires and the benchmark drive's alarm at
+start and throughout each guest. A 30-second window must show temperatures
+below the tripwires and all reserved cores below 5% load before collection.
+It snapshots all frequency policies before hotplug/governor changes and
+restores policies, preferences, SMT, boost and the partition on every exit.
+Missing controls abort the run; `--pilot` produces no performance record.
+
+```sh
+python3 verification/fs-linux-sweep/measure.py --pilot --samples 1 \
+  --workdir /tmp/filesystem-pilot-new --narf-kernel /path/to/narf-frame \
+  --linux-kernel /path/to/vmlinuz
+python3 verification/fs-linux-sweep/controlled_host.py --apply \
+  --workdir /tmp/filesystem-sweep-new --narf-kernel /path/to/narf-frame \
+  --linux-kernel /path/to/vmlinuz --samples 100
+```
+
+Full collection uses 100 fresh boots per kernel per format (600 total), with
+randomized order, fresh 512 MiB images, 8 MiB data files and 1,024 directory
+entries. Every boot must pass the offline checker and independent content
+readback. A failure preserves its image and aborts collection. Kernel, source
+and base-image hashes are recorded and checked again after collection. The
+installed Linux image is identified by its hash; the local source reference
+and its dirty status are recorded separately, without asserting build provenance.
+
+| Timed case | Fixed work |
+| --- | --- |
+| `first-read-64k` | 8 MiB, no target-file data warmup; host/device cache state is uncontrolled. |
+| `cached-read-64k` | 16 passes over 8 MiB after two warmup passes. |
+| `cached-random-read-4k` | 4,096 reads from that cached file. |
+| `sequential-write-64k-fsync` | 8 MiB in 64 KiB writes, then fsync. |
+| `random-overwrite-4k-fsync` | 4,096 writes over an existing 8 MiB file, then fsync. |
+| `append-64k-fsync` | Append 64 KiB to 8 MiB, then fsync. |
+| `write-4k-fsync-each` | 64 writes, each followed by fsync. |
+| `cached-stat` | 16,384 warmed lookups. |
+| `readdir` | 32 complete scans of 1,024 entries. |
+| `create-directory-fsync`, `rename-directory-fsync` | 128 operations, then directory fsync. |
+
+Two 4 KiB create/fsync operations warm the write path before measurement.
+Created/renamed files remain linked; unlink failures are still covered by the
+diagnostic harness. Results describe accepted writes and persistent readback,
+not power-loss durability or equivalent journal/flush guarantees.
+
+`analyze.rs` reuses `build/xtask/src/bench_stats.rs`. It reports median and mean
+with 95% bootstrap CIs (10,000 resamples), p95/p99/p99.9 and CV. Welch and
+Mann–Whitney tests receive separate BH corrections across all 33 comparisons
+at q=0.05. Both must agree, and the ratio CI must exceed the declared 3% delta,
+to label a difference. Insufficient samples prevent a performance record.
+These kernel-to-kernel comparisons are not a before/after optimization claim
+or a schema-2 CI regression record for two clean source builds.

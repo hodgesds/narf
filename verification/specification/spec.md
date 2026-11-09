@@ -53,6 +53,17 @@ for that combination to pass. This diagnostic tool does not satisfy or replace
 the controlled-run and statistical protocol in §8. Workload details, mount
 differences and CLI usage live in `verification/fs-linux-sweep/README.md`.
 
+`verification/fs-linux-sweep/measure.py` adds matched KVM measurements using
+the same static benchmark, fresh images, 100 independent boots per side/format,
+and mandatory offline structural/content checks. `controlled_host.py` applies
+and verifies the runner-specific §8.2 controls with rollback; a pilot emits no
+performance record. `analyze.rs` reuses xtask's statistics with 10,000 bootstrap
+resamples, Welch/Mann–Whitney tests, suite-wide BH q=0.05 and declared δ=3%.
+The metric is elapsed invariant TSC cycles for fixed work, lower is better.
+Kernel image hashes identify the compared binaries; source reference status
+does not establish the installed Linux image's build provenance. This is not
+a schema-2 regression record for two clean source builds.
+
 Wi-Fi and GPU implementations and maintained validation execute native Rust.
 They do not extract Linux/Mesa C functions, compile C shims, slice Rust source
 into temporary adapters, or invoke Python/compiler wrappers for comparisons.
