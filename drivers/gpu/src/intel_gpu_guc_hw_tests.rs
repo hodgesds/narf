@@ -1755,7 +1755,10 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                             &data[1024..1031],
                             &[
                                 0,
-                                if gen12 { 0x11081019 } else { 0x1108101d },
+                                // First group grew by one register on both
+                                // paths (issue #1821): Gen12 13 -> 14,
+                                // non-Gen12 15 -> 16 (OACTXCONTROL last).
+                                if gen12 { 0x1108101b } else { 0x1108101f },
                                 0x2244,
                                 data[1027],
                                 0x2034,
@@ -1765,9 +1768,12 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         );
                         assert!(matches!(data[1027], 0x00090009 | 0x00090008));
                         assert_eq!(data[1032], 0x2038);
-                        assert_eq!(data[1024 + 33], 0x11081011);
-                        assert_eq!(data[1024 + 65], 0x11080001);
-                        assert_eq!(data[1024 + if gen12 { 0xb9 } else { 68 }], 0x05000001);
+                        // The non-Gen12 image is cursor-based, so the extra
+                        // register shifts the following groups by 2 dwords;
+                        // the Gen12 image uses fixed group starts.
+                        assert_eq!(data[1024 + if gen12 { 33 } else { 35 }], 0x11081011);
+                        assert_eq!(data[1024 + if gen12 { 65 } else { 67 }], 0x11080001);
+                        assert_eq!(data[1024 + if gen12 { 0xb9 } else { 70 }], 0x05000001);
                         // xe_lrc.c::reset_stop_ring, graphics IP >= 12.50.
                         assert_eq!(data[1024 + if gen12 { 0x61 } else { 0x71 }], 0x01000000);
                         assert_eq!(data[1024 + 0x72], if gen12 { 0x241c } else { 0 });
