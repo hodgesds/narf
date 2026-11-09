@@ -75,28 +75,35 @@ impl Protocol51 {
     /// `rtw89_fw_h2c_cxdrv_init` (`fcxinit` 0) from `rtw8851b_btc_set_rfe`:
     /// rfe_type 3n+1 is one shared antenna (`ant.type` SHARED, `ant.num` 1,
     /// `bt0_pos` BTG, `wa_type` 1), 3n+3 two dedicated antennas (`ant.type`
-    /// DEDICATED, `ant.num` 2, `bt0_pos` ALONE, `bt0_sw_type` EXTERNAL);
-    /// both: isolation 10, `ant_info` = `stream_cnt` 1 with single/BTG
-    /// position S0 and no diversity, `mod_adie_kt` = `hal.acv`, chip
-    /// `afh_guard_ch` 6, WL-only + init ok. rfe_type 0 (Linux returns
-    /// before any antenna field) and 3n+2 (diversity) have no encoding.
+    /// DEDICATED, `ant.num` 2, `bt0_pos` ALONE, `bt0_sw_type` EXTERNAL),
+    /// 3n+2 the dedicated layout with antenna diversity (`ant_info`
+    /// DIVERSITY, fw.h `RTW89_H2C_CXINIT_ANT_INFO_DIVERSITY` BIT(1), on
+    /// top of the dedicated `stream_cnt` 1 / `ant_info` 0x10); all three:
+    /// isolation 10, single/BTG position S0, `mod_adie_kt` = `hal.acv`,
+    /// chip `afh_guard_ch` 6, WL-only + init ok. rfe_type 0 (Linux returns
+    /// before any antenna field) has no encoding.
     pub fn init(self, rfe: u8, cut: u8, acv: u8) -> Option<[u8; 14]> {
-        let shared = match rfe % 3 {
-            _ if rfe == 0 => return None,
-            1 => true,
-            0 => false,
-            _ => return None,
+        if rfe == 0 {
+            return None;
+        }
+        // (ant.type, ant.num, ant_info, mod_info) per layout; the
+        // diversity layout differs from dedicated only in the
+        // DIVERSITY bit of ant_info.
+        let (ant_type, ant_num, ant_info, mod_info) = match rfe % 3 {
+            1 => (0, 1, 1 << 4, (1 << 1) | (1 << 3)),
+            0 => (1, 2, 1 << 4, 1 << 2),
+            _ => (1, 2, (1 << 4) | (1 << 1), 1 << 2),
         };
         Some([
             0,
             12,
-            u8::from(!shared),
-            if shared { 1 } else { 2 },
+            ant_type,
+            ant_num,
             10,
-            1 << 4,
+            ant_info,
             rfe,
             cut,
-            if shared { (1 << 1) | (1 << 3) } else { 1 << 2 },
+            mod_info,
             acv & 0xf,
             6,
             3,

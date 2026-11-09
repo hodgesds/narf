@@ -33,6 +33,40 @@ pub(super) fn vht_rate(rate: u16) -> bool {
 pub(super) fn he_rate(rate: u16) -> bool {
     (0x180..=0x18b).contains(&rate) || (0x190..=0x19b).contains(&rate)
 }
+/// PPDU class for antenna diversity (phy.c
+/// `rtw89_phy_antdiv_sts_instance_add`): the rate-mode split of
+/// `rtw89_get_data_rate_mode` (txrx.h: `(hw_rate >> 7) & 0x3`, NON_HT 0 /
+/// HT 1 / VHT 2 / HE 3) with the `RTW89_HW_RATE_OFDM6` split: NON_HT
+/// below OFDM6 is CCK, NON_HT at or above OFDM6 is OFDM, any other mode
+/// is non-legacy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PpduClass {
+    Cck,
+    Ofdm,
+    NonLegacy,
+}
+/// `rtw89_get_data_rate_mode` + the OFDM6 split, as above.
+pub(super) fn ppdu_class(rate: u16) -> PpduClass {
+    if (rate >> 7) & 0x3 == 0 {
+        if rate < OFDM6 {
+            PpduClass::Cck
+        } else {
+            PpduClass::Ofdm
+        }
+    } else {
+        PpduClass::NonLegacy
+    }
+}
+/// One classified PPDU observation for the one-path antenna-diversity
+/// tracker (phy.c `rtw89_phy_antdiv_parse`): PPDU class, `RSSI_AVG`
+/// (half-dB units), and the IE01 OFDM `evm_min` (0 for CCK and when no
+/// IE01 is present, matching Linux's zeroed `ofdm.evm_min`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AntDivObservation {
+    pub class: PpduClass,
+    pub rssi: u8,
+    pub evm: u8,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Descriptor {
     pub size: usize,
@@ -176,8 +210,10 @@ const CCK_PKT: u32 = 11;
 /// Linux `rtw89_core_rx_process_ppdu_sts` for an AX PPDU status report:
 /// MAC info and user records (`rtw89_core_rx_process_mac_ppdu`), then the
 /// PHY status header (`rtw89_core_rx_process_phy_ppdu`) and its IE walk
-/// (`rtw89_core_rx_parse_phy_sts`). Returns the header `RSSI_AVG` only when
-/// every step Linux checks succeeds, since Linux updates `avg_rssi` only then.
+/// (`rtw89_core_rx_parse_phy_sts`). Returns the header `RSSI_AVG`, the
+/// IE01 CFO and the IE01 OFDM `evm_min` (0 when the IE01 gates do not
+/// apply) only when every step Linux checks succeeds, since Linux updates
+/// `avg_rssi` only then.
 ///
 /// `premb_cfo` selects IE01 `PREMB_CFO` [31:20] instead of `FD_CFO` [19:8]
 /// (core.c `rtw89_core_parse_phy_status_ie01`: RTL8852C `cfo_src_fd` false).
@@ -185,7 +221,7 @@ pub(super) fn phy_status(
     descriptor: &Descriptor,
     bytes: &[u8],
     premb_cfo: bool,
-) -> Option<(u8, Option<i16>)> {
+) -> Option<(u8, Option<i16>, u8)> {
     let mut start = 0;
     if descriptor.mac_info {
         let w0 = word(bytes, 0).ok()?;
@@ -212,6 +248,7 @@ pub(super) fn phy_status(
     }
     let mut position = if w0 & (1 << 5) != 0 { 16 } else { 8 };
     let mut cfo = None;
+    let mut evm = 0;
     while position < status.len() {
         let header = word(status, position).ok()?;
         let kind = header & 0x1f;
@@ -224,15 +261,17 @@ pub(super) fn phy_status(
         }
         // rtw89_core_parse_phy_status_ie01: OFDM-or-faster PPDUs addressed
         // to this station carry FD_CFO (cfo_src_fd on B) or PREMB_CFO (C),
-        // S(12,2).
+        // S(12,2), and IE01 w2 `ofdm.evm_min` GENMASK(23,16).
         if kind == 1 && descriptor.rate >= OFDM6 && descriptor.to_self {
             let w1 = word(status, position + 4).ok()?;
             let shift = if premb_cfo { 20 } else { 8 };
             cfo = Some((((w1 >> shift) & 0xfff) as i16) << 4 >> 4);
+            let w2 = word(status, position + 8).ok()?;
+            evm = ((w2 >> 16) & 0xff) as u8;
         }
         position += length;
     }
-    Some(((w0 >> 24) as u8, cfo))
+    Some(((w0 >> 24) as u8, cfo, evm))
 }
 /// One accepted PPDU status report (`struct rtw89_rx_phy_ppdu`) for the
 /// addressed `mac_id`.
@@ -243,6 +282,10 @@ pub(super) struct PhyStatus {
     pub rssi: u8,
     /// IE01 `FD_CFO` for an OFDM-or-faster PPDU.
     pub cfo: Option<i16>,
+    /// IE01 `ofdm.evm_min` for an OFDM-or-faster PPDU; 0 otherwise.
+    pub evm: u8,
+    /// `ppdu_class(descriptor.rate)` for the diversity tracker.
+    pub class: PpduClass,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Event {
@@ -387,10 +430,12 @@ impl Assembler {
                 }
             }
             1 => match phy_status(&descriptor, &bytes, self.bw_v1) {
-                Some((rssi, cfo)) if descriptor.to_self => Event::PhyStatus(PhyStatus {
+                Some((rssi, cfo, evm)) if descriptor.to_self => Event::PhyStatus(PhyStatus {
                     mac_id: descriptor.mac_id,
                     rssi,
                     cfo,
+                    evm,
+                    class: ppdu_class(descriptor.rate),
                 }),
                 _ => Event::Dropped,
             },
