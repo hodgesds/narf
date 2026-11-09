@@ -382,13 +382,14 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, Bring
     grant.invoke(|| ar9003::power::program(&mut io, &plan))?;
     o.prepared.power = plan;
     let prepared = o.prepared;
+    let revision = o.revision;
     let report = {
         // SAFETY: probe or the last generation reset identified this
         // AR9300 and ran its complete inactive preparation for `prepared`
         // (whose power plan was just re-programmed); PCI parking was
         // verified above and no packet DMA exists. The async mutex
         // serializes the whole attempt.
-        let future = unsafe { o.radio.run(&mut io, &identity, &prepared) };
+        let future = unsafe { o.radio.run(&mut io, &identity, &revision, &prepared) };
         let mut future = core::pin::pin!(future);
         core::future::poll_fn(|cx| {
             if narf_wireless::reg::db::snapshot().is_none_or(|d| !permission.current_dual_in(&d)) {
@@ -434,6 +435,7 @@ fn compose(
     let channel_mask = admitted_mask(o);
     let totals = o.totals.clone();
     let periodic = ar9003::calib::Periodic::new(
+        &o.revision,
         &report,
         *totals.lock(),
         narf_time::monotonic_ns() / 1_000_000,

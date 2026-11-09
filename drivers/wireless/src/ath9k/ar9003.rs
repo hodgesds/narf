@@ -65,6 +65,9 @@ pub(super) const AR_SREV_REVISION_9565_11: u8 = 2;
 pub(super) const AR_SREV_REVISION_9580_10: u8 = 4;
 /// `reg.h::AR_SREV_VERSION_9485`.
 pub(super) const AR_SREV_VERSION_9485: u32 = 0x240;
+/// `reg.h::AR_SREV_VERSION_9340`: no modeled chip carries it, but the
+/// `TX_IQ_ON_AGC_CAL` gate (`9485_OR_LATER` non-9340) names it.
+pub(super) const AR_SREV_VERSION_9340: u32 = 0x300;
 /// `reg.h::AR_SREV_REVISION_9485_11`: `AR_SREV_9485_11_OR_LATER` is
 /// macRev >= 1; no 1.0 tables exist anywhere in the Linux ath9k tree.
 pub(super) const AR_SREV_REVISION_9485_11: u8 = 1;
@@ -239,6 +242,35 @@ impl Revision {
             mac_rev,
             pcie: srev & AR_SREV_TYPE2_HOST_MODE == 0,
         })
+    }
+
+    /// `AR_SREV_9300_20_OR_LATER` (`reg.h`: `macVersion >=
+    /// `AR_SREV_VERSION_9300`). Every modeled chip satisfies it.
+    pub fn ar9300_20_or_later(&self) -> bool {
+        self.chip.mac_version() >= AR_SREV_VERSION_9300
+    }
+
+    /// `AR_SREV_9485_OR_LATER` (`reg.h`: `macVersion >=
+    /// `AR_SREV_VERSION_9485`).
+    pub fn ar9485_or_later(&self) -> bool {
+        self.chip.mac_version() >= AR_SREV_VERSION_9485
+    }
+
+    /// `AR_SREV_9340` (`reg.h`: `macVersion == AR_SREV_VERSION_9340`).
+    /// No modeled chip carries it; the predicate keeps the
+    /// `TX_IQ_ON_AGC_CAL` gate literal.
+    pub fn ar9340(&self) -> bool {
+        self.chip.mac_version() == AR_SREV_VERSION_9340
+    }
+
+    /// `AR_SREV_9565` (`reg.h`: `macVersion == AR_SREV_VERSION_9565`).
+    pub fn ar9565(&self) -> bool {
+        self.chip == Chip::Ar9565
+    }
+
+    /// `AR_SREV_9485` (`reg.h`: `macVersion == AR_SREV_VERSION_9485`).
+    pub fn ar9485(&self) -> bool {
+        self.chip == Chip::Ar9485
     }
 
     /// `AR_SREV_9300_22`.
