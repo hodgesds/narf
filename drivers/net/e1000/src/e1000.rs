@@ -3750,6 +3750,37 @@ impl E1000 {
         self.tx_resets.load(Ordering::Relaxed)
     }
 
+    /// Test-side accessor: the TX producer cursor — the slot the
+    /// next `tx_enqueue` will fill. The multi-instance fixture
+    /// snapshots it before `send_on` to prove the frame landed in
+    /// the addressed port's TX slot buffer (issue #795).
+    pub fn tx_next_to_use(&self) -> usize {
+        self.tx_state.lock().cursor.next_to_use
+    }
+
+    /// Test-side accessor: true when TX pool slot `slot` currently
+    /// holds the first 14 bytes of `frame` — the routing proof for
+    /// the multi-instance fixture (issue #795): `tx_enqueue` copies
+    /// the frame into `tx_pool[slot]` before posting the
+    /// descriptor, so the bytes land exactly on the instance that
+    /// was addressed.
+    pub fn tx_slot_matches(&self, slot: usize, frame: &[u8]) -> bool {
+        if slot >= TX_RING_LEN || frame.len() < 14 {
+            return false;
+        }
+        // SAFETY: `slot < TX_RING_LEN`, so it indexes a live TX pool
+        // buffer; the reads are volatile, as in the driver's own
+        // transmit path.
+        for k in 0..14usize {
+            let b =
+                unsafe { core::ptr::read_volatile(self.tx_pool[slot].cpu_ptr_at::<u8>(k as u64)) };
+            if b != frame[k] {
+                return false;
+            }
+        }
+        true
+    }
+
     /// One watchdog pass (shared by the supervisor task and the
     /// fixture): if the link is up and a TX descriptor has waited
     /// past the timeout, count the timeout and recover. Returns
