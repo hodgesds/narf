@@ -590,11 +590,9 @@ fn find_mag_approx(in_re: i64, in_im: i64) -> i64 {
     max_abs - max_abs / 32 + min_abs / 8 + min_abs / 4
 }
 
-/// `ar9003_hw_solve_iq_cal`: the 4x4 loopback IQ calibration solve.
-/// Linux computes in `s32`; the products can exceed `s32` for
-/// out-of-range inputs, so the port widens the intermediates to `i64` —
-/// identical results for every in-range input, no wrap on any other.
-fn solve_iq_cal(
+/// The eight inputs to the 4x4 loopback IQ calibration solve, bundled so
+/// `solve_iq_cal` stays under clippy's argument limit.
+struct IqCalSolveParams {
     sin_2phi_1: i64,
     cos_2phi_1: i64,
     sin_2phi_2: i64,
@@ -603,7 +601,23 @@ fn solve_iq_cal(
     phs_a0_d0: i64,
     mag_a1_d0: i64,
     phs_a1_d0: i64,
-) -> Option<[i64; 4]> {
+}
+
+/// `ar9003_hw_solve_iq_cal`: the 4x4 loopback IQ calibration solve.
+/// Linux computes in `s32`; the products can exceed `s32` for
+/// out-of-range inputs, so the port widens the intermediates to `i64` —
+/// identical results for every in-range input, no wrap on any other.
+fn solve_iq_cal(params: IqCalSolveParams) -> Option<[i64; 4]> {
+    let IqCalSolveParams {
+        sin_2phi_1,
+        cos_2phi_1,
+        sin_2phi_2,
+        cos_2phi_2,
+        mag_a0_d0,
+        phs_a0_d0,
+        mag_a1_d0,
+        phs_a1_d0,
+    } = params;
     const RESULT_SHIFT: i64 = 1 << 15;
     let f1 = cos_2phi_1 - cos_2phi_2;
     let f3 = sin_2phi_1 - sin_2phi_2;
@@ -659,8 +673,7 @@ fn calc_iq_corr(iq_res: &[i32; 6]) -> Option<[i32; 2]> {
     if i2_p_q2_a0_d0 == 0 || i2_p_q2_a0_d1 == 0 || i2_p_q2_a1_d0 == 0 || i2_p_q2_a1_d1 == 0 {
         return None;
     }
-    if i2_p_q2_a0_d0 < 1024
-        || i2_p_q2_a0_d0 > 2047
+    if !(1024..=2047).contains(&i2_p_q2_a0_d0)
         || i2_p_q2_a1_d0 < 0
         || i2_p_q2_a1_d1 < 0
         || i2_p_q2_a0_d0 <= i2_m_q2_a0_d0
@@ -695,9 +708,16 @@ fn calc_iq_corr(iq_res: &[i32; 6]) -> Option<[i32; 2]> {
     cos_2phi_1 = cos_2phi_1 * RES_SCALE / mag1;
     sin_2phi_2 = sin_2phi_2 * RES_SCALE / mag2;
     cos_2phi_2 = cos_2phi_2 * RES_SCALE / mag2;
-    let [mag_tx, phs_tx, mag_rx, phs_rx] = solve_iq_cal(
-        sin_2phi_1, cos_2phi_1, sin_2phi_2, cos_2phi_2, mag_a0_d0, phs_a0_d0, mag_a1_d0, phs_a1_d0,
-    )?;
+    let [mag_tx, phs_tx, mag_rx, phs_rx] = solve_iq_cal(IqCalSolveParams {
+        sin_2phi_1,
+        cos_2phi_1,
+        sin_2phi_2,
+        cos_2phi_2,
+        mag_a0_d0,
+        phs_a0_d0,
+        mag_a1_d0,
+        phs_a1_d0,
+    })?;
     if RES_SCALE == mag_tx {
         return None;
     }
@@ -731,20 +751,20 @@ fn detect_outlier(coeff: &mut [i32; MAX_MEASUREMENT], nmeasurement: usize, max_d
     let mut max_idx = 0;
     let mut mp_min = 63;
     let mut min_idx = 0;
-    for i in 0..nmeasurement {
-        if coeff[i] > mp_max {
-            mp_max = coeff[i];
+    for (i, &value) in coeff.iter().enumerate().take(nmeasurement) {
+        if value > mp_max {
+            mp_max = value;
             max_idx = i;
-        } else if coeff[i] < mp_min {
-            mp_min = coeff[i];
+        } else if value < mp_min {
+            mp_min = value;
             min_idx = i;
         }
     }
     let mut mp_avg = 0;
     let mut mp_count = 0;
-    for i in 0..nmeasurement {
-        if coeff[i].abs() < mp_max.abs() || coeff[i].abs() < mp_min.abs() {
-            mp_avg += coeff[i];
+    for &value in coeff.iter().take(nmeasurement) {
+        if value.abs() < mp_max.abs() || value.abs() < mp_min.abs() {
+            mp_avg += value;
             mp_count += 1;
         }
     }
@@ -925,8 +945,12 @@ pub(in crate::ath9k) fn tx_iq_cal_reload(
 ) -> Result<(), BringUpError> {
     let table = corr_coeff_table(revision.ar9485());
     for chain in chains(tx_chainmask) {
-        for im in 0..data.num_measures[chain].min(MAX_MEASUREMENT) {
-            let register = table[im][chain];
+        for (im, row) in table
+            .iter()
+            .enumerate()
+            .take(data.num_measures[chain].min(MAX_MEASUREMENT))
+        {
+            let register = row[chain];
             let coeff = data.tx_corr_coeff[im][chain];
             if im % 2 == 0 {
                 field(
