@@ -7404,8 +7404,8 @@ mod smbus_rmi_smokes {
         if t.read_block(0x40, &mut buf).is_err() {
             return TestResult::Fail("40-byte v1 read failed");
         }
-        for i in 0..40usize {
-            if buf[i] != 0x40 + i as u8 {
+        for (i, &byte) in buf.iter().enumerate() {
+            if byte != 0x40 + i as u8 {
                 return TestResult::Fail("40-byte v1 read bytes wrong");
             }
         }
