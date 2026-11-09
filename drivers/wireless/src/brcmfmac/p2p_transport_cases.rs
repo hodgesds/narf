@@ -147,6 +147,12 @@ pub(crate) fn discovery<R: Fullmac>(
     model.event(wire::E_ACTION_FRAME_RX, PEER, &rx);
     model.event(wire::E_P2P_DISC_LISTEN_COMPLETE, PEER, &[]);
     for _ in 0..4 {
+        // Pump the transport first: `service` only drains events `poll`
+        // has already moved from the firmware model to the runtime queue.
+        station
+            .runtime
+            .poll()
+            .map_err(|_| "discovery transport pump")?;
         block(p2p.service(&mut station.runtime, &mut owner)).map_err(|_| "discovery service")?;
     }
     let Some(Notice::Rx {
