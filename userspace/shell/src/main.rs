@@ -911,6 +911,19 @@ fn tcptest_run(fd: i32) {
         unsafe { write_all(fd, b"tcptest: parent recv != pong\n"); }
         return;
     }
+    // EOF: the listener closes its end after "pong", so a second
+    // recv must terminate with 0 (close-delimited read). Regression
+    // for #1936: libc recvfrom used to loop forever on a 0 return,
+    // so this recv never came back.
+    // SAFETY: Valid memory or trusted environment
+    let n = unsafe {
+        libc::recv(cfd, rbuf.as_mut_ptr() as *mut core::ffi::c_void, rbuf.len(), 0)
+    };
+    if n != 0 {
+        // SAFETY: Valid memory or trusted environment
+        unsafe { write_all(fd, b"tcptest: parent recv after peer close != 0 (EOF)\n"); }
+        return;
+    }
     // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::pthread_join(tid, core::ptr::null_mut()) };
     // SAFETY: Valid memory or trusted environment
@@ -918,7 +931,7 @@ fn tcptest_run(fd: i32) {
     let result = TCPTEST_RESULT.load(Ordering::SeqCst);
     if result == 1 {
         // SAFETY: Valid memory or trusted environment
-        unsafe { write_all(fd, b"tcptest: ok (ping<->pong over 127.0.0.1:8000)\n"); }
+        unsafe { write_all(fd, b"tcptest: ok (ping<->pong + EOF over 127.0.0.1:8000)\n"); }
     } else {
         let mut buf = [0u8; 12];
         let s = u32_to_decimal(result, &mut buf);
@@ -1063,6 +1076,18 @@ fn socktest_run(fd: i32) {
         unsafe { write_all(fd, b"socktest: parent recv != pong\n"); }
         return;
     }
+    // EOF: the listener closes its end after "pong", so a second
+    // recv must terminate with 0 (close-delimited read) on the
+    // AF_UNIX ring path too. Regression for #1936.
+    // SAFETY: Valid memory or trusted environment
+    let n = unsafe {
+        libc::recv(cfd, rbuf.as_mut_ptr() as *mut core::ffi::c_void, rbuf.len(), 0)
+    };
+    if n != 0 {
+        // SAFETY: Valid memory or trusted environment
+        unsafe { write_all(fd, b"socktest: parent recv after peer close != 0 (EOF)\n"); }
+        return;
+    }
     // Join the listener.
     // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::pthread_join(tid, core::ptr::null_mut()) };
@@ -1071,7 +1096,7 @@ fn socktest_run(fd: i32) {
     let result = SOCKTEST_RESULT.load(Ordering::SeqCst);
     if result == 1 {
         // SAFETY: Valid memory or trusted environment
-        unsafe { write_all(fd, b"socktest: ok (ping<->pong over AF_UNIX)\n"); }
+        unsafe { write_all(fd, b"socktest: ok (ping<->pong + EOF over AF_UNIX)\n"); }
     } else {
         let mut buf = [0u8; 12];
         let s = u32_to_decimal(result, &mut buf);

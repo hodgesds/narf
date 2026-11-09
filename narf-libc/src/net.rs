@@ -439,9 +439,20 @@ pub unsafe extern "C" fn sendto(
     r
 }
 
-/// `recvfrom(fd, *buf, len, flags, *addr, *alen)`. Loops over the
-/// kernel single-shot recv until at least 1 byte arrives or the
-/// peer closes (returns 0).
+/// `recvfrom(fd, *buf, len, flags, *addr, *alen)`. Single-shot: the
+/// kernel parks a blocking recv on WouldBlock and re-executes it
+/// (`userspace/src/handlers/sys_socket_recv.rs`), so whatever the
+/// kernel returns here is terminal — `> 0` bytes, `0` = EOF (peer
+/// FIN / closed socket, per `userspace/src/socket.rs::do_recv`),
+/// `< 0` = `-errno`. There is nothing for libc to retry: a
+/// WouldBlock never reaches us on a blocking socket, and on a
+/// non-blocking socket it arrives as `-EAGAIN`, which POSIX says
+/// to surface at once, not spin on.
+///
+/// The previous loop retried on `r == 0`, conflating EOF with
+/// WouldBlock (the kernel never returns 0 for WouldBlock), so
+/// `recv()` could never return 0 and close-delimited reads hung
+/// forever (#1936).
 ///
 /// # Safety
 /// `buf` must be writable for `len` bytes.
@@ -457,30 +468,18 @@ pub unsafe extern "C" fn recvfrom(
     if len == 0 {
         return 0;
     }
-    // Peek loop: kernel returns 0 to indicate "WouldBlock — try
-    // again after a yield"; -1 to indicate genuine error. A real
-    // 0-length read on a closed socket would also return 0, but
-    // for connected SOCK_STREAM that's only after shutdown — for
-    // now we conflate "would-block" and "EOF" as "loop". The
-    // kernel-side park keeps the spin cheap.
-    loop {
-        let r = narf_user_runtime::recvfrom(
-            fd,
-            buf as *mut u8,
-            len,
-            flags as u32,
-            addr as *mut u8,
-            alen,
-        );
-        if r > 0 {
-            return r;
-        }
-        if r < 0 {
-            crate::errno::set_errno(crate::errno::EINVAL);
-            return r;
-        }
-        // r == 0 — kernel parked us; retry.
+    let r = narf_user_runtime::recvfrom(
+        fd,
+        buf as *mut u8,
+        len,
+        flags as u32,
+        addr as *mut u8,
+        alen,
+    );
+    if r < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
     }
+    r
 }
 
 /// `getsockopt(fd, level, name, *val, *vlen)`.
