@@ -566,10 +566,10 @@ fn rx_iq_saturation_abort() -> Result<(), &'static str> {
     };
     // AR9300 writes the saturated coefficients and enables the correction.
     let mut io = Model::new();
-    for chain in 0..3 {
-        io.values.insert(CAL_MEAS[chain], 0);
-        io.values.insert(CAL_MEAS[chain] + 4, 0);
-        io.values.insert(CAL_MEAS[chain] + 8, 0);
+    for meas in CAL_MEAS {
+        io.values.insert(meas, 0);
+        io.values.insert(meas + 4, 0);
+        io.values.insert(meas + 8, 0);
     }
     let mut cal = Calibration::default();
     let revision = rev_for(0x001c_03ff, super::super::Chip::Ar9300);
@@ -589,10 +589,10 @@ fn rx_iq_saturation_abort() -> Result<(), &'static str> {
     // AR9565 aborts the whole calibration on the saturated chain: no
     // coefficient write and no enable, but the calibration is done.
     let mut io = Model::new();
-    for chain in 0..3 {
-        io.values.insert(CAL_MEAS[chain], 0);
-        io.values.insert(CAL_MEAS[chain] + 4, 0);
-        io.values.insert(CAL_MEAS[chain] + 8, 0);
+    for meas in CAL_MEAS {
+        io.values.insert(meas, 0);
+        io.values.insert(meas + 4, 0);
+        io.values.insert(meas + 8, 0);
     }
     let mut cal = Calibration::default();
     let revision = rev_for(0x002c_02ff, super::super::Chip::Ar9565);
