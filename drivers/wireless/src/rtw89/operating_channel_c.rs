@@ -3,10 +3,11 @@
 //!
 //! Pure Linux 7.3-rc4 derivations for a typed RTL8852C operating channel:
 //! core.c `rtw89_channels_{2ghz,5ghz,6ghz}` primaries, IEEE 802.11 20/40/80/
-//! 160MHz channelization (rtw8852c `support_bandwidths`), chan.c
-//! `rtw89_chan_create` (`rtw89_get_subband_type`, `rtw89_get_tx_comp_band`,
-//! `rtw89_get_primary_chan_idx`, `rtw89_get_primary_sb_idx`), phy.h gain band
-//! maps, phy.c `rtw89_encode_chan_idx`, rtw8852c.c `rtw8852c_ctrl_sco_cck` /
+//! 160MHz channelization (rtw8852c `support_bandwidths`) plus 6GHz 320MHz
+//! EHT channelization, chan.c `rtw89_chan_create` (`rtw89_get_subband_type`,
+//! `rtw89_get_tx_comp_band`, `rtw89_get_primary_chan_idx`,
+//! `rtw89_get_primary_sb_idx`), phy.h gain band maps, phy.c
+//! `rtw89_encode_chan_idx`, rtw8852c.c `rtw8852c_ctrl_sco_cck` /
 //! `rtw8852c_ctrl_ch` SCO terms and rtw8852c_rfk.c TSSI groups. A profile is
 //! a geometry fact only: admission still needs signed per-channel records and
 //! the current regulatory rule over [`Profile::occupied`].
@@ -18,13 +19,25 @@ pub(super) enum Band {
     Ghz5 = 1,
     Ghz6 = 2,
 }
-/// `enum rtw89_bandwidth` (5/10/320MHz are not RTL8852C station widths).
+/// Linux `enum rtw89_bandwidth` (`core.h`, torvalds/linux @ cbbddb6):
+/// 20/40/80/160/320MHz = 0..4. This is the shared rtw89 width type the
+/// channel-geometry and RFK layers carry: the BE RFK offload bodies map
+/// the discriminant straight to the Linux width value
+/// (`RTW89_CHANNEL_WIDTH_320` = 4), and the 8922A EHT width type
+/// (`eht::Width`) is a separate, BE-only enum. 320MHz is 6GHz-only EHT
+/// (IEEE 802.11be); it is NOT an RTL8852C station width (rtw8852c.c
+/// `support_bandwidths` caps at 160MHz, `RTW89_5G_BW_NUM` stops at 160,
+/// only `RTW89_6G_BW_NUM` reaches 320) and no 8852C station constructor
+/// builds one on 2.4/5GHz. The 8852C chip programs below transcribe
+/// Linux's default arms for 320MHz (they program nothing, or the 20MHz
+/// default) rather than inventing a 320MHz C program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Width {
     Mhz20 = 0,
     Mhz40 = 1,
     Mhz80 = 2,
     Mhz160 = 3,
+    Mhz320 = 4,
 }
 impl Width {
     pub(super) const fn mhz(self) -> u32 {
@@ -127,6 +140,12 @@ impl Profile {
     /// A 5/6GHz channel of `width` containing `primary`, at the unique IEEE
     /// channelization block (5GHz blocks start at 36/100/149, 6GHz at 1);
     /// every 20MHz subchannel of the block must be a Linux channel.
+    /// 320MHz is 6GHz-only: 5GHz blocks leave the Linux channel set and
+    /// are refused. 320MHz centers are spaced 160MHz (IEEE 802.11be EHT
+    /// bonds two 160MHz channels, so a primary sits in two overlapping
+    /// 320MHz channels); `new_wide` builds the 64-channel-aligned one
+    /// (centers 31/95/159) and [`Self::new_6ghz_320`] builds any of the
+    /// six valid centers (31/63/95/127/159/191) explicitly.
     pub(super) const fn new_wide(band: Band, primary: u8, width: Width) -> Option<Self> {
         let base = match band {
             Band::Ghz2 => return None,
@@ -168,6 +187,42 @@ impl Profile {
             primary,
             center: start + 2 * n - 2,
             width,
+        })
+    }
+    /// A 6GHz 320MHz channel with an explicit center: the six valid IEEE
+    /// 802.11be centers are 31 + 32k (31/63/95/127/159/191; 223's block
+    /// runs past the 6GHz band edge at channel 233 and is refused by the
+    /// subchannel check). `primary` must be one of the channel's sixteen
+    /// 20MHz subchannels and every subchannel must be a Linux 6GHz
+    /// primary.
+    pub(super) const fn new_6ghz_320(primary: u8, center: u8) -> Option<Self> {
+        if center < 31 || center > 223 || (center - 31) % 32 != 0 {
+            return None;
+        }
+        if !is_6ghz_primary(primary) {
+            return None;
+        }
+        let low = center - 30;
+        let mut i = 0;
+        let mut found = false;
+        while i < 16 {
+            let ch = low + 4 * i;
+            if !is_6ghz_primary(ch) {
+                return None;
+            }
+            if ch == primary {
+                found = true;
+            }
+            i += 1;
+        }
+        if !found {
+            return None;
+        }
+        Some(Self {
+            band: Band::Ghz6,
+            primary,
+            center,
+            width: Width::Mhz320,
         })
     }
     pub(super) const fn band(self) -> Band {
@@ -216,7 +271,13 @@ impl Profile {
         let half = self.width.mhz() / 2;
         (self.center_mhz() - half, self.center_mhz() + half)
     }
-    /// chan.c `rtw89_get_subband_type` (`enum rtw89_subband` values).
+    /// chan.c `rtw89_get_subband_type` (`enum rtw89_subband` values),
+    /// transcribed literally including the `default:` arm: the 6GHz
+    /// ranges leave 3-channel gaps (30..32, 62..64, ...) and any center
+    /// in a gap falls to `RTW89_CH_6G_BAND_IDX0` (5). Every 320MHz center
+    /// (31/63/95/127/159/191) sits in a gap, so every 320MHz channel
+    /// has subband 5; no center reachable at 20/40/80/160MHz is in a
+    /// gap, so the older widths are unaffected.
     pub(super) const fn subband(self) -> u8 {
         match self.band {
             Band::Ghz2 => 0,
@@ -225,8 +286,19 @@ impl Profile {
                 100..=148 => 3,
                 _ => 4,
             },
-            // RTW89_CH_6G_BAND_IDX0 (5) .. IDX7 (12), 32-channel groups.
-            Band::Ghz6 => 5 + (self.center - 1) / 32,
+            // RTW89_CH_6G_BAND_IDX0 (5) .. IDX7 (12); gap centers
+            // (the 320MHz centers) fall to IDX0 by Linux's default arm.
+            Band::Ghz6 => match self.center {
+                1..=29 => 5,
+                33..=61 => 6,
+                65..=93 => 7,
+                97..=125 => 8,
+                129..=157 => 9,
+                161..=189 => 10,
+                193..=221 => 11,
+                225..=253 => 12,
+                _ => 5,
+            },
         }
     }
     /// chan.c `rtw89_get_tx_comp_band`.
@@ -289,11 +361,14 @@ impl Profile {
         (idx << 4) | ((p - base) >> 1)
     }
     /// chan.c `rtw89_get_primary_chan_idx` (`enum rtw89_sc_offset`).
+    /// Linux switches on 20/40/80/160 only; 320MHz falls to `default:`
+    /// and returns `RTW89_SC_DONT_CARE` (0).
     pub(super) const fn pri_ch_idx(self) -> u8 {
         let center = self.center_mhz();
         let primary = self.primary_mhz();
         match self.width {
             Width::Mhz20 => 0,
+            Width::Mhz320 => 0,
             Width::Mhz40 => {
                 if primary > center {
                     1
@@ -312,7 +387,9 @@ impl Profile {
     }
     /// chan.c `rtw89_get_primary_sb_idx`.
     pub(super) const fn pri_sb_idx(self) -> u8 {
-        const OFST: [u8; 4] = [0, 2, 6, 14];
+        // chan.c `prisb_cal_ofst[RTW89_CHANNEL_WIDTH_ORDINARY_NUM]`
+        // = {0, 2, 6, 14, 30}.
+        const OFST: [u8; 5] = [0, 2, 6, 14, 30];
         (OFST[self.width as usize] + self.primary - self.center) / 4
     }
     /// Linux `chan->rfsi_band` (`RFSI_CTRL_BAND_2GHZ` = 1, 5/6GHz = 0).
@@ -343,7 +420,9 @@ impl Profile {
                     self.center - 1 - 2
                 }
             }
-            _ => return None,
+            // Linux: any other bandwidth is -EINVAL for CCK (320MHz is
+            // 6GHz-only, so it never reaches here on a 2.4GHz profile).
+            Width::Mhz80 | Width::Mhz160 | Width::Mhz320 => return None,
         }) as usize;
         if element >= 14 {
             return None;
@@ -424,28 +503,38 @@ impl Profile {
                     }
                 }
             }
+            // Linux `rtw89_phy_get_txsc` switches on 40/80/160/80+80
+            // only; 320MHz falls to `default:` and returns 0.
+            Width::Mhz320 => 0,
             Width::Mhz20 => 0,
         }
     }
     /// rtw8852c.c `rtw8852c_set_channel_mac(MAC_0)`: (R_AX_WMAC_RFMOD
     /// 0xc010 bits 1:0, R_AX_TX_SUB_CARRIER_VALUE 0xc088 word, the
     /// R_AX_TXRATE_CHK 0xc628 bits set after clearing BAND_MODE|CHECK_CCK_EN|
-    /// RTS_LIMIT_IN_OFDM6).
+    /// RTS_LIMIT_IN_OFDM6). Linux has no 320MHz arm in either switch:
+    /// the txsc switch falls to `default:` (all txsc 0) and the RFMOD
+    /// switch falls to `default:` (`AX_WMAC_RFMOD_20M`, 0), so a 320MHz
+    /// profile programs (0, 0, chk) on the 8852C.
     pub(super) const fn mac_program(self) -> (u8, u32, u8) {
         let txsc20 = self.txsc(Width::Mhz20) as u32;
         let txsc40 = self.txsc(Width::Mhz40) as u32;
         let txsc80 = self.txsc(Width::Mhz80) as u32;
-        let sub_carrier = match self.width {
-            Width::Mhz20 => 0,
-            Width::Mhz40 => txsc20 & 15,
-            Width::Mhz80 => (txsc20 & 15) | ((txsc40 & 15) << 4),
-            Width::Mhz160 => (txsc20 & 15) | ((txsc40 & 15) << 4) | ((txsc80 & 15) << 8),
+        let (rf_mod, sub_carrier) = match self.width {
+            Width::Mhz20 => (0, 0),
+            Width::Mhz40 => (1, txsc20 & 15),
+            Width::Mhz80 => (2, (txsc20 & 15) | ((txsc40 & 15) << 4)),
+            Width::Mhz160 => (
+                3,
+                (txsc20 & 15) | ((txsc40 & 15) << 4) | ((txsc80 & 15) << 8),
+            ),
+            Width::Mhz320 => (0, 0),
         };
         let chk = match self.band {
             Band::Ghz2 => 1 << 4,
             _ => (1 << 0) | (1 << 1),
         };
-        (self.width as u8, sub_carrier, chk)
+        (rf_mod, sub_carrier, chk)
     }
     /// rtw8852c_rfk.c TSSI groups of the center channel: (`_tssi_get_cck_group`
     /// for 2.4GHz, OFDM group, trim group). 6GHz uses `_tssi_get_6g_*`.

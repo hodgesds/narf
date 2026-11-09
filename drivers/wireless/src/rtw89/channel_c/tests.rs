@@ -208,6 +208,39 @@ fn smoke_rtw89_c_channel_mac_and_ctrl_ch_follow_rtw8852c() -> TestResult {
             return TestResult::Fail("ignored C channel write returned success");
         }
     }
+    // 320MHz (6GHz primary 29, center 31): Linux `rtw8852c_ctrl_bw`
+    // programs no FC0 BW / CHBW / sample-delay / BW-select field, and
+    // `rtw8852c_set_channel_mac` falls to the RFMOD_20M default with
+    // txsc 0; the BW40 and per-20 writes still apply (both 0).
+    let Some(wide320) = Profile::new_wide(Band::Ghz6, 29, Width::Mhz320) else {
+        return TestResult::Fail("6GHz 320MHz profile refused");
+    };
+    let fields320 = ctrl_fields(wide320, &inputs);
+    if mac_fields(wide320)
+        != [
+            (0xc010, 0x3, 0),
+            (0xc088, u32::MAX, 0),
+            (0xc628, 0x13, 0),
+            (0xc628, 0x3, 0x3),
+        ]
+        || fields320.iter().any(|f| {
+            matches!(
+                (f.0, f.1),
+                (0x14974, 0xc000_0000)
+                    | (0x14978, 0x3000)
+                    | (0x14978, 0xf00)
+                    | (0x1c0d4, 0x0c00_0000)
+                    | (0x1c1d4, 0x0c00_0000)
+                    | (0x1c0d8, 0x1e0)
+                    | (0x1c1d8, 0x1e0)
+            )
+        })
+        || !fields320
+            .iter()
+            .any(|f| (f.0, f.1) == (0x10c9c, 0x000f_f000))
+    {
+        return TestResult::Fail("C 320MHz channel program differs from Linux default arms");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

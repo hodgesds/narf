@@ -237,19 +237,28 @@ pub(super) fn ctrl_fields(profile: Profile, inputs: &Inputs<'_>) -> alloc::vec::
 /// `rtw8852c_edcca_per20_bitmap_sifs`.
 fn ctrl_bw(profile: Profile, out: &mut alloc::vec::Vec<Field>) {
     let width = profile.width();
-    let (set, prich, delay, select) = match width {
-        Width::Mhz20 => (0, 0, 3, 0xf),
-        Width::Mhz40 => (1, profile.pri_ch_idx(), 3, 0xf),
-        Width::Mhz80 => (2, profile.pri_ch_idx(), 2, 0xd),
-        Width::Mhz160 => (3, profile.pri_ch_idx(), 1, 0xb),
+    // Linux `rtw8852c_ctrl_bw` switches on 5/10/20/40/80/160 only; its
+    // `default:` arm warns and programs no FC0 BW / CHBW / sample-delay
+    // / BW-select field, so a 320MHz profile emits none of those. The
+    // BW40 2xFFT / T2F GI combine writes and the per-20 bitmap (the
+    // `rtw8852c_edcca_per20_bitmap_sifs` part, which Linux runs for
+    // every bandwidth) still apply below.
+    let bw = match width {
+        Width::Mhz20 => Some((0, 0, 3, 0xf)),
+        Width::Mhz40 => Some((1, profile.pri_ch_idx(), 3, 0xf)),
+        Width::Mhz80 => Some((2, profile.pri_ch_idx(), 2, 0xd)),
+        Width::Mhz160 => Some((3, profile.pri_ch_idx(), 1, 0xb)),
+        Width::Mhz320 => None,
     };
-    out.push((PHY + 0x4974, 0xc000_0000, set));
-    out.push((PHY + 0x4978, 0x3000, 0));
-    out.push((PHY + 0x4978, 0xf00, u32::from(prich)));
-    out.push((PHY + 0xc0d4, 0x0c00_0000, delay));
-    out.push((PHY + 0xc1d4, 0x0c00_0000, delay));
-    out.push((PHY + 0xc0d8, 0x1e0, select));
-    out.push((PHY + 0xc1d8, 0x1e0, select));
+    if let Some((set, prich, delay, select)) = bw {
+        out.push((PHY + 0x4974, 0xc000_0000, set));
+        out.push((PHY + 0x4978, 0x3000, 0));
+        out.push((PHY + 0x4978, 0xf00, u32::from(prich)));
+        out.push((PHY + 0xc0d4, 0x0c00_0000, delay));
+        out.push((PHY + 0xc1d4, 0x0c00_0000, delay));
+        out.push((PHY + 0xc0d8, 0x1e0, select));
+        out.push((PHY + 0xc1d8, 0x1e0, select));
+    }
     let bw40 = u32::from(width == Width::Mhz40);
     out.push((PHY + 0x4e30, 1 << 26, bw40));
     out.push((PHY + 0x4424, 1 << 2, bw40));

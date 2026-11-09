@@ -464,6 +464,10 @@ impl Rules<'_> {
                 put(P0P5, min2(mcs(1, -4), mcs(1, 4)));
                 put(P2P5, min2(mcs(1, -8), mcs(1, 8)));
             }
+            // Linux phy.c `rtw89_phy_fill_txpwr_limit_ax` memsets the
+            // limit struct to 0 and switches on 20/40/80/160 only: there
+            // is no 320MHz fill at cbbddb6, so a 320MHz page stays zero.
+            Width::Mhz320 => {}
         }
         page
     }
@@ -471,11 +475,15 @@ impl Rules<'_> {
     /// `struct rtw89_txpwr_limit_ru_ax` {ru26[8], ru52[8], ru106[8]}.
     fn ru_page(&self, profile: Profile, ntx: u8) -> [i8; 24] {
         let ch = profile.center();
+        // Linux phy.c `rtw89_phy_fill_txpwr_limit_ru_ax` switches on
+        // 20/40/80/160 only: there is no 320MHz RU fill at cbbddb6, so
+        // a 320MHz RU page stays zero (empty deltas fill nothing).
         let deltas: &[i16] = match profile.width() {
             Width::Mhz20 => &[0],
             Width::Mhz40 => &[-2, 2],
             Width::Mhz80 => &[-6, -2, 2, 6],
             Width::Mhz160 => &[-14, -10, -6, -2, 2, 6, 10, 14],
+            Width::Mhz320 => &[],
         };
         let mut page = [0i8; 24];
         for ru in 0..3u8 {

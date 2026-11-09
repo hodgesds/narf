@@ -190,7 +190,10 @@ impl<I: Interface> Access<'_, I> {
         let clk = match channel.width() {
             Width::Mhz80 => 1,
             Width::Mhz160 => 2,
-            _ => 0,
+            // Linux `_tssi_set_sys` switches on 80 / 80+80 / 160 only;
+            // its `default:` arm leaves the ADC clock at 0, so 320MHz
+            // takes 0 like 20/40MHz.
+            Width::Mhz20 | Width::Mhz40 | Width::Mhz320 => 0,
         };
         self.wm(adc, B_TSSI_ADC_CLK, clk)?;
         self.table(match (a, two) {

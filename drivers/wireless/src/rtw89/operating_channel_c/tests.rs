@@ -209,3 +209,122 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_c_operating_channel_matches_linux_geometry_and_tssi_groups
 );
+/// Linux `enum rtw89_bandwidth` (`core.h` @ cbbddb6) 320MHz:
+/// `RTW89_CHANNEL_WIDTH_320` = 4, `RTW89_6G_BW_NUM` reaches 320, and
+/// chan.c/phy.c/rfK default arms pin every 320MHz derivation. 320MHz
+/// centers are the IEEE 802.11be 31 + 32k set; every one sits in the
+/// 3-channel gaps of Linux's 6GHz subband and TSSI tables, so
+/// `rtw89_get_subband_type` falls to `RTW89_CH_6G_BAND_IDX0` (5) and
+/// the 6G TSSI groups fall to 0 (golden.rs, generated from
+/// rtw8852c_rfk.c, agrees on every channel). `new_wide` builds the
+/// 64-channel-aligned 320MHz channels (31/95/159); `new_6ghz_320`
+/// builds any of the six valid centers, including the overlapping
+/// 63/127/191.
+fn smoke_rtw89_c_operating_channel_320mhz_matches_linux() -> TestResult {
+    if Width::Mhz320 as u8 != 4
+        || Width::Mhz320.mhz() != 320
+        || Width::Mhz320.subchannels() != 16
+        || Width::Mhz160.mhz() != 160
+        || Width::Mhz160.subchannels() != 8
+    {
+        return TestResult::Fail("320MHz width value/MHz/subchannels differ from Linux");
+    }
+    // (primary, center, center MHz, chan_idx, pri_sb_idx, tx_comp_band).
+    // new_wide 64-aligned rows: every 320MHz subband is 5 (IDX0),
+    // pri_ch_idx is 0 (SC_DONT_CARE), TSSI groups are (None, 0, 0),
+    // txsc is 0 at every dbw, mac_program is (0, 0, 3).
+    type Row = (u8, u8, u32, u8, u8, u8);
+    const ROWS: [Row; 8] = [
+        (1, 31, 6105, 0x70, 0, 2),
+        (37, 31, 6105, 0x82, 9, 2),
+        (61, 31, 6105, 0x8e, 15, 2),
+        (65, 95, 6425, 0x90, 0, 3),
+        (95, 95, 6425, 0x9f, 7, 3),
+        (125, 95, 6425, 0xae, 15, 3),
+        (129, 159, 6745, 0xb0, 0, 3),
+        (189, 159, 6745, 0xce, 15, 3),
+    ];
+    for (primary, center, mhz, idx, sb, comp) in ROWS {
+        let Some(p) = Profile::new_wide(Band::Ghz6, primary, Width::Mhz320) else {
+            return TestResult::Fail("valid 6GHz 320MHz chandef refused");
+        };
+        if p.primary() != primary
+            || p.center() != center
+            || p.width() != Width::Mhz320
+            || p.center_mhz() != mhz
+            || p.subband() != 5
+            || p.gain_band() != 4
+            || p.gain_offset_band() != 5
+            || p.tx_comp_band() != comp
+            || p.chan_idx() != idx
+            || p.pri_ch_idx() != 0
+            || p.pri_sb_idx() != sb
+            || p.tssi_groups() != (None, 0, 0)
+            || p.tssi_cck_group() != 0
+            || p.txsc(Width::Mhz20) != 0
+            || p.txsc(Width::Mhz40) != 0
+            || p.txsc(Width::Mhz80) != 0
+            || p.txsc(Width::Mhz160) != 0
+            || p.txsc(Width::Mhz320) != 0
+            || p.mac_program() != (0, 0, 3)
+            || p.occupied() != (mhz - 160, mhz + 160)
+        {
+            return TestResult::Fail("6GHz 320MHz chandef derivation differs from Linux");
+        }
+    }
+    // Explicit-center rows: the overlapping 320MHz channels new_wide
+    // cannot name (63/127/191), plus the aligned centers through the
+    // same constructor.
+    const EXPLICIT: [Row; 5] = [
+        (1, 31, 6105, 0x70, 0, 2),
+        (37, 63, 6265, 0x82, 1, 2),
+        (65, 63, 6265, 0x90, 8, 2),
+        (97, 127, 6585, 0xa0, 0, 3),
+        (161, 191, 6905, 0xc0, 0, 3),
+    ];
+    for (primary, center, mhz, idx, sb, comp) in EXPLICIT {
+        let Some(p) = Profile::new_6ghz_320(primary, center) else {
+            return TestResult::Fail("valid explicit-center 320MHz chandef refused");
+        };
+        if p.primary() != primary
+            || p.center() != center
+            || p.width() != Width::Mhz320
+            || p.center_mhz() != mhz
+            || p.subband() != 5
+            || p.chan_idx() != idx
+            || p.pri_ch_idx() != 0
+            || p.pri_sb_idx() != sb
+            || p.tx_comp_band() != comp
+            || p.tssi_groups() != (None, 0, 0)
+            || p.mac_program() != (0, 0, 3)
+        {
+            return TestResult::Fail("explicit-center 320MHz chandef differs from Linux");
+        }
+    }
+    // Blocks that leave the Linux channel set are refused, never
+    // narrowed; 320MHz exists on 6GHz only.
+    if Profile::new_wide(Band::Ghz5, 36, Width::Mhz320).is_some()
+        || Profile::new_wide(Band::Ghz5, 149, Width::Mhz320).is_some()
+        || Profile::new_wide(Band::Ghz2, 1, Width::Mhz320).is_some()
+        || Profile::new_wide(Band::Ghz6, 193, Width::Mhz320).is_some()
+        || Profile::new_wide(Band::Ghz6, 221, Width::Mhz320).is_some()
+        || Profile::new_wide(Band::Ghz6, 233, Width::Mhz320).is_some()
+        || Profile::new_6ghz_320(193, 223).is_some()
+        || Profile::new_6ghz_320(37, 223).is_some()
+        || Profile::new_6ghz_320(37, 95).is_some()
+        || Profile::new_6ghz_320(3, 63).is_some()
+        || Profile::new_6ghz_320(37, 32).is_some()
+        || Profile::new_6ghz_320(61, 95).is_some()
+    {
+        return TestResult::Fail("320MHz chandef outside the Linux channel set admitted");
+    }
+    // A primary in the overlap belongs to both of its 320MHz channels.
+    if Profile::new_6ghz_320(61, 31).is_none() || Profile::new_6ghz_320(61, 63).is_none() {
+        return TestResult::Fail("overlapping 320MHz channel refused its primary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_c_operating_channel_320mhz_matches_linux
+);
