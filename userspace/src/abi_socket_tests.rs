@@ -462,6 +462,98 @@ kernel_test_in!(
     smoke_abi_socket_unix_stream_request_reply
 );
 
+/// Regression for #1103 (unix-socket ghost-connect window): `connect()`
+/// clones the listener `Arc` from the socket registry, and if the
+/// listener's last fd closed in between, `unregister()` removed the name
+/// but left the state `UnixListener` — so the in-flight connect enqueued
+/// into a dead listener and returned success, with nobody left to ever
+/// accept it.
+///
+/// The interleaving is staged deterministically with the `kernel-test`
+/// seam in `dispatch_unix_stream` Connect: the armed hook runs the
+/// listener's last-close teardown (`unregister()`) after the lookup
+/// cloned the `Arc` and before the enqueue-time state check. Pre-fix
+/// the connect returns success (the test fails); post-fix the state
+/// check refuses it with -ECONNREFUSED. The seam is disarmed on every
+/// path out of the connect call, so a failure here cannot poison later
+/// cases. The tail of the test re-binds the released name and runs a
+/// normal connect/accept, proving the fix did not break the live path.
+#[cfg(feature = "kernel-test")]
+fn smoke_abi_socket_unix_connect_racing_listener_close_refused() -> TestResult {
+    with_setup(|| {
+        let srv = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-ghost-connect");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("server bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+            return Err("server listen failed");
+        }
+        let cli = open_unix_stream()?;
+        crate::socket::SocketFile::__test_arm_unix_connect_pre_enqueue_hook(
+            crate::socket::SocketFile::__test_unregister_listener,
+        );
+        let r = call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        );
+        crate::socket::SocketFile::__test_disarm_unix_connect_pre_enqueue_hook();
+        let r = match r {
+            Some(r) => r,
+            None => return Err("connect status"),
+        };
+        if r != ECONNREFUSED {
+            return Err("connect racing the listener's last close succeeded into a dead listener");
+        }
+        // The name was released: a fresh listener can bind it and serve a
+        // normal connect/accept.
+        let srv2 = open_unix_stream()?;
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv2, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("fresh listener bind failed after the ghost connect");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv2, 16)).ok_or("listen status")? != 0 {
+            return Err("fresh listener listen failed after the ghost connect");
+        }
+        let cli2 = open_unix_stream()?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli2, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("connect status")?
+            != 0
+        {
+            return Err("normal connect to the fresh listener failed");
+        }
+        let conn = call(Syscall::SocketAccept.raw(), a0(srv2)).ok_or("accept status")?;
+        if conn < 0 {
+            return Err("fresh listener accept did not return a connection fd");
+        }
+        let _ = call(Syscall::Close.raw(), a0(cli));
+        let _ = call(Syscall::Close.raw(), a0(cli2));
+        let _ = call(Syscall::Close.raw(), a0(conn as u64));
+        let _ = call(Syscall::Close.raw(), a0(srv));
+        let _ = call(Syscall::Close.raw(), a0(srv2));
+        Ok(())
+    })
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_connect_racing_listener_close_refused
+);
+
 // ──────────────────────────── SocketAccept4 ───────────────────────────
 
 fn smoke_abi_socket_accept4_neg() -> TestResult {
