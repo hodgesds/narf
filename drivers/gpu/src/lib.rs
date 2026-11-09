@@ -193,6 +193,8 @@ pub mod amdgpu_dcn30_audio;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_clk;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_dcn30_color;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_cursor;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dcn30_ddc;

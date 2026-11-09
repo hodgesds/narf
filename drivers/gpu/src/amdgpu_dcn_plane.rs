@@ -13,11 +13,13 @@
 //! `dcn_3_0_0_offset.h` DSCL block); the modeset itself programs the
 //! scaler in bypass. A stream is blanked here, by the OPP's pattern
 //! generator, rather than at the timing generator.
+use crate::amdgpu_dcn30_color::{GamutProgram, OgamProgram, PreDegam};
 use crate::amdgpu_dcn30_scl::{u0d19, u3d19, ScalerData};
 use crate::amdgpu_dcn_color::Fixed31_32;
 use crate::{
     amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Format,
 };
+use alloc::vec::Vec;
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
@@ -32,6 +34,18 @@ const PRE_DEALPHA: u64 = 0x0cde; // linux: mmCNVC_CFG0_PRE_DEALPHA
 const PRE_DEGAM: u64 = 0x0ced; // linux: mmCNVC_CFG0_PRE_DEGAM
 const PRE_REALPHA: u64 = 0x0cee; // linux: mmCNVC_CFG0_PRE_REALPHA
 const CM_CONTROL: u64 = 0x0d20; // linux: mmCM0_CM_CONTROL
+
+// The DPP GAMCOR block (DCN3.0 only; `dcn_3_0_0_offset.h`): the CM's
+// distributed-points RAM, laid out as the OGAM's (START_CNTL_B/G/R,
+// START_SLOPE_CNTL_B/G/R, START_BASE_CNTL_B/G/R, END_CNTL1/2_B, _G, _R,
+// OFFSET_B/G/R, then REGION_0_1..REGION_32_33).
+const GAMCOR_CONTROL: u64 = 0x0d3d; // CM_GAMCOR_CONTROL
+const GAMCOR_LUT_INDEX: u64 = 0x0d3e; // CM_GAMCOR_LUT_INDEX
+const GAMCOR_LUT_DATA: u64 = 0x0d3f; // CM_GAMCOR_LUT_DATA
+const GAMCOR_LUT_CONTROL: u64 = 0x0d40; // CM_GAMCOR_LUT_CONTROL
+const GAMCOR_RAMA: u64 = 0x0d41; // CM_GAMCOR_RAMA_START_CNTL_B
+const GAMCOR_RAMB: u64 = 0x0d64; // CM_GAMCOR_RAMB_START_CNTL_B
+const CM_MEM_PWR_CTRL: u64 = 0x0dd2; // CM_MEM_PWR_CTRL
 const SCL_MODE: u64 = 0x0cfb; // linux: mmDSCL0_SCL_MODE
 const DSCL_CONTROL: u64 = 0x0cfd; // linux: mmDSCL0_DSCL_CONTROL
 const DSCL_AUTOCAL: u64 = 0x0d0c; // linux: mmDSCL0_DSCL_AUTOCAL
@@ -90,6 +104,34 @@ const MPCC_STRIDE: u64 = 0x20; // linux: mmMPCC1_MPCC_TOP_SEL - mmMPCC0_MPCC_TOP
 const MPCC_OGAM_CONTROL: u64 = 0x0100; // linux: mmMPCC_OGAM0_MPCC_OGAM_CONTROL
 const MPCC_GAMUT_REMAP_MODE: u64 = 0x014b; // linux: mmMPCC_OGAM0_MPCC_GAMUT_REMAP_MODE
 const OGAM_STRIDE: u64 = 0x80; // linux: mmMPCC_OGAM1_MPCC_OGAM_CONTROL - mmMPCC_OGAM0_MPCC_OGAM_CONTROL
+
+// The MPCC OGAM block (DCN3.0 only; `dcn_3_0_0_offset.h`): LUT access and
+// the RAMA/RAMB banks, laid out as the GAMCOR's.
+const OGAM_LUT_INDEX: u64 = 0x0101; // linux: mmMPCC_OGAM0_MPCC_OGAM_LUT_INDEX
+const OGAM_LUT_DATA: u64 = 0x0102; // linux: mmMPCC_OGAM0_MPCC_OGAM_LUT_DATA
+const OGAM_LUT_CONTROL: u64 = 0x0103; // linux: mmMPCC_OGAM0_MPCC_OGAM_LUT_CONTROL
+const OGAM_RAMA: u64 = 0x0104; // linux: mmMPCC_OGAM0_MPCC_OGAM_RAMA_START_CNTL_B
+const OGAM_RAMB: u64 = 0x0127; // linux: mmMPCC_OGAM0_MPCC_OGAM_RAMB_START_CNTL_B
+const GAMUT_COEF_FORMAT: u64 = 0x014a; // linux: mmMPCC_OGAM0_MPCC_GAMUT_REMAP_COEF_FORMAT
+const GAMUT_A: u64 = 0x014c; // linux: mmMPCC_OGAM0_MPCC_GAMUT_REMAP_C11_C12_A
+const GAMUT_B: u64 = 0x0152; // linux: mmMPCC_OGAM0_MPCC_GAMUT_REMAP_C11_C12_B
+
+// linux: mmMPCC0_MPCC_MEM_PWR_CTRL
+const MPCC_MEM_PWR_CTRL: u64 = 0x000c;
+// linux: MPCC0_MPCC_MEM_PWR_CTRL__MPCC_OGAM_MEM_PWR_DIS_MASK
+const MPCC_OGAM_MEM_PWR_DIS: u32 = 1 << 2;
+// linux: MPCC0_MPCC_MEM_PWR_CTRL__MPCC_OGAM_MEM_PWR_STATE_MASK
+const MPCC_OGAM_MEM_PWR_STATE: u32 = 0x300;
+/// `REG_WAIT(MPCC_MEM_PWR_CTRL, MPCC_OGAM_MEM_PWR_STATE, 0, 10, 10)`.
+// linux: n/a (REG_WAIT max_try 10, literal in dcn30_mpc.c:mpc3_power_on_ogam_lut)
+const MEM_PWR_POLLS: u32 = 10;
+// linux: n/a (REG_WAIT delay 10 us, literal in dcn30_mpc.c:mpc3_power_on_ogam_lut)
+const MEM_PWR_POLL_US: u64 = 10;
+/// The RAM banks' relative layout, shared by OGAM and GAMCOR (RAMB is
+/// RAMA + 0x23 on both; CONTROL is RAMA_START − 4).
+const RAM_START_SLOPE: u64 = 3;
+const RAM_END: u64 = 9;
+const RAM_REGIONS: u64 = 0x12;
 const MPC_RMU_CONTROL: u64 = 0x0680; // linux: mmMPC_RMU_CONTROL
 static RMU_MUX_LOCK: narf_lib::sync::IrqSafeSpinLock<()> = narf_lib::sync::IrqSafeSpinLock::new(());
 const MPC_OUT_MUX: u64 = 0x0580; // linux: mmMPC_OUT0_MUX
@@ -97,7 +139,7 @@ const MPC_OUT_STRIDE: u64 = 4; // linux: mmMPC_OUT1_MUX - mmMPC_OUT0_MUX
                                // linux-ctx: hdr=dcn
 
 #[cfg(feature = "kernel-test")]
-const DPP_LAST_REG: u32 = (CM_CONTROL + 3 * DPP_STRIDE) as u32; // linux: n/a (test-only bank bound)
+const DPP_LAST_REG: u32 = (CM_MEM_PWR_CTRL + 3 * DPP_STRIDE) as u32; // linux: n/a (test-only bank bound)
 #[cfg(feature = "kernel-test")]
 // linux: n/a (test-only bank bound)
 const OPP_LAST_REG: u32 = (OPP_PIPE_CONTROL + 3 * OPP_STRIDE) as u32;
@@ -1008,6 +1050,198 @@ impl<I: Io> Block<I> {
         }
         Ok(())
     }
+    /// Back-to-back LUT_DATA writes; the hardware advances the index.
+    fn lut_words(&mut self, data: u64, words: &[u32]) -> Result<(), Error> {
+        self.access(|io| {
+            for &word in words {
+                io.write(data, word);
+            }
+        })
+    }
+    /// dcn30_set_input_transfer_func on this DPP for a plane without its
+    /// own color: dpp3_set_pre_degam, then dpp3_program_gamcor_lut with
+    /// the distributed points' PWL (or none). Returns the GAMCOR RAM bank
+    /// now selected. DCN3.0 only.
+    fn dpp_program_input_tf(
+        &mut self,
+        pre_degam: PreDegam,
+        degamma: Option<&OgamProgram>,
+    ) -> Result<Option<u8>, Error> {
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        let base = u64::from(self.instance) * DPP_STRIDE;
+        let at = |reg: u64| reg + base;
+        self.update(at(PRE_DEGAM), 0x73, pre_degam.word())?;
+        // dpp3_enable_cm_block (no cm_in_bypass debug option).
+        self.update(at(CM_CONTROL), 1, 0)?;
+        let Some(o) = degamma else {
+            self.update(at(GAMCOR_CONTROL), 0xf, 0)?;
+            return Ok(None);
+        };
+        // dpp3_power_on_gamcor_lut without enable_mem_low_power.bits.cm
+        // (dcn401_resource): GAMCOR_MEM_PWR_DIS 0 in a REG_SET.
+        self.update(at(CM_MEM_PWR_CTRL), 7, 0)?;
+        self.update(at(GAMCOR_CONTROL), 0xf, 2)?;
+        // dpp30_get_gamcor_current: RAM A or B only when MODE_CURRENT is
+        // RAM; from bypass or A the next is B, from B it is A.
+        let control = self.access(|io| io.read(at(GAMCOR_CONTROL)))?;
+        if control == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        let ram_a = (control >> 4) & 3 == 2 && (control >> 6) & 1 == 1;
+        self.update(at(CM_MEM_PWR_CTRL), 7, 0)?;
+        // dpp3_configure_gamcor_lut: all channels, host access to the bank.
+        self.update(at(GAMCOR_LUT_CONTROL), 7, 7)?;
+        self.update(at(GAMCOR_LUT_CONTROL), 0x40, u32::from(!ram_a) << 6)?;
+        self.update(at(GAMCOR_LUT_INDEX), 0x1ff, 0)?;
+        let ram = if ram_a { GAMCOR_RAMA } else { GAMCOR_RAMB };
+        // cm_helper_program_gamcor_xfer_func's order.
+        for (c, &start) in o.start.iter().enumerate() {
+            self.update(at(ram + c as u64), u32::MAX, start)?;
+        }
+        for (c, &slope) in o.start_slope.iter().enumerate() {
+            self.update(at(ram + RAM_START_SLOPE + c as u64), u32::MAX, slope)?;
+        }
+        for (c, &base) in o.end_base.iter().enumerate() {
+            self.update(at(ram + RAM_END + 2 * c as u64), u32::MAX, base)?;
+        }
+        for (c, &end) in o.end.iter().enumerate() {
+            self.update(at(ram + RAM_END + 2 * c as u64 + 1), u32::MAX, end)?;
+        }
+        for (i, &region) in o.regions.iter().enumerate() {
+            self.update(at(ram + RAM_REGIONS + i as u64), u32::MAX, region)?;
+        }
+        // dpp3_program_gamcor_lut: every base value, then the last one
+        // again; one pass when the channels agree, else red, green and
+        // blue under their write masks.
+        let data = at(GAMCOR_LUT_DATA);
+        let with_last = |v: &[u32]| -> Vec<u32> { v.iter().chain(v.last()).copied().collect() };
+        if o.lut[0] == o.lut[1] && o.lut[1] == o.lut[2] {
+            self.lut_words(data, &with_last(&o.lut[0]))?;
+        } else {
+            for (c, mask) in [4u32, 2, 1].into_iter().enumerate() {
+                if c > 0 {
+                    self.update(at(GAMCOR_LUT_INDEX), 0x1ff, 0)?;
+                }
+                self.update(at(GAMCOR_LUT_CONTROL), 7, mask)?;
+                self.lut_words(data, &with_last(&o.lut[c]))?;
+            }
+        }
+        self.update(at(GAMCOR_CONTROL), 4, u32::from(!ram_a) << 2)?;
+        Ok(Some(u8::from(!ram_a)))
+    }
+    /// dcn30_program_gamut_remap on this MPCC: the stream's remap, or
+    /// bypass. Returns the coefficient set now selected. DCN3.0 only.
+    fn mpc_program_gamut(
+        &mut self,
+        gamut: Option<&GamutProgram>,
+    ) -> Result<Option<(u8, bool)>, Error> {
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        let stride = u64::from(self.instance) * OGAM_STRIDE;
+        let at = |reg: u64| reg + stride;
+        let Some(g) = gamut else {
+            self.update(at(MPCC_GAMUT_REMAP_MODE), 3, 0)?;
+            return Ok(None);
+        };
+        // The set in use is not rewritten: A unless A is current.
+        let current = self.access(|io| io.read(at(MPCC_GAMUT_REMAP_MODE)))?;
+        if current == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        let set = if (current >> 7) & 3 != 1 { 1 } else { 2 };
+        let base = if set == 1 { GAMUT_A } else { GAMUT_B };
+        for (i, &word) in g.coef.iter().enumerate() {
+            self.update(at(base + i as u64), u32::MAX, word)?;
+        }
+        self.update(at(MPCC_GAMUT_REMAP_MODE), 3, set)?;
+        self.update(at(GAMUT_COEF_FORMAT), 1, u32::from(g.s3_12))?;
+        Ok(Some((set as u8, g.s3_12)))
+    }
+    /// mpc3_set_output_gamma on this MPCC. Returns the RAM bank now
+    /// selected. DCN3.0 only.
+    async fn mpc_program_ogam(&mut self, ogam: Option<&OgamProgram>) -> Result<Option<u8>, Error> {
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        let base = u64::from(self.instance) * OGAM_STRIDE;
+        let at = |reg: u64| reg + base;
+        let Some(o) = ogam else {
+            self.update(at(MPCC_OGAM_CONTROL), 0xf, 0)?;
+            return Ok(None);
+        };
+        self.update(at(MPCC_OGAM_CONTROL), 0xf, 2)?;
+        // mpc3_get_ogam_current: RAM A or B only when MODE_CURRENT is RAM.
+        let control = self.access(|io| io.read(at(MPCC_OGAM_CONTROL)))?;
+        if control == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        let current = ((control >> 7) & 3 == 2).then_some((control >> 9) & 1);
+        let next: u32 = if current == Some(0) { 1 } else { 0 };
+        // mpc3_power_on_ogam_lut: force the memory on, then wait for it.
+        let power = self.mpcc(MPCC_MEM_PWR_CTRL);
+        self.update(power, MPCC_OGAM_MEM_PWR_DIS, MPCC_OGAM_MEM_PWR_DIS)?;
+        let mut on = false;
+        for _ in 0..MEM_PWR_POLLS {
+            let state = self.access(|io| io.read(power))?;
+            if state == u32::MAX {
+                return Err(Error::DeviceGone);
+            }
+            if state & MPCC_OGAM_MEM_PWR_STATE == 0 {
+                on = true;
+                break;
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(MEM_PWR_POLL_US).as_instant())
+                .await;
+        }
+        if !on {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 MPCC {} OGAM memory did not power on",
+                self.instance
+            );
+        }
+        // mpc3_configure_ogam_lut: all channels, host access to `next`.
+        self.update(at(OGAM_LUT_CONTROL), 0x47, 7 | next << 6)?;
+        self.update(at(OGAM_LUT_INDEX), 0x1ff, 0)?;
+        let ram = if next == 0 { OGAM_RAMA } else { OGAM_RAMB };
+        // cm_helper_program_gamcor_xfer_func's order.
+        for (c, &start) in o.start.iter().enumerate() {
+            self.update(at(ram + c as u64), u32::MAX, start)?;
+        }
+        for (c, &slope) in o.start_slope.iter().enumerate() {
+            self.update(at(ram + RAM_START_SLOPE + c as u64), u32::MAX, slope)?;
+        }
+        // END_CNTL1 then END_CNTL2 of B, G and R (interleaved registers).
+        for (c, &base) in o.end_base.iter().enumerate() {
+            self.update(at(ram + RAM_END + 2 * c as u64), u32::MAX, base)?;
+        }
+        for (c, &end) in o.end.iter().enumerate() {
+            self.update(at(ram + RAM_END + 2 * c as u64 + 1), u32::MAX, end)?;
+        }
+        for (i, &region) in o.regions.iter().enumerate() {
+            self.update(at(ram + RAM_REGIONS + i as u64), u32::MAX, region)?;
+        }
+        // mpc3_program_ogam_pwl: one pass when the channels agree, else red,
+        // green and blue each under its write mask from index 0.
+        let data = at(OGAM_LUT_DATA);
+        if o.lut[0] == o.lut[1] && o.lut[1] == o.lut[2] {
+            self.lut_words(data, &o.lut[0])?;
+        } else {
+            for (c, mask) in [4u32, 2, 1].into_iter().enumerate() {
+                if c > 0 {
+                    self.update(at(OGAM_LUT_INDEX), 0x1ff, 0)?;
+                }
+                self.update(at(OGAM_LUT_CONTROL), 7, mask)?;
+                self.lut_words(data, &o.lut[c])?;
+            }
+        }
+        self.update(at(MPCC_OGAM_CONTROL), 4, next << 2)?;
+        Ok(Some(next as u8))
+    }
     /// Program the output formatter. Truncation and dithering stay off, so the
     /// formatter passes the plane's depth through untouched.
     fn opp_program(&mut self, encoding: Encoding, width: u32, height: u32) -> Result<(), Error> {
@@ -1072,7 +1306,7 @@ impl Dpp {
                     base: profile.bank(
                         gpu,
                         2, // linux-lit: 2=mmDPP_TOP0_DPP_CONTROL_BASE_IDX
-                        (CM_CONTROL + u64::from(profile.pipes() - 1) * DPP_STRIDE) as u32,
+                        (CM_MEM_PWR_CTRL + u64::from(profile.pipes() - 1) * DPP_STRIDE) as u32,
                     )?,
                 },
                 authority,
@@ -1093,6 +1327,16 @@ impl Dpp {
     /// holds the OTG's pipe-control lock so it latches with the surface.
     pub fn set_scaler(&mut self, data: &ScalerData) -> Result<(), Error> {
         self.0.dscl_set_scaler(data, &mut self.1)
+    }
+    /// `dcn30_set_input_transfer_func` on this DPP: the PRE_DEGAM ROM and
+    /// the GAMCOR PWL of a CRTC DEGAMMA_LUT, or both bypassed. Returns the
+    /// GAMCOR RAM bank now selected. DCN3.0 only.
+    pub fn program_input_tf(
+        &mut self,
+        pre_degam: PreDegam,
+        degamma: Option<&OgamProgram>,
+    ) -> Result<Option<u8>, Error> {
+        self.0.dpp_program_input_tf(pre_degam, degamma)
     }
 }
 
@@ -1178,6 +1422,20 @@ impl Mpc {
     /// primary's MPCC — the bottom of an overlay tree — never the slave's.
     pub fn set_bg_color(&mut self, rgb: [u16; 3]) -> Result<(), Error> {
         self.0.mpc_set_bg_color(rgb)
+    }
+    /// `dcn30_program_gamut_remap` on this MPCC: the CTM's coefficient
+    /// set, or bypass. Returns the set now selected. DCN3.0 only.
+    pub fn program_gamut(
+        &mut self,
+        gamut: Option<&GamutProgram>,
+    ) -> Result<Option<(u8, bool)>, Error> {
+        self.0.mpc_program_gamut(gamut)
+    }
+    /// `mpc3_set_output_gamma` on this MPCC: the GAMMA_LUT's PWL into the
+    /// RAM bank not in use, then that bank selected; bypass without one.
+    /// Returns the bank now selected. DCN3.0 only.
+    pub async fn program_ogam(&mut self, ogam: Option<&OgamProgram>) -> Result<Option<u8>, Error> {
+        self.0.mpc_program_ogam(ogam).await
     }
     /// Park the combiner so neither the DPP nor the OPP is still routed.
     pub fn release(&mut self, opp: u8) -> Result<(), Error> {

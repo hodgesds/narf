@@ -201,12 +201,15 @@ pub fn console_pipe() -> u8 {
         crate::amdgpu_navi48_platform::console_pipe()
     }
 }
-/// A CRTC's committed CTM and GAMMA_LUT blob bytes (None: the property is
-/// clear), as DRM hands amdgpu_dm a color_mgmt_changed CRTC state.
+/// A CRTC's committed CTM, GAMMA_LUT and DEGAMMA_LUT blob bytes (None: the
+/// property is clear), as DRM hands amdgpu_dm a color_mgmt_changed CRTC
+/// state. Navi48 leaves `degamma_lut` None: DCN 4.0.1 publishes no
+/// DEGAMMA_LUT.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CrtcColorRequest {
     pub ctm: Option<alloc::vec::Vec<u8>>,
     pub gamma_lut: Option<alloc::vec::Vec<u8>>,
+    pub degamma_lut: Option<alloc::vec::Vec<u8>>,
 }
 /// A connector's committed "Colorspace" and HDR_OUTPUT_METADATA bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,9 +219,12 @@ pub struct ConnectorColorRequest {
     pub colorspace: u32,
     pub hdr_output_metadata: Option<alloc::vec::Vec<u8>>,
 }
-/// CRTC CTM / GAMMA_LUT. Only Navi48 attaches them.
+/// CRTC CTM / GAMMA_LUT / DEGAMMA_LUT: Navi48 attaches CTM and GAMMA_LUT,
+/// Navi22 all three.
 pub fn request_crtc_color(display: u8, request: CrtcColorRequest) {
-    if !navi22() {
+    if navi22() {
+        crate::amdgpu_navi22_kms::request_crtc_color(display, request)
+    } else {
         crate::amdgpu_navi48_platform::request_crtc_color(display, request)
     }
 }

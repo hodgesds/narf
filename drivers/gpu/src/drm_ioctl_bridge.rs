@@ -3151,10 +3151,12 @@ const BROADCAST_RGB_ENUMS: EnumEntries = [(0, b"Automatic"), (1, b"Full"), (2, b
 /// prop_vrr_enabled): ranges 0..1, the latter settable and not ATOMIC-only.
 const VRR_CAPABLE_PROP_ID: u32 = 0x62;
 const CRTC_VRR_ENABLED_PROP_ID: u32 = 0x63;
-/// amdgpu_dm's CRTC color management on DCN 4.0.1:
+/// amdgpu_dm's CRTC color management: on DCN 4.0.1,
 /// `drm_crtc_enable_color_mgmt(crtc, 0, true, MAX_COLOR_LUT_ENTRIES)`
 /// attaches "CTM", "GAMMA_LUT" and the immutable "GAMMA_LUT_SIZE" (no
-/// DEGAMMA_LUT: amdgpu_dm_crtc_init leaves it off DCN_VERSION_4_01).
+/// DEGAMMA_LUT: amdgpu_dm_crtc_init leaves it off DCN_VERSION_4_01); on
+/// DCN 3.0, `drm_crtc_enable_color_mgmt(crtc, 4096, true, 4096)` attaches
+/// "DEGAMMA_LUT" and the immutable "DEGAMMA_LUT_SIZE" too.
 const CRTC_CTM_PROP_ID: u32 = 0x64;
 const CRTC_GAMMA_LUT_PROP_ID: u32 = 0x65;
 const CRTC_GAMMA_LUT_SIZE_PROP_ID: u32 = 0x66;
@@ -3787,6 +3789,23 @@ fn crtc_color_properties(card: &crate::drm::card::Card, crtc: u32) -> (Vec<u32>,
                 card.intel_lut_sizes(crtc).expect("Intel color profile").1 as u64,
             ],
         )
+    } else if color.degamma_size > 0 {
+        (
+            vec![
+                CRTC_CTM_PROP_ID,
+                CRTC_GAMMA_LUT_PROP_ID,
+                CRTC_GAMMA_LUT_SIZE_PROP_ID,
+                CRTC_DEGAMMA_LUT_PROP_ID,
+                CRTC_DEGAMMA_LUT_SIZE_PROP_ID,
+            ],
+            vec![
+                u64::from(color.ctm),
+                u64::from(color.gamma_lut),
+                GAMMA_LUT_SIZE,
+                u64::from(color.degamma_lut),
+                u64::from(color.degamma_size),
+            ],
+        )
     } else {
         (
             vec![
@@ -3840,22 +3859,38 @@ fn crtc_color_property(
         return Err(invalid_at(line!()));
     }
     if prop == CRTC_DEGAMMA_LUT_PROP_ID {
-        if !card.intel_color(crtc) {
+        if card.intel_color(crtc) {
+            let id = blob_value(
+                card,
+                value,
+                Some(
+                    card.intel_lut_sizes(crtc).ok_or(invalid_at(line!()))?.1 * COLOR_LUT_ENTRY_SIZE,
+                ),
+                None,
+            )?;
+            #[cfg(feature = "intel")]
+            if id != 0 {
+                crate::intel_gpu_color::DegammaLut::decode_profile(
+                    card.property_blob(id).ok_or(invalid_at(line!()))?,
+                    card.intel_lut_profile(),
+                )?;
+            }
+            change.degamma_lut = Some(id);
+            return Ok(true);
+        }
+        // amdgpu_dm_verify_lut_sizes: a DCN 3.0 DEGAMMA_LUT is exactly
+        // its published size (4096 entries); 0 means the CRTC publishes
+        // no DEGAMMA_LUT at all.
+        let size = card.crtc_color(crtc).map_or(0, |c| c.degamma_size);
+        if size == 0 {
             return Err(invalid_at(line!()));
         }
         let id = blob_value(
             card,
             value,
-            Some(card.intel_lut_sizes(crtc).ok_or(invalid_at(line!()))?.1 * COLOR_LUT_ENTRY_SIZE),
+            Some(usize::from(size) * COLOR_LUT_ENTRY_SIZE),
             None,
         )?;
-        #[cfg(feature = "intel")]
-        if id != 0 {
-            crate::intel_gpu_color::DegammaLut::decode_profile(
-                card.property_blob(id).ok_or(invalid_at(line!()))?,
-                card.intel_lut_profile(),
-            )?;
-        }
         change.degamma_lut = Some(id);
         return Ok(true);
     }
@@ -3879,9 +3914,9 @@ fn crtc_color_property(
 }
 
 /// Commit a CRTC's color change: the CRTC reports the new blobs (DRM's
-/// color_mgmt_changed). Returns the native display and the committed CTM
-/// and GAMMA_LUT bytes to program, which the caller requests after
-/// releasing the card lock; None when nothing changed.
+/// color_mgmt_changed). Returns the native display and the committed CTM,
+/// GAMMA_LUT and DEGAMMA_LUT bytes to program, which the caller requests
+/// after releasing the card lock; None when nothing changed.
 fn apply_crtc_color(
     card_index: u32,
     card: &mut crate::drm::card::Card,
@@ -3889,7 +3924,7 @@ fn apply_crtc_color(
     change: CrtcColorChange,
 ) -> Option<(u8, CrtcColorRequest)> {
     let color = card.crtc_color.iter_mut().find(|c| c.crtc == crtc)?;
-    let before = (color.ctm, color.gamma_lut);
+    let before = (color.ctm, color.gamma_lut, color.degamma_lut);
     if let Some(id) = change.ctm {
         color.ctm = id;
     }
@@ -3899,9 +3934,9 @@ fn apply_crtc_color(
     if let Some(id) = change.degamma_lut {
         color.degamma_lut = id;
     }
-    let (ctm, gamma_lut) = (color.ctm, color.gamma_lut);
+    let (ctm, gamma_lut, degamma_lut) = (color.ctm, color.gamma_lut, color.degamma_lut);
     card.collect_blobs();
-    if (ctm, gamma_lut) == before {
+    if (ctm, gamma_lut, degamma_lut) == before {
         return None;
     }
     // The committed state above is generic DRM state; turning it
@@ -3916,6 +3951,7 @@ fn apply_crtc_color(
         let request = crate::amdgpu_native_kms::CrtcColorRequest {
             ctm: bytes(ctm),
             gamma_lut: bytes(gamma_lut),
+            degamma_lut: bytes(degamma_lut),
         };
         (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
             .then(|| crate::amdgpu_native_kms::crtc_display(crtc))

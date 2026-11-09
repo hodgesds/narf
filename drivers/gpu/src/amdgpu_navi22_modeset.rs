@@ -44,6 +44,7 @@ use crate::{
     amdgpu::AmdGpu,
     amdgpu_dcn30_audio::{Audio, AudioStream},
     amdgpu_dcn30_clk::{Clock, ClockManager},
+    amdgpu_dcn30_color::{ColorProgram, PreDegam},
     amdgpu_dcn30_dp::{self as dp, Aux, Depth},
     amdgpu_dcn30_dp_link as dp_link,
     amdgpu_dcn30_hdmi::{self as hdmi, DigMode, Hdmi},
@@ -62,7 +63,7 @@ use crate::{
     amdgpu_reg_window::Window,
     amdgpu_vram::{Pool, Reservation},
 };
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{rc::Rc, sync::Arc, vec::Vec};
 use core::{cell::RefCell, future::Future};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
@@ -920,6 +921,9 @@ pub struct Pipeline {
     /// The DP FreeSync state `configure_dp_vrr` last committed, as
     /// `hdmi_vrr` is for HDMI.
     dp_vrr: Option<(Option<crate::amdgpu_freesync::VrrRange>, bool)>,
+    /// The CRTC color program last programmed on this pipe's DPP and MPCC
+    /// (None: bypass, as the light path leaves it).
+    color: Option<Arc<ColorProgram>>,
     /// ODM 2:1 ([`hdmi_plan`]): the secondary pipe's front end and the
     /// plane with both slices.
     slice: Option<Slice>,
@@ -1044,6 +1048,7 @@ impl Pipeline {
                 dp_format: DpFormat::DEFAULT,
                 hdmi_vrr: None,
                 dp_vrr: None,
+                color: None,
                 slice: None,
                 odm: None,
                 plane: None,
@@ -2623,6 +2628,45 @@ impl Pipeline {
         self.hdmi = Some(stream);
         self.hdmi_settings = settings;
         Ok(())
+    }
+    /// Program the CRTC color on the running pipe's DPP and MPCC, in
+    /// dcn30_program_pipe's order (gamut remap, input then output
+    /// transfer function), and record it; the ODM secondary's DPP and
+    /// MPCC take the same program (each pipe's MPCC is its own top
+    /// layer). A live update latches with the next VUPDATE through the
+    /// double-buffered selections. Records nothing on failure: the
+    /// monitor retries or relights.
+    pub async fn set_color(&mut self, program: Option<Arc<ColorProgram>>) -> Result<(), Error> {
+        if self.state != State::At(Step::Running) {
+            return Err(Error::Invalid);
+        }
+        let (pre_degam, degamma, gamut, ogam) = match &program {
+            Some(p) => (
+                if p.pre_degam_srgb {
+                    PreDegam::Srgb
+                } else {
+                    PreDegam::Bypass
+                },
+                p.degamma.as_ref(),
+                p.gamut.as_ref(),
+                p.ogam.as_ref(),
+            ),
+            None => (PreDegam::Bypass, None, None, None),
+        };
+        self.mpc.program_gamut(gamut)?;
+        self.dpp.program_input_tf(pre_degam, degamma)?;
+        self.mpc.program_ogam(ogam).await?;
+        if let Some(slice) = self.slice.as_mut() {
+            slice.mpc.program_gamut(gamut)?;
+            slice.dpp.program_input_tf(pre_degam, degamma)?;
+            slice.mpc.program_ogam(ogam).await?;
+        }
+        self.color = program;
+        Ok(())
+    }
+    /// The CRTC color program last programmed on this pipe.
+    pub fn color(&self) -> Option<Arc<ColorProgram>> {
+        self.color.clone()
     }
     /// Connector state captured before enable; requests during enable are
     /// left pending for the monitor's next convergence pass.
