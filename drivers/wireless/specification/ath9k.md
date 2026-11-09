@@ -2098,7 +2098,7 @@ chain masks (`ar9003_hw_set_chain_masks`, APM-reduced selfgen), `TX_CL_CAL`
 from the INI `AR_PHY_CL_CAL_ENABLE` fact sets `AR_PHY_CL_CAL_CTL` and
 forces the AGC calibration, `TX_IQ_CAL` programs the
 `AR_PHY_TX_IQCAL_CONTROL_1` `DELPT` 32 field (without
-`TX_IQ_ON_AGC_CAL`, which is `AR_SREV_9485_OR_LATER`, Linux never runs
+`TX_IQ_ON_AGC_CAL`, Linux never runs
 `ar9003_hw_tx_iq_cal_post_proc` or `_reload` on AR9300), the carrier-leak
 bracket (PHY inactive, 5 µs, `RX_DELAY_DELAY`, PHY active; INI delay
 restored after), the AGC `CAL` poll for `AH_WAIT_TIMEOUT`, the
@@ -2107,7 +2107,23 @@ whatever the poll returned), the `CLC_SUCCESS` sample of
 `ar9003_hw_cl_cal_post_proc`, runtime chain masks and
 `ar9003_hw_init_cal_common` (IQ mismatch calibration started with
 `PER_MAX_LOG_COUNT`). An AGC timeout fails the attempt (`ath9k_hw_reset`
-`-EIO`). `Periodic::start` is the reset tail's `ath9k_hw_loadnf`
+`-EIO`). The per-chip branches of `ar9003_hw_init_cal_settings`
+(`ar9003_calib.c:321-323`): `TX_IQ_CAL` is `AR_SREV_9300_20_OR_LATER`
+(every modeled chip) and `TX_IQ_ON_AGC_CAL` is `AR_SREV_9485_OR_LATER`
+non-9340 (AR9485, AR9462, AR9565); on those chips `run` sets
+`AR_PHY_TX_IQCAL_CONTROL_0` `ENABLE_TXIQ_CAL` and runs
+`ar9003_hw_tx_iq_cal_post_proc` after the AGC calibration — the
+chan-info reads, `ar9003_hw_calc_iq_corr` (with `ar9003_hw_solve_iq_cal`
+and `ar9003_hw_find_mag_approx`), `ar9003_hw_tx_iq_cal_outlier_detection`
+(`:901`: the `CORR_COEFF_B1/B2` table only when not AR9485) and the
+`TXIQCAL_DONE` state carried in the report, which a fast channel change
+would `ar9003_hw_tx_iq_cal_reload` (`:1162`: same not-9485 table). The
+AR9485 TX IQCAL register map splits from the other parts
+(`TX_IQCAL_CONTROL_0` 0xa5c4, `CONTROL_1` 0xa5c8, `STATUS_B0` 0xa5f0,
+`CORR_COEFF_B0` 0xa5d0, against 0xa644/0xa648/0xa68c/0xa650). Not ported:
+the AR9550 three-pass `ar955x_tx_iq_cal_median` (no AR9550 is modeled)
+and `ar9003_hw_dynamic_osdac_selection` with its `ar9003_hw_tx_iq_cal`
+caller. `Periodic::start` is the reset tail's `ath9k_hw_loadnf`
 (result ignored as Linux) + `ath9k_hw_start_nfcal(ah, true)`;
 `Periodic::tick` is `ath_ani_calibrate` without ANI over
 `ar9003_hw_calibrate`: the one-entry circular IQ list (no AR9003
@@ -2115,7 +2131,10 @@ calibration timeout; `ar9003_hw_iqcal_collect` accumulates the
 `ah->txchainmask` chains of `AR_PHY_CAL_MEAS_0/1/2`,
 `ar9003_hw_iqcalibrate` over `numChains` with the `> 0x80000000` sign
 test, ±63 clamps, 7-bit `AR_PHY_RX_IQCAL_CORR_B0/1/2` fields and the
-chain-0 enable), the 20 min `ath9k_hw_reset_calvalid` restart, and on
+chain-0 enable — and on AR9565 a saturated (±63) coefficient aborts the
+whole calibration, `:273`, with no write and no enable, while the
+calibration is still marked done), the 20 min
+`ath9k_hw_reset_calvalid` restart, and on
 the 30 s long calibration `ath9k_hw_getnf` (`ar9003_hw_do_getnf` over
 `AR_PHY_CCA_0/1/2`, `ath9k_hw_nf_sanitize` with the AR9300 limits
 -110/-125/-60 (2 GHz) and -115/-125/-60 (5 GHz), the five-entry history),
@@ -2128,7 +2147,12 @@ band's value the previous `ath9k_hw_apply_txpower` left); the
 `caldata->tx_clcal` copy is not kept (only fast channel change, not
 ported, would reload it). Smokes (written, not executed):
 `smoke_ath9k_ar9300_init_and_periodic_calibration`,
-`smoke_ath9k_ar9300_calibration_refusals`.
+`smoke_ath9k_ar9300_calibration_refusals`,
+`smoke_ath9k_ar9003_tx_iq_enabled_cals`,
+`smoke_ath9k_ar9565_tx_iq_cal_post_proc`,
+`smoke_ath9k_ar9485_tx_iq_cal_post_proc`,
+`smoke_ath9k_ar9003_tx_iq_cal_outlier_and_reload`,
+`smoke_ath9k_ar9565_rx_iq_saturation_abort`.
 
 AR9300 signed records (step 5a, format only). `admission::Facts::new_ar9300`
 keys the 128-byte `N93A` v1 record (same layout as `N87A`/`N80A`) to one

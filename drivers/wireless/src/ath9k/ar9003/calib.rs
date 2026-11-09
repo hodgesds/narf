@@ -17,12 +17,26 @@
 //! AR9300 initial and periodic calibration of one full-reset 20 MHz
 //! channel: `ar9003_phy.c::ar9003_hw_init_bb`, the PCOEM
 //! `ar9003_calib.c::ar9003_hw_init_cal_pcoem` (AR9300 has neither
-//! `ATH9K_HW_CAP_RTT` nor MCI, and `TX_IQ_ON_AGC_CAL` is
-//! `AR_SREV_9485_OR_LATER`), the `ath9k_hw_reset` tail's
+//! `ATH9K_HW_CAP_RTT` nor MCI), the `ath9k_hw_reset` tail's
 //! `ath9k_hw_loadnf` + `ath9k_hw_start_nfcal(ah, true)`, and the periodic
 //! `ar9003_hw_calibrate` driven by `link.c::ath_ani_calibrate` (ANI is not
 //! part of this owner), with the AR9300 `ar9003_hw_set_nf_limits` limits
 //! and the `ar9300_cca_regs` control-chain NF registers.
+//!
+//! The per-chip branches of `ar9003_hw_init_cal_settings`:
+//! `TX_IQ_CAL` is `AR_SREV_9300_20_OR_LATER` (every modeled chip) and
+//! `TX_IQ_ON_AGC_CAL` is `AR_SREV_9485_OR_LATER` non-9340 (AR9485,
+//! AR9462, AR9565). On `TX_IQ_ON_AGC_CAL` chips `run` sets
+//! `AR_PHY_TX_IQCAL_CONTROL_0` `ENABLE_TXIQ_CAL` and, after the AGC
+//! calibration, runs `ar9003_hw_tx_iq_cal_post_proc` (chan-info reads,
+//! `ar9003_hw_calc_iq_corr`, `ar9003_hw_tx_iq_cal_outlier_detection`
+//! with its not-9485 `CORR_COEFF_B1/B2` table); the saved coefficients
+//! are the `TXIQCAL_DONE` state a fast channel change would
+//! `ar9003_hw_tx_iq_cal_reload` (not-9485 table likewise). On AR9300
+//! neither runs, exactly as before. The periodic RX IQ calibration
+//! aborts on a saturated (±63) coefficient on AR9565
+//! (`ar9003_calib.c:273`); the calibration is still marked done, only
+//! the writes and the `IQCORR_ENABLE` are skipped.
 //!
 //! TX IQ calibration as Linux runs it on AR9300: `ar9003_hw_init_cal_settings`
 //! enables `TX_IQ_CAL`, so `init_cal_pcoem` programs the
@@ -32,9 +46,13 @@
 //! carrier-leak table copy into `caldata->tx_clcal` is not kept:
 //! `ath9k_hw_reset` clears `TXCLCAL_DONE` before every full-reset
 //! `init_cal`, so only the (unported) fast channel change would reload it.
+//!
+//! Not ported: the AR9550 three-pass `ar955x_tx_iq_cal_median` (no
+//! AR9550 is modeled) and `ar9003_hw_dynamic_osdac_selection` with its
+//! `ar9003_hw_tx_iq_cal` caller; both are follow-ups, not silent gaps.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
-use super::{eeprom::Identity, field, phy::Prepared, rmw};
+use super::{eeprom::Identity, field, phy::Prepared, rmw, Revision};
 use crate::ath9k::{
     calibration::{ar9287::Limits, Io},
     identity::{BringUpError, RegisterIo},
@@ -81,10 +99,58 @@ const AR_PHY_CL_CAL_ENABLE: u32 = 0x2;
 const AR_PHY_ANALOG_SWAP: u64 = 0xa34c;
 const AR_PHY_SWAP_ALT_CHAIN: u32 = 0x40;
 const AR_PHY_TX_IQCAL_CONTROL_1: u64 = 0xa648;
+/// `ar9003_phy.h::AR_PHY_TX_IQCAL_CONTROL_1(ah)` on AR9485
+/// (`AR_SM_BASE + 0x3c8`).
+const AR_PHY_TX_IQCAL_CONTROL_1_9485: u64 = 0xa5c8;
 const DELPT_MASK: u32 = 0x01fc_0000;
 const DELPT_SHIFT: u32 = 18;
 /// `ar9003_calib.c` `DELPT`.
 const DELPT: u32 = 32;
+/// `ar9003_phy.h::AR_PHY_TX_IQCAL_CONTROL_0(ah)` (`AR_SM_BASE + 0x444`,
+/// `0x3c4` on AR9485) and its `ENABLE_TXIQ_CAL` bit.
+const AR_PHY_TX_IQCAL_CONTROL_0: u64 = 0xa644;
+const AR_PHY_TX_IQCAL_CONTROL_0_9485: u64 = 0xa5c4;
+const TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL: u32 = 0x8000_0000;
+/// `ar9003_phy.h::AR_PHY_TX_IQCAL_STATUS_B{0,1,2}(ah)` (`AR_SM_BASE` +
+/// `0x48c`, `0x3f0` on AR9485; `AR_SM1_BASE`/`AR_SM2_BASE` + `0x48c`),
+/// its `FAILED` bit and the `CALIBRATED_GAINS_0` field.
+const AR_PHY_TX_IQCAL_STATUS_B0: u64 = 0xa68c;
+const AR_PHY_TX_IQCAL_STATUS_B0_9485: u64 = 0xa5f0;
+const AR_PHY_TX_IQCAL_STATUS_B1: u64 = 0xb68c;
+const AR_PHY_TX_IQCAL_STATUS_B2: u64 = 0xc68c;
+const TX_IQCAL_STATUS_FAILED: u32 = 0x1;
+const CALIBRATED_GAINS_0_MASK: u32 = 0x3e;
+const CALIBRATED_GAINS_0_SHIFT: u32 = 1;
+/// `ar9003_phy.h::AR_PHY_CHAN_INFO_MEMORY(ah)` (`AR_SM_BASE + 0x170`,
+/// non-AR9561), its `TAB_S2_READ` field and the per-chain
+/// `AR_PHY_CHAN_INFO_TAB_{0,1,2}` bases.
+const AR_PHY_CHAN_INFO_MEMORY: u64 = 0xa370;
+const CHAN_INFO_TAB_S2_READ_MASK: u32 = 0x8;
+const CHAN_INFO_TAB_S2_READ_SHIFT: u32 = 3;
+const CHAN_INFO_TAB: [u64; 3] = [0x9b00, 0xab00, 0xbb00];
+/// `ar9003_phy.h::AR_PHY_TX_IQCAL_CORR_COEFF_B{0,1,2}(ah, i)`
+/// (`AR_SM_BASE` + `0x450` + 4i, `0x3d0` + 4i on AR9485 for B0;
+/// `AR_SM1_BASE`/`AR_SM2_BASE` + `0x450` + 4i) and the `00`/`01`
+/// `COEFF_TABLE` fields.
+const AR_PHY_TX_IQCAL_CORR_COEFF_B0: u64 = 0xa650;
+const AR_PHY_TX_IQCAL_CORR_COEFF_B0_9485: u64 = 0xa5d0;
+const AR_PHY_TX_IQCAL_CORR_COEFF_B1: u64 = 0xb650;
+const AR_PHY_TX_IQCAL_CORR_COEFF_B2: u64 = 0xc650;
+const COEFF_00_TABLE_MASK: u32 = 0x0000_3fff;
+const COEFF_00_TABLE_SHIFT: u32 = 0;
+const COEFF_01_TABLE_MASK: u32 = 0x0fff_c000;
+const COEFF_01_TABLE_SHIFT: u32 = 14;
+/// `ar9003_phy.h::AR_PHY_TX_IQCAL_CONTROL_3` (`AR_CHAN_BASE + 0xb0`)
+/// and its `IQCORR_EN` bit; `AR_PHY_RX_IQCAL_CORR_B0`'s
+/// `LOOPBACK_IQCORR_EN` bit.
+const AR_PHY_TX_IQCAL_CONTROL_3: u64 = 0x98b0;
+const TX_IQCAL_CONTROL_3_IQCORR_EN: u32 = 0x8000_0000;
+const RX_IQCAL_CORR_B0_LOOPBACK_IQCORR_EN: u32 = 0x2000_0000;
+/// `hw.h::MAX_IQCAL_MEASUREMENT` and `ar9003_calib.c::MAXIQCAL`.
+const MAX_MEASUREMENT: usize = 8;
+/// `ar9003_calib.c::MAX_MAG_DELTA` / `MAX_PHS_DELTA`.
+const MAX_MAG_DELTA: i32 = 11;
+const MAX_PHS_DELTA: i32 = 10;
 /// `AR_PHY_CAL_MEAS_{0,1,2}(chain)`.
 const CAL_MEAS: [u64; 3] = [0x98c0, 0xa8c0, 0xb8c0];
 /// `AR_PHY_RX_IQCAL_CORR_B{0,1,2}` and its fields.
@@ -255,6 +321,11 @@ pub struct Report {
     pub carrier_leak: Option<bool>,
     /// `ath9k_hw_get_default_nf` per control chain.
     pub default_nf: [i16; 3],
+    /// `ar9003_hw_tx_iq_cal_post_proc`'s saved coefficients
+    /// (`TXIQCAL_DONE`): `Some` only on `TX_IQ_ON_AGC_CAL` chips when the
+    /// post-processing succeeded; `None` on AR9300/AR9580 and when the TX
+    /// IQ calibration failed.
+    pub tx_iq_cal: Option<TxIqCal>,
 }
 
 #[derive(Debug)]
@@ -283,16 +354,19 @@ impl Calibration {
     /// The channel's calibration data is fresh (`TXCLCAL_DONE` and
     /// `TXIQCAL_DONE` clear, as `ath9k_hw_reset` leaves them). The IQ
     /// mismatch calibration is left running (`ar9003_hw_init_cal_common`);
-    /// `Periodic::start` performs the reset tail's NF load.
+    /// `Periodic::start` performs the reset tail's NF load. `revision`
+    /// gates the per-chip branches: `TX_IQ_ON_AGC_CAL` (AR9485, AR9462,
+    /// AR9565) runs the TX IQ post-processing after the AGC calibration.
     ///
     /// # Safety
-    /// Exclusive identified AR9300 directly after `phy::prepare` for
+    /// Exclusive identified AR9003 part directly after `phy::prepare` for
     /// `prepared`. PCI BME off, no published packet DMA, MAC/TX/IRQ parked.
     /// A new attempt requires an independently proved complete reset.
     pub(in crate::ath9k) async unsafe fn run(
         &mut self,
         io: &mut impl Io,
         identity: &Identity,
+        revision: &Revision,
         prepared: &Prepared,
     ) -> Result<Report, BringUpError> {
         if self.state != State::New {
@@ -331,14 +405,32 @@ impl Calibration {
         if prepared.carrier_leak_cal {
             rmw(io, AR_PHY_CL_CAL_CTL, 0, AR_PHY_CL_CAL_ENABLE)?;
         }
-        // TX_IQ_CAL without TX_IQ_ON_AGC_CAL: DELPT only.
-        field(
-            io,
-            AR_PHY_TX_IQCAL_CONTROL_1,
-            DELPT_MASK,
-            DELPT_SHIFT,
-            DELPT,
-        )?;
+        // `ar9003_hw_init_cal_settings` (`:321-323`) + `init_cal_pcoem`:
+        // `TX_IQ_CAL` programs `DELPT`; on `TX_IQ_ON_AGC_CAL` chips the
+        // AGC calibration also runs the TX IQ calibration.
+        let cals = enabled_cals(revision);
+        if cals.tx_iq_cal {
+            field(
+                io,
+                tx_iqcal_control_1(revision.ar9485()),
+                DELPT_MASK,
+                DELPT_SHIFT,
+                DELPT,
+            )?;
+        }
+        let txiqcal_done = if cals.tx_iq_on_agc_cal {
+            // Fresh channel calibration data: `TXIQCAL_DONE` is clear, as
+            // `ath9k_hw_reset` leaves it.
+            rmw(
+                io,
+                tx_iqcal_control_0(revision.ar9485()),
+                0,
+                TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL,
+            )?;
+            true
+        } else {
+            false
+        };
         let clc = read(io, AR_PHY_CL_CAL_CTL)? & AR_PHY_CL_CAL_ENABLE != 0;
         let mut rx_delay = 0;
         if clc {
@@ -365,6 +457,14 @@ impl Calibration {
             // "offset calibration failed to complete": ath9k_hw_reset -EIO.
             return Err(BringUpError::Timeout);
         }
+        // `init_cal_pcoem`: the TX IQ post-processing runs before
+        // `ar9003_hw_cl_cal_post_proc`; a failed TX IQ calibration leaves
+        // no coefficients and the reset continues.
+        let tx_iq_cal = if txiqcal_done {
+            tx_iq_cal_post_proc(io, revision, tx)?
+        } else {
+            None
+        };
         // ar9003_hw_cl_cal_post_proc's CLC_SUCCESS sample.
         let carrier_leak = if prepared.carrier_leak_cal {
             Some(read(io, AR_PHY_AGC_CONTROL)? & AGC_CLC_SUCCESS != 0)
@@ -391,11 +491,470 @@ impl Calibration {
             peak_caldac,
             carrier_leak,
             default_nf,
+            tx_iq_cal,
         };
         self.report = Some(report);
         *attempt.state = State::Ready;
         Ok(report)
     }
+}
+
+/// `ar9003_hw_init_cal_settings`' `enabled_cals` for this chip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ath9k) struct EnabledCals {
+    pub tx_iq_cal: bool,
+    pub tx_iq_on_agc_cal: bool,
+}
+
+/// `ar9003_hw_init_cal_settings` (`ar9003_calib.c:321-323`): `TX_IQ_CAL`
+/// for `AR_SREV_9300_20_OR_LATER`, and `TX_IQ_ON_AGC_CAL` for
+/// `AR_SREV_9485_OR_LATER` non-9340. Every modeled chip has `TX_IQ_CAL`;
+/// AR9485, AR9462 and AR9565 additionally have `TX_IQ_ON_AGC_CAL`.
+pub(in crate::ath9k) fn enabled_cals(revision: &Revision) -> EnabledCals {
+    let tx_iq_cal = revision.ar9300_20_or_later();
+    EnabledCals {
+        tx_iq_cal,
+        tx_iq_on_agc_cal: tx_iq_cal && revision.ar9485_or_later() && !revision.ar9340(),
+    }
+}
+
+/// `struct ath9k_hw_cal_data`'s TX IQ calibration result
+/// (`hw.h::MAX_IQCAL_MEASUREMENT` x `AR9300_MAX_CHAINS`): the per-chain
+/// measurement counts and correction coefficients
+/// `ar9003_hw_tx_iq_cal_outlier_detection` writes, and
+/// `ar9003_hw_tx_iq_cal_reload` re-applies. `Some` in a `Report` is the
+/// `TXIQCAL_DONE` state `ar9003_hw_tx_iq_cal_outlier_detection` sets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::ath9k) struct TxIqCal {
+    pub num_measures: [usize; 3],
+    pub tx_corr_coeff: [[i32; 3]; MAX_MEASUREMENT],
+}
+
+/// `ar9003_phy.h::AR_PHY_TX_IQCAL_CONTROL_1(ah)`.
+fn tx_iqcal_control_1(ar9485: bool) -> u64 {
+    if ar9485 {
+        AR_PHY_TX_IQCAL_CONTROL_1_9485
+    } else {
+        AR_PHY_TX_IQCAL_CONTROL_1
+    }
+}
+
+/// `ar9003_phy.h::AR_PHY_TX_IQCAL_CONTROL_0(ah)`.
+fn tx_iqcal_control_0(ar9485: bool) -> u64 {
+    if ar9485 {
+        AR_PHY_TX_IQCAL_CONTROL_0_9485
+    } else {
+        AR_PHY_TX_IQCAL_CONTROL_0
+    }
+}
+
+/// `ar9003_phy.h::AR_PHY_TX_IQCAL_STATUS_B{0,1,2}(ah)` for `chain`.
+fn tx_iqcal_status(chain: usize, ar9485: bool) -> u64 {
+    match chain {
+        0 => {
+            if ar9485 {
+                AR_PHY_TX_IQCAL_STATUS_B0_9485
+            } else {
+                AR_PHY_TX_IQCAL_STATUS_B0
+            }
+        }
+        1 => AR_PHY_TX_IQCAL_STATUS_B1,
+        _ => AR_PHY_TX_IQCAL_STATUS_B2,
+    }
+}
+
+/// `ar9003_phy.h::AR_PHY_TX_IQCAL_CORR_COEFF_B{0,1,2}(ah, i)` for `chain`
+/// and measurement pair `i`.
+fn tx_iqcal_corr_coeff(chain: usize, ar9485: bool, i: usize) -> u64 {
+    let base = match chain {
+        0 => {
+            if ar9485 {
+                AR_PHY_TX_IQCAL_CORR_COEFF_B0_9485
+            } else {
+                AR_PHY_TX_IQCAL_CORR_COEFF_B0
+            }
+        }
+        1 => AR_PHY_TX_IQCAL_CORR_COEFF_B1,
+        _ => AR_PHY_TX_IQCAL_CORR_COEFF_B2,
+    };
+    base + (i as u64) * 4
+}
+
+/// `ar9003_hw_find_mag_approx`: `max - max/32 + min/8 + min/4`.
+fn find_mag_approx(in_re: i64, in_im: i64) -> i64 {
+    let (max_abs, min_abs) = if in_re.abs() > in_im.abs() {
+        (in_re.abs(), in_im.abs())
+    } else {
+        (in_im.abs(), in_re.abs())
+    };
+    max_abs - max_abs / 32 + min_abs / 8 + min_abs / 4
+}
+
+/// `ar9003_hw_solve_iq_cal`: the 4x4 loopback IQ calibration solve.
+/// Linux computes in `s32`; the products can exceed `s32` for
+/// out-of-range inputs, so the port widens the intermediates to `i64` —
+/// identical results for every in-range input, no wrap on any other.
+fn solve_iq_cal(
+    sin_2phi_1: i64,
+    cos_2phi_1: i64,
+    sin_2phi_2: i64,
+    cos_2phi_2: i64,
+    mag_a0_d0: i64,
+    phs_a0_d0: i64,
+    mag_a1_d0: i64,
+    phs_a1_d0: i64,
+) -> Option<[i64; 4]> {
+    const RESULT_SHIFT: i64 = 1 << 15;
+    let f1 = cos_2phi_1 - cos_2phi_2;
+    let f3 = sin_2phi_1 - sin_2phi_2;
+    let f2 = ((f1 >> 3) * (f1 >> 3) + (f3 >> 3) * (f3 >> 3)) >> 9;
+    if f2 == 0 {
+        return None;
+    }
+    let mag_tx = (f1 * (mag_a0_d0 - mag_a1_d0) + f3 * (phs_a0_d0 - phs_a1_d0)) / f2;
+    let phs_tx = (f3 * (-mag_a0_d0 + mag_a1_d0) + f1 * (phs_a0_d0 - phs_a1_d0)) / f2;
+    let mag_rx = mag_a0_d0 - (cos_2phi_1 * mag_tx + sin_2phi_1 * phs_tx) / RESULT_SHIFT;
+    let phs_rx = phs_a0_d0 + (sin_2phi_1 * mag_tx - cos_2phi_1 * phs_tx) / RESULT_SHIFT;
+    Some([mag_tx, phs_tx, mag_rx, phs_rx])
+}
+
+/// Clamp a TX IQ correction factor to ±63 (`ar9003_hw_calc_iq_corr`).
+fn clamp63(value: i64) -> i32 {
+    value.clamp(-63, 63) as i32
+}
+
+/// `ar9003_hw_calc_iq_corr`: the TX/RX IQ correction factors for one
+/// chain from six chan-info words. Returns `[tx, rx]`, or `None` on a
+/// failed calculation. The unpacking is Linux's, including the
+/// asymmetric detail that `i2_p_q2_a0_d1` is not sign-extended.
+fn calc_iq_corr(iq_res: &[i32; 6]) -> Option<[i32; 2]> {
+    const RES_SCALE: i64 = 1 << 15;
+    const DELPT_SHIFT: i64 = 1 << 8;
+    /// `calc_iq_corr`'s 12-bit sign extension (`> 0x800` wraps negative).
+    fn extend(value: i64) -> i64 {
+        if value > 0x800 {
+            -((0xfff - value) + 1)
+        } else {
+            value
+        }
+    }
+    let i2_m_q2_a0_d0 = extend(i64::from(iq_res[0] & 0xfff));
+    let i2_p_q2_a0_d0 = extend(i64::from((iq_res[0] >> 12) & 0xfff));
+    let iq_corr_a0_d0 = extend(i64::from(
+        ((iq_res[0] >> 24) & 0xff) + ((iq_res[1] & 0xf) << 8),
+    ));
+    let i2_m_q2_a0_d1 = extend(i64::from((iq_res[1] >> 4) & 0xfff));
+    let i2_p_q2_a0_d1 = i64::from(iq_res[2] & 0xfff);
+    let iq_corr_a0_d1 = extend(i64::from((iq_res[2] >> 12) & 0xfff));
+    let i2_m_q2_a1_d0 = extend(i64::from(
+        ((iq_res[2] >> 24) & 0xff) + ((iq_res[3] & 0xf) << 8),
+    ));
+    let i2_p_q2_a1_d0 = extend(i64::from((iq_res[3] >> 4) & 0xfff));
+    let iq_corr_a1_d0 = extend(i64::from(iq_res[4] & 0xfff));
+    let i2_m_q2_a1_d1 = extend(i64::from((iq_res[4] >> 12) & 0xfff));
+    let i2_p_q2_a1_d1 = extend(i64::from(
+        ((iq_res[4] >> 24) & 0xff) + ((iq_res[5] & 0xf) << 8),
+    ));
+    let iq_corr_a1_d1 = extend(i64::from((iq_res[5] >> 4) & 0xfff));
+    if i2_p_q2_a0_d0 == 0 || i2_p_q2_a0_d1 == 0 || i2_p_q2_a1_d0 == 0 || i2_p_q2_a1_d1 == 0 {
+        return None;
+    }
+    if i2_p_q2_a0_d0 < 1024
+        || i2_p_q2_a0_d0 > 2047
+        || i2_p_q2_a1_d0 < 0
+        || i2_p_q2_a1_d1 < 0
+        || i2_p_q2_a0_d0 <= i2_m_q2_a0_d0
+        || i2_p_q2_a0_d0 <= iq_corr_a0_d0
+        || i2_p_q2_a0_d1 <= i2_m_q2_a0_d1
+        || i2_p_q2_a0_d1 <= iq_corr_a0_d1
+        || i2_p_q2_a1_d0 <= i2_m_q2_a1_d0
+        || i2_p_q2_a1_d0 <= iq_corr_a1_d0
+        || i2_p_q2_a1_d1 <= i2_m_q2_a1_d1
+        || i2_p_q2_a1_d1 <= iq_corr_a1_d1
+    {
+        return None;
+    }
+    let mag_a0_d0 = i2_m_q2_a0_d0 * RES_SCALE / i2_p_q2_a0_d0;
+    let phs_a0_d0 = iq_corr_a0_d0 * RES_SCALE / i2_p_q2_a0_d0;
+    let mag_a0_d1 = i2_m_q2_a0_d1 * RES_SCALE / i2_p_q2_a0_d1;
+    let phs_a0_d1 = iq_corr_a0_d1 * RES_SCALE / i2_p_q2_a0_d1;
+    let mag_a1_d0 = i2_m_q2_a1_d0 * RES_SCALE / i2_p_q2_a1_d0;
+    let phs_a1_d0 = iq_corr_a1_d0 * RES_SCALE / i2_p_q2_a1_d0;
+    let mag_a1_d1 = i2_m_q2_a1_d1 * RES_SCALE / i2_p_q2_a1_d1;
+    let phs_a1_d1 = iq_corr_a1_d1 * RES_SCALE / i2_p_q2_a1_d1;
+    let mut sin_2phi_1 = (mag_a0_d0 - mag_a0_d1) * DELPT_SHIFT / i64::from(DELPT);
+    let mut cos_2phi_1 = (phs_a0_d1 - phs_a0_d0) * DELPT_SHIFT / i64::from(DELPT);
+    let mut sin_2phi_2 = (mag_a1_d0 - mag_a1_d1) * DELPT_SHIFT / i64::from(DELPT);
+    let mut cos_2phi_2 = (phs_a1_d1 - phs_a1_d0) * DELPT_SHIFT / i64::from(DELPT);
+    let mag1 = find_mag_approx(cos_2phi_1, sin_2phi_1);
+    let mag2 = find_mag_approx(cos_2phi_2, sin_2phi_2);
+    if mag1 == 0 || mag2 == 0 {
+        return None;
+    }
+    sin_2phi_1 = sin_2phi_1 * RES_SCALE / mag1;
+    cos_2phi_1 = cos_2phi_1 * RES_SCALE / mag1;
+    sin_2phi_2 = sin_2phi_2 * RES_SCALE / mag2;
+    cos_2phi_2 = cos_2phi_2 * RES_SCALE / mag2;
+    let [mag_tx, phs_tx, mag_rx, phs_rx] = solve_iq_cal(
+        sin_2phi_1, cos_2phi_1, sin_2phi_2, cos_2phi_2, mag_a0_d0, phs_a0_d0, mag_a1_d0, phs_a1_d0,
+    )?;
+    if RES_SCALE == mag_tx {
+        return None;
+    }
+    let mag_corr_tx = mag_tx * RES_SCALE / (RES_SCALE - mag_tx);
+    let phs_corr_tx = -phs_tx;
+    let q_q_coff = clamp63(mag_corr_tx * 128 / RES_SCALE);
+    let q_i_coff = clamp63(phs_corr_tx * 256 / RES_SCALE);
+    let tx = q_q_coff * 128 + (0x7f & q_i_coff);
+    if -mag_rx == RES_SCALE {
+        return None;
+    }
+    let mag_corr_rx = -mag_rx * RES_SCALE / (RES_SCALE + mag_rx);
+    let phs_corr_rx = -phs_rx;
+    let q_q_coff = clamp63(mag_corr_rx * 128 / RES_SCALE);
+    let q_i_coff = clamp63(phs_corr_rx * 256 / RES_SCALE);
+    let rx = q_q_coff * 128 + (0x7f & q_i_coff);
+    Some([tx, rx])
+}
+
+/// `ar9003_hw_detect_outlier` for one chain's single-pass (`[0]`)
+/// column: the min/max mismatch, the mean excluding the largest absolute
+/// value, and the outlier replaced by the mean when the spread exceeds
+/// `max_delta`.
+fn detect_outlier(coeff: &mut [i32; MAX_MEASUREMENT], nmeasurement: usize, max_delta: i32) {
+    if nmeasurement == 0 {
+        // Linux reads `mp_coeff[nmeasurement - 1]` here; with no
+        // measurement there is nothing to detect.
+        return;
+    }
+    let mut mp_max = -64;
+    let mut max_idx = 0;
+    let mut mp_min = 63;
+    let mut min_idx = 0;
+    for i in 0..nmeasurement {
+        if coeff[i] > mp_max {
+            mp_max = coeff[i];
+            max_idx = i;
+        } else if coeff[i] < mp_min {
+            mp_min = coeff[i];
+            min_idx = i;
+        }
+    }
+    let mut mp_avg = 0;
+    let mut mp_count = 0;
+    for i in 0..nmeasurement {
+        if coeff[i].abs() < mp_max.abs() || coeff[i].abs() < mp_min.abs() {
+            mp_avg += coeff[i];
+            mp_count += 1;
+        }
+    }
+    if mp_count != 0 {
+        mp_avg /= mp_count;
+    } else {
+        mp_avg = coeff[nmeasurement - 1];
+    }
+    if (mp_max - mp_min).abs() > max_delta {
+        let outlier_idx = if (mp_max - mp_avg).abs() > (mp_min - mp_avg).abs() {
+            max_idx
+        } else {
+            min_idx
+        };
+        coeff[outlier_idx] = mp_avg;
+    }
+}
+
+/// `ar9003_hw_tx_iq_cal_outlier_detection`'s and
+/// `ar9003_hw_tx_iq_cal_reload`'s `tx_corr_coeff` table:
+/// `CORR_COEFF_B0(ah, i)` for measurement pairs, plus `B1`/`B2` only
+/// when not AR9485 (`ar9003_calib.c:901`, `:1162`). Unpopulated entries
+/// are 0, as Linux's `memset` leaves them.
+fn corr_coeff_table(ar9485: bool) -> [[u64; 3]; MAX_MEASUREMENT] {
+    let mut table = [[0u64; 3]; MAX_MEASUREMENT];
+    for i in 0..MAX_MEASUREMENT / 2 {
+        table[i * 2][0] = tx_iqcal_corr_coeff(0, ar9485, i);
+        table[i * 2 + 1][0] = tx_iqcal_corr_coeff(0, ar9485, i);
+        if !ar9485 {
+            table[i * 2][1] = tx_iqcal_corr_coeff(1, ar9485, i);
+            table[i * 2 + 1][1] = tx_iqcal_corr_coeff(1, ar9485, i);
+            table[i * 2][2] = tx_iqcal_corr_coeff(2, ar9485, i);
+            table[i * 2 + 1][2] = tx_iqcal_corr_coeff(2, ar9485, i);
+        }
+    }
+    table
+}
+
+/// `ar9003_hw_tx_iq_cal_outlier_detection` for the single `iqcal_idx == 0`
+/// pass: per-chain outlier detection (skipped on AR9550, which is not
+/// modeled), the `iqc_coeff` table writes and the `TXIQCAL_DONE` state
+/// (`is_reusable` is always true here: no MCI). Also sets
+/// `AR_PHY_TX_IQCAL_CONTROL_3` `IQCORR_EN` and
+/// `AR_PHY_RX_IQCAL_CORR_B0` `LOOPBACK_IQCORR_EN`.
+fn tx_iq_cal_outlier_detection(
+    io: &mut impl RegisterIo,
+    revision: &Revision,
+    tx_chainmask: u8,
+    mag: &mut [[i32; MAX_MEASUREMENT]; 3],
+    phs: &mut [[i32; MAX_MEASUREMENT]; 3],
+) -> Result<TxIqCal, BringUpError> {
+    let table = corr_coeff_table(revision.ar9485());
+    let mut data = TxIqCal::default();
+    for chain in chains(tx_chainmask) {
+        let mut nmeasurement = ((read(io, tx_iqcal_status(0, revision.ar9485()))?
+            & CALIBRATED_GAINS_0_MASK)
+            >> CALIBRATED_GAINS_0_SHIFT) as usize;
+        if nmeasurement > MAX_MEASUREMENT {
+            nmeasurement = MAX_MEASUREMENT;
+        }
+        if nmeasurement > 1 {
+            detect_outlier(&mut mag[chain], nmeasurement, MAX_MAG_DELTA);
+            detect_outlier(&mut phs[chain], nmeasurement, MAX_PHS_DELTA);
+        }
+        for im in 0..nmeasurement {
+            let magnitude = mag[chain][im];
+            let phase = phs[chain][im];
+            let coeff = (phase & 0x7f) | ((magnitude & 0x7f) << 7);
+            let register = table[im][chain];
+            if im % 2 == 0 {
+                field(
+                    io,
+                    register,
+                    COEFF_00_TABLE_MASK,
+                    COEFF_00_TABLE_SHIFT,
+                    coeff as u32,
+                )?;
+            } else {
+                field(
+                    io,
+                    register,
+                    COEFF_01_TABLE_MASK,
+                    COEFF_01_TABLE_SHIFT,
+                    coeff as u32,
+                )?;
+            }
+            data.tx_corr_coeff[im][chain] = coeff;
+        }
+        data.num_measures[chain] = nmeasurement;
+    }
+    rmw(
+        io,
+        AR_PHY_TX_IQCAL_CONTROL_3,
+        0,
+        TX_IQCAL_CONTROL_3_IQCORR_EN,
+    )?;
+    rmw(io, RX_IQCAL_CORR[0], 0, RX_IQCAL_CORR_B0_LOOPBACK_IQCORR_EN)?;
+    Ok(data)
+}
+
+/// `ar9003_hw_tx_iq_cal_post_proc(ah, 0, true)`: the single-pass TX IQ
+/// calibration `ar9003_hw_init_cal_pcoem` runs on a `TX_IQ_ON_AGC_CAL`
+/// chip after the AGC calibration. Returns the saved coefficients
+/// (`TXIQCAL_DONE`), or `None` when the calibration failed — Linux logs
+/// and continues the reset without coefficients. The AR9550 three-pass
+/// median is not implemented (no AR9550 is modeled): `outlier_detect`
+/// stays true, so outlier detection always runs.
+fn tx_iq_cal_post_proc(
+    io: &mut impl RegisterIo,
+    revision: &Revision,
+    tx_chainmask: u8,
+) -> Result<Option<TxIqCal>, BringUpError> {
+    let ar9485 = revision.ar9485();
+    let mut mag = [[0i32; MAX_MEASUREMENT]; 3];
+    let mut phs = [[0i32; MAX_MEASUREMENT]; 3];
+    for chain in chains(tx_chainmask) {
+        let mut nmeasurement = ((read(io, tx_iqcal_status(0, ar9485))? & CALIBRATED_GAINS_0_MASK)
+            >> CALIBRATED_GAINS_0_SHIFT) as usize;
+        if nmeasurement > MAX_MEASUREMENT {
+            nmeasurement = MAX_MEASUREMENT;
+        }
+        for im in 0..nmeasurement {
+            if read(io, tx_iqcal_status(chain, ar9485))? & TX_IQCAL_STATUS_FAILED != 0 {
+                return Ok(None);
+            }
+            let mut iq_res = [0i32; 6];
+            for j in 0..3 {
+                let idx = 2 * j;
+                let offset = (4 * (3 * im + j)) as u64;
+                field(
+                    io,
+                    AR_PHY_CHAN_INFO_MEMORY,
+                    CHAN_INFO_TAB_S2_READ_MASK,
+                    CHAN_INFO_TAB_S2_READ_SHIFT,
+                    0,
+                )?;
+                iq_res[idx] = read(io, CHAN_INFO_TAB[chain] + offset)? as i32;
+                field(
+                    io,
+                    AR_PHY_CHAN_INFO_MEMORY,
+                    CHAN_INFO_TAB_S2_READ_MASK,
+                    CHAN_INFO_TAB_S2_READ_SHIFT,
+                    1,
+                )?;
+                iq_res[idx + 1] = (read(io, CHAN_INFO_TAB[chain] + offset)? & 0xffff) as i32;
+            }
+            let Some(iqc) = calc_iq_corr(&iq_res) else {
+                return Ok(None);
+            };
+            phs[chain][im] = iqc[0] & 0x7f;
+            mag[chain][im] = (iqc[0] >> 7) & 0x7f;
+            if mag[chain][im] > 63 {
+                mag[chain][im] -= 128;
+            }
+            if phs[chain][im] > 63 {
+                phs[chain][im] -= 128;
+            }
+        }
+    }
+    Ok(Some(tx_iq_cal_outlier_detection(
+        io,
+        revision,
+        tx_chainmask,
+        &mut mag,
+        &mut phs,
+    )?))
+}
+
+/// `ar9003_hw_tx_iq_cal_reload`: re-apply saved TX IQ coefficients on a
+/// fast channel change (`TXIQCAL_DONE` set). Only the (unported) fast
+/// channel change calls it; `run` never does. The not-9485 `B1`/`B2`
+/// table is `ar9003_calib.c:1162`.
+pub(in crate::ath9k) fn tx_iq_cal_reload(
+    io: &mut impl RegisterIo,
+    revision: &Revision,
+    tx_chainmask: u8,
+    data: &TxIqCal,
+) -> Result<(), BringUpError> {
+    let table = corr_coeff_table(revision.ar9485());
+    for chain in chains(tx_chainmask) {
+        for im in 0..data.num_measures[chain].min(MAX_MEASUREMENT) {
+            let register = table[im][chain];
+            let coeff = data.tx_corr_coeff[im][chain];
+            if im % 2 == 0 {
+                field(
+                    io,
+                    register,
+                    COEFF_00_TABLE_MASK,
+                    COEFF_00_TABLE_SHIFT,
+                    coeff as u32,
+                )?;
+            } else {
+                field(
+                    io,
+                    register,
+                    COEFF_01_TABLE_MASK,
+                    COEFF_01_TABLE_SHIFT,
+                    coeff as u32,
+                )?;
+            }
+        }
+    }
+    rmw(
+        io,
+        AR_PHY_TX_IQCAL_CONTROL_3,
+        0,
+        TX_IQCAL_CONTROL_3_IQCORR_EN,
+    )?;
+    rmw(io, RX_IQCAL_CORR[0], 0, RX_IQCAL_CORR_B0_LOOPBACK_IQCORR_EN)?;
+    Ok(())
 }
 
 /// `ar9003_hw_setup_calibration(IQ_MISMATCH_CAL)` with
@@ -452,6 +1011,7 @@ pub(in crate::ath9k) struct Tick {
 /// `CalValid`, the IQ list entry and `ah->cal_samples`.
 #[derive(Clone, Debug)]
 pub(in crate::ath9k) struct Periodic {
+    revision: Revision,
     rx_chainmask: u8,
     tx_chainmask: u8,
     limits: Limits,
@@ -476,8 +1036,14 @@ impl Periodic {
     /// `nf_2g`/`nf_5g.cal` the previous `ath9k_hw_apply_txpower` left;
     /// this owner uses the reset channel's own interpolated value, which
     /// is what Linux holds after any earlier reset onto that channel.
-    pub(in crate::ath9k) fn new(report: &Report, totals: IqTotals, now_ms: u64) -> Self {
+    pub(in crate::ath9k) fn new(
+        revision: &Revision,
+        report: &Report,
+        totals: IqTotals,
+        now_ms: u64,
+    ) -> Self {
         Self {
+            revision: *revision,
             rx_chainmask: report.rx_chainmask,
             tx_chainmask: report.tx_chainmask,
             limits: limits(report.five_ghz),
@@ -651,7 +1217,10 @@ impl Periodic {
     }
 
     /// `ar9003_hw_iqcalibrate` over chains `0..num_chains`, then the
-    /// chain-0 `IQCORR_ENABLE`.
+    /// chain-0 `IQCORR_ENABLE`. On AR9565 a saturated (±63) coefficient
+    /// aborts the whole calibration (`ar9003_calib.c:273`): that chain
+    /// and later chains are not written and the enable is skipped — the
+    /// caller still marks the calibration done, as Linux does.
     fn iqcalibrate(
         &mut self,
         io: &mut impl RegisterIo,
@@ -659,15 +1228,31 @@ impl Periodic {
     ) -> Result<[Option<(u8, u8)>; 3], BringUpError> {
         let mut out = [None; 3];
         for (chain, slot) in out.iter_mut().enumerate().take(num_chains) {
-            *slot = iq_coefficients(
+            let Some(coeff) = iq_coefficients(
                 self.totals.power_i[chain],
                 self.totals.power_q[chain],
                 self.totals.correlation[chain] as u32,
-            );
-            if let Some((i, q)) = *slot {
-                field(io, RX_IQCAL_CORR[chain], IQCORR_Q_I_COFF, 7, u32::from(i))?;
-                field(io, RX_IQCAL_CORR[chain], IQCORR_Q_Q_COFF, 0, u32::from(q))?;
+            ) else {
+                continue;
+            };
+            if self.revision.ar9565() && coeff.saturated {
+                return Ok(out);
             }
+            field(
+                io,
+                RX_IQCAL_CORR[chain],
+                IQCORR_Q_I_COFF,
+                7,
+                u32::from(coeff.i),
+            )?;
+            field(
+                io,
+                RX_IQCAL_CORR[chain],
+                IQCORR_Q_Q_COFF,
+                0,
+                u32::from(coeff.q),
+            )?;
+            *slot = Some((coeff.i, coeff.q));
         }
         rmw(io, RX_IQCAL_CORR[0], 0, IQCORR_ENABLE)?;
         Ok(out)
@@ -764,6 +1349,16 @@ impl Periodic {
     }
 }
 
+/// One chain's `ar9003_hw_iqcalibrate` coefficients: the 7-bit fields
+/// and whether either hit the ±63 clamp (on AR9565 a saturated
+/// coefficient aborts the whole calibration, `ar9003_calib.c:273`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ath9k) struct IqCoefficients {
+    pub i: u8,
+    pub q: u8,
+    pub saturated: bool,
+}
+
 /// `ar9003_hw_iqcalibrate` arithmetic for one chain, in Linux's u32/int32
 /// types: the `> 0x80000000` sign test, both denominators non-zero,
 /// `iCoff`/`qCoff` clamped to ±63, `iCoff` negated for a non-negative
@@ -772,7 +1367,7 @@ pub(in crate::ath9k) fn iq_coefficients(
     power_i: u32,
     power_q: u32,
     correlation: u32,
-) -> Option<(u8, u8)> {
+) -> Option<IqCoefficients> {
     let (correlation, negative) = if correlation > 0x8000_0000 {
         ((0xffff_ffff - correlation) + 1, true)
     } else {
@@ -790,7 +1385,12 @@ pub(in crate::ath9k) fn iq_coefficients(
         i_coff = -i_coff;
     }
     let q_coff = q_coff.clamp(-63, 63);
-    Some(((i_coff & 0x7f) as u8, (q_coff & 0x7f) as u8))
+    let saturated = i_coff == 63 || i_coff == -63 || q_coff == 63 || q_coff == -63;
+    Some(IqCoefficients {
+        i: (i_coff & 0x7f) as u8,
+        q: (q_coff & 0x7f) as u8,
+        saturated,
+    })
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
