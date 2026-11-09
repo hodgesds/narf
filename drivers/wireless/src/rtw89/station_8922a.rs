@@ -39,8 +39,21 @@
 //!   downgraded — an EHT peer belongs on [`admit`]. The
 //!   legacy facet carries no EHT caps by construction, so a
 //!   legacy record can never program EHT RA or TXWD fields.
-//! - Single-link. MLO multi-link (chip supports 2 links) is a
-//!   remainder; admission carries one link's parameters.
+//! - Multi-link (MLO) is admitted by [`admit_mld`] as an
+//!   [`MldStation`]: one MLD address, one shared AID and port,
+//!   up to `SUPPORT_LINK_NUM` (2) links, each with its own
+//!   link address, channel, per-link MACID, per-link G7
+//!   default + assoc CCTL, and per-link BA-CAM map. The
+//!   per-link MACIDs are strided off one pool base
+//!   (`base + index * MLD_MACID_STRIDE`, stride 16), the
+//!   BA-CAM H2C is built from the designated link (first
+//!   link added) with MLD_EN set and BAND_SEL from that
+//!   link's MAC index, and links can be added
+//!   ([`MldStation::add_link`]) or removed one at a time
+//!   ([`MldStation::remove_link`]) with the MLD surviving
+//!   on the remaining link. See the "MLO model" section
+//!   below for the Linux grounding and the deliberate
+//!   differences from it.
 //! - 2.4/5 GHz only, plus 6 GHz at 20 MHz with a 6 GHz power
 //!   program. A 6 GHz request must carry [`SixGhzAdmission`]
 //!   (the AP's client power type + the regd.c TPE constraint from
@@ -58,7 +71,9 @@
 //!   consumes. The register-level program itself (by-rate /
 //!   limit / limit-RU pages on BE registers, shape, diff, ref,
 //!   SAR-diff) is a follow-up: it needs the firmware TXPWR
-//!   elements container this owner does not hold.
+//!   elements container this owner does not hold. The program
+//!   applies per link: each link of an MLD request carries its
+//!   own admission, validated by [`validate`].
 //! - 320 MHz refused (`WidthNotAdvertised`): the width is
 //!   programmed by the EHT lane but deliberately NOT advertised
 //!   (chip bandwidths top at 160 MHz, `rtw8922a.c:3263..3266`).
@@ -86,6 +101,79 @@
 //!   separate 6 GHz lane's work, and composing it into the
 //!   legacy path (HE20 6 GHz stations) is a follow-up once
 //!   that program exists, not part of this remainder.
+//! ## MLO model (Linux grounding)
+//!
+//! Grounded in torvalds/linux master `7475ea8b`
+//! (`drivers/net/wireless/realtek/rtw89`), same tree the
+//! single-link owner cites at `05441d6` for the builders:
+//!
+//! - Chip caps: `support_macid_num` = 32, `support_link_num`
+//!   = 2 (`rtw8922a.c:3256..3257`), `support_chanctx_num` =
+//!   2 (`rtw8922a.c:3258`), `__RTW89_MLD_MAX_LINK_NUM` = 2
+//!   (`core.h:904`); 802.11 link IDs are 0..=14
+//!   (`IEEE80211_MLD_MAX_NUM_LINKS` = 15,
+//!   `include/linux/ieee80211-eht.h:462`).
+//! - MACIDs: `rtw89_acquire_mac_id` (`core.c:6771`) searches
+//!   only `support_macid_num / support_link_num` base slots
+//!   when MLO is on, and `rtw89_init_sta` (`core.c:6830`)
+//!   gives link instance `index` the MACID
+//!   `base + index * support_mld_num`, where
+//!   `support_mld_num = support_macid_num / support_link_num`
+//!   = 16. Each link instance also gets
+//!   `mac_idx = RTW89_MAC_0 + index` (`core.c:6822`) and all
+//!   links share one port ("multi-link use the same port id
+//!   on different HW bands", `core.c:6825`).
+//! - Link identity: `rtw89_sta_set_link` (`core.c:6909`)
+//!   assigns the lowest free *instance* index (admission
+//!   order, not the 802.11 link ID); the designated link is
+//!   the first entry of the link pool (`rtw89_get_designated_link`,
+//!   `core.h:8000`) — i.e. the first link added.
+//! - Assoc is per link: `__rtw89_ops_sta_assoc`
+//!   (`mac80211.c`) iterates every link and calls
+//!   `rtw89_core_sta_link_assoc` per link, which sends one
+//!   assoc CMAC table per link
+//!   (`rtw89_fw_h2c_assoc_cmac_tbl_g7`, `fw.c:4431`) keyed by
+//!   that link's MACID, band, and per-link EHT/HE pads —
+//!   while the AID is `vif->cfg.aid`, one AID shared by all
+//!   links. The G7 assoc table has no MLD-specific field.
+//! - BA-CAM is MLD-aware: `rtw89_fw_h2c_ba_cam_v1`
+//!   (`fw.c:2922`) builds from the *designated* link
+//!   (`macid = rtwsta_link->mac_id`), sets MLD_EN when the
+//!   VIF is MLD (`ieee80211_vif_is_mld`), and sets BAND_SEL
+//!   from the designated link's `mac_idx != 0`.
+//! - Link add/remove: `__rtw89_ops_set_sta_links`
+//!   (`mac80211.c:1809`) does set-link, link-add, then
+//!   link-assoc per added link; `__rtw89_ops_clr_sta_links`
+//!   (`mac80211.c:1786`) does disassoc, disconnect, remove,
+//!   then unset-link per removed link.
+//! - MLO itself is gated in Linux on the firmware
+//!   `NOTIFY_AP_INFO` feature (`core.c:7691`, present for
+//!   RTL8922A at `fw.c:1010`); this owner cannot see
+//!   firmware features, so that gate is a caller/platform
+//!   precondition, not a check here.
+//!
+//! Deliberate differences from Linux (same spirit as the
+//! single-link owner):
+//! - The pool keeps the full 32-slot range for single-link
+//!   admission; an MLD base is admitted only when both of
+//!   its strided slots (`base`, `base + 16`) are free, so a
+//!   single-link station can never collide with an MLD link.
+//!   (Linux searches only the 16 base slots while MLO is on.)
+//! - BA-CAM slot maps are per link (each link `Station`
+//!   owns its own `BaCam`); Linux allocates BA-CAM entries
+//!   from one device-global map with per-sta tracking
+//!   (`core.c:5597`). The H2C still comes from the
+//!   designated link's map, as in Linux.
+//! - This owner has no VIF concept, so the station-mode rule
+//!   that a peer station takes the VIF's main MACID instead
+//!   of a pool MACID (`mac80211.c`, `rtw89_vif_get_main_macid`)
+//!   is not modeled; MLD links take pool MACIDs exactly like
+//!   the single-link owner does. VIF composition (including
+//!   `Prepared` MLD admission) is a follow-up.
+//! - Role-maintain / DMAC / join-info / CAM H2Cs that Linux
+//!   sends around link add/assoc/disconnect are not built
+//!   here: like the single-link owner, this module builds
+//!   CCTL + BA-CAM bodies only and never sends them.
 
 use super::{
     bacam_v1::{self, BaCam},
@@ -99,6 +187,19 @@ use super::{
 };
 use narf_wireless::association::six_ghz::SixGhzChannel;
 use narf_wireless::reg::PowerType6Ghz;
+
+/// Stride between an MLD link's MACIDs: one base MACID per
+/// MLD station, link instance `index` takes
+/// `base + index * MLD_MACID_STRIDE` (Linux `core.c`
+/// `rtw89_acquire_mac_id` / `rtw89_init_sta`:
+/// `support_mld_num = support_macid_num / support_link_num`).
+pub(super) const MLD_MACID_STRIDE: usize =
+    chip_8922a::SUPPORT_MACID_NUM / chip_8922a::SUPPORT_LINK_NUM;
+
+/// Maximum 802.11 link ID (`IEEE80211_MLD_MAX_NUM_LINKS` =
+/// 15, `include/linux/ieee80211-eht.h:462`): link IDs are
+/// 0..=14.
+pub(super) const MAX_LINK_ID: u8 = 14;
 
 /// Operating band of the admitted link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,6 +407,30 @@ pub(super) enum Error {
     NoSupportedRates,
     /// RA command build rejection for a legacy station.
     Ra(ra_mask::Error),
+    /// MLD admission with zero link requests.
+    NoLinks,
+    /// More link requests than the chip's link count (2).
+    TooManyLinks,
+    /// A link ID above 14 (`IEEE80211_MLD_MAX_NUM_LINKS` - 1).
+    LinkIdOutOfRange,
+    /// Two links share one 802.11 link ID.
+    DuplicateLinkId,
+    /// Two links share one peer link address.
+    DuplicateLinkAddr,
+    /// Two links share one (band, primary channel): each
+    /// link needs its own channel context (the chip has 2).
+    DuplicateChannel,
+    /// Link requests disagree on the AID: Linux programs
+    /// the one `vif->cfg.aid` into every link's assoc CCTL.
+    AidMismatch,
+    /// Link requests disagree on the port: Linux uses one
+    /// port id for all of an MLD's links ("multi-link use
+    /// the same port id on different HW bands").
+    PortMismatch,
+    /// No admitted link has this 802.11 link ID.
+    LinkNotFound,
+    /// A link with this 802.11 link ID is already admitted.
+    LinkAlreadyActive,
 }
 
 /// MACID allocator over the chip's station slots
@@ -347,6 +472,28 @@ impl MacIdPool {
     /// True when `macid` is currently admitted.
     pub(super) fn is_used(&self, macid: u8) -> bool {
         self.used.get(macid as usize).copied().unwrap_or(false)
+    }
+
+    /// Allocate an MLD base MACID: the lowest base `b` in
+    /// `0..MLD_MACID_STRIDE` whose whole strided pair
+    /// (`b`, `b + MLD_MACID_STRIDE`) is free. Both slots are
+    /// marked used, reserving the second link's MACID even
+    /// when the MLD is admitted with one link (Linux
+    /// precomputes both instances' MACIDs in
+    /// `rtw89_init_sta`). A later [`Self::free`] of one
+    /// slot frees only that link; the base slot stays held
+    /// until its own link is removed. Refuses with
+    /// [`Error::NoMacId`] when no pair is free.
+    pub(super) fn alloc_mld_base(&mut self) -> Result<u8, Error> {
+        for base in 0..MLD_MACID_STRIDE {
+            let second = base + MLD_MACID_STRIDE;
+            if !self.used[base] && !self.used[second] {
+                self.used[base] = true;
+                self.used[second] = true;
+                return Ok(base as u8);
+            }
+        }
+        Err(Error::NoMacId)
     }
 }
 
@@ -444,16 +591,15 @@ impl Station {
     }
 }
 
-/// Admit one EHT station. Checks run in a fixed order so a
-/// request failing several checks always reports the same
-/// refusal; no MACID is consumed by a refused request (the
-/// pool allocation happens only after every other check).
-pub(super) fn admit(
-    factory: &BeFactory,
-    facet: EhtStation,
-    pool: &mut MacIdPool,
-    req: &Request,
-) -> Result<Station, Error> {
+/// Validate one link's admission request. Checks run in a
+/// fixed order so a request failing several checks always
+/// reports the same refusal. Does not touch the pool: a
+/// refused request consumes no MACID. Returns the 6 GHz
+/// power program for an admitted 6 GHz link (`None` on
+/// 2.4/5 GHz): a 6 GHz request without an admission is
+/// refused (`SixGhzPowerMissing`), as is a non-6 GHz
+/// request carrying one (`SixGhzContextUnexpected`).
+fn validate(req: &Request) -> Result<Option<SixGhzProgram>, Error> {
     let six_ghz = match (req.band, req.six_ghz) {
         (Band::Ghz6, None) => return Err(Error::SixGhzPowerMissing),
         (Band::Ghz6, Some(admission)) => Some(SixGhzProgram::from_admission(admission)?),
@@ -478,12 +624,24 @@ pub(super) fn admit(
     if req.port > 7 {
         return Err(Error::PortOutOfRange);
     }
+    Ok(six_ghz)
+}
+
+/// Build one link's station record for an already-allocated
+/// `macid`: the G7 default + assoc CCTL tables and the
+/// BA-CAM map. Pure: no pool interaction.
+fn build_station(
+    factory: &BeFactory,
+    facet: EhtStation,
+    req: &Request,
+    macid: u8,
+    six_ghz: Option<SixGhzProgram>,
+) -> Result<Station, Error> {
     // Pads come from the peer's IEs, never from the caller: the
     // parse output is always five 2-bit values, so no
     // PadsOutOfRange refusal exists anymore (the assoc builder
     // still validates its own input).
     let pads = ppe::parse_assoc_ppe(req.peer_ies, req.nss);
-    let macid = pool.alloc()?;
     let default_cctl = cctl_g7::build_default(macid as u32, req.mgq_rpt_en).map_err(Error::Cctl)?;
     let assoc_cctl = cctl_g7::build_assoc(
         macid as u32,
@@ -775,5 +933,348 @@ pub(super) fn admit_legacy(
         bacam,
         default_cctl,
         assoc_cctl,
+    })
+}
+
+/// Admit one EHT station. Checks run in a fixed order so a
+/// request failing several checks always reports the same
+/// refusal; no MACID is consumed by a refused request (the
+/// pool allocation happens only after every other check).
+pub(super) fn admit(
+    factory: &BeFactory,
+    facet: EhtStation,
+    pool: &mut MacIdPool,
+    req: &Request,
+) -> Result<Station, Error> {
+    let six_ghz = validate(req)?;
+    let macid = pool.alloc()?;
+    build_station(factory, facet, req, macid, six_ghz)
+}
+
+/// One MLD link request: the 802.11 link ID plus the
+/// single-link admission request for that link's channel.
+/// The link ID is the peer's advertised link ID (0..=14),
+/// distinct from the instance index (admission order),
+/// exactly as Linux keeps `links[link_id]` separate from
+/// `links_inst[index]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LinkRequest<'a> {
+    /// 802.11 link ID (0..=14).
+    pub(super) link_id: u8,
+    /// This link's admission request (peer link address,
+    /// band, width, channel, NSS, and the shared AID/port).
+    pub(super) req: Request<'a>,
+}
+
+/// One admitted MLD link: its 802.11 link ID, its instance
+/// index, and its single-link station record. The instance
+/// index is the admission order (lowest free slot, Linux
+/// `rtw89_sta_set_link`); the link's MAC index is the
+/// instance index (`RTW89_MAC_0 + index`) and its MACID is
+/// `base + index * MLD_MACID_STRIDE` (Linux
+/// `rtw89_init_sta`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MldLink {
+    /// 802.11 link ID (0..=14).
+    pub(super) link_id: u8,
+    /// Instance index (0 or 1): admission order.
+    pub(super) index: usize,
+    /// This link's station record (per-link MACID, CCTLs,
+    /// BA-CAM map).
+    pub(super) station: Station,
+}
+
+impl MldLink {
+    /// This link's MACID (`station.macid`).
+    pub(super) fn macid(&self) -> u8 {
+        self.station.macid
+    }
+
+    /// This link's MAC index (`RTW89_MAC_0 + index`).
+    pub(super) fn mac_idx(&self) -> u8 {
+        self.index as u8
+    }
+}
+
+/// An admitted 8922A MLD station: one peer MLD, up to two
+/// links. The MLD address is the shared identity; each link
+/// carries its own link address, channel, MACID, CCTLs, and
+/// BA-CAM map. AID and port are shared across links (Linux
+/// programs the one `vif->cfg.aid` and the one port id into
+/// every link's assoc CCTL). Links live in instance-index
+/// slots: the designated link — the one BA-CAM H2C is built
+/// from — is the first present link in index order (Linux
+/// `rtw89_get_designated_link`: first link added).
+///
+/// The caller owns transport, as for [`Station`]: it sends
+/// each link's CCTL bodies over H2C. Removing the last link
+/// leaves an empty MLD; the caller then drops it (its
+/// [`MldStation::release_all`] is a no-op once empty, and
+/// every removed link already freed its own MACID).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MldStation {
+    /// Peer MLD address (shared by all links).
+    pub(super) mld_addr: [u8; 6],
+    /// Pool base MACID: link `index` owns
+    /// `base_macid + index * MLD_MACID_STRIDE`.
+    pub(super) base_macid: u8,
+    /// Association ID, shared by all links.
+    pub(super) aid: u16,
+    /// Multi-port id, shared by all links.
+    pub(super) port: u8,
+    /// Admitted links by instance index; `None` = free.
+    pub(super) links: [Option<MldLink>; chip_8922a::SUPPORT_LINK_NUM],
+}
+
+impl MldStation {
+    /// Number of admitted links.
+    pub(super) fn link_count(&self) -> usize {
+        self.links.iter().filter(|link| link.is_some()).count()
+    }
+
+    /// True when no link is admitted.
+    pub(super) fn is_empty(&self) -> bool {
+        self.link_count() == 0
+    }
+
+    /// The designated link (first present link in instance
+    /// index order), or `None` when empty. Linux builds the
+    /// BA-CAM H2C from this link.
+    pub(super) fn designated_link(&self) -> Option<&MldLink> {
+        self.links.iter().flatten().next()
+    }
+
+    /// Mutable access to the designated link, for BA-CAM
+    /// slot acquisition.
+    fn designated_link_mut(&mut self) -> Option<&mut MldLink> {
+        self.links.iter_mut().flatten().next()
+    }
+
+    /// Admitted link by 802.11 link ID, if any.
+    pub(super) fn link(&self, link_id: u8) -> Option<&MldLink> {
+        self.links
+            .iter()
+            .flatten()
+            .find(|link| link.link_id == link_id)
+    }
+
+    /// EHT contribution to the BE TXWD_INFO block for one
+    /// admitted link: (info4 bits, info7 bits) from that
+    /// link's facet. `None` when the link ID is not
+    /// admitted or the facet cannot encode its NLTF value.
+    pub(super) fn txwd_info_eht(&self, link_id: u8) -> Option<(u32, u32)> {
+        self.link(link_id)?.station.txwd_info_eht()
+    }
+
+    /// Acquire a BA-CAM bitmap slot for a BlockAck session
+    /// on the designated link. The index feeds
+    /// [`Self::ba_h2c`]; it is only meaningful while the
+    /// designated link stays admitted — release it before
+    /// removing that link.
+    pub(super) fn acquire_bacam(&mut self, tid: u8) -> Result<usize, Error> {
+        let link = self.designated_link_mut().ok_or(Error::LinkNotFound)?;
+        link.station.bacam.acquire(tid).map_err(Error::BaCam)
+    }
+
+    /// Build a BA-CAM v1 H2C body for one of the designated
+    /// link's BlockAck sessions. MLD on, band-select from
+    /// the designated link's MAC index (Linux
+    /// `rtw89_fw_h2c_ba_cam_v1`: MLD_EN when the VIF is MLD,
+    /// BAND_SEL = `mac_idx != 0`). `bitmap_idx` must come
+    /// from [`Self::acquire_bacam`].
+    pub(super) fn ba_h2c(
+        &self,
+        tid: u32,
+        bmap_size: u32,
+        ssn: u32,
+        bitmap_idx: u32,
+    ) -> Result<bacam_v1::BaCamH2c, Error> {
+        let link = self.designated_link().ok_or(Error::LinkNotFound)?;
+        bacam_v1::build_h2c(
+            true,
+            link.macid() as u32,
+            tid,
+            bmap_size,
+            ssn,
+            bitmap_idx,
+            chip_8922a::BACAM_DYNAMIC_NUM as u32,
+            true,
+            link.mac_idx() != 0,
+        )
+        .map_err(Error::BaCam)
+    }
+
+    /// Release a BA-CAM bitmap slot acquired via
+    /// [`Self::acquire_bacam`] on the designated link.
+    pub(super) fn release_bacam(&mut self, idx: usize) -> Result<(), Error> {
+        let link = self.designated_link_mut().ok_or(Error::LinkNotFound)?;
+        link.station.bacam.release(idx).map_err(Error::BaCam)
+    }
+
+    /// Admit one more link to this MLD (Linux
+    /// `__rtw89_ops_set_sta_links`: set-link, link-add,
+    /// link-assoc). The new link takes the lowest free
+    /// instance index, whose MACID slot was already
+    /// reserved by the MLD base allocation, so no pool
+    /// allocation happens here. Returns the new link's
+    /// MACID. A refused request leaves the existing links
+    /// untouched.
+    pub(super) fn add_link(
+        &mut self,
+        factory: &BeFactory,
+        facet: EhtStation,
+        link: &LinkRequest<'_>,
+    ) -> Result<u8, Error> {
+        if link.link_id > MAX_LINK_ID {
+            return Err(Error::LinkIdOutOfRange);
+        }
+        let six_ghz = validate(&link.req)?;
+        if self.link(link.link_id).is_some() {
+            return Err(Error::LinkAlreadyActive);
+        }
+        if link.req.aid != self.aid {
+            return Err(Error::AidMismatch);
+        }
+        if link.req.port != self.port {
+            return Err(Error::PortMismatch);
+        }
+        for other in self.links.iter().flatten() {
+            if other.station.peer == link.req.peer {
+                return Err(Error::DuplicateLinkAddr);
+            }
+            if other.station.band == link.req.band && other.station.primary == link.req.primary {
+                return Err(Error::DuplicateChannel);
+            }
+        }
+        let index = self
+            .links
+            .iter()
+            .position(|slot| slot.is_none())
+            .ok_or(Error::TooManyLinks)?;
+        let macid = self.base_macid + (index * MLD_MACID_STRIDE) as u8;
+        let station = build_station(factory, facet, &link.req, macid, six_ghz)?;
+        self.links[index] = Some(MldLink {
+            link_id: link.link_id,
+            index,
+            station,
+        });
+        Ok(macid)
+    }
+
+    /// Remove one link (Linux `__rtw89_ops_clr_sta_links`:
+    /// disassoc, disconnect, remove, unset-link). The
+    /// removed link's MACID returns to the pool and its
+    /// record is returned; the MLD survives on the
+    /// remaining link, whose designated-link status follows
+    /// automatically (first present link in index order).
+    /// Removing the last link leaves an empty MLD for the
+    /// caller to drop. Release the link's BA-CAM slots
+    /// before removing it when it is the designated link:
+    /// its map goes away with it.
+    pub(super) fn remove_link(
+        &mut self,
+        pool: &mut MacIdPool,
+        link_id: u8,
+    ) -> Result<MldLink, Error> {
+        let index = self
+            .links
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|link| link.link_id == link_id))
+            .ok_or(Error::LinkNotFound)?;
+        let link = self.links[index].take().expect("slot held a link");
+        pool.free(link.macid());
+        Ok(link)
+    }
+
+    /// Release every remaining link's MACID back to the
+    /// pool (dissolve the whole MLD at once). The MLD
+    /// record itself is then dead; the caller must not send
+    /// further H2C for it. A no-op when already empty.
+    pub(super) fn release_all(&self, pool: &mut MacIdPool) {
+        for link in self.links.iter().flatten() {
+            pool.free(link.macid());
+        }
+    }
+}
+
+/// Admit one EHT MLD station with 1..=2 links. Cross-link
+/// checks (distinct link IDs, link addresses, and channels;
+/// one shared AID and port) run before any pool allocation,
+/// and each link's own request is validated by
+/// [`validate`], so a refused request consumes no MACID and
+/// produces no station. The base MACID comes from
+/// [`MacIdPool::alloc_mld_base`]; link instance `index`
+/// takes `base + index * MLD_MACID_STRIDE`, and each link's
+/// station record is built with that MACID (per-link G7
+/// default + assoc CCTL, per-link BA-CAM map).
+pub(super) fn admit_mld(
+    factory: &BeFactory,
+    facet: EhtStation,
+    pool: &mut MacIdPool,
+    mld_addr: [u8; 6],
+    links: &[LinkRequest<'_>],
+) -> Result<MldStation, Error> {
+    if links.is_empty() {
+        return Err(Error::NoLinks);
+    }
+    if links.len() > chip_8922a::SUPPORT_LINK_NUM {
+        return Err(Error::TooManyLinks);
+    }
+    let mut programs: [Option<SixGhzProgram>; chip_8922a::SUPPORT_LINK_NUM] = [None, None];
+    for (i, link) in links.iter().enumerate() {
+        if link.link_id > MAX_LINK_ID {
+            return Err(Error::LinkIdOutOfRange);
+        }
+        programs[i] = validate(&link.req)?;
+    }
+    for (i, a) in links.iter().enumerate() {
+        for b in &links[i + 1..] {
+            if a.link_id == b.link_id {
+                return Err(Error::DuplicateLinkId);
+            }
+            if a.req.peer == b.req.peer {
+                return Err(Error::DuplicateLinkAddr);
+            }
+            if a.req.band == b.req.band && a.req.primary == b.req.primary {
+                return Err(Error::DuplicateChannel);
+            }
+        }
+    }
+    let aid = links[0].req.aid;
+    let port = links[0].req.port;
+    if links.iter().any(|link| link.req.aid != aid) {
+        return Err(Error::AidMismatch);
+    }
+    if links.iter().any(|link| link.req.port != port) {
+        return Err(Error::PortMismatch);
+    }
+    let base_macid = pool.alloc_mld_base()?;
+    let mut slots: [Option<MldLink>; chip_8922a::SUPPORT_LINK_NUM] = [None, None];
+    for (index, link) in links.iter().enumerate() {
+        let macid = base_macid + (index * MLD_MACID_STRIDE) as u8;
+        match build_station(factory, facet, &link.req, macid, programs[index]) {
+            Ok(station) => {
+                slots[index] = Some(MldLink {
+                    link_id: link.link_id,
+                    index,
+                    station,
+                });
+            }
+            // Unreachable after validation (CCTL/BA-CAM only
+            // fail on field overflow), but a refused request
+            // must never leak its base pair.
+            Err(error) => {
+                pool.free(base_macid);
+                pool.free(base_macid + MLD_MACID_STRIDE as u8);
+                return Err(error);
+            }
+        }
+    }
+    Ok(MldStation {
+        mld_addr,
+        base_macid,
+        aid,
+        port,
+        links: slots,
     })
 }
