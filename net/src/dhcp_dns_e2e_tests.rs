@@ -19,6 +19,11 @@
 //! - **DNS**: `send_dns_query` captures frames via `TX_CAPTURE`; we inspect
 //!   the wire query, then use `__inject_reply_for_test` + `__parse_response_for_test`
 //!   for the response decode path.
+//! - **NTP discovery (option 42)**: the NTP smokes below DO run the full
+//!   `acquire` / `dhcp_acquire` against a responding fake iface
+//!   (`dhcp_ntp_respond`), which answers DISCOVER/REQUEST synchronously
+//!   from its xmit hook, so the spin loop finds the reply on its first
+//!   poll and there is no 32 s timeout spin.
 //!
 //! ## Linux reference
 //!
@@ -44,6 +49,8 @@
 //! 13. DNS CNAME chain resolution
 //! 14. DNS NXDOMAIN returns NotFound
 //! 15. DNS TC bit → TcpNotReady
+//! 16. DHCP option 42 (1 NTP server) → `DhcpLease.ntp` via `acquire`
+//! 17. DHCP option 42 (2 NTP servers) → `Lease.ntp` via `dhcp_acquire`
 
 #![allow(dead_code)]
 
@@ -66,8 +73,8 @@ use crate::pkt_dhcp::{
     build_request, iter_options, DhcpHeader, DHCPACK, DHCPDECLINE, DHCPDISCOVER, DHCPNAK,
     DHCPOFFER, DHCPRELEASE, DHCPREQUEST, DHCP_HDR_LEN, FLAG_BROADCAST, HTYPE_ETHERNET,
     MAGIC_COOKIE, OPT_DHCP_MESSAGE_TYPE, OPT_DNS_SERVER, OPT_INTERFACE_MTU, OPT_LEASE_TIME,
-    OPT_PARAMETER_REQUEST_LIST, OPT_REBINDING_TIME_T2, OPT_RENEWAL_TIME_T1, OPT_REQUESTED_IP,
-    OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK, OP_BOOT_REQUEST,
+    OPT_NTP_SERVERS, OPT_PARAMETER_REQUEST_LIST, OPT_REBINDING_TIME_T2, OPT_RENEWAL_TIME_T1,
+    OPT_REQUESTED_IP, OPT_ROUTER, OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK, OP_BOOT_REQUEST,
 };
 use crate::pkt_dns::{
     encode_name, DnsHeader, CLASS_IN, DNS_HDR_LEN, FLAG_QR, FLAG_RD, FLAG_TC, RCODE_NXDOMAIN,
@@ -120,6 +127,23 @@ fn reset_all(iface_name: &'static str) {
 
 // ── DHCP synthetic packet helpers ──────────────────────────────────────────
 
+/// Shared field bundle for the synthetic DHCP OFFER/ACK packet builders
+/// below. The OFFER and ACK builders take the same eight fields, which
+/// exceeds clippy's `too_many_arguments` limit (7) when passed one by
+/// one; bundling them in a struct keeps every call site a single
+/// named-field literal, so no value can be silently misordered.
+#[derive(Clone, Copy)]
+struct DhcpPacketParams<'a> {
+    xid: u32,
+    yiaddr: [u8; 4],
+    server_id: [u8; 4],
+    lease_secs: u32,
+    gateway: [u8; 4],
+    dns: &'a [[u8; 4]],
+    subnet: [u8; 4],
+    ntp: &'a [[u8; 4]],
+}
+
 /// Build a synthetic DHCP OFFER as if the server sent it.
 ///
 /// `xid` must match the XID the client used in DISCOVER.
@@ -132,6 +156,21 @@ fn build_offer_bytes(
     dns: &[[u8; 4]],
     subnet: [u8; 4],
 ) -> Vec<u8> {
+    build_offer_bytes_ntp(DhcpPacketParams {
+        xid,
+        yiaddr,
+        server_id,
+        lease_secs,
+        gateway,
+        dns,
+        subnet,
+        ntp: &[],
+    })
+}
+
+/// Same as [`build_offer_bytes`], plus an option-42 (NTP servers,
+/// RFC 2132 §8.3) payload carrying `ntp` (empty = option omitted).
+fn build_offer_bytes_ntp(params: DhcpPacketParams<'_>) -> Vec<u8> {
     let mut chaddr = [0u8; 16];
     chaddr[..6].copy_from_slice(&IFACE_MAC);
     let hdr = DhcpHeader {
@@ -139,11 +178,11 @@ fn build_offer_bytes(
         htype: HTYPE_ETHERNET,
         hlen: 6,
         hops: 0,
-        xid,
+        xid: params.xid,
         secs: 0,
         flags: 0,
         ciaddr: [0; 4],
-        yiaddr,
+        yiaddr: params.yiaddr,
         siaddr: [0; 4],
         giaddr: [0; 4],
         chaddr,
@@ -153,20 +192,28 @@ fn build_offer_bytes(
     // Options.
     append_message_type(&mut pkt, DHCPOFFER);
     // server-id
-    append_option(&mut pkt, OPT_SERVER_IDENTIFIER, &server_id);
+    append_option(&mut pkt, OPT_SERVER_IDENTIFIER, &params.server_id);
     // lease time
-    append_option(&mut pkt, OPT_LEASE_TIME, &lease_secs.to_be_bytes());
+    append_option(&mut pkt, OPT_LEASE_TIME, &params.lease_secs.to_be_bytes());
     // subnet mask
-    append_option(&mut pkt, OPT_SUBNET_MASK, &subnet);
+    append_option(&mut pkt, OPT_SUBNET_MASK, &params.subnet);
     // router
-    append_option(&mut pkt, OPT_ROUTER, &gateway);
+    append_option(&mut pkt, OPT_ROUTER, &params.gateway);
     // DNS servers
-    if !dns.is_empty() {
+    if !params.dns.is_empty() {
         let mut dns_bytes: Vec<u8> = Vec::new();
-        for addr in dns {
+        for addr in params.dns {
             dns_bytes.extend_from_slice(addr);
         }
         append_option(&mut pkt, OPT_DNS_SERVER, &dns_bytes);
+    }
+    // NTP servers (option 42, RFC 2132 §8.3): one 4-byte address each.
+    if !params.ntp.is_empty() {
+        let mut ntp_bytes: Vec<u8> = Vec::new();
+        for addr in params.ntp {
+            ntp_bytes.extend_from_slice(addr);
+        }
+        append_option(&mut pkt, OPT_NTP_SERVERS, &ntp_bytes);
     }
     append_end(&mut pkt);
     pkt
@@ -183,7 +230,21 @@ fn build_ack_bytes(
     dns: &[[u8; 4]],
     subnet: [u8; 4],
 ) -> Vec<u8> {
-    let mut pkt = build_offer_bytes(xid, yiaddr, server_id, lease_secs, gateway, dns, subnet);
+    build_ack_bytes_ntp(DhcpPacketParams {
+        xid,
+        yiaddr,
+        server_id,
+        lease_secs,
+        gateway,
+        dns,
+        subnet,
+        ntp: &[],
+    })
+}
+
+/// Same as [`build_ack_bytes`], plus an option-42 (NTP servers) payload.
+fn build_ack_bytes_ntp(params: DhcpPacketParams<'_>) -> Vec<u8> {
+    let mut pkt = build_offer_bytes_ntp(params);
     // Replace msg-type byte: options start at DHCP_HDR_LEN (240).
     // The first option after position 240 is OPT_DHCP_MESSAGE_TYPE (53).
     // byte 241 = tag=53, byte 242 = len=1, byte 243 = type value.
@@ -1279,3 +1340,151 @@ fn smoke_dns_tc_bit_fallback() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/dhcp_dns_e2e", smoke_dns_tc_bit_fallback);
+
+// ── Option-42 (NTP servers) smokes ──────────────────────────────────────────
+//
+// A fake DHCP server that answers synchronously: `dhcp_ntp_respond` is
+// installed as the iface's xmit hook, parses the outgoing DISCOVER /
+// REQUEST, and injects a matching OFFER / ACK (with the option-42 servers
+// from `DHCP_NTP_SERVERS`) via `on_udp_in` before `xmit` returns — so
+// `acquire`'s spin loop finds the reply on its first poll.
+//
+// Linux ref: RFC 2132 §8.3 — option 42 is a list of IPv4 addresses,
+// 4 bytes each, no count limit in the RFC; the tree caps the parsed list
+// at 3, mirroring option 6 (see the parse arm in `dhcp.rs`).
+
+/// NTP servers the responding fake server advertises in option 42.
+/// Set by each NTP smoke before calling `acquire` / `dhcp_acquire`.
+static DHCP_NTP_SERVERS: IrqSafeSpinLock<Vec<[u8; 4]>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Fake-server xmit hook: answer DHCP DISCOVER with OFFER and DHCP REQUEST
+/// with ACK, both carrying the option-42 servers from `DHCP_NTP_SERVERS`.
+/// Anything that is not a DHCP DISCOVER/REQUEST for UDP port 67 is ignored.
+fn dhcp_ntp_respond(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+    // Ethernet (14) + IPv4 (IHL from the header) + UDP (8) + DHCP payload.
+    if frame.len() < 14 + 20 + 8 + 240 {
+        return Ok(());
+    }
+    // Ethertype IPv4 (0x0800).
+    if frame[12] != 0x08 || frame[13] != 0x00 {
+        return Ok(());
+    }
+    let ihl = ((frame[14] & 0x0f) * 4) as usize;
+    if ihl < 20 || frame.len() < 14 + ihl + 8 + 240 {
+        return Ok(());
+    }
+    // IP protocol UDP (17).
+    if frame[14 + 9] != 17 {
+        return Ok(());
+    }
+    // UDP destination port 67 (DHCP server).
+    let udp_off = 14 + ihl;
+    if u16::from_be_bytes([frame[udp_off + 2], frame[udp_off + 3]]) != 67 {
+        return Ok(());
+    }
+    let dhcp = &frame[udp_off + 8..];
+    // BOOTREQUEST only.
+    if dhcp[0] != 1 {
+        return Ok(());
+    }
+    let xid = u32::from_be_bytes([dhcp[4], dhcp[5], dhcp[6], dhcp[7]]);
+    let mut msg_type = 0u8;
+    for opt in iter_options(&dhcp[240..]) {
+        if opt.tag == OPT_DHCP_MESSAGE_TYPE && opt.data.len() == 1 {
+            msg_type = opt.data[0];
+        }
+    }
+    let ntp = DHCP_NTP_SERVERS.lock().clone();
+    let offered = [192, 168, 1, 42];
+    let server_id = [192, 168, 1, 1];
+    let subnet = [255, 255, 255, 0];
+    let gw = [192, 168, 1, 1];
+    let dns = [[8u8, 8, 8, 8]];
+    match msg_type {
+        DHCPDISCOVER => {
+            let offer = build_offer_bytes_ntp(DhcpPacketParams {
+                xid,
+                yiaddr: offered,
+                server_id,
+                lease_secs: 3600,
+                gateway: gw,
+                dns: &dns,
+                subnet,
+                ntp: &ntp,
+            });
+            inject_dhcp_udp(&offer);
+        }
+        DHCPREQUEST => {
+            let ack = build_ack_bytes_ntp(DhcpPacketParams {
+                xid,
+                yiaddr: offered,
+                server_id,
+                lease_secs: 3600,
+                gateway: gw,
+                dns: &dns,
+                subnet,
+                ntp: &ntp,
+            });
+            inject_dhcp_udp(&ack);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// ── Smoke 16: option 42 with 1 NTP server → `DhcpLease.ntp` ────────────────
+//
+// Drive the full `acquire` against the responding fake server and verify
+// the returned lease carries the single advertised NTP server.
+
+fn smoke_dhcp_option42_one_ntp_server() -> TestResult {
+    const IFACE: &str = "dhcp-ntp-1";
+    reset_all(IFACE);
+    // Swap the TX-capture hook for the responding fake server.
+    iface::register(IFACE, IFACE_MAC, dhcp_ntp_respond);
+    *DHCP_NTP_SERVERS.lock() = vec![[192, 0, 2, 53]];
+
+    let lease = match dhcp::acquire(IFACE, 4000) {
+        Ok(l) => l,
+        Err(()) => return TestResult::Fail("acquire failed with responding fake server"),
+    };
+    if lease.ip != [192, 168, 1, 42] {
+        return TestResult::Fail("acquire did not complete the OFFER/ACK exchange");
+    }
+    if lease.ntp_count != 1 {
+        return TestResult::Fail("option 42 with 1 server: ntp_count != 1");
+    }
+    if lease.ntp[0] != [192, 0, 2, 53] {
+        return TestResult::Fail("option 42 with 1 server: ntp[0] != 192.0.2.53");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp_dns_e2e", smoke_dhcp_option42_one_ntp_server);
+
+// ── Smoke 17: option 42 with 2 NTP servers → `Lease.ntp` ──────────────────
+//
+// Drive the full `dhcp_acquire` against the responding fake server and
+// verify the public `Lease` carries both advertised NTP servers.
+
+fn smoke_dhcp_option42_two_ntp_servers() -> TestResult {
+    const IFACE: &str = "dhcp-ntp-2";
+    reset_all(IFACE);
+    // Swap the TX-capture hook for the responding fake server.
+    iface::register(IFACE, IFACE_MAC, dhcp_ntp_respond);
+    *DHCP_NTP_SERVERS.lock() = vec![[192, 0, 2, 53], [192, 0, 2, 54]];
+
+    let lease = match dhcp::dhcp_acquire(IFACE, 4000) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("dhcp_acquire failed with responding fake server"),
+    };
+    if lease.addr != Ipv4Addr([192, 168, 1, 42]) {
+        return TestResult::Fail("dhcp_acquire did not complete the OFFER/ACK exchange");
+    }
+    if lease.ntp != vec![Ipv4Addr([192, 0, 2, 53]), Ipv4Addr([192, 0, 2, 54])] {
+        return TestResult::Fail("option 42 with 2 servers: Lease.ntp mismatch");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp_dns_e2e", smoke_dhcp_option42_two_ntp_servers);
