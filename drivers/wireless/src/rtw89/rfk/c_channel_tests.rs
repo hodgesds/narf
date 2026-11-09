@@ -160,9 +160,16 @@ fn smoke_rtw89_c_set_channel_rf_and_help_follow_rtw8852c() -> TestResult {
             return TestResult::Fail("C CAV path-B RF18 copy differs from _ctrl_bw");
         }
     }
-    // 160MHz: BW 0, CFCH 1/0xb, LUT 0x3, EBW 0.
-    if bw_setting(Width::Mhz160) != (0, 1, 0xb) || rxbb_bw(Width::Mhz160) != (0x3, 0) {
-        return TestResult::Fail("C 160MHz RF bandwidth constants differ");
+    // 160MHz: BW 0, CFCH 1/0xb, LUT 0x3, EBW 0. 320MHz: Linux
+    // `_bw_setting` clears the RF18 BW bits (0) and writes no CFCH
+    // pair; `_set_rxbb_bw` falls to the 0x3 default and `_set_tia_bw`
+    // to EBW 2.
+    if bw_setting(Width::Mhz160) != (0, Some((1, 0xb)))
+        || rxbb_bw(Width::Mhz160) != (0x3, 0)
+        || bw_setting(Width::Mhz320) != (0, None)
+        || rxbb_bw(Width::Mhz320) != (0x3, 2)
+    {
+        return TestResult::Fail("C 160/320MHz RF bandwidth constants differ");
     }
     // 6GHz ch 37 (20MHz): BAND1 = 3, BAND0 = 0.
     let Some(six) = Profile::new20(Band::Ghz6, 37) else {

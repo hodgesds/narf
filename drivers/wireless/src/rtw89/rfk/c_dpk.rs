@@ -433,7 +433,10 @@ impl<I: Interface> Access<'_, I> {
             match width {
                 Width::Mhz20 => 2,
                 Width::Mhz40 | Width::Mhz80 => 1,
-                Width::Mhz160 => 0,
+                // Linux `_dpk_idl_mpa` falls to `else` (0x0) for any
+                // bandwidth other than 5/10/20/40/80, including 160
+                // and 320MHz.
+                Width::Mhz160 | Width::Mhz320 => 0,
             }
         };
         self.d_mdpd(order).await?;
@@ -546,12 +549,13 @@ impl<I: Interface> Access<'_, I> {
         self.d_one_shot(path, D_KIP_PRESET).await?;
         self.d_txpwr_force(path, true)?;
         self.d_txagc(path, Some(15), state).await?;
-        // `_dpk_tpg_sel`.
+        // `_dpk_tpg_sel`: Linux falls to the `else` arm (the 20MHz
+        // pair) for any bandwidth other than 160/80/40, including 320MHz.
         let (mode, select) = match channel.width() {
             Width::Mhz160 => (0x3, 0x0180_ff30),
             Width::Mhz80 => (0x0, 0xffe0_fa00),
             Width::Mhz40 => (0x2, 0xff40_09e0),
-            Width::Mhz20 => (0x1, 0xf9f0_07d0),
+            Width::Mhz20 | Width::Mhz320 => (0x1, 0xf9f0_07d0),
         };
         self.wm(R_TPG_MOD, B_TPG_MOD_F, mode)?;
         self.wm(R_TPG_SEL, u32::MAX, select)?;

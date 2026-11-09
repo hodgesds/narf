@@ -132,12 +132,17 @@ fn domain(profile: Profile) -> &'static [u8] {
         b"NARF RTL8852C noninitial full RF 2.4GHz awake WLAN-only v1;TX-A,RX-AB;no hardwarecrypto;retuned from Ready ch1 program"
     }
 }
+/// Width in MHz as the one byte the C record identity and the N5CC
+/// channel image carry it. 320MHz has no `u8` MHz encoding, so it is
+/// the sentinel 0: no station width is 0MHz, so the byte still
+/// distinguishes all five widths unambiguously.
 fn width_mhz(width: Width) -> u8 {
     match width {
         Width::Mhz20 => 20,
         Width::Mhz40 => 40,
         Width::Mhz80 => 80,
         Width::Mhz160 => 160,
+        Width::Mhz320 => 0,
     }
 }
 /// Profiles a C record may admit: 2.4GHz and 5GHz typed profiles, never
@@ -150,7 +155,7 @@ pub(super) fn admissible(profile: Profile) -> bool {
     }
 }
 /// Typed 6GHz profiles a 6GHz `N5CC` record may admit (with a power
-/// context): every 6GHz 20/40/80/160MHz block (`operating_channel_c`).
+/// context): every 6GHz 20/40/80/160/320MHz block (`operating_channel_c`).
 pub(super) fn admissible_6ghz(profile: Profile) -> bool {
     profile.band() == Band::Ghz6
 }
@@ -159,7 +164,7 @@ pub(super) fn noninitial_6ghz() -> alloc::vec::Vec<Profile> {
     let mut out = alloc::vec::Vec::new();
     for primary in (1..=233).filter(|&p| super::operating_channel_c::is_6ghz_primary(p)) {
         out.extend(Profile::new20(Band::Ghz6, primary));
-        for width in [Width::Mhz40, Width::Mhz80, Width::Mhz160] {
+        for width in [Width::Mhz40, Width::Mhz80, Width::Mhz160, Width::Mhz320] {
             out.extend(Profile::new_wide(Band::Ghz6, primary, width));
         }
     }

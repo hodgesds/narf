@@ -118,23 +118,31 @@ pub(in super::super) fn rf18_channel(old: u32, profile: Profile) -> u32 {
         | (band0 << 8)
 }
 
-/// `_bw_setting`: (RF18 BW field, CFCH_BW0, CFCH_BW1).
-pub(in super::super) fn bw_setting(width: Width) -> (u32, u32, u32) {
+/// `_bw_setting`: (RF18 BW field, CFCH_BW0/CFCH_BW1 pair). Linux's
+/// `default:` arm clears the RF18 BW bits (0) and performs no CFCH
+/// write at all, so 320MHz carries no CFCH pair (`None`); the caller
+/// still writes the RF18 word with the BW bits cleared.
+pub(in super::super) fn bw_setting(width: Width) -> (u32, Option<(u32, u32)>) {
     match width {
-        Width::Mhz20 => (3, 0x3, 0xf),
-        Width::Mhz40 => (2, 0x3, 0xf),
-        Width::Mhz80 => (1, 0x2, 0xd),
-        Width::Mhz160 => (0, 0x1, 0xb),
+        Width::Mhz20 => (3, Some((0x3, 0xf))),
+        Width::Mhz40 => (2, Some((0x3, 0xf))),
+        Width::Mhz80 => (1, Some((0x2, 0xd))),
+        Width::Mhz160 => (0, Some((0x1, 0xb))),
+        Width::Mhz320 => (0, None),
     }
 }
 
 /// `_set_rxbb_bw` LUT value and `_set_tia_bw` RR_RXBB2_EBW.
+/// Linux `_set_rxbb_bw` falls to `default:` (0x3, the 160MHz LUT
+/// value) for 320MHz, and `_set_tia_bw` writes EBW 2 for any width
+/// other than 160MHz.
 pub(in super::super) fn rxbb_bw(width: Width) -> (u32, u32) {
     match width {
         Width::Mhz20 => (0x1b, 2),
         Width::Mhz40 => (0x13, 2),
         Width::Mhz80 => (0xb, 2),
         Width::Mhz160 => (0x3, 0),
+        Width::Mhz320 => (0x3, 2),
     }
 }
 
@@ -214,15 +222,17 @@ impl<I: Interface> Access<'_, I> {
                 }
             }
         }
-        let (bw, bw0, bw1) = bw_setting(profile.width());
+        let (bw, cfch) = bw_setting(profile.width());
         for path in 0..2u8 {
             let p = usize::from(path);
             for (slot, address) in [RR_CFGCH, RR_CFGCH_V1].into_iter().enumerate() {
                 let old = self.rr(path, address, RFREG_MASK).await?;
                 let new = (old & !RR_CFGCH_BW) | (bw << 10);
                 let offset = u32::from(path) << 8;
-                self.wm(CFCH_BW0.0 | offset, CFCH_BW0.1, bw0)?;
-                self.wm(CFCH_BW1.0 | offset, CFCH_BW1.1, bw1)?;
+                if let Some((bw0, bw1)) = cfch {
+                    self.wm(CFCH_BW0.0 | offset, CFCH_BW0.1, bw0)?;
+                    self.wm(CFCH_BW1.0 | offset, CFCH_BW1.1, bw1)?;
+                }
                 self.wr(path, address, RFREG_MASK, new).await?;
                 last[p][slot] = Some(new);
             }

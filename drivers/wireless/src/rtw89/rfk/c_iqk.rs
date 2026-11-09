@@ -325,17 +325,24 @@ impl<I: Interface> Access<'_, I> {
     async fn c_iqk_rxk_setting(&mut self, path: u8, width: Width) -> Result<(), Error> {
         let fifo = if path == 0 { 0x0101 } else { 0x0202 };
         self.wm(R_ADC_FIFO, B_ADC_FIFO_RXK, fifo)?;
-        let (ck, ack) = match width {
-            Width::Mhz20 | Width::Mhz40 => (ADC_480M, 0),
-            Width::Mhz80 => (ADC_960M, 1),
-            Width::Mhz160 => (ADC_1920M, 2),
+        // Linux `_iqk_rxk_setting` switches on 20/40/80/160 only; its
+        // `default:` arm programs no RX clock / ACK / RXBB2 / NRBW
+        // write, so 320MHz skips the middle block (the ADC FIFO writes
+        // and the RXK config table still run).
+        let setting = match width {
+            Width::Mhz20 | Width::Mhz40 => Some((ADC_480M, 0)),
+            Width::Mhz80 => Some((ADC_960M, 1)),
+            Width::Mhz160 => Some((ADC_1920M, 2)),
+            Width::Mhz320 => None,
         };
-        let off = u32::from(path) << 13;
-        self.wm(R_UPD_CLK + off, B_DPD_GDIS, 1)?;
-        self.c_rxck(path, true, ck)?;
-        self.wm(R_UPD_CLK + off, B_ACK_VAL, ack)?;
-        self.wr(path, RR_RXBB2, RR_RXBB2_CKT, 1).await?;
-        self.wm(R_P0_NRBW + off, B_P0_NRBW_DBG, 1)?;
+        if let Some((ck, ack)) = setting {
+            let off = u32::from(path) << 13;
+            self.wm(R_UPD_CLK + off, B_DPD_GDIS, 1)?;
+            self.c_rxck(path, true, ck)?;
+            self.wm(R_UPD_CLK + off, B_ACK_VAL, ack)?;
+            self.wr(path, RR_RXBB2, RR_RXBB2_CKT, 1).await?;
+            self.wm(R_P0_NRBW + off, B_P0_NRBW_DBG, 1)?;
+        }
         self.table(&RXK_CFG).await?;
         let fifo = if path == 0 { 0x1101 } else { 0x2202 };
         self.wm(R_ADC_FIFO, B_ADC_FIFO_RXK, fifo)

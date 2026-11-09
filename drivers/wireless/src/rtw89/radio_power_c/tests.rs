@@ -374,6 +374,19 @@ fn smoke_rtw8852c_6ghz_txpwr_follows_rtw89_regd_and_phy_6g() -> TestResult {
     {
         return TestResult::Fail("C 6GHz program wrote the 2.4GHz CCK DFIR");
     }
+    // 320MHz: Linux phy.c has no 320MHz TX power limit fill
+    // (`rtw89_phy_fill_txpwr_limit_ax` / `_ru_ax` switch on 20/40/80/160
+    // only), so the 320MHz limit and RU pages stay zero.
+    let Some(wide320) = Profile::new_wide(Band::Ghz6, 29, Width::Mhz320) else {
+        return TestResult::Fail("6GHz 320MHz profile refused");
+    };
+    let Ok(plan320) = Plan::from_elements_6ghz(&set, 5, wide320, us, None) else {
+        return TestResult::Fail("C 6GHz 320MHz power plan refused");
+    };
+    let (_, _, limit320, ru320, _) = plan320.parts();
+    if limit320.iter().flatten().any(|&v| v != 0) || ru320.iter().flatten().any(|&v| v != 0) {
+        return TestResult::Fail("C 6GHz 320MHz limit/RU page is not zero");
+    }
     // STD with a TPE: min3 with dbm_to_mac(5) = 10; the bound identity
     // stays the TPE-free plan's; TPE is refused off STD or below -10dBm.
     let (Ok(sp), Ok(bare)) = (
