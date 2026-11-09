@@ -465,7 +465,7 @@ pub(in crate::ath9k) fn prepare(
     field(io, AR_PHY_SGI_DELTA, 0xf, 0, exponent)?;
     spur_mrc_cck(io, frequency)?;
     spur_ofdm(io, image, frequency)?;
-    board::set_board_values(io, image, frequency, rx, tx)?;
+    board::set_board_values(io, revision.chip, image, frequency, rx, tx)?;
     // ar9003_hw_set_channel.
     let (select, two) = channel_select(frequency);
     io.write32(AR_PHY_SYNTH_CONTROL, u32::from(two) << 29);
