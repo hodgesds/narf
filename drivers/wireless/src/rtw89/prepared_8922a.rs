@@ -245,6 +245,16 @@ impl Prepared8922a {
         &self.factory
     }
 
+    /// Fuse-selected secure-download state for this device: the BE
+    /// secure fuses read at probe (`efuse_be::read_secure`), in the
+    /// form `DownloadPlan::new` consumes. The firmware-download
+    /// owner builds the plan from the registry image + these fuses +
+    /// `Blacklist::upstream(Rtl8922A)`; until that owner exists no
+    /// image is trusted or downloaded on this path.
+    pub(super) fn secure_fuses(&self) -> super::secure::Fuses {
+        super::secure::Fuses::from_be(super::mac::ChipId::Rtl8922A, self.factory.secure)
+    }
+
     /// Own MAC, from the BE factory identity.
     pub(super) fn mac(&self) -> [u8; 6] {
         self.factory.mac

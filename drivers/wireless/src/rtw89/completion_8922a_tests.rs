@@ -74,6 +74,7 @@ fn factory() -> BeFactory {
         phycap: [0u8; chip_8922a::PHYCAP_SIZE],
         cv: None,
         thermal_k: None,
+        secure: super::efuse_be::SecureInfo::disabled(),
     }
 }
 

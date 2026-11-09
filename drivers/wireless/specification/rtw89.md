@@ -139,7 +139,16 @@ version0 empty policy; RTL8851B takes Linux's exact NULL `fw_blacklist`
 policy (`Blacklist::upstream(Rtl8851B)` has no chip list: fw.c
 `__check_secure_blacklist` -ENOENT is only `WARN_ONCE`d, so the matching MSS
 signature is the whole secure policy, still required); A requires an
-authenticated board policy.
+authenticated board policy. RTL8922A (BE) takes the same plan through
+`Fuses::from_be`: its secure-window read (`efuse_be::read_secure`,
+`rtw89_efuse_read_fw_secure_be`) supplies the Linux-mapped MSS triple
+plus `sb_sel_mgn`, a formatted section's `sb_sel_ver` must be zero or
+that magnitude (`__parse_formatted_mssc`), and its upstream blacklist
+is the same version-0/all-clear default list as B/C
+(`rtw8922a.c:3215`); the AX DDV decoder still refuses 8922A. `BeFactory`
+carries the secure state from probe and `Prepared8922a::secure_fuses`
+exposes it to the future download owner. The plan runs once per
+firmware download, never on a packet path (perf class (a): no hot path).
 No missing policy or signature falls back to an unsecured transfer.
 
 The plan couples v1 ignored-security descriptor compaction/count with the
