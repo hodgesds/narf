@@ -14,6 +14,10 @@ pub(super) enum Error {
     Policy,
     Table,
     Terminal,
+    /// A firmware RFK offload reported a non-OK state (FAIL, TIMEOUT or
+    /// H2C_CMD_ERR) in its C2H report. Linux logs and continues past a
+    /// failed `rtw89_phy_rfk_*_and_wait`; NARF fails closed instead.
+    Report,
 }
 impl From<power::Error> for Error {
     fn from(e: power::Error) -> Self {
@@ -49,6 +53,31 @@ pub(super) trait Interface: Io {
     /// coex.c `rtw89_btc_ntfy_switch_band` (no DBCC) -> `_run_coex`
     /// (`BTC_RSN_NTFY_SWBAND`). Default: no coexistence owner.
     async fn coex_switch_band(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Send one H2C command (category/class/function + payload bytes) to
+    /// the firmware. The BE firmware-offloaded RFK steps
+    /// (`rtw89_fw_h2c_rf_*`, OUTSRC class `H2C_CL_OUTSRC_RF_FW_RFK`)
+    /// go through this. Default: no H2C transport (the owner cannot run).
+    async fn h2c(&mut self, _cat: u8, _class: u8, _func: u8, _payload: &[u8]) -> Result<(), Error> {
+        Err(Error::Terminal)
+    }
+    /// Wait for the next firmware C2H RFK report
+    /// (`RTW89_C2H_CAT_OUTSRC` / `RTW89_PHY_C2H_RFK_REPORT` /
+    /// `RTW89_PHY_C2H_RFK_REPORT_FUNC_STATE`), up to `timeout_ms`, and
+    /// return its parsed (state, version). One report is consumed per
+    /// call; the caller issues exactly one offload per wait, as Linux
+    /// does with its single `rtwdev->rfk_wait` completion. Default: no
+    /// C2H transport (the owner cannot run).
+    async fn await_rfk_report(&mut self, _timeout_ms: u64) -> Result<be_rfk::Report, Error> {
+        Err(Error::Terminal)
+    }
+    /// coex.c `rtw89_btc_ntfy_wl_rfk` (`BTC_WRFKT_CHLK`) START/STOP around
+    /// a channel RFK run: `wl->rfk_info.state` + the WLRFK scoreboard bit
+    /// + `_run_coex`. Default: no coexistence owner. The native override
+    ///   runs `_run_coex` via `coex_enforce`; the scoreboard bit itself
+    ///   needs a read-modify-write helper the tree does not have yet.
+    async fn coex_rfk(&mut self, _start: bool) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -486,6 +515,19 @@ impl ChannelRxDck {
     }
 }
 
+/// RTL8922A channel RFK (`rtw8922a_rfk_channel`, `rtw8922a_rfk_band_changed`)
+/// and periodic track (`rtw89_core_rfk_track` / `rtw8922a_rfk_track`).
+#[path = "rfk/be_channel.rs"]
+pub(super) mod be_channel;
+/// RTL8922A firmware-offloaded RFK (`rtw89_phy_rfk_*_and_wait`):
+/// report kinds/states, the OUTSRC RFK H2C bodies and the C2H report
+/// parse, plus the single-outstanding report-wait runner.
+#[path = "rfk/be_rfk.rs"]
+pub(super) mod be_rfk;
+/// RTL8922A TSSI H2C fill (`rtw89_phy_rfk_tssi_fill_fwcmd_*`):
+/// efuse-to-DE values and the TXPWR_TRK thermal table for one channel.
+#[path = "rfk/be_tssi.rs"]
+pub(super) mod be_tssi;
 /// RTL8852C `rtw8852c_rfk_init` (RCK/DACK/RX DCK).
 #[path = "rfk/c.rs"]
 pub(super) mod c;

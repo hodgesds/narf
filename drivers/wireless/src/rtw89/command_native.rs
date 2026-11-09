@@ -1527,6 +1527,76 @@ impl super::rfk::Interface for Native {
         self.scheduler = Some(mailbox);
         result.map_err(Into::into)
     }
+    /// One BE firmware-offload H2C (`H2C_CAT_OUTSRC` /
+    /// `H2C_CL_OUTSRC_RF_FW_RFK`), sent like the C `RF_GET_MCCCH` H2C:
+    /// no done-ack, `Permit::Legacy`. Unmatched C2H events (including
+    /// the RFK report) are retained into the backlog by
+    /// `runtime_command` for `await_rfk_report`.
+    async fn h2c(
+        &mut self,
+        cat: u8,
+        class: u8,
+        func: u8,
+        payload: &[u8],
+    ) -> Result<(), super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        self.runtime_command(cat, class, func, payload, false, station::Permit::Legacy)
+            .await
+            .map_err(Into::into)
+    }
+    /// Wait for the firmware C2H RFK report (OUTSRC / RFK_REPORT /
+    /// STATE), mirroring `wow_c2h`'s backlog poll: the retained backlog
+    /// first (the report may already have arrived during the H2C
+    /// send), then 50 us polls with RX steps until `timeout_ms`. A
+    /// report that parses as a non-report message fails closed.
+    async fn await_rfk_report(
+        &mut self,
+        timeout_ms: u64,
+    ) -> Result<super::rfk::be_rfk::Report, super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        let start = self.io.now_us();
+        loop {
+            let index = self.station_runtime.backlog.iter().position(|event| {
+                matches!(event, super::rx_packet::Event::Firmware(m)
+                if (m.category, m.class, m.function)
+                    == (
+                        super::rfk::be_rfk::C2H_CAT_OUTSRC,
+                        super::rfk::be_rfk::C2H_CLASS_RFK_REPORT,
+                        super::rfk::be_rfk::C2H_FUNC_RFK_REPORT_STATE,
+                    ))
+            });
+            if let Some(index) = index {
+                if let Some(super::rx_packet::Event::Firmware(message)) =
+                    self.station_runtime.backlog.remove(index)
+                {
+                    return super::rfk::be_rfk::parse_c2h_report(&message.bytes)
+                        .ok_or(super::rfk::Error::Table);
+                }
+            }
+            if self.io.now_us().saturating_sub(start) >= timeout_ms * 1000 {
+                return Err(super::power::Error::Timeout.into());
+            }
+            self.io.delay_us(50).await;
+            self.poll().map_err(|_| super::power::Error::Access)?;
+            let batch = self
+                .rx_hardware_step(32)
+                .map_err(|_| super::power::Error::Access)?;
+            for event in batch.events {
+                self.retain_event(event)?;
+            }
+        }
+    }
+    /// `rtw89_btc_ntfy_wl_rfk` (`BTC_WRFKT_CHLK`): run coexistence
+    /// with the current state, as `coex_switch_band` does. The WLRFK
+    /// scoreboard bit (`BIT(11)`) is not written here: the tree's
+    /// scoreboard helper overwrites the lower word instead of
+    /// setting/clearing one bit.
+    async fn coex_rfk(&mut self, _start: bool) -> Result<(), super::rfk::Error> {
+        super::rfk::Interface::admit(self)?;
+        self.coex_enforce()
+            .await
+            .map_err(|_| super::rfk::Error::Policy)
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
