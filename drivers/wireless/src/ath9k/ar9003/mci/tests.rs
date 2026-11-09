@@ -643,12 +643,17 @@ fn mci_update_wlan_channels() -> TestResult {
     // and BT channel `i` is payload bit `48 + i`
     // (`MCI_GPM_CLR_CHANNEL_BIT`), so bits 48..74 go: word 1 loses
     // its whole top half (0xffff_0000 -> 0) and word 2 its low 11
-    // bits (0xffff_ffff -> 0xffff_f800).
+    // bits (0xffff_ffff -> 0xffff_f800). The stored map is NOT the
+    // pristine channelmap, though: `update_wlan_channels` sends it,
+    // and Linux's `ar9003_mci_send_coex_wlan_channels` stamps the
+    // type/opcode into `mci->wlan_channels` in place and overwrites
+    // them with 0xff/0xff after the send — so bytes 4-5 (word 1's
+    // low half) read 0xffff at assertion time, not 0x0000.
     let (mut io, mut btcoex) = live();
     if update_wlan_channels(&mut io, &mut btcoex.mci, 2412, Ht40::None, false).is_err() {
         return TestResult::Fail("update_wlan_channels errored on 2412");
     }
-    if btcoex.mci.wlan_channels != [0, 0, 0xffff_f800, 0x7fff_ffff] {
+    if btcoex.mci.wlan_channels != [0, 0x0000_ffff, 0xffff_f800, 0x7fff_ffff] {
         return TestResult::Fail("2412 HT20 channel map is wrong");
     }
     // The map goes out as a channels GPM (type/opcode in word 1):
@@ -669,12 +674,14 @@ fn mci_update_wlan_channels() -> TestResult {
     }
     // allow_all leaves the map fully open: the local initial map
     // (`mci.c`: [0, 0xffff_0000, 0xffff_ffff, 0x7fff_ffff]), not the
-    // `init_mci` default (whose word 1 is 0xffff_ffff).
+    // `init_mci` default (whose word 1 is 0xffff_ffff) — and with
+    // the same in-place 0xff/0xff type-opcode stamp the send leaves
+    // behind, word 1 reads 0xffff_ffff, not 0xffff_0000.
     let (mut io, mut btcoex) = live();
     if update_wlan_channels(&mut io, &mut btcoex.mci, 2412, Ht40::None, true).is_err() {
         return TestResult::Fail("update_wlan_channels (allow_all) errored");
     }
-    if btcoex.mci.wlan_channels != [0, 0xffff_0000, 0xffff_ffff, 0x7fff_ffff] {
+    if btcoex.mci.wlan_channels != [0, 0xffff_ffff, 0xffff_ffff, 0x7fff_ffff] {
         return TestResult::Fail("allow_all channel map is wrong");
     }
     // Concurrent-TX power caps: HT20 0x14, HT40 0x10, else none.
