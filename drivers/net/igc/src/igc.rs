@@ -161,7 +161,7 @@ use crate::{
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
-use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
+use narf_bus::{enable_msix, map_bar_control, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_io::alloc_coherent;
 use narf_ipc::{channel, Consumer, Producer};
@@ -194,6 +194,21 @@ impl CapOp<BusDeviceCap, Write> for Check {
     }
 }
 
+fn pci_current<T>(
+    cap: &Cap<BusDeviceCap, Write>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, IgcError> {
+    struct Access<F>(F);
+    impl<T, F: FnOnce() -> T> CapOp<BusDeviceCap, Write> for Access<F> {
+        type Output = T;
+        fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+            Ok(self.0())
+        }
+    }
+    cap.invoke(Access(operation))
+        .map_err(|_| IgcError::BarMapFailed)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Hardware {
     mmio: MmioRegion,
@@ -204,6 +219,108 @@ struct RegisterAccess<'a> {
     reg: u64,
     value: Option<u32>,
 }
+struct PcieStatusAccess<'a>(&'a BusDevice);
+impl CapOp<BusDeviceCap, Write> for PcieStatusAccess<'_> {
+    type Output = Result<narf_bus::pci_express::PcieStatus, narf_bus::pci_express::PcieCapError>;
+    fn execute(self, cap: &Cap<BusDeviceCap, Write>) -> Result<Self::Output, CapError> {
+        // Retain the current PCI invocation across the capability-list walk
+        // and reads; read_status alone checks only a previously live grant.
+        Ok(narf_bus::pci_express::read_status(&cap.derive()?, self.0))
+    }
+}
+
+struct DmaSnoopingAccess<'a>(&'a BusDevice);
+pub(crate) trait PcieConfig {
+    fn read(&self, offset: u16) -> Result<u32, IgcError>;
+    fn write(&self, offset: u16, value: u32) -> Result<(), IgcError>;
+}
+struct DeviceConfig<'a> {
+    cap: &'a Cap<BusDeviceCap, Write>,
+    device: &'a BusDevice,
+}
+impl PcieConfig for DeviceConfig<'_> {
+    fn read(&self, offset: u16) -> Result<u32, IgcError> {
+        narf_bus::pci::read_config32(self.cap, self.device, offset)
+            .map_err(|_| IgcError::BarMapFailed)
+    }
+    fn write(&self, offset: u16, value: u32) -> Result<(), IgcError> {
+        narf_bus::pci::write_config32(self.cap, self.device, offset, value)
+            .map_err(|_| IgcError::BarMapFailed)
+    }
+}
+
+pub(crate) fn require_dma_snooping(
+    config: &impl PcieConfig,
+    express_offset: u64,
+) -> Result<(u16, u16), IgcError> {
+    if !(0x40..=0xf4).contains(&express_offset) || express_offset % 4 != 0 {
+        return Err(IgcError::Other("PCIe Device Control unavailable"));
+    }
+    let offset = (express_offset + 8) as u16;
+    let before = config.read(offset)?;
+    if before == u32::MAX {
+        return Err(IgcError::Other("PCIe device unavailable"));
+    }
+    // alloc_coherent supplies cached memory. Do not allow this endpoint to
+    // opt out of interconnect cache snooping. Preserve all other controls.
+    const NO_SNOOP_ENABLE: u16 = 0x0800;
+    let control = before as u16;
+    let wanted = control & !NO_SNOOP_ENABLE;
+    if wanted != control {
+        // The upper half is Device Status (RW1C): write zeros there rather
+        // than acknowledging errors observed in `before`.
+        config.write(offset, u32::from(wanted))?;
+    }
+    let after = config.read(offset)?;
+    if after == u32::MAX || after as u16 != wanted {
+        return Err(IgcError::Other("PCIe DMA snooping readback failed"));
+    }
+    Ok((control, after as u16))
+}
+
+impl CapOp<BusDeviceCap, Write> for DmaSnoopingAccess<'_> {
+    type Output = Result<(u16, u16), IgcError>;
+    fn execute(self, cap: &Cap<BusDeviceCap, Write>) -> Result<Self::Output, CapError> {
+        let configure = || {
+            // SAFETY: the live device invocation encloses the bounded
+            // capability walk and every subsequent configuration access.
+            let offset =
+                unsafe { narf_bus::pci_cap::find_cap(self.0, narf_bus::pci_express::PCIE_CAP_ID) }
+                    .map_err(|_| IgcError::BarMapFailed)?
+                    .ok_or(IgcError::Other("PCIe Device Control unavailable"))?;
+            require_dma_snooping(
+                &DeviceConfig {
+                    cap,
+                    device: self.0,
+                },
+                offset,
+            )
+        };
+        Ok(configure())
+    }
+}
+
+pub(crate) fn configure_dma_snooping(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Result<(u16, u16), IgcError> {
+    // read/write_config32 check a prior grant only; invoke must enclose
+    // the complete read/modify/write/readback operation.
+    cap.invoke(DmaSnoopingAccess(device))
+        .map_err(|_| IgcError::BarMapFailed)?
+}
+
+fn verify_memory_only(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<(), IgcError> {
+    use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+    let command = narf_bus::pci::read_command(cap, device).map_err(|_| IgcError::BarMapFailed)?;
+    if command == u16::MAX
+        || command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE
+    {
+        return Err(IgcError::Other("PCI memory-only setup rejected"));
+    }
+    Ok(())
+}
+
 impl CapOp<BusDeviceCap, Write> for RegisterAccess<'_> {
     type Output = u32;
     fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<u32, CapError> {
@@ -377,11 +494,26 @@ impl Igc {
         device: &BusDevice,
         cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Arc<Self>, IgcError> {
+        pci_current(cap, || Self::bring_up_current(device, cap))?
+    }
+
+    fn bring_up_current(
+        device: &BusDevice,
+        cap: &Cap<BusDeviceCap, Write>,
+    ) -> Result<Arc<Self>, IgcError> {
+        narf_bus::pci::prepare_memory_probe(cap, device).map_err(|_| IgcError::BarMapFailed)?;
         // SAFETY: caller's exclusive ownership contract.
-        let mmio = unsafe { map_bar(device, 0) }.map_err(|_| IgcError::BarMapFailed)?;
+        let mmio = unsafe { map_bar_control(device, 0) }.map_err(|_| IgcError::BarMapFailed)?;
         if mmio.len < 0x20000 {
             return Err(IgcError::BarMapFailed);
         }
+        narf_bus::pci::set_command(
+            cap,
+            device,
+            narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE,
+        )
+        .map_err(|_| IgcError::BarMapFailed)?;
+        verify_memory_only(cap, device)?;
         let hw = Hardware { mmio, cap: *cap };
         hardware::reset(&hw, 4)?;
         let mac = hardware::read_mac(&hw)?;
@@ -584,6 +716,10 @@ impl Igc {
     }
 
     fn start(&self) -> Result<(), IgcError> {
+        pci_current(&self.hw.cap, || self.start_current())?
+    }
+
+    fn start_current(&self) -> Result<(), IgcError> {
         self.apply_pci_quirks()?;
         if self.removed.load(Ordering::Acquire) {
             return Err(IgcError::Other("device removed"));
@@ -673,6 +809,19 @@ impl Igc {
         self.configure_interrupts();
         if self.removed.load(Ordering::Acquire) {
             return Err(IgcError::Other("device removed"));
+        }
+        // All ring bases, handlers and retained allocations are current
+        // before any DMA request or MSI write is permitted on the bus.
+        narf_bus::pci::set_command(&self.hw.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
+            .map_err(|_| IgcError::BarMapFailed)?;
+        let command = narf_bus::pci::read_command(&self.hw.cap, &self.device)
+            .map_err(|_| IgcError::BarMapFailed)?;
+        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        if command == u16::MAX
+            || command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+                != BUS_MASTER | MEM_SPACE | INTX_DISABLE
+        {
+            return Err(IgcError::Other("PCI DMA enable rejected"));
         }
         hardware::enable_data(&self.hw)?;
         self.mtu.store(mtu, Ordering::Release);
@@ -849,18 +998,16 @@ impl Igc {
     }
     fn reset_and_start(&self) -> Result<(), IgcError> {
         self.cancel_timestamps(125);
-        let result = (|| {
-            narf_bus::pci::restore_config(&self.hw.cap, &self.device, &self.saved_pci)
+        let result = pci_current(&self.hw.cap, || {
+            narf_bus::pci::prepare_memory_probe(&self.hw.cap, &self.device)
                 .map_err(|_| IgcError::BarMapFailed)?;
-            // Restore PCI memory/master decoding after system sleep.
-            narf_bus::pci::set_command(
-                &self.hw.cap,
-                &self.device,
-                narf_bus::pci::cmd::MEM_SPACE
-                    | narf_bus::pci::cmd::BUS_MASTER
-                    | narf_bus::pci::cmd::INTX_DISABLE,
-            )
-            .map_err(|_| IgcError::BarMapFailed)?;
+            let mut saved = self.saved_pci;
+            saved.command = (saved.command & !narf_bus::pci::cmd::BUS_MASTER)
+                | narf_bus::pci::cmd::MEM_SPACE
+                | narf_bus::pci::cmd::INTX_DISABLE;
+            narf_bus::pci::restore_config(&self.hw.cap, &self.device, &saved)
+                .map_err(|_| IgcError::BarMapFailed)?;
+            verify_memory_only(&self.hw.cap, &self.device)?;
             let closed = self
                 .queues()
                 .iter()
@@ -874,7 +1021,8 @@ impl Igc {
             }
             self.stats.lock().resets += 1;
             self.start()
-        })();
+        })
+        .and_then(|result| result);
         if result.is_err() {
             let _ = hardware::quiesce(&self.hw, self.queues().len());
             self.state.store(FAILED, Ordering::Release);
@@ -1032,6 +1180,63 @@ impl Igc {
         stats.tx_bytes = counters.value(0x4090);
     }
 
+    /// Capture the first stalled completion before recovery destroys it.
+    /// No added packet/IRQ logging or cache maintenance on live DMA buffers.
+    fn dump_completion_state(&self) {
+        use core::fmt::Write;
+        let Ok(_operation) = self.operation() else {
+            return;
+        };
+        let _ = writeln!(
+            narf_console::Writer,
+            "[igc] {} first TX timeout: ctrl={:#x} status={:#x}",
+            self.name(),
+            self.hw.read(0),
+            self.hw.read(8),
+        );
+        if let Ok(Ok(status)) = self.hw.cap.invoke(PcieStatusAccess(&self.device)) {
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] PCIe device_control={:#x} device_status={:#x}",
+                status.device_control,
+                status.device_status,
+            );
+        }
+        for (q, queue) in self.queues().iter().enumerate() {
+            let snapshot = queue.completion_snapshot();
+            let offset = q as u64 * 0x40;
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] q{q} TX dma={:#x} cpu={:#x} next={} clean={} end={:?} words={:08x?} hw_head={} hw_tail={} ctl={:#x} wb_addr={:#x}:{:08x} dma_ctl={:#x}",
+                snapshot.tx_dma,
+                snapshot.tx_cpu,
+                snapshot.tx_next,
+                snapshot.tx_clean,
+                snapshot.tx_end,
+                snapshot.tx_words,
+                self.hw.read(0xe010 + offset),
+                self.hw.read(0xe018 + offset),
+                self.hw.read(0xe028 + offset),
+                self.hw.read(0xe03c + offset),
+                self.hw.read(0xe038 + offset),
+                self.hw.read(0xe014 + offset),
+            );
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] q{q} RX dma={:#x} cpu={:#x} head={} words={:08x?} hw_head={} hw_tail={} ctl={:#x} srrctl={:#x} dma_ctl={:#x}",
+                snapshot.rx_dma,
+                snapshot.rx_cpu,
+                snapshot.rx_head,
+                snapshot.rx_words,
+                self.hw.read(0xc010 + offset),
+                self.hw.read(0xc018 + offset),
+                self.hw.read(0xc028 + offset),
+                self.hw.read(0xc00c + offset),
+                self.hw.read(0xc014 + offset),
+            );
+        }
+    }
+
     fn set_pme(&self, enabled: bool) -> Result<(), IgcError> {
         self.hw
             .cap
@@ -1058,6 +1263,17 @@ impl Igc {
         Ok(())
     }
     fn apply_pci_quirks(&self) -> Result<(), IgcError> {
+        // start() runs before queue enable, including recovery/resume after
+        // PCI state restoration. Fail closed if coherent DMA cannot be set.
+        let (before, after) = configure_dma_snooping(&self.hw.cap, &self.device)?;
+        if before != after {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] {} PCIe DMA snooping: device_control={before:#06x}->{after:#06x}",
+                self.name(),
+            );
+        }
         self.set_pme(false)?;
         if matches!(
             self.device.id.device,
@@ -1205,17 +1421,6 @@ impl narf_power::device_pm::DevicePmOps for Igc {
         self.state
             .compare_exchange(SUSPENDED, CHANGING, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| narf_power::device_pm::DevicePmError::Busy)?;
-        if narf_bus::pci::set_power_state(
-            &self.hw.cap,
-            &self.device,
-            narf_bus::pci::PciPowerState::D0,
-        )
-        .is_err()
-        {
-            self.state.store(FAILED, Ordering::Release);
-            return Err(narf_power::device_pm::DevicePmError::DriverError);
-        }
-        self.hw.delay(10_000);
         self.reset_and_start()
             .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)?;
         if !self.admin_up.load(Ordering::Acquire) {
@@ -1295,18 +1500,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     {
         return Err(narf_bus::ProbeError::BadDevice);
     }
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE
-            | narf_bus::pci::cmd::BUS_MASTER
-            | narf_bus::pci::cmd::INTX_DISABLE,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: PCI match framework grants exclusive function ownership.
     let controller = match unsafe { Igc::bring_up(&device, &cap) } {
         Ok(controller) => controller,
         Err(error) => {
+            let _ = pci_current(&cap, || {
+                narf_bus::pci::clear_command(
+                    &cap,
+                    &device,
+                    narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE,
+                )
+            });
             let _ = core::fmt::write(
                 &mut narf_console::Writer,
                 format_args!(
@@ -1709,7 +1913,14 @@ fn spawn_pumps(
                     .iter()
                     .any(|q| q.stalled(narf_time::now_cycles(), timeout))
             {
-                device.stats.lock().tx_timeouts += 1;
+                let first = {
+                    let mut stats = device.stats.lock();
+                    stats.tx_timeouts += 1;
+                    stats.tx_timeouts == 1
+                };
+                if first {
+                    device.dump_completion_state();
+                }
                 let _ = device.recover();
             }
             narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000)).await;

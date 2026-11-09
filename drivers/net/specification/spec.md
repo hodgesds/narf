@@ -178,6 +178,26 @@ PHY ownership and acknowledged advanced queue enable. Blank-NVM IDs match,
 but an invalid factory MAC fails probe; NVM programming is unsupported.
 I220/I221 omit 2500 Mbps. Carrier, speed and duplex come from hardware.
 
+Initial built-in and module IGC probes park inherited mastering/decode and
+verify D0 before BAR sizing. Control MMIO is mapped before memory decode is
+enabled; BME remains off through reset, allocation and ring programming.
+Recovery/resume restores PCI state with BME masked before reset/reinitialization.
+Only retained, programmed DMA rings precede the final BME grant. A failed
+probe parks the function; failed quiescence still retains uncertain DMA.
+Shared queue initialization rejects invalid ring geometry or failed base,
+length, SRRCTL and TX writeback-mode readbacks before queue enable. TX head
+writeback is disabled: terminal descriptor DD remains the completion authority.
+Advanced one-buffer RX programs a 2048-byte packet buffer, 256-byte header
+size and SRRCTL drop enable at bit31, with reserved bit28 clear.
+
+Before enabling queues, the built-in driver clears PCIe Device Control's
+No Snoop Enable bit and verifies the readback, including after recovery or
+resume restores PCI state. Its cached coherent rings require snooped DMA.
+Other Device Control fields are preserved; Device Status RW1C bits are not
+acknowledged by this write. Missing/unresponsive configuration or a failed
+readback prevents queue enable. This does not establish coherence for an
+otherwise non-coherent platform interconnect.
+
 Each function supports 1–4 queue pairs, initially bounded by online CPUs, with
 independent 64–4096-entry TX/RX rings (multiples of eight). The initial size is
 256 entries. MSI-X entry 0 handles other causes and entries 1–4 route queue

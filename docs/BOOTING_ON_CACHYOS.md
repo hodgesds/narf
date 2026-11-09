@@ -1360,7 +1360,7 @@ mounted writable unless the command line says `ro`.
 
 The maintained collector lives in `verification/data/host-capture/`. It runs
 only with `narf.disks=root-rw` and preserves independent kernel, journal,
-service, seat and process streams under `/narf-diagnostics/plasma-<boot-id>`.
+service, seat, process and network streams under `/narf-diagnostics/plasma-<boot-id>`.
 Build its userspace stream helper on the target distribution:
 
 ```sh
@@ -1369,15 +1369,18 @@ cc -O2 -std=c11 -Wall -Wextra -Werror \
   verification/data/host-capture/narf-capture-stream.c \
   -o target/host-capture/narf-capture-stream
 python3 verification/data/host-capture/test_batch_stream.py
+python3 verification/data/host-capture/test_network_capture.py
 bash -n verification/data/host-capture/narf-plasma-capture
+bash -n verification/data/host-capture/narf-network-capture
 ```
 
 For a host that already has `narf-plasma-capture.service` enabled, update
-both executables together; `install -b` retains the previous files:
+all three files together; `install -b` retains the previous files:
 
 ```sh
 sudo install -b -m 0755 target/host-capture/narf-capture-stream \
-  verification/data/host-capture/narf-plasma-capture /usr/local/libexec/
+  verification/data/host-capture/narf-plasma-capture \
+  verification/data/host-capture/narf-network-capture /usr/local/libexec/
 ```
 
 For a first installation, also install and enable the service:
@@ -1389,7 +1392,23 @@ sudo systemctl daemon-reload
 sudo systemctl enable narf-plasma-capture.service
 ```
 
-Version `10-buffered-stream-helper` corrects a diagnostic observer effect.
+Version `12-network-pci-init-audit` extends the independent `network.log` for the
+first few minutes. It records PCI network devices even when driver probe
+failed, bridge identity and first-sample PCI configuration/topology, interface counters, packet/UDP socket and routing state,
+NetworkManager/WPA logs, and read-only ethtool link, queue, offload,
+statistics and register queries. Each query has a timeout and records its
+exit status; a stuck network tool cannot block the other capture streams.
+The queries use the legacy ethtool ioctl ABI for NARF compatibility. The
+register dump contains queue heads/tails for diagnosing a carrier-up NIC
+that cannot complete DHCP. It requests no self-tests or configuration
+changes. To collect a Linux baseline without starting the boot collector:
+
+```sh
+bash verification/data/host-capture/narf-network-capture --once \
+  > target/host-capture/network-linux.log 2>&1
+```
+
+Version `10-buffered-stream-helper` corrected a diagnostic observer effect.
 The previous shell stream reader issued roughly one read per byte, and
 shell `printf` split buffered samples into many small writes. The helper
 batches both reads and writes in 16 KiB blocks, flushes partial blocks after
@@ -1404,8 +1423,138 @@ performance measurements or physical Plasma acceptance.
 
 This collector update does not require a kernel rebuild. Keep the kernel
 revision and collector version separately recorded when assessing a boot.
+The IGC driver also prints a descriptor snapshot on its first TX watchdog
+timeout, before recovery resets the queues. That driver diagnostic requires
+the updated kernel. The `[igc]` lines include CPU/DMA ring addresses, the
+oldest pending TX descriptor, the next software RX descriptor, hardware
+heads/tails, writeback controls and PCIe device control/status. These are
+read-only samples of live DMA state, not completion or quiescence proofs.
 An abrupt reset can lose the last buffered fragment and unsynced filesystem
 data; retained logs alone do not establish exactly when the machine stopped.
+
+### Physical network bring-up evidence (2026-11-09)
+
+The desktop host has two independent endpoints behind the AMD 600-series
+chipset: `00:02.1 -> 05:00.0 -> 06:0a.0 -> 0e:00.0` is an Intel
+I225-V (`8086:15f3`, revision 01), and the `06:0b.0 -> 0f:00.0` branch is a
+MediaTek MT7922 (`14c3:0616`). Both negotiate PCIe 5.0 GT/s x1. Linux's
+`igc` brings up `enp14s0` at 1 Gbps full duplex, four 256-entry queue pairs,
+with working DHCP (`192.168.3.165/22`, gateway `192.168.1.1`). Its baseline
+reports no packet errors or timeouts. The radio fails Linux `mt7921e`
+probe with `driver own failed`, error `-5`, as well as failing NARF ownership
+acquisition. Do not assume both failures have the same cause, or that a warm
+reboot has removed power from the radio.
+
+Keep the original directories under `/narf-diagnostics/plasma-<boot-id>`.
+The following are observations from physical boots, distinct from model or
+QEMU results:
+
+| Boot ID | Kernel identity | Network evidence |
+| --- | --- | --- |
+| `016de032-b179-479e-b012-fe4a65b678f8` | Revision `27df4a9d8313bfb4ddbe6985d6113718fdff2b2f` | IGC carrier up and managed by NetworkManager; repeated DHCP timeout. MT7922 `DriverOwnTimeout`, LPCTL `0x4`. |
+| `db2ac425-b179-479e-b012-fe4a8895eaf3` | Same installed kernel; collector `11-network-snapshots` | Hardware RX 23→327 and TX 0→87, software RX/completions zero, 13 TX watchdog recoveries. RX hardware heads advance without CRC/no-buffer/missed errors. |
+| `0304012d-b179-479e-b012-fe4ae40288f7` | Diagnostic kernel SHA256 `8adcaf9569aa29a2248abbe88ce7abb4472d65cb6e9647a20d70181a7541bc7b` | First-timeout dump: TX heads equal tails, RX heads advance, but CPU descriptor words retain their original contents with DD clear. PCIe Device Control `0x2810`, Device Status `0x10`. |
+| `49d20e7a-b179-479e-b012-fe4ac1e90fdc` | Snooping kernel SHA256 `b756826195388cd2b357e788dc2b616dd6c2b461d104c7439d6ff8f873f32062` | No Snoop verified clear (`0x2810→0x2010`), but hardware RX 26→218/TX 0→84, software completions zero, nine watchdog resets. Ring addresses are below64 GiB; CPU descriptors still retain original contents. MT7922 ownership still fails. |
+
+The last two captures and Linux baseline are copied under
+`target/host-capture/network-20261109/`, with per-capture summaries. The
+diagnostic image and its exact source/manifest/install metadata remain under
+`target/host-narf/network-20261109/`. Ring DMA addresses above 64 GiB are
+observed, but are not by themselves evidence of invalid RAM or an address
+width limit. Do not reclaim packets from a hardware head alone or flush
+dirty cache lines over live device writeback.
+
+Clearing PCIe No Snoop Enable alone did **not** repair completions. The
+latest capture is preserved in
+`target/host-narf/network-init-audit-20261109/narf-49d20e7a/`; the installed
+failed candidate remains in `target/host-narf/network-snoop-20261109/`.
+Below64-GiB rings also fail, so the observed failure is not explained by
+crossing that boundary. RX/TX descriptor layouts and writeback thresholds
+match the Linux reference; thresholds have not been changed speculatively.
+
+The consolidated kernel `f4cca489a0bf71fd0d8a8cb56f1232ea979f4f79d91e930ad0e5e3de49f39f7e`
+was installed at2026-11-09 21:07 UTC and the user reports it failed to reach
+login. No new userspace capture directory or journal boot was retained, so
+the precise stop remains unconfirmed. The newly added inherited-IOMMU
+diagnostic incorrectly assumed all IVRS register windows were RAM-direct-mapped.
+Its follow-up uses the backend's checked Device mappings and skips failed
+mappings. This is a concrete defect; its relationship to that physical
+failure is assessed against the actual IVRS below; the visible stop point
+remains unknown. The earlier
+kernel that reached login remains in `target/host-narf/network-snoop-20261109/`.
+The follow-up also removes the speculative WFSYS reset after initial
+ownership timeout, matching Linux's ownership prerequisite. Even a bounded
+poll cannot make an unclocked MMIO load return; failure diagnostics now read
+only the HIF ownership register. The intermediate mapping-only kernel passed
+both x86 root rehearsals with an emulated AMD IOMMU and actually logged its
+inherited registers; that evidence does not establish the physical stop cause.
+
+The root-only follow-up capture contains a valid510-byte IVRS: IVHD types
+`0x10`, `0x11` and `0x40` all identify PCI`0000:00:00.2` at`0xf7700000`.
+These are three descriptions of one hardware unit; the basic discovery count
+of3 is a record count. The prior successful boot already read EFR in that
+same page, so an additional unmapped IOMMU window does not explain this
+host's failed login. The collected `boot.log` files identify Linux boots
+only, with no pstore or EFI NARF log recovered. The physical stop remains
+unlocalized; preserve the distinction between the confirmed code defects
+and the unconfirmed physical cause.
+
+The subsequent initialization audit compares local Linux `ecd997b0189a`
+(`igc`, `mt7921/pci.c`, `mt792x_core.c`, `mt792x_dma.c`) and the Intel I225
+Software User Manual v1.3 (§8.9.6, §8.11.16). It covers these entry points:
+
+| Entry | Audited behavior and corrections |
+| --- | --- |
+| Initial PCI probe, both NICs | Park inherited BME/decode and INTx; verify D0 and settle lower-state exits; preserve BARs before sizing; map control MMIO before memory decode; defer BME until owned rings are programmed. |
+| IGC built-in, reset, recovery, reconfiguration, resume | Current PCI invocation encloses setup; saved Command restores with BME masked; reset/quiescence still gates buffer reuse; No Snoop is verified clear again before queue enable. |
+| IGC module | Fresh-context preparation shares parking/D0 policy and coherent PCIe control; Command enable is checked; BME follows retained ring programming. Shared queue code fixes SRRCTL's reserved-bit error and verifies ring/format readback. |
+| IGC advanced queues | Drop enable belongs at SRRCTL bit31, not the formerly programmed reserved bit28. Header size is256 bytes as in Linux. Clear inherited TX head-writeback selection so DD is authoritative; reject failed register readbacks before queue enable. |
+| MT7922 built-in and hosted module discovery | Firmware-own → driver-own → WFSYS reset before transport construction, ownership failure returns before WFSYS access. Verify reset assertion,50-ms hold, release and ready only after ownership; log failed phase. Mastering remains off. |
+| MT76 retained firmware, recovery and resume | Existing firmware validation, owned ring/address masks, DMA idle/reset and generation checks remain in force. Fresh probe does not bypass ownership or an existing transport's uncertain-DMA retention. |
+| Shared DMA/IOMMU | Coherent buffers use their CPU/DMA address pair. Default `Identity` detects AMD-Vi but leaves hardware configuration untouched; added read-only per-unit control/table-base logging distinguishes that contract from actual firmware state. No translation-policy change is inferred from the Ethernet trace. |
+
+The frozen x86_64 scope (`bus/pci-probe`, IGC, MT7921, module KABI and
+IOMMU) passes491 tests,0 failures,3 skips. The MT76 P2P prefix is excluded
+after four failures were reproduced on unmodified `e494a84092db`; none of
+those failures is counted as repaired. Strict changed-crate lint contexts and
+standalone IGC module builds pass for both architectures. The aarch64 runtime
+run was cancelled at the user's request for this desktop iteration.
+Exact-source, test-log and Linux-reference hashes are staged alongside the
+candidate; physical acceptance and exact-image root rehearsals have separate
+receipts.
+
+The SRRCTL programming error and missing probe sequencing are concrete code
+findings. They are candidates for physical validation, not evidence that
+Ethernet DHCP or Wi-Fi now works. Keep the first-timeout capture if either
+still fails. A privileged **read-only** Linux register/configuration baseline
+can be collected with the staged `capture-linux.sh`; it never resets links,
+reprobes devices or changes network configuration.
+
+The 2026-11-09 PR audit found 60 open PRs and inspected changed-file lists
+for 45 candidates related to networking, wireless, shared bus/ABI or boot
+work. None of those lists touches IGC or MT76. The saved API responses and
+overlap report are in `target/host-capture/network-20261109/pr-audit/`.
+[PR #1973](https://github.com/hodgesds/narf/pull/1973) adds DHCP option 42
+(NTP servers), without repairing descriptor DMA.
+[PR #1991](https://github.com/hodgesds/narf/pull/1991),
+[PR #1992](https://github.com/hodgesds/narf/pull/1992), and
+[PR #1997](https://github.com/hodgesds/narf/pull/1997) concern IGB, AQC1xx,
+and IXGBE respectively. The PCI changes in
+[PR #1054](https://github.com/hodgesds/narf/pull/1054) only add platform-bus
+match arms to the relevant files.
+[PR #1959](https://github.com/hodgesds/narf/pull/1959) and
+[PR #1966](https://github.com/hodgesds/narf/pull/1966) are Navi22 display
+work; #1966 depends on [#1967](https://github.com/hodgesds/narf/pull/1967).
+A later same-day refresh found64 open PRs and rechecked six new or updated
+network/wireless/example file lists. None overlaps these IGC/MT76 or shared
+initialization changes. [#2003](https://github.com/hodgesds/narf/pull/2003)
+extends an e1000 multi-instance fixture;
+[#2000](https://github.com/hodgesds/narf/pull/2000) fixes listener teardown;
+[#1899](https://github.com/hodgesds/narf/pull/1899) changes iwlwifi tests, not
+the four MT76 P2P failures reproduced on this branch's unmodified HEAD.
+The refresh responses and exact path intersections are under
+`target/host-narf/network-init-audit-20261109/pr-audit-refresh.json`.
+Refresh again before proposing upstream integration.
 
 ### What fails, and why that is harmless
 

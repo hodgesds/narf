@@ -13,7 +13,7 @@ boot_id=$(cat /proc/sys/kernel/random/boot_id)
 case "$boot_id" in ''|*[!a-fA-F0-9-]*) exit 1 ;; esac
 output=/narf-diagnostics/plasma-$boot_id
 mkdir -p "$output/process-maps" || exit 1
-printf 'capture-version: 10-buffered-stream-helper\n' > "$output/capture-version.txt"
+printf 'capture-version: 12-network-pci-init-audit\n' > "$output/capture-version.txt"
 
 # Keep stream writes bounded and batched: dmesg's per-line writes otherwise
 # force repeated root-filesystem transactions while other services page in.
@@ -28,6 +28,17 @@ batched_stream() {
 kernel_snapshots() {
     # Append new records instead of repeatedly rewriting the entire boot log.
     dmesg --follow --color=never 2>&1 | batched_stream > "$output/kernel-stream.log"
+}
+
+network_snapshots() {
+    local helper=${BASH_SOURCE[0]%/*}/narf-network-capture
+    if [ ! -r "$helper" ]; then
+        printf 'narf capture: missing network helper %s\n' "$helper" > "$output/network.log"
+        return
+    fi
+    # A stuck network query must not hide independent process/seat streams.
+    timeout --kill-after=2s 240s /usr/bin/bash "$helper" 2>&1 |
+        batched_stream > "$output/network.log"
 }
 
 # Capture the missing identity of a blocked compositor read. No trap hooks.
@@ -117,7 +128,7 @@ process_snapshots() {
                 pid=${process##*/}
                 printf -v sample '%spid=%s comm=%s\n' "$sample" "$pid" "$comm"
                 case "$comm" in
-                    systemd|plasmalogin*|plasma-login*|startplasma*|kwin*|systemd-execut*|systemd-tmpfile*|mount|\(mount\)|dbus*|systemd-logind|systemd-journal*|journalctl|timeout)
+                    systemd|plasmalogin*|plasma-login*|startplasma*|kwin*|plasma*|ksplash*|kded*|konsole*|cachyos-hello|systemd-execut*|systemd-tmpfile*|mount|\(mount\)|dbus*|systemd-logind|systemd-journal*|journalctl|timeout|NetworkManager|wpa_supplicant)
                         for field in status syscall wchan; do
                             if [ -r "$process/$field" ]; then
                                 printf -v sample '%s%s:\n%s\n' "$sample" "$field" "$(<"$process/$field")"
@@ -200,6 +211,7 @@ seat_snapshots() {
 seat_snapshots &
 boot_console_snapshots &
 kernel_snapshots &
+network_snapshots &
 process_snapshots &
 kwin_read_snapshots &
 service_snapshots &

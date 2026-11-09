@@ -106,12 +106,23 @@ added to the `kernel_abi!{}` block. `dev` = device token the probe received.
 
 **Stage 1 — PCI + MMIO**
 ```
-narf_pci_enable(dev, cmd_bits: u16) -> i32          // set_command (MEM|BUSMASTER|…), cap-checked
+narf_pci_prepare_probe(dev) -> i32                 // park inherited DMA/decode, checked D0 entry
+narf_pci_enable(dev, cmd_bits: u16) -> i32          // set/readback Command, cap-checked
 narf_bar_map(dev, bar_idx: u8) -> u64               // -> mmio handle (0 = fail)
 narf_mmio_read32(dev, mmio: u64, off: u64, out: *mut u32) -> i32
 narf_mmio_write32(dev, mmio: u64, off: u64, val: u32) -> i32
 narf_mmio_wait32(dev, mmio: u64, off: u64, mask: u32, expected: u32, timeout_ns: u64) -> i32
 ```
+
+`narf_pci_prepare_probe` is for a fresh, exclusively executing probe token,
+before mapping BARs or allocating DMA/MSI-X/pollers/interfaces. It refuses
+existing resources (`-EBUSY`) and resolves the caller's exact device authority;
+the D0 wait holds no context spinlock. It leaves BME and memory decode off and
+INTx disabled. The module enables memory for setup, then BME only after owning
+and programming every DMA ring. PCIe No Snoop Enable is cleared/readback for
+cached coherent DMA; unrelated controls and RW1C Device Status are preserved.
+`narf_pci_enable` returns `-EIO` when configuration disappears or requested bits
+do not latch. Preparation is not a DMA completion or teardown fence.
 
 The first ABI intentionally exports only the 32-bit MMIO width needed by
 e1000. PCI configuration reads and additional MMIO widths are not part of the

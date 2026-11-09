@@ -34,6 +34,7 @@ struct Model {
     stuck_nvm: Cell<bool>,
     mdic_error: Cell<bool>,
     bad_echo: Cell<bool>,
+    rejected_register: Cell<Option<u64>>,
 }
 impl Model {
     fn new() -> Self {
@@ -79,6 +80,9 @@ impl Registers for Model {
     }
     fn write(&self, reg: u64, mut value: u32) {
         self.writes.borrow_mut().push((reg, value));
+        if self.rejected_register.get() == Some(reg) {
+            return;
+        }
         if reg == 0 && value & (1 << 26) != 0 {
             value &= !(1 << 26);
             self.regs
@@ -162,6 +166,132 @@ macro_rules! check {
         }
     };
 }
+
+struct PcieConfigModel {
+    value: Cell<u32>,
+    writes: RefCell<Vec<(u16, u32)>>,
+    stuck: Cell<bool>,
+    gone_after_write: Cell<bool>,
+}
+impl PcieConfigModel {
+    fn new(value: u32) -> Self {
+        Self {
+            value: Cell::new(value),
+            writes: RefCell::new(Vec::new()),
+            stuck: Cell::new(false),
+            gone_after_write: Cell::new(false),
+        }
+    }
+}
+impl crate::igc::PcieConfig for PcieConfigModel {
+    fn read(&self, offset: u16) -> Result<u32, IgcError> {
+        assert_eq!(offset, 0x78);
+        Ok(self.value.get())
+    }
+    fn write(&self, offset: u16, value: u32) -> Result<(), IgcError> {
+        assert_eq!(offset, 0x78);
+        self.writes.borrow_mut().push((offset, value));
+        if self.gone_after_write.get() {
+            self.value.set(u32::MAX);
+        } else if !self.stuck.get() {
+            // Device Status RW1C above Device Control: zero preserves it.
+            let status = (self.value.get() & 0xffff_0000) & !(value & 0xffff_0000);
+            self.value.set(status | (value & 0xffff));
+        }
+        Ok(())
+    }
+}
+
+fn smoke_igc_dma_snooping_preserves_control_and_status() -> TestResult {
+    let config = PcieConfigModel::new(0x001f_2810);
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70) == Ok((0x2810, 0x2010)),
+        "No Snoop was not disabled with readback"
+    );
+    check!(
+        config.value.get() == 0x001f_2010 && config.writes.borrow().as_slice() == [(0x78, 0x2010)],
+        "unrelated controls changed or RW1C status was acknowledged"
+    );
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70) == Ok((0x2010, 0x2010))
+            && config.writes.borrow().len() == 1,
+        "already-snooping endpoint was written unnecessarily"
+    );
+    // A later PCI state restore must not reintroduce non-snooping DMA.
+    config.value.set(0x001f_38b0);
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70) == Ok((0x38b0, 0x30b0))
+            && config.value.get() == 0x001f_30b0,
+        "restored PCI controls were not preserved while disabling No Snoop"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_dma_snooping_preserves_control_and_status
+);
+
+fn smoke_igc_dma_snooping_rejects_unavailable_config() -> TestResult {
+    let config = PcieConfigModel::new(0x001f_2810);
+    for offset in [0, 0x3c, 0x71, 0xfc, u64::MAX] {
+        check!(
+            crate::igc::require_dma_snooping(&config, offset).is_err()
+                && config.writes.borrow().is_empty(),
+            "malformed PCIe capability was accessed"
+        );
+    }
+    config.value.set(u32::MAX);
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70).is_err()
+            && config.writes.borrow().is_empty(),
+        "removed endpoint accepted or written"
+    );
+    config.value.set(0x001f_2810);
+    config.stuck.set(true);
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70).is_err(),
+        "No Snoop write refusal accepted"
+    );
+    config.gone_after_write.set(true);
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70).is_err(),
+        "endpoint removal during readback accepted"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_dma_snooping_rejects_unavailable_config
+);
+
+fn smoke_igc_dma_snooping_revoked_before_ecam() -> TestResult {
+    let cap = narf_capabilities::Cap::bootstrap(); // Isolated test authority.
+    cap.revoke();
+    let addr = narf_bus::PcieAddr::new(0, 0, 0, 0);
+    let device = narf_bus::BusDevice {
+        addr: narf_bus::BusAddr::Pcie(addr),
+        id: narf_bus::DeviceId {
+            vendor: 0x8086,
+            device: 0x15f3,
+            class: 0x020000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: narf_bus::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    };
+    check!(
+        crate::igc::configure_dma_snooping(&cap, &device).is_err(),
+        "revoked configuration authority accepted"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_dma_snooping_revoked_before_ecam
+);
 
 fn smoke_igc_wait_does_not_repeat_acquisition() -> TestResult {
     let acquisitions = Cell::new(0);
@@ -366,6 +496,7 @@ kernel_test_in!("drivers/net/igc", smoke_igc_reset_requires_dma_and_nvm_ack);
 
 fn smoke_igc_queue_enable_and_rss() -> TestResult {
     let m = Model::new();
+    m.regs.borrow_mut().extend([(0xe0f8, 1), (0xe0fc, 0xdead)]);
     check!(
         hardware::queue(&m, 3, 0x112233440000, 0x556677880000, 256).is_ok(),
         "queue setup failed"
@@ -375,8 +506,12 @@ fn smoke_igc_queue_enable_and_rss() -> TestResult {
         "TX ring DMA address/length wrong"
     );
     check!(
-        m.value(0xc0d8) == 255 && m.value(0xc0cc) == 0x12000002,
+        m.value(0xc0d8) == 255 && m.value(0xc0cc) == 0x82000402,
         "RX tail/type/size wrong"
+    );
+    check!(
+        m.value(0xe0f8) == 0 && m.value(0xe0fc) == 0,
+        "inherited TX head writeback still suppresses descriptor DD"
     );
     let rss = narf_net::rss::RssConfig::standard(4, 128);
     hardware::configure(&m, [2, 1, 2, 3, 4, 5], 9216, &rss);
@@ -414,6 +549,37 @@ fn smoke_igc_queue_enable_and_rss() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_queue_enable_and_rss);
+
+fn smoke_igc_queue_rejected_configuration_never_enables_dma() -> TestResult {
+    // Each hardware refusal must stop before either queue is enabled.
+    for rejected in [
+        0xc000, 0xc004, 0xc008, 0xe000, 0xe004, 0xe008, 0xe038, 0xc00c,
+    ] {
+        let m = Model::new();
+        m.regs.borrow_mut().insert(rejected, 0xdead_beef);
+        m.rejected_register.set(Some(rejected));
+        check!(
+            hardware::queue(&m, 0, 0x112233440000, 0x556677880000, 256).is_err(),
+            "rejected ring or completion format accepted"
+        );
+        check!(
+            m.value(0xc028) & (1 << 25) == 0 && m.value(0xe028) & (1 << 25) == 0,
+            "DMA queue enabled after configuration rejection"
+        );
+    }
+    for (q, tx, count) in [(4, 0x1000, 256), (0, 0x1001, 256), (0, 0x1000, 65)] {
+        let m = Model::new();
+        check!(
+            hardware::queue(&m, q, tx, 0x2000, count).is_err() && m.writes.borrow().is_empty(),
+            "invalid ring geometry reached hardware"
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_queue_rejected_configuration_never_enables_dma
+);
 
 fn smoke_igc_negotiated_link_metadata() -> TestResult {
     for (status, speed) in [(3, 10), (0x43, 100), (0x83, 1000), (0x400083, 2500)] {
@@ -659,6 +825,21 @@ fn smoke_igc_tx_owned_until_final_completion() -> TestResult {
         covered == 8054 && q.reclaim() == 0,
         "uncompleted frame reclaimed"
     );
+    let before = q.statistics();
+    let snapshot = q.completion_snapshot();
+    check!(
+        snapshot.tx_end == Some(end - 1)
+            && snapshot.tx_next == end
+            && snapshot.tx_clean == 0
+            && snapshot.tx_dma == q.tx_ring.dma_addr().raw()
+            && snapshot.tx_cpu == q.tx_ring.cpu_ptr::<u8>() as usize
+            && snapshot.tx_words[2] & 0x09000000 == 0x09000000
+            && snapshot.tx_words[3] & 1 == 0
+            && snapshot.rx_head == 0
+            && snapshot.rx_words[2..] == [0, 0]
+            && q.statistics() == before,
+        "stalled descriptor snapshot changed ownership or selected the wrong slot"
+    );
     // Completing a context/intermediate slot is insufficient.
     // SAFETY: the test is the sole DMA model writer of this queue.
     unsafe {
@@ -673,6 +854,10 @@ fn smoke_igc_tx_owned_until_final_completion() -> TestResult {
             1,
         );
     }
+    check!(
+        q.completion_snapshot().tx_words[3] & 1 != 0 && q.statistics()[4] == 1,
+        "snapshot did not observe DD without reclaiming it"
+    );
     check!(
         q.reclaim() == 1 && q.reclaim() == 0,
         "final completion ownership not reclaimed exactly once"

@@ -21,6 +21,9 @@ pub(crate) trait Registers {
     }
 }
 
+// Keep the timeout construction at the caller: outlining its enum copy can
+// introduce an unavailable memcpy relocation in the standalone ARM module.
+#[inline(always)]
 pub(crate) fn poll(r: &impl Registers, reg: u64, mask: u32, value: u32) -> Result<(), IgcError> {
     if r.wait(100_000, || {
         let observed = r.read(reg);
@@ -400,6 +403,15 @@ pub(crate) fn queue_sized(
     tx_count: usize,
     rx_count: usize,
 ) -> Result<(), IgcError> {
+    if q >= 4
+        || tx & 127 != 0
+        || rx & 127 != 0
+        || [tx_count, rx_count]
+            .into_iter()
+            .any(|count| !(64..=4096).contains(&count) || count % 8 != 0)
+    {
+        return Err(IgcError::Other("invalid DMA ring geometry"));
+    }
     let offset = q as u64 * 0x40;
     for base in [0xc000, 0xe000] {
         r.write(base + offset + 0x28, 0);
@@ -408,16 +420,45 @@ pub(crate) fn queue_sized(
         let addr = if base == 0xc000 { rx } else { tx };
         r.write(base + offset, addr as u32);
         r.write(base + offset + 4, (addr >> 32) as u32);
-        r.write(
-            base + offset + 8,
-            (if base == 0xc000 { rx_count } else { tx_count } * 16) as u32,
-        );
+        let count = if base == 0xc000 { rx_count } else { tx_count };
+        r.write(base + offset + 8, (count * 16) as u32);
         r.write(base + offset + 0x10, 0);
         r.write(base + offset + 0x18, 0);
+        // A previous owner may have selected head writeback instead of DD.
+        // Never publish an address for that mode or infer completion from TDH.
+        if base == 0xe000 {
+            r.write(base + offset + 0x38, 0);
+            r.write(base + offset + 0x3c, 0);
+        }
+        r.flush();
+        for (register, expected) in [
+            (base + offset, addr as u32),
+            (base + offset + 4, (addr >> 32) as u32),
+            (base + offset + 8, (count * 16) as u32),
+        ] {
+            if r.read(register) != expected {
+                return Err(IgcError::Other("DMA ring address/length readback failed"));
+            }
+        }
+        if base == 0xe000
+            && (r.read(base + offset + 0x38) != 0 || r.read(base + offset + 0x3c) != 0)
+        {
+            return Err(IgcError::Other("descriptor writeback mode rejected"));
+        }
     }
     // Advanced one-buffer RX, 2048 bytes, drop on exhausted queue so a
     // congested RSS queue cannot stall every other queue (no flow control).
-    r.write(0xc00c + q as u64 * 0x40, 2 | (1 << 25) | (1 << 28));
+    // igc_base.h: BSIZEHDR is in 64-byte units; Linux uses 256 bytes even
+    // in advanced one-buffer mode. I225 SRRCTL.Drop_En is bit 31, not the
+    // reserved bit 28 (Intel SUM §8.9.6).
+    r.write(
+        0xc00c + q as u64 * 0x40,
+        2 | (4 << 8) | (1 << 25) | (1 << 31),
+    );
+    r.flush();
+    if r.read(0xc00c + offset) != 0x82000402 {
+        return Err(IgcError::Other("RX descriptor format readback failed"));
+    }
     r.write(0xe028 + offset, 8 | (1 << 8) | (16 << 16) | (1 << 25));
     poll(r, 0xe028 + offset, 1 << 25, 1 << 25)?;
     r.write(0xc028 + offset, 8 | (8 << 8) | (4 << 16) | (1 << 25));

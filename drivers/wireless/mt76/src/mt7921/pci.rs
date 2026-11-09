@@ -100,6 +100,8 @@ pub enum ProbeError {
     /// retries. Either the firmware never released ownership (cold
     /// power-up with no PCIE_BUS_PWR), or the chip is wedged.
     DriverOwnTimeout,
+    /// WFSYS reset failed to latch or report initialization complete.
+    ResetFailed,
     /// Legacy EFUSE probe error. Discovery leaves MAC unset; the retained
     /// post-firmware path requires a valid firmware-reported MAC.
     EfuseRead,
@@ -246,9 +248,7 @@ fn probe_with_policy(
     // current invocation. Skipped singleton functions remain parked.
     let result = invoke(&cap, || {
         use narf_bus::pci::{self, cmd};
-        pci::clear_command(&cap, &device, cmd::BUS_MASTER | cmd::MEM_SPACE)
-            .map_err(|_| ProbeError::Authority)?;
-        pci::set_command(&cap, &device, cmd::INTX_DISABLE).map_err(|_| ProbeError::Authority)?;
+        pci::prepare_memory_probe(&cap, &device).map_err(|_| ProbeError::Authority)?;
         if pci::read_command(&cap, &device).map_err(|_| ProbeError::Authority)?
             & (cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE)
             != cmd::INTX_DISABLE
@@ -399,6 +399,7 @@ fn bring_up_current(
     if parked == u16::MAX || parked & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != INTX_DISABLE {
         return Err(ProbeError::Authority);
     }
+    narf_bus::pci::prepare_memory_probe(cap, device).map_err(|_| ProbeError::Authority)?;
     // ── Stage 0: BAR0 mapping ───────────────────────────────────
     //
     // SAFETY: caller-asserted BAR exclusivity.
@@ -414,13 +415,13 @@ fn bring_up_current(
         return Err(ProbeError::Authority);
     }
 
-    let _ = narf_bus::pci::set_power_state(cap, device, narf_bus::pci::PciPowerState::D0);
-    let _ = narf_bus::pci_express::clear_and_set_link_control(
+    narf_bus::pci_express::clear_and_set_link_control(
         cap,
         device,
         narf_bus::pci_express::LNKCTL_ASPMC,
         0,
-    );
+    )
+    .map_err(|_| ProbeError::Authority)?;
 
     let _ = writeln!(
         narf_console::Writer,
@@ -450,18 +451,27 @@ fn bring_up_current(
         "  mt7921: chip={raw_chip:04x} rev={hw_rev:#x}; taking driver ownership"
     );
 
-    // ── Stage 1: driver-own + firmware-load stub + EFUSE ─────────
-    //
-    // Linux mt7921_pci_probe calls __mt792xe_mcu_drv_pmctrl (HOST_CLR_OWN)
-    // to take driver ownership. (mt792xe_mcu_fw_pmctrl / HOST_SET_OWN is
-    // only used during suspend/sleep, not during probe).
-    // SAFETY: BAR0 mapped + owned.
-    let driver_owned = match unsafe { mac::take_driver_own(&mmio_bar0) } {
-        Ok(()) => true,
+    // Linux mt7921_pci_probe performs firmware-own -> driver-own -> WFSYS
+    // reset before DMA/firmware setup. Ownership failure must return before
+    // WFSYS access: BME-off alone does not prove that its clocks are running.
+    if pci::read_command(cap, device).map_err(|_| ProbeError::Authority)?
+        & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+        != PROBE_COMMAND
+    {
+        return Err(ProbeError::Authority);
+    }
+    // SAFETY: exclusive current invocation, verified BME-off, mapped control
+    // window, and no published controller/transport or host DMA allocations.
+    match unsafe { mac::initialize_probe(&mmio_bar0) } {
+        Ok(()) => {}
         Err(mac::PowerError::Timeout) => return Err(ProbeError::DriverOwnTimeout),
         Err(mac::PowerError::DeviceGone) => return Err(ProbeError::DeviceGone),
         Err(mac::PowerError::InvalidWindow) => return Err(ProbeError::UnsupportedRegisterWindow),
-    };
+        Err(mac::PowerError::ResetRejected | mac::PowerError::ResetTimeout) => {
+            return Err(ProbeError::ResetFailed);
+        }
+    }
+    let _ = writeln!(narf_console::Writer, "  mt7921: ownership and WFSYS ready");
 
     // Firmware payloads are not registered until Late init. The retained
     // MCU/DMA owner is prepared there, outside this controller spinlock.
@@ -472,7 +482,7 @@ fn bring_up_current(
         effective_did,
         chip_id,
         chip_rev: (hw_rev & 0xff) as u8,
-        driver_owned,
+        driver_owned: true,
         mac: mac_bytes,
     })
 }

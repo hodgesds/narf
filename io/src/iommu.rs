@@ -239,6 +239,33 @@ pub fn init() -> Result<IommuMode, IommuInitError> {
     *STATE.mode.lock() = IommuMode::Identity;
 
     if !per_domain_requested_in(narf_boot::cmdline()) {
+        // Identity is the software address contract; this branch does not
+        // program the units. Record firmware's actual translation state so
+        // a DMA failure cannot mistake detection for verified passthrough.
+        if vendor == IommuVendor::AmdVi {
+            use crate::amd_vi::{AmdViRegs, MmioRegs, MMIO_CONTROL, MMIO_DEV_TABLE};
+            use core::fmt::Write;
+            let mut units = [narf_acpi::IvrsIommu::default(); narf_acpi::MAX_IVRS_IOMMUS];
+            let count = narf_acpi::copy_ivrs_iommus(&mut units);
+            for (index, unit) in units[..count].iter().enumerate() {
+                // IVRS reports device MMIO, which need not be covered by the
+                // RAM direct map. Use the backend's checked Device mapping;
+                // a failed diagnostic map must not prevent normal boot.
+                // SAFETY: this is an IVRS-reported AMD-Vi register window;
+                // the boot path owns it and these accesses perform no writes.
+                let Some(regs) = (unsafe { MmioRegs::map(unit.base) }) else {
+                    let _ = writeln!(narf_console::Writer,
+                        "[iommu] AMD-Vi inherited unit{index} base={:#x}: diagnostic mapping unavailable (hardware unchanged)",
+                        unit.base);
+                    continue;
+                };
+                let control = regs.read64(MMIO_CONTROL);
+                let table = regs.read64(MMIO_DEV_TABLE);
+                let _ = writeln!(narf_console::Writer,
+                    "[iommu] AMD-Vi inherited unit{index} base={:#x} control={control:#x} dev_table={table:#x} (hardware unchanged)",
+                    unit.base);
+            }
+        }
         *OPT_IN.lock() = PerDomainOptIn::NotRequested;
         return Ok(IommuMode::Identity);
     }
