@@ -159,6 +159,7 @@ mod radio_policy;
 mod radio_policy_51;
 mod radio_policy_c;
 mod radio_power;
+mod radio_power_be;
 mod radio_power_c;
 mod radio_shutdown;
 mod radio_stop;
