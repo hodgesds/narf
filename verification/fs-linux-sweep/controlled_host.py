@@ -116,6 +116,9 @@ def initial_window(state, seconds=30):
 
 
 def plan():
+    model = next(line.split(":", 1)[1].strip() for line in read("/proc/cpuinfo").splitlines() if line.startswith("model name"))
+    if "AMD Ryzen 9 7940HX" not in model:
+        raise RuntimeError("PreconditionFailed: unreviewed CPU/thermal profile")
     cpus = list(range(8, 16))
     nominal = {int(read(CPU_ROOT / f"cpu{c}/acpi_cppc/nominal_freq")) * 1000 for c in cpus}
     if len(nominal) != 1: raise RuntimeError("different nominal frequencies in benchmark LLC")
@@ -126,11 +129,12 @@ def plan():
     if disk["source"] != "/dev/nvme0n1p3": raise RuntimeError("unreviewed benchmark storage topology")
     sensor = next(p for p in Path("/sys/class/hwmon").glob("*")
                   if read(p / "name") == "nvme" and (p / "device").resolve().name == "nvme0")
-    return dict(cpus=cpus, frequency_khz=nominal.pop(), cgroup=f"/sys/fs/cgroup/narf-fs-bench-{os.getpid()}",
+    warning = int(read(sensor / "temp1_max")) if (sensor / "temp1_max").exists() else int(read(sensor / "temp1_crit"))
+    return dict(cpu_model=model, cpus=cpus, frequency_khz=nominal.pop(), cgroup=f"/sys/fs/cgroup/narf-fs-bench-{os.getpid()}",
                 sensors={"cpu": str(cpu_sensor / "temp1_input"), "nvme": str(sensor / "temp1_input")},
                 # AMD specifies Tjmax=100 C for the Ryzen 9 7940HX; retain
                 # a 15 C margin instead of treating ordinary 70 C as a throttle.
-                limits={"cpu": 85000, "nvme": int(read(sensor / "temp1_crit")) - 5000},
+                limits={"cpu": 85000, "nvme": min(warning, int(read(sensor / "temp1_crit"))) - 5000},
                 storage_alarm=str(sensor / "temp1_alarm"), storage=disk)
 
 
@@ -156,6 +160,7 @@ def main():
         print(json.dumps(state, indent=2)); return 0
     args.workdir.mkdir(parents=True, exist_ok=False)
     group = Path(state["cgroup"])
+    group_created = False
     child = None
     errors = []
     state["originals"] = {}
@@ -186,6 +191,7 @@ def main():
             write(base / "scaling_min_freq", state["frequency_khz"])
             write(base / "scaling_max_freq", state["frequency_khz"])
         group.mkdir()
+        group_created = True
         (group / "cpuset.mems").write_text(read("/sys/fs/cgroup/cpuset.mems.effective") + "\n")
         (group / "cpuset.cpus").write_text("8-15\n")
         (group / "cpuset.cpus.exclusive").write_text("8-15\n")
@@ -208,7 +214,7 @@ def main():
             os.killpg(child.pid, signal.SIGTERM)
             try: child.wait(timeout=10)
             except subprocess.TimeoutExpired: os.killpg(child.pid, signal.SIGKILL); child.wait()
-        if group.exists():
+        if group_created and group.exists():
             try:
                 # Children use separate process sessions. Kill remaining members
                 # before returning this temporary partition's CPUs to the host.
