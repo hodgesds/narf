@@ -26,6 +26,7 @@ use narf_capabilities::{Cap, Read, Write};
 use narf_driver_runtime::DomainId;
 use narf_filesystem::{DirOps, FsError, FsInstance};
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
+use narf_lib::mutex::Mutex;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::bpb::{Bpb, Fat32ExtBpb};
@@ -73,13 +74,28 @@ pub struct FatVolume<B: BlockDevice> {
     pub version: FatVersion,
     pub domain: DomainId,
     pub self_weak: Weak<FatVolume<B>>,
-    /// Per-volume scratch buffer + cap. Wrapped in a spinlock so
-    /// every sector op holds it for the synchronous-copy span only
-    /// and never across an `await` (the lock would otherwise
-    /// deadlock under cooperative async). FAT operations are
-    /// inherently sequential — the lock contention is not a hot
-    /// concern.
-    io: IrqSafeSpinLock<VolumeIo>,
+    /// Per-volume scratch buffer + cap. Serialised by an async
+    /// mutex held across the whole submit + copy window in
+    /// `read_sector` / `write_sector` (#1988): the buffer is shared
+    /// by every sector op on the volume, so the submit and the copy
+    /// must be one critical section — a concurrent op's submit would
+    /// otherwise overwrite the bytes this op is about to copy out
+    /// (or the bytes it just staged in). `narf_lib::mutex::Mutex`
+    /// parks waiters on the scheduler waker instead of disabling
+    /// IRQs, so holding it across `.await` is safe; the
+    /// `IrqSafeSpinLock` this replaces could only ever be held for
+    /// the synchronous copy span, which left the window between
+    /// submit and copy unserialised. No higher-level serialiser
+    /// covers the window: `FatNode::read` / `write` take the node
+    /// state lock only in block scope and release it before any
+    /// await (`node.rs`), the VFS dispatches `FileOps::read` /
+    /// `write` with no volume lock, and `BlockDevice::submit`
+    /// carries no serialisation contract. Callers that only need
+    /// `lbs` (`next_cluster` / `update_fat_entry` / `flush_fsinfo`)
+    /// take the lock briefly and release it before any await. Same
+    /// shape as squashfs `read_exact_from` and the minix fix
+    /// (#1979).
+    io: Mutex<VolumeIo>,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
     /// Seconds ADDED to the local time a FAT timestamp holds to get UTC:
@@ -327,7 +343,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             version,
             domain,
             self_weak: self_weak.clone(),
-            io: IrqSafeSpinLock::new(io),
+            io: Mutex::new(io),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
             tz_offset_secs: opts.tz_offset_secs,
             opts,
@@ -483,15 +499,22 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
     /// the device's logical block size; shorter slices return
     /// `Io(InvalidRange)`. Internally serialises on the volume's
     /// scratch buffer + cap.
+    ///
+    /// The async mutex is held across the whole submit + copy
+    /// window (#1988): the scratch buffer is shared by every sector
+    /// op on the volume, so the submit and the copy-out must be one
+    /// critical section. Holding an `IrqSafeSpinLock` across the
+    /// await instead would deadlock the executor (IRQs disabled
+    /// while the wake the await waits on cannot fire); the async
+    /// mutex parks waiters on the scheduler waker, so it is safe
+    /// here.
     pub async fn read_sector(&self, lba: u64, dst: &mut [u8]) -> Result<(), FsError> {
-        let lbs = self.io.lock().lbs;
+        let io = self.io.lock().await;
+        let lbs = io.lbs;
         if dst.len() != lbs {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
-        // We can't hold the spinlock across the await, so snapshot
-        // the cap (it's `Copy`), do the I/O, then re-acquire to
-        // copy out of the registered buffer.
-        let cap = { self.io.lock().cap };
+        let cap = io.cap;
         let req = BlockRequest {
             op: BlockOp::Read,
             lba,
@@ -505,16 +528,14 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         let completion = self.device.submit(req).await;
         completion.result.map_err(FsError::Io)?;
 
-        let buf = self
-            .io
-            .lock()
+        let buf = io
             .buffer()
             .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-        // SAFETY: the registry holds the only `Arc<DmaBuffer>`
-        // outside this clone; FAT serialises sector ops via the
-        // outer spinlock so no other CPU/task is racing the buffer
-        // bytes during this copy. Identity-mapped phys backs the
-        // read.
+        // SAFETY: the mutex is held across submit + copy, so no
+        // other sector op can stage through the shared scratch
+        // buffer while this copy runs; the registry holds the only
+        // `Arc<DmaBuffer>` outside this clone. Identity-mapped phys
+        // backs the read.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
         dst.copy_from_slice(src);
@@ -523,24 +544,28 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
 
     /// Issue a one-sector FUA write from `src`. Same length contract
     /// as [`read_sector`].
+    ///
+    /// Same window as `read_sector`, mirrored: the stage-in and the
+    /// submit must be one critical section under the async mutex, or
+    /// a concurrent read's submit overwrites the staged bytes before
+    /// this op's DMA runs (#1988).
     pub async fn write_sector(&self, lba: u64, src: &[u8]) -> Result<(), FsError> {
-        let lbs = self.io.lock().lbs;
+        let io = self.io.lock().await;
+        let lbs = io.lbs;
         if src.len() != lbs {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
         // Stage data into the volume's registered buffer.
-        let cap = {
-            let g = self.io.lock();
-            let buf = g
-                .buffer()
-                .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-            // SAFETY: see read_sector — same single-CPU
-            // cooperative serialisation.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
-            dst.copy_from_slice(src);
-            g.cap
-        };
+        let buf = io
+            .buffer()
+            .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
+        // SAFETY: see read_sector. The cap → registry resolve
+        // guarantees the buffer is alive; the mutex serialises
+        // ops, so no concurrent user.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
+        dst.copy_from_slice(src);
+        let cap = io.cap;
         let req = BlockRequest {
             op: BlockOp::Write { fua: true },
             lba,
@@ -557,7 +582,10 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
 
     /// `read_sector` variant usable before the `FatVolume` Arc
     /// exists — `mount()` calls this through a `&VolumeIo`
-    /// directly. Same contract as [`read_sector`].
+    /// directly. Same contract as [`read_sector`]. Unchanged by
+    /// #1988: `mount()` runs single-threaded before the volume is
+    /// shared, and each mount owns its own `VolumeIo`, so no second
+    /// op can race this buffer.
     async fn read_sector_into(
         device: &B,
         io: &VolumeIo,
@@ -600,7 +628,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
 
     pub async fn next_cluster(&self, cluster: u32) -> Result<super::fat::FatEntry, FsError> {
         let (sec_num, ent_offset) = self.sector_of_fat_entry(cluster);
-        let lbs = self.io.lock().lbs;
+        let lbs = self.io.lock().await.lbs;
         let mut buf = vec![0u8; lbs];
         self.read_sector(sec_num as u64, &mut buf).await?;
         if self.fat_entry_straddles(ent_offset, lbs) {
@@ -619,7 +647,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
 
     pub async fn update_fat_entry(&self, cluster: u32, value: u32) -> Result<(), FsError> {
         let (sec_num, ent_offset) = self.sector_of_fat_entry(cluster);
-        let lbs = self.io.lock().lbs;
+        let lbs = self.io.lock().await.lbs;
         let mut buf = vec![0u8; lbs];
         self.read_sector(sec_num as u64, &mut buf).await?;
         // A split FAT12 entry is read-modify-written across both sectors,
@@ -713,7 +741,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         } else {
             return Ok(());
         };
-        let lbs = self.io.lock().lbs;
+        let lbs = self.io.lock().await.lbs;
         let mut buf: Vec<u8> = vec![0u8; lbs];
         let snapshot = match *self.fsinfo.lock() {
             Some(ref i) => *i,
