@@ -351,7 +351,7 @@ impl Native {
             armed: false,
             state: State::Unpublished,
             receive: super::rx_dma::Rx::default(),
-            radio: super::rf_access::Rf::default(),
+            radio: super::rf_access::Rf::for_chip(chip),
             runtime_sequence: 0,
             station_runtime: station::Runtime::default(),
             sleep_blocked: false,
@@ -533,9 +533,13 @@ impl Native {
         result
     }
     fn radio_access(&mut self) -> Result<(), super::power::Error> {
-        // Chip dispatch: B, C or RTL8851B with its own factory PHY-cap and
+        // Chip dispatch: A, B, C or RTL8851B with its own factory PHY-cap and
         // window.
         let phycap = match self.chip {
+            ChipId::Rtl8852A => self
+                .factory
+                .as_ref()
+                .is_some_and(|f| f.a_phycap().is_some()),
             ChipId::Rtl8851B => self
                 .factory
                 .as_ref()
@@ -557,6 +561,7 @@ impl Native {
             return Err(super::power::Error::Unsupported);
         }
         match self.chip {
+            ChipId::Rtl8852A => self.io.a_phy_window()?,
             ChipId::Rtl8852C => self.io.c_phy_window()?,
             ChipId::Rtl8851B => self.io.n51_phy_window()?,
             _ => self.io.b_phy_window()?,

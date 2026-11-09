@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Real RTL8852B RF v1 SWSI/direct transactions, separate from PCIe PHY MDIO.
+//! Real RTL8852A/B RF v1 SWSI/direct transactions, separate from PCIe PHY MDIO.
 //! Linux phy.c::{read,write}_rf_v1 and phy_gen_ax.cr_base=0x10000.
-use super::power::{Error, Io};
+//! The direct RF bases are per chip: RTL8852A uses `rf_base_addr`
+//! {0xc000, 0xd000} (rtw8852a.c `rtw8852a_chip_info`), every other AX chip
+//! {0xe000, 0xf000} (rtw8852b/c `rtw8852b_chip_info` / `rtw8852c_chip_info`).
+use super::{
+    mac::ChipId,
+    power::{Error, Io},
+};
 const BASE: u32 = 0x10000;
 const RF_MASK: u32 = 0xfffff;
 const SWSI: u32 = BASE + 0x174c;
@@ -12,11 +18,26 @@ pub(super) enum State {
     Busy,
     Terminal,
 }
-#[derive(Default)]
 pub(super) struct Rf {
     state: State,
+    /// The chip whose `rf_base_addr` selects the direct RF bases; the
+    /// SWSI path is chip-independent (same `BASE` + `SWSI` registers).
+    chip: ChipId,
+}
+impl Default for Rf {
+    /// The historical B owner: every pre-A caller keeps B's bases.
+    fn default() -> Self {
+        Self::for_chip(ChipId::Rtl8852B)
+    }
 }
 impl Rf {
+    /// An RF owner for `chip` (`Rf::default()` is the B owner).
+    pub fn for_chip(chip: ChipId) -> Self {
+        Self {
+            state: State::Idle,
+            chip,
+        }
+    }
     pub fn state(&self) -> State {
         self.state
     }
@@ -38,11 +59,26 @@ impl Rf {
         };
         result
     }
+    fn direct(&self, path: u8, address: u32) -> u32 {
+        // Linux `rtw89_phy_read_rf`/`rtw89_phy_write_rf` direct aperture:
+        // `cr_base + rf_base_addr[path] + (addr & 0xff) * 4`. A is
+        // {0xc000, 0xd000}; B/C/8851B are {0xe000, 0xf000} (8851B has one
+        // path, so its path-1 base is never used).
+        let base = match (self.chip, path) {
+            (ChipId::Rtl8852A, 0) => 0xc000,
+            (ChipId::Rtl8852A, _) => 0xd000,
+            (_, 0) => 0xe000,
+            (_, _) => 0xf000,
+        };
+        BASE + base + ((address & 255) << 2)
+    }
     /// # Safety
-    /// Same exclusively retained actual B factory/MAC owner, full >=0x1f400
-    /// Device BAR aperture and current per-transaction device authority. No
-    /// concurrent RFK/table/channel/reset/PHY operation. The enclosing attempt
-    /// closes packet/command DMA and retains published resources on cancellation.
+    /// Same exclusively retained actual factory/MAC owner for this chip,
+    /// full Device BAR aperture covering its last direct RF dword
+    /// (A >=0x1d400, B/C >=0x1f400) and current per-transaction device
+    /// authority. No concurrent RFK/table/channel/reset/PHY operation. The
+    /// enclosing attempt closes packet/command DMA and retains published
+    /// resources on cancellation.
     pub async unsafe fn read(
         &mut self,
         io: &mut impl Io,
@@ -54,7 +90,7 @@ impl Rf {
         let mask = mask & RF_MASK;
         let result = async {
             if address & 0x10000 != 0 {
-                return Ok((read(io, direct(path, address))? & mask) >> mask.trailing_zeros());
+                return Ok((read(io, self.direct(path, address))? & mask) >> mask.trailing_zeros());
             }
             idle(io).await?;
             modify(io, BASE + 0x378, 0x7ff, u32::from(path) << 8 | address)?;
@@ -75,8 +111,9 @@ impl Rf {
         self.end(result)
     }
     /// # Safety
-    /// Same retained/current full-aperture B contract as read. Analog success
-    /// means the command was issued; the next transaction checks actual busy.
+    /// Same retained/current full-aperture contract as read, for this chip.
+    /// Analog success means the command was issued; the next transaction
+    /// checks actual busy.
     pub async unsafe fn write(
         &mut self,
         io: &mut impl Io,
@@ -89,7 +126,7 @@ impl Rf {
         let mask = mask & RF_MASK;
         let result = async {
             if address & 0x10000 != 0 {
-                modify(io, direct(path, address), mask, data)?;
+                modify(io, self.direct(path, address), mask, data)?;
                 io.delay_us(1).await;
                 return Ok(());
             }
@@ -107,9 +144,6 @@ impl Rf {
         .await;
         self.end(result)
     }
-}
-fn direct(path: u8, address: u32) -> u32 {
-    BASE + if path == 0 { 0xe000 } else { 0xf000 } + ((address & 255) << 2)
 }
 fn read(io: &mut impl Io, address: u32) -> Result<u32, Error> {
     let value = io.read32(address)?;

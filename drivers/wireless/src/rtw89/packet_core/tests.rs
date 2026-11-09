@@ -614,7 +614,7 @@ unsafe impl Port for Model {
     }
     fn start(&mut self, open: u32) -> Result<(), Error> {
         self.ordinary_allowed()?;
-        if open & STOP != STOP || open & !format::STOP_ALL != 0 {
+        if open & STOP != STOP || open & !format::AP_STOP_ALL != 0 {
             return Err(Error::State);
         }
         self.put(0x1010, self.word(0x1010) & !open);
@@ -1249,27 +1249,11 @@ kernel_test_in!(
     smoke_rtw89_b_packet_rx_width_follows_programmed_channel
 );
 
-fn smoke_rtw8852a_packet_rings_use_ax_desa_and_refuse_unproven_programs() -> TestResult {
+fn smoke_rtw8852a_packet_rings_use_ax_desa() -> TestResult {
     let mut model = Model::new();
     model.chip = ChipId::Rtl8852A;
-    let Ok(mut core) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht) else {
-        return TestResult::Fail("A ordinary rings refused");
-    };
-    // No A-domain aggregate (Ampdu) program and no A-MSDU path.
-    if core.enable_aggregation().is_ok() || core.enable_amsdu(1).is_ok() {
-        return TestResult::Fail("A A-MPDU admitted or A-MSDU admitted");
-    }
-    let mut model = Model::new();
-    model.chip = ChipId::Rtl8852A;
-    if Core::prepare_with(&mut model, OWN, 0, true, RxPhy::Legacy).is_err() {
-        return TestResult::Fail("A all-AC QoS rings refused");
-    }
-    let mut model = Model::new();
-    model.chip = ChipId::Rtl8852A;
-    if Core::prepare(&mut model, OWN, 0).is_err()
-        || Core::prepare_ap(&mut model, OWN, false, RxPhy::Legacy).is_ok()
-    {
-        return TestResult::Fail("A station ring preparation or AP refusal");
+    if Core::prepare(&mut model, OWN, 0).is_err() {
+        return TestResult::Fail("A station ring preparation");
     }
     // rtw89_pci_ch_dma_addr_set: ACH0 0x1110/0x1114, CH8 0x1150/0x1154
     // with the shared NUM registers; the V1 DESA stays untouched.
@@ -1285,7 +1269,133 @@ fn smoke_rtw8852a_packet_rings_use_ax_desa_and_refuse_unproven_programs() -> Tes
     }
     TestResult::Pass
 }
+
+fn smoke_rtw89_a_packet_station_amsdu_aggregate_ap() -> TestResult {
+    // RTL8852A station: ordinary rings on the AX address set (A and B share
+    // `AX_DMA_ADDR_SET` and the v0 TXWD, `rtw89_core_fill_txdesc`), A-MPDU
+    // plus A-MSDU to A's own 3500-byte ceiling, and the AP role.
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852A;
+    let Ok(mut core) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht) else {
+        return TestResult::Fail("A ordinary rings refused");
+    };
+    // A-MSDU needs the aggregate program first; the ceiling is A's 3500
+    // (`rtw8852a_chip_info.max_amsdu_limit`), not B's 5000.
+    if core.enable_amsdu(1).is_ok() {
+        return TestResult::Fail("A A-MSDU admitted without the aggregate program");
+    }
+    if core.enable_aggregation().is_err()
+        || core.enable_amsdu(3500).is_err()
+        || core.enable_amsdu(3501).is_ok()
+        || core.enable_amsdu(5000).is_ok()
+    {
+        return TestResult::Fail("A A-MSDU ceiling differs from rtw8852a max_amsdu_limit");
+    }
+    // A never widens past 80MHz (`support_bandwidths` 20/40/80).
+    core.set_operating_width(3, true);
+    if core.rx_width != 2 {
+        return TestResult::Fail("RTL8852A RX bound widened to 160MHz");
+    }
+    if core.start(&mut model).is_err() {
+        return TestResult::Fail("A packet start");
+    }
+    // One aggregated QoS frame, retired exactly once.
+    let agg = format::Agg {
+        num: 63,
+        density: 5,
+    };
+    let rate = format::FIRMWARE_RA;
+    let Ok(id) = core.submit_agg(&mut model, &qos_frame(1), false, rate, Some(agg)) else {
+        return TestResult::Fail("A aggregated frame refused inside the window");
+    };
+    let history = model.history.clone();
+    if history.len() != 1 || history[0].agg != Some((63, 5)) {
+        return TestResult::Fail("A aggregate TXWD A-MPDU fields differ");
+    }
+    model.consumed(history[0]);
+    model.report(history[0], 0).unwrap();
+    let mut receipt = None;
+    for _ in 0..4 {
+        match core.poll(&mut model) {
+            Ok(step) => receipt = receipt.or(step.receipt.map(|r| r.id)),
+            Err(_) => return TestResult::Fail("A aggregate retirement failed"),
+        }
+    }
+    if receipt != Some(id) || !core.ready() {
+        return TestResult::Fail("A aggregated frame did not retire exactly once");
+    }
+    // One A-MSDU frame (QoS data with the A-MSDU subframe header bit) under
+    // the companion grant, retired exactly once.
+    let mut amsdu = qos_frame(2);
+    amsdu[16..22].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+    amsdu[24] = 0x80;
+    model.amsdu = Some(3500);
+    let Ok(id) = core.submit(&mut model, &amsdu, false) else {
+        return TestResult::Fail("A A-MSDU frame refused");
+    };
+    let history = model.history.clone();
+    if history.len() != 2 || model.transmitted.last() != Some(&amsdu) {
+        return TestResult::Fail("A A-MSDU publication differs");
+    }
+    model.consumed(history[1]);
+    model.report(history[1], 0).unwrap();
+    let mut receipt = None;
+    for _ in 0..4 {
+        match core.poll(&mut model) {
+            Ok(step) => receipt = receipt.or(step.receipt.map(|r| r.id)),
+            Err(_) => return TestResult::Fail("A A-MSDU retirement failed"),
+        }
+    }
+    if receipt != Some(id) || !core.ready() {
+        return TestResult::Fail("A A-MSDU frame did not retire exactly once");
+    }
+    // The AP role: ordinary rings plus CH9 on the AX address set (the C V1
+    // DESA stays untouched), one unicast data frame, retired once.
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852A;
+    let Ok(mut ap) = Core::prepare_ap(&mut model, OWN, false, RxPhy::Legacy) else {
+        return TestResult::Fail("A AP rings refused");
+    };
+    if !ap.ap()
+        || model.word(0x1110) == 0
+        || model.word(0x1158) == 0
+        || model.word(0x1230) != 0
+        || ap.start(&mut model).is_err()
+    {
+        return TestResult::Fail("A AP ring bases did not follow the AX address set");
+    }
+    let tx = format::ApTx {
+        mac_id: 1,
+        port: 0,
+        after_dtim: false,
+        report: false,
+        rate: format::FIRMWARE_RA,
+    };
+    let Ok(id) = ap.submit_ap(&mut model, &frame(), tx) else {
+        return TestResult::Fail("A AP frame refused");
+    };
+    let history = model.history.clone();
+    model.consumed(history[0]);
+    model.report(history[0], 0).unwrap();
+    let mut receipt = None;
+    for _ in 0..4 {
+        match ap.poll(&mut model) {
+            Ok(step) => receipt = receipt.or(step.receipt.map(|r| r.id)),
+            Err(_) => return TestResult::Fail("A AP retirement failed"),
+        }
+    }
+    if receipt != Some(id) || !ap.ready() {
+        return TestResult::Fail("A AP frame did not retire exactly once");
+    }
+    TestResult::Pass
+}
+
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw8852a_packet_rings_use_ax_desa_and_refuse_unproven_programs
+    smoke_rtw8852a_packet_rings_use_ax_desa
+);
+
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_packet_station_amsdu_aggregate_ap
 );
