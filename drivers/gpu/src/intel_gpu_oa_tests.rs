@@ -2051,6 +2051,7 @@ impl PinModel {
                 Arc::new(move |id| {
                     released.lock().push(id);
                 }),
+                None,
             ))
         }
     }
@@ -2236,7 +2237,7 @@ fn smoke_i915_filter_report_squashes_foreign_and_invalid_ctx() -> TestResult {
     let dev = device(48, MTL, 1270);
     let session = test_session_i915(dev, 3, DEFAULT_BUFFER, Some(5), &[(0x9888, 1)]);
     assert!(!session.format.header64);
-    session.set_pin(PinToken::new(3, 3, Arc::new(|_: u32| {})));
+    session.set_pin(PinToken::new(3, 3, Arc::new(|_: u32| {}), None));
     let valid = GEN12_VALID_CTX_BIT | 0x42;
     let mut own = report256(valid, 3);
     session.filter_report(&mut own);
@@ -2281,7 +2282,7 @@ fn smoke_i915_filter_report_squashes_foreign_and_invalid_ctx() -> TestResult {
     let session64 = test_session_i915(dev, 6, DEFAULT_BUFFER, None, &[(0x9888, 1)]);
     assert!(session64.format.header64);
     assert_eq!(session64.format.size, 320);
-    session64.set_pin(PinToken::new(3, 3, Arc::new(|_: u32| {})));
+    session64.set_pin(PinToken::new(3, 3, Arc::new(|_: u32| {}), None));
     let mut report64 = [0u8; 320];
     report64[0..4].copy_from_slice(&valid.to_le_bytes());
     report64[8..12].copy_from_slice(&0x7777u32.to_le_bytes());
@@ -3491,4 +3492,185 @@ fn smoke_oa_media_gt_oam_unit1_stream_support() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_oa",
     smoke_oa_media_gt_oam_unit1_stream_support
+);
+
+fn smoke_oa_oactxcontrol_image_slot() -> TestResult {
+    // The render image carries an OACTXCONTROL slot (engine base +
+    // 0x360) with the disabled value 0; the scan finds it and the apply
+    // programs it. Compute and Xe2 render images carry no slot, so the
+    // apply fails closed. (Issue #1821; Linux i915_perf.c
+    // `gen12_configure_oar_context` writes the image slot, never the
+    // template.)
+    let base = Engine::Rcs0.base();
+    let image = Arc::new(Memory {
+        hw: Hw::new(),
+        pages: 2,
+        coherent: false,
+        host: 0,
+    });
+    crate::intel_gpu_engine::xcs_image(Engine::Rcs0, &image, MTL, 0x1000);
+    let slot = crate::intel_gpu_engine::oactxcontrol_value_slot(&image, base)
+        .expect("RCS image carries OACTXCONTROL");
+    assert_eq!(
+        image.read32(crate::intel_gpu_engine::REGS + slot),
+        0,
+        "template default is the disabled value"
+    );
+    assert!(crate::intel_gpu_engine::apply_oa_oactxcontrol(
+        &image, base, 1
+    ));
+    assert_eq!(image.read32(crate::intel_gpu_engine::REGS + slot), 1);
+    assert!(crate::intel_gpu_engine::apply_oa_oactxcontrol(
+        &image, base, 0
+    ));
+    assert_eq!(image.read32(crate::intel_gpu_engine::REGS + slot), 0);
+
+    // The non-Gen12 GuC image (MTL) carries the slot too.
+    let guc_image = Arc::new(Memory {
+        hw: Hw::new(),
+        pages: 2,
+        coherent: false,
+        host: 0,
+    });
+    crate::intel_gpu_guc_sched::context_image(&guc_image, MTL, 0x1000);
+    let guc_slot = crate::intel_gpu_engine::oactxcontrol_value_slot(&guc_image, base)
+        .expect("MTL GuC image carries OACTXCONTROL");
+    assert!(crate::intel_gpu_engine::apply_oa_oactxcontrol(
+        &guc_image, base, 1
+    ));
+    assert_eq!(
+        guc_image.read32(crate::intel_gpu_engine::REGS + guc_slot),
+        1
+    );
+
+    // Compute has no slot (OAC on compute is a follow-up): the apply
+    // fails closed and writes nothing.
+    let ccs_image = Arc::new(Memory {
+        hw: Hw::new(),
+        pages: 2,
+        coherent: false,
+        host: 0,
+    });
+    crate::intel_gpu_engine::xcs_image(Engine::Ccs0, &ccs_image, MTL, 0x1000);
+    assert!(
+        crate::intel_gpu_engine::oactxcontrol_value_slot(&ccs_image, Engine::Ccs0.base()).is_none()
+    );
+    assert!(!crate::intel_gpu_engine::apply_oa_oactxcontrol(
+        &ccs_image,
+        Engine::Ccs0.base(),
+        1
+    ));
+
+    // Xe2 render has no room in its first group (15 registers already),
+    // so it keeps the live-only path: no slot, apply fails closed.
+    let xe2_image = Arc::new(Memory {
+        hw: Hw::new(),
+        pages: 2,
+        coherent: false,
+        host: 0,
+    });
+    crate::intel_gpu_engine::xcs_image(Engine::Rcs0, &xe2_image, LNL, 0x1000);
+    assert!(crate::intel_gpu_engine::oactxcontrol_value_slot(&xe2_image, base).is_none());
+    assert!(!crate::intel_gpu_engine::apply_oa_oactxcontrol(
+        &xe2_image, base, 1
+    ));
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_gpu_oa", smoke_oa_oactxcontrol_image_slot);
+
+fn smoke_oa_oactxcontrol_pinned_image_lifecycle() -> TestResult {
+    // Opening a pinned i915 OA stream programs the resume bit into the
+    // pinned context's saved LRC image (issue #1821): enable records the
+    // value on the pinned context, the submit path applies it to the
+    // freshly built image, disable clears it, re-enable restores it,
+    // and close clears it. An unpinned context's image stays 0.
+    let backend = Backend::new(device(40, MTL, 1270));
+    let wire = Wire::new();
+    let config = add(&backend, &wire, 1, &[(0x9888, 1)]);
+    let ctx = crate::intel_gpu_user::UserContext::for_engine(Engine::Rcs0);
+    let pinned_ctx = ctx.clone();
+    let released = Arc::new(IrqSafeSpinLock::new(Vec::new()));
+    let pin = |id: u32, _hold: bool| -> Option<PinToken> {
+        if id != 3 {
+            return None;
+        }
+        let released = released.clone();
+        let user = pinned_ctx.clone();
+        Some(PinToken::new(
+            id,
+            id,
+            Arc::new(move |id| {
+                released.lock().push(id);
+            }),
+            Some(user),
+        ))
+    };
+    let props = [
+        (crate::intel_gpu_uapi::PERF_PROP_SAMPLE_OA, 1u64),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_METRICS_SET, config),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_FORMAT, 10),
+        (crate::intel_gpu_uapi::PERF_PROP_OA_EXPONENT, 5),
+        (crate::intel_gpu_uapi::PERF_PROP_CTX_HANDLE, 3),
+    ];
+    assert_eq!(open_i915_props(&backend, &wire, &props, &pin), Ok(41));
+    let session = attached_session(&backend);
+    assert!(session.enabled());
+    // Open enables the unit: the pinned context carries the resume bit.
+    assert_eq!(ctx.oa_oactxcontrol(), Some(1));
+
+    // The image value: build the pinned context's image (MTL GuC
+    // template) and apply the recorded value; the slot reads 1.
+    let base = Engine::Rcs0.base();
+    let image = Arc::new(Memory {
+        hw: Hw::new(),
+        pages: 2,
+        coherent: false,
+        host: 0,
+    });
+    crate::intel_gpu_guc_sched::context_image(&image, MTL, 0x1000);
+    let slot = crate::intel_gpu_engine::oactxcontrol_value_slot(&image, base)
+        .expect("MTL GuC image carries OACTXCONTROL");
+    assert!(crate::intel_gpu_engine::apply_oa_oactxcontrol(
+        &image,
+        base,
+        ctx.oa_oactxcontrol().unwrap()
+    ));
+    assert_eq!(image.read32(crate::intel_gpu_engine::REGS + slot), 1);
+
+    // An unpinned context's image is untouched (slot stays 0).
+    let other = crate::intel_gpu_user::UserContext::for_engine(Engine::Rcs0);
+    assert_eq!(other.oa_oactxcontrol(), None);
+    let other_image = Arc::new(Memory {
+        hw: Hw::new(),
+        pages: 2,
+        coherent: false,
+        host: 0,
+    });
+    crate::intel_gpu_guc_sched::context_image(&other_image, MTL, 0x1000);
+    let other_slot = crate::intel_gpu_engine::oactxcontrol_value_slot(&other_image, base)
+        .expect("MTL GuC image carries OACTXCONTROL");
+    assert_eq!(
+        other_image.read32(crate::intel_gpu_engine::REGS + other_slot),
+        0
+    );
+
+    // Disable clears it; re-enable restores it.
+    let file = wire.file();
+    assert_eq!(ready(file.ioctl_user(DISABLE, 0, &wire)), Ok(0));
+    assert_eq!(ctx.oa_oactxcontrol(), None);
+    assert_eq!(ready(file.ioctl_user(ENABLE, 0, &wire)), Ok(0));
+    assert_eq!(ctx.oa_oactxcontrol(), Some(1));
+
+    // Close clears it too (release_pin clears before the teardown poll).
+    drop(file);
+    backend.poll(1);
+    assert_eq!(ctx.oa_oactxcontrol(), None);
+    assert_eq!(*released.lock(), vec![3]);
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_oa",
+    smoke_oa_oactxcontrol_pinned_image_lifecycle
 );

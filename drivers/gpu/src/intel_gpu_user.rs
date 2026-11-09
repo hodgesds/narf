@@ -372,6 +372,16 @@ struct State {
     /// OAR/OAC stream holds it (set at OA enable, cleared at disable).
     /// `None` when no query-mode stream is live on this queue.
     query_sampler: Option<Arc<crate::intel_gpu_oa::QuerySampler>>,
+    /// The OACTXCONTROL value the pinned context's saved LRC image must
+    /// carry while a per-context OA stream holds it (set at OA enable,
+    /// cleared at disable). `Some(OA_COUNTER_RESUME)` — the Gen12 image
+    /// value is the resume bit only (Linux i915_perf.c
+    /// `gen12_configure_oar_context`); period/timer bits live in the
+    /// Gen8–11 encoding and the OAG global control, not this slot.
+    /// `None` when no per-context stream is live on this queue. The
+    /// submit path applies this to the freshly built image after any
+    /// state restore, so the programming survives a context switch.
+    oa_oactxcontrol: Option<u32>,
     /// i915 requests queued and not yet staged, per GuC band.
     queued: [u32; 4],
     /// The band of the i915 request whose submission attempt is next to
@@ -545,6 +555,7 @@ impl UserContext {
                 job_policy: (GUC_PRIORITY_NORMAL, 1000),
                 oa_saved: None,
                 query_sampler: None,
+                oa_oactxcontrol: None,
                 queued: [0; 4],
                 staged: None,
                 low_latency: false,
@@ -694,6 +705,18 @@ impl UserContext {
     /// OAR/OAC stream holds it.
     pub(crate) fn query_sampler(&self) -> Option<Arc<crate::intel_gpu_oa::QuerySampler>> {
         self.state.lock().query_sampler.clone()
+    }
+    /// Register or clear the OACTXCONTROL value for this context's saved
+    /// LRC image. Set at OA enable for a per-context stream, cleared at
+    /// disable (and on teardown), so the submit path programs the image
+    /// slot only while the stream is live.
+    pub(crate) fn set_oa_oactxcontrol(&self, value: Option<u32>) {
+        self.state.lock().oa_oactxcontrol = value;
+    }
+    /// The OACTXCONTROL value this context's saved LRC image must carry,
+    /// if a per-context OA stream holds it.
+    pub(crate) fn oa_oactxcontrol(&self) -> Option<u32> {
+        self.state.lock().oa_oactxcontrol
     }
     /// The GuC priority a request queued now would carry.
     #[cfg(any(test, feature = "kernel-test"))]
@@ -894,6 +917,12 @@ impl ContextClaim {
     /// to emit one MI_REPORT_PERF_COUNT per batch.
     pub(crate) fn query_sampler(&self) -> Option<Arc<crate::intel_gpu_oa::QuerySampler>> {
         self.context.query_sampler()
+    }
+    /// The OACTXCONTROL value this context's saved LRC image must carry,
+    /// if a per-context OA stream holds it. The submit path reads this at
+    /// submit time to program the image slot.
+    pub(crate) fn oa_oactxcontrol(&self) -> Option<u32> {
+        self.context.oa_oactxcontrol()
     }
     pub(crate) fn restore(&self, image: &impl GpuBacking) {
         self.restore_lane(image, 0);

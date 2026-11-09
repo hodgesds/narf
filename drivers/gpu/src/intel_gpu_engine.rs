@@ -16,6 +16,12 @@ use alloc::vec::Vec;
 
 /// Engine-state page offset of the register state within every LRC image.
 pub(crate) const REGS: u64 = 4096;
+
+/// OACTXCONTROL register offset from the engine base (Linux
+/// `i915_perf_oa_regs.h` `GEN12_OACTXCONTROL(base)`: `(base) + 0x360`;
+/// pre-Gen12 fixed `GEN8_OACTXCONTROL` 0x2360). Single authority for the
+/// offset: the OA live job and the LRC image hook both use this.
+pub(crate) const OACTXCONTROL_OFF: u32 = 0x360;
 /// Driver-defined PPHWSP breadcrumb and job-start stamp.
 pub(crate) const BREADCRUMB: u64 = 0x800;
 const START: u64 = BREADCRUMB + 8;
@@ -643,6 +649,21 @@ pub(crate) fn xcs_image(engine: Engine, image: &impl GpuBacking, platform: GtPla
     {
         first.extend_from_slice(&[0x120, 0x124]);
     }
+    // OACTXCONTROL (engine base + 0x360) in the render image only, last in
+    // the group, value default 0 (the disabled value). The OA image hook
+    // programs this slot at stream enable (see
+    // `oactxcontrol_value_slot`); the default is load-bearing — adding the
+    // register without the hook would restore 0 over the live programming
+    // on the next context switch (Linux i915_perf.c
+    // `gen12_configure_oar_context` writes the image slot, never the
+    // template). The group only takes the register while it still ends
+    // before the second group at dword 0x21: Gen12 render has 13
+    // registers, so it fits; Xe2/compute/media images already carry 15
+    // and have no room, so they keep the live-only path (their image hook
+    // is a follow-up, as is OAC on compute).
+    if engine == Engine::Rcs0 && first.len() < 15 {
+        first.push(OACTXCONTROL_OFF);
+    }
     let second: &[u32] = if xe2 {
         &[
             0x3a8, 0x3ac, 0x108, 0x284, 0x280, 0x27c, 0x278, 0x274, 0x270,
@@ -672,6 +693,69 @@ pub(crate) fn xcs_image(engine: Engine, image: &impl GpuBacking, platform: GtPla
         REGS + if platform.is_gen12() { 0x61 } else { 0x71 } * 4,
         0x01000000,
     );
+}
+
+/// Scan an LRC image's register-state page for the OACTXCONTROL slot and
+/// return the byte offset (relative to the REGS page) of its value dword.
+///
+/// Layout-independent: it walks the image's MI_LOAD_REGISTER_IMM groups
+/// (Linux `i915_perf.c` `oa_context_image_offset` does the same scan on
+/// Gen12, caching the offset; NARF re-scans per apply — the image is a
+/// few KiB and the apply is once per stream enable). A value dword is
+/// the word immediately following its register dword; the LRI header is
+/// `0x11000000 | (2 * nregs - 1)`, one register dword plus one value
+/// dword per register. Returns `None` when the image has no OACTXCONTROL slot (an
+/// engine whose template does not carry it) — callers fail closed.
+pub(crate) fn oactxcontrol_value_slot<B: GpuBacking>(image: &B, base: u32) -> Option<u64> {
+    const MI_LRI_HEADER: u32 = 0x11000000;
+    const MI_BATCH_BUFFER_END: u32 = 0x05000001;
+    const MAX_DWORDS: u64 = 1024;
+    let mut dw: u64 = 0;
+    while dw < MAX_DWORDS {
+        let word = image.read32(REGS + dw * 4);
+        if word == MI_BATCH_BUFFER_END {
+            return None;
+        }
+        if word == 0 {
+            // MI_NOOP; skip one dword.
+            dw += 1;
+            continue;
+        }
+        if word & 0xFF000000 == MI_LRI_HEADER {
+            // The header's low field is (2 * nregs - 1): each register
+            // contributes a register dword and a value dword. Dword
+            // indices are u64 throughout (the image cursor is u64).
+            let nregs = (word & 0x3FF).div_ceil(2) as u64;
+            for i in 0..nregs {
+                let reg_dw = dw + 1 + i * 2;
+                let val_dw = reg_dw + 1;
+                if val_dw >= MAX_DWORDS {
+                    return None;
+                }
+                if image.read32(REGS + reg_dw * 4) == base + OACTXCONTROL_OFF {
+                    return Some(val_dw * 4);
+                }
+            }
+            dw += 1 + nregs * 2;
+            continue;
+        }
+        // Unknown dword: skip it; a malformed image terminates at the
+        // batch-buffer end or the dword bound.
+        dw += 1;
+    }
+    None
+}
+
+/// Write `value` into the image's OACTXCONTROL slot, if it has one.
+/// Returns false (no write) when the image carries no slot.
+pub(crate) fn apply_oa_oactxcontrol<B: GpuBacking>(image: &B, base: u32, value: u32) -> bool {
+    match oactxcontrol_value_slot(image, base) {
+        Some(slot) => {
+            image.write32(REGS + slot, value);
+            true
+        }
+        None => false,
+    }
 }
 
 #[cfg(feature = "kernel-test")]

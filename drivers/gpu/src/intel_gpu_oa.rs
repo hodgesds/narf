@@ -12,7 +12,7 @@
 use crate::{
     drm::syncobj::SyncObjTable,
     intel_gpu_aux::MmioWindow,
-    intel_gpu_engine::{Engine, EngineSet},
+    intel_gpu_engine::{Engine, EngineSet, OACTXCONTROL_OFF},
     intel_gpu_gt::GtPlatform,
     intel_gpu_guc_boot::BootAllocator,
     intel_gpu_rcs::GpuBacking,
@@ -102,8 +102,6 @@ const ROW_CHICKEN2: u64 = 0xe4f4;
 const OAR_OACONTROL: u32 = 0x2960;
 /// OAC unit: regs/xe_oa_regs.h OAC_OACONTROL.
 const OAC_OACONTROL: u32 = 0x15114;
-/// OACTXCONTROL(base): regs/xe_oa_regs.h, engine base + 0x360.
-const OACTXCONTROL_OFF: u32 = 0x360;
 /// OA_COUNTER_RESUME: regs/xe_oa_regs.h, OACTXCONTROL bit 0.
 const OA_COUNTER_RESUME: u32 = 1;
 /// RING_CONTEXT_CONTROL(base): regs/xe_engine_regs.h, engine base + 0x244.
@@ -558,9 +556,13 @@ pub(crate) fn config_jobs(regs: &[(u32, u32)]) -> Vec<Job> {
 /// queue's saved state: that register is per-context saved state
 /// (`xe_lrc.c::reg_offsets`, `intel_gpu_engine::xcs_image`). The
 /// OAR/OAC_OACONTROL writes name fixed unit addresses and land regardless
-/// of context. Whether OACTXCONTROL is context-saved is UNVERIFIED
-/// in-tree (it is absent from `reg_offsets`), so its effect through this
-/// path is unknown; this path does not depend on it.
+/// of context. OACTXCONTROL is context-saved too: it sits in the RCS
+/// image template (`intel_gpu_engine::xcs_image` /
+/// `intel_gpu_guc_sched::context_image`, value default 0) and the OA
+/// image hook (`Unit::enable` + `submit_inner`) programs the pinned
+/// context's saved image with the resume bit (issue #1821), so the
+/// programming survives a context switch; this live job programs the
+/// same value and never fights it.
 /// The two-word head of the owned breadcrumb MI_FLUSH_DW that every
 /// `resident_ring` job ends with (also the marker the user-fence splice
 /// in `intel_gpu_guc_sched::submit_inner` searches for). The per-batch
@@ -1003,14 +1005,27 @@ pub(crate) type PinRelease = Arc<dyn Fn(u32) + Send + Sync>;
 pub(crate) struct PinToken {
     pub(crate) gem_handle: u32,
     pub(crate) hw_ctx_id: u32,
+    /// The pinned gem context's GuC `UserContext`, when the pin knows it.
+    /// The OA layer programs the pinned context's saved LRC image through
+    /// this handle at stream enable (see `Session::pin_user`); `None`
+    /// when the pin was created without a user context (tests, or a pin
+    /// path that cannot resolve one), in which case no image programming
+    /// happens.
+    pub(crate) user_context: Option<Arc<UserContext>>,
     unpin: PinRelease,
 }
 
 impl PinToken {
-    pub(crate) fn new(gem_handle: u32, hw_ctx_id: u32, unpin: PinRelease) -> Self {
+    pub(crate) fn new(
+        gem_handle: u32,
+        hw_ctx_id: u32,
+        unpin: PinRelease,
+        user_context: Option<Arc<UserContext>>,
+    ) -> Self {
         Self {
             gem_handle,
             hw_ctx_id,
+            user_context,
             unpin,
         }
     }
@@ -1847,6 +1862,10 @@ pub struct Session {
     /// release callback the stream's close runs. None for global and Xe
     /// streams. Set once by `i915_open` after the pin lookup succeeds.
     pin: IrqSafeSpinLock<Option<(PinnedContext, PinRelease)>>,
+    /// The pinned gem context's GuC `UserContext`, when the pin knows it.
+    /// The OA layer programs this context's saved LRC image at stream
+    /// enable (see `Unit::enable`); cleared with the pin on close.
+    pin_user: IrqSafeSpinLock<Option<Arc<UserContext>>>,
 }
 impl core::fmt::Debug for Session {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1903,6 +1922,7 @@ impl Session {
             query_size,
             privileged,
             pin: IrqSafeSpinLock::new(None),
+            pin_user: IrqSafeSpinLock::new(None),
         })
     }
     #[allow(dead_code)]
@@ -1950,6 +1970,7 @@ impl Session {
         let PinToken {
             gem_handle,
             hw_ctx_id,
+            user_context,
             unpin,
         } = token;
         *self.pin.lock() = Some((
@@ -1960,17 +1981,30 @@ impl Session {
             },
             unpin,
         ));
+        *self.pin_user.lock() = user_context;
     }
     /// The pinned context, if this is a single-context i915 stream.
     pub(crate) fn pinned_ctx(&self) -> Option<PinnedContext> {
         self.pin.lock().as_ref().map(|(pinned, _)| *pinned)
     }
-    /// Release the pinned context exactly once: take the record, then run
-    /// its release callback outside the lock. No-op when nothing is
-    /// pinned. Called from `File`'s drop (stream close) and from
-    /// `PendingOpen`'s drop (open rollback).
+    /// The pinned gem context's GuC `UserContext`, when the pin knows it.
+    pub(crate) fn pinned_user_context(&self) -> Option<Arc<UserContext>> {
+        self.pin_user.lock().clone()
+    }
+    /// Release the pinned context exactly once: take the record, clear
+    /// the pinned context's OACTXCONTROL image value (issue #1821 — the
+    /// stream's hold on that context ends here, and the close path runs
+    /// before the unit's teardown poll, so teardown can no longer reach
+    /// the context through the pin), then run its release callback
+    /// outside the lock. No-op when nothing is pinned. Called from
+    /// `File`'s drop (stream close) and from `PendingOpen`'s drop (open
+    /// rollback).
     pub(crate) fn release_pin(&self) {
         let taken = self.pin.lock().take();
+        let user = self.pin_user.lock().take();
+        if let Some(user) = user {
+            user.set_oa_oactxcontrol(None);
+        }
         if let Some((pinned, unpin)) = taken {
             (unpin)(pinned.gem_handle);
         }
@@ -3060,6 +3094,27 @@ impl<A: BootAllocator> Unit<A> {
                     ))));
             }
         }
+        // OACTXCONTROL image value (issue #1821), applied only once the
+        // MMIO enable has succeeded, mirroring the NO_PREEMPT/query
+        // blocks above. The value is the resume bit only — the Gen12
+        // image value (Linux i915_perf.c `gen12_configure_oar_context`).
+        // It is recorded on the context whose saved LRC image the submit
+        // path programs: the bound queue's context for a per-context Xe
+        // stream, and the pinned gem context for a single-context i915
+        // stream on the render engine. The live per-context job (O1)
+        // programs the same value, so the two agree and never fight.
+        // A stream with no bound queue and no pinned context applies
+        // nothing; the image slot stays 0 (disabled).
+        if session.programs_per_context() {
+            if let Some(binding) = session.queue_binding() {
+                binding.context.set_oa_oactxcontrol(Some(OA_COUNTER_RESUME));
+            }
+        }
+        if session.hwe == Engine::Rcs0 {
+            if let Some(user) = session.pinned_user_context() {
+                user.set_oa_oactxcontrol(Some(OA_COUNTER_RESUME));
+            }
+        }
         self.active = true;
         self.next_poll = now.saturating_add(POLL_NS);
         session.set_enabled(true);
@@ -3085,6 +3140,13 @@ impl<A: BootAllocator> Unit<A> {
         if let Some(binding) = session.queue_binding() {
             binding.context.oa_restore_no_preempt();
             binding.context.set_query_sampler(None);
+            binding.context.set_oa_oactxcontrol(None);
+        }
+        // OACTXCONTROL image value (issue #1821): clear the pinned
+        // context's slot the same way, so a closed stream cannot leave
+        // the resume bit in an image that later runs without OA.
+        if let Some(user) = session.pinned_user_context() {
+            user.set_oa_oactxcontrol(None);
         }
         if !self.active {
             return Ok(());
@@ -3170,6 +3232,12 @@ impl<A: BootAllocator> Unit<A> {
             if let Some(binding) = session.queue_binding() {
                 binding.context.oa_restore_no_preempt();
                 binding.context.set_query_sampler(None);
+                binding.context.set_oa_oactxcontrol(None);
+            }
+            // OACTXCONTROL image value (issue #1821): same clear for
+            // the pinned context.
+            if let Some(user) = session.pinned_user_context() {
+                user.set_oa_oactxcontrol(None);
             }
         }
         self.invalidate();
