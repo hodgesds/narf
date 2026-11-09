@@ -3385,7 +3385,7 @@ fn smoke_ath11k_dp_service_multi_pdev() -> TestResult {
     // RXDMA error on pdev 1's own error ring: one link descriptor
     // naming a posted pdev-1 buffer cookie (PDEV_ID 1). The freed
     // buffer must come back to pdev 1's refill ring, not pdev 0's.
-    let mut refill1 = msg_for(&msgs1, &hal, refill_id);
+    let refill1 = msg_for(&msgs1, &hal, refill_id);
     let (_, cookie, _) = buf_addr_get(refill1.entry(0)[0], refill1.entry(0)[1]);
     let buf0 = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, cookie);
     check!(

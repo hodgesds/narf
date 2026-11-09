@@ -522,6 +522,21 @@ fn pump() {
         }
     }
 }
+#[derive(Default)]
+struct FixtureConfig {
+    noncoherent: bool,
+    ati: bool,
+    second_port: bool,
+    navi22: bool,
+    line_in: bool,
+    alc256: bool,
+    alc282: bool,
+    yoga9: bool,
+    seed_alc256_coef: bool,
+    codec_id: u32,
+    hp_plugged: bool,
+}
+
 struct Fixture {
     controller: Option<Arc<IntelHda>>,
     model: Box<Model>,
@@ -542,110 +557,109 @@ impl Fixture {
         Self::build(true, true, true)
     }
     fn build(noncoherent: bool, ati: bool, second_port: bool) -> Result<Self, &'static str> {
-        Self::build_model(
+        Self::build_model(FixtureConfig {
             noncoherent,
             ati,
             second_port,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            0,
-            false,
-        )
+            ..Default::default()
+        })
     }
     /// The analog codec with a line-in pin beside the mic pin, for
     /// jack-driven capture-source switching tests.
     fn line_in() -> Result<Self, &'static str> {
-        Self::build_model(
-            false, false, false, false, true, false, false, false, false, 0, false,
-        )
+        Self::build_model(FixtureConfig {
+            line_in: true,
+            ..Default::default()
+        })
     }
     /// The analog codec as an ALC256 (#776 coef-init fixture).
     fn alc256() -> Result<Self, &'static str> {
-        Self::build_model(
-            false, false, false, false, false, true, false, false, false, 0, false,
-        )
+        Self::build_model(FixtureConfig {
+            alc256: true,
+            ..Default::default()
+        })
     }
     /// The analog codec as an ALC256 with coef 0x46 pre-seeded to
     /// 0xF5A5 (#1496 RMW fixture): the masked update must preserve
     /// the bits outside its mask.
     fn alc256_seeded() -> Result<Self, &'static str> {
-        Self::build_model(
-            false, false, false, false, false, true, false, false, true, 0, false,
-        )
+        Self::build_model(FixtureConfig {
+            alc256: true,
+            seed_alc256_coef: true,
+            ..Default::default()
+        })
     }
     /// The analog codec as an ALC282 (#1496 full-table coef-init fixture).
     fn alc282() -> Result<Self, &'static str> {
-        Self::build_model(
-            false, false, false, false, false, false, true, false, false, 0, false,
-        )
+        Self::build_model(FixtureConfig {
+            alc282: true,
+            ..Default::default()
+        })
     }
     /// The analog codec as an ALC282 with a headphone plugged
     /// (#776 HP-tail sense-plugged branch).
     fn alc282_plugged() -> Result<Self, &'static str> {
-        Self::build_model(
-            false, false, false, false, false, false, true, false, false, 0, true,
-        )
+        Self::build_model(FixtureConfig {
+            alc282: true,
+            hp_plugged: true,
+            ..Default::default()
+        })
     }
     /// The analog codec as an ALC283 (#776 HP-tail fixture).
     fn alc283() -> Result<Self, &'static str> {
-        Self::build_model(
-            false, false, false, false, false, false, false, false, false, 0x10ec0283, false,
-        )
+        Self::build_model(FixtureConfig {
+            codec_id: 0x10ec0283,
+            ..Default::default()
+        })
     }
     /// The analog codec as an ALC283 with a headphone plugged
     /// (#776 HP-tail sense-plugged branch).
     fn alc283_plugged() -> Result<Self, &'static str> {
-        Self::build_model(
-            false, false, false, false, false, false, false, false, false, 0x10ec0283, true,
-        )
+        Self::build_model(FixtureConfig {
+            codec_id: 0x10ec0283,
+            hp_plugged: true,
+            ..Default::default()
+        })
     }
     /// The analog codec as the given Realtek codec vendor id
     /// (#776 remainder fixtures: parse-time updates, sibling IDs).
     fn with_codec(codec_id: u32) -> Result<Self, &'static str> {
-        Self::build_model(
-            false, false, false, false, false, false, false, false, false, codec_id, false,
-        )
+        Self::build_model(FixtureConfig {
+            codec_id,
+            ..Default::default()
+        })
     }
     /// The analog codec as a Lenovo Yoga 7 2-in-1 16AKP10 (ALC287,
     /// subsystem 0x17aa391d; #1496 verified-quirk fixture).
     fn yoga9() -> Result<Self, &'static str> {
-        Self::build_model(
-            false, false, false, false, false, false, false, true, false, 0, false,
-        )
+        Self::build_model(FixtureConfig {
+            yoga9: true,
+            ..Default::default()
+        })
     }
     /// The RX 6750 XT's HD-Audio function: 1002:ab28 runs without snoop.
     fn navi22() -> Result<Self, &'static str> {
-        Self::build_model(
-            super::super::ati_hdmi_noncoherent(0x1002, 0xab28),
-            true,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            0,
-            false,
-        )
+        Self::build_model(FixtureConfig {
+            noncoherent: super::super::ati_hdmi_noncoherent(0x1002, 0xab28),
+            ati: true,
+            navi22: true,
+            ..Default::default()
+        })
     }
-    fn build_model(
-        noncoherent: bool,
-        ati: bool,
-        second_port: bool,
-        navi22: bool,
-        line_in: bool,
-        alc256: bool,
-        alc282: bool,
-        yoga9: bool,
-        seed_alc256_coef: bool,
-        codec_id: u32,
-        hp_plugged: bool,
-    ) -> Result<Self, &'static str> {
+    fn build_model(config: FixtureConfig) -> Result<Self, &'static str> {
+        let FixtureConfig {
+            noncoherent,
+            ati,
+            second_port,
+            navi22,
+            line_in,
+            alc256,
+            alc282,
+            yoga9,
+            seed_alc256_coef,
+            codec_id,
+            hp_plugged,
+        } = config;
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
             phys: memory.phys_addr(),

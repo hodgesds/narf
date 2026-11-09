@@ -200,12 +200,10 @@ kernel_test_in!("drivers/fs/minix", smoke_minix_inode_decode_v1_v2);
 
 // ── End-to-end mount + I/O against RamBlockDevice ──────────────────
 
-/// Synchronous-only future poll. RamBlockDevice's `submit` returns
-/// `Ready` after the in-memory copy, so every MINIX op completes on
-/// the first poll.
-fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
-    use core::pin::Pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+/// A waker that does nothing: the harness re-polls futures
+/// directly, so no wake is ever needed to make progress.
+fn noop_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
     fn raw_waker() -> RawWaker {
         unsafe fn no_clone(_: *const ()) -> RawWaker {
             raw_waker()
@@ -218,7 +216,16 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     // rebuilds an equivalent waker and `no_op` makes wake/drop side-effect-free
     // on the null data pointer, so all vtable functions are sound to invoke.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    unsafe { Waker::from_raw(raw_waker()) }
+}
+
+/// Synchronous-only future poll. RamBlockDevice's `submit` returns
+/// `Ready` after the in-memory copy, so every MINIX op completes on
+/// the first poll.
+fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     // SAFETY: `fut` is a local owned by this fn and never moved after this
     // point (it lives until `poll_once` returns), so pinning `&mut fut` in
@@ -229,6 +236,67 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         Poll::Ready(v) => Some(v),
         Poll::Pending => None,
     }
+}
+
+/// Poll a future to completion, re-polling while it pends. For ops
+/// on [`DeferredDmaDevice`], whose submits pend exactly once, every
+/// op needs only a handful of polls; a future still pending after
+/// the bound is a harness failure, not a slow device.
+fn drive<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // SAFETY: same pinning argument as `poll_once`.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    for _ in 0..256 {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Drive two futures to completion by alternating polls: poll the
+/// first, then the second, repeat until both are ready. Each future
+/// is polled while the other is suspended at its `.await` — the
+/// interleaving two sequential `poll_once` calls can never produce,
+/// and the one a shared scratch buffer's race needs to be observed.
+/// Returns `None` for a future still pending after the bound.
+fn poll_two<F1, F2>(mut fut1: F1, mut fut2: F2) -> (Option<F1::Output>, Option<F2::Output>)
+where
+    F1: core::future::Future,
+    F2: core::future::Future,
+{
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // SAFETY: same pinning argument as `poll_once`: both futures
+    // are locals owned by this fn and never moved after this point.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let mut fut1 = unsafe { Pin::new_unchecked(&mut fut1) };
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let mut fut2 = unsafe { Pin::new_unchecked(&mut fut2) };
+    let mut out1 = None;
+    let mut out2 = None;
+    for _ in 0..64 {
+        if out1.is_none() {
+            if let Poll::Ready(v) = fut1.as_mut().poll(&mut cx) {
+                out1 = Some(v);
+            }
+        }
+        if out2.is_none() {
+            if let Poll::Ready(v) = fut2.as_mut().poll(&mut cx) {
+                out2 = Some(v);
+            }
+        }
+        if out1.is_some() && out2.is_some() {
+            break;
+        }
+    }
+    (out1, out2)
 }
 
 /// Build a minimal V3 MINIX image in heap memory.
@@ -1787,3 +1855,399 @@ fn smoke_minix_cross_open_write_visible() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/minix", smoke_minix_cross_open_write_visible);
+
+// ── Block-level read-modify-write races (#1998) ────────────────────
+
+/// Test-only block device that models real DMA timing: the transfer
+/// into/out of the request buffer happens when the device first
+/// executes the request (first poll of the submit future), and
+/// completion is signalled only on a later poll.
+///
+/// `RamBlockDevice` instead transfers synchronously inside
+/// `submit()` and completes on the first poll, so two block-level
+/// sequences can never interleave at the `.await` point and a
+/// read → patch → write race is invisible against it. This device
+/// makes the interleave observable: poll op A (transfer A lands,
+/// A pends), poll op B (transfer B lands, B pends), poll A again
+/// (A copies out).
+///
+/// Deviation from the `BlockDevice::submit` contract, documented
+/// here rather than hidden: a pending submit never wakes its waker
+/// — the harness re-polls it directly (`drive` / `poll_two`).
+/// Test-only; never used outside this module.
+struct DeferredDmaDevice {
+    storage: narf_lib::sync::IrqSafeSpinLock<Vec<u8>>,
+    logical_block_size: u32,
+    capacity_blocks: u64,
+}
+
+impl DeferredDmaDevice {
+    fn from_image(lbs: u32, image: Vec<u8>) -> alloc::sync::Arc<Self> {
+        assert!(
+            image.len() % lbs as usize == 0,
+            "DeferredDmaDevice image length must be a multiple of lbs"
+        );
+        let capacity_blocks = (image.len() / lbs as usize) as u64;
+        alloc::sync::Arc::new(Self {
+            storage: narf_lib::sync::IrqSafeSpinLock::new(image),
+            logical_block_size: lbs,
+            capacity_blocks,
+        })
+    }
+
+    /// Perform the DMA transfer for `req`: reads copy storage into
+    /// the request buffer, writes copy the request buffer into
+    /// storage. Mirrors `RamBlockDevice::do_io`'s bounds and
+    /// cap-resolution behaviour.
+    fn transfer(&self, req: &narf_block::BlockRequest) -> Result<(), narf_block::BlockError> {
+        use narf_block::{BlockError, BlockOp};
+        let buffer = narf_io::resolve_cap(&req.buffer).ok_or(BlockError::PermissionDenied)?;
+        let lbs = self.logical_block_size as u64;
+        let end = req
+            .lba
+            .checked_add(u64::from(req.blocks))
+            .ok_or(BlockError::InvalidRange)?;
+        if end > self.capacity_blocks {
+            return Err(BlockError::InvalidRange);
+        }
+        let start = (req.lba * lbs) as usize;
+        let span = (u64::from(req.blocks) * lbs) as usize;
+        if buffer.len() < span {
+            return Err(BlockError::InvalidRange);
+        }
+        let mut storage = self.storage.lock();
+        match req.op {
+            BlockOp::Read => {
+                let src = &storage[start..start + span];
+                // SAFETY: `buffer.as_mut_ptr()` returns a raw ptr into
+                // the identity-mapped DMA buffer; the cap → registry
+                // resolve guarantees the buffer is alive for the
+                // duration of the `Arc` we hold. The buffer is at
+                // least `span` bytes (checked above) and `src` is
+                // exactly `span` bytes of in-range storage.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
+                let dst = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), span) };
+                dst.copy_from_slice(src);
+                Ok(())
+            }
+            BlockOp::Write { .. } => {
+                // SAFETY: same identity-map argument as the read arm.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
+                let src = unsafe { core::slice::from_raw_parts(buffer.as_ptr(), span) };
+                storage[start..start + span].copy_from_slice(src);
+                Ok(())
+            }
+            BlockOp::WriteZeroes => {
+                for b in &mut storage[start..start + span] {
+                    *b = 0;
+                }
+                Ok(())
+            }
+            BlockOp::Trim => Ok(()),
+        }
+    }
+}
+
+impl narf_block::BlockDevice for DeferredDmaDevice {
+    fn logical_block_size(&self) -> u32 {
+        self.logical_block_size
+    }
+    fn physical_block_size(&self) -> u32 {
+        self.logical_block_size
+    }
+    fn capacity_blocks(&self) -> u64 {
+        self.capacity_blocks
+    }
+    fn supports(&self, feature: narf_block::BlockFeature) -> bool {
+        matches!(
+            feature,
+            narf_block::BlockFeature::Flush | narf_block::BlockFeature::WriteZeroes
+        )
+    }
+    fn submit(
+        &self,
+        req: narf_block::BlockRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        DeferredSubmit {
+            device: self,
+            req,
+            transferred: false,
+        }
+    }
+    async fn flush(&self) {}
+    async fn discard(&self, _range: narf_block::LbaRange) {}
+    async fn cancel(&self, _tag: u64) -> narf_block::CancelResult {
+        narf_block::CancelResult::NotFound
+    }
+}
+
+/// The submit future for [`DeferredDmaDevice`]: transfers on the
+/// first poll, then pends once so a concurrent op can interleave,
+/// and completes on the second poll.
+struct DeferredSubmit<'a> {
+    device: &'a DeferredDmaDevice,
+    req: narf_block::BlockRequest,
+    transferred: bool,
+}
+
+impl core::future::Future for DeferredSubmit<'_> {
+    type Output = narf_block::BlockCompletion;
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        use core::task::Poll;
+        let this = self.as_mut().get_mut();
+        if !this.transferred {
+            this.transferred = true;
+            return match this.device.transfer(&this.req) {
+                Ok(()) => Poll::Pending,
+                Err(e) => Poll::Ready(narf_block::BlockCompletion {
+                    tag: 0,
+                    user_tag: this.req.user_tag,
+                    result: Err(e),
+                }),
+            };
+        }
+        Poll::Ready(narf_block::BlockCompletion {
+            tag: 0,
+            user_tag: this.req.user_tag,
+            result: Ok(()),
+        })
+    }
+}
+
+/// Mount the V3 fixture image on a [`DeferredDmaDevice`] (512-byte
+/// LBS). Returns the device (for post-write snapshots) and the
+/// mounted volume.
+fn mount_deferred_volume() -> Option<(
+    alloc::sync::Arc<DeferredDmaDevice>,
+    alloc::sync::Arc<super::volume::MinixVolume<DeferredDmaDevice>>,
+)> {
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image(b"hello minix\n");
+    let device = DeferredDmaDevice::from_image(512, img);
+    let volume = drive(MinixVolume::mount(device.clone(), DomainId::DRIVER_0))?.ok()?;
+    Some((device, volume))
+}
+
+/// Harness limitation, stated plainly — these fixtures pin the
+/// post-fix end-state invariant through the real `write_inode` /
+/// bitmap / `write_file` paths, and they pin liveness of the chosen
+/// design (a design that nested `block_rmw` — e.g. holding it across
+/// `map_block_alloc` — would park forever, so `poll_two` would return
+/// `None` here and the test would fail instead of hanging the suite).
+/// They do NOT deterministically fail pre-fix for the #1998 race
+/// itself, for two measured reasons:
+///
+/// 1. On main the shared DMA scratch buffer is still unserialised
+///    (#1987, open): under `poll_two` + `DeferredDmaDevice` the
+///    second reader's buffer is contaminated by the first writer's
+///    staged bytes before the lost update can manifest as such. The
+///    host simulation (`~/workspace/queue/1998-sim.rs`, log
+///    `1998-sim.log`) measures it: shared-scratch pre-fix FAILs all
+///    four cases, but with #1987 corruption signatures, not #1998
+///    lost updates — `write_inode` leaves mtime1 = 0x0000 (neither
+///    the old 0xCAFE nor the new 0x1111), `alloc` returns ordinals
+///    3,1 (live inode 1 re-allocated; imap byte 0x02), alloc-vs-free
+///    wipes the imap's first byte to 0x00, `write_file` loses the
+///    first half. Do not read a pre-fix failure of these fixtures as
+///    #1998 evidence.
+/// 2. Even with #1987 fixed, the span between a read completing and
+///    the write submitting holds no pended await (the patch is
+///    synchronous and the write's first submit poll happens inside
+///    the same poll), and the barging `narf_lib::mutex::Mutex` lets
+///    the releasing task re-acquire the sector lock in the same poll,
+///    so no other task can run inside the span under single-threaded
+///    cooperative polling — the race is an SMP race, two CPUs
+///    genuinely overlapping the sequences.
+///
+/// The deterministic FAIL-pre-fix / PASS-post-fix evidence for the
+/// race itself is the host simulation's per-request device model
+/// (each submit has its own DMA buffer, isolating #1998): pre-fix
+/// all four cases fail with the clean lost-update signature
+/// (`write_inode` mtime1 stays 0xCAFE; `alloc` ordinals 3,3;
+/// alloc-vs-free returns 4 with bit 4 clear; `write_file` first
+/// half lost) and post-fix all four pass, on both device models.
+/// What these fixtures do prove in CI: the fix's end state through
+/// the real code paths, and that the serialised sequences complete
+/// under the harness's alternating polls.
+fn smoke_minix_concurrent_write_inode_both_survive() -> TestResult {
+    let (_device, volume) = match mount_deferred_volume() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount on deferred device failed"),
+    };
+    // Inodes 1 and 2 share inode-table block 4 (V3, 64-byte inodes,
+    // 16 per 1 KiB block).
+    let mut ino_a = match drive(volume.read_inode(1)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read_inode(1) failed"),
+    };
+    let mut ino_b = match drive(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read_inode(2) failed"),
+    };
+    ino_a.mtime = 0x1111;
+    ino_b.mtime = 0x2222;
+    let fut_a = volume.write_inode(1, &ino_a);
+    let fut_b = volume.write_inode(2, &ino_b);
+    let (ra, rb) = poll_two(fut_a, fut_b);
+    match (ra, rb) {
+        (Some(Ok(())), Some(Ok(()))) => {}
+        _ => return TestResult::Fail("concurrent write_inode did not complete"),
+    }
+    let back_a = match drive(volume.read_inode(1)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read-back of inode 1 failed"),
+    };
+    let back_b = match drive(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read-back of inode 2 failed"),
+    };
+    if back_a.mtime != 0x1111 {
+        return TestResult::Fail("inode 1 update lost to the concurrent write");
+    }
+    if back_b.mtime != 0x2222 {
+        return TestResult::Fail("inode 2 update lost to the concurrent write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_concurrent_write_inode_both_survive
+);
+
+/// Two concurrent `alloc_inode`s must hand out distinct ordinals,
+/// and both ordinals' bits must be set in the inode bitmap on disk.
+/// Fixture image imap byte 0 = 0b111 (inodes 1, 2 used), so the
+/// first two free ordinals are 3 and 4 in some order.
+fn smoke_minix_concurrent_alloc_inode_distinct() -> TestResult {
+    let (_device, volume) = match mount_deferred_volume() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount on deferred device failed"),
+    };
+    let fut_a = volume.alloc_inode();
+    let fut_b = volume.alloc_inode();
+    let (ra, rb) = poll_two(fut_a, fut_b);
+    let (oa, ob) = match (ra, rb) {
+        (Some(Ok(a)), Some(Ok(b))) => (a, b),
+        _ => return TestResult::Fail("concurrent alloc_inode did not complete"),
+    };
+    if oa == ob {
+        return TestResult::Fail("concurrent alloc_inode handed the same ordinal out twice");
+    }
+    let imap = volume.sb.imap_first_block();
+    let bs = volume.sb.block_size as usize;
+    let mut buf = vec![0u8; bs];
+    match drive(volume.read_block(imap, &mut buf)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("read-back of the inode bitmap failed"),
+    }
+    for o in [oa, ob] {
+        if buf[(o / 8) as usize] & (1 << (o % 8)) == 0 {
+            return TestResult::Fail("allocated ordinal's bitmap bit is clear on disk");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_concurrent_alloc_inode_distinct
+);
+
+/// An `alloc_inode` racing a `free_inode` on the same bitmap block
+/// must leave the bitmap consistent: the allocated ordinal's bit is
+/// set, and the freed ordinal's bit is clear — unless the alloc
+/// re-took the freed ordinal, which is only possible if the free
+/// completed first. See the harness-limitation note above: the
+/// pre-fix failure mode here is the shared-scratch race, not a
+/// clean lost update; the simulation carries the #1998 evidence.
+fn smoke_minix_concurrent_alloc_vs_free_bitmap_consistent() -> TestResult {
+    let (_device, volume) = match mount_deferred_volume() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount on deferred device failed"),
+    };
+    // Allocate inode 3 first, so there is a live bit to free.
+    let victim = match drive(volume.alloc_inode()) {
+        Some(Ok(o)) => o,
+        _ => return TestResult::Fail("setup alloc_inode failed"),
+    };
+    if victim != 3 {
+        return TestResult::Fail("fixture setup: first free inode ordinal is not 3");
+    }
+    let fut_a = volume.alloc_inode();
+    let fut_b = volume.free_inode(victim);
+    let (ra, rb) = poll_two(fut_a, fut_b);
+    let oa = match (ra, rb) {
+        (Some(Ok(a)), Some(Ok(()))) => a,
+        _ => return TestResult::Fail("concurrent alloc/free_inode did not complete"),
+    };
+    let imap = volume.sb.imap_first_block();
+    let bs = volume.sb.block_size as usize;
+    let mut buf = vec![0u8; bs];
+    match drive(volume.read_block(imap, &mut buf)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("read-back of the inode bitmap failed"),
+    }
+    let bit = |o: u32| buf[(o / 8) as usize] & (1 << (o % 8)) != 0;
+    if !bit(oa) {
+        return TestResult::Fail("allocated ordinal's bitmap bit is clear on disk");
+    }
+    if oa != victim && bit(victim) {
+        return TestResult::Fail("freed inode's bitmap bit is still set on disk");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_concurrent_alloc_vs_free_bitmap_consistent
+);
+
+/// Two concurrent `write_file`s to disjoint halves of one zone must
+/// both survive: the zone holds the first writer's bytes in its
+/// first half and the second writer's bytes in its second half.
+/// Inode 2 owns zone 6 in the fixture image; each future writes
+/// through its own decode copy so the two `&mut Inode`s do not alias.
+fn smoke_minix_concurrent_write_file_same_zone_both_halves_survive() -> TestResult {
+    let (_device, volume) = match mount_deferred_volume() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount on deferred device failed"),
+    };
+    let mut ino_a = match drive(volume.read_inode(2)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read_inode(2) failed"),
+    };
+    let mut ino_b = ino_a;
+    if ino_a.zones[0] != 6 {
+        return TestResult::Fail("fixture setup: inode 2 does not own zone 6");
+    }
+    let data_a = vec![0xA1u8; 512];
+    let data_b = vec![0xB2u8; 512];
+    let fut_a = volume.write_file(&mut ino_a, 0, &data_a);
+    let fut_b = volume.write_file(&mut ino_b, 512, &data_b);
+    let (ra, rb) = poll_two(fut_a, fut_b);
+    match (ra, rb) {
+        (Some(Ok(512)), Some(Ok(512))) => {}
+        _ => return TestResult::Fail("concurrent write_file did not complete"),
+    }
+    let mut zbuf = vec![0u8; 1024];
+    match drive(volume.read_zone(6, &mut zbuf)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("read-back of zone 6 failed"),
+    }
+    if zbuf[..512].iter().any(|b| *b != 0xA1) {
+        return TestResult::Fail("first half of the zone lost to the concurrent write");
+    }
+    if zbuf[512..].iter().any(|b| *b != 0xB2) {
+        return TestResult::Fail("second half of the zone lost to the concurrent write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_concurrent_write_file_same_zone_both_halves_survive
+);

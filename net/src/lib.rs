@@ -121,6 +121,7 @@ pub mod readiness;
 pub mod resolv_conf;
 pub mod route;
 pub mod rss;
+pub mod sntp;
 pub mod stack;
 pub mod stun;
 pub mod tcp;

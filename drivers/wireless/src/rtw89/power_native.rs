@@ -62,6 +62,18 @@ impl NativeIo {
         }
         self.checked(0x1f3fc, 4, |_, _| ())
     }
+    /// RTL8852A: the same AX PHY offset, but `rf_base_addr` is
+    /// {0xc000, 0xd000} (`rtw8852a.c:2388` @ 05441d6), so the last direct
+    /// RF dword is 0xd000 + 0x3fc, plus the AX `cr_base` 0x10000:
+    /// 0x1d3fc. RF transactions themselves stay RTL8852B-only
+    /// (`rf_access` hardcodes B's {0xe000, 0xf000} bases); this window
+    /// authorizes the aperture for the station preflight, not RF I/O.
+    pub(super) fn a_phy_window(&self) -> Result<(), Error> {
+        if self.chip != ChipId::Rtl8852A {
+            return Err(Error::Unsupported);
+        }
+        self.checked(0x1d3fc, 4, |_, _| ())
+    }
     pub(super) fn c_phy_window(&self) -> Result<(), Error> {
         if self.chip != ChipId::Rtl8852C {
             return Err(Error::Unsupported);
@@ -70,6 +82,15 @@ impl NativeIo {
     }
     pub(super) fn b_station_window(&self, indirect: bool) -> Result<(), Error> {
         self.b_phy_window()?;
+        if indirect {
+            self.checked(0x4001c, 4, |_, _| ())?;
+        }
+        Ok(())
+    }
+    /// RTL8852A station window: its PHY window plus, for the nonsecure
+    /// table init, `R_AX_INDIR_ACCESS_ENTRY` words (common AX code).
+    pub(super) fn a_station_window(&self, indirect: bool) -> Result<(), Error> {
+        self.a_phy_window()?;
         if indirect {
             self.checked(0x4001c, 4, |_, _| ())?;
         }

@@ -9,8 +9,8 @@
 //!
 //! RFC 2132 — DHCP Options and BOOTP Vendor Extensions
 //! (S. Alexander & R. Droms, Mar 1997). Option 6 (DNS servers),
-//! option 51 (lease time), option 53 (message type), option 54
-//! (server identifier).
+//! option 42 (NTP servers), option 51 (lease time), option 53
+//! (message type), option 54 (server identifier).
 //! <https://datatracker.ietf.org/doc/html/rfc2132>
 //!
 //! RFC 3927 — Dynamic Configuration of IPv4 Link-Local Addresses
@@ -55,8 +55,8 @@ use crate::pkt::{
 };
 use crate::pkt_dhcp::{
     build_discover, build_request, iter_options, DhcpHeader, DHCPACK, DHCPOFFER,
-    OPT_DHCP_MESSAGE_TYPE, OPT_DNS_SERVER, OPT_LEASE_TIME, OPT_ROUTER, OPT_SERVER_IDENTIFIER,
-    OPT_SUBNET_MASK,
+    OPT_DHCP_MESSAGE_TYPE, OPT_DNS_SERVER, OPT_LEASE_TIME, OPT_NTP_SERVERS, OPT_ROUTER,
+    OPT_SERVER_IDENTIFIER, OPT_SUBNET_MASK,
 };
 use crate::pkt_udp::{build_ipv4 as build_udp_datagram, UDP_HDR_LEN};
 
@@ -74,8 +74,8 @@ const DHCP_PER_ATTEMPT_MS: u64 = 4_000;
 // ── Legacy internal reply type ─────────────────────────────────────
 
 /// Snapshot of a successful DHCP lease (legacy `acquire` return type).
-/// Callers that don't need the DNS list or `Option<gateway>` semantics
-/// use this; `dhcp_acquire` returns the richer `Lease` type.
+/// Carries the NTP servers from option 42 (RFC 2132 §8.3); `dhcp_acquire`
+/// returns the richer `Lease` type.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DhcpLease {
     pub ip: [u8; 4],
@@ -83,6 +83,9 @@ pub struct DhcpLease {
     pub gateway: [u8; 4],
     pub server: [u8; 4],
     pub lease_secs: u32,
+    /// Up to 3 NTP servers from option 42 (RFC 2132 §8.3).
+    pub ntp: [[u8; 4]; 3],
+    pub ntp_count: u8,
 }
 
 // ── Parsed reply cache ─────────────────────────────────────────────
@@ -100,6 +103,9 @@ struct ParsedReply {
     /// Up to 3 DNS servers from option 6 (RFC 2132 §3.8).
     dns: [[u8; 4]; 3],
     dns_count: u8,
+    /// Up to 3 NTP servers from option 42 (RFC 2132 §8.3).
+    ntp: [[u8; 4]; 3],
+    ntp_count: u8,
     lease_secs: u32,
 }
 
@@ -144,6 +150,8 @@ pub fn on_udp_in_in(
     let mut gateway = [0u8; 4];
     let mut dns: [[u8; 4]; 3] = [[0u8; 4]; 3];
     let mut dns_count = 0u8;
+    let mut ntp: [[u8; 4]; 3] = [[0u8; 4]; 3];
+    let mut ntp_count = 0u8;
     let mut lease_secs = 0u32;
     if payload.len() < 240 {
         return;
@@ -171,6 +179,22 @@ pub fn on_udp_in_in(
                 }
                 dns_count = n;
             }
+            // RFC 2132 §8.3 option 42: NTP server(s). Each address is 4
+            // bytes; parse up to 3 addresses, mirroring option 6. The
+            // RFC places no count limit; the cap of 3 is the tree
+            // convention shared with the DNS list (fixed 3-slot arrays,
+            // no alloc in the RX path).
+            OPT_NTP_SERVERS if opt.data.len() >= 4 => {
+                let n = (opt.data.len() / 4).min(3) as u8;
+                for (slot, chunk) in ntp
+                    .iter_mut()
+                    .zip(opt.data.chunks_exact(4))
+                    .take(n as usize)
+                {
+                    slot.copy_from_slice(chunk);
+                }
+                ntp_count = n;
+            }
             _ => {}
         }
     }
@@ -185,6 +209,8 @@ pub fn on_udp_in_in(
             gateway,
             dns,
             dns_count,
+            ntp,
+            ntp_count,
             lease_secs,
         },
     );
@@ -327,6 +353,8 @@ pub fn acquire(iface_name: &str, timeout_ms: u64) -> Result<DhcpLease, ()> {
         gateway: ack.gateway,
         server: ack.server,
         lease_secs: ack.lease_secs,
+        ntp: ack.ntp,
+        ntp_count: ack.ntp_count,
     })
 }
 
@@ -361,6 +389,11 @@ pub struct Lease {
     pub gateway: Option<Ipv4Addr>,
     /// DNS resolver addresses (RFC 2132 option 6). Up to 3 entries.
     pub dns: Vec<Ipv4Addr>,
+    /// NTP server addresses (RFC 2132 option 42). Up to 3 entries.
+    /// No consumer reads this yet: the SNTP client preferring a
+    /// DHCP-advertised server is the #1955 follow-up, held on the
+    /// SNTP client landing (PR #1960).
+    pub ntp: Vec<Ipv4Addr>,
     /// Lease duration in seconds (RFC 2132 option 51).
     pub lease_seconds: u32,
 }
@@ -415,6 +448,16 @@ pub fn dhcp_acquire(iface_name: &str, _timeout_ms: u32) -> Result<Lease, DhcpErr
                 }
             }
 
+            // NTP rides in the `DhcpLease` return value itself
+            // (`raw.ntp`), so no second side-channel slot is needed;
+            // the DNS side-channel above is left untouched.
+            let mut ntp_vec: Vec<Ipv4Addr> = Vec::new();
+            for addr in raw.ntp.iter().take(raw.ntp_count as usize) {
+                if *addr != [0u8; 4] {
+                    ntp_vec.push(Ipv4Addr(*addr));
+                }
+            }
+
             let gateway = if raw.gateway == [0u8; 4] {
                 None
             } else {
@@ -426,6 +469,7 @@ pub fn dhcp_acquire(iface_name: &str, _timeout_ms: u32) -> Result<Lease, DhcpErr
                 netmask: Ipv4Addr(raw.netmask),
                 gateway,
                 dns: dns_vec.clone(),
+                ntp: ntp_vec,
                 lease_seconds: raw.lease_secs,
             };
 

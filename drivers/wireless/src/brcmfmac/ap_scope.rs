@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Fixed original AP/peer/DATA copy generations. Dynamic socket/provider
 //! work is completed by the frontend before this callback-free final fence.
-use super::{ap_source::Source, runtime::Error};
+use super::{ap_native::Scope, ap_source::Source, runtime::Error};
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_wireless::{ap_control::ApEmissionAuthority, reg::RegulatoryDomain};
@@ -105,6 +105,12 @@ pub struct Capture {
     pub(super) source: ApEmissionAuthority,
     pub(super) sources: Vec<ApEmissionAuthority>,
     pub(super) policy: Policy,
+    /// The AP scope this capture belongs to: its firmware events carry
+    /// this scope's (ifidx, bsscfgidx) pair. `program_event_blocks`
+    /// classifies with it, so a benign event on a secondary vif no
+    /// longer spuriously blocks Program SET, and a secondary
+    /// association indication still blocks.
+    pub(super) scope: Scope,
     pub(super) role: Epoch,
     pub(super) copy: Epoch,
     pub(super) peer: Option<Epoch>,
@@ -137,7 +143,7 @@ impl Capture {
         header: &crate::cyw43439::events::EventHeader,
     ) -> bool {
         !matches!(
-            super::ap_wire::event_transition(header, self.own),
+            super::ap_wire::event_transition(header, self.own, self.scope.indices()),
             Ok(super::ap_wire::Transition::Benign)
         )
     }

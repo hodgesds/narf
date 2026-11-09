@@ -1451,18 +1451,25 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         }
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
-        if n_blocks != 1 {
+        let required = usize::from(n_blocks) * 512;
+        if data.len() < required {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        if data.len() < 512 {
-            return Err(narf_block::BlockIoError::BufferTooSmall);
-        }
-        let mut buf = [0u8; 512];
-        buf.copy_from_slice(&data[..512]);
         // Same reasoning as `read` above.
         let (_gate, dev) = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        dev.write_sector(lba, &buf)
-            .map_err(|_| narf_block::BlockIoError::DriverError)
+        if lba.checked_add(u64::from(n_blocks)).is_none() {
+            return Err(narf_block::BlockIoError::OutOfRange);
+        }
+        // The synchronous sector primitive is polled; batching at this layer
+        // must preserve every sector of an ordinary BlockDeviceSync request.
+        // Btrfs metadata and encrypted adapters routinely write multiple LBAs.
+        for (offset, sector) in data[..required].chunks_exact(512).enumerate() {
+            let mut buf = [0u8; 512];
+            buf.copy_from_slice(sector);
+            dev.write_sector(lba + offset as u64, &buf)
+                .map_err(|_| narf_block::BlockIoError::DriverError)?;
+        }
+        Ok(())
     }
     /// Drain the device write cache via T_FLUSH when negotiated
     /// (#841). A failed flush surfaces as `DriverError`, never as

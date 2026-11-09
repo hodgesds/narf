@@ -220,8 +220,16 @@ impl Rx {
         }
         // RTL8851B: rtw8851be.c `rtw89_8851be_info` is field-for-field
         // rtw8852be.c's (DMA address set, LTR, RX ring/descriptor), so it
-        // takes B's geometry and prerequisite.
-        if !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B) {
+        // takes B's geometry and prerequisite. RTL8852A takes the same
+        // non-V1 geometry: rtw8852ae.c `rtw8852a_pci_info.dma_addr_set` is
+        // `&rtw89_pci_ch_dma_addr_set` (same as 8852be/8851be, @ 05441d6),
+        // and its DMA-stop mask is a superset of B's
+        // (`B_AX_TX_STOP1_MASK` vs `_V1`, plus `B_AX_TX_STOP2_ALL`),
+        // so the shared stopped readback below holds for A too.
+        if !matches!(
+            chip,
+            ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+        ) {
             return Err(power::Error::Unsupported.into());
         }
         self.state = State::Publishing;
@@ -263,6 +271,17 @@ impl Rx {
                 ltr_v1(io)?;
             } else {
                 ltr(io)?;
+            }
+        }
+        // RTL8852A-only LTR software trigger (pci.c
+        // `rtw89_pci_ops_mac_post_init_ax` @ 05441d6, after `ltr_set`):
+        // `R_AX_LTR_CTRL_0` (0x8410) `B_AX_APP_LTR_ACT` (bit 5, reg.h).
+        // Unconditional in Linux, so it runs even when DEVCTL2 left LTR
+        // unprogrammed above; read back the bit, not the whole register.
+        if chip == ChipId::Rtl8852A {
+            modify(io, LTR_CTRL_0, 0, 1 << 5)?;
+            if read(io, LTR_CTRL_0)? & (1 << 5) == 0 {
+                return Err(power::Error::Access.into());
             }
         }
         if c {

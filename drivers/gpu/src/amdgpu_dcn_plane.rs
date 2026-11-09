@@ -6,7 +6,9 @@
 //! `dcn20_opp.c::opp2_set_disp_pattern_generator`.
 //!
 //! Scope is one plane with every colour-management stage bypassed and no
-//! blending. On DCN3.0 the DSCL scales and positions it as
+//! blending — except the MPC tree, where [`Mpc::insert_plane`] links a
+//! second (overlay) plane above the primary and [`Mpc::set_blend`] programs
+//! its `mpc2_update_blending` fields. On DCN3.0 the DSCL scales and positions it as
 //! `dpp1_dscl_set_scaler_manual_scale` does (`Dpp::set_scaler`, the
 //! `dcn_3_0_0_offset.h` DSCL block); the modeset itself programs the
 //! scaler in bypass. A stream is blanked here, by the OPP's pattern
@@ -72,6 +74,15 @@ const MPCC_TOP_SEL: u64 = 0x0000; // linux: mmMPCC0_MPCC_TOP_SEL
 const MPCC_BOT_SEL: u64 = 0x0001; // linux: mmMPCC0_MPCC_BOT_SEL
 const MPCC_OPP_ID: u64 = 0x0002; // linux: mmMPCC0_MPCC_OPP_ID
 const MPCC_CONTROL: u64 = 0x0003; // linux: mmMPCC0_MPCC_CONTROL
+/// `MPCC_UPDATE_LOCK_SEL`: the VUPDATE lock set this MPCC's double-buffered
+/// updates latch under, which `mpc1_insert_plane` maps to the OPP.
+const MPCC_UPDATE_LOCK_SEL: u64 = 0x0005; // linux: mmMPCC0_MPCC_UPDATE_LOCK_SEL
+/// The gain registers `mpc2_update_blending` (DCN30's blend op) writes after
+/// `MPCC_CONTROL`: the top gain and the bottom gain inside/outside the
+/// overlap.
+const MPCC_TOP_GAIN: u64 = 0x0006; // linux: mmMPCC0_MPCC_TOP_GAIN
+const MPCC_BOT_GAIN_INSIDE: u64 = 0x0007; // linux: mmMPCC0_MPCC_BOT_GAIN_INSIDE
+const MPCC_BOT_GAIN_OUTSIDE: u64 = 0x0008; // linux: mmMPCC0_MPCC_BOT_GAIN_OUTSIDE
 const MPCC_BG_R_CR: u64 = 0x0009; // linux: mmMPCC0_MPCC_BG_R_CR
 const MPCC_BG_G_Y: u64 = 0x000a; // linux: mmMPCC0_MPCC_BG_G_Y
 const MPCC_BG_B_CB: u64 = 0x000b; // linux: mmMPCC0_MPCC_BG_B_CB
@@ -175,6 +186,15 @@ const MPCC_ALPHA_MULTIPLIED_MODE: u32 = 0x0000_0040;
 const MPCC_BLND_ACTIVE_OVERLAP_ONLY: u32 = 0x0000_0080;
 const MPCC_BG_BPC: u32 = 0x0000_0700; // linux: MPCC0_MPCC_CONTROL__MPCC_BG_BPC_MASK
 const MPCC_GLOBAL_ALPHA: u32 = 0x00FF_0000; // linux: MPCC0_MPCC_CONTROL__MPCC_GLOBAL_ALPHA_MASK
+/// `MPCC_GLOBAL_GAIN` (bits 31:24): the plane-alpha gain
+/// `mpc2_update_blending` writes alongside the global alpha. The in-tree
+/// mask predates it: `mux_plane`'s opaque blend leaves an inherited gain
+/// behind, which the overlay insert path below writes explicitly.
+const MPCC_GLOBAL_GAIN: u32 = 0xFF00_0000; // linux: MPCC0_MPCC_CONTROL__MPCC_GLOBAL_GAIN_MASK
+/// `MPCC_BOT_GAIN_MODE` (bit 11): the blend mode for the bottom gain.
+const MPCC_BOT_GAIN_MODE: u32 = 0x0000_0800; // linux: MPCC0_MPCC_CONTROL__MPCC_BOT_GAIN_MODE_MASK
+/// The gain registers hold one 19-bit gain each.
+const MPCC_GAIN_MASK: u32 = 0x0007_FFFF; // linux: MPCC0_MPCC_TOP_GAIN__MPCC_TOP_GAIN_MASK
 
 /// `MPCC_BLEND_MODE_TOP_LAYER_ONLY` from `enum mpcc_blend_mode`
 /// (`inc/hw/mpc.h:70-75`): BYPASS 0, TOP_LAYER_PASSTHROUGH 1, TOP_LAYER_ONLY 2,
@@ -187,6 +207,107 @@ const MPCC_GLOBAL_ALPHA: u32 = 0x00FF_0000; // linux: MPCC0_MPCC_CONTROL__MPCC_G
 /// on the OPP at all.
 // linux: n/a (enum mpcc_blend_mode in inc/hw/mpc.h; header not in checker set)
 const MPCC_BLEND_MODE_TOP_LAYER_ONLY: u32 = 2;
+/// `MPCC_BLEND_MODE_TOP_LAYER_PASSTHROUGH` (`inc/hw/mpc.h`): the top layer
+/// passes and the bottom layer is ignored. `mpc1_remove_mpcc` writes it on
+/// the MPCC above a removed bottom MPCC, whose blend partner is gone but
+/// whose bottom select is now parked.
+// linux: n/a (enum mpcc_blend_mode in inc/hw/mpc.h; header not in checker set)
+const MPCC_BLEND_MODE_TOP_LAYER_PASSTHROUGH: u32 = 1;
+/// `MPCC_BLEND_MODE_TOP_BOT_BLENDING` (`inc/hw/mpc.h`): the top layer blends
+/// over the bottom layer. `mpc1_insert_plane` writes it on a new MPCC
+/// inserted above another, and on the old bottom when a plane is appended
+/// below it.
+// linux: n/a (enum mpcc_blend_mode in inc/hw/mpc.h; header not in checker set)
+const MPCC_BLEND_MODE_TOP_BOT_BLENDING: u32 = 3;
+
+/// How one MPCC blends its top layer over its bottom layer: `enum
+/// mpcc_alpha_blend_mode` (`inc/hw/mpc.h:80-98`), the `MPCC_ALPHA_BLND_MODE`
+/// field of `MPCC_CONTROL`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlphaBlendMode {
+    /// Per-pixel alpha from the DPP, ignoring any plane alpha.
+    PerPixelAlpha,
+    /// Per-pixel alpha multiplied by the global gain (the plane alpha).
+    PerPixelAlphaCombinedGlobalGain,
+    /// The global alpha only, ignoring pixel alpha.
+    GlobalAlpha,
+}
+impl AlphaBlendMode {
+    const fn code(self) -> u32 {
+        match self {
+            // linux: n/a (enum mpcc_alpha_blend_mode in inc/hw/mpc.h)
+            AlphaBlendMode::PerPixelAlpha => 0,
+            // linux: n/a (enum mpcc_alpha_blend_mode in inc/hw/mpc.h)
+            AlphaBlendMode::PerPixelAlphaCombinedGlobalGain => 1,
+            // linux: n/a (enum mpcc_alpha_blend_mode in inc/hw/mpc.h)
+            AlphaBlendMode::GlobalAlpha => 2,
+        }
+    }
+}
+
+/// `struct mpcc_blnd_cfg` (`inc/hw/mpc.h:124-175`) as `mpc2_update_blending`
+/// (DCN30's blend op, `dcn20_mpc.c`) writes it: the seven `MPCC_CONTROL`
+/// fields plus the top and bottom gains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlendConfig {
+    pub alpha_mode: AlphaBlendMode,
+    pub pre_multiplied_alpha: bool,
+    pub overlap_only: bool,
+    /// Plane alpha (0-255); the `MPCC_GLOBAL_ALPHA` field.
+    pub global_alpha: u8,
+    /// Plane-alpha gain (0-255); the `MPCC_GLOBAL_GAIN` field.
+    pub global_gain: u8,
+    /// Background colour depth (0-7); the `MPCC_BG_BPC` field.
+    pub background_color_bpc: u32,
+    /// Bottom-gain blend mode (0-1); the `MPCC_BOT_GAIN_MODE` field.
+    pub bottom_gain_mode: u32,
+    /// The `MPCC_TOP_GAIN` register (19 bits).
+    pub top_gain: u32,
+    /// The `MPCC_BOT_GAIN_INSIDE` register (19 bits).
+    pub bottom_inside_gain: u32,
+    /// The `MPCC_BOT_GAIN_OUTSIDE` register (19 bits).
+    pub bottom_outside_gain: u32,
+}
+impl BlendConfig {
+    /// `dcn20_update_mpcc`'s composition for an opaque plane with no
+    /// per-pixel alpha: global-alpha mode, global alpha and gain 0xff,
+    /// background bpc 4, bottom gain mode 0, all gains 0x1f000.
+    pub const fn opaque() -> Self {
+        Self {
+            alpha_mode: AlphaBlendMode::GlobalAlpha,
+            pre_multiplied_alpha: false,
+            overlap_only: false,
+            global_alpha: 0xff,
+            global_gain: 0xff,
+            background_color_bpc: 4,
+            bottom_gain_mode: 0,
+            top_gain: 0x1f000,
+            bottom_inside_gain: 0x1f000,
+            bottom_outside_gain: 0x1f000,
+        }
+    }
+    /// `dcn20_update_mpcc`'s composition for a plane with per-pixel alpha
+    /// and no plane alpha: per-pixel mode, global alpha and gain 0xff.
+    pub const fn per_pixel_alpha(pre_multiplied: bool) -> Self {
+        Self {
+            alpha_mode: AlphaBlendMode::PerPixelAlpha,
+            pre_multiplied_alpha: pre_multiplied,
+            ..Self::opaque()
+        }
+    }
+    /// `dcn20_update_mpcc`'s composition for a plane with per-pixel alpha
+    /// and a plane alpha `gain`: per-pixel-combined-global-gain mode, the
+    /// gain in both the global-gain and the global-alpha fields.
+    pub const fn per_pixel_alpha_with_gain(pre_multiplied: bool, gain: u8) -> Self {
+        Self {
+            alpha_mode: AlphaBlendMode::PerPixelAlphaCombinedGlobalGain,
+            pre_multiplied_alpha: pre_multiplied,
+            global_alpha: gain,
+            global_gain: gain,
+            ..Self::opaque()
+        }
+    }
+}
 /// `MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA` (`inc/hw/mpc.h`), which
 /// `dcn20_hwseq.c` selects for a plane with no per-pixel alpha, paired with
 /// `global_alpha = 0xff`.
@@ -371,6 +492,13 @@ impl<I: Io> Block<I> {
             io.write(reg, (old & !mask) | (value & mask));
             Ok(())
         })?
+    }
+    fn read_reg(&mut self, reg: u64) -> Result<u32, Error> {
+        let value = self.access(|io| io.read(reg))?;
+        if value == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        Ok(value)
     }
 }
 impl<I: Io> Block<I> {
@@ -687,6 +815,199 @@ impl<I: Io> Block<I> {
         }
         Ok(())
     }
+    /// This MPCC's register `reg` of MPCC `id` (the tree spans instances;
+    /// the mux, top and bottom selects of several MPCCs are one tree).
+    fn mpcc_at(&self, id: u8, reg: u64) -> u64 {
+        reg + u64::from(id) * MPCC_STRIDE
+    }
+    /// The MPCC id the OPP's output mux names, or `MPCC_UNSET` for an empty
+    /// tree.
+    fn mpc_tree_head(&mut self, opp: u8) -> Result<u32, Error> {
+        if opp >= self.profile.pipes() {
+            return Err(Error::Invalid);
+        }
+        let reg = MPC_OUT_MUX + u64::from(opp) * MPC_OUT_STRIDE;
+        Ok(self.read_reg(reg)? & 0xf)
+    }
+    /// `mpc2_update_blending` (DCN30's blend op, `dcn20_mpc.c`) on MPCC
+    /// `id`: the seven `MPCC_CONTROL` fields, then the top and bottom gain
+    /// registers whole. The mode field is not touched: the caller sets it
+    /// when it links the MPCC into the tree.
+    fn mpc_set_blend(&mut self, id: u8, cfg: &BlendConfig) -> Result<(), Error> {
+        if id >= self.profile.pipes() || cfg.background_color_bpc > 7 || cfg.bottom_gain_mode > 1 {
+            return Err(Error::Invalid);
+        }
+        let reg = self.mpcc_at(id, MPCC_CONTROL);
+        self.update(
+            reg,
+            MPCC_ALPHA_BLND_MODE
+                | MPCC_ALPHA_MULTIPLIED_MODE
+                | MPCC_BLND_ACTIVE_OVERLAP_ONLY
+                | MPCC_GLOBAL_ALPHA
+                | MPCC_GLOBAL_GAIN
+                | MPCC_BG_BPC
+                | MPCC_BOT_GAIN_MODE,
+            cfg.alpha_mode.code() << MPCC_ALPHA_BLND_MODE.trailing_zeros()
+                | u32::from(cfg.pre_multiplied_alpha)
+                    << MPCC_ALPHA_MULTIPLIED_MODE.trailing_zeros()
+                | u32::from(cfg.overlap_only) << MPCC_BLND_ACTIVE_OVERLAP_ONLY.trailing_zeros()
+                | u32::from(cfg.global_alpha) << MPCC_GLOBAL_ALPHA.trailing_zeros()
+                | u32::from(cfg.global_gain) << MPCC_GLOBAL_GAIN.trailing_zeros()
+                | cfg.background_color_bpc << MPCC_BG_BPC.trailing_zeros()
+                | cfg.bottom_gain_mode << MPCC_BOT_GAIN_MODE.trailing_zeros(),
+        )?;
+        for (reg, value) in [
+            (MPCC_TOP_GAIN, cfg.top_gain),
+            (MPCC_BOT_GAIN_INSIDE, cfg.bottom_inside_gain),
+            (MPCC_BOT_GAIN_OUTSIDE, cfg.bottom_outside_gain),
+        ] {
+            let reg = self.mpcc_at(id, reg);
+            self.set(reg, value & MPCC_GAIN_MASK)?;
+        }
+        Ok(())
+    }
+    /// `mpc1_insert_plane` for this MPCC (`dcn10_mpc.c`): bind it to `dpp`
+    /// on `opp`, above MPCC `above` (`Some`: on top of it, blending over
+    /// it; `None`: at the bottom of the tree, or the tree's only MPCC), map
+    /// its VUPDATE lock set to the OPP, and apply `blend`. The tree is
+    /// walked from the output mux first, so a link that cannot be made
+    /// fails before any register is written. Ownership is the caller's:
+    /// this MPCC must be leased (no other tree names it), which the
+    /// registers cannot prove after a firmware handoff.
+    fn mpc_insert_plane(
+        &mut self,
+        dpp: u8,
+        opp: u8,
+        above: Option<u8>,
+        blend: &BlendConfig,
+    ) -> Result<(), Error> {
+        let pipes = self.profile.pipes();
+        if dpp >= pipes || opp >= pipes {
+            return Err(Error::Invalid);
+        }
+        if let Some(a) = above {
+            if a >= pipes || a == self.instance {
+                return Err(Error::Invalid);
+            }
+        }
+        // Find the link first: the mux names this MPCC when the tree is
+        // empty or `above` is its head; otherwise the MPCC whose bottom
+        // select names `above` (or the bottommost, for `None`) takes it.
+        enum Link {
+            Mux,
+            Below(u8),
+        }
+        let head = self.mpc_tree_head(opp)?;
+        let link = if head == MPCC_UNSET {
+            if above.is_some() {
+                return Err(Error::Invalid);
+            }
+            Link::Mux
+        } else if head >= u32::from(pipes) {
+            return Err(Error::Invalid);
+        } else if Some(head as u8) == above {
+            Link::Mux
+        } else {
+            let want = above.map_or(MPCC_UNSET, u32::from);
+            let mut temp = head;
+            let mut found = None;
+            for _ in 0..pipes {
+                let bot = self.read_reg(self.mpcc_at(temp as u8, MPCC_BOT_SEL))? & 0xf;
+                if bot == want {
+                    found = Some(temp as u8);
+                    break;
+                }
+                if bot == MPCC_UNSET || bot >= u32::from(pipes) {
+                    break;
+                }
+                temp = bot;
+            }
+            Link::Below(found.ok_or(Error::Invalid)?)
+        };
+        // This MPCC's mux: its DPP on top, `above` (or nothing) below it,
+        // the OPP, the VUPDATE lock set, and the blend mode for its place.
+        let (bot, mode) = match above {
+            Some(a) => (u32::from(a), MPCC_BLEND_MODE_TOP_BOT_BLENDING),
+            None => (MPCC_UNSET, MPCC_BLEND_MODE_TOP_LAYER_ONLY),
+        };
+        let reg = self.mpcc(MPCC_TOP_SEL);
+        self.update(reg, 0xf, u32::from(dpp))?; // linux-lit: 0xf=MPCC0_MPCC_TOP_SEL__MPCC_TOP_SEL_MASK
+        let reg = self.mpcc(MPCC_BOT_SEL);
+        self.update(reg, 0xf, bot)?; // linux-lit: 0xf=MPCC0_MPCC_BOT_SEL__MPCC_BOT_SEL_MASK
+        let reg = self.mpcc(MPCC_OPP_ID);
+        self.update(reg, 0xf, u32::from(opp))?; // linux-lit: 0xf=MPCC0_MPCC_OPP_ID__MPCC_OPP_ID_MASK
+        let reg = self.mpcc(MPCC_UPDATE_LOCK_SEL);
+        // linux-lit: 0xf=MPCC0_MPCC_UPDATE_LOCK_SEL__MPCC_UPDATE_LOCK_SEL_MASK
+        self.update(reg, 0xf, u32::from(opp))?;
+        let reg = self.mpcc(MPCC_CONTROL);
+        self.update(reg, MPCC_MODE, mode)?; // linux-lit: 0x3=MPCC0_MPCC_CONTROL__MPCC_MODE_MASK
+        match link {
+            Link::Mux => {
+                let reg = MPC_OUT_MUX + u64::from(opp) * MPC_OUT_STRIDE;
+                self.update(reg, 0xf, u32::from(self.instance))?;
+                // linux-lit: 0xf=MPC_OUT0_MUX__MPC_OUT_MUX_MASK
+            }
+            Link::Below(temp) => {
+                let reg = self.mpcc_at(temp, MPCC_BOT_SEL);
+                self.update(reg, 0xf, u32::from(self.instance))?;
+                if above.is_none() {
+                    // The old bottom now has a bottom to blend with.
+                    let reg = self.mpcc_at(temp, MPCC_CONTROL);
+                    self.update(reg, MPCC_MODE, MPCC_BLEND_MODE_TOP_BOT_BLENDING)?;
+                }
+            }
+        }
+        self.mpc_set_blend(self.instance, blend)
+    }
+    /// `mpc1_remove_mpcc` for this MPCC (`dcn10_mpc.c`): unlink it from
+    /// `opp`'s tree — the MPCC below becomes the top when it was the head,
+    /// the MPCC above takes its bottom select otherwise (and stops
+    /// blending when it was the bottom) — then park its mux registers. A
+    /// MPCC that is not in the tree is still parked, as Linux parks a
+    /// BIOS leftover on the S3-resume path.
+    fn mpc_remove_plane(&mut self, opp: u8) -> Result<(), Error> {
+        let pipes = self.profile.pipes();
+        if opp >= pipes {
+            return Err(Error::Invalid);
+        }
+        let me = u32::from(self.instance);
+        let head = self.mpc_tree_head(opp)?;
+        if head == me {
+            let bot = self.read_reg(self.mpcc(MPCC_BOT_SEL))? & 0xf;
+            let reg = MPC_OUT_MUX + u64::from(opp) * MPC_OUT_STRIDE;
+            self.update(reg, 0xf, bot)?; // linux-lit: 0xf=MPC_OUT0_MUX__MPC_OUT_MUX_MASK
+        } else if head != MPCC_UNSET && head < u32::from(pipes) {
+            let mut temp = head;
+            for _ in 0..pipes {
+                let bot = self.read_reg(self.mpcc_at(temp as u8, MPCC_BOT_SEL))? & 0xf;
+                if bot == me {
+                    let my_bot = self.read_reg(self.mpcc(MPCC_BOT_SEL))? & 0xf;
+                    let reg = self.mpcc_at(temp as u8, MPCC_BOT_SEL);
+                    self.update(reg, 0xf, my_bot)?;
+                    if my_bot == MPCC_UNSET {
+                        let reg = self.mpcc_at(temp as u8, MPCC_CONTROL);
+                        self.update(reg, MPCC_MODE, MPCC_BLEND_MODE_TOP_LAYER_PASSTHROUGH)?;
+                    }
+                    break;
+                }
+                if bot == MPCC_UNSET || bot >= u32::from(pipes) {
+                    break;
+                }
+                temp = bot;
+            }
+        }
+        for reg in [
+            MPCC_TOP_SEL,
+            MPCC_BOT_SEL,
+            MPCC_OPP_ID,
+            MPCC_UPDATE_LOCK_SEL,
+        ] {
+            let reg = self.mpcc(reg);
+            // linux-lit: 0xf=MPCC0_MPCC_TOP_SEL__MPCC_TOP_SEL_MASK
+            self.update(reg, 0xf, MPCC_UNSET)?;
+        }
+        Ok(())
+    }
     /// Program the output formatter. Truncation and dithering stay off, so the
     /// formatter passes the plane's depth through untouched.
     fn opp_program(&mut self, encoding: Encoding, width: u32, height: u32) -> Result<(), Error> {
@@ -776,7 +1097,9 @@ impl Dpp {
 }
 
 /// The multiple-pipe/plane combiner. One MPCC takes one DPP and feeds one OPP,
-/// with nothing below it to blend against.
+/// with nothing below it to blend against — until [`Mpc::insert_plane`] links
+/// it into an OPP's tree, where the mux names the topmost MPCC and each
+/// MPCC's bottom select names the one below it.
 #[derive(Debug)]
 pub struct Mpc(Block<Mmio>);
 impl Mpc {
@@ -813,11 +1136,46 @@ impl Mpc {
     pub fn mux_plane(&mut self, dpp: u8, opp: u8) -> Result<(), Error> {
         self.0.mpc_mux_plane(dpp, opp)
     }
+    /// `mpc1_insert_plane` for this MPCC: link it into `opp`'s tree above
+    /// MPCC `above` (`Some`: the new top over it; `None`: appended at the
+    /// bottom, or the tree's only MPCC), fed by `dpp`, with `blend`. The
+    /// overlay path inserts the slave MPCC above the primary's, so the
+    /// overlay blends over the primary and the output mux names the slave.
+    pub fn insert_plane(
+        &mut self,
+        dpp: u8,
+        opp: u8,
+        above: Option<u8>,
+        blend: &BlendConfig,
+    ) -> Result<(), Error> {
+        self.0.mpc_insert_plane(dpp, opp, above, blend)
+    }
+    /// `mpc1_remove_mpcc` for this MPCC: unlink it from `opp`'s tree and
+    /// park its mux registers. The MPCC above it (if any) takes its bottom
+    /// select, and stops blending when it was the bottom.
+    pub fn remove_plane(&mut self, opp: u8) -> Result<(), Error> {
+        self.0.mpc_remove_plane(opp)
+    }
+    /// `mpc2_update_blending` (DCN30's blend op) on this MPCC: the blend
+    /// fields of `MPCC_CONTROL` and the top/bottom gain registers. The
+    /// blend mode itself is the tree link's, set by [`Mpc::insert_plane`].
+    pub fn set_blend(&mut self, blend: &BlendConfig) -> Result<(), Error> {
+        let instance = self.0.instance;
+        self.0.mpc_set_blend(instance, blend)
+    }
+    /// The MPCC id the OPP's output mux names, or `0xf` for an empty tree.
+    pub fn tree_head(&mut self, opp: u8) -> Result<u8, Error> {
+        Ok(self.0.mpc_tree_head(opp)? as u8)
+    }
     /// `mpc1_set_bg_color` on this (bottommost) MPCC: the colour shown
     /// wherever the plane's recout does not cover the OPP. `rgb` is DC's
     /// 10-bit `tg_color`; MPC colour is 12-bit. `dcn20_update_mpcc` sets it
     /// from `visual_confirm_color`, all zero (black) with visual confirm
     /// off on DCN2+.
+    ///
+    /// LINUX-GAP: Linux's `mpc1_set_bg_color` walks to the tree's
+    /// bottommost MPCC; this writes this MPCC's registers. Call it on the
+    /// primary's MPCC — the bottom of an overlay tree — never the slave's.
     pub fn set_bg_color(&mut self, rgb: [u16; 3]) -> Result<(), Error> {
         self.0.mpc_set_bg_color(rgb)
     }

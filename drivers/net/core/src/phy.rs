@@ -177,6 +177,7 @@ pub fn merge_phy_sample(base: LinkSample, phy: PhyLink) -> LinkSample {
         // read — preserve the base sample's media fields.
         media_available: base.media_available,
         phy_type: base.phy_type,
+        phy_type_name: base.phy_type_name,
     }
 }
 

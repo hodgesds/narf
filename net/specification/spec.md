@@ -308,16 +308,23 @@ complete `rtnl_link_stats64` counter set. `set_link_state` changes only
 administrative `IFF_UP`; a driver publishes an authoritative PHY sample with
 `set_link_metadata(name, carrier, speed_mbps, duplex)`. A driver whose
 hardware reports transceiver/module state publishes it separately with
-`set_link_media(name, media_available, phy_type)` (issue #791 / #867):
+`set_link_media(name, media_available, phy_type, phy_type_name)` (issue #791 / #867):
 `media_available` is `Some(true)` while a module is seated even when the
 link is down and `Some(false)` for an empty cage, and it is deliberately
 NOT cleared on carrier-down; `phy_type` is the family's raw firmware
-PHY-type code (`I40E_PHY_TYPE_*` for i40e — decoding it to a name is
-#867's table work), and an empty cage clears it, so no type is ever
-reported for a module that is no longer seated. `publish_link` in the
+PHY-type code (`I40E_PHY_TYPE_*` for i40e), and an empty cage clears it, so no type is ever
+reported for a module that is no longer seated. The fourth argument,
+`phy_type_name`, is the decoded name for that code (issue #867) — for
+i40e the `I40E_PHY_TYPE_*` suffix (`"SFI"`, `"10GBASE_SR"`) from the
+sourced Linux table; other families publish their own table's names as
+they gain decodes, `None` until then. It follows the raw code exactly:
+it survives carrier-down and clears with an empty cage. `publish_link` in the
 shared driver publication layer forwards a sample's media fields
 through `set_link_media` when present. Rtnetlink/sysfs surfacing of
-the media fields is still open (see #867). A driver whose
+the media fields is still open (see #867): the fields exist in entry
+and snapshot metadata so a consumer can read them, but no
+sysfs/rtnetlink file renders them yet — that surfacing decision is the
+documented remainder, not a silent drop.
 hardware must be started on `IFF_UP` (`ndo_open` / `ndo_stop`) installs
 `iface::set_open_stop(name, hook: fn(&str, bool)) -> bool` after `register`
 (registration clears it); `set_link_state` calls the hook on every real
@@ -1552,8 +1559,11 @@ References (public-only, all IETF documents):
   the §2.4(c) bound (1232 bytes) and applying the §2.4(e) suppression
   rules (no error for an ICMPv6 error, a Redirect, a multicast-destined
   packet except Packet Too Big / Parameter Problem code 2, or a
-  non-identifying source). §2.4(f) rate limiting is NOT implemented
-  (token bucket is a follow-up lane). RX answers Echo Requests
+  non-identifying source), then the §2.4(f) token bucket
+  (`ipv6_stack::icmp6_error_rate_limiter`, one bucket per node,
+  defaults B=10, N=10/s — the RFC's example defaults for a
+  small/mid-size device — configurable via `configure`, exhausted
+  bucket returns `Icmp6SendError::RateLimited`). RX answers Echo Requests
   (RFC 4443 §2.2 source rules) and solicited NS→NA replies (RFC 4861
   §7.2.4, including the DAD-probe multicast reply) through the same
   surface; `ndp::on_ns` returns the reply body plus its IPv6
@@ -1697,10 +1707,13 @@ The networking axis cycle continued past app-layer protocols into
 the time-sync, real-time-streaming, IPv6-config, and IPv4-error /
 multicast layers a kernel network stack also needs.
 
-### NTPv4 (`pkt_ntp`)
+### NTPv4 (`pkt_ntp` + `sntp`)
 - **RFC 5905** — Network Time Protocol Version 4 (D. Mills et al,
   June 2010). §6 NTP timestamp format. §7.3 Packet Header Variables.
-  §7.5 Packet Header Format.
+  §7.5 Packet Header Format. §7.4 Kiss-o'-Death. §8 on-wire protocol
+  (`theta = 1/2 * [(T2-T1) + (T3-T4)]`, `delta = (T4-T1) - (T3-T2)`,
+  bogus check, delay clamp). §14 SNTP (single server). §16 UDP port
+  123. Appendix A `STEPT` 0.128 s, `PANICT` 1000 s.
 - **RFC 868** — referenced for the historical 1900-01-01 NTP prime
   epoch.
 - Surfaced: `NtpHeader::encode/decode` (LI/VN/Mode byte packing,
@@ -1708,6 +1721,15 @@ multicast layers a kernel network stack also needs.
   Root Dispersion, 4-byte Reference ID, four 64-bit timestamps).
   `unix_to_ntp` / `ntp_to_unix` with the 2_208_988_800-second epoch
   offset. `client_request` SNTP-style builder.
+- Surfaced (`sntp`, issue #1764): `SntpConfig` (explicit server IPv4,
+  no default, no hardcoded pool), `exchange` (UDP socket API:
+  ephemeral bind + connect + send/recv with deadline, `drain_pump`
+  while waiting), `validate_reply` (§9.2 format checks, §8 bogus
+  check, KoD), `compute_offset_delay`, `resolve_server` (DNS A
+  lookup, caller-chosen name), `discipline_sample` /
+  `sync_once` (feed the sample to `narf_time::ntp::apply_sample`).
+  Out of scope: discovery (DHCP option 42 unparsed), authentication
+  (no MAC/Autokey/NTS), multi-server selection, poll daemon, IPv6.
 
 ### WebSocket (`ws`)
 - **RFC 6455** — The WebSocket Protocol (I. Fette & A. Melnikov,

@@ -551,10 +551,13 @@ kernel_test_in!("drivers/net/i40e", smoke_i40e_all_queues_deliver_and_rearm);
 /// phy_type:u8, link_speed:u8, link_info:u8, …): the sample must
 /// carry carrier + speed + media state together into `iface`
 /// metadata, and the down sample must still carry the cage state —
-/// a seated module with no link is not an empty cage.
+/// a seated module with no link is not an empty cage. The PHY
+/// type rides decoded as well (`phy_type_name`), from #867's
+/// sourced `I40E_PHY_TYPE_*` table; an empty cage has no type
+/// to name.
 fn smoke_i40e_link_sample_media() -> TestResult {
     let mut p = [0u8; 16];
-    p[2] = 0x07; // phy_type (raw AQ byte; name decode is #867)
+    p[2] = 0x07; // phy_type: SFI in the #867 table
     p[3] = 1 << 3; // I40E_LINK_SPEED_10GB
     p[4] = LINK_INFO_LINK_UP | LINK_INFO_MEDIA_AVAILABLE;
     p[8..10].copy_from_slice(&9728u16.to_le_bytes());
@@ -564,6 +567,9 @@ fn smoke_i40e_link_sample_media() -> TestResult {
     }
     if up.media_available != Some(true) || up.phy_type != Some(0x07) {
         return TestResult::Fail("up sample dropped media_available or phy_type");
+    }
+    if up.phy_type_name != Some("SFI") {
+        return TestResult::Fail("up sample did not decode phy_type to SFI");
     }
     // Seated module, link down: carrier false, but the cage state
     // and the PHY type still publish.
@@ -577,12 +583,18 @@ fn smoke_i40e_link_sample_media() -> TestResult {
     if down.media_available != Some(true) || down.phy_type != Some(0x07) {
         return TestResult::Fail("down sample dropped the seated-module state");
     }
+    if down.phy_type_name != Some("SFI") {
+        return TestResult::Fail("down sample dropped the decoded phy_type name");
+    }
     // Empty cage: PF healthy, link down, no media.
     let mut empty = [0u8; 16];
     empty[4] = 0;
     let cage = link_sample(LinkStatus::parse(&empty));
     if cage.carrier || cage.media_available != Some(false) {
         return TestResult::Fail("empty cage must read down with no media");
+    }
+    if cage.phy_type_name.is_some() {
+        return TestResult::Fail("empty cage must not name a PHY type");
     }
     TestResult::Pass
 }

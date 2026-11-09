@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # End-to-end native-package UEFI path:
-# OVMF -> installed-style GRUB -> /EFI/NARF/narf.efi (Limine) -> packaged kernel.
+# OVMF -> installed-style GRUB -> /EFI/NARF/narf.efi -> embedded kernel.
 # The ordinary iso-boot gate runs first unless its boot-smoke kernel was built
 # immediately before this script.
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
 if [[ ${NARF_UEFI_SKIP_BASE_ISO_BOOT:-0} != 1 ]]; then
-    cargo xtask iso-boot --arch=x86_64
+    cargo xtask efi-image --smoke
 fi
 
 for command_name in grub-mkimage mformat mcopy qemu-system-x86_64 sfdisk; do
@@ -19,15 +19,9 @@ for command_name in grub-mkimage mformat mcopy qemu-system-x86_64 sfdisk; do
     }
 done
 
-limine_efi=${NARF_LIMINE_EFI:-}
-if [[ -z $limine_efi && -n ${LIMINE_PATH:-} ]]; then
-    limine_efi=$LIMINE_PATH/BOOTX64.EFI
-fi
-if [[ -z $limine_efi ]]; then
-    limine_efi=$root/target/iso-x86_64/EFI/BOOT/BOOTX64.EFI
-fi
-[[ -f $limine_efi ]] || {
-    echo "packaged UEFI boot test cannot find BOOTX64.EFI" >&2
+native_efi=${NARF_NATIVE_EFI:-$root/target/narf-x86_64-smoke.efi}
+[[ -f $native_efi ]] || {
+    echo "packaged UEFI boot test cannot find native EFI image" >&2
     exit 1
 }
 
@@ -60,7 +54,7 @@ NARF_SKIP_GRUB_CHECK=0 packaging/build-release.sh \
     --version 0.0.0-uefi-test \
     --skip-build \
     --formats tar \
-    --limine-efi "$limine_efi" \
+    --uefi-loader "$native_efi" \
     --output "$tmp/packages"
 
 mkdir -p "$tmp/tree" "$tmp/esp"
@@ -108,7 +102,7 @@ timeout "$timeout_secs" qemu-system-x86_64 \
     -machine q35 \
     -cpu max \
     -smp 2 \
-    -m 2048M \
+    -m 4096M \
     -drive "format=raw,file=$tmp/esp.img" \
     -boot order=c \
     -serial stdio \
@@ -127,4 +121,4 @@ then
     exit 1
 fi
 
-echo "packaged UEFI boot passed: OVMF -> GRUB -> Limine -> NARF"
+echo "packaged UEFI boot passed: OVMF -> GRUB -> native NARF EFI"

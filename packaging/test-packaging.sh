@@ -479,6 +479,50 @@ NARF_UEFI_ALLOW_NON_ESP=1 \
     "$tmp/arm-tree/usr/bin/narf-uefi" remove \
     --esp "$tmp/arm-esp" --no-manager-hooks --quiet
 
+# Native x86 packages install one complete EFI image. Exercise a legacy
+# managed layout upgrade, status, failed upgrade, and package removal.
+python3 packaging/test_native_efi.py
+python3 packaging/test_native_efi.py --fixture "$tmp/native.efi"
+NARF_SKIP_GRUB_CHECK=1 packaging/build-release.sh --version 0.0.0-test.2 --skip-build \
+    --uefi-loader "$tmp/native.efi" --formats tar --output "$tmp/native-out"
+mkdir -p "$tmp/native-tree" "$tmp/native-esp/EFI/NARF" "$tmp/native-esp/boot/limine"
+tar -xzf "$tmp/native-out/narf-0.0.0-test.2-x86_64.tar.gz" -C "$tmp/native-tree"
+grep -Fx native "$tmp/native-tree/usr/lib/narf/uefi/loader-kind" >/dev/null
+test ! -e "$tmp/native-tree/usr/lib/narf/uefi/limine.conf"
+printf '# Managed by narf-uefi\nlegacy\n' >"$tmp/native-esp/boot/limine/limine.conf"
+printf legacy >"$tmp/native-esp/EFI/NARF/narf-frame"
+printf legacy >"$tmp/native-esp/EFI/NARF/limine.conf"
+native_installer() {
+    NARF_UEFI_SOURCE_DIR="$tmp/native-tree/usr/lib/narf/uefi" \
+    NARF_UEFI_STATE_DIR="$tmp/native-state" NARF_UEFI_ALLOW_NON_ESP=1 \
+        "$tmp/native-tree/usr/bin/narf-uefi" "$@" --esp "$tmp/native-esp" --no-manager-hooks --quiet
+}
+native_installer install
+native_installer status
+test ! -e "$tmp/native-esp/EFI/NARF/narf-frame"
+test ! -e "$tmp/native-esp/EFI/NARF/limine.conf"
+test ! -e "$tmp/native-esp/boot/limine/limine.conf"
+cmp "$tmp/native.efi" "$tmp/native-esp/EFI/NARF/narf.efi"
+python3 packaging/native-efi.py "$tmp/native.efi" --tamper initramfs \
+    --output "$tmp/native-tree/usr/lib/narf/uefi/narf.efi"
+if native_installer install >/dev/null 2>&1; then
+    echo "native installer accepted a corrupt embedded initramfs" >&2; exit 1
+fi
+cmp "$tmp/native.efi" "$tmp/native-esp/EFI/NARF/narf.efi"
+cp "$tmp/native.efi" "$tmp/native-tree/usr/lib/narf/uefi/narf.efi"
+printf '/host/limine.conf\n' >"$tmp/native-state/limine-config"
+if native_installer install >/dev/null 2>&1; then
+    echo "native upgrade silently discarded adopted host boot policy" >&2; exit 1
+fi
+rm "$tmp/native-state/limine-config"
+mkdir -p "$tmp/native-esp/boot/limine"
+printf '# host-owned\n' >"$tmp/native-esp/boot/limine/limine.conf"
+native_installer install
+grep -Fx '# host-owned' "$tmp/native-esp/boot/limine/limine.conf" >/dev/null
+native_installer remove
+test ! -e "$tmp/native-esp/EFI/NARF/narf.efi"
+grep -Fx '# host-owned' "$tmp/native-esp/boot/limine/limine.conf" >/dev/null
+
 if [[ -f $tmp/created ]]; then
     while IFS= read -r path; do rm -f "$path"; done <"$tmp/created"
 fi

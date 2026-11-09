@@ -26,6 +26,8 @@
 
 extern crate alloc;
 
+use core::fmt;
+
 use alloc::vec::Vec;
 
 // ── SHA-1 (FIPS 180-4 §6.1) ─────────────────────────────────────────
@@ -39,13 +41,29 @@ use alloc::vec::Vec;
 
 /// SHA-1 streaming context. State is the five 32-bit working
 /// variables (FIPS 180-4 §5.3.1); input is buffered in 64-byte blocks.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Sha1 {
     state: [u32; 5],
     /// Total bits processed (FIPS 180-4 §5.1.1 message-length field).
     count: u64,
     buf: [u8; 64],
     buf_len: usize,
+}
+
+/// SEC-C2 (#1551): the internal `buf` holds in-flight message
+/// bytes (PBKDF2 password bytes flow through here) and `state`
+/// holds intermediate state — `Debug` is hand-written and redacts
+/// them; only the public lengths print. The derived `Debug`
+/// printed all four fields.
+impl fmt::Debug for Sha1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sha1")
+            .field("state", &"<redacted>")
+            .field("count", &self.count)
+            .field("buf", &"<redacted>")
+            .field("buf_len", &self.buf_len)
+            .finish()
+    }
 }
 
 impl Default for Sha1 {

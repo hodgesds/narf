@@ -45,13 +45,26 @@
 //!   writes to incrementing addresses, which is semantically
 //!   identical to one master send because the device
 //!   auto-increments its register pointer.
-//! - v1 reads are assembled from word/byte reads for the same
-//!   reason: the ICH host has no verified plain-I2C block-read
-//!   op (its block read is the count-led SMBus form, which the
-//!   v1 device does not speak), so each 2-byte chunk is one
-//!   `read_word_data` at the chunk's address. Slower than a
-//!   single block read, but correct — and the probe path only
-//!   ever reads 6-byte PDT entries and 11-byte query blocks.
+//! - v1 reads are one I2C Block Read per ≤32-byte chunk
+//!   (`read_i2c_block_data`): the ICH host issues the
+//!   host-counted, count-byte-free form the v1 device speaks
+//!   (Linux `i2c_smbus_read_i2c_block_data`, as
+//!   `rmi_smb_v1_read_block` used it) — HST_CNT protocol 110
+//!   / 111, command in HST_D1, count in HST_D0, one byte per
+//!   BYTE_DONE. A chunk never crosses a page boundary: the
+//!   device's auto-increment wraps inside the page and 0xFF
+//!   is the page-select register, so a chunk is split at the
+//!   page end and the next chunk re-selects the page. That
+//!   also means a packet register block laid out across 0xFF
+//!   would read the page-select value as its middle byte and
+//!   fail to parse — by RMI4 layout descriptor packets fit
+//!   within a page, so this is a documented corner, not a
+//!   supported layout. Reads longer than 32 bytes chunk at
+//!   32 with the address advancing, as the reference v1
+//!   loop does; a single packet register larger than 32
+//!   bytes cannot be read as one packet by any SMBus
+//!   transport, and F$12 descriptor packets are a few
+//!   bytes, so this does not bite in practice.
 //! - v2 reads use the existing `read_block_data` host op
 //!   (SMBus Block Read, count-led — exactly what
 //!   `smb_v2_block_read` wraps). v2 writes need the new
@@ -133,6 +146,12 @@ pub trait SmbusIo: core::fmt::Debug {
     fn read_word_data(&self, addr: u8, cmd: u8) -> Result<u16, SmbusError>;
     fn write_word_data(&self, addr: u8, cmd: u8, value: u16) -> Result<(), SmbusError>;
     fn read_block_data(&self, addr: u8, cmd: u8, buf: &mut [u8]) -> Result<usize, SmbusError>;
+    /// I2C Block Read: read exactly `buf.len()` host-counted
+    /// bytes at `cmd` (no Count byte from the slave), the
+    /// plain-I2C form the RMI4 v1 device speaks. Returns the
+    /// number of bytes read (always `buf.len()` on success);
+    /// 0-length and over-32-byte buffers are framing errors.
+    fn read_i2c_block_data(&self, addr: u8, cmd: u8, buf: &mut [u8]) -> Result<usize, SmbusError>;
     fn write_block_data(&self, addr: u8, cmd: u8, data: &[u8]) -> Result<(), SmbusError>;
 }
 
@@ -151,6 +170,9 @@ impl SmbusIo for Smbus {
     }
     fn read_block_data(&self, addr: u8, cmd: u8, buf: &mut [u8]) -> Result<usize, SmbusError> {
         Smbus::read_block_data(self, addr, cmd, buf)
+    }
+    fn read_i2c_block_data(&self, addr: u8, cmd: u8, buf: &mut [u8]) -> Result<usize, SmbusError> {
+        Smbus::read_i2c_block_data(self, addr, cmd, buf)
     }
     fn write_block_data(&self, addr: u8, cmd: u8, data: &[u8]) -> Result<(), SmbusError> {
         Smbus::write_block_data(self, addr, cmd, data)
@@ -172,6 +194,9 @@ impl<H: SmbusIo> SmbusIo for &H {
     }
     fn read_block_data(&self, addr: u8, cmd: u8, buf: &mut [u8]) -> Result<usize, SmbusError> {
         (*self).read_block_data(addr, cmd, buf)
+    }
+    fn read_i2c_block_data(&self, addr: u8, cmd: u8, buf: &mut [u8]) -> Result<usize, SmbusError> {
+        (*self).read_i2c_block_data(addr, cmd, buf)
     }
     fn write_block_data(&self, addr: u8, cmd: u8, data: &[u8]) -> Result<(), SmbusError> {
         (*self).write_block_data(addr, cmd, data)
@@ -322,30 +347,33 @@ impl<H: SmbusIo> SmbusRmiTransport<H> {
     // ── v1 (plain master send/recv framing) ─────────────────────
 
     fn v1_read_block(&mut self, addr: u16, dst: &mut [u8]) -> Result<(), TransportError> {
-        // The reference does one master-recv of the whole block
-        // with the device auto-incrementing; the ICH host has no
-        // such op, so the block is assembled from word/byte
-        // reads at incrementing addresses (page switches when a
-        // chunk crosses a page boundary).
+        // One I2C Block Read per chunk: the reference does one
+        // master-recv of the whole block with the device
+        // auto-incrementing (`rmi_smb_v1_read_block` via
+        // `i2c_smbus_read_i2c_block_data`), and the ICH host
+        // issues exactly that op (`read_i2c_block_data`). A
+        // chunk is capped at SMB_MAX_COUNT and never crosses a
+        // page boundary — the next chunk re-selects the page
+        // (see the module docs for the 0xFF corner). This is
+        // what makes multi-byte packet registers (the F$12
+        // descriptor presence/structure packets) read
+        // correctly: every byte of a packet streams from the
+        // ONE packet address, instead of the word/byte
+        // assembly mixing in the next register's first byte.
         let mut off = 0usize;
         while off < dst.len() {
             let cur = addr.wrapping_add(off as u16);
             self.set_page((cur >> 8) as u8)?;
-            let cmd = cur as u8;
-            if off + 1 < dst.len() && (cur & 0xFF) != 0xFF {
-                let w = self
-                    .io
-                    .read_word_data(self.addr, cmd)
-                    .map_err(map_smbus_error)?;
-                dst[off..off + 2].copy_from_slice(&w.to_le_bytes());
-                off += 2;
-            } else {
-                dst[off] = self
-                    .io
-                    .read_byte_data(self.addr, cmd)
-                    .map_err(map_smbus_error)?;
-                off += 1;
+            let to_page_end = 0x100 - (cur & 0xFF) as usize;
+            let chunk_len = (dst.len() - off).min(SMB_MAX_COUNT).min(to_page_end);
+            let n = self
+                .io
+                .read_i2c_block_data(self.addr, cur as u8, &mut dst[off..off + chunk_len])
+                .map_err(map_smbus_error)?;
+            if n != chunk_len {
+                return Err(TransportError::Short);
             }
+            off += chunk_len;
         }
         Ok(())
     }
@@ -522,13 +550,16 @@ pub fn probe_smbus_rmi_with_state() -> Option<(Rmi4DeviceProbe, SmbusRmiSessionS
         let (version, probe, state) = probe_at_with_state(c, SMBUS_RMI_DEFAULT_ADDR)?;
         let _ = writeln!(
             narf_console::Writer,
-            "  smbus-rmi: bound addr={:#04x} version={:?} manufacturer={} f11={} f12={} f30={}",
+            "  smbus-rmi: bound addr={:#04x} version={:?} manufacturer={} f11={} f12={} f30={} max={}x{} slots={}",
             SMBUS_RMI_DEFAULT_ADDR,
             version,
             probe.product.manufacturer_id,
             probe.f11.is_some(),
             probe.f12.is_some(),
             probe.f30.is_some(),
+            probe.sensor_axis_maxima().0,
+            probe.sensor_axis_maxima().1,
+            probe.sensor_slots(),
         );
         Some((probe, state))
     })

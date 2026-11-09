@@ -244,6 +244,72 @@ kernel_test_in!(
     kms_linear_primary_retains_gem_and_resolves_atomic_preparation
 );
 
+/// ADDFB2 on the linear card (Navi22) takes a two-plane NV12 GEM
+/// framebuffer once an overlay plane takes the format
+/// (drm_any_plane_has_format): the 19-format overlay list, not the
+/// 2-format primary list, admits it — while a tiled modifier is still
+/// refused on the linear card.
+fn kms_linear_card_with_overlays_takes_gem_nv12() -> TestResult {
+    let Ok(f) = Fixture::new(4) else {
+        return TestResult::Fail("fixture");
+    };
+    {
+        let mut c = f.mode.lock();
+        c.driver_name = "amdgpu";
+        c.gfx12_modifiers = false;
+        c.native_planes.clear();
+        c.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        c.plane_formats = Some(&[DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888]);
+    }
+    let Ok(object) = f.object() else {
+        return TestResult::Fail("linear BO");
+    };
+    // One BO for both planes (amdgpu_dm's one-BO rule): 64x12 luma at
+    // offset 0, 32x6 chroma at offset 768, both at pitch 64.
+    let cmd = crate::amdgpu_dm_modifiers::FbCmd {
+        width: 64,
+        height: 12,
+        pixel_format: crate::amdgpu_dm_modifiers::NV12,
+        handles: [1, 1, 0, 0],
+        pitches: [64, 64, 0, 0],
+        offsets: [0, 768, 0, 0],
+        ..Default::default()
+    };
+    let before = f.mode.lock().framebuffers.len();
+    let Ok(fb) = f.mode.lock().addfb2_bo(&cmd, object.clone(), MASTER) else {
+        return TestResult::Fail("linear card with overlays refused GEM NV12");
+    };
+    if f.mode.lock().framebuffers.len() != before + 1 {
+        return TestResult::Fail("GEM NV12 framebuffer not recorded");
+    }
+    let (offsets, chroma_pitch, modifier) = {
+        let c = f.mode.lock();
+        let record = c.framebuffer(fb).unwrap();
+        (record.offsets, record.chroma_pitch, record.modifier)
+    };
+    if offsets != [0, 768] || chroma_pitch != 64 || modifier != 0 {
+        return TestResult::Fail("GEM NV12 planes not recorded");
+    }
+    // A tiled modifier is still refused on the linear card.
+    let mut tiled = cmd;
+    tiled.pixel_format = DRM_FORMAT_XRGB8888;
+    tiled.flags = crate::amdgpu_dm_modifiers::FB_MODIFIERS;
+    tiled.modifier[0] = crate::amdgpu_dm_modifiers::PLANE_MODIFIERS[1];
+    if f.mode
+        .lock()
+        .addfb2_bo(&tiled, object.clone(), MASTER)
+        .is_ok()
+        || f.mode.lock().framebuffers.len() != before + 1
+    {
+        return TestResult::Fail("linear card accepted an AMD tiled modifier");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    kms_linear_card_with_overlays_takes_gem_nv12
+);
+
 fn kms_prepare_exact_inherited_cross_open_and_cursor_targets() -> TestResult {
     let Ok(f) = Fixture::new(4) else {
         return TestResult::Fail("fixture");

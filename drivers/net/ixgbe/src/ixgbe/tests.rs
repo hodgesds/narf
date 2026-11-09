@@ -1792,6 +1792,13 @@ impl FwFakeBank {
     }
 
     /// Exclusive access to the state.
+    // `mut_from_ref` is allowed here deliberately: the fake is
+    // test-local and single-threaded (see the struct docs), the
+    // state lives behind `UnsafeCell` for exactly this interior
+    // mutability, and `&mut self` is impossible — the firmware
+    // simulation runs inside `RegBank::read32`, which takes
+    // `&self` (queues.rs).
+    #[allow(clippy::mut_from_ref)]
     fn state_mut(&self) -> &mut FwFakeState {
         // SAFETY: test-local, never shared across tasks.
         unsafe { &mut *self.state.get() }
@@ -1862,8 +1869,8 @@ impl FwFakeBank {
         let activity = (word1 >> 16) as u16;
         st.hic_activities_seen.push(activity);
         let mut data = [0u32; 4];
-        for i in 0..4 {
-            data[i] = st.regs[base + 2 + i].swap_bytes();
+        for (i, slot) in data.iter_mut().enumerate() {
+            *slot = st.regs[base + 2 + i].swap_bytes();
         }
         st.last_hic_data = data;
         let status = if self.mode == FwMode::HicBadRetStatus {
@@ -1909,9 +1916,7 @@ impl FwFakeBank {
         let hida = (aci::REG_PF_HIDA_BASE / 4) as usize;
         let hiba = (aci::REG_PF_HIBA_BASE / 4) as usize;
         let mut req = [0u32; aci::ACI_DESC_DWORDS];
-        for i in 0..aci::ACI_DESC_DWORDS {
-            req[i] = st.regs[hida + i];
-        }
+        req[..aci::ACI_DESC_DWORDS].copy_from_slice(&st.regs[hida..(aci::ACI_DESC_DWORDS + hida)]);
         let opcode = aci::desc_opcode(&req);
         st.aci_opcodes_seen.push(opcode);
         // Capture an RD (host-to-firmware) buffer before
@@ -1958,9 +1963,7 @@ impl FwFakeBank {
             b[..chunk.len()].copy_from_slice(chunk);
             st.regs[hiba + i] = u32::from_le_bytes(b);
         }
-        for i in 0..aci::ACI_DESC_DWORDS {
-            st.regs[hida + i] = resp[i];
-        }
+        st.regs[hida..(aci::ACI_DESC_DWORDS + hida)].copy_from_slice(&resp[..aci::ACI_DESC_DWORDS]);
         let mut hicr = st.regs[(aci::REG_PF_HICR / 4) as usize];
         hicr &= !aci::PF_HICR_C;
         if self.mode != FwMode::AciNoSvEv {
@@ -2082,7 +2085,14 @@ fn smoke_ixgbe_eee_hic_header() -> TestResult {
     if hic_checksum(&[5, 20, 0]) != 0xE7 {
         return TestResult::Fail("HIC checksum wrong");
     }
-    if (5u16 + 20 + 0 + 0xE7) & 0xFF != 0 {
+    // Sum the header bytes plus the computed checksum: the total
+    // must be 0 mod 256. (The literal form `5 + 20 + 0 + 0xE7`
+    // folds to the constant 0, so the check was vacuous — using
+    // the computed checksum makes it a real property check.)
+    let total: u16 = [5, 20, 0, hic_checksum(&[5, 20, 0])]
+        .into_iter()
+        .fold(0u16, |acc, b| acc + u16::from(b));
+    if total & 0xFF != 0 {
         return TestResult::Fail("HIC checksum does not zero the total");
     }
     TestResult::Pass
@@ -5215,6 +5225,142 @@ fn smoke_ixgbe_vmdq_dispatch_messages() -> TestResult {
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_dispatch_messages);
 
+// ── Mailbox pump fixtures (issue #1261) ───────────────────────────
+
+fn smoke_ixgbe_vmdq_mailbox_pump_reset() -> TestResult {
+    use super::queues::RegBank;
+    use super::vmdq::{
+        mailbox_pump_step, mbvficr, pfmailbox, pfmbmem, VfTable, PFMAILBOX_STS, VF_RESET,
+        VT_MSGTYPE_NACK,
+    };
+    let mut bank = FakeBank::new();
+    let mut table = VfTable::new();
+    // VF 0 posts RESET: seed the message, raise the request bit.
+    bank.write32(pfmbmem(0), VF_RESET);
+    bank.write32(mbvficr(0), 1);
+    let outcome = mailbox_pump_step(&mut bank, &mut table, 63);
+    if outcome.msgs != 0x01 || outcome.acks != 0 || outcome.resets != 0 {
+        return TestResult::Fail("mailbox pump did not dispatch the RESET");
+    }
+    if bank.read32(pfmbmem(0)) != (VF_RESET | VT_MSGTYPE_NACK) {
+        return TestResult::Fail("RESET pump reply was not NACK (no MAC set)");
+    }
+    if bank.read32(pfmailbox(0)) != PFMAILBOX_STS {
+        return TestResult::Fail("RESET pump reply did not ring STS");
+    }
+    if !table.vfs[0].clear_to_send {
+        return TestResult::Fail("RESET pump did not set clear_to_send");
+    }
+    // The request bit was cleared with a write-1-to-clear of exactly
+    // the VF's bit (the fake bank keeps the last write verbatim).
+    if bank.read32(mbvficr(0)) != 0x01 {
+        return TestResult::Fail("pump did not W1C-clear the request bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_mailbox_pump_reset);
+
+fn smoke_ixgbe_vmdq_mailbox_pump_two_vfs() -> TestResult {
+    use super::queues::RegBank;
+    use super::vmdq::{
+        mailbox_pump_step, mbvficr, pfmbmem, rah, ral, VfTable, VF_RESET, VF_SET_MAC_ADDR,
+        VT_MSGTYPE_ACK, VT_MSGTYPE_CTS, VT_MSGTYPE_NACK,
+    };
+    let mut bank = FakeBank::new();
+    let mut table = VfTable::new();
+    // VF 1: SET_MAC_ADDR with a valid unicast MAC.
+    bank.write32(pfmbmem(1), VF_SET_MAC_ADDR);
+    bank.write32(pfmbmem(1) + 4, 0x3322_1102);
+    bank.write32(pfmbmem(1) + 8, 0x5544);
+    // VF 2: RESET.
+    bank.write32(pfmbmem(2), VF_RESET);
+    // Both request bits live in MBVFICR group 0.
+    bank.write32(mbvficr(0), (1 << 1) | (1 << 2));
+    let outcome = mailbox_pump_step(&mut bank, &mut table, 63);
+    if outcome.msgs != 0x06 || outcome.acks != 0 || outcome.resets != 0 {
+        return TestResult::Fail("mailbox pump did not dispatch both VF messages");
+    }
+    if bank.read32(pfmbmem(1)) != (VF_SET_MAC_ADDR | VT_MSGTYPE_ACK | VT_MSGTYPE_CTS) {
+        return TestResult::Fail("SET_MAC pump reply was not ACK|CTS");
+    }
+    if bank.read32(ral(2)) != 0x3322_1102 || bank.read32(rah(2)) != (0x8000_0000 | 0x5544) {
+        return TestResult::Fail("SET_MAC pump did not program RAR slot 2");
+    }
+    if !table.vfs[1].mac_set || table.vfs[1].mac != [0x02, 0x11, 0x22, 0x33, 0x44, 0x55] {
+        return TestResult::Fail("SET_MAC pump state wrong");
+    }
+    if bank.read32(pfmbmem(2)) != (VF_RESET | VT_MSGTYPE_NACK) {
+        return TestResult::Fail("RESET pump reply wrong");
+    }
+    // Last W1C clear written was VF 2's bit (ascending VF order).
+    if bank.read32(mbvficr(0)) != (1 << 2) {
+        return TestResult::Fail("pump W1C clear sequence wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vmdq_mailbox_pump_two_vfs);
+
+fn smoke_ixgbe_vmdq_mailbox_pump_idle_and_ack() -> TestResult {
+    use super::queues::RegBank;
+    use super::vmdq::{mailbox_pump_step, mbvficr, pfmailbox, pfmbmem, VfTable, MBVFICR_VFACK_VF1};
+    let mut bank = FakeBank::new();
+    let mut table = VfTable::new();
+    if !mailbox_pump_step(&mut bank, &mut table, 63).is_empty() {
+        return TestResult::Fail("idle mailbox pump reported work");
+    }
+    if bank.read32(pfmbmem(0)) != 0 || bank.read32(pfmailbox(0)) != 0 {
+        return TestResult::Fail("idle mailbox pump touched a mailbox");
+    }
+    // A VF past the configured count is not scanned.
+    bank.write32(mbvficr(0), 1 << 1);
+    if !mailbox_pump_step(&mut bank, &mut table, 1).is_empty() {
+        return TestResult::Fail("pump dispatched past num_vfs");
+    }
+    // VF 2 acks a PF reply: consumed, never dispatched.
+    bank.write32(mbvficr(2), MBVFICR_VFACK_VF1 << 2);
+    let outcome = mailbox_pump_step(&mut bank, &mut table, 63);
+    if outcome.msgs != 0 || outcome.acks != (1u64 << 2) || outcome.resets != 0 {
+        return TestResult::Fail("VF ack was dispatched or not consumed");
+    }
+    if bank.read32(pfmbmem(2)) != 0 || bank.read32(pfmailbox(2)) != 0 {
+        return TestResult::Fail("VF ack wrote a reply");
+    }
+    // W1C clear of exactly the ack bit.
+    if bank.read32(mbvficr(2)) != (MBVFICR_VFACK_VF1 << 2) {
+        return TestResult::Fail("pump did not W1C-clear the ack bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_vmdq_mailbox_pump_idle_and_ack
+);
+
+fn smoke_ixgbe_vmdq_mailbox_pump_reset_event() -> TestResult {
+    use super::queues::RegBank;
+    use super::vmdq::{mailbox_pump_step, vflre, vflrec, VfTable};
+    let mut bank = FakeBank::new();
+    let mut table = VfTable::new();
+    bank.write32(vflre(3), 1 << 3);
+    let outcome = mailbox_pump_step(&mut bank, &mut table, 63);
+    if outcome.msgs != 0 || outcome.acks != 0 || outcome.resets != (1u64 << 3) {
+        return TestResult::Fail("VF reset event not consumed");
+    }
+    if bank.read32(vflrec(3)) != (1 << 3) {
+        return TestResult::Fail("reset event not cleared via VFLREC");
+    }
+    // The FLR event alone resets no VF state: the VF's RESET
+    // message owns the state reset (see the pump docs).
+    if table.vfs[3].clear_to_send {
+        return TestResult::Fail("reset event mutated VF state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_vmdq_mailbox_pump_reset_event
+);
+
 // ── FCoE fixtures ────────────────────────────────────────────────
 
 fn smoke_ixgbe_fcoe_configure_82599() -> TestResult {
@@ -5763,6 +5909,7 @@ impl TxTimeoutFixture {
             dcb_cfg: IrqSafeSpinLock::new(None),
             vlan_filter: IrqSafeSpinLock::new(None),
             vmdq_cfg: IrqSafeSpinLock::new(None),
+            vf_table: IrqSafeSpinLock::new(super::vmdq::VfTable::new()),
             fcoe_queues: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             fdir_state: IrqSafeSpinLock::new(super::fdir::FdirState::default()),
             wol_armed: IrqSafeSpinLock::new(None),

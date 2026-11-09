@@ -151,6 +151,54 @@ fn smoke_rtw89_tx_8922a_header() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_tx_8922a_header);
 
+fn smoke_rtw89_tx_8922a_header_with_info() -> TestResult {
+    // With an info block: WDINFO_EN stays set, the 32 info bytes
+    // follow the body, WP shifts to offset 64; total =
+    // 32 + 32 + 8 + 6 (100-byte frame).
+    let mut body = zero_body();
+    body[0..4].copy_from_slice(&(1u32 << 22).to_le_bytes());
+    let mut info = [0u8; 32];
+    info[0] = 0x5A;
+    info[16] = 0xA5;
+    let header = match build_header_with_info(&body, Some(&info), 7, 0x20000, 100) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("build_header_with_info failed"),
+    };
+    if header.len() != 78 {
+        return TestResult::Fail("info header length wrong");
+    }
+    if u32::from_le_bytes(header[0..4].try_into().unwrap()) & (1 << 22) == 0 {
+        return TestResult::Fail("WDINFO_EN not set with info block");
+    }
+    if header[32..64] != info {
+        return TestResult::Fail("info block bytes wrong");
+    }
+    if u16::from_le_bytes(header[64..66].try_into().unwrap()) != (7 | 0x8000) {
+        return TestResult::Fail("WP seq0 wrong with info block");
+    }
+    if u16::from_le_bytes(header[72..74].try_into().unwrap()) != (100 | (1 << 15)) {
+        return TestResult::Fail("addr-info length_opt wrong with info block");
+    }
+    // Without an info block the with-info builder matches the
+    // plain builder byte for byte.
+    let plain = match build_header(&body, 7, 0x20000, 100) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("build_header failed"),
+    };
+    let no_info = match build_header_with_info(&body, None, 7, 0x20000, 100) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("build_header_with_info(None) failed"),
+    };
+    if plain != no_info {
+        return TestResult::Fail("build_header_with_info(None) must equal build_header");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_tx_8922a_header_with_info
+);
+
 fn smoke_rtw89_tx_8922a_submit_cycle() -> TestResult {
     // Channel 2, MACID 5, QSEL 0x02, 100-byte frame.
     let mut tx = match DataTx::new() {

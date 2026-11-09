@@ -72,7 +72,9 @@ fn engine(pipe: u8) -> Engine<Fake> {
         authority: Cap::bootstrap(),
         pipe,
         odm: None,
+        overlay: None,
         requested: None,
+        overlay_requested: None,
     }
 }
 fn run<T>(future: impl core::future::Future<Output = T>) -> T {
@@ -360,4 +362,95 @@ fn dcn30_flip_odm_arms_both_slices_under_one_otg_lock() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     dcn30_flip_odm_arms_both_slices_under_one_otg_lock
+);
+
+/// The overlay HUBP arms its own address at VUPDATE, and the flip stays
+/// pending until the overlay has latched too — then the release forgets it.
+fn dcn30_flip_overlay_arms_its_own_address_and_holds_the_flip() -> TestResult {
+    let mut e = engine(0);
+    // The latch never fires on its own: the test drives it by hand.
+    e.io.latch_after = None;
+    e.overlay = Some(5);
+    let primary = 0x0081_821a_4000;
+    let overlay = 0x0082_1234_5000;
+    if e.program_flip(primary).is_err() || e.program_overlay_locked(overlay).is_err() {
+        return TestResult::Fail("overlay flip refused");
+    }
+    let v = &e.io.values;
+    let base = 5 * HUBP_STRIDE;
+    if v[(base + PRIMARY_SURFACE_ADDRESS_HIGH) as usize] != 0x82
+        || v[(base + PRIMARY_SURFACE_ADDRESS) as usize] != 0x1234_5000
+    {
+        return TestResult::Fail("overlay address wrong");
+    }
+    if e.pending() != Ok(true) {
+        return TestResult::Fail("armed flip not pending");
+    }
+    // The primary latches; the overlay still holds the flip.
+    e.io.values[FLIP_CONTROL as usize] &= !FLIP_PENDING;
+    e.io.values[EARLIEST_INUSE as usize] = 0x821a_4000;
+    e.io.values[EARLIEST_INUSE_HIGH as usize] = 0x81;
+    if e.pending() != Ok(true) {
+        return TestResult::Fail("unlatched overlay did not hold the flip");
+    }
+    // The overlay latches; nothing is pending.
+    e.io.values[(base + FLIP_CONTROL) as usize] &= !FLIP_PENDING;
+    e.io.values[(base + EARLIEST_INUSE) as usize] = 0x1234_5000;
+    e.io.values[(base + EARLIEST_INUSE_HIGH) as usize] = 0x82;
+    if e.pending() != Ok(false) {
+        return TestResult::Fail("latched overlay still pending");
+    }
+    // Released: a stale overlay HUBP no longer holds the flip.
+    e.clear_overlay();
+    e.io.values[(base + FLIP_CONTROL) as usize] |= FLIP_PENDING;
+    e.io.values[(base + EARLIEST_INUSE) as usize] = 0;
+    if e.pending() != Ok(false) {
+        return TestResult::Fail("released overlay still holds the flip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    dcn30_flip_overlay_arms_its_own_address_and_holds_the_flip
+);
+
+/// The overlay flip without an overlay, and with a bad address, is refused;
+/// with one, it takes the OTG lock around the address like the ODM flip.
+fn dcn30_flip_overlay_needs_an_overlay_and_takes_the_lock() -> TestResult {
+    let mut bare = engine(0);
+    bare.io.latch_after = None;
+    let address = 0x0082_1234_5000;
+    if bare.program_overlay(address).is_ok() || bare.program_overlay_locked(address).is_ok() {
+        return TestResult::Fail("overlay flip without an overlay accepted");
+    }
+    let mut e = engine(0);
+    e.io.latch_after = None;
+    e.overlay = Some(5);
+    if e.program_overlay_locked(0).is_ok()
+        || e.program_overlay_locked(0x1001).is_ok()
+        || e.program_overlay_locked(1 << 48).is_ok()
+    {
+        return TestResult::Fail("bad overlay address accepted");
+    }
+    if e.program_overlay(address).is_err() {
+        return TestResult::Fail("overlay flip refused");
+    }
+    let writes = &e.io.writes;
+    let at = |reg: u64, value: Option<u32>| {
+        writes
+            .iter()
+            .position(|&(r, v)| r == reg && value.is_none_or(|x| x == v))
+    };
+    let lock = at(OTG_MASTER_UPDATE_LOCK, Some(1));
+    let armed = at(5 * HUBP_STRIDE + PRIMARY_SURFACE_ADDRESS, None);
+    let unlock = at(OTG_MASTER_UPDATE_LOCK, Some(0));
+    match (lock, armed, unlock) {
+        (Some(l), Some(a), Some(u)) if l < a && a < u => {}
+        _ => return TestResult::Fail("overlay address not armed inside the OTG lock"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    dcn30_flip_overlay_needs_an_overlay_and_takes_the_lock
 );

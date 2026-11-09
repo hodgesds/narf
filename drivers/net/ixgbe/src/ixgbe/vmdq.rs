@@ -47,10 +47,14 @@
 //! still gates delivery.
 //!
 //! NOT in this module (sequenced follow-ups, not silently dropped):
-//! the mailbox interrupt pump (nothing consumes `mailbox_has_msg`
-//! yet — the dispatcher is callable, fixture-proven, and awaits a
-//! pump), PCI SR-IOV config-space enablement (VF devices appearing
-//! on the bus is a PCI-layer step, not device registers),
+//! the mailbox *interrupt* routing (the pump below is polled from
+//! the driver's 10 ms watchdog tick — no ISR exists in this driver
+//! yet, and the `EICR_MAILBOX` cause bit's numeric value was not
+//! verifiable against Linux ixgbe @ cbbddb6 from the sources
+//! available to this lane, so no cause bit is programmed; wiring
+//! the misc-vector cause to the pump is the follow-up), PCI SR-IOV
+//! config-space enablement (VF devices appearing on the bus is a
+//! PCI-layer step, not device registers),
 //! `SET_MULTICAST` / `GET_RETA` / `GET_RSS_KEY` / `UPDATE_XCAST_MODE`
 //! / link-state / IPSEC / `FEATURES_NEGOTIATE` (all NACKed),
 //! 32-VF mode (4 queues/pool — `MTQC_32VF` needs its `MRQC` 32-pool
@@ -1381,4 +1385,104 @@ fn get_vf_queues_msg(st: &VfState, reply: &mut [u32; MBX_WORDS]) -> Result<(), V
     reply[VF_TRANS_VLAN] = if st.pf_vlan != 0 { 1 } else { 0 };
     reply[VF_DEF_QUEUE] = 0;
     Ok(())
+}
+
+// ── Mailbox interrupt pump ────────────────────────────────────────
+
+/// Outcome of one [`mailbox_pump_step`]: which VFs had a message
+/// dispatched, an ack consumed, or a reset event processed. Bit
+/// `vf` set = VF `vf` took that path (63 VFs need a `u64` mask;
+/// the igb pump's `u8` mask only covers its 8 VFs).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MailboxPumpOutcome {
+    /// VFs whose pending message was read and dispatched (reply
+    /// written, or ignored as already-ACK/NACK).
+    pub msgs: u64,
+    /// VFs whose VFACK bit was consumed (never dispatched: the PF
+    /// sends no PF-initiated messages, so there is nothing for a
+    /// VF ack to match).
+    pub acks: u64,
+    /// VFs whose VFLRE reset event was cleared.
+    pub resets: u64,
+}
+
+impl MailboxPumpOutcome {
+    /// No VF took any path.
+    pub const fn is_empty(&self) -> bool {
+        self.msgs == 0 && self.acks == 0 && self.resets == 0
+    }
+}
+
+/// Run one mailbox-pump pass (Linux `ixgbe_msg_task`, as reached
+/// from the misc vector's `EICR_MAILBOX` cause): consume MBVFICR /
+/// VFLRE, dispatch each pending VF message through
+/// [`dispatch_vf_message`], and write the reply back.
+///
+/// Per VF, in Linux's order: reset event, message, ack.
+/// * Reset: `VFLRE` is cleared via `VFLREC` (Linux
+///   `ixgbe_check_for_rst_pf`) and counted. It mutates no VF
+///   state: the VF's RESET *message* owns the state reset (the
+///   dispatcher RESET path), and an FLR always precedes one.
+/// * Message: the request bit is cleared write-1-to-clear (Linux
+///   `ixgbe_check_for_bit_pf` writes the mask back to the same
+///   `MBVFICR` word), the message is read with [`mailbox_read`],
+///   and [`dispatch_vf_message`] writes the reply. A message the
+///   mailbox lock refuses is dropped with its bit already
+///   cleared, exactly Linux's check-then-read order; a message
+///   already carrying ACK/NACK still counts as dispatched
+///   (`Ignored` — the pending request was consumed, nothing
+///   further is owed).
+/// * Ack: the ack bit is cleared write-1-to-clear (Linux
+///   `ixgbe_check_for_ack_pf`) and counted, never dispatched.
+///
+/// Polled, not interrupt-driven: this driver has no ISR yet (the
+/// datapath is polled), so the driver's 10 ms watchdog tick calls
+/// this. The interrupt routing — `EICR_MAILBOX` on the misc
+/// vector — is a follow-up: the cause's name and delivery path
+/// (`ixgbe_msix_lsc` → `ixgbe_msg_task`) are verified against
+/// Linux, but its numeric bit was not verifiable against Linux
+/// ixgbe @ cbbddb6 from the sources available, so no cause bit
+/// is programmed here. `num_vfs` bounds the scan (clamped to
+/// [`MAX_VFS`]); VFs past it are never touched.
+pub fn mailbox_pump_step(
+    bank: &mut impl RegBank,
+    table: &mut VfTable,
+    num_vfs: usize,
+) -> MailboxPumpOutcome {
+    let mut outcome = MailboxPumpOutcome::default();
+    let num_vfs = num_vfs.min(MAX_VFS);
+    if num_vfs == 0 {
+        return outcome;
+    }
+    // One MBVFICR word covers 16 VFs; snapshot each word once,
+    // then work the VFs in ascending order.
+    let groups = num_vfs.div_ceil(16);
+    for group in 0..groups {
+        let word = bank.read32(mbvficr(group * 16));
+        for i in 0..16 {
+            let vf = group * 16 + i;
+            if vf >= num_vfs {
+                break;
+            }
+            if vf_reset_pending(bank, vf) && clear_vf_reset_event(bank, vf).is_ok() {
+                outcome.resets |= 1u64 << vf;
+            }
+            let req_bit = MBVFICR_VFREQ_VF1 << i;
+            if word & req_bit != 0 {
+                bank.write32(mbvficr(vf), req_bit);
+                let mut msg = [0u32; MBX_WORDS];
+                if mailbox_read(bank, vf, &mut msg).is_ok()
+                    && dispatch_vf_message(bank, table, vf, &msg).is_ok()
+                {
+                    outcome.msgs |= 1u64 << vf;
+                }
+            }
+            let ack_bit = MBVFICR_VFACK_VF1 << i;
+            if word & ack_bit != 0 {
+                bank.write32(mbvficr(vf), ack_bit);
+                outcome.acks |= 1u64 << vf;
+            }
+        }
+    }
+    outcome
 }

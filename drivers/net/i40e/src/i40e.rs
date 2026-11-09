@@ -458,6 +458,12 @@ pub enum AqOpcode {
     MacAddressWrite = 0x0108,
     /// Release the port from the option ROM's PXE mode (direct).
     ClearPxeMode = 0x0110,
+    /// Read the PHY's capabilities (indirect, 0x218-byte response).
+    /// Linux `i40e_aqc_opc_get_phy_abilities`.
+    GetPhyAbilities = 0x0600,
+    /// Program the PHY type / link speed / abilities (direct).
+    /// Linux `i40e_aqc_opc_set_phy_config`.
+    SetPhyConfig = 0x0601,
     /// Current link speed / state (direct).
     GetLinkStatus = 0x0607,
     /// Read the switch topology (indirect).
@@ -706,6 +712,367 @@ impl LinkStatus {
     }
 }
 
+impl LinkStatus {
+    /// Decoded PHY type for this sample (issue #867).
+    pub const fn phy_type_decoded(&self) -> I40ePhyType {
+        I40ePhyType::from_byte(self.phy_type)
+    }
+}
+
+/// PHY type reported by firmware (`enum i40e_aq_phy_type`).
+///
+/// Source: torvalds/linux @ cbbddb6b08cc9900a87cccaa9b22bbe06aa4f50a,
+/// `drivers/net/ethernet/intel/i40e/i40e_adminq_cmd.h` lines
+/// 1384–1428. Every named value in that enum is a variant here, in
+/// the same order, with the same byte; the gaps in the enum (0x10,
+/// 0x25, 0x28–0x2F, 0x32–0xFC) have no name in Linux either and
+/// decode to [`I40ePhyType::Unknown`], never to a fabricated type.
+/// The `name()` strings are the Linux constant suffixes verbatim.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum I40ePhyType {
+    Sgmii,
+    Base1000Kx,
+    Base10GKx4,
+    Base10GKr,
+    Base40GKr4,
+    Xaui,
+    Xfi,
+    Sfi,
+    Xlaui,
+    Xlppi,
+    Base40GCr4Cu,
+    Base10GCr1Cu,
+    Base10GAoc,
+    Base40GAoc,
+    Unrecognized,
+    Unsupported,
+    Base100Tx,
+    Base1000T,
+    Base10GT,
+    Base10GSr,
+    Base10GLr,
+    Base10GSfppCu,
+    Base10GCr1,
+    Base40GCr4,
+    Base40GSr4,
+    Base40GLr4,
+    Base1000Sx,
+    Base1000Lx,
+    Base1000TOptical,
+    Base20GKr2,
+    Base25GKr,
+    Base25GCr,
+    Base25GSr,
+    Base25GLr,
+    Base25GAoc,
+    Base25GAcc,
+    Base2_5GT,
+    Base5GT,
+    Base2_5GTLinkStatus,
+    Base5GTLinkStatus,
+    NotSupportedHighTemp,
+    Empty,
+    Default,
+    /// A byte Linux gives no name to (a gap in the enum, or a
+    /// newer firmware value). The byte is preserved so callers can
+    /// still report it; it is never mapped onto a named type.
+    Unknown(u8),
+}
+
+impl I40ePhyType {
+    /// Decode one AQ `phy_type` byte against the sourced table.
+    pub const fn from_byte(b: u8) -> Self {
+        match b {
+            0x00 => Self::Sgmii,
+            0x01 => Self::Base1000Kx,
+            0x02 => Self::Base10GKx4,
+            0x03 => Self::Base10GKr,
+            0x04 => Self::Base40GKr4,
+            0x05 => Self::Xaui,
+            0x06 => Self::Xfi,
+            0x07 => Self::Sfi,
+            0x08 => Self::Xlaui,
+            0x09 => Self::Xlppi,
+            0x0A => Self::Base40GCr4Cu,
+            0x0B => Self::Base10GCr1Cu,
+            0x0C => Self::Base10GAoc,
+            0x0D => Self::Base40GAoc,
+            0x0E => Self::Unrecognized,
+            0x0F => Self::Unsupported,
+            0x11 => Self::Base100Tx,
+            0x12 => Self::Base1000T,
+            0x13 => Self::Base10GT,
+            0x14 => Self::Base10GSr,
+            0x15 => Self::Base10GLr,
+            0x16 => Self::Base10GSfppCu,
+            0x17 => Self::Base10GCr1,
+            0x18 => Self::Base40GCr4,
+            0x19 => Self::Base40GSr4,
+            0x1A => Self::Base40GLr4,
+            0x1B => Self::Base1000Sx,
+            0x1C => Self::Base1000Lx,
+            0x1D => Self::Base1000TOptical,
+            0x1E => Self::Base20GKr2,
+            0x1F => Self::Base25GKr,
+            0x20 => Self::Base25GCr,
+            0x21 => Self::Base25GSr,
+            0x22 => Self::Base25GLr,
+            0x23 => Self::Base25GAoc,
+            0x24 => Self::Base25GAcc,
+            0x26 => Self::Base2_5GT,
+            0x27 => Self::Base5GT,
+            0x30 => Self::Base2_5GTLinkStatus,
+            0x31 => Self::Base5GTLinkStatus,
+            0xFD => Self::NotSupportedHighTemp,
+            0xFE => Self::Empty,
+            0xFF => Self::Default,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Inverse of [`Self::from_byte`].
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Sgmii => 0x00,
+            Self::Base1000Kx => 0x01,
+            Self::Base10GKx4 => 0x02,
+            Self::Base10GKr => 0x03,
+            Self::Base40GKr4 => 0x04,
+            Self::Xaui => 0x05,
+            Self::Xfi => 0x06,
+            Self::Sfi => 0x07,
+            Self::Xlaui => 0x08,
+            Self::Xlppi => 0x09,
+            Self::Base40GCr4Cu => 0x0A,
+            Self::Base10GCr1Cu => 0x0B,
+            Self::Base10GAoc => 0x0C,
+            Self::Base40GAoc => 0x0D,
+            Self::Unrecognized => 0x0E,
+            Self::Unsupported => 0x0F,
+            Self::Base100Tx => 0x11,
+            Self::Base1000T => 0x12,
+            Self::Base10GT => 0x13,
+            Self::Base10GSr => 0x14,
+            Self::Base10GLr => 0x15,
+            Self::Base10GSfppCu => 0x16,
+            Self::Base10GCr1 => 0x17,
+            Self::Base40GCr4 => 0x18,
+            Self::Base40GSr4 => 0x19,
+            Self::Base40GLr4 => 0x1A,
+            Self::Base1000Sx => 0x1B,
+            Self::Base1000Lx => 0x1C,
+            Self::Base1000TOptical => 0x1D,
+            Self::Base20GKr2 => 0x1E,
+            Self::Base25GKr => 0x1F,
+            Self::Base25GCr => 0x20,
+            Self::Base25GSr => 0x21,
+            Self::Base25GLr => 0x22,
+            Self::Base25GAoc => 0x23,
+            Self::Base25GAcc => 0x24,
+            Self::Base2_5GT => 0x26,
+            Self::Base5GT => 0x27,
+            Self::Base2_5GTLinkStatus => 0x30,
+            Self::Base5GTLinkStatus => 0x31,
+            Self::NotSupportedHighTemp => 0xFD,
+            Self::Empty => 0xFE,
+            Self::Default => 0xFF,
+            Self::Unknown(b) => b,
+        }
+    }
+
+    /// The Linux `I40E_PHY_TYPE_*` constant suffix for this type
+    /// (`"SFI"`, `"10GBASE_SR"`, …); `"UNKNOWN"` for an unnamed
+    /// byte. This is the string published into iface metadata as
+    /// `phy_type_name` — the raw byte stays alongside it in
+    /// `phy_type`, so an unknown byte is still reportable.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sgmii => "SGMII",
+            Self::Base1000Kx => "1000BASE_KX",
+            Self::Base10GKx4 => "10GBASE_KX4",
+            Self::Base10GKr => "10GBASE_KR",
+            Self::Base40GKr4 => "40GBASE_KR4",
+            Self::Xaui => "XAUI",
+            Self::Xfi => "XFI",
+            Self::Sfi => "SFI",
+            Self::Xlaui => "XLAUI",
+            Self::Xlppi => "XLPPI",
+            Self::Base40GCr4Cu => "40GBASE_CR4_CU",
+            Self::Base10GCr1Cu => "10GBASE_CR1_CU",
+            Self::Base10GAoc => "10GBASE_AOC",
+            Self::Base40GAoc => "40GBASE_AOC",
+            Self::Unrecognized => "UNRECOGNIZED",
+            Self::Unsupported => "UNSUPPORTED",
+            Self::Base100Tx => "100BASE_TX",
+            Self::Base1000T => "1000BASE_T",
+            Self::Base10GT => "10GBASE_T",
+            Self::Base10GSr => "10GBASE_SR",
+            Self::Base10GLr => "10GBASE_LR",
+            Self::Base10GSfppCu => "10GBASE_SFPP_CU",
+            Self::Base10GCr1 => "10GBASE_CR1",
+            Self::Base40GCr4 => "40GBASE_CR4",
+            Self::Base40GSr4 => "40GBASE_SR4",
+            Self::Base40GLr4 => "40GBASE_LR4",
+            Self::Base1000Sx => "1000BASE_SX",
+            Self::Base1000Lx => "1000BASE_LX",
+            Self::Base1000TOptical => "1000BASE_T_OPTICAL",
+            Self::Base20GKr2 => "20GBASE_KR2",
+            Self::Base25GKr => "25GBASE_KR",
+            Self::Base25GCr => "25GBASE_CR",
+            Self::Base25GSr => "25GBASE_SR",
+            Self::Base25GLr => "25GBASE_LR",
+            Self::Base25GAoc => "25GBASE_AOC",
+            Self::Base25GAcc => "25GBASE_ACC",
+            Self::Base2_5GT => "2_5GBASE_T",
+            Self::Base5GT => "5GBASE_T",
+            Self::Base2_5GTLinkStatus => "2_5GBASE_T_LINK_STATUS",
+            Self::Base5GTLinkStatus => "5GBASE_T_LINK_STATUS",
+            Self::NotSupportedHighTemp => "NOT_SUPPORTED_HIGH_TEMP",
+            Self::Empty => "EMPTY",
+            Self::Default => "DEFAULT",
+            Self::Unknown(_) => "UNKNOWN",
+        }
+    }
+}
+
+/// `I40E_AQ_PHY_REPORT_QUALIFIED_MODULES` — set in param0 of
+/// `get_phy_abilities` to have firmware report qualified modules.
+pub const AQ_PHY_REPORT_QUALIFIED_MODULES: u16 = 0x0001;
+/// `I40E_AQ_PHY_REPORT_INITIAL_VALUES` — report initial values.
+pub const AQ_PHY_REPORT_INITIAL_VALUES: u16 = 0x0002;
+/// Length of the `get_phy_abilities` response:
+/// `I40E_CHECK_STRUCT_LEN(0x218, i40e_aq_get_phy_abilities_resp)`.
+pub const PHY_ABILITIES_RESP_LEN: u16 = 0x218;
+
+/// Decoded `get_phy_abilities` (0x0600) response — the prefix of
+/// `struct i40e_aq_get_phy_abilities_resp` (same Linux header,
+/// lines 1501–1528): `phy_type:le32` is a *bitmap* using the
+/// `i40e_aq_phy_type` values as bit offsets (not the single byte
+/// `get_link_status` reports), `link_speed:u8` is the
+/// `i40e_aq_link_speed` bitmap, then `abilities`, `eee_capability`,
+/// `eer`, `phy_type_ext`, `phy_id[4]`, `module_type[3]` and
+/// `qualified_module_count`. The 16 qualified-module descriptors
+/// that follow are not decoded — module interrogation reads the
+/// count and the module type here; per-module OUI/part-number
+/// decoding is a follow-on, not this issue.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PhyAbilities {
+    /// Supported PHY types, one bit per `i40e_aq_phy_type` value.
+    pub phy_type_bitmap: u32,
+    /// Supported link speeds (`i40e_aq_link_speed` bitmap).
+    pub link_speed: u8,
+    /// `I40E_AQ_PHY_FLAG_PAUSE_TX` (0x01) / `PAUSE_RX` (0x02).
+    pub abilities: u8,
+    pub eee_capability: u16,
+    pub eer: u32,
+    /// `I40E_AQ_PHY_TYPE_EXT_25G_*` bits.
+    pub phy_type_ext: u8,
+    pub phy_id: [u8; 4],
+    pub module_type: [u8; 3],
+    pub qualified_module_count: u8,
+}
+
+impl PhyAbilities {
+    /// Decode the response buffer firmware wrote for
+    /// `get_phy_abilities`. `None` when the buffer is shorter than
+    /// the 24-byte decoded prefix.
+    pub const fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 24 {
+            return None;
+        }
+        Some(Self {
+            phy_type_bitmap: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            link_speed: buf[4],
+            abilities: buf[5],
+            eee_capability: u16::from_le_bytes([buf[6], buf[7]]),
+            eer: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            phy_type_ext: buf[13],
+            phy_id: [buf[16], buf[17], buf[18], buf[19]],
+            module_type: [buf[20], buf[21], buf[22]],
+            qualified_module_count: buf[23],
+        })
+    }
+
+    /// True when firmware reports `ty` as a supported PHY type
+    /// (its bit set in the bitmap). The link-status sentinels
+    /// (`NOT_SUPPORTED_HIGH_TEMP` / `EMPTY` / `DEFAULT`) and
+    /// unknown bytes are not capability bits and always read
+    /// false — a bitmap bit past the u32 cannot be set.
+    pub const fn supports(self, ty: I40ePhyType) -> bool {
+        let bit = ty.as_byte();
+        if bit >= 32 {
+            return false;
+        }
+        self.phy_type_bitmap & (1u32 << bit) != 0
+    }
+}
+
+/// `I40E_AQ_PHY_ENABLE_LINK` — set in `SetPhyConfig.abilities`.
+pub const PHY_ENABLE_LINK: u8 = 0x08;
+/// `I40E_AQ_PHY_ENABLE_AN` — enable auto-negotiation.
+pub const PHY_ENABLE_AN: u8 = 0x10;
+/// `I40E_AQ_PHY_ENABLE_ATOMIC_LINK`.
+pub const PHY_ENABLE_ATOMIC_LINK: u8 = 0x20;
+/// `I40E_AQ_SET_FEC_ABILITY_KR` — set in `PhyConfig.fec_config`.
+pub const PHY_FEC_ABILITY_KR: u8 = 0x01;
+/// `I40E_AQ_SET_FEC_ABILITY_RS`.
+pub const PHY_FEC_ABILITY_RS: u8 = 0x02;
+/// `I40E_AQ_SET_FEC_REQUEST_KR`.
+pub const PHY_FEC_REQUEST_KR: u8 = 0x04;
+/// `I40E_AQ_SET_FEC_REQUEST_RS`.
+pub const PHY_FEC_REQUEST_RS: u8 = 0x08;
+/// `I40E_AQ_SET_FEC_AUTO`.
+pub const PHY_FEC_AUTO: u8 = 0x10;
+
+/// Parameters for `set_phy_config` (0x0601) — `struct
+/// i40e_aq_set_phy_config` (same Linux header, lines 1531–1558).
+/// `phy_type` is the same bitmap `get_phy_abilities` reports.
+/// There is deliberately no in-tree caller yet: programming the
+/// PHY changes live link state, so issuing it belongs to a
+/// control-plane owner (ethtool path), not to probe — this issue
+/// only wires the opcode and the encoding, with fixture coverage.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PhyConfig {
+    pub phy_type: u32,
+    pub link_speed: u8,
+    pub abilities: u8,
+    pub eee_capability: u16,
+    pub eer: u32,
+    pub low_power_ctrl: u8,
+    pub phy_type_ext: u8,
+    pub fec_config: u8,
+}
+
+impl PhyConfig {
+    /// Encode into the 16-byte direct-command `params`:
+    /// `phy_type:le32` @0, `link_speed` @4, `abilities` @5,
+    /// `eee_capability:le16` @6, `eer:le32` @8, `low_power_ctrl`
+    /// @12, `phy_type_ext` @13, `fec_config` @14, reserved @15.
+    pub const fn encode(self) -> [u8; 16] {
+        let phy_type = self.phy_type.to_le_bytes();
+        let eee = self.eee_capability.to_le_bytes();
+        let eer = self.eer.to_le_bytes();
+        [
+            phy_type[0],
+            phy_type[1],
+            phy_type[2],
+            phy_type[3],
+            self.link_speed,
+            self.abilities,
+            eee[0],
+            eee[1],
+            eer[0],
+            eer[1],
+            eer[2],
+            eer[3],
+            self.low_power_ctrl,
+            self.phy_type_ext,
+            self.fec_config,
+            0,
+        ]
+    }
+}
+
 /// Decoded `get_version` (0x0001) response — `struct
 /// libie_aqc_get_ver`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -835,6 +1202,8 @@ pub enum I40eError {
     NoMainVsi,
     /// `get_vsi_parameters` returned a short or undecodable context.
     BadVsiParams,
+    /// `get_phy_abilities` returned a short or undecodable response.
+    BadPhyAbilities,
     /// Firmware refused a MAC filter — typically out of filter
     /// resources.
     MacFilterRejected,
@@ -1772,6 +2141,45 @@ impl Hardware {
         params[0] = AQ_LSE_ENABLE;
         let (_slot, wb) = self.aq_send(AqOpcode::GetLinkStatus, params, None, 0)?;
         Ok(LinkStatus::parse(&wb.params))
+    }
+
+    /// `get_phy_abilities` (0x0600) — indirect. Reports the PHY
+    /// types / speeds firmware supports and, when
+    /// `report_qualified_modules` is set, the qualified modules
+    /// for this port (`I40E_AQ_PHY_REPORT_QUALIFIED_MODULES` in
+    /// param0). The 0x218-byte response fits one ATQ slot buffer
+    /// (`AQ_BUF_BYTES` is 4096). No in-tree caller yet: capability
+    /// interrogation is for the ethtool / module-state path, not
+    /// for probe — this issue only wires the opcode and the
+    /// decode, with fixture coverage.
+    pub fn aq_get_phy_abilities(
+        &self,
+        report_qualified_modules: bool,
+    ) -> Result<PhyAbilities, I40eError> {
+        let mut params = [0u8; 16];
+        let flags = if report_qualified_modules {
+            AQ_PHY_REPORT_QUALIFIED_MODULES
+        } else {
+            0
+        };
+        params[0..2].copy_from_slice(&flags.to_le_bytes());
+        let (buf, _wb) = self.aq_send(
+            AqOpcode::GetPhyAbilities,
+            params,
+            None,
+            PHY_ABILITIES_RESP_LEN,
+        )?;
+        PhyAbilities::parse(&buf).ok_or(I40eError::BadPhyAbilities)
+    }
+
+    /// `set_phy_config` (0x0601) — direct. Programs the PHY type
+    /// bitmap / link speed / abilities from [`PhyConfig`]. No
+    /// in-tree caller yet (see [`PhyConfig`]): programming the PHY
+    /// changes live link state and belongs to a control-plane
+    /// owner, not to probe.
+    pub fn aq_set_phy_config(&self, config: &PhyConfig) -> Result<(), I40eError> {
+        self.aq_send(AqOpcode::SetPhyConfig, config.encode(), None, 0)?;
+        Ok(())
     }
 
     /// `queue_shutdown` (0x0003) — tell firmware the driver is going

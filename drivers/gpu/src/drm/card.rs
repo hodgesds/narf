@@ -2321,6 +2321,33 @@ impl Card {
         self.addfb2_cmd(&cmd)
     }
 
+    /// Whether any plane takes `format` (drm_any_plane_has_format): a
+    /// primary's or an overlay's. A card without native planes keeps the
+    /// formats it always took.
+    fn takes_format(&self, format: u32) -> bool {
+        if self.plane_formats.is_some_and(|f| f.contains(&format))
+            || self.overlay_formats.is_some_and(|f| f.contains(&format))
+        {
+            return true;
+        }
+        self.plane_formats.is_none()
+            && self.overlay_formats.is_none()
+            && matches!(format, 0x3432_5258 | 0x3432_5241 | 0x3631_4752)
+    }
+
+    /// Every format any plane takes, primaries then overlays not already
+    /// listed (drm_any_plane_has_format, for the amdgpu framebuffer
+    /// checks).
+    fn all_plane_formats(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.plane_formats.unwrap_or(&[]).to_vec();
+        for &format in self.overlay_formats.unwrap_or(&[]) {
+            if !out.contains(&format) {
+                out.push(format);
+            }
+        }
+        out
+    }
+
     /// ADDFB2 with the whole `drm_mode_fb_cmd2`: handles, pitches, offsets
     /// and modifiers. The native amdgpu card (`gfx12_modifiers`) runs
     /// drm_internal_framebuffer_create's and amdgpu's checks
@@ -2385,21 +2412,21 @@ impl Card {
                 return Err(CardError::BadGemHandle);
             }
             let format = cmd.pixel_format;
-            // Validate pixel format: a format no plane takes is refused.
-            if self
-                .plane_formats
-                .is_some_and(|formats| !formats.contains(&format))
-            {
-                return Err(CardError::UnknownFormat);
-            }
-            // A card without native planes keeps the formats it always took.
-            let legacy = matches!(format, 0x3432_5258 | 0x3432_5241 | 0x3631_4752);
-            if self.plane_formats.is_none() && !legacy {
+            // Validate pixel format: a format no plane takes is refused
+            // (drm_any_plane_has_format: a primary's or an overlay's).
+            if !self.takes_format(format) {
                 return Err(CardError::UnknownFormat);
             }
             let format = PixelFormat::from_fourcc(format).ok_or(CardError::UnknownFormat)?;
-            // Two-plane formats need the native amdgpu card's checks.
-            if matches!(format, PixelFormat::Nv12 | PixelFormat::P010) {
+            // Two-plane formats need an overlay plane that takes them (the
+            // native amdgpu card's checks otherwise); their second plane is
+            // recorded from the command, as on the GFX12 path.
+            let two = matches!(format, PixelFormat::Nv12 | PixelFormat::P010);
+            if two
+                && !self
+                    .overlay_formats
+                    .is_some_and(|formats| formats.contains(&cmd.pixel_format))
+            {
                 return Err(CardError::UnknownFormat);
             }
             // drm_framebuffer's framebuffer_check: the pitch holds a line of
@@ -2407,6 +2434,14 @@ impl Card {
             // object holds every line (EINVAL either way).
             let line = u64::from(width) * u64::from(format.cpp());
             if u64::from(pitch) < line {
+                return Err(CardError::InvalidDimensions);
+            }
+            // A 4:2:0 chroma plane holds ceil(width / 2) interleaved
+            // samples a row (2 bytes each for NV12, 4 for P010: twice the
+            // luma bytes per pixel) over ceil(height / 2) rows.
+            let chroma_line = u64::from(width.div_ceil(2)) * 2 * u64::from(format.cpp());
+            let chroma_rows = u64::from(height.div_ceil(2));
+            if two && u64::from(cmd.pitches[1]) < chroma_line {
                 return Err(CardError::InvalidDimensions);
             }
             if let Some(b) = self
@@ -2417,8 +2452,20 @@ impl Card {
                 if (b.byte_len as u64) < u64::from(height - 1) * u64::from(pitch) + line {
                     return Err(CardError::InvalidDimensions);
                 }
+                if two
+                    && (b.byte_len as u64)
+                        < u64::from(cmd.offsets[1])
+                            + chroma_rows.saturating_sub(1) * u64::from(cmd.pitches[1])
+                            + chroma_line
+                {
+                    return Err(CardError::InvalidDimensions);
+                }
             }
-            ([0, 0], 0, 0)
+            (
+                [cmd.offsets[0], if two { cmd.offsets[1] } else { 0 }],
+                if two { cmd.pitches[1] } else { 0 },
+                0,
+            )
         };
         let format = PixelFormat::from_fourcc(cmd.pixel_format).ok_or(CardError::UnknownFormat)?;
         if self.framebuffers.len() >= 4096 {
@@ -2482,7 +2529,7 @@ impl Card {
         }
         let info = m::check_fb_cmd(cmd).map_err(|_| CardError::InvalidDimensions)?;
         let dcc = object.flags & u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_GFX12_DCC) != 0;
-        let formats = self.plane_formats.unwrap_or(&[]);
+        let formats = self.all_plane_formats();
         // The linear-primary card is GFX10.3 (Navi22): its BOs carry the
         // GFX9+ tiling-flag layout, not GFX12's.
         let layout = if linear {
@@ -2497,16 +2544,17 @@ impl Card {
         let modifier = m::check_amdgpu_fb(
             cmd,
             &info,
-            formats,
+            &formats,
             object.tiling_flags(),
             dcc,
             object.byte_len,
             layout,
         )
         .map_err(|_| CardError::UnknownFormat)?;
-        if linear
-            && (modifier != 0 || dcc || !matches!(cmd.pixel_format, 0x3432_5258 | 0x3432_5241))
-        {
+        // The linear-primary card is GFX10.3 (Navi22): only LINEAR without
+        // DCC reaches it — its primary takes 8888, its overlays the wider
+        // list (already enforced by `check_amdgpu_fb` above).
+        if linear && (modifier != 0 || dcc || !self.takes_format(cmd.pixel_format)) {
             return Err(CardError::UnknownFormat);
         }
         let format = PixelFormat::from_fourcc(cmd.pixel_format).ok_or(CardError::UnknownFormat)?;

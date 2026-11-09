@@ -91,6 +91,11 @@ impl From<BlockIoError> for DetectError {
 /// ISO9660; LBA 128 covers btrfs). The function returns at the
 /// first hit so cheap matches don't pay for the deeper reads.
 pub fn detect_filesystem(dev: &Arc<dyn BlockDeviceSync>) -> Result<Option<FsType>, DetectError> {
+    detect_filesystem_sync(dev.as_ref())
+}
+
+/// Borrowed-device probe for authenticated block adapters before registration.
+pub fn detect_filesystem_sync(dev: &dyn BlockDeviceSync) -> Result<Option<FsType>, DetectError> {
     let lba_size = dev.lba_size();
     if !matches!(lba_size, 512 | 1024 | 2048 | 4096) {
         return Err(DetectError::UnsupportedLbaSize(lba_size));
