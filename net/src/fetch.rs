@@ -55,6 +55,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -554,8 +555,11 @@ impl<'a, T: Transport> FetchStream for TlsStream<'a, T> {
 pub enum FetchConn<'a> {
     /// Plain HTTP over TCP.
     Plain(TcpStream),
-    /// HTTPS: TLS over TCP.
-    Tls(TlsStream<'a, TcpTransport>),
+    /// HTTPS: TLS over TCP. Boxed: the TLS stream (~776 bytes)
+    /// dwarfs the plain leg (4 bytes), and the connection is
+    /// opened once per fetch, so one heap allocation per TLS
+    /// fetch keeps the enum small without a hot-path cost.
+    Tls(Box<TlsStream<'a, TcpTransport>>),
 }
 
 impl FetchStream for FetchConn<'_> {
@@ -867,7 +871,9 @@ fn connect_url<'a>(
             let transport = TcpTransport::connect(ip, url.port).map_err(|_| FetchError::Connect)?;
             let mut config = ClientConfig::new(roots, now_unix);
             config.server_name = Some(url.host.as_str());
-            Ok(FetchConn::Tls(TlsStream::connect(transport, config)?))
+            Ok(FetchConn::Tls(Box::new(TlsStream::connect(
+                transport, config,
+            )?)))
         }
     }
 }
