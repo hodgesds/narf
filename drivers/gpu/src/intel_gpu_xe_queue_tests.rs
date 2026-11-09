@@ -376,11 +376,16 @@ fn smoke_xe_parallel_queue_creation_validation_and_media_classes() -> TestResult
         user.wire.store(64, &wire);
     };
 
-    // 1. Parallel queue with width 2 for Compute (class 4) on GT0:
+    // 1. Parallel queue with width 2 for Compute (class 4) on GT0 is
+    // refused: MeteorLake publishes a single CCS (Ccs0) — `compute_instances`
+    // returns 1 for Integrated platforms and the default CCS mode is 1 — so
+    // the second lane has no published instance. Per spec.md §3,
+    // "COMPUTE/VIDEO on a GT without published instances, return EINVAL".
     queue_wire_raw(2, 1, &[[4, 0, 0, 0], [4, 1, 0, 0]]);
-    assert_eq!(invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE), Ok(0));
-    let q_compute = u32_at(&user.wire.load(64, 48), 20);
-    assert_ne!(q_compute, 0);
+    assert_eq!(
+        invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE),
+        Err(FsError::InvalidData)
+    );
 
     // 2. Parallel queue with width 2 for Video Decode (class 2, VCS) on GT1:
     queue_wire_raw(2, 1, &[[2, 0, 1, 0], [2, 1, 1, 0]]);
@@ -466,7 +471,7 @@ fn smoke_xe_parallel_queue_creation_validation_and_media_classes() -> TestResult
     // 11. Multi-batch exec validation:
     // Submitting parallel exec with count != width (e.g. count=1 when width=2):
     let mut exec_wire = [0u8; 56];
-    put32(&mut exec_wire, 8, q_compute); // queue
+    put32(&mut exec_wire, 8, q_vcs); // queue (width-2 VCS parallel queue; no Compute one exists on this GT0)
     put32(&mut exec_wire, 12, 0); // num_syncs
     put64(&mut exec_wire, 16, 0); // syncs
     put64(&mut exec_wire, 24, 0x1000); // batch address array
