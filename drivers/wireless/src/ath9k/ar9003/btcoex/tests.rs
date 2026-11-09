@@ -185,12 +185,15 @@ fn btcoex_set_weight() -> TestResult {
         return TestResult::Fail("AR9300 STOMP_AUDIO weights are not zero");
     }
     // Concurrent-TX priority overlays the top bytes of slots 1..3.
+    // Linux applies the same tx_prio at every slot
+    // (`btcoex.c::txprio_shift = {24, 16, 16, 0}`; no +1 anywhere),
+    // so slot 2/3 take 0x5a in the 16-shift byte, not 0x5b.
     let mut btcoex = Btcoex::new(Chip::Ar9462);
     init_mci(&mut btcoex);
     btcoex.mci.concur_tx = true;
     set_concur_txprio(&mut btcoex, [0x5a, 0, 0, 0, 0]);
     set_weight(&mut btcoex, StompType::All);
-    if btcoex.wlan_weight != [0x0101_7d01, 0x5a41_4101, 0x415b_4101, 0x415b_415a] {
+    if btcoex.wlan_weight != [0x0101_7d01, 0x5a41_4101, 0x415a_4101, 0x415a_415a] {
         return TestResult::Fail("concurrent-TX priority overlay is wrong");
     }
     // Zero priority means no overlay even with concur_tx on.
@@ -244,8 +247,11 @@ fn btcoex_enable_disable_mci() -> TestResult {
     if disable_mci(&mut io, &mut btcoex).is_err() {
         return TestResult::Fail("disable_mci errored");
     }
-    if btcoex.enabled {
-        return TestResult::Fail("disable_mci cleared enabled itself");
+    // Linux's `ath9k_hw_btcoex_disable_mci` does not touch `enabled`
+    // (the caller `ath9k_hw_btcoex_disable` clears it first), so it
+    // must still be set here.
+    if !btcoex.enabled {
+        return TestResult::Fail("disable_mci cleared enabled itself; the caller owns enabled");
     }
     for (reg, w) in regs.iter().zip(want.iter()) {
         if io.last_write(*reg) != Some(*w) {

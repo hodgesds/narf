@@ -130,8 +130,10 @@ fn mci_message_exchange() -> TestResult {
     if command_header(cmd) != Msg::Gpm as u8 || command_len(cmd) != 16 {
         return TestResult::Fail("version query COMMAND0 is not a 16-byte GPM");
     }
-    // Payload word 1 carries the type/opcode bytes (4/5).
-    if io.last_write(AR_MCI_TX_PAYLOAD0 + 4) != Some(0x0000_0c00) {
+    // Payload word 1 carries the type/opcode bytes (4/5): type
+    // COEX_AGENT (0x0c) in byte 4, opcode VERSION_QUERY (0x00) in
+    // byte 5, so word 1 is 0x0000_000c.
+    if io.last_write(AR_MCI_TX_PAYLOAD0 + 4) != Some(0x0000_000c) {
         return TestResult::Fail("version query payload is not COEX_AGENT/VERSION_QUERY");
     }
     // BT answers with a version-response GPM in slot 0.
@@ -398,7 +400,10 @@ fn mci_cal_handshake() -> TestResult {
     if io.last_write(AR_PHY_TIMING4) != Some(0) {
         return TestResult::Fail("end_reset did not clear the cal bit");
     }
-    // No wakeup bits: idle, and the bit stays set.
+    // No wakeup bits: idle, and the bit stays set. Linux's idle path
+    // (`ar9003_mci_end_reset` going to `exit`) does not touch
+    // TIMING4 at all, so the register must still read set and no
+    // write to it may have happened.
     let (mut io, mut btcoex) = live();
     btcoex.mci.bt_state = BtState::Sleep;
     io.regs.insert(
@@ -411,7 +416,9 @@ fn mci_cal_handshake() -> TestResult {
     if end != EndReset::Idle {
         return TestResult::Fail("end_reset recalibrated without a BT wakeup");
     }
-    if io.last_write(AR_PHY_TIMING4) != Some(1 << AR_PHY_TIMING_CONTROL4_DO_GAIN_DC_IQ_CAL_SHIFT) {
+    if io.reg(AR_PHY_TIMING4) != 1 << AR_PHY_TIMING_CONTROL4_DO_GAIN_DC_IQ_CAL_SHIFT
+        || io.last_write(AR_PHY_TIMING4).is_some()
+    {
         return TestResult::Fail("end_reset cleared the cal bit while idle");
     }
     TestResult::Pass
@@ -597,9 +604,13 @@ fn mci_state_sweep() -> TestResult {
     if !btcoex.mci.update_2g5g {
         return TestResult::Fail("state(ResetReqWake) did not arm the 2G/5G update");
     }
-    // RX recovery is rate-limited by the TSF.
+    // RX recovery is rate-limited by the TSF. `init_mci` leaves
+    // `query_bt` set, so clear it first: the "soon" call must be the
+    // thing that leaves it clear, not the fixture default.
     let (mut io, mut btcoex) = live();
     btcoex.mci.last_recovery = 100_000;
+    btcoex.mci.query_bt = false;
+    btcoex.mci.need_flush_btinfo = false;
     io.regs.insert(AR_TSF_L32, 150_000);
     let Ok(_) = state(&mut io, &mut btcoex.mci, MciState::RecoverRx) else {
         return TestResult::Fail("state(RecoverRx, soon) errored");
@@ -627,16 +638,24 @@ fn mci_state_sweep() -> TestResult {
 
 fn mci_update_wlan_channels() -> TestResult {
     // Channel 1 (2412 MHz, HT20) clears the WLAN channel ±10 plus the
-    // 7-channel guard from the map.
+    // 7-channel guard from the map. Linux clears BT channels 0..26
+    // (`wlan_chan` 10, `chan_start` -7 clamped to 0, `chan_end` 27),
+    // and BT channel `i` is payload bit `48 + i`
+    // (`MCI_GPM_CLR_CHANNEL_BIT`), so bits 48..74 go: word 1 loses
+    // its whole top half (0xffff_0000 -> 0) and word 2 its low 11
+    // bits (0xffff_ffff -> 0xffff_f800).
     let (mut io, mut btcoex) = live();
     if update_wlan_channels(&mut io, &mut btcoex.mci, 2412, Ht40::None, false).is_err() {
         return TestResult::Fail("update_wlan_channels errored on 2412");
     }
-    if btcoex.mci.wlan_channels != [0, 0xffff_ffff, 0xffff_f800, 0x7fff_ffff] {
+    if btcoex.mci.wlan_channels != [0, 0, 0xffff_f800, 0x7fff_ffff] {
         return TestResult::Fail("2412 HT20 channel map is wrong");
     }
-    // The map goes out as a channels GPM (type/opcode in word 1).
-    if io.last_write(AR_MCI_TX_PAYLOAD0 + 4) != Some(0xffff_040c) {
+    // The map goes out as a channels GPM (type/opcode in word 1):
+    // word 1 is 0x0000_040c (type 0x0c, opcode 4, map word 1 is 0).
+    // It is not the last payload write — the trailing version query
+    // overwrites TX_PAYLOAD0+4 afterwards — so look at all the writes.
+    if !io.writes(AR_MCI_TX_PAYLOAD0 + 4).contains(&0x0000_040c) {
         return TestResult::Fail("channels GPM payload is wrong");
     }
     // 5 GHz channels are skipped entirely.
@@ -648,12 +667,14 @@ fn mci_update_wlan_channels() -> TestResult {
     if btcoex.mci.wlan_channels != before || io.last_write(AR_MCI_COMMAND0).is_some() {
         return TestResult::Fail("5 GHz channel was not skipped");
     }
-    // allow_all leaves the map fully open.
+    // allow_all leaves the map fully open: the local initial map
+    // (`mci.c`: [0, 0xffff_0000, 0xffff_ffff, 0x7fff_ffff]), not the
+    // `init_mci` default (whose word 1 is 0xffff_ffff).
     let (mut io, mut btcoex) = live();
     if update_wlan_channels(&mut io, &mut btcoex.mci, 2412, Ht40::None, true).is_err() {
         return TestResult::Fail("update_wlan_channels (allow_all) errored");
     }
-    if btcoex.mci.wlan_channels != [0, 0xffff_ffff, 0xffff_ffff, 0x7fff_ffff] {
+    if btcoex.mci.wlan_channels != [0, 0xffff_0000, 0xffff_ffff, 0x7fff_ffff] {
         return TestResult::Fail("allow_all channel map is wrong");
     }
     // Concurrent-TX power caps: HT20 0x14, HT40 0x10, else none.
