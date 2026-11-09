@@ -1552,8 +1552,11 @@ References (public-only, all IETF documents):
   the §2.4(c) bound (1232 bytes) and applying the §2.4(e) suppression
   rules (no error for an ICMPv6 error, a Redirect, a multicast-destined
   packet except Packet Too Big / Parameter Problem code 2, or a
-  non-identifying source). §2.4(f) rate limiting is NOT implemented
-  (token bucket is a follow-up lane). RX answers Echo Requests
+  non-identifying source), then the §2.4(f) token bucket
+  (`ipv6_stack::icmp6_error_rate_limiter`, one bucket per node,
+  defaults B=10, N=10/s — the RFC's example defaults for a
+  small/mid-size device — configurable via `configure`, exhausted
+  bucket returns `Icmp6SendError::RateLimited`). RX answers Echo Requests
   (RFC 4443 §2.2 source rules) and solicited NS→NA replies (RFC 4861
   §7.2.4, including the DAD-probe multicast reply) through the same
   surface; `ndp::on_ns` returns the reply body plus its IPv6
