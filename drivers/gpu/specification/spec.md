@@ -9970,6 +9970,33 @@ of the given type ENOENT. Non-atomic cards keep set_property_legacy. Model-teste
 `dcn401-deadline`, `dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm`,
 `drm_ioctl`); not validated on hardware.
 
+**Navi 22 (DCN 3.0) overlays — DRM layer only (#1950).** Navi22
+publishes two shared overlays (dc caps' `max_slave_planes = 2` on DCN
+3.0, also `max_slave_yuv_planes = 2` and `max_slave_rgb_planes = 2`;
+Linux v6.12 `dc/resource/dcn30/dcn30_resource.c`) at plane ids
+0x44/0x45, with the same 19-format overlay list as Navi48 and the
+cursor planes at 0x46+ after them (contiguous, as amdgpu_dm registers
+each CRTC's cursor after every primary and overlay). The primaries
+stay synthesized (their CRTC's `primary_fb`): the primary's immutable
+zpos is 2 (`max_slave_planes`), overlay k's default zpos is 7 + k
+(`primary_zpos + 1 + drm_plane_index`). `check()` gains a
+synthesized-primary mode: the overlay CRTC-switch rule, the overlay
+format list, DCN30's scaling/viewport/rotation caps (16x upscale,
+167 downscale, 12-pixel minimum viewport, no 90/270 turn of a linear
+surface), linear surfaces only, and an enabled CRTC's primary required
+via `primary_fb`. Only a CRTC with an enabled overlay returns a setup;
+a primary-only CRTC stays on the synthesized path. Color properties
+stay on any YUV plane including overlays (the tree's deviation from
+Linux, which attaches them to the primary only); matching Linux there
+is a separate tree-wide cleanup. ADDFB2 takes a format any plane takes
+(`drm_any_plane_has_format`): a two-plane NV12/P010 framebuffer over
+the dumb path or a GEM one once an overlay plane takes the format,
+with its chroma plane recorded and validated. The display side that
+programs the overlays is #1951, and `present_planes` still refuses
+overlays on Navi22 until then — this lands together with #1951, never
+alone. Model-tested only (`navi22`, `drm`, `drm_ioctl`); not validated
+on hardware.
+
 ### Navi 48 seamless shared-clock changes
 
 A configuration change that keeps running displays lit follows
